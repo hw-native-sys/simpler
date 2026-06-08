@@ -16,9 +16,11 @@ from simpler.callable_identity import (
     CallableKindName,
     TargetNamespaceName,
     build_chip_callable_descriptor,
+    build_python_import_descriptor,
     build_python_serialized_descriptor,
     compute_callable_hashid,
     hashid_to_digest,
+    parse_python_import_target,
     validate_hashid,
 )
 from simpler.task_interface import ChipCallable
@@ -46,6 +48,36 @@ def test_chip_descriptor_changes_when_callable_blob_changes():
     assert compute_callable_hashid(build_chip_callable_descriptor(target=first)) != compute_callable_hashid(
         build_chip_callable_descriptor(target=second)
     )
+
+
+def test_python_import_descriptor_hash_is_stable():
+    module, qualname = parse_python_import_target("pkg.mod:Class.method")
+    descriptor = build_python_import_descriptor(module, qualname)
+
+    assert (module, qualname) == ("pkg.mod", "Class.method")
+    assert compute_callable_hashid(descriptor) == compute_callable_hashid(
+        build_python_import_descriptor("pkg.mod", "Class.method")
+    )
+    assert len(hashid_to_digest(compute_callable_hashid(descriptor))) == 32
+
+
+@pytest.mark.parametrize(
+    "target",
+    [
+        "pkg.mod.fn",
+        ":fn",
+        "pkg:",
+        ".pkg:fn",
+        "pkg..mod:fn",
+        "pkg.mod:Class..method",
+        "pkg.mod:<locals>.fn",
+        "pkg.mod:bad-name",
+        object(),
+    ],
+)
+def test_python_import_target_validation_rejects_invalid_targets(target):
+    with pytest.raises((TypeError, ValueError)):
+        parse_python_import_target(target)
 
 
 @pytest.mark.parametrize("hashid", ["", "sha256:ABC", "md5:" + "0" * 64, "sha256:" + "0" * 63])
@@ -89,6 +121,19 @@ def test_callable_handle_public_constructor_returns_unbound_handle():
     assert handle._owner_id is None
     assert not hasattr(handle, "slot_id")
     assert not hasattr(handle, "cid")
+
+
+def test_callable_handle_accepts_remote_dispatcher_import_namespace():
+    descriptor = build_python_import_descriptor("pkg.mod", "remote_entry")
+    handle = CallableHandle(
+        compute_callable_hashid(descriptor),
+        cast(CallableKindName, "PYTHON_IMPORT"),
+        cast(TargetNamespaceName, "REMOTE_TASK_DISPATCHER"),
+    )
+
+    assert handle.kind == "PYTHON_IMPORT"
+    assert handle.target_namespace == "REMOTE_TASK_DISPATCHER"
+    assert handle.digest == hashid_to_digest(handle.hashid)
 
 
 def test_forged_public_handle_is_rejected_by_worker_apis():
