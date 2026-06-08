@@ -26,19 +26,33 @@ void TaskSlotState::reset() {
     }
     fanout_released.store(0, std::memory_order_relaxed);
     output_keys.clear();
+    eligible_endpoint_ids.clear();
     fanin_producers.clear();
+    failure_message.clear();
     worker_type = WorkerType::NEXT_LEVEL;
     callable = CallableIdentity{};
     config = CallConfig{};
     task_args.clear();
     task_args_list.clear();
     is_group_ = false;
+    remote_sidecar.clear();
+    remote_sidecars.clear();
     affinities.clear();
     // ring_idx / ring_slot_idx are deliberately NOT cleared here: Ring
     // stamps them at alloc() before the Orchestrator ever calls reset(),
     // and Ring::release() needs to read them for the FIFO advance. The
     // fields are rewritten on every alloc, so stale values never escape.
     sub_complete_count.store(0, std::memory_order_relaxed);
+    {
+        std::lock_guard<std::mutex> lk(group_mu);
+        group_member_states.clear();
+        group_member_outcomes.clear();
+        group_failed = false;
+        group_first_failure_index = -1;
+        group_first_failure_message.clear();
+    }
+    group_terminal_count.store(0, std::memory_order_relaxed);
+    group_dispatched_count.store(0, std::memory_order_relaxed);
 }
 
 // =============================================================================
