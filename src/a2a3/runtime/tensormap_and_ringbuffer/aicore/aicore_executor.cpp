@@ -132,6 +132,15 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, in
         }
 
         {
+            // receive_time is captured the instant DATA_MAIN_BASE returned a
+            // new task_id, BEFORE the per-task dcci + ack pair. Paired with
+            // start_time (captured after dcci + ack) it lets DFX split head_OH
+            // into the AICPU→AICore NoC propagation (dispatch_ts → receive_time,
+            // hardware-bound) and the AICore-local dcci+ack cost
+            // (receive_time → start_time, software-tunable). Stored in the
+            // record as a 32-bit delta `start_time − receive_time`.
+            uint64_t receive_time = get_sys_cnt_aicore();
+
             uint32_t task_id = reg_val;  // Decode: register holds task_id directly
 
             // Select dual-buffer slot: same bit as AICPU used when writing payload
@@ -179,7 +188,7 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, in
                 uint64_t end_time = get_sys_cnt_aicore();
                 uint64_t task_token_raw = exec_payload->local_context.async_ctx.task_token.raw;
                 l2_swimlane_aicore_record_task(
-                    l2_swimlane_head, &l2_swimlane_local, task_token_raw, task_id, start_time, end_time
+                    l2_swimlane_head, &l2_swimlane_local, task_token_raw, task_id, receive_time, start_time, end_time
                 );
             }
 

@@ -100,11 +100,22 @@ def read_perf_data(filepath):  # noqa: PLR0912, PLR0915
             "core_types": ["aic"|"aiv", ...],   # indexed by core_id
             "core_to_thread": [<int>, ...]      # optional (level >= 3)
           },
-          "aicore_tasks": [[core_id, task_token_raw, reg_task_id, start_cycles, end_cycles], ...],
+          "aicore_tasks": [[core_id, task_token_raw, reg_task_id, start_cycles,
+                            end_cycles, receive_to_start_cycles], ...],
           "aicpu_tasks":  [[core_id, reg_task_id, dispatch_cycles, finish_cycles], ...],
           "aicpu_scheduler_phases":     [ [ {kind, start_cycles, end_cycles, ...}, ... ], ... ],
           "aicpu_orchestrator_phases":  [ [ {submit_idx, task_id, start_cycles, end_cycles}, ... ], ... ]
         }
+
+    aicore_tasks columns (v3 schema): the trailing receive_to_start_cycles
+    is a uint32 delta = AICore-side `start_time − receive_time`, where
+    receive_time is captured immediately after AICore's
+    `read_reg(DATA_MAIN_BASE)` returns the new task_id (before the per-task
+    dcci + ack pair). Lets DFX split per-task head_OH into the
+    AICPU→AICore NoC propagation (dispatch_ts → receive_time, hardware-
+    bound) and the AICore-local dcci + ack cost (receive_time → start_time,
+    software-tunable). Archived v2 JSON without this column still parses;
+    the field is exposed as 0 for those.
 
     Returns a dict shaped for `generate_chrome_trace_json`,
     `print_task_statistics`, and `sched_overhead_analysis`: `tasks`,
@@ -152,13 +163,19 @@ def read_perf_data(filepath):  # noqa: PLR0912, PLR0915
     # same PTO2 task_token_raw to the same core (SPMD over-subscription, MIX
     # cluster spread) each get their own reg_task_id, so this key is unique
     # per dispatch even when task_token_raw collides.
-    aicore_lookup: dict[tuple[int, int], tuple[int, int, int]] = {}
+    #
+    # `*rest` makes v2 rows (5 cols, no receive_to_start_cycles) and v3 rows
+    # (6 cols) both parse — archived JSON from before the receive_time split
+    # still loads with r2s_cycles defaulting to 0.
+    aicore_lookup: dict[tuple[int, int], tuple[int, int, int, int]] = {}
     for row in aicore_rows:
-        core_id, task_token_raw, reg_task_id, start_cycles, end_cycles = row
+        core_id, task_token_raw, reg_task_id, start_cycles, end_cycles, *rest = row
+        r2s_cycles = int(rest[0]) if rest else 0
         aicore_lookup[(int(core_id), int(reg_task_id))] = (
             int(task_token_raw),
             int(start_cycles),
             int(end_cycles),
+            r2s_cycles,
         )
 
     # base_time = min non-zero timestamp across every stream that will be
@@ -170,9 +187,11 @@ def read_perf_data(filepath):  # noqa: PLR0912, PLR0915
         if v > 0 and (base_time_cycles is None or v < base_time_cycles):
             base_time_cycles = v
 
-    for _, _, _, s, e in aicore_rows:
-        _track(int(s))
-        _track(int(e))
+    for row in aicore_rows:
+        # Column count varies (v2: 5, v3: 6); only the timing columns matter
+        # for base_time tracking.
+        _track(int(row[3]))
+        _track(int(row[4]))
     for _, _, d, f in aicpu_rows:
         _track(int(d))
         _track(int(f))
@@ -212,9 +231,15 @@ def read_perf_data(filepath):  # noqa: PLR0912, PLR0915
             if ac is None:
                 unmatched_per_core[core_id] += 1
                 continue
-            task_token_raw, start_cycles, end_cycles = ac
+            task_token_raw, start_cycles, end_cycles, r2s_cycles = ac
             start_us = _to_us(start_cycles)
             end_us = _to_us(end_cycles)
+            dispatch_us = _to_us(int(dispatch_cycles))
+            # receive_to_start delta is in cycles; convert via the same
+            # cycles_to_us_factor that drives the absolute timestamps. No
+            # base_time subtraction — this is a delta.
+            local_setup_us = r2s_cycles * cycles_to_us_factor
+            receive_us = start_us - local_setup_us
             tasks.append(
                 {
                     "task_id": task_token_raw,
@@ -225,19 +250,24 @@ def read_perf_data(filepath):  # noqa: PLR0912, PLR0915
                     "start_time_us": start_us,
                     "end_time_us": end_us,
                     "duration_us": end_us - start_us,
-                    "dispatch_time_us": _to_us(int(dispatch_cycles)),
+                    "dispatch_time_us": dispatch_us,
                     "finish_time_us": _to_us(int(finish_cycles)),
+                    "receive_time_us": receive_us,
+                    "local_setup_us": local_setup_us,
+                    "propagation_us": receive_us - dispatch_us,
                 }
             )
     elif level == 1:
         # AICORE_TIMING fallback: AICPU records are absent (complete_task
         # bypassed). The AICore stream alone is the source of truth.
         for row in aicore_rows:
-            core_id, task_token_raw, _reg_task_id, start_cycles, end_cycles = row
+            core_id, task_token_raw, _reg_task_id, start_cycles, end_cycles, *rest = row
+            r2s_cycles = int(rest[0]) if rest else 0
             core_id = int(core_id)
             task_token_raw = int(task_token_raw)
             start_us = _to_us(int(start_cycles))
             end_us = _to_us(int(end_cycles))
+            local_setup_us = r2s_cycles * cycles_to_us_factor
             tasks.append(
                 {
                     "task_id": task_token_raw,
@@ -250,6 +280,9 @@ def read_perf_data(filepath):  # noqa: PLR0912, PLR0915
                     "duration_us": end_us - start_us,
                     "dispatch_time_us": 0.0,
                     "finish_time_us": 0.0,
+                    "receive_time_us": start_us - local_setup_us,
+                    "local_setup_us": local_setup_us,
+                    # propagation_us requires AICPU dispatch_ts; absent at level 1.
                 }
             )
 
@@ -518,6 +551,8 @@ def print_task_statistics(tasks, func_id_to_name=None):
             "durations": [],
             "head_overheads": [],
             "tail_overheads": [],
+            "propagations": [],  # dispatch_ts → AICore receive_time (NoC + FFTS)
+            "local_setups": [],  # receive_time → start_time (dcci + ack on AICore)
             "latencies": [],
             "total_exec_time": 0.0,
             "total_latency": 0.0,
@@ -548,6 +583,13 @@ def print_task_statistics(tasks, func_id_to_name=None):
             tail_overhead = finish_time - end_time
             func_stats[func_id]["tail_overheads"].append(tail_overhead)
 
+            # Head OH split (v3 schema only — falls back to absent when the
+            # AICore record came from a pre-receive_time build).
+            if "propagation_us" in task:
+                func_stats[func_id]["propagations"].append(task["propagation_us"])
+            if "local_setup_us" in task:
+                func_stats[func_id]["local_setups"].append(task["local_setup_us"])
+
             # Latency: finish_time_us - dispatch_time_us
             latency = finish_time - dispatch_time
             func_stats[func_id]["latencies"].append(latency)
@@ -561,15 +603,17 @@ def print_task_statistics(tasks, func_id_to_name=None):
             max_finish_time = max(max_finish_time, finish_time)
 
     # Print statistics
-    print("\n" + "=" * 110)
+    print("\n" + "=" * 140)
     print("Task Statistics by Function")
     print("  Exec = kernel time on AICore; Latency = dispatch->finish (incl. head OH + Exec + tail OH)")
-    print("=" * 110)
+    print("  Head OH split (v3): Prop = NoC propagation (dispatch_ts→AICore receive); Local = dcci+ack (receive→start)")
+    print("=" * 140)
     print(
         f"{'Func_ID':<8} {'Func_Name':<12} {'Count':>5}   {'Avg Exec(us)':>12}  "
-        f"{'Avg Latency(us)':>15}  {'Exec%':>6}   {'Avg Head OH(us)':>15}  {'Avg Tail OH(us)':>15}"
+        f"{'Avg Latency(us)':>15}  {'Exec%':>6}   {'Avg Head OH(us)':>15}  {'Avg Tail OH(us)':>15}  "
+        f"{'Avg Prop(us)':>12}  {'Avg Local(us)':>13}"
     )
-    print("-" * 110)
+    print("-" * 140)
 
     # Sort by func_id for consistent output
     total_count = 0
@@ -600,17 +644,25 @@ def print_task_statistics(tasks, func_id_to_name=None):
             sum(stats["tail_overheads"]) / len(stats["tail_overheads"]) if stats["tail_overheads"] else 0
         )
         avg_latency = stats["total_latency"] / count if count > 0 else 0
+        # `None` (not NaN) signals "no v3 receive_time data on this func" so
+        # the print line below renders a dash. NaN would force ruff's
+        # PLR0124 self-compare idiom.
+        avg_propagation = sum(stats["propagations"]) / len(stats["propagations"]) if stats["propagations"] else None
+        avg_local_setup = sum(stats["local_setups"]) / len(stats["local_setups"]) if stats["local_setups"] else None
 
         # Calculate execution ratio: total_exec_time / total_latency
         exec_ratio = (stats["total_exec_time"] / stats["total_latency"] * 100) if stats["total_latency"] > 0 else 0
 
+        prop_str = f"{avg_propagation:>12.2f}" if avg_propagation is not None else f"{'-':>12}"
+        local_str = f"{avg_local_setup:>13.2f}" if avg_local_setup is not None else f"{'-':>13}"
         print(
             f"{func_id:<8} {func_name:<12} {count:>5}   {avg_duration:>12.2f}  {avg_latency:>15.2f}  "
-            f"{exec_ratio:>5.1f}%   {avg_head_overhead:>15.2f}  {avg_tail_overhead:>15.2f}"
+            f"{exec_ratio:>5.1f}%   {avg_head_overhead:>15.2f}  {avg_tail_overhead:>15.2f}  "
+            f"{prop_str}  {local_str}"
         )
 
     # Print total row
-    print("-" * 110)
+    print("-" * 140)
 
     # Calculate total latency (sum of all latencies)
     total_latency_sum = sum(stats["total_latency"] for stats in func_stats.values())

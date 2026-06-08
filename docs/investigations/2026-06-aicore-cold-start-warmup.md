@@ -139,10 +139,72 @@ property of the dispatch path that future profiling work should expect:
   the first task of a run should not assume software warmup will fix
   it.
 
+## Follow-up — receive_time DFX field + what propagation/local_setup actually mean
+
+PR #1004 adds an AICore-side `receive_time` capture immediately after
+`read_reg(DATA_MAIN_BASE)` returns the new task_id (before the per-task
+`dcci(payload, ENTIRE_DATA_CACHE) + write_reg(COND, ACK)` pair). With it
+the swimlane reports two new per-task fields:
+
+- `local_setup_us` = start_time − receive_time (AICore-side dcci + ack).
+- `propagation_us` = receive_time − dispatch_ts.
+
+The cleanest reading **only applies to IDLE-phase dispatches** (where
+AICPU writes the new task_id to a core whose RUNNING slot is empty —
+core was actually idle and polling). In that case:
+
+- `propagation_us` ≈ AICPU→AICore SoC delivery + AICore's next poll iter
+  picking up the new value. Hardware-bound at the ns scale per the
+  cold-start measurement above.
+- `local_setup_us` ≈ dcci + ack cost on AICore. Empirically 0–0.02 µs on
+  warm cache, 0.5–1 µs on cold first task.
+
+For **PENDING-phase dispatches** (AICPU pre-loads next task_id while
+RUNNING slot is still busy), `dispatch_ts` is captured at pre-load time,
+which can be tens of µs before the prior task FINs. AICore picks up the
+pending task immediately after prior FIN. So:
+
+- `propagation_us` here is **not** AICPU→AICore delay. It is mostly
+  "remaining exec time of the prior task at the moment of pre-load",
+  i.e. a measurement artifact of dual-buffer scheduling, not a physical
+  delivery delay.
+- `local_setup_us` interpretation still holds (dcci + ack on AICore).
+
+How to know which kind of dispatch a record represents: compare
+`dispatch_ts` against the prior task's `end_time` on the same core
+(both available in the swimlane records). `dispatch_ts ≥ prior.end` →
+IDLE-phase, propagation reflects real NoC delivery. `dispatch_ts <
+prior.end` → PENDING-phase, propagation is a pre-load offset.
+
+Level-3 capture on `vector_example` (5 tasks, all IDLE-dispatched):
+
+| Task | head_OH | propagation | local_setup |
+| ---- | ------: | ----------: | ----------: |
+| Cold first on core 5 | 2.12 µs | 1.20 µs | 0.92 µs |
+| Warm on core 5 | 0.16 µs | 0.16 µs | 0.00 µs |
+| Cold first on core 6 | 1.66 µs | 0.80 µs | 0.86 µs |
+| Warm on core 5 | 0.34 µs | 0.34 µs | 0.00 µs |
+| Warm on core 5 | 0.32 µs | 0.32 µs | 0.00 µs |
+
+Cold tasks pay both halves; warm tasks have local_setup at cycle-zero
+(dcci on already-invalidated cache is free) and propagation dominates.
+**This pattern is specific to the IDLE-phase regime.** Mid-workload
+traces (qwen3 decode_layer) include both IDLE and PENDING dispatches
+interleaved, and aggregating `propagation_us` without separating them
+yields confusing distributions — the "long tail" in such aggregates is
+usually PENDING pre-load offset, not slow NoC.
+
+Future warmup proposals targeting `local_setup_us` can now be evaluated
+directly against captured data. Proposals targeting `propagation_us`
+should first filter to IDLE-dispatched records to avoid attacking a
+measurement artifact.
+
 ## References
 
 - PR #989: dispatch path batched publish (where the eager swimlane head
   resolve lives).
+- PR #1004: AICore receive_time DFX field (the measurement that
+  confirmed the split above).
 - PR #988: `spmd_serial_chain_mix` example used for measurement.
 - Issue #545 comment #2: SPMD dispatch stagger.
 - `.claude/rules/...` DFX priority guidance.

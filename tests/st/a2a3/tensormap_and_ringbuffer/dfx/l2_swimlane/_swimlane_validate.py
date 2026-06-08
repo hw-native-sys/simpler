@@ -31,7 +31,19 @@ from pathlib import Path
 from simpler_setup.scene_test import _outputs_dir, _sanitize_for_filename
 from simpler_setup.tools.swimlane_converter import read_perf_data
 
-_REQUIRED_TASK_FIELDS = ("task_id", "func_id", "core_id", "core_type", "start_time_us", "end_time_us")
+_REQUIRED_TASK_FIELDS = (
+    "task_id",
+    "func_id",
+    "core_id",
+    "core_type",
+    "start_time_us",
+    "end_time_us",
+    # receive_time_us / local_setup_us are populated unconditionally by the
+    # AICore-side capture (v3 schema). propagation_us requires AICPU dispatch_ts
+    # and is therefore only present at level≥2 — not in this required-set.
+    "receive_time_us",
+    "local_setup_us",
+)
 
 
 def validate_perf_artifact(case_label: str, *, expected_task_count: int | None = None) -> None:
