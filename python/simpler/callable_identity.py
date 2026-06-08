@@ -13,7 +13,7 @@ from __future__ import annotations
 import ctypes
 import hashlib
 import struct
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Literal
 
 from .task_interface import ArgDirection, ChipCallable
@@ -22,11 +22,13 @@ CALLABLE_DESCRIPTOR_SCHEMA_VERSION = 1
 CALLABLE_HASH_DIGEST_BYTES = 32
 CALLABLE_KIND_CHIP = 1
 CALLABLE_KIND_PYTHON_SERIALIZED = 2
+CALLABLE_KIND_PYTHON_IMPORT = 3
 TARGET_NAMESPACE_LOCAL_CHIP = "LOCAL_CHIP"
 TARGET_NAMESPACE_LOCAL_PYTHON = "LOCAL_PYTHON"
+TARGET_NAMESPACE_REMOTE_TASK_DISPATCHER = "REMOTE_TASK_DISPATCHER"
 
-CallableKindName = Literal["CHIP_CALLABLE", "PYTHON_SERIALIZED"]
-TargetNamespaceName = Literal["LOCAL_CHIP", "LOCAL_PYTHON"]
+CallableKindName = Literal["CHIP_CALLABLE", "PYTHON_SERIALIZED", "PYTHON_IMPORT"]
+TargetNamespaceName = Literal["LOCAL_CHIP", "LOCAL_PYTHON", "REMOTE_TASK_DISPATCHER"]
 
 __all__ = [
     "CALLABLE_HASH_DIGEST_BYTES",
@@ -35,9 +37,11 @@ __all__ = [
     "TargetNamespaceName",
     "build_chip_callable_descriptor",
     "build_chip_signature_schema",
+    "build_python_import_descriptor",
     "build_python_serialized_descriptor",
     "compute_callable_hashid",
     "hashid_to_digest",
+    "parse_python_import_target",
     "parse_python_callable_payload",
     "validate_hashid",
 ]
@@ -63,6 +67,14 @@ def _pack_string(value: str) -> bytes:
 
 def _pack_bytes(value: bytes) -> bytes:
     return _pack_u32(len(value)) + value
+
+
+def _validate_dotted_ident(value: str, *, field_name: str) -> None:
+    parts = value.split(".")
+    if any(not part for part in parts):
+        raise ValueError(f"{field_name} must contain non-empty dot-separated identifiers")
+    if any(not part.isidentifier() for part in parts):
+        raise ValueError(f"{field_name} contains a non-identifier component: {value!r}")
 
 
 def _sha256_digest(data: bytes) -> bytes:
@@ -144,6 +156,34 @@ def build_python_serialized_descriptor(payload: bytes) -> bytes:
     return bytes(data)
 
 
+def parse_python_import_target(target: str) -> tuple[str, str]:
+    if not isinstance(target, str):
+        raise TypeError("RemoteCallable target must be a string")
+    normalized = target.strip(" \t\r\n")
+    if normalized.count(":") != 1:
+        raise ValueError("RemoteCallable target must have exactly one ':' separator")
+    module, qualname = normalized.split(":", 1)
+    if not module or not qualname:
+        raise ValueError("RemoteCallable module and qualname must be non-empty")
+    if module.startswith("."):
+        raise ValueError("RemoteCallable module must be absolute")
+    if "<locals>" in qualname.split("."):
+        raise ValueError("RemoteCallable qualname must not contain <locals>")
+    _validate_dotted_ident(module, field_name="RemoteCallable module")
+    _validate_dotted_ident(qualname, field_name="RemoteCallable qualname")
+    return module, qualname
+
+
+def build_python_import_descriptor(module: str, qualname: str) -> bytes:
+    parse_python_import_target(f"{module}:{qualname}")
+    data = bytearray()
+    data += _pack_u32(CALLABLE_DESCRIPTOR_SCHEMA_VERSION)
+    data += _pack_u32(CALLABLE_KIND_PYTHON_IMPORT)
+    data += _pack_string(module)
+    data += _pack_string(qualname)
+    return bytes(data)
+
+
 def compute_callable_hashid(descriptor: bytes) -> str:
     return _sha256_hashid(descriptor)
 
@@ -205,9 +245,13 @@ class CallableHandle:
         return handle
 
     def _validate_public_fields(self) -> None:
-        if self.kind not in ("CHIP_CALLABLE", "PYTHON_SERIALIZED"):
+        if self.kind not in ("CHIP_CALLABLE", "PYTHON_SERIALIZED", "PYTHON_IMPORT"):
             raise ValueError(f"CALLABLE_KIND_UNSUPPORTED: {self.kind}")
-        if self.target_namespace not in (TARGET_NAMESPACE_LOCAL_CHIP, TARGET_NAMESPACE_LOCAL_PYTHON):
+        if self.target_namespace not in (
+            TARGET_NAMESPACE_LOCAL_CHIP,
+            TARGET_NAMESPACE_LOCAL_PYTHON,
+            TARGET_NAMESPACE_REMOTE_TASK_DISPATCHER,
+        ):
             raise ValueError(f"unsupported callable target namespace: {self.target_namespace}")
 
     @property
@@ -227,3 +271,4 @@ class _CallableIdentityState:
     target: Any
     ref_count: int = 0
     state: str = "INSTALLED"
+    eligible_endpoint_ids: tuple[int, ...] = field(default_factory=tuple)

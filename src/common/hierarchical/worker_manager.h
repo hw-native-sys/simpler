@@ -41,6 +41,7 @@
 #include <vector>
 
 #include "../task_interface/call_config.h"
+#include "remote_wire.h"
 #include "types.h"
 
 class Ring;  // forward decl — owns the slot state pool
@@ -161,6 +162,131 @@ struct ControlResult {
     std::string error_message;
 };
 
+struct WorkerDispatch;
+
+enum class WorkerEndpointKind : int32_t {
+    LOCAL_MAILBOX = 0,
+    REMOTE_L3 = 1,
+};
+
+struct WorkerEndpointCaps {
+    WorkerEndpointKind kind{WorkerEndpointKind::LOCAL_MAILBOX};
+    int32_t endpoint_id{-1};
+    bool remote{false};
+    bool supports_task_dispatch{true};
+    bool supports_control{true};
+    std::string transport{"local-mailbox"};
+};
+
+class WorkerEndpoint {
+public:
+    virtual ~WorkerEndpoint() = default;
+
+    virtual const WorkerEndpointCaps &caps() const = 0;
+    virtual WorkerCompletion run(Ring *ring, const WorkerDispatch &dispatch) = 0;
+
+    virtual void shutdown_child() {}
+    virtual uint64_t control_malloc(size_t size);
+    virtual void control_free(uint64_t ptr);
+    virtual void control_copy_to(uint64_t dst, uint64_t src, size_t size);
+    virtual void control_copy_from(uint64_t dst, uint64_t src, size_t size);
+    virtual void control_prepare(const uint8_t *digest);
+    virtual void control_register(const char *shm_name, size_t blob_size, const uint8_t *digest);
+    virtual void control_unregister(const uint8_t *digest);
+    virtual void control_remote_prepare_register(
+        remote_l3::RemoteRegistryTarget target_registry, CallableKind callable_kind, const uint8_t *digest,
+        const void *payload, size_t payload_size
+    );
+    virtual void control_remote_commit_register(
+        remote_l3::RemoteRegistryTarget target_registry, CallableKind callable_kind, const uint8_t *digest
+    );
+    virtual void control_remote_abort_register(
+        remote_l3::RemoteRegistryTarget target_registry, CallableKind callable_kind, const uint8_t *digest
+    );
+    virtual void control_remote_unregister(
+        remote_l3::RemoteRegistryTarget target_registry, CallableKind callable_kind, const uint8_t *digest
+    );
+    virtual RemoteBufferHandle control_remote_malloc(size_t size);
+    virtual void control_remote_free(const RemoteBufferHandle &handle);
+    virtual void
+    control_remote_copy_to(const RemoteBufferHandle &handle, uint64_t offset, const void *src, size_t size);
+    virtual void control_remote_copy_from(void *dst, const RemoteBufferHandle &handle, uint64_t offset, size_t size);
+    virtual RemoteBufferExport control_remote_export(
+        const RemoteBufferHandle &handle, uint64_t offset, uint64_t size, uint32_t access_flags,
+        const std::string &transport_profile
+    );
+    virtual RemoteBufferHandle control_remote_import(
+        int32_t importer_endpoint_id, const RemoteBufferExport &export_desc, uint32_t requested_access_flags
+    );
+    virtual void control_remote_release_import(const RemoteBufferHandle &handle);
+    virtual void control_generic(
+        uint64_t sub_cmd, const char *shm_name, size_t payload_size, double timeout_s, const uint8_t *digest
+    );
+    virtual void control_alloc_domain(const char *request_shm_name, const char *reply_shm_name);
+    virtual void control_release_domain(const char *request_shm_name);
+    virtual void control_comm_init(const char *request_shm_name);
+};
+
+class LocalMailboxEndpoint : public WorkerEndpoint {
+public:
+    LocalMailboxEndpoint(int32_t endpoint_id, void *mailbox);
+
+    const WorkerEndpointCaps &caps() const override { return caps_; }
+    WorkerCompletion run(Ring *ring, const WorkerDispatch &dispatch) override;
+
+    void shutdown_child() override;
+    uint64_t control_malloc(size_t size) override;
+    void control_free(uint64_t ptr) override;
+    void control_copy_to(uint64_t dst, uint64_t src, size_t size) override;
+    void control_copy_from(uint64_t dst, uint64_t src, size_t size) override;
+    void control_prepare(const uint8_t *digest) override;
+    void control_register(const char *shm_name, size_t blob_size, const uint8_t *digest) override;
+    void control_unregister(const uint8_t *digest) override;
+    void control_remote_prepare_register(
+        remote_l3::RemoteRegistryTarget target_registry, CallableKind callable_kind, const uint8_t *digest,
+        const void *payload, size_t payload_size
+    ) override;
+    void control_remote_commit_register(
+        remote_l3::RemoteRegistryTarget target_registry, CallableKind callable_kind, const uint8_t *digest
+    ) override;
+    void control_remote_abort_register(
+        remote_l3::RemoteRegistryTarget target_registry, CallableKind callable_kind, const uint8_t *digest
+    ) override;
+    void control_remote_unregister(
+        remote_l3::RemoteRegistryTarget target_registry, CallableKind callable_kind, const uint8_t *digest
+    ) override;
+    RemoteBufferHandle control_remote_malloc(size_t size) override;
+    void control_remote_free(const RemoteBufferHandle &handle) override;
+    void
+    control_remote_copy_to(const RemoteBufferHandle &handle, uint64_t offset, const void *src, size_t size) override;
+    void control_remote_copy_from(void *dst, const RemoteBufferHandle &handle, uint64_t offset, size_t size) override;
+    RemoteBufferExport control_remote_export(
+        const RemoteBufferHandle &handle, uint64_t offset, uint64_t size, uint32_t access_flags,
+        const std::string &transport_profile
+    ) override;
+    RemoteBufferHandle control_remote_import(
+        int32_t importer_endpoint_id, const RemoteBufferExport &export_desc, uint32_t requested_access_flags
+    ) override;
+    void control_remote_release_import(const RemoteBufferHandle &handle) override;
+    void control_generic(
+        uint64_t sub_cmd, const char *shm_name, size_t payload_size, double timeout_s, const uint8_t *digest
+    ) override;
+    void control_alloc_domain(const char *request_shm_name, const char *reply_shm_name) override;
+    void control_release_domain(const char *request_shm_name) override;
+    void control_comm_init(const char *request_shm_name) override;
+
+private:
+    WorkerEndpointCaps caps_;
+    void *mailbox_{nullptr};
+    std::mutex mailbox_mu_;
+    bool mailbox_control_timed_out_{false};
+
+    char *mbox() const { return static_cast<char *>(mailbox_); }
+    MailboxState read_mailbox_state() const;
+    void write_mailbox_state(MailboxState s);
+    void run_control_command(const char *op_name, double timeout_s = -1.0);
+};
+
 // =============================================================================
 // WorkerDispatch — per-dispatch handle handed to a WorkerThread.
 // =============================================================================
@@ -195,16 +321,22 @@ public:
     // `ring` is a borrowed pointer to the engine's slot-state pool —
     // the thread reads callable/args/config from
     // `ring->slot_state(task_slot)` on each dispatch.
-    // on_complete(slot) is called (in the WorkerThread) after each run().
+    // on_complete(completion) is called (in the WorkerThread) after each
+    // endpoint run().
     // `manager` is a borrowed pointer used to report dispatch failures
     // (exception_ptr routed out of the worker thread to the orch thread).
-    void start(Ring *ring, WorkerManager *manager, const std::function<void(TaskSlot)> &on_complete, void *mailbox);
+    void start(
+        Ring *ring, WorkerManager *manager, const std::function<void(WorkerCompletion)> &on_complete,
+        std::unique_ptr<WorkerEndpoint> endpoint
+    );
 
     // Enqueue a dispatch for the worker. Non-blocking.
     void dispatch(WorkerDispatch d);
 
     // True if the worker has no active task.
     bool idle() const { return idle_.load(std::memory_order_acquire); }
+    const WorkerEndpointCaps &caps() const;
+    int32_t endpoint_id() const;
 
     void stop();
 
@@ -237,7 +369,34 @@ public:
     // TASK_DONE before claiming the mailbox.
     void control_register(const char *shm_name, size_t blob_size, const uint8_t *digest);
     void control_unregister(const uint8_t *digest);
-    void control_generic(uint64_t sub_cmd, const char *shm_name, double timeout_s, const uint8_t *digest);
+    void control_remote_prepare_register(
+        remote_l3::RemoteRegistryTarget target_registry, CallableKind callable_kind, const uint8_t *digest,
+        const void *payload, size_t payload_size
+    );
+    void control_remote_commit_register(
+        remote_l3::RemoteRegistryTarget target_registry, CallableKind callable_kind, const uint8_t *digest
+    );
+    void control_remote_abort_register(
+        remote_l3::RemoteRegistryTarget target_registry, CallableKind callable_kind, const uint8_t *digest
+    );
+    void control_remote_unregister(
+        remote_l3::RemoteRegistryTarget target_registry, CallableKind callable_kind, const uint8_t *digest
+    );
+    RemoteBufferHandle control_remote_malloc(size_t size);
+    void control_remote_free(const RemoteBufferHandle &handle);
+    void control_remote_copy_to(const RemoteBufferHandle &handle, uint64_t offset, const void *src, size_t size);
+    void control_remote_copy_from(void *dst, const RemoteBufferHandle &handle, uint64_t offset, size_t size);
+    RemoteBufferExport control_remote_export(
+        const RemoteBufferHandle &handle, uint64_t offset, uint64_t size, uint32_t access_flags,
+        const std::string &transport_profile
+    );
+    RemoteBufferHandle control_remote_import(
+        int32_t importer_endpoint_id, const RemoteBufferExport &export_desc, uint32_t requested_access_flags
+    );
+    void control_remote_release_import(const RemoteBufferHandle &handle);
+    void control_generic(
+        uint64_t sub_cmd, const char *shm_name, size_t payload_size, double timeout_s, const uint8_t *digest
+    );
 
     // Dynamic CommDomain allocate / release.  `request_shm_name` carries the
     // request payload (header + rank_ids + buffer_nbytes); for alloc the child
@@ -255,8 +414,8 @@ public:
 private:
     Ring *ring_{nullptr};
     WorkerManager *manager_{nullptr};
-    void *mailbox_{nullptr};
-    std::function<void(TaskSlot)> on_complete_;
+    std::unique_ptr<WorkerEndpoint> endpoint_;
+    std::function<void(WorkerCompletion)> on_complete_;
 
     std::thread thread_;
     std::queue<WorkerDispatch> queue_;
@@ -265,23 +424,8 @@ private:
     bool shutdown_{false};
     std::atomic<bool> idle_{true};
 
-    // Serializes parent-side mailbox access between this WorkerThread's
-    // dispatch loop and the orch-thread control_* path. Per-WorkerThread,
-    // so different workers can dispatch in parallel.
-    std::mutex mailbox_mu_;
-    bool mailbox_control_timed_out_{false};
-
     void loop();
-    void dispatch_process(TaskSlotState &s, int32_t group_index);
-
-    // Common tail for the four control_* methods. Caller writes the args
-    // region and holds `mailbox_mu_`; this helper signals the child,
-    // spin-polls CONTROL_DONE, and throws on a non-zero child error code.
-    void run_control_command(const char *op_name, double timeout_s = -1.0);
-
-    char *mbox() const { return static_cast<char *>(mailbox_); }
-    MailboxState read_mailbox_state() const;
-    void write_mailbox_state(MailboxState s);
+    WorkerCompletion dispatch_process(WorkerDispatch d);
 };
 
 // =============================================================================
@@ -290,12 +434,13 @@ private:
 
 class WorkerManager {
 public:
-    using OnCompleteFn = std::function<void(TaskSlot)>;
+    using OnCompleteFn = std::function<void(WorkerCompletion)>;
 
     // Register a worker. `mailbox` is a MAILBOX_SIZE-byte MAP_SHARED
     // region; the real worker (a `ChipWorker` for NEXT_LEVEL, a Python
     // callable for SUB) lives in the forked child.
     void add_next_level(void *mailbox);
+    void add_next_level_endpoint(std::unique_ptr<WorkerEndpoint> endpoint);
     void add_sub(void *mailbox);
 
     void start(Ring *ring, const OnCompleteFn &on_complete);
@@ -306,9 +451,13 @@ public:
 
     // Direct index into the worker pool by logical id (0-based).
     WorkerThread *get_worker(WorkerType type, int logical_id) const;
+    WorkerThread *get_worker_by_endpoint_id(WorkerType type, int32_t endpoint_id) const;
 
     // Pick one idle worker NOT in `exclude`. Returns nullptr if none available.
     WorkerThread *pick_idle_excluding(WorkerType type, const std::vector<WorkerThread *> &exclude) const;
+    WorkerThread *pick_idle_excluding_eligible(
+        WorkerType type, const std::vector<WorkerThread *> &exclude, const std::vector<int32_t> &eligible_endpoint_ids
+    ) const;
 
     bool any_busy() const;
 
@@ -326,6 +475,34 @@ public:
     void control_comm_init(int worker_id, const char *request_shm_name);
     ControlResult
     control_digest_only(WorkerType type, int worker_id, uint64_t sub_cmd, const uint8_t *digest, double timeout_s);
+    ControlResult control_remote_prepare_register(
+        int endpoint_id, remote_l3::RemoteRegistryTarget target_registry, CallableKind callable_kind,
+        const void *payload, size_t payload_size, const uint8_t *digest
+    );
+    ControlResult control_remote_commit_register(
+        int endpoint_id, remote_l3::RemoteRegistryTarget target_registry, CallableKind callable_kind,
+        const uint8_t *digest
+    );
+    ControlResult control_remote_abort_register(
+        int endpoint_id, remote_l3::RemoteRegistryTarget target_registry, CallableKind callable_kind,
+        const uint8_t *digest
+    );
+    ControlResult control_remote_unregister(
+        int endpoint_id, remote_l3::RemoteRegistryTarget target_registry, CallableKind callable_kind,
+        const uint8_t *digest
+    );
+    RemoteBufferHandle control_remote_malloc(int endpoint_id, size_t size);
+    void control_remote_free(const RemoteBufferHandle &handle);
+    void control_remote_copy_to(const RemoteBufferHandle &handle, uint64_t offset, const void *src, size_t size);
+    void control_remote_copy_from(void *dst, const RemoteBufferHandle &handle, uint64_t offset, size_t size);
+    RemoteBufferExport control_remote_export(
+        const RemoteBufferHandle &handle, uint64_t offset, uint64_t size, uint32_t access_flags,
+        const std::string &transport_profile
+    );
+    RemoteBufferHandle control_remote_import(
+        int32_t importer_endpoint_id, const RemoteBufferExport &export_desc, uint32_t requested_access_flags
+    );
+    void control_remote_release_import(const RemoteBufferHandle &handle);
 
     // Broadcast CTRL_REGISTER for `digest` to every NEXT_LEVEL worker in
     // parallel. Stages `blob_size` bytes from `blob_ptr` into a per-call
@@ -358,6 +535,7 @@ public:
 private:
     std::vector<void *> next_level_entries_;
     std::vector<void *> sub_entries_;
+    std::vector<std::unique_ptr<WorkerEndpoint>> next_level_endpoint_entries_;
 
     std::vector<std::unique_ptr<WorkerThread>> next_level_threads_;
     std::vector<std::unique_ptr<WorkerThread>> sub_threads_;

@@ -27,8 +27,8 @@
  *     drain ready_queue → manager.pick_n_idle → dispatch
  *
  *   WorkerThread (managed by WorkerManager):
- *     loop: task_queue.pop() → worker.run(payload) →
- *           completion callback → Scheduler.worker_done(slot)
+ *     loop: task_queue.pop() → endpoint.run(dispatch) →
+ *           completion callback → Scheduler.worker_done(completion)
  */
 
 #pragma once
@@ -38,6 +38,7 @@
 #include <functional>
 #include <mutex>
 #include <queue>
+#include <string>
 #include <thread>
 
 #include "types.h"
@@ -68,8 +69,9 @@ public:
 
     bool running() const { return running_.load(std::memory_order_acquire); }
 
-    // Called by WorkerManager (from WorkerThread) after run() completes.
-    void worker_done(TaskSlot slot);
+    // Called by WorkerManager (from WorkerThread) after endpoint run() reaches
+    // a terminal outcome.
+    void worker_done(WorkerCompletion completion);
 
     // Mutex held by run() across each loop iteration's slot-touching body
     // (completion processing + dispatch). Orchestrator::drain() acquires it
@@ -82,7 +84,7 @@ private:
     std::mutex loop_mu_;
 
     // Shared completion queue (WorkerThread → Scheduler)
-    std::queue<TaskSlot> completion_queue_;
+    std::queue<WorkerCompletion> completion_queue_;
     std::mutex completion_mu_;
     std::condition_variable completion_cv_;
 
@@ -91,7 +93,8 @@ private:
     std::atomic<bool> running_{false};
 
     void run();
-    void on_task_complete(TaskSlot slot);
+    void on_task_complete(const WorkerCompletion &completion);
+    void poison_task(TaskSlot slot, const std::string &root_message);
     void try_consume(TaskSlot slot);
     void dispatch_ready();
 };

@@ -33,10 +33,16 @@ public:
     // --- Internal submit API (tags inside TaskArgs drive deps) ---
     SubmitResult submit_next_level(const CallableIdentity &callable,
                                     const TaskArgs &args,
-                                    const CallConfig &config);
+                                    const CallConfig &config,
+                                    int8_t worker = -1,
+                                    const std::vector<int32_t> &eligible_endpoint_ids = {},
+                                    const RemoteTaskArgsSidecar &remote_sidecar = {});
     SubmitResult submit_next_level_group(const CallableIdentity &callable,
                                           const std::vector<TaskArgs> &args_list,
-                                          const CallConfig &config);
+                                          const CallConfig &config,
+                                          const std::vector<int8_t> &workers = {},
+                                          const std::vector<std::vector<int32_t>> &eligible_endpoint_ids = {},
+                                          const std::vector<RemoteTaskArgsSidecar> &remote_sidecars = {});
     SubmitResult submit_sub(const CallableIdentity &callable,
                             const TaskArgs &args);
     SubmitResult submit_sub_group(const CallableIdentity &callable,
@@ -64,6 +70,13 @@ struct SubmitResult { TaskSlot task_slot; };  // internal only; not bound to Pyt
 `scope_begin` / `scope_end` / `drain` are invoked from Python `Worker.run` via
 `_scope_begin` / `_scope_end` / `_drain` bindings. They are not part of the
 user-facing orch-fn API.
+
+Remote L3 submit adds two hidden pieces of metadata: final eligible endpoint
+sets and optional `RemoteTaskArgsSidecar` entries aligned by tensor index.
+Python `RemoteCallable` handles supply callable eligibility, and
+`RemoteTaskArgs` supplies tensor sidecars. The Orchestrator validates affinity,
+endpoint existence, local-vs-remote compatibility, bare host pointers, and
+remote null OUTPUT tensors before committing the slot.
 
 ---
 
@@ -94,15 +107,15 @@ SubmitResult Orchestrator::submit_next_level(const CallableIdentity &callable,
     std::unordered_set<TaskSlot> producers_seen;
     for (int i = 0; i < s.task_args.tensor_count(); i++) {
         TensorArgType tag = s.task_args.tag(i);
-        uint64_t ptr      = s.task_args.tensor(i).data;
+        TensorKey key     = key_for_tensor_or_remote_sidecar(i);
 
         if (tag == INPUT || tag == INOUT) {
-            if (TaskSlot prod = tensormap_.lookup(ptr); prod != INVALID)
+            if (TaskSlot prod = tensormap_.lookup(key); prod != INVALID)
                 if (producers_seen.insert(prod).second)
                     producers.push_back(prod);
         }
         if (tag == OUTPUT || tag == INOUT || tag == OUTPUT_EXISTING) {
-            tensormap_.insert(ptr, sid);
+            tensormap_.insert(key, sid);
         }
         // NO_DEP: skip both
     }
@@ -136,6 +149,9 @@ small POD copied by value. `callable` is a `uint64_t` opaque handle (see
 **Step 3 — tag walk**: The only place tags are consumed. After this step tags
 are never inspected again; they are not carried into the slot's stored
 `task_args` value during dispatch (see [task-flow.md](task-flow.md) §3).
+Local tensors key TensorMap by `(LOCAL_HOST, ptr)` or
+`(LOCAL_CHILD, worker, ptr)`. Remote tensors with sidecars key by
+`(address_kind, owner_endpoint_id, buffer_id, generation, offset)`.
 
 | Tag | `tensormap.lookup` | `tensormap.insert` |
 | --- | ------------------ | ------------------ |
@@ -147,7 +163,9 @@ are never inspected again; they are not carried into the slot's stored
 
 `OUTPUT_EXISTING` differs from `OUTPUT` in runtime semantics (user-provided
 buffer vs. runtime-allocated) but dependency tracking is identical: both
-register this task as the new producer of `tensor.data`.
+register this task as the new producer of the tensor's dependency key. For
+local tensors this key contains `tensor.data`; for remote sidecars it contains
+remote buffer identity and logical offset.
 
 **Step 4 — fanin count**: The number of live producers. Decremented by
 `fanin_released++` each time a producer completes; when `fanin_released ==
@@ -498,45 +516,46 @@ concurrent hash map can replace it.
 Each `TaskSlotState.state` progresses through:
 
 ```text
-FREE ──► PENDING ──► COMPLETED ──► CONSUMED ──► FREE
- ↑         │            │             │
- │       submit      worker(s)     all refs
- │                   done          released
- │                                 (scope + fanout)
- │                                     │
- └──────── ring.release(sid) ◄─────────┘
+FREE ──► PENDING ──► READY ──► RUNNING ──► COMPLETED ──► CONSUMED ──► FREE
+                             │               │
+                             └──────────────► FAILED ─────► CONSUMED ──► FREE
 ```
 
 - **FREE**: slot in the ring pool, not allocated
-- **PENDING**: allocated; remains PENDING through "waiting on producers",
-  "queued in ready_queue", and "dispatched to a worker"
+- **PENDING**: allocated; waiting on live fanin producers
+- **READY**: all fanins satisfied; queued for Scheduler dispatch
+- **RUNNING**: dispatched to one or more endpoints
 - **COMPLETED**: worker(s) done; may still be referenced by fanout / scope
+- **FAILED**: a worker/endpoint failed, or a failed producer poisoned this
+  slot. Failed slots are never dispatched if they were not already running.
 - **CONSUMED**: all references released; Scheduler calls `ring.release(sid)`
   and the slot returns to FREE
 
-There is no separate READY or RUNNING state — readiness is derived from
-`fanin_refcount == fanin_count` and running-vs-idle from the per-core
-`running_slot_state` pointer. State transitions are driven by atomic
-operations:
+State transitions are driven by atomic operations:
 
 - Orch: FREE → PENDING at submit time
-- Scheduler: PENDING → COMPLETED → CONSUMED during completion
+- Scheduler: PENDING → READY → RUNNING during dispatch
+- Scheduler: RUNNING → COMPLETED or RUNNING/PENDING/READY → FAILED during
+  completion / dependency poisoning
+- Scheduler/Orch cleanup: COMPLETED/FAILED → CONSUMED
 
 ### Fanout-release threshold
 
-Both paths that can trigger COMPLETED → CONSUMED (the scheduler's
+Both paths that can trigger COMPLETED/FAILED → CONSUMED (the scheduler's
 `try_consume` and the scope-end `release_ref`) use the same threshold:
 
 ```cpp
-if (fanout_released >= fanout_total + 1 && state == COMPLETED) on_consumed(slot);
+if (fanout_released >= fanout_total + 1 &&
+    (state == COMPLETED || state == FAILED))
+    on_consumed(slot);
 ```
 
 The `+1` accounts for the slot's own self-release contribution, which normal
 tasks emit from `on_task_complete` (`try_consume(slot)` self-call). Alloc
 slots (§8b) bypass the scheduler and pre-bump `fanout_released` to `1` at
 `alloc()` time to stand in for the self-release. Both paths use `on_consumed`,
-which uses a CAS on `state` from `COMPLETED` to `CONSUMED` to remain idempotent
-when both fire concurrently at threshold.
+which CASes `state` from `COMPLETED` or `FAILED` to `CONSUMED` to remain
+idempotent when both fire concurrently at threshold.
 
 ---
 
@@ -587,7 +606,9 @@ per-slab free syscall.
 `infer_deps` treats `COMPLETED` producers specially: it still wires the
 fanout edge (so the producer waits for the consumer before being consumed and
 freeing its buffer) but does not bump `live_fanins` (the consumer is
-immediately ready because the producer is already done).
+immediately ready because the producer is already done). A producer that is
+already `FAILED` is not a successful fanin; downstream consumers are poisoned
+by the Scheduler rather than dispatched.
 
 ```cpp
 if (ps_state == TaskState::CONSUMED) continue;  // already gone
