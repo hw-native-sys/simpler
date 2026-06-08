@@ -13,7 +13,7 @@ from __future__ import annotations
 import ctypes
 import hashlib
 import struct
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Literal
 
 from .task_interface import ArgDirection, ChipCallable
@@ -271,3 +271,4 @@ class _CallableIdentityState:
     target: Any
     ref_count: int = 0
     state: str = "INSTALLED"
+    eligible_endpoint_ids: tuple[int, ...] = field(default_factory=tuple)
