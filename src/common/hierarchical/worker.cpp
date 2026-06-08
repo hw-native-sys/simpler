@@ -78,8 +78,8 @@ void Worker::init() {
 
     // Start WorkerManager first — creates WorkerThreads.
     // The on_complete callback routes through the Scheduler's worker_done().
-    manager_.start(&allocator_, [this](TaskSlot slot) {
-        scheduler_.worker_done(slot);
+    manager_.start(&allocator_, [this](WorkerCompletion completion) {
+        scheduler_.worker_done(completion);
     });
 
     Scheduler::Config cfg;

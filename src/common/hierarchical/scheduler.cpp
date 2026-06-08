@@ -12,10 +12,24 @@
 #include "scheduler.h"
 
 #include <stdexcept>
+#include <utility>
 
 #include "ring.h"
 #include "types.h"
 #include "worker_manager.h"
+
+namespace {
+
+bool is_failure(EndpointOutcome outcome) {
+    return outcome == EndpointOutcome::TASK_FAILURE || outcome == EndpointOutcome::ENDPOINT_FAILURE;
+}
+
+bool is_terminal_group_state(GroupMemberState state) {
+    return state == GroupMemberState::SUCCESS || state == GroupMemberState::FAILED ||
+           state == GroupMemberState::SKIPPED;
+}
+
+}  // namespace
 
 // =============================================================================
 // Scheduler
@@ -52,18 +66,86 @@ void Scheduler::stop() {
 // WorkerThread completion callback (called from WorkerThread via Manager)
 // =============================================================================
 
-void Scheduler::worker_done(TaskSlot slot) {
-    TaskSlotState &s = *cfg_.ring->slot_state(slot);
+void Scheduler::worker_done(WorkerCompletion completion) {
+    TaskSlotState &s = *cfg_.ring->slot_state(completion.task_slot);
 
     // Group aggregation: only push to completion queue when ALL workers done
     if (s.is_group()) {
-        int32_t done = s.sub_complete_count.fetch_add(1, std::memory_order_acq_rel) + 1;
-        if (done < s.group_size()) return;
+        WorkerCompletion terminal = completion;
+        bool group_terminal = false;
+        {
+            std::lock_guard<std::mutex> lk(s.group_mu);
+            const int32_t group_size = s.group_size();
+            if (s.group_member_states.size() != static_cast<size_t>(group_size)) {
+                s.group_member_states.assign(static_cast<size_t>(group_size), GroupMemberState::NOT_DISPATCHED);
+                s.group_member_outcomes.assign(static_cast<size_t>(group_size), EndpointOutcome::SKIPPED);
+            }
+            if (completion.group_index < 0 || completion.group_index >= group_size) {
+                terminal.outcome = EndpointOutcome::ENDPOINT_FAILURE;
+                terminal.error_message = "Scheduler::worker_done: group_index " +
+                                         std::to_string(completion.group_index) + " out of range for group_size " +
+                                         std::to_string(group_size);
+            }
+
+            int32_t index = terminal.group_index;
+            if (index >= 0 && index < group_size) {
+                GroupMemberState &member_state = s.group_member_states[static_cast<size_t>(index)];
+                if (is_terminal_group_state(member_state)) return;
+
+                if (terminal.outcome == EndpointOutcome::SUCCESS) {
+                    member_state = GroupMemberState::SUCCESS;
+                } else {
+                    member_state = GroupMemberState::FAILED;
+                    if (!s.group_failed) {
+                        s.group_first_failure_index = index;
+                        s.group_first_failure_message = terminal.error_message;
+                    }
+                    s.group_failed = true;
+                }
+                s.group_member_outcomes[static_cast<size_t>(index)] = terminal.outcome;
+                s.group_terminal_count.fetch_add(1, std::memory_order_acq_rel);
+            } else {
+                if (!s.group_failed) {
+                    s.group_first_failure_index = -1;
+                    s.group_first_failure_message = terminal.error_message;
+                }
+                s.group_failed = true;
+            }
+
+            if (s.group_failed) {
+                for (int32_t i = 0; i < group_size; ++i) {
+                    GroupMemberState &member_state = s.group_member_states[static_cast<size_t>(i)];
+                    if (member_state != GroupMemberState::NOT_DISPATCHED) continue;
+                    member_state = GroupMemberState::SKIPPED;
+                    s.group_member_outcomes[static_cast<size_t>(i)] = EndpointOutcome::SKIPPED;
+                    s.group_terminal_count.fetch_add(1, std::memory_order_acq_rel);
+                }
+            }
+
+            if (s.group_terminal_count.load(std::memory_order_acquire) < group_size) return;
+
+            group_terminal = true;
+            if (s.group_failed) {
+                int32_t failure_index = s.group_first_failure_index;
+                terminal.group_index = failure_index;
+                terminal.outcome = EndpointOutcome::TASK_FAILURE;
+                if (failure_index >= 0 && failure_index < group_size) {
+                    EndpointOutcome member_outcome = s.group_member_outcomes[static_cast<size_t>(failure_index)];
+                    if (is_failure(member_outcome)) terminal.outcome = member_outcome;
+                }
+                terminal.error_message = s.group_first_failure_message;
+            } else {
+                terminal.outcome = EndpointOutcome::SUCCESS;
+                terminal.error_message.clear();
+            }
+        }
+        if (!group_terminal) return;
+        completion = std::move(terminal);
     }
 
     {
         std::lock_guard<std::mutex> lk(completion_mu_);
-        completion_queue_.push(slot);
+        completion_queue_.push(std::move(completion));
     }
     completion_cv_.notify_one();
 }
@@ -89,14 +171,14 @@ void Scheduler::run() {
 
         // Phase 1: drain completions
         while (true) {
-            TaskSlot slot;
+            WorkerCompletion completion;
             {
                 std::lock_guard<std::mutex> lk(completion_mu_);
                 if (completion_queue_.empty()) break;
-                slot = completion_queue_.front();
+                completion = std::move(completion_queue_.front());
                 completion_queue_.pop();
             }
-            on_task_complete(slot);
+            on_task_complete(completion);
         }
 
         // Phase 2: dispatch ready tasks
@@ -107,14 +189,14 @@ void Scheduler::run() {
             if (!cfg_.manager->any_busy()) {
                 // Final drain
                 while (true) {
-                    TaskSlot slot;
+                    WorkerCompletion completion;
                     {
                         std::lock_guard<std::mutex> lk(completion_mu_);
                         if (completion_queue_.empty()) break;
-                        slot = completion_queue_.front();
+                        completion = std::move(completion_queue_.front());
                         completion_queue_.pop();
                     }
-                    on_task_complete(slot);
+                    on_task_complete(completion);
                 }
                 dispatch_ready();
                 break;  // loop_lk released on scope exit before exiting run()
@@ -127,9 +209,16 @@ void Scheduler::run() {
 // on_task_complete / try_consume
 // =============================================================================
 
-void Scheduler::on_task_complete(TaskSlot slot) {
+void Scheduler::on_task_complete(const WorkerCompletion &completion) {
+    TaskSlot slot = completion.task_slot;
     TaskSlotState &s = *cfg_.ring->slot_state(slot);
-    s.state.store(TaskState::COMPLETED, std::memory_order_release);
+    bool failed = is_failure(completion.outcome);
+    if (failed) {
+        s.failure_message = completion.error_message;
+        s.state.store(TaskState::FAILED, std::memory_order_release);
+    } else {
+        s.state.store(TaskState::COMPLETED, std::memory_order_release);
+    }
 
     // Release fanin on downstream consumers
     std::vector<TaskSlot> consumers;
@@ -138,6 +227,10 @@ void Scheduler::on_task_complete(TaskSlot slot) {
         consumers = s.fanout_consumers;
     }
     for (TaskSlot consumer : consumers) {
+        if (failed) {
+            poison_task(consumer, completion.error_message);
+            continue;
+        }
         TaskSlotState &cs = *cfg_.ring->slot_state(consumer);
         int32_t released = cs.fanin_released.fetch_add(1, std::memory_order_acq_rel) + 1;
         if (released >= cs.fanin_count) {
@@ -166,6 +259,57 @@ void Scheduler::on_task_complete(TaskSlot slot) {
     }
 }
 
+void Scheduler::poison_task(TaskSlot slot, const std::string &root_message) {
+    TaskSlotState &s = *cfg_.ring->slot_state(slot);
+    TaskState state = s.state.load(std::memory_order_acquire);
+    if (state == TaskState::FAILED || state == TaskState::CONSUMED || state == TaskState::FREE) return;
+    if (state == TaskState::RUNNING || state == TaskState::COMPLETED) return;
+
+    s.failure_message = root_message;
+    s.state.store(TaskState::FAILED, std::memory_order_release);
+
+    if (s.is_group()) {
+        std::lock_guard<std::mutex> lk(s.group_mu);
+        const int32_t group_size = s.group_size();
+        if (s.group_member_states.size() != static_cast<size_t>(group_size)) {
+            s.group_member_states.assign(static_cast<size_t>(group_size), GroupMemberState::NOT_DISPATCHED);
+            s.group_member_outcomes.assign(static_cast<size_t>(group_size), EndpointOutcome::SKIPPED);
+        }
+        if (!s.group_failed) {
+            s.group_failed = true;
+            s.group_first_failure_index = -1;
+            s.group_first_failure_message = root_message;
+        }
+        for (int32_t i = 0; i < group_size; ++i) {
+            GroupMemberState &member_state = s.group_member_states[static_cast<size_t>(i)];
+            if (is_terminal_group_state(member_state)) continue;
+            member_state = GroupMemberState::SKIPPED;
+            s.group_member_outcomes[static_cast<size_t>(i)] = EndpointOutcome::SKIPPED;
+            s.group_terminal_count.fetch_add(1, std::memory_order_acq_rel);
+        }
+    }
+
+    std::vector<TaskSlot> consumers;
+    {
+        std::lock_guard<std::mutex> lk(s.fanout_mu);
+        consumers = s.fanout_consumers;
+    }
+    for (TaskSlot consumer : consumers) {
+        poison_task(consumer, root_message);
+    }
+
+    try_consume(slot);
+
+    std::vector<TaskSlot> producers;
+    {
+        std::lock_guard<std::mutex> lk(s.fanout_mu);
+        producers = s.fanin_producers;
+    }
+    for (TaskSlot prod : producers) {
+        try_consume(prod);
+    }
+}
+
 void Scheduler::try_consume(TaskSlot slot) {
     TaskSlotState &s = *cfg_.ring->slot_state(slot);
     int32_t released = s.fanout_released.fetch_add(1, std::memory_order_acq_rel) + 1;
@@ -175,7 +319,8 @@ void Scheduler::try_consume(TaskSlot slot) {
         total = s.fanout_total;
     }
     if (released >= total + 1) {
-        if (s.state.load(std::memory_order_acquire) == TaskState::COMPLETED) {
+        TaskState state = s.state.load(std::memory_order_acquire);
+        if (state == TaskState::COMPLETED || state == TaskState::FAILED) {
             if (cfg_.on_consumed_cb) cfg_.on_consumed_cb(slot);
         }
     }
@@ -193,6 +338,9 @@ void Scheduler::dispatch_ready() {
         TaskSlot slot;
         while (q->try_pop(slot)) {
             TaskSlotState &s = *cfg_.ring->slot_state(slot);
+            if (s.state.load(std::memory_order_acquire) != TaskState::READY) {
+                continue;
+            }
             int N = s.group_size();  // 1 for normal tasks
 
             // Affinity-aware dispatch: pin args[i] to worker affinities[i]
@@ -205,7 +353,7 @@ void Scheduler::dispatch_ready() {
                 int8_t aff = s.get_affinity(i);
                 if (aff >= 0) {
                     auto *wt = cfg_.manager->get_worker(s.worker_type, aff);
-                    if (!wt || !wt->idle()) {
+                    if (!wt || !wt->idle() || !s.endpoint_allowed(i, wt->endpoint_id())) {
                         ok = false;
                         break;
                     }
@@ -217,7 +365,8 @@ void Scheduler::dispatch_ready() {
             if (ok) {
                 for (int i = 0; i < N; i++) {
                     if (workers[static_cast<size_t>(i)] != nullptr) continue;
-                    auto *wt = cfg_.manager->pick_idle_excluding(s.worker_type, workers);
+                    auto *wt =
+                        cfg_.manager->pick_idle_excluding_eligible(s.worker_type, workers, s.eligible_endpoints_for(i));
                     if (!wt) {
                         ok = false;
                         break;
@@ -232,7 +381,26 @@ void Scheduler::dispatch_ready() {
             }
 
             s.state.store(TaskState::RUNNING, std::memory_order_release);
+            if (s.is_group()) {
+                std::lock_guard<std::mutex> lk(s.group_mu);
+                s.group_member_states.assign(static_cast<size_t>(N), GroupMemberState::NOT_DISPATCHED);
+                s.group_member_outcomes.assign(static_cast<size_t>(N), EndpointOutcome::SKIPPED);
+                s.group_terminal_count.store(0, std::memory_order_relaxed);
+                s.group_dispatched_count.store(0, std::memory_order_relaxed);
+                s.group_failed = false;
+                s.group_first_failure_index = -1;
+                s.group_first_failure_message.clear();
+            }
             for (int i = 0; i < N; i++) {
+                if (s.is_group()) {
+                    std::lock_guard<std::mutex> lk(s.group_mu);
+                    GroupMemberState &member_state = s.group_member_states[static_cast<size_t>(i)];
+                    if (member_state != GroupMemberState::NOT_DISPATCHED || s.group_failed) {
+                        continue;
+                    }
+                    member_state = GroupMemberState::RUNNING;
+                    s.group_dispatched_count.fetch_add(1, std::memory_order_relaxed);
+                }
                 WorkerDispatch d;
                 d.task_slot = slot;
                 d.group_index = i;
