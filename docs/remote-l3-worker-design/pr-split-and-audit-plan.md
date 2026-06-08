@@ -90,7 +90,7 @@ Use this matrix shape:
 
 | Req | Source | Class | Implementation | Tests | Gap/Drift | PR |
 | --- | ------ | ----- | -------------- | ----- | --------- | -- |
-|     |        |       |                |       |           |    |
+| | | | | | | |
 
 The split map must assign every changed file and major hunk to one child PR.
 If one hunk does not belong cleanly to one PR, split the hunk before opening
@@ -100,7 +100,7 @@ Use this split-map shape:
 
 | File or hunk | Owner PR | Reason | Depends on | Tests |
 | ------------ | -------- | ------ | ---------- | ----- |
-|              |          |        |            |       |
+| | | | | |
 
 The risk register must include at least:
 
@@ -118,7 +118,7 @@ Use this risk-register shape:
 
 | Risk | Location | Failure mode | Mitigation | Test |
 | ---- | -------- | ------------ | ---------- | ---- |
-|      |          |              |            |      |
+| | | | | |
 
 The future-work list must be explicit about what the current split does not
 implement. For this PR cut, expected future work includes hardware HCOMM
