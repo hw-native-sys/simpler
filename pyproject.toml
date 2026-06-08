@@ -17,6 +17,10 @@ version = "0.1.0"
 requires-python = ">=3.9"
 dependencies = ["cloudpickle>=2.2"]
 
+[project.scripts]
+simpler-remote-worker = "simpler.remote_l3_worker:main"
+simpler-remote-l3-session = "simpler.remote_l3_session:main"
+
 [project.optional-dependencies]
 # ``torch>=2.3`` is required by ``simpler_setup.torch_interop`` (uses
 # ``torch.uint16`` / ``torch.uint32``, added in PyTorch 2.3). CI installs
