@@ -312,6 +312,7 @@ std::vector<uint8_t> encode_call_config(const CallConfig &config) {
     put_i32(out, config.enable_dump_tensor);
     put_i32(out, config.enable_pmu);
     put_i32(out, config.enable_dep_gen);
+    put_i32(out, config.enable_scope_stats);
     put_string(out, call_config_prefix(config), MAX_STRING_BYTES, "CallConfig.output_prefix");
     return out;
 }
@@ -324,7 +325,7 @@ CallConfig decode_call_config(const uint8_t *data, size_t size, size_t &offset) 
     config.enable_dump_tensor = get_i32(data, size, offset);
     config.enable_pmu = get_i32(data, size, offset);
     config.enable_dep_gen = get_i32(data, size, offset);
-    config.enable_scope_stats = 0;
+    config.enable_scope_stats = get_i32(data, size, offset);
     std::string prefix = get_string(data, size, offset, MAX_STRING_BYTES, "CallConfig.output_prefix");
     ensure(prefix.size() < sizeof(config.output_prefix), "remote_wire: CallConfig.output_prefix is too long");
     std::memset(config.output_prefix, 0, sizeof(config.output_prefix));

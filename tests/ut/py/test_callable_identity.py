@@ -221,6 +221,42 @@ def test_remote_dispatcher_rejects_chip_callable_target():
         _prepare_register_callable(command, {"platform": "a2a3sim", "runtime": "tensormap_and_ringbuffer"})
 
 
+def test_remote_register_rejects_python_serialized_without_negotiation():
+    command = encode_register_callable_command(
+        RemoteRegistryTarget.REMOTE_TASK_DISPATCHER,
+        CallableKind.PYTHON_SERIALIZED,
+        b"\x00" * 32,
+        1,
+        b"serialized",
+    )
+
+    with pytest.raises(ValueError, match="PYTHON_SERIALIZED is not negotiated"):
+        _prepare_register_callable(command, {"platform": "a2a3sim", "runtime": "tensormap_and_ringbuffer"})
+
+
+def test_remote_inner_chip_callable_rejects_staged_blob_without_negotiation():
+    payload = encode_remote_chip_callable_payload(
+        RemoteChipCallablePayload(
+            descriptor_bytes=b"descriptor",
+            blob_location=ChipCallableBlobLocation.STAGED_BLOB,
+            blob_size=4,
+            blob_sha256=hashlib.sha256(b"abcd").digest(),
+            inline_blob=b"",
+            staged_blob_token=b"token",
+        )
+    )
+    command = encode_register_callable_command(
+        RemoteRegistryTarget.INNER_L3_WORKER,
+        CallableKind.CHIP_CALLABLE,
+        b"\x00" * 32,
+        1,
+        payload,
+    )
+
+    with pytest.raises(ValueError, match="STAGED_BLOB is unsupported"):
+        _prepare_register_callable(command, {"platform": "a2a3sim", "runtime": "tensormap_and_ringbuffer"})
+
+
 def test_remote_manifest_inner_python_import_installs_session_handle():
     worker = Worker(level=3, platform="a2a3sim", runtime="tensormap_and_ringbuffer", num_sub_workers=1)
     digest = hashid_to_digest(_INNER_SUB_HASHID)

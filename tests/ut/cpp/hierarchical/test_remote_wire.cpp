@@ -92,6 +92,25 @@ TEST(RemoteWire, TaskPayloadRejectsNonZeroTensorData) {
     EXPECT_THROW((void)remote_l3::encode_task_payload(payload), std::runtime_error);
 }
 
+TEST(RemoteWire, TaskPayloadPreservesScopeStatsCallConfig) {
+    remote_l3::TaskPayloadWire payload;
+    payload.callable_digest.fill(0xAB);
+    payload.config.block_dim = 7;
+    payload.config.aicpu_thread_num = 5;
+    payload.config.enable_scope_stats = 1;
+    const char *prefix = "/tmp/remote-scope";
+    std::memcpy(payload.config.output_prefix, prefix, std::strlen(prefix));
+    payload.args.tensor_metadata.push_back(metadata_tensor());
+
+    auto encoded = remote_l3::encode_task_payload(payload);
+    auto decoded = remote_l3::decode_task_payload(encoded.data(), encoded.size());
+
+    EXPECT_EQ(decoded.config.block_dim, 7);
+    EXPECT_EQ(decoded.config.aicpu_thread_num, 5);
+    EXPECT_EQ(decoded.config.enable_scope_stats, 1);
+    EXPECT_STREQ(decoded.config.output_prefix, prefix);
+}
+
 TEST(RemoteWire, TruncatedControlPayloadIsRejected) {
     std::vector<uint8_t> truncated{1, 0, 0};
     EXPECT_THROW((void)remote_l3::decode_control(truncated.data(), truncated.size()), std::runtime_error);
