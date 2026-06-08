@@ -133,6 +133,29 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, in
         }
 
         {
+            // receive_time marks the moment AICPU's full "task is ready to
+            // execute" signal landed on this core. Paired with start_time
+            // (captured after the per-task dcci + ack pair) it lets DFX split
+            // head_OH into the AICPU→AICore-ready propagation (dispatch_ts →
+            // receive_time, hardware + scheduling-bound) and the AICore-local
+            // critical-path prep (receive_time → start_time, software-tunable).
+            // Stored in the record as a 32-bit delta `start_time - receive_time`.
+            //
+            // For the common path (not_ready == 0) the new task_id on
+            // DATA_MAIN_BASE is itself the ready signal, so receive_time is
+            // stamped immediately and local_setup covers dcci + ack.
+            //
+            // For the speculative early-dispatch path (not_ready == 1) the
+            // dcci ran BEFORE the dependency-wait spin, so its cost is hidden
+            // behind the doorbell-wait — not on the critical path between
+            // "task genuinely ready" and "kernel begins". receive_time is
+            // re-stamped after the doorbell arrives, so propagation absorbs
+            // both the original NoC delivery AND any speculation overshoot,
+            // while local_setup stays the pure ack-on-critical-path cost. This
+            // makes local_setup the clean "AICore prep we can't hide" figure
+            // for both paths.
+            uint64_t receive_time = get_sys_cnt_aicore();
+
             uint32_t task_id = reg_val;  // Decode: register holds task_id directly
 
             // Select dual-buffer slot: same bit as AICPU used when writing payload
@@ -172,6 +195,12 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, in
                     write_reg(RegId::COND, AICORE_EXITED_VALUE);
                     break;
                 }
+                // Re-stamp receive_time at the moment the doorbell landed: the
+                // dcci above ran during the speculative-staging window
+                // (overlapped with the dependency wait, off the critical path).
+                // Propagation now absorbs the speculation overshoot; local_setup
+                // = start - receive stays the pure ack-on-critical-path cost.
+                receive_time = get_sys_cnt_aicore();
             }
 
             write_reg(RegId::COND, MAKE_ACK_VALUE(task_id));
@@ -221,7 +250,7 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, in
                 uint64_t end_time = get_sys_cnt_aicore();
                 uint64_t task_token_raw = exec_payload->local_context.async_ctx.task_token.raw;
                 l2_swimlane_aicore_record_task(
-                    l2_swimlane_head, &l2_swimlane_local, task_token_raw, task_id, start_time, end_time
+                    l2_swimlane_head, &l2_swimlane_local, task_token_raw, task_id, receive_time, start_time, end_time
                 );
             }
         }

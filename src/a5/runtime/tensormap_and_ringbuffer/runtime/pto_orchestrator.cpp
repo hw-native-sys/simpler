@@ -894,7 +894,7 @@ TaskOutputTensors PTO2OrchestratorState::alloc_tensors(const Arg &args) {
     if (prepared.slot_state != nullptr) {
         // Hidden alloc tasks complete inline in the orchestrator before any
         // consumer can exist, so they have no fanout to notify and no worker
-        // subtasks to retire. Running the full on_mixed_task_complete path
+        // subtasks to retire. Running the full on_task_complete path
         // would only pay unnecessary fanout_lock / traversal overhead here.
         // The generic slot initialization done in prepare_task() is still
         // required so scope_end can release the producer-side reference and

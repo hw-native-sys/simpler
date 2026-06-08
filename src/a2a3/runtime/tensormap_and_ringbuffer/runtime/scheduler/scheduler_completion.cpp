@@ -132,7 +132,7 @@ void SchedulerContext::complete_slot_task(
         if (cond_count > 0) {
             // Publish "this task is deferred" before on_subtask_complete so the
             // acq_rel fetch_add inside on_subtask_complete makes the flag
-            // visible to whichever subtask sees mixed_complete=true (which may
+            // visible to whichever subtask sees task_complete=true (which may
             // be this thread or a later one).
             slot_state.any_subtask_deferred.store(true, std::memory_order_release);
 
@@ -147,17 +147,17 @@ void SchedulerContext::complete_slot_task(
         }
     }
 
-    bool mixed_complete = sched_->on_subtask_complete(slot_state);
+    bool task_complete = sched_->on_subtask_complete(slot_state);
 
 #if PTO2_PROFILING
     // Sub-block retire that did not finish the slot: record it so the poll
     // iteration becomes visible on the scheduler lane (the SPMD harvest tail).
-    if (!mixed_complete && l2_swimlane_level_ >= L2SwimlaneLevel::SCHED_PHASES) {
+    if (!task_complete && l2_swimlane_level_ >= L2SwimlaneLevel::SCHED_PHASES) {
         l2_swimlane.phase_subretire_count++;
     }
 #endif
 
-    if (mixed_complete && slot_state.payload != nullptr &&
+    if (task_complete && slot_state.payload != nullptr &&
         slot_state.any_subtask_deferred.load(std::memory_order_acquire)) {
         // Some subtask of this task registered conditions; finish the
         // registration by handing the slot_state off to the consumer.
@@ -168,7 +168,7 @@ void SchedulerContext::complete_slot_task(
         defer_completion_to_consumer = true;
     }
 
-    if (mixed_complete && !defer_completion_to_consumer) {
+    if (task_complete && !defer_completion_to_consumer) {
 #if PTO2_PROFILING
         if (is_dump_tensor_enabled()) {
             dump_tensors_for_task<PTO2_SUBTASK_SLOT_COUNT>(
@@ -183,25 +183,41 @@ void SchedulerContext::complete_slot_task(
         }
 #endif
 #if PTO2_PROFILING
-        // Time the fanout (fanin release + consumer doorbells) so it renders as
-        // a child bar nested inside this iteration's Complete bar — surfacing how
-        // much of a long complete is the 50-consumer walk + doorbell vs scan.
-        uint64_t fanout_t0 = (l2_swimlane_level_ >= L2SwimlaneLevel::SCHED_PHASES) ? get_sys_cnt_aicpu() : 0;
+        // Time Resolve (walk the consumer list, decrement each consumer's
+        // fanin, push the newly-ready ones, ring doorbells for speculative
+        // hits) so it renders as a child bar nested inside this iteration's
+        // Complete bar. The 1 µs floor below filters out the ~88% of tasks
+        // with 1-2 consumers (~500 ns Resolve) so only the long broadcast /
+        // reduction walks stand out on the lane.
+        uint64_t resolve_t0 = (l2_swimlane_level_ >= L2SwimlaneLevel::SCHED_PHASES) ? get_sys_cnt_aicpu() : 0;
 #endif
+        // [[maybe_unused]] silences -Werror=unused-but-set-variable on the
+        // profiling-flags-smoke build path where PTO2_PROFILING is OFF and
+        // the Resolve emit below is excluded.
+        [[maybe_unused]] uint32_t consumers_resolved = 0;
 #if PTO2_SCHED_PROFILING
         // SCHED_PROFILING variant takes thread_idx for its per-thread atomic
         // counter side-effects (g_sched_*_atomic_count[thread_idx], consumed
-        // by the otc_* log lines). Its return value is unused.
-        (void)sched_->on_mixed_task_complete(slot_state, thread_idx, local_bufs);
+        // by the otc_* log lines). It returns CompletionStats whose
+        // `fanout_edges` is the consumer-walk count.
+        consumers_resolved = sched_->on_task_complete(slot_state, thread_idx, local_bufs).fanout_edges;
 #else
-        sched_->on_mixed_task_complete(slot_state, local_bufs);
+        consumers_resolved = sched_->on_task_complete(slot_state, local_bufs);
 #endif
 #if PTO2_PROFILING
-        if (fanout_t0 != 0) {
-            l2_swimlane_aicpu_record_sched_phase(
-                thread_idx, L2SwimlaneSchedPhaseKind::Fanout, fanout_t0, get_sys_cnt_aicpu(),
-                l2_swimlane.sched_loop_count, /*tasks_processed=*/0
-            );
+        if (resolve_t0 != 0) {
+            uint64_t resolve_t1 = get_sys_cnt_aicpu();
+            // Filter: drop Resolve bars under 1 µs so the lane shows only
+            // resolves that did meaningful work (high consumer counts or
+            // doorbells). 50 cycles @ 50 MHz = 1 µs (PLATFORM_PROF_SYS_CNT_FREQ
+            // is the device sys-cnt frequency).
+            constexpr uint64_t RESOLVE_EMIT_MIN_CYCLES = PLATFORM_PROF_SYS_CNT_FREQ / 1'000'000;  // 1 µs
+            if (resolve_t1 - resolve_t0 >= RESOLVE_EMIT_MIN_CYCLES) {
+                l2_swimlane_aicpu_record_sched_phase(
+                    thread_idx, L2SwimlaneSchedPhaseKind::Resolve, resolve_t0, resolve_t1, l2_swimlane.sched_loop_count,
+                    consumers_resolved
+                );
+            }
         }
         l2_swimlane.phase_complete_count++;
 #endif
@@ -284,14 +300,6 @@ void SchedulerContext::check_running_cores_for_completion(
 #if PTO2_SCHED_PROFILING
     auto &l2_swimlane = sched_l2_swimlane_[thread_idx];
 #endif
-#if PTO2_PROFILING
-    // Time this whole pass and count cores whose MMIO COND we actually read
-    // (skip-gated cores excluded) — emit a Scan bar so the per-pass MMIO cost
-    // and effective re-poll cadence are visible directly.
-    bool scan_record = l2_swimlane_level_ >= L2SwimlaneLevel::SCHED_PHASES;
-    uint64_t scan_t0 = scan_record ? get_sys_cnt_aicpu() : 0;
-    uint32_t scan_cores = 0;
-#endif
     CoreTracker &tracker = core_trackers_[thread_idx];
     auto running_core_states = tracker.get_all_running_cores();
     while (running_core_states.has_value()) {
@@ -317,9 +325,6 @@ void SchedulerContext::check_running_cores_for_completion(
         // --- Judgment phase: read register, derive transition ---
         // Use the precomputed cond_ptr (resolved once in handshake) to skip
         // the reg_offset switch and reg_addr addition on every poll.
-#if PTO2_PROFILING
-        scan_cores++;  // counts cores whose MMIO COND we actually read this pass
-#endif
         uint64_t reg_val = static_cast<uint64_t>(*core.cond_ptr);
         // ARM64 allows Device-nGnRnE -> Normal-cacheable load reorder; the
         // rmb() pins any AICore-published cacheable reads downstream of the
@@ -425,14 +430,6 @@ void SchedulerContext::check_running_cores_for_completion(
             made_progress = true;
         }
     }
-#if PTO2_PROFILING
-    if (scan_record && scan_cores > 0) {
-        l2_swimlane_aicpu_record_sched_phase(
-            thread_idx, L2SwimlaneSchedPhaseKind::Scan, scan_t0, get_sys_cnt_aicpu(),
-            sched_l2_swimlane_[thread_idx].sched_loop_count, scan_cores
-        );
-    }
-#endif
 }
 
 // =============================================================================

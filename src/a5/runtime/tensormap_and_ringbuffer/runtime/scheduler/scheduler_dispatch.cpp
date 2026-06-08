@@ -750,9 +750,9 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
             for (int di = 0; di < dummy_got; di++) {
                 PTO2TaskSlotState &dummy_slot = *dummy_batch[di];
 #if PTO2_SCHED_PROFILING
-                sched_->on_mixed_task_complete(dummy_slot, thread_idx, local_bufs);
+                sched_->on_task_complete(dummy_slot, thread_idx, local_bufs);
 #else
-                sched_->on_mixed_task_complete(dummy_slot, local_bufs);
+                sched_->on_task_complete(dummy_slot, local_bufs);
 #endif
                 // Dummy tasks have no subtasks to retire and no fanout pre-conditions
                 // beyond their own producers; release self-reference so the slot can

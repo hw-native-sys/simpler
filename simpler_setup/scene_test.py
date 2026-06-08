@@ -679,12 +679,18 @@ def _build_output_prefix(case_label: str) -> Path:
 def _run_swimlane_converter(
     input_path: Path | None = None,
     func_names_path: Path | None = None,
+    enable_overhead: bool = False,
 ) -> None:
     """Invoke the bundled swimlane converter as a subprocess.
 
     When ``input_path`` is given, the converter derives its output filename from
     the input's timestamp (see ``swimlane_converter._resolve_output_path``).
     Without it, the converter auto-selects the latest ``l2_swimlane_records_*.json``.
+
+    ``enable_overhead`` forwards the converter's ``--overhead`` flag — adds the
+    8 Overhead Analysis counter tracks (per-engine idle/ready/overhead + system
+    all/has overhead) under the AICPU Scheduler process. Needs deps.json; the
+    converter silently no-ops if deps is absent.
     """
     import logging  # noqa: PLC0415
     import subprocess  # noqa: PLC0415
@@ -695,6 +701,8 @@ def _run_swimlane_converter(
         cmd.append(str(input_path))
     if func_names_path is not None:
         cmd += ["--func-names", str(func_names_path)]
+    if enable_overhead:
+        cmd.append("--overhead")
     try:
         result = subprocess.run(cmd, check=True, capture_output=True, text=True)
         if result.stdout:
@@ -716,6 +724,7 @@ def _convert_case_swimlane(
     case_label: str,
     output_prefix: Path,
     callable_spec: dict | None = None,
+    enable_overhead: bool = False,
 ) -> None:
     """Post-case: invoke the swimlane converter on the perf file the runtime
     just wrote into ``<output_prefix>/l2_swimlane_records.json``. No diff/rename
@@ -736,7 +745,7 @@ def _convert_case_swimlane(
         safe_label = _sanitize_for_filename(case_label)
         func_names_path = _dump_name_map(mapping, output_prefix / f"name_map_{safe_label}.json")
 
-    _run_swimlane_converter(input_path=perf_file, func_names_path=func_names_path)
+    _run_swimlane_converter(input_path=perf_file, func_names_path=func_names_path, enable_overhead=enable_overhead)
 
 
 def _run_deps_viewer(
@@ -837,6 +846,7 @@ def run_class_cases(  # noqa: PLR0913 -- shared layer-5 entry; kwargs mirror CLI
     enable_dep_gen,
     enable_scope_stats,
     enable_device_log_timing=False,
+    enable_swimlane_overhead=False,
 ):
     """Execute a pre-filtered list of cases for one class (layers 5-6).
 
@@ -887,7 +897,12 @@ def run_class_cases(  # noqa: PLR0913 -- shared layer-5 entry; kwargs mirror CLI
             )
         finally:
             if enable_l2_swimlane:
-                _convert_case_swimlane(case_label, prefix, callable_spec=callable_spec)
+                _convert_case_swimlane(
+                    case_label,
+                    prefix,
+                    callable_spec=callable_spec,
+                    enable_overhead=enable_swimlane_overhead,
+                )
             if enable_dep_gen:
                 _graph_case_dep_gen(case_label, prefix, callable_spec=callable_spec)
             if enable_scope_stats:
@@ -1354,6 +1369,7 @@ class SceneTestCase:
         # device-log timing is cheap (PTO2_PROFILING markers, one block/round)
         # so unlike the heavy diagnostics it is NOT disabled when --rounds > 1.
         enable_device_log_timing = request.config.getoption("--enable-device-log-timing", default=False)
+        enable_swimlane_overhead = request.config.getoption("--enable-swimlane-overhead", default=False)
         if rounds > 1:
             if enable_l2_swimlane:
                 logger.warning("Profiling disabled: --rounds > 1")
@@ -1409,6 +1425,7 @@ class SceneTestCase:
             enable_dep_gen=enable_dep_gen,
             enable_scope_stats=enable_scope_stats,
             enable_device_log_timing=enable_device_log_timing,
+            enable_swimlane_overhead=enable_swimlane_overhead,
         )
 
     # ------------------------------------------------------------------
@@ -1506,6 +1523,15 @@ class SceneTestCase:
             default=False,
             help="Enable per-scope peak collection and emit <output_prefix>/scope_stats/scope_stats.jsonl "
             "(per-scope ring-fill peaks).",
+        )
+        parser.add_argument(
+            "--enable-swimlane-overhead",
+            action="store_true",
+            default=False,
+            help="Add the 8 Overhead Analysis counter tracks (per-engine "
+            "idle/ready/overhead + system all/has overhead) to the swimlane "
+            "JSON. Requires --enable-l2-swimlane + deps.json (re-run with "
+            "--enable-dep-gen if absent).",
         )
         parser.add_argument(
             "--runtime",
@@ -1722,6 +1748,7 @@ class SceneTestCase:
                                 enable_dep_gen=args.enable_dep_gen,
                                 enable_scope_stats=args.enable_scope_stats,
                                 enable_device_log_timing=args.enable_device_log_timing,
+                                enable_swimlane_overhead=args.enable_swimlane_overhead,
                             )
                             print("PASSED")
                         except Exception as e:  # noqa: BLE001
@@ -1767,6 +1794,8 @@ def _dispatch_test_phases_standalone(module_name, selected_by_cls, args):  # noq
         common.append("--enable-scope-stats")
     if args.enable_device_log_timing:
         common.append("--enable-device-log-timing")
+    if args.enable_swimlane_overhead:
+        common.append("--enable-swimlane-overhead")
 
     # ----- L3 phase: one subprocess per class (not per case).
     # The child's _create_standalone_worker allocates max(cls.CASES.device_count)

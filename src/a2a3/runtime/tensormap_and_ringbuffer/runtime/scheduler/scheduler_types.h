@@ -388,12 +388,6 @@ struct alignas(64) SchedL2SwimlaneCounters {
     uint64_t pop_miss{0};
     uint64_t pop_hit_at_last_emit{0};
     uint64_t pop_miss_at_last_emit{0};
-    // Activity-fill: coalesced segment covering iterations that emit no
-    // Complete/Dispatch bar, so the scheduler lane tiles with no blanks.
-    // fill_kind: 0 = none open, else L2SwimlaneSchedPhaseKind value + 1.
-    uint32_t fill_kind{0};
-    uint64_t fill_start{0};
-    uint64_t fill_end{0};
 #if PTO2_SCHED_PROFILING
     uint32_t phase_wiring_count{0};
     uint64_t complete_probe_count{0};
