@@ -14,6 +14,7 @@
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 #include <atomic>
@@ -50,6 +51,18 @@ std::string format_digest(const uint8_t *digest) {
         out.push_back(kHex[v & 0x0F]);
     }
     return out;
+}
+
+std::string child_status_message(int child_pid, int status) {
+    std::string msg = "child process pid=" + std::to_string(child_pid) + " exited before mailbox completion";
+    if (WIFEXITED(status)) {
+        msg += " (exit_status=" + std::to_string(WEXITSTATUS(status)) + ")";
+    } else if (WIFSIGNALED(status)) {
+        msg += " (signal=" + std::to_string(WTERMSIG(status)) + ")";
+    } else {
+        msg += " (status=" + std::to_string(status) + ")";
+    }
+    return msg;
 }
 
 }  // namespace
@@ -90,16 +103,42 @@ void WorkerThread::write_mailbox_state(MailboxState s) {
 // =============================================================================
 
 void WorkerThread::start(
-    Ring *ring, WorkerManager *manager, const std::function<void(TaskSlot)> &on_complete, void *mailbox
+    Ring *ring, WorkerManager *manager, const std::function<void(TaskSlot)> &on_complete, void *mailbox, int child_pid
 ) {
     if (mailbox == nullptr) throw std::invalid_argument("WorkerThread::start: null mailbox");
     ring_ = ring;
     manager_ = manager;
     on_complete_ = on_complete;
     mailbox_ = mailbox;
+    child_pid_ = child_pid;
+    child_reaped_ = false;
     shutdown_ = false;
     idle_.store(true, std::memory_order_relaxed);
     thread_ = std::thread(&WorkerThread::loop, this);
+}
+
+void WorkerThread::check_child_alive(const char *op_name) {
+    if (child_pid_ <= 0 || child_reaped_) return;
+
+    int status = 0;
+    pid_t r = waitpid(static_cast<pid_t>(child_pid_), &status, WNOHANG);
+    if (r == 0) return;
+
+    child_reaped_ = true;
+    if (r == static_cast<pid_t>(child_pid_)) {
+        throw std::runtime_error(std::string(op_name) + ": " + child_status_message(child_pid_, status));
+    }
+    if (r < 0 && errno == ECHILD) {
+        throw std::runtime_error(
+            std::string(op_name) + ": child process pid=" + std::to_string(child_pid_) +
+            " is no longer waitable before mailbox completion"
+        );
+    }
+    if (r < 0) {
+        throw std::runtime_error(
+            std::string(op_name) + ": waitpid(pid=" + std::to_string(child_pid_) + ") failed: " + std::strerror(errno)
+        );
+    }
 }
 
 void WorkerThread::dispatch(WorkerDispatch d) {
@@ -214,7 +253,11 @@ void WorkerThread::dispatch_process(TaskSlotState &s, int32_t group_index) {
     write_mailbox_state(MailboxState::TASK_READY);
 
     // Spin-poll until child signals TASK_DONE.
+    int poll_count = 0;
     while (read_mailbox_state() != MailboxState::TASK_DONE) {
+        if ((++poll_count % 200) == 0) {
+            check_child_alive("WorkerThread::dispatch_process");
+        }
         std::this_thread::sleep_for(std::chrono::microseconds(50));
     }
 
@@ -239,16 +282,19 @@ void WorkerThread::dispatch_process(TaskSlotState &s, int32_t group_index) {
 // WorkerManager
 // =============================================================================
 
-void WorkerManager::add_next_level(void *mailbox) { next_level_entries_.push_back(mailbox); }
+void WorkerManager::add_next_level(void *mailbox, int child_pid) {
+    next_level_entries_.push_back({mailbox, child_pid});
+}
 
-void WorkerManager::add_sub(void *mailbox) { sub_entries_.push_back(mailbox); }
+void WorkerManager::add_sub(void *mailbox, int child_pid) { sub_entries_.push_back({mailbox, child_pid}); }
 
 void WorkerManager::start(Ring *ring, const OnCompleteFn &on_complete) {
     if (ring == nullptr) throw std::invalid_argument("WorkerManager::start: null ring");
-    auto make_threads = [&](const std::vector<void *> &entries, std::vector<std::unique_ptr<WorkerThread>> &threads) {
-        for (void *mailbox : entries) {
+    auto make_threads = [&](const std::vector<WorkerEntry> &entries,
+                            std::vector<std::unique_ptr<WorkerThread>> &threads) {
+        for (const WorkerEntry &entry : entries) {
             auto wt = std::make_unique<WorkerThread>();
-            wt->start(ring, this, on_complete, mailbox);
+            wt->start(ring, this, on_complete, entry.mailbox, entry.child_pid);
             threads.push_back(std::move(wt));
         }
     };
@@ -378,7 +424,11 @@ void WorkerThread::run_control_command(const char *op_name, double timeout_s) {
             std::chrono::steady_clock::now() +
             std::chrono::duration_cast<std::chrono::steady_clock::duration>(std::chrono::duration<double>(timeout_s));
     }
+    int poll_count = 0;
     while (read_mailbox_state() != MailboxState::CONTROL_DONE) {
+        if ((++poll_count % 200) == 0) {
+            check_child_alive(op_name);
+        }
         if (std::chrono::steady_clock::now() >= deadline) {
             mailbox_control_timed_out_ = true;
             throw std::runtime_error(std::string(op_name) + " timed out waiting for CONTROL_DONE");

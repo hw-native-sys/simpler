@@ -554,6 +554,14 @@ def _read_error_msg(buf) -> str:
     return raw.decode("utf-8", "replace")
 
 
+def _waitpid_if_child(pid: int) -> None:
+    """Reap a child pid, tolerating C++ liveness checks that reaped it first."""
+    try:
+        os.waitpid(pid, 0)
+    except ChildProcessError:
+        pass
+
+
 def _format_exc(prefix: str, exc: BaseException) -> str:
     return f"{prefix}: {type(exc).__name__}: {exc}"
 
@@ -2022,15 +2030,21 @@ class Worker:
 
             # Register chip workers as NEXT_LEVEL (L3)
             if device_ids:
-                for shm in self._chip_shms:
-                    dw.add_next_level_worker(_mailbox_addr(shm))
+                if len(self._chip_shms) != len(self._chip_pids):
+                    raise RuntimeError("chip worker shm/pid count mismatch")
+                for shm, pid in zip(self._chip_shms, self._chip_pids):
+                    dw.add_next_level_worker(_mailbox_addr(shm), pid)
 
             # Register Worker children as NEXT_LEVEL (L4+)
-            for shm in self._next_level_shms:
-                dw.add_next_level_worker(_mailbox_addr(shm))
+            if len(self._next_level_shms) != len(self._next_level_pids):
+                raise RuntimeError("next-level worker shm/pid count mismatch")
+            for shm, pid in zip(self._next_level_shms, self._next_level_pids):
+                dw.add_next_level_worker(_mailbox_addr(shm), pid)
 
-            for shm in self._sub_shms:
-                dw.add_sub_worker(_mailbox_addr(shm))
+            if len(self._sub_shms) != len(self._sub_pids):
+                raise RuntimeError("sub-worker shm/pid count mismatch")
+            for shm, pid in zip(self._sub_shms, self._sub_pids):
+                dw.add_sub_worker(_mailbox_addr(shm), pid)
 
             # Start Scheduler + WorkerThreads (C++ threads start here, after fork)
             dw.init()
@@ -2665,7 +2679,7 @@ class Worker:
                 assert buf is not None
                 _mailbox_store_i32(_buffer_field_addr(buf, _OFF_STATE), _SHUTDOWN)
             for pid in self._sub_pids:
-                os.waitpid(pid, 0)
+                _waitpid_if_child(pid)
             for shm in self._sub_shms:
                 shm.close()
                 shm.unlink()
@@ -2676,7 +2690,7 @@ class Worker:
                 assert buf is not None
                 _mailbox_store_i32(_buffer_field_addr(buf, _OFF_STATE), _SHUTDOWN)
             for pid in self._chip_pids:
-                os.waitpid(pid, 0)
+                _waitpid_if_child(pid)
             for shm in self._chip_shms:
                 shm.close()
                 shm.unlink()
@@ -2688,7 +2702,7 @@ class Worker:
                 assert buf is not None
                 _mailbox_store_i32(_buffer_field_addr(buf, _OFF_STATE), _SHUTDOWN)
             for pid in self._next_level_pids:
-                os.waitpid(pid, 0)
+                _waitpid_if_child(pid)
             for shm in self._next_level_shms:
                 shm.close()
                 shm.unlink()
