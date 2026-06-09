@@ -226,6 +226,8 @@ void validate_desc_against_inline_payload(const RemoteTensorDesc &desc, size_t i
         ensure(desc.inline_payload_offset == 0, "remote_wire: non-HOST_INLINE inline offset must be zero");
         ensure(desc.inline_payload_len == 0, "remote_wire: non-HOST_INLINE inline length must be zero");
         ensure(desc.owner_endpoint_id >= 0, "remote_wire: remote descriptor owner endpoint must be non-negative");
+        ensure(desc.buffer_id != 0, "remote_wire: remote descriptor buffer_id must be non-zero");
+        ensure(desc.generation != 0, "remote_wire: remote descriptor generation must be non-zero");
     }
 }
 

@@ -160,6 +160,27 @@ TEST(RemoteWire, NonHostInlineDescriptorRejectsInlinePayloadFields) {
     EXPECT_THROW((void)remote_l3::encode_remote_task_args(args), std::runtime_error);
 }
 
+TEST(RemoteWire, NonHostInlineDescriptorRejectsMissingBufferIdentity) {
+    remote_l3::RemoteTaskArgsWire args;
+    args.tensor_metadata.push_back(metadata_tensor());
+
+    RemoteTensorSidecar sidecar;
+    sidecar.present = true;
+    sidecar.desc.address_space = RemoteAddressSpace::REMOTE_DEVICE;
+    sidecar.desc.owner_endpoint_id = 3;
+    sidecar.desc.buffer_id = 9;
+    sidecar.desc.generation = 1;
+    sidecar.desc.nbytes = 4;
+    args.remote_desc.push_back(sidecar);
+
+    args.remote_desc[0].desc.buffer_id = 0;
+    EXPECT_THROW((void)remote_l3::encode_remote_task_args(args), std::runtime_error);
+
+    args.remote_desc[0].desc.buffer_id = 9;
+    args.remote_desc[0].desc.generation = 0;
+    EXPECT_THROW((void)remote_l3::encode_remote_task_args(args), std::runtime_error);
+}
+
 TEST(RemoteWire, CompletionAndControlReplyMatchSequences) {
     remote_l3::CompletionPayload completion;
     completion.sequence = 42;

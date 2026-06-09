@@ -536,7 +536,7 @@ def decode_task_payload(data: bytes) -> TaskPayloadWire:
 def encode_completion(sequence: int, error_code: int, error_message: str) -> bytes:
     data = error_message.encode("utf-8")
     if len(data) > MAX_ERROR_BYTES:
-        data = data[:MAX_ERROR_BYTES]
+        raise ValueError("remote_wire: completion error message too long")
     return struct.pack("<QiI", int(sequence), int(error_code), len(data)) + data
 
 
@@ -827,7 +827,7 @@ def encode_control_reply(
 ) -> bytes:
     msg = error_message.encode("utf-8")
     if len(msg) > MAX_ERROR_BYTES:
-        msg = msg[:MAX_ERROR_BYTES]
+        raise ValueError("remote_wire: control reply error message too long")
     if len(result_bytes) > MAX_FRAME_PAYLOAD_BYTES:
         raise ValueError("remote_wire: control reply result too large")
     return (

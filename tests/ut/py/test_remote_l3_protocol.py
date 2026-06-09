@@ -11,8 +11,10 @@ import struct
 
 import pytest
 from simpler.remote_l3_protocol import (
+    MAX_ERROR_BYTES,
     REMOTE_BUFFER_ACCESS_READ,
     CallableKind,
+    ControlName,
     ExportBufferResult,
     ImportBufferResult,
     RemoteAddressSpace,
@@ -20,6 +22,8 @@ from simpler.remote_l3_protocol import (
     decode_export_buffer_result,
     decode_register_callable_command,
     decode_task_payload,
+    encode_completion,
+    encode_control_reply,
     encode_export_buffer_result,
     encode_import_buffer_result,
     encode_register_callable_command,
@@ -58,6 +62,20 @@ def test_register_callable_command_round_trips_python_import_target():
     assert decoded.digest == digest
     assert decoded.payload_version == 1
     assert decoded.payload == target
+
+
+def test_completion_rejects_oversized_utf8_error_message():
+    message = "中" * (MAX_ERROR_BYTES // len("中".encode()) + 1)
+
+    with pytest.raises(ValueError, match="completion error message too long"):
+        encode_completion(1, 1, message)
+
+
+def test_control_reply_rejects_oversized_utf8_error_message():
+    message = "中" * (MAX_ERROR_BYTES // len("中".encode()) + 1)
+
+    with pytest.raises(ValueError, match="control reply error message too long"):
+        encode_control_reply(1, ControlName.PREPARE_CALLABLE, 1, 1, message)
 
 
 def _export_result(**overrides):
