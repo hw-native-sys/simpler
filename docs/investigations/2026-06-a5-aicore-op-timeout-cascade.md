@@ -1,9 +1,11 @@
 # a5 AICore op-timeout poisons the shared L2 worker for the rest of an xdist session
 
-**Date**: 2026-06-08
-**Verdict**: contained (two independent guards landed — driver fail-fast +
-fixture rebuild-then-skip). The poison itself is unrecoverable in-process on
-a5; containment stops it from cascading.
+**Date**: 2026-06-08 (force-reset recovery added 2026-06-09)
+**Verdict**: recovered. #1005 *contained* the cascade (driver fail-fast +
+fixture rebuild-then-skip). A follow-up found the poison **is** clearable
+in-process with a *force* device reset (`aclrtResetDeviceForce`), so the
+worker now recovers and the would-be-skipped tests actually run — see
+"Force-reset recovery" below.
 
 ## Question
 
@@ -70,7 +72,8 @@ a process exit + device reset (cascade variant 0/10). The amplifier is the
 so the poison spreads to every later test in the worker's process — exactly
 the CI cascade.
 
-**Recovery is not possible in-process.** Two reset paths were measured:
+**Soft-reset recovery is not possible in-process** (a *force* reset is — see
+"Force-reset recovery" below). Two soft-reset paths were measured:
 
 - `aclrtSynchronizeDeviceWithTimeout` (the bounded device drain in fix #1)
   returns the *same* 507046 — it does not clear the sticky error.
@@ -80,13 +83,25 @@ the CI cascade.
   (`simpler_init failed with code 507899`). The op-timeout poison survives a
   device reset within the process.
 
-The only reset that recovers is **process exit** — which is exactly why the
-separate-process cascade variant is 0/10. `aclrtResetDeviceForce` *would*
-reset the physical device, but this box is shared (see
-`.claude/rules/running-onboard.md`) and force-resetting kills other users'
-work on the same die, so it is not an option. Net: after an AICore
-op-timeout an a5 worker process cannot get a usable device back; only a new
-process can.
+A *soft* reset does not recover, but a **force** reset does. Follow-up
+measurement (2026-06-09): after poisoning a card, `aclrtResetDeviceForce`
+(rc=0) lets a fresh `Worker.init()` on the **same card in the same process**
+succeed — a trivial noop then runs clean. The earlier belief that "only a new
+process recovers" was specific to the *soft* `rtDeviceReset`; the *force*
+reset clears the op-timeout sticky-error in place. Two safety facts were also
+verified:
+
+- **Per-card scope.** With process A force-resetting device 2 while process B
+  ran a noop loop on device 3, B's 14/14 iterations passed straight through
+  A's reset — `aclrtResetDeviceForce(2)` does not disturb device 3. So under
+  xdist (gw0→dev4, gw1→dev5) one worker force-resetting its card cannot break
+  another's.
+- **Exclusive ownership.** Force reset is destructive to anything else on the
+  *physical* card, but onboard work always holds an exclusive `task-submit`
+  lock (`.claude/rules/running-onboard.md`), so the only thing on the card is
+  this job.
+
+This is what the **force-reset recovery** fix below builds on.
 
 ## Fix
 
@@ -136,40 +151,77 @@ failed with code 507899); the device context is not recoverable in-process
 after an earlier AICore error — skipping remaining 'tensormap_and_ringbuffer'
 L2 tests (a fresh worker process recovers)."*
 
+## Force-reset recovery (2026-06-09)
+
+The original containment left two gaps: the triggering test stays red, and the
+"skipped" tests are never validated (real CI run 27182822054 went from 8 red to
+`1 failed, 13 skipped` — contained, but the job is still red and 13 cases are
+unverified). The follow-up measurement above showed `aclrtResetDeviceForce`
+clears the poison in-process and is per-card safe under an exclusive lock, so
+recovery is possible after all:
+
+- `DeviceRunner::finalize()` calls `force_reset_device()`
+  (`aclInit` + `aclrtSetDevice` + `aclrtResetDeviceForce`) whenever
+  `device_unusable_` is set. The card is reset before the runner is torn down.
+- The conftest heal then closes + drops the poisoned `Worker` (unchanged from
+  #1005); the **next** test's `Worker.init()` lands on the now-clean card and
+  **succeeds**, so the previously-skipped tests actually run. No CLI/env flag —
+  it fires only on the rare device-poison path and onboard always holds an
+  exclusive `task-submit` lock (see `.claude/rules/env-macro-gating.md` for why
+  this is unconditional rather than gated).
+
+Verified on a5: a pooled `hang → noop` pair, hang FAILED (trigger, not retried),
+noop **PASSED** 3/3 (force-reset recovered the card and the victim ran). The
+`fixture rebuild-then-skip` path remains as the fallback when a force reset ever
+fails (and on a2a3, which has no force-reset).
+
+This is the recovery layer; the triggering test itself is still red (retrying it
+on a fresh card is a separate, later step).
+
 ## Why this shape
 
-The cascade cannot be *recovered* on a5 — the device is dead in-process and
-force-reset is unsafe on shared hardware — so the goal is **containment**,
-not recovery:
-
 - fix #1 (driver) turns the confusing `halResMap rc=62` / `rtMalloc 507899`
-  cascade into an immediate, self-explanatory "DeviceRunner marked unusable;
-  rebuild the Worker" — for *any* caller, not just pytest.
-- fix #2 (fixture) turns the rest of an xdist worker's L2 tests from a storm
-  of red 507899 errors into **one real failure + clean skips** with a
-  reason. A fresh worker process (the next CI shard, or the standalone phase)
-  starts clean.
+  cascade into an immediate, self-explanatory fail-fast — for *any* caller,
+  not just pytest.
+- force-reset recovery clears the card in-process so the worker re-inits and
+  the rest of the L2 tests **run** instead of cascading or being skipped.
+- fixture rebuild-then-skip is the fallback when a force reset itself fails.
 
-Both are cheap, independent, and additive.
+The same three guards are mirrored into `src/a2a3/` (the a2a3 device_runner
+had none of them; #1005 was a5-only). a2a3 has the identical
+`device_unusable_` / `recover_device_or_mark_unusable` / `force_reset_device`
+chain wired into its `run()` / `finalize()`. The mechanism is CANN-level
+(`aclrtResetDeviceForce`), so it is expected to behave as on a5, but a2a3
+**was not hardware-verified locally** — this dev box is Ascend950PR (a5) only;
+the `st-onboard-a2a3` CI job is the a2a3 verification channel.
 
 ## When to reconsider
 
-- If a future CANN release makes `aclrtSynchronizeDeviceWithTimeout` (or a
-  scoped reset API) actually clear an op-timeout sticky error in-place,
-  fix #1 could be upgraded from fail-fast to true in-place recovery, and
-  the worker would not need rebuilding at all.
-- a2a3 shows the same `finalize_common` cascade note (507018/507899/507901)
-  but the trigger there has historically been blamed on runner contention;
-  the a2a3 side was intentionally **not** touched (could not reproduce the
-  cascade deterministically on a2a3 hardware here). If an a2a3 repro lands,
-  port the same two guards to `src/a2a3/`.
+- The triggering test is still reported failed (its `207001` is likely
+  transient). Adding a bounded retry (≤3 attempts) of just that test on a
+  freshly-reset card would turn the last red into green — a follow-up step.
+- a2a3 now carries the mirrored guards (see "Why this shape") but they are
+  CI-verified only — no a2a3 silicon on this box. If the `st-onboard-a2a3`
+  job ever shows the force reset failing or not recovering on real a2a3
+  hardware, revisit `force_reset_device()` there (the CANN force-reset
+  semantics may differ from a5).
 
 ## References
 
-- CI run 27090242388, job `st-onboard-a5` (`gh run view --job 79952403308`).
-- Fix: `src/a5/platform/onboard/host/device_runner.{h,cpp}`
+- CI run 27090242388, job `st-onboard-a5` (`gh run view --job 79952403308`) —
+  original 8-failure cascade. CI run 27182822054 — post-#1005 contained run
+  (`1 failed, 13 skipped`).
+- Containment (#1005): `src/a5/platform/onboard/host/device_runner.{h,cpp}`
   (`device_unusable_`, `recover_device_or_mark_unusable`), `conftest.py`
   (`pytest_runtest_makereport`, `_register_l2_pool_heal`).
+- Force-reset recovery: `src/a5/platform/onboard/host/device_runner.{h,cpp}`
+  (`force_reset_device`, called from `finalize()` on the `device_unusable_`
+  path).
+- a2a3 mirror (CI-verified only): `src/a2a3/platform/onboard/host/`
+  `device_runner.{h,cpp}` — identical `device_unusable_` /
+  `recover_device_or_mark_unusable` / `force_reset_device` chain.
 - `DeviceRunnerBase::finalize_common` — prior note on why finalize skips a
   pre-destroy stream sync on the error-state stream.
 - `.claude/rules/running-onboard.md` — `task-submit` device isolation.
+- `.claude/rules/env-macro-gating.md` — why force reset is unconditional
+  (no opt-in flag) rather than gated.

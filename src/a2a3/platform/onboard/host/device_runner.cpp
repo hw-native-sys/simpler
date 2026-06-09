@@ -184,6 +184,23 @@ int DeviceRunner::destroy_comm_stream(void *stream) {
 // `src/common/platform/onboard/host/device_runner_base.cpp`.
 
 int DeviceRunner::run(Runtime &runtime, int block_dim, int launch_aicpu_num) {
+    // A prior AICore launch/sync error poisoned the device context and the
+    // in-place drain could not clear it. Refuse to run rather than cascade into
+    // rtMalloc 507899 / halResMap rc=62 (init_aicore_register_addresses). A soft
+    // close()+reset does NOT clear the poison, but finalize() force-resets the
+    // card on this path so the next Worker re-inits clean in the same process
+    // (see force_reset_device()). Failing fast here turns the rest of an xdist
+    // worker session's tests from a slow, confusing failure cascade into a
+    // single fast, self-explanatory error; the runner is then recovered at
+    // finalize.
+    if (device_unusable_) {
+        LOG_ERROR(
+            "DeviceRunner marked unusable by a prior AICore failure; refusing to run. "
+            "A soft reset does not clear the poison; finalize() will force-reset "
+            "the card so the next Worker on it inits clean."
+        );
+        return -1;
+    }
     if (validate_launch_aicpu_num(launch_aicpu_num) != 0) return -1;
 
     int rc = ensure_device_initialized();
@@ -371,11 +388,20 @@ int DeviceRunner::run(Runtime &runtime, int block_dim, int launch_aicpu_num) {
     rc = launch_aicore_kernel(stream_aicore_, kernel_args_.device_k_args_);
     if (rc != 0) {
         LOG_ERROR("launch_aicore_kernel failed: %d", rc);
+        recover_device_or_mark_unusable(rc);
         return rc;
     }
 
     rc = sync_run_streams();
-    if (rc != 0) return rc;
+    if (rc != 0) {
+        // sync_run_streams surfaces the AICore op-timeout (STARS-reaped op ->
+        // 507000/507018/507046 at AICPU/AICore stream sync). The op-timeout
+        // leaves the device context poisoned for the SAME DeviceRunner's next
+        // run, so attempt recovery / mark-unusable here too, not only on the
+        // launch-error path above.
+        recover_device_or_mark_unusable(rc);
+        return rc;
+    }
 
     read_device_wall_ns();
 
@@ -406,6 +432,127 @@ int DeviceRunner::run(Runtime &runtime, int block_dim, int launch_aicpu_num) {
 // `register_callable_host_orch`, `unregister_callable`, `has_callable`,
 // `bind_callable_to_runtime`, and `upload_chip_callable_buffer` live on
 // `DeviceRunnerBase`.
+
+void DeviceRunner::recover_device_or_mark_unusable(int aicore_rc) {
+    // An AICore launch failure (207001) or an op-timeout reaped by STARS
+    // (surfaced as 507000/507018/507046 at stream sync) leaves the device
+    // context in a sticky-error state: the streams stay poisoned and the
+    // SAME DeviceRunner's next run() fails early — observed on a2a3 as
+    // `rtMalloc failed: 507899`, and on a5 as `halResMap failed (rc=62)` in
+    // init_aicore_register_addresses. Reused across a session (the L2
+    // st_worker pool hands one ChipWorker to every test class on a device),
+    // that one error poisons every later test in the xdist worker process.
+    //
+    // Try to drain the device so a subsequent run can recover in place. Use
+    // the BOUNDED aclrtSynchronizeDeviceWithTimeout, NOT an unbounded
+    // aclrtSynchronizeStream* on the error-state stream — the latter wedges
+    // subsequent tests (see DeviceRunnerBase::finalize_common's comment on
+    // why finalize deliberately skips a pre-destroy sync). If the bounded
+    // device drain itself errors, the context is unrecoverable without a full
+    // device reset, so mark the runner unusable: run() then fails fast with a
+    // clear message instead of cascading, and finalize() force-resets the card.
+    int sync_rc = aclrtSynchronizeDeviceWithTimeout(PLATFORM_STREAM_SYNC_TIMEOUT_MS);
+    if (sync_rc != ACL_SUCCESS) {
+        LOG_ERROR(
+            "Device unrecoverable after AICore error %d: aclrtSynchronizeDeviceWithTimeout failed: %d. "
+            "Marking DeviceRunner unusable; run() will fail fast and finalize() will force-reset the "
+            "card (a soft in-process reset does not clear the poison).",
+            aicore_rc, sync_rc
+        );
+        device_unusable_ = true;
+    } else {
+        LOG_WARN("AICore error %d: device drained via aclrtSynchronizeDeviceWithTimeout", aicore_rc);
+    }
+}
+
+namespace {
+
+// RAII: bring ACL up if needed, and finalize on scope exit ONLY if this guard
+// is the one that initialized it. On the L2 poison path the rt-layer runner
+// never brought ACL up (acl_ready_ is false, so finalize() did a bare
+// rtDeviceReset and no aclFinalize), so aclInit here genuinely initializes ACL
+// and we own its teardown. If some other owner already init'd ACL, aclInit
+// returns 100002 and we leave it alone — finalizing it would tear ACL down for
+// the rest of the process.
+class AclInitGuard {
+public:
+    AclInitGuard() {
+        aclError rc = aclInit(nullptr);
+        if (rc == ACL_SUCCESS) {
+            owns_ = true;
+            ok_ = true;
+        } else if (static_cast<int>(rc) == ACL_ERROR_REPEAT_INITIALIZE) {
+            ok_ = true;
+        } else {
+            LOG_ERROR("force_reset_device: aclInit failed: %d", static_cast<int>(rc));
+        }
+    }
+    ~AclInitGuard() {
+        if (owns_) {
+            (void)aclFinalize();
+        }
+    }
+    AclInitGuard(const AclInitGuard &) = delete;
+    AclInitGuard &operator=(const AclInitGuard &) = delete;
+    bool ok() const { return ok_; }
+
+private:
+    bool owns_{false};
+    bool ok_{false};
+};
+
+// RAII: bind the device to this thread for the force reset, and unbind it on
+// scope exit so the per-thread device reference does not leak into the next
+// Worker on this card.
+class DeviceBindGuard {
+public:
+    explicit DeviceBindGuard(int device_id) :
+        device_id_(device_id) {
+        aclError rc = aclrtSetDevice(device_id_);
+        if (rc == ACL_SUCCESS) {
+            bound_ = true;
+        } else {
+            LOG_ERROR("force_reset_device: aclrtSetDevice(%d) failed: %d", device_id_, static_cast<int>(rc));
+        }
+    }
+    ~DeviceBindGuard() {
+        if (bound_) {
+            (void)aclrtResetDevice(device_id_);
+        }
+    }
+    DeviceBindGuard(const DeviceBindGuard &) = delete;
+    DeviceBindGuard &operator=(const DeviceBindGuard &) = delete;
+    bool bound() const { return bound_; }
+
+private:
+    int device_id_;
+    bool bound_{false};
+};
+
+}  // namespace
+
+void DeviceRunner::force_reset_device() {
+    if (device_id_ < 0) {
+        return;
+    }
+    // aclrtResetDeviceForce is an ACL API; bring ACL up and bind the device,
+    // both released on scope exit (LIFO) so a repeated poison-then-reset cycle
+    // in a long-lived process leaks neither ACL state nor a device reference.
+    AclInitGuard acl_guard;
+    if (!acl_guard.ok()) {
+        return;
+    }
+    DeviceBindGuard bind_guard(device_id_);
+    if (!bind_guard.bound()) {
+        return;
+    }
+    aclError rc = aclrtResetDeviceForce(device_id_);
+    if (rc != ACL_SUCCESS) {
+        LOG_ERROR("force_reset_device: aclrtResetDeviceForce(%d) failed: %d", device_id_, static_cast<int>(rc));
+    } else {
+        LOG_WARN("force_reset_device: aclrtResetDeviceForce(%d) cleared the poisoned card", device_id_);
+    }
+}
 
 int DeviceRunner::finalize() {
     if (device_id_ == -1) {
@@ -465,7 +612,22 @@ int DeviceRunner::finalize() {
         }
     }
 
+    // On the poison path the soft reset above does NOT clear the op-timeout
+    // sticky-error — a fresh in-process Worker.init then fails at rtStreamCreate
+    // 507899. A FORCE reset clears it, so the next Worker on this card inits
+    // clean in the SAME process and the remaining tests run instead of cascading
+    // / being skipped. Only reached on the (rare) device-poison path; onboard
+    // work always holds an exclusive task-submit lock on the card (enforced by
+    // .claude/rules/running-onboard.md), and the reset scopes to this card alone,
+    // so it cannot disturb other devices/users.
+    if (device_unusable_) {
+        force_reset_device();
+    }
+
     device_id_ = -1;
+    // A finalized runner has reset the device; clear the poison flag so a
+    // reused DeviceRunner object (re-init after close) starts clean.
+    device_unusable_ = false;
     LOG_INFO_V0("DeviceRunner finalized");
     return rc;
 }

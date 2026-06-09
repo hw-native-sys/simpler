@@ -146,16 +146,17 @@ int DeviceRunner::run(Runtime &runtime, int block_dim, int launch_aicpu_num) {
     // A prior AICore launch/sync error poisoned the device context and the
     // in-place drain could not clear it. Refuse to run rather than cascade
     // into halResMap rc=62 (init_aicore_register_addresses) or rtMalloc
-    // 507899. On a5 the poison is unrecoverable in-process (even close()+reset
-    // + a fresh Worker.init fails with rtStreamCreate 507899); only a fresh
-    // process clears it. Failing fast here turns the rest of an xdist worker
-    // session's tests from a slow, confusing failure cascade into a single
-    // fast, self-explanatory error (the test fixture then skips the remainder).
+    // 507899. A soft close()+reset does NOT clear the poison on a5, but
+    // finalize() force-resets the card on this path so the next Worker re-inits
+    // clean in the same process (see force_reset_device()). Failing fast here
+    // turns the rest of an xdist worker session's tests from a slow, confusing
+    // failure cascade into a single fast, self-explanatory error; the runner is
+    // then recovered at finalize.
     if (device_unusable_) {
         LOG_ERROR(
             "DeviceRunner marked unusable by a prior AICore failure; refusing to run. "
-            "The device context is unrecoverable in-process on a5 (close + re-create does "
-            "not reset it); a fresh worker process is required to recover."
+            "A soft reset does not clear the poison on a5; finalize() will force-reset "
+            "the card so the next Worker on it inits clean."
         );
         return -1;
     }
@@ -438,6 +439,96 @@ void DeviceRunner::recover_device_or_mark_unusable(int aicore_rc) {
     }
 }
 
+namespace {
+
+// RAII: bring ACL up if needed, and finalize on scope exit ONLY if this guard
+// is the one that initialized it. On the L2 poison path the rt-layer runner
+// never brought ACL up (acl_ready_ is false, so finalize() did a bare
+// rtDeviceReset and no aclFinalize), so aclInit here genuinely initializes ACL
+// and we own its teardown. If some other owner already init'd ACL, aclInit
+// returns 100002 and we leave it alone — finalizing it would tear ACL down for
+// the rest of the process.
+class AclInitGuard {
+public:
+    AclInitGuard() {
+        constexpr int kAclRepeatInit = 100002;
+        aclError rc = aclInit(nullptr);
+        if (rc == ACL_SUCCESS) {
+            owns_ = true;
+            ok_ = true;
+        } else if (static_cast<int>(rc) == kAclRepeatInit) {
+            ok_ = true;
+        } else {
+            LOG_ERROR("force_reset_device: aclInit failed: %d", static_cast<int>(rc));
+        }
+    }
+    ~AclInitGuard() {
+        if (owns_) {
+            (void)aclFinalize();
+        }
+    }
+    AclInitGuard(const AclInitGuard &) = delete;
+    AclInitGuard &operator=(const AclInitGuard &) = delete;
+    bool ok() const { return ok_; }
+
+private:
+    bool owns_{false};
+    bool ok_{false};
+};
+
+// RAII: bind the device to this thread for the force reset, and unbind it on
+// scope exit so the per-thread device reference does not leak into the next
+// Worker on this card.
+class DeviceBindGuard {
+public:
+    explicit DeviceBindGuard(int device_id) :
+        device_id_(device_id) {
+        aclError rc = aclrtSetDevice(device_id_);
+        if (rc == ACL_SUCCESS) {
+            bound_ = true;
+        } else {
+            LOG_ERROR("force_reset_device: aclrtSetDevice(%d) failed: %d", device_id_, static_cast<int>(rc));
+        }
+    }
+    ~DeviceBindGuard() {
+        if (bound_) {
+            (void)aclrtResetDevice(device_id_);
+        }
+    }
+    DeviceBindGuard(const DeviceBindGuard &) = delete;
+    DeviceBindGuard &operator=(const DeviceBindGuard &) = delete;
+    bool bound() const { return bound_; }
+
+private:
+    int device_id_;
+    bool bound_{false};
+};
+
+}  // namespace
+
+void DeviceRunner::force_reset_device() {
+    if (device_id_ < 0) {
+        return;
+    }
+    // aclrtResetDeviceForce is an ACL API; bring ACL up and bind the device,
+    // both released on scope exit (LIFO) so a repeated poison-then-reset cycle
+    // in a long-lived process leaks neither ACL state nor a device reference.
+    AclInitGuard acl_guard;
+    if (!acl_guard.ok()) {
+        return;
+    }
+    DeviceBindGuard bind_guard(device_id_);
+    if (!bind_guard.bound()) {
+        return;
+    }
+    aclError rc = aclrtResetDeviceForce(device_id_);
+    if (rc != ACL_SUCCESS) {
+        LOG_ERROR("force_reset_device: aclrtResetDeviceForce(%d) failed: %d", device_id_, static_cast<int>(rc));
+    } else {
+        LOG_WARN("force_reset_device: aclrtResetDeviceForce(%d) cleared the poisoned card", device_id_);
+    }
+}
+
 // `print_handshake_results`, `prepare_orch_so`, `register_callable`,
 // `register_callable_host_orch`, `unregister_callable`, `has_callable`,
 // `bind_callable_to_runtime`, and `upload_chip_callable_buffer` live on
@@ -504,6 +595,18 @@ int DeviceRunner::finalize() {
             LOG_ERROR("rtDeviceReset(%d) failed during finalize: %d", device_id_, reset_rc);
             if (rc == 0) rc = reset_rc;
         }
+    }
+
+    // On the poison path the soft reset above does NOT clear the op-timeout
+    // sticky-error — a fresh in-process Worker.init then fails at rtStreamCreate
+    // 507899. A FORCE reset clears it, so the next Worker on this card inits
+    // clean in the SAME process and the remaining tests run instead of cascading
+    // / being skipped. Only reached on the (rare) device-poison path; onboard
+    // work always holds an exclusive task-submit lock on the card (enforced by
+    // .claude/rules/running-onboard.md), and the reset is verified to scope to
+    // this card alone, so it cannot disturb other devices/users.
+    if (device_unusable_) {
+        force_reset_device();
     }
 
     device_id_ = -1;
