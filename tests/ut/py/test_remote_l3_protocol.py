@@ -30,6 +30,11 @@ from simpler.remote_l3_protocol import (
 )
 
 
+def _oversized_multibyte_error_message():
+    multi_byte = chr(0x20AC)
+    return multi_byte * (MAX_ERROR_BYTES // len(multi_byte.encode("utf-8")) + 1)
+
+
 def test_task_payload_decode_preserves_scope_stats_config():
     prefix = b"/tmp/remote-scope"
     config = struct.pack("<iiiiiii", 7, 5, 0, 0, 0, 0, 1) + struct.pack("<I", len(prefix)) + prefix
@@ -65,14 +70,14 @@ def test_register_callable_command_round_trips_python_import_target():
 
 
 def test_completion_rejects_oversized_utf8_error_message():
-    message = "中" * (MAX_ERROR_BYTES // len("中".encode()) + 1)
+    message = _oversized_multibyte_error_message()
 
     with pytest.raises(ValueError, match="completion error message too long"):
         encode_completion(1, 1, message)
 
 
 def test_control_reply_rejects_oversized_utf8_error_message():
-    message = "中" * (MAX_ERROR_BYTES // len("中".encode()) + 1)
+    message = _oversized_multibyte_error_message()
 
     with pytest.raises(ValueError, match="control reply error message too long"):
         encode_control_reply(1, ControlName.PREPARE_CALLABLE, 1, 1, message)
