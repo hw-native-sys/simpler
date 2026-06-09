@@ -869,6 +869,11 @@ rules.
 
 ## 9. Related docs
 
+- [l2-timing.md](l2-timing.md) — the everyday L2 numbers: `RunTiming`
+  host_wall / device_wall, plus Total / Orch / Sched straight from the
+  `PTO2_PROFILING` device-log markers (no swimlane capture, works with
+  `--rounds > 1`); the lighter alternative when you don't need the
+  per-task / phase deep dive.
 - [profiling-framework.md](../profiling-framework.md) — shared
   host-side collector framework (a2a3 only).
 - [profiling-name-map.md](../profiling-name-map.md) — `func_id` →

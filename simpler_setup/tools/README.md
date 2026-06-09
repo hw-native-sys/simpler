@@ -11,6 +11,7 @@ no repo checkout required.
 
 - **[swimlane_converter](#swimlane_converter)** — perf JSON → Chrome Trace Event (Perfetto)
 - **[sched_overhead_analysis](#sched_overhead_analysis)** — scheduler overhead / Tail OH breakdown
+- **[device_log_timing](#device_log_timing)** — Total / Orch / Sched from a CANN device log (no swimlane JSON)
 - **[deps_to_graph](#deps_to_graph)** — `deps.json` (dep_gen) → pan/zoom HTML dependency graph
 - **[dump_viewer](#dump_viewer)** — inspect / export tensor dumps (see [docs/tensor-dump.md](../../docs/dfx/tensor-dump.md) for full workflow)
 
@@ -152,6 +153,10 @@ python -m simpler_setup.tools.sched_overhead_analysis \
     --deps-json outputs/<case>_<ts>/deps.json
 ```
 
+> For Total / Orch / Sched timing from a **plain** run (no swimlane JSON), use
+> [`device_log_timing`](#device_log_timing) instead — `sched_overhead_analysis`
+> is the swimlane-JSON deep dive.
+
 ### Command-Line Options
 
 | Option | Description |
@@ -168,6 +173,54 @@ Output is emitted in three parts:
 - **Part 3: Tail OH distribution & cause analysis** — Tail OH quantile distribution (P10–P99), correlation between scheduler loop iteration time and Tail OH, and data-driven insights into the dominant phase
 
 The perf JSON must be captured at l2_swimlane_level >= 3 so that `aicpu_scheduler_phases` is non-empty (rerun the case with `--enable-l2-swimlane` if the tool reports the field is missing).
+
+---
+
+## device_log_timing
+
+Print per-round **Total / Orch / Sched** timing parsed from a CANN device log's
+`PTO2_PROFILING` orch/sched markers. Unlike `sched_overhead_analysis` (which
+reads the swimlane JSON), this needs **no swimlane capture** — use it for a
+plain benchmark run, a `--rounds N` sweep, or an external workload that never
+produces an `l2_swimlane_records.json`.
+
+### Basic Usage
+
+```bash
+# Explicit file or glob (quote the glob so the shell doesn't expand it; a glob
+# parses all matched rotated files)
+python -m simpler_setup.tools.device_log_timing \
+    --device-log '~/ascend/log/debug/device-0/device-*.log'
+
+# Auto-pick the newest log under device-<id>/
+python -m simpler_setup.tools.device_log_timing -d 0
+```
+
+To get the same table emitted automatically by the test harness, pass
+`--enable-device-log-timing` to `scene_test` / pytest (onboard L2 only; works
+with `--rounds N`). See [docs/dfx/l2-timing.md](../../docs/dfx/l2-timing.md) for
+the full guide, including the `RunTiming` host_wall / device_wall numbers and
+how they relate to Orch / Sched / Total.
+
+### Command-Line Options
+
+| Option | Description |
+| ------ | ----------- |
+| `--device-log` | Path / dir / glob of a CANN device log. A glob parses every matched (rotated) file. |
+| `-d`, `--device-id` | Device id: auto-pick the newest log under `device-<id>/`. |
+
+### CANN device-log environment variables
+
+| Env var | Effect |
+| ------- | ------ |
+| `ASCEND_PROCESS_LOG_PATH` | Relocates the log root to `$ASCEND_PROCESS_LOG_PATH/debug` (highest precedence, above `ASCEND_WORK_PATH/log/debug` and the `<euid-home>/ascend/log/debug` default). Resolved automatically. |
+| `ASCEND_SLOG_PRINT_TO_STDOUT=1` | Routes CANN logs to stdout — **no device log file is written**; the CLI errors out and the harness flag skips. Unset it (or set `0`) to capture device timing. |
+| `ASCEND_HOST_LOG_FILE_NUM` | Rotated files retained per process (default 10). Each file caps at 20 MB; a long run can rotate mid-run, so the harness reads **all** files written after the run started, and a `--device-log` glob parses all matches. |
+
+The default root (no relocation env var) is `<euid-home>/ascend/log/debug`,
+using the effective uid's passwd home (e.g. `/root` under sudo / `task-submit`),
+which is where the driver actually writes device logs — not `$HOME`, which sudo
+often leaves pointing at the invoking user.
 
 ---
 

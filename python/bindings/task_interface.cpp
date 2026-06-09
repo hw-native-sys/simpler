@@ -697,7 +697,9 @@ NB_MODULE(_task_interface, m) {
             [](const RunTiming &t) {
                 return t.device_wall_ns / 1000.0;
             },
-            "On-NPU wall (orch end - orch start), in microseconds. Populated whenever the "
+            "Full on-NPU kernel wall, in microseconds: simpler_aicpu_init start -> "
+            "simpler_aicpu_exec end (init + run + teardown), NOT just the orch span — "
+            "it is larger than the device-log Orch/Sched/Total. Populated whenever the "
             "runtime was built with PTO2_PROFILING (the default); independent of "
             "enable_l2_swimlane after the orch_summary capture was decoupled from the "
             "swimlane shared region. Zero only on a PTO2_PROFILING-off build."

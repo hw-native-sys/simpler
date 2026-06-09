@@ -161,13 +161,14 @@ case "$RUNTIME" in
 esac
 
 # ---------------------------------------------------------------------------
-# Resolve CANN device log directory: $ASCEND_WORK_PATH/log/debug or ~/ascend/log/debug
+# Resolve CANN device log directory. Precedence matches CANN's own resolution
+# and simpler_setup/tools/device_log_resolver.py:
+#   ASCEND_PROCESS_LOG_PATH/debug  >  ASCEND_WORK_PATH/log/debug  >  ~/ascend/log/debug
 # ---------------------------------------------------------------------------
-if [[ -n "${ASCEND_WORK_PATH:-}" ]]; then
+if [[ -n "${ASCEND_PROCESS_LOG_PATH:-}" && -d "$ASCEND_PROCESS_LOG_PATH/debug" ]]; then
+    LOG_ROOT="$ASCEND_PROCESS_LOG_PATH/debug"
+elif [[ -n "${ASCEND_WORK_PATH:-}" && -d "$ASCEND_WORK_PATH/log/debug" ]]; then
     LOG_ROOT="$ASCEND_WORK_PATH/log/debug"
-    if [[ ! -d "$LOG_ROOT" ]]; then
-        LOG_ROOT="$HOME/ascend/log/debug"
-    fi
 else
     LOG_ROOT="$HOME/ascend/log/debug"
 fi
