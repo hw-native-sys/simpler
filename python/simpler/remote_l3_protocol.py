@@ -328,6 +328,21 @@ def _validate_access_flags(flags: int, field_name: str) -> None:
         raise ValueError(f"remote_wire: {field_name} contains unknown bits")
 
 
+def _validate_export_result_identity(result: ExportBufferResult) -> None:
+    if result.owner_endpoint_id < 0 or result.buffer_id == 0 or result.generation == 0:
+        raise ValueError("remote_wire: export result requires live owner buffer identity")
+
+
+def _validate_import_result_identity(result: ImportBufferResult) -> None:
+    if (
+        result.importer_endpoint_id < 0
+        or result.owner_endpoint_id < 0
+        or result.buffer_id == 0
+        or result.generation == 0
+    ):
+        raise ValueError("remote_wire: import result requires live imported buffer identity")
+
+
 def encode_frame(header: FrameHeader, payload: bytes) -> bytes:
     if len(payload) > MAX_FRAME_PAYLOAD_BYTES:
         raise ValueError("remote_wire: frame payload exceeds maximum")
@@ -643,6 +658,7 @@ def decode_remote_chip_callable_payload(data: bytes) -> RemoteChipCallablePayloa
 
 
 def encode_export_buffer_result(result: ExportBufferResult) -> bytes:
+    _validate_export_result_identity(result)
     _validate_access_flags(result.access_flags, "export result access_flags")
     if result.address_space not in (RemoteAddressSpace.REMOTE_WINDOW, RemoteAddressSpace.UB_LDST):
         raise ValueError("remote_wire: export result address_space is invalid")
@@ -718,6 +734,7 @@ def decode_export_buffer_result(data: bytes) -> ExportBufferResult:
     if reader.u32() != 0:
         raise ValueError("remote_wire: export result reserved field must be zero")
     reader.done("export result")
+    _validate_export_result_identity(result)
     _validate_access_flags(result.access_flags, "export result access_flags")
     if result.address_space not in (RemoteAddressSpace.REMOTE_WINDOW, RemoteAddressSpace.UB_LDST):
         raise ValueError("remote_wire: export result address_space is invalid")
@@ -747,6 +764,7 @@ def decode_import_buffer_request(data: bytes) -> ImportBufferRequest:
 
 
 def encode_import_buffer_result(result: ImportBufferResult) -> bytes:
+    _validate_import_result_identity(result)
     _validate_access_flags(result.access_flags, "import result access_flags")
     if result.address_space not in (RemoteAddressSpace.REMOTE_WINDOW, RemoteAddressSpace.UB_LDST):
         raise ValueError("remote_wire: import result address_space is invalid")

@@ -9,11 +9,19 @@
 
 import struct
 
+import pytest
 from simpler.remote_l3_protocol import (
+    REMOTE_BUFFER_ACCESS_READ,
     CallableKind,
+    ExportBufferResult,
+    ImportBufferResult,
+    RemoteAddressSpace,
     RemoteRegistryTarget,
+    decode_export_buffer_result,
     decode_register_callable_command,
     decode_task_payload,
+    encode_export_buffer_result,
+    encode_import_buffer_result,
     encode_register_callable_command,
 )
 
@@ -50,3 +58,89 @@ def test_register_callable_command_round_trips_python_import_target():
     assert decoded.digest == digest
     assert decoded.payload_version == 1
     assert decoded.payload == target
+
+
+def _export_result(**overrides):
+    fields = {
+        "owner_endpoint_id": 1,
+        "buffer_id": 2,
+        "generation": 3,
+        "address_space": RemoteAddressSpace.REMOTE_WINDOW,
+        "offset": 0,
+        "nbytes": 4,
+        "export_id": 5,
+        "remote_addr": 0,
+        "rkey_or_token": 0,
+        "ub_ldst_va": 0,
+        "access_flags": REMOTE_BUFFER_ACCESS_READ,
+        "transport_profile": "sim",
+        "transport_descriptor": b"",
+    }
+    fields.update(overrides)
+    return ExportBufferResult(**fields)
+
+
+def _import_result(**overrides):
+    fields = {
+        "importer_endpoint_id": 1,
+        "owner_endpoint_id": 2,
+        "buffer_id": 3,
+        "generation": 4,
+        "import_id": 5,
+        "address_space": RemoteAddressSpace.REMOTE_WINDOW,
+        "offset": 0,
+        "nbytes": 4,
+        "remote_addr": 0,
+        "rkey_or_token": 0,
+        "ub_ldst_va": 0,
+        "access_flags": REMOTE_BUFFER_ACCESS_READ,
+        "transport_profile": "sim",
+        "import_descriptor": b"",
+    }
+    fields.update(overrides)
+    return ImportBufferResult(**fields)
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("owner_endpoint_id", -1),
+        ("buffer_id", 0),
+        ("generation", 0),
+    ],
+)
+def test_export_buffer_result_rejects_invalid_live_identity(field, value):
+    with pytest.raises(ValueError, match="live owner buffer identity"):
+        encode_export_buffer_result(_export_result(**{field: value}))
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("owner_endpoint_id", -1),
+        ("buffer_id", 0),
+        ("generation", 0),
+    ],
+)
+def test_export_buffer_result_decode_rejects_invalid_live_identity(field, value):
+    encoded = encode_export_buffer_result(_export_result())
+    values = list(struct.unpack_from("<iQQ", encoded, 0))
+    values[["owner_endpoint_id", "buffer_id", "generation"].index(field)] = value
+    corrupted = struct.pack("<iQQ", *values) + encoded[20:]
+
+    with pytest.raises(ValueError, match="live owner buffer identity"):
+        decode_export_buffer_result(corrupted)
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("importer_endpoint_id", -1),
+        ("owner_endpoint_id", -1),
+        ("buffer_id", 0),
+        ("generation", 0),
+    ],
+)
+def test_import_buffer_result_rejects_invalid_live_identity(field, value):
+    with pytest.raises(ValueError, match="live imported buffer identity"):
+        encode_import_buffer_result(_import_result(**{field: value}))
