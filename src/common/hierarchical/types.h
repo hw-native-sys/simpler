@@ -130,6 +130,12 @@ enum class RemoteAddressSpace : int32_t {
     UB_LDST = 4,
 };
 
+// RemoteBufferHandle combines wire-visible identity/mapping metadata
+// (`endpoint_id`, `owner_endpoint_id`, `buffer_id`, `generation`, `import_id`,
+// `address_space`, `nbytes`, `offset`, `remote_addr`, `rkey_or_token`,
+// `ub_ldst_va`, `access_flags`) with parent-local lifecycle state (`released`,
+// `live_slot_refs`). Keep wire formats in remote_wire.cpp explicit; do not
+// serialize this struct by raw POD copy.
 struct RemoteBufferHandle {
     int32_t endpoint_id{-1};
     int32_t owner_endpoint_id{-1};
