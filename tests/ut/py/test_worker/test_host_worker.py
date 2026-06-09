@@ -1786,6 +1786,26 @@ class TestChipMainLoopDigestRegister:
         _mailbox_store_i32(state_addr, _CONTROL_REQUEST)
 
     @staticmethod
+    def _send_ctrl_l3_l2_orch_comm_init(buf, state_addr, shm_name: str):
+        from simpler.worker import (  # noqa: PLC0415
+            _CONTROL_REQUEST,
+            _CTRL_L3_L2_ORCH_COMM_INIT,
+            _CTRL_SHM_NAME_BYTES,
+            _OFF_ARGS,
+            _OFF_CALLABLE,
+            _mailbox_store_i32,
+        )
+
+        struct.pack_into("Q", buf, _OFF_CALLABLE, _CTRL_L3_L2_ORCH_COMM_INIT)
+        encoded = shm_name.encode("utf-8")
+        assert len(encoded) + 1 <= _CTRL_SHM_NAME_BYTES
+        buf[_OFF_ARGS : _OFF_ARGS + len(encoded)] = encoded
+        buf[_OFF_ARGS + len(encoded) : _OFF_ARGS + _CTRL_SHM_NAME_BYTES] = b"\x00" * (
+            _CTRL_SHM_NAME_BYTES - len(encoded)
+        )
+        _mailbox_store_i32(state_addr, _CONTROL_REQUEST)
+
+    @staticmethod
     def _wait_for_done_and_reset(buf, state_addr, timeout: float = 5.0):
         """Block until the loop publishes _CONTROL_DONE, then read the error
         code and reset the mailbox to _IDLE so the next round can start."""
@@ -1872,6 +1892,34 @@ class TestChipMainLoopDigestRegister:
             shm.unlink()
             payload_shm.close()
             payload_shm.unlink()
+
+    def test_l3_l2_orch_comm_init_passes_control_shm_mapping_to_chip_worker(self):
+        from unittest.mock import MagicMock  # noqa: PLC0415
+
+        cw = MagicMock()
+        cw.l3_l2_orch_comm_init_from_addr = MagicMock()
+
+        control_shm = SharedMemory(create=True, size=4096)
+        shm, buf, state_addr = self._build_mailbox()
+        try:
+            t = self._spawn_loop(cw, buf, state_addr)
+            try:
+                self._send_ctrl_l3_l2_orch_comm_init(buf, state_addr, control_shm.name)
+                assert self._wait_for_done_and_reset(buf, state_addr) == 0
+                cw.l3_l2_orch_comm_init_from_addr.assert_called_once()
+                addr, size = cw.l3_l2_orch_comm_init_from_addr.call_args.args
+                assert isinstance(addr, int)
+                assert addr != 0
+                assert size == control_shm.size
+            finally:
+                self._shutdown(state_addr)
+                t.join(timeout=2.0)
+                assert not t.is_alive()
+        finally:
+            shm.close()
+            shm.unlink()
+            control_shm.close()
+            control_shm.unlink()
 
     def test_register_reads_only_declared_payload_size(self):
         from unittest.mock import MagicMock  # noqa: PLC0415

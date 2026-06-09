@@ -440,11 +440,13 @@ Illustrative L2 API:
 ```cpp
 AicpuEndpoint ep(region_desc);
 
-PayloadView input_view = ep.payload_read(input_offset, input_nbytes);
-PayloadView output_view = ep.payload_read(output_offset, output_nbytes);
+PayloadView input_view{};
+PayloadView output_view{};
+bool input_ok = ep.payload_read(input_offset, input_nbytes, &input_view);
+bool output_ok = ep.payload_read(output_offset, output_nbytes, &output_view);
 ep.payload_write(metadata_offset, &metadata, sizeof(metadata));
 ep.notify(seq);
-bool ok = ep.wait(seq, timeout);
+bool wait_ok = ep.wait(seq, timeout);
 ```
 
 `PayloadView` is byte-oriented and carries only a GM address and byte length.
@@ -457,14 +459,16 @@ struct PayloadView {
 };
 ```
 
-`payload_read` validates bounds and returns a GM payload view. The returned
-view can be combined with dtype and shape metadata supplied by task args or
-local protocol conventions to build runtime tensor views such as
+`payload_read` validates bounds and writes a GM payload view into its output
+parameter. The returned view can be combined with dtype and shape metadata
+supplied by task args or local protocol conventions to build runtime tensor
+views such as
 `ContinuousTensor(child_memory=1)`. It does not copy data.
 
 For large tensor output, L2 should obtain the output GM view through
-`payload_read(output_offset, output_nbytes)` and pass that view to AICore or the
-runtime. AICore writes the output directly into the communication region.
+`payload_read(output_offset, output_nbytes, &output_view)` and pass that view to
+AICore or the runtime. AICore writes the output directly into the communication
+region.
 
 `payload_write` has a narrow first-version contract: it is byte-oriented and
 intended for small metadata, status, actual output size, error code, test
@@ -502,8 +506,8 @@ L3:
 
 L2:
   wait(seq)
-  input_view = payload_read(input_offset, input_nbytes)
-  output_view = payload_read(output_offset, output_nbytes)
+  payload_read(input_offset, input_nbytes, &input_view)
+  payload_read(output_offset, output_nbytes, &output_view)
   submit AICore(input_view, output_view)
   wait for AICore completion
   notify(seq)

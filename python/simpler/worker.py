@@ -190,6 +190,7 @@ _CTRL_RELEASE_DOMAIN = 8
 _CTRL_COMM_INIT = 9
 _CTRL_PY_REGISTER = 10
 _CTRL_PY_UNREGISTER = 11
+_CTRL_L3_L2_ORCH_COMM_INIT = 12
 
 # Layout of the CTRL_COMM_INIT request shm.
 _COMM_INIT_HEADER = struct.Struct("<II")  # rank (u32), nranks (u32)
@@ -735,6 +736,22 @@ def _handle_ctrl_comm_init(cw: "ChipWorker", buf: memoryview) -> None:
     cw._comm_base_handle_cached = int(handle)
 
 
+def _handle_ctrl_l3_l2_orch_comm_init(cw: "ChipWorker", buf: memoryview) -> SharedMemory:
+    control_shm_name = _read_shm_name(buf, _OFF_ARGS)
+    control_shm = SharedMemory(name=control_shm_name)
+    exported = ctypes.c_char.from_buffer(control_shm.buf)
+    success = False
+    try:
+        control_block_addr = ctypes.addressof(exported)
+        cw.l3_l2_orch_comm_init_from_addr(control_block_addr, control_shm.size)
+        success = True
+    finally:
+        del exported
+        if not success:
+            control_shm.close()
+    return control_shm
+
+
 def _handle_ctrl_release_domain(cw: "ChipWorker", buf: memoryview) -> None:
     """CTRL_RELEASE_DOMAIN handler — collective free for one allocation."""
     request_shm_name = _read_shm_name(buf, _OFF_ARGS)
@@ -812,142 +829,167 @@ def _run_chip_main_loop(  # noqa: PLR0912, PLR0913, PLR0915 -- unified TASK_READ
     net when the digest mapping exists but prewarm was missed.
     """
     prepared: set[int] = set()
-    while True:
-        state = _mailbox_load_i32(state_addr)
-        if state == _TASK_READY:
-            digest = _read_task_digest(buf)
-            cid = identity_table.get(digest)
-            cfg = _read_config_from_mailbox(buf)
+    l3_l2_control_shms: list[SharedMemory] = []
+    try:
+        while True:
+            state = _mailbox_load_i32(state_addr)
+            if state == _TASK_READY:
+                digest = _read_task_digest(buf)
+                cid = identity_table.get(digest)
+                cfg = _read_config_from_mailbox(buf)
 
-            code = 0
-            msg = ""
-            try:
-                if cid is None:
-                    raise RuntimeError(f"callable hash {_format_digest(digest)} not registered")
-                _ensure_prepared(cw, registry, prepared, cid, lazy=True, device_id=device_id)
-                # Hand the mailbox bytes straight to C++ (zero-copy zero-decode):
-                # the blob layout is what `write_blob` already wrote, so re-parsing
-                # it in Python is N×40B of avoidable work and a permanent
-                # opportunity to drop a field.  C++ reinterpret_cast<ChipStorageTaskArgs*>
-                # is the source of truth.
-                cw._impl.run_prepared_from_blob(cid, mailbox_addr + _OFF_TASK_ARGS_BLOB, _MAILBOX_ARGS_CAPACITY, cfg)
-            except Exception as e:  # noqa: BLE001
-                code = 1
-                msg = _format_exc(f"chip_process dev={device_id}", e)
-
-            # On a successful kernel run, give the caller a chance to do
-            # post-run work (e.g. store_to_host D2H staging) before the
-            # parent sees TASK_DONE. The kernel's failure path skips the
-            # hook because the device output region is undefined and
-            # staging garbage would mask the real error in post-mortems.
-            if code == 0 and on_task_done_success is not None:
-                code, msg = on_task_done_success()
-
-            _write_error(buf, code, msg)
-            _mailbox_store_i32(state_addr, _TASK_DONE)
-        elif state == _CONTROL_REQUEST:
-            sub_cmd = struct.unpack_from("Q", buf, _OFF_CALLABLE)[0]
-            code = 0
-            msg = ""
-            try:
-                if sub_cmd == _CTRL_MALLOC:
-                    size = struct.unpack_from("Q", buf, _CTRL_OFF_ARG0)[0]
-                    ptr = cw.malloc(size)
-                    struct.pack_into("Q", buf, _CTRL_OFF_RESULT, ptr)
-                elif sub_cmd == _CTRL_FREE:
-                    ptr = struct.unpack_from("Q", buf, _CTRL_OFF_ARG0)[0]
-                    cw.free(ptr)
-                elif sub_cmd == _CTRL_COPY_TO:
-                    dst = struct.unpack_from("Q", buf, _CTRL_OFF_ARG0)[0]
-                    src = struct.unpack_from("Q", buf, _CTRL_OFF_ARG1)[0]
-                    n = struct.unpack_from("Q", buf, _CTRL_OFF_ARG2)[0]
-                    cw.copy_to(dst, src, n)
-                elif sub_cmd == _CTRL_COPY_FROM:
-                    dst = struct.unpack_from("Q", buf, _CTRL_OFF_ARG0)[0]
-                    src = struct.unpack_from("Q", buf, _CTRL_OFF_ARG1)[0]
-                    n = struct.unpack_from("Q", buf, _CTRL_OFF_ARG2)[0]
-                    cw.copy_from(dst, src, n)
-                elif sub_cmd == _CTRL_PREPARE:
-                    digest = _read_control_digest(buf)
-                    cid = identity_table.get(digest)
+                code = 0
+                msg = ""
+                try:
                     if cid is None:
-                        raise RuntimeError(
-                            f"prepare chip={device_id}: callable hash {_format_digest(digest)} not registered"
-                        )
-                    _ensure_prepared(cw, registry, prepared, int(cid), lazy=False, device_id=device_id)
-                elif sub_cmd == _CTRL_REGISTER:
-                    digest = _read_control_digest(buf)
-                    payload_size = struct.unpack_from("Q", buf, _CTRL_OFF_ARG0)[0]
-                    raw = bytes(buf[_OFF_ARGS : _OFF_ARGS + _CTRL_SHM_NAME_BYTES])
-                    nul = raw.find(b"\x00")
-                    shm_name = raw[: nul if nul >= 0 else _CTRL_SHM_NAME_BYTES].decode("utf-8", "replace")
-                    shm = SharedMemory(name=shm_name)
-                    shm_buf = shm.buf
-                    assert shm_buf is not None
-                    try:
-                        if payload_size <= 0 or payload_size > shm.size:
+                        raise RuntimeError(f"callable hash {_format_digest(digest)} not registered")
+                    _ensure_prepared(cw, registry, prepared, cid, lazy=True, device_id=device_id)
+                    # Hand the mailbox bytes straight to C++ (zero-copy zero-decode):
+                    # the blob layout is what `write_blob` already wrote, so re-parsing
+                    # it in Python is N×40B of avoidable work and a permanent
+                    # opportunity to drop a field.  C++ reinterpret_cast<ChipStorageTaskArgs*>
+                    # is the source of truth.
+                    cw._impl.run_prepared_from_blob(
+                        cid, mailbox_addr + _OFF_TASK_ARGS_BLOB, _MAILBOX_ARGS_CAPACITY, cfg
+                    )
+                except Exception as e:  # noqa: BLE001
+                    code = 1
+                    msg = _format_exc(f"chip_process dev={device_id}", e)
+
+                # On a successful kernel run, give the caller a chance to do
+                # post-run work (e.g. store_to_host D2H staging) before the
+                # parent sees TASK_DONE. The kernel's failure path skips the
+                # hook because the device output region is undefined and
+                # staging garbage would mask the real error in post-mortems.
+                if code == 0 and on_task_done_success is not None:
+                    code, msg = on_task_done_success()
+
+                _write_error(buf, code, msg)
+                _mailbox_store_i32(state_addr, _TASK_DONE)
+            elif state == _CONTROL_REQUEST:
+                sub_cmd = struct.unpack_from("Q", buf, _OFF_CALLABLE)[0]
+                code = 0
+                msg = ""
+                try:
+                    if sub_cmd == _CTRL_MALLOC:
+                        size = struct.unpack_from("Q", buf, _CTRL_OFF_ARG0)[0]
+                        ptr = cw.malloc(size)
+                        struct.pack_into("Q", buf, _CTRL_OFF_RESULT, ptr)
+                    elif sub_cmd == _CTRL_FREE:
+                        ptr = struct.unpack_from("Q", buf, _CTRL_OFF_ARG0)[0]
+                        cw.free(ptr)
+                    elif sub_cmd == _CTRL_COPY_TO:
+                        dst = struct.unpack_from("Q", buf, _CTRL_OFF_ARG0)[0]
+                        src = struct.unpack_from("Q", buf, _CTRL_OFF_ARG1)[0]
+                        n = struct.unpack_from("Q", buf, _CTRL_OFF_ARG2)[0]
+                        cw.copy_to(dst, src, n)
+                    elif sub_cmd == _CTRL_COPY_FROM:
+                        dst = struct.unpack_from("Q", buf, _CTRL_OFF_ARG0)[0]
+                        src = struct.unpack_from("Q", buf, _CTRL_OFF_ARG1)[0]
+                        n = struct.unpack_from("Q", buf, _CTRL_OFF_ARG2)[0]
+                        cw.copy_from(dst, src, n)
+                    elif sub_cmd == _CTRL_PREPARE:
+                        digest = _read_control_digest(buf)
+                        cid = identity_table.get(digest)
+                        if cid is None:
                             raise RuntimeError(
-                                f"CTRL_REGISTER payload size mismatch: payload={payload_size}, shm={shm.size}"
+                                f"prepare chip={device_id}: callable hash {_format_digest(digest)} not registered"
                             )
-                        callable_obj = ChipCallable.from_bytes(bytes(shm_buf[:payload_size]))
-                        _validate_chip_payload_digest(
-                            callable_obj,
-                            digest,
-                            platform=chip_platform,
-                            runtime=chip_runtime,
-                            context=f"chip_process dev={device_id}",
-                        )
-                        if digest in identity_table:
-                            identity_refs[digest] = identity_refs.get(digest, 1) + 1
-                        else:
-                            cid = _install_local_identity(registry, identity_table, identity_refs, digest, callable_obj)
-                            # Self-heal when a prior unregister popped the local
-                            # identity table but failed before clearing device
-                            # prepared state for the reusable private slot.
-                            if int(cid) in prepared:
+                        _ensure_prepared(cw, registry, prepared, int(cid), lazy=False, device_id=device_id)
+                    elif sub_cmd == _CTRL_REGISTER:
+                        digest = _read_control_digest(buf)
+                        payload_size = struct.unpack_from("Q", buf, _CTRL_OFF_ARG0)[0]
+                        raw = bytes(buf[_OFF_ARGS : _OFF_ARGS + _CTRL_SHM_NAME_BYTES])
+                        nul = raw.find(b"\x00")
+                        shm_name = raw[: nul if nul >= 0 else _CTRL_SHM_NAME_BYTES].decode("utf-8", "replace")
+                        shm = SharedMemory(name=shm_name)
+                        shm_buf = shm.buf
+                        assert shm_buf is not None
+                        try:
+                            if payload_size <= 0 or payload_size > shm.size:
+                                raise RuntimeError(
+                                    f"CTRL_REGISTER payload size mismatch: payload={payload_size}, shm={shm.size}"
+                                )
+                            callable_obj = ChipCallable.from_bytes(bytes(shm_buf[:payload_size]))
+                            _validate_chip_payload_digest(
+                                callable_obj,
+                                digest,
+                                platform=chip_platform,
+                                runtime=chip_runtime,
+                                context=f"chip_process dev={device_id}",
+                            )
+                            if digest in identity_table:
+                                identity_refs[digest] = identity_refs.get(digest, 1) + 1
+                            else:
+                                cid = _install_local_identity(
+                                    registry, identity_table, identity_refs, digest, callable_obj
+                                )
+                                # Self-heal when a prior unregister popped the local
+                                # identity table but failed before clearing device
+                                # prepared state for the reusable private slot.
+                                if int(cid) in prepared:
+                                    try:
+                                        cw._unregister_slot(int(cid))
+                                    except Exception:  # noqa: BLE001
+                                        pass
+                                    prepared.discard(int(cid))
+                                exported = ctypes.c_char.from_buffer(shm_buf)
                                 try:
-                                    cw._unregister_slot(int(cid))
-                                except Exception:  # noqa: BLE001
-                                    pass
-                                prepared.discard(int(cid))
-                            exported = ctypes.c_char.from_buffer(shm_buf)
-                            try:
-                                addr = ctypes.addressof(exported)
-                                cw._impl.prepare_callable_from_blob(int(cid), addr)
-                            finally:
-                                del exported
-                            prepared.add(int(cid))
-                    finally:
-                        shm_buf.release()
-                        # Release the local mmap as soon as prepare returns;
-                        # prepare_callable has already H2D-copied the bytes to
-                        # device GM, so the child no longer needs the shm.
-                        shm.close()
-                elif sub_cmd == _CTRL_UNREGISTER:
-                    digest = _read_control_digest(buf)
-                    cid, removed = _remove_local_identity(registry, identity_table, identity_refs, digest)
-                    if removed and cid is not None:
-                        cw._unregister_slot(int(cid))
-                        prepared.discard(int(cid))
-                elif sub_cmd == _CTRL_ALLOC_DOMAIN:
-                    _handle_ctrl_alloc_domain(cw, buf)
-                elif sub_cmd == _CTRL_RELEASE_DOMAIN:
-                    _handle_ctrl_release_domain(cw, buf)
-                elif sub_cmd == _CTRL_COMM_INIT:
-                    _handle_ctrl_comm_init(cw, buf)
-                else:
-                    raise RuntimeError(f"unknown control sub-command {int(sub_cmd)}")
+                                    addr = ctypes.addressof(exported)
+                                    cw._impl.prepare_callable_from_blob(int(cid), addr)
+                                finally:
+                                    del exported
+                                prepared.add(int(cid))
+                        finally:
+                            shm_buf.release()
+                            # Release the local mmap as soon as prepare returns;
+                            # prepare_callable has already H2D-copied the bytes to
+                            # device GM, so the child no longer needs the shm.
+                            shm.close()
+                    elif sub_cmd == _CTRL_UNREGISTER:
+                        digest = _read_control_digest(buf)
+                        cid, removed = _remove_local_identity(registry, identity_table, identity_refs, digest)
+                        if removed and cid is not None:
+                            cw._unregister_slot(int(cid))
+                            prepared.discard(int(cid))
+                    elif sub_cmd == _CTRL_ALLOC_DOMAIN:
+                        _handle_ctrl_alloc_domain(cw, buf)
+                    elif sub_cmd == _CTRL_RELEASE_DOMAIN:
+                        _handle_ctrl_release_domain(cw, buf)
+                    elif sub_cmd == _CTRL_COMM_INIT:
+                        _handle_ctrl_comm_init(cw, buf)
+                    elif sub_cmd == _CTRL_L3_L2_ORCH_COMM_INIT:
+                        l3_l2_control_shms.append(_handle_ctrl_l3_l2_orch_comm_init(cw, buf))
+                    else:
+                        raise RuntimeError(f"unknown control sub-command {int(sub_cmd)}")
+                except Exception as e:  # noqa: BLE001
+                    code = 1
+                    if sub_cmd in (_CTRL_REGISTER, _CTRL_UNREGISTER):
+                        op = "register" if sub_cmd == _CTRL_REGISTER else "unregister"
+                        msg = _format_exc(
+                            f"{op} hash={_format_digest(_read_control_digest(buf))} chip={device_id}", e
+                        )
+                    else:
+                        msg = _format_exc(f"chip_process dev={device_id} ctrl={int(sub_cmd)}", e)
+                _write_error(buf, code, msg)
+                _mailbox_store_i32(state_addr, _CONTROL_DONE)
+            elif state == _SHUTDOWN:
+                break
+    finally:
+        if l3_l2_control_shms:
+            try:
+                cw.l3_l2_orch_comm_shutdown()
             except Exception as e:  # noqa: BLE001
-                code = 1
-                if sub_cmd in (_CTRL_REGISTER, _CTRL_UNREGISTER):
-                    op = "register" if sub_cmd == _CTRL_REGISTER else "unregister"
-                    msg = _format_exc(f"{op} hash={_format_digest(_read_control_digest(buf))} chip={device_id}", e)
-                else:
-                    msg = _format_exc(f"chip_process dev={device_id} ctrl={int(sub_cmd)}", e)
-            _write_error(buf, code, msg)
-            _mailbox_store_i32(state_addr, _CONTROL_DONE)
-        elif state == _SHUTDOWN:
-            break
+                sys.stderr.write(
+                    f"[chip_process pid={os.getpid()} dev={device_id}] "
+                    f"WARN: l3_l2_orch_comm_shutdown failed: {type(e).__name__}: {e}\n"
+                )
+                sys.stderr.flush()
+        for control_shm in reversed(l3_l2_control_shms):
+            try:
+                control_shm.close()
+            except Exception:  # noqa: BLE001
+                pass
 
 
 def _chip_process_loop(
@@ -1209,6 +1251,12 @@ class Worker:
         # keep ``Worker.init()`` cheap — it only forks chip children and
         # starts the C++ scheduler; no comm work happens there.
         self._comm_base_ready: bool = False
+
+        self._l3_l2_orch_comm_ready: set[int] = set()
+        self._l3_l2_orch_comm_shms: dict[int, SharedMemory] = {}
+        self._l3_l2_orch_comm_clients: dict[int, Any] = {}
+        self._live_l3_l2_regions: list[Any] = []
+        self._l3_l2_orch_comm_host_buffers: dict[int, int] = {}
 
     def _comm_plan_rootinfo_path(self) -> str:
         """Per-Worker rootinfo path used by HCCL/sim base comm_init.
@@ -2117,6 +2165,135 @@ class Worker:
         """
         return dict(self._live_domains)
 
+    def _make_l3_l2_orch_comm_client(self, shm: SharedMemory):
+        from .l3_l2_orch_comm import L3L2OrchCommClient  # noqa: PLC0415
+
+        return L3L2OrchCommClient(shm)
+
+    def _ensure_l3_l2_orch_comm(self, worker_id: int):
+        from .l3_l2_orch_comm import CONTROL_SHM_SIZE  # noqa: PLC0415
+
+        if self.level < 3:
+            raise RuntimeError("create_l3_l2_region requires a hierarchical Worker")
+        if self._worker is None:
+            raise RuntimeError("create_l3_l2_region requires Worker.init()")
+        device_ids = self._config.get("device_ids", [])
+        if worker_id < 0 or worker_id >= len(device_ids):
+            raise ValueError(f"create_l3_l2_region: worker_id {worker_id} outside [0, {len(device_ids)})")
+        if worker_id in self._l3_l2_orch_comm_ready:
+            return self._l3_l2_orch_comm_clients[worker_id]
+
+        chip_shm = self._chip_shms[worker_id]
+        assert chip_shm.buf is not None
+        state = _mailbox_load_i32(_buffer_field_addr(chip_shm.buf, _OFF_STATE))
+        if state != _IDLE:
+            raise RuntimeError(
+                f"create_l3_l2_region bootstrap failed: target worker {worker_id} is busy and "
+                "the L3-L2 service is not ready"
+            )
+
+        control_shm = SharedMemory(create=True, size=CONTROL_SHM_SIZE)
+        try:
+            client = self._make_l3_l2_orch_comm_client(control_shm)
+            self._worker.control_l3_l2_orch_comm_init(worker_id, control_shm.name)
+        except Exception:
+            try:
+                control_shm.close()
+                control_shm.unlink()
+            except Exception:  # noqa: BLE001
+                pass
+            raise
+
+        self._l3_l2_orch_comm_shms[worker_id] = control_shm
+        self._l3_l2_orch_comm_clients[worker_id] = client
+        self._l3_l2_orch_comm_ready.add(worker_id)
+        return client
+
+    def _l3_l2_orch_comm_submit(self, worker_id: int, request, timeout_s: float):
+        client = self._ensure_l3_l2_orch_comm(int(worker_id))
+        return client.submit(request, timeout_s)
+
+    def _register_l3_l2_orch_comm_host_buffer(self, tensor) -> None:
+        from .task_interface import ContinuousTensor  # noqa: PLC0415
+
+        if not isinstance(tensor, ContinuousTensor):
+            raise TypeError("L3-L2 host buffer registration expects a ContinuousTensor")
+        if tensor.child_memory:
+            raise ValueError("L3-L2 payload buffer must be host storage, not child_memory device storage")
+        base = int(tensor.data)
+        nbytes = int(tensor.nbytes())
+        if base <= 0 or nbytes <= 0:
+            return
+        self._l3_l2_orch_comm_host_buffers[base] = max(
+            int(self._l3_l2_orch_comm_host_buffers.get(base, 0)),
+            nbytes,
+        )
+
+    def _validate_l3_l2_orch_comm_host_buffer(self, tensor) -> None:
+        from .task_interface import ContinuousTensor  # noqa: PLC0415
+
+        if not isinstance(tensor, ContinuousTensor):
+            raise ValueError("L3-L2 payload buffer must be a ContinuousTensor returned by orch.alloc(...)")
+        if tensor.child_memory:
+            raise ValueError("L3-L2 payload buffer must be host storage, not child_memory device storage")
+        base = int(tensor.data)
+        nbytes = int(tensor.nbytes())
+        if base <= 0 or nbytes <= 0:
+            raise ValueError("L3-L2 payload buffer must have a nonzero address and size")
+        registered_nbytes = self._l3_l2_orch_comm_host_buffers.get(base)
+        if registered_nbytes is None:
+            raise ValueError("L3-L2 payload ContinuousTensor is not registered; use a tensor returned by orch.alloc(...)")
+        if nbytes > int(registered_nbytes):
+            raise ValueError(
+                f"L3-L2 payload ContinuousTensor size {nbytes} exceeds registered shared storage {registered_nbytes}"
+            )
+
+    def _create_l3_l2_region(self, worker_id: int, payload_bytes: int):
+        from .l3_l2_orch_comm import L3L2OrchCommCmd, L3L2OrchCommRequest, L3L2OrchRegion  # noqa: PLC0415
+
+        if payload_bytes <= 0:
+            raise ValueError("create_l3_l2_region: payload_bytes must be positive")
+        response = self._l3_l2_orch_comm_submit(
+            int(worker_id),
+            L3L2OrchCommRequest(cmd=L3L2OrchCommCmd.ALLOC_REGION, nbytes=int(payload_bytes)),
+            timeout_s=5.0,
+        )
+        if response.status != 0 or response.desc is None:
+            raise RuntimeError(response.message or "create_l3_l2_region: ALLOC_REGION failed")
+        region = L3L2OrchRegion(self, int(worker_id), response.desc, int(payload_bytes))
+        self._live_l3_l2_regions.append(region)
+        return region
+
+    def _cleanup_l3_l2_regions(self) -> None:
+        if not self._live_l3_l2_regions:
+            return
+        from .l3_l2_orch_comm import L3L2OrchCommCmd, L3L2OrchCommRequest  # noqa: PLC0415
+
+        regions, self._live_l3_l2_regions = self._live_l3_l2_regions, []
+        for region in regions:
+            try:
+                if region._worker_id in self._l3_l2_orch_comm_ready:
+                    self._l3_l2_orch_comm_submit(
+                        region._worker_id,
+                        L3L2OrchCommRequest(cmd=L3L2OrchCommCmd.FREE_REGION, region_id=region.region_id),
+                        timeout_s=5.0,
+                    )
+            finally:
+                region._expire()
+
+    def _close_l3_l2_orch_comm(self) -> None:
+        self._live_l3_l2_regions.clear()
+        self._l3_l2_orch_comm_clients.clear()
+        self._l3_l2_orch_comm_ready.clear()
+        self._l3_l2_orch_comm_host_buffers.clear()
+        for shm in self._l3_l2_orch_comm_shms.values():
+            try:
+                shm.close()
+                shm.unlink()
+            except Exception:  # noqa: BLE001
+                pass
+        self._l3_l2_orch_comm_shms.clear()
+
     # ------------------------------------------------------------------
     # Dynamic CommDomain allocation (driven by Orchestrator.allocate_domain;
     # do not call directly from user code — use the orch API.)
@@ -2603,6 +2780,10 @@ class Worker:
             try:
                 self._orch._drain()
             finally:
+                try:
+                    self._cleanup_l3_l2_regions()
+                finally:
+                    self._l3_l2_orch_comm_host_buffers.clear()
                 self._execute_pending_domain_releases()
                 if self._live_domains:
                     self._release_all_live_domains()
@@ -2646,6 +2827,7 @@ class Worker:
         # Release any orch-allocated CommDomain handles before tearing down
         # the C++ scheduler.  Once `dw.close()` runs, the chip mailboxes
         # become unusable and we can no longer drive CTRL_RELEASE_DOMAIN.
+        self._cleanup_l3_l2_regions()
         if self._live_domains:
             self._release_all_live_domains()
 
@@ -2693,6 +2875,7 @@ class Worker:
                 shm.close()
                 shm.unlink()
 
+            self._close_l3_l2_orch_comm()
             self._sub_shms.clear()
             self._sub_pids.clear()
             self._chip_shms.clear()

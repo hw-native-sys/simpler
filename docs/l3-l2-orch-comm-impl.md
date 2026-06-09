@@ -97,12 +97,21 @@ while (true) {
         return endpoint_error(...);
     }
 
-    PayloadView header = ep.payload_read(header_offset, sizeof(ChannelHeader));
+    PayloadView header{};
+    if (!ep.payload_read(header_offset, sizeof(ChannelHeader), &header)) {
+        return endpoint_error(...);
+    }
     ChannelHeader hdr = wrapper_read_header(header.gm_addr);
     if (hdr.opcode == STOP) break;
 
-    PayloadView input = ep.payload_read(input_offset, nbytes);
-    PayloadView output = ep.payload_read(output_offset, nbytes);
+    PayloadView input{};
+    PayloadView output{};
+    if (!ep.payload_read(input_offset, nbytes, &input)) {
+        return endpoint_error(...);
+    }
+    if (!ep.payload_read(output_offset, nbytes, &output)) {
+        return endpoint_error(...);
+    }
 
     ContinuousTensor in = make_child_memory_tensor(input.gm_addr, shape, dtype);
     ContinuousTensor out = make_child_memory_tensor(output.gm_addr, shape, dtype);
@@ -215,7 +224,6 @@ Recommended additions:
 src/common/hierarchical/l3_l2_orch_comm.h
 src/common/platform/include/common/l3_l2_orch_comm.h
 src/common/platform/include/aicpu/l3_l2_orch_endpoint.h
-src/common/platform/shared/aicpu/l3_l2_orch_endpoint.cpp
 src/common/platform/include/host/l3_l2_orch_comm_service.h
 src/common/platform/shared/host/l3_l2_orch_comm_service.cpp
 python/simpler/l3_l2_orch_comm.py
@@ -773,6 +781,12 @@ Reject:
 - non-contiguous tensors;
 - tensors whose data pointer cannot be extracted through a supported binding.
 
+Stage 4 currently implements the conservative subset: `payload_write` and
+`payload_read` accept only live `ContinuousTensor` handles returned by
+`orch.alloc(...)` in the current orchestration run. Other shared Host tensor
+sources remain future extensions until their child-visible address contract is
+tested.
+
 If detection is incomplete, fail conservatively with a message such as:
 
 ```text
@@ -964,7 +978,7 @@ src/common/platform/include/aicpu/l3_l2_orch_endpoint.h
 Illustrative API:
 
 ```cpp
-struct PayloadView {
+struct L3L2OrchPayloadView {
     uint64_t gm_addr;
     uint64_t nbytes;
 };
@@ -989,15 +1003,20 @@ class L3L2OrchEndpoint {
 public:
     explicit L3L2OrchEndpoint(const L3L2OrchRegionDesc &desc);
 
-    bool ok() const;
     const L3L2EndpointError &error() const;
 
-    PayloadView payload_read(uint64_t offset, uint64_t nbytes);
+    bool payload_read(uint64_t offset, uint64_t nbytes, L3L2OrchPayloadView *out);
     bool payload_write(uint64_t offset, const void *src, uint64_t nbytes);
     bool wait(uint64_t seq, uint64_t timeout);
     bool notify(uint64_t seq);
 };
 ```
+
+The current implementation is header-only in
+`src/common/platform/include/aicpu/l3_l2_orch_endpoint.h`.
+The endpoint uses a header-local monotonic counter for `wait()` timeout checks,
+so orchestration `.so` files do not need an extra link dependency on
+`device_time.cpp`.
 
 `payload_read` returns a GM view and does not copy. It is used for tensor input
 and output views. The streaming wrapper may also use the returned GM view for
@@ -1040,8 +1059,14 @@ nbytes
 Example:
 
 ```cpp
-PayloadView input = ep.payload_read(input_offset, nbytes);
-PayloadView output = ep.payload_read(output_offset, nbytes);
+PayloadView input{};
+PayloadView output{};
+if (!ep.payload_read(input_offset, nbytes, &input)) {
+    return endpoint_error(...);
+}
+if (!ep.payload_read(output_offset, nbytes, &output)) {
+    return endpoint_error(...);
+}
 
 ContinuousTensor input_tensor;
 input_tensor.data = input.gm_addr;
@@ -1207,6 +1232,21 @@ Worker.run drain is the acknowledgement
 ```
 
 STOP does not require a third signal slot.
+
+The sim ST implementation lives under:
+
+```text
+tests/st/a2a3/tensormap_and_ringbuffer/l3_l2_orch_comm/
+tests/st/a5/tensormap_and_ringbuffer/l3_l2_orch_comm/
+```
+
+Each test creates one region, submits one persistent L2 orchestration task, and
+then drives multiple DATA rounds entirely through `payload_write`, `notify`,
+`wait`, and `payload_read`. The L2 wrapper decodes the descriptor scalars,
+views the input/output payload slices as fixed `FLOAT32[128 * 128]` tensors,
+submits AIV work, and notifies L3 after the output producer is complete. The
+STOP round is represented only by `ChannelHeader` metadata; L2 returning from
+the orchestration task lets `Worker.run` drain act as the acknowledgement.
 
 ## Development Stages
 

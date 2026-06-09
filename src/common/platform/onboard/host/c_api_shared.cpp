@@ -201,6 +201,18 @@ int finalize_device(DeviceContextHandle ctx) {
     }
 }
 
+int l3_l2_orch_comm_init_ctx(DeviceContextHandle ctx, void *control_block, size_t control_block_size) {
+    (void)ctx;
+    (void)control_block;
+    (void)control_block_size;
+    return -1;
+}
+
+int l3_l2_orch_comm_shutdown_ctx(DeviceContextHandle ctx) {
+    (void)ctx;
+    return 0;
+}
+
 int simpler_init(
     DeviceContextHandle ctx, int device_id, const uint8_t *aicpu_binary, size_t aicpu_size,
     const uint8_t *aicore_binary, size_t aicore_size, const uint8_t *dispatcher_binary, size_t dispatcher_size
