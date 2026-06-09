@@ -54,6 +54,7 @@
 #include "utils/device_arena.h"
 #include "device_runner_helpers.h"
 #include "aicpu_loader/host/load_aicpu_op.h"
+#include "host/l3_l2_orch_comm_service.h"
 #include "host/l2_swimlane_collector.h"
 #include "host/memory_allocator.h"
 #include "host/pmu_collector.h"
@@ -70,7 +71,7 @@
  * `destroy_device_context` sees, so the non-virtual `~DeviceRunnerBase`
  * is safe — it never runs as a virtual base destructor.
  */
-class DeviceRunnerBase {
+class DeviceRunnerBase : public L3L2OrchCommBackend {
 public:
     // Public virtual dtor so the shared c_api can `delete` a polymorphic
     // `DeviceRunnerBase *` (the `destroy_device_context` entrypoint). Each
@@ -86,6 +87,8 @@ public:
     void free_tensor(void *dev_ptr);
     int copy_to_device(void *dev_ptr, const void *host_ptr, std::size_t bytes);
     int copy_from_device(void *host_ptr, const void *dev_ptr, std::size_t bytes);
+    int l3_l2_orch_comm_init(void *control_block, size_t control_block_size);
+    int l3_l2_orch_comm_shutdown();
 
     /**
      * Commit the three per-Worker pooled regions (PTO2 GM heap, PTO2
@@ -337,6 +340,8 @@ public:
      * The base default is a no-op for any arch that does not implement dep_gen.
      */
     virtual void set_dep_gen_enabled(bool /*enable*/) {}
+
+    virtual bool l3_l2_orch_comm_supported() const { return true; }
 
     /**
      * Launch an AICPU kernel. Internal helper used by the subclass's
@@ -767,6 +772,17 @@ protected:
     L2SwimlaneLevel l2_swimlane_level_{L2SwimlaneLevel::DISABLED};  // resolved from set_l2_swimlane_enabled()
     PmuEventType pmu_event_type_{PmuEventType::PIPE_UTILIZATION};   // resolved from set_pmu_enabled()
     std::string output_prefix_{};                                   // diagnostic artifact root directory
+
+private:
+    void *l3_l2_allocate_region_bytes(uint64_t bytes) override;
+    void l3_l2_free_region_bytes(void *ptr) override;
+    int l3_l2_copy_to_device(void *dev_ptr, const void *host_ptr, uint64_t bytes) override;
+    int l3_l2_copy_from_device(void *host_ptr, const void *dev_ptr, uint64_t bytes) override;
+    std::thread l3_l2_create_service_thread(std::function<void()> fn) override;
+
+    L3L2OrchCommService l3_l2_orch_comm_service_;
+    std::mutex l3_l2_alloc_mu_;
+    std::unordered_set<void *> l3_l2_allocations_;
 };
 
 #endif  // SIMPLER_COMMON_PLATFORM_ONBOARD_HOST_DEVICE_RUNNER_BASE_H

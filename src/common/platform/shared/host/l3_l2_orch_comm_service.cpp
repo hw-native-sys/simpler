@@ -218,11 +218,19 @@ void L3L2OrchCommService::alloc_region(const L3L2OrchCommRequest &request, L3L2O
 }
 
 void L3L2OrchCommService::free_region(uint64_t region_id, L3L2OrchCommResponse *response) {
-    std::lock_guard<std::mutex> lk(regions_mu_);
-    auto it = regions_.find(region_id);
-    if (it != regions_.end()) {
-        release_region(it->second);
-        regions_.erase(it);
+    Region region{};
+    bool found = false;
+    {
+        std::lock_guard<std::mutex> lk(regions_mu_);
+        auto it = regions_.find(region_id);
+        if (it != regions_.end()) {
+            region = it->second;
+            regions_.erase(it);
+            found = true;
+        }
+    }
+    if (found) {
+        release_region(region);
     }
     set_response(response, 0, ServiceError::OK, region_id, "");
 }

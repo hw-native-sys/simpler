@@ -21,6 +21,44 @@
 
 #include "common/l3_l2_orch_comm.h"
 
+inline void l3_l2_orch_endpoint_cache_invalidate_range(const void *addr, size_t size) {
+#if defined(L3_L2_ORCH_ENDPOINT_ENABLE_CACHE_MAINTENANCE) && defined(__aarch64__)
+    if (size == 0) {
+        return;
+    }
+    const size_t kCacheLineSize = 64;
+    uintptr_t start = reinterpret_cast<uintptr_t>(addr) & ~(kCacheLineSize - 1);
+    uintptr_t end = (reinterpret_cast<uintptr_t>(addr) + size + kCacheLineSize - 1) & ~(kCacheLineSize - 1);
+    for (uintptr_t p = start; p < end; p += kCacheLineSize) {
+        __asm__ __volatile__("dc civac, %0" ::"r"(p) : "memory");
+    }
+    __asm__ __volatile__("dsb sy" ::: "memory");
+    __asm__ __volatile__("isb" ::: "memory");
+#else
+    (void)addr;
+    (void)size;
+#endif
+}
+
+inline void l3_l2_orch_endpoint_cache_flush_range(const void *addr, size_t size) {
+#if defined(L3_L2_ORCH_ENDPOINT_ENABLE_CACHE_MAINTENANCE) && defined(__aarch64__)
+    if (size == 0) {
+        return;
+    }
+    const size_t kCacheLineSize = 64;
+    uintptr_t start = reinterpret_cast<uintptr_t>(addr) & ~(kCacheLineSize - 1);
+    uintptr_t end = (reinterpret_cast<uintptr_t>(addr) + size + kCacheLineSize - 1) & ~(kCacheLineSize - 1);
+    for (uintptr_t p = start; p < end; p += kCacheLineSize) {
+        __asm__ __volatile__("dc cvac, %0" ::"r"(p) : "memory");
+    }
+    __asm__ __volatile__("dsb sy" ::: "memory");
+    __asm__ __volatile__("isb" ::: "memory");
+#else
+    (void)addr;
+    (void)size;
+#endif
+}
+
 struct L3L2OrchPayloadView {
     uint64_t gm_addr;
     uint64_t nbytes;
@@ -98,7 +136,11 @@ public:
         if (!validate_payload_range("payload_read", offset, nbytes)) {
             return false;
         }
-        *out = L3L2OrchPayloadView{desc_.payload_base + offset, nbytes};
+        uint64_t gm_addr = desc_.payload_base + offset;
+        l3_l2_orch_endpoint_cache_invalidate_range(
+            reinterpret_cast<const void *>(static_cast<uintptr_t>(gm_addr)), static_cast<size_t>(nbytes)
+        );
+        *out = L3L2OrchPayloadView{gm_addr, nbytes};
         return true;
     }
 
@@ -117,6 +159,7 @@ public:
         }
         void *dst = reinterpret_cast<void *>(static_cast<uintptr_t>(desc_.payload_base + offset));
         memcpy(dst, src, static_cast<size_t>(nbytes));
+        l3_l2_orch_endpoint_cache_flush_range(dst, static_cast<size_t>(nbytes));
         return true;
     }
 
@@ -132,6 +175,9 @@ public:
             reinterpret_cast<volatile uint64_t *>(static_cast<uintptr_t>(desc_.l3_to_l2_signal_base));
         uint64_t start = l3_l2_orch_endpoint_now();
         while (true) {
+            l3_l2_orch_endpoint_cache_invalidate_range(
+                reinterpret_cast<const void *>(static_cast<uintptr_t>(desc_.l3_to_l2_signal_base)), sizeof(*slot)
+            );
             uint64_t observed = *slot;
             if (observed == seq) {
                 last_wait_seq_ = seq;
@@ -166,6 +212,9 @@ public:
         volatile uint64_t *slot =
             reinterpret_cast<volatile uint64_t *>(static_cast<uintptr_t>(desc_.l2_to_l3_signal_base));
         *slot = seq;
+        l3_l2_orch_endpoint_cache_flush_range(
+            reinterpret_cast<const void *>(static_cast<uintptr_t>(desc_.l2_to_l3_signal_base)), sizeof(*slot)
+        );
         last_notify_seq_ = seq;
         return true;
     }

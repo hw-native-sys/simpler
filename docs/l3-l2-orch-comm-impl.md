@@ -1233,20 +1233,28 @@ Worker.run drain is the acknowledgement
 
 STOP does not require a third signal slot.
 
-The sim ST implementation lives under:
+The readable a2a3 stream example lives under:
+
+```text
+examples/a2a3/tensormap_and_ringbuffer/l3_l2_orch_comm_stream/
+```
+
+The ST wrappers live under:
 
 ```text
 tests/st/a2a3/tensormap_and_ringbuffer/l3_l2_orch_comm/
 tests/st/a5/tensormap_and_ringbuffer/l3_l2_orch_comm/
 ```
 
-Each test creates one region, submits one persistent L2 orchestration task, and
-then drives multiple DATA rounds entirely through `payload_write`, `notify`,
-`wait`, and `payload_read`. The L2 wrapper decodes the descriptor scalars,
-views the input/output payload slices as fixed `FLOAT32[128 * 128]` tensors,
-submits AIV work, and notifies L3 after the output producer is complete. The
-STOP round is represented only by `ChannelHeader` metadata; L2 returning from
-the orchestration task lets `Worker.run` drain act as the acknowledgement.
+The a2a3 ST imports the example helper so the readable example and regression
+coverage share one implementation. Each run creates one region, submits one
+persistent L2 orchestration task, and then drives multiple DATA rounds entirely
+through `payload_write`, `notify`, `wait`, and `payload_read`. The L2 wrapper
+decodes the descriptor scalars, views the input/output payload slices as fixed
+`FLOAT32[128 * 128]` tensors, submits AIV work, and notifies L3 after the output
+producer is complete. The STOP round is represented only by `ChannelHeader`
+metadata; L2 returning from the orchestration task lets `Worker.run` drain act
+as the acknowledgement.
 
 ## Development Stages
 

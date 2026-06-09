@@ -195,22 +195,38 @@ int copy_from_device_ctx(DeviceContextHandle ctx, void *host_ptr, const void *de
 int finalize_device(DeviceContextHandle ctx) {
     if (ctx == NULL) return -1;
     try {
-        return static_cast<DeviceRunnerBase *>(ctx)->finalize();
+        DeviceRunnerBase *runner = static_cast<DeviceRunnerBase *>(ctx);
+        int rc = runner->l3_l2_orch_comm_shutdown();
+        int finalize_rc = runner->finalize();
+        if (rc == 0) {
+            rc = finalize_rc;
+        }
+        return rc;
     } catch (...) {
         return -1;
     }
 }
 
 int l3_l2_orch_comm_init_ctx(DeviceContextHandle ctx, void *control_block, size_t control_block_size) {
-    (void)ctx;
-    (void)control_block;
-    (void)control_block_size;
-    return -1;
+    if (ctx == NULL || control_block == NULL) return -1;
+    try {
+        DeviceRunnerBase *runner = static_cast<DeviceRunnerBase *>(ctx);
+        if (!runner->l3_l2_orch_comm_supported()) {
+            return -1;
+        }
+        return runner->l3_l2_orch_comm_init(control_block, control_block_size);
+    } catch (...) {
+        return -1;
+    }
 }
 
 int l3_l2_orch_comm_shutdown_ctx(DeviceContextHandle ctx) {
-    (void)ctx;
-    return 0;
+    if (ctx == NULL) return -1;
+    try {
+        return static_cast<DeviceRunnerBase *>(ctx)->l3_l2_orch_comm_shutdown();
+    } catch (...) {
+        return -1;
+    }
 }
 
 int simpler_init(
