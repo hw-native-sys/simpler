@@ -38,6 +38,11 @@
 #include "pto_runtime2_types.h"
 #include "pto_shared_memory.h"
 
+#if PTO2_PROFILING
+// Strong def in scope_stats_collector_aicpu.cpp; weak fallback in pto_scheduler.cpp for host/UT builds.
+extern "C" bool is_scope_stats_enabled();
+#endif
+
 #if PTO2_SCHED_PROFILING
 #include "aicpu/device_time.h"
 #define PTO2_SCHED_CYCLE_START() uint64_t _st0 = get_sys_cnt_aicpu(), _st1
@@ -580,6 +585,11 @@ struct PTO2SchedulerState {
 
         // --- Cache Line 1+: Thread 0 only (wiring dep_pool) ---
         alignas(64) PTO2DepListPool dep_pool;
+#if PTO2_PROFILING
+        // Published only for scope_stats; orchestrator must not read dep_pool's non-atomic counters directly.
+        alignas(64) std::atomic<int32_t> dep_pool_snapshot_tail;
+        std::atomic<int32_t> dep_pool_snapshot_top;
+#endif
 
         // Initialize arena-internal data + arena-external pointers; does NOT
         // store dep_pool.base (that lives in the runtime arena and is wired
@@ -590,6 +600,19 @@ struct PTO2SchedulerState {
         void destroy();
 
         void sync_to_sm() { ring->fc.last_task_alive.store(last_task_alive, std::memory_order_release); }
+
+#if PTO2_PROFILING
+        void publish_dep_pool_snapshot() {
+            dep_pool_snapshot_tail.store(dep_pool.tail, std::memory_order_release);
+            dep_pool_snapshot_top.store(dep_pool.top, std::memory_order_release);
+        }
+
+        void read_dep_pool_snapshot(int32_t &tail, int32_t &top) const {
+            top = dep_pool_snapshot_top.load(std::memory_order_acquire);
+            tail = dep_pool_snapshot_tail.load(std::memory_order_acquire);
+            if (tail > top) tail = top;
+        }
+#endif
 
         void advance_ring_pointers() {
             int32_t current_task_index = ring->fc.current_task_index.load(std::memory_order_acquire);
@@ -700,7 +723,12 @@ struct PTO2SchedulerState {
 
             if (wfanin > 0 && rss.dep_pool.available() < wfanin) {
                 rss.dep_pool.reclaim(*rss.ring, rss.last_task_alive);
-                if (wfanin > 0 && rss.dep_pool.available() < wfanin) {
+                if (rss.dep_pool.available() < wfanin) {
+#if PTO2_PROFILING
+                    if (is_scope_stats_enabled()) {
+                        rss.publish_dep_pool_snapshot();
+                    }
+#endif
                     break;  // not enough dep_pool space — keep remainder for next call
                 }
             }
@@ -760,6 +788,11 @@ struct PTO2SchedulerState {
         }
 
         ws->dep_pool_mark = rss.dep_pool.top;
+#if PTO2_PROFILING
+        if (is_scope_stats_enabled()) {
+            rss.publish_dep_pool_snapshot();
+        }
+#endif
     }
 
     void check_and_handle_consumed(PTO2TaskSlotState &slot_state) {

@@ -17,7 +17,8 @@
  * the mgmt thread (polls the per-thread ready queue, recycles buffers, refills
  * the single instance's free_queue); ScopeStatsCollector's poll thread appends
  * each full buffer's ScopeStatsRecords to an in-memory vector. After stop(),
- * write_jsonl() renders them to <output_dir>/scope_stats.jsonl.
+ * write_jsonl() renders them to
+ * <output_dir>/scope_stats/scope_stats.jsonl.
  *
  * Memory mirroring is handled by the framework via the MemoryOps installed
  * at set_memory_context time:
@@ -35,13 +36,19 @@
  *   stop()               — Inherited: drain queues, join threads.
  *   reconcile_counters() — current_buf_ptr cleared by flush + collected ==
  *                          total - dropped cross-check.
- *   write_jsonl()        — Emit scope_stats.jsonl (meta line + one record/line).
+ *   write_jsonl()        — Emit scope_stats/scope_stats.jsonl
+ *                          (meta line + one record/line).
  *   finalize()           — Free all device memory, unregister.
  *
- * Output (scope_stats.jsonl), NDJSON:
- *   line 1: {"version":3,"fatal":bool,"dropped":uint,"total":uint}
- *   line k: {"site":"file:line","depth":int,
- *            "task_window":"u/c","heap":"u/c","tensormap":"u/c"}
+ * Output (scope_stats/scope_stats.jsonl), NDJSON:
+ *   line 1: {"version":5,"fatal":bool,"dropped":uint,"total":uint,
+ *            "task_window_max":[...],"heap_max":[...],
+ *            "dep_pool_max":[...],"tensormap_max":uint}
+ *   line k: {"site":"file:line","phase":"begin|end","depth":int,
+ *            "ring":int,"task_window_start":int,"task_window_end":int,
+ *            "heap_start":uint,"heap_end":uint,
+ *            "dep_pool_start":int,"dep_pool_end":int,
+ *            "tensormap":int}
  */
 
 #ifndef SRC_COMMON_PLATFORM_INCLUDE_HOST_SCOPE_STATS_COLLECTOR_H_
@@ -150,9 +157,10 @@ public:
     // collected == total - dropped. Returns true iff the run is clean.
     bool reconcile_counters();
 
-    // Render the collected records to <output_dir>/scope_stats.jsonl. Reads the
-    // static capacity metadata + fatal latch from the shared header (constant
-    // after orchestrator init). Must be called after stop().
+    // Render the collected records to
+    // <output_dir>/scope_stats/scope_stats.jsonl. Reads the static capacity
+    // metadata + fatal latch from the shared header (constant after
+    // orchestrator init). Must be called after stop().
     int write_jsonl(const std::string &output_dir);
 
     void finalize(ScopeStatsUnregisterCallback unregister_cb, const ScopeStatsFreeCallback &free_cb);

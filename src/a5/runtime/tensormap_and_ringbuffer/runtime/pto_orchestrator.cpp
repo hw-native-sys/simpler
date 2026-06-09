@@ -433,10 +433,16 @@ void PTO2OrchestratorState::begin_scope(PTO2ScopeMode mode) {
     // collector call: when disabled we pay nothing. Sample the current ring's
     // task/heap start-end and tensormap usage at the scope boundary.
     if (is_scope_stats_enabled()) {
-        auto &alloc = orch->rings[orch->current_ring_id()].task_allocator;
+        uint8_t ring_id = orch->current_ring_id();
+        auto &alloc = orch->rings[ring_id].task_allocator;
+        int32_t dep_pool_tail = 0;
+        int32_t dep_pool_top = 0;
+        if (orch->scheduler) {
+            orch->scheduler->ring_sched_states[ring_id].read_dep_pool_snapshot(dep_pool_tail, dep_pool_top);
+        }
         scope_stats_begin(
-            orch->current_ring_id(), alloc.task_tail(), alloc.task_head(), alloc.heap_tail(), alloc.heap_top(),
-            orch->tensor_map.current_used()
+            ring_id, alloc.task_tail(), alloc.task_head(), alloc.heap_tail(), alloc.heap_top(), dep_pool_tail,
+            dep_pool_top, orch->tensor_map.current_used()
         );
     }
 #endif
@@ -456,10 +462,16 @@ void PTO2OrchestratorState::end_scope() {
     // Gate via is_scope_stats_enabled() (see begin_scope). One collector call
     // emits the end-boundary record and tears down bookkeeping.
     if (is_scope_stats_enabled()) {
-        auto &alloc = orch->rings[orch->current_ring_id()].task_allocator;
+        uint8_t ring_id = orch->current_ring_id();
+        auto &alloc = orch->rings[ring_id].task_allocator;
+        int32_t dep_pool_tail = 0;
+        int32_t dep_pool_top = 0;
+        if (orch->scheduler) {
+            orch->scheduler->ring_sched_states[ring_id].read_dep_pool_snapshot(dep_pool_tail, dep_pool_top);
+        }
         scope_stats_end(
-            orch->current_ring_id(), alloc.task_tail(), alloc.task_head(), alloc.heap_tail(), alloc.heap_top(),
-            orch->tensor_map.current_used()
+            ring_id, alloc.task_tail(), alloc.task_head(), alloc.heap_tail(), alloc.heap_top(), dep_pool_tail,
+            dep_pool_top, orch->tensor_map.current_used()
         );
     }
 #endif

@@ -244,24 +244,26 @@ int ScopeStatsCollector::write_jsonl(const std::string &output_dir) {
     const ScopeStatsDataHeader *hdr = scope_stats_header();
     const ScopeStatsBufferState *state = scope_stats_state(0);
 
-    // Line 1: run metadata. The per-ring maxima (task window / heap capacities)
-    // and the tensormap capacity are run-constants, so they live here once
-    // rather than on every record.
+    // Line 1: run metadata. Per-ring capacities and the tensormap capacity are
+    // run-constants, so they live here once rather than on every record.
     std::string task_window_max;
     std::string heap_max;
+    std::string dep_pool_max;
     for (int r = 0; r < PTO2_SCOPE_STATS_MAX_RING_DEPTH; r++) {
         char buf[32];
         std::snprintf(buf, sizeof(buf), "%s%d", r == 0 ? "" : ", ", hdr->task_window_cap[r]);
         task_window_max += buf;
         std::snprintf(buf, sizeof(buf), "%s%" PRIu64, r == 0 ? "" : ", ", hdr->heap_cap[r]);
         heap_max += buf;
+        std::snprintf(buf, sizeof(buf), "%s%d", r == 0 ? "" : ", ", hdr->dep_pool_cap[r]);
+        dep_pool_max += buf;
     }
     std::fprintf(
         fp,
-        "{\"version\": 4, \"fatal\": %s, \"dropped\": %u, \"total\": %u, "
-        "\"task_window_max\": [%s], \"heap_max\": [%s], \"tensormap_max\": %d}\n",
+        "{\"version\": 5, \"fatal\": %s, \"dropped\": %u, \"total\": %u, "
+        "\"task_window_max\": [%s], \"heap_max\": [%s], \"dep_pool_max\": [%s], \"tensormap_max\": %d}\n",
         hdr->fatal_latched ? "true" : "false", state->dropped_record_count, state->total_record_count,
-        task_window_max.c_str(), heap_max.c_str(), hdr->tensormap_cap
+        task_window_max.c_str(), heap_max.c_str(), dep_pool_max.c_str(), hdr->tensormap_cap
     );
 
     // Serialize every record into one in-memory buffer, then a single fwrite.
@@ -269,8 +271,8 @@ int ScopeStatsCollector::write_jsonl(const std::string &output_dir) {
     // parsing + per-call FILE locking on ~6×N calls was the dominant host cost.
     std::scoped_lock lock(records_mutex_);
     std::string out;
-    out.reserve(records_.size() * 128);
-    char line[320];
+    out.reserve(records_.size() * 384);
+    char line[512];
     for (const ScopeStatsRecord &rec : records_) {
         const int site_len = static_cast<int>(strnlen(rec.site_file_basename, sizeof(rec.site_file_basename)));
         const char *phase = (rec.phase == SCOPE_STATS_PHASE_BEGIN) ? "begin" : "end";
@@ -279,9 +281,10 @@ int ScopeStatsCollector::write_jsonl(const std::string &output_dir) {
             "{\"site\": \"%.*s:%d\", \"phase\": \"%s\", \"depth\": %d, \"ring\": %d, "
             "\"task_window_start\": %d, \"task_window_end\": %d, "
             "\"heap_start\": %" PRIu64 ", \"heap_end\": %" PRIu64 ", "
+            "\"dep_pool_start\": %d, \"dep_pool_end\": %d, "
             "\"tensormap\": %d}\n",
             site_len, rec.site_file_basename, rec.site_line, phase, rec.depth, rec.ring_id, rec.task_start,
-            rec.task_end, rec.heap_start, rec.heap_end, rec.tensormap_used
+            rec.task_end, rec.heap_start, rec.heap_end, rec.dep_pool_start, rec.dep_pool_end, rec.tensormap_used
         );
         if (n > 0) out.append(line, static_cast<size_t>(n < static_cast<int>(sizeof(line)) ? n : sizeof(line) - 1));
     }

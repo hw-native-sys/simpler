@@ -640,8 +640,9 @@ def _convert_case_swimlane(
 
 
 def _plot_case_scope_stats(case_label: str, output_prefix: Path) -> None:
-    """Post-case: turn ``<output_prefix>/scope_stats.jsonl`` into per-ring
-    heap-delta line charts. Path is known a priori from CallConfig.output_prefix.
+    """Post-case: turn ``<output_prefix>/scope_stats/scope_stats.jsonl`` into
+    the self-contained scope_stats HTML report. Path is known a priori from
+    CallConfig.output_prefix.
     """
     import logging  # noqa: PLC0415
 

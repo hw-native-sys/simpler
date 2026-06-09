@@ -21,6 +21,10 @@
 #include <stdlib.h>
 #include "common/unified_log.h"
 
+#if PTO2_PROFILING
+extern "C" __attribute__((weak, visibility("hidden"))) bool is_scope_stats_enabled() { return false; }
+#endif
+
 // =============================================================================
 // Scheduler Profiling Counters
 // =============================================================================
