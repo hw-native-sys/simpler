@@ -60,6 +60,8 @@ class ShapePreset:
     head_dim: int
     block_size: int
     context_len: int
+    include_in_suite: bool = True
+    run_highperf: bool = True
 
 
 SHAPE_PRESETS = {
@@ -80,6 +82,37 @@ SHAPE_PRESETS = {
         head_dim=128,
         block_size=128,
         context_len=512,
+    ),
+    "b1_h32_kv8_s4096_bs128_fp16": ShapePreset(
+        highperf_case="b1_h32_kv8_s4096_bs128_fp16",
+        batch=1,
+        num_heads=32,
+        num_kv_heads=8,
+        head_dim=128,
+        block_size=128,
+        context_len=4096,
+    ),
+    "b1_h32_kv8_s8192_bs128_fp16": ShapePreset(
+        highperf_case="b1_h32_kv8_s8192_bs128_fp16",
+        batch=1,
+        num_heads=32,
+        num_kv_heads=8,
+        head_dim=128,
+        block_size=128,
+        context_len=8192,
+        include_in_suite=False,
+        run_highperf=False,
+    ),
+    "b1_h32_kv8_s16384_bs128_fp16": ShapePreset(
+        highperf_case="b1_h32_kv8_s16384_bs128_fp16",
+        batch=1,
+        num_heads=32,
+        num_kv_heads=8,
+        head_dim=128,
+        block_size=128,
+        context_len=16384,
+        include_in_suite=False,
+        run_highperf=False,
     ),
 }
 
@@ -273,6 +306,8 @@ def _apply_shape_preset(args: argparse.Namespace, preset: ShapePreset) -> argpar
     shaped_args.context_len = preset.context_len
     shaped_args.max_model_len = preset.context_len
     shaped_args.scale = 1.0 / math.sqrt(float(preset.head_dim))
+    if not preset.run_highperf:
+        shaped_args.skip_highperf = True
     if shaped_args.q_tile is None:
         shaped_args.q_tile = 16
     return shaped_args
@@ -280,18 +315,32 @@ def _apply_shape_preset(args: argparse.Namespace, preset: ShapePreset) -> argpar
 
 def _selected_shape_names(args: argparse.Namespace) -> list[str]:
     if args.shape_suite:
-        return list(SHAPE_PRESETS)
+        return [name for name, preset in SHAPE_PRESETS.items() if preset.include_in_suite]
     return args.shape or []
 
 
-def _attention_matmul_flops(args: argparse.Namespace) -> int:
+def _attention_matmul_flops(args: argparse.Namespace | ShapePreset) -> int:
     return 4 * args.batch * args.num_heads * args.context_len * args.head_dim
 
 
-def _device_gflops(args: argparse.Namespace, result: TimingResult) -> float | None:
+def _attention_memory_bytes(args: argparse.Namespace | ShapePreset) -> int:
+    fp16_bytes = 2
+    query_bytes = args.batch * args.num_heads * args.head_dim * fp16_bytes
+    kv_cache_bytes = 2 * args.batch * args.context_len * args.num_kv_heads * args.head_dim * fp16_bytes
+    output_bytes = args.batch * args.num_heads * args.head_dim * fp16_bytes
+    return query_bytes + kv_cache_bytes + output_bytes
+
+
+def _device_gflops(args: argparse.Namespace | ShapePreset, result: TimingResult) -> float | None:
     if result.device_us is None or result.device_us <= 0:
         return None
     return _attention_matmul_flops(args) / (result.device_us * 1_000.0)
+
+
+def _device_bandwidth_gbs(args: argparse.Namespace | ShapePreset, result: TimingResult) -> float | None:
+    if result.device_us is None or result.device_us <= 0:
+        return None
+    return _attention_memory_bytes(args) / (result.device_us * 1_000.0)
 
 
 def _device_log_snapshot(device: int) -> dict[Path, int]:
@@ -556,19 +605,31 @@ def _parse_args() -> argparse.Namespace:
 def _print_highperf_result(args: argparse.Namespace, result: TimingResult) -> None:
     print(f"highperf host e2e avg:        {result.host_us:.1f} us")
     device_gflops = _device_gflops(args, result)
+    device_bandwidth_gbs = _device_bandwidth_gbs(args, result)
     if result.device_us is not None:
         print(f"highperf runtime device avg:  {result.device_us:.1f} us")
     if device_gflops is not None:
         print(f"highperf device throughput:   {device_gflops:.2f} GFLOP/s")
+    if device_bandwidth_gbs is not None:
+        print(
+            f"highperf est. bandwidth:      {device_bandwidth_gbs:.2f} GB/s "
+            f"({device_bandwidth_gbs / 1_000.0:.4f} TB/s)"
+        )
 
 
 def _print_pypto_result(args: argparse.Namespace, result: TimingResult) -> None:
     print(f"PyPTO host e2e avg:           {result.host_us:.1f} us")
     device_gflops = _device_gflops(args, result)
+    device_bandwidth_gbs = _device_bandwidth_gbs(args, result)
     if result.device_us is not None:
         print(f"PyPTO torch.npu.Event avg:    {result.device_us:.1f} us")
     if device_gflops is not None:
         print(f"PyPTO device throughput:      {device_gflops:.2f} GFLOP/s")
+    if device_bandwidth_gbs is not None:
+        print(
+            f"PyPTO est. bandwidth:         {device_bandwidth_gbs:.2f} GB/s "
+            f"({device_bandwidth_gbs / 1_000.0:.4f} TB/s)"
+        )
 
 
 def _run_one_shape(args: argparse.Namespace) -> tuple[TimingResult | None, TimingResult | None]:
@@ -608,11 +669,21 @@ def _run_shape_suite(args: argparse.Namespace, shape_names: list[str]) -> None:
             highperf_gflops_value = _device_gflops(SHAPE_PRESETS[shape_name], highperf)
             if highperf_gflops_value is not None:
                 highperf_gflops = f"{highperf_gflops_value:.2f}"
+        highperf_gbs = "n/a"
+        if highperf is not None:
+            highperf_gbs_value = _device_bandwidth_gbs(SHAPE_PRESETS[shape_name], highperf)
+            if highperf_gbs_value is not None:
+                highperf_gbs = f"{highperf_gbs_value:.2f}"
         pypto_gflops = "n/a"
         if pypto is not None:
             pypto_gflops_value = _device_gflops(SHAPE_PRESETS[shape_name], pypto)
             if pypto_gflops_value is not None:
                 pypto_gflops = f"{pypto_gflops_value:.2f}"
+        pypto_gbs = "n/a"
+        if pypto is not None:
+            pypto_gbs_value = _device_bandwidth_gbs(SHAPE_PRESETS[shape_name], pypto)
+            if pypto_gbs_value is not None:
+                pypto_gbs = f"{pypto_gbs_value:.2f}"
         ratio = "n/a"
         if highperf is not None and pypto is not None and highperf.host_us > 0:
             ratio = f"{pypto.host_us / highperf.host_us:.2f}x"
@@ -620,6 +691,7 @@ def _run_shape_suite(args: argparse.Namespace, shape_names: list[str]) -> None:
             f"{shape_name}: highperf_host_us={highperf_host} "
             f"pypto_host_us={pypto_host} pypto_npu_event_us={pypto_event} "
             f"highperf_device_gflops={highperf_gflops} pypto_device_gflops={pypto_gflops} "
+            f"highperf_est_gbs={highperf_gbs} pypto_est_gbs={pypto_gbs} "
             f"pypto/highperf={ratio}"
         )
 
