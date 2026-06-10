@@ -268,7 +268,7 @@ static void prefetch_payload(PTO2TaskPayload *payload, int32_t tensor_count, int
     __builtin_prefetch(reinterpret_cast<char *>(payload) + 128, 1, 3);
 }
 
-static bool prepare_task(
+__attribute__((always_inline)) static inline bool prepare_task(
     PTO2OrchestratorState *orch, const Arg &args, int32_t total_output_size, ActiveMask active_mask,
     PTO2PreparedTask *out
 ) {
@@ -478,7 +478,7 @@ void PTO2OrchestratorState::end_scope() {
 //
 // All tensormap work (sync / compute_task_fanin / register_task_outputs) and
 // the producer fanout_count++ loop run in the wiring thread inside wire_task.
-static TaskOutputTensors submit_task_common(
+__attribute__((always_inline)) static inline TaskOutputTensors submit_task_common(
     PTO2OrchestratorState *orch, const Arg &args, ActiveMask active_mask, int32_t aic_kernel_id, int32_t aiv0_kernel_id,
     int32_t aiv1_kernel_id
 ) {
