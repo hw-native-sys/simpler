@@ -517,6 +517,9 @@ void ChipWorker::l3_l2_orch_comm_init(uint64_t control_block_addr, size_t contro
         throw std::runtime_error("l3_l2_orch_comm_init is not supported by this runtime");
     }
     int rc = l3_l2_orch_comm_init_fn_(device_ctx_, reinterpret_cast<void *>(control_block_addr), control_block_size);
+    if (rc == PTO_RUNTIME_ERR_UNSUPPORTED) {
+        throw std::runtime_error("l3_l2_orch_comm_init is not supported by this platform/runtime");
+    }
     if (rc != 0) {
         throw std::runtime_error("l3_l2_orch_comm_init failed with code " + std::to_string(rc));
     }

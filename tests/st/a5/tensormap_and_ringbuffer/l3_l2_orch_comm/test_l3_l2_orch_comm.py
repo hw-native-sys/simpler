@@ -7,7 +7,7 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""Closed-loop L3-L2 in-flight orchestration communication ST."""
+"""a5sim-only L3-L2 in-flight communication regression; a5 onboard is unsupported."""
 
 from __future__ import annotations
 

@@ -1034,8 +1034,16 @@ Endpoint validation:
 - sequence monotonicity;
 - timeout.
 
-Endpoint errors must carry `region_id`; L3 uses it for poisoning the matching
-Host handle.
+Endpoint errors must carry `region_id` at the source. The current
+orchestration fatal channel transports endpoint metadata to the Host as a
+canonical text line:
+
+```text
+L3-L2 endpoint error ... region=<id> ...
+```
+
+`Worker.run` extracts that `region=<id>` field to poison the matching Host
+handle. The free-form message remains diagnostic only.
 
 ## Building Tensor Views On L2
 
@@ -1329,7 +1337,30 @@ Exit criteria:
 
 - bootstrap behavior is deterministic and covered in sim.
 
-### Stage 4: L2 Endpoint
+### Stage 4: Python Facade And Region Lifetime
+
+Implement:
+
+- `python/simpler/l3_l2_orch_comm.py`;
+- `Orchestrator.create_l3_l2_region(worker_id, payload_bytes)`;
+- `L3L2OrchRegion` descriptor, payload, signal, and free methods;
+- live, released, poisoned, and expired handle state checks;
+- conservative child-visible Host buffer validation;
+- deferred physical free after L3 drain.
+
+Tests:
+
+- region payload and signal commands use the independent service client;
+- pre-command validation failures do not poison the region;
+- private or unregistered Host buffers fail before service submission;
+- cleanup physically frees regions and expires handles.
+
+Exit criteria:
+
+- the Python API enforces region lifetime and preserves cleanup after orch
+  exceptions or drain errors.
+
+### Stage 5: L2 AICPU Endpoint
 
 Implement:
 
@@ -1351,7 +1382,7 @@ Exit criteria:
 
 - L2 can wait on L3 signal and notify L3 without AICore work.
 
-### Stage 5: Closed-Loop Sim Example
+### Stage 6: Closed-Loop Sim Example And ST
 
 Implement:
 
@@ -1373,7 +1404,7 @@ Exit criteria:
 
 - `a2a3sim` and `a5sim` closed-loop tests pass.
 
-### Stage 6: Onboard A2A3
+### Stage 7: A2A3 Onboard Support
 
 Implement:
 
@@ -1396,7 +1427,7 @@ Exit criteria:
 
 - a2a3 onboard passes closed-loop tests under `task-submit`.
 
-### Stage 7: A5 Onboard Stubs
+### Stage 8: A5 Onboard Stubs
 
 Implement:
 
@@ -1417,12 +1448,12 @@ Exit criteria:
 
 - a5 onboard behavior is explicit and stable.
 
-### Stage 8: Multi-Region And Poison Isolation
+### Stage 9: Multi-Region And Poison Isolation
 
 Implement:
 
 - multiple live regions per L3 run;
-- structured error mapping from `region_id` to Host handle;
+- endpoint error mapping from `region_id` to Host handle;
 - per-region poison only.
 
 Tests:
@@ -1435,7 +1466,32 @@ Tests:
 
 Exit criteria:
 
-- region attribution does not depend on parsing diagnostic strings.
+- region attribution is stable: L2 endpoint metadata includes `region_id`, the
+  current Host bridge extracts it from the canonical
+  `L3-L2 endpoint error ... region=<id>` fatal transport, and tests prove only
+  the matching Host region is poisoned.
+
+### Stage 10: Final Review And Documentation Consistency
+
+Implement:
+
+- grep changed symbols, flags, and behavior names across code and docs;
+- update stale docs and comments caused by the final Stage 8/9 behavior;
+- check the review checklist below against the implementation;
+- keep `todo.md` aligned as local progress tracking only.
+
+Tests:
+
+- Python and C++ unit tests for the L3-L2 control service and Host facade;
+- a2a3sim and a5sim closed-loop ST;
+- onboard checks only from the onboard-local worktree, after that worktree's
+  `CLAUDE.md` and the onboard arch precheck rules are applied.
+
+Exit criteria:
+
+- docs, comments, and `todo.md` agree on stage numbering, platform support,
+  unsupported a5 onboard behavior, multi-region poison isolation, and the
+  current endpoint-error attribution transport.
 
 ## Test Matrix
 
@@ -1460,6 +1516,7 @@ python -m pytest \
 Onboard a2a3:
 
 ```bash
+cd /mnt/data/ntlab/wenchy/simpler-onboard-local
 .claude/skills/onboard-arch-precheck/check.sh a2a3
 TEST_DIR=tests/st/a2a3/tensormap_and_ringbuffer/l3_l2_orch_comm
 task-submit --device auto --device-num 1 \
@@ -1469,6 +1526,7 @@ task-submit --device auto --device-num 1 \
 Onboard a5 stub:
 
 ```bash
+cd /mnt/data/ntlab/wenchy/simpler-onboard-local
 .claude/skills/onboard-arch-precheck/check.sh a5
 TEST_DIR=tests/st/a5/tensormap_and_ringbuffer/l3_l2_orch_comm
 task-submit --device auto --device-num 1 \
@@ -1479,6 +1537,9 @@ task-submit --device auto --device-num 1 \
 
 Before considering the implementation ready:
 
+- onboard commands are run only from
+  `/mnt/data/ntlab/wenchy/simpler-onboard-local` after reading that worktree's
+  `CLAUDE.md`;
 - task mailbox is used only for bootstrap;
 - in-flight commands use the independent service;
 - payload bytes never appear in control requests;
@@ -1488,6 +1549,8 @@ Before considering the implementation ready:
 - waits require finite timeouts;
 - `current > seq` is a protocol error;
 - timeout poisons only the corresponding region;
+- endpoint drain errors poison only the region named by the canonical
+  `region=<id>` endpoint fatal transport;
 - descriptor extraction fails after release or poison;
 - physical free is delayed until after L2 drain;
 - a5 onboard exports stubs, not missing symbols;

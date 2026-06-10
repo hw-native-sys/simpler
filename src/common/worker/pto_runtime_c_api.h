@@ -50,6 +50,10 @@ extern "C" {
 typedef void *RuntimeHandle;
 typedef void *DeviceContextHandle;
 
+enum {
+    PTO_RUNTIME_ERR_UNSUPPORTED = -2,
+};
+
 /**
  * Timing breakdown for a single run_prepared() invocation.
  *

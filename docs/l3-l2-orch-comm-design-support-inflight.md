@@ -478,7 +478,7 @@ tensor output path.
 `wait` waits on the L3-to-L2 signal slot. `notify` publishes on the L2-to-L3
 signal slot after relevant payload writes and barriers.
 
-L2 endpoint errors must carry structured metadata, at minimum:
+L2 endpoint errors must carry structured metadata at the source, at minimum:
 
 ```text
 kind
@@ -488,8 +488,16 @@ seq
 message
 ```
 
-L3 uses `region_id` to poison only the corresponding Host region. Human-readable
-error strings are diagnostics, not the attribution mechanism.
+The current orchestration fatal channel transports that metadata to the Host as
+a canonical text line:
+
+```text
+L3-L2 endpoint error op=<op> kind=<kind> region=<region_id> seq=<seq> ...
+```
+
+L3 extracts the `region=<region_id>` field from this standard format to poison
+only the corresponding Host region. Free-form human-readable message text
+remains diagnostic only and is not used for attribution.
 
 ## Synchronization Semantics
 
@@ -678,7 +686,8 @@ The bottom layer should fail loudly on:
 - DMA failure;
 - signal wait timeout;
 - L2 descriptor ABI mismatch;
-- L2 endpoint error metadata without a usable `region_id`.
+- L2 endpoint error metadata without a usable `region_id` in the canonical
+  fatal transport.
 
 The first version does not recover protocol state after poison. Higher-level
 stream wrappers may recreate the region and retry, but that is outside this

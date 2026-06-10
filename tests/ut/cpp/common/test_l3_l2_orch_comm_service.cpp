@@ -194,6 +194,81 @@ TEST_F(ServiceFixture, SignalWaitGreaterObservedValuePoisonsRegion) {
     EXPECT_NE(submit(write_req).status, 0);
 }
 
+TEST_F(ServiceFixture, MultipleRegionsKeepPayloadSignalsAndPoisonSeparate) {
+    L3L2OrchRegionDesc first = alloc_region();
+    L3L2OrchRegionDesc second = alloc_region();
+    const uint8_t first_src[4] = {2, 4, 6, 8};
+    const uint8_t second_src[4] = {1, 3, 5, 7};
+    uint8_t first_dst[4] = {};
+    uint8_t second_dst[4] = {};
+
+    L3L2OrchCommRequest write_req{};
+    write_req.cmd = static_cast<uint32_t>(L3L2OrchCommCmd::PAYLOAD_WRITE);
+    write_req.region_id = first.region_id;
+    write_req.host_ptr = reinterpret_cast<uint64_t>(first_src);
+    write_req.nbytes = sizeof(first_src);
+    EXPECT_EQ(submit(write_req).status, 0);
+
+    write_req.region_id = second.region_id;
+    write_req.host_ptr = reinterpret_cast<uint64_t>(second_src);
+    write_req.nbytes = sizeof(second_src);
+    EXPECT_EQ(submit(write_req).status, 0);
+
+    L3L2OrchCommRequest read_req{};
+    read_req.cmd = static_cast<uint32_t>(L3L2OrchCommCmd::PAYLOAD_READ);
+    read_req.region_id = first.region_id;
+    read_req.host_ptr = reinterpret_cast<uint64_t>(first_dst);
+    read_req.nbytes = sizeof(first_dst);
+    EXPECT_EQ(submit(read_req).status, 0);
+
+    read_req.region_id = second.region_id;
+    read_req.host_ptr = reinterpret_cast<uint64_t>(second_dst);
+    read_req.nbytes = sizeof(second_dst);
+    EXPECT_EQ(submit(read_req).status, 0);
+
+    EXPECT_EQ(std::memcmp(first_src, first_dst, sizeof(first_src)), 0);
+    EXPECT_EQ(std::memcmp(second_src, second_dst, sizeof(second_src)), 0);
+
+    L3L2OrchCommRequest notify_req{};
+    notify_req.cmd = static_cast<uint32_t>(L3L2OrchCommCmd::SIGNAL_NOTIFY);
+    notify_req.signal_slot = static_cast<uint64_t>(L3L2OrchCommSignalSlot::L2_TO_L3);
+    notify_req.region_id = first.region_id;
+    notify_req.seq = 3;
+    EXPECT_EQ(submit(notify_req).status, 0);
+    notify_req.region_id = second.region_id;
+    notify_req.seq = 7;
+    EXPECT_EQ(submit(notify_req).status, 0);
+
+    L3L2OrchCommRequest wait_req{};
+    wait_req.cmd = static_cast<uint32_t>(L3L2OrchCommCmd::SIGNAL_WAIT);
+    wait_req.signal_slot = static_cast<uint64_t>(L3L2OrchCommSignalSlot::L2_TO_L3);
+    wait_req.timeout_ns = 100000000;
+    wait_req.region_id = first.region_id;
+    wait_req.seq = 3;
+    EXPECT_EQ(submit(wait_req).status, 0);
+    wait_req.region_id = second.region_id;
+    wait_req.seq = 7;
+    EXPECT_EQ(submit(wait_req).status, 0);
+
+    notify_req.region_id = first.region_id;
+    notify_req.seq = 9;
+    EXPECT_EQ(submit(notify_req).status, 0);
+    wait_req.region_id = first.region_id;
+    wait_req.seq = 8;
+    L3L2OrchCommResponse first_poison = submit(wait_req);
+    EXPECT_NE(first_poison.status, 0);
+    EXPECT_EQ(first_poison.region_id, first.region_id);
+
+    read_req.region_id = first.region_id;
+    read_req.host_ptr = reinterpret_cast<uint64_t>(first_dst);
+    EXPECT_NE(submit(read_req).status, 0);
+
+    read_req.region_id = second.region_id;
+    read_req.host_ptr = reinterpret_cast<uint64_t>(second_dst);
+    EXPECT_EQ(submit(read_req).status, 0);
+    EXPECT_EQ(std::memcmp(second_src, second_dst, sizeof(second_src)), 0);
+}
+
 TEST_F(ServiceFixture, FreeRegionIsIdempotent) {
     L3L2OrchRegionDesc desc = alloc_region();
 

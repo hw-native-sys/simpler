@@ -212,7 +212,7 @@ int l3_l2_orch_comm_init_ctx(DeviceContextHandle ctx, void *control_block, size_
     try {
         DeviceRunnerBase *runner = static_cast<DeviceRunnerBase *>(ctx);
         if (!runner->l3_l2_orch_comm_supported()) {
-            return -1;
+            return PTO_RUNTIME_ERR_UNSUPPORTED;
         }
         return runner->l3_l2_orch_comm_init(control_block, control_block_size);
     } catch (...) {

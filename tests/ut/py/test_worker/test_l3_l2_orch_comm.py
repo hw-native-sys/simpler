@@ -24,6 +24,28 @@ class _FakeCWorker:
         self.bootstrap_calls.append((int(worker_id), str(control_shm_name)))
 
 
+class _FailingCWorker(_FakeCWorker):
+    def control_l3_l2_orch_comm_init(self, worker_id: int, control_shm_name: str) -> None:
+        super().control_l3_l2_orch_comm_init(worker_id, control_shm_name)
+        raise RuntimeError("l3_l2_orch_comm_init is not supported by this platform/runtime")
+
+
+class _EndpointFailingOrch:
+    def _clear_error(self) -> None:
+        pass
+
+    def _scope_begin(self) -> None:
+        pass
+
+    def _scope_end(self) -> None:
+        pass
+
+    def _drain(self) -> None:
+        raise RuntimeError(
+            "child failed: L3-L2 endpoint error op=wait kind=3 region=2 seq=7 observed=0 msg=wait timed out"
+        )
+
+
 class _FakeClient:
     def __init__(self):
         self.requests = []
@@ -99,6 +121,25 @@ def test_bootstrap_fails_immediately_when_worker_busy_and_service_not_ready():
         with pytest.raises(RuntimeError, match="bootstrap.*busy"):
             worker._create_l3_l2_region(0, 128)
         assert fake_c_worker.bootstrap_calls == []
+    finally:
+        worker._close_l3_l2_orch_comm()
+        shm.close()
+        shm.unlink()
+
+
+def test_bootstrap_unsupported_failure_leaves_no_partial_service_state():
+    worker, shm, _fake_c_worker, _fake_client = _make_started_worker()
+    failing_c_worker = _FailingCWorker()
+    worker._worker = failing_c_worker
+    try:
+        for _ in range(2):
+            with pytest.raises(RuntimeError, match="not supported"):
+                worker._create_l3_l2_region(0, 128)
+            assert worker._l3_l2_orch_comm_ready == set()
+            assert worker._l3_l2_orch_comm_clients == {}
+            assert worker._l3_l2_orch_comm_shms == {}
+            assert worker._live_l3_l2_regions == []
+        assert len(failing_c_worker.bootstrap_calls) == 2
     finally:
         worker._close_l3_l2_orch_comm()
         shm.close()
@@ -194,6 +235,38 @@ def test_cleanup_expires_region_handles_after_physical_free():
 
         assert [req.cmd for req, _timeout in fake_client.requests] == [
             L3L2OrchCommCmd.ALLOC_REGION,
+            L3L2OrchCommCmd.FREE_REGION,
+        ]
+    finally:
+        worker._close_l3_l2_orch_comm()
+        shm.close()
+        shm.unlink()
+
+
+def test_endpoint_region_error_poisons_only_matching_live_region_during_drain():
+    worker, shm, _fake_c_worker, fake_client = _make_started_worker()
+    worker._orch = _EndpointFailingOrch()
+    worker._start_hierarchical = lambda: None
+    regions = []
+    try:
+        def orch(_orch_handle, _args, _cfg):
+            regions.append(worker._create_l3_l2_region(0, 32))
+            regions.append(worker._create_l3_l2_region(0, 64))
+
+        with pytest.raises(RuntimeError, match="L3-L2 endpoint error.*region=2"):
+            worker.run(orch)
+
+        assert regions[0]._poisoned is False
+        assert regions[1]._poisoned is True
+        assert regions[0]._expired is True
+        assert regions[1]._expired is True
+
+        from simpler.l3_l2_orch_comm import L3L2OrchCommCmd
+
+        assert [req.cmd for req, _timeout in fake_client.requests] == [
+            L3L2OrchCommCmd.ALLOC_REGION,
+            L3L2OrchCommCmd.ALLOC_REGION,
+            L3L2OrchCommCmd.FREE_REGION,
             L3L2OrchCommCmd.FREE_REGION,
         ]
     finally:

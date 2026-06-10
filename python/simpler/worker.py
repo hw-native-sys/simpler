@@ -59,6 +59,7 @@ Usage::
 
 import ctypes
 import os
+import re
 import signal
 import struct
 import sys
@@ -111,6 +112,10 @@ from .task_interface import (
 _BOOTSTRAP_WAIT_TIMEOUT_S = 120.0
 _BOOTSTRAP_POLL_INTERVAL_S = 0.001
 _PY_CONTROL_TIMEOUT_S = 30.0
+# L2 endpoint metadata currently reaches the parent through the canonical fatal
+# text emitted by the orchestration wrapper; keep this pattern in sync with the
+# wrapper's ``L3-L2 endpoint error ... region=<id>`` format.
+_L3_L2_ENDPOINT_ERROR_REGION_RE = re.compile(r"\bL3-L2 endpoint error\b[^\n]*\bregion=(\d+)\b")
 
 
 # ---------------------------------------------------------------------------
@@ -2213,6 +2218,20 @@ class Worker:
         client = self._ensure_l3_l2_orch_comm(int(worker_id))
         return client.submit(request, timeout_s)
 
+    def _poison_l3_l2_region_from_endpoint_error(self, exc: BaseException) -> bool:
+        match = _L3_L2_ENDPOINT_ERROR_REGION_RE.search(str(exc))
+        if match is None:
+            return False
+        region_id = int(match.group(1))
+        if region_id == 0:
+            return False
+        poisoned = False
+        for region in self._live_l3_l2_regions:
+            if int(region.region_id) == region_id:
+                region._poison()
+                poisoned = True
+        return poisoned
+
     def _register_l3_l2_orch_comm_host_buffer(self, tensor) -> None:
         from .task_interface import ContinuousTensor  # noqa: PLC0415
 
@@ -2778,7 +2797,11 @@ class Worker:
             # cleanup lives in a finally: a failed task must not strand
             # backend domain allocations into the next run.
             try:
-                self._orch._drain()
+                try:
+                    self._orch._drain()
+                except Exception as e:
+                    self._poison_l3_l2_region_from_endpoint_error(e)
+                    raise
             finally:
                 try:
                     self._cleanup_l3_l2_regions()
