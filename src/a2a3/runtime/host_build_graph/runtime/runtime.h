@@ -223,6 +223,11 @@ public:
     // Task storage
     Task tasks[RUNTIME_MAX_TASKS];  // Fixed-size task array
 
+    // TraCR data placeholder
+    // Those are the pointers with the allocated memory on the device
+    void *tracrData_;
+    void *tracrDataSizes_;
+
 private:
     int next_task_id;  // Next available task ID
 

@@ -207,6 +207,11 @@ public:
     // Controlled via PTO2_ORCH_TO_SCHED environment variable.
     bool orch_to_sched;
 
+    // TraCR data placeholder
+    // Those are the pointers with the allocated memory on the device
+    void *tracrData_;
+    void *tracrDataSizes_;
+
 private:
     // Kernel binary tracking for cleanup
     int registered_kernel_func_ids_[RUNTIME_MAX_FUNC_ID];

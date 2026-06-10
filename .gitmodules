@@ -1,0 +1,3 @@
+[submodule "tools/tracr"]
+	path = tools/tracr
+	url = https://github.com/huawei-csl/TracR.git
