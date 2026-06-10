@@ -49,6 +49,14 @@ python tests/st/<case>/test_<name>.py -p a5sim --dump-tensor 2
 | `0` (or flag absent) | off — zero overhead |
 | `1` (bare `--dump-tensor`) | **partial** — only tasks marked with `Arg::dump(...)` (see §3.2) |
 | `2` (`--dump-tensor 2`) | **full** — every task's tensor inputs and outputs |
+| `3` (`--dump-tensor 3`) | **full, JSON only** — every task's metadata (shape, dtype, strides, scalar values) to `tensor_dump.json`; no payload captured, no `.bin` file |
+
+Level 3 exists for consumers that need only the per-task tensor *structure*,
+not the element data — e.g. feeding the manifest into tooling. The AICPU
+skips the arena payload copy entirely (treating every tensor like a scalar
+for payload purposes), so it incurs none of full mode's device→host
+bandwidth or arena pressure, and the manifest's `bin_file` is `null` with
+every `bin_size` at `0`.
 
 ```bash
 # Standalone runner
@@ -60,18 +68,19 @@ pytest tests/st/<case> --platform a5sim --dump-tensor 2
 pytest examples/a5/host_build_graph/vector_example --platform a5sim --dump-tensor 2
 ```
 
-The level sets `CallConfig::enable_dump_tensor` (0/1/2). The host then
+The level sets `CallConfig::enable_dump_tensor` (0/1/2/3). The host then
 allocates dump storage, publishes its base address through
 `kernel_args.dump_data_base`, and sets `PROFILING_FLAG_DUMP_TENSOR`
-(levels 1 and 2) in each worker handshake's `enable_profiling_flag` for
-the enable/disable decision. The **partial-vs-full** distinction is
-carried as a `DumpTensorLevel` in the dump shared-memory header
+(levels 1, 2, and 3) in each worker handshake's `enable_profiling_flag` for
+the enable/disable decision. The **partial / full / full-json-only**
+distinction is carried as a `DumpTensorLevel` in the dump shared-memory header
 (`DumpDataHeader::dump_tensor_level`, host-written before launch) rather
 than in the profiling-flag bitmask. The on-device AICPU reads the storage base
 via `set_platform_dump_base()`, the enable bit via
-`set_dump_tensor_enabled(GET_PROFILING_FLAG(...))`, and latches selective
-mode in `dump_tensor_init()` from the header level (`PARTIAL` →
-selective). Because the level is decided host-side **before any task is
+`set_dump_tensor_enabled(GET_PROFILING_FLAG(...))`, and latches the mode
+in `dump_tensor_init()` from the header level (`PARTIAL` → selective,
+`FULL_JSON_ONLY` → metadata-only, payload copy suppressed). Because the
+level is decided host-side **before any task is
 dispatched**, it is latched up front — there is no dependence on task
 submission order. AICore executors read the same `PROFILING_FLAG_DUMP_TENSOR`
 bit to insert a `pipe_barrier(PIPE_ALL)` before FIN when dump is on, so
@@ -123,7 +132,8 @@ Partial vs full is chosen by the **dump level** (§3.1), latched host-side
 before any dispatch — not inferred from the markers, so it never depends
 on task submission order. At level 1, tasks without a marker are skipped
 and marked tasks dump only their selected arguments. At level 2, the
-markers are ignored and every task's tensors are dumped. With no
+markers are ignored and every task's tensors are dumped. At level 3, every
+task's tensors are dumped as metadata only (no payload, no `.bin`). With no
 `--dump-tensor` (level 0) dump is off entirely.
 
 If you run at level 1 but place no `dump(...)` markers anywhere, the
@@ -151,7 +161,9 @@ same `tensor_dump/` directory.
 #### `tensor_dump.json` — Unified manifest
 
 `tensor_dump.json` is the manifest; its `bin_file` field points at
-the sibling binary payload.
+the sibling binary payload. At level 3 (full, JSON only) no payload is
+captured: `bin_file` is `null`, no `.bin` is written, and every entry's
+`bin_size` is `0`.
 
 Example manifest (one input tensor captured before dispatch):
 
@@ -304,7 +316,7 @@ DumpDataHeader                                  (host init, AICPU reads)
 ├── num_dump_threads
 ├── records_per_buffer
 ├── magic = 0x44554D50 ("DUMP")
-└── dump_tensor_level  (DumpTensorLevel: 0=off, 1=partial, 2=full; AICPU latches in dump_tensor_init)
+└── dump_tensor_level  (DumpTensorLevel: 0=off, 1=partial, 2=full, 3=full_json_only; AICPU latches in dump_tensor_init)
 
 DumpBufferState[num_dump_threads]               (per-thread)
 ├── free_queue {buffer_ptrs[SLOT_COUNT], head, tail}

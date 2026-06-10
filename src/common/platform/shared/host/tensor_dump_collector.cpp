@@ -56,6 +56,7 @@ int TensorDumpCollector::initialize(
 
     num_dump_threads_ = num_dump_threads;
     output_prefix_ = output_prefix;
+    dump_tensor_level_ = dump_tensor_level;
 
     // Stash the memory context on the base up-front so alloc_paired_buffer
     // (which reads alloc_cb_/register_cb_/free_cb_/device_id_)
@@ -171,7 +172,12 @@ void TensorDumpCollector::start_writer_thread_once() {
     std::string base_name = "tensor_dump";
     run_dir_ = std::filesystem::path(output_prefix_) / base_name;
     std::filesystem::create_directories(run_dir_);
-    bin_file_.open(run_dir_ / (base_name + ".bin"), std::ios::binary);
+    // FULL_JSON_ONLY captures no payload (device sets payload_size == 0), so
+    // there is nothing to stream — skip the .bin file rather than leaving a
+    // 0-byte artifact next to the manifest.
+    if (dump_tensor_level_ != DumpTensorLevel::FULL_JSON_ONLY) {
+        bin_file_.open(run_dir_ / (base_name + ".bin"), std::ios::binary);
+    }
     next_bin_offset_ = 0;
 
     writer_done_.store(false);
@@ -470,7 +476,9 @@ int TensorDumpCollector::export_dump_files() {
             std::this_thread::sleep_for(std::chrono::seconds(1));
         }
 
-        bin_file_.close();
+        if (bin_file_.is_open()) {
+            bin_file_.close();
+        }
 
         auto elapsed_ms =
             std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - run_start_time_)
@@ -538,7 +546,11 @@ int TensorDumpCollector::export_dump_files() {
     json << "  \"truncated_tensors\": " << total_truncated_count_ << ",\n";
     json << "  \"dropped_records\": " << total_dropped_record_count_ << ",\n";
     json << "  \"dropped_overwrite\": " << total_overwrite_count_ << ",\n";
-    json << "  \"bin_file\": \"" << base_name << ".bin\",\n";
+    if (dump_tensor_level_ == DumpTensorLevel::FULL_JSON_ONLY) {
+        json << "  \"bin_file\": null,\n";
+    } else {
+        json << "  \"bin_file\": \"" << base_name << ".bin\",\n";
+    }
     json << "  \"tensors\": [\n";
 
     bool first_entry = true;

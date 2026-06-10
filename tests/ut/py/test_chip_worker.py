@@ -43,12 +43,15 @@ class TestCallConfig:
         assert config.enable_l2_swimlane == 2
         config.enable_l2_swimlane = False
         assert config.enable_l2_swimlane == 0
-        # enable_dump_tensor is likewise a level (0=off, 1=partial, 2=full):
-        # `True` maps to level 1 (partial), explicit ints select the level.
+        # enable_dump_tensor is likewise a level (0=off, 1=partial, 2=full,
+        # 3=full_json_only): `True` maps to level 1 (partial), explicit ints
+        # select the level.
         config.enable_dump_tensor = True
         assert config.enable_dump_tensor == 1
         config.enable_dump_tensor = 2
         assert config.enable_dump_tensor == 2
+        config.enable_dump_tensor = 3
+        assert config.enable_dump_tensor == 3
         config.enable_dump_tensor = False
         assert config.enable_dump_tensor == 0
 

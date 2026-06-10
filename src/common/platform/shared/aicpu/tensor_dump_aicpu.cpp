@@ -54,7 +54,10 @@ extern "C" void set_platform_dump_base(uint64_t dump_data_base) { g_platform_dum
 extern "C" uint64_t get_platform_dump_base() { return g_platform_dump_base; }
 
 static bool g_enable_dump_tensor = false;
-static bool g_dump_tensor_selective_mode = false;
+// Dump level latched from the header in dump_tensor_init(). The selective
+// (PARTIAL) and json-only (FULL_JSON_ONLY) modes are derived from it rather
+// than tracked as separate flags — mirrors g_l2_swimlane_level.
+static DumpTensorLevel g_dump_tensor_level = DumpTensorLevel::OFF;
 struct DumpTaskMaskEntry {
     uint64_t task_id;
     TensorDumpArgMask mask;
@@ -91,15 +94,13 @@ static void clear_dump_mask_table() {
 
 extern "C" void set_dump_tensor_enabled(bool enable) {
     g_enable_dump_tensor = enable;
-    g_dump_tensor_selective_mode = false;
+    g_dump_tensor_level = DumpTensorLevel::OFF;
     clear_dump_mask_table();
 }
 
 extern "C" bool is_dump_tensor_enabled() { return g_enable_dump_tensor; }
 
-extern "C" void set_dump_tensor_selective_mode(bool enable) { g_dump_tensor_selective_mode = enable; }
-
-extern "C" bool is_dump_tensor_selective_mode() { return g_dump_tensor_selective_mode; }
+extern "C" bool is_dump_tensor_selective_mode() { return g_dump_tensor_level == DumpTensorLevel::PARTIAL; }
 
 extern "C" void set_dump_tensor_task_mask(uint64_t task_id, TensorDumpArgMask mask) {
     if (mask == TENSOR_DUMP_ARG_MASK_NONE) {
@@ -439,11 +440,10 @@ void dump_tensor_init(int num_dump_threads) {
 
     s_dump_header = get_dump_header(dump_base);
 
-    // Latch dump mode from the host-written header before any task is dumped.
-    // PARTIAL → selective (only Arg::dump()-marked tasks); FULL → every task.
-    set_dump_tensor_selective_mode(
-        static_cast<DumpTensorLevel>(s_dump_header->dump_tensor_level) == DumpTensorLevel::PARTIAL
-    );
+    // Latch dump level from the host-written header before any task is dumped.
+    // PARTIAL → selective (only Arg::dump()-marked tasks); FULL → every task;
+    // FULL_JSON_ONLY → every task, metadata only (no payload copied into arena).
+    g_dump_tensor_level = static_cast<DumpTensorLevel>(s_dump_header->dump_tensor_level);
 
     LOG_INFO_V0("Initializing tensor dump for %d threads", num_dump_threads);
 
@@ -517,7 +517,9 @@ int dump_tensor_record(int thread_idx, const TensorDumpInfo &info) {
     bool is_contiguous = tensor_dump_is_contiguous(info);
     bool is_scalar = static_cast<TensorDumpKind>(info.kind) == TensorDumpKind::SCALAR;
 
-    if (is_scalar) {
+    if (is_scalar || g_dump_tensor_level == DumpTensorLevel::FULL_JSON_ONLY) {
+        // JSON-only level captures full metadata but no payload, so the
+        // record carries shape/dtype/strides with payload_size == 0.
         copy_bytes = 0;
     } else if (bytes > state->arena_size) {
         // Tensor larger than entire arena — copy a partial sample

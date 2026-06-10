@@ -200,8 +200,10 @@ public:
      * @param user_data         Opaque pointer forwarded to callbacks
      * @param output_prefix     Per-task directory; tensor_dump/ subdir lands here
      * @param dump_tensor_level OFF / PARTIAL (only Arg::dump()-marked tasks) /
-     *                          FULL. Written to DumpDataHeader so the AICPU
-     *                          latches the mode before any dispatch.
+     *                          FULL / FULL_JSON_ONLY (every task's metadata to
+     *                          JSON, no payload or .bin). Written to
+     *                          DumpDataHeader so the AICPU latches the mode
+     *                          before any dispatch.
      * @return 0 on success, error code on failure
      */
     int initialize(
@@ -298,6 +300,9 @@ private:
     std::condition_variable write_cv_;
     std::queue<DumpedTensor> write_queue_;
     std::atomic<bool> writer_done_{false};
+
+    // Resolved dump level; FULL_JSON_ONLY suppresses the .bin file entirely.
+    DumpTensorLevel dump_tensor_level_{DumpTensorLevel::OFF};
 
     // Output directory and single binary file
     std::filesystem::path run_dir_;
