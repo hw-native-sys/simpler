@@ -99,12 +99,16 @@ class L3L2OrchCommResponse:
 class L3L2OrchCommClient:
     def __init__(self, shm: SharedMemory) -> None:
         self._shm = shm
-        self._buf = shm.buf
+        buf = shm.buf
+        assert buf is not None
+        self._buf = buf
         self._state_addr = ctypes.addressof(ctypes.c_char.from_buffer(self._buf)) + _CONTROL_OFF_STATE
         self._mu = threading.Lock()
         _mailbox_store_i32(self._state_addr, _STATE_IDLE)
 
-    def submit(self, request: L3L2OrchCommRequest, timeout_s: float = _DEFAULT_SUBMIT_TIMEOUT_S) -> L3L2OrchCommResponse:
+    def submit(
+        self, request: L3L2OrchCommRequest, timeout_s: float = _DEFAULT_SUBMIT_TIMEOUT_S
+    ) -> L3L2OrchCommResponse:
         deadline = time.monotonic() + float(timeout_s)
         with self._mu:
             while _mailbox_load_i32(self._state_addr) != _STATE_IDLE:
@@ -169,7 +173,7 @@ class _PinnedBuffer:
     def close(self) -> None:
         return None
 
-    def __enter__(self) -> "_PinnedBuffer":
+    def __enter__(self) -> _PinnedBuffer:
         return self
 
     def __exit__(self, *_: Any) -> None:
@@ -288,7 +292,9 @@ class L3L2OrchRegion:
                 f"L3-L2 payload range [{offset}, {offset + nbytes}) exceeds region size {self._payload_bytes}"
             )
 
-    def _submit(self, request: L3L2OrchCommRequest, timeout_s: float = _DEFAULT_SUBMIT_TIMEOUT_S) -> L3L2OrchCommResponse:
+    def _submit(
+        self, request: L3L2OrchCommRequest, timeout_s: float = _DEFAULT_SUBMIT_TIMEOUT_S
+    ) -> L3L2OrchCommResponse:
         try:
             response = self._owner._l3_l2_orch_comm_submit(self._worker_id, request, timeout_s)
         except Exception:

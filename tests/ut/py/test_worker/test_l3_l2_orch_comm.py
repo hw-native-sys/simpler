@@ -7,13 +7,23 @@
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
 
-import struct
 import ctypes
+import struct
 from multiprocessing.shared_memory import SharedMemory
 
 import pytest
+from simpler.l3_l2_orch_comm import L3L2OrchCommCmd, L3L2OrchCommResponse, L3L2OrchRegionDesc
+from simpler.task_interface import ContinuousTensor, DataType
+from simpler.worker import (
+    _IDLE,
+    _OFF_STATE,
+    _TASK_READY,
+    Worker,
+    _buffer_field_addr,
+    _mailbox_store_i32,
+)
 
-from simpler.worker import _IDLE, _TASK_READY, _OFF_STATE, _buffer_field_addr, _mailbox_store_i32, Worker
+from simpler_setup.runtime_builder import RuntimeBuilder
 
 
 class _FakeCWorker:
@@ -53,7 +63,6 @@ class _FakeClient:
 
     def submit(self, request, timeout_s: float):
         self.requests.append((request, timeout_s))
-        from simpler.l3_l2_orch_comm import L3L2OrchCommCmd, L3L2OrchCommResponse, L3L2OrchRegionDesc
 
         if request.cmd == L3L2OrchCommCmd.ALLOC_REGION:
             region_id = self.next_region_id
@@ -150,7 +159,6 @@ def test_region_payload_and_signal_commands_use_service_client():
     worker, shm, _fake_c_worker, fake_client = _make_started_worker()
     try:
         region = worker._create_l3_l2_region(0, 16)
-        from simpler.task_interface import ContinuousTensor, DataType
 
         payload = ContinuousTensor.make(0x1000, (16,), DataType.UINT8)
         worker._register_l3_l2_orch_comm_host_buffer(payload)
@@ -159,8 +167,6 @@ def test_region_payload_and_signal_commands_use_service_client():
         region.payload_read(8, payload, nbytes=4)
         region.notify(3)
         region.wait(3, timeout=0.001)
-
-        from simpler.l3_l2_orch_comm import L3L2OrchCommCmd
 
         assert [req.cmd for req, _timeout in fake_client.requests] == [
             L3L2OrchCommCmd.ALLOC_REGION,
@@ -180,8 +186,6 @@ def test_precommand_validation_failure_does_not_poison_region():
     try:
         region = worker._create_l3_l2_region(0, 4)
         with pytest.raises(ValueError, match="exceeds region size"):
-            from simpler.task_interface import ContinuousTensor, DataType
-
             payload = ContinuousTensor.make(0x1000, (1,), DataType.UINT8)
             worker._register_l3_l2_orch_comm_host_buffer(payload)
             region.payload_write(8, payload)
@@ -210,8 +214,6 @@ def test_private_python_payload_buffer_fails_before_service_submission_without_p
 def test_unregistered_continuous_tensor_fails_before_service_submission_without_poisoning():
     worker, shm, _fake_c_worker, fake_client = _make_started_worker()
     try:
-        from simpler.task_interface import ContinuousTensor, DataType
-
         region = worker._create_l3_l2_region(0, 4)
         payload = ContinuousTensor.make(0x1000, (4,), DataType.UINT8)
         with pytest.raises(ValueError, match="not registered"):
@@ -231,7 +233,6 @@ def test_cleanup_expires_region_handles_after_physical_free():
         worker._cleanup_l3_l2_regions()
         with pytest.raises(RuntimeError, match="expired"):
             region.descriptor_scalars()
-        from simpler.l3_l2_orch_comm import L3L2OrchCommCmd
 
         assert [req.cmd for req, _timeout in fake_client.requests] == [
             L3L2OrchCommCmd.ALLOC_REGION,
@@ -249,6 +250,7 @@ def test_endpoint_region_error_poisons_only_matching_live_region_during_drain():
     worker._start_hierarchical = lambda: None
     regions = []
     try:
+
         def orch(_orch_handle, _args, _cfg):
             regions.append(worker._create_l3_l2_region(0, 32))
             regions.append(worker._create_l3_l2_region(0, 64))
@@ -260,8 +262,6 @@ def test_endpoint_region_error_poisons_only_matching_live_region_during_drain():
         assert regions[1]._poisoned is True
         assert regions[0]._expired is True
         assert regions[1]._expired is True
-
-        from simpler.l3_l2_orch_comm import L3L2OrchCommCmd
 
         assert [req.cmd for req, _timeout in fake_client.requests] == [
             L3L2OrchCommCmd.ALLOC_REGION,
@@ -277,9 +277,6 @@ def test_endpoint_region_error_poisons_only_matching_live_region_during_drain():
 
 @pytest.mark.parametrize("platform", ["a2a3sim", "a5sim"])
 def test_sim_worker_region_payload_roundtrip(platform):
-    from simpler.task_interface import DataType
-    from simpler_setup.runtime_builder import RuntimeBuilder
-
     try:
         RuntimeBuilder(platform=platform).get_binaries("tensormap_and_ringbuffer")
     except FileNotFoundError as e:
@@ -294,6 +291,7 @@ def test_sim_worker_region_payload_roundtrip(platform):
     )
     worker.init()
     try:
+
         def orch(orch_handle, _args, _cfg):
             host = orch_handle.alloc([16], DataType.UINT8)
             buf_t = ctypes.c_uint8 * 16
@@ -314,8 +312,6 @@ def test_sim_worker_region_payload_roundtrip(platform):
 
 @pytest.mark.parametrize("platform", ["a2a3sim", "a5sim"])
 def test_sim_worker_wait_timeout_poisons_region_and_free_is_idempotent(platform):
-    from simpler_setup.runtime_builder import RuntimeBuilder
-
     try:
         RuntimeBuilder(platform=platform).get_binaries("tensormap_and_ringbuffer")
     except FileNotFoundError as e:
@@ -330,6 +326,7 @@ def test_sim_worker_wait_timeout_poisons_region_and_free_is_idempotent(platform)
     )
     worker.init()
     try:
+
         def orch(orch_handle, _args, _cfg):
             region = orch_handle.create_l3_l2_region(worker_id=0, payload_bytes=16)
             with pytest.raises(RuntimeError, match="timed out"):

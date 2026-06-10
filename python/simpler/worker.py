@@ -744,7 +744,9 @@ def _handle_ctrl_comm_init(cw: "ChipWorker", buf: memoryview) -> None:
 def _handle_ctrl_l3_l2_orch_comm_init(cw: "ChipWorker", buf: memoryview) -> SharedMemory:
     control_shm_name = _read_shm_name(buf, _OFF_ARGS)
     control_shm = SharedMemory(name=control_shm_name)
-    exported = ctypes.c_char.from_buffer(control_shm.buf)
+    control_buf = control_shm.buf
+    assert control_buf is not None
+    exported = ctypes.c_char.from_buffer(control_buf)
     success = False
     try:
         control_block_addr = ctypes.addressof(exported)
@@ -752,6 +754,7 @@ def _handle_ctrl_l3_l2_orch_comm_init(cw: "ChipWorker", buf: memoryview) -> Shar
         success = True
     finally:
         del exported
+        del control_buf
         if not success:
             control_shm.close()
     return control_shm
@@ -971,9 +974,7 @@ def _run_chip_main_loop(  # noqa: PLR0912, PLR0913, PLR0915 -- unified TASK_READ
                     code = 1
                     if sub_cmd in (_CTRL_REGISTER, _CTRL_UNREGISTER):
                         op = "register" if sub_cmd == _CTRL_REGISTER else "unregister"
-                        msg = _format_exc(
-                            f"{op} hash={_format_digest(_read_control_digest(buf))} chip={device_id}", e
-                        )
+                        msg = _format_exc(f"{op} hash={_format_digest(_read_control_digest(buf))} chip={device_id}", e)
                     else:
                         msg = _format_exc(f"chip_process dev={device_id} ctrl={int(sub_cmd)}", e)
                 _write_error(buf, code, msg)
@@ -2261,7 +2262,9 @@ class Worker:
             raise ValueError("L3-L2 payload buffer must have a nonzero address and size")
         registered_nbytes = self._l3_l2_orch_comm_host_buffers.get(base)
         if registered_nbytes is None:
-            raise ValueError("L3-L2 payload ContinuousTensor is not registered; use a tensor returned by orch.alloc(...)")
+            raise ValueError(
+                "L3-L2 payload ContinuousTensor is not registered; use a tensor returned by orch.alloc(...)"
+            )
         if nbytes > int(registered_nbytes):
             raise ValueError(
                 f"L3-L2 payload ContinuousTensor size {nbytes} exceeds registered shared storage {registered_nbytes}"

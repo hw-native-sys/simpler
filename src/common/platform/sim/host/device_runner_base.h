@@ -61,7 +61,7 @@ public:
 
     // Public virtual dtor so c_api_shared can `delete` a SimDeviceRunnerBase *
     // (destroy_device_context entrypoint).
-    virtual ~SimDeviceRunnerBase() = default;
+    ~SimDeviceRunnerBase() override = default;
 
     // --- Pure / no-op virtuals dispatched from the shared c_api glue ----
     virtual int run(Runtime &runtime, int block_dim, int launch_aicpu_num = 1) = 0;

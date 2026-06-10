@@ -73,7 +73,7 @@ scalar[i + 5] = l2_to_l3_signal_base
 ```
 
 | Field | Meaning |
-| --- | --- |
+| ----- | ------- |
 | `magic_version` | Descriptor ABI marker and version. |
 | `region_id` | Region identifier for diagnostics and region-scoped errors. |
 | `payload_base` | Base GM address of the payload byte range. |
