@@ -137,6 +137,7 @@ inline void bind_worker(nb::module_ &m) {
         .value("READY", TaskState::READY)
         .value("RUNNING", TaskState::RUNNING)
         .value("COMPLETED", TaskState::COMPLETED)
+        .value("FAILED", TaskState::FAILED)
         .value("CONSUMED", TaskState::CONSUMED);
 
     // --- Orchestrator (DAG builder, exposed via Worker.get_orchestrator()) ---

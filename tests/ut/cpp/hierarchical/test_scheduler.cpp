@@ -17,6 +17,7 @@
 #include <chrono>
 #include <cstring>
 #include <iterator>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -207,6 +208,30 @@ private:
     }
 };
 
+class FakeEndpoint final : public WorkerEndpoint {
+public:
+    explicit FakeEndpoint(int32_t endpoint_id) {
+        caps_.kind = WorkerEndpointKind::REMOTE_L3;
+        caps_.endpoint_id = endpoint_id;
+        caps_.remote = true;
+        caps_.transport = "test-remote";
+    }
+
+    const WorkerEndpointCaps &caps() const override { return caps_; }
+
+    WorkerCompletion run(Ring *ring, const WorkerDispatch &dispatch) override {
+        (void)ring;
+        WorkerCompletion completion;
+        completion.task_slot = dispatch.task_slot;
+        completion.group_index = dispatch.group_index;
+        completion.outcome = EndpointOutcome::SUCCESS;
+        return completion;
+    }
+
+private:
+    WorkerEndpointCaps caps_;
+};
+
 // ---------------------------------------------------------------------------
 // Helper: build a TaskArgs whose only tensor has the given (data, tag).
 // ---------------------------------------------------------------------------
@@ -296,6 +321,28 @@ struct SchedulerFixture : public ::testing::Test {
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+TEST(WorkerManagerTest, StartRejectsDuplicateNextLevelEndpointId) {
+    alignas(8) std::array<char, MAILBOX_SIZE> mailbox{};
+    Ring allocator;
+    allocator.init(/*heap_bytes=*/0);
+    WorkerManager manager;
+
+    manager.add_next_level(mailbox.data());
+    manager.add_next_level_endpoint(std::make_unique<FakeEndpoint>(0));
+
+    bool threw = false;
+    try {
+        manager.start(&allocator, [](WorkerCompletion) {});
+    } catch (const std::runtime_error &e) {
+        threw = true;
+        EXPECT_NE(std::string(e.what()).find("duplicate NEXT_LEVEL endpoint_id 0"), std::string::npos);
+    }
+
+    manager.stop();
+    allocator.shutdown();
+    EXPECT_TRUE(threw);
+}
 
 TEST_F(SchedulerFixture, IndependentTaskDispatchedAndConsumed) {
     auto args_a = single_tensor_args(0xCAFE, TensorArgType::OUTPUT);

@@ -248,6 +248,8 @@ SubmitResult Orchestrator::submit_impl(
     // producer is already done. CONSUMED producers are gone (resources freed),
     // so we skip them entirely.
     int32_t live_fanins = 0;
+    bool poisoned_by_failed_producer = false;
+    std::string poison_message;
     for (TaskSlot prod : producers) {
         TaskSlotState &ps = slot_state(prod);
         std::lock_guard<std::mutex> lk(ps.fanout_mu);
@@ -259,7 +261,10 @@ SubmitResult Orchestrator::submit_impl(
         ps.fanout_consumers.push_back(slot);
         ps.fanout_total++;
         s.fanin_producers.push_back(prod);
-        if (ps_state != TaskState::COMPLETED) {
+        if (ps_state == TaskState::FAILED) {
+            poisoned_by_failed_producer = true;
+            if (poison_message.empty()) poison_message = ps.failure_message;
+        } else if (ps_state != TaskState::COMPLETED) {
             live_fanins++;
         }
     }
@@ -275,6 +280,18 @@ SubmitResult Orchestrator::submit_impl(
     s.fanout_released.store(0, std::memory_order_relaxed);
 
     if (scope_ref > 0) scope_->register_task(slot);
+
+    if (poisoned_by_failed_producer) {
+        if (poison_message.empty()) poison_message = "producer task failed";
+        s.failure_message = poison_message;
+        s.state.store(TaskState::FAILED, std::memory_order_release);
+        std::vector<TaskSlot> fanin_producers = s.fanin_producers;
+        try_consume(slot);
+        for (TaskSlot prod : fanin_producers) {
+            try_consume(prod);
+        }
+        return SubmitResult{slot};
+    }
 
     // --- Step 6: If no live fanins → READY ---
     // Strict-4: push to the queue dedicated to this task's worker type so a
@@ -587,6 +604,10 @@ void Orchestrator::scope_end() {
 // =============================================================================
 
 void Orchestrator::release_ref(TaskSlot slot) {
+    try_consume(slot);
+}
+
+void Orchestrator::try_consume(TaskSlot slot) {
     TaskSlotState &s = slot_state(slot);
     int32_t released = s.fanout_released.fetch_add(1, std::memory_order_acq_rel) + 1;
     int32_t total;
@@ -594,12 +615,10 @@ void Orchestrator::release_ref(TaskSlot slot) {
         std::lock_guard<std::mutex> lk(s.fanout_mu);
         total = s.fanout_total;
     }
-    // Threshold matches Scheduler::try_consume: total contributors are
-    // 1 (self try_consume from on_task_complete, or the alloc-time sim) +
-    // N (per consumer's deferred try_consume) + 1 (this scope_end release)
-    // = N + 2 = total + 1 where total = scope_ref + N.
-    // Using `>= total + 1` keeps scope_end from prematurely consuming while
-    // a consumer (or a HeapRing peer) is still live.
+    // Threshold matches Scheduler::try_consume. fanout_total counts
+    // scope_ref + N consumer refs; the extra +1 is the terminal self
+    // release. These refs can be released from completion, poison, or
+    // scope_end paths in different orders.
     TaskState state = s.state.load(std::memory_order_acquire);
     if (released >= total + 1 && (state == TaskState::COMPLETED || state == TaskState::FAILED)) {
         on_consumed(slot);

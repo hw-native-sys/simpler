@@ -16,6 +16,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cerrno>
 #include <cstdio>
@@ -359,6 +360,28 @@ void WorkerManager::add_sub(void *mailbox) { sub_entries_.push_back(mailbox); }
 
 void WorkerManager::start(Ring *ring, const OnCompleteFn &on_complete) {
     if (ring == nullptr) throw std::invalid_argument("WorkerManager::start: null ring");
+
+    std::vector<int32_t> next_level_endpoint_ids;
+    next_level_endpoint_ids.reserve(next_level_entries_.size() + next_level_endpoint_entries_.size());
+    auto register_next_level_endpoint_id = [&](int32_t endpoint_id) {
+        if (endpoint_id < 0) {
+            throw std::runtime_error("WorkerManager::start: endpoint must have a stable endpoint_id");
+        }
+        if (std::find(next_level_endpoint_ids.begin(), next_level_endpoint_ids.end(), endpoint_id) !=
+            next_level_endpoint_ids.end()) {
+            throw std::runtime_error(
+                "WorkerManager::start: duplicate NEXT_LEVEL endpoint_id " + std::to_string(endpoint_id)
+            );
+        }
+        next_level_endpoint_ids.push_back(endpoint_id);
+    };
+    for (size_t i = 0; i < next_level_entries_.size(); ++i) {
+        register_next_level_endpoint_id(static_cast<int32_t>(i));
+    }
+    for (const auto &endpoint : next_level_endpoint_entries_) {
+        register_next_level_endpoint_id(endpoint->caps().endpoint_id);
+    }
+
     auto make_threads = [&](const std::vector<void *> &entries, std::vector<std::unique_ptr<WorkerThread>> &threads,
                             int32_t endpoint_offset) {
         for (size_t i = 0; i < entries.size(); ++i) {
@@ -372,9 +395,6 @@ void WorkerManager::start(Ring *ring, const OnCompleteFn &on_complete) {
     make_threads(next_level_entries_, next_level_threads_, 0);
     for (auto &endpoint : next_level_endpoint_entries_) {
         auto wt = std::make_unique<WorkerThread>();
-        if (endpoint->caps().endpoint_id < 0) {
-            throw std::runtime_error("WorkerManager::start: custom endpoint must have a stable endpoint_id");
-        }
         wt->start(ring, this, on_complete, std::move(endpoint));
         next_level_threads_.push_back(std::move(wt));
     }

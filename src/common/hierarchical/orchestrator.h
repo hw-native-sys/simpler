@@ -230,4 +230,5 @@ private:
     // Release one fanout reference on 'slot'.
     // If all references are released → transition to CONSUMED.
     void release_ref(TaskSlot slot);
+    void try_consume(TaskSlot slot);
 };
