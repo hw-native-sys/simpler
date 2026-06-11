@@ -66,6 +66,11 @@ __attribute__((weak, visibility("hidden"))) void dep_gen_aicpu_record_submit(
 // builds fall back to this weak `false`. Gating here still skips the
 // cross-agent occupancy reads that feed the sample when scope_stats is disabled.
 extern "C" __attribute__((weak, visibility("hidden"))) bool is_scope_stats_enabled() { return false; }
+
+// Heap-ring wrap report, called from the allocator (pto_ring_buffer.h) on each
+// wrap. Strong definition lives in the AICPU collector; host builds fall back to
+// this weak no-op so the runtime translation unit stays self-contained.
+extern "C" __attribute__((weak, visibility("hidden"))) void scope_stats_note_heap_wrap(int) {}
 #endif
 
 // =============================================================================
