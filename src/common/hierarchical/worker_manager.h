@@ -70,7 +70,11 @@ enum class MailboxState : int32_t {
     INIT_DONE = 6,
 };
 
-static constexpr size_t MAILBOX_SIZE = 4096;
+// Sized so the args region can hold any TaskArgs the runtime itself accepts
+// (CHIP_MAX_TENSOR_ARGS tensors + CHIP_MAX_SCALAR_ARGS scalars; see the
+// static_assert after MAILBOX_ARGS_CAPACITY). 4096 was too tight for composed
+// child kernels with many tensor args (issue #1024).
+static constexpr size_t MAILBOX_SIZE = 16384;
 
 // Error message region lives at the mailbox tail. 256 B of headroom is
 // enough for `<ExceptionType>: <short message>` produced by the child-side
@@ -107,6 +111,12 @@ static constexpr ptrdiff_t MAILBOX_OFF_CONTROL_CALLABLE_HASH =
     MAILBOX_OFF_ARGS + static_cast<ptrdiff_t>(CTRL_SHM_NAME_BYTES);
 static constexpr size_t MAILBOX_ARGS_CAPACITY =
     MAILBOX_SIZE - static_cast<size_t>(MAILBOX_OFF_TASK_ARGS_BLOB) - MAILBOX_ERROR_MSG_SIZE;
+static_assert(
+    MAILBOX_ARGS_CAPACITY >= TASK_ARGS_BLOB_HEADER_SIZE +
+                                 static_cast<size_t>(CHIP_MAX_TENSOR_ARGS) * sizeof(ContinuousTensor) +
+                                 static_cast<size_t>(CHIP_MAX_SCALAR_ARGS) * sizeof(uint64_t),
+    "mailbox args region must hold the largest TaskArgs blob the runtime accepts (issue #1024)"
+);
 
 // Control sub-commands (written at MAILBOX_OFF_CALLABLE when state == CONTROL_*)
 static constexpr uint64_t CTRL_MALLOC = 0;

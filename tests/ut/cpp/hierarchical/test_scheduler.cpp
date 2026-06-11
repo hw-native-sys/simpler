@@ -309,6 +309,39 @@ TEST_F(SchedulerFixture, DependentTaskDispatchedAfterProducerCompletes) {
     (void)a;
 }
 
+// Issue #1024: composed child kernels can carry far more tensor args than a
+// top-level entry (repro: 76 tensors + 2 scalars = 3064-byte blob). The
+// mailbox must hold any blob the runtime itself accepts, i.e. up to
+// CHIP_MAX_TENSOR_ARGS / CHIP_MAX_SCALAR_ARGS.
+TEST_F(SchedulerFixture, ComposedKernelArgsBlobFitsMailbox) {
+    constexpr size_t max_blob = TASK_ARGS_BLOB_HEADER_SIZE +
+                                static_cast<size_t>(CHIP_MAX_TENSOR_ARGS) * sizeof(ContinuousTensor) +
+                                static_cast<size_t>(CHIP_MAX_SCALAR_ARGS) * sizeof(uint64_t);
+    EXPECT_GE(MAILBOX_ARGS_CAPACITY, max_blob);
+
+    TaskArgs args;
+    for (int i = 0; i < 76; ++i) {
+        ContinuousTensor t{};
+        t.data = 0x1000u + static_cast<uint64_t>(i) * 0x100u;
+        t.ndims = 1;
+        t.shapes[0] = 1;
+        t.dtype = DataType::UINT8;
+        args.add_tensor(t, TensorArgType::OUTPUT);
+    }
+    args.add_scalar(1);
+    args.add_scalar(2);
+
+    auto res = orch.submit_next_level(C(76), args, cfg);
+
+    mock_worker.wait_running();
+    ASSERT_GE(mock_worker.dispatched_count(), 1)
+        << "dispatch never reached the child: args blob exceeds mailbox capacity";
+    EXPECT_EQ(mock_worker.dispatched[0].callable_hash0, 76u);
+
+    mock_worker.complete();
+    wait_consumed(res.task_slot);
+}
+
 // ===========================================================================
 // Group task tests -- fixture with 2 MockMailboxWorkers
 // ===========================================================================

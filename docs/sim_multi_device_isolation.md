@@ -20,7 +20,7 @@ Main process (Scheduler)
                                                 ← isolated globals
 ```
 
-Communication uses a 4096-byte shared-memory mailbox per chip — the same layout used for SUB-type workers. The parent copies `ChipStorageTaskArgs` into the mailbox; the child copies it to heap before calling `run_runtime` (sim runtime requires heap-backed args, not mmap-backed).
+Communication uses a fixed-size (`MAILBOX_SIZE`-byte) shared-memory mailbox per chip — the same layout used for SUB-type workers. The parent copies `ChipStorageTaskArgs` into the mailbox; the child copies it to heap before calling `run_runtime` (sim runtime requires heap-backed args, not mmap-backed).
 
 ## Why Not Fix the Globals
 

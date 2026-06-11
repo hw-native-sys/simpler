@@ -189,7 +189,11 @@ void WorkerThread::dispatch_process(TaskSlotState &s, int32_t group_index) {
     size_t blob_bytes = TASK_ARGS_BLOB_HEADER_SIZE + static_cast<size_t>(view.tensor_count) * sizeof(ContinuousTensor) +
                         static_cast<size_t>(view.scalar_count) * sizeof(uint64_t);
     if (blob_bytes > MAILBOX_ARGS_CAPACITY) {
-        throw std::runtime_error("WorkerThread::dispatch_process: args blob exceeds mailbox capacity");
+        throw std::runtime_error(
+            "WorkerThread::dispatch_process: args blob exceeds mailbox capacity: need " + std::to_string(blob_bytes) +
+            " bytes, capacity " + std::to_string(MAILBOX_ARGS_CAPACITY) +
+            " bytes, tensors=" + std::to_string(view.tensor_count) + ", scalars=" + std::to_string(view.scalar_count)
+        );
     }
     uint8_t *hash_dst = reinterpret_cast<uint8_t *>(mbox() + MAILBOX_OFF_TASK_CALLABLE_HASH);
     std::memcpy(hash_dst, s.callable.digest.data(), CALLABLE_HASH_DIGEST_SIZE);
