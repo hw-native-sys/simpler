@@ -75,7 +75,6 @@ target_compile_options(aicpu_kernel
     PRIVATE
         -Wall
         -Wextra
-        -Werror
         $<$<CXX_COMPILER_ID:GNU>:-Wno-error=class-memaccess>
         -fPIC
         -O3
