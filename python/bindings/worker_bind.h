@@ -251,20 +251,20 @@ inline void bind_worker(nb::module_ &m) {
 
         .def(
             "add_next_level_worker",
-            [](Worker &self, uint64_t mailbox_ptr) {
-                self.add_worker(WorkerType::NEXT_LEVEL, reinterpret_cast<void *>(mailbox_ptr));
+            [](Worker &self, uint64_t mailbox_ptr, int child_pid) {
+                self.add_worker(WorkerType::NEXT_LEVEL, reinterpret_cast<void *>(mailbox_ptr), child_pid);
             },
-            nb::arg("mailbox_ptr"),
+            nb::arg("mailbox_ptr"), nb::arg("child_pid") = -1,
             "Add a NEXT_LEVEL sub-worker. `mailbox_ptr` is the address of a "
             "MAILBOX_SIZE-byte MAP_SHARED region; the child process loop is "
             "Python-managed (fork + _chip_process_loop)."
         )
         .def(
             "add_sub_worker",
-            [](Worker &self, uint64_t mailbox_ptr) {
-                self.add_worker(WorkerType::SUB, reinterpret_cast<void *>(mailbox_ptr));
+            [](Worker &self, uint64_t mailbox_ptr, int child_pid) {
+                self.add_worker(WorkerType::SUB, reinterpret_cast<void *>(mailbox_ptr), child_pid);
             },
-            nb::arg("mailbox_ptr"),
+            nb::arg("mailbox_ptr"), nb::arg("child_pid") = -1,
             "Add a SUB sub-worker. `mailbox_ptr` is the address of a "
             "MAILBOX_SIZE-byte MAP_SHARED region; the child process loop is "
             "Python-managed (fork + _sub_worker_loop)."

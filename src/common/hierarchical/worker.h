@@ -74,7 +74,7 @@ public:
     // MAILBOX_SIZE-byte MAP_SHARED region; the real worker (a `ChipWorker`
     // for NEXT_LEVEL, a Python callable for SUB) lives in the forked
     // child and consumes the mailbox via the Python child loop.
-    void add_worker(WorkerType type, void *mailbox);
+    void add_worker(WorkerType type, void *mailbox, int child_pid = -1);
 
     // Start the scheduler thread. Must be called AFTER the parent has forked
     // any child workers — init() spins up threads in the parent that would

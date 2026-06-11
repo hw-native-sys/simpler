@@ -208,7 +208,10 @@ public:
     // on_complete(slot) is called (in the WorkerThread) after each run().
     // `manager` is a borrowed pointer used to report dispatch failures
     // (exception_ptr routed out of the worker thread to the orch thread).
-    void start(Ring *ring, WorkerManager *manager, const std::function<void(TaskSlot)> &on_complete, void *mailbox);
+    void start(
+        Ring *ring, WorkerManager *manager, const std::function<void(TaskSlot)> &on_complete, void *mailbox,
+        int child_pid = -1
+    );
 
     // Enqueue a dispatch for the worker. Non-blocking.
     void dispatch(WorkerDispatch d);
@@ -280,9 +283,12 @@ private:
     // so different workers can dispatch in parallel.
     std::mutex mailbox_mu_;
     bool mailbox_control_timed_out_{false};
+    int child_pid_{-1};
+    bool child_reaped_{false};
 
     void loop();
     void dispatch_process(TaskSlotState &s, int32_t group_index);
+    void check_child_alive(const char *op_name);
 
     // Common tail for the four control_* methods. Caller writes the args
     // region and holds `mailbox_mu_`; this helper signals the child,
@@ -305,8 +311,8 @@ public:
     // Register a worker. `mailbox` is a MAILBOX_SIZE-byte MAP_SHARED
     // region; the real worker (a `ChipWorker` for NEXT_LEVEL, a Python
     // callable for SUB) lives in the forked child.
-    void add_next_level(void *mailbox);
-    void add_sub(void *mailbox);
+    void add_next_level(void *mailbox, int child_pid = -1);
+    void add_sub(void *mailbox, int child_pid = -1);
 
     void start(Ring *ring, const OnCompleteFn &on_complete);
     void stop();
@@ -366,8 +372,13 @@ public:
     void clear_error();
 
 private:
-    std::vector<void *> next_level_entries_;
-    std::vector<void *> sub_entries_;
+    struct WorkerEntry {
+        void *mailbox{nullptr};
+        int child_pid{-1};
+    };
+
+    std::vector<WorkerEntry> next_level_entries_;
+    std::vector<WorkerEntry> sub_entries_;
 
     std::vector<std::unique_ptr<WorkerThread>> next_level_threads_;
     std::vector<std::unique_ptr<WorkerThread>> sub_threads_;

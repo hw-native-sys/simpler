@@ -65,10 +65,10 @@ Worker::~Worker() {
     if (initialized_) close();
 }
 
-void Worker::add_worker(WorkerType type, void *mailbox) {
+void Worker::add_worker(WorkerType type, void *mailbox, int child_pid) {
     if (initialized_) throw std::runtime_error("Worker: add_worker after init");
-    if (type == WorkerType::NEXT_LEVEL) manager_.add_next_level(mailbox);
-    else manager_.add_sub(mailbox);
+    if (type == WorkerType::NEXT_LEVEL) manager_.add_next_level(mailbox, child_pid);
+    else manager_.add_sub(mailbox, child_pid);
 }
 
 void Worker::init() {
