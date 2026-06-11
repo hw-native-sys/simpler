@@ -35,14 +35,14 @@ Orchestration structure:
     in pl.cluster() for cooperative execution
 
 Tensor layout:
-  query:       [batch * num_heads, head_dim]                    BF16
-  key_cache:   [batch * max_num_blocks_per_req * block_size, head_dim]  BF16
-  value_cache: [batch * max_num_blocks_per_req * block_size, head_dim]  BF16
+  query:       [batch * num_kv_heads * q_tile, head_dim]          FP16
+  key_cache:   [batch * max_num_blocks_per_req * num_kv_heads * block_size, head_dim]  FP16
+  value_cache: [batch * max_num_blocks_per_req * num_kv_heads * block_size, head_dim]  FP16
   block_table: [batch * max_num_blocks_per_req]                 INT32
   context_lens:[batch]                                          INT32
   scale:       [1]                                              FP32
-  out:         [batch * num_heads, head_dim]                    FP32
-  config:      [7]  (batch, num_heads, kv_head_num, head_dim,
+  out:         [batch * num_kv_heads * q_tile, head_dim]          FP32
+  config:      [7]  (batch, logical num_heads, kv_head_num, head_dim,
                      block_size, block_num_capacity, active_block_num)  INT64
 """
 
@@ -70,6 +70,18 @@ def _get_default_device_id() -> int:
     return 0
 
 
+def _validate_gqa_tile(num_heads: int, num_kv_heads: int, q_tile: int) -> None:
+    if num_kv_heads <= 0:
+        raise ValueError("num_kv_heads must be positive")
+    if num_heads % num_kv_heads != 0:
+        raise ValueError("num_heads must be divisible by num_kv_heads")
+    heads_per_kv = num_heads // num_kv_heads
+    if q_tile < heads_per_kv:
+        raise ValueError("q_tile must cover all query heads in each KV group")
+    if q_tile < 16 or q_tile % 16 != 0:
+        raise ValueError("q_tile must be a multiple of 16 for the PyPTO FP16 matmul tile")
+
+
 def build_paged_attention_spmd_program(
     batch: int,
     num_heads: int,
@@ -94,11 +106,14 @@ def build_paged_attention_spmd_program(
     max_num_blocks_per_req: maximum number of KV blocks per request
     q_tile:                 query-head tile size used by the InCore kernels
     """
-    query_rows = batch * num_heads
+    _validate_gqa_tile(num_heads, num_kv_heads, q_tile)
+    heads_per_kv = num_heads // num_kv_heads
+    padded_num_heads = num_kv_heads * q_tile
+    query_rows = batch * padded_num_heads
     key_cache_rows = batch * max_num_blocks_per_req * num_kv_heads * block_size
-    out_rows = batch * num_heads
+    out_rows = batch * padded_num_heads
     block_table_flat_size = batch * max_num_blocks_per_req
-    active_q_tile = num_heads // num_kv_heads
+    active_q_tile = heads_per_kv
     batch_q_tile = batch * q_tile
 
     @pl.program
@@ -124,13 +139,13 @@ def build_paged_attention_spmd_program(
             q_offset: pl.Scalar[pl.INDEX],
             block_num: pl.Scalar[pl.INDEX],
             block_size_param: pl.Scalar[pl.INDEX],
-            num_heads_param: pl.Scalar[pl.INDEX],
+            padded_num_heads_param: pl.Scalar[pl.INDEX],
         ) -> pl.Tensor[[batch_q_tile, block_size], pl.FP32]:
             """QK matmul with SPMD stride partitioning over batch (CUBE)."""
             spmd_idx = pl.tile.get_block_idx()
             spmd_block_num = pl.tile.get_block_num()
             for b in pl.range(spmd_idx, batch_count, spmd_block_num):
-                qi_row = b * num_heads_param + q_offset
+                qi_row = b * padded_num_heads_param + q_offset
                 cur_seq = pl.tensor.read(context_lens, [b])
                 start = block_idx_kv * block_size_param
                 remaining = cur_seq - start
@@ -139,7 +154,7 @@ def build_paged_attention_spmd_program(
                 if valid_len > 0:
                     phys_block_raw: pl.Scalar[pl.INT32] = pl.read(block_table, b * block_num + block_idx_kv)
                     phys_block_idx: pl.Scalar[pl.INDEX] = pl.cast(phys_block_raw, pl.INDEX)
-                    kv_head_idx: pl.Scalar[pl.INDEX] = q_offset // active_q_tile
+                    kv_head_idx: pl.Scalar[pl.INDEX] = q_offset // q_tile
                     kj_row = (phys_block_idx * num_kv_heads + kv_head_idx) * block_size_param
 
                     qi_l1 = pl.load(
@@ -273,7 +288,7 @@ def build_paged_attention_spmd_program(
                 if valid_len > 0:
                     phys_block_raw: pl.Scalar[pl.INT32] = pl.read(block_table, b * block_num + block_idx_kv)
                     phys_block_idx: pl.Scalar[pl.INDEX] = pl.cast(phys_block_raw, pl.INDEX)
-                    kv_head_idx: pl.Scalar[pl.INDEX] = q_offset // active_q_tile
+                    kv_head_idx: pl.Scalar[pl.INDEX] = q_offset // q_tile
                     vj_row = (phys_block_idx * num_kv_heads + kv_head_idx) * block_size_param
 
                     pij_l1 = pl.load(
@@ -342,9 +357,9 @@ def build_paged_attention_spmd_program(
                         [q_tile, head_dim],
                         target_memory=pl.MemorySpace.Vec,
                     )
-                    mi_batch = pl.store(mij_tile, [b * q_tile, 0], mi_batch, [q_tile, 1])
-                    li_batch = pl.store(lij_tile, [b * q_tile, 0], li_batch, [q_tile, 1])
-                    oi_batch = pl.store(oi_new_tile, [b * q_tile, 0], oi_batch, [q_tile, head_dim])
+                    mi_batch = pl.store(mij_tile, [b * q_tile, 0], mi_batch, [active_q_tile, 1])
+                    li_batch = pl.store(lij_tile, [b * q_tile, 0], li_batch, [active_q_tile, 1])
+                    oi_batch = pl.store(oi_new_tile, [b * q_tile, 0], oi_batch, [active_q_tile, head_dim])
             else:
                 for b in pl.range(spmd_idx, batch_count, spmd_block_num):
                     mij_tile = pl.load(
@@ -470,7 +485,6 @@ def build_paged_attention_spmd_program(
                      block_size, block_num_capacity, active_block_num]
             """
             batch_cfg = pl.tensor.read(config, [0])
-            num_heads_cfg = pl.tensor.read(config, [1])
             kv_head_num_cfg = pl.tensor.read(config, [2])
             block_size_cfg = pl.tensor.read(config, [4])
             block_num_capacity_cfg = pl.tensor.read(config, [5])
@@ -490,9 +504,10 @@ def build_paged_attention_spmd_program(
 
             max_bn_cfg = pl.min(max_bn_cfg, active_block_num_cfg)
             q_loop_cfg = kv_head_num_cfg
+            padded_num_heads_cfg = kv_head_num_cfg * q_tile
 
             for q_idx in pl.range(q_loop_cfg):
-                q_offset = q_idx * active_q_tile
+                q_offset = q_idx * q_tile
 
                 # Per-batch accumulators for online softmax across KV blocks.
                 mi_a = pl.create_tensor([batch_q_tile, 1], dtype=pl.FP32)
@@ -521,7 +536,7 @@ def build_paged_attention_spmd_program(
                             q_offset,
                             block_num_capacity_cfg,
                             block_size_cfg,
-                            num_heads_cfg,
+                            padded_num_heads_cfg,
                         )
 
                     with pl.cluster():
@@ -578,7 +593,7 @@ def build_paged_attention_spmd_program(
                         out,
                         batch_cfg,
                         q_offset,
-                        num_heads_cfg,
+                        padded_num_heads_cfg,
                     )
 
             return out
@@ -598,31 +613,32 @@ def golden(tensors: dict, params: dict | None = None) -> None:
     active_num_blocks = int(config[6].item())
     scale = float(tensors["scale"][0].item())
 
-    query = tensors["query"].float().reshape(batch_size, num_heads, head_dim)
+    padded_num_heads = tensors["query"].shape[0] // batch_size
+    q_tile = padded_num_heads // num_kv_heads
+    heads_per_kv = num_heads // num_kv_heads
+    query = tensors["query"].float().reshape(batch_size, padded_num_heads, head_dim)
     total_pool_blocks = batch_size * max_num_blocks_per_req
     key_cache = tensors["key_cache"].float().reshape(total_pool_blocks, num_kv_heads, block_size, head_dim)
     value_cache = tensors["value_cache"].float().reshape(total_pool_blocks, num_kv_heads, block_size, head_dim)
     block_table = tensors["block_table"].reshape(batch_size, max_num_blocks_per_req)
     context_lens = tensors["context_lens"]
 
-    out = torch.zeros((batch_size, num_heads, head_dim), dtype=torch.float32)
-    q_tile = 16
+    out = torch.zeros((batch_size, padded_num_heads, head_dim), dtype=torch.float32)
     max_bn = min(
         active_num_blocks,
         int((context_lens.max().item() + block_size - 1) // block_size),
     )
 
-    for q_offset in range(0, num_heads, q_tile):
-        q_tile_size = min(q_tile, num_heads - q_offset)
-        kv_head_idx = q_offset // q_tile
-        qi = query[:, q_offset : q_offset + q_tile_size, :]
+    for kv_head_idx in range(num_kv_heads):
+        q_offset = kv_head_idx * q_tile
+        qi = query[:, q_offset : q_offset + heads_per_kv, :]
         oi = torch.zeros(
-            (batch_size, q_tile_size, head_dim),
+            (batch_size, heads_per_kv, head_dim),
             dtype=value_cache.dtype,
             device=qi.device,
         )
         li = torch.zeros(
-            (batch_size, q_tile_size, 1),
+            (batch_size, heads_per_kv, 1),
             dtype=qi.dtype,
             device=qi.device,
         )
@@ -656,13 +672,13 @@ def golden(tensors: dict, params: dict | None = None) -> None:
                 oi = alpha * oi + beta * oi_new
                 mi = mi_new
 
-        out[:, q_offset : q_offset + q_tile_size, :] = torch.where(
+        out[:, q_offset : q_offset + heads_per_kv, :] = torch.where(
             li > 0,
             oi / li,
             torch.zeros_like(oi),
         )
 
-    tensors["out"][:] = out.reshape(batch_size * num_heads, head_dim)
+    tensors["out"][:] = out.reshape(batch_size * padded_num_heads, head_dim)
 
 
 def build_tensor_specs(
@@ -675,11 +691,14 @@ def build_tensor_specs(
     active_num_blocks: int,
     context_len: int | Sequence[int] | torch.Tensor,
     scale: float = 1.0,
+    q_tile: int = 16,
 ):
     """Build TensorSpec objects matching the paged_attention_spmd signature."""
     from pypto.runtime import TensorSpec  # noqa: PLC0415
 
-    query_rows = batch * num_heads
+    _validate_gqa_tile(num_heads, num_kv_heads, q_tile)
+    query_rows = batch * num_kv_heads * q_tile
+    out_rows = query_rows
     key_cache_rows = batch * max_num_blocks_per_req * num_kv_heads * block_size
     block_table_flat_size = batch * max_num_blocks_per_req
 
@@ -735,7 +754,7 @@ def build_tensor_specs(
         TensorSpec("block_table", [block_table_flat_size], torch.int32, init_value=init_block_table),
         TensorSpec("context_lens", [batch], torch.int32, init_value=init_context_lens),
         TensorSpec("scale", [1], torch.float32, init_value=init_scale),
-        TensorSpec("out", [query_rows, head_dim], torch.float32, is_output=True),
+        TensorSpec("out", [out_rows, head_dim], torch.float32, is_output=True),
         TensorSpec("config", [7], torch.int64, init_value=init_config),
     ]
 

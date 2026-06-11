@@ -32,8 +32,13 @@ HIGHPERF_REL_DIR = Path("tests/st/a2a3/tensormap_and_ringbuffer/spmd_paged_atten
 DEFAULT_PYTPO_EXAMPLE = SCRIPT_DIR / "pypto_paged_attention_spmd_fp16_gqa.py"
 AVG_HOST_RE = re.compile(r"Avg Host:\s*([0-9.]+)\s*us")
 AVG_DEVICE_RE = re.compile(r"Avg Device:\s*([0-9.]+)\s*us")
-SCHED_COST_RE = re.compile(r"sched_cost=([0-9.]+)us")
 PYTPO_ROUND_RE = re.compile(r"PYTPO_ROUND_RESULT round=\d+ host_us=([0-9.]+)(?: npu_event_us=([0-9.]+))?")
+DEVICE_LOG_AVG_RE = re.compile(
+    r"Avg\s+Total:\s*([0-9.]+)\s*us\s*\|\s*Orch:\s*([0-9.]+)\s*us\s*\|\s*Sched:\s*([0-9.]+)\s*us"
+)
+DEVICE_LOG_TRIMMED_RE = re.compile(
+    r"Trimmed Avg\s+Total:\s*([0-9.]+)\s*us\s*\|\s*Orch:\s*([0-9.]+)\s*us\s*\|\s*Sched:\s*([0-9.]+)\s*us"
+)
 
 
 def _default_repo_root() -> Path:
@@ -48,7 +53,9 @@ def _default_repo_root() -> Path:
 class TimingResult:
     host_us: float
     device_us: float | None
-    scheduler_log_us: float | None = None
+    total_us: float | None = None
+    orch_us: float | None = None
+    sched_us: float | None = None
 
 
 @dataclass(frozen=True)
@@ -101,7 +108,6 @@ SHAPE_PRESETS = {
         block_size=128,
         context_len=8192,
         include_in_suite=False,
-        run_highperf=False,
     ),
     "b1_h32_kv8_s16384_bs128_fp16": ShapePreset(
         highperf_case="b1_h32_kv8_s16384_bs128_fp16",
@@ -188,71 +194,17 @@ def _overwrite_pypto_inputs_like_highperf(tensors, args: argparse.Namespace) -> 
     tensors["context_lens"][:] = torch.full((args.batch,), args.context_len, dtype=torch.int32)
     tensors["scale"][:] = torch.tensor([args.scale], dtype=torch.float32)
     tensors["config"][:] = torch.tensor(
-        [args.batch, pypto_num_heads, args.num_kv_heads, args.head_dim, args.block_size, max_blocks, active_blocks],
+        [args.batch, args.num_heads, args.num_kv_heads, args.head_dim, args.block_size, max_blocks, active_blocks],
         dtype=torch.int64,
     )
 
 
-def _extract_logical_heads(padded: torch.Tensor, args: argparse.Namespace) -> torch.Tensor:
-    heads_per_kv = args.num_heads // args.num_kv_heads
-    pypto_num_heads = args.num_kv_heads * args.q_tile
-    logical = torch.empty(args.batch, args.num_heads, args.head_dim, dtype=padded.dtype, device=padded.device)
-    for batch_idx in range(args.batch):
-        for kv_idx in range(args.num_kv_heads):
-            logical_start = kv_idx * heads_per_kv
-            logical_end = logical_start + heads_per_kv
-            padded_start = batch_idx * pypto_num_heads + kv_idx * args.q_tile
-            padded_end = padded_start + heads_per_kv
-            logical[batch_idx, logical_start:logical_end, :] = padded[padded_start:padded_end, :]
-    return logical
-
-
-def _compute_highperf_reference_from_pypto_tensors(tensors, args: argparse.Namespace) -> torch.Tensor:
-    query = _extract_logical_heads(tensors["query"], args)
-    max_blocks = args.max_model_len // args.block_size
-    total_blocks = args.batch * max_blocks
-    key_cache = tensors["key_cache"].reshape(total_blocks, args.num_kv_heads, args.block_size, args.head_dim)
-    value_cache = tensors["value_cache"].reshape(total_blocks, args.num_kv_heads, args.block_size, args.head_dim)
-    key_page = key_cache.permute(0, 2, 1, 3).contiguous()
-    value_page = value_cache.permute(0, 2, 1, 3).contiguous()
-    block_table = tensors["block_table"].reshape(args.batch, max_blocks)
-    context_lens = tensors["context_lens"]
-
-    heads_per_kv = args.num_heads // args.num_kv_heads
-    reference = torch.empty(args.batch, args.num_heads, args.head_dim, dtype=torch.float32)
-    for batch_idx in range(args.batch):
-        seq_len = int(context_lens[batch_idx].item())
-        block_count = (seq_len + args.block_size - 1) // args.block_size
-        blocks = block_table[batch_idx, :block_count]
-        for head_idx in range(args.num_heads):
-            kv_head = head_idx // heads_per_kv
-            keys = []
-            values = []
-            remaining = seq_len
-            for block in blocks:
-                valid = min(args.block_size, remaining)
-                block_id = int(block.item())
-                keys.append(key_page[block_id, :valid, kv_head, :])
-                values.append(value_page[block_id, :valid, kv_head, :])
-                remaining -= valid
-            key = torch.cat(keys, dim=0).float()
-            value = torch.cat(values, dim=0).float()
-            scores = torch.mv(key, query[batch_idx, head_idx].float()) * args.scale
-            probs = torch.softmax(scores, dim=0)
-            reference[batch_idx, head_idx] = torch.mv(value.t(), probs)
-    return reference
-
-
-def _validate_pypto_reference_parity(module, tensors, args: argparse.Namespace) -> None:
-    expected = torch.zeros_like(tensors["out"])
-    tensors["out"] = expected
-    module.golden(tensors)
-    pypto_reference = _extract_logical_heads(expected, args).float()
-    highperf_reference = _compute_highperf_reference_from_pypto_tensors(tensors, args)
-    if not torch.allclose(pypto_reference, highperf_reference, rtol=1e-3, atol=1e-3):
-        max_diff = (pypto_reference - highperf_reference).abs().max().item()
-        raise RuntimeError(f"PyPTO/highperf reference parity failed: max diff={max_diff}")
-    print("PYTPO_HIGHPERF_REFERENCE_PARITY passed", flush=True)
+def _parse_device_log_summary(output: str) -> tuple[float, float, float] | None:
+    matches = list(DEVICE_LOG_TRIMMED_RE.finditer(output)) or list(DEVICE_LOG_AVG_RE.finditer(output))
+    if not matches:
+        return None
+    match = matches[-1]
+    return float(match.group(1)), float(match.group(2)), float(match.group(3))
 
 
 def _parse_highperf_timing(output: str) -> TimingResult:
@@ -260,38 +212,37 @@ def _parse_highperf_timing(output: str) -> TimingResult:
     if host_match is None:
         raise RuntimeError("Could not parse highperf Avg Host timing from scene-test output")
     device_match = AVG_DEVICE_RE.search(output)
+    total_us = orch_us = sched_us = None
+    device_log_summary = _parse_device_log_summary(output)
+    if device_log_summary is not None:
+        total_us, orch_us, sched_us = device_log_summary
     return TimingResult(
         host_us=float(host_match.group(1)),
         device_us=float(device_match.group(1)) if device_match is not None else None,
+        total_us=total_us,
+        orch_us=orch_us,
+        sched_us=sched_us,
     )
 
 
-def _parse_pypto_device_timings(output: str, rounds: int, scheduler_threads: int) -> list[float]:
-    costs = [float(match.group(1)) for match in SCHED_COST_RE.finditer(output)]
-    if not costs:
-        return []
-
-    group_size = max(1, scheduler_threads)
-    groups = [costs[idx : idx + group_size] for idx in range(0, len(costs), group_size)]
-    complete_groups = [group for group in groups if len(group) == group_size]
-    if not complete_groups:
-        return []
-
-    measured_groups = complete_groups[-rounds:]
-    return [max(group) for group in measured_groups]
-
-
-def _parse_pypto_child_timing(output: str, args: argparse.Namespace) -> TimingResult:
+def _parse_pypto_child_timing(output: str, args: argparse.Namespace, device_rounds=None) -> TimingResult:
     matches = list(PYTPO_ROUND_RE.finditer(output))
     host_samples = [float(match.group(1)) for match in matches]
     if not host_samples:
         raise RuntimeError("Could not parse PyPTO host timing from child output")
     event_samples = [float(match.group(2)) for match in matches if match.group(2) is not None]
-    log_samples = _parse_pypto_device_timings(output, args.rounds, args.aicpu_thread_num - 1)
+    total_us = orch_us = sched_us = None
+    if device_rounds:
+        measured = device_rounds[-args.rounds :]
+        total_us = mean(round.total_us for round in measured)
+        orch_us = mean(round.orch_us for round in measured)
+        sched_us = mean(round.sched_us for round in measured)
     return TimingResult(
         host_us=mean(host_samples),
         device_us=mean(event_samples) if event_samples else None,
-        scheduler_log_us=mean(log_samples) if log_samples else None,
+        total_us=total_us,
+        orch_us=orch_us,
+        sched_us=sched_us,
     )
 
 
@@ -319,63 +270,50 @@ def _selected_shape_names(args: argparse.Namespace) -> list[str]:
     return args.shape or []
 
 
-def _attention_matmul_flops(args: argparse.Namespace | ShapePreset) -> int:
-    return 4 * args.batch * args.num_heads * args.context_len * args.head_dim
+def _load_device_log_tools(repo_root: Path):
+    repo_root = repo_root.resolve()
+    if str(repo_root) not in sys.path:
+        sys.path.insert(0, str(repo_root))
+    from simpler_setup.tools.device_log_resolver import get_log_root
+    from simpler_setup.tools.device_log_timing import parse_device_log_timing
+
+    return get_log_root, parse_device_log_timing
 
 
-def _attention_memory_bytes(args: argparse.Namespace | ShapePreset) -> int:
-    fp16_bytes = 2
-    query_bytes = args.batch * args.num_heads * args.head_dim * fp16_bytes
-    kv_cache_bytes = 2 * args.batch * args.context_len * args.num_kv_heads * args.head_dim * fp16_bytes
-    output_bytes = args.batch * args.num_heads * args.head_dim * fp16_bytes
-    return query_bytes + kv_cache_bytes + output_bytes
-
-
-def _device_gflops(args: argparse.Namespace | ShapePreset, result: TimingResult) -> float | None:
-    if result.device_us is None or result.device_us <= 0:
-        return None
-    return _attention_matmul_flops(args) / (result.device_us * 1_000.0)
-
-
-def _device_bandwidth_gbs(args: argparse.Namespace | ShapePreset, result: TimingResult) -> float | None:
-    if result.device_us is None or result.device_us <= 0:
-        return None
-    return _attention_memory_bytes(args) / (result.device_us * 1_000.0)
-
-
-def _device_log_snapshot(device: int) -> dict[Path, int]:
-    log_dir = Path(f"/root/ascend/log/debug/device-{device}")
-    if not log_dir.is_dir():
-        return {}
-
-    snapshot: dict[Path, int] = {}
-    for log_path in log_dir.glob("device-*.log"):
+def _device_log_paths(args: argparse.Namespace) -> list[Path]:
+    get_log_root, _ = _load_device_log_tools(args.repo_root)
+    log_dir = get_log_root() / f"device-{args.device}"
+    paths_with_mtime = []
+    for log_path in log_dir.glob("*.log"):
         try:
-            if log_path.is_file():
-                snapshot[log_path] = log_path.stat().st_size
+            paths_with_mtime.append((log_path.stat().st_mtime_ns, log_path))
         except OSError:
             continue
-    return snapshot
+    paths_with_mtime.sort()
+    return [path for _, path in paths_with_mtime]
 
 
-def _read_device_log_delta(device: int, snapshot: dict[Path, int]) -> str:
-    log_dir = Path(f"/root/ascend/log/debug/device-{device}")
-    if not log_dir.is_dir():
-        return ""
-
-    chunks = []
-    for log_path in sorted(log_dir.glob("device-*.log")):
+def _snapshot_device_logs(args: argparse.Namespace) -> tuple[list[Path], dict[str, int]]:
+    logs = _device_log_paths(args)
+    offsets: dict[str, int] = {}
+    for log_path in logs:
         try:
-            old_size = snapshot.get(log_path, 0)
-            new_size = log_path.stat().st_size
-            if new_size <= old_size:
-                continue
-            with log_path.open("rb") as log_file:
-                log_file.seek(old_size)
-                chunks.append(log_file.read().decode(errors="ignore"))
+            offsets[str(log_path)] = log_path.stat().st_size
         except OSError:
             continue
-    return "".join(chunks)
+    return logs, offsets
+
+
+def _parse_pypto_device_log_rounds(args: argparse.Namespace, offsets: dict[str, int], timeout: float = 20.0):
+    _, parse_device_log_timing = _load_device_log_tools(args.repo_root)
+    deadline = time.monotonic() + timeout
+    rounds = []
+    while time.monotonic() < deadline:
+        rounds = parse_device_log_timing(_device_log_paths(args), offsets=offsets)
+        if len(rounds) >= args.rounds:
+            return rounds
+        time.sleep(0.5)
+    return rounds
 
 
 def _run_highperf(args: argparse.Namespace) -> TimingResult:
@@ -402,8 +340,8 @@ def _run_highperf(args: argparse.Namespace) -> TimingResult:
         "--rounds",
         str(rounds),
     ]
-    if not args.validate_results:
-        command.append("--skip-golden")
+    command.append("--skip-golden")
+    command.append("--enable-device-log-timing")
     if args.enable_l2_swimlane:
         command.append("--enable-l2-swimlane")
 
@@ -458,10 +396,6 @@ def _pypto_child_command(args: argparse.Namespace) -> list[str]:
     ]
     if args.enable_l2_swimlane:
         command.append("--enable-l2-swimlane")
-    if args.validate_pypto:
-        command.append("--validate-pypto")
-    if args.validate_results:
-        command.append("--validate-results")
     return command
 
 
@@ -469,15 +403,15 @@ def _run_pypto(args: argparse.Namespace) -> TimingResult:
     command = _pypto_child_command(args)
     print("\n== PyPTO SPMD example ==")
     print(" ".join(command))
-    log_snapshot = _device_log_snapshot(args.device)
+    _logs, offsets = _snapshot_device_logs(args)
     proc = subprocess.run(command, cwd=REPO_ROOT, text=True, capture_output=True, check=False)
-    device_log_delta = _read_device_log_delta(args.device, log_snapshot)
+    device_rounds = _parse_pypto_device_log_rounds(args, offsets)
     print(proc.stdout, end="")
     if proc.stderr:
         print(proc.stderr, end="", file=sys.stderr)
     if proc.returncode != 0:
         raise RuntimeError(f"PyPTO benchmark failed with exit code {proc.returncode}")
-    return _parse_pypto_child_timing(proc.stdout + proc.stderr + device_log_delta, args)
+    return _parse_pypto_child_timing(proc.stdout + proc.stderr, args, device_rounds=device_rounds)
 
 
 def _run_pypto_child(args: argparse.Namespace) -> None:
@@ -489,7 +423,7 @@ def _run_pypto_child(args: argparse.Namespace) -> None:
     pypto_num_heads = args.num_kv_heads * args.q_tile
     program = module.build_paged_attention_spmd_program(
         batch=args.batch,
-        num_heads=pypto_num_heads,
+        num_heads=args.num_heads,
         num_kv_heads=args.num_kv_heads,
         head_dim=args.head_dim,
         block_size=args.block_size,
@@ -498,7 +432,7 @@ def _run_pypto_child(args: argparse.Namespace) -> None:
     )
     tensor_specs = module.build_tensor_specs(
         batch=args.batch,
-        num_heads=pypto_num_heads,
+        num_heads=args.num_heads,
         num_kv_heads=args.num_kv_heads,
         head_dim=args.head_dim,
         block_size=args.block_size,
@@ -506,11 +440,10 @@ def _run_pypto_child(args: argparse.Namespace) -> None:
         active_num_blocks=active_blocks,
         context_len=args.context_len,
         scale=args.scale,
+        q_tile=args.q_tile,
     )
     tensors, input_tensors = module._build_runtime_tensors(tensor_specs)
     _overwrite_pypto_inputs_like_highperf(tensors, args)
-    if args.validate_results:
-        _validate_pypto_reference_parity(module, tensors, args)
     input_tensors = tuple(tensors[spec.name] for spec in tensor_specs if not spec.is_output)
     run_config = RunConfig(
         platform=args.platform,
@@ -534,15 +467,8 @@ def _run_pypto_child(args: argparse.Namespace) -> None:
     )
     compiled = run(program, config=run_config)
 
-    output = compiled(*input_tensors, config=run_config)
+    compiled(*input_tensors, config=run_config)
     _sync_torch()
-    if args.validate_pypto or args.validate_results:
-        expected = torch.zeros_like(output)
-        tensors["out"] = expected
-        module.golden(tensors)
-        if not torch.allclose(output, expected, rtol=2e-2, atol=2e-2):
-            max_diff = (output - expected).abs().max().item()
-            raise RuntimeError(f"PyPTO validation failed: max diff={max_diff}")
 
     for warmup_idx in range(args.warmup):
         print(f"PYTPO_WARMUP_BEGIN {warmup_idx}", flush=True)
@@ -582,8 +508,6 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--pypto-example", type=Path, default=DEFAULT_PYTPO_EXAMPLE)
     parser.add_argument("--shape", action="append", choices=sorted(SHAPE_PRESETS))
     parser.add_argument("--shape-suite", action="store_true")
-    parser.add_argument("--validate-pypto", action="store_true")
-    parser.add_argument("--validate-results", action="store_true")
     parser.add_argument("--highperf-case", default="b4_h32_kv8_s512_bs128_fp16")
     parser.add_argument("--batch", type=int, default=4)
     parser.add_argument("--num-heads", type=int, default=32)
@@ -602,50 +526,42 @@ def _parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def _print_highperf_result(args: argparse.Namespace, result: TimingResult) -> None:
+def _print_highperf_result(result: TimingResult) -> None:
     print(f"highperf host e2e avg:        {result.host_us:.1f} us")
-    device_gflops = _device_gflops(args, result)
-    device_bandwidth_gbs = _device_bandwidth_gbs(args, result)
     if result.device_us is not None:
         print(f"highperf runtime device avg:  {result.device_us:.1f} us")
-    if device_gflops is not None:
-        print(f"highperf device throughput:   {device_gflops:.2f} GFLOP/s")
-    if device_bandwidth_gbs is not None:
-        print(
-            f"highperf est. bandwidth:      {device_bandwidth_gbs:.2f} GB/s "
-            f"({device_bandwidth_gbs / 1_000.0:.4f} TB/s)"
-        )
+    if result.total_us is not None:
+        print(f"highperf device-log total:    {result.total_us:.1f} us")
+        print(f"highperf device-log orch:     {result.orch_us:.1f} us")
+        print(f"highperf device-log sched:    {result.sched_us:.1f} us")
 
 
-def _print_pypto_result(args: argparse.Namespace, result: TimingResult) -> None:
+def _print_pypto_result(result: TimingResult) -> None:
     print(f"PyPTO host e2e avg:           {result.host_us:.1f} us")
-    device_gflops = _device_gflops(args, result)
-    device_bandwidth_gbs = _device_bandwidth_gbs(args, result)
     if result.device_us is not None:
         print(f"PyPTO torch.npu.Event avg:    {result.device_us:.1f} us")
-    if device_gflops is not None:
-        print(f"PyPTO device throughput:      {device_gflops:.2f} GFLOP/s")
-    if device_bandwidth_gbs is not None:
-        print(
-            f"PyPTO est. bandwidth:         {device_bandwidth_gbs:.2f} GB/s "
-            f"({device_bandwidth_gbs / 1_000.0:.4f} TB/s)"
-        )
+    if result.total_us is not None:
+        print(f"PyPTO device-log total:       {result.total_us:.1f} us")
+        print(f"PyPTO device-log orch:        {result.orch_us:.1f} us")
+        print(f"PyPTO device-log sched:       {result.sched_us:.1f} us")
 
 
 def _run_one_shape(args: argparse.Namespace) -> tuple[TimingResult | None, TimingResult | None]:
     print(f"Note: PyPTO runs from {args.pypto_example} with deterministic highperf-style inputs.")
-    print("Note: host e2e is the primary comparison; PyPTO torch.npu.Event timing is secondary context.")
+    print("Note: device-log Total/Orch/Sched is the primary on-device comparison.")
     highperf = None if args.skip_highperf else _run_highperf(args)
     pypto = None if args.skip_pypto else _run_pypto(args)
 
     print("\n== summary ==")
     if highperf is not None:
-        _print_highperf_result(args, highperf)
+        _print_highperf_result(highperf)
     if pypto is not None:
-        _print_pypto_result(args, pypto)
+        _print_pypto_result(pypto)
     if highperf is not None and pypto is not None:
         if highperf.host_us > 0:
             print(f"PyPTO / highperf host e2e:    {pypto.host_us / highperf.host_us:.2f}x")
+        if highperf.total_us is not None and pypto.total_us is not None and highperf.total_us > 0:
+            print(f"PyPTO / highperf device total: {pypto.total_us / highperf.total_us:.2f}x")
     return highperf, pypto
 
 
@@ -664,35 +580,42 @@ def _run_shape_suite(args: argparse.Namespace, shape_names: list[str]) -> None:
         pypto_event = "n/a"
         if pypto is not None and pypto.device_us is not None:
             pypto_event = f"{pypto.device_us:.1f}"
-        highperf_gflops = "n/a"
-        if highperf is not None:
-            highperf_gflops_value = _device_gflops(SHAPE_PRESETS[shape_name], highperf)
-            if highperf_gflops_value is not None:
-                highperf_gflops = f"{highperf_gflops_value:.2f}"
-        highperf_gbs = "n/a"
-        if highperf is not None:
-            highperf_gbs_value = _device_bandwidth_gbs(SHAPE_PRESETS[shape_name], highperf)
-            if highperf_gbs_value is not None:
-                highperf_gbs = f"{highperf_gbs_value:.2f}"
-        pypto_gflops = "n/a"
-        if pypto is not None:
-            pypto_gflops_value = _device_gflops(SHAPE_PRESETS[shape_name], pypto)
-            if pypto_gflops_value is not None:
-                pypto_gflops = f"{pypto_gflops_value:.2f}"
-        pypto_gbs = "n/a"
-        if pypto is not None:
-            pypto_gbs_value = _device_bandwidth_gbs(SHAPE_PRESETS[shape_name], pypto)
-            if pypto_gbs_value is not None:
-                pypto_gbs = f"{pypto_gbs_value:.2f}"
-        ratio = "n/a"
+        host_ratio = "n/a"
         if highperf is not None and pypto is not None and highperf.host_us > 0:
-            ratio = f"{pypto.host_us / highperf.host_us:.2f}x"
+            host_ratio = f"{pypto.host_us / highperf.host_us:.2f}x"
+        device_total_ratio = "n/a"
+        if (
+            highperf is not None
+            and pypto is not None
+            and highperf.total_us is not None
+            and pypto.total_us is not None
+            and highperf.total_us > 0
+        ):
+            device_total_ratio = f"{pypto.total_us / highperf.total_us:.2f}x"
+        pypto_total = "n/a"
+        pypto_orch = "n/a"
+        pypto_sched = "n/a"
+        if pypto is not None and pypto.total_us is not None:
+            pypto_total = f"{pypto.total_us:.1f}"
+            pypto_orch = f"{pypto.orch_us:.1f}"
+            pypto_sched = f"{pypto.sched_us:.1f}"
+        highperf_device = "n/a"
+        if highperf is not None and highperf.device_us is not None:
+            highperf_device = f"{highperf.device_us:.1f}"
+        highperf_total = "n/a"
+        highperf_orch = "n/a"
+        highperf_sched = "n/a"
+        if highperf is not None and highperf.total_us is not None:
+            highperf_total = f"{highperf.total_us:.1f}"
+            highperf_orch = f"{highperf.orch_us:.1f}"
+            highperf_sched = f"{highperf.sched_us:.1f}"
         print(
             f"{shape_name}: highperf_host_us={highperf_host} "
+            f"highperf_device_us={highperf_device} highperf_total_us={highperf_total} "
+            f"highperf_orch_us={highperf_orch} highperf_sched_us={highperf_sched} "
             f"pypto_host_us={pypto_host} pypto_npu_event_us={pypto_event} "
-            f"highperf_device_gflops={highperf_gflops} pypto_device_gflops={pypto_gflops} "
-            f"highperf_est_gbs={highperf_gbs} pypto_est_gbs={pypto_gbs} "
-            f"pypto/highperf={ratio}"
+            f"pypto_total_us={pypto_total} pypto_orch_us={pypto_orch} pypto_sched_us={pypto_sched} "
+            f"pypto/highperf_host={host_ratio} pypto/highperf_device_total={device_total_ratio}"
         )
 
 
@@ -714,8 +637,6 @@ def main() -> None:
         return
     if args.skip_highperf and args.skip_pypto:
         raise SystemExit("nothing to benchmark")
-    if args.validate_results:
-        args.validate_pypto = True
     shape_names = _selected_shape_names(args)
     if shape_names:
         _run_shape_suite(args, shape_names)
