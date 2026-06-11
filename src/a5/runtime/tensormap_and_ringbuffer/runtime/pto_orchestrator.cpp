@@ -36,7 +36,9 @@
 #include "pto_types.h"
 #include "tensor.h"
 
-extern "C" void set_dump_tensor_task_mask(uint64_t task_id, uint64_t mask);
+#if PTO2_PROFILING
+#include "aicpu/tensor_dump_aicpu.h"
+#endif
 
 // Verify the captured Tensor blob size in DepGenRecord matches the runtime
 // Tensor layout. The platform header defines DEP_GEN_TENSOR_SIZE without
@@ -656,12 +658,19 @@ static TaskOutputTensors submit_task_common(
 
     payload.init(args, result, prepared.alloc_result, layout);
 #if PTO2_PROFILING
-    // Selective vs full dump is latched at dump_tensor_init from DumpDataHeader
-    // (host-decided before any dispatch), so it is race-free regardless of
-    // submission order. Here we only record each marked task's arg mask, which
-    // selective collection consults.
-    if (args.tensor_dump_arg_mask() != 0) {
-        set_dump_tensor_task_mask(task_id.raw, args.tensor_dump_arg_mask());
+    if (is_dump_tensor_enabled()) {
+        if (args.scalar_count() > 0) {
+            set_dump_tensor_task_scalar_dtypes(
+                task_id.raw, static_cast<uint32_t>(args.scalar_count()), args.scalar_dtypes()
+            );
+        }
+        // Selective vs full dump is latched at dump_tensor_init from DumpDataHeader
+        // (host-decided before any dispatch), so it is race-free regardless of
+        // submission order. Here we only record each marked task's arg mask, which
+        // selective collection consults.
+        if (args.tensor_dump_arg_mask() != 0) {
+            set_dump_tensor_task_mask(task_id.raw, args.tensor_dump_arg_mask());
+        }
     }
 #endif
 

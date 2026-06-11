@@ -603,15 +603,16 @@ NB_MODULE(_task_interface, m) {
             [](const CallConfig &c) {
                 return c.enable_dump_tensor;
             },
-            // Accept either an int dump level (0=off, 1=partial, 2=full) or a
-            // Python bool. `True` maps to level 1 (partial) — the default when
-            // --dump-tensor is passed without a value; `False` maps to 0.
+            // Accept either an int dump level (0=off, 1=partial, 2=full,
+            // 3=full_json_only) or a Python bool. `True` maps to level 1
+            // (partial) — the default when --dump-tensor is passed without a
+            // value; `False` maps to 0.
             [](CallConfig &c, nb::object v) {
                 if (PyBool_Check(v.ptr())) {
                     c.enable_dump_tensor = nb::cast<bool>(v) ? 1 : 0;
                 } else {
                     int level = nb::cast<int>(v);
-                    c.enable_dump_tensor = (level < 0) ? 0 : (level > 2) ? 2 : level;
+                    c.enable_dump_tensor = (level < 0) ? 0 : (level > 3) ? 3 : level;
                 }
             }
         )

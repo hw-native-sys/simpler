@@ -110,9 +110,12 @@ struct Callable {
     // Children live in storage_ at CALLABLE_ALIGN-aligned offsets, but the
     // all-uint32 header above can leave offsetof(storage_) at 4-mod-8, which
     // would place an 8-byte-aligned Child (CoreCallable has a uint64) on a
-    // misaligned address — UB on reference binding (caught by UBSan). Align
-    // storage_ to the child's alignment so every child lands aligned.
-    alignas(alignof(Child)) char storage_[];
+    // misaligned address — UB on reference binding (caught by UBSan). It can
+    // also leave it at 8-mod-16, which under-aligns a5 SIMT kernel binaries
+    // (mscatter et al. require a 16-byte-aligned code address). Align storage_
+    // to CALLABLE_CHILD_ALIGN (>= alignof(Child)) so every child — and the
+    // kernel binary inside it — lands at the strictest required alignment.
+    alignas(CALLABLE_CHILD_ALIGN) char storage_[];
 
     ArgDirection sig(int32_t i) const {
         if (i < 0 || i >= sig_count_) throw std::out_of_range("Callable: sig index out of range");
@@ -158,13 +161,19 @@ private:
 using CoreCallable = Callable<void, CORE_MAX_TENSOR_ARGS, 0>;
 using ChipCallable = Callable<CoreCallable, CHIP_MAX_TENSOR_ARGS, 1024>;
 
-// storage_ holds CoreCallable children at CALLABLE_ALIGN-aligned offsets; for
-// child() to bind a reference without UB, storage_ itself must be aligned for
-// CoreCallable (which has a uint64 -> alignof 8). The alignas on storage_
-// guarantees this; assert it so a future header tweak can't silently regress.
+// storage_ holds CoreCallable children at CALLABLE_ALIGN-aligned offsets; the
+// child kernel binary's device address is offsetof(storage_) + child_offset +
+// CoreCallable::binary_data_offset(). The latter two are CALLABLE_ALIGN (64)
+// multiples, so storage_ alignment alone decides the binary's alignment.
+// CALLABLE_CHILD_ALIGN (16) must cover both: child() reference binding without
+// UB (needs alignof(CoreCallable) = 8) and a5 SIMT kernel-binary fetch (needs
+// 16). Assert both invariants so a future header tweak can't silently regress.
 static_assert(
-    offsetof(ChipCallable, storage_) % alignof(CoreCallable) == 0,
-    "ChipCallable.storage_ must be aligned for its CoreCallable children"
+    CALLABLE_CHILD_ALIGN >= alignof(CoreCallable), "CALLABLE_CHILD_ALIGN must not under-align CoreCallable children"
+);
+static_assert(
+    offsetof(ChipCallable, storage_) % CALLABLE_CHILD_ALIGN == 0,
+    "ChipCallable.storage_ must be CALLABLE_CHILD_ALIGN-aligned for SIMT kernel binaries"
 );
 
 // ============================================================================

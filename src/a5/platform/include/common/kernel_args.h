@@ -102,6 +102,12 @@ struct KernelArgs {
     // mirroring the per-device simpler_inner preinstall fix. Trailing field —
     // keeps the CANN-fixed front offsets and AICore-read fields in place.
     uint32_t device_id{0};
+    // Opaque always-false guard read by the AICore SIMT meta anchor (AIV
+    // KERNEL_ENTRY). The host never sets it non-zero; its only purpose is to be
+    // a runtime-valued condition the compiler cannot constant-fold, so the
+    // never-executed SIMT launch in simt_anchor.h survives DCE and bisheng
+    // still classifies the entry as SIMT. Keep it last (trailing field).
+    uint32_t force_simt_anchor{0};
 };
 
 #ifdef __cplusplus

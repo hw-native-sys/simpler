@@ -43,6 +43,7 @@ enum class DataType : uint8_t {
     UINT64,    // 8 bytes
     UINT16,    // 2 bytes
     UINT32,    // 4 bytes
+    BOOL,      // 1 byte (stored as 1/0 in uint64_t slot)
     DATA_TYPE_NUM,
 };
 
@@ -68,6 +69,7 @@ inline uint64_t get_element_size(DataType dtype) {
         8,  // DataType::UINT64
         2,  // DataType::UINT16
         4,  // DataType::UINT32
+        1,  // DataType::BOOL
     };
     return data_type_size[static_cast<int>(dtype)];
 }
@@ -102,6 +104,8 @@ inline const char *get_dtype_name(DataType dtype) {
         return "UINT16";
     case DataType::UINT32:
         return "UINT32";
+    case DataType::BOOL:
+        return "BOOL";
     default:
         return "UNKNOWN";
     }
@@ -136,7 +140,42 @@ inline const char *get_dtype_name(DataType dtype) {
 //
 // Named convenience functions (from_u64_f32 etc.) are removed — use the
 // template form from_u64<T>() / to_u64() directly.
-// -----------------------------------------------------------------------------
+
+/**
+ * Map a C++ type to its DataType enum value.
+ *
+ * Used to preserve original scalar type information through the
+ * Arg -> PTO2TaskPayload -> tensor dump pipeline.
+ */
+template <typename T>
+inline constexpr uint8_t dtype_of() {
+    static_assert(is_supported_scalar_arg_v<T>, "dtype_of: type must be arithmetic or enum");
+    if constexpr (std::is_same_v<T, float>) {
+        return static_cast<uint8_t>(DataType::FLOAT32);
+    } else if constexpr (std::is_same_v<T, double>) {
+        return static_cast<uint8_t>(DataType::FLOAT32);
+    } else if constexpr (std::is_same_v<T, int32_t>) {
+        return static_cast<uint8_t>(DataType::INT32);
+    } else if constexpr (std::is_same_v<T, uint32_t>) {
+        return static_cast<uint8_t>(DataType::UINT32);
+    } else if constexpr (std::is_same_v<T, int64_t>) {
+        return static_cast<uint8_t>(DataType::INT64);
+    } else if constexpr (std::is_same_v<T, uint64_t>) {
+        return static_cast<uint8_t>(DataType::UINT64);
+    } else if constexpr (std::is_same_v<T, int16_t>) {
+        return static_cast<uint8_t>(DataType::INT16);
+    } else if constexpr (std::is_same_v<T, uint16_t>) {
+        return static_cast<uint8_t>(DataType::UINT16);
+    } else if constexpr (std::is_same_v<T, int8_t>) {
+        return static_cast<uint8_t>(DataType::INT8);
+    } else if constexpr (std::is_same_v<T, uint8_t>) {
+        return static_cast<uint8_t>(DataType::UINT8);
+    } else if constexpr (std::is_same_v<T, bool>) {
+        return static_cast<uint8_t>(DataType::BOOL);
+    } else {
+        return static_cast<uint8_t>(DataType::UINT64);
+    }
+}
 
 /**
  * Pack a value into uint64_t storage (zero-extends smaller types).

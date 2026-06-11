@@ -35,6 +35,7 @@
 #include <functional>
 #include <mutex>
 #include <queue>
+#include <string>
 #include <vector>
 
 #include "../task_interface/call_config.h"
@@ -85,11 +86,13 @@ static constexpr size_t CALLABLE_HASH_DIGEST_SIZE = 32;
 enum class CallableKind : int32_t {
     CHIP_CALLABLE = 1,
     PYTHON_SERIALIZED = 2,
+    PYTHON_IMPORT = 3,
 };
 
 enum class TargetNamespace : int32_t {
     LOCAL_CHIP = 1,
     LOCAL_PYTHON = 2,
+    REMOTE_TASK_DISPATCHER = 3,
 };
 
 struct CallableIdentity {
@@ -118,6 +121,89 @@ enum class TaskState : int32_t {
     RUNNING = 3,    // dispatched to a worker
     COMPLETED = 4,  // worker finished, outputs may still be referenced
     CONSUMED = 5,   // all references released, slot may be reused
+};
+
+enum class RemoteAddressSpace : int32_t {
+    HOST_INLINE = 1,
+    REMOTE_DEVICE = 2,
+    REMOTE_WINDOW = 3,
+    UB_LDST = 4,
+};
+
+// RemoteBufferHandle combines wire-visible identity/mapping metadata
+// (`endpoint_id`, `owner_endpoint_id`, `buffer_id`, `generation`, `import_id`,
+// `address_space`, `nbytes`, `offset`, `remote_addr`, `rkey_or_token`,
+// `ub_ldst_va`, `access_flags`) with parent-local lifecycle state (`released`,
+// `live_slot_refs`). Keep wire formats in remote_wire.cpp explicit; do not
+// serialize this struct by raw POD copy.
+struct RemoteBufferHandle {
+    int32_t endpoint_id{-1};
+    int32_t owner_endpoint_id{-1};
+    uint64_t buffer_id{0};
+    uint64_t generation{0};
+    uint64_t import_id{0};
+    RemoteAddressSpace address_space{RemoteAddressSpace::REMOTE_DEVICE};
+    uint64_t nbytes{0};
+    uint64_t offset{0};
+    uint64_t remote_addr{0};
+    uint64_t rkey_or_token{0};
+    uint64_t ub_ldst_va{0};
+    uint32_t access_flags{0};
+    bool released{false};
+    int32_t live_slot_refs{0};
+};
+
+struct RemoteBufferExport {
+    int32_t owner_endpoint_id{-1};
+    uint64_t buffer_id{0};
+    uint64_t generation{0};
+    RemoteAddressSpace address_space{RemoteAddressSpace::REMOTE_WINDOW};
+    uint64_t offset{0};
+    uint64_t nbytes{0};
+    uint64_t export_id{0};
+    uint64_t remote_addr{0};
+    uint64_t rkey_or_token{0};
+    uint64_t ub_ldst_va{0};
+    uint32_t access_flags{0};
+    std::string transport_profile;
+    std::vector<uint8_t> transport_descriptor;
+};
+
+struct RemoteTensorDesc {
+    RemoteAddressSpace address_space{RemoteAddressSpace::REMOTE_DEVICE};
+    int32_t owner_endpoint_id{-1};
+    uint64_t buffer_id{0};
+    uint64_t offset{0};
+    uint64_t nbytes{0};
+    uint64_t remote_addr{0};
+    uint64_t rkey_or_token{0};
+    uint64_t generation{0};
+    uint64_t inline_payload_offset{0};
+    uint64_t inline_payload_len{0};
+    uint64_t flags{0};
+};
+
+struct RemoteTensorSidecar {
+    bool present{false};
+    RemoteTensorDesc desc{};
+};
+
+struct RemoteTaskArgsSidecar {
+    std::vector<RemoteTensorSidecar> tensors;
+    std::vector<uint8_t> inline_payload;
+
+    bool empty() const {
+        if (!inline_payload.empty()) return false;
+        for (const auto &tensor : tensors) {
+            if (tensor.present) return false;
+        }
+        return true;
+    }
+
+    void clear() {
+        tensors.clear();
+        inline_payload.clear();
+    }
 };
 
 // =============================================================================

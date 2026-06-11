@@ -28,12 +28,13 @@
 #include <stdint.h>
 #include <string.h>
 
-#include <utility>
-
 #if defined(__aarch64__)
 #include <arm_neon.h>
 #endif
 
+#include <utility>
+
+#include "data_type.h"
 #include "pto_submit_types.h"
 #include "task_args.h"
 #include "tensor.h"
@@ -181,6 +182,7 @@ struct Arg : TaskArgsTpl<TensorRef, uint64_t, MAX_TENSOR_ARGS, MAX_SCALAR_ARGS, 
         tensor_dump_arg_mask_ = 0;
         explicit_deps_ = nullptr;
         explicit_dep_count_ = 0;
+        memset(scalar_dtypes_, 0, sizeof(scalar_dtypes_));
     }
 
     void reset() {
@@ -316,7 +318,9 @@ struct Arg : TaskArgsTpl<TensorRef, uint64_t, MAX_TENSOR_ARGS, MAX_SCALAR_ARGS, 
             set_error("Too many scalar args (exceeds MAX_SCALAR_ARGS=32)");
             return;
         }
-        ((scalars_[scalar_count_++] = to_u64(args)), ...);
+        ((scalars_[scalar_count_] = to_u64(args),
+          scalar_dtypes_[scalar_count_] = dtype_of<std::remove_cv_t<std::remove_reference_t<Args>>>(), ++scalar_count_),
+         ...);
     }
 
     void add_scalars(const uint64_t *values, int count) {
@@ -374,8 +378,11 @@ struct Arg : TaskArgsTpl<TensorRef, uint64_t, MAX_TENSOR_ARGS, MAX_SCALAR_ARGS, 
             return;
         }
         memcpy(&scalars_[scalar_count_], &src.scalars_[src_offset], count * sizeof(uint64_t));
+        memcpy(&scalar_dtypes_[scalar_count_], &src.scalar_dtypes_[src_offset], count * sizeof(uint8_t));
         scalar_count_ += count;
     }
+
+    const uint8_t *scalar_dtypes() const { return scalar_dtypes_; }
 
 private:
     // Caller-owned dependency array; lifetime must extend through submit.
@@ -383,6 +390,7 @@ private:
     uint64_t tensor_dump_arg_mask_{0};
     const PTO2TaskId *explicit_deps_{nullptr};
     uint32_t explicit_dep_count_{0};
+    uint8_t scalar_dtypes_[MAX_SCALAR_ARGS] = {};
 
     // No-arg dump(): mark every tensor arg already added to this Arg.
     void mark_all_tensor_dump_arg() {

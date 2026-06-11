@@ -27,9 +27,11 @@
 
 #include "host/tensor_dump_collector.h"
 
+#include "data_type.h"
+
 #include <algorithm>
 #include <chrono>
-#include <cstdlib>
+#include <cmath>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -56,6 +58,7 @@ int TensorDumpCollector::initialize(
 
     num_dump_threads_ = num_dump_threads;
     output_prefix_ = output_prefix;
+    dump_tensor_level_ = dump_tensor_level;
 
     // Stash the memory context on the base up-front so alloc_paired_buffer
     // (which reads alloc_cb_/register_cb_/free_cb_/device_id_)
@@ -171,7 +174,12 @@ void TensorDumpCollector::start_writer_thread_once() {
     std::string base_name = "tensor_dump";
     run_dir_ = std::filesystem::path(output_prefix_) / base_name;
     std::filesystem::create_directories(run_dir_);
-    bin_file_.open(run_dir_ / (base_name + ".bin"), std::ios::binary);
+    // FULL_JSON_ONLY captures no payload (device sets payload_size == 0), so
+    // there is nothing to stream — skip the .bin file rather than leaving a
+    // 0-byte artifact next to the manifest.
+    if (dump_tensor_level_ != DumpTensorLevel::FULL_JSON_ONLY) {
+        bin_file_.open(run_dir_ / (base_name + ".bin"), std::ios::binary);
+    }
     next_bin_offset_ = 0;
 
     writer_done_.store(false);
@@ -226,12 +234,13 @@ void TensorDumpCollector::process_dump_buffer(const DumpReadyBufferInfo &info) {
         dt.is_contiguous = (rec.is_contiguous != 0);
         dt.truncated = (rec.truncated != 0);
         dt.overwritten = false;
-        if (dt.truncated && ++total_truncated_count_ == 1) {
-            LOG_WARN("Tensor dump truncation detected. Increase PLATFORM_DUMP_AVG_TENSOR_BYTES.");
-        }
         dt.start_offset = rec.start_offset;
         std::memcpy(dt.shapes, rec.shapes, sizeof(dt.shapes));
         std::memcpy(dt.strides, rec.strides, sizeof(dt.strides));
+
+        if (dt.truncated && ++total_truncated_count_ == 1) {
+            LOG_WARN("Tensor dump truncation detected. Increase PLATFORM_DUMP_AVG_TENSOR_BYTES.");
+        }
 
         if (dt.kind == TensorDumpKind::TENSOR && thread_idx >= 0 && thread_idx < static_cast<int>(arenas_.size())) {
             ArenaInfo &ai = arenas_[thread_idx];
@@ -402,6 +411,43 @@ static const char *tensor_dump_kind_name(TensorDumpKind kind) {
     return "unknown";
 }
 
+static void write_scalar_json_value(std::ofstream &json, const DumpedTensor &dt) {
+    uint64_t raw = dt.scalar_value;
+    if (dt.dtype == static_cast<uint8_t>(DataType::FLOAT32)) {
+        float f;
+        memcpy(&f, &raw, sizeof(float));
+        if (std::isnan(f)) {
+            json << ", \"value\": null";
+        } else if (std::isinf(f)) {
+            json << ", \"value\": " << (f < 0 ? "\"-$Inf\"" : "\"$Inf\"");
+        } else {
+            std::ostringstream val_ss;
+            val_ss << f;
+            std::string val_str = val_ss.str();
+            if (val_str.find('.') == std::string::npos && val_str.find('e') == std::string::npos) {
+                val_str += ".0";
+            }
+            json << ", \"value\": " << val_str;
+        }
+    } else if (dt.dtype == static_cast<uint8_t>(DataType::INT32)) {
+        int32_t val;
+        memcpy(&val, &raw, sizeof(int32_t));
+        json << ", \"value\": " << val;
+    } else if (dt.dtype == static_cast<uint8_t>(DataType::UINT32)) {
+        uint32_t val;
+        memcpy(&val, &raw, sizeof(uint32_t));
+        json << ", \"value\": " << val;
+    } else if (dt.dtype == static_cast<uint8_t>(DataType::BOOL)) {
+        json << ", \"value\": " << (raw != 0 ? "true" : "false");
+    } else if (dt.dtype == static_cast<uint8_t>(DataType::INT64)) {
+        int64_t val;
+        memcpy(&val, &raw, sizeof(int64_t));
+        json << ", \"value\": " << val;
+    } else {
+        json << ", \"value\": " << raw;
+    }
+}
+
 static std::string dims_to_string(const uint32_t dims[], int ndims) {
     std::ostringstream ss;
     ss << "[";
@@ -470,7 +516,9 @@ int TensorDumpCollector::export_dump_files() {
             std::this_thread::sleep_for(std::chrono::seconds(1));
         }
 
-        bin_file_.close();
+        if (bin_file_.is_open()) {
+            bin_file_.close();
+        }
 
         auto elapsed_ms =
             std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - run_start_time_)
@@ -538,7 +586,11 @@ int TensorDumpCollector::export_dump_files() {
     json << "  \"truncated_tensors\": " << total_truncated_count_ << ",\n";
     json << "  \"dropped_records\": " << total_dropped_record_count_ << ",\n";
     json << "  \"dropped_overwrite\": " << total_overwrite_count_ << ",\n";
-    json << "  \"bin_file\": \"" << base_name << ".bin\",\n";
+    if (dump_tensor_level_ == DumpTensorLevel::FULL_JSON_ONLY) {
+        json << "  \"bin_file\": null,\n";
+    } else {
+        json << "  \"bin_file\": \"" << base_name << ".bin\",\n";
+    }
     json << "  \"tensors\": [\n";
 
     bool first_entry = true;
@@ -555,14 +607,15 @@ int TensorDumpCollector::export_dump_files() {
         first_entry = false;
 
         json << "    {\"task_id\": \"0x" << std::hex << std::setfill('0') << std::setw(16) << dt.task_id << std::dec
-             << "\", \"arg_index\": " << dt.arg_index << ", \"role\": \"" << tensor_dump_role_name(dt.role)
+             << "\"";
+        json << ", \"arg_index\": " << dt.arg_index << ", \"role\": \"" << tensor_dump_role_name(dt.role)
              << "\", \"stage\": \"" << tensor_dump_stage_name(dt.stage) << "\", \"kind\": \""
              << tensor_dump_kind_name(dt.kind) << "\", \"dtype\": \"" << dtype_name
              << "\", \"is_contiguous\": " << (dt.is_contiguous ? "true" : "false") << ", \"shape\": " << shape_str
              << ", \"strides\": " << strides_str << ", \"start_offset\": " << dt.start_offset
              << ", \"numel\": " << numel;
         if (dt.kind == TensorDumpKind::SCALAR) {
-            json << ", \"value\": " << dt.scalar_value;
+            write_scalar_json_value(json, dt);
         }
         json << ", \"bin_offset\": " << dt.bin_offset << ", \"bin_size\": " << dt.payload_size
              << ", \"truncated\": " << (dt.truncated ? "true" : "false")

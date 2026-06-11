@@ -51,8 +51,11 @@ DTYPE_INFO = {
     "int64": ("q", 8),
     "uint64": ("Q", 8),
     "int16": ("h", 2),
+    "uint16": ("H", 2),
     "int8": ("b", 1),
     "uint8": ("B", 1),
+    "uint32": ("I", 4),
+    "bool": ("?", 1),
 }
 
 
@@ -96,13 +99,14 @@ def tensor_filename(t: dict) -> str:
     return f"task_{t['task_id']}_{stage_str}_{role_str}{t['arg_index']}.txt"
 
 
-def write_tensor(tensor: dict, bin_path: Path, out):
+def write_tensor(tensor: dict, bin_path: Path | None, out):
     t = tensor
     out.write(f"# task_id: {t['task_id']}\n")
     out.write(f"# role: {t['role']}\n")
     out.write(f"# stage: {t['stage']}\n")
     out.write(f"# arg_index: {t['arg_index']}\n")
     out.write(f"# dtype: {t['dtype']}\n")
+    out.write(f"# kind: {t.get('kind', 'tensor')}\n")
     out.write(f"# is_contiguous: {t['is_contiguous']}\n")
     out.write(f"# shape: {t['shape']}\n")
     out.write(f"# strides: {t['strides']}\n")
@@ -114,11 +118,24 @@ def write_tensor(tensor: dict, bin_path: Path, out):
     if t.get("truncated"):
         out.write("# DATA TRUNCATED (tensor too large for arena)\n")
 
+    if t.get("kind") == "scalar":
+        val = t.get("value")
+        if t.get("dtype", "").upper() == "BOOL":
+            val = "true" if val else "false"
+        out.write(f"# value: {val}\n")
+        return
+
     bin_size = t.get("bin_size", 0)
     if bin_size == 0:
         out.write("# (no data)\n")
         return
 
+    # bin_size > 0 implies a payload was captured, so bin_path is set
+    # (full_json_only dumps have bin_size == 0 everywhere and never reach here).
+    # Guard explicitly rather than assert so a corrupt manifest fails loudly
+    # even under python -O.
+    if bin_path is None:
+        raise ValueError("bin_path is None but bin_size > 0 (corrupt manifest?)")
     data = read_tensor_data(bin_path, t["bin_offset"], bin_size)
     shape = t["shape"]
     numel = 1
@@ -163,7 +180,7 @@ def write_tensor(tensor: dict, bin_path: Path, out):
         out.write(f"[{idx_str}] {s}\n")
 
 
-def export_tensor(tensor: dict, bin_path: Path, dump_dir: Path):
+def export_tensor(tensor: dict, bin_path: Path | None, dump_dir: Path):
     txt_dir = dump_dir / "txt"
     txt_dir.mkdir(exist_ok=True)
     fname = tensor_filename(tensor)
@@ -268,7 +285,10 @@ def main():
     with open(manifest_path) as f:
         manifest = json.load(f)
 
-    bin_path = dump_dir / manifest.get("bin_file", "tensors.bin")
+    # full_json_only dumps (level 3) carry no payload: bin_file is null and
+    # there is no .bin to export from — listing metadata still works.
+    bin_name = manifest.get("bin_file", "tensors.bin")
+    bin_path = (dump_dir / bin_name) if bin_name else None
     tensors = manifest["tensors"]
 
     filtered = _apply_filters(tensors, args)
