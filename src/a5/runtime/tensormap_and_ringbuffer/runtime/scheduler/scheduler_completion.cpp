@@ -73,7 +73,7 @@ void SchedulerContext::complete_slot_task(
     PTO2TaskSlotState *deferred_release_slot_states[], int32_t &deferred_release_count, PTO2LocalReadyBuffer *local_bufs
 #if PTO2_PROFILING
     ,
-    uint64_t dispatch_ts
+    uint64_t dispatch_ts, uint64_t finish_ts
 #endif
 ) {
 #if PTO2_PROFILING
@@ -179,28 +179,18 @@ void SchedulerContext::complete_slot_task(
     }
 
 #if PTO2_PROFILING
-    if (l2_swimlane.l2_swimlane_enabled) {
+    // Level gate: at AICORE_TIMING (level=1) the AICore record alone carries
+    // {start, end, task_token_raw}, host resolves func_id/core_type from
+    // dep_gen / per-core mapping, and AICPU has nothing to write. Only at
+    // AICPU_TIMING (level=2) and above does AICPU contribute dispatch/finish
+    // timestamps via complete_task.
+    if (l2_swimlane.l2_swimlane_enabled && l2_swimlane_level_ >= L2SwimlaneLevel::AICPU_TIMING) {
 #if PTO2_SCHED_PROFILING
         uint64_t t_perf_start = get_sys_cnt_aicpu();
 #endif
-        uint64_t finish_ts = 0;
-        uint64_t fanout_arr[RUNTIME_MAX_FANOUT];
-        int32_t fanout_n = 0;
 
-        if (l2_swimlane_level_ >= L2SwimlaneLevel::AICPU_TIMING) {
-            finish_ts = get_sys_cnt_aicpu();
-            PTO2DepListEntry *cur = slot_state.fanout_head;
-            while (cur != nullptr && fanout_n < RUNTIME_MAX_FANOUT) {
-                fanout_arr[fanout_n++] = cur->slot_state->task->task_id.raw;
-                cur = cur->next;
-            }
-        }
-
-        int32_t perf_slot_idx = static_cast<int32_t>(subslot);
         if (l2_swimlane_aicpu_complete_task(
-                core_id, thread_idx, static_cast<uint32_t>(expected_reg_task_id), slot_state.task->task_id.raw,
-                slot_state.task->kernel_id[perf_slot_idx], hank[core_id].core_type, dispatch_ts, finish_ts, fanout_arr,
-                fanout_n
+                core_id, thread_idx, static_cast<uint32_t>(expected_reg_task_id), dispatch_ts, finish_ts
             ) != 0) {
             LOG_ERROR(
                 "Core %d: l2_swimlane_aicpu_complete_task failed for task 0x%" PRIx64, core_id,
@@ -289,6 +279,17 @@ void SchedulerContext::check_running_cores_for_completion(
         }
 #endif
 
+#if PTO2_PROFILING
+        // Capture finish_ts at the FIN observation point — right after rmb()
+        // pinned cacheable AICore reads downstream of the register load, and
+        // BEFORE any fanin / deferred-release work. Anything later would
+        // charge AICPU completion-processing cost to (end → finish).
+        uint64_t finish_ts = 0;
+        if (l2_swimlane_level_ >= L2SwimlaneLevel::AICPU_TIMING && (t.pending_done || t.running_done)) {
+            finish_ts = get_sys_cnt_aicpu();
+        }
+#endif
+
         // --- Apply phase: execute actions based on transition ---
 
         // 1. Complete finished tasks (capture pointers before modifying core state)
@@ -298,7 +299,7 @@ void SchedulerContext::check_running_cores_for_completion(
                 completed_this_turn, deferred_release_slot_states, deferred_release_count, local_bufs
 #if PTO2_PROFILING
                 ,
-                core.pending_dispatch_timestamp
+                core.pending_dispatch_timestamp, finish_ts
 #endif
             );
             cur_thread_completed++;
@@ -309,7 +310,7 @@ void SchedulerContext::check_running_cores_for_completion(
                 completed_this_turn, deferred_release_slot_states, deferred_release_count, local_bufs
 #if PTO2_PROFILING
                 ,
-                core.running_dispatch_timestamp
+                core.running_dispatch_timestamp, finish_ts
 #endif
             );
             cur_thread_completed++;

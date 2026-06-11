@@ -10,6 +10,8 @@
  */
 #include "scheduler_context.h"
 
+#include <algorithm>
+
 #include "common/unified_log.h"
 #include "aicpu/device_time.h"
 #include "aicpu/platform_regs.h"
@@ -73,7 +75,7 @@ void SchedulerContext::complete_slot_task(
     PTO2TaskSlotState *deferred_release_slot_states[], int32_t &deferred_release_count, PTO2LocalReadyBuffer *local_bufs
 #if PTO2_PROFILING
     ,
-    uint64_t dispatch_ts
+    uint64_t dispatch_ts, uint64_t finish_ts
 #endif
 ) {
 #if PTO2_PROFILING
@@ -189,16 +191,20 @@ void SchedulerContext::complete_slot_task(
     }
 
 #if PTO2_PROFILING
-    if (l2_swimlane.l2_swimlane_enabled) {
+    // Level gate: at AICORE_TIMING (level=1) the AICore record alone carries
+    // {start, end, task_token_raw}, host resolves func_id/core_type from
+    // dep_gen / per-core mapping, and AICPU has nothing to write. Only at
+    // AICPU_TIMING (level=2) and above does AICPU contribute dispatch/finish
+    // timestamps via complete_task. Bypassing here saves the per-completion
+    // hot-path cost (counter inc + ring lookup + record store + wmb + buffer
+    // rotation bookkeeping) for runs that only want AICore timing.
+    if (l2_swimlane.l2_swimlane_enabled && l2_swimlane_level_ >= L2SwimlaneLevel::AICPU_TIMING) {
 #if PTO2_SCHED_PROFILING
         uint64_t t_perf_start = get_sys_cnt_aicpu();
 #endif
-        uint64_t finish_ts = (l2_swimlane_level_ >= L2SwimlaneLevel::AICPU_TIMING) ? get_sys_cnt_aicpu() : 0;
 
-        int32_t perf_slot_idx = static_cast<int32_t>(subslot);
         if (l2_swimlane_aicpu_complete_task(
-                core_id, thread_idx, static_cast<uint32_t>(expected_reg_task_id), slot_state.task->task_id.raw,
-                slot_state.task->kernel_id[perf_slot_idx], hank[core_id].core_type, dispatch_ts, finish_ts
+                core_id, thread_idx, static_cast<uint32_t>(expected_reg_task_id), dispatch_ts, finish_ts
             ) != 0) {
             LOG_ERROR(
                 "Core %d: l2_swimlane_aicpu_complete_task failed for task 0x%" PRIx64, core_id,
@@ -280,6 +286,19 @@ void SchedulerContext::check_running_cores_for_completion(
         }
 #endif
 
+#if PTO2_PROFILING
+        // Capture finish_ts at the FIN observation point — right after rmb()
+        // above pinned the cacheable AICore reads downstream of the register
+        // load, and BEFORE any fanin / deferred-release work. Anything later
+        // (slot transition apply, complete_slot_task fanin processing) would
+        // charge AICPU completion-processing cost to the (end → finish)
+        // span, masking the actual FIN-delivery latency.
+        uint64_t finish_ts = 0;
+        if (l2_swimlane_level_ >= L2SwimlaneLevel::AICPU_TIMING && (t.pending_done || t.running_done)) {
+            finish_ts = get_sys_cnt_aicpu();
+        }
+#endif
+
         // --- Apply phase: execute actions based on transition ---
 
         // 1. Complete finished tasks (capture pointers before modifying core state)
@@ -289,7 +308,7 @@ void SchedulerContext::check_running_cores_for_completion(
                 completed_this_turn, deferred_release_slot_states, deferred_release_count, local_bufs
 #if PTO2_PROFILING
                 ,
-                core.pending_dispatch_timestamp
+                core.pending_dispatch_timestamp, finish_ts
 #endif
             );
             cur_thread_completed++;
@@ -300,7 +319,7 @@ void SchedulerContext::check_running_cores_for_completion(
                 completed_this_turn, deferred_release_slot_states, deferred_release_count, local_bufs
 #if PTO2_PROFILING
                 ,
-                core.running_dispatch_timestamp
+                core.running_dispatch_timestamp, finish_ts
 #endif
             );
             cur_thread_completed++;
@@ -391,9 +410,27 @@ void SchedulerContext::drain_worker_dispatch(int32_t block_num) {
 
     for (int32_t t = 0; t < active_sched_threads_ && slot_state->next_block_idx < block_num; t++) {
         auto valid = core_trackers_[t].get_idle_core_offset_states(shape);
-        while (valid.has_value() && slot_state->next_block_idx < block_num) {
-            dispatch_block(t, valid.pop_first(), *slot_state, shape, false, slot_state->next_block_idx);
-            slot_state->next_block_idx++;
+        int32_t remaining = slot_state->logical_block_num - slot_state->next_block_idx;
+        int32_t claim = std::min(valid.count(), remaining);
+        int32_t start = slot_state->next_block_idx;
+        slot_state->next_block_idx += claim;
+        PublishHandle handles[CoreTracker::MAX_CLUSTERS * 3];
+        int handle_count = 0;
+        for (int32_t b = 0; b < claim; b++) {
+            auto core_offset = valid.pop_first();
+            handle_count += prepare_block_for_dispatch(
+                t, core_offset, *slot_state, shape, false, start + b, &handles[handle_count]
+            );
+        }
+        wmb();
+        uint64_t dispatch_ts = 0;
+#if PTO2_PROFILING
+        if (l2_swimlane_level_ >= L2SwimlaneLevel::AICPU_TIMING) {
+            dispatch_ts = get_sys_cnt_aicpu();
+        }
+#endif
+        for (int i = 0; i < handle_count; i++) {
+            publish_subtask_to_core(handles[i], dispatch_ts);
         }
     }
 

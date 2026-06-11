@@ -322,8 +322,9 @@ public:
      * @return 0 on success, error code on failure
      */
     int initialize(
-        int num_aicore, int device_id, L2SwimlaneLevel l2_swimlane_level, const L2SwimlaneAllocCallback &alloc_cb,
-        L2SwimlaneRegisterCallback register_cb, const L2SwimlaneFreeCallback &free_cb, const std::string &output_prefix
+        int num_aicore, int aicpu_thread_num, int device_id, L2SwimlaneLevel l2_swimlane_level,
+        const L2SwimlaneAllocCallback &alloc_cb, L2SwimlaneRegisterCallback register_cb,
+        const L2SwimlaneFreeCallback &free_cb, const std::string &output_prefix
     );
 
     /**
@@ -333,6 +334,21 @@ public:
      * phase-record vector.
      */
     void on_buffer_collected(const ReadyBufferInfo &info);
+
+    /**
+     * Publish per-core core_type (AIC/AIV/...) so the host emit path can
+     * resolve the lane label without consulting an AICPU task record. Required
+     * for AICORE_TIMING (level=1) where complete_task is bypassed and the
+     * AICore record alone is on disk. Caller is the device_runner — sim sets
+     * it from `runtime.workers[i].core_type` (rule-based), onboard sets it
+     * from the handshake-discovered table.
+     *
+     * Safe to call multiple times; the last call wins.
+     *
+     * @param types  CoreType[n] table indexed by core_id
+     * @param n      table length (typically `num_aicore`)
+     */
+    void set_core_types(const CoreType *types, int n);
 
     /**
      * Export collected records as a Chrome Trace Event JSON (swimlane view).
@@ -413,7 +429,17 @@ private:
     void *aicore_ring_addr_table_dev_{nullptr};
 
     int num_aicore_{0};
+    // Total AICPU threads launched this run. The dedicated orchestrator runs on
+    // the last one (aicpu_thread_num_ - 1); used to report its thread number in
+    // the phase-metadata log (orch-phase is a single pool, so its index alone
+    // does not encode the AICPU thread).
+    int aicpu_thread_num_{0};
     L2SwimlaneLevel l2_swimlane_level_{L2SwimlaneLevel::DISABLED};
+
+    // Per-core core_type table populated by set_core_types(). Indexed by
+    // core_id; size matches num_aicore_ once populated. Used by the level=1
+    // emit path which has no AICPU record to read core_type from.
+    std::vector<CoreType> core_types_;
 
     // Per-task output directory captured at initialize() time. Consumed by
     // export_swimlane_json() to build <prefix>/l2_swimlane_records.json.
@@ -452,16 +478,6 @@ private:
     void copy_sched_phase_buffer(const ReadyBufferInfo &info);
     void copy_orch_phase_buffer(const ReadyBufferInfo &info);
     void copy_aicore_buffer(const ReadyBufferInfo &info);
-
-    // AICore-as-producer: AICore writes start/end/task_id directly into a
-    // per-core L2SwimlaneAicoreTaskBuffer (allocated by initialize(), addressed via
-    // L2SwimlaneAicoreTaskPool::rotation, which AICPU rotates per BUFFER_SIZE
-    // completion). AICPU never reads the AICore records on the hot path.
-    // join_aicore_records() runs after stop(): it walks each core's buffer,
-    // builds a `task_id_low32 → (start, end)` map, then patches the matching
-    // L2SwimlaneAicpuTaskRecord entries in collected_perf_records_. Called from
-    // export_swimlane_json() so external callers see a transparent stream.
-    void join_aicore_records();
 };
 
 #endif  // SRC_A2A3_PLATFORM_INCLUDE_HOST_L2_SWIMLANE_COLLECTOR_H_

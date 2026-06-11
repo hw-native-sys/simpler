@@ -67,12 +67,12 @@ class TestSubWorkerException:
             raise SentinelError("boom-from-sub")
 
         hw = Worker(level=3, num_sub_workers=1)
-        cid = hw.register(boom)
+        handle = hw.register(boom)
         hw.init()
         try:
 
             def orch(o, args, cfg):
-                o.submit_sub(cid)
+                o.submit_sub(handle)
 
             with pytest.raises(RuntimeError) as info:
                 hw.run(orch)
@@ -92,9 +92,9 @@ class TestSubWorkerException:
             def orch(o, args, cfg):
                 o.submit_sub(42)
 
-            with pytest.raises(RuntimeError) as info:
+            with pytest.raises(TypeError) as info:
                 hw.run(orch)
-            assert "not registered" in str(info.value)
+            assert "CallableHandle returned by Worker.register" in str(info.value)
         finally:
             hw.close()
 
@@ -126,16 +126,16 @@ class TestScopeMidFailure:
                 raise SentinelError("first run failure")
 
             hw = Worker(level=3, num_sub_workers=1)
-            fail_cid = hw.register(boom)
-            ok_cid = hw.register(lambda args: _increment_counter(counter_buf))
+            fail_handle = hw.register(boom)
+            ok_handle = hw.register(lambda args: _increment_counter(counter_buf))
             hw.init()
             try:
 
                 def failing_orch(o, args, cfg):
-                    o.submit_sub(fail_cid)
+                    o.submit_sub(fail_handle)
 
                 def ok_orch(o, args, cfg):
-                    o.submit_sub(ok_cid)
+                    o.submit_sub(ok_handle)
 
                 with pytest.raises(RuntimeError):
                     hw.run(failing_orch)
@@ -165,17 +165,17 @@ class TestScopeMidFailure:
             raise SentinelError("fail-fast")
 
         hw = Worker(level=3, num_sub_workers=1)
-        cid = hw.register(boom)
+        handle = hw.register(boom)
         hw.init()
         try:
 
             def orch(o, args, cfg):
-                o.submit_sub(cid)
+                o.submit_sub(handle)
                 # Give the child enough wall-clock time to run and fail
                 # before issuing the second submit, so the fail-fast check
                 # in submit_impl has something to trip on.
                 time.sleep(1.0)
-                o.submit_sub(cid)
+                o.submit_sub(handle)
 
             with pytest.raises(RuntimeError) as info:
                 hw.run(orch)
@@ -208,19 +208,19 @@ class TestL4ChainedFailure:
             raise SentinelError("l3-sub-boom")
 
         l3 = Worker(level=3, num_sub_workers=1)
-        l3_sub_cid = l3.register(boom_sub)
+        l3_sub_handle = l3.register(boom_sub)
 
         def l3_orch(orch, args, config):
-            orch.submit_sub(l3_sub_cid)
+            orch.submit_sub(l3_sub_handle)
 
         w4 = Worker(level=4, num_sub_workers=0)
-        l3_cid = w4.register(l3_orch)
+        l3_handle = w4.register(l3_orch)
         w4.add_worker(l3)
         w4.init()
         try:
 
             def l4_orch(orch, args, config):
-                orch.submit_next_level(l3_cid, TaskArgs(), CallConfig())
+                orch.submit_next_level(l3_handle, TaskArgs(), CallConfig())
 
             with pytest.raises(RuntimeError) as info:
                 w4.run(l4_orch)

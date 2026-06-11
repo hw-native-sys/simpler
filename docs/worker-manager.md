@@ -1,15 +1,33 @@
 # Worker Manager — Pool, Threading, and Dispatch
 
-`WorkerManager` and `WorkerThread` together implement the **execution layer**
-of a `Worker` engine. `WorkerManager` owns two pools of `WorkerThread`s (one
-for next-level workers, one for sub workers); each `WorkerThread` drives a
-shared-memory mailbox that a forked Python child consumes — the child runs
-the real worker (a `ChipWorker` for NEXT_LEVEL, a Python callable for SUB)
-in its own address space.
+Callable identity update: WorkerThread task frames now carry the submitted
+callable's 32-byte digest; the child resolves that digest to its private local
+slot. Older callable-id snippets below are historical shorthand for
+target-local internals. See
+[callable-identity-registration.md](callable-identity-registration.md).
+
+`WorkerManager`, `WorkerThread`, and `WorkerEndpoint` together implement the
+**execution layer** of a `Worker` engine. In today's local implementation,
+`WorkerManager` owns two pools of `WorkerThread`s (one for next-level workers,
+one for sub workers); each `WorkerThread` owns a `LocalMailboxEndpoint` that
+drives a shared-memory mailbox consumed by a forked Python child. The child
+runs the real worker (a `ChipWorker` for NEXT_LEVEL, a Python callable for
+SUB) in its own address space.
+
+The remote L3 design keeps this local fork/shm path behind
+`LocalMailboxEndpoint` and reserves the same `WorkerEndpoint` boundary for a
+framed `RemoteL3Endpoint` for cross-host NEXT_LEVEL children. A remote endpoint
+is not another child loop that polls the 4096-byte mailbox; it uses the
+contracts in
+[remote-l3-worker-design.md](remote-l3-worker-design.md).
+The current code includes that `RemoteL3Endpoint` boundary, a socket-backed
+simulation transport, and the daemon/session runner used by
+`Worker.add_remote_worker()` for sim remote L3 endpoints. HCOMM hardware
+profiles are still pending.
 
 For the high-level role of this layer among the three engine components, see
 [hierarchical_level_runtime.md](hierarchical_level_runtime.md). For what
-runs on the other side of the mailbox, see [task-flow.md](task-flow.md).
+runs on the other side of the local mailbox, see [task-flow.md](task-flow.md).
 For where dispatched tasks come from, see [scheduler.md](scheduler.md).
 
 ---
@@ -23,6 +41,7 @@ public:
     // MAP_SHARED region; the real worker (a `ChipWorker` for NEXT_LEVEL,
     // a Python callable for SUB) lives in the forked child.
     void add_next_level(void *mailbox);
+    void add_next_level_endpoint(std::unique_ptr<WorkerEndpoint> endpoint);
     void add_sub       (void *mailbox);
 
     // Lifecycle
@@ -32,6 +51,10 @@ public:
     // Scheduler API
     WorkerThread *pick_idle(WorkerType type) const;
     std::vector<WorkerThread *> pick_n_idle(WorkerType type, int n) const;
+    WorkerThread *get_worker_by_endpoint_id(WorkerType type, int32_t endpoint_id) const;
+    WorkerThread *pick_idle_excluding_eligible(WorkerType type,
+                                               const std::vector<WorkerThread *> &exclude,
+                                               const std::vector<int32_t> &eligible_endpoint_ids) const;
 
 private:
     std::vector<void *> next_level_entries_;
@@ -47,6 +70,9 @@ private:
   calls
 - **Idle selection**: `pick_idle(type)` finds a WorkerThread whose queue is
   empty; returns nullptr if none available
+- **Endpoint eligibility**: remote-aware NEXT_LEVEL slots carry final eligible
+  endpoint ids. Scheduler dispatch calls `pick_idle_excluding_eligible()` so a
+  task cannot land on a worker that lacks the callable or tensor sidecars.
 
 ---
 
@@ -63,26 +89,29 @@ struct WorkerDispatch {
 class WorkerThread {
 public:
     void start(Ring *ring, WorkerManager *manager,
-               const std::function<void(TaskSlot)> &on_complete,
-               void *mailbox);
+               const std::function<void(WorkerCompletion)> &on_complete,
+               std::unique_ptr<WorkerEndpoint> endpoint);
     void stop();
     void dispatch(WorkerDispatch d);       // slot id + group sub-index
     bool idle() const;
+    const WorkerEndpointCaps &caps() const;
+    int32_t endpoint_id() const;
 
 private:
     Ring *ring_;                       // reads slot state via ring->slot_state(id)
-    void *mailbox_ = nullptr;          // MAP_SHARED region the child polls
+    std::unique_ptr<WorkerEndpoint> endpoint_;
     std::thread thread_;
     std::queue<WorkerDispatch> queue_;
     std::mutex mu_;
     std::condition_variable cv_;
 
     void loop();
-    void dispatch_process(TaskSlotState &s, int32_t group_index);
+    WorkerCompletion dispatch_process(WorkerDispatch d);
 };
 ```
 
-The WorkerThread's `std::thread` pumps the internal queue and drives the
+The WorkerThread's `std::thread` pumps the internal queue and calls
+`endpoint->run(...)` once per dispatch. `LocalMailboxEndpoint::run` drives the
 shm handshake — one mailbox round trip per dispatch. The forked child loop
 that consumes the mailbox lives in Python (`_chip_process_loop` /
 `_sub_worker_loop` in `python/simpler/worker.py`); the parent does not fork
@@ -101,30 +130,28 @@ group sub-index.
 
 ## 3. Dispatch via shm mailbox
 
-Each WorkerThread drives a `MAILBOX_SIZE`-byte `MAP_SHARED` region. The
-Python facade forks one child per mailbox **before** `WorkerManager::start()`
-(so the parent has only the Python main thread when fork runs, avoiding the
-classical "fork in a multi-threaded process" hazard) and the child polls
-the mailbox for the lifetime of the worker.
+Each `LocalMailboxEndpoint` drives a `MAILBOX_SIZE`-byte `MAP_SHARED` region.
+The Python facade forks one child per mailbox **before**
+`WorkerManager::start()` (so the parent has only the Python main thread when
+fork runs, avoiding the classical "fork in a multi-threaded process" hazard)
+and the child polls the mailbox for the lifetime of the worker.
 
 ### 3.1 Parent-side dispatch
 
 ```cpp
-void WorkerThread::dispatch_process(WorkerDispatch d) {
-    TaskSlotState &s = *ring_->slot_state(d.task_slot);
-    uint8_t *m = (uint8_t*)mailbox_ + HEADER_SIZE;
+WorkerCompletion LocalMailboxEndpoint::run(Ring *ring, WorkerDispatch d) {
+    TaskSlotState &s = *ring->slot_state(d.task_slot);
+    char *m = static_cast<char *>(mailbox_);
 
-    // Write task data: callable (8 B) + config (~16 B) + length-prefixed
-    // TaskArgs blob. The blob is derived from the slot's stored TaskArgs
-    // via write_blob() — tags are stripped, only [T][S][tensors][scalars]
-    // crosses the fork boundary.
-    uint64_t callable = (s.worker_type == WorkerType::SUB)
-        ? static_cast<uint64_t>(s.callable_id)
-        : s.callable;
-    *reinterpret_cast<uint64_t*>(m)            = callable;
-    *reinterpret_cast<CallConfig*>(m + 8)      = s.config;
+    // Write task data: reserved callable field, config, digest prefix, then
+    // length-prefixed TaskArgs blob. Tags are stripped; only
+    // [digest][T][S][tensors][scalars] crosses the fork boundary.
+    uint64_t reserved = 0;
+    memcpy(m + MAILBOX_OFF_CALLABLE, &reserved, sizeof(reserved));
+    memcpy(m + MAILBOX_OFF_CONFIG, &s.config, sizeof(CallConfig));
+    memcpy(m + MAILBOX_OFF_TASK_CALLABLE_HASH, s.callable.digest.data(), 32);
     const TaskArgs &args = s.is_group() ? s.task_args_list[d.group_index] : s.task_args;
-    write_blob(m + 8 + sizeof(CallConfig), args);
+    write_blob(m + MAILBOX_OFF_TASK_ARGS_BLOB, args);
 
     // Signal child
     write_state(mailbox_, MailboxState::TASK_READY);
@@ -135,16 +162,20 @@ void WorkerThread::dispatch_process(WorkerDispatch d) {
 
     int err = read_error(mailbox_);
     write_state(mailbox_, MailboxState::IDLE);
-    on_complete_(d.task_slot, err);
+    return err == 0
+        ? WorkerCompletion{d.task_slot, d.group_index, EndpointOutcome::SUCCESS, ""}
+        : WorkerCompletion{d.task_slot, d.group_index, EndpointOutcome::TASK_FAILURE,
+                           read_error_msg(mailbox_)};
 }
 ```
 
 Parent-side cost per dispatch:
 
-- One memcpy of `Callable` (8 B) + `CallConfig` (~16 B) + blob (≤~1.7 KB for
-  L3)
+- One reserved `uint64`, one `CallConfig`, one 32-byte digest, and one
+  TaskArgs blob
 - One signal (`write_state`)
 - Poll loop with `sleep_for(50us)` (not busy-wait)
+- One explicit completion outcome: success, task failure, or endpoint failure
 
 Total ~nanoseconds overhead; the wait is dominated by actual kernel execution.
 
@@ -152,9 +183,8 @@ Total ~nanoseconds overhead; the wait is dominated by actual kernel execution.
 
 The child loop lives in Python — see `_chip_process_loop` and
 `_sub_worker_loop` in `python/simpler/worker.py`. Each child polls
-`MAILBOX_OFF_STATE`, decodes the args blob on `TASK_READY`, runs the
-real worker (a `ChipWorker.run(cid, …)` call for chip children, the
-registered Python callable for sub workers), writes back any error,
+`MAILBOX_OFF_STATE`, decodes the digest-prefixed args blob on `TASK_READY`,
+resolves the digest to its private local slot/callable, writes back any error,
 and publishes `TASK_DONE`.
 The child inherits the parent's full address space at fork time, so:
 
@@ -165,49 +195,55 @@ The child inherits the parent's full address space at fork time, so:
 ### 3.3 Mailbox layout
 
 ```text
-offset 0:                              int32  state    (IDLE / TASK_READY / TASK_DONE / SHUTDOWN)
-offset 4:                              int32  error
-offset 8:                              uint64 callable
-offset 16:                             CallConfig config
-offset 16 + sizeof(CallConfig):        bytes  blob:  [int32 T][int32 S][ContinuousTensor × T][uint64_t × S]
+offset 0:                         int32   state
+offset 4:                         int32   error
+offset 8:                         uint64  reserved task callable field
+                                          or control sub-command
+offset 16:                        CallConfig config
+MAILBOX_OFF_TASK_CALLABLE_HASH:   uint8[32] callable digest
+MAILBOX_OFF_TASK_ARGS_BLOB:       bytes [int32 T][int32 S]
+                                        [ContinuousTensor x T][uint64_t x S]
+tail:                             fixed-size NUL-terminated error message
 ```
 
-Sized at WorkerThread construction:
-
-```cpp
-mailbox_size_ = HEADER_SIZE                    // 8 B (state + error)
-              + sizeof(Callable)                // 8 B
-              + sizeof(CallConfig)              // ~16 B
-              + MAX_BLOB_SIZE;                  // per-level, e.g. 1672 B for L3
-```
-
-Per-worker total: ~2 KB. Typical pool: 4-8 workers → ~8-16 KB shm total.
+The current mailbox size is the C++ `MAILBOX_SIZE` constant exported through
+the nanobind module; Python derives its offsets from the same binding where
+possible so the two sides cannot drift silently.
 
 ### 3.4 Shutdown
 
 `WorkerManager::shutdown_children()` writes `SHUTDOWN` to every registered
-mailbox; each child loop sees it on its next poll and exits. The Python
-facade owns the child PIDs and calls `waitpid()` after writing `SHUTDOWN`
-to its own mailbox copy. The parent's `WorkerThread::stop()` only joins
-the C++ dispatcher thread — it does not own the child process.
+endpoint; for `LocalMailboxEndpoint` this writes `SHUTDOWN` to the mailbox.
+Each child loop sees it on its next poll and exits. The Python facade owns the
+child PIDs and calls `waitpid()` after writing `SHUTDOWN` to its own mailbox
+copy. The parent's `WorkerThread::stop()` only joins the C++ dispatcher thread
+— it does not own the child process.
 
 ---
 
-## 4. Adding a new worker kind
+## 4. Local vs. Remote Endpoints
 
-To add a new worker type (e.g., a RemoteWorker over RPC):
+The mailbox protocol is the local endpoint contract. Adding another local
+forked worker kind still follows the existing pattern:
 
-1. Define the kernel-running entry point (a C++ class with a `run` method
-   or a Python callable — there is no abstract interface to inherit from).
-2. Write a child-process loop (mirroring `_chip_process_loop` or
-   `_sub_worker_loop`) that polls the mailbox, decodes the args blob, and
-   invokes that entry point.
-3. Register the per-child mailbox via `manager.add_next_level(mailbox)`
-   or `manager.add_sub(mailbox)`.
+1. Define the worker entry point.
+2. Write a child-process loop that polls the mailbox, decodes the args blob,
+   and invokes that entry point.
+3. Register the mailbox via `manager.add_next_level(mailbox)` or
+   `manager.add_sub(mailbox)`.
 
-The parent side (WorkerManager / WorkerThread) doesn't change — it
-only knows the mailbox protocol, not who runs the kernel on the other
-end.
+Remote L3 is different. It cannot reuse the mailbox wire format because the
+remote side does not share virtual addresses, fork-time COW registries, POSIX
+shm names, or parent-visible child PIDs. The remote design introduces a
+transport-neutral endpoint under `WorkerThread`: `LocalMailboxEndpoint` wraps
+this local mailbox path, while `RemoteL3Endpoint` sends framed TASK, CONTROL,
+COMPLETION, HEALTH, and SHUTDOWN messages over the negotiated transport.
+
+The implemented `RemoteL3Endpoint` sends TASK and CONTROL frames, waits for
+COMPLETION and CONTROL_REPLY frames through `RemoteL3Transport`, and monitors
+an independent simulation health lane. Python remote worker specs open a
+session through `simpler-remote-worker`; the endpoint is schedulable only after
+the session runner reports `HELLO READY`.
 
 ### 4.1 Nested fork ordering (L4+ Worker children)
 

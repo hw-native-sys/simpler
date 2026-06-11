@@ -293,7 +293,7 @@ public:
     // Pending dispatch: returns bit offsets of cores eligible for pending-slot dispatch.
     // AIC: 1 bit per cluster (aic_mask_ positions). AIV: 1 bit per AIV core (aiv_mask_ positions).
     // MIX: 1 bit per cluster where ALL 3 cores have free pending slots AND at least one is running.
-    //       Idle cores participate via to_pending=false in dispatch_mix_block_to_cluster.
+    //       Idle cores participate via to_pending=false in the MIX prepare path.
     BitStates get_pending_core_offset_states(PTO2ResourceShape shape) const {
         if (shape == PTO2ResourceShape::MIX) {
             // Any core without a pending payload can accept a dispatch (idle or running).
@@ -366,10 +366,8 @@ struct alignas(64) SchedL2SwimlaneCounters {
     uint64_t sched_loop_count{0};
     uint32_t phase_complete_count{0};
     uint32_t phase_dispatch_count{0};
-    // Run-cumulative pop counters; the dispatch-phase record emitter
-    // (aicpu_scheduler_phases[]) writes per-emit deltas computed as
-    // (current - pop_*_at_last_emit) and the end-of-run cold-path log reads
-    // the cumulatives directly.
+    // Per-emit delta is (current - *_at_last_emit). Accumulated only when
+    // l2_swimlane_level_ >= SCHED_PHASES.
     uint64_t pop_hit{0};
     uint64_t pop_miss{0};
     uint64_t pop_hit_at_last_emit{0};
@@ -378,8 +376,6 @@ struct alignas(64) SchedL2SwimlaneCounters {
     uint32_t phase_wiring_count{0};
     uint64_t complete_probe_count{0};
     uint64_t complete_hit_count{0};
-    uint64_t local_dispatch_count{0};
-    uint64_t local_overflow_count{0};
     uint64_t sched_complete_perf_cycle{0};
     uint64_t sched_dispatch_pop_cycle{0};
     uint64_t sched_dispatch_setup_cycle{0};

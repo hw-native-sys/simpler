@@ -4,25 +4,11 @@
 
 This dev box is **shared** across many users running NPU work concurrently
 (`pypto-serving`, model decode benchmarks, PTOAS validation, other `simpler`
-hacking, etc.). Without explicit per-device locking, two users hitting the
-same physical chip will contend on chip-shared resources (FFTS control,
-shared L2, MMU TLB, register MMIO); the symptom on AICore is a dispatched
-task that ACKs but never writes FIN — scheduler stalls 800K idle iterations,
-CANN reports `errorCode=0x2a` / `507018` "aicpu execute failed" with
-`errcode:0`. **It looks exactly like a code bug.** It is not — it is cross-user
-contention.
-
-Concrete example: an investigation chased a flaky `st-onboard-a2a3`
-`simpler_aicpu_exec` 0x2a for hours assuming a software root cause, and
-"reproduced" 100% in iter 1 on devices 8/9 — only to find another user had
-been holding `npu-lock 8` for 5 hours with a heavy serving workload. With
-`task-submit` exclusive lock on a free pair, all 50 iterations passed clean.
-The "reproduction" was contention noise.
-
-CI runs on dedicated runners and **always uses `task-submit`** (see
-`.github/workflows/ci.yml`), so CI never sees this class of noise. Local
-hardware work that bypasses `task-submit` is comparing against a stricter
-environment.
+hacking, etc.). `task-submit` is the queue / per-device lock used on this
+box and on CI runners — running hardware work through it keeps two users
+from grabbing the same device, keeps the `--list` queue accurate, and keeps
+local runs comparable to CI (CI always wraps pytest in `task-submit`, see
+`.github/workflows/ci.yml`).
 
 ## Rule
 
@@ -83,9 +69,9 @@ echo "[WARN] task-submit not found; running unlocked — results may be noisy if
 python -m pytest tests/st/... --platform a2a3 --device 8-9 ...
 ```
 
-If unlocked results contradict CI or prior runs, **first** check whether
-another process is on the same chip (`npu-smi info` + the process table at
-the bottom) before treating the discrepancy as a real signal.
+If unlocked results contradict CI or prior runs, **first** rule out the
+usual environment causes (binary out of sync with source, wrong arch,
+stale CMake cache) before treating the discrepancy as a real signal.
 
 ## Pre-flight: arch precheck
 
@@ -110,8 +96,8 @@ are silicon-agnostic. The precheck is purely about onboard invocations.
 ## Anti-patterns
 
 - ❌ Bash `for i in $(seq 1 50); do pytest ... --device 8 & pytest ... --device 9 & wait; done`
-  with no lock — your iter results are entangled with whoever else is on
-  those devices.
+  with no lock — you'll race other users for the same device and break
+  the shared queue's accounting.
 - ❌ Reading `gh pr checks <PR>` "ci passed" as proof a fix worked while
   your own local repro (unlocked) shows the bug — your local environment is
   the outlier, not CI.
@@ -130,6 +116,6 @@ are silicon-agnostic. The precheck is purely about onboard invocations.
 - **See queue + running** — `task-submit --list`
 - **Wait for a submitted task** — `task-submit --wait <task-id>`
 - **Cancel pending** — `task-submit --cancel <task-id>`
-- **Per-die contention map** — `npu-smi info` + bottom process table
+- **Per-die utilization + process table** — `npu-smi info`
 
 `task-submit --help` for the full surface.

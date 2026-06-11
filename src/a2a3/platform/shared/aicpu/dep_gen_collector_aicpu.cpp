@@ -162,7 +162,7 @@ void dep_gen_aicpu_init() {
 
 void dep_gen_aicpu_record_submit(
     uint64_t task_id_raw, bool in_manual_scope, int tensor_count, const void *const *tensor_ptrs,
-    const uint8_t *arg_types, int explicit_dep_count, const uint64_t *explicit_deps_raw
+    const uint8_t *arg_types, int explicit_dep_count, const uint64_t *explicit_deps_raw, const int32_t kernel_ids[3]
 ) {
     if (!g_enable_dep_gen || s_dep_gen_state == nullptr) {
         return;
@@ -269,6 +269,21 @@ void dep_gen_aicpu_record_submit(
     // arg_types
     if (tc > 0 && arg_types != nullptr) {
         memcpy(rec->arg_types, arg_types, static_cast<size_t>(tc));
+    }
+
+    // Per-subslot kernel ids (AIC, AIV0, AIV1). The orchestrator owns the
+    // identity-side of the swimlane join: with task_id (PTO2 raw) + kernel_id
+    // captured here, the host post-processor can name every AICore record.
+    // Inactive subslots stay at INVALID_KERNEL_ID (-1); the caller is expected
+    // to pass that sentinel rather than 0.
+    if (kernel_ids != nullptr) {
+        rec->kernel_id[0] = kernel_ids[0];
+        rec->kernel_id[1] = kernel_ids[1];
+        rec->kernel_id[2] = kernel_ids[2];
+    } else {
+        rec->kernel_id[0] = -1;
+        rec->kernel_id[1] = -1;
+        rec->kernel_id[2] = -1;
     }
 
     // tensors[]: per-slot 128-byte blob (or zero if pointer is null — OUTPUT slot)

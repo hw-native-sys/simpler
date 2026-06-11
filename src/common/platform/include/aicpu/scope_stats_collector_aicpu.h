@@ -36,17 +36,19 @@ extern "C" {
 
 // --- Scope lifecycle probes (called by orchestrator begin_scope/end_scope) ---
 //
-// Each emits one record for the scope's current ring, carrying the task ring's
-// and heap ring's start/end plus the tensormap pool usage, sampled at that
+// Each emits one record for the scope's current ring, carrying task ring,
+// heap ring, dep_pool tail/top, and tensormap pool usage sampled at that
 // boundary: begin tags it SCOPE_STATS_PHASE_BEGIN, end tags it
 // SCOPE_STATS_PHASE_END. task_start/end = task ring tail/head, heap_start/end =
-// heap reclaim/allocation pointers.
+// heap reclaim/allocation pointers, dep_pool_start/end = dep_pool tail/top.
 
 void scope_stats_begin(
-    int ring_id, int32_t task_start, int32_t task_end, uint64_t heap_start, uint64_t heap_end, int32_t tensormap_used
+    int ring_id, int32_t task_start, int32_t task_end, uint64_t heap_start, uint64_t heap_end, int32_t dep_pool_start,
+    int32_t dep_pool_end, int32_t tensormap_used
 );
 void scope_stats_end(
-    int ring_id, int32_t task_start, int32_t task_end, uint64_t heap_start, uint64_t heap_end, int32_t tensormap_used
+    int ring_id, int32_t task_start, int32_t task_end, uint64_t heap_start, uint64_t heap_end, int32_t dep_pool_start,
+    int32_t dep_pool_end, int32_t tensormap_used
 );
 void scope_stats_on_fatal();
 
@@ -84,7 +86,7 @@ void scope_stats_aicpu_flush_buffers();
 
 // --- Capacity registration (called by runtime at init) ---
 
-void scope_stats_set_ring_capacity(int ring_id, int32_t window_cap, uint64_t heap_cap);
+void scope_stats_set_ring_capacity(int ring_id, int32_t window_cap, uint64_t heap_cap, int32_t dep_pool_cap);
 void scope_stats_set_tensormap_capacity(int32_t cap);
 
 }  // extern "C"

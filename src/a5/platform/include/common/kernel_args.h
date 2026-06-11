@@ -80,13 +80,15 @@ struct KernelArgs {
     // Profiling per-core address arrays (moved out of Handshake). Each *_addrs
     // field is a device pointer to uint64_t[num_aicore]. AICore KERNEL_ENTRY
     // indexes by block_idx and forwards into per-core platform state.
-    uint64_t aicore_l2_swimlane_ring_addrs{0};  // L2SwimlaneAicoreRing* per core; 0 when L2 swimlane is off
-    uint64_t aicore_pmu_ring_addrs{0};          // PmuAicoreRing* per core; 0 when PMU is off
-    uint64_t scope_stats_data_base{0};          // ScopeStatsBuffer device pointer; 0 when scope_stats is off.
-                                                // a5 has no halHostRegister — host keeps a separate shadow and
-                                                // refreshes it via rtMemcpy DEVICE_TO_HOST at dump time.
-    uint32_t log_level{1};                      // Severity floor: 0=DEBUG, 1=INFO, 2=WARN, 3=ERROR, 4=NUL
-    uint32_t log_info_v{5};                     // INFO verbosity threshold (0..9); default V5
+    uint64_t l2_swimlane_aicore_rotation_table{
+        0
+    };  // L2SwimlaneActiveHead* per core (rotation channel); 0 when L2 swimlane is off
+    uint64_t aicore_pmu_ring_addrs{0};  // PmuAicoreRing* per core; 0 when PMU is off
+    uint64_t scope_stats_data_base{0};  // ScopeStatsBuffer device pointer; 0 when scope_stats is off.
+                                        // a5 has no halHostRegister — host keeps a separate shadow and
+                                        // refreshes it via rtMemcpy DEVICE_TO_HOST at dump time.
+    uint32_t log_level{1};              // Severity floor: 0=DEBUG, 1=INFO, 2=WARN, 3=ERROR, 4=NUL
+    uint32_t log_info_v{5};             // INFO verbosity threshold (0..9); default V5
     uint32_t enable_profiling_flag{0};  // Profiling umbrella bitmask; dump_tensor|l2_swimlane|pmu|dep_gen|scope_stats
     uint32_t _pad{0};                   // Alignment padding
 
@@ -100,6 +102,12 @@ struct KernelArgs {
     // mirroring the per-device simpler_inner preinstall fix. Trailing field —
     // keeps the CANN-fixed front offsets and AICore-read fields in place.
     uint32_t device_id{0};
+    // Opaque always-false guard read by the AICore SIMT meta anchor (AIV
+    // KERNEL_ENTRY). The host never sets it non-zero; its only purpose is to be
+    // a runtime-valued condition the compiler cannot constant-fold, so the
+    // never-executed SIMT launch in simt_anchor.h survives DCE and bisheng
+    // still classifies the entry as SIMT. Keep it last (trailing field).
+    uint32_t force_simt_anchor{0};
 };
 
 #ifdef __cplusplus

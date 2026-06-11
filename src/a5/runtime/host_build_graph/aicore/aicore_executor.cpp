@@ -63,7 +63,10 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, in
     bool l2_swimlane_enabled = GET_PROFILING_FLAG(profiling_flag, PROFILING_FLAG_L2_SWIMLANE);
     bool dump_tensor_enabled = GET_PROFILING_FLAG(profiling_flag, PROFILING_FLAG_DUMP_TENSOR);
     bool pmu_enabled = GET_PROFILING_FLAG(profiling_flag, PROFILING_FLAG_PMU);
-    __gm__ L2SwimlaneAicoreRing *l2_swimlane_ring = l2_swimlane_enabled ? get_aicore_l2_swimlane_ring() : nullptr;
+    // Lazy resolve at first dispatch — AICPU init populates the rotation
+    // table concurrently with kernel entry; first dispatch is proof init done.
+    __gm__ L2SwimlaneActiveHead *l2_swimlane_head = nullptr;
+    L2SwimlaneAicoreLocalState l2_swimlane_local = {nullptr, UINT32_MAX, 0};
     __gm__ PmuAicoreRing *pmu_ring = pmu_enabled ? get_aicore_pmu_ring() : nullptr;
     uint64_t pmu_reg_base = pmu_enabled ? get_aicore_pmu_reg_base() : 0;
 
@@ -87,6 +90,11 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, in
             uint32_t actual_task_id = task_id;
             write_reg(RegId::COND, MAKE_ACK_VALUE(actual_task_id));
 
+            // First-task lazy resolve of the rotation channel.
+            if (l2_swimlane_enabled && l2_swimlane_head == nullptr) {
+                l2_swimlane_head = get_l2_swimlane_aicore_head();
+            }
+
             __gm__ Task *task_ptr = &(runtime->tasks[actual_task_id]);
             uint64_t start_time = get_sys_cnt_aicore();
 
@@ -105,9 +113,16 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, in
                 pipe_barrier(PIPE_ALL);
             }
 
+            // host_build_graph uses plain task indices; zero-extend into
+            // task_token_raw (identity) AND pass as reg_task_id (join key).
+            // With block_num always == 1 here, identity and dispatch token
+            // coincide and a single value covers both.
             if (l2_swimlane_enabled) {
                 uint64_t end_time = get_sys_cnt_aicore();
-                l2_swimlane_aicore_record_task(l2_swimlane_ring, actual_task_id, start_time, end_time);
+                l2_swimlane_aicore_record_task(
+                    l2_swimlane_head, &l2_swimlane_local, static_cast<uint64_t>(actual_task_id),
+                    static_cast<uint32_t>(actual_task_id), start_time, end_time
+                );
             }
 
             last_task_id = task_id;

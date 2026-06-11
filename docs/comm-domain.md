@@ -26,7 +26,7 @@ with orch.allocate_domain(
     for chip_idx in handle.workers:
         domain = handle[chip_idx]          # -> ChipDomainContext
         ...
-        orch.submit_next_level(cid, args, cfg, worker=chip_idx)
+        orch.submit_next_level(chip_handle, args, cfg, worker=chip_idx)
 ```
 
 `window_size` is validated on the orch thread **before** any chip-side
@@ -143,7 +143,7 @@ with orch.allocate_domain(...) as handle:
     for chip_idx in handle.workers:                       # stage all first
         orch.copy_to(chip_idx, dst=handle[chip_idx].buffer_ptrs["input"], src=..., size=n)
     for chip_idx in handle.workers:                       # then submit
-        orch.submit_next_level(cid, args, cfg, worker=chip_idx)
+        orch.submit_next_level(chip_handle, args, cfg, worker=chip_idx)
 ```
 
 ---

@@ -128,7 +128,7 @@ so you know exactly what silicon was detected (e.g.
 
 ## Related
 
-- [task-submit-isolation.md](../../rules/task-submit-isolation.md) — sister
+- [running-onboard.md](../../rules/running-onboard.md) — sister
   rule that says all hardware work goes through `task-submit`. The
   precheck runs BEFORE `task-submit` to avoid wasteful device lock
   acquisition on a doomed-to-fail invocation.

@@ -18,6 +18,7 @@
 #include "common/l2_swimlane_profiling.h"
 #include "common/platform_config.h"
 #include "common/pmu_profiling.h"
+#include "simt_anchor.h"
 
 class Runtime;
 
@@ -47,18 +48,29 @@ class Runtime;
 // linker dedup the otherwise-duplicate symbol definitions across the two
 // compilation units.
 [[block_local]] static uint32_t s_aicore_profiling_flag;
-[[block_local]] static __gm__ L2SwimlaneAicoreRing *s_aicore_l2_swimlane_ring;
+// Slot pointer (NOT the dereferenced head address) — see
+// aicore_profiling_state.h for the lazy-deref contract.
+[[block_local]] static __gm__ uint64_t *s_l2_swimlane_aicore_head_slot;
+[[block_local]] static __gm__ L2SwimlaneActiveHead *s_l2_swimlane_aicore_head;
 [[block_local]] static __gm__ PmuAicoreRing *s_aicore_pmu_ring;
 [[block_local]] static uint64_t s_aicore_pmu_reg_base;
 
 __attribute__((weak)) __aicore__ void set_aicore_profiling_flag(uint32_t flag) { s_aicore_profiling_flag = flag; }
 __attribute__((weak)) __aicore__ uint32_t get_aicore_profiling_flag() { return s_aicore_profiling_flag; }
 
-__attribute__((weak)) __aicore__ void set_aicore_l2_swimlane_ring(__gm__ L2SwimlaneAicoreRing *ring) {
-    s_aicore_l2_swimlane_ring = ring;
+__attribute__((weak)) __aicore__ void set_l2_swimlane_aicore_head_slot(__gm__ uint64_t *slot_ptr) {
+    s_l2_swimlane_aicore_head_slot = slot_ptr;
+    s_l2_swimlane_aicore_head = nullptr;  // force lazy resolution on next get
 }
-__attribute__((weak)) __aicore__ __gm__ L2SwimlaneAicoreRing *get_aicore_l2_swimlane_ring() {
-    return s_aicore_l2_swimlane_ring;
+__attribute__((weak)) __aicore__ __gm__ L2SwimlaneActiveHead *get_l2_swimlane_aicore_head() {
+    // Lazy first-call resolve: AICPU init populates `*s_l2_swimlane_aicore_head_slot`
+    // before dispatching the first task, so by the time the executor reaches
+    // for the head (inside the first-task branch of the dispatch poll) the
+    // slot holds a valid device address.
+    if (s_l2_swimlane_aicore_head == nullptr && s_l2_swimlane_aicore_head_slot != nullptr) {
+        s_l2_swimlane_aicore_head = reinterpret_cast<__gm__ L2SwimlaneActiveHead *>(*s_l2_swimlane_aicore_head_slot);
+    }
+    return s_l2_swimlane_aicore_head;
 }
 
 __attribute__((weak)) __aicore__ void set_aicore_pmu_ring(__gm__ PmuAicoreRing *ring) { s_aicore_pmu_ring = ring; }
@@ -82,7 +94,7 @@ extern __aicore__ void aicore_execute(__gm__ Runtime *runtime, int block_idx, Co
  *
  * Each core (AIC or AIV) gets its own handshake buffer indexed by block_idx.
  * Profiling state flows from KernelArgs into platform-owned per-core slots
- * via set_aicore_profiling_flag() / set_aicore_l2_swimlane_ring() /
+ * via set_aicore_profiling_flag() / set_l2_swimlane_aicore_head_slot() /
  * set_aicore_pmu_ring() / set_aicore_pmu_reg_base(); the runtime's
  * Handshake stays profiling-free and aicore_execute keeps its original
  * signature.
@@ -106,15 +118,24 @@ extern "C" __global__ __aicore__ void KERNEL_ENTRY(aicore_kernel)(__gm__ KernelA
     // kernel launch, so the resolved base is valid from Phase 1 onward and
     // does not depend on any AICPU init ordering.
     set_aicore_profiling_flag(k_args->enable_profiling_flag);
-    if (GET_PROFILING_FLAG(k_args->enable_profiling_flag, PROFILING_FLAG_L2_SWIMLANE)) {
-        __gm__ uint64_t *ring_table = reinterpret_cast<__gm__ uint64_t *>(k_args->aicore_l2_swimlane_ring_addrs);
-        if (ring_table != nullptr) {
-            set_aicore_l2_swimlane_ring(reinterpret_cast<__gm__ L2SwimlaneAicoreRing *>(ring_table[block_idx]));
-        } else {
-            set_aicore_l2_swimlane_ring(nullptr);
-        }
+    // Always publish the head slot (nullptr when this launch is disabled or
+    // has no rotation table). [[block_local]] storage persists across launches
+    // on the same loaded kernel binary, so without an explicit nullptr
+    // publication a sequence like enabled(valid)→enabled(NULL table) or
+    // enabled→disabled would leave `get_l2_swimlane_aicore_head()` returning
+    // the prior launch's freed pointer.
+    if (GET_PROFILING_FLAG(k_args->enable_profiling_flag, PROFILING_FLAG_L2_SWIMLANE) &&
+        k_args->l2_swimlane_aicore_rotation_table != 0) {
+        // Stash only the slot pointer. The slot CONTENTS are written by
+        // AICPU's `l2_swimlane_aicpu_init` which runs concurrently with this
+        // entry; dereferencing here would race with AICPU's write. The
+        // executor defers the deref via `get_l2_swimlane_aicore_head()` until
+        // inside the first-task branch — by then AICPU has dispatched, so
+        // init is done and the slot is populated.
+        __gm__ uint64_t *head_table = reinterpret_cast<__gm__ uint64_t *>(k_args->l2_swimlane_aicore_rotation_table);
+        set_l2_swimlane_aicore_head_slot(&head_table[block_idx]);
     } else {
-        set_aicore_l2_swimlane_ring(nullptr);
+        set_l2_swimlane_aicore_head_slot(nullptr);
     }
     if (GET_PROFILING_FLAG(k_args->enable_profiling_flag, PROFILING_FLAG_PMU)) {
         __gm__ uint64_t *pmu_ring_table = reinterpret_cast<__gm__ uint64_t *>(k_args->aicore_pmu_ring_addrs);
@@ -133,6 +154,17 @@ extern "C" __global__ __aicore__ void KERNEL_ENTRY(aicore_kernel)(__gm__ KernelA
         set_aicore_pmu_ring(nullptr);
         set_aicore_pmu_reg_base(0);
     }
+
+#ifdef __DAV_VEC__
+    // SIMT classification anchor (AIV only). Never executes —
+    // `force_simt_anchor` is always 0 — but the compiler cannot prove the
+    // GM-loaded condition false, so the never-taken SIMT launch survives DCE
+    // and bisheng auto-emits this entry's SIMT meta TLVs (UB size + AIV type)
+    // that runtime reads at register time. See simt_anchor.h.
+    if (k_args->force_simt_anchor) {
+        simt_meta_anchor(reinterpret_cast<__gm__ uint32_t *>(k_args));
+    }
+#endif
 
     aicore_execute(k_args->runtime_args, block_idx, core_type);
 }

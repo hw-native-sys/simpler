@@ -15,11 +15,11 @@ With ``--enable-scope-stats`` the platform collector
 (begin and end) into a pooled buffer that streams to the host, which writes
 NDJSON. Enabling the flag is the entire user surface for the new API — the
 runtime takes care of the ``set_pending_site`` / ``scope_stats_begin`` /
-``scope_stats_end`` calls. Schema lives in ``docs/dfx/scope-stats.md`` §5.
+``scope_stats_end`` calls. Schema lives in ``docs/dfx/scope-stats.md`` §3.
 
 Output (``scope_stats.jsonl``): line 1 is run metadata
-(``{"version":4,"fatal":bool,"dropped":uint,"total":uint}``); each subsequent
-line is one scope-boundary record carrying the ring task/heap start-end.
+(``{"version":5,"fatal":bool,"dropped":uint,"total":uint}``); each subsequent
+line is one scope-boundary record carrying task/heap/dep_pool start-end.
 """
 
 import json
@@ -40,6 +40,8 @@ _REQUIRED_RECORD_FIELDS = {
     "task_window_end",
     "heap_start",
     "heap_end",
+    "dep_pool_start",
+    "dep_pool_end",
     "tensormap",
 }
 
@@ -116,9 +118,10 @@ class TestScopeStats(SceneTestCase):
         lines = [ln for ln in path.read_text().splitlines() if ln.strip()]
         assert lines, f"scope_stats.jsonl empty under {matches[-1]}"
         meta = json.loads(lines[0])
-        assert meta.get("version") == 4, f"unexpected schema version: {meta!r}"
+        assert meta.get("version") == 5, f"unexpected schema version: {meta!r}"
         assert meta.get("fatal") is False, f"run latched fatal: {meta!r}"
         assert meta.get("dropped", 0) == 0, f"records dropped on device: {meta!r}"
+        assert "dep_pool_max" in meta, f"metadata missing dep_pool_max: {meta!r}"
         records = [json.loads(ln) for ln in lines[1:]]
         # outer (executor) + inner PTO2_SCOPE, each emitting a begin and an end
         # record → ≥4 records.

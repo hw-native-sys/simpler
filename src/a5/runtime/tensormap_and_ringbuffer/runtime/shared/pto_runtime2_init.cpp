@@ -76,6 +76,10 @@ bool PTO2SchedulerState::RingSchedState::init_data_from_layout(void *sm_dev_base
     ring = pto2_sm_layout::ring_header_addr(sm_dev_base, ring_id);
     last_task_alive = 0;
     advance_lock.store(0, std::memory_order_relaxed);
+#if PTO2_PROFILING
+    dep_pool_snapshot_tail.store(1, std::memory_order_relaxed);
+    dep_pool_snapshot_top.store(1, std::memory_order_relaxed);
+#endif
 
     // Per-slot SM-side initialization (bind_ring + reset_for_reuse +
     // fanin_count/active_mask zero) lives in PTO2SharedMemoryHandle::

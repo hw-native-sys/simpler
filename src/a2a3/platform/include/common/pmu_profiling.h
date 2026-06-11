@@ -134,7 +134,7 @@ inline const PmuEventConfig *pmu_resolve_event_config_a2a3(PmuEventType event_ty
  * Per-task PMU snapshot written by AICPU after each AICore task FIN.
  */
 struct PmuRecord {
-    uint64_t task_id;                               // Same encoding as L2SwimlaneAicpuTaskRecord.task_id
+    uint64_t task_id;                               // Same encoding as L2SwimlaneAicoreTaskRecord.task_token_raw
     uint32_t func_id;                               // Kernel function identifier
     CoreType core_type;                             // AIC or AIV
     uint64_t pmu_total_cycles;                      // PMU_CNT_TOTAL (64-bit combined)

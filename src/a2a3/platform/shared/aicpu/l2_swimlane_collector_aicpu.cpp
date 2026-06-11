@@ -52,6 +52,13 @@ static L2SwimlaneAicpuTaskPool *s_aicpu_task_pools[PLATFORM_MAX_CORES] = {};
 // since current_buf_seq only bumps on a successful rotation.
 static L2SwimlaneAicoreTaskPool *s_aicore_task_pools[PLATFORM_MAX_CORES] = {};
 
+// Per-core AICPU-side dispatch count. Incremented on every
+// `l2_swimlane_aicpu_on_aicore_dispatch` call (= once per AICore dispatch).
+// When the pre-bump value is a non-zero multiple of PLATFORM_AICORE_BUFFER_SIZE,
+// AICPU rotates the AICore buffer before the upcoming write_reg(DATA_MAIN_BASE).
+// Single-writer per cell (the scheduler thread that owns the core).
+static uint32_t s_aicore_dispatched_count[PLATFORM_MAX_CORES] = {};
+
 // Per-core cached current-records-buffer pointer. Written by AICPU when
 // rotating buffers from inside `complete_record`. AICore writes to its own
 // per-core L2SwimlaneAicoreTaskBuffer (host-allocated, AICPU rotates) and AICPU
@@ -105,8 +112,8 @@ L2SwimlaneLevel get_l2_swimlane_level() { return g_l2_swimlane_level; }
  * Enqueue ready buffer to per-thread queue
  *
  * @param header L2SwimlaneDataHeader pointer
- * @param thread_idx Thread index
- * @param core_index Core index (or thread_idx for phase entries)
+ * @param thread_idx AICPU thread index (selects the per-thread ready queue)
+ * @param core_index Core index for task entries, or pool ordinal for phase entries
  * @param buffer_ptr Device pointer to the full buffer
  * @param buffer_seq Sequence number for ordering
  * @param kind Buffer kind discriminator (see L2SwimlaneBufferKind)
@@ -145,6 +152,15 @@ void l2_swimlane_aicpu_init(int worker_count) {
     // in onboard/aicore/kernel.cpp for the AICore-side rotation slot
     // (fixed in #936).
     s_phase_initialized = false;
+
+    // Reset AICore dispatch-count bookkeeping for the same reason: the next
+    // launch must start counting from 0 so the rotation boundary check
+    // (count % BUFFER_SIZE == 0) lands on the right dispatches. Stale values
+    // from a prior launch would skip the first rotation (count already past a
+    // boundary) or trigger one prematurely.
+    for (int i = 0; i < PLATFORM_MAX_CORES; i++) {
+        s_aicore_dispatched_count[i] = 0;
+    }
 
     void *l2_swimlane_base = reinterpret_cast<void *>(g_platform_l2_swimlane_base);
     if (l2_swimlane_base == nullptr) {
@@ -390,14 +406,46 @@ static void aicore_rotate(int core_id, int thread_idx) {
     wmb();
 }
 
-// Public no-op shim kept so callers compile during the cross-runtime
-// transition; the rotation has been moved into l2_swimlane_aicpu_complete_task
-// where it is race-free vs in-flight AICore record writes.
-void l2_swimlane_aicpu_maybe_rotate_aicore(int /*core_id*/, int /*thread_idx*/) {}
+// Pre-dispatch hook. Called from the dispatch path (scheduler_dispatch in
+// tensormap_and_ringbuffer; aicpu_executor in host_build_graph) immediately
+// before `write_reg(DATA_MAIN_BASE)` for each AICore task. Maintains the
+// per-core dispatch count and rotates the AICore buffer when the count is
+// about to cross a PLATFORM_AICORE_BUFFER_SIZE boundary.
+//
+// Race safety: rotation runs before the dispatch register write. The
+// completion-before-dispatch invariant (AICore per core is single-threaded
+// and AICPU does not dispatch task K+1 until K FIN'd) guarantees AICore has
+// already finished writing — and dcci'd out — every record in the old buffer
+// by then. AICPU can safely enqueue the old buffer to the ready queue.
+//
+// total_record_count accounting also lives here: one AICore record == one
+// dispatch, so the dispatch count IS the AICore-side total. Bumping here
+// (instead of inside complete_task) means level=1 (AICORE_TIMING-only) gets
+// accurate reconcile counts even when complete_task is bypassed.
+void l2_swimlane_aicpu_on_aicore_dispatch(int core_id, int thread_idx) {
+    if (!g_enable_l2_swimlane) {
+        return;
+    }
+    if (core_id < 0 || core_id >= PLATFORM_MAX_CORES) {
+        return;
+    }
+    L2SwimlaneAicoreTaskPool *ac_state = s_aicore_task_pools[core_id];
+    if (ac_state == nullptr) {
+        return;
+    }
+    uint32_t prev = s_aicore_dispatched_count[core_id];
+    // Rotate exactly on the first dispatch of each non-initial BUFFER_SIZE
+    // batch (prev = BUFFER_SIZE, 2*BUFFER_SIZE, ...). PLATFORM_AICORE_BUFFER_SIZE
+    // is asserted power-of-two so the mod lowers to a bitwise AND.
+    if (prev > 0 && (prev & (PLATFORM_AICORE_BUFFER_SIZE - 1)) == 0) {
+        aicore_rotate(core_id, thread_idx);
+    }
+    s_aicore_dispatched_count[core_id] = prev + 1;
+    ac_state->head.total_record_count += 1;
+}
 
 int l2_swimlane_aicpu_complete_task(
-    int core_id, int thread_idx, uint32_t expected_reg_task_id, uint64_t task_id, uint32_t func_id, CoreType core_type,
-    uint64_t dispatch_time, uint64_t finish_time
+    int core_id, int thread_idx, uint32_t reg_task_id, uint64_t dispatch_time, uint64_t finish_time
 ) {
     if (core_id < 0 || core_id >= PLATFORM_MAX_CORES) {
         return -1;
@@ -425,31 +473,13 @@ int l2_swimlane_aicpu_complete_task(
         return -1;
     }
 
-    // AICore-as-producer: AICore writes start/end/task_id directly into its
-    // own per-core L2SwimlaneAicoreTaskBuffer (indexed by reg_task_id % SIZE). AICPU
-    // writes only AICPU-owned fields here; start/end stay zero on-device and
-    // are patched by the host when the buffer is consumed. Join key is
-    // `reg_task_id` (monotonic per core), stored alongside the PTO2-encoded
-    // `task_id` so the host can match without a hashmap lookup. This
-    // eliminates the per-task rmb() + staging cache-line read the previous
-    // design required.
+    // AICPU-only timing — three fields, two cache half-lines. Identity
+    // (task_token_raw, core_type) lives in the AICore record; the host
+    // joins by reg_task_id. See L2SwimlaneAicpuTaskRecord header comment.
     L2SwimlaneAicpuTaskRecord *record = &l2_swimlane_buf->records[count];
-    record->start_time = 0;
-    record->end_time = 0;
-    record->duration = 0;
-    record->task_id = task_id;
-    record->reg_task_id = expected_reg_task_id;
-    record->func_id = func_id;
-    record->core_type = core_type;
-
-    // AICPU_TIMING and above: dispatch/finish timing.
-    if (g_l2_swimlane_level >= L2SwimlaneLevel::AICPU_TIMING) {
-        record->dispatch_time = dispatch_time;
-        record->finish_time = finish_time;
-    } else {
-        record->dispatch_time = 0;
-        record->finish_time = 0;
-    }
+    record->reg_task_id = reg_task_id;
+    record->dispatch_time = dispatch_time;
+    record->finish_time = finish_time;
 
     uint32_t new_count = count + 1;
     l2_swimlane_buf->count = new_count;
@@ -461,38 +491,10 @@ int l2_swimlane_aicpu_complete_task(
         switch_records_buffer(core_id, thread_idx);
     }
 
-    // AICore-side rotation: piggy-back on this completion. The current task's
-    // AICore record has already been written (AICore writes it before the FIN
-    // signal that brought us here), so at every PLATFORM_AICORE_BUFFER_SIZE-th
-    // completion we hand the just-filled AICore buffer to the ready queue and
-    // pop a fresh one. Doing this in the completion path (not the dispatch
-    // path) closes the dispatch-boundary race: at a dispatch boundary AICore
-    // may still be running task K-1 with its record write yet to happen, so a
-    // dispatch-time rotation could leak K-1's record into the wrong buffer.
-    //
-    // Residual race at the next dispatch: under dual-issue, AICPU may have
-    // already dispatched task K+1 when it processes the FIN of K=BUFFER_SIZE-1.
-    // AICPU's rotation (~1 us — a few wmbs + an enqueue + a pop) needs to
-    // complete before AICore's `record_task` for K+1 reads the published
-    // rotation channel; otherwise AICore's local `slot_within_buf` hits the
-    // `slot >= BUFFER_SIZE` guard and silently drops K+1's record. For typical
-    // kernels (>10 us) the rotation completes long before AICore's record
-    // write, so this never fires; for adversarial sub-microsecond kernels it
-    // can. The host parser surfaces the loss via the `unmatched > 0` warning
-    // in join_aicore_records().
-    //
-    // total_record_count is uint32_t — wraps after ~4 G completions per core.
-    // At realistic dispatch rates this is multi-week continuous-run territory;
-    // we accept the limitation rather than widening the on-device counter.
-    L2SwimlaneAicoreTaskPool *ac_state = s_aicore_task_pools[core_id];
-    if (ac_state != nullptr) {
-        uint32_t completed = ac_state->head.total_record_count + 1;
-        ac_state->head.total_record_count = completed;
-        if ((completed & (PLATFORM_AICORE_BUFFER_SIZE - 1)) == 0) {
-            aicore_rotate(core_id, thread_idx);
-        }
-    }
-
+    // AICore-pool stats (total_record_count) are bumped on the dispatch side,
+    // not here. See l2_swimlane_aicpu_on_aicore_dispatch — counting per
+    // dispatch keeps reconcile counts accurate even at level=1 where this
+    // function never runs.
     return 0;
 }
 
@@ -555,12 +557,12 @@ void l2_swimlane_aicpu_flush(int thread_idx, const int *cur_thread_cores, int co
         // sees this session's final batch of AICore timestamps.
         //
         // High-water mark uses the rotation accounting (total_record_count -
-        // current_buf_seq * BUFFER_SIZE) so the failed-rotation case is
-        // correctly handled: when an earlier rotation couldn't find a free
-        // buffer the current buffer holds BUFFER_SIZE valid records plus an
-        // unknown number of dropped overflow attempts; the formula clamps
-        // to BUFFER_SIZE in that case rather than stamping a stale partial
-        // count.
+        // current_buf_seq * BUFFER_SIZE). total_record_count is bumped per
+        // dispatch in l2_swimlane_aicpu_on_aicore_dispatch and is therefore
+        // accurate at all levels — including level=1 where complete_task is
+        // bypassed. The formula clamps to BUFFER_SIZE if an earlier rotation
+        // failed (no free buffer), so we never stamp a partial count when
+        // the buffer is actually full.
         L2SwimlaneAicoreTaskPool *ac_state = s_aicore_task_pools[core_id];
         if (ac_state == nullptr) continue;
 
@@ -568,16 +570,26 @@ void l2_swimlane_aicpu_flush(int thread_idx, const int *cur_thread_cores, int co
         uint64_t ac_buf_ptr = ac_state->head.current_buf_ptr;
         if (ac_buf_ptr == 0) continue;
 
-        uint32_t live = ac_state->head.total_record_count -
-                        ac_state->head.current_buf_seq * static_cast<uint32_t>(PLATFORM_AICORE_BUFFER_SIZE);
-        if (live == 0) {
-            // Last rotation matched the last completion exactly — buffer is
-            // freshly popped and empty. Skip.
-            continue;
+        // At AICPU_TIMING+, `total_record_count` is bumped on every complete
+        // and gives an accurate live count for the current buffer. At
+        // AICORE_TIMING (level=1) complete_task is skipped, so that counter
+        // stays 0 and the formula bails even when AICore has filled records.
+        // Fall back to the buffer's full capacity in that case; the host-side
+        // copy_aicore_buffer skips trailing slots whose start_time is still 0,
+        // so over-stating count costs only a scan pass — never spurious records.
+        uint32_t ac_mark;
+        if (g_l2_swimlane_level >= L2SwimlaneLevel::AICPU_TIMING) {
+            uint32_t live = ac_state->head.total_record_count -
+                            ac_state->head.current_buf_seq * static_cast<uint32_t>(PLATFORM_AICORE_BUFFER_SIZE);
+            if (live == 0) {
+                continue;
+            }
+            ac_mark = (live > static_cast<uint32_t>(PLATFORM_AICORE_BUFFER_SIZE)) ?
+                          static_cast<uint32_t>(PLATFORM_AICORE_BUFFER_SIZE) :
+                          live;
+        } else {
+            ac_mark = static_cast<uint32_t>(PLATFORM_AICORE_BUFFER_SIZE);
         }
-        uint32_t ac_mark = (live > static_cast<uint32_t>(PLATFORM_AICORE_BUFFER_SIZE)) ?
-                               static_cast<uint32_t>(PLATFORM_AICORE_BUFFER_SIZE) :
-                               live;
         L2SwimlaneAicoreTaskBuffer *ac_buf = reinterpret_cast<L2SwimlaneAicoreTaskBuffer *>(ac_buf_ptr);
         ac_buf->count = ac_mark;
         wmb();
@@ -684,10 +696,16 @@ void l2_swimlane_aicpu_init_phase(int worker_count, int num_sched_phase_threads,
 // ready queue under `kind`, then pop a fresh buffer from free_queue. Sets
 // `*current_buf_out` to nullptr if no free buffer is available — subsequent
 // records on that thread will drop until the host catches up.
+// `thread_idx` is the AICPU thread doing the enqueue (always the caller); it
+// selects that thread's own SPSC ready queue, which it must own exclusively.
+// `pool_idx` is the pool ordinal the host uses to file records and recycle the
+// buffer to that pool (the same ordinal indexes the output lane). For sched
+// pools the two coincide (thread t → queue t, pool t); for the single orch
+// instance they differ (orchestrator's thread, but pool ordinal 0).
 template <typename Buffer>
 static void switch_phase_buffer_kind(
-    int thread_idx, L2SwimlaneAicpuTaskPool *state, Buffer **current_buf_out, L2SwimlaneBufferKind kind,
-    const char *kind_label
+    int thread_idx, uint32_t pool_idx, L2SwimlaneAicpuTaskPool *state, Buffer **current_buf_out,
+    L2SwimlaneBufferKind kind, const char *kind_label
 ) {
     Buffer *full_buf = *current_buf_out;
     if (state == nullptr || full_buf == nullptr) return;
@@ -695,7 +713,7 @@ static void switch_phase_buffer_kind(
     LOG_INFO_V0("Thread %d: %s phase buffer is full (count=%u)", thread_idx, kind_label, full_buf->count);
 
     uint32_t seq = state->head.current_buf_seq;
-    int rc = enqueue_ready_buffer(s_l2_swimlane_header, thread_idx, thread_idx, state->head.current_buf_ptr, seq, kind);
+    int rc = enqueue_ready_buffer(s_l2_swimlane_header, thread_idx, pool_idx, state->head.current_buf_ptr, seq, kind);
     if (rc != 0) {
         LOG_ERROR(
             "Thread %d: failed to enqueue %s phase buffer (queue full), %u records lost!", thread_idx, kind_label,
@@ -741,8 +759,8 @@ static void switch_phase_buffer_kind(
 // callers should bump `dropped_record_count` and return when nullptr.
 template <typename Buffer, typename Record>
 static Record *acquire_phase_slot(
-    int thread_idx, L2SwimlaneAicpuTaskPool *state, Buffer **current_buf_out, L2SwimlaneBufferKind kind,
-    const char *kind_label
+    int thread_idx, uint32_t pool_idx, L2SwimlaneAicpuTaskPool *state, Buffer **current_buf_out,
+    L2SwimlaneBufferKind kind, const char *kind_label
 ) {
     Buffer *buf = *current_buf_out;
     if (buf == nullptr) {
@@ -766,7 +784,7 @@ static Record *acquire_phase_slot(
 
     uint32_t idx = buf->count;
     if (idx >= PLATFORM_PHASE_RECORDS_PER_THREAD) {
-        switch_phase_buffer_kind(thread_idx, state, current_buf_out, kind, kind_label);
+        switch_phase_buffer_kind(thread_idx, pool_idx, state, current_buf_out, kind, kind_label);
         buf = *current_buf_out;
         if (buf == nullptr) return nullptr;
         idx = buf->count;
@@ -779,7 +797,8 @@ static Record *acquire_phase_slot(
 
 void l2_swimlane_aicpu_record_sched_phase(
     int thread_idx, L2SwimlaneSchedPhaseKind kind, uint64_t start_time, uint64_t end_time, uint32_t loop_iter,
-    uint32_t tasks_processed, uint32_t pop_hit, uint32_t pop_miss
+    uint32_t tasks_processed, uint32_t pop_hit, uint32_t pop_miss, const int16_t *local_at_start,
+    const int16_t *shared_at_start, const int16_t *local_at_end, const int16_t *shared_at_end
 ) {
     if (!s_phase_initialized) return;
     auto *state = s_sched_phase_pools[thread_idx];
@@ -788,7 +807,8 @@ void l2_swimlane_aicpu_record_sched_phase(
     state->head.total_record_count += 1;
 
     auto *record = acquire_phase_slot<L2SwimlaneAicpuSchedPhaseBuffer, L2SwimlaneAicpuSchedPhaseRecord>(
-        thread_idx, state, &s_current_sched_phase_buffers[thread_idx], L2SwimlaneBufferKind::AicpuSchedPhase, "sched"
+        /*thread_idx=*/thread_idx, /*pool_idx=*/static_cast<uint32_t>(thread_idx), state,
+        &s_current_sched_phase_buffers[thread_idx], L2SwimlaneBufferKind::AicpuSchedPhase, "sched"
     );
     if (record == nullptr) {
         state->head.dropped_record_count += 1;
@@ -801,6 +821,19 @@ void l2_swimlane_aicpu_record_sched_phase(
     record->tasks_processed = tasks_processed;
     record->pop_hit = pop_hit;
     record->pop_miss = pop_miss;
+    auto copy_snapshot = [](int16_t dst[L2SWIMLANE_NUM_QUEUE_SHAPES], const int16_t *src) {
+        if (src == nullptr) {
+            for (int i = 0; i < L2SWIMLANE_NUM_QUEUE_SHAPES; i++)
+                dst[i] = 0;
+        } else {
+            for (int i = 0; i < L2SWIMLANE_NUM_QUEUE_SHAPES; i++)
+                dst[i] = src[i];
+        }
+    };
+    copy_snapshot(record->local_depth_at_start, local_at_start);
+    copy_snapshot(record->shared_depth_at_start, shared_at_start);
+    copy_snapshot(record->local_depth_at_end, local_at_end);
+    copy_snapshot(record->shared_depth_at_end, shared_at_end);
 }
 
 void l2_swimlane_aicpu_set_orch_thread_idx(int thread_idx) { s_orch_thread_idx = thread_idx; }
@@ -809,13 +842,18 @@ void l2_swimlane_aicpu_record_orch_phase(
     uint64_t start_time, uint64_t end_time, uint64_t task_id, uint32_t submit_idx
 ) {
     if (s_orch_thread_idx < 0 || !s_phase_initialized) return;
-    auto *state = s_orch_phase_pools[s_orch_thread_idx];
+    // Single orch instance (dep_gen / scope_stats style): all orch records
+    // funnel into pool ordinal 0, regardless of which AICPU thread the
+    // orchestrator runs on. s_orch_thread_idx is the orchestrator's AICPU
+    // thread index — used only to pick its own ready queue (SPSC owner); the
+    // entry is tagged with pool ordinal 0 so the host files it into orch lane 0.
+    auto *state = s_orch_phase_pools[0];
     if (state == nullptr) return;
 
     state->head.total_record_count += 1;
 
     auto *record = acquire_phase_slot<L2SwimlaneAicpuOrchPhaseBuffer, L2SwimlaneAicpuOrchPhaseRecord>(
-        s_orch_thread_idx, state, &s_current_orch_phase_buffers[s_orch_thread_idx],
+        /*thread_idx=*/s_orch_thread_idx, /*pool_idx=*/0, state, &s_current_orch_phase_buffers[0],
         L2SwimlaneBufferKind::AicpuOrchPhase, "orch"
     );
     if (record == nullptr) {
@@ -828,39 +866,56 @@ void l2_swimlane_aicpu_record_orch_phase(
     record->submit_idx = submit_idx;
 }
 
-// Final-drain flush for both phase pools owned by this thread (sched + orch).
-// Called once per AICPU thread at end-of-run.
-void l2_swimlane_aicpu_flush_phase_buffers(int thread_idx) {
+// Final-drain flush of one phase pool's active buffer. `thread_idx` / `pool_idx`
+// as in switch_phase_buffer_kind.
+static void flush_phase_pool(
+    int thread_idx, uint32_t pool_idx, L2SwimlaneAicpuTaskPool *state, L2SwimlaneBufferKind kind, const char *kind_label
+) {
+    if (state == nullptr) return;
+    rmb();
+    uint64_t buf_ptr = state->head.current_buf_ptr;
+    if (buf_ptr == 0) return;
+    // `count` sits AFTER the records[] array in TypedBuffer, so its byte offset
+    // is N * sizeof(Record) — different for sched (40B) vs orch (32B) records.
+    // Read/write it through the matching buffer type; a single fixed cast reads
+    // past the orch buffer, sees 0, and silently skips the orch flush.
+    volatile uint32_t *count_ptr = (kind == L2SwimlaneBufferKind::AicpuOrchPhase) ?
+                                       &reinterpret_cast<L2SwimlaneAicpuOrchPhaseBuffer *>(buf_ptr)->count :
+                                       &reinterpret_cast<L2SwimlaneAicpuSchedPhaseBuffer *>(buf_ptr)->count;
+    if (*count_ptr == 0) return;
+    uint32_t seq = state->head.current_buf_seq;
+    int rc = enqueue_ready_buffer(s_l2_swimlane_header, thread_idx, pool_idx, buf_ptr, seq, kind);
+    if (rc == 0) {
+        LOG_INFO_V0("Thread %d: flushed %s phase buffer with %u records", thread_idx, kind_label, *count_ptr);
+    } else {
+        LOG_ERROR(
+            "Thread %d: failed to enqueue %s phase buffer (queue full), %u records lost!", thread_idx, kind_label,
+            *count_ptr
+        );
+        state->head.dropped_record_count += *count_ptr;
+        *count_ptr = 0;
+    }
+    state->head.current_buf_ptr = 0;
+    wmb();
+}
+
+// Final-drain flush of the scheduler-phase pool owned by this scheduler thread.
+void l2_swimlane_aicpu_flush_sched_phase_buffer(int thread_idx) {
     if (!s_phase_initialized || s_l2_swimlane_header == nullptr) return;
-
-    auto flush_one = [&](L2SwimlaneAicpuTaskPool *state, L2SwimlaneBufferKind kind, const char *kind_label) {
-        if (state == nullptr) return;
-        rmb();
-        uint64_t buf_ptr = state->head.current_buf_ptr;
-        if (buf_ptr == 0) return;
-        // Reuse TypedBuffer's count layout — same offset regardless of payload type.
-        auto *buf = reinterpret_cast<L2SwimlaneAicpuSchedPhaseBuffer *>(buf_ptr);
-        if (buf->count == 0) return;
-        uint32_t seq = state->head.current_buf_seq;
-        int rc = enqueue_ready_buffer(s_l2_swimlane_header, thread_idx, thread_idx, buf_ptr, seq, kind);
-        if (rc == 0) {
-            LOG_INFO_V0("Thread %d: flushed %s phase buffer with %u records", thread_idx, kind_label, buf->count);
-        } else {
-            LOG_ERROR(
-                "Thread %d: failed to enqueue %s phase buffer (queue full), %u records lost!", thread_idx, kind_label,
-                buf->count
-            );
-            state->head.dropped_record_count += buf->count;
-            buf->count = 0;
-        }
-        state->head.current_buf_ptr = 0;
-        wmb();
-    };
-
-    flush_one(s_sched_phase_pools[thread_idx], L2SwimlaneBufferKind::AicpuSchedPhase, "sched");
+    flush_phase_pool(
+        thread_idx, static_cast<uint32_t>(thread_idx), s_sched_phase_pools[thread_idx],
+        L2SwimlaneBufferKind::AicpuSchedPhase, "sched"
+    );
     s_current_sched_phase_buffers[thread_idx] = nullptr;
-    flush_one(s_orch_phase_pools[thread_idx], L2SwimlaneBufferKind::AicpuOrchPhase, "orch");
-    s_current_orch_phase_buffers[thread_idx] = nullptr;
+}
+
+// Final-drain flush of the single orchestrator's orch-phase pool (ordinal 0).
+// Called once by the orchestrator thread at orchestration end; see
+// record_orch_phase for the pool-0 / own-ready-queue tagging.
+void l2_swimlane_aicpu_flush_orch_phase_buffer(int thread_idx) {
+    if (!s_phase_initialized || s_l2_swimlane_header == nullptr) return;
+    flush_phase_pool(thread_idx, /*pool_idx=*/0, s_orch_phase_pools[0], L2SwimlaneBufferKind::AicpuOrchPhase, "orch");
+    s_current_orch_phase_buffers[0] = nullptr;
 }
 
 void l2_swimlane_aicpu_init_core_assignments(int total_cores) {

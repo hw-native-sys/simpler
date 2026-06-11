@@ -118,7 +118,9 @@ uint64_t read_reg(uint64_t reg_base_addr, RegId reg);
  * @param reg            Register identifier (C++ enum class)
  * @param value          Value to write (truncated to register width)
  */
-void write_reg(uint64_t reg_base_addr, RegId reg, uint64_t value);
+inline void write_reg(uint64_t reg_base_addr, RegId reg, uint64_t value) {
+    *reinterpret_cast<volatile uint32_t *>(reg_base_addr + reg_offset(reg)) = static_cast<uint32_t>(value);
+}
 
 /**
  * Initialize AICore registers after core discovery

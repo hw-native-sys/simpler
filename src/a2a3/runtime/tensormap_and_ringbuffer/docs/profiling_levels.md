@@ -254,10 +254,37 @@ header just like on onboard.
 | Level | Collects |
 | ----- | -------- |
 | 0 | Nothing (disabled) |
-| 1 | AICore timing only (start/end/task_id/func_id/core_type) |
-| 2 | + dispatch_time, finish_time |
+| 1 | AICore timing only (start/end/task_token_raw) — AICPU `complete_task` is bypassed |
+| 2 | + AICPU dispatch_time, finish_time |
 | 3 | + Scheduler phases (`SCHED_*`) |
 | 4 | + Orchestrator phases (full) |
+
+At level 1 the AICore record carries the full PTO2 `task_token_raw`
+(`(ring_id << 32) | local_id`), read straight from
+`LocalContext.async_ctx.task_token.raw` inside the AICore helper —
+already in cache from the dispatch payload, so no extra GM load.
+Identity fields the AICPU side used to write at level 1 (`func_id`,
+`core_type`) are derived host-side:
+
+- `func_id` ← `deps.json`'s per-task `kernel_ids[]`, joined by
+  `task_id` at post-process by `swimlane_converter.py`. Same model
+  `fanout` already uses.
+- `core_type` ← per-core static table published by the host into the
+  collector (`L2SwimlaneCollector::set_core_types`).
+
+AICore buffer rotation no longer piggy-backs on `complete_task`. AICPU
+counts dispatches per core in the dispatch path (scheduler_dispatch in
+tensormap_and_ringbuffer; aicpu_executor in host_build_graph) and rotates
+the AICore buffer when the count is about to cross a
+`PLATFORM_AICORE_BUFFER_SIZE` boundary — strictly before
+`write_reg(DATA_MAIN_BASE)` for the first task of the new batch. The
+hook is `l2_swimlane_aicpu_on_aicore_dispatch`. No AICore-side signal is
+needed: AICPU has full dispatch visibility on its own. Race safety comes
+from the completion-before-dispatch invariant (AICore per core is
+single-threaded and AICPU does not dispatch task K+1 until K FIN'd), which
+guarantees AICore has FIN'd — and `dcci`'d out — every record in the old
+buffer by rotation time. This decoupling is what lets level 1 skip
+`complete_task` without losing rotations.
 
 Fanout edges are no longer carried on the device hot path — `swimlane_converter.py`
 joins them from the sibling `deps.json` (produced by dep_gen) at post-process time.

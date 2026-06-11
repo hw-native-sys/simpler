@@ -55,10 +55,6 @@ volatile uint32_t *get_reg_ptr(uint64_t reg_base_addr, RegId reg) {
 
 uint64_t read_reg(uint64_t reg_base_addr, RegId reg) { return static_cast<uint64_t>(*get_reg_ptr(reg_base_addr, reg)); }
 
-void write_reg(uint64_t reg_base_addr, RegId reg, uint64_t value) {
-    *get_reg_ptr(reg_base_addr, reg) = static_cast<uint32_t>(value);
-}
-
 void platform_init_aicore_regs(uint64_t reg_addr) {
     // Both a2a3 and a2a3sim require fast path control to be enabled before use
     write_reg(reg_addr, RegId::FAST_PATH_ENABLE, REG_SPR_FAST_PATH_OPEN);

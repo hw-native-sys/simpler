@@ -7,7 +7,13 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""End-to-end 2-card EP dispatch + local_expert + combine demo.
+"""End-to-end 2-card EP dispatch + local_expert + combine.
+
+Runs the real DeepSeek-V4 FLASH MoE shapes (pypto-lib/models/deepseek/v4):
+T=128, TOPK=6, D=4096, per-rank L=16 local experts, R=192 receive cap. The
+only deviation from the production deployment is EP=2 here vs EP=16 there —
+each rank keeps the same 16-expert load, so only the global expert count
+differs (32 vs 256).
 
 A single orchestration runs three child AIV kernels back-to-back over a
 shared HCCL window scratch:
@@ -36,8 +42,10 @@ Each rank drives the dispatch kernel through these phases (0..4):
   stage_out     stage out recv_x / recv_w / recv_idx windows -> host-backed outputs
 
 Type/shape contract:
-  - ``x_norm`` and ``recv_x_out`` are **BF16**. Test inputs use small
-    integer values (≤ 256) that fit BF16 exactly.
+  - ``x_norm`` and ``recv_x_out`` are **BF16**. The dispatch x channel is a
+    pure copy, so ``recv_x_out`` is compared BF16-vs-BF16 (bit-exact) against
+    the host golden regardless of magnitude — no ``≤ 256`` assumption needed at
+    this scale (D=4096 pushes values well past BF16's exact-integer range).
   - Weight uses a 1xW_PAD=8 FP32 tile per route (the minimum vector tile
     granularity = 32 B = one MTE burst). The host pre-packs each row as
     [weight, 0, 0, …, 0]; receiver writes recv_w[loc_e][slot, :W_PAD]
@@ -84,25 +92,29 @@ from simpler_setup.torch_interop import make_tensor_arg  # noqa: E402
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 
-# Demo dimensions — must mirror constants at the top of the kernel.
+# Real DeepSeek-V4 FLASH MoE shapes (pypto-lib/models/deepseek/v4) — must
+# mirror constants at the top of the kernel. T = DECODE_BATCH*DECODE_SEQ = 128,
+# TOPK = num_experts_per_tok = 6, D = hidden_size = 4096, L = N_LOCAL = 16
+# experts/rank, R = RECV_MAX = 192. Production runs EP=16; here EP=2 keeps the
+# same per-rank load, so only the global expert count differs (32 vs 256).
 N_RANKS = 2
-T = 8
-TOPK = 2
-D = 64
-L = 4  # N_LOCAL_EXPERTS per rank
-R = 32  # RECV_MAX (single-expert receive upper bound)
+T = 128
+TOPK = 6
+D = 4096
+L = 16  # N_LOCAL_EXPERTS per rank
+R = 192  # RECV_MAX (single-expert receive upper bound)
 W_PAD = 8  # weight tile width — minimum vector tile (1x8 FP32 = 32 B)
 IDX_PAD = 8  # idx tile width   — minimum vector tile (1x8 INT32 = 32 B)
-E_GLOBAL = N_RANKS * L
-N_ROUTES = T * TOPK
+E_GLOBAL = N_RANKS * L  # 32 routed experts
+N_ROUTES = T * TOPK  # 768
 
 # Window region byte sizes — mirror k*Bytes / kOff* in the kernels.
 PUB_COUNTS_BYTES = N_RANKS * N_RANKS * L * 4  # N*N*L INT32
 SIGNAL_BYTES = 64  # padded slot per signal area
-RECV_X_BYTES = L * R * D * 2  # 16 KB (BF16)
-RECV_W_BYTES = L * R * W_PAD * 4  # 4  KB (FP32; weight at slot 0)
-RECV_IDX_BYTES = L * R * IDX_PAD * 4  # 4  KB (INT32; r at slot 0)
-ROUTED_Y_BUF_BYTES = T * TOPK * D * 2  # 2  KB (BF16; combine push dest)
+RECV_X_BYTES = L * R * D * 2  # 24 MB (BF16)
+RECV_W_BYTES = L * R * W_PAD * 4  # 384 KB (FP32; weight at slot 0)
+RECV_IDX_BYTES = L * R * IDX_PAD * 4  # 384 KB (INT32; r at slot 0)
+ROUTED_Y_BUF_BYTES = T * TOPK * D * 2  # 6 MB (BF16; combine push dest)
 SCRATCH_NBYTES = (
     PUB_COUNTS_BYTES
     + SIGNAL_BYTES  # count_done_sig
@@ -351,8 +363,8 @@ def _verify_recv_outputs(
             n = int(cnt[e].item())
             if n == 0:
                 continue
-            # Cast BF16 → FP32 for diff math; values are integer ≤ 256 so
-            # the comparison is bit-exact.
+            # Cast BF16 → FP32 for diff math; recv_x is a pure copy so got/exp
+            # are the same BF16 bits — comparison is bit-exact at any magnitude.
             got_x = recv_x_outs[r][e, :n, :].to(torch.float32)
             exp_x = expected_recv_x[r][e, :n, :].to(torch.float32)
             got_w = recv_w_outs[r][e, :n]
@@ -377,41 +389,74 @@ def _verify_recv_outputs(
     return ok
 
 
+def _bf16_ulp_report(
+    tag: str,
+    r: int,
+    got: torch.Tensor,  # [rows, D] FP32
+    expected: torch.Tensor,  # [rows, D] FP32
+    rtol: float,
+    atol: float,
+) -> bool:
+    """Shared ULP-tolerant comparison + structural diagnostics.
+
+    A single BF16 cast can differ from torch's round-to-nearest-even by one ULP
+    on an exact tie, so we allow `atol + rtol*|expected|`. Anything larger is a
+    real fault — the diagnostics expose its shape: which rows, which d-range,
+    and the got/expected ratio (a dropped data chunk shows ratio → 0).
+    """
+    elem_diff = (got - expected).abs()
+    elem_tol = atol + rtol * expected.abs()
+    bad = elem_diff > elem_tol
+    n_bad = int(bad.sum().item())
+    max_diff = elem_diff.max().item()
+    rel = max_diff / (expected.abs().max().item() + 1e-9)
+    print(f"[ep_dispatch] chip {r}: {tag} max|diff|={max_diff:.3e} (rel={rel:.3e}) bad={n_bad}/{got.numel()}")
+    if n_bad == 0:
+        return True
+    rows, dloc = got.shape
+    n_bad_rows = int(bad.any(dim=1).sum().item())
+    bad_cols = bad.any(dim=0).nonzero().flatten()
+    col_lo = int(bad_cols.min().item())
+    col_hi = int(bad_cols.max().item())
+    safe = expected.clone()
+    safe[safe == 0] = float("nan")
+    ratios = (got / safe)[bad]
+    ratios = ratios[~torch.isnan(ratios)]
+    print(f"  {tag}: bad rows={n_bad_rows}/{rows} | bad-d span=[{col_lo},{col_hi}] of {dloc}")
+    if ratios.numel() > 0:
+        qs = torch.quantile(ratios, torch.tensor([0.05, 0.5, 0.95]))
+        print(
+            f"  {tag}: got/expected over bad elems — min={ratios.min():.4f} median={qs[1]:.4f} max={ratios.max():.4f}"
+        )
+    return False
+
+
 def _verify_routed_y(
     nranks: int,
     x_norms: list[torch.Tensor],
     weights: torch.Tensor,
     routed_y_outs: list[torch.Tensor],
 ) -> bool:
-    """Compare combine output routed_y[t, :] against the local-only golden.
+    """Post-reduce check: routed_y[t, :] == sum_k bf16(x_norms[t]*weights[t,k]) (fp32 accum).
 
-    routed_y[t, :] should equal sum_k weights[me, t, k] * x_norms[me][t, :]
-    since local_expert is elementwise x*weight and combine reduces along
-    TOPK. The only BF16 round-trip is local_expert's `cast(x*w, bf16)`;
-    combine's accumulator stays FP32 — mirror that exactly so the model
-    captures every cast and we can assert ~0 diff in steady state.
+    Mirrors the kernel's TOPK reduce (fp32 accumulator over TOPK bf16 terms).
+    Each term carries the same <=1 BF16 ULP cast diff as recv_y; summing TOPK in
+    fp32 keeps the *relative* error ~1-2 ULP (the sum magnitude grows with it),
+    so rtol = 2 ULP holds for a correct reduce. The rich diagnostics flag any
+    structural error — a dropped term shows as ratio (TOPK-1)/TOPK, a high-d
+    tail loss as a bad-d span at high d.
     """
+    rtol = 2.0**-6  # 2 BF16 ULPs (1 ULP = 2**-7); fp32 accumulation is exact
+    atol = 2.0**-6
     ok = True
     for r in range(nranks):
         expected = torch.zeros(T, D, dtype=torch.float32)
         for t in range(T):
             for k in range(TOPK):
-                weighted_fp32 = weights[r, t, k] * x_norms[r][t, :].to(torch.float32)
-                expected[t, :] += weighted_fp32.to(torch.bfloat16).to(torch.float32)
-        diff = (routed_y_outs[r] - expected).abs().max().item()
-        rel_diff = diff / (expected.abs().max().item() + 1e-9)
-        print(f"[ep_dispatch] chip {r}: routed_y max|diff|={diff:.3e} (rel={rel_diff:.3e})")
-        # Allow 1e-3 abs as headroom for any fp32 reorder we missed.
-        if diff > 1e-3:
-            ok = False
-            print(f"[ep_dispatch] chip {r}: routed_y mismatch (tol=1e-3)")
-            per_token_diff = (routed_y_outs[r] - expected).abs().max(dim=1).values
-            for t in range(T):
-                if per_token_diff[t] > 1e-3:
-                    print(
-                        f"  token {t}: got[0]={float(routed_y_outs[r][t, 0]):.4f} "
-                        f"expected[0]={float(expected[t, 0]):.4f}"
-                    )
+                term = weights[r, t, k] * x_norms[r][t, :].to(torch.float32)
+                expected[t, :] += term.to(torch.bfloat16).to(torch.float32)
+        got = routed_y_outs[r].to(torch.float32)
+        ok = _bf16_ulp_report("routed_y", r, got, expected, rtol, atol) and ok
     return ok
 
 
@@ -428,10 +473,10 @@ def run(
 
     print(f"[ep_dispatch] platform={platform} devices={device_ids} nranks={nranks}")
 
-    # x_norm[r, t, d] = r*100 + t*10 + d  →  max value = 1*100 + 7*10 + 63 = 233.
-    # All values are integers ≤ 256, so they fit BF16 exactly (8-bit mantissa
-    # with hidden bit = exact integers up to 2^8). The host can compare BF16
-    # outputs bit-for-bit against this golden.
+    # x_norm[r, t, d] = r*100 + t*10 + d. At this scale (D=4096) values exceed
+    # BF16's exact-integer range, but recv_x is a pure copy so the host compares
+    # the BF16 tensor against itself bit-for-bit — magnitude is irrelevant. The
+    # recv_y / routed_y checks tolerate the BF16 cast(s) via a ULP bound.
     x_norms = [
         torch.tensor(
             [[r * 100 + t * 10 + d for d in range(D)] for t in range(T)],
@@ -463,13 +508,10 @@ def run(
     recv_idx_outs = [torch.zeros(L, R, dtype=torch.int32).share_memory_() for _ in range(nranks)]
     recv_count_outs = [torch.zeros(L, 1, dtype=torch.int32).share_memory_() for _ in range(nranks)]
     # Cross-kernel host-backed tensors:
-    #   recv_y    [L, R, D]  BF16 — local_expert output, also visible to host
-    #                                for debug.
-    #   routed_y  [T, D]     FP32 — combine output; the FP32 reduce accumulator
-    #                                is written out directly without a final
-    #                                cast back to BF16 (mirrors how the
-    #                                production block keeps the FP32 accumulator
-    #                                live until exit).
+    #   recv_y    [L, R, D]  BF16 — local_expert output; feeds combine as its
+    #                                OUTPUT_EXISTING input.
+    #   routed_y  [T, D]     FP32 — combine output: the TOPK reduce sum, written
+    #                                straight from the FP32 accumulator.
     recv_y_outs = [torch.zeros(L, R, D, dtype=torch.bfloat16).share_memory_() for _ in range(nranks)]
     routed_y_outs = [torch.zeros(T, D, dtype=torch.float32).share_memory_() for _ in range(nranks)]
 
@@ -487,7 +529,7 @@ def run(
         device_ids=device_ids,
         num_sub_workers=0,
     )
-    chip_cid = worker.register(chip_callable)
+    chip_handle = worker.register(chip_callable)
 
     try:
         print("[ep_dispatch] init worker (forks chip children; base comm is lazy)...")
@@ -536,13 +578,14 @@ def run(
                     )
                     chip_args.add_scalar(domain.domain_size)
                     chip_args.add_scalar(domain.device_ctx)
-                    orch.submit_next_level(chip_cid, chip_args, cfg, worker=i)
+                    orch.submit_next_level(chip_handle, chip_args, cfg, worker=i)
 
         print("[ep_dispatch] running 2-chip dispatch DAG...")
         worker.run(orch_fn, args=None, config=CallConfig())
 
         if platform.endswith("sim"):
-            # Sim keeps intermediate child outputs device-local when they feed later child tasks.
+            # Sim keeps intermediate child outputs (recv_y) device-local when they
+            # feed later child tasks, so only the final routed_y is host-visible.
             ok = _verify_routed_y(nranks, x_norms, weights, routed_y_outs)
         else:
             ok = _verify_recv_outputs(

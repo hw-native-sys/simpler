@@ -15,9 +15,9 @@
  * sub-features under the profiling umbrella: `enable_l2_swimlane` (swimlane),
  * `enable_dump_tensor`, `enable_pmu`, `enable_dep_gen`, and
  * `enable_scope_stats`. All five require `output_prefix` because they each
- * write a sibling artifact into that directory
+ * write sibling artifacts into that directory
  * (`l2_swimlane_records.json` / `tensor_dump/` / `pmu.csv` / `deps.json` /
- * `scope_stats.json`).
+ * `scope_stats/scope_stats.jsonl`).
  *
  * `block_dim == 0` is a sentinel for "auto" — DeviceRunner resolves it at
  * run() time to the max block_dim the AICore stream allows
@@ -36,8 +36,8 @@
  *
  * `output_prefix` is a NUL-terminated directory path under which all
  * diagnostic artifacts (l2_swimlane_records.json / tensor_dump/ / pmu.csv /
- * deps.json / scope_stats.json) are written. The caller is responsible for
- * filling it whenever any diagnostic flag is enabled — `validate()` enforces
+ * deps.json / scope_stats/scope_stats.jsonl) are written. The caller is
+ * responsible for filling it whenever any diagnostic flag is enabled — `validate()` enforces
  * this contract at every submit/run entry point so the runtime never has to
  * invent a path.
  */
@@ -56,7 +56,7 @@ struct CallConfig {
     int32_t enable_dump_tensor = 0;
     int32_t enable_pmu = 0;  // 0 = disabled; >0 = enabled, value selects event type
     int32_t enable_dep_gen = 0;
-    int32_t enable_scope_stats = 0;  // writes <output_prefix>/scope_stats.json
+    int32_t enable_scope_stats = 0;  // writes <output_prefix>/scope_stats/scope_stats.jsonl
     char output_prefix[1024] = {};
 
     bool diagnostics_any() const noexcept {

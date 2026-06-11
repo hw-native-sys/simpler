@@ -152,7 +152,7 @@ export SIMPLER_DISPATCHER_SO=$REPO/build/lib/a2a3/dispatcher/libsimpler_aicpu_di
 export SIMPLER_HELLO_AICPU_SO=$REPO/tools/cann-examples/aicpu-kernel-launch/device/build/libhello_aicpu.so
 
 # This dev box is shared. Hardware work goes through task-submit (see
-# .claude/rules/task-submit-isolation.md). Gate by arch first to avoid
+# .claude/rules/running-onboard.md). Gate by arch first to avoid
 # wasting a device lock on a wrong-arch attempt
 # (.claude/skills/onboard-arch-precheck/).
 .claude/skills/onboard-arch-precheck/check.sh a2a3 || exit 1

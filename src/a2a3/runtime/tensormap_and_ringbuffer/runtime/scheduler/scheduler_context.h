@@ -11,6 +11,7 @@
 #ifndef SCHEDULER_CONTEXT_H
 #define SCHEDULER_CONTEXT_H
 
+#include "aicpu/platform_regs.h"
 #include "common/l2_swimlane_profiling.h"
 #include "common/unified_log.h"
 #include "scheduler_types.h"
@@ -230,18 +231,39 @@ private:
         const AsyncCtx &async_ctx, int32_t block_idx
     );
 
-    void dispatch_subtask_to_core(
+    // Batched-dispatch primitives. prepare_* builds the payload and per-core
+    // state; publish_* issues the MMIO register write. Callers must wmb()
+    // between the prepare batch and the publish batch, then sample
+    // get_sys_cnt_aicpu() once and pass it to publish_* for every handle.
+    //
+    // dispatch_timestamp_slot points to the CoreExecState slot
+    // (pending_dispatch_timestamp / running_dispatch_timestamp) selected at
+    // prepare time, or nullptr when L2 swimlane is below AICPU_TIMING and no
+    // dispatch timestamp is being recorded.
+    struct PublishHandle {
+        uint64_t reg_addr;
+        uint32_t reg_task_id;
+        int32_t core_offset;
+        uint64_t *dispatch_timestamp_slot;
+    };
+
+    PublishHandle prepare_subtask_to_core(
         int32_t thread_idx, int32_t core_offset, PTO2TaskSlotState &slot_state, PTO2SubtaskSlot subslot,
         bool to_pending, int32_t block_idx
     );
 
-    void dispatch_mix_block_to_cluster(
-        int32_t thread_idx, int32_t cluster_offset, PTO2TaskSlotState &slot_state, bool to_pending, int32_t block_idx
-    );
+    inline void publish_subtask_to_core(const PublishHandle &h, uint64_t dispatch_ts) {
+        if (h.dispatch_timestamp_slot != nullptr) {
+            *h.dispatch_timestamp_slot = dispatch_ts;
+        }
+        write_reg(h.reg_addr, RegId::DATA_MAIN_BASE, static_cast<uint64_t>(h.reg_task_id));
+    }
 
-    void dispatch_block(
+    // Fan out one block's subtasks (1 for AIC/AIV, 1-3 for MIX) into the
+    // caller-supplied handles buffer. Returns the number of handles written.
+    int prepare_block_for_dispatch(
         int32_t thread_idx, int32_t core_offset, PTO2TaskSlotState &slot_state, PTO2ResourceShape shape,
-        bool to_pending, int32_t block_idx
+        bool to_pending, int32_t block_idx, PublishHandle *out_handles
     );
 
     void dispatch_shape(
@@ -297,7 +319,7 @@ private:
         PTO2LocalReadyBuffer *local_bufs
 #if PTO2_PROFILING
         ,
-        uint64_t dispatch_ts
+        uint64_t dispatch_ts, uint64_t finish_ts
 #endif
     );
 

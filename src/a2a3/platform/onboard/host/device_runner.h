@@ -200,6 +200,36 @@ private:
     // acl_ready_, so runtimes that never ask for ACL (e.g. pure rt-layer) stay unaffected.
     bool acl_ready_{false};
 
+    // Set true when an AICore launch/sync error (e.g. an op-timeout reaped by
+    // STARS, surfaced as 507000/507018 at stream sync, or a 207001 launch
+    // failure) left the device context in a sticky-error state that an
+    // in-place drain could not clear. Once set, run() fails fast instead of
+    // cascading into the confusing downstream failures (rtMalloc 507899, or
+    // halResMap rc=62 at init_aicore_register_addresses) that a poisoned
+    // context produces. The poison survives a close()+soft-reset for the life
+    // of the process (an in-process re-init fails with rtStreamCreate 507899),
+    // but a *force* reset clears it: finalize() calls force_reset_device() on
+    // this path so the next Worker re-inits clean in the same process (see
+    // force_reset_device()). This flag fails run() fast and drives that
+    // recovery. See run() and recover_device_or_mark_unusable().
+    bool device_unusable_{false};
+
+    // On an AICore launch/sync error, best-effort drain the device so a later
+    // run() on the same DeviceRunner can recover in place; if the drain itself
+    // errors the context is unrecoverable without a full reset, so flip
+    // device_unusable_ and let run() fail fast.
+    void recover_device_or_mark_unusable(int aicore_rc);
+
+    // Force-reset the card via aclrtResetDeviceForce to clear an op-timeout
+    // sticky-error that the soft rtDeviceReset cannot (a soft reset + fresh
+    // in-process Worker.init still fails at rtStreamCreate 507899, whereas a
+    // force reset lets the next init succeed in the same process). Called from
+    // finalize() only on the device-poison path (device_unusable_). Safe
+    // because onboard work always holds an exclusive task-submit lock on the
+    // card (.claude/rules/running-onboard.md) and the reset scopes to this card
+    // only (does not disturb other devices).
+    void force_reset_device();
+
     // Shared collectors (`l2_swimlane_collector_`, `dump_collector_`,
     // `pmu_collector_`, `scope_stats_collector_`) live on `DeviceRunnerBase`.
     //
@@ -222,7 +252,7 @@ private:
      * @param device_id Device ID for host registration
      * @return 0 on success, error code on failure
      */
-    int init_l2_swimlane(int num_aicore, int device_id);
+    int init_l2_swimlane(int num_aicore, int aicpu_thread_num, int device_id);
 
     /**
      * Initialize tensor dump shared memory and collector.

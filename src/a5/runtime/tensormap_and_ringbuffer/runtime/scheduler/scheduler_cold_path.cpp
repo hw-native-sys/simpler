@@ -477,24 +477,9 @@ void SchedulerContext::log_l2_swimlane_summary(int32_t thread_idx, int32_t cur_t
             l2_swimlane.sched_complete_perf_cycle * 100.0 / c_parent
         );
 
-        // pop_hit / pop_miss per-emit deltas live in each dispatch-phase
-        // record's extras in aicpu_scheduler_phases[]; sum-of-deltas equals
-        // the run-cumulative tracked in this struct (final-drain emit covers
-        // the trailing-idle tail).
         LOG_INFO_V9(
             "Thread %d:   dispatch       : %.3fus (%.1f%%)", thread_idx, cycles_to_us(l2_swimlane.sched_dispatch_cycle),
             l2_swimlane.sched_dispatch_cycle * 100.0 / sched_total
-        );
-        uint64_t global_dispatch_count = l2_swimlane.pop_hit - l2_swimlane.local_dispatch_count;
-        uint64_t total_dispatched = l2_swimlane.local_dispatch_count + global_dispatch_count;
-        double local_hit_rate =
-            total_dispatched > 0 ? l2_swimlane.local_dispatch_count * 100.0 / total_dispatched : 0.0;
-        LOG_INFO_V9(
-            "Thread %d:     local_disp   : local=%" PRIu64 ", global=%" PRIu64 ", overflow=%" PRIu64
-            ", local_rate=%.1f%%",
-            thread_idx, static_cast<uint64_t>(l2_swimlane.local_dispatch_count),
-            static_cast<uint64_t>(global_dispatch_count), static_cast<uint64_t>(l2_swimlane.local_overflow_count),
-            local_hit_rate
         );
 
         uint64_t d_parent = l2_swimlane.sched_dispatch_cycle > 0 ? l2_swimlane.sched_dispatch_cycle : 1;
@@ -879,8 +864,18 @@ int32_t SchedulerContext::init(
             // (PTO2_ORCH_TO_SCHED=1), phase records flow through
             // aicpu_thread_num_ pools — matches the same branch in
             // dump_tensor_init (scheduler_dispatch.cpp).
-            const int phase_threads = orch_to_sched_ ? aicpu_thread_num_ : sched_thread_num_;
-            l2_swimlane_aicpu_init_phase(runtime->worker_count, phase_threads);
+            // Sched phase pool count = number of scheduler threads.
+            // sched_thread_num_ <= 0 is the "use all AICPU threads as
+            // scheduler threads" sentinel (see assign_cores_to_threads'
+            // active_sched_threads_ normalization). Without this
+            // normalization here, init_phase would prime zero sched pools
+            // and all sched_phase emits would silently drop.
+            const int active_sched = (sched_thread_num_ > 0) ? sched_thread_num_ : aicpu_thread_num_;
+            const int sched_phase_threads = orch_to_sched_ ? aicpu_thread_num_ : active_sched;
+            // Orch phase is a single instance (PR #971 design), so the orch
+            // pool count is always 1 regardless of orch_to_sched mode.
+            const int orch_phase_threads = 1;
+            l2_swimlane_aicpu_init_phase(runtime->worker_count, sched_phase_threads, orch_phase_threads);
         }
     } else {
         l2_swimlane_level_ = L2SwimlaneLevel::DISABLED;
@@ -900,11 +895,19 @@ int32_t SchedulerContext::init(
     // Initialize task counters. Task count comes from PTO2 shared memory.
     if (runtime->get_gm_sm_ptr()) {
         auto *header = static_cast<PTO2SharedMemoryHeader *>(runtime->get_gm_sm_ptr());
-        int32_t task_count = 0;
+        // Read at one-time boot init, before the SM is reset for the run, so a
+        // ring not yet written holds uninitialized memory (0xbe... under ASAN's
+        // malloc-fill). Sum in int64 and only count rings whose value is a
+        // plausible task count — (0, PTO2_SCOPE_TASKS_CAP]; a ring cannot hold
+        // more than the scope cap. This rejects any garbage pattern (negative
+        // or positive), so uninitialized rings contribute 0 (the correct boot
+        // count) while valid counts still add up, with no signed overflow.
+        int64_t task_count = 0;
         for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
-            task_count += header->rings[r].fc.current_task_index.load(std::memory_order_acquire);
+            int32_t ring_tasks = header->rings[r].fc.current_task_index.load(std::memory_order_acquire);
+            if (ring_tasks > 0 && ring_tasks <= PTO2_SCOPE_TASKS_CAP) task_count += ring_tasks;
         }
-        total_tasks_ = task_count > 0 ? task_count : 0;
+        total_tasks_ = static_cast<int32_t>(task_count);
     } else {
         total_tasks_ = 0;
     }
@@ -1007,9 +1010,9 @@ void SchedulerContext::on_orchestration_done(
     Runtime *runtime, PTO2Runtime *rt, int32_t thread_idx, int32_t total_tasks
 ) {
 #if PTO2_PROFILING
-    if (l2_swimlane_level_ >= L2SwimlaneLevel::SCHED_PHASES) {
-        // Flush orchestrator's phase record buffer
-        l2_swimlane_aicpu_flush_phase_buffers(thread_idx);
+    if (l2_swimlane_level_ >= L2SwimlaneLevel::ORCH_PHASES) {
+        // Flush orchestrator's phase record buffer (orch pool, ordinal 0)
+        l2_swimlane_aicpu_flush_orch_phase_buffer(thread_idx);
     }
 #endif
 

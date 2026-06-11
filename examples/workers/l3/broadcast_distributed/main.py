@@ -148,7 +148,7 @@ def run(
         num_sub_workers=0,
         build=build,
     )
-    chip_cid = worker.register(chip_callable)
+    chip_handle = worker.register(chip_callable)
 
     try:
         print("[broadcast] init worker (forks chip children; base comm is lazy)...")
@@ -183,7 +183,7 @@ def run(
                     chip_args.add_scalar(domain.domain_size)
                     chip_args.add_scalar(root)
                     chip_args.add_scalar(domain.device_ctx)
-                    orch.submit_next_level(chip_cid, chip_args, cfg, worker=i)
+                    orch.submit_next_level(chip_handle, chip_args, cfg, worker=i)
 
         print(f"[broadcast] running {nranks}-chip broadcast DAG...")
         worker.run(orch_fn, args=None, config=CallConfig())

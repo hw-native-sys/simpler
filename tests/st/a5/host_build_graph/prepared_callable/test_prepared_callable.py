@@ -7,7 +7,7 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""End-to-end test for ChipWorker.prepare_callable / run on a5/host_build_graph.
+"""End-to-end white-box test for the private L2 prepared-callable ABI on a5/host_build_graph.
 
 Mirrors tests/st/a2a3/host_build_graph/prepared_callable for the a5 variant.
 Reuses the dump_tensor example kernels (a + b + 1) since a5/hbg has no
@@ -21,19 +21,15 @@ from simpler.task_interface import ArgDirection as D
 from simpler_setup import SceneTestCase, TaskArgsBuilder, Tensor, scene_test
 from simpler_setup.scene_test import _build_chip_task_args, _compare_outputs
 
-# White-box cids: this class owns the entire cid table of its isolated
-# Worker (see ./conftest.py), so picking 0 and 1 directly is intentional —
-# they signify "the first two slots in a fresh table" rather than "any
-# free cid". Naming them makes that intent explicit.
-_CID_PRIMARY = 0
-_CID_SECONDARY = 1
+_SLOT_PRIMARY = 0
+_SLOT_SECONDARY = 1
 
 
 @scene_test(level=2, runtime="host_build_graph")
 class TestPreparedCallableHbgA5(SceneTestCase):
-    """Exercise prepare_callable / run / unregister_callable on a5/hbg.
+    """Exercise private prepare / run / unregister slot ABI on a5/hbg.
 
-    Requires an isolated L2 ``Worker`` (cid table starts empty); this is
+    Requires an isolated L2 ``Worker`` (private slot table starts empty); this is
     provided by the directory-local ``conftest.py`` overriding ``st_worker``
     with a class-scope fixture.
     """
@@ -85,6 +81,11 @@ class TestPreparedCallableHbgA5(SceneTestCase):
         # dump_tensor orchestration computes f = (a + b) + 1
         args.f[:] = (args.a + args.b) + 1
 
+    def _chip_worker(self, worker):
+        chip_worker = worker._chip_worker
+        assert chip_worker is not None
+        return chip_worker
+
     def _run_and_validate_l2(  # noqa: PLR0913
         self,
         worker,
@@ -104,9 +105,10 @@ class TestPreparedCallableHbgA5(SceneTestCase):
         orch_sig = self.CALLABLE.get("orchestration", {}).get("signature", [])
 
         config = self._build_config(config_dict)
+        chip_worker = self._chip_worker(worker)
 
-        worker.prepare_callable(_CID_PRIMARY, callable_obj)
-        worker.prepare_callable(_CID_SECONDARY, callable_obj)
+        chip_worker._prepare_callable_at_slot(_SLOT_PRIMARY, callable_obj)
+        chip_worker._prepare_callable_at_slot(_SLOT_SECONDARY, callable_obj)
 
         for _ in range(2):
             test_args = self.generate_args(params)
@@ -114,7 +116,7 @@ class TestPreparedCallableHbgA5(SceneTestCase):
             golden_args = test_args.clone()
             self.compute_golden(golden_args, params)
 
-            worker.run(_CID_PRIMARY, chip_args, config=config)
+            chip_worker._run_slot(_SLOT_PRIMARY, chip_args, config=config)
             _compare_outputs(test_args, golden_args, output_names, self.RTOL, self.ATOL)
 
         test_args = self.generate_args(params)
@@ -122,11 +124,11 @@ class TestPreparedCallableHbgA5(SceneTestCase):
         golden_args = test_args.clone()
         self.compute_golden(golden_args, params)
 
-        worker.run(_CID_SECONDARY, chip_args, config=config)
+        chip_worker._run_slot(_SLOT_SECONDARY, chip_args, config=config)
         _compare_outputs(test_args, golden_args, output_names, self.RTOL, self.ATOL)
 
-        worker.unregister_callable(_CID_PRIMARY)
-        worker.unregister_callable(_CID_SECONDARY)
+        chip_worker._unregister_slot(_SLOT_PRIMARY)
+        chip_worker._unregister_slot(_SLOT_SECONDARY)
 
     def _setup_dlopen_count_test(self, st_worker, st_platform):
         case = self.CASES[0]
@@ -134,73 +136,89 @@ class TestPreparedCallableHbgA5(SceneTestCase):
         config = self._build_config(case["config"])
         return callable_obj, config, case
 
-    def _run_one(self, worker, cid, callable_obj, config, case):
+    def _run_one(self, worker, slot, config, case):
         params = case["params"]
         orch_sig = self.CALLABLE["orchestration"]["signature"]
         test_args = self.generate_args(params)
         chip_args, output_names = _build_chip_task_args(test_args, orch_sig)
         golden_args = test_args.clone()
         self.compute_golden(golden_args, params)
-        worker.run(cid, chip_args, config=config)
+        self._chip_worker(worker)._run_slot(slot, chip_args, config=config)
         _compare_outputs(test_args, golden_args, output_names, self.RTOL, self.ATOL)
 
-    def test_dlopen_count_same_cid_repeated_runs(self, st_platform, st_worker):
+    def test_dlopen_count_same_slot_repeated_runs(self, st_platform, st_worker):
         callable_obj, config, case = self._setup_dlopen_count_test(st_worker, st_platform)
         baseline = st_worker.host_dlopen_count
         baseline_aicpu = st_worker.aicpu_dlopen_count
+        prepared = False
+        chip_worker = self._chip_worker(st_worker)
         try:
-            st_worker.prepare_callable(_CID_PRIMARY, callable_obj)
+            chip_worker._prepare_callable_at_slot(_SLOT_PRIMARY, callable_obj)
+            prepared = True
             for _ in range(5):
-                self._run_one(st_worker, _CID_PRIMARY, callable_obj, config, case)
+                self._run_one(st_worker, _SLOT_PRIMARY, config, case)
             assert st_worker.host_dlopen_count - baseline == 1
             assert st_worker.aicpu_dlopen_count == baseline_aicpu
         finally:
-            st_worker.unregister_callable(_CID_PRIMARY)
+            if prepared:
+                chip_worker._unregister_slot(_SLOT_PRIMARY)
 
-    def test_dlopen_count_two_cids_alternating(self, st_platform, st_worker):
+    def test_dlopen_count_two_slots_alternating(self, st_platform, st_worker):
         callable_obj, config, case = self._setup_dlopen_count_test(st_worker, st_platform)
         baseline = st_worker.host_dlopen_count
         baseline_aicpu = st_worker.aicpu_dlopen_count
+        primary_prepared = False
+        secondary_prepared = False
+        chip_worker = self._chip_worker(st_worker)
         try:
-            st_worker.prepare_callable(_CID_PRIMARY, callable_obj)
-            st_worker.prepare_callable(_CID_SECONDARY, callable_obj)
+            chip_worker._prepare_callable_at_slot(_SLOT_PRIMARY, callable_obj)
+            primary_prepared = True
+            chip_worker._prepare_callable_at_slot(_SLOT_SECONDARY, callable_obj)
+            secondary_prepared = True
             for _ in range(5):
-                self._run_one(st_worker, _CID_PRIMARY, callable_obj, config, case)
-                self._run_one(st_worker, _CID_SECONDARY, callable_obj, config, case)
+                self._run_one(st_worker, _SLOT_PRIMARY, config, case)
+                self._run_one(st_worker, _SLOT_SECONDARY, config, case)
             assert st_worker.host_dlopen_count - baseline == 2
             assert st_worker.aicpu_dlopen_count == baseline_aicpu
         finally:
-            st_worker.unregister_callable(_CID_PRIMARY)
-            st_worker.unregister_callable(_CID_SECONDARY)
+            if secondary_prepared:
+                chip_worker._unregister_slot(_SLOT_SECONDARY)
+            if primary_prepared:
+                chip_worker._unregister_slot(_SLOT_PRIMARY)
 
     def test_dlopen_count_double_prepare_raises(self, st_platform, st_worker):
         callable_obj, _config, _case = self._setup_dlopen_count_test(st_worker, st_platform)
+        prepared = False
+        chip_worker = self._chip_worker(st_worker)
         try:
-            st_worker.prepare_callable(_CID_PRIMARY, callable_obj)
+            chip_worker._prepare_callable_at_slot(_SLOT_PRIMARY, callable_obj)
+            prepared = True
             with pytest.raises(RuntimeError):
-                st_worker.prepare_callable(_CID_PRIMARY, callable_obj)
+                chip_worker._prepare_callable_at_slot(_SLOT_PRIMARY, callable_obj)
         finally:
-            st_worker.unregister_callable(_CID_PRIMARY)
+            if prepared:
+                chip_worker._unregister_slot(_SLOT_PRIMARY)
 
     def test_dlopen_count_unregister_re_prepare(self, st_platform, st_worker):
         callable_obj, config, case = self._setup_dlopen_count_test(st_worker, st_platform)
         baseline = st_worker.host_dlopen_count
-        registered = False
+        prepared = False
+        chip_worker = self._chip_worker(st_worker)
         try:
-            st_worker.prepare_callable(_CID_PRIMARY, callable_obj)
-            registered = True
-            self._run_one(st_worker, _CID_PRIMARY, callable_obj, config, case)
+            chip_worker._prepare_callable_at_slot(_SLOT_PRIMARY, callable_obj)
+            prepared = True
+            self._run_one(st_worker, _SLOT_PRIMARY, config, case)
             assert st_worker.host_dlopen_count - baseline == 1
-            st_worker.unregister_callable(_CID_PRIMARY)
-            registered = False
+            chip_worker._unregister_slot(_SLOT_PRIMARY)
+            prepared = False
             assert st_worker.host_dlopen_count - baseline == 1, "unregister must NOT decrement the host dlopen counter"
-            st_worker.prepare_callable(_CID_PRIMARY, callable_obj)
-            registered = True
-            self._run_one(st_worker, _CID_PRIMARY, callable_obj, config, case)
+            chip_worker._prepare_callable_at_slot(_SLOT_PRIMARY, callable_obj)
+            prepared = True
+            self._run_one(st_worker, _SLOT_PRIMARY, config, case)
             assert st_worker.host_dlopen_count - baseline == 2
         finally:
-            if registered:
-                st_worker.unregister_callable(_CID_PRIMARY)
+            if prepared:
+                chip_worker._unregister_slot(_SLOT_PRIMARY)
 
 
 if __name__ == "__main__":

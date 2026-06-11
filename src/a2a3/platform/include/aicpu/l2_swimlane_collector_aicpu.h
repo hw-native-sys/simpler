@@ -77,55 +77,58 @@ L2SwimlaneLevel get_l2_swimlane_level();
 void l2_swimlane_aicpu_init(int worker_count);
 
 /**
- * Rotate the AICore buffer for a given core, if needed.
+ * Pre-dispatch hook for AICore buffer rotation and per-pool stats.
  *
  * Called from the dispatch path (scheduler_dispatch in tensormap_and_ringbuffer,
- * aicpu_executor in host_build_graph) immediately before write_reg(DATA_MAIN_BASE)
- * for each task. Increments the per-core dispatch counter and, when it crosses
- * a PLATFORM_AICORE_BUFFER_SIZE boundary, enqueues the current AICore buffer
- * to the ready queue (kind=2) and pops the next one from free_queue.
+ * aicpu_executor in host_build_graph) immediately BEFORE `write_reg(DATA_MAIN_BASE)`
+ * for each AICore task. Two responsibilities:
  *
- * Race safety: rotation happens BEFORE the dispatch register write, so by the
- * runtime's completion-before-dispatch invariant all prior tasks have FIN'd
- * (and AICore has finished writing their records into the old buffer) before
- * the old buffer enters the ready queue.
+ *   1. Maintain the per-core AICPU-side dispatch count.
+ *   2. Rotate the AICore buffer when the count is about to cross a
+ *      PLATFORM_AICORE_BUFFER_SIZE boundary — enqueue the just-filled buffer
+ *      to the ready queue and pop the next one from free_queue.
+ *   3. Bump the AICore pool's `total_record_count` so host reconcile
+ *      (total == collected + dropped) stays accurate at all levels —
+ *      including AICORE_TIMING (level=1), where `complete_task` is bypassed.
  *
- * Called regardless of l2_swimlane_level — internally gates on AICORE_TIMING.
+ * Race safety: rotation runs BEFORE the dispatch register write. The runtime's
+ * completion-before-dispatch invariant (AICore per core is single-threaded
+ * and AICPU does not dispatch task K+1 until K FIN'd) guarantees AICore has
+ * FIN'd — and dcci'd out — every record in the old buffer by then. No
+ * AICore-side signal is needed; AICPU has full dispatch visibility itself.
  *
- * @param core_id     Core index
- * @param thread_idx  Owning AICPU thread (target ready-queue)
+ * No-op if l2_swimlane is disabled or `core_id` is out of range.
+ *
+ * @param core_id     Core index this dispatch targets
+ * @param thread_idx  Owning AICPU thread (target ready-queue for rotation)
  */
-void l2_swimlane_aicpu_maybe_rotate_aicore(int core_id, int thread_idx);
+void l2_swimlane_aicpu_on_aicore_dispatch(int core_id, int thread_idx);
 
 /**
- * Complete a L2SwimlaneAicpuTaskRecord with AICPU-side metadata after AICore task completion
+ * Commit an AICPU-side timing record for one completed task.
  *
- * AICore-as-producer: AICore writes start/end/task_id directly into the
- * per-core L2SwimlaneAicoreTaskBuffer at `records[reg_task_id % SIZE]`. AICPU does
- * NOT read that buffer on the hot path — it only writes AICPU-owned fields
- * (task_id, reg_task_id, func_id, core_type, dispatch_time, finish_time)
- * here, leaving start/end as zero. The host post-processor joins the AICore
- * stream into the L2SwimlaneAicpuTaskRecord stream by `reg_task_id` at flush time.
+ * AICore-as-producer: identity (task_token_raw) and AICore-side timing
+ * (start/end) live in the per-core L2SwimlaneAicoreTaskRecord stream;
+ * core_type is published once by the host into the collector
+ * (L2SwimlaneCollector::set_core_types); func_id is resolved post-process
+ * from deps.json. This function therefore only needs to record the two
+ * AICPU-only timestamps plus the host-side join key.
  *
  * Per-core counter accounting:
  *   total_record_count++       — every commit attempt (success or failure)
- *   dropped_record_count++     — capacity-driven drop (no free buffer / queue
- *                                full); actionable via
+ *   dropped_record_count++     — capacity-driven drop (no free buffer /
+ *                                queue full); actionable via
  *                                PLATFORM_PROF_BUFFERS_PER_CORE
  *
  * @param core_id               Core index — used to resolve buffer state and update counters
  * @param thread_idx            Owning AICPU thread (used when rotating records buffer)
- * @param expected_reg_task_id  Register dispatch token (low 32 bits) — written
- *                              into L2SwimlaneAicpuTaskRecord.reg_task_id as the join key
- * @param task_id               Task identifier to write (PTO2 encoding or plain id)
- * @param func_id               Kernel function identifier
- * @param core_type             Core type (AIC/AIV)
+ * @param reg_task_id           Per-core dispatch token (low 32 bits) — host join
+ *                              key against the AICore record stream
  * @param dispatch_time         AICPU timestamp when task was dispatched
  * @param finish_time           AICPU timestamp when task completion was observed
  */
 int l2_swimlane_aicpu_complete_task(
-    int core_id, int thread_idx, uint32_t expected_reg_task_id, uint64_t task_id, uint32_t func_id, CoreType core_type,
-    uint64_t dispatch_time, uint64_t finish_time
+    int core_id, int thread_idx, uint32_t reg_task_id, uint64_t dispatch_time, uint64_t finish_time
 );
 
 /**
@@ -164,6 +167,12 @@ void l2_swimlane_aicpu_init_phase(int worker_count, int num_sched_phase_threads,
  * pool. Silently drops records when the buffer is full or the pool was not
  * primed (init failed for this thread).
  *
+ * Queue-depth snapshots distinguish "task hidden in T0's local_buf" from
+ * "shared queue has it but peers spin on the wrong shape" — the former shows
+ * `local_depth > 0, shared_depth == 0` for the owning thread while peers see
+ * `shared_depth == 0` until overflow. Pass nullptr for any of the four arrays
+ * when not capturing (the record's corresponding slot is zero-filled).
+ *
  * @param thread_idx       Scheduler thread index
  * @param kind             Complete or Dispatch
  * @param start_time       Phase start timestamp
@@ -172,10 +181,17 @@ void l2_swimlane_aicpu_init_phase(int worker_count, int num_sched_phase_threads,
  * @param tasks_processed  Tasks processed in this phase batch
  * @param pop_hit          Dispatch delta since last emit (0 for Complete)
  * @param pop_miss         Dispatch delta since last emit (0 for Complete)
+ * @param local_at_start   Per-shape PTO2LocalReadyBuffer.count at phase start (size L2SWIMLANE_NUM_QUEUE_SHAPES; may be
+ * nullptr)
+ * @param shared_at_start  Per-shape sched.ready_queues[shape].size() at phase start (may be nullptr)
+ * @param local_at_end     Per-shape PTO2LocalReadyBuffer.count at phase end (may be nullptr)
+ * @param shared_at_end    Per-shape sched.ready_queues[shape].size() at phase end (may be nullptr)
  */
 void l2_swimlane_aicpu_record_sched_phase(
     int thread_idx, L2SwimlaneSchedPhaseKind kind, uint64_t start_time, uint64_t end_time, uint32_t loop_iter,
-    uint32_t tasks_processed, uint32_t pop_hit = 0, uint32_t pop_miss = 0
+    uint32_t tasks_processed, uint32_t pop_hit = 0, uint32_t pop_miss = 0, const int16_t *local_at_start = nullptr,
+    const int16_t *shared_at_start = nullptr, const int16_t *local_at_end = nullptr,
+    const int16_t *shared_at_end = nullptr
 );
 
 /**
@@ -217,13 +233,22 @@ void l2_swimlane_aicpu_init_core_assignments(int total_cores);
 void l2_swimlane_aicpu_write_core_assignments_for_thread(int thread_idx, const int *core_ids, int core_num);
 
 /**
- * Flush remaining phase records for a thread
+ * Flush the remaining scheduler-phase records for a scheduler thread.
  *
- * Marks the current WRITING phase buffer as READY and enqueues it
- * for host collection. Called at thread exit (analogous to l2_swimlane_aicpu_flush).
+ * Marks the thread's current WRITING sched-phase buffer as READY and enqueues
+ * it for host collection. Called at scheduler-thread exit.
  *
- * @param thread_idx Thread index (scheduler thread or orchestrator)
+ * @param thread_idx Scheduler thread index (= sched pool index = ready queue)
  */
-void l2_swimlane_aicpu_flush_phase_buffers(int thread_idx);
+void l2_swimlane_aicpu_flush_sched_phase_buffer(int thread_idx);
+
+/**
+ * Flush the remaining orchestrator-phase records (single orch instance, pool
+ * ordinal 0). Called once by the orchestrator thread at orchestration end.
+ *
+ * @param thread_idx Calling (orchestrator) AICPU thread index — selects the
+ *                   ready queue to enqueue into. The pool/lane tag is ordinal 0.
+ */
+void l2_swimlane_aicpu_flush_orch_phase_buffer(int thread_idx);
 
 #endif  // PLATFORM_AICPU_L2_SWIMLANE_COLLECTOR_AICPU_H_

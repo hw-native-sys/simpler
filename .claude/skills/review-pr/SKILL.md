@@ -14,6 +14,22 @@ the user explicitly opts in — see [Input](#input).
 Accept PR number (`123`, `#123`), or no input (review current branch
 against its base).
 
+**User-stated expected goal (optional but high-priority).** When the
+user invokes `/review-pr` they may describe in natural language what
+they think this PR is *supposed* to achieve — possibly more ambitious
+or differently-framed than the PR body itself claims. Treat that
+description as a first-class source of the stated goal (see Step 4),
+ranked **above** the PR body. The most common reason this matters:
+the PR author downgraded the original goal in their own description,
+and the user — who is reviewing — knows the original target.
+
+Examples of user-stated goals to watch for:
+
+- "I thought this PR was supposed to do X" — X is now part of stated goal.
+- "The original design was Y" — Y is now part of stated goal.
+- "The team agreed to Z" — Z is now part of stated goal.
+- "Per issue #N this should do W" — go read issue #N before Step 4.
+
 **Optional external reviewer opt-in.** The arguments may also contain
 the literal tokens `codex`, `gemini`, or `all` — these turn on the
 Step 7 cross-check with the named CLIs. Without an explicit opt-in,
@@ -26,6 +42,8 @@ Examples:
 - `/review-pr 773 codex` — also run `codex review`.
 - `/review-pr 773 codex gemini` or `/review-pr 773 all` — both.
 - `/review-pr with codex` — review current branch, also run codex.
+- `/review-pr 773 — this PR is supposed to add symmetric IPC between
+  X and Y` — user-stated goal wins over PR body for Step 4.
 
 ## Step 1: Setup
 
@@ -89,10 +107,34 @@ git diff "$MERGE_BASE"...HEAD
 For large PRs, read diffs per-category (by directory or file type) to
 avoid overwhelming context.
 
-## Step 4: Extract the Stated Goal
+## Step 4: Extract the Stated Goal(s)
 
-Read the PR title, body, and commit messages. Write **one paragraph** in
-your own words restating what the author says the PR does and why.
+The stated goal can come from **multiple sources**. Gather all of them
+before judging. They are not equal in weight — when they disagree, the
+disagreement itself is a finding.
+
+### Sources, in priority order
+
+1. **User's natural-language description in the `/review-pr` invocation.**
+   See Input. If the user said "this PR is supposed to do X", X is the
+   highest-priority stated goal — they're the reviewer asking for the
+   review, and they may know context (linked design doc, team agreement,
+   parent issue) the PR body omits.
+
+2. **Linked GitHub issue or design doc.** If PR body, commit messages,
+   or the user references an issue number / design doc, **read it
+   before judging**. Issues often carry the original goal the PR body
+   later compressed or downgraded.
+
+   ```bash
+   # If PR body / commits reference an issue:
+   gh issue view "$ISSUE_NUMBER" --repo "$PR_REPO_OWNER/$PR_REPO_NAME"
+   ```
+
+3. **PR body and title.** What the author wrote when opening the PR.
+
+4. **Commit messages.** Often the most precise per-commit intent;
+   useful when PR body is empty or a template.
 
 ```bash
 if [ -n "$PR_NUMBER" ]; then
@@ -101,21 +143,46 @@ fi
 git log --format='%s%n%n%b%n---' "$MERGE_BASE"..HEAD
 ```
 
-If reviewing the current branch with no open PR, the commit messages
-are the only stated goal you have — read them as the PR body.
+### Producing the Stated Goal
 
-If the PR body is empty or just a template, say so — that itself is
-worth flagging.
+Write your Stated Goal section using **the most ambitious / most
+authoritative** source that's coherent with the others. Then explicitly
+note any *narrower* sources:
+
+- If the user said "should do X" and the PR body says "adds primitive
+  for X-helper", **state X as the goal** and record "PR body downgrades
+  to X-helper" as a discrepancy to track through Steps 5.7 and 8.
+- If a linked issue says "implement Y" and PR body says "first step
+  toward Y", **state Y as the goal** and record "PR body scopes to
+  first step" as a discrepancy.
+- If only the PR body exists and it's a coherent goal statement, use it.
+- If only commit messages exist (current-branch review), synthesize
+  from them.
+- If the PR body is empty or just a template **and** no user
+  description and no linked issue, say so — that itself is a finding.
+
+**Goal downgrade is a high-value finding.** The single most common
+cause of "approved PR turns out to not have done what we wanted" is
+the author silently narrowing the goal in their own PR body. The
+extra Step 4 work catches it before approval.
+
+If reviewing the current branch with no open PR, commit messages and
+any user-stated description are your only sources.
 
 ## Step 5: Derive the Real Goal from the Code
 
-Independently of Step 4, read the diff and write **one paragraph**
-describing what the code actually does. Do not look back at the stated
-goal while writing this — the point is an independent read.
+Independently of Step 4, read the diff and describe what the code
+actually does. Do not look back at the stated goal while writing this —
+the point is an independent read.
 
-Then **compare the two paragraphs**:
+**Length scales with PR size.** One paragraph for a small PR; several
+paragraphs for a medium PR; a full Mechanism Brief (Step 5.5) for any
+PR over ~500 changed lines or 3+ files. A "one paragraph" summary of a
+5000-line PR is not a summary, it's an abdication.
 
-- **Match** → proceed to Step 6 with the agreed goal.
+Then **compare your description against the stated goal**:
+
+- **Match** → proceed to Step 5.5 / 5.7 with the agreed goal.
 - **Mismatch** → record it as a Must-fix-or-explain issue. Common
   mismatches:
   - Stated as bugfix, but adds new functionality
@@ -125,6 +192,62 @@ Then **compare the two paragraphs**:
 
 The mismatch is the finding — do **not** silently rewrite the stated
 goal to match the code.
+
+## Step 5.5: Mechanism Brief
+
+**Required for PRs over ~500 lines or 3+ files. Recommended otherwise.**
+
+Write a Mechanism Brief that walks a reader through the PR's design from
+scratch. The audience is anyone who will later need to reason about this
+code — including the PR author re-reading their own work in six months.
+
+This is not the place for findings. It is the place where you prove you
+understood the PR before judging it. Skipping it on a large PR makes the
+rest of the review unreliable: bug-hunting without a mental model
+produces low-signal nitpicks and misses architectural issues.
+
+Cover, in order:
+
+1. **What problem the PR solves** — in your own words, not the PR
+   body's. If you can't restate it, you don't understand it yet.
+2. **Central abstractions introduced or modified** — data structures,
+   state machines, ABI surfaces, on-disk / on-wire formats.
+3. **Lifetime and ownership rules** — who allocates, who frees, what
+   prevents use-after-free / leaks.
+4. **Concurrency / threading model** — invariants, critical sections,
+   what's serialized vs. parallel.
+5. **Cross-boundary contracts** — process / language / ABI / network /
+   IPC. What's the wire format? What's the version story?
+6. **How the existing system absorbed the change** — which extension
+   points were used, what was generalized, what was duplicated.
+
+## Step 5.7: Goal-Method Traceability
+
+Build a table mapping every stated goal to the specific design choice
+and code location that implements it:
+
+| Stated goal | Design choice | Code location | Assessment |
+| :---------- | :------------ | :------------ | :--------- |
+
+For each row, mark one of:
+
+- ✅ **Solid** — choice clearly supports the goal
+- ⚠️ **Underspecified** — choice exists but rationale missing from PR
+  body, comments, or docs
+- ⚠️ **Weak** — choice exists but doesn't fully support the goal
+  (explain how it falls short)
+- ❌ **Missing** — goal stated but no corresponding choice in the diff
+- ➕ **Implicit** — code introduces a choice not covered by any stated
+  goal. This is itself a finding — either the author needs to state
+  the goal, or the code needs to go.
+
+❌ and ➕ rows are must-discuss before approval. ⚠️ rows feed Step 8's
+Issues list (typically as Should-fix or Consider). ✅ rows need no
+further action but document that the goal landed.
+
+This table also makes asymmetries obvious: if a PR has 8 stated goals
+and only 3 traceable design choices, the other 5 goals are either
+hand-waving or done implicitly via mechanisms the reader has to guess.
 
 ## Step 6: Type-Specific Analysis
 
@@ -160,6 +283,36 @@ CI was green before this PR, which means the existing test suite does
    touch? Are tests added for each platform it claims to support?
 4. **Is it complete?** Half-finished features (TODOs, stubs, disabled
    code paths) should be flagged.
+5. **Stable-boundary discipline.** Identify every boundary the PR
+   touches (C ABI, IPC protocol, on-disk format, public Python API,
+   wire format). For each:
+   - Is there a version field? Is its evolution rule documented?
+   - Are reserved fields constrained at the validator (rejected if
+     non-zero)?
+   - What's the deprecation path if v2 needs to differ?
+   Reserved-but-unvalidated fields and absent version stories are
+   findings.
+6. **Error propagation paths.** Trace each error condition from where
+   it is raised to where the end user sees it. For cross-boundary
+   paths (process / language / ABI):
+   - Are integer codes preserved, or translated to strings and back?
+   - Is the translation rule documented or hardcoded?
+   - Are there any string-matching error translations? Those are bug
+     magnets — flag them.
+7. **Concurrency model.** Enumerate every critical section and every
+   happens-before relation the code relies on. For each:
+   - Where is the invariant stated (comment, doc)?
+   - Which test exercises the path under contention?
+   - What's the failure mode if the invariant breaks?
+   A concurrency-relevant mechanism with no contention test is
+   incomplete, even if the linear-case tests pass.
+8. **Alternatives considered.** What other shape could this feature
+   have taken? For each plausible alternative (extending an existing
+   primitive, reusing an adjacent mechanism, picking a different
+   ownership model), why was this shape chosen? If the PR body
+   doesn't answer this, flag it — the next contributor will have to
+   re-derive the trade-off, and missing rationale is the single most
+   common cause of architectural regressions.
 
 ### Other (refactor / docs / config / chore / test-only)
 
@@ -309,18 +462,71 @@ running; you will block on buffer flush and see no progress.
 - If a CLI is unavailable or errors out, note it once in the final
   review and continue.
 
+### Verification before surfacing
+
+External reviewers routinely confuse "code in the file I'm reading" with
+"code this PR added" — the most common hallucination class. Before
+including any external finding in your final review, run the matching
+check:
+
+1. **Locate the claimed code in the PR diff.** If the reviewer cites a
+   function, file, or line number, open it and confirm the cited lines
+   are in `git diff "$MERGE_BASE"...HEAD -- <path>`. If they're not in
+   the diff, drop the finding — the reviewer is reading current file
+   state, not your PR's contribution.
+
+2. **For "missing test for bugfix" claims, verify the alleged bugfix is
+   in your diff.** Take a distinctive substring from the change the
+   reviewer cites and run:
+
+   ```bash
+   git log -S "distinctive substring" --oneline -- "path/to/file"
+   ```
+
+   If the introducing commit is outside `"$MERGE_BASE"..HEAD`, the
+   "bugfix" was merged earlier — the reviewer is hallucinating PR
+   authorship. Drop it.
+
+3. **For "race condition" / "thread safety" claims, identify the
+   specific interleaving.** If the reviewer can't name two concurrent
+   call paths and the shared state between them, the claim is
+   speculative. Drop it.
+
+4. **For "memory leak" claims, identify the missing free.** A claim
+   without a concrete "allocated here, never freed on path X" trace is
+   speculative. Drop it.
+
+Only findings that survive these checks land in Step 8's Independent
+Reviewer Notes. In that section, also record findings you dropped (one
+line each) so the human can audit your filtering.
+
 ## Step 8: Write the Review
 
 Structure:
 
 ### Stated Goal
 
-One paragraph from Step 4.
+From Step 4.
 
 ### Real Goal (as read from the code)
 
-One paragraph from Step 5. If it matches the stated goal, say so in one
-line and move on. If it mismatches, this section is the headline finding.
+From Step 5. If it matches the stated goal, say so in one line and move
+on. If it mismatches, this section is the headline finding.
+
+### Mechanism Brief
+
+**Required for PRs over ~500 lines; recommended for medium PRs; may be
+omitted only for trivial PRs (single-file, < ~50 lines).**
+
+From Step 5.5. This is the section that proves you understood the PR.
+Omitting it on a large PR makes the rest of the review look like
+nitpicking.
+
+### Goal-Method Traceability
+
+From Step 5.7. Include the table verbatim; let ❌ / ➕ / ⚠️ rows speak
+for themselves. May be folded into Issues Found if the table is short
+(< 3 rows) and every row is ✅.
 
 ### Type-specific Analysis
 
@@ -332,16 +538,25 @@ several.
 Categorize by severity:
 
 - **Must fix**: bugs, correctness issues, security problems,
-  unresolved goal-vs-code mismatches
+  unresolved goal-vs-code mismatches, ❌ / ➕ traceability rows
 - **Should fix**: style violations per `.claude/rules/`, missing
-  tests for bugfixes, doc/comment drift
-- **Consider**: suggestions, optional improvements
+  tests for bugfixes, doc/comment drift, ⚠️ traceability rows with
+  user-visible impact, string-matching error translations across
+  boundaries, missing version stories on new ABIs
+- **Consider**: suggestions, optional improvements, ⚠️ rows that
+  only affect future maintainability
 
 ### Independent Reviewer Notes
 
-A short subsection per external reviewer (codex, gemini) summarizing
-which of their findings you verified and included, and which you
-dropped (and why, in one line).
+A short subsection per external reviewer (codex, gemini) listing:
+
+- which of their findings you verified and surfaced above
+- which you dropped, with a one-line reason each (using the
+  "Verification before surfacing" checks from Step 7)
+
+The dropped-list is part of the review's audit trail — do not omit it
+when there were dropped findings. A reader needs to see what filtering
+you did.
 
 ### Verdict
 
@@ -364,6 +579,13 @@ approve / request changes / needs discussion.
    KiB on Linux).
 5. **Silent goal rewriting** — Never paper over a stated-vs-real goal
    mismatch by rephrasing the stated goal. The mismatch is the finding.
+   Equally: never silently *accept* the PR body's framing of the goal
+   when other sources (user description, linked issue, design doc) give
+   a broader or different target. Step 4 ranks user description above
+   PR body for exactly this reason — authors routinely downgrade their
+   own goal description, and a review that adopts the downgraded version
+   approves a PR that doesn't do what was intended. When in doubt, ask
+   the user "is X the goal, or is Y?" before judging.
 6. **Trusting external reviewers** — `codex` and `gemini` hallucinate.
    Verify every claim against the diff before surfacing it.
 7. **Misconfigured CLI ≠ unavailable** — a CLI binary can be on PATH

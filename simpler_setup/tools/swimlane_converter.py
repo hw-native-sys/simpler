@@ -22,6 +22,7 @@ Usage:
 """
 
 import argparse
+import bisect
 import importlib.util
 import json
 import sys
@@ -85,32 +86,229 @@ def format_task_display(task_id):
     return f"r{ring}t{local}"
 
 
-def read_perf_data(filepath):
-    """Read performance data from JSON file.
+def read_perf_data(filepath):  # noqa: PLR0912, PLR0915
+    """Read performance data from a swimlane JSON file.
 
-    Args:
-        filepath: Path to input JSON file
+    Host dumps raw cycle-domain per-stream records plus metadata; this
+    function does the AICore↔AICPU join. Schema:
 
-    Returns:
-        dict: Parsed performance data with keys:
-            - l2_swimlane_level
-            - tasks (list)
+        {
+          "l2_swimlane_level": <1..4>,
+          "metadata": {
+            "clock_freq_hz": <int>,
+            "num_cores": <int>,
+            "core_types": ["aic"|"aiv", ...],   # indexed by core_id
+            "core_to_thread": [<int>, ...]      # optional (level >= 3)
+          },
+          "aicore_tasks": [[core_id, task_token_raw, reg_task_id, start_cycles, end_cycles], ...],
+          "aicpu_tasks":  [[core_id, reg_task_id, dispatch_cycles, finish_cycles], ...],
+          "aicpu_scheduler_phases":     [ [ {kind, start_cycles, end_cycles, ...}, ... ], ... ],
+          "aicpu_orchestrator_phases":  [ [ {submit_idx, task_id, start_cycles, end_cycles}, ... ], ... ]
+        }
+
+    Returns a dict shaped for `generate_chrome_trace_json`,
+    `print_task_statistics`, and `sched_overhead_analysis`: `tasks`,
+    `aicpu_scheduler_phases`, `aicpu_orchestrator_phases`,
+    `core_to_thread`.
+
+    The join logic that used to live in `export_swimlane_json` (host C++):
+
+      - per-core `reg_task_id → (task_token_raw, start_cycles, end_cycles)` map
+        from `aicore_tasks` (the AICore is the canonical identity producer)
+      - `base_time_cycles` = min non-zero timestamp across all streams (task,
+        phase, orch)
+      - cycles → µs via `clock_freq_hz` from metadata (a2a3=50 MHz, a5=1 GHz —
+        the freq MUST come from the host, never be hardcoded here)
+      - join `aicpu_tasks` by `(core_id, reg_task_id)`; unmatched rows are
+        dropped and counted
+      - AICORE_TIMING (level=1): aicpu_tasks is empty by construction, so
+        synthesize one task per aicore record (dispatch/finish = 0)
+      - sort joined `tasks` by `task_id` (= task_token_raw)
+      - convert phase records from `*_cycles` → `*_time_us`
 
     Raises:
-        ValueError: If JSON format is invalid
+        ValueError: If the JSON is malformed.
     """
     with open(filepath) as f:
         data = json.load(f)
 
-    required_fields = ["l2_swimlane_level", "tasks"]
-    for field in required_fields:
-        if field not in data:
-            raise ValueError(f"Missing required field: {field}")
+    level = int(data.get("l2_swimlane_level"))
+    if level not in [1, 2, 3, 4]:
+        raise ValueError(f"Unsupported l2_swimlane_level: {level} (expected 1, 2, 3, or 4)")
 
-    if data["l2_swimlane_level"] not in [1, 2, 3, 4]:
-        raise ValueError(f"Unsupported l2_swimlane_level: {data['l2_swimlane_level']} (expected 1, 2, 3, or 4)")
+    metadata = data.get("metadata") or {}
+    clock_freq_hz = int(metadata.get("clock_freq_hz") or 0)
+    if clock_freq_hz <= 0:
+        raise ValueError(f"metadata missing/zero clock_freq_hz: {clock_freq_hz}")
+    core_types = list(metadata.get("core_types") or [])
+    core_to_thread = list(metadata.get("core_to_thread") or [])
 
-    return data
+    aicore_rows = data.get("aicore_tasks") or []
+    aicpu_rows = data.get("aicpu_tasks") or []
+    sched_phases_raw = data.get("aicpu_scheduler_phases") or []
+    orch_phases_raw = data.get("aicpu_orchestrator_phases") or []
+
+    # AICore lookup keyed by (core_id, reg_task_id). Two dispatches of the
+    # same PTO2 task_token_raw to the same core (SPMD over-subscription, MIX
+    # cluster spread) each get their own reg_task_id, so this key is unique
+    # per dispatch even when task_token_raw collides.
+    aicore_lookup: dict[tuple[int, int], tuple[int, int, int]] = {}
+    for row in aicore_rows:
+        core_id, task_token_raw, reg_task_id, start_cycles, end_cycles = row
+        aicore_lookup[(int(core_id), int(reg_task_id))] = (
+            int(task_token_raw),
+            int(start_cycles),
+            int(end_cycles),
+        )
+
+    # base_time = min non-zero timestamp across every stream that will be
+    # emitted. Used as the cycle-domain zero for all µs conversions.
+    base_time_cycles = None
+
+    def _track(v):
+        nonlocal base_time_cycles
+        if v > 0 and (base_time_cycles is None or v < base_time_cycles):
+            base_time_cycles = v
+
+    for _, _, _, s, e in aicore_rows:
+        _track(int(s))
+        _track(int(e))
+    for _, _, d, f in aicpu_rows:
+        _track(int(d))
+        _track(int(f))
+    for thread_records in sched_phases_raw:
+        for pr in thread_records:
+            _track(int(pr.get("start_cycles", 0)))
+            _track(int(pr.get("end_cycles", 0)))
+    for thread_records in orch_phases_raw:
+        for pr in thread_records:
+            _track(int(pr.get("start_cycles", 0)))
+            _track(int(pr.get("end_cycles", 0)))
+
+    if base_time_cycles is None:
+        base_time_cycles = 0
+
+    cycles_to_us_factor = 1_000_000.0 / float(clock_freq_hz)
+
+    def _to_us(cycles):
+        if cycles <= 0:
+            return 0.0
+        return (cycles - base_time_cycles) * cycles_to_us_factor
+
+    def _core_type(core_id):
+        if 0 <= core_id < len(core_types):
+            return core_types[core_id]
+        return "aiv"
+
+    tasks = []
+    unmatched_per_core: dict[int, int] = defaultdict(int)
+
+    if aicpu_rows:
+        for row in aicpu_rows:
+            core_id, reg_task_id, dispatch_cycles, finish_cycles = row
+            core_id = int(core_id)
+            reg_task_id = int(reg_task_id)
+            ac = aicore_lookup.get((core_id, reg_task_id))
+            if ac is None:
+                unmatched_per_core[core_id] += 1
+                continue
+            task_token_raw, start_cycles, end_cycles = ac
+            start_us = _to_us(start_cycles)
+            end_us = _to_us(end_cycles)
+            tasks.append(
+                {
+                    "task_id": task_token_raw,
+                    "func_id": -1,
+                    "core_id": core_id,
+                    "core_type": _core_type(core_id),
+                    "ring_id": (task_token_raw >> 32) & 0xFFFFFFFF,
+                    "start_time_us": start_us,
+                    "end_time_us": end_us,
+                    "duration_us": end_us - start_us,
+                    "dispatch_time_us": _to_us(int(dispatch_cycles)),
+                    "finish_time_us": _to_us(int(finish_cycles)),
+                }
+            )
+    elif level == 1:
+        # AICORE_TIMING fallback: AICPU records are absent (complete_task
+        # bypassed). The AICore stream alone is the source of truth.
+        for row in aicore_rows:
+            core_id, task_token_raw, _reg_task_id, start_cycles, end_cycles = row
+            core_id = int(core_id)
+            task_token_raw = int(task_token_raw)
+            start_us = _to_us(int(start_cycles))
+            end_us = _to_us(int(end_cycles))
+            tasks.append(
+                {
+                    "task_id": task_token_raw,
+                    "func_id": -1,
+                    "core_id": core_id,
+                    "core_type": _core_type(core_id),
+                    "ring_id": (task_token_raw >> 32) & 0xFFFFFFFF,
+                    "start_time_us": start_us,
+                    "end_time_us": end_us,
+                    "duration_us": end_us - start_us,
+                    "dispatch_time_us": 0.0,
+                    "finish_time_us": 0.0,
+                }
+            )
+
+    tasks.sort(key=lambda t: int(t["task_id"]))
+
+    total_unmatched = sum(unmatched_per_core.values())
+    if total_unmatched > 0:
+        worst = sorted(unmatched_per_core.items(), key=lambda kv: -kv[1])[:3]
+        worst_str = ", ".join(f"core {c}: {n}" for c, n in worst)
+        print(
+            f"Warning: {total_unmatched} aicpu_task(s) had no matching AICore record (top offenders: {worst_str}); "
+            "the missing AICore buffer(s) were dropped on rotation. Bump PLATFORM_AICORE_BUFFERS_PER_CORE if you "
+            "see this regularly.",
+            file=sys.stderr,
+        )
+
+    def _phase_us(pr):
+        # Host already omits pop_hit / pop_miss for Complete records (terse
+        # emit), so we don't need to re-strip zero deltas here.
+        out = dict(pr)
+        out["start_time_us"] = _to_us(int(pr.get("start_cycles", 0)))
+        out["end_time_us"] = _to_us(int(pr.get("end_cycles", 0)))
+        out.pop("start_cycles", None)
+        out.pop("end_cycles", None)
+        return out
+
+    aicpu_scheduler_phases = []
+    for thread_records in sched_phases_raw:
+        converted = []
+        for pr in thread_records:
+            kind = pr.get("kind", "unknown")
+            out = _phase_us(pr)
+            # Downstream code branches on "phase" as the sched-record
+            # discriminator; surface "kind" under that name.
+            out["phase"] = kind
+            out.pop("kind", None)
+            converted.append(out)
+        aicpu_scheduler_phases.append(converted)
+
+    aicpu_orchestrator_phases = []
+    for thread_records in orch_phases_raw:
+        converted = []
+        for pr in thread_records:
+            out = _phase_us(pr)
+            out["phase"] = "orch_submit"
+            converted.append(out)
+        aicpu_orchestrator_phases.append(converted)
+
+    out = {
+        "l2_swimlane_level": level,
+        "tasks": tasks,
+    }
+    if aicpu_scheduler_phases:
+        out["aicpu_scheduler_phases"] = aicpu_scheduler_phases
+    if aicpu_orchestrator_phases:
+        out["aicpu_orchestrator_phases"] = aicpu_orchestrator_phases
+    if core_to_thread:
+        out["core_to_thread"] = core_to_thread
+    return out
 
 
 def load_deps_json(deps_path):
@@ -160,6 +358,74 @@ def load_deps_json(deps_path):
         seen.add(key)
         by_pred[pred].append(succ)
     return dict(by_pred)
+
+
+def load_deps_kernel_map(deps_path):
+    """Build a ``task_id → kernel_ids[3]`` map from deps.json's ``tasks[]``.
+
+    a2a3 dep_gen captures per-task ``kernel_ids = [aic, aiv0, aiv1]`` so the
+    swimlane post-processor can resolve ``func_id`` at AICORE_TIMING (level=1)
+    where the AICore record alone is on disk and carries ``func_id == -1``.
+    The trace generator uses the per-record ``core_type`` to pick the right
+    subslot: ``aic → kernel_ids[0]``, ``aiv → kernel_ids[1]`` (falling back
+    to ``[2]`` if AIV0 is inactive). Same pattern fanout edges already use
+    (deps.json is the offline-joined identity source).
+
+    Returns:
+        dict[int, list[int]] mapping ``task_id_raw → [aic, aiv0, aiv1]``,
+        or ``None`` if the file is missing / unreadable / lacks the field.
+        Entries without ``kernel_ids`` (pre-schema deps.json from older
+        runs) are silently skipped — the caller treats a missing map as
+        "no override available" and emits the ``func_-1_(...)`` fallback.
+    """
+    deps_path = Path(deps_path)
+    if not deps_path.exists():
+        return None
+    try:
+        with deps_path.open() as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return None
+    tasks = data.get("tasks")
+    if not isinstance(tasks, list):
+        return None
+    kmap: dict[int, list[int]] = {}
+    for task in tasks:
+        if not isinstance(task, dict):
+            continue
+        tid = normalize_pto2_task_id_int(task.get("task_id"))
+        kids = task.get("kernel_ids")
+        if tid is None or not isinstance(kids, list) or len(kids) != 3:
+            continue
+        kmap[tid] = [int(k) for k in kids]
+    return kmap if kmap else None
+
+
+def resolve_func_id_from_kernel_map(task_id, core_type, kernel_map):
+    """Look up the active ``func_id`` for an AICORE_TIMING record via dep_gen.
+
+    Picks the kernel_ids[3] subslot by record ``core_type``. Returns the
+    resolved func_id (>= 0) on a hit, or -1 if no usable subslot was found
+    (caller keeps the original -1 and emits the ``func_-1_(...)`` fallback
+    name). The choice for ``aiv`` prefers AIV0 ([1]) and falls back to AIV1
+    ([2]) — works for pure-AIV and MIX-with-single-AIV records; for MIX
+    records that span both AIVs the host swimlane record only tells us the
+    lane is "aiv", so the resolver may name an AIV1 lane after AIV0's
+    kernel. Acceptable trade-off until the host emits a lane-disambiguated
+    core_type ("aiv0" / "aiv1").
+    """
+    if kernel_map is None or task_id is None:
+        return -1
+    kids = kernel_map.get(int(task_id))
+    if not kids:
+        return -1
+    if core_type == "aic":
+        return kids[0] if kids[0] >= 0 else -1
+    # "aiv": prefer AIV0, fall back to AIV1.
+    for idx in (1, 2):
+        if kids[idx] >= 0:
+            return kids[idx]
+    return -1
 
 
 def load_kernel_config(config_path):
@@ -381,6 +647,7 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0915
     core_to_thread=None,
     orchestrator_name=None,
     deps_edges=None,
+    deps_kernel_map=None,
 ):
     """Generate Chrome Trace Event Format JSON from task data.
 
@@ -468,8 +735,16 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0915
         ts = task["start_time_us"]
         dur = task["duration_us"]
 
-        # Get function name if available
+        # Get function name if available. At AICORE_TIMING (level=1) the
+        # host emits func_id=-1; recover the real func_id from dep_gen's
+        # per-task kernel_ids[3] using the record's core_type to pick the
+        # active subslot. See resolve_func_id_from_kernel_map() for the
+        # AIV0-vs-AIV1 tie-break and the host-side contract.
         func_id = task["func_id"]
+        if int(func_id) < 0 and deps_kernel_map is not None:
+            resolved = resolve_func_id_from_kernel_map(task["task_id"], task.get("core_type"), deps_kernel_map)
+            if resolved >= 0:
+                func_id = resolved
         tdisp = format_task_display(task["task_id"])
         if func_id_to_name and str(func_id) in func_id_to_name:
             func_name = func_id_to_name[str(func_id)]
@@ -719,6 +994,57 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0915
             "dispatch": "terrible",  # red
         }
 
+        # Per-complete subtask-finish counts surface "how many AICore FINs
+        # did the AICPU poll in this phase" — useful context that
+        # tasks_processed (logical task count) doesn't convey. Computed
+        # with "phase contains finish_us" semantics so it matches how the
+        # AICPU actually attributes finishes to its polling windows.
+        complete_phases_by_thread_pre = []
+        complete_starts_by_thread_pre = []
+        for thread_records in scheduler_phases:
+            sorted_completes = sorted(
+                (r for r in thread_records if r.get("phase") == "complete"),
+                key=lambda r: r["start_time_us"],
+            )
+            complete_phases_by_thread_pre.append(sorted_completes)
+            complete_starts_by_thread_pre.append([c["start_time_us"] for c in sorted_completes])
+
+        def _find_containing_complete(thread_idx: int, finish_us: float):
+            # Bisect into the per-thread sorted start_time_us list. Complete
+            # phases on a thread don't overlap, so the only complete that can
+            # CONTAIN finish_us is the last one whose start is <= finish_us
+            # (= entry at idx-1 after bisect_right). Fall back to the next
+            # starting complete (entry at idx) if it doesn't contain.
+            phases = complete_phases_by_thread_pre[thread_idx]
+            starts = complete_starts_by_thread_pre[thread_idx]
+            if not phases:
+                return None
+            idx = bisect.bisect_right(starts, finish_us)
+            if idx > 0:
+                prev_c = phases[idx - 1]
+                if prev_c["start_time_us"] <= finish_us <= prev_c["end_time_us"]:
+                    return prev_c
+            if idx < len(phases):
+                return phases[idx]
+            return None
+
+        finishes_per_complete: dict[int, int] = defaultdict(int)
+        if core_to_thread:
+            for t in tasks:
+                f_us = t.get("finish_time_us")
+                if f_us is None or f_us < 0:
+                    continue
+                t_cid = t["core_id"]
+                if t_cid >= len(core_to_thread):
+                    continue
+                t_thr = core_to_thread[t_cid]
+                if t_thr < 0 or t_thr >= len(complete_phases_by_thread_pre):
+                    continue
+                t_comp = _find_containing_complete(t_thr, f_us)
+                if t_comp is None:
+                    continue
+                finishes_per_complete[id(t_comp)] += 1
+
         for thread_idx, thread_records in enumerate(scheduler_phases):
             tid = 3000 + thread_idx
 
@@ -746,16 +1072,57 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0915
                 dur = end_us - start_us
                 tasks_processed = record.get("tasks_processed", 0)
 
+                # Queue-depth snapshot fields. Layout per
+                # L2SwimlaneAicpuSchedPhaseRecord docstring: [AIC, AIV, MIX].
+                local_at_start = record.get("local_at_start")
+                local_at_end = record.get("local_at_end")
+                shared_at_start = record.get("shared_at_start")
+                shared_at_end = record.get("shared_at_end")
+                depths_valid = (
+                    isinstance(local_at_start, list)
+                    and isinstance(local_at_end, list)
+                    and isinstance(shared_at_start, list)
+                    and isinstance(shared_at_end, list)
+                    and len(local_at_start) == 3
+                    and len(local_at_end) == 3
+                    and len(shared_at_start) == 3
+                    and len(shared_at_end) == 3
+                )
+
+                # Phase block. When queue depths are present, fold them into
+                # args so hover on a complete/dispatch bar surfaces the
+                # before/after queue state alongside the phase metadata.
+                phase_args = {
+                    "phase": phase,
+                    "loop_iter": record.get("loop_iter", 0),
+                    "tasks_processed": tasks_processed,
+                }
+                if depths_valid:
+                    # Perfetto's args SQL parses key names; `[...]` looks like
+                    # an array-index op and crashes the details-panel query.
+                    # Encode the AIC/AIV/MIX layout inline so the key stays
+                    # parser-safe while still self-documenting.
+                    phase_args.update(
+                        {
+                            f"T{thread_idx}_local_at_start (aic,aiv,mix)": list(local_at_start),
+                            f"T{thread_idx}_local_at_end (aic,aiv,mix)": list(local_at_end),
+                            "shared_at_start (aic,aiv,mix)": list(shared_at_start),
+                            "shared_at_end (aic,aiv,mix)": list(shared_at_end),
+                        }
+                    )
+                if phase == "complete":
+                    # finishes_processed kept in args (hover) for forensics —
+                    # SPMD cases where one logical task has N subtask FINs
+                    # observed in the phase. Label stays minimal.
+                    finishes_count = finishes_per_complete.get(id(record), 0)
+                    phase_args["finishes_processed"] = finishes_count
+                display_name = f"{phase}({tasks_processed})"
                 events.append(
                     {
-                        "args": {
-                            "phase": phase,
-                            "loop_iter": record.get("loop_iter", 0),
-                            "tasks_processed": tasks_processed,
-                        },
+                        "args": phase_args,
                         "cat": "scheduler",
                         "cname": phase_colors.get(phase, "generic_work"),
-                        "name": f"{phase}({tasks_processed})",
+                        "name": display_name,
                         "ph": "X",
                         "pid": 3,
                         "tid": tid,
@@ -763,6 +1130,69 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0915
                         "dur": dur,
                     }
                 )
+
+                # Queue-depth counter tracks (Perfetto "ph": "C"). Emit ONE
+                # sample per phase at its end_us — phase N's end is phase N+1's
+                # start, so emitting both is redundant. Two samples at the
+                # SAME ts (e.g. final-drain emit where start_time==end_time)
+                # also breaks Perfetto's rate calc (divide-by-zero → NULL).
+                # Track name carries thread index so it reads standalone
+                # even with the thread tree collapsed.
+                if not depths_valid:
+                    continue
+                local_track_name = f"local_ready_buf_T{thread_idx}"
+                events.append(
+                    {
+                        "args": {"AIC": local_at_end[0], "AIV": local_at_end[1], "MIX": local_at_end[2]},
+                        "cat": "queue",
+                        "name": local_track_name,
+                        "ph": "C",
+                        "pid": 3,
+                        "tid": tid,
+                        "ts": end_us,
+                    }
+                )
+                # Shared queue: dedicated tid 3999 so all 3 schedulers'
+                # snapshots compose onto one timeline (it's the same global
+                # queue regardless of who sampled it). Samples from different
+                # threads at slightly different ts are fine — Perfetto plots
+                # them in time order to render the step function.
+                events.append(
+                    {
+                        "args": {"AIC": shared_at_end[0], "AIV": shared_at_end[1], "MIX": shared_at_end[2]},
+                        "cat": "queue",
+                        "name": "shared_ready_queue",
+                        "ph": "C",
+                        "pid": 3,
+                        "tid": 3999,
+                        "ts": end_us,
+                    }
+                )
+
+        # Name the shared-queue pseudo-thread + give it a sort index that
+        # places it after the 3 scheduler threads but still inside the
+        # AICPU Scheduler process row, so the user reads top-to-bottom:
+        # Sched_0 / Sched_1 / Sched_2 / Shared queue (global).
+        events.append(
+            {
+                "args": {"name": "shared_ready_queue (global)"},
+                "cat": "__metadata",
+                "name": "thread_name",
+                "ph": "M",
+                "pid": 3,
+                "tid": 3999,
+            }
+        )
+        events.append(
+            {
+                "args": {"sort_index": 100},
+                "cat": "__metadata",
+                "name": "thread_sort_index",
+                "ph": "M",
+                "pid": 3,
+                "tid": 3999,
+            }
+        )
 
     # AICPU Orchestrator lane (l2_swimlane_level >= 4)
     #
@@ -892,6 +1322,222 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0915
                         flow_f["bind_id"] = dst_aicpu_eid
                     events.append(flow_f)
 
+                    flow_id += 1
+
+    # Complete-phase flow arrows. The complete phase wraps the AICPU's
+    # completion-polling loop: it observes AICore subtask FINs, increments
+    # the slot's per-task subtask counter, and on the LAST subtask of a
+    # logical task it walks the fanout list and releases each consumer's
+    # fanin refcount. The arrows are built in two stages.
+    #
+    # Inbound: per-task, NOT per-subtask. A task is logically "completed"
+    # only when its LAST subtask is observed (the one that triggers
+    # phase_complete_count++ in firmware). For SPMD with N subtasks across
+    # N cores, the earlier N-1 subtasks just bump the slot's
+    # completed_subtasks counter inside whatever complete phase happened to
+    # poll them; only the LAST subtask's finish actually completes the
+    # task. So per task: take max(finish_time_us) across its subtasks, find
+    # the complete phase that CONTAINS that time, draw one arrow from that
+    # subtask's core lane to the complete phase start.
+    #
+    # Outbound: per-consumer, gated on full fanin. Each consumer in
+    # deps.json has multiple producer fanin edges; refcount += 1 fires
+    # whenever ANY producer's complete walks its fanout, but the consumer
+    # only becomes ready when ALL producers have completed. The complete
+    # that triggers the LAST refcount bump is the one that "released" the
+    # consumer — that's the causal edge. Compute by walking complete
+    # phases in temporal order and tracking each consumer's satisfied
+    # fanin count.
+    if scheduler_phases and core_to_thread:
+        complete_phases_by_thread = []
+        complete_starts_by_thread = []
+        for thread_records in scheduler_phases:
+            sorted_completes = sorted(
+                (r for r in thread_records if r.get("phase") == "complete"),
+                key=lambda r: r["start_time_us"],
+            )
+            complete_phases_by_thread.append(sorted_completes)
+            complete_starts_by_thread.append([c["start_time_us"] for c in sorted_completes])
+
+        # Group subtask records by task_id; SPMD tasks have multiple rows.
+        tasks_by_id: dict[int, list[dict]] = defaultdict(list)
+        for t in tasks:
+            tasks_by_id[t["task_id"]].append(t)
+
+        # For each task: completion = LAST subtask's finish observation.
+        # The owning thread is determined by core_to_thread of that last
+        # subtask's core — typical case is the same thread observed
+        # earlier subtasks too, but we don't assume. The source anchor for
+        # the flow arrow is the last subtask's AICore slice (its end_us)
+        # so the user can click the AICore task block in Perfetto and see
+        # the outbound complete arrow.
+        task_to_complete: dict[int, dict] = {}
+        task_last_subtask: dict[int, tuple[float, float, int]] = {}  # tid -> (last_end_us, last_finish_us, core_id)
+        for tid, recs in tasks_by_id.items():
+            valid_finishes = [
+                (r.get("finish_time_us"), r.get("end_time_us"), r["core_id"])
+                for r in recs
+                if r.get("finish_time_us") is not None and r["finish_time_us"] >= 0 and r.get("end_time_us") is not None
+            ]
+            if not valid_finishes:
+                continue
+            last_finish_us, last_end_us, last_cid = max(valid_finishes, key=lambda x: x[0])
+            if last_cid >= len(core_to_thread):
+                continue
+            owning_thread = core_to_thread[last_cid]
+            if owning_thread < 0 or owning_thread >= len(complete_phases_by_thread):
+                continue
+            task_last_subtask[tid] = (last_end_us, last_finish_us, last_cid)
+            # Find the complete phase that CONTAINS this last_finish_us.
+            # Fall back to the next-starting complete if none contains
+            # (rare: AICore reported the finish but the scheduler hadn't
+            # entered its next complete phase by run end). Bisect for O(log N).
+            chosen = None
+            phases = complete_phases_by_thread[owning_thread]
+            starts = complete_starts_by_thread[owning_thread]
+            if phases:
+                idx = bisect.bisect_right(starts, last_finish_us)
+                if idx > 0:
+                    prev_c = phases[idx - 1]
+                    if prev_c["start_time_us"] <= last_finish_us <= prev_c["end_time_us"]:
+                        chosen = prev_c
+                if chosen is None and idx < len(phases):
+                    chosen = phases[idx]
+            if chosen is not None:
+                task_to_complete[tid] = chosen
+
+        # ---- Inbound: one arrow per task, anchored on the AICore slice ----
+        # Source ts = end_us - epsilon so it lands INSIDE the AICore task
+        # X event (last subtask of this task on its core). Without this
+        # anchoring Perfetto can't bind the flow to a slice and the arrow
+        # is invisible when you click the task. Same convention as the
+        # existing `dependency` arrows.
+        FLOW_EPSILON_US = 0.01
+        for tid, comp in task_to_complete.items():
+            last_end_us, _last_finish_us, last_cid = task_last_subtask[tid]
+            src_tid = core_to_tid[last_cid]
+            owning_thread = core_to_thread[last_cid]
+            dst_tid = 3000 + owning_thread
+            events.append(
+                {
+                    "cat": "flow",
+                    "id": flow_id,
+                    "name": "complete",
+                    "ph": "s",
+                    "pid": 1,
+                    "tid": src_tid,
+                    "ts": last_end_us - FLOW_EPSILON_US,
+                }
+            )
+            events.append(
+                {
+                    "cat": "flow",
+                    "id": flow_id,
+                    "name": "complete",
+                    "ph": "f",
+                    "pid": 3,
+                    "tid": dst_tid,
+                    "ts": comp["start_time_us"],
+                    "bp": "e",
+                }
+            )
+            flow_id += 1
+
+        # ---- Outbound: per-consumer, gated on full fanin ----
+        if deps_edges is not None:
+            # Invert deps_edges to consumer → predecessors for fanin counting.
+            preds_for_consumer: dict[int, list[int]] = defaultdict(list)
+            for pred, succs in deps_edges.items():
+                for succ in succs:
+                    preds_for_consumer[succ].append(pred)
+            fanin_total = {c: len(preds) for c, preds in preds_for_consumer.items()}
+            fanin_satisfied: dict[int, int] = defaultdict(int)
+
+            # Reverse map: complete_phase id → list of task_ids it completed.
+            complete_to_tasks: dict[int, list[int]] = defaultdict(list)
+            for tid, comp in task_to_complete.items():
+                complete_to_tasks[id(comp)].append(tid)
+
+            # Walk completes in temporal order (by end_time). Within each,
+            # walk the tasks it completed; for each completed task, bump
+            # its consumers' satisfied fanin. The complete that pushes a
+            # consumer's satisfied count to its total is the one that
+            # released that consumer.
+            all_completes = []
+            for thr_idx, phases in enumerate(complete_phases_by_thread):
+                for p in phases:
+                    all_completes.append((p["end_time_us"], thr_idx, p))
+            # Explicit key restricts the comparison to (end_time_us, thr_idx).
+            # Without it, ties in both fields fall through to comparing the
+            # third element (a dict), which raises TypeError in Python 3.
+            all_completes.sort(key=lambda x: (x[0], x[1]))
+
+            # Earliest dispatch per task_id (for arrow target).
+            earliest_dispatch_us: dict[int, tuple[float, int]] = {}
+            for tid, recs in tasks_by_id.items():
+                valid = [
+                    (r.get("dispatch_time_us"), r["core_id"])
+                    for r in recs
+                    if r.get("dispatch_time_us") is not None and r["dispatch_time_us"] >= 0
+                ]
+                if not valid:
+                    continue
+                d_us, d_cid = min(valid, key=lambda x: x[0])
+                if d_cid >= len(core_to_thread):
+                    continue
+                d_thr = core_to_thread[d_cid]
+                if d_thr < 0:
+                    continue
+                earliest_dispatch_us[tid] = (d_us, d_thr)
+
+            for end_us, comp_thr, comp in all_completes:
+                completed_tids = complete_to_tasks.get(id(comp), ())
+                if not completed_tids:
+                    continue
+                triggered: list[int] = []
+                for completed_tid in completed_tids:
+                    for consumer in deps_edges.get(completed_tid, ()):
+                        fanin_satisfied[consumer] += 1
+                        if fanin_satisfied[consumer] == fanin_total.get(consumer, 0):
+                            triggered.append(consumer)
+                if not triggered:
+                    continue
+                src_tid = 3000 + comp_thr
+                for consumer in triggered:
+                    if consumer not in earliest_dispatch_us:
+                        continue
+                    d_us, d_thr = earliest_dispatch_us[consumer]
+                    # Skip degenerate "dispatched before complete ended" —
+                    # the consumer was popped/dispatched off a still-in-flight
+                    # release path while the complete was still running;
+                    # the arrow would point backwards.
+                    if d_us < end_us:
+                        continue
+                    events.append(
+                        {
+                            "cat": "flow",
+                            "id": flow_id,
+                            "name": "complete→ready",
+                            "ph": "s",
+                            "pid": 3,
+                            "tid": src_tid,
+                            # Anchor inside the complete phase X event so
+                            # clicking the complete block surfaces this arrow.
+                            "ts": end_us - FLOW_EPSILON_US,
+                        }
+                    )
+                    events.append(
+                        {
+                            "cat": "flow",
+                            "id": flow_id,
+                            "name": "complete→ready",
+                            "ph": "f",
+                            "pid": 3,
+                            "tid": 3000 + d_thr,
+                            "ts": d_us,
+                            "bp": "e",
+                        }
+                    )
                     flow_id += 1
 
     # Scheduler DISPATCH → task execution arrows
@@ -1247,9 +1893,16 @@ def main():
 
         deps_path = Path(args.deps_json) if args.deps_json else Path(input_path).parent / "deps.json"
         deps_edges = load_deps_json(deps_path)
+        # Load the per-task kernel_ids map separately so the trace generator
+        # can resolve func_id=-1 records (AICORE_TIMING / level=1) back to
+        # the real kernel name. Optional — pre-schema deps.json without
+        # kernel_ids and AICPU_TIMING+ runs both leave this at None.
+        deps_kernel_map = load_deps_kernel_map(deps_path)
         if deps_edges is not None:
             if args.verbose:
                 print(f"  Using deps.json edges ({sum(len(v) for v in deps_edges.values())} total) from {deps_path}")
+                if deps_kernel_map is not None:
+                    print(f"  Using deps.json kernel_ids for {len(deps_kernel_map)} tasks (level=1 name recovery)")
         else:
             print(
                 f"Warning: no usable deps.json at {deps_path}; Perfetto trace will have no dependency arrows. "
@@ -1267,6 +1920,7 @@ def main():
             orchestrator_phases=data.get("aicpu_orchestrator_phases"),
             core_to_thread=data.get("core_to_thread"),
             deps_edges=deps_edges,
+            deps_kernel_map=deps_kernel_map,
         )
 
         print("\n✓ Conversion complete")

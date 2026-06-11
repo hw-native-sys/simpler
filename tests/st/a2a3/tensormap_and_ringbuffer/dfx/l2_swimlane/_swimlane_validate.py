@@ -29,6 +29,7 @@ import sys
 from pathlib import Path
 
 from simpler_setup.scene_test import _outputs_dir, _sanitize_for_filename
+from simpler_setup.tools.swimlane_converter import read_perf_data
 
 _REQUIRED_TASK_FIELDS = ("task_id", "func_id", "core_id", "core_type", "start_time_us", "end_time_us")
 
@@ -51,8 +52,11 @@ def validate_perf_artifact(case_label: str, *, expected_task_count: int | None =
     perf = matches[-1] / "l2_swimlane_records.json"
     assert perf.exists(), f"l2_swimlane_records.json missing under {matches[-1]} — swimlane capture failed?"
 
-    with perf.open() as f:
-        data = json.load(f)
+    # Read via the swimlane_converter loader so v2 host JSON gets joined into
+    # the v1-shaped dict the rest of this validator (and the differential
+    # oracle below) expects. Direct json.load(perf) would see only raw
+    # aicore_tasks / aicpu_tasks arrays under v2.
+    data = read_perf_data(perf)
     assert data.get("l2_swimlane_level") in (1, 2, 3, 4), (
         f"unexpected l2_swimlane_level: {data.get('l2_swimlane_level')}"
     )

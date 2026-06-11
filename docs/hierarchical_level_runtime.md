@@ -1,5 +1,10 @@
 # Hierarchical Level Runtime — Level Model and Component Composition
 
+Callable identity update: public hierarchical registration returns
+`CallableHandle`; local IPC task frames carry the handle hash digest and each
+target resolves it to a private local slot. See
+[callable-identity-registration.md](callable-identity-registration.md).
+
 This document covers:
 
 - The **L0–L6 level model** (what each level represents)
@@ -13,6 +18,8 @@ For details of each component's internals, see:
 - [scheduler.md](scheduler.md) — dispatch loop, queues, completion handling
 - [worker-manager.md](worker-manager.md) — WorkerThread pool, fork + mailbox
 - [task-flow.md](task-flow.md) — Callable / TaskArgs / CallConfig data flow, execution leaves
+- [remote-l3-worker-design.md](remote-l3-worker-design.md) — design proposal
+  for scheduling remote L3 workers as NEXT_LEVEL children
 
 For the L2 chip-level details (host `.so`, AICPU, AICore), see
 [chip-level-arch.md](chip-level-arch.md).
@@ -42,14 +49,18 @@ L0  CORE  / AIV, AIC   ── individual compute core (hardware-managed)
   atomics and barriers.
 - **L3–L6** (host/cluster): each level runs the same scheduling engine
   composed of Orchestrator + Scheduler + Worker pool. Communication via IPC
-  (fork + shm at L3 today; RDMA / sockets at L4+).
+  (fork + shm for today's L3 and for local recursive L4+ composition).
+  Cross-host L4/L5/L6 composition, where a parent schedules a remote L3
+  endpoint over RoCE/HCCS/UB/sockets, now has the local endpoint/eligibility
+  boundary and socket-backed simulation session runner implemented; HCOMM
+  hardware profiles are still pending.
 
 | Level | Workers it contains | Status |
 | ----- | ------------------- | ------ |
 | L3 (Host) | `ChipWorker` ×N + `SubWorker` ×M | Implemented |
-| L4 (Pod) | `Worker(level=3)` ×N + `SubWorker` ×M | Implemented |
-| L5 (SuperNode) | `Worker(level=4)` ×N | Same code as L4 (untested) |
-| L6 (Cluster) | `Worker(level=5)` ×N | Same code as L4 (untested) |
+| L4 (Pod) | `Worker(level=3)` ×N + `SubWorker` ×M | Local implemented; remote sim implemented; HCOMM profiles pending |
+| L5 (SuperNode) | `Worker(level=4)` ×N | Local L4 code path, untested; remote proposed |
+| L6 (Cluster) | `Worker(level=5)` ×N | Local L4 code path, untested; remote proposed |
 
 `Worker` is a single C++ class that handles every level from L3 upward — the
 `level` parameter is a diagnostic label; behavior does not branch on it. The
@@ -70,7 +81,9 @@ first argument of `submit_*`. Runs single-threaded on the user's thread.
 Owns:
 
 - `Ring` — fixed-size slot pool, allocates with back-pressure
-- `TensorMap` — `tensor_base_ptr → producer_slot` lookup, drives automatic dep inference
+- `TensorMap` — tensor dependency key to producer slot lookup, drives automatic
+  dep inference. Local keys contain a pointer; remote keys contain buffer
+  identity and logical offset.
 - `Scope` — lifetime management for intermediate tensors
 
 One `submit_next_level(callable, task_args, config)` call:
@@ -103,7 +116,7 @@ The **execution layer**. `WorkerManager` holds two pools of `WorkerThread`s
 (next-level pool and sub pool). Each `WorkerThread` owns one std::thread that
 encodes `(callable, config, args_blob)` into a `MAILBOX_SIZE`-byte shared
 memory region, signals the pre-forked Python child, and spin-polls
-`TASK_DONE`.
+  `TASK_DONE`, returning an explicit completion outcome to the Scheduler.
 
 - Next-level (chip) children run `_chip_process_loop`, which constructs a
   `ChipWorker` and dispatches each kernel through it.
@@ -138,10 +151,10 @@ what flows through `ChipWorker::run`.
                  │                                 │ wt.dispatch(slot_id) ──────► WorkerThread
                  │                                 │                              encode mailbox → spin-poll TASK_DONE
                  │                                 │                              (blocking; child runs the kernel)
-                 │                                 │◄── completion_queue ────── on_complete_(slot_id)
+                 │                                 │◄── completion_queue ────── on_complete_(completion)
                  │                                 │ on_task_complete:
-                 │                                 │   fanout release
-                 │                                 │   wake downstream
+                 │                                 │   success → COMPLETED
+                 │                                 │   failure → FAILED + poison downstream
                  │                                 │   try_consume → ring release
                  │ drain() ◄── notify when all done │
 ```
@@ -152,7 +165,7 @@ Communication channels:
 | ---- | --------- | ------- |
 | Orch → Scheduler | wiring_queue (mutex + CV) | slot id |
 | Scheduler → WorkerThread | WorkerThread internal queue | slot id |
-| WorkerThread → Scheduler | completion_queue (mutex + CV) | slot id |
+| WorkerThread → Scheduler | completion_queue (mutex + CV) | slot id + group index + outcome |
 | WorkerThread ↔ child | shm mailbox (state + error + task data) | encoded blob |
 | Python ↔ C++ | nanobind bindings | TaskArgs / CallConfig / callable handle |
 | Tensor data | `torch.share_memory_()` or host malloc | zero-copy shared address |
@@ -170,30 +183,31 @@ inner Worker and enters a mailbox-polling loop (`_child_worker_loop`).
 ```python
 # L3 child: sub-only (or with chips via device_ids)
 l3 = Worker(level=3, num_sub_workers=1)
-l3_sub_cid = l3.register(lambda: verify_result())
+l3_sub_handle = l3.register(lambda: verify_result())
 
 def my_l3_orch(orch, args, config):
-    orch.submit_sub(l3_sub_cid)
+    orch.submit_sub(l3_sub_handle)
 
 # L4 parent
 w4 = Worker(level=4, num_sub_workers=0)
-l3_cid = w4.register(my_l3_orch)
+l3_handle = w4.register(my_l3_orch)
 w4.add_worker(l3)
 w4.init()
 
 def my_l4_orch(orch, args, config):
-    orch.submit_next_level(l3_cid, TaskArgs(), CallConfig())
+    orch.submit_next_level(l3_handle, TaskArgs(), CallConfig())
 
 w4.run(my_l4_orch)
 w4.close()
 ```
 
-When L4's `WorkerThread` writes `(cid, config, args_blob)` to the L3 child's
-mailbox, the child loop reads `cid`, looks up the orch function in the
-COW-inherited callable registry, and calls `inner_worker.run(orch_fn, args,
-cfg)`. The inner Worker opens its own scope, executes the orch function with
-its own `Orchestrator`, and drains. Each level's orch fn receives its own
-Orchestrator — recursion is symmetric.
+When L4's `WorkerThread` writes a task frame to the L3 child's mailbox, the
+frame carries the callable hash digest plus `config` and `args_blob`. The child
+loop reads the digest, resolves it through its local identity table to a private
+orch-function slot, and calls `inner_worker.run(orch_fn, args, cfg)`. The inner
+Worker opens its own scope, executes the orch function with its own
+`Orchestrator`, and drains. Each level's orch fn receives its own Orchestrator
+— recursion is symmetric.
 
 **Nested fork ordering**: L3's own children (sub/chip) are forked **inside**
 the L4 child process, on L3's first `run()`. This keeps the process tree
@@ -214,10 +228,10 @@ walk-through.
 | Concern | Python layer | C++ layer |
 | ------- | ------------ | --------- |
 | Process lifecycle | fork() timing, `SharedMemory` alloc/unlink, waitpid | — |
-| Callable registration | maintains `py_registry[cid]` for sub callables | — |
+| Callable registration | owns handle/hashid registries and child-local Python dispatch mappings | — |
 | Orchestration DAG | user's orch fn, `submit_*` calls | `Orchestrator::submit_*` engine |
 | Scheduling | — | `Scheduler` thread, queues, `WorkerThread` pool |
-| Dispatch | — | `WorkerThread::dispatch_process`, mailbox IPC |
+| Dispatch | — | `WorkerThread::dispatch` → `WorkerEndpoint::run`, mailbox IPC for local endpoints |
 | Runtime execution | — | `ChipWorker` via dlsym'd runtime `.so` |
 
 Python handles **when** things happen (fork ordering, lifecycle). C++ handles
@@ -279,6 +293,8 @@ device allocation algorithm.
 | `src/common/hierarchical/orchestrator.{h,cpp}` | `Orchestrator`: submit, TensorMap, Scope |
 | `src/common/hierarchical/scheduler.{h,cpp}` | `Scheduler`: dispatch loop + queues |
 | `src/common/hierarchical/worker_manager.{h,cpp}` | `WorkerManager` + `WorkerThread`: pool, mailbox-IPC dispatch |
+| `src/common/hierarchical/remote_endpoint.{h,cpp}` | `RemoteL3Endpoint` transport-neutral TASK/COMPLETION boundary |
+| `src/common/hierarchical/remote_wire.{h,cpp}` | Versioned remote L3 frame codec |
 | `src/common/hierarchical/worker.{h,cpp}` | `Worker` (L3+): composes the above |
 | `src/common/hierarchical/ring.{h,cpp}` | slot allocator |
 | `src/common/hierarchical/tensormap.{h,cpp}` | base_ptr → producer slot |

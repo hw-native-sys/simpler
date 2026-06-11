@@ -447,10 +447,9 @@ NB_MODULE(_task_interface, m) {
                 // serialised representation produced by `buffer_ptr()` /
                 // `buffer_size()`. Used by the L4 cascade in
                 // _child_worker_loop, which receives CTRL_REGISTER bytes
-                // through shared memory and needs a typed ChipCallable to
-                // hand to inner_worker._register_at (the cid is dictated
-                // by the outer cascade, not freshly allocated); see
-                // docs/callable-ipc-dynamic-register.md.
+                // through shared memory and needs a typed ChipCallable for
+                // digest-owned registration on the child Worker; see
+                // docs/callable-identity-registration.md.
                 std::vector<uint8_t> buf(
                     reinterpret_cast<const uint8_t *>(raw.c_str()),
                     reinterpret_cast<const uint8_t *>(raw.c_str()) + raw.size()
@@ -604,15 +603,16 @@ NB_MODULE(_task_interface, m) {
             [](const CallConfig &c) {
                 return c.enable_dump_tensor;
             },
-            // Accept either an int dump level (0=off, 1=partial, 2=full) or a
-            // Python bool. `True` maps to level 1 (partial) — the default when
-            // --dump-tensor is passed without a value; `False` maps to 0.
+            // Accept either an int dump level (0=off, 1=partial, 2=full,
+            // 3=full_json_only) or a Python bool. `True` maps to level 1
+            // (partial) — the default when --dump-tensor is passed without a
+            // value; `False` maps to 0.
             [](CallConfig &c, nb::object v) {
                 if (PyBool_Check(v.ptr())) {
                     c.enable_dump_tensor = nb::cast<bool>(v) ? 1 : 0;
                 } else {
                     int level = nb::cast<int>(v);
-                    c.enable_dump_tensor = (level < 0) ? 0 : (level > 2) ? 2 : level;
+                    c.enable_dump_tensor = (level < 0) ? 0 : (level > 3) ? 3 : level;
                 }
             }
         )
@@ -746,8 +746,8 @@ NB_MODULE(_task_interface, m) {
             nb::arg("callable_id"), nb::arg("blob_ptr"),
             "Stage a ChipCallable from a raw contiguous-buffer pointer (used by "
             "post-fork dynamic register handlers that receive the ChipCallable "
-            "bytes via shared memory; see docs/callable-ipc-dynamic-register.md). "
-            "Equivalent to prepare_callable(cid, ChipCallable) but accepts the "
+            "bytes via shared memory; see docs/callable-identity-registration.md). "
+            "Equivalent to prepare_callable(callable_id, ChipCallable) but accepts the "
             "ChipCallable layout pointer directly so chip-child loops can prepare "
             "from shm without rebuilding a PyChipCallable wrapper."
         )
@@ -803,9 +803,9 @@ NB_MODULE(_task_interface, m) {
         .def_prop_ro("initialized", &ChipWorker::initialized)
         .def_prop_ro(
             "aicpu_dlopen_count", &ChipWorker::aicpu_dlopen_count,
-            "Number of distinct callable_ids the AICPU has dlopened for on the "
+            "Number of distinct callable entries the AICPU has dlopened for on the "
             "bound device. Equals 0 when not initialized or the runtime "
-            "variant lacks per-cid registration. Tests assert this to verify "
+            "variant lacks prepared-callable registration. Tests assert this to verify "
             "prepare_callable + repeated run do not redundantly dlopen."
         )
         .def_prop_ro(

@@ -536,7 +536,9 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
                 auto &orch = rt->orchestrator;
                 for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
                     auto &alloc = orch.rings[r].task_allocator;
-                    scope_stats_set_ring_capacity(r, alloc.window_size(), alloc.heap_capacity());
+                    scope_stats_set_ring_capacity(
+                        r, alloc.window_size(), alloc.heap_capacity(), rt->prebuilt_layout.dep_pool_capacity
+                    );
                 }
                 scope_stats_set_tensormap_capacity(orch.tensor_map.pool_capacity());
             }

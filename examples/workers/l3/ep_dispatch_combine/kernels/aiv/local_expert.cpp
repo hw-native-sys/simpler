@@ -10,7 +10,7 @@
  */
 /**
  * Local-expert kernel — placeholder for the production moe_expert in this
- * 2-rank demo. Replaced by the real moe_expert without changing the
+ * EP=2 config. Replaced by the real moe_expert without changing the
  * surrounding orchestration / combine wiring.
  *
  * Behavior (one element-wise multiply per row):
@@ -46,10 +46,10 @@
 
 using namespace pto;
 
-// Demo dimensions — must match dispatch.cpp / main.py.
-static constexpr int L = 4;
-static constexpr int R = 32;
-static constexpr int D = 64;
+// Real DeepSeek-V4 FLASH MoE shapes — must match dispatch.cpp / main.py.
+static constexpr int L = 16;
+static constexpr int R = 192;
+static constexpr int D = 4096;
 
 extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ int64_t *args) {
     __gm__ Tensor *recv_x_tensor = reinterpret_cast<__gm__ Tensor *>(args[0]);

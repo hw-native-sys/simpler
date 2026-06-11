@@ -99,7 +99,7 @@ def tensor_filename(t: dict) -> str:
     return f"task_{t['task_id']}_{stage_str}_{role_str}{t['arg_index']}.txt"
 
 
-def write_tensor(tensor: dict, bin_path: Path, out):
+def write_tensor(tensor: dict, bin_path: Path | None, out):
     t = tensor
     out.write(f"# task_id: {t['task_id']}\n")
     out.write(f"# role: {t['role']}\n")
@@ -130,6 +130,12 @@ def write_tensor(tensor: dict, bin_path: Path, out):
         out.write("# (no data)\n")
         return
 
+    # bin_size > 0 implies a payload was captured, so bin_path is set
+    # (full_json_only dumps have bin_size == 0 everywhere and never reach here).
+    # Guard explicitly rather than assert so a corrupt manifest fails loudly
+    # even under python -O.
+    if bin_path is None:
+        raise ValueError("bin_path is None but bin_size > 0 (corrupt manifest?)")
     data = read_tensor_data(bin_path, t["bin_offset"], bin_size)
     shape = t["shape"]
     numel = 1
@@ -174,7 +180,7 @@ def write_tensor(tensor: dict, bin_path: Path, out):
         out.write(f"[{idx_str}] {s}\n")
 
 
-def export_tensor(tensor: dict, bin_path: Path, dump_dir: Path):
+def export_tensor(tensor: dict, bin_path: Path | None, dump_dir: Path):
     txt_dir = dump_dir / "txt"
     txt_dir.mkdir(exist_ok=True)
     fname = tensor_filename(tensor)
@@ -279,7 +285,10 @@ def main():
     with open(manifest_path) as f:
         manifest = json.load(f)
 
-    bin_path = dump_dir / manifest.get("bin_file", "tensors.bin")
+    # full_json_only dumps (level 3) carry no payload: bin_file is null and
+    # there is no .bin to export from — listing metadata still works.
+    bin_name = manifest.get("bin_file", "tensors.bin")
+    bin_path = (dump_dir / bin_name) if bin_name else None
     tensors = manifest["tensors"]
 
     filtered = _apply_filters(tensors, args)

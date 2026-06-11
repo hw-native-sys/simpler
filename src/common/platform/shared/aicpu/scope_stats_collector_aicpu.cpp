@@ -19,7 +19,6 @@
 // boundary.
 
 #include "aicpu/scope_stats_collector_aicpu.h"
-
 #include <cstring>
 
 #include "common/memory_barrier.h"
@@ -170,7 +169,7 @@ void switch_buffer() {
 // scope boundary.
 void append_record_snapshot(
     int ring_id, int16_t phase, int32_t task_start, int32_t task_end, uint64_t heap_start, uint64_t heap_end,
-    int32_t tensormap_used
+    int32_t dep_pool_start, int32_t dep_pool_end, int32_t tensormap_used
 ) {
     if (s_scope_stats_state == nullptr) return;
     // Single volatile read of current_buf_ptr (re-read only after a pop/switch).
@@ -202,6 +201,8 @@ void append_record_snapshot(
     rec._pad = 0;
     rec.task_start = task_start;
     rec.task_end = task_end;
+    rec.dep_pool_start = dep_pool_start;
+    rec.dep_pool_end = dep_pool_end;
     rec.tensormap_used = tensormap_used;
     rec.heap_start = heap_start;
     rec.heap_end = heap_end;
@@ -278,7 +279,8 @@ extern "C" void scope_stats_set_pending_site(const char *file, int line) {
 
 // Push depth/site and emit the begin-boundary record (ring start/end + usage).
 extern "C" void scope_stats_begin(
-    int ring_id, int32_t task_start, int32_t task_end, uint64_t heap_start, uint64_t heap_end, int32_t tensormap_used
+    int ring_id, int32_t task_start, int32_t task_end, uint64_t heap_start, uint64_t heap_end, int32_t dep_pool_start,
+    int32_t dep_pool_end, int32_t tensormap_used
 ) {
     if (!scope_stats_enabled) return;
     if (scope_stats_depth + 1 >= PTO2_SCOPE_STATS_MAX_SCOPE_DEPTH) return;
@@ -288,18 +290,23 @@ extern "C" void scope_stats_begin(
     s_pending_site_file = nullptr;
     s_pending_site_line = 0;
     append_record_snapshot(
-        ring_id, SCOPE_STATS_PHASE_BEGIN, task_start, task_end, heap_start, heap_end, tensormap_used
+        ring_id, SCOPE_STATS_PHASE_BEGIN, task_start, task_end, heap_start, heap_end, dep_pool_start, dep_pool_end,
+        tensormap_used
     );
 }
 
 // Emit the end-boundary record, then tear down depth/site.
 extern "C" void scope_stats_end(
-    int ring_id, int32_t task_start, int32_t task_end, uint64_t heap_start, uint64_t heap_end, int32_t tensormap_used
+    int ring_id, int32_t task_start, int32_t task_end, uint64_t heap_start, uint64_t heap_end, int32_t dep_pool_start,
+    int32_t dep_pool_end, int32_t tensormap_used
 ) {
     if (!scope_stats_enabled) return;
     if (scope_stats_depth < 0) return;
     int32_t d = scope_stats_depth;
-    append_record_snapshot(ring_id, SCOPE_STATS_PHASE_END, task_start, task_end, heap_start, heap_end, tensormap_used);
+    append_record_snapshot(
+        ring_id, SCOPE_STATS_PHASE_END, task_start, task_end, heap_start, heap_end, dep_pool_start, dep_pool_end,
+        tensormap_used
+    );
     s_scope_site_file[d] = nullptr;
     s_scope_site_line[d] = 0;
     --scope_stats_depth;
@@ -318,11 +325,13 @@ extern "C" void scope_stats_on_fatal() {
 // Capacity registration — called by runtime at init
 // ---------------------------------------------------------------------------
 
-extern "C" void scope_stats_set_ring_capacity(int ring_id, int32_t window_cap, uint64_t heap_cap) {
+extern "C" void
+scope_stats_set_ring_capacity(int ring_id, int32_t window_cap, uint64_t heap_cap, int32_t dep_pool_cap) {
     if (!s_scope_stats_header) return;
     if (ring_id < 0 || ring_id >= PTO2_SCOPE_STATS_MAX_RING_DEPTH) return;
     s_scope_stats_header->task_window_cap[ring_id] = window_cap;
     s_scope_stats_header->heap_cap[ring_id] = heap_cap;
+    s_scope_stats_header->dep_pool_cap[ring_id] = dep_pool_cap;
 }
 
 extern "C" void scope_stats_set_tensormap_capacity(int32_t cap) {

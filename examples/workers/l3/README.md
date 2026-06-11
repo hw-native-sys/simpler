@@ -26,8 +26,8 @@ worker = Worker(
 )
 
 # 1. Register sub-worker callables BEFORE init (level >= 3 only).
-#    Returns an integer id you pass to orchestrator.submit_sub(...) later.
-postprocess_id = worker.register(
+#    Returns an opaque handle you pass to orchestrator.submit_sub(...) later.
+postprocess_handle = worker.register(
     lambda args: print("post-process received", args)
 )
 
@@ -37,7 +37,7 @@ worker.init()                 # forks chip child processes + sub children,
 def my_orch(orch, args, cfg):
     # orch is the Orchestrator. Submit one task per chip + any sub work.
     # orch.submit_next_level(...) schedules a ChipCallable onto a free chip.
-    # orch.submit_sub(cid, sub_args) schedules a Python callable.
+    # orch.submit_sub(postprocess_handle, sub_args) schedules a Python callable.
     ...
 
 try:
@@ -48,10 +48,9 @@ finally:
 
 Two things to know before reading the example:
 
-1. **`register()` and `add_worker()` MUST run before `init()`**. The Python
-   callables get captured via copy-on-write when `init()` forks child
-   processes, so anything registered after the fork is invisible to the
-   children.
+1. **This example registers callables before `init()`**. That keeps startup
+   simple and lets chip children pre-warm their callable state before the
+   first DAG dispatch.
 2. **The orchestration function is a *plain Python function*, not a C++
    kernel.** It runs in the host process and calls `orch.submit_*(...)` to
    hand work to chip children. The children get the submitted `ChipCallable`
@@ -64,6 +63,7 @@ Two things to know before reading the example:
 | [`multi_chip_dispatch/`](multi_chip_dispatch/) | Two chips + one SubWorker. An orchestration fn dispatches a `ChipCallable` to each chip, then submits a Python callable to collect/verify results. |
 | [`child_memory/`](child_memory/) | `orch.malloc` + `ContinuousTensor(child_memory=True)` to load a weight once and reuse it across multiple kernel invocations on the same chip. |
 | [`allreduce_distributed/`](allreduce_distributed/) | One communication domain allocated inside the orchestration via `orch.allocate_domain`, with PTO-ISA remote reads over the domain window. |
+| [`allreduce_ring_distributed/`](allreduce_ring_distributed/) | Same domain/window setup as mesh allreduce; **chunked ring RS+AG** (`2(P−1)` rounds, one chunk per step) instead of O(P) full-vector remote reads. |
 | [`allgather_distributed/`](allgather_distributed/) | One communication domain via `orch.allocate_domain`; each rank stages its slice, synchronizes across ranks, then gathers every rank's window data into a full output. |
 | [`reduce_scatter_distributed/`](reduce_scatter_distributed/) | One communication domain via `orch.allocate_domain`; each rank stages all input chunks, synchronizes, then reduces the per-rank chunk across peers into a rank-local output. |
 | [`broadcast_distributed/`](broadcast_distributed/) | One communication domain via `orch.allocate_domain`; root stages into the window, synchronizes, then every rank reads the root's scratch slot into its output. |

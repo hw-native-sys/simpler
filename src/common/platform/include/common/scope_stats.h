@@ -15,8 +15,8 @@
  *
  * Two ScopeStatsRecords are produced per scope — one at scope_begin and one at
  * scope_end — each carrying the task/heap ring start/end and the tensormap
- * live-entry count sampled at that boundary, tagged with a phase flag. Records
- * stream off the device in
+ * live-entry count sampled at that boundary, plus the scheduler-published
+ * dep_pool tail/top snapshot tagged with a phase flag. Records stream off the device in
  * fixed-capacity buffers, mirroring PMU / dep_gen / tensor_dump / l2_swimlane (the
  * single source of mgmt-loop truth is
  * src/common/platform/include/host/profiler_base.h):
@@ -69,9 +69,11 @@ extern "C" {
 // touches its own ring (ring_id = min(scope_depth, PTO2_MAX_RING_DEPTH-1)), so
 // a single ring's start/end is stored rather than a per-ring array.
 //
-// For both rings, end-start is the live span: task_end-task_start is in-flight
-// tasks, heap_end-heap_start is bytes in use. tensormap is a free-list pool
-// (not a ring), so its current live-entry count is stored directly.
+// For the ring resources, end-start is the live span: task_end-task_start is
+// in-flight tasks, heap_end-heap_start is bytes in use, and
+// dep_pool_end-dep_pool_start is live dependency-list entries. tensormap is a
+// free-list pool (not a ring), so its current live-entry count is stored
+// directly.
 //
 // Field order keeps the uint64 heap pointers 8-byte aligned with no internal
 // padding.
@@ -86,6 +88,8 @@ struct ScopeStatsRecord {
     int32_t site_line;
     int32_t task_start;      // Task ring tail (last_task_alive).
     int32_t task_end;        // Task ring head (next task id).
+    int32_t dep_pool_start;  // Dep-list pool tail snapshot.
+    int32_t dep_pool_end;    // Dep-list pool top snapshot.
     int32_t tensormap_used;  // tensormap pool live-entry count (not a ring).
     int16_t depth;
     int16_t ring_id;  // Ring whose start/end this record carries.
@@ -154,10 +158,10 @@ struct ScopeStatsDataHeader {
     // (scope_stats_set_ring_capacity / scope_stats_set_tensormap_capacity).
     // Host needs them to render the "used/cap" ratio without a separate query.
     int32_t task_window_cap[PTO2_SCOPE_STATS_MAX_RING_DEPTH];
+    int32_t dep_pool_cap[PTO2_SCOPE_STATS_MAX_RING_DEPTH];
     uint64_t heap_cap[PTO2_SCOPE_STATS_MAX_RING_DEPTH];
     int32_t tensormap_cap;
     volatile uint32_t fatal_latched;  // AICPU sets to 1 on first fatal.
-    uint32_t _pad[2];
 } __attribute__((aligned(64)));
 
 // =============================================================================

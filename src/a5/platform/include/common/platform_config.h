@@ -157,18 +157,24 @@ constexpr int PLATFORM_PROF_BUFFERS_PER_CORE = 8;
 constexpr int PLATFORM_PROF_BUFFERS_PER_THREAD = 16;
 
 /**
+ * Per-core L2SwimlaneAicoreTaskBuffer pre-allocation count.
+ * 1 goes into the free_queue at init, the rest are recycled by host as
+ * AICPU rotates per BUFFER_SIZE dispatches. Declared here so the ready-queue
+ * formula below can include the AICore-pool worst-case burst depth.
+ */
+constexpr int PLATFORM_AICORE_BUFFERS_PER_CORE = 4;
+
+/**
  * Ready queue capacity for performance data collection
  * Queue holds ReadyQueueEntry structs for buffers ready to be read by Host.
  * Sized to match pre-allocation total across all cores and threads.
  */
-constexpr int PLATFORM_PROF_READYQUEUE_SIZE =
-    PLATFORM_MAX_CORES * PLATFORM_PROF_BUFFERS_PER_CORE + PLATFORM_MAX_AICPU_THREADS * PLATFORM_PROF_BUFFERS_PER_THREAD;
+constexpr int PLATFORM_PROF_READYQUEUE_SIZE = PLATFORM_MAX_CORES * PLATFORM_PROF_BUFFERS_PER_CORE +
+                                              2 * PLATFORM_MAX_AICPU_THREADS * PLATFORM_PROF_BUFFERS_PER_THREAD +
+                                              PLATFORM_MAX_CORES * PLATFORM_AICORE_BUFFERS_PER_CORE;
 
-/**
- * Performance buffer capacity per AICPU thread
- * Maximum number of L2SwimlaneAicpuPhaseRecord entries per L2SwimlaneAicpuPhaseBuffer.
- */
-constexpr int PLATFORM_PHASE_RECORDS_PER_THREAD = 500000;
+// PLATFORM_PHASE_RECORDS_PER_THREAD lives in l2_swimlane_profiling.h (16384) —
+// kept beside the buffer types that use it. Do not redeclare here.
 
 /**
  * System counter frequency (get_sys_cnt)
@@ -255,20 +261,6 @@ constexpr int PLATFORM_DUMP_TIMEOUT_SECONDS = 30;
  * Number of PmuRecord entries per PmuBuffer.
  */
 constexpr int PLATFORM_PMU_RECORDS_PER_BUFFER = 512;
-
-/**
- * Per-core L2Swimlane staging ring depth (AICore-side WIP slots).
- *
- * Must be ≥ the maximum number of in-flight tasks per core (today's
- * dual-issue dispatch keeps this at 2). The ring lives outside the
- * rotating L2SwimlaneAicpuTaskBuffer so AICore's write address never changes mid-run.
- *
- * Indexing uses `task_id % PLATFORM_L2_AICORE_RING_SIZE` (see
- * `l2_swimlane_aicore_record_task`), so non-power-of-two values are correct
- * but compile to an integer divide on the AICore hot path. Prefer a power
- * of two so the compiler reduces the modulo to a mask.
- */
-constexpr int PLATFORM_L2_AICORE_RING_SIZE = 2;
 
 /**
  * Per-core PMU staging ring depth (AICore-side dual-issue slots).

@@ -96,7 +96,7 @@ export SIMPLER_DISPATCHER_SO=$REPO/build/lib/a5/dispatcher/libsimpler_aicpu_disp
 export SIMPLER_AICPU_SPREAD_SO=$REPO/tools/cann-examples/aicpu-thread-spread/device/build/libaicpu_thread_spread.so
 
 # Always run hardware work via task-submit on shared dev boxes (see
-# .claude/rules/task-submit-isolation.md).
+# .claude/rules/running-onboard.md).
 task-submit --device auto --device-num 1 \
     --run "for N in 1 6 7 8 14; do
              echo '====== launch_count='\$N' ======'

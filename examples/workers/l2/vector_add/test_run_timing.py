@@ -41,7 +41,7 @@ def _drive_one_run(platform: str, device_id: int, *, enable_l2_swimlane: bool = 
         device_id=device_id,
     )
     chip_callable = build_chip_callable(platform)
-    chip_cid = worker.register(chip_callable)
+    chip_handle = worker.register(chip_callable)
     worker.init()
     try:
         # Use deterministic inputs so the run never accidentally hits a
@@ -63,7 +63,7 @@ def _drive_one_run(platform: str, device_id: int, *, enable_l2_swimlane: bool = 
         config = CallConfig()
         config.enable_l2_swimlane = enable_l2_swimlane
 
-        timing = worker.run(chip_cid, args, config)
+        timing = worker.run(chip_handle, args, config)
 
         # Verify the output is sane (so we know the kernel actually ran and
         # the timing isn't from an early-error path).

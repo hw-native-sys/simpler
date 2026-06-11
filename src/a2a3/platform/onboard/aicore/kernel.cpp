@@ -119,11 +119,10 @@ extern "C" __global__ __aicore__ void KERNEL_ENTRY(aicore_kernel)(__gm__ KernelA
     if (GET_PROFILING_FLAG(k_args->enable_profiling_flag, PROFILING_FLAG_L2_SWIMLANE) &&
         k_args->l2_swimlane_aicore_rotation_table != 0) {
         // Stash only the slot pointer. The slot CONTENTS are written by
-        // AICPU's `l2_swimlane_aicpu_init` which runs concurrently with this
-        // entry; dereferencing here would race with AICPU's write. The
-        // executor defers the deref via `get_l2_swimlane_aicore_head()` until
-        // inside the first-task branch — by then AICPU has dispatched, so
-        // init is done and the slot is populated.
+        // AICPU's `l2_swimlane_aicpu_init`, which races with this entry but
+        // completes before AICPU sets `aicpu_ready = 1`. The executor
+        // dereferences via `get_l2_swimlane_aicore_head()` only after Phase 1
+        // handshake exit.
         __gm__ uint64_t *head_table = reinterpret_cast<__gm__ uint64_t *>(k_args->l2_swimlane_aicore_rotation_table);
         set_l2_swimlane_aicore_head_slot(&head_table[block_idx]);
     } else {

@@ -12,6 +12,7 @@
 
 #include <algorithm>
 #include <cinttypes>
+#include <limits>
 
 #include "common.h"  // debug_assert
 #include "common/unified_log.h"
@@ -79,20 +80,18 @@ int SchedulerContext::pop_ready_tasks_batch(
     extern uint64_t g_sched_pop_atomic_count[], g_sched_pop_wait_cycle[];
     uint64_t t_pop_start = get_sys_cnt_aicpu();
     int count = sched_->get_ready_tasks_batch(
-        shape, local_buf, out, max_count, g_sched_pop_atomic_count[thread_idx], g_sched_pop_wait_cycle[thread_idx],
-        l2_swimlane.local_dispatch_count
+        shape, local_buf, out, max_count, g_sched_pop_atomic_count[thread_idx], g_sched_pop_wait_cycle[thread_idx]
     );
     l2_swimlane.sched_dispatch_pop_cycle += (get_sys_cnt_aicpu() - t_pop_start);
 #else
     int count = sched_->get_ready_tasks_batch(shape, local_buf, out, max_count);
 #endif
-    // pop_hit / pop_miss are PTO2_PROFILING-gated (not the inner verbose tier)
-    // so dispatch-phase records in aicpu_scheduler_phases[] carry queue-health
-    // stats on default builds.
-    if (count > 0) {
-        l2_swimlane.pop_hit += count;
-    } else {
-        l2_swimlane.pop_miss++;
+    if (l2_swimlane_level_ >= L2SwimlaneLevel::SCHED_PHASES) {
+        if (count > 0) {
+            l2_swimlane.pop_hit += count;
+        } else {
+            l2_swimlane.pop_miss++;
+        }
     }
 #else
     (void)thread_idx;
@@ -154,20 +153,10 @@ void SchedulerContext::dispatch_subtask_to_core(
         core_exec_state.pending_subslot = subslot;
         core_exec_state.pending_slot_state = &slot_state;
         core_exec_state.pending_reg_task_id = static_cast<int32_t>(reg_task_id);
-#if PTO2_PROFILING
-        if (l2_swimlane_level_ >= L2SwimlaneLevel::AICPU_TIMING) {
-            core_exec_state.pending_dispatch_timestamp = get_sys_cnt_aicpu();
-        }
-#endif
     } else {
         core_exec_state.running_subslot = subslot;
         core_exec_state.running_slot_state = &slot_state;
         core_exec_state.running_reg_task_id = static_cast<int32_t>(reg_task_id);
-#if PTO2_PROFILING
-        if (l2_swimlane_level_ >= L2SwimlaneLevel::AICPU_TIMING) {
-            core_exec_state.running_dispatch_timestamp = get_sys_cnt_aicpu();
-        }
-#endif
         tracker.change_core_state(core_offset);
     }
 
@@ -180,11 +169,34 @@ void SchedulerContext::dispatch_subtask_to_core(
         core_offset, core_id, reg_task_id
     );
 
+    // AICore buffer rotation lives on the dispatch path: count this dispatch
+    // and rotate before write_reg when we're about to cross a BUFFER_SIZE
+    // boundary. The completion-before-dispatch invariant makes this race-free.
+#if PTO2_PROFILING
+    if (l2_swimlane_level_ != L2SwimlaneLevel::DISABLED) {
+        l2_swimlane_aicpu_on_aicore_dispatch(core_id, thread_idx);
+    }
+#endif
+
     // Publish task data (slot_state / args writes done above) before AICore
     // can observe the dispatched task_id. ARM64 needs an explicit store-store
     // fence across Normal-cacheable -> Device-nGnRnE; the old write_reg()
     // helper provided this implicitly via __sync_synchronize.
     wmb();
+
+    // Capture dispatch timestamp at the latest possible moment — after wmb,
+    // immediately before the DATA_MAIN_BASE write.
+#if PTO2_PROFILING
+    if (l2_swimlane_level_ >= L2SwimlaneLevel::AICPU_TIMING) {
+        uint64_t dispatch_ts = get_sys_cnt_aicpu();
+        if (to_pending) {
+            core_exec_state.pending_dispatch_timestamp = dispatch_ts;
+        } else {
+            core_exec_state.running_dispatch_timestamp = dispatch_ts;
+        }
+    }
+#endif
+
     write_reg(core_exec_state.reg_addr, RegId::DATA_MAIN_BASE, static_cast<uint64_t>(reg_task_id));
     tracker.set_pending_occupied(core_offset);
 }
@@ -352,23 +364,9 @@ void SchedulerContext::dispatch_ready_tasks(
     };
     const PTO2ResourceShape *aic_aiv = kAicAivOrder[thread_idx & 1];
 
-#if PTO2_SCHED_PROFILING
-    auto &l2_swimlane = sched_l2_swimlane_[thread_idx];
-#endif
-
-    // Note: flush_local_bufs is invoked multiple times per pass (mid-function
-    // flush + RAII tail flush). local_overflow_count accumulates each batch
-    // separately — each entry is counted exactly once (count is zeroed after
-    // push_batch). The total reflects "entries this pass pushed to the global
-    // queue", which is slightly larger than the pre-refactor "buf residual at
-    // pass end" semantics — comparing PTO2_SCHED_PROFILING traces across
-    // commits, expect the post-refactor number to be greater-or-equal.
     auto flush_local_bufs = [&]() {
         for (int32_t s = 0; s < PTO2_NUM_RESOURCE_SHAPES; s++) {
             auto &lb = local_bufs[s];
-#if PTO2_SCHED_PROFILING
-            l2_swimlane.local_overflow_count += lb.count;
-#endif
             if (lb.count > 0) {
                 sched_->ready_queues[s].push_batch(lb.slot_states, lb.count);
                 lb.count = 0;
@@ -532,6 +530,63 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
     l2_swimlane.sched_start_ts = get_sys_cnt_aicpu();
 #endif
 
+#if PTO2_PROFILING
+    // Queue-depth snapshot carried across the iteration boundary: each phase
+    // emit consumes (phase_start_*) and refreshes them with its own end snapshot
+    // so the next phase's "at_start" equals the previous phase's "at_end".
+    //
+    // L2SWIMLANE_NUM_QUEUE_SHAPES (3) matches PTO2_NUM_RESOURCE_SHAPES: AIC/AIV/MIX.
+    //
+    // **Hot-path cost discipline.** Local depth (this thread's PTO2LocalReadyBuffer)
+    // is a single int read on a register-cached stack — free. Shared depth
+    // (PTO2ReadyQueue::size) is two atomic relaxed loads against cache lines
+    // that all peer sched threads also write to (enqueue_pos and dequeue_pos
+    // bounce on every flush_local_bufs + every pop). With both phases emitting
+    // per iter that's 12 cross-core loads × thousands of iters per run, a
+    // measurable AICPU slowdown. Mitigation: lazy + per-iter cached shared
+    // snapshot, refreshed at most once per iteration. The complete-emit and
+    // dispatch-emit in the same iter both reuse the same shared sample; the
+    // big transitions (local→shared flush) still show up across iter boundaries.
+    static_assert(
+        L2SWIMLANE_NUM_QUEUE_SHAPES == PTO2_NUM_RESOURCE_SHAPES,
+        "queue snapshot width must match runtime resource shape count"
+    );
+    int16_t phase_start_local[L2SWIMLANE_NUM_QUEUE_SHAPES] = {0};
+    int16_t phase_start_shared[L2SWIMLANE_NUM_QUEUE_SHAPES] = {0};
+    int16_t iter_shared_snapshot[L2SWIMLANE_NUM_QUEUE_SHAPES] = {0};
+    bool iter_shared_sampled = false;
+    auto capture_local_snapshot = [&](int16_t local_out[L2SWIMLANE_NUM_QUEUE_SHAPES]) {
+        for (int s = 0; s < L2SWIMLANE_NUM_QUEUE_SHAPES; s++) {
+            local_out[s] = static_cast<int16_t>(local_bufs[s].count);
+        }
+    };
+    auto get_or_sample_shared = [&]() -> const int16_t * {
+        if (!iter_shared_sampled) {
+            // Clamp to int16_t max before narrowing. PTO2_PROF_READYQUEUE_SIZE
+            // is in the low thousands today but could grow with platform
+            // scaling — without clamp, sizes above 32767 wrap to negatives
+            // and silently corrupt the snapshot.
+            constexpr size_t kMax = static_cast<size_t>(std::numeric_limits<int16_t>::max());
+            for (int s = 0; s < L2SWIMLANE_NUM_QUEUE_SHAPES; s++) {
+                const size_t qsize = sched_->ready_queues[s].size();
+                iter_shared_snapshot[s] = static_cast<int16_t>(std::min(qsize, kMax));
+            }
+            iter_shared_sampled = true;
+        }
+        return iter_shared_snapshot;
+    };
+    auto capture_phase_end = [&](int16_t local_out[L2SWIMLANE_NUM_QUEUE_SHAPES],
+                                 int16_t shared_out[L2SWIMLANE_NUM_QUEUE_SHAPES]) {
+        capture_local_snapshot(local_out);
+        const int16_t *shared_cached = get_or_sample_shared();
+        for (int s = 0; s < L2SWIMLANE_NUM_QUEUE_SHAPES; s++)
+            shared_out[s] = shared_cached[s];
+    };
+    if (l2_swimlane_level_ >= L2SwimlaneLevel::SCHED_PHASES) {
+        capture_phase_end(phase_start_local, phase_start_shared);
+    }
+#endif
+
     // Wall-clock timestamp of the last completed task on this thread.
     // Updated on made_progress; consulted to decide whether the wall-clock
     // budget for declaring a scheduler hang has elapsed. Initialized to
@@ -548,6 +603,11 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
         CYCLE_COUNT_START();
         l2_swimlane.sched_loop_count++;
         uint64_t _t0_phase = _t0;
+        // Per-iter lazy shared-queue snapshot: first phase emit in this iter
+        // pays the atomic-load cost, subsequent emits in the same iter reuse
+        // the cached value. Reset here so we re-sample exactly once per iter
+        // (or skip entirely on iters with no phase emit).
+        iter_shared_sampled = false;
 #endif
         int32_t task_count = 0;
         if (!tracker.has_any_running_cores()) {
@@ -627,10 +687,24 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
         } else {
             CYCLE_COUNT_LAP(l2_swimlane.sched_complete_cycle);
             if (l2_swimlane_level_ >= L2SwimlaneLevel::SCHED_PHASES && l2_swimlane.phase_complete_count > 0) {
-                l2_swimlane_aicpu_record_phase(
-                    thread_idx, L2SwimlaneAicpuPhaseId::SCHED_COMPLETE, _t0_phase, _t1, l2_swimlane.sched_loop_count,
-                    l2_swimlane.phase_complete_count
+                // Local depth is cheap (this thread's own buffer counter).
+                // Shared depth is NOT sampled here: complete's release_fanin
+                // pushes to local_bufs in the fast path (try_push succeeds
+                // until cap=64). Shared only changes on dispatch's flush
+                // path. Carrying phase_start_shared forward as end_shared
+                // is the right answer 99% of the time AND skips three
+                // contended atomic loads per emit.
+                int16_t phase_end_local[L2SWIMLANE_NUM_QUEUE_SHAPES];
+                capture_local_snapshot(phase_end_local);
+                l2_swimlane_aicpu_record_sched_phase(
+                    thread_idx, L2SwimlaneSchedPhaseKind::Complete, _t0_phase, _t1, l2_swimlane.sched_loop_count,
+                    l2_swimlane.phase_complete_count, /*pop_hit=*/0, /*pop_miss=*/0, phase_start_local,
+                    phase_start_shared, phase_end_local, phase_start_shared
                 );
+                for (int s = 0; s < L2SWIMLANE_NUM_QUEUE_SHAPES; s++) {
+                    phase_start_local[s] = phase_end_local[s];
+                    // phase_start_shared unchanged — carried forward
+                }
                 _t0_phase = _t1;
                 l2_swimlane.phase_complete_count = 0;
             }
@@ -711,8 +785,8 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
         } else {
             CYCLE_COUNT_LAP(l2_swimlane.sched_dispatch_cycle);
             if (l2_swimlane_level_ >= L2SwimlaneLevel::SCHED_PHASES && l2_swimlane.phase_dispatch_count > 0) {
-                // Per-emit pop deltas via snapshot diff; the cumulative
-                // pop_hit / pop_miss stay intact for the cold-path log.
+                // Final-drain at loop end emits the trailing-idle tail so
+                // sum-of-deltas == run-cumulative.
                 uint64_t pop_hit_delta = l2_swimlane.pop_hit - l2_swimlane.pop_hit_at_last_emit;
                 uint64_t pop_miss_delta = l2_swimlane.pop_miss - l2_swimlane.pop_miss_at_last_emit;
                 // L2SwimlaneAicpuPhaseRecord's extras are uint32 — a delta that overflows means
@@ -720,11 +794,19 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
                 // realistic dispatch cadence and silently truncates without this guard.
                 debug_assert(pop_hit_delta < (1ULL << 32));
                 debug_assert(pop_miss_delta < (1ULL << 32));
-                l2_swimlane_aicpu_record_phase(
-                    thread_idx, L2SwimlaneAicpuPhaseId::SCHED_DISPATCH, _t0_phase, _t1, l2_swimlane.sched_loop_count,
+                int16_t phase_end_local[L2SWIMLANE_NUM_QUEUE_SHAPES];
+                int16_t phase_end_shared[L2SWIMLANE_NUM_QUEUE_SHAPES];
+                capture_phase_end(phase_end_local, phase_end_shared);
+                l2_swimlane_aicpu_record_sched_phase(
+                    thread_idx, L2SwimlaneSchedPhaseKind::Dispatch, _t0_phase, _t1, l2_swimlane.sched_loop_count,
                     l2_swimlane.phase_dispatch_count, static_cast<uint32_t>(pop_hit_delta),
-                    static_cast<uint32_t>(pop_miss_delta)
+                    static_cast<uint32_t>(pop_miss_delta), phase_start_local, phase_start_shared, phase_end_local,
+                    phase_end_shared
                 );
+                for (int s = 0; s < L2SWIMLANE_NUM_QUEUE_SHAPES; s++) {
+                    phase_start_local[s] = phase_end_local[s];
+                    phase_start_shared[s] = phase_end_shared[s];
+                }
                 _t0_phase = _t1;
                 l2_swimlane.phase_dispatch_count = 0;
                 l2_swimlane.pop_hit_at_last_emit = l2_swimlane.pop_hit;
@@ -794,12 +876,9 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
             SPIN_WAIT_HINT();
 #if PTO2_PROFILING
             CYCLE_COUNT_LAP(l2_swimlane.sched_idle_cycle);
-            if (l2_swimlane_level_ >= L2SwimlaneLevel::SCHED_PHASES) {
-                l2_swimlane_aicpu_record_phase(
-                    thread_idx, L2SwimlaneAicpuPhaseId::SCHED_IDLE_WAIT, _t0_phase, _t1, l2_swimlane.sched_loop_count, 0
-                );
-                _t0_phase = _t1;
-            }
+            // a2a3 design has Complete + Dispatch sched phases only; idle gaps
+            // are reconstructed at post-process time from sched record spacing.
+            (void)_t0_phase;
 #endif
         }
     }
@@ -831,9 +910,13 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
         debug_assert(final_pop_miss_delta < (1ULL << 32));
         if (final_pop_hit_delta != 0 || final_pop_miss_delta != 0) {
             uint64_t t_now = get_sys_cnt_aicpu();
-            l2_swimlane_aicpu_record_phase(
-                thread_idx, L2SwimlaneAicpuPhaseId::SCHED_DISPATCH, t_now, t_now, l2_swimlane.sched_loop_count, 0,
-                static_cast<uint32_t>(final_pop_hit_delta), static_cast<uint32_t>(final_pop_miss_delta)
+            int16_t phase_end_local[L2SWIMLANE_NUM_QUEUE_SHAPES];
+            int16_t phase_end_shared[L2SWIMLANE_NUM_QUEUE_SHAPES];
+            capture_phase_end(phase_end_local, phase_end_shared);
+            l2_swimlane_aicpu_record_sched_phase(
+                thread_idx, L2SwimlaneSchedPhaseKind::Dispatch, t_now, t_now, l2_swimlane.sched_loop_count, 0,
+                static_cast<uint32_t>(final_pop_hit_delta), static_cast<uint32_t>(final_pop_miss_delta),
+                phase_end_local, phase_end_shared, phase_end_local, phase_end_shared
             );
             l2_swimlane.pop_hit_at_last_emit = l2_swimlane.pop_hit;
             l2_swimlane.pop_miss_at_last_emit = l2_swimlane.pop_miss;
@@ -848,7 +931,7 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
             thread_idx, core_trackers_[thread_idx].core_ids(), core_trackers_[thread_idx].core_num()
         );
         if (l2_swimlane_level_ >= L2SwimlaneLevel::SCHED_PHASES) {
-            l2_swimlane_aicpu_flush_phase_buffers(thread_idx);
+            l2_swimlane_aicpu_flush_sched_phase_buffer(thread_idx);
         }
     }
 #endif

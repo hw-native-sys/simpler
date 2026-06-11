@@ -102,14 +102,12 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, in
     bool dump_tensor_enabled = GET_PROFILING_FLAG(enable_profiling_flag, PROFILING_FLAG_DUMP_TENSOR);
     bool pmu_enabled = GET_PROFILING_FLAG(enable_profiling_flag, PROFILING_FLAG_PMU);
 
-    // Per-core L2SwimlaneActiveHead channel. The pointer to THIS core's rotation
-    // is stored in `KernelArgs::l2_swimlane_aicore_rotation_table[block_idx]`, but AICPU
-    // populates that table inside `l2_swimlane_aicpu_init` which runs
-    // concurrently with this kernel's entry — so we cannot deref at startup.
-    // Defer the deref via `get_l2_swimlane_aicore_head()` until the first task is
-    // dispatched; by then AICPU's init has completed (the very dispatch is
-    // proof of that).
-    __gm__ L2SwimlaneActiveHead *l2_swimlane_head = nullptr;
+    // Per-core L2SwimlaneActiveHead channel. AICPU completes
+    // `l2_swimlane_aicpu_init` before writing `aicpu_ready = 1` in
+    // `handshake_all_cores`, and Phase 1 above has already observed
+    // `aicpu_ready == 1`, so the rotation-table slot is populated and the
+    // first deref is safe here — off the dispatch→start critical path.
+    __gm__ L2SwimlaneActiveHead *l2_swimlane_head = l2_swimlane_enabled ? get_l2_swimlane_aicore_head() : nullptr;
     // cached_buf_seq must start != AICPU's initial head.current_buf_seq (0)
     // so the first record_task observes a mismatch and loads the buffer ptr.
     L2SwimlaneAicoreLocalState l2_swimlane_local = {nullptr, UINT32_MAX, 0};
@@ -135,13 +133,6 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, in
 
         {
             uint32_t task_id = reg_val;  // Decode: register holds task_id directly
-
-            // First-task lazy resolve of the rotation channel — see comment
-            // above. `get_l2_swimlane_aicore_head()` caches after first call so this
-            // costs nothing on subsequent tasks.
-            if (l2_swimlane_enabled && l2_swimlane_head == nullptr) {
-                l2_swimlane_head = get_l2_swimlane_aicore_head();
-            }
 
             // Select dual-buffer slot: same bit as AICPU used when writing payload
             __gm__ PTO2DispatchPayload *exec_payload = payload + (task_id & 1u);
@@ -170,10 +161,26 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, in
                 pipe_barrier(PIPE_ALL);
             }
 
-            // Performance profiling: record task execution
+            // Performance profiling: record task execution.
+            // Two identity fields go into the record (different roles):
+            //   - task_token_raw (PTO2 ring/local) is pulled from the dispatch
+            //     payload's LocalContext.async_ctx — already in AICore cache
+            //     from the just-completed task, no extra GM load. Host uses
+            //     it as the canonical task identity for JSON output / ring
+            //     decoding.
+            //   - reg_task_id is `task_id` (= reg_val, the per-core dispatch
+            //     token AICore just read from DATA_MAIN_BASE). Per-dispatch
+            //     unique within this core; host uses it as the join key
+            //     against the AICPU record stream. Required for correctness
+            //     under SPMD (block_num > num_cores) and MIX cluster spread,
+            //     where multiple dispatches of the same task share the same
+            //     task_token_raw.
             if (l2_swimlane_enabled) {
                 uint64_t end_time = get_sys_cnt_aicore();
-                l2_swimlane_aicore_record_task(l2_swimlane_head, &l2_swimlane_local, task_id, start_time, end_time);
+                uint64_t task_token_raw = exec_payload->local_context.async_ctx.task_token.raw;
+                l2_swimlane_aicore_record_task(
+                    l2_swimlane_head, &l2_swimlane_local, task_token_raw, task_id, start_time, end_time
+                );
             }
 
             last_reg_val = reg_val;

@@ -34,11 +34,13 @@
  *      (the slot pointer — NOT the dereferenced head pointer yet) via
  *      `set_l2_swimlane_aicore_head_slot()`, and calls `set_aicore_profiling_flag()`,
  *      before invoking `aicore_execute`.
- *   3. `get_l2_swimlane_aicore_head()` lazily dereferences the slot the first
- *      time it is called. Callers must defer the call until AFTER AICPU has
- *      dispatched the first task (so AICPU init has had a chance to populate
- *      the table). The executor handles this by calling it inside the main
- *      loop's first-task branch.
+ *   3. `get_l2_swimlane_aicore_head()` dereferences the slot on first use and
+ *      caches the result. Callers must defer the first call until AFTER the
+ *      Phase 1 handshake (`aicpu_ready == 1`): AICPU's `l2_swimlane_aicpu_init`
+ *      runs before it sets `aicpu_ready = 1`, so Phase 1 exit is the
+ *      slot-populated guarantee. The executor resolves the head right after
+ *      handshake exit so the first-task dispatch→start path carries no
+ *      resolve work.
  */
 
 #ifndef PLATFORM_AICORE_AICORE_PROFILING_STATE_H_
@@ -67,13 +69,11 @@ __aicore__ uint32_t get_aicore_profiling_flag();
  * yet have populated the table (the host launches both kernels and AICPU's
  * init runs concurrently with AICore's entry).
  *
- * `get_l2_swimlane_aicore_head()` lazily dereferences the stashed slot on
- * first use, caches the result, and returns it on subsequent calls. Callers
- * MUST defer the first call until after AICPU has dispatched the first task —
- * by then AICPU's init has completed and the slot holds a valid device
- * address pointing at the AICore pool's `head` (an `L2SwimlaneActiveHead`).
- * The executor's main loop honours this by reading the head only inside the
- * first-task branch of the dispatch poll.
+ * `get_l2_swimlane_aicore_head()` dereferences the stashed slot on first use,
+ * caches the result, and returns the cached pointer on subsequent calls.
+ * Callers MUST defer the first call until after AICPU has set
+ * `aicpu_ready = 1` (Phase 1 handshake exit), since AICPU's
+ * `l2_swimlane_aicpu_init` populates the slot before that signal.
  */
 __aicore__ void set_l2_swimlane_aicore_head_slot(__gm__ uint64_t *slot_ptr);
 __aicore__ __gm__ L2SwimlaneActiveHead *get_l2_swimlane_aicore_head();

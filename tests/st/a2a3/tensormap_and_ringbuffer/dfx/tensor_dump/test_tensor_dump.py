@@ -111,12 +111,18 @@ class TestTensorDump(SceneTestCase):
         with manifest.open() as f:
             data = json.load(f)
         bin_name = data.get("bin_file")
-        assert bin_name, f"manifest missing bin_file field: {data}"
-        bin_path = dump_dir / bin_name
-        assert bin_path.exists(), f"manifest names bin_file={bin_name!r} but {bin_path} not found"
         tensors = data.get("tensors", [])
         assert tensors, f"tensor_dump.json has no entries: {data}"
-        assert bin_path.stat().st_size > 0, "tensor_dump.bin is empty"
+        if level == 3:
+            # full_json_only: metadata only, no payload and no .bin file.
+            assert bin_name is None, f"level 3 manifest should have bin_file=null: {data}"
+            assert not (dump_dir / "tensor_dump.bin").exists(), "level 3 must not write tensor_dump.bin"
+            assert all(t.get("bin_size") == 0 for t in tensors), tensors
+        else:
+            assert bin_name, f"manifest missing bin_file field: {data}"
+            bin_path = dump_dir / bin_name
+            assert bin_path.exists(), f"manifest names bin_file={bin_name!r} but {bin_path} not found"
+            assert bin_path.stat().st_size > 0, "tensor_dump.bin is empty"
 
         # Unified manifest (#792): tensors and scalar args share one
         # tensor_dump.json keyed by a "kind" field; no separate args files.
@@ -144,7 +150,7 @@ class TestTensorDump(SceneTestCase):
             # Selective mode also confines scalar-arg dumps to the marked tasks.
             assert {t["task_id"] for t in scalar_entries} <= task_ids, scalar_entries
         else:
-            # Full (level 2): markers ignored — every one of the 5 tasks is dumped.
+            # Full (level 2 or 3): markers ignored — every one of the 5 tasks is dumped.
             assert len(task_ids) >= 5, f"full dump should cover all 5 tasks, got {sorted(task_ids)}"
 
         # ---- Tool smoke: dump_viewer ----

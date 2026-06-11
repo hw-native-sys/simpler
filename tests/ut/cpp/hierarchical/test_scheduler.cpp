@@ -34,7 +34,7 @@
 // ---------------------------------------------------------------------------
 // MockMailboxWorker: in-process stand-in for the forked Python child loop.
 //
-// The production dispatch path writes (callable, config, args_blob) into a
+// The production dispatch path writes (callable digest, config, args_blob) into a
 // MAILBOX_SIZE-byte shared region and spin-polls TASK_DONE; the real child
 // (`_chip_process_loop` in python/simpler/worker.py) decodes the mailbox and
 // dispatches to a `ChipWorker`. For unit testing the Scheduler / WorkerManager
@@ -43,7 +43,7 @@
 // test thread releases it via `complete()`.
 //
 // API parity with the previous MockWorker:
-//   - dispatched[i].callable / .tensor_key — recorded on TASK_READY
+//   - dispatched[i].callable_hash0 / .tensor_key — recorded on TASK_READY
 //   - is_running                            — atomic flag the test polls
 //   - wait_running()                        — spin-wait until is_running flips
 //   - complete()                            — release the parked dispatch so
@@ -52,7 +52,7 @@
 
 struct MockMailboxWorker {
     struct Record {
-        uint64_t callable;
+        uint8_t callable_hash0;
         uint64_t tensor_key;  // first tensor's `data` field (unique per submit in tests)
     };
 
@@ -131,21 +131,21 @@ private:
             if (stop_flag.load(std::memory_order_acquire)) return;
             MailboxState s = read_state();
             if (s == MailboxState::TASK_READY) {
-                uint64_t callable = 0;
-                std::memcpy(&callable, mailbox.data() + MAILBOX_OFF_CALLABLE, sizeof(uint64_t));
+                uint8_t callable_hash0 = static_cast<uint8_t>(mailbox[MAILBOX_OFF_TASK_CALLABLE_HASH]);
                 int32_t t_count = 0;
-                std::memcpy(&t_count, mailbox.data() + MAILBOX_OFF_ARGS, sizeof(int32_t));
+                std::memcpy(&t_count, mailbox.data() + MAILBOX_OFF_TASK_ARGS_BLOB, sizeof(int32_t));
                 uint64_t tensor_key = 0;
                 if (t_count > 0) {
                     ContinuousTensor first{};
                     std::memcpy(
-                        &first, mailbox.data() + MAILBOX_OFF_ARGS + TASK_ARGS_BLOB_HEADER_SIZE, sizeof(ContinuousTensor)
+                        &first, mailbox.data() + MAILBOX_OFF_TASK_ARGS_BLOB + TASK_ARGS_BLOB_HEADER_SIZE,
+                        sizeof(ContinuousTensor)
                     );
                     tensor_key = first.data;
                 }
                 {
                     std::lock_guard<std::mutex> lk(dispatched_mu);
-                    dispatched.push_back({callable, tensor_key});
+                    dispatched.push_back({callable_hash0, tensor_key});
                 }
                 is_running.store(true, std::memory_order_release);
 
@@ -194,6 +194,12 @@ static TaskArgs single_tensor_args(uint64_t data_ptr, TensorArgType tag) {
     t.dtype = DataType::UINT8;
     a.add_tensor(t, tag);
     return a;
+}
+
+static CallableIdentity C(uint8_t seed) {
+    CallableIdentity c;
+    c.digest.fill(seed);
+    return c;
 }
 
 // ---------------------------------------------------------------------------
@@ -267,13 +273,13 @@ struct SchedulerFixture : public ::testing::Test {
 
 TEST_F(SchedulerFixture, IndependentTaskDispatchedAndConsumed) {
     auto args_a = single_tensor_args(0xCAFE, TensorArgType::OUTPUT);
-    auto res = orch.submit_next_level(42, args_a, cfg);
+    auto res = orch.submit_next_level(C(42), args_a, cfg);
     TaskSlot slot = res.task_slot;
 
     mock_worker.wait_running();
     ASSERT_GE(mock_worker.dispatched_count(), 1);
     EXPECT_EQ(mock_worker.dispatched[0].tensor_key, 0xCAFEu);
-    EXPECT_EQ(mock_worker.dispatched[0].callable, 42u);
+    EXPECT_EQ(mock_worker.dispatched[0].callable_hash0, 42u);
 
     mock_worker.complete();
     wait_consumed(slot);
@@ -281,14 +287,14 @@ TEST_F(SchedulerFixture, IndependentTaskDispatchedAndConsumed) {
 
 TEST_F(SchedulerFixture, DependentTaskDispatchedAfterProducerCompletes) {
     auto args_a = single_tensor_args(0xBEEF, TensorArgType::OUTPUT);
-    auto a = orch.submit_next_level(10, args_a, cfg);
+    auto a = orch.submit_next_level(C(10), args_a, cfg);
 
     auto args_b = single_tensor_args(0xBEEF, TensorArgType::INPUT);
-    auto b = orch.submit_next_level(11, args_b, cfg);
+    auto b = orch.submit_next_level(C(11), args_b, cfg);
     EXPECT_EQ(S(b.task_slot).state.load(), TaskState::PENDING);
 
     mock_worker.wait_running();
-    EXPECT_EQ(mock_worker.dispatched[0].callable, 10u);
+    EXPECT_EQ(mock_worker.dispatched[0].callable_hash0, 10u);
     mock_worker.complete();  // A done
 
     auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(300);
@@ -296,7 +302,7 @@ TEST_F(SchedulerFixture, DependentTaskDispatchedAfterProducerCompletes) {
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
     ASSERT_GE(mock_worker.dispatched_count(), 2);
-    EXPECT_EQ(mock_worker.dispatched[1].callable, 11u);
+    EXPECT_EQ(mock_worker.dispatched[1].callable_hash0, 11u);
 
     mock_worker.complete();  // B done
     wait_consumed(b.task_slot);
@@ -375,7 +381,7 @@ TEST_F(GroupSchedulerFixture, GroupDispatchesToNWorkers) {
     TaskArgs a0 = single_tensor_args(0xA0, TensorArgType::OUTPUT);
     TaskArgs a1 = single_tensor_args(0xA1, TensorArgType::OUTPUT);
 
-    auto res = orch.submit_next_level_group(42, {a0, a1}, cfg);
+    auto res = orch.submit_next_level_group(C(42), {a0, a1}, cfg);
     TaskSlot slot = res.task_slot;
 
     worker_a.wait_running();
@@ -400,7 +406,7 @@ TEST_F(GroupSchedulerFixture, GroupDispatchesToNWorkers) {
 TEST_F(GroupSchedulerFixture, GroupCompletesOnlyWhenAllDone) {
     TaskArgs a0 = single_tensor_args(0xB0, TensorArgType::OUTPUT);
     TaskArgs a1 = single_tensor_args(0xB1, TensorArgType::OUTPUT);
-    auto res = orch.submit_next_level_group(42, {a0, a1}, cfg);
+    auto res = orch.submit_next_level_group(C(42), {a0, a1}, cfg);
     TaskSlot slot = res.task_slot;
 
     worker_a.wait_running();
@@ -491,7 +497,7 @@ TEST_F(MixedTypeSchedulerFixture, SubTaskDispatchesWhileNextLevelPoolSaturated) 
     // Submit a next-level task; the only chip worker begins running it and
     // stays blocked until we call complete() on it.
     auto chip_args = single_tensor_args(0xAAA, TensorArgType::OUTPUT);
-    auto chip = orch.submit_next_level(20, chip_args, cfg);
+    auto chip = orch.submit_next_level(C(20), chip_args, cfg);
     next_level_worker.wait_running();
     ASSERT_TRUE(next_level_worker.is_running.load());
 
@@ -501,7 +507,7 @@ TEST_F(MixedTypeSchedulerFixture, SubTaskDispatchesWhileNextLevelPoolSaturated) 
     // queues (Strict-4) it must dispatch immediately to the idle sub
     // worker.
     auto sub_args = single_tensor_args(0xBBB, TensorArgType::OUTPUT);
-    auto sub = orch.submit_sub(/*callable_id=*/7, sub_args);
+    auto sub = orch.submit_sub(C(7), sub_args);
 
     sub_worker.wait_running();
     EXPECT_TRUE(sub_worker.is_running.load());
@@ -522,10 +528,10 @@ TEST_F(GroupSchedulerFixture, GroupDependencyChain) {
     // Task B reads INPUT at the same key -- depends on group A.
     TaskArgs a0 = single_tensor_args(0xCAFE, TensorArgType::OUTPUT);
     TaskArgs a1 = single_tensor_args(0xCAFE, TensorArgType::OUTPUT);
-    auto a = orch.submit_next_level_group(42, {a0, a1}, cfg);
+    auto a = orch.submit_next_level_group(C(42), {a0, a1}, cfg);
 
     auto args_b = single_tensor_args(0xCAFE, TensorArgType::INPUT);
-    auto b = orch.submit_next_level(42, args_b, cfg);
+    auto b = orch.submit_next_level(C(42), args_b, cfg);
     EXPECT_EQ(S(b.task_slot).state.load(), TaskState::PENDING);
 
     worker_a.wait_running();
