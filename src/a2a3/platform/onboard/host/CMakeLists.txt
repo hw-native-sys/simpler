@@ -160,11 +160,13 @@ endif()
 # Link against CANN runtime libraries
 # ascend_hal is dynamically loaded at runtime via dlopen in device_runner
 # when performance profiling is enabled
+# HCCL entry points are weak symbols in CANN's hccl_comm.h. Keep libhcomm
+# in DT_NEEDED even when the x86 toolchain defaults to --as-needed.
 target_link_libraries(host_runtime
     PRIVATE
         runtime
         ascendcl
-        ${HCCL_LINK_TARGETS}
+        -Wl,--push-state,--no-as-needed,${HCCL_LINK_TARGETS},--pop-state
         dl
 )
 
