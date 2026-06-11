@@ -70,9 +70,9 @@ endif()
 # Create shared library (host-compatible for dlopen)
 add_library(aicpu_kernel SHARED ${AICPU_SOURCES})
 
-option(WERROR "Treat compiler warnings as errors" OFF)
-if(DEFINED ENV{CI})
-    set(WERROR ON)
+option(WERROR "Treat compiler warnings as errors" ON)
+if(DEFINED ENV{SIMPLER_DISABLE_WARNINGS_AS_ERRORS})
+    set(WERROR OFF)
 endif()
 
 # Compile options (host g++/gcc)
