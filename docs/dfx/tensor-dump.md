@@ -26,9 +26,11 @@ saw, without the timing distortion of inline printing.
 - **Manifest + binary payload.** `--dump-tensor` writes a JSON
   manifest plus one `.bin` payload per run; tensor entries carry
   `bin_offset` / `bin_size`, while scalar entries stay manifest-only.
-- **Unified scalar args.** Scalar callable slots are emitted as
+- **Unified scalar args.** Scalar values are emitted as
   `kind: scalar`, `stage: before_dispatch`, zero-dim records in
-  `tensor_dump.json`; there is no separate args-only manifest.
+  `tensor_dump.json`; there is no separate args-only manifest. Their
+  final `dtype` is registered at submit time in a dump-only per-task side table
+  and resolved by AICPU when writing each scalar dump record.
 - **Cross-architecture.** Same flags and on-disk layout family on
   `a2a3` and `a5`. Both runtimes are wired through.
 
@@ -274,8 +276,9 @@ What you can read out of `tensor_dump.json` + `tensor_dump.bin`:
 - **Per-task input snapshots** (`role: input`, `stage:
   before_dispatch`) — what each kernel was given.
 - **Per-dispatch scalar args** (`kind: scalar`, `stage:
-  before_dispatch`) — the raw callable-slot scalar values AICPU
-  handed to the kernel.
+  before_dispatch`) — the raw per-task scalar-slot values AICPU
+  handed to the kernel, tagged with the dump-only dtype captured at
+  submit time.
 - **Per-task output snapshots** (`role: output`, `stage:
   after_completion`) — what each kernel produced. The barrier
   ensures these reflect the kernel's final writes.
@@ -284,8 +287,8 @@ What you can read out of `tensor_dump.json` + `tensor_dump.bin`:
 - **Logical view reconstruction** — `shape` / `strides` /
   `start_offset` / `is_contiguous` plus the gathered
   logical-contiguous payload.
-- **Per-task identity** — `task_id` / `subtask_id` / `func_id`
-  correlates dump entries with swimlane and PMU rows.
+- **Per-task identity** — `task_id`, `stage`, `role`, and `arg_index`
+  identify each dumped argument within a task.
 - **Loss accounting** — `truncated` / `overwritten` per-record
   flags, plus aggregate `dropped_records` / `dropped_overwrite` in
   the summary.
@@ -361,10 +364,13 @@ Each runtime's scheduler dispatch code calls
 └──────────────────────────────────────┘
 ```
 
-`dump_tensors_for_task` walks the formal callable signature,
-matches each non-scalar slot to a `TensorDumpInfo` (dtype + shape +
-strides + start offset + device address), and calls
-`dump_tensor_record` for slots that match the current stage.
+`dump_tensors_for_task` walks the formal callable signature for
+non-scalar tensor slots, matches each tensor slot to a
+`TensorDumpInfo` (dtype + shape + strides + start offset + device
+address), and calls `dump_tensor_record` for slots that match the
+current stage. Scalar values are dumped separately from the flat
+payload `scalars[]`; their dtype table is registered at submit time
+and emitted as a dump-only metadata record at `BEFORE_DISPATCH`.
 
 When dump is enabled, AICore executors also issue
 `pipe_barrier(PIPE_ALL)` after kernel execution and before writing

@@ -51,8 +51,11 @@ DTYPE_INFO = {
     "int64": ("q", 8),
     "uint64": ("Q", 8),
     "int16": ("h", 2),
+    "uint16": ("H", 2),
     "int8": ("b", 1),
     "uint8": ("B", 1),
+    "uint32": ("I", 4),
+    "bool": ("?", 1),
 }
 
 
@@ -103,6 +106,7 @@ def write_tensor(tensor: dict, bin_path: Path, out):
     out.write(f"# stage: {t['stage']}\n")
     out.write(f"# arg_index: {t['arg_index']}\n")
     out.write(f"# dtype: {t['dtype']}\n")
+    out.write(f"# kind: {t.get('kind', 'tensor')}\n")
     out.write(f"# is_contiguous: {t['is_contiguous']}\n")
     out.write(f"# shape: {t['shape']}\n")
     out.write(f"# strides: {t['strides']}\n")
@@ -113,6 +117,13 @@ def write_tensor(tensor: dict, bin_path: Path, out):
         return
     if t.get("truncated"):
         out.write("# DATA TRUNCATED (tensor too large for arena)\n")
+
+    if t.get("kind") == "scalar":
+        val = t.get("value")
+        if t.get("dtype", "").upper() == "BOOL":
+            val = "true" if val else "false"
+        out.write(f"# value: {val}\n")
+        return
 
     bin_size = t.get("bin_size", 0)
     if bin_size == 0:
