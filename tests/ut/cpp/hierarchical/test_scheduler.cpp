@@ -570,6 +570,29 @@ TEST_F(GroupSchedulerFixture, GroupFailureWaitsForRunningMembersThenConsumes) {
     EXPECT_EQ(S(slot).state.load(), TaskState::CONSUMED);
 }
 
+TEST_F(GroupSchedulerFixture, InvalidGroupIndexFailsAndConsumesGroup) {
+    TaskArgs a0 = single_tensor_args(0xD0, TensorArgType::OUTPUT);
+    TaskArgs a1 = single_tensor_args(0xD1, TensorArgType::OUTPUT);
+    auto res = orch.submit_next_level_group(C(42), {a0, a1}, cfg);
+    TaskSlot slot = res.task_slot;
+
+    worker_a.wait_running();
+    worker_b.wait_running();
+
+    WorkerCompletion bad;
+    bad.task_slot = slot;
+    bad.group_index = 99;
+    bad.outcome = EndpointOutcome::ENDPOINT_FAILURE;
+    bad.error_message = "bad completion index";
+    sched.worker_done(std::move(bad));
+
+    wait_consumed(slot);
+    EXPECT_EQ(S(slot).state.load(), TaskState::CONSUMED);
+
+    worker_a.complete();
+    worker_b.complete();
+}
+
 TEST_F(GroupSchedulerFixture, EndpointEligibilityRestrictsIdleSelection) {
     TaskArgs args = single_tensor_args(0xE0, TensorArgType::OUTPUT);
     auto res = orch.submit_next_level(C(55), args, cfg, -1, {1});

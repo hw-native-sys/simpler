@@ -80,14 +80,15 @@ void Scheduler::worker_done(WorkerCompletion completion) {
                 s.group_member_states.assign(static_cast<size_t>(group_size), GroupMemberState::NOT_DISPATCHED);
                 s.group_member_outcomes.assign(static_cast<size_t>(group_size), EndpointOutcome::SKIPPED);
             }
-            if (completion.group_index < 0 || completion.group_index >= group_size) {
+            bool invalid_group_index = completion.group_index < 0 || completion.group_index >= group_size;
+            if (invalid_group_index) {
                 terminal.outcome = EndpointOutcome::ENDPOINT_FAILURE;
                 terminal.error_message = "Scheduler::worker_done: group_index " +
                                          std::to_string(completion.group_index) + " out of range for group_size " +
                                          std::to_string(group_size);
             }
 
-            int32_t index = terminal.group_index;
+            int32_t index = invalid_group_index ? -1 : terminal.group_index;
             if (index >= 0 && index < group_size) {
                 GroupMemberState &member_state = s.group_member_states[static_cast<size_t>(index)];
                 if (is_terminal_group_state(member_state)) return;
@@ -115,7 +116,8 @@ void Scheduler::worker_done(WorkerCompletion completion) {
             if (s.group_failed) {
                 for (int32_t i = 0; i < group_size; ++i) {
                     GroupMemberState &member_state = s.group_member_states[static_cast<size_t>(i)];
-                    if (member_state != GroupMemberState::NOT_DISPATCHED) continue;
+                    if (is_terminal_group_state(member_state)) continue;
+                    if (!invalid_group_index && member_state != GroupMemberState::NOT_DISPATCHED) continue;
                     member_state = GroupMemberState::SKIPPED;
                     s.group_member_outcomes[static_cast<size_t>(i)] = EndpointOutcome::SKIPPED;
                     s.group_terminal_count.fetch_add(1, std::memory_order_acq_rel);
