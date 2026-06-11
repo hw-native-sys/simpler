@@ -63,6 +63,11 @@ message(STATUS "AICpu kernel: ${NUM_AICPU_KERNEL_SOURCES} source files")
 message(VERBOSE "AICpu kernel sources: ${AICPU_KERNEL_SOURCES}")
 add_library(aicpu_kernel SHARED ${AICPU_KERNEL_SOURCES})
 
+option(WERROR "Treat compiler warnings as errors" OFF)
+if(DEFINED ENV{CI})
+    set(WERROR ON)
+endif()
+
 # Compile options (common to both C and C++)
 target_compile_options(aicpu_kernel
     PRIVATE
@@ -71,6 +76,7 @@ target_compile_options(aicpu_kernel
         -rdynamic
         -O3
         -fPIC
+        $<$<BOOL:${WERROR}>:-Werror>
         -Wno-error=variadic-macros
         -fno-common
         -g
