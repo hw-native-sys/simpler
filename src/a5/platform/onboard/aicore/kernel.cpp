@@ -18,6 +18,7 @@
 #include "common/l2_swimlane_profiling.h"
 #include "common/platform_config.h"
 #include "common/pmu_profiling.h"
+#include "simt_anchor.h"
 
 class Runtime;
 
@@ -153,6 +154,17 @@ extern "C" __global__ __aicore__ void KERNEL_ENTRY(aicore_kernel)(__gm__ KernelA
         set_aicore_pmu_ring(nullptr);
         set_aicore_pmu_reg_base(0);
     }
+
+#ifdef __DAV_VEC__
+    // SIMT classification anchor (AIV only). Never executes —
+    // `force_simt_anchor` is always 0 — but the compiler cannot prove the
+    // GM-loaded condition false, so the never-taken SIMT launch survives DCE
+    // and bisheng auto-emits this entry's SIMT meta TLVs (UB size + AIV type)
+    // that runtime reads at register time. See simt_anchor.h.
+    if (k_args->force_simt_anchor) {
+        simt_meta_anchor(reinterpret_cast<__gm__ uint32_t *>(k_args));
+    }
+#endif
 
     aicore_execute(k_args->runtime_args, block_idx, core_type);
 }

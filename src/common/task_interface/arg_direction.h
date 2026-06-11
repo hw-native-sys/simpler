@@ -36,6 +36,18 @@ inline constexpr int CORE_MAX_SCALAR_ARGS = 32;
 inline constexpr int CHIP_MAX_SCALAR_ARGS = 128;
 inline constexpr uint32_t CALLABLE_ALIGN = 64;
 
+// Minimum alignment of a child kernel binary's device address within a
+// ChipCallable. The device address is
+//   chip_dev + offsetof(ChipCallable, storage_) + child_offset(i)
+//            + CoreCallable::binary_data_offset()
+// and child_offset / binary_data_offset are already CALLABLE_ALIGN (64)
+// multiples, so this value only constrains offsetof(storage_). It is driven
+// by the strictest device-side fetch requirement: a5 SIMT vector intrinsics
+// (e.g. mscatter) require a 16-byte-aligned code address. Must stay >=
+// alignof(CoreCallable) (8, from its uint64 resolved_addr_) so aligning
+// storage_ to it never weakens child reference alignment. Powers of two only.
+inline constexpr uint32_t CALLABLE_CHILD_ALIGN = 16;
+
 static inline uint32_t callable_align_up(uint32_t size) { return (size + CALLABLE_ALIGN - 1) & ~(CALLABLE_ALIGN - 1); }
 
 inline const char *arg_direction_name(ArgDirection d) {
