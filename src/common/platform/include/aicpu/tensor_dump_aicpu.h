@@ -189,6 +189,51 @@ inline void dump_tensors_for_task(
     }
 }
 
+// Dump the OUTPUT tensors of every task still RUNNING on a core, for the
+// scheduler-hang / timeout path. These tasks never reached completion, so their
+// AFTER_COMPLETION output was never captured; reading the current GM contents
+// shows how far each stuck kernel got and how much output it wrote.
+//
+// Best-effort: only AICore writes already drained to GM are visible (the stuck
+// core issued no pipe_barrier, so writes still in its cache are not), and a read
+// may be torn if the core is mid-write. Records go into thread_idx's dump buffer
+// and ride out on its dump_tensor_flush.
+//
+// The runtime supplies its own core/slot accessors so this stays platform-side
+// and reusable across runtimes:
+//   get_running_slot(cid)   -> SlotState* for the task running on core cid, or
+//                              nullptr if idle. A cluster's cores share one
+//                              SlotState pointer; pointer identity is used to
+//                              emit each running task exactly once.
+//   is_subtask_active / get_function_bin_addr — same callbacks as
+//   dump_tensors_for_task.
+template <int MaxSubtaskSlots, typename GetRunningSlotFn, typename IsSubtaskActiveFn, typename GetFunctionBinAddrFn>
+inline void dump_running_task_outputs(
+    int32_t thread_idx, int32_t cores_total_num, GetRunningSlotFn get_running_slot, IsSubtaskActiveFn is_subtask_active,
+    GetFunctionBinAddrFn get_function_bin_addr
+) {
+    for (int32_t cid = 0; cid < cores_total_num; cid++) {
+        auto *running = get_running_slot(cid);
+        if (running == nullptr) {
+            continue;
+        }
+        // Dedup: let the lowest-id core of each running task drive the dump.
+        bool already_dumped = false;
+        for (int32_t prev = 0; prev < cid; prev++) {
+            if (get_running_slot(prev) == running) {
+                already_dumped = true;
+                break;
+            }
+        }
+        if (already_dumped) {
+            continue;
+        }
+        dump_tensors_for_task<MaxSubtaskSlots>(
+            thread_idx, *running, TensorDumpStage::AFTER_COMPLETION, is_subtask_active, get_function_bin_addr
+        );
+    }
+}
+
 template <typename TensorInfoT>
 inline void dump_tensors_for_task(
     int32_t thread_idx, uint64_t task_id, int32_t task_arg_count, const CoreCallable &callable,

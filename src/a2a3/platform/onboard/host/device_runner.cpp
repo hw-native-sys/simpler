@@ -400,6 +400,15 @@ int DeviceRunner::run(Runtime &runtime, int block_dim, int launch_aicpu_num) {
         // run, so attempt recovery / mark-unusable here too, not only on the
         // launch-error path above.
         recover_device_or_mark_unusable(rc);
+        // On an AICPU-detected scheduler hang the device flushed its diagnostic
+        // buffers during emergency_shutdown before returning the timeout rc.
+        // Export them here too — otherwise the success-only teardown below is
+        // skipped and the dumped tensors (the stuck task's inputs plus every
+        // completed task's in/out) are streamed to .bin but left without the
+        // JSON manifest, i.e. unusable for triage. reconcile/export are not
+        // idempotent, so this runs only on the error return; the success path
+        // still exports exactly once below.
+        teardown_shared_collectors_after_run();
         return rc;
     }
 

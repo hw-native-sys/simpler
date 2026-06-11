@@ -60,7 +60,15 @@ constexpr int32_t FATAL_ERROR_CHECK_INTERVAL = 1024;  // Check orchestrator erro
 // same iteration count. The fast spinner racing ahead and latching fatal
 // kills the slower-but-correct poller mid-poll — see the distributed
 // startup-skew scenario in issue #897.
-constexpr int32_t SCHEDULER_TIMEOUT_MS = 5000;  // 5 s; > worst observed distributed-init skew + HCCL wait
+//
+// The value is set *below* the STARS AICore op-execution timeout
+// (PLATFORM_OP_EXECUTE_TIMEOUT_US, 3 s) on purpose: the AICPU must detect a hang
+// and flush its diagnostics (tensor dump, in-flight partial output) before STARS
+// reaps the op and poisons the context. Chain: this < op-exec < host stream-sync
+// (platform_config.h). Trade-off: 2 s is shorter than the worst distributed-init
+// / HCCL skew #897 sized 5 s for, so a slow distributed startup can false-latch;
+// if that bites, raise this together with the op-exec / stream-sync timeouts.
+constexpr int32_t SCHEDULER_TIMEOUT_MS = 2000;  // 2 s; < op-exec so the AICPU dumps before STARS reaps
 constexpr uint64_t SCHEDULER_TIMEOUT_CYCLES =
     static_cast<uint64_t>(SCHEDULER_TIMEOUT_MS) * (PLATFORM_PROF_SYS_CNT_FREQ / 1000);
 constexpr int32_t STALL_DUMP_READY_MAX = 8;

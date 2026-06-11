@@ -832,6 +832,52 @@ viewer's working directory differs from the run's. Pass the
 explicit dump-dir path to the viewer:
 `python -m simpler_setup.tools.dump_viewer outputs/<case>_<ts>/tensor_dump`.
 
+**The run hung (AICore op-timeout / scheduler timeout) — is there
+still a dump?** Yes, and it includes the hung kernel's own partial
+output. The host exports the manifest even though `run()` returns the
+timeout error, and you get the inputs of every dispatched task
+(captured at `BEFORE_DISPATCH`) plus the `AFTER_COMPLETION` output of
+every task that completed before the hang. This rests on the timeout
+ordering — the three budgets are tuned so the **AICPU detects the
+hang first**, dumps, and only then the hardware/host timeouts fire:
+
+```text
+SCHEDULER_TIMEOUT_MS (2 s)  <  PLATFORM_OP_EXECUTE_TIMEOUT_US (3 s)  <  PLATFORM_STREAM_SYNC_TIMEOUT_MS (4 s)
+   AICPU declares hang,          STARS reaps the AICore op            host stream sync gives up
+   flushes + dumps in-flight     and poisons the context              and surfaces the error
+```
+
+- **Device-side graceful flush (primary).** At 2 s of no progress
+  the AICPU declares the hang, runs the end-of-loop flush, *and*
+  dumps the **partial output** of every task still RUNNING on a core
+  — written at the `after_completion` stage, reflecting current GM,
+  so you can see how far a stuck kernel got and how much it wrote.
+  Because this fires ~1 s before STARS reaps the op (3 s), it
+  normally completes while the kernel is still wedged (and host-side
+  recovery below backstops the rest). Best-effort:
+  only AICore writes already drained to GM are visible (the stuck
+  core issued no `pipe_barrier`, so writes still in its cache are
+  not), and a read may be torn if the core is mid-write. To tell a
+  running task's partial output apart from a genuine completion,
+  cross-reference the `[STALL …] state=RUNNING` / `SHUTDOWN_SNAPSHOT`
+  log lines — those task_ids are the in-flight ones.
+- **Host-side recovery (backstop).** If the AICPU is killed before
+  it finishes flushing (it loses the race, or `emergency_shutdown`
+  blocks on the wedged core), its last buffer is left un-flushed on
+  the device (`current_buf_ptr != 0`). The host's `reconcile_counters`
+  detects this and recovers those records directly from the device
+  buffer + arena (the device is not reset until *after* the export),
+  so whatever the AICPU managed to record — including in-flight
+  output written before the kill — still reaches the manifest.
+
+This ordering is load-bearing: if the timeouts were inverted (STARS
+reaping before the AICPU's budget, as in earlier versions), the
+device-side dump would never run on a real AICore hang and you would
+only recover what was already in the buffer. The chain lives in
+`scheduler_types.h` (`SCHEDULER_TIMEOUT_MS`) and `platform_config.h`
+(`PLATFORM_OP_EXECUTE_TIMEOUT_US` / `PLATFORM_STREAM_SYNC_TIMEOUT_MS`),
+along with the `#897` distributed-skew trade-off.
+
 ## 9. Related docs
 
 - [profiling-framework.md](../profiling-framework.md) — shared

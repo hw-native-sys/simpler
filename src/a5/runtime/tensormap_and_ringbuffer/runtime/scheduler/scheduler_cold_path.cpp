@@ -18,6 +18,7 @@
 #include "aicpu/l2_swimlane_collector_aicpu.h"
 #include "aicpu/platform_regs.h"
 #include "aicpu/pmu_collector_aicpu.h"
+#include "aicpu/tensor_dump_aicpu.h"
 #include "common/memory_barrier.h"
 #include "common/l2_swimlane_profiling.h"
 #include "common/platform_config.h"
@@ -381,6 +382,24 @@ int32_t SchedulerContext::handle_timeout_exit(
     latch_scheduler_error(header, thread_idx, PTO2_ERROR_SCHEDULER_TIMEOUT);
     if (!completed_.exchange(true, std::memory_order_acq_rel)) {
         log_shutdown_stall_snapshot(thread_idx, idle_iterations, last_progress_count);
+#if PTO2_PROFILING
+        // Capture the in-flight kernels' partial output before signalling the
+        // cores to exit, so the dump reflects the live stuck state.
+        if (is_dump_tensor_enabled()) {
+            dump_running_task_outputs<PTO2_SUBTASK_SLOT_COUNT>(
+                thread_idx, cores_total_num_,
+                [this](int32_t cid) {
+                    return core_exec_states_[cid].running_slot_state;
+                },
+                [](ActiveMask active_mask, int raw_subtask_id) {
+                    return active_mask.subtask_active(static_cast<PTO2SubtaskSlot>(raw_subtask_id));
+                },
+                [this](int32_t func_id) {
+                    return get_function_bin_addr(func_id);
+                }
+            );
+        }
+#endif
         emergency_shutdown(runtime);
     }
 #if PTO2_PROFILING
