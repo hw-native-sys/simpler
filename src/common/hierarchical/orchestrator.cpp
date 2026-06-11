@@ -603,9 +603,7 @@ void Orchestrator::scope_end() {
 // Reference release helpers
 // =============================================================================
 
-void Orchestrator::release_ref(TaskSlot slot) {
-    try_consume(slot);
-}
+void Orchestrator::release_ref(TaskSlot slot) { try_consume(slot); }
 
 void Orchestrator::try_consume(TaskSlot slot) {
     TaskSlotState &s = slot_state(slot);
