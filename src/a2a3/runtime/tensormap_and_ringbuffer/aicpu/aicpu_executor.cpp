@@ -175,6 +175,8 @@ int32_t AicpuExecutor::init(Runtime *runtime) {
         return 0;
     }
 
+    INSTRUMENTATION_MARK_SET(g_TraCR_thread_idx, Initializing, uint32_t(sched_getcpu()));
+
     LOG_INFO_V0("AicpuExecutor: Initializing");
 
     if (runtime == nullptr) {
@@ -243,6 +245,8 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
             DeviceOrchestrationBindRuntimeFunc *p_bind = &orch_so_table_[callable_id].bind;
             DeviceOrchestrationConfigFunc *p_config_func = &orch_so_table_[callable_id].config_func;
             const bool reload_so = runtime->register_new_callable_id();
+
+            INSTRUMENTATION_MARK_SET(g_TraCR_thread_idx, DLL_loading, 0);
 
             if (reload_so) {
                 LOG_INFO_V0("Thread %d: New orch SO detected (callable_id=%d), (re)loading", thread_idx, callable_id);
@@ -435,6 +439,8 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
                 LOG_INFO_V0("Thread %d: No config function, using defaults", thread_idx);
             }
 
+            INSTRUMENTATION_MARK_SET(g_TraCR_thread_idx, Allocating, 0);
+
             // sm_handle / rt are bound to *this* run's memory and must be
             // (re)created every run, regardless of whether the SO itself was
             // reused above.
@@ -576,6 +582,7 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
 #if PTO2_PROFILING
             orch_cycle_start = get_sys_cnt_aicpu();
 #endif
+            INSTRUMENTATION_MARK_SET(g_TraCR_thread_idx, Orchestrating, thread_idx);
             framework_bind_runtime(rt);
             if (*p_bind != nullptr) {
                 (*p_bind)(rt);
@@ -713,6 +720,7 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
         if (rt == nullptr) {
             LOG_ERROR("Thread %d: rt is null after orchestrator error, skipping dispatch", thread_idx);
         } else {
+            INSTRUMENTATION_MARK_SET(g_TraCR_thread_idx, Scheduling, thread_idx);
             sched_ctx_.bind_runtime(rt);
             int32_t completed = sched_ctx_.resolve_and_dispatch(runtime, thread_idx);
             if (completed < 0) {
@@ -727,6 +735,7 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
     // Always shutdown AICore — even if sched_ctx_.completed_ was already true.
     // platform_deinit_aicore_regs is idempotent; orchestrator threads have
     // core_trackers_[thread_idx].core_num() == 0 so they skip the loop harmlessly.
+    INSTRUMENTATION_MARK_SET(g_TraCR_thread_idx, De_Initializing, 0);
     int32_t shutdown_rc = sched_ctx_.shutdown(thread_idx);
     if (shutdown_rc != 0 && run_rc == 0) {
         run_rc = shutdown_rc;
@@ -872,12 +881,6 @@ extern "C" int32_t aicpu_execute(Runtime *runtime) {
     }
 
     LOG_INFO_V0("%s", "aicpu_execute: Starting AICPU kernel execution");
-
-    // Watch out, basicly hardcoded, we assume the all four threads to lie on each CPU on the same NUMA domain
-    // if (sched_getcpu() <= 3) {
-    //     LOG_ERROR("DynTileFwkBackendKernelServer: Scheduling thread is in the wrong NUMA domain! aicpu_thread_num=%d sched_getcpu=%d", runtime->aicpu_thread_num, sched_getcpu());
-    //     return -1;
-    // }
 
     // INIT TraCR all threads coming in
     TRACR_START();
