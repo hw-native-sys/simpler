@@ -38,11 +38,6 @@
 #include "pto_runtime2_types.h"
 #include "pto_shared_memory.h"
 
-#if PTO2_PROFILING
-// Strong def in scope_stats_collector_aicpu.cpp; weak fallback in pto_scheduler.cpp for host/UT builds.
-extern "C" bool is_scope_stats_enabled();
-#endif
-
 #if PTO2_SCHED_PROFILING
 #include "aicpu/device_time.h"
 #define PTO2_SCHED_CYCLE_START() uint64_t _st0 = get_sys_cnt_aicpu(), _st1

@@ -38,6 +38,12 @@ static ScopeStatsDataHeader *s_scope_stats_header = nullptr;
 static ScopeStatsBufferState *s_scope_stats_state = nullptr;
 static int s_orch_thread_idx = -1;  // set via scope_stats_aicpu_set_orch_thread_idx
 
+// Cumulative heap-ring wrap counts per ring, indexed by SCOPE_STATS_HEAP_SIDE_*.
+// Fed by the runtime via scope_stats_note_heap_wrap at each wrap; used to unroll
+// the boundary-sampled wrapping offsets into monotonic values (see
+// unroll_heap_offset). Reset in set_platform_scope_stats_base.
+static uint64_t s_heap_wraps[PTO2_SCOPE_STATS_MAX_RING_DEPTH][2] = {};
+
 namespace {
 
 const char *s_pending_site_file = nullptr;
@@ -45,6 +51,9 @@ int32_t s_pending_site_line = 0;
 
 const char *s_scope_site_file[PTO2_SCOPE_STATS_MAX_SCOPE_DEPTH] = {};
 int32_t s_scope_site_line[PTO2_SCOPE_STATS_MAX_SCOPE_DEPTH] = {};
+// Ring id of each open scope, recorded at scope_stats_begin. Lets a heap-wrap
+// report (which carries no ring id) be attributed to the current scope's ring.
+int s_scope_ring[PTO2_SCOPE_STATS_MAX_SCOPE_DEPTH] = {};
 
 inline const char *basename_of(const char *path) {
     if (!path) return "(unknown)";
@@ -164,6 +173,16 @@ void switch_buffer() {
     wmb();
 }
 
+// Unroll a wrapping heap byte offset into a monotonic value using the
+// accumulated wrap count for this ring/side and the registered heap capacity.
+// With monotonic heap_start/heap_end, every host-side delta (real_occupancy,
+// scope_alloc, high-water) is an exact subtraction regardless of wrap count.
+inline uint64_t unroll_heap_offset(uint64_t offset, int ring_id, int side) {
+    if (s_scope_stats_header == nullptr) return offset;
+    if (ring_id < 0 || ring_id >= PTO2_SCOPE_STATS_MAX_RING_DEPTH) return offset;
+    return offset + s_heap_wraps[ring_id][side] * s_scope_stats_header->heap_cap[ring_id];
+}
+
 // Append one record carrying the task/heap ring start/end and tensormap usage,
 // tagged with the current depth/site and the boundary phase. Called once per
 // scope boundary.
@@ -204,8 +223,8 @@ void append_record_snapshot(
     rec.dep_pool_start = dep_pool_start;
     rec.dep_pool_end = dep_pool_end;
     rec.tensormap_used = tensormap_used;
-    rec.heap_start = heap_start;
-    rec.heap_end = heap_end;
+    rec.heap_start = unroll_heap_offset(heap_start, ring_id, SCOPE_STATS_HEAP_SIDE_RECLAIM);
+    rec.heap_end = unroll_heap_offset(heap_end, ring_id, SCOPE_STATS_HEAP_SIDE_ALLOC);
     buf->count = idx + 1;
 }
 
@@ -237,6 +256,8 @@ extern "C" void set_platform_scope_stats_base(uint64_t scope_stats_data_base) {
     s_pending_site_line = 0;
     memset(s_scope_site_file, 0, sizeof(s_scope_site_file));
     memset(s_scope_site_line, 0, sizeof(s_scope_site_line));
+    memset(s_scope_ring, 0, sizeof(s_scope_ring));
+    memset(s_heap_wraps, 0, sizeof(s_heap_wraps));
 }
 
 void scope_stats_aicpu_set_orch_thread_idx(int thread_idx) { s_orch_thread_idx = thread_idx; }
@@ -287,6 +308,7 @@ extern "C" void scope_stats_begin(
     int32_t d = ++scope_stats_depth;
     s_scope_site_file[d] = s_pending_site_file;
     s_scope_site_line[d] = s_pending_site_line;
+    s_scope_ring[d] = ring_id;
     s_pending_site_file = nullptr;
     s_pending_site_line = 0;
     append_record_snapshot(
@@ -337,4 +359,13 @@ scope_stats_set_ring_capacity(int ring_id, int32_t window_cap, uint64_t heap_cap
 extern "C" void scope_stats_set_tensormap_capacity(int32_t cap) {
     if (!s_scope_stats_header) return;
     s_scope_stats_header->tensormap_cap = cap;
+}
+
+extern "C" void scope_stats_note_heap_wrap(int side) {
+    if (!scope_stats_enabled) return;
+    if (scope_stats_depth < 0) return;  // wrap outside any scope — unattributable
+    if (side != SCOPE_STATS_HEAP_SIDE_ALLOC && side != SCOPE_STATS_HEAP_SIDE_RECLAIM) return;
+    int ring_id = s_scope_ring[scope_stats_depth];
+    if (ring_id < 0 || ring_id >= PTO2_SCOPE_STATS_MAX_RING_DEPTH) return;
+    s_heap_wraps[ring_id][side] += 1;
 }

@@ -42,6 +42,13 @@
 #include "pto_shared_memory.h"
 #include "common/unified_log.h"
 
+#if PTO2_PROFILING
+// Heap-ring wrap reporting — the allocator is the only place each individual
+// wrap is observable, so it notifies the scope_stats collector here. Gated:
+// pays nothing (no include, no call) when profiling is compiled out.
+#include "aicpu/scope_stats_collector_aicpu.h"
+#endif
+
 // Block notification interval (in spin counts)
 #define PTO2_BLOCK_NOTIFY_INTERVAL 10000
 // Alloc spin limit - after this, report deadlock and exit
@@ -253,8 +260,19 @@ private:
         last_alive_seen_ = last_alive;
 
         PTO2TaskDescriptor &desc = descriptors_[(last_alive - 1) & window_mask_];
+        uint64_t old_tail = heap_tail_;
         heap_tail_ =
             static_cast<uint64_t>(static_cast<char *>(desc.packed_buffer_end) - static_cast<char *>(heap_base_));
+#if PTO2_PROFILING
+        // Reclaim pointer moves forward monotonically in ring order; a decrease
+        // means it wrapped past heap_size_ (occupancy < heap_size_ guarantees at
+        // most one wrap per call). Report it so scope_stats can unroll.
+        if (is_scope_stats_enabled() && heap_tail_ < old_tail) {
+            scope_stats_note_heap_wrap(SCOPE_STATS_HEAP_SIDE_RECLAIM);
+        }
+#else
+        (void)old_tail;
+#endif
     }
 
     /**
@@ -282,6 +300,12 @@ private:
                 );
                 result = heap_base_;
                 heap_top_ = alloc_size;
+#if PTO2_PROFILING
+                // Allocation pointer just wrapped past heap_size_; report it so
+                // scope_stats can unroll the wrapping offset into a monotonic value.
+                // The collector attributes the wrap to the current scope's ring.
+                if (is_scope_stats_enabled()) scope_stats_note_heap_wrap(SCOPE_STATS_HEAP_SIDE_ALLOC);
+#endif
             } else {
                 LOG_DEBUG(
                     "try_bump_heap failed (top>=tail): top=%" PRIu64 ", tail=%" PRIu64 ", alloc=%" PRIu64
