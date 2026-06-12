@@ -284,7 +284,11 @@ class RuntimeCompiler:
                     dest_dir.mkdir(parents=True, exist_ok=True)
                     dest_dispatcher = dest_dir / dispatcher_name
                     shutil.copy2(dispatcher_so, dest_dispatcher)
-                    subprocess.run(["strip", "-s", str(dest_dispatcher)], check=True)
+                    # Cross-arch strip: aicpu .so is aarch64 even on x86 host;
+                    # GNU strip 2.38 on Ubuntu 22.04 cannot read it. Prefer
+                    # llvm-strip (multi-arch) when available.
+                    strip_bin = shutil.which("llvm-strip") or "strip"
+                    subprocess.run([strip_bin, "-s", str(dest_dispatcher)], check=True)
             if output_dir is not None:
                 od = Path(output_dir)
                 od.mkdir(parents=True, exist_ok=True)

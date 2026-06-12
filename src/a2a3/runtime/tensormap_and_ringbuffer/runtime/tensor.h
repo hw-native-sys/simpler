@@ -347,20 +347,33 @@ struct alignas(64) Tensor {
     /// Updates start_offset += Σ off[i]·strides[i]; shapes := new_shape; stride unchanged.
     /// Each (offset[i], new_shape[i]) must stay within the current shapes[i] —
     /// i.e. a view cannot expand any dimension beyond what the parent view sees.
+    /// Exception: a zero-size view (any new_shape[i] == 0) captures no bytes,
+    /// so out-of-range offsets are harmless and accepted as a no-op. Codegen
+    /// relies on this to clamp dynamic context-length / sequence-position
+    /// offsets that can run past the parent tensor — it emits guards of the
+    /// form ``(off >= shape ? 0 : min(...))`` to set the SHAPE dim and leaves
+    /// the OFFSET dim as the raw (possibly out-of-range) value, expecting the
+    /// runtime to honour the empty-view contract.
     Tensor view(const uint32_t view_shapes[], const uint32_t view_offsets[], bool in_manual_dep = false) const {
         Tensor result;
         // Copy line 1 only; stride from *this is still in result's line 2 garbage
         // — we need to bring it forward explicitly since view keeps stride.
         result.init_from_line1(*this);
+        bool empty = false;
         for (uint32_t i = 0; i < ndims; i++) {
-            debug_assert(view_offsets[i] + view_shapes[i] <= shapes[i]);
-            result.start_offset += static_cast<uint64_t>(view_offsets[i]) * static_cast<uint64_t>(strides[i]);
+            if (view_shapes[i] == 0) { empty = true; break; }
+        }
+        for (uint32_t i = 0; i < ndims; i++) {
+            if (!empty) {
+                debug_assert(view_offsets[i] + view_shapes[i] <= shapes[i]);
+                result.start_offset += static_cast<uint64_t>(view_offsets[i]) * static_cast<uint64_t>(strides[i]);
+            }
             result.shapes[i] = view_shapes[i];
             result.strides[i] = strides[i];
         }
         result.manual_dep = in_manual_dep;
         result.refresh_derived();
-        result.assert_in_buffer_bounds();
+        if (!empty) result.assert_in_buffer_bounds();
         return result;
     }
 

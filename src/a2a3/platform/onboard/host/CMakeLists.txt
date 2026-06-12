@@ -36,10 +36,17 @@ endif()
 # issue. The SDMA workspace init in comm_hccl.cpp pulls in pto-isa
 # headers and CANN-9.0-only aclnn symbols (aclnnShmemSdmaStarsQuery*),
 # even though it is logically orthogonal to HCCL comm bootstrap and only
-# needed by the sdma_async_completion_demo. Until that coupling is
-# refactored away, the macro is forced ON: PTO_ISA_ROOT and CANN 9.0+ are
-# hard build/runtime preconditions for a2a3 onboard.
-set(SIMPLER_ENABLE_PTO_SDMA_WORKSPACE ON)
+# needed by the sdma_async_completion_demo.
+#
+# Forced OFF: on this driver/CANN the ShmemSdmaStarsQuery AICPU kernel
+# (libcpu_kernels.so::RunCpuKernel) raises an AICPU exception (errorCode
+# 0x2a) during comm bootstrap, which faults the whole chip and cascades
+# every subsequent op to 507899/507018 (notably aclrtIpcMemImportByKey in
+# domain_alloc_via_ipc). The workspace is orthogonal to comm bootstrap and
+# leaving workSpace == 0 is the supported fallback (sync TLOAD/TSTORE and
+# the IPC window path do not need it), so disabling it unblocks multi-rank
+# comm. Re-enable once ShmemSdmaStarsQuery is fixed for the async-SDMA demo.
+set(SIMPLER_ENABLE_PTO_SDMA_WORKSPACE OFF)
 if(NOT DEFINED ENV{PTO_ISA_ROOT})
     message(FATAL_ERROR
         "a2a3 onboard host_runtime requires PTO_ISA_ROOT "
@@ -160,11 +167,16 @@ endif()
 # Link against CANN runtime libraries
 # ascend_hal is dynamically loaded at runtime via dlopen in device_runner
 # when performance profiling is enabled
+# HcclGetRootInfo/HcclCommInitRootInfo are declared weak in CANN's hccl_comm.h.
+# Under a toolchain that defaults to --as-needed (Ubuntu/conda gcc on x86), a
+# weak undefined ref does not mark libhcomm "needed", so its DT_NEEDED is
+# dropped and the symbols resolve to NULL at runtime -> SIGSEGV on the first
+# HcclGetRootInfo call. Force the dependency so it survives any default. See #1018.
 target_link_libraries(host_runtime
     PRIVATE
         runtime
         ascendcl
-        ${HCCL_LINK_TARGETS}
+        -Wl,--no-as-needed ${HCCL_LINK_TARGETS} -Wl,--as-needed
         dl
 )
 
