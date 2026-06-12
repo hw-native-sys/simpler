@@ -45,13 +45,14 @@
 #include "common/platform_config.h"
 #include "common/unified_log.h"
 #include "host/memory_allocator.h"
+#include "host/l3_l2_orch_comm_service.h"
 #include "host/l2_swimlane_collector.h"
 #include "host/tensor_dump_collector.h"
 #include "host/pmu_collector.h"
 #include "host/scope_stats_collector.h"
 #include "runtime.h"
 
-class SimDeviceRunnerBase {
+class SimDeviceRunnerBase : public L3L2OrchCommBackend {
 public:
     SimDeviceRunnerBase() :
         gm_heap_arena_(&arena_alloc_trampoline, &arena_free_trampoline, &mem_alloc_),
@@ -60,7 +61,7 @@ public:
 
     // Public virtual dtor so c_api_shared can `delete` a SimDeviceRunnerBase *
     // (destroy_device_context entrypoint).
-    virtual ~SimDeviceRunnerBase() = default;
+    ~SimDeviceRunnerBase() override = default;
 
     // --- Pure / no-op virtuals dispatched from the shared c_api glue ----
     virtual int run(Runtime &runtime, int block_dim, int launch_aicpu_num = 1) = 0;
@@ -83,6 +84,9 @@ public:
     void free_tensor(void *dev_ptr);
     int copy_to_device(void *dev_ptr, const void *host_ptr, size_t bytes);
     int copy_from_device(void *host_ptr, const void *dev_ptr, size_t bytes);
+
+    int l3_l2_orch_comm_init(void *control_block, size_t control_block_size);
+    int l3_l2_orch_comm_shutdown();
 
     int register_callable(
         int32_t callable_id, const void *orch_so_data, size_t orch_so_size, const char *func_name,
@@ -256,6 +260,17 @@ protected:
     L2SwimlaneLevel l2_swimlane_level_{L2SwimlaneLevel::DISABLED};  // resolved from set_l2_swimlane_enabled()
     PmuEventType pmu_event_type_{PmuEventType::PIPE_UTILIZATION};   // resolved from set_pmu_enabled()
     std::string output_prefix_{};                                   // diagnostic artifact root directory
+
+private:
+    void *l3_l2_allocate_region_bytes(uint64_t bytes) override;
+    void l3_l2_free_region_bytes(void *ptr) override;
+    int l3_l2_copy_to_device(void *dev_ptr, const void *host_ptr, uint64_t bytes) override;
+    int l3_l2_copy_from_device(void *host_ptr, const void *dev_ptr, uint64_t bytes) override;
+    std::thread l3_l2_create_service_thread(std::function<void()> fn) override;
+
+    L3L2OrchCommService l3_l2_orch_comm_service_;
+    std::mutex l3_l2_alloc_mu_;
+    std::unordered_set<void *> l3_l2_allocations_;
 };
 
 namespace simpler::common::sim_host {

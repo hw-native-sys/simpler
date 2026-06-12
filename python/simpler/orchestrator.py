@@ -225,6 +225,12 @@ class Orchestrator:
         """Collective release.  Equivalent to ``handle.release()``."""
         handle.release()
 
+    def create_l3_l2_region(self, *, worker_id: int, payload_bytes: int):
+        """Create an L3-L2 communication region on one NEXT_LEVEL chip worker."""
+        if self._worker is None:
+            raise RuntimeError("create_l3_l2_region requires an Orchestrator bound to a Worker")
+        return self._worker._create_l3_l2_region(int(worker_id), int(payload_bytes))
+
     # ------------------------------------------------------------------
     # Nested scope (Strict-1 per-scope rings)
     # ------------------------------------------------------------------
@@ -292,7 +298,10 @@ class Orchestrator:
         pre-allocating with ``torch.share_memory_()`` — the runtime owns
         the lifecycle.
         """
-        return self._o.alloc(list(shape), dtype)
+        tensor = self._o.alloc(list(shape), dtype)
+        if self._worker is not None:
+            self._worker._register_l3_l2_orch_comm_host_buffer(tensor)
+        return tensor
 
     # ------------------------------------------------------------------
     # Internal (called by Worker.run)

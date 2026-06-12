@@ -570,6 +570,19 @@ class ChipWorker:
         """Copy *size* bytes from worker *src* to host *dst*."""
         self._impl.copy_from(int(dst), int(src), int(size))
 
+    def l3_l2_orch_comm_init_from_addr(self, control_block_addr: int, control_block_size: int) -> None:
+        """Start the independent L3-L2 orchestrator communication service.
+
+        ``control_block_addr`` must point at a shared-memory control block
+        mapped in this chip child process. The child keeps that mapping alive
+        until the service is shut down.
+        """
+        self._impl.l3_l2_orch_comm_init_from_addr(int(control_block_addr), int(control_block_size))
+
+    def l3_l2_orch_comm_shutdown(self) -> None:
+        """Stop the independent L3-L2 orchestrator communication service."""
+        self._impl.l3_l2_orch_comm_shutdown()
+
     def comm_init(self, rank: int, nranks: int, rootinfo_path: str) -> int:
         """Initialize a distributed communicator for this rank.
 

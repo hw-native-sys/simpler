@@ -147,6 +147,16 @@ class TestChipWorkerStateMachine:
         with pytest.raises(RuntimeError, match="not initialized"):
             worker.unregister_callable(0)
 
+    def test_l3_l2_orch_comm_init_before_init_raises(self):
+        worker = _ChipWorker()
+        with pytest.raises(RuntimeError, match="not initialized"):
+            worker.l3_l2_orch_comm_init_from_addr(0x1000, 4096)
+
+    def test_l3_l2_orch_comm_shutdown_before_init_raises(self):
+        worker = _ChipWorker()
+        with pytest.raises(RuntimeError, match="not initialized"):
+            worker.l3_l2_orch_comm_shutdown()
+
 
 # ============================================================================
 # Python-level ChipWorker wrapper tests

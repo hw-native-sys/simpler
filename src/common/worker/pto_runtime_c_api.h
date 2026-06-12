@@ -26,6 +26,8 @@
  *                   copy_to_device_ctx, copy_from_device_ctx
  *   - prepared run: prepare_callable, run_prepared, unregister_callable,
  *                   get_aicpu_dlopen_count, get_host_dlopen_count
+ *   - L3-L2 orch:   l3_l2_orch_comm_init_ctx,
+ *                   l3_l2_orch_comm_shutdown_ctx
  *   - ACL/stream:   ensure_acl_ready_ctx, create_comm_stream_ctx,
  *                   destroy_comm_stream_ctx
  *   - comm:         comm_init, comm_alloc_windows, comm_get_local_window_base,
@@ -47,6 +49,10 @@ extern "C" {
 
 typedef void *RuntimeHandle;
 typedef void *DeviceContextHandle;
+
+enum {
+    PTO_RUNTIME_ERR_UNSUPPORTED = -2,
+};
 
 /**
  * Timing breakdown for a single run_prepared() invocation.
@@ -140,6 +146,15 @@ int simpler_init(
  * Must be called before destroy_device_context() / dlclose().
  */
 int finalize_device(DeviceContextHandle ctx);
+
+/**
+ * Start / stop the independent L3-L2 orchestrator communication service.
+ * `control_block` points at a shared L3L2OrchCommControlBlock mapped by both
+ * parent and child. Normal in-flight commands are submitted through that
+ * block, not through the task-dispatch mailbox.
+ */
+int l3_l2_orch_comm_init_ctx(DeviceContextHandle ctx, void *control_block, size_t control_block_size);
+int l3_l2_orch_comm_shutdown_ctx(DeviceContextHandle ctx);
 
 /* ===========================================================================
  * Per-callable_id preparation

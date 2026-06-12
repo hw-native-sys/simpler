@@ -20,6 +20,7 @@
 #include <chrono>
 #include <cstdarg>
 #include <cstdint>
+#include <cstddef>
 #include <cstdio>
 #include <stdexcept>
 #include <string>
@@ -75,6 +76,10 @@ uint64_t get_sys_cnt_aicpu() {
     auto now = std::chrono::steady_clock::now();
     return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(now.time_since_epoch()).count());
 }
+
+void cache_invalidate_range(const void * /* addr */, size_t /* size */) {}
+
+void cache_flush_range(const void * /* addr */, size_t /* size */) {}
 
 // =============================================================================
 // common.h stubs (assert_impl, get_stacktrace, AssertionError)
