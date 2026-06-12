@@ -189,12 +189,18 @@ int prepare_callable(DeviceContextHandle ctx, int32_t callable_id, const void *c
  * this invocation into it (see PtoRunTiming above). The struct is zeroed on
  * entry and partially populated on early-error returns.
  *
+ * `ring_task_window` / `ring_heap` / `ring_dep_pool` are per-task ring sizing
+ * overrides (0 = unset). Precedence: per-task value > PTO2_RING_* env var >
+ * compile-time default. Consumed by tensormap_and_ringbuffer only; other
+ * runtime variants accept and ignore them.
+ *
  * @return 0 on success, negative on error (no prep state, NULL ctx, etc.).
  */
 int run_prepared(
     DeviceContextHandle ctx, RuntimeHandle runtime, int32_t callable_id, const void *args, int block_dim,
     int aicpu_thread_num, int enable_l2_swimlane, int enable_dump_tensor, int enable_pmu, int enable_dep_gen,
-    int enable_scope_stats, const char *output_prefix, PtoRunTiming *out_timing
+    int enable_scope_stats, uint64_t ring_task_window, uint64_t ring_heap, uint64_t ring_dep_pool,
+    const char *output_prefix, PtoRunTiming *out_timing
 );
 
 /**

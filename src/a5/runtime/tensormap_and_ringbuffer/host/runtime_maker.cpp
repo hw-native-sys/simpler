@@ -162,7 +162,8 @@ prepare_callable_impl(const ChipCallable *callable, uint64_t (*upload_fn)(const 
  */
 extern "C" int bind_callable_to_runtime_impl(
     Runtime *runtime, const ChipStorageTaskArgs *orch_args, void *host_orch_func_ptr,
-    const ArgDirection * /*signature*/, int /*sig_count*/
+    const ArgDirection * /*signature*/, int /*sig_count*/, uint64_t ring_task_window, uint64_t ring_heap,
+    uint64_t ring_dep_pool
 ) {
     if (runtime == nullptr) {
         LOG_ERROR("Runtime pointer is null");
@@ -253,11 +254,13 @@ extern "C" int bind_callable_to_runtime_impl(
         LOG_INFO_V0("Orchestrator-to-scheduler transition: %s", runtime->orch_to_sched ? "enabled" : "disabled");
     }
 
-    // Read ring buffer size overrides from environment
+    // Ring buffer size overrides: per-task CallConfig value wins over the
+    // env var; both fall back to the compile-time default when zero.
     {
-        runtime->task_window_size = parse_env_uint64("PTO2_RING_TASK_WINDOW", 4, true);
-        runtime->heap_size = parse_env_uint64("PTO2_RING_HEAP", 1024, true);
-        runtime->dep_pool_size = parse_env_uint64("PTO2_RING_DEP_POOL", 4, false);
+        runtime->task_window_size =
+            ring_task_window ? ring_task_window : parse_env_uint64("PTO2_RING_TASK_WINDOW", 4, true);
+        runtime->heap_size = ring_heap ? ring_heap : parse_env_uint64("PTO2_RING_HEAP", 1024, true);
+        runtime->dep_pool_size = ring_dep_pool ? ring_dep_pool : parse_env_uint64("PTO2_RING_DEP_POOL", 4, false);
         if (runtime->task_window_size || runtime->heap_size || runtime->dep_pool_size) {
             LOG_INFO_V0(
                 "Ring buffer overrides: task_window=%" PRIu64 " heap=%" PRIu64 " dep_pool=%" PRIu64,

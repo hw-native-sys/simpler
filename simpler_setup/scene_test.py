@@ -1015,6 +1015,13 @@ class SceneTestCase:
         # explicitly in their config dict.
         config.block_dim = config_dict.get("block_dim", 0)
         config.aicpu_thread_num = config_dict.get("aicpu_thread_num", 3)
+        # Per-task ring sizing (tensormap_and_ringbuffer only; 0 = unset),
+        # nested under the "runtime_env" key. Takes precedence over the
+        # PTO2_RING_* env vars / RUNTIME_ENV.
+        runtime_env = config_dict.get("runtime_env", {})
+        config.runtime_env.ring_task_window = runtime_env.get("ring_task_window", 0)
+        config.runtime_env.ring_heap = runtime_env.get("ring_heap", 0)
+        config.runtime_env.ring_dep_pool = runtime_env.get("ring_dep_pool", 0)
         config.enable_l2_swimlane = enable_l2_swimlane
         config.enable_dump_tensor = enable_dump_tensor
         config.enable_pmu = enable_pmu  # 0=disabled, >0=enabled with event type
