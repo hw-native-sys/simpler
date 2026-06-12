@@ -61,6 +61,7 @@ static DumpTensorLevel g_dump_tensor_level = DumpTensorLevel::OFF;
 struct DumpTaskMaskEntry {
     uint64_t task_id;
     TensorDumpArgMask mask;
+    TensorDumpArgMask flags;
 };
 struct DumpTaskScalarDtypeEntry {
     uint64_t task_id;
@@ -84,6 +85,7 @@ static bool ensure_dump_mask_table() {
     for (uint32_t i = 0; i < DUMP_TASK_MASK_TABLE_CAPACITY; i++) {
         g_dump_mask_table[i].task_id = DUMP_TASK_MASK_EMPTY_TASK_ID;
         g_dump_mask_table[i].mask = TENSOR_DUMP_ARG_MASK_NONE;
+        g_dump_mask_table[i].flags = TENSOR_DUMP_ARG_MASK_NONE;
     }
     return true;
 }
@@ -112,6 +114,7 @@ static void clear_dump_mask_table() {
         for (uint32_t i = 0; i < DUMP_TASK_MASK_TABLE_CAPACITY; i++) {
             g_dump_mask_table[i].task_id = DUMP_TASK_MASK_EMPTY_TASK_ID;
             g_dump_mask_table[i].mask = TENSOR_DUMP_ARG_MASK_NONE;
+            g_dump_mask_table[i].flags = TENSOR_DUMP_ARG_MASK_NONE;
         }
     }
     if (g_dump_scalar_dtype_table != nullptr) {
@@ -195,7 +198,7 @@ extern "C" bool is_dump_tensor_enabled() { return g_enable_dump_tensor; }
 
 extern "C" bool is_dump_tensor_selective_mode() { return g_dump_tensor_level == DumpTensorLevel::PARTIAL; }
 
-extern "C" void set_dump_tensor_task_mask(uint64_t task_id, TensorDumpArgMask mask) {
+extern "C" void set_dump_tensor_task_mask(uint64_t task_id, TensorDumpArgMask mask, TensorDumpArgMask flags) {
     if (mask == TENSOR_DUMP_ARG_MASK_NONE) {
         return;
     }
@@ -213,32 +216,44 @@ extern "C" void set_dump_tensor_task_mask(uint64_t task_id, TensorDumpArgMask ma
         if (entry.task_id == DUMP_TASK_MASK_EMPTY_TASK_ID || entry.task_id == task_id) {
             entry.task_id = task_id;
             entry.mask = mask;
+            entry.flags = flags;
             return;
         }
     }
     LOG_ERROR("tensor dump selective mask table is full");
 }
 
-extern "C" TensorDumpArgMask get_dump_tensor_task_mask(uint64_t task_id) {
+extern "C" void get_dump_tensor_task_masks(uint64_t task_id, TensorDumpArgMask *mask, TensorDumpArgMask *flags) {
+    if (mask != nullptr) {
+        *mask = TENSOR_DUMP_ARG_MASK_NONE;
+    }
+    if (flags != nullptr) {
+        *flags = TENSOR_DUMP_ARG_MASK_NONE;
+    }
     if (g_dump_mask_table == nullptr) {
-        return TENSOR_DUMP_ARG_MASK_NONE;
+        return;
     }
     uint32_t ring_id = static_cast<uint32_t>(task_id >> 32);
     if (ring_id >= TENSOR_DUMP_MASK_POOL_MAX_RINGS) {
-        return TENSOR_DUMP_ARG_MASK_NONE;
+        return;
     }
     uint32_t slot = static_cast<uint32_t>(task_id) & TENSOR_DUMP_MASK_POOL_DEFAULT_SLOT_MASK;
     uint32_t idx = (ring_id * TENSOR_DUMP_MASK_POOL_MAX_SLOTS + slot) & (DUMP_TASK_MASK_TABLE_CAPACITY - 1);
     for (uint32_t probe = 0; probe < DUMP_TASK_MASK_TABLE_CAPACITY; probe++) {
         const DumpTaskMaskEntry &entry = g_dump_mask_table[(idx + probe) & (DUMP_TASK_MASK_TABLE_CAPACITY - 1)];
         if (entry.task_id == task_id) {
-            return entry.mask;
+            if (mask != nullptr) {
+                *mask = entry.mask;
+            }
+            if (flags != nullptr) {
+                *flags = entry.flags;
+            }
+            return;
         }
         if (entry.task_id == DUMP_TASK_MASK_EMPTY_TASK_ID) {
-            return TENSOR_DUMP_ARG_MASK_NONE;
+            return;
         }
     }
-    return TENSOR_DUMP_ARG_MASK_NONE;
 }
 
 bool get_tensor_dump_role_from_direction(ArgDirection dir, TensorDumpRole *role) {
@@ -287,10 +302,15 @@ bool should_dump_task(TensorDumpArgMask arg_mask) {
     return arg_mask != TENSOR_DUMP_ARG_MASK_NONE;
 }
 
-bool should_dump_tensor_arg(TensorDumpArgMask arg_mask, int32_t arg_index) {
+bool should_dump_arg(TensorDumpArgMask arg_mask, int32_t arg_index) {
     if (!is_dump_tensor_selective_mode()) {
         return true;
     }
+    if (arg_index < 0 || arg_index >= static_cast<int32_t>(TENSOR_DUMP_ARG_MASK_BITS)) return false;
+    return (arg_mask & (TensorDumpArgMask{1} << arg_index)) != 0;
+}
+
+bool has_dump_arg_flag(TensorDumpArgMask arg_mask, int32_t arg_index) {
     if (arg_index < 0 || arg_index >= static_cast<int32_t>(TENSOR_DUMP_ARG_MASK_BITS)) return false;
     return (arg_mask & (TensorDumpArgMask{1} << arg_index)) != 0;
 }
@@ -534,7 +554,7 @@ void dump_tensor_init(int num_dump_threads) {
     s_dump_header = get_dump_header(dump_base);
 
     // Latch dump level from the host-written header before any task is dumped.
-    // PARTIAL → selective (only Arg::dump()-marked tasks); FULL → every task;
+    // PARTIAL → selective (only Arg::dump()-marked args); FULL → every task;
     // FULL_JSON_ONLY → every task, metadata only (no payload copied into arena).
     g_dump_tensor_level = static_cast<DumpTensorLevel>(s_dump_header->dump_tensor_level);
 
@@ -648,6 +668,7 @@ int dump_tensor_record(int thread_idx, const TensorDumpInfo &info) {
     rec->payload_size = copy_bytes;
     rec->scalar_value = is_scalar ? info.scalar_value : 0;
     rec->kind = info.kind;
+    rec->flags = info.flags;
     rec->start_offset = info.start_offset;
     for (int d = 0; d < info.ndims && d < PLATFORM_DUMP_MAX_DIMS; d++) {
         rec->shapes[d] = info.shapes[d];

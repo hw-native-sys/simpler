@@ -43,16 +43,24 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
         Arg params_t1;
         params_t1.add_input(c);
         params_t1.add_output(inter_ci);
-        params_t1.add_scalar(1.0f);
-        params_t1.add_scalar(3u);
+        float t1_addend = 1.0f;
+        uint32_t t1_count = 3u;
+        params_t1.add_scalar(t1_addend, t1_count);
+        // Partial dump, task granularity: no-arg dump() selects every tensor
+        // and scalar arg on this Arg.
+        params_t1.dump();
         TaskOutputTensors outs_t1 = rt_submit_aiv_task(1, params_t1);
         const Tensor &d = outs_t1.get_ref(0);
 
         Arg params_t2;
         params_t2.add_input(c);
         params_t2.add_output(inter_ci);
-        params_t2.add_scalar(2.0f);
-        params_t2.add_scalar(3u);
+        float t2_addend = 2.0f;
+        uint32_t t2_count = 3u;
+        params_t2.add_scalar(t2_addend, t2_count);
+        // Scalar-only selection: t2_count has the same value as t1_count
+        // but is left unmarked, so only t2_addend should be dumped.
+        params_t2.dump(t2_addend);
         TaskOutputTensors outs_t2 = rt_submit_aiv_task(1, params_t2);
         const Tensor &e = outs_t2.get_ref(0);
 
@@ -60,10 +68,13 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
         params_t3.add_input(d);
         params_t3.add_input(e);
         params_t3.add_output(inter_ci);
-        params_t3.add_scalar(3u);
-        // Partial dump, tensor granularity: select specific tensors of this task
-        // (input d + the output; input e is left unmarked).
-        params_t3.dump(d, inter_ci);
+        uint32_t t3_count = 3u;
+        params_t3.add_scalar(t3_count, t3_count);
+        // Mixed selection: input d + the output + one scalar. The scalar lvalue
+        // is added twice, so dump(t3_count) selects the first matching scalar
+        // arg and marks its JSON arg_index as ambiguous. Input e is left
+        // unmarked.
+        params_t3.dump(d, inter_ci, t3_count);
         TaskOutputTensors outs_t3 = rt_submit_aiv_task(2, params_t3);
         const Tensor &g = outs_t3.get_ref(0);
 
@@ -71,8 +82,8 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
         params_t4.add_input(g);
         params_t4.add_input(c);
         params_t4.add_output(ext_f);
-        // Partial dump, task granularity: no-arg dump() selects the whole task
-        // (every tensor arg on this Arg).
+        // Tensor-only task granularity: no-arg dump() still selects every
+        // tensor arg on this Arg.
         params_t4.dump();
         rt_submit_aiv_task(0, params_t4);
     }

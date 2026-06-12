@@ -666,10 +666,12 @@ static TaskOutputTensors submit_task_common(
         }
         // Selective vs full dump is latched at dump_tensor_init from DumpDataHeader
         // (host-decided before any dispatch), so it is race-free regardless of
-        // submission order. Here we only record each marked task's arg mask, which
-        // selective collection consults.
+        // submission order. Here we only record each marked task's arg mask and
+        // metadata flags, which selective collection consults.
         if (args.tensor_dump_arg_mask() != 0) {
-            set_dump_tensor_task_mask(task_id.raw, args.tensor_dump_arg_mask());
+            set_dump_tensor_task_mask(
+                task_id.raw, args.tensor_dump_arg_mask(), args.tensor_dump_arg_index_ambiguous_mask()
+            );
         }
     }
 #endif

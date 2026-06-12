@@ -95,6 +95,8 @@ TaskOutputTensors fake_alloc_tensors(PTO2Runtime *rt, const Arg &) {
     return TaskOutputTensors{};
 }
 
+TaskOutputTensors fake_submit_dummy(PTO2Runtime *, const Arg &) { return TaskOutputTensors{}; }
+
 const PTO2RuntimeOps kFakeOps = {
     .submit_task = fake_submit,
     .scope_begin = fake_scope_begin,
@@ -109,6 +111,8 @@ const PTO2RuntimeOps kFakeOps = {
     .get_tensor_data = fake_get_tensor_data,
     .set_tensor_data = fake_set_tensor_data,
     .alloc_tensors = fake_alloc_tensors,
+    .submit_dummy_task = fake_submit_dummy,
+    .scope_set_site = nullptr,
 };
 
 class RuntimeBindingGuard {

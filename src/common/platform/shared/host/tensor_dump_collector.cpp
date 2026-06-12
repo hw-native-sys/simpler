@@ -229,6 +229,7 @@ void TensorDumpCollector::process_dump_buffer(const DumpReadyBufferInfo &info) {
         dt.stage = static_cast<TensorDumpStage>(rec.stage);
         dt.dtype = rec.dtype;
         dt.ndims = rec.ndims;
+        dt.flags = rec.flags;
         dt.kind = static_cast<TensorDumpKind>(rec.kind);
         dt.scalar_value = rec.scalar_value;
         dt.is_contiguous = (rec.is_contiguous != 0);
@@ -624,12 +625,15 @@ int TensorDumpCollector::export_dump_files() {
              << "\"";
         json << ", \"arg_index\": " << dt.arg_index << ", \"role\": \"" << tensor_dump_role_name(dt.role)
              << "\", \"stage\": \"" << tensor_dump_stage_name(dt.stage) << "\", \"kind\": \""
-             << tensor_dump_kind_name(dt.kind) << "\", \"dtype\": \"" << dtype_name
-             << "\", \"is_contiguous\": " << (dt.is_contiguous ? "true" : "false") << ", \"shape\": " << shape_str
-             << ", \"strides\": " << strides_str << ", \"start_offset\": " << dt.start_offset
-             << ", \"numel\": " << numel;
+             << tensor_dump_kind_name(dt.kind) << "\", \"dtype\": \"" << dtype_name << "\"";
         if (dt.kind == TensorDumpKind::SCALAR) {
             write_scalar_json_value(json, dt);
+        }
+        json << ", \"is_contiguous\": " << (dt.is_contiguous ? "true" : "false") << ", \"shape\": " << shape_str
+             << ", \"strides\": " << strides_str << ", \"start_offset\": " << dt.start_offset
+             << ", \"numel\": " << numel;
+        if ((dt.flags & TENSOR_DUMP_RECORD_FLAG_ARG_INDEX_AMBIGUOUS) != 0) {
+            json << ", \"arg_index_ambiguous\": true";
         }
         json << ", \"bin_offset\": " << dt.bin_offset << ", \"bin_size\": " << dt.payload_size
              << ", \"truncated\": " << (dt.truncated ? "true" : "false")

@@ -73,8 +73,8 @@ void set_dump_tensor_enabled(bool enable);
  */
 bool is_dump_tensor_enabled();
 bool is_dump_tensor_selective_mode();
-void set_dump_tensor_task_mask(uint64_t task_id, TensorDumpArgMask mask);
-TensorDumpArgMask get_dump_tensor_task_mask(uint64_t task_id);
+void set_dump_tensor_task_mask(uint64_t task_id, TensorDumpArgMask mask, TensorDumpArgMask flags);
+void get_dump_tensor_task_masks(uint64_t task_id, TensorDumpArgMask *mask, TensorDumpArgMask *flags);
 void set_dump_tensor_task_scalar_dtypes(uint64_t task_id, uint32_t scalar_count, const uint8_t *scalar_dtypes);
 bool get_dump_tensor_task_scalar_dtypes(uint64_t task_id, uint32_t *scalar_count, uint8_t *scalar_dtypes);
 
@@ -87,7 +87,8 @@ bool get_tensor_dump_role_from_direction(ArgDirection dir, TensorDumpRole *role)
 int32_t count_callable_tensor_args(const CoreCallable &callable);
 bool should_dump_tensor_at_stage(TensorDumpRole role, TensorDumpStage stage);
 bool should_dump_task(TensorDumpArgMask arg_mask);
-bool should_dump_tensor_arg(TensorDumpArgMask arg_mask, int32_t arg_index);
+bool should_dump_arg(TensorDumpArgMask arg_mask, int32_t arg_index);
+bool has_dump_arg_flag(TensorDumpArgMask arg_mask, int32_t arg_index);
 bool try_log_tensor_dump_layout_mismatch();
 int dump_tensor_record(int thread_idx, const TensorDumpInfo &info);
 
@@ -98,8 +99,9 @@ inline void dump_tensors_for_task(
 ) {
     const auto &pl = *slot_state.payload;
     TensorDumpArgMask dump_arg_mask = TENSOR_DUMP_ARG_MASK_NONE;
+    TensorDumpArgMask dump_arg_flags = TENSOR_DUMP_ARG_MASK_NONE;
     if (is_dump_tensor_selective_mode()) {
-        dump_arg_mask = get_dump_tensor_task_mask(slot_state.task->task_id.raw);
+        get_dump_tensor_task_masks(slot_state.task->task_id.raw, &dump_arg_mask, &dump_arg_flags);
     }
     if (!should_dump_task(dump_arg_mask)) {
         return;
@@ -134,7 +136,6 @@ inline void dump_tensors_for_task(
 
     rmb();
 
-    int32_t arg_index = 0;
     int32_t tensor_index = 0;
     for (int raw_subtask_id = 0; raw_subtask_id < MaxSubtaskSlots; raw_subtask_id++) {
         if (!is_subtask_active(slot_state.active_mask, raw_subtask_id)) {
@@ -145,13 +146,11 @@ inline void dump_tensors_for_task(
         for (int32_t sig_idx = 0; sig_idx < callable.sig_count(); sig_idx++) {
             ArgDirection dir = callable.sig(sig_idx);
             if (dir == ArgDirection::SCALAR) {
-                arg_index++;
                 continue;
             }
             TensorDumpRole role;
             bool dump_tensor = get_tensor_dump_role_from_direction(dir, &role) &&
-                               should_dump_tensor_at_stage(role, stage) &&
-                               should_dump_tensor_arg(dump_arg_mask, tensor_index);
+                               should_dump_tensor_at_stage(role, stage) && should_dump_arg(dump_arg_mask, tensor_index);
             if (dump_tensor) {
                 const auto &t = pl.tensors[tensor_index];
                 TensorDumpInfo info = {};
@@ -164,23 +163,28 @@ inline void dump_tensors_for_task(
                     info.strides[d] = t.strides[d];
                 }
                 info.task_id = slot_state.task->task_id.raw;
-                info.arg_index = static_cast<uint32_t>(arg_index);
+                info.arg_index = static_cast<uint32_t>(tensor_index);
                 info.role = role;
                 info.stage = stage;
                 info.kind = static_cast<uint8_t>(TensorDumpKind::TENSOR);
                 dump_tensor_record(thread_idx, info);
             }
-            arg_index++;
             tensor_index++;
         }
     }
 
+    // Scalars are stored once in the task payload; keep them out of the
+    // subtask loop to avoid duplicate records for mixed-subtask tasks.
     if (stage == TensorDumpStage::BEFORE_DISPATCH && pl.scalar_count > 0) {
         uint8_t scalar_dtypes[CORE_MAX_SCALAR_ARGS] = {};
         uint32_t dtype_scalar_count = 0;
         bool has_scalar_dtypes =
             get_dump_tensor_task_scalar_dtypes(slot_state.task->task_id.raw, &dtype_scalar_count, scalar_dtypes);
         for (int32_t scalar_index = 0; scalar_index < pl.scalar_count; scalar_index++) {
+            int32_t scalar_arg_index = pl.tensor_count + scalar_index;
+            if (!should_dump_arg(dump_arg_mask, scalar_arg_index)) {
+                continue;
+            }
             TensorDumpInfo info = {};
             info.task_id = slot_state.task->task_id.raw;
             info.role = TensorDumpRole::INPUT;
@@ -189,9 +193,12 @@ inline void dump_tensors_for_task(
                              scalar_dtypes[scalar_index] :
                              static_cast<uint8_t>(DataType::UINT64);
             info.ndims = 0;
-            info.arg_index = static_cast<uint32_t>(pl.tensor_count + scalar_index);
+            info.arg_index = static_cast<uint32_t>(scalar_arg_index);
             info.kind = static_cast<uint8_t>(TensorDumpKind::SCALAR);
             info.scalar_value = pl.scalars[scalar_index];
+            if (has_dump_arg_flag(dump_arg_flags, scalar_arg_index)) {
+                info.flags = TENSOR_DUMP_RECORD_FLAG_ARG_INDEX_AMBIGUOUS;
+            }
             dump_tensor_record(thread_idx, info);
         }
     }

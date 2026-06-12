@@ -28,17 +28,22 @@
 #include <stdint.h>
 #include <string.h>
 
+#include <type_traits>
+#include <utility>
+
 #if defined(__aarch64__)
 #include <arm_neon.h>
 #endif
-
-#include <utility>
 
 #include "data_type.h"
 #include "pto_submit_types.h"
 #include "task_args.h"
 #include "tensor.h"
 #include "tensor_arg.h"
+
+#ifndef PTO2_PROFILING
+#define PTO2_PROFILING 1
+#endif
 
 // Task arguments — alias the common CORE_MAX_* constants (single source of
 // truth in src/common/task_interface/arg_direction.h, transitively included
@@ -179,10 +184,14 @@ struct Arg : TaskArgsTpl<TensorRef, uint64_t, MAX_TENSOR_ARGS, MAX_SCALAR_ARGS, 
 
     void clear() {
         TaskArgsTpl<TensorRef, uint64_t, MAX_TENSOR_ARGS, MAX_SCALAR_ARGS, TensorArgType>::clear();
-        tensor_dump_arg_mask_ = 0;
+#if PTO2_PROFILING
+        dump_arg_mask_ = 0;
+        dump_arg_index_ambiguous_mask_ = 0;
+        clear_scalar_sources();
+        memset(scalar_dtypes_, 0, sizeof(scalar_dtypes_));
+#endif
         explicit_deps_ = nullptr;
         explicit_dep_count_ = 0;
-        memset(scalar_dtypes_, 0, sizeof(scalar_dtypes_));
     }
 
     void reset() {
@@ -200,23 +209,32 @@ struct Arg : TaskArgsTpl<TensorRef, uint64_t, MAX_TENSOR_ARGS, MAX_SCALAR_ARGS, 
 
     template <typename... Args>
     void dump(Args &&...args) {
+#if PTO2_PROFILING
         static_assert(
             (std::is_lvalue_reference_v<Args> && ...),
-            "dump: temporaries are not allowed — pass tensors already added to this Arg"
+            "dump: temporaries are not allowed — pass tensors/scalars already added to this Arg"
         );
         static_assert(
-            ((std::is_same_v<std::decay_t<Args>, Tensor> || std::is_same_v<std::decay_t<Args>, TensorCreateInfo>) &&
-             ...),
-            "dump: all arguments must be Tensor or TensorCreateInfo"
+            (is_supported_dump_arg_v<Args> && ...),
+            "dump: all arguments must be Tensor, TensorCreateInfo, or scalar lvalues"
         );
         if constexpr (sizeof...(Args) == 0) {
-            mark_all_tensor_dump_arg();
+            mark_all_dump_args();
         } else {
-            (mark_tensor_dump_arg(args), ...);
+            (mark_dump_arg(args), ...);
         }
+#else
+        ((void)args, ...);
+#endif
     }
 
-    uint64_t tensor_dump_arg_mask() const { return tensor_dump_arg_mask_; }
+#if PTO2_PROFILING
+    uint64_t tensor_dump_arg_mask() const { return dump_arg_mask_; }
+    uint64_t tensor_dump_arg_index_ambiguous_mask() const { return dump_arg_index_ambiguous_mask_; }
+#else
+    uint64_t tensor_dump_arg_mask() const { return 0; }
+    uint64_t tensor_dump_arg_index_ambiguous_mask() const { return 0; }
+#endif
 
     template <typename... Args>
     void add_input(Args &&...args) {
@@ -311,16 +329,14 @@ struct Arg : TaskArgsTpl<TensorRef, uint64_t, MAX_TENSOR_ARGS, MAX_SCALAR_ARGS, 
      *   args.add_scalar(3.14f, int32_t(42), 7u);     // mixed batch
      */
     template <typename... Args>
-    void add_scalar(Args... args) {
+    void add_scalar(Args &&...args) {
         static_assert(sizeof...(Args) >= 1, "add_scalar: at least one argument required");
         static_assert((is_supported_scalar_arg_v<Args> && ...), "add_scalar: all types must be arithmetic or enum");
         if (scalar_count_ + sizeof...(Args) > MAX_SCALAR_ARGS) {
             set_error("Too many scalar args (exceeds MAX_SCALAR_ARGS=32)");
             return;
         }
-        ((scalars_[scalar_count_] = to_u64(args),
-          scalar_dtypes_[scalar_count_] = dtype_of<std::remove_cv_t<std::remove_reference_t<Args>>>(), ++scalar_count_),
-         ...);
+        (add_scalar_one(std::forward<Args>(args)), ...);
     }
 
     void add_scalars(const uint64_t *values, int count) {
@@ -329,6 +345,10 @@ struct Arg : TaskArgsTpl<TensorRef, uint64_t, MAX_TENSOR_ARGS, MAX_SCALAR_ARGS, 
             return;
         }
         memcpy(&scalars_[scalar_count_], values, count * sizeof(uint64_t));
+#if PTO2_PROFILING
+        memset(&scalar_dtypes_[scalar_count_], 0, count * sizeof(uint8_t));
+        clear_scalar_sources(scalar_count_, count);
+#endif
         scalar_count_ += count;
     }
 
@@ -361,6 +381,10 @@ struct Arg : TaskArgsTpl<TensorRef, uint64_t, MAX_TENSOR_ARGS, MAX_SCALAR_ARGS, 
             dst[i] = static_cast<uint64_t>(static_cast<uint32_t>(values[i]));
         }
 #endif
+#if PTO2_PROFILING
+        memset(&scalar_dtypes_[scalar_count_], 0, count * sizeof(uint8_t));
+        clear_scalar_sources(scalar_count_, count);
+#endif
         scalar_count_ += count;
     }
 
@@ -378,50 +402,123 @@ struct Arg : TaskArgsTpl<TensorRef, uint64_t, MAX_TENSOR_ARGS, MAX_SCALAR_ARGS, 
             return;
         }
         memcpy(&scalars_[scalar_count_], &src.scalars_[src_offset], count * sizeof(uint64_t));
+#if PTO2_PROFILING
         memcpy(&scalar_dtypes_[scalar_count_], &src.scalar_dtypes_[src_offset], count * sizeof(uint8_t));
+        clear_scalar_sources(scalar_count_, count);
+#endif
         scalar_count_ += count;
     }
 
+#if PTO2_PROFILING
     const uint8_t *scalar_dtypes() const { return scalar_dtypes_; }
+#else
+    const uint8_t *scalar_dtypes() const { return nullptr; }
+#endif
 
 private:
     // Caller-owned dependency array; lifetime must extend through submit.
-    static_assert(MAX_TENSOR_ARGS <= 64, "tensor dump arg mask assumes at most 64 tensor arguments");
-    uint64_t tensor_dump_arg_mask_{0};
+#if PTO2_PROFILING
+    static_assert(MAX_TENSOR_ARGS + MAX_SCALAR_ARGS <= 64, "dump arg mask assumes at most 64 arguments");
+    uint64_t dump_arg_mask_{0};
+    uint64_t dump_arg_index_ambiguous_mask_{0};
+    uintptr_t scalar_source_ptrs_[MAX_SCALAR_ARGS]{};
+#endif
     const PTO2TaskId *explicit_deps_{nullptr};
     uint32_t explicit_dep_count_{0};
+#if PTO2_PROFILING
     uint8_t scalar_dtypes_[MAX_SCALAR_ARGS] = {};
 
-    // No-arg dump(): mark every tensor arg already added to this Arg.
-    void mark_all_tensor_dump_arg() {
-        if (tensor_count_ == 0) {
-            set_error("dump: no tensor arguments added to this Arg");
-            return;
-        }
-        for (int32_t i = 0; i < tensor_count_; i++) {
-            tensor_dump_arg_mask_ |= (uint64_t{1} << i);
+    template <typename T>
+    static constexpr bool is_supported_dump_arg_v =
+        std::is_same_v<std::decay_t<T>, Tensor> || std::is_same_v<std::decay_t<T>, TensorCreateInfo> ||
+        is_supported_scalar_arg_v<T>;
+
+    void mark_arg_index(int32_t index) { dump_arg_mask_ |= (uint64_t{1} << index); }
+    void mark_arg_index_ambiguous(int32_t index) { dump_arg_index_ambiguous_mask_ |= (uint64_t{1} << index); }
+
+    void clear_scalar_sources() { clear_scalar_sources(0, MAX_SCALAR_ARGS); }
+
+    void clear_scalar_sources(int32_t start, int32_t count) {
+        for (int32_t i = 0; i < count; i++) {
+            scalar_source_ptrs_[start + i] = 0;
         }
     }
 
-    void mark_tensor_dump_arg(const Tensor &tensor) {
+#endif
+
+    template <typename T>
+    void add_scalar_one(T &&value) {
+        scalars_[scalar_count_] = to_u64(value);
+#if PTO2_PROFILING
+        scalar_dtypes_[scalar_count_] = dtype_of<std::remove_cv_t<std::remove_reference_t<T>>>();
+        if constexpr (std::is_lvalue_reference_v<T>) {
+            scalar_source_ptrs_[scalar_count_] = reinterpret_cast<uintptr_t>(&value);
+        } else {
+            scalar_source_ptrs_[scalar_count_] = 0;
+        }
+#endif
+        scalar_count_++;
+    }
+
+#if PTO2_PROFILING
+    // No-arg dump(): mark every arg already added to this Arg.
+    void mark_all_dump_args() {
+        if (tensor_count_ == 0 && scalar_count_ == 0) {
+            set_error("dump: no arguments added to this Arg");
+            return;
+        }
+        for (int32_t i = 0; i < tensor_count_; i++) {
+            mark_arg_index(i);
+        }
+        for (int32_t i = 0; i < scalar_count_; i++) {
+            mark_arg_index(tensor_count_ + i);
+        }
+    }
+
+    void mark_dump_arg(const Tensor &tensor) {
         for (int32_t i = 0; i < tensor_count_; i++) {
             if (tags_[i] != TensorArgType::OUTPUT && tensors_[i].ptr == &tensor) {
-                tensor_dump_arg_mask_ |= (uint64_t{1} << i);
+                mark_arg_index(i);
                 return;
             }
         }
         set_error("dump: tensor is not part of this Arg");
     }
 
-    void mark_tensor_dump_arg(const TensorCreateInfo &create_info) {
+    void mark_dump_arg(const TensorCreateInfo &create_info) {
         for (int32_t i = 0; i < tensor_count_; i++) {
             if (tags_[i] == TensorArgType::OUTPUT && tensors_[i].create_info == &create_info) {
-                tensor_dump_arg_mask_ |= (uint64_t{1} << i);
+                mark_arg_index(i);
                 return;
             }
         }
         set_error("dump: TensorCreateInfo is not part of this Arg");
     }
+
+    template <typename T>
+    std::enable_if_t<is_supported_scalar_arg_v<T>, void> mark_dump_arg(const T &scalar) {
+        uintptr_t ptr = reinterpret_cast<uintptr_t>(&scalar);
+        int32_t first_match = -1;
+        int32_t match_count = 0;
+        for (int32_t i = 0; i < scalar_count_; i++) {
+            if (scalar_source_ptrs_[i] == ptr) {
+                if (first_match < 0) {
+                    first_match = i;
+                }
+                match_count++;
+            }
+        }
+        if (first_match >= 0) {
+            int32_t arg_index = tensor_count_ + first_match;
+            mark_arg_index(arg_index);
+            if (match_count > 1) {
+                mark_arg_index_ambiguous(arg_index);
+            }
+            return;
+        }
+        set_error("dump: scalar is not part of this Arg");
+    }
+#endif
 
     template <bool is_output, typename... Args>
     bool check_add_tensor_valid(Args &&...) {
