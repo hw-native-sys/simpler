@@ -92,16 +92,18 @@ and common patterns.
 
 | Metric | Formula | What it tells you |
 | ------ | ------- | ----------------- |
-| `scope_high_water` | `end.head − begin.tail` | Highest occupancy the scope held — residual not yet released on entry, plus what this scope added. The true peak. |
-| `real_occupancy` | `end.head − end.tail` | What is still occupied at scope exit (the live level on leaving). |
-| `scope_alloc` | `end.head − begin.head` | How far the allocation frontier advanced — this scope's own net (unreleased) allocation. |
+| `scope_high_water` | `end.head − begin.tail` | Upper bound on the occupancy this scope reached — entry backlog plus everything this scope allocated, *without* subtracting what was released mid-scope. Not a realized peak, and not bounded by capacity: a scope that streams more than `cap` reports more than `cap`. |
+| `real_occupancy` | `end.head − end.tail` | What is still occupied at scope exit (the live level on leaving). Always in `[0, cap]`. |
+| `scope_alloc` | `end.head − begin.head` | How far the allocation frontier advanced over the scope — this scope's total allocation throughput (can exceed `cap`). |
 
 For `task_window`, `heap`, and `dep_pool`, `head` / `tail` mean that
 resource's allocation frontier and released boundary at the sampled scope
-boundary. Ring-buffer occupancy is non-negative, so a negative delta is folded
-back by one buffer length (`(head + cap − tail) % cap`) — a wrap past the
-buffer end. `tensormap` is reported as a single in-use value (no head/tail), so
-it shows only the `real_occupancy` curve.
+boundary. All three are reported as **monotonic, non-wrapping** counters
+(byte totals for `heap`, entry counters for the others), so every delta above
+is an exact, non-negative subtraction regardless of how many times the
+underlying ring wrapped during the scope — no wrap correction is applied.
+`tensormap` is reported as a single in-use value (no head/tail), so it shows
+only the `real_occupancy` curve.
 
 ## 2. What gets captured
 
@@ -158,8 +160,8 @@ Per-sample lines, oldest-first:
 | `ring` | int | Ring this scope used; indexes `task_window_max` / `heap_max` / `dep_pool_max` |
 | `task_window_start` | int | Task-window ring tail at this boundary |
 | `task_window_end` | int | Task-window ring head at this boundary |
-| `heap_start` | uint | Heap ring tail (released boundary) in bytes |
-| `heap_end` | uint | Heap ring head (allocation frontier) in bytes |
+| `heap_start` | uint | Heap reclaim boundary — monotonic cumulative bytes reclaimed (non-wrapping) |
+| `heap_end` | uint | Heap allocation frontier — monotonic cumulative bytes allocated (non-wrapping) |
 | `dep_pool_start` | int | Scheduler-published dependency-list pool tail at this boundary |
 | `dep_pool_end` | int | Scheduler-published dependency-list pool top at this boundary |
 | `tensormap` | int | Tensormap entries in use |

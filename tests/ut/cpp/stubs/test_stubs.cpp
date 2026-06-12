@@ -68,6 +68,20 @@ void unified_log_info_v(const char *func, int v, const char *fmt, ...) {
 }  // extern "C"
 
 // =============================================================================
+// scope_stats collector stubs
+// =============================================================================
+//
+// pto_ring_buffer.h (PTO2_PROFILING build) calls these from the inlined
+// allocator paths to report heap-ring wraps. Unit tests of the allocator do not
+// link the platform collector, so provide weak no-op fallbacks here: the real
+// collector's strong definitions win whenever it is linked, and the allocator
+// test stays self-contained (scope_stats is disabled in tests, so the gated
+// calls never fire anyway).
+
+extern "C" __attribute__((weak)) bool is_scope_stats_enabled() { return false; }
+extern "C" __attribute__((weak)) void scope_stats_note_heap_wrap(int /* side */) {}
+
+// =============================================================================
 // device_time.h stub
 // =============================================================================
 

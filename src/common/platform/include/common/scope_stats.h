@@ -83,8 +83,8 @@ struct ScopeStatsRecord {
                                   // human-readable path without dereferencing a
                                   // device pointer (the string table lives in the
                                   // orchestration .so, not in shared memory).
-    uint64_t heap_start;          // Heap ring reclaim pointer (heap_tail_).
-    uint64_t heap_end;            // Heap ring allocation pointer (heap_top_).
+    uint64_t heap_start;          // Heap reclaim pointer, unrolled to monotonic cumulative bytes.
+    uint64_t heap_end;            // Heap allocation pointer, unrolled to monotonic cumulative bytes.
     int32_t site_line;
     int32_t task_start;      // Task ring tail (last_task_alive).
     int32_t task_end;        // Task ring head (next task id).
