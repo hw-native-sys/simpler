@@ -7,19 +7,24 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""Scheduler overhead analysis for PTO2.
+"""Scheduler overhead analysis for PTO2 — is the scheduler the bottleneck, or starved?
 
-Inputs:
+Inputs (BOTH required, captured in SEPARATE runs — do not co-run the flags, as
+dep_gen perturbs the swimlane timing):
   1. Per-task perf profiling data (l2_swimlane_records_*.json) with
-     ``aicpu_scheduler_phases`` populated by ``--enable-l2-swimlane`` at
-     level >= 3.
-  2. deps.json (optional, dep_gen replay output) colocated with the perf JSON,
-     used to derive per-thread fanout / fanin DAG stats.
+     ``aicpu_scheduler_phases``, from a ``--enable-l2-swimlane`` (level >= 3) run.
+  2. deps.json (the task DAG) from a separate ``--enable-dep-gen`` run. It drives
+     ready(C) = max(producer.end), which separates scheduler bubbles from
+     dependency stalls. Required — the report errors without it.
+
+Report:
+  Part 1 Verdict | Part 2 core-capacity decomposition (Busy / Sched-starve /
+  Dep-idle[same|cross], sums to 100%) | Part 3 per-hop latency | Part 4/5 Head/Tail
+  OH distributions | Part 6 scheduler loop budget | Part 7 critical-path attribution.
 
 Usage:
-    python -m simpler_setup.tools.sched_overhead_analysis                   # auto-select latest files
-    python -m simpler_setup.tools.sched_overhead_analysis --l2-swimlane-records-json <path>
-    python -m simpler_setup.tools.sched_overhead_analysis --l2-swimlane-records-json <path> --deps-json <path>
+    python -m simpler_setup.tools.sched_overhead_analysis \\
+        --l2-swimlane-records-json <swimlane.json> --deps-json <deps.json>
 """
 
 import argparse
@@ -253,6 +258,7 @@ def validate_perf_tasks_for_overhead_analysis(tasks):
         tuple[bool, str]: (is_valid, error_message)
     """
     required_fields = [
+        "core_id",
         "duration_us",
         "start_time_us",
         "end_time_us",
@@ -294,6 +300,232 @@ def validate_perf_tasks_for_overhead_analysis(tasks):
         return False, msg
 
     return True, ""
+
+
+def compute_head_tail(tasks):
+    """Per-task Head OH and Tail OH (microseconds), clamped at 0.
+
+    ``head = min(start - dispatch, start - last_task_end)`` when a previous task
+    ran on the same core, else ``start - dispatch``. The ``min`` auto-selects
+    the right case with no running/pending classification: when the core was
+    idle at dispatch (``dispatch >= last_task_end``) it picks ``start - dispatch``
+    (dispatch latency); when the core was still busy it picks
+    ``start - last_task_end`` (wait from core-free), excluding the queue wait.
+
+    ``tail = finish - end``. Both clamp at 0 — dual-issue / concurrent execution
+    can make ``start < last_task_end``, and AICore↔AICPU clock skew can make a
+    raw delta negative.
+
+    ``last_task_end`` is the previous same-core task's ``end_time_us`` in
+    start-time order. Returns ``(heads, tails)`` — flat per-task µs lists.
+    """
+    by_core = defaultdict(list)
+    for t in tasks:
+        by_core[t["core_id"]].append(t)
+    heads, tails = [], []
+    for core_tasks in by_core.values():
+        core_tasks.sort(key=lambda t: t["start_time_us"])
+        last_end = None
+        for t in core_tasks:
+            head = t["start_time_us"] - t["dispatch_time_us"]
+            if last_end is not None:
+                head = min(head, t["start_time_us"] - last_end)
+            heads.append(max(0.0, head))
+            tails.append(max(0.0, t["finish_time_us"] - t["end_time_us"]))
+            last_end = t["end_time_us"]
+    return heads, tails
+
+
+def compute_utilization(tasks):
+    """Compute-core utilization by core type over the AICore active window.
+
+    ``util = busy exec time / (active cores of type * window)``, where
+    ``window = max(end) - min(start)`` across all tasks and "active cores" are
+    the distinct ``core_id``s of that type that ran >= 1 task. Returns a dict
+    keyed "all" / "aic" / "aiv" with ``{n_cores, busy_us, util}``.
+    """
+    if not tasks:
+        return {}
+    window = max(t["end_time_us"] for t in tasks) - min(t["start_time_us"] for t in tasks)
+    groups = {
+        "all": tasks,
+        "aic": [t for t in tasks if t.get("core_type") == "aic"],
+        "aiv": [t for t in tasks if t.get("core_type") == "aiv"],
+    }
+    out = {}
+    for key, ts in groups.items():
+        cores = {t["core_id"] for t in ts}
+        busy = sum(t["duration_us"] for t in ts)
+        denom = len(cores) * window
+        out[key] = {"n_cores": len(cores), "busy_us": busy, "util": (busy / denom) if denom > 0 else 0.0}
+    return out
+
+
+def print_distribution(label, vals):
+    """Print percentile distribution + mean/total for a list of µs values."""
+    vals = sorted(vals)
+    n = len(vals)
+    if n == 0:
+        print(f"  {label}: (no tasks)")
+        return
+    print(f"  {label} distribution (N={n}):")
+    for p in (10, 25, 50, 75, 90, 95, 99):
+        idx = min(int(n * p / 100), n - 1)
+        print(f"    P{p:<4} {vals[idx]:>8.2f} us")
+    print(f"    Max:  {vals[-1]:>8.2f} us")
+    print(f"    Mean: {sum(vals) / n:>8.2f} us   Total: {sum(vals):>10.1f} us")
+
+
+def build_task_graph(tasks, deps_data, window_start):
+    """Per-task input-ready time + producer info from the DAG.
+
+    ``ready(C) = max over C's producers of producer end_time``; a task with no
+    producer in the perf set (root) is ready at ``window_start``. Mixed tasks
+    (one perf record per subtask/core) are folded to a single end (their max).
+
+    Returns dicts keyed by uint64 task_id:
+      ready_by_id    : input-ready time (us)
+      gating_type_by_id : core_type of the producer that *gates* ready (max end)
+      end_by_id, type_by_id
+    """
+    end_by_id, type_by_id = {}, {}
+    for t in tasks:
+        tid = _to_uint64(t.get("task_id"))
+        if tid is None:
+            continue
+        end_by_id[tid] = max(end_by_id.get(tid, t["end_time_us"]), t["end_time_us"])
+        type_by_id.setdefault(tid, t.get("core_type"))
+
+    preds_by_id = defaultdict(set)
+    for e in (deps_data or {}).get("edges", []):
+        if not isinstance(e, dict):
+            continue
+        p, s = _to_uint64(e.get("pred")), _to_uint64(e.get("succ"))
+        if p is not None and s is not None and p != s:
+            preds_by_id[s].add(p)
+
+    ready_by_id, gating_type_by_id = {}, {}
+    for tid in end_by_id:
+        ends = [(end_by_id[p], type_by_id.get(p)) for p in preds_by_id.get(tid, ()) if p in end_by_id]
+        if ends:
+            end_max, gate_type = max(ends, key=lambda x: x[0])
+            ready_by_id[tid] = end_max
+            gating_type_by_id[tid] = gate_type
+        else:
+            ready_by_id[tid] = window_start
+            gating_type_by_id[tid] = None
+    return ready_by_id, gating_type_by_id, end_by_id, type_by_id, preds_by_id
+
+
+def decompose_core_capacity(tasks, ready_by_id, gating_type_by_id, core_type, k_cores, w0, w1):
+    """Split a core type's capacity (k_cores * window) into Busy / Sched-starve /
+    Dep-idle(same-type) / Dep-idle(cross-type) via a sweep over task intervals.
+
+    At each instant: idle_cap = k - running; starve = min(idle_cap, ready-waiting)
+    (a free core AND a ready task = scheduler's fault); the rest of idle_cap is
+    dep-bound (no ready task), attributed same/cross by the gating producer type
+    of the next task to become ready. The four sum to k_cores * window.
+    """
+    recs = tasks if core_type == "all" else [t for t in tasks if t.get("core_type") == core_type]
+    window = w1 - w0
+    busy = sum(t["duration_us"] for t in recs)
+    out = {"k": k_cores, "window": window, "busy": busy, "sched_starve": 0.0, "dep_same": 0.0, "dep_cross": 0.0}
+    if k_cores <= 0 or window <= 0 or not recs:
+        return out
+
+    evts = defaultdict(lambda: [0, 0])  # time -> [d_busy, d_wait]
+    waiting = []  # (ready_time, gating_type) for the same/cross attribution
+    for t in recs:
+        tid = _to_uint64(t.get("task_id"))
+        r = max(w0, min(ready_by_id.get(tid, w0), w1))
+        s = max(w0, min(t["start_time_us"], w1))
+        e = max(w0, min(t["end_time_us"], w1))
+        evts[s][0] += 1
+        evts[e][0] -= 1
+        if s > r:
+            evts[r][1] += 1
+            evts[s][1] -= 1
+        waiting.append((r, gating_type_by_id.get(tid)))
+    waiting.sort(key=lambda x: x[0])
+
+    # Pin the sweep to the full window so edges with no task activity (before
+    # the first start / after the last end) count as idle, not vanish — else
+    # the four buckets don't sum to k * window.
+    evts[w0]
+    evts[w1]
+    times = sorted(evts)
+    busy_c = wait_c = ptr = 0
+    for i in range(len(times) - 1):
+        a, b = times[i], times[i + 1]
+        busy_c += evts[a][0]
+        wait_c += evts[a][1]
+        length = b - a
+        if length <= 0:
+            continue
+        idle_cap = max(0, k_cores - busy_c)
+        starve = min(idle_cap, max(0, wait_c))
+        out["sched_starve"] += starve * length
+        dep = idle_cap - starve
+        if dep > 0:
+            while ptr < len(waiting) and waiting[ptr][0] <= a:
+                ptr += 1
+            gate = waiting[ptr][1] if ptr < len(waiting) else None
+            if core_type != "all" and gate is not None and gate != core_type:
+                out["dep_cross"] += dep * length
+            else:
+                out["dep_same"] += dep * length
+    return out
+
+
+def per_id_timing(tasks):
+    """Fold per-core perf records to one timing tuple per task_id.
+
+    Mixed/SPMD tasks emit one record per core; the task's dispatch/start is the
+    earliest, its end/finish the latest. Returns dicts keyed by uint64 task_id.
+    """
+    dispatch, start, end, finish = {}, {}, {}, {}
+    for t in tasks:
+        tid = _to_uint64(t.get("task_id"))
+        if tid is None:
+            continue
+        dispatch[tid] = min(dispatch.get(tid, t["dispatch_time_us"]), t["dispatch_time_us"])
+        start[tid] = min(start.get(tid, t["start_time_us"]), t["start_time_us"])
+        end[tid] = max(end.get(tid, t["end_time_us"]), t["end_time_us"])
+        finish[tid] = max(finish.get(tid, t["finish_time_us"]), t["finish_time_us"])
+    return dispatch, start, end, finish
+
+
+def compute_critical_path(preds_by_id, end_by_id, finish_by_id, start_by_id, dispatch_by_id, w0):
+    """Walk the makespan-determining path and split it into compute vs scheduler.
+
+    Final task = latest finish; backtrack each hop to the gating producer (max
+    end). Per hop producer->consumer the scheduler injects
+    ``consumer.start - producer.end`` (detect + resolve + head); the root adds
+    ``root.start - root.dispatch``. Returns a dict with the path length, the
+    scheduler-injected total, and the per-segment sums (detect/resolve/head).
+    """
+    if not finish_by_id:
+        return None
+    cur = max(finish_by_id, key=lambda k: finish_by_id[k])
+    makespan_end = finish_by_id[cur]
+    sched_total = exec_total = 0.0
+    hops = 0
+    path_start = start_by_id.get(cur, w0)
+    while True:
+        preds = [(end_by_id[p], p) for p in preds_by_id.get(cur, ()) if p in end_by_id]
+        exec_total += max(0.0, end_by_id.get(cur, 0.0) - start_by_id.get(cur, 0.0))
+        if not preds:
+            # root: dispatch->start head
+            sched_total += max(0.0, start_by_id.get(cur, w0) - dispatch_by_id.get(cur, w0))
+            path_start = min(path_start, start_by_id.get(cur, w0))
+            break
+        pend, p = max(preds)
+        sched_total += max(0.0, start_by_id.get(cur, 0.0) - pend)  # producer.end -> consumer.start
+        hops += 1
+        cur = p
+        path_start = min(path_start, start_by_id.get(cur, w0))
+    span = makespan_end - path_start
+    return {"hops": hops, "span": span, "sched": sched_total, "exec": exec_total}
 
 
 def run_analysis(  # noqa: PLR0912, PLR0915
@@ -358,52 +590,147 @@ def run_analysis(  # noqa: PLR0912, PLR0915
         print(f"Error: {err}", file=sys.stderr)
         return 1
 
-    all_exec = sum(t["duration_us"] for t in tasks)
-    all_head = sum(t["start_time_us"] - t["dispatch_time_us"] for t in tasks)
-    all_tail = sum(t["finish_time_us"] - t["end_time_us"] for t in tasks)
-    min_disp = min(t["dispatch_time_us"] for t in tasks)
-    max_fin = max(t["finish_time_us"] for t in tasks)
-    wall = max_fin - min_disp
+    # Deps (DAG) are REQUIRED: ready(C) = max(producer.end) drives the
+    # scheduler-starvation split — without it we can't separate scheduler
+    # bubbles from dependency stalls, which is the whole point of this tool.
+    # Capture deps.json SEPARATELY with --enable-dep-gen (do NOT co-run with
+    # --enable-l2-swimlane: dep_gen perturbs timing).
+    if deps_json_path is None:
+        print(
+            "Error: scheduler-overhead analysis needs the task DAG (deps.json). Capture it in a "
+            "SEPARATE run with --enable-dep-gen (not co-run with --enable-l2-swimlane), then pass --deps-json.",
+            file=sys.stderr,
+        )
+        return 1
+    try:
+        with open(deps_json_path) as df:
+            deps_data = json.load(df)
+    except (OSError, ValueError) as e:
+        print(f"Error: failed to read deps.json {deps_json_path}: {e}", file=sys.stderr)
+        return 1
 
-    all_latency = all_exec + all_head + all_tail
+    w0 = min(t["start_time_us"] for t in tasks)
+    w1 = max(t["end_time_us"] for t in tasks)
+    window = w1 - w0
+    ready_by_id, gating_type_by_id, end_by_id, type_by_id, preds_by_id = build_task_graph(tasks, deps_data, w0)
+    dispatch_by_id, start_by_id, _end2, finish_by_id = per_id_timing(tasks)
+    heads, tails = compute_head_tail(tasks)
 
+    core_types_meta = data.get("core_types") or []
+
+    def _k(ct):
+        if ct == "all":
+            act = len({t["core_id"] for t in tasks})
+            return act, (len(core_types_meta) or act)
+        act = len({t["core_id"] for t in tasks if t.get("core_type") == ct})
+        return act, (sum(1 for c in core_types_meta if c == ct) or act)
+
+    cap = {}
+    for ct in ("all", "aic", "aiv"):
+        act, hw = _k(ct)
+        cap[(ct, "act")] = decompose_core_capacity(tasks, ready_by_id, gating_type_by_id, ct, act, w0, w1)
+        cap[(ct, "hw")] = decompose_core_capacity(tasks, ready_by_id, gating_type_by_id, ct, hw, w0, w1)
+
+    # === Part 1: Verdict ===
+    a = cap[("all", "act")]
+    denom_all = a["k"] * window
+    busy_pct = a["busy"] / denom_all * 100 if denom_all > 0 else 0
+    starve_pct = a["sched_starve"] / denom_all * 100 if denom_all > 0 else 0
+    dep_pct = max(0.0, 100 - busy_pct - starve_pct)
+    if starve_pct >= max(busy_pct, dep_pct):
+        verdict = "SCHEDULER-BOUND — scheduler starves idle cores (real overhead dominates idle)."
+    elif dep_pct >= busy_pct:
+        verdict = "DEPENDENCY-BOUND — cores idle waiting on the graph; scheduler is not the bottleneck."
+    else:
+        verdict = "COMPUTE-BOUND — cores mostly busy."
     print()
     print("=" * 90)
-    print("Part 1: Per-task time breakdown (from perf profiling data)")
+    print("Part 1: Verdict")
     print("=" * 90)
-    print(f"Total tasks: {n_total}")
-    print(f"Wall-clock:  {wall:.1f} us")
-    print()
-    fmt = "  {:<35} {:>12} {:>14} {:>13}"
-    print(fmt.format("Component", "Total (us)", "Avg/task (us)", "% of Latency"))
-    print("  " + "-" * 78)
-    print(
-        fmt.format(
-            "Kernel Exec (end-start)",
-            f"{all_exec:.1f}",
-            f"{all_exec / n_total:.2f}",
-            f"{all_exec / all_latency * 100:.1f}%",
-        )
-    )
-    print(
-        fmt.format(
-            "Head OH (start-dispatch)",
-            f"{all_head:.1f}",
-            f"{all_head / n_total:.2f}",
-            f"{all_head / all_latency * 100:.1f}%",
-        )
-    )
-    print(
-        fmt.format(
-            "Tail OH (finish-end)",
-            f"{all_tail:.1f}",
-            f"{all_tail / n_total:.2f}",
-            f"{all_tail / all_latency * 100:.1f}%",
-        )
-    )
+    print(f"  Total tasks: {n_total}   window: {window:.1f} us")
+    print(f"  Active-core capacity: Busy {busy_pct:.1f}% | Sched-starve {starve_pct:.1f}% | Dep-idle {dep_pct:.1f}%")
+    print(f"  -> {verdict}")
     print()
 
-    # === Part 2: AICPU scheduler loop breakdown ===
+    # === Part 2: Core-capacity decomposition (sums to 100% of cores x window) ===
+    print("=" * 90)
+    print("Part 2: Core-capacity decomposition  (Busy + Sched-starve + Dep-idle = 100%)")
+    print("=" * 90)
+    print("  Sched-starve = idle core AND a ready task waiting (real overhead; fix the scheduler)")
+    print("  Dep-idle/same = blocked on same-type producer (serial chain); /cross = on the other engine")
+    print()
+    c_fmt = "  {:<10} {:>6} {:>9} {:>11} {:>11} {:>11} {:>11}"
+    for kvar, ktitle in (("act", "active cores"), ("hw", "hardware cores")):
+        print(f"  [{ktitle}]")
+        print(c_fmt.format("Core type", "Cores", "Busy%", "Starve%", "Dep-same%", "Dep-cross%", "Cap (us)"))
+        print("  " + "-" * 80)
+        for ct, label in (("all", "All"), ("aic", "C (AIC)"), ("aiv", "V (AIV)")):
+            d = cap[(ct, kvar)]
+            denom = d["k"] * d["window"]
+            if denom <= 0:
+                continue
+            print(
+                c_fmt.format(
+                    label,
+                    d["k"],
+                    f"{d['busy'] / denom * 100:.1f}",
+                    f"{d['sched_starve'] / denom * 100:.1f}",
+                    f"{d['dep_same'] / denom * 100:.1f}",
+                    f"{d['dep_cross'] / denom * 100:.1f}",
+                    f"{denom:.0f}",
+                )
+            )
+        print()
+
+    # === Part 3: Per-hop scheduler latency (producer -> consumer hand-off) ===
+    detects, resolves, edge_heads = [], [], []
+    root_heads = []
+    for tid in start_by_id:
+        preds = [(end_by_id[p], p) for p in preds_by_id.get(tid, ()) if p in end_by_id]
+        head = max(0.0, start_by_id[tid] - dispatch_by_id.get(tid, start_by_id[tid]))
+        if preds:
+            pend, p = max(preds)
+            detects.append(max(0.0, finish_by_id.get(p, pend) - pend))
+            resolves.append(max(0.0, dispatch_by_id.get(tid, pend) - finish_by_id.get(p, pend)))
+            edge_heads.append(head)
+        else:
+            root_heads.append(head)
+    print("=" * 90)
+    print("Part 3: Per-hop scheduler latency  (producer.end -> consumer.start)")
+    print("=" * 90)
+    print(f"  {len(edge_heads)} dependent hand-offs, {len(root_heads)} root tasks")
+    print("  hand-off = detect(producer tail) + resolve/dispatch + head(consumer)")
+    print()
+    print_distribution("  detect  (producer finish-end)", detects)
+    print_distribution("  resolve (dispatch-producer finish)", resolves)
+    print_distribution("  head    (start-dispatch)", edge_heads)
+    if root_heads:
+        print_distribution("  root head (no dep)", root_heads)
+    print()
+
+    # === Part 4: Head OH statistics & distribution ===
+    print("=" * 90)
+    print("Part 4: Head OH statistics & distribution")
+    print("=" * 90)
+    print("  head = min(start - dispatch, start - last_task_end) per task (clamped at 0)")
+    print()
+    print_distribution("Head OH", heads)
+    print()
+
+    # === Part 5: Tail OH distribution ===
+    print("=" * 90)
+    print("Part 5: Tail OH distribution")
+    print("=" * 90)
+    print("  tail = finish - end per task")
+    print()
+    n = len(tails)
+    if n == 0:
+        print("Error: Empty tail-overhead set", file=sys.stderr)
+        return 1
+    print_distribution("Tail OH", tails)
+    print()
+
+    # === Part 6: AICPU scheduler loop breakdown (+ tail-vs-loop cause analysis) ===
     threads = parse_scheduler_from_json_phases(data)
     if not threads:
         print(
@@ -413,42 +740,30 @@ def run_analysis(  # noqa: PLR0912, PLR0915
         )
         return 1
 
-    # Per-thread fanout / fanin come from deps.json when colocated. Without it
-    # the report still prints Part 2 phase timings but suppresses the DAG-stats
-    # rows so missing-artifact zeros are not mistaken for measured values.
-    dag_stats_available = False
-    if deps_json_path is not None:
-        try:
-            with open(deps_json_path) as df:
-                deps_data = json.load(df)
-            compute_dag_stats_from_deps(deps_data, data, threads)
-            dag_stats_available = True
-        except (OSError, ValueError) as ex:
-            print(f"Warning: failed to load deps.json for DAG stats: {ex}", file=sys.stderr)
+    # Per-thread fanout / fanin from the (already-loaded, required) deps.json.
+    dag_stats_available = True
+    compute_dag_stats_from_deps(deps_data, data, threads)
 
     n_threads = len(threads)
 
     print("=" * 90)
-    print("Part 2: AICPU scheduler loop breakdown")
+    print("Part 6: AICPU scheduler loop breakdown")
     print(f"  {n_threads} scheduler threads")
     print("=" * 90)
     print()
 
     fmt2 = "  {:<10} {:>7} {:>10} {:>12} {:>11}"
-    print(fmt2.format("Thread", "Loops", "Completed", "Tasks/loop", "Total (us)"))
+    print(fmt2.format("Thread", "Loops", "Completed", "ns/loop", "Total (us)"))
     print("  " + "-" * 54)
     for tid in sorted(threads.keys()):
         t = threads[tid]
-        print(
-            fmt2.format(
-                "T" + str(tid), t["loops"], t["completed"], f"{t['tasks_per_loop']:.1f}", f"{t['total_us']:.1f}"
-            )
-        )
+        ns_per_loop = t["total_us"] * 1000 / t["loops"] if t["loops"] else 0
+        print(fmt2.format("T" + str(tid), t["loops"], t["completed"], f"{ns_per_loop:.0f}", f"{t['total_us']:.1f}"))
     total_us = sum(t["total_us"] for t in threads.values())
     total_completed = sum(t["completed"] for t in threads.values())
     total_loops = sum(t["loops"] for t in threads.values())
-    avg_tpl = total_completed / total_loops if total_loops > 0 else 0
-    print(fmt2.format("SUM", total_loops, total_completed, f"{avg_tpl:.1f}", f"{total_us:.1f}"))
+    avg_ns_per_loop = total_us * 1000 / total_loops if total_loops > 0 else 0
+    print(fmt2.format("SUM", total_loops, total_completed, f"{avg_ns_per_loop:.0f}", f"{total_us:.1f}"))
     print()
 
     # Phase breakdown. Idle is reconstructed from gaps between work
@@ -461,9 +776,13 @@ def run_analysis(  # noqa: PLR0912, PLR0915
         "idle": "Idle (spinning, no progress — reconstructed from gaps)",
     }
 
-    fmt3 = "  {:<50} {:>11} {:>10} {:>14}"
-    print(fmt3.format("Phase", "Total (us)", "% of total", "Avg/task (us)"))
-    print("  " + "-" * 89)
+    # Total (us) is summed across all scheduler threads, so it can exceed the
+    # wall-clock window (e.g. idle ~= n_threads x per-thread idle); "% of total"
+    # is each phase's share of that summed scheduler CPU.
+    fmt3 = "  {:<55} {:>11} {:>10} {:>14}"
+    header = fmt3.format("Phase (summed over threads)", "Total (us)", "% of total", "Avg/task (us)")
+    print(header)
+    print("  " + "-" * (len(header) - 2))
     phase_totals = {}
     for p in phases:
         key = p + "_us"
@@ -511,38 +830,16 @@ def run_analysis(  # noqa: PLR0912, PLR0915
         print("  Pop: (no per-emit pop deltas in input — needs --enable-l2-swimlane at level >= 3)")
 
     print()
-    print("=" * 90)
-    print("Part 3: Tail OH distribution & cause analysis")
-    print("=" * 90)
-    print()
-
-    tails = [t["finish_time_us"] - t["end_time_us"] for t in tasks]
-    tails.sort()
-    n = len(tails)
-    if n == 0:
-        print("Error: Empty tail-overhead set", file=sys.stderr)
-        return 1
-
-    print(f"  Tail OH distribution (N={n}):")
-    for pct_val in [10, 25, 50, 75, 90, 95, 99]:
-        idx = min(int(n * pct_val / 100), n - 1)
-        print(f"    P{pct_val:<4}  {tails[idx]:>7.1f} us")
-    print(f"    Max:   {tails[-1]:>7.1f} us")
-    print(f"    Mean:  {sum(tails) / n:>7.1f} us")
-    print()
-
-    # Scheduler loop time
+    # Tail-vs-loop cause analysis (closes Part 6).
+    # Scheduler loop time, reported in ns — a loop iteration is sub-us, so us
+    # rounds to a misleading 0.0; ns keeps it readable.
     avg_loop_us = total_us / total_loops if total_loops > 0 else 0
+    avg_loop_ns = avg_loop_us * 1000
     avg_tail_oh = sum(tails) / n
     loop_ratio = avg_tail_oh / avg_loop_us if avg_loop_us > 0 else 0
-    # %.3f instead of %.1f: idle is now reconstructed from gaps between work
-    # records on the same thread, so threads that did no work (only spinning)
-    # contribute their loop count without any measured us — the SUM-based
-    # average lands in the sub-us range on small captures and would round to
-    # 0.0 under .1f.
-    print(f"  Avg scheduler loop iteration: {avg_loop_us:.3f} us (approx avg polling interval per loop)")
+    print(f"  Avg scheduler loop iteration: {avg_loop_ns:.0f} ns (approx avg polling interval per loop)")
     print()
-    print(f"  Avg Tail OH = {avg_tail_oh:.1f} us ~= {loop_ratio:.1f} x avg loop iteration ({avg_loop_us:.3f} us)")
+    print(f"  Avg Tail OH = {avg_tail_oh:.1f} us ~= {loop_ratio:.1f} x avg loop iteration ({avg_loop_ns:.0f} ns)")
     print(f"  -> On average, a completed task waits ~{loop_ratio:.1f} loop iterations before being detected")
     print()
 
@@ -566,6 +863,24 @@ def run_analysis(  # noqa: PLR0912, PLR0915
                 print("  Fanout traversal and atomic ops dominate the complete phase.")
         else:
             print("  DAG stats unavailable (no deps.json); cannot attribute complete-phase cost further.")
+    print("=" * 90)
+
+    # === Part 7: Critical-path latency attribution ===
+    cp = compute_critical_path(preds_by_id, end_by_id, finish_by_id, start_by_id, dispatch_by_id, w0)
+    print()
+    print("=" * 90)
+    print("Part 7: Critical-path latency attribution")
+    print("=" * 90)
+    if cp and cp["span"] > 0:
+        sched_pct = cp["sched"] / cp["span"] * 100
+        exec_pct = cp["exec"] / cp["span"] * 100
+        print(f"  Makespan-determining path: {cp['hops']} hops, span {cp['span']:.1f} us")
+        print(f"    Compute (exec) on path : {cp['exec']:.1f} us ({exec_pct:.1f}%)")
+        print(f"    Scheduler injected     : {cp['sched']:.1f} us ({sched_pct:.1f}%)")
+        print(f"    Other (dep wait on path): {max(0.0, cp['span'] - cp['exec'] - cp['sched']):.1f} us")
+        print(f"  -> scheduler adds ~{sched_pct:.1f}% to the critical path's end-to-end latency.")
+    else:
+        print("  (could not resolve a critical path from the DAG)")
     print("=" * 90)
 
     return 0

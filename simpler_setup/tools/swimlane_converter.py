@@ -31,8 +31,6 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Any
 
-from .sched_overhead_analysis import run_analysis as run_sched_overhead_analysis
-
 
 def _func_id_to_letter(func_id):
     """Map a non-negative integer func_id to a numeric+letter label.
@@ -1930,23 +1928,16 @@ def main():
 
         print_task_statistics(data["tasks"], func_names)
 
-        # The deep-dive reads the perf JSON plus deps.json (for per-thread
-        # fanout / fanin aggregates). Forward the resolved deps path so an
-        # explicit --deps-json overrides sibling auto-discovery there too.
-        print("\n=== Scheduler Overhead Deep Dive ===")
-        deep_dive_rc = run_sched_overhead_analysis(
-            input_path,
-            print_sources=True,
-            perf_data=data,
-            deps_json_path=deps_path if deps_edges is not None else None,
+        # Scheduler-overhead deep-dive is a SEPARATE manual tool now: it needs
+        # the task DAG (deps.json) captured in its own --enable-dep-gen run
+        # (co-running dep_gen with swimlane perturbs the timing), so it can't be
+        # produced accurately inline here. Run it explicitly:
+        #   python -m simpler_setup.tools.sched_overhead_analysis \
+        #       --l2-swimlane-records-json <this> --deps-json <deps from dep_gen run>
+        print(
+            "\nScheduler-overhead deep-dive: run sched_overhead_analysis manually with a "
+            "separately-captured deps.json (--enable-dep-gen)."
         )
-        if deep_dive_rc != 0:
-            print(
-                "Warning: Scheduler overhead deep-dive failed; conversion output is still available. "
-                "Check the detailed error above for root cause and fix route "
-                "(typically missing aicpu_scheduler_phases — rerun with --enable-l2-swimlane).",
-                file=sys.stderr,
-            )
 
         return 0
 
