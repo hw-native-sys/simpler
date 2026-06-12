@@ -93,17 +93,13 @@ A statistics summary grouped by function (printed to the console), including Exe
 - **Head/Tail OH**: scheduling head/tail overhead
 - **Exec_%**: Exec / Latency percentage (kernel utilization)
 
-#### 3. Scheduler Overhead Deep-Dive (Automatic)
+#### 3. Scheduler Overhead Deep-Dive
 
-`swimlane_converter` invokes `sched_overhead_analysis` directly on the same
-perf JSON and emits, in the same run:
-
-- Part 1: Per-task time breakdown
-- Part 2: AICPU scheduler loop breakdown (from `aicpu_scheduler_phases`)
-- Part 3: Tail OH distribution & cause analysis
-
-When `deps.json` is colocated (produced by `--enable-dep-gen`), Part 2 also
-prints per-thread fanout / fanin aggregates.
+`swimlane_converter` no longer runs the deep-dive inline — it needs the task DAG
+(`deps.json`) from a *separate* `--enable-dep-gen` run, which can't be produced
+accurately alongside the swimlane capture. Run
+[`sched_overhead_analysis`](#sched_overhead_analysis) manually with both
+artifacts to get the scheduler-starvation / critical-path report.
 
 ### Integration with run_example.py
 
@@ -128,49 +124,56 @@ After the test passes, the tool will:
 
 ## sched_overhead_analysis
 
-Analyze AICPU scheduler overhead and quantitatively decompose the sources of Tail OH (the latency between task completion and scheduler acknowledgement).
+Answer **"is the AICPU scheduler the bottleneck, or is it starved?"** by
+decomposing core capacity into real scheduler overhead vs dependency stalls,
+using the task DAG.
 
 ### Overview
 
-`sched_overhead_analysis` reads two artifacts produced by the runtime:
+`sched_overhead_analysis` needs **two artifacts, captured in SEPARATE runs**
+(co-running the flags perturbs timing — `dep_gen` adds per-submit overhead):
 
-1. **Perf profiling data** (`l2_swimlane_records_*.json`, l2_swimlane_level >= 3): per-task Exec / Head OH / Tail OH time breakdowns plus `aicpu_scheduler_phases` — per-thread, per-loop-iteration phase records carrying scan / complete / dispatch / idle timings and per-emit pop_hit / pop_miss deltas.
-2. **`deps.json`** (optional, dep_gen replay output): structural task DAG. When colocated with the perf JSON, Part 2 prints per-thread fanout / fanin aggregates derived from it.
+1. **Perf profiling data** (`l2_swimlane_records_*.json`, level >= 3) from a
+   `--enable-l2-swimlane` run — per-task dispatch/start/end/finish +
+   `aicpu_scheduler_phases`.
+2. **`deps.json`** (the task DAG) from a separate `--enable-dep-gen` run. It
+   drives `ready(C) = max(producer.end)`, which is what separates scheduler
+   bubbles from dependency stalls. **Required** — the tool errors without it.
 
 ### Basic Usage
 
 ```bash
-# Auto-pick the latest perf data under ./outputs/ (deps.json sibling is auto-detected)
-python -m simpler_setup.tools.sched_overhead_analysis
+# Capture once (two separate runs of the same case):
+pytest <case> --platform a2a3 --device N --enable-dep-gen        # -> deps.json
+pytest <case> --platform a2a3 --device N --enable-l2-swimlane    # -> l2_swimlane_records.json (clean timing)
 
-# Specify the perf JSON explicitly
+# Analyze:
 python -m simpler_setup.tools.sched_overhead_analysis \
-    --l2-swimlane-records-json outputs/<case>_<ts>/l2_swimlane_records.json
-
-# Override the deps.json location
-python -m simpler_setup.tools.sched_overhead_analysis \
-    --l2-swimlane-records-json outputs/<case>_<ts>/l2_swimlane_records.json \
-    --deps-json outputs/<case>_<ts>/deps.json
+    --l2-swimlane-records-json outputs/<swimlane case>/l2_swimlane_records.json \
+    --deps-json outputs/<dep_gen case>/deps.json
 ```
 
-> For Total / Orch / Sched timing from a **plain** run (no swimlane JSON), use
-> [`device_log_timing`](#device_log_timing) instead — `sched_overhead_analysis`
-> is the swimlane-JSON deep dive.
+> `deps.json` is topology-invariant — capture it once per graph and reuse it for
+> any number of swimlane runs. For Total / Orch / Sched timing from a plain run,
+> use [`device_log_timing`](#device_log_timing) instead.
 
 ### Command-Line Options
 
 | Option | Description |
 | ------ | ----------- |
-| `--l2-swimlane-records-json` | Path to the l2_swimlane_records_*.json file. If omitted, the latest file in outputs/ is auto-selected |
-| `--deps-json` | Path to deps.json (dep_gen replay output) for fanout / fanin aggregates. Defaults to the deps.json sibling of the perf JSON. |
+| `--l2-swimlane-records-json` | Path to the l2_swimlane_records_*.json file (level >= 3). If omitted, the latest under outputs/ is auto-selected. |
+| `--deps-json` | Path to deps.json from a `--enable-dep-gen` run. **Required.** Falls back to a `deps.json` sibling of the perf JSON if present. |
 
 ### Outputs
 
-Output is emitted in three parts:
+Emitted in seven parts:
 
-- **Part 1: Per-task time breakdown** — Exec / Head OH / Tail OH percentages of Latency
-- **Part 2: AICPU scheduler loop breakdown** — per-scheduler-thread loop statistics, per-phase (scan / complete / dispatch / idle) time ratios, pop_hit / pop_miss totals, and (when deps.json is available) per-thread fanout / fanin aggregates
-- **Part 3: Tail OH distribution & cause analysis** — Tail OH quantile distribution (P10–P99), correlation between scheduler loop iteration time and Tail OH, and data-driven insights into the dominant phase
+- **Part 1: Verdict** — scheduler- / dependency- / compute-bound, one line.
+- **Part 2: Core-capacity decomposition** — per type (All / C-AIC / V-AIV) × {active, hardware} cores: `Busy + Sched-starve + Dep-idle(same|cross) = 100%` of `cores × window`. **Sched-starve** = idle core *and* a ready task waiting (the real scheduler overhead); **Dep-idle** = idle with no ready task (the graph's fault), split by gating-producer type (same engine = serial chain, cross = the other engine stalls it).
+- **Part 3: Per-hop scheduler latency** — `producer.end → consumer.start` = detect (producer tail) + resolve/dispatch + head (consumer), with distributions.
+- **Part 4 / 5: Head / Tail OH distributions** — P10–P99 + mean + total (the scheduler's per-hop reaction-time magnitude).
+- **Part 6: AICPU scheduler loop breakdown** — per-thread loops, ns/loop, complete/dispatch/idle phase ratios, pop_hit / pop_miss, fanout / fanin, + the tail-vs-loop cause analysis.
+- **Part 7: Critical-path latency attribution** — along the makespan path, scheduler-injected µs vs compute µs ("scheduler adds X% to the critical path").
 
 The perf JSON must be captured at l2_swimlane_level >= 3 so that `aicpu_scheduler_phases` is non-empty (rerun the case with `--enable-l2-swimlane` if the tool reports the field is missing).
 
