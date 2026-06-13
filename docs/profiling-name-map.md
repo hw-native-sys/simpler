@@ -156,6 +156,11 @@ python -m simpler_setup.tools.swimlane_converter \
 python -m simpler_setup.tools.deps_to_graph \
     outputs/<case>_<ts>/deps.json \
     --func-names outputs/<case>_<ts>/name_map_TestPA_basic.json
+
+python -m simpler_setup.tools.deps_to_graph \
+    outputs/<case>_<ts>/deps.json \
+    --format html \
+    --func-names outputs/<case>_<ts>/name_map_TestPA_basic.json
 ```
 
 ## File Layout
