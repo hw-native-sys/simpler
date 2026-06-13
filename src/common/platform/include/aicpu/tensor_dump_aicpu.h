@@ -72,6 +72,7 @@ void set_dump_tensor_enabled(bool enable);
  * @return true if tensor dump is enabled
  */
 bool is_dump_tensor_enabled();
+void set_dump_tensor_selective_mode(bool enable);
 bool is_dump_tensor_selective_mode();
 void set_dump_tensor_task_mask(uint64_t task_id, TensorDumpArgMask mask);
 TensorDumpArgMask get_dump_tensor_task_mask(uint64_t task_id);
