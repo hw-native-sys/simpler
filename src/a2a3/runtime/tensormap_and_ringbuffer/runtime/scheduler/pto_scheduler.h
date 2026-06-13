@@ -885,11 +885,16 @@ struct PTO2SchedulerState {
         while (expect == PTO2_SPEC_STAGING) {
             expect = slot_state.payload->spec_state.load(std::memory_order_acquire);
         }
-        volatile uint64_t *dmb = reinterpret_cast<volatile uint64_t *>(
-            get_reg_ptr(slot_state.payload->staged_reg_addr, RegId::DATA_MAIN_BASE)
-        );
-        uint64_t tk = static_cast<uint64_t>(static_cast<uint32_t>(slot_state.payload->staged_reg_task_id));
-        *dmb = (tk << 32) | tk;  // 64-bit STR: high=low=token releases the gated AICore
+        // Ring one doorbell per gated subtask core (AIC/AIV: 1, MIX: 1-3). Each
+        // core spins on its own dispatch token, so each gets a distinct STR.
+        uint8_t count = slot_state.payload->staged_count;
+        for (uint8_t i = 0; i < count; i++) {
+            volatile uint64_t *dmb = reinterpret_cast<volatile uint64_t *>(
+                get_reg_ptr(slot_state.payload->staged_reg_addr[i], RegId::DATA_MAIN_BASE)
+            );
+            uint64_t tk = static_cast<uint64_t>(static_cast<uint32_t>(slot_state.payload->staged_reg_task_id[i]));
+            *dmb = (tk << 32) | tk;  // 64-bit STR: high=low=token releases the gated AICore
+        }
         return true;
     }
 

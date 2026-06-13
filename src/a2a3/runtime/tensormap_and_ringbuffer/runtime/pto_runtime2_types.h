@@ -243,6 +243,11 @@ enum PTO2SpecState : uint8_t {
     PTO2_SPEC_DISPATCHED = 3  // routed via the normal dispatch path (no pre-stage)
 };
 
+// A pre-staged single-block consumer occupies one core per active subtask: 1 for
+// AIC/AIV, up to 3 (AIC + AIV0 + AIV1) for MIX. Each gated core has its own
+// dispatch token + reg_addr, so the release rings one doorbell per core.
+inline constexpr int PTO2_SPEC_MAX_DOORBELLS = 3;
+
 struct PTO2TaskPayload {
     // === Cache lines 0-8 (576B) — metadata + inline fanin ===
     int32_t tensor_count{0};
@@ -256,12 +261,14 @@ struct PTO2TaskPayload {
     // (offset 576), so sizeof and tensors[] alignment are unchanged.
     bool allow_early_resolve{false};  // codegen hint copied from Arg in prepare_task
     // Lock-free claim state for the pre-stage race between Hook 1 (stager) and
-    // Hook 2 (router at ready-pop): 0=NONE, 1=STAGING, 2=STAGED, 3=DISPATCHED.
-    // The release-store to STAGED publishes the two staged_* fields below; the
-    // acquire-load of STAGED at the doorbell makes them visible.
+    // the completion-path release (try_speculative_release):
+    // 0=NONE, 1=STAGING, 2=STAGED, 3=DISPATCHED. The release-store to STAGED
+    // publishes staged_count + the staged_* arrays below; the acquire-load of
+    // STAGED at the doorbell makes them visible.
     std::atomic<uint8_t> spec_state{0};
-    int32_t staged_reg_task_id{0};  // dispatch token of the staged task (valid at STAGED)
-    uint64_t staged_reg_addr{0};    // reg_addr of the core the task was staged on (valid at STAGED)
+    uint8_t staged_count{0};                                // number of valid doorbells (1 for AIC/AIV, 1-3 for MIX)
+    int32_t staged_reg_task_id[PTO2_SPEC_MAX_DOORBELLS]{};  // per-core dispatch tokens (valid at STAGED)
+    uint64_t staged_reg_addr[PTO2_SPEC_MAX_DOORBELLS]{};    // per-core reg_addrs (valid at STAGED)
     // === Cache lines 9-72 (4096B) — tensors (alignas(64) forces alignment) ===
     Tensor tensors[MAX_TENSOR_ARGS];
     // === Cache lines 73-74 (128B) — scalars ===

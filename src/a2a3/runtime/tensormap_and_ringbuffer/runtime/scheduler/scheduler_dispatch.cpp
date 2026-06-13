@@ -588,7 +588,10 @@ void SchedulerContext::try_speculative_prestage(int32_t thread_idx) {
             PTO2TaskSlotState *c = edge->slot_state;
             if (c->payload == nullptr || c->logical_block_num != 1) continue;
             PTO2ResourceShape shape = c->active_mask.to_shape();
-            if (shape != PTO2ResourceShape::AIC && shape != PTO2ResourceShape::AIV) continue;
+            // AIC/AIV use one core; MIX claims a fully-idle cluster (1-3 cores,
+            // one doorbell each). DUMMY never reaches core dispatch.
+            if (shape != PTO2ResourceShape::AIC && shape != PTO2ResourceShape::AIV && shape != PTO2ResourceShape::MIX)
+                continue;
             if (c->payload->spec_state.load(std::memory_order_relaxed) != PTO2_SPEC_NONE) continue;
             // Eligible iff exactly ONE producer of C is still unsatisfied. Since we
             // are scanning a RUNNING producer P (itself unsatisfied for C), that one
@@ -621,10 +624,19 @@ void SchedulerContext::try_speculative_prestage(int32_t thread_idx) {
                 publish_subtask_to_core(handles[i], prestage_ts);
             }
             c->next_block_idx = c->logical_block_num;  // single block fully dispatched
-            c->payload->staged_reg_addr = handles[0].reg_addr;
-            c->payload->staged_reg_task_id = handles[0].reg_task_id;
-            // Release-store STAGED publishes the two staged_* writes above to the
-            // router/doorbell side (Hook 2 acquire-loads STAGED before reading them).
+            // Record one doorbell per gated subtask core (AIC/AIV: 1, MIX: 1-3).
+            for (int i = 0; i < n; i++) {
+                c->payload->staged_reg_addr[i] = handles[i].reg_addr;
+                c->payload->staged_reg_task_id[i] = handles[i].reg_task_id;
+            }
+            c->payload->staged_count = static_cast<uint8_t>(n);
+            LOG_INFO_V9(
+                "[SPEC] prestaged task %" PRId64 " shape=%d staged_count=%d on thread %d",
+                static_cast<int64_t>(c->task->task_id.raw), static_cast<int>(shape), n, thread_idx
+            );
+            // Release-store STAGED publishes staged_count + the staged_* writes
+            // above to the completion-path release (which acquire-loads STAGED
+            // before reading them).
             c->payload->spec_state.store(PTO2_SPEC_STAGED, std::memory_order_release);
         }
     }
