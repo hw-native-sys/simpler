@@ -116,6 +116,7 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, in
     // Register encoding: AICPU_IDLE_TASK_ID=idle, task_id=task, AICORE_EXIT_SIGNAL=exit
     uint32_t reg_val = AICPU_IDLE_TASK_ID;
     uint32_t last_reg_val = AICPU_IDLE_TASK_ID;
+    bool exiting = false;
 
     while (true) {
         reg_val = static_cast<uint32_t>(read_reg(RegId::DATA_MAIN_BASE));
@@ -139,6 +140,30 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, in
 
             // Invalidate payload buffer (AICPU updates its content each dispatch)
             dcci(exec_payload, ENTIRE_DATA_CACHE);
+
+            // Speculative early-dispatch gate. A not-ready task was staged on
+            // this core before its dependencies resolved; wait until AICPU rings
+            // the doorbell (DATA_MAIN_BASE high 32 == task_id) before executing.
+            // The ACK is deferred until AFTER the gate so the scheduler keeps the
+            // core off-limits (pending_occupied stays set, no ACK->pending_freed)
+            // while the task is gated — preventing a real task from being
+            // dual-issued behind it. The kernel's own input dcci runs inside
+            // execute_task() below — strictly AFTER this gate — so predecessor
+            // outputs are visible. not_ready == 0 (the common path) skips this.
+            if (exec_payload->not_ready) {
+                while (read_dmb_high32() != task_id) {
+                    // Honor teardown: shutdown overwrites the low half with EXIT.
+                    if (static_cast<uint32_t>(read_reg(RegId::DATA_MAIN_BASE)) == AICORE_EXIT_SIGNAL) {
+                        exiting = true;
+                        break;
+                    }
+                    SPIN_WAIT_HINT();
+                }
+                if (exiting) {
+                    write_reg(RegId::COND, AICORE_EXITED_VALUE);
+                    break;
+                }
+            }
 
             write_reg(RegId::COND, MAKE_ACK_VALUE(task_id));
 

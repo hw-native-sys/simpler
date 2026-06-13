@@ -163,6 +163,17 @@ inline uint64_t read_reg(RegId reg) {
 }
 
 /**
+ * Read the high 32 bits of DATA_MAIN_BASE (speculative-dispatch doorbell).
+ * The high word lives one 32-bit slot above the dispatch token.
+ */
+inline uint32_t read_dmb_high32() {
+    uint32_t offset = reg_offset(RegId::DATA_MAIN_BASE);
+    uint32_t hi = *reinterpret_cast<volatile uint32_t *>(sim_get_reg_base() + offset + 4);
+    OUT_OF_ORDER_LOAD_BARRIER();
+    return hi;
+}
+
+/**
  * Write to an AICore register in simulated register memory
  *
  * @param reg    Register identifier

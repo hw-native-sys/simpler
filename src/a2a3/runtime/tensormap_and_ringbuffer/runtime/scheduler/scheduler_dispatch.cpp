@@ -126,6 +126,11 @@ void SchedulerContext::build_payload(
     dispatch_payload.local_context.async_ctx = async_ctx;
     dispatch_payload.args[PAYLOAD_LOCAL_CONTEXT_INDEX] = reinterpret_cast<uint64_t>(&dispatch_payload.local_context);
     dispatch_payload.args[PAYLOAD_GLOBAL_CONTEXT_INDEX] = reinterpret_cast<uint64_t>(&dispatch_payload.global_context);
+    // Speculative early-dispatch: a task being staged (Hook 1 set spec_state to
+    // STAGING before this call) is gated — the AICore must wait for the
+    // DATA_MAIN_BASE high-32 doorbell. All other dispatches run on pickup.
+    dispatch_payload.not_ready =
+        (slot_state.payload->spec_state.load(std::memory_order_relaxed) == PTO2_SPEC_STAGING) ? 1 : 0;
 }
 
 SchedulerContext::PublishHandle SchedulerContext::prepare_subtask_to_core(
@@ -337,6 +342,10 @@ void SchedulerContext::dispatch_shape(
 
         for (int bi = 0; bi < got; bi++) {
             PTO2TaskSlotState *slot_state = batch[bi];
+
+            // (Speculative pre-staged tasks never reach this ready-pop: they are
+            // released by their doorbell in release_fanin_and_check_ready the
+            // instant their last producer completes — see try_speculative_release.)
 
             if (slot_state->active_mask.requires_sync_start()) {
                 if (is_pending) {
@@ -556,6 +565,68 @@ void SchedulerContext::dispatch_ready_tasks(
             try_pushed
         );
         if (entered_drain) return;
+    }
+}
+
+// Speculative early-dispatch (Hook 1). First-cut policy: pre-stage onto
+// fully-idle cores only (dual-issue staging is a later refinement). Touches no
+// dependency state; correctness rests on the lock-free spec_state CAS shared
+// with the ready-pop router (Hook 2) and the doorbell.
+void SchedulerContext::try_speculative_prestage(int32_t thread_idx) {
+    CoreTracker &tracker = core_trackers_[thread_idx];
+    auto running = tracker.get_all_running_cores();
+    while (running.has_value()) {
+        int32_t core_id = tracker.get_core_id_by_offset(running.pop_first());
+        PTO2TaskSlotState *p = core_exec_states_[core_id].running_slot_state;
+        if (p == nullptr || p->payload == nullptr || !p->payload->allow_early_resolve) continue;
+
+        // Snapshot P's consumer list under its lock, then walk it lock-free.
+        p->lock_fanout();
+        PTO2DepListEntry *edge = p->fanout_head;
+        p->unlock_fanout();
+        for (; edge != nullptr; edge = edge->next) {
+            PTO2TaskSlotState *c = edge->slot_state;
+            if (c->payload == nullptr || c->logical_block_num != 1) continue;
+            PTO2ResourceShape shape = c->active_mask.to_shape();
+            if (shape != PTO2ResourceShape::AIC && shape != PTO2ResourceShape::AIV) continue;
+            if (c->payload->spec_state.load(std::memory_order_relaxed) != PTO2_SPEC_NONE) continue;
+            // Eligible iff exactly ONE producer of C is still unsatisfied. Since we
+            // are scanning a RUNNING producer P (itself unsatisfied for C), that one
+            // must be P — so C becomes ready exactly when P finishes. Handles
+            // multi-producer joins: a join is pre-staged only once all its OTHER
+            // producers already completed (already counted into fanin_refcount) —
+            // which is what enables the cascade down a chain.
+            if (c->fanin_count - c->fanin_refcount.load(std::memory_order_acquire) != 1) continue;
+
+            auto idle = tracker.get_idle_core_offset_states(shape);
+            if (!idle.has_value()) continue;
+
+            // Claim C for staging; lose => already staged/routed elsewhere.
+            uint8_t expect = PTO2_SPEC_NONE;
+            if (!c->payload->spec_state.compare_exchange_strong(
+                    expect, PTO2_SPEC_STAGING, std::memory_order_acq_rel, std::memory_order_acquire
+                )) {
+                continue;
+            }
+
+            int32_t core_offset = idle.pop_first();
+            PublishHandle handles[CoreTracker::MAX_CLUSTERS * 3];
+            int n = prepare_block_for_dispatch(
+                thread_idx, core_offset, *c, shape, /*to_pending=*/false, /*block_idx=*/0, handles
+            );
+            // Stamp the real pre-stage time (NOT 0) so the swimlane shows this
+            // task dispatched during its producer's run, not at trace start.
+            uint64_t prestage_ts = get_sys_cnt_aicpu();
+            for (int i = 0; i < n; i++) {
+                publish_subtask_to_core(handles[i], prestage_ts);
+            }
+            c->next_block_idx = c->logical_block_num;  // single block fully dispatched
+            c->payload->staged_reg_addr = handles[0].reg_addr;
+            c->payload->staged_reg_task_id = handles[0].reg_task_id;
+            // Release-store STAGED publishes the two staged_* writes above to the
+            // router/doorbell side (Hook 2 acquire-loads STAGED before reading them).
+            c->payload->spec_state.store(PTO2_SPEC_STAGED, std::memory_order_release);
+        }
     }
 }
 
@@ -893,6 +964,10 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
         // Phase 4: MIX-strict-priority dispatch with phase-split and
         // cross-thread idle gating. See dispatch_ready_tasks for the policy.
         dispatch_ready_tasks(thread_idx, tracker, local_bufs, pmu_active, made_progress, try_pushed);
+
+        // Phase 4b: speculative early-dispatch onto any spare idle cores left
+        // after normal dispatch (Hook 1). Best-effort; touches no dep state.
+        try_speculative_prestage(thread_idx);
 
 #if PTO2_PROFILING
         if (!try_pushed) {

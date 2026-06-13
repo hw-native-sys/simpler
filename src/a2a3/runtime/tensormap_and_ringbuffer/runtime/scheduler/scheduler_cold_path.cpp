@@ -194,8 +194,11 @@ void format_core_status(
         );
     } else {
         snprintf(
-            buf, buf_size, "core%d(busy kernel=%d task=%" PRId64 " cond_reg_state=%s ANOMALY)", core_id, kernel,
-            task_id_raw, cond_reg_state_str
+            buf, buf_size,
+            "core%d(busy kernel=%d task=%" PRId64
+            " cond_reg_state=%s ANOMALY cond_tok=%d running_tok=%d pending_tok=%d)",
+            core_id, kernel, task_id_raw, cond_reg_state_str, EXTRACT_TASK_ID(cond_reg),
+            core_state->running_reg_task_id, core_state->pending_reg_task_id
         );
     }
 }

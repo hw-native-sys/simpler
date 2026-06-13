@@ -33,6 +33,7 @@
 
 #include "common/core_type.h"
 #include "utils/device_arena.h"
+#include "aicpu/platform_regs.h"  // get_reg_ptr / RegId for the speculative doorbell
 #include "pto_async_wait.h"
 #include "pto_ring_buffer.h"
 #include "pto_runtime2_types.h"
@@ -866,6 +867,32 @@ struct PTO2SchedulerState {
     }
 #endif
 
+    // Speculative early-dispatch release. If the now-ready task was pre-staged
+    // (gated on a core), ring its DATA_MAIN_BASE high-32 doorbell RIGHT HERE in
+    // the completion path — the moment its last producer's FIN satisfies fanin —
+    // instead of routing it through the ready queue and waiting for the dispatch
+    // pass to pop it. Returns true if it rang the doorbell (caller must NOT also
+    // push to the ready queue). Lock-free claim shared with Hook 1 (the stager):
+    // CAS NONE->DISPATCHED wins => not pre-staged, route normally; lose => STAGED
+    // (spin past the brief STAGING window so staged_* are visible), then ring.
+    inline bool try_speculative_release(PTO2TaskSlotState &slot_state) {
+        uint8_t expect = PTO2_SPEC_NONE;
+        if (slot_state.payload->spec_state.compare_exchange_strong(
+                expect, PTO2_SPEC_DISPATCHED, std::memory_order_acq_rel, std::memory_order_acquire
+            )) {
+            return false;  // not pre-staged
+        }
+        while (expect == PTO2_SPEC_STAGING) {
+            expect = slot_state.payload->spec_state.load(std::memory_order_acquire);
+        }
+        volatile uint64_t *dmb = reinterpret_cast<volatile uint64_t *>(
+            get_reg_ptr(slot_state.payload->staged_reg_addr, RegId::DATA_MAIN_BASE)
+        );
+        uint64_t tk = static_cast<uint64_t>(static_cast<uint32_t>(slot_state.payload->staged_reg_task_id));
+        *dmb = (tk << 32) | tk;  // 64-bit STR: high=low=token releases the gated AICore
+        return true;
+    }
+
     bool release_fanin_and_check_ready(PTO2TaskSlotState &slot_state, PTO2LocalReadyBuffer *local_bufs = nullptr) {
         // Atomically increment fanin_refcount and check if all producers are done
         // ACQ_REL on fanin_refcount already synchronizes with the orchestrator's
@@ -873,6 +900,9 @@ struct PTO2SchedulerState {
         int32_t new_refcount = slot_state.fanin_refcount.fetch_add(1, std::memory_order_acq_rel) + 1;
 
         if (new_refcount == slot_state.fanin_count) {
+            // Speculative early-dispatch: pre-staged tasks are released by doorbell
+            // here, skipping the ready-queue round-trip entirely.
+            if (try_speculative_release(slot_state)) return true;
             // Local-first: try per-CoreType thread-local buffer before global queue
             // Route by active_mask: AIC-containing tasks → buf[0], AIV-only → buf[1]
             // DUMMY shape is out of range for local_bufs (sized PTO2_NUM_RESOURCE_SHAPES);
@@ -897,6 +927,9 @@ struct PTO2SchedulerState {
         atomic_count += 1;  // fanin_refcount.fetch_add
 
         if (new_refcount == slot_state.fanin_count) {
+            // Speculative early-dispatch: pre-staged tasks are released by doorbell
+            // here, skipping the ready-queue round-trip entirely.
+            if (try_speculative_release(slot_state)) return true;
             // Local-first: try per-CoreType thread-local buffer before global queue.
             // Dummy slots bypass local_bufs (out-of-range for PTO2_NUM_RESOURCE_SHAPES)
             // and go straight to dummy_ready_queue; use the profiling-aware push so

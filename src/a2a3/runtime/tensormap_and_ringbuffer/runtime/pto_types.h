@@ -184,6 +184,15 @@ struct Arg : TaskArgsTpl<TensorRef, uint64_t, MAX_TENSOR_ARGS, MAX_SCALAR_ARGS, 
     const char *error_msg{nullptr};
     PTO2LaunchSpec launch_spec;  // SPMD launch parameters (block_num, etc.)
 
+    // Speculative early-dispatch hint (codegen-author set, off by default). When
+    // true, the scheduler may stage this task on an idle core before its producer
+    // finishes, gating execution on the DATA_MAIN_BASE doorbell — only safe when
+    // the author knows the task's data dependencies allow it. Read in-process by
+    // the runtime; never crosses the wire format.
+    bool allow_early_resolve_{false};
+    void set_allow_early_resolve(bool v = true) { allow_early_resolve_ = v; }
+    bool allow_early_resolve() const { return allow_early_resolve_; }
+
     void clear() {
         TaskArgsTpl<TensorRef, uint64_t, MAX_TENSOR_ARGS, MAX_SCALAR_ARGS, TensorArgType>::clear();
 #if PTO2_PROFILING
@@ -194,6 +203,7 @@ struct Arg : TaskArgsTpl<TensorRef, uint64_t, MAX_TENSOR_ARGS, MAX_SCALAR_ARGS, 
 #endif
         explicit_deps_ = nullptr;
         explicit_dep_count_ = 0;
+        allow_early_resolve_ = false;
     }
 
     void reset() {

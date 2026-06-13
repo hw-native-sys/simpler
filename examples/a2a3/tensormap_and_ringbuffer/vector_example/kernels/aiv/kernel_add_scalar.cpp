@@ -80,7 +80,8 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
     TLOAD(srcTile, srcGlobal);
     set_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
     wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
-    TADDS(dstTile, srcTile, scalar);
+    for (int _r = 0; _r < 32; ++_r)
+        TADDS(dstTile, srcTile, scalar);  // inflate to ~50us
     set_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
     wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
     TSTORE(dstGlobal, dstTile);

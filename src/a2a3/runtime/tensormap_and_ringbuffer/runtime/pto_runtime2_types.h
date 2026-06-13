@@ -235,6 +235,14 @@ struct PTO2TaskDescriptor {
  * by bulk tensor and scalar data. Small fanins stay fully inline; larger
  * fanins spill into a per-ring ring buffer slice.
  */
+// Speculative early-dispatch claim states for PTO2TaskPayload::spec_state.
+enum PTO2SpecState : uint8_t {
+    PTO2_SPEC_NONE = 0,       // not pre-staged
+    PTO2_SPEC_STAGING = 1,    // Hook 1 claimed it; staging in progress
+    PTO2_SPEC_STAGED = 2,     // staged on a core, gated; staged_* fields valid
+    PTO2_SPEC_DISPATCHED = 3  // routed via the normal dispatch path (no pre-stage)
+};
+
 struct PTO2TaskPayload {
     // === Cache lines 0-8 (576B) — metadata + inline fanin ===
     int32_t tensor_count{0};
@@ -243,6 +251,17 @@ struct PTO2TaskPayload {
     int32_t fanin_spill_start{0};   // Linear start index in fanin spill pool (0 = no spill)
     PTO2FaninPool *fanin_spill_pool{nullptr};
     PTO2TaskSlotState *fanin_inline_slot_states[PTO2_FANIN_INLINE_CAP];
+    // Speculative early-dispatch metadata (AICPU-side only). Fits in the 40B of
+    // padding between the fanin array (offset 536) and the 64B-aligned tensors[]
+    // (offset 576), so sizeof and tensors[] alignment are unchanged.
+    bool allow_early_resolve{false};  // codegen hint copied from Arg in prepare_task
+    // Lock-free claim state for the pre-stage race between Hook 1 (stager) and
+    // Hook 2 (router at ready-pop): 0=NONE, 1=STAGING, 2=STAGED, 3=DISPATCHED.
+    // The release-store to STAGED publishes the two staged_* fields below; the
+    // acquire-load of STAGED at the doorbell makes them visible.
+    std::atomic<uint8_t> spec_state{0};
+    int32_t staged_reg_task_id{0};  // dispatch token of the staged task (valid at STAGED)
+    uint64_t staged_reg_addr{0};    // reg_addr of the core the task was staged on (valid at STAGED)
     // === Cache lines 9-72 (4096B) — tensors (alignas(64) forces alignment) ===
     Tensor tensors[MAX_TENSOR_ARGS];
     // === Cache lines 73-74 (128B) — scalars ===

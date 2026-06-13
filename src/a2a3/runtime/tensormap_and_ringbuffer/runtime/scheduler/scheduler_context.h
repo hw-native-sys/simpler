@@ -259,6 +259,25 @@ private:
         write_reg(h.reg_addr, RegId::DATA_MAIN_BASE, static_cast<uint64_t>(h.reg_task_id));
     }
 
+    // Speculative early-dispatch doorbell: release a not-ready task that was
+    // already staged on `reg_addr`'s core by writing `reg_task_id` into the high
+    // 32 bits of DATA_MAIN_BASE (the low half still holds the dispatch token, so
+    // a 32-bit store to the high word leaves it intact). The AICore is spinning
+    // on `read_dmb_high32() == reg_task_id`. Matching on the task id (not a bare
+    // 1) makes a stale doorbell value from a prior task self-evidently not match.
+    inline void ring_speculative_doorbell(uint64_t reg_addr, int32_t reg_task_id) {
+        // A standalone 32-bit store to the high word does NOT propagate to the
+        // AICore's MOV-readable DATA_MAIN_BASE SPR (the SPR commits on a low-word
+        // write — the dispatch protocol's signalling edge). Issue a single 64-bit
+        // STR with high == low == token: the low half re-asserts the (unchanged)
+        // dispatch token, the high half carries the doorbell, and the 64-bit STR
+        // commits both into the SPR. The gated AICore (spinning on high32 ==
+        // task_id) then observes the match and runs.
+        volatile uint64_t *dmb = reinterpret_cast<volatile uint64_t *>(get_reg_ptr(reg_addr, RegId::DATA_MAIN_BASE));
+        uint64_t t = static_cast<uint64_t>(static_cast<uint32_t>(reg_task_id));
+        *dmb = (t << 32) | t;
+    }
+
     // Fan out one block's subtasks (1 for AIC/AIV, 1-3 for MIX) into the
     // caller-supplied handles buffer. Returns the number of handles written.
     int prepare_block_for_dispatch(
@@ -270,6 +289,12 @@ private:
         int32_t thread_idx, PTO2ResourceShape shape, CoreTracker::DispatchPhase phase, PTO2LocalReadyBuffer &local_buf,
         CoreTracker &tracker, bool &entered_drain, bool &made_progress, bool &try_pushed
     );
+
+    // Speculative early-dispatch (Hook 1). After normal dispatch leaves idle
+    // cores spare, pre-stage the consumers of any RUNNING flagged producer onto
+    // those cores with not_ready=1 (gated). Touches no dependency state — the
+    // task is released by the doorbell at its normal ready-pop (Hook 2).
+    void try_speculative_prestage(int32_t thread_idx);
 
     // One pass of "Phase 4" in the resolve_and_dispatch loop: IDLE-stage dispatch
     // for MIX then (if no mix residual) AIC/AIV; mid-flush of local buffers; then
