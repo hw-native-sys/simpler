@@ -871,9 +871,13 @@ struct PTO2SchedulerState {
     // (gated on a core), ring its DATA_MAIN_BASE high-32 doorbell RIGHT HERE in
     // the completion path — the moment its last producer's FIN satisfies fanin —
     // instead of routing it through the ready queue and waiting for the dispatch
-    // pass to pop it. Returns true if it rang the doorbell (caller must NOT also
-    // push to the ready queue). Lock-free claim shared with Hook 1 (the stager):
-    // CAS NONE->DISPATCHED wins => not pre-staged, route normally; lose => STAGED
+    // pass to pop it. Returns true if the task is fully handled (caller must NOT
+    // push to the ready queue). Returns false when the caller must route C
+    // normally: either it was never pre-staged, OR it is a SPMD consumer only
+    // PARTIALLY pre-staged — the gated blocks are released by the doorbells rung
+    // here, and the remaining (next_block_idx .. logical_block_num) blocks
+    // dispatch normally off the ready queue. Lock-free claim shared with Hook 1
+    // (the stager): CAS NONE->DISPATCHED wins => not pre-staged; lose => STAGED
     // (spin past the brief STAGING window so staged_* are visible), then ring.
     inline bool try_speculative_release(PTO2TaskSlotState &slot_state) {
         uint8_t expect = PTO2_SPEC_NONE;
@@ -895,7 +899,10 @@ struct PTO2SchedulerState {
             uint64_t tk = static_cast<uint64_t>(static_cast<uint32_t>(slot_state.payload->staged_reg_task_id[i]));
             *dmb = (tk << 32) | tk;  // 64-bit STR: high=low=token releases the gated AICore
         }
-        return true;
+        // Fully pre-staged (all blocks gated) => skip the ready queue. Partially
+        // pre-staged SPMD consumer => fall through so the caller pushes C to the
+        // ready queue; dispatch_shape resumes from next_block_idx for the rest.
+        return slot_state.next_block_idx >= slot_state.logical_block_num;
     }
 
     bool release_fanin_and_check_ready(PTO2TaskSlotState &slot_state, PTO2LocalReadyBuffer *local_bufs = nullptr) {

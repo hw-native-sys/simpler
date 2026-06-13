@@ -586,7 +586,10 @@ void SchedulerContext::try_speculative_prestage(int32_t thread_idx) {
         p->unlock_fanout();
         for (; edge != nullptr; edge = edge->next) {
             PTO2TaskSlotState *c = edge->slot_state;
-            if (c->payload == nullptr || c->logical_block_num != 1) continue;
+            if (c->payload == nullptr) continue;
+            // sync_start SPMD tasks require all blocks to launch atomically;
+            // block-by-block / partial pre-staging would break that contract.
+            if (c->active_mask.requires_sync_start()) continue;
             PTO2ResourceShape shape = c->active_mask.to_shape();
             // AIC/AIV use one core; MIX claims a fully-idle cluster (1-3 cores,
             // one doorbell each). DUMMY never reaches core dispatch.
@@ -604,6 +607,16 @@ void SchedulerContext::try_speculative_prestage(int32_t thread_idx) {
             auto idle = tracker.get_idle_core_offset_states(shape);
             if (!idle.has_value()) continue;
 
+            // A SPMD consumer is pre-staged block-by-block (one idle core/cluster
+            // per block) — not all N at once. Each block costs subtasks_per_block
+            // doorbells (AIC/AIV: 1, MIX: 1-3), so the staged doorbell array caps
+            // how many blocks fit. Stage min(idle cores now, remaining blocks,
+            // doorbell budget) blocks in THIS single pass; any remaining blocks
+            // dispatch normally when C is released (see try_speculative_release).
+            int32_t subtasks_per_block = __builtin_popcount(c->active_mask.core_mask());
+            int32_t max_blocks_fit = PTO2_SPEC_MAX_DOORBELLS / subtasks_per_block;
+            if (max_blocks_fit == 0) continue;  // unreachable: popcount <= 3 == cap
+
             // Claim C for staging; lose => already staged/routed elsewhere.
             uint8_t expect = PTO2_SPEC_NONE;
             if (!c->payload->spec_state.compare_exchange_strong(
@@ -612,27 +625,36 @@ void SchedulerContext::try_speculative_prestage(int32_t thread_idx) {
                 continue;
             }
 
-            int32_t core_offset = idle.pop_first();
-            PublishHandle handles[CoreTracker::MAX_CLUSTERS * 3];
-            int n = prepare_block_for_dispatch(
-                thread_idx, core_offset, *c, shape, /*to_pending=*/false, /*block_idx=*/0, handles
-            );
-            // Stamp the real pre-stage time (NOT 0) so the swimlane shows this
-            // task dispatched during its producer's run, not at trace start.
+            int32_t start_block = c->next_block_idx;  // 0 (reset in prepare_task)
+            int32_t remaining_blocks = c->logical_block_num - start_block;
+            int32_t blocks_to_stage = idle.count();
+            if (blocks_to_stage > remaining_blocks) blocks_to_stage = remaining_blocks;
+            if (blocks_to_stage > max_blocks_fit) blocks_to_stage = max_blocks_fit;
+
+            // Stamp the real pre-stage time (NOT 0) so the swimlane shows these
+            // blocks dispatched during the producer's run, not at trace start.
             uint64_t prestage_ts = get_sys_cnt_aicpu();
-            for (int i = 0; i < n; i++) {
-                publish_subtask_to_core(handles[i], prestage_ts);
+            int32_t dcount = 0;
+            for (int32_t b = 0; b < blocks_to_stage; b++) {
+                int32_t core_offset = idle.pop_first();
+                PublishHandle handles[CoreTracker::MAX_CLUSTERS * 3];
+                int n = prepare_block_for_dispatch(
+                    thread_idx, core_offset, *c, shape, /*to_pending=*/false, start_block + b, handles
+                );
+                // Record one doorbell per gated subtask core (AIC/AIV: 1, MIX: 1-3).
+                for (int i = 0; i < n; i++) {
+                    publish_subtask_to_core(handles[i], prestage_ts);
+                    c->payload->staged_reg_addr[dcount] = handles[i].reg_addr;
+                    c->payload->staged_reg_task_id[dcount] = handles[i].reg_task_id;
+                    dcount++;
+                }
             }
-            c->next_block_idx = c->logical_block_num;  // single block fully dispatched
-            // Record one doorbell per gated subtask core (AIC/AIV: 1, MIX: 1-3).
-            for (int i = 0; i < n; i++) {
-                c->payload->staged_reg_addr[i] = handles[i].reg_addr;
-                c->payload->staged_reg_task_id[i] = handles[i].reg_task_id;
-            }
-            c->payload->staged_count = static_cast<uint8_t>(n);
+            c->next_block_idx = start_block + blocks_to_stage;
+            c->payload->staged_count = static_cast<uint8_t>(dcount);
             LOG_INFO_V9(
-                "[SPEC] prestaged task %" PRId64 " shape=%d staged_count=%d on thread %d",
-                static_cast<int64_t>(c->task->task_id.raw), static_cast<int>(shape), n, thread_idx
+                "[SPEC] prestaged task %" PRId64 " shape=%d blocks=%d/%d staged_count=%d on thread %d",
+                static_cast<int64_t>(c->task->task_id.raw), static_cast<int>(shape), blocks_to_stage,
+                c->logical_block_num, dcount, thread_idx
             );
             // Release-store STAGED publishes staged_count + the staged_* writes
             // above to the completion-path release (which acquire-loads STAGED
