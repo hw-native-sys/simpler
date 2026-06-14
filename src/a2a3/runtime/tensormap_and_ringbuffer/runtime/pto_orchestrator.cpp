@@ -387,7 +387,8 @@ static bool prepare_task(
     // any stale staging state left in this slot from its previous reuse.
     out->payload->allow_early_resolve = args.allow_early_resolve();
     out->payload->spec_state.store(PTO2_SPEC_NONE, std::memory_order_relaxed);
-    out->payload->staged_count = 0;
+    // staged_core_mask is (re)cleared by the stager under its STAGING claim before
+    // use, so no reset is needed here.
 
     // Fields already reset by advance_ring_pointers (eager reset after CONSUMED):
     //   fanout_lock=0, fanout_count=1, fanout_head=nullptr,

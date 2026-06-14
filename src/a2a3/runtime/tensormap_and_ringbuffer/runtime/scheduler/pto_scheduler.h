@@ -878,26 +878,19 @@ struct PTO2SchedulerState {
     // here, and the remaining (next_block_idx .. logical_block_num) blocks
     // dispatch normally off the ready queue. Lock-free claim shared with Hook 1
     // (the stager): CAS NONE->DISPATCHED wins => not pre-staged; lose => STAGED
-    // (spin past the brief STAGING window so staged_* are visible), then ring.
-    // Collects pre-staged consumers' doorbells during a producer's fanout walk so
-    // they can be rung back-to-back AFTER the walk (flush_spec_doorbells), instead
-    // of interleaved with each consumer's release_fanin work. Interleaved rings
-    // stagger the released consumers' execution by ~the per-consumer release_fanin
-    // cost each (~0.25us); batching rings them within a few ns, so the LAST
-    // consumer starts ~(N * 0.25)us sooner and the wave launches aligned.
-    struct SpecDoorbellBatch {
-        static constexpr int CAP = 64;
-        uint64_t addr[CAP];
-        uint32_t tok[CAP];
-        int n = 0;
-        inline void add(uint64_t a, uint32_t t) {
-            if (n < CAP) {
-                addr[n] = a;
-                tok[n] = t;
-                n++;
-            }
-        }
+    // (spin past the brief STAGING window so the mask is visible), then ring.
+
+    // Per-core speculative doorbell table. Hook 1 records each gated core's
+    // (reg_addr, dispatch token) here at stage time; the completion-path release
+    // reads it back for the cores set in the consumer's staged_core_mask. One
+    // global table indexed by core_id (not per-task): gated cores in flight are
+    // bounded by the chip's core count (no two-level pre-dispatch), so this is the
+    // natural capacity and removes the old per-task 3-doorbell cap.
+    struct SpecDoorbell {
+        uint64_t addr{0};
+        uint32_t token{0};
     };
+    SpecDoorbell spec_doorbell_table[PTO2_SPEC_CORE_MASK_WORDS * 64]{};
 
     static inline void ring_one_doorbell(uint64_t reg_addr, uint32_t token) {
         volatile uint64_t *dmb = reinterpret_cast<volatile uint64_t *>(get_reg_ptr(reg_addr, RegId::DATA_MAIN_BASE));
@@ -905,13 +898,7 @@ struct PTO2SchedulerState {
         *dmb = (tk << 32) | tk;  // 64-bit STR: high=low=token releases the gated AICore
     }
 
-    inline void flush_spec_doorbells(SpecDoorbellBatch &db) {
-        for (int i = 0; i < db.n; i++)
-            ring_one_doorbell(db.addr[i], db.tok[i]);
-        db.n = 0;
-    }
-
-    inline bool try_speculative_release(PTO2TaskSlotState &slot_state, SpecDoorbellBatch *db = nullptr) {
+    inline bool try_speculative_release(PTO2TaskSlotState &slot_state) {
         uint8_t expect = PTO2_SPEC_NONE;
         if (slot_state.payload->spec_state.compare_exchange_strong(
                 expect, PTO2_SPEC_DISPATCHED, std::memory_order_acq_rel, std::memory_order_acquire
@@ -921,17 +908,14 @@ struct PTO2SchedulerState {
         while (expect == PTO2_SPEC_STAGING) {
             expect = slot_state.payload->spec_state.load(std::memory_order_acquire);
         }
-        // One doorbell per gated subtask core (AIC/AIV: 1, MIX: 1-3). Collect into
-        // the caller's batch when there's room so the whole fanout's doorbells ring
-        // together after the walk; else ring inline.
-        uint8_t count = slot_state.payload->staged_count;
-        bool batched = (db != nullptr) && (db->n + count <= SpecDoorbellBatch::CAP);
-        for (uint8_t i = 0; i < count; i++) {
-            uint32_t tk = static_cast<uint32_t>(slot_state.payload->staged_reg_task_id[i]);
-            if (batched) {
-                db->add(slot_state.payload->staged_reg_addr[i], tk);
-            } else {
-                ring_one_doorbell(slot_state.payload->staged_reg_addr[i], tk);
+        // Ring one doorbell per gated core (each set bit in the mask). The
+        // (reg_addr, token) was recorded in spec_doorbell_table at stage time.
+        for (int w = 0; w < PTO2_SPEC_CORE_MASK_WORDS; w++) {
+            uint64_t bits = slot_state.payload->staged_core_mask[w];
+            while (bits != 0) {
+                int core_id = w * 64 + __builtin_ctzll(bits);
+                bits &= bits - 1;
+                ring_one_doorbell(spec_doorbell_table[core_id].addr, spec_doorbell_table[core_id].token);
             }
         }
         // Released: the gated cores will now ACK/FIN. Flip STAGED -> DISPATCHED so
@@ -946,9 +930,7 @@ struct PTO2SchedulerState {
         return slot_state.next_block_idx >= slot_state.logical_block_num;
     }
 
-    bool release_fanin_and_check_ready(
-        PTO2TaskSlotState &slot_state, PTO2LocalReadyBuffer *local_bufs = nullptr, SpecDoorbellBatch *db = nullptr
-    ) {
+    bool release_fanin_and_check_ready(PTO2TaskSlotState &slot_state, PTO2LocalReadyBuffer *local_bufs = nullptr) {
         // Atomically increment fanin_refcount and check if all producers are done
         // ACQ_REL on fanin_refcount already synchronizes with the orchestrator's
         // init release, making fanin_count visible — plain load suffices.
@@ -957,7 +939,7 @@ struct PTO2SchedulerState {
         if (new_refcount == slot_state.fanin_count) {
             // Speculative early-dispatch: pre-staged tasks are released by doorbell
             // here, skipping the ready-queue round-trip entirely.
-            if (try_speculative_release(slot_state, db)) return true;
+            if (try_speculative_release(slot_state)) return true;
             // Local-first: try per-CoreType thread-local buffer before global queue
             // Route by active_mask: AIC-containing tasks → buf[0], AIV-only → buf[1]
             // DUMMY shape is out of range for local_bufs (sized PTO2_NUM_RESOURCE_SHAPES);
@@ -976,7 +958,7 @@ struct PTO2SchedulerState {
 #if PTO2_ORCH_PROFILING || PTO2_SCHED_PROFILING
     bool release_fanin_and_check_ready(
         PTO2TaskSlotState &slot_state, uint64_t &atomic_count, uint64_t &push_wait,
-        PTO2LocalReadyBuffer *local_bufs = nullptr, SpecDoorbellBatch *db = nullptr
+        PTO2LocalReadyBuffer *local_bufs = nullptr
     ) {
         int32_t new_refcount = slot_state.fanin_refcount.fetch_add(1, std::memory_order_acq_rel) + 1;
         atomic_count += 1;  // fanin_refcount.fetch_add
@@ -984,7 +966,7 @@ struct PTO2SchedulerState {
         if (new_refcount == slot_state.fanin_count) {
             // Speculative early-dispatch: pre-staged tasks are released by doorbell
             // here, skipping the ready-queue round-trip entirely.
-            if (try_speculative_release(slot_state, db)) return true;
+            if (try_speculative_release(slot_state)) return true;
             // Local-first: try per-CoreType thread-local buffer before global queue.
             // Dummy slots bypass local_bufs (out-of-range for PTO2_NUM_RESOURCE_SHAPES)
             // and go straight to dummy_ready_queue; use the profiling-aware push so
@@ -1129,11 +1111,11 @@ struct PTO2SchedulerState {
             PTO2TaskSlotState &consumer_slot = *current->slot_state;
 #if PTO2_SCHED_PROFILING
             stats.fanout_edges++;
-            if (release_fanin_and_check_ready(consumer_slot, fanout_atomics, push_wait, local_bufs, nullptr)) {
+            if (release_fanin_and_check_ready(consumer_slot, fanout_atomics, push_wait, local_bufs)) {
                 stats.tasks_enqueued++;
             }
 #else
-            release_fanin_and_check_ready(consumer_slot, local_bufs, nullptr);
+            release_fanin_and_check_ready(consumer_slot, local_bufs);
 #endif
             current = current->next;
         }

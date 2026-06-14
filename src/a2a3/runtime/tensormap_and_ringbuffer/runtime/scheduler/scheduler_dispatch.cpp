@@ -44,6 +44,12 @@ namespace {
 inline constexpr int32_t PTO2_DEFERRED_RELEASE_CAP = 256;
 }
 
+// The speculative core bitmask (PTO2_SPEC_CORE_MASK_WORDS * 64 bits) must cover
+// every global core_id, and the per-core doorbell table is sized to match.
+static_assert(
+    RUNTIME_MAX_WORKER <= PTO2_SPEC_CORE_MASK_WORDS * 64, "staged_core_mask too small for RUNTIME_MAX_WORKER cores"
+);
+
 const char *SchedulerContext::shape_name(PTO2ResourceShape shape) {
     switch (shape) {
     case PTO2ResourceShape::AIC:
@@ -620,15 +626,13 @@ void SchedulerContext::try_speculative_prestage(int32_t thread_idx) {
             auto idle = tracker.get_idle_core_offset_states(shape);
             if (!idle.has_value()) continue;
 
-            // A SPMD consumer is pre-staged block-by-block (one idle core/cluster
-            // per block) — not all N at once. Each block costs subtasks_per_block
-            // doorbells (AIC/AIV: 1, MIX: 1-3), so the staged doorbell array caps
-            // how many blocks fit. Stage min(idle cores now, remaining blocks,
-            // doorbell budget) blocks in THIS single pass; any remaining blocks
-            // dispatch normally when C is released (see try_speculative_release).
-            int32_t subtasks_per_block = __builtin_popcount(c->active_mask.core_mask());
-            int32_t max_blocks_fit = PTO2_SPEC_MAX_DOORBELLS / subtasks_per_block;
-            if (max_blocks_fit == 0) continue;  // unreachable: popcount <= 3 == cap
+            // A SPMD consumer is pre-staged block-by-block — stage as many blocks
+            // as there are idle cores now (one core/cluster per block), capped only
+            // by remaining blocks. No per-task doorbell cap: each gated core records
+            // its (addr, token) in the scheduler's per-core doorbell table and its
+            // bit in staged_core_mask; total gated cores are bounded by the chip's
+            // core count. Any blocks that don't fit this pass dispatch normally when
+            // C is released (see try_speculative_release).
 
             // Claim C for staging; lose => already staged/routed elsewhere.
             uint8_t expect = PTO2_SPEC_NONE;
@@ -637,36 +641,37 @@ void SchedulerContext::try_speculative_prestage(int32_t thread_idx) {
                 )) {
                 continue;
             }
+            for (int w = 0; w < PTO2_SPEC_CORE_MASK_WORDS; w++)
+                c->payload->staged_core_mask[w] = 0;
 
             int32_t start_block = c->next_block_idx;  // 0 (reset in prepare_task)
             int32_t remaining_blocks = c->logical_block_num - start_block;
             int32_t blocks_to_stage = idle.count();
             if (blocks_to_stage > remaining_blocks) blocks_to_stage = remaining_blocks;
-            if (blocks_to_stage > max_blocks_fit) blocks_to_stage = max_blocks_fit;
 
             // Stamp the real pre-stage time (NOT 0) so the swimlane shows these
             // blocks dispatched during the producer's run, not at trace start.
             uint64_t prestage_ts = get_sys_cnt_aicpu();
-            int32_t dcount = 0;
             for (int32_t b = 0; b < blocks_to_stage; b++) {
                 int32_t core_offset = idle.pop_first();
                 PublishHandle handles[CoreTracker::MAX_CLUSTERS * 3];
                 int n = prepare_block_for_dispatch(
                     thread_idx, core_offset, *c, shape, /*to_pending=*/false, start_block + b, handles
                 );
-                // Record one doorbell per gated subtask core (AIC/AIV: 1, MIX: 1-3).
+                // Record one doorbell per gated subtask core (AIC/AIV: 1, MIX: 1-3)
+                // into the per-core table + set its bit in the consumer's mask.
                 for (int i = 0; i < n; i++) {
                     publish_subtask_to_core(handles[i], prestage_ts);
-                    c->payload->staged_reg_addr[dcount] = handles[i].reg_addr;
-                    c->payload->staged_reg_task_id[dcount] = handles[i].reg_task_id;
-                    dcount++;
+                    int32_t cid = tracker.get_core_id_by_offset(handles[i].core_offset);
+                    sched_->spec_doorbell_table[cid].addr = handles[i].reg_addr;
+                    sched_->spec_doorbell_table[cid].token = handles[i].reg_task_id;
+                    c->payload->staged_core_mask[cid >> 6] |= (1ULL << (cid & 63));
                 }
             }
             c->next_block_idx = start_block + blocks_to_stage;
-            c->payload->staged_count = static_cast<uint8_t>(dcount);
-            // Release-store STAGED publishes staged_count + the staged_* writes
-            // above to the completion-path release (which acquire-loads STAGED
-            // before reading them).
+            // Release-store STAGED publishes staged_core_mask + the doorbell-table
+            // writes above to the completion-path release (which acquire-loads
+            // STAGED before reading them).
             c->payload->spec_state.store(PTO2_SPEC_STAGED, std::memory_order_release);
         }
     }
