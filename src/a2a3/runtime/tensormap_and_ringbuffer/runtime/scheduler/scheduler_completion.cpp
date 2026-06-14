@@ -37,7 +37,7 @@ inline constexpr int32_t PTO2_DEFERRED_RELEASE_CAP = 256;
 
 // Pure function: read register result -> SlotTransition (no side effects).
 SlotTransition SchedulerContext::decide_slot_transition(
-    int32_t reg_task_id, int32_t reg_state, int32_t running_id, int32_t pending_id
+    int32_t reg_task_id, int32_t reg_state, int32_t running_id, int32_t pending_id, bool pending_gated
 ) {
     SlotTransition t;
     if (pending_id != AICPU_TASK_INVALID && reg_task_id == pending_id) {
@@ -56,9 +56,22 @@ SlotTransition SchedulerContext::decide_slot_transition(
                 t.matched = true;
                 t.running_done = true;
                 t.running_freed = true;
+            } else if (pending_gated) {
+                // Case 3.3: running FIN, pending is a SPECULATIVE GATED task. The
+                // Case 3.1 "wait for the pending's ack" shortcut assumes the AICore
+                // immediately runs the pending task; a gated task instead spins on
+                // its doorbell and never acks until its producer completes — and
+                // that producer's completion depends on collecting THIS running FIN.
+                // Waiting would deadlock. Complete the running FIN now and promote
+                // the gated task (it then skip-gates until its doorbell). pending is
+                // NOT freed (it promotes, not retires) so the bitmap update keeps the
+                // core off-limits — no second gated block, no doorbell overwrite.
+                t.matched = true;
+                t.running_done = true;
+                t.running_freed = true;
             }
-            // Case 3.1: running FIN, pending exists -> skip (transient state).
-            // Case 1/2 (pending ACK/FIN) will complete running implicitly via running_done=true.
+            // Case 3.1: running FIN, NON-gated pending exists -> skip (transient
+            // state). Case 1/2 (pending ack/FIN) completes running implicitly.
         } else {
             // Case 4: running ACK -- only pending_freed (slot now hardware-latched)
             t.matched = true;
@@ -322,8 +335,16 @@ void SchedulerContext::check_running_cores_for_completion(
         }
 #endif
 
-        SlotTransition t =
-            decide_slot_transition(reg_task_id, reg_state, core.running_reg_task_id, core.pending_reg_task_id);
+        // A pending task is "gated" when it is a speculative pre-stage still
+        // waiting on its doorbell (STAGED): it will not ack on the producer's FIN,
+        // so the Case 3.1 wait-for-pending-ack shortcut would deadlock. Detect it
+        // so decide_slot_transition completes the running FIN and promotes it.
+        bool pending_gated =
+            (core.pending_slot_state != nullptr && core.pending_slot_state->payload != nullptr &&
+             core.pending_slot_state->payload->spec_state.load(std::memory_order_relaxed) == PTO2_SPEC_STAGED);
+        SlotTransition t = decide_slot_transition(
+            reg_task_id, reg_state, core.running_reg_task_id, core.pending_reg_task_id, pending_gated
+        );
         if (!t.matched) continue;
 
 #if PTO2_SCHED_PROFILING
