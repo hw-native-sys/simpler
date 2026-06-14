@@ -813,6 +813,14 @@ int L2SwimlaneCollector::export_swimlane_json() {
                 return "complete";
             case L2SwimlaneSchedPhaseKind::Dispatch:
                 return "dispatch";
+            case L2SwimlaneSchedPhaseKind::Poll:
+                return "poll";
+            case L2SwimlaneSchedPhaseKind::Release:
+                return "release";
+            case L2SwimlaneSchedPhaseKind::Fanout:
+                return "fanout";
+            case L2SwimlaneSchedPhaseKind::Scan:
+                return "scan";
             }
             return "unknown";
         };

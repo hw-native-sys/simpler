@@ -200,6 +200,14 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, in
             //     under SPMD (block_num > num_cores) and MIX cluster spread,
             //     where multiple dispatches of the same task share the same
             //     task_token_raw.
+            last_reg_val = reg_val;
+            write_reg(RegId::COND, MAKE_FIN_VALUE(task_id));
+
+            // Sample end_time AFTER the FIN write so the op-event end marks the
+            // moment the AICPU can first observe completion — any compute-end ->
+            // FIN gap (epilogue / write-back) shows directly on the bar instead
+            // of being inferred. The record write itself stays off the critical
+            // path (it runs after FIN, so it no longer delays completion).
             if (l2_swimlane_enabled) {
                 uint64_t end_time = get_sys_cnt_aicore();
                 uint64_t task_token_raw = exec_payload->local_context.async_ctx.task_token.raw;
@@ -207,9 +215,6 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, in
                     l2_swimlane_head, &l2_swimlane_local, task_token_raw, task_id, start_time, end_time
                 );
             }
-
-            last_reg_val = reg_val;
-            write_reg(RegId::COND, MAKE_FIN_VALUE(task_id));
         }
     }
 

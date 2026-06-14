@@ -575,10 +575,23 @@ void SchedulerContext::dispatch_ready_tasks(
 void SchedulerContext::try_speculative_prestage(int32_t thread_idx) {
     CoreTracker &tracker = core_trackers_[thread_idx];
     auto running = tracker.get_all_running_cores();
+    // An SPMD producer occupies many cores but is ONE task (one slot_state, one
+    // fanout). Dedup so we walk each distinct running producer's fanout once,
+    // not once per block-core (e.g. online_softmax on 48 cores => 1 walk, not 48).
+    PTO2TaskSlotState *seen[CoreTracker::MAX_CLUSTERS * 3];
+    int seen_n = 0;
     while (running.has_value()) {
         int32_t core_id = tracker.get_core_id_by_offset(running.pop_first());
         PTO2TaskSlotState *p = core_exec_states_[core_id].running_slot_state;
         if (p == nullptr || p->payload == nullptr || !p->payload->allow_early_resolve) continue;
+        bool dup = false;
+        for (int i = 0; i < seen_n; i++)
+            if (seen[i] == p) {
+                dup = true;
+                break;
+            }
+        if (dup) continue;
+        if (seen_n < static_cast<int>(sizeof(seen) / sizeof(seen[0]))) seen[seen_n++] = p;
 
         // Snapshot P's consumer list under its lock, then walk it lock-free.
         p->lock_fanout();
@@ -651,11 +664,6 @@ void SchedulerContext::try_speculative_prestage(int32_t thread_idx) {
             }
             c->next_block_idx = start_block + blocks_to_stage;
             c->payload->staged_count = static_cast<uint8_t>(dcount);
-            LOG_INFO_V9(
-                "[SPEC] prestaged task %" PRId64 " shape=%d blocks=%d/%d staged_count=%d on thread %d",
-                static_cast<int64_t>(c->task->task_id.raw), static_cast<int>(shape), blocks_to_stage,
-                c->logical_block_num, dcount, thread_idx
-            );
             // Release-store STAGED publishes staged_count + the staged_* writes
             // above to the completion-path release (which acquire-loads STAGED
             // before reading them).
@@ -806,6 +814,18 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
     if (l2_swimlane_level_ >= L2SwimlaneLevel::SCHED_PHASES) {
         capture_phase_end(phase_start_local, phase_start_shared);
     }
+    // Flush the open activity-fill run (Poll/Idle) as a phase record. Called
+    // when a Complete/Dispatch bar takes over, when the fill kind changes, and
+    // at loop exit — so every iteration is attributed and the lane has no blanks.
+    auto flush_activity_fill = [&]() {
+        if (l2_swimlane.fill_kind != 0) {
+            l2_swimlane_aicpu_record_sched_phase(
+                thread_idx, static_cast<L2SwimlaneSchedPhaseKind>(l2_swimlane.fill_kind - 1), l2_swimlane.fill_start,
+                l2_swimlane.fill_end, l2_swimlane.sched_loop_count, /*tasks_processed=*/0
+            );
+            l2_swimlane.fill_kind = 0;
+        }
+    };
 #endif
 
     // Wall-clock timestamp of the last completed task on this thread.
@@ -824,6 +844,13 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
         CYCLE_COUNT_START();
         l2_swimlane.sched_loop_count++;
         uint64_t _t0_phase = _t0;
+        // Activity-fill bookkeeping: an iteration that emits no Complete/Dispatch
+        // bar and scanned running cores (retired nothing) is filled with a Poll
+        // bar; genuine spin stays blank. Release is NOT classified here — it is a
+        // distinct operation emitted with its own span in the idle branch below.
+        uint64_t iter_start_ts = _t0;
+        uint64_t fill_complete_at_start = l2_swimlane.sched_complete_cycle;
+        bool emitted_phase_bar = false;
         // Per-iter lazy shared-queue snapshot: first phase emit in this iter
         // pays the atomic-load cost, subsequent emits in the same iter reuse
         // the cached value. Reset here so we re-sample exactly once per iter
@@ -907,7 +934,12 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
             CYCLE_COUNT_LAP(l2_swimlane.sched_idle_cycle);
         } else {
             CYCLE_COUNT_LAP(l2_swimlane.sched_complete_cycle);
-            if (l2_swimlane_level_ >= L2SwimlaneLevel::SCHED_PHASES && l2_swimlane.phase_complete_count > 0) {
+            // Emit on any completion work this iteration — a finished slot OR
+            // sub-block retires that did not finish a slot. The latter makes the
+            // SPMD harvest tail visible (count field = blocks processed this
+            // iteration; on a pure-retire iteration phase_complete_count is 0).
+            if (l2_swimlane_level_ >= L2SwimlaneLevel::SCHED_PHASES &&
+                (l2_swimlane.phase_complete_count > 0 || l2_swimlane.phase_subretire_count > 0)) {
                 // Local depth is cheap (this thread's own buffer counter).
                 // Shared depth is NOT sampled here: complete's release_fanin
                 // pushes to local_bufs in the fast path (try_push succeeds
@@ -919,8 +951,8 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
                 capture_local_snapshot(phase_end_local);
                 l2_swimlane_aicpu_record_sched_phase(
                     thread_idx, L2SwimlaneSchedPhaseKind::Complete, _t0_phase, _t1, l2_swimlane.sched_loop_count,
-                    l2_swimlane.phase_complete_count, /*pop_hit=*/0, /*pop_miss=*/0, phase_start_local,
-                    phase_start_shared, phase_end_local, phase_start_shared
+                    l2_swimlane.phase_complete_count + l2_swimlane.phase_subretire_count, /*pop_hit=*/0,
+                    /*pop_miss=*/0, phase_start_local, phase_start_shared, phase_end_local, phase_start_shared
                 );
                 for (int s = 0; s < L2SWIMLANE_NUM_QUEUE_SHAPES; s++) {
                     phase_start_local[s] = phase_end_local[s];
@@ -928,6 +960,8 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
                 }
                 _t0_phase = _t1;
                 l2_swimlane.phase_complete_count = 0;
+                l2_swimlane.phase_subretire_count = 0;
+                emitted_phase_bar = true;
             }
         }
 #endif
@@ -1003,6 +1037,34 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
         // after normal dispatch (Hook 1). Best-effort; touches no dep state.
         try_speculative_prestage(thread_idx);
 
+        // Second completion poll. dispatch_ready_tasks + try_speculative_prestage
+        // above can take several us in a busy window; a producer block that FINs
+        // during them would otherwise wait for the NEXT iteration's top-of-loop
+        // Phase-1 poll (the ~7us detection latency that delays a flagged
+        // producer's doorbell). Re-polling here observes those FINs immediately,
+        // so the doorbell fires this iteration. Idempotent (the poll is a poll);
+        // we drain deferred releases eagerly to keep the buffer from growing.
+        if (tracker.has_any_running_cores()) {
+            int32_t completed_2nd = 0;
+            check_running_cores_for_completion(
+                thread_idx, hank, completed_2nd, cur_thread_completed, made_progress, deferred_release_slot_states,
+                deferred_release_count, local_bufs
+            );
+            if (completed_2nd > 0) {
+                completed_tasks_.fetch_add(completed_2nd, std::memory_order_relaxed);
+                last_progress_count = completed_tasks_.load(std::memory_order_relaxed);
+            }
+            // Eager drain so the second poll can't push deferred_release toward
+            // its cap between idle iterations.
+            while (deferred_release_count >= PTO2_DEFERRED_RELEASE_CAP - 96) {
+#if PTO2_SCHED_PROFILING
+                (void)sched_->on_task_release(*deferred_release_slot_states[--deferred_release_count], thread_idx);
+#else
+                sched_->on_task_release(*deferred_release_slot_states[--deferred_release_count]);
+#endif
+            }
+        }
+
 #if PTO2_PROFILING
         if (!try_pushed) {
             CYCLE_COUNT_LAP(l2_swimlane.sched_idle_cycle);
@@ -1035,6 +1097,7 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
                 l2_swimlane.phase_dispatch_count = 0;
                 l2_swimlane.pop_hit_at_last_emit = l2_swimlane.pop_hit;
                 l2_swimlane.pop_miss_at_last_emit = l2_swimlane.pop_miss;
+                emitted_phase_bar = true;
             }
         }
 #endif
@@ -1048,6 +1111,11 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
             idle_iterations = 0;
             last_progress_ts = get_sys_cnt_aicpu();
         } else {
+#if PTO2_PROFILING
+            uint64_t rel_t0 = (l2_swimlane_level_ >= L2SwimlaneLevel::SCHED_PHASES && deferred_release_count > 0) ?
+                                  get_sys_cnt_aicpu() :
+                                  0;
+#endif
             while (deferred_release_count > 0) {
 #if PTO2_SCHED_PROFILING
                 (void)sched_->on_task_release(*deferred_release_slot_states[--deferred_release_count], thread_idx);
@@ -1055,6 +1123,18 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
                 sched_->on_task_release(*deferred_release_slot_states[--deferred_release_count]);
 #endif
             }
+#if PTO2_PROFILING
+            // Release is a distinct operation from the poll scan — emit it with
+            // its own span (Perfetto nests it inside the surrounding poll/idle
+            // run by time-containment) rather than competing with poll for one
+            // per-iteration label.
+            if (rel_t0 != 0) {
+                l2_swimlane_aicpu_record_sched_phase(
+                    thread_idx, L2SwimlaneSchedPhaseKind::Release, rel_t0, get_sys_cnt_aicpu(),
+                    l2_swimlane.sched_loop_count, /*tasks_processed=*/0
+                );
+            }
+#endif
             idle_iterations++;
 
             if (idle_iterations % FATAL_ERROR_CHECK_INTERVAL == 0) {
@@ -1107,18 +1187,50 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
             SPIN_WAIT_HINT();
 #if PTO2_PROFILING
             CYCLE_COUNT_LAP(l2_swimlane.sched_idle_cycle);
-            // Idle iterations no longer emit a phase record. Host tooling
-            // recovers idle spans from the gap between consecutive sched
-            // phase records on the same thread. _t0_phase still advances
-            // so the next emitted COMPLETE/DISPATCH gets the correct
-            // start_time (the iter it actually ran in), not the start of
-            // the preceding idle stretch.
+            // _t0_phase advances through idle laps so the next emitted
+            // COMPLETE/DISPATCH bar starts at the iter it actually ran in, not
+            // at the start of the preceding idle stretch. The idle/poll time
+            // itself is attributed by the activity-fill below — no blanks.
             if (l2_swimlane_level_ >= L2SwimlaneLevel::SCHED_PHASES) {
                 _t0_phase = _t1;
             }
 #endif
         }
+
+#if PTO2_PROFILING
+        // Activity-fill: attribute an iteration that emitted no Complete/Dispatch
+        // bar to the real operation that dominated it — Release (on_task_release
+        // drain) or Poll (completion scan that retired nothing). Genuine spin
+        // (neither did work) emits nothing and shows as a blank gap. Consecutive
+        // same-kind iterations coalesce into one bar.
+        if (l2_swimlane_level_ >= L2SwimlaneLevel::SCHED_PHASES) {
+            if (emitted_phase_bar) {
+                flush_activity_fill();
+            } else {
+                uint64_t dc = l2_swimlane.sched_complete_cycle - fill_complete_at_start;
+                // Poll = scanned running cores, retired nothing; else genuine
+                // spin (blank). Release is emitted separately in the idle branch.
+                uint32_t kc = (dc > 0) ? (static_cast<uint32_t>(L2SwimlaneSchedPhaseKind::Poll) + 1) : 0;
+                if (kc == 0) {
+                    flush_activity_fill();  // genuine spin — leave a blank gap
+                } else if (l2_swimlane.fill_kind == kc) {
+                    l2_swimlane.fill_end = _t1;
+                } else {
+                    flush_activity_fill();
+                    l2_swimlane.fill_kind = kc;
+                    l2_swimlane.fill_start = iter_start_ts;
+                    l2_swimlane.fill_end = _t1;
+                }
+            }
+        }
+#endif
     }
+
+#if PTO2_PROFILING
+    // Close the final open activity-fill run so the trailing idle/poll stretch
+    // before loop exit is attributed.
+    flush_activity_fill();
+#endif
 
     // Drain any entries left in the deferred-release batch. The in-loop flush
     // only fires on idle iterations and on buffer-full; a loop exit while the

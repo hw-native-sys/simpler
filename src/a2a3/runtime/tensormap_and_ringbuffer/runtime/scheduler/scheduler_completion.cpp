@@ -136,6 +136,14 @@ void SchedulerContext::complete_slot_task(
 
     bool mixed_complete = sched_->on_subtask_complete(slot_state);
 
+#if PTO2_PROFILING
+    // Sub-block retire that did not finish the slot: record it so the poll
+    // iteration becomes visible on the scheduler lane (the SPMD harvest tail).
+    if (!mixed_complete && l2_swimlane_level_ >= L2SwimlaneLevel::SCHED_PHASES) {
+        l2_swimlane.phase_subretire_count++;
+    }
+#endif
+
     if (mixed_complete && slot_state.payload != nullptr &&
         slot_state.any_subtask_deferred.load(std::memory_order_acquire)) {
         // Some subtask of this task registered conditions; finish the
@@ -161,6 +169,12 @@ void SchedulerContext::complete_slot_task(
             );
         }
 #endif
+#if PTO2_PROFILING
+        // Time the fanout (fanin release + consumer doorbells) so it renders as
+        // a child bar nested inside this iteration's Complete bar — surfacing how
+        // much of a long complete is the 50-consumer walk + doorbell vs scan.
+        uint64_t fanout_t0 = (l2_swimlane_level_ >= L2SwimlaneLevel::SCHED_PHASES) ? get_sys_cnt_aicpu() : 0;
+#endif
 #if PTO2_SCHED_PROFILING
         // SCHED_PROFILING variant takes thread_idx for its per-thread atomic
         // counter side-effects (g_sched_*_atomic_count[thread_idx], consumed
@@ -170,6 +184,12 @@ void SchedulerContext::complete_slot_task(
         sched_->on_mixed_task_complete(slot_state, local_bufs);
 #endif
 #if PTO2_PROFILING
+        if (fanout_t0 != 0) {
+            l2_swimlane_aicpu_record_sched_phase(
+                thread_idx, L2SwimlaneSchedPhaseKind::Fanout, fanout_t0, get_sys_cnt_aicpu(),
+                l2_swimlane.sched_loop_count, /*tasks_processed=*/0
+            );
+        }
         l2_swimlane.phase_complete_count++;
 #endif
         if (deferred_release_count < PTO2_DEFERRED_RELEASE_CAP) {
@@ -251,6 +271,14 @@ void SchedulerContext::check_running_cores_for_completion(
 #if PTO2_SCHED_PROFILING
     auto &l2_swimlane = sched_l2_swimlane_[thread_idx];
 #endif
+#if PTO2_PROFILING
+    // Time this whole pass and count cores whose MMIO COND we actually read
+    // (skip-gated cores excluded) — emit a Scan bar so the per-pass MMIO cost
+    // and effective re-poll cadence are visible directly.
+    bool scan_record = l2_swimlane_level_ >= L2SwimlaneLevel::SCHED_PHASES;
+    uint64_t scan_t0 = scan_record ? get_sys_cnt_aicpu() : 0;
+    uint32_t scan_cores = 0;
+#endif
     CoreTracker &tracker = core_trackers_[thread_idx];
     auto running_core_states = tracker.get_all_running_cores();
     while (running_core_states.has_value()) {
@@ -258,9 +286,27 @@ void SchedulerContext::check_running_cores_for_completion(
         int32_t core_id = tracker.get_core_id_by_offset(bit_pos);
         CoreExecState &core = core_exec_states_[core_id];
 
+        // Skip gated speculative cores. A STAGED task is parked on this core
+        // waiting for its doorbell — it physically cannot ACK/FIN yet, so
+        // reading its COND (MMIO, and the core is hot-spinning on its own SPR)
+        // every poll is pure waste that drags out the completion phase. The
+        // doorbell (try_speculative_release) flips spec_state to DISPATCHED, at
+        // which point the core becomes pollable again and its FIN is caught.
+        // Cheap cacheable load; no MMIO. Pending slot is empty while gated.
+        {
+            PTO2TaskSlotState *rs = core.running_slot_state;
+            if (rs != nullptr && rs->payload != nullptr &&
+                rs->payload->spec_state.load(std::memory_order_relaxed) == PTO2_SPEC_STAGED) {
+                continue;
+            }
+        }
+
         // --- Judgment phase: read register, derive transition ---
         // Use the precomputed cond_ptr (resolved once in handshake) to skip
         // the reg_offset switch and reg_addr addition on every poll.
+#if PTO2_PROFILING
+        scan_cores++;  // counts cores whose MMIO COND we actually read this pass
+#endif
         uint64_t reg_val = static_cast<uint64_t>(*core.cond_ptr);
         // ARM64 allows Device-nGnRnE -> Normal-cacheable load reorder; the
         // rmb() pins any AICore-published cacheable reads downstream of the
@@ -358,6 +404,14 @@ void SchedulerContext::check_running_cores_for_completion(
             made_progress = true;
         }
     }
+#if PTO2_PROFILING
+    if (scan_record && scan_cores > 0) {
+        l2_swimlane_aicpu_record_sched_phase(
+            thread_idx, L2SwimlaneSchedPhaseKind::Scan, scan_t0, get_sys_cnt_aicpu(),
+            sched_l2_swimlane_[thread_idx].sched_loop_count, scan_cores
+        );
+    }
+#endif
 }
 
 // =============================================================================

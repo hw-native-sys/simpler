@@ -467,10 +467,18 @@ static_assert(sizeof(L2SwimlaneDataHeader) % 64 == 0, "L2SwimlaneDataHeader must
 //   (`g_orch_*_cycle`) — they answer "which sub-step dominates overall";
 //   the per-submit envelope answers "which submit was slow".
 
-/** Discriminator for the two SCHED phase records (the orch side has no kind). */
+/** Discriminator for the SCHED phase records (the orch side has no kind). */
 enum class L2SwimlaneSchedPhaseKind : uint32_t {
     Complete = 0,  // Process completed tasks (fanin traversal)
     Dispatch = 1,  // Dispatch ready tasks to idle cores
+    // Surfaced for loop iterations that produce no Complete/Dispatch bar but
+    // still do real work — otherwise hidden inside the "idle" stretch.
+    Poll = 2,     // Completion poll scanned running cores but retired nothing
+    Release = 3,  // Deferred-release drain (on_task_release fanout/refcount work)
+    // Nested child kinds — rendered inside their parent Complete/Dispatch bar
+    // (Perfetto stacks time-contained events on the same lane).
+    Fanout = 4,  // on_mixed_task_complete: fanin release + consumer doorbells
+    Scan = 5,    // one check_running_cores pass — tasks_processed = cores' MMIO COND read
 };
 
 /** Index layout of the queue-depth snapshot arrays below: AIC=0, AIV=1, MIX=2.

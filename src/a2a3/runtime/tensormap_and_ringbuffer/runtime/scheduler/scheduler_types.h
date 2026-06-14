@@ -375,6 +375,12 @@ struct alignas(64) SchedL2SwimlaneCounters {
     uint64_t sched_idle_cycle{0};
     uint64_t sched_loop_count{0};
     uint32_t phase_complete_count{0};
+    // Sub-block retires that did NOT finish a slot (SPMD blocks of a multi-block
+    // task retiring one at a time). Counted separately so the Complete-phase
+    // emit can fire on poll iterations that only retired sub-blocks — otherwise
+    // the serial-harvest tail of an SPMD slot is invisible (no slot completes
+    // until the last block, leaving the scheduler lane blank for that window).
+    uint32_t phase_subretire_count{0};
     uint32_t phase_dispatch_count{0};
     // Per-emit delta is (current - *_at_last_emit). Accumulated only when
     // l2_swimlane_level_ >= SCHED_PHASES.
@@ -382,6 +388,12 @@ struct alignas(64) SchedL2SwimlaneCounters {
     uint64_t pop_miss{0};
     uint64_t pop_hit_at_last_emit{0};
     uint64_t pop_miss_at_last_emit{0};
+    // Activity-fill: coalesced segment covering iterations that emit no
+    // Complete/Dispatch bar, so the scheduler lane tiles with no blanks.
+    // fill_kind: 0 = none open, else L2SwimlaneSchedPhaseKind value + 1.
+    uint32_t fill_kind{0};
+    uint64_t fill_start{0};
+    uint64_t fill_end{0};
 #if PTO2_SCHED_PROFILING
     uint32_t phase_wiring_count{0};
     uint64_t complete_probe_count{0};
