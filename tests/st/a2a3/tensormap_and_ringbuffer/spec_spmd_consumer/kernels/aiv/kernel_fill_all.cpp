@@ -49,7 +49,7 @@ extern "C" __aicore__ void kernel_entry(__gm__ int64_t *args) {
 
     uint32_t count = out_tensor->shapes[0];
     for (uint32_t i = 0; i < count; i++) {
-        out[i] = static_cast<float>(i + 1);
+        out[i] = static_cast<float>(static_cast<int32_t>(i + 1));
     }
     dcci(out, ENTIRE_DATA_CACHE, CACHELINE_OUT);
 }

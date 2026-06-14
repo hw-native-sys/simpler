@@ -57,9 +57,13 @@ extern "C" __aicore__ void kernel_entry(__gm__ int64_t *args) {
     // Invalidate the producer's output so this load sees post-doorbell data.
     dcci(in, ENTIRE_DATA_CACHE);
 
-    uint32_t count = in_tensor->shapes[0];
-    for (uint32_t i = 0; i < count; i++) {
-        out[i] = 2.0f * in[i];
+    // The SPMD producer wrote block i at stride CL (its own cache line); read
+    // back the per-block values. out is single-block (this kernel), so it can
+    // stay compact. CL = 64B / sizeof(float) on a2a3.
+    constexpr int CL = 16;
+    uint32_t n = in_tensor->shapes[0] / CL;
+    for (uint32_t i = 0; i < n; i++) {
+        out[i] = 2.0f * in[i * CL];
     }
     dcci(out, ENTIRE_DATA_CACHE, CACHELINE_OUT);
 }

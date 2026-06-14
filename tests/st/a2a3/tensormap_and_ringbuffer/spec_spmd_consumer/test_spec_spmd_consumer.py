@@ -10,9 +10,10 @@
 """Speculative early-dispatch — SPMD consumer coverage.
 
 DAG: t0 (single-block AIV, flagged) out_p[i]=i+1 -> t1 (SPMD AIV, block_num=4)
-out_c[i]=out_p[i]+10. The multi-block consumer is pre-staged block-by-block:
+out_c[i*CL]=out_p[i]+10. The multi-block consumer is pre-staged block-by-block:
 three blocks fit the doorbell budget (gated + released by doorbell) and the
-fourth dispatches normally off the ready queue. Golden: out_c[i]=i+11.
+fourth dispatches normally off the ready queue. Each block writes its own cache
+line (block i -> out_c[i*CL]); golden out_c[i*CL]=i+11, other slots 0.
 """
 
 import torch
@@ -21,6 +22,10 @@ from simpler.task_interface import ArgDirection as D
 from simpler_setup import SceneTestCase, TaskArgsBuilder, Tensor, scene_test
 
 BLOCK_NUM = 4
+# Each SPMD consumer block writes its own cache line — two AICore cores must
+# never write the same line on silicon (see docs/aicore-kernel-programming.md).
+# CL = 64B / sizeof(float) on a2a3, so block i writes out_c[i * CL].
+CL = 16
 
 
 @scene_test(level=2, runtime="tensormap_and_ringbuffer")
@@ -63,12 +68,14 @@ class TestSpecSpmdConsumer(SceneTestCase):
 
     def generate_args(self, params):
         return TaskArgsBuilder(
-            Tensor("out_c", torch.zeros(BLOCK_NUM, dtype=torch.float32)),
+            Tensor("out_c", torch.zeros(BLOCK_NUM * CL, dtype=torch.float32)),
         )
 
     def compute_golden(self, args, params):
-        out_p = torch.arange(1, BLOCK_NUM + 1, dtype=torch.float32)
-        args.out_c[:] = out_p + 10.0
+        # SPMD block i reads out_p[i]=i+1 and writes out_c[i*CL]=(i+1)+10.
+        args.out_c.zero_()
+        for i in range(BLOCK_NUM):
+            args.out_c[i * CL] = float(i + 1 + 10)
 
 
 if __name__ == "__main__":

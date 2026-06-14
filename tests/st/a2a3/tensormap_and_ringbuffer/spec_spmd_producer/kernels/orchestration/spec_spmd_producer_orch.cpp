@@ -45,7 +45,10 @@ aicpu_orchestration_config(const ChipStorageTaskArgs &orch_args) {
 __attribute__((visibility("default"))) void aicpu_orchestration_entry(const ChipStorageTaskArgs &orch_args) {
     Tensor ext_out = from_tensor_arg(orch_args.tensor(0));  // out_c
 
-    uint32_t inter_shapes[1] = {static_cast<uint32_t>(BLOCK_NUM)};
+    // Stride the SPMD producer's output by one cache line per block (16 floats
+    // = 64B on a2a3) so no two cores write the same line. See
+    // docs/aicore-kernel-programming.md "Each block must write to its own cache line".
+    uint32_t inter_shapes[1] = {static_cast<uint32_t>(BLOCK_NUM) * 16};
     TensorCreateInfo inter_ci(inter_shapes, 1, DataType::FLOAT32);
 
     // t0: SPMD producer, block i writes out_p[i] = i + 1  [flagged]

@@ -83,6 +83,42 @@ runs the same kernel and the kernel partitions work however it likes
 using `get_block_idx()` against whatever it expects. Don't conflate
 the two.
 
+### Each block must write to its own cache line
+
+**Two AICore blocks running on different cores must never write to the
+same cache line.** This is a hardware constraint, not a software policy.
+
+Each core holds its own copy of a cache line; on `dcci` (clean+invalidate)
+it writes back the **entire 64-byte line** (16 `float`s on a2a3), including
+the bytes it never touched — which in its copy are stale. When N cores each
+write a different element of the *same* line and flush, the last core to
+flush wins and overwrites every other core's element with a stale value.
+There is no per-element flush; `dcci` granularity is one whole cache line.
+
+So a kernel like this is **wrong** on silicon (it happens to pass on `sim`,
+which models no cache):
+
+```cpp
+// BROKEN: out has block_num elements packed into one cache line; every
+// block flushes the whole line -> last-writer-wins -> [0,0,0,last].
+out[block_idx] = value;
+dcci(&out[block_idx], SINGLE_CACHE_LINE, CACHELINE_OUT);
+```
+
+The fix is to give each block a cache-line-isolated output region — stride
+each block's output by at least one cache line (`>= 16` `float`s on a2a3),
+or have each block write a full cache-line-aligned tile (the usual case:
+real kernels write a head / row / tile per block, which is already aligned):
+
+```cpp
+constexpr int CACHE_LINE_FLOATS = 16;            // 64 B / sizeof(float)
+out[block_idx * CACHE_LINE_FLOATS] = value;      // distinct line per block
+dcci(&out[block_idx * CACHE_LINE_FLOATS], SINGLE_CACHE_LINE, CACHELINE_OUT);
+```
+
+See [hardware/cache-coherency.md](hardware/cache-coherency.md) for the full
+`dcci` / cache-line model.
+
 ---
 
 ## 3. Do **not** use the CCE topology intrinsics

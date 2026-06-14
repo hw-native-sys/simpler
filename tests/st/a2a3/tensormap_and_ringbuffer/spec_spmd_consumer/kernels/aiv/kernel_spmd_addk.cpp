@@ -62,6 +62,11 @@ extern "C" __aicore__ void kernel_entry(__gm__ int64_t *args) {
 
     // Invalidate so this load sees the producer's post-doorbell data.
     dcci(in, ENTIRE_DATA_CACHE);
-    out[block_idx] = in[block_idx] + 10.0f;
-    dcci(&out[block_idx], SINGLE_CACHE_LINE, CACHELINE_OUT);
+    // Each SPMD block writes its own cache line: two cores must never write the
+    // same line (each flushes the whole line -> last-writer-wins). The producer
+    // output `in` is compact (single-block writer), so reads stay compact.
+    // CL = 64B / sizeof(float) on a2a3. See docs/aicore-kernel-programming.md.
+    constexpr int CL = 16;
+    out[block_idx * CL] = in[block_idx] + 10.0f;
+    dcci(&out[block_idx * CL], SINGLE_CACHE_LINE, CACHELINE_OUT);
 }

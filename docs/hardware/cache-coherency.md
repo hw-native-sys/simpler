@@ -44,6 +44,21 @@ and what code lives on each side.
 for `Runtime` struct hand-off where the host writes via `rtMemcpy` and
 AICPU reads. **It is NOT the right primitive for AICore → AICPU.**
 
+### `dcci` is whole-cache-line: no parallel sub-line writes
+
+`dcci` cleans+invalidates **one whole cache line** (64 B on a2a3 = 16
+`float`s); there is no sub-line granularity. A core's writeback emits its
+entire line copy, including bytes it never wrote (stale in its copy).
+
+**Consequence — two AICore cores must never write different elements of the
+same cache line in parallel.** Each core flushes the whole line, so the last
+flush clobbers the others' elements with stale values (classic false
+sharing → last-writer-wins). This is invisible on `sim` (cache modeled as
+no-op: `SINGLE_CACHE_LINE == 0` in `platform/sim/aicore/inner_kernel.h`) and
+only fails on silicon. The kernel-author rule (each SPMD block writes its own
+cache line) lives in
+[../aicore-kernel-programming.md](../aicore-kernel-programming.md#each-block-must-write-to-its-own-cache-line).
+
 ## The "AICore → AICPU" path: AICPU does not invalidate, but DOES barrier
 
 AICore and AICPU share a coherency domain on GM. When AICore writes a

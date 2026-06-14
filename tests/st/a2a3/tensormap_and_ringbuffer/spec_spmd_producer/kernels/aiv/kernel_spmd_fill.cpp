@@ -52,8 +52,13 @@ extern "C" __aicore__ void kernel_entry(__gm__ int64_t *args) {
     __gm__ Tensor *out_tensor = reinterpret_cast<__gm__ Tensor *>(args[0]);
     __gm__ float *out = reinterpret_cast<__gm__ float *>(out_tensor->buffer.addr) + out_tensor->start_offset;
 
+    // Isolate each block on its own cache line: two AICore cores must never
+    // write the same line (each flushes the whole line -> last-writer-wins).
+    // See docs/aicore-kernel-programming.md "Each block must write to its own
+    // cache line". CL = 64B / sizeof(float) on a2a3.
+    constexpr int CL = 16;
     int32_t block_idx = get_block_idx(args);
-    out[block_idx] = static_cast<float>(block_idx + 1);
+    out[block_idx * CL] = static_cast<float>(block_idx + 1);
 
-    dcci(&out[block_idx], SINGLE_CACHE_LINE, CACHELINE_OUT);
+    dcci(&out[block_idx * CL], SINGLE_CACHE_LINE, CACHELINE_OUT);
 }
