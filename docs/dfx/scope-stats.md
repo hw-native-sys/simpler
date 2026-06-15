@@ -300,6 +300,8 @@ ScopeStatsCollector                platform scope_stats_collector_aicpu.cpp
       │                         │         └─ emit record, append to buffer;
   stop() (drain + join)         └──────────── push full buffer to ready_queue
   reconcile_counters()               orch exit: flush remaining buffers
+    recover current_buf_ptr
+    if abnormal exit left one
   write_jsonl()
 ```
 

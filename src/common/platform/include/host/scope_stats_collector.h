@@ -34,8 +34,9 @@
  *   start(tf)            — Inherited: launches mgmt + poll threads.
  *   [device execution]
  *   stop()               — Inherited: drain queues, join threads.
- *   reconcile_counters() — current_buf_ptr cleared by flush + collected ==
- *                          total - dropped cross-check.
+ *   reconcile_counters() — Recover any un-flushed current buffer left by an
+ *                          abnormal exit, then cross-check collected ==
+ *                          total - dropped.
  *   write_jsonl()        — Emit scope_stats/scope_stats.jsonl
  *                          (meta line + one record/line).
  *   finalize()           — Free all device memory, unregister.
@@ -153,8 +154,9 @@ public:
     // Poll-thread hook: append the buffer's records to the in-memory vector.
     void on_buffer_collected(const ScopeStatsReadyBufferInfo &info);
 
-    // After stop(): warn on drops / un-flushed buffer and cross-check
-    // collected == total - dropped. Returns true iff the run is clean.
+    // After stop(): recover a non-empty current buffer left by abnormal exit,
+    // warn on drops, and cross-check collected == total - dropped. Returns
+    // true iff the run is clean.
     bool reconcile_counters();
 
     // Render the collected records to
@@ -180,6 +182,8 @@ private:
     std::vector<ScopeStatsRecord> records_;
     std::mutex records_mutex_;
     uint64_t total_collected_ = 0;
+    uint64_t recovered_current_buf_ = 0;
+    uint64_t recovered_current_total_ = 0;
 
     ScopeStatsDataHeader *scope_stats_header() const { return get_scope_stats_header(shm_host_); }
     ScopeStatsBufferState *scope_stats_state(int idx = 0) const { return get_scope_stats_buffer_state(shm_host_, idx); }

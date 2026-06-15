@@ -37,7 +37,6 @@
 #include <cstring>
 #include <filesystem>
 #include <system_error>
-#include <unordered_set>
 
 #include "common/memory_barrier.h"
 #include "common/unified_log.h"
@@ -65,6 +64,8 @@ int ScopeStatsCollector::init(
     num_threads_ = num_threads;
     total_collected_ = 0;
     records_.clear();
+    recovered_current_buf_ = 0;
+    recovered_current_total_ = 0;
     execution_complete_.store(false, std::memory_order_release);
 
     // Stash callbacks on the base up-front so alloc_paired_buffer sees
@@ -175,6 +176,9 @@ bool ScopeStatsCollector::reconcile_counters() {
     bool clean = true;
 
     ScopeStatsBufferState *state = scope_stats_state(0);
+    uint64_t total_device = state->total_record_count;
+    uint64_t dropped_device = state->dropped_record_count;
+
     uint64_t buf_dev = state->current_buf_ptr;
     if (buf_dev != 0) {
         void *host_ptr = manager_.resolve_host_ptr(reinterpret_cast<void *>(buf_dev));
@@ -182,17 +186,32 @@ bool ScopeStatsCollector::reconcile_counters() {
             profiling_copy_from_device(host_ptr, reinterpret_cast<void *>(buf_dev), sizeof(ScopeStatsBuffer));
             uint32_t count = reinterpret_cast<const ScopeStatsBuffer *>(host_ptr)->count;
             if (count != 0) {
-                LOG_ERROR(
-                    "scope_stats reconcile: un-flushed buffer (current_buf_ptr=0x%lx, count=%u) — device flush failed",
-                    static_cast<unsigned long>(buf_dev), count
-                );
+                if (recovered_current_buf_ != buf_dev || recovered_current_total_ != total_device) {
+                    append_buffer_records(host_ptr);
+                    recovered_current_buf_ = buf_dev;
+                    recovered_current_total_ = total_device;
+                    LOG_WARN(
+                        "scope_stats reconcile: recovered un-flushed buffer "
+                        "(current_buf_ptr=0x%lx, count=%u) host-side; device flush did not run",
+                        static_cast<unsigned long>(buf_dev), count
+                    );
+                } else {
+                    LOG_WARN(
+                        "scope_stats reconcile: un-flushed buffer "
+                        "(current_buf_ptr=0x%lx, count=%u) was already recovered host-side",
+                        static_cast<unsigned long>(buf_dev), count
+                    );
+                }
                 clean = false;
             }
+        } else {
+            LOG_ERROR(
+                "scope_stats reconcile: un-flushed buffer current_buf_ptr=0x%lx has no host mapping",
+                static_cast<unsigned long>(buf_dev)
+            );
+            clean = false;
         }
     }
-
-    uint64_t total_device = state->total_record_count;
-    uint64_t dropped_device = state->dropped_record_count;
 
     if (dropped_device > 0) {
         LOG_WARN(
@@ -312,6 +331,8 @@ void ScopeStatsCollector::finalize(ScopeStatsUnregisterCallback unregister_cb, c
         records_.clear();
         records_.shrink_to_fit();
     }
+    recovered_current_buf_ = 0;
+    recovered_current_total_ = 0;
 
     auto release_dev = [&](void *p) {
         release_one_buffer(p, unregister_cb, free_cb);

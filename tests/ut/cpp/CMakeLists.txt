@@ -315,6 +315,27 @@ add_common_utils_test(test_elf_build_id common/test_elf_build_id.cpp)
 add_common_utils_test(test_runtime_orch_so common/test_runtime_orch_so.cpp)
 add_common_utils_test(test_device_arena common/test_device_arena.cpp)
 
+add_executable(test_scope_stats_collector
+    common/test_scope_stats_collector.cpp
+    ${CMAKE_SOURCE_DIR}/../../../src/common/platform/shared/host/scope_stats_collector.cpp
+    ${CMAKE_SOURCE_DIR}/../../../src/a2a3/platform/sim/host/profiling_copy.cpp
+    ${CMAKE_SOURCE_DIR}/stubs/test_stubs.cpp
+)
+target_include_directories(test_scope_stats_collector PRIVATE
+    ${GTEST_INCLUDE_DIRS}
+    ${CMAKE_SOURCE_DIR}/../../../src/a2a3/platform/include
+    ${CMAKE_SOURCE_DIR}/../../../src/common/platform/include
+    ${CMAKE_SOURCE_DIR}/../../../src/common/log/include
+    ${CMAKE_SOURCE_DIR}/../../../src/common
+)
+target_link_libraries(test_scope_stats_collector PRIVATE
+    ${GTEST_MAIN_LIB}
+    ${GTEST_LIB}
+    pthread
+)
+add_test(NAME test_scope_stats_collector COMMAND test_scope_stats_collector)
+set_tests_properties(test_scope_stats_collector PROPERTIES LABELS "no_hardware")
+
 # Per-callable_id orch SO file naming regression (see rtStreamSynchronize
 # 507018 root cause). Compiles the a2a3 onboard `create_orch_so_file`
 # against the test source so it runs on no-hw runners too.
