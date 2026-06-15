@@ -108,6 +108,10 @@ struct TensorPair {
     void *host_ptr;
     void *dev_ptr;
     size_t size;
+    // false for read-only INPUT tensors: they are never written by the kernel,
+    // so the end-of-run D2H copy-back is skipped. OUTPUT/INOUT/unknown
+    // keep the safe default of copying back.
+    bool needs_copy_back = true;
 };
 
 /**
@@ -119,6 +123,11 @@ struct HostApi {
     void (*device_free)(void *dev_ptr);
     int (*copy_to_device)(void *dev_ptr, const void *host_ptr, size_t size);
     int (*copy_from_device)(void *host_ptr, const void *dev_ptr, size_t size);
+    // Set a device buffer to a byte value (device-side, no PCIe). Used to
+    // zero-init pure OUTPUT buffers in lieu of an H2D copy-in. May be
+    // null on backends that don't wire it; callers must fall back to
+    // copy_to_device.
+    int (*device_memset)(void *dev_ptr, int value, size_t size);
     // Commit the three per-Worker pooled regions (PTO2 GM heap, PTO2 shared
     // memory, trb prebuilt runtime arena) as three independent device
     // allocations. `runtime_arena_size == 0` skips the third region (hbg

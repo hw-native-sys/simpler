@@ -106,6 +106,15 @@ static int copy_from_device(void *host_ptr, const void *dev_ptr, size_t size) {
     }
 }
 
+static int device_memset(void *dev_ptr, int value, size_t size) {
+    if (dev_ptr == NULL) return -1;
+    try {
+        return current_runner()->device_memset(dev_ptr, value, size);
+    } catch (...) {
+        return -1;
+    }
+}
+
 static uint64_t upload_chip_callable_buffer_wrapper(const void *callable) {
     try {
         return current_runner()->upload_chip_callable_buffer(static_cast<const ChipCallable *>(callable));
@@ -359,6 +368,7 @@ int run_prepared(
         r->host_api.device_free = device_free;
         r->host_api.copy_to_device = copy_to_device;
         r->host_api.copy_from_device = copy_from_device;
+        r->host_api.device_memset = device_memset;
         r->host_api.setup_static_arena = setup_static_arena_wrapper;
         r->host_api.acquire_pooled_gm_heap = acquire_pooled_gm_heap_wrapper;
         r->host_api.acquire_pooled_gm_sm = acquire_pooled_gm_sm_wrapper;
@@ -369,8 +379,9 @@ int run_prepared(
         // returned host_orch_func_ptr is non-null only on the hbg path and is
         // handed straight into bind_callable_to_runtime_impl below. signature
         // is the cached ChipCallable signature_[]; it's plumbed end-to-end for
-        // per-tensor direction decisions in runtime_maker but is currently
-        // unconsumed on both runtimes — see bind_callable_to_runtime_impl.
+        // per-tensor direction decisions in runtime_maker. trb consumes it to
+        // skip the D2H copy-back of read-only INPUT tensors; hbg still
+        // ignores it — see bind_callable_to_runtime_impl.
         auto bind_result = runner->bind_callable_to_runtime(*r, callable_id);
         if (bind_result.rc != 0) {
             return bind_result.rc;
