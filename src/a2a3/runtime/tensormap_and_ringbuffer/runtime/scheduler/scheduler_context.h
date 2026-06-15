@@ -277,13 +277,16 @@ private:
     // task is released by the doorbell at its normal ready-pop (Hook 2).
     int32_t try_speculative_prestage(int32_t thread_idx);
 
-    // Claim (claim_from=NONE) or extend (claim_from=STAGED) consumer `c`, staging
-    // its remaining blocks onto thread_idx's idle (RUNNING slot) then pending
-    // (gated-pending, promote-on-FIN) cores. Returns the number of blocks staged
-    // this call (0 if it lost the CAS or had no cores). Used by both the producer
-    // fanout walk (first claim) and the cross-thread extend-list drain.
-    int32_t
-    stage_consumer_blocks(int32_t thread_idx, PTO2TaskSlotState *c, PTO2ResourceShape shape, uint8_t claim_from);
+    // Stage the already-claimed range [start, start+count) of consumer `c` onto
+    // thread_idx's idle (RUNNING slot) then pending (gated-pending, promote-on-FIN)
+    // cores from the provided free-core sets. The caller advances next_block_idx and
+    // re-pushes `c` BEFORE calling, so this expensive prepare+publish runs
+    // concurrently with peers (mirrors the normal SPMD dispatch path). Returns the
+    // number of blocks staged.
+    int32_t stage_consumer_blocks(
+        int32_t thread_idx, PTO2TaskSlotState *c, PTO2ResourceShape shape, int32_t start, int32_t count,
+        CoreTracker::BitStates &idle, CoreTracker::BitStates &pend
+    );
 
     // One pass of "Phase 4" in the resolve_and_dispatch loop: IDLE-stage dispatch
     // for MIX then (if no mix residual) AIC/AIV; mid-flush of local buffers; then

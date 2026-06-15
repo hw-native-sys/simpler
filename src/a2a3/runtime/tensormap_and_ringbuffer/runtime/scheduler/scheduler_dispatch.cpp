@@ -574,13 +574,14 @@ void SchedulerContext::dispatch_ready_tasks(
     }
 }
 
-// Stage consumer `c`'s blocks onto thread_idx's idle then pending cores,
-// CONCURRENTLY with other threads. claim_from=NONE: this is the first claim (CAS
-// NONE->STAGING); claim_from=STAGING: join an in-progress staging (no CAS). Once
-// STAGING holds, every thread runs this body in parallel — each atomically claims
-// a distinct block via next_block_idx CAS and OR-s its cores into staged_core_mask,
-// so the 3 threads stage at once instead of in a serialized staircase (mirrors how
-// normal SPMD dispatch claims a range and lets peers grab the rest concurrently).
+// Stage the ALREADY-CLAIMED range [start, start+count) of consumer `c` onto
+// thread_idx's idle then pending cores. The caller (the queue drain) has advanced
+// next_block_idx by `count` under pop-exclusivity AND re-pushed `c` for peers
+// BEFORE calling this — so this, the expensive prepare+publish, runs CONCURRENTLY
+// with peers staging other ranges of the same consumer. This mirrors the normal
+// SPMD dispatch path (claim range -> store next_block_idx -> re-push -> dispatch).
+// `idle`/`pend` are this thread's free-core sets, sized so idle.count+pend.count >=
+// count (the caller clamped the claim to them), so all `count` blocks get a core.
 //
 // Rule 1: idle cores -> gated task in the RUNNING slot. Rule 2: PENDING slot of
 // cores running a real task -> promoted in when that task FINs (gated-pending Case
@@ -593,53 +594,16 @@ void SchedulerContext::dispatch_ready_tasks(
 // seq_cst order between "OR mask then load spec_state" (here) and "store DISPATCHED
 // then read mask" (release) guarantees every gated core's doorbell fires.
 int32_t SchedulerContext::stage_consumer_blocks(
-    int32_t thread_idx, PTO2TaskSlotState *c, PTO2ResourceShape shape, uint8_t claim_from
+    int32_t thread_idx, PTO2TaskSlotState *c, PTO2ResourceShape shape, int32_t start, int32_t count,
+    CoreTracker::BitStates &idle, CoreTracker::BitStates &pend
 ) {
-    if (claim_from == PTO2_SPEC_NONE) {
-        uint8_t expect = PTO2_SPEC_NONE;
-        if (!c->payload->spec_state.compare_exchange_strong(
-                expect, PTO2_SPEC_STAGING, std::memory_order_seq_cst, std::memory_order_seq_cst
-            )) {
-            return 0;  // lost: another thread already claimed or released
-        }
-        // mask was reset in reset_for_reuse; concurrent stagers only OR into it.
-    } else if (c->payload->spec_state.load(std::memory_order_seq_cst) != PTO2_SPEC_STAGING) {
-        return 0;  // released (or never staged) before we could join
-    }
-
     CoreTracker &tracker = core_trackers_[thread_idx];
-    auto idle = tracker.get_idle_core_offset_states(shape);
-    auto pend = tracker.get_pending_core_offset_states(shape);
     // Stamp the real pre-stage time (NOT 0) so the swimlane shows these blocks
     // dispatched during the producer's run, not at trace start.
     uint64_t prestage_ts = get_sys_cnt_aicpu();
     uint64_t my_cores[PTO2_SPEC_CORE_MASK_WORDS] = {0};  // cores this thread gated (for self-ring)
     int32_t staged = 0;
-
-    // Claim a CONTIGUOUS range of blocks in ONE CAS, sized to this thread's cores.
-    // Per-block CAS on the shared next_block_idx from 3 threads bounces that cache
-    // line and makes each staging pass tens of us, which (since staging runs on the
-    // producer's owner thread before the completion scan) delays detecting the
-    // producer finishing -> delays the doorbell. One range-claim per pass plus a
-    // batched mask OR (below) keeps the contended-atomic count tiny.
-    // Claim as many blocks as this thread has cores, in ONE CAS (range claim) — so
-    // the producer's whole consumer is pre-staged across the threads, not dribbled
-    // out a couple of blocks per pass.
-    int32_t my_cap = (idle.has_value() ? idle.count() : 0) + (pend.has_value() ? pend.count() : 0);
-    int32_t block = 0, count = 0;
-    while (my_cap > 0) {
-        int16_t cur = c->next_block_idx.load(std::memory_order_relaxed);
-        if (cur >= c->logical_block_num) break;
-        int32_t cnt = c->logical_block_num - cur;
-        if (cnt > my_cap) cnt = my_cap;
-        if (c->next_block_idx.compare_exchange_weak(
-                cur, static_cast<int16_t>(cur + cnt), std::memory_order_seq_cst, std::memory_order_relaxed
-            )) {
-            block = cur;
-            count = cnt;
-            break;
-        }
-    }
+    int32_t block = start;
     auto stage_from = [&](CoreTracker::BitStates &avail, bool to_pending) {
         while (count > 0 && avail.has_value()) {
             int32_t core_offset = avail.pop_first();
@@ -678,13 +642,6 @@ int32_t SchedulerContext::stage_consumer_blocks(
             }
         }
     }
-    if (staged > 0) {
-        LOG_INFO_V9(
-            "[SPEC] thread=%d %s consumer=%" PRId64 " staged +%d ->%d/%d", thread_idx,
-            claim_from == PTO2_SPEC_NONE ? "FIRST" : "EXTEND", static_cast<int64_t>(c->task->task_id.raw), staged,
-            c->next_block_idx.load(std::memory_order_relaxed), c->logical_block_num
-        );
-    }
     return staged;
 }
 
@@ -692,12 +649,13 @@ int32_t SchedulerContext::stage_consumer_blocks(
 // flagged producer onto cores freeing up when it finishes, gated by doorbell.
 // Returns the number of blocks staged this pass (for the Prestage swimlane bar).
 int32_t SchedulerContext::try_speculative_prestage(int32_t thread_idx) {
+    constexpr int PTO2_SPEC_QUEUE_DRAIN_MAX = 8;  // bounded pops per pass
     CoreTracker &tracker = core_trackers_[thread_idx];
     int32_t total_staged = 0;
 
     // Pass 1: first-claim consumers discovered via this thread's running flagged
-    // producers' fanout. A consumer with leftover blocks is published to the
-    // cross-thread extend list so threads NOT running the producer can finish it.
+    // producers' fanout. A consumer with leftover blocks is pushed to the
+    // cross-thread queue so threads NOT running the producer can finish it.
     auto running = tracker.get_all_running_cores();
     // An SPMD producer occupies many cores but is ONE task (one slot_state, one
     // fanout). Dedup so we walk each distinct running producer's fanout once.
@@ -729,42 +687,75 @@ int32_t SchedulerContext::try_speculative_prestage(int32_t thread_idx) {
             PTO2ResourceShape shape = c->active_mask.to_shape();
             if (shape != PTO2ResourceShape::AIC && shape != PTO2ResourceShape::AIV && shape != PTO2ResourceShape::MIX)
                 continue;
-            // Only FIRST-claim here (NONE). Extends are driven by the list in pass 2
-            // so they don't depend on which thread runs the producer.
             if (c->payload->spec_state.load(std::memory_order_acquire) != PTO2_SPEC_NONE) continue;
             // Eligible iff exactly ONE producer of C is still unsatisfied — that one
             // is P (we are scanning it RUNNING), so C is ready exactly when P ends.
             // Multi-producer joins pre-stage only once all OTHER producers completed.
             if (c->fanin_count - c->fanin_refcount.load(std::memory_order_acquire) != 1) continue;
 
-            total_staged += stage_consumer_blocks(thread_idx, c, shape, PTO2_SPEC_NONE);
-            // Publish for cross-thread extend whenever C is in the staging window
-            // with blocks left — regardless of whether THIS thread won the claim or
-            // staged anything (idempotent; spec_extend_publish dedups).
-            if (c->payload->spec_state.load(std::memory_order_acquire) == PTO2_SPEC_STAGING &&
-                c->next_block_idx.load(std::memory_order_relaxed) < c->logical_block_num) {
-                sched_->spec_extend_publish(c);
+            // First claim: CAS NONE->STAGING and push C to the queue ONCE. ALL
+            // staging (ours included) happens via the pass-2 drain, so every idle
+            // thread pops, claims a range, re-pushes, and stages CONCURRENTLY — no
+            // thread front-loads by staging here (that was the serial daisy chain).
+            uint8_t expect = PTO2_SPEC_NONE;
+            if (!c->payload->spec_state.compare_exchange_strong(
+                    expect, PTO2_SPEC_STAGING, std::memory_order_seq_cst, std::memory_order_seq_cst
+                )) {
+                continue;  // lost: another thread already claimed (and pushed) it
             }
+            if (!sched_->spec_queue_push(c))
+                LOG_INFO_V9(
+                    "[SPEC] queue full, consumer=%" PRId64 " dispatches normally",
+                    static_cast<int64_t>(c->task->task_id.raw)
+                );
         }
     }
 
-    // Pass 2: drain the cross-thread extend list onto THIS thread's cores. This is
-    // what lets a thread-local producer's consumer (e.g. rope_qkv's blocks all on
-    // one thread) still pre-stage the blocks belonging to other threads' cores —
-    // and lets all threads stage CONCURRENTLY rather than in a staircase.
-    for (int i = 0; i < PTO2SchedulerState::PTO2_SPEC_EXTEND_CAP; i++) {
-        PTO2TaskSlotState *c = sched_->spec_extend_list[i].load(std::memory_order_acquire);
-        if (c == nullptr) continue;
-        uint8_t st = c->payload->spec_state.load(std::memory_order_acquire);
-        // Released, or fully staged across threads => retire the entry.
-        if (st == PTO2_SPEC_DISPATCHED || c->next_block_idx.load(std::memory_order_relaxed) >= c->logical_block_num) {
-            sched_->spec_extend_list[i].store(nullptr, std::memory_order_release);
-            continue;
+    // Pass 2: drain the queue — mirrors the normal SPMD dispatch path. Pop a consumer,
+    // CLAIM a range sized to THIS thread's free cores by advancing next_block_idx with
+    // a CAS (atomic — next_block_idx is shared with normal dispatch, which also claims
+    // it if release routes the consumer to the ready queue, so a plain store could
+    // double-dispatch), RE-PUSH it for peers, THEN do the expensive prepare+publish.
+    // Re-pushing before staging lets peers claim the next range and stage CONCURRENTLY
+    // — a wide consumer (online_softmax, 48 blocks) is filled by all idle threads in
+    // parallel instead of a serial winner-then-peer daisy chain. Bounded pops/pass.
+    for (int n = 0; n < PTO2_SPEC_QUEUE_DRAIN_MAX; n++) {
+        PTO2TaskSlotState *c = sched_->spec_queue_pop();
+        if (c == nullptr) break;
+        if (c->payload->spec_state.load(std::memory_order_acquire) != PTO2_SPEC_STAGING) continue;  // released
+        PTO2ResourceShape shape = c->active_mask.to_shape();
+        auto idle = tracker.get_idle_core_offset_states(shape);
+        auto pend = tracker.get_pending_core_offset_states(shape);
+        int32_t freecores = (idle.has_value() ? idle.count() : 0) + (pend.has_value() ? pend.count() : 0);
+        if (freecores == 0) {  // no free cores of this shape — give it back for peers and stop
+            sched_->spec_queue_push(c);
+            break;
         }
-        if (st != PTO2_SPEC_STAGING) continue;  // not in the staging window
-        total_staged += stage_consumer_blocks(thread_idx, c, c->active_mask.to_shape(), PTO2_SPEC_STAGING);
-        if (c->next_block_idx.load(std::memory_order_relaxed) >= c->logical_block_num)
-            sched_->spec_extend_list[i].store(nullptr, std::memory_order_release);
+        // CAS-claim a contiguous range [start, start+claim) sized to this thread's
+        // free cores; CAS keeps it atomic against peers AND normal dispatch.
+        int32_t start = 0, claim = 0;
+        while (true) {
+            int16_t cur = c->next_block_idx.load(std::memory_order_relaxed);
+            if (cur >= c->logical_block_num) break;  // fully claimed
+            int32_t cnt = c->logical_block_num - cur;
+            if (cnt > freecores) cnt = freecores;
+            if (c->next_block_idx.compare_exchange_weak(
+                    cur, static_cast<int16_t>(cur + cnt), std::memory_order_seq_cst, std::memory_order_relaxed
+                )) {
+                start = cur;
+                claim = cnt;
+                break;
+            }
+        }
+        if (claim == 0) continue;  // nothing left to claim -> drop (no re-push)
+        // Re-push for concurrent peers BEFORE the expensive staging.
+        if (start + claim < c->logical_block_num) {
+            if (!sched_->spec_queue_push(c))
+                LOG_INFO_V9(
+                    "[SPEC] queue full on re-push, consumer=%" PRId64, static_cast<int64_t>(c->task->task_id.raw)
+                );
+        }
+        total_staged += stage_consumer_blocks(thread_idx, c, shape, start, claim, idle, pend);
     }
     return total_staged;
 }
@@ -1130,13 +1121,21 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
         // cross-thread idle gating. See dispatch_ready_tasks for the policy.
         dispatch_ready_tasks(thread_idx, tracker, local_bufs, pmu_active, made_progress, try_pushed);
 
-        // Phase 4b: speculative early-dispatch onto any spare idle cores left
-        // after normal dispatch (Hook 1). Best-effort; touches no dep state.
+        // Phase 4b: early-dispatch onto spare cores, but ONLY when this thread is
+        // otherwise idle — nothing was dispatched this iteration AND no ready work is
+        // queued for any shape. Early-dispatch competes with normal dispatch for
+        // pending slots, so gating on "no ready work" keeps it from delaying a real
+        // ready task; skipping the producer-fanout scan when busy also removes its
+        // per-iteration cost (the discovery walk only runs on genuinely idle passes).
+        bool any_ready_work = try_pushed;
+        for (int s = 0; !any_ready_work && s < PTO2_NUM_RESOURCE_SHAPES; s++) {
+            if (sched_->ready_queues[s].size() > 0 || local_bufs[s].count > 0) any_ready_work = true;
+        }
 #if PTO2_PROFILING
         bool prestage_record = l2_swimlane_level_ >= L2SwimlaneLevel::SCHED_PHASES;
         uint64_t prestage_t0 = prestage_record ? get_sys_cnt_aicpu() : 0;
 #endif
-        int32_t prestaged = try_speculative_prestage(thread_idx);
+        int32_t prestaged = any_ready_work ? 0 : try_speculative_prestage(thread_idx);
 #if PTO2_PROFILING
         // Emit a Prestage bar so a staging-dominated iteration shows as Prestage,
         // not mislabeled Poll (the cheap scan also ran, so the activity-fill would

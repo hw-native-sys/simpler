@@ -155,6 +155,8 @@ bool PTO2SchedulerState::init_data_from_layout(
     sched->wiring.batch_index = 0;
     sched->wiring.backoff_counter = 0;
 
+    sched->spec_queue_init();
+
     return true;
 }
 
