@@ -137,11 +137,19 @@ inline void dump_tensors_for_task(
     rmb();
 
     int32_t tensor_index = 0;
+    // Scalars are dumped once per task (outside the subtask loop below); stamp
+    // them with the first active subtask's func_id so a per-func_id filter
+    // (l0_swimlane) still finds them. For a mix task the pair is merged, so any
+    // active subtask's id works.
+    int32_t scalar_func_id = -1;
     for (int raw_subtask_id = 0; raw_subtask_id < MaxSubtaskSlots; raw_subtask_id++) {
         if (!is_subtask_active(slot_state.active_mask, raw_subtask_id)) {
             continue;
         }
         int32_t slot_idx = raw_subtask_id;
+        if (scalar_func_id < 0) {
+            scalar_func_id = slot_state.task->kernel_id[slot_idx];
+        }
         const CoreCallable &callable = *callables[slot_idx];
         for (int32_t sig_idx = 0; sig_idx < callable.sig_count(); sig_idx++) {
             ArgDirection dir = callable.sig(sig_idx);
@@ -163,6 +171,7 @@ inline void dump_tensors_for_task(
                     info.strides[d] = t.strides[d];
                 }
                 info.task_id = slot_state.task->task_id.raw;
+                info.func_id = slot_state.task->kernel_id[slot_idx];
                 info.arg_index = static_cast<uint32_t>(tensor_index);
                 info.role = role;
                 info.stage = stage;
@@ -187,6 +196,7 @@ inline void dump_tensors_for_task(
             }
             TensorDumpInfo info = {};
             info.task_id = slot_state.task->task_id.raw;
+            info.func_id = scalar_func_id;
             info.role = TensorDumpRole::INPUT;
             info.stage = stage;
             info.dtype = (has_scalar_dtypes && scalar_index < static_cast<int32_t>(dtype_scalar_count)) ?
@@ -315,6 +325,7 @@ inline void dump_tensors_for_task(
         const auto &t = tensor_info[tensor_arg_index];
         TensorDumpInfo info = {};
         info.task_id = task_id;
+        info.func_id = -1;  // host_build_graph overload: func_id not threaded here -> unknown
         info.role = role;
         info.stage = stage;
         info.dtype = static_cast<uint8_t>(t.dtype);

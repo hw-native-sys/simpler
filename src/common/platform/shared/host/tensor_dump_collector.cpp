@@ -224,6 +224,7 @@ void TensorDumpCollector::process_dump_buffer(const DumpReadyBufferInfo &info) {
 
         DumpedTensor dt;
         dt.task_id = rec.task_id;
+        dt.func_id = rec.func_id;
         dt.arg_index = rec.arg_index;
         dt.role = static_cast<TensorDumpRole>(rec.role);
         dt.stage = static_cast<TensorDumpStage>(rec.stage);
@@ -622,8 +623,8 @@ int TensorDumpCollector::export_dump_files() {
         first_entry = false;
 
         json << "    {\"task_id\": \"0x" << std::hex << std::setfill('0') << std::setw(16) << dt.task_id << std::dec
-             << "\"";
-        json << ", \"arg_index\": " << dt.arg_index << ", \"role\": \"" << tensor_dump_role_name(dt.role)
+             << "\", \"func_id\": " << (dt.func_id == 0xFFFF ? -1 : static_cast<int>(dt.func_id))
+             << ", \"arg_index\": " << dt.arg_index << ", \"role\": \"" << tensor_dump_role_name(dt.role)
              << "\", \"stage\": \"" << tensor_dump_stage_name(dt.stage) << "\", \"kind\": \""
              << tensor_dump_kind_name(dt.kind) << "\", \"dtype\": \"" << dtype_name << "\"";
         if (dt.kind == TensorDumpKind::SCALAR) {

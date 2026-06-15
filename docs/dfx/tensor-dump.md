@@ -204,6 +204,7 @@ Example manifest (one input tensor captured before dispatch):
   "tensors": [
     {
       "task_id": "0x0000000200000a00",
+      "func_id": 0,
       "role": "input",
       "stage": "before_dispatch",
       "arg_index": 0,
@@ -226,6 +227,11 @@ Key fields:
 
 - `task_id` — runtime task identity. Use to correlate with swimlane / PMU
   output.
+- `func_id` — kernel function id that produced the task, so each record is
+  attributable to a specific callable (e.g. filter all records of one
+  kernel). `-1` when unknown (currently the `host_build_graph` dump path,
+  which does not thread func_id). Emitted for the
+  `tensormap_and_ringbuffer` runtime.
 - `arg_index` — payload argument index. Tensor entries use the payload
   tensor index; scalar entries use `payload.tensor_count + scalar_index`.
   When scalar lvalue selection matched multiple scalar slots, the selected

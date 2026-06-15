@@ -610,6 +610,62 @@ an AIC-only launch with `HW_BLOCK_NUM=1`, you see one `cubecore0/`
 (no `veccore/`); for AIV-only, two `veccore{0,1}/` (no `cubecore0/`).
 Drag the `simulator/` directory into MindStudio Insight.
 
+## Viewing in Perfetto (optional — trace.json targets Insight)
+
+The intended viewer is **MindStudio Insight** (drag the `simulator/`
+directory in). In that export, `trace.json` is the timeline and
+`visualize_data.bin` is a binary bundle that embeds a byte-identical copy
+of `trace.json` plus an extra instruction→source map (`Cores` /
+`Instructions` with `AscendC Inner Code`) — Insight-only; Perfetto cannot
+read the `.bin`.
+
+`trace.json` is Chrome Trace Event JSON, so Perfetto (ui.perfetto.dev)
+*opens* it, but it is not Perfetto's intended format. **Opening the raw
+`trace.json` directly in Perfetto silently loses records** — some events
+present in the file never appear on the timeline, with no warning. The file
+itself is intact (Insight shows every record); the loss is purely in
+Perfetto's preview. It manifests in two ways:
+
+1. **Instruction records are dropped from the view.** Each pipe
+   (MTE1/MTE2/CUBE/FIXP) is one track, and concurrently in-flight `ph:"X"`
+   complete events on it overlap in time. Perfetto requires complete events
+   on a track to nest strictly; partially-overlapping ones are **dropped or
+   mis-stacked**, so e.g. a double-buffered LOAD_2D burst shows fewer
+   slices in Perfetto than were actually recorded. Because nothing warns
+   you, the missing instructions are easy to overlook.
+2. **SET_FLAG appears as a long bar (mispaired records).** SET_FLAG/
+   WAIT_FLAG are encoded as `B`/`E` pairs. Perfetto pairs them with a
+   per-track LIFO stack after sorting by ts; tie/edge cases can close a
+   short SET_FLAG `B` with a later `E`, drawing a spurious long SET_FLAG.
+   (SET_FLAG is always ~0.5 ns; the genuinely long flag bars are WAIT_FLAG
+   = pipe wait time — easy to misread as SET_FLAG.)
+
+To view in Perfetto, post-process a **copy** of `trace.json` (leave the
+original intact — Insight still needs it) with two **lossless** transforms.
+Both keep every event and its `ts`/`dur`; they only change `tid` and
+re-encode `B`/`E` as `X`:
+
+- **Sub-lanes (fixes problem 1).** Per `(pid,tid)`, greedily pack each
+  duration event into the lowest lane whose previous event already ended
+  (interval partitioning), so no two events on a lane overlap. A pipe
+  `MTE1` with depth-k concurrency becomes `MTE1#0..#k`. Give every lane of
+  a split track the `#N` suffix (**including `#0`** — a bare `MTE1`
+  alongside `MTE1#1` sorts apart) and rebuild each `thread_sort_index` as
+  `base*100 + lane`, so `#0..#k` render adjacent under their parent pipe.
+  Remember the pipe tracks also carry the flag `B`/`E` pairs and `flow`
+  (`ph` `s`/`t`) arrows — re-lane *all* of them, not just `ph:"X"`, or a
+  bare track lingers.
+- **Atomic flags (fixes problem 2).** Merge each `B`/`E` pair into a single
+  `ph:"X"` slice with `ts = B.ts`, `dur = E.ts - B.ts`. With no begin/end
+  events left, Perfetto has nothing to mispair; SET_FLAG stays its true
+  ~0.5 ns and WAIT_FLAG keeps its real wait duration.
+
+After both transforms every track is strictly non-overlapping per lane and
+free of `B`/`E`, so Perfetto shows all instructions with correct flag
+durations. If a long "SET_FLAG" still shows, you are viewing the original
+`trace.json` or a stale file — Perfetto does not auto-refresh; re-open the
+post-processed copy.
+
 ## Common pitfalls (in order of how often they bite)
 
 1. **Empty OPPROF dump after a "successful" simulator run.** Almost

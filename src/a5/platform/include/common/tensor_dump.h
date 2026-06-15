@@ -117,9 +117,10 @@ struct alignas(64) TensorDumpRecord {
     uint64_t payload_offset;  // Monotonic byte offset into thread arena
     uint64_t payload_size;    // Bytes actually copied (may be < full tensor bytes)
     uint64_t scalar_value;    // Valid when kind == TensorDumpKind::SCALAR
+    uint16_t func_id;         // Kernel function id that produced this record; 0xFFFF if unknown
     uint8_t kind;             // TensorDumpKind
     uint8_t flags;            // TENSOR_DUMP_RECORD_FLAG_*
-    uint8_t pad0[14];         // Preserve 64B cache-line layout + scalar_value + kind
+    uint8_t pad0[12];         // Preserve 64B cache-line layout + scalar_value + func_id + kind + flags
 
     // === Cache line 2 (64B) — strided view descriptor ===
     // start_offset placed first for 8B alignment without padding gaps; total = 8 + 20 + 20 = 48B.
@@ -269,6 +270,7 @@ struct TensorDumpInfo {
     uint64_t buffer_addr;
     uint64_t scalar_value;
     uint8_t kind;
+    int32_t func_id;  // Kernel function id; -1 (0xFFFF in record) if unknown
     uint8_t flags;
     uint8_t pad[14];
     uint64_t start_offset;                     // 1D ELEMENT offset of the view origin

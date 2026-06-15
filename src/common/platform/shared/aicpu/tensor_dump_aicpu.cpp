@@ -657,6 +657,7 @@ int dump_tensor_record(int thread_idx, const TensorDumpInfo &info) {
     uint32_t idx = buf->count;
     TensorDumpRecord *rec = &buf->records[idx];
     rec->task_id = info.task_id;
+    rec->func_id = static_cast<uint16_t>(info.func_id);  // -1 -> 0xFFFF (unknown)
     rec->arg_index = info.arg_index;
     rec->is_contiguous = is_contiguous ? 1 : 0;
     rec->role = static_cast<uint8_t>(info.role);
