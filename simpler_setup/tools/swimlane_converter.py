@@ -51,6 +51,27 @@ def _func_id_to_letter(func_id):
     return str(n) + "_" + "".join(reversed(letters))
 
 
+def _task_display_name(func_id, func_id_to_name, tdisp):
+    """Build the swimlane event label for a task.
+
+    Naming, in priority order:
+      - ``func_id < 0`` (unresolved): ``task(rXtY)``. This is the no-deps.json
+        case — without a dep_gen capture the host never carries func_id, so
+        every lane is an anonymous ``task(...)`` distinguished only by id.
+      - a name mapping exists for the func_id: ``<name>(rXtY)``.
+      - otherwise: ``func_<letter>(rXtY)`` (resolved id, but no name map entry).
+    """
+    try:
+        resolved = int(func_id) >= 0
+    except (TypeError, ValueError):
+        resolved = False
+    if not resolved:
+        return f"task({tdisp})"
+    if func_id_to_name and str(func_id) in func_id_to_name:
+        return f"{func_id_to_name[str(func_id)]}({tdisp})"
+    return f"func_{_func_id_to_letter(func_id)}({tdisp})"
+
+
 def normalize_pto2_task_id_int(v):
     """Unsigned 64-bit PTO2 task id (matches host JSON / device ``task_id.raw``).
 
@@ -688,6 +709,20 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0915
     if verbose:
         print(f"  Unique cores: {len(unique_cores)}")
 
+    # Recover func_id for AICORE_TIMING (level=1) records, which the host
+    # emits as func_id=-1. Resolve once here against dep_gen's per-task
+    # kernel_ids[3] (picking the subslot by core_type) and write it back onto
+    # the task, so every downstream consumer — AICore View, AICPU View, and
+    # event-hints — sees the same real func_id. See
+    # resolve_func_id_from_kernel_map() for the AIV0-vs-AIV1 tie-break and the
+    # host-side contract.
+    if deps_kernel_map is not None:
+        for task in tasks:
+            if int(task["func_id"]) < 0:
+                resolved = resolve_func_id_from_kernel_map(task["task_id"], task.get("core_type"), deps_kernel_map)
+                if resolved >= 0:
+                    task["func_id"] = resolved
+
     # Step 2: Generate JSON events
     events = []
 
@@ -735,22 +770,12 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0915
         ts = task["start_time_us"]
         dur = task["duration_us"]
 
-        # Get function name if available. At AICORE_TIMING (level=1) the
-        # host emits func_id=-1; recover the real func_id from dep_gen's
-        # per-task kernel_ids[3] using the record's core_type to pick the
-        # active subslot. See resolve_func_id_from_kernel_map() for the
-        # AIV0-vs-AIV1 tie-break and the host-side contract.
+        # func_id is already resolved (level=1 records recovered from
+        # dep_gen's kernel_ids up front; see the pre-pass above). Without a
+        # deps.json the id stays -1 and the lane is named task(rXtY).
         func_id = task["func_id"]
-        if int(func_id) < 0 and deps_kernel_map is not None:
-            resolved = resolve_func_id_from_kernel_map(task["task_id"], task.get("core_type"), deps_kernel_map)
-            if resolved >= 0:
-                func_id = resolved
         tdisp = format_task_display(task["task_id"])
-        if func_id_to_name and str(func_id) in func_id_to_name:
-            func_name = func_id_to_name[str(func_id)]
-            task_name = f"{func_name}({tdisp})"
-        else:
-            task_name = f"func_{_func_id_to_letter(func_id)}({tdisp})"
+        task_name = _task_display_name(func_id, func_id_to_name, tdisp)
 
         # Build fanout hint string (packed ids → rXtY / tY for readability)
         # from deps.json — the device hot path no longer carries fanout.
@@ -860,14 +885,11 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0915
             tid = task_to_aicpu_tid.get((task["task_id"], task["core_id"]), core_to_tid[task["core_id"]])
             aicpu_dur = finish_us - dispatch_us
 
-            # Get function name if available
+            # Get function name if available (task(rXtY) when no deps.json
+            # resolved the func_id; see _task_display_name).
             func_id = task["func_id"]
             tdisp = format_task_display(task["task_id"])
-            if func_id_to_name and str(func_id) in func_id_to_name:
-                func_name = func_id_to_name[str(func_id)]
-                task_name = f"{func_name}({tdisp})"
-            else:
-                task_name = f"func_{_func_id_to_letter(func_id)}({tdisp})"
+            task_name = _task_display_name(func_id, func_id_to_name, tdisp)
 
             events.append(
                 {

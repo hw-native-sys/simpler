@@ -136,7 +136,11 @@ When `--enable-l2-swimlane` is used, SceneTest automatically:
 3. Passes the file to `swimlane_converter.py` via `--func-names`.
 
 No manual steps are needed.  If no `"name"` fields are defined, no
-mapping file is written and the tools fall back to default labels.
+mapping file is written and the tools fall back to default labels:
+`func_<id>(rXtY)` when a `deps.json` resolved the `func_id`, or
+`task(rXtY)` when none is available (the host emits `func_id = -1`,
+so without `deps.json` tasks cannot be told apart by function — see
+[dfx/l2-swimlane-profiling.md §3.5](dfx/l2-swimlane-profiling.md#35-dependency-arrows-from-dep_gen)).
 
 ## Tool Usage
 
