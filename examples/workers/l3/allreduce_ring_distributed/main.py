@@ -28,10 +28,9 @@ Compared to mesh ``allreduce_distributed/`` (O(P) full-vector remote reads per
 rank), ring moves one chunk per round.  P=4 is the primary schedule width;
 P=2 is supported for regression.
 
-Scratch layout: P equal chunk slots followed by a compact 2(P-1)×P int32
-signal matrix (per-round notify/wait barriers).  Peers read directly from
+Scratch layout: P equal chunk slots followed by a 2(P-1)×kMax signal
+matrix (per-round notify/wait barriers).  Peers read directly from
 each other's chunk slots via CommRemotePtr — no separate exchange buffer.
-Signal slots rely on fresh-window zero-init (runtime guarantee).
 
 Run:
     python examples/workers/l3/allreduce_ring_distributed/main.py -p a2a3sim -d 0-3

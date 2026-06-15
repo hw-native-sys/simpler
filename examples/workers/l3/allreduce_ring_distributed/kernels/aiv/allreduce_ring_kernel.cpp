@@ -19,8 +19,8 @@
  * input / output are per-rank host tensors passed through TaskArgs (the
  * runtime handles the H2D / D2H).  scratch is the HCCL-window buffer:
  *   [0 .. P*chunk)           P chunk slots owned by this rank
- *   tail                     2*(P-1)*nranks int32 barrier slots (compact layout)
- *                            (fresh-window zero init — runtime guarantee)
+ *   tail                     2*(P-1)*kMaxSupportedRanks int32 barrier slots
+ *                            (fresh-window zero init)
  *
  * After each per-round barrier, peers read directly from each other's
  * chunks[] slots via CommRemotePtr — no separate exchange publish buffer.
@@ -85,21 +85,6 @@ AICORE inline void RoundBarrier(__gm__ CommContext *ctx, __gm__ int32_t *signal_
     pipe_barrier(PIPE_ALL);
 }
 
-// Stage-in / stage-out helper: copy one chunk-sized segment using MTE2↔MTE3.
-template <typename ShapeDyn, typename StrideDyn, typename Global, typename TileData>
-AICORE inline void CopyChunk(__gm__ float *dst, __gm__ float *src,
-                              TileData &tile,
-                              const ShapeDyn &chunkShape, const StrideDyn &chunkStride) {
-    Global srcG(src, chunkShape, chunkStride);
-    Global dstG(dst, chunkShape, chunkStride);
-    TLOAD(tile, srcG);
-    set_flag(PIPE_MTE2, PIPE_MTE3, EVENT_ID0);
-    wait_flag(PIPE_MTE2, PIPE_MTE3, EVENT_ID0);
-    TSTORE(dstG, tile);
-    set_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID0);
-    wait_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID0);
-}
-
 extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ int64_t *args) {
     __gm__ Tensor *input_tensor = reinterpret_cast<__gm__ Tensor *>(args[0]);
     __gm__ Tensor *output_tensor = reinterpret_cast<__gm__ Tensor *>(args[1]);
@@ -126,8 +111,7 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
 
     const int chunk_elems = static_cast<int>(ALLREDUCE_COUNT / static_cast<size_t>(nranks));
     __gm__ float *chunks = scratch;
-    // Signal rows after float region: total_rounds × nranks int32s (compact).
-    const int total_rounds = 2 * (nranks - 1);
+    // Signal rows after float region: 2*(P-1) rounds, kMaxSupportedRanks stride.
     __gm__ int32_t *signal_base =
         reinterpret_cast<__gm__ int32_t *>(scratch + static_cast<size_t>(nranks * chunk_elems));
 
@@ -146,7 +130,14 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
     for (int chunk = 0; chunk < nranks; ++chunk) {
         __gm__ float *dst = chunks + static_cast<size_t>(chunk * chunk_elems);
         __gm__ float *src = input + static_cast<size_t>(chunk * chunk_elems);
-        CopyChunk<ShapeDyn, StrideDyn, Global, TileData>(dst, src, chunkTile, chunkShape, chunkStride);
+        Global srcG(src, chunkShape, chunkStride);
+        Global dstG(dst, chunkShape, chunkStride);
+        TLOAD(chunkTile, srcG);
+        set_flag(PIPE_MTE2, PIPE_MTE3, EVENT_ID0);
+        wait_flag(PIPE_MTE2, PIPE_MTE3, EVENT_ID0);
+        TSTORE(dstG, chunkTile);
+        set_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID0);
+        wait_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID0);
     }
     pipe_barrier(PIPE_ALL);
 
@@ -159,7 +150,7 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
     for (int step = 1; step < nranks; ++step) {
         const int recv_add_idx = (my_rank - step - 1 + nranks) % nranks;
 
-        RoundBarrier(commCtx, signal_base + round * nranks, my_rank, nranks);
+        RoundBarrier(commCtx, signal_base + round * kMaxSupportedRanks, my_rank, nranks);
         ++round;
 
         const int left = (my_rank - 1 + nranks) % nranks;
@@ -193,7 +184,7 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
     for (int step = 1; step < nranks; ++step) {
         const int recv_idx = (my_rank - step + nranks) % nranks;
 
-        RoundBarrier(commCtx, signal_base + round * nranks, my_rank, nranks);
+        RoundBarrier(commCtx, signal_base + round * kMaxSupportedRanks, my_rank, nranks);
         ++round;
 
         const int left = (my_rank - 1 + nranks) % nranks;
@@ -222,7 +213,14 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
     for (int chunk = 0; chunk < nranks; ++chunk) {
         __gm__ float *dst = output + static_cast<size_t>(chunk * chunk_elems);
         __gm__ float *src = chunks + static_cast<size_t>(chunk * chunk_elems);
-        CopyChunk<ShapeDyn, StrideDyn, Global, TileData>(dst, src, chunkTile, chunkShape, chunkStride);
+        Global srcG(src, chunkShape, chunkStride);
+        Global dstG(dst, chunkShape, chunkStride);
+        TLOAD(chunkTile, srcG);
+        set_flag(PIPE_MTE2, PIPE_MTE3, EVENT_ID0);
+        wait_flag(PIPE_MTE2, PIPE_MTE3, EVENT_ID0);
+        TSTORE(dstG, chunkTile);
+        set_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID0);
+        wait_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID0);
     }
     pipe_barrier(PIPE_ALL);
 }
