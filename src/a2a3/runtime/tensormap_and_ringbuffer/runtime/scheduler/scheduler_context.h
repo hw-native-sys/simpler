@@ -275,7 +275,15 @@ private:
     // cores spare, pre-stage the consumers of any RUNNING flagged producer onto
     // those cores with not_ready=1 (gated). Touches no dependency state — the
     // task is released by the doorbell at its normal ready-pop (Hook 2).
-    void try_speculative_prestage(int32_t thread_idx);
+    int32_t try_speculative_prestage(int32_t thread_idx);
+
+    // Claim (claim_from=NONE) or extend (claim_from=STAGED) consumer `c`, staging
+    // its remaining blocks onto thread_idx's idle (RUNNING slot) then pending
+    // (gated-pending, promote-on-FIN) cores. Returns the number of blocks staged
+    // this call (0 if it lost the CAS or had no cores). Used by both the producer
+    // fanout walk (first claim) and the cross-thread extend-list drain.
+    int32_t
+    stage_consumer_blocks(int32_t thread_idx, PTO2TaskSlotState *c, PTO2ResourceShape shape, uint8_t claim_from);
 
     // One pass of "Phase 4" in the resolve_and_dispatch loop: IDLE-stage dispatch
     // for MIX then (if no mix residual) AIC/AIV; mid-flush of local buffers; then

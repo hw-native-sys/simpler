@@ -479,6 +479,11 @@ enum class L2SwimlaneSchedPhaseKind : uint32_t {
     // (Perfetto stacks time-contained events on the same lane).
     Fanout = 4,  // on_mixed_task_complete: fanin release + consumer doorbells
     Scan = 5,    // one check_running_cores pass — tasks_processed = cores' MMIO COND read
+    // Speculative early-dispatch (Hook 1): building + publishing a flagged
+    // producer's consumer's gated blocks. Its own bar so a long staging pass is
+    // NOT mislabeled Poll — it runs on the producer's owner thread and the
+    // payload-build cost is real (~us/subtask), so it must be visible directly.
+    Prestage = 6,  // try_speculative_prestage — tasks_processed = blocks staged
 };
 
 /** Index layout of the queue-depth snapshot arrays below: AIC=0, AIV=1, MIX=2.

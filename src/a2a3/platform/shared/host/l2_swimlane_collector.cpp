@@ -821,6 +821,8 @@ int L2SwimlaneCollector::export_swimlane_json() {
                 return "fanout";
             case L2SwimlaneSchedPhaseKind::Scan:
                 return "scan";
+            case L2SwimlaneSchedPhaseKind::Prestage:
+                return "prestage";
             }
             return "unknown";
         };

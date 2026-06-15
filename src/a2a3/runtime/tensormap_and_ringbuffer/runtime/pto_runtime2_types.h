@@ -264,16 +264,19 @@ struct PTO2TaskPayload {
     // padding between the fanin array (offset 536) and the 64B-aligned tensors[]
     // (offset 576), so sizeof and tensors[] alignment are unchanged.
     bool allow_early_resolve{false};  // codegen hint copied from Arg in prepare_task
-    // Lock-free claim state for the pre-stage race between Hook 1 (stager) and
-    // the completion-path release (try_speculative_release):
-    // 0=NONE, 1=STAGING, 2=STAGED, 3=DISPATCHED. The release-store to STAGED
-    // publishes staged_core_mask below (and the scheduler's doorbell-table writes
-    // the stager made); the acquire-load of STAGED at the doorbell makes them
-    // visible.
+    // Lock-free claim state shared by the stagers (Hook 1, possibly several AICPU
+    // threads concurrently) and the completion-path release: 0=NONE, 1=STAGING,
+    // 3=DISPATCHED (2=STAGED is unused now). STAGING is the STABLE gated state —
+    // many threads stage blocks concurrently while it holds, each claiming a block
+    // via the atomic next_block_idx and OR-ing its cores into staged_core_mask.
+    // Release does STAGING->DISPATCHED then rings the mask; a thread that stages a
+    // block AFTER release flipped DISPATCHED rings that block's doorbell itself
+    // (self-ring), so no doorbell is ever missed.
     std::atomic<uint8_t> spec_state{0};
-    // Bitmask of global core_ids this consumer is pre-staged (gated) on. Valid at
-    // STAGED. Release iterates set bits -> spec_doorbell_table[core_id].
-    uint64_t staged_core_mask[PTO2_SPEC_CORE_MASK_WORDS]{};
+    // Bitmask of global core_ids this consumer is pre-staged (gated) on. Set with
+    // atomic fetch_or by concurrent stagers; read by release. Reset in
+    // reset_for_reuse before the slot can be staged again.
+    std::atomic<uint64_t> staged_core_mask[PTO2_SPEC_CORE_MASK_WORDS]{};
     // === Cache lines 9-72 (4096B) — tensors (alignas(64) forces alignment) ===
     Tensor tensors[MAX_TENSOR_ARGS];
     // === Cache lines 73-74 (128B) — scalars ===
@@ -386,7 +389,11 @@ struct alignas(64) PTO2TaskSlotState {
     std::atomic<int16_t> completed_subtasks{0};  // Each core completion increments by 1
     int16_t total_required_subtasks{0};          // = logical_block_num * popcount(active_mask)
     int16_t logical_block_num{1};                // Total logical blocks (set by orchestrator)
-    int16_t next_block_idx{0};                   // Next block to dispatch (scheduler state)
+    // Next block to dispatch. Atomic so concurrent speculative stagers can each
+    // claim a distinct block via CAS; normal dispatch (ready-queue serialized)
+    // uses plain relaxed load/store. The two phases never overlap in time (staging
+    // happens before release; normal dispatch of the remainder happens after).
+    std::atomic<int16_t> next_block_idx{0};
 
     /**
      * Bind the slot-invariant ring id. Called once per slot during
@@ -424,8 +431,11 @@ struct alignas(64) PTO2TaskSlotState {
         fanin_refcount.store(0, std::memory_order_relaxed);
         fanout_refcount.store(0, std::memory_order_relaxed);
         completed_subtasks.store(0, std::memory_order_relaxed);
-        next_block_idx = 0;
+        next_block_idx.store(0, std::memory_order_relaxed);
         any_subtask_deferred.store(false, std::memory_order_relaxed);
+        if (payload != nullptr)
+            for (int w = 0; w < PTO2_SPEC_CORE_MASK_WORDS; w++)
+                payload->staged_core_mask[w].store(0, std::memory_order_relaxed);
     }
 
     // === Per-task fanout spinlock ===

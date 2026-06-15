@@ -892,6 +892,40 @@ struct PTO2SchedulerState {
     };
     SpecDoorbell spec_doorbell_table[PTO2_SPEC_CORE_MASK_WORDS * 64]{};
 
+    // Cross-thread extend list. A consumer's SPMD blocks span cores owned by
+    // several AICPU threads, but only a thread RUNNING the consumer's producer
+    // discovers it (via the producer's fanout). When that producer is thread-local
+    // (e.g. a 16-block AIV op filling one thread's cores), the other threads never
+    // see the consumer and its blocks on their cores can't pre-stage. The first
+    // claimer publishes a partially-staged consumer here; every thread's prestage
+    // pass then drains this list and extends listed consumers onto ITS OWN cores
+    // (CAS STAGED->STAGING). Safe across threads: entries are ring slot_states
+    // (stable memory, never freed — only reused) and all mutation goes through the
+    // consumer's atomic spec_state, so a stale/reused entry simply fails the CAS.
+    // Small: typically ~1 consumer is mid-stage at once. Kept to one cache line so
+    // the per-pass scan (run by every thread) doesn't bounce several lines across
+    // cores. A would-be entry that overflows just dispatches its blocks normally.
+    static constexpr int PTO2_SPEC_EXTEND_CAP = 4;
+    std::atomic<PTO2TaskSlotState *> spec_extend_list[PTO2_SPEC_EXTEND_CAP]{};
+
+    inline void spec_extend_publish(PTO2TaskSlotState *c) {
+        for (int i = 0; i < PTO2_SPEC_EXTEND_CAP; i++) {
+            PTO2TaskSlotState *e = nullptr;
+            if (spec_extend_list[i].compare_exchange_strong(e, c, std::memory_order_acq_rel, std::memory_order_relaxed))
+                return;
+            if (e == c) return;  // already listed
+        }
+        // List full: cross-thread extend just won't happen for this consumer; its
+        // overflow blocks dispatch normally. Not a correctness issue.
+    }
+
+    inline void spec_extend_remove(PTO2TaskSlotState *c) {
+        for (int i = 0; i < PTO2_SPEC_EXTEND_CAP; i++) {
+            if (spec_extend_list[i].load(std::memory_order_relaxed) == c)
+                spec_extend_list[i].store(nullptr, std::memory_order_release);
+        }
+    }
+
     static inline void ring_one_doorbell(uint64_t reg_addr, uint32_t token) {
         volatile uint64_t *dmb = reinterpret_cast<volatile uint64_t *>(get_reg_ptr(reg_addr, RegId::DATA_MAIN_BASE));
         uint64_t tk = static_cast<uint64_t>(token);
@@ -899,35 +933,39 @@ struct PTO2SchedulerState {
     }
 
     inline bool try_speculative_release(PTO2TaskSlotState &slot_state) {
+        // Never staged => CAS NONE->DISPATCHED wins => dispatch normally.
         uint8_t expect = PTO2_SPEC_NONE;
         if (slot_state.payload->spec_state.compare_exchange_strong(
-                expect, PTO2_SPEC_DISPATCHED, std::memory_order_acq_rel, std::memory_order_acquire
+                expect, PTO2_SPEC_DISPATCHED, std::memory_order_seq_cst, std::memory_order_seq_cst
             )) {
-            return false;  // not pre-staged
+            return false;
         }
-        while (expect == PTO2_SPEC_STAGING) {
-            expect = slot_state.payload->spec_state.load(std::memory_order_acquire);
-        }
-        // Ring one doorbell per gated core (each set bit in the mask). The
-        // (reg_addr, token) was recorded in spec_doorbell_table at stage time.
+        // Staged (STAGING). Flip STAGING->DISPATCHED, THEN read the mask. seq_cst
+        // gives a total order with the concurrent stagers, each of which OR-s its
+        // core into the mask and THEN loads spec_state: a stager whose bit lands
+        // before this CAS is read here and rung; a stager whose bit lands after
+        // sees DISPATCHED and rings that core itself (self-ring in
+        // stage_consumer_blocks). Either way every gated core's doorbell fires once
+        // (a double-ring is harmless — the AICore already matched). This replaces
+        // the old transient-STAGING spin: STAGING is now the stable gated state.
+        expect = PTO2_SPEC_STAGING;
+        slot_state.payload->spec_state.compare_exchange_strong(
+            expect, PTO2_SPEC_DISPATCHED, std::memory_order_seq_cst, std::memory_order_seq_cst
+        );
         for (int w = 0; w < PTO2_SPEC_CORE_MASK_WORDS; w++) {
-            uint64_t bits = slot_state.payload->staged_core_mask[w];
+            uint64_t bits = slot_state.payload->staged_core_mask[w].load(std::memory_order_seq_cst);
             while (bits != 0) {
                 int core_id = w * 64 + __builtin_ctzll(bits);
                 bits &= bits - 1;
                 ring_one_doorbell(spec_doorbell_table[core_id].addr, spec_doorbell_table[core_id].token);
             }
         }
-        // Released: the gated cores will now ACK/FIN. Flip STAGED -> DISPATCHED so
-        // the completion poll (which skips STAGED cores) resumes reading their COND.
-        // Safe to set before the batched ring fires: until the doorbell, the gated
-        // core's COND still holds its prior task's value, which decide_slot_transition
-        // won't match against this task's reg_task_id (no false completion).
-        slot_state.payload->spec_state.store(PTO2_SPEC_DISPATCHED, std::memory_order_release);
-        // Fully pre-staged (all blocks gated) => skip the ready queue. Partially
-        // pre-staged SPMD consumer => fall through so the caller pushes C to the
-        // ready queue; dispatch_shape resumes from next_block_idx for the rest.
-        return slot_state.next_block_idx >= slot_state.logical_block_num;
+        // Drop it from the cross-thread extend list (a stale entry would still fail
+        // the STAGING check, but removing keeps the list from filling with dead ones).
+        spec_extend_remove(&slot_state);
+        // Fully pre-staged => skip the ready queue. Partially staged SPMD consumer =>
+        // fall through so the caller pushes C; dispatch resumes from next_block_idx.
+        return slot_state.next_block_idx.load(std::memory_order_seq_cst) >= slot_state.logical_block_num;
     }
 
     bool release_fanin_and_check_ready(PTO2TaskSlotState &slot_state, PTO2LocalReadyBuffer *local_bufs = nullptr) {

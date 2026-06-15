@@ -1166,6 +1166,7 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
             "release": "olive",  # deferred-release drain (on_task_release work)
             "fanout": "vsync_highlight_color",  # nested in complete: fanin + doorbells
             "scan": "thread_state_iowait",  # one running-core MMIO COND scan pass
+            "prestage": "rail_animation",  # speculative early-dispatch (Hook 1) staging
         }
 
         # Per-complete subtask-finish counts surface "how many AICore FINs
@@ -1240,7 +1241,7 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
             # spin emits no record and shows as a blank gap.
             for record in thread_records:
                 phase = record.get("phase", "unknown")
-                if phase not in ("complete", "dispatch", "poll", "release", "fanout", "scan"):
+                if phase not in ("complete", "dispatch", "poll", "release", "fanout", "scan", "prestage"):
                     continue
                 start_us = record["start_time_us"]
                 end_us = record["end_time_us"]

@@ -309,7 +309,7 @@ void SchedulerContext::check_running_cores_for_completion(
         {
             PTO2TaskSlotState *rs = core.running_slot_state;
             if (rs != nullptr && rs->payload != nullptr &&
-                rs->payload->spec_state.load(std::memory_order_relaxed) == PTO2_SPEC_STAGED) {
+                rs->payload->spec_state.load(std::memory_order_relaxed) == PTO2_SPEC_STAGING) {
                 continue;
             }
         }
@@ -341,7 +341,7 @@ void SchedulerContext::check_running_cores_for_completion(
         // so decide_slot_transition completes the running FIN and promotes it.
         bool pending_gated =
             (core.pending_slot_state != nullptr && core.pending_slot_state->payload != nullptr &&
-             core.pending_slot_state->payload->spec_state.load(std::memory_order_relaxed) == PTO2_SPEC_STAGED);
+             core.pending_slot_state->payload->spec_state.load(std::memory_order_relaxed) == PTO2_SPEC_STAGING);
         SlotTransition t = decide_slot_transition(
             reg_task_id, reg_state, core.running_reg_task_id, core.pending_reg_task_id, pending_gated
         );
@@ -483,12 +483,13 @@ void SchedulerContext::drain_worker_dispatch(int32_t block_num) {
     }
     PTO2ResourceShape shape = slot_state->active_mask.to_shape();
 
-    for (int32_t t = 0; t < active_sched_threads_ && slot_state->next_block_idx < block_num; t++) {
+    for (int32_t t = 0;
+         t < active_sched_threads_ && slot_state->next_block_idx.load(std::memory_order_relaxed) < block_num; t++) {
         auto valid = core_trackers_[t].get_idle_core_offset_states(shape);
-        int32_t remaining = slot_state->logical_block_num - slot_state->next_block_idx;
+        int32_t start = slot_state->next_block_idx.load(std::memory_order_relaxed);
+        int32_t remaining = slot_state->logical_block_num - start;
         int32_t claim = std::min(valid.count(), remaining);
-        int32_t start = slot_state->next_block_idx;
-        slot_state->next_block_idx += claim;
+        slot_state->next_block_idx.store(static_cast<int16_t>(start + claim), std::memory_order_relaxed);
         PublishHandle handles[CoreTracker::MAX_CLUSTERS * 3];
         int handle_count = 0;
         for (int32_t b = 0; b < claim; b++) {
