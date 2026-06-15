@@ -20,7 +20,7 @@
  * runtime handles the H2D / D2H).  scratch is the HCCL-window buffer:
  *   [0 .. P*chunk)           P chunk slots owned by this rank
  *   tail                     2*(P-1)*nranks int32 barrier slots (compact layout)
- *                            (zero-initialized at kernel entry)
+ *                            (fresh-window zero init — runtime guarantee)
  *
  * After each per-round barrier, peers read directly from each other's
  * chunks[] slots via CommRemotePtr — no separate exchange publish buffer.
@@ -62,6 +62,7 @@ AICORE inline __gm__ T *CommRemotePtr(__gm__ CommContext *ctx, __gm__ T *localPt
 }
 
 // Per-round barrier row: used exactly once (AtomicAdd 0→1, TWAIT GE 1).
+// Relies on fresh-window zero-init (runtime guarantee) — no explicit reset.
 // Caller drains MTE pipes before invoking this so that prior TSTORE/TLOAD
 // work is visible before TNOTIFY lands on the peer (PTOAS v0.45 equivalent).
 AICORE inline void RoundBarrier(__gm__ CommContext *ctx, __gm__ int32_t *signal_row,
@@ -137,15 +138,6 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
 
     ShapeDyn chunkShape(1, 1, 1, 1, chunk_elems);
     StrideDyn chunkStride(chunk_elems, chunk_elems, chunk_elems, chunk_elems, 1);
-
-    // Explicitly zero-initialize local signal slots — device memory is not
-    // guaranteed to be zero-initialized and stale values cause spurious TWAIT.
-    for (int r = 0; r < total_rounds; ++r) {
-        for (int peer = 0; peer < nranks; ++peer) {
-            signal_base[r * nranks + peer] = 0;
-        }
-    }
-    pipe_barrier(PIPE_ALL);
 
     // ------------------------------------------------------------------
     // Phase 1: stage-in — partition local input into P chunk slots in the
