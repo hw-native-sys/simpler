@@ -1,0 +1,92 @@
+/*
+ * Copyright (c) PyPTO Contributors.
+ * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+ * CANN Open Software License Agreement Version 2.0 (the "License").
+ * Please refer to the License for details. You may not use this file except in compliance with the License.
+ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+ * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+ * See LICENSE in the root of the software repository for the full text of the License.
+ * -----------------------------------------------------------------------------------------------------------
+ */
+// producer.cce — AICore inner kernel. Single block (block_dim=1) on a single
+// AIC. The kernel runs a mode-aware tight loop that publishes a monotonic
+// counter + AICore-side sys_cnt via either:
+//
+//   mode == kNotifPerfModeGm:    write p_seq, write p_tw, dcci both fields,
+//                                let the GM cache-coherency protocol carry
+//                                the update to the AICPU's L1.
+//   mode == kNotifPerfModeCond:  write p_tw, dcci, then `set_cond(FIN|seq)`
+//                                via the SPR write — AICPU reads through
+//                                MMIO at COND register.
+//
+// Producer reads `mode` and `go` from the GM handshake every iteration, so
+// AICPU can switch subtest mid-flight without dropping go to 0 first.
+// Throttle (configurable via handshake.throttle_iter) leaves time for the
+// AICPU consumer to observe each update without queueing them up.
+//
+// Args contract (host passes via KernelArgs):
+//   args[0] = &NotifPerfHandshake (GM device pointer)
+
+#include "kernel_operator.h"
+
+#include "../shared/handshake.h"
+
+using AscendC::GlobalTensor;
+
+extern "C" __global__ __aicore__ void notif_perf_producer(__gm__ NotifPerfHandshake *hank) {
+    if (hank == nullptr) {
+        return;
+    }
+
+    // Wait until AICPU sets go=1. AICore's L1 cache for GM is non-coherent
+    // with AICPU writes, so dcci-invalidate the line before re-reading each
+    // time. Without dcci, AICore's L1 caches go=0 forever.
+    while (true) {
+        dcci(reinterpret_cast<__gm__ uint64_t *>(hank), SINGLE_CACHE_LINE);
+        if (hank->go == 1) {
+            break;
+        }
+    }
+
+    uint64_t seq = 0;
+    while (true) {
+        // Re-read mode + go each iter. The first cache line of the handshake
+        // holds {go, mode, throttle_iter, _pad0}, so a single SINGLE_CACHE_LINE
+        // dcci refreshes both.
+        dcci(reinterpret_cast<__gm__ uint64_t *>(hank), SINGLE_CACHE_LINE);
+        if (hank->go == 0) {
+            break;
+        }
+        uint32_t mode = hank->mode;
+        uint32_t throttle = hank->throttle_iter;
+
+        seq++;
+        uint64_t tw = get_sys_cnt();
+
+        if (mode == kNotifPerfModeGm) {
+            // Order matters: write tw FIRST so by the time AICPU observes
+            // the new p_seq, the paired tw is already in GM. dcci flushes the
+            // cache line containing both fields together.
+            hank->p_tw = tw;
+            hank->p_seq = seq;
+            dcci(&hank->p_seq, SINGLE_CACHE_LINE, CACHELINE_OUT);
+        } else {
+            // COND path: tw must still be visible to AICPU so it can compute
+            // the (t_obs - tw) latency once it sees the COND change.
+            hank->p_tw = tw;
+            dcci(&hank->p_tw, SINGLE_CACHE_LINE, CACHELINE_OUT);
+            // Write COND via SPR — production set_cond writes the same FIN
+            // encoding the scheduler expects.
+            uint32_t cond_val = (static_cast<uint32_t>(seq) & kNotifPerfTaskIdMask) | kNotifPerfTaskStateMask;
+            set_cond(cond_val);
+        }
+
+        // Throttle: a short spin so AICPU has time to observe each update.
+        // Empirically ~50 iter ≈ 1 µs on a3 AICore. Read once and let the
+        // compiler hoist the bound — the inner volatile keeps it from being
+        // optimised away entirely.
+        for (volatile uint32_t s = 0; s < throttle; s++) {
+            // empty
+        }
+    }
+}

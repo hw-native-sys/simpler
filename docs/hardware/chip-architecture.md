@@ -279,6 +279,8 @@ see `src/{a2a3,a5}/docs/`.
 | You want to know… | Read |
 | ----------------- | ---- |
 | When to insert `dcci` / `cache_invalidate_range` / `rmb()` | [cache-coherency.md](cache-coherency.md) |
+| AIC_CTRL MMIO attribute / cost / how to pick a notification path | [mmio-performance.md](mmio-performance.md) |
+| Where the public CANN driver / HCCL / HCOMM source lives | [cann-source-references.md](cann-source-references.md) |
 | Software three-program model layered on this hardware | [../chip-level-arch.md](../chip-level-arch.md) |
 | End-to-end task data flow | [../task-flow.md](../task-flow.md) |
 | Chip-specific counts, bus version, die / device-id mapping | [`src/a2a3/docs/hardware.md`](../../src/a2a3/docs/hardware.md), [`src/a5/docs/hardware.md`](../../src/a5/docs/hardware.md) |

@@ -181,7 +181,83 @@ down from `kernel_entry` into `UnpadAttentionDecoderAic::SetArgs` and
 
 ---
 
-## 4. Related
+## 4. Hard constraints — what AICore physically cannot do
+
+These are not design preferences; the hardware refuses or the chip
+hangs. They cap what protocol the kernel author can ask of the AICore
+side. Confirmed on a3 silicon — see
+[`docs/hardware/mmio-performance.md`](hardware/mmio-performance.md)
+for the measurements and
+[`docs/investigations/2026-06-aicore-mmio-to-spr.md`](investigations/2026-06-aicore-mmio-to-spr.md)
+for the verdict trail.
+
+- **No SPR-write to `DATA_MAIN_BASE`.** `MOV DATA_MAIN_BASE, x` is
+  rejected at compile time — the CCEC backend has no destination
+  encoding for that SPR. Only `MOV %0, DATA_MAIN_BASE` (read self) is
+  available. Use the `=l` constraint to accept either uint32 or
+  uint64; `=r` rejects uint64.
+- **No load or store into the SPR MMIO window.** Issuing a
+  `LDR`/`STR` from inside an AICore at `peer.reg_addr + offset` (or
+  your own `reg_addr + offset`) hangs the AICore. The CCECPU monitor
+  kills `aicpu-sd` 50 s later. This applies symmetrically to peer
+  cores' DMB, peer cores' COND, and any other AIC_CTRL register —
+  the chip only accepts SPR-window transactions from AICPU.
+- **DMB is hardware-unidirectional.** Combining the two above, an
+  AICore has no path to mutate any DATA_MAIN_BASE — its own or a
+  peer's. If a protocol needs an AICore to publish a value into DMB,
+  route through GM (write field + `dcci`, see
+  [`cache-coherency.md`](hardware/cache-coherency.md)) and let an
+  AICPU thread forward the value into DMB by MMIO STR.
+- **COND is the only AICPU-visible per-task signal an AICore can
+  emit.** `write_reg(RegId::COND, MAKE_FIN_VALUE(task_id))` (or
+  `MAKE_ACK_VALUE`) is the production path — the SPR write retires
+  in ~5–10 ns and lands at the COND MMIO register that AICPU's
+  scheduler polls.
+
+If a kernel needs to publish anything other than a per-task COND
+update — for example, a counter, a profiling slot, or a
+ring-buffer-style record — it must go through GM with `dcci`. There
+is no "fast direct register" alternative on the AICore side.
+
+### 4.1 AIC vs AIV on SPR self-access — single-run measurements
+
+These were sampled on a3 silicon during the experiment that produced
+[`mmio-performance.md`](hardware/mmio-performance.md). They are
+single-run readings; treat as "the direction of the surprise is solid,
+the exact magnitude needs verification before you optimise on it."
+
+- **AIC and AIV are indistinguishable on a hot SPR self-cadence path.**
+  A tight loop of `set_cond(FIN) + read_reg(DMB)` runs at ~9.7 ns /
+  iter on both AIC and AIV. This **refutes** the commonly-stated
+  hypothesis that AIC SPR writes trigger a pipeline flush that AIV
+  avoids. If you've seen a kernel slowdown attributed to "AIC SPR
+  pipeline penalty," look for the real cause elsewhere — the bare
+  set_cond + read_reg cost is the same on both engines.
+- **AIC tolerates rotating SPR write targets; AIV does not.** A
+  tight loop of `STR` cycling across N distinct SPR target registers
+  costs ~5 ns / STR on AIC (no extra cost vs same-target). On AIV the
+  same loop costs ~26 ns / STR (about 5× slower than same-target).
+  Direction is opposite of the obvious guess ("AIC has more cube
+  state, so target switching should hurt more"). Practical
+  implication: AIV kernels that publish across multiple SPRs in a
+  tight loop pay a per-switch tax that AIC kernels don't; if you can
+  batch writes to one SPR before moving to the next, do so on AIV.
+
+Both findings come from one sample. Re-verify before relying on
+either as a design constraint. The
+[`aicore-notification-perf`](../tools/cann-examples/aicore-notification-perf/)
+tool's producer kernel is the closest scaffolding — its `producer.cce`
+already has a mode-aware tight-loop runs on AICore with AICPU-side
+tick capture. Extending it to time the AICore-internal
+`set_cond + read_reg` cadence (Phase 5) or rotating-target SPR writes
+(Phase 6) is the minimum work — add a new `NotifPerfMode` value, a
+matching branch in `producer.cce`, and result fields the consumer
+sums into the existing `NotifPerfResult`. Build the producer once
+with `-DCCE_AICORE_ARCH=dav-c220-cube` for AIC and once with
+`-DCCE_AICORE_ARCH=dav-c220-vec` for AIV; both findings need the
+AIC/AIV comparison to be meaningful.
+
+## 5. Related
 
 - [`src/a2a3/runtime/tensormap_and_ringbuffer/common/intrinsic.h`](../src/a2a3/runtime/tensormap_and_ringbuffer/common/intrinsic.h)
   — declarations of the args-based accessors and the

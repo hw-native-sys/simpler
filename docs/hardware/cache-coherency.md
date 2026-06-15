@@ -66,7 +66,7 @@ slot, the correct handshake is:
 
 ```text
 AICore                              AICPU
-  store slot fields                   read COND (MMIO, Device-nGnRnE)
+  store slot fields                   read COND (MMIO, Device-nGnRE)
   store task_id (last)                check FIN bit
   dcci slot, SINGLE_CACHE_LINE   →    rmb()                ← load-load barrier
   dsb (commit dcci before FIN)        read slot fields     ← Normal cacheable
@@ -83,7 +83,7 @@ Two separate concerns, often conflated:
   never reaches HBM and AICPU would observe an old value.
 
 - **Load-load ordering** (Do we need `rmb()`?): **Yes.** The COND
-  register is `Device-nGnRnE` memory; the slot is Normal cacheable
+  register is `Device-nGnRE` memory; the slot is Normal cacheable
   memory. ARM64 does not implicitly order Device reads against
   subsequent Normal reads — they can be reordered if there is no
   data/address dependency. In this path, the slot address is computed
@@ -171,7 +171,7 @@ When you are about to insert a cache operation, ask in order:
    before signaling? If not, fix that instead of papering over it
    with an AICPU-side invalidate.
 4. Did I just read a completion flag (COND / mailbox / counter) from
-   a different memory type (Device-nGnRnE MMIO) before this load? If
+   a different memory type (Device-nGnRE MMIO) before this load? If
    yes, and there is no data/address dependency between that read and
    this one, insert `rmb()` between them — coherency does not imply
    load-load ordering on ARM64.
