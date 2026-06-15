@@ -333,15 +333,15 @@ struct Arg : TaskArgsTpl<TensorRef, uint64_t, MAX_TENSOR_ARGS, MAX_SCALAR_ARGS, 
         static_assert(sizeof...(Args) >= 1, "add_scalar: at least one argument required");
         static_assert((is_supported_scalar_arg_v<Args> && ...), "add_scalar: all types must be arithmetic or enum");
         if (scalar_count_ + sizeof...(Args) > MAX_SCALAR_ARGS) {
-            set_error("Too many scalar args (exceeds MAX_SCALAR_ARGS=32)");
+            set_error("Too many scalar args (exceeds MAX_SCALAR_ARGS=16)");
             return;
         }
         (add_scalar_one(std::forward<Args>(args)), ...);
     }
 
     void add_scalars(const uint64_t *values, int count) {
-        if (scalar_count_ + count > MAX_SCALAR_ARGS) {
-            set_error("Too many scalar args (exceeds MAX_SCALAR_ARGS=32)");
+        if (count < 0 || scalar_count_ + count > MAX_SCALAR_ARGS) {
+            set_error("Too many scalar args (exceeds MAX_SCALAR_ARGS=16)");
             return;
         }
         memcpy(&scalars_[scalar_count_], values, count * sizeof(uint64_t));
@@ -359,8 +359,8 @@ struct Arg : TaskArgsTpl<TensorRef, uint64_t, MAX_TENSOR_ARGS, MAX_SCALAR_ARGS, 
      * Uses NEON to process 4 elements per iteration on aarch64.
      */
     void add_scalars_i32(const int32_t *values, int count) {
-        if (scalar_count_ + count > MAX_SCALAR_ARGS) {
-            set_error("Too many scalar args (exceeds MAX_SCALAR_ARGS=32)");
+        if (count < 0 || scalar_count_ + count > MAX_SCALAR_ARGS) {
+            set_error("Too many scalar args (exceeds MAX_SCALAR_ARGS=16)");
             return;
         }
         uint64_t *dst = &scalars_[scalar_count_];
@@ -393,12 +393,12 @@ struct Arg : TaskArgsTpl<TensorRef, uint64_t, MAX_TENSOR_ARGS, MAX_SCALAR_ARGS, 
      * Useful when multiple tasks share the same scalar data (e.g., block indices).
      */
     void copy_scalars_from(const Arg &src, int src_offset, int count) {
-        if (src_offset + count > src.scalar_count_) {
+        if (count < 0 || src_offset + count > src.scalar_count_) {
             set_error("Source scalar range out of bounds in copy_scalars_from");
             return;
         }
         if (scalar_count_ + count > MAX_SCALAR_ARGS) {
-            set_error("Too many scalar args (exceeds MAX_SCALAR_ARGS=32)");
+            set_error("Too many scalar args (exceeds MAX_SCALAR_ARGS=16)");
             return;
         }
         memcpy(&scalars_[scalar_count_], &src.scalars_[src_offset], count * sizeof(uint64_t));
