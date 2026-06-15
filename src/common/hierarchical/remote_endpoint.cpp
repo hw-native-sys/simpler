@@ -414,9 +414,9 @@ void RemoteL3SocketTransport::start_health_monitor(uint64_t session_id, int32_t 
         auto read_exact = [&](uint8_t *data, size_t size) -> bool {
             size_t off = 0;
             auto deadline =
-                std::chrono::steady_clock::now() +
-                std::chrono::duration_cast<std::chrono::steady_clock::duration>(std::chrono::duration<double>(timeout_s)
-                );
+                std::chrono::steady_clock::now() + std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+                                                       std::chrono::duration<double>(timeout_s)
+                                                   );
             while (off < size) {
                 if (health_stop_.load(std::memory_order_acquire)) return false;
                 auto now = std::chrono::steady_clock::now();
