@@ -12,18 +12,20 @@
 #include "remote_endpoint.h"
 
 #include <arpa/inet.h>
+#include <fcntl.h>
 #include <netdb.h>
 #include <sys/select.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
+#include <cerrno>
 #include <chrono>
 #include <cstring>
-#include <cerrno>
 #include <cstdint>
-#include <array>
+#include <future>
 #include <stdexcept>
 #include <thread>
 #include <utility>
@@ -31,6 +33,22 @@
 #include "ring.h"
 
 namespace {
+
+using Deadline = std::chrono::steady_clock::time_point;
+
+struct TcpAddress {
+    int family{AF_UNSPEC};
+    int socktype{SOCK_STREAM};
+    int protocol{0};
+    sockaddr_storage addr{};
+    socklen_t addrlen{0};
+};
+
+struct ResolveTcpResult {
+    int error_code{0};
+    std::string error_message;
+    std::vector<TcpAddress> addresses;
+};
 
 uint32_t read_le_u32(const uint8_t *data) {
     return static_cast<uint32_t>(data[0]) | (static_cast<uint32_t>(data[1]) << 8) |
@@ -76,6 +94,12 @@ int32_t get_i32(const std::vector<uint8_t> &data, size_t &offset) {
     return static_cast<int32_t>(v);
 }
 
+double remaining_seconds(Deadline deadline, const std::string &message) {
+    auto now = std::chrono::steady_clock::now();
+    if (now >= deadline) throw std::runtime_error(message);
+    return std::chrono::duration<double>(deadline - now).count();
+}
+
 timeval timeout_to_timeval(double timeout_s) {
     if (timeout_s <= 0.0) throw std::invalid_argument("RemoteL3SocketTransport: timeout must be positive");
     timeval tv{};
@@ -84,39 +108,204 @@ timeval timeout_to_timeval(double timeout_s) {
     return tv;
 }
 
-int connect_tcp_socket(const std::string &host, uint16_t port, const std::string &label) {
+ResolveTcpResult resolve_tcp_addresses(const std::string &host, const std::string &port_s) {
     addrinfo hints{};
     hints.ai_family = AF_UNSPEC;
     hints.ai_socktype = SOCK_STREAM;
     addrinfo *results = nullptr;
-    std::string port_s = std::to_string(port);
+
+    ResolveTcpResult result;
     int rc = getaddrinfo(host.c_str(), port_s.c_str(), &hints, &results);
     if (rc != 0) {
-        throw std::runtime_error(label + ": getaddrinfo failed for " + host + ":" + port_s + ": " + gai_strerror(rc));
+        result.error_code = rc;
+        result.error_message = gai_strerror(rc);
+        return result;
     }
+    for (addrinfo *ai = results; ai != nullptr; ai = ai->ai_next) {
+        if (ai->ai_addrlen > sizeof(sockaddr_storage)) continue;
+        TcpAddress addr;
+        addr.family = ai->ai_family;
+        addr.socktype = ai->ai_socktype;
+        addr.protocol = ai->ai_protocol;
+        addr.addrlen = static_cast<socklen_t>(ai->ai_addrlen);
+        std::memcpy(&addr.addr, ai->ai_addr, ai->ai_addrlen);
+        result.addresses.push_back(addr);
+    }
+    freeaddrinfo(results);
+    return result;
+}
 
+std::vector<TcpAddress> resolve_tcp_addresses_with_timeout(
+    const std::string &host, const std::string &port_s, const std::string &label, Deadline deadline
+) {
+    auto promise = std::make_shared<std::promise<ResolveTcpResult>>();
+    std::future<ResolveTcpResult> future = promise->get_future();
+    std::thread([promise, host, port_s]() {
+        try {
+            promise->set_value(resolve_tcp_addresses(host, port_s));
+        } catch (...) {
+            promise->set_exception(std::current_exception());
+        }
+    }).detach();
+
+    double remaining = remaining_seconds(deadline, label + ": timed out resolving address");
+    if (future.wait_for(std::chrono::duration<double>(remaining)) != std::future_status::ready) {
+        throw std::runtime_error(label + ": timed out resolving address");
+    }
+    ResolveTcpResult result = future.get();
+    if (result.error_code != 0) {
+        throw std::runtime_error(
+            label + ": getaddrinfo failed for " + host + ":" + port_s + ": " + result.error_message
+        );
+    }
+    if (result.addresses.empty()) {
+        throw std::runtime_error(label + ": no TCP address found for " + host + ":" + port_s);
+    }
+    return result.addresses;
+}
+
+void configure_socket_no_sigpipe(int fd, const std::string &label) {
+#if defined(SO_NOSIGPIPE)
+    int one = 1;
+    if (::setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof(one)) != 0) {
+        throw std::runtime_error(label + ": setsockopt(SO_NOSIGPIPE) failed: " + std::strerror(errno));
+    }
+#else
+    (void)fd;
+    (void)label;
+#endif
+}
+
+ssize_t send_no_sigpipe(int fd, const uint8_t *data, size_t size) {
+#if defined(MSG_NOSIGNAL)
+    return ::send(fd, data, size, MSG_NOSIGNAL);
+#else
+    return ::send(fd, data, size, 0);
+#endif
+}
+
+void restore_socket_flags(int fd, int flags, const std::string &label) {
+    if (::fcntl(fd, F_SETFL, flags) != 0) {
+        throw std::runtime_error(label + ": fcntl(F_SETFL) failed: " + std::strerror(errno));
+    }
+}
+
+int wait_for_connect(int fd, Deadline deadline, const std::string &label) {
+    while (true) {
+        double remaining = remaining_seconds(deadline, label + ": connect timed out");
+        timeval tv = timeout_to_timeval(std::min(0.2, remaining));
+        fd_set wfds;
+        FD_ZERO(&wfds);
+        FD_SET(fd, &wfds);
+        int rc = ::select(fd + 1, nullptr, &wfds, nullptr, &tv);
+        if (rc == 0) continue;
+        if (rc < 0) {
+            if (errno == EINTR) continue;
+            return errno;
+        }
+        int socket_error = 0;
+        socklen_t len = sizeof(socket_error);
+        if (::getsockopt(fd, SOL_SOCKET, SO_ERROR, &socket_error, &len) != 0) {
+            return errno;
+        }
+        return socket_error;
+    }
+}
+
+int connect_tcp_socket(const std::string &host, uint16_t port, const std::string &label, double timeout_s) {
+    Deadline deadline =
+        std::chrono::steady_clock::now() +
+        std::chrono::duration_cast<std::chrono::steady_clock::duration>(std::chrono::duration<double>(timeout_s));
+    std::string port_s = std::to_string(port);
+    std::vector<TcpAddress> addresses = resolve_tcp_addresses_with_timeout(host, port_s, label, deadline);
     int fd = -1;
     int last_errno = 0;
-    for (addrinfo *ai = results; ai != nullptr; ai = ai->ai_next) {
-        int candidate = ::socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
+    for (const TcpAddress &addr : addresses) {
+        (void)remaining_seconds(deadline, label + ": connect timed out");
+        int candidate = ::socket(addr.family, addr.socktype, addr.protocol);
         if (candidate < 0) {
             last_errno = errno;
             continue;
         }
-        if (::connect(candidate, ai->ai_addr, ai->ai_addrlen) == 0) {
-            fd = candidate;
-            break;
+        try {
+            configure_socket_no_sigpipe(candidate, label);
+            int flags = ::fcntl(candidate, F_GETFL, 0);
+            if (flags < 0) {
+                last_errno = errno;
+                ::close(candidate);
+                continue;
+            }
+            if (::fcntl(candidate, F_SETFL, flags | O_NONBLOCK) != 0) {
+                last_errno = errno;
+                ::close(candidate);
+                continue;
+            }
+            int rc = ::connect(candidate, reinterpret_cast<const sockaddr *>(&addr.addr), addr.addrlen);
+            if (rc == 0) {
+                restore_socket_flags(candidate, flags, label);
+                fd = candidate;
+                break;
+            }
+            if (errno != EINPROGRESS) {
+                last_errno = errno;
+                ::close(candidate);
+                continue;
+            }
+            int connect_error = wait_for_connect(candidate, deadline, label);
+            if (connect_error == 0) {
+                restore_socket_flags(candidate, flags, label);
+                fd = candidate;
+                break;
+            }
+            last_errno = connect_error;
+            ::close(candidate);
+        } catch (...) {
+            ::close(candidate);
+            throw;
         }
-        last_errno = errno;
-        ::close(candidate);
     }
-    freeaddrinfo(results);
     if (fd < 0) {
+        if (std::chrono::steady_clock::now() >= deadline) {
+            throw std::runtime_error(label + ": connect timed out to " + host + ":" + port_s);
+        }
         throw std::runtime_error(
             label + ": connect failed to " + host + ":" + port_s + ": " + std::strerror(last_errno)
         );
     }
     return fd;
+}
+
+RemoteAddressSpace decode_remote_address_space(int32_t raw, const char *field_name) {
+    switch (static_cast<RemoteAddressSpace>(raw)) {
+    case RemoteAddressSpace::HOST_INLINE:
+    case RemoteAddressSpace::REMOTE_DEVICE:
+    case RemoteAddressSpace::REMOTE_WINDOW:
+    case RemoteAddressSpace::UB_LDST:
+        return static_cast<RemoteAddressSpace>(raw);
+    default:
+        throw std::runtime_error(std::string("RemoteL3Endpoint: unknown ") + field_name);
+    }
+}
+
+void validate_owner_buffer_handle(const RemoteBufferHandle &handle, size_t requested_size) {
+    if (handle.buffer_id == 0) {
+        throw std::runtime_error("RemoteL3Endpoint::control_remote_malloc: buffer_id must be non-zero");
+    }
+    if (handle.generation == 0) {
+        throw std::runtime_error("RemoteL3Endpoint::control_remote_malloc: generation must be non-zero");
+    }
+    if (handle.import_id != 0) {
+        throw std::runtime_error("RemoteL3Endpoint::control_remote_malloc: import_id must be zero");
+    }
+    if (handle.address_space != RemoteAddressSpace::REMOTE_DEVICE) {
+        throw std::runtime_error("RemoteL3Endpoint::control_remote_malloc: owner allocation must be REMOTE_DEVICE");
+    }
+    if (handle.nbytes == 0 || handle.nbytes != static_cast<uint64_t>(requested_size)) {
+        throw std::runtime_error("RemoteL3Endpoint::control_remote_malloc: result size mismatch");
+    }
+    if (handle.offset != 0) {
+        throw std::runtime_error("RemoteL3Endpoint::control_remote_malloc: owner allocation offset must be zero");
+    }
 }
 
 }  // namespace
@@ -140,7 +329,7 @@ RemoteL3SocketTransport::RemoteL3SocketTransport(
 RemoteL3SocketTransport::~RemoteL3SocketTransport() { close_socket(); }
 
 void RemoteL3SocketTransport::connect_socket() {
-    fd_ = connect_tcp_socket(host_, port_, "RemoteL3SocketTransport(command)");
+    fd_ = connect_tcp_socket(host_, port_, "RemoteL3SocketTransport(command)", timeout_s_);
 }
 
 void RemoteL3SocketTransport::close_socket() {
@@ -172,7 +361,7 @@ void RemoteL3SocketTransport::check_health() {
 
 void RemoteL3SocketTransport::start_health_monitor(uint64_t session_id, int32_t endpoint_id) {
     if (health_thread_.joinable()) return;
-    health_fd_ = connect_tcp_socket(health_host_, health_port_, "RemoteL3SocketTransport(health)");
+    health_fd_ = connect_tcp_socket(health_host_, health_port_, "RemoteL3SocketTransport(health)", timeout_s_);
     health_stop_.store(false, std::memory_order_release);
     health_failed_.store(false, std::memory_order_release);
     {
@@ -185,9 +374,9 @@ void RemoteL3SocketTransport::start_health_monitor(uint64_t session_id, int32_t 
         auto read_exact = [&](uint8_t *data, size_t size) -> bool {
             size_t off = 0;
             auto deadline =
-                std::chrono::steady_clock::now() + std::chrono::duration_cast<std::chrono::steady_clock::duration>(
-                                                       std::chrono::duration<double>(timeout_s)
-                                                   );
+                std::chrono::steady_clock::now() +
+                std::chrono::duration_cast<std::chrono::steady_clock::duration>(std::chrono::duration<double>(timeout_s)
+                );
             while (off < size) {
                 if (health_stop_.load(std::memory_order_acquire)) return false;
                 auto now = std::chrono::steady_clock::now();
@@ -305,7 +494,7 @@ void RemoteL3SocketTransport::write_all(const uint8_t *data, size_t size) {
     size_t off = 0;
     while (off < size) {
         wait_writable();
-        ssize_t n = ::send(fd_, data + off, size - off, 0);
+        ssize_t n = send_no_sigpipe(fd_, data + off, size - off);
         if (n < 0) {
             if (errno == EINTR) continue;
             throw std::runtime_error(std::string("RemoteL3SocketTransport: send failed: ") + std::strerror(errno));
@@ -583,6 +772,7 @@ void RemoteL3Endpoint::control_remote_unregister(
 }
 
 RemoteBufferHandle RemoteL3Endpoint::control_remote_malloc(size_t size) {
+    if (size == 0) throw std::invalid_argument("RemoteL3Endpoint::control_remote_malloc: size must be non-zero");
     std::vector<uint8_t> command;
     put_u64(command, static_cast<uint64_t>(size));
     auto reply = run_control(remote_l3::ControlName::ALLOC_REMOTE_BUFFER, command);
@@ -593,7 +783,8 @@ RemoteBufferHandle RemoteL3Endpoint::control_remote_malloc(size_t size) {
     handle.buffer_id = get_u64(reply.result_bytes, offset);
     handle.generation = get_u64(reply.result_bytes, offset);
     handle.import_id = 0;
-    handle.address_space = static_cast<RemoteAddressSpace>(get_i32(reply.result_bytes, offset));
+    handle.address_space =
+        decode_remote_address_space(get_i32(reply.result_bytes, offset), "ALLOC_REMOTE_BUFFER address_space");
     handle.nbytes = get_u64(reply.result_bytes, offset);
     handle.offset = 0;
     handle.remote_addr = get_u64(reply.result_bytes, offset);
@@ -606,6 +797,7 @@ RemoteBufferHandle RemoteL3Endpoint::control_remote_malloc(size_t size) {
     if (offset != reply.result_bytes.size()) {
         throw std::runtime_error("RemoteL3Endpoint::control_remote_malloc: trailing bytes in result");
     }
+    validate_owner_buffer_handle(handle, size);
     return handle;
 }
 

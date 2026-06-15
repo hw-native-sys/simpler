@@ -11,8 +11,19 @@
 
 #include <gtest/gtest.h>
 
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <unistd.h>
+
+#include <array>
+#include <cerrno>
+#include <csignal>
+#include <chrono>
+#include <cstring>
 #include <memory>
 #include <stdexcept>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -21,10 +32,96 @@
 
 namespace {
 
+volatile sig_atomic_t g_sigpipe_count = 0;
+
+void count_sigpipe(int) { ++g_sigpipe_count; }
+
+class ScopedSigpipeCounter {
+public:
+    ScopedSigpipeCounter() {
+        struct sigaction action {};
+        action.sa_handler = count_sigpipe;
+        sigemptyset(&action.sa_mask);
+        action.sa_flags = 0;
+        if (sigaction(SIGPIPE, &action, &old_action_) != 0) {
+            throw std::runtime_error(std::string("sigaction failed: ") + std::strerror(errno));
+        }
+        g_sigpipe_count = 0;
+    }
+
+    ~ScopedSigpipeCounter() { (void)sigaction(SIGPIPE, &old_action_, nullptr); }
+
+    ScopedSigpipeCounter(const ScopedSigpipeCounter &) = delete;
+    ScopedSigpipeCounter &operator=(const ScopedSigpipeCounter &) = delete;
+
+private:
+    struct sigaction old_action_ {};
+};
+
+void append_i32(std::vector<uint8_t> &out, int32_t v) {
+    uint32_t raw = static_cast<uint32_t>(v);
+    for (int i = 0; i < 4; ++i)
+        out.push_back(static_cast<uint8_t>((raw >> (8 * i)) & 0xffU));
+}
+
+void append_u64(std::vector<uint8_t> &out, uint64_t v) {
+    for (int i = 0; i < 8; ++i)
+        out.push_back(static_cast<uint8_t>((v >> (8 * i)) & 0xffU));
+}
+
+std::vector<uint8_t>
+malloc_result(int32_t endpoint_id, uint64_t buffer_id, uint64_t generation, int32_t address_space, uint64_t nbytes) {
+    std::vector<uint8_t> out;
+    append_i32(out, endpoint_id);
+    append_u64(out, buffer_id);
+    append_u64(out, generation);
+    append_i32(out, address_space);
+    append_u64(out, nbytes);
+    append_u64(out, 0x1000);
+    append_u64(out, 0x2000);
+    append_u64(out, 0x3000);
+    return out;
+}
+
+uint16_t start_closing_server(std::thread &server_thread) {
+    int listener = ::socket(AF_INET, SOCK_STREAM, 0);
+    if (listener < 0) throw std::runtime_error(std::string("socket failed: ") + std::strerror(errno));
+    int one = 1;
+    (void)::setsockopt(listener, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    addr.sin_port = 0;
+    if (::bind(listener, reinterpret_cast<sockaddr *>(&addr), sizeof(addr)) != 0) {
+        int err = errno;
+        ::close(listener);
+        throw std::runtime_error(std::string("bind failed: ") + std::strerror(err));
+    }
+    if (::listen(listener, 1) != 0) {
+        int err = errno;
+        ::close(listener);
+        throw std::runtime_error(std::string("listen failed: ") + std::strerror(err));
+    }
+    socklen_t len = sizeof(addr);
+    if (::getsockname(listener, reinterpret_cast<sockaddr *>(&addr), &len) != 0) {
+        int err = errno;
+        ::close(listener);
+        throw std::runtime_error(std::string("getsockname failed: ") + std::strerror(err));
+    }
+    server_thread = std::thread([listener]() {
+        int fd = ::accept(listener, nullptr, nullptr);
+        if (fd >= 0) ::close(fd);
+        ::close(listener);
+    });
+    return ntohs(addr.sin_port);
+}
+
 class FakeRemoteTransport : public RemoteL3Transport {
 public:
     int32_t next_error_code{0};
     std::string next_error_message;
+    std::vector<uint8_t> next_control_result_bytes;
     std::vector<uint8_t> last_frame;
     remote_l3::ControlName last_control_name{remote_l3::ControlName::PREPARE_CALLABLE};
     remote_l3::RemoteRegistryTarget last_target_registry{remote_l3::RemoteRegistryTarget::REMOTE_TASK_DISPATCHER};
@@ -56,6 +153,7 @@ public:
             payload.sequence = sequence;
             payload.control_name = control.control_name;
             payload.control_version = control.control_version;
+            payload.result_bytes = next_control_result_bytes;
             remote_l3::FrameHeader header;
             header.frame_type = remote_l3::FrameType::CONTROL_REPLY;
             header.session_id = submitted.header.session_id;
@@ -175,6 +273,70 @@ TEST(RemoteEndpoint, RemoteRegisterPrepareCarriesRequestedRegistryTarget) {
     EXPECT_EQ(transport->last_control_name, remote_l3::ControlName::PREPARE_REGISTER_CALLABLE);
     EXPECT_EQ(transport->last_target_registry, remote_l3::RemoteRegistryTarget::INNER_L3_WORKER);
     EXPECT_EQ(transport->last_callable_kind, CallableKind::CHIP_CALLABLE);
+}
+
+TEST(RemoteEndpoint, RemoteMallocAcceptsValidOwnerHandle) {
+    auto *transport = new FakeRemoteTransport();
+    transport->next_control_result_bytes =
+        malloc_result(3, 9, 2, static_cast<int32_t>(RemoteAddressSpace::REMOTE_DEVICE), 64);
+    RemoteL3Endpoint endpoint(3, 99, "fake", std::unique_ptr<RemoteL3Transport>(transport));
+
+    RemoteBufferHandle handle = endpoint.control_remote_malloc(64);
+
+    EXPECT_EQ(handle.endpoint_id, 3);
+    EXPECT_EQ(handle.owner_endpoint_id, 3);
+    EXPECT_EQ(handle.buffer_id, 9u);
+    EXPECT_EQ(handle.generation, 2u);
+    EXPECT_EQ(handle.import_id, 0u);
+    EXPECT_EQ(handle.address_space, RemoteAddressSpace::REMOTE_DEVICE);
+    EXPECT_EQ(handle.nbytes, 64u);
+}
+
+TEST(RemoteEndpoint, RemoteMallocRejectsInvalidOwnerHandle) {
+    auto expect_reject = [](std::vector<uint8_t> result_bytes, size_t requested_size) {
+        auto *transport = new FakeRemoteTransport();
+        transport->next_control_result_bytes = std::move(result_bytes);
+        RemoteL3Endpoint endpoint(3, 99, "fake", std::unique_ptr<RemoteL3Transport>(transport));
+        EXPECT_THROW((void)endpoint.control_remote_malloc(requested_size), std::runtime_error);
+    };
+
+    EXPECT_THROW(
+        {
+            auto *transport = new FakeRemoteTransport();
+            RemoteL3Endpoint endpoint(3, 99, "fake", std::unique_ptr<RemoteL3Transport>(transport));
+            (void)endpoint.control_remote_malloc(0);
+        },
+        std::invalid_argument
+    );
+    expect_reject(malloc_result(3, 0, 2, static_cast<int32_t>(RemoteAddressSpace::REMOTE_DEVICE), 64), 64);
+    expect_reject(malloc_result(3, 9, 0, static_cast<int32_t>(RemoteAddressSpace::REMOTE_DEVICE), 64), 64);
+    expect_reject(malloc_result(3, 9, 2, static_cast<int32_t>(RemoteAddressSpace::HOST_INLINE), 64), 64);
+    expect_reject(malloc_result(3, 9, 2, 99, 64), 64);
+    expect_reject(malloc_result(3, 9, 2, static_cast<int32_t>(RemoteAddressSpace::REMOTE_DEVICE), 32), 64);
+}
+
+TEST(RemoteSocketTransport, ClosedPeerWriteDoesNotRaiseSigpipe) {
+    std::thread server_thread;
+    uint16_t port = start_closing_server(server_thread);
+    RemoteL3SocketTransport transport("127.0.0.1", port, "127.0.0.1", 1, 1.0);
+    server_thread.join();
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+    ScopedSigpipeCounter sigpipe_counter;
+    std::vector<uint8_t> frame(4096, 0x5A);
+    bool saw_error = false;
+    for (int i = 0; i < 3; ++i) {
+        try {
+            transport.submit_frame(frame);
+        } catch (const std::runtime_error &) {
+            saw_error = true;
+            break;
+        }
+    }
+
+    EXPECT_TRUE(saw_error);
+    EXPECT_EQ(g_sigpipe_count, 0);
+    transport.shutdown();
 }
 
 TEST(RemoteEndpoint, BareHostPointerWithoutSidecarIsEndpointFailure) {
