@@ -14,7 +14,7 @@
 #include <arpa/inet.h>
 #include <fcntl.h>
 #include <netdb.h>
-#include <sys/select.h>
+#include <poll.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
@@ -100,12 +100,10 @@ double remaining_seconds(Deadline deadline, const std::string &message) {
     return std::chrono::duration<double>(deadline - now).count();
 }
 
-timeval timeout_to_timeval(double timeout_s) {
+int timeout_to_poll_ms(double timeout_s) {
     if (timeout_s <= 0.0) throw std::invalid_argument("RemoteL3SocketTransport: timeout must be positive");
-    timeval tv{};
-    tv.tv_sec = static_cast<long>(timeout_s);
-    tv.tv_usec = static_cast<long>((timeout_s - static_cast<double>(tv.tv_sec)) * 1000000.0);
-    return tv;
+    int timeout_ms = static_cast<int>(timeout_s * 1000.0);
+    return timeout_ms > 0 ? timeout_ms : 1;
 }
 
 ResolveTcpResult resolve_tcp_addresses(const std::string &host, const std::string &port_s) {
@@ -190,25 +188,68 @@ void restore_socket_flags(int fd, int flags, const std::string &label) {
     }
 }
 
-int wait_for_connect(int fd, Deadline deadline, const std::string &label) {
+short poll_socket(
+    int fd, short events, Deadline deadline, const std::string &timeout_message, const std::string &poll_error_context
+) {
     while (true) {
-        double remaining = remaining_seconds(deadline, label + ": connect timed out");
-        timeval tv = timeout_to_timeval(std::min(0.2, remaining));
-        fd_set wfds;
-        FD_ZERO(&wfds);
-        FD_SET(fd, &wfds);
-        int rc = ::select(fd + 1, nullptr, &wfds, nullptr, &tv);
+        double remaining = remaining_seconds(deadline, timeout_message);
+        pollfd pfd{};
+        pfd.fd = fd;
+        pfd.events = events;
+        int rc = ::poll(&pfd, 1, timeout_to_poll_ms(std::min(0.2, remaining)));
         if (rc == 0) continue;
         if (rc < 0) {
             if (errno == EINTR) continue;
-            return errno;
+            throw std::runtime_error(poll_error_context + ": " + std::strerror(errno));
         }
+        if ((pfd.revents & POLLNVAL) != 0) {
+            throw std::runtime_error(poll_error_context + ": invalid file descriptor");
+        }
+        if ((pfd.revents & (events | POLLERR | POLLHUP)) != 0) {
+            return pfd.revents;
+        }
+    }
+}
+
+int wait_for_connect(int fd, Deadline deadline, const std::string &label) {
+    while (true) {
+        short revents =
+            poll_socket(fd, POLLOUT, deadline, label + ": connect timed out", label + ": poll(connect) failed");
         int socket_error = 0;
         socklen_t len = sizeof(socket_error);
         if (::getsockopt(fd, SOL_SOCKET, SO_ERROR, &socket_error, &len) != 0) {
             return errno;
         }
+        if (socket_error == 0 && (revents & (POLLERR | POLLHUP)) != 0) {
+            return ECONNRESET;
+        }
         return socket_error;
+    }
+}
+
+void validate_remote_buffer_relative_range(
+    const char *op_name, const RemoteBufferHandle &handle, uint64_t offset, uint64_t size
+) {
+    if (handle.nbytes == 0) {
+        throw std::invalid_argument(std::string(op_name) + ": handle size must be non-zero");
+    }
+    if (offset > handle.nbytes || size > handle.nbytes - offset) {
+        throw std::out_of_range(std::string(op_name) + ": range exceeds remote buffer");
+    }
+}
+
+void validate_remote_buffer_export_range(
+    const char *op_name, const RemoteBufferHandle &handle, uint64_t offset, uint64_t size
+) {
+    if (handle.nbytes == 0) {
+        throw std::invalid_argument(std::string(op_name) + ": handle size must be non-zero");
+    }
+    if (handle.offset > handle.nbytes) {
+        throw std::invalid_argument(std::string(op_name) + ": handle offset exceeds size");
+    }
+    uint64_t available = handle.nbytes - handle.offset;
+    if (offset > available || size > available - offset) {
+        throw std::out_of_range(std::string(op_name) + ": range exceeds remote buffer");
     }
 }
 
@@ -342,11 +383,10 @@ void RemoteL3SocketTransport::close_socket() {
 }
 
 void RemoteL3SocketTransport::mark_health_failed(const std::string &message) {
-    bool expected = false;
-    if (health_failed_.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
-        std::lock_guard<std::mutex> lk(health_mu_);
-        health_error_ = message;
-    }
+    std::lock_guard<std::mutex> lk(health_mu_);
+    if (health_failed_.load(std::memory_order_acquire)) return;
+    health_error_ = message;
+    health_failed_.store(true, std::memory_order_release);
 }
 
 void RemoteL3SocketTransport::check_health() {
@@ -381,17 +421,7 @@ void RemoteL3SocketTransport::start_health_monitor(uint64_t session_id, int32_t 
                 if (health_stop_.load(std::memory_order_acquire)) return false;
                 auto now = std::chrono::steady_clock::now();
                 if (now >= deadline) throw std::runtime_error("timed out waiting for HEALTH frame");
-                double remaining = std::chrono::duration<double>(deadline - now).count();
-                timeval tv = timeout_to_timeval(std::min(0.2, remaining));
-                fd_set rfds;
-                FD_ZERO(&rfds);
-                FD_SET(fd, &rfds);
-                int rc = ::select(fd + 1, &rfds, nullptr, nullptr, &tv);
-                if (rc == 0) continue;
-                if (rc < 0) {
-                    if (errno == EINTR) continue;
-                    throw std::runtime_error(std::string("select failed: ") + std::strerror(errno));
-                }
+                (void)poll_socket(fd, POLLIN, deadline, "timed out waiting for HEALTH frame", "poll failed");
                 ssize_t n = ::recv(fd, data + off, size - off, 0);
                 if (n < 0) {
                     if (errno == EINTR) continue;
@@ -450,19 +480,11 @@ void RemoteL3SocketTransport::wait_readable() {
         check_health();
         auto now = std::chrono::steady_clock::now();
         if (now >= deadline) throw std::runtime_error("RemoteL3SocketTransport: timed out waiting for frame");
-        double remaining = std::chrono::duration<double>(deadline - now).count();
-        timeval tv = timeout_to_timeval(std::min(0.2, remaining));
-        fd_set rfds;
-        FD_ZERO(&rfds);
-        FD_SET(fd_, &rfds);
-        int rc = ::select(fd_ + 1, &rfds, nullptr, nullptr, &tv);
-        if (rc > 0) return;
-        if (rc < 0) {
-            if (errno == EINTR) continue;
-            throw std::runtime_error(
-                std::string("RemoteL3SocketTransport: select(read) failed: ") + std::strerror(errno)
-            );
-        }
+        (void)poll_socket(
+            fd_, POLLIN, deadline, "RemoteL3SocketTransport: timed out waiting for frame",
+            "RemoteL3SocketTransport: poll(read) failed"
+        );
+        return;
     }
 }
 
@@ -474,19 +496,11 @@ void RemoteL3SocketTransport::wait_writable() {
         check_health();
         auto now = std::chrono::steady_clock::now();
         if (now >= deadline) throw std::runtime_error("RemoteL3SocketTransport: timed out writing frame");
-        double remaining = std::chrono::duration<double>(deadline - now).count();
-        timeval tv = timeout_to_timeval(std::min(0.2, remaining));
-        fd_set wfds;
-        FD_ZERO(&wfds);
-        FD_SET(fd_, &wfds);
-        int rc = ::select(fd_ + 1, nullptr, &wfds, nullptr, &tv);
-        if (rc > 0) return;
-        if (rc < 0) {
-            if (errno == EINTR) continue;
-            throw std::runtime_error(
-                std::string("RemoteL3SocketTransport: select(write) failed: ") + std::strerror(errno)
-            );
-        }
+        (void)poll_socket(
+            fd_, POLLOUT, deadline, "RemoteL3SocketTransport: timed out writing frame",
+            "RemoteL3SocketTransport: poll(write) failed"
+        );
+        return;
     }
 }
 
@@ -813,6 +827,7 @@ void RemoteL3Endpoint::control_remote_copy_to(
     const RemoteBufferHandle &handle, uint64_t offset, const void *src, size_t size
 ) {
     if (src == nullptr && size != 0) throw std::invalid_argument("control_remote_copy_to: null src");
+    validate_remote_buffer_relative_range("control_remote_copy_to", handle, offset, static_cast<uint64_t>(size));
     std::vector<uint8_t> command;
     put_i32(command, handle.endpoint_id);
     put_u64(command, handle.buffer_id);
@@ -828,6 +843,7 @@ void RemoteL3Endpoint::control_remote_copy_from(
     void *dst, const RemoteBufferHandle &handle, uint64_t offset, size_t size
 ) {
     if (dst == nullptr && size != 0) throw std::invalid_argument("control_remote_copy_from: null dst");
+    validate_remote_buffer_relative_range("control_remote_copy_from", handle, offset, static_cast<uint64_t>(size));
     std::vector<uint8_t> command;
     put_i32(command, handle.endpoint_id);
     put_u64(command, handle.buffer_id);
@@ -845,6 +861,7 @@ RemoteBufferExport RemoteL3Endpoint::control_remote_export(
     const RemoteBufferHandle &handle, uint64_t offset, uint64_t size, uint32_t access_flags,
     const std::string &transport_profile
 ) {
+    validate_remote_buffer_export_range("RemoteL3Endpoint::control_remote_export", handle, offset, size);
     const int32_t owner_endpoint_id = handle.owner_endpoint_id >= 0 ? handle.owner_endpoint_id : handle.endpoint_id;
     if (owner_endpoint_id != caps_.endpoint_id) {
         throw std::invalid_argument("RemoteL3Endpoint::control_remote_export: endpoint is not the owner");

@@ -137,7 +137,10 @@ public:
             auto control = remote_l3::decode_control(submitted.payload.data(), submitted.payload.size());
             last_control_name = control.control_name;
             if (control.control_name == remote_l3::ControlName::PREPARE_REGISTER_CALLABLE) {
-                EXPECT_GE(control.command_bytes.size(), 8u);
+                if (control.command_bytes.size() < 8u) {
+                    ADD_FAILURE() << "PREPARE_REGISTER_CALLABLE command is truncated";
+                    return {};
+                }
                 uint32_t raw_target = static_cast<uint32_t>(control.command_bytes[0]) |
                                       (static_cast<uint32_t>(control.command_bytes[1]) << 8) |
                                       (static_cast<uint32_t>(control.command_bytes[2]) << 16) |
@@ -313,6 +316,35 @@ TEST(RemoteEndpoint, RemoteMallocRejectsInvalidOwnerHandle) {
     expect_reject(malloc_result(3, 9, 2, static_cast<int32_t>(RemoteAddressSpace::HOST_INLINE), 64), 64);
     expect_reject(malloc_result(3, 9, 2, 99, 64), 64);
     expect_reject(malloc_result(3, 9, 2, static_cast<int32_t>(RemoteAddressSpace::REMOTE_DEVICE), 32), 64);
+}
+
+TEST(RemoteEndpoint, RemoteBufferControlsRejectOutOfRangeSlices) {
+    auto *transport = new FakeRemoteTransport();
+    RemoteL3Endpoint endpoint(3, 99, "fake", std::unique_ptr<RemoteL3Transport>(transport));
+    RemoteBufferHandle handle;
+    handle.endpoint_id = 3;
+    handle.owner_endpoint_id = 3;
+    handle.buffer_id = 9;
+    handle.generation = 2;
+    handle.address_space = RemoteAddressSpace::REMOTE_DEVICE;
+    handle.nbytes = 64;
+    handle.offset = 0;
+    std::array<uint8_t, 8> bytes{};
+
+    EXPECT_THROW(endpoint.control_remote_copy_to(handle, 64, bytes.data(), 1), std::out_of_range);
+    EXPECT_THROW(endpoint.control_remote_copy_from(bytes.data(), handle, 63, 2), std::out_of_range);
+    EXPECT_THROW(
+        endpoint.control_remote_export(handle, 64, 1, remote_l3::REMOTE_BUFFER_ACCESS_READ, "tcp"), std::out_of_range
+    );
+
+    handle.offset = 16;
+    EXPECT_THROW(
+        endpoint.control_remote_export(handle, 48, 1, remote_l3::REMOTE_BUFFER_ACCESS_READ, "tcp"), std::out_of_range
+    );
+
+    handle.offset = 0;
+    handle.nbytes = 0;
+    EXPECT_THROW(endpoint.control_remote_copy_to(handle, 0, bytes.data(), 1), std::invalid_argument);
 }
 
 TEST(RemoteSocketTransport, ClosedPeerWriteDoesNotRaiseSigpipe) {

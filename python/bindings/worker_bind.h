@@ -30,6 +30,7 @@
 
 #include <cstdint>
 #include <cstring>
+#include <limits>
 #include <stdexcept>
 #include <vector>
 
@@ -40,6 +41,52 @@
 #include "worker_manager.h"
 
 namespace nb = nanobind;
+
+class PyBufferView {
+public:
+    explicit PyBufferView(nb::handle obj) {
+        if (PyObject_GetBuffer(obj.ptr(), &view_, PyBUF_CONTIG_RO) != 0) {
+            throw nb::python_error();
+        }
+    }
+
+    ~PyBufferView() { PyBuffer_Release(&view_); }
+
+    PyBufferView(const PyBufferView &) = delete;
+    PyBufferView &operator=(const PyBufferView &) = delete;
+
+    const void *data() const { return view_.buf; }
+    Py_ssize_t size() const { return view_.len; }
+
+private:
+    Py_buffer view_{};
+};
+
+inline uint64_t checked_remote_range_end(const char *op_name, uint64_t base, uint64_t offset, uint64_t size) {
+    uint64_t max = std::numeric_limits<uint64_t>::max();
+    if (offset > max - size || base > max - offset - size) {
+        throw std::invalid_argument(std::string(op_name) + ": remote buffer range overflows");
+    }
+    return base + offset + size;
+}
+
+inline uint64_t
+validated_handle_nbytes(uint64_t nbytes, const char *op_name, uint64_t base, uint64_t offset, uint64_t size) {
+    uint64_t minimum = checked_remote_range_end(op_name, base, offset, size);
+    if (nbytes < minimum) {
+        throw std::invalid_argument(std::string(op_name) + ": handle_nbytes is smaller than requested range");
+    }
+    return nbytes;
+}
+
+inline std::string buffer_to_string(nb::handle obj, const char *field_name) {
+    PyBufferView view(obj);
+    if (view.size() < 0) {
+        throw std::invalid_argument(std::string(field_name) + " must not have negative length");
+    }
+    if (view.size() == 0) return {};
+    return std::string(static_cast<const char *>(view.data()), static_cast<size_t>(view.size()));
+}
 
 inline CallableKind parse_callable_kind(const std::string &kind) {
     if (kind == "CHIP_CALLABLE") return CallableKind::CHIP_CALLABLE;
@@ -63,32 +110,19 @@ inline remote_l3::RemoteRegistryTarget parse_remote_registry_target(const std::s
 
 inline CallableIdentity
 make_callable_identity(nb::bytes digest, const std::string &kind, const std::string &target_namespace) {
-    Py_buffer view;
-    if (PyObject_GetBuffer(digest.ptr(), &view, PyBUF_CONTIG_RO) != 0) {
-        throw nb::python_error();
-    }
-    auto release = [&]() {
-        PyBuffer_Release(&view);
-    };
-    if (static_cast<size_t>(view.len) != CALLABLE_HASH_DIGEST_SIZE) {
-        release();
+    PyBufferView view(digest);
+    if (view.size() != static_cast<Py_ssize_t>(CALLABLE_HASH_DIGEST_SIZE)) {
         throw std::invalid_argument("callable digest must be exactly 32 bytes");
     }
     CallableIdentity out;
-    std::memcpy(out.digest.data(), view.buf, CALLABLE_HASH_DIGEST_SIZE);
-    release();
+    std::memcpy(out.digest.data(), view.data(), CALLABLE_HASH_DIGEST_SIZE);
     out.kind = parse_callable_kind(kind);
     out.target_namespace = parse_target_namespace(target_namespace);
     return out;
 }
 
 inline std::string bytes_from_digest_arg(nb::object digest) {
-    Py_buffer view;
-    if (PyObject_GetBuffer(digest.ptr(), &view, PyBUF_CONTIG_RO) != 0) {
-        throw nb::python_error();
-    }
-    std::string out(static_cast<const char *>(view.buf), static_cast<size_t>(view.len));
-    PyBuffer_Release(&view);
+    std::string out = buffer_to_string(digest, "callable digest");
     if (out.size() != CALLABLE_HASH_DIGEST_SIZE) {
         throw std::invalid_argument("callable digest must be exactly 32 bytes");
     }
@@ -96,18 +130,13 @@ inline std::string bytes_from_digest_arg(nb::object digest) {
 }
 
 inline std::vector<uint8_t> bytes_to_u8_vector(nb::handle obj, const char *field_name) {
-    Py_buffer view;
-    if (PyObject_GetBuffer(obj.ptr(), &view, PyBUF_CONTIG_RO) != 0) {
-        throw nb::python_error();
-    }
-    if (view.len < 0) {
-        PyBuffer_Release(&view);
+    PyBufferView view(obj);
+    if (view.size() < 0) {
         throw std::invalid_argument(std::string(field_name) + " must not have negative length");
     }
-    auto *begin = static_cast<const uint8_t *>(view.buf);
-    std::vector<uint8_t> out(begin, begin + static_cast<size_t>(view.len));
-    PyBuffer_Release(&view);
-    return out;
+    if (view.size() == 0) return {};
+    auto *begin = static_cast<const uint8_t *>(view.data());
+    return std::vector<uint8_t>(begin, begin + static_cast<size_t>(view.size()));
 }
 
 inline RemoteAddressSpace parse_remote_address_space(nb::handle value) {
@@ -434,12 +463,7 @@ inline void bind_worker(nb::module_ &m) {
                nb::object payload, nb::object digest) {
                 std::string payload_bytes;
                 if (!payload.is_none()) {
-                    Py_buffer view;
-                    if (PyObject_GetBuffer(payload.ptr(), &view, PyBUF_CONTIG_RO) != 0) {
-                        throw nb::python_error();
-                    }
-                    payload_bytes.assign(static_cast<const char *>(view.buf), static_cast<size_t>(view.len));
-                    PyBuffer_Release(&view);
+                    payload_bytes = buffer_to_string(payload, "payload");
                 }
                 std::string digest_bytes = bytes_from_digest_arg(digest);
                 nb::gil_scoped_release release;
@@ -523,41 +547,45 @@ inline void bind_worker(nb::module_ &m) {
         .def(
             "remote_copy_to",
             [](Worker &self, int endpoint_id, uint64_t buffer_id, uint64_t generation, uint64_t offset, uint64_t src,
-               size_t size) {
+               size_t size, uint64_t handle_nbytes) {
                 RemoteBufferHandle h;
                 h.endpoint_id = endpoint_id;
                 h.buffer_id = buffer_id;
                 h.generation = generation;
+                h.nbytes = validated_handle_nbytes(handle_nbytes, "remote_copy_to", 0, offset, size);
                 nb::gil_scoped_release release;
                 self.remote_copy_to(h, offset, reinterpret_cast<const void *>(src), size);
             },
             nb::arg("endpoint_id"), nb::arg("buffer_id"), nb::arg("generation"), nb::arg("offset"), nb::arg("src"),
-            nb::arg("size"), "Copy host bytes into a remote buffer."
+            nb::arg("size"), nb::arg("handle_nbytes"), "Copy host bytes into a remote buffer."
         )
         .def(
             "remote_copy_from",
             [](Worker &self, uint64_t dst, int endpoint_id, uint64_t buffer_id, uint64_t generation, uint64_t offset,
-               size_t size) {
+               size_t size, uint64_t handle_nbytes) {
                 RemoteBufferHandle h;
                 h.endpoint_id = endpoint_id;
                 h.buffer_id = buffer_id;
                 h.generation = generation;
+                h.nbytes = validated_handle_nbytes(handle_nbytes, "remote_copy_from", 0, offset, size);
                 nb::gil_scoped_release release;
                 self.remote_copy_from(reinterpret_cast<void *>(dst), h, offset, size);
             },
             nb::arg("dst"), nb::arg("endpoint_id"), nb::arg("buffer_id"), nb::arg("generation"), nb::arg("offset"),
-            nb::arg("size"), "Copy remote buffer bytes into host memory."
+            nb::arg("size"), nb::arg("handle_nbytes"), "Copy remote buffer bytes into host memory."
         )
         .def(
             "remote_export",
             [](Worker &self, int owner_endpoint_id, uint64_t buffer_id, uint64_t generation, uint64_t handle_offset,
-               uint64_t offset, uint64_t size, uint32_t access_flags, const std::string &transport_profile) {
+               uint64_t offset, uint64_t size, uint32_t access_flags, const std::string &transport_profile,
+               uint64_t handle_nbytes) {
                 RemoteBufferHandle h;
                 h.endpoint_id = owner_endpoint_id;
                 h.owner_endpoint_id = owner_endpoint_id;
                 h.buffer_id = buffer_id;
                 h.generation = generation;
                 h.offset = handle_offset;
+                h.nbytes = validated_handle_nbytes(handle_nbytes, "remote_export", handle_offset, offset, size);
                 RemoteBufferExport e;
                 {
                     nb::gil_scoped_release release;
@@ -574,7 +602,7 @@ inline void bind_worker(nb::module_ &m) {
             },
             nb::arg("owner_endpoint_id"), nb::arg("buffer_id"), nb::arg("generation"), nb::arg("handle_offset"),
             nb::arg("offset"), nb::arg("size"), nb::arg("access_flags"), nb::arg("transport_profile"),
-            "Export a remote buffer range and return export descriptor fields."
+            nb::arg("handle_nbytes"), "Export a remote buffer range and return export descriptor fields."
         )
         .def(
             "remote_import",
@@ -648,12 +676,7 @@ inline void bind_worker(nb::module_ &m) {
                 const void *payload_ptr = nullptr;
                 size_t payload_size = 0;
                 if (!payload.is_none()) {
-                    Py_buffer view;
-                    if (PyObject_GetBuffer(payload.ptr(), &view, PyBUF_CONTIG_RO) != 0) {
-                        throw nb::python_error();
-                    }
-                    payload_bytes.assign(static_cast<const char *>(view.buf), static_cast<size_t>(view.len));
-                    PyBuffer_Release(&view);
+                    payload_bytes = buffer_to_string(payload, "payload");
                     payload_ptr = payload_bytes.data();
                     payload_size = payload_bytes.size();
                 }
