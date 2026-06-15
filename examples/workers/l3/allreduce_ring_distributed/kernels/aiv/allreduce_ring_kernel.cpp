@@ -176,24 +176,19 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
             __gm__ float *remote_chunk =
                 CommRemotePtr(commCtx, chunks + static_cast<size_t>(left_send_idx * chunk_elems), left);
             Global remoteG(remote_chunk, chunkShape, chunkStride);
-            // Issue remote and local TLOADs back-to-back to overlap latency:
-            // both target different tiles (recvTile vs chunkTile).
             TLOAD(recvTile, remoteG);
             set_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
-            Global accG(chunks + static_cast<size_t>(recv_add_idx * chunk_elems), chunkShape, chunkStride);
-            TLOAD(chunkTile, accG);
-            set_flag(PIPE_MTE2, PIPE_V, EVENT_ID1);
             wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
-            wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID1);
         }
 
+        Global accG(chunks + static_cast<size_t>(recv_add_idx * chunk_elems), chunkShape, chunkStride);
+        TLOAD(chunkTile, accG);
+        set_flag(PIPE_MTE2, PIPE_V, EVENT_ID1);
+        wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID1);
         TADD(chunkTile, chunkTile, recvTile);
         set_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
         wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
-        {
-            Global accG(chunks + static_cast<size_t>(recv_add_idx * chunk_elems), chunkShape, chunkStride);
-            TSTORE(accG, chunkTile);
-        }
+        TSTORE(accG, chunkTile);
         set_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID0);
         wait_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID0);
         pipe_barrier(PIPE_ALL);
