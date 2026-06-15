@@ -65,8 +65,7 @@ AICORE inline __gm__ T *CommRemotePtr(__gm__ CommContext *ctx, __gm__ T *localPt
 // Relies on fresh-window zero-init (runtime guarantee) — no explicit reset.
 // Caller drains MTE pipes before invoking this so that prior TSTORE/TLOAD
 // work is visible before TNOTIFY lands on the peer (PTOAS v0.45 equivalent).
-AICORE inline void RoundBarrier(__gm__ CommContext *ctx, __gm__ int32_t *signal_row,
-                                 int my_rank, int nranks) {
+AICORE inline void RoundBarrier(__gm__ CommContext *ctx, __gm__ int32_t *signal_row, int my_rank, int nranks) {
     for (int peer = 0; peer < nranks; ++peer) {
         if (peer == my_rank) {
             continue;
