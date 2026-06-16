@@ -139,7 +139,7 @@ layers to be aware of:**
   in `core_type` / `core_to_thread`, converts cycles to microseconds
   using `metadata.clock_freq_hz`, and returns the joined dict that every
   downstream consumer (Perfetto converter, `sched_overhead_analysis`,
-  `deps_to_graph`, in-test validator) reads. Always go through
+  `deps_viewer`, in-test validator) reads. Always go through
   `read_perf_data`; never load `l2_swimlane_records.json` with raw
   `json.load` from new code.
 

@@ -68,7 +68,7 @@ def validate_perf_artifact(case_label: str, *, expected_task_count: int | None =
             f"got {len(tasks)} perf records, expected {expected_task_count} under {perf}"
         )
     # Spot-check a single record's required fields — guards against drift in
-    # the swimlane schema that swimlane_converter.py / deps_to_graph.py rely on.
+    # the swimlane schema that swimlane_converter.py / deps_viewer.py rely on.
     first = tasks[0]
     for key in _REQUIRED_TASK_FIELDS:
         assert key in first, f"perf record missing required field '{key}': {first}"
