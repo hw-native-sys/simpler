@@ -380,6 +380,11 @@ void SchedulerContext::dispatch_shape(
 
             dispatched_any = true;
             try_pushed = true;
+            // Normal dispatch of this task = it starts running now. If it's a flagged
+            // producer, propagate dispatch_fanin to its consumers (event-driven
+            // candidate detection; once-guarded so SPMD block-by-block dispatch fires
+            // once). knob A: bump when the producer actually runs.
+            sched_->propagate_dispatch_fanin(*slot_state);
             // Claim a contiguous range of blocks, hand the slot back to the
             // ready queue immediately, then perform the expensive dispatches.
             // This lets other schedulers concurrently claim and dispatch the
@@ -645,73 +650,17 @@ int32_t SchedulerContext::stage_consumer_blocks(
     return staged;
 }
 
-// Speculative early-dispatch (Hook 1). Pre-stage the consumers of any RUNNING
-// flagged producer onto cores freeing up when it finishes, gated by doorbell.
+// Early-dispatch drain (idle pass). Candidates are pushed to spec_queue
+// EVENT-DRIVEN by propagate_dispatch_fanin (a flagged producer's dispatch bumps its
+// consumers' dispatch_fanin; reaching fanin_count enqueues the consumer) — there is
+// no per-iteration PULL scan here anymore. This pass only DRAINS the queue.
 // Returns the number of blocks staged this pass (for the Prestage swimlane bar).
 int32_t SchedulerContext::try_speculative_prestage(int32_t thread_idx) {
     constexpr int PTO2_SPEC_QUEUE_DRAIN_MAX = 8;  // bounded pops per pass
     CoreTracker &tracker = core_trackers_[thread_idx];
     int32_t total_staged = 0;
 
-    // Pass 1: first-claim consumers discovered via this thread's running flagged
-    // producers' fanout. A consumer with leftover blocks is pushed to the
-    // cross-thread queue so threads NOT running the producer can finish it.
-    auto running = tracker.get_all_running_cores();
-    // An SPMD producer occupies many cores but is ONE task (one slot_state, one
-    // fanout). Dedup so we walk each distinct running producer's fanout once.
-    PTO2TaskSlotState *seen[CoreTracker::MAX_CLUSTERS * 3];
-    int seen_n = 0;
-    while (running.has_value()) {
-        int32_t core_id = tracker.get_core_id_by_offset(running.pop_first());
-        PTO2TaskSlotState *p = core_exec_states_[core_id].running_slot_state;
-        if (p == nullptr || p->payload == nullptr || !p->payload->allow_early_resolve) continue;
-        bool dup = false;
-        for (int i = 0; i < seen_n; i++)
-            if (seen[i] == p) {
-                dup = true;
-                break;
-            }
-        if (dup) continue;
-        if (seen_n < static_cast<int>(sizeof(seen) / sizeof(seen[0]))) seen[seen_n++] = p;
-
-        // Snapshot P's consumer list under its lock, then walk it lock-free.
-        p->lock_fanout();
-        PTO2DepListEntry *edge = p->fanout_head;
-        p->unlock_fanout();
-        for (; edge != nullptr; edge = edge->next) {
-            PTO2TaskSlotState *c = edge->slot_state;
-            if (c->payload == nullptr) continue;
-            // sync_start SPMD tasks require all blocks to launch atomically;
-            // block-by-block / partial pre-staging would break that contract.
-            if (c->active_mask.requires_sync_start()) continue;
-            PTO2ResourceShape shape = c->active_mask.to_shape();
-            if (shape != PTO2ResourceShape::AIC && shape != PTO2ResourceShape::AIV && shape != PTO2ResourceShape::MIX)
-                continue;
-            if (c->payload->spec_state.load(std::memory_order_acquire) != PTO2_SPEC_NONE) continue;
-            // Eligible iff exactly ONE producer of C is still unsatisfied — that one
-            // is P (we are scanning it RUNNING), so C is ready exactly when P ends.
-            // Multi-producer joins pre-stage only once all OTHER producers completed.
-            if (c->fanin_count - c->fanin_refcount.load(std::memory_order_acquire) != 1) continue;
-
-            // First claim: CAS NONE->STAGING and push C to the queue ONCE. ALL
-            // staging (ours included) happens via the pass-2 drain, so every idle
-            // thread pops, claims a range, re-pushes, and stages CONCURRENTLY — no
-            // thread front-loads by staging here (that was the serial daisy chain).
-            uint8_t expect = PTO2_SPEC_NONE;
-            if (!c->payload->spec_state.compare_exchange_strong(
-                    expect, PTO2_SPEC_STAGING, std::memory_order_seq_cst, std::memory_order_seq_cst
-                )) {
-                continue;  // lost: another thread already claimed (and pushed) it
-            }
-            if (!sched_->spec_queue_push(c))
-                LOG_INFO_V9(
-                    "[SPEC] queue full, consumer=%" PRId64 " dispatches normally",
-                    static_cast<int64_t>(c->task->task_id.raw)
-                );
-        }
-    }
-
-    // Pass 2: drain the queue — mirrors the normal SPMD dispatch path. Pop a consumer,
+    // Drain the queue — mirrors the normal SPMD dispatch path. Pop a consumer,
     // CLAIM a range sized to THIS thread's free cores by advancing next_block_idx with
     // a CAS (atomic — next_block_idx is shared with normal dispatch, which also claims
     // it if release routes the consumer to the ready queue, so a plain store could

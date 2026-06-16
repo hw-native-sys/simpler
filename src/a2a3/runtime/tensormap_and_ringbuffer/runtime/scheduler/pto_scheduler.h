@@ -773,6 +773,18 @@ struct PTO2SchedulerState {
                 producer->unlock_fanout();
             });
 
+            // Seed dispatch_fanin with producers already complete at wiring
+            // time (e.g. buffer-creator tasks that finished before this
+            // consumer entered the graph). Such producers never dispatch at
+            // runtime, so they can never bump dispatch_fanin via the fanout
+            // walk; without this seed the candidate compare
+            // (dispatch_fanin == fanin_actual_count) would be unreachable
+            // whenever any producer is pre-completed. Mirrors the
+            // early_finished seed that ready_fanin gets via init_rc.
+            if (early_finished != 0) {
+                wp->dispatch_fanin.fetch_add(early_finished, std::memory_order_acq_rel);
+            }
+
             int32_t init_rc = early_finished + 1;
             int32_t new_rc = ws->fanin_refcount.fetch_add(init_rc, std::memory_order_acq_rel) + init_rc;
             if (new_rc >= ws->fanin_count) {
@@ -975,6 +987,54 @@ struct PTO2SchedulerState {
         *dmb = (tk << 32) | tk;  // 64-bit STR: high=low=token releases the gated AICore
     }
 
+    // auto-chain depth cap: a candidate inherits the flag only while depth < this.
+    static constexpr uint8_t PTO2_SPEC_CHAIN_MAX = 4;
+
+    // Event-driven candidate detection (the dual of fanin_refcount/ready). Call when a
+    // FLAGGED producer `p` DISPATCHES (starts running): walk its fanout and bump each
+    // consumer's dispatch_fanin. A consumer whose dispatch_fanin reaches
+    // fanin_actual_count (= every producer is either flagged-and-dispatched, or was
+    // already complete when the consumer was wired) is an early-dispatch candidate:
+    // CAS NONE->STAGING (exactly-once) and push to spec_queue for the idle drain to
+    // pre-stage. Once-guarded per producer so an SPMD producer's block-by-block
+    // dispatch propagates once. Replaces the old per-iteration pass-1 PULL scan.
+    void propagate_dispatch_fanin(PTO2TaskSlotState &p) {
+        if (!(p.payload->allow_early_resolve || p.payload->spec_chain_active.load(std::memory_order_acquire)))
+            return;  // only flagged (codegen or inherited) producers propagate
+        if (p.payload->dispatch_propagated.exchange(1, std::memory_order_acq_rel) != 0)
+            return;  // already propagated once
+        uint8_t child_depth = static_cast<uint8_t>(p.payload->spec_chain_depth + 1);
+        p.lock_fanout();
+        PTO2DepListEntry *edge = p.fanout_head;  // snapshot head, walk lock-free (fanout stable by dispatch)
+        p.unlock_fanout();
+        for (; edge != nullptr; edge = edge->next) {
+            PTO2TaskSlotState *c = edge->slot_state;
+            if (c->payload == nullptr) continue;
+            // Compare to fanin_actual_count (the real producer-edge count), NOT
+            // fanin_count: fanin_count = fanin_actual_count + 1 (a self/wiring +1 that
+            // ready_fanin gets but dispatch_fanin does not). dispatch_fanin starts at
+            // the wiring-time early_finished seed (producers already complete) and is
+            // bumped here by flagged producers; reaching fanin_actual_count means every
+            // producer is flagged-dispatched or was pre-completed.
+            int32_t nf = c->payload->dispatch_fanin.fetch_add(1, std::memory_order_acq_rel) + 1;
+            if (nf != c->payload->fanin_actual_count) continue;
+            if (c->active_mask.requires_sync_start()) continue;  // sync_start can't be block-by-block pre-staged
+            PTO2ResourceShape shape = c->active_mask.to_shape();
+            if (shape != PTO2ResourceShape::AIC && shape != PTO2ResourceShape::AIV && shape != PTO2ResourceShape::MIX)
+                continue;
+            uint8_t expect = PTO2_SPEC_NONE;  // exactly-once: only the CAS winner enqueues
+            if (!c->payload->spec_state.compare_exchange_strong(
+                    expect, PTO2_SPEC_STAGING, std::memory_order_seq_cst, std::memory_order_seq_cst
+                ))
+                continue;
+            if (child_depth < PTO2_SPEC_CHAIN_MAX) {  // auto-chain: C propagates to ITS consumers
+                c->payload->spec_chain_depth = child_depth;
+                c->payload->spec_chain_active.store(1, std::memory_order_release);
+            }
+            spec_queue_push(c);
+        }
+    }
+
     inline bool try_speculative_release(PTO2TaskSlotState &slot_state) {
         // Never staged => CAS NONE->DISPATCHED wins => dispatch normally.
         uint8_t expect = PTO2_SPEC_NONE;
@@ -1003,6 +1063,10 @@ struct PTO2SchedulerState {
                 ring_one_doorbell(spec_doorbell_table[core_id].addr, spec_doorbell_table[core_id].token);
             }
         }
+        // This pre-staged producer was just released by its doorbell — it starts
+        // running NOW. Propagate dispatch_fanin to its consumers (auto-chain, knob A:
+        // bump when the producer actually runs).
+        propagate_dispatch_fanin(slot_state);
         // No explicit removal from the cross-thread queue: a still-queued entry for
         // this consumer is now DISPATCHED and is dropped when a peer pops it.
         // Fully pre-staged => skip the ready queue. Partially staged SPMD consumer =>

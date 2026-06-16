@@ -277,6 +277,15 @@ struct PTO2TaskPayload {
     // atomic fetch_or by concurrent stagers; read by release. Reset in
     // reset_for_reuse before the slot can be staged again.
     std::atomic<uint64_t> staged_core_mask[PTO2_SPEC_CORE_MASK_WORDS]{};
+    // Early-dispatch CANDIDATE detection (event-driven, dual of fanin_refcount):
+    // seeded at wiring with producers already complete, then a flagged producer's
+    // DISPATCH bumps each consumer's dispatch_fanin. dispatch_fanin ==
+    // fanin_actual_count  <=>  every producer is flagged-and-dispatched or was
+    // pre-completed  =>  this task is an early-dispatch candidate (push spec_queue).
+    std::atomic<int32_t> dispatch_fanin{0};       // CONSUMER side: flagged-dispatched + pre-completed producers
+    std::atomic<uint8_t> dispatch_propagated{0};  // PRODUCER side: once-guard for fanout propagation
+    std::atomic<uint8_t> spec_chain_active{0};    // inherited early-dispatch flag (auto-chain past codegen flag)
+    uint8_t spec_chain_depth{0};                  // auto-chain depth; inherited = parent+1, capped
     // === Cache lines 9-72 (4096B) — tensors (alignas(64) forces alignment) ===
     Tensor tensors[MAX_TENSOR_ARGS];
     // === Cache lines 73-74 (128B) — scalars ===
@@ -433,9 +442,14 @@ struct alignas(64) PTO2TaskSlotState {
         completed_subtasks.store(0, std::memory_order_relaxed);
         next_block_idx.store(0, std::memory_order_relaxed);
         any_subtask_deferred.store(false, std::memory_order_relaxed);
-        if (payload != nullptr)
+        if (payload != nullptr) {
             for (int w = 0; w < PTO2_SPEC_CORE_MASK_WORDS; w++)
                 payload->staged_core_mask[w].store(0, std::memory_order_relaxed);
+            payload->dispatch_fanin.store(0, std::memory_order_relaxed);
+            payload->dispatch_propagated.store(0, std::memory_order_relaxed);
+            payload->spec_chain_active.store(0, std::memory_order_relaxed);
+            payload->spec_chain_depth = 0;
+        }
     }
 
     // === Per-task fanout spinlock ===
