@@ -665,13 +665,13 @@ int32_t SchedulerContext::stage_consumer_blocks(
     return staged;
 }
 
-// Early-dispatch drain (idle pass). Candidates are pushed to spec_queue
+// Early-dispatch drain (idle pass). Candidates are pushed to early_dispatch_queue
 // EVENT-DRIVEN by propagate_dispatch_fanin (a flagged producer's dispatch bumps its
 // consumers' dispatch_fanin; reaching fanin_count enqueues the consumer) — there is
 // no per-iteration PULL scan here anymore. This pass only DRAINS the queue.
 // Returns the number of blocks staged this pass (for the Prestage swimlane bar).
 int32_t SchedulerContext::try_speculative_prestage(int32_t thread_idx) {
-    constexpr int PTO2_SPEC_QUEUE_DRAIN_MAX = 8;  // bounded pops per pass
+    constexpr int PTO2_EARLY_DISPATCH_DRAIN_MAX = 8;  // bounded pops per pass
     CoreTracker &tracker = core_trackers_[thread_idx];
     int32_t total_staged = 0;
 
@@ -683,8 +683,8 @@ int32_t SchedulerContext::try_speculative_prestage(int32_t thread_idx) {
     // Re-pushing before staging lets peers claim the next range and stage CONCURRENTLY
     // — a wide consumer (online_softmax, 48 blocks) is filled by all idle threads in
     // parallel instead of a serial winner-then-peer daisy chain. Bounded pops/pass.
-    for (int n = 0; n < PTO2_SPEC_QUEUE_DRAIN_MAX; n++) {
-        PTO2TaskSlotState *c = sched_->spec_queue_pop();
+    for (int n = 0; n < PTO2_EARLY_DISPATCH_DRAIN_MAX; n++) {
+        PTO2TaskSlotState *c = sched_->early_dispatch_queue.pop();
         if (c == nullptr) break;
         if (c->payload->spec_state.load(std::memory_order_acquire) != PTO2_SPEC_STAGING) continue;  // released
         PTO2ResourceShape shape = c->active_mask.to_shape();
@@ -692,7 +692,7 @@ int32_t SchedulerContext::try_speculative_prestage(int32_t thread_idx) {
         auto pend = tracker.get_pending_core_offset_states(shape);
         int32_t freecores = (idle.has_value() ? idle.count() : 0) + (pend.has_value() ? pend.count() : 0);
         if (freecores == 0) {  // no free cores of this shape — give it back for peers and stop
-            sched_->spec_queue_push(c);
+            sched_->early_dispatch_queue.push(c);
             break;
         }
         // CAS-claim a contiguous range [start, start+claim) sized to this thread's
@@ -714,7 +714,7 @@ int32_t SchedulerContext::try_speculative_prestage(int32_t thread_idx) {
         if (claim == 0) continue;  // nothing left to claim -> drop (no re-push)
         // Re-push for concurrent peers BEFORE the expensive staging.
         if (start + claim < c->logical_block_num) {
-            if (!sched_->spec_queue_push(c))
+            if (!sched_->early_dispatch_queue.push(c))
                 LOG_INFO_V9(
                     "[SPEC] queue full on re-push, consumer=%" PRId64, static_cast<int64_t>(c->task->task_id.raw)
                 );

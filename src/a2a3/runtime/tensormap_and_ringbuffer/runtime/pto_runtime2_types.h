@@ -118,6 +118,9 @@
 // Ready queue
 #define PTO2_READY_QUEUE_SIZE 65536  // Per-shape queue size
 
+// Cross-thread early-dispatch work queue (power of two)
+#define PTO2_EARLY_DISPATCH_QUEUE_SIZE 64
+
 // Wiring queue
 #define PTO2_WRIRING_QUEUE_SIZE 1024  // Per-shape queue size
 
@@ -281,7 +284,7 @@ struct PTO2TaskPayload {
     // seeded at wiring with producers already complete, then a flagged producer's
     // DISPATCH bumps each consumer's dispatch_fanin. dispatch_fanin ==
     // fanin_actual_count  <=>  every producer is flagged-and-dispatched or was
-    // pre-completed  =>  this task is an early-dispatch candidate (push spec_queue).
+    // pre-completed  =>  this task is an early-dispatch candidate (push early_dispatch_queue).
     std::atomic<int32_t> dispatch_fanin{0};       // CONSUMER side: flagged-dispatched + pre-completed producers
     std::atomic<uint8_t> dispatch_propagated{0};  // PRODUCER side: once-guard for fanout propagation
     std::atomic<uint8_t> spec_chain_active{0};    // inherited early-dispatch flag (auto-chain past codegen flag)

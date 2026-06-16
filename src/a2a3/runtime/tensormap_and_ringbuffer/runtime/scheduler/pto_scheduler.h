@@ -554,6 +554,7 @@ struct CompletionStats {
 struct PTO2SchedulerLayout {
     size_t off_ready_queue_slots[PTO2_NUM_RESOURCE_SHAPES];
     size_t off_dummy_ready_queue_slots;
+    size_t off_early_dispatch_queue_slots;
     size_t off_dep_pool_entries[PTO2_MAX_RING_DEPTH];
     size_t off_wiring_spsc_buffer;
     uint64_t ready_queue_capacity;
@@ -904,7 +905,8 @@ struct PTO2SchedulerState {
     };
     SpecDoorbell spec_doorbell_table[PTO2_SPEC_CORE_MASK_WORDS * 64]{};
 
-    // Cross-thread early-dispatch work queue (inline Vyukov MPMC, no arena alloc).
+    // Cross-thread early-dispatch work queue (a PTO2ReadyQueue MPMC instance,
+    // arena-backed — reserved/wired in pto_runtime2_init alongside the ready queues).
     // A consumer's SPMD blocks span cores owned by several AICPU threads, but only a
     // thread RUNNING the consumer's producer discovers it (via the producer's
     // fanout). When that producer is thread-local (e.g. a 16-block AIV op filling one
@@ -913,73 +915,10 @@ struct PTO2SchedulerState {
     // consumer here; every idle thread's prestage pass pops one, stages a range onto
     // ITS OWN cores (range-claim via next_block_idx), and re-pushes if blocks remain
     // — exactly mirroring how a partially-dispatched SPMD task is re-pushed to the
-    // ready queue (scheduler_dispatch: pop -> claim -> re-push). O(1) pop, no
-    // per-pass broadcast scan. Entries are ring slot_states (stable, never freed —
-    // only reused); a stale/released entry fails the STAGING check on pop and is
-    // dropped. Capacity is a power of two; a push that overflows is logged and the
-    // consumer's overflow blocks dispatch normally (no early-dispatch).
-    static constexpr int PTO2_SPEC_QUEUE_CAP = 64;  // power of two
-    struct SpecQueueSlot {
-        PTO2TaskSlotState *slot_state{nullptr};
-        std::atomic<int64_t> sequence{0};
-    };
-    SpecQueueSlot spec_queue_[PTO2_SPEC_QUEUE_CAP];
-    alignas(64) std::atomic<uint64_t> spec_queue_enqueue_{0};
-    alignas(64) std::atomic<uint64_t> spec_queue_dequeue_{0};
-
-    // Init the per-slot sequence numbers (slot i -> i). Zero-init leaves all
-    // sequences at 0, which the Vyukov protocol would reject for every slot but 0.
-    void spec_queue_init() {
-        for (int i = 0; i < PTO2_SPEC_QUEUE_CAP; i++)
-            spec_queue_[i].sequence.store(static_cast<int64_t>(i), std::memory_order_relaxed);
-        spec_queue_enqueue_.store(0, std::memory_order_relaxed);
-        spec_queue_dequeue_.store(0, std::memory_order_relaxed);
-    }
-
-    // Returns false if the queue is full (caller logs; the consumer's blocks fall
-    // back to normal dispatch).
-    bool spec_queue_push(PTO2TaskSlotState *c) {
-        constexpr uint64_t mask = PTO2_SPEC_QUEUE_CAP - 1;
-        uint64_t pos = spec_queue_enqueue_.load(std::memory_order_relaxed);
-        while (true) {
-            SpecQueueSlot *s = &spec_queue_[pos & mask];
-            int64_t seq = s->sequence.load(std::memory_order_acquire);
-            int64_t diff = seq - static_cast<int64_t>(pos);
-            if (diff == 0) {
-                if (spec_queue_enqueue_.compare_exchange_weak(pos, pos + 1, std::memory_order_relaxed)) {
-                    s->slot_state = c;
-                    s->sequence.store(static_cast<int64_t>(pos + 1), std::memory_order_release);
-                    return true;
-                }
-            } else if (diff < 0) {
-                return false;  // full
-            } else {
-                pos = spec_queue_enqueue_.load(std::memory_order_relaxed);
-            }
-        }
-    }
-
-    // Returns nullptr if the queue is empty.
-    PTO2TaskSlotState *spec_queue_pop() {
-        constexpr uint64_t mask = PTO2_SPEC_QUEUE_CAP - 1;
-        uint64_t pos = spec_queue_dequeue_.load(std::memory_order_relaxed);
-        while (true) {
-            SpecQueueSlot *s = &spec_queue_[pos & mask];
-            int64_t seq = s->sequence.load(std::memory_order_acquire);
-            int64_t diff = seq - static_cast<int64_t>(pos + 1);
-            if (diff == 0) {
-                if (spec_queue_dequeue_.compare_exchange_weak(pos, pos + 1, std::memory_order_relaxed)) {
-                    PTO2TaskSlotState *c = s->slot_state;
-                    s->sequence.store(static_cast<int64_t>(pos + PTO2_SPEC_QUEUE_CAP), std::memory_order_release);
-                    return c;
-                }
-            } else if (diff < 0) {
-                return nullptr;  // empty
-            } else {
-                pos = spec_queue_dequeue_.load(std::memory_order_relaxed);
-            }
-        }
-    }
+    // ready queue (scheduler_dispatch: pop -> claim -> re-push). A stale/released
+    // entry fails the STAGING check on pop and is dropped; a push that overflows is
+    // logged and the consumer's blocks fall back to normal dispatch.
+    PTO2ReadyQueue early_dispatch_queue;
 
     static inline void ring_one_doorbell(uint64_t reg_addr, uint32_t token) {
         volatile uint64_t *dmb = reinterpret_cast<volatile uint64_t *>(get_reg_ptr(reg_addr, RegId::DATA_MAIN_BASE));
@@ -995,7 +934,7 @@ struct PTO2SchedulerState {
     // consumer's dispatch_fanin. A consumer whose dispatch_fanin reaches
     // fanin_actual_count (= every producer is either flagged-and-dispatched, or was
     // already complete when the consumer was wired) is an early-dispatch candidate:
-    // CAS NONE->STAGING (exactly-once) and push to spec_queue for the idle drain to
+    // CAS NONE->STAGING (exactly-once) and push to early_dispatch_queue for the idle drain to
     // pre-stage. Once-guarded per producer so an SPMD producer's block-by-block
     // dispatch propagates once. Replaces the old per-iteration pass-1 PULL scan.
     void propagate_dispatch_fanin(PTO2TaskSlotState &p) {
@@ -1031,7 +970,7 @@ struct PTO2SchedulerState {
                 c->payload->spec_chain_depth = child_depth;
                 c->payload->spec_chain_active.store(1, std::memory_order_release);
             }
-            spec_queue_push(c);
+            early_dispatch_queue.push(c);
         }
     }
 
