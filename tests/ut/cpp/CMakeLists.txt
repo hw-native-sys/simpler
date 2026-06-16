@@ -374,7 +374,7 @@ add_a2a3_runtime_test(test_fanin_pool       a2a3/test_fanin_pool.cpp)
 add_a2a3_runtime_test(test_spsc_queue       a2a3/test_spsc_queue.cpp)
 add_a2a3_runtime_test(test_wiring           a2a3/test_wiring.cpp)
 add_a2a3_runtime_test(test_aicore_completion_mailbox a2a3/test_aicore_completion_mailbox.cpp)
-add_a2a3_runtime_test(test_scope_stats_collector a2a3/test_scope_stats_collector.cpp)
+add_a2a3_runtime_test(test_a2a3_scope_stats_collector a2a3/test_scope_stats_collector.cpp)
 
 # ---------------------------------------------------------------------------
 # A5 tests (src/a5/runtime/tensormap_and_ringbuffer/)
