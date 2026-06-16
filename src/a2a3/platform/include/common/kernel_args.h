@@ -103,17 +103,18 @@ struct KernelArgs {
     uint32_t enable_profiling_flag{0};  // Profiling umbrella bitmask; dump_tensor|l2_swimlane|pmu|dep_gen|scope_stats
     uint32_t _pad{0};                   // Alignment padding
 
-    // Device pointer to an 8-byte buffer that the platform AICPU entry writes
-    // the run-wall (ns) into. Allocated once at simpler_init, kept resident.
-    // Onboard AICPU receives KernelArgs as a CANN-private copy (see
-    // rtAicpuKernelLaunchExWithArgs in launch_aicpu_kernel), so an inline
-    // field on KernelArgs is write-only from AICPU — host has no way to read
-    // it back. The dedicated device buffer is host-allocated and the address
-    // travels via this field; AICPU writes `*(uint64_t*)device_wall_data_base
-    // = wall_ns`, host pulls the 8 bytes via rtMemcpy(... DEVICE_TO_HOST)
-    // after stream sync. Sim's "device pointer" is a host malloc'd uint64
-    // (no special-casing — write-through works because sim AICPU and host
-    // share memory). Zero when the buffer was not allocated.
+    // Device pointer to the run-wall buffer the platform AICPU entry writes.
+    // Allocated once and kept resident, reset each run. Onboard AICPU receives
+    // KernelArgs as a CANN-private copy (see rtAicpuKernelLaunchExWithArgs in
+    // launch_aicpu_kernel), so an inline field would be write-only from AICPU;
+    // the dedicated host-allocated buffer's address travels via this field.
+    // Onboard layout: one { start_cycle, end_cycle } pair per launched AICPU
+    // thread (PLATFORM_MAX_AICPU_THREADS_JUST_FOR_LAUNCH pairs, raw sys-counter
+    // cycles). Each surviving thread writes its own slot (plain stores, no
+    // atomics); the host reduces max(end) - min(start) -> ns on readback (see
+    // ensure_device_wall_buffer / read_device_wall_ns). Sim keeps the simpler
+    // single-uint64 wall_ns write-through (sim AICPU and host share memory).
+    // Zero when the buffer was not allocated.
     uint64_t device_wall_data_base{0};
     // ACL device ordinal. Pushed to the AICPU so the executor can suffix the
     // staged orchestration SO name (libdevice_orch_<pid>_<cid>_<device_id>.so):

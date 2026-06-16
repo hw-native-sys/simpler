@@ -675,7 +675,7 @@ CANN's AICPU dispatch uses a framework SO (`libaicpu_extend_kernels.so`) with a 
 1. **`SaveSoFile`**: Writes the user AICPU .so to disk on first call, then sets `firstCreatSo_ = true` to skip all subsequent writes.
 2. **`SetTileFwkKernelMap`**: `dlopen`s the .so and caches function pointers on first call, then sets `firstLoadSo_ = true` to skip all subsequent loads.
 
-When a second runtime launches on the same device (same CANN process context), the Init kernel call hits the cached flags — the new AICPU .so is never written or loaded. The Exec kernel then calls function pointers from the first runtime's .so, which operates on incompatible data structures and hangs.
+When a second runtime launches on the same device (same CANN process context), the first `simpler_aicpu_exec` launch hits the cached flags — the new AICPU .so is never written or loaded, so it calls function pointers from the first runtime's .so, which operates on incompatible data structures and hangs.
 
 ### Impact
 

@@ -34,10 +34,23 @@ static std::atomic<int32_t> s_gate_ready{0};
 static int32_t s_thread_cpu[MAX_GATE_THREADS];
 static bool s_thread_survive[MAX_GATE_THREADS];
 
+// Per-thread exec/slot index set by BOTH gates (legacy a2a3 + filter a5):
+// -1 = dropped, otherwise this thread's index among the launched threads.
+// Read via platform_aicpu_affinity_thread_idx(); used as the run-wall buffer
+// slot and (filter gate) the sched/orch role id.
+static thread_local int32_t tl_exec_idx = -1;
+
 static inline int32_t popcount64(uint64_t v) { return __builtin_popcountll(static_cast<unsigned long long>(v)); }
 
 bool platform_aicpu_affinity_gate(int32_t logical_count, int32_t total_launched) {
+    tl_exec_idx = -1;
     if (logical_count >= total_launched) {
+        // No over-launch (unreachable for a2a3, where logical < total always):
+        // every thread survives. Leave tl_exec_idx = -1 so no run-wall slot is
+        // claimed on this degenerate path — and, crucially, do NOT touch
+        // s_reported here: this early return has no barrier/cleanup to reset
+        // it, so incrementing it would leak state into the next launch
+        // (s_reported is reset only by the full path's last-thread cleanup).
         return true;
     }
 
@@ -148,6 +161,9 @@ bool platform_aicpu_affinity_gate(int32_t logical_count, int32_t total_launched)
         LOG_INFO_V0("AICPU affinity gate: thread idx=%d cpu=%d ACTIVE", idx, normalized_cpu);
     }
 
+    // Publish this thread's slot index (survivors only) for the run-wall
+    // buffer; dropped threads report -1 so they never claim a slot.
+    tl_exec_idx = survive ? idx : -1;
     return survive;
 }
 
@@ -163,11 +179,6 @@ bool platform_aicpu_affinity_gate(int32_t logical_count, int32_t total_launched)
 // State is shared with the legacy gate where harmless (s_reported,
 // s_gate_init, s_gate_ready, s_cleanup) — only one variant runs in any
 // given build (a2a3 uses the legacy gate; a5 onboard uses this one).
-
-// Per-thread output of the filter gate. -1 = dropped (this thread was not
-// in allowed_cpus when the CAS-winner classified). Otherwise = position in
-// allowed_cpus[0..allowed_count-1], used downstream as sched/orch role id.
-static thread_local int32_t tl_filter_exec_idx = -1;
 
 // Per-launch barrier + classification state, parallel to the legacy gate.
 // Two counters: s_filter_claim hands out a unique slot via fetch_add so each
@@ -186,7 +197,7 @@ static int32_t s_filter_thread_cpu[MAX_GATE_THREADS];
 static int32_t s_filter_thread_exec_idx[MAX_GATE_THREADS];
 
 bool platform_aicpu_affinity_gate_filter(const int32_t *allowed_cpus, int32_t allowed_count, int32_t total_launched) {
-    tl_filter_exec_idx = -1;
+    tl_exec_idx = -1;
 
     // Bound-check both inputs against the static slot buffers
     // (s_filter_thread_cpu[MAX_GATE_THREADS] etc.) before any indexing.
@@ -259,10 +270,10 @@ bool platform_aicpu_affinity_gate_filter(const int32_t *allowed_cpus, int32_t al
 
     bool survive;
     if (idx < total_launched && idx < MAX_GATE_THREADS) {
-        tl_filter_exec_idx = s_filter_thread_exec_idx[idx];
-        survive = (tl_filter_exec_idx >= 0);
+        tl_exec_idx = s_filter_thread_exec_idx[idx];
+        survive = (tl_exec_idx >= 0);
     } else {
-        tl_filter_exec_idx = -1;
+        tl_exec_idx = -1;
         survive = false;
     }
 
@@ -276,14 +287,12 @@ bool platform_aicpu_affinity_gate_filter(const int32_t *allowed_cpus, int32_t al
     }
 
     if (survive) {
-        const char *role = (tl_filter_exec_idx == allowed_count - 1) ? "orch" : "sched";
-        LOG_INFO_V0(
-            "AICPU filter gate: thread idx=%d cpu=%d exec_idx=%d ACTIVE(%s)", idx, cpu, tl_filter_exec_idx, role
-        );
+        const char *role = (tl_exec_idx == allowed_count - 1) ? "orch" : "sched";
+        LOG_INFO_V0("AICPU filter gate: thread idx=%d cpu=%d exec_idx=%d ACTIVE(%s)", idx, cpu, tl_exec_idx, role);
     } else {
         LOG_INFO_V0("AICPU filter gate: thread idx=%d cpu=%d DROPPED", idx, cpu);
     }
     return survive;
 }
 
-int32_t platform_aicpu_affinity_thread_idx() { return tl_filter_exec_idx; }
+int32_t platform_aicpu_affinity_thread_idx() { return tl_exec_idx; }
