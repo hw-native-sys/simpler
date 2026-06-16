@@ -205,44 +205,56 @@ int DeviceRunner::run(Runtime &runtime, int block_dim, int launch_aicpu_num) {
         const int32_t n_sched = (launch_aicpu_num > 1) ? (launch_aicpu_num - n_orch) : 0;
         runtime.aicpu_allowed_cpu_count = 0;
         if (n_sched > 0) {
+            // The affinity gate is a performance optimization (ready-queue
+            // locality), not a correctness requirement. On a5 SKUs/drivers
+            // whose CPU_TOPO query is unsupported the probe fails
+            // (halGetDeviceInfoByBuff rc=65534 / dsmi_get_device_info rc=27).
+            // Degrade to the pre-#963 behavior — leave aicpu_allowed_cpu_count
+            // and aicpu_launch_count at 0, which the device kernel reads as
+            // "gate disabled": no CPU pinning, launch the caller-requested
+            // thread count, roles assigned by arrival order. Do NOT fail the
+            // run — only probe-incapable hardware reaches here, and CANN still
+            // schedules the AICPU threads correctly without the gate.
             if (!pto::a5::probe_aicpu_topology(static_cast<uint32_t>(device_id_), user_cpus)) {
-                LOG_ERROR("AICPU topology probe failed; affinity gate will drop all threads");
-                return -1;
-            }
-            if (!pto::a5::compute_allowed_cpus(user_cpus, n_sched, n_orch, allowed)) {
+                LOG_WARN(
+                    "AICPU topology probe failed; disabling affinity gate "
+                    "(no CPU pinning, launching %d AICPU threads unpinned)", launch_aicpu_num
+                );
+            } else if (!pto::a5::compute_allowed_cpus(user_cpus, n_sched, n_orch, allowed)) {
                 LOG_ERROR(
                     "AICPU topology has %zu user cpus, cannot fit %d sched + %d orch", user_cpus.size(), n_sched, n_orch
                 );
                 return -1;
+            } else {
+                const size_t cap = sizeof(runtime.aicpu_allowed_cpus) / sizeof(runtime.aicpu_allowed_cpus[0]);
+                if (allowed.size() > cap) {
+                    LOG_ERROR("compute_allowed_cpus returned %zu > cap %zu", allowed.size(), cap);
+                    return -1;
+                }
+                for (size_t i = 0; i < allowed.size(); ++i)
+                    runtime.aicpu_allowed_cpus[i] = allowed[i];
+                runtime.aicpu_allowed_cpu_count = static_cast<int32_t>(allowed.size());
+                // Launch one AICPU thread per OCCUPY-visible user cpu so CANN
+                // spreads exactly across the user pool — over-subscription on a
+                // SKU with fewer user cpus than the compile-time bound deadlocks
+                // the production AICPU kernel. Capped by the compile-time array
+                // sizing in case the SKU exceeds expectation.
+                int32_t launch_n = static_cast<int32_t>(user_cpus.size());
+                if (launch_n > PLATFORM_MAX_AICPU_THREADS_JUST_FOR_LAUNCH) {
+                    launch_n = PLATFORM_MAX_AICPU_THREADS_JUST_FOR_LAUNCH;
+                }
+                runtime.aicpu_launch_count = launch_n;
+                std::string dump;
+                for (size_t i = 0; i < allowed.size(); ++i) {
+                    if (i) dump += ", ";
+                    dump += std::to_string(allowed[i]);
+                    if (i + 1 == allowed.size()) dump += "(orch)";
+                }
+                LOG_INFO_V0(
+                    "AICPU ALLOWED_CPUS = [%s] (n_sched=%d, n_orch=%d, launch=%d, user_cpus=%zu)", dump.c_str(), n_sched,
+                    n_orch, launch_n, user_cpus.size()
+                );
             }
-            const size_t cap = sizeof(runtime.aicpu_allowed_cpus) / sizeof(runtime.aicpu_allowed_cpus[0]);
-            if (allowed.size() > cap) {
-                LOG_ERROR("compute_allowed_cpus returned %zu > cap %zu", allowed.size(), cap);
-                return -1;
-            }
-            for (size_t i = 0; i < allowed.size(); ++i)
-                runtime.aicpu_allowed_cpus[i] = allowed[i];
-            runtime.aicpu_allowed_cpu_count = static_cast<int32_t>(allowed.size());
-            // Launch one AICPU thread per OCCUPY-visible user cpu so CANN
-            // spreads exactly across the user pool — over-subscription on a
-            // SKU with fewer user cpus than the compile-time bound deadlocks
-            // the production AICPU kernel. Capped by the compile-time array
-            // sizing in case the SKU exceeds expectation.
-            int32_t launch_n = static_cast<int32_t>(user_cpus.size());
-            if (launch_n > PLATFORM_MAX_AICPU_THREADS_JUST_FOR_LAUNCH) {
-                launch_n = PLATFORM_MAX_AICPU_THREADS_JUST_FOR_LAUNCH;
-            }
-            runtime.aicpu_launch_count = launch_n;
-            std::string dump;
-            for (size_t i = 0; i < allowed.size(); ++i) {
-                if (i) dump += ", ";
-                dump += std::to_string(allowed[i]);
-                if (i + 1 == allowed.size()) dump += "(orch)";
-            }
-            LOG_INFO_V0(
-                "AICPU ALLOWED_CPUS = [%s] (n_sched=%d, n_orch=%d, launch=%d, user_cpus=%zu)", dump.c_str(), n_sched,
-                n_orch, launch_n, user_cpus.size()
-            );
         }
     }
 

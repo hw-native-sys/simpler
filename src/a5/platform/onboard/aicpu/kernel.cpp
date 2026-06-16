@@ -124,21 +124,22 @@ extern "C" __attribute__((visibility("default"))) int simpler_aicpu_exec(void *a
     // exec_idx via platform_aicpu_affinity_thread_idx() — the executor
     // reads it to assign sched/orch role.
     //
-    // If the host probe didn't populate the gate inputs (allowed_count or
-    // launch_count is 0) the gate would unconditionally drop every thread
-    // and we'd silently return success without ever calling aicpu_execute.
-    // That's a host-side bug; fail loud so it surfaces instead of
-    // producing nothing at runtime.
+    // Empty gate inputs (allowed_count or launch_count == 0) mean the host
+    // disabled the gate: either the single-thread init path (no gate needed)
+    // or a SKU whose topology probe is unsupported, where device_runner.cpp
+    // degrades to unpinned launch. Run all threads with no filtering — the
+    // executor falls back to arrival-order role assignment
+    // (platform_aicpu_affinity_thread_idx() returns -1 → thread_idx_++).
+    // This is the pre-#963 behavior; the gate is a perf optimization, not a
+    // correctness requirement.
     if (runtime->aicpu_allowed_cpu_count <= 0 || runtime->aicpu_launch_count <= 0) {
-        LOG_ERROR(
-            "AICPU affinity inputs missing: allowed_cpu_count=%d launch_count=%d (host probe must run before exec)",
+        LOG_INFO_V0(
+            "AICPU affinity gate disabled (allowed_cpu_count=%d launch_count=%d); running unpinned",
             runtime->aicpu_allowed_cpu_count, runtime->aicpu_launch_count
         );
-        return -1;
-    }
-    if (!platform_aicpu_affinity_gate_filter(
-            runtime->aicpu_allowed_cpus, runtime->aicpu_allowed_cpu_count, runtime->aicpu_launch_count
-        )) {
+    } else if (!platform_aicpu_affinity_gate_filter(
+                   runtime->aicpu_allowed_cpus, runtime->aicpu_allowed_cpu_count, runtime->aicpu_launch_count
+               )) {
         LOG_INFO_V0("Thread dropped by filter affinity gate");
         return 0;
     }
