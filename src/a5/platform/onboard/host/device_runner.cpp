@@ -203,7 +203,14 @@ int DeviceRunner::run(Runtime &runtime, int block_dim, int launch_aicpu_num) {
         std::vector<int32_t> allowed;
         const int32_t n_orch = 1;
         const int32_t n_sched = (launch_aicpu_num > 1) ? (launch_aicpu_num - n_orch) : 0;
+        // Default to the gate-disabled state; only a successful probe below
+        // sets these positive. Resetting both (not just allowed_cpu_count)
+        // matters when a Runtime is reused across launches — a stale positive
+        // aicpu_launch_count would otherwise survive into the probe-failure /
+        // single-thread fallback and override the requested launch count at
+        // the aicpu_launch_n computation below.
         runtime.aicpu_allowed_cpu_count = 0;
+        runtime.aicpu_launch_count = 0;
         if (n_sched > 0) {
             // The affinity gate is a performance optimization (ready-queue
             // locality), not a correctness requirement. On a5 SKUs/drivers
@@ -218,7 +225,8 @@ int DeviceRunner::run(Runtime &runtime, int block_dim, int launch_aicpu_num) {
             if (!pto::a5::probe_aicpu_topology(static_cast<uint32_t>(device_id_), user_cpus)) {
                 LOG_WARN(
                     "AICPU topology probe failed; disabling affinity gate "
-                    "(no CPU pinning, launching %d AICPU threads unpinned)", launch_aicpu_num
+                    "(no CPU pinning, launching %d AICPU threads unpinned)",
+                    launch_aicpu_num
                 );
             } else if (!pto::a5::compute_allowed_cpus(user_cpus, n_sched, n_orch, allowed)) {
                 LOG_ERROR(
@@ -251,8 +259,8 @@ int DeviceRunner::run(Runtime &runtime, int block_dim, int launch_aicpu_num) {
                     if (i + 1 == allowed.size()) dump += "(orch)";
                 }
                 LOG_INFO_V0(
-                    "AICPU ALLOWED_CPUS = [%s] (n_sched=%d, n_orch=%d, launch=%d, user_cpus=%zu)", dump.c_str(), n_sched,
-                    n_orch, launch_n, user_cpus.size()
+                    "AICPU ALLOWED_CPUS = [%s] (n_sched=%d, n_orch=%d, launch=%d, user_cpus=%zu)", dump.c_str(),
+                    n_sched, n_orch, launch_n, user_cpus.size()
                 );
             }
         }
