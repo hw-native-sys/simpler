@@ -50,7 +50,7 @@ if sys.platform == "darwin":
 import pytest  # noqa: E402
 
 from simpler_setup import parallel_scheduler as _ps  # noqa: E402
-from simpler_setup.log_config import configure_logging  # noqa: E402
+from simpler_setup.log_config import DEFAULT_LOG_LEVEL, configure_logging  # noqa: E402
 from simpler_setup.pto_isa import ensure_pto_isa_root  # noqa: E402
 from simpler_setup.scene_test import clear_compile_cache  # noqa: E402
 
@@ -146,6 +146,14 @@ def pytest_addoption(parser):
         metavar="PERF_LEVEL",
         help="Enable L2 swimlane. Bare flag=level 4 (full). "
         "1=AICore timing, 2=+dispatch/fanout, 3=+sched phases, 4=+orch phases",
+    )
+    parser.addoption(
+        "--enable-device-log-timing",
+        action="store_true",
+        default=False,
+        help="After the run, parse the CANN device log and print per-round Total / Orch / "
+        "Sched timing (from PTO2_PROFILING markers; no swimlane needed). Works with --rounds N. "
+        "Onboard only — ignored on sim and L3.",
     )
     parser.addoption(
         "--dump-tensor",
@@ -419,9 +427,14 @@ def pytest_configure(config):
 
     _configure_sanitizer(config)
 
+    # Configure logging unconditionally (not only when --log-level is passed) so
+    # simpler's own WARNINGs — e.g. the device-log-timing "no device log written"
+    # diagnostic — reach stderr by default under pytest, matching the standalone
+    # CLI path. Without this the root logger has no handler, so pytest's log
+    # capture swallows the message and a passing run shows nothing. An explicit
+    # --log-level still overrides the default threshold.
     log_level = config.getoption("--log-level", default=None)
-    if log_level:
-        configure_logging(log_level)
+    configure_logging(log_level or DEFAULT_LOG_LEVEL)
 
     commit = config.getoption("--pto-isa-commit")
     clone_protocol = config.getoption("--clone-protocol")

@@ -325,12 +325,12 @@ slots that overlay normal record slots in the buffer.
 | Submit `explicit_dep_count` | Chain shape | Per-submit slots used |
 | --------------------------- | ----------- | --------------------- |
 | `0 ≤ dc ≤ 64` | base only — fast path, no chain bookkeeping | 1 |
-| `65 ≤ dc ≤ 390` | base (64 deps) + 1 overflow (up to 326 deps) | 2 |
-| `391 ≤ dc ≤ 716` | base + 2 overflow | 3 |
-| general | base + `⌈(dc − 64) / 326⌉` overflow | `1 + ⌈(dc − 64) / 326⌉` |
+| `65 ≤ dc ≤ 646` | base (64 deps) + 1 overflow (up to 582 deps) | 2 |
+| `647 ≤ dc ≤ 1228` | base + 2 overflow | 3 |
+| general | base + `⌈(dc − 64) / 582⌉` overflow | `1 + ⌈(dc − 64) / 582⌉` |
 
-**Wire format.** An overflow record reinterprets the same 2624-byte slot
-as `{ task_id (8) + flags (4) + dep_count (2) + _reserved (2) + deps[326] }` —
+**Wire format.** An overflow record reinterprets the same 4672-byte slot
+as `{ task_id (8) + flags (4) + dep_count (2) + _reserved (2) + deps[582] }` —
 no tensor blobs (those live on the base record). Replay distinguishes
 the two views by `flags & DEP_GEN_FLAG_OVERFLOW`. Chain records always
 share the base's `task_id`, and the last one sets
@@ -347,7 +347,7 @@ base via `task_id`.
 
 **Truncation tail.** A submit whose chain exceeds the buffer's slot
 budget (`PLATFORM_DEP_GEN_RECORDS_PER_BUFFER = 32` slots → roughly
-`64 + 31 × 326 = 10170` deps max in the best case) is logged via
+`64 + 31 × 582 = 18106` deps max in the best case) is logged via
 `LOG_ERROR` and truncated to the largest dc that fits. Runtime
 correctness is unaffected — `Arg::set_dependencies` keeps the full dep
 list; only the dep_gen replay graph loses the tail.
@@ -358,7 +358,7 @@ list; only the dep_gen replay graph loses the tail.
 
 | Layer | File | Role |
 | ----- | ---- | ---- |
-| Shared-mem layout | `src/{a2a3,a5}/platform/include/common/dep_gen.h` | `DepGenRecord` (2624 B base, cache-line aligned, ≤64 inline explicit_deps) + `DepGenOverflowRecord` chain view (≤326 deps per slot) + SPSC ring + per-thread ready queue. Byte-identical layout across platforms. |
+| Shared-mem layout | `src/{a2a3,a5}/platform/include/common/dep_gen.h` | `DepGenRecord` (4672 B base, cache-line aligned, ≤64 inline explicit_deps) + `DepGenOverflowRecord` chain view (≤582 deps per slot) + SPSC ring + per-thread ready queue. Byte-identical layout across platforms. |
 | AICPU writer | `src/{a2a3,a5}/platform/{include,shared}/aicpu/dep_gen_collector_aicpu.{h,cpp}` | Single-instance write path; weak-fallback exported to host build. a5 reuses the a2a3 source verbatim — the writer accesses its own device-side view of shared memory, independent of how host↔device transport is implemented. |
 | Host collector | `src/{a2a3,a5}/platform/{include/host,shared/host}/dep_gen_collector.{h,cpp}` | `ProfilerBase<DepGenCollector, DepGenModule>` — drains ring → `records_` vector. On a5 (no SVM) it uses the base `alloc_paired_buffer`, which malloc's a host shadow + `copy_to_device`'s it and registers it via `add_malloc_shadow` so teardown can free it; `reconcile_counters` explicitly `copy_from_device`'s the BufferState before reading, and `finalize` lets `BufferPoolManager::clear_mappings()` release all shadows as the single source of truth. |
 | Capture call site | `src/{a2a3,a5}/runtime/tensormap_and_ringbuffer/runtime/pto_orchestrator.cpp` `submit_task_common` | One conditional block that snapshots inputs into the ring when `is_dep_gen_enabled()`; fires for both `submit_task` and `submit_dummy_task`. **a2a3 only:** the schema additionally carries `kernel_id[3] = {aic, aiv0, aiv1}` so the swimlane post-processor can resolve `task_id → kernel` from `deps.json` at level=1 where the AICore record is the sole device-side identity source. Inactive subslots stay at `INVALID_KERNEL_ID = -1`. |

@@ -507,6 +507,10 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
 
     LOG_INFO_V0("Thread %d: PTO2 dispatch starting with %d cores", thread_idx, tracker.core_num());
     int32_t cur_thread_completed = 0;
+    // Non-zero once a scheduler-hang timeout latches; returned in place of the
+    // completed count so the caller still sees the negative error rc while the
+    // shared end-of-loop flush below runs.
+    int32_t timeout_rc = 0;
     int32_t idle_iterations = 0;
     int32_t last_progress_count = 0;
 #if PTO2_PROFILING
@@ -863,13 +867,20 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
                                     completed_tasks_.load(std::memory_order_relaxed) < total_tasks_ &&
                                     no_thread_owns_running_task();
                 if (self_owns || global_stuck) {
-                    return handle_timeout_exit(
+                    // Latch the error + emergency_shutdown, then break to the
+                    // shared end-of-loop cleanup so the diagnostic buffers get
+                    // flushed to the host. An early return here would strand the
+                    // stuck task's already-dumped inputs and every completed
+                    // task's in/out records in the unflushed per-thread dump
+                    // buffer — exactly the state we need to triage the hang.
+                    timeout_rc = handle_timeout_exit(
                         thread_idx, header, runtime, idle_iterations, last_progress_count
 #if PTO2_PROFILING
                         ,
                         l2_swimlane.sched_start_ts
 #endif
                     );
+                    break;
                 }
                 last_progress_ts = get_sys_cnt_aicpu();
             }
@@ -948,5 +959,5 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
     }
 #endif
 
-    return cur_thread_completed;
+    return timeout_rc != 0 ? timeout_rc : cur_thread_completed;
 }

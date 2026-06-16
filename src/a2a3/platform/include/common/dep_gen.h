@@ -93,11 +93,11 @@ enum DepGenRecordFlags : uint32_t {
  * Layout:
  *   - task_id, flags, counts, explicit_deps, arg_types, kernel_id in the first
  *     cache lines
- *   - tensors[] (16 × 128 B opaque blobs) at the tail; covers ~64% of the entry
+ *   - tensors[] (32 × 128 B opaque blobs) at the tail; covers ~88% of the entry
  *
- * Total size: 8 + 4 + 4 + 64*8 + 16 + 12 (kernel_id) + 20 (pad) + 16*128
- *           = 2624 bytes.
- * Aligned to 64 B → 2624 B (already a multiple of 64). kernel_id + _pad0
+ * Total size: 8 + 4 + 4 + 64*8 + 32 + 12 (kernel_id) + 4 (pad) + 32*128
+ *           = 4672 bytes.
+ * Aligned to 64 B → 4672 B (already a multiple of 64). kernel_id + _pad0
  * together pad tensors[] up to offset 576 = 9 * 64 so each 128-byte tensor
  * blob covers exactly two cache lines instead of straddling three.
  */
@@ -109,11 +109,11 @@ struct DepGenRecord {
     uint64_t explicit_deps[DEP_GEN_MAX_EXPLICIT_DEPS];  // PTO2TaskId::raw, length = explicit_dep_count
     uint8_t arg_types[CORE_MAX_TENSOR_ARGS];            // TensorArgType, length = tensor_count
     int32_t kernel_id[3];  // per-subslot kernel id (AIC, AIV0, AIV1); INVALID_KERNEL_ID = -1
-    uint8_t _pad0[20];     // align tensors[] to 64 B (offset 576)
+    uint8_t _pad0[4];      // align tensors[] to 64 B (offset 576)
     uint8_t tensors[CORE_MAX_TENSOR_ARGS][DEP_GEN_TENSOR_SIZE];  // opaque Tensor blobs
 } __attribute__((aligned(64)));
 
-static_assert(sizeof(DepGenRecord) == 2624, "DepGenRecord size changed — update header comment + docs/dfx/dep_gen.md");
+static_assert(sizeof(DepGenRecord) == 4672, "DepGenRecord size changed — update header comment + docs/dfx/dep_gen.md");
 static_assert(sizeof(DepGenRecord) % 64 == 0, "DepGenRecord must be cache-line aligned");
 static_assert(offsetof(DepGenRecord, tensors) % 64 == 0, "DepGenRecord::tensors[] must start on a cache-line boundary");
 static_assert(offsetof(DepGenRecord, tensors) == 576, "DepGenRecord::tensors offset changed — update header comment");
@@ -127,9 +127,9 @@ static_assert(offsetof(DepGenRecord, tensors) == 576, "DepGenRecord::tensors off
  * DepGenOverflowRecord exactly overlays a DepGenRecord slot in the buffer.
  *
  * Layout: 16-byte header (task_id + flags + dep_count + _reserved) + deps[].
- * deps[] occupies (sizeof(DepGenRecord) - 16) / sizeof(uint64_t) = 326 entries.
+ * deps[] occupies (sizeof(DepGenRecord) - 16) / sizeof(uint64_t) = 582 entries.
  */
-constexpr int DEP_GEN_OVERFLOW_DEPS_PER_RECORD = 326;
+constexpr int DEP_GEN_OVERFLOW_DEPS_PER_RECORD = 582;
 
 /**
  * Reinterpret-view of a DepGenRecord slot when flags & DEP_GEN_FLAG_OVERFLOW.

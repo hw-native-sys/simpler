@@ -25,7 +25,7 @@ design: remote L3 callable routing should use `hashid` identities and
 target-private execution slots instead of cross-worker integer routing.
 
 The current implementation uses pre-forked local child processes and a
-4096-byte shared-memory mailbox. That model depends on copy-on-write callable
+fixed-size (`MAILBOX_SIZE`-byte) shared-memory mailbox. That model depends on copy-on-write callable
 registries, identical virtual addresses for `MAP_SHARED` regions, and
 parent-visible child PIDs. None of those assumptions holds across hosts.
 
@@ -37,7 +37,7 @@ not the production daemon/HCOMM backends.
 Implemented:
 
 - `WorkerEndpoint` with `LocalMailboxEndpoint` and `RemoteL3Endpoint`.
-  `LocalMailboxEndpoint` keeps the existing 4096-byte mailbox local-only.
+  `LocalMailboxEndpoint` keeps the existing fixed-size mailbox local-only.
   `RemoteL3Endpoint` encodes versioned TASK frames through a
   `RemoteL3Transport` interface and waits for matching COMPLETION frames.
 - Explicit endpoint outcomes: success, task failure, endpoint failure, and
@@ -549,7 +549,7 @@ requirements.
 
 ## Protocol
 
-Do not reuse the raw 4096-byte mailbox format across hosts. It has no version
+Do not reuse the raw fixed-size mailbox format across hosts. It has no version
 field, no sequence number, and assumes shared virtual memory.
 
 Remote endpoints use a versioned frame protocol with `HELLO`, `TASK`,

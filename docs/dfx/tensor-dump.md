@@ -49,9 +49,9 @@ python tests/st/<case>/test_<name>.py -p a5sim --dump-tensor 2
 | Level | Meaning |
 | ----- | ------- |
 | `0` (or flag absent) | off — zero overhead |
-| `1` (bare `--dump-tensor`) | **partial** — only tasks marked with `Arg::dump(...)` (see §3.2) |
-| `2` (`--dump-tensor 2`) | **full** — every task's tensor inputs and outputs |
-| `3` (`--dump-tensor 3`) | **full, JSON only** — every task's metadata (shape, dtype, strides, scalar values) to `tensor_dump.json`; no payload captured, no `.bin` file |
+| `1` (bare `--dump-tensor`) | **partial** — only args marked with `Arg::dump(...)` (see §3.2) |
+| `2` (`--dump-tensor 2`) | **full** — every task's tensor inputs/outputs and scalar args |
+| `3` (`--dump-tensor 3`) | **full, JSON only** — every task's tensor/scalar metadata (shape, dtype, strides, scalar values) to `tensor_dump.json`; no payload captured, no `.bin` file |
 
 Level 3 exists for consumers that need only the per-task tensor *structure*,
 not the element data — e.g. feeding the manifest into tooling. The AICPU
@@ -88,10 +88,11 @@ submission order. AICore executors read the same `PROFILING_FLAG_DUMP_TENSOR`
 bit to insert a `pipe_barrier(PIPE_ALL)` before FIN when dump is on, so
 `AFTER_COMPLETION` snapshots see the kernel's final writes.
 
-### 3.2 Partial Dump — Select Specific Tasks / Tensors
+### 3.2 Partial Dump — Select Specific Args
 
 Partial dump (level 1) captures only the tasks whose `Arg` is marked
-with `dump(...)`; every unmarked task is skipped. Mark the arguments on
+with `dump(...)`; every unmarked task is skipped. Within a marked task,
+only the selected tensor/scalar args are recorded. Mark the arguments on
 the relevant `Arg` before submission:
 
 ```cpp
@@ -99,34 +100,47 @@ Arg args;
 args.add_input(x);
 args.add_input(y);
 args.add_output(z);
-args.dump(x, y, z);
+float scale = 1.0f;
+args.add_scalar(scale);
+args.dump(x, z, scale);
 rt_submit_aiv_task(FUNC_ADD, args);
 ```
 
-`dump(...)` selects tensor arguments from the current `Arg`; it does not
-execute a dump immediately. The selected tensors must already belong to
-that `Arg`. The runtime uses the argument direction already provided by
-`add_input()`, `add_output()`, or `add_inout()` to decide when each
-selected tensor is captured:
+`dump(...)` selects arguments from the current `Arg`; it does not execute
+a dump immediately. The selected tensors and scalar lvalues must already
+belong to that `Arg`. Scalar selection is by the lvalue passed to
+`add_scalar(...)`, not by scalar value. Temporaries such as
+`args.dump(1.0f)` are rejected because they do not identify a previously
+added scalar slot. If the same scalar lvalue is added more than once,
+`dump(lvalue)` selects the first matching scalar arg and marks that scalar
+entry with `arg_index_ambiguous: true` in `tensor_dump.json`; use distinct
+local variables when you need to select a later duplicate.
+
+The runtime uses the tensor direction already provided by `add_input()`,
+`add_output()`, or `add_inout()` to decide when each selected tensor is
+captured:
 
 - input tensors are dumped before dispatch.
 - output tensors are dumped after completion.
 - inout tensors follow the existing inout dump behavior.
+- scalar args are dumped before dispatch.
 
 Selective dump comes at two granularities, both expressed with the same
 `dump(...)` marker:
 
-- **Tensor granularity** — `dump(x, y, z)` selects specific tensor
-  arguments of the task (the example above).
+- **Arg granularity** — `dump(x, z, scale)` selects specific tensor and
+  scalar arguments of the task (the example above).
 - **Task granularity** — `dump()` with no arguments selects the whole
-  task (every tensor argument on the `Arg`), without enumerating them:
+  task (every tensor and scalar argument on the `Arg`), without
+  enumerating them:
 
   ```cpp
   Arg args;
   args.add_input(x);
   args.add_input(y);
   args.add_output(z);
-  args.dump();        // whole task: every tensor arg on this Arg
+  args.add_scalar(scale);
+  args.dump();        // whole task: every tensor/scalar arg on this Arg
   rt_submit_aiv_task(FUNC_ADD, args);
   ```
 
@@ -134,8 +148,9 @@ Partial vs full is chosen by the **dump level** (§3.1), latched host-side
 before any dispatch — not inferred from the markers, so it never depends
 on task submission order. At level 1, tasks without a marker are skipped
 and marked tasks dump only their selected arguments. At level 2, the
-markers are ignored and every task's tensors are dumped. At level 3, every
-task's tensors are dumped as metadata only (no payload, no `.bin`). With no
+markers are ignored and every task's tensors/scalars are dumped. At level
+3, every task's tensors/scalars are dumped as metadata only (no payload,
+no `.bin`). With no
 `--dump-tensor` (level 0) dump is off entirely.
 
 If you run at level 1 but place no `dump(...)` markers anywhere, the
@@ -211,8 +226,10 @@ Key fields:
 
 - `task_id` — runtime task identity. Use to correlate with swimlane / PMU
   output.
-- `arg_index` — position in the formal callable signature. For scalar
-  entries this equals `payload.tensor_count + scalar_index`.
+- `arg_index` — payload argument index. Tensor entries use the payload
+  tensor index; scalar entries use `payload.tensor_count + scalar_index`.
+  When scalar lvalue selection matched multiple scalar slots, the selected
+  first-match scalar entry carries `arg_index_ambiguous: true`.
 - `role` / `stage` — `input` / `output` / `inout`, captured
   `before_dispatch` / `after_completion`.
 - `kind` — `tensor` for arena-backed payloads, `scalar` for
@@ -849,6 +866,52 @@ Either the run did not produce one (see first question), or the
 viewer's working directory differs from the run's. Pass the
 explicit dump-dir path to the viewer:
 `python -m simpler_setup.tools.dump_viewer outputs/<case>_<ts>/tensor_dump`.
+
+**The run hung (AICore op-timeout / scheduler timeout) — is there
+still a dump?** Yes, and it includes the hung kernel's own partial
+output. The host exports the manifest even though `run()` returns the
+timeout error, and you get the inputs of every dispatched task
+(captured at `BEFORE_DISPATCH`) plus the `AFTER_COMPLETION` output of
+every task that completed before the hang. This rests on the timeout
+ordering — the three budgets are tuned so the **AICPU detects the
+hang first**, dumps, and only then the hardware/host timeouts fire:
+
+```text
+SCHEDULER_TIMEOUT_MS (2 s)  <  PLATFORM_OP_EXECUTE_TIMEOUT_US (3 s)  <  PLATFORM_STREAM_SYNC_TIMEOUT_MS (4 s)
+   AICPU declares hang,          STARS reaps the AICore op            host stream sync gives up
+   flushes + dumps in-flight     and poisons the context              and surfaces the error
+```
+
+- **Device-side graceful flush (primary).** At 2 s of no progress
+  the AICPU declares the hang, runs the end-of-loop flush, *and*
+  dumps the **partial output** of every task still RUNNING on a core
+  — written at the `after_completion` stage, reflecting current GM,
+  so you can see how far a stuck kernel got and how much it wrote.
+  Because this fires ~1 s before STARS reaps the op (3 s), it
+  normally completes while the kernel is still wedged (and host-side
+  recovery below backstops the rest). Best-effort:
+  only AICore writes already drained to GM are visible (the stuck
+  core issued no `pipe_barrier`, so writes still in its cache are
+  not), and a read may be torn if the core is mid-write. To tell a
+  running task's partial output apart from a genuine completion,
+  cross-reference the `[STALL …] state=RUNNING` / `SHUTDOWN_SNAPSHOT`
+  log lines — those task_ids are the in-flight ones.
+- **Host-side recovery (backstop).** If the AICPU is killed before
+  it finishes flushing (it loses the race, or `emergency_shutdown`
+  blocks on the wedged core), its last buffer is left un-flushed on
+  the device (`current_buf_ptr != 0`). The host's `reconcile_counters`
+  detects this and recovers those records directly from the device
+  buffer + arena (the device is not reset until *after* the export),
+  so whatever the AICPU managed to record — including in-flight
+  output written before the kill — still reaches the manifest.
+
+This ordering is load-bearing: if the timeouts were inverted (STARS
+reaping before the AICPU's budget, as in earlier versions), the
+device-side dump would never run on a real AICore hang and you would
+only recover what was already in the buffer. The chain lives in
+`scheduler_types.h` (`SCHEDULER_TIMEOUT_MS`) and `platform_config.h`
+(`PLATFORM_OP_EXECUTE_TIMEOUT_US` / `PLATFORM_STREAM_SYNC_TIMEOUT_MS`),
+along with the `#897` distributed-skew trade-off.
 
 ## 9. Related docs
 

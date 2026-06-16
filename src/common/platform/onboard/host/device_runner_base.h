@@ -86,6 +86,7 @@ public:
     void free_tensor(void *dev_ptr);
     int copy_to_device(void *dev_ptr, const void *host_ptr, std::size_t bytes);
     int copy_from_device(void *host_ptr, const void *dev_ptr, std::size_t bytes);
+    int device_memset(void *dev_ptr, int value, std::size_t bytes);
 
     /**
      * Commit the three per-Worker pooled regions (PTO2 GM heap, PTO2

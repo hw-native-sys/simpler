@@ -17,7 +17,7 @@ SUB) in its own address space.
 The remote L3 design keeps this local fork/shm path behind
 `LocalMailboxEndpoint` and reserves the same `WorkerEndpoint` boundary for a
 framed `RemoteL3Endpoint` for cross-host NEXT_LEVEL children. A remote endpoint
-is not another child loop that polls the 4096-byte mailbox; it uses the
+is not another child loop that polls the `MAILBOX_SIZE`-byte mailbox; it uses the
 contracts in
 [remote-l3-worker-design.md](remote-l3-worker-design.md).
 The current code includes that `RemoteL3Endpoint` boundary, a socket-backed

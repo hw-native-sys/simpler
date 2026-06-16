@@ -576,11 +576,36 @@ NB_MODULE(_task_interface, m) {
             return os.str();
         });
 
+    // --- RuntimeEnv (per-task PTO2_RING_* overrides; nested under CallConfig.runtime_env) ---
+    nb::class_<RuntimeEnv>(m, "RuntimeEnv")
+        .def(nb::init<>())
+        .def_rw("ring_task_window", &RuntimeEnv::ring_task_window)
+        .def_rw("ring_heap", &RuntimeEnv::ring_heap)
+        .def_rw("ring_dep_pool", &RuntimeEnv::ring_dep_pool)
+        .def("__repr__", [](const RuntimeEnv &self) -> std::string {
+            std::ostringstream os;
+            os << "RuntimeEnv(ring_task_window=" << self.ring_task_window << ", ring_heap=" << self.ring_heap
+               << ", ring_dep_pool=" << self.ring_dep_pool << ")";
+            return os.str();
+        });
+
     // --- CallConfig ---
     nb::class_<CallConfig>(m, "CallConfig")
         .def(nb::init<>())
         .def_rw("block_dim", &CallConfig::block_dim)
         .def_rw("aicpu_thread_num", &CallConfig::aicpu_thread_num)
+        // runtime_env returns an internal reference so `cfg.runtime_env.ring_heap = X`
+        // writes through to the owning CallConfig (rv_policy::reference_internal).
+        .def_prop_rw(
+            "runtime_env",
+            [](CallConfig &c) -> RuntimeEnv & {
+                return c.runtime_env;
+            },
+            [](CallConfig &c, const RuntimeEnv &re) {
+                c.runtime_env = re;
+            },
+            nb::rv_policy::reference_internal
+        )
         .def_prop_rw(
             "enable_l2_swimlane",
             [](const CallConfig &c) {
@@ -617,6 +642,7 @@ NB_MODULE(_task_interface, m) {
             }
         )
         .def_rw("enable_pmu", &CallConfig::enable_pmu)
+        .def("validate", &CallConfig::validate)
         .def_prop_rw(
             "enable_dep_gen",
             [](const CallConfig &c) {
@@ -658,6 +684,11 @@ NB_MODULE(_task_interface, m) {
                << ", enable_dump_tensor=" << self.enable_dump_tensor << ", enable_pmu=" << self.enable_pmu
                << ", enable_dep_gen=" << (self.enable_dep_gen ? "True" : "False")
                << ", enable_scope_stats=" << (self.enable_scope_stats ? "True" : "False");
+            if (self.runtime_env.any()) {
+                os << ", runtime_env.ring_task_window=" << self.runtime_env.ring_task_window
+                   << ", runtime_env.ring_heap=" << self.runtime_env.ring_heap
+                   << ", runtime_env.ring_dep_pool=" << self.runtime_env.ring_dep_pool;
+            }
             if (self.output_prefix_set()) {
                 os << ", output_prefix='" << self.output_prefix << "'";
             }
@@ -697,7 +728,9 @@ NB_MODULE(_task_interface, m) {
             [](const RunTiming &t) {
                 return t.device_wall_ns / 1000.0;
             },
-            "On-NPU wall (orch end - orch start), in microseconds. Populated whenever the "
+            "Full on-NPU kernel wall, in microseconds: simpler_aicpu_init start -> "
+            "simpler_aicpu_exec end (init + run + teardown), NOT just the orch span — "
+            "it is larger than the device-log Orch/Sched/Total. Populated whenever the "
             "runtime was built with PTO2_PROFILING (the default); independent of "
             "enable_l2_swimlane after the orch_summary capture was decoupled from the "
             "swimlane shared region. Zero only on a PTO2_PROFILING-off build."

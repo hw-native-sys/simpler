@@ -12,7 +12,7 @@ by host pointers.
 
 ## Frames
 
-Remote transport must not reuse the raw 4096-byte mailbox format. Define a
+Remote transport must not reuse the raw fixed-size mailbox format. Define a
 versioned frame header:
 
 ```text

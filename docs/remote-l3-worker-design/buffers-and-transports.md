@@ -128,7 +128,7 @@ and imported simulation handles.
 Endpoint rules:
 
 - `LocalMailboxEndpoint` rejects non-empty sidecars. It cannot encode remote
-  descriptors into the local 4096-byte mailbox, and its child processes expect
+  descriptors into the local fixed-size mailbox, and its child processes expect
   `ContinuousTensor.data` to be a local host/shm pointer or a local child-memory
   pointer.
 - `RemoteL3Endpoint` requires a sidecar for every tensor payload that crosses

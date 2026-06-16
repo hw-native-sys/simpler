@@ -152,6 +152,7 @@ struct DumpedTensor {
     TensorDumpStage stage;
     uint8_t dtype;
     uint8_t ndims;
+    uint8_t flags;
     TensorDumpKind kind;
     uint64_t scalar_value;
     uint64_t start_offset;                     // 1D element offset of the view origin
@@ -199,7 +200,7 @@ public:
      * @param free_cb           Memory free callback
      * @param user_data         Opaque pointer forwarded to callbacks
      * @param output_prefix     Per-task directory; tensor_dump/ subdir lands here
-     * @param dump_tensor_level OFF / PARTIAL (only Arg::dump()-marked tasks) /
+     * @param dump_tensor_level OFF / PARTIAL (only Arg::dump()-marked args) /
      *                          FULL / FULL_JSON_ONLY (every task's metadata to
      *                          JSON, no payload or .bin). Written to
      *                          DumpDataHeader so the AICPU latches the mode

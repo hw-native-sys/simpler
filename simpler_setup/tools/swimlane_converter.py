@@ -31,8 +31,6 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Any
 
-from .sched_overhead_analysis import run_analysis as run_sched_overhead_analysis
-
 
 def _func_id_to_letter(func_id):
     """Map a non-negative integer func_id to a numeric+letter label.
@@ -49,6 +47,27 @@ def _func_id_to_letter(func_id):
         m, rem = divmod(m - 1, 26)
         letters.append(chr(ord("a") + rem))
     return str(n) + "_" + "".join(reversed(letters))
+
+
+def _task_display_name(func_id, func_id_to_name, tdisp):
+    """Build the swimlane event label for a task.
+
+    Naming, in priority order:
+      - ``func_id < 0`` (unresolved): ``task(rXtY)``. This is the no-deps.json
+        case — without a dep_gen capture the host never carries func_id, so
+        every lane is an anonymous ``task(...)`` distinguished only by id.
+      - a name mapping exists for the func_id: ``<name>(rXtY)``.
+      - otherwise: ``func_<letter>(rXtY)`` (resolved id, but no name map entry).
+    """
+    try:
+        resolved = int(func_id) >= 0
+    except (TypeError, ValueError):
+        resolved = False
+    if not resolved:
+        return f"task({tdisp})"
+    if func_id_to_name and str(func_id) in func_id_to_name:
+        return f"{func_id_to_name[str(func_id)]}({tdisp})"
+    return f"func_{_func_id_to_letter(func_id)}({tdisp})"
 
 
 def normalize_pto2_task_id_int(v):
@@ -637,7 +656,147 @@ def print_task_statistics(tasks, func_id_to_name=None):
     print("=" * 110)
 
 
-def generate_chrome_trace_json(  # noqa: PLR0912, PLR0915
+def build_overhead_counter_events(tasks, deps_edges, pid=3):  # noqa: PLR0912
+    """Per-engine + system overhead counter tracks for the Perfetto trace.
+
+    Emits 8 counter (``"ph":"C"``) series under the AICPU Scheduler process
+    (``pid=3``) — it is scheduler-overhead analysis, so it lives in the sched
+    group — overlaid alongside the scheduler's own tracks and the AICore task
+    bars to see, at every instant, why time is or is not wasted (see
+    docs/dfx/sched-overhead-model.md):
+
+      {aic,aiv}_idle     core of that type NOT executing (k - running)
+      {aic,aiv}_ready    that type's tasks whose producers have ended but that
+                         are not yet dispatched. A MIX task (records on BOTH
+                         engines) counts for BOTH.
+      {aic,aiv}_overhead 1 when idle>0 AND ready>0 (free core + ready work the
+                         scheduler hasn't placed)
+      all_overhead       1 when EVERY present engine is overhead (whole chip
+                         blocked — e.g. a MIX waiting to launch)
+      has_overhead       1 when every engine that HAS ready work is overhead
+                         (engines with no work are ignored)
+
+    Readiness keys off producer end_time; a task whose predecessors are all
+    absent from the perf set falls back to its own dispatch (no unverifiable
+    early readiness). Needs ``deps_edges`` (pred -> [succ]); returns [] without it.
+    """
+    if not deps_edges or not tasks:
+        return []
+
+    def _u64(x):
+        try:
+            x = int(x)
+        except (TypeError, ValueError):
+            return None
+        return x & ((1 << 64) - 1) if x < 0 else x
+
+    cores_by_type = defaultdict(set)
+    for t in tasks:
+        cores_by_type[t.get("core_type")].add(t.get("core_id"))
+    types = [ty for ty in ("aic", "aiv") if cores_by_type.get(ty)]
+    if not types:
+        return []
+    k = {ty: len(cores_by_type[ty]) for ty in types}
+
+    types_of = defaultdict(set)
+    disp, end = {}, {}
+    for t in tasks:
+        tid = _u64(t.get("task_id"))
+        if tid is None:
+            continue
+        types_of[tid].add(t.get("core_type"))
+        disp[tid] = min(disp.get(tid, t["dispatch_time_us"]), t["dispatch_time_us"])
+        end[tid] = max(end.get(tid, t["end_time_us"]), t["end_time_us"])
+
+    preds = defaultdict(set)
+    for pred, succs in deps_edges.items():
+        p = _u64(pred)
+        for s in succs:
+            ss = _u64(s)
+            if p is not None and ss is not None and p != ss:
+                preds[ss].add(p)
+    ready = {}
+    for tid, dp in disp.items():
+        in_perf = [p for p in preds.get(tid, ()) if p in end]
+        ready[tid] = max(end[p] for p in in_perf) if in_perf else dp
+
+    w0 = min(t["start_time_us"] for t in tasks)
+    w1 = max(t["end_time_us"] for t in tasks)
+    run = {ty: defaultdict(int) for ty in types}
+    rw = {ty: defaultdict(int) for ty in types}
+    times = {w0, w1}
+    for t in tasks:
+        ty = t.get("core_type")
+        if ty not in run:
+            continue
+        s = max(w0, min(t["start_time_us"], w1))
+        e = max(w0, min(t["end_time_us"], w1))
+        if e > s:
+            run[ty][s] += 1
+            run[ty][e] -= 1
+            times.update((s, e))
+    for tid, dp in disp.items():
+        r = max(w0, min(ready[tid], w1))
+        dd = max(w0, min(dp, w1))
+        if dd > r:
+            for ty in types_of[tid]:  # MIX -> credit both engines
+                if ty in rw:
+                    rw[ty][r] += 1
+                    rw[ty][dd] -= 1
+            times.update((r, dd))
+
+    tids = {
+        "oh_aic_idle": 9101,
+        "oh_aic_ready": 9102,
+        "oh_aic_overhead": 9103,
+        "oh_aiv_idle": 9111,
+        "oh_aiv_ready": 9112,
+        "oh_aiv_overhead": 9113,
+        "oh_all_overhead": 9121,
+        "oh_has_overhead": 9122,
+    }
+    # No process metadata: pid=3 is the AICPU Scheduler process (named/sorted
+    # elsewhere). Emitting it here would override that — these counters just
+    # join the scheduler group as extra tracks (names prefixed "oh_").
+    events = []
+    run_c = {ty: 0 for ty in types}
+    rw_c = {ty: 0 for ty in types}
+    prev = {}
+    order = sorted(times)
+    for i in range(len(order) - 1):
+        a = order[i]
+        for ty in types:
+            run_c[ty] += run[ty][a]
+            rw_c[ty] += rw[ty][a]
+        ov = {}
+        vals = {}
+        for ty in types:
+            idle = k[ty] - run_c[ty]
+            vals[f"oh_{ty}_idle"] = idle
+            vals[f"oh_{ty}_ready"] = rw_c[ty]
+            ov[ty] = 1 if (idle > 0 and rw_c[ty] > 0) else 0
+            vals[f"oh_{ty}_overhead"] = ov[ty]
+        vals["oh_all_overhead"] = 1 if all(ov[ty] for ty in types) else 0
+        work = [ty for ty in types if rw_c[ty] > 0]
+        vals["oh_has_overhead"] = 1 if (work and all(k[ty] - run_c[ty] > 0 for ty in work)) else 0
+        for name, v in vals.items():
+            if name in tids and prev.get(name) != v:
+                events.append(
+                    {
+                        "ph": "C",
+                        "cat": "overhead",
+                        "name": name,
+                        "pid": pid,
+                        "tid": tids[name],
+                        "ts": round(a, 3),
+                        "args": {name: v},
+                    }
+                )
+                prev[name] = v
+    return events
+
+
+def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
     tasks,
     output_path,
     func_id_to_name=None,
@@ -648,6 +807,7 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0915
     orchestrator_name=None,
     deps_edges=None,
     deps_kernel_map=None,
+    emit_overhead=False,
 ):
     """Generate Chrome Trace Event Format JSON from task data.
 
@@ -687,6 +847,20 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0915
 
     if verbose:
         print(f"  Unique cores: {len(unique_cores)}")
+
+    # Recover func_id for AICORE_TIMING (level=1) records, which the host
+    # emits as func_id=-1. Resolve once here against dep_gen's per-task
+    # kernel_ids[3] (picking the subslot by core_type) and write it back onto
+    # the task, so every downstream consumer — AICore View, AICPU View, and
+    # event-hints — sees the same real func_id. See
+    # resolve_func_id_from_kernel_map() for the AIV0-vs-AIV1 tie-break and the
+    # host-side contract.
+    if deps_kernel_map is not None:
+        for task in tasks:
+            if int(task["func_id"]) < 0:
+                resolved = resolve_func_id_from_kernel_map(task["task_id"], task.get("core_type"), deps_kernel_map)
+                if resolved >= 0:
+                    task["func_id"] = resolved
 
     # Step 2: Generate JSON events
     events = []
@@ -730,41 +904,40 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0915
     task_to_aicpu_tid: dict[tuple[int, int], int] = {}
     event_id = 0
 
+    # Invert deps (pred -> [succ]) into a fanin map (succ -> [pred]) so each task
+    # bar can show both its consumers (fanout) and producers (fanin) with counts.
+    fanin_map: dict[int, list] = defaultdict(list)
+    if deps_edges:
+        for pred, succs in deps_edges.items():
+            for succ in succs:
+                fanin_map[succ].append(pred)
+
     for task in tasks:
         tid = core_to_tid[task["core_id"]]
         ts = task["start_time_us"]
         dur = task["duration_us"]
 
-        # Get function name if available. At AICORE_TIMING (level=1) the
-        # host emits func_id=-1; recover the real func_id from dep_gen's
-        # per-task kernel_ids[3] using the record's core_type to pick the
-        # active subslot. See resolve_func_id_from_kernel_map() for the
-        # AIV0-vs-AIV1 tie-break and the host-side contract.
+        # func_id is already resolved (level=1 records recovered from
+        # dep_gen's kernel_ids up front; see the pre-pass above). Without a
+        # deps.json the id stays -1 and the lane is named task(rXtY).
         func_id = task["func_id"]
-        if int(func_id) < 0 and deps_kernel_map is not None:
-            resolved = resolve_func_id_from_kernel_map(task["task_id"], task.get("core_type"), deps_kernel_map)
-            if resolved >= 0:
-                func_id = resolved
         tdisp = format_task_display(task["task_id"])
-        if func_id_to_name and str(func_id) in func_id_to_name:
-            func_name = func_id_to_name[str(func_id)]
-            task_name = f"{func_name}({tdisp})"
-        else:
-            task_name = f"func_{_func_id_to_letter(func_id)}({tdisp})"
+        task_name = _task_display_name(func_id, func_id_to_name, tdisp)
 
-        # Build fanout hint string (packed ids → rXtY / tY for readability)
-        # from deps.json — the device hot path no longer carries fanout.
-        fanout_str = (
-            "["
-            + ", ".join(format_task_display(x) for x in (deps_edges.get(task["task_id"], []) if deps_edges else []))
-            + "]"
-        )
+        # fanout (consumers) / fanin (producers) hints from deps.json — the device
+        # hot path no longer carries them. Each leads with the degree (count) so
+        # broadcast / reduction nodes are obvious without expanding the list.
+        fanout_ids = deps_edges.get(task["task_id"], []) if deps_edges else []
+        fanin_ids = fanin_map.get(task["task_id"], [])
+        fanout_str = f"{len(fanout_ids)}: [" + ", ".join(format_task_display(x) for x in fanout_ids) + "]"
+        fanin_str = f"{len(fanin_ids)}: [" + ", ".join(format_task_display(x) for x in fanin_ids) + "]"
 
         events.append(
             {
                 "args": {
                     "event-hint": f"Task:{tdisp}, FuncId:{func_id}, CoreId:{task['core_id']}",
                     "fanout-hint": fanout_str,
+                    "fanin-hint": fanin_str,
                     "duration-us": dur,
                     "taskId": task["task_id"],
                 },
@@ -860,14 +1033,11 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0915
             tid = task_to_aicpu_tid.get((task["task_id"], task["core_id"]), core_to_tid[task["core_id"]])
             aicpu_dur = finish_us - dispatch_us
 
-            # Get function name if available
+            # Get function name if available (task(rXtY) when no deps.json
+            # resolved the func_id; see _task_display_name).
             func_id = task["func_id"]
             tdisp = format_task_display(task["task_id"])
-            if func_id_to_name and str(func_id) in func_id_to_name:
-                func_name = func_id_to_name[str(func_id)]
-                task_name = f"{func_name}({tdisp})"
-            else:
-                task_name = f"func_{_func_id_to_letter(func_id)}({tdisp})"
+            task_name = _task_display_name(func_id, func_id_to_name, tdisp)
 
             events.append(
                 {
@@ -1727,6 +1897,12 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0915
         print(f"  Flow events: {flow_id}")
 
     # Step 3: Write JSON file (with traceEvents wrapper to match C++ output)
+    if emit_overhead:
+        oh = build_overhead_counter_events(tasks, deps_edges)
+        events.extend(oh)
+        if verbose:
+            print(f"  Overhead Analysis: {sum(1 for e in oh if e.get('ph') == 'C')} counter points (8 tracks)")
+
     with open(output_path, "w") as f:
         json.dump({"traceEvents": events}, f, indent=2)
 
@@ -1771,6 +1947,12 @@ Examples:
         ),
     )
     parser.add_argument("-v", "--verbose", action="store_true", help="Verbose output")
+    parser.add_argument(
+        "--overhead",
+        action="store_true",
+        help="Add an 'Overhead Analysis' track (8 counter lines: per-engine "
+        "idle/ready/overhead + system all_overhead/has_overhead). Needs deps.json.",
+    )
     return parser
 
 
@@ -1921,7 +2103,14 @@ def main():
             core_to_thread=data.get("core_to_thread"),
             deps_edges=deps_edges,
             deps_kernel_map=deps_kernel_map,
+            emit_overhead=args.overhead,
         )
+        if args.overhead and deps_edges is None:
+            print(
+                "Warning: --overhead needs deps.json for task readiness; no deps found, "
+                "Overhead Analysis track skipped.",
+                file=sys.stderr,
+            )
 
         print("\n✓ Conversion complete")
         print(f"  Input:  {input_path}")
@@ -1930,23 +2119,16 @@ def main():
 
         print_task_statistics(data["tasks"], func_names)
 
-        # The deep-dive reads the perf JSON plus deps.json (for per-thread
-        # fanout / fanin aggregates). Forward the resolved deps path so an
-        # explicit --deps-json overrides sibling auto-discovery there too.
-        print("\n=== Scheduler Overhead Deep Dive ===")
-        deep_dive_rc = run_sched_overhead_analysis(
-            input_path,
-            print_sources=True,
-            perf_data=data,
-            deps_json_path=deps_path if deps_edges is not None else None,
+        # Scheduler-overhead deep-dive is a SEPARATE manual tool now: it needs
+        # the task DAG (deps.json) captured in its own --enable-dep-gen run
+        # (co-running dep_gen with swimlane perturbs the timing), so it can't be
+        # produced accurately inline here. Run it explicitly:
+        #   python -m simpler_setup.tools.sched_overhead_analysis \
+        #       --l2-swimlane-records-json <this> --deps-json <deps from dep_gen run>
+        print(
+            "\nScheduler-overhead deep-dive: run sched_overhead_analysis manually with a "
+            "separately-captured deps.json (--enable-dep-gen)."
         )
-        if deep_dive_rc != 0:
-            print(
-                "Warning: Scheduler overhead deep-dive failed; conversion output is still available. "
-                "Check the detailed error above for root cause and fix route "
-                "(typically missing aicpu_scheduler_phases — rerun with --enable-l2-swimlane).",
-                file=sys.stderr,
-            )
 
         return 0
 

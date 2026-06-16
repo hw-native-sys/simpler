@@ -86,12 +86,17 @@ if(INDEP_ORCH)
     target_compile_definitions(aicpu_kernel PRIVATE INDEP_ORCH)
 endif()
 
+option(WERROR "Treat compiler warnings as errors" ON)
+if(DEFINED ENV{SIMPLER_DISABLE_WARNINGS_AS_ERRORS})
+    set(WERROR OFF)
+endif()
+
 # Compile options (host g++/gcc)
 target_compile_options(aicpu_kernel
     PRIVATE
         -Wall
         -Wextra
-        -Werror
+        $<$<BOOL:${WERROR}>:-Werror>
         $<$<CXX_COMPILER_ID:GNU>:-Wno-error=class-memaccess>
         -fPIC
         -O3

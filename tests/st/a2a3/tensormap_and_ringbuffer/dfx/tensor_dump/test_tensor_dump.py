@@ -34,14 +34,16 @@ KERNELS_BASE = "../../../../../../examples/a2a3/tensormap_and_ringbuffer/vector_
 class TestTensorDump(SceneTestCase):
     """tensor_dump capture smoke, level-aware on the ``--dump-tensor`` level.
 
-    Uses ``partial_dump_orch`` (5 tasks; two carry ``dump(...)`` markers) so a
+    Uses ``partial_dump_orch`` (5 tasks; four carry ``dump(...)`` markers) so a
     single orchestration exercises both modes:
 
-    - ``--dump-tensor 1`` (partial): only the two marked tasks are captured —
-      task ``0x..02`` via ``dump(d, inter_ci)`` (tensor granularity: args 0+2,
-      input ``e`` excluded), task ``0x..03`` via no-arg ``dump()`` (task
-      granularity: all three args). Mode is latched host-side before dispatch,
-      so it is race-free regardless of submission order.
+    - ``--dump-tensor 1`` (partial): only marked args are captured — task
+      ``0x..00`` via no-arg ``dump()`` (all tensor + scalar args), task
+      ``0x..01`` via ``dump(t2_addend)`` (scalar-only), task ``0x..02`` via
+      ``dump(d, inter_ci, t3_count)`` (mixed tensor + scalar, input ``e``
+      excluded), and task ``0x..03`` via no-arg ``dump()`` (all tensor args).
+      Mode is latched host-side before dispatch, so it is race-free regardless
+      of submission order.
     - ``--dump-tensor 2`` (full): markers are ignored, every task is dumped.
 
     The dump level comes straight from the CLI ``--dump-tensor`` value
@@ -138,17 +140,36 @@ class TestTensorDump(SceneTestCase):
         tensor_entries = [t for t in tensors if t.get("kind") == "tensor"]
         task_ids = {t["task_id"] for t in tensor_entries}
         if level == 1:
-            # Partial: only the two dump()-marked tasks, race-free (host-latched).
-            assert len(tensor_entries) == 5, f"partial expected 5 tensor entries, got {len(tensor_entries)}"
-            assert task_ids == {"0x0000000100000002", "0x0000000100000003"}
-            # Tensor granularity: dump(d, inter_ci) captured args 0 + 2, not arg 1 (e).
+            # Partial: only the selected tensor/scalar args, race-free (host-latched).
+            assert len(tensor_entries) == 7, f"partial expected 7 tensor entries, got {len(tensor_entries)}"
+            assert task_ids == {
+                "0x0000000100000000",
+                "0x0000000100000002",
+                "0x0000000100000003",
+            }
+            # Task granularity: dump() captured all tensor args on task 0.
+            t00 = sorted(t["arg_index"] for t in tensor_entries if t["task_id"] == "0x0000000100000000")
+            assert t00 == [0, 1]
+            # Mixed granularity: dump(d, inter_ci, t3_count) captured tensor args
+            # 0 + 2, not arg 1 (e).
             t02 = sorted(t["arg_index"] for t in tensor_entries if t["task_id"] == "0x0000000100000002")
             assert t02 == [0, 2]
-            # Task granularity: dump() captured all three tensor args.
+            # Tensor-only task granularity: dump() captured all three tensor args.
             t03 = sorted(t["arg_index"] for t in tensor_entries if t["task_id"] == "0x0000000100000003")
             assert t03 == [0, 1, 2]
-            # Selective mode also confines scalar-arg dumps to the marked tasks.
-            assert {t["task_id"] for t in scalar_entries} <= task_ids, scalar_entries
+            scalar_by_task = {
+                task_id: sorted(t["arg_index"] for t in scalar_entries if t["task_id"] == task_id)
+                for task_id in {t["task_id"] for t in scalar_entries}
+            }
+            assert scalar_by_task == {
+                "0x0000000100000000": [2, 3],
+                "0x0000000100000001": [2],
+                "0x0000000100000002": [3],
+            }
+            ambiguous_scalars = [
+                (t["task_id"], t["arg_index"]) for t in scalar_entries if t.get("arg_index_ambiguous", False)
+            ]
+            assert ambiguous_scalars == [("0x0000000100000002", 3)]
         else:
             # Full (level 2 or 3): markers ignored — every one of the 5 tasks is dumped.
             assert len(task_ids) >= 5, f"full dump should cover all 5 tasks, got {sorted(task_ids)}"

@@ -22,6 +22,7 @@ from _task_interface import (  # pyright: ignore[reportMissingImports]
     CoreCallable,
     DataType,
     TaskArgs,
+    TaskState,
     TensorArgType,
     arg_direction_name,
     get_dtype_name,
@@ -59,6 +60,13 @@ class TestDataType:
         assert DataType.UINT64.value == 8
         assert DataType.UINT16.value == 9
         assert DataType.UINT32.value == 10
+
+
+class TestTaskState:
+    def test_failed_state_is_bound(self):
+        assert TaskState.FAILED is not None
+        assert TaskState.FAILED.value == 5
+        assert TaskState.CONSUMED.value == 6
 
 
 class TestGetElementSize:

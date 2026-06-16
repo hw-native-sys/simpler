@@ -68,12 +68,17 @@ endif()
 # Create shared library (host-compatible for dlopen)
 add_library(aicpu_kernel SHARED ${AICPU_SOURCES})
 
+option(WERROR "Treat compiler warnings as errors" ON)
+if(DEFINED ENV{SIMPLER_DISABLE_WARNINGS_AS_ERRORS})
+    set(WERROR OFF)
+endif()
+
 # Compile options (host g++/gcc)
 target_compile_options(aicpu_kernel
     PRIVATE
         -Wall
         -Wextra
-        -Werror
+        $<$<BOOL:${WERROR}>:-Werror>
         $<$<CXX_COMPILER_ID:GNU>:-Wno-error=class-memaccess>
         -fPIC
         -O3

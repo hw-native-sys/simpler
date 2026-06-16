@@ -229,6 +229,7 @@ void TensorDumpCollector::process_dump_buffer(const DumpReadyBufferInfo &info) {
         dt.stage = static_cast<TensorDumpStage>(rec.stage);
         dt.dtype = rec.dtype;
         dt.ndims = rec.ndims;
+        dt.flags = rec.flags;
         dt.kind = static_cast<TensorDumpKind>(rec.kind);
         dt.scalar_value = rec.scalar_value;
         dt.is_contiguous = (rec.is_contiguous != 0);
@@ -334,11 +335,15 @@ void TensorDumpCollector::reconcile_counters() {
     rmb();
 
     uint32_t dropped_total = 0;
-    int leftover_active = 0;
-    // After stop(), dump_tensor_flush should have either enqueued the
-    // active buffer (success → current_buf_ptr=0) or counted it as dropped
-    // and cleared it. A non-zero pointer with non-zero count means records
-    // AICPU neither delivered nor accounted for — a device-side flush bug.
+    int recovered_threads = 0;
+    // After stop(), a non-zero current_buf_ptr with records means the device
+    // never ran dump_tensor_flush for that thread. The common cause is a hang:
+    // the AICPU op is reaped by the hardware op-execution timeout (507xxx)
+    // before its graceful scheduler-timeout shutdown can flush. The host still
+    // holds the buffer and the originating arena, so recover the records here
+    // (the same path the poll thread uses for a ready buffer) instead of
+    // dropping them — export_dump_files() then writes them like any normally
+    // collected buffer, so a hung run still yields its dumped inputs/outputs.
     for (int t = 0; t < num_dump_threads_; t++) {
         DumpBufferState *state = get_dump_buffer_state(shm_host_, t);
 
@@ -355,12 +360,18 @@ void TensorDumpCollector::reconcile_counters() {
         uint32_t count = reinterpret_cast<DumpMetaBuffer *>(host_ptr)->count;
         if (count == 0) continue;
 
-        LOG_ERROR(
-            "Dump reconcile: thread %d has un-flushed buffer (current_buf_ptr=0x%lx, count=%u) after "
-            "stop() — device flush failed",
-            t, static_cast<unsigned long>(cur_ptr), count
+        DumpReadyBufferInfo info;
+        info.thread_index = static_cast<uint32_t>(t);
+        info.dev_buffer_ptr = reinterpret_cast<void *>(cur_ptr);
+        info.host_buffer_ptr = host_ptr;
+        info.buffer_seq = state->current_buf_seq;
+        on_buffer_collected(info);
+        recovered_threads++;
+        LOG_WARN(
+            "Dump reconcile: thread %d had an un-flushed buffer (count=%u) — device flush did not run "
+            "(AICPU likely reaped on a hang); recovered the records host-side",
+            t, count
         );
-        leftover_active++;
     }
 
     if (dropped_total > 0) {
@@ -370,8 +381,12 @@ void TensorDumpCollector::reconcile_counters() {
             dropped_total
         );
     }
-    if (leftover_active > 0) {
-        LOG_ERROR("Dump reconcile: %d thread(s) had un-cleared current_buf_ptr — see prior errors", leftover_active);
+    if (recovered_threads > 0) {
+        LOG_WARN(
+            "Dump reconcile: recovered un-flushed buffers from %d thread(s) (device-side flush was skipped, "
+            "typically an AICPU hang reap)",
+            recovered_threads
+        );
     }
 }
 
@@ -610,12 +625,15 @@ int TensorDumpCollector::export_dump_files() {
              << "\"";
         json << ", \"arg_index\": " << dt.arg_index << ", \"role\": \"" << tensor_dump_role_name(dt.role)
              << "\", \"stage\": \"" << tensor_dump_stage_name(dt.stage) << "\", \"kind\": \""
-             << tensor_dump_kind_name(dt.kind) << "\", \"dtype\": \"" << dtype_name
-             << "\", \"is_contiguous\": " << (dt.is_contiguous ? "true" : "false") << ", \"shape\": " << shape_str
-             << ", \"strides\": " << strides_str << ", \"start_offset\": " << dt.start_offset
-             << ", \"numel\": " << numel;
+             << tensor_dump_kind_name(dt.kind) << "\", \"dtype\": \"" << dtype_name << "\"";
         if (dt.kind == TensorDumpKind::SCALAR) {
             write_scalar_json_value(json, dt);
+        }
+        json << ", \"is_contiguous\": " << (dt.is_contiguous ? "true" : "false") << ", \"shape\": " << shape_str
+             << ", \"strides\": " << strides_str << ", \"start_offset\": " << dt.start_offset
+             << ", \"numel\": " << numel;
+        if ((dt.flags & TENSOR_DUMP_RECORD_FLAG_ARG_INDEX_AMBIGUOUS) != 0) {
+            json << ", \"arg_index_ambiguous\": true";
         }
         json << ", \"bin_offset\": " << dt.bin_offset << ", \"bin_size\": " << dt.payload_size
              << ", \"truncated\": " << (dt.truncated ? "true" : "false")

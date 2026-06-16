@@ -76,6 +76,11 @@ if(INDEP_ORCH)
     target_compile_definitions(aicpu_kernel PRIVATE INDEP_ORCH)
 endif()
 
+option(WERROR "Treat compiler warnings as errors" ON)
+if(DEFINED ENV{SIMPLER_DISABLE_WARNINGS_AS_ERRORS})
+    set(WERROR OFF)
+endif()
+
 # Compile options (common to both C and C++)
 target_compile_options(aicpu_kernel
     PRIVATE
@@ -84,7 +89,7 @@ target_compile_options(aicpu_kernel
         -rdynamic
         -O3
         -fPIC
-        -Werror
+        $<$<BOOL:${WERROR}>:-Werror>
         -Wno-error=variadic-macros
         -fno-common
         -g

@@ -67,6 +67,10 @@ int DeviceRunnerBase::copy_from_device(void *host_ptr, const void *dev_ptr, std:
     return rtMemcpy(host_ptr, bytes, dev_ptr, bytes, RT_MEMCPY_DEVICE_TO_HOST);
 }
 
+int DeviceRunnerBase::device_memset(void *dev_ptr, int value, std::size_t bytes) {
+    return aclrtMemset(dev_ptr, bytes, value, bytes);
+}
+
 void *DeviceRunnerBase::acquire_pooled_gm_heap() {
     if (!gm_heap_arena_.is_committed()) return nullptr;
     return gm_heap_arena_.base();

@@ -141,6 +141,10 @@ struct HostApi {
     void (*device_free)(void *dev_ptr);
     int (*copy_to_device)(void *dev_ptr, const void *host_ptr, size_t size);
     int (*copy_from_device)(void *host_ptr, const void *dev_ptr, size_t size);
+    // Device-side memset (zero-init pure OUTPUT buffers in lieu of an H2D
+    // copy-in). Unused by host_build_graph; present only so the platform
+    // layer can populate the same HostApi shape regardless of runtime variant.
+    int (*device_memset)(void *dev_ptr, int value, size_t size);
     // PTO2 static-arena hooks. The host_build_graph runtime does not currently
     // use these — the fields exist only so the platform layer's
     // pto_runtime_c_api.cpp can populate the same HostApi struct regardless of

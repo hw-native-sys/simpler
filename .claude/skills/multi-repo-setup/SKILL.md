@@ -27,27 +27,33 @@ unit tests).
 ## Step 1: The repo graph (URLs)
 
 For an Ascend workload investigation, the cast is usually some subset
-of these. `simpler` is `$PWD` — the other rows list a GitHub URL and a
-canonical local clone path Step 2 ensures exists and is up-to-date.
+of these. `simpler` is `$PWD` — the other repos are cloned under the
+worktree's **`build/`** (gitignored, so they never get committed and stay
+co-located with the simpler you're testing). `$BUILD` =
+`$(git rev-parse --show-toplevel)/build` (Step 2 defines it).
 
 | repo | role | GitHub URL | local clone |
 | ---- | ---- | ---------- | ----------- |
 | simpler | host runtime + DFX (this repo) | <https://github.com/hw-native-sys/simpler> | `$PWD` (the current worktree) |
-| pypto | compiler + Python frontend; vendors a simpler submodule at `runtime/` | <https://github.com/hw-native-sys/pypto> | `$HOME/workspace/pypto` |
-| pypto-lib | model workloads (qwen3, deepseek, etc.) — imports pypto + simpler | <https://github.com/hw-native-sys/pypto-lib> | `$HOME/workspace/pypto-lib` |
-| pto-isa | ISA spec; pinned by pypto-lib via env (`PTO_ISA_COMMIT`) | <https://github.com/hw-native-sys/pto-isa> | `$HOME/workspace/pto-isa` |
-| PTOAS | release binary (`ptoas`); located via `PTOAS_ROOT` env | <https://github.com/hw-native-sys/PTOAS> (releases) | `/tmp/ptoas-v0XX/` (extracted tarball) |
+| pypto | compiler + Python frontend; vendors a simpler submodule at `runtime/` | <https://github.com/hw-native-sys/pypto> | `$BUILD/pypto` |
+| pypto-lib | model workloads (qwen3, deepseek, etc.) — imports pypto + simpler | <https://github.com/hw-native-sys/pypto-lib> | `$BUILD/pypto-lib` |
+| pto-isa | ISA spec; sets `PTO_ISA_ROOT` (required to BUILD the simpler runtime) | <https://github.com/hw-native-sys/pto-isa> | `$BUILD/pto-isa` |
+| PTOAS | `ptoas` assembler — **provided globally**, no clone | (on dev box / CI) | `/usr/local/bin/ptoas-bin` via `pypto-setup` |
 
 Drop rows your investigation doesn't need. Add rows for ad-hoc repos in
 the same format.
 
 ## Step 2: Clone-or-update every external repo
 
-Run this each invocation — never trust the existing clone to be
-current. Same shell function handles both "doesn't exist yet" and
-"already there, just sync to origin/main":
+Clones live under the worktree's `build/` (gitignored — co-located with
+the simpler you test, never committed). Run this each invocation — never
+trust the existing clone to be current. Same shell function handles both
+"doesn't exist yet" and "already there, just sync to origin/main":
 
 ```bash
+BUILD="$(git rev-parse --show-toplevel)/build"   # gitignored; holds the external clones
+mkdir -p "$BUILD"
+
 ensure_repo() {
   local url=$1 dir=$2
   if [ -d "$dir/.git" ]; then
@@ -59,8 +65,9 @@ ensure_repo() {
   git -C "$dir" submodule update --init --recursive --depth 1
 }
 
-ensure_repo https://github.com/hw-native-sys/pypto      "$HOME/workspace/pypto"
-ensure_repo https://github.com/hw-native-sys/pypto-lib  "$HOME/workspace/pypto-lib"
+ensure_repo https://github.com/hw-native-sys/pypto      "$BUILD/pypto"
+ensure_repo https://github.com/hw-native-sys/pypto-lib  "$BUILD/pypto-lib"
+ensure_repo https://github.com/hw-native-sys/pto-isa    "$BUILD/pto-isa"
 # add more as needed
 ```
 
@@ -70,9 +77,27 @@ Notes:
   If you have edits there, stash / commit them before invoking this skill.
 - `submodule update --init --recursive` matches the pin recorded in
   each repo's commit — that's the version the repo's CI runs against.
-- For PTOAS, download the release tarball mentioned in pypto-lib's
-  `.github/workflows/daily_ci.yml` (the `PTOAS_VERSION` env), don't
-  clone — it ships as a binary release.
+- PTOAS / CANN / gcc-15 are **provided globally** — no download. Step 2.5's
+  `pypto-setup --export` points `PTOAS_ROOT` at them.
+
+## Step 2.5: Toolchain env — `pypto-setup` + `PTO_ISA_ROOT`
+
+The dev box and CI runners ship ptoas, CANN, and gcc-15 globally; the
+`pypto-setup` helper hands you the env in one line. `PTO_ISA_ROOT` is the
+one piece it does NOT set (it's per-user) — point it at the `build/` clone:
+
+```bash
+eval "$(pypto-setup --export)"          # exports PTOAS_ROOT, ASCEND_HOME_PATH, GCC15_ROOT, PATH
+export PTO_ISA_ROOT="$BUILD/pto-isa"    # required to BUILD the simpler runtime
+```
+
+Run `pypto-setup` (no args) to see every global component, its path, and
+whether it's present. Why each matters:
+
+- **`PTOAS_ROOT`** unset → the JIT compile silently sets `skip_ptoas=True` →
+  no `kernel_config.py` emitted → the runtime can't assemble kernels onboard.
+- **`PTO_ISA_ROOT`** unset → the simpler runtime build fails with
+  `PTO-ISA not available`.
 
 ## Step 3: Override — pick which simpler the workload sees
 
@@ -85,19 +110,21 @@ You want the latest merged simpler against the external workload (e.g.
 confirm a recently merged PR didn't break a downstream case).
 
 ```bash
-ensure_repo https://github.com/hw-native-sys/simpler "$HOME/workspace/simpler-main"
+ensure_repo https://github.com/hw-native-sys/simpler "$BUILD/simpler-main"
 source <your-venv>/bin/activate
-pip install --no-build-isolation "$HOME/workspace/simpler-main"
+pip install --no-build-isolation "$BUILD/simpler-main"
 ```
 
 ### Override B: this worktree's simpler (your PR branch)
 
 You want to test in-flight changes (current PR / dev branch) against the
-external workload.
+external workload. `PTO_ISA_ROOT` (Step 2.5) must be exported first — the
+install builds the onboard runtime against it. A stale simpler whose ABI
+doesn't match the pypto compiler surfaces as **507018** on the first run.
 
 ```bash
 source .venv/bin/activate
-pip install --no-build-isolation .
+pip install --no-build-isolation .   # needs PTO_ISA_ROOT set (Step 2.5)
 ```
 
 ### Either way: verify which simpler actually loaded
@@ -135,8 +162,8 @@ For pypto, plain install too — let pypto's vendored `runtime/` stay
 unbuilt because you've already provided simpler via Step 3:
 
 ```bash
-pip install --no-build-isolation "$HOME/workspace/pypto"
-# Do NOT `pip install "$HOME/workspace/pypto/runtime"` — that would
+pip install --no-build-isolation "$BUILD/pypto"
+# Do NOT `pip install "$BUILD/pypto/runtime"` — that would
 # overwrite the simpler you installed in Step 3 with pypto's older pin.
 ```
 
@@ -144,11 +171,45 @@ pypto-lib is import-only (no install). Set `PYTHONPATH` and run
 scripts out of its tree directly:
 
 ```bash
-export PYTHONPATH="$HOME/workspace/pypto-lib"
+export PYTHONPATH="$BUILD/pypto-lib"
 ```
 
 Re-verify the loaded simpler after every install — pypto's install can
 re-resolve dependencies in ways that change what wins.
+
+## Worked example: qwen3 decode_layer onboard (a2a3) + DFX
+
+End-to-end, assuming Steps 1–4 done (repos in `$BUILD`, env from Step 2.5,
+worktree simpler installed). The case is
+`$BUILD/pypto-lib/models/qwen3/14b/decode_layer.py`. Onboard runs MUST hold a
+per-die lock (see `.claude/rules/running-onboard.md`) and pass the
+`onboard-arch-precheck` gate.
+
+```bash
+.claude/skills/onboard-arch-precheck/check.sh a2a3 || exit 1   # refuse wrong-arch BEFORE locking
+cd "$BUILD/pypto-lib/models/qwen3/14b"
+# Round 1 — dep_gen (topology) ; Round 2 — swimlane (clean timing). NEVER co-run:
+# dep_gen perturbs the timing the overhead analysis reads.
+task-submit --device auto --device-num 1 --run "python decode_layer.py -p a2a3 -d \$TASK_DEVICE"
+task-submit --device auto --device-num 1 --run "python decode_layer.py -p a2a3 -d \$TASK_DEVICE --no-dep-gen --enable-l2-swimlane"
+```
+
+Both write to `build_output/_jit_*/dfx_outputs/` (`deps.json` from round 1,
+`l2_swimlane_records.json` from round 2). Then analyze from the simpler worktree
+(its `simpler_setup/tools` wins by cwd precedence):
+
+```bash
+# ROUND1_DIR / ROUND2_DIR are the two build_output/_jit_*/dfx_outputs/ dirs above.
+python -m simpler_setup.tools.sched_overhead_analysis \
+    --l2-swimlane-records-json "ROUND2_DIR/l2_swimlane_records.json" \
+    --deps-json "ROUND1_DIR/deps.json"
+# Visual: add the Overhead Analysis track to the Perfetto trace
+python -m simpler_setup.tools.swimlane_converter "ROUND2_DIR/l2_swimlane_records.json" \
+    --deps-json "ROUND1_DIR/deps.json" --overhead -o swimlane.json
+```
+
+See [docs/dfx/sched-overhead-model.md](../../../docs/dfx/sched-overhead-model.md)
+for what the report and the 8 overhead tracks mean.
 
 ## Step 5: If the workload fails — start with "is it CI-gated?"
 
@@ -164,7 +225,7 @@ Quick check:
 
 ```bash
 F=<workload>.py
-grep -nE "python .*$(basename $F)" "$HOME/workspace/"*/.github/workflows/*.yml
+grep -nE "python .*$(basename $F)" "$BUILD/"*/.github/workflows/*.yml
 # Match → CI-gated. No match → not CI-gated.
 ```
 
@@ -178,9 +239,10 @@ pypto-lib ... example"). That subset is the actual cross-repo gate.
 | ------- | ------------ | ----------- |
 | `ModuleNotFoundError: No module named 'pypto'` | pypto not installed in this venv | reinstall pypto from your local clone |
 | `import simpler` resolves to wrong path | user-site `.pth` hook shadowing venv | remove `_simpler_editable.{pth,py}` from user-site |
-| `FileNotFoundError: kernel_config.py not found in ...` | `PTOAS_ROOT` unset → pypto auto-skips ptoas → no `kernel_config.py` emitted | `export PTOAS_ROOT=/tmp/ptoas-v040` (or whichever release) |
+| `FileNotFoundError: kernel_config.py not found in ...` | `PTOAS_ROOT` unset → pypto auto-skips ptoas → no `kernel_config.py` emitted | `eval "$(pypto-setup --export)"` (Step 2.5) |
+| `OSError: PTO-ISA not available` (during simpler build) | `PTO_ISA_ROOT` unset | `export PTO_ISA_ROOT="$BUILD/pto-isa"` (Step 2.5) |
 | script exits 0 but no device run | compile-only smoke fallback (golden data dir missing) | pass `--data-dir <golden>` or `--smoke` explicitly |
-| `aclrtSynchronizeStreamWithTimeout (AICPU) failed: 507018` | several — device log is the only ground truth | read `~/ascend/log/debug/device-N/device-<pid>_*.log` |
+| `aclrtSynchronizeStreamWithTimeout (AICPU) failed: 507018` | binary skew (simpler runtime vs pypto compiler ABI), OR device log is the only ground truth | rebuild simpler against the matching pypto (Step 3/4); then read `~/ascend/log/debug/device-N/device-<pid>_*.log` |
 | `BFloat16 did not match Float` at validate | golden data shape mismatch (data older than code) | regenerate golden via the workload's `gen_*_golden.py` |
 
 When the surface is `507018` / `507899` / `507046`, **do not stop at

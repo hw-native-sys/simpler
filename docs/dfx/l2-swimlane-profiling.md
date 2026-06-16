@@ -246,13 +246,30 @@ The output is `outputs/<case>_<ts>/merged_swimlane.json` (or your
 in. The trace contains:
 
 - **AICore View** — one swim-lane per AICore (AIC / AIV / mix
-  channel). Each task shows `func_name(t<task_id>)`; dependency
-  arrows are joined from `deps.json` when it's available — see
-  [§3.5](#35-dependency-arrows-from-dep_gen) for the workflow. No
-  `deps.json` → no arrows (the converter prints a one-line hint).
-- **AICPU View** — scheduler thread lanes with per-iteration
-  phase blocks coloured by `phase`.
-- **AICPU Scheduler** — orchestrator phase summary at the top.
+  channel) showing each task's execution window. Task labels follow
+  the deps.json-dependent rule below.
+- **AICPU View** — one lane per task showing the AICPU
+  `dispatch_time_us → finish_time_us` window (level >= 2). Tasks here
+  carry the **same labels** as the AICore View — so they share the
+  same deps.json dependency below.
+- **AICPU Scheduler** — per-iteration scheduler phase blocks
+  (`complete` / `dispatch`) coloured by `phase` (level >= 3).
+- **AICPU Orchestrator** — per-submit `orch_submit` envelope blocks
+  (level >= 4).
+
+**Task labeling (AICore View and AICPU View) depends entirely on
+whether a `deps.json` is present** (see
+[§3.5](#35-dependency-arrows-from-dep_gen)):
+
+- **With `deps.json`** — each task shows `func_name(rXtY)` (or
+  `func_<id>(rXtY)` when no name map), and dependency arrows are
+  drawn in the AICore View.
+- **Without `deps.json`** — the host never records `func_id` (it's
+  `-1` on disk), so the converter cannot tell tasks apart by
+  function. Every task in **both** views is labeled `task(rXtY)` —
+  distinguished only by id — and no arrows are drawn (the converter
+  prints a one-line hint). Re-run with `--enable-dep-gen` (or join an
+  existing `deps.json`) to recover names and arrows.
 
 When the run also emitted a device log (`device-*` file under
 `outputs/`), `swimlane_converter` resolves the nearest log by
@@ -263,9 +280,18 @@ specific overhead source.
 
 ### 3.4 Adding human-readable names
 
-Without name mapping, tasks show as `func_<id>(t<task_id>)`. To
-get readable lane labels, add a `name` field to your CALLABLE
-spec:
+Lane labels degrade in two steps:
+
+| What's available | Label | Distinguishable? |
+| ---------------- | ----- | ---------------- |
+| No `deps.json` (no `--enable-dep-gen`) | `task(rXtY)` | By id only — `func_id` is unresolved |
+| `deps.json`, no name map | `func_<id>(rXtY)` | By function id |
+| `deps.json` + name map | `QK(rXtY)` | By human name |
+
+So a readable trace needs **both** a `deps.json` (to resolve
+`func_id`; see [§3.5](#35-dependency-arrows-from-dep_gen)) **and** a
+name map. To get readable lane labels, add a `name` field to your
+CALLABLE spec:
 
 ```python
 @scene_test(level=2, runtime="tensormap_and_ringbuffer")
@@ -345,6 +371,35 @@ Use this when:
   (one `dep_gen` capture amortizes across N swimlane runs).
 - A workload is so large that the dep_gen replay validation gate
   would dominate the swimlane run time.
+
+**Low-distortion workflow (minimal capture, names recovered
+offline):** When you want the least possible perturbation — skip the
+`dep_gen` replay overhead on the measured run, and/or use a low
+swimlane perf_level (e.g. level 1, AICore timing only) — run the perf
+capture *without* `--enable-dep-gen`. The resulting trace labels every
+task `task(rXtY)` (no `func_id`, no arrows). To recover names and
+arrows afterward, take a `deps.json` from a separate `dep_gen` capture
+of the same topology, drop it next to your `l2_swimlane_records.json`
+(or point `--deps-json` at it), and re-run the converter:
+
+```bash
+# Low-overhead perf run — no dep_gen, low level.
+python test_my_case.py --platform a2a3 --enable-l2-swimlane 1
+
+# Separately (once per topology), capture the graph.
+python test_my_case.py --platform a2a3 --enable-dep-gen
+
+# Join offline: copy the deps.json in, then re-run the converter.
+cp outputs/<case_dep_ts>/deps.json outputs/<case_perf_ts>/deps.json
+python -m simpler_setup.tools.swimlane_converter \
+    outputs/<case_perf_ts>/l2_swimlane_records.json \
+    --func-names outputs/<case_perf_ts>/name_map_<case>.json
+```
+
+The converter is a pure post-processor — re-running it against the
+same raw records with a `deps.json` now present upgrades the labels
+from `task(rXtY)` to real names and adds the dependency arrows,
+without re-running the workload.
 
 When `--deps-json` is omitted **and** the converter cannot find a
 sibling `deps.json` next to `l2_swimlane_records.json`, the trace is
@@ -827,9 +882,17 @@ did not, run it manually:
 python -m simpler_setup.tools.swimlane_converter outputs/<case>_<ts>/l2_swimlane_records.json
 ```
 
-**Tasks show as `func_<id>` instead of human names.** The
-CALLABLE spec lacks `"name"` fields, or
-`name_map_<case>.json` was not produced. See [profiling-name-map.md](../profiling-name-map.md).
+**All tasks show as `task(rXtY)` (undistinguished).** No `deps.json`
+was available, so the converter could not resolve `func_id` (it's
+`-1` on disk) and every lane falls back to the anonymous `task(rXtY)`
+label with no dependency arrows. Re-run with `--enable-dep-gen`, or
+drop a `deps.json` from a prior `dep_gen` capture next to the records
+and re-run the converter — see
+[§3.5](#35-dependency-arrows-from-dep_gen).
+
+**Tasks show as `func_<id>` instead of human names.** `deps.json`
+resolved the `func_id`, but the CALLABLE spec lacks `"name"` fields
+or `name_map_<case>.json` was not produced. See [profiling-name-map.md](../profiling-name-map.md).
 
 **Some tasks missing from the swimlane.** Likely dropped on device
 because the buffer pool ran out. On a2a3 check
@@ -869,6 +932,11 @@ rules.
 
 ## 9. Related docs
 
+- [l2-timing.md](l2-timing.md) — the everyday L2 numbers: `RunTiming`
+  host_wall / device_wall, plus Total / Orch / Sched straight from the
+  `PTO2_PROFILING` device-log markers (no swimlane capture, works with
+  `--rounds > 1`); the lighter alternative when you don't need the
+  per-task / phase deep dive.
 - [profiling-framework.md](../profiling-framework.md) — shared
   host-side collector framework (a2a3 only).
 - [profiling-name-map.md](../profiling-name-map.md) — `func_id` →

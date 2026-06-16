@@ -79,13 +79,15 @@ enum class TensorDumpKind : uint8_t {
 using TensorDumpArgMask = uint64_t;
 
 // Bitmask stored in the platform-owned mask pool when orchestration selects
-// specific task tensor arguments for dump. Bit N corresponds to tensors[N].
+// specific task tensor/scalar arguments for dump. Bit N corresponds to the
+// payload arg index: tensors first, then scalars.
 // Zero preserves legacy "dump all tasks" behavior unless selective mode is enabled.
 constexpr TensorDumpArgMask TENSOR_DUMP_ARG_MASK_NONE = 0;
 constexpr uint32_t TENSOR_DUMP_ARG_MASK_BITS = 64;
 constexpr uint32_t TENSOR_DUMP_MASK_POOL_MAX_RINGS = PTO2_MAX_RING_DEPTH;
 constexpr uint32_t TENSOR_DUMP_MASK_POOL_MAX_SLOTS = PTO2_TASK_WINDOW_SIZE;
 constexpr uint32_t TENSOR_DUMP_MASK_POOL_DEFAULT_SLOT_MASK = TENSOR_DUMP_MASK_POOL_MAX_SLOTS - 1;
+constexpr uint8_t TENSOR_DUMP_RECORD_FLAG_ARG_INDEX_AMBIGUOUS = 1u << 0;
 
 // =============================================================================
 // TensorDumpRecord - Single Tensor Dump Entry (128B = 2 cache lines)
@@ -112,7 +114,8 @@ struct alignas(64) TensorDumpRecord {
     uint64_t payload_size;    // Bytes actually copied (may be < full tensor bytes)
     uint64_t scalar_value;    // Valid when kind == TensorDumpKind::SCALAR
     uint8_t kind;             // TensorDumpKind
-    uint8_t pad0[15];         // Preserve 64B cache-line layout + scalar_value + kind
+    uint8_t flags;            // TENSOR_DUMP_RECORD_FLAG_*
+    uint8_t pad0[14];         // Preserve 64B cache-line layout + scalar_value + kind
 
     // === Cache line 2 (64B) — strided view descriptor ===
     // start_offset placed first for 8B alignment without padding gaps; total = 8 + 20 + 20 = 48B.
@@ -225,9 +228,9 @@ struct DumpReadyQueueEntry {
 // AICPU latches the mode in dump_tensor_init() before any task is dispatched.
 enum class DumpTensorLevel : uint32_t {
     OFF = 0,             // no dump
-    PARTIAL = 1,         // only tasks marked with Arg::dump(...)
-    FULL = 2,            // every task's tensor I/O (JSON manifest + BIN payload)
-    FULL_JSON_ONLY = 3,  // every task's metadata to JSON; no payload capture, no BIN
+    PARTIAL = 1,         // only args marked with Arg::dump(...)
+    FULL = 2,            // every task's tensor/scalar I/O (JSON manifest + BIN payload)
+    FULL_JSON_ONLY = 3,  // every task's tensor/scalar metadata to JSON; no BIN
 };
 
 struct DumpDataHeader {
@@ -262,7 +265,8 @@ struct TensorDumpInfo {
     uint64_t buffer_addr;
     uint64_t scalar_value;
     uint8_t kind;
-    uint8_t pad[15];
+    uint8_t flags;
+    uint8_t pad[14];
     uint64_t start_offset;                     // 1D ELEMENT offset of the view origin
     uint32_t shapes[PLATFORM_DUMP_MAX_DIMS];   // Current view shape
     uint32_t strides[PLATFORM_DUMP_MAX_DIMS];  // Element stride per dimension (strictly > 0, type-enforced)

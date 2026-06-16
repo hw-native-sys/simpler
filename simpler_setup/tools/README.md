@@ -11,6 +11,7 @@ no repo checkout required.
 
 - **[swimlane_converter](#swimlane_converter)** — perf JSON → Chrome Trace Event (Perfetto)
 - **[sched_overhead_analysis](#sched_overhead_analysis)** — scheduler overhead / Tail OH breakdown
+- **[device_log_timing](#device_log_timing)** — Total / Orch / Sched from a CANN device log (no swimlane JSON)
 - **[deps_to_graph](#deps_to_graph)** — `deps.json` (dep_gen) → pan/zoom HTML dependency graph
 - **[dump_viewer](#dump_viewer)** — inspect / export tensor dumps (see [docs/tensor-dump.md](../../docs/dfx/tensor-dump.md) for full workflow)
 
@@ -27,7 +28,7 @@ Convert performance profiling JSON files into Chrome Trace Event format for visu
 
 ### Overview
 
-Converts PTO Runtime profiling data (`l2_swimlane_records_*.json`) into the format used by the Perfetto trace viewer (<https://ui.perfetto.dev/>). It also produces a task execution statistics summary grouped by function and a scheduler overhead deep-dive report (the same one `sched_overhead_analysis` emits).
+Converts PTO Runtime profiling data (`l2_swimlane_records_*.json`) into the format used by the Perfetto trace viewer (<https://ui.perfetto.dev/>) and prints a per-function task-execution summary. With `--overhead` (needs `deps.json`) it also adds an **Overhead Analysis** counter group under the AICPU Scheduler track — 8 lines (`oh_{aic,aiv}_{idle,ready,overhead}` + `oh_all_overhead` / `oh_has_overhead`) you can overlay on the task bars. See [docs/dfx/sched-overhead-model.md](../../docs/dfx/sched-overhead-model.md) for the model.
 
 ### Basic Usage
 
@@ -70,6 +71,7 @@ python -m simpler_setup.tools.swimlane_converter outputs/<case>_<ts>/l2_swimlane
 | `--kernel-config` | `-k` | Path to kernel_config.py, used for function name mapping |
 | `--func-names` | | Path to func_id_names_*.json (SceneTest format) for function name mapping |
 | `--deps-json` | | Path to a dep_gen `deps.json` (defaults to sibling of input). Without one, no dependency arrows are drawn. |
+| `--overhead` | | Add the 8-line Overhead Analysis counter group (needs `deps.json`). See [sched-overhead-model](../../docs/dfx/sched-overhead-model.md). |
 | `--verbose` | `-v` | Enable verbose output |
 
 ### Outputs
@@ -92,17 +94,13 @@ A statistics summary grouped by function (printed to the console), including Exe
 - **Head/Tail OH**: scheduling head/tail overhead
 - **Exec_%**: Exec / Latency percentage (kernel utilization)
 
-#### 3. Scheduler Overhead Deep-Dive (Automatic)
+#### 3. Scheduler Overhead Deep-Dive
 
-`swimlane_converter` invokes `sched_overhead_analysis` directly on the same
-perf JSON and emits, in the same run:
-
-- Part 1: Per-task time breakdown
-- Part 2: AICPU scheduler loop breakdown (from `aicpu_scheduler_phases`)
-- Part 3: Tail OH distribution & cause analysis
-
-When `deps.json` is colocated (produced by `--enable-dep-gen`), Part 2 also
-prints per-thread fanout / fanin aggregates.
+`swimlane_converter` no longer runs the deep-dive inline — it needs the task DAG
+(`deps.json`) from a *separate* `--enable-dep-gen` run, which can't be produced
+accurately alongside the swimlane capture. Run
+[`sched_overhead_analysis`](#sched_overhead_analysis) manually with both
+artifacts to get the scheduler-starvation / critical-path report.
 
 ### Integration with run_example.py
 
@@ -127,47 +125,106 @@ After the test passes, the tool will:
 
 ## sched_overhead_analysis
 
-Analyze AICPU scheduler overhead and quantitatively decompose the sources of Tail OH (the latency between task completion and scheduler acknowledgement).
+Answer **"is the AICPU scheduler the bottleneck, or is it starved?"** by
+measuring, dependency- and MIX-aware, how much of the makespan a free core has
+ready, undispatched work — vs. legitimately busy or dependency-limited. Full
+model: [docs/dfx/sched-overhead-model.md](../../docs/dfx/sched-overhead-model.md).
 
 ### Overview
 
-`sched_overhead_analysis` reads two artifacts produced by the runtime:
+`sched_overhead_analysis` needs **two artifacts, captured in SEPARATE runs**
+(co-running the flags perturbs timing — `dep_gen` adds per-submit overhead):
 
-1. **Perf profiling data** (`l2_swimlane_records_*.json`, l2_swimlane_level >= 3): per-task Exec / Head OH / Tail OH time breakdowns plus `aicpu_scheduler_phases` — per-thread, per-loop-iteration phase records carrying scan / complete / dispatch / idle timings and per-emit pop_hit / pop_miss deltas.
-2. **`deps.json`** (optional, dep_gen replay output): structural task DAG. When colocated with the perf JSON, Part 2 prints per-thread fanout / fanin aggregates derived from it.
+1. **Perf profiling data** (`l2_swimlane_records_*.json`, level >= 3) from a
+   `--enable-l2-swimlane` run — per-task dispatch/start/end/finish +
+   `aicpu_scheduler_phases`.
+2. **`deps.json`** (the task DAG) from a separate `--enable-dep-gen` run. It
+   drives `ready(C) = max(producer.end)`, which is what separates scheduler
+   bubbles from dependency stalls. **Required** — the tool errors without it.
 
 ### Basic Usage
 
 ```bash
-# Auto-pick the latest perf data under ./outputs/ (deps.json sibling is auto-detected)
-python -m simpler_setup.tools.sched_overhead_analysis
+# Capture once (two separate runs of the same case):
+pytest <case> --platform a2a3 --device N --enable-dep-gen        # -> deps.json
+pytest <case> --platform a2a3 --device N --enable-l2-swimlane    # -> l2_swimlane_records.json (clean timing)
 
-# Specify the perf JSON explicitly
+# Analyze:
 python -m simpler_setup.tools.sched_overhead_analysis \
-    --l2-swimlane-records-json outputs/<case>_<ts>/l2_swimlane_records.json
-
-# Override the deps.json location
-python -m simpler_setup.tools.sched_overhead_analysis \
-    --l2-swimlane-records-json outputs/<case>_<ts>/l2_swimlane_records.json \
-    --deps-json outputs/<case>_<ts>/deps.json
+    --l2-swimlane-records-json outputs/<swimlane case>/l2_swimlane_records.json \
+    --deps-json outputs/<dep_gen case>/deps.json
 ```
+
+> `deps.json` is topology-invariant — capture it once per graph and reuse it for
+> any number of swimlane runs. For Total / Orch / Sched timing from a plain run,
+> use [`device_log_timing`](#device_log_timing) instead.
 
 ### Command-Line Options
 
 | Option | Description |
 | ------ | ----------- |
-| `--l2-swimlane-records-json` | Path to the l2_swimlane_records_*.json file. If omitted, the latest file in outputs/ is auto-selected |
-| `--deps-json` | Path to deps.json (dep_gen replay output) for fanout / fanin aggregates. Defaults to the deps.json sibling of the perf JSON. |
+| `--l2-swimlane-records-json` | Path to the l2_swimlane_records_*.json file (level >= 3). If omitted, the latest under outputs/ is auto-selected. |
+| `--deps-json` | Path to deps.json from a `--enable-dep-gen` run. **Required.** Falls back to a `deps.json` sibling of the perf JSON if present. |
 
 ### Outputs
 
-Output is emitted in three parts:
+Emitted in six parts:
 
-- **Part 1: Per-task time breakdown** — Exec / Head OH / Tail OH percentages of Latency
-- **Part 2: AICPU scheduler loop breakdown** — per-scheduler-thread loop statistics, per-phase (scan / complete / dispatch / idle) time ratios, pop_hit / pop_miss totals, and (when deps.json is available) per-thread fanout / fanin aggregates
-- **Part 3: Tail OH distribution & cause analysis** — Tail OH quantile distribution (P10–P99), correlation between scheduler loop iteration time and Tail OH, and data-driven insights into the dominant phase
+- **Part 1: Overhead verdict** — per-engine overhead (idle T-core *and* a ready, undispatched T-task, MIX-aware) + system `all_overhead` / `has_overhead`, all as % of makespan. An engine with no ready work is not overhead (dependency-mandated idle, not waste).
+- **Part 2: aicore switch** — the pre-dispatched pickup gap (`dispatch < prev_end`), reported **per core** (min/mean/max, ~0.8 µs each), the overhead-vs-independent split, and the makespan switch bound `[min over cores, sum of per-engine minima]`.
+- **Part 3 / 4: Head / Tail OH distributions** — P10–P99 + mean + total (per-task pickup and detect-latency magnitude).
+- **Part 5: AICPU scheduler loop breakdown** — per-thread loops, ns/loop, complete/dispatch/idle phase ratios, pop_hit / pop_miss, fanout / fanin, + the tail-vs-loop cause analysis.
+- **Part 6: Critical-path latency attribution** — along the makespan path, scheduler-injected µs vs compute µs ("scheduler adds X% to the critical path").
 
 The perf JSON must be captured at l2_swimlane_level >= 3 so that `aicpu_scheduler_phases` is non-empty (rerun the case with `--enable-l2-swimlane` if the tool reports the field is missing).
+
+---
+
+## device_log_timing
+
+Print per-round **Total / Orch / Sched** timing parsed from a CANN device log's
+`PTO2_PROFILING` orch/sched markers. Unlike `sched_overhead_analysis` (which
+reads the swimlane JSON), this needs **no swimlane capture** — use it for a
+plain benchmark run, a `--rounds N` sweep, or an external workload that never
+produces an `l2_swimlane_records.json`.
+
+### Basic Usage
+
+```bash
+# Explicit file or glob (quote the glob so the shell doesn't expand it; a glob
+# parses all matched rotated files)
+python -m simpler_setup.tools.device_log_timing \
+    --device-log '~/ascend/log/debug/device-0/device-*.log'
+
+# Auto-pick the newest log under device-<id>/
+python -m simpler_setup.tools.device_log_timing -d 0
+```
+
+To get the same table emitted automatically by the test harness, pass
+`--enable-device-log-timing` to `scene_test` / pytest (onboard L2 only; works
+with `--rounds N`). See [docs/dfx/l2-timing.md](../../docs/dfx/l2-timing.md) for
+the full guide, including the `RunTiming` host_wall / device_wall numbers and
+how they relate to Orch / Sched / Total.
+
+### Command-Line Options
+
+| Option | Description |
+| ------ | ----------- |
+| `--device-log` | Path / dir / glob of a CANN device log. A glob parses every matched (rotated) file. |
+| `-d`, `--device-id` | Device id: auto-pick the newest log under `device-<id>/`. |
+
+### CANN device-log environment variables
+
+| Env var | Effect |
+| ------- | ------ |
+| `ASCEND_PROCESS_LOG_PATH` | Relocates the log root to `$ASCEND_PROCESS_LOG_PATH/debug` (highest precedence, above `ASCEND_WORK_PATH/log/debug` and the `<euid-home>/ascend/log/debug` default). Resolved automatically. |
+| `ASCEND_SLOG_PRINT_TO_STDOUT=1` | Routes CANN logs to stdout — **no device log file is written**; the CLI errors out and the harness flag skips. Unset it (or set `0`) to capture device timing. |
+| `ASCEND_HOST_LOG_FILE_NUM` | Rotated files retained per process (default 10). Each file caps at 20 MB; a long run can rotate mid-run, so the harness reads **all** files written after the run started, and a `--device-log` glob parses all matches. |
+
+The default root (no relocation env var) is `<euid-home>/ascend/log/debug`,
+using the effective uid's passwd home (e.g. `/root` under sudo / `task-submit`),
+which is where the driver actually writes device logs — not `$HOME`, which sudo
+often leaves pointing at the invoking user.
 
 ---
 

@@ -102,6 +102,37 @@ TEST_F(OrchestratorFixture, DependentTaskIsPending) {
     EXPECT_FALSE(rq.try_pop(extra));  // B should NOT be in ready queue
 }
 
+TEST_F(OrchestratorFixture, SubmitAfterFailedProducerPoisonsConsumer) {
+    orch.scope_begin();
+
+    auto args_a = single_tensor_args(0xD00D, TensorArgType::OUTPUT);
+    auto a = orch.submit_next_level(C(42), args_a, cfg);
+    TaskSlot ready;
+    ASSERT_TRUE(rq.try_pop(ready));
+    ASSERT_EQ(ready, a.task_slot);
+
+    TaskSlotState &producer = S(a.task_slot);
+    producer.failure_message = "producer failed";
+    producer.state.store(TaskState::FAILED, std::memory_order_release);
+    producer.fanout_released.store(1, std::memory_order_release);
+
+    auto args_b = single_tensor_args(0xD00D, TensorArgType::INPUT);
+    auto b = orch.submit_next_level(C(43), args_b, cfg);
+
+    EXPECT_EQ(S(b.task_slot).state.load(), TaskState::FAILED);
+    EXPECT_EQ(S(b.task_slot).failure_message, "producer failed");
+    EXPECT_EQ(S(b.task_slot).fanin_count, 0);
+    ASSERT_EQ(S(b.task_slot).fanin_producers.size(), 1u);
+    EXPECT_EQ(S(b.task_slot).fanin_producers[0], a.task_slot);
+
+    TaskSlot extra;
+    EXPECT_FALSE(rq.try_pop(extra));
+
+    orch.scope_end();
+    EXPECT_EQ(S(a.task_slot).state.load(), TaskState::CONSUMED);
+    EXPECT_EQ(S(b.task_slot).state.load(), TaskState::CONSUMED);
+}
+
 TEST_F(OrchestratorFixture, TensorMapTracksProducer) {
     auto args_a = single_tensor_args(0x1234, TensorArgType::OUTPUT);
     auto a = orch.submit_next_level(C(42), args_a, cfg);
@@ -217,6 +248,96 @@ TEST_F(OrchestratorFixture, OutputAutoAllocsFromHeapRing) {
     EXPECT_EQ(data % HEAP_ALIGN, 0u);
 
     EXPECT_EQ(tm.lookup(TensorKey{data, -1}), res.task_slot);
+}
+
+TEST_F(OrchestratorFixture, RemoteOutputSidecarSkipsLocalAutoAllocAndRegistersRemoteKey) {
+    TaskArgs args;
+    ContinuousTensor t{};
+    t.data = 0;
+    t.ndims = 1;
+    t.shapes[0] = 1024;
+    t.dtype = DataType::UINT8;
+    args.add_tensor(t, TensorArgType::OUTPUT);
+
+    RemoteTaskArgsSidecar sidecar;
+    sidecar.tensors.resize(1);
+    sidecar.tensors[0].present = true;
+    sidecar.tensors[0].desc.address_space = RemoteAddressSpace::REMOTE_DEVICE;
+    sidecar.tensors[0].desc.owner_endpoint_id = 3;
+    sidecar.tensors[0].desc.buffer_id = 9;
+    sidecar.tensors[0].desc.generation = 2;
+    sidecar.tensors[0].desc.offset = 64;
+    sidecar.tensors[0].desc.nbytes = 1024;
+
+    auto res = orch.submit_next_level(C(42), args, cfg, -1, {3}, sidecar);
+    ASSERT_NE(res.task_slot, INVALID_SLOT);
+    EXPECT_EQ(S(res.task_slot).task_args.tensor(0).data, 0u);
+
+    TensorKey key = TensorKey::remote_buffer(TensorAddressKind::REMOTE_BUFFER, 3, 9, 2, 64);
+    EXPECT_EQ(tm.lookup(key), res.task_slot);
+}
+
+TEST_F(OrchestratorFixture, RemoteBarePayloadFailsBeforeSlotCommit) {
+    TaskArgs args = single_tensor_args(0x1234, TensorArgType::INPUT);
+
+    RemoteTaskArgsSidecar sidecar;
+    sidecar.tensors.resize(1);
+
+    EXPECT_THROW({ (void)orch.submit_next_level(C(42), args, cfg, -1, {3}, sidecar); }, std::invalid_argument);
+}
+
+TEST_F(OrchestratorFixture, RemoteSidecarRejectsNonOwnerEligibleEndpointWithoutImport) {
+    TaskArgs args;
+    ContinuousTensor t{};
+    t.data = 0;
+    t.ndims = 1;
+    t.shapes[0] = 1;
+    t.dtype = DataType::UINT8;
+    args.add_tensor(t, TensorArgType::INPUT);
+
+    RemoteTaskArgsSidecar sidecar;
+    sidecar.tensors.resize(1);
+    sidecar.tensors[0].present = true;
+    sidecar.tensors[0].desc.address_space = RemoteAddressSpace::REMOTE_DEVICE;
+    sidecar.tensors[0].desc.owner_endpoint_id = 3;
+    sidecar.tensors[0].desc.buffer_id = 9;
+    sidecar.tensors[0].desc.generation = 2;
+    sidecar.tensors[0].desc.nbytes = 1;
+
+    EXPECT_THROW({ (void)orch.submit_next_level(C(42), args, cfg, -1, {3, 4}, sidecar); }, std::invalid_argument);
+}
+
+TEST_F(OrchestratorFixture, RemoteInputSidecarUsesRemoteTensorMapKey) {
+    TaskArgs output_args;
+    ContinuousTensor out{};
+    out.data = 0;
+    out.ndims = 1;
+    out.shapes[0] = 1;
+    out.dtype = DataType::UINT8;
+    output_args.add_tensor(out, TensorArgType::OUTPUT);
+
+    RemoteTaskArgsSidecar output_sidecar;
+    output_sidecar.tensors.resize(1);
+    output_sidecar.tensors[0].present = true;
+    output_sidecar.tensors[0].desc.address_space = RemoteAddressSpace::REMOTE_DEVICE;
+    output_sidecar.tensors[0].desc.owner_endpoint_id = 3;
+    output_sidecar.tensors[0].desc.buffer_id = 9;
+    output_sidecar.tensors[0].desc.generation = 2;
+    output_sidecar.tensors[0].desc.offset = 0;
+    output_sidecar.tensors[0].desc.nbytes = 1;
+    auto producer = orch.submit_next_level(C(42), output_args, cfg, -1, {3}, output_sidecar);
+    TaskSlot ready;
+    rq.try_pop(ready);
+
+    TaskArgs input_args;
+    ContinuousTensor in = out;
+    input_args.add_tensor(in, TensorArgType::INPUT);
+    auto consumer = orch.submit_next_level(C(43), input_args, cfg, -1, {3}, output_sidecar);
+
+    EXPECT_EQ(S(consumer.task_slot).state.load(), TaskState::PENDING);
+    EXPECT_EQ(S(consumer.task_slot).fanin_count, 1);
+    ASSERT_EQ(S(consumer.task_slot).fanin_producers.size(), 1u);
+    EXPECT_EQ(S(consumer.task_slot).fanin_producers[0], producer.task_slot);
 }
 
 TEST_F(OrchestratorFixture, InoutWiresCreatorAsFanin) {

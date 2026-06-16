@@ -287,6 +287,7 @@ add_hierarchical_test(test_remote_wire hierarchical/test_remote_wire.cpp)
 # ---------------------------------------------------------------------------
 add_task_interface_test(test_child_memory types/test_child_memory.cpp)
 add_task_interface_test(test_chip_max_tensor_args types/test_chip_max_tensor_args.cpp)
+add_task_interface_test(test_call_config types/test_call_config.cpp)
 
 # Contract test for upload_chip_callable_buffer caller-buffer immutability.
 # Pulls both task_interface (callable.h) and src/common (utils/fnv1a_64.h),
