@@ -1035,7 +1035,21 @@ struct PTO2SchedulerState {
         }
     }
 
-    inline bool try_speculative_release(PTO2TaskSlotState &slot_state) {
+    // Collects consumers released via the speculative-doorbell path during a
+    // single on_mixed_task_complete fanout walk, so their dispatch_fanin
+    // propagation runs AFTER the walk — never between two siblings' doorbells.
+    struct SpecReleaseSink {
+        static constexpr int CAP = 32;
+        PTO2TaskSlotState *items[CAP];
+        int n = 0;
+        inline bool push(PTO2TaskSlotState *s) {
+            if (n >= CAP) return false;
+            items[n++] = s;
+            return true;
+        }
+    };
+
+    inline bool try_speculative_release(PTO2TaskSlotState &slot_state, SpecReleaseSink *sink = nullptr) {
         // Never staged => CAS NONE->DISPATCHED wins => dispatch normally.
         uint8_t expect = PTO2_SPEC_NONE;
         if (slot_state.payload->spec_state.compare_exchange_strong(
@@ -1063,10 +1077,14 @@ struct PTO2SchedulerState {
                 ring_one_doorbell(spec_doorbell_table[core_id].addr, spec_doorbell_table[core_id].token);
             }
         }
-        // This pre-staged producer was just released by its doorbell — it starts
-        // running NOW. Propagate dispatch_fanin to its consumers (auto-chain, knob A:
-        // bump when the producer actually runs).
-        propagate_dispatch_fanin(slot_state);
+        // This pre-staged consumer was just released by its doorbell — it starts
+        // running NOW, so propagate dispatch_fanin to ITS consumers (auto-chain,
+        // knob A). Defer it via the sink so it runs after the whole fanout walk:
+        // doing it inline here would delay the doorbells of later consumers in the
+        // same producer's fanout. Fallback to inline if no sink / sink full.
+        if (sink == nullptr || !sink->push(&slot_state)) {
+            propagate_dispatch_fanin(slot_state);
+        }
         // No explicit removal from the cross-thread queue: a still-queued entry for
         // this consumer is now DISPATCHED and is dropped when a peer pops it.
         // Fully pre-staged => skip the ready queue. Partially staged SPMD consumer =>
@@ -1074,7 +1092,9 @@ struct PTO2SchedulerState {
         return slot_state.next_block_idx.load(std::memory_order_seq_cst) >= slot_state.logical_block_num;
     }
 
-    bool release_fanin_and_check_ready(PTO2TaskSlotState &slot_state, PTO2LocalReadyBuffer *local_bufs = nullptr) {
+    bool release_fanin_and_check_ready(
+        PTO2TaskSlotState &slot_state, PTO2LocalReadyBuffer *local_bufs = nullptr, SpecReleaseSink *sink = nullptr
+    ) {
         // Atomically increment fanin_refcount and check if all producers are done
         // ACQ_REL on fanin_refcount already synchronizes with the orchestrator's
         // init release, making fanin_count visible — plain load suffices.
@@ -1083,7 +1103,7 @@ struct PTO2SchedulerState {
         if (new_refcount == slot_state.fanin_count) {
             // Speculative early-dispatch: pre-staged tasks are released by doorbell
             // here, skipping the ready-queue round-trip entirely.
-            if (try_speculative_release(slot_state)) return true;
+            if (try_speculative_release(slot_state, sink)) return true;
             // Local-first: try per-CoreType thread-local buffer before global queue
             // Route by active_mask: AIC-containing tasks → buf[0], AIV-only → buf[1]
             // DUMMY shape is out of range for local_bufs (sized PTO2_NUM_RESOURCE_SHAPES);
@@ -1102,7 +1122,7 @@ struct PTO2SchedulerState {
 #if PTO2_ORCH_PROFILING || PTO2_SCHED_PROFILING
     bool release_fanin_and_check_ready(
         PTO2TaskSlotState &slot_state, uint64_t &atomic_count, uint64_t &push_wait,
-        PTO2LocalReadyBuffer *local_bufs = nullptr
+        PTO2LocalReadyBuffer *local_bufs = nullptr, SpecReleaseSink *sink = nullptr
     ) {
         int32_t new_refcount = slot_state.fanin_refcount.fetch_add(1, std::memory_order_acq_rel) + 1;
         atomic_count += 1;  // fanin_refcount.fetch_add
@@ -1110,7 +1130,7 @@ struct PTO2SchedulerState {
         if (new_refcount == slot_state.fanin_count) {
             // Speculative early-dispatch: pre-staged tasks are released by doorbell
             // here, skipping the ready-queue round-trip entirely.
-            if (try_speculative_release(slot_state)) return true;
+            if (try_speculative_release(slot_state, sink)) return true;
             // Local-first: try per-CoreType thread-local buffer before global queue.
             // Dummy slots bypass local_bufs (out-of-range for PTO2_NUM_RESOURCE_SHAPES)
             // and go straight to dummy_ready_queue; use the profiling-aware push so
@@ -1251,17 +1271,24 @@ struct PTO2SchedulerState {
 #if PTO2_SCHED_PROFILING
         uint64_t fanout_atomics = 0, push_wait = 0;
 #endif
+        // Doorbells for released pre-staged consumers fire INLINE in the walk
+        // below; their dispatch_fanin propagation is collected here and replayed
+        // after the walk, so no consumer's doorbell waits on a sibling's propagate.
+        SpecReleaseSink rel_sink;
         while (current != nullptr) {
             PTO2TaskSlotState &consumer_slot = *current->slot_state;
 #if PTO2_SCHED_PROFILING
             stats.fanout_edges++;
-            if (release_fanin_and_check_ready(consumer_slot, fanout_atomics, push_wait, local_bufs)) {
+            if (release_fanin_and_check_ready(consumer_slot, fanout_atomics, push_wait, local_bufs, &rel_sink)) {
                 stats.tasks_enqueued++;
             }
 #else
-            release_fanin_and_check_ready(consumer_slot, local_bufs);
+            release_fanin_and_check_ready(consumer_slot, local_bufs, &rel_sink);
 #endif
             current = current->next;
+        }
+        for (int i = 0; i < rel_sink.n; i++) {
+            propagate_dispatch_fanin(*rel_sink.items[i]);
         }
 
 #if PTO2_SCHED_PROFILING

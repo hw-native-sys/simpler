@@ -323,6 +323,14 @@ void SchedulerContext::dispatch_shape(
         PublishHandle handles[CoreTracker::MAX_CLUSTERS * 3];
         int handle_count = 0;
         bool dispatched_any = false;
+        // Slots dispatched this pop whose dispatch_fanin must be propagated to
+        // consumers. Deferred until AFTER publish (below) so a flagged producer's
+        // fanout walk never sits between claiming cores and publishing its own
+        // blocks — doing it inline delays this thread's blocks while peer threads
+        // co-dispatching the same SPMD task publish immediately, misaligning the
+        // task's block starts. Bounded by cores.count() ≤ MAX_CLUSTERS dispatches.
+        PTO2TaskSlotState *prop_list[CoreTracker::MAX_CLUSTERS];
+        int prop_n = 0;
 #if PTO2_SCHED_PROFILING
         uint64_t t_setup_start = get_sys_cnt_aicpu();
 #endif
@@ -380,11 +388,12 @@ void SchedulerContext::dispatch_shape(
 
             dispatched_any = true;
             try_pushed = true;
-            // Normal dispatch of this task = it starts running now. If it's a flagged
-            // producer, propagate dispatch_fanin to its consumers (event-driven
-            // candidate detection; once-guarded so SPMD block-by-block dispatch fires
-            // once). knob A: bump when the producer actually runs.
-            sched_->propagate_dispatch_fanin(*slot_state);
+            // Record for deferred dispatch_fanin propagation after this pop's
+            // blocks are published (see after the loop). propagate's own guard
+            // filters non-flagged slots, so recording unconditionally is cheap.
+            if (prop_n < static_cast<int>(sizeof(prop_list) / sizeof(prop_list[0]))) {
+                prop_list[prop_n++] = slot_state;
+            }
             // Claim a contiguous range of blocks, hand the slot back to the
             // ready queue immediately, then perform the expensive dispatches.
             // This lets other schedulers concurrently claim and dispatch the
@@ -418,6 +427,12 @@ void SchedulerContext::dispatch_shape(
         }
 
         flush_publish();
+        // Blocks are published; now propagate dispatch_fanin for any flagged
+        // producers dispatched above (knob A: producer is running). Off the
+        // pre-publish path so it cannot delay or misalign their blocks.
+        for (int i = 0; i < prop_n; i++) {
+            sched_->propagate_dispatch_fanin(*prop_list[i]);
+        }
 #if PTO2_SCHED_PROFILING
         l2_swimlane.sched_dispatch_setup_cycle += (get_sys_cnt_aicpu() - t_setup_start);
 #endif
