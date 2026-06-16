@@ -15,15 +15,15 @@
  * In simulation, all AICPU scheduler threads share a small number of host CPU
  * cores with AICore threads. Without explicit yielding, idle scheduler threads
  * in tight polling loops starve the AICore thread executing the actual kernel,
- * causing iteration-based timeouts (MAX_IDLE_ITERATIONS) before the kernel can
- * complete — especially on resource-constrained CI runners (e.g., 2 cores
- * running 13+ threads).
+ * causing premature scheduler timeouts before the kernel can complete —
+ * especially on resource-constrained CI runners (e.g., 2 cores running 13+
+ * threads).
  *
  * Two mitigations live here. The CPU hint (pause/yield) plus sched_yield() let
  * the OS scheduler give time slices to threads doing real work, and
- * PLATFORM_MAX_IDLE_ITERATIONS below raises the idle cap well above the onboard
- * value so a slow CPU-sim task (e.g. matmul-heavy kernels) making real progress
- * is not mistaken for a deadlock.
+ * PLATFORM_SCHEDULER_TIMEOUT_MS below keeps the no-progress budget generous so a
+ * slow CPU-sim task (e.g. matmul-heavy kernels) making real progress is not
+ * mistaken for a deadlock.
  */
 
 #ifndef PLATFORM_A2A3SIM_AICPU_SPIN_HINT_H_
@@ -48,13 +48,14 @@
 #define SPIN_WAIT_HINT() sched_yield()
 #endif
 
-// Consecutive idle scheduler iterations (no task progress) before the dispatch
-// loop aborts with PTO2_ERROR_SCHEDULER_TIMEOUT. CPU sim accumulates idle
-// iterations far faster than real kernel progress, so the cap is raised well
-// above the onboard value to avoid false timeouts on slow (e.g. matmul-heavy)
-// kernels. Set to 10x the onboard cap as a conservative bump; raise further if
-// a slow kernel still false-times-out. The runtime consumes it as
-// MAX_IDLE_ITERATIONS (see scheduler_types.h).
-constexpr int32_t PLATFORM_MAX_IDLE_ITERATIONS = 8000000;
+// Wall-clock budget (ms) of no task progress before the dispatch loop aborts
+// with PTO2_ERROR_SCHEDULER_TIMEOUT. Unlike onboard there is no STARS
+// op-execution timeout to race here, so this keeps the full #897 distributed-init
+// / HCCL-skew headroom (the onboard build trims its copy to 2 s to dump before
+// STARS reaps). A generous budget also avoids false timeouts when an
+// oversubscribed CPU-sim kernel (e.g. matmul-heavy) makes real but slow
+// progress; raise further if a slow kernel still false-times-out. The runtime
+// consumes it as SCHEDULER_TIMEOUT_MS (see scheduler_types.h).
+constexpr int32_t PLATFORM_SCHEDULER_TIMEOUT_MS = 5000;
 
 #endif  // PLATFORM_A2A3SIM_AICPU_SPIN_HINT_H_

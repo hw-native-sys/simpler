@@ -43,7 +43,7 @@ Each sub-level macro requires `PTO2_PROFILING=1`:
 
 - Debug/diagnostic logs (always present)
 - Progress tracking (`PTO2 progress: completed=...`)
-- Stall detection and dump (triggered only after `MAX_IDLE_ITERATIONS` idle loops)
+- Stall detection and dump (triggered after the `SCHEDULER_TIMEOUT_MS` wall-clock no-progress budget)
 - Deadlock/livelock detection (`diagnose_stuck_state`, called on stall)
 
 **What's NOT compiled:**

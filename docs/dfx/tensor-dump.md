@@ -877,9 +877,9 @@ ordering — the three budgets are tuned so the **AICPU detects the
 hang first**, dumps, and only then the hardware/host timeouts fire:
 
 ```text
-SCHEDULER_TIMEOUT_MS (2 s)  <  PLATFORM_OP_EXECUTE_TIMEOUT_US (3 s)  <  PLATFORM_STREAM_SYNC_TIMEOUT_MS (4 s)
-   AICPU declares hang,          STARS reaps the AICore op            host stream sync gives up
-   flushes + dumps in-flight     and poisons the context              and surfaces the error
+SCHEDULER_TIMEOUT_MS (2 s, onboard)  <  PLATFORM_OP_EXECUTE_TIMEOUT_US (3 s)  <  PLATFORM_STREAM_SYNC_TIMEOUT_MS (4 s)
+   AICPU declares hang,                   STARS reaps the AICore op              host stream sync gives up
+   flushes + dumps in-flight              and poisons the context                and surfaces the error
 ```
 
 - **Device-side graceful flush (primary).** At 2 s of no progress
@@ -909,9 +909,11 @@ This ordering is load-bearing: if the timeouts were inverted (STARS
 reaping before the AICPU's budget, as in earlier versions), the
 device-side dump would never run on a real AICore hang and you would
 only recover what was already in the buffer. The chain lives in
-`scheduler_types.h` (`SCHEDULER_TIMEOUT_MS`) and `platform_config.h`
-(`PLATFORM_OP_EXECUTE_TIMEOUT_US` / `PLATFORM_STREAM_SYNC_TIMEOUT_MS`),
-along with the `#897` distributed-skew trade-off.
+`spin_hint.h` (`PLATFORM_SCHEDULER_TIMEOUT_MS`, surfaced as
+`SCHEDULER_TIMEOUT_MS` — 2 s onboard, 5 s in sim where there is no STARS to
+race) and `platform_config.h` (`PLATFORM_OP_EXECUTE_TIMEOUT_US` /
+`PLATFORM_STREAM_SYNC_TIMEOUT_MS`), along with the `#897` distributed-skew
+trade-off.
 
 ## 9. Related docs
 

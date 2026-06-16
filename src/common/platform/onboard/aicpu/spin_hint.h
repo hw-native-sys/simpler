@@ -23,10 +23,17 @@
 
 #define SPIN_WAIT_HINT() ((void)0)
 
-// Consecutive idle scheduler iterations (no task progress) before the dispatch
-// loop aborts with PTO2_ERROR_SCHEDULER_TIMEOUT. On real hardware each idle
-// iteration is a cheap no-op spin, so this bounds a genuine deadlock. The
-// runtime consumes it as MAX_IDLE_ITERATIONS (see scheduler_types.h).
-constexpr int32_t PLATFORM_MAX_IDLE_ITERATIONS = 800000;
+// Wall-clock budget (ms) of no task progress before the dispatch loop aborts
+// with PTO2_ERROR_SCHEDULER_TIMEOUT. On real hardware this must sit *below* the
+// STARS AICore op-execution timeout (PLATFORM_OP_EXECUTE_TIMEOUT_US, 3 s) so the
+// AICPU detects the hang and flushes its diagnostics (tensor dump, in-flight
+// partial output) before STARS reaps the op and poisons the context. Chain:
+// this < op-exec < host stream-sync (platform_config.h). Trade-off: 2 s is
+// shorter than the worst distributed-init / HCCL skew #897 sized 5 s for, so a
+// slow distributed startup can false-latch; if that bites, raise this together
+// with the op-exec / stream-sync timeouts. The sim build keeps the full 5 s (no
+// STARS to race). The runtime consumes it as SCHEDULER_TIMEOUT_MS (see
+// scheduler_types.h).
+constexpr int32_t PLATFORM_SCHEDULER_TIMEOUT_MS = 2000;
 
 #endif  // PLATFORM_A2A3_AICPU_SPIN_HINT_H_

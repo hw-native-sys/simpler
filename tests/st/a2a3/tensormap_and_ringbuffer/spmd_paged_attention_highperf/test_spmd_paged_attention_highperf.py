@@ -170,11 +170,9 @@ class TestSpmdPagedAttentionHighPerf(SceneTestCase):
     CASES = [
         {
             "name": "b1_h32_kv8_s128_bs128_fp16",
-            # Disabled from CI: regression on main (passed at 17fa04aa, fails at
-            # 19b2c0be) — sim scheduler stall (rc=-100 TIMEOUT_EXIT) and onboard
-            # golden mismatch. Tracked in hw-native-sys/simpler#1070.
-            "manual": True,
-            "platforms": ["a2a3sim", "a2a3"],
+            # onboard a2a3 stays out pending the
+            # separate 'out' golden mismatch (hw-native-sys/simpler#1070).
+            "platforms": ["a2a3sim"],
             "config": {"aicpu_thread_num": 4, "block_dim": 24},
             "params": {
                 "batch": 1,
