@@ -181,7 +181,7 @@ struct Arg : TaskArgsTpl<TensorRef, uint64_t, MAX_TENSOR_ARGS, MAX_SCALAR_ARGS, 
         clear();
         has_error = false;
         error_msg = nullptr;
-        tensor_dump_arg_mask_ = 0;
+        dump_arg_mask_ = 0;
         explicit_deps_ = nullptr;
         explicit_dep_count_ = 0;
         memset(scalar_dtypes_, 0, sizeof(scalar_dtypes_));
@@ -206,13 +206,13 @@ struct Arg : TaskArgsTpl<TensorRef, uint64_t, MAX_TENSOR_ARGS, MAX_SCALAR_ARGS, 
             "dump: all arguments must be Tensor or TensorCreateInfo"
         );
         if constexpr (sizeof...(Args) == 0) {
-            mark_all_tensor_dump_arg();
+            mark_all_dump_args();
         } else {
-            (mark_tensor_dump_arg(args), ...);
+            (mark_dump_arg(args), ...);
         }
     }
 
-    uint64_t tensor_dump_arg_mask() const { return tensor_dump_arg_mask_; }
+    uint64_t dump_arg_mask() const { return dump_arg_mask_; }
 
     template <typename... Args>
     void add_input(Args &&...args) {
@@ -382,37 +382,37 @@ struct Arg : TaskArgsTpl<TensorRef, uint64_t, MAX_TENSOR_ARGS, MAX_SCALAR_ARGS, 
 
 private:
     // Caller-owned dependency array; lifetime must extend through submit.
-    static_assert(MAX_TENSOR_ARGS <= 64, "tensor dump arg mask assumes at most 64 tensor arguments");
-    uint64_t tensor_dump_arg_mask_{0};
+    static_assert(MAX_TENSOR_ARGS <= 64, "dump arg mask assumes at most 64 tensor arguments");
+    uint64_t dump_arg_mask_{0};
     const PTO2TaskId *explicit_deps_{nullptr};
     uint32_t explicit_dep_count_{0};
     uint8_t scalar_dtypes_[MAX_SCALAR_ARGS] = {};
 
     // No-arg dump(): mark every tensor arg already added to this Arg.
-    void mark_all_tensor_dump_arg() {
+    void mark_all_dump_args() {
         if (tensor_count_ == 0) {
             set_error("dump: no tensor arguments added to this Arg");
             return;
         }
         for (int32_t i = 0; i < tensor_count_; i++) {
-            tensor_dump_arg_mask_ |= (uint64_t{1} << i);
+            dump_arg_mask_ |= (uint64_t{1} << i);
         }
     }
 
-    void mark_tensor_dump_arg(const Tensor &tensor) {
+    void mark_dump_arg(const Tensor &tensor) {
         for (int32_t i = 0; i < tensor_count_; i++) {
             if (tags_[i] != TensorArgType::OUTPUT && tensors_[i].ptr == &tensor) {
-                tensor_dump_arg_mask_ |= (uint64_t{1} << i);
+                dump_arg_mask_ |= (uint64_t{1} << i);
                 return;
             }
         }
         set_error("dump: tensor is not part of this Arg");
     }
 
-    void mark_tensor_dump_arg(const TensorCreateInfo &create_info) {
+    void mark_dump_arg(const TensorCreateInfo &create_info) {
         for (int32_t i = 0; i < tensor_count_; i++) {
             if (tags_[i] == TensorArgType::OUTPUT && tensors_[i].create_info == &create_info) {
-                tensor_dump_arg_mask_ |= (uint64_t{1} << i);
+                dump_arg_mask_ |= (uint64_t{1} << i);
                 return;
             }
         }

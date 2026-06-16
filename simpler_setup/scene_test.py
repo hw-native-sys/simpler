@@ -558,7 +558,7 @@ def _build_output_prefix(case_label: str) -> Path:
     """Per-case directory for diagnostic artifacts.
 
     Each case gets its own ``outputs/<case_label>_<timestamp>/`` directory; the
-    runtime writes ``l2_swimlane_records.json``, ``tensor_dump/``, and ``pmu.csv``
+    runtime writes ``l2_swimlane_records.json``, ``args_dump/``, and ``pmu.csv``
     under that root with fixed filenames. Two cases of the same name run in
     the same second is not a contemplated scenario (parallel xdist runs differ
     by class+method).
@@ -675,7 +675,7 @@ def run_class_cases(  # noqa: PLR0913 -- shared layer-5 entry; kwargs mirror CLI
     rounds,
     skip_golden,
     enable_l2_swimlane,
-    enable_dump_tensor,
+    enable_dump_args,
     enable_pmu,
     enable_dep_gen,
     enable_scope_stats,
@@ -688,7 +688,7 @@ def run_class_cases(  # noqa: PLR0913 -- shared layer-5 entry; kwargs mirror CLI
     """
     cls_name = type(cls_inst).__name__
     callable_spec = getattr(type(cls_inst), "CALLABLE", None)
-    diagnostics_on = enable_l2_swimlane or enable_dump_tensor or enable_pmu or enable_dep_gen or enable_scope_stats
+    diagnostics_on = enable_l2_swimlane or enable_dump_args or enable_pmu or enable_dep_gen or enable_scope_stats
     for case in cases:
         case_label = f"{cls_name}_{case['name']}"
         # Per-case directory the runtime writes into. Required (non-empty) when
@@ -706,7 +706,7 @@ def run_class_cases(  # noqa: PLR0913 -- shared layer-5 entry; kwargs mirror CLI
                 rounds=rounds,
                 skip_golden=skip_golden,
                 enable_l2_swimlane=enable_l2_swimlane,
-                enable_dump_tensor=enable_dump_tensor,
+                enable_dump_args=enable_dump_args,
                 enable_pmu=enable_pmu,
                 enable_dep_gen=enable_dep_gen,
                 enable_scope_stats=enable_scope_stats,
@@ -881,7 +881,7 @@ class SceneTestCase:
         self,
         config_dict,
         enable_l2_swimlane=0,
-        enable_dump_tensor=False,
+        enable_dump_args=False,
         enable_pmu=0,
         enable_dep_gen=False,
         enable_scope_stats=False,
@@ -898,7 +898,7 @@ class SceneTestCase:
         config.block_dim = config_dict.get("block_dim", 0)
         config.aicpu_thread_num = config_dict.get("aicpu_thread_num", 3)
         config.enable_l2_swimlane = enable_l2_swimlane
-        config.enable_dump_tensor = enable_dump_tensor
+        config.enable_dump_tensor = enable_dump_args
         config.enable_pmu = enable_pmu  # 0=disabled, >0=enabled with event type
         config.enable_dep_gen = enable_dep_gen
         config.enable_scope_stats = enable_scope_stats
@@ -935,7 +935,7 @@ class SceneTestCase:
         rounds=1,
         skip_golden=False,
         enable_l2_swimlane=0,
-        enable_dump_tensor=False,
+        enable_dump_args=False,
         enable_pmu=0,
         enable_dep_gen=False,
         enable_scope_stats=False,
@@ -949,7 +949,7 @@ class SceneTestCase:
                 rounds=rounds,
                 skip_golden=skip_golden,
                 enable_l2_swimlane=enable_l2_swimlane,
-                enable_dump_tensor=enable_dump_tensor,
+                enable_dump_args=enable_dump_args,
                 enable_pmu=enable_pmu,
                 enable_dep_gen=enable_dep_gen,
                 enable_scope_stats=enable_scope_stats,
@@ -964,7 +964,7 @@ class SceneTestCase:
                 rounds=rounds,
                 skip_golden=skip_golden,
                 enable_l2_swimlane=enable_l2_swimlane,
-                enable_dump_tensor=enable_dump_tensor,
+                enable_dump_args=enable_dump_args,
                 enable_pmu=enable_pmu,
                 enable_dep_gen=enable_dep_gen,
                 enable_scope_stats=enable_scope_stats,
@@ -979,7 +979,7 @@ class SceneTestCase:
         rounds=1,
         skip_golden=False,
         enable_l2_swimlane=0,
-        enable_dump_tensor=False,
+        enable_dump_args=False,
         enable_pmu=0,
         enable_dep_gen=False,
         enable_scope_stats=False,
@@ -1027,7 +1027,7 @@ class SceneTestCase:
             config = self._build_config(
                 config_dict,
                 enable_l2_swimlane=enable_l2_swimlane,
-                enable_dump_tensor=enable_dump_tensor,
+                enable_dump_args=enable_dump_args,
                 enable_pmu=enable_pmu,
                 enable_dep_gen=enable_dep_gen,
                 enable_scope_stats=enable_scope_stats,
@@ -1054,7 +1054,7 @@ class SceneTestCase:
         rounds=1,
         skip_golden=False,
         enable_l2_swimlane=0,
-        enable_dump_tensor=False,
+        enable_dump_args=False,
         enable_pmu=0,
         enable_dep_gen=False,
         enable_scope_stats=False,
@@ -1109,7 +1109,7 @@ class SceneTestCase:
             config = self._build_config(
                 config_dict,
                 enable_l2_swimlane=enable_l2_swimlane,
-                enable_dump_tensor=enable_dump_tensor,
+                enable_dump_args=enable_dump_args,
                 enable_pmu=enable_pmu,
                 enable_dep_gen=enable_dep_gen,
                 enable_scope_stats=enable_scope_stats,
@@ -1163,7 +1163,7 @@ class SceneTestCase:
         rounds = request.config.getoption("--rounds", default=1)
         skip_golden = request.config.getoption("--skip-golden", default=False)
         enable_l2_swimlane = request.config.getoption("--enable-l2-swimlane", default=0)
-        enable_dump_tensor = request.config.getoption("--dump-tensor", default=0)
+        enable_dump_args = request.config.getoption("--dump-args", default=0)
         enable_pmu = request.config.getoption("--enable-pmu", default=0)
         enable_dep_gen = self._effective_enable_dep_gen(request, warn=True)
         enable_scope_stats = request.config.getoption("--enable-scope-stats", default=False)
@@ -1171,9 +1171,9 @@ class SceneTestCase:
             if enable_l2_swimlane:
                 logger.warning("Profiling disabled: --rounds > 1")
                 enable_l2_swimlane = 0
-            if enable_dump_tensor:
-                logger.warning("Dump tensor disabled: --rounds > 1")
-                enable_dump_tensor = 0
+            if enable_dump_args:
+                logger.warning("Dump args disabled: --rounds > 1")
+                enable_dump_args = 0
             if enable_pmu:
                 logger.warning("PMU disabled: --rounds > 1")
                 enable_pmu = 0
@@ -1217,7 +1217,7 @@ class SceneTestCase:
             rounds=rounds,
             skip_golden=skip_golden,
             enable_l2_swimlane=enable_l2_swimlane,
-            enable_dump_tensor=enable_dump_tensor,
+            enable_dump_args=enable_dump_args,
             enable_pmu=enable_pmu,
             enable_dep_gen=enable_dep_gen,
             enable_scope_stats=enable_scope_stats,
@@ -1282,12 +1282,12 @@ class SceneTestCase:
             "1=AICore timing, 2=+dispatch/fanout, 3=+sched phases, 4=+orch phases",
         )
         parser.add_argument(
-            "--dump-tensor",
+            "--dump-args",
             nargs="?",
             const=1,
             type=int,
             default=0,
-            help="Dump per-task tensor I/O at runtime. Level: 0=off, 1=partial (only "
+            help="Dump per-task args at runtime. Level: 0=off, 1=partial (only "
             "tasks marked via Arg::dump(...), default when given without a value), 2=full (all tasks).",
         )
         parser.add_argument(
@@ -1522,7 +1522,7 @@ class SceneTestCase:
                                 rounds=args.rounds,
                                 skip_golden=args.skip_golden,
                                 enable_l2_swimlane=args.enable_l2_swimlane,
-                                enable_dump_tensor=args.dump_tensor,
+                                enable_dump_args=args.dump_args,
                                 enable_pmu=args.enable_pmu,
                                 enable_dep_gen=args.enable_dep_gen,
                                 enable_scope_stats=args.enable_scope_stats,
@@ -1563,8 +1563,8 @@ def _dispatch_test_phases_standalone(module_name, selected_by_cls, args):  # noq
         common.append("--skip-golden")
     if args.enable_l2_swimlane:
         common += ["--enable-l2-swimlane", str(args.enable_l2_swimlane)]
-    if args.dump_tensor:
-        common.append("--dump-tensor")
+    if args.dump_args:
+        common.append("--dump-args")
     if args.enable_dep_gen:
         common.append("--enable-dep-gen")
     if args.enable_scope_stats:

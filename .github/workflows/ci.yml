@@ -241,7 +241,7 @@ jobs:
         run: |
           pytest tests/st/a2a3/tensormap_and_ringbuffer/dfx/tensor_dump/test_tensor_dump.py \
             --platform a2a3sim --device 0-15 -p no:xdist --pto-session-timeout 600 \
-            --dump-tensor --clone-protocol https
+            --dump-args --clone-protocol https
 
   st-sim-a5:
     needs: detect-changes
@@ -562,7 +562,7 @@ jobs:
           source .venv/bin/activate
           python -m pytest tests/st/a2a3/tensormap_and_ringbuffer/dfx/tensor_dump/test_tensor_dump.py \
             --platform a2a3 --device ${DEVICE_RANGE} -p no:xdist --pto-session-timeout 600 \
-            --dump-tensor --clone-protocol ssh
+            --dump-args --clone-protocol ssh
 
 
   # ---------- Detect platform-specific changes (runs on GitHub server) ----------

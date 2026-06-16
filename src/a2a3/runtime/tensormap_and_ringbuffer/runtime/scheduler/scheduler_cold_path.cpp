@@ -851,7 +851,7 @@ int32_t SchedulerContext::init(
         l2_swimlane_aicpu_init(runtime->worker_count);
         l2_swimlane_level_ = get_l2_swimlane_level();
         if (l2_swimlane_level_ >= L2SwimlaneLevel::SCHED_PHASES) {
-            // Sched-phase pool count: matches the dump_tensor_init branch in
+            // Sched-phase pool count: matches the dump_args_init branch in
             // scheduler_dispatch.cpp. sched_thread_num_ <= 0 means "use all
             // AICPU threads as scheduler threads" (see assign_cores_to_threads'
             // active_sched_threads_ normalization at line 689). Without this
