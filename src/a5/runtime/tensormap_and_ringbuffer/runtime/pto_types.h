@@ -224,13 +224,11 @@ struct Arg : TaskArgsTpl<TensorRef, uint64_t, MAX_TENSOR_ARGS, MAX_SCALAR_ARGS, 
     }
 
 #if PTO2_PROFILING
-    uint64_t tensor_dump_arg_mask() const { return dump_arg_selection_.dump_arg_mask(); }
-    uint64_t tensor_dump_arg_index_ambiguous_mask() const {
-        return dump_arg_selection_.dump_arg_index_ambiguous_mask();
-    }
+    uint64_t dump_arg_mask() const { return dump_arg_selection_.dump_arg_mask(); }
+    uint64_t dump_arg_index_ambiguous_mask() const { return dump_arg_selection_.dump_arg_index_ambiguous_mask(); }
 #else
-    uint64_t tensor_dump_arg_mask() const { return 0; }
-    uint64_t tensor_dump_arg_index_ambiguous_mask() const { return 0; }
+    uint64_t dump_arg_mask() const { return 0; }
+    uint64_t dump_arg_index_ambiguous_mask() const { return 0; }
 #endif
 
     template <typename... Args>

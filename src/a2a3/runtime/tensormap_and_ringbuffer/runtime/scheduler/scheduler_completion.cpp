@@ -170,8 +170,8 @@ void SchedulerContext::complete_slot_task(
 
     if (mixed_complete && !defer_completion_to_consumer) {
 #if PTO2_PROFILING
-        if (is_dump_tensor_enabled()) {
-            dump_tensors_for_task<PTO2_SUBTASK_SLOT_COUNT>(
+        if (is_dump_args_enabled()) {
+            dump_args_for_task<PTO2_SUBTASK_SLOT_COUNT>(
                 thread_idx, slot_state, TensorDumpStage::AFTER_COMPLETION,
                 [](ActiveMask active_mask, int raw_subtask_id) {
                     return active_mask.subtask_active(static_cast<PTO2SubtaskSlot>(raw_subtask_id));

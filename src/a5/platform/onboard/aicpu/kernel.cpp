@@ -105,7 +105,7 @@ extern "C" __attribute__((visibility("default"))) int simpler_aicpu_exec(void *a
     // Device ordinal for per-device orchestration-SO naming in the executor.
     set_orch_device_id(static_cast<int>(k_args->device_id));
     set_platform_dump_base(k_args->dump_data_base);
-    set_dump_tensor_enabled(GET_PROFILING_FLAG(k_args->enable_profiling_flag, PROFILING_FLAG_DUMP_TENSOR));
+    set_dump_args_enabled(GET_PROFILING_FLAG(k_args->enable_profiling_flag, PROFILING_FLAG_DUMP_TENSOR));
     set_platform_l2_swimlane_base(k_args->l2_swimlane_data_base);
     set_l2_swimlane_enabled(GET_PROFILING_FLAG(k_args->enable_profiling_flag, PROFILING_FLAG_L2_SWIMLANE));
     set_platform_pmu_base(k_args->pmu_data_base);

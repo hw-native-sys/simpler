@@ -1,4 +1,4 @@
-# Tensor Dump — Per-task Tensor Capture
+# Args Dump — Per-task Argument Capture
 
 ## 1. Background & Motivation
 
@@ -8,11 +8,11 @@ the symptom shows up two tasks downstream, the suspect tensor is
 gone, and re-running with `printf` distorts the timing that triggered
 the bug in the first place.
 
-Tensor Dump captures per-task tensor inputs and outputs during kernel
+Args Dump captures per-task tensor inputs/outputs plus scalar inputs during kernel
 execution and writes them to disk for offline inspection. The host
 pre-allocates the recording buffers, AICPU writes records during
 execution, and the host exports a JSON manifest plus a binary payload.
-The result is a stable, replayable record of every tensor a kernel
+The result is a stable, replayable record of every dumped argument a kernel
 saw, without the timing distortion of inline printing.
 
 ## 2. Overview
@@ -23,12 +23,12 @@ saw, without the timing distortion of inline printing.
 - **Logical shape preserved.** Records carry dtype, shape,
   `strides`, `start_offset`, and `is_contiguous` so logical views are
   reconstructable.
-- **Manifest + binary payload.** `--dump-tensor` writes a JSON
+- **Manifest + binary payload.** `--dump-args` writes a JSON
   manifest plus one `.bin` payload per run; tensor entries carry
   `bin_offset` / `bin_size`, while scalar entries stay manifest-only.
 - **Unified scalar args.** Scalar values are emitted as
   `kind: scalar`, `stage: before_dispatch`, zero-dim records in
-  `tensor_dump.json`; there is no separate args-only manifest. Their
+  `args_dump.json`; there is no separate args-only manifest. Their
   final `dtype` is registered at submit time in a dump-only per-task side table
   and resolved by AICPU when writing each scalar dump record.
 - **Cross-architecture.** Same flags and on-disk layout family on
@@ -37,24 +37,24 @@ saw, without the timing distortion of inline printing.
 Enable in one line (`2` = full dump, every task):
 
 ```bash
-python tests/st/<case>/test_<name>.py -p a5sim --dump-tensor 2
+python tests/st/<case>/test_<name>.py -p a5sim --dump-args 2
 ```
 
 ## 3. How to Use
 
-### 3.1 Enable Tensor Dump
+### 3.1 Enable Args Dump
 
-`--dump-tensor` takes an optional **level**:
+`--dump-args` takes an optional **level**:
 
 | Level | Meaning |
 | ----- | ------- |
 | `0` (or flag absent) | off — zero overhead |
-| `1` (bare `--dump-tensor`) | **partial** — only args marked with `Arg::dump(...)` (see §3.2) |
-| `2` (`--dump-tensor 2`) | **full** — every task's tensor inputs/outputs and scalar args |
-| `3` (`--dump-tensor 3`) | **full, JSON only** — every task's tensor/scalar metadata (shape, dtype, strides, scalar values) to `tensor_dump.json`; no payload captured, no `.bin` file |
+| `1` (bare `--dump-args`) | **partial** — only args marked with `Arg::dump(...)` (see §3.2) |
+| `2` (`--dump-args 2`) | **full** — every task's tensor inputs/outputs and scalar args |
+| `3` (`--dump-args 3`) | **full, JSON only** — every task's tensor/scalar metadata (shape, dtype, strides, scalar values) to `args_dump.json`; no payload captured, no `.bin` file |
 
-Level 3 exists for consumers that need only the per-task tensor *structure*,
-not the element data — e.g. feeding the manifest into tooling. The AICPU
+Level 3 exists for consumers that need only the per-task argument metadata,
+not the tensor element data — e.g. feeding the manifest into tooling. The AICPU
 skips the arena payload copy entirely (treating every tensor like a scalar
 for payload purposes), so it incurs none of full mode's device→host
 bandwidth or arena pressure, and the manifest's `bin_file` is `null` with
@@ -62,12 +62,12 @@ every `bin_size` at `0`.
 
 ```bash
 # Standalone runner
-python tests/st/<case>/test_<name>.py -p a5sim --dump-tensor 2     # full
-python tests/st/<case>/test_<name>.py -p a2a3 -d 0 --dump-tensor   # partial (level 1)
+python tests/st/<case>/test_<name>.py -p a5sim --dump-args 2     # full
+python tests/st/<case>/test_<name>.py -p a2a3 -d 0 --dump-args   # partial (level 1)
 
 # pytest
-pytest tests/st/<case> --platform a5sim --dump-tensor 2
-pytest examples/a5/host_build_graph/vector_example --platform a5sim --dump-tensor 2
+pytest tests/st/<case> --platform a5sim --dump-args 2
+pytest examples/a5/host_build_graph/vector_example --platform a5sim --dump-args 2
 ```
 
 The level sets `CallConfig::enable_dump_tensor` (0/1/2/3). The host then
@@ -79,8 +79,8 @@ distinction is carried as a `DumpTensorLevel` in the dump shared-memory header
 (`DumpDataHeader::dump_tensor_level`, host-written before launch) rather
 than in the profiling-flag bitmask. The on-device AICPU reads the storage base
 via `set_platform_dump_base()`, the enable bit via
-`set_dump_tensor_enabled(GET_PROFILING_FLAG(...))`, and latches the mode
-in `dump_tensor_init()` from the header level (`PARTIAL` → selective,
+`set_dump_args_enabled(GET_PROFILING_FLAG(...))`, and latches the mode
+in `dump_args_init()` from the header level (`PARTIAL` → selective,
 `FULL_JSON_ONLY` → metadata-only, payload copy suppressed). Because the
 level is decided host-side **before any task is
 dispatched**, it is latched up front — there is no dependence on task
@@ -113,7 +113,7 @@ belong to that `Arg`. Scalar selection is by the lvalue passed to
 `args.dump(1.0f)` are rejected because they do not identify a previously
 added scalar slot. If the same scalar lvalue is added more than once,
 `dump(lvalue)` selects the first matching scalar arg and marks that scalar
-entry with `arg_index_ambiguous: true` in `tensor_dump.json`; use distinct
+entry with `arg_index_ambiguous: true` in `args_dump.json`; use distinct
 local variables when you need to select a later duplicate.
 
 The runtime uses the tensor direction already provided by `add_input()`,
@@ -151,11 +151,11 @@ and marked tasks dump only their selected arguments. At level 2, the
 markers are ignored and every task's tensors/scalars are dumped. At level
 3, every task's tensors/scalars are dumped as metadata only (no payload,
 no `.bin`). With no
-`--dump-tensor` (level 0) dump is off entirely.
+`--dump-args` (level 0) dump is off entirely.
 
 If you run at level 1 but place no `dump(...)` markers anywhere, the
 manifest is empty — that is the deliberate "only what I marked" contract.
-Use `--dump-tensor 2` when you want everything.
+Use `--dump-args 2` when you want everything.
 
 ### 3.3 Output
 
@@ -166,18 +166,18 @@ The dump artifacts land under the per-task output prefix
 
 ```text
 <output_prefix>/
-└── tensor_dump/
-    ├── tensor_dump.json  # unified tensor/scalar manifest (`--dump-tensor`)
-    └── tensor_dump.bin   # raw tensor payload (`--dump-tensor`)
+└── args_dump/
+    ├── args_dump.json  # unified argument manifest (`--dump-args`)
+    └── args.bin   # raw tensor payload (`--dump-args`)
 ```
 
 Filenames are fixed (no per-file timestamp) — the directory is the
-per-task uniqueness boundary. `--dump-tensor` emits both files in the
-same `tensor_dump/` directory.
+per-task uniqueness boundary. `--dump-args` emits both files in the
+same `args_dump/` directory.
 
-#### `tensor_dump.json` — Unified manifest
+#### `args_dump.json` — Unified manifest
 
-`tensor_dump.json` is the manifest; its `bin_file` field points at
+`args_dump.json` is the manifest; its `bin_file` field points at
 the sibling binary payload. At level 3 (full, JSON only) no payload is
 captured: `bin_file` is `null`, no `.bin` is written, and every entry's
 `bin_size` is `0`.
@@ -186,22 +186,22 @@ Example manifest (one input tensor captured before dispatch):
 
 ```json
 {
-  "run_dir": "tensor_dump",
+  "run_dir": "args_dump",
   "bin_format": {
     "type": "logical_contiguous",
     "byte_order": "little_endian"
   },
-  "total_tensors": 1,
+  "total_args": 1,
   "before_dispatch": 1,
   "after_completion": 0,
-  "input_tensors": 1,
-  "output_tensors": 0,
-  "inout_tensors": 0,
-  "truncated_tensors": 0,
+  "input_args": 1,
+  "output_args": 0,
+  "inout_args": 0,
+  "truncated_args": 0,
   "dropped_records": 0,
   "dropped_overwrite": 0,
-  "bin_file": "tensor_dump.bin",
-  "tensors": [
+  "bin_file": "args.bin",
+  "args": [
     {
       "task_id": "0x0000000200000a00",
       "role": "input",
@@ -239,7 +239,7 @@ Key fields:
   `is_contiguous` — logical view geometry. Tensor `bin_size` is
   `numel × elem_size` of the *logical* view, gathered if
   non-contiguous; scalar entries have `bin_size = 0`.
-- `bin_offset` — byte offset into `tensor_dump.bin` where the
+- `bin_offset` — byte offset into `args.bin` where the
   payload starts.
 - `truncated` / `overwritten` — set when the tensor exceeded arena
   size or was overwritten by a later task; see §7.
@@ -248,22 +248,22 @@ Key fields:
 
 ### 3.3 Inspect with `dump_viewer`
 
-The viewer auto-picks the latest `outputs/*/tensor_dump` directory
-when invoked without arguments. It loads `tensor_dump.json` and
+The viewer auto-picks the latest `outputs/*/args_dump` directory
+when invoked without arguments. It loads `args_dump.json` and
 uses its `bin_file` field to find the payload:
 
 ```bash
-# List every dumped tensor in the latest run
+# List every dumped arg in the latest run
 python -m simpler_setup.tools.dump_viewer
 
-# Filter and save matching tensors to human-readable .txt files
+# Filter and save matching args to human-readable .txt files
 python -m simpler_setup.tools.dump_viewer --stage before --role input --export
 
 # Export one specific entry by its manifest index
 python -m simpler_setup.tools.dump_viewer --index 42
 
 # Pin to a specific dump directory
-python -m simpler_setup.tools.dump_viewer outputs/<case>_<ts>/tensor_dump \
+python -m simpler_setup.tools.dump_viewer outputs/<case>_<ts>/args_dump \
     --task 0x0000000200000a00 --export
 ```
 
@@ -294,13 +294,13 @@ int t1 = add_task_with_tensor_info(
 ```
 
 Full template:
-[`tests/st/a5/host_build_graph/dump_tensor_example`](../tests/st/a5/host_build_graph/dump_tensor_example/)
+[`tests/st/a5/host_build_graph/dump_tensor`](../../tests/st/a5/host_build_graph/dump_tensor/)
 (and the `a2a3` mirror at
-`tests/st/a2a3/host_build_graph/dump_tensor_example`).
+`tests/st/a2a3/host_build_graph/dump_tensor`).
 
 ## 4. Capabilities
 
-What you can read out of `tensor_dump.json` + `tensor_dump.bin`:
+What you can read out of `args_dump.json` + `args.bin`:
 
 - **Per-task input snapshots** (`role: input`, `stage:
   before_dispatch`) — what each kernel was given.
@@ -341,7 +341,7 @@ DumpDataHeader                                  (host init, AICPU reads)
 ├── num_dump_threads
 ├── records_per_buffer
 ├── magic = 0x44554D50 ("DUMP")
-└── dump_tensor_level  (DumpTensorLevel: 0=off, 1=partial, 2=full, 3=full_json_only; AICPU latches in dump_tensor_init)
+└── dump_tensor_level  (DumpTensorLevel: 0=off, 1=partial, 2=full, 3=full_json_only; AICPU latches in dump_args_init)
 
 DumpBufferState[num_dump_threads]               (per-thread)
 ├── free_queue {buffer_ptrs[SLOT_COUNT], head, tail}
@@ -366,7 +366,7 @@ These structs are binary-identical between a2a3 and a5
 `set_platform_dump_base()`. Dump enablement is propagated
 separately via the umbrella bitmask `KernelArgs::enable_profiling_flag`
 (`bit0 = PROFILING_FLAG_DUMP_TENSOR`); the AICPU kernel entry calls
-`set_dump_tensor_enabled()` with the decoded bit, so device-side
+`set_dump_args_enabled()` with the decoded bit, so device-side
 code does not infer "dump enabled" from `dump_data_base != 0`.
 
 Each record is fixed at 128 B (two cache lines) — see
@@ -376,7 +376,7 @@ Each record is fixed at 128 B (two cache lines) — see
 ### 5.2 Where dump calls are wired in
 
 Each runtime's scheduler dispatch code calls
-`dump_tensors_for_task` at two points in the per-task state machine
+`dump_args_for_task` at two points in the per-task state machine
 (for `tensormap_and_ringbuffer`, this is in
 `runtime/scheduler/scheduler_completion.cpp` and
 `runtime/scheduler/scheduler_dispatch.cpp`):
@@ -384,24 +384,24 @@ Each runtime's scheduler dispatch code calls
 ```text
 ┌──────────────────────────────────────┐
 │ per-task dispatch:                   │
-│   if enable_dump_tensor {            │
-│     dump_tensors_for_task(           │
+│   if enable_dump_args {              │
+│     dump_args_for_task(              │
 │         BEFORE_DISPATCH);            │
 │   }                                  │
 │   dispatch(task);                    │
 │   wait FIN;                          │
-│   if enable_dump_tensor {            │
-│     dump_tensors_for_task(           │
+│   if enable_dump_args {              │
+│     dump_args_for_task(              │
 │         AFTER_COMPLETION);           │
 │   }                                  │
 │   retire(task);                      │
 └──────────────────────────────────────┘
 ```
 
-`dump_tensors_for_task` walks the formal callable signature for
+`dump_args_for_task` walks the formal callable signature for
 non-scalar tensor slots, matches each tensor slot to a
 `TensorDumpInfo` (dtype + shape + strides + start offset + device
-address), and calls `dump_tensor_record` for slots that match the
+address), and calls `dump_arg_record` for slots that match the
 current stage. Scalar values are dumped separately from the flat
 payload `scalars[]`; their dtype table is registered at submit time
 and emitted as a dump-only metadata record at `BEFORE_DISPATCH`.
@@ -429,7 +429,7 @@ on `TensorInfo` (see
   - `add_task_with_tensor_info()` (single-call convenience wrapper)
 
   See
-  [`dump_tensor_orch.cpp`](../tests/st/a5/host_build_graph/dump_tensor_example/kernels/orchestration/dump_tensor_orch.cpp)
+  [`dump_tensor_orch.cpp`](../../tests/st/a5/host_build_graph/dump_tensor/kernels/orchestration/dump_tensor_orch.cpp)
   for both styles in one file.
 - **`tensormap_and_ringbuffer`** — runtime layer fills `TensorInfo`
   from `PTO2TaskPayload::tensors[]` directly. The ring buffer
@@ -438,7 +438,7 @@ on `TensorInfo` (see
 
 When metadata is missing or inconsistent, the task is skipped for
 dump and a single `LOG_WARN` is emitted (guarded by
-`try_log_tensor_dump_layout_mismatch` to avoid log flooding);
+`try_log_dump_args_layout_mismatch` to avoid log flooding);
 normal execution continues.
 
 ### 5.4 a2a3 — shared-memory streaming
@@ -457,23 +457,23 @@ poll thread that drains the L2 hand-off queue into
 ┌──────────────────────────┐               ┌──────────────────────────┐
 │ TensorDumpCollector      │               │ AICPU thread             │
 │                          │               │                          │
-│ initialize()             │  alloc +      │ dump_tensor_init()       │
+│ initialize()             │  alloc +      │ dump_args_init()         │
 │   rtMalloc + halRegister │──register────>│   read DumpDataHeader    │
 │   build DumpDataHeader   │              │   cache per-thread ptrs  │
 │                          │               │                          │
 │ start()                  │               │ per-task run loop:       │
 │   ┌────────────────────┐ │               │   BEFORE_DISPATCH        │
-│   │ mgmt thread        │ │               │     dump_tensor_record() │
+│   │ mgmt thread        │ │               │     dump_arg_record()    │
 │   │ (BufferPool driver)│ │ SPSC ready    │     → write to arena     │
 │   │   poll ready queue │<┼──queues──────<│     → append record      │
 │   │   recycle buffers  │─┼──free queue──>│     → push to ready_q    │
 │   └────────────────────┘ │               │   dispatch kernel        │
 │   ┌────────────────────┐ │               │   wait FIN               │
 │   │ poll thread        │ │               │   AFTER_COMPLETION       │
-│   │   reads arena via  │ │ shared mem    │     dump_tensor_record() │
+│   │   reads arena via  │ │ shared mem    │     dump_arg_record()    │
 │   │   host mapping     │<┼──mapping─────<│                          │
 │   └────────────────────┘ │               │                          │
-│                          │               │ dump_tensor_flush()      │
+│                          │               │ dump_args_flush()        │
 │ stop()                   │               │   log per-thread stats   │
 │   join mgmt → join poll  │               └──────────────────────────┘
 │ reconcile_counters()     │
@@ -482,9 +482,9 @@ poll thread that drains the L2 hand-off queue into
 │                          │
 │ export_dump_files()      │
 │   → <output_prefix>/     │
-│     tensor_dump/         │
-│       tensor_dump.json   │
-│       tensor_dump.bin    │
+│     args_dump/           │
+│       args_dump.json     │
+│       args.bin           │
 └──────────────────────────┘
 ```
 
@@ -553,22 +553,22 @@ the buffer's records.
 │ TensorDumpCollector      │               │ AICPU thread             │
 │   : ProfilerBase<...>    │               │                          │
 │                          │               │                          │
-│ initialize()             │  alloc + reg  │ dump_tensor_init()       │
+│ initialize()             │  alloc + reg  │ dump_args_init()         │
 │   rtMalloc shm           │──+ shadow────>│   read DumpDataHeader    │
 │   per-thread arenas      │   memset 0    │   cache per-thread ptrs  │
 │   per-thread             │   + push 0s   │                          │
 │   DumpMetaBuffers        │               │ per-task run loop:       │
 │   register_mapping(s)    │               │   BEFORE_DISPATCH        │
-│                          │               │     dump_tensor_record() │
+│                          │               │     dump_arg_record()    │
 │ start(thread_factory)    │               │   dispatch kernel        │
 │   mgmt_thread starts     │               │   wait FIN               │
 │   poll_thread starts     │               │   AFTER_COMPLETION       │
-│                          │               │     dump_tensor_record() │
+│                          │               │     dump_arg_record()    │
 │ mgmt every 10us tick:    │               │   if buffer full:        │
 │   copy_from_device(shm)  │<──memcpy─────<│     push ready entry,    │
 │   for each ready entry:  │               │     pop next from free_q │
 │     copy buf from device │<──memcpy─────<│                          │
-│     resolve host ptr     │               │ dump_tensor_flush():     │
+│     resolve host ptr     │               │ dump_args_flush():       │
 │     push to L2 ready_q   │               │   push remaining buffers │
 │   advance queue_heads,   │               │   to ready_q             │
 │     refill free_queues   │               │                          │
@@ -577,7 +577,7 @@ the buffer's records.
 │     field                │               │                          │
 │                          │               │                          │
 │ poll thread:             │               │                          │
-│   wait_pop_ready          │               │                          │
+│   wait_pop_ready         │               │                          │
 │   on_buffer_collected →  │               │                          │
 │     copy arena slice     │<──memcpy─────<│                          │
 │     extract DumpedTensors│               │                          │
@@ -592,7 +592,7 @@ the buffer's records.
 │   + dropped accounting   │               │                          │
 │ export_dump_files()      │               │                          │
 │   → <output_prefix>/     │               │                          │
-│     tensor_dump/...      │               │                          │
+│     args_dump/...        │               │                          │
 └──────────────────────────┘               └──────────────────────────┘
 ```
 
@@ -621,7 +621,7 @@ with `DumpModule`. The only a5-specific glue is the 5-callback
 `MemoryOps`, the per-tick shm mirror, and the on-demand arena copy
 inside `on_buffer_collected`.
 
-a5 normally relies on per-thread AICPU flush (`dump_tensor_flush`) to move
+a5 normally relies on per-thread AICPU flush (`dump_args_flush`) to move
 the current buffer into the ready queue. If a hang/op-timeout reaps AICPU
 before that flush runs, `reconcile_counters` recovers a non-empty
 `current_buf_ptr` host-side before export, then accumulates each thread's
@@ -644,12 +644,12 @@ before that flush runs, `reconcile_counters` recovers a non-empty
 
 ## 6. Overhead
 
-Tensor Dump is opt-in and zero-overhead when disabled — without
-`--dump-tensor` the host does not allocate dump storage and AICPU /
+Args Dump is opt-in and zero-overhead when disabled — without
+`--dump-args` the host does not allocate dump storage and AICPU /
 AICore skip the dump-specific code paths. The `pipe_barrier(PIPE_ALL)`
 before FIN is also gated on the same handshake bit.
 
-With `--dump-tensor`, AICPU records full `BEFORE_DISPATCH` /
+With `--dump-args`, AICPU records full `BEFORE_DISPATCH` /
 `AFTER_COMPLETION` tensor payloads plus manifest-only
 `BEFORE_DISPATCH` scalar args. The per-task overhead is dominated by:
 
@@ -670,7 +670,7 @@ device.
 ## 7. Limitations
 
 Three failure modes exist when dump buffers run out of space. All
-three surface in the JSON manifest plus the `dump_tensor_flush`
+three surface in the JSON manifest plus the `dump_args_flush`
 log line so users can detect and diagnose them.
 
 ### 7.1 Truncation (`truncated = true`)
@@ -755,7 +755,7 @@ full and no replacement buffer is available.
 
 **a5 mechanism (simple):** each thread has a single `DumpBuffer`
 with `capacity = RECORDS_PER_BUFFER` (default 256). When `count >=
-capacity`, subsequent `dump_tensor_record()` calls increment
+capacity`, subsequent `dump_arg_record()` calls increment
 `dropped_count` and return immediately — no metadata, no payload
 is stored for that tensor.
 
@@ -785,7 +785,7 @@ cur_buf.count = 0          ← reset and reuse
 dropped_record_count += N  ← tracks total lost records
 ```
 
-The same fallback applies during `dump_tensor_flush()` at end of
+The same fallback applies during `dump_args_flush()` at end of
 execution if the ready queue is full.
 
 **Effect:** `dropped_records` in the manifest summary shows how
@@ -824,21 +824,21 @@ Per-thread arena =
 
 ## 8. FAQ / Debug Guide
 
-**No `tensor_dump/` directory in the output.** Check that
-`--dump-tensor` was passed; without it (level 0) the host does not
+**No `args_dump/` directory in the output.** Check that
+`--dump-args` was passed; without it (level 0) the host does not
 allocate dump storage. Verify the run wrote to the expected
 `<output_prefix>` and that the kernel actually executed (a kernel
 that exits early before any task dispatch produces an empty
 manifest).
 
-**`tensor_dump/` exists but the manifest captured nothing.** You are
-most likely at the default partial level (`--dump-tensor` = level 1)
+**`args_dump/` exists but the manifest captured nothing.** You are
+most likely at the default partial level (`--dump-args` = level 1)
 with no `Arg::dump(...)` markers in the orchestration, so every task is
-skipped. Add markers (§3.2), or pass `--dump-tensor 2` for a full dump.
+skipped. Add markers (§3.2), or pass `--dump-args 2` for a full dump.
 
 **Manifest has tasks but `tensors[]` is empty.** AICPU received a
 task whose `TensorInfo` was missing or inconsistent. Look for a
-`LOG_WARN` from `try_log_tensor_dump_layout_mismatch` — it
+`LOG_WARN` from `try_log_dump_args_layout_mismatch` — it
 identifies the first mismatched task, then is suppressed to avoid
 log flooding. For `host_build_graph`, ensure
 `set_tensor_info_to_task` (or
@@ -851,7 +851,7 @@ If you see it, verify the executor saw `PROFILING_FLAG_DUMP_TENSOR`
 set in the handshake (a missing handshake bit silently disables
 the barrier).
 
-**`truncated_tensors > 0` in summary.** A tensor exceeded the
+**`truncated_args > 0` in summary.** A tensor exceeded the
 per-thread arena (default 128 MiB). Bump
 `PLATFORM_DUMP_AVG_TENSOR_BYTES` to extend the arena and rerun.
 
@@ -866,11 +866,11 @@ On a5 raise `PLATFORM_DUMP_RECORDS_PER_BUFFER`; on a2a3 raise
 `PLATFORM_DUMP_BUFFERS_PER_THREAD` and/or
 `PLATFORM_DUMP_READYQUEUE_SIZE`.
 
-**Viewer reports "no `outputs/*/tensor_dump` directory found".**
+**Viewer reports "no `outputs/*/args_dump` directory found".**
 Either the run did not produce one (see first question), or the
 viewer's working directory differs from the run's. Pass the
 explicit dump-dir path to the viewer:
-`python -m simpler_setup.tools.dump_viewer outputs/<case>_<ts>/tensor_dump`.
+`python -m simpler_setup.tools.dump_viewer outputs/<case>_<ts>/args_dump`.
 
 **The run hung (AICore op-timeout / scheduler timeout) — is there
 still a dump?** Yes, and it includes the hung kernel's own partial

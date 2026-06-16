@@ -45,9 +45,9 @@ python examples/a2a3/tensormap_and_ringbuffer/vector_example/test_vector_example
 python examples/a2a3/tensormap_and_ringbuffer/vector_example/test_vector_example.py \
     -p a2a3 --enable-l2-swimlane
 
-# Tensor dump
+# Args dump
 python tests/st/a2a3/tensormap_and_ringbuffer/alternating_matmul_add/test_alternating_matmul_add.py \
-    -p a2a3 -d 11 --dump-tensor
+    -p a2a3 -d 11 --dump-args
 ```
 
 ## Test Organization
@@ -69,7 +69,7 @@ If a module is pure C++ with no Python binding, test in **ut-cpp** (`tests/ut/cp
 
 Scene tests support advanced CLI options for benchmarking, profiling, and runtime control. These work identically in both pytest and standalone mode.
 
-> "Profiling" is the umbrella for three parallel diagnostics sub-features: `--enable-l2-swimlane` (L2 swimlane), `--dump-tensor` (unified tensor/scalar dump), and `--enable-pmu` (PMU CSV). They are independent and can be combined.
+> "Profiling" is the umbrella for three parallel diagnostics sub-features: `--enable-l2-swimlane` (L2 swimlane), `--dump-args` (unified argument dump), and `--enable-pmu` (PMU CSV). They are independent and can be combined.
 
 ### pytest
 
@@ -87,7 +87,7 @@ pytest --platform a2a3sim --log-level debug                        # verbose C++
 python test_xxx.py -p a2a3sim                                    # default: 1 round + golden
 python test_xxx.py -p a2a3 -d 0 --rounds 100 --skip-golden       # benchmark mode
 python test_xxx.py -p a2a3 --enable-l2-swimlane                         # L2 swimlane (first round)
-python test_xxx.py -p a2a3 --dump-tensor                         # dump unified tensor/scalar artifacts
+python test_xxx.py -p a2a3 --dump-args                         # dump unified argument artifacts
 python test_xxx.py -p a2a3 --enable-pmu 4                        # PMU CSV (MEMORY)
 python test_xxx.py -p a2a3sim --log-level debug                  # verbose C++ logging
 ```
@@ -105,7 +105,7 @@ python test_xxx.py -p a2a3sim --log-level debug                  # verbose C++ l
 | `--manual` | | `exclude` | `exclude`/`include`/`only` for manual cases |
 | `--skip-golden` | | false | Skip golden comparison (for benchmarking) |
 | `--enable-l2-swimlane [PERF_LEVEL]` | | `0` | Enable L2 swimlane collection on first round only. The flag takes an integer perf_level 0–4 (bare = 4); see [docs/dfx/l2-swimlane-profiling.md](dfx/l2-swimlane-profiling.md#31-enable-l2-swimlane) for the level table. Each test case gets its own `outputs/<case>_<ts>/` directory under which `l2_swimlane_records.json` lands; parallel runs never collide. |
-| `--dump-tensor` | | false | Dump tensors plus scalar args into unified runtime artifacts |
+| `--dump-args` | | `0` | Dump tensors plus scalar args into unified runtime artifacts (bare flag = `1`; supports `0/1/2/3`) |
 | `--enable-pmu [EVENT_TYPE]` | | `0` | Enable a2a3 PMU CSV collection. Bare flag selects `PIPE_UTILIZATION` (`2`); pass an event type such as `4` for `MEMORY`. |
 | `--exitfirst` | `-x` | false | Stop on first failing test (fail-fast, primarily for CI) |
 | `--log-level LEVEL` | | `v5` | Simpler logger threshold. Accepts `debug` / `V0..V9` / `info` / `warn` / `error` / `null` (case-insensitive). pytest's own CLI validator does `int(getattr(logging, level.upper(), level))`, so the V tiers and `NUL`/`NULL` are exposed as attributes on the `logging` module via `setattr` (registration in `conftest.py` runs before pytest's option machinery). `logging.addLevelName` is also called so `%(levelname)s` formatters print `V3` instead of `Level 18`, but it is not what makes the CLI parser accept the value. The "simpler" Python logger is the single source of truth; the value is snapshotted into the platform SO at `Worker.init()` time (not per `Worker.run()`) and pushed to host `HostLogger`, runner state, and (onboard) CANN `dlog_setlevel`. AICPU receives it via `KernelArgs.log_info_v`. Changing the Python logger level after `Worker.init()` does not retroactively affect that worker. See [Log levels](#log-levels). |
@@ -211,7 +211,7 @@ Worked examples:
 | `--rounds` | both | **(none)** | pytest-xdist already uses `-n` for worker count. Standalone originally had `-n` for `--rounds`, creating a letter-level collision whenever a user switched between pytest (`-n 8` = 8 workers) and standalone (`-n 8` = 8 rounds). Removed in [#574](https://github.com/hw-native-sys/simpler/pull/574); do not reintroduce. |
 | `--max-parallel` | both | **(none)** | `-j` would be the natural make-style short, but pytest reserves all lowercase single letters (`parser.addoption` rejects lowercase shorts). Standalone mirrors this to keep both CLIs identical — no short in either, always spell out `--max-parallel`. |
 | `--runtime` / `--level` | both | **(none)** | Internal child-mode markers; users rarely type them. No short keeps them distinctive. |
-| `--skip-golden`, `--enable-l2-swimlane`, `--dump-tensor`, `--enable-pmu`, `--manual`, `--case`, `--log-level` | both | **(none)** | Low-frequency; long form reads better in scripts and docs. Not worth reserving letters. |
+| `--skip-golden`, `--enable-l2-swimlane`, `--dump-args`, `--enable-pmu`, `--manual`, `--case`, `--log-level` | both | **(none)** | Low-frequency; long form reads better in scripts and docs. Not worth reserving letters. |
 
 Practical guidance when adding a new CLI option:
 
@@ -319,7 +319,7 @@ A single file can declare both L2 and L3 classes; they're grouped by `(runtime, 
 Each test case sets its own `CallConfig.output_prefix` (chosen by `scene_test.py::_build_output_prefix` as `outputs/<ClassName>_<case>_<YYYYMMDD_HHMMSS>/`). The C++ runtime writes all diagnostic artifacts under that prefix with fixed filenames:
 
 - `outputs/<case>_<ts>/l2_swimlane_records.json` — swimlane (`--enable-l2-swimlane`)
-- `outputs/<case>_<ts>/tensor_dump/` — tensor dump (`--dump-tensor`)
+- `outputs/<case>_<ts>/args_dump/` — args dump (`--dump-args`)
 - `outputs/<case>_<ts>/pmu.csv` — PMU counters (`--enable-pmu`)
 
 Because each case gets its own directory, parallel runs (xdist workers, L3 case fanout, L2 device fanout) can never collide on filename — there is no per-file timestamp, no env-var scoping, and no post-run flatten step. `CallConfig::validate()` throws if any diagnostic flag is enabled but `output_prefix` is empty; `scene_test.py::run_class_cases` always fills it from the case label.

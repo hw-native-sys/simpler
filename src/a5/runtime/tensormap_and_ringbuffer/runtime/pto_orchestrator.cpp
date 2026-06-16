@@ -663,20 +663,18 @@ static TaskOutputTensors submit_task_common(
 
     payload.init(args, result, prepared.alloc_result, layout);
 #if PTO2_PROFILING
-    if (is_dump_tensor_enabled()) {
+    if (is_dump_args_enabled()) {
         if (args.scalar_count() > 0) {
-            set_dump_tensor_task_scalar_dtypes(
+            set_dump_args_task_scalar_dtypes(
                 task_id.raw, static_cast<uint32_t>(args.scalar_count()), args.scalar_dtypes()
             );
         }
-        // Selective vs full dump is latched at dump_tensor_init from DumpDataHeader
+        // Selective vs full dump is latched at dump_args_init from DumpDataHeader
         // (host-decided before any dispatch), so it is race-free regardless of
         // submission order. Here we only record each marked task's arg mask and
         // metadata flags, which selective collection consults.
-        if (args.tensor_dump_arg_mask() != 0) {
-            set_dump_tensor_task_mask(
-                task_id.raw, args.tensor_dump_arg_mask(), args.tensor_dump_arg_index_ambiguous_mask()
-            );
+        if (args.dump_arg_mask() != 0) {
+            set_dump_args_task_mask(task_id.raw, args.dump_arg_mask(), args.dump_arg_index_ambiguous_mask());
         }
     }
 #endif
