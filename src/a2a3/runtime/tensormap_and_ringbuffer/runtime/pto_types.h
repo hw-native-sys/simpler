@@ -512,7 +512,7 @@ private:
             return false;
         }
         if (tensor_count_ + sizeof...(Args) > MAX_TENSOR_ARGS) {
-            set_error("Too many tensor args (exceeds MAX_TENSOR_ARGS=16)");
+            set_error("Too many tensor args (exceeds MAX_TENSOR_ARGS=32)");
             return false;
         }
         return true;

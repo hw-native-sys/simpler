@@ -322,7 +322,7 @@ struct PTO2TaskPayload {
                 result.materialize_output(tensors[i]);
             }
         }
-        // Round up to cache line boundary. Both arrays are 1024B so no overrun.
+        // Round up to cache line boundary. Both arrays are 128B so no overrun.
         // Eliminates branches; extra bytes within the same CL have zero additional cost.
         memcpy(scalars, args.scalars(), PTO2_ALIGN_UP(args.scalar_count() * sizeof(uint64_t), 64));
 
