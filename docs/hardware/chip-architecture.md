@@ -54,6 +54,21 @@ A chip may comprise one or more dies, and may present to the host as
 one or more device IDs (the die ↔ device-id mapping is chip-specific —
 see `src/{a2a3,a5}/docs/`).
 
+**GM is "shared" only within one `device_id`** — shared across that device's
+AICPU and AICore tiers. It is **exclusive per `device_id`**, never shared across
+device IDs. The die↔device mapping differs by arch but does not change this:
+
+- **a5**: one `device_id` owns the chip's dies/clusters, managed as one unit by
+  the AICPU; one orch runs per `device_id` (an invariant). There is no
+  "two-die concurrency" inside a device.
+- **a2a3**: a card presents two `device_id`s; they are independent.
+
+So multiple device IDs (e.g. pytest xdist `gw0`/`gw1`, or `--device 2-3`) run on
+**independent HBM with no cross-device contention**. A per-device OOM comes from
+that device's own workload, not from an "adjacent die". (The chip-shared
+contention model was removed in PR #990 — see
+`.claude/rules/running-onboard.md`.)
+
 ## Identifying which chip generation you have
 
 CANN ships per-SoC platform configs under

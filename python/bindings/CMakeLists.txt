@@ -22,6 +22,8 @@ set(HIERARCHICAL_SOURCES
     ${HIERARCHICAL_SRC}/tensormap.cpp
     ${HIERARCHICAL_SRC}/ring.cpp
     ${HIERARCHICAL_SRC}/scope.cpp
+    ${HIERARCHICAL_SRC}/remote_wire.cpp
+    ${HIERARCHICAL_SRC}/remote_endpoint.cpp
     ${HIERARCHICAL_SRC}/orchestrator.cpp
     ${HIERARCHICAL_SRC}/worker_manager.cpp
     ${HIERARCHICAL_SRC}/scheduler.cpp

@@ -89,4 +89,23 @@ void scope_stats_aicpu_flush_buffers();
 void scope_stats_set_ring_capacity(int ring_id, int32_t window_cap, uint64_t heap_cap, int32_t dep_pool_cap);
 void scope_stats_set_tensormap_capacity(int32_t cap);
 
+// --- Heap-ring wrap accounting ---
+//
+// The heap ring's reclaim/alloc pointers are wrapping byte offsets in
+// [0, heap_cap); subtracting two boundary snapshots therefore loses every wrap
+// that happened in between, so the per-scope alloc / high-water deltas are not
+// recoverable once a scope's heap throughput exceeds heap_cap. The runtime is
+// the only place each individual wrap is observable (each allocation is
+// < heap_cap, so a single wrap is unambiguous), so it reports each wrap here;
+// the collector accumulates the count per ring and unrolls the sampled wrapping
+// offsets into monotonic values, making every delta exact for any wrap count.
+//
+// The runtime passes only the side — it stores no per-ring state. The collector
+// attributes the wrap to the current scope's ring (the wrap always happens mid
+// scope, where the active ring equals the most recent scope_stats_begin's ring).
+#define SCOPE_STATS_HEAP_SIDE_ALLOC 0    // heap_top (allocation pointer) wrapped.
+#define SCOPE_STATS_HEAP_SIDE_RECLAIM 1  // heap_tail (reclaim pointer) wrapped.
+
+void scope_stats_note_heap_wrap(int side);
+
 }  // extern "C"

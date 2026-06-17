@@ -45,15 +45,17 @@
 
 constexpr int32_t MAX_AICPU_THREADS = PLATFORM_MAX_AICPU_THREADS;
 
-constexpr int32_t MAX_IDLE_ITERATIONS = PLATFORM_MAX_IDLE_ITERATIONS;  // platform-defined cap (sim vs onboard)
-constexpr int32_t STALL_LOG_INTERVAL =
-    MAX_IDLE_ITERATIONS * 6 / 10;                     // derived: ~one stall diagnostic halfway to timeout
+// Periodic cadence (in idle iterations) for emitting the per-thread STALL
+// diagnostic while no progress is being made. Purely an observability knob,
+// independent of the wall-clock timeout below: small enough to fire a few times
+// before the budget expires, large enough not to flood device_log.
+constexpr int32_t STALL_LOG_INTERVAL = 480000;
 constexpr int32_t FATAL_ERROR_CHECK_INTERVAL = 1024;  // Check orchestrator error every N idle iters
 
 // Wall-clock budget for declaring "no progress = scheduler timeout". Replaces
-// the per-thread iteration-count cap for the fatal-latch decision; the
-// iteration cap still drives the STALL diagnostic cadence (which is per-thread
-// observability and benefits from running at the thread's own pace).
+// the per-thread iteration-count cap that once lived here as MAX_IDLE_ITERATIONS
+// for the fatal-latch decision; STALL_LOG_INTERVAL above keeps the per-thread
+// diagnostic cadence.
 //
 // Using wall-clock here is load-bearing for distributed runs: with per-thread
 // iteration counts, a pure-idle thread spinning ~115 ns/iter hits the cap in
@@ -62,14 +64,14 @@ constexpr int32_t FATAL_ERROR_CHECK_INTERVAL = 1024;  // Check orchestrator erro
 // kills the slower-but-correct poller mid-poll — see the distributed
 // startup-skew scenario in issue #897.
 //
-// The value is set *below* the STARS AICore op-execution timeout
-// (PLATFORM_OP_EXECUTE_TIMEOUT_US, 3 s) on purpose: the AICPU must detect a hang
-// and flush its diagnostics (tensor dump, in-flight partial output) before STARS
-// reaps the op and poisons the context. Chain: this < op-exec < host stream-sync
-// (platform_config.h). Trade-off: 2 s is shorter than the worst distributed-init
-// / HCCL skew #897 sized 5 s for, so a slow distributed startup can false-latch;
-// if that bites, raise this together with the op-exec / stream-sync timeouts.
-constexpr int32_t SCHEDULER_TIMEOUT_MS = 2000;  // 2 s; < op-exec so the AICPU dumps before STARS reaps
+// The budget is platform-defined (PLATFORM_SCHEDULER_TIMEOUT_MS in spin_hint.h)
+// because the safe value differs per variant: onboard trims it to 2 s so the
+// AICPU detects a hang and flushes its diagnostics (tensor dump, in-flight
+// partial output) before STARS reaps the op and poisons the context (chain:
+// this < op-exec < host stream-sync, platform_config.h); sim has no STARS to
+// race and keeps the full 5 s #897 headroom. See spin_hint.h for the per-variant
+// rationale.
+constexpr int32_t SCHEDULER_TIMEOUT_MS = PLATFORM_SCHEDULER_TIMEOUT_MS;
 constexpr uint64_t SCHEDULER_TIMEOUT_CYCLES =
     static_cast<uint64_t>(SCHEDULER_TIMEOUT_MS) * (PLATFORM_PROF_SYS_CNT_FREQ / 1000);
 constexpr int32_t STALL_DUMP_READY_MAX = 8;

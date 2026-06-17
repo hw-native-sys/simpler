@@ -84,7 +84,8 @@ that ...".
 
 Newest first.
 
-- [2026-06 — Cross-task batched publish: hoist wmb across distinct tasks in one pop](2026-06-cross-task-batched-publish.md)
+- [2026-06 — PA-unroll 207001: an op-timeout-window issue fixed by #1035, not a launch-order bug](2026-06-pa-unroll-207001-optimeout-window.md)
+- [2026-06 — Cross-task batched publish: hoist wmb across distinct tasks in one pop](2026-06-cross-task-batched-publish.md) — also carries the root cause + fix for the `spmd_sync_start_stress` 507018 drain-barrier hang
 - [2026-06 — AICore first-task cold-start: pre-warm dispatch path](2026-06-aicore-cold-start-warmup.md)
 - [2026-06 — a5 AICore op-timeout poisons the shared L2 worker (cascade)](2026-06-a5-aicore-op-timeout-cascade.md)
 - [2026-06 — a5 AICPU filter gate: Scenario B fail-fast guard not added](2026-06-a5-aicpu-filter-gate-scenario-b-validation.md)

@@ -228,11 +228,9 @@ public:
     int export_dump_files();
 
     /**
-     * After stop(), perform purely-passive accounting:
-     *   - LOG_ERROR any non-zero DumpBufferState::current_buf_ptr with
-     *     records (device flush should always succeed-or-bump-dropped, so
-     *     a non-empty leftover indicates an AICPU flush bug — host does
-     *     NOT recover, to avoid masking the bug).
+     * After stop():
+     *   - Recover records from any non-empty DumpBufferState::current_buf_ptr
+     *     left behind by abnormal exit before device-side flush ran.
      *   - Accumulate device-side dropped_record_count into
      *     total_dropped_record_count_ for the final anomaly report.
      * Must be called after stop().

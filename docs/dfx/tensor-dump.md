@@ -472,6 +472,8 @@ poll thread that drains the L2 hand-off queue into
 │ stop()                   │               │   log per-thread stats   │
 │   join mgmt → join poll  │               └──────────────────────────┘
 │ reconcile_counters()     │
+│   recover leftovers      │
+│   + dropped accounting   │
 │                          │
 │ export_dump_files()      │
 │   → <output_prefix>/     │
@@ -494,10 +496,8 @@ rtStreamSynchronize              ← wait for kernel completion
 stop()                           ← join mgmt (its final-drain pass into L2
                                    has poll as the consumer), then signal
                                    poll and join it
-reconcile_counters()             ← passive sanity check + dropped accounting
-                                   (host never recovers from
-                                   current_buf_ptr — device flush is the
-                                   sole data path)
+reconcile_counters()             ← recover leftover current buffers
+                                   + dropped accounting
 export_dump_files()
 ```
 
@@ -583,7 +583,7 @@ the buffer's records.
 │ stop()                   │               │                          │
 │   join mgmt + poll       │               │                          │
 │ reconcile_counters()     │               │                          │
-│   sanity-check leftovers │               │                          │
+│   recover leftovers      │               │                          │
 │   + dropped accounting   │               │                          │
 │ export_dump_files()      │               │                          │
 │   → <output_prefix>/     │               │                          │
@@ -601,7 +601,8 @@ dump_collector_.start(thread_factory)   ← mgmt + poll threads
 launch AICPU / AICore
 rtStreamSynchronize
 dump_collector_.stop()                  ← join mgmt + poll, drain final batch
-dump_collector_.reconcile_counters()    ← sanity-check + dropped accounting
+dump_collector_.reconcile_counters()    ← recover leftover current buffers
+                                          + dropped accounting
 dump_collector_.export_dump_files()
 dump_collector_.finalize()
 ```
@@ -615,11 +616,10 @@ with `DumpModule`. The only a5-specific glue is the 5-callback
 `MemoryOps`, the per-tick shm mirror, and the on-demand arena copy
 inside `on_buffer_collected`.
 
-a5's per-thread AICPU flush (`dump_tensor_flush`) is the only data
-path on the records side — host never reads from `current_buf_ptr`
-to recover records. `reconcile_counters` is purely passive: it logs
-an error if any `current_buf_ptr` is non-zero with a non-empty buffer
-(a device-flush bug), then accumulates each thread's
+a5 normally relies on per-thread AICPU flush (`dump_tensor_flush`) to move
+the current buffer into the ready queue. If a hang/op-timeout reaps AICPU
+before that flush runs, `reconcile_counters` recovers a non-empty
+`current_buf_ptr` host-side before export, then accumulates each thread's
 `dropped_record_count` for the final anomaly report.
 
 ### 5.6 a2a3 vs a5 at a glance
@@ -634,7 +634,7 @@ an error if any `current_buf_ptr` is non-zero with a non-empty buffer
 | Host transport | `halHostRegister` shared memory | host-shadow `malloc` + per-tick `rtMemcpy`/`memcpy` |
 | `MemoryOps` callbacks | 3 (`alloc`, `reg`, `free_`) | 5 (+ `copy_to_device`, `copy_from_device`) |
 | Arena access | direct via SVM | `copy_from_device` inside `on_buffer_collected` |
-| `reconcile_counters` | passive sanity check + dropped accounting | identical |
+| `reconcile_counters` | recover leftover current buffers + dropped accounting | identical |
 | Lifecycle | `initialize` → `start` → `stop` → `reconcile_counters` → `export_dump_files` → `finalize` | identical |
 
 ## 6. Overhead
@@ -877,9 +877,9 @@ ordering — the three budgets are tuned so the **AICPU detects the
 hang first**, dumps, and only then the hardware/host timeouts fire:
 
 ```text
-SCHEDULER_TIMEOUT_MS (2 s)  <  PLATFORM_OP_EXECUTE_TIMEOUT_US (3 s)  <  PLATFORM_STREAM_SYNC_TIMEOUT_MS (4 s)
-   AICPU declares hang,          STARS reaps the AICore op            host stream sync gives up
-   flushes + dumps in-flight     and poisons the context              and surfaces the error
+SCHEDULER_TIMEOUT_MS (2 s, onboard)  <  PLATFORM_OP_EXECUTE_TIMEOUT_US (3 s)  <  PLATFORM_STREAM_SYNC_TIMEOUT_MS (4 s)
+   AICPU declares hang,                   STARS reaps the AICore op              host stream sync gives up
+   flushes + dumps in-flight              and poisons the context                and surfaces the error
 ```
 
 - **Device-side graceful flush (primary).** At 2 s of no progress
@@ -909,9 +909,11 @@ This ordering is load-bearing: if the timeouts were inverted (STARS
 reaping before the AICPU's budget, as in earlier versions), the
 device-side dump would never run on a real AICore hang and you would
 only recover what was already in the buffer. The chain lives in
-`scheduler_types.h` (`SCHEDULER_TIMEOUT_MS`) and `platform_config.h`
-(`PLATFORM_OP_EXECUTE_TIMEOUT_US` / `PLATFORM_STREAM_SYNC_TIMEOUT_MS`),
-along with the `#897` distributed-skew trade-off.
+`spin_hint.h` (`PLATFORM_SCHEDULER_TIMEOUT_MS`, surfaced as
+`SCHEDULER_TIMEOUT_MS` — 2 s onboard, 5 s in sim where there is no STARS to
+race) and `platform_config.h` (`PLATFORM_OP_EXECUTE_TIMEOUT_US` /
+`PLATFORM_STREAM_SYNC_TIMEOUT_MS`), along with the `#897` distributed-skew
+trade-off.
 
 ## 9. Related docs
 

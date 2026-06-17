@@ -320,7 +320,7 @@ void TensorDumpCollector::on_buffer_collected(const DumpReadyBufferInfo &info) {
 }
 
 // ---------------------------------------------------------------------------
-// reconcile_counters: passive sanity-check + dropped accounting
+// reconcile_counters: recover un-flushed current buffers + dropped accounting
 // ---------------------------------------------------------------------------
 
 void TensorDumpCollector::reconcile_counters() {

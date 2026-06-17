@@ -462,9 +462,20 @@ void SchedulerContext::drain_worker_dispatch(int32_t block_num) {
 //      Non-elected threads spin-wait until sync_start_pending == 0.
 //      During dispatch the elected thread has exclusive tracker access.
 void SchedulerContext::handle_drain_mode(int32_t thread_idx) {
+    // Every spin in this function honors is_completed(): once the run latches
+    // completed_ (all tasks done, or a fatal error raised elsewhere), peers leave
+    // the dispatch loop and stop participating in the drain. A thread parked in a
+    // drain spin would then wait forever for acks / a gate-open that can no longer
+    // arrive -- the AICPU watchdog never fires here because these spins live
+    // outside the dispatch loop's wall-clock budget, so the hang escalates straight
+    // to the 3 s STARS op-exec timeout (507018) and poisons the device. Bailing on
+    // completed_ is always safe: any pending sync_start task is either already
+    // dispatched (a stale re-popped slot) or moot under teardown, and deinit()
+    // resets drain_state_ before the next run, so leaving it dirty is harmless.
     // Spin until drain is fully initialized (sentinel -1 -> block_num > 0).
     int32_t block_num;
     do {
+        if (is_completed()) return;
         block_num = drain_state_.sync_start_pending.load(std::memory_order_acquire);
     } while (block_num < 0);
     if (block_num == 0) return;
@@ -477,6 +488,7 @@ void SchedulerContext::handle_drain_mode(int32_t thread_idx) {
     // Spin until all threads have acked.
     // If our bit is cleared while waiting, elected reset due to insufficient resources.
     while (true) {
+        if (is_completed()) return;
         uint32_t ack = drain_state_.drain_ack_mask.load(std::memory_order_acquire);
         if ((ack & all_acked) == all_acked) break;
         if ((ack & (1u << thread_idx)) == 0) return;
@@ -492,6 +504,7 @@ void SchedulerContext::handle_drain_mode(int32_t thread_idx) {
     if (drain_state_.drain_worker_elected.load(std::memory_order_relaxed) != thread_idx + 1) {
         // Non-elected: spin-wait for drain completion or resource-insufficient reset.
         while (drain_state_.sync_start_pending.load(std::memory_order_acquire) != 0) {
+            if (is_completed()) return;
             if (drain_state_.drain_worker_elected.load(std::memory_order_acquire) == 0) return;
             SPIN_WAIT_HINT();
         }

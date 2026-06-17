@@ -387,20 +387,36 @@ int DeviceRunner::run(Runtime &runtime, int block_dim, int launch_aicpu_num) {
         l2_swimlane_collector_.set_core_types(core_types.data(), num_aicore);
     }
 
+    // Launch the AICore worker BEFORE the AICPU Run task — mirrors the a5 path
+    // so the two arches stay symmetric. First-launch latency optimization +
+    // op-timeout-family defense-in-depth: with the AICPU Run task launched first
+    // it occupies the device (spinning in the handshake), and the first AICore
+    // launch — which lazily loads the kernel binary onto the device inside
+    // rtKernelLaunchWithHandleV2 — is slow; launching AICore first does that load
+    // on an idle device. The handshake is launch-order-independent. The ~1.4 s
+    // slow-launch / 207001 wedge was measured on a5; this mirror is UNVERIFIED on
+    // a2a3 silicon (the dev box is a5-only), relying on CI. See
+    // docs/investigations/2026-06-pa-unroll-207001-optimeout-window.md.
+    LOG_INFO_V0("=== launch_aicore_kernel ===");
+    // Launch AICore kernel (pass device copy of KernelArgs)
+    rc = launch_aicore_kernel(stream_aicore_, kernel_args_.device_k_args_);
+    if (rc != 0) {
+        LOG_ERROR("launch_aicore_kernel failed: %d", rc);
+        recover_device_or_mark_unusable(rc);
+        return rc;
+    }
+
     LOG_INFO_V0("=== launch_aicpu_kernel %s ===", host::KernelNames::RunName);
     rc = launch_aicpu_kernel(
         stream_aicpu_, &kernel_args_.args, host::KernelNames::RunName, PLATFORM_MAX_AICPU_THREADS_JUST_FOR_LAUNCH
     );
     if (rc != 0) {
         LOG_ERROR("launch_aicpu_kernel (main) failed: %d", rc);
-        return rc;
-    }
-
-    LOG_INFO_V0("=== launch_aicore_kernel ===");
-    // Launch AICore kernel (pass device copy of KernelArgs)
-    rc = launch_aicore_kernel(stream_aicore_, kernel_args_.device_k_args_);
-    if (rc != 0) {
-        LOG_ERROR("launch_aicore_kernel failed: %d", rc);
+        // The AICore worker was already launched above and is now spinning in
+        // the handshake waiting for this AICPU Run task. If the Run launch
+        // fails, that AICore is orphaned and will spin to the op-timeout,
+        // poisoning the device — so recover/mark-unusable here (matches the
+        // launch_aicore failure path).
         recover_device_or_mark_unusable(rc);
         return rc;
     }

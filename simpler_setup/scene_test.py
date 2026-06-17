@@ -739,6 +739,63 @@ def _convert_case_swimlane(
     _run_swimlane_converter(input_path=perf_file, func_names_path=func_names_path)
 
 
+def _run_deps_viewer(
+    input_path: Path,
+    func_names_path: Path | None = None,
+) -> None:
+    """Invoke the bundled deps_viewer tool as a subprocess (text mode).
+
+    Produces ``deps_viewer.txt`` next to ``input_path`` by default.
+    """
+    import logging  # noqa: PLC0415
+    import subprocess  # noqa: PLC0415
+
+    logger = logging.getLogger(__name__)
+    cmd = [sys.executable, "-m", "simpler_setup.tools.deps_viewer", str(input_path), "--format", "text"]
+    if func_names_path is not None:
+        cmd += ["--func-names", str(func_names_path)]
+    try:
+        result = subprocess.run(cmd, check=True, capture_output=True, text=True)
+        if result.stdout:
+            logger.info(result.stdout)
+        logger.info("deps_viewer text generation completed")
+    except subprocess.CalledProcessError as e:
+        logger.warning(f"Failed to generate deps_viewer.txt: {e}")
+        if e.stdout:
+            logger.debug(f"stdout: {e.stdout}")
+        if e.stderr:
+            logger.debug(f"stderr: {e.stderr}")
+
+
+def _graph_case_dep_gen(
+    case_label: str,
+    output_prefix: Path,
+    callable_spec: dict | None = None,
+) -> None:
+    """Post-case: invoke deps_viewer on the deps.json the dep-gen host
+    replay just wrote into ``<output_prefix>/deps.json``.
+    """
+    import logging  # noqa: PLC0415
+
+    logger = logging.getLogger(__name__)
+    deps_file = output_prefix / "deps.json"
+    if not deps_file.exists():
+        logger.warning(f"[{case_label}] {deps_file} not produced; skipping deps_viewer")
+        return
+
+    func_names_path = None
+    if callable_spec:
+        safe_label = _sanitize_for_filename(case_label)
+        name_map_path = output_prefix / f"name_map_{safe_label}.json"
+        if name_map_path.exists():
+            func_names_path = name_map_path
+        else:
+            mapping = _extract_name_map(callable_spec)
+            func_names_path = _dump_name_map(mapping, name_map_path)
+
+    _run_deps_viewer(input_path=deps_file, func_names_path=func_names_path)
+
+
 def _plot_case_scope_stats(case_label: str, output_prefix: Path) -> None:
     """Post-case: turn ``<output_prefix>/scope_stats/scope_stats.jsonl`` into
     the self-contained scope_stats HTML report. Path is known a priori from
@@ -831,6 +888,8 @@ def run_class_cases(  # noqa: PLR0913 -- shared layer-5 entry; kwargs mirror CLI
         finally:
             if enable_l2_swimlane:
                 _convert_case_swimlane(case_label, prefix, callable_spec=callable_spec)
+            if enable_dep_gen:
+                _graph_case_dep_gen(case_label, prefix, callable_spec=callable_spec)
             if enable_scope_stats:
                 _plot_case_scope_stats(case_label, prefix)
             if dlt_baseline is not None:

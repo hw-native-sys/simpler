@@ -92,7 +92,6 @@ add_library(a2a3_rt_objs OBJECT
     ${A2A3_RUNTIME_DIR}/scheduler/pto_scheduler.cpp
     ${A2A3_RUNTIME_DIR}/shared/pto_tensormap.cpp
     ${A2A3_RUNTIME_DIR}/shared/pto_runtime2_init.cpp
-    ${CMAKE_SOURCE_DIR}/../../../src/common/platform/shared/aicpu/scope_stats_collector_aicpu.cpp
     ${CMAKE_SOURCE_DIR}/stubs/test_stubs.cpp
 )
 target_include_directories(a2a3_rt_objs PUBLIC
@@ -132,6 +131,7 @@ add_library(hierarchical_objs OBJECT
     ${HIERARCHICAL_SRC_DIR}/ring.cpp
     ${HIERARCHICAL_SRC_DIR}/scope.cpp
     ${HIERARCHICAL_SRC_DIR}/remote_wire.cpp
+    ${HIERARCHICAL_SRC_DIR}/remote_endpoint.cpp
     ${HIERARCHICAL_SRC_DIR}/orchestrator.cpp
     ${HIERARCHICAL_SRC_DIR}/worker_manager.cpp
     ${HIERARCHICAL_SRC_DIR}/scheduler.cpp
@@ -281,6 +281,7 @@ add_hierarchical_test(test_scope      hierarchical/test_scope.cpp)
 add_hierarchical_test(test_orchestrator hierarchical/test_orchestrator.cpp)
 add_hierarchical_test(test_scheduler  hierarchical/test_scheduler.cpp)
 add_hierarchical_test(test_remote_wire hierarchical/test_remote_wire.cpp)
+add_hierarchical_test(test_remote_endpoint hierarchical/test_remote_endpoint.cpp)
 
 # ---------------------------------------------------------------------------
 # Types / task_interface tests (src/common/task_interface/)
@@ -314,6 +315,27 @@ set_tests_properties(test_chip_callable_upload_immutable PROPERTIES LABELS "no_h
 add_common_utils_test(test_elf_build_id common/test_elf_build_id.cpp)
 add_common_utils_test(test_runtime_orch_so common/test_runtime_orch_so.cpp)
 add_common_utils_test(test_device_arena common/test_device_arena.cpp)
+
+add_executable(test_scope_stats_collector
+    common/test_scope_stats_collector.cpp
+    ${CMAKE_SOURCE_DIR}/../../../src/common/platform/shared/host/scope_stats_collector.cpp
+    ${CMAKE_SOURCE_DIR}/../../../src/a2a3/platform/sim/host/profiling_copy.cpp
+    ${CMAKE_SOURCE_DIR}/stubs/test_stubs.cpp
+)
+target_include_directories(test_scope_stats_collector PRIVATE
+    ${GTEST_INCLUDE_DIRS}
+    ${CMAKE_SOURCE_DIR}/../../../src/a2a3/platform/include
+    ${CMAKE_SOURCE_DIR}/../../../src/common/platform/include
+    ${CMAKE_SOURCE_DIR}/../../../src/common/log/include
+    ${CMAKE_SOURCE_DIR}/../../../src/common
+)
+target_link_libraries(test_scope_stats_collector PRIVATE
+    ${GTEST_MAIN_LIB}
+    ${GTEST_LIB}
+    pthread
+)
+add_test(NAME test_scope_stats_collector COMMAND test_scope_stats_collector)
+set_tests_properties(test_scope_stats_collector PROPERTIES LABELS "no_hardware")
 
 # Per-callable_id orch SO file naming regression (see rtStreamSynchronize
 # 507018 root cause). Compiles the a2a3 onboard `create_orch_so_file`
@@ -352,6 +374,7 @@ add_a2a3_runtime_test(test_fanin_pool       a2a3/test_fanin_pool.cpp)
 add_a2a3_runtime_test(test_spsc_queue       a2a3/test_spsc_queue.cpp)
 add_a2a3_runtime_test(test_wiring           a2a3/test_wiring.cpp)
 add_a2a3_runtime_test(test_aicore_completion_mailbox a2a3/test_aicore_completion_mailbox.cpp)
+add_a2a3_runtime_test(test_a2a3_scope_stats_collector a2a3/test_scope_stats_collector.cpp)
 
 # ---------------------------------------------------------------------------
 # A5 tests (src/a5/runtime/tensormap_and_ringbuffer/)
