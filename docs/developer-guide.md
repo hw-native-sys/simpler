@@ -185,6 +185,7 @@ This builds the nanobind `_task_interface` extension **and** pre-builds all runt
 | Nanobind bindings (`python/bindings/`) | Re-run `pip install --no-build-isolation -e .` (no rebuild-on-import; `editable.rebuild = false`) |
 | Python-only code (`python/*.py`, `simpler_setup/*.py`) | No rebuild needed (editable install) |
 | Examples / kernels (`examples/{arch}/`, `tests/st/`) | No rebuild needed, just re-run |
+| Pinned pto-isa commit (CI `PTO_ISA_COMMIT`) | Re-run `pip install` — onboard a2a3 `host_runtime.so` embeds pto-isa SDMA headers, so a commit bump must rebuild it. Pin the build to the same commit the tests use via `--config-settings=cmake.define.SIMPLER_PTO_ISA_COMMIT=<sha>` (issue #1067). |
 
 ### Runtime binary lookup
 
