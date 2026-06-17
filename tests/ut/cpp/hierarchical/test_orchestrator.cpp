@@ -102,6 +102,23 @@ TEST_F(OrchestratorFixture, DependentTaskIsPending) {
     EXPECT_FALSE(rq.try_pop(extra));  // B should NOT be in ready queue
 }
 
+TEST_F(OrchestratorFixture, GroupDuplicateInputsKeepOneProducer) {
+    auto producer_args = single_tensor_args(0xBEEF, TensorArgType::OUTPUT);
+    auto producer = orch.submit_next_level(C(42), producer_args, cfg);
+    TaskSlot ready;
+    ASSERT_TRUE(rq.try_pop(ready));
+    ASSERT_EQ(ready, producer.task_slot);
+
+    TaskArgs input0 = single_tensor_args(0xBEEF, TensorArgType::INPUT);
+    TaskArgs input1 = single_tensor_args(0xBEEF, TensorArgType::INPUT);
+    auto consumer = orch.submit_next_level_group(C(43), {input0, input1}, cfg);
+
+    EXPECT_EQ(S(consumer.task_slot).state.load(), TaskState::PENDING);
+    EXPECT_EQ(S(consumer.task_slot).fanin_count, 1);
+    ASSERT_EQ(S(consumer.task_slot).fanin_producers.size(), 1u);
+    EXPECT_EQ(S(consumer.task_slot).fanin_producers[0], producer.task_slot);
+}
+
 TEST_F(OrchestratorFixture, SubmitAfterFailedProducerPoisonsConsumer) {
     orch.scope_begin();
 

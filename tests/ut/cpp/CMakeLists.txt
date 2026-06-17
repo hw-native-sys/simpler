@@ -118,6 +118,27 @@ function(add_a2a3_runtime_test name src)
     set_tests_properties(${name} PROPERTIES LABELS "no_hardware")
 endfunction()
 
+function(add_a2a3_orchestrator_runtime_test name src)
+    add_executable(${name}
+        ${src}
+        ${A2A3_RUNTIME_DIR}/pto_orchestrator.cpp
+        ${CMAKE_SOURCE_DIR}/../../../src/common/platform/shared/aicpu/scope_stats_collector_aicpu.cpp
+        ${CMAKE_SOURCE_DIR}/../../../src/common/platform/shared/aicpu/tensor_dump_aicpu.cpp
+    )
+    target_include_directories(${name} PRIVATE
+        ${GTEST_INCLUDE_DIRS}
+        ${CMAKE_SOURCE_DIR}/../../../src/a2a3/runtime
+    )
+    target_link_libraries(${name} PRIVATE
+        a2a3_rt_objs
+        ${GTEST_MAIN_LIB}
+        ${GTEST_LIB}
+        pthread
+    )
+    add_test(NAME ${name} COMMAND ${name})
+    set_tests_properties(${name} PROPERTIES LABELS "no_hardware")
+endfunction()
+
 # ---------------------------------------------------------------------------
 # Distributed runtime sources under test, bundled into an OBJECT library so
 # they compile once and link into every hierarchical test.
@@ -229,6 +250,27 @@ target_include_directories(a5_rt_objs PUBLIC
 function(add_a5_runtime_test name src)
     add_executable(${name} ${src})
     target_include_directories(${name} PRIVATE ${GTEST_INCLUDE_DIRS})
+    target_link_libraries(${name} PRIVATE
+        a5_rt_objs
+        ${GTEST_MAIN_LIB}
+        ${GTEST_LIB}
+        pthread
+    )
+    add_test(NAME ${name} COMMAND ${name})
+    set_tests_properties(${name} PROPERTIES LABELS "no_hardware")
+endfunction()
+
+function(add_a5_orchestrator_runtime_test name src)
+    add_executable(${name}
+        ${src}
+        ${A5_RUNTIME_DIR}/pto_orchestrator.cpp
+        ${CMAKE_SOURCE_DIR}/../../../src/common/platform/shared/aicpu/scope_stats_collector_aicpu.cpp
+        ${CMAKE_SOURCE_DIR}/../../../src/common/platform/shared/aicpu/tensor_dump_aicpu.cpp
+    )
+    target_include_directories(${name} PRIVATE
+        ${GTEST_INCLUDE_DIRS}
+        ${CMAKE_SOURCE_DIR}/../../../src/a5/runtime
+    )
     target_link_libraries(${name} PRIVATE
         a5_rt_objs
         ${GTEST_MAIN_LIB}
@@ -371,6 +413,7 @@ add_a2a3_runtime_test(test_ready_queue      a2a3/test_ready_queue.cpp)
 add_a2a3_runtime_test(test_shared_memory    a2a3/test_shared_memory.cpp)
 add_a2a3_runtime_test(test_a2a3_tensormap   a2a3/test_tensormap.cpp)
 add_a2a3_runtime_test(test_fanin_pool       a2a3/test_fanin_pool.cpp)
+add_a2a3_orchestrator_runtime_test(test_a2a3_orchestrator_fanin a2a3/test_orchestrator_fanin.cpp)
 add_a2a3_runtime_test(test_spsc_queue       a2a3/test_spsc_queue.cpp)
 add_a2a3_runtime_test(test_wiring           a2a3/test_wiring.cpp)
 add_a2a3_runtime_test(test_aicore_completion_mailbox a2a3/test_aicore_completion_mailbox.cpp)
@@ -393,6 +436,7 @@ add_a5_runtime_test(test_a5_ready_queue      a5/test_ready_queue.cpp)
 add_a5_runtime_test(test_a5_shared_memory    a5/test_shared_memory.cpp)
 add_a5_runtime_test(test_a5_tensormap        a5/test_tensormap.cpp)
 add_a5_runtime_test(test_a5_fanin_pool       a5/test_fanin_pool.cpp)
+add_a5_orchestrator_runtime_test(test_a5_orchestrator_fanin a5/test_orchestrator_fanin.cpp)
 add_a5_runtime_test(test_a5_spsc_queue       a5/test_spsc_queue.cpp)
 add_a5_runtime_test(test_a5_wiring           a5/test_wiring.cpp)
 add_a5_runtime_test(test_a5_aicore_completion_mailbox a5/test_aicore_completion_mailbox.cpp)
