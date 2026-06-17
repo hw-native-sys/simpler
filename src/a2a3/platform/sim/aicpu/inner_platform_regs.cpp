@@ -13,14 +13,22 @@
  * @brief Variant-specific platform_regs hooks for simulation (a2a3sim)
  *
  * a2a3 sim and onboard share the same register layout, so read_reg /
- * write_reg live in the shared src/aicpu/platform_regs.cpp. This file
- * exists only for the deinit-timeout split where sim wants a much wider
- * budget than onboard — see platform_regs.h for the rationale.
+ * write_reg live in the shared src/aicpu/platform_regs.cpp. This file holds
+ * the variant-specific hooks: the reg_load_acquire / reg_store_release
+ * handshake-gate accessors (atomic here) and the deinit-timeout budget — see
+ * platform_regs.h for the rationale of each.
  */
 
 #include <cstdint>
 #include "aicpu/platform_regs.h"
 #include "common/platform_config.h"
+
+// Atomic acquire/release: simulated registers are plain host memory shared
+// across the AICPU and AICore host threads, so the access itself must carry
+// happens-before (and be visible to TSAN). See platform_regs.h.
+uint32_t reg_load_acquire(const volatile uint32_t *p) { return __atomic_load_n(p, __ATOMIC_ACQUIRE); }
+
+void reg_store_release(volatile uint32_t *p, uint32_t v) { __atomic_store_n(p, v, __ATOMIC_RELEASE); }
 
 /**
  * @brief Deinit ACK-wait budget on sim: 10 s.

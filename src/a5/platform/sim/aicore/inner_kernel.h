@@ -179,9 +179,13 @@ inline uint64_t read_reg(RegId reg) {
     uint32_t offset = reg_offset(reg);
     volatile uint32_t *ptr = reinterpret_cast<volatile uint32_t *>(sparse_reg_ptr(sim_get_reg_base(), offset));
 
-    uint64_t val = static_cast<uint64_t>(*ptr);
-    OUT_OF_ORDER_LOAD_BARRIER();
-    return val;
+    // The register cell is the AICPU<->AICore handshake gate (dispatch / COND).
+    // In sim it is plain host memory shared across the AICore and AICPU host
+    // threads, so the load itself must be an atomic acquire for happens-before
+    // to hold against the writer's release (and for TSAN to see it). A bare
+    // fence beside a non-atomic load does neither, so __atomic_load_n subsumes
+    // the old OUT_OF_ORDER_LOAD_BARRIER().
+    return static_cast<uint64_t>(__atomic_load_n(ptr, __ATOMIC_ACQUIRE));
 }
 
 /**
@@ -196,8 +200,10 @@ inline void write_reg(RegId reg, uint64_t value) {
     uint32_t offset = reg_offset(reg);
     volatile uint32_t *ptr = reinterpret_cast<volatile uint32_t *>(sparse_reg_ptr(sim_get_reg_base(), offset));
 
-    *ptr = static_cast<uint32_t>(value);
-    OUT_OF_ORDER_STORE_BARRIER();
+    // Atomic release store: publishes any prior stores (e.g. kernel outputs,
+    // the COND task_id payload) before the gate becomes visible to the AICPU's
+    // acquire load. Subsumes the old OUT_OF_ORDER_STORE_BARRIER().
+    __atomic_store_n(ptr, static_cast<uint32_t>(value), __ATOMIC_RELEASE);
 }
 
 /**
