@@ -1099,7 +1099,7 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
         bool prestage_record = l2_swimlane_level_ >= L2SwimlaneLevel::SCHED_PHASES;
         uint64_t prestage_t0 = prestage_record ? get_sys_cnt_aicpu() : 0;
 #endif
-        int32_t prestaged = any_ready_work ? 0 : try_speculative_prestage(thread_idx);
+        [[maybe_unused]] int32_t prestaged = any_ready_work ? 0 : try_speculative_prestage(thread_idx);
 #if PTO2_PROFILING
         // Emit a Prestage bar so a staging-dominated iteration shows as Prestage,
         // not mislabeled Poll (the cheap scan also ran, so the activity-fill would
