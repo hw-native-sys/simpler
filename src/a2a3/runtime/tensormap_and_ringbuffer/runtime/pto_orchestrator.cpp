@@ -336,19 +336,6 @@ static bool check_scope_can_accept_task(PTO2OrchestratorState *orch, PTO2TaskAll
     return false;
 }
 
-static void prefetch_payload(PTO2TaskPayload *payload, int32_t tensor_count, int32_t scalar_count) {
-    for (int32_t i = 0; i < tensor_count; i++) {
-        __builtin_prefetch(&payload->tensors[i], 1, 3);
-        __builtin_prefetch(reinterpret_cast<char *>(&payload->tensors[i]) + 64, 1, 3);
-    }
-    for (int32_t i = 0; i < scalar_count; i += 8) {
-        __builtin_prefetch(&payload->scalars[i], 1, 3);
-    }
-    __builtin_prefetch(payload, 1, 3);
-    __builtin_prefetch(reinterpret_cast<char *>(payload) + 64, 1, 3);
-    __builtin_prefetch(reinterpret_cast<char *>(payload) + 128, 1, 3);
-}
-
 static bool prepare_task(
     PTO2OrchestratorState *orch, const Arg &args, int32_t total_output_size, ActiveMask active_mask,
     PTO2PreparedTask *out
@@ -371,7 +358,7 @@ static bool prepare_task(
     out->task = &orch->sm_header->rings[ring_id].task_descriptors[out->alloc_result.slot];
     out->payload = &orch->sm_header->rings[ring_id].task_payloads[out->alloc_result.slot];
 
-    prefetch_payload(out->payload, args.tensor_count(), args.scalar_count());
+    out->payload->prefetch(args.tensor_count(), args.scalar_count());
 
     // Re-bind payload/task pointers each submit. Value is per-slot constant
     // (same as &task_payloads[slot] / &task_descriptors[slot]), but writing
@@ -383,12 +370,9 @@ static bool prepare_task(
     // slot_state->payload by another thread.
     out->slot_state->bind_buffers(out->payload, out->task);
 
-    // Speculative early-dispatch: copy the codegen hint from the Arg and clear
-    // any stale staging state left in this slot from its previous reuse.
-    out->payload->allow_early_resolve = args.allow_early_resolve();
-    out->payload->spec_state.store(PTO2_SPEC_NONE, std::memory_order_relaxed);
-    // staged_core_mask is (re)cleared by the stager under its STAGING claim before
-    // use, so no reset is needed here.
+    // prepare_task does NO payload writes: all payload content (tensors/scalars +
+    // early-dispatch spec fields) is initialized in PTO2TaskPayload::init, the
+    // single payload-init point, which runs before the scheduler wiring push.
 
     // Fields already reset by advance_ring_pointers (eager reset after CONSUMED):
     //   fanout_lock=0, fanout_count=1, fanout_head=nullptr,
