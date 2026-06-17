@@ -28,10 +28,19 @@ volatile uint32_t *get_reg_ptr(uint64_t reg_base_addr, RegId reg) {
     return reinterpret_cast<volatile uint32_t *>(sparse_reg_ptr(reg_base, reg_offset(reg)));
 }
 
-uint64_t read_reg(uint64_t reg_base_addr, RegId reg) { return static_cast<uint64_t>(*get_reg_ptr(reg_base_addr, reg)); }
+// Atomic acquire/release: simulated registers are plain host memory shared
+// across the AICPU and AICore host threads, so the access itself must carry
+// happens-before (and be visible to TSAN). See platform_regs.h.
+uint32_t reg_load_acquire(const volatile uint32_t *p) { return __atomic_load_n(p, __ATOMIC_ACQUIRE); }
+
+void reg_store_release(volatile uint32_t *p, uint32_t v) { __atomic_store_n(p, v, __ATOMIC_RELEASE); }
+
+uint64_t read_reg(uint64_t reg_base_addr, RegId reg) {
+    return static_cast<uint64_t>(reg_load_acquire(get_reg_ptr(reg_base_addr, reg)));
+}
 
 void write_reg(uint64_t reg_base_addr, RegId reg, uint64_t value) {
-    *get_reg_ptr(reg_base_addr, reg) = static_cast<uint32_t>(value);
+    reg_store_release(get_reg_ptr(reg_base_addr, reg), static_cast<uint32_t>(value));
 }
 
 /**
