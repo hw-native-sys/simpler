@@ -1238,11 +1238,11 @@ def test_worker_remote_memory_api_returns_opaque_handle_and_routes_controls():
             self.calls.append(("malloc", endpoint_id, size))
             return (endpoint_id, 7, 1, int(RemoteAddressSpace.REMOTE_DEVICE), size, 0xCAFE, 0xBEEF, 0)
 
-        def remote_copy_to(self, endpoint_id, buffer_id, generation, offset, src, size):
-            self.calls.append(("copy_to", endpoint_id, buffer_id, generation, offset, src, size))
+        def remote_copy_to(self, endpoint_id, buffer_id, generation, offset, src, size, handle_nbytes):
+            self.calls.append(("copy_to", endpoint_id, buffer_id, generation, offset, src, size, handle_nbytes))
 
-        def remote_copy_from(self, dst, endpoint_id, buffer_id, generation, offset, size):
-            self.calls.append(("copy_from", dst, endpoint_id, buffer_id, generation, offset, size))
+        def remote_copy_from(self, dst, endpoint_id, buffer_id, generation, offset, size, handle_nbytes):
+            self.calls.append(("copy_from", dst, endpoint_id, buffer_id, generation, offset, size, handle_nbytes))
 
         def remote_free(self, endpoint_id, buffer_id, generation):
             self.calls.append(("free", endpoint_id, buffer_id, generation))
@@ -1272,8 +1272,8 @@ def test_worker_remote_memory_api_returns_opaque_handle_and_routes_controls():
         assert handle.released
         assert fake.calls[:4] == [
             ("malloc", endpoint, 4),
-            ("copy_to", endpoint, 7, 1, 0, ctypes.addressof(src), 4),
-            ("copy_from", ctypes.addressof(dst), endpoint, 7, 1, 0, 4),
+            ("copy_to", endpoint, 7, 1, 0, ctypes.addressof(src), 4, 4),
+            ("copy_from", ctypes.addressof(dst), endpoint, 7, 1, 0, 4, 4),
             ("free", endpoint, 7, 1),
         ]
         with pytest.raises(RuntimeError, match="released"):

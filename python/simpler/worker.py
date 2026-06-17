@@ -1611,7 +1611,13 @@ class Worker:
             raise ValueError("Worker.remote_copy_to range exceeds RemoteBufferHandle.nbytes")
         assert self._worker is not None
         self._worker.remote_copy_to(
-            handle.endpoint_id, handle._buffer_id, handle._generation, start, self._host_ptr_value(host_ptr), size
+            handle.endpoint_id,
+            handle._buffer_id,
+            handle._generation,
+            start,
+            self._host_ptr_value(host_ptr),
+            size,
+            handle.nbytes,
         )
 
     def remote_copy_from(self, handle: RemoteBufferHandle, host_ptr: Any, nbytes: int, *, offset: int = 0) -> None:
@@ -1626,7 +1632,13 @@ class Worker:
             raise ValueError("Worker.remote_copy_from range exceeds RemoteBufferHandle.nbytes")
         assert self._worker is not None
         self._worker.remote_copy_from(
-            self._host_ptr_value(host_ptr), handle.endpoint_id, handle._buffer_id, handle._generation, start, size
+            self._host_ptr_value(host_ptr),
+            handle.endpoint_id,
+            handle._buffer_id,
+            handle._generation,
+            start,
+            size,
+            handle.nbytes,
         )
 
     def remote_export(
@@ -1660,6 +1672,7 @@ class Worker:
             size,
             flags,
             str(transport_profile),
+            handle.nbytes,
         )
         return RemoteBufferExport(
             owner_endpoint_id=int(fields[0]),
