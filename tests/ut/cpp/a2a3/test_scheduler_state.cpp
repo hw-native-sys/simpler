@@ -29,6 +29,13 @@ protected:
     DeviceArena sm_arena;
     DeviceArena sched_arena;
 
+    // Each init_slot()'d slot gets a distinct zeroed payload from this pool,
+    // mirroring orch::prepare_task's bind_buffers: every production slot has a
+    // payload, and the scheduler's release/propagate paths dereference it.
+    static constexpr int kSlotPayloadPoolSize = 16;
+    PTO2TaskPayload slot_payload_pool_[kSlotPayloadPoolSize];
+    int slot_payload_pool_idx_ = 0;
+
     void SetUp() override {
         sm_handle = PTO2SharedMemoryHandle::create_and_init_default(sm_arena);
         ASSERT_NE(sm_handle, nullptr);
@@ -60,6 +67,9 @@ protected:
         slot.completed_subtasks.store(0);
         slot.total_required_subtasks = 1;
         slot.logical_block_num = 1;
+        PTO2TaskPayload &slot_pl = slot_payload_pool_[slot_payload_pool_idx_++ % kSlotPayloadPoolSize];
+        memset(&slot_pl, 0, sizeof(slot_pl));
+        slot.payload = &slot_pl;
     }
 };
 

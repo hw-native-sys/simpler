@@ -948,7 +948,6 @@ struct PTO2SchedulerState {
         p.unlock_fanout();
         for (; edge != nullptr; edge = edge->next) {
             PTO2TaskSlotState *c = edge->slot_state;
-            if (c->payload == nullptr) continue;
             // Compare to fanin_actual_count (the real producer-edge count), NOT
             // fanin_count: fanin_count = fanin_actual_count + 1 (a self/wiring +1 that
             // ready_fanin gets but dispatch_fanin does not). dispatch_fanin starts at
