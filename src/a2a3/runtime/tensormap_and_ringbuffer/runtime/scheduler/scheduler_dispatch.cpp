@@ -625,20 +625,28 @@ int32_t SchedulerContext::stage_consumer_blocks(
     int32_t staged = 0;
     int32_t block = start;
     auto stage_from = [&](CoreTracker::BitStates &avail, bool to_pending) {
+        // Mirror the normal flush_publish (scheduler_dispatch.cpp wmb()+publish loop):
+        // prepare all claimed blocks' payloads, one wmb(), then publish. The wmb
+        // guarantees the not_ready gate + args are globally visible before any
+        // DATA_MAIN_BASE token — without it a gated core can pick up the token and
+        // dcci a stale payload (the doorbell/release path mirrors normal dispatch).
+        PublishHandle handles[CoreTracker::MAX_CLUSTERS * 3];
+        int n = 0;
         while (count > 0 && avail.has_value()) {
             int32_t core_offset = avail.pop_first();
-            PublishHandle handles[CoreTracker::MAX_CLUSTERS * 3];
-            int n = prepare_block_for_dispatch(thread_idx, core_offset, *c, shape, to_pending, block, handles);
-            for (int i = 0; i < n; i++) {
-                publish_subtask_to_core(handles[i], prestage_ts);
-                int32_t cid = tracker.get_core_id_by_offset(handles[i].core_offset);
-                sched_->spec_doorbell_table[cid].addr = handles[i].reg_addr;
-                sched_->spec_doorbell_table[cid].token = handles[i].reg_task_id;
-                my_cores[cid >> 6] |= (1ULL << (cid & 63));
-            }
+            n += prepare_block_for_dispatch(thread_idx, core_offset, *c, shape, to_pending, block, &handles[n]);
             block++;
             count--;
             staged++;
+        }
+        if (n == 0) return;
+        wmb();
+        for (int i = 0; i < n; i++) {
+            publish_subtask_to_core(handles[i], prestage_ts);
+            int32_t cid = tracker.get_core_id_by_offset(handles[i].core_offset);
+            sched_->spec_doorbell_table[cid].addr = handles[i].reg_addr;
+            sched_->spec_doorbell_table[cid].token = handles[i].reg_task_id;
+            my_cores[cid >> 6] |= (1ULL << (cid & 63));
         }
     };
     if (idle.has_value()) stage_from(idle, /*to_pending=*/false);
