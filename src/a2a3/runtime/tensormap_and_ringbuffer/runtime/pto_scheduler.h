@@ -345,8 +345,10 @@ struct PTO2SchedulerLayout
     size_t off_ready_queue_slots[PTO2_NUM_RESOURCE_SHAPES];
     size_t off_dummy_ready_queue_slots;
     size_t off_pending_spsc_buffer;
+    size_t off_pending_buffer;
     uint64_t ready_queue_capacity;
     uint64_t spsc_capacity;
+    uint64_t pending_capacity;
 };
 
 struct PTO2SchedulerState
@@ -406,9 +408,11 @@ struct PTO2SchedulerState
     // the dispatch loop and completed inline -- never goes to AICore.
     PTO2ReadyQueue dummy_ready_queue;
 
-    // Thread 0 exclusive: intrusive pending list of tasks awaiting fanin
-    // readiness. SPSC queue receives slot_states from the orchestrator; thread 0
-    // drains them into the pending list and polls fanin producers' task_state.
+    // Thread 0 exclusive: circular FIFO of tasks awaiting fanin readiness.
+    // SPSC queue receives slot_states from the orchestrator; thread 0 drains
+    // them into the pending ring and polls fanin readiness. Storing the FIFO
+    // out of band (instead of intrusively in PTO2TaskSlotState) keeps the
+    // task struct free of scheduler-private state.
     struct alignas(64) PendingState
     {
         static constexpr int BACKOFF_LIMIT = 32;
@@ -416,9 +420,11 @@ struct PTO2SchedulerState
         static constexpr int POLL_MAX_PER_ITER = 128;
 
         // --- Thread 0 exclusive ---
-        PTO2TaskSlotState *pending_head{nullptr};
-        PTO2TaskSlotState *pending_tail{nullptr};
-        int32_t pending_count{0};
+        PTO2TaskSlotState **pending_buf{nullptr};  // capacity slots, arena-owned
+        uint32_t pending_cap{0};
+        uint32_t pending_mask{0};
+        uint32_t pending_head_idx{0};  // next pop
+        uint32_t pending_tail_idx{0};  // next push
         int backoff_counter{0};
         PTO2TaskSlotState *drain_buf[DRAIN_BATCH];
 
@@ -427,6 +433,9 @@ struct PTO2SchedulerState
 
         // --- Orchestrator write, thread 0 read ---
         alignas(64) std::atomic<bool> orch_needs_drain{false};
+
+        uint32_t pending_count() const { return pending_tail_idx - pending_head_idx; }
+        bool pending_empty() const { return pending_tail_idx == pending_head_idx; }
     } wiring;
 
     alignas(64) AsyncWaitList async_wait_list;
@@ -438,25 +447,19 @@ struct PTO2SchedulerState
         else ready_queues[static_cast<int32_t>(shape)].push(slot_state);
     }
 
-    // Append slot to the tail of the intrusive pending list.
+    // Append slot to the tail of the pending FIFO.
     void pending_push_back(PTO2TaskSlotState *s)
     {
-        s->next_pending = nullptr;
-        if (wiring.pending_tail) wiring.pending_tail->next_pending = s;
-        else wiring.pending_head = s;
-        wiring.pending_tail = s;
-        wiring.pending_count++;
+        wiring.pending_buf[wiring.pending_tail_idx & wiring.pending_mask] = s;
+        wiring.pending_tail_idx++;
     }
 
-    // Pop the head of the pending list (or nullptr).
+    // Pop the head of the pending FIFO (or nullptr).
     PTO2TaskSlotState *pending_pop_front()
     {
-        PTO2TaskSlotState *s = wiring.pending_head;
-        if (s == nullptr) return nullptr;
-        wiring.pending_head = s->next_pending;
-        if (wiring.pending_head == nullptr) wiring.pending_tail = nullptr;
-        s->next_pending = nullptr;
-        wiring.pending_count--;
+        if (wiring.pending_empty()) return nullptr;
+        PTO2TaskSlotState *s = wiring.pending_buf[wiring.pending_head_idx & wiring.pending_mask];
+        wiring.pending_head_idx++;
         return s;
     }
 
@@ -477,12 +480,12 @@ struct PTO2SchedulerState
     // 0 signals no productive work.
     int drain_wiring_queue(bool force_drain = false)
     {
-        // Stage 1: drain SPSC → pending list tail
+        // Stage 1: drain SPSC → pending FIFO tail
         int drained = wiring.queue.pop_batch(wiring.drain_buf, PendingState::DRAIN_BATCH);
         for (int i = 0; i < drained; i++) pending_push_back(wiring.drain_buf[i]);
 
         // Backoff when nothing to do and orchestrator isn't pressing
-        if (drained == 0 && wiring.pending_head == nullptr)
+        if (drained == 0 && wiring.pending_empty())
         {
             if (!force_drain && !wiring.orch_needs_drain.load(std::memory_order_acquire) && wiring.backoff_counter < PendingState::BACKOFF_LIMIT)
             {
@@ -492,9 +495,9 @@ struct PTO2SchedulerState
         }
         wiring.backoff_counter = 0;
 
-        // Stage 2: poll pending list, route ready tasks
+        // Stage 2: poll pending FIFO, route ready tasks
         int routed = 0;
-        int to_visit = wiring.pending_count;
+        int to_visit = static_cast<int>(wiring.pending_count());
         if (to_visit > PendingState::POLL_MAX_PER_ITER) to_visit = PendingState::POLL_MAX_PER_ITER;
         for (int i = 0; i < to_visit; i++)
         {
@@ -580,10 +583,12 @@ struct PTO2SchedulerState
         PTO2SchedulerLayout layout{};
         layout.ready_queue_capacity = PTO2_READY_QUEUE_SIZE;
         layout.spsc_capacity = PTO2_WRIRING_QUEUE_SIZE;
+        layout.pending_capacity = PTO2_TASK_WINDOW_SIZE;  // bounded by per-ring slot window
 
         for (int i = 0; i < PTO2_NUM_RESOURCE_SHAPES; i++) layout.off_ready_queue_slots[i] = ready_queue_reserve_layout(arena, PTO2_READY_QUEUE_SIZE);
         layout.off_dummy_ready_queue_slots = ready_queue_reserve_layout(arena, PTO2_READY_QUEUE_SIZE);
         layout.off_pending_spsc_buffer = PTO2SpscQueue::reserve_layout(arena, PTO2_WRIRING_QUEUE_SIZE);
+        layout.off_pending_buffer = arena.reserve(layout.pending_capacity * sizeof(PTO2TaskSlotState *), PTO2_ALIGN_SIZE);
         return layout;
     }
 
@@ -600,9 +605,13 @@ struct PTO2SchedulerState
         if (!ready_queue_init_data_from_layout(&sched->dummy_ready_queue, arena, layout.off_dummy_ready_queue_slots, layout.ready_queue_capacity)) return false;
 
         if (!sched->wiring.queue.init_data_from_layout(arena, layout.off_pending_spsc_buffer, layout.spsc_capacity)) return false;
-        sched->wiring.pending_head = nullptr;
-        sched->wiring.pending_tail = nullptr;
-        sched->wiring.pending_count = 0;
+
+        if (layout.pending_capacity == 0 || (layout.pending_capacity & (layout.pending_capacity - 1)) != 0) return false;
+        sched->wiring.pending_buf = static_cast<PTO2TaskSlotState **>(arena.region_ptr(layout.off_pending_buffer));
+        sched->wiring.pending_cap = static_cast<uint32_t>(layout.pending_capacity);
+        sched->wiring.pending_mask = sched->wiring.pending_cap - 1;
+        sched->wiring.pending_head_idx = 0;
+        sched->wiring.pending_tail_idx = 0;
         sched->wiring.backoff_counter = 0;
 
         return true;
@@ -614,6 +623,7 @@ struct PTO2SchedulerState
         for (int i = 0; i < PTO2_NUM_RESOURCE_SHAPES; i++) ready_queue_wire_arena_pointers(&sched->ready_queues[i], arena, layout.off_ready_queue_slots[i]);
         ready_queue_wire_arena_pointers(&sched->dummy_ready_queue, arena, layout.off_dummy_ready_queue_slots);
         sched->wiring.queue.wire_arena_pointers(arena, layout.off_pending_spsc_buffer);
+        sched->wiring.pending_buf = static_cast<PTO2TaskSlotState **>(arena.region_ptr(layout.off_pending_buffer));
     }
 
     // Forget per-region pointers; arena owns the backing memory.
@@ -622,6 +632,7 @@ struct PTO2SchedulerState
         PTO2SchedulerState *sched = this;
         for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) sched->ring_sched_states[r].destroy();
         sched->wiring.queue.destroy();
+        sched->wiring.pending_buf = nullptr;
         for (int i = 0; i < PTO2_NUM_RESOURCE_SHAPES; i++) ready_queue_destroy(&sched->ready_queues[i]);
         ready_queue_destroy(&sched->dummy_ready_queue);
     }

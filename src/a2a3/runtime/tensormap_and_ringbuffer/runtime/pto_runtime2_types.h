@@ -173,9 +173,6 @@ struct alignas(64) PTO2TaskSlotState
     PTO2TaskPayload *payload;
     PTO2TaskDescriptor *task;
 
-    // Intrusive linkage for the thread-0 pending-readiness queue.
-    PTO2TaskSlotState *next_pending{nullptr};
-
     // --- Set per-submit (depend on task inputs) ---
     ActiveMask active_mask;  // Bitmask of active subtask slots (set once)
     uint8_t ring_id;         // Ring layer (immutable after init)
@@ -203,7 +200,6 @@ struct alignas(64) PTO2TaskSlotState
         completed_subtasks.store(0, std::memory_order_relaxed);
         next_block_idx = 0;
         any_subtask_deferred.store(false, std::memory_order_relaxed);
-        next_pending = nullptr;
         // last_consumer_local_id is reset in prepare_task once the task_id is known.
     }
 };
