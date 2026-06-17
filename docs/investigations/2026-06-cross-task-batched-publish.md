@@ -123,6 +123,42 @@ The qwen3 metrics validate the workload class the doc's original
 (50 single-AIC `out_proj` tasks ready together) and kernel duration
 short enough (~22 µs each) that the per-task wmb cost matters.
 
+## Root cause found (2026-06-16) — drain ack-barrier had no `completed_` escape
+
+The "exact race window was not pinpointed" note above is now resolved. The
+507018 was **not** fundamentally about batched-publish timing — that change
+only widened an existing window. The real defect is a liveness bug in the
+sync_start drain protocol (`SchedulerContext::handle_drain_mode`):
+
+the three drain spin-waits (sentinel wait, **ack barrier**, non-elected wait)
+require all `active_sched_threads_` to keep participating, but a scheduler
+thread leaves the dispatch loop (`SchedulerContext::resolve_and_dispatch`) the
+instant `completed_` latches — at the loop-top check or via
+`SchedulerContext::handle_orchestrator_exit`. A thread that
+enters the ack barrier in the window where its peers are exiting on
+`completed_` waits forever for acks that can never arrive. The in-runtime 2 s
+watchdog can't catch it (it lives in the dispatch loop's idle path, not inside
+the barrier spin), so the hang escalates to the 3 s STARS op-exec timeout →
+507018 → device poison → force-reset.
+
+`spmd_sync_start_stress` is the only test that hits it because it is the sole
+case that maximizes all four required factors simultaneously: many drain
+cycles (24 sync tasks), concurrent normal tasks occupying cores (forces the
+drain *retry* state to linger), cross-shape MIX+AIV contention on the single
+drain slot, and a long multi-round tail that produces thread skew. `--rounds N`
+multiplies the per-run hit probability. Pure sync_start tests dispatch their
+drains instantly (resources always available) so the barrier is a sub-µs
+transient; siblings with contention (`spmd_starvation`) have too few drain
+cycles.
+
+**Fix**: every drain spin now honors `is_completed()` and returns when the run
+has latched `completed_`, mirroring the existing escape in
+`SchedulerContext::handle_core_transition`. Abandoning a drain under
+`completed_` is safe — any
+pending sync_start task is either already dispatched (a stale re-popped slot)
+or moot under teardown, and `deinit()` resets `drain_state_` before the next
+run. Applied to both a2a3 and a5.
+
 ## References
 
 - PR #989 (this PR): where per-task batched publish + the sync_start-
