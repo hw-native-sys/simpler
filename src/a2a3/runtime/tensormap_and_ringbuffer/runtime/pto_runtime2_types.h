@@ -66,9 +66,10 @@ constexpr uint64_t PTO2_TENSOR_DATA_TIMEOUT_CYCLES = 15 * 1000 * 1000 * 1000ULL;
 
 typedef enum
 {
-    PTO2_TASK_PENDING = 0,    // Submitted; awaiting fanin, queued, or dispatched
-    PTO2_TASK_COMPLETED = 1,  // Execution finished, output may still be in use
-    PTO2_TASK_CONSUMED = 2    // Output fully consumed, buffers can be released
+    PTO2_TASK_PENDING = 0,   // Submitted; awaiting fanin, queued, or dispatched
+    PTO2_TASK_COMPLETED = 1  // Execution finished; per-ring completed_watermark
+                             // advances past this slot's last_consumer_local_id
+                             // to make its heap chunk reclaimable.
 } PTO2TaskState;
 
 struct PTO2TaskAllocResult
@@ -153,14 +154,17 @@ static_assert(sizeof(PTO2TaskPayload) == offsetof(PTO2TaskPayload, scalars) + MA
 
 struct alignas(64) PTO2TaskSlotState
 {
-    // Fanout: tracks producer->CONSUMED transition. Incremented by the
-    // orchestrator (+1 sentinel and once per consumer of this slot) and
-    // matched by release_producer in on_task_release.
-    int32_t fanout_count;
-    std::atomic<int32_t> fanout_refcount;
+    // Highest local task id among this slot's consumers. Set to this slot's
+    // own local_id in prepare_task; bumped via max() in submit_task_common for
+    // each consumer that has this slot as a fanin. The slot's heap chunk is
+    // safe to reclaim when the per-ring completed_watermark reaches at least
+    // this id (i.e. every task up to and including the last consumer has
+    // transitioned to COMPLETED). Single-writer (orchestrator) at submit time.
+    int32_t last_consumer_local_id;
 
-    // Task state (PENDING/COMPLETED/CONSUMED). Polling readiness reads
-    // task_state on producer slots.
+    // Task state (PENDING/COMPLETED). Polling readiness reads task_state on
+    // producer slots; reclamation gates on the completed_watermark instead of
+    // a separate CONSUMED transition.
     std::atomic<PTO2TaskState> task_state;
 
     PTO2TaskPayload *payload;
@@ -193,12 +197,11 @@ struct alignas(64) PTO2TaskSlotState
 
     void reset_for_reuse()
     {
-        fanout_count = 1;
-        fanout_refcount.store(0, std::memory_order_relaxed);
         completed_subtasks.store(0, std::memory_order_relaxed);
         next_block_idx = 0;
         any_subtask_deferred.store(false, std::memory_order_relaxed);
         next_pending = nullptr;
+        // last_consumer_local_id is reset in prepare_task once the task_id is known.
     }
 };
 

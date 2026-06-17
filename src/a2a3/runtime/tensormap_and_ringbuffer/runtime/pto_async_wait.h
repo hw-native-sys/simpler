@@ -168,9 +168,6 @@ struct AsyncWaitList
     {
         PTO2SchedulerState *sched{nullptr};
         PTO2LocalReadyBuffer *local_bufs{nullptr};
-        PTO2TaskSlotState **deferred_release_slot_states{nullptr};
-        int32_t *deferred_release_count{nullptr};
-        int32_t deferred_release_capacity{0};
         int32_t inline_completed{0};
 
         bool can_inline_complete() const
@@ -179,8 +176,7 @@ struct AsyncWaitList
         }
     };
 
-    // Inline-complete a NotDeferred task during drain. Returns false on
-    // deferred_release_slot_states overflow.
+    // Inline-complete a NotDeferred task during drain.
     bool try_inline_complete_locked(DrainCompletionSink &sink, PTO2TaskSlotState &slot_state);
 
     int32_t drain_aicore_completion_mailbox_locked(AICoreCompletionMailbox *aicore_mailbox, DrainCompletionSink &sink, int32_t &error_code)
@@ -270,7 +266,7 @@ struct AsyncWaitList
     }
 
     template <bool Profiling>
-    AsyncPollResult poll_and_complete(AICoreCompletionMailbox *aicore_mailbox, PTO2SchedulerState *sched, PTO2LocalReadyBuffer *local_bufs, PTO2TaskSlotState **deferred_release_slot_states, int32_t &deferred_release_count, int32_t deferred_release_capacity);
+    AsyncPollResult poll_and_complete(AICoreCompletionMailbox *aicore_mailbox, PTO2SchedulerState *sched, PTO2LocalReadyBuffer *local_bufs);
 };
 
 #endif  // PTO_ASYNC_WAIT_H

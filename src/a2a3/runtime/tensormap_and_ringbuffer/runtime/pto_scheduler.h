@@ -378,13 +378,18 @@ struct PTO2SchedulerState
 
         void advance_ring_pointers()
         {
-            int32_t current_task_index = ring->fc.current_task_index.load(std::memory_order_acquire);
+            const int32_t watermark = ring->completed_watermark.load(std::memory_order_acquire);
             int32_t old_last_task_alive = last_task_alive;
 
-            while (last_task_alive < current_task_index)
+            // Retire any slot at the tail whose last consumer is at or below
+            // the global completed watermark — i.e. every consumer of this
+            // producer has reached COMPLETED. Implies this slot itself is
+            // COMPLETED because the seed value of last_consumer_local_id is
+            // the slot's own local_id.
+            while (last_task_alive <= watermark)
             {
                 PTO2TaskSlotState &slot_state = ring->get_slot_state_by_task_id(last_task_alive);
-                if (slot_state.task_state.load(std::memory_order_acquire) != PTO2_TASK_CONSUMED) break;
+                if (watermark < slot_state.last_consumer_local_id) break;
                 last_task_alive++;
             }
 
@@ -506,29 +511,6 @@ struct PTO2SchedulerState
         return drained + routed;
     }
 
-    void check_and_handle_consumed(PTO2TaskSlotState &slot_state)
-    {
-        if (slot_state.fanout_refcount.load(std::memory_order_acquire) != slot_state.fanout_count) return;
-
-        PTO2TaskState expected = PTO2_TASK_COMPLETED;
-        if (!slot_state.task_state.compare_exchange_strong(expected, PTO2_TASK_CONSUMED, std::memory_order_acq_rel, std::memory_order_acquire)) return;
-
-        int32_t ring_id = slot_state.ring_id;
-        // Try-lock — if another thread is advancing this ring, it will scan our CONSUMED task
-        int32_t expected_lock = 0;
-        if (ring_sched_states[ring_id].advance_lock.compare_exchange_strong(expected_lock, 1, std::memory_order_acquire, std::memory_order_relaxed))
-        {
-            ring_sched_states[ring_id].advance_ring_pointers();
-            ring_sched_states[ring_id].advance_lock.store(0, std::memory_order_release);
-        }
-    }
-
-    void release_producer(PTO2TaskSlotState &slot_state)
-    {
-        slot_state.fanout_refcount.fetch_add(1, std::memory_order_acq_rel);
-        check_and_handle_consumed(slot_state);
-    }
-
     int get_ready_tasks_batch(PTO2ResourceShape shape, PTO2LocalReadyBuffer &local_buf, PTO2TaskSlotState **out, int max_count)
     {
         int count = 0;
@@ -538,44 +520,49 @@ struct PTO2SchedulerState
         return count;
     }
 
-    void on_scope_end(PTO2TaskSlotState **task_slot_states, int32_t count)
-    {
-        if (count > 0) __builtin_prefetch(task_slot_states[0], 1, 0);
-        for (int32_t i = 0; i < count; i++)
-        {
-            if (i + 1 < count) __builtin_prefetch(task_slot_states[i + 1], 1, 0);
-            release_producer(*task_slot_states[i]);
-        }
-    }
-
     bool on_subtask_complete(PTO2TaskSlotState &slot_state)
     {
         int16_t prev = slot_state.completed_subtasks.fetch_add(1, std::memory_order_acq_rel);
         return (prev + 1) == slot_state.total_required_subtasks;
     }
 
-    void on_mixed_task_complete(
-        PTO2TaskSlotState &slot_state,
-
-        [[maybe_unused]] PTO2LocalReadyBuffer *local_bufs = nullptr
-    )
+    // Publish this slot as COMPLETED, then advance the per-ring monotonic
+    // completed_watermark — the highest local_id W such that every task
+    // 0..W has reached COMPLETED. Reclamation in advance_ring_pointers gates
+    // on watermark >= producer.last_consumer_local_id, so no consumer→producer
+    // notification edge is needed.
+    void on_mixed_task_complete(PTO2TaskSlotState &slot_state, [[maybe_unused]] PTO2LocalReadyBuffer *local_bufs = nullptr)
     {
-        // Polling model: just publish COMPLETED. Thread 0's pending-poll loop
-        // observes producer task_state and routes consumers when their fanin
-        // is satisfied.
         slot_state.task_state.store(PTO2_TASK_COMPLETED, std::memory_order_release);
-    }
 
-    int32_t on_task_release(PTO2TaskSlotState &slot_state)
-    {
-        PTO2TaskPayload *payload = slot_state.payload;
-        for_each_fanin_slot_state(*payload, [&](PTO2TaskSlotState *producer_slot_state) {
-            release_producer(*producer_slot_state);
-        });
+        const int32_t my_id = static_cast<int32_t>(slot_state.task->task_id.local());
+        int32_t ring_id = slot_state.ring_id;
+        auto &rss = ring_sched_states[ring_id];
+        auto &ring = *rss.ring;
 
-        // Self consumed check
-        check_and_handle_consumed(slot_state);
-        return payload->fanin_count;
+        // CAS-advance the watermark, bounded by my_id (which we know is
+        // published since we just completed it). If a forward task we observe
+        // as COMPLETED is also published, but a gap remains, we stop — the
+        // task filling the gap will resume the walk when it completes.
+        int32_t w = ring.completed_watermark.load(std::memory_order_acquire);
+        while (w < my_id)
+        {
+            int32_t next = w + 1;
+            PTO2TaskSlotState &cand = ring.get_slot_state_by_task_id(next);
+            if (cand.task_state.load(std::memory_order_acquire) != PTO2_TASK_COMPLETED) break;
+            if (ring.completed_watermark.compare_exchange_weak(w, next, std::memory_order_acq_rel, std::memory_order_acquire))
+            {
+                w = next;
+            }
+        }
+
+        // Try to retire slots whose last consumer has reached COMPLETED.
+        int32_t expected_lock = 0;
+        if (rss.advance_lock.compare_exchange_strong(expected_lock, 1, std::memory_order_acquire, std::memory_order_relaxed))
+        {
+            rss.advance_ring_pointers();
+            rss.advance_lock.store(0, std::memory_order_release);
+        }
     }
 
     // === Cold-path API ===
@@ -642,15 +629,12 @@ struct PTO2SchedulerState
 inline bool AsyncWaitList::try_inline_complete_locked(AsyncWaitList::DrainCompletionSink &sink, PTO2TaskSlotState &slot_state)
 {
     sink.sched->on_mixed_task_complete(slot_state, sink.local_bufs);
-    if (*sink.deferred_release_count >= sink.deferred_release_capacity)
-        while (*sink.deferred_release_count > 0) sink.sched->on_task_release(*sink.deferred_release_slot_states[--(*sink.deferred_release_count)]);
-    sink.deferred_release_slot_states[(*sink.deferred_release_count)++] = &slot_state;
     sink.inline_completed++;
     return true;
 }
 
 template <bool Profiling>
-inline AsyncPollResult AsyncWaitList::poll_and_complete(AICoreCompletionMailbox *aicore_mailbox, PTO2SchedulerState *sched, PTO2LocalReadyBuffer *local_bufs, PTO2TaskSlotState **deferred_release_slot_states, int32_t &deferred_release_count, int32_t deferred_release_capacity)
+inline AsyncPollResult AsyncWaitList::poll_and_complete(AICoreCompletionMailbox *aicore_mailbox, PTO2SchedulerState *sched, PTO2LocalReadyBuffer *local_bufs)
 {
     AsyncPollResult result;
     if (!try_lock()) return result;
@@ -658,9 +642,6 @@ inline AsyncPollResult AsyncWaitList::poll_and_complete(AICoreCompletionMailbox 
     AsyncWaitList::DrainCompletionSink sink{};
     sink.sched = sched;
     sink.local_bufs = local_bufs;
-    sink.deferred_release_slot_states = deferred_release_slot_states;
-    sink.deferred_release_count = &deferred_release_count;
-    sink.deferred_release_capacity = deferred_release_capacity;
 
     int32_t drain_err = PTO2_ERROR_NONE;
     drain_aicore_completion_mailbox_locked(aicore_mailbox, sink, drain_err);
@@ -708,9 +689,6 @@ inline AsyncPollResult AsyncWaitList::poll_and_complete(AICoreCompletionMailbox 
         if (entry.normal_done && entry.waiting_completion_count <= 0)
         {
             sched->on_mixed_task_complete(*entry.slot_state, local_bufs);
-            if (deferred_release_count >= deferred_release_capacity)
-                while (deferred_release_count > 0) sched->on_task_release(*deferred_release_slot_states[--deferred_release_count]);
-            deferred_release_slot_states[deferred_release_count++] = entry.slot_state;
             result.completed++;
 
             int32_t last = count - 1;

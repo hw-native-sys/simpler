@@ -39,6 +39,12 @@ struct alignas(64) PTO2SharedMemoryRingHeader
 {
     PTO2RingFlowControl fc;
 
+    // Highest task_id such that every task with id in [0, completed_watermark]
+    // has reached COMPLETED. Maintained at task-completion time. Used to gate
+    // slot reclamation: a producer slot P is safe to retire when
+    // completed_watermark >= P.last_consumer_local_id.
+    alignas(64) std::atomic<int32_t> completed_watermark;
+
     // Layout metadata (set once at init)
     uint64_t task_window_size;
     int32_t task_window_mask;
@@ -223,7 +229,13 @@ private:
     void init_header_per_ring(const uint64_t task_window_sizes[PTO2_MAX_RING_DEPTH], const uint64_t heap_sizes[PTO2_MAX_RING_DEPTH])
     {
         // Per-ring flow control (start at 0)
-        for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) header->rings[r].fc.init();
+        for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++)
+        {
+            header->rings[r].fc.init();
+            // -1 = "no task completed yet"; first task to complete (local_id 0)
+            // will advance the watermark to 0.
+            header->rings[r].completed_watermark.store(-1, std::memory_order_relaxed);
+        }
 
         header->orchestrator_done.store(0, std::memory_order_relaxed);
 

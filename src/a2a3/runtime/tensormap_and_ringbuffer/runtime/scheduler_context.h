@@ -36,8 +36,6 @@
 #define unlikely(x) __builtin_expect(!!(x), 0)
 #endif
 
-inline constexpr int32_t PTO2_DEFERRED_RELEASE_CAP = 256;
-
 inline void latch_scheduler_error(PTO2SharedMemoryHeader *header, int32_t thread_idx, int32_t error_code)
 {
     if (header == nullptr || error_code == PTO2_ERROR_NONE) return;
@@ -224,8 +222,6 @@ public:
         PTO2TaskSlotState *local_ptrs[PTO2_NUM_RESOURCE_SHAPES][LOCAL_READY_CAP_PER_TYPE];
         PTO2LocalReadyBuffer local_bufs[PTO2_NUM_RESOURCE_SHAPES];
         for (int32_t i = 0; i < PTO2_NUM_RESOURCE_SHAPES; i++) local_bufs[i].reset(local_ptrs[i], LOCAL_READY_CAP_PER_TYPE);
-        PTO2TaskSlotState *deferred_release_slot_states[PTO2_DEFERRED_RELEASE_CAP];
-        int32_t deferred_release_count = 0;
 
         bool cores_released = false;
 
@@ -254,7 +250,7 @@ public:
             int32_t completed_this_turn = 0;
 
             bool try_completed = tracker.has_any_running_cores();
-            if (try_completed) check_running_cores_for_completion(thread_idx, hank, completed_this_turn, cur_thread_completed, made_progress, deferred_release_slot_states, deferred_release_count, local_bufs);
+            if (try_completed) check_running_cores_for_completion(thread_idx, hank, completed_this_turn, cur_thread_completed, made_progress, local_bufs);
             if (completed_this_turn > 0)
             {
                 int32_t prev = completed_tasks_.fetch_add(completed_this_turn, std::memory_order_relaxed);
@@ -269,7 +265,7 @@ public:
 
             if (rt_ != nullptr && rt_->aicore_mailbox != nullptr && (sched_->async_wait_list.count > 0 || rt_->aicore_mailbox->has_pending()))
             {
-                AsyncPollResult poll_result = sched_->async_wait_list.poll_and_complete<false>(rt_->aicore_mailbox, sched_, local_bufs, deferred_release_slot_states, deferred_release_count, PTO2_DEFERRED_RELEASE_CAP);
+                AsyncPollResult poll_result = sched_->async_wait_list.poll_and_complete<false>(rt_->aicore_mailbox, sched_, local_bufs);
                 if (poll_result.error_code != PTO2_ERROR_NONE)
                 {
                     int32_t expected = PTO2_ERROR_NONE;
@@ -311,9 +307,6 @@ public:
                 {
                     PTO2TaskSlotState &dummy_slot = *dummy_batch[di];
                     sched_->on_mixed_task_complete(dummy_slot, local_bufs);
-                    deferred_release_slot_states[deferred_release_count++] = &dummy_slot;
-                    if (deferred_release_count >= PTO2_DEFERRED_RELEASE_CAP)
-                        while (deferred_release_count > 0) sched_->on_task_release(*deferred_release_slot_states[--deferred_release_count]);
                     int32_t prev = completed_tasks_.fetch_add(1, std::memory_order_relaxed);
                     last_progress_count = prev + 1;
                     cur_thread_completed++;
@@ -335,7 +328,6 @@ public:
             }
             else
             {
-                while (deferred_release_count > 0) sched_->on_task_release(*deferred_release_slot_states[--deferred_release_count]);
                 idle_iterations++;
 
                 if (idle_iterations % FATAL_ERROR_CHECK_INTERVAL == 0)
@@ -355,8 +347,6 @@ public:
                 SPIN_WAIT_HINT();
             }
         }
-
-        while (deferred_release_count > 0) sched_->on_task_release(*deferred_release_slot_states[--deferred_release_count]);
 
         return cur_thread_completed;
     }
@@ -1089,7 +1079,7 @@ private:
         return t;
     }
 
-    void complete_slot_task(PTO2TaskSlotState &slot_state, int32_t expected_reg_task_id, int32_t core_id, Handshake *hank, int32_t &completed_this_turn, PTO2TaskSlotState *deferred_release_slot_states[], int32_t &deferred_release_count, PTO2LocalReadyBuffer *local_bufs)
+    void complete_slot_task(PTO2TaskSlotState &slot_state, int32_t expected_reg_task_id, int32_t core_id, Handshake *hank, int32_t &completed_this_turn, PTO2LocalReadyBuffer *local_bufs)
     {
         (void)hank;
         AICoreCompletionMailbox *mailbox = rt_ != nullptr ? rt_->aicore_mailbox : nullptr;
@@ -1150,15 +1140,6 @@ private:
         if (mixed_complete && !defer_completion_to_consumer)
         {
             sched_->on_mixed_task_complete(slot_state, local_bufs);
-            if (deferred_release_count < PTO2_DEFERRED_RELEASE_CAP)
-            {
-                deferred_release_slot_states[deferred_release_count++] = &slot_state;
-            }
-            else
-            {
-                while (deferred_release_count > 0) sched_->on_task_release(*deferred_release_slot_states[--deferred_release_count]);
-                deferred_release_slot_states[deferred_release_count++] = &slot_state;
-            }
             completed_this_turn++;
         }
     }
@@ -1177,7 +1158,7 @@ private:
         core.running_reg_task_id = AICPU_TASK_INVALID;
     }
 
-    void check_running_cores_for_completion(int32_t thread_idx, Handshake *hank, int32_t &completed_this_turn, int32_t &cur_thread_completed, bool &made_progress, PTO2TaskSlotState *deferred_release_slot_states[], int32_t &deferred_release_count, PTO2LocalReadyBuffer *local_bufs)
+    void check_running_cores_for_completion(int32_t thread_idx, Handshake *hank, int32_t &completed_this_turn, int32_t &cur_thread_completed, bool &made_progress, PTO2LocalReadyBuffer *local_bufs)
     {
         CoreTracker &tracker = core_trackers_[thread_idx];
         auto running_core_states = tracker.get_all_running_cores();
@@ -1200,12 +1181,12 @@ private:
             // 1. Complete finished tasks (capture pointers before modifying core state)
             if (t.pending_done)
             {
-                complete_slot_task(*core.pending_slot_state, core.pending_reg_task_id, core_id, hank, completed_this_turn, deferred_release_slot_states, deferred_release_count, local_bufs);
+                complete_slot_task(*core.pending_slot_state, core.pending_reg_task_id, core_id, hank, completed_this_turn, local_bufs);
                 cur_thread_completed++;
             }
             if (t.running_done)
             {
-                complete_slot_task(*core.running_slot_state, core.running_reg_task_id, core_id, hank, completed_this_turn, deferred_release_slot_states, deferred_release_count, local_bufs);
+                complete_slot_task(*core.running_slot_state, core.running_reg_task_id, core_id, hank, completed_this_turn, local_bufs);
                 cur_thread_completed++;
             }
 

@@ -235,12 +235,10 @@ struct PTO2OrchestratorState
 
         bool ending_manual_scope = orch->scope_stack_top == orch->manual_begin_depth;
         int32_t begin = orch->scope_begins[orch->scope_stack_top--];
-        int32_t count = orch->scope_tasks_size - begin;
         if (ending_manual_scope) orch->manual_begin_depth = PTO2_MAX_SCOPE_DEPTH;
 
-        if (orch->scheduler && count > 0) orch->scheduler->on_scope_end(&orch->scope_tasks[begin], count);
-
-        // Rewind the task buffer — these entries are no longer needed
+        // Watermark-based reclamation: scope-end has no work to do — consumers
+        // no longer need to notify producers.
         orch->scope_tasks_size = begin;
     }
     TaskOutputTensors submit_task(const MixedKernels &mixed_kernels, const Arg &args)
@@ -473,6 +471,9 @@ inline bool prepare_task(PTO2OrchestratorState *orch, const Arg &args, int32_t t
     out->slot_state->bind_buffers(out->payload, out->task);
 
     out->slot_state->task_state.store(PTO2_TASK_PENDING, std::memory_order_relaxed);
+    // Seed last_consumer_local_id to self — with no consumers, the slot is
+    // safe to reclaim as soon as the watermark reaches this task itself.
+    out->slot_state->last_consumer_local_id = out->alloc_result.task_id;
     int16_t block_num = args.launch_spec.block_num();
     out->slot_state->total_required_subtasks = static_cast<int16_t>(block_num * __builtin_popcount(active_mask.core_mask()));
     out->slot_state->logical_block_num = block_num;
@@ -564,7 +565,15 @@ inline TaskOutputTensors submit_task_common(PTO2OrchestratorState *orch, const A
     task.packed_buffer_base = prepared.alloc_result.packed_base;
     task.packed_buffer_end = prepared.alloc_result.packed_end;
 
-    for (int32_t i = 0; i < fanin_builder.count; i++) fanin_builder.slots[i]->fanout_count++;
+    // Push this consumer's local_id into each producer's last_consumer high-
+    // water-mark, replacing the per-completion fanout_refcount notification.
+    // Reclamation gates on the global completed_watermark reaching this value.
+    const int32_t self_local = static_cast<int32_t>(task_id.local());
+    for (int32_t i = 0; i < fanin_builder.count; i++)
+    {
+        PTO2TaskSlotState *prod = fanin_builder.slots[i];
+        if (self_local > prod->last_consumer_local_id) prod->last_consumer_local_id = self_local;
+    }
 
     payload.fanin_count = fanin_builder.count;
     for (int32_t i = 0; i < fanin_builder.count; i++) payload.fanin_slot_states[i] = fanin_builder.slots[i];

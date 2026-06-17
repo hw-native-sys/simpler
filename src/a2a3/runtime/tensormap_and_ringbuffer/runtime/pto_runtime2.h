@@ -234,9 +234,14 @@ inline bool wait_for_tensor_ready(PTO2Runtime *rt, const Tensor &tensor, bool wa
     auto wait_one_consumers = [&](const PTO2TaskSlotState &slot) {
         uint8_t ring_id = slot.ring_id;
         int32_t local_id = slot.task->task_id.local();
+        // With watermark-based reclamation, "all consumers done" means the
+        // per-ring completed_watermark has reached this slot's recorded
+        // last_consumer_local_id.
+        PTO2SharedMemoryRingHeader &ring_hdr = rt->orchestrator.sm_header->rings[ring_id];
+        int32_t target = slot.last_consumer_local_id;
         uint64_t t0 = get_sys_cnt_aicpu();
         int32_t spin_count = 0;
-        while (slot.fanout_refcount.load(std::memory_order_acquire) < slot.fanout_count - 1)
+        while (ring_hdr.completed_watermark.load(std::memory_order_acquire) < target)
         {
             SPIN_WAIT_HINT();
             if ((++spin_count & 1023) == 0 && get_sys_cnt_aicpu() - t0 > PTO2_TENSOR_DATA_TIMEOUT_CYCLES)
