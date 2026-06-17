@@ -77,6 +77,7 @@ def build_all(
     platforms: Optional[list] = None,
     clone_protocol: str = "ssh",
     sanitizer: str = "none",
+    pto_isa_commit: Optional[str] = None,
 ) -> None:
     """Build all runtime variants for the given platforms.
 
@@ -90,6 +91,10 @@ def build_all(
         sanitizer: Sanitizer preset (asan/ubsan/tsan/none) or raw `-fsanitize`
             token list. Only host-compiled targets honor it; see
             BuildTarget.gen_cmake_args.
+        pto_isa_commit: pto-isa commit to pin the onboard a2a3 host build to.
+            None = clone/use HEAD. Must match the `--pto-isa-commit` the scene
+            tests pin at run time so host_runtime.so (which compiles the pto-isa
+            SDMA headers) and the test-time kernels share one pto-isa revision.
     """
     # Override default paths to respect CLI args
     RuntimeBuilder._LIB_DIR = lib_dir
@@ -121,10 +126,17 @@ def build_all(
     # CMakeLists invocation) is the one actually used, instead of relying on
     # the fallback in RuntimeCompiler._init_a2a3. No-ops when PTO_ISA_ROOT
     # is already set. Skipped when only sim platforms are being built.
+    #
+    # pto_isa_commit pins the clone to the same revision the scene tests later
+    # check out via `--pto-isa-commit`. Without it, host_runtime.so would be
+    # built against whatever pto-isa HEAD (or a stale clone) happened to be at
+    # install time, diverging from the test-time kernels — see issue #1067.
     if "a2a3" in platforms:
         from simpler_setup.pto_isa import ensure_pto_isa_root  # noqa: PLC0415
 
-        os.environ["PTO_ISA_ROOT"] = ensure_pto_isa_root(clone_protocol=clone_protocol, verbose=True)
+        os.environ["PTO_ISA_ROOT"] = ensure_pto_isa_root(
+            commit=pto_isa_commit, clone_protocol=clone_protocol, verbose=True
+        )
 
     # libsimpler_log.so and libcpu_sim_context.so are process-global (one per
     # host toolchain, not per arch/variant) — build them once before iterating
@@ -229,6 +241,16 @@ def main():
             "Default: none. asan/tsan are mutually exclusive (separate builds)."
         ),
     )
+    parser.add_argument(
+        "--pto-isa-commit",
+        default=None,
+        help=(
+            "Pin the onboard a2a3 pto-isa clone to this commit before building "
+            "host_runtime. Must match the scene tests' --pto-isa-commit so the "
+            "host runtime and test-time kernels share one pto-isa revision "
+            "(default: clone/use HEAD)."
+        ),
+    )
     args = parser.parse_args()
 
     logging.basicConfig(
@@ -254,6 +276,7 @@ def main():
         platforms=args.platforms,
         clone_protocol=args.clone_protocol,
         sanitizer=args.sanitizer,
+        pto_isa_commit=args.pto_isa_commit,
     )
 
 

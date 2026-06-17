@@ -9,6 +9,11 @@ concurrency:
   cancel-in-progress: true
 
 env:
+  # Single source of truth for the pinned pto-isa revision. Drives BOTH the
+  # build (`pip install` threads it into build_runtimes.py via
+  # SIMPLER_PTO_ISA_COMMIT, so host_runtime.so embeds these pto-isa headers)
+  # and the run (scene tests check it out via `--pto-isa-commit`). Bump here to
+  # update both at once — never pin one without the other (issue #1067).
   PTO_ISA_COMMIT: ddafa8da9c760ecd13fe9fe2833d6ee55fb20bd8
 
 jobs:
@@ -223,25 +228,25 @@ jobs:
         run: |
           pytest tests/st/a2a3/tensormap_and_ringbuffer/dfx/dep_gen/test_dep_gen.py \
             --platform a2a3sim --device 0-15 -p no:xdist --pto-session-timeout 600 \
-            --enable-dep-gen --clone-protocol https
+            --enable-dep-gen --clone-protocol https --pto-isa-commit ${{ env.PTO_ISA_COMMIT }}
 
       - name: l2_swimlane smoke
         run: |
           pytest tests/st/a2a3/tensormap_and_ringbuffer/dfx/l2_swimlane/ \
             --platform a2a3sim --device 0-15 -p no:xdist --pto-session-timeout 600 \
-            --enable-l2-swimlane --enable-dep-gen --clone-protocol https
+            --enable-l2-swimlane --enable-dep-gen --clone-protocol https --pto-isa-commit ${{ env.PTO_ISA_COMMIT }}
 
       - name: PMU smoke
         run: |
           pytest tests/st/a2a3/tensormap_and_ringbuffer/dfx/pmu/test_pmu.py \
             --platform a2a3sim --device 0-15 -p no:xdist --pto-session-timeout 600 \
-            --enable-pmu 2 --clone-protocol https
+            --enable-pmu 2 --clone-protocol https --pto-isa-commit ${{ env.PTO_ISA_COMMIT }}
 
       - name: tensor_dump smoke
         run: |
           pytest tests/st/a2a3/tensormap_and_ringbuffer/dfx/tensor_dump/test_tensor_dump.py \
             --platform a2a3sim --device 0-15 -p no:xdist --pto-session-timeout 600 \
-            --dump-tensor --clone-protocol https
+            --dump-tensor --clone-protocol https --pto-isa-commit ${{ env.PTO_ISA_COMMIT }}
 
   st-sim-a5:
     needs: detect-changes
@@ -445,19 +450,26 @@ jobs:
           python3 -m venv --system-site-packages .venv
           source .venv/bin/activate
           pip install --upgrade pip
-          pip install '.[test]'
+          # Pin the onboard a2a3 host_runtime build to the same pto-isa commit
+          # the scene tests check out (PTO_ISA_COMMIT), so host_runtime.so and
+          # the test-time kernels share one pto-isa revision (see issue #1067).
+          pip install --config-settings=cmake.define.SIMPLER_PTO_ISA_COMMIT="${PTO_ISA_COMMIT}" '.[test]'
 
       - name: Run Python hardware unit tests
         run: |
           source .venv/bin/activate
-          python -m pytest tests -m requires_hardware --platform a2a3 --device ${DEVICE_RANGE} -v
+          # Pin to the same commit pip install built host_runtime against, so
+          # conftest does not reset build/pto-isa to HEAD (which would diverge
+          # from the pre-built host_runtime and break the C++ UT rebuild below).
+          python -m pytest tests -m requires_hardware --platform a2a3 --device ${DEVICE_RANGE} -v \
+            --pto-isa-commit ${{ env.PTO_ISA_COMMIT }}
 
       - name: Build and run C++ hardware unit tests
         run: |
           source .venv/bin/activate
           # pip install's build_runtimes.py already cloned pto-isa into
-          # build/pto-isa; point this step's RuntimeBuilder at it so
-          # _init_a2a3's PTO_ISA_ROOT check passes without re-cloning.
+          # build/pto-isa at PTO_ISA_COMMIT; point this step's RuntimeBuilder at
+          # it so _init_a2a3's PTO_ISA_ROOT check passes without re-cloning.
           export PTO_ISA_ROOT="$(pwd)/build/pto-isa"
           python -c "from simpler_setup.runtime_builder import RuntimeBuilder; RuntimeBuilder('a2a3').get_binaries('tensormap_and_ringbuffer', build=True)"
           cmake -B tests/ut/cpp/build -S tests/ut/cpp -DSIMPLER_ENABLE_HARDWARE_TESTS=ON
@@ -517,7 +529,10 @@ jobs:
           python3 -m venv --system-site-packages .venv
           source .venv/bin/activate
           pip install --upgrade pip
-          pip install '.[test]'
+          # Pin the onboard a2a3 host_runtime build to the same pto-isa commit
+          # the scene tests check out (PTO_ISA_COMMIT), so host_runtime.so and
+          # the test-time kernels share one pto-isa revision (see issue #1067).
+          pip install --config-settings=cmake.define.SIMPLER_PTO_ISA_COMMIT="${PTO_ISA_COMMIT}" '.[test]'
           # Warn if graphviz isn't installed on the runner — the dep_gen
           # smoke step needs `dot` to render deps_viewer. The Python
           # has_binary("dot") guard in the test will skip cleanly without
@@ -541,28 +556,28 @@ jobs:
           source .venv/bin/activate
           python -m pytest tests/st/a2a3/tensormap_and_ringbuffer/dfx/dep_gen/test_dep_gen.py \
             --platform a2a3 --device ${DEVICE_RANGE} -p no:xdist --pto-session-timeout 600 \
-            --enable-dep-gen --clone-protocol ssh
+            --enable-dep-gen --clone-protocol ssh --pto-isa-commit ${{ env.PTO_ISA_COMMIT }}
 
       - name: l2_swimlane smoke
         run: |
           source .venv/bin/activate
           python -m pytest tests/st/a2a3/tensormap_and_ringbuffer/dfx/l2_swimlane/ \
             --platform a2a3 --device ${DEVICE_RANGE} -p no:xdist --pto-session-timeout 600 \
-            --enable-l2-swimlane --enable-dep-gen --clone-protocol ssh
+            --enable-l2-swimlane --enable-dep-gen --clone-protocol ssh --pto-isa-commit ${{ env.PTO_ISA_COMMIT }}
 
       - name: PMU smoke
         run: |
           source .venv/bin/activate
           python -m pytest tests/st/a2a3/tensormap_and_ringbuffer/dfx/pmu/test_pmu.py \
             --platform a2a3 --device ${DEVICE_RANGE} -p no:xdist --pto-session-timeout 600 \
-            --enable-pmu 2 --clone-protocol ssh
+            --enable-pmu 2 --clone-protocol ssh --pto-isa-commit ${{ env.PTO_ISA_COMMIT }}
 
       - name: tensor_dump smoke
         run: |
           source .venv/bin/activate
           python -m pytest tests/st/a2a3/tensormap_and_ringbuffer/dfx/tensor_dump/test_tensor_dump.py \
             --platform a2a3 --device ${DEVICE_RANGE} -p no:xdist --pto-session-timeout 600 \
-            --dump-tensor --clone-protocol ssh
+            --dump-tensor --clone-protocol ssh --pto-isa-commit ${{ env.PTO_ISA_COMMIT }}
 
 
   # ---------- Detect platform-specific changes (runs on GitHub server) ----------
@@ -623,13 +638,16 @@ jobs:
           python3 -m venv --system-site-packages .venv
           source .venv/bin/activate
           pip install --upgrade pip
-          pip install '.[test]'
+          # Pin the onboard a2a3 host_runtime build to the same pto-isa commit
+          # the scene tests check out (PTO_ISA_COMMIT), so host_runtime.so and
+          # the test-time kernels share one pto-isa revision (see issue #1067).
+          pip install --config-settings=cmake.define.SIMPLER_PTO_ISA_COMMIT="${PTO_ISA_COMMIT}" '.[test]'
 
       - name: Run Python hardware unit tests (a5)
         run: |
           source .venv/bin/activate
           DEVICE_LIST=$(python -c "p='${DEVICE_RANGE}'.split('-'); s,e=p[0],p[-1]; print(','.join(str(i) for i in range(int(s),int(e)+1)))")
-          task-submit --timeout 1800 --max-time 1800 --device "$DEVICE_LIST" --run "python -m pytest tests -m requires_hardware --platform a5 --device ${DEVICE_RANGE} -v"
+          task-submit --timeout 1800 --max-time 1800 --device "$DEVICE_LIST" --run "python -m pytest tests -m requires_hardware --platform a5 --device ${DEVICE_RANGE} -v --pto-isa-commit ${{ env.PTO_ISA_COMMIT }}"
 
       - name: Build and run C++ hardware unit tests (a5)
         run: |
@@ -688,7 +706,10 @@ jobs:
           python3 -m venv --system-site-packages .venv
           source .venv/bin/activate
           pip install --upgrade pip
-          pip install '.[test]'
+          # Pin the onboard a2a3 host_runtime build to the same pto-isa commit
+          # the scene tests check out (PTO_ISA_COMMIT), so host_runtime.so and
+          # the test-time kernels share one pto-isa revision (see issue #1067).
+          pip install --config-settings=cmake.define.SIMPLER_PTO_ISA_COMMIT="${PTO_ISA_COMMIT}" '.[test]'
 
       - name: Run pytest scene tests (a5)
         run: |

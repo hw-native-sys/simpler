@@ -36,12 +36,28 @@ add_subdirectory(python/bindings)
 set(SIMPLER_PTO_CLONE_PROTOCOL "ssh" CACHE STRING
     "Protocol for cloning pto-isa during install (ssh or https)")
 
+# Pin pto-isa to a specific commit when `build_runtimes.py` builds the onboard
+# a2a3 host runtime (which compiles the pto-isa SDMA headers into
+# host_runtime.so). Must match the `--pto-isa-commit` the scene tests pin at
+# run time, otherwise host_runtime.so and the test-time kernels are built
+# against different pto-isa revisions. Empty (default) clones/uses HEAD. Set at
+# `pip install` time via
+#   pip install --config-settings=cmake.define.SIMPLER_PTO_ISA_COMMIT=<sha> .
+set(SIMPLER_PTO_ISA_COMMIT "" CACHE STRING
+    "pto-isa commit to pin the onboard a2a3 host build to (empty = HEAD)")
+
 # Compiler sanitizer for host-compiled targets (sim runtime/kernels and the
 # onboard host runtime). Default `none`. Preset (asan/ubsan/tsan) or a raw
 # -fsanitize token list. Enable at `pip install` time via
 #   pip install --no-build-isolation --config-settings=cmake.define.SIMPLER_SANITIZER=asan .
 set(SIMPLER_SANITIZER "none" CACHE STRING
     "Sanitizer for host targets during install (none/asan/ubsan/tsan)")
+
+# Pass --pto-isa-commit only when pinned; an empty cache var leaves the flag
+# off (build_runtimes then clones/uses HEAD).
+if(NOT SIMPLER_PTO_ISA_COMMIT STREQUAL "")
+    set(_pto_isa_commit_arg --pto-isa-commit "${SIMPLER_PTO_ISA_COMMIT}")
+endif()
 
 # Pre-build runtime binaries (persistent build dirs for incremental compilation)
 add_custom_target(build_runtimes ALL
@@ -51,6 +67,7 @@ add_custom_target(build_runtimes ALL
         --cache-dir ${CMAKE_SOURCE_DIR}/build/cache
         --clone-protocol ${SIMPLER_PTO_CLONE_PROTOCOL}
         --sanitizer ${SIMPLER_SANITIZER}
+        ${_pto_isa_commit_arg}
     COMMENT "Building runtime binaries (incremental)..."
 )
 
