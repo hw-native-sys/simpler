@@ -52,7 +52,7 @@ Thread 3: PTO2 total submitted tasks = 16704
 
 ### Field Reference
 
-| Field | Source (`pto_orchestrator.cpp`) | Description |
+| Field | Source (`pto_orchestrator.h`) | Description |
 | ----- | ------------------------------- | ----------- |
 | **cost** | Wall-clock around `orch_func()` call | Total time including orchestration logic + scope overhead |
 | **total** | Sum of all sub-steps below | Accumulated time inside `submit_task` across all tasks |

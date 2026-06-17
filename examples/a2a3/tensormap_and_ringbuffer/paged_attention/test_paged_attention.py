@@ -109,6 +109,22 @@ class TestPagedAttention(SceneTestCase):
             },
         },
         {
+            "name": "Case4",
+            "platforms": ["a2a3"],
+            "config": {"aicpu_thread_num": 4, "block_dim": 24},
+            "manual": True,
+            "params": {
+                "batch": 16,
+                "num_heads": 16,
+                "kv_head_num": 1,
+                "head_dim": 16,
+                "block_size": 16,
+                "context_len": 256,
+                "max_model_len": 2048,
+                "dtype": "bfloat16",
+            },
+        },
+        {
             "name": "CaseSmall1",
             "platforms": ["a2a3sim", "a2a3"],
             "config": {"aicpu_thread_num": 4, "block_dim": 9},

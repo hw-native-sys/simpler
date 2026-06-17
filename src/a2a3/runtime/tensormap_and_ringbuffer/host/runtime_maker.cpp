@@ -15,14 +15,12 @@
  * Supports device orchestration where AICPU thread 3 runs the orchestrator.
  *
  * init_runtime_impl:
- *   - Converts host tensor pointers to device pointers (all inputs copied H2D;
- *     only OUTPUT/INOUT tensors are copied back D2H)
+ *   - Converts host tensor pointers to device pointers (all tensors copied both directions)
  *   - Copies orchestration SO to device memory
  *   - Sets up runtime state for device orchestration
  *
  * validate_runtime_impl:
- *   - Copies OUTPUT/INOUT tensors back from device to host (read-only inputs
- *     are skipped)
+ *   - Copies recorded tensors back from device to host
  *   - Frees device memory
  */
 
@@ -163,8 +161,8 @@ prepare_callable_impl(const ChipCallable *callable, uint64_t (*upload_fn)(const 
  * @return 0 on success, -1 on failure
  */
 extern "C" int bind_callable_to_runtime_impl(
-    Runtime *runtime, const ChipStorageTaskArgs *orch_args, void *host_orch_func_ptr, const ArgDirection *signature,
-    int sig_count, uint64_t ring_task_window, uint64_t ring_heap, uint64_t ring_dep_pool
+    Runtime *runtime, const ChipStorageTaskArgs *orch_args, void *host_orch_func_ptr,
+    const ArgDirection * /*signature*/, int /*sig_count*/
 ) {
     if (runtime == nullptr) {
         LOG_ERROR("Runtime pointer is null");
@@ -210,32 +208,13 @@ extern "C" int bind_callable_to_runtime_impl(
             return -1;
         }
 
-        // Pure write-only OUTPUT buffers carry no meaningful host content, so
-        // the H2D copy-in is wasted. Zero them on-device instead (cheap HBM
-        // memset, no PCIe) so any region the kernel leaves unwritten reads as 0
-        // rather than pooled-allocator garbage. INOUT (read-before-write)
-        // and IN keep the H2D copy. Falls back to copy_to_device if a backend
-        // did not wire device_memset.
-        bool is_pure_output = (signature != nullptr && i < sig_count && signature[i] == ArgDirection::OUT);
-        int rc;
-        if (is_pure_output && runtime->host_api.device_memset != nullptr) {
-            rc = runtime->host_api.device_memset(dev_ptr, 0, size);
-        } else {
-            rc = runtime->host_api.copy_to_device(dev_ptr, host_ptr, size);
-        }
+        int rc = runtime->host_api.copy_to_device(dev_ptr, host_ptr, size);
         if (rc != 0) {
-            LOG_ERROR("Failed to stage tensor %d to device", i);
+            LOG_ERROR("Failed to copy tensor %d to device", i);
             runtime->host_api.device_free(dev_ptr);
             return -1;
         }
-        // Read-only INPUT tensors are never written by the kernel, so there is
-        // no point copying them back D2H at the end. Index the signature
-        // by the orch tensor index `i` (child_memory tensors are skipped above
-        // but do not consume a separate signature slot — scalars follow the
-        // tensor entries). Anything not provably IN keeps the safe default of
-        // copying back.
-        bool needs_copy_back = !(signature != nullptr && i < sig_count && signature[i] == ArgDirection::IN);
-        runtime->tensor_pairs_.push_back({host_ptr, dev_ptr, size, needs_copy_back});
+        runtime->tensor_pairs_.push_back({host_ptr, dev_ptr, size});
         LOG_INFO_V0("  Tensor %d: %zu bytes at %p", i, size, dev_ptr);
 
         t.data = reinterpret_cast<uint64_t>(dev_ptr);
@@ -274,13 +253,11 @@ extern "C" int bind_callable_to_runtime_impl(
         LOG_INFO_V0("Orchestrator-to-scheduler transition: %s", runtime->orch_to_sched ? "enabled" : "disabled");
     }
 
-    // Ring buffer size overrides: per-task CallConfig value wins over the
-    // env var; both fall back to the compile-time default when zero.
+    // Read ring buffer size overrides from environment
     {
-        runtime->task_window_size =
-            ring_task_window ? ring_task_window : parse_env_uint64("PTO2_RING_TASK_WINDOW", 4, true);
-        runtime->heap_size = ring_heap ? ring_heap : parse_env_uint64("PTO2_RING_HEAP", 1024, true);
-        runtime->dep_pool_size = ring_dep_pool ? ring_dep_pool : parse_env_uint64("PTO2_RING_DEP_POOL", 4, false);
+        runtime->task_window_size = parse_env_uint64("PTO2_RING_TASK_WINDOW", 4, true);
+        runtime->heap_size = parse_env_uint64("PTO2_RING_HEAP", 1024, true);
+        runtime->dep_pool_size = parse_env_uint64("PTO2_RING_DEP_POOL", 4, false);
         if (runtime->task_window_size || runtime->heap_size || runtime->dep_pool_size) {
             LOG_INFO_V0(
                 "Ring buffer overrides: task_window=%" PRIu64 " heap=%" PRIu64 " dep_pool=%" PRIu64,
@@ -470,14 +447,6 @@ extern "C" int validate_runtime_impl(Runtime *runtime) {
             // If host pointer is null, this is a device-only allocation (no copy-back)
             if (pair.host_ptr == nullptr) {
                 LOG_INFO_V0("Tensor %d: device-only allocation (no copy-back)", i);
-                continue;
-            }
-
-            // Read-only INPUT tensors were uploaded H2D but the kernel never
-            // wrote them — copying them back (potentially ~GB) is pure waste.
-            // They are still device_free'd in the cleanup loop below.
-            if (!pair.needs_copy_back) {
-                LOG_INFO_V0("Tensor %d: read-only input, skipping copy-back", i);
                 continue;
             }
 
