@@ -151,8 +151,17 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, in
             // execute_task() below — strictly AFTER this gate — so predecessor
             // outputs are visible. not_ready == 0 (the common path) skips this.
             if (exec_payload->not_ready) {
-                while (read_dmb_high32() != task_id) {
+                while (true) {
                     // Honor teardown: shutdown overwrites the low half with EXIT.
+                    // Check it on the doorbell-match iteration too, so an EXIT that
+                    // races in right after the matching doorbell still wins over
+                    // executing the gated task.
+                    if (read_dmb_high32() == task_id) {
+                        if (static_cast<uint32_t>(read_reg(RegId::DATA_MAIN_BASE)) == AICORE_EXIT_SIGNAL) {
+                            exiting = true;
+                        }
+                        break;
+                    }
                     if (static_cast<uint32_t>(read_reg(RegId::DATA_MAIN_BASE)) == AICORE_EXIT_SIGNAL) {
                         exiting = true;
                         break;

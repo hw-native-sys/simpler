@@ -1107,7 +1107,10 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
         bool prestage_record = l2_swimlane_level_ >= L2SwimlaneLevel::SCHED_PHASES;
         uint64_t prestage_t0 = prestage_record ? get_sys_cnt_aicpu() : 0;
 #endif
-        [[maybe_unused]] int32_t prestaged = any_ready_work ? 0 : try_speculative_prestage(thread_idx);
+        // Skip speculative prestage under PMU: dispatch_ready_tasks already withholds
+        // PENDING dispatch when pmu_active to preserve single-issue PMU windows, and
+        // prestaging gated work into idle/pending slots would perturb the same windows.
+        [[maybe_unused]] int32_t prestaged = (pmu_active || any_ready_work) ? 0 : try_speculative_prestage(thread_idx);
 #if PTO2_PROFILING
         // Emit a Prestage bar so a staging-dominated iteration shows as Prestage,
         // not mislabeled Poll (the cheap scan also ran, so the activity-fill would
@@ -1117,6 +1120,10 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
                 thread_idx, L2SwimlaneSchedPhaseKind::Prestage, prestage_t0, get_sys_cnt_aicpu(),
                 sched_l2_swimlane_[thread_idx].sched_loop_count, static_cast<uint32_t>(prestaged)
             );
+            // prepare_block_for_dispatch bumped phase_dispatch_count while staging;
+            // those blocks belong to this Prestage bar, so clear the counter before it
+            // leaks into the next Dispatch bar.
+            sched_l2_swimlane_[thread_idx].phase_dispatch_count = 0;
             emitted_phase_bar = true;  // suppress the Poll/idle fill for this iteration
         }
 #endif
@@ -1135,6 +1142,9 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
                 deferred_release_count, local_bufs
             );
             if (completed_2nd > 0) {
+#if PTO2_SCHED_PROFILING
+                sched_->tasks_completed.fetch_add(completed_2nd, std::memory_order_relaxed);
+#endif
                 completed_tasks_.fetch_add(completed_2nd, std::memory_order_relaxed);
                 last_progress_count = completed_tasks_.load(std::memory_order_relaxed);
             }
