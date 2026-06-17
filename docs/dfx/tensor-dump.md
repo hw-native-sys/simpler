@@ -324,6 +324,11 @@ What you can read out of `tensor_dump.json` + `tensor_dump.bin`:
 
 ## 5. Design Highlights
 
+`Arg::dump(...)` selection state is compiled only when
+`PTO2_PROFILING=1`. With `PTO2_PROFILING=0`, the public API remains
+available but acts as a no-op: no dump-only `Arg` state is stored and
+submit does not propagate dump metadata.
+
 ### 5.1 Common device-side structures
 
 Both architectures share the same device-side layout, published via

@@ -31,6 +31,7 @@
 
 #include <atomic>
 
+#include "profiling_config.h"
 #include "pto_constants.h"
 #include "pto_runtime_status.h"
 #include "pto2_dispatch_payload.h"
@@ -48,38 +49,6 @@
 #include "spin_hint.h"
 #else
 #define SPIN_WAIT_HINT() ((void)0)
-#endif
-
-// =============================================================================
-// Profiling Configuration
-// =============================================================================
-
-#ifndef PTO2_PROFILING
-#define PTO2_PROFILING 1
-#endif
-
-#ifndef PTO2_ORCH_PROFILING
-#define PTO2_ORCH_PROFILING 0
-#endif
-
-#ifndef PTO2_SCHED_PROFILING
-#define PTO2_SCHED_PROFILING 0
-#endif
-
-#ifndef PTO2_TENSORMAP_PROFILING
-#define PTO2_TENSORMAP_PROFILING 0
-#endif
-
-#if PTO2_ORCH_PROFILING && !PTO2_PROFILING
-#error "PTO2_ORCH_PROFILING requires PTO2_PROFILING=1"
-#endif
-
-#if PTO2_SCHED_PROFILING && !PTO2_PROFILING
-#error "PTO2_SCHED_PROFILING requires PTO2_PROFILING=1"
-#endif
-
-#if PTO2_TENSORMAP_PROFILING && !PTO2_ORCH_PROFILING
-#error "PTO2_TENSORMAP_PROFILING requires PTO2_ORCH_PROFILING=1"
 #endif
 
 #if PTO2_ORCH_PROFILING || PTO2_SCHED_PROFILING

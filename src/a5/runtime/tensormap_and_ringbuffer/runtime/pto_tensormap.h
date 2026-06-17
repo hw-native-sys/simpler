@@ -43,6 +43,7 @@
 #pragma once
 
 #include "common.h"
+#include "profiling_config.h"
 #include "utils/device_arena.h"
 #include "pto_runtime2_types.h"
 #include "tensor.h"
@@ -64,13 +65,7 @@ struct PTO2TensorMapLayout {
     int32_t task_window_sizes[PTO2_MAX_RING_DEPTH];
 };
 
-// =============================================================================
-// TensorMap Lookup Profiling (must precede inline lookup/insert methods)
-// =============================================================================
-#ifndef PTO2_TENSORMAP_PROFILING
-#define PTO2_TENSORMAP_PROFILING 0
-#endif
-
+// TensorMap Lookup Profiling (must precede inline lookup/insert methods).
 #if PTO2_TENSORMAP_PROFILING
 extern uint64_t g_lookup_chain_total;
 extern uint64_t g_lookup_count;

@@ -2,8 +2,9 @@
 
 For an L2 run you usually look at a handful of timing numbers. They come from
 **two channels**, both available with no extra flags because they ride on the
-compile-time `PTO2_PROFILING` macro (default `1`, already in the prebuilt
-runtimes):
+compile-time `PTO2_PROFILING` macro (default `1` in
+`src/common/task_interface/profiling_config.h`, already enabled in the
+prebuilt runtimes):
 
 1. **`RunTiming`** — `host_wall` and `device_wall`, returned directly by
    `Worker.run()` and printed per round by the harness.
