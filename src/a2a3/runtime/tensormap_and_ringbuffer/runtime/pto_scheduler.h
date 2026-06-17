@@ -463,8 +463,11 @@ struct PTO2SchedulerState
     bool fanin_satisfied(PTO2TaskSlotState *s) const
     {
         const PTO2TaskPayload &p = *s->payload;
+        const auto &ring = *ring_sched_states[s->ring_id].ring;
+        const int32_t mask = ring.task_window_mask;
+        std::atomic<uint8_t> *flags = ring.completion_flags;
         for (int32_t i = 0; i < p.fanin_count; i++)
-            if (p.fanin_slot_states[i]->task_state.load(std::memory_order_acquire) < PTO2_TASK_COMPLETED) return false;
+            if (flags[p.fanin_local_ids[i] & mask].load(std::memory_order_acquire) == 0) return false;
         return true;
     }
 
@@ -539,6 +542,11 @@ struct PTO2SchedulerState
         int32_t ring_id = slot_state.ring_id;
         auto &rss = ring_sched_states[ring_id];
         auto &ring = *rss.ring;
+
+        // Publish to the polling-fast completion array. Release ordering
+        // makes the producer's output writes visible to consumers that
+        // acquire-load this byte in fanin_satisfied.
+        ring.completion_flags[my_id & ring.task_window_mask].store(1, std::memory_order_release);
 
         // CAS-advance the watermark, bounded by my_id (which we know is
         // published since we just completed it). If a forward task we observe

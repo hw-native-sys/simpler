@@ -112,8 +112,11 @@ struct PTO2TaskPayload
     // === Cache lines 0-2 (192B) — metadata + fanin ===
     int32_t tensor_count{0};
     int32_t scalar_count{0};
-    int32_t fanin_count{0};  // Number of valid entries in fanin_slot_states
-    PTO2TaskSlotState *fanin_slot_states[PTO2_MAX_FANIN];
+    int32_t fanin_count{0};  // Number of valid entries in fanin_local_ids
+    // Local ids of fanin producers, used by the thread-0 polling loop to
+    // index a compact ring-level completion_flags byte array. Avoids a
+    // pointer chase per fanin into a 128B-aligned slot_state.
+    int32_t fanin_local_ids[PTO2_MAX_FANIN];
     // === Tensors (Tensor is alignas(64); array is naturally aligned) ===
     Tensor tensors[MAX_TENSOR_ARGS];
     // === Scalars ===
@@ -148,7 +151,7 @@ struct PTO2TaskPayload
 };
 
 // PTO2TaskPayload layout verification (offsetof requires complete type).
-static_assert(offsetof(PTO2TaskPayload, fanin_slot_states) == 16, "fanin array must follow metadata words");
+static_assert(offsetof(PTO2TaskPayload, fanin_local_ids) == 12, "fanin array must follow metadata words");
 static_assert(offsetof(PTO2TaskPayload, scalars) == offsetof(PTO2TaskPayload, tensors) + MAX_TENSOR_ARGS * sizeof(Tensor), "scalars must immediately follow tensors");
 static_assert(sizeof(PTO2TaskPayload) == offsetof(PTO2TaskPayload, scalars) + MAX_SCALAR_ARGS * sizeof(uint64_t), "no trailing padding after scalars");
 

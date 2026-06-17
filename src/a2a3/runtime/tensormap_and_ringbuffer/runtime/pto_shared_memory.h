@@ -56,6 +56,15 @@ struct alignas(64) PTO2SharedMemoryRingHeader
     PTO2TaskPayload *task_payloads;
     PTO2TaskSlotState *slot_states;
 
+    // Compact contiguous array (one byte per slot) holding the polling-fast
+    // "task X completed?" flag. 0 = pending, 1 = completed. Indexed by
+    // local_id & task_window_mask. Writer: the task's completer at
+    // on_mixed_task_complete; Resetter: orchestrator in prepare_task for the
+    // newly-allocated slot. Reader: thread-0 fanin polling. Replaces a chain
+    // of 128B-aligned slot_state pointer derefs with byte reads into a single
+    // array — typically condenses 16 fanin checks into 1-2 cache lines.
+    std::atomic<uint8_t> *completion_flags;
+
     PTO2TaskDescriptor &get_task_by_slot(int32_t slot)
     {
         return task_descriptors[slot];
@@ -149,6 +158,7 @@ struct PTO2SharedMemoryHandle
             size += PTO2_ALIGN_UP(task_window_sizes[r] * sizeof(PTO2TaskDescriptor), PTO2_ALIGN_SIZE);
             size += PTO2_ALIGN_UP(task_window_sizes[r] * sizeof(PTO2TaskPayload), PTO2_ALIGN_SIZE);
             size += PTO2_ALIGN_UP(task_window_sizes[r] * sizeof(PTO2TaskSlotState), PTO2_ALIGN_SIZE);
+            size += PTO2_ALIGN_UP(task_window_sizes[r] * sizeof(std::atomic<uint8_t>), PTO2_ALIGN_SIZE);
         }
 
         return size;
@@ -299,6 +309,9 @@ private:
 
             ring.slot_states = (PTO2TaskSlotState *)ptr;
             ptr += PTO2_ALIGN_UP(task_window_sizes[r] * sizeof(PTO2TaskSlotState), PTO2_ALIGN_SIZE);
+
+            ring.completion_flags = (std::atomic<uint8_t> *)ptr;
+            ptr += PTO2_ALIGN_UP(task_window_sizes[r] * sizeof(std::atomic<uint8_t>), PTO2_ALIGN_SIZE);
         }
     }
 };

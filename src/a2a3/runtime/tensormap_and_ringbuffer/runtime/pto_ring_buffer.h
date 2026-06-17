@@ -243,37 +243,6 @@ private:
     }
 };
 
-template <typename Fn>
-using PTO2FaninCallbackResult = std::invoke_result_t<Fn &, PTO2TaskSlotState *>;
-
-template <typename Fn>
-using PTO2FaninForEachReturn = std::conditional_t<std::is_same_v<PTO2FaninCallbackResult<Fn>, void>, void, bool>;
-
-template <typename Slots, typename Fn>
-inline PTO2FaninForEachReturn<Fn> for_each_fanin_in(Slots &&slot_states, int32_t fanin_count, Fn &&fn)
-{
-    using FaninCallbackResult = PTO2FaninCallbackResult<Fn>;
-    static_assert(std::is_same_v<FaninCallbackResult, void> || std::is_same_v<FaninCallbackResult, bool>, "fanin callback must return void or bool");
-
-    if constexpr (std::is_void_v<FaninCallbackResult>)
-    {
-        for (int32_t i = 0; i < fanin_count; i++) fn(slot_states[i]);
-    }
-    else
-    {
-        for (int32_t i = 0; i < fanin_count; i++)
-            if (!fn(slot_states[i])) return false;
-        return true;
-    }
-}
-
-template <typename Fn>
-inline PTO2FaninForEachReturn<Fn> for_each_fanin_slot_state(const PTO2TaskPayload &payload, Fn &&fn)
-{
-    return for_each_fanin_in(payload.fanin_slot_states, payload.fanin_count, static_cast<Fn &&>(fn));
-}
-
-
 struct PTO2RingSet
 {
     PTO2TaskAllocator task_allocator;

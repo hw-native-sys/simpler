@@ -46,12 +46,7 @@ struct PTO2FaninBuilder
 {
     int32_t count{0};
     PTO2TaskSlotState *slots[PTO2_MAX_FANIN];
-
-    template <typename Fn>
-    PTO2FaninForEachReturn<Fn> for_each(Fn &&fn) const
-    {
-        return for_each_fanin_in(slots, count, static_cast<Fn &&>(fn));
-    }
+    int32_t local_ids[PTO2_MAX_FANIN];
 
     bool contains(PTO2TaskSlotState *prod_state) const
     {
@@ -68,7 +63,7 @@ inline void orch_report_fatal_v(PTO2OrchestratorState *orch, int32_t error_code,
 inline void scope_tasks_push(PTO2OrchestratorState *orch, PTO2TaskSlotState *task_slot_state);
 inline bool prepare_task(PTO2OrchestratorState *orch, const Arg &args, int32_t total_output_size, ActiveMask active_mask, PTO2PreparedTask *out);
 inline PTO2OutputLayout calculate_output_layout(const Arg &args);
-inline bool append_fanin_or_fail(PTO2OrchestratorState *orch, PTO2TaskSlotState *prod_state, PTO2FaninBuilder *fanin_builder);
+inline bool append_fanin_or_fail(PTO2OrchestratorState *orch, PTO2TaskSlotState *prod_state, int32_t prod_local_id, PTO2FaninBuilder *fanin_builder);
 inline bool check_scope_can_accept_task(PTO2OrchestratorState *orch, PTO2TaskAllocator &allocator);
 inline void prefetch_payload(PTO2TaskPayload *payload, int32_t tensor_count, int32_t scalar_count);
 inline TaskOutputTensors submit_task_common(PTO2OrchestratorState *orch, const Arg &args, ActiveMask active_mask, int32_t aic_kernel_id, int32_t aiv0_kernel_id, int32_t aiv1_kernel_id);
@@ -355,7 +350,12 @@ struct PTO2OrchestratorState
         payload.init(args, outputs, prepared.alloc_result, layout);
         payload.fanin_count = 0;
 
-        if (prepared.slot_state != nullptr) prepared.slot_state->task_state.store(PTO2_TASK_COMPLETED, std::memory_order_release);
+        if (prepared.slot_state != nullptr)
+        {
+            prepared.slot_state->task_state.store(PTO2_TASK_COMPLETED, std::memory_order_release);
+            uint8_t ring_id = prepared.task_id.ring();
+            orch->sm_header->rings[ring_id].completion_flags[prepared.alloc_result.slot].store(1, std::memory_order_release);
+        }
         orch->inline_completed_tasks++;
 
         return outputs;
@@ -398,7 +398,7 @@ inline void orch_report_fatal_v(PTO2OrchestratorState *orch, int32_t error_code,
     (void)message;
 }
 
-inline bool append_fanin_or_fail(PTO2OrchestratorState *orch, PTO2TaskSlotState *prod_state, PTO2FaninBuilder *fanin_builder)
+inline bool append_fanin_or_fail(PTO2OrchestratorState *orch, PTO2TaskSlotState *prod_state, int32_t prod_local_id, PTO2FaninBuilder *fanin_builder)
 {
     if (fanin_builder->contains(prod_state)) return true;
     if (fanin_builder->count >= PTO2_MAX_FANIN)
@@ -406,7 +406,9 @@ inline bool append_fanin_or_fail(PTO2OrchestratorState *orch, PTO2TaskSlotState 
         orch_mark_fatal(orch, PTO2_ERROR_DEPENDENCY_OVERFLOW);
         return false;
     }
-    fanin_builder->slots[fanin_builder->count++] = prod_state;
+    int32_t idx = fanin_builder->count++;
+    fanin_builder->slots[idx] = prod_state;
+    fanin_builder->local_ids[idx] = prod_local_id;
     return true;
 }
 
@@ -471,6 +473,12 @@ inline bool prepare_task(PTO2OrchestratorState *orch, const Arg &args, int32_t t
     out->slot_state->bind_buffers(out->payload, out->task);
 
     out->slot_state->task_state.store(PTO2_TASK_PENDING, std::memory_order_relaxed);
+    // Clear the polling-fast completion byte for the newly-allocated slot.
+    // The previous incarnation's completer set this byte to 1; we publish 0
+    // before this task can be added as a fanin to any consumer (single-
+    // orchestrator-thread guarantee) and before the wiring-queue push
+    // (release-acquire) makes the slot visible to thread 0.
+    orch->sm_header->rings[ring_id].completion_flags[out->alloc_result.slot].store(0, std::memory_order_relaxed);
     // Seed last_consumer_local_id to self — with no consumers, the slot is
     // safe to reclaim as soon as the watermark reaches this task itself.
     out->slot_state->last_consumer_local_id = out->alloc_result.task_id;
@@ -541,7 +549,7 @@ inline TaskOutputTensors submit_task_common(PTO2OrchestratorState *orch, const A
         int32_t dep_last_task_alive = dep_ring.fc.last_task_alive.load(std::memory_order_acquire);
         if (dep_local_task_id < dep_last_task_alive) continue;
         PTO2TaskSlotState *producer_slot_state = &dep_ring.get_slot_state_by_task_id(dep_local_task_id);
-        if (!append_fanin_or_fail(orch, producer_slot_state, &fanin_builder)) return result;
+        if (!append_fanin_or_fail(orch, producer_slot_state, dep_local_task_id, &fanin_builder)) return result;
     }
 
     DepInputs dep_inputs{
@@ -549,8 +557,9 @@ inline TaskOutputTensors submit_task_common(PTO2OrchestratorState *orch, const A
     };
 
     auto runtime_emit = [&](PTO2TaskId producer_task_id) -> bool {
-        PTO2TaskSlotState *prod_state = &orch->sm_header->rings[producer_task_id.ring()].get_slot_state_by_task_id(producer_task_id.local());
-        return append_fanin_or_fail(orch, prod_state, &fanin_builder);
+        int32_t prod_local = static_cast<int32_t>(producer_task_id.local());
+        PTO2TaskSlotState *prod_state = &orch->sm_header->rings[producer_task_id.ring()].get_slot_state_by_task_id(prod_local);
+        return append_fanin_or_fail(orch, prod_state, prod_local, &fanin_builder);
     };
 
     if (!compute_task_fanin(dep_inputs, orch->tensor_map, orch->in_manual_scope(), runtime_emit)) return result;
@@ -576,7 +585,7 @@ inline TaskOutputTensors submit_task_common(PTO2OrchestratorState *orch, const A
     }
 
     payload.fanin_count = fanin_builder.count;
-    for (int32_t i = 0; i < fanin_builder.count; i++) payload.fanin_slot_states[i] = fanin_builder.slots[i];
+    for (int32_t i = 0; i < fanin_builder.count; i++) payload.fanin_local_ids[i] = fanin_builder.local_ids[i];
 
     payload.init(args, result, prepared.alloc_result, layout);
 
