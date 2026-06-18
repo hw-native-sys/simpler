@@ -173,6 +173,16 @@ struct alignas(64) PTO2TaskSlotState
     PTO2TaskPayload *payload;
     PTO2TaskDescriptor *task;
 
+    // --- (e) Wake-list: lightweight last-fanin notification ---
+    // When a pending consumer's fanin scan finds exactly ONE unmet fanin,
+    // it registers itself on the producer's wake list (CAS push). On producer
+    // completion, the producer atomic-exchanges wake_list_head to the
+    // SENTINEL value and pushes every waiter to the ready queues. Consumers
+    // that observe SENTINEL during registration push themselves directly
+    // (producer already completed). Reset to nullptr on slot reuse.
+    std::atomic<PTO2TaskSlotState *> wake_list_head{nullptr};
+    PTO2TaskSlotState *next_in_wake_list{nullptr};
+
     // --- Set per-submit (depend on task inputs) ---
     ActiveMask active_mask;  // Bitmask of active subtask slots (set once)
     uint8_t ring_id;         // Ring layer (immutable after init)
@@ -200,9 +210,17 @@ struct alignas(64) PTO2TaskSlotState
         completed_subtasks.store(0, std::memory_order_relaxed);
         next_block_idx = 0;
         any_subtask_deferred.store(false, std::memory_order_relaxed);
+        // (e) Wake list: clear for the next incarnation. Previous incarnation
+        // left it at WAKE_LIST_SENTINEL (set by its on_mixed_task_complete).
+        wake_list_head.store(nullptr, std::memory_order_relaxed);
+        next_in_wake_list = nullptr;
         // last_consumer_local_id is reset in prepare_task once the task_id is known.
     }
 };
+
+// (e) Sentinel marking a wake list as "owner already completed; no more
+// registrations accepted". Distinct from any real slot_state pointer.
+inline PTO2TaskSlotState *const WAKE_LIST_SENTINEL = reinterpret_cast<PTO2TaskSlotState *>(uintptr_t{1});
 
 static_assert(sizeof(PTO2TaskSlotState) <= 128, "slot state should fit in two cache lines");
 

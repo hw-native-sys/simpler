@@ -479,6 +479,53 @@ struct PTO2SchedulerState
         return true;
     }
 
+    // (e) Single-pass fanin classification used by the pending poll. Returns:
+    //   -2: all fanins met (route directly to ready)
+    //   -1: 2+ fanins unmet (push back to pending FIFO)
+    //   ≥0: exactly 1 fanin unmet, returned index identifies which fanin
+    //       (register on that producer's wake list).
+    int classify_fanin_state(PTO2TaskSlotState *s) const
+    {
+        const PTO2TaskPayload &p = *s->payload;
+        const auto &ring = *ring_sched_states[s->ring_id].ring;
+        const int32_t mask = ring.task_window_mask;
+        std::atomic<uint8_t> *flags = ring.completion_flags;
+        int unmet_idx = -2;
+        for (int32_t i = 0; i < p.fanin_count; i++)
+        {
+            if (flags[p.fanin_local_ids[i] & mask].load(std::memory_order_acquire) == 0)
+            {
+                if (unmet_idx >= 0) return -1;  // 2+ unmet
+                unmet_idx = i;
+            }
+        }
+        return unmet_idx;
+    }
+
+    // (e) Register `consumer` on `producer`'s wake list. If producer has
+    // already completed (head == WAKE_LIST_SENTINEL), push consumer directly
+    // to ready_queues. Otherwise CAS push-onto the head.
+    void register_wake(PTO2TaskSlotState *producer, PTO2TaskSlotState *consumer)
+    {
+        PTO2TaskSlotState *expected = producer->wake_list_head.load(std::memory_order_relaxed);
+        while (true)
+        {
+            if (expected == WAKE_LIST_SENTINEL)
+            {
+                // Producer already completed and drained its wake list. The
+                // last unmet fanin is now satisfied; push consumer to ready.
+                push_ready_routed(consumer);
+                return;
+            }
+            consumer->next_in_wake_list = expected;
+            if (producer->wake_list_head.compare_exchange_weak(expected, consumer, std::memory_order_acq_rel, std::memory_order_relaxed))
+            {
+                return;  // registered
+            }
+            // CAS failed: expected was updated by load on retry. Loop.
+        }
+    }
+
     // Thread 0 entry point: drain SPSC into pending list, then poll pending
     // for newly-ready tasks. Not-ready tasks rotate to the tail.
     // Returns >0 if anything moved (SPSC drained OR tasks routed to ready);
@@ -512,7 +559,11 @@ struct PTO2SchedulerState
         }
         wiring.backoff_counter = 0;
 
-        // Stage 2: poll pending FIFO, route ready tasks
+        // Stage 2: poll pending FIFO. Three-way classification:
+        //   - all fanins met → push to ready_queues
+        //   - exactly 1 unmet → register on that producer's wake list (no
+        //     more polling for this task; producer wakes it on completion)
+        //   - 2+ unmet → push back to FIFO for the next poll cycle
         uint64_t t1 = poll_cyc_out ? get_sys_cnt_aicpu() : 0;
         int routed = 0;
         int to_visit = static_cast<int>(wiring.pending_count());
@@ -521,14 +572,24 @@ struct PTO2SchedulerState
         {
             PTO2TaskSlotState *s = pending_pop_front();
             if (s == nullptr) break;
-            if (fanin_satisfied(s))
+            int state = classify_fanin_state(s);
+            if (state == -2)
             {
                 push_ready_routed(s);
                 routed++;
             }
+            else if (state == -1)
+            {
+                pending_push_back(s);  // 2+ missing, re-check next cycle
+            }
             else
             {
-                pending_push_back(s);
+                // exactly 1 unmet at index `state`; register and remove from FIFO
+                int32_t prod_local = s->payload->fanin_local_ids[state];
+                auto &ring = *ring_sched_states[s->ring_id].ring;
+                PTO2TaskSlotState *producer = &ring.get_slot_state_by_task_id(prod_local);
+                register_wake(producer, s);
+                routed++;  // count as routed since it's no longer in FIFO
             }
         }
         if (poll_cyc_out)
@@ -573,6 +634,23 @@ struct PTO2SchedulerState
         // makes the producer's output writes visible to consumers that
         // acquire-load this byte in fanin_satisfied.
         ring.completion_flags[my_id & ring.task_window_mask].store(1, std::memory_order_release);
+
+        // (e) Drain the wake list. Any consumer registered on this slot was
+        // waiting on us as their last unmet fanin. After completion_flag is
+        // set above, atomic-exchange wake_list_head to SENTINEL (refusing
+        // any future registrations) and push every waiter to the ready
+        // queues. Ordering: completion_flag is set BEFORE the exchange, so
+        // any consumer that races a registration against our exchange and
+        // observes a SENTINEL during retry will see completion_flag=1 and
+        // push itself directly.
+        PTO2TaskSlotState *waiter = slot_state.wake_list_head.exchange(WAKE_LIST_SENTINEL, std::memory_order_acq_rel);
+        while (waiter != nullptr && waiter != WAKE_LIST_SENTINEL)
+        {
+            PTO2TaskSlotState *next = waiter->next_in_wake_list;
+            waiter->next_in_wake_list = nullptr;
+            push_ready_routed(waiter);
+            waiter = next;
+        }
 
         // CAS-advance the watermark, bounded by my_id (which we know is
         // published since we just completed it). If a forward task we observe
