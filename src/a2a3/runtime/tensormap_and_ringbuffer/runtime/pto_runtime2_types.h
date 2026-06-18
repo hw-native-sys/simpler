@@ -165,11 +165,6 @@ struct alignas(64) PTO2TaskSlotState
     // transitioned to COMPLETED). Single-writer (orchestrator) at submit time.
     int32_t last_consumer_local_id;
 
-    // Task state (PENDING/COMPLETED). Polling readiness reads task_state on
-    // producer slots; reclamation gates on the completed_watermark instead of
-    // a separate CONSUMED transition.
-    std::atomic<PTO2TaskState> task_state;
-
     PTO2TaskPayload *payload;
     PTO2TaskDescriptor *task;
 

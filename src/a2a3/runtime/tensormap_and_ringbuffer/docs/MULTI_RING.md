@@ -179,8 +179,9 @@ Each ring's `last_task_alive` advances independently:
 
 ```text
 advance_ring_pointers(ring_id):  // protected by per-ring advance_lock
-    la = ring->fc.last_task_alive
-    while ring->get_slot_state_by_task_id(la).task_state >= CONSUMED:
+    watermark = ring->completed_watermark
+    la = last_task_alive
+    while la <= watermark and watermark >= slot[la].last_consumer_local_id:
         reset slot for reuse
         la++
     sync_to_sm()  // release-store last_task_alive

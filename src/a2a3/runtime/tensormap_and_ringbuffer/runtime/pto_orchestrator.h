@@ -472,7 +472,6 @@ inline bool prepare_task(PTO2OrchestratorState *orch, const Arg &args, int32_t t
 
     out->slot_state->bind_buffers(out->payload, out->task);
 
-    out->slot_state->task_state.store(PTO2_TASK_PENDING, std::memory_order_relaxed);
     // Clear the polling-fast completion byte for the newly-allocated slot.
     // The previous incarnation's completer set this byte to 1; we publish 0
     // before this task can be added as a fanin to any consumer (single-
