@@ -391,10 +391,12 @@ public:
         // exits, so this adds no overhead to the measured phases.
         profile.total_cycles = get_sys_cnt_aicpu() - profile_loop_start;
         LOG_INFO_V9(
-            "CLAUDE_PROFILING thread=%d total_cyc=%lu iters=%lu compl_cyc=%lu compl_n=%lu async_cyc=%lu async_n=%lu drain_cyc=%lu drain_n=%lu spsc_cyc=%lu spsc_n=%lu poll_cyc=%lu poll_n=%lu poll_skipped=%lu dummy_cyc=%lu dummy_n=%lu dispatch_cyc=%lu dispatch_n=%lu idle_cyc=%lu idle_n=%lu",
+            "CLAUDE_PROFILING thread=%d total_cyc=%lu iters=%lu compl_cyc=%lu compl_n=%lu ctask_cyc=%lu ctask_n=%lu cores_scan=%lu async_cyc=%lu async_n=%lu drain_cyc=%lu drain_n=%lu spsc_cyc=%lu spsc_n=%lu poll_cyc=%lu poll_n=%lu poll_skipped=%lu dummy_cyc=%lu dummy_n=%lu dispatch_cyc=%lu dispatch_n=%lu idle_cyc=%lu idle_n=%lu",
             (int)thread_idx,
             (unsigned long)profile.total_cycles, (unsigned long)profile.total_iters,
             (unsigned long)profile.completion_cycles, (unsigned long)profile.completion_iters,
+            (unsigned long)profile.complete_task_cycles, (unsigned long)profile.complete_task_calls,
+            (unsigned long)profile.cores_scanned,
             (unsigned long)profile.async_wait_cycles, (unsigned long)profile.async_wait_iters,
             (unsigned long)profile.drain_wiring_cycles, (unsigned long)profile.drain_wiring_iters,
             (unsigned long)profile.spsc_drain_cycles, (unsigned long)profile.spsc_drain_iters,
@@ -1217,6 +1219,7 @@ private:
 
     void check_running_cores_for_completion(int32_t thread_idx, Handshake *hank, int32_t &completed_this_turn, int32_t &cur_thread_completed, bool &made_progress, PTO2LocalReadyBuffer *local_bufs)
     {
+        SchedulerThreadProfile &profile = thread_profiles_[thread_idx];
         CoreTracker &tracker = core_trackers_[thread_idx];
         auto running_core_states = tracker.get_all_running_cores();
         while (running_core_states.has_value())
@@ -1224,6 +1227,7 @@ private:
             int32_t bit_pos = running_core_states.pop_first();
             int32_t core_id = tracker.get_core_id_by_offset(bit_pos);
             CoreExecState &core = core_exec_states_[core_id];
+            profile.cores_scanned++;
 
             uint64_t reg_val = static_cast<uint64_t>(*core.cond_ptr);
             rmb();
@@ -1238,12 +1242,18 @@ private:
             // 1. Complete finished tasks (capture pointers before modifying core state)
             if (t.pending_done)
             {
+                uint64_t tc0 = get_sys_cnt_aicpu();
                 complete_slot_task(*core.pending_slot_state, core.pending_reg_task_id, core_id, hank, completed_this_turn, local_bufs);
+                profile.complete_task_cycles += get_sys_cnt_aicpu() - tc0;
+                profile.complete_task_calls++;
                 cur_thread_completed++;
             }
             if (t.running_done)
             {
+                uint64_t tc0 = get_sys_cnt_aicpu();
                 complete_slot_task(*core.running_slot_state, core.running_reg_task_id, core_id, hank, completed_this_turn, local_bufs);
+                profile.complete_task_cycles += get_sys_cnt_aicpu() - tc0;
+                profile.complete_task_calls++;
                 cur_thread_completed++;
             }
 

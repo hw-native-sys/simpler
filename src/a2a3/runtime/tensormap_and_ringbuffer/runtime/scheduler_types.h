@@ -48,6 +48,13 @@ struct alignas(64) SchedulerThreadProfile
 {
     uint64_t total_cycles{0};
     uint64_t completion_cycles{0};
+    // Sub-phase of completion: time spent INSIDE complete_slot_task, and
+    // count of times it ran (one per subtask completion observed).
+    uint64_t complete_task_cycles{0};
+    uint64_t complete_task_calls{0};
+    // Sub-phase of completion: count of cores scanned per iter (proxy for
+    // cond_ptr read cost; aggregate / completion_iters = avg cores/iter).
+    uint64_t cores_scanned{0};
     uint64_t async_wait_cycles{0};
     uint64_t drain_wiring_cycles{0};
     uint64_t spsc_drain_cycles{0};    // sub-phase of drain_wiring: SPSC → pending FIFO
