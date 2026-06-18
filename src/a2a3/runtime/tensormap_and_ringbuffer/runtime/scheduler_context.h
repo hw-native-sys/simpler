@@ -30,7 +30,10 @@
 #include "aicpu/tensor_dump_aicpu.h"
 #include "common/memory_barrier.h"
 #include "common/platform_config.h"
+#include "common/unified_log.h"
 #include "spin_hint.h"
+// SchedulerThreadProfile is defined in scheduler_types.h (above) so the
+// drain_wiring_queue method in pto_scheduler.h can take a pointer to it.
 
 #ifndef unlikely
 #define unlikely(x) __builtin_expect(!!(x), 0)
@@ -229,10 +232,18 @@ public:
 
         uint64_t last_progress_ts = get_sys_cnt_aicpu();
 
+        // Profile reset + total-cycle start. Reset here so each
+        // resolve_and_dispatch call (≈ one kernel launch) records its own
+        // breakdown. The dump happens at loop exit, well outside the hot path.
+        SchedulerThreadProfile &profile = thread_profiles_[thread_idx];
+        profile.reset();
+        const uint64_t profile_loop_start = get_sys_cnt_aicpu();
+
         while (true)
         {
             if (completed_.load(std::memory_order_acquire)) break;
             bool made_progress = false;
+            profile.total_iters++;
             int32_t task_count = 0;
             if (!tracker.has_any_running_cores())
             {
@@ -250,7 +261,13 @@ public:
             int32_t completed_this_turn = 0;
 
             bool try_completed = tracker.has_any_running_cores();
-            if (try_completed) check_running_cores_for_completion(thread_idx, hank, completed_this_turn, cur_thread_completed, made_progress, local_bufs);
+            if (try_completed)
+            {
+                uint64_t t0 = get_sys_cnt_aicpu();
+                check_running_cores_for_completion(thread_idx, hank, completed_this_turn, cur_thread_completed, made_progress, local_bufs);
+                profile.completion_cycles += get_sys_cnt_aicpu() - t0;
+                profile.completion_iters++;
+            }
             if (completed_this_turn > 0)
             {
                 int32_t prev = completed_tasks_.fetch_add(completed_this_turn, std::memory_order_relaxed);
@@ -263,8 +280,10 @@ public:
                 }
             }
 
+            uint64_t t0_async = 0;
             if (rt_ != nullptr && rt_->aicore_mailbox != nullptr && (sched_->async_wait_list.count > 0 || rt_->aicore_mailbox->has_pending()))
             {
+                t0_async = get_sys_cnt_aicpu();
                 AsyncPollResult poll_result = sched_->async_wait_list.poll_and_complete<false>(rt_->aicore_mailbox, sched_, local_bufs);
                 if (poll_result.error_code != PTO2_ERROR_NONE)
                 {
@@ -280,6 +299,8 @@ public:
                     last_progress_count = new_total;
                     made_progress = true;
                 }
+                profile.async_wait_cycles += get_sys_cnt_aicpu() - t0_async;
+                profile.async_wait_iters++;
             }
 
             bool try_pushed = false;
@@ -291,15 +312,23 @@ public:
                 continue;
             }
 
-            // Phase 3: Drain wiring queue (thread 0 only)
+            // Phase 3: Drain wiring queue (thread 0 only). Pass cumulative
+            // sub-phase counters (SPSC drain stage 1 / pending-FIFO poll
+            // stage 2) so drain_wiring_queue accumulates into them.
             if (thread_idx == 0)
             {
-                int wired = sched_->drain_wiring_queue(orchestrator_done_);
+                uint64_t t0 = get_sys_cnt_aicpu();
+                int wired = sched_->drain_wiring_queue(orchestrator_done_,
+                    &profile.spsc_drain_cycles, &profile.spsc_drain_iters,
+                    &profile.pending_poll_cycles, &profile.pending_poll_iters);
                 if (wired > 0) made_progress = true;
+                profile.drain_wiring_cycles += get_sys_cnt_aicpu() - t0;
+                profile.drain_wiring_iters++;
             }
 
             if (thread_idx == 0)
             {
+                uint64_t t0 = get_sys_cnt_aicpu();
                 constexpr int DUMMY_DRAIN_BATCH = 16;
                 PTO2TaskSlotState *dummy_batch[DUMMY_DRAIN_BATCH];
                 int dummy_got = sched_->dummy_ready_queue.pop_batch(dummy_batch, DUMMY_DRAIN_BATCH);
@@ -312,11 +341,18 @@ public:
                     cur_thread_completed++;
                 }
                 if (dummy_got > 0) made_progress = true;
+                profile.dummy_drain_cycles += get_sys_cnt_aicpu() - t0;
+                profile.dummy_drain_iters++;
             }
 
             // Phase 4: MIX-strict-priority dispatch with phase-split and
             // cross-thread idle gating. See dispatch_ready_tasks for the policy.
-            dispatch_ready_tasks(thread_idx, tracker, local_bufs, pmu_active, made_progress, try_pushed);
+            {
+                uint64_t t0 = get_sys_cnt_aicpu();
+                dispatch_ready_tasks(thread_idx, tracker, local_bufs, pmu_active, made_progress, try_pushed);
+                profile.dispatch_cycles += get_sys_cnt_aicpu() - t0;
+                profile.dispatch_iters++;
+            }
 
             (void)try_completed;
             (void)try_pushed;
@@ -328,6 +364,7 @@ public:
             }
             else
             {
+                uint64_t t0_idle = get_sys_cnt_aicpu();
                 idle_iterations++;
 
                 if (idle_iterations % FATAL_ERROR_CHECK_INTERVAL == 0)
@@ -345,8 +382,27 @@ public:
                     last_progress_ts = get_sys_cnt_aicpu();
                 }
                 SPIN_WAIT_HINT();
+                profile.idle_spin_cycles += get_sys_cnt_aicpu() - t0_idle;
+                profile.idle_iters++;
             }
         }
+
+        // Dump profile breakdown for this thread. Logged AFTER the hot loop
+        // exits, so this adds no overhead to the measured phases.
+        profile.total_cycles = get_sys_cnt_aicpu() - profile_loop_start;
+        LOG_INFO_V9(
+            "CLAUDE_PROFILING thread=%d total_cyc=%lu iters=%lu compl_cyc=%lu compl_n=%lu async_cyc=%lu async_n=%lu drain_cyc=%lu drain_n=%lu spsc_cyc=%lu spsc_n=%lu poll_cyc=%lu poll_n=%lu poll_skipped=%lu dummy_cyc=%lu dummy_n=%lu dispatch_cyc=%lu dispatch_n=%lu idle_cyc=%lu idle_n=%lu",
+            (int)thread_idx,
+            (unsigned long)profile.total_cycles, (unsigned long)profile.total_iters,
+            (unsigned long)profile.completion_cycles, (unsigned long)profile.completion_iters,
+            (unsigned long)profile.async_wait_cycles, (unsigned long)profile.async_wait_iters,
+            (unsigned long)profile.drain_wiring_cycles, (unsigned long)profile.drain_wiring_iters,
+            (unsigned long)profile.spsc_drain_cycles, (unsigned long)profile.spsc_drain_iters,
+            (unsigned long)profile.pending_poll_cycles, (unsigned long)profile.pending_poll_iters,
+            (unsigned long)profile.pending_poll_skipped,
+            (unsigned long)profile.dummy_drain_cycles, (unsigned long)profile.dummy_drain_iters,
+            (unsigned long)profile.dispatch_cycles, (unsigned long)profile.dispatch_iters,
+            (unsigned long)profile.idle_spin_cycles, (unsigned long)profile.idle_iters);
 
         return cur_thread_completed;
     }
@@ -457,6 +513,7 @@ private:
 
     // Cluster-ordered core trackers, one per scheduler thread
     CoreTracker core_trackers_[MAX_AICPU_THREADS];
+    SchedulerThreadProfile thread_profiles_[MAX_AICPU_THREADS];
 
     // Per-core dispatch payload storage: dual-buffer for pipelining.
     // buf_idx = reg_task_id & 1; adjacent dispatches alternate automatically.

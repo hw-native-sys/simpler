@@ -20,6 +20,11 @@
 #include "pto_runtime2_types.h"
 #include "pto_shared_memory.h"
 
+// Forward declaration so this header can compile under both AICPU and host
+// builds. The actual definition is provided by aicpu/device_time.cpp (AICPU)
+// or a weak stub in pto_runtime2.h (host). Used only for sub-phase profiling.
+uint64_t get_sys_cnt_aicpu();
+
 struct PTO2ReadyQueueSlot
 {
     std::atomic<int64_t> sequence;
@@ -478,11 +483,23 @@ struct PTO2SchedulerState
     // for newly-ready tasks. Not-ready tasks rotate to the tail.
     // Returns >0 if anything moved (SPSC drained OR tasks routed to ready);
     // 0 signals no productive work.
-    int drain_wiring_queue(bool force_drain = false)
+    //
+    // Sub-phase timing pointers (optional). If non-null, cumulative cycle/
+    // iteration counters for Stage 1 (SPSC drain) and Stage 2 (pending poll)
+    // are accumulated into them.
+    int drain_wiring_queue(bool force_drain = false,
+                           uint64_t *spsc_cyc_out = nullptr, uint64_t *spsc_iters_out = nullptr,
+                           uint64_t *poll_cyc_out = nullptr, uint64_t *poll_iters_out = nullptr)
     {
         // Stage 1: drain SPSC → pending FIFO tail
+        uint64_t t0 = spsc_cyc_out ? get_sys_cnt_aicpu() : 0;
         int drained = wiring.queue.pop_batch(wiring.drain_buf, PendingState::DRAIN_BATCH);
         for (int i = 0; i < drained; i++) pending_push_back(wiring.drain_buf[i]);
+        if (spsc_cyc_out)
+        {
+            *spsc_cyc_out += get_sys_cnt_aicpu() - t0;
+            if (spsc_iters_out) (*spsc_iters_out)++;
+        }
 
         // Backoff when nothing to do and orchestrator isn't pressing
         if (drained == 0 && wiring.pending_empty())
@@ -496,6 +513,7 @@ struct PTO2SchedulerState
         wiring.backoff_counter = 0;
 
         // Stage 2: poll pending FIFO, route ready tasks
+        uint64_t t1 = poll_cyc_out ? get_sys_cnt_aicpu() : 0;
         int routed = 0;
         int to_visit = static_cast<int>(wiring.pending_count());
         if (to_visit > PendingState::POLL_MAX_PER_ITER) to_visit = PendingState::POLL_MAX_PER_ITER;
@@ -512,6 +530,11 @@ struct PTO2SchedulerState
             {
                 pending_push_back(s);
             }
+        }
+        if (poll_cyc_out)
+        {
+            *poll_cyc_out += get_sys_cnt_aicpu() - t1;
+            if (poll_iters_out) (*poll_iters_out)++;
         }
 
         return drained + routed;

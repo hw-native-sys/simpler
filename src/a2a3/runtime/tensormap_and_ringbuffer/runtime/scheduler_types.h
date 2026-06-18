@@ -41,6 +41,34 @@ enum class LoopAction : int8_t
     BREAK_LOOP,  // equivalent to 'break' from the while(true) loop
 };
 
+// Per-thread phase profiling. Accumulates cumulative cycle counts and entry
+// counts for each phase of resolve_and_dispatch's main loop. Dumped once at
+// loop exit via LOG_INFO_V9 — the hot path only does cycle counter math.
+struct alignas(64) SchedulerThreadProfile
+{
+    uint64_t total_cycles{0};
+    uint64_t completion_cycles{0};
+    uint64_t async_wait_cycles{0};
+    uint64_t drain_wiring_cycles{0};
+    uint64_t spsc_drain_cycles{0};    // sub-phase of drain_wiring: SPSC → pending FIFO
+    uint64_t pending_poll_cycles{0};  // sub-phase of drain_wiring: pending FIFO → ready
+    uint64_t dummy_drain_cycles{0};
+    uint64_t dispatch_cycles{0};
+    uint64_t idle_spin_cycles{0};
+    uint64_t completion_iters{0};
+    uint64_t async_wait_iters{0};
+    uint64_t drain_wiring_iters{0};
+    uint64_t spsc_drain_iters{0};
+    uint64_t pending_poll_iters{0};
+    uint64_t pending_poll_skipped{0};  // (a) gate hits: poll calls skipped due to no new completions
+    uint64_t dummy_drain_iters{0};
+    uint64_t dispatch_iters{0};
+    uint64_t idle_iters{0};
+    uint64_t total_iters{0};
+
+    void reset() { *this = SchedulerThreadProfile{}; }
+};
+
 struct alignas(64) CoreExecState
 {
     // --- Hot fields (completion + dispatch, every iteration) ---
