@@ -44,14 +44,14 @@ def _send_json(sock: socket.socket, payload: dict[str, Any]) -> None:
 
 
 def _validate_manifest(manifest: dict[str, Any]) -> None:
-    required = ["session_id", "endpoint_id", "parent_worker_level", "remote_worker_level", "platform", "transport"]
+    required = ["session_id", "worker_id", "parent_worker_level", "remote_worker_level", "platform", "transport"]
     for key in required:
         if key not in manifest:
             raise ValueError(f"manifest missing {key}")
     if int(manifest["session_id"]) == 0:
         raise ValueError("manifest session_id must be non-zero")
-    if int(manifest["endpoint_id"]) < 0:
-        raise ValueError("manifest endpoint_id must be non-negative")
+    if int(manifest["worker_id"]) < 0:
+        raise ValueError("manifest worker_id must be non-negative")
     if int(manifest["remote_worker_level"]) != 3:
         raise ValueError("manifest remote_worker_level must be 3")
     if not str(manifest["platform"]):

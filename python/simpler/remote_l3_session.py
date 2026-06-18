@@ -159,7 +159,7 @@ def _send_ready(fd: int, payload: dict[str, Any]) -> None:
     os.close(fd)
 
 
-def _health_loop(sock: socket.socket, stop: threading.Event, session_id: int, endpoint_id: int) -> None:
+def _health_loop(sock: socket.socket, stop: threading.Event, session_id: int, worker_id: int) -> None:
     sock.settimeout(0.2)
     try:
         conn: socket.socket | None = None
@@ -173,7 +173,7 @@ def _health_loop(sock: socket.socket, stop: threading.Event, session_id: int, en
                     continue
             try:
                 sequence += 1
-                header = FrameHeader(FrameType.HEALTH, session_id, endpoint_id, sequence)
+                header = FrameHeader(FrameType.HEALTH, session_id, worker_id, sequence)
                 conn.sendall(encode_frame(header, b""))
                 stop.wait(0.2)
             except OSError:
@@ -414,16 +414,16 @@ def _control_reply(
     error_message: str,
 ) -> None:
     session_id = int(manifest["session_id"])
-    endpoint_id = int(manifest["endpoint_id"])
+    worker_id = int(manifest["worker_id"])
     payload = encode_control_reply(sequence, control_name, version, error_code, error_message)
-    send_frame(conn, FrameHeader(FrameType.CONTROL_REPLY, session_id, endpoint_id, sequence), payload)
+    send_frame(conn, FrameHeader(FrameType.CONTROL_REPLY, session_id, worker_id, sequence), payload)
 
 
 def _copy_command_header(data: bytes) -> tuple[int, int, int, int, int, bytes]:
     if len(data) < 36:
         raise ValueError("remote buffer copy command is truncated")
-    endpoint_id, buffer_id, generation, offset, size = struct.unpack_from("<iQQQQ", data, 0)
-    return int(endpoint_id), int(buffer_id), int(generation), int(offset), int(size), data[36:]
+    worker_id, buffer_id, generation, offset, size = struct.unpack_from("<iQQQQ", data, 0)
+    return int(worker_id), int(buffer_id), int(generation), int(offset), int(size), data[36:]
 
 
 def _buffer_key(buffer_id: int, generation: int) -> tuple[int, int]:
@@ -435,7 +435,7 @@ def _tensor_with_data(tensor: ContinuousTensor, data: int) -> ContinuousTensor:
 
 
 def _materialize_task_args(  # noqa: PLR0912
-    args: RemoteTaskArgsWire, buffers: dict[tuple[int, ...], _RemoteBufferEntry], endpoint_id: int
+    args: RemoteTaskArgsWire, buffers: dict[tuple[int, ...], _RemoteBufferEntry], worker_id: int
 ) -> tuple[TaskArgs, list[Any]]:
     if len(args.remote_desc) != len(args.tensor_metadata):
         raise ValueError("remote TASK descriptor count does not match tensor metadata count")
@@ -460,13 +460,13 @@ def _materialize_task_args(  # noqa: PLR0912
                 keepalive.append(buf)
                 materialized = _tensor_with_data(tensor, ctypes.addressof(buf))
             else:
-                if desc.owner_endpoint_id == endpoint_id and desc.address_space == RemoteAddressSpace.REMOTE_DEVICE:
+                if desc.owner_worker_id == worker_id and desc.address_space == RemoteAddressSpace.REMOTE_DEVICE:
                     key = _buffer_key(desc.buffer_id, desc.generation)
                 elif desc.address_space in (RemoteAddressSpace.REMOTE_WINDOW, RemoteAddressSpace.UB_LDST):
-                    key = (desc.owner_endpoint_id, desc.buffer_id, desc.generation, desc.rkey_or_token)
+                    key = (desc.owner_worker_id, desc.buffer_id, desc.generation, desc.rkey_or_token)
                 else:
                     raise ValueError(
-                        "remote TASK descriptor names a different endpoint without an imported buffer handle"
+                        "remote TASK descriptor names a different worker without an imported buffer handle"
                     )
                 entry = buffers.get(key)
                 if entry is None:
@@ -493,7 +493,7 @@ def _run_command_loop(  # noqa: PLR0912, PLR0915
     manifest_dispatch_registry: dict[bytes, Callable[..., Any]] | None = None,
 ) -> None:
     session_id = int(manifest["session_id"])
-    endpoint_id = int(manifest["endpoint_id"])
+    worker_id = int(manifest["worker_id"])
     dispatch_registry: dict[bytes, Callable[..., Any]] = dict(manifest_dispatch_registry or {})
     prepared_dispatcher: dict[bytes, Callable[..., Any]] = {}
     prepared_inner: dict[tuple[CallableKind, bytes], Any] = {}
@@ -505,20 +505,20 @@ def _run_command_loop(  # noqa: PLR0912, PLR0915
 
     hello = HelloPayload(
         session_id=session_id,
-        endpoint_id=endpoint_id,
+        worker_id=worker_id,
         protocol_version=1,
         comm_profile=str(manifest["transport"]),
         feature_flags=0,
         ready_state=ReadyState.READY,
     )
-    send_frame(conn, FrameHeader(FrameType.HELLO, session_id, endpoint_id, 0), encode_hello(hello))
+    send_frame(conn, FrameHeader(FrameType.HELLO, session_id, worker_id, 0), encode_hello(hello))
 
     try:
         while True:
             frame = read_frame(conn)
             header = frame.header
-            if header.session_id != session_id or header.endpoint_id != endpoint_id:
-                raise RuntimeError("remote session received mismatched session or endpoint frame")
+            if header.session_id != session_id or header.worker_id != worker_id:
+                raise RuntimeError("remote session received mismatched session or worker frame")
             if header.frame_type == FrameType.SHUTDOWN:
                 return
             if header.frame_type == FrameType.CONTROL:
@@ -621,7 +621,7 @@ def _run_command_loop(  # noqa: PLR0912, PLR0915
                         remote_addr = entry.addr
                         result = struct.pack(
                             "<iQQiQQQQ",
-                            endpoint_id,
+                            worker_id,
                             buffer_id,
                             generation,
                             int(RemoteAddressSpace.REMOTE_DEVICE),
@@ -635,15 +635,15 @@ def _run_command_loop(  # noqa: PLR0912, PLR0915
                         )
                         send_frame(
                             conn,
-                            FrameHeader(FrameType.CONTROL_REPLY, session_id, endpoint_id, header.sequence),
+                            FrameHeader(FrameType.CONTROL_REPLY, session_id, worker_id, header.sequence),
                             payload,
                         )
                     elif control.control_name == ControlName.FREE_REMOTE_BUFFER:
                         if len(control.command_bytes) != 20:
-                            raise ValueError("FREE_REMOTE_BUFFER payload must be endpoint_id, buffer_id, generation")
-                        owner_endpoint, buffer_id, generation = struct.unpack("<iQQ", control.command_bytes)
-                        if int(owner_endpoint) != endpoint_id:
-                            raise ValueError("FREE_REMOTE_BUFFER endpoint mismatch")
+                            raise ValueError("FREE_REMOTE_BUFFER payload must be worker_id, buffer_id, generation")
+                        owner_worker_id, buffer_id, generation = struct.unpack("<iQQ", control.command_bytes)
+                        if int(owner_worker_id) != worker_id:
+                            raise ValueError("FREE_REMOTE_BUFFER worker mismatch")
                         key = _buffer_key(buffer_id, generation)
                         entry = buffers.get(key)
                         if entry is not None:
@@ -654,11 +654,11 @@ def _run_command_loop(  # noqa: PLR0912, PLR0915
                             conn, manifest, header.sequence, control.control_name, control.control_version, 0, ""
                         )
                     elif control.control_name == ControlName.COPY_TO_REMOTE:
-                        owner_endpoint, buffer_id, generation, offset, size, data = _copy_command_header(
+                        owner_worker_id, buffer_id, generation, offset, size, data = _copy_command_header(
                             control.command_bytes
                         )
-                        if owner_endpoint != endpoint_id:
-                            raise ValueError("COPY_TO_REMOTE endpoint mismatch")
+                        if owner_worker_id != worker_id:
+                            raise ValueError("COPY_TO_REMOTE worker mismatch")
                         key = _buffer_key(buffer_id, generation)
                         entry = buffers.get(key)
                         if entry is None:
@@ -674,13 +674,13 @@ def _run_command_loop(  # noqa: PLR0912, PLR0915
                             conn, manifest, header.sequence, control.control_name, control.control_version, 0, ""
                         )
                     elif control.control_name == ControlName.COPY_FROM_REMOTE:
-                        owner_endpoint, buffer_id, generation, offset, size, data = _copy_command_header(
+                        owner_worker_id, buffer_id, generation, offset, size, data = _copy_command_header(
                             control.command_bytes
                         )
                         if data:
                             raise ValueError("COPY_FROM_REMOTE request must not carry data bytes")
-                        if owner_endpoint != endpoint_id:
-                            raise ValueError("COPY_FROM_REMOTE endpoint mismatch")
+                        if owner_worker_id != worker_id:
+                            raise ValueError("COPY_FROM_REMOTE worker mismatch")
                         key = _buffer_key(buffer_id, generation)
                         entry = buffers.get(key)
                         if entry is None:
@@ -695,13 +695,13 @@ def _run_command_loop(  # noqa: PLR0912, PLR0915
                         )
                         send_frame(
                             conn,
-                            FrameHeader(FrameType.CONTROL_REPLY, session_id, endpoint_id, header.sequence),
+                            FrameHeader(FrameType.CONTROL_REPLY, session_id, worker_id, header.sequence),
                             payload,
                         )
                     elif control.control_name == ControlName.EXPORT_BUFFER:
                         request = decode_export_buffer_request(control.command_bytes)
-                        if request.owner_endpoint_id != endpoint_id:
-                            raise ValueError("EXPORT_BUFFER endpoint mismatch")
+                        if request.owner_worker_id != worker_id:
+                            raise ValueError("EXPORT_BUFFER worker mismatch")
                         key = _buffer_key(request.buffer_id, request.generation)
                         entry = buffers.get(key)
                         if entry is None:
@@ -715,7 +715,7 @@ def _run_command_loop(  # noqa: PLR0912, PLR0915
                         export_id = next_export_id
                         next_export_id += 1
                         result = ExportBufferResult(
-                            owner_endpoint_id=endpoint_id,
+                            owner_worker_id=worker_id,
                             buffer_id=request.buffer_id,
                             generation=request.generation,
                             address_space=RemoteAddressSpace.REMOTE_WINDOW,
@@ -739,13 +739,13 @@ def _run_command_loop(  # noqa: PLR0912, PLR0915
                         )
                         send_frame(
                             conn,
-                            FrameHeader(FrameType.CONTROL_REPLY, session_id, endpoint_id, header.sequence),
+                            FrameHeader(FrameType.CONTROL_REPLY, session_id, worker_id, header.sequence),
                             payload,
                         )
                     elif control.control_name == ControlName.IMPORT_BUFFER:
                         request = decode_import_buffer_request(control.command_bytes)
-                        if request.importer_endpoint_id != endpoint_id:
-                            raise ValueError("IMPORT_BUFFER endpoint mismatch")
+                        if request.importer_worker_id != worker_id:
+                            raise ValueError("IMPORT_BUFFER worker mismatch")
                         export_desc = request.export_desc
                         if export_desc.transport_profile != "sim":
                             raise ValueError("IMPORT_BUFFER transport_profile is not supported by sim")
@@ -753,7 +753,7 @@ def _run_command_loop(  # noqa: PLR0912, PLR0915
                         shm = shared_memory.SharedMemory(name=shm_name)
                         import_id = next_import_id
                         next_import_id += 1
-                        key = (export_desc.owner_endpoint_id, export_desc.buffer_id, export_desc.generation, import_id)
+                        key = (export_desc.owner_worker_id, export_desc.buffer_id, export_desc.generation, import_id)
                         buffers[key] = _RemoteBufferEntry(
                             shm,
                             int(export_desc.nbytes),
@@ -762,8 +762,8 @@ def _run_command_loop(  # noqa: PLR0912, PLR0915
                             offset=int(export_desc.offset),
                         )
                         result = ImportBufferResult(
-                            importer_endpoint_id=endpoint_id,
-                            owner_endpoint_id=export_desc.owner_endpoint_id,
+                            importer_worker_id=worker_id,
+                            owner_worker_id=export_desc.owner_worker_id,
                             buffer_id=export_desc.buffer_id,
                             generation=export_desc.generation,
                             import_id=import_id,
@@ -787,14 +787,14 @@ def _run_command_loop(  # noqa: PLR0912, PLR0915
                         )
                         send_frame(
                             conn,
-                            FrameHeader(FrameType.CONTROL_REPLY, session_id, endpoint_id, header.sequence),
+                            FrameHeader(FrameType.CONTROL_REPLY, session_id, worker_id, header.sequence),
                             payload,
                         )
                     elif control.control_name == ControlName.RELEASE_IMPORT:
                         request = decode_release_import_request(control.command_bytes)
-                        if request.importer_endpoint_id != endpoint_id:
-                            raise ValueError("RELEASE_IMPORT endpoint mismatch")
-                        key = (request.owner_endpoint_id, request.buffer_id, request.generation, request.import_id)
+                        if request.importer_worker_id != worker_id:
+                            raise ValueError("RELEASE_IMPORT worker mismatch")
+                        key = (request.owner_worker_id, request.buffer_id, request.generation, request.import_id)
                         entry = buffers.get(key)
                         if entry is None:
                             raise KeyError("RELEASE_IMPORT names unknown import")
@@ -843,14 +843,14 @@ def _run_command_loop(  # noqa: PLR0912, PLR0915
                         control_name,
                         control_version,
                         1,
-                        _format_remote_error(f"remote endpoint={endpoint_id} control sequence={header.sequence}", exc),
+                        _format_remote_error(f"remote worker_id={worker_id} control sequence={header.sequence}", exc),
                     )
                 continue
             if header.frame_type != FrameType.TASK:
                 payload = encode_completion(
                     header.sequence, 1, f"unsupported remote frame type {int(header.frame_type)}"
                 )
-                send_frame(conn, FrameHeader(FrameType.COMPLETION, session_id, endpoint_id, header.sequence), payload)
+                send_frame(conn, FrameHeader(FrameType.COMPLETION, session_id, worker_id, header.sequence), payload)
                 continue
 
             try:
@@ -858,7 +858,7 @@ def _run_command_loop(  # noqa: PLR0912, PLR0915
                 orch_fn = dispatch_registry.get(task.callable_digest)
                 if orch_fn is None:
                     raise KeyError(f"remote TASK dispatcher has no callable hashid {task.callable_digest.hex()}")
-                task_args, keepalive = _materialize_task_args(task.args, buffers, endpoint_id)
+                task_args, keepalive = _materialize_task_args(task.args, buffers, worker_id)
                 try:
                     inner_worker.run(orch_fn, task_args, task.config)
                 finally:
@@ -869,11 +869,11 @@ def _run_command_loop(  # noqa: PLR0912, PLR0915
                     header.sequence,
                     1,
                     _format_remote_error(
-                        f"remote endpoint={endpoint_id} hashid={frame.payload[:32].hex()} sequence={header.sequence}",
+                        f"remote worker_id={worker_id} hashid={frame.payload[:32].hex()} sequence={header.sequence}",
                         exc,
                     ),
                 )
-            send_frame(conn, FrameHeader(FrameType.COMPLETION, session_id, endpoint_id, header.sequence), payload)
+            send_frame(conn, FrameHeader(FrameType.COMPLETION, session_id, worker_id, header.sequence), payload)
     finally:
         for key, entry in list(buffers.items()):
             entry.close(unlink=len(key) == 2)
@@ -906,7 +906,7 @@ def run_session(manifest: dict[str, Any], ready_fd: int) -> int:
         health_sock = _bind_listener(listen_host)
         health_thread = threading.Thread(
             target=_health_loop,
-            args=(health_sock, stop_health, int(manifest["session_id"]), int(manifest["endpoint_id"])),
+            args=(health_sock, stop_health, int(manifest["session_id"]), int(manifest["worker_id"])),
             daemon=True,
         )
         health_thread.start()

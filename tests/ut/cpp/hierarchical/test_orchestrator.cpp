@@ -263,7 +263,7 @@ TEST_F(OrchestratorFixture, RemoteOutputSidecarSkipsLocalAutoAllocAndRegistersRe
     sidecar.tensors.resize(1);
     sidecar.tensors[0].present = true;
     sidecar.tensors[0].desc.address_space = RemoteAddressSpace::REMOTE_DEVICE;
-    sidecar.tensors[0].desc.owner_endpoint_id = 3;
+    sidecar.tensors[0].desc.owner_worker_id = 3;
     sidecar.tensors[0].desc.buffer_id = 9;
     sidecar.tensors[0].desc.generation = 2;
     sidecar.tensors[0].desc.offset = 64;
@@ -299,7 +299,7 @@ TEST_F(OrchestratorFixture, RemoteSidecarRejectsNonOwnerEligibleEndpointWithoutI
     sidecar.tensors.resize(1);
     sidecar.tensors[0].present = true;
     sidecar.tensors[0].desc.address_space = RemoteAddressSpace::REMOTE_DEVICE;
-    sidecar.tensors[0].desc.owner_endpoint_id = 3;
+    sidecar.tensors[0].desc.owner_worker_id = 3;
     sidecar.tensors[0].desc.buffer_id = 9;
     sidecar.tensors[0].desc.generation = 2;
     sidecar.tensors[0].desc.nbytes = 1;
@@ -320,7 +320,7 @@ TEST_F(OrchestratorFixture, RemoteInputSidecarUsesRemoteTensorMapKey) {
     output_sidecar.tensors.resize(1);
     output_sidecar.tensors[0].present = true;
     output_sidecar.tensors[0].desc.address_space = RemoteAddressSpace::REMOTE_DEVICE;
-    output_sidecar.tensors[0].desc.owner_endpoint_id = 3;
+    output_sidecar.tensors[0].desc.owner_worker_id = 3;
     output_sidecar.tensors[0].desc.buffer_id = 9;
     output_sidecar.tensors[0].desc.generation = 2;
     output_sidecar.tensors[0].desc.offset = 0;

@@ -22,7 +22,7 @@ FrameHeader:
   frame_type =
     HELLO | TASK | CONTROL | CONTROL_REPLY | COMPLETION | HEALTH | SHUTDOWN
   session_id
-  endpoint_id
+  worker_id
   sequence
   payload_bytes
   flags
@@ -32,7 +32,7 @@ Rules:
 
 - `magic` and `version` are validated before reading payload fields.
 - `session_id` protects against stale frames from prior sessions.
-- `endpoint_id` must match the logical NEXT_LEVEL worker selected by the
+- `worker_id` must match the logical NEXT_LEVEL worker selected by the
   parent scheduler.
 - For parent-to-runner command requests, `sequence` is monotonic per endpoint
   on the ordered command lane. This includes `TASK`, state-changing `CONTROL`,
@@ -116,7 +116,7 @@ and health lanes. `HELLO` does not carry the bootstrap manifest.
 
 ```text
 session_id
-endpoint_id
+worker_id
 protocol_version
 comm profile
 feature flags
@@ -124,7 +124,7 @@ ready_state
 ```
 
 The parent treats the endpoint as schedulable only after the `HELLO` exchange
-confirms `ready_state=READY`, matching `session_id`, matching `endpoint_id`,
+confirms `ready_state=READY`, matching `session_id`, matching `worker_id`,
 and compatible protocol and feature sets.
 
 `READY` is a scheduling barrier. A session that can answer liveness probes but
@@ -196,7 +196,7 @@ RemoteTensorDescWire:
     REMOTE_DEVICE
     REMOTE_WINDOW
     UB_LDST
-  owner_endpoint_id
+  owner_worker_id
   buffer_id
   offset
   nbytes
@@ -220,7 +220,7 @@ Rules:
 - Metadata-only tensors also require `ContinuousTensorWire.data == 0`.
 - Parent-side dependency keys use a stable logical start-address key derived at
   submit time:
-  `(address_kind, owner_endpoint_id, buffer_id, generation, offset)`.
+  `(address_kind, owner_worker_id, buffer_id, generation, offset)`.
   `nbytes` bounds the descriptor and is kept for validation and future overlap
   detection, but it is not part of the first implementation's TensorMap lookup.
 - `offset + nbytes` must fit inside the referenced handle.
@@ -228,12 +228,12 @@ Rules:
   live handle entry.
 - For `HOST_INLINE`, `inline_payload_offset + inline_payload_len` must fit
   inside `inline_payload_bytes_len`, and `inline_payload_len` must equal
-  `nbytes`. Remote handle fields (`owner_endpoint_id`, `buffer_id`,
+  `nbytes`. Remote handle fields (`owner_worker_id`, `buffer_id`,
   `remote_addr`, `rkey_or_token`, `generation`) are reserved and must be zero.
 - For non-`HOST_INLINE` descriptors, `inline_payload_len` must be zero.
 - A tensor owned by endpoint 3 cannot be submitted to endpoint 5 unless the
   parent has first created an imported peer handle through `IMPORT_BUFFER`.
-  The descriptor sent to endpoint 5 still keeps `owner_endpoint_id=3` and the
+  The descriptor sent to endpoint 5 still keeps `owner_worker_id=3` and the
   original `(buffer_id, generation, offset, nbytes)` identity; endpoint 5
   resolves it through its live importer-local registry entry.
 - `child_memory=1` keeps its local meaning: the data is managed by a
@@ -256,7 +256,7 @@ Rules:
 - Non-zero error means task failure. The parent marks the slot failed/poisoned
   and does not dispatch downstream consumers.
 - `error_message` is bounded UTF-8. It should include remote host,
-  `endpoint_id`, callable hashid, and `sequence`.
+  `worker_id`, callable hashid, and `sequence`.
 - If health expires or the process exits, the parent fabricates an endpoint
   failure completion for every in-flight sequence.
 
@@ -452,16 +452,16 @@ Unsupported negotiated extensions, including `PYTHON_SERIALIZED` and
 
 Multi-endpoint parent registration uses two-phase visibility:
 
-1. The parent sends `PREPARE_REGISTER_CALLABLE` to every selected endpoint.
+1. The parent sends `PREPARE_REGISTER_CALLABLE` to every selected worker.
    Each endpoint validates the descriptor/payload, checks feature gates, stages
    any callable bytes, and records the hashid as prepared but not visible to
    TASK.
 2. If every prepare succeeds, the parent sends `COMMIT_REGISTER_CALLABLE` to
-   every selected endpoint. A successful commit makes the hashid visible to
+   every selected worker. A successful commit makes the hashid visible to
    later TASK frames on that endpoint.
 3. If any prepare or commit fails, the parent sends `ABORT_REGISTER_CALLABLE`
    to endpoints with prepared or uncertain state, keeps the hashid invisible,
-   and marks endpoints failed when their final registry state cannot be proven.
+   and marks workers failed when their final registry state cannot be proven.
 
 Partial failure outcomes:
 
@@ -471,21 +471,21 @@ Partial failure outcomes:
 - Commit failure or timeout means the parent cannot assume all endpoints have
   the same visible state. It keeps the handle unpublished, sends cleanup to any
   endpoint that may have prepared or committed, and removes endpoints with
-  uncertain cleanup from eligibility for that endpoint/hashid pair.
-- Abort or cleanup failure leaves only the affected endpoint/hashid pair in a
-  cleanup-uncertain state. Other endpoint/hashid pairs remain usable if their
+  uncertain cleanup from eligibility for that worker/hashid pair.
+- Abort or cleanup failure leaves only the affected worker/hashid pair in a
+  cleanup-uncertain state. Other worker/hashid pairs remain usable if their
   state is confirmed.
-- Final unregister failure leaves the endpoint/hashid tombstone in place. The
-  same endpoint/hashid pair cannot be re-registered or dispatched until cleanup
+- Final unregister failure leaves the worker/hashid tombstone in place. The
+  same worker/hashid pair cannot be re-registered or dispatched until cleanup
   is confirmed or the endpoint is failed for the session.
 
 Final unregister creates a parent-side tombstone for the selected
-endpoint/hashid pairs. The hashid remains dispatchable through any other live
+worker/hashid pairs. The hashid remains dispatchable through any other live
 handle that still owns a reference. Once the final reference is dropped for an
-endpoint, that endpoint/hashid pair cannot be dispatched or published by a new
+worker, that worker/hashid pair cannot be dispatched or published by a new
 handle until cleanup is confirmed, or until any non-responsive endpoint has
 been removed from eligibility and marked failed. If register rollback cleanup
-cannot be confirmed, that endpoint/hashid pair enters a cleanup-uncertain state
+cannot be confirmed, that worker/hashid pair enters a cleanup-uncertain state
 and is unusable for the current session.
 
 ### Remote Buffer Export and Import Controls
@@ -499,7 +499,7 @@ integers.
 
 ```text
 ExportBufferRequestWire v1:
-  owner_endpoint_id: int32
+  owner_worker_id: int32
   buffer_id: uint64
   generation: uint64
   offset: uint64
@@ -511,17 +511,17 @@ ExportBufferRequestWire v1:
 
 Rules:
 
-- `owner_endpoint_id` must match the endpoint that receives the control.
+- `owner_worker_id` must match the endpoint that receives the control.
 - `buffer_id` and `generation` must name a live owner allocation.
 - `offset + nbytes` must fit inside that allocation and `nbytes` must be
   non-zero.
 - `access_flags` must request at least one supported access bit and no unknown
   bits.
-- `transport_profile` must match a profile advertised by the owner endpoint
+- `transport_profile` must match a profile advertised by the owner worker
   for this session.
 - The control may create or reuse a transport registration for the same
   `(buffer_id, generation, offset, nbytes, access_flags, transport_profile)`.
-  There is no separate public release-export command in v1; the owner endpoint
+  There is no separate public release-export command in v1; the owner worker
   releases export registrations when the owner allocation is physically freed
   after all imports and slot refs have drained.
 
@@ -529,7 +529,7 @@ On success, `EXPORT_BUFFER` returns:
 
 ```text
 ExportBufferResultWire v1:
-  owner_endpoint_id: int32
+  owner_worker_id: int32
   buffer_id: uint64
   generation: uint64
   address_space: uint32  # REMOTE_WINDOW or UB_LDST
@@ -545,20 +545,20 @@ ExportBufferResultWire v1:
   reserved: uint32 = 0
 ```
 
-`export_id` is an opaque session-local capability issued by the owner endpoint.
+`export_id` is an opaque session-local capability issued by the owner worker.
 For the simulation profile it may be the only meaningful token. For RoCE/HCCS
 it identifies the HCOMM/RDMA memory registration described by
 `rkey_or_token` and `transport_descriptor`. For UB it may also carry a
 validated `ub_ldst_va`. `REMOTE_DEVICE` is not a valid export result address
-space because peer endpoints consume the export through a window or UB mapping,
+space because peer workers consume the export through a window or UB mapping,
 not by dereferencing the owner's local device pointer.
 
-`IMPORT_BUFFER` is sent to the endpoint that will consume the peer buffer. Its
+`IMPORT_BUFFER` is sent to the worker that will consume the peer buffer. Its
 payload carries the owner-produced export descriptor plus the importer target:
 
 ```text
 ImportBufferRequestWire v1:
-  importer_endpoint_id: int32
+  importer_worker_id: int32
   requested_access_flags: uint32
   export_desc: ExportBufferResultWire v1
   reserved: uint32 = 0
@@ -566,20 +566,20 @@ ImportBufferRequestWire v1:
 
 Rules:
 
-- `importer_endpoint_id` must match the endpoint that receives the control.
+- `importer_worker_id` must match the worker that receives the control.
 - `requested_access_flags` must be a non-empty subset of
   `export_desc.access_flags`.
 - The importer must advertise the same `transport_profile` and support
   `export_desc.address_space`.
-- The importer validates `owner_endpoint_id`, `buffer_id`, `generation`,
+- The importer validates `owner_worker_id`, `buffer_id`, `generation`,
   `offset`, `nbytes`, `export_id`, transport metadata, and access flags before
   publishing a mapping in its local import registry.
-- A live import makes the buffer range data-eligible on the importer endpoint.
-  Without a live import, non-owner endpoints remain ineligible for descriptors
+- A live import makes the buffer range data-eligible on the importer worker.
+  Without a live import, non-owner workers remain ineligible for descriptors
   that name the owner's allocation.
 - The dependency key for an imported handle remains the owner identity
-  `(address_kind, owner_endpoint_id, buffer_id, generation, offset)`. The
-  importer endpoint id and `import_id` are mapping details, not producer/consumer
+  `(address_kind, owner_worker_id, buffer_id, generation, offset)`. The
+  importer worker id and `import_id` are mapping details, not producer/consumer
   identity. This keeps tasks on different endpoints ordered when they touch the
   same physical remote buffer at the same logical start offset.
 
@@ -587,8 +587,8 @@ On success, `IMPORT_BUFFER` returns:
 
 ```text
 ImportBufferResultWire v1:
-  importer_endpoint_id: int32
-  owner_endpoint_id: int32
+  importer_worker_id: int32
+  owner_worker_id: int32
   buffer_id: uint64
   generation: uint64
   import_id: uint64
@@ -605,18 +605,18 @@ ImportBufferResultWire v1:
 ```
 
 `import_id` is opaque and unique within
-`(session_id, importer_endpoint_id)`. The parent stores it inside the imported
+`(session_id, importer_worker_id)`. The parent stores it inside the imported
 `RemoteBufferHandle`; user code does not inspect it. TASK descriptors built
 from the imported handle carry the original owner identity and the importer
 mapping metadata from `ImportBufferResultWire`. The session runner rejects a
 TASK descriptor if the corresponding importer-local mapping is no longer live.
 
-`RELEASE_IMPORT` is sent to the importer endpoint:
+`RELEASE_IMPORT` is sent to the importer worker:
 
 ```text
 ReleaseImportRequestWire v1:
-  importer_endpoint_id: int32
-  owner_endpoint_id: int32
+  importer_worker_id: int32
+  owner_worker_id: int32
   buffer_id: uint64
   generation: uint64
   import_id: uint64
@@ -625,7 +625,7 @@ ReleaseImportRequestWire v1:
 
 Rules:
 
-- `importer_endpoint_id` must match the endpoint that receives the control.
+- `importer_worker_id` must match the endpoint that receives the control.
 - The request releases only the importer-local mapping. It never frees the
   owner allocation and never invalidates imports on other endpoints.
 - The parent sends `RELEASE_IMPORT` only after all slot refs captured from the
@@ -638,8 +638,8 @@ Rules:
 
 Multi-endpoint import setup is owner-first and rollback-aware:
 
-1. The parent sends `EXPORT_BUFFER` to the owner endpoint.
-2. The parent sends `IMPORT_BUFFER` to each selected importer endpoint.
+1. The parent sends `EXPORT_BUFFER` to the owner worker.
+2. The parent sends `IMPORT_BUFFER` to each selected importer worker.
 3. If any import fails, the parent sends `RELEASE_IMPORT` to importers that
    succeeded. If cleanup cannot be confirmed, those importer mappings enter an
    import-cleanup-uncertain state and the affected endpoint/buffer pair is
@@ -672,7 +672,7 @@ Rules:
   state change, except for commands whose versioned contract explicitly allows
   best-effort partial cleanup.
 - `error_message` is bounded UTF-8. It should include remote host,
-  `endpoint_id`, `control_name`, and `sequence`.
+  `worker_id`, `control_name`, and `sequence`.
 - `result_bytes` uses the same canonical encoding rules as other remote
   payloads. For example, `ALLOC_REMOTE_BUFFER` returns a buffer id,
   generation, address space, size, and transport-specific export metadata.

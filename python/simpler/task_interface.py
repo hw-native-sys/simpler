@@ -111,8 +111,8 @@ _REMOTE_BUFFER_EXPORT_TOKEN = object()
 
 class RemoteBufferHandle:
     __slots__ = (
-        "_endpoint_id",
-        "_owner_endpoint_id",
+        "_worker_id",
+        "_owner_worker_id",
         "_buffer_id",
         "_generation",
         "_import_id",
@@ -132,8 +132,8 @@ class RemoteBufferHandle:
     def __init__(  # noqa: PLR0913
         self,
         *,
-        endpoint_id: int,
-        owner_endpoint_id: int | None = None,
+        worker_id: int,
+        owner_worker_id: int | None = None,
         buffer_id: int,
         generation: int,
         import_id: int = 0,
@@ -152,8 +152,8 @@ class RemoteBufferHandle:
         if _internal_token is not _REMOTE_BUFFER_HANDLE_TOKEN:
             raise TypeError("RemoteBufferHandle values are returned by Worker.remote_malloc/import")
 
-        self._endpoint_id = int(endpoint_id)
-        self._owner_endpoint_id = int(endpoint_id if owner_endpoint_id is None else owner_endpoint_id)
+        self._worker_id = int(worker_id)
+        self._owner_worker_id = int(worker_id if owner_worker_id is None else owner_worker_id)
         self._buffer_id = int(buffer_id)
         self._generation = int(generation)
         self._import_id = int(import_id)
@@ -169,10 +169,10 @@ class RemoteBufferHandle:
         self._live_import_refs = 0
         self._owner_handle_ref = owner_handle_ref
 
-        if self._endpoint_id < 0:
-            raise ValueError("RemoteBufferHandle.endpoint_id must be non-negative")
-        if self._owner_endpoint_id < 0:
-            raise ValueError("RemoteBufferHandle.owner_endpoint_id must be non-negative")
+        if self._worker_id < 0:
+            raise ValueError("RemoteBufferHandle.worker_id must be non-negative")
+        if self._owner_worker_id < 0:
+            raise ValueError("RemoteBufferHandle.owner_worker_id must be non-negative")
         if self._buffer_id < 0 or self._generation < 0 or self._import_id < 0:
             raise ValueError("RemoteBufferHandle ids must be non-negative")
         if self._nbytes < 0:
@@ -181,8 +181,8 @@ class RemoteBufferHandle:
             raise ValueError("RemoteBufferHandle.offset must be non-negative")
         if self._address_space != RemoteAddressSpace.HOST_INLINE and self._buffer_id == 0:
             raise ValueError("RemoteBufferHandle.buffer_id must be non-zero for remote buffers")
-        if self._address_space == RemoteAddressSpace.REMOTE_DEVICE and self._endpoint_id != self._owner_endpoint_id:
-            raise ValueError("REMOTE_DEVICE handles must be consumed on their owner endpoint")
+        if self._address_space == RemoteAddressSpace.REMOTE_DEVICE and self._worker_id != self._owner_worker_id:
+            raise ValueError("REMOTE_DEVICE handles must be consumed on their owner worker")
         if (
             self._address_space in (RemoteAddressSpace.REMOTE_WINDOW, RemoteAddressSpace.UB_LDST)
             and self._import_id == 0
@@ -195,7 +195,7 @@ class RemoteBufferHandle:
     def _from_remote_allocation(
         cls,
         *,
-        endpoint_id: int,
+        worker_id: int,
         buffer_id: int,
         generation: int,
         address_space: RemoteAddressSpace,
@@ -206,8 +206,8 @@ class RemoteBufferHandle:
         released: bool = False,
     ) -> RemoteBufferHandle:
         return cls(
-            endpoint_id=endpoint_id,
-            owner_endpoint_id=endpoint_id,
+            worker_id=worker_id,
+            owner_worker_id=worker_id,
             buffer_id=buffer_id,
             generation=generation,
             import_id=0,
@@ -226,8 +226,8 @@ class RemoteBufferHandle:
     def _from_imported_mapping(  # noqa: PLR0913
         cls,
         *,
-        endpoint_id: int,
-        owner_endpoint_id: int,
+        worker_id: int,
+        owner_worker_id: int,
         buffer_id: int,
         generation: int,
         import_id: int,
@@ -242,8 +242,8 @@ class RemoteBufferHandle:
         owner_handle_ref: RemoteBufferHandle | None = None,
     ) -> RemoteBufferHandle:
         return cls(
-            endpoint_id=endpoint_id,
-            owner_endpoint_id=owner_endpoint_id,
+            worker_id=worker_id,
+            owner_worker_id=owner_worker_id,
             buffer_id=buffer_id,
             generation=generation,
             import_id=import_id,
@@ -260,12 +260,12 @@ class RemoteBufferHandle:
         )
 
     @property
-    def endpoint_id(self) -> int:
-        return self._endpoint_id
+    def worker_id(self) -> int:
+        return self._worker_id
 
     @property
-    def owner_endpoint_id(self) -> int:
-        return self._owner_endpoint_id
+    def owner_worker_id(self) -> int:
+        return self._owner_worker_id
 
     @property
     def import_id(self) -> int:
@@ -317,7 +317,7 @@ class RemoteBufferHandle:
     def __repr__(self) -> str:
         return (
             "RemoteBufferHandle("
-            f"endpoint_id={self.endpoint_id}, owner_endpoint_id={self.owner_endpoint_id}, "
+            f"worker_id={self.worker_id}, owner_worker_id={self.owner_worker_id}, "
             f"address_space={self.address_space.name}, nbytes={self.nbytes}, released={self.released})"
         )
 
@@ -330,7 +330,7 @@ class RemoteBufferExport:
     """
 
     __slots__ = (
-        "_owner_endpoint_id",
+        "_owner_worker_id",
         "_buffer_id",
         "_generation",
         "_address_space",
@@ -351,7 +351,7 @@ class RemoteBufferExport:
     def __init__(  # noqa: PLR0913
         self,
         *,
-        owner_endpoint_id: int,
+        owner_worker_id: int,
         buffer_id: int,
         generation: int,
         address_space: RemoteAddressSpace,
@@ -371,7 +371,7 @@ class RemoteBufferExport:
         if _internal_token is not _REMOTE_BUFFER_EXPORT_TOKEN:
             raise TypeError("RemoteBufferExport values are returned by Worker.remote_export")
         object.__setattr__(self, "_sealed", False)
-        object.__setattr__(self, "_owner_endpoint_id", int(owner_endpoint_id))
+        object.__setattr__(self, "_owner_worker_id", int(owner_worker_id))
         object.__setattr__(self, "_buffer_id", int(buffer_id))
         object.__setattr__(self, "_generation", int(generation))
         object.__setattr__(self, "_address_space", RemoteAddressSpace(int(address_space)))
@@ -388,7 +388,7 @@ class RemoteBufferExport:
         object.__setattr__(self, "_worker_owner_id", None if _worker_owner_id is None else str(_worker_owner_id))
 
         for name in (
-            "_owner_endpoint_id",
+            "_owner_worker_id",
             "_buffer_id",
             "_generation",
             "_offset",
@@ -401,7 +401,7 @@ class RemoteBufferExport:
         ):
             if int(getattr(self, name)) < 0:
                 raise ValueError(f"RemoteBufferExport.{name[1:]} must be non-negative")
-        if self._owner_endpoint_id < 0 or self._buffer_id == 0 or self._generation == 0 or self._export_id == 0:
+        if self._owner_worker_id < 0 or self._buffer_id == 0 or self._generation == 0 or self._export_id == 0:
             raise ValueError("RemoteBufferExport requires live owner buffer identity and export_id")
         if self._nbytes <= 0:
             raise ValueError("RemoteBufferExport.nbytes must be positive")
@@ -415,7 +415,7 @@ class RemoteBufferExport:
     def _from_remote_export(  # noqa: PLR0913
         cls,
         *,
-        owner_endpoint_id: int,
+        owner_worker_id: int,
         buffer_id: int,
         generation: int,
         address_space: RemoteAddressSpace,
@@ -432,7 +432,7 @@ class RemoteBufferExport:
         worker_owner_id: str | None = None,
     ) -> RemoteBufferExport:
         return cls(
-            owner_endpoint_id=owner_endpoint_id,
+            owner_worker_id=owner_worker_id,
             buffer_id=buffer_id,
             generation=generation,
             address_space=address_space,
@@ -456,8 +456,8 @@ class RemoteBufferExport:
         object.__setattr__(self, name, value)
 
     @property
-    def owner_endpoint_id(self) -> int:
-        return self._owner_endpoint_id
+    def owner_worker_id(self) -> int:
+        return self._owner_worker_id
 
     @property
     def address_space(self) -> RemoteAddressSpace:
@@ -482,7 +482,7 @@ class RemoteBufferExport:
     def __repr__(self) -> str:
         return (
             "RemoteBufferExport("
-            f"owner_endpoint_id={self.owner_endpoint_id}, address_space={self.address_space.name}, "
+            f"owner_worker_id={self.owner_worker_id}, address_space={self.address_space.name}, "
             f"offset={self.offset}, nbytes={self.nbytes}, access_flags={self.access_flags}, "
             f"transport_profile={self.transport_profile!r})"
         )
@@ -491,7 +491,7 @@ class RemoteBufferExport:
 @dataclass(frozen=True)
 class _RemoteTensorDesc:
     address_space: RemoteAddressSpace
-    owner_endpoint_id: int = -1
+    owner_worker_id: int = -1
     buffer_id: int = 0
     offset: int = 0
     nbytes: int = 0
@@ -555,8 +555,8 @@ class RemoteTensorRef:
     def host_inline(cls, payload: bytes, *, shape: tuple[int, ...], dtype: DataType) -> RemoteTensorRef:
         data = bytes(payload)
         handle = RemoteBufferHandle(
-            endpoint_id=0,
-            owner_endpoint_id=0,
+            worker_id=0,
+            owner_worker_id=0,
             buffer_id=0,
             generation=0,
             address_space=RemoteAddressSpace.HOST_INLINE,
@@ -591,7 +591,7 @@ def _sidecar_from_ref(storage: _RemoteTaskArgsStorage, ref: RemoteTensorRef) -> 
 
     desc = _RemoteTensorDesc(
         address_space=handle.address_space,
-        owner_endpoint_id=0 if handle.address_space == RemoteAddressSpace.HOST_INLINE else handle.owner_endpoint_id,
+        owner_worker_id=0 if handle.address_space == RemoteAddressSpace.HOST_INLINE else handle.owner_worker_id,
         buffer_id=0 if handle.address_space == RemoteAddressSpace.HOST_INLINE else handle._buffer_id,
         offset=0 if handle.address_space == RemoteAddressSpace.HOST_INLINE else handle._offset + ref.offset,
         nbytes=int(nbytes),

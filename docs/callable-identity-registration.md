@@ -301,7 +301,10 @@ every active child endpoint in the handle's `target_namespace` for this
 worker subset is not part of this contract.
 `orch.submit_next_level(..., worker=...)` and
 `orch.submit_next_level_group(..., workers=...)` are submit-time affinity
-controls; they do not define registration scope.
+controls; they do not define registration scope. NEXT_LEVEL affinity consumes
+stable worker ids. Local Python Worker children and remote L3 workers use the
+worker ids returned by `add_worker(...)` / `add_remote_worker(...)`; L3 chip
+worker ids are the existing chip worker ids.
 
 `CallableHandle` is the public callable token returned by registration:
 
@@ -486,7 +489,7 @@ REGISTER_TOMBSTONE_ACTIVE
 UNREGISTER_TOMBSTONE_ACTIVE
 ```
 
-Error messages should include endpoint id, namespace, `hashid`, and operation.
+Error messages should include worker id, namespace, `hashid`, and operation.
 The current local mailbox has one outstanding operation per endpoint and does
 not carry a separate sequence field; a future multi-flight control channel must
 add one. Messages must not include user-specific local absolute paths.

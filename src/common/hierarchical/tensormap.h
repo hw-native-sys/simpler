@@ -13,10 +13,10 @@
  * TensorMap — TensorKey → producer task slot mapping.
  *
  * At the hierarchical host level, every tensor is identified by a TensorKey
- * consisting of (ptr, worker).  Host tensors (HeapRing) use worker=-1 because
- * their addresses are globally unique; child_memory tensors use the owning
- * worker's logical id (0..N-1) to disambiguate identical device addresses
- * across different NPUs.
+ * consisting of (ptr, worker_id). Host tensors (HeapRing) use
+ * worker_id=-1 because their addresses are globally unique; child_memory
+ * tensors use the owning NEXT_LEVEL worker id to disambiguate identical
+ * device addresses across different children.
  *
  * Unlike the L2 PTO2TensorMap, this implementation:
  *   - Uses std::unordered_map (no ring buffer entry pool)

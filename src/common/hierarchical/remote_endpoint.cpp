@@ -399,7 +399,7 @@ void RemoteL3SocketTransport::check_health() {
     throw std::runtime_error("RemoteL3SocketTransport: health lane failed: " + message);
 }
 
-void RemoteL3SocketTransport::start_health_monitor(uint64_t session_id, int32_t endpoint_id) {
+void RemoteL3SocketTransport::start_health_monitor(uint64_t session_id, int32_t worker_id) {
     if (health_thread_.joinable()) return;
     health_fd_ = connect_tcp_socket(health_host_, health_port_, "RemoteL3SocketTransport(health)", timeout_s_);
     health_stop_.store(false, std::memory_order_release);
@@ -410,13 +410,13 @@ void RemoteL3SocketTransport::start_health_monitor(uint64_t session_id, int32_t 
     }
     int fd = health_fd_;
     double timeout_s = timeout_s_;
-    health_thread_ = std::thread([this, fd, session_id, endpoint_id, timeout_s]() {
+    health_thread_ = std::thread([this, fd, session_id, worker_id, timeout_s]() {
         auto read_exact = [&](uint8_t *data, size_t size) -> bool {
             size_t off = 0;
             auto deadline =
-                std::chrono::steady_clock::now() + std::chrono::duration_cast<std::chrono::steady_clock::duration>(
-                                                       std::chrono::duration<double>(timeout_s)
-                                                   );
+                std::chrono::steady_clock::now() +
+                std::chrono::duration_cast<std::chrono::steady_clock::duration>(std::chrono::duration<double>(timeout_s)
+                );
             while (off < size) {
                 if (health_stop_.load(std::memory_order_acquire)) return false;
                 auto now = std::chrono::steady_clock::now();
@@ -448,8 +448,8 @@ void RemoteL3SocketTransport::start_health_monitor(uint64_t session_id, int32_t 
                 if (decoded.header.frame_type != remote_l3::FrameType::HEALTH) {
                     throw std::runtime_error("non-HEALTH frame on health lane");
                 }
-                if (decoded.header.session_id != session_id || decoded.header.endpoint_id != endpoint_id) {
-                    throw std::runtime_error("HEALTH session or endpoint mismatch");
+                if (decoded.header.session_id != session_id || decoded.header.worker_id != worker_id) {
+                    throw std::runtime_error("HEALTH session or worker mismatch");
                 }
             }
         } catch (const std::exception &e) {
@@ -556,15 +556,15 @@ std::vector<uint8_t> RemoteL3SocketTransport::read_frame() {
 }
 
 void RemoteL3SocketTransport::expect_hello_ready(
-    uint64_t session_id, int32_t endpoint_id, const std::string &comm_profile
+    uint64_t session_id, int32_t worker_id, const std::string &comm_profile
 ) {
     auto frame = remote_l3::decode_frame(read_frame());
     if (frame.header.frame_type != remote_l3::FrameType::HELLO) {
         throw std::runtime_error("RemoteL3SocketTransport: expected HELLO frame");
     }
     auto hello = remote_l3::decode_hello(frame.payload.data(), frame.payload.size());
-    if (hello.session_id != session_id || hello.endpoint_id != endpoint_id) {
-        throw std::runtime_error("RemoteL3SocketTransport: HELLO session or endpoint mismatch");
+    if (hello.session_id != session_id || hello.worker_id != worker_id) {
+        throw std::runtime_error("RemoteL3SocketTransport: HELLO session or worker mismatch");
     }
     if (hello.ready_state != remote_l3::ReadyState::READY) {
         throw std::runtime_error("RemoteL3SocketTransport: HELLO did not report READY");
@@ -572,7 +572,7 @@ void RemoteL3SocketTransport::expect_hello_ready(
     if (hello.comm_profile != comm_profile) {
         throw std::runtime_error("RemoteL3SocketTransport: HELLO comm profile mismatch");
     }
-    start_health_monitor(session_id, endpoint_id);
+    start_health_monitor(session_id, worker_id);
 }
 
 void RemoteL3SocketTransport::submit_frame(const std::vector<uint8_t> &frame) {
@@ -592,15 +592,15 @@ std::vector<uint8_t> RemoteL3SocketTransport::wait_for_reply(remote_l3::FrameTyp
 void RemoteL3SocketTransport::shutdown() { close_socket(); }
 
 RemoteL3Endpoint::RemoteL3Endpoint(
-    int32_t endpoint_id, uint64_t session_id, std::string transport_name, std::unique_ptr<RemoteL3Transport> transport
+    int32_t worker_id, uint64_t session_id, std::string transport_name, std::unique_ptr<RemoteL3Transport> transport
 ) :
     session_id_(session_id),
     transport_(std::move(transport)) {
-    if (endpoint_id < 0) throw std::invalid_argument("RemoteL3Endpoint: endpoint_id must be non-negative");
+    if (worker_id < 0) throw std::invalid_argument("RemoteL3Endpoint: worker_id must be non-negative");
     if (session_id == 0) throw std::invalid_argument("RemoteL3Endpoint: session_id must be non-zero");
     if (!transport_) throw std::invalid_argument("RemoteL3Endpoint: null transport");
     caps_.kind = WorkerEndpointKind::REMOTE_L3;
-    caps_.endpoint_id = endpoint_id;
+    caps_.worker_id = worker_id;
     caps_.remote = true;
     caps_.supports_task_dispatch = true;
     caps_.supports_control = true;
@@ -660,7 +660,7 @@ WorkerCompletion RemoteL3Endpoint::run(Ring *ring, const WorkerDispatch &dispatc
         remote_l3::FrameHeader header;
         header.frame_type = remote_l3::FrameType::TASK;
         header.session_id = session_id_;
-        header.endpoint_id = caps_.endpoint_id;
+        header.worker_id = caps_.worker_id;
         header.sequence = sequence;
         transport_->submit_frame(remote_l3::encode_frame(header, payload));
 
@@ -669,8 +669,8 @@ WorkerCompletion RemoteL3Endpoint::run(Ring *ring, const WorkerDispatch &dispatc
         if (reply.header.frame_type != remote_l3::FrameType::COMPLETION) {
             throw std::runtime_error("RemoteL3Endpoint::run: expected COMPLETION reply");
         }
-        if (reply.header.session_id != session_id_ || reply.header.endpoint_id != caps_.endpoint_id) {
-            throw std::runtime_error("RemoteL3Endpoint::run: completion session or endpoint mismatch");
+        if (reply.header.session_id != session_id_ || reply.header.worker_id != caps_.worker_id) {
+            throw std::runtime_error("RemoteL3Endpoint::run: completion session or worker mismatch");
         }
         auto decoded = remote_l3::decode_completion(reply.payload.data(), reply.payload.size(), sequence);
         command_lane_.finish_reply(sequence);
@@ -689,7 +689,7 @@ WorkerCompletion RemoteL3Endpoint::run(Ring *ring, const WorkerDispatch &dispatc
         }
         completion.outcome = EndpointOutcome::ENDPOINT_FAILURE;
         completion.error_message =
-            std::string("RemoteL3Endpoint::run(endpoint=") + std::to_string(caps_.endpoint_id) + "): " + e.what();
+            std::string("RemoteL3Endpoint::run(worker_id=") + std::to_string(caps_.worker_id) + "): " + e.what();
     }
     return completion;
 }
@@ -707,14 +707,14 @@ RemoteL3Endpoint::run_control(remote_l3::ControlName control_name, const std::ve
         remote_l3::FrameHeader header;
         header.frame_type = remote_l3::FrameType::CONTROL;
         header.session_id = session_id_;
-        header.endpoint_id = caps_.endpoint_id;
+        header.worker_id = caps_.worker_id;
         header.sequence = sequence;
         transport_->submit_frame(remote_l3::encode_frame(header, remote_l3::encode_control(control)));
 
         auto reply_bytes = transport_->wait_for_reply(remote_l3::FrameType::CONTROL_REPLY, sequence);
         auto reply = remote_l3::decode_frame(reply_bytes);
-        if (reply.header.session_id != session_id_ || reply.header.endpoint_id != caps_.endpoint_id) {
-            throw std::runtime_error("RemoteL3Endpoint::control: reply session or endpoint mismatch");
+        if (reply.header.session_id != session_id_ || reply.header.worker_id != caps_.worker_id) {
+            throw std::runtime_error("RemoteL3Endpoint::control: reply session or worker mismatch");
         }
         auto decoded =
             remote_l3::decode_control_reply(reply.payload.data(), reply.payload.size(), sequence, control_name, 1);
@@ -792,8 +792,8 @@ RemoteBufferHandle RemoteL3Endpoint::control_remote_malloc(size_t size) {
     auto reply = run_control(remote_l3::ControlName::ALLOC_REMOTE_BUFFER, command);
     size_t offset = 0;
     RemoteBufferHandle handle;
-    handle.endpoint_id = get_i32(reply.result_bytes, offset);
-    handle.owner_endpoint_id = handle.endpoint_id;
+    handle.worker_id = get_i32(reply.result_bytes, offset);
+    handle.owner_worker_id = handle.worker_id;
     handle.buffer_id = get_u64(reply.result_bytes, offset);
     handle.generation = get_u64(reply.result_bytes, offset);
     handle.import_id = 0;
@@ -805,8 +805,8 @@ RemoteBufferHandle RemoteL3Endpoint::control_remote_malloc(size_t size) {
     handle.rkey_or_token = get_u64(reply.result_bytes, offset);
     handle.ub_ldst_va = get_u64(reply.result_bytes, offset);
     handle.access_flags = remote_l3::REMOTE_BUFFER_ACCESS_READ_WRITE;
-    if (handle.endpoint_id != caps_.endpoint_id) {
-        throw std::runtime_error("RemoteL3Endpoint::control_remote_malloc: endpoint mismatch in result");
+    if (handle.worker_id != caps_.worker_id) {
+        throw std::runtime_error("RemoteL3Endpoint::control_remote_malloc: worker mismatch in result");
     }
     if (offset != reply.result_bytes.size()) {
         throw std::runtime_error("RemoteL3Endpoint::control_remote_malloc: trailing bytes in result");
@@ -817,7 +817,7 @@ RemoteBufferHandle RemoteL3Endpoint::control_remote_malloc(size_t size) {
 
 void RemoteL3Endpoint::control_remote_free(const RemoteBufferHandle &handle) {
     std::vector<uint8_t> command;
-    put_i32(command, handle.endpoint_id);
+    put_i32(command, handle.worker_id);
     put_u64(command, handle.buffer_id);
     put_u64(command, handle.generation);
     run_control(remote_l3::ControlName::FREE_REMOTE_BUFFER, command);
@@ -829,7 +829,7 @@ void RemoteL3Endpoint::control_remote_copy_to(
     if (src == nullptr && size != 0) throw std::invalid_argument("control_remote_copy_to: null src");
     validate_remote_buffer_relative_range("control_remote_copy_to", handle, offset, static_cast<uint64_t>(size));
     std::vector<uint8_t> command;
-    put_i32(command, handle.endpoint_id);
+    put_i32(command, handle.worker_id);
     put_u64(command, handle.buffer_id);
     put_u64(command, handle.generation);
     put_u64(command, offset);
@@ -845,7 +845,7 @@ void RemoteL3Endpoint::control_remote_copy_from(
     if (dst == nullptr && size != 0) throw std::invalid_argument("control_remote_copy_from: null dst");
     validate_remote_buffer_relative_range("control_remote_copy_from", handle, offset, static_cast<uint64_t>(size));
     std::vector<uint8_t> command;
-    put_i32(command, handle.endpoint_id);
+    put_i32(command, handle.worker_id);
     put_u64(command, handle.buffer_id);
     put_u64(command, handle.generation);
     put_u64(command, offset);
@@ -862,12 +862,12 @@ RemoteBufferExport RemoteL3Endpoint::control_remote_export(
     const std::string &transport_profile
 ) {
     validate_remote_buffer_export_range("RemoteL3Endpoint::control_remote_export", handle, offset, size);
-    const int32_t owner_endpoint_id = handle.owner_endpoint_id >= 0 ? handle.owner_endpoint_id : handle.endpoint_id;
-    if (owner_endpoint_id != caps_.endpoint_id) {
-        throw std::invalid_argument("RemoteL3Endpoint::control_remote_export: endpoint is not the owner");
+    const int32_t owner_worker_id = handle.owner_worker_id >= 0 ? handle.owner_worker_id : handle.worker_id;
+    if (owner_worker_id != caps_.worker_id) {
+        throw std::invalid_argument("RemoteL3Endpoint::control_remote_export: worker is not the owner");
     }
     remote_l3::ExportBufferRequest request;
-    request.owner_endpoint_id = owner_endpoint_id;
+    request.owner_worker_id = owner_worker_id;
     request.buffer_id = handle.buffer_id;
     request.generation = handle.generation;
     request.offset = handle.offset + offset;
@@ -876,37 +876,37 @@ RemoteBufferExport RemoteL3Endpoint::control_remote_export(
     request.transport_profile = transport_profile;
     auto reply = run_control(remote_l3::ControlName::EXPORT_BUFFER, remote_l3::encode_export_buffer_request(request));
     auto result = remote_l3::decode_export_buffer_result(reply.result_bytes.data(), reply.result_bytes.size());
-    if (result.owner_endpoint_id != owner_endpoint_id) {
-        throw std::runtime_error("RemoteL3Endpoint::control_remote_export: owner endpoint mismatch in result");
+    if (result.owner_worker_id != owner_worker_id) {
+        throw std::runtime_error("RemoteL3Endpoint::control_remote_export: owner worker mismatch in result");
     }
     return result;
 }
 
 RemoteBufferHandle RemoteL3Endpoint::control_remote_import(
-    int32_t importer_endpoint_id, const RemoteBufferExport &export_desc, uint32_t requested_access_flags
+    int32_t importer_worker_id, const RemoteBufferExport &export_desc, uint32_t requested_access_flags
 ) {
-    if (importer_endpoint_id != caps_.endpoint_id) {
-        throw std::invalid_argument("RemoteL3Endpoint::control_remote_import: endpoint is not the importer");
+    if (importer_worker_id != caps_.worker_id) {
+        throw std::invalid_argument("RemoteL3Endpoint::control_remote_import: worker is not the importer");
     }
     remote_l3::ImportBufferRequest request;
-    request.importer_endpoint_id = importer_endpoint_id;
+    request.importer_worker_id = importer_worker_id;
     request.requested_access_flags = requested_access_flags;
     request.export_desc = export_desc;
     auto reply = run_control(remote_l3::ControlName::IMPORT_BUFFER, remote_l3::encode_import_buffer_request(request));
     auto handle = remote_l3::decode_import_buffer_result(reply.result_bytes.data(), reply.result_bytes.size());
-    if (handle.endpoint_id != importer_endpoint_id) {
-        throw std::runtime_error("RemoteL3Endpoint::control_remote_import: importer endpoint mismatch in result");
+    if (handle.worker_id != importer_worker_id) {
+        throw std::runtime_error("RemoteL3Endpoint::control_remote_import: importer worker mismatch in result");
     }
     return handle;
 }
 
 void RemoteL3Endpoint::control_remote_release_import(const RemoteBufferHandle &handle) {
-    if (handle.endpoint_id != caps_.endpoint_id) {
-        throw std::invalid_argument("RemoteL3Endpoint::control_remote_release_import: endpoint is not the importer");
+    if (handle.worker_id != caps_.worker_id) {
+        throw std::invalid_argument("RemoteL3Endpoint::control_remote_release_import: worker is not the importer");
     }
     remote_l3::ReleaseImportRequest request;
-    request.importer_endpoint_id = handle.endpoint_id;
-    request.owner_endpoint_id = handle.owner_endpoint_id;
+    request.importer_worker_id = handle.worker_id;
+    request.owner_worker_id = handle.owner_worker_id;
     request.buffer_id = handle.buffer_id;
     request.generation = handle.generation;
     request.import_id = handle.import_id;
@@ -921,7 +921,7 @@ void RemoteL3Endpoint::shutdown_child() {
         remote_l3::FrameHeader header;
         header.frame_type = remote_l3::FrameType::SHUTDOWN;
         header.session_id = session_id_;
-        header.endpoint_id = caps_.endpoint_id;
+        header.worker_id = caps_.worker_id;
         header.sequence = sequence;
         transport_->submit_frame(remote_l3::encode_frame(header, {}));
         command_lane_.finish_reply(sequence);

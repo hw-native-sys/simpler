@@ -191,15 +191,19 @@ def my_l3_orch(orch, args, config):
 # L4 parent
 w4 = Worker(level=4, num_sub_workers=0)
 l3_handle = w4.register(my_l3_orch)
-w4.add_worker(l3)
+l3_endpoint = w4.add_worker(l3)
 w4.init()
 
 def my_l4_orch(orch, args, config):
-    orch.submit_next_level(l3_handle, TaskArgs(), CallConfig())
+    orch.submit_next_level(l3_handle, TaskArgs(), CallConfig(), worker=l3_worker_id)
 
 w4.run(my_l4_orch)
 w4.close()
 ```
+
+`l3_worker_id` is the local child worker id returned by `add_worker(...)`.
+It is a public worker id, not necessarily the child's C++ worker-thread
+vector index.
 
 When L4's `WorkerThread` writes a task frame to the L3 child's mailbox, the
 frame carries the callable hash digest plus `config` and `args_blob`. The child

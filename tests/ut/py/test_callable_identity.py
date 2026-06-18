@@ -445,19 +445,141 @@ def test_remote_callable_register_requires_explicit_remote_workers():
         with pytest.raises(RuntimeError, match="add at least one remote worker"):
             worker.register(RemoteCallable("pkg.remote:orch"), workers=[0])
 
-        endpoint = worker.add_remote_worker(RemoteWorkerSpec(endpoint="127.0.0.1:19073", platform="a2a3sim"))
+        worker_id = worker.add_remote_worker(RemoteWorkerSpec(endpoint="127.0.0.1:19073", platform="a2a3sim"))
         with pytest.raises(ValueError, match="workers must be an explicit non-empty list"):
             worker.register(RemoteCallable("pkg.remote:orch"))
 
-        handle = worker.register(RemoteCallable("pkg.remote:orch"), workers=[endpoint])
+        handle = worker.register(RemoteCallable("pkg.remote:orch"), workers=[worker_id])
         state = worker._resolve_handle(handle)
         assert handle.kind == "PYTHON_IMPORT"
         assert handle.target_namespace == "REMOTE_TASK_DISPATCHER"
-        assert state.eligible_endpoint_ids == (endpoint,)
+        assert state.eligible_worker_ids == (worker_id,)
         assert state.slot_id == -1
         assert worker._callable_registry == {}
     finally:
         worker.close()
+
+
+def test_remote_worker_id_stays_stable_when_local_worker_is_added_later(monkeypatch):
+    import simpler.worker as worker_mod
+
+    class FakeCWorker:
+        def __init__(self, *args):
+            self.remote_worker_ids = []
+            self.closed = False
+
+        def add_remote_l3_socket(self, worker_id, *args):
+            self.remote_worker_ids.append(worker_id)
+
+        def close(self):
+            self.closed = True
+
+    fake_c_worker = FakeCWorker()
+    opened_worker_ids = []
+
+    def fake_worker_ctor(*args):
+        return fake_c_worker
+
+    def fake_open_remote_session(self, *, spec, worker_id, session_id, timeout_s):
+        opened_worker_ids.append(worker_id)
+        return worker_mod._RemoteSession(  # noqa: SLF001
+            worker_id=worker_id,
+            session_id=session_id,
+            command_host="127.0.0.1",
+            command_port=1,
+            health_host="127.0.0.1",
+            health_port=2,
+            pid=0,
+        )
+
+    monkeypatch.setattr(worker_mod, "_Worker", fake_worker_ctor)
+    monkeypatch.setattr(Worker, "_open_remote_session", fake_open_remote_session)
+
+    worker = Worker(level=4, num_sub_workers=0)
+    try:
+        remote_worker_id = worker.add_remote_worker(RemoteWorkerSpec(endpoint="127.0.0.1:19073", platform="a2a3sim"))
+        local_worker_id = worker.add_worker(Worker(level=3, num_sub_workers=0))
+
+        assert remote_worker_id == 0
+        assert local_worker_id == 1
+
+        handle = worker.register(RemoteCallable("pkg.remote:orch"), workers=[remote_worker_id])
+        assert worker._resolve_handle(handle).eligible_worker_ids == (remote_worker_id,)
+
+        worker.init()
+
+        assert opened_worker_ids == [remote_worker_id]
+        assert fake_c_worker.remote_worker_ids == [remote_worker_id]
+    finally:
+        worker.close()
+
+
+def test_remote_submit_worker_affinity_uses_stable_worker_id_after_mixed_add_order():
+    class FakeCOrchestrator:
+        def submit_next_level(self, *args):
+            self.submit_next_level_args = args
+
+    worker = Worker(level=4, num_sub_workers=0)
+    try:
+        remote_worker_id = worker.add_remote_worker(RemoteWorkerSpec(endpoint="127.0.0.1:19073", platform="a2a3sim"))
+        local_worker_id = worker.add_worker(Worker(level=3, num_sub_workers=0))
+        assert (remote_worker_id, local_worker_id) == (0, 1)
+
+        handle = worker.register(RemoteCallable("pkg.remote:orch"), workers=[remote_worker_id])
+        fake = FakeCOrchestrator()
+        orch = Orchestrator(fake, worker=worker)  # type: ignore[arg-type]
+
+        orch.submit_next_level(handle, TaskArgs(), worker=remote_worker_id)
+
+        call = fake.submit_next_level_args
+        assert call[5] == remote_worker_id
+        assert call[6] == [remote_worker_id]
+    finally:
+        worker.close()
+
+
+def test_local_submit_worker_affinity_maps_stable_worker_id_after_mixed_add_order():
+    class FakeCOrchestrator:
+        def submit_next_level(self, *args):
+            self.submit_next_level_args = args
+
+    worker = Worker(level=4, num_sub_workers=0)
+    try:
+        remote_worker_id = worker.add_remote_worker(RemoteWorkerSpec(endpoint="127.0.0.1:19073", platform="a2a3sim"))
+        local_worker_id = worker.add_worker(Worker(level=3, num_sub_workers=0))
+        assert (remote_worker_id, local_worker_id) == (0, 1)
+
+        handle = worker.register(_py_target)
+        fake = FakeCOrchestrator()
+        orch = Orchestrator(fake, worker=worker)  # type: ignore[arg-type]
+
+        orch.submit_next_level(handle, TaskArgs(), worker=local_worker_id)
+
+        call = fake.submit_next_level_args
+        assert call[5] == local_worker_id
+        assert call[6] == []
+    finally:
+        worker.close()
+
+
+def test_chip_submit_uses_chip_index_worker_id():
+    class FakeCOrchestrator:
+        def submit_next_level(self, *args):
+            self.submit_next_level_args = args
+
+    handle = CallableHandle(
+        "sha256:" + "00" * 32,
+        "CHIP_CALLABLE",
+        "LOCAL_CHIP",
+    )
+    fake = FakeCOrchestrator()
+    orch = Orchestrator(fake)
+
+    orch.submit_next_level(handle, TaskArgs(), worker=0)
+
+    call = fake.submit_next_level_args
+    assert call[5] == 0
+    assert call[6] == []
 
 
 def test_remote_callable_submit_passes_remote_sidecar_to_cpp_facade():
@@ -470,13 +592,13 @@ def test_remote_callable_submit_passes_remote_sidecar_to_cpp_facade():
 
     worker = Worker(level=4, num_sub_workers=0)
     try:
-        endpoint = worker.add_remote_worker(RemoteWorkerSpec(endpoint="127.0.0.1:19073", platform="a2a3sim"))
-        handle = worker.register(RemoteCallable("pkg.remote:orch"), workers=[endpoint])
+        worker_id = worker.add_remote_worker(RemoteWorkerSpec(endpoint="127.0.0.1:19073", platform="a2a3sim"))
+        handle = worker.register(RemoteCallable("pkg.remote:orch"), workers=[worker_id])
         fake = FakeCOrchestrator()
         orch = Orchestrator(fake, worker=worker)  # type: ignore[arg-type]
 
         buf = RemoteBufferHandle._from_remote_allocation(
-            endpoint_id=endpoint,
+            worker_id=worker_id,
             buffer_id=1,
             generation=1,
             address_space=RemoteAddressSpace.REMOTE_DEVICE,
@@ -489,11 +611,11 @@ def test_remote_callable_submit_passes_remote_sidecar_to_cpp_facade():
         call = fake.submit_next_level_args
         assert call[1] == "PYTHON_IMPORT"
         assert call[2] == "REMOTE_TASK_DISPATCHER"
-        assert call[6] == [endpoint]
+        assert call[6] == [worker_id]
         sidecar = call[7]
         assert len(sidecar.tensors) == 1
         assert sidecar.tensors[0].present
-        assert sidecar.tensors[0].desc.owner_endpoint_id == endpoint
+        assert sidecar.tensors[0].desc.owner_worker_id == worker_id
 
         bare = TaskArgs()
         bare.add_tensor(ContinuousTensor.make(0x1234, (1,), DataType.UINT8), TensorArgType.INPUT)
@@ -523,12 +645,12 @@ def test_remote_callable_submit_rejects_tag_access_mismatch(tag, access_flags):
 
     worker = Worker(level=4, num_sub_workers=0)
     try:
-        endpoint = worker.add_remote_worker(RemoteWorkerSpec(endpoint="127.0.0.1:19073", platform="a2a3sim"))
-        handle = worker.register(RemoteCallable("pkg.remote:orch"), workers=[endpoint])
+        worker_id = worker.add_remote_worker(RemoteWorkerSpec(endpoint="127.0.0.1:19073", platform="a2a3sim"))
+        handle = worker.register(RemoteCallable("pkg.remote:orch"), workers=[worker_id])
         orch = Orchestrator(FakeCOrchestrator(), worker=worker)  # type: ignore[arg-type]
         remote_buf = RemoteBufferHandle._from_imported_mapping(
-            endpoint_id=endpoint,
-            owner_endpoint_id=endpoint,
+            worker_id=worker_id,
+            owner_worker_id=worker_id,
             buffer_id=1,
             generation=1,
             import_id=9,
@@ -563,13 +685,13 @@ def test_remote_callable_submit_accepts_readwrite_handle_for_all_tags(tag):
 
     worker = Worker(level=4, num_sub_workers=0)
     try:
-        endpoint = worker.add_remote_worker(RemoteWorkerSpec(endpoint="127.0.0.1:19073", platform="a2a3sim"))
-        handle = worker.register(RemoteCallable("pkg.remote:orch"), workers=[endpoint])
+        worker_id = worker.add_remote_worker(RemoteWorkerSpec(endpoint="127.0.0.1:19073", platform="a2a3sim"))
+        handle = worker.register(RemoteCallable("pkg.remote:orch"), workers=[worker_id])
         fake = FakeCOrchestrator()
         orch = Orchestrator(fake, worker=worker)  # type: ignore[arg-type]
         remote_buf = RemoteBufferHandle._from_imported_mapping(
-            endpoint_id=endpoint,
-            owner_endpoint_id=endpoint,
+            worker_id=worker_id,
+            owner_worker_id=worker_id,
             buffer_id=1,
             generation=1,
             import_id=9,
@@ -583,12 +705,12 @@ def test_remote_callable_submit_accepts_readwrite_handle_for_all_tags(tag):
 
         orch.submit_next_level(handle, args)
 
-        assert fake.submit_next_level_args[6] == [endpoint]
+        assert fake.submit_next_level_args[6] == [worker_id]
     finally:
         worker.close()
 
 
-def test_remote_callable_submit_intersects_remote_buffer_owner_endpoint():
+def test_remote_callable_submit_intersects_remote_buffer_owner_worker():
     class FakeCOrchestrator:
         def submit_next_level(self, *args):
             self.submit_next_level_args = args
@@ -598,14 +720,14 @@ def test_remote_callable_submit_intersects_remote_buffer_owner_endpoint():
 
     worker = Worker(level=4, num_sub_workers=0)
     try:
-        endpoint0 = worker.add_remote_worker(RemoteWorkerSpec(endpoint="127.0.0.1:19073", platform="a2a3sim"))
-        endpoint1 = worker.add_remote_worker(RemoteWorkerSpec(endpoint="127.0.0.1:19074", platform="a2a3sim"))
-        handle = worker.register(RemoteCallable("pkg.remote:orch"), workers=[endpoint0, endpoint1])
+        worker_id0 = worker.add_remote_worker(RemoteWorkerSpec(endpoint="127.0.0.1:19073", platform="a2a3sim"))
+        worker_id1 = worker.add_remote_worker(RemoteWorkerSpec(endpoint="127.0.0.1:19074", platform="a2a3sim"))
+        handle = worker.register(RemoteCallable("pkg.remote:orch"), workers=[worker_id0, worker_id1])
         fake = FakeCOrchestrator()
         orch = Orchestrator(fake, worker=worker)  # type: ignore[arg-type]
 
         buf = RemoteBufferHandle._from_remote_allocation(
-            endpoint_id=endpoint1,
+            worker_id=worker_id1,
             buffer_id=1,
             generation=1,
             address_space=RemoteAddressSpace.REMOTE_DEVICE,
@@ -615,12 +737,12 @@ def test_remote_callable_submit_intersects_remote_buffer_owner_endpoint():
         args.add_tensor(RemoteTensorRef(buf, shape=(4,), dtype=DataType.UINT8), TensorArgType.INPUT)
         orch.submit_next_level(handle, args)
 
-        assert fake.submit_next_level_args[6] == [endpoint1]
+        assert fake.submit_next_level_args[6] == [worker_id1]
     finally:
         worker.close()
 
 
-def test_remote_callable_submit_rejects_remote_buffer_outside_callable_endpoints():
+def test_remote_callable_submit_rejects_remote_buffer_outside_callable_workers():
     class FakeCOrchestrator:
         def submit_next_level(self, *args):
             self.submit_next_level_args = args
@@ -630,14 +752,14 @@ def test_remote_callable_submit_rejects_remote_buffer_outside_callable_endpoints
 
     worker = Worker(level=4, num_sub_workers=0)
     try:
-        endpoint0 = worker.add_remote_worker(RemoteWorkerSpec(endpoint="127.0.0.1:19073", platform="a2a3sim"))
-        endpoint1 = worker.add_remote_worker(RemoteWorkerSpec(endpoint="127.0.0.1:19074", platform="a2a3sim"))
-        handle = worker.register(RemoteCallable("pkg.remote:orch"), workers=[endpoint0])
+        worker_id0 = worker.add_remote_worker(RemoteWorkerSpec(endpoint="127.0.0.1:19073", platform="a2a3sim"))
+        worker_id1 = worker.add_remote_worker(RemoteWorkerSpec(endpoint="127.0.0.1:19074", platform="a2a3sim"))
+        handle = worker.register(RemoteCallable("pkg.remote:orch"), workers=[worker_id0])
         fake = FakeCOrchestrator()
         orch = Orchestrator(fake, worker=worker)  # type: ignore[arg-type]
 
         buf = RemoteBufferHandle._from_remote_allocation(
-            endpoint_id=endpoint1,
+            worker_id=worker_id1,
             buffer_id=1,
             generation=1,
             address_space=RemoteAddressSpace.REMOTE_DEVICE,
@@ -646,13 +768,13 @@ def test_remote_callable_submit_rejects_remote_buffer_outside_callable_endpoints
         args = TaskArgs()
         args.add_tensor(RemoteTensorRef(buf, shape=(4,), dtype=DataType.UINT8), TensorArgType.INPUT)
 
-        with pytest.raises(ValueError, match="no eligible remote endpoint"):
+        with pytest.raises(ValueError, match="no eligible remote worker"):
             orch.submit_next_level(handle, args)
     finally:
         worker.close()
 
 
-def test_remote_callable_group_submit_intersects_each_member_endpoint_set():
+def test_remote_callable_group_submit_intersects_each_member_worker_set():
     class FakeCOrchestrator:
         def submit_next_level(self, *args):
             self.submit_next_level_args = args
@@ -662,21 +784,21 @@ def test_remote_callable_group_submit_intersects_each_member_endpoint_set():
 
     worker = Worker(level=4, num_sub_workers=0)
     try:
-        endpoint0 = worker.add_remote_worker(RemoteWorkerSpec(endpoint="127.0.0.1:19073", platform="a2a3sim"))
-        endpoint1 = worker.add_remote_worker(RemoteWorkerSpec(endpoint="127.0.0.1:19074", platform="a2a3sim"))
-        handle = worker.register(RemoteCallable("pkg.remote:orch"), workers=[endpoint0, endpoint1])
+        worker_id0 = worker.add_remote_worker(RemoteWorkerSpec(endpoint="127.0.0.1:19073", platform="a2a3sim"))
+        worker_id1 = worker.add_remote_worker(RemoteWorkerSpec(endpoint="127.0.0.1:19074", platform="a2a3sim"))
+        handle = worker.register(RemoteCallable("pkg.remote:orch"), workers=[worker_id0, worker_id1])
         fake = FakeCOrchestrator()
         orch = Orchestrator(fake, worker=worker)  # type: ignore[arg-type]
 
         buf0 = RemoteBufferHandle._from_remote_allocation(
-            endpoint_id=endpoint0,
+            worker_id=worker_id0,
             buffer_id=1,
             generation=1,
             address_space=RemoteAddressSpace.REMOTE_DEVICE,
             nbytes=16,
         )
         buf1 = RemoteBufferHandle._from_remote_allocation(
-            endpoint_id=endpoint1,
+            worker_id=worker_id1,
             buffer_id=2,
             generation=1,
             address_space=RemoteAddressSpace.REMOTE_DEVICE,
@@ -688,16 +810,16 @@ def test_remote_callable_group_submit_intersects_each_member_endpoint_set():
         args1.add_tensor(RemoteTensorRef(buf1, shape=(4,), dtype=DataType.UINT8), TensorArgType.INPUT)
         orch.submit_next_level_group(handle, [args0, args1])
 
-        assert fake.submit_next_level_group_args[6] == [[endpoint0], [endpoint1]]
+        assert fake.submit_next_level_group_args[6] == [[worker_id0], [worker_id1]]
     finally:
         worker.close()
 
 
-def test_remote_worker_requires_reachable_daemon_before_endpoint_registration():
+def test_remote_worker_requires_reachable_daemon_before_registration():
     worker = Worker(level=4, num_sub_workers=0)
     try:
-        endpoint = worker.add_remote_worker(RemoteWorkerSpec(endpoint="127.0.0.1:1", platform="a2a3sim"))
-        worker.register(RemoteCallable("pkg.remote:orch"), workers=[endpoint])
+        worker_id = worker.add_remote_worker(RemoteWorkerSpec(endpoint="127.0.0.1:1", platform="a2a3sim"))
+        worker.register(RemoteCallable("pkg.remote:orch"), workers=[worker_id])
         with pytest.raises((ConnectionRefusedError, OSError, RuntimeError)):
             worker.init()
     finally:
@@ -714,17 +836,17 @@ def test_remote_sim_noop_task_roundtrip():
     worker = Worker(level=4, num_sub_workers=0, remote_session_timeout_s=10)
     try:
         time.sleep(0.3)
-        endpoint = worker.add_remote_worker(
+        worker_id = worker.add_remote_worker(
             RemoteWorkerSpec(endpoint=f"127.0.0.1:{port}", platform="a2a3sim", transport="sim")
         )
         handle = worker.register(
             RemoteCallable("tests.ut.py.test_callable_identity:_remote_noop_orch"),
-            workers=[endpoint],
+            workers=[worker_id],
         )
         worker.init()
 
         def parent_orch(orch, _args, cfg):
-            orch.submit_next_level(handle, TaskArgs(), cfg, worker=endpoint)
+            orch.submit_next_level(handle, TaskArgs(), cfg, worker=worker_id)
 
         worker.run(parent_orch)
     finally:
@@ -747,20 +869,20 @@ def test_remote_sim_prepare_callable_control_roundtrip():
     worker = Worker(level=4, num_sub_workers=0, remote_session_timeout_s=10)
     try:
         time.sleep(0.3)
-        endpoint = worker.add_remote_worker(
+        worker_id = worker.add_remote_worker(
             RemoteWorkerSpec(endpoint=f"127.0.0.1:{port}", platform="a2a3sim", transport="sim")
         )
         handle = worker.register(
             RemoteCallable("tests.ut.py.test_callable_identity:_remote_noop_orch"),
-            workers=[endpoint],
+            workers=[worker_id],
         )
         worker.init()
         worker._start_hierarchical()  # noqa: SLF001 -- exercise PREPARE_CALLABLE before TASK dispatch.
         assert worker._worker is not None
-        worker._worker.control_prepare(endpoint, handle.digest)
+        worker._worker.control_prepare(worker_id, handle.digest)
 
         def parent_orch(orch, _args, cfg):
-            orch.submit_next_level(handle, TaskArgs(), cfg, worker=endpoint)
+            orch.submit_next_level(handle, TaskArgs(), cfg, worker=worker_id)
 
         worker.run(parent_orch)
     finally:
@@ -783,17 +905,17 @@ def test_remote_sim_error_completion_raises_root_error():
     worker = Worker(level=4, num_sub_workers=0, remote_session_timeout_s=10)
     try:
         time.sleep(0.3)
-        endpoint = worker.add_remote_worker(
+        worker_id = worker.add_remote_worker(
             RemoteWorkerSpec(endpoint=f"127.0.0.1:{port}", platform="a2a3sim", transport="sim")
         )
         handle = worker.register(
             RemoteCallable("tests.ut.py.test_callable_identity:_remote_raises_orch"),
-            workers=[endpoint],
+            workers=[worker_id],
         )
         worker.init()
 
         def parent_orch(orch, _args, cfg):
-            orch.submit_next_level(handle, TaskArgs(), cfg, worker=endpoint)
+            orch.submit_next_level(handle, TaskArgs(), cfg, worker=worker_id)
 
         with pytest.raises(RuntimeError, match="remote boom"):
             worker.run(parent_orch)
@@ -817,17 +939,17 @@ def test_remote_sim_post_init_register_roundtrip():
     worker = Worker(level=4, num_sub_workers=0, remote_session_timeout_s=10)
     try:
         time.sleep(0.3)
-        endpoint = worker.add_remote_worker(
+        worker_id = worker.add_remote_worker(
             RemoteWorkerSpec(endpoint=f"127.0.0.1:{port}", platform="a2a3sim", transport="sim")
         )
         worker.init()
         handle = worker.register(
             RemoteCallable("tests.ut.py.test_callable_identity:_remote_noop_orch"),
-            workers=[endpoint],
+            workers=[worker_id],
         )
 
         def parent_orch(orch, _args, cfg):
-            orch.submit_next_level(handle, TaskArgs(), cfg, worker=endpoint)
+            orch.submit_next_level(handle, TaskArgs(), cfg, worker=worker_id)
 
         worker.run(parent_orch)
     finally:
@@ -850,27 +972,27 @@ def test_remote_sim_unregister_then_reregister_roundtrip():
     worker = Worker(level=4, num_sub_workers=0, remote_session_timeout_s=10)
     try:
         time.sleep(0.3)
-        endpoint = worker.add_remote_worker(
+        worker_id = worker.add_remote_worker(
             RemoteWorkerSpec(endpoint=f"127.0.0.1:{port}", platform="a2a3sim", transport="sim")
         )
         worker.init()
 
         def run_handle(handle):
             def parent_orch(orch, _args, cfg):
-                orch.submit_next_level(handle, TaskArgs(), cfg, worker=endpoint)
+                orch.submit_next_level(handle, TaskArgs(), cfg, worker=worker_id)
 
             worker.run(parent_orch)
 
         first = worker.register(
             RemoteCallable("tests.ut.py.test_callable_identity:_remote_noop_orch"),
-            workers=[endpoint],
+            workers=[worker_id],
         )
         run_handle(first)
         worker.unregister(first)
 
         second = worker.register(
             RemoteCallable("tests.ut.py.test_callable_identity:_remote_noop_orch"),
-            workers=[endpoint],
+            workers=[worker_id],
         )
         run_handle(second)
     finally:
@@ -893,17 +1015,17 @@ def test_remote_sim_health_lane_stays_live_during_long_task():
     worker = Worker(level=4, num_sub_workers=0, remote_session_timeout_s=5)
     try:
         time.sleep(0.3)
-        endpoint = worker.add_remote_worker(
+        worker_id = worker.add_remote_worker(
             RemoteWorkerSpec(endpoint=f"127.0.0.1:{port}", platform="a2a3sim", transport="sim")
         )
         handle = worker.register(
             RemoteCallable("tests.ut.py.test_callable_identity:_remote_sleep_orch"),
-            workers=[endpoint],
+            workers=[worker_id],
         )
         worker.init()
 
         def parent_orch(orch, _args, cfg):
-            orch.submit_next_level(handle, TaskArgs(), cfg, worker=endpoint)
+            orch.submit_next_level(handle, TaskArgs(), cfg, worker=worker_id)
 
         worker.run(parent_orch)
     finally:
@@ -925,10 +1047,10 @@ def test_remote_sim_inner_python_import_register_runs_sub_task():
     )
     worker = Worker(level=4, num_sub_workers=0, remote_session_timeout_s=10)
     inner_committed = False
-    endpoint = -1
+    worker_id = -1
     try:
         time.sleep(0.3)
-        endpoint = worker.add_remote_worker(
+        worker_id = worker.add_remote_worker(
             RemoteWorkerSpec(
                 endpoint=f"127.0.0.1:{port}",
                 platform="a2a3sim",
@@ -938,7 +1060,7 @@ def test_remote_sim_inner_python_import_register_runs_sub_task():
         )
         handle = worker.register(
             RemoteCallable("tests.ut.py.test_callable_identity:_remote_submit_inner_sub_orch"),
-            workers=[endpoint],
+            workers=[worker_id],
         )
         worker.init()
         worker._start_hierarchical()
@@ -946,7 +1068,7 @@ def test_remote_sim_inner_python_import_register_runs_sub_task():
         inner_digest = hashid_to_digest(_INNER_SUB_HASHID)
         target = b"tests.ut.py.test_callable_identity:_remote_inner_sub_noop"
         result = worker._worker.remote_prepare_register(
-            endpoint,
+            worker_id,
             "INNER_L3_WORKER",
             "PYTHON_IMPORT",
             target,
@@ -954,7 +1076,7 @@ def test_remote_sim_inner_python_import_register_runs_sub_task():
         )
         assert result.ok, result.error_message
         result = worker._worker.remote_commit_register(
-            endpoint,
+            worker_id,
             "INNER_L3_WORKER",
             "PYTHON_IMPORT",
             inner_digest,
@@ -963,12 +1085,12 @@ def test_remote_sim_inner_python_import_register_runs_sub_task():
         inner_committed = True
 
         def parent_orch(orch, _args, cfg):
-            orch.submit_next_level(handle, TaskArgs(), cfg, worker=endpoint)
+            orch.submit_next_level(handle, TaskArgs(), cfg, worker=worker_id)
 
         worker.run(parent_orch)
 
         result = worker._worker.remote_unregister(
-            endpoint,
+            worker_id,
             "INNER_L3_WORKER",
             "PYTHON_IMPORT",
             inner_digest,
@@ -979,7 +1101,7 @@ def test_remote_sim_inner_python_import_register_runs_sub_task():
         if inner_committed and worker._worker is not None:
             try:
                 worker._worker.remote_unregister(
-                    endpoint,
+                    worker_id,
                     "INNER_L3_WORKER",
                     "PYTHON_IMPORT",
                     hashid_to_digest(_INNER_SUB_HASHID),
@@ -1005,16 +1127,16 @@ def test_remote_sim_buffer_copy_roundtrip():
     worker = Worker(level=4, num_sub_workers=0, remote_session_timeout_s=10)
     try:
         time.sleep(0.3)
-        endpoint = worker.add_remote_worker(
+        worker_id = worker.add_remote_worker(
             RemoteWorkerSpec(endpoint=f"127.0.0.1:{port}", platform="a2a3sim", transport="sim")
         )
         handle = worker.register(
             RemoteCallable("tests.ut.py.test_callable_identity:_remote_increment_u8_orch"),
-            workers=[endpoint],
+            workers=[worker_id],
         )
         worker.init()
 
-        remote_buf = worker.remote_malloc(worker=endpoint, nbytes=4)
+        remote_buf = worker.remote_malloc(worker=worker_id, nbytes=4)
         src = (ctypes.c_ubyte * 4)(1, 2, 3, 4)
         worker.remote_copy_to(remote_buf, src, 4)
 
@@ -1024,7 +1146,7 @@ def test_remote_sim_buffer_copy_roundtrip():
                 RemoteTensorRef(remote_buf, shape=(4,), dtype=DataType.UINT8),
                 TensorArgType.INOUT,
             )
-            orch.submit_next_level(handle, task_args, cfg, worker=endpoint)
+            orch.submit_next_level(handle, task_args, cfg, worker=worker_id)
 
         worker.run(parent_orch)
 
@@ -1042,7 +1164,7 @@ def test_remote_sim_buffer_copy_roundtrip():
             daemon.wait(timeout=5)
 
 
-def test_remote_sim_imported_buffer_runs_on_peer_endpoint():
+def test_remote_sim_imported_buffer_runs_on_peer_worker():
     owner_port = _free_tcp_port()
     peer_port = _free_tcp_port()
     owner_daemon = subprocess.Popen(
@@ -1058,23 +1180,23 @@ def test_remote_sim_imported_buffer_runs_on_peer_endpoint():
     worker = Worker(level=4, num_sub_workers=0, remote_session_timeout_s=10)
     try:
         time.sleep(0.3)
-        owner_endpoint = worker.add_remote_worker(
+        owner_worker_id = worker.add_remote_worker(
             RemoteWorkerSpec(endpoint=f"127.0.0.1:{owner_port}", platform="a2a3sim", transport="sim")
         )
-        peer_endpoint = worker.add_remote_worker(
+        peer_worker_id = worker.add_remote_worker(
             RemoteWorkerSpec(endpoint=f"127.0.0.1:{peer_port}", platform="a2a3sim", transport="sim")
         )
         handle = worker.register(
             RemoteCallable("tests.ut.py.test_callable_identity:_remote_increment_u8_orch"),
-            workers=[peer_endpoint],
+            workers=[peer_worker_id],
         )
         worker.init()
 
-        owner_buf = worker.remote_malloc(worker=owner_endpoint, nbytes=4)
+        owner_buf = worker.remote_malloc(worker=owner_worker_id, nbytes=4)
         src = (ctypes.c_ubyte * 4)(10, 11, 12, 13)
         worker.remote_copy_to(owner_buf, src, 4)
         exported = worker.remote_export(owner_buf, access="readwrite")
-        peer_buf = worker.remote_import(exported, worker=peer_endpoint)
+        peer_buf = worker.remote_import(exported, worker=peer_worker_id)
 
         def parent_orch(orch, _args, cfg):
             task_args = TaskArgs()
@@ -1082,7 +1204,7 @@ def test_remote_sim_imported_buffer_runs_on_peer_endpoint():
                 RemoteTensorRef(peer_buf, shape=(4,), dtype=DataType.UINT8),
                 TensorArgType.INOUT,
             )
-            orch.submit_next_level(handle, task_args, cfg, worker=peer_endpoint)
+            orch.submit_next_level(handle, task_args, cfg, worker=peer_worker_id)
 
         worker.run(parent_orch)
 
@@ -1105,14 +1227,14 @@ def test_remote_sim_imported_buffer_runs_on_peer_endpoint():
 def test_remote_owner_free_waits_for_import_release():
     worker = Worker(level=4, num_sub_workers=0)
     owner = RemoteBufferHandle._from_remote_allocation(
-        endpoint_id=0,
+        worker_id=0,
         buffer_id=1,
         generation=1,
         address_space=RemoteAddressSpace.REMOTE_DEVICE,
         nbytes=4,
     )
     exported = RemoteBufferExport._from_remote_export(
-        owner_endpoint_id=0,
+        owner_worker_id=0,
         buffer_id=1,
         generation=1,
         address_space=RemoteAddressSpace.REMOTE_WINDOW,
@@ -1141,12 +1263,13 @@ def test_remote_owner_free_waits_for_import_release():
     fake = FakeRemoteWorker()
     fake.released = None
     fake.freed = None
+    worker.add_remote_worker(RemoteWorkerSpec(endpoint="127.0.0.1:19073", platform="a2a3sim"))
+    importer_worker_id = worker.add_remote_worker(RemoteWorkerSpec(endpoint="127.0.0.1:19074", platform="a2a3sim"))
     worker._worker = fake
     worker._initialized = True
     worker._hierarchical_start_state = "started"
-    worker._remote_worker_specs = [object(), object()]
 
-    imported = worker.remote_import(exported, worker=1)
+    imported = worker.remote_import(exported, worker=importer_worker_id)
     worker.remote_free(owner)
     assert owner.released
     assert fake.freed is None
@@ -1160,17 +1283,18 @@ def test_remote_owner_free_waits_for_import_release():
 
 def test_remote_import_rejects_cross_worker_or_stale_export():
     owner = RemoteBufferHandle._from_remote_allocation(
-        endpoint_id=0,
+        worker_id=0,
         buffer_id=1,
         generation=1,
         address_space=RemoteAddressSpace.REMOTE_DEVICE,
         nbytes=4,
     )
     worker = Worker(level=4, num_sub_workers=0)
+    worker_id = worker.add_remote_worker(RemoteWorkerSpec(endpoint="127.0.0.1:19073", platform="a2a3sim"))
 
     def make_export(*, worker_owner_id=None):
         return RemoteBufferExport._from_remote_export(
-            owner_endpoint_id=0,
+            owner_worker_id=0,
             buffer_id=1,
             generation=1,
             address_space=RemoteAddressSpace.REMOTE_WINDOW,
@@ -1187,14 +1311,14 @@ def test_remote_import_rejects_cross_worker_or_stale_export():
         )
 
     with pytest.raises(ValueError, match="forged"):
-        worker.remote_import(make_export(), worker=0)
+        worker.remote_import(make_export(), worker=worker_id)
     with pytest.raises(ValueError, match="different Worker"):
-        worker.remote_import(make_export(worker_owner_id="other-worker"), worker=0)
+        worker.remote_import(make_export(worker_owner_id="other-worker"), worker=worker_id)
 
     exported = make_export(worker_owner_id=worker._owner_id)
     owner._mark_released()
     with pytest.raises(ValueError, match="stale"):
-        worker.remote_import(exported, worker=0)
+        worker.remote_import(exported, worker=worker_id)
 
 
 def test_remote_pending_free_is_retained_when_control_fails():
@@ -1204,17 +1328,17 @@ def test_remote_pending_free_is_retained_when_control_fails():
 
     worker = Worker(level=4, num_sub_workers=0)
     owner = RemoteBufferHandle._from_remote_allocation(
-        endpoint_id=0,
+        worker_id=0,
         buffer_id=1,
         generation=1,
         address_space=RemoteAddressSpace.REMOTE_DEVICE,
         nbytes=4,
     )
     owner._mark_released()
+    worker.add_remote_worker(RemoteWorkerSpec(endpoint="127.0.0.1:19073", platform="a2a3sim"))
     worker._worker = FailingRemoteWorker()  # type: ignore[assignment]
     worker._initialized = True
     worker._hierarchical_start_state = "started"
-    worker._remote_worker_specs = [object()]
     worker._pending_remote_buffer_frees = [owner]
 
     worker._flush_pending_remote_frees()
@@ -1243,13 +1367,13 @@ def test_partial_init_failure_cleans_open_remote_session(monkeypatch):
 
     calls = 0
 
-    def fake_open_remote_session(self, *, spec, endpoint_id, session_id, timeout_s):
+    def fake_open_remote_session(self, *, spec, worker_id, session_id, timeout_s):
         nonlocal calls
         calls += 1
         if calls == 2:
             raise RuntimeError("second session failed")
         return worker_mod._RemoteSession(  # noqa: SLF001
-            endpoint_id=endpoint_id,
+            worker_id=worker_id,
             session_id=session_id,
             command_host="127.0.0.1",
             command_port=1,
@@ -1289,7 +1413,7 @@ def test_partial_init_failure_closes_unregistered_open_remote_session(monkeypatc
 
     fake_c_worker = FailingAddCWorker()
     opened_session = worker_mod._RemoteSession(  # noqa: SLF001
-        endpoint_id=0,
+        worker_id=0,
         session_id=123,
         command_host="127.0.0.1",
         command_port=1,
@@ -1302,7 +1426,7 @@ def test_partial_init_failure_closes_unregistered_open_remote_session(monkeypatc
     def fake_worker_ctor(*args):
         return fake_c_worker
 
-    def fake_open_remote_session(self, *, spec, endpoint_id, session_id, timeout_s):
+    def fake_open_remote_session(self, *, spec, worker_id, session_id, timeout_s):
         return opened_session
 
     def fake_close_remote_session(self, session):
@@ -1382,20 +1506,20 @@ def test_remote_sim_failed_dependency_skips_consumer():
     worker = Worker(level=4, num_sub_workers=0, remote_session_timeout_s=10)
     try:
         time.sleep(0.3)
-        endpoint = worker.add_remote_worker(
+        worker_id = worker.add_remote_worker(
             RemoteWorkerSpec(endpoint=f"127.0.0.1:{port}", platform="a2a3sim", transport="sim")
         )
         fail_handle = worker.register(
             RemoteCallable("tests.ut.py.test_callable_identity:_remote_fail_before_write_orch"),
-            workers=[endpoint],
+            workers=[worker_id],
         )
         mark_handle = worker.register(
             RemoteCallable("tests.ut.py.test_callable_identity:_remote_mark_u8_orch"),
-            workers=[endpoint],
+            workers=[worker_id],
         )
         worker.init()
 
-        remote_buf = worker.remote_malloc(worker=endpoint, nbytes=4)
+        remote_buf = worker.remote_malloc(worker=worker_id, nbytes=4)
         src = (ctypes.c_ubyte * 4)(1, 2, 3, 4)
         worker.remote_copy_to(remote_buf, src, 4)
 
@@ -1410,8 +1534,8 @@ def test_remote_sim_failed_dependency_skips_consumer():
                 RemoteTensorRef(remote_buf, shape=(4,), dtype=DataType.UINT8),
                 TensorArgType.INPUT,
             )
-            orch.submit_next_level(fail_handle, producer_args, cfg, worker=endpoint)
-            orch.submit_next_level(mark_handle, consumer_args, cfg, worker=endpoint)
+            orch.submit_next_level(fail_handle, producer_args, cfg, worker=worker_id)
+            orch.submit_next_level(mark_handle, consumer_args, cfg, worker=worker_id)
 
         with pytest.raises(RuntimeError, match="remote producer failed before write"):
             worker.run(parent_orch)
@@ -1440,17 +1564,17 @@ def test_remote_sim_session_exit_becomes_endpoint_failure():
     worker = Worker(level=4, num_sub_workers=0, remote_session_timeout_s=3)
     try:
         time.sleep(0.3)
-        endpoint = worker.add_remote_worker(
+        worker_id = worker.add_remote_worker(
             RemoteWorkerSpec(endpoint=f"127.0.0.1:{port}", platform="a2a3sim", transport="sim")
         )
         handle = worker.register(
             RemoteCallable("tests.ut.py.test_callable_identity:_remote_exit_orch"),
-            workers=[endpoint],
+            workers=[worker_id],
         )
         worker.init()
 
         def parent_orch(orch, _args, cfg):
-            orch.submit_next_level(handle, TaskArgs(), cfg, worker=endpoint)
+            orch.submit_next_level(handle, TaskArgs(), cfg, worker=worker_id)
 
         with pytest.raises(RuntimeError, match="RemoteL3Endpoint::run|socket closed|health lane"):
             worker.run(parent_orch)
@@ -1474,17 +1598,17 @@ def test_remote_sim_input_free_is_deferred_until_slot_refs_drop():
     worker = Worker(level=4, num_sub_workers=0, remote_session_timeout_s=10)
     try:
         time.sleep(0.3)
-        endpoint = worker.add_remote_worker(
+        worker_id = worker.add_remote_worker(
             RemoteWorkerSpec(endpoint=f"127.0.0.1:{port}", platform="a2a3sim", transport="sim")
         )
         handle = worker.register(
             RemoteCallable("tests.ut.py.test_callable_identity:_remote_sum_u8_orch"),
-            workers=[endpoint],
+            workers=[worker_id],
         )
         worker.init()
 
-        remote_in = worker.remote_malloc(worker=endpoint, nbytes=4)
-        remote_out = worker.remote_malloc(worker=endpoint, nbytes=1)
+        remote_in = worker.remote_malloc(worker=worker_id, nbytes=4)
+        remote_out = worker.remote_malloc(worker=worker_id, nbytes=1)
         src = (ctypes.c_ubyte * 4)(1, 2, 3, 4)
         worker.remote_copy_to(remote_in, src, 4)
 
@@ -1498,7 +1622,7 @@ def test_remote_sim_input_free_is_deferred_until_slot_refs_drop():
                 RemoteTensorRef(remote_out, shape=(1,), dtype=DataType.UINT8),
                 TensorArgType.OUTPUT,
             )
-            orch.submit_next_level(handle, task_args, cfg, worker=endpoint)
+            orch.submit_next_level(handle, task_args, cfg, worker=worker_id)
             worker.remote_free(remote_in)
 
         worker.run(parent_orch)
@@ -1528,16 +1652,16 @@ def test_remote_sim_host_inline_descriptor_roundtrip():
     worker = Worker(level=4, num_sub_workers=0, remote_session_timeout_s=10)
     try:
         time.sleep(0.3)
-        endpoint = worker.add_remote_worker(
+        worker_id = worker.add_remote_worker(
             RemoteWorkerSpec(endpoint=f"127.0.0.1:{port}", platform="a2a3sim", transport="sim")
         )
         handle = worker.register(
             RemoteCallable("tests.ut.py.test_callable_identity:_remote_sum_u8_orch"),
-            workers=[endpoint],
+            workers=[worker_id],
         )
         worker.init()
 
-        remote_out = worker.remote_malloc(worker=endpoint, nbytes=1)
+        remote_out = worker.remote_malloc(worker=worker_id, nbytes=1)
 
         def parent_orch(orch, _args, cfg):
             task_args = TaskArgs()
@@ -1549,7 +1673,7 @@ def test_remote_sim_host_inline_descriptor_roundtrip():
                 RemoteTensorRef(remote_out, shape=(1,), dtype=DataType.UINT8),
                 TensorArgType.OUTPUT,
             )
-            orch.submit_next_level(handle, task_args, cfg, worker=endpoint)
+            orch.submit_next_level(handle, task_args, cfg, worker=worker_id)
 
         worker.run(parent_orch)
 
@@ -1572,32 +1696,32 @@ def test_worker_remote_memory_api_returns_opaque_handle_and_routes_controls():
         def __init__(self):
             self.calls = []
 
-        def remote_malloc(self, endpoint_id, size):
-            self.calls.append(("malloc", endpoint_id, size))
-            return (endpoint_id, 7, 1, int(RemoteAddressSpace.REMOTE_DEVICE), size, 0xCAFE, 0xBEEF, 0)
+        def remote_malloc(self, worker_id, size):
+            self.calls.append(("malloc", worker_id, size))
+            return (worker_id, 7, 1, int(RemoteAddressSpace.REMOTE_DEVICE), size, 0xCAFE, 0xBEEF, 0)
 
-        def remote_copy_to(self, endpoint_id, buffer_id, generation, offset, src, size, handle_nbytes):
-            self.calls.append(("copy_to", endpoint_id, buffer_id, generation, offset, src, size, handle_nbytes))
+        def remote_copy_to(self, worker_id, buffer_id, generation, offset, src, size, handle_nbytes):
+            self.calls.append(("copy_to", worker_id, buffer_id, generation, offset, src, size, handle_nbytes))
 
-        def remote_copy_from(self, dst, endpoint_id, buffer_id, generation, offset, size, handle_nbytes):
-            self.calls.append(("copy_from", dst, endpoint_id, buffer_id, generation, offset, size, handle_nbytes))
+        def remote_copy_from(self, dst, worker_id, buffer_id, generation, offset, size, handle_nbytes):
+            self.calls.append(("copy_from", dst, worker_id, buffer_id, generation, offset, size, handle_nbytes))
 
-        def remote_free(self, endpoint_id, buffer_id, generation):
-            self.calls.append(("free", endpoint_id, buffer_id, generation))
+        def remote_free(self, worker_id, buffer_id, generation):
+            self.calls.append(("free", worker_id, buffer_id, generation))
 
         def close(self):
             self.calls.append(("close",))
 
     worker = Worker(level=4, num_sub_workers=0)
-    endpoint = worker.add_remote_worker(RemoteWorkerSpec(endpoint="127.0.0.1:19073", platform="a2a3sim"))
+    worker_id = worker.add_remote_worker(RemoteWorkerSpec(endpoint="127.0.0.1:19073", platform="a2a3sim"))
     fake = FakeRemoteCWorker()
     worker._initialized = True
     worker._worker = fake  # type: ignore[assignment]
     worker._hierarchical_started = True
     worker._hierarchical_start_state = "started"
     try:
-        handle = worker.remote_malloc(worker=endpoint, nbytes=4)
-        assert handle.endpoint_id == endpoint
+        handle = worker.remote_malloc(worker=worker_id, nbytes=4)
+        assert handle.worker_id == worker_id
         assert handle.nbytes == 4
         assert not hasattr(handle, "rkey_or_token")
 
@@ -1609,23 +1733,23 @@ def test_worker_remote_memory_api_returns_opaque_handle_and_routes_controls():
 
         assert handle.released
         assert fake.calls[:4] == [
-            ("malloc", endpoint, 4),
-            ("copy_to", endpoint, 7, 1, 0, ctypes.addressof(src), 4, 4),
-            ("copy_from", ctypes.addressof(dst), endpoint, 7, 1, 0, 4, 4),
-            ("free", endpoint, 7, 1),
+            ("malloc", worker_id, 4),
+            ("copy_to", worker_id, 7, 1, 0, ctypes.addressof(src), 4, 4),
+            ("copy_from", ctypes.addressof(dst), worker_id, 7, 1, 0, 4, 4),
+            ("free", worker_id, 7, 1),
         ]
         with pytest.raises(RuntimeError, match="released"):
             worker.remote_copy_to(handle, src, 1)
 
-        deferred = worker.remote_malloc(worker=endpoint, nbytes=8)
+        deferred = worker.remote_malloc(worker=worker_id, nbytes=8)
         deferred._acquire_slot_ref()
         worker.remote_free(deferred)
         assert deferred.released
-        assert ("free", endpoint, 7, 1) in fake.calls
-        free_count = fake.calls.count(("free", endpoint, 7, 1))
+        assert ("free", worker_id, 7, 1) in fake.calls
+        free_count = fake.calls.count(("free", worker_id, 7, 1))
         deferred._release_slot_ref()
         worker._flush_pending_remote_frees()
-        assert fake.calls.count(("free", endpoint, 7, 1)) == free_count + 1
+        assert fake.calls.count(("free", worker_id, 7, 1)) == free_count + 1
     finally:
         worker.close()
 

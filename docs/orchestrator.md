@@ -34,14 +34,14 @@ public:
     SubmitResult submit_next_level(const CallableIdentity &callable,
                                     const TaskArgs &args,
                                     const CallConfig &config,
-                                    int8_t worker = -1,
-                                    const std::vector<int32_t> &eligible_endpoint_ids = {},
+                                    int32_t worker = -1,
+                                    const std::vector<int32_t> &eligible_worker_ids = {},
                                     const RemoteTaskArgsSidecar &remote_sidecar = {});
     SubmitResult submit_next_level_group(const CallableIdentity &callable,
                                           const std::vector<TaskArgs> &args_list,
                                           const CallConfig &config,
-                                          const std::vector<int8_t> &workers = {},
-                                          const std::vector<std::vector<int32_t>> &eligible_endpoint_ids = {},
+                                          const std::vector<int32_t> &workers = {},
+                                          const std::vector<std::vector<int32_t>> &eligible_worker_ids = {},
                                           const std::vector<RemoteTaskArgsSidecar> &remote_sidecars = {});
     SubmitResult submit_sub(const CallableIdentity &callable,
                             const TaskArgs &args);
@@ -71,13 +71,15 @@ struct SubmitResult { TaskSlot task_slot; };  // internal only; not bound to Pyt
 `_scope_begin` / `_scope_end` / `_drain` bindings. They are not part of the
 user-facing orch-fn API.
 
-Remote L3 submit adds two hidden pieces of metadata: final eligible endpoint
+Remote L3 submit adds two hidden pieces of metadata: final eligible worker-id
 sets and optional `RemoteTaskArgsSidecar` entries aligned by tensor index.
 Python `RemoteCallable` handles supply callable eligibility, and
 `TaskArgs.add_tensor(RemoteTensorRef(...), tag)` supplies tensor sidecars. The
-Orchestrator validates affinity, endpoint existence, local-vs-remote
+Orchestrator validates affinity, worker existence, local-vs-remote
 compatibility, remote handle access rights for the tensor tag, bare host
 pointers, and remote null OUTPUT tensors before committing the slot.
+For NEXT_LEVEL tasks, `worker`/`workers` are stable worker ids rather than
+C++ worker-thread vector indices.
 
 ---
 
@@ -152,7 +154,7 @@ are never inspected again; they are not carried into the slot's stored
 `task_args` value during dispatch (see [task-flow.md](task-flow.md) §3).
 Local tensors key TensorMap by `(LOCAL_HOST, ptr)` or
 `(LOCAL_CHILD, worker, ptr)`. Remote tensors with sidecars key by
-`(address_kind, owner_endpoint_id, buffer_id, generation, offset)`.
+`(address_kind, owner_worker_id, buffer_id, generation, offset)`.
 
 | Tag | `tensormap.lookup` | `tensormap.insert` |
 | --- | ------------------ | ------------------ |

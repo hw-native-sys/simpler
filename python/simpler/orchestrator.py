@@ -78,7 +78,7 @@ def _require_handle(
         raise TypeError(f"{kind} expects a CallableHandle returned by Worker.register")
     if worker is not None:
         state = worker._resolve_handle(callable_or_handle, expected_namespace=expected_namespace)
-        return state.digest, state.kind, state.target_namespace, state.eligible_endpoint_ids
+        return state.digest, state.kind, state.target_namespace, state.eligible_worker_ids
     if expected_namespace is not None and callable_or_handle.target_namespace != expected_namespace:
         raise TypeError(
             f"{kind} cannot run {callable_or_handle.target_namespace}; expected {expected_namespace} "
@@ -93,15 +93,15 @@ def _split_next_level_args(args: TaskArgs) -> tuple[TaskArgs, object | None]:
     raise TypeError("NEXT_LEVEL submit expects TaskArgs")
 
 
-def _remote_data_eligible_endpoint_ids(
+def _remote_data_eligible_worker_ids(
     remote_sidecar: object | None,
-    callable_endpoint_ids: tuple[int, ...],
+    callable_worker_ids: tuple[int, ...],
 ) -> list[int]:
-    endpoint_ids = [int(endpoint_id) for endpoint_id in callable_endpoint_ids]
+    worker_ids = [int(worker_id) for worker_id in callable_worker_ids]
     if remote_sidecar is None:
-        return endpoint_ids
+        return worker_ids
 
-    allowed = set(endpoint_ids)
+    allowed = set(worker_ids)
     for tensor_sidecar in getattr(remote_sidecar, "tensors", ()):
         if tensor_sidecar is None or not getattr(tensor_sidecar, "present", False):
             continue
@@ -109,13 +109,13 @@ def _remote_data_eligible_endpoint_ids(
         if RemoteAddressSpace(int(desc.address_space)) == RemoteAddressSpace.HOST_INLINE:
             continue
         handle = getattr(tensor_sidecar, "handle", None)
-        consumable_endpoint_id = int(getattr(handle, "endpoint_id", desc.owner_endpoint_id))
-        allowed.intersection_update({consumable_endpoint_id})
+        consumable_worker_id = int(getattr(handle, "worker_id", desc.owner_worker_id))
+        allowed.intersection_update({consumable_worker_id})
 
-    final_endpoint_ids = [endpoint_id for endpoint_id in endpoint_ids if endpoint_id in allowed]
-    if not final_endpoint_ids:
-        raise ValueError("remote tensor sidecars leave no eligible remote endpoint")
-    return final_endpoint_ids
+    final_worker_ids = [worker_id for worker_id in worker_ids if worker_id in allowed]
+    if not final_worker_ids:
+        raise ValueError("remote tensor sidecars leave no eligible remote worker")
+    return final_worker_ids
 
 
 class Orchestrator:
@@ -154,7 +154,9 @@ class Orchestrator:
         """Submit a NEXT_LEVEL task by registered callable handle.
 
         ``callable_handle`` must be returned by ``Worker.register``. Tags inside ``args`` drive deps.
-        ``worker``: logical worker id for affinity (-1 = unconstrained).
+        ``worker``: stable NEXT_LEVEL worker id for affinity
+        (-1 = unconstrained). For L3 chip dispatch, worker ids are the
+        existing chip worker ids.
         """
         cfg = config if config is not None else CallConfig()
         expected_namespace = (
@@ -163,7 +165,7 @@ class Orchestrator:
             and callable_handle.target_namespace == "REMOTE_TASK_DISPATCHER"
             else self._expected_next_level_namespace()
         )
-        digest, kind, target_namespace, eligible_endpoint_ids = _require_handle(
+        digest, kind, target_namespace, eligible_worker_ids = _require_handle(
             callable_handle,
             kind="orch.submit_next_level",
             worker=self._worker,
@@ -179,11 +181,12 @@ class Orchestrator:
                 raise TypeError("RemoteTensorRef is only supported for RemoteCallable NEXT_LEVEL submits")
             remote_sidecar = None
         _validate_remote_sidecar_access(c_args, remote_sidecar)
-        final_endpoint_ids = _remote_data_eligible_endpoint_ids(remote_sidecar, eligible_endpoint_ids)
+        final_worker_ids = _remote_data_eligible_worker_ids(remote_sidecar, eligible_worker_ids)
+        cpp_worker_id = int(worker)
         captured_refs = self._worker._capture_remote_sidecar_refs(remote_sidecar) if self._worker is not None else []
         try:
             self._o.submit_next_level(
-                digest, kind, target_namespace, c_args, cfg, int(worker), final_endpoint_ids, remote_sidecar
+                digest, kind, target_namespace, c_args, cfg, cpp_worker_id, final_worker_ids, remote_sidecar
             )
         except BaseException:
             if self._worker is not None:
@@ -200,19 +203,21 @@ class Orchestrator:
         *,
         workers: list | None = None,
     ):
-        """Submit a group of NEXT_LEVEL tasks (N TaskArgs → N workers, 1 DAG node).
+        """Submit a group of NEXT_LEVEL tasks (N TaskArgs → N worker selections, 1 DAG node).
 
-        ``workers``: per-args affinity list (None/empty = all unconstrained).
+        ``workers``: per-args stable NEXT_LEVEL worker ids. For L3 chip
+        dispatch, worker ids are the existing chip worker ids.
+        None/empty = all unconstrained.
         """
         cfg = config if config is not None else CallConfig()
-        w = [int(x) for x in workers] if workers else []
+        worker_ids = [int(x) for x in workers] if workers else []
         expected_namespace = (
             None
             if isinstance(callable_handle, CallableHandle)
             and callable_handle.target_namespace == "REMOTE_TASK_DISPATCHER"
             else self._expected_next_level_namespace()
         )
-        digest, kind, target_namespace, eligible_endpoint_ids = _require_handle(
+        digest, kind, target_namespace, eligible_worker_ids = _require_handle(
             callable_handle,
             kind="orch.submit_next_level_group",
             worker=self._worker,
@@ -238,23 +243,24 @@ class Orchestrator:
         if remote_sidecars is not None:
             for c_args, remote_sidecar in zip(c_args_list, remote_sidecars):
                 _validate_remote_sidecar_access(c_args, remote_sidecar)
-        endpoint_sets = (
+        worker_id_sets = (
             [
-                _remote_data_eligible_endpoint_ids(remote_sidecar, eligible_endpoint_ids)
+                _remote_data_eligible_worker_ids(remote_sidecar, eligible_worker_ids)
                 for remote_sidecar in remote_sidecars
             ]
             if remote_sidecars is not None
-            else [list(eligible_endpoint_ids) for _ in args_list]
-            if eligible_endpoint_ids
+            else [list(eligible_worker_ids) for _ in args_list]
+            if eligible_worker_ids
             else []
         )
+        cpp_worker_ids = worker_ids
         captured_refs: list[Any] = []
         if self._worker is not None and remote_sidecars is not None:
             for sidecar in remote_sidecars:
                 captured_refs.extend(self._worker._capture_remote_sidecar_refs(sidecar))
         try:
             self._o.submit_next_level_group(
-                digest, kind, target_namespace, c_args_list, cfg, w, endpoint_sets, remote_sidecars
+                digest, kind, target_namespace, c_args_list, cfg, cpp_worker_ids, worker_id_sets, remote_sidecars
             )
         except BaseException:
             if self._worker is not None:
@@ -270,7 +276,7 @@ class Orchestrator:
         """
         if args is None:
             args = TaskArgs()
-        digest, kind, target_namespace, _eligible_endpoint_ids = _require_handle(
+        digest, kind, target_namespace, _eligible_worker_ids = _require_handle(
             callable_handle,
             kind="orch.submit_sub",
             worker=self._worker,
@@ -280,7 +286,7 @@ class Orchestrator:
 
     def submit_sub_group(self, callable_handle: Any, args_list: list):
         """Submit a group of SUB tasks (N TaskArgs → N workers, 1 DAG node)."""
-        digest, kind, target_namespace, _eligible_endpoint_ids = _require_handle(
+        digest, kind, target_namespace, _eligible_worker_ids = _require_handle(
             callable_handle,
             kind="orch.submit_sub_group",
             worker=self._worker,

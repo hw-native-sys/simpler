@@ -210,9 +210,9 @@ private:
 
 class FakeEndpoint final : public WorkerEndpoint {
 public:
-    explicit FakeEndpoint(int32_t endpoint_id) {
+    explicit FakeEndpoint(int32_t worker_id) {
         caps_.kind = WorkerEndpointKind::REMOTE_L3;
-        caps_.endpoint_id = endpoint_id;
+        caps_.worker_id = worker_id;
         caps_.remote = true;
         caps_.transport = "test-remote";
     }
@@ -336,7 +336,7 @@ TEST(WorkerManagerTest, StartRejectsDuplicateNextLevelEndpointId) {
         manager.start(&allocator, [](WorkerCompletion) {});
     } catch (const std::runtime_error &e) {
         threw = true;
-        EXPECT_NE(std::string(e.what()).find("duplicate NEXT_LEVEL endpoint_id 0"), std::string::npos);
+        EXPECT_NE(std::string(e.what()).find("duplicate NEXT_LEVEL worker_id 0"), std::string::npos);
     }
 
     manager.stop();
@@ -613,6 +613,73 @@ TEST_F(GroupSchedulerFixture, AffinityMustBeInEligibleEndpointSet) {
     EXPECT_THROW((void)orch.submit_next_level(C(56), args, cfg, 0, {1}), std::invalid_argument);
 }
 
+TEST(SchedulerEndpointAffinityTest, NextLevelAffinityUsesEndpointIdNotVectorIndex) {
+    TensorMap tm;
+    Ring allocator;
+    Scope scope;
+    ReadyQueue rq_next_level;
+    ReadyQueue rq_sub;
+    Orchestrator orch;
+    MockMailboxWorker worker_a;
+    MockMailboxWorker worker_b;
+    WorkerManager manager;
+    Scheduler sched;
+    CallConfig cfg;
+    std::vector<TaskSlot> consumed_slots;
+    std::mutex consumed_mu;
+
+    allocator.init(/*heap_bytes=*/1ULL << 20);
+    orch.init(&tm, &allocator, &scope, &rq_next_level, &rq_sub, &manager);
+
+    worker_a.start();
+    worker_b.start();
+    manager.add_next_level_at(7, worker_a.mailbox_ptr());
+    manager.add_next_level_at(9, worker_b.mailbox_ptr());
+    manager.start(&allocator, [&sched](WorkerCompletion completion) {
+        sched.worker_done(std::move(completion));
+    });
+
+    Scheduler::Config c;
+    c.ring = &allocator;
+    c.ready_next_level_queue = &rq_next_level;
+    c.ready_sub_queue = &rq_sub;
+    c.manager = &manager;
+    c.on_consumed_cb = [&orch, &consumed_slots, &consumed_mu](TaskSlot s) {
+        orch.on_consumed(s);
+        std::lock_guard<std::mutex> lk(consumed_mu);
+        consumed_slots.push_back(s);
+    };
+    sched.start(c);
+
+    TaskArgs args = single_tensor_args(0xE2, TensorArgType::OUTPUT);
+    auto res = orch.submit_next_level(C(58), args, cfg, 9);
+
+    worker_b.wait_running();
+    EXPECT_FALSE(worker_a.is_running.load());
+    EXPECT_TRUE(worker_b.is_running.load());
+    EXPECT_EQ(worker_a.dispatched_count(), 0);
+    EXPECT_EQ(worker_b.dispatched_count(), 1);
+
+    if (worker_a.is_running.load()) worker_a.complete();
+    if (worker_b.is_running.load()) worker_b.complete();
+
+    bool consumed = false;
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(1000);
+    while (std::chrono::steady_clock::now() < deadline) {
+        {
+            std::lock_guard<std::mutex> lk(consumed_mu);
+            consumed = std::find(consumed_slots.begin(), consumed_slots.end(), res.task_slot) != consumed_slots.end();
+        }
+        if (consumed) break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    EXPECT_TRUE(consumed);
+
+    sched.stop();
+    manager.stop();
+    allocator.shutdown();
+}
+
 TEST_F(GroupSchedulerFixture, RemoteSidecarRejectsLocalEndpointEligibility) {
     TaskArgs args;
     ContinuousTensor tensor{};
@@ -626,7 +693,7 @@ TEST_F(GroupSchedulerFixture, RemoteSidecarRejectsLocalEndpointEligibility) {
     sidecar.tensors.resize(1);
     sidecar.tensors[0].present = true;
     sidecar.tensors[0].desc.address_space = RemoteAddressSpace::REMOTE_DEVICE;
-    sidecar.tensors[0].desc.owner_endpoint_id = 7;
+    sidecar.tensors[0].desc.owner_worker_id = 7;
     sidecar.tensors[0].desc.buffer_id = 11;
     sidecar.tensors[0].desc.generation = 1;
     sidecar.tensors[0].desc.nbytes = 1;
@@ -754,8 +821,8 @@ TEST_F(GroupSchedulerFixture, GroupDependencyChain) {
     worker_b.complete();
 
     auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(500);
-    while (worker_a.dispatched_count() + worker_b.dispatched_count() < 3 &&
-           std::chrono::steady_clock::now() < deadline) {
+    while (worker_a.dispatched_count() + worker_b.dispatched_count() < 3 && std::chrono::steady_clock::now() < deadline
+    ) {
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
     int total = worker_a.dispatched_count() + worker_b.dispatched_count();

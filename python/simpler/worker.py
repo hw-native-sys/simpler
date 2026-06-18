@@ -46,11 +46,11 @@ Usage::
     w4 = Worker(level=4, num_sub_workers=1)
     l3_handle = w4.register(my_l3_orch)
     verify_handle = w4.register(lambda args: verify())
-    w4.add_worker(l3)
+    l3_worker_id = w4.add_worker(l3)
     w4.init()
 
     def my_l4_orch(orch, args, config):
-        orch.submit_next_level(l3_handle, chip_args, config)
+        orch.submit_next_level(l3_handle, chip_args, config, worker=l3_worker_id)
         orch.submit_sub(verify_handle)
 
     w4.run(my_l4_orch)
@@ -258,7 +258,7 @@ class _CallableRegistration:
     digest: bytes
     payload_digest: bytes
     payload: bytes | None = None
-    eligible_endpoint_ids: tuple[int, ...] = ()
+    eligible_worker_ids: tuple[int, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -306,7 +306,7 @@ class RemoteWorkerSpec:
 
 @dataclass(frozen=True)
 class _RemoteSession:
-    endpoint_id: int
+    worker_id: int
     session_id: int
     command_host: str
     command_port: int
@@ -428,10 +428,10 @@ def _build_callable_registration(worker: Worker, target, *, workers: list[int] |
     if isinstance(target, RemoteCallable):
         if workers is None or len(workers) == 0:
             raise ValueError("Worker.register(RemoteCallable): workers must be an explicit non-empty list")
-        endpoint_ids = tuple(int(w) for w in workers)
-        if any(w < 0 for w in endpoint_ids):
+        worker_ids = tuple(int(w) for w in workers)
+        if any(w < 0 for w in worker_ids):
             raise ValueError("Worker.register(RemoteCallable): worker ids must be non-negative")
-        if len(set(endpoint_ids)) != len(endpoint_ids):
+        if len(set(worker_ids)) != len(worker_ids):
             raise ValueError("Worker.register(RemoteCallable): workers must not contain duplicates")
         descriptor = build_python_import_descriptor(target.module, target.qualname)
         hashid = compute_callable_hashid(descriptor)
@@ -444,7 +444,7 @@ def _build_callable_registration(worker: Worker, target, *, workers: list[int] |
             digest=hashid_to_digest(hashid),
             payload_digest=descriptor,
             payload=target.target.encode("utf-8"),
-            eligible_endpoint_ids=endpoint_ids,
+            eligible_worker_ids=worker_ids,
         )
     if isinstance(target, ChipCallable):
         if workers is not None:
@@ -1337,10 +1337,13 @@ class Worker:
 
         # L4+ next-level Worker children (added via add_worker before init)
         self._next_level_workers: list[Worker] = []
+        self._next_level_worker_ids: list[int] = []
         self._next_level_shms: list[SharedMemory] = []
         self._next_level_pids: list[int] = []
         self._remote_worker_specs: list[RemoteWorkerSpec] = []
+        self._remote_worker_ids: list[int] = []
         self._remote_sessions: list[_RemoteSession] = []
+        self._next_level_worker_id_count: int = 0
         self._active_remote_slot_refs: list[RemoteBufferHandle] = []
         self._pending_remote_buffer_frees: list[RemoteBufferHandle] = []
         self._pending_remote_import_releases: list[RemoteBufferHandle] = []
@@ -1374,6 +1377,11 @@ class Worker:
         tag = f"pto_multi_comm_{os.getpid()}_{id(self):x}.bin"
         return os.path.join("/tmp", tag)
 
+    def _allocate_next_level_worker_id(self) -> int:
+        worker_id = self._next_level_worker_id_count
+        self._next_level_worker_id_count += 1
+        return worker_id
+
     def add_remote_worker(self, spec: RemoteWorkerSpec) -> int:
         if self._initialized:
             raise RuntimeError("Worker.add_remote_worker after init")
@@ -1381,9 +1389,10 @@ class Worker:
             raise TypeError("Worker.add_remote_worker: remote L3 workers require a level >= 4 parent")
         if not isinstance(spec, RemoteWorkerSpec):
             raise TypeError("Worker.add_remote_worker expects a RemoteWorkerSpec")
-        endpoint_id = len(self._next_level_workers) + len(self._remote_worker_specs)
+        worker_id = self._allocate_next_level_worker_id()
         self._remote_worker_specs.append(spec)
-        return endpoint_id
+        self._remote_worker_ids.append(worker_id)
+        return worker_id
 
     @staticmethod
     def _parse_remote_endpoint(endpoint: str) -> tuple[str, int]:
@@ -1421,14 +1430,14 @@ class Worker:
             data.extend(chunk)
         return json.loads(bytes(data).decode("utf-8"))
 
-    def _remote_dispatcher_entries_for_endpoint(self, endpoint_id: int) -> list[dict[str, str]]:
+    def _remote_dispatcher_entries_for_worker(self, worker_id: int) -> list[dict[str, str]]:
         entries: list[dict[str, str]] = []
         with self._registry_lock:
             states = list(self._identity_registry.values())
         for state in states:
             if state.target_namespace != "REMOTE_TASK_DISPATCHER":
                 continue
-            if endpoint_id not in state.eligible_endpoint_ids:
+            if worker_id not in state.eligible_worker_ids:
                 continue
             if not isinstance(state.target, RemoteCallable):
                 raise RuntimeError(f"remote dispatcher hashid {state.hashid} does not carry a RemoteCallable target")
@@ -1442,14 +1451,14 @@ class Worker:
             )
         return entries
 
-    def _build_remote_manifest(self, *, spec: RemoteWorkerSpec, endpoint_id: int, session_id: int) -> dict[str, Any]:
+    def _build_remote_manifest(self, *, spec: RemoteWorkerSpec, worker_id: int, session_id: int) -> dict[str, Any]:
         daemon_host, _daemon_port = self._parse_remote_endpoint(spec.endpoint)
         loopback = daemon_host in ("127.0.0.1", "localhost", "::1")
         return {
             "session_id": int(session_id),
             "parent_worker_level": int(self.level),
             "remote_worker_level": 3,
-            "endpoint_id": int(endpoint_id),
+            "worker_id": int(worker_id),
             "platform": spec.platform,
             "runtime": spec.runtime,
             "device_ids": list(spec.device_ids),
@@ -1458,24 +1467,24 @@ class Worker:
             "transport": spec.transport,
             "listen_host": "127.0.0.1" if loopback else "0.0.0.0",
             "connect_host": daemon_host,
-            "remote_task_dispatcher": self._remote_dispatcher_entries_for_endpoint(endpoint_id),
+            "remote_task_dispatcher": self._remote_dispatcher_entries_for_worker(worker_id),
             "inner_l3_worker": [],
             "feature_flags": [],
         }
 
     def _open_remote_session(
-        self, *, spec: RemoteWorkerSpec, endpoint_id: int, session_id: int, timeout_s: float
+        self, *, spec: RemoteWorkerSpec, worker_id: int, session_id: int, timeout_s: float
     ) -> _RemoteSession:
         daemon_host, daemon_port = self._parse_remote_endpoint(spec.endpoint)
-        manifest = self._build_remote_manifest(spec=spec, endpoint_id=endpoint_id, session_id=session_id)
+        manifest = self._build_remote_manifest(spec=spec, worker_id=worker_id, session_id=session_id)
         with socket.create_connection((daemon_host, daemon_port), timeout=timeout_s) as sock:
             sock.settimeout(timeout_s)
             self._send_remote_daemon_json(sock, manifest)
             reply = self._recv_remote_daemon_json(sock)
         if not reply.get("ok", False):
-            raise RuntimeError(f"remote L3 session startup failed for endpoint {endpoint_id}: {reply.get('error')}")
+            raise RuntimeError(f"remote L3 session startup failed for worker {worker_id}: {reply.get('error')}")
         return _RemoteSession(
-            endpoint_id=endpoint_id,
+            worker_id=worker_id,
             session_id=session_id,
             command_host=str(reply["command_host"]),
             command_port=int(reply["command_port"]),
@@ -1492,7 +1501,7 @@ class Worker:
         try:
             with socket.create_connection((session.command_host, session.command_port), timeout=timeout_s) as sock:
                 sock.settimeout(timeout_s)
-                send_frame(sock, FrameHeader(FrameType.SHUTDOWN, session.session_id, session.endpoint_id, 0))
+                send_frame(sock, FrameHeader(FrameType.SHUTDOWN, session.session_id, session.worker_id, 0))
         except BaseException:  # noqa: BLE001
             pass
 
@@ -1500,15 +1509,13 @@ class Worker:
         for session in reversed(sessions):
             self._close_remote_session(session)
 
-    def _require_remote_endpoint_started(self, endpoint_id: int) -> None:
+    def _require_remote_worker_started(self, worker_id: int) -> None:
         if self.level < 4:
             raise TypeError("remote memory APIs require a level >= 4 parent Worker")
         if not self._initialized:
             raise RuntimeError("remote memory APIs require Worker.init() before allocation or copy")
-        local_count = len(self._next_level_workers)
-        total_count = local_count + len(self._remote_worker_specs)
-        if endpoint_id < local_count or endpoint_id >= total_count:
-            raise ValueError("remote memory APIs require a remote endpoint id returned by add_remote_worker")
+        if int(worker_id) not in set(self._remote_worker_ids):
+            raise ValueError("remote memory APIs require a remote worker id returned by add_remote_worker")
         self._start_hierarchical()
         if self._worker is None:
             raise RuntimeError("remote memory APIs require a started hierarchical Worker")
@@ -1541,7 +1548,7 @@ class Worker:
             raise ValueError("HOST_INLINE RemoteBufferHandle is not a remote allocation")
         if handle.released:
             raise RuntimeError("RemoteBufferHandle has already been released")
-        self._require_remote_endpoint_started(handle.endpoint_id)
+        self._require_remote_worker_started(handle.worker_id)
 
     @staticmethod
     def _remote_access_flags(access: str | int) -> int:
@@ -1562,33 +1569,33 @@ class Worker:
     def _send_remote_free(self, handle: RemoteBufferHandle) -> None:
         if handle.is_imported:
             raise ValueError("remote_free is invalid for imported handles; use remote_release_import")
-        self._require_remote_endpoint_started(handle.endpoint_id)
+        self._require_remote_worker_started(handle.worker_id)
         assert self._worker is not None
-        self._worker.remote_free(handle.endpoint_id, handle._buffer_id, handle._generation)
+        self._worker.remote_free(handle.worker_id, handle._buffer_id, handle._generation)
 
     def _send_remote_release_import(self, handle: RemoteBufferHandle) -> None:
         if not handle.is_imported:
             raise ValueError("remote_release_import expects an imported remote handle")
-        self._require_remote_endpoint_started(handle.endpoint_id)
+        self._require_remote_worker_started(handle.worker_id)
         assert self._worker is not None
         self._worker.remote_release_import(
-            handle.endpoint_id,
-            handle.owner_endpoint_id,
+            handle.worker_id,
+            handle.owner_worker_id,
             handle._buffer_id,
             handle._generation,
             handle.import_id,
         )
 
     def remote_malloc(self, *, worker: int, nbytes: int) -> RemoteBufferHandle:
-        endpoint_id = int(worker)
+        worker_id = int(worker)
         size = int(nbytes)
         if size <= 0:
             raise ValueError("Worker.remote_malloc nbytes must be positive")
-        self._require_remote_endpoint_started(endpoint_id)
+        self._require_remote_worker_started(worker_id)
         assert self._worker is not None
-        fields = self._worker.remote_malloc(endpoint_id, size)
+        fields = self._worker.remote_malloc(worker_id, size)
         return RemoteBufferHandle._from_remote_allocation(
-            endpoint_id=int(fields[0]),
+            worker_id=int(fields[0]),
             buffer_id=int(fields[1]),
             generation=int(fields[2]),
             address_space=RemoteAddressSpace(int(fields[3])),
@@ -1627,7 +1634,7 @@ class Worker:
             raise ValueError("Worker.remote_copy_to range exceeds RemoteBufferHandle.nbytes")
         assert self._worker is not None
         self._worker.remote_copy_to(
-            handle.endpoint_id,
+            handle.worker_id,
             handle._buffer_id,
             handle._generation,
             start,
@@ -1649,7 +1656,7 @@ class Worker:
         assert self._worker is not None
         self._worker.remote_copy_from(
             self._host_ptr_value(host_ptr),
-            handle.endpoint_id,
+            handle.worker_id,
             handle._buffer_id,
             handle._generation,
             start,
@@ -1680,7 +1687,7 @@ class Worker:
             raise ValueError("Worker.remote_export requested access is not allowed by handle")
         assert self._worker is not None
         fields = self._worker.remote_export(
-            handle.owner_endpoint_id,
+            handle.owner_worker_id,
             handle._buffer_id,
             handle._generation,
             handle._offset,
@@ -1691,7 +1698,7 @@ class Worker:
             handle.nbytes,
         )
         return RemoteBufferExport._from_remote_export(
-            owner_endpoint_id=int(fields[0]),
+            owner_worker_id=int(fields[0]),
             buffer_id=int(fields[1]),
             generation=int(fields[2]),
             address_space=RemoteAddressSpace(int(fields[3])),
@@ -1717,15 +1724,15 @@ class Worker:
             raise ValueError("Worker.remote_import rejects forged or different Worker RemoteBufferExport values")
         if exported._owner_handle is not None and exported._owner_handle.released:
             raise ValueError("Worker.remote_import rejects stale RemoteBufferExport values for released buffers")
-        importer_endpoint_id = int(worker)
-        self._require_remote_endpoint_started(importer_endpoint_id)
+        importer_worker_id = int(worker)
+        self._require_remote_worker_started(importer_worker_id)
         flags = exported._access_flags if access is None else self._remote_access_flags(access)
         if flags & ~exported._access_flags:
             raise ValueError("Worker.remote_import requested access is not a subset of export access")
         assert self._worker is not None
         fields = self._worker.remote_import(
-            importer_endpoint_id,
-            exported._owner_endpoint_id,
+            importer_worker_id,
+            exported._owner_worker_id,
             exported._buffer_id,
             exported._generation,
             int(exported._address_space),
@@ -1742,8 +1749,8 @@ class Worker:
         )
         owner_handle = exported._owner_handle
         imported = RemoteBufferHandle._from_imported_mapping(
-            endpoint_id=int(fields[0]),
-            owner_endpoint_id=int(fields[1]),
+            worker_id=int(fields[0]),
+            owner_worker_id=int(fields[1]),
             buffer_id=int(fields[2]),
             generation=int(fields[3]),
             import_id=int(fields[4]),
@@ -1820,7 +1827,7 @@ class Worker:
                 self._send_remote_release_import(handle)
             except Exception as exc:  # noqa: BLE001
                 remaining_imports.append(handle)
-                errors.append(f"release_import endpoint={handle.endpoint_id} import_id={handle.import_id}: {exc}")
+                errors.append(f"release_import worker_id={handle.worker_id} import_id={handle.import_id}: {exc}")
                 continue
             if handle._owner_handle_ref is not None:
                 handle._owner_handle_ref._release_import_ref()
@@ -1838,7 +1845,7 @@ class Worker:
                 self._send_remote_free(handle)
             except Exception as exc:  # noqa: BLE001
                 remaining.append(handle)
-                errors.append(f"free endpoint={handle.endpoint_id} buffer_id={handle._buffer_id}: {exc}")
+                errors.append(f"free worker_id={handle.worker_id} buffer_id={handle._buffer_id}: {exc}")
                 continue
         self._pending_remote_buffer_frees.extend(remaining)
         if errors:
@@ -1873,7 +1880,7 @@ class Worker:
                 raise RuntimeError(f"REGISTER_TOMBSTONE_ACTIVE: {reg.hashid}")
             if state.descriptor != reg.descriptor or state.kind != reg.kind:
                 raise RuntimeError(f"HASHID_DESCRIPTOR_MISMATCH: {reg.hashid}")
-            if state.eligible_endpoint_ids != reg.eligible_endpoint_ids:
+            if state.eligible_worker_ids != reg.eligible_worker_ids:
                 raise RuntimeError(f"REMOTE_CALLABLE_ENDPOINT_SCOPE_MISMATCH: {reg.hashid}")
             state.ref_count += 1
             return self._make_handle_locked(state), False
@@ -1890,7 +1897,7 @@ class Worker:
             slot_id=slot_id,
             target=reg.target,
             ref_count=1,
-            eligible_endpoint_ids=reg.eligible_endpoint_ids,
+            eligible_worker_ids=reg.eligible_worker_ids,
         )
         self._identity_registry[reg.digest] = state
         if not is_remote:
@@ -1963,12 +1970,11 @@ class Worker:
         if isinstance(target, RemoteCallable):
             if not self._remote_worker_specs:
                 raise RuntimeError("Worker.register(RemoteCallable): add at least one remote worker first")
-            local_count = len(self._next_level_workers)
-            total_count = local_count + len(self._remote_worker_specs)
-            for endpoint_id in reg.eligible_endpoint_ids:
-                if endpoint_id < local_count or endpoint_id >= total_count:
+            remote_worker_ids = set(self._remote_worker_ids)
+            for worker_id in reg.eligible_worker_ids:
+                if worker_id not in remote_worker_ids:
                     raise ValueError(
-                        "Worker.register(RemoteCallable): workers must name remote endpoint ids returned by "
+                        "Worker.register(RemoteCallable): workers must name remote worker ids returned by "
                         "add_remote_worker"
                     )
             if not self._initialized:
@@ -2067,16 +2073,16 @@ class Worker:
         prepared: list[int] = []
         errors: list[str] = []
         payload = reg.payload if reg.payload is not None else b""
-        for endpoint_id in reg.eligible_endpoint_ids:
+        for worker_id in reg.eligible_worker_ids:
             result = self._worker.remote_prepare_register(
-                endpoint_id,
+                worker_id,
                 "REMOTE_TASK_DISPATCHER",
                 reg.kind,
                 payload,
                 reg.digest,
             )
             if result.ok:
-                prepared.append(endpoint_id)
+                prepared.append(worker_id)
             else:
                 errors.append(f"{result.worker_type}[{result.worker_index}]: {result.error_message}")
                 break
@@ -2088,21 +2094,21 @@ class Worker:
             raise RuntimeError(self._format_register_partial_failure(reg.digest, errors, cleanup_errors))
 
         committed: list[int] = []
-        for endpoint_id in reg.eligible_endpoint_ids:
+        for worker_id in reg.eligible_worker_ids:
             result = self._worker.remote_commit_register(
-                endpoint_id,
+                worker_id,
                 "REMOTE_TASK_DISPATCHER",
                 reg.kind,
                 reg.digest,
             )
             if result.ok:
-                committed.append(endpoint_id)
+                committed.append(worker_id)
             else:
                 errors.append(f"{result.worker_type}[{result.worker_index}]: {result.error_message}")
                 break
         if errors:
             cleanup_errors = self._remote_abort_prepared(
-                [endpoint_id for endpoint_id in prepared if endpoint_id not in committed], reg
+                [worker_id for worker_id in prepared if worker_id not in committed], reg
             )
             cleanup_errors.extend(self._remote_unregister_committed(committed, reg))
             if cleanup_errors:
@@ -2121,13 +2127,13 @@ class Worker:
                     self._uncertain_hashids.add(reg.digest)
             raise
 
-    def _remote_abort_prepared(self, endpoint_ids: list[int], reg: _CallableRegistration) -> list[str]:
+    def _remote_abort_prepared(self, worker_ids: list[int], reg: _CallableRegistration) -> list[str]:
         if self._worker is None:
             return []
         errors: list[str] = []
-        for endpoint_id in endpoint_ids:
+        for worker_id in worker_ids:
             result = self._worker.remote_abort_register(
-                endpoint_id,
+                worker_id,
                 "REMOTE_TASK_DISPATCHER",
                 reg.kind,
                 reg.digest,
@@ -2136,13 +2142,13 @@ class Worker:
                 errors.append(f"{result.worker_type}[{result.worker_index}]: {result.error_message}")
         return errors
 
-    def _remote_unregister_committed(self, endpoint_ids: list[int], reg: _CallableRegistration) -> list[str]:
+    def _remote_unregister_committed(self, worker_ids: list[int], reg: _CallableRegistration) -> list[str]:
         if self._worker is None:
             return []
         errors: list[str] = []
-        for endpoint_id in endpoint_ids:
+        for worker_id in worker_ids:
             result = self._worker.remote_unregister(
-                endpoint_id,
+                worker_id,
                 "REMOTE_TASK_DISPATCHER",
                 reg.kind,
                 reg.digest,
@@ -2551,7 +2557,7 @@ class Worker:
                 self._pending_unregister_cids.discard(cid)
 
     def _unregister_remote_handle(self, handle: CallableHandle) -> None:
-        endpoint_ids: tuple[int, ...]
+        worker_ids: tuple[int, ...]
         kind: str
         digest: bytes
         remove_state = False
@@ -2564,7 +2570,7 @@ class Worker:
             if state.ref_count > 0:
                 return
             self._pending_remote_unregister_hashids.add(digest)
-            endpoint_ids = state.eligible_endpoint_ids
+            worker_ids = state.eligible_worker_ids
             kind = state.kind
             remove_state = True
 
@@ -2573,9 +2579,9 @@ class Worker:
             if self._initialized:
                 self._start_hierarchical()
                 assert self._worker is not None
-                for endpoint_id in endpoint_ids:
+                for worker_id in worker_ids:
                     result = self._worker.remote_unregister(
-                        endpoint_id,
+                        worker_id,
                         "REMOTE_TASK_DISPATCHER",
                         kind,
                         digest,
@@ -2587,7 +2593,7 @@ class Worker:
                         self._uncertain_hashids.add(digest)
                     sys.stderr.write(
                         f"Worker.unregister(hash={_format_digest(digest)}): remote cleanup uncertain on "
-                        f"{len(errors)} endpoints. First error: {errors[0]}\n"
+                        f"{len(errors)} remote workers. First error: {errors[0]}\n"
                     )
                     sys.stderr.flush()
         finally:
@@ -2685,12 +2691,12 @@ class Worker:
             )
             sys.stderr.flush()
 
-    def add_worker(self, worker: Worker) -> None:
+    def add_worker(self, worker: Worker) -> int:
         """Add a lower-level Worker as a NEXT_LEVEL child. Must be called before init().
 
         The child Worker must NOT be init'd — init happens inside the forked
         child process (so the child's own children are forked in the right
-        process tree).
+        process tree). Returns this child's stable NEXT_LEVEL worker id.
         """
         if self.level < 4:
             raise RuntimeError("Worker.add_worker() requires level >= 4")
@@ -2700,7 +2706,10 @@ class Worker:
             raise RuntimeError("Worker.add_worker() must be called before init()")
         if worker._initialized:
             raise RuntimeError("Child worker must not be initialized before add_worker()")
+        worker_id = self._allocate_next_level_worker_id()
         self._next_level_workers.append(worker)
+        self._next_level_worker_ids.append(worker_id)
+        return worker_id
 
     # ------------------------------------------------------------------
     # init — auto-discovery
@@ -2796,22 +2805,20 @@ class Worker:
         else:
             self._worker = _Worker(self.level, int(heap_ring_size))
 
-        local_next_level_count = len(self._next_level_workers)
         opened_remote_sessions: list[_RemoteSession] = []
         try:
-            for i, spec in enumerate(self._remote_worker_specs):
-                endpoint_id = local_next_level_count + i
+            for worker_id, spec in zip(self._remote_worker_ids, self._remote_worker_specs, strict=True):
                 session_id = uuid.uuid4().int & ((1 << 63) - 1)
                 if session_id == 0:
                     session_id = 1
                 timeout_s = float(self._config.get("remote_session_timeout_s", 30.0))
                 session = self._open_remote_session(
-                    spec=spec, endpoint_id=endpoint_id, session_id=session_id, timeout_s=timeout_s
+                    spec=spec, worker_id=worker_id, session_id=session_id, timeout_s=timeout_s
                 )
                 opened_remote_sessions.append(session)
                 assert self._worker is not None
                 self._worker.add_remote_l3_socket(
-                    endpoint_id,
+                    worker_id,
                     session_id,
                     spec.transport,
                     session.command_host,
@@ -2948,8 +2955,11 @@ class Worker:
                     dw.add_next_level_worker(_mailbox_addr(shm))
 
             # Register Worker children as NEXT_LEVEL (L4+)
-            for shm in self._next_level_shms:
-                dw.add_next_level_worker(_mailbox_addr(shm))
+            if self._next_level_shms and not hasattr(dw, "add_next_level_worker_at"):
+                raise RuntimeError("explicit NEXT_LEVEL worker ids require a rebuilt _task_interface module")
+            for idx, shm in enumerate(self._next_level_shms):
+                worker_id = self._next_level_worker_ids[idx]
+                dw.add_next_level_worker_at(worker_id, _mailbox_addr(shm))
 
             for shm in self._sub_shms:
                 dw.add_sub_worker(_mailbox_addr(shm))
@@ -3662,6 +3672,7 @@ class Worker:
             self._next_level_shms.clear()
             self._next_level_pids.clear()
             self._next_level_workers.clear()
+            self._next_level_worker_ids.clear()
 
         self._initialized = False
 

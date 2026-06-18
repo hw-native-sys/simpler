@@ -482,7 +482,7 @@ class TestRemoteTaskArgsSidecar:
 
     def test_remote_buffer_ref_adds_zero_metadata_and_sidecar(self):
         handle = RemoteBufferHandle._from_remote_allocation(
-            endpoint_id=3,
+            worker_id=3,
             buffer_id=11,
             generation=2,
             address_space=RemoteAddressSpace.REMOTE_DEVICE,
@@ -508,7 +508,7 @@ class TestRemoteTaskArgsSidecar:
         assert sidecar.tensors[0].present
         desc = sidecar.tensors[0].desc
         assert desc.address_space == RemoteAddressSpace.REMOTE_DEVICE
-        assert desc.owner_endpoint_id == 3
+        assert desc.owner_worker_id == 3
         assert desc.buffer_id == 11
         assert desc.generation == 2
         assert desc.offset == 8
@@ -522,7 +522,7 @@ class TestRemoteTaskArgsSidecar:
 
         def make_remote_args_ref():
             handle = RemoteBufferHandle._from_remote_allocation(
-                endpoint_id=3,
+                worker_id=3,
                 buffer_id=11,
                 generation=2,
                 address_space=RemoteAddressSpace.REMOTE_DEVICE,
@@ -544,7 +544,7 @@ class TestRemoteTaskArgsSidecar:
     def test_remote_buffer_handle_is_opaque_to_public_constructor(self):
         with pytest.raises(TypeError, match="Worker.remote_malloc"):
             RemoteBufferHandle(
-                endpoint_id=3,
+                worker_id=3,
                 buffer_id=11,
                 generation=2,
                 address_space=RemoteAddressSpace.REMOTE_DEVICE,
@@ -554,7 +554,7 @@ class TestRemoteTaskArgsSidecar:
             )
         with pytest.raises(TypeError, match="Worker.remote_malloc"):
             RemoteBufferHandle(
-                endpoint_id=0,
+                worker_id=0,
                 buffer_id=0,
                 generation=0,
                 address_space=RemoteAddressSpace.HOST_INLINE,
@@ -562,7 +562,7 @@ class TestRemoteTaskArgsSidecar:
             )
 
         handle = RemoteBufferHandle._from_remote_allocation(
-            endpoint_id=3,
+            worker_id=3,
             buffer_id=11,
             generation=2,
             address_space=RemoteAddressSpace.REMOTE_DEVICE,
@@ -570,7 +570,7 @@ class TestRemoteTaskArgsSidecar:
             remote_addr=0xCAFE,
             rkey_or_token=0xBEEF,
         )
-        assert handle.endpoint_id == 3
+        assert handle.worker_id == 3
         assert handle.nbytes == 64
         assert not handle.released
         assert not hasattr(handle, "rkey_or_token")
@@ -595,7 +595,7 @@ class TestRemoteTaskArgsSidecar:
 
     def test_remote_ref_rejects_out_of_bounds_range(self):
         handle = RemoteBufferHandle._from_remote_allocation(
-            endpoint_id=1,
+            worker_id=1,
             buffer_id=2,
             generation=1,
             address_space=RemoteAddressSpace.REMOTE_DEVICE,
@@ -607,7 +607,7 @@ class TestRemoteTaskArgsSidecar:
     def test_remote_buffer_export_is_opaque_to_public_constructor_and_repr(self):
         with pytest.raises(TypeError, match="Worker.remote_export"):
             RemoteBufferExport(
-                owner_endpoint_id=0,
+                owner_worker_id=0,
                 buffer_id=1,
                 generation=1,
                 address_space=RemoteAddressSpace.REMOTE_WINDOW,
@@ -623,7 +623,7 @@ class TestRemoteTaskArgsSidecar:
             )
 
         exported = RemoteBufferExport._from_remote_export(
-            owner_endpoint_id=0,
+            owner_worker_id=0,
             buffer_id=1,
             generation=1,
             address_space=RemoteAddressSpace.REMOTE_WINDOW,
@@ -637,7 +637,7 @@ class TestRemoteTaskArgsSidecar:
             transport_profile="sim",
             transport_descriptor=b"psm_secret",
         )
-        assert exported.owner_endpoint_id == 0
+        assert exported.owner_worker_id == 0
         assert exported.nbytes == 4
         assert not hasattr(exported, "remote_addr")
         assert not hasattr(exported, "rkey_or_token")
@@ -677,7 +677,7 @@ class TestRemoteL3SessionTaskArgsMaterialization:
         tensor = ContinuousTensor.make(0, (4,), DataType.UINT8)
         desc = RemoteTensorDesc(
             address_space=WireRemoteAddressSpace.HOST_INLINE,
-            owner_endpoint_id=0,
+            owner_worker_id=0,
             buffer_id=0,
             offset=0,
             nbytes=4,
@@ -690,7 +690,7 @@ class TestRemoteL3SessionTaskArgsMaterialization:
         )
         wire = RemoteTaskArgsWire((tensor,), (RemoteTensorSidecar(True, desc),), (), b"abcd")
 
-        args, keepalive = _materialize_task_args(wire, {}, endpoint_id=3)
+        args, keepalive = _materialize_task_args(wire, {}, worker_id=3)
 
         assert keepalive
         assert args.tensor(0).data != 0
@@ -712,7 +712,7 @@ class TestRemoteL3SessionTaskArgsMaterialization:
         tensor = ContinuousTensor.make(0, (4,), DataType.UINT8)
         desc = RemoteTensorDesc(
             address_space=WireRemoteAddressSpace.REMOTE_DEVICE,
-            owner_endpoint_id=2,
+            owner_worker_id=2,
             buffer_id=9,
             offset=2,
             nbytes=4,
@@ -725,7 +725,7 @@ class TestRemoteL3SessionTaskArgsMaterialization:
         )
         wire = RemoteTaskArgsWire((tensor,), (RemoteTensorSidecar(True, desc),), (), b"")
 
-        args, keepalive = _materialize_task_args(wire, {(9, 1): entry}, endpoint_id=2)
+        args, keepalive = _materialize_task_args(wire, {(9, 1): entry}, worker_id=2)
 
         assert keepalive == []
         assert args.tensor(0).data == entry.addr + 2

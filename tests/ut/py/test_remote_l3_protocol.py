@@ -85,7 +85,7 @@ def test_control_reply_rejects_oversized_utf8_error_message():
 
 def _export_result(**overrides):
     fields = {
-        "owner_endpoint_id": 1,
+        "owner_worker_id": 1,
         "buffer_id": 2,
         "generation": 3,
         "address_space": RemoteAddressSpace.REMOTE_WINDOW,
@@ -105,8 +105,8 @@ def _export_result(**overrides):
 
 def _import_result(**overrides):
     fields = {
-        "importer_endpoint_id": 1,
-        "owner_endpoint_id": 2,
+        "importer_worker_id": 1,
+        "owner_worker_id": 2,
         "buffer_id": 3,
         "generation": 4,
         "import_id": 5,
@@ -127,7 +127,7 @@ def _import_result(**overrides):
 @pytest.mark.parametrize(
     "field,value",
     [
-        ("owner_endpoint_id", -1),
+        ("owner_worker_id", -1),
         ("buffer_id", 0),
         ("generation", 0),
     ],
@@ -140,7 +140,7 @@ def test_export_buffer_result_rejects_invalid_live_identity(field, value):
 @pytest.mark.parametrize(
     "field,value",
     [
-        ("owner_endpoint_id", -1),
+        ("owner_worker_id", -1),
         ("buffer_id", 0),
         ("generation", 0),
     ],
@@ -148,7 +148,7 @@ def test_export_buffer_result_rejects_invalid_live_identity(field, value):
 def test_export_buffer_result_decode_rejects_invalid_live_identity(field, value):
     encoded = encode_export_buffer_result(_export_result())
     values = list(struct.unpack_from("<iQQ", encoded, 0))
-    values[["owner_endpoint_id", "buffer_id", "generation"].index(field)] = value
+    values[["owner_worker_id", "buffer_id", "generation"].index(field)] = value
     corrupted = struct.pack("<iQQ", *values) + encoded[20:]
 
     with pytest.raises(ValueError, match="live owner buffer identity"):
@@ -158,8 +158,8 @@ def test_export_buffer_result_decode_rejects_invalid_live_identity(field, value)
 @pytest.mark.parametrize(
     "field,value",
     [
-        ("importer_endpoint_id", -1),
-        ("owner_endpoint_id", -1),
+        ("importer_worker_id", -1),
+        ("owner_worker_id", -1),
         ("buffer_id", 0),
         ("generation", 0),
     ],

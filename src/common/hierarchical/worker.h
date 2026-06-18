@@ -75,11 +75,12 @@ public:
     // for NEXT_LEVEL, a Python callable for SUB) lives in the forked
     // child and consumes the mailbox via the Python child loop.
     void add_worker(WorkerType type, void *mailbox);
+    void add_next_level_worker(int32_t worker_id, void *mailbox);
 
     // Register a REMOTE_L3 endpoint only after its session runner completed
     // prestart and reported HELLO READY on the command lane.
     void add_remote_l3_socket(
-        int32_t endpoint_id, uint64_t session_id, const std::string &transport_name, const std::string &host,
+        int32_t worker_id, uint64_t session_id, const std::string &transport_name, const std::string &host,
         uint16_t port, const std::string &health_host, uint16_t health_port, double timeout_s
     );
 
@@ -118,33 +119,33 @@ public:
         return manager_.control_digest_only(type, worker_id, sub_cmd, digest, timeout_s);
     }
     ControlResult remote_prepare_register(
-        int endpoint_id, remote_l3::RemoteRegistryTarget target_registry, CallableKind callable_kind,
-        const void *payload, size_t payload_size, const uint8_t *digest
+        int worker_id, remote_l3::RemoteRegistryTarget target_registry, CallableKind callable_kind, const void *payload,
+        size_t payload_size, const uint8_t *digest
     ) {
         return manager_.control_remote_prepare_register(
-            endpoint_id, target_registry, callable_kind, payload, payload_size, digest
+            worker_id, target_registry, callable_kind, payload, payload_size, digest
         );
     }
     ControlResult remote_commit_register(
-        int endpoint_id, remote_l3::RemoteRegistryTarget target_registry, CallableKind callable_kind,
+        int worker_id, remote_l3::RemoteRegistryTarget target_registry, CallableKind callable_kind,
         const uint8_t *digest
     ) {
-        return manager_.control_remote_commit_register(endpoint_id, target_registry, callable_kind, digest);
+        return manager_.control_remote_commit_register(worker_id, target_registry, callable_kind, digest);
     }
     ControlResult remote_abort_register(
-        int endpoint_id, remote_l3::RemoteRegistryTarget target_registry, CallableKind callable_kind,
+        int worker_id, remote_l3::RemoteRegistryTarget target_registry, CallableKind callable_kind,
         const uint8_t *digest
     ) {
-        return manager_.control_remote_abort_register(endpoint_id, target_registry, callable_kind, digest);
+        return manager_.control_remote_abort_register(worker_id, target_registry, callable_kind, digest);
     }
     ControlResult remote_unregister(
-        int endpoint_id, remote_l3::RemoteRegistryTarget target_registry, CallableKind callable_kind,
+        int worker_id, remote_l3::RemoteRegistryTarget target_registry, CallableKind callable_kind,
         const uint8_t *digest
     ) {
-        return manager_.control_remote_unregister(endpoint_id, target_registry, callable_kind, digest);
+        return manager_.control_remote_unregister(worker_id, target_registry, callable_kind, digest);
     }
-    RemoteBufferHandle remote_malloc(int endpoint_id, size_t size) {
-        return manager_.control_remote_malloc(endpoint_id, size);
+    RemoteBufferHandle remote_malloc(int worker_id, size_t size) {
+        return manager_.control_remote_malloc(worker_id, size);
     }
     void remote_free(const RemoteBufferHandle &handle) { manager_.control_remote_free(handle); }
     void remote_copy_to(const RemoteBufferHandle &handle, uint64_t offset, const void *src, size_t size) {
@@ -159,10 +160,9 @@ public:
     ) {
         return manager_.control_remote_export(handle, offset, size, access_flags, transport_profile);
     }
-    RemoteBufferHandle remote_import(
-        int32_t importer_endpoint_id, const RemoteBufferExport &export_desc, uint32_t requested_access_flags
-    ) {
-        return manager_.control_remote_import(importer_endpoint_id, export_desc, requested_access_flags);
+    RemoteBufferHandle
+    remote_import(int32_t importer_worker_id, const RemoteBufferExport &export_desc, uint32_t requested_access_flags) {
+        return manager_.control_remote_import(importer_worker_id, export_desc, requested_access_flags);
     }
     void remote_release_import(const RemoteBufferHandle &handle) { manager_.control_remote_release_import(handle); }
 

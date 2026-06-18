@@ -271,4 +271,4 @@ class _CallableIdentityState:
     target: Any
     ref_count: int = 0
     state: str = "INSTALLED"
-    eligible_endpoint_ids: tuple[int, ...] = field(default_factory=tuple)
+    eligible_worker_ids: tuple[int, ...] = field(default_factory=tuple)

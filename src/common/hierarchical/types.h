@@ -54,26 +54,26 @@ enum class TensorAddressKind : int32_t {
 
 struct TensorKey {
     uint64_t ptr;
-    int8_t worker;  // -1 = host (globally unique), 0..N-1 = next-level worker logical id
+    int32_t worker_id;  // -1 = host; non-negative values are NEXT_LEVEL worker ids
     TensorAddressKind address_kind{TensorAddressKind::LOCAL_HOST};
-    int32_t owner_endpoint_id{-1};
+    int32_t owner_worker_id{-1};
     uint64_t buffer_id{0};
     uint64_t generation{0};
     uint64_t offset_begin{0};
 
     static TensorKey local_host(uint64_t ptr) { return TensorKey{ptr, -1, TensorAddressKind::LOCAL_HOST}; }
-    static TensorKey local_child(uint64_t ptr, int8_t worker) {
-        return TensorKey{ptr, worker, TensorAddressKind::LOCAL_CHILD};
+    static TensorKey local_child(uint64_t ptr, int32_t worker_id) {
+        return TensorKey{ptr, worker_id, TensorAddressKind::LOCAL_CHILD};
     }
     static TensorKey remote_buffer(
-        TensorAddressKind address_kind, int32_t owner_endpoint_id, uint64_t buffer_id, uint64_t generation,
+        TensorAddressKind address_kind, int32_t owner_worker_id, uint64_t buffer_id, uint64_t generation,
         uint64_t offset_begin
     ) {
         TensorKey key{};
         key.ptr = 0;
-        key.worker = -1;
+        key.worker_id = -1;
         key.address_kind = address_kind;
-        key.owner_endpoint_id = owner_endpoint_id;
+        key.owner_worker_id = owner_worker_id;
         key.buffer_id = buffer_id;
         key.generation = generation;
         key.offset_begin = offset_begin;
@@ -81,8 +81,8 @@ struct TensorKey {
     }
 
     bool operator==(const TensorKey &o) const {
-        return ptr == o.ptr && worker == o.worker && address_kind == o.address_kind &&
-               owner_endpoint_id == o.owner_endpoint_id && buffer_id == o.buffer_id && generation == o.generation &&
+        return ptr == o.ptr && worker_id == o.worker_id && address_kind == o.address_kind &&
+               owner_worker_id == o.owner_worker_id && buffer_id == o.buffer_id && generation == o.generation &&
                offset_begin == o.offset_begin;
     }
 };
@@ -93,9 +93,9 @@ struct TensorKeyHash {
         auto mix = [&h](size_t v) {
             h ^= v + 0x9e3779b9 + (h << 6) + (h >> 2);
         };
-        mix(std::hash<int>{}(k.worker));
+        mix(std::hash<int>{}(k.worker_id));
         mix(std::hash<int>{}(static_cast<int>(k.address_kind)));
-        mix(std::hash<int>{}(k.owner_endpoint_id));
+        mix(std::hash<int>{}(k.owner_worker_id));
         mix(std::hash<uint64_t>{}(k.buffer_id));
         mix(std::hash<uint64_t>{}(k.generation));
         mix(std::hash<uint64_t>{}(k.offset_begin));
@@ -182,14 +182,14 @@ enum class RemoteAddressSpace : int32_t {
 };
 
 // RemoteBufferHandle combines wire-visible identity/mapping metadata
-// (`endpoint_id`, `owner_endpoint_id`, `buffer_id`, `generation`, `import_id`,
+// (`worker_id`, `owner_worker_id`, `buffer_id`, `generation`, `import_id`,
 // `address_space`, `nbytes`, `offset`, `remote_addr`, `rkey_or_token`,
 // `ub_ldst_va`, `access_flags`) with parent-local lifecycle state (`released`,
 // `live_slot_refs`). Keep wire formats in remote_wire.cpp explicit; do not
 // serialize this struct by raw POD copy.
 struct RemoteBufferHandle {
-    int32_t endpoint_id{-1};
-    int32_t owner_endpoint_id{-1};
+    int32_t worker_id{-1};
+    int32_t owner_worker_id{-1};
     uint64_t buffer_id{0};
     uint64_t generation{0};
     uint64_t import_id{0};
@@ -205,7 +205,7 @@ struct RemoteBufferHandle {
 };
 
 struct RemoteBufferExport {
-    int32_t owner_endpoint_id{-1};
+    int32_t owner_worker_id{-1};
     uint64_t buffer_id{0};
     uint64_t generation{0};
     RemoteAddressSpace address_space{RemoteAddressSpace::REMOTE_WINDOW};
@@ -222,7 +222,7 @@ struct RemoteBufferExport {
 
 struct RemoteTensorDesc {
     RemoteAddressSpace address_space{RemoteAddressSpace::REMOTE_DEVICE};
-    int32_t owner_endpoint_id{-1};
+    int32_t owner_worker_id{-1};
     uint64_t buffer_id{0};
     uint64_t offset{0};
     uint64_t nbytes{0};
@@ -306,16 +306,17 @@ struct TaskSlotState {
     std::vector<TensorKey> output_keys;
 
     // Empty outer vector means legacy/unconstrained dispatch. When present,
-    // each group member's vector is the final callable/data endpoint
+    // each group member's vector is the final callable/data worker-id
     // intersection and must be non-empty.
-    std::vector<std::vector<int32_t>> eligible_endpoint_ids;
+    std::vector<std::vector<int32_t>> eligible_worker_ids;
 
-    // --- Worker affinity (set by submit_next_level with worker= parameter) ---
-    // Empty = unconstrained (any idle worker). Otherwise affinities[i] gives
-    // the logical worker id for args[i] (-1 = unconstrained for that slot).
-    std::vector<int8_t> affinities;
+    // --- Submit affinity (set by submit_next_level with worker= parameter) ---
+    // Empty = unconstrained. For NEXT_LEVEL, non-negative values are stable
+    // worker ids. SUB has no public affinity surface and keeps index
+    // semantics for any internal callers that populate this vector.
+    std::vector<int32_t> affinities;
 
-    int8_t get_affinity(int i) const {
+    int32_t get_affinity(int i) const {
         if (affinities.empty()) return -1;
         return affinities[static_cast<size_t>(i)];
     }
@@ -373,20 +374,20 @@ struct TaskSlotState {
 
     bool is_group() const { return is_group_; }
     int32_t group_size() const { return is_group_ ? static_cast<int32_t>(task_args_list.size()) : 1; }
-    bool has_endpoint_constraints() const { return !eligible_endpoint_ids.empty(); }
+    bool has_worker_constraints() const { return !eligible_worker_ids.empty(); }
 
-    const std::vector<int32_t> &eligible_endpoints_for(int32_t i) const {
+    const std::vector<int32_t> &eligible_workers_for(int32_t i) const {
         static const std::vector<int32_t> empty;
-        if (eligible_endpoint_ids.empty()) return empty;
-        if (i < 0 || static_cast<size_t>(i) >= eligible_endpoint_ids.size()) return empty;
-        return eligible_endpoint_ids[static_cast<size_t>(i)];
+        if (eligible_worker_ids.empty()) return empty;
+        if (i < 0 || static_cast<size_t>(i) >= eligible_worker_ids.size()) return empty;
+        return eligible_worker_ids[static_cast<size_t>(i)];
     }
 
-    bool endpoint_allowed(int32_t i, int32_t endpoint_id) const {
-        if (eligible_endpoint_ids.empty()) return true;
-        const auto &eligible = eligible_endpoints_for(i);
+    bool worker_allowed(int32_t i, int32_t worker_id) const {
+        if (eligible_worker_ids.empty()) return true;
+        const auto &eligible = eligible_workers_for(i);
         for (int32_t id : eligible) {
-            if (id == endpoint_id) return true;
+            if (id == worker_id) return true;
         }
         return false;
     }
