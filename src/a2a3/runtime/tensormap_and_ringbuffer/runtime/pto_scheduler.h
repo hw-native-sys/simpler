@@ -621,7 +621,7 @@ struct PTO2SchedulerState
     // 0..W has reached COMPLETED. Reclamation in advance_ring_pointers gates
     // on watermark >= producer.last_consumer_local_id, so no consumer→producer
     // notification edge is needed.
-    void on_mixed_task_complete(PTO2TaskSlotState &slot_state, [[maybe_unused]] PTO2LocalReadyBuffer *local_bufs = nullptr)
+    void on_mixed_task_complete(PTO2TaskSlotState &slot_state)
     {
         // (m) Skip slot_state.task_state.store here; completion_flags below is
         // the single source of truth. Saves one atomic release store per task.
@@ -739,31 +739,26 @@ struct PTO2SchedulerState
         for (int i = 0; i < PTO2_NUM_RESOURCE_SHAPES; i++) ready_queue_destroy(&sched->ready_queues[i]);
         ready_queue_destroy(&sched->dummy_ready_queue);
     }
-    void print_stats()
-    {}
-    void print_queues()
-    {}
 };
 
 // Scheduler cold-path API is declared as PTO2SchedulerState member functions.
-// See init()/destroy()/print_stats()/print_queues() below the struct definition.
+// See init()/destroy() below the struct definition.
 
 inline bool AsyncWaitList::try_inline_complete_locked(AsyncWaitList::DrainCompletionSink &sink, PTO2TaskSlotState &slot_state)
 {
-    sink.sched->on_mixed_task_complete(slot_state, sink.local_bufs);
+    sink.sched->on_mixed_task_complete(slot_state);
     sink.inline_completed++;
     return true;
 }
 
 template <bool Profiling>
-inline AsyncPollResult AsyncWaitList::poll_and_complete(AICoreCompletionMailbox *aicore_mailbox, PTO2SchedulerState *sched, PTO2LocalReadyBuffer *local_bufs)
+inline AsyncPollResult AsyncWaitList::poll_and_complete(AICoreCompletionMailbox *aicore_mailbox, PTO2SchedulerState *sched)
 {
     AsyncPollResult result;
     if (!try_lock()) return result;
 
     AsyncWaitList::DrainCompletionSink sink{};
     sink.sched = sched;
-    sink.local_bufs = local_bufs;
 
     int32_t drain_err = PTO2_ERROR_NONE;
     drain_aicore_completion_mailbox_locked(aicore_mailbox, sink, drain_err);
@@ -810,7 +805,7 @@ inline AsyncPollResult AsyncWaitList::poll_and_complete(AICoreCompletionMailbox 
 
         if (entry.normal_done && entry.waiting_completion_count <= 0)
         {
-            sched->on_mixed_task_complete(*entry.slot_state, local_bufs);
+            sched->on_mixed_task_complete(*entry.slot_state);
             result.completed++;
 
             int32_t last = count - 1;

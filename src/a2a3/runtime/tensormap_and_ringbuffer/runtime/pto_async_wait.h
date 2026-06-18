@@ -167,7 +167,6 @@ struct AsyncWaitList
     struct DrainCompletionSink
     {
         PTO2SchedulerState *sched{nullptr};
-        PTO2LocalReadyBuffer *local_bufs{nullptr};
         int32_t inline_completed{0};
 
         bool can_inline_complete() const
@@ -266,7 +265,7 @@ struct AsyncWaitList
     }
 
     template <bool Profiling>
-    AsyncPollResult poll_and_complete(AICoreCompletionMailbox *aicore_mailbox, PTO2SchedulerState *sched, PTO2LocalReadyBuffer *local_bufs);
+    AsyncPollResult poll_and_complete(AICoreCompletionMailbox *aicore_mailbox, PTO2SchedulerState *sched);
 };
 
 #endif  // PTO_ASYNC_WAIT_H

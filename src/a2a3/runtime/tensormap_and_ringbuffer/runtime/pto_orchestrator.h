@@ -386,16 +386,12 @@ inline int32_t orch_mark_fatal(PTO2OrchestratorState *orch, int32_t error_code)
     return expected;
 }
 
-inline void orch_report_fatal_v(PTO2OrchestratorState *orch, int32_t error_code, const char *fmt, va_list args)
+inline void orch_report_fatal_v(PTO2OrchestratorState *orch, int32_t error_code, const char *, va_list)
 {
-    int32_t latched_code = orch_mark_fatal(orch, error_code);
-
-    if (fmt == nullptr || fmt[0] == '\0') return;
-
-    char message[1024];
-    vsnprintf(message, sizeof(message), fmt, args);
-    (void)latched_code;
-    (void)message;
+    // fmt + args are accepted for future logging-sink wiring but are not yet
+    // routed anywhere — the error_code is latched in shared memory via
+    // orch_mark_fatal and that's what callers actually observe.
+    orch_mark_fatal(orch, error_code);
 }
 
 inline bool append_fanin_or_fail(PTO2OrchestratorState *orch, PTO2TaskSlotState *prod_state, int32_t prod_local_id, PTO2FaninBuilder *fanin_builder)

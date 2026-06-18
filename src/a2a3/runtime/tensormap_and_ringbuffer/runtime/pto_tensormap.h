@@ -472,53 +472,6 @@ struct PTO2TensorMap
         entry.prev_in_task = nullptr;
     }
 
-    void print_stats()
-    {
-        int32_t valid = 0;
-        int32_t stale = 0;
-        int32_t empty_buckets = 0;
-        int32_t max_chain = 0;
-        int64_t total_chain = 0;
-        int32_t non_empty_buckets = 0;
-
-        // Count entries
-        for (int32_t i = 0; i < pool_size; i++)
-        {
-            if (entry_pool[i].bucket_index != -1)
-            {
-                if (entry_valid(entry_pool[i])) valid++;
-                else stale++;
-            }
-        }
-
-        // Count bucket stats
-        for (int32_t b = 0; b < num_buckets; b++)
-        {
-            int32_t chain_len = 0;
-            auto cur_entry = buckets[b];
-
-            while (cur_entry != nullptr)
-            {
-                chain_len++;
-                cur_entry = cur_entry->next_in_bucket;
-            }
-
-            if (chain_len == 0)
-            {
-                empty_buckets++;
-            }
-            else
-            {
-                non_empty_buckets++;
-                total_chain += chain_len;
-                if (chain_len > max_chain) max_chain = chain_len;
-            }
-        }
-
-        for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++)
-        {}
-    }
-
     int32_t valid_count()
     {
         int32_t count = 0;
