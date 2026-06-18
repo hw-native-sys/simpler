@@ -52,9 +52,10 @@ Implemented:
 - Python `RemoteCallable("module:qualname")`, `PYTHON_IMPORT`, and
   `REMOTE_TASK_DISPATCHER` callable identity. Registration requires an
   explicit `workers=[...]` list naming ids returned by `add_remote_worker()`.
-- Python `RemoteBufferHandle`, `RemoteTensorRef`, and `RemoteTaskArgs`
-  wrappers. They keep `ContinuousTensor.data == 0` and carry the remote
-  descriptor sidecar into C++ submit.
+- Python `RemoteBufferHandle` and `RemoteTensorRef` wrappers. `TaskArgs`
+  accepts `RemoteTensorRef` through `add_tensor(...)`, keeps
+  `ContinuousTensor.data == 0`, and carries the remote descriptor sidecar into
+  C++ submit.
 - Canonical little-endian `remote_wire.{h,cpp}` frame codec with bounds checks
   for TASK payloads, remote tensor descriptors, COMPLETION, CONTROL_REPLY, and
   ordered command-lane sequencing.
@@ -284,7 +285,7 @@ Required contracts:
     `orch.submit_next_level(...)` or `orch.submit_sub(...)`.
 - The remote TASK dispatcher is not a Worker and must not reimplement
   Scheduler, Orchestrator, TensorMap, or drain semantics. It is an RPC entry
-  adapter that resolves the outer callable, materializes `RemoteTaskArgs`,
+  adapter that resolves the outer callable, materializes `RemoteTaskArgsWire`,
   calls the embedded `inner_worker`, and wraps completion/error reporting.
 - Resolver location is selected by execution context, not by a second identity
   dimension. A remote TASK frame always resolves in the remote TASK dispatcher
@@ -425,7 +426,7 @@ add or remove entries in either registry location after bootstrap:
 For a TASK frame, the session runner:
 
 1. Validates the session and sequence number.
-2. Decodes `RemoteTaskArgs`.
+2. Decodes `RemoteTaskArgsWire`.
 3. Translates remote tensor descriptors into local `ContinuousTensor` values.
 4. Looks up the L3 orchestration function in the remote TASK dispatcher
    registry by hashid.
@@ -576,8 +577,8 @@ The recommended first cut is conservative:
 
 1. Land the endpoint abstraction and local adapter. **Implemented.**
 2. Add remote tensor sidecars and endpoint eligibility metadata.
-   **Implemented for C++ submit, Python `RemoteTaskArgs`, owner buffers, and
-   imported simulation buffers.**
+   **Implemented for C++ submit, Python `TaskArgs.add_tensor(RemoteTensorRef(...))`,
+   owner buffers, and imported simulation buffers.**
 3. Add the versioned frame codec and the independent health-lane contract.
    **Implemented for the socket-backed simulation transport.**
 4. Add remote callable registration with all-or-nothing multi-endpoint

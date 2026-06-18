@@ -50,6 +50,7 @@ from .task_interface import (
     TaskArgs,
     _empty_remote_sidecar_for,
     _remote_sidecar_for,
+    _validate_remote_sidecar_access,
 )
 
 
@@ -177,6 +178,7 @@ class Orchestrator:
             if explicit_remote_sidecar is not None:
                 raise TypeError("RemoteTensorRef is only supported for RemoteCallable NEXT_LEVEL submits")
             remote_sidecar = None
+        _validate_remote_sidecar_access(c_args, remote_sidecar)
         final_endpoint_ids = _remote_data_eligible_endpoint_ids(remote_sidecar, eligible_endpoint_ids)
         captured_refs = self._worker._capture_remote_sidecar_refs(remote_sidecar) if self._worker is not None else []
         try:
@@ -233,6 +235,9 @@ class Orchestrator:
             if has_explicit_remote_sidecar:
                 raise TypeError("RemoteTensorRef is only supported for RemoteCallable NEXT_LEVEL submits")
             remote_sidecars = None
+        if remote_sidecars is not None:
+            for c_args, remote_sidecar in zip(c_args_list, remote_sidecars):
+                _validate_remote_sidecar_access(c_args, remote_sidecar)
         endpoint_sets = (
             [
                 _remote_data_eligible_endpoint_ids(remote_sidecar, eligible_endpoint_ids)

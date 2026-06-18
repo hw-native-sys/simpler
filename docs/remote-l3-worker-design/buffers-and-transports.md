@@ -71,14 +71,16 @@ explicitly imported, staged, or materialized into a local-addressable
 staging produced a handle.
 
 `remote_export()` returns an opaque session-scoped export descriptor. It does
-not create a new user-releasable allocation. `remote_import()` consumes that
-descriptor on a target endpoint and returns an imported `RemoteBufferHandle`.
+not expose transport keys such as remote addresses, rkeys/tokens, UB LD/ST
+addresses, or transport descriptors, and it does not create a new
+user-releasable allocation. `remote_import()` consumes that descriptor on a
+target endpoint and returns an imported `RemoteBufferHandle`.
 `remote_release_import()` releases the importer-local mapping after all slot
 refs on that imported handle have drained. `remote_free()` on the owner handle
 releases the owner allocation after all imports and slot refs have drained.
 
-Current status: Python exposes `RemoteBufferHandle`, `RemoteTensorRef`, and
-`RemoteTaskArgs`. `RemoteTaskArgs.add_tensor(RemoteTensorRef(...), tag)` stores
+Current status: Python exposes `RemoteBufferHandle` and `RemoteTensorRef`.
+`TaskArgs.add_tensor(RemoteTensorRef(...), tag)` stores
 `ContinuousTensor.data == 0` in the underlying `TaskArgs` and keeps the remote
 descriptor in a same-index sidecar. Public `remote_malloc`, `remote_free`,
 `remote_copy_to`, `remote_copy_from`, `remote_export`, `remote_import`, and
@@ -96,6 +98,10 @@ Python-facing rules:
 - `RemoteTensorRef` is not converted to a fake integer pointer.
 - `RemoteBufferHandle` is opaque to user code. Users may inspect endpoint,
   size, and release state, but not transport keys such as `rkey`.
+- Submit validates the remote handle's access flags against the tensor tag:
+  `INPUT` requires read, `OUTPUT` and `OUTPUT_EXISTING` require write, and
+  `INOUT` and remote `NO_DEP` require read/write. `NO_DEP` skips dependency
+  inference only; it does not weaken remote memory access requirements.
 - A `TaskArgs` containing any remote sidecar is legal only when the final
   selected endpoint set contains remote endpoints that can consume every
   referenced sidecar.

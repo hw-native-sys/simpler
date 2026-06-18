@@ -41,6 +41,7 @@ from simpler.remote_l3_protocol import (
     encode_remote_chip_callable_payload,
 )
 from simpler.remote_l3_session import (
+    _install_manifest_dispatcher_registry,
     _install_manifest_inner_registry,
     _prepare_register_callable,
     _unpublish_inner_handle,
@@ -119,6 +120,10 @@ def _remote_inner_sub_noop(args):
 
 _INNER_SUB_HASHID = compute_callable_hashid(
     build_python_import_descriptor("tests.ut.py.test_callable_identity", "_remote_inner_sub_noop")
+)
+_REMOTE_NOOP_ORCH_TARGET = "tests.ut.py.test_callable_identity:_remote_noop_orch"
+_REMOTE_NOOP_ORCH_HASHID = compute_callable_hashid(
+    build_python_import_descriptor("tests.ut.py.test_callable_identity", "_remote_noop_orch")
 )
 
 
@@ -232,6 +237,41 @@ def test_remote_register_rejects_python_serialized_without_negotiation():
 
     with pytest.raises(ValueError, match="PYTHON_SERIALIZED is not negotiated"):
         _prepare_register_callable(command, {"platform": "a2a3sim", "runtime": "tensormap_and_ringbuffer"})
+
+
+def test_remote_dispatcher_dynamic_register_hashid_matches_manifest_path():
+    digest = hashid_to_digest(_REMOTE_NOOP_ORCH_HASHID)
+    command = encode_register_callable_command(
+        RemoteRegistryTarget.REMOTE_TASK_DISPATCHER,
+        CallableKind.PYTHON_IMPORT,
+        digest,
+        1,
+        _REMOTE_NOOP_ORCH_TARGET.encode("utf-8"),
+    )
+
+    got_digest, got_kind, got_registry, got_target = _prepare_register_callable(
+        command,
+        {"platform": "a2a3sim", "runtime": "tensormap_and_ringbuffer"},
+    )
+    installed = _install_manifest_dispatcher_registry(
+        {
+            "platform": "a2a3sim",
+            "runtime": "tensormap_and_ringbuffer",
+            "remote_task_dispatcher": [
+                {
+                    "hashid": _REMOTE_NOOP_ORCH_HASHID,
+                    "kind": "PYTHON_IMPORT",
+                    "target_registry": "REMOTE_TASK_DISPATCHER",
+                    "target": _REMOTE_NOOP_ORCH_TARGET,
+                }
+            ],
+        }
+    )
+
+    assert got_digest == digest
+    assert got_kind == CallableKind.PYTHON_IMPORT
+    assert got_registry == RemoteRegistryTarget.REMOTE_TASK_DISPATCHER
+    assert installed == {got_digest: got_target}
 
 
 def test_remote_inner_chip_callable_rejects_staged_blob_without_negotiation():
@@ -458,9 +498,92 @@ def test_remote_callable_submit_passes_remote_sidecar_to_cpp_facade():
         bare = TaskArgs()
         bare.add_tensor(ContinuousTensor.make(0x1234, (1,), DataType.UINT8), TensorArgType.INPUT)
         orch.submit_next_level(handle, bare)
+
         bare_sidecar = fake.submit_next_level_args[7]
         assert len(bare_sidecar.tensors) == 1
         assert bare_sidecar.tensors[0] is None
+    finally:
+        worker.close()
+
+
+@pytest.mark.parametrize(
+    ("tag", "access_flags"),
+    [
+        (TensorArgType.OUTPUT, 1),
+        (TensorArgType.INOUT, 1),
+        (TensorArgType.INPUT, 2),
+        (TensorArgType.NO_DEP, 1),
+        (TensorArgType.NO_DEP, 2),
+    ],
+)
+def test_remote_callable_submit_rejects_tag_access_mismatch(tag, access_flags):
+    class FakeCOrchestrator:
+        def submit_next_level(self, *args):
+            self.submit_next_level_args = args
+
+    worker = Worker(level=4, num_sub_workers=0)
+    try:
+        endpoint = worker.add_remote_worker(RemoteWorkerSpec(endpoint="127.0.0.1:19073", platform="a2a3sim"))
+        handle = worker.register(RemoteCallable("pkg.remote:orch"), workers=[endpoint])
+        orch = Orchestrator(FakeCOrchestrator(), worker=worker)  # type: ignore[arg-type]
+        remote_buf = RemoteBufferHandle._from_imported_mapping(
+            endpoint_id=endpoint,
+            owner_endpoint_id=endpoint,
+            buffer_id=1,
+            generation=1,
+            import_id=9,
+            address_space=RemoteAddressSpace.REMOTE_WINDOW,
+            nbytes=4,
+            offset=0,
+            access_flags=access_flags,
+        )
+        args = TaskArgs()
+        args.add_tensor(RemoteTensorRef(remote_buf, shape=(4,), dtype=DataType.UINT8), tag)
+
+        with pytest.raises(ValueError, match="remote tensor .* access"):
+            orch.submit_next_level(handle, args)
+    finally:
+        worker.close()
+
+
+@pytest.mark.parametrize(
+    "tag",
+    [
+        TensorArgType.INPUT,
+        TensorArgType.OUTPUT,
+        TensorArgType.OUTPUT_EXISTING,
+        TensorArgType.INOUT,
+        TensorArgType.NO_DEP,
+    ],
+)
+def test_remote_callable_submit_accepts_readwrite_handle_for_all_tags(tag):
+    class FakeCOrchestrator:
+        def submit_next_level(self, *args):
+            self.submit_next_level_args = args
+
+    worker = Worker(level=4, num_sub_workers=0)
+    try:
+        endpoint = worker.add_remote_worker(RemoteWorkerSpec(endpoint="127.0.0.1:19073", platform="a2a3sim"))
+        handle = worker.register(RemoteCallable("pkg.remote:orch"), workers=[endpoint])
+        fake = FakeCOrchestrator()
+        orch = Orchestrator(fake, worker=worker)  # type: ignore[arg-type]
+        remote_buf = RemoteBufferHandle._from_imported_mapping(
+            endpoint_id=endpoint,
+            owner_endpoint_id=endpoint,
+            buffer_id=1,
+            generation=1,
+            import_id=9,
+            address_space=RemoteAddressSpace.REMOTE_WINDOW,
+            nbytes=4,
+            offset=0,
+            access_flags=3,
+        )
+        args = TaskArgs()
+        args.add_tensor(RemoteTensorRef(remote_buf, shape=(4,), dtype=DataType.UINT8), tag)
+
+        orch.submit_next_level(handle, args)
+
+        assert fake.submit_next_level_args[6] == [endpoint]
     finally:
         worker.close()
 
@@ -988,7 +1111,7 @@ def test_remote_owner_free_waits_for_import_release():
         address_space=RemoteAddressSpace.REMOTE_DEVICE,
         nbytes=4,
     )
-    exported = RemoteBufferExport(
+    exported = RemoteBufferExport._from_remote_export(
         owner_endpoint_id=0,
         buffer_id=1,
         generation=1,
@@ -1002,6 +1125,7 @@ def test_remote_owner_free_waits_for_import_release():
         access_flags=3,
         transport_profile="sim",
         _owner_handle=owner,
+        worker_owner_id=worker._owner_id,
     )
 
     class FakeRemoteWorker:
@@ -1032,6 +1156,220 @@ def test_remote_owner_free_waits_for_import_release():
     assert fake.released == (1, 0, 1, 1, 7)
     assert fake.freed == (0, 1, 1)
     assert worker._pending_remote_buffer_frees == []
+
+
+def test_remote_import_rejects_cross_worker_or_stale_export():
+    owner = RemoteBufferHandle._from_remote_allocation(
+        endpoint_id=0,
+        buffer_id=1,
+        generation=1,
+        address_space=RemoteAddressSpace.REMOTE_DEVICE,
+        nbytes=4,
+    )
+    worker = Worker(level=4, num_sub_workers=0)
+
+    def make_export(*, worker_owner_id=None):
+        return RemoteBufferExport._from_remote_export(
+            owner_endpoint_id=0,
+            buffer_id=1,
+            generation=1,
+            address_space=RemoteAddressSpace.REMOTE_WINDOW,
+            offset=0,
+            nbytes=4,
+            export_id=1,
+            remote_addr=0,
+            rkey_or_token=1,
+            ub_ldst_va=0,
+            access_flags=3,
+            transport_profile="sim",
+            _owner_handle=owner,
+            worker_owner_id=worker_owner_id,
+        )
+
+    with pytest.raises(ValueError, match="forged"):
+        worker.remote_import(make_export(), worker=0)
+    with pytest.raises(ValueError, match="different Worker"):
+        worker.remote_import(make_export(worker_owner_id="other-worker"), worker=0)
+
+    exported = make_export(worker_owner_id=worker._owner_id)
+    owner._mark_released()
+    with pytest.raises(ValueError, match="stale"):
+        worker.remote_import(exported, worker=0)
+
+
+def test_remote_pending_free_is_retained_when_control_fails():
+    class FailingRemoteWorker:
+        def remote_free(self, *args):
+            raise RuntimeError("free failed")
+
+    worker = Worker(level=4, num_sub_workers=0)
+    owner = RemoteBufferHandle._from_remote_allocation(
+        endpoint_id=0,
+        buffer_id=1,
+        generation=1,
+        address_space=RemoteAddressSpace.REMOTE_DEVICE,
+        nbytes=4,
+    )
+    owner._mark_released()
+    worker._worker = FailingRemoteWorker()  # type: ignore[assignment]
+    worker._initialized = True
+    worker._hierarchical_start_state = "started"
+    worker._remote_worker_specs = [object()]
+    worker._pending_remote_buffer_frees = [owner]
+
+    worker._flush_pending_remote_frees()
+
+    assert worker._pending_remote_buffer_frees == [owner]
+
+
+def test_partial_init_failure_cleans_open_remote_session(monkeypatch):
+    import simpler.worker as worker_mod
+
+    class FakeCWorker:
+        def __init__(self):
+            self.closed = False
+            self.added = []
+
+        def add_remote_l3_socket(self, *args):
+            self.added.append(args)
+
+        def close(self):
+            self.closed = True
+
+    fake_c_worker = FakeCWorker()
+
+    def fake_worker_ctor(*args):
+        return fake_c_worker
+
+    calls = 0
+
+    def fake_open_remote_session(self, *, spec, endpoint_id, session_id, timeout_s):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise RuntimeError("second session failed")
+        return worker_mod._RemoteSession(  # noqa: SLF001
+            endpoint_id=endpoint_id,
+            session_id=session_id,
+            command_host="127.0.0.1",
+            command_port=1,
+            health_host="127.0.0.1",
+            health_port=2,
+            pid=0,
+        )
+
+    monkeypatch.setattr(worker_mod, "_Worker", fake_worker_ctor)
+    monkeypatch.setattr(Worker, "_open_remote_session", fake_open_remote_session)
+
+    worker = Worker(level=4, num_sub_workers=0)
+    worker.add_remote_worker(RemoteWorkerSpec(endpoint="127.0.0.1:19073", platform="a2a3sim"))
+    worker.add_remote_worker(RemoteWorkerSpec(endpoint="127.0.0.1:19074", platform="a2a3sim"))
+
+    with pytest.raises(RuntimeError, match="second session failed"):
+        worker.init()
+
+    assert fake_c_worker.closed
+    assert worker._worker is None
+    assert worker._remote_sessions == []
+    assert not worker._initialized
+
+
+def test_partial_init_failure_closes_unregistered_open_remote_session(monkeypatch):
+    import simpler.worker as worker_mod
+
+    class FailingAddCWorker:
+        def __init__(self):
+            self.closed = False
+
+        def add_remote_l3_socket(self, *args):
+            raise RuntimeError("remote socket register failed")
+
+        def close(self):
+            self.closed = True
+
+    fake_c_worker = FailingAddCWorker()
+    opened_session = worker_mod._RemoteSession(  # noqa: SLF001
+        endpoint_id=0,
+        session_id=123,
+        command_host="127.0.0.1",
+        command_port=1,
+        health_host="127.0.0.1",
+        health_port=2,
+        pid=0,
+    )
+    closed_sessions = []
+
+    def fake_worker_ctor(*args):
+        return fake_c_worker
+
+    def fake_open_remote_session(self, *, spec, endpoint_id, session_id, timeout_s):
+        return opened_session
+
+    def fake_close_remote_session(self, session):
+        closed_sessions.append(session)
+
+    monkeypatch.setattr(worker_mod, "_Worker", fake_worker_ctor)
+    monkeypatch.setattr(Worker, "_open_remote_session", fake_open_remote_session)
+    monkeypatch.setattr(Worker, "_close_remote_session", fake_close_remote_session)
+
+    worker = Worker(level=4, num_sub_workers=0)
+    worker.add_remote_worker(RemoteWorkerSpec(endpoint="127.0.0.1:19073", platform="a2a3sim"))
+
+    with pytest.raises(RuntimeError, match="remote socket register failed"):
+        worker.init()
+
+    assert closed_sessions == [opened_session]
+    assert fake_c_worker.closed
+    assert worker._worker is None
+    assert worker._remote_sessions == []
+    assert not worker._initialized
+    worker.close()
+    worker.close()
+
+
+def test_remote_dispatcher_manifest_rejects_hashid_target_mismatch():
+    manifest = {
+        "remote_task_dispatcher": [
+            {
+                "hashid": "sha256:" + "0" * 64,
+                "kind": "PYTHON_IMPORT",
+                "target_registry": "REMOTE_TASK_DISPATCHER",
+                "target": _REMOTE_NOOP_ORCH_TARGET,
+            }
+        ]
+    }
+
+    with pytest.raises(ValueError, match="hashid"):
+        _install_manifest_dispatcher_registry(manifest)
+
+
+def test_remote_dispatcher_manifest_rejects_malformed_hashid():
+    manifest = {
+        "remote_task_dispatcher": [
+            {
+                "hashid": "sha256:ABC",
+                "kind": "PYTHON_IMPORT",
+                "target_registry": "REMOTE_TASK_DISPATCHER",
+                "target": "tests.ut.py.test_callable_identity:_remote_noop_orch",
+            }
+        ]
+    }
+
+    with pytest.raises(ValueError, match="HASHID_FORMAT_INVALID"):
+        _install_manifest_dispatcher_registry(manifest)
+
+
+def test_remote_dispatcher_manifest_rejects_duplicate_hashid():
+    entry = {
+        "hashid": _REMOTE_NOOP_ORCH_HASHID,
+        "kind": "PYTHON_IMPORT",
+        "target_registry": "REMOTE_TASK_DISPATCHER",
+        "target": _REMOTE_NOOP_ORCH_TARGET,
+    }
+    manifest = {"remote_task_dispatcher": [entry, dict(entry)]}
+
+    with pytest.raises(ValueError, match="duplicate hashid"):
+        _install_manifest_dispatcher_registry(manifest)
 
 
 def test_remote_sim_failed_dependency_skips_consumer():

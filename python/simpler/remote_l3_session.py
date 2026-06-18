@@ -261,23 +261,44 @@ def _decode_digest_command(command_payload: bytes) -> tuple[bytes, CallableKind,
     return command.digest, command.callable_kind, command.target_registry
 
 
-def _manifest_digest(entry: dict[str, Any]) -> bytes:
+def _manifest_digest(entry: dict[str, Any], *, context: str = "inner_l3_worker") -> bytes:
     raw = entry.get("hashid")
     if not isinstance(raw, str):
-        raise ValueError("inner_l3_worker manifest entry requires string hashid")
+        raise ValueError(f"{context} manifest entry requires string hashid")
     normalized = raw if raw.startswith("sha256:") else f"sha256:{raw}"
     validate_hashid(normalized)
     return hashid_to_digest(normalized)
 
 
-def _manifest_kind(entry: dict[str, Any]) -> CallableKind:
+def _manifest_kind(entry: dict[str, Any], *, context: str = "inner_l3_worker") -> CallableKind:
     raw = entry.get("kind")
     if not isinstance(raw, str):
-        raise ValueError("inner_l3_worker manifest entry requires string kind")
+        raise ValueError(f"{context} manifest entry requires string kind")
     try:
         return CallableKind[raw]
     except KeyError as exc:
-        raise ValueError(f"inner_l3_worker manifest entry has unsupported kind {raw!r}") from exc
+        raise ValueError(f"{context} manifest entry has unsupported kind {raw!r}") from exc
+
+
+def _manifest_dispatcher_register_command(entry: dict[str, Any]) -> bytes:
+    target_registry = entry.get("target_registry", "REMOTE_TASK_DISPATCHER")
+    if target_registry != "REMOTE_TASK_DISPATCHER":
+        raise ValueError("remote_task_dispatcher manifest entry target_registry must be REMOTE_TASK_DISPATCHER")
+    kind = _manifest_kind(entry, context="remote_task_dispatcher")
+    if kind != CallableKind.PYTHON_IMPORT:
+        raise ValueError("remote_task_dispatcher manifest entry kind must be PYTHON_IMPORT")
+    digest = _manifest_digest(entry, context="remote_task_dispatcher")
+    payload_version = int(entry.get("payload_version", 1))
+    target = entry.get("target")
+    if not isinstance(target, str):
+        raise ValueError("remote_task_dispatcher PYTHON_IMPORT manifest entry requires string target")
+    return encode_register_callable_command(
+        RemoteRegistryTarget.REMOTE_TASK_DISPATCHER,
+        kind,
+        digest,
+        payload_version,
+        target.encode("utf-8"),
+    )
 
 
 def _manifest_inner_register_command(entry: dict[str, Any]) -> bytes:
@@ -309,6 +330,27 @@ def _manifest_inner_register_command(entry: dict[str, Any]) -> bytes:
         payload_version,
         payload,
     )
+
+
+def _install_manifest_dispatcher_registry(manifest: dict[str, Any]) -> dict[bytes, Callable[..., Any]]:
+    entries = manifest.get("remote_task_dispatcher", [])
+    if entries is None:
+        return {}
+    if not isinstance(entries, list):
+        raise ValueError("remote_task_dispatcher manifest registry must be a list")
+
+    installed: dict[bytes, Callable[..., Any]] = {}
+    for entry in entries:
+        if not isinstance(entry, dict):
+            raise ValueError("remote_task_dispatcher manifest entries must be objects")
+        command_payload = _manifest_dispatcher_register_command(entry)
+        digest, kind, registry, target = _prepare_register_callable(command_payload, manifest)
+        if registry != RemoteRegistryTarget.REMOTE_TASK_DISPATCHER or kind != CallableKind.PYTHON_IMPORT:
+            raise ValueError("remote_task_dispatcher manifest entry decoded to the wrong registry")
+        if digest in installed:
+            raise ValueError(f"remote_task_dispatcher manifest contains duplicate hashid {digest.hex()}")
+        installed[digest] = target
+    return installed
 
 
 def _install_manifest_inner_registry(
@@ -448,13 +490,11 @@ def _run_command_loop(  # noqa: PLR0912, PLR0915
     manifest: dict[str, Any],
     inner_worker: Worker,
     manifest_inner_handles: dict[tuple[CallableKind, bytes], CallableHandle] | None = None,
+    manifest_dispatch_registry: dict[bytes, Callable[..., Any]] | None = None,
 ) -> None:
     session_id = int(manifest["session_id"])
     endpoint_id = int(manifest["endpoint_id"])
-    dispatch_registry: dict[bytes, Callable[..., Any]] = {
-        bytes.fromhex(entry["hashid"]): _load_import_target(entry["target"])
-        for entry in manifest.get("remote_task_dispatcher", [])
-    }
+    dispatch_registry: dict[bytes, Callable[..., Any]] = dict(manifest_dispatch_registry or {})
     prepared_dispatcher: dict[bytes, Callable[..., Any]] = {}
     prepared_inner: dict[tuple[CallableKind, bytes], Any] = {}
     inner_handles: dict[tuple[CallableKind, bytes], CallableHandle] = dict(manifest_inner_handles or {})
@@ -856,6 +896,7 @@ def run_session(manifest: dict[str, Any], ready_fd: int) -> int:
     stop_health = threading.Event()
     health_thread: threading.Thread | None = None
     try:
+        manifest_dispatch_registry = _install_manifest_dispatcher_registry(manifest)
         inner_worker.init()
         manifest_inner_handles = _install_manifest_inner_registry(manifest, inner_worker)
         inner_worker._start_hierarchical()  # noqa: SLF001 -- session runner owns the fork-safe prestart.
@@ -885,7 +926,7 @@ def run_session(manifest: dict[str, Any], ready_fd: int) -> int:
 
         conn, _addr = command_sock.accept()
         with conn:
-            _run_command_loop(conn, manifest, inner_worker, manifest_inner_handles)
+            _run_command_loop(conn, manifest, inner_worker, manifest_inner_handles, manifest_dispatch_registry)
         return 0
     except BaseException as exc:  # noqa: BLE001
         try:

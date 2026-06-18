@@ -74,9 +74,10 @@ user-facing orch-fn API.
 Remote L3 submit adds two hidden pieces of metadata: final eligible endpoint
 sets and optional `RemoteTaskArgsSidecar` entries aligned by tensor index.
 Python `RemoteCallable` handles supply callable eligibility, and
-`RemoteTaskArgs` supplies tensor sidecars. The Orchestrator validates affinity,
-endpoint existence, local-vs-remote compatibility, bare host pointers, and
-remote null OUTPUT tensors before committing the slot.
+`TaskArgs.add_tensor(RemoteTensorRef(...), tag)` supplies tensor sidecars. The
+Orchestrator validates affinity, endpoint existence, local-vs-remote
+compatibility, remote handle access rights for the tensor tag, bare host
+pointers, and remote null OUTPUT tensors before committing the slot.
 
 ---
 

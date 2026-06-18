@@ -1484,6 +1484,22 @@ class Worker:
             pid=int(reply.get("pid", 0)),
         )
 
+    def _close_remote_session(self, session: _RemoteSession, *, timeout_s: float = 1.0) -> None:
+        """Best-effort protocol shutdown for a remote L3 session."""
+
+        from .remote_l3_protocol import FrameHeader, FrameType, send_frame  # noqa: PLC0415
+
+        try:
+            with socket.create_connection((session.command_host, session.command_port), timeout=timeout_s) as sock:
+                sock.settimeout(timeout_s)
+                send_frame(sock, FrameHeader(FrameType.SHUTDOWN, session.session_id, session.endpoint_id, 0))
+        except BaseException:  # noqa: BLE001
+            pass
+
+    def _close_remote_sessions(self, sessions: list[_RemoteSession]) -> None:
+        for session in reversed(sessions):
+            self._close_remote_session(session)
+
     def _require_remote_endpoint_started(self, endpoint_id: int) -> None:
         if self.level < 4:
             raise TypeError("remote memory APIs require a level >= 4 parent Worker")
@@ -1674,7 +1690,7 @@ class Worker:
             str(transport_profile),
             handle.nbytes,
         )
-        return RemoteBufferExport(
+        return RemoteBufferExport._from_remote_export(
             owner_endpoint_id=int(fields[0]),
             buffer_id=int(fields[1]),
             generation=int(fields[2]),
@@ -1689,6 +1705,7 @@ class Worker:
             transport_profile=str(fields[11]),
             transport_descriptor=bytes(fields[12]),
             _owner_handle=handle,
+            worker_owner_id=self._owner_id,
         )
 
     def remote_import(
@@ -1696,27 +1713,31 @@ class Worker:
     ) -> RemoteBufferHandle:
         if not isinstance(exported, RemoteBufferExport):
             raise TypeError("Worker.remote_import expects a RemoteBufferExport returned by remote_export")
+        if exported._worker_owner_id != self._owner_id:
+            raise ValueError("Worker.remote_import rejects forged or different Worker RemoteBufferExport values")
+        if exported._owner_handle is not None and exported._owner_handle.released:
+            raise ValueError("Worker.remote_import rejects stale RemoteBufferExport values for released buffers")
         importer_endpoint_id = int(worker)
         self._require_remote_endpoint_started(importer_endpoint_id)
-        flags = exported.access_flags if access is None else self._remote_access_flags(access)
-        if flags & ~exported.access_flags:
+        flags = exported._access_flags if access is None else self._remote_access_flags(access)
+        if flags & ~exported._access_flags:
             raise ValueError("Worker.remote_import requested access is not a subset of export access")
         assert self._worker is not None
         fields = self._worker.remote_import(
             importer_endpoint_id,
-            exported.owner_endpoint_id,
-            exported.buffer_id,
-            exported.generation,
-            int(exported.address_space),
-            exported.offset,
-            exported.nbytes,
-            exported.export_id,
-            exported.remote_addr,
-            exported.rkey_or_token,
-            exported.ub_ldst_va,
-            exported.access_flags,
-            exported.transport_profile,
-            exported.transport_descriptor,
+            exported._owner_endpoint_id,
+            exported._buffer_id,
+            exported._generation,
+            int(exported._address_space),
+            exported._offset,
+            exported._nbytes,
+            exported._export_id,
+            exported._remote_addr,
+            exported._rkey_or_token,
+            exported._ub_ldst_va,
+            exported._access_flags,
+            exported._transport_profile,
+            exported._transport_descriptor,
             flags,
         )
         owner_handle = exported._owner_handle
@@ -1787,6 +1808,7 @@ class Worker:
         self._release_remote_slot_refs(refs)
 
     def _flush_pending_remote_frees(self) -> None:
+        errors: list[str] = []
         pending_imports = self._pending_remote_import_releases
         self._pending_remote_import_releases = []
         remaining_imports: list[RemoteBufferHandle] = []
@@ -1794,7 +1816,12 @@ class Worker:
             if handle._live_slot_refs > 0:
                 remaining_imports.append(handle)
                 continue
-            self._send_remote_release_import(handle)
+            try:
+                self._send_remote_release_import(handle)
+            except Exception as exc:  # noqa: BLE001
+                remaining_imports.append(handle)
+                errors.append(f"release_import endpoint={handle.endpoint_id} import_id={handle.import_id}: {exc}")
+                continue
             if handle._owner_handle_ref is not None:
                 handle._owner_handle_ref._release_import_ref()
                 handle._owner_handle_ref = None
@@ -1807,8 +1834,19 @@ class Worker:
             if handle._live_slot_refs > 0 or handle._live_import_refs > 0:
                 remaining.append(handle)
                 continue
-            self._send_remote_free(handle)
+            try:
+                self._send_remote_free(handle)
+            except Exception as exc:  # noqa: BLE001
+                remaining.append(handle)
+                errors.append(f"free endpoint={handle.endpoint_id} buffer_id={handle._buffer_id}: {exc}")
+                continue
         self._pending_remote_buffer_frees.extend(remaining)
+        if errors:
+            sys.stderr.write(
+                "Worker._flush_pending_remote_frees(): deferred remote buffer cleanup after control error. "
+                f"First error: {errors[0]}\n"
+            )
+            sys.stderr.flush()
 
     # ------------------------------------------------------------------
     # Callable registration (before init)
@@ -2672,12 +2710,16 @@ class Worker:
         if self._initialized:
             raise RuntimeError("Worker already initialized")
 
-        if self.level == 2:
-            self._init_level2()
-        elif self.level >= 3:
-            self._init_hierarchical()
-        else:
-            raise ValueError(f"Worker: level {self.level} not supported")
+        try:
+            if self.level == 2:
+                self._init_level2()
+            elif self.level >= 3:
+                self._init_hierarchical()
+            else:
+                raise ValueError(f"Worker: level {self.level} not supported")
+        except BaseException:
+            self._cleanup_partial_init()
+            raise
 
         self._initialized = True
 
@@ -2755,27 +2797,34 @@ class Worker:
             self._worker = _Worker(self.level, int(heap_ring_size))
 
         local_next_level_count = len(self._next_level_workers)
-        for i, spec in enumerate(self._remote_worker_specs):
-            endpoint_id = local_next_level_count + i
-            session_id = uuid.uuid4().int & ((1 << 63) - 1)
-            if session_id == 0:
-                session_id = 1
-            timeout_s = float(self._config.get("remote_session_timeout_s", 30.0))
-            session = self._open_remote_session(
-                spec=spec, endpoint_id=endpoint_id, session_id=session_id, timeout_s=timeout_s
-            )
-            assert self._worker is not None
-            self._worker.add_remote_l3_socket(
-                endpoint_id,
-                session_id,
-                spec.transport,
-                session.command_host,
-                session.command_port,
-                session.health_host,
-                session.health_port,
-                timeout_s,
-            )
-            self._remote_sessions.append(session)
+        opened_remote_sessions: list[_RemoteSession] = []
+        try:
+            for i, spec in enumerate(self._remote_worker_specs):
+                endpoint_id = local_next_level_count + i
+                session_id = uuid.uuid4().int & ((1 << 63) - 1)
+                if session_id == 0:
+                    session_id = 1
+                timeout_s = float(self._config.get("remote_session_timeout_s", 30.0))
+                session = self._open_remote_session(
+                    spec=spec, endpoint_id=endpoint_id, session_id=session_id, timeout_s=timeout_s
+                )
+                opened_remote_sessions.append(session)
+                assert self._worker is not None
+                self._worker.add_remote_l3_socket(
+                    endpoint_id,
+                    session_id,
+                    spec.transport,
+                    session.command_host,
+                    session.command_port,
+                    session.health_host,
+                    session.health_port,
+                    timeout_s,
+                )
+                self._remote_sessions.append(session)
+                opened_remote_sessions.pop()
+        except BaseException:
+            self._close_remote_sessions(opened_remote_sessions)
+            raise
 
         self._hierarchical_started = False
 
@@ -2980,6 +3029,38 @@ class Worker:
         self._sub_shms.clear()
         self._chip_shms.clear()
         self._next_level_shms.clear()
+
+    def _cleanup_partial_init(self) -> None:
+        """Best-effort cleanup for init() failures before the Worker is public-live."""
+
+        try:
+            self._release_active_remote_slot_refs()
+        except BaseException:  # noqa: BLE001
+            pass
+
+        remote_sessions = list(self._remote_sessions)
+        if self._worker is not None:
+            try:
+                self._worker.close()
+            except BaseException:  # noqa: BLE001
+                pass
+        self._close_remote_sessions(remote_sessions)
+        if self._chip_worker is not None:
+            try:
+                self._chip_worker.finalize()
+            except BaseException:  # noqa: BLE001
+                pass
+            self._chip_worker = None
+
+        self._remote_sessions.clear()
+        self._abort_hierarchical()
+        self._hierarchical_started = False
+        self._comm_base_ready = False
+        self._initialized = False
+        with self._hierarchical_start_cv:
+            if self._hierarchical_start_state != "started":
+                self._hierarchical_start_state = "not_started"
+            self._hierarchical_start_cv.notify_all()
 
     @property
     def live_domains(self) -> dict[str, CommDomainHandle]:

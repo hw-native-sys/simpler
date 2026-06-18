@@ -310,8 +310,8 @@ Scope:
 
 - `simpler-remote-worker`.
 - `simpler-remote-l3-session`.
-- Python `RemoteCallable`, `RemoteBufferHandle`, `RemoteTensorRef`, and
-  `RemoteTaskArgs` integration.
+- Python `RemoteCallable`, `RemoteBufferHandle`, `RemoteBufferExport`,
+  `RemoteTensorRef`, and hidden remote tensor sidecar integration.
 - Simulation remote buffer allocation, copy, export, import, and release.
 - Remote dispatcher and inner worker registry controls.
 - Simulation integration tests.

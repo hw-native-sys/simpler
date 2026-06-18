@@ -10,9 +10,12 @@
 """Tests for the _task_interface nanobind extension and task_interface wrapper."""
 
 import ctypes
+import gc
 import struct
+import weakref
 
 import pytest
+import simpler.task_interface as task_interface_module
 from _task_interface import (  # pyright: ignore[reportMissingImports]
     CONTINUOUS_TENSOR_MAX_DIMS,
     ArgDirection,
@@ -28,7 +31,13 @@ from _task_interface import (  # pyright: ignore[reportMissingImports]
     get_dtype_name,
     get_element_size,
 )
-from simpler.task_interface import RemoteAddressSpace, RemoteBufferHandle, RemoteTensorRef, _remote_sidecar_for
+from simpler.task_interface import (
+    RemoteAddressSpace,
+    RemoteBufferExport,
+    RemoteBufferHandle,
+    RemoteTensorRef,
+    _remote_sidecar_for,
+)
 
 # ============================================================================
 # DataType enum
@@ -467,6 +476,10 @@ class TestTaskArgs:
 
 
 class TestRemoteTaskArgsSidecar:
+    def test_remote_task_args_is_not_public_api(self):
+        assert not hasattr(task_interface_module, "RemoteTaskArgs")
+        assert "RemoteTaskArgs" not in task_interface_module.__all__
+
     def test_remote_buffer_ref_adds_zero_metadata_and_sidecar(self):
         handle = RemoteBufferHandle._from_remote_allocation(
             endpoint_id=3,
@@ -502,6 +515,31 @@ class TestRemoteTaskArgsSidecar:
         assert desc.nbytes == 4
         assert desc.remote_addr == 0xCAFE
         assert desc.rkey_or_token == 0xBEEF
+
+    def test_remote_sidecar_storage_is_bound_to_task_args_lifetime(self):
+        gc.collect()
+        before_count = len(task_interface_module._REMOTE_TASK_ARGS_STORAGE)  # noqa: SLF001
+
+        def make_remote_args_ref():
+            handle = RemoteBufferHandle._from_remote_allocation(
+                endpoint_id=3,
+                buffer_id=11,
+                generation=2,
+                address_space=RemoteAddressSpace.REMOTE_DEVICE,
+                nbytes=64,
+            )
+            args = TaskArgs()
+            args.add_tensor(RemoteTensorRef(handle=handle, shape=(4,), dtype=DataType.UINT8))
+            assert args in task_interface_module._REMOTE_TASK_ARGS_STORAGE  # noqa: SLF001
+            assert _remote_sidecar_for(args) is not None
+            return weakref.ref(args)
+
+        ref = make_remote_args_ref()
+        for _ in range(3):
+            gc.collect()
+
+        assert ref() is None
+        assert len(task_interface_module._REMOTE_TASK_ARGS_STORAGE) == before_count  # noqa: SLF001
 
     def test_remote_buffer_handle_is_opaque_to_public_constructor(self):
         with pytest.raises(TypeError, match="Worker.remote_malloc"):
@@ -565,6 +603,48 @@ class TestRemoteTaskArgsSidecar:
         )
         with pytest.raises(ValueError, match="exceeds"):
             RemoteTensorRef(handle=handle, offset=2, shape=(4,), dtype=DataType.UINT8)
+
+    def test_remote_buffer_export_is_opaque_to_public_constructor_and_repr(self):
+        with pytest.raises(TypeError, match="Worker.remote_export"):
+            RemoteBufferExport(
+                owner_endpoint_id=0,
+                buffer_id=1,
+                generation=1,
+                address_space=RemoteAddressSpace.REMOTE_WINDOW,
+                offset=0,
+                nbytes=4,
+                export_id=1,
+                remote_addr=0xCAFE,
+                rkey_or_token=0xBEEF,
+                ub_ldst_va=0,
+                access_flags=3,
+                transport_profile="sim",
+                transport_descriptor=b"psm_secret",
+            )
+
+        exported = RemoteBufferExport._from_remote_export(
+            owner_endpoint_id=0,
+            buffer_id=1,
+            generation=1,
+            address_space=RemoteAddressSpace.REMOTE_WINDOW,
+            offset=0,
+            nbytes=4,
+            export_id=1,
+            remote_addr=0xCAFE,
+            rkey_or_token=0xBEEF,
+            ub_ldst_va=0,
+            access_flags=3,
+            transport_profile="sim",
+            transport_descriptor=b"psm_secret",
+        )
+        assert exported.owner_endpoint_id == 0
+        assert exported.nbytes == 4
+        assert not hasattr(exported, "remote_addr")
+        assert not hasattr(exported, "rkey_or_token")
+        assert not hasattr(exported, "ub_ldst_va")
+        assert not hasattr(exported, "transport_descriptor")
+        assert "psm_secret" not in repr(exported)
+        assert "0xCAFE" not in repr(exported)
 
 
 class TestRemoteL3SessionTaskArgsMaterialization:

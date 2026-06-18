@@ -113,12 +113,11 @@ public:
 `TensorArgType` has five values (matches existing `tensor_arg.h:53-59`):
 `INPUT`, `OUTPUT`, `INOUT`, `OUTPUT_EXISTING`, `NO_DEP`.
 
-For remote L3 submits, public Python uses `RemoteTaskArgs` as a wrapper around
-the same `TaskArgs` builder. Each `RemoteTensorRef` appends a normal
-`ContinuousTensor` metadata entry with `data == 0` plus a hidden remote
-sidecar at the same tensor index. The local mailbox path rejects non-empty
-remote sidecars; the remote framed path encodes the sidecar as a
-`RemoteTensorDescWire`.
+For remote L3 submits, public Python still uses the same `TaskArgs` builder.
+`TaskArgs.add_tensor(RemoteTensorRef(...), tag)` appends a normal
+`ContinuousTensor` metadata entry with `data == 0` plus a hidden remote sidecar
+at the same tensor index. The local mailbox path rejects non-empty remote
+sidecars; the remote framed path encodes the sidecar as a `RemoteTensorDescWire`.
 
 ### Representation at each phase
 

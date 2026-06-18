@@ -259,7 +259,7 @@ NB_MODULE(_task_interface, m) {
         .value("NO_DEP", TensorArgType::NO_DEP);
 
     // --- TaskArgs (unified vector-backed builder with per-tensor TensorArgType tags) ---
-    nb::class_<TaskArgs>(m, "TaskArgs")
+    nb::class_<TaskArgs>(m, "TaskArgs", nb::is_weak_referenceable())
         .def(nb::init<>())
 
         .def(
