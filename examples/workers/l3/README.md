@@ -61,7 +61,7 @@ Two things to know before reading the example:
 | Directory | New concept |
 | --------- | ----------- |
 | [`multi_chip_dispatch/`](multi_chip_dispatch/) | Two chips + one SubWorker. An orchestration fn dispatches a `ChipCallable` to each chip, then submits a Python callable to collect/verify results. |
-| [`child_memory/`](child_memory/) | `orch.malloc` + `ContinuousTensor(child_memory=True)` to load a weight once and reuse it across multiple kernel invocations on the same chip. |
+| [`child_memory/`](child_memory/) | `orch.malloc` + `Tensor(child_memory=True)` to load a weight once and reuse it across multiple kernel invocations on the same chip. |
 | [`allreduce_distributed/`](allreduce_distributed/) | One communication domain allocated inside the orchestration via `orch.allocate_domain`, with PTO-ISA remote reads over the domain window. |
 | [`allreduce_ring_distributed/`](allreduce_ring_distributed/) | Same domain/window setup as mesh allreduce; **chunked ring RS+AG** (`2(P−1)` rounds, one chunk per step) instead of O(P) full-vector remote reads. |
 | [`allgather_distributed/`](allgather_distributed/) | One communication domain via `orch.allocate_domain`; each rank stages its slice, synchronizes across ranks, then gathers every rank's window data into a full output. |

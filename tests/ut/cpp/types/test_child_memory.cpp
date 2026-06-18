@@ -17,28 +17,28 @@
 #include "task_args.h"
 
 // ---------------------------------------------------------------------------
-// ContinuousTensor layout
+// Tensor layout
 // ---------------------------------------------------------------------------
 
-// ABI contract: size must match serialization format.
-TEST(ChildMemory, SizeofUnchanged) { EXPECT_EQ(sizeof(ContinuousTensor), 40u); }
+// ABI contract: size must match the wire serialization format (2 cache lines).
+TEST(ChildMemory, TensorAbiSize) { EXPECT_EQ(sizeof(Tensor), 128u); }
 
 TEST(ChildMemory, DefaultIsZero) {
-    ContinuousTensor t{};
+    Tensor t{};
     EXPECT_EQ(t.child_memory, 0);
     EXPECT_FALSE(t.is_child_memory());
 }
 
 TEST(ChildMemory, SetChildMemory) {
-    ContinuousTensor t{};
-    t.data = 0xDEAD0000;
+    Tensor t{};
+    t.buffer.addr = 0xDEAD0000;
     t.shapes[0] = 16;
     t.ndims = 1;
     t.dtype = DataType::FLOAT32;
     t.child_memory = 1;
 
     EXPECT_TRUE(t.is_child_memory());
-    EXPECT_EQ(t.data, 0xDEAD0000u);
+    EXPECT_EQ(t.buffer.addr, 0xDEAD0000u);
     EXPECT_EQ(t.nbytes(), 16u * 4u);
 }
 
@@ -49,16 +49,16 @@ TEST(ChildMemory, SetChildMemory) {
 TEST(ChildMemory, BlobRoundtripPreservesChildMemory) {
     TaskArgs args;
 
-    ContinuousTensor host_t{};
-    host_t.data = 0x1000;
+    Tensor host_t{};
+    host_t.buffer.addr = 0x1000;
     host_t.shapes[0] = 4;
     host_t.ndims = 1;
     host_t.dtype = DataType::FLOAT32;
     host_t.child_memory = 0;
     args.add_tensor(host_t, TensorArgType::INPUT);
 
-    ContinuousTensor dev_t{};
-    dev_t.data = 0x2000;
+    Tensor dev_t{};
+    dev_t.buffer.addr = 0x2000;
     dev_t.shapes[0] = 8;
     dev_t.ndims = 1;
     dev_t.dtype = DataType::FLOAT16;
@@ -82,7 +82,7 @@ TEST(ChildMemory, BlobRoundtripPreservesChildMemory) {
 
     EXPECT_EQ(view.tensors[1].child_memory, 1);
     EXPECT_TRUE(view.tensors[1].is_child_memory());
-    EXPECT_EQ(view.tensors[1].data, 0x2000u);
+    EXPECT_EQ(view.tensors[1].buffer.addr, 0x2000u);
 }
 
 // ---------------------------------------------------------------------------
@@ -90,14 +90,14 @@ TEST(ChildMemory, BlobRoundtripPreservesChildMemory) {
 // ---------------------------------------------------------------------------
 
 TEST(ChildMemory, ViewToChipStoragePreservesChildMemory) {
-    ContinuousTensor tensors[2] = {};
-    tensors[0].data = 0xA000;
+    Tensor tensors[2] = {};
+    tensors[0].buffer.addr = 0xA000;
     tensors[0].shapes[0] = 1;
     tensors[0].ndims = 1;
     tensors[0].dtype = DataType::INT32;
     tensors[0].child_memory = 0;
 
-    tensors[1].data = 0xB000;
+    tensors[1].buffer.addr = 0xB000;
     tensors[1].shapes[0] = 2;
     tensors[1].ndims = 1;
     tensors[1].dtype = DataType::INT32;
@@ -111,7 +111,7 @@ TEST(ChildMemory, ViewToChipStoragePreservesChildMemory) {
     ASSERT_EQ(chip.tensor_count(), 2);
     EXPECT_FALSE(chip.tensor(0).is_child_memory());
     EXPECT_TRUE(chip.tensor(1).is_child_memory());
-    EXPECT_EQ(chip.tensor(1).data, 0xB000u);
+    EXPECT_EQ(chip.tensor(1).buffer.addr, 0xB000u);
 }
 
 // ---------------------------------------------------------------------------
@@ -124,16 +124,16 @@ TEST(ChildMemory, SkipLogicSimulation) {
     // malloc'd vs passed-through.
     ChipStorageTaskArgs args;
 
-    ContinuousTensor host_t{};
-    host_t.data = 0x1000;
+    Tensor host_t{};
+    host_t.buffer.addr = 0x1000;
     host_t.shapes[0] = 4;
     host_t.ndims = 1;
     host_t.dtype = DataType::FLOAT32;
     host_t.child_memory = 0;
     args.add_tensor(host_t);
 
-    ContinuousTensor dev_t{};
-    dev_t.data = 0x2000;
+    Tensor dev_t{};
+    dev_t.buffer.addr = 0x2000;
     dev_t.shapes[0] = 8;
     dev_t.ndims = 1;
     dev_t.dtype = DataType::FLOAT32;
@@ -144,7 +144,7 @@ TEST(ChildMemory, SkipLogicSimulation) {
     int passthrough_count = 0;
 
     for (int i = 0; i < args.tensor_count(); i++) {
-        ContinuousTensor t = args.tensor(i);
+        Tensor t = args.tensor(i);
         if (t.is_child_memory()) {
             passthrough_count++;
         } else {

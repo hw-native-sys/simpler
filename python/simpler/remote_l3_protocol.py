@@ -15,7 +15,7 @@ import socket
 import struct
 from dataclasses import dataclass
 
-from .task_interface import CONTINUOUS_TENSOR_MAX_DIMS, CallConfig, ContinuousTensor, DataType
+from .task_interface import MAX_TENSOR_DIMS, CallConfig, DataType, Tensor
 
 PROTOCOL_VERSION = 1
 MAX_FRAME_PAYLOAD_BYTES = 16 * 1024 * 1024
@@ -141,7 +141,7 @@ class RemoteTensorSidecar:
 
 @dataclass(frozen=True)
 class RemoteTaskArgsWire:
-    tensor_metadata: tuple[ContinuousTensor, ...]
+    tensor_metadata: tuple[Tensor, ...]
     remote_desc: tuple[RemoteTensorSidecar, ...]
     scalars: tuple[int, ...]
     inline_payload: bytes
@@ -432,13 +432,13 @@ def decode_call_config(reader: _Reader) -> CallConfig:
     return cfg
 
 
-def decode_continuous_tensor(reader: _Reader) -> ContinuousTensor:
+def decode_tensor(reader: _Reader) -> Tensor:
     data = reader.u64()
     if data != 0:
         raise ValueError("remote_wire: remote TASK tensor data must be zero")
-    shapes = [reader.u32() for _ in range(CONTINUOUS_TENSOR_MAX_DIMS)]
+    shapes = [reader.u32() for _ in range(MAX_TENSOR_DIMS)]
     ndims = reader.u32()
-    if ndims > CONTINUOUS_TENSOR_MAX_DIMS:
+    if ndims > MAX_TENSOR_DIMS:
         raise ValueError("remote_wire: tensor ndims exceeds maximum")
     dtype = DataType(reader.u32())
     child_memory = reader.u8()
@@ -446,8 +446,8 @@ def decode_continuous_tensor(reader: _Reader) -> ContinuousTensor:
         raise ValueError("remote_wire: tensor child_memory must be 0 or 1")
     for _ in range(7):
         if reader.u8() != 0:
-            raise ValueError("remote_wire: ContinuousTensor reserved bytes must be zero")
-    return ContinuousTensor.make(0, tuple(shapes[:ndims]), dtype, bool(child_memory))
+            raise ValueError("remote_wire: Tensor reserved bytes must be zero")
+    return Tensor.make(0, tuple(shapes[:ndims]), dtype, bool(child_memory))
 
 
 def decode_remote_tensor_desc(reader: _Reader) -> RemoteTensorDesc:
@@ -501,7 +501,7 @@ def decode_remote_task_args(data: bytes) -> RemoteTaskArgsWire:
         raise ValueError("remote_wire: tensor count exceeds maximum")
     if scalar_count > MAX_SCALARS:
         raise ValueError("remote_wire: scalar count exceeds maximum")
-    tensors = tuple(decode_continuous_tensor(reader) for _ in range(tensor_count))
+    tensors = tuple(decode_tensor(reader) for _ in range(tensor_count))
     sidecars: list[RemoteTensorSidecar] = []
     for _ in range(tensor_count):
         present = reader.u8()

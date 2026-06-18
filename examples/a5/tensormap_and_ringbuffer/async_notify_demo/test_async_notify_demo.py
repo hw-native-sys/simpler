@@ -20,10 +20,10 @@ from simpler.task_interface import (
     CallConfig,
     ChipCallable,
     CommBufferSpec,
-    ContinuousTensor,
     CoreCallable,
     DataType,
     TaskArgs,
+    Tensor,
     TensorArgType,
 )
 from simpler.worker import Worker
@@ -130,7 +130,7 @@ def run(platform: str = "a5", device_ids: list[int] | None = None, pto_isa_commi
                     args.add_tensor(make_tensor_arg(out[rank]), TensorArgType.OUTPUT_EXISTING)
                     args.add_tensor(make_tensor_arg(result[rank]), TensorArgType.OUTPUT_EXISTING)
                     args.add_tensor(
-                        ContinuousTensor.make(
+                        Tensor.make(
                             data=domain.buffer_ptrs["notify_counter"],
                             shapes=(1,),
                             dtype=DataType.INT32,

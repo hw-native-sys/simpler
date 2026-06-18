@@ -25,7 +25,7 @@ doesn't drag in its own kernel sources. The contract being verified:
 
 import pytest
 from _task_interface import RunTiming  # pyright: ignore[reportMissingImports]
-from simpler.task_interface import CallConfig, ChipStorageTaskArgs, ContinuousTensor, DataType
+from simpler.task_interface import CallConfig, ChipStorageTaskArgs, DataType, Tensor
 from simpler.worker import Worker
 
 from .main import N_COLS, N_ELEMS, N_ROWS, NBYTES, build_chip_callable
@@ -56,9 +56,9 @@ def _drive_one_run(platform: str, device_id: int, *, enable_l2_swimlane: bool = 
         worker.copy_to(dev_b, host_b.data_ptr(), NBYTES)
 
         args = ChipStorageTaskArgs()
-        args.add_tensor(ContinuousTensor.make(dev_a, (N_ROWS, N_COLS), DataType.FLOAT32))
-        args.add_tensor(ContinuousTensor.make(dev_b, (N_ROWS, N_COLS), DataType.FLOAT32))
-        args.add_tensor(ContinuousTensor.make(dev_out, (N_ROWS, N_COLS), DataType.FLOAT32))
+        args.add_tensor(Tensor.make(dev_a, (N_ROWS, N_COLS), DataType.FLOAT32))
+        args.add_tensor(Tensor.make(dev_b, (N_ROWS, N_COLS), DataType.FLOAT32))
+        args.add_tensor(Tensor.make(dev_out, (N_ROWS, N_COLS), DataType.FLOAT32))
 
         config = CallConfig()
         config.enable_l2_swimlane = enable_l2_swimlane

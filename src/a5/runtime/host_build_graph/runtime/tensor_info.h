@@ -17,7 +17,7 @@
 #include "common/platform_config.h"
 #include "data_type.h"
 #include "profiling_config.h"
-#include "tensor_arg.h"
+#include "tensor.h"
 
 struct TensorInfo {
     DataType dtype;
@@ -54,7 +54,7 @@ inline TensorInfo make_tensor_info(
     return info;
 }
 
-inline TensorInfo make_tensor_info_from_tensor_arg(const ContinuousTensor &tensor) {
+inline TensorInfo make_tensor_info_from_tensor_arg(const Tensor &tensor) {
     return make_tensor_info(tensor.dtype, tensor.ndims, tensor.shapes);
 }
 

@@ -16,13 +16,14 @@
 #include <algorithm>
 #include <sstream>
 #include <string>
+#include <type_traits>
 #include <utility>
 
-#include "common.h"
+#include "assert_compat.h"
 #include "data_type.h"
 #include "pto_task_id.h"
 
-constexpr int RUNTIME_MAX_TENSOR_DIMS = 5;
+constexpr int MAX_TENSOR_DIMS = 5;
 
 /**
  * Buffer Handle
@@ -35,96 +36,25 @@ struct PTOBufferHandle {
     uint64_t size;  // Total buffer size in bytes
 };
 
-enum class OverlapStatus {
-    NO_OVERLAP,
-    COVERED,
-    OTHER,
-};
-
-struct Segment {
-    uint64_t begin;
-    uint64_t end;
-
-    bool line_segment_intersection(const Segment &other) const { return end > other.begin && other.end > begin; }
-    bool contains(const Segment &other) const { return begin <= other.begin && other.end <= end; }
-};
-
 /**
- * TensorCreateInfo — submit-time create-info for runtime-allocated outputs.
+ * TensorArgType - Distinguishes inputs, outputs, and in-place updates.
  *
- * Carries the metadata required to materialize a fresh contiguous output:
- * dtype, ndims, shapes, manual_dep, and an optional initial value fill.
- *
- * Layout (64B) is aligned with Tensor cache line 1 so that
- * init_from_create_info() can copy the entire cache line with a single memcpy,
- * then overwrite buffer/owner metadata and compute the contiguous stride in
- * cache line 2.
- *
- * Arg::add_output() stores a pointer to this object, so the original
- * must remain valid (not a temporary) until after the submit call.
+ * A per-tensor tag carried by TaskArgs (drives dependency inference at submit
+ * time; stripped before the args cross the dispatch boundary).
  */
-class alignas(64) TensorCreateInfo {
-public:
-    TensorCreateInfo(
-        const uint32_t shapes_in[], uint32_t ndims_in, DataType dtype_in = DataType::FLOAT32, bool manual_dep_in = false
-    ) :
-        initial_value(0),
-        has_initial_value(false),
-        __pad2__(0),
-        start_offset(0),  // mirrors Tensor::start_offset; pre-zeroed for create-info outputs
-        version(0),
-        ndims(ndims_in),
-        dtype(dtype_in),
-        manual_dep(manual_dep_in),
-        is_contiguous(true),  // mirrors Tensor::is_contiguous; pre-set for create-info outputs
-        __pad_flags__(0) {
-        for (uint32_t i = 0; i < ndims_in; i++) {
-            shapes[i] = shapes_in[i];
-        }
-    }
-
-    void copy(const TensorCreateInfo &other) { memcpy(this, &other, sizeof(other)); }
-
-    template <typename T = uint64_t>
-    void set_initial_value(T value) {
-        has_initial_value = true;
-        initial_value = to_u64(value);
-    }
-
-    uint64_t buffer_size_bytes() const {
-        uint64_t total = 1;
-        for (uint32_t i = 0; i < ndims; i++) {
-            total *= shapes[i];
-        }
-        return total * get_element_size(dtype);
-    }
-
-public:
-    // --- Bytes [0, 32): TensorCreateInfo-only fields ---
-    // These occupy the same positions as Tensor::buffer, Tensor::owner_task_id,
-    // and Tensor::start_offset. The runtime overwrites owner metadata after the
-    // memcpy and recomputes start_offset / stride during payload materialization.
-    uint64_t initial_value;
-    bool has_initial_value;
-    uint8_t __pad1__[7];
-    uint64_t __pad2__;      // → Tensor::owner_task_id (overwritten post-memcpy)
-    uint64_t start_offset;  // mirrors Tensor::start_offset; always 0 for create-info outputs
-
-    // --- Bytes [32, 64): Matches Tensor cache line 1 layout ---
-    int32_t version;  // Always 0 for create-info outputs
-    uint32_t ndims;
-    DataType dtype;
-    bool manual_dep;
-    bool is_contiguous;  // Always true for create-info outputs
-    uint8_t __pad_flags__;
-    uint32_t shapes[RUNTIME_MAX_TENSOR_DIMS];  // → Tensor::shapes
-
-    TensorCreateInfo() = default;
-
-    friend struct Arg;
+enum class TensorArgType : int32_t {
+    INPUT = 0,            // Read-only input buffer
+    OUTPUT = 1,           // Write-only output buffer (runtime allocates)
+    INOUT = 2,            // Read-then-write: modifier for downstream
+    OUTPUT_EXISTING = 3,  // Write-only existing tensor: skips OverlapMap lookup, depends on creator
+    NO_DEP = 4,           // No-dependency existing tensor: skips OverlapMap lookup, no publish
 };
 
-static_assert(sizeof(TensorCreateInfo) == 64);
+// `OverlapStatus` / `Segment` (overlap geometry) live in the runtime
+// pto_tensormap.h. `TensorCreateInfo` (submit-time create-info for
+// runtime-allocated outputs) and its materialization helpers live in the
+// runtime tensor_create_info.h. Both are runtime-only and intentionally not
+// part of the wire/host-facing Tensor definition.
 
 /**
  * Tensor descriptor for Task input/output (128B = 2 cache lines)
@@ -164,23 +94,30 @@ static_assert(sizeof(TensorCreateInfo) == 64);
  */
 struct alignas(64) Tensor {
     // === Cache line 1 (64B) — hot path ===
-    PTOBufferHandle buffer;    // Underlying memory buffer (addr in bytes, size in bytes)
-    PTO2TaskId owner_task_id;  // Creator task; PTO2TaskId::invalid() for external tensors
-    uint64_t start_offset;     // 1D ELEMENT offset of the view origin into `buffer`
-    int32_t version;           // Tensor version for overlap detection
-    uint32_t ndims;            // Number of dimensions used
-    DataType dtype;            // Data type of tensor elements
-    bool manual_dep;           // True when dependency tracking is creator-only (skip OverlapMap lookup/insert)
-    bool is_contiguous;        // Cached: strides[] == row_major_stride(shapes)
-    uint8_t _pad_cl1;          // Pad to align shapes[5] at byte 44
-    uint32_t shapes[RUNTIME_MAX_TENSOR_DIMS];  // Current view shape per dimension (elements)
+    PTOBufferHandle buffer;            // Underlying memory buffer (addr in bytes, size in bytes)
+    PTO2TaskId owner_task_id;          // Creator task; PTO2TaskId::invalid() for external tensors
+    uint64_t start_offset;             // 1D ELEMENT offset of the view origin into `buffer`
+    int32_t version;                   // Tensor version for overlap detection
+    uint32_t ndims;                    // Number of dimensions used
+    DataType dtype;                    // Data type of tensor elements
+    bool manual_dep;                   // True when dependency tracking is creator-only (skip OverlapMap lookup/insert)
+    bool is_contiguous;                // Cached: strides[] == row_major_stride(shapes)
+    uint8_t child_memory;              // 0 = host memory (default), 1 = child-managed device memory (skips H2D copy)
+    uint32_t shapes[MAX_TENSOR_DIMS];  // Current view shape per dimension (elements)
 
     // === Cache line 2 (64B) — warm path (view metadata) ===
     // Field order: place the 8B-aligned cache before the 4B-aligned strides[]
     // to avoid 4B padding between them (sizeof(Tensor) must stay 128).
-    uint64_t extent_elem_cache;                 // Cached extent_elem (see extent_elem()); maintained by ops
-    uint32_t strides[RUNTIME_MAX_TENSOR_DIMS];  // Element stride per dimension; ALWAYS > 0 (type-enforced)
-    uint8_t _pad_cl2[36];                       // Reserved for future extension
+    uint64_t extent_elem_cache;         // Cached extent_elem (see extent_elem()); maintained by ops
+    uint32_t strides[MAX_TENSOR_DIMS];  // Element stride per dimension; ALWAYS > 0 (type-enforced)
+    uint8_t _pad_cl2[36];               // Reserved for future extension
+
+    // Default construction is public: Tensor doubles as the wire / TaskArgs
+    // storage type (TaskArgsTpl<Tensor> arrays, ChipStorageTaskArgs POD, blob
+    // memcpy targets), all of which require a default-constructible element. A
+    // default-constructed Tensor is uninitialized and must be filled via
+    // make_tensor_external() / init_external() / a view op before use.
+    Tensor() = default;
 
     // --- Copy / move / destroy ---
     // Kept trivially copyable (default copy = byte-for-byte) so other modules
@@ -215,6 +152,24 @@ struct alignas(64) Tensor {
         return extent_elem_cache;
     }
 
+    /// True when `buffer.addr` is a device pointer allocated by the child process
+    /// (host skips the H2D copy in init_runtime_impl). Host-side concept carried
+    /// across the wire; runtime views inherit it via the cache-line-1 copy.
+    [[nodiscard]] bool is_child_memory() const { return child_memory != 0; }
+
+    /// Logical byte size of the view (numel * element size). For a contiguous
+    /// host-constructed tensor this equals buffer.size; provided for parity with
+    /// the host-side allocators that size buffers from a tensor's logical bytes.
+    [[nodiscard]] uint64_t nbytes() const { return numel() * get_element_size(dtype); }
+
+    /// Typed pointer to the tensor's buffer base (== buffer.addr). Convenience
+    /// accessor used by orchestration sources to read raw tensor data; matches
+    /// the former ContinuousTensor::data_as<T>() semantics.
+    template <typename T>
+    T *data_as() const {
+        return reinterpret_cast<T *>(static_cast<uintptr_t>(buffer.addr));
+    }
+
     // ========================================================================
     // Initialization (operates on already-constructed Tensor)
     // ========================================================================
@@ -224,16 +179,16 @@ struct alignas(64) Tensor {
     /// Enforces the ndims > 0 invariant relied upon by every downstream op.
     void init_external(
         void *addr, uint64_t buffer_size_bytes, const uint32_t in_shapes[], uint32_t in_ndims, DataType in_dtype,
-        int32_t in_version, bool in_manual_dep = false
+        int32_t in_version, bool in_manual_dep = false, uint8_t in_child_memory = 0
     ) {
-        always_assert(in_ndims > 0 && in_ndims <= RUNTIME_MAX_TENSOR_DIMS);
+        always_assert(in_ndims > 0 && in_ndims <= MAX_TENSOR_DIMS);
         buffer = {reinterpret_cast<uint64_t>(addr), buffer_size_bytes};
         ndims = in_ndims;
         dtype = in_dtype;
         version = in_version;
         manual_dep = in_manual_dep;
         is_contiguous = true;
-        _pad_cl1 = 0;
+        child_memory = in_child_memory;
         start_offset = 0;
         owner_task_id = PTO2TaskId::invalid();
         // Single reverse pass: write shapes, accumulate row-major stride, and
@@ -287,42 +242,11 @@ struct alignas(64) Tensor {
     /// deep copy. Equivalent to `init_from(other)`.
     void copy(const Tensor &other) { init_from(other); }
 
-    /// Materialize a TensorCreateInfo into this Tensor (fresh contiguous output).
-    /// Single 64B memcpy covers cache line 1; ci pre-initialises start_offset (=0)
-    /// and is_contiguous (=true) in its line-1 slots so they need no reset here.
-    /// Cache line 2 (stride/extent) is computed from `ci.shapes` in a single reverse pass.
-    void init_from_create_info(const TensorCreateInfo &ci, void *addr, uint64_t buffer_size) {
-        always_assert(ci.ndims > 0 && ci.ndims <= RUNTIME_MAX_TENSOR_DIMS);
-        memcpy(this, &ci, 64);
-        buffer = {reinterpret_cast<uint64_t>(addr), buffer_size};
-        owner_task_id = PTO2TaskId::invalid();  // caller (orchestrator) overwrites with actual task_id
-        uint32_t s = 1;
-        for (int32_t i = static_cast<int32_t>(ndims) - 1; i >= 0; --i) {
-            strides[i] = s;
-            s *= shapes[i];
-        }
-        extent_elem_cache = s;
-        if (ci.has_initial_value) {
-            fill_initial_value(ci.initial_value);
-        }
-    }
-
-    void fill_initial_value(uint64_t initial_value) {
-        always_assert(reinterpret_cast<char *>(buffer.addr) != nullptr);
-        uint64_t elem_size = get_element_size(dtype);
-        char *dst = reinterpret_cast<char *>(buffer.addr);
-        constexpr uint64_t blk_size = 64;
-        uint64_t blk = (buffer.size < blk_size) ? buffer.size : blk_size;
-        for (uint64_t b = 0; b < blk; b += elem_size) {
-            memcpy(dst + b, &initial_value, elem_size);
-        }
-        uint64_t filled = blk;
-        while (filled < buffer.size) {
-            uint64_t copy_size = ((buffer.size - filled) < filled) ? (buffer.size - filled) : filled;
-            memcpy(dst + filled, dst, copy_size);
-            filled += copy_size;
-        }
-    }
+    // Materialization from a TensorCreateInfo (runtime-allocated outputs) lives
+    // in the runtime tensor_create_info.h as the free functions
+    // init_tensor_from_create_info() / fill_tensor_initial_value(); they operate
+    // on a Tensor& through its public members. Kept out of the wire/host-facing
+    // Tensor so this header has no dependency on the runtime-only create-info.
 
     // ========================================================================
     // Address / offset computation
@@ -482,15 +406,16 @@ struct alignas(64) Tensor {
     }
 
 private:
-    // Default and parameterized constructors are private.
-    // Valid Tensors come only from controlled entry points.
-    Tensor() = default;
-
+    // The parameterized constructor is private: a fully-initialized Tensor with
+    // a real buffer comes only through make_tensor_external() / view ops. (The
+    // default constructor is public — see above — for POD/array storage.)
     Tensor(
         void *addr, uint64_t buffer_size_bytes, const uint32_t in_shapes[], uint32_t in_ndims, DataType in_dtype,
-        int32_t in_version, bool in_manual_dep = false
+        int32_t in_version, bool in_manual_dep = false, uint8_t in_child_memory = 0
     ) {
-        init_external(addr, buffer_size_bytes, in_shapes, in_ndims, in_dtype, in_version, in_manual_dep);
+        init_external(
+            addr, buffer_size_bytes, in_shapes, in_ndims, in_dtype, in_version, in_manual_dep, in_child_memory
+        );
     }
 
     // ------------------------------------------------------------------------
@@ -526,10 +451,12 @@ private:
     // Friends that need to construct Tensors
     friend struct PTO2TaskPayload;
     friend inline Tensor make_tensor_external(
-        void *addr, const uint32_t shapes[], uint32_t ndims, DataType dtype, bool manual_dep, int32_t version
+        void *addr, const uint32_t shapes[], uint32_t ndims, DataType dtype, bool manual_dep, int32_t version,
+        uint8_t child_memory
     );
 };
 
+static_assert(std::is_trivially_copyable_v<Tensor>, "Tensor must be trivially copyable for DMA / wire transport");
 static_assert(sizeof(Tensor) == 128, "Tensor must be exactly 2 cache lines (128 bytes)");
 static_assert(offsetof(Tensor, owner_task_id) == 16, "owner_task_id must be at bytes 16-23 (cacheline 1)");
 static_assert(offsetof(Tensor, start_offset) == 24, "start_offset must be at bytes 24-31 (cacheline 1)");
@@ -538,16 +465,25 @@ static_assert(offsetof(Tensor, ndims) == 36);
 static_assert(offsetof(Tensor, dtype) == 40);
 static_assert(offsetof(Tensor, manual_dep) == 41);
 static_assert(offsetof(Tensor, is_contiguous) == 42);
+static_assert(offsetof(Tensor, child_memory) == 43, "child_memory must be at byte 43 (cacheline 1, former _pad_cl1)");
 static_assert(offsetof(Tensor, shapes) == 44, "shapes must start at byte 44 (cacheline 1)");
 static_assert(offsetof(Tensor, extent_elem_cache) == 64, "extent_elem_cache must start at byte 64 (cacheline 2)");
 static_assert(offsetof(Tensor, strides) == 72);
 
-// TensorCreateInfo layout must match Tensor cacheline 1 for memcpy optimization
-static_assert(sizeof(TensorCreateInfo) == 64, "TensorCreateInfo must match Tensor cacheline 1 size (64 bytes)");
-static_assert(offsetof(TensorCreateInfo, start_offset) == offsetof(Tensor, start_offset));
-static_assert(offsetof(TensorCreateInfo, version) == offsetof(Tensor, version));
-static_assert(offsetof(TensorCreateInfo, ndims) == offsetof(Tensor, ndims));
-static_assert(offsetof(TensorCreateInfo, dtype) == offsetof(Tensor, dtype));
-static_assert(offsetof(TensorCreateInfo, manual_dep) == offsetof(Tensor, manual_dep));
-static_assert(offsetof(TensorCreateInfo, is_contiguous) == offsetof(Tensor, is_contiguous));
-static_assert(offsetof(TensorCreateInfo, shapes) == offsetof(Tensor, shapes));
+// =============================================================================
+// Tensor factory — canonical construction entry for pre-allocated external
+// memory. Lives here (not in the runtime orchestration header) so host-side
+// consumers (the nanobind binding, make_tensor_arg) build Tensors through the
+// same controlled path as the runtime. The resulting Tensor is contiguous:
+// start_offset == 0 and strides == row_major(shapes).
+// =============================================================================
+inline Tensor make_tensor_external(
+    void *addr, const uint32_t shapes[], uint32_t ndims, DataType dtype = DataType::FLOAT32, bool manual_dep = false,
+    int32_t version = 0, uint8_t child_memory = 0
+) {
+    uint64_t total = 1;
+    for (uint32_t i = 0; i < ndims; i++) {
+        total *= shapes[i];
+    }
+    return {addr, total * get_element_size(dtype), shapes, ndims, dtype, version, manual_dep, child_memory};
+}

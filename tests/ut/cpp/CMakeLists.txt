@@ -158,6 +158,10 @@ add_library(hierarchical_objs OBJECT
     ${HIERARCHICAL_SRC_DIR}/scheduler.cpp
     ${HIERARCHICAL_SRC_DIR}/worker.cpp
     ${WORKER_SRC_DIR}/chip_worker.cpp
+    # Host-side assert_impl / get_stacktrace for the unified Tensor's
+    # always_assert (init_external, reached via make_tensor_external in
+    # remote_wire.cpp / orchestrator.cpp). Mirrors the binding's CMake.
+    ${CMAKE_SOURCE_DIR}/../../../src/common/task_interface/assert_compat.cpp
 )
 target_include_directories(hierarchical_objs PUBLIC
     ${HIERARCHICAL_SRC_DIR}

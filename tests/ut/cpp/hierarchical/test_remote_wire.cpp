@@ -21,9 +21,9 @@
 
 namespace {
 
-ContinuousTensor metadata_tensor() {
-    ContinuousTensor t{};
-    t.data = 0;
+Tensor metadata_tensor() {
+    Tensor t{};
+    t.buffer.addr = 0;
     t.ndims = 1;
     t.shapes[0] = 4;
     t.dtype = DataType::UINT8;
@@ -88,7 +88,7 @@ TEST(RemoteWire, TaskPayloadRejectsNonZeroTensorData) {
     EXPECT_EQ(decoded.callable_digest[0], 0xAB);
     EXPECT_EQ(decoded.args.scalars[0], 0xCAFEu);
 
-    payload.args.tensor_metadata[0].data = 0x1234;
+    payload.args.tensor_metadata[0].buffer.addr = 0x1234;
     EXPECT_THROW((void)remote_l3::encode_task_payload(payload), std::runtime_error);
 }
 

@@ -36,35 +36,26 @@
 #include "pto_runtime2_types.h"  // PTO2_ERROR_*
 #include "pto_submit_types.h"    // MixedKernels, INVALID_KERNEL_ID, subtask slots
 #include "pto_types.h"           // Arg, TaskOutputTensors, TensorArgType
-#include "task_args.h"           // ChipStorageTaskArgs, ContinuousTensor
+#include "task_args.h"           // ChipStorageTaskArgs, Tensor
 #include "tensor.h"              // Tensor, TensorCreateInfo
 
 // =============================================================================
 // Tensor Factory Helpers
 // =============================================================================
 
-/**
- * Create a Tensor for pre-allocated external memory.
- */
-inline Tensor make_tensor_external(
-    void *addr, const uint32_t shapes[], uint32_t ndims, DataType dtype = DataType::FLOAT32, bool manual_dep = false,
-    int32_t version = 0
-) {
-    uint64_t total = 1;
-    for (uint32_t i = 0; i < ndims; i++) {
-        total *= shapes[i];
-    }
-    return {addr, total * get_element_size(dtype), shapes, ndims, dtype, version, manual_dep};
-}
+// make_tensor_external(...) — canonical factory for pre-allocated external
+// memory — is defined in the unified tensor.h (common), so host and runtime
+// build Tensors through the same controlled path.
 
-// Convert ContinuousTensor to Tensor
-static_assert(
-    CONTINUOUS_TENSOR_MAX_DIMS == RUNTIME_MAX_TENSOR_DIMS, "ContinuousTensor and runtime max dims must match"
-);
-inline Tensor from_tensor_arg(const ContinuousTensor &t, bool manual_dep = false, int32_t version = 0) {
-    return make_tensor_external(
-        reinterpret_cast<void *>(static_cast<uintptr_t>(t.data)), t.shapes, t.ndims, t.dtype, manual_dep, version
-    );
+// Adapt an orchestration-arg Tensor into a runtime Tensor, optionally setting
+// creator-only dependency tracking (manual_dep) and an initial version. Since
+// TaskArgs now carries Tensor directly, this is a copy with those two fields
+// applied; buffer / shapes / strides / start_offset / child_memory are kept.
+inline Tensor from_tensor_arg(const Tensor &t, bool manual_dep = false, int32_t version = 0) {
+    Tensor result = t;
+    result.manual_dep = manual_dep;
+    result.version = version;
+    return result;
 }
 
 // =============================================================================

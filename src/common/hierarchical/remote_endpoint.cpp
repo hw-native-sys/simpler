@@ -622,10 +622,10 @@ remote_l3::TaskPayloadWire RemoteL3Endpoint::build_task_payload(const TaskSlotSt
     payload.args.remote_desc.reserve(static_cast<size_t>(view.tensor_count));
 
     for (int32_t i = 0; i < view.tensor_count; ++i) {
-        ContinuousTensor tensor = view.tensors[i];
+        Tensor tensor = view.tensors[i];
         RemoteTensorSidecar tensor_sidecar{};
         if (!sidecar.tensors.empty()) tensor_sidecar = sidecar.tensors[static_cast<size_t>(i)];
-        if (tensor.data != 0 && !tensor_sidecar.present) {
+        if (tensor.buffer.addr != 0 && !tensor_sidecar.present) {
             throw std::runtime_error("RemoteL3Endpoint::run: bare host pointer submitted without remote sidecar");
         }
         if (tensor.is_child_memory() && !tensor_sidecar.present) {
@@ -634,7 +634,7 @@ remote_l3::TaskPayloadWire RemoteL3Endpoint::build_task_payload(const TaskSlotSt
         if (!tensor_sidecar.present && tensor.nbytes() != 0) {
             throw std::runtime_error("RemoteL3Endpoint::run: tensor payload submitted without remote sidecar");
         }
-        tensor.data = 0;
+        tensor.buffer.addr = 0;
         payload.args.tensor_metadata.push_back(tensor);
         payload.args.remote_desc.push_back(tensor_sidecar);
     }

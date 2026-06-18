@@ -287,7 +287,7 @@ WorkerCompletion LocalMailboxEndpoint::run(Ring *ring, const WorkerDispatch &dis
     std::memcpy(mbox() + MAILBOX_OFF_CONFIG, &s.config, sizeof(CallConfig));
 
     // Write length-prefixed TaskArgs blob: [T][S][tensors][scalars].
-    size_t blob_bytes = TASK_ARGS_BLOB_HEADER_SIZE + static_cast<size_t>(view.tensor_count) * sizeof(ContinuousTensor) +
+    size_t blob_bytes = TASK_ARGS_BLOB_HEADER_SIZE + static_cast<size_t>(view.tensor_count) * sizeof(Tensor) +
                         static_cast<size_t>(view.scalar_count) * sizeof(uint64_t);
     if (blob_bytes > MAILBOX_ARGS_CAPACITY) {
         completion.outcome = EndpointOutcome::ENDPOINT_FAILURE;
@@ -305,14 +305,13 @@ WorkerCompletion LocalMailboxEndpoint::run(Ring *ring, const WorkerDispatch &dis
     std::memcpy(d + 4, &view.scalar_count, sizeof(int32_t));
     if (view.tensor_count > 0) {
         std::memcpy(
-            d + TASK_ARGS_BLOB_HEADER_SIZE, view.tensors,
-            static_cast<size_t>(view.tensor_count) * sizeof(ContinuousTensor)
+            d + TASK_ARGS_BLOB_HEADER_SIZE, view.tensors, static_cast<size_t>(view.tensor_count) * sizeof(Tensor)
         );
     }
     if (view.scalar_count > 0) {
         std::memcpy(
-            d + TASK_ARGS_BLOB_HEADER_SIZE + static_cast<size_t>(view.tensor_count) * sizeof(ContinuousTensor),
-            view.scalars, static_cast<size_t>(view.scalar_count) * sizeof(uint64_t)
+            d + TASK_ARGS_BLOB_HEADER_SIZE + static_cast<size_t>(view.tensor_count) * sizeof(Tensor), view.scalars,
+            static_cast<size_t>(view.scalar_count) * sizeof(uint64_t)
         );
     }
 

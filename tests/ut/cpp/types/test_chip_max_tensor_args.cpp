@@ -21,9 +21,9 @@
 
 namespace {
 
-ContinuousTensor make_tensor(uint64_t addr) {
-    ContinuousTensor t{};
-    t.data = addr;
+Tensor make_tensor(uint64_t addr) {
+    Tensor t{};
+    t.buffer.addr = addr;
     t.shapes[0] = 1;
     t.ndims = 1;
     t.dtype = DataType::FLOAT32;
@@ -47,8 +47,8 @@ TEST(ChipMaxTensorArgs, ChipStorageHoldsAtLeast128Tensors) {
         ASSERT_NO_THROW(args.add_tensor(make_tensor(static_cast<uint64_t>(0x1000 + i))));
     }
     EXPECT_EQ(args.tensor_count(), 128);
-    EXPECT_EQ(args.tensor(0).data, 0x1000u);
-    EXPECT_EQ(args.tensor(127).data, 0x1000u + 127);
+    EXPECT_EQ(args.tensor(0).buffer.addr, 0x1000u);
+    EXPECT_EQ(args.tensor(127).buffer.addr, 0x1000u + 127);
 }
 
 TEST(ChipMaxTensorArgs, ChipStorageRejectsOverflow) {
@@ -60,7 +60,7 @@ TEST(ChipMaxTensorArgs, ChipStorageRejectsOverflow) {
 }
 
 TEST(ChipMaxTensorArgs, ViewToChipStorageAcceptsCap) {
-    std::vector<ContinuousTensor> tensors;
+    std::vector<Tensor> tensors;
     tensors.reserve(CHIP_MAX_TENSOR_ARGS);
     for (int i = 0; i < CHIP_MAX_TENSOR_ARGS; ++i) {
         tensors.push_back(make_tensor(static_cast<uint64_t>(0x2000 + i)));
@@ -70,11 +70,11 @@ TEST(ChipMaxTensorArgs, ViewToChipStorageAcceptsCap) {
     ChipStorageTaskArgs chip;
     ASSERT_NO_THROW(chip = view_to_chip_storage(view));
     EXPECT_EQ(chip.tensor_count(), CHIP_MAX_TENSOR_ARGS);
-    EXPECT_EQ(chip.tensor(CHIP_MAX_TENSOR_ARGS - 1).data, 0x2000u + CHIP_MAX_TENSOR_ARGS - 1);
+    EXPECT_EQ(chip.tensor(CHIP_MAX_TENSOR_ARGS - 1).buffer.addr, 0x2000u + CHIP_MAX_TENSOR_ARGS - 1);
 }
 
 TEST(ChipMaxTensorArgs, ViewToChipStorageRejectsOverflow) {
-    std::vector<ContinuousTensor> tensors(CHIP_MAX_TENSOR_ARGS + 1, make_tensor(0));
+    std::vector<Tensor> tensors(CHIP_MAX_TENSOR_ARGS + 1, make_tensor(0));
     TaskArgsView view{CHIP_MAX_TENSOR_ARGS + 1, 0, tensors.data(), nullptr};
     EXPECT_THROW(view_to_chip_storage(view), std::out_of_range);
 }

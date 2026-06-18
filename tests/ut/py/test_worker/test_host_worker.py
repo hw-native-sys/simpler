@@ -1515,7 +1515,7 @@ class TestScope:
 
 class TestOrchAlloc:
     def test_alloc_returns_valid_tensor(self):
-        """alloc returns a ContinuousTensor whose data ptr is non-zero and writeable."""
+        """alloc returns a Tensor whose data ptr is non-zero and writeable."""
         captured = []
 
         hw = Worker(level=3, num_sub_workers=1)
@@ -1629,7 +1629,7 @@ class TestOrchAlloc:
 class TestSubCallableArgs:
     def test_sub_callable_receives_tensor_metadata(self):
         """Sub callable receives TaskArgs with correct tensor count and shape."""
-        from simpler.task_interface import ContinuousTensor  # noqa: PLC0415
+        from simpler.task_interface import Tensor  # noqa: PLC0415
 
         result_shm, result_buf = _make_shared_counter()
         try:
@@ -1647,7 +1647,7 @@ class TestSubCallableArgs:
 
             # Use a synthetic non-zero pointer — sub callable only checks metadata,
             # doesn't dereference the pointer.
-            ct = ContinuousTensor.make(0xCAFE0000, (4,), DataType.FLOAT32)
+            ct = Tensor.make(0xCAFE0000, (4,), DataType.FLOAT32)
 
             def orch(o, args, cfg):
                 sub_args = TaskArgs()

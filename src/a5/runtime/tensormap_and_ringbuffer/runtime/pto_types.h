@@ -41,7 +41,7 @@
 #include "pto_submit_types.h"
 #include "task_args.h"
 #include "tensor.h"
-#include "tensor_arg.h"
+#include "tensor_create_info.h"  // runtime-only TensorCreateInfo + materialization helpers
 
 // Task arguments — alias the common CORE_MAX_* constants (single source of
 // truth in src/common/task_interface/arg_direction.h, transitively included
@@ -139,7 +139,7 @@ private:
 // Argument Types (for pto_submit_task API)
 // =============================================================================
 
-// TensorArgType is defined in tensor_arg.h (included above)
+// TensorArgType is defined in tensor.h (included via task_args.h above)
 
 /**
  * Tagged union for a single Arg slot — either a Tensor* or a TensorCreateInfo value.

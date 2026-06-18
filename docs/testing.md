@@ -480,7 +480,7 @@ ctest --test-dir tests/ut/cpp/build --output-on-failure
 
 Tests for the nanobind extension and the Python build pipeline:
 
-- `test_task_interface.py` — DataType, ContinuousTensor, ChipStorageTaskArgs, torch integration
+- `test_task_interface.py` — DataType, Tensor, ChipStorageTaskArgs, torch integration
 - `test_runtime_builder.py` — RuntimeBuilder discovery, error handling, build logic (mocked), and real compilation integration tests
 
 ```bash

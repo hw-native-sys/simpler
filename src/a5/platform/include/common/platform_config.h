@@ -240,7 +240,7 @@ constexpr int PLATFORM_DUMP_SLOT_COUNT = 4;
 constexpr uint64_t PLATFORM_DUMP_AVG_TENSOR_BYTES = 65536;
 
 /**
- * Maximum tensor dimensions (matches RUNTIME_MAX_TENSOR_DIMS).
+ * Maximum tensor dimensions (matches MAX_TENSOR_DIMS).
  */
 constexpr int PLATFORM_DUMP_MAX_DIMS = 5;
 

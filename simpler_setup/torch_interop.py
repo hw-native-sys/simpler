@@ -10,7 +10,7 @@
 """Torch integration helpers.
 
 Canonical home for torch-aware helpers that convert ``torch.Tensor`` and
-``torch.dtype`` values into the runtime's ``ContinuousTensor`` / ``DataType``
+``torch.dtype`` values into the runtime's ``Tensor`` / ``DataType``
 types. These helpers live in ``simpler_setup`` (not ``simpler``) so that the
 stable ``simpler`` runtime API can remain torch-free; torch integration is a
 setup-time/test-framework concern.
@@ -33,7 +33,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from simpler.task_interface import ContinuousTensor, DataType
+    from simpler.task_interface import DataType, Tensor
 
 _TORCH_DTYPE_MAP = None
 
@@ -68,17 +68,26 @@ def torch_dtype_to_datatype(dt) -> DataType:
     return _TORCH_DTYPE_MAP[dt]  # pyright: ignore[reportOptionalSubscript]
 
 
-def make_tensor_arg(tensor) -> ContinuousTensor:
-    """Create a ``ContinuousTensor`` from a torch.Tensor.
+def make_tensor_arg(tensor) -> Tensor:
+    """Create a ``Tensor`` from a torch.Tensor.
 
-    The tensor must be CPU-contiguous. Its ``data_ptr()``, shape, and dtype
-    are read and stored in the returned ``ContinuousTensor``.
+    The result is always contiguous (row-major strides, ``start_offset == 0``) —
+    the unified ``Tensor`` can express strided views, but this construction path
+    is constrained to contiguous memory. The input torch tensor MUST therefore be
+    contiguous; a non-contiguous tensor raises ``ValueError`` (call
+    ``.contiguous()`` first). Its ``data_ptr()``, shape, and dtype are read and
+    stored in the returned ``Tensor``.
     """
-    from simpler.task_interface import ContinuousTensor
+    from simpler.task_interface import Tensor
 
     _ensure_torch_map()
     dt = _TORCH_DTYPE_MAP.get(tensor.dtype)  # pyright: ignore[reportOptionalMemberAccess]
     if dt is None:
-        raise ValueError(f"Unsupported tensor dtype for ContinuousTensor: {tensor.dtype}")
+        raise ValueError(f"Unsupported tensor dtype for Tensor: {tensor.dtype}")
+    if not tensor.is_contiguous():
+        raise ValueError(
+            "make_tensor_arg requires a contiguous tensor (TaskArgs Tensors are constructed "
+            "contiguous); call tensor.contiguous() before passing it."
+        )
     shapes = tuple(int(s) for s in tensor.shape)
-    return ContinuousTensor.make(tensor.data_ptr(), shapes, dt)
+    return Tensor.make(tensor.data_ptr(), shapes, dt)

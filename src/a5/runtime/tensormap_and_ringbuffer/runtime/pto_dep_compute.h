@@ -49,7 +49,6 @@
 #include "pto_tensormap.h"
 #include "pto_types.h"  // TensorRef
 #include "tensor.h"
-#include "tensor_arg.h"  // TensorArgType
 
 /**
  * View struct for inputs to compute_task_fanin / register_task_outputs.

@@ -28,7 +28,7 @@
  * MTE pipes before ``RoundBarrier`` fires ``TNOTIFY`` (hand-written
  * equivalent of PTOAS v0.45's automatic ``emitTNotifyMteDrain``).
  *
- * args layout (passed as ContinuousTensor arg slots — see allreduce_ring_orch.cpp):
+ * args layout (passed as Tensor arg slots — see allreduce_ring_orch.cpp):
  *   tensor(0) = input    (host-backed, framework-supplied device addr)
  *   tensor(1) = output   (host-backed, framework-supplied device addr)
  *   tensor(2) = scratch  (HCCL window slot, cross-rank addressable)

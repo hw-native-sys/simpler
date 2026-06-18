@@ -57,12 +57,12 @@ static void run_lookup(PTO2TensorMap &tmap, const Tensor &tensor, TestLookupResu
 }
 
 static Tensor make_test_tensor(uint64_t addr, uint32_t shape0, uint32_t ndims = 1, int32_t version = 0) {
-    uint32_t shapes[RUNTIME_MAX_TENSOR_DIMS] = {shape0};
+    uint32_t shapes[MAX_TENSOR_DIMS] = {shape0};
     return make_tensor_external(reinterpret_cast<void *>(addr), shapes, ndims, DataType::FLOAT32, false, version);
 }
 
 static Tensor make_test_tensor_2d(uint64_t addr, uint32_t s0, uint32_t s1, int32_t version = 0) {
-    uint32_t shapes[RUNTIME_MAX_TENSOR_DIMS] = {s0, s1};
+    uint32_t shapes[MAX_TENSOR_DIMS] = {s0, s1};
     return make_tensor_external(reinterpret_cast<void *>(addr), shapes, 2, DataType::FLOAT32, false, version);
 }
 
