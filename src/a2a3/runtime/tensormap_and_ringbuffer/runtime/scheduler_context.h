@@ -1147,26 +1147,30 @@ private:
         if (slot_state.payload != nullptr)
         {
             volatile DeferredCompletionSlab *deferred_slab = &deferred_slab_per_core_[core_id][expected_reg_task_id & 1];
-            int32_t slab_err = deferred_slab->error_code;
-            if (slab_err != PTO2_ERROR_NONE)
-            {
-                int32_t expected = PTO2_ERROR_NONE;
-                sched_->sm_header->sched_error_code.compare_exchange_strong(expected, slab_err, std::memory_order_acq_rel, std::memory_order_acquire);
-                completed_.store(true, std::memory_order_release);
-                return;
-            }
-
+            // (q) Read count first. AICore only writes error_code as part of a
+            // condition-registration attempt that also increments count, so
+            // count == 0 ⇒ no error and no conditions to forward. This is the
+            // common path for kernels that don't use async waits (paged
+            // attention, GEMM, etc.) and saves an L1 load + branch per call.
             uint32_t cond_count = deferred_slab->count;
-            if (cond_count > MAX_COMPLETIONS_PER_TASK)
+            if (cond_count != 0)
             {
-                int32_t expected = PTO2_ERROR_NONE;
-                sched_->sm_header->sched_error_code.compare_exchange_strong(expected, PTO2_ERROR_ASYNC_REGISTRATION_FAILED, std::memory_order_acq_rel, std::memory_order_acquire);
-                completed_.store(true, std::memory_order_release);
-                return;
-            }
+                int32_t slab_err = deferred_slab->error_code;
+                if (slab_err != PTO2_ERROR_NONE)
+                {
+                    int32_t expected = PTO2_ERROR_NONE;
+                    sched_->sm_header->sched_error_code.compare_exchange_strong(expected, slab_err, std::memory_order_acq_rel, std::memory_order_acquire);
+                    completed_.store(true, std::memory_order_release);
+                    return;
+                }
+                if (cond_count > MAX_COMPLETIONS_PER_TASK)
+                {
+                    int32_t expected = PTO2_ERROR_NONE;
+                    sched_->sm_header->sched_error_code.compare_exchange_strong(expected, PTO2_ERROR_ASYNC_REGISTRATION_FAILED, std::memory_order_acq_rel, std::memory_order_acquire);
+                    completed_.store(true, std::memory_order_release);
+                    return;
+                }
 
-            if (cond_count > 0)
-            {
                 slot_state.any_subtask_deferred.store(true, std::memory_order_release);
 
                 const PTO2TaskId token = slot_state.task->task_id;
@@ -1487,9 +1491,9 @@ private:
                 for (int32_t si = 0; si < ring_task_count; si++)
                 {
                     PTO2TaskSlotState &slot_state = ring.get_slot_state_by_task_id(si);
-                    PTO2TaskState st = slot_state.task_state.load(std::memory_order_relaxed);
+                    // (m) task_state retired; use completion_flags directly.
                     bool fanin_ready = sched_->fanin_satisfied(&slot_state);
-                    if (st >= PTO2_TASK_COMPLETED) continue;
+                    if (ring.completion_flags[si & ring.task_window_mask].load(std::memory_order_relaxed) != 0) continue;
                     char running_on[192] = {0};
                     int32_t owner = -1;
                     int32_t pos = 0;

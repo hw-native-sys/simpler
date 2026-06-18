@@ -623,8 +623,8 @@ struct PTO2SchedulerState
     // notification edge is needed.
     void on_mixed_task_complete(PTO2TaskSlotState &slot_state, [[maybe_unused]] PTO2LocalReadyBuffer *local_bufs = nullptr)
     {
-        slot_state.task_state.store(PTO2_TASK_COMPLETED, std::memory_order_release);
-
+        // (m) Skip slot_state.task_state.store here; completion_flags below is
+        // the single source of truth. Saves one atomic release store per task.
         const int32_t my_id = static_cast<int32_t>(slot_state.task->task_id.local());
         int32_t ring_id = slot_state.ring_id;
         auto &rss = ring_sched_states[ring_id];
@@ -660,8 +660,10 @@ struct PTO2SchedulerState
         while (w < my_id)
         {
             int32_t next = w + 1;
-            PTO2TaskSlotState &cand = ring.get_slot_state_by_task_id(next);
-            if (cand.task_state.load(std::memory_order_acquire) != PTO2_TASK_COMPLETED) break;
+            // (m) Read completion_flags (already published by the candidate's
+            // completer) instead of cand.task_state — one fewer atomic store
+            // per task in the common path.
+            if (ring.completion_flags[next & ring.task_window_mask].load(std::memory_order_acquire) == 0) break;
             if (ring.completed_watermark.compare_exchange_weak(w, next, std::memory_order_acq_rel, std::memory_order_acquire))
             {
                 w = next;

@@ -217,9 +217,12 @@ inline bool wait_for_tensor_ready(PTO2Runtime *rt, const Tensor &tensor, bool wa
     auto wait_one_producer = [&](const PTO2TaskSlotState &slot) {
         uint8_t ring_id = slot.ring_id;
         int32_t local_id = static_cast<int32_t>(slot.task->task_id.local());
+        auto &ring_hdr = orch.sm_header->rings[ring_id];
+        const int32_t mask = ring_hdr.task_window_mask;
         uint64_t t0 = get_sys_cnt_aicpu();
         int32_t spin_count = 0;
-        while (slot.task_state.load(std::memory_order_acquire) < PTO2_TASK_COMPLETED)
+        // (m) Use completion_flags as the single completion signal.
+        while (ring_hdr.completion_flags[local_id & mask].load(std::memory_order_acquire) == 0)
         {
             SPIN_WAIT_HINT();
             if ((++spin_count & 1023) == 0 && get_sys_cnt_aicpu() - t0 > PTO2_TENSOR_DATA_TIMEOUT_CYCLES)

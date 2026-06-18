@@ -352,7 +352,7 @@ struct PTO2OrchestratorState
 
         if (prepared.slot_state != nullptr)
         {
-            prepared.slot_state->task_state.store(PTO2_TASK_COMPLETED, std::memory_order_release);
+            // (m) Inline completion uses completion_flags only.
             uint8_t ring_id = prepared.task_id.ring();
             orch->sm_header->rings[ring_id].completion_flags[prepared.alloc_result.slot].store(1, std::memory_order_release);
         }
