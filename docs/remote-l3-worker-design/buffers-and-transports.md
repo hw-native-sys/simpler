@@ -58,7 +58,7 @@ args.add_tensor(
     RemoteTensorRef(peer, offset=0, shape=(1024,), dtype=DataType.FLOAT32),
     TensorArgType.INPUT,
 )
-orch.submit_next_level(l3_handle, args, cfg, worker=peer_l3_endpoint)
+orch.submit_next_level(l3_handle, args, cfg, worker=peer_l3_worker_id)
 orch.drain()
 
 w4.remote_release_import(peer)
@@ -160,14 +160,14 @@ remote L3 worker cannot use a parent-host HeapRing pointer.
 Remote callers must allocate or import output storage explicitly before submit:
 
 ```python
-out = w4.remote_malloc(worker=l3_endpoint, nbytes=4096)
+out = w4.remote_malloc(worker=l3_worker_id, nbytes=4096)
 
 args = TaskArgs()
 args.add_tensor(
     RemoteTensorRef(out, offset=0, shape=(1024,), dtype=DataType.FLOAT32),
     TensorArgType.OUTPUT,
 )
-orch.submit_next_level(l3_handle, args, cfg, worker=l3_endpoint)
+orch.submit_next_level(l3_handle, args, cfg, worker=l3_worker_id)
 ```
 
 This keeps submit-time validation simple: the slot already carries complete

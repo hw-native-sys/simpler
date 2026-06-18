@@ -273,7 +273,7 @@ Scope:
 
 - `WorkerEndpoint` interface.
 - `LocalMailboxEndpoint` adapter.
-- Endpoint capability metadata and eligible endpoint sets.
+- Endpoint capability metadata and eligible worker-id sets.
 - `WorkerCompletion` outcome propagation.
 - Failed task poisoning.
 - Remote tensor sidecars and dependency keys, without a live remote session.
@@ -281,7 +281,7 @@ Scope:
 
 Acceptance criteria:
 
-- Scheduler chooses only eligible idle endpoints.
+- Scheduler chooses only eligible idle workers.
 - Worker affinity is validated against eligibility.
 - Group partial failure and downstream poison are tested.
 - Slot release and `drain()` behavior are correct after success and failure.

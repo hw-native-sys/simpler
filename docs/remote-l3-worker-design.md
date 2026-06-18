@@ -355,10 +355,10 @@ l3 = RemoteWorkerSpec(
     transport="roce",
 )
 
-l3_endpoint = w4.add_remote_worker(l3)
+l3_worker_id = w4.add_remote_worker(l3)
 l3_handle = w4.register(
     RemoteCallable("my_pkg.remote_orch:l3_orch"),
-    workers=[l3_endpoint],
+    workers=[l3_worker_id],
 )
 w4.init()
 ```

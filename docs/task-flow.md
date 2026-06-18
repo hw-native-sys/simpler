@@ -422,7 +422,7 @@ def my_l3_orch(orch, args, config):
 # L4 parent
 w4 = Worker(level=4, num_sub_workers=0)
 l3_handle = w4.register(my_l3_orch) # register L3 orch fn in Python dict
-l3_endpoint = w4.add_worker(l3)     # add un-init'd L3 Worker as child
+l3_worker_id = w4.add_worker(l3)    # add un-init'd L3 Worker as child
 w4.init()
 
 def my_l4_orch(orch, args, config):
@@ -430,7 +430,7 @@ def my_l4_orch(orch, args, config):
         l3_handle,
         TaskArgs(),
         CallConfig(),
-        worker=l3_endpoint,
+        worker=l3_worker_id,
     )
 
 w4.run(my_l4_orch)

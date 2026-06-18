@@ -191,7 +191,7 @@ def my_l3_orch(orch, args, config):
 # L4 parent
 w4 = Worker(level=4, num_sub_workers=0)
 l3_handle = w4.register(my_l3_orch)
-l3_endpoint = w4.add_worker(l3)
+l3_worker_id = w4.add_worker(l3)
 w4.init()
 
 def my_l4_orch(orch, args, config):
