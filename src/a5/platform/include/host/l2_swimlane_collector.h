@@ -468,11 +468,6 @@ private:
     uint64_t total_sched_phase_collected_{0};
     uint64_t total_orch_phase_collected_{0};
 
-    // Allocate a single buffer (any of the L2SwimlaneAicpu*Buffer kinds) and register it.
-    // The RAII counterpart ``release_one_buffer`` lives on ProfilerBase and
-    // is shared with every other collector.
-    void *alloc_single_buffer(size_t size, void **host_ptr_out);
-
     // Per-buffer-kind handlers used by on_buffer_collected.
     void copy_perf_buffer(const ReadyBufferInfo &info);
     void copy_sched_phase_buffer(const ReadyBufferInfo &info);
