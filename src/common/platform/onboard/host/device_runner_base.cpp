@@ -278,13 +278,13 @@ int DeviceRunnerBase::ensure_binaries_loaded() {
     }
     LOG_INFO_V2("DeviceRunner: inner SO uploaded to preinstall via dispatcher bootstrap");
 
-    // JSON-register the inner SO and resolve simpler_aicpu_init / _exec handles.
+    // JSON-register the inner SO and resolve the simpler_aicpu_exec handle.
     rc = load_aicpu_op_.Init();
     if (rc != 0) {
         LOG_ERROR("LoadAicpuOp::Init failed: %d", rc);
         return rc;
     }
-    LOG_INFO_V2("DeviceRunner: inner SO registered (simpler_aicpu_init/exec handles ready)");
+    LOG_INFO_V2("DeviceRunner: inner SO registered (simpler_aicpu_exec handle ready)");
 
     // H2D the per-task DeviceArgs struct itself. device_args_.aicpu_so_bin/len
     // stay zero — our own per-task AICPU code (launched via rtsLaunchCpuKernel
@@ -636,10 +636,10 @@ BindCallableResult DeviceRunnerBase::bind_callable_to_runtime(Runtime &runtime, 
 int DeviceRunnerBase::launch_aicpu_kernel(
     rtStream_t stream, KernelArgs *k_args, const char *kernel_name, int aicpu_num
 ) {
-    // kernel_name is host::KernelNames::InitName / RunName — the runtime SO's
-    // actual exported symbol (simpler_aicpu_init / simpler_aicpu_exec).
-    // LaunchBuiltInOp dispatches via rtsLaunchCpuKernel on the cached
-    // rtFuncHandle resolved by LoadAicpuOp::Init at first-time bootstrap.
+    // kernel_name is host::KernelNames::RunName — the runtime SO's actual
+    // exported symbol (simpler_aicpu_exec). LaunchBuiltInOp dispatches via
+    // rtsLaunchCpuKernel on the cached rtFuncHandle resolved by
+    // LoadAicpuOp::Init at first-time bootstrap.
     return load_aicpu_op_.LaunchBuiltInOp(stream, k_args, aicpu_num, kernel_name);
 }
 
@@ -799,12 +799,34 @@ int DeviceRunnerBase::validate_launch_aicpu_num(int launch_aicpu_num) {
 }
 
 void DeviceRunnerBase::ensure_device_wall_buffer() {
-    if (device_wall_dev_ptr_ != nullptr) return;
-    device_wall_dev_ptr_ = allocate_tensor(sizeof(uint64_t));
+    // Run-wall slots: one { start_cycle, end_cycle } pair per launched AICPU
+    // thread. Each surviving AICPU thread writes its own slot (plain stores,
+    // no atomics); read_device_wall_ns() reduces max(end) - min(start). The
+    // buffer is allocated once (lazy) but RESET every run so a stale prior
+    // run cannot leak into the reduction.
+    constexpr int kWallSlots = PLATFORM_MAX_AICPU_THREADS_JUST_FOR_LAUNCH;
+    constexpr size_t kWallBytes = static_cast<size_t>(kWallSlots) * 2 * sizeof(uint64_t);
+    if (device_wall_dev_ptr_ == nullptr) {
+        device_wall_dev_ptr_ = allocate_tensor(kWallBytes);
+        if (device_wall_dev_ptr_ != nullptr) {
+            kernel_args_.args.device_wall_data_base = reinterpret_cast<uint64_t>(device_wall_dev_ptr_);
+        }
+    }
     if (device_wall_dev_ptr_ != nullptr) {
-        kernel_args_.args.device_wall_data_base = reinterpret_cast<uint64_t>(device_wall_dev_ptr_);
-        uint64_t zero = 0;
-        (void)copy_to_device(device_wall_dev_ptr_, &zero, sizeof(uint64_t));
+        uint64_t init[kWallSlots * 2];
+        for (int i = 0; i < kWallSlots; ++i) {
+            init[i * 2] = UINT64_MAX;  // start: MAX so min() ignores unused slots
+            init[i * 2 + 1] = 0;       // end: 0 so max() ignores unused slots
+        }
+        if (copy_to_device(device_wall_dev_ptr_, init, sizeof(init)) != 0) {
+            // Reset failed — disable wall capture for this run so stale slot
+            // data can't leak into the reduction. Cleared pointer means the
+            // buffer is re-allocated (and re-reset) on the next run.
+            LOG_WARN("device_wall reset H2D failed; disabling wall capture this run");
+            free_tensor(device_wall_dev_ptr_);
+            device_wall_dev_ptr_ = nullptr;
+            kernel_args_.args.device_wall_data_base = 0;
+        }
     }
 }
 
@@ -907,14 +929,29 @@ void DeviceRunnerBase::read_device_wall_ns() {
     // writes to its local copy don't propagate to device_k_args_.)
     // Failure path is a soft warn — wall stays zero.
     device_wall_ns_ = 0;
-    if (device_wall_dev_ptr_ != nullptr) {
-        int wall_rc = rtMemcpy(
-            &device_wall_ns_, sizeof(uint64_t), device_wall_dev_ptr_, sizeof(uint64_t), RT_MEMCPY_DEVICE_TO_HOST
-        );
-        if (wall_rc != 0) {
-            LOG_WARN("rtMemcpy(device_wall_ns) D2H failed: %d", wall_rc);
-            device_wall_ns_ = 0;
-        }
+    if (device_wall_dev_ptr_ == nullptr) return;
+
+    constexpr int kWallSlots = PLATFORM_MAX_AICPU_THREADS_JUST_FOR_LAUNCH;
+    uint64_t buf[kWallSlots * 2] = {};
+    int wall_rc = rtMemcpy(buf, sizeof(buf), device_wall_dev_ptr_, sizeof(buf), RT_MEMCPY_DEVICE_TO_HOST);
+    if (wall_rc != 0) {
+        LOG_WARN("rtMemcpy(device_wall) D2H failed: %d", wall_rc);
+        return;
+    }
+
+    // Reduce the per-thread slots: wall = max(end) - min(start) in cycles,
+    // converted to ns. Unused/dropped slots stay at { MAX, 0 } from the reset
+    // and are skipped by the sentinel checks.
+    uint64_t min_start = UINT64_MAX;
+    uint64_t max_end = 0;
+    for (int i = 0; i < kWallSlots; ++i) {
+        uint64_t s = buf[i * 2];
+        uint64_t e = buf[i * 2 + 1];
+        if (s != UINT64_MAX && s < min_start) min_start = s;
+        if (e > max_end) max_end = e;
+    }
+    if (min_start != UINT64_MAX && max_end > min_start) {
+        device_wall_ns_ = static_cast<uint64_t>(cycles_to_us(max_end - min_start) * 1000.0);
     }
 }
 

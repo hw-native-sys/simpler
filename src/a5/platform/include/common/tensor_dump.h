@@ -229,7 +229,7 @@ struct DumpReadyQueueEntry {
  */
 
 // Tensor-dump level. Carried in DumpDataHeader so the
-// AICPU latches the mode in dump_tensor_init() before any task is dispatched.
+// AICPU latches the mode in dump_args_init() before any task is dispatched.
 enum class DumpTensorLevel : uint32_t {
     OFF = 0,             // no dump
     PARTIAL = 1,         // only args marked with Arg::dump(...)

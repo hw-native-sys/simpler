@@ -1,5 +1,9 @@
 name: CI
 
+permissions:
+  contents: read
+  pull-requests: read
+
 on:
   pull_request:
     branches: [main]
@@ -246,7 +250,7 @@ jobs:
         run: |
           pytest tests/st/a2a3/tensormap_and_ringbuffer/dfx/tensor_dump/test_tensor_dump.py \
             --platform a2a3sim --device 0-15 -p no:xdist --pto-session-timeout 600 \
-            --dump-tensor --clone-protocol https --pto-isa-commit ${{ env.PTO_ISA_COMMIT }}
+            --dump-args --clone-protocol https --pto-isa-commit ${{ env.PTO_ISA_COMMIT }}
 
   st-sim-a5:
     needs: detect-changes
@@ -306,11 +310,11 @@ jobs:
 
   # ---------- Profiling sub-flags smoke (compile + run) ----------
   # PTO2_PROFILING / PTO2_ORCH_PROFILING / PTO2_SCHED_PROFILING /
-  # PTO2_TENSORMAP_PROFILING are compile-time gates in src/{a2a3,a5}/runtime/
-  # tensormap_and_ringbuffer/runtime/pto_runtime2_types.h. The defaults
-  # (PTO2_PROFILING=1, sub-flags=0) are exercised by every CI job, but the
-  # non-default branches are dead coverage today — a developer flipping any
-  # of them for perf debugging or to minimize logging overhead had no gate
+  # PTO2_TENSORMAP_PROFILING are compile-time gates whose defaults and
+  # dependency checks live in src/common/task_interface/profiling_config.h.
+  # The defaults (PTO2_PROFILING=1, sub-flags=0) are exercised by every CI job,
+  # but non-default branches are otherwise dead coverage: a developer flipping
+  # any of them for perf debugging or to minimize logging overhead had no gate
   # protecting the gated code from drift (renamed fields, changed signatures,
   # format-string mismatches in LOG_INFO summaries, dead parameters caught
   # only by -Wunused-parameter -Werror).
@@ -577,7 +581,7 @@ jobs:
           source .venv/bin/activate
           python -m pytest tests/st/a2a3/tensormap_and_ringbuffer/dfx/tensor_dump/test_tensor_dump.py \
             --platform a2a3 --device ${DEVICE_RANGE} -p no:xdist --pto-session-timeout 600 \
-            --dump-tensor --clone-protocol ssh --pto-isa-commit ${{ env.PTO_ISA_COMMIT }}
+            --dump-args --clone-protocol ssh --pto-isa-commit ${{ env.PTO_ISA_COMMIT }}
 
 
   # ---------- Detect platform-specific changes (runs on GitHub server) ----------

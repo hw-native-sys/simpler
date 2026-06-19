@@ -14,6 +14,7 @@
 #include <cstdint>
 #include <cstring>
 #include <stdexcept>
+#include <unordered_set>
 
 #include "worker_manager.h"
 
@@ -510,16 +511,22 @@ void Orchestrator::infer_deps(
     const std::vector<RemoteTaskArgsSidecar> &remote_sidecars, std::vector<TaskSlot> &producers,
     std::vector<TensorKey> &output_keys
 ) {
+    std::unordered_set<TaskSlot> producer_seen;
+    size_t tensor_count_hint = 0;
+    for (const TaskArgs &args : args_list) {
+        tensor_count_hint += static_cast<size_t>(args.tensor_count());
+    }
+    producer_seen.reserve(tensor_count_hint);
+
     auto add_unique_producer = [&](TaskSlot p) {
         // Group submits walk many TaskArgs under one slot: if two entries in
         // the same group tag the same buffer (e.g. both OUTPUT 0xCAFE), the
         // second-pass lookup would return the slot that the first pass just
         // inserted — a self-loop. Skip it.
         if (p == slot) return;
-        for (TaskSlot existing : producers) {
-            if (existing == p) return;
+        if (producer_seen.insert(p).second) {
+            producers.push_back(p);
         }
-        producers.push_back(p);
     };
 
     // Tag-driven dependency inference — mirrors L2

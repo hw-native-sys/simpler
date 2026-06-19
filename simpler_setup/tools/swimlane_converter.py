@@ -1162,6 +1162,11 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
         phase_colors = {
             "complete": "good",  # green
             "dispatch": "terrible",  # red
+            "poll": "yellow",  # completion-poll that scanned but retired nothing
+            "release": "olive",  # deferred-release drain (on_task_release work)
+            "fanout": "vsync_highlight_color",  # nested in complete: fanin + doorbells
+            "scan": "thread_state_iowait",  # one running-core MMIO COND scan pass
+            "prestage": "rail_animation",  # speculative early-dispatch (Hook 1) staging
         }
 
         # Per-complete subtask-finish counts surface "how many AICore FINs
@@ -1230,12 +1235,13 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
                 }
             )
 
-            # Render only the work phases (complete / dispatch). Legacy
-            # captures may carry "idle" / "scan" records from older builds;
-            # drop them so the lane shows only actual work.
+            # Render work phases (complete / dispatch) plus the real operations
+            # that otherwise hide inside an idle stretch (poll = completion-scan
+            # that retired nothing; release = on_task_release drain). Genuine
+            # spin emits no record and shows as a blank gap.
             for record in thread_records:
                 phase = record.get("phase", "unknown")
-                if phase not in ("complete", "dispatch"):
+                if phase not in ("complete", "dispatch", "poll", "release", "fanout", "scan", "prestage"):
                     continue
                 start_us = record["start_time_us"]
                 end_us = record["end_time_us"]
@@ -1307,7 +1313,11 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
                 # SAME ts (e.g. final-drain emit where start_time==end_time)
                 # also breaks Perfetto's rate calc (divide-by-zero → NULL).
                 # Track name carries thread index so it reads standalone
-                # even with the thread tree collapsed.
+                # even with the thread tree collapsed. Only complete/dispatch
+                # carry real queue depths; poll/release/fanout zero-fill them,
+                # so skip their counter samples to avoid spurious 0 dips.
+                if phase not in ("complete", "dispatch"):
+                    continue
                 if not depths_valid:
                     continue
                 local_track_name = f"local_ready_buf_T{thread_idx}"

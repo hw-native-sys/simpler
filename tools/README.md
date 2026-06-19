@@ -85,3 +85,29 @@ correctness. Read this first if you want to add new AICPU work to this
 repo. See the tool's own
 [README](./cann-examples/aicpu-kernel-launch/README.md) for the
 pipeline diagram, I/O contract, and Path A vs Path B (#822) notes.
+
+### cann-examples/aicpu-mmio-probes
+
+AICPU-side MMIO microbenchmarks. No AICore involvement. Measures STR
+DMB cost (single + burst), STR + LDR round trip, single-thread LDR COND
+serialization (same core / rotating cores), and multi-thread parallel
+scaling. Reproduces Phase 4 + Phase 12 of
+[`docs/hardware/mmio-performance.md`](../docs/hardware/mmio-performance.md);
+the multi-thread test is the one that directly refutes "polling COND
+from AICPU is sequential". See the tool's own
+[README](./cann-examples/aicpu-mmio-probes/README.md) for build and
+expected output.
+
+### cann-examples/aicore-notification-perf
+
+End-to-end measurement of the **two AICore→AICPU notification paths**:
+`GM + dcci` vs `COND register (MMIO Device-nGnRE)`. Runs an AICore
+producer and an AICPU consumer concurrently on two streams, computes
+single-event E2E latency and idle-state polling LDR rate for both
+paths. Reproduces Phase 13 + Phase 14 of
+[`docs/investigations/2026-06-cond-vs-gm-notification.md`](../docs/investigations/2026-06-cond-vs-gm-notification.md)
+standalone — no dependency on this repo's runtime. Use as a template
+when adding a new notification mechanism that needs head-to-head
+comparison with the existing two. See the tool's own
+[README](./cann-examples/aicore-notification-perf/README.md) for the
+pipeline diagram, build steps, and expected numbers.

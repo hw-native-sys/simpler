@@ -235,8 +235,8 @@ void SchedulerContext::dispatch_block(
     bool to_pending, int32_t block_idx
 ) {
 #if PTO2_PROFILING
-    if (is_dump_tensor_enabled()) {
-        dump_tensors_for_task<PTO2_SUBTASK_SLOT_COUNT>(
+    if (is_dump_args_enabled()) {
+        dump_args_for_task<PTO2_SUBTASK_SLOT_COUNT>(
             thread_idx, slot_state, TensorDumpStage::BEFORE_DISPATCH,
             [](ActiveMask active_mask, int raw_subtask_id) {
                 return active_mask.subtask_active(static_cast<PTO2SubtaskSlot>(raw_subtask_id));
@@ -488,8 +488,8 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
         LOG_INFO_V0("Thread %d: doing one-time init", thread_idx);
 
 #if PTO2_PROFILING
-        if (is_dump_tensor_enabled()) {
-            dump_tensor_init(orch_to_sched_ ? aicpu_thread_num_ : sched_thread_num_);
+        if (is_dump_args_enabled()) {
+            dump_args_init(orch_to_sched_ ? aicpu_thread_num_ : sched_thread_num_);
         }
         if (is_pmu_enabled()) {
             pmu_aicpu_init(physical_core_ids_, cores_total_num_);
@@ -947,8 +947,8 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
     }
 #endif
 #if PTO2_PROFILING
-    if (is_dump_tensor_enabled()) {
-        dump_tensor_flush(thread_idx);
+    if (is_dump_args_enabled()) {
+        dump_args_flush(thread_idx);
     }
 #endif
 #if PTO2_PROFILING

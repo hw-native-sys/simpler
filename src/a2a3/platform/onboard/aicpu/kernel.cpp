@@ -24,65 +24,36 @@
 #include "aicpu/tensor_dump_aicpu.h"
 #include "runtime.h"
 
-// Run-wall capture: g_device_start_cycle is set once in
-// simpler_aicpu_init (single-threaded launch); each thread
-// of the multi-threaded simpler_aicpu_exec writes the converted
-// (end - start) into KernelArgs.device_wall_ns on exit. Plain stores —
-// last-writer-wins is fine for wall measurement (concurrent exiting threads'
-// `my_end` values differ by µs, the final overwrite is within benchmark
-// noise of the true max-end - min-start).
-static uint64_t g_device_start_cycle = 0;
+// Run-wall capture: the host allocates a device buffer addressed by
+// KernelArgs.device_wall_data_base holding one { start_cycle, end_cycle } pair
+// per launched AICPU thread (PLATFORM_MAX_AICPU_THREADS_JUST_FOR_LAUNCH pairs,
+// raw sys-counter cycles), and resets it to { UINT64_MAX, 0 } before each run.
+// Every surviving simpler_aicpu_exec thread writes its own start/end into its
+// own slot (indexed by platform_aicpu_affinity_thread_idx()) — plain stores,
+// no cross-thread atomics. The host reads the whole array and reduces once:
+// wall = max(end) - min(start). No single-threaded pre-pass is needed to
+// seed the start.
 
 // Forward declaration of aicpu_execute (implemented in aicpu_executor.cpp)
 extern "C" int aicpu_execute(Runtime *arg);
 
 /**
- * AICPU kernel initialization entry point.
+ * AICPU kernel main execution entry point — the runtime SO's sole entry point.
  *
- * Called once per run by the main aicpu_scheduler. Host registers this SO
- * via `rtsBinaryLoadFromFile` (JSON load, cpuKernelMode=0) and resolves
- * this symbol via `rtsFuncGetByName`; the per-task launch goes through
- * `rtsLaunchCpuKernel` on the cached `rtFuncHandle`. The bootstrap
- * dispatcher only writes this SO to the preinstall path — it does not
- * dlsym these symbols itself.
- *
- * @param arg Pointer to KernelArgs structure
- * @return 0 on success, -1 on error
- */
-extern "C" __attribute__((visibility("default"))) int simpler_aicpu_init(void *arg) {
-    init_log_switch();
-    if (arg == nullptr) {
-        LOG_ERROR("%s", "Invalid kernel arguments: null pointer");
-        return -1;
-    }
-    auto k_args = (KernelArgs *)arg;
-    set_log_level(static_cast<int>(k_args->log_level));
-    set_log_info_v(static_cast<int>(k_args->log_info_v));
-
-    // Init is launched single-threaded (block_dim=1), so the race-free spot
-    // to capture run start and reset the wall accumulator. Subsequent
-    // simpler_aicpu_exec threads stamp end on their way out, via
-    // the device-resident 8-byte buffer addressed by device_wall_data_base.
-    g_device_start_cycle = get_sys_cnt_aicpu();
-    if (k_args->device_wall_data_base != 0) {
-        *reinterpret_cast<uint64_t *>(k_args->device_wall_data_base) = 0;
-    }
-
-    LOG_INFO_V0("%s", "Runtime Executor Init: Initializing AICPU kernel");
-    return 0;
-}
-
-/**
- * AICPU kernel main execution entry point.
- *
- * Called per-thread by the main aicpu_scheduler via the cached
- * `rtFuncHandle` resolved during host-side init (see
- * `simpler_aicpu_init` docstring for the load path).
+ * Called per-thread by the main aicpu_scheduler. Host registers this SO via
+ * `rtsBinaryLoadFromFile` (JSON load, cpuKernelMode=0) and resolves this
+ * symbol via `rtsFuncGetByName`; each per-task launch goes through
+ * `rtsLaunchCpuKernel` on the cached `rtFuncHandle`. The bootstrap dispatcher
+ * only writes this SO to the preinstall path — it does not dlsym this symbol
+ * itself.
  *
  * @param arg Pointer to KernelArgs structure containing runtime_args
  * @return 0 on success, non-zero on error
  */
 extern "C" __attribute__((visibility("default"))) int simpler_aicpu_exec(void *arg) {
+    // Snapshot CANN log severity. Idempotent across the concurrent exec
+    // threads — same snapshot value.
+    init_log_switch();
     if (arg == nullptr) {
         LOG_ERROR("%s", "Invalid kernel arguments: null pointer");
         return -1;
@@ -108,7 +79,7 @@ extern "C" __attribute__((visibility("default"))) int simpler_aicpu_exec(void *a
     // Device ordinal for per-device orchestration-SO naming in the executor.
     set_orch_device_id(static_cast<int>(k_args->device_id));
     set_platform_dump_base(k_args->dump_data_base);
-    set_dump_tensor_enabled(GET_PROFILING_FLAG(k_args->enable_profiling_flag, PROFILING_FLAG_DUMP_TENSOR));
+    set_dump_args_enabled(GET_PROFILING_FLAG(k_args->enable_profiling_flag, PROFILING_FLAG_DUMP_TENSOR));
     set_platform_l2_swimlane_base(k_args->l2_swimlane_data_base);
     set_platform_l2_swimlane_aicore_rotation_table(k_args->l2_swimlane_aicore_rotation_table);
     set_l2_swimlane_enabled(GET_PROFILING_FLAG(k_args->enable_profiling_flag, PROFILING_FLAG_L2_SWIMLANE));
@@ -126,6 +97,15 @@ extern "C" __attribute__((visibility("default"))) int simpler_aicpu_exec(void *a
         return 0;
     }
 
+    // Run-wall: record this thread's start into its own slot (plain store,
+    // no cross-thread contention). Slot = affinity-gate exec index.
+    const int32_t wall_slot = platform_aicpu_affinity_thread_idx();
+    uint64_t *const wall = reinterpret_cast<uint64_t *>(k_args->device_wall_data_base);
+    const bool wall_ok = wall != nullptr && wall_slot >= 0 && wall_slot < PLATFORM_MAX_AICPU_THREADS_JUST_FOR_LAUNCH;
+    if (wall_ok) {
+        wall[wall_slot * 2] = get_sys_cnt_aicpu();
+    }
+
     LOG_INFO_V0("%s", "simpler_aicpu_exec: Calling aicpu_execute with Runtime");
     int rc = aicpu_execute(runtime);
     if (rc != 0) {
@@ -134,13 +114,10 @@ extern "C" __attribute__((visibility("default"))) int simpler_aicpu_exec(void *a
     }
     LOG_INFO_V0("%s", "simpler_aicpu_exec: aicpu_execute completed successfully");
 
-    // Stamp end into the device_wall buffer (addressed via
-    // device_wall_data_base). Last-writer-wins across threads — wall
-    // measurements are µs-scale tolerant, see g_device_start_cycle comment.
-    uint64_t my_end = get_sys_cnt_aicpu();
-    if (k_args->device_wall_data_base != 0 && my_end > g_device_start_cycle) {
-        *reinterpret_cast<uint64_t *>(k_args->device_wall_data_base) =
-            static_cast<uint64_t>(cycles_to_us(my_end - g_device_start_cycle) * 1000.0);
+    // Run-wall: record this thread's end into its own slot (plain store).
+    // Host reduces max(end) - min(start) → ns (see wall-capture note above).
+    if (wall_ok) {
+        wall[wall_slot * 2 + 1] = get_sys_cnt_aicpu();
     }
 
     return rc;

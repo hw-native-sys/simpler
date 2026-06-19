@@ -170,15 +170,15 @@ void TensorDumpCollector::start_writer_thread_once() {
     writer_started_ = true;
 
     // `output_prefix_` is captured at initialize() time and is the per-task
-    // uniqueness boundary; the dump dir name is fixed (`<prefix>/tensor_dump`).
-    std::string base_name = "tensor_dump";
-    run_dir_ = std::filesystem::path(output_prefix_) / base_name;
+    // uniqueness boundary; the dump dir name is fixed (`<prefix>/args_dump`).
+    std::string run_dir_name = "args_dump";
+    run_dir_ = std::filesystem::path(output_prefix_) / run_dir_name;
     std::filesystem::create_directories(run_dir_);
     // FULL_JSON_ONLY captures no payload (device sets payload_size == 0), so
     // there is nothing to stream — skip the .bin file rather than leaving a
     // 0-byte artifact next to the manifest.
     if (dump_tensor_level_ != DumpTensorLevel::FULL_JSON_ONLY) {
-        bin_file_.open(run_dir_ / (base_name + ".bin"), std::ios::binary);
+        bin_file_.open(run_dir_ / "args.bin", std::ios::binary);
     }
     next_bin_offset_ = 0;
 
@@ -313,7 +313,7 @@ void TensorDumpCollector::on_buffer_collected(const DumpReadyBufferInfo &info) {
     if (std::chrono::duration_cast<std::chrono::seconds>(now - last_progress_time_).count() >= 5) {
         auto elapsed_s = std::chrono::duration_cast<std::chrono::seconds>(now - run_start_time_).count();
         LOG_INFO_V0(
-            "Collecting: %zu tensors, %.1f GB written (%lds)", collected_.size(), bytes_written_.load() / 1e9, elapsed_s
+            "Collecting: %zu args, %.1f GB written (%lds)", collected_.size(), bytes_written_.load() / 1e9, elapsed_s
         );
         last_progress_time_ = now;
     }
@@ -525,7 +525,7 @@ int TensorDumpCollector::export_dump_files() {
                 std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now() - run_start_time_)
                     .count();
             LOG_INFO_V0(
-                "Writing to disk: %.1f GB written, %zu tensors remaining (%lds)", bytes_written_.load() / 1e9,
+                "Writing to disk: %.1f GB written, %zu args remaining (%lds)", bytes_written_.load() / 1e9,
                 write_queue_.size(), elapsed_s
             );
             std::this_thread::sleep_for(std::chrono::seconds(1));
@@ -539,13 +539,13 @@ int TensorDumpCollector::export_dump_files() {
             std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - run_start_time_)
                 .count();
         LOG_INFO_V0(
-            "Collected %zu tensors, wrote %.1f GB to disk (%.1fs)", collected_.size(), bytes_written_.load() / 1e9,
+            "Collected %zu args, wrote %.1f GB to disk (%.1fs)", collected_.size(), bytes_written_.load() / 1e9,
             elapsed_ms / 1000.0
         );
     }
 
     if (collected_.empty()) {
-        LOG_WARN("No tensor dump data to export");
+        LOG_WARN("No args dump data to export");
         writer_started_ = false;
         return 0;
     }
@@ -558,13 +558,13 @@ int TensorDumpCollector::export_dump_files() {
         return static_cast<uint8_t>(a.role) < static_cast<uint8_t>(b.role);
     });
 
-    LOG_INFO_V0("Writing JSON manifest for %zu tensors...", collected_.size());
+    LOG_INFO_V0("Writing JSON manifest for %zu args...", collected_.size());
 
     uint32_t num_before_dispatch = 0;
     uint32_t num_after_completion = 0;
-    uint32_t num_input_tensors = 0;
-    uint32_t num_output_tensors = 0;
-    uint32_t num_inout_tensors = 0;
+    uint32_t num_input_args = 0;
+    uint32_t num_output_args = 0;
+    uint32_t num_inout_args = 0;
     for (const auto &dt : collected_) {
         if (dt.stage == TensorDumpStage::BEFORE_DISPATCH) {
             num_before_dispatch++;
@@ -573,40 +573,40 @@ int TensorDumpCollector::export_dump_files() {
         }
         switch (dt.role) {
         case TensorDumpRole::INPUT:
-            num_input_tensors++;
+            num_input_args++;
             break;
         case TensorDumpRole::OUTPUT:
-            num_output_tensors++;
+            num_output_args++;
             break;
         case TensorDumpRole::INOUT:
-            num_inout_tensors++;
+            num_inout_args++;
             break;
         }
     }
 
-    std::string base_name = run_dir_.filename().string();
-    std::ofstream json(run_dir_ / (base_name + ".json"));
+    std::string run_dir_name = run_dir_.filename().string();
+    std::ofstream json(run_dir_ / "args_dump.json");
     json << "{\n";
-    json << "  \"run_dir\": \"" << base_name << "\",\n";
+    json << "  \"run_dir\": \"" << run_dir_name << "\",\n";
     json << "  \"bin_format\": {\n";
     json << "    \"type\": \"logical_contiguous\",\n";
     json << "    \"byte_order\": \"little_endian\"\n";
     json << "  },\n";
-    json << "  \"total_tensors\": " << collected_.size() << ",\n";
+    json << "  \"total_args\": " << collected_.size() << ",\n";
     json << "  \"before_dispatch\": " << num_before_dispatch << ",\n";
     json << "  \"after_completion\": " << num_after_completion << ",\n";
-    json << "  \"input_tensors\": " << num_input_tensors << ",\n";
-    json << "  \"output_tensors\": " << num_output_tensors << ",\n";
-    json << "  \"inout_tensors\": " << num_inout_tensors << ",\n";
-    json << "  \"truncated_tensors\": " << total_truncated_count_ << ",\n";
+    json << "  \"input_args\": " << num_input_args << ",\n";
+    json << "  \"output_args\": " << num_output_args << ",\n";
+    json << "  \"inout_args\": " << num_inout_args << ",\n";
+    json << "  \"truncated_args\": " << total_truncated_count_ << ",\n";
     json << "  \"dropped_records\": " << total_dropped_record_count_ << ",\n";
     json << "  \"dropped_overwrite\": " << total_overwrite_count_ << ",\n";
     if (dump_tensor_level_ == DumpTensorLevel::FULL_JSON_ONLY) {
         json << "  \"bin_file\": null,\n";
     } else {
-        json << "  \"bin_file\": \"" << base_name << ".bin\",\n";
+        json << "  \"bin_file\": \"args.bin\",\n";
     }
-    json << "  \"tensors\": [\n";
+    json << "  \"args\": [\n";
 
     bool first_entry = true;
 
@@ -645,11 +645,11 @@ int TensorDumpCollector::export_dump_files() {
 
     auto export_end = std::chrono::steady_clock::now();
     auto total_ms = std::chrono::duration_cast<std::chrono::milliseconds>(export_end - export_start).count();
-    LOG_INFO_V0("Wrote JSON manifest (%zu tensors) to %s (%ldms)", collected_.size(), run_dir_.c_str(), total_ms);
+    LOG_INFO_V0("Wrote JSON manifest (%zu args) to %s (%ldms)", collected_.size(), run_dir_.c_str(), total_ms);
 
     if (total_truncated_count_ > 0 || total_dropped_record_count_ > 0 || total_overwrite_count_ > 0) {
         LOG_WARN(
-            "Tensor dump anomalies: truncated=%u, dropped_records=%u, overwritten=%u", total_truncated_count_,
+            "Args dump anomalies: truncated=%u, dropped_records=%u, overwritten=%u", total_truncated_count_,
             total_dropped_record_count_, total_overwrite_count_
         );
     }

@@ -365,20 +365,14 @@ int DeviceRunner::run(Runtime &runtime, int block_dim, int launch_aicpu_num) {
         dep_gen_collector_.start(thread_factory);
     }
 
-    LOG_INFO_V0("=== launch_aicpu_kernel %s ===", host::KernelNames::InitName);
-    rc = launch_aicpu_kernel(stream_aicpu_, &kernel_args_.args, host::KernelNames::InitName, 1);
-    if (rc != 0) {
-        LOG_ERROR("launch_aicpu_kernel (init) failed: %d", rc);
-        return rc;
-    }
-
-    // The init kernel completes the AICore handshake, which populates
-    // runtime.workers[i].core_type for every core. Publish that table to the
-    // L2 swimlane collector so the AICORE_TIMING (level=1) host emit path
-    // can label lanes ("aic" / "aiv") without consulting an AICPU record.
-    // Sim sets workers[].core_type via the rule-based path in its own
-    // device_runner before init_l2_swimlane; on onboard the values are
-    // discovered here, after init kernel returns.
+    // workers[i].core_type is written by the AICore kernel during its
+    // AICPU<->AICore handshake (aicore_executor.cpp). That kernel is launched
+    // further below, so the values read here reflect the most recent prior
+    // run's handshake still resident in device memory (unset on the first run
+    // of a freshly-loaded runtime). We publish them to the L2 swimlane
+    // collector so the AICORE_TIMING (level=1) host emit path can label lanes
+    // ("aic" / "aiv"). Sim sets workers[].core_type via the rule-based path in
+    // its own device_runner before init_l2_swimlane.
     if (enable_l2_swimlane_ && l2_swimlane_collector_.is_initialized()) {
         std::vector<CoreType> core_types(num_aicore);
         for (int i = 0; i < num_aicore; i++) {

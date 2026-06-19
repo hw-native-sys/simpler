@@ -246,25 +246,6 @@ extern "C" int bind_callable_to_runtime_impl(
     }
     int64_t t_args_end = _now_ms();
 
-    // Read ready queue shard count from environment for AICPU scheduler
-    {
-        const char *env_shards = std::getenv("PTO2_READY_QUEUE_SHARDS");
-        if (env_shards) {
-            char *endptr;
-            int64_t val = strtol(env_shards, &endptr, 10);
-            if (endptr != env_shards && *endptr == '\0' && val >= 1 && val <= PLATFORM_MAX_AICPU_THREADS) {
-                runtime->ready_queue_shards = static_cast<int>(val);
-            } else {
-                LOG_WARN(
-                    "PTO2_READY_QUEUE_SHARDS=%s is invalid or out of range [1,%d], using default %d", env_shards,
-                    PLATFORM_MAX_AICPU_THREADS, RUNTIME_DEFAULT_READY_QUEUE_SHARDS
-                );
-                runtime->ready_queue_shards = RUNTIME_DEFAULT_READY_QUEUE_SHARDS;
-            }
-        }
-        LOG_INFO_V0("Ready queue shards: %d", runtime->ready_queue_shards);
-    }
-
     // Read orchestrator-to-scheduler transition flag from environment
     {
         const char *env_val = std::getenv("PTO2_ORCH_TO_SCHED");
