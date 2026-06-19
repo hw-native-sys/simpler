@@ -179,7 +179,6 @@ int StoreTracrData(DeviceRunnerT *device_runner, RuntimeT &runtime) {
         return -1;
     }
 
-    LOG_INFO_V9("[TraCR] runtime.aicpu_thread_num is zero or negative: %d", runtime.aicpu_thread_num);
     if (runtime.aicpu_thread_num <= 0) {
         LOG_ERROR("runtime.aicpu_thread_num is zero or negative: %d", runtime.aicpu_thread_num);
         return -1;
