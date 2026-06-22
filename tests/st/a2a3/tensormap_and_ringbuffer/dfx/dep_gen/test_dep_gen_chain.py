@@ -64,12 +64,17 @@ class TestDepGenChain(SceneTestCase):
                 "name": "WRITE_CONST",
                 "source": f"{DUMMY_KERNELS}/aic/kernel_write_const.cpp",
                 "core_type": "aic",
+                # Single-AIC task with one INOUT tensor (args[0]). Declared so
+                # the tensor dump's per-subtask sum matches the payload.
+                "signature": [D.INOUT],
             },
             {
                 "func_id": 1,
                 "name": "COPY_FIRST",
                 "source": f"{DUMMY_KERNELS}/aic/kernel_copy_first.cpp",
                 "core_type": "aic",
+                # Single-AIC task: copies args[0] -> args[1] (IN, INOUT).
+                "signature": [D.IN, D.INOUT],
             },
         ],
     }

@@ -18,7 +18,6 @@
 #include "pto_tensormap.h"
 #include "pto_types.h"  // TensorRef
 #include "tensor.h"
-#include "tensor_arg.h"  // TensorArgType
 
 struct DepInputs
 {

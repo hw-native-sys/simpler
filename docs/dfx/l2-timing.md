@@ -2,8 +2,9 @@
 
 For an L2 run you usually look at a handful of timing numbers. They come from
 **two channels**, both available with no extra flags because they ride on the
-compile-time `PTO2_PROFILING` macro (default `1`, already in the prebuilt
-runtimes):
+compile-time `PTO2_PROFILING` macro (default `1` in
+`src/common/task_interface/profiling_config.h`, already enabled in the
+prebuilt runtimes):
 
 1. **`RunTiming`** — `host_wall` and `device_wall`, returned directly by
    `Worker.run()` and printed per round by the harness.
@@ -26,7 +27,7 @@ capture — is opt-in (`--enable-l2-swimlane`) and documented separately in
 | Field | What it measures | Source |
 | ----- | ---------------- | ------ |
 | **`host_wall_us`** | Host `steady_clock` delta wrapping the dispatch call — includes Python/host overhead. | host side, around the C-ABI run call |
-| **`device_wall_us`** | **Full on-NPU kernel wall**: from `simpler_aicpu_init` (start, captured single-threaded) to the end of `simpler_aicpu_exec` — i.e. **init + the whole run + teardown**. | AICPU stamps it into `KernelArgs.device_wall_*` (`src/{arch}/platform/onboard/aicpu/kernel.cpp`); host reads it back each run |
+| **`device_wall_us`** | **Full on-NPU kernel wall**: earliest `simpler_aicpu_exec` start to latest `simpler_aicpu_exec` end across launched threads — i.e. **the whole run + teardown**. | Each `simpler_aicpu_exec` thread stamps its own start/end slot in the `KernelArgs.device_wall_*` buffer (`src/{arch}/platform/onboard/aicpu/kernel.cpp`); host reduces `max(end) - min(start)` each run |
 
 Both are populated whenever the runtime was built with `PTO2_PROFILING` (the
 default) — **independent of `--enable-l2-swimlane`**. `device_wall_us` is `0`

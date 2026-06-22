@@ -32,7 +32,7 @@
  * Intermediate result P flows via TPUSH/TPOP (VEC_FIFO), bypassing GM.
  * Dependencies are automatic via TensorMap overlap detection.
  *
- * Arg layout: [A, B, C]  — shape/dtype/size in ContinuousTensor metadata
+ * Arg layout: [A, B, C]  — shape/dtype/size in Tensor metadata
  */
 
 #include <cstdint>

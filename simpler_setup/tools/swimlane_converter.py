@@ -119,11 +119,22 @@ def read_perf_data(filepath):  # noqa: PLR0912, PLR0915
             "core_types": ["aic"|"aiv", ...],   # indexed by core_id
             "core_to_thread": [<int>, ...]      # optional (level >= 3)
           },
-          "aicore_tasks": [[core_id, task_token_raw, reg_task_id, start_cycles, end_cycles], ...],
+          "aicore_tasks": [[core_id, task_token_raw, reg_task_id, start_cycles,
+                            end_cycles, receive_to_start_cycles], ...],
           "aicpu_tasks":  [[core_id, reg_task_id, dispatch_cycles, finish_cycles], ...],
           "aicpu_scheduler_phases":     [ [ {kind, start_cycles, end_cycles, ...}, ... ], ... ],
           "aicpu_orchestrator_phases":  [ [ {submit_idx, task_id, start_cycles, end_cycles}, ... ], ... ]
         }
+
+    aicore_tasks columns (v3 schema): the trailing receive_to_start_cycles
+    is a uint32 delta = AICore-side `start_time - receive_time`, where
+    receive_time is captured immediately after AICore's
+    `read_reg(DATA_MAIN_BASE)` returns the new task_id (before the per-task
+    dcci + ack pair). Lets DFX split per-task head_OH into the
+    AICPU→AICore NoC propagation (dispatch_ts → receive_time, hardware-
+    bound) and the AICore-local dcci + ack cost (receive_time → start_time,
+    software-tunable). Archived v2 JSON without this column still parses;
+    the field is exposed as 0 for those.
 
     Returns a dict shaped for `generate_chrome_trace_json`,
     `print_task_statistics`, and `sched_overhead_analysis`: `tasks`,
@@ -171,13 +182,19 @@ def read_perf_data(filepath):  # noqa: PLR0912, PLR0915
     # same PTO2 task_token_raw to the same core (SPMD over-subscription, MIX
     # cluster spread) each get their own reg_task_id, so this key is unique
     # per dispatch even when task_token_raw collides.
-    aicore_lookup: dict[tuple[int, int], tuple[int, int, int]] = {}
+    #
+    # `*rest` makes v2 rows (5 cols, no receive_to_start_cycles) and v3 rows
+    # (6 cols) both parse — archived JSON from before the receive_time split
+    # still loads with r2s_cycles defaulting to 0.
+    aicore_lookup: dict[tuple[int, int], tuple[int, int, int, int]] = {}
     for row in aicore_rows:
-        core_id, task_token_raw, reg_task_id, start_cycles, end_cycles = row
+        core_id, task_token_raw, reg_task_id, start_cycles, end_cycles, *rest = row
+        r2s_cycles = int(rest[0]) if rest else 0
         aicore_lookup[(int(core_id), int(reg_task_id))] = (
             int(task_token_raw),
             int(start_cycles),
             int(end_cycles),
+            r2s_cycles,
         )
 
     # base_time = min non-zero timestamp across every stream that will be
@@ -189,9 +206,17 @@ def read_perf_data(filepath):  # noqa: PLR0912, PLR0915
         if v > 0 and (base_time_cycles is None or v < base_time_cycles):
             base_time_cycles = v
 
-    for _, _, _, s, e in aicore_rows:
-        _track(int(s))
-        _track(int(e))
+    for row in aicore_rows:
+        # Column count varies (v2: 5, v3: 6); only the timing columns matter
+        # for base_time tracking. For v3, the per-task receive_time =
+        # start_cycles - receive_to_start_cycles is earlier than start_cycles
+        # itself; track it so the v3 setup-bar (ts = receive_time) doesn't
+        # land at a negative offset relative to the kernel-bar base.
+        start_c = int(row[3])
+        end_c = int(row[4])
+        r2s_c = int(row[5]) if len(row) > 5 else 0
+        _track(start_c - r2s_c)
+        _track(end_c)
     for _, _, d, f in aicpu_rows:
         _track(int(d))
         _track(int(f))
@@ -231,9 +256,15 @@ def read_perf_data(filepath):  # noqa: PLR0912, PLR0915
             if ac is None:
                 unmatched_per_core[core_id] += 1
                 continue
-            task_token_raw, start_cycles, end_cycles = ac
+            task_token_raw, start_cycles, end_cycles, r2s_cycles = ac
             start_us = _to_us(start_cycles)
             end_us = _to_us(end_cycles)
+            dispatch_us = _to_us(int(dispatch_cycles))
+            # receive_to_start delta is in cycles; convert via the same
+            # cycles_to_us_factor that drives the absolute timestamps. No
+            # base_time subtraction — this is a delta.
+            local_setup_us = r2s_cycles * cycles_to_us_factor
+            receive_us = start_us - local_setup_us
             tasks.append(
                 {
                     "task_id": task_token_raw,
@@ -244,19 +275,24 @@ def read_perf_data(filepath):  # noqa: PLR0912, PLR0915
                     "start_time_us": start_us,
                     "end_time_us": end_us,
                     "duration_us": end_us - start_us,
-                    "dispatch_time_us": _to_us(int(dispatch_cycles)),
+                    "dispatch_time_us": dispatch_us,
                     "finish_time_us": _to_us(int(finish_cycles)),
+                    "receive_time_us": receive_us,
+                    "local_setup_us": local_setup_us,
+                    "propagation_us": receive_us - dispatch_us,
                 }
             )
     elif level == 1:
         # AICORE_TIMING fallback: AICPU records are absent (complete_task
         # bypassed). The AICore stream alone is the source of truth.
         for row in aicore_rows:
-            core_id, task_token_raw, _reg_task_id, start_cycles, end_cycles = row
+            core_id, task_token_raw, _reg_task_id, start_cycles, end_cycles, *rest = row
+            r2s_cycles = int(rest[0]) if rest else 0
             core_id = int(core_id)
             task_token_raw = int(task_token_raw)
             start_us = _to_us(int(start_cycles))
             end_us = _to_us(int(end_cycles))
+            local_setup_us = r2s_cycles * cycles_to_us_factor
             tasks.append(
                 {
                     "task_id": task_token_raw,
@@ -269,6 +305,9 @@ def read_perf_data(filepath):  # noqa: PLR0912, PLR0915
                     "duration_us": end_us - start_us,
                     "dispatch_time_us": 0.0,
                     "finish_time_us": 0.0,
+                    "receive_time_us": start_us - local_setup_us,
+                    "local_setup_us": local_setup_us,
+                    # propagation_us requires AICPU dispatch_ts; absent at level 1.
                 }
             )
 
@@ -537,6 +576,8 @@ def print_task_statistics(tasks, func_id_to_name=None):
             "durations": [],
             "head_overheads": [],
             "tail_overheads": [],
+            "propagations": [],  # dispatch_ts → AICore receive_time (NoC + FFTS)
+            "local_setups": [],  # receive_time → start_time (dcci + ack on AICore)
             "latencies": [],
             "total_exec_time": 0.0,
             "total_latency": 0.0,
@@ -567,6 +608,13 @@ def print_task_statistics(tasks, func_id_to_name=None):
             tail_overhead = finish_time - end_time
             func_stats[func_id]["tail_overheads"].append(tail_overhead)
 
+            # Head OH split (v3 schema only — falls back to absent when the
+            # AICore record came from a pre-receive_time build).
+            if "propagation_us" in task:
+                func_stats[func_id]["propagations"].append(task["propagation_us"])
+            if "local_setup_us" in task:
+                func_stats[func_id]["local_setups"].append(task["local_setup_us"])
+
             # Latency: finish_time_us - dispatch_time_us
             latency = finish_time - dispatch_time
             func_stats[func_id]["latencies"].append(latency)
@@ -580,15 +628,17 @@ def print_task_statistics(tasks, func_id_to_name=None):
             max_finish_time = max(max_finish_time, finish_time)
 
     # Print statistics
-    print("\n" + "=" * 110)
+    print("\n" + "=" * 140)
     print("Task Statistics by Function")
     print("  Exec = kernel time on AICore; Latency = dispatch->finish (incl. head OH + Exec + tail OH)")
-    print("=" * 110)
+    print("  Head OH split (v3): Prop = NoC propagation (dispatch_ts→AICore receive); Local = dcci+ack (receive→start)")
+    print("=" * 140)
     print(
         f"{'Func_ID':<8} {'Func_Name':<12} {'Count':>5}   {'Avg Exec(us)':>12}  "
-        f"{'Avg Latency(us)':>15}  {'Exec%':>6}   {'Avg Head OH(us)':>15}  {'Avg Tail OH(us)':>15}"
+        f"{'Avg Latency(us)':>15}  {'Exec%':>6}   {'Avg Head OH(us)':>15}  {'Avg Tail OH(us)':>15}  "
+        f"{'Avg Prop(us)':>12}  {'Avg Local(us)':>13}"
     )
-    print("-" * 110)
+    print("-" * 140)
 
     # Sort by func_id for consistent output
     total_count = 0
@@ -619,17 +669,25 @@ def print_task_statistics(tasks, func_id_to_name=None):
             sum(stats["tail_overheads"]) / len(stats["tail_overheads"]) if stats["tail_overheads"] else 0
         )
         avg_latency = stats["total_latency"] / count if count > 0 else 0
+        # `None` (not NaN) signals "no v3 receive_time data on this func" so
+        # the print line below renders a dash. NaN would force ruff's
+        # PLR0124 self-compare idiom.
+        avg_propagation = sum(stats["propagations"]) / len(stats["propagations"]) if stats["propagations"] else None
+        avg_local_setup = sum(stats["local_setups"]) / len(stats["local_setups"]) if stats["local_setups"] else None
 
         # Calculate execution ratio: total_exec_time / total_latency
         exec_ratio = (stats["total_exec_time"] / stats["total_latency"] * 100) if stats["total_latency"] > 0 else 0
 
+        prop_str = f"{avg_propagation:>12.2f}" if avg_propagation is not None else f"{'-':>12}"
+        local_str = f"{avg_local_setup:>13.2f}" if avg_local_setup is not None else f"{'-':>13}"
         print(
             f"{func_id:<8} {func_name:<12} {count:>5}   {avg_duration:>12.2f}  {avg_latency:>15.2f}  "
-            f"{exec_ratio:>5.1f}%   {avg_head_overhead:>15.2f}  {avg_tail_overhead:>15.2f}"
+            f"{exec_ratio:>5.1f}%   {avg_head_overhead:>15.2f}  {avg_tail_overhead:>15.2f}  "
+            f"{prop_str}  {local_str}"
         )
 
     # Print total row
-    print("-" * 110)
+    print("-" * 140)
 
     # Calculate total latency (sum of all latencies)
     total_latency_sum = sum(stats["total_latency"] for stats in func_stats.values())
@@ -656,11 +714,11 @@ def print_task_statistics(tasks, func_id_to_name=None):
     print("=" * 110)
 
 
-def build_overhead_counter_events(tasks, deps_edges, pid=3):  # noqa: PLR0912
+def build_overhead_counter_events(tasks, deps_edges, pid=2):  # noqa: PLR0912
     """Per-engine + system overhead counter tracks for the Perfetto trace.
 
     Emits 8 counter (``"ph":"C"``) series under the AICPU Scheduler process
-    (``pid=3``) — it is scheduler-overhead analysis, so it lives in the sched
+    (``pid=2``) — it is scheduler-overhead analysis, so it lives in the sched
     group — overlaid alongside the scheduler's own tracks and the AICore task
     bars to see, at every instant, why time is or is not wasted (see
     docs/dfx/sched-overhead-model.md):
@@ -755,7 +813,7 @@ def build_overhead_counter_events(tasks, deps_edges, pid=3):  # noqa: PLR0912
         "oh_all_overhead": 9121,
         "oh_has_overhead": 9122,
     }
-    # No process metadata: pid=3 is the AICPU Scheduler process (named/sorted
+    # No process metadata: pid=2 is the AICPU Scheduler process (named/sorted
     # elsewhere). Emitting it here would override that — these counters just
     # join the scheduler group as extra tracks (names prefixed "oh_").
     events = []
@@ -825,10 +883,10 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
         core_to_thread: Optional list mapping core_id (index) to scheduler thread index (-1 = unassigned)
 
     Generates processes in the trace:
-        - pid=1 "AICore View": start_time_us to end_time_us (kernel execution)
-        - pid=2 "AICPU View": dispatch_time_us to finish_time_us (AICPU perspective)
-        - pid=3 "AICPU Scheduler": scheduler phase bars (l2_swimlane_level >= 3)
-        - pid=4 "AICPU Orchestrator": orchestrator phase bars or summary (l2_swimlane_level >= 4)
+        - pid=4 "Worker View": start_time_us to end_time_us (kernel execution)
+        - pid=3 "Scheduler View": dispatch_time_us to finish_time_us (AICPU perspective)
+        - pid=2 "AICPU Scheduler": scheduler phase bars (l2_swimlane_level >= 3)
+        - pid=1 "AICPU Orchestrator": orchestrator phase bars or summary (l2_swimlane_level >= 4)
     """
     if verbose:
         print("Generating Chrome Trace JSON...")
@@ -851,7 +909,7 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
     # Recover func_id for AICORE_TIMING (level=1) records, which the host
     # emits as func_id=-1. Resolve once here against dep_gen's per-task
     # kernel_ids[3] (picking the subslot by core_type) and write it back onto
-    # the task, so every downstream consumer — AICore View, AICPU View, and
+    # the task, so every downstream consumer — Worker View, Scheduler View, and
     # event-hints — sees the same real func_id. See
     # resolve_func_id_from_kernel_map() for the AIV0-vs-AIV1 tie-break and the
     # host-side contract.
@@ -865,20 +923,25 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
     # Step 2: Generate JSON events
     events = []
 
-    # Metadata event: Process names and sort order
-    # Display order: Orchestrator (pid=4) → Scheduler (pid=3) → AICPU View (pid=2) → AICore View (pid=1)
-    events.append({"args": {"name": "AICore View"}, "cat": "__metadata", "name": "process_name", "ph": "M", "pid": 1})
-    events.append({"args": {"sort_index": 4}, "cat": "__metadata", "name": "process_sort_index", "ph": "M", "pid": 1})
+    # Metadata event: Process names and sort order.
+    # pid is renumbered in pipeline order (top → bottom in Perfetto):
+    #   pid=1  AICPU Orchestrator  (submits tasks — earliest)
+    #   pid=2  AICPU Scheduler     (pops ready, dispatches, completes)
+    #   pid=3  Scheduler View      (AICPU-eye view of each worker's dispatch→finish)
+    #   pid=4  Worker View         (physical AIC/AIV + DUMMY virtual workers — latest)
+    # sort_index intentionally equals pid so JSON ordering is self-evident.
+    events.append({"args": {"name": "Worker View"}, "cat": "__metadata", "name": "process_name", "ph": "M", "pid": 4})
+    events.append({"args": {"sort_index": 4}, "cat": "__metadata", "name": "process_sort_index", "ph": "M", "pid": 4})
 
     # Check if any task has AICPU timestamps
     has_aicpu_data = any(task.get("dispatch_time_us", 0) >= 0 and task.get("finish_time_us", 0) > 0 for task in tasks)
 
     if has_aicpu_data:
         events.append(
-            {"args": {"name": "AICPU View"}, "cat": "__metadata", "name": "process_name", "ph": "M", "pid": 2}
+            {"args": {"name": "Scheduler View"}, "cat": "__metadata", "name": "process_name", "ph": "M", "pid": 3}
         )
         events.append(
-            {"args": {"sort_index": 3}, "cat": "__metadata", "name": "process_sort_index", "ph": "M", "pid": 2}
+            {"args": {"sort_index": 3}, "cat": "__metadata", "name": "process_sort_index", "ph": "M", "pid": 3}
         )
 
     # Metadata events: Thread names (one per core)
@@ -894,7 +957,7 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
         core_type_str = (core_type or "unknown").upper()
         thread_name = f"{core_type_str}_{core_id}"
         events.append(
-            {"args": {"name": thread_name}, "cat": "__metadata", "name": "thread_name", "ph": "M", "pid": 1, "tid": tid}
+            {"args": {"name": thread_name}, "cat": "__metadata", "name": "thread_name", "ph": "M", "pid": 4, "tid": tid}
         )
 
     # Duration events (Complete events "X")
@@ -911,6 +974,11 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
         for pred, succs in deps_edges.items():
             for succ in succs:
                 fanin_map[succ].append(pred)
+
+    # One clock period at the AICore counter resolution. The device counter
+    # ticks at 50 MHz on a2a3 (20 ns) — sub-period local_setup intervals are
+    # noise (warm dcci is cycle-zero), so don't emit invisible zero-width bars.
+    _SETUP_MIN_US = 0.02
 
     for task in tasks:
         tid = core_to_tid[task["core_id"]]
@@ -932,6 +1000,35 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
         fanout_str = f"{len(fanout_ids)}: [" + ", ".join(format_task_display(x) for x in fanout_ids) + "]"
         fanin_str = f"{len(fanin_ids)}: [" + ", ".join(format_task_display(x) for x in fanin_ids) + "]"
 
+        # Setup bar (receive → start): visualises AICore-local critical-path
+        # prep (dcci + ack for the common path, ack-only for speculation-hit
+        # path — see docs/investigations/2026-06-aicore-cold-start-warmup.md).
+        # Same `name` across all setup bars → Perfetto auto-assigns one
+        # consistent color, distinct from kernel bars. Emit only when above
+        # one clock period; warm-cache dcci+ack lands sub-period and would
+        # render as an invisible zero-width slice.
+        local_setup_us = task.get("local_setup_us", 0.0) or 0.0
+        receive_time_us = task.get("receive_time_us")
+        if local_setup_us >= _SETUP_MIN_US and receive_time_us is not None:
+            events.append(
+                {
+                    "args": {
+                        "event-hint": f"setup: dcci+ack for Task:{tdisp} CoreId:{task['core_id']}",
+                        "local_setup_us": local_setup_us,
+                        "taskId": task["task_id"],
+                    },
+                    "cat": "event",
+                    "id": event_id,
+                    "name": "setup",
+                    "ph": "X",
+                    "pid": 4,
+                    "tid": tid,
+                    "ts": receive_time_us,
+                    "dur": local_setup_us,
+                }
+            )
+            event_id += 1
+
         events.append(
             {
                 "args": {
@@ -945,7 +1042,7 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
                 "id": event_id,
                 "name": task_name,
                 "ph": "X",
-                "pid": 1,
+                "pid": 4,
                 "tid": tid,
                 "ts": ts,
                 "dur": dur,
@@ -956,7 +1053,7 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
         task_to_event_id[(task["task_id"], task["core_id"])] = event_id
         event_id += 1
 
-    # AICPU View duration events (dispatch_time to finish_time)
+    # Scheduler View duration events (dispatch_time to finish_time)
     # Assign overlapping tasks on the same core to different tids so Perfetto
     # renders each bar on its own row (Perfetto requires strict nesting on a tid).
     if has_aicpu_data:
@@ -992,7 +1089,7 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
                 task_to_aicpu_tid[(task["task_id"], task["core_id"])] = tid
                 aicpu_tid_set.add(tid)
 
-        # Thread name metadata for AICPU View (one entry per unique tid used)
+        # Thread name metadata for Scheduler View (one entry per unique tid used)
         for core_id, base_tid in core_to_tid.items():
             ct_list = _core_aicpu_tasks.get(core_id)
             core_type_str = ct_list[0]["core_type"].upper() if ct_list else "unknown"
@@ -1005,7 +1102,7 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
                         "cat": "__metadata",
                         "name": "thread_name",
                         "ph": "M",
-                        "pid": 2,
+                        "pid": 3,
                         "tid": base_tid,
                     }
                 )
@@ -1018,7 +1115,7 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
                         "cat": "__metadata",
                         "name": "thread_name",
                         "ph": "M",
-                        "pid": 2,
+                        "pid": 3,
                         "tid": overflow_tid,
                     }
                 )
@@ -1052,7 +1149,7 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
                     "id": event_id,
                     "name": task_name,
                     "ph": "X",
-                    "pid": 2,
+                    "pid": 3,
                     "tid": tid,
                     "ts": dispatch_us,
                     "dur": aicpu_dur,
@@ -1094,13 +1191,20 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
 
             for succ_task in task_map[succ_task_id]:
                 dst_tid = core_to_tid[succ_task["core_id"]]
-                dst_ts_start = succ_task["start_time_us"]
+                # Land the dependency arrow at the consumer's `receive_time` —
+                # the instant AICore saw the dispatch signal on DATA_MAIN_BASE.
+                # The gap between this anchor and the kernel's `start_time` is
+                # the per-task local_setup (dcci + ack), now visible as the
+                # "setup" sub-bar PR #1004 adds. Fall back to start_time for
+                # captures without v3 receive_time (older swimlane records or
+                # AICPU-only joins).
+                dst_ts_start = succ_task.get("receive_time_us") or succ_task["start_time_us"]
                 dst_event_id = task_to_event_id[(succ_task["task_id"], succ_task["core_id"])]
 
-                # Happens-before violation: producer outlived consumer's start.
-                # Real time order broke the data dependency the graph asserted;
-                # the runtime got away with it (consumer presumably re-read fresh
-                # data) but it's a smell — surface it.
+                # Happens-before violation: producer outlived consumer's
+                # receive. Real time order broke the data dependency the graph
+                # asserted; the runtime got away with it (consumer presumably
+                # re-read fresh data) but it's a smell — surface it.
                 hb_violated = src_ts_end > dst_ts_start
                 flow_name = "hb_violation" if hb_violated else "dependency"
                 if hb_violated:
@@ -1113,7 +1217,7 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
                         "id": flow_id,
                         "name": flow_name,
                         "ph": "s",
-                        "pid": 1,
+                        "pid": 4,
                         "tid": src_tid,
                         "ts": flow_start_us,
                         "bind_id": src_event_id,
@@ -1126,7 +1230,7 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
                         "id": flow_id,
                         "name": flow_name,
                         "ph": "f",
-                        "pid": 1,
+                        "pid": 4,
                         "tid": dst_tid,
                         "ts": dst_ts_start,
                         "bp": "e",
@@ -1147,10 +1251,10 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
     if scheduler_phases:
         # Process metadata
         events.append(
-            {"args": {"name": "AICPU Scheduler"}, "cat": "__metadata", "name": "process_name", "ph": "M", "pid": 3}
+            {"args": {"name": "AICPU Scheduler"}, "cat": "__metadata", "name": "process_name", "ph": "M", "pid": 2}
         )
         events.append(
-            {"args": {"sort_index": 2}, "cat": "__metadata", "name": "process_sort_index", "ph": "M", "pid": 3}
+            {"args": {"sort_index": 2}, "cat": "__metadata", "name": "process_sort_index", "ph": "M", "pid": 2}
         )
 
         # Phase color mapping. The Perfetto sched lane only renders the
@@ -1162,6 +1266,11 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
         phase_colors = {
             "complete": "good",  # green
             "dispatch": "terrible",  # red
+            "release": "olive",  # deferred-release drain (on_task_release work)
+            "resolve": "vsync_highlight_color",  # nested in complete: walk consumer list + doorbells
+            "early_dispatch": "rail_animation",  # speculative early-dispatch (Hook 1) staging
+            # Rendered separately on Worker View; this color is a fallback if it ever lands on Sched.
+            "dummy_task": "grey",
         }
 
         # Per-complete subtask-finish counts surface "how many AICore FINs
@@ -1215,6 +1324,28 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
                     continue
                 finishes_per_complete[id(t_comp)] += 1
 
+        # Worker View (pid=4) DUMMY lanes: one per scheduler thread, used by
+        # the `dummy_task` phase below to surface DAG fence / barrier nodes.
+        # Tids 19000+thread_idx keep them visually grouped after the physical
+        # AIC/AIV lanes (which sit at 10000+core_id*10).
+        DUMMY_TID_BASE = 19000  # noqa: N806
+        for thread_idx in range(len(scheduler_phases)):
+            events.append(
+                {
+                    "args": {"name": f"DUMMY_T{thread_idx}"},
+                    "cat": "__metadata",
+                    "name": "thread_name",
+                    "ph": "M",
+                    "pid": 4,
+                    "tid": DUMMY_TID_BASE + thread_idx,
+                }
+            )
+
+        # Dummy task X event width — start/end on the device coincide
+        # (identification is a single MSR read); render as a 0.02 µs sliver
+        # so Perfetto picks it up instead of collapsing it to a hairline.
+        DUMMY_BAR_MIN_DUR_US = 0.02  # noqa: N806
+
         for thread_idx, thread_records in enumerate(scheduler_phases):
             tid = 3000 + thread_idx
 
@@ -1225,17 +1356,46 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
                     "cat": "__metadata",
                     "name": "thread_name",
                     "ph": "M",
-                    "pid": 3,
+                    "pid": 2,
                     "tid": tid,
                 }
             )
 
-            # Render only the work phases (complete / dispatch). Legacy
-            # captures may carry "idle" / "scan" records from older builds;
-            # drop them so the lane shows only actual work.
+            # Render work phases (complete / dispatch) plus the real operations
+            # that otherwise hide inside an idle stretch (poll = completion-scan
+            # that retired nothing; release = on_task_release drain). Genuine
+            # spin emits no record and shows as a blank gap.
+            #
+            # `dummy_task` is special: it does NOT live on the sched track —
+            # it represents a DAG fence node briefly inhabiting the AICPU as a
+            # virtual worker, so we route it to Worker View (pid=4) DUMMY_T{thr}.
             for record in thread_records:
                 phase = record.get("phase", "unknown")
-                if phase not in ("complete", "dispatch"):
+                if phase == "dummy_task":
+                    start_us = record["start_time_us"]
+                    end_us = record["end_time_us"]
+                    dur = max(end_us - start_us, DUMMY_BAR_MIN_DUR_US)
+                    task_id_low32 = record.get("tasks_processed", 0)
+                    events.append(
+                        {
+                            "args": {
+                                "phase": "dummy_task",
+                                "loop_iter": record.get("loop_iter", 0),
+                                "dummy_task_id_low32": task_id_low32,
+                                "event-hint": f"dummy(t{task_id_low32})",
+                            },
+                            "cat": "event",
+                            "cname": "grey",
+                            "name": f"dummy(t{task_id_low32})",
+                            "ph": "X",
+                            "pid": 4,
+                            "tid": DUMMY_TID_BASE + thread_idx,
+                            "ts": start_us,
+                            "dur": dur,
+                        }
+                    )
+                    continue
+                if phase not in ("complete", "dispatch", "release", "resolve", "early_dispatch"):
                     continue
                 start_us = record["start_time_us"]
                 end_us = record["end_time_us"]
@@ -1294,7 +1454,7 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
                         "cname": phase_colors.get(phase, "generic_work"),
                         "name": display_name,
                         "ph": "X",
-                        "pid": 3,
+                        "pid": 2,
                         "tid": tid,
                         "ts": start_us,
                         "dur": dur,
@@ -1307,7 +1467,12 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
                 # SAME ts (e.g. final-drain emit where start_time==end_time)
                 # also breaks Perfetto's rate calc (divide-by-zero → NULL).
                 # Track name carries thread index so it reads standalone
-                # even with the thread tree collapsed.
+                # even with the thread tree collapsed. Only complete/dispatch
+                # carry real queue depths; release/resolve/early_dispatch zero-
+                # fill them, so skip their counter samples to avoid spurious 0
+                # dips.
+                if phase not in ("complete", "dispatch"):
+                    continue
                 if not depths_valid:
                     continue
                 local_track_name = f"local_ready_buf_T{thread_idx}"
@@ -1317,7 +1482,7 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
                         "cat": "queue",
                         "name": local_track_name,
                         "ph": "C",
-                        "pid": 3,
+                        "pid": 2,
                         "tid": tid,
                         "ts": end_us,
                     }
@@ -1333,7 +1498,7 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
                         "cat": "queue",
                         "name": "shared_ready_queue",
                         "ph": "C",
-                        "pid": 3,
+                        "pid": 2,
                         "tid": 3999,
                         "ts": end_us,
                     }
@@ -1349,7 +1514,7 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
                 "cat": "__metadata",
                 "name": "thread_name",
                 "ph": "M",
-                "pid": 3,
+                "pid": 2,
                 "tid": 3999,
             }
         )
@@ -1359,7 +1524,7 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
                 "cat": "__metadata",
                 "name": "thread_sort_index",
                 "ph": "M",
-                "pid": 3,
+                "pid": 2,
                 "tid": 3999,
             }
         )
@@ -1374,10 +1539,10 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
         # Process metadata
         orch_process_label = f"AICPU {orchestrator_name}" if orchestrator_name else "AICPU Orchestrator"
         events.append(
-            {"args": {"name": orch_process_label}, "cat": "__metadata", "name": "process_name", "ph": "M", "pid": 4}
+            {"args": {"name": orch_process_label}, "cat": "__metadata", "name": "process_name", "ph": "M", "pid": 1}
         )
         events.append(
-            {"args": {"sort_index": 1}, "cat": "__metadata", "name": "process_sort_index", "ph": "M", "pid": 4}
+            {"args": {"sort_index": 1}, "cat": "__metadata", "name": "process_sort_index", "ph": "M", "pid": 1}
         )
 
         # Thread name metadata for each orchestrator thread
@@ -1385,7 +1550,7 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
             tid = 4000 + orch_idx
             name = f"Orch_{orch_idx}"
             events.append(
-                {"args": {"name": name}, "cat": "__metadata", "name": "thread_name", "ph": "M", "pid": 4, "tid": tid}
+                {"args": {"name": name}, "cat": "__metadata", "name": "thread_name", "ph": "M", "pid": 1, "tid": tid}
             )
 
         # Per-task orchestrator phase bars. As of PR-X the device folds
@@ -1402,6 +1567,37 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
             "orch_insert": "olive",
             "orch_fanin": "rail_animation",
         }
+
+        # Build the regular-task and dummy-task id sets so the orch-phase loop
+        # below can identify which orch_submit envelopes belong to
+        # `alloc_tensors()` calls (no AICore record, no DummyTask phase — purely
+        # inline-completed by the orchestrator on host CPU). Those get a
+        # parallel ALLOC bar on Worker View pid=4 so the DAG node is visible.
+        regular_task_ids = {int(t.get("task_id", -1)) for t in tasks}
+        dummy_low32 = set()
+        if scheduler_phases:
+            for thread_records in scheduler_phases:
+                for rec in thread_records:
+                    if rec.get("phase") == "dummy_task":
+                        dummy_low32.add(rec.get("tasks_processed", 0))
+
+        # ALLOC lane metadata on Worker View (pid=4). One ALLOC_T{orch_idx}
+        # lane per orchestrator thread (mirror DUMMY_T{thread_idx} convention).
+        # Tids 18000+orch_idx keep ALLOC lanes grouped just before the DUMMY
+        # lanes (tids 19000+) so the Worker View reads:
+        #   AIC_* / AIV_* / ALLOC_T* / DUMMY_T*
+        ALLOC_TID_BASE = 18000  # noqa: N806
+        for orch_idx in range(len(orchestrator_phases)):
+            events.append(
+                {
+                    "args": {"name": f"ALLOC_T{orch_idx}"},
+                    "cat": "__metadata",
+                    "name": "thread_name",
+                    "ph": "M",
+                    "pid": 4,
+                    "tid": ALLOC_TID_BASE + orch_idx,
+                }
+            )
 
         for orch_idx, thread_records in enumerate(orchestrator_phases):
             tid = 4000 + orch_idx
@@ -1428,14 +1624,42 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
                     "cname": orch_phase_colors.get(phase, "generic_work"),
                     "name": label,
                     "ph": "X",
-                    "pid": 4,
+                    "pid": 1,
                     "tid": tid,
                     "ts": start_us,
                     "dur": dur,
                 }
                 events.append(event)
 
-    # AICPU View fanout arrows (duplicate AICore View flow events using AICPU timestamps)
+                # Classification: orch_submit envelopes whose task_id is NOT in
+                # the AICore record set AND NOT in DummyTask phases are
+                # alloc_tensors() calls. Render a parallel "alloc(...)" bar on
+                # Worker View pid=4 ALLOC_T{orch_idx} so DAG nodes for alloc
+                # tasks are visible (matches the DUMMY_T treatment).
+                if phase == "orch_submit" and task_id >= 0:
+                    is_regular = task_id in regular_task_ids
+                    task_low32 = task_id & 0xFFFFFFFF
+                    is_dummy = task_low32 in dummy_low32
+                    if not is_regular and not is_dummy:
+                        events.append(
+                            {
+                                "args": {
+                                    "phase": "alloc",
+                                    "task_id": task_id,
+                                    "event-hint": f"alloc({format_task_display(task_id)})",
+                                },
+                                "cat": "event",
+                                "cname": "olive",
+                                "name": f"alloc({format_task_display(task_id)})",
+                                "ph": "X",
+                                "pid": 4,
+                                "tid": ALLOC_TID_BASE + orch_idx,
+                                "ts": start_us,
+                                "dur": max(dur, 0.02),
+                            }
+                        )
+
+    # Scheduler View fanout arrows (duplicate Worker View flow events using AICPU timestamps)
     if has_aicpu_data:
         for task in tasks:
             src_finish_us = task.get("finish_time_us", 0)
@@ -1470,7 +1694,7 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
                         "id": flow_id,
                         "name": aicpu_flow_name,
                         "ph": "s",
-                        "pid": 2,
+                        "pid": 3,
                         "tid": src_tid,
                         "ts": src_finish_us - 0.01,
                     }
@@ -1483,7 +1707,7 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
                         "id": flow_id,
                         "name": aicpu_flow_name,
                         "ph": "f",
-                        "pid": 2,
+                        "pid": 3,
                         "tid": dst_tid,
                         "ts": dst_dispatch_us,
                         "bp": "e",
@@ -1594,7 +1818,7 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
                     "id": flow_id,
                     "name": "complete",
                     "ph": "s",
-                    "pid": 1,
+                    "pid": 4,
                     "tid": src_tid,
                     "ts": last_end_us - FLOW_EPSILON_US,
                 }
@@ -1605,7 +1829,7 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
                     "id": flow_id,
                     "name": "complete",
                     "ph": "f",
-                    "pid": 3,
+                    "pid": 2,
                     "tid": dst_tid,
                     "ts": comp["start_time_us"],
                     "bp": "e",
@@ -1689,7 +1913,7 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
                             "id": flow_id,
                             "name": "complete→ready",
                             "ph": "s",
-                            "pid": 3,
+                            "pid": 2,
                             "tid": src_tid,
                             # Anchor inside the complete phase X event so
                             # clicking the complete block surfaces this arrow.
@@ -1702,7 +1926,7 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
                             "id": flow_id,
                             "name": "complete→ready",
                             "ph": "f",
-                            "pid": 3,
+                            "pid": 2,
                             "tid": 3000 + d_thr,
                             "ts": d_us,
                             "bp": "e",
@@ -1760,14 +1984,14 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
                 core_tid = core_to_tid[task["core_id"]]
                 aicpu_tid = task_to_aicpu_tid.get((task["task_id"], task["core_id"]), core_tid)
 
-                # Flow: scheduler DISPATCH → AICore View task start
+                # Flow: scheduler DISPATCH → Worker View task start
                 events.append(
                     {
                         "cat": "flow",
                         "id": flow_id,
                         "name": "dispatch",
                         "ph": "s",
-                        "pid": 3,
+                        "pid": 2,
                         "tid": sched_tid,
                         "ts": dispatch_us,
                     }
@@ -1778,7 +2002,7 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
                         "id": flow_id,
                         "name": "dispatch",
                         "ph": "f",
-                        "pid": 1,
+                        "pid": 4,
                         "tid": core_tid,
                         "ts": task["start_time_us"],
                         "bp": "e",
@@ -1786,7 +2010,7 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
                 )
                 flow_id += 1
 
-                # Flow: scheduler DISPATCH → AICPU View task start
+                # Flow: scheduler DISPATCH → Scheduler View task start
                 aicpu_eid = task_to_aicpu_event_id.get((task["task_id"], task["core_id"]))
                 events.append(
                     {
@@ -1794,7 +2018,7 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
                         "id": flow_id,
                         "name": "dispatch",
                         "ph": "s",
-                        "pid": 3,
+                        "pid": 2,
                         "tid": sched_tid,
                         "ts": dispatch_us,
                     }
@@ -1804,7 +2028,7 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
                     "id": flow_id,
                     "name": "dispatch",
                     "ph": "f",
-                    "pid": 2,
+                    "pid": 3,
                     "tid": aicpu_tid,
                     "ts": dispatch_us,
                     "bp": "e",
@@ -1873,7 +2097,7 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
                         "id": flow_id,
                         "name": flow_name,
                         "ph": "s",
-                        "pid": 4,
+                        "pid": 1,
                         "tid": orch_tid,
                         "ts": anchor_us,
                     }
@@ -1884,7 +2108,7 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
                         "id": flow_id,
                         "name": flow_name,
                         "ph": "f",
-                        "pid": 3,
+                        "pid": 2,
                         "tid": sched_tid,
                         "ts": dispatch_us,
                         "bp": "e",

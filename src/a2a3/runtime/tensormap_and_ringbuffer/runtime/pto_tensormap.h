@@ -12,10 +12,35 @@
 #pragma once
 
 #include "common.h"
+#include "profiling_config.h"
 #include "utils/device_arena.h"
 #include "pto_runtime2_types.h"
 #include "tensor.h"
 
+// Overlap geometry types. Relocated here from tensor.h: they are used only by
+// the runtime's overlap-detection / dependency machinery, not by the
+// wire/host-facing Tensor definition.
+enum class OverlapStatus {
+    NO_OVERLAP,
+    COVERED,
+    OTHER,
+};
+
+struct Segment {
+    uint64_t begin;
+    uint64_t end;
+
+    bool line_segment_intersection(const Segment &other) const { return end > other.begin && other.end > begin; }
+    bool contains(const Segment &other) const { return begin <= other.begin && other.end <= end; }
+};
+
+/**
+ * Layout descriptor produced by PTO2TensorMap::reserve_layout(). Stores the
+ * region offsets returned by DeviceArena::reserve() so init_from_layout()
+ * can fetch the matching pointers after the arena is committed.
+ *
+ * All offsets are relative to the arena's base.
+ */
 struct PTO2TensorMapLayout
 {
     size_t off_buckets;
@@ -27,6 +52,46 @@ struct PTO2TensorMapLayout
     int32_t task_window_sizes[PTO2_MAX_RING_DEPTH];
 };
 
+// TensorMap Lookup Profiling (must precede inline lookup/insert methods).
+#if PTO2_TENSORMAP_PROFILING
+extern uint64_t g_lookup_chain_total;
+extern uint64_t g_lookup_count;
+extern int32_t g_lookup_chain_max;
+extern uint64_t g_lookup_overlap_checks;
+extern uint64_t g_lookup_overlap_hits;
+extern uint64_t g_insert_count;
+#endif
+
+// =============================================================================
+// TensorMap Structure
+// =============================================================================
+
+/**
+ * TensorMap entry structure — cache-line optimized for lookup
+ *
+ * Cache line 1 (64B, lookup hot path) mirrors Tensor cache line 1 byte-for-byte
+ * from byte 16 onward, so that `memcpy(this, &tensor, 64)` populates everything
+ * we need for overlap checks. Bytes [0, 16) carry entry-only fields (hash
+ * bucket head + chain pointer) that overlap Tensor::buffer (addr in [0, 8) is
+ * the hash key, size in [8, 16) is unused by the entry — we repurpose it for
+ * `next_in_bucket`).
+ *
+ *   buffer_addr / next_in_bucket / producer_task_id   — chain traversal + match
+ *   start_offset                                       — overlap byte range begin
+ *   version, ndims, dtype, manual_dep, is_contiguous   — overlap fast path
+ *   shapes[5]                                          — overlap comparison (line 1)
+ *
+ * Cache line 2 (64B, slow-path / non-contiguous overlap):
+ *   prev_in_bucket / next_in_task / prev_in_task       — chain manipulation
+ *   bucket_index                                       — bookkeeping
+ *   extent_elem_cache                                  — overlap byte range end
+ *   strides[5]                                          — reserved for L2 overlap (PR-2)
+ *
+ * When both entry & probe are `is_contiguous && start_offset == 0`, the overlap
+ * check derives `extent_elem = prod(shapes)` from cache line 1 alone.
+ *
+ * Entry size: 128B (2 cache lines), matches Tensor.
+ */
 struct alignas(64) PTO2TensorMapEntry
 {
     // === Cache line 1 (64B) — lookup hot path; mirrors Tensor line 1 from byte 16 ===
@@ -40,7 +105,7 @@ struct alignas(64) PTO2TensorMapEntry
     bool manual_dep;                           // 1B [41, 42):  mirrors Tensor::manual_dep
     bool is_contiguous;                        // 1B [42, 43):  mirrors Tensor::is_contiguous
     uint8_t __padding1__;                      // 1B [43, 44):  mirrors Tensor padding
-    uint32_t shapes[RUNTIME_MAX_TENSOR_DIMS];  // 20B [44, 64): mirrors Tensor::shapes
+    uint32_t shapes[MAX_TENSOR_DIMS];          // 20B [44, 64): mirrors Tensor::shapes
 
     // === Cache line 2 (64B) — chain manipulation + non-contiguous overlap data ===
     PTO2TensorMapEntry *prev_in_bucket;         // 8B [64, 72)
@@ -49,7 +114,7 @@ struct alignas(64) PTO2TensorMapEntry
     int32_t bucket_index;                       // 4B [88, 92): -1 when unlinked
     uint32_t __padding2__;                      // 4B [92, 96)
     uint64_t extent_elem_cache;                 // 8B [96, 104): non-contiguous extent (mirrors Tensor)
-    uint32_t strides[RUNTIME_MAX_TENSOR_DIMS];  // 20B [104, 124): element strides, mirrors Tensor::strides
+    uint32_t strides[MAX_TENSOR_DIMS];          // 20B [104, 124): element strides, mirrors Tensor::strides
     uint8_t __padding3__[4];                    // 4B [124, 128)
 
     void copy_from_tensor(const Tensor &tensor)
@@ -125,8 +190,28 @@ struct alignas(64) PTO2TensorMapEntry
         for (uint32_t i = 1; i < ndims; i++)
             if (strides[i - 1] % strides[i] != 0) return OverlapStatus::OTHER;
 
-        uint32_t ref_shapes[RUNTIME_MAX_TENSOR_DIMS] = {};
-        for (uint32_t i = 1; i < ndims; i++) ref_shapes[i] = strides[i - 1] / strides[i];
+        // Derive reference shape A from stride. By construction stride is
+        // row-major over A: strides[i] = prod(A[i+1..ndims-1]). So
+        //   A[i] = strides[i-1] / strides[i]   for i >= 1
+        //   A[0] = (buffer.size / dtype_bytes) / strides[0]
+        // input.buffer.size is the storage size; entry shares the same buffer
+        // (debug-asserted by buffer.addr equality at the top), so we read it
+        // from input rather than mirroring buffer.size into the entry.
+        //
+        // Note on buffer padding: runtime allocators may over-allocate
+        // `buffer.size` (cache-line / 1024B alignment, ring-buffer slot
+        // rounding, etc). When that happens, `numel_storage` is larger than
+        // the true logical extent and `ref_shapes[0]` ends up generously over-
+        // sized. This is intentional: ref_shapes is only used as an *upper
+        // bound* in the in-bounds checks below; the actual overlap test (the
+        // per-dim line-segment intersection on the real start_offset /
+        // shapes / stride further down) is unaffected. A larger-than-truth
+        // ref_shapes[0] simply makes the bounds check more permissive — it
+        // can never cause a false NO_OVERLAP nor a false COVERED.
+        uint32_t ref_shapes[MAX_TENSOR_DIMS] = {};
+        for (uint32_t i = 1; i < ndims; i++) {
+            ref_shapes[i] = strides[i - 1] / strides[i];
+        }
         const uint64_t elem_size = get_element_size(dtype);
         if (elem_size == 0) return OverlapStatus::OTHER;
         const uint64_t numel_storage = input.buffer.size / elem_size;
@@ -134,8 +219,11 @@ struct alignas(64) PTO2TensorMapEntry
         if (numel_storage % stride0 != 0) return OverlapStatus::OTHER;
         ref_shapes[0] = static_cast<uint32_t>(numel_storage / stride0);
 
-        uint32_t in_offsets[RUNTIME_MAX_TENSOR_DIMS] = {};
-        uint32_t ent_offsets[RUNTIME_MAX_TENSOR_DIMS] = {};
+        // Decompose start_offset into row-major multi-dim offsets. By the same
+        // relation strides[i] = prod(ref_shapes[i+1..]) so dividing by strides[i]
+        // (no inner loop) yields each axis offset directly.
+        uint32_t in_offsets[MAX_TENSOR_DIMS] = {};
+        uint32_t ent_offsets[MAX_TENSOR_DIMS] = {};
         uint64_t in_remain = input.start_offset;
         uint64_t ent_remain = start_offset;
         for (uint32_t i = 0; i < ndims; i++)

@@ -74,7 +74,6 @@
 #include "pto_task_id.h"
 #include "pto_tensormap.h"
 #include "tensor.h"
-#include "tensor_arg.h"
 
 namespace {
 
@@ -160,15 +159,15 @@ struct EdgeAnnot {
     // Consumer side (the Tensor the submitting task is reading).
     uint8_t consumer_dtype;
     uint32_t consumer_ndims;
-    uint32_t consumer_shape[RUNTIME_MAX_TENSOR_DIMS];
+    uint32_t consumer_shape[MAX_TENSOR_DIMS];
     uint64_t consumer_start_offset;  // 1D element offset
-    uint32_t consumer_strides[RUNTIME_MAX_TENSOR_DIMS];
+    uint32_t consumer_strides[MAX_TENSOR_DIMS];
     // Producer side (the slice the producer wrote, from the tensormap entry).
     // Only populated when source == TENSORMAP.
     uint32_t producer_ndims;
-    uint32_t producer_shape[RUNTIME_MAX_TENSOR_DIMS];
+    uint32_t producer_shape[MAX_TENSOR_DIMS];
     uint64_t producer_start_offset;
-    uint32_t producer_strides[RUNTIME_MAX_TENSOR_DIMS];
+    uint32_t producer_strides[MAX_TENSOR_DIMS];
 };
 
 // One entry in the tensors[] table: the underlying storage, keyed by
@@ -194,9 +193,9 @@ struct TaskArgEntry {
     uint64_t tensor_id;
     uint8_t dtype;
     uint32_t ndims;
-    uint32_t shape[RUNTIME_MAX_TENSOR_DIMS];
+    uint32_t shape[MAX_TENSOR_DIMS];
     uint64_t start_offset;  // 1D element offset
-    uint32_t strides[RUNTIME_MAX_TENSOR_DIMS];
+    uint32_t strides[MAX_TENSOR_DIMS];
 };
 
 struct TaskTableEntry {
@@ -271,7 +270,7 @@ void fill_consumer(EdgeAnnot &e, const Tensor &t) {
     e.consumer_dtype = static_cast<uint8_t>(t.dtype);
     e.consumer_ndims = t.ndims;
     e.consumer_start_offset = t.start_offset;
-    for (uint32_t i = 0; i < t.ndims && i < RUNTIME_MAX_TENSOR_DIMS; i++) {
+    for (uint32_t i = 0; i < t.ndims && i < MAX_TENSOR_DIMS; i++) {
         e.consumer_shape[i] = t.shapes[i];
         e.consumer_strides[i] = t.strides[i];
     }
@@ -282,7 +281,7 @@ void fill_consumer(EdgeAnnot &e, const Tensor &t) {
 void fill_producer(EdgeAnnot &e, const PTO2TensorMapEntry &entry) {
     e.producer_ndims = entry.ndims;
     e.producer_start_offset = entry.start_offset;
-    for (uint32_t i = 0; i < entry.ndims && i < RUNTIME_MAX_TENSOR_DIMS; i++) {
+    for (uint32_t i = 0; i < entry.ndims && i < MAX_TENSOR_DIMS; i++) {
         e.producer_shape[i] = entry.shapes[i];
         e.producer_strides[i] = entry.strides[i];
     }
@@ -661,7 +660,7 @@ dep_gen_replay_emit_deps_json(const DepGenRecord *records, size_t num_records, c
                 slot.dtype = static_cast<uint8_t>(t.dtype);
                 slot.ndims = t.ndims;
                 slot.start_offset = t.start_offset;
-                for (uint32_t d = 0; d < t.ndims && d < RUNTIME_MAX_TENSOR_DIMS; d++) {
+                for (uint32_t d = 0; d < t.ndims && d < MAX_TENSOR_DIMS; d++) {
                     slot.shape[d] = t.shapes[d];
                     slot.strides[d] = t.strides[d];
                 }

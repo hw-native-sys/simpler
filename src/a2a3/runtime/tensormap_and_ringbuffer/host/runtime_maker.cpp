@@ -191,15 +191,15 @@ extern "C" int bind_callable_to_runtime_impl(
 
     int64_t t_args_start = _now_ms();
     for (int i = 0; i < tensor_count; i++) {
-        ContinuousTensor t = orch_args->tensor(i);
+        Tensor t = orch_args->tensor(i);
 
         if (t.is_child_memory()) {
-            LOG_INFO_V0("  Tensor %d: child memory, pass-through (0x%" PRIx64 ")", i, t.data);
+            LOG_INFO_V0("  Tensor %d: child memory, pass-through (0x%" PRIx64 ")", i, t.buffer.addr);
             device_args.add_tensor(t);
             continue;
         }
 
-        void *host_ptr = reinterpret_cast<void *>(static_cast<uintptr_t>(t.data));
+        void *host_ptr = reinterpret_cast<void *>(static_cast<uintptr_t>(t.buffer.addr));
         size_t size = static_cast<size_t>(t.nbytes());
 
         void *dev_ptr = runtime->host_api.device_malloc(size);
@@ -217,32 +217,13 @@ extern "C" int bind_callable_to_runtime_impl(
         runtime->tensor_pairs_.push_back({host_ptr, dev_ptr, size});
         LOG_INFO_V0("  Tensor %d: %zu bytes at %p", i, size, dev_ptr);
 
-        t.data = reinterpret_cast<uint64_t>(dev_ptr);
+        t.buffer.addr = reinterpret_cast<uint64_t>(dev_ptr);
         device_args.add_tensor(t);
     }
     for (int i = 0; i < scalar_count; i++) {
         device_args.add_scalar(orch_args->scalar(i));
     }
     int64_t t_args_end = _now_ms();
-
-    // Read ready queue shard count from environment for AICPU scheduler
-    {
-        const char *env_shards = std::getenv("PTO2_READY_QUEUE_SHARDS");
-        if (env_shards) {
-            char *endptr;
-            int64_t val = strtol(env_shards, &endptr, 10);
-            if (endptr != env_shards && *endptr == '\0' && val >= 1 && val <= PLATFORM_MAX_AICPU_THREADS) {
-                runtime->ready_queue_shards = static_cast<int>(val);
-            } else {
-                LOG_WARN(
-                    "PTO2_READY_QUEUE_SHARDS=%s is invalid or out of range [1,%d], using default %d", env_shards,
-                    PLATFORM_MAX_AICPU_THREADS, RUNTIME_DEFAULT_READY_QUEUE_SHARDS
-                );
-                runtime->ready_queue_shards = RUNTIME_DEFAULT_READY_QUEUE_SHARDS;
-            }
-        }
-        LOG_INFO_V0("Ready queue shards: %d", runtime->ready_queue_shards);
-    }
 
     // Read orchestrator-to-scheduler transition flag from environment
     {

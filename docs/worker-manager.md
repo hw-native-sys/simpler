@@ -202,7 +202,7 @@ offset 8:                         uint64  reserved task callable field
 offset 16:                        CallConfig config
 MAILBOX_OFF_TASK_CALLABLE_HASH:   uint8[32] callable digest
 MAILBOX_OFF_TASK_ARGS_BLOB:       bytes [int32 T][int32 S]
-                                        [ContinuousTensor x T][uint64_t x S]
+                                        [Tensor x T][uint64_t x S]
 tail:                             fixed-size NUL-terminated error message
 ```
 

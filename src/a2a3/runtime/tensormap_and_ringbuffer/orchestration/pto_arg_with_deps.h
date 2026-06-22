@@ -30,7 +30,9 @@ public:
     using Arg::add_scalar;
     using Arg::add_scalars;
     using Arg::add_scalars_i32;
+    using Arg::allow_early_resolve;  // speculative early-dispatch hint (getter)
     using Arg::copy_scalars_from;
+    using Arg::set_allow_early_resolve;  // speculative early-dispatch hint (setter)
 
     // Error / status — forward to Arg
     using Arg::error_msg;

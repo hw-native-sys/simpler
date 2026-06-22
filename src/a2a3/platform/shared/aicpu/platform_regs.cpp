@@ -18,7 +18,9 @@
  * 3. Platform-agnostic AICore register initialization/deinitialization
  *
  * Ordering: read_reg / write_reg emit only the volatile MMIO load/store.
- * ARM64 Device-nGnRnE memory orders accesses within the same region; cross
+ * The MMIO region is Device-nGnRE (Early-write-ack, no Gathering, no
+ * Reordering) — see docs/hardware/mmio-performance.md for the driver
+ * source trace. nR orders accesses within the same region; cross
  * Device <-> Normal-cacheable ordering is the caller's responsibility
  * (wmb() before a publishing register write, rmb() after observing a
  * register hand-off bit).

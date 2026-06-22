@@ -348,7 +348,7 @@ public:
      * @param stream       AICPU stream
      * @param k_args       Kernel arguments
      * @param kernel_name  Name of the kernel to launch (e.g.
-     *                     `host::KernelNames::InitName` / `RunName`)
+     *                     `host::KernelNames::RunName`)
      * @param aicpu_num    Number of AICPU instances to launch
      * @return 0 on success, error code on failure
      */

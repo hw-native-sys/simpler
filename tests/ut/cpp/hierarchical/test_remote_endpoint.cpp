@@ -209,8 +209,8 @@ TaskArgs scalar_args() {
 
 TaskArgs bare_pointer_args() {
     TaskArgs args;
-    ContinuousTensor tensor{};
-    tensor.data = 0x1234;
+    Tensor tensor{};
+    tensor.buffer.addr = 0x1234;
     tensor.ndims = 1;
     tensor.shapes[0] = 1;
     tensor.dtype = DataType::UINT8;

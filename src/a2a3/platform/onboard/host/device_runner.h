@@ -98,11 +98,10 @@ public:
      * 1. Initializes device if not already done (lazy initialization)
      * 2. Initializes worker handshake buffers in the runtime based on block_dim
      * 3. Transfers runtime to device memory
-     * 4. Launches AICPU init kernel
-     * 5. Launches AICPU main kernel
-     * 6. Launches AICore kernel
-     * 7. Synchronizes streams
-     * 8. Cleans up runtime memory
+     * 4. Launches AICPU main kernel
+     * 5. Launches AICore kernel
+     * 6. Synchronizes streams
+     * 7. Cleans up runtime memory
      *
      * @param runtime             Runtime to execute (will be modified to
      * initialize workers)

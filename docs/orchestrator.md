@@ -49,7 +49,7 @@ public:
                                    const std::vector<TaskArgs> &args_list);
 
     // --- Intermediate-buffer allocation (runtime-owned lifetime) ---
-    ContinuousTensor alloc(const std::vector<uint32_t> &shape, DataType dtype);
+    Tensor alloc(const std::vector<uint32_t> &shape, DataType dtype);
 
     // --- Internal lifecycle (invoked by Worker::run only, bound as _scope_begin
     //     / _scope_end / _drain in the Python facade) ---
@@ -567,7 +567,7 @@ implicitly once the slot reaches `CONSUMED` and `last_alive` sweeps over it
 — no per-slot `munmap` runs.
 
 ```cpp
-ContinuousTensor Orchestrator::alloc(const std::vector<uint32_t> &shape, DataType dtype) {
+Tensor Orchestrator::alloc(const std::vector<uint32_t> &shape, DataType dtype) {
     // 1. Atomic {slot, heap_ptr} from the merged Ring. Blocks on
     //    back-pressure; throws on timeout.
     uint64_t aligned = align_up(nbytes(shape, dtype), HEAP_ALIGN);
@@ -592,7 +592,7 @@ ContinuousTensor Orchestrator::alloc(const std::vector<uint32_t> &shape, DataTyp
     // 6. Straight to COMPLETED — no dispatch needed.
     s.state = TaskState::COMPLETED;
     active_tasks_++;
-    return ContinuousTensor{key, shape, dtype};
+    return Tensor{key, shape, dtype};
 }
 ```
 

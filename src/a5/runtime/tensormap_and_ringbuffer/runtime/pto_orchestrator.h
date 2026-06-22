@@ -44,6 +44,7 @@
  */
 struct PTO2OrchestratorLayout {
     size_t off_fanin_pool[PTO2_MAX_RING_DEPTH];
+    size_t off_fanin_seen_epoch[PTO2_MAX_RING_DEPTH];
     size_t off_scope_tasks;
     size_t off_scope_begins;
     PTO2TensorMapLayout tensor_map;
@@ -67,6 +68,8 @@ struct PTO2OrchestratorState {
 
     // === PER-RING RESOURCES ===
     PTO2RingSet rings[PTO2_MAX_RING_DEPTH];
+    uint32_t *fanin_seen_epoch[PTO2_MAX_RING_DEPTH];
+    uint32_t fanin_seen_current_epoch{1};
 
     // === TENSOR MAP (Private) ===
     PTO2TensorMap tensor_map;  // Producer lookup

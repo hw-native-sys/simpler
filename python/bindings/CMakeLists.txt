@@ -34,6 +34,10 @@ nanobind_add_module(_task_interface ${BINDING_SOURCES} ${HIERARCHICAL_SOURCES})
 
 target_sources(_task_interface PRIVATE
     ${CMAKE_SOURCE_DIR}/src/common/worker/chip_worker.cpp
+    # Host-side assert_impl / get_stacktrace for the unified Tensor's
+    # always_assert (Tensor::make -> init_external). The binding does not link
+    # the runtime orchestration/common.cpp that provides these for runtime .so.
+    ${CMAKE_SOURCE_DIR}/src/common/task_interface/assert_compat.cpp
 )
 
 target_include_directories(_task_interface PRIVATE

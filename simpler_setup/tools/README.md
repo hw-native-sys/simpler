@@ -1,6 +1,6 @@
 # Profiling & Debug Tools (shipped in the wheel)
 
-End-user CLIs for analyzing PTO Runtime profiling data and tensor dumps.
+End-user CLIs for analyzing PTO Runtime profiling data and args dumps.
 All are invokable as Python modules once the `simpler` wheel is installed —
 no repo checkout required.
 
@@ -12,10 +12,10 @@ no repo checkout required.
 - **[swimlane_converter](#swimlane_converter)** — perf JSON → Chrome Trace Event (Perfetto)
 - **[sched_overhead_analysis](#sched_overhead_analysis)** — scheduler overhead / Tail OH breakdown
 - **[device_log_timing](#device_log_timing)** — Total / Orch / Sched from a CANN device log (no swimlane JSON)
-- **[dump_viewer](#dump_viewer)** — tensor dump inspection and export
+- **[dump_viewer](#dump_viewer)** — inspect / export args dumps (see [docs/tensor-dump.md](../../docs/dfx/tensor-dump.md) for full workflow)
 - **[deps_viewer](#deps_viewer)** — `deps.json` (dep_gen) → text or pan/zoom HTML dependency graph
 
-Auto-detection paths (`outputs/*/l2_swimlane_records.json`, `outputs/*/tensor_dump/`)
+Auto-detection paths (`outputs/*/l2_swimlane_records.json`, `outputs/*/args_dump/`)
 are resolved relative to the **current working directory** — run these from the
 directory that holds your `outputs/`. Each test case writes into its own
 `outputs/<case>_<ts>/` directory; the tools auto-pick the latest by mtime.
@@ -325,24 +325,24 @@ at view time.
 
 ## dump_viewer
 
-Inspect and export tensors captured by the runtime tensor-dump feature.
+Inspect and export args captured by the runtime args-dump feature.
 See [docs/tensor-dump.md](../../docs/dfx/tensor-dump.md) for the full capture workflow;
 this section only documents CLI invocation.
 
 ### Basic Usage
 
 ```bash
-# List all tensors (auto-picks latest outputs/tensor_dump_* dir)
+# List all args (auto-picks latest outputs/*/args_dump dir)
 python -m simpler_setup.tools.dump_viewer
 
-# Filter by stage/role/func_id
-python -m simpler_setup.tools.dump_viewer --func 3 --stage before --role input
+# Filter by task/stage/role
+python -m simpler_setup.tools.dump_viewer --task 0x0000000200000a00 --stage before --role input
 
 # Export the current selection to txt
-python -m simpler_setup.tools.dump_viewer --func 3 --stage before --role input --export
+python -m simpler_setup.tools.dump_viewer --task 0x0000000200000a00 --stage before --role input --export
 
-# Export a specific tensor by index (always exports)
-python -m simpler_setup.tools.dump_viewer outputs/<case>_<ts>/tensor_dump/ --index 42
+# Export a specific arg by index (always exports)
+python -m simpler_setup.tools.dump_viewer outputs/<case>_<ts>/args_dump/ --index 42
 ```
 
 ---

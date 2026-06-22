@@ -42,9 +42,9 @@ from .task_interface import (
     ChipCallable,
     CommBufferSpec,
     CommDomainHandle,
-    ContinuousTensor,
     DataType,
     TaskArgs,
+    Tensor,
 )
 
 
@@ -279,10 +279,10 @@ class Orchestrator:
         """Copy *size* bytes from worker *src* to host *dst*."""
         self._o.copy_from(int(worker_id), int(dst), int(src), int(size))
 
-    def alloc(self, shape: Sequence[int], dtype: DataType) -> ContinuousTensor:
+    def alloc(self, shape: Sequence[int], dtype: DataType) -> Tensor:
         """Allocate a runtime-managed intermediate buffer.
 
-        Returns a ``ContinuousTensor`` whose backing memory comes from a
+        Returns a ``Tensor`` whose backing memory comes from a
         per-allocation MAP_SHARED mmap (visible to forked child workers).
         Lifetime is bound to a synthetic task slot that the Orchestrator
         treats as the buffer's producer; the buffer is freed when all

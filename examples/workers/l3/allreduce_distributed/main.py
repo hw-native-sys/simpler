@@ -46,10 +46,10 @@ from simpler.task_interface import (  # noqa: E402
     CallConfig,
     ChipCallable,
     CommBufferSpec,
-    ContinuousTensor,
     CoreCallable,
     DataType,
     TaskArgs,
+    Tensor,
     TensorArgType,
 )
 from simpler.worker import Worker  # noqa: E402
@@ -192,7 +192,7 @@ def run(
                     # host tensor — so wrap it manually with child_memory=True
                     # to skip the runtime's H2D path.
                     chip_args.add_tensor(
-                        ContinuousTensor.make(
+                        Tensor.make(
                             data=domain.buffer_ptrs["scratch"],
                             shapes=(ALLREDUCE_COUNT,),
                             dtype=DataType.FLOAT32,

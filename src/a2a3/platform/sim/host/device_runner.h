@@ -57,7 +57,7 @@ private:
     void (*aicore_execute_func_)(Runtime *, int, CoreType, uint32_t, uint64_t, uint32_t, uint64_t){nullptr};
     void (*set_platform_regs_func_)(uint64_t){nullptr};
     void (*set_platform_dump_base_func_)(uint64_t){nullptr};
-    void (*set_dump_tensor_enabled_func_)(bool){nullptr};
+    void (*set_dump_args_enabled_func_)(bool){nullptr};
     void (*set_platform_l2_swimlane_base_func_)(uint64_t){nullptr};
     void (*set_platform_l2_swimlane_aicore_rotation_table_func_)(uint64_t){nullptr};
     void (*set_l2_swimlane_enabled_func_)(bool){nullptr};

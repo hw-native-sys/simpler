@@ -18,6 +18,7 @@
 
 #include <atomic>
 
+#include "profiling_config.h"
 #include "pto_constants.h"
 #include "pto_runtime_status.h"
 #include "pto2_dispatch_payload.h"
@@ -32,6 +33,18 @@
 #define SPIN_WAIT_HINT() ((void)0)
 #endif
 
+#if PTO2_ORCH_PROFILING || PTO2_SCHED_PROFILING
+#include "aicpu/device_time.h"
+#endif
+
+// =============================================================================
+// Configuration Constants
+// =============================================================================
+
+// Task management
+// NOTE: PTO2_TASK_WINDOW_SIZE is now a per-ring default value.
+// Actual window size is passed at runtime to runtime_create_from_sm().
+// Use pto2_task_slot(sched, task_id) for slot calculation.
 #define PTO2_TASK_WINDOW_SIZE 16384  // Default per-ring task window size (power of 2)
 
 // Step 1 of static-N migration: single-ring layout. All scopes map to ring 0.
@@ -49,6 +62,9 @@
 
 // Ready queue
 #define PTO2_READY_QUEUE_SIZE 65536  // Per-shape queue size
+
+// Cross-thread early-dispatch work queue (power of two)
+#define PTO2_EARLY_DISPATCH_QUEUE_SIZE 64
 
 // Wiring queue
 #define PTO2_WRIRING_QUEUE_SIZE 1024  // Per-shape queue size
@@ -107,15 +123,26 @@ struct PTO2TaskDescriptor
     void *packed_buffer_end;   // End of packed buffer (for heap reclamation)
 };
 
-struct PTO2TaskPayload
-{
-    // === Cache lines 0-2 (192B) — metadata + fanin ===
+// =============================================================================
+// Per-Slot Scheduling State
+// =============================================================================
+
+/**
+ * Task payload data (cold path - only accessed during orchestration and dispatch)
+ *
+ * Layout: metadata + flat fanin_local_ids[] in the first 2 cache lines,
+ * followed by bulk tensor and scalar data.
+ */
+
+struct PTO2TaskPayload {
+    // === Cache lines 0-2 (192B) — metadata + fanin (wireless model) ===
     int32_t tensor_count{0};
     int32_t scalar_count{0};
-    int32_t fanin_count{0};  // Number of valid entries in fanin_local_ids
-    // Local ids of fanin producers, used by the thread-0 polling loop to
-    // index a compact ring-level completion_flags byte array. Avoids a
-    // pointer chase per fanin into a 128B-aligned slot_state.
+    // wireless: flat fanin_local_ids[] populated at submit. The thread-0
+    // pending poll indexes a compact ring-level completion_flags byte array
+    // via these ids — avoids a pointer chase per fanin into a 128B-aligned
+    // slot_state.
+    int32_t fanin_count{0};
     int32_t fanin_local_ids[PTO2_MAX_FANIN];
     // === Tensors (Tensor is alignas(64); array is naturally aligned) ===
     Tensor tensors[MAX_TENSOR_ARGS];
@@ -125,8 +152,37 @@ struct PTO2TaskPayload
     static_assert(sizeof(Tensor) == 128, "Tensor must be 2 cache lines");
     static_assert(MAX_SCALAR_ARGS * sizeof(uint64_t) == MAX_SCALAR_ARGS * 8, "scalar region size matches MAX_SCALAR_ARGS");
 
-    void init(const Arg &args, TaskOutputTensors &result, PTO2TaskAllocResult &alloc_result, PTO2OutputLayout &layout)
-    {
+    /**
+     * Prefetch (for write) the regions init() is about to fill so the stores land
+     * in warm cache. tensor_count/scalar_count come from the Arg — the payload's
+     * own counts are not set until init(). Warms the early-dispatch spec block at
+     * offset 536 (cache line 8) too. A member fn lowers to the same prefetch
+     * instructions as a free function (`this` is just a register), no cache impact.
+     */
+    void prefetch(int32_t tensor_count, int32_t scalar_count) const {
+        for (int32_t i = 0; i < tensor_count; i++) {
+            __builtin_prefetch(&tensors[i], 1, 3);
+            __builtin_prefetch(reinterpret_cast<const char *>(&tensors[i]) + 64, 1, 3);
+        }
+        for (int32_t i = 0; i < scalar_count; i += 8) {
+            __builtin_prefetch(&scalars[i], 1, 3);
+        }
+        __builtin_prefetch(this, 1, 3);
+        __builtin_prefetch(reinterpret_cast<const char *>(this) + 64, 1, 3);
+        __builtin_prefetch(reinterpret_cast<const char *>(this) + 128, 1, 3);
+    }
+
+    /**
+     * Initialize payload: copy tensors, store scalars.
+     *
+     * For each param slot, the tensor source is determined by TensorArgType:
+     * - OUTPUT -> use materialized_outputs.output_ptr(out_idx++)
+     * - INPUT / INOUT -> use refs[i].tensor
+     *
+     * @param args                Task arguments (tensors + scalars)
+     * @param result  Materialized output tensors (from TensorCreateInfo path)
+     */
+    void init(const Arg &args, TaskOutputTensors &result, PTO2TaskAllocResult &alloc_result, PTO2OutputLayout &layout) {
         tensor_count = args.tensor_count();
         scalar_count = args.scalar_count();
 
@@ -136,15 +192,17 @@ struct PTO2TaskPayload
             if (args.tag(i) != TensorArgType::OUTPUT)
             {
                 tensors[i].copy(*args.tensor(i).ptr);
-            }
-            else
-            {
-                tensors[i].init_from_create_info(*args.tensor(i).create_info, reinterpret_cast<void *>(reinterpret_cast<char *>(alloc_result.packed_base) + layout.offsets[i]), layout.buffer_sizes[i]);
+            } else {
+                init_tensor_from_create_info(
+                    tensors[i], *args.tensor(i).create_info,
+                    reinterpret_cast<void *>(reinterpret_cast<char *>(alloc_result.packed_base) + layout.offsets[i]),
+                    layout.buffer_sizes[i]
+                );
                 tensors[i].owner_task_id = result.task_id();
                 result.materialize_output(tensors[i]);
             }
         }
-        // Round up to cache line boundary. Both arrays are 1024B so no overrun.
+        // Round up to cache line boundary. Both arrays are 128B so no overrun.
         // Eliminates branches; extra bytes within the same CL have zero additional cost.
         memcpy(scalars, args.scalars(), PTO2_ALIGN_UP(args.scalar_count() * sizeof(uint64_t), 64));
     }
@@ -187,7 +245,11 @@ struct alignas(64) PTO2TaskSlotState
     std::atomic<int16_t> completed_subtasks{0};  // Each core completion increments by 1
     int16_t total_required_subtasks{0};          // = logical_block_num * popcount(active_mask)
     int16_t logical_block_num{1};                // Total logical blocks (set by orchestrator)
-    int16_t next_block_idx{0};                   // Next block to dispatch (scheduler state)
+    // Next block to dispatch. Atomic so concurrent speculative stagers can each
+    // claim a distinct block via CAS; normal dispatch (ready-queue serialized)
+    // uses plain relaxed load/store. The two phases never overlap in time (staging
+    // happens before release; normal dispatch of the remainder happens after).
+    std::atomic<int16_t> next_block_idx{0};
 
     void bind_ring(uint8_t rid)
     {
@@ -203,7 +265,7 @@ struct alignas(64) PTO2TaskSlotState
     void reset_for_reuse()
     {
         completed_subtasks.store(0, std::memory_order_relaxed);
-        next_block_idx = 0;
+        next_block_idx.store(0, std::memory_order_relaxed);
         any_subtask_deferred.store(false, std::memory_order_relaxed);
         // (e) Wake list: clear for the next incarnation. Previous incarnation
         // left it at WAKE_LIST_SENTINEL (set by its on_mixed_task_complete).

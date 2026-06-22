@@ -178,7 +178,7 @@ inline void AicpuExecutor::resolve_task_dependencies(
     }
 
 #if PTO2_PROFILING
-    if (is_dump_tensor_enabled()) {
+    if (is_dump_args_enabled()) {
         uint64_t callable_addr = runtime.get_function_bin_addr(task->func_id);
         if (callable_addr != 0) {
             const CoreCallable *callable = reinterpret_cast<const CoreCallable *>(callable_addr);
@@ -187,7 +187,7 @@ inline void AicpuExecutor::resolve_task_dependencies(
             uint64_t tensor_buffer_addrs[RUNTIME_MAX_ARGS] = {};
             int tensor_buffer_count =
                 collect_task_tensor_buffer_addrs(runtime, *task, tensor_buffer_addrs, RUNTIME_MAX_ARGS);
-            dump_tensors_for_task(
+            dump_args_for_task(
                 thread_idx, static_cast<uint64_t>(task->task_id), task->num_args, *callable, tensor_info,
                 tensor_info_count, tensor_buffer_addrs, tensor_buffer_count, TensorDumpStage::AFTER_COMPLETION
             );
@@ -256,7 +256,7 @@ inline bool AicpuExecutor::try_dispatch_task(
     );
 
 #if PTO2_PROFILING
-    if (is_dump_tensor_enabled()) {
+    if (is_dump_args_enabled()) {
         Task *task = runtime.get_task(task_id);
         if (task != nullptr) {
             uint64_t callable_addr = runtime.get_function_bin_addr(task->func_id);
@@ -267,7 +267,7 @@ inline bool AicpuExecutor::try_dispatch_task(
                 uint64_t tensor_buffer_addrs[RUNTIME_MAX_ARGS] = {};
                 int tensor_buffer_count =
                     collect_task_tensor_buffer_addrs(runtime, *task, tensor_buffer_addrs, RUNTIME_MAX_ARGS);
-                dump_tensors_for_task(
+                dump_args_for_task(
                     thread_idx, static_cast<uint64_t>(task_id), task->num_args, *callable, tensor_info,
                     tensor_info_count, tensor_buffer_addrs, tensor_buffer_count, TensorDumpStage::BEFORE_DISPATCH
                 );
@@ -368,8 +368,8 @@ int AicpuExecutor::init(Runtime *runtime) {
         dispatch_timestamps_[i] = 0;
     }
 #if PTO2_PROFILING
-    if (is_dump_tensor_enabled()) {
-        dump_tensor_init(aicpu_thread_num_);
+    if (is_dump_args_enabled()) {
+        dump_args_init(aicpu_thread_num_);
     }
     if (is_pmu_enabled()) {
         pmu_aicpu_init(physical_core_ids_, cores_total_num_);
@@ -1102,8 +1102,8 @@ int AicpuExecutor::run(Runtime *runtime) {
     if (is_pmu_enabled()) {
         pmu_aicpu_flush_buffers(thread_idx, cur_thread_cores, thread_cores_num_[thread_idx]);
     }
-    if (is_dump_tensor_enabled()) {
-        dump_tensor_flush(thread_idx);
+    if (is_dump_args_enabled()) {
+        dump_args_flush(thread_idx);
     }
 #endif
 

@@ -13,7 +13,7 @@
  *
  * 1. wire_task()         — fanout wiring, early-finished detection,
  *                          fanin_count initialization, ready push
- * 2. on_mixed_task_complete() — COMPLETED transition, fanout traversal,
+ * 2. on_task_complete() — COMPLETED transition, fanout traversal,
  *                               consumer fanin release
  * 3. on_task_release()   — fanin traversal, producer release,
  *                          self-CONSUMED check
@@ -42,6 +42,13 @@ protected:
     PTO2SharedMemoryHandle *sm_handle = nullptr;
     DeviceArena sm_arena;
     DeviceArena sched_arena;
+
+    // Each init_slot()'d slot gets a distinct zeroed payload from this pool,
+    // mirroring orch::prepare_task's bind_buffers: every production slot has a
+    // payload, and the scheduler's release/propagate paths dereference it.
+    static constexpr int kSlotPayloadPoolSize = 16;
+    PTO2TaskPayload slot_payload_pool_[kSlotPayloadPoolSize];
+    int slot_payload_pool_idx_ = 0;
 
     void SetUp() override {
         sm_handle = PTO2SharedMemoryHandle::create_and_init_default(sm_arena);
@@ -76,6 +83,9 @@ protected:
         slot.total_required_subtasks = 1;
         slot.logical_block_num = 1;
         slot.dep_pool_mark = 0;
+        PTO2TaskPayload &slot_pl = slot_payload_pool_[slot_payload_pool_idx_++ % kSlotPayloadPoolSize];
+        memset(&slot_pl, 0, sizeof(slot_pl));
+        slot.payload = &slot_pl;
     }
 };
 
@@ -231,7 +241,7 @@ TEST_F(WiringTest, WireTaskMixedProducerStates) {
 }
 
 // =============================================================================
-// on_mixed_task_complete: notifies consumers via fanout chain
+// on_task_complete: notifies consumers via fanout chain
 // =============================================================================
 
 TEST_F(WiringTest, OnMixedTaskCompleteNotifiesConsumers) {
@@ -264,7 +274,7 @@ TEST_F(WiringTest, OnMixedTaskCompleteNotifiesConsumers) {
     dep_entries[1].next = &dep_entries[0];
     producer.fanout_head = &dep_entries[1];
 
-    sched.on_mixed_task_complete(producer);
+    sched.on_task_complete(producer);
 
     // Producer should be COMPLETED
     EXPECT_EQ(producer.task_state.load(), PTO2_TASK_COMPLETED);

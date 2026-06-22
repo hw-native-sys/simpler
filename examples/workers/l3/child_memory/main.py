@@ -14,7 +14,7 @@ Pattern (the "load weights once, run kernel many times" idiom):
   * ``orch.malloc(worker_id=0, nbytes)`` — allocate a buffer that lives on
     the chip child for as long as the chip is alive.
   * ``orch.copy_to(worker_id=0, dev, host, n)`` — H2D upload of the weight.
-  * ``ContinuousTensor.make(dev_ptr, shape, dtype, child_memory=True)`` —
+  * ``Tensor.make(dev_ptr, shape, dtype, child_memory=True)`` —
     wrap the worker pointer as a tensor that the runtime treats as
     *already on device*. ``init_runtime_impl`` skips malloc + H2D copy
     for these and does not record them in ``tensor_pairs``, so the buffer
@@ -29,7 +29,7 @@ basics of L3 / orch / submit_next_level):
 
   * ``orch.malloc / orch.copy_to`` — control-plane device-memory ops that
     forward to the chip child via mailbox IPC.
-  * ``ContinuousTensor.make(..., child_memory=True)`` — opt-out of the
+  * ``Tensor.make(..., child_memory=True)`` — opt-out of the
     runtime's auto-malloc + auto-free for a tensor whose lifetime you
     manage yourself.
 
@@ -54,10 +54,10 @@ from simpler.task_interface import (
     ArgDirection,
     CallConfig,
     ChipCallable,
-    ContinuousTensor,
     CoreCallable,
     DataType,
     TaskArgs,
+    Tensor,
     TensorArgType,
 )
 from simpler.worker import Worker
@@ -165,7 +165,7 @@ def run(platform: str, device_id: int) -> int:
             # on the worker; do NOT auto-malloc, do NOT auto-free at end-of-task".
             # Without this flag the first task's teardown would free dev_w and
             # the second task would read freed memory.
-            w_dev = ContinuousTensor.make(dev_w, (SIZE,), DataType.FLOAT32, child_memory=True)
+            w_dev = Tensor.make(dev_w, (SIZE,), DataType.FLOAT32, child_memory=True)
 
             # Two kernel invocations sharing the weight, pinned to chip 0.
             for out in (host_f1, host_f2):

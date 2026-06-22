@@ -222,7 +222,7 @@ def _split_core_bns_nd(
     kv_split_core_num = _ceil_div(kv_seq_aligned, kv_split_per_core)
 
     core_per_kv = 1
-    if decoder_batch * kv_split_core_num < block_dim * SPLITHEAD_RATIO:
+    if decoder_batch * kv_split_core_num < block_dim:
         core_per_kv = _ceil_div(block_dim, decoder_batch * kv_split_core_num)
 
     head_split = _ceil_div(num_heads, core_per_kv)
@@ -296,7 +296,7 @@ def make_pa_nd_decode_tiling(  # noqa: PLR0913, PLR0915
     indices: list[int] = sorted(range(batch), key=lambda i: kv_seq_lens[i])
 
     decoder_batch = batch
-    is_long_seq = max_kv >= block_dim * KV_SEQLEN_SLICE * 2
+    is_long_seq = max_kv >= KV_SEQLEN_SLICE_512 * 8
 
     use_bn = is_mla or (decoder_batch * num_heads >= block_dim * SPLITKV_RATIO and not is_long_seq)
 
