@@ -34,7 +34,7 @@ class TestPagedAttentionUnroll(SceneTestCase):
                 "name": "QK",
                 "source": "kernels/aic/aic_qk_matmul.cpp",
                 "core_type": "aic",
-                "signature": [D.IN, D.IN, D.OUT],
+                "signature": [D.IN, D.IN, D.IN, D.OUT],
             },
             {
                 "func_id": 1,
@@ -48,7 +48,7 @@ class TestPagedAttentionUnroll(SceneTestCase):
                 "name": "PV",
                 "source": "kernels/aic/aic_pv_matmul.cpp",
                 "core_type": "aic",
-                "signature": [D.IN, D.IN, D.OUT],
+                "signature": [D.IN, D.IN, D.IN, D.OUT],
             },
             {
                 "func_id": 3,

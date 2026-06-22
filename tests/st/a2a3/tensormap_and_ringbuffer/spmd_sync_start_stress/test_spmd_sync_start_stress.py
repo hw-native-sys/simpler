@@ -62,6 +62,11 @@ class TestSpmdSyncStartStress(SceneTestCase):
                 "name": "SPMD_MIX_AIC",
                 "source": "../spmd_multiblock_mix/kernels/aic/kernel_spmd_mix.cpp",
                 "core_type": "aic",
+                # Cooperative MIX (AIC+AIV0+AIV1 share one args[]). Declare the
+                # payload signature on exactly ONE subtask so the tensor dump's
+                # per-subtask sum equals the payload (1 INOUT tensor); the AIVs
+                # stay empty or the sum would triple and the dump is skipped.
+                "signature": [D.INOUT],
             },
             {
                 "func_id": 1,
@@ -80,6 +85,9 @@ class TestSpmdSyncStartStress(SceneTestCase):
                 "name": "SPMD_WRITE_AIV",
                 "source": "../spmd_multiblock_aiv/kernels/aiv/kernel_spmd_write.cpp",
                 "core_type": "aiv",
+                # Separate single-AIV task (not part of the MIX above): its own
+                # args[] has one INOUT tensor, so declare it here.
+                "signature": [D.INOUT],
             },
         ],
     }
