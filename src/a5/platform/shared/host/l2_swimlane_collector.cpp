@@ -831,6 +831,18 @@ int L2SwimlaneCollector::export_swimlane_json() {
                 return "complete";
             case L2SwimlaneSchedPhaseKind::Dispatch:
                 return "dispatch";
+            case L2SwimlaneSchedPhaseKind::Release:
+                return "release";
+            case L2SwimlaneSchedPhaseKind::Wire:
+                return "wire";
+            case L2SwimlaneSchedPhaseKind::Dummy:
+                return "dummy";
+            case L2SwimlaneSchedPhaseKind::EarlyDispatch:
+                return "early_dispatch";
+            case L2SwimlaneSchedPhaseKind::Resolve:
+                return "resolve";
+            case L2SwimlaneSchedPhaseKind::DummyTask:
+                return "dummy_task";
             }
             return "unknown";
         };

@@ -743,8 +743,9 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
         }
 
         // Phase 3: Drain wiring queue (thread 0 only)
+        int wired = 0;
         if (thread_idx == 0) {
-            int wired = sched_->drain_wiring_queue(orchestrator_done_);
+            wired = sched_->drain_wiring_queue(orchestrator_done_);
             if (wired > 0) {
                 made_progress = true;
 #if PTO2_SCHED_PROFILING
@@ -754,6 +755,21 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
         }
 #if PTO2_PROFILING
         CYCLE_COUNT_LAP(l2_swimlane.sched_wiring_cycle);
+        // Wire outer phase: emit one bar covering this iter's drain_wiring_queue
+        // pass when it wired any tasks. tasks_processed = wired count.
+        if (l2_swimlane_level_ >= L2SwimlaneLevel::SCHED_PHASES && wired > 0) {
+            int16_t phase_end_local[L2SWIMLANE_NUM_QUEUE_SHAPES];
+            capture_local_snapshot(phase_end_local);
+            l2_swimlane_aicpu_record_sched_phase(
+                thread_idx, L2SwimlaneSchedPhaseKind::Wire, _t0_phase, _t1, l2_swimlane.sched_loop_count,
+                static_cast<uint32_t>(wired), /*pop_hit=*/0, /*pop_miss=*/0, phase_start_local, phase_start_shared,
+                phase_end_local, phase_start_shared
+            );
+            for (int s = 0; s < L2SWIMLANE_NUM_QUEUE_SHAPES; s++) {
+                phase_start_local[s] = phase_end_local[s];
+            }
+            _t0_phase = _t1;
+        }
 #endif
 
         // Phase 3b: Drain dummy ready queue (thread 0 only).
@@ -766,6 +782,12 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
             constexpr int DUMMY_DRAIN_BATCH = 16;
             PTO2TaskSlotState *dummy_batch[DUMMY_DRAIN_BATCH];
             int dummy_got = sched_->dummy_ready_queue.pop_batch(dummy_batch, DUMMY_DRAIN_BATCH);
+#if PTO2_PROFILING
+            // Dummy outer phase: covers handling of all dummies popped this
+            // iter. tasks_processed = dummy_got.
+            uint64_t dummy_outer_t0 =
+                (dummy_got > 0 && l2_swimlane_level_ >= L2SwimlaneLevel::SCHED_PHASES) ? get_sys_cnt_aicpu() : 0;
+#endif
             for (int di = 0; di < dummy_got; di++) {
                 PTO2TaskSlotState &dummy_slot = *dummy_batch[di];
 #if PTO2_SCHED_PROFILING
@@ -795,6 +817,22 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
             if (dummy_got > 0) {
                 made_progress = true;
             }
+#if PTO2_PROFILING
+            if (dummy_outer_t0 != 0) {
+                int16_t phase_end_local[L2SWIMLANE_NUM_QUEUE_SHAPES];
+                capture_local_snapshot(phase_end_local);
+                uint64_t dummy_outer_t1 = get_sys_cnt_aicpu();
+                l2_swimlane_aicpu_record_sched_phase(
+                    thread_idx, L2SwimlaneSchedPhaseKind::Dummy, dummy_outer_t0, dummy_outer_t1,
+                    l2_swimlane.sched_loop_count, static_cast<uint32_t>(dummy_got), /*pop_hit=*/0,
+                    /*pop_miss=*/0, phase_start_local, phase_start_shared, phase_end_local, phase_start_shared
+                );
+                for (int s = 0; s < L2SWIMLANE_NUM_QUEUE_SHAPES; s++) {
+                    phase_start_local[s] = phase_end_local[s];
+                }
+                _t0_phase = dummy_outer_t1;
+            }
+#endif
         }
 
         // Phase 4: MIX-strict-priority dispatch with phase-split and
