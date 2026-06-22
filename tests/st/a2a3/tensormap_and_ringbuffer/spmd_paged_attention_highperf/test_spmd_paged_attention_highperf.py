@@ -170,9 +170,10 @@ class TestSpmdPagedAttentionHighPerf(SceneTestCase):
     CASES = [
         {
             "name": "b1_h32_kv8_s128_bs128_fp16",
-            # onboard a2a3 stays out pending the
-            # separate 'out' golden mismatch (hw-native-sys/simpler#1070).
-            "platforms": ["a2a3sim"],
+            # onboard a2a3 enabled: the 'out' golden mismatch is closed by the
+            # producer-side DdrBarrierBeforeFfts cross-core DDR fence, validated
+            # over 19 st-onboard-a2a3 rounds.
+            "platforms": ["a2a3sim", "a2a3"],
             "config": {"aicpu_thread_num": 4, "block_dim": 24},
             "params": {
                 "batch": 1,
@@ -251,7 +252,7 @@ class TestSpmdPagedAttentionHighPerf(SceneTestCase):
         },
         {
             "name": "b1_h32_kv8_s8192_bs128_fp16",
-            "manual": True,
+            # enabled in CI to guard the long-sequence fix onboard.
             "platforms": ["a2a3"],
             "config": {"aicpu_thread_num": 4, "block_dim": 24},
             "params": {
