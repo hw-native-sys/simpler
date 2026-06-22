@@ -72,10 +72,6 @@
 // Fanin storage — absolute max number of unique fanin dependencies per task.
 #define PTO2_MAX_FANIN 16
 
-// Upstream spec-dispatch compatibility: inline fanin cap + spill pool fwd decl.
-#define PTO2_FANIN_INLINE_CAP 64
-struct PTO2FaninPool;  // Forward declaration (defined by upstream spec-dispatch path)
-
 // TensorMap cleanup interval
 #define PTO2_TENSORMAP_CLEANUP_INTERVAL 64  // Cleanup every N retired tasks
 #define PTO2_DEP_POOL_CLEANUP_INTERVAL 64   // Cleanup every N retired tasks
@@ -134,26 +130,9 @@ struct PTO2TaskDescriptor
 /**
  * Task payload data (cold path - only accessed during orchestration and dispatch)
  *
- * Layout: metadata + inline fanin packed in the first 9 cache lines, followed
- * by bulk tensor and scalar data. Small fanins stay fully inline; larger
- * fanins spill into a per-ring ring buffer slice.
+ * Layout: metadata + flat fanin_local_ids[] in the first 2 cache lines,
+ * followed by bulk tensor and scalar data.
  */
-// Speculative early-dispatch claim states for PTO2TaskPayload::spec_state.
-enum PTO2SpecState : uint8_t {
-    PTO2_SPEC_NONE = 0,       // not pre-staged
-    PTO2_SPEC_STAGING = 1,    // Hook 1 claimed it; staging in progress
-    PTO2_SPEC_STAGED = 2,     // staged on a core, gated; staged_* fields valid
-    PTO2_SPEC_DISPATCHED = 3  // routed via the normal dispatch path (no pre-stage)
-};
-
-// A pre-staged consumer occupies one core per gated subtask block. WHICH cores
-// it occupies is recorded as a bitmask (staged_core_mask, 1 bit per global
-// core_id); the completion-path release iterates the set bits and rings each
-// core's doorbell from the scheduler's per-core doorbell table. Bounded by the
-// chip's core count (RUNTIME_MAX_WORKER = 72; no two-level pre-dispatch means
-// gated cores in flight <= core count), NOT by block_num — so a wide SPMD
-// consumer can pre-stage all its idle cores. 2 words = 128 bits >= 72.
-inline constexpr int PTO2_SPEC_CORE_MASK_WORDS = 2;
 
 struct PTO2TaskPayload {
     // === Cache lines 0-2 (192B) — metadata + fanin (wireless model) ===
@@ -165,22 +144,6 @@ struct PTO2TaskPayload {
     // slot_state.
     int32_t fanin_count{0};
     int32_t fanin_local_ids[PTO2_MAX_FANIN];
-    // ---- Upstream spec-dispatch coexistence (compatibility layer) ----
-    // Speculative early-dispatch (#1079) was built on a fanin_refcount /
-    // fanin_slot_states model. The wireless poller doesn't read these
-    // fields, but the spec-dispatch code paths still do — keep the storage
-    // so that code links. Populated alongside fanin_local_ids[].
-    int32_t fanin_actual_count{0};
-    int32_t fanin_spill_start{0};
-    PTO2FaninPool *fanin_spill_pool{nullptr};
-    PTO2TaskSlotState *fanin_inline_slot_states[PTO2_FANIN_INLINE_CAP];
-    std::atomic<uint64_t> staged_core_mask[PTO2_SPEC_CORE_MASK_WORDS]{};
-    std::atomic<int32_t> dispatch_fanin{0};
-    bool allow_early_resolve{false};
-    std::atomic<uint8_t> spec_state{0};
-    std::atomic<uint8_t> dispatch_propagated{0};
-    std::atomic<uint8_t> spec_chain_active{0};
-    uint8_t spec_chain_depth{0};
     // === Tensors (Tensor is alignas(64); array is naturally aligned) ===
     Tensor tensors[MAX_TENSOR_ARGS];
     // === Scalars ===
@@ -207,7 +170,6 @@ struct PTO2TaskPayload {
         __builtin_prefetch(this, 1, 3);
         __builtin_prefetch(reinterpret_cast<const char *>(this) + 64, 1, 3);
         __builtin_prefetch(reinterpret_cast<const char *>(this) + 128, 1, 3);
-        __builtin_prefetch(reinterpret_cast<const char *>(this) + 512, 1, 3);  // spec fields (cache line 8)
     }
 
     /**
@@ -243,27 +205,6 @@ struct PTO2TaskPayload {
         // Round up to cache line boundary. Both arrays are 128B so no overrun.
         // Eliminates branches; extra bytes within the same CL have zero additional cost.
         memcpy(scalars, args.scalars(), PTO2_ALIGN_UP(args.scalar_count() * sizeof(uint64_t), 64));
-
-        // Speculative early-dispatch metadata — the single init point for these
-        // fields. reset_for_reuse MUST NOT touch the payload (it runs on the
-        // scheduler's advance-ring path and would pull this cold cache line across
-        // structures); prepare_task only allocates/binds. prefetch() warms this
-        // line (offset 512) so these writes land in warm cache.
-        //
-        // spec_state / staged_core_mask / dispatch_fanin / spec_chain_* are all
-        // CONSUMER-side: a task with allow_early_resolve == false still has them
-        // touched when one of ITS producers is flagged (propagate_dispatch_fanin
-        // bumps dispatch_fanin and may CAS spec_state / set the auto-chain flag on
-        // any consumer, independent of the consumer's own hint). So they MUST be
-        // zeroed here unconditionally — no per-task allow_early_resolve gating.
-        allow_early_resolve = args.allow_early_resolve();
-        spec_state.store(PTO2_SPEC_NONE, std::memory_order_relaxed);
-        for (int w = 0; w < PTO2_SPEC_CORE_MASK_WORDS; w++)
-            staged_core_mask[w].store(0, std::memory_order_relaxed);
-        dispatch_fanin.store(0, std::memory_order_relaxed);
-        dispatch_propagated.store(0, std::memory_order_relaxed);
-        spec_chain_active.store(0, std::memory_order_relaxed);
-        spec_chain_depth = 0;
     }
 };
 
@@ -326,11 +267,6 @@ struct alignas(64) PTO2TaskSlotState
         completed_subtasks.store(0, std::memory_order_relaxed);
         next_block_idx.store(0, std::memory_order_relaxed);
         any_subtask_deferred.store(false, std::memory_order_relaxed);
-        // Note: payload spec fields (spec_state / staged_core_mask / dispatch_fanin /
-        // spec_chain_*) are NOT reset here — this method skips the payload by
-        // contract. They are (re)initialized in PTO2TaskPayload::init on every
-        // submit, before the slot becomes visible to the scheduler.
-
         // (e) Wake list: clear for the next incarnation. Previous incarnation
         // left it at WAKE_LIST_SENTINEL (set by its on_mixed_task_complete).
         wake_list_head.store(nullptr, std::memory_order_relaxed);
