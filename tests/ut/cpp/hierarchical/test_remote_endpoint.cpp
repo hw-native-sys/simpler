@@ -39,7 +39,7 @@ void count_sigpipe(int) { ++g_sigpipe_count; }
 class ScopedSigpipeCounter {
 public:
     ScopedSigpipeCounter() {
-        struct sigaction action {};
+        struct sigaction action{};
         action.sa_handler = count_sigpipe;
         sigemptyset(&action.sa_mask);
         action.sa_flags = 0;
@@ -55,7 +55,7 @@ public:
     ScopedSigpipeCounter &operator=(const ScopedSigpipeCounter &) = delete;
 
 private:
-    struct sigaction old_action_ {};
+    struct sigaction old_action_{};
 };
 
 void append_i32(std::vector<uint8_t> &out, int32_t v) {
@@ -112,7 +112,7 @@ uint16_t start_closing_server(std::thread &server_thread) {
     server_thread = std::thread([listener]() {
         int fd = ::accept(listener, nullptr, nullptr);
         if (fd >= 0) {
-            struct linger rst {};
+            struct linger rst{};
             rst.l_onoff = 1;
             rst.l_linger = 0;
             (void)::setsockopt(fd, SOL_SOCKET, SO_LINGER, &rst, sizeof(rst));
