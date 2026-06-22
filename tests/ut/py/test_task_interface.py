@@ -593,6 +593,10 @@ class TestRemoteTaskArgsSidecar:
         assert desc.buffer_id == 0
         assert desc.generation == 0
 
+    def test_host_inline_ref_rejects_payload_shape_mismatch(self):
+        with pytest.raises(ValueError, match="HOST_INLINE payload length"):
+            RemoteTensorRef.host_inline(b"abcd", shape=(2,), dtype=DataType.UINT8)
+
     def test_remote_ref_rejects_out_of_bounds_range(self):
         handle = RemoteBufferHandle._from_remote_allocation(
             worker_id=1,

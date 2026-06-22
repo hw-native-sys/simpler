@@ -554,16 +554,22 @@ class RemoteTensorRef:
     @classmethod
     def host_inline(cls, payload: bytes, *, shape: tuple[int, ...], dtype: DataType) -> RemoteTensorRef:
         data = bytes(payload)
+        shape_tuple = tuple(int(x) for x in shape)
+        if any(x < 0 for x in shape_tuple):
+            raise ValueError("RemoteTensorRef.shape entries must be non-negative")
+        expected_nbytes = _remote_tensor_nbytes(shape_tuple, dtype)
+        if len(data) != expected_nbytes:
+            raise ValueError("HOST_INLINE payload length must match shape*dtype size")
         handle = RemoteBufferHandle(
             worker_id=0,
             owner_worker_id=0,
             buffer_id=0,
             generation=0,
             address_space=RemoteAddressSpace.HOST_INLINE,
-            nbytes=len(data),
+            nbytes=expected_nbytes,
             _internal_token=_REMOTE_BUFFER_HANDLE_TOKEN,
         )
-        return cls(handle=handle, offset=0, shape=shape, dtype=dtype, nbytes=len(data), inline_payload=data)
+        return cls(handle=handle, offset=0, shape=shape_tuple, dtype=dtype, nbytes=expected_nbytes, inline_payload=data)
 
 
 @dataclass
