@@ -943,7 +943,7 @@ NB_MODULE(_task_interface, m) {
             TaskArgsView view = read_blob(reinterpret_cast<const uint8_t *>(blob_ptr), MAILBOX_ARGS_CAPACITY);
             TaskArgs args;
             for (int32_t i = 0; i < view.tensor_count; i++) {
-                args.add_tensor(view.tensors[i]);
+                args.add_tensor(view.tensors(i));
             }
             for (int32_t i = 0; i < view.scalar_count; i++) {
                 args.add_scalar(view.scalars[i]);

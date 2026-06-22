@@ -622,7 +622,7 @@ remote_l3::TaskPayloadWire RemoteL3Endpoint::build_task_payload(const TaskSlotSt
     payload.args.remote_desc.reserve(static_cast<size_t>(view.tensor_count));
 
     for (int32_t i = 0; i < view.tensor_count; ++i) {
-        Tensor tensor = view.tensors[i];
+        Tensor tensor = view.tensors(i);
         RemoteTensorSidecar tensor_sidecar{};
         if (!sidecar.tensors.empty()) tensor_sidecar = sidecar.tensors[static_cast<size_t>(i)];
         if (tensor.buffer.addr != 0 && !tensor_sidecar.present) {
