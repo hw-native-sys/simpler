@@ -7,25 +7,26 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""End-to-end distributed allreduce — symmetric 4-phase pattern.
+"""End-to-end distributed allreduce with selectable algorithm variant.
+
+Three algorithm modes are available via --mode:
+
+  onephase   (default) Mesh direct: read full vector from all peers, accumulate.
+             Best for small P (2-4), simplest implementation.
+
+  twophase   Mesh RS+AG: reduce-scatter then allgather with mesh barriers.
+             Best for medium P, bandwidth-efficient (2*(P-1) chunks vs P-1 vectors).
+
+  ring       Ring RS+AG: chunked reduce-scatter + allgather with neighbor barriers.
+             Best for large P (8+), bandwidth-optimal (2*(P-1)/P * N).
 
 Each rank owns a private input/output tensor; cross-rank communication happens
-strictly inside the kernel, via a communication window scratch slot:
+strictly inside the kernel, via a communication window scratch slot.
 
-  Phase 1 stage-in      input → my scratch slot (HCCL window)
-  Phase 2 device barrier signal matrix cross-rank sync via TNOTIFY/TWAIT
-  Phase 3 compute       TLOAD every peer's scratch slot, TADD into acc
-  Phase 4 stage-out     TSTORE acc → output
-
-input / output are plain per-rank ``torch.share_memory_()`` tensors — the
-parent writes inputs before ``init()`` and reads outputs after ``run()``, and
-the framework's TaskArgs path handles H2D / D2H automatically (same as
-``multi_chip_dispatch``).  Only ``scratch`` is declared in the communication
-domain because window buffers can only exist after the comm backend
-``comm_alloc_windows`` has run.
-
-Run:
-    python examples/workers/l3/allreduce_distributed/main.py -p a2a3sim -d 0-1
+Run examples:
+    python main.py -p a2a3sim -d 0-1 --mode onephase
+    python main.py -p a2a3sim -d 0-3 --mode twophase
+    python main.py -p a2a3sim -d 0-3 --mode ring
 
 """
 
@@ -35,9 +36,6 @@ import argparse
 import os
 import sys
 
-# Workaround for the duplicate-libomp abort when homebrew numpy and pip torch
-# coexist in one macOS process. Harmless on Linux. Must be set before
-# ``import torch``. See docs/troubleshooting/macos-libomp-collision.md.
 os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
 
 import torch  # noqa: E402
@@ -61,34 +59,79 @@ from simpler_setup.torch_interop import make_tensor_arg  # noqa: E402
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 
-# Must match ALLREDUCE_COUNT in kernels/aiv/allreduce_kernel.cpp.
 ALLREDUCE_COUNT = 256
 DTYPE_NBYTES = 4  # float32
-BUFFER_NBYTES = ALLREDUCE_COUNT * DTYPE_NBYTES
-# Signal tail: one int32 slot per rank, bounded by kMaxSupportedRanks in
-# the kernel.  Signal area sits at the tail of the scratch buffer.
-SIGNAL_TAIL_NBYTES = 16 * 4
-SCRATCH_NBYTES = BUFFER_NBYTES + SIGNAL_TAIL_NBYTES
+K_MAX_SUPPORTED_RANKS = 16
+
+# Kernel and orchestration file mappings per mode.
+KERNEL_MAP = {
+    "onephase": "kernels/aiv/allreduce_onephase_kernel.cpp",
+    "twophase": "kernels/aiv/allreduce_twophase_kernel.cpp",
+    "ring": "kernels/aiv/allreduce_ring_kernel.cpp",
+}
+ORCH_MAP = {
+    "onephase": (
+        "kernels/orchestration/allreduce_onephase_orch.cpp",
+        "allreduce_orchestration",
+        "allreduce_orchestration_config",
+    ),
+    "twophase": (
+        "kernels/orchestration/allreduce_twophase_orch.cpp",
+        "allreduce_twophase_orchestration",
+        "allreduce_twophase_orchestration_config",
+    ),
+    "ring": (
+        "kernels/orchestration/allreduce_ring_orch.cpp",
+        "allreduce_ring_orchestration",
+        "allreduce_ring_orchestration_config",
+    ),
+}
+
+
+def compute_scratch_params(mode: str, nranks: int) -> tuple[int, int, int]:
+    """Compute scratch buffer parameters for the given mode and rank count.
+
+    Returns:
+        (float_elems, scratch_nbytes, window_size)
+    """
+    if mode == "onephase":
+        # One-phase: ALLREDUCE_COUNT floats + signal tail (16 int32 slots).
+        float_elems = ALLREDUCE_COUNT
+        signal_tail_nbytes = K_MAX_SUPPORTED_RANKS * DTYPE_NBYTES
+        scratch_nbytes = float_elems * DTYPE_NBYTES + signal_tail_nbytes
+    elif mode == "twophase":
+        # Two-phase: nranks * chunk_elems floats + 2 signal rows (RS + AG barriers).
+        chunk_elems = ALLREDUCE_COUNT // nranks
+        float_elems = nranks * chunk_elems
+        signal_tail_nbytes = 2 * K_MAX_SUPPORTED_RANKS * DTYPE_NBYTES
+        scratch_nbytes = float_elems * DTYPE_NBYTES + signal_tail_nbytes
+    elif mode == "ring":
+        # Ring: (nranks+1) * chunk_elems floats (P chunks + 1 exchange) + 2*(P-1) signal rows.
+        chunk_elems = ALLREDUCE_COUNT // nranks
+        float_elems = (nranks + 1) * chunk_elems
+        signal_tail_nbytes = 2 * (nranks - 1) * K_MAX_SUPPORTED_RANKS * DTYPE_NBYTES
+        scratch_nbytes = float_elems * DTYPE_NBYTES + signal_tail_nbytes
+    else:
+        raise ValueError(f"Unsupported allreduce mode: {mode!r}. Expected one of {tuple(KERNEL_MAP.keys())}.")
+
+    window_size = max(scratch_nbytes, 4 * 1024)
+    return float_elems, scratch_nbytes, window_size
 
 
 def parse_device_range(spec: str) -> list[int]:
+    """Parse a device range string like ``0-1`` or a single device id."""
     if "-" in spec:
         lo, hi = (int(x) for x in spec.split("-"))
         ids = list(range(lo, hi + 1))
     else:
         ids = [int(spec)]
-    if not (2 <= len(ids) <= 16):
-        raise ValueError(f"allreduce_distributed needs between 2 and 16 devices, got {len(ids)} ({ids})")
+    if not (2 <= len(ids) <= K_MAX_SUPPORTED_RANKS):
+        raise ValueError(f"allreduce needs between 2 and {K_MAX_SUPPORTED_RANKS} devices, got {len(ids)} ({ids})")
     return ids
 
 
-def build_chip_callable(platform: str, pto_isa_commit: str | None) -> ChipCallable:
-    """Compile the AIV allreduce kernel + its C++ orchestration shim.
-
-    The orchestration forwards three Tensor args (input / output / scratch)
-    plus two scalars (nranks, CommContext pointer); the kernel reads
-    ``Tensor->buffer.addr + start_offset`` to reach the device pointer.
-    """
+def build_chip_callable(platform: str, mode: str, pto_isa_commit: str | None) -> ChipCallable:
+    """Compile the selected allreduce kernel + orchestration shim."""
     kc = KernelCompiler(platform=platform)
     runtime = "tensormap_and_ringbuffer"
     pto_isa_root = ensure_pto_isa_root(commit=pto_isa_commit, clone_protocol="https")
@@ -99,7 +142,7 @@ def build_chip_callable(platform: str, pto_isa_commit: str | None) -> ChipCallab
     # include set so the kernel compile can see it.
     kernel_include_dirs = list(include_dirs) + [str(kc.project_root / "src" / "common")]
     kernel_bytes = kc.compile_incore(
-        source_path=os.path.join(HERE, "kernels/aiv/allreduce_kernel.cpp"),
+        source_path=os.path.join(HERE, KERNEL_MAP[mode]),
         core_type="aiv",
         pto_isa_root=pto_isa_root,
         extra_include_dirs=kernel_include_dirs,
@@ -107,9 +150,10 @@ def build_chip_callable(platform: str, pto_isa_commit: str | None) -> ChipCallab
     if not platform.endswith("sim"):
         kernel_bytes = extract_text_section(kernel_bytes)
 
+    orch_path, func_name, config_name = ORCH_MAP[mode]
     orch_bytes = kc.compile_orchestration(
         runtime_name=runtime,
-        source_path=os.path.join(HERE, "kernels/orchestration/allreduce_orch.cpp"),
+        source_path=os.path.join(HERE, orch_path),
     )
     core_callable = CoreCallable.build(
         signature=[ArgDirection.IN, ArgDirection.OUT, ArgDirection.INOUT],
@@ -117,8 +161,8 @@ def build_chip_callable(platform: str, pto_isa_commit: str | None) -> ChipCallab
     )
     return ChipCallable.build(
         signature=[ArgDirection.IN, ArgDirection.OUT, ArgDirection.INOUT],
-        func_name="allreduce_orchestration",
-        config_name="allreduce_orchestration_config",
+        func_name=func_name,
+        config_name=config_name,
         binary=orch_bytes,
         children=[(0, core_callable)],
     )
@@ -132,29 +176,32 @@ def expected_output(nranks: int) -> list[float]:
 def run(
     device_ids: list[int],
     platform: str = "a2a3",
+    mode: str = "onephase",
     pto_isa_commit: str | None = None,
 ) -> int:
     """Core logic — callable from both CLI and pytest."""
     nranks = len(device_ids)
-    # Backends may round up; only needs to hold SCRATCH_NBYTES.  A 4 KB floor
-    # keeps us clear of minimum-window-size quirks.
-    window_size = max(SCRATCH_NBYTES, 4 * 1024)
+    if mode not in KERNEL_MAP:
+        raise ValueError(f"Unsupported allreduce mode: {mode!r}. Expected one of {tuple(KERNEL_MAP.keys())}.")
+    if not (2 <= nranks <= K_MAX_SUPPORTED_RANKS):
+        raise ValueError(f"allreduce needs between 2 and {K_MAX_SUPPORTED_RANKS} devices, got {nranks} ({device_ids})")
 
-    print(f"[allreduce] platform={platform} devices={device_ids} nranks={nranks}")
+    # Ring and twophase require ALLREDUCE_COUNT divisible by nranks.
+    if mode in ("twophase", "ring") and ALLREDUCE_COUNT % nranks != 0:
+        raise ValueError(f"ALLREDUCE_COUNT={ALLREDUCE_COUNT} must be divisible by nranks={nranks} for {mode} mode")
 
-    # --- Per-rank host tensors (input/output) via torch.share_memory_().
-    # share_memory_() moves the storage into an mmap region that forked
-    # children see at the same virtual address, so ``chip_args.add_tensor``
-    # with TensorArgType.INPUT / OUTPUT_EXISTING can hand the kernel a host
-    # pointer and the framework handles H2D/D2H transparently.
+    float_elems, scratch_nbytes, window_size = compute_scratch_params(mode, nranks)
+
+    print(f"[allreduce] mode={mode} platform={platform} devices={device_ids} nranks={nranks}")
+
     host_inputs = [
         torch.tensor([i + rank * 100 for i in range(ALLREDUCE_COUNT)], dtype=torch.float32).share_memory_()
         for rank in range(nranks)
     ]
     host_outputs = [torch.zeros(ALLREDUCE_COUNT, dtype=torch.float32).share_memory_() for _ in range(nranks)]
 
-    print("[allreduce] compiling kernels...")
-    chip_callable = build_chip_callable(platform, pto_isa_commit)
+    print(f"[allreduce] compiling {mode} kernel...")
+    chip_callable = build_chip_callable(platform, mode, pto_isa_commit)
 
     worker = Worker(
         level=3,
@@ -170,13 +217,11 @@ def run(
         worker.init()
 
         def orch_fn(orch, _args, cfg):
-            # One scratch domain spanning every chip, allocated on demand.
-            # No host staging is needed for scratch.
             with orch.allocate_domain(
                 name="default",
                 workers=list(range(nranks)),
                 window_size=window_size,
-                buffers=[CommBufferSpec(name="scratch", dtype="float32", count=ALLREDUCE_COUNT, nbytes=SCRATCH_NBYTES)],
+                buffers=[CommBufferSpec(name="scratch", dtype="float32", count=float_elems, nbytes=scratch_nbytes)],
             ) as handle:
                 for i in range(nranks):
                     domain = handle[i]
@@ -188,13 +233,10 @@ def run(
                     chip_args = TaskArgs()
                     chip_args.add_tensor(make_tensor_arg(host_inputs[i]), TensorArgType.INPUT)
                     chip_args.add_tensor(make_tensor_arg(host_outputs[i]), TensorArgType.OUTPUT_EXISTING)
-                    # Scratch is a device pointer into the HCCL window — not a
-                    # host tensor — so wrap it manually with child_memory=True
-                    # to skip the runtime's H2D path.
                     chip_args.add_tensor(
                         Tensor.make(
                             data=domain.buffer_ptrs["scratch"],
-                            shapes=(ALLREDUCE_COUNT,),
+                            shapes=(float_elems,),
                             dtype=DataType.FLOAT32,
                             child_memory=True,
                         ),
@@ -218,25 +260,33 @@ def run(
                     print(f"  output[{j}]={float(host_outputs[i][j])!r} expected={float(expected[j])!r}")
 
         if not ok:
-            print("[allreduce] golden check FAILED")
+            print(f"[allreduce] {mode} golden check FAILED")
             return 1
-        print("[allreduce] all ranks matched golden ✅")
+        print(f"[allreduce] {mode} all ranks matched golden ✅")
         return 0
     finally:
         worker.close()
 
 
 def main() -> int:
+    """CLI entry point for distributed allreduce with selectable ``--mode``."""
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
 
     parser.add_argument("-p", "--platform", default="a2a3", help="Platform backend, e.g. a2a3 or a2a3sim.")
     parser.add_argument(
         "-d", "--device", default="0-1", help="Device range, e.g. '0-1' or '0-3'. 2 to 16 chips required."
     )
+    parser.add_argument(
+        "-m",
+        "--mode",
+        choices=["onephase", "twophase", "ring"],
+        default="onephase",
+        help="Allreduce algorithm variant: onephase (mesh direct), twophase (mesh RS+AG), ring (ring RS+AG).",
+    )
     parser.add_argument("--pto-isa-commit", default=None, help="Optional PTO ISA commit/tag to fetch before compiling.")
     cli = parser.parse_args()
 
-    return run(parse_device_range(cli.device), platform=cli.platform, pto_isa_commit=cli.pto_isa_commit)
+    return run(parse_device_range(cli.device), platform=cli.platform, mode=cli.mode, pto_isa_commit=cli.pto_isa_commit)
 
 
 if __name__ == "__main__":

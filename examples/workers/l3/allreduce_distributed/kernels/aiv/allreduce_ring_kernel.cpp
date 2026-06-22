@@ -62,9 +62,7 @@ AICORE inline __gm__ T *CommRemotePtr(__gm__ CommContext *ctx, __gm__ T *localPt
 }
 
 // Per-round barrier row: used exactly once (AtomicAdd 0→1, TWAIT GE 1).
-// Relies on fresh-window zero-init (runtime guarantee) — no explicit reset.
-// Caller drains MTE pipes before invoking this so that prior TSTORE/TLOAD
-// work is visible before TNOTIFY lands on the peer (PTOAS v0.45 equivalent).
+// No explicit reset — matches mesh allreduce_onephase_kernel.cpp; zeroing races peer notify.
 AICORE inline void RoundBarrier(__gm__ CommContext *ctx, __gm__ int32_t *signal_row, int my_rank, int nranks) {
     for (int peer = 0; peer < nranks; ++peer) {
         if (peer == my_rank) {

@@ -22,7 +22,7 @@
  * lives at the tail of scratch: nranks int32 slots where peer r writes a
  * counter and my_rank waits on slot[r] before reading.
  *
- * args layout (passed as Tensor arg slots — see allreduce_orch.cpp):
+ * args layout (passed as ContinuousTensor arg slots — see domain_allreduce_orch.cpp):
  *   tensor(0) = input    (host-backed, framework-supplied device addr)
  *   tensor(1) = output   (host-backed, framework-supplied device addr)
  *   tensor(2) = scratch  (HCCL window slot, cross-rank addressable)
