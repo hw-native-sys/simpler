@@ -40,7 +40,7 @@
  *      the same preinstall filename.
  *   5. Per-task launches: host calls `rtsBinaryLoadFromFile` to
  *      JSON-register the preinstall file (cpuKernelMode=0), resolves
- *      `simpler_aicpu_init` / `simpler_aicpu_exec` via `rtsFuncGetByName`,
+ *      `simpler_aicpu_exec` via `rtsFuncGetByName`,
  *      then dispatches each task through `rtsLaunchCpuKernel` on the cached
  *      `rtFuncHandle`. The main aicpu_scheduler owns the dlopen of the
  *      preinstall file; this dispatcher SO is no longer in the picture.

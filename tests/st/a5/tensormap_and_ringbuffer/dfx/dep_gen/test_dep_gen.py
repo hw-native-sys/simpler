@@ -210,28 +210,49 @@ class TestDepGen(SceneTestCase):
                 f"edge {e.get('pred')}->{e.get('succ')} (source={source}) missing consumer_shape/start_offset/strides"
             )
 
-        # ---- Tool smoke: deps_to_graph ----
-        # Exit-code-only check; we don't validate the HTML content. A schema
-        # change that breaks the viewer fires here in the same CI step that
-        # produced the artifact, so the failure is attributed to the right
-        # capture. graphviz `dot` is required for rendering; skip on dev
-        # machines without it (CI installs it explicitly).
+        # ---- Tool smoke: deps_viewer (text) ----
+        # scene_test auto-generates deps_viewer.txt via _graph_case_dep_gen;
+        # smoke verifies it was produced and has the expected sections.
+        out_txt = out_dir / "deps_viewer.txt"
+        assert out_txt.exists(), f"scene_test auto-hook did not produce {out_txt}"
+        text = out_txt.read_text()
+        assert "SUMMARY" in text and "TASK INDEX" in text, "text deps graph missing expected sections"
+
+        for extra in (["--direction", "LR"], ["--engine", "dot"]):
+            bad = subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "simpler_setup.tools.deps_viewer",
+                    str(deps_path),
+                    "--format",
+                    "text",
+                    *extra,
+                ],
+                check=False,
+                timeout=60,
+                capture_output=True,
+                text=True,
+            )
+            assert bad.returncode != 0, f"text mode should reject {' '.join(extra)}"
+            assert "only valid with --format html" in bad.stderr
+
         if shutil.which("dot"):
-            for extra in ([], ["--show-tensor-info"]):
-                out_html = out_dir / ("_smoke_deps_with_tensors.html" if extra else "_smoke_deps.html")
-                subprocess.run(
-                    [
-                        sys.executable,
-                        "-m",
-                        "simpler_setup.tools.deps_to_graph",
-                        str(deps_path),
-                        *extra,
-                        "-o",
-                        str(out_html),
-                    ],
-                    check=True,
-                    timeout=60,
-                )
+            out_html = out_dir / "_smoke_deps.html"
+            subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "simpler_setup.tools.deps_viewer",
+                    str(deps_path),
+                    "--format",
+                    "html",
+                    "-o",
+                    str(out_html),
+                ],
+                check=True,
+                timeout=60,
+            )
 
 
 if __name__ == "__main__":

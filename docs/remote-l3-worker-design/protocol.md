@@ -49,7 +49,7 @@ Rules:
 ## Wire Encoding
 
 Remote frames use canonical field encoding. They do not memcpy C++ POD structs
-such as `CallConfig` or `ContinuousTensor` onto the wire. The local fork/shm
+such as `CallConfig` or `Tensor` onto the wire. The local fork/shm
 mailbox may continue to use the raw POD layout because both endpoints are
 fork-related processes running the same binary; remote endpoints must treat the
 wire schema below as the compatibility contract.
@@ -87,21 +87,28 @@ encodes these fields explicitly and rejects drift through decode-time bounds
 checks. The local fork/shm mailbox continues to memcpy the packed `CallConfig`
 POD because it is same-binary IPC, not the cross-host protocol.
 
-`ContinuousTensorWire v1` encodes tensor metadata explicitly. In remote TASK
+`TensorWire v1` encodes tensor metadata explicitly. In remote TASK
 frames, `data` is not a transferable pointer; it is reserved and must be zero.
 
 ```text
 data: uint64  # reserved in remote TASK frames; must be 0
-shapes: uint32[CONTINUOUS_TENSOR_MAX_DIMS]
+shapes: uint32[MAX_TENSOR_DIMS]
 ndims: uint32
 dtype: uint32
 child_memory: uint8
 reserved: uint8[7]
 ```
 
+The wire carries only the contiguous-defining fields; it does **not** carry
+`strides` / `start_offset`, and `decode_tensor` rebuilds them as row-major.
+The remote wire is therefore **contiguous-only**: strided views round-trip
+solely over the local fork/shm mailbox blob (full 128 B `Tensor` memcpy).
+`encode_tensor` asserts `is_contiguous && start_offset == 0` so a strided
+tensor fails loudly rather than being silently flattened.
+
 The session runner decodes these wire records into local `CallConfig` and
-`ContinuousTensor` values before calling `inner_worker.run()`. For tensors with
-a remote descriptor, the runner fills the local `ContinuousTensor.data` from
+`Tensor` values before calling `inner_worker.run()`. For tensors with
+a remote descriptor, the runner fills the local `Tensor.data` from
 its buffer/import registry after validating the descriptor. Local ABI structs
 therefore remain the in-process execution ABI, not the remote transport ABI.
 
@@ -151,7 +158,7 @@ dispatcher registry. The dispatcher is not a Worker: it resolves the digest to
 its private orchestration callable slot, materializes the remote arguments, and
 then invokes the embedded `inner_worker = Worker(level=3)`. The endpoint uses
 the sidecar descriptors captured at submit time to materialize local
-`ContinuousTensor` values on the session runner.
+`Tensor` values on the session runner.
 
 The current `RemoteL3Endpoint` implementation builds this payload from
 `TaskSlotState`, zeros every tensor metadata `data` field, and submits the
@@ -164,7 +171,7 @@ descriptors, and calls `inner_worker.run()`.
 ```text
 tensor_count: uint32
 scalar_count: uint32
-tensor_metadata: ContinuousTensorWire[tensor_count]
+tensor_metadata: TensorWire[tensor_count]
 remote_desc: OptionalRemoteTensorDescWire[tensor_count]
 scalars: uint64[scalar_count]
 inline_payload_bytes_len: uint32
@@ -210,14 +217,14 @@ RemoteTensorDescWire:
 
 Rules:
 
-- `ContinuousTensor` remains the L2 ABI. The session runner translates
-  descriptors into local `ContinuousTensor` values immediately before
+- `Tensor` remains the L2 ABI. The session runner translates
+  descriptors into local `Tensor` values immediately before
   `inner_worker.run()`.
-- When a descriptor is present, the incoming `ContinuousTensorWire.data` is
+- When a descriptor is present, the incoming `TensorWire.data` is
   reserved and must be zero. The session runner derives the executable local
   address only from the validated descriptor and its live buffer/import
   registry.
-- Metadata-only tensors also require `ContinuousTensorWire.data == 0`.
+- Metadata-only tensors also require `TensorWire.data == 0`.
 - Parent-side dependency keys use a stable logical start-address key derived at
   submit time:
   `(address_kind, owner_worker_id, buffer_id, generation, offset)`.
@@ -744,7 +751,7 @@ The frame codec must reject:
 - descriptor offsets outside the referenced handle;
 - `HOST_INLINE` payload offsets or lengths outside the inline byte arena;
 - non-`HOST_INLINE` descriptors with non-zero inline payload lengths;
-- non-zero `ContinuousTensorWire.data` in remote TASK frames;
+- non-zero `TensorWire.data` in remote TASK frames;
 - stale generations;
 - unknown control names or control versions;
 - completion sequence mismatch;

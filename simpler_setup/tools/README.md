@@ -1,6 +1,6 @@
 # Profiling & Debug Tools (shipped in the wheel)
 
-End-user CLIs for analyzing PTO Runtime profiling data and tensor dumps.
+End-user CLIs for analyzing PTO Runtime profiling data and args dumps.
 All are invokable as Python modules once the `simpler` wheel is installed —
 no repo checkout required.
 
@@ -12,10 +12,10 @@ no repo checkout required.
 - **[swimlane_converter](#swimlane_converter)** — perf JSON → Chrome Trace Event (Perfetto)
 - **[sched_overhead_analysis](#sched_overhead_analysis)** — scheduler overhead / Tail OH breakdown
 - **[device_log_timing](#device_log_timing)** — Total / Orch / Sched from a CANN device log (no swimlane JSON)
-- **[deps_to_graph](#deps_to_graph)** — `deps.json` (dep_gen) → pan/zoom HTML dependency graph
-- **[dump_viewer](#dump_viewer)** — inspect / export tensor dumps (see [docs/tensor-dump.md](../../docs/dfx/tensor-dump.md) for full workflow)
+- **[dump_viewer](#dump_viewer)** — inspect / export args dumps (see [docs/tensor-dump.md](../../docs/dfx/tensor-dump.md) for full workflow)
+- **[deps_viewer](#deps_viewer)** — `deps.json` (dep_gen) → text or pan/zoom HTML dependency graph
 
-Auto-detection paths (`outputs/*/l2_swimlane_records.json`, `outputs/*/tensor_dump/`)
+Auto-detection paths (`outputs/*/l2_swimlane_records.json`, `outputs/*/args_dump/`)
 are resolved relative to the **current working directory** — run these from the
 directory that holds your `outputs/`. Each test case writes into its own
 `outputs/<case>_<ts>/` directory; the tools auto-pick the latest by mtime.
@@ -228,51 +228,65 @@ often leaves pointing at the invoking user.
 
 ---
 
-## deps_to_graph
+## deps_viewer
 
-Render the dep_gen `deps.json` task graph as a self-contained pan/zoom HTML
-page (Graphviz SVG + inline vanilla-JS drag-pan + wheel-zoom). Pairs naturally
-with [`swimlane_converter`](#swimlane_converter): swimlane is the timing view,
+Render the dep_gen `deps.json` task graph as either grep-friendly text
+(default) or a self-contained pan/zoom HTML page. Pairs naturally with
+[`swimlane_converter`](#swimlane_converter): swimlane is the timing view,
 this is the structural view.
 
 ### Overview
 
-`deps_to_graph` reads `deps.json` produced by the dep_gen replay (see
-[docs/dfx/dep_gen.md](../../docs/dfx/dep_gen.md)) and emits an HTML file
-viewable in any modern browser, no internet needed. Two modes:
+`deps_viewer` reads `deps.json` produced by the dep_gen replay (see
+[docs/dfx/dep_gen.md](../../docs/dfx/dep_gen.md)) and supports two modes:
 
-- **Default** — every task is a shape-coded node (AIC blue box / AIV orange
-  ellipse / mix green diamond / alloc dashed grey), edges are bare arrows.
-  Best for "is task X reachable from task Y?" topology questions on dense
-  graphs.
-- **`--show-tensor-info`** — every task is an HTML-table node with input
-  rows on top, identity header in the middle, output rows on the bottom;
-  each slot row shows `arg<i> <TYPE> <Tname>:<dtype>` plus `raw:` / `shape:` /
-  `offset:`. Edges route from `pred:out_<idx>` to `succ:in_<arg>` by
-  matching `tensor_id`, so "which output of X feeds which input of Y" is
-  visually obvious. This is the answer to issue #666's "what slice does
-  this edge carry?" question.
+- **Default text mode** — emits `deps_viewer.txt` with:
+  - `SUMMARY` (input path plus task / edge / tensor counts)
+    - `tasks`: number of rendered task ids
+    - `unique_task_edges`: number of unique `(pred, succ)` pairs
+    - `annotated_edges`: total number of annotated edge rows
+    - `perf_sidecar`: `yes` when `l2_swimlane_records.json` was successfully loaded
+    - `func_name_map`: `yes` when at least one task name resolved to a named
+      `func_name` from `--func-names` or an auto-discovered `name_map_*.json`.
+      `func_name_map` stays `no` unless a real human-readable name was resolved.
+  - `TASK INDEX` (one line per task for grep)
+    - `kind=` distinguishes `submit` / `dummy` / `alloc` / `unknown`
+    - `func_id=` is taken only from `tasks[].kernel_ids` and shows the aligned
+      three-slot `[aic,aiv0,aiv1]` array for `submit`
+    - `kind=alloc` / `kind=dummy` render as `func_id=none`
+  - `TASK DETAILS` (per-task `FANIN` / `FANOUT` blocks showing peer task references only)
+  Best for "what does task X depend on?" and large-graph debugging.
+- **`--format html`** — renders the task graph as Graphviz SVG wrapped in a
+  self-contained HTML file viewable in any modern browser.
+  - Add `--show-tensor-info` to restore per-task tensor rows and edge routing
+    to specific arg ports in the HTML view.
 
 ### Basic Usage
 
 ```bash
-# Auto-pick the newest deps.json under ./outputs/
-python -m simpler_setup.tools.deps_to_graph
+# Auto-pick the newest deps.json under ./outputs/ -> deps_viewer.txt
+python -m simpler_setup.tools.deps_viewer
 
-# Specific path
-python -m simpler_setup.tools.deps_to_graph outputs/<case>_<ts>/deps.json
+# Specific path -> deps_viewer.txt next to deps.json
+python -m simpler_setup.tools.deps_viewer outputs/<case>_<ts>/deps.json
 
-# Specify an output HTML path
-python -m simpler_setup.tools.deps_to_graph outputs/<case>_<ts>/deps.json -o graph.html
+# Explicit text output path
+python -m simpler_setup.tools.deps_viewer outputs/<case>_<ts>/deps.json -o graph.txt
 
-# Show per-edge tensor slice info (compartments + matched ports)
-python -m simpler_setup.tools.deps_to_graph outputs/<case>_<ts>/deps.json --show-tensor-info
+# HTML output
+python -m simpler_setup.tools.deps_viewer outputs/<case>_<ts>/deps.json \
+    --format html -o graph.html
 
-# Force-directed layout for large graphs (>~1000 nodes)
-python -m simpler_setup.tools.deps_to_graph outputs/<case>_<ts>/deps.json --engine sfdp
+# HTML output with per-task tensor details and arg-port routing
+python -m simpler_setup.tools.deps_viewer outputs/<case>_<ts>/deps.json \
+    --format html --show-tensor-info -o graph.html
 
-# Override node labels with a func_id -> name mapping
-python -m simpler_setup.tools.deps_to_graph outputs/<case>_<ts>/deps.json \
+# Force-directed HTML layout for large graphs (>~1000 nodes)
+python -m simpler_setup.tools.deps_viewer outputs/<case>_<ts>/deps.json \
+    --format html --engine sfdp
+
+# Override task labels with a func_id -> name mapping
+python -m simpler_setup.tools.deps_viewer outputs/<case>_<ts>/deps.json \
     --func-names outputs/<case>_<ts>/name_map_TestPA_basic.json
 ```
 
@@ -281,15 +295,16 @@ python -m simpler_setup.tools.deps_to_graph outputs/<case>_<ts>/deps.json \
 | Option | Short | Description |
 | ------ | ----- | ----------- |
 | `input` | | Path to `deps.json` (default: newest under `./outputs/`) |
-| `--output` | `-o` | Output HTML path (default: same dir as input, `deps_graph.html`) |
-| `--engine` | | Graphviz layout engine: `dot` (default, hierarchical), `sfdp` (force-directed, recommended >1000 nodes), `neato`, `fdp`, `circo`, `twopi` |
-| `--direction` | | Flow direction for hierarchical layouts: `LR` (default) / `TB` / `BT` / `RL`. Ignored by sfdp/neato. |
-| `--func-names` | | JSON file with `callable_id_to_name` (or flat `{func_id: name}`) for node-label enrichment |
-| `--show-tensor-info` | | Render each task as an HTML-table node with input/output slot compartments; route edges between matching ports. Default: off (bare topology). |
+| `--output` | `-o` | Output path (default: `deps_viewer.txt` for text, `deps_viewer.html` for HTML) |
+| `--format` | | Output format: `text` (default) or `html` |
+| `--engine` | | HTML-only Graphviz layout engine: `dot` (default), `sfdp`, `neato`, `fdp`, `circo`, `twopi` |
+| `--direction` | | HTML-only flow direction for hierarchical layouts: `LR` (default) / `TB` / `BT` / `RL` |
+| `--show-tensor-info` | | HTML-only: render per-task tensor rows and route edges to specific arg ports |
+| `--func-names` | | JSON file with `callable_id_to_name` (or flat `{func_id: name}`) for task-label enrichment |
 
 ### Dependencies
 
-Requires the Graphviz `dot` binary on PATH:
+Text output has no extra dependencies. HTML output requires Graphviz on PATH:
 
 ```bash
 brew install graphviz    # macOS
@@ -310,24 +325,24 @@ at view time.
 
 ## dump_viewer
 
-Inspect and export tensors captured by the runtime tensor-dump feature.
+Inspect and export args captured by the runtime args-dump feature.
 See [docs/tensor-dump.md](../../docs/dfx/tensor-dump.md) for the full capture workflow;
 this section only documents CLI invocation.
 
 ### Basic Usage
 
 ```bash
-# List all tensors (auto-picks latest outputs/tensor_dump_* dir)
+# List all args (auto-picks latest outputs/*/args_dump dir)
 python -m simpler_setup.tools.dump_viewer
 
-# Filter by stage/role/func_id
-python -m simpler_setup.tools.dump_viewer --func 3 --stage before --role input
+# Filter by task/stage/role
+python -m simpler_setup.tools.dump_viewer --task 0x0000000200000a00 --stage before --role input
 
 # Export the current selection to txt
-python -m simpler_setup.tools.dump_viewer --func 3 --stage before --role input --export
+python -m simpler_setup.tools.dump_viewer --task 0x0000000200000a00 --stage before --role input --export
 
-# Export a specific tensor by index (always exports)
-python -m simpler_setup.tools.dump_viewer outputs/<case>_<ts>/tensor_dump/ --index 42
+# Export a specific arg by index (always exports)
+python -m simpler_setup.tools.dump_viewer outputs/<case>_<ts>/args_dump/ --index 42
 ```
 
 ---
@@ -415,13 +430,14 @@ The tools extract the `func_id` to `name` mapping from the `KERNELS` list.
 - Task execution statistics
 - Professional performance analysis and optimization
 
-### Use deps_to_graph when you need
+### Use deps_viewer when you need
 
 - A structural view of task dependencies (who feeds whom)
-- Per-edge tensor slice info — which `(tensor_id, offset, shape)` an edge
-  carries — via `--show-tensor-info`
+- Fast grep-friendly inspection via the default text output
 - A single-file HTML you can open offline, drag-pan / wheel-zoom in any
-  browser
+  browser when you want a visual layout
+- Optional per-task tensor rows and arg-port routing in HTML via
+  `--show-tensor-info`
 - A graph that survives without an associated timing run (deps.json is
   produced by structural replay, not by hardware profiling)
 
@@ -435,13 +451,14 @@ pytest tests/st/... --enable-l2-swimlane --enable-dep-gen
 # -> outputs/<case>_<ts>/merged_swimlane.json
 #    open at https://ui.perfetto.dev/
 
-# 3. Structural dependency graph (manual)
-python -m simpler_setup.tools.deps_to_graph outputs/<case>_<ts>/deps.json
-# -> outputs/<case>_<ts>/deps_graph.html (drag / wheel / f / r)
+# 3. Structural dependency graph (manual, default text output)
+python -m simpler_setup.tools.deps_viewer outputs/<case>_<ts>/deps.json
+# -> outputs/<case>_<ts>/deps_viewer.txt
 
-# 4. Same graph with per-edge tensor info
-python -m simpler_setup.tools.deps_to_graph outputs/<case>_<ts>/deps.json \
-    --show-tensor-info -o outputs/<case>_<ts>/deps_graph_with_tensors.html
+# 4. Same graph as HTML
+python -m simpler_setup.tools.deps_viewer outputs/<case>_<ts>/deps.json \
+    --format html -o outputs/<case>_<ts>/deps_viewer.html
+
 ```
 
 For batch-run hardware regression, see the dev-only script
@@ -476,8 +493,9 @@ For batch-run hardware regression, see the dev-only script
   2. Re-run `swimlane_converter` or `sched_overhead_analysis`
   3. Verify that each task in the JSON contains `dispatch_time_us` and `finish_time_us`
 
-### `deps_to_graph` complains that Graphviz `dot` is not on PATH
+### `deps_viewer` complains that Graphviz `dot` is not on PATH
 
+- This only affects `--format html`
 - Install graphviz: `brew install graphviz` (macOS) or `apt install graphviz` (Debian/Ubuntu)
 - Verify with `which dot`; should print a path
 - Use a different layout engine with `--engine sfdp` for very large graphs
@@ -491,7 +509,8 @@ For batch-run hardware regression, see the dev-only script
 | `l2_swimlane_records_*.json` | Runtime | Raw timing profiling data | JSON |
 | `merged_swimlane_*.json` | swimlane_converter | Perfetto visualization | Chrome Trace Event JSON |
 | `deps.json` | Runtime (dep_gen replay) | Structural task dependency graph + per-edge tensor info | JSON |
-| `deps_graph.html` | deps_to_graph | Pan/zoom dependency graph viewer | HTML (self-contained) |
+| `deps_viewer.txt` | deps_viewer | Grep-friendly dependency graph view | Plain text |
+| `deps_viewer.html` | deps_viewer | Pan/zoom dependency graph viewer | HTML (self-contained) |
 
 ---
 

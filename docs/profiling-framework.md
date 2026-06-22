@@ -362,7 +362,7 @@ per-core ring/reg addresses travel through `KernelArgs`:
 
 | `KernelArgs` field | Producer | Consumer |
 | ------------------ | -------- | -------- |
-| `enable_profiling_flag` (bitmask) | host (DeviceRunner) | AICPU `kernel.cpp` → `set_l2_swimlane_enabled` / `set_pmu_enabled` / `set_dump_tensor_enabled`; AICore `KERNEL_ENTRY` → `set_aicore_profiling_flag` |
+| `enable_profiling_flag` (bitmask) | host (DeviceRunner) | AICPU `kernel.cpp` → `set_l2_swimlane_enabled` / `set_pmu_enabled` / `set_dump_args_enabled`; AICore `KERNEL_ENTRY` → `set_aicore_profiling_flag` |
 | `aicore_l2_swimlane_ring_addrs` (table) | host (`L2SwimlaneCollector::initialize`) | AICore `KERNEL_ENTRY` indexes `table[block_idx]` → `set_aicore_l2_swimlane_ring` |
 | `aicore_pmu_ring_addrs` (table) | host (`PmuCollector::init`) | AICore `KERNEL_ENTRY` → `set_aicore_pmu_ring` |
 | `regs` (per-physical-core register-base table) | host (already required for AICPU MMIO) | AICore `KERNEL_ENTRY` resolves `regs[get_physical_core_id()]` → `set_aicore_pmu_reg_base`; AICore `aicore_execute` caches the value at Phase-3 |

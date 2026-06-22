@@ -151,12 +151,11 @@ private:
                 std::memcpy(&t_count, mailbox.data() + MAILBOX_OFF_TASK_ARGS_BLOB, sizeof(int32_t));
                 uint64_t tensor_key = 0;
                 if (t_count > 0) {
-                    ContinuousTensor first{};
+                    Tensor first{};
                     std::memcpy(
-                        &first, mailbox.data() + MAILBOX_OFF_TASK_ARGS_BLOB + TASK_ARGS_BLOB_HEADER_SIZE,
-                        sizeof(ContinuousTensor)
+                        &first, mailbox.data() + MAILBOX_OFF_TASK_ARGS_BLOB + TASK_ARGS_BLOB_HEADER_SIZE, sizeof(Tensor)
                     );
-                    tensor_key = first.data;
+                    tensor_key = first.buffer.addr;
                 }
                 {
                     std::lock_guard<std::mutex> lk(dispatched_mu);
@@ -244,8 +243,8 @@ private:
 
 static TaskArgs single_tensor_args(uint64_t data_ptr, TensorArgType tag) {
     TaskArgs a;
-    ContinuousTensor t{};
-    t.data = data_ptr;
+    Tensor t{};
+    t.buffer.addr = data_ptr;
     t.ndims = 1;
     t.shapes[0] = 1;
     t.dtype = DataType::UINT8;
@@ -414,14 +413,14 @@ TEST_F(SchedulerFixture, DependentTaskDispatchedAfterProducerCompletes) {
 // CHIP_MAX_TENSOR_ARGS / CHIP_MAX_SCALAR_ARGS.
 TEST_F(SchedulerFixture, ComposedKernelArgsBlobFitsMailbox) {
     constexpr size_t max_blob = TASK_ARGS_BLOB_HEADER_SIZE +
-                                static_cast<size_t>(CHIP_MAX_TENSOR_ARGS) * sizeof(ContinuousTensor) +
+                                static_cast<size_t>(CHIP_MAX_TENSOR_ARGS) * sizeof(Tensor) +
                                 static_cast<size_t>(CHIP_MAX_SCALAR_ARGS) * sizeof(uint64_t);
     EXPECT_GE(MAILBOX_ARGS_CAPACITY, max_blob);
 
     TaskArgs args;
     for (int i = 0; i < 76; ++i) {
-        ContinuousTensor t{};
-        t.data = 0x1000u + static_cast<uint64_t>(i) * 0x100u;
+        Tensor t{};
+        t.buffer.addr = 0x1000u + static_cast<uint64_t>(i) * 0x100u;
         t.ndims = 1;
         t.shapes[0] = 1;
         t.dtype = DataType::UINT8;
@@ -732,8 +731,8 @@ TEST(SchedulerWorkerAffinityTest, NextLevelAffinityUsesWorkerIdNotVectorIndex) {
 
 TEST_F(GroupSchedulerFixture, RemoteSidecarRejectsLocalEndpointEligibility) {
     TaskArgs args;
-    ContinuousTensor tensor{};
-    tensor.data = 0;
+    Tensor tensor{};
+    tensor.buffer.addr = 0;
     tensor.ndims = 1;
     tensor.shapes[0] = 1;
     tensor.dtype = DataType::UINT8;

@@ -49,13 +49,13 @@ from simpler.remote_l3_session import (
 )
 from simpler.task_interface import (
     ChipCallable,
-    ContinuousTensor,
     DataType,
     RemoteAddressSpace,
     RemoteBufferExport,
     RemoteBufferHandle,
     RemoteTensorRef,
     TaskArgs,
+    Tensor,
     TensorArgType,
 )
 from simpler.worker import (
@@ -675,7 +675,7 @@ def test_remote_callable_submit_passes_remote_sidecar_to_cpp_facade():
         assert sidecar.tensors[0].desc.owner_worker_id == worker_id
 
         bare = TaskArgs()
-        bare.add_tensor(ContinuousTensor.make(0x1234, (1,), DataType.UINT8), TensorArgType.INPUT)
+        bare.add_tensor(Tensor.make(0x1234, (1,), DataType.UINT8), TensorArgType.INPUT)
         orch.submit_next_level(handle, bare)
 
         bare_sidecar = fake.submit_next_level_args[7]

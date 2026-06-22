@@ -21,7 +21,7 @@
  *
  * Dispatch encodes (callable hash digest, CallConfig, TaskArgs) into the
  * per-WorkerThread shm mailbox with inline std::memcpy of
- * [hash digest][int32 T][int32 S][ContinuousTensor × T][uint64 × S]; the
+ * [hash digest][int32 T][int32 S][Tensor × T][uint64 × S]; the
  * forked child decodes the same layout to rebuild a TaskArgsView and resolves
  * the digest to a target-private execution slot.
  */

@@ -31,6 +31,7 @@
 
 #include <atomic>
 
+#include "profiling_config.h"
 #include "pto_constants.h"
 #include "pto_runtime_status.h"
 #include "pto2_dispatch_payload.h"
@@ -48,38 +49,6 @@
 #include "spin_hint.h"
 #else
 #define SPIN_WAIT_HINT() ((void)0)
-#endif
-
-// =============================================================================
-// Profiling Configuration
-// =============================================================================
-
-#ifndef PTO2_PROFILING
-#define PTO2_PROFILING 1
-#endif
-
-#ifndef PTO2_ORCH_PROFILING
-#define PTO2_ORCH_PROFILING 0
-#endif
-
-#ifndef PTO2_SCHED_PROFILING
-#define PTO2_SCHED_PROFILING 0
-#endif
-
-#ifndef PTO2_TENSORMAP_PROFILING
-#define PTO2_TENSORMAP_PROFILING 0
-#endif
-
-#if PTO2_ORCH_PROFILING && !PTO2_PROFILING
-#error "PTO2_ORCH_PROFILING requires PTO2_PROFILING=1"
-#endif
-
-#if PTO2_SCHED_PROFILING && !PTO2_PROFILING
-#error "PTO2_SCHED_PROFILING requires PTO2_PROFILING=1"
-#endif
-
-#if PTO2_TENSORMAP_PROFILING && !PTO2_ORCH_PROFILING
-#error "PTO2_TENSORMAP_PROFILING requires PTO2_ORCH_PROFILING=1"
 #endif
 
 #if PTO2_ORCH_PROFILING || PTO2_SCHED_PROFILING
@@ -271,8 +240,8 @@ struct PTO2TaskPayload {
             if (args.tag(i) != TensorArgType::OUTPUT) {
                 tensors[i].copy(*args.tensor(i).ptr);
             } else {
-                tensors[i].init_from_create_info(
-                    *args.tensor(i).create_info,
+                init_tensor_from_create_info(
+                    tensors[i], *args.tensor(i).create_info,
                     reinterpret_cast<void *>(reinterpret_cast<char *>(alloc_result.packed_base) + layout.offsets[i]),
                     layout.buffer_sizes[i]
                 );
@@ -280,7 +249,7 @@ struct PTO2TaskPayload {
                 result.materialize_output(tensors[i]);
             }
         }
-        // Round up to cache line boundary. Both arrays are 1024B so no overrun.
+        // Round up to cache line boundary. Both arrays are 128B so no overrun.
         // Eliminates branches; extra bytes within the same CL have zero additional cost.
         memcpy(scalars, args.scalars(), PTO2_ALIGN_UP(args.scalar_count() * sizeof(uint64_t), 64));
     }

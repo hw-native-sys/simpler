@@ -74,7 +74,7 @@ Status for the local PR #866 cut:
    lane.**
    - Add `remote_wire.h/.cpp`.
    - Implement canonical little-endian encode/decode for `CallConfigWire`,
-     `ContinuousTensorWire`, frame headers, descriptors, counts, strings, and
+     `TensorWire`, frame headers, descriptors, counts, strings, and
      enum values.
    - Implement the `HOST_INLINE` inline byte arena with descriptor
      `inline_payload_offset` / `inline_payload_len` validation.
@@ -91,7 +91,7 @@ Status for the local PR #866 cut:
      bounded error payloads.
    - Include tests that reject unknown enum values, non-zero reserved fields,
      and truncated multi-byte fields.
-   - Include tests that reject non-zero `ContinuousTensorWire.data` in remote
+   - Include tests that reject non-zero `TensorWire.data` in remote
      TASK frames.
 
 6. Remote callable registry. **Implemented for dispatcher `PYTHON_IMPORT`,

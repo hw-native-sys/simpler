@@ -336,9 +336,20 @@ CallConfig decode_call_config(const uint8_t *data, size_t size, size_t &offset) 
     return config;
 }
 
-std::vector<uint8_t> encode_continuous_tensor(const ContinuousTensor &tensor) {
+// Wire format carries only the contiguous-defining fields (addr, shapes, ndims,
+// dtype, child_memory +
+// 7 reserved bytes). The unified Tensor's derived state (strides / start_offset
+// / is_contiguous) is recomputed as row-major on decode. The wire is therefore
+// contiguous-only: a strided Tensor would be silently flattened. Guard against
+// that here so the loss is loud, not silent — strided views only round-trip
+// over the local fork/shm mailbox blob, never this remote wire.
+std::vector<uint8_t> encode_tensor(const Tensor &tensor) {
+    ensure(
+        tensor.is_contiguous && tensor.start_offset == 0,
+        "remote_wire: only contiguous, zero-offset tensors are supported on the wire"
+    );
     std::vector<uint8_t> out;
-    put_u64(out, tensor.data);
+    put_u64(out, tensor.buffer.addr);
     for (uint32_t shape : tensor.shapes)
         put_u32(out, shape);
     put_u32(out, tensor.ndims);
@@ -349,23 +360,26 @@ std::vector<uint8_t> encode_continuous_tensor(const ContinuousTensor &tensor) {
     return out;
 }
 
-ContinuousTensor decode_continuous_tensor(const uint8_t *data, size_t size, size_t &offset, bool remote_task) {
-    ContinuousTensor tensor{};
-    tensor.data = get_u64(data, size, offset);
-    if (remote_task) ensure(tensor.data == 0, "remote_wire: remote TASK tensor data must be zero");
-    for (uint32_t &shape : tensor.shapes)
+Tensor decode_tensor(const uint8_t *data, size_t size, size_t &offset, bool remote_task) {
+    uint64_t addr = get_u64(data, size, offset);
+    if (remote_task) ensure(addr == 0, "remote_wire: remote TASK tensor data must be zero");
+    uint32_t shapes[MAX_TENSOR_DIMS];
+    for (uint32_t &shape : shapes)
         shape = get_u32(data, size, offset);
-    tensor.ndims = get_u32(data, size, offset);
-    ensure(tensor.ndims <= CONTINUOUS_TENSOR_MAX_DIMS, "remote_wire: tensor ndims exceeds maximum");
+    uint32_t ndims = get_u32(data, size, offset);
+    ensure(ndims > 0 && ndims <= MAX_TENSOR_DIMS, "remote_wire: tensor ndims out of range");
     uint32_t dtype = get_u32(data, size, offset);
     ensure(valid_dtype(dtype), "remote_wire: unknown tensor dtype");
-    tensor.dtype = static_cast<DataType>(dtype);
-    tensor.child_memory = get_u8(data, size, offset);
-    ensure(tensor.child_memory == 0 || tensor.child_memory == 1, "remote_wire: tensor child_memory must be 0 or 1");
+    uint8_t child_memory = get_u8(data, size, offset);
+    ensure(child_memory == 0 || child_memory == 1, "remote_wire: tensor child_memory must be 0 or 1");
     for (int i = 0; i < 7; ++i) {
-        ensure(get_u8(data, size, offset) == 0, "remote_wire: ContinuousTensor reserved bytes must be zero");
+        ensure(get_u8(data, size, offset) == 0, "remote_wire: Tensor reserved bytes must be zero");
     }
-    return tensor;
+    // Reconstruct a contiguous external Tensor (owner=invalid, row-major strides).
+    return make_tensor_external(
+        reinterpret_cast<void *>(addr), shapes, ndims, static_cast<DataType>(dtype), /*manual_dep=*/false,
+        /*version=*/0, child_memory
+    );
 }
 
 std::vector<uint8_t> encode_remote_tensor_desc(const RemoteTensorDesc &desc) {
@@ -414,8 +428,8 @@ std::vector<uint8_t> encode_remote_task_args(const RemoteTaskArgsWire &args) {
     put_u32(out, static_cast<uint32_t>(args.tensor_metadata.size()));
     put_u32(out, static_cast<uint32_t>(args.scalars.size()));
     for (const auto &tensor : args.tensor_metadata) {
-        ensure(tensor.data == 0, "remote_wire: remote TASK tensor data must be zero");
-        auto encoded = encode_continuous_tensor(tensor);
+        ensure(tensor.buffer.addr == 0, "remote_wire: remote TASK tensor data must be zero");
+        auto encoded = encode_tensor(tensor);
         put_bytes(out, encoded.data(), encoded.size());
     }
     for (size_t i = 0; i < args.tensor_metadata.size(); ++i) {
@@ -445,7 +459,7 @@ RemoteTaskArgsWire decode_remote_task_args(const uint8_t *data, size_t size) {
     RemoteTaskArgsWire args;
     args.tensor_metadata.reserve(tensor_count);
     for (uint32_t i = 0; i < tensor_count; ++i)
-        args.tensor_metadata.push_back(decode_continuous_tensor(data, size, offset, true));
+        args.tensor_metadata.push_back(decode_tensor(data, size, offset, true));
 
     args.remote_desc.reserve(tensor_count);
     for (uint32_t i = 0; i < tensor_count; ++i) {

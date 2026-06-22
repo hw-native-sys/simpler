@@ -21,14 +21,13 @@
 
 namespace {
 
-ContinuousTensor metadata_tensor() {
-    ContinuousTensor t{};
-    t.data = 0;
-    t.ndims = 1;
-    t.shapes[0] = 4;
-    t.dtype = DataType::UINT8;
-    t.child_memory = 0;
-    return t;
+Tensor metadata_tensor() {
+    // Build through the canonical factory so the tensor is a valid contiguous
+    // descriptor (is_contiguous = true, start_offset = 0, row-major strides) —
+    // encode_tensor enforces contiguity on the wire. addr = 0 keeps it a
+    // metadata-only remote tensor.
+    const uint32_t shapes[1] = {4};
+    return make_tensor_external(nullptr, shapes, 1, DataType::UINT8);
 }
 
 }  // namespace
@@ -88,7 +87,7 @@ TEST(RemoteWire, TaskPayloadRejectsNonZeroTensorData) {
     EXPECT_EQ(decoded.callable_digest[0], 0xAB);
     EXPECT_EQ(decoded.args.scalars[0], 0xCAFEu);
 
-    payload.args.tensor_metadata[0].data = 0x1234;
+    payload.args.tensor_metadata[0].buffer.addr = 0x1234;
     EXPECT_THROW((void)remote_l3::encode_task_payload(payload), std::runtime_error);
 }
 

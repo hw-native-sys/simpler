@@ -19,11 +19,16 @@
  * input / output are per-rank host tensors passed through TaskArgs (the
  * runtime handles the H2D / D2H).  scratch is the HCCL-window buffer:
  *   [0 .. P*chunk)           P chunk slots owned by this rank
- *   [P*chunk .. (P+1)*chunk) single-chunk exchange publish area
  *   tail                     2*(P-1)*kMaxSupportedRanks int32 barrier slots
- *                            (one row per round; fresh-window zero init)
+ *                            (fresh-window zero init)
  *
- * args layout (passed as ContinuousTensor arg slots — see allreduce_ring_orch.cpp):
+ * After each per-round barrier, peers read directly from each other's
+ * chunks[] slots via CommRemotePtr — no separate exchange publish buffer.
+ * The ``pipe_barrier(PIPE_ALL)`` at the end of each RS/AG step body drains
+ * MTE pipes before ``RoundBarrier`` fires ``TNOTIFY`` (hand-written
+ * equivalent of PTOAS v0.45's automatic ``emitTNotifyMteDrain``).
+ *
+ * args layout (passed as Tensor arg slots — see allreduce_ring_orch.cpp):
  *   tensor(0) = input    (host-backed, framework-supplied device addr)
  *   tensor(1) = output   (host-backed, framework-supplied device addr)
  *   tensor(2) = scratch  (HCCL window slot, cross-rank addressable)
@@ -57,7 +62,9 @@ AICORE inline __gm__ T *CommRemotePtr(__gm__ CommContext *ctx, __gm__ T *localPt
 }
 
 // Per-round barrier row: used exactly once (AtomicAdd 0→1, TWAIT GE 1).
-// No explicit reset — matches mesh allreduce_kernel.cpp; zeroing races peer notify.
+// Relies on fresh-window zero-init (runtime guarantee) — no explicit reset.
+// Caller drains MTE pipes before invoking this so that prior TSTORE/TLOAD
+// work is visible before TNOTIFY lands on the peer (PTOAS v0.45 equivalent).
 AICORE inline void RoundBarrier(__gm__ CommContext *ctx, __gm__ int32_t *signal_row, int my_rank, int nranks) {
     for (int peer = 0; peer < nranks; ++peer) {
         if (peer == my_rank) {
@@ -103,10 +110,9 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
 
     const int chunk_elems = static_cast<int>(ALLREDUCE_COUNT / static_cast<size_t>(nranks));
     __gm__ float *chunks = scratch;
-    __gm__ float *exchange = scratch + static_cast<size_t>(nranks * chunk_elems);
-    // Signal rows after float region: one row per RS/AG round (2*(P-1) rounds total).
+    // Signal rows after float region: 2*(P-1) rounds, kMaxSupportedRanks stride.
     __gm__ int32_t *signal_base =
-        reinterpret_cast<__gm__ int32_t *>(scratch + static_cast<size_t>((nranks + 1) * chunk_elems));
+        reinterpret_cast<__gm__ int32_t *>(scratch + static_cast<size_t>(nranks * chunk_elems));
 
     TileData chunkTile(1, chunk_elems);
     TileData recvTile(1, chunk_elems);
@@ -138,25 +144,10 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
 
     // ------------------------------------------------------------------
     // Phase 2: reduce-scatter — (P-1) ring steps; rank r ends with fully
-    // reduced chunk r.  Publish to exchange, barrier, TLOAD left neighbour's
-    // chunks[] slot (not the local exchange mirror).
+    // reduced chunk r.  Barrier, then TLOAD left neighbour's chunks[] slot.
     // ------------------------------------------------------------------
     for (int step = 1; step < nranks; ++step) {
-        const int send_idx = (my_rank - step + nranks) % nranks;
         const int recv_add_idx = (my_rank - step - 1 + nranks) % nranks;
-
-        {
-            __gm__ float *src = chunks + static_cast<size_t>(send_idx * chunk_elems);
-            Global srcG(src, chunkShape, chunkStride);
-            Global dstG(exchange, chunkShape, chunkStride);
-            TLOAD(chunkTile, srcG);
-            set_flag(PIPE_MTE2, PIPE_MTE3, EVENT_ID0);
-            wait_flag(PIPE_MTE2, PIPE_MTE3, EVENT_ID0);
-            TSTORE(dstG, chunkTile);
-            set_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID0);
-            wait_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID0);
-        }
-        pipe_barrier(PIPE_ALL);
 
         RoundBarrier(commCtx, signal_base + round * kMaxSupportedRanks, my_rank, nranks);
         ++round;
@@ -190,21 +181,7 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
     // reduced chunks from left neighbour chunks[] after each barrier.
     // ------------------------------------------------------------------
     for (int step = 1; step < nranks; ++step) {
-        const int send_idx = (my_rank - step + 1 + nranks) % nranks;
         const int recv_idx = (my_rank - step + nranks) % nranks;
-
-        {
-            __gm__ float *src = chunks + static_cast<size_t>(send_idx * chunk_elems);
-            Global srcG(src, chunkShape, chunkStride);
-            Global dstG(exchange, chunkShape, chunkStride);
-            TLOAD(chunkTile, srcG);
-            set_flag(PIPE_MTE2, PIPE_MTE3, EVENT_ID0);
-            wait_flag(PIPE_MTE2, PIPE_MTE3, EVENT_ID0);
-            TSTORE(dstG, chunkTile);
-            set_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID0);
-            wait_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID0);
-        }
-        pipe_barrier(PIPE_ALL);
 
         RoundBarrier(commCtx, signal_base + round * kMaxSupportedRanks, my_rank, nranks);
         ++round;

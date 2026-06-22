@@ -9,13 +9,13 @@
 # ruff: noqa: PLW0603, PLC0415
 """Public Python API for task_interface nanobind bindings.
 
-Re-exports the canonical C++ types (DataType, ContinuousTensor, ChipStorageTaskArgs,
+Re-exports the canonical C++ types (DataType, Tensor, ChipStorageTaskArgs,
 TaskArgs, TensorArgType) plus ``scalar_to_uint64``. Torch-aware helpers
 (``make_tensor_arg``, ``torch_dtype_to_datatype``) live in
 ``simpler_setup.torch_interop`` — this module has no torch dependency.
 
 Usage:
-    from simpler.task_interface import DataType, ContinuousTensor, ChipStorageTaskArgs
+    from simpler.task_interface import DataType, Tensor, ChipStorageTaskArgs
     from simpler_setup.torch_interop import make_tensor_arg
 """
 
@@ -32,21 +32,21 @@ from math import prod
 from typing import Any
 
 from _task_interface import (  # pyright: ignore[reportMissingImports]
-    CONTINUOUS_TENSOR_MAX_DIMS,
     MAILBOX_ERROR_MSG_SIZE,
     MAILBOX_OFF_ERROR_MSG,
     MAILBOX_SIZE,
     MAX_REGISTERED_CALLABLE_IDS,
+    MAX_TENSOR_DIMS,
     ArgDirection,
     CallConfig,
     ChipCallable,
     ChipStorageTaskArgs,
-    ContinuousTensor,
     CoreCallable,
     DataType,
     RuntimeEnv,
     TaskArgs,
     TaskState,
+    Tensor,
     TensorArgType,
     WorkerType,
     _ChipWorker,
@@ -61,8 +61,8 @@ __all__ = [
     "DataType",
     "get_element_size",
     "get_dtype_name",
-    "CONTINUOUS_TENSOR_MAX_DIMS",
-    "ContinuousTensor",
+    "MAX_TENSOR_DIMS",
+    "Tensor",
     "ChipStorageTaskArgs",
     "TensorArgType",
     "TaskArgs",
@@ -622,16 +622,16 @@ def _storage_for_remote_task_args(args: TaskArgs) -> _RemoteTaskArgsStorage:
 
 
 def _task_args_add_tensor(
-    self: TaskArgs, tensor: ContinuousTensor | RemoteTensorRef, tag: TensorArgType = TensorArgType.INPUT
+    self: TaskArgs, tensor: Tensor | RemoteTensorRef, tag: TensorArgType = TensorArgType.INPUT
 ) -> None:
     if isinstance(tensor, RemoteTensorRef):
         storage = _storage_for_remote_task_args(self)
-        metadata = ContinuousTensor.make(0, tensor.shape, tensor.dtype)
+        metadata = Tensor.make(0, tensor.shape, tensor.dtype)
         _TASK_ARGS_ADD_TENSOR(self, metadata, tag)
         storage.sidecars.append(_sidecar_from_ref(storage, tensor))
         return
-    if not isinstance(tensor, ContinuousTensor):
-        raise TypeError("TaskArgs.add_tensor expects ContinuousTensor or RemoteTensorRef")
+    if not isinstance(tensor, Tensor):
+        raise TypeError("TaskArgs.add_tensor expects Tensor or RemoteTensorRef")
     _TASK_ARGS_ADD_TENSOR(self, tensor, tag)
     with _REMOTE_TASK_ARGS_STORAGE_LOCK:
         storage = _REMOTE_TASK_ARGS_STORAGE.get(self)

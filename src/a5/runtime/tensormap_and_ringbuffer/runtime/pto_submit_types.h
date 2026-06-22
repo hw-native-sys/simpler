@@ -47,10 +47,11 @@ inline constexpr uint8_t PTO2_SUBTASK_FLAG_SYNC_START = (1u << 3);  // 0x8: all 
 /**
  * Resource shape — classifies a MixedKernels into one of 3 scheduling buckets.
  *
- * Multi-subtask tasks (2+ active slots) are all scheduled as MIX, which
- * requires a fully-idle cluster (1 AIC + 2 AIV).  The actual cores used
- * are determined at dispatch time by active_mask — unused cores in the
- * cluster remain idle and available for single-core tasks.
+ * Multi-subtask tasks (2+ active slots) are all scheduled as MIX. Dispatch
+ * chooses one cluster, then uses active_mask to decide which cores in that
+ * cluster must be placed together: all used cores idle -> running placement;
+ * all used cores already running with free pending slots -> pending placement;
+ * mixed used-core state is rejected and retried later.
  *
  * DUMMY is a synthetic shape for dep-only tasks (no AICore dispatch). Tasks
  * with an empty core_mask route to a dedicated DUMMY ready queue and are

@@ -279,7 +279,9 @@ int ScopeStatsCollector::write_jsonl(const std::string &output_dir) {
     }
     std::fprintf(
         fp,
-        "{\"version\": 5, \"fatal\": %s, \"dropped\": %u, \"total\": %u, "
+        // version 6: heap_start/heap_end are monotonic cumulative bytes (was
+        // wrapping ring offsets in v5) — see docs/dfx/scope-stats.md.
+        "{\"version\": 6, \"fatal\": %s, \"dropped\": %u, \"total\": %u, "
         "\"task_window_max\": [%s], \"heap_max\": [%s], \"dep_pool_max\": [%s], \"tensormap_max\": %d}\n",
         hdr->fatal_latched ? "true" : "false", state->dropped_record_count, state->total_record_count,
         task_window_max.c_str(), heap_max.c_str(), dep_pool_max.c_str(), hdr->tensormap_cap

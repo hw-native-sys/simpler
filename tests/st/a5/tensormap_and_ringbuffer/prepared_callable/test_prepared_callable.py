@@ -106,7 +106,7 @@ class TestPreparedCallable(SceneTestCase):
         rounds=1,
         skip_golden=False,
         enable_l2_swimlane=False,
-        enable_dump_tensor=False,
+        enable_dump_args=False,
         enable_pmu=0,
         enable_dep_gen=False,
         enable_scope_stats=False,

@@ -17,15 +17,15 @@ import weakref
 import pytest
 import simpler.task_interface as task_interface_module
 from _task_interface import (  # pyright: ignore[reportMissingImports]
-    CONTINUOUS_TENSOR_MAX_DIMS,
+    MAX_TENSOR_DIMS,
     ArgDirection,
     ChipCallable,
     ChipStorageTaskArgs,
-    ContinuousTensor,
     CoreCallable,
     DataType,
     TaskArgs,
     TaskState,
+    Tensor,
     TensorArgType,
     arg_direction_name,
     get_dtype_name,
@@ -159,7 +159,7 @@ class TestTorchInterop:
 
         t = torch.zeros(4, 8, dtype=torch.float32)
         arg = make_tensor_arg(t)
-        assert isinstance(arg, ContinuousTensor)
+        assert isinstance(arg, Tensor)
         assert arg.data == t.data_ptr()
         assert arg.shapes == (4, 8)
         assert arg.dtype == DataType.FLOAT32
@@ -186,62 +186,62 @@ class TestScalarToUint64:
 
 
 # ============================================================================
-# ContinuousTensor
+# Tensor
 # ============================================================================
 
 
-class TestContinuousTensor:
+class TestTensor:
     def test_default_constructor(self):
-        arg = ContinuousTensor()
+        arg = Tensor()
         assert arg is not None
 
     def test_max_dims_constant(self):
-        assert CONTINUOUS_TENSOR_MAX_DIMS == 5
+        assert MAX_TENSOR_DIMS == 5
 
     def test_make(self):
-        arg = ContinuousTensor.make(0xDEAD, (4, 8), DataType.FLOAT32)
+        arg = Tensor.make(0xDEAD, (4, 8), DataType.FLOAT32)
         assert arg.data == 0xDEAD
         assert arg.shapes == (4, 8)
         assert arg.ndims == 2
         assert arg.dtype == DataType.FLOAT32
 
     def test_nbytes(self):
-        arg = ContinuousTensor.make(0, (10, 20), DataType.FLOAT32)
+        arg = Tensor.make(0, (10, 20), DataType.FLOAT32)
         assert arg.nbytes() == 10 * 20 * 4
 
     def test_nbytes_int8(self):
-        arg = ContinuousTensor.make(0, (256,), DataType.INT8)
+        arg = Tensor.make(0, (256,), DataType.INT8)
         assert arg.nbytes() == 256
 
     def test_shapes_setter(self):
-        arg = ContinuousTensor()
+        arg = Tensor()
         arg.shapes = (3, 5, 7)
         assert arg.ndims == 3
         assert arg.shapes == (3, 5, 7)
 
     def test_max_dims(self):
-        arg = ContinuousTensor.make(0, (1, 2, 3, 4, 5), DataType.INT32)
+        arg = Tensor.make(0, (1, 2, 3, 4, 5), DataType.INT32)
         assert arg.ndims == 5
 
     def test_exceed_max_dims(self):
         with pytest.raises((ValueError, RuntimeError)):
-            ContinuousTensor.make(0, (1, 2, 3, 4, 5, 6), DataType.INT32)
+            Tensor.make(0, (1, 2, 3, 4, 5, 6), DataType.INT32)
 
     def test_dtype_readwrite(self):
-        arg = ContinuousTensor.make(0, (1,), DataType.FLOAT32)
+        arg = Tensor.make(0, (1,), DataType.FLOAT32)
         arg.dtype = DataType.INT64
         assert arg.dtype == DataType.INT64
 
     def test_data_readwrite(self):
-        arg = ContinuousTensor.make(0x1000, (1,), DataType.FLOAT32)
+        arg = Tensor.make(0x1000, (1,), DataType.FLOAT32)
         assert arg.data == 0x1000
         arg.data = 0x2000
         assert arg.data == 0x2000
 
     def test_repr(self):
-        arg = ContinuousTensor.make(0x1000, (4, 8), DataType.FLOAT16)
+        arg = Tensor.make(0x1000, (4, 8), DataType.FLOAT16)
         r = repr(arg)
-        assert "ContinuousTensor" in r
+        assert "Tensor" in r
         assert "4" in r
         assert "8" in r
         assert "FLOAT16" in r
@@ -261,7 +261,7 @@ class TestChipStorageTaskArgs:
 
     def test_add_tensor(self):
         args = ChipStorageTaskArgs()
-        t = ContinuousTensor.make(0xBEEF, (4, 8), DataType.FLOAT32)
+        t = Tensor.make(0xBEEF, (4, 8), DataType.FLOAT32)
         args.add_tensor(t)
         assert args.tensor_count() == 1
         assert args.scalar_count() == 0
@@ -276,8 +276,8 @@ class TestChipStorageTaskArgs:
 
     def test_mixed(self):
         args = ChipStorageTaskArgs()
-        args.add_tensor(ContinuousTensor.make(0x1, (2,), DataType.INT32))
-        args.add_tensor(ContinuousTensor.make(0x2, (3,), DataType.FLOAT16))
+        args.add_tensor(Tensor.make(0x1, (2,), DataType.INT32))
+        args.add_tensor(Tensor.make(0x2, (3,), DataType.FLOAT16))
         args.add_scalar(99)
         args.add_scalar(100)
         assert args.tensor_count() == 2
@@ -288,12 +288,12 @@ class TestChipStorageTaskArgs:
         args = ChipStorageTaskArgs()
         args.add_scalar(42)
         with pytest.raises(RuntimeError):
-            args.add_tensor(ContinuousTensor.make(0x1, (2,), DataType.INT32))
+            args.add_tensor(Tensor.make(0x1, (2,), DataType.INT32))
 
     def test_tensor_access(self):
         args = ChipStorageTaskArgs()
-        args.add_tensor(ContinuousTensor.make(0xA, (4,), DataType.FLOAT32))
-        args.add_tensor(ContinuousTensor.make(0xB, (8,), DataType.INT32))
+        args.add_tensor(Tensor.make(0xA, (4,), DataType.FLOAT32))
+        args.add_tensor(Tensor.make(0xB, (8,), DataType.INT32))
         assert args.tensor(0).data == 0xA
         assert args.tensor(1).data == 0xB
         assert args.tensor(0).shapes == (4,)
@@ -318,7 +318,7 @@ class TestChipStorageTaskArgs:
 
     def test_clear(self):
         args = ChipStorageTaskArgs()
-        args.add_tensor(ContinuousTensor.make(0, (1,), DataType.INT8))
+        args.add_tensor(Tensor.make(0, (1,), DataType.INT8))
         args.add_scalar(42)
         args.clear()
         assert len(args) == 0
@@ -357,24 +357,24 @@ class TestTaskArgs:
 
     def test_add_tensor_default_tag(self):
         args = TaskArgs()
-        t = ContinuousTensor.make(0xBEEF, (4, 8), DataType.FLOAT32)
+        t = Tensor.make(0xBEEF, (4, 8), DataType.FLOAT32)
         args.add_tensor(t)
         assert args.tensor_count() == 1
         assert args.tag(0) == TensorArgType.INPUT
 
     def test_add_tensor_with_tag(self):
         args = TaskArgs()
-        t = ContinuousTensor.make(0xBEEF, (4, 8), DataType.FLOAT32)
+        t = Tensor.make(0xBEEF, (4, 8), DataType.FLOAT32)
         args.add_tensor(t, TensorArgType.OUTPUT)
         assert args.tag(0) == TensorArgType.OUTPUT
 
     def test_multiple_tensors_with_tags(self):
         args = TaskArgs()
-        args.add_tensor(ContinuousTensor.make(0x1, (2,), DataType.INT32), TensorArgType.INPUT)
-        args.add_tensor(ContinuousTensor.make(0x2, (3,), DataType.FLOAT16), TensorArgType.OUTPUT)
-        args.add_tensor(ContinuousTensor.make(0x3, (4,), DataType.INT8), TensorArgType.INOUT)
-        args.add_tensor(ContinuousTensor.make(0x4, (5,), DataType.FLOAT32), TensorArgType.OUTPUT_EXISTING)
-        args.add_tensor(ContinuousTensor.make(0x5, (6,), DataType.INT32), TensorArgType.NO_DEP)
+        args.add_tensor(Tensor.make(0x1, (2,), DataType.INT32), TensorArgType.INPUT)
+        args.add_tensor(Tensor.make(0x2, (3,), DataType.FLOAT16), TensorArgType.OUTPUT)
+        args.add_tensor(Tensor.make(0x3, (4,), DataType.INT8), TensorArgType.INOUT)
+        args.add_tensor(Tensor.make(0x4, (5,), DataType.FLOAT32), TensorArgType.OUTPUT_EXISTING)
+        args.add_tensor(Tensor.make(0x5, (6,), DataType.INT32), TensorArgType.NO_DEP)
         assert args.tensor_count() == 5
         assert args.tag(0) == TensorArgType.INPUT
         assert args.tag(1) == TensorArgType.OUTPUT
@@ -384,7 +384,7 @@ class TestTaskArgs:
 
     def test_set_tag(self):
         args = TaskArgs()
-        args.add_tensor(ContinuousTensor.make(0x1, (2,), DataType.INT32))
+        args.add_tensor(Tensor.make(0x1, (2,), DataType.INT32))
         assert args.tag(0) == TensorArgType.INPUT
         args.set_tag(0, TensorArgType.INOUT)
         assert args.tag(0) == TensorArgType.INOUT
@@ -398,8 +398,8 @@ class TestTaskArgs:
 
     def test_mixed_with_tags(self):
         args = TaskArgs()
-        args.add_tensor(ContinuousTensor.make(0x1, (2,), DataType.INT32), TensorArgType.INPUT)
-        args.add_tensor(ContinuousTensor.make(0x2, (3,), DataType.FLOAT16), TensorArgType.OUTPUT)
+        args.add_tensor(Tensor.make(0x1, (2,), DataType.INT32), TensorArgType.INPUT)
+        args.add_tensor(Tensor.make(0x2, (3,), DataType.FLOAT16), TensorArgType.OUTPUT)
         args.add_scalar(99)
         args.add_scalar(100)
         assert args.tensor_count() == 2
@@ -414,12 +414,12 @@ class TestTaskArgs:
         args = TaskArgs()
         args.add_scalar(42)
         with pytest.raises(RuntimeError):
-            args.add_tensor(ContinuousTensor.make(0x1, (2,), DataType.INT32))
+            args.add_tensor(Tensor.make(0x1, (2,), DataType.INT32))
 
     def test_tensor_access(self):
         args = TaskArgs()
-        args.add_tensor(ContinuousTensor.make(0xA, (4,), DataType.FLOAT32))
-        args.add_tensor(ContinuousTensor.make(0xB, (8,), DataType.INT32))
+        args.add_tensor(Tensor.make(0xA, (4,), DataType.FLOAT32))
+        args.add_tensor(Tensor.make(0xB, (8,), DataType.INT32))
         assert args.tensor(0).data == 0xA
         assert args.tensor(1).data == 0xB
         assert args.tensor(0).shapes == (4,)
@@ -454,7 +454,7 @@ class TestTaskArgs:
 
     def test_clear(self):
         args = TaskArgs()
-        args.add_tensor(ContinuousTensor.make(0, (1,), DataType.INT8), TensorArgType.OUTPUT)
+        args.add_tensor(Tensor.make(0, (1,), DataType.INT8), TensorArgType.OUTPUT)
         args.add_scalar(42)
         args.clear()
         assert len(args) == 0
@@ -465,7 +465,7 @@ class TestTaskArgs:
         """TaskArgs is vector-backed — no per-class capacity limit on tensors."""
         args = TaskArgs()
         for i in range(20):
-            args.add_tensor(ContinuousTensor.make(i, (1,), DataType.INT8))
+            args.add_tensor(Tensor.make(i, (1,), DataType.INT8))
         assert args.tensor_count() == 20
 
     def test_no_capacity_limit_scalars(self):
@@ -678,7 +678,7 @@ class TestRemoteL3SessionTaskArgsMaterialization:
         )
         from simpler.remote_l3_session import _materialize_task_args
 
-        tensor = ContinuousTensor.make(0, (4,), DataType.UINT8)
+        tensor = Tensor.make(0, (4,), DataType.UINT8)
         desc = RemoteTensorDesc(
             address_space=WireRemoteAddressSpace.HOST_INLINE,
             owner_worker_id=0,
@@ -713,7 +713,7 @@ class TestRemoteL3SessionTaskArgsMaterialization:
 
         backing = ctypes.create_string_buffer(b"01234567", 8)
         entry = _RemoteBufferEntry(backing, 8, 1, WireRemoteAddressSpace.REMOTE_DEVICE)
-        tensor = ContinuousTensor.make(0, (4,), DataType.UINT8)
+        tensor = Tensor.make(0, (4,), DataType.UINT8)
         desc = RemoteTensorDesc(
             address_space=WireRemoteAddressSpace.REMOTE_DEVICE,
             owner_worker_id=2,
@@ -916,45 +916,45 @@ class TestChipCallable:
 
 
 # ============================================================================
-# ContinuousTensor.child_memory
+# Tensor.child_memory
 # ============================================================================
 
 
 class TestChildMemory:
     def test_default_is_false(self):
-        t = ContinuousTensor()
+        t = Tensor()
         assert t.child_memory is False
 
     def test_make_default_is_false(self):
-        t = ContinuousTensor.make(0x1000, (4,), DataType.FLOAT32)
+        t = Tensor.make(0x1000, (4,), DataType.FLOAT32)
         assert t.child_memory is False
 
     def test_make_child_memory_true(self):
-        t = ContinuousTensor.make(0xDEAD, (8,), DataType.FLOAT16, child_memory=True)
+        t = Tensor.make(0xDEAD, (8,), DataType.FLOAT16, child_memory=True)
         assert t.child_memory is True
         assert t.data == 0xDEAD
         assert t.shapes == (8,)
         assert t.dtype == DataType.FLOAT16
 
     def test_set_child_memory(self):
-        t = ContinuousTensor.make(0x1000, (4,), DataType.FLOAT32)
+        t = Tensor.make(0x1000, (4,), DataType.FLOAT32)
         assert t.child_memory is False
         t.child_memory = True
         assert t.child_memory is True
 
     def test_repr_shows_child_memory_when_set(self):
-        t = ContinuousTensor.make(0x1000, (4,), DataType.FLOAT32, child_memory=True)
+        t = Tensor.make(0x1000, (4,), DataType.FLOAT32, child_memory=True)
         r = repr(t)
         assert "child_memory=True" in r
 
     def test_repr_hides_child_memory_when_default(self):
-        t = ContinuousTensor.make(0x1000, (4,), DataType.FLOAT32)
+        t = Tensor.make(0x1000, (4,), DataType.FLOAT32)
         r = repr(t)
         assert "child_memory" not in r
 
     def test_chip_storage_preserves_child_memory(self):
         args = ChipStorageTaskArgs()
-        t = ContinuousTensor.make(0x2000, (16,), DataType.INT32, child_memory=True)
+        t = Tensor.make(0x2000, (16,), DataType.INT32, child_memory=True)
         args.add_tensor(t)
         out = args.tensor(0)
         assert out.child_memory is True

@@ -92,7 +92,6 @@ add_library(a2a3_rt_objs OBJECT
     ${A2A3_RUNTIME_DIR}/scheduler/pto_scheduler.cpp
     ${A2A3_RUNTIME_DIR}/shared/pto_tensormap.cpp
     ${A2A3_RUNTIME_DIR}/shared/pto_runtime2_init.cpp
-    ${CMAKE_SOURCE_DIR}/../../../src/common/platform/shared/aicpu/scope_stats_collector_aicpu.cpp
     ${CMAKE_SOURCE_DIR}/stubs/test_stubs.cpp
 )
 target_include_directories(a2a3_rt_objs PUBLIC
@@ -100,6 +99,7 @@ target_include_directories(a2a3_rt_objs PUBLIC
     ${CMAKE_SOURCE_DIR}/../../../src/a2a3/runtime/tensormap_and_ringbuffer/runtime
     ${CMAKE_SOURCE_DIR}/../../../src/a2a3/runtime/tensormap_and_ringbuffer/common
     ${CMAKE_SOURCE_DIR}/../../../src/a2a3/platform/include
+    ${CMAKE_SOURCE_DIR}/../../../src/common/platform/sim/aicpu
     ${CMAKE_SOURCE_DIR}/../../../src/common/platform/include
     ${CMAKE_SOURCE_DIR}/../../../src/common/task_interface
     ${CMAKE_SOURCE_DIR}/../../../src/common/log/include
@@ -109,6 +109,27 @@ target_include_directories(a2a3_rt_objs PUBLIC
 function(add_a2a3_runtime_test name src)
     add_executable(${name} ${src})
     target_include_directories(${name} PRIVATE ${GTEST_INCLUDE_DIRS})
+    target_link_libraries(${name} PRIVATE
+        a2a3_rt_objs
+        ${GTEST_MAIN_LIB}
+        ${GTEST_LIB}
+        pthread
+    )
+    add_test(NAME ${name} COMMAND ${name})
+    set_tests_properties(${name} PROPERTIES LABELS "no_hardware")
+endfunction()
+
+function(add_a2a3_orchestrator_runtime_test name src)
+    add_executable(${name}
+        ${src}
+        ${A2A3_RUNTIME_DIR}/pto_orchestrator.cpp
+        ${CMAKE_SOURCE_DIR}/../../../src/common/platform/shared/aicpu/scope_stats_collector_aicpu.cpp
+        ${CMAKE_SOURCE_DIR}/../../../src/common/platform/shared/aicpu/tensor_dump_aicpu.cpp
+    )
+    target_include_directories(${name} PRIVATE
+        ${GTEST_INCLUDE_DIRS}
+        ${CMAKE_SOURCE_DIR}/../../../src/a2a3/runtime
+    )
     target_link_libraries(${name} PRIVATE
         a2a3_rt_objs
         ${GTEST_MAIN_LIB}
@@ -138,6 +159,14 @@ add_library(hierarchical_objs OBJECT
     ${HIERARCHICAL_SRC_DIR}/scheduler.cpp
     ${HIERARCHICAL_SRC_DIR}/worker.cpp
     ${WORKER_SRC_DIR}/chip_worker.cpp
+    # Host-side assert_impl / get_stacktrace for the unified Tensor's
+    # always_assert (init_external, reached via make_tensor_external in
+    # remote_wire.cpp / orchestrator.cpp). Mirrors the binding's CMake.
+    # ODR invariant: assert_impl / get_stacktrace are ALSO defined in the runtime
+    # orchestration/common.cpp. No target may link both that and this file, or
+    # the linker sees duplicate symbols. This target links neither runtime
+    # orchestration TU, so only this host-side definition is present.
+    ${CMAKE_SOURCE_DIR}/../../../src/common/task_interface/assert_compat.cpp
 )
 target_include_directories(hierarchical_objs PUBLIC
     ${HIERARCHICAL_SRC_DIR}
@@ -221,6 +250,7 @@ target_include_directories(a5_rt_objs PUBLIC
     ${CMAKE_SOURCE_DIR}/../../../src/a5/runtime/tensormap_and_ringbuffer/runtime
     ${CMAKE_SOURCE_DIR}/../../../src/a5/runtime/tensormap_and_ringbuffer/common
     ${CMAKE_SOURCE_DIR}/../../../src/a5/platform/include
+    ${CMAKE_SOURCE_DIR}/../../../src/common/platform/sim/aicpu
     ${CMAKE_SOURCE_DIR}/../../../src/common/platform/include
     ${CMAKE_SOURCE_DIR}/../../../src/common/task_interface
     ${CMAKE_SOURCE_DIR}/../../../src/common/log/include
@@ -230,6 +260,27 @@ target_include_directories(a5_rt_objs PUBLIC
 function(add_a5_runtime_test name src)
     add_executable(${name} ${src})
     target_include_directories(${name} PRIVATE ${GTEST_INCLUDE_DIRS})
+    target_link_libraries(${name} PRIVATE
+        a5_rt_objs
+        ${GTEST_MAIN_LIB}
+        ${GTEST_LIB}
+        pthread
+    )
+    add_test(NAME ${name} COMMAND ${name})
+    set_tests_properties(${name} PROPERTIES LABELS "no_hardware")
+endfunction()
+
+function(add_a5_orchestrator_runtime_test name src)
+    add_executable(${name}
+        ${src}
+        ${A5_RUNTIME_DIR}/pto_orchestrator.cpp
+        ${CMAKE_SOURCE_DIR}/../../../src/common/platform/shared/aicpu/scope_stats_collector_aicpu.cpp
+        ${CMAKE_SOURCE_DIR}/../../../src/common/platform/shared/aicpu/tensor_dump_aicpu.cpp
+    )
+    target_include_directories(${name} PRIVATE
+        ${GTEST_INCLUDE_DIRS}
+        ${CMAKE_SOURCE_DIR}/../../../src/a5/runtime
+    )
     target_link_libraries(${name} PRIVATE
         a5_rt_objs
         ${GTEST_MAIN_LIB}
@@ -372,9 +423,11 @@ add_a2a3_runtime_test(test_ready_queue      a2a3/test_ready_queue.cpp)
 add_a2a3_runtime_test(test_shared_memory    a2a3/test_shared_memory.cpp)
 add_a2a3_runtime_test(test_a2a3_tensormap   a2a3/test_tensormap.cpp)
 add_a2a3_runtime_test(test_fanin_pool       a2a3/test_fanin_pool.cpp)
+add_a2a3_orchestrator_runtime_test(test_a2a3_orchestrator_fanin a2a3/test_orchestrator_fanin.cpp)
 add_a2a3_runtime_test(test_spsc_queue       a2a3/test_spsc_queue.cpp)
 add_a2a3_runtime_test(test_wiring           a2a3/test_wiring.cpp)
 add_a2a3_runtime_test(test_aicore_completion_mailbox a2a3/test_aicore_completion_mailbox.cpp)
+add_a2a3_runtime_test(test_a2a3_scope_stats_collector a2a3/test_scope_stats_collector.cpp)
 
 # ---------------------------------------------------------------------------
 # A5 tests (src/a5/runtime/tensormap_and_ringbuffer/)
@@ -393,6 +446,7 @@ add_a5_runtime_test(test_a5_ready_queue      a5/test_ready_queue.cpp)
 add_a5_runtime_test(test_a5_shared_memory    a5/test_shared_memory.cpp)
 add_a5_runtime_test(test_a5_tensormap        a5/test_tensormap.cpp)
 add_a5_runtime_test(test_a5_fanin_pool       a5/test_fanin_pool.cpp)
+add_a5_orchestrator_runtime_test(test_a5_orchestrator_fanin a5/test_orchestrator_fanin.cpp)
 add_a5_runtime_test(test_a5_spsc_queue       a5/test_spsc_queue.cpp)
 add_a5_runtime_test(test_a5_wiring           a5/test_wiring.cpp)
 add_a5_runtime_test(test_a5_aicore_completion_mailbox a5/test_aicore_completion_mailbox.cpp)

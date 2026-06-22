@@ -38,11 +38,6 @@
 #include "pto_runtime2_types.h"
 #include "pto_shared_memory.h"
 
-#if PTO2_PROFILING
-// Strong def in scope_stats_collector_aicpu.cpp; weak fallback in pto_scheduler.cpp for host/UT builds.
-extern "C" bool is_scope_stats_enabled();
-#endif
-
 #if PTO2_SCHED_PROFILING
 #include "aicpu/device_time.h"
 #define PTO2_SCHED_CYCLE_START() uint64_t _st0 = get_sys_cnt_aicpu(), _st1
@@ -991,7 +986,7 @@ struct PTO2SchedulerState {
 #else
     void
 #endif
-    on_mixed_task_complete(
+    on_task_complete(
         PTO2TaskSlotState &slot_state,
 #if PTO2_SCHED_PROFILING
         int thread_idx,
@@ -1129,9 +1124,9 @@ struct PTO2SchedulerState {
 inline bool
 AsyncWaitList::try_inline_complete_locked(AsyncWaitList::DrainCompletionSink &sink, PTO2TaskSlotState &slot_state) {
 #if PTO2_SCHED_PROFILING
-    sink.sched->on_mixed_task_complete(slot_state, sink.thread_idx, sink.local_bufs);
+    sink.sched->on_task_complete(slot_state, sink.thread_idx, sink.local_bufs);
 #else
-    sink.sched->on_mixed_task_complete(slot_state, sink.local_bufs);
+    sink.sched->on_task_complete(slot_state, sink.local_bufs);
 #endif
     if (*sink.deferred_release_count >= sink.deferred_release_capacity) {
         while (*sink.deferred_release_count > 0) {
@@ -1209,9 +1204,9 @@ inline AsyncPollResult AsyncWaitList::poll_and_complete(
 
         if (entry.normal_done && entry.waiting_completion_count <= 0) {
 #if PTO2_SCHED_PROFILING
-            sched->on_mixed_task_complete(*entry.slot_state, thread_idx, local_bufs);
+            sched->on_task_complete(*entry.slot_state, thread_idx, local_bufs);
 #else
-            sched->on_mixed_task_complete(*entry.slot_state, local_bufs);
+            sched->on_task_complete(*entry.slot_state, local_bufs);
 #endif
             if (deferred_release_count >= deferred_release_capacity) {
                 while (deferred_release_count > 0) {
@@ -1241,7 +1236,7 @@ inline AsyncPollResult AsyncWaitList::poll_and_complete(
 
 #if PTO2_SCHED_PROFILING
 struct PTO2SchedProfilingData {
-    // Sub-phase cycle breakdown within on_mixed_task_complete
+    // Sub-phase cycle breakdown within on_task_complete
     uint64_t lock_cycle;           // lock_fanout + state store + unlock
     uint64_t fanout_cycle;         // fanout traversal
     uint64_t fanin_cycle;          // fanin traversal

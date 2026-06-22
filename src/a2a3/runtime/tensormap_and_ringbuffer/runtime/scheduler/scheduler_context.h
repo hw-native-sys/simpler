@@ -271,6 +271,23 @@ private:
         CoreTracker &tracker, bool &entered_drain, bool &made_progress, bool &try_pushed
     );
 
+    // Speculative early-dispatch (Hook 1). After normal dispatch leaves idle
+    // cores spare, pre-stage the consumers of any RUNNING flagged producer onto
+    // those cores with not_ready=1 (gated). Touches no dependency state — the
+    // task is released by the doorbell at its normal ready-pop (Hook 2).
+    int32_t try_speculative_early_dispatch(int32_t thread_idx);
+
+    // Stage the already-claimed range [start, start+count) of consumer `c` onto
+    // thread_idx's idle (RUNNING slot) then pending (gated-pending, promote-on-FIN)
+    // cores from the provided free-core sets. The caller advances next_block_idx and
+    // re-pushes `c` BEFORE calling, so this expensive prepare+publish runs
+    // concurrently with peers (mirrors the normal SPMD dispatch path). Returns the
+    // number of blocks staged.
+    int32_t stage_consumer_blocks(
+        int32_t thread_idx, PTO2TaskSlotState *c, PTO2ResourceShape shape, int32_t start, int32_t count,
+        CoreTracker::BitStates &idle, CoreTracker::BitStates &pend
+    );
+
     // One pass of "Phase 4" in the resolve_and_dispatch loop: IDLE-stage dispatch
     // for MIX then (if no mix residual) AIC/AIV; mid-flush of local buffers; then
     // PENDING-stage dispatch with cross-thread idle gating. MIX is strictly
@@ -309,8 +326,9 @@ private:
     // Completion & drain (scheduler_completion.cpp)
     // =========================================================================
 
-    static SlotTransition
-    decide_slot_transition(int32_t reg_task_id, int32_t reg_state, int32_t running_id, int32_t pending_id);
+    static SlotTransition decide_slot_transition(
+        int32_t reg_task_id, int32_t reg_state, int32_t running_id, int32_t pending_id, bool pending_gated = false
+    );
 
     void complete_slot_task(
         PTO2TaskSlotState &slot_state, int32_t expected_reg_task_id, PTO2SubtaskSlot subslot, int32_t thread_idx,
@@ -333,7 +351,7 @@ private:
     );
 
     bool enter_drain_mode(PTO2TaskSlotState *slot_state, int32_t block_num);
-    int32_t count_global_available(PTO2ResourceShape shape);
+    int32_t count_global_available(PTO2ResourceShape shape, uint8_t core_mask);
     void drain_worker_dispatch(int32_t block_num);
     void handle_drain_mode(int32_t thread_idx);
 

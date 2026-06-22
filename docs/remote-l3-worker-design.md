@@ -56,8 +56,8 @@ Implemented:
   `add_remote_worker()`.
 - Python `RemoteBufferHandle` and `RemoteTensorRef` wrappers. `TaskArgs`
   accepts `RemoteTensorRef` through `add_tensor(...)`, keeps
-  `ContinuousTensor.data == 0`, and carries the remote descriptor sidecar into
-  C++ submit.
+  `Tensor.data == 0`, and carries the remote descriptor sidecar into C++
+  submit.
 - Canonical little-endian `remote_wire.{h,cpp}` frame codec with bounds checks
   for TASK payloads, remote tensor descriptors, COMPLETION, CONTROL_REPLY, and
   ordered command-lane sequencing.
@@ -140,7 +140,7 @@ Relevant code paths:
   `CallableIdentity`, and optional worker affinity in a parent-side slot.
   - Dependency inference happens before dispatch from tags in `TaskArgs`.
 - `src/common/task_interface/task_args.h`
-  - Process dispatch writes `[T][S][ContinuousTensor x T][uint64 x S]`.
+  - Process dispatch writes `[T][S][Tensor x T][uint64 x S]`.
   - Tags are stripped after submit.
 - `docs/comm-domain.md`
   - Dynamic communication domains already model deferred release after
@@ -437,7 +437,7 @@ For a TASK frame, the session runner:
 
 1. Validates the session and sequence number.
 2. Decodes `RemoteTaskArgsWire`.
-3. Translates remote tensor descriptors into local `ContinuousTensor` values.
+3. Translates remote tensor descriptors into local `Tensor` values.
 4. Looks up the L3 orchestration function in the remote TASK dispatcher
    registry by hashid.
 5. Calls `inner_worker.run(orch_fn, args, config)`.
@@ -470,7 +470,7 @@ Session execution rules:
 
 ## Remote TaskArgs Representation
 
-Keep `ContinuousTensor` as the L2 ABI. Do not overload raw pointer values to
+Keep `Tensor` as the L2 ABI. Do not overload raw pointer values to
 carry transport state.
 
 Public Python uses a sidecar representation:
@@ -483,13 +483,13 @@ Public Python uses a sidecar representation:
 - Local endpoints reject remote tensor refs. `RemoteTensorRef` is transport
   metadata, not a local mailbox ABI. A local fork/shm endpoint becomes eligible
   only after the data has been explicitly imported, staged, or materialized into
-  a local-addressable `ContinuousTensor`.
+  a local-addressable `Tensor`.
 - Remote endpoints require a sidecar/descriptor for every tensor that carries
   data over the remote protocol, including `HOST_INLINE` tensors. A null
   sidecar is allowed only for metadata-only tensors with no data payload.
   Remote endpoints reject bare host pointers unless an explicit staging API
   produced a remote handle.
-- Remote submits reject `OUTPUT` tensors whose `ContinuousTensor.data == 0`
+- Remote submits reject `OUTPUT` tensors whose `Tensor.data == 0`
   unless the caller has already supplied a `RemoteTensorRef` sidecar. The first
   implementation does not auto-allocate remote outputs during submit.
 
@@ -572,7 +572,7 @@ operations use the HCOMM data adapter. The local path keeps the existing
 mailbox layout behind `LocalMailboxEndpoint`.
 
 Remote frames use canonical little-endian field encoding for `CallConfig`,
-`ContinuousTensor`, tensor descriptors, strings, counts, and enums; they do not
+`Tensor`, tensor descriptors, strings, counts, and enums; they do not
 memcpy local C++ POD structs onto the wire. Each endpoint has one ordered
 command lane for runtime state-changing frames, so TASK cannot overtake
 registry-changing CONTROL. Liveness uses a separate health lane or equivalent

@@ -33,18 +33,14 @@
 
 #include "common/core_type.h"
 #include "utils/device_arena.h"
+#include "aicpu/platform_regs.h"  // get_reg_ptr / RegId for the speculative doorbell
 #include "pto_async_wait.h"
 #include "pto_ring_buffer.h"
 #include "pto_runtime2_types.h"
 #include "pto_shared_memory.h"
 
-#if PTO2_PROFILING
-// Strong def in scope_stats_collector_aicpu.cpp; weak fallback in pto_scheduler.cpp for host/UT builds.
-extern "C" bool is_scope_stats_enabled();
-#endif
-
+#include "aicpu/device_time.h"  // get_sys_cnt_aicpu (weak; used by spec doorbell timing too)
 #if PTO2_SCHED_PROFILING
-#include "aicpu/device_time.h"
 #define PTO2_SCHED_CYCLE_START() uint64_t _st0 = get_sys_cnt_aicpu(), _st1
 #define PTO2_SCHED_CYCLE_LAP(acc)   \
     do {                            \
@@ -558,6 +554,7 @@ struct CompletionStats {
 struct PTO2SchedulerLayout {
     size_t off_ready_queue_slots[PTO2_NUM_RESOURCE_SHAPES];
     size_t off_dummy_ready_queue_slots;
+    size_t off_early_dispatch_queue_slots;
     size_t off_dep_pool_entries[PTO2_MAX_RING_DEPTH];
     size_t off_wiring_spsc_buffer;
     uint64_t ready_queue_capacity;
@@ -777,6 +774,18 @@ struct PTO2SchedulerState {
                 producer->unlock_fanout();
             });
 
+            // Seed dispatch_fanin with producers already complete at wiring
+            // time (e.g. buffer-creator tasks that finished before this
+            // consumer entered the graph). Such producers never dispatch at
+            // runtime, so they can never bump dispatch_fanin via the fanout
+            // walk; without this seed the candidate compare
+            // (dispatch_fanin == fanin_actual_count) would be unreachable
+            // whenever any producer is pre-completed. Mirrors the
+            // early_finished seed that ready_fanin gets via init_rc.
+            if (early_finished != 0) {
+                wp->dispatch_fanin.fetch_add(early_finished, std::memory_order_acq_rel);
+            }
+
             int32_t init_rc = early_finished + 1;
             int32_t new_rc = ws->fanin_refcount.fetch_add(init_rc, std::memory_order_acq_rel) + init_rc;
             if (new_rc >= ws->fanin_count) {
@@ -871,13 +880,168 @@ struct PTO2SchedulerState {
     }
 #endif
 
-    bool release_fanin_and_check_ready(PTO2TaskSlotState &slot_state, PTO2LocalReadyBuffer *local_bufs = nullptr) {
+    // Speculative early-dispatch release. If the now-ready task was pre-staged
+    // (gated on a core), ring its DATA_MAIN_BASE high-32 doorbell RIGHT HERE in
+    // the completion path — the moment its last producer's FIN satisfies fanin —
+    // instead of routing it through the ready queue and waiting for the dispatch
+    // pass to pop it. Returns true if the task is fully handled (caller must NOT
+    // push to the ready queue). Returns false when the caller must route C
+    // normally: either it was never pre-staged, OR it is a SPMD consumer only
+    // PARTIALLY pre-staged — the gated blocks are released by the doorbells rung
+    // here, and the remaining (next_block_idx .. logical_block_num) blocks
+    // dispatch normally off the ready queue. Lock-free claim shared with Hook 1
+    // (the stager): CAS NONE->DISPATCHED wins => not pre-staged; lose => STAGED
+    // (spin past the brief STAGING window so the mask is visible), then ring.
+
+    // Per-core speculative doorbell table. Hook 1 records each gated core's
+    // (reg_addr, dispatch token) here at stage time; the completion-path release
+    // reads it back for the cores set in the consumer's staged_core_mask. One
+    // global table indexed by core_id (not per-task): gated cores in flight are
+    // bounded by the chip's core count (no two-level pre-dispatch), so this is the
+    // natural capacity and removes the old per-task 3-doorbell cap.
+    struct SpecDoorbell {
+        uint64_t addr{0};
+        uint32_t token{0};
+    };
+    SpecDoorbell spec_doorbell_table[PTO2_SPEC_CORE_MASK_WORDS * 64]{};
+
+    // Cross-thread early-dispatch work queue (a PTO2ReadyQueue MPMC instance,
+    // arena-backed — reserved/wired in pto_runtime2_init alongside the ready queues).
+    // A consumer's SPMD blocks span cores owned by several AICPU threads, but only a
+    // thread RUNNING the consumer's producer discovers it (via the producer's
+    // fanout). When that producer is thread-local (e.g. a 16-block AIV op filling one
+    // thread's cores), the other threads never see the consumer and its blocks on
+    // their cores can't pre-stage. The first claimer pushes the partially-staged
+    // consumer here; every idle thread's early_dispatch pass pops one, stages a range onto
+    // ITS OWN cores (range-claim via next_block_idx), and re-pushes if blocks remain
+    // — exactly mirroring how a partially-dispatched SPMD task is re-pushed to the
+    // ready queue (scheduler_dispatch: pop -> claim -> re-push). A stale/released
+    // entry fails the STAGING check on pop and is dropped; a push that overflows is
+    // logged and the consumer's blocks fall back to normal dispatch.
+    PTO2ReadyQueue early_dispatch_queue;
+
+    static inline void ring_one_doorbell(uint64_t reg_addr, uint32_t token) {
+        volatile uint64_t *dmb = reinterpret_cast<volatile uint64_t *>(get_reg_ptr(reg_addr, RegId::DATA_MAIN_BASE));
+        uint64_t tk = static_cast<uint64_t>(token);
+        *dmb = (tk << 32) | tk;  // 64-bit STR: high=low=token releases the gated AICore
+    }
+
+    // auto-chain depth cap: a candidate inherits the flag only while depth < this.
+    static constexpr uint8_t PTO2_SPEC_CHAIN_MAX = 4;
+
+    // Event-driven candidate detection (the dual of fanin_refcount/ready). Call when a
+    // FLAGGED producer `p` DISPATCHES (starts running): walk its fanout and bump each
+    // consumer's dispatch_fanin. A consumer whose dispatch_fanin reaches
+    // fanin_actual_count (= every producer is either flagged-and-dispatched, or was
+    // already complete when the consumer was wired) is an early-dispatch candidate:
+    // CAS NONE->STAGING (exactly-once) and push to early_dispatch_queue for the idle drain to
+    // pre-stage. Once-guarded per producer so an SPMD producer's block-by-block
+    // dispatch propagates once. Replaces the old per-iteration pass-1 PULL scan.
+    void propagate_dispatch_fanin(PTO2TaskSlotState &p) {
+        if (!(p.payload->allow_early_resolve || p.payload->spec_chain_active.load(std::memory_order_acquire)))
+            return;  // only flagged (codegen or inherited) producers propagate
+        if (p.payload->dispatch_propagated.exchange(1, std::memory_order_acq_rel) != 0)
+            return;  // already propagated once
+        uint8_t child_depth = static_cast<uint8_t>(p.payload->spec_chain_depth + 1);
+        p.lock_fanout();
+        PTO2DepListEntry *edge = p.fanout_head;  // snapshot head, walk lock-free (fanout stable by dispatch)
+        p.unlock_fanout();
+        for (; edge != nullptr; edge = edge->next) {
+            PTO2TaskSlotState *c = edge->slot_state;
+            // Compare to fanin_actual_count (the real producer-edge count), NOT
+            // fanin_count: fanin_count = fanin_actual_count + 1 (a self/wiring +1 that
+            // ready_fanin gets but dispatch_fanin does not). dispatch_fanin starts at
+            // the wiring-time early_finished seed (producers already complete) and is
+            // bumped here by flagged producers; reaching fanin_actual_count means every
+            // producer is flagged-dispatched or was pre-completed.
+            int32_t nf = c->payload->dispatch_fanin.fetch_add(1, std::memory_order_acq_rel) + 1;
+            if (nf != c->payload->fanin_actual_count) continue;
+            if (c->active_mask.requires_sync_start()) continue;  // sync_start can't be block-by-block pre-staged
+            PTO2ResourceShape shape = c->active_mask.to_shape();
+            if (shape != PTO2ResourceShape::AIC && shape != PTO2ResourceShape::AIV && shape != PTO2ResourceShape::MIX)
+                continue;
+            uint8_t expect = PTO2_SPEC_NONE;  // exactly-once: only the CAS winner enqueues
+            if (!c->payload->spec_state.compare_exchange_strong(
+                    expect, PTO2_SPEC_STAGING, std::memory_order_seq_cst, std::memory_order_seq_cst
+                ))
+                continue;
+            if (child_depth < PTO2_SPEC_CHAIN_MAX) {  // auto-chain: C propagates to ITS consumers
+                c->payload->spec_chain_depth = child_depth;
+                c->payload->spec_chain_active.store(1, std::memory_order_release);
+            }
+            early_dispatch_queue.push(c);
+        }
+    }
+
+    // Collects consumers released via the speculative-doorbell path during a
+    // single on_task_complete fanout walk, so their dispatch_fanin
+    // propagation runs AFTER the walk — never between two siblings' doorbells.
+    struct SpecReleaseSink {
+        static constexpr int CAP = 32;
+        PTO2TaskSlotState *items[CAP];
+        int n = 0;
+        inline bool push(PTO2TaskSlotState *s) {
+            if (n >= CAP) return false;
+            items[n++] = s;
+            return true;
+        }
+    };
+
+    inline bool try_speculative_release(PTO2TaskSlotState &slot_state, SpecReleaseSink *sink = nullptr) {
+        // Never staged => CAS NONE->DISPATCHED wins => dispatch normally.
+        uint8_t expect = PTO2_SPEC_NONE;
+        if (slot_state.payload->spec_state.compare_exchange_strong(
+                expect, PTO2_SPEC_DISPATCHED, std::memory_order_seq_cst, std::memory_order_seq_cst
+            )) {
+            return false;
+        }
+        // Staged (STAGING). Flip STAGING->DISPATCHED, THEN read the mask. seq_cst
+        // gives a total order with the concurrent stagers, each of which OR-s its
+        // core into the mask and THEN loads spec_state: a stager whose bit lands
+        // before this CAS is read here and rung; a stager whose bit lands after
+        // sees DISPATCHED and rings that core itself (self-ring in
+        // stage_consumer_blocks). Either way every gated core's doorbell fires once
+        // (a double-ring is harmless — the AICore already matched). This replaces
+        // the old transient-STAGING spin: STAGING is now the stable gated state.
+        expect = PTO2_SPEC_STAGING;
+        slot_state.payload->spec_state.compare_exchange_strong(
+            expect, PTO2_SPEC_DISPATCHED, std::memory_order_seq_cst, std::memory_order_seq_cst
+        );
+        for (int w = 0; w < PTO2_SPEC_CORE_MASK_WORDS; w++) {
+            uint64_t bits = slot_state.payload->staged_core_mask[w].load(std::memory_order_seq_cst);
+            while (bits != 0) {
+                int core_id = w * 64 + __builtin_ctzll(bits);
+                bits &= bits - 1;
+                ring_one_doorbell(spec_doorbell_table[core_id].addr, spec_doorbell_table[core_id].token);
+            }
+        }
+        // This pre-staged consumer was just released by its doorbell — it starts
+        // running NOW, so propagate dispatch_fanin to ITS consumers (auto-chain,
+        // knob A). Defer it via the sink so it runs after the whole fanout walk:
+        // doing it inline here would delay the doorbells of later consumers in the
+        // same producer's fanout. Fallback to inline if no sink / sink full.
+        if (sink == nullptr || !sink->push(&slot_state)) {
+            propagate_dispatch_fanin(slot_state);
+        }
+        // No explicit removal from the cross-thread queue: a still-queued entry for
+        // this consumer is now DISPATCHED and is dropped when a peer pops it.
+        // Fully pre-staged => skip the ready queue. Partially staged SPMD consumer =>
+        // fall through so the caller pushes C; dispatch resumes from next_block_idx.
+        return slot_state.next_block_idx.load(std::memory_order_seq_cst) >= slot_state.logical_block_num;
+    }
+
+    bool release_fanin_and_check_ready(
+        PTO2TaskSlotState &slot_state, PTO2LocalReadyBuffer *local_bufs = nullptr, SpecReleaseSink *sink = nullptr
+    ) {
         // Atomically increment fanin_refcount and check if all producers are done
         // ACQ_REL on fanin_refcount already synchronizes with the orchestrator's
         // init release, making fanin_count visible — plain load suffices.
         int32_t new_refcount = slot_state.fanin_refcount.fetch_add(1, std::memory_order_acq_rel) + 1;
 
         if (new_refcount == slot_state.fanin_count) {
+            // Speculative early-dispatch: pre-staged tasks are released by doorbell
+            // here, skipping the ready-queue round-trip entirely.
+            if (try_speculative_release(slot_state, sink)) return true;
             // Local-first: try per-CoreType thread-local buffer before global queue
             // Route by active_mask: AIC-containing tasks → buf[0], AIV-only → buf[1]
             // DUMMY shape is out of range for local_bufs (sized PTO2_NUM_RESOURCE_SHAPES);
@@ -896,12 +1060,15 @@ struct PTO2SchedulerState {
 #if PTO2_ORCH_PROFILING || PTO2_SCHED_PROFILING
     bool release_fanin_and_check_ready(
         PTO2TaskSlotState &slot_state, uint64_t &atomic_count, uint64_t &push_wait,
-        PTO2LocalReadyBuffer *local_bufs = nullptr
+        PTO2LocalReadyBuffer *local_bufs = nullptr, SpecReleaseSink *sink = nullptr
     ) {
         int32_t new_refcount = slot_state.fanin_refcount.fetch_add(1, std::memory_order_acq_rel) + 1;
         atomic_count += 1;  // fanin_refcount.fetch_add
 
         if (new_refcount == slot_state.fanin_count) {
+            // Speculative early-dispatch: pre-staged tasks are released by doorbell
+            // here, skipping the ready-queue round-trip entirely.
+            if (try_speculative_release(slot_state, sink)) return true;
             // Local-first: try per-CoreType thread-local buffer before global queue.
             // Dummy slots bypass local_bufs (out-of-range for PTO2_NUM_RESOURCE_SHAPES)
             // and go straight to dummy_ready_queue; use the profiling-aware push so
@@ -982,16 +1149,22 @@ struct PTO2SchedulerState {
 
     /**
      * Two-stage completion: second stage.
-     * Called exactly once when all subtasks of a mixed task are done
-     * (i.e., on_subtask_complete returned true).
-     * Handles fanout notification, fanin release, and self-consumption check.
+     * Called exactly once when all subtasks of a task are done (i.e.,
+     * on_subtask_complete returned true). Walks the consumer (fanout) list,
+     * decrements each consumer's fanin, pushes newly-ready ones, and rings
+     * doorbells for speculative hits.
+     *
+     * Non-PROFILING returns the consumer-walk count (= edges traversed). The
+     * Resolve swimlane bar reads it to label the bar with how many successors
+     * actually got resolved. PROFILING returns the richer CompletionStats
+     * whose `fanout_edges` carries the same number.
      */
 #if PTO2_SCHED_PROFILING
     CompletionStats
 #else
-    void
+    uint32_t
 #endif
-    on_mixed_task_complete(
+    on_task_complete(
         PTO2TaskSlotState &slot_state,
 #if PTO2_SCHED_PROFILING
         int thread_idx,
@@ -1001,6 +1174,8 @@ struct PTO2SchedulerState {
     ) {
 #if PTO2_SCHED_PROFILING
         CompletionStats stats = {0, 0, 0, true};
+#else
+        uint32_t consumer_walk_count = 0;
 #endif
 #if PTO2_SCHED_PROFILING
         extern uint64_t g_sched_lock_cycle[], g_sched_fanout_cycle[];
@@ -1026,21 +1201,41 @@ struct PTO2SchedulerState {
         PTO2_SCHED_CYCLE_LAP(g_sched_lock_cycle[thread_idx]);
 #endif
 
-        // Fanout: notify consumers
+        // Fanout: notify consumers. A pre-staged consumer that becomes ready has
+        // its doorbell rung INLINE (db = nullptr) the moment its node is reached,
+        // not batched to after the whole walk — so a flagged consumer near the
+        // front of the list starts immediately and overlaps the remaining
+        // release_fanin work for the other consumers, instead of waiting for the
+        // full O(fanout-degree) walk (~5us for a 50-consumer producer).
+        //
+        // Safe on silicon: the producer's slot is already COMPLETED here — every
+        // SPMD block has FIN'd AND dcci-flushed its output to HBM before
+        // on_task_complete runs — so a released consumer never reads stale
+        // producer output. (Batching used to align the released wave, but pushed
+        // every doorbell to the end of the walk, defeating the whole point of
+        // speculative early-dispatch: minimal producer-end -> consumer-start.)
 #if PTO2_SCHED_PROFILING
         uint64_t fanout_atomics = 0, push_wait = 0;
 #endif
+        // Doorbells for released pre-staged consumers fire INLINE in the walk
+        // below; their dispatch_fanin propagation is collected here and replayed
+        // after the walk, so no consumer's doorbell waits on a sibling's propagate.
+        SpecReleaseSink rel_sink;
         while (current != nullptr) {
             PTO2TaskSlotState &consumer_slot = *current->slot_state;
 #if PTO2_SCHED_PROFILING
             stats.fanout_edges++;
-            if (release_fanin_and_check_ready(consumer_slot, fanout_atomics, push_wait, local_bufs)) {
+            if (release_fanin_and_check_ready(consumer_slot, fanout_atomics, push_wait, local_bufs, &rel_sink)) {
                 stats.tasks_enqueued++;
             }
 #else
-            release_fanin_and_check_ready(consumer_slot, local_bufs);
+            consumer_walk_count++;
+            release_fanin_and_check_ready(consumer_slot, local_bufs, &rel_sink);
 #endif
             current = current->next;
+        }
+        for (int i = 0; i < rel_sink.n; i++) {
+            propagate_dispatch_fanin(*rel_sink.items[i]);
         }
 
 #if PTO2_SCHED_PROFILING
@@ -1048,6 +1243,8 @@ struct PTO2SchedulerState {
         g_sched_push_wait_cycle[thread_idx] += push_wait;
         PTO2_SCHED_CYCLE_LAP(g_sched_fanout_cycle[thread_idx]);
         return stats;
+#else
+        return consumer_walk_count;
 #endif
     }
 
@@ -1126,7 +1323,7 @@ struct PTO2SchedulerState {
 
 // try_inline_complete_locked: short-circuit NotDeferred completions seen during
 // drain so they don't grow entries[]. Defined here (not in pto_async_wait.h)
-// because PTO2SchedulerState's on_mixed_task_complete signature is only known
+// because PTO2SchedulerState's on_task_complete signature is only known
 // after its full definition above.
 //
 // When the deferred_release_slot_states[] buffer is full, drain it via
@@ -1135,10 +1332,12 @@ struct PTO2SchedulerState {
 // rates don't surface as ASYNC_WAIT_OVERFLOW errors.
 inline bool
 AsyncWaitList::try_inline_complete_locked(AsyncWaitList::DrainCompletionSink &sink, PTO2TaskSlotState &slot_state) {
+    // Return value (CompletionStats / consumer-walk count) discarded:
+    // async-wait drain path has no Resolve swimlane bar attached.
 #if PTO2_SCHED_PROFILING
-    sink.sched->on_mixed_task_complete(slot_state, sink.thread_idx, sink.local_bufs);
+    (void)sink.sched->on_task_complete(slot_state, sink.thread_idx, sink.local_bufs);
 #else
-    sink.sched->on_mixed_task_complete(slot_state, sink.local_bufs);
+    (void)sink.sched->on_task_complete(slot_state, sink.local_bufs);
 #endif
     if (*sink.deferred_release_count >= sink.deferred_release_capacity) {
         while (*sink.deferred_release_count > 0) {
@@ -1215,10 +1414,12 @@ inline AsyncPollResult AsyncWaitList::poll_and_complete(
         }
 
         if (entry.normal_done && entry.waiting_completion_count <= 0) {
+            // Return value (CompletionStats / consumer-walk count) discarded:
+            // deferred-completion drain has no Resolve swimlane bar attached.
 #if PTO2_SCHED_PROFILING
-            sched->on_mixed_task_complete(*entry.slot_state, thread_idx, local_bufs);
+            (void)sched->on_task_complete(*entry.slot_state, thread_idx, local_bufs);
 #else
-            sched->on_mixed_task_complete(*entry.slot_state, local_bufs);
+            (void)sched->on_task_complete(*entry.slot_state, local_bufs);
 #endif
             // Drain deferred_release in place when the buffer fills — same
             // overflow-drain idiom used by complete_slot_task's inline path
@@ -1253,7 +1454,7 @@ inline AsyncPollResult AsyncWaitList::poll_and_complete(
 
 #if PTO2_SCHED_PROFILING
 struct PTO2SchedProfilingData {
-    // Sub-phase cycle breakdown within on_mixed_task_complete
+    // Sub-phase cycle breakdown within on_task_complete
     uint64_t lock_cycle;           // lock_fanout + state store + unlock
     uint64_t fanout_cycle;         // fanout traversal
     uint64_t fanin_cycle;          // fanin traversal

@@ -11,10 +11,10 @@
 /**
  * Nanobind Python extension for task_interface headers.
  *
- * Wraps DataType, ContinuousTensor, ChipStorageTaskArgs, TaskArgs (unified
+ * Wraps DataType, Tensor, ChipStorageTaskArgs, TaskArgs (unified
  * vector-backed builder with per-tensor TensorArgType tags), TensorArgType,
  * ArgDirection, CoreCallable, ChipCallable, and helper functions from
- * data_type.h / tensor_arg.h / task_args.h / arg_direction.h / callable.h.
+ * data_type.h / tensor.h / task_args.h / arg_direction.h / callable.h.
  */
 
 #include <nanobind/nanobind.h>
@@ -36,7 +36,7 @@
 #include "data_type.h"
 #include "worker_bind.h"
 #include "task_args.h"
-#include "tensor_arg.h"
+#include "tensor.h"
 
 namespace nb = nanobind;
 
@@ -45,7 +45,7 @@ namespace nb = nanobind;
 // ============================================================================
 
 NB_MODULE(_task_interface, m) {
-    m.doc() = "Nanobind bindings for task_interface (DataType, ContinuousTensor, TaskArgs variants)";
+    m.doc() = "Nanobind bindings for task_interface (DataType, Tensor, TaskArgs variants)";
 
     // --- DataType enum ---
     nb::enum_<DataType>(m, "DataType")
@@ -76,107 +76,143 @@ NB_MODULE(_task_interface, m) {
     );
 
     // --- Constants ---
-    m.attr("CONTINUOUS_TENSOR_MAX_DIMS") = CONTINUOUS_TENSOR_MAX_DIMS;
+    m.attr("MAX_TENSOR_DIMS") = MAX_TENSOR_DIMS;
     m.attr("MAX_REGISTERED_CALLABLE_IDS") = MAX_REGISTERED_CALLABLE_IDS;
 
-    // --- ContinuousTensor ---
-    nb::class_<ContinuousTensor>(m, "ContinuousTensor")
+    // --- Tensor ---
+    // The unified strided tensor descriptor. Constructed contiguous via make()
+    // (row-major strides, start_offset == 0); see src/common/task_interface/tensor.h.
+    nb::class_<Tensor>(m, "Tensor")
         .def(nb::init<>())
 
         .def_static(
             "make",
-            [](uint64_t data, nb::tuple shapes, DataType dtype, bool child_memory) -> ContinuousTensor {
+            [](uint64_t data, nb::tuple shapes, DataType dtype, bool child_memory) -> Tensor {
                 size_t n = nb::len(shapes);
-                if (n > CONTINUOUS_TENSOR_MAX_DIMS)
-                    throw std::invalid_argument("shapes length exceeds CONTINUOUS_TENSOR_MAX_DIMS");
-                ContinuousTensor arg{};
-                arg.data = data;
-                arg.dtype = dtype;
-                arg.ndims = static_cast<uint32_t>(n);
-                arg.child_memory = child_memory ? 1 : 0;
+                if (n == 0 || n > MAX_TENSOR_DIMS)
+                    throw std::invalid_argument("Tensor.make: shapes length must be in [1, MAX_TENSOR_DIMS]");
+                uint32_t shp[MAX_TENSOR_DIMS];
                 for (size_t i = 0; i < n; ++i)
-                    arg.shapes[i] = nb::cast<uint32_t>(shapes[i]);
-                return arg;
+                    shp[i] = nb::cast<uint32_t>(shapes[i]);
+                // make_tensor_external yields a contiguous Tensor: row-major strides,
+                // start_offset == 0, buffer.size == numel * element_size.
+                return make_tensor_external(
+                    reinterpret_cast<void *>(static_cast<uintptr_t>(data)), shp, static_cast<uint32_t>(n), dtype,
+                    /*manual_dep=*/false, /*version=*/0, child_memory ? 1 : 0
+                );
             },
             nb::arg("data"), nb::arg("shapes"), nb::arg("dtype"), nb::arg("child_memory") = false,
-            "Create a ContinuousTensor. Set child_memory=True when data is a device pointer "
-            "allocated by the child process (skips H2D copy in init_runtime_impl)."
+            "Create a contiguous Tensor over pre-allocated memory. Set child_memory=True when "
+            "data is a device pointer allocated by the child process (skips H2D copy in "
+            "init_runtime_impl)."
         )
 
+        // `data` is the tensor's memory address — i.e. Tensor::buffer.addr.
         .def_prop_rw(
             "data",
-            [](const ContinuousTensor &self) -> uint64_t {
-                return self.data;
+            [](const Tensor &self) -> uint64_t {
+                return self.buffer.addr;
             },
-            [](ContinuousTensor &self, uint64_t v) {
-                self.data = v;
+            [](Tensor &self, uint64_t v) {
+                self.buffer.addr = v;
             }
         )
 
         .def_prop_rw(
             "shapes",
-            [](const ContinuousTensor &self) -> nb::tuple {
+            [](const Tensor &self) -> nb::tuple {
                 uint32_t n = self.ndims;
-                if (n > CONTINUOUS_TENSOR_MAX_DIMS) n = CONTINUOUS_TENSOR_MAX_DIMS;
+                if (n > MAX_TENSOR_DIMS) n = MAX_TENSOR_DIMS;
                 nb::list lst;
                 for (uint32_t i = 0; i < n; ++i)
                     lst.append(self.shapes[i]);
                 return nb::tuple(lst);
             },
-            [](ContinuousTensor &self, nb::tuple t) {
+            [](Tensor &self, nb::tuple t) {
                 size_t n = nb::len(t);
-                if (n > CONTINUOUS_TENSOR_MAX_DIMS)
+                if (n == 0 || n > MAX_TENSOR_DIMS)
                     throw std::invalid_argument(
-                        "shapes tuple length exceeds CONTINUOUS_TENSOR_MAX_DIMS (" +
-                        std::to_string(CONTINUOUS_TENSOR_MAX_DIMS) + ")"
+                        "shapes tuple length must be in [1, MAX_TENSOR_DIMS] (" + std::to_string(MAX_TENSOR_DIMS) + ")"
                     );
+                uint32_t shp[MAX_TENSOR_DIMS];
                 for (size_t i = 0; i < n; ++i)
-                    self.shapes[i] = nb::cast<uint32_t>(t[i]);
-                self.ndims = static_cast<uint32_t>(n);
+                    shp[i] = nb::cast<uint32_t>(t[i]);
+                uint64_t numel = 1;
+                for (size_t i = 0; i < n; ++i)
+                    numel *= shp[i];
+                // Re-establish a contiguous layout over the same buffer base.
+                self.init_external(
+                    reinterpret_cast<void *>(self.buffer.addr), numel * get_element_size(self.dtype), shp,
+                    static_cast<uint32_t>(n), self.dtype, self.version, self.manual_dep, self.child_memory
+                );
             }
         )
 
-        .def_prop_rw(
+        // Read-only: a raw `ndims` write would desync shapes/strides/buffer.size
+        // and could index past the fixed MAX_TENSOR_DIMS arrays. Rank changes go
+        // through the `shapes` setter, which rebuilds a valid contiguous layout.
+        .def_prop_ro(
             "ndims",
-            [](const ContinuousTensor &self) -> uint32_t {
+            [](const Tensor &self) -> uint32_t {
                 return self.ndims;
-            },
-            [](ContinuousTensor &self, uint32_t v) {
-                self.ndims = v;
             }
         )
 
         .def_prop_rw(
             "dtype",
-            [](const ContinuousTensor &self) -> DataType {
+            [](const Tensor &self) -> DataType {
                 return self.dtype;
             },
-            [](ContinuousTensor &self, DataType dt) {
+            [](Tensor &self, DataType dt) {
                 self.dtype = dt;
+                self.buffer.size = self.numel() * get_element_size(dt);
             }
         )
 
         .def_prop_rw(
             "child_memory",
-            [](const ContinuousTensor &self) -> bool {
+            [](const Tensor &self) -> bool {
                 return self.is_child_memory();
             },
-            [](ContinuousTensor &self, bool v) {
+            [](Tensor &self, bool v) {
                 self.child_memory = v ? 1 : 0;
+            }
+        )
+
+        // Read-only views of the strided metadata (always contiguous for make()).
+        .def_prop_ro(
+            "strides",
+            [](const Tensor &self) -> nb::tuple {
+                nb::list lst;
+                for (uint32_t i = 0; i < self.ndims && i < MAX_TENSOR_DIMS; ++i)
+                    lst.append(self.strides[i]);
+                return nb::tuple(lst);
+            }
+        )
+        .def_prop_ro(
+            "start_offset",
+            [](const Tensor &self) -> uint64_t {
+                return self.start_offset;
+            }
+        )
+        .def_prop_ro(
+            "is_contiguous",
+            [](const Tensor &self) -> bool {
+                return self.is_contiguous;
             }
         )
 
         .def(
             "nbytes",
-            [](const ContinuousTensor &self) -> uint64_t {
+            [](const Tensor &self) -> uint64_t {
                 return self.nbytes();
             },
             "Compute total bytes (product of shapes * element_size)."
         )
 
-        .def("__repr__", [](const ContinuousTensor &self) -> std::string {
+        .def("__repr__", [](const Tensor &self) -> std::string {
             std::ostringstream os;
-            os << "ContinuousTensor(data=0x" << std::hex << self.data << std::dec << ", shapes=(";
+            os << "Tensor(data=0x" << std::hex << self.buffer.addr << std::dec << ", shapes=(";
             for (uint32_t i = 0; i < self.ndims; ++i) {
                 if (i) os << ", ";
                 os << self.shapes[i];
@@ -193,7 +229,7 @@ NB_MODULE(_task_interface, m) {
 
         .def(
             "add_tensor", &ChipStorageTaskArgs::add_tensor, nb::arg("t"),
-            "Add a ContinuousTensor. Must be called before any add_scalar()."
+            "Add a Tensor. Must be called before any add_scalar()."
         )
 
         .def(
@@ -203,12 +239,12 @@ NB_MODULE(_task_interface, m) {
 
         .def(
             "tensor",
-            [](const ChipStorageTaskArgs &self, int32_t i) -> const ContinuousTensor & {
+            [](const ChipStorageTaskArgs &self, int32_t i) -> const Tensor & {
                 if (i < 0 || i >= self.tensor_count())
                     throw std::out_of_range("ChipStorageTaskArgs tensor index out of range");
                 return self.tensor(i);
             },
-            nb::arg("i"), nb::rv_policy::reference_internal, "Return the ContinuousTensor at index i."
+            nb::arg("i"), nb::rv_policy::reference_internal, "Return the Tensor at index i."
         )
 
         .def(
@@ -264,11 +300,11 @@ NB_MODULE(_task_interface, m) {
 
         .def(
             "add_tensor",
-            [](TaskArgs &self, const ContinuousTensor &t, TensorArgType tag) {
+            [](TaskArgs &self, const Tensor &t, TensorArgType tag) {
                 self.add_tensor(t, tag);
             },
             nb::arg("t"), nb::arg("tag") = TensorArgType::INPUT,
-            "Add a ContinuousTensor with an optional TensorArgType tag (default INPUT)."
+            "Add a Tensor with an optional TensorArgType tag (default INPUT)."
         )
 
         .def(
@@ -278,11 +314,11 @@ NB_MODULE(_task_interface, m) {
 
         .def(
             "tensor",
-            [](const TaskArgs &self, int32_t i) -> const ContinuousTensor & {
+            [](const TaskArgs &self, int32_t i) -> const Tensor & {
                 if (i < 0 || i >= self.tensor_count()) throw std::out_of_range("TaskArgs tensor index out of range");
                 return self.tensor(i);
             },
-            nb::arg("i"), nb::rv_policy::reference_internal, "Return the ContinuousTensor at index i."
+            nb::arg("i"), nb::rv_policy::reference_internal, "Return the Tensor at index i."
         )
 
         .def(
@@ -728,8 +764,9 @@ NB_MODULE(_task_interface, m) {
             [](const RunTiming &t) {
                 return t.device_wall_ns / 1000.0;
             },
-            "Full on-NPU kernel wall, in microseconds: simpler_aicpu_init start -> "
-            "simpler_aicpu_exec end (init + run + teardown), NOT just the orch span — "
+            "Full on-NPU kernel wall, in microseconds: earliest simpler_aicpu_exec "
+            "start -> latest simpler_aicpu_exec end across launched threads (run + "
+            "teardown), NOT just the orch span — "
             "it is larger than the device-log Orch/Sched/Total. Populated whenever the "
             "runtime was built with PTO2_PROFILING (the default); independent of "
             "enable_l2_swimlane after the orch_summary capture was decoupled from the "
@@ -906,7 +943,7 @@ NB_MODULE(_task_interface, m) {
             TaskArgsView view = read_blob(reinterpret_cast<const uint8_t *>(blob_ptr), MAILBOX_ARGS_CAPACITY);
             TaskArgs args;
             for (int32_t i = 0; i < view.tensor_count; i++) {
-                args.add_tensor(view.tensors[i]);
+                args.add_tensor(view.tensors(i));
             }
             for (int32_t i = 0; i < view.scalar_count; i++) {
                 args.add_scalar(view.scalars[i]);

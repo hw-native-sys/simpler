@@ -385,7 +385,7 @@ int32_t SchedulerContext::handle_timeout_exit(
 #if PTO2_PROFILING
         // Capture the in-flight kernels' partial output before signalling the
         // cores to exit, so the dump reflects the live stuck state.
-        if (is_dump_tensor_enabled()) {
+        if (is_dump_args_enabled()) {
             dump_running_task_outputs<PTO2_SUBTASK_SLOT_COUNT>(
                 thread_idx, cores_total_num_,
                 [this](int32_t cid) {
@@ -882,7 +882,7 @@ int32_t SchedulerContext::init(
             // When orchestrator phases merge into scheduler threads
             // (PTO2_ORCH_TO_SCHED=1), phase records flow through
             // aicpu_thread_num_ pools — matches the same branch in
-            // dump_tensor_init (scheduler_dispatch.cpp).
+            // dump_args_init (scheduler_dispatch.cpp).
             // Sched phase pool count = number of scheduler threads.
             // sched_thread_num_ <= 0 is the "use all AICPU threads as
             // scheduler threads" sentinel (see assign_cores_to_threads'

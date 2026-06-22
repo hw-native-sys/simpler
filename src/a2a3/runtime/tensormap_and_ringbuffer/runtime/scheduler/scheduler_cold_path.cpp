@@ -194,8 +194,11 @@ void format_core_status(
         );
     } else {
         snprintf(
-            buf, buf_size, "core%d(busy kernel=%d task=%" PRId64 " cond_reg_state=%s ANOMALY)", core_id, kernel,
-            task_id_raw, cond_reg_state_str
+            buf, buf_size,
+            "core%d(busy kernel=%d task=%" PRId64
+            " cond_reg_state=%s ANOMALY cond_tok=%d running_tok=%d pending_tok=%d)",
+            core_id, kernel, task_id_raw, cond_reg_state_str, EXTRACT_TASK_ID(cond_reg),
+            core_state->running_reg_task_id, core_state->pending_reg_task_id
         );
     }
 }
@@ -327,7 +330,7 @@ void SchedulerContext::log_stall_diagnostics(
         bool aiv0_idle = tracker.is_aiv0_core_idle(offset);
         bool aiv1_idle = tracker.is_aiv1_core_idle(offset);
         int32_t cluster_id = cli * ast + thread_idx;
-        char aic_buf[128], aiv0_buf[128], aiv1_buf[128];
+        char aic_buf[192], aiv0_buf[192], aiv1_buf[192];
         format_core_status(
             aic_buf, sizeof(aic_buf), aic_id, aic_idle, &core_exec_states_[aic_id], core_exec_states_[aic_id].reg_addr
         );
@@ -385,7 +388,7 @@ int32_t SchedulerContext::handle_timeout_exit(
 #if PTO2_PROFILING
         // Capture the in-flight kernels' partial output before signalling the
         // cores to exit, so the dump reflects the live stuck state.
-        if (is_dump_tensor_enabled()) {
+        if (is_dump_args_enabled()) {
             dump_running_task_outputs<PTO2_SUBTASK_SLOT_COUNT>(
                 thread_idx, cores_total_num_,
                 [this](int32_t cid) {
@@ -870,7 +873,7 @@ int32_t SchedulerContext::init(
         l2_swimlane_aicpu_init(runtime->worker_count);
         l2_swimlane_level_ = get_l2_swimlane_level();
         if (l2_swimlane_level_ >= L2SwimlaneLevel::SCHED_PHASES) {
-            // Sched-phase pool count: matches the dump_tensor_init branch in
+            // Sched-phase pool count: matches the dump_args_init branch in
             // scheduler_dispatch.cpp. sched_thread_num_ <= 0 means "use all
             // AICPU threads as scheduler threads" (see assign_cores_to_threads'
             // active_sched_threads_ normalization at line 689). Without this

@@ -98,7 +98,7 @@ int DeviceRunner::ensure_binaries_loaded() {
         if (!load_sym("aicpu_execute", reinterpret_cast<void **>(&aicpu_execute_func_))) return -1;
         if (!load_sym("set_platform_regs", reinterpret_cast<void **>(&set_platform_regs_func_))) return -1;
         if (!load_sym("set_platform_dump_base", reinterpret_cast<void **>(&set_platform_dump_base_func_))) return -1;
-        if (!load_sym("set_dump_tensor_enabled", reinterpret_cast<void **>(&set_dump_tensor_enabled_func_))) return -1;
+        if (!load_sym("set_dump_args_enabled", reinterpret_cast<void **>(&set_dump_args_enabled_func_))) return -1;
         if (!load_sym("set_platform_l2_swimlane_base", reinterpret_cast<void **>(&set_platform_l2_swimlane_base_func_)))
             return -1;
         if (!load_sym("set_l2_swimlane_enabled", reinterpret_cast<void **>(&set_l2_swimlane_enabled_func_))) return -1;
@@ -347,7 +347,7 @@ int DeviceRunner::run(Runtime &runtime, int block_dim, int launch_aicpu_num) {
     );
 
     if (aicpu_execute_func_ == nullptr || aicore_execute_func_ == nullptr || set_platform_regs_func_ == nullptr ||
-        set_platform_dump_base_func_ == nullptr || set_dump_tensor_enabled_func_ == nullptr ||
+        set_platform_dump_base_func_ == nullptr || set_dump_args_enabled_func_ == nullptr ||
         set_platform_pmu_base_func_ == nullptr || set_pmu_enabled_func_ == nullptr ||
         set_platform_dep_gen_base_func_ == nullptr || set_dep_gen_enabled_func_ == nullptr ||
         set_scope_stats_enabled_func_ == nullptr || set_platform_scope_stats_base_func_ == nullptr) {
@@ -357,7 +357,7 @@ int DeviceRunner::run(Runtime &runtime, int block_dim, int launch_aicpu_num) {
 
     set_platform_regs_func_(kernel_args_.regs);
     set_platform_dump_base_func_(kernel_args_.dump_data_base);
-    set_dump_tensor_enabled_func_(enable_dump_tensor_);
+    set_dump_args_enabled_func_(enable_dump_tensor_);
     set_platform_l2_swimlane_base_func_(kernel_args_.l2_swimlane_data_base);
     set_l2_swimlane_enabled_func_(enable_l2_swimlane_);
     set_platform_pmu_base_func_(kernel_args_.pmu_data_base);
@@ -510,7 +510,7 @@ void DeviceRunner::unload_executor_binaries() {
         aicpu_execute_func_ = nullptr;
         set_platform_regs_func_ = nullptr;
         set_platform_dump_base_func_ = nullptr;
-        set_dump_tensor_enabled_func_ = nullptr;
+        set_dump_args_enabled_func_ = nullptr;
         set_platform_l2_swimlane_base_func_ = nullptr;
         set_l2_swimlane_enabled_func_ = nullptr;
         set_platform_pmu_base_func_ = nullptr;

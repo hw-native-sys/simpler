@@ -156,12 +156,12 @@ def pytest_addoption(parser):
         "Onboard only — ignored on sim and L3.",
     )
     parser.addoption(
-        "--dump-tensor",
+        "--dump-args",
         nargs="?",
         const=1,
         type=int,
         default=0,
-        help="Dump per-task tensor I/O at runtime. Level: 0=off, 1=partial (only "
+        help="Dump per-task args at runtime. Level: 0=off, 1=partial (only "
         "tasks marked via Arg::dump(...), default when given without a value), 2=full (all tasks), "
         "3=full_json_only (all tasks, JSON metadata only, no .bin payload).",
     )
@@ -186,6 +186,14 @@ def pytest_addoption(parser):
         action="store_true",
         default=False,
         help="Enable per-scope peak collection and emit <output_prefix>/scope_stats.jsonl (per-scope ring-fill peaks).",
+    )
+    parser.addoption(
+        "--enable-swimlane-overhead",
+        action="store_true",
+        default=False,
+        help="Add the 8 Overhead Analysis counter tracks (per-engine "
+        "idle/ready/overhead + system all/has overhead) to the swimlane JSON. "
+        "Requires --enable-l2-swimlane + deps.json (re-run with --enable-dep-gen if absent).",
     )
     parser.addoption(
         "--pto-isa-commit",

@@ -101,6 +101,7 @@ PTO2SchedulerLayout PTO2SchedulerState::reserve_layout(DeviceArena &arena, int32
         layout.off_ready_queue_slots[i] = ready_queue_reserve_layout(arena, PTO2_READY_QUEUE_SIZE);
     }
     layout.off_dummy_ready_queue_slots = ready_queue_reserve_layout(arena, PTO2_READY_QUEUE_SIZE);
+    layout.off_early_dispatch_queue_slots = ready_queue_reserve_layout(arena, PTO2_EARLY_DISPATCH_QUEUE_SIZE);
     for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
         // Force a cache-line base so writes from scheduler thread 0 (sole
         // writer of this ring's dep_pool) do not invalidate adjacent
@@ -140,6 +141,11 @@ bool PTO2SchedulerState::init_data_from_layout(
         )) {
         return false;
     }
+    if (!ready_queue_init_data_from_layout(
+            &sched->early_dispatch_queue, arena, layout.off_early_dispatch_queue_slots, PTO2_EARLY_DISPATCH_QUEUE_SIZE
+        )) {
+        return false;
+    }
 
     auto *orch_err = pto2_sm_layout::orch_error_code_addr(sm_dev_base);
     for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
@@ -164,6 +170,7 @@ void PTO2SchedulerState::wire_arena_pointers(const PTO2SchedulerLayout &layout, 
         ready_queue_wire_arena_pointers(&sched->ready_queues[i], arena, layout.off_ready_queue_slots[i]);
     }
     ready_queue_wire_arena_pointers(&sched->dummy_ready_queue, arena, layout.off_dummy_ready_queue_slots);
+    ready_queue_wire_arena_pointers(&sched->early_dispatch_queue, arena, layout.off_early_dispatch_queue_slots);
     for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
         sched->ring_sched_states[r].dep_pool.base =
             static_cast<PTO2DepListEntry *>(arena.region_ptr(layout.off_dep_pool_entries[r]));
@@ -182,6 +189,7 @@ void PTO2SchedulerState::destroy() {
         ready_queue_destroy(&sched->ready_queues[i]);
     }
     ready_queue_destroy(&sched->dummy_ready_queue);
+    ready_queue_destroy(&sched->early_dispatch_queue);
 }
 
 // =============================================================================
@@ -200,6 +208,11 @@ PTO2OrchestratorLayout PTO2OrchestratorState::reserve_layout(
         const size_t fanin_pool_bytes =
             PTO2_ALIGN_UP(static_cast<size_t>(dep_pool_capacity) * sizeof(PTO2FaninSpillEntry), PTO2_ALIGN_SIZE);
         layout.off_fanin_pool[r] = arena.reserve(fanin_pool_bytes, PTO2_ALIGN_SIZE);
+
+        always_assert(task_window_sizes[r] > 0 && (task_window_sizes[r] & (task_window_sizes[r] - 1)) == 0);
+        const size_t seen_epoch_bytes =
+            PTO2_ALIGN_UP(static_cast<size_t>(task_window_sizes[r]) * sizeof(uint32_t), PTO2_ALIGN_SIZE);
+        layout.off_fanin_seen_epoch[r] = arena.reserve(seen_epoch_bytes, PTO2_ALIGN_SIZE);
     }
     layout.off_scope_tasks = arena.reserve(
         static_cast<size_t>(layout.scope_tasks_cap) * sizeof(PTO2TaskSlotState *), alignof(PTO2TaskSlotState *)
@@ -245,6 +258,13 @@ bool PTO2OrchestratorState::init_data_from_layout(
         auto *fanin_entries = static_cast<PTO2FaninSpillEntry *>(arena.region_ptr(layout.off_fanin_pool[r]));
         memset(fanin_entries, 0, fanin_pool_bytes);
         orch->rings[r].fanin_pool.init(fanin_entries, layout.dep_pool_capacity, orch_err);
+
+        const size_t seen_epoch_bytes = PTO2_ALIGN_UP(
+            static_cast<size_t>(layout.tensor_map.task_window_sizes[r]) * sizeof(uint32_t), PTO2_ALIGN_SIZE
+        );
+        auto *seen_epoch = static_cast<uint32_t *>(arena.region_ptr(layout.off_fanin_seen_epoch[r]));
+        memset(seen_epoch, 0, seen_epoch_bytes);
+        orch->fanin_seen_epoch[r] = seen_epoch;
     }
 
     if (!orch->tensor_map.init_data_from_layout(layout.tensor_map, arena)) {
@@ -266,6 +286,7 @@ void PTO2OrchestratorState::wire_arena_pointers(
     auto *orch = this;
     for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
         orch->rings[r].fanin_pool.base = static_cast<PTO2FaninSpillEntry *>(arena.region_ptr(layout.off_fanin_pool[r]));
+        orch->fanin_seen_epoch[r] = static_cast<uint32_t *>(arena.region_ptr(layout.off_fanin_seen_epoch[r]));
     }
     orch->tensor_map.wire_arena_pointers(layout.tensor_map, arena);
     orch->scope_tasks = static_cast<PTO2TaskSlotState **>(arena.region_ptr(layout.off_scope_tasks));
@@ -278,6 +299,7 @@ void PTO2OrchestratorState::destroy() {
     orch->tensor_map.destroy();
     for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
         orch->rings[r].fanin_pool.base = nullptr;
+        orch->fanin_seen_epoch[r] = nullptr;
     }
     orch->scope_tasks = nullptr;
     orch->scope_begins = nullptr;

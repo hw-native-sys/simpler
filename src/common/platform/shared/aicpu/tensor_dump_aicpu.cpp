@@ -11,7 +11,7 @@
 
 /**
  * @file tensor_dump_aicpu.cpp
- * @brief AICPU tensor dump collection implementation
+ * @brief AICPU args dump collection implementation
  *
  * - Per-thread DumpBufferState with SPSC free queues
  * - Per-thread ready queue for handing off full metadata buffers
@@ -35,7 +35,7 @@ static DumpMetaBuffer *s_current_dump_buf[PLATFORM_MAX_AICPU_THREADS] = {};
 
 static bool s_logged_ready_queue_full[PLATFORM_MAX_AICPU_THREADS] = {};
 static bool s_logged_no_free_meta_buffer[PLATFORM_MAX_AICPU_THREADS] = {};
-static bool s_logged_dump_layout_mismatch = false;
+static bool s_logged_dump_args_layout_mismatch = false;
 static uint32_t s_records_written[PLATFORM_MAX_AICPU_THREADS] = {};
 static uint32_t s_buffers_switched[PLATFORM_MAX_AICPU_THREADS] = {};
 static uint32_t s_buffers_flushed[PLATFORM_MAX_AICPU_THREADS] = {};
@@ -53,11 +53,11 @@ extern "C" void set_platform_dump_base(uint64_t dump_data_base) { g_platform_dum
 
 extern "C" uint64_t get_platform_dump_base() { return g_platform_dump_base; }
 
-static bool g_enable_dump_tensor = false;
-// Dump level latched from the header in dump_tensor_init(). The selective
+static bool g_enable_dump_args = false;
+// Dump level latched from the header in dump_args_init(). The selective
 // (PARTIAL) and json-only (FULL_JSON_ONLY) modes are derived from it rather
 // than tracked as separate flags — mirrors g_l2_swimlane_level.
-static DumpTensorLevel g_dump_tensor_level = DumpTensorLevel::OFF;
+static DumpTensorLevel g_dump_args_level = DumpTensorLevel::OFF;
 struct DumpTaskMaskEntry {
     uint64_t task_id;
     TensorDumpArgMask mask;
@@ -72,14 +72,14 @@ static constexpr uint64_t DUMP_TASK_MASK_EMPTY_TASK_ID = UINT64_MAX;
 static constexpr uint32_t DUMP_TASK_MASK_TABLE_CAPACITY = 32768;
 static DumpTaskMaskEntry *g_dump_mask_table = nullptr;
 static DumpTaskScalarDtypeEntry *g_dump_scalar_dtype_table = nullptr;
-static bool ensure_dump_mask_table() {
+static bool ensure_dump_args_mask_table() {
     if (g_dump_mask_table != nullptr) {
         return true;
     }
     g_dump_mask_table =
         static_cast<DumpTaskMaskEntry *>(malloc(sizeof(DumpTaskMaskEntry) * DUMP_TASK_MASK_TABLE_CAPACITY));
     if (g_dump_mask_table == nullptr) {
-        LOG_ERROR("Failed to allocate tensor dump selective mask table");
+        LOG_ERROR("Failed to allocate args dump selective mask table");
         return false;
     }
     for (uint32_t i = 0; i < DUMP_TASK_MASK_TABLE_CAPACITY; i++) {
@@ -90,7 +90,7 @@ static bool ensure_dump_mask_table() {
     return true;
 }
 
-static bool ensure_dump_scalar_dtype_table() {
+static bool ensure_dump_args_scalar_dtype_table() {
     if (g_dump_scalar_dtype_table != nullptr) {
         return true;
     }
@@ -98,7 +98,7 @@ static bool ensure_dump_scalar_dtype_table() {
         malloc(sizeof(DumpTaskScalarDtypeEntry) * DUMP_TASK_MASK_TABLE_CAPACITY)
     );
     if (g_dump_scalar_dtype_table == nullptr) {
-        LOG_ERROR("Failed to allocate tensor dump scalar dtype table");
+        LOG_ERROR("Failed to allocate args dump scalar dtype table");
         return false;
     }
     for (uint32_t i = 0; i < DUMP_TASK_MASK_TABLE_CAPACITY; i++) {
@@ -109,7 +109,7 @@ static bool ensure_dump_scalar_dtype_table() {
     return true;
 }
 
-static void clear_dump_mask_table() {
+static void clear_dump_args_tables() {
     if (g_dump_mask_table != nullptr) {
         for (uint32_t i = 0; i < DUMP_TASK_MASK_TABLE_CAPACITY; i++) {
             g_dump_mask_table[i].task_id = DUMP_TASK_MASK_EMPTY_TASK_ID;
@@ -126,7 +126,7 @@ static void clear_dump_mask_table() {
     }
 }
 
-static bool resolve_dump_task_slot(uint64_t task_id, uint32_t *idx_out) {
+static bool resolve_dump_args_task_slot(uint64_t task_id, uint32_t *idx_out) {
     uint32_t ring_id = static_cast<uint32_t>(task_id >> 32);
     if (ring_id >= TENSOR_DUMP_MASK_POOL_MAX_RINGS) {
         return false;
@@ -137,19 +137,19 @@ static bool resolve_dump_task_slot(uint64_t task_id, uint32_t *idx_out) {
 }
 
 extern "C" void
-set_dump_tensor_task_scalar_dtypes(uint64_t task_id, uint32_t scalar_count, const uint8_t *scalar_dtypes) {
+set_dump_args_task_scalar_dtypes(uint64_t task_id, uint32_t scalar_count, const uint8_t *scalar_dtypes) {
     if (scalar_count == 0 || scalar_dtypes == nullptr) {
         return;
     }
     if (scalar_count > 32) {
-        LOG_ERROR("tensor dump scalar dtype count exceeds max (%u > 32)", scalar_count);
+        LOG_ERROR("args dump scalar dtype count exceeds max (%u > 32)", scalar_count);
         return;
     }
-    if (!ensure_dump_scalar_dtype_table()) {
+    if (!ensure_dump_args_scalar_dtype_table()) {
         return;
     }
     uint32_t idx = 0;
-    if (!resolve_dump_task_slot(task_id, &idx)) {
+    if (!resolve_dump_args_task_slot(task_id, &idx)) {
         return;
     }
     for (uint32_t probe = 0; probe < DUMP_TASK_MASK_TABLE_CAPACITY; probe++) {
@@ -162,15 +162,15 @@ set_dump_tensor_task_scalar_dtypes(uint64_t task_id, uint32_t scalar_count, cons
             return;
         }
     }
-    LOG_ERROR("tensor dump scalar dtype table is full");
+    LOG_ERROR("args dump scalar dtype table is full");
 }
 
-extern "C" bool get_dump_tensor_task_scalar_dtypes(uint64_t task_id, uint32_t *scalar_count, uint8_t *scalar_dtypes) {
+extern "C" bool get_dump_args_task_scalar_dtypes(uint64_t task_id, uint32_t *scalar_count, uint8_t *scalar_dtypes) {
     if (g_dump_scalar_dtype_table == nullptr || scalar_count == nullptr || scalar_dtypes == nullptr) {
         return false;
     }
     uint32_t idx = 0;
-    if (!resolve_dump_task_slot(task_id, &idx)) {
+    if (!resolve_dump_args_task_slot(task_id, &idx)) {
         return false;
     }
     for (uint32_t probe = 0; probe < DUMP_TASK_MASK_TABLE_CAPACITY; probe++) {
@@ -188,21 +188,36 @@ extern "C" bool get_dump_tensor_task_scalar_dtypes(uint64_t task_id, uint32_t *s
     return false;
 }
 
-extern "C" void set_dump_tensor_enabled(bool enable) {
-    g_enable_dump_tensor = enable;
-    g_dump_tensor_level = DumpTensorLevel::OFF;
-    clear_dump_mask_table();
+extern "C" void set_dump_args_enabled(bool enable) {
+    g_enable_dump_args = enable;
+    g_dump_args_level = DumpTensorLevel::OFF;
+    if (enable) {
+        if (!ensure_dump_args_mask_table() || !ensure_dump_args_scalar_dtype_table()) {
+            g_enable_dump_args = false;
+            free(g_dump_mask_table);
+            g_dump_mask_table = nullptr;
+            free(g_dump_scalar_dtype_table);
+            g_dump_scalar_dtype_table = nullptr;
+            return;
+        }
+    } else {
+        free(g_dump_mask_table);
+        g_dump_mask_table = nullptr;
+        free(g_dump_scalar_dtype_table);
+        g_dump_scalar_dtype_table = nullptr;
+    }
+    clear_dump_args_tables();
 }
 
-extern "C" bool is_dump_tensor_enabled() { return g_enable_dump_tensor; }
+extern "C" bool is_dump_args_enabled() { return g_enable_dump_args; }
 
-extern "C" bool is_dump_tensor_selective_mode() { return g_dump_tensor_level == DumpTensorLevel::PARTIAL; }
+extern "C" bool is_dump_args_selective_mode() { return g_dump_args_level == DumpTensorLevel::PARTIAL; }
 
-extern "C" void set_dump_tensor_task_mask(uint64_t task_id, TensorDumpArgMask mask, TensorDumpArgMask flags) {
+extern "C" void set_dump_args_task_mask(uint64_t task_id, TensorDumpArgMask mask, TensorDumpArgMask flags) {
     if (mask == TENSOR_DUMP_ARG_MASK_NONE) {
         return;
     }
-    if (!ensure_dump_mask_table()) {
+    if (!ensure_dump_args_mask_table()) {
         return;
     }
     uint32_t ring_id = static_cast<uint32_t>(task_id >> 32);
@@ -220,10 +235,10 @@ extern "C" void set_dump_tensor_task_mask(uint64_t task_id, TensorDumpArgMask ma
             return;
         }
     }
-    LOG_ERROR("tensor dump selective mask table is full");
+    LOG_ERROR("args dump selective mask table is full");
 }
 
-extern "C" void get_dump_tensor_task_masks(uint64_t task_id, TensorDumpArgMask *mask, TensorDumpArgMask *flags) {
+extern "C" void get_dump_args_task_masks(uint64_t task_id, TensorDumpArgMask *mask, TensorDumpArgMask *flags) {
     if (mask != nullptr) {
         *mask = TENSOR_DUMP_ARG_MASK_NONE;
     }
@@ -256,7 +271,7 @@ extern "C" void get_dump_tensor_task_masks(uint64_t task_id, TensorDumpArgMask *
     }
 }
 
-bool get_tensor_dump_role_from_direction(ArgDirection dir, TensorDumpRole *role) {
+bool get_dump_arg_role_from_direction(ArgDirection dir, TensorDumpRole *role) {
     switch (dir) {
     case ArgDirection::IN:
         *role = TensorDumpRole::INPUT;
@@ -283,7 +298,7 @@ int32_t count_callable_tensor_args(const CoreCallable &callable) {
     return tensor_count;
 }
 
-bool should_dump_tensor_at_stage(TensorDumpRole role, TensorDumpStage stage) {
+bool should_dump_arg_at_stage(TensorDumpRole role, TensorDumpStage stage) {
     switch (role) {
     case TensorDumpRole::INPUT:
         return stage == TensorDumpStage::BEFORE_DISPATCH;
@@ -296,14 +311,14 @@ bool should_dump_tensor_at_stage(TensorDumpRole role, TensorDumpStage stage) {
 }
 
 bool should_dump_task(TensorDumpArgMask arg_mask) {
-    if (!is_dump_tensor_selective_mode()) {
+    if (!is_dump_args_selective_mode()) {
         return true;
     }
     return arg_mask != TENSOR_DUMP_ARG_MASK_NONE;
 }
 
 bool should_dump_arg(TensorDumpArgMask arg_mask, int32_t arg_index) {
-    if (!is_dump_tensor_selective_mode()) {
+    if (!is_dump_args_selective_mode()) {
         return true;
     }
     if (arg_index < 0 || arg_index >= static_cast<int32_t>(TENSOR_DUMP_ARG_MASK_BITS)) return false;
@@ -315,11 +330,11 @@ bool has_dump_arg_flag(TensorDumpArgMask arg_mask, int32_t arg_index) {
     return (arg_mask & (TensorDumpArgMask{1} << arg_index)) != 0;
 }
 
-bool try_log_tensor_dump_layout_mismatch() {
-    if (s_logged_dump_layout_mismatch) {
+bool try_log_dump_args_layout_mismatch() {
+    if (s_logged_dump_args_layout_mismatch) {
         return false;
     }
-    s_logged_dump_layout_mismatch = true;
+    s_logged_dump_args_layout_mismatch = true;
     return true;
 }
 
@@ -388,7 +403,7 @@ static int switch_dump_meta_buffer(int thread_idx) {
         if (!s_logged_no_free_meta_buffer[thread_idx]) {
             s_logged_no_free_meta_buffer[thread_idx] = true;
             LOG_WARN(
-                "Tensor dump ran out of free metadata buffers on thread %d after spin-wait, "
+                "Args dump ran out of free metadata buffers on thread %d after spin-wait, "
                 "overwriting current buffer. Increase PLATFORM_DUMP_BUFFERS_PER_THREAD.",
                 thread_idx
             );
@@ -417,7 +432,7 @@ static int switch_dump_meta_buffer(int thread_idx) {
         if (!s_logged_ready_queue_full[thread_idx]) {
             s_logged_ready_queue_full[thread_idx] = true;
             LOG_WARN(
-                "Tensor dump ready queue full on thread %d after spin-wait, "
+                "Args dump ready queue full on thread %d after spin-wait, "
                 "overwriting current buffer. Increase PLATFORM_DUMP_READYQUEUE_SIZE.",
                 thread_idx
             );
@@ -464,7 +479,7 @@ struct CircularArenaWriter {
     }
 };
 
-static inline uint64_t get_tensor_dump_num_elements(const TensorDumpInfo &info) {
+static inline uint64_t get_dump_arg_num_elements(const TensorDumpInfo &info) {
     uint64_t elements = 1;
     for (uint32_t d = 0; d < info.ndims && d < PLATFORM_DUMP_MAX_DIMS; d++) {
         elements *= info.shapes[d];
@@ -473,7 +488,7 @@ static inline uint64_t get_tensor_dump_num_elements(const TensorDumpInfo &info) 
 }
 
 // PyTorch-style contiguous: strides[d] == prod(shapes[d+1..]) for all d.
-static inline bool tensor_dump_is_contiguous(const TensorDumpInfo &info) {
+static inline bool dump_arg_is_contiguous(const TensorDumpInfo &info) {
     if (info.ndims == 0) return true;
     uint64_t expected = 1;
     for (int32_t d = static_cast<int32_t>(info.ndims) - 1; d >= 0 && d < PLATFORM_DUMP_MAX_DIMS; --d) {
@@ -483,7 +498,7 @@ static inline bool tensor_dump_is_contiguous(const TensorDumpInfo &info) {
     return true;
 }
 
-static inline void write_tensor_dump_contiguous_prefix(
+static inline void write_dump_arg_contiguous_prefix(
     CircularArenaWriter *writer, const TensorDumpInfo &info, uint64_t elem_sz, uint64_t copy_bytes
 ) {
     const char *src = reinterpret_cast<const char *>(info.buffer_addr) + info.start_offset * elem_sz;
@@ -493,7 +508,7 @@ static inline void write_tensor_dump_contiguous_prefix(
 // Recursive per-dim gather: at dim d we step shapes[d] times with element step
 // strides[d]. Inner-most dim writes `shapes[d]` contiguous elements (only valid
 // when strides[innermost] == 1 — non-unit innermost stride degrades to per-element).
-static void gather_tensor_dump_dim(
+static void gather_dump_arg_dim(
     CircularArenaWriter *writer, const TensorDumpInfo &info, uint64_t elem_sz, uint32_t dim,
     uint64_t base_element_index, uint64_t *remaining_bytes
 ) {
@@ -525,29 +540,33 @@ static void gather_tensor_dump_dim(
     const int32_t s = info.strides[dim];
     for (uint32_t i = 0; i < info.shapes[dim] && *remaining_bytes > 0; i++) {
         uint64_t next_base = base_element_index + static_cast<uint64_t>(i) * static_cast<uint64_t>(s);
-        gather_tensor_dump_dim(writer, info, elem_sz, dim + 1, next_base, remaining_bytes);
+        gather_dump_arg_dim(writer, info, elem_sz, dim + 1, next_base, remaining_bytes);
     }
 }
 
-static inline void write_tensor_dump_logical_prefix(
+static inline void write_dump_arg_logical_prefix(
     CircularArenaWriter *writer, const TensorDumpInfo &info, uint64_t elem_sz, uint64_t copy_bytes
 ) {
     if (copy_bytes == 0) {
         return;
     }
-    if (tensor_dump_is_contiguous(info)) {
-        write_tensor_dump_contiguous_prefix(writer, info, elem_sz, copy_bytes);
+    if (dump_arg_is_contiguous(info)) {
+        write_dump_arg_contiguous_prefix(writer, info, elem_sz, copy_bytes);
         return;
     }
     // Walk the view origin first; per-dim recursion adds (i * strides[d]) for each axis.
     uint64_t remaining_bytes = copy_bytes;
-    gather_tensor_dump_dim(writer, info, elem_sz, 0, info.start_offset, &remaining_bytes);
+    gather_dump_arg_dim(writer, info, elem_sz, 0, info.start_offset, &remaining_bytes);
 }
 
-void dump_tensor_init(int num_dump_threads) {
+void dump_args_init(int num_dump_threads) {
     void *dump_base = reinterpret_cast<void *>(get_platform_dump_base());
     if (dump_base == nullptr) {
-        LOG_ERROR("platform dump base is NULL, cannot initialize tensor dump");
+        LOG_ERROR("platform dump base is NULL, cannot initialize args dump");
+        return;
+    }
+    if (num_dump_threads <= 0 || num_dump_threads > PLATFORM_MAX_AICPU_THREADS) {
+        LOG_ERROR("invalid args dump thread count %d (expected 1..%d)", num_dump_threads, PLATFORM_MAX_AICPU_THREADS);
         return;
     }
 
@@ -556,9 +575,9 @@ void dump_tensor_init(int num_dump_threads) {
     // Latch dump level from the host-written header before any task is dumped.
     // PARTIAL → selective (only Arg::dump()-marked args); FULL → every task;
     // FULL_JSON_ONLY → every task, metadata only (no payload copied into arena).
-    g_dump_tensor_level = static_cast<DumpTensorLevel>(s_dump_header->dump_tensor_level);
+    g_dump_args_level = static_cast<DumpTensorLevel>(s_dump_header->dump_tensor_level);
 
-    LOG_INFO_V0("Initializing tensor dump for %d threads", num_dump_threads);
+    LOG_INFO_V0("Initializing args dump for %d threads", num_dump_threads);
 
     // Pop initial metadata buffer from free_queue for each thread
     for (int t = 0; t < num_dump_threads; t++) {
@@ -595,7 +614,7 @@ void dump_tensor_init(int num_dump_threads) {
     memset(s_buffers_flushed, 0, sizeof(s_buffers_flushed));
 }
 
-int dump_tensor_record(int thread_idx, const TensorDumpInfo &info) {
+int dump_arg_record(int thread_idx, const TensorDumpInfo &info) {
     if (s_dump_header == nullptr) {
         return -1;
     }
@@ -623,15 +642,15 @@ int dump_tensor_record(int thread_idx, const TensorDumpInfo &info) {
     // Reserve space in arena
     // Compute actual tensor data size from shape (not buffer.size which may include padding)
     TensorDumpKind kind = static_cast<TensorDumpKind>(info.kind);
-    uint64_t actual_elements = get_tensor_dump_num_elements(info);
+    uint64_t actual_elements = get_dump_arg_num_elements(info);
     uint64_t elem_sz = get_element_size(static_cast<DataType>(info.dtype));
     uint64_t bytes = actual_elements * elem_sz;
     uint64_t copy_bytes = bytes;
     bool truncated = false;
-    bool is_contiguous = tensor_dump_is_contiguous(info);
+    bool is_contiguous = dump_arg_is_contiguous(info);
     bool is_scalar = kind == TensorDumpKind::SCALAR;
 
-    if (is_scalar || g_dump_tensor_level == DumpTensorLevel::FULL_JSON_ONLY) {
+    if (is_scalar || g_dump_args_level == DumpTensorLevel::FULL_JSON_ONLY) {
         // JSON-only level captures full metadata but no payload, so the
         // record carries shape/dtype/strides with payload_size == 0.
         copy_bytes = 0;
@@ -649,7 +668,7 @@ int dump_tensor_record(int thread_idx, const TensorDumpInfo &info) {
     uint64_t arena_sz = state->arena_size;
     CircularArenaWriter writer = {arena, arena_sz, offset, 0};
     if (!is_scalar && copy_bytes > 0) {
-        write_tensor_dump_logical_prefix(&writer, info, elem_sz, copy_bytes);
+        write_dump_arg_logical_prefix(&writer, info, elem_sz, copy_bytes);
     }
     wmb();
 
@@ -682,7 +701,7 @@ int dump_tensor_record(int thread_idx, const TensorDumpInfo &info) {
     return 0;
 }
 
-void dump_tensor_flush(int thread_idx) {
+void dump_args_flush(int thread_idx) {
     if (s_dump_header == nullptr) {
         return;
     }
@@ -704,9 +723,9 @@ void dump_tensor_flush(int thread_idx) {
             // buffer so host reconcile sees a clean state (current_buf_ptr=0)
             // and dropped == flush failures rather than silent wip-mismatch.
             // Bounded to one per thread per run (unlike the hot-path
-            // dump_tensor_record site), so no spam guard is needed here.
+            // dump_arg_record site), so no spam guard is needed here.
             LOG_ERROR(
-                "Thread %d: failed to flush tensor-dump buffer (ready_queue full), %u records lost!", thread_idx,
+                "Thread %d: failed to flush args-dump buffer (ready_queue full), %u records lost!", thread_idx,
                 buf->count
             );
             account_dropped_records(state, buf->count);
@@ -720,7 +739,7 @@ void dump_tensor_flush(int thread_idx) {
     s_buffers_flushed[thread_idx]++;
     uint32_t dropped = s_dump_states[thread_idx] ? s_dump_states[thread_idx]->dropped_record_count : 0;
     LOG_INFO_V0(
-        "Thread %d: dump_tensor_flush (records=%u, buf_switches=%u, flushes=%u, dropped=%u)", thread_idx,
+        "Thread %d: dump_args_flush (records=%u, buf_switches=%u, flushes=%u, dropped=%u)", thread_idx,
         s_records_written[thread_idx], s_buffers_switched[thread_idx], s_buffers_flushed[thread_idx], dropped
     );
 }

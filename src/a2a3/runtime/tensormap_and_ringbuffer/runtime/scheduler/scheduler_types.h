@@ -161,6 +161,7 @@ public:
 
         bool has_value() const { return states_ > 0; }
         int32_t count() const { return __builtin_popcountll(states_); }
+        void clear_bit(int32_t offset) { states_ &= ~(1ULL << offset); }
 
         // Extract the lowest set bit from mask, clear it, and return its position.
         // Returns -1 if mask is empty.
@@ -230,6 +231,7 @@ public:
     }
 
     BitStates get_all_running_cores() const { return (~core_states_) & (aic_mask_ | aiv_mask_); }
+    BitStates get_cluster_offset_states() const { return aic_mask_; }
 
     // --- Cluster matching ---
 
@@ -302,19 +304,67 @@ public:
 
     // Pending dispatch: returns bit offsets of cores eligible for pending-slot dispatch.
     // AIC: 1 bit per cluster (aic_mask_ positions). AIV: 1 bit per AIV core (aiv_mask_ positions).
-    // MIX: 1 bit per cluster where ALL 3 cores have free pending slots AND at least one is running.
-    //       Idle cores participate via to_pending=false in the MIX prepare path.
+    // Runtime MIX dispatch uses classify_mix_cluster() so the decision follows the task's active_mask.
+    enum class MixPlacement : uint8_t { RUNNING, PENDING, REJECT };
+
+    // A MIX block must place all cores named by active_mask the same way:
+    // all idle means running placement, all running means pending placement,
+    // and any mixed state is retried later.
+    MixPlacement classify_mix_cluster(int32_t cluster_offset, uint8_t core_mask) const {
+        BitStates used(0ULL);
+        if (core_mask & PTO2_SUBTASK_MASK_AIC) {
+            used |= BitStates(1ULL << cluster_offset);
+        }
+        if (core_mask & PTO2_SUBTASK_MASK_AIV0) {
+            used |= BitStates(1ULL << (cluster_offset + 1));
+        }
+        if (core_mask & PTO2_SUBTASK_MASK_AIV1) {
+            used |= BitStates(1ULL << (cluster_offset + 2));
+        }
+        if (!used.has_value() || (pending_occupied_ & used).has_value()) {
+            return MixPlacement::REJECT;
+        }
+
+        BitStates idle = core_states_ & used;
+        if (idle.count() == used.count()) {
+            return MixPlacement::RUNNING;
+        }
+        if (!idle.has_value()) {
+            return MixPlacement::PENDING;
+        }
+        return MixPlacement::REJECT;
+    }
+
+    BitStates get_mix_running_cluster_offset_states(uint8_t core_mask) const {
+        BitStates result(0ULL);
+        BitStates candidates = get_cluster_offset_states();
+        while (candidates.has_value()) {
+            int32_t cluster_offset = candidates.pop_first();
+            if (classify_mix_cluster(cluster_offset, core_mask) == MixPlacement::RUNNING) {
+                result |= BitStates(1ULL << cluster_offset);
+            }
+        }
+        return result;
+    }
+
+    int32_t count_mix_running_clusters(uint8_t core_mask) const {
+        return get_mix_running_cluster_offset_states(core_mask).count();
+    }
+
     BitStates get_pending_core_offset_states(PTO2ResourceShape shape) const {
         if (shape == PTO2ResourceShape::MIX) {
+            // Shape-level query kept conservative for legacy callers/tests.
+            // The real MIX dispatch path applies active_mask in classify_mix_cluster().
             // Any core without a pending payload can accept a dispatch (idle or running).
             BitStates available = ~pending_occupied_;
             BitStates mix_available =
                 (available & aic_mask_) & ((available >> 1) & aic_mask_) & ((available >> 2) & aic_mask_);
-            // Exclude fully-idle clusters (handled by IDLE phase) to prevent double-dispatch.
+            // Pending MIX can only reuse a fully-running cluster. Partially-running clusters
+            // could split one MIX block across immediate and pending placement.
             BitStates running = ~core_states_;
-            BitStates cluster_has_running =
-                (running & aic_mask_) | ((running >> 1) & aic_mask_) | ((running >> 2) & aic_mask_);
-            return mix_available & cluster_has_running;
+            BitStates cluster_all_running =
+                (running & aic_mask_) & ((running >> 1) & aic_mask_) & ((running >> 2) & aic_mask_);
+            return mix_available & cluster_all_running;
         }
         if (shape == PTO2ResourceShape::AIC) {
             return (~core_states_) & aic_mask_ & ~(pending_occupied_ & aic_mask_);
@@ -375,6 +425,12 @@ struct alignas(64) SchedL2SwimlaneCounters {
     uint64_t sched_idle_cycle{0};
     uint64_t sched_loop_count{0};
     uint32_t phase_complete_count{0};
+    // Sub-block retires that did NOT finish a slot (SPMD blocks of a multi-block
+    // task retiring one at a time). Counted separately so the Complete-phase
+    // emit can fire on poll iterations that only retired sub-blocks — otherwise
+    // the serial-harvest tail of an SPMD slot is invisible (no slot completes
+    // until the last block, leaving the scheduler lane blank for that window).
+    uint32_t phase_subretire_count{0};
     uint32_t phase_dispatch_count{0};
     // Per-emit delta is (current - *_at_last_emit). Accumulated only when
     // l2_swimlane_level_ >= SCHED_PHASES.

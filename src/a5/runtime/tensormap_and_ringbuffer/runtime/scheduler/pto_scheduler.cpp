@@ -22,7 +22,9 @@
 #include "common/unified_log.h"
 
 #if PTO2_PROFILING
+// Weak fallbacks for host/UT builds that don't link the scope_stats collector.
 extern "C" __attribute__((weak, visibility("hidden"))) bool is_scope_stats_enabled() { return false; }
+extern "C" __attribute__((weak, visibility("hidden"))) void scope_stats_note_heap_wrap(int) {}
 #endif
 
 // =============================================================================

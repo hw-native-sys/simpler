@@ -42,7 +42,7 @@
  *   finalize()           — Free all device memory, unregister.
  *
  * Output (scope_stats/scope_stats.jsonl), NDJSON:
- *   line 1: {"version":5,"fatal":bool,"dropped":uint,"total":uint,
+ *   line 1: {"version":6,"fatal":bool,"dropped":uint,"total":uint,
  *            "task_window_max":[...],"heap_max":[...],
  *            "dep_pool_max":[...],"tensormap_max":uint}
  *   line k: {"site":"file:line","phase":"begin|end","depth":int,

@@ -81,7 +81,11 @@ struct alignas(64) PTO2DispatchPayload {
      *  args[SPMD_GLOBAL_CONTEXT_INDEX] points here. */
     GlobalContext global_context;
 
-    uint8_t reserved_payload_abi_pad[8];
+    /** Speculative early-dispatch gate. 0 = ready: AICore executes on pickup.
+     *  1 = not-ready: AICore waits until AICPU rings the doorbell
+     *  (DATA_MAIN_BASE high 32 == this dispatch's reg_task_id) before executing. */
+    volatile uint32_t not_ready;
+    uint8_t reserved_payload_abi_pad[4];
 
     static_assert(sizeof(args[0]) == 8);
     static_assert(

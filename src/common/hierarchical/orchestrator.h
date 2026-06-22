@@ -40,7 +40,7 @@
 #include "../task_interface/call_config.h"
 #include "../task_interface/data_type.h"
 #include "../task_interface/task_args.h"
-#include "../task_interface/tensor_arg.h"
+#include "../task_interface/tensor.h"
 #include "ring.h"
 #include "scope.h"
 #include "tensormap.h"
@@ -77,13 +77,13 @@ public:
     );
 
     // Allocate an intermediate buffer from the Worker's HeapRing (MAP_SHARED,
-    // visible to forked child workers). Returns a ContinuousTensor whose
-    // `.data` points into the ring.
+    // visible to forked child workers). Returns a contiguous Tensor whose
+    // `.buffer.addr` points into the ring.
     //
     // Lifetime: aligned with a synthetic task slot. The buffer is reclaimed
     // (FIFO, via last_alive) once every downstream consumer tagging the
     // pointer has reached CONSUMED and scope_end has released the scope ref.
-    ContinuousTensor alloc(const std::vector<uint32_t> &shape, DataType dtype);
+    Tensor alloc(const std::vector<uint32_t> &shape, DataType dtype);
 
     // Memory management on a specific next-level worker. Thread-safe:
     // can be called from the orch thread while the target worker is
@@ -198,7 +198,7 @@ private:
     );
 
     // Size, in aligned bytes, an OUTPUT tensor should occupy in the HeapRing.
-    static uint64_t output_alloc_bytes(const ContinuousTensor &t);
+    static uint64_t output_alloc_bytes(const Tensor &t);
 
     // Rewrite any OUTPUT tensors with a null data pointer to point into a
     // freshly-allocated HeapRing slab. Returns the total aligned byte span

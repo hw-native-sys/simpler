@@ -54,6 +54,21 @@ A chip may comprise one or more dies, and may present to the host as
 one or more device IDs (the die ↔ device-id mapping is chip-specific —
 see `src/{a2a3,a5}/docs/`).
 
+**GM is "shared" only within one `device_id`** — shared across that device's
+AICPU and AICore tiers. It is **exclusive per `device_id`**, never shared across
+device IDs. The die↔device mapping differs by arch but does not change this:
+
+- **a5**: one `device_id` owns the chip's dies/clusters, managed as one unit by
+  the AICPU; one orch runs per `device_id` (an invariant). There is no
+  "two-die concurrency" inside a device.
+- **a2a3**: a card presents two `device_id`s; they are independent.
+
+So multiple device IDs (e.g. pytest xdist `gw0`/`gw1`, or `--device 2-3`) run on
+**independent HBM with no cross-device contention**. A per-device OOM comes from
+that device's own workload, not from an "adjacent die". (The chip-shared
+contention model was removed in PR #990 — see
+`.claude/rules/running-onboard.md`.)
+
 ## Identifying which chip generation you have
 
 CANN ships per-SoC platform configs under
@@ -264,6 +279,8 @@ see `src/{a2a3,a5}/docs/`.
 | You want to know… | Read |
 | ----------------- | ---- |
 | When to insert `dcci` / `cache_invalidate_range` / `rmb()` | [cache-coherency.md](cache-coherency.md) |
+| AIC_CTRL MMIO attribute / cost / how to pick a notification path | [mmio-performance.md](mmio-performance.md) |
+| Where the public CANN driver / HCCL / HCOMM source lives | [cann-source-references.md](cann-source-references.md) |
 | Software three-program model layered on this hardware | [../chip-level-arch.md](../chip-level-arch.md) |
 | End-to-end task data flow | [../task-flow.md](../task-flow.md) |
 | Chip-specific counts, bus version, die / device-id mapping | [`src/a2a3/docs/hardware.md`](../../src/a2a3/docs/hardware.md), [`src/a5/docs/hardware.md`](../../src/a5/docs/hardware.md) |

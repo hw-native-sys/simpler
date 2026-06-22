@@ -158,16 +158,25 @@ static_assert(sizeof(L2SwimlaneAicpuTaskRecord) == 32, "L2SwimlaneAicpuTaskRecor
  *   reg_task_id, giving a clean 1:1 join even when multiple dispatches
  *   of the same task land on the same core.
  *
- * Layout: 24B identity/timing + 4B reg_task_id + 4B pad → 32B (half a
- * cache line). Two records pack into one cache line so AICore's per-task
- * store is at most a single line commit + dcci.
+ * Layout: 24B identity/timing + 4B reg_task_id + 4B receive_to_start delta →
+ * 32B (half a cache line). Two records pack into one cache line so AICore's
+ * per-task store is at most a single line commit + dcci.
+ *
+ * receive_to_start_cycles isolates the AICore-side dcci+ack cost from the
+ * AICPU→AICore NoC propagation. AICore captures receive_time right after
+ * `read_reg(DATA_MAIN_BASE)` returns the new task_id (before dcci+ack), and
+ * start_time after them. Host derives:
+ *   - receive_time  = start_time - receive_to_start_cycles
+ *   - propagation   = receive_time - dispatch_ts (AICPU view)
+ *   - local_setup   = receive_to_start_cycles    (dcci + ack)
+ * Delta fits in 32 bits at any platform clock (1 GHz @ 32-bit ≈ 4.3 s).
  */
 struct L2SwimlaneAicoreTaskRecord {
-    uint64_t start_time;      // Task start timestamp (get_sys_cnt)
-    uint64_t end_time;        // Task end timestamp
-    uint64_t task_token_raw;  // PTO2TaskId::raw — identity (NOT join key)
-    uint32_t reg_task_id;     // Per-core dispatch token — host join key vs AICPU stream
-    uint32_t _pad;
+    uint64_t start_time;               // Post-dcci+ack timestamp (kernel begins next)
+    uint64_t end_time;                 // Post-kernel timestamp
+    uint64_t task_token_raw;           // PTO2TaskId::raw — identity (NOT join key)
+    uint32_t reg_task_id;              // Per-core dispatch token — host join key vs AICPU stream
+    uint32_t receive_to_start_cycles;  // start_time - receive_time (AICore-local dcci + ack cost)
 } __attribute__((aligned(32)));
 
 static_assert(sizeof(L2SwimlaneAicoreTaskRecord) == 32, "L2SwimlaneAicoreTaskRecord must be 32B");

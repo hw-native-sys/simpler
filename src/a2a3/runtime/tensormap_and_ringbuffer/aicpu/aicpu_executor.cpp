@@ -439,10 +439,10 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
             int32_t arg_count = args.tensor_count() + args.scalar_count();
             LOG_INFO_V0("Thread %d: sm_ptr=%p, arg_count=%d", thread_idx, runtime->get_gm_sm_ptr(), arg_count);
             for (int32_t i = 0; i < args.tensor_count() && i < 20; i++) {
-                const ContinuousTensor &t = args.tensor(i);
+                const Tensor &t = args.tensor(i);
                 LOG_INFO_V0(
                     "Thread %d: orch_args[%d] = TENSOR(data=0x%lx, ndims=%u, dtype=%u)", thread_idx, i,
-                    static_cast<uint64_t>(t.data), t.ndims, static_cast<unsigned>(t.dtype)
+                    static_cast<uint64_t>(t.buffer.addr), t.ndims, static_cast<unsigned>(t.dtype)
                 );
             }
             for (int32_t i = 0; i < args.scalar_count() && (args.tensor_count() + i) < 20; i++) {

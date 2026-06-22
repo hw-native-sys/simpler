@@ -24,6 +24,8 @@
 #include <stdexcept>
 #include <string>
 
+#include "aicpu/platform_regs.h"  // get_reg_ptr / RegId (arch header picked up via rt_objs include path)
+
 // =============================================================================
 // unified_log.h stubs (5 log-level functions)
 // =============================================================================
@@ -74,6 +76,20 @@ void unified_log_info_v(const char *func, int v, const char *fmt, ...) {
 uint64_t get_sys_cnt_aicpu() {
     auto now = std::chrono::steady_clock::now();
     return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(now.time_since_epoch()).count());
+}
+
+// =============================================================================
+// platform_regs.h stub (get_reg_ptr)
+// =============================================================================
+
+// PTO2SchedulerState::ring_one_doorbell (pto_scheduler.h, speculative
+// early-dispatch) is an inline that resolves a register id to its MMIO pointer
+// via get_reg_ptr and writes a 64-bit token through it. There is no MMIO on the
+// host UT runner; hand back writable static storage (8 bytes — the doorbell is a
+// 64-bit store) so the inline links and any write is harmless.
+volatile uint32_t *get_reg_ptr(uint64_t /* reg_base_addr */, RegId /* reg */) {
+    static volatile uint64_t dummy_reg = 0;
+    return reinterpret_cast<volatile uint32_t *>(&dummy_reg);
 }
 
 // =============================================================================

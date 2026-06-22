@@ -47,32 +47,6 @@ L2SwimlaneCollector::~L2SwimlaneCollector() {
     }
 }
 
-void *L2SwimlaneCollector::alloc_single_buffer(size_t size, void **host_ptr_out) {
-    void *dev_ptr = alloc_cb_(size);
-    if (dev_ptr == nullptr) {
-        LOG_ERROR("Failed to allocate buffer (%zu bytes)", size);
-        *host_ptr_out = nullptr;
-        return nullptr;
-    }
-
-    if (register_cb_ != nullptr) {
-        void *host_ptr = nullptr;
-        int rc = register_cb_(dev_ptr, size, device_id_, &host_ptr);
-        if (rc != 0 || host_ptr == nullptr) {
-            LOG_ERROR("Buffer registration failed: %d", rc);
-            *host_ptr_out = nullptr;
-            return nullptr;
-        }
-        *host_ptr_out = host_ptr;
-    } else {
-        *host_ptr_out = dev_ptr;
-    }
-
-    // Register mapping so the BufferPoolManager can resolve dev→host
-    manager_.register_mapping(dev_ptr, *host_ptr_out);
-    return dev_ptr;
-}
-
 int L2SwimlaneCollector::initialize(
     int num_aicore, int aicpu_thread_num, int device_id, L2SwimlaneLevel l2_swimlane_level,
     const L2SwimlaneAllocCallback &alloc_cb, L2SwimlaneRegisterCallback register_cb,
@@ -80,6 +54,13 @@ int L2SwimlaneCollector::initialize(
 ) {
     if (shm_host_ != nullptr) {
         LOG_ERROR("L2SwimlaneCollector already initialized");
+        return -1;
+    }
+
+    // register_cb may legitimately be null (a5 has no halHostRegister); alloc
+    // and free callbacks are mandatory. Matches dep_gen / pmu / scope_stats.
+    if (alloc_cb == nullptr || free_cb == nullptr) {
+        LOG_ERROR("L2SwimlaneCollector::initialize: alloc_cb/free_cb must be non-null");
         return -1;
     }
 
@@ -98,14 +79,22 @@ int L2SwimlaneCollector::initialize(
     total_sched_phase_collected_ = 0;
     total_orch_phase_collected_ = 0;
 
-    // Stash the memory context on the base up-front so alloc_single_buffer
+    // Stash the memory context on the base up-front so alloc_paired_buffer
     // sees consistent values during init. shm_host_ stays nullptr until the
     // shm allocation succeeds — the nullptr guard makes a post-failure
     // start(tf) a no-op.
     set_memory_context(
-        alloc_cb, register_cb, free_cb, /*copy_to=*/nullptr, /*copy_from=*/nullptr, /*shm_dev=*/nullptr,
-        /*shm_host=*/nullptr, /*shm_size=*/0, device_id
+        alloc_cb, register_cb, free_cb, profiling_copy_to_device_for_ops, profiling_copy_from_device_for_ops,
+        /*shm_dev=*/nullptr, /*shm_host=*/nullptr, /*shm_size=*/0, device_id
     );
+
+    // RAII rollback: shm_host_ is only set at the end of init, so finalize()
+    // (which early-returns on shm_host_ == nullptr) cannot clean up a partial
+    // allocation. Any early return after this point therefore releases every
+    // manager-tracked device buffer + a5 host shadow allocated so far via the
+    // guard's destructor; guard.commit() disarms it on the success path.
+    // Matches dep_gen / pmu.
+    profiling_common::InitRollbackGuard<decltype(manager_)> guard(manager_, free_cb);
 
     // Step 1: Calculate shared memory size (slot arrays only, no actual
     // buffers). Host over-allocates phase pool slots to the platform max for
@@ -122,31 +111,33 @@ int L2SwimlaneCollector::initialize(
     LOG_DEBUG("  L2SwimlaneAicpuOrchPhasePool size:  %zu bytes each", sizeof(L2SwimlaneAicpuOrchPhasePool));
     LOG_DEBUG("  Total shared memory:  %zu bytes (%zu KB)", total_size, total_size / 1024);
 
-    // Step 2: Allocate shared memory for slot arrays
-    void *perf_dev_ptr = alloc_cb(total_size);
+    // Step 2: Allocate the shared-memory region (header + SPSC slot arrays)
+    // via the base allocator. On a5 there is no halHostRegister and the
+    // device HBM region is not host-addressable, so alloc_paired_buffer
+    // mallocs a host shadow and seeds the device copy (the shadow path is
+    // selected by the copy_to_device callback installed in set_memory_context
+    // above). The host initializes the region through perf_host_ptr below,
+    // and a single profiling_copy_to_device at the end of init pushes the
+    // primed state to the device. Writing perf_host_ptr directly to the raw
+    // device pointer here would SIGSEGV — see set_memory_context above.
+    void *perf_host_ptr = nullptr;
+    void *perf_dev_ptr = alloc_paired_buffer(total_size, &perf_host_ptr);
     if (perf_dev_ptr == nullptr) {
         LOG_ERROR("Failed to allocate shared memory (%zu bytes)", total_size);
         return -1;
     }
-    LOG_DEBUG("Allocated shared memory: %p", perf_dev_ptr);
+    LOG_DEBUG("Allocated shared memory: dev=%p host=%p", perf_dev_ptr, perf_host_ptr);
 
-    // Step 3: Register to host mapping (optional)
-    void *perf_host_ptr = nullptr;
-    if (register_cb != nullptr) {
-        int rc = register_cb(perf_dev_ptr, total_size, device_id, &perf_host_ptr);
-        if (rc != 0) {
-            LOG_ERROR("Memory registration failed: %d", rc);
-            return rc;
-        }
-        if (perf_host_ptr == nullptr) {
-            LOG_ERROR("register_cb succeeded but returned null host_ptr");
-            return -1;
-        }
-        LOG_DEBUG("Mapped to host memory: %p", perf_host_ptr);
-    } else {
-        perf_host_ptr = perf_dev_ptr;
-        LOG_DEBUG("Simulation mode: host_ptr = dev_ptr = %p", perf_host_ptr);
-    }
+    // Zero the whole host shadow before initializing individual fields. Don't
+    // assume the allocator hands back zeroed memory: the malloc'd-shadow path
+    // of alloc_paired_buffer does memset, but the halHostRegister and
+    // identity-map paths do not, and neither guarantees the inter-field
+    // padding/gaps are clean. A single up-front memset makes the whole region
+    // (header, pool states, and all padding) well-defined regardless of which
+    // path ran; the explicit field inits below then set the meaningful values,
+    // and the end-of-init profiling_copy_to_device pushes the clean region to
+    // the device.
+    memset(perf_host_ptr, 0, total_size);
 
     // Step 4: Initialize header
     L2SwimlaneDataHeader *header = get_l2_swimlane_header(perf_host_ptr);
@@ -191,7 +182,7 @@ int L2SwimlaneCollector::initialize(
 
         for (int s = 0; s < PLATFORM_PROF_BUFFERS_PER_CORE; s++) {
             void *host_buf_ptr = nullptr;
-            void *dev_buf_ptr = alloc_single_buffer(sizeof(L2SwimlaneAicpuTaskBuffer), &host_buf_ptr);
+            void *dev_buf_ptr = alloc_paired_buffer(sizeof(L2SwimlaneAicpuTaskBuffer), &host_buf_ptr);
             if (dev_buf_ptr == nullptr) {
                 LOG_ERROR("Failed to allocate L2SwimlaneAicpuTaskBuffer for core %d, buffer %d", i, s);
                 return -1;
@@ -219,7 +210,7 @@ int L2SwimlaneCollector::initialize(
 
         for (int s = 0; s < PLATFORM_AICORE_BUFFERS_PER_CORE; s++) {
             void *host_buf_ptr = nullptr;
-            void *dev_buf_ptr = alloc_single_buffer(sizeof(L2SwimlaneAicoreTaskBuffer), &host_buf_ptr);
+            void *dev_buf_ptr = alloc_paired_buffer(sizeof(L2SwimlaneAicoreTaskBuffer), &host_buf_ptr);
             if (dev_buf_ptr == nullptr) {
                 LOG_ERROR("Failed to allocate L2SwimlaneAicoreTaskBuffer for core %d, buffer %d", i, s);
                 return -1;
@@ -255,7 +246,7 @@ int L2SwimlaneCollector::initialize(
     {
         size_t table_bytes = static_cast<size_t>(num_aicore) * sizeof(uint64_t);
         void *rotation_table_host = nullptr;
-        void *rotation_table_dev = alloc_single_buffer(table_bytes, &rotation_table_host);
+        void *rotation_table_dev = alloc_paired_buffer(table_bytes, &rotation_table_host);
         if (rotation_table_dev == nullptr) {
             LOG_ERROR("Failed to allocate l2_swimlane_aicore_rotation_table (rotation) table (%zu bytes)", table_bytes);
             return -1;
@@ -286,7 +277,7 @@ int L2SwimlaneCollector::initialize(
             if (t >= buffer_count) continue;  // zeroed state only; no buffers (unused slot)
             for (int s = 0; s < PLATFORM_PROF_BUFFERS_PER_THREAD; s++) {
                 void *host_buf_ptr = nullptr;
-                void *dev_buf_ptr = alloc_single_buffer(buffer_bytes, &host_buf_ptr);
+                void *dev_buf_ptr = alloc_paired_buffer(buffer_bytes, &host_buf_ptr);
                 if (dev_buf_ptr == nullptr) {
                     LOG_ERROR("Failed to allocate %s phase buffer for thread %d, slot %d", kind_label, t, s);
                     return -1;
@@ -343,6 +334,14 @@ int L2SwimlaneCollector::initialize(
 
     wmb();
 
+    // Push the host-initialized region (header + every pool's primed
+    // free_queue tail/buffer_ptrs[0]) down to the device. perf_host_ptr is a
+    // malloc'd shadow distinct from the device HBM region, so without this the
+    // device never sees the primed free queues and AICPU/AICore read zeros.
+    // The mgmt-loop mirror is read-only (device→host) and never re-pushes this
+    // initial state — it must land here, before start(tf) launches mgmt.
+    profiling_copy_to_device(perf_dev_ptr, perf_host_ptr, total_size);
+
     // Step 7: Stash device pointer for the caller to publish via
     // kernel_args.l2_swimlane_data_base (read back via get_l2_swimlane_setup_device_ptr()).
     LOG_DEBUG("L2 swimlane device base = 0x%lx", reinterpret_cast<uint64_t>(perf_dev_ptr));
@@ -351,8 +350,8 @@ int L2SwimlaneCollector::initialize(
     // Refresh memory context with the now-known SHM tuple. start(tf) (inherited)
     // gates on shm_host_, so this is the moment the collector becomes startable.
     set_memory_context(
-        alloc_cb, register_cb, free_cb, /*copy_to=*/nullptr, /*copy_from=*/nullptr, perf_dev_ptr, perf_host_ptr,
-        total_size, device_id
+        alloc_cb, register_cb, free_cb, profiling_copy_to_device_for_ops, profiling_copy_from_device_for_ops,
+        perf_dev_ptr, perf_host_ptr, total_size, device_id
     );
 
     collected_perf_records_.assign(num_aicore_, {});
@@ -361,6 +360,7 @@ int L2SwimlaneCollector::initialize(
     collected_orch_phase_records_.assign(PLATFORM_MAX_AICPU_THREADS, {});
 
     LOG_INFO_V0("Performance profiling initialized (dynamic buffer mode)");
+    guard.commit();
     return 0;
 }
 
@@ -503,6 +503,14 @@ void L2SwimlaneCollector::reconcile_counters() {
         return;
     }
 
+    // Refresh the pool states (current_buf_ptr + total/dropped counters) from
+    // device before the sanity loop so leftovers reflect post-stop() device
+    // state. Per-buffer contents are pulled individually inside reconcile_one —
+    // an un-flushed active buffer was never enqueued, so the mgmt loop's
+    // process_entry never copied its contents into the shadow.
+    if (manager_.shared_mem_dev() != nullptr && shm_size_ > 0) {
+        profiling_copy_from_device(shm_host_, manager_.shared_mem_dev(), shm_size_);
+    }
     rmb();
 
     // Two-bucket invariant (post-AICore-as-producer): every commit attempt
@@ -519,7 +527,7 @@ void L2SwimlaneCollector::reconcile_counters() {
     // for — i.e. a device-side flush bug. Empty buffers (count=0, never
     // written) are fine; AICPU's flush legitimately skips them.
     auto reconcile_one = [&](const char *kind, const char *unit_name, int unit_count, auto get_state,
-                             auto read_buf_count, uint64_t collected, bool optional) {
+                             auto read_buf_count, size_t buf_size, uint64_t collected, bool optional) {
         int leftover_active = 0;
         for (int i = 0; i < unit_count; i++) {
             L2SwimlaneAicpuTaskPool *state = get_state(i);
@@ -527,6 +535,10 @@ void L2SwimlaneCollector::reconcile_counters() {
             if (buf_ptr == 0) continue;
             void *host_ptr = manager_.resolve_host_ptr(reinterpret_cast<void *>(buf_ptr));
             if (host_ptr == nullptr) continue;
+            // This buffer was never enqueued (it's the still-active head), so
+            // process_entry never pulled its contents into the shadow. Refresh
+            // it from device before reading count.
+            profiling_copy_from_device(host_ptr, reinterpret_cast<void *>(buf_ptr), buf_size);
             uint32_t count = read_buf_count(host_ptr);
             if (count == 0) continue;
             LOG_ERROR(
@@ -590,7 +602,7 @@ void L2SwimlaneCollector::reconcile_counters() {
         [](void *host_ptr) {
             return reinterpret_cast<L2SwimlaneAicpuTaskBuffer *>(host_ptr)->count;
         },
-        total_perf_collected_, /*optional=*/false
+        sizeof(L2SwimlaneAicpuTaskBuffer), total_perf_collected_, /*optional=*/false
     );
 
     reconcile_one(
@@ -601,7 +613,7 @@ void L2SwimlaneCollector::reconcile_counters() {
         [](void *host_ptr) {
             return reinterpret_cast<L2SwimlaneAicpuSchedPhaseBuffer *>(host_ptr)->count;
         },
-        total_sched_phase_collected_, /*optional=*/true
+        sizeof(L2SwimlaneAicpuSchedPhaseBuffer), total_sched_phase_collected_, /*optional=*/true
     );
 
     reconcile_one(
@@ -612,7 +624,7 @@ void L2SwimlaneCollector::reconcile_counters() {
         [](void *host_ptr) {
             return reinterpret_cast<L2SwimlaneAicpuOrchPhaseBuffer *>(host_ptr)->count;
         },
-        total_orch_phase_collected_, /*optional=*/true
+        sizeof(L2SwimlaneAicpuOrchPhaseBuffer), total_orch_phase_collected_, /*optional=*/true
     );
 }
 
@@ -621,6 +633,12 @@ void L2SwimlaneCollector::read_phase_header_metadata() {
         return;
     }
 
+    // First post-stop() reader of the device-written header (phase thread
+    // counts + core_to_thread). Pull the shm region into the shadow so these
+    // reads don't depend on the timing of mgmt's final mirror.
+    if (manager_.shared_mem_dev() != nullptr && shm_size_ > 0) {
+        profiling_copy_from_device(shm_host_, manager_.shared_mem_dev(), shm_size_);
+    }
     rmb();
 
     L2SwimlaneDataHeader *header = get_l2_swimlane_header(shm_host_);
@@ -764,7 +782,7 @@ int L2SwimlaneCollector::export_swimlane_json() {
     // file size). Column order is documented in the schema comment at the top
     // of swimlane_converter.py's v2 reader.
     //
-    //   aicore_tasks: [core_id, task_token_raw, reg_task_id, start_cycles, end_cycles]
+    //   aicore_tasks: [core_id, task_token_raw, reg_task_id, start_cycles, end_cycles, receive_to_start_cycles]
     //   aicpu_tasks:  [core_id, reg_task_id, dispatch_cycles, finish_cycles]
     {
         // copy_aicore_buffer already drops r.start_time == 0 slots when
@@ -776,7 +794,7 @@ int L2SwimlaneCollector::export_swimlane_json() {
             for (const auto &r : collected_aicore_records_[core_idx]) {
                 if (!first) outfile << ",";
                 outfile << "\n    [" << core_idx << ", " << r.task_token_raw << ", " << r.reg_task_id << ", "
-                        << r.start_time << ", " << r.end_time << "]";
+                        << r.start_time << ", " << r.end_time << ", " << r.receive_to_start_cycles << "]";
                 first = false;
                 total++;
             }
@@ -904,13 +922,15 @@ int L2SwimlaneCollector::finalize(L2SwimlaneUnregisterCallback unregister_cb, co
 
     LOG_DEBUG("Cleaning up performance profiling resources");
 
-    // Every release site below goes through release_one_buffer so the
-    // unregister and free are an inseparable pair — each dev_ptr that
-    // alloc_single_buffer installed via halHostRegister is unregistered
-    // before its device memory is freed. Without this the Ascend HAL's
-    // per-device registration table accumulates leaked entries across
-    // init_l2_swimlane() invocations and back-to-back l2_swimlane tests on
-    // a reused Worker fail at rc=8 from halHostRegister.
+    // Every release site below goes through release_one_buffer so an
+    // optional halHostRegister unregister and the free stay an inseparable
+    // pair — each dev_ptr a register_cb mapped is unregistered before its
+    // device memory is freed. On a5 register_cb is null (no halHostRegister)
+    // so the unregister branch is a no-op and only the device free runs; the
+    // paired host shadows are reclaimed separately by clear_mappings() below.
+    // The pairing matters on a2a3, where leaking HAL registrations across
+    // init_l2_swimlane() invocations makes back-to-back tests on a reused
+    // Worker fail at rc=8 from halHostRegister.
 
     // Free standalone l2_swimlane_aicore_rotation_table table
     release_one_buffer(aicore_ring_addr_table_dev_, unregister_cb, free_cb);
@@ -986,6 +1006,14 @@ int L2SwimlaneCollector::finalize(L2SwimlaneUnregisterCallback unregister_cb, co
     LOG_DEBUG("Main shm released");
 
     perf_shared_mem_dev_ = nullptr;
+    // Free any malloc'd host shadows still tracked in the manager's
+    // malloc_shadows_ — the shm region, rotation table, and per-pool buffers
+    // were freed above via release_one_buffer (device pointer only), so their
+    // paired shadows (allocated by alloc_paired_buffer on a5's no-SVM path)
+    // never went through release_owned_buffers. clear_mappings() std::free's
+    // them. No-op on SVM (host_ptr == dev_ptr, nothing in malloc_shadows_).
+    // Matches PMU / DepGen finalize.
+    manager_.clear_mappings();
     // shm_host_ aliases freed device/host memory now; null it so is_initialized()
     // reports false, the dtor's "destroyed without finalize()" warning stays
     // quiet, and a re-entrant finalize() / re-init hits the early-out instead of

@@ -14,6 +14,7 @@
 #include <cstdint>
 #include <cstring>
 #include <stdexcept>
+#include <unordered_set>
 
 #include "worker_manager.h"
 
@@ -64,11 +65,17 @@ TaskSlotState &Orchestrator::slot_state(TaskSlot s) {
 // alloc(shape, dtype) — user-facing intermediate buffer from the HeapRing
 // ---------------------------------------------------------------------------
 
-uint64_t Orchestrator::output_alloc_bytes(const ContinuousTensor &t) { return align_up(t.nbytes(), HEAP_ALIGN); }
+uint64_t Orchestrator::output_alloc_bytes(const Tensor &t) { return align_up(t.nbytes(), HEAP_ALIGN); }
 
-ContinuousTensor Orchestrator::alloc(const std::vector<uint32_t> &shape, DataType dtype) {
-    if (shape.size() > CONTINUOUS_TENSOR_MAX_DIMS) {
-        throw std::invalid_argument("Orchestrator::alloc: shape exceeds CONTINUOUS_TENSOR_MAX_DIMS");
+Tensor Orchestrator::alloc(const std::vector<uint32_t> &shape, DataType dtype) {
+    if (shape.empty()) {
+        // Rank-0 tensors are not supported across the ABI (Tensor enforces
+        // ndims > 0). Reject here so we never allocate + register a buffer in
+        // the tensormap only to hand back an unusable addr==0 sentinel.
+        throw std::invalid_argument("Orchestrator::alloc: shape must have at least one dimension");
+    }
+    if (shape.size() > MAX_TENSOR_DIMS) {
+        throw std::invalid_argument("Orchestrator::alloc: shape exceeds MAX_TENSOR_DIMS");
     }
 
     uint64_t numel = 1;
@@ -123,12 +130,16 @@ ContinuousTensor Orchestrator::alloc(const std::vector<uint32_t> &shape, DataTyp
 
     active_tasks_.fetch_add(1, std::memory_order_relaxed);
 
-    ContinuousTensor t{};
-    t.data = ptr;
-    t.dtype = dtype;
-    t.ndims = static_cast<uint32_t>(shape.size());
-    for (size_t i = 0; i < shape.size(); ++i)
-        t.shapes[i] = shape[i];
+    // Build a contiguous external Tensor over the allocated buffer. ptr may be
+    // 0 for a 0-byte request (a shape with a zero dim), in which case
+    // init_external sets buffer.addr == 0 — the "no tensor" sentinel honored by
+    // infer_deps; buffer.size carries numel*elem. shape is non-empty (rejected
+    // at entry), so ndims >= 1 holds for init_external's assertion.
+    Tensor t{};
+    t.init_external(
+        reinterpret_cast<void *>(ptr), bytes, shape.data(), static_cast<uint32_t>(shape.size()), dtype,
+        /*version=*/0
+    );
     return t;
 }
 
@@ -419,15 +430,15 @@ void Orchestrator::validate_remote_sidecars(
             }
         }
         for (int32_t i = 0; i < args.tensor_count(); ++i) {
-            const ContinuousTensor &tensor = args.tensor(i);
+            const Tensor &tensor = args.tensor(i);
             const RemoteTensorSidecar &tensor_sidecar = sidecar.tensors[static_cast<size_t>(i)];
-            if (tensor_sidecar.present && tensor.data != 0) {
+            if (tensor_sidecar.present && tensor.buffer.addr != 0) {
                 throw std::invalid_argument("Orchestrator: remote tensor metadata data field must be zero");
             }
-            if (!tensor_sidecar.present && tensor.data != 0) {
+            if (!tensor_sidecar.present && tensor.buffer.addr != 0) {
                 throw std::invalid_argument("Orchestrator: remote tensor uses a bare host pointer without sidecar");
             }
-            if (args.tag(i) == TensorArgType::OUTPUT && tensor.data == 0 && !tensor_sidecar.present) {
+            if (args.tag(i) == TensorArgType::OUTPUT && tensor.buffer.addr == 0 && !tensor_sidecar.present) {
                 throw std::invalid_argument("Orchestrator: remote OUTPUT tensor requires a RemoteTensorRef sidecar");
             }
             if (!tensor_sidecar.present && tensor.nbytes() != 0) {
@@ -478,7 +489,7 @@ AllocResult Orchestrator::reserve_outputs_and_slot(
         const TaskArgs &a = args_list[g];
         for (int32_t i = 0; i < a.tensor_count(); ++i) {
             if (a.tag(i) != TensorArgType::OUTPUT) continue;
-            if (a.tensor(i).data != 0) continue;  // user supplied a pointer — leave alone
+            if (a.tensor(i).buffer.addr != 0) continue;  // user supplied a pointer — leave alone
             bool remote_output = !remote_sidecars.empty() &&
                                  static_cast<size_t>(i) < remote_sidecars[g].tensors.size() &&
                                  remote_sidecars[g].tensors[static_cast<size_t>(i)].present;
@@ -497,14 +508,14 @@ AllocResult Orchestrator::reserve_outputs_and_slot(
         TaskArgs &a = args_list[g];
         for (int32_t i = 0; i < a.tensor_count(); ++i) {
             if (a.tag(i) != TensorArgType::OUTPUT) continue;
-            ContinuousTensor &t = a.tensor(i);
-            if (t.data != 0) continue;
+            Tensor &t = a.tensor(i);
+            if (t.buffer.addr != 0) continue;
             bool remote_output = !remote_sidecars.empty() &&
                                  static_cast<size_t>(i) < remote_sidecars[g].tensors.size() &&
                                  remote_sidecars[g].tensors[static_cast<size_t>(i)].present;
             if (remote_output) continue;
             uint64_t slab = output_alloc_bytes(t);
-            t.data = reinterpret_cast<uint64_t>(base + off);
+            t.buffer.addr = reinterpret_cast<uint64_t>(base + off);
             off += slab;
         }
     }
@@ -520,16 +531,22 @@ void Orchestrator::infer_deps(
     const std::vector<RemoteTaskArgsSidecar> &remote_sidecars, std::vector<TaskSlot> &producers,
     std::vector<TensorKey> &output_keys
 ) {
+    std::unordered_set<TaskSlot> producer_seen;
+    size_t tensor_count_hint = 0;
+    for (const TaskArgs &args : args_list) {
+        tensor_count_hint += static_cast<size_t>(args.tensor_count());
+    }
+    producer_seen.reserve(tensor_count_hint);
+
     auto add_unique_producer = [&](TaskSlot p) {
         // Group submits walk many TaskArgs under one slot: if two entries in
         // the same group tag the same buffer (e.g. both OUTPUT 0xCAFE), the
         // second-pass lookup would return the slot that the first pass just
         // inserted — a self-loop. Skip it.
         if (p == slot) return;
-        for (TaskSlot existing : producers) {
-            if (existing == p) return;
+        if (producer_seen.insert(p).second) {
+            producers.push_back(p);
         }
-        producers.push_back(p);
     };
 
     // Tag-driven dependency inference — mirrors L2
@@ -547,7 +564,7 @@ void Orchestrator::infer_deps(
         int32_t worker_id = (g < affinities.size()) ? affinities[g] : -1;
         const TaskArgs &a = args_list[g];
         for (int32_t i = 0; i < a.tensor_count(); ++i) {
-            const ContinuousTensor &t = a.tensor(i);
+            const Tensor &t = a.tensor(i);
             TensorKey key{};
             bool has_key = false;
             if (!remote_sidecars.empty()) {
@@ -565,8 +582,9 @@ void Orchestrator::infer_deps(
                 }
             }
             if (!has_key) {
-                if (t.data == 0) continue;  // null tensor — nothing to track
-                key = t.is_child_memory() ? TensorKey::local_child(t.data, worker_id) : TensorKey::local_host(t.data);
+                if (t.buffer.addr == 0) continue;  // null tensor — nothing to track
+                key = t.is_child_memory() ? TensorKey::local_child(t.buffer.addr, worker_id) :
+                                            TensorKey::local_host(t.buffer.addr);
                 has_key = true;
             }
             TensorArgType tag = a.tag(i);

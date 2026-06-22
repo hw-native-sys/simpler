@@ -34,12 +34,15 @@ available.
   [`dep_gen`](dep_gen.md) at post-process time; see
   [§3.5](#35-dependency-arrows-from-dep_gen).
 - **AICPU scheduler phases** — per-iteration breakdown into
-  `complete` / `dispatch`. Idle iterations no longer emit a record
-  on a2a3; the host tooling reconstructs idle spans from the gap
-  between consecutive work records on the same thread. Legacy
-  captures (and a5) may still carry `scan` / `idle` records — both
-  are silently dropped by the parser (idle is double-painted
-  by the gap reconstruction; `scan` was never emitted in a2a3).
+  `complete` / `dispatch` / `release` / `resolve` (Complete sub-bar
+  for the consumer-release walk) / `early_dispatch` (speculative
+  pre-staging). Idle iterations no longer emit a record on a2a3;
+  the host tooling reconstructs idle spans from the gap between
+  consecutive work records on the same thread. Legacy captures may
+  carry `scan` / `poll` / `idle` / `fanout` / `prestage` — current
+  a2a3 builds no longer emit them (PR #1079's Scan/Poll debug
+  overlay was removed; Fanout was renamed Resolve and now also
+  filters out <1 µs walks; Prestage was renamed EarlyDispatch).
 - **Orchestrator submit envelope** — one record per `submit_task()`
   / `alloc_tensors()` call covering the whole submit's
   `[start, end]` window (`orch_submit` phase). Per-sub-step
@@ -139,7 +142,7 @@ layers to be aware of:**
   in `core_type` / `core_to_thread`, converts cycles to microseconds
   using `metadata.clock_freq_hz`, and returns the joined dict that every
   downstream consumer (Perfetto converter, `sched_overhead_analysis`,
-  `deps_to_graph`, in-test validator) reads. Always go through
+  `deps_viewer`, in-test validator) reads. Always go through
   `read_perf_data`; never load `l2_swimlane_records.json` with raw
   `json.load` from new code.
 
@@ -208,7 +211,7 @@ Phase records (per scheduler thread, level >= 3 for
 | Field | Meaning |
 | ----- | ------- |
 | `start_time_us` / `end_time_us` | Phase start / end timestamps in microseconds (reader-side cycle→µs conversion) |
-| `phase` | Lowercase phase name. Scheduler: `complete` / `dispatch` (`scan` / `idle` may appear in legacy captures and a5; both are dropped by the parser). Orchestrator: `orch_submit` — one record per `submit_task()` / `alloc_tensors()` call spanning its full `[start, end]` window. Legacy per-sub-step strings (`orch_sync` / `orch_alloc` / `orch_params` / `orch_lookup` / `orch_insert` / `orch_fanin`) may appear in old captures. |
+| `phase` | Lowercase phase name. Scheduler: `complete` / `dispatch` / `release` / `resolve` / `early_dispatch`. Legacy (still parsed for old captures): `scan` / `poll` / `fanout` / `prestage` / `idle` — current a2a3 builds no longer emit Scan/Poll (PR #1079 debug overlay removed) or Prestage (renamed to EarlyDispatch); Fanout was renamed to Resolve. Orchestrator: `orch_submit` — one record per `submit_task()` / `alloc_tensors()` call spanning its full `[start, end]` window. Legacy per-sub-step strings (`orch_sync` / `orch_alloc` / `orch_params` / `orch_lookup` / `orch_insert` / `orch_fanin`) may appear in old captures. |
 | `loop_iter` (scheduler) / `submit_idx` (orchestrator) | Iteration / submit-call counter for the producing thread |
 | `tasks_processed` (scheduler) / `task_id` (orchestrator) | Phase-specific union field |
 | `pop_hit` / `pop_miss` (dispatch only) | Ready-queue pop deltas since the previous dispatch emit |
@@ -557,7 +560,7 @@ bounded only by how fast the host drains — not by the per-core buffer
 sum.
 
 **Measured impact.** Hardware bench on a2a3 paged_attention_unroll
-Case1 with swimlane=4: rotation design delivers sched −4 µs / orch −19 µs
+Case1 with swimlane=4: rotation design delivers sched -4 µs / orch -19 µs
 vs the upstream/main baseline, comparable to the no-rotation predecessor
 (which had this PR's earlier commit; the rotation adds about 3 µs
 sched overhead per session as price for unbounded session length).

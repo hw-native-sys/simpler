@@ -75,7 +75,11 @@ enum class MailboxState : int32_t {
 // (CHIP_MAX_TENSOR_ARGS tensors + CHIP_MAX_SCALAR_ARGS scalars; see the
 // static_assert after MAILBOX_ARGS_CAPACITY). 4096 was too tight for composed
 // child kernels with many tensor args (issue #1024).
-static constexpr size_t MAILBOX_SIZE = 16384;
+// Bumped 16384 -> 32768 when TaskArgs moved from the former 40 B compact tensor
+// to the unified 128 B Tensor: the worst-case blob (CHIP_MAX_TENSOR_ARGS tensors)
+// grew ~3x, and 128*128 B = 16 KB alone exceeded the old mailbox (see the
+// capacity static_assert after MAILBOX_ARGS_CAPACITY).
+static constexpr size_t MAILBOX_SIZE = 32768;
 
 // Error message region lives at the mailbox tail. 256 B of headroom is
 // enough for `<ExceptionType>: <short message>` produced by the child-side
@@ -86,9 +90,9 @@ static constexpr size_t MAILBOX_ERROR_MSG_SIZE = 256;
 // Both ends transfer it with one memcpy — no per-field offsets to keep in sync.
 //
 // MAILBOX_OFF_ARGS is derived: round up CallConfig's end to 8 bytes so the
-// args blob's first ContinuousTensor.data (uint64_t at OFF_ARGS+8) is 8-byte
-// aligned, avoiding SIGBUS on strict-alignment platforms (aarch64 atomics,
-// some ARM cores). The control region (CTRL_OFF_ARG0..CTRL_OFF_RESULT) lives
+// args blob's first Tensor field (buffer.addr, a uint64_t at OFF_ARGS+8) is
+// 8-byte aligned, avoiding SIGBUS on strict-alignment platforms (aarch64
+// atomics, some ARM cores). The control region (CTRL_OFF_ARG0..CTRL_OFF_RESULT) lives
 // inside the CallConfig byte range — that's safe because control commands
 // and task dispatch are mutually exclusive in time.
 static constexpr ptrdiff_t MAILBOX_OFF_STATE = 0;
@@ -97,7 +101,7 @@ static constexpr ptrdiff_t MAILBOX_OFF_CALLABLE = 8;  // also: control sub-comma
 static constexpr ptrdiff_t MAILBOX_OFF_CONFIG = 16;
 static constexpr ptrdiff_t MAILBOX_OFF_ARGS =
     (MAILBOX_OFF_CONFIG + static_cast<ptrdiff_t>(sizeof(CallConfig)) + 7) & ~ptrdiff_t{7};
-static_assert(MAILBOX_OFF_ARGS % 8 == 0, "MAILBOX_OFF_ARGS must be 8-aligned for ContinuousTensor.data");
+static_assert(MAILBOX_OFF_ARGS % 8 == 0, "MAILBOX_OFF_ARGS must be 8-aligned for Tensor.buffer.addr");
 static_assert(
     MAILBOX_OFF_CONFIG + static_cast<ptrdiff_t>(sizeof(CallConfig)) <= MAILBOX_OFF_ARGS,
     "CallConfig overflows reserved config region"
@@ -113,8 +117,7 @@ static constexpr ptrdiff_t MAILBOX_OFF_CONTROL_CALLABLE_HASH =
 static constexpr size_t MAILBOX_ARGS_CAPACITY =
     MAILBOX_SIZE - static_cast<size_t>(MAILBOX_OFF_TASK_ARGS_BLOB) - MAILBOX_ERROR_MSG_SIZE;
 static_assert(
-    MAILBOX_ARGS_CAPACITY >= TASK_ARGS_BLOB_HEADER_SIZE +
-                                 static_cast<size_t>(CHIP_MAX_TENSOR_ARGS) * sizeof(ContinuousTensor) +
+    MAILBOX_ARGS_CAPACITY >= TASK_ARGS_BLOB_HEADER_SIZE + static_cast<size_t>(CHIP_MAX_TENSOR_ARGS) * sizeof(Tensor) +
                                  static_cast<size_t>(CHIP_MAX_SCALAR_ARGS) * sizeof(uint64_t),
     "mailbox args region must hold the largest TaskArgs blob the runtime accepts (issue #1024)"
 );
