@@ -159,10 +159,17 @@ def _send_ready(fd: int, payload: dict[str, Any]) -> None:
     os.close(fd)
 
 
+def _session_timeout_s(manifest: dict[str, Any]) -> float:
+    timeout_s = float(manifest.get("session_timeout_s", 30.0))
+    if timeout_s <= 0:
+        raise ValueError("manifest session_timeout_s must be positive")
+    return timeout_s
+
+
 def _health_loop(sock: socket.socket, stop: threading.Event, session_id: int, worker_id: int) -> None:
+    conn: socket.socket | None = None
     sock.settimeout(0.2)
     try:
-        conn: socket.socket | None = None
         sequence = 0
         while not stop.is_set():
             if conn is None:
@@ -183,6 +190,11 @@ def _health_loop(sock: socket.socket, stop: threading.Event, session_id: int, wo
                     pass
                 conn = None
     finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except OSError:
+                pass
         try:
             sock.close()
         except OSError:
@@ -896,6 +908,7 @@ def run_session(manifest: dict[str, Any], ready_fd: int) -> int:
     stop_health = threading.Event()
     health_thread: threading.Thread | None = None
     try:
+        session_timeout_s = _session_timeout_s(manifest)
         manifest_dispatch_registry = _install_manifest_dispatcher_registry(manifest)
         inner_worker.init()
         manifest_inner_handles = _install_manifest_inner_registry(manifest, inner_worker)
@@ -924,6 +937,7 @@ def run_session(manifest: dict[str, Any], ready_fd: int) -> int:
             },
         )
 
+        command_sock.settimeout(session_timeout_s)
         conn, _addr = command_sock.accept()
         with conn:
             _run_command_loop(conn, manifest, inner_worker, manifest_inner_handles, manifest_dispatch_registry)

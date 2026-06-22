@@ -13,11 +13,14 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import select
 import socket
 import struct
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 from typing import Any
 
 
@@ -60,9 +63,23 @@ def _validate_manifest(manifest: dict[str, Any]) -> None:
         raise ValueError("only sim transport is accepted by simpler-remote-worker")
 
 
-def _read_runner_ready(fd: int) -> dict[str, Any]:
+def _session_timeout_s(manifest: dict[str, Any]) -> float:
+    timeout_s = float(manifest.get("session_timeout_s", 30.0))
+    if timeout_s <= 0:
+        raise ValueError("manifest session_timeout_s must be positive")
+    return timeout_s
+
+
+def _read_runner_ready(fd: int, timeout_s: float) -> dict[str, Any]:
     chunks = bytearray()
+    deadline = time.monotonic() + timeout_s
     while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("session runner did not send ready payload before timeout")
+        readable, _writable, _error = select.select([fd], [], [], remaining)
+        if not readable:
+            raise TimeoutError("session runner did not send ready payload before timeout")
         b = os.read(fd, 1)
         if not b:
             break
@@ -74,10 +91,35 @@ def _read_runner_ready(fd: int) -> dict[str, Any]:
     return json.loads(bytes(chunks).decode("utf-8"))
 
 
+def _wait_or_kill_runner(proc: subprocess.Popen[Any], *, timeout_s: float = 5.0) -> None:
+    try:
+        proc.wait(timeout=timeout_s)
+        return
+    except subprocess.TimeoutExpired:
+        pass
+    try:
+        proc.kill()
+    except OSError:
+        pass
+    try:
+        proc.wait(timeout=timeout_s)
+    except subprocess.TimeoutExpired:
+        pass
+
+
+def _reap_session_runner(proc: subprocess.Popen[Any]) -> None:
+    try:
+        proc.wait()
+    except BaseException:  # noqa: BLE001
+        pass
+
+
 def _start_session(manifest: dict[str, Any]) -> dict[str, Any]:
     _validate_manifest(manifest)
+    timeout_s = _session_timeout_s(manifest)
     ready_r, ready_w = os.pipe()
     manifest_path = ""
+    proc: subprocess.Popen[Any] | None = None
     try:
         with tempfile.NamedTemporaryFile(
             "w", encoding="utf-8", prefix="simpler-remote-l3-", suffix=".json", delete=False
@@ -99,10 +141,21 @@ def _start_session(manifest: dict[str, Any]) -> dict[str, Any]:
         )
         os.close(ready_w)
         ready_w = -1
-        ready = _read_runner_ready(ready_r)
+        try:
+            ready = _read_runner_ready(ready_r, timeout_s)
+        except BaseException:
+            if proc.poll() is None:
+                try:
+                    proc.kill()
+                except OSError:
+                    pass
+            _wait_or_kill_runner(proc)
+            raise
         ready["pid"] = int(proc.pid)
         if not ready.get("ok", False):
-            proc.wait(timeout=5)
+            _wait_or_kill_runner(proc)
+        else:
+            threading.Thread(target=_reap_session_runner, args=(proc,), daemon=True).start()
         return ready
     finally:
         if ready_w >= 0:

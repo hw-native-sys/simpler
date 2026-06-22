@@ -1420,6 +1420,12 @@ class Worker:
     def _is_wildcard_session_host(host: str) -> bool:
         return host in ("0.0.0.0", "::")
 
+    def _remote_session_timeout_s(self) -> float:
+        timeout_s = float(self._config.get("remote_session_timeout_s", 30.0))
+        if timeout_s <= 0:
+            raise ValueError("Worker remote_session_timeout_s must be positive")
+        return timeout_s
+
     @staticmethod
     def _send_remote_daemon_json(sock: socket.socket, payload: dict[str, Any]) -> None:
         data = json.dumps(payload, sort_keys=True).encode("utf-8")
@@ -1483,6 +1489,7 @@ class Worker:
             "num_sub_workers": int(spec.num_sub_workers),
             "heap_ring_size": self._config.get("remote_heap_ring_size", None),
             "transport": spec.transport,
+            "session_timeout_s": self._remote_session_timeout_s(),
             "listen_host": listen_host,
             "connect_host": daemon_host,
             "remote_task_dispatcher": self._remote_dispatcher_entries_for_worker(worker_id),
@@ -2829,7 +2836,7 @@ class Worker:
                 session_id = uuid.uuid4().int & ((1 << 63) - 1)
                 if session_id == 0:
                     session_id = 1
-                timeout_s = float(self._config.get("remote_session_timeout_s", 30.0))
+                timeout_s = self._remote_session_timeout_s()
                 session = self._open_remote_session(
                     spec=spec, worker_id=worker_id, session_id=session_id, timeout_s=timeout_s
                 )
