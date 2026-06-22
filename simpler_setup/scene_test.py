@@ -1538,13 +1538,13 @@ class SceneTestCase:
             "-c",
             "--pto-isa-commit",
             default=None,
-            help="Checkout PTO-ISA at this git commit before running.",
+            help=("Override the PTO-ISA revision before running. Default/latest: use the current checkout HEAD."),
         )
         parser.add_argument(
             "--clone-protocol",
             choices=["ssh", "https"],
             default="ssh",
-            help="Git protocol for auto-cloning PTO-ISA (used with --pto-isa-commit). Default: ssh.",
+            help="Git protocol for auto-cloning PTO-ISA when PTO_ISA_ROOT is not set. Default: ssh.",
         )
         parser.add_argument(
             "--log-level",
