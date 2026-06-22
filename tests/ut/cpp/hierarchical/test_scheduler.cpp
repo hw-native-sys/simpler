@@ -639,6 +639,11 @@ TEST_F(GroupSchedulerFixture, AffinityMustBeInEligibleEndpointSet) {
     EXPECT_THROW((void)orch.submit_next_level(C(56), args, cfg, 0, {1}), std::invalid_argument);
 }
 
+TEST_F(GroupSchedulerFixture, UnknownEligibleWorkerIdIsRejectedBeforeScheduling) {
+    TaskArgs args = single_tensor_args(0xE3, TensorArgType::OUTPUT);
+    EXPECT_THROW((void)orch.submit_next_level(C(59), args, cfg, -1, {99}), std::invalid_argument);
+}
+
 TEST(SchedulerWorkerAffinityTest, NextLevelAffinityUsesWorkerIdNotVectorIndex) {
     TensorMap tm;
     Ring allocator;
@@ -677,6 +682,20 @@ TEST(SchedulerWorkerAffinityTest, NextLevelAffinityUsesWorkerIdNotVectorIndex) {
     };
     sched.start(c);
 
+    auto wait_consumed_slot = [&consumed_slots, &consumed_mu](TaskSlot slot) {
+        bool consumed = false;
+        auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(1000);
+        while (std::chrono::steady_clock::now() < deadline) {
+            {
+                std::lock_guard<std::mutex> lk(consumed_mu);
+                consumed = std::find(consumed_slots.begin(), consumed_slots.end(), slot) != consumed_slots.end();
+            }
+            if (consumed) break;
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        EXPECT_TRUE(consumed);
+    };
+
     TaskArgs args = single_tensor_args(0xE2, TensorArgType::OUTPUT);
     auto res = orch.submit_next_level(C(58), args, cfg, 9);
 
@@ -689,17 +708,22 @@ TEST(SchedulerWorkerAffinityTest, NextLevelAffinityUsesWorkerIdNotVectorIndex) {
     if (worker_a.is_running.load()) worker_a.complete();
     if (worker_b.is_running.load()) worker_b.complete();
 
-    bool consumed = false;
-    auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(1000);
-    while (std::chrono::steady_clock::now() < deadline) {
-        {
-            std::lock_guard<std::mutex> lk(consumed_mu);
-            consumed = std::find(consumed_slots.begin(), consumed_slots.end(), res.task_slot) != consumed_slots.end();
-        }
-        if (consumed) break;
-        std::this_thread::sleep_for(std::chrono::milliseconds(1));
-    }
-    EXPECT_TRUE(consumed);
+    wait_consumed_slot(res.task_slot);
+
+    TaskArgs a0 = single_tensor_args(0xE6, TensorArgType::OUTPUT);
+    TaskArgs a1 = single_tensor_args(0xE7, TensorArgType::OUTPUT);
+    auto group_res = orch.submit_next_level_group(C(61), {a0, a1}, cfg, {}, {{7}, {9}});
+
+    worker_a.wait_running();
+    worker_b.wait_running();
+    EXPECT_TRUE(worker_a.is_running.load());
+    EXPECT_TRUE(worker_b.is_running.load());
+    EXPECT_EQ(worker_a.dispatched_count(), 1);
+    EXPECT_EQ(worker_b.dispatched_count(), 2);
+
+    worker_a.complete();
+    worker_b.complete();
+    wait_consumed_slot(group_res.task_slot);
 
     sched.stop();
     manager.stop();

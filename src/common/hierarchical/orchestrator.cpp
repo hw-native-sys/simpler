@@ -323,12 +323,22 @@ void Orchestrator::validate_worker_eligibility(
         );
     }
 
+    const std::vector<int32_t> empty_eligible;
     for (size_t i = 0; i < args_count; ++i) {
-        const auto &eligible = eligible_worker_ids.empty() ? std::vector<int32_t>{} : eligible_worker_ids[i];
+        const auto &eligible = eligible_worker_ids.empty() ? empty_eligible : eligible_worker_ids[i];
         if (!eligible_worker_ids.empty() && eligible.empty()) {
             throw std::invalid_argument(
                 "Orchestrator: final eligible worker-id set is empty for member " + std::to_string(i)
             );
+        }
+        if (manager_ != nullptr && !eligible_worker_ids.empty()) {
+            for (int32_t worker_id : eligible) {
+                if (manager_->get_worker_by_id(worker_type, worker_id) == nullptr) {
+                    throw std::invalid_argument(
+                        "Orchestrator: eligible worker-id " + std::to_string(worker_id) + " is not a registered worker"
+                    );
+                }
+            }
         }
         int32_t affinity = affinities.empty() ? -1 : affinities[i];
         if (affinity < 0) continue;
@@ -355,7 +365,7 @@ void Orchestrator::validate_worker_eligibility(
                     " is not in the slot's final eligible worker-id set"
                 );
             }
-        } else if (!eligible_worker_ids.empty()) {
+        } else if (affinity >= 0 && !eligible_worker_ids.empty()) {
             bool allowed = false;
             for (int32_t id : eligible) {
                 if (id == affinity) {
