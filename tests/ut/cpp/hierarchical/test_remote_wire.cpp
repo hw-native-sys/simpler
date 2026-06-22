@@ -22,13 +22,12 @@
 namespace {
 
 Tensor metadata_tensor() {
-    Tensor t{};
-    t.buffer.addr = 0;
-    t.ndims = 1;
-    t.shapes[0] = 4;
-    t.dtype = DataType::UINT8;
-    t.child_memory = 0;
-    return t;
+    // Build through the canonical factory so the tensor is a valid contiguous
+    // descriptor (is_contiguous = true, start_offset = 0, row-major strides) —
+    // encode_tensor enforces contiguity on the wire. addr = 0 keeps it a
+    // metadata-only remote tensor.
+    const uint32_t shapes[1] = {4};
+    return make_tensor_external(nullptr, shapes, 1, DataType::UINT8);
 }
 
 }  // namespace

@@ -339,8 +339,15 @@ CallConfig decode_call_config(const uint8_t *data, size_t size, size_t &offset) 
 // Wire format carries only the contiguous-defining fields (addr, shapes, ndims,
 // dtype, child_memory +
 // 7 reserved bytes). The unified Tensor's derived state (strides / start_offset
-// / is_contiguous) is recomputed on decode, since wire tensors are contiguous.
+// / is_contiguous) is recomputed as row-major on decode. The wire is therefore
+// contiguous-only: a strided Tensor would be silently flattened. Guard against
+// that here so the loss is loud, not silent — strided views only round-trip
+// over the local fork/shm mailbox blob, never this remote wire.
 std::vector<uint8_t> encode_tensor(const Tensor &tensor) {
+    ensure(
+        tensor.is_contiguous && tensor.start_offset == 0,
+        "remote_wire: only contiguous, zero-offset tensors are supported on the wire"
+    );
     std::vector<uint8_t> out;
     put_u64(out, tensor.buffer.addr);
     for (uint32_t shape : tensor.shapes)

@@ -99,6 +99,13 @@ child_memory: uint8
 reserved: uint8[7]
 ```
 
+The wire carries only the contiguous-defining fields; it does **not** carry
+`strides` / `start_offset`, and `decode_tensor` rebuilds them as row-major.
+The remote wire is therefore **contiguous-only**: strided views round-trip
+solely over the local fork/shm mailbox blob (full 128 B `Tensor` memcpy).
+`encode_tensor` asserts `is_contiguous && start_offset == 0` so a strided
+tensor fails loudly rather than being silently flattened.
+
 The session runner decodes these wire records into local `CallConfig` and
 `Tensor` values before calling `inner_worker.run()`. For tensors with
 a remote descriptor, the runner fills the local `Tensor.data` from

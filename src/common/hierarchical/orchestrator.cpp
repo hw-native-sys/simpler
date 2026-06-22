@@ -68,6 +68,12 @@ TaskSlotState &Orchestrator::slot_state(TaskSlot s) {
 uint64_t Orchestrator::output_alloc_bytes(const Tensor &t) { return align_up(t.nbytes(), HEAP_ALIGN); }
 
 Tensor Orchestrator::alloc(const std::vector<uint32_t> &shape, DataType dtype) {
+    if (shape.empty()) {
+        // Rank-0 tensors are not supported across the ABI (Tensor enforces
+        // ndims > 0). Reject here so we never allocate + register a buffer in
+        // the tensormap only to hand back an unusable addr==0 sentinel.
+        throw std::invalid_argument("Orchestrator::alloc: shape must have at least one dimension");
+    }
     if (shape.size() > MAX_TENSOR_DIMS) {
         throw std::invalid_argument("Orchestrator::alloc: shape exceeds MAX_TENSOR_DIMS");
     }
@@ -125,15 +131,15 @@ Tensor Orchestrator::alloc(const std::vector<uint32_t> &shape, DataType dtype) {
     active_tasks_.fetch_add(1, std::memory_order_relaxed);
 
     // Build a contiguous external Tensor over the allocated buffer. ptr may be
-    // 0 for a 0-byte request (sentinel "no tensor"), matching the prior
-    // empty-Tensor (buffer.addr == 0) behavior; buffer.size carries numel*elem.
+    // 0 for a 0-byte request (a shape with a zero dim), in which case
+    // init_external sets buffer.addr == 0 — the "no tensor" sentinel honored by
+    // infer_deps; buffer.size carries numel*elem. shape is non-empty (rejected
+    // at entry), so ndims >= 1 holds for init_external's assertion.
     Tensor t{};
-    if (!shape.empty()) {
-        t.init_external(
-            reinterpret_cast<void *>(ptr), bytes, shape.data(), static_cast<uint32_t>(shape.size()), dtype,
-            /*version=*/0
-        );
-    }
+    t.init_external(
+        reinterpret_cast<void *>(ptr), bytes, shape.data(), static_cast<uint32_t>(shape.size()), dtype,
+        /*version=*/0
+    );
     return t;
 }
 

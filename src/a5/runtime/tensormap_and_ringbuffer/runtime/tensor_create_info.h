@@ -43,6 +43,10 @@ public:
         manual_dep(manual_dep_in),
         is_contiguous(true),  // mirrors Tensor::is_contiguous; pre-set for create-info outputs
         __pad_flags__(0) {
+        // Bound the write below: shapes[] holds MAX_TENSOR_DIMS, and ndims_in
+        // comes from user-submitted output shapes — guard before the loop so an
+        // oversized rank can't overrun the fixed array.
+        always_assert(ndims_in > 0 && ndims_in <= MAX_TENSOR_DIMS);
         for (uint32_t i = 0; i < ndims_in; i++) {
             shapes[i] = shapes_in[i];
         }

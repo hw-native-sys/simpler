@@ -75,8 +75,11 @@ def make_tensor_arg(tensor) -> Tensor:
     the unified ``Tensor`` can express strided views, but this construction path
     is constrained to contiguous memory. The input torch tensor MUST therefore be
     contiguous; a non-contiguous tensor raises ``ValueError`` (call
-    ``.contiguous()`` first). Its ``data_ptr()``, shape, and dtype are read and
-    stored in the returned ``Tensor``.
+    ``.contiguous()`` first). It must also be a CPU tensor: a device tensor's
+    ``data_ptr()`` is a device pointer that requires ``child_memory=True``, which
+    this helper does not set, so a non-CPU tensor raises ``ValueError``. Its
+    ``data_ptr()``, shape, and dtype are read and stored in the returned
+    ``Tensor``.
     """
     from simpler.task_interface import Tensor
 
@@ -84,6 +87,12 @@ def make_tensor_arg(tensor) -> Tensor:
     dt = _TORCH_DTYPE_MAP.get(tensor.dtype)  # pyright: ignore[reportOptionalMemberAccess]
     if dt is None:
         raise ValueError(f"Unsupported tensor dtype for Tensor: {tensor.dtype}")
+    if tensor.device.type != "cpu":
+        raise ValueError(
+            f"make_tensor_arg requires a CPU tensor, got device={tensor.device}. "
+            "A device pointer must be wrapped explicitly via "
+            "Tensor.make(..., child_memory=True)."
+        )
     if not tensor.is_contiguous():
         raise ValueError(
             "make_tensor_arg requires a contiguous tensor (TaskArgs Tensors are constructed "

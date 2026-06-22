@@ -85,8 +85,11 @@ enum class TensorArgType : int32_t {
  * stride + cached extent_elem.
  *
  * Construction:
- * Users cannot default-construct or directly construct a Tensor.
- * Valid Tensors are obtained only through controlled entry points:
+ * Default construction is public (Tensor doubles as wire / TaskArgs / blob
+ * storage, which needs a default-constructible element) but yields an
+ * UNINITIALIZED object that must be filled before use. The parameterized
+ * constructor is private, so a *valid* Tensor (real buffer, row-major strides)
+ * is obtained only through controlled entry points:
  *   - make_tensor_external(...)
  *   - from_tensor_arg(...)
  *   - TaskOutputTensors returned by submit(...)

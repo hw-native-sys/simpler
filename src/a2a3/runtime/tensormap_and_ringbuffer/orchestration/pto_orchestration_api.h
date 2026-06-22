@@ -51,6 +51,10 @@
 // creator-only dependency tracking (manual_dep) and an initial version. Since
 // TaskArgs now carries Tensor directly, this is a copy with those two fields
 // applied; buffer / shapes / strides / start_offset / child_memory are kept.
+// Precondition: `t` is an external, submit-time tensor (owner_task_id invalid,
+// start_offset 0, contiguous) — the construction path enforces this. The copy
+// therefore preserves owner_task_id, which is equivalent to the former
+// make_tensor_external rebuild (it forced owner invalid) for every caller.
 inline Tensor from_tensor_arg(const Tensor &t, bool manual_dep = false, int32_t version = 0) {
     Tensor result = t;
     result.manual_dep = manual_dep;

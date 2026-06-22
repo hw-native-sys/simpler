@@ -110,7 +110,7 @@ public:
 };
 ```
 
-`TensorArgType` has five values (matches existing `tensor_arg.h:53-59`):
+`TensorArgType` has five values (matches existing `tensor.h:45-51`):
 `INPUT`, `OUTPUT`, `INOUT`, `OUTPUT_EXISTING`, `NO_DEP`.
 
 For remote L3 submits, public Python uses `RemoteTaskArgs` as a wrapper around
@@ -589,5 +589,5 @@ lives in the mailbox blob bytes on the child side — view doesn't care.
   model (host / AICPU / AICore)
 - [`../src/common/task_interface/task_args.h`](../src/common/task_interface/task_args.h)
   — `TaskArgs` template and `ChipStorageTaskArgs` alias
-- [`../src/common/task_interface/tensor_arg.h`](../src/common/task_interface/tensor_arg.h)
+- [`../src/common/task_interface/tensor.h`](../src/common/task_interface/tensor.h)
   — `Tensor` POD and `TensorArgType` enum

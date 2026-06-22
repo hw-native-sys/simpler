@@ -148,13 +148,13 @@ NB_MODULE(_task_interface, m) {
             }
         )
 
-        .def_prop_rw(
+        // Read-only: a raw `ndims` write would desync shapes/strides/buffer.size
+        // and could index past the fixed MAX_TENSOR_DIMS arrays. Rank changes go
+        // through the `shapes` setter, which rebuilds a valid contiguous layout.
+        .def_prop_ro(
             "ndims",
             [](const Tensor &self) -> uint32_t {
                 return self.ndims;
-            },
-            [](Tensor &self, uint32_t v) {
-                self.ndims = v;
             }
         )
 

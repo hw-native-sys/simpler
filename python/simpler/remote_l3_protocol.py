@@ -438,8 +438,8 @@ def decode_tensor(reader: _Reader) -> Tensor:
         raise ValueError("remote_wire: remote TASK tensor data must be zero")
     shapes = [reader.u32() for _ in range(MAX_TENSOR_DIMS)]
     ndims = reader.u32()
-    if ndims > MAX_TENSOR_DIMS:
-        raise ValueError("remote_wire: tensor ndims exceeds maximum")
+    if ndims == 0 or ndims > MAX_TENSOR_DIMS:
+        raise ValueError("remote_wire: tensor ndims out of range")
     dtype = DataType(reader.u32())
     child_memory = reader.u8()
     if child_memory not in (0, 1):
