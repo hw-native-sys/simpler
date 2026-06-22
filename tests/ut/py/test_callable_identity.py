@@ -724,6 +724,40 @@ def test_submit_sub_group_rejects_remote_tensor_ref_sidecar():
     assert not fake.called
 
 
+def test_capture_remote_sidecar_refs_rolls_back_partial_acquires():
+    class FakeTensorSidecar:
+        present = True
+
+        def __init__(self, handle):
+            self.handle = handle
+
+    class FakeRemoteSidecar:
+        def __init__(self, *handles):
+            self.tensors = tuple(FakeTensorSidecar(handle) for handle in handles)
+
+    worker = Worker(level=4, num_sub_workers=0)
+    first = RemoteBufferHandle._from_remote_allocation(
+        worker_id=0,
+        buffer_id=1,
+        generation=1,
+        address_space=RemoteAddressSpace.REMOTE_DEVICE,
+        nbytes=4,
+    )
+    released = RemoteBufferHandle._from_remote_allocation(
+        worker_id=0,
+        buffer_id=2,
+        generation=1,
+        address_space=RemoteAddressSpace.REMOTE_DEVICE,
+        nbytes=4,
+        released=True,
+    )
+
+    with pytest.raises(RuntimeError, match="already been released"):
+        worker._capture_remote_sidecar_refs(FakeRemoteSidecar(first, released))
+
+    assert first._live_slot_refs == 0
+
+
 @pytest.mark.parametrize(
     ("tag", "access_flags"),
     [

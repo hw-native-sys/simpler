@@ -1837,16 +1837,20 @@ class Worker:
         captured: list[RemoteBufferHandle] = []
         if remote_sidecar is None:
             return captured
-        for tensor_sidecar in getattr(remote_sidecar, "tensors", ()):
-            if tensor_sidecar is None or not getattr(tensor_sidecar, "present", False):
-                continue
-            handle = getattr(tensor_sidecar, "handle", None)
-            if handle is None:
-                continue
-            if not isinstance(handle, RemoteBufferHandle):
-                raise TypeError("remote sidecar handle must be a RemoteBufferHandle")
-            handle._acquire_slot_ref()
-            captured.append(handle)
+        try:
+            for tensor_sidecar in getattr(remote_sidecar, "tensors", ()):
+                if tensor_sidecar is None or not getattr(tensor_sidecar, "present", False):
+                    continue
+                handle = getattr(tensor_sidecar, "handle", None)
+                if handle is None:
+                    continue
+                if not isinstance(handle, RemoteBufferHandle):
+                    raise TypeError("remote sidecar handle must be a RemoteBufferHandle")
+                handle._acquire_slot_ref()
+                captured.append(handle)
+        except BaseException:
+            self._release_remote_slot_refs(captured)
+            raise
         return captured
 
     def _adopt_remote_slot_refs(self, handles: list[RemoteBufferHandle]) -> None:
