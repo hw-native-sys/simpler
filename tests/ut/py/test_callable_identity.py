@@ -1377,6 +1377,106 @@ def test_remote_owner_free_waits_for_import_release():
     assert worker._pending_remote_buffer_frees == []
 
 
+def test_remote_import_pins_owner_during_control_and_rolls_back_on_error():
+    worker = Worker(level=4, num_sub_workers=0)
+    owner = RemoteBufferHandle._from_remote_allocation(
+        worker_id=0,
+        buffer_id=1,
+        generation=1,
+        address_space=RemoteAddressSpace.REMOTE_DEVICE,
+        nbytes=4,
+    )
+    exported = RemoteBufferExport._from_remote_export(
+        owner_worker_id=0,
+        buffer_id=1,
+        generation=1,
+        address_space=RemoteAddressSpace.REMOTE_WINDOW,
+        offset=0,
+        nbytes=4,
+        export_id=1,
+        remote_addr=0,
+        rkey_or_token=1,
+        ub_ldst_va=0,
+        access_flags=3,
+        transport_profile="sim",
+        _owner_handle=owner,
+        worker_owner_id=worker._owner_id,
+    )
+
+    class FailingRemoteWorker:
+        def __init__(self):
+            self.owner_ref_seen = None
+
+        def remote_import(self, *args):
+            self.owner_ref_seen = owner._live_import_refs
+            raise RuntimeError("import failed")
+
+    fake = FailingRemoteWorker()
+    worker_id = worker.add_remote_worker(RemoteWorkerSpec(endpoint="127.0.0.1:19073", platform="a2a3sim"))
+    worker._worker = fake  # type: ignore[assignment]
+    worker._initialized = True
+    worker._hierarchical_start_state = "started"
+
+    with pytest.raises(RuntimeError, match="import failed"):
+        worker.remote_import(exported, worker=worker_id)
+
+    assert fake.owner_ref_seen == 1
+    assert owner._live_import_refs == 0
+
+
+def test_remote_import_releases_remote_mapping_when_handle_build_fails(monkeypatch):
+    worker = Worker(level=4, num_sub_workers=0)
+    owner = RemoteBufferHandle._from_remote_allocation(
+        worker_id=0,
+        buffer_id=1,
+        generation=1,
+        address_space=RemoteAddressSpace.REMOTE_DEVICE,
+        nbytes=4,
+    )
+    exported = RemoteBufferExport._from_remote_export(
+        owner_worker_id=0,
+        buffer_id=1,
+        generation=1,
+        address_space=RemoteAddressSpace.REMOTE_WINDOW,
+        offset=0,
+        nbytes=4,
+        export_id=1,
+        remote_addr=0,
+        rkey_or_token=1,
+        ub_ldst_va=0,
+        access_flags=3,
+        transport_profile="sim",
+        _owner_handle=owner,
+        worker_owner_id=worker._owner_id,
+    )
+
+    class FakeRemoteWorker:
+        def __init__(self):
+            self.released = None
+
+        def remote_import(self, *args):
+            return (0, 0, 1, 1, 7, int(RemoteAddressSpace.REMOTE_WINDOW), 4, 0, 0, 7, 0, 3)
+
+        def remote_release_import(self, *args):
+            self.released = args
+
+    def fail_from_imported_mapping(**kwargs):
+        raise RuntimeError("handle build failed")
+
+    fake = FakeRemoteWorker()
+    worker_id = worker.add_remote_worker(RemoteWorkerSpec(endpoint="127.0.0.1:19073", platform="a2a3sim"))
+    worker._worker = fake  # type: ignore[assignment]
+    worker._initialized = True
+    worker._hierarchical_start_state = "started"
+    monkeypatch.setattr(RemoteBufferHandle, "_from_imported_mapping", staticmethod(fail_from_imported_mapping))
+
+    with pytest.raises(RuntimeError, match="handle build failed"):
+        worker.remote_import(exported, worker=worker_id)
+
+    assert fake.released == (0, 0, 1, 1, 7)
+    assert owner._live_import_refs == 0
+
+
 def test_remote_import_rejects_cross_worker_or_stale_export():
     owner = RemoteBufferHandle._from_remote_allocation(
         worker_id=0,

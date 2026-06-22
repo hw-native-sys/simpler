@@ -1611,6 +1611,18 @@ class Worker:
             handle.import_id,
         )
 
+    def _send_remote_release_import_fields(self, fields: Any) -> None:
+        worker_id = int(fields[0])
+        self._require_remote_worker_started(worker_id)
+        assert self._worker is not None
+        self._worker.remote_release_import(
+            worker_id,
+            int(fields[1]),
+            int(fields[2]),
+            int(fields[3]),
+            int(fields[4]),
+        )
+
     def remote_malloc(self, *, worker: int, nbytes: int) -> RemoteBufferHandle:
         worker_id = int(worker)
         size = int(nbytes)
@@ -1755,42 +1767,52 @@ class Worker:
         if flags & ~exported._access_flags:
             raise ValueError("Worker.remote_import requested access is not a subset of export access")
         assert self._worker is not None
-        fields = self._worker.remote_import(
-            importer_worker_id,
-            exported._owner_worker_id,
-            exported._buffer_id,
-            exported._generation,
-            int(exported._address_space),
-            exported._offset,
-            exported._nbytes,
-            exported._export_id,
-            exported._remote_addr,
-            exported._rkey_or_token,
-            exported._ub_ldst_va,
-            exported._access_flags,
-            exported._transport_profile,
-            exported._transport_descriptor,
-            flags,
-        )
         owner_handle = exported._owner_handle
-        imported = RemoteBufferHandle._from_imported_mapping(
-            worker_id=int(fields[0]),
-            owner_worker_id=int(fields[1]),
-            buffer_id=int(fields[2]),
-            generation=int(fields[3]),
-            import_id=int(fields[4]),
-            address_space=RemoteAddressSpace(int(fields[5])),
-            nbytes=int(fields[6]),
-            offset=int(fields[7]),
-            remote_addr=int(fields[8]),
-            rkey_or_token=int(fields[9]),
-            ub_ldst_va=int(fields[10]),
-            access_flags=int(fields[11]),
-            owner_handle_ref=owner_handle,
-        )
         if owner_handle is not None:
             owner_handle._acquire_import_ref()
-        return imported
+        fields: Any | None = None
+        try:
+            fields = self._worker.remote_import(
+                importer_worker_id,
+                exported._owner_worker_id,
+                exported._buffer_id,
+                exported._generation,
+                int(exported._address_space),
+                exported._offset,
+                exported._nbytes,
+                exported._export_id,
+                exported._remote_addr,
+                exported._rkey_or_token,
+                exported._ub_ldst_va,
+                exported._access_flags,
+                exported._transport_profile,
+                exported._transport_descriptor,
+                flags,
+            )
+            return RemoteBufferHandle._from_imported_mapping(
+                worker_id=int(fields[0]),
+                owner_worker_id=int(fields[1]),
+                buffer_id=int(fields[2]),
+                generation=int(fields[3]),
+                import_id=int(fields[4]),
+                address_space=RemoteAddressSpace(int(fields[5])),
+                nbytes=int(fields[6]),
+                offset=int(fields[7]),
+                remote_addr=int(fields[8]),
+                rkey_or_token=int(fields[9]),
+                ub_ldst_va=int(fields[10]),
+                access_flags=int(fields[11]),
+                owner_handle_ref=owner_handle,
+            )
+        except BaseException:
+            if fields is not None:
+                try:
+                    self._send_remote_release_import_fields(fields)
+                except Exception:  # noqa: BLE001
+                    pass
+            if owner_handle is not None:
+                owner_handle._release_import_ref()
+            raise
 
     def remote_release_import(self, handle: RemoteBufferHandle) -> None:
         if not isinstance(handle, RemoteBufferHandle):
