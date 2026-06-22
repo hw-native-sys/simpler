@@ -72,6 +72,10 @@
 // Fanin storage — absolute max number of unique fanin dependencies per task.
 #define PTO2_MAX_FANIN 16
 
+// Upstream spec-dispatch compatibility: inline fanin cap + spill pool fwd decl.
+#define PTO2_FANIN_INLINE_CAP 64
+struct PTO2FaninPool;  // Forward declaration (defined by upstream spec-dispatch path)
+
 // TensorMap cleanup interval
 #define PTO2_TENSORMAP_CLEANUP_INTERVAL 64  // Cleanup every N retired tasks
 #define PTO2_DEP_POOL_CLEANUP_INTERVAL 64   // Cleanup every N retired tasks
