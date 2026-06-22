@@ -62,6 +62,7 @@ typedef struct PTO2RuntimeOps
 
     // Logging (populated by runtime, called by orchestration)
     // INFO with explicit verbosity tier (v ∈ [0, 9]; gating done inside).
+    void (*log_info_v)(const char *func, int v, const char *fmt, ...);
 
     // Cross-layer data access (orchestration reads/writes tensor values via runtime)
     // Placed after logging to avoid shifting hot-path field offsets.
@@ -229,6 +230,20 @@ private:
 #define PTO2_SCOPE_GUARD() [[maybe_unused]] PTO2ScopeGuard _PTO2_CONCATENATE(scope_guard_, __COUNTER__)
 
 #define PTO2_SCOPE(...) if (PTO2ScopeGuard _PTO2_CONCATENATE(scope_guard_, __COUNTER__){__VA_ARGS__}; true)
+
+// User-orchestration logging macros. Route through the runtime's ops table so
+// the verbosity gating (V0..V9) and the actual logging sink stay owned by the
+// runtime. The orchestration .so just calls — gating is done inside.
+#define LOG_INFO_V0(fmt, ...) current_runtime()->ops->log_info_v(__FUNCTION__, 0, fmt, ##__VA_ARGS__)
+#define LOG_INFO_V1(fmt, ...) current_runtime()->ops->log_info_v(__FUNCTION__, 1, fmt, ##__VA_ARGS__)
+#define LOG_INFO_V2(fmt, ...) current_runtime()->ops->log_info_v(__FUNCTION__, 2, fmt, ##__VA_ARGS__)
+#define LOG_INFO_V3(fmt, ...) current_runtime()->ops->log_info_v(__FUNCTION__, 3, fmt, ##__VA_ARGS__)
+#define LOG_INFO_V4(fmt, ...) current_runtime()->ops->log_info_v(__FUNCTION__, 4, fmt, ##__VA_ARGS__)
+#define LOG_INFO_V5(fmt, ...) current_runtime()->ops->log_info_v(__FUNCTION__, 5, fmt, ##__VA_ARGS__)
+#define LOG_INFO_V6(fmt, ...) current_runtime()->ops->log_info_v(__FUNCTION__, 6, fmt, ##__VA_ARGS__)
+#define LOG_INFO_V7(fmt, ...) current_runtime()->ops->log_info_v(__FUNCTION__, 7, fmt, ##__VA_ARGS__)
+#define LOG_INFO_V8(fmt, ...) current_runtime()->ops->log_info_v(__FUNCTION__, 8, fmt, ##__VA_ARGS__)
+#define LOG_INFO_V9(fmt, ...) current_runtime()->ops->log_info_v(__FUNCTION__, 9, fmt, ##__VA_ARGS__)
 
 #ifndef PTO2_ORCHESTRATION_CONFIG_DEFINED
 #define PTO2_ORCHESTRATION_CONFIG_DEFINED

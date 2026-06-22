@@ -25,6 +25,7 @@
 #include <stdio.h>
 #include <string.h>
 #include "aicpu/device_time.h"
+#include "common/unified_log.h"
 
 __attribute__((weak, visibility("hidden"))) uint64_t get_sys_cnt_aicpu();
 
@@ -48,6 +49,7 @@ struct PTO2RuntimeOps
 
     // Logging (populated by runtime, called by orchestration)
     // INFO with explicit verbosity tier (v ∈ [0, 9]; gating done inside).
+    void (*log_info_v)(const char *func, int v, const char *fmt, ...);
 
     // Cross-layer data access (orchestration reads/writes tensor values via runtime)
     // Placed after logging to avoid shifting hot-path field offsets.
@@ -200,6 +202,19 @@ inline void rt_report_fatal(PTO2Runtime *rt, int32_t error_code, const char *fun
         rt->orchestrator.report_fatal(error_code, func, "%s", message);
     }
     va_end(args);
+}
+
+// Orchestration-side logging dispatcher: orchestration .so calls
+// LOG_INFO_V<n>(fmt, ...) which routes through this op into the unified log.
+// The verbosity gate lives inside unified_log_info_v.
+inline void rt_log_info_v(const char *func, int v, const char *fmt, ...)
+{
+    va_list args;
+    va_start(args, fmt);
+    char message[1024];
+    vsnprintf(message, sizeof(message), fmt, args);
+    va_end(args);
+    unified_log_info_v(func, v, "%s", message);
 }
 
 MAYBE_UNINITIALIZED_BEGIN
@@ -365,6 +380,7 @@ inline const PTO2RuntimeOps s_runtime_ops = {
     .orchestration_done = rt_orchestration_done,
     .is_fatal = is_fatal_impl,
     .report_fatal = rt_report_fatal,
+    .log_info_v = rt_log_info_v,
     .get_tensor_data = get_tensor_data,
     .set_tensor_data = set_tensor_data,
     .alloc_tensors = alloc_tensors_impl,
