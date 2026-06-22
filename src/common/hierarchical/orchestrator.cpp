@@ -31,25 +31,25 @@ void Orchestrator::init(
 }
 
 uint64_t Orchestrator::malloc(int worker_id, size_t size) {
-    auto *wt = manager_->get_worker_by_index(WorkerType::NEXT_LEVEL, worker_id);
+    auto *wt = manager_->get_worker_by_id(WorkerType::NEXT_LEVEL, worker_id);
     if (!wt) throw std::runtime_error("Orchestrator::malloc: invalid worker_id");
     return wt->control_malloc(size);
 }
 
 void Orchestrator::free(int worker_id, uint64_t ptr) {
-    auto *wt = manager_->get_worker_by_index(WorkerType::NEXT_LEVEL, worker_id);
+    auto *wt = manager_->get_worker_by_id(WorkerType::NEXT_LEVEL, worker_id);
     if (!wt) throw std::runtime_error("Orchestrator::free: invalid worker_id");
     wt->control_free(ptr);
 }
 
 void Orchestrator::copy_to(int worker_id, uint64_t dst, uint64_t src, size_t size) {
-    auto *wt = manager_->get_worker_by_index(WorkerType::NEXT_LEVEL, worker_id);
+    auto *wt = manager_->get_worker_by_id(WorkerType::NEXT_LEVEL, worker_id);
     if (!wt) throw std::runtime_error("Orchestrator::copy_to: invalid worker_id");
     wt->control_copy_to(dst, src, size);
 }
 
 void Orchestrator::copy_from(int worker_id, uint64_t dst, uint64_t src, size_t size) {
-    auto *wt = manager_->get_worker_by_index(WorkerType::NEXT_LEVEL, worker_id);
+    auto *wt = manager_->get_worker_by_id(WorkerType::NEXT_LEVEL, worker_id);
     if (!wt) throw std::runtime_error("Orchestrator::copy_from: invalid worker_id");
     wt->control_copy_from(dst, src, size);
 }

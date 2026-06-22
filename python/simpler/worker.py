@@ -2084,7 +2084,7 @@ class Worker:
             if result.ok:
                 prepared.append(worker_id)
             else:
-                errors.append(f"{result.worker_type}[{result.worker_index}]: {result.error_message}")
+                errors.append(f"{result.worker_type}[{result.worker_id}]: {result.error_message}")
                 break
         if errors:
             cleanup_errors = self._remote_abort_prepared(prepared, reg)
@@ -2104,7 +2104,7 @@ class Worker:
             if result.ok:
                 committed.append(worker_id)
             else:
-                errors.append(f"{result.worker_type}[{result.worker_index}]: {result.error_message}")
+                errors.append(f"{result.worker_type}[{result.worker_id}]: {result.error_message}")
                 break
         if errors:
             cleanup_errors = self._remote_abort_prepared(
@@ -2139,7 +2139,7 @@ class Worker:
                 reg.digest,
             )
             if not result.ok:
-                errors.append(f"{result.worker_type}[{result.worker_index}]: {result.error_message}")
+                errors.append(f"{result.worker_type}[{result.worker_id}]: {result.error_message}")
         return errors
 
     def _remote_unregister_committed(self, worker_ids: list[int], reg: _CallableRegistration) -> list[str]:
@@ -2154,7 +2154,7 @@ class Worker:
                 reg.digest,
             )
             if not result.ok:
-                errors.append(f"{result.worker_type}[{result.worker_index}]: {result.error_message}")
+                errors.append(f"{result.worker_type}[{result.worker_id}]: {result.error_message}")
         return errors
 
     def _broadcast_py_control_results(
@@ -2183,7 +2183,7 @@ class Worker:
     @staticmethod
     def _control_errors(results: list[Any]) -> list[str]:
         return [
-            f"{result.worker_type}[{result.worker_index}]: {result.error_message}"
+            f"{result.worker_type}[{result.worker_id}]: {result.error_message}"
             for result in results
             if not result.ok
         ]
@@ -2423,15 +2423,15 @@ class Worker:
             try:
                 cleanup = self._worker.control_digest_only(
                     self._worker_type_from_result(result.worker_type),
-                    int(result.worker_index),
+                    int(result.worker_id),
                     int(sub_cmd),
                     digest,
                     timeout_s=self._py_control_timeout_s,
                 )
                 if not cleanup.ok:
-                    errors.append(f"{cleanup.worker_type}[{cleanup.worker_index}]: {cleanup.error_message}")
+                    errors.append(f"{cleanup.worker_type}[{cleanup.worker_id}]: {cleanup.error_message}")
             except Exception as exc:  # noqa: BLE001
-                errors.append(f"{result.worker_type}[{result.worker_index}]: {exc}")
+                errors.append(f"{result.worker_type}[{result.worker_id}]: {exc}")
         return errors
 
     @staticmethod
@@ -2587,7 +2587,7 @@ class Worker:
                         digest,
                     )
                     if not result.ok:
-                        errors.append(f"{result.worker_type}[{result.worker_index}]: {result.error_message}")
+                        errors.append(f"{result.worker_type}[{result.worker_id}]: {result.error_message}")
                 if errors:
                     with self._registry_lock:
                         self._uncertain_hashids.add(digest)
@@ -3167,7 +3167,7 @@ class Worker:
         device_ids = self._config.get("device_ids", [])
         for w in workers:
             if w < 0 or w >= len(device_ids):
-                raise ValueError(f"allocate_domain: worker index {w} outside [0, {len(device_ids)})")
+                raise ValueError(f"allocate_domain: worker_id {w} outside [0, {len(device_ids)})")
         if window_size <= 0:
             raise ValueError("allocate_domain: window_size must be positive")
         buffer_names = [b.name for b in buffers]

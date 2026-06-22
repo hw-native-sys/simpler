@@ -372,7 +372,7 @@ void WorkerManager::start(Ring *ring, const OnCompleteFn &on_complete) {
     next_level_worker_ids.reserve(next_level_entries_.size() + next_level_endpoint_entries_.size());
     auto register_next_level_worker_id = [&](int32_t worker_id) {
         if (worker_id < 0) {
-            throw std::runtime_error("WorkerManager::start: endpoint must have a stable worker_id");
+            throw std::runtime_error("WorkerManager::start: NEXT_LEVEL worker must have a stable worker_id");
         }
         if (std::find(next_level_worker_ids.begin(), next_level_worker_ids.end(), worker_id) !=
             next_level_worker_ids.end()) {
@@ -982,7 +982,7 @@ private:
 }  // namespace
 
 void WorkerManager::control_prepare(int worker_id, const uint8_t *digest) {
-    auto *wt = get_worker_by_index(WorkerType::NEXT_LEVEL, worker_id);
+    auto *wt = get_worker_by_id(WorkerType::NEXT_LEVEL, worker_id);
     if (wt == nullptr) {
         throw std::runtime_error("control_prepare: invalid worker_id " + std::to_string(worker_id));
     }
@@ -990,7 +990,7 @@ void WorkerManager::control_prepare(int worker_id, const uint8_t *digest) {
 }
 
 void WorkerManager::control_alloc_domain(int worker_id, const char *request_shm_name, const char *reply_shm_name) {
-    auto *wt = get_worker_by_index(WorkerType::NEXT_LEVEL, worker_id);
+    auto *wt = get_worker_by_id(WorkerType::NEXT_LEVEL, worker_id);
     if (wt == nullptr) {
         throw std::runtime_error("control_alloc_domain: invalid worker_id " + std::to_string(worker_id));
     }
@@ -998,7 +998,7 @@ void WorkerManager::control_alloc_domain(int worker_id, const char *request_shm_
 }
 
 void WorkerManager::control_release_domain(int worker_id, const char *request_shm_name) {
-    auto *wt = get_worker_by_index(WorkerType::NEXT_LEVEL, worker_id);
+    auto *wt = get_worker_by_id(WorkerType::NEXT_LEVEL, worker_id);
     if (wt == nullptr) {
         throw std::runtime_error("control_release_domain: invalid worker_id " + std::to_string(worker_id));
     }
@@ -1006,7 +1006,7 @@ void WorkerManager::control_release_domain(int worker_id, const char *request_sh
 }
 
 void WorkerManager::control_comm_init(int worker_id, const char *request_shm_name) {
-    auto *wt = get_worker_by_index(WorkerType::NEXT_LEVEL, worker_id);
+    auto *wt = get_worker_by_id(WorkerType::NEXT_LEVEL, worker_id);
     if (wt == nullptr) {
         throw std::runtime_error("control_comm_init: invalid worker_id " + std::to_string(worker_id));
     }
@@ -1016,15 +1016,15 @@ void WorkerManager::control_comm_init(int worker_id, const char *request_shm_nam
 ControlResult WorkerManager::control_digest_only(
     WorkerType type, int worker_id, uint64_t sub_cmd, const uint8_t *digest, double timeout_s
 ) {
-    auto &threads = (type == WorkerType::NEXT_LEVEL) ? next_level_threads_ : sub_threads_;
     const char *type_name = (type == WorkerType::NEXT_LEVEL) ? "NEXT_LEVEL" : "SUB";
     ControlResult result{type_name, static_cast<int32_t>(worker_id), false, ""};
-    if (worker_id < 0 || static_cast<size_t>(worker_id) >= threads.size()) {
+    WorkerThread *wt = get_worker_by_id(type, worker_id);
+    if (wt == nullptr) {
         result.error_message = "invalid worker_id " + std::to_string(worker_id);
         return result;
     }
     try {
-        threads[static_cast<size_t>(worker_id)]->control_generic(sub_cmd, nullptr, 0, timeout_s, digest);
+        wt->control_generic(sub_cmd, nullptr, 0, timeout_s, digest);
         result.ok = true;
     } catch (const std::exception &e) {
         result.error_message = strip_control_prefix(e.what(), "control_generic");
@@ -1179,7 +1179,7 @@ WorkerManager::broadcast_register_all(const void *blob_ptr, size_t blob_size, co
     std::vector<ControlResult> results;
     results.reserve(next_level_threads_.size());
     for (size_t i = 0; i < next_level_threads_.size(); ++i) {
-        results.push_back(ControlResult{"NEXT_LEVEL", static_cast<int32_t>(i), true, ""});
+        results.push_back(ControlResult{"NEXT_LEVEL", next_level_threads_[i]->worker_id(), true, ""});
     }
     if (next_level_threads_.empty()) return results;
 
@@ -1213,7 +1213,7 @@ WorkerManager::broadcast_register_all(const void *blob_ptr, size_t blob_size, co
     for (auto &result : results) {
         if (!result.ok && result.error_message.find("hash=") == std::string::npos) {
             result.error_message = "Worker.register(hash=" + hash + ") failed on next_level " +
-                                   std::to_string(result.worker_index) + ": " + result.error_message;
+                                   std::to_string(result.worker_id) + ": " + result.error_message;
         }
     }
     return results;
@@ -1232,7 +1232,8 @@ std::vector<std::string> WorkerManager::broadcast_unregister_all(const uint8_t *
                 next_level_threads_[i]->control_unregister(digest);
             } catch (const std::exception &e) {
                 std::string msg = strip_control_prefix(e.what(), "control_unregister");
-                per_worker[i] = std::string("next_level ") + std::to_string(i) + ": " + msg;
+                per_worker[i] = std::string("next_level worker_id ") +
+                                std::to_string(next_level_threads_[i]->worker_id()) + ": " + msg;
             }
         });
     }
@@ -1254,7 +1255,7 @@ std::vector<ControlResult> WorkerManager::broadcast_control_all(
     std::vector<ControlResult> results;
     results.reserve(threads.size());
     for (size_t i = 0; i < threads.size(); ++i) {
-        results.push_back(ControlResult{type_name, static_cast<int32_t>(i), true, ""});
+        results.push_back(ControlResult{type_name, threads[i]->worker_id(), true, ""});
     }
     if (threads.empty()) return results;
 

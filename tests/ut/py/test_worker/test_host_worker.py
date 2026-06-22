@@ -107,9 +107,9 @@ def _slot_for(worker: Worker, handle: CallableHandle) -> int:
 
 
 class _FakeControlResult:
-    def __init__(self, worker_type: str, worker_index: int = 0, ok: bool = True, error_message: str = ""):
+    def __init__(self, worker_type: str, worker_id: int = 0, ok: bool = True, error_message: str = ""):
         self.worker_type = worker_type
-        self.worker_index = worker_index
+        self.worker_id = worker_id
         self.ok = ok
         self.error_message = error_message
 
@@ -1153,7 +1153,7 @@ class TestLifecycle:
 
             for result in (register_results[0], unregister_results[0]):
                 assert isinstance(result.worker_type, str)
-                assert isinstance(result.worker_index, int)
+                assert isinstance(result.worker_id, int)
                 assert isinstance(result.ok, bool)
                 assert isinstance(result.error_message, str)
             assert not register_results[0].ok
@@ -1219,9 +1219,9 @@ class TestLifecycle:
                     return [_FakeControlResult("NEXT_LEVEL", 0, True), _FakeControlResult("NEXT_LEVEL", 1, True)]
                 return [_FakeControlResult("NEXT_LEVEL", 0, True), _FakeControlResult("NEXT_LEVEL", 1, False, "boom")]
 
-            def control_digest_only(self, worker_type, worker_index, sub_cmd, digest, timeout_s=None):
-                calls.append(("cleanup_one", worker_type, worker_index, sub_cmd, digest))
-                return _FakeControlResult("NEXT_LEVEL", worker_index, True)
+            def control_digest_only(self, worker_type, worker_id, sub_cmd, digest, timeout_s=None):
+                calls.append(("cleanup_one", worker_type, worker_id, sub_cmd, digest))
+                return _FakeControlResult("NEXT_LEVEL", worker_id, True)
 
         hw = Worker(level=3, num_sub_workers=1)
         hw._initialized = True

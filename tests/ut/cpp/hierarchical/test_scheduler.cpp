@@ -210,7 +210,8 @@ private:
 
 class FakeEndpoint final : public WorkerEndpoint {
 public:
-    explicit FakeEndpoint(int32_t worker_id) {
+    explicit FakeEndpoint(int32_t worker_id, std::atomic<int> *prepare_count = nullptr) :
+        prepare_count_(prepare_count) {
         caps_.kind = WorkerEndpointKind::REMOTE_L3;
         caps_.worker_id = worker_id;
         caps_.remote = true;
@@ -228,8 +229,13 @@ public:
         return completion;
     }
 
+    void control_prepare(const uint8_t *) override {
+        if (prepare_count_ != nullptr) prepare_count_->fetch_add(1, std::memory_order_relaxed);
+    }
+
 private:
     WorkerEndpointCaps caps_;
+    std::atomic<int> *prepare_count_{nullptr};
 };
 
 // ---------------------------------------------------------------------------
@@ -322,7 +328,7 @@ struct SchedulerFixture : public ::testing::Test {
 // Tests
 // ---------------------------------------------------------------------------
 
-TEST(WorkerManagerTest, StartRejectsDuplicateNextLevelEndpointId) {
+TEST(WorkerManagerTest, StartRejectsDuplicateNextLevelWorkerId) {
     alignas(8) std::array<char, MAILBOX_SIZE> mailbox{};
     Ring allocator;
     allocator.init(/*heap_bytes=*/0);
@@ -342,6 +348,26 @@ TEST(WorkerManagerTest, StartRejectsDuplicateNextLevelEndpointId) {
     manager.stop();
     allocator.shutdown();
     EXPECT_TRUE(threw);
+}
+
+TEST(WorkerManagerTest, ControlPrepareUsesStableNextLevelWorkerId) {
+    Ring allocator;
+    allocator.init(/*heap_bytes=*/0);
+    WorkerManager manager;
+    std::atomic<int> worker7_prepares{0};
+    std::atomic<int> worker3_prepares{0};
+
+    manager.add_next_level_endpoint(std::make_unique<FakeEndpoint>(7, &worker7_prepares));
+    manager.add_next_level_endpoint(std::make_unique<FakeEndpoint>(3, &worker3_prepares));
+    manager.start(&allocator, [](WorkerCompletion) {});
+
+    std::array<uint8_t, CALLABLE_HASH_DIGEST_SIZE> digest{};
+    manager.control_prepare(3, digest.data());
+
+    manager.stop();
+    allocator.shutdown();
+    EXPECT_EQ(worker7_prepares.load(std::memory_order_relaxed), 0);
+    EXPECT_EQ(worker3_prepares.load(std::memory_order_relaxed), 1);
 }
 
 TEST_F(SchedulerFixture, IndependentTaskDispatchedAndConsumed) {
@@ -613,7 +639,7 @@ TEST_F(GroupSchedulerFixture, AffinityMustBeInEligibleEndpointSet) {
     EXPECT_THROW((void)orch.submit_next_level(C(56), args, cfg, 0, {1}), std::invalid_argument);
 }
 
-TEST(SchedulerEndpointAffinityTest, NextLevelAffinityUsesEndpointIdNotVectorIndex) {
+TEST(SchedulerWorkerAffinityTest, NextLevelAffinityUsesWorkerIdNotVectorIndex) {
     TensorMap tm;
     Ring allocator;
     Scope scope;

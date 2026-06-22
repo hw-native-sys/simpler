@@ -238,7 +238,7 @@ inline void bind_worker(nb::module_ &m) {
 
     nb::class_<ControlResult>(m, "ControlResult")
         .def_ro("worker_type", &ControlResult::worker_type)
-        .def_ro("worker_index", &ControlResult::worker_index)
+        .def_ro("worker_id", &ControlResult::worker_id)
         .def_ro("ok", &ControlResult::ok)
         .def_ro("error_message", &ControlResult::error_message);
 

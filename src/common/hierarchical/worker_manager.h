@@ -167,7 +167,7 @@ static constexpr ptrdiff_t CTRL_OFF_RESULT = 40;
 
 struct ControlResult {
     std::string worker_type;
-    int32_t worker_index{0};
+    int32_t worker_id{0};
     bool ok{false};
     std::string error_message;
 };
