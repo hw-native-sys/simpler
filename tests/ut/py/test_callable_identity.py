@@ -677,6 +677,53 @@ def test_remote_callable_submit_passes_remote_sidecar_to_cpp_facade():
         worker.close()
 
 
+def test_submit_sub_rejects_remote_tensor_ref_sidecar():
+    class FakeCOrchestrator:
+        def __init__(self):
+            self.called = False
+
+        def submit_sub(self, *args):
+            self.called = True
+
+    handle = CallableHandle("sha256:" + "00" * 32, "PYTHON_IMPORT", "LOCAL_PYTHON")
+    fake = FakeCOrchestrator()
+    orch = Orchestrator(fake)  # type: ignore[arg-type]
+    args = TaskArgs()
+    args.add_tensor(
+        RemoteTensorRef.host_inline(b"abcd", shape=(4,), dtype=DataType.UINT8),
+        TensorArgType.INPUT,
+    )
+
+    with pytest.raises(TypeError, match="RemoteTensorRef.*NEXT_LEVEL"):
+        orch.submit_sub(handle, args)
+
+    assert not fake.called
+
+
+def test_submit_sub_group_rejects_remote_tensor_ref_sidecar():
+    class FakeCOrchestrator:
+        def __init__(self):
+            self.called = False
+
+        def submit_sub_group(self, *args):
+            self.called = True
+
+    handle = CallableHandle("sha256:" + "00" * 32, "PYTHON_IMPORT", "LOCAL_PYTHON")
+    fake = FakeCOrchestrator()
+    orch = Orchestrator(fake)  # type: ignore[arg-type]
+    local_args = TaskArgs()
+    remote_args = TaskArgs()
+    remote_args.add_tensor(
+        RemoteTensorRef.host_inline(b"abcd", shape=(4,), dtype=DataType.UINT8),
+        TensorArgType.INPUT,
+    )
+
+    with pytest.raises(TypeError, match="RemoteTensorRef.*NEXT_LEVEL"):
+        orch.submit_sub_group(handle, [local_args, remote_args])
+
+    assert not fake.called
+
+
 @pytest.mark.parametrize(
     ("tag", "access_flags"),
     [

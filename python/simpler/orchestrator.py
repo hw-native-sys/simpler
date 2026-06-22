@@ -93,6 +93,11 @@ def _split_next_level_args(args: TaskArgs) -> tuple[TaskArgs, object | None]:
     raise TypeError("NEXT_LEVEL submit expects TaskArgs")
 
 
+def _reject_remote_sidecar_args(args: object, *, kind: str) -> None:
+    if isinstance(args, TaskArgs) and _remote_sidecar_for(args) is not None:
+        raise TypeError(f"RemoteTensorRef is only supported for RemoteCallable NEXT_LEVEL submits, not {kind}")
+
+
 def _remote_data_eligible_worker_ids(
     remote_sidecar: object | None,
     callable_worker_ids: tuple[int, ...],
@@ -282,6 +287,7 @@ class Orchestrator:
             worker=self._worker,
             expected_namespace="LOCAL_PYTHON",
         )
+        _reject_remote_sidecar_args(args, kind="orch.submit_sub")
         self._o.submit_sub(digest, kind, target_namespace, args)
 
     def submit_sub_group(self, callable_handle: Any, args_list: list):
@@ -292,6 +298,8 @@ class Orchestrator:
             worker=self._worker,
             expected_namespace="LOCAL_PYTHON",
         )
+        for args in args_list:
+            _reject_remote_sidecar_args(args, kind="orch.submit_sub_group")
         self._o.submit_sub_group(digest, kind, target_namespace, args_list)
 
     # ------------------------------------------------------------------
