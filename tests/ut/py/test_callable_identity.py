@@ -18,6 +18,7 @@ from multiprocessing.shared_memory import SharedMemory
 from typing import cast
 
 import pytest
+import simpler.worker as worker_mod
 from simpler import callable_identity
 from simpler.callable_identity import (
     CallableHandle,
@@ -469,8 +470,6 @@ def test_remote_callable_register_requires_explicit_remote_workers():
 
 
 def test_remote_worker_id_stays_stable_when_local_worker_is_added_later(monkeypatch):
-    import simpler.worker as worker_mod
-
     class FakeCWorker:
         def __init__(self, *args):
             self.remote_worker_ids = []
@@ -1585,8 +1584,6 @@ def test_remote_pending_free_is_retained_when_control_fails():
 
 
 def test_partial_init_failure_cleans_open_remote_session(monkeypatch):
-    import simpler.worker as worker_mod
-
     class FakeCWorker:
         def __init__(self):
             self.closed = False
@@ -1637,8 +1634,6 @@ def test_partial_init_failure_cleans_open_remote_session(monkeypatch):
 
 
 def test_partial_init_failure_closes_unregistered_open_remote_session(monkeypatch):
-    import simpler.worker as worker_mod
-
     class FailingAddCWorker:
         def __init__(self):
             self.closed = False

@@ -10,9 +10,9 @@
 import os
 import socket
 import threading
+from typing import cast
 
 import pytest
-
 from simpler import remote_l3_session, remote_l3_worker
 
 
@@ -201,7 +201,7 @@ def test_health_loop_closes_active_connection_on_stop():
     conn = FakeConn()
     sock = FakeSock(conn)
 
-    remote_l3_session._health_loop(sock, stop, session_id=1, worker_id=0)
+    remote_l3_session._health_loop(cast(socket.socket, sock), stop, session_id=1, worker_id=0)
 
     assert sock.closed
     assert conn.closed

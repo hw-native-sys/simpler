@@ -1475,9 +1475,7 @@ class Worker:
         daemon_host, _daemon_port = self._parse_remote_endpoint(spec.endpoint)
         listen_host = spec.session_listen_host or ("127.0.0.1" if daemon_host == "localhost" else daemon_host)
         if self._is_wildcard_session_host(listen_host) and not spec.allow_wildcard_session_bind:
-            raise ValueError(
-                "RemoteWorkerSpec wildcard session bind requires allow_wildcard_session_bind=True"
-            )
+            raise ValueError("RemoteWorkerSpec wildcard session bind requires allow_wildcard_session_bind=True")
         return {
             "session_id": int(session_id),
             "parent_worker_level": int(self.level),
@@ -2113,7 +2111,9 @@ class Worker:
     def _format_remote_control_exception(worker_id: int, exc: BaseException) -> str:
         return f"NEXT_LEVEL[{int(worker_id)}]: {type(exc).__name__}: {exc}"
 
-    def _post_start_register_remote(self, reg: _CallableRegistration) -> CallableHandle:
+    def _post_start_register_remote(  # noqa: PLR0912 -- two-phase remote register/commit cleanup paths
+        self, reg: _CallableRegistration
+    ) -> CallableHandle:
         assert reg.target_namespace == "REMOTE_TASK_DISPATCHER"
         with self._registry_lock:
             state = self._identity_registry.get(reg.digest)
@@ -2258,9 +2258,7 @@ class Worker:
     @staticmethod
     def _control_errors(results: list[Any]) -> list[str]:
         return [
-            f"{result.worker_type}[{result.worker_id}]: {result.error_message}"
-            for result in results
-            if not result.ok
+            f"{result.worker_type}[{result.worker_id}]: {result.error_message}" for result in results if not result.ok
         ]
 
     def _broadcast_py_control(

@@ -334,12 +334,7 @@ def _validate_export_result_identity(result: ExportBufferResult) -> None:
 
 
 def _validate_import_result_identity(result: ImportBufferResult) -> None:
-    if (
-        result.importer_worker_id < 0
-        or result.owner_worker_id < 0
-        or result.buffer_id == 0
-        or result.generation == 0
-    ):
+    if result.importer_worker_id < 0 or result.owner_worker_id < 0 or result.buffer_id == 0 or result.generation == 0:
         raise ValueError("remote_wire: import result requires live imported buffer identity")
 
 

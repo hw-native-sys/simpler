@@ -50,6 +50,7 @@ from .task_interface import (
     Tensor,
     _empty_remote_sidecar_for,
     _remote_sidecar_for,
+    _RemoteTaskArgsSidecar,
     _validate_remote_sidecar_access,
 )
 
@@ -87,7 +88,7 @@ def _require_handle(
     return callable_or_handle.digest, callable_or_handle.kind, callable_or_handle.target_namespace, ()
 
 
-def _split_next_level_args(args: TaskArgs) -> tuple[TaskArgs, object | None]:
+def _split_next_level_args(args: TaskArgs) -> tuple[TaskArgs, _RemoteTaskArgsSidecar | None]:
     if isinstance(args, TaskArgs):
         return args, _remote_sidecar_for(args)
     raise TypeError("NEXT_LEVEL submit expects TaskArgs")
@@ -99,7 +100,7 @@ def _reject_remote_sidecar_args(args: object, *, kind: str) -> None:
 
 
 def _remote_data_eligible_worker_ids(
-    remote_sidecar: object | None,
+    remote_sidecar: _RemoteTaskArgsSidecar | None,
     callable_worker_ids: tuple[int, ...],
 ) -> list[int]:
     worker_ids = [int(worker_id) for worker_id in callable_worker_ids]
