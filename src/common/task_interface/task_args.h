@@ -200,8 +200,12 @@ struct TaskArgsView {
     const uint64_t *scalars;  // 8-byte aligned by blob construction; safe to address as uint64_t*
 
     // Copy the i-th tensor into a properly-aligned local. Never forms a pointer
-    // into the (possibly under-aligned) tensor_bytes region.
+    // into the (possibly under-aligned) tensor_bytes region. Bounds-checked: a
+    // negative index would otherwise wrap to a huge offset once cast to size_t.
     Tensor tensors(int32_t i) const {
+        if (i < 0 || i >= tensor_count) {
+            throw std::out_of_range("TaskArgsView::tensors: index out of range");
+        }
         Tensor t;
         std::memcpy(&t, tensor_bytes + static_cast<size_t>(i) * sizeof(Tensor), sizeof(Tensor));
         return t;
