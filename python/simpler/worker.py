@@ -2109,6 +2109,10 @@ class Worker:
             raise
         return handle
 
+    @staticmethod
+    def _format_remote_control_exception(worker_id: int, exc: BaseException) -> str:
+        return f"NEXT_LEVEL[{int(worker_id)}]: {type(exc).__name__}: {exc}"
+
     def _post_start_register_remote(self, reg: _CallableRegistration) -> CallableHandle:
         assert reg.target_namespace == "REMOTE_TASK_DISPATCHER"
         with self._registry_lock:
@@ -2123,15 +2127,21 @@ class Worker:
 
         prepared: list[int] = []
         errors: list[str] = []
+        direct_error = False
         payload = reg.payload if reg.payload is not None else b""
         for worker_id in reg.eligible_worker_ids:
-            result = self._worker.remote_prepare_register(
-                worker_id,
-                "REMOTE_TASK_DISPATCHER",
-                reg.kind,
-                payload,
-                reg.digest,
-            )
+            try:
+                result = self._worker.remote_prepare_register(
+                    worker_id,
+                    "REMOTE_TASK_DISPATCHER",
+                    reg.kind,
+                    payload,
+                    reg.digest,
+                )
+            except Exception as exc:  # noqa: BLE001
+                errors.append(self._format_remote_control_exception(worker_id, exc))
+                direct_error = True
+                break
             if result.ok:
                 prepared.append(worker_id)
             else:
@@ -2139,19 +2149,25 @@ class Worker:
                 break
         if errors:
             cleanup_errors = self._remote_abort_prepared(prepared, reg)
-            if cleanup_errors:
+            if cleanup_errors or direct_error:
                 with self._registry_lock:
                     self._uncertain_hashids.add(reg.digest)
             raise RuntimeError(self._format_register_partial_failure(reg.digest, errors, cleanup_errors))
 
         committed: list[int] = []
+        direct_error = False
         for worker_id in reg.eligible_worker_ids:
-            result = self._worker.remote_commit_register(
-                worker_id,
-                "REMOTE_TASK_DISPATCHER",
-                reg.kind,
-                reg.digest,
-            )
+            try:
+                result = self._worker.remote_commit_register(
+                    worker_id,
+                    "REMOTE_TASK_DISPATCHER",
+                    reg.kind,
+                    reg.digest,
+                )
+            except Exception as exc:  # noqa: BLE001
+                errors.append(self._format_remote_control_exception(worker_id, exc))
+                direct_error = True
+                break
             if result.ok:
                 committed.append(worker_id)
             else:
@@ -2162,7 +2178,7 @@ class Worker:
                 [worker_id for worker_id in prepared if worker_id not in committed], reg
             )
             cleanup_errors.extend(self._remote_unregister_committed(committed, reg))
-            if cleanup_errors:
+            if cleanup_errors or direct_error:
                 with self._registry_lock:
                     self._uncertain_hashids.add(reg.digest)
             raise RuntimeError(self._format_register_partial_failure(reg.digest, errors, cleanup_errors))
@@ -2183,12 +2199,16 @@ class Worker:
             return []
         errors: list[str] = []
         for worker_id in worker_ids:
-            result = self._worker.remote_abort_register(
-                worker_id,
-                "REMOTE_TASK_DISPATCHER",
-                reg.kind,
-                reg.digest,
-            )
+            try:
+                result = self._worker.remote_abort_register(
+                    worker_id,
+                    "REMOTE_TASK_DISPATCHER",
+                    reg.kind,
+                    reg.digest,
+                )
+            except Exception as exc:  # noqa: BLE001
+                errors.append(self._format_remote_control_exception(worker_id, exc))
+                continue
             if not result.ok:
                 errors.append(f"{result.worker_type}[{result.worker_id}]: {result.error_message}")
         return errors
@@ -2198,12 +2218,16 @@ class Worker:
             return []
         errors: list[str] = []
         for worker_id in worker_ids:
-            result = self._worker.remote_unregister(
-                worker_id,
-                "REMOTE_TASK_DISPATCHER",
-                reg.kind,
-                reg.digest,
-            )
+            try:
+                result = self._worker.remote_unregister(
+                    worker_id,
+                    "REMOTE_TASK_DISPATCHER",
+                    reg.kind,
+                    reg.digest,
+                )
+            except Exception as exc:  # noqa: BLE001
+                errors.append(self._format_remote_control_exception(worker_id, exc))
+                continue
             if not result.ok:
                 errors.append(f"{result.worker_type}[{result.worker_id}]: {result.error_message}")
         return errors
@@ -2631,12 +2655,16 @@ class Worker:
                 self._start_hierarchical()
                 assert self._worker is not None
                 for worker_id in worker_ids:
-                    result = self._worker.remote_unregister(
-                        worker_id,
-                        "REMOTE_TASK_DISPATCHER",
-                        kind,
-                        digest,
-                    )
+                    try:
+                        result = self._worker.remote_unregister(
+                            worker_id,
+                            "REMOTE_TASK_DISPATCHER",
+                            kind,
+                            digest,
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        errors.append(self._format_remote_control_exception(worker_id, exc))
+                        continue
                     if not result.ok:
                         errors.append(f"{result.worker_type}[{result.worker_id}]: {result.error_message}")
                 if errors:

@@ -113,6 +113,14 @@ def _remote_sum_u8_orch(orch, args, cfg):
     dst_data[0] = sum(int(src_data[i]) for i in range(src.nbytes())) & 0xFF
 
 
+class _FakeRemoteControlResult:
+    def __init__(self, worker_id: int, ok: bool = True, error_message: str = ""):
+        self.worker_type = "NEXT_LEVEL"
+        self.worker_id = worker_id
+        self.ok = ok
+        self.error_message = error_message
+
+
 def _remote_inner_sub_noop(args):
     if args.scalar_count() != 1 or args.scalar(0) != 17:
         raise RuntimeError("inner sub args mismatch")
@@ -1982,6 +1990,72 @@ def test_worker_remote_memory_api_returns_opaque_handle_and_routes_controls():
         assert fake.calls.count(("free", worker_id, 7, 1)) == free_count + 1
     finally:
         worker.close()
+
+
+def test_remote_register_prepare_exception_marks_hash_uncertain():
+    class FailingPrepareWorker:
+        def remote_prepare_register(self, *args):
+            raise RuntimeError("prepare transport failed")
+
+    worker = Worker(level=4, num_sub_workers=0)
+    worker_id = worker.add_remote_worker(RemoteWorkerSpec(endpoint="127.0.0.1:19073", platform="a2a3sim"))
+    worker._initialized = True
+    worker._hierarchical_start_state = "started"
+    worker._worker = FailingPrepareWorker()  # type: ignore[assignment]
+    digest = hashid_to_digest(_REMOTE_NOOP_ORCH_HASHID)
+
+    with pytest.raises(RuntimeError, match="REGISTER_PARTIAL_FAILURE.*prepare transport failed"):
+        worker.register(RemoteCallable(_REMOTE_NOOP_ORCH_TARGET), workers=[worker_id])
+
+    assert digest in worker._uncertain_hashids
+
+
+def test_remote_register_commit_exception_aborts_prepared_and_marks_uncertain():
+    class FailingCommitWorker:
+        def __init__(self):
+            self.aborted = []
+
+        def remote_prepare_register(self, worker_id, *args):
+            return _FakeRemoteControlResult(worker_id)
+
+        def remote_commit_register(self, *args):
+            raise RuntimeError("commit transport failed")
+
+        def remote_abort_register(self, worker_id, *args):
+            self.aborted.append(worker_id)
+            return _FakeRemoteControlResult(worker_id)
+
+    fake = FailingCommitWorker()
+    worker = Worker(level=4, num_sub_workers=0)
+    worker_id = worker.add_remote_worker(RemoteWorkerSpec(endpoint="127.0.0.1:19073", platform="a2a3sim"))
+    worker._initialized = True
+    worker._hierarchical_start_state = "started"
+    worker._worker = fake  # type: ignore[assignment]
+    digest = hashid_to_digest(_REMOTE_NOOP_ORCH_HASHID)
+
+    with pytest.raises(RuntimeError, match="REGISTER_PARTIAL_FAILURE.*commit transport failed"):
+        worker.register(RemoteCallable(_REMOTE_NOOP_ORCH_TARGET), workers=[worker_id])
+
+    assert fake.aborted == [worker_id]
+    assert digest in worker._uncertain_hashids
+
+
+def test_remote_unregister_exception_is_best_effort_and_marks_uncertain():
+    class FailingUnregisterWorker:
+        def remote_unregister(self, *args):
+            raise RuntimeError("unregister transport failed")
+
+    worker = Worker(level=4, num_sub_workers=0)
+    worker_id = worker.add_remote_worker(RemoteWorkerSpec(endpoint="127.0.0.1:19073", platform="a2a3sim"))
+    handle = worker.register(RemoteCallable(_REMOTE_NOOP_ORCH_TARGET), workers=[worker_id])
+    worker._initialized = True
+    worker._hierarchical_start_state = "started"
+    worker._worker = FailingUnregisterWorker()  # type: ignore[assignment]
+
+    worker.unregister(handle)
+
+    assert handle.digest in worker._uncertain_hashids
+    assert handle.digest not in worker._identity_registry
 
 
 def test_callable_handle_public_constructor_returns_unbound_handle():
