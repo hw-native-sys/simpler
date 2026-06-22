@@ -190,13 +190,29 @@ using ChipStorageTaskArgs = TaskArgsTpl<Tensor, uint64_t, CHIP_MAX_TENSOR_ARGS, 
 struct TaskArgsView {
     int32_t tensor_count;
     int32_t scalar_count;
-    const Tensor *tensors;
-    const uint64_t *scalars;
+    // Raw bytes of the tensor array, NOT a `const Tensor*`. When this view is
+    // over a mailbox blob the tensor region starts at an 8-byte boundary, but
+    // `Tensor` is `alignas(64)` — forming a `Tensor*`/`Tensor&` to it would be
+    // undefined behavior. Copy a tensor out with tensors(i); bulk movers
+    // memcpy straight from these bytes. (For the make_view path the bytes are
+    // a 64-aligned vector, but the accessor keeps a single uniform contract.)
+    const uint8_t *tensor_bytes;
+    const uint64_t *scalars;  // 8-byte aligned by blob construction; safe to address as uint64_t*
+
+    // Copy the i-th tensor into a properly-aligned local. Never forms a pointer
+    // into the (possibly under-aligned) tensor_bytes region.
+    Tensor tensors(int32_t i) const {
+        Tensor t;
+        std::memcpy(&t, tensor_bytes + static_cast<size_t>(i) * sizeof(Tensor), sizeof(Tensor));
+        return t;
+    }
 };
 
 // Build a view directly over a TaskArgs's vectors (THREAD-mode dispatch).
 inline TaskArgsView make_view(const TaskArgs &a) {
-    return TaskArgsView{a.tensor_count(), a.scalar_count(), a.tensor_data(), a.scalar_data()};
+    return TaskArgsView{
+        a.tensor_count(), a.scalar_count(), reinterpret_cast<const uint8_t *>(a.tensor_data()), a.scalar_data()
+    };
 }
 
 // ============================================================================
@@ -276,7 +292,7 @@ inline TaskArgsView read_blob(const uint8_t *src, size_t capacity) {
     return TaskArgsView{
         T,
         S,
-        reinterpret_cast<const Tensor *>(src + TASK_ARGS_BLOB_HEADER_SIZE),
+        src + TASK_ARGS_BLOB_HEADER_SIZE,
         reinterpret_cast<const uint64_t *>(src + TASK_ARGS_BLOB_HEADER_SIZE + static_cast<size_t>(T) * sizeof(Tensor)),
     };
 }
@@ -297,7 +313,7 @@ inline ChipStorageTaskArgs view_to_chip_storage(TaskArgsView view) {
     out.tensor_count_ = view.tensor_count;
     out.scalar_count_ = view.scalar_count;
     if (view.tensor_count > 0) {
-        std::memcpy(out.tensors_, view.tensors, static_cast<size_t>(view.tensor_count) * sizeof(Tensor));
+        std::memcpy(out.tensors_, view.tensor_bytes, static_cast<size_t>(view.tensor_count) * sizeof(Tensor));
     }
     if (view.scalar_count > 0) {
         std::memcpy(out.scalars_, view.scalars, static_cast<size_t>(view.scalar_count) * sizeof(uint64_t));

@@ -305,7 +305,7 @@ WorkerCompletion LocalMailboxEndpoint::run(Ring *ring, const WorkerDispatch &dis
     std::memcpy(d + 4, &view.scalar_count, sizeof(int32_t));
     if (view.tensor_count > 0) {
         std::memcpy(
-            d + TASK_ARGS_BLOB_HEADER_SIZE, view.tensors, static_cast<size_t>(view.tensor_count) * sizeof(Tensor)
+            d + TASK_ARGS_BLOB_HEADER_SIZE, view.tensor_bytes, static_cast<size_t>(view.tensor_count) * sizeof(Tensor)
         );
     }
     if (view.scalar_count > 0) {

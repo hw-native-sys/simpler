@@ -223,8 +223,8 @@ TEST_F(OrchestratorFixture, GroupTaskStoresArgsListPerMember) {
     EXPECT_EQ(S(res.task_slot).task_args_list.size(), 2u);
 
     // args_view(i) yields each member's distinct tensor list.
-    EXPECT_EQ(S(res.task_slot).args_view(0).tensors[0].buffer.addr, 0xA0u);
-    EXPECT_EQ(S(res.task_slot).args_view(1).tensors[0].buffer.addr, 0xA1u);
+    EXPECT_EQ(S(res.task_slot).args_view(0).tensors(0).buffer.addr, 0xA0u);
+    EXPECT_EQ(S(res.task_slot).args_view(1).tensors(0).buffer.addr, 0xA1u);
 
     // Both keys registered as producers for the group slot.
     EXPECT_EQ(tm.lookup(TensorKey{0xA0, -1}), res.task_slot);
@@ -238,7 +238,7 @@ TEST_F(OrchestratorFixture, SingleTaskStoresTaskArgsDirectly) {
     EXPECT_FALSE(S(res.task_slot).is_group());
     EXPECT_EQ(S(res.task_slot).group_size(), 1);
     EXPECT_EQ(S(res.task_slot).task_args.tensor_count(), 1);
-    EXPECT_EQ(S(res.task_slot).args_view(0).tensors[0].buffer.addr, 0xC0u);
+    EXPECT_EQ(S(res.task_slot).args_view(0).tensors(0).buffer.addr, 0xC0u);
 }
 
 TEST_F(OrchestratorFixture, OutputAutoAllocsFromHeapRing) {

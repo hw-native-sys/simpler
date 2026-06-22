@@ -77,12 +77,12 @@ TEST(ChildMemory, BlobRoundtripPreservesChildMemory) {
     ASSERT_EQ(view.tensor_count, 2);
     ASSERT_EQ(view.scalar_count, 1);
 
-    EXPECT_EQ(view.tensors[0].child_memory, 0);
-    EXPECT_FALSE(view.tensors[0].is_child_memory());
+    EXPECT_EQ(view.tensors(0).child_memory, 0);
+    EXPECT_FALSE(view.tensors(0).is_child_memory());
 
-    EXPECT_EQ(view.tensors[1].child_memory, 1);
-    EXPECT_TRUE(view.tensors[1].is_child_memory());
-    EXPECT_EQ(view.tensors[1].buffer.addr, 0x2000u);
+    EXPECT_EQ(view.tensors(1).child_memory, 1);
+    EXPECT_TRUE(view.tensors(1).is_child_memory());
+    EXPECT_EQ(view.tensors(1).buffer.addr, 0x2000u);
 }
 
 // ---------------------------------------------------------------------------
@@ -104,7 +104,7 @@ TEST(ChildMemory, ViewToChipStoragePreservesChildMemory) {
     tensors[1].child_memory = 1;
 
     uint64_t scalars[] = {99};
-    TaskArgsView view{2, 1, tensors, scalars};
+    TaskArgsView view{2, 1, reinterpret_cast<const uint8_t *>(tensors), scalars};
 
     ChipStorageTaskArgs chip = view_to_chip_storage(view);
 
