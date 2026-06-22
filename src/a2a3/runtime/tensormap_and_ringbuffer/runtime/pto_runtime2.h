@@ -8,29 +8,6 @@
  * See LICENSE in the root of the software repository for the full text of the License.
  * -----------------------------------------------------------------------------------------------------------
  */
-/**
- * PTO Runtime2 - Main Interface
- *
- * This is the main header for the PTO Runtime2 system.
- * It provides a unified API for task graph construction and execution.
- *
- * Key Features:
- * - Ring buffer based memory management (zero allocation overhead)
- * - Lazy invalidation TensorMap for dependency discovery
- * - Scope-based buffer lifecycle management
- * - Per-task spinlocks for concurrent fanout updates
- * - Orchestrator-Scheduler decoupling via shared memory
- *
- * Usage:
- *   1. Create runtime: PTO2Runtime create methods
- *   2. Build task graph in orchestration function:
- *      - begin_scope() / end_scope()
- *      - submit_task()
- *   3. Mark orchestration complete: mark_done()
- *   4. Destroy runtime
- *
- * Based on: docs/RUNTIME_LOGIC.md
- */
 
 #pragma once
 
@@ -40,33 +17,29 @@
 #include "pto_shared_memory.h"
 #include "pto_ring_buffer.h"
 #include "pto_tensormap.h"
-#include "scheduler/pto_scheduler.h"
+#include "pto_scheduler.h"
 #include "pto_orchestrator.h"
 #include "aicore_completion_mailbox.h"
 
-// =============================================================================
-// Runtime Context
-// =============================================================================
+#include <stdarg.h>
+#include <stdio.h>
+#include <string.h>
+#include "aicpu/device_time.h"
+#include "common/unified_log.h"
 
-/**
- * Runtime execution mode
- */
-enum PTO2RuntimeMode {
+__attribute__((weak, visibility("hidden"))) uint64_t get_sys_cnt_aicpu();
+
+enum PTO2RuntimeMode
+{
     PTO2_MODE_EXECUTE = 0,    // Execute tasks on workers
     PTO2_MODE_SIMULATE = 1,   // Simulate task execution with cycle counting
     PTO2_MODE_GRAPH_ONLY = 2  // Build graph only, no execution
 };
 
-/**
- * Function-pointer ops table for runtime operations.
- *
- * The orchestration .so calls runtime functions through this table
- * (via pto_orchestration_api.h inline wrappers), so it has zero link
- * dependencies on runtime .cpp files.
- */
 typedef struct PTO2Runtime PTO2Runtime;  // forward declare for ops signatures
 
-struct PTO2RuntimeOps {
+struct PTO2RuntimeOps
+{
     TaskOutputTensors (*submit_task)(PTO2Runtime *rt, const MixedKernels &mixed_kernels, const Arg &args);
     void (*scope_begin)(PTO2Runtime *rt);
     void (*scope_end)(PTO2Runtime *rt);
@@ -75,34 +48,20 @@ struct PTO2RuntimeOps {
     void (*report_fatal)(PTO2Runtime *rt, int32_t error_code, const char *func, const char *fmt, ...);
 
     // Logging (populated by runtime, called by orchestration)
-    void (*log_error)(const char *func, const char *fmt, ...);
-    void (*log_warn)(const char *func, const char *fmt, ...);
-    void (*log_debug)(const char *func, const char *fmt, ...);
-    // INFO with explicit verbosity tier (v ∈ [0,9]; gating done inside).
+    // INFO with explicit verbosity tier (v ∈ [0, 9]; gating done inside).
     void (*log_info_v)(const char *func, int v, const char *fmt, ...);
 
     // Cross-layer data access (orchestration reads/writes tensor values via runtime)
     // Placed after logging to avoid shifting hot-path field offsets.
     uint64_t (*get_tensor_data)(PTO2Runtime *rt, const Tensor &tensor, uint32_t ndims, const uint32_t indices[]);
-    void (*set_tensor_data)(
-        PTO2Runtime *rt, const Tensor &tensor, uint32_t ndims, const uint32_t indices[], uint64_t value
-    );
+    void (*set_tensor_data)(PTO2Runtime *rt, const Tensor &tensor, uint32_t ndims, const uint32_t indices[], uint64_t value);
     TaskOutputTensors (*alloc_tensors)(PTO2Runtime *rt, const Arg &args);
     TaskOutputTensors (*submit_dummy_task)(PTO2Runtime *rt, const Arg &args);
-    // Stash the call-site captured by PTO2ScopeGuard into the [ScopeStats]
-    // collector. Always present in the struct to keep ops-table layout stable
-    // across PTO2_PROFILING settings; set to nullptr at PTO2_PROFILING=0.
     void (*scope_set_site)(const char *file, int line);
 };
 
-/**
- * Layout descriptor for the prebuilt runtime arena. Holds all sub-region
- * offsets (orchestrator / scheduler / sm_handle wrapper / runtime header /
- * AICore mailbox) plus the layout-defining capacities. Produced once on the
- * host by runtime_reserve_layout(); consumed by runtime_init_data_from_layout
- * and runtime_wire_arena_pointers.
- */
-struct PTO2RuntimeArenaLayout {
+struct PTO2RuntimeArenaLayout
+{
     size_t off_sm_handle{0};
     PTO2OrchestratorLayout orch;
     PTO2SchedulerLayout sched;
@@ -119,13 +78,8 @@ struct PTO2RuntimeArenaLayout {
     size_t arena_size{0};
 };
 
-/**
- * PTO Runtime2 context
- *
- * Contains all state for orchestration and scheduling.
- * In simulated mode, runs in single process with shared address space.
- */
-struct PTO2Runtime {
+struct PTO2Runtime
+{
     // Ops table (first field — used by orchestration .so via function pointers)
     const PTO2RuntimeOps *ops;
     PTO2ScopeMode pending_scope_mode;
@@ -147,136 +101,304 @@ struct PTO2Runtime {
     // Statistics
     int64_t total_cycles;
 
-    // Prebuilt-arena fast path metadata. Carries every offset
-    // wire_arena_pointers needs at AICPU boot so the AICPU can reconstruct
-    // all arena-internal pointer fields without re-running init_data. The
-    // device base of the runtime arena travels separately on the host-side
-    // Runtime (Runtime::prebuilt_arena_base_), since the AICPU needs it
-    // *before* dereferencing this image. Populated on host by
-    // runtime_init_data_from_layout + runtime_wire_arena_pointers; read by
-    // aicpu_executor.cpp.
     PTO2RuntimeArenaLayout prebuilt_layout;
 };
 
-// =============================================================================
-// Runtime Lifecycle API
-// =============================================================================
+inline PTO2RuntimeArenaLayout runtime_reserve_layout(DeviceArena &arena, uint64_t task_window_size, int32_t dep_pool_capacity)
+{
+    PTO2RuntimeArenaLayout layout{};
+    layout.task_window_size = task_window_size;
+    layout.dep_pool_capacity = dep_pool_capacity;
 
-/**
- * Phase 1 — declare every sub-region (sm_handle wrapper, orchestrator /
- * scheduler / tensor_map / mailbox / PTO2Runtime header) on the supplied
- * arena. Pure arithmetic; does not touch device memory and may run on host.
- * Returns the layout descriptor; caller commits/attaches the arena before
- * Phase 2/3.
- */
-PTO2RuntimeArenaLayout runtime_reserve_layout(
-    DeviceArena &arena, uint64_t task_window_size, int32_t dep_pool_capacity = PTO2_DEP_LIST_POOL_SIZE
-);
+    int32_t task_window_sizes[PTO2_MAX_RING_DEPTH];
+    for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) task_window_sizes[r] = static_cast<int32_t>(task_window_size);
 
-/**
- * Phase 2 — write the data half of the runtime arena: standalone fields,
- * memset'd arena regions, sub-structure initializers, and SM-side device
- * pointers. The arena must already be committed (or attached); writes go
- * into arena.base() + sub-region offsets.
- *
- * `sm_dev_base` / `gm_heap_dev_base` are device addresses; we only store
- * them (never dereference). Safe to run on a host arena that owns a host
- * mirror of the runtime image — the resulting buffer is rtMemcpy-ready.
- *
- * Returns the PTO2Runtime* that sits at layout.off_runtime within the arena.
- * Caller must follow up with runtime_wire_arena_pointers; rt->ops and the
- * AICore-side count fields are left untouched and must be filled by the
- * AICPU at boot.
- */
-PTO2Runtime *runtime_init_data_from_layout(
-    DeviceArena &arena, const PTO2RuntimeArenaLayout &layout, PTO2RuntimeMode mode, void *sm_dev_base, uint64_t sm_size,
-    void *gm_heap_dev_base, uint64_t heap_size
-);
+    layout.off_sm_handle = arena.reserve(sizeof(PTO2SharedMemoryHandle), alignof(PTO2SharedMemoryHandle));
+    layout.orch = PTO2OrchestratorState::reserve_layout(arena, task_window_sizes, dep_pool_capacity);
+    layout.sched = PTO2SchedulerState::reserve_layout(arena, dep_pool_capacity);
+    layout.off_runtime = arena.reserve(sizeof(PTO2Runtime), PTO2_ALIGN_SIZE);
+    layout.off_mailbox = arena.reserve(sizeof(AICoreCompletionMailbox), alignof(AICoreCompletionMailbox));
 
-/**
- * Phase 3 — wire every arena-internal pointer field (rt->sm_handle,
- * rt->aicore_mailbox, orchestrator.{scope_tasks, scope_begins, scheduler,
- * tensor_map.*, rings[].fanin_pool.base}, scheduler.{ready_queues, dep_pool,
- * wiring.queue}) so each holds arena.base() + offset. Idempotent — runs on
- * both host (writing host-mirror addresses) and AICPU (writing device
- * addresses) sides.
- */
-void runtime_wire_arena_pointers(DeviceArena &arena, const PTO2RuntimeArenaLayout &layout, PTO2Runtime *rt);
+    layout.arena_size = arena.total_size();
+    return layout;
+}
 
-/**
- * AICPU-only Phase 4 — fill in the few fields the host could not know at
- * prebuilt-image build time: the ops table (s_runtime_ops is a device-side
- * file-local global, host cannot resolve its device address) and the
- * orchestrator's core counts (depend on the executor's scheduler context).
- * Call once per boot after runtime_wire_arena_pointers.
- */
-void runtime_finalize_after_wire(PTO2Runtime *rt, int32_t aic_count, int32_t aiv_count);
+inline PTO2Runtime *runtime_init_data_from_layout(DeviceArena &arena, const PTO2RuntimeArenaLayout &layout, PTO2RuntimeMode mode, void *sm_dev_base, uint64_t, void *gm_heap_dev_base, uint64_t heap_size)
+{
+    PTO2Runtime *rt = static_cast<PTO2Runtime *>(arena.region_ptr(layout.off_runtime));
+    memset(rt, 0, sizeof(*rt));
 
-/**
- * Destroy runtime. With the prebuilt-arena fast path the arena buffer is
- * pooled across runs by DeviceRunner, so we never call arena.release()
- * here — the destructor only forgets sub-structure pointers (idempotent
- * cleanup).
- */
-void runtime_destroy(PTO2Runtime *rt, DeviceArena &arena);
+    auto *sm_wrap = static_cast<PTO2SharedMemoryHandle *>(arena.region_ptr(layout.off_sm_handle));
+    memset(sm_wrap, 0, sizeof(*sm_wrap));
 
-/**
- * Set execution mode
- */
-void runtime_set_mode(PTO2Runtime *rt, PTO2RuntimeMode mode);
+    // rt->ops is filled by the AICPU at boot.
+    rt->mode = mode;
+    rt->gm_heap = gm_heap_dev_base;
+    rt->gm_heap_size = heap_size > 0 ? heap_size * PTO2_MAX_RING_DEPTH : 0;
+    rt->gm_heap_owned = false;
+    rt->total_cycles = 0;
 
-// =============================================================================
-// Orchestration API (called by orchestration function)
-// =============================================================================
+    if (!rt->orchestrator.init_data_from_layout(layout.orch, arena, sm_dev_base, gm_heap_dev_base, heap_size, layout.task_window_size)) return nullptr;
+    if (!rt->scheduler.init_data_from_layout(layout.sched, arena, sm_dev_base)) return nullptr;
 
-/**
- * Begin a new scope
- *
- * All tasks submitted within this scope will have their lifetime
- * bounded by the scope. When scope_end() is called, the scope
- * releases its reference to all enclosed tasks.
- */
-void rt_scope_begin(PTO2Runtime *rt);
+    auto *mailbox = static_cast<AICoreCompletionMailbox *>(arena.region_ptr(layout.off_mailbox));
+    memset(mailbox, 0, sizeof(*mailbox));
 
-/**
- * End current scope
- *
- * Releases scope reference for all tasks submitted since scope_begin().
- * Tasks whose refcount reaches zero will have their buffers released.
- */
-void rt_scope_end(PTO2Runtime *rt);
+    return rt;
+}
 
-/**
- * Mark orchestration as complete
- *
- * Signals that no more tasks will be submitted.
- */
-void rt_orchestration_done(PTO2Runtime *rt);
+inline void runtime_wire_arena_pointers(DeviceArena &arena, const PTO2RuntimeArenaLayout &layout, PTO2Runtime *rt)
+{
+    rt->sm_handle = static_cast<PTO2SharedMemoryHandle *>(arena.region_ptr(layout.off_sm_handle));
+    rt->aicore_mailbox = static_cast<AICoreCompletionMailbox *>(arena.region_ptr(layout.off_mailbox));
+    rt->orchestrator.wire_arena_pointers(layout.orch, arena, &rt->scheduler);
+    rt->scheduler.wire_arena_pointers(layout.sched, arena);
+}
 
-/**
- * Enter fatal state explicitly from orchestration.
- */
-void rt_report_fatal(PTO2Runtime *rt, int32_t error_code, const char *func, const char *fmt, ...);
+inline void runtime_destroy(PTO2Runtime *rt)
+{
+    // Arena buffer is pooled across runs by DeviceRunner — never freed here.
+    if (!rt) return;
+    rt->scheduler.destroy();
+    rt->orchestrator.destroy();
+    rt->aicore_mailbox = nullptr;
+    rt->sm_handle = nullptr;
+}
 
-/**
- * Cross-layer data access: read a tensor value by waiting for its producer.
- */
-uint64_t get_tensor_data(PTO2Runtime *rt, const Tensor &tensor, uint32_t ndims, const uint32_t indices[]);
+inline void runtime_set_mode(PTO2Runtime *rt, PTO2RuntimeMode mode)
+{
+    if (rt) rt->mode = mode;
+}
 
-/**
- * Cross-layer data access: write a value to a tensor at given indices.
- * Waits for producer completion (WAW) and all consumers (WAR) via TensorMap.
- * See set_tensor_data in pto_orchestration_api.h for full documentation.
- */
-void set_tensor_data(PTO2Runtime *rt, const Tensor &tensor, uint32_t ndims, const uint32_t indices[], uint64_t value);
+inline void rt_scope_begin(PTO2Runtime *rt)
+{
+    PTO2ScopeMode mode = rt->pending_scope_mode;
+    rt->pending_scope_mode = PTO2ScopeMode::AUTO;
+    rt->orchestrator.begin_scope(mode);
+}
 
-/**
- * Slim config struct exported by orchestration .so via aicpu_orchestration_config().
- * Shared definition with pto_orchestration_api.h (same layout, guarded).
- */
+inline void rt_scope_end(PTO2Runtime *rt)
+{
+    rt->orchestrator.end_scope();
+}
+
+inline void rt_orchestration_done(PTO2Runtime *rt)
+{
+    rt->orchestrator.mark_done();
+}
+
+inline void rt_report_fatal(PTO2Runtime *rt, int32_t error_code, const char *func, const char *fmt, ...)
+{
+    va_list args;
+    va_start(args, fmt);
+    if (fmt == nullptr || fmt[0] == '\0')
+    {
+        rt->orchestrator.report_fatal(error_code, func, nullptr);
+    }
+    else
+    {
+        char message[1024];
+        vsnprintf(message, sizeof(message), fmt, args);
+        rt->orchestrator.report_fatal(error_code, func, "%s", message);
+    }
+    va_end(args);
+}
+
+// Orchestration-side logging dispatcher: orchestration .so calls
+// LOG_INFO_V<n>(fmt, ...) which routes through this op into the unified log.
+// The verbosity gate lives inside unified_log_info_v.
+inline void rt_log_info_v(const char *func, int v, const char *fmt, ...)
+{
+    va_list args;
+    va_start(args, fmt);
+    char message[1024];
+    vsnprintf(message, sizeof(message), fmt, args);
+    va_end(args);
+    unified_log_info_v(func, v, "%s", message);
+}
+
+MAYBE_UNINITIALIZED_BEGIN
+inline bool wait_for_tensor_ready(PTO2Runtime *rt, const Tensor &tensor, bool wait_for_consumers, const char *caller)
+{
+    PTO2TaskId owner = tensor.owner_task_id;
+    PTO2OrchestratorState &orch = rt->orchestrator;
+
+    constexpr int kSegmentCap = 64;
+    const PTO2TaskSlotState *seg[kSegmentCap];
+    int seg_count = 0;
+    bool signaled = false;
+    bool failed = false;
+
+    auto wait_one_producer = [&](const PTO2TaskSlotState &slot) {
+        uint8_t ring_id = slot.ring_id;
+        int32_t local_id = static_cast<int32_t>(slot.task->task_id.local());
+        auto &ring_hdr = orch.sm_header->rings[ring_id];
+        const int32_t mask = ring_hdr.task_window_mask;
+        uint64_t t0 = get_sys_cnt_aicpu();
+        int32_t spin_count = 0;
+        // (m) Use completion_flags as the single completion signal.
+        while (ring_hdr.completion_flags[local_id & mask].load(std::memory_order_acquire) == 0)
+        {
+            SPIN_WAIT_HINT();
+            if ((++spin_count & 1023) == 0 && get_sys_cnt_aicpu() - t0 > PTO2_TENSOR_DATA_TIMEOUT_CYCLES)
+            {
+                orch.report_fatal(PTO2_ERROR_TENSOR_WAIT_TIMEOUT, caller, "Timeout (%llu cycles): producer (ring=%d, local=%d) not completed", (unsigned long long)PTO2_TENSOR_DATA_TIMEOUT_CYCLES, ring_id, local_id);
+                failed = true;
+                return;
+            }
+        }
+    };
+
+    auto wait_one_consumers = [&](const PTO2TaskSlotState &slot) {
+        uint8_t ring_id = slot.ring_id;
+        int32_t local_id = slot.task->task_id.local();
+        // With watermark-based reclamation, "all consumers done" means the
+        // per-ring completed_watermark has reached this slot's recorded
+        // last_consumer_local_id.
+        PTO2SharedMemoryRingHeader &ring_hdr = rt->orchestrator.sm_header->rings[ring_id];
+        int32_t target = slot.last_consumer_local_id;
+        uint64_t t0 = get_sys_cnt_aicpu();
+        int32_t spin_count = 0;
+        while (ring_hdr.completed_watermark.load(std::memory_order_acquire) < target)
+        {
+            SPIN_WAIT_HINT();
+            if ((++spin_count & 1023) == 0 && get_sys_cnt_aicpu() - t0 > PTO2_TENSOR_DATA_TIMEOUT_CYCLES)
+            {
+                orch.report_fatal(PTO2_ERROR_TENSOR_WAIT_TIMEOUT, caller, "Timeout (%llu cycles): consumers of producer (ring=%d, local=%d) not done", (unsigned long long)PTO2_TENSOR_DATA_TIMEOUT_CYCLES, ring_id, local_id);
+                failed = true;
+                return;
+            }
+        }
+    };
+
+    auto flush_segment = [&]() {
+        for (int i = 0; i < seg_count; i++)
+        {
+            wait_one_producer(*seg[i]);
+            if (failed) return;
+            if (!wait_for_consumers) continue;
+            wait_one_consumers(*seg[i]);
+            if (failed) return;
+        }
+        seg_count = 0;
+    };
+
+    auto try_push = [&](const PTO2TaskSlotState &s) {
+        for (int j = 0; j < seg_count; j++)
+            if (seg[j] == &s) return;
+        if (seg_count == kSegmentCap)
+        {
+            flush_segment();
+            if (failed) return;
+        }
+        seg[seg_count++] = &s;
+        if (!signaled)
+        {
+            orch.scheduler->wiring.orch_needs_drain.store(true, std::memory_order_release);
+            signaled = true;
+        }
+    };
+
+    auto do_wait = [&]() {
+        if (owner.is_valid())
+        {
+            auto &s = orch.sm_header->rings[owner.ring()].get_slot_state_by_task_id(owner.local());
+            try_push(s);
+            if (failed) return;
+        }
+
+        orch.tensor_map.lookup(tensor, [&](PTO2TensorMapEntry &entry, OverlapStatus) -> bool {
+            PTO2TaskId pid = entry.producer_task_id;
+            auto &s = orch.sm_header->rings[pid.ring()].get_slot_state_by_task_id(pid.local());
+            try_push(s);
+            return !failed;
+        });
+        if (failed) return;
+        flush_segment();
+    };
+
+    do_wait();
+    if (signaled) orch.scheduler->wiring.orch_needs_drain.store(false, std::memory_order_release);
+    return !failed;
+}
+MAYBE_UNINITIALIZED_END
+
+inline uint64_t get_tensor_data(PTO2Runtime *rt, const Tensor &tensor, uint32_t ndims, const uint32_t indices[])
+{
+    if (tensor.buffer.addr == 0) return 0;
+
+    if (!wait_for_tensor_ready(rt, tensor, false, __FUNCTION__)) return 0;
+
+    uint64_t flat_offset = tensor.compute_flat_offset(indices, ndims);
+    uint64_t elem_size = get_element_size(tensor.dtype);
+    const void *ptr = reinterpret_cast<const void *>(tensor.buffer.addr + flat_offset * elem_size);
+    uint64_t result = 0;
+    memcpy(&result, ptr, elem_size);
+    return result;
+}
+
+inline void set_tensor_data(PTO2Runtime *rt, const Tensor &tensor, uint32_t ndims, const uint32_t indices[], uint64_t value)
+{
+    if (tensor.buffer.addr == 0) return;
+
+    // Wait for producer + all consumers before writing (WAW + WAR safety)
+    if (!wait_for_tensor_ready(rt, tensor, true, __FUNCTION__)) return;
+
+    uint64_t flat_offset = tensor.compute_flat_offset(indices, ndims);
+    uint64_t elem_size = get_element_size(tensor.dtype);
+    void *ptr = reinterpret_cast<void *>(tensor.buffer.addr + flat_offset * elem_size);
+    memcpy(ptr, &value, elem_size);
+}
+
+// Function-pointer ops table backing — moved from pto_runtime2.cpp so that
+// the inline runtime_finalize_after_wire above can refer to it.
+
+inline TaskOutputTensors submit_task_impl(PTO2Runtime *rt, const MixedKernels &mixed_kernels, const Arg &args)
+{
+    return rt->orchestrator.submit_task(mixed_kernels, args);
+}
+
+inline TaskOutputTensors alloc_tensors_impl(PTO2Runtime *rt, const Arg &args)
+{
+    return rt->orchestrator.alloc_tensors(args);
+}
+
+inline TaskOutputTensors submit_dummy_task_impl(PTO2Runtime *rt, const Arg &args)
+{
+    return rt->orchestrator.submit_dummy_task(args);
+}
+
+inline bool is_fatal_impl(PTO2Runtime *rt)
+{
+    return rt->orchestrator.fatal;
+}
+
+inline const PTO2RuntimeOps s_runtime_ops = {
+    .submit_task = submit_task_impl,
+    .scope_begin = rt_scope_begin,
+    .scope_end = rt_scope_end,
+    .orchestration_done = rt_orchestration_done,
+    .is_fatal = is_fatal_impl,
+    .report_fatal = rt_report_fatal,
+    .log_info_v = rt_log_info_v,
+    .get_tensor_data = get_tensor_data,
+    .set_tensor_data = set_tensor_data,
+    .alloc_tensors = alloc_tensors_impl,
+    .submit_dummy_task = submit_dummy_task_impl,
+    .scope_set_site = nullptr,
+};
+
+inline void runtime_finalize_after_wire(PTO2Runtime *rt, int32_t aic_count, int32_t aiv_count)
+{
+    rt->ops = &s_runtime_ops;
+    rt->orchestrator.total_cluster_count = aic_count;
+    rt->orchestrator.total_aiv_count = aiv_count;
+}
+
 #ifndef PTO2_ORCHESTRATION_CONFIG_DEFINED
 #define PTO2_ORCHESTRATION_CONFIG_DEFINED
-struct PTO2OrchestrationConfig {
+struct PTO2OrchestrationConfig
+{
     int expected_arg_count;
 };
 #endif

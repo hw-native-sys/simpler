@@ -179,8 +179,9 @@ Each ring's `last_task_alive` advances independently:
 
 ```text
 advance_ring_pointers(ring_id):  // protected by per-ring advance_lock
-    la = ring->fc.last_task_alive
-    while ring->get_slot_state_by_task_id(la).task_state >= CONSUMED:
+    watermark = ring->completed_watermark
+    la = last_task_alive
+    while la <= watermark and watermark >= slot[la].last_consumer_local_id:
         reset slot for reuse
         la++
     sync_to_sm()  // release-store last_task_alive
@@ -235,35 +236,24 @@ AICore uses `last_reg_val` to detect new dispatches — identical values cause s
 | `PTO2_HEAP_SIZE` | 256 MB | 1 GB |
 | `PTO2_DEP_LIST_POOL_SIZE` | 16384 | 65536 |
 
-### 7.2 Runtime Overrides
+### 7.2 Runtime Environment Overrides
 
-Precedence per value: **per-task `CallConfig` field > `PTO2_RING_*` env var
-> compile-time default**. Uniform across all rings of that task's runtime.
-
-Per-task via `CallConfig.runtime_env` — different L2 tasks in one launch can
-each carry their own sizes. Invalid values raise at submit time (`validate()`):
-
-```python
-cfg = CallConfig()
-cfg.runtime_env.ring_task_window = 128   # power of 2, >= 4
-cfg.runtime_env.ring_heap = 262144       # bytes/ring, power of 2, >= 1024
-cfg.runtime_env.ring_dep_pool = 256      # 4 .. INT32_MAX
-orchestrator.submit_next_level(handle, args, cfg)
-```
-
-Scene tests set the same keys under a nested `runtime_env` block in the
-per-case `config` dict:
-
-```python
-"config": {"runtime_env": {"ring_task_window": 128, "ring_heap": 262144, "ring_dep_pool": 256}}
-```
-
-Process-wide env fallback (invalid values are silently ignored):
+Uniform (applies to all rings):
 
 ```bash
 PTO2_RING_TASK_WINDOW=1024
 PTO2_RING_HEAP=1048576
 PTO2_RING_DEP_POOL=1024
+```
+
+In `kernel_config.py`:
+
+```python
+RUNTIME_ENV = {
+    "PTO2_RING_TASK_WINDOW": "128",
+    "PTO2_RING_HEAP": "262144",
+    "PTO2_RING_DEP_POOL": "256",
+}
 ```
 
 ### 7.3 Sizing Guidelines

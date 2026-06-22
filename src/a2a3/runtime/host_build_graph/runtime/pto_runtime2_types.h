@@ -20,7 +20,11 @@
 
 // Tensor dump uses these defaults to size its selective mask table so task-id
 // ring/slot lookup stays aligned with PTO2 task id layout.
+#ifndef PTO2_TASK_WINDOW_SIZE
 #define PTO2_TASK_WINDOW_SIZE 16384  // Default per-ring task window size (power of 2)
+#endif
+#ifndef PTO2_MAX_RING_DEPTH
 #define PTO2_MAX_RING_DEPTH 4        // Number of task-id ring layers
+#endif
 
 #endif  // SRC_A2A3_RUNTIME_HOST_BUILD_GRAPH_RUNTIME_PTO_RUNTIME2_TYPES_H_

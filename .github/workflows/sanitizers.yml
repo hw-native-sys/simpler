@@ -11,8 +11,8 @@ name: Sanitizers
 # parallelism-limited subset to dodge the sim-oversubscription livelock; see the
 # run step. detect_leaks=0 until LSan suppressions exist for the device arenas.
 on:
-  schedule:
-    - cron: "0 18 * * *"  # 02:00 Beijing
+  pull_request:
+    branches: [main]
 
 concurrency:
   group: sanitizers-${{ github.ref }}
