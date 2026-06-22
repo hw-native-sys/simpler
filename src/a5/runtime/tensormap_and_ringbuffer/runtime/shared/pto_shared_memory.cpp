@@ -87,14 +87,27 @@ void PTO2SharedMemoryHandle::setup_pointers(uint64_t task_window_size) {
 bool PTO2SharedMemoryHandle::init(
     void *sm_base_arg, uint64_t sm_size_arg, uint64_t task_window_size, uint64_t heap_size
 ) {
+    uint64_t task_window_sizes[PTO2_MAX_RING_DEPTH];
+    uint64_t heap_sizes[PTO2_MAX_RING_DEPTH];
+    for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
+        task_window_sizes[r] = task_window_size;
+        heap_sizes[r] = heap_size;
+    }
+    return init_per_ring(sm_base_arg, sm_size_arg, task_window_sizes, heap_sizes);
+}
+
+bool PTO2SharedMemoryHandle::init_per_ring(
+    void *sm_base_arg, uint64_t sm_size_arg, const uint64_t task_window_sizes[PTO2_MAX_RING_DEPTH],
+    const uint64_t heap_sizes[PTO2_MAX_RING_DEPTH]
+) {
     if (!sm_base_arg || sm_size_arg == 0) return false;
-    if (sm_size_arg < calculate_size(task_window_size)) return false;
+    if (sm_size_arg < calculate_size_per_ring(task_window_sizes)) return false;
 
     sm_base = sm_base_arg;
     sm_size = sm_size_arg;
     is_owner = false;
-    setup_pointers(task_window_size);
-    init_header(task_window_size, heap_size);
+    setup_pointers_per_ring(task_window_sizes);
+    init_header_per_ring(task_window_sizes, heap_sizes);
     return true;
 }
 

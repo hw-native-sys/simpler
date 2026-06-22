@@ -144,7 +144,7 @@ private:
     using PrepareCallableFn = int (*)(void *, int32_t, const void *);
     using RunPreparedFn = int (*)(
         void *, void *, int32_t, const void *, int, int, int, int, int, int, int, uint64_t, uint64_t, uint64_t,
-        const char *, PtoRunTiming *
+        const uint64_t *, const uint64_t *, const uint64_t *, const char *, PtoRunTiming *
     );
     using UnregisterCallableFn = int (*)(void *, int32_t);
     using GetAicpuDlopenCountFn = size_t (*)(void *);

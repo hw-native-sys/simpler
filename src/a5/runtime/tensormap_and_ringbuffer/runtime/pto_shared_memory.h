@@ -187,6 +187,10 @@ struct PTO2SharedMemoryHandle {
     // init_header. Returns false when `sm_size` is too small for the requested
     // `task_window_size`.
     bool init(void *sm_base, uint64_t sm_size, uint64_t task_window_size, uint64_t heap_size);
+    bool init_per_ring(
+        void *sm_base, uint64_t sm_size, const uint64_t task_window_sizes[PTO2_MAX_RING_DEPTH],
+        const uint64_t heap_sizes[PTO2_MAX_RING_DEPTH]
+    );
 
     void destroy();
     void print_layout();

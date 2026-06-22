@@ -87,24 +87,51 @@ class TestCallConfig:
         assert config.runtime_env.ring_task_window == 0
         assert config.runtime_env.ring_heap == 0
         assert config.runtime_env.ring_dep_pool == 0
+        assert config.runtime_env.ring_task_windows == [0, 0, 0, 0]
+        assert config.runtime_env.ring_heaps == [0, 0, 0, 0]
+        assert config.runtime_env.ring_dep_pools == [0, 0, 0, 0]
         config.runtime_env.ring_task_window = 64
-        config.runtime_env.ring_heap = 4 * 1024 * 1024
+        config.runtime_env.ring_heap = 2621440
         config.runtime_env.ring_dep_pool = 256
+        config.runtime_env.ring_task_windows = [16, 32, 128, 256]
+        config.runtime_env.ring_heaps = [
+            10 * 1024 * 1024,
+            64 * 1024 * 1024,
+            1536 * 1024 * 1024,
+            4 * 1024 * 1024 * 1024,
+        ]
+        config.runtime_env.ring_dep_pools = [64, 128, 256, 512]
         assert config.runtime_env.ring_task_window == 64
-        assert config.runtime_env.ring_heap == 4 * 1024 * 1024
+        assert config.runtime_env.ring_heap == 2621440
         assert config.runtime_env.ring_dep_pool == 256
+        assert config.runtime_env.ring_task_windows == [16, 32, 128, 256]
+        assert config.runtime_env.ring_heaps == [
+            10 * 1024 * 1024,
+            64 * 1024 * 1024,
+            1536 * 1024 * 1024,
+            4 * 1024 * 1024 * 1024,
+        ]
+        assert config.runtime_env.ring_dep_pools == [64, 128, 256, 512]
         config.validate()
         r = repr(config)
         assert "runtime_env.ring_task_window=64" in r
-        assert "runtime_env.ring_heap=4194304" in r
+        assert "runtime_env.ring_heap=2621440" in r
         assert "runtime_env.ring_dep_pool=256" in r
+        assert "runtime_env.ring_task_windows=[16, 32, 128, 256]" in r
 
     def test_runtime_env_whole_object_assignment(self):
         re = RuntimeEnv()
         re.ring_heap = 1024
+        re.ring_heaps = [1024, 2048, 3072, 4096]
         config = CallConfig()
         config.runtime_env = re
         assert config.runtime_env.ring_heap == 1024
+        assert config.runtime_env.ring_heaps == [1024, 2048, 3072, 4096]
+
+    def test_runtime_env_per_ring_length_validation(self):
+        config = CallConfig()
+        with pytest.raises(ValueError):
+            config.runtime_env.ring_task_windows = [16, 32, 64]
 
     @pytest.mark.parametrize(
         ("field", "value"),
@@ -112,7 +139,6 @@ class TestCallConfig:
             ("ring_task_window", 3),  # below min 4
             ("ring_task_window", 48),  # not a power of 2
             ("ring_heap", 512),  # below min 1024
-            ("ring_heap", 2621440),  # not a power of 2
             ("ring_dep_pool", 3),  # below min 4
             ("ring_dep_pool", 2**31),  # above INT32_MAX
         ],
@@ -120,6 +146,22 @@ class TestCallConfig:
     def test_runtime_env_validate_rejects(self, field, value):
         config = CallConfig()
         setattr(config.runtime_env, field, value)
+        with pytest.raises(ValueError):
+            config.validate()
+
+    def test_runtime_env_per_ring_validate_rejects(self):
+        config = CallConfig()
+        config.runtime_env.ring_task_windows = [16, 32, 48, 64]
+        with pytest.raises(ValueError):
+            config.validate()
+
+        config = CallConfig()
+        config.runtime_env.ring_heaps = [1024, 512, 2048, 4096]
+        with pytest.raises(ValueError):
+            config.validate()
+
+        config = CallConfig()
+        config.runtime_env.ring_dep_pools = [4, 8, 2**31, 16]
         with pytest.raises(ValueError):
             config.validate()
 
@@ -293,6 +335,9 @@ class TestMailboxConfigRoundtrip:
         cfg.runtime_env.ring_task_window = 64
         cfg.runtime_env.ring_heap = 4 * 1024 * 1024
         cfg.runtime_env.ring_dep_pool = 256
+        cfg.runtime_env.ring_task_windows = [16, 32, 128, 256]
+        cfg.runtime_env.ring_heaps = [1024, 2048, 4096, 8192]
+        cfg.runtime_env.ring_dep_pools = [64, 128, 256, 512]
         cfg.output_prefix = "/tmp/out"
 
         buf = bytearray(_OFF_CONFIG + _CFG_FMT.size)
@@ -309,6 +354,9 @@ class TestMailboxConfigRoundtrip:
             cfg.runtime_env.ring_task_window,
             cfg.runtime_env.ring_heap,
             cfg.runtime_env.ring_dep_pool,
+            *cfg.runtime_env.ring_task_windows,
+            *cfg.runtime_env.ring_heaps,
+            *cfg.runtime_env.ring_dep_pools,
             cfg.output_prefix.encode(),
         )
 
@@ -323,4 +371,7 @@ class TestMailboxConfigRoundtrip:
         assert decoded.runtime_env.ring_task_window == 64
         assert decoded.runtime_env.ring_heap == 4 * 1024 * 1024
         assert decoded.runtime_env.ring_dep_pool == 256
+        assert decoded.runtime_env.ring_task_windows == [16, 32, 128, 256]
+        assert decoded.runtime_env.ring_heaps == [1024, 2048, 4096, 8192]
+        assert decoded.runtime_env.ring_dep_pools == [64, 128, 256, 512]
         assert decoded.output_prefix == "/tmp/out"

@@ -456,7 +456,7 @@ struct alignas(64) PTO2SpscQueue {
     // orchestrator (push) and scheduler thread 0 (pop_batch), so its base
     // must not false-share with neighboring regions.
     static size_t reserve_layout(DeviceArena &arena, uint64_t capacity) {
-        return arena.reserve(capacity * sizeof(PTO2TaskSlotState *), PTO2_ALIGN_SIZE);
+        return arena.reserve(capacity * sizeof(uintptr_t), PTO2_ALIGN_SIZE);
     }
 
     // Writes everything except the arena-internal `buffer_` pointer field
@@ -557,7 +557,7 @@ struct PTO2SchedulerLayout {
     size_t off_wiring_spsc_buffer;
     uint64_t ready_queue_capacity;
     uint64_t spsc_capacity;
-    int32_t dep_pool_capacity;
+    int32_t dep_pool_capacities[PTO2_MAX_RING_DEPTH];
 };
 
 /**
@@ -1095,6 +1095,8 @@ struct PTO2SchedulerState {
     // Capacities are baked into the returned layout; init_data_from_layout uses
     // the same values.
     static PTO2SchedulerLayout reserve_layout(DeviceArena &arena, int32_t dep_pool_capacity = PTO2_DEP_LIST_POOL_SIZE);
+    static PTO2SchedulerLayout
+    reserve_layout(DeviceArena &arena, const int32_t dep_pool_capacities[PTO2_MAX_RING_DEPTH]);
 
     // Phase 3a: write everything *except* arena-internal pointer fields.
     // `sm_dev_base` is the device address of the SM (only stored, never

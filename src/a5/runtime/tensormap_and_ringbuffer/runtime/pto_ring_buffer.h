@@ -384,7 +384,7 @@ private:
                 "  Increase heap size (current: %" PRIu64 ", recommended: %" PRIu64 ")", heap_size_, heap_size_ * 2
             );
             LOG_ERROR("  Compile-time: PTO2_HEAP_SIZE in pto_runtime2_types.h");
-            LOG_ERROR("  Runtime env:  PTO2_RING_HEAP=<power-of-2 bytes> (e.g. %" PRIu64 ")", heap_size_ * 2);
+            LOG_ERROR("  Runtime env:  PTO2_RING_HEAP=<bytes> (e.g. %" PRIu64 ")", heap_size_ * 2);
         } else {
             LOG_ERROR("  Increase task window size (current: %d, recommended: %d)", window_size_, active_tasks * 2);
             LOG_ERROR("  Compile-time: PTO2_TASK_WINDOW_SIZE in pto_runtime2_types.h");
