@@ -315,7 +315,7 @@ private:
     );
 
     bool enter_drain_mode(PTO2TaskSlotState *slot_state, int32_t block_num);
-    int32_t count_global_available(PTO2ResourceShape shape);
+    int32_t count_global_available(PTO2ResourceShape shape, uint8_t core_mask);
     void drain_worker_dispatch(Runtime *runtime, int32_t block_num);
     void handle_drain_mode(Runtime *runtime, int32_t thread_idx);
 

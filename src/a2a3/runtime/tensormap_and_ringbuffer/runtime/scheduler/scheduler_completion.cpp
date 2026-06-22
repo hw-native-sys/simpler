@@ -464,10 +464,14 @@ bool SchedulerContext::enter_drain_mode(PTO2TaskSlotState *slot_state, int32_t b
 }
 
 // Count total available resources across all scheduler threads for a given shape.
-int32_t SchedulerContext::count_global_available(PTO2ResourceShape shape) {
+int32_t SchedulerContext::count_global_available(PTO2ResourceShape shape, uint8_t core_mask) {
     int32_t total = 0;
     for (int32_t t = 0; t < active_sched_threads_; t++) {
-        total += core_trackers_[t].get_idle_core_offset_states(shape).count();
+        if (shape == PTO2ResourceShape::MIX) {
+            total += core_trackers_[t].count_mix_running_clusters(core_mask);
+        } else {
+            total += core_trackers_[t].get_idle_core_offset_states(shape).count();
+        }
     }
     return total;
 }
@@ -482,10 +486,13 @@ void SchedulerContext::drain_worker_dispatch(int32_t block_num) {
         return;
     }
     PTO2ResourceShape shape = slot_state->active_mask.to_shape();
+    uint8_t core_mask = slot_state->active_mask.core_mask();
 
     for (int32_t t = 0;
          t < active_sched_threads_ && slot_state->next_block_idx.load(std::memory_order_relaxed) < block_num; t++) {
-        auto valid = core_trackers_[t].get_idle_core_offset_states(shape);
+        auto valid = (shape == PTO2ResourceShape::MIX) ?
+                         core_trackers_[t].get_mix_running_cluster_offset_states(core_mask) :
+                         core_trackers_[t].get_idle_core_offset_states(shape);
         int32_t start = slot_state->next_block_idx.load(std::memory_order_relaxed);
         int32_t remaining = slot_state->logical_block_num - start;
         int32_t claim = std::min(valid.count(), remaining);
@@ -595,7 +602,7 @@ void SchedulerContext::handle_drain_mode(int32_t thread_idx) {
         return;
     }
     PTO2ResourceShape shape = slot_state->active_mask.to_shape();
-    int32_t available = count_global_available(shape);
+    int32_t available = count_global_available(shape, slot_state->active_mask.core_mask());
 
     if (available < block_num) {
         // Insufficient resources -- reset drain fields so threads can resume
