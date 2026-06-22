@@ -342,7 +342,7 @@ inline void bind_worker(nb::module_ &m) {
                 return self.alloc(shape, dtype);
             },
             nb::arg("shape"), nb::arg("dtype"),
-            "Allocate an intermediate ContinuousTensor from the orchestrator's MAP_SHARED "
+            "Allocate an intermediate Tensor from the orchestrator's MAP_SHARED "
             "pool (visible to forked child workers). Lifetime: until the next Worker.run() call."
         )
         .def(

@@ -30,6 +30,7 @@
 #include "pto_runtime_c_api.h"
 #include "task_args.h"
 
+#include <dlfcn.h>
 #include <pthread.h>
 
 #include <chrono>
@@ -298,6 +299,11 @@ int prepare_callable(DeviceContextHandle ctx, int32_t callable_id, const void *c
         if (rc != 0) {
             return rc;
         }
+        auto host_dlopen_guard = RAIIScopeGuard([&artifacts]() {
+            if (artifacts.host_dlopen_handle != nullptr) {
+                dlclose(artifacts.host_dlopen_handle);
+            }
+        });
 
         // Re-pack ChildKernelAddr -> std::pair to match the existing
         // register_callable* signature. The named struct only crosses
@@ -312,10 +318,14 @@ int prepare_callable(DeviceContextHandle ctx, int32_t callable_id, const void *c
         // hbg's prepare_callable_impl populates host_dlopen_handle; trb's
         // leaves it null and fills orch_so_data + func_name/config_name.
         if (artifacts.host_dlopen_handle != nullptr) {
-            return runner->register_callable_host_orch(
+            rc = runner->register_callable_host_orch(
                 callable_id, artifacts.host_dlopen_handle, artifacts.host_orch_func_ptr, std::move(kernel_addrs),
                 std::move(artifacts.signature)
             );
+            if (rc == 0) {
+                host_dlopen_guard.dismiss();
+            }
+            return rc;
         }
         return runner->register_callable(
             callable_id, artifacts.orch_so_data, artifacts.orch_so_size, artifacts.func_name.c_str(),

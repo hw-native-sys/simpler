@@ -28,6 +28,10 @@ Compared to mesh ``allreduce_distributed/`` (O(P) full-vector remote reads per
 rank), ring moves one chunk per round.  P=4 is the primary schedule width;
 P=2 is supported for regression.
 
+Scratch layout: P equal chunk slots followed by a 2(P-1) x kMax signal
+matrix (per-round notify/wait barriers).  Peers read directly from
+each other's chunk slots via CommRemotePtr — no separate exchange buffer.
+
 Run:
     python examples/workers/l3/allreduce_ring_distributed/main.py -p a2a3sim -d 0-3
 
@@ -53,10 +57,10 @@ from simpler.task_interface import (  # noqa: E402
     CallConfig,
     ChipCallable,
     CommBufferSpec,
-    ContinuousTensor,
     CoreCallable,
     DataType,
     TaskArgs,
+    Tensor,
     TensorArgType,
 )
 from simpler.worker import Worker  # noqa: E402
@@ -73,19 +77,19 @@ ALLREDUCE_COUNT = 256
 DTYPE_NBYTES = 4  # float32
 K_MAX_SUPPORTED_RANKS = 16
 CHUNK_MAX = ALLREDUCE_COUNT // 2  # largest chunk (P=2)
-# Float region: (nranks+1)*chunk at runtime; SCRATCH_NBYTES sized for max chunk.
-SCRATCH_FLOAT_ELEMS_MAX = (K_MAX_SUPPORTED_RANKS + 1) * CHUNK_MAX
+# Float region: P*chunk at runtime; SCRATCH_NBYTES sized for max chunk (no exchange).
+SCRATCH_FLOAT_ELEMS_MAX = K_MAX_SUPPORTED_RANKS * CHUNK_MAX
 # Signal tail: one int32 row per RS/AG round (2*(P-1) rounds), bounded by kMaxSupportedRanks.
 SIGNAL_TAIL_NBYTES = 2 * (K_MAX_SUPPORTED_RANKS - 1) * K_MAX_SUPPORTED_RANKS * DTYPE_NBYTES
 SCRATCH_NBYTES = SCRATCH_FLOAT_ELEMS_MAX * DTYPE_NBYTES + SIGNAL_TAIL_NBYTES
 
 
 def scratch_float_elems(nranks: int) -> int:
-    """Float slots in the HCCL window for this rank count: P chunk slots + 1 exchange."""
+    """Float slots in the HCCL window for this rank count: P equal chunk slots."""
     if ALLREDUCE_COUNT % nranks != 0:
         raise ValueError(f"ALLREDUCE_COUNT={ALLREDUCE_COUNT} must divide nranks={nranks}")
     chunk = ALLREDUCE_COUNT // nranks
-    return (nranks + 1) * chunk
+    return nranks * chunk
 
 
 def parse_device_range(spec: str) -> list[int]:
@@ -226,7 +230,7 @@ def run(
                     # host tensor — so wrap it manually with child_memory=True
                     # to skip the runtime's H2D path.
                     chip_args.add_tensor(
-                        ContinuousTensor.make(
+                        Tensor.make(
                             data=domain.buffer_ptrs["scratch"],
                             shapes=(float_elems,),
                             dtype=DataType.FLOAT32,

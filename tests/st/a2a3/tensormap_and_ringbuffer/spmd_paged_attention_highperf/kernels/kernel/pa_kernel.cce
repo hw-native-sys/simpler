@@ -84,6 +84,18 @@ __aicore__ inline void FftsCrossCoreSync(uint16_t flagId)
     ffts_cross_core_sync(pipe, config);
 }
 
+inline __aicore__ void DdrBarrierBeforeFfts()
+{
+#if defined(__CCE_KT_TEST__) || defined(__CCE_AICORE__) || defined(__DAV_C220__)
+#if defined(__CPU_SIM)
+    dsb(0);
+#else
+    dsb(DSB_DDR);
+#endif
+    pipe_barrier(PIPE_ALL);
+#endif
+}
+
 constexpr uint32_t PA_L1L0_BLOCK_BYTES = 32;
 constexpr uint32_t PA_GM_ND2NZ_STRIDE_LIMIT = 65536;
 
@@ -184,6 +196,7 @@ constexpr uint32_t VEC_DEQ_K0_READY = 9;
 constexpr uint32_t VEC_DEQ_K1_READY = 10;
 constexpr uint32_t VEC_DEQ_V0_READY = 11;
 constexpr uint32_t VEC_DEQ_V1_READY = 12;
+constexpr int32_t REDUCE_READY_DECODER = 13;
 
 
 constexpr int32_t BLOCK_SIZE = 16;
@@ -1194,6 +1207,8 @@ private:
                     head_split_num_move, cur_head_num_round,split_idx, move_l1b_flag, is_l0b_pingpong_off);
                 ChangePingPongFlag();
             }
+            pipe_barrier(PIPE_FIX);
+            DdrBarrierBeforeFfts();
             FftsCrossCoreSync<PIPE_FIX, 2>(QK_READY_DECODER);
 
             /* ************ CUBE1 stage2  ************* */
@@ -1226,6 +1241,8 @@ private:
                         head_split_num_move, cur_head_num_round, split_idx, move_l1b_flag, is_l0b_pingpong_off);
                     ChangePingPongFlag();
                 }
+                pipe_barrier(PIPE_FIX);
+                DdrBarrierBeforeFfts();
                 FftsCrossCoreSync<PIPE_FIX, 2>(QK_READY_STAGE2);
             }
 
@@ -1259,6 +1276,8 @@ private:
                     split_idx, move_l1b_flag, SOFTMAX_READY_DECODER, is_l0b_pingpong_off);
                 ChangePingPongFlag();
             }
+            pipe_barrier(PIPE_FIX);
+            DdrBarrierBeforeFfts();
             FftsCrossCoreSync<PIPE_FIX, 2>(UPDATE_READY_DECODER);
 
             /* ************ CUBE2 stage2  ************* */
@@ -1293,6 +1312,8 @@ private:
                         split_idx, move_l1b_flag, SOFTMAX_READY_STAGE2, is_l0b_pingpong_off);
                     ChangePingPongFlag();
                 }
+                pipe_barrier(PIPE_FIX);
+                DdrBarrierBeforeFfts();
                 FftsCrossCoreSync<PIPE_FIX, 2>(UPDATE_READY_STAGE2);
             }
         }
@@ -1600,9 +1621,9 @@ public:
         wait_flag(PIPE_V, PIPE_MTE2, EVENT_ID2);
         pipe_barrier(PIPE_ALL);
         if (SplitKV) {
-            int reduce_flag_id = 3;
-            FftsCrossCoreSync<PIPE_MTE3, (uint8_t)0>(reduce_flag_id);
-            wait_flag_dev(3);
+            DdrBarrierBeforeFfts();
+            FftsCrossCoreSync<PIPE_MTE3, (uint8_t)0>(REDUCE_READY_DECODER);
+            wait_flag_dev(REDUCE_READY_DECODER);
             CombineScale(decoder_batch_size_, q_heads, kv_split_core_num, embedding_size);
         }
     }
@@ -2295,7 +2316,7 @@ private:
         }
         pipe_barrier(PIPE_V);
 
-        if (mask_gm != nullptr) {
+        if (max_context_len != 0) {
             wait_flag(PIPE_V, PIPE_MTE2, EVENT_ID0);
             wait_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID0);
             AddMask(mask_gm_tensor, mask_ubuf_tensor, mask32_ubuf_tensor, sub_m, qk_n, qk_round_n, mask_offset);
@@ -2395,7 +2416,7 @@ private:
             0,                        // srcGap
             0                         // dstGap
         );
-        if (mask_gm != nullptr){
+        if (max_context_len != 0){
             set_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID0);
         }
         // *** ll = rowsum(ls32)
@@ -2732,6 +2753,8 @@ private:
                 );
                // input QK shape (sub_m, qk_round_n)
             }
+            pipe_barrier(PIPE_MTE3);
+            DdrBarrierBeforeFfts();
             FftsCrossCoreSync<PIPE_MTE3, 2>(SOFTMAX_READY_DECODER);
             set_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID3);
             wait_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID3);
@@ -2752,6 +2775,8 @@ private:
                     );
 
                 }
+                pipe_barrier(PIPE_MTE3);
+                DdrBarrierBeforeFfts();
                 FftsCrossCoreSync<PIPE_MTE3, 2>(SOFTMAX_READY_STAGE2);
             }
             set_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID3);

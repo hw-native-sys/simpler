@@ -11,7 +11,7 @@ pattern in miniature.
 | ---- | --- | ----------------------------------- |
 | 1 | `orch.malloc(worker_id=0, nbytes)` | Control-plane device-side `malloc` forwarded to chip child via mailbox IPC. |
 | 2 | `orch.copy_to(worker_id=0, dev, host, n)` | Same, for H2D byte copy. |
-| 3 | `ContinuousTensor.make(dev_ptr, ..., child_memory=True)` | Flag the runtime to **skip auto-malloc and skip auto-free** for this tensor — the buffer survives task teardown. |
+| 3 | `Tensor.make(dev_ptr, ..., child_memory=True)` | Flag the runtime to **skip auto-malloc and skip auto-free** for this tensor — the buffer survives task teardown. |
 | 4 | `orch.submit_next_level(...)` × 2 | Both kernel invocations share `w_dev`. The second proves the buffer was **not** freed after the first. |
 
 There is no `orch.free` — the buffer is reclaimed by `DeviceRunner::finalize`

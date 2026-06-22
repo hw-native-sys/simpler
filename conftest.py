@@ -188,6 +188,14 @@ def pytest_addoption(parser):
         help="Enable per-scope peak collection and emit <output_prefix>/scope_stats.jsonl (per-scope ring-fill peaks).",
     )
     parser.addoption(
+        "--enable-swimlane-overhead",
+        action="store_true",
+        default=False,
+        help="Add the 8 Overhead Analysis counter tracks (per-engine "
+        "idle/ready/overhead + system all/has overhead) to the swimlane JSON. "
+        "Requires --enable-l2-swimlane + deps.json (re-run with --enable-dep-gen if absent).",
+    )
+    parser.addoption(
         "--pto-isa-commit",
         action="store",
         default=None,

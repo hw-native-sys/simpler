@@ -84,6 +84,16 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, in
         }
 
         {
+            // receive_time captures the instant DATA_MAIN_BASE returned a new
+            // task_id, BEFORE the ack write. Paired with start_time (captured
+            // after task_ptr resolve) it lets DFX split head_OH into the
+            // AICPU→AICore NoC propagation (dispatch_ts → receive_time,
+            // hardware-bound) and the AICore-local ack + task_ptr resolve
+            // (receive_time → start_time). host_build_graph has no per-task
+            // dcci so the local-setup span is naturally tighter than the
+            // tensormap_and_ringbuffer runtime; the field still records it.
+            uint64_t receive_time = get_sys_cnt_aicore();
+
             uint32_t actual_task_id = task_id;
             write_reg(RegId::COND, MAKE_ACK_VALUE(actual_task_id));
 
@@ -118,7 +128,7 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, in
                 // dispatch token coincide and a single value covers both.
                 l2_swimlane_aicore_record_task(
                     l2_swimlane_head, &l2_swimlane_local, static_cast<uint64_t>(actual_task_id),
-                    static_cast<uint32_t>(actual_task_id), start_time, end_time
+                    static_cast<uint32_t>(actual_task_id), receive_time, start_time, end_time
                 );
             }
 

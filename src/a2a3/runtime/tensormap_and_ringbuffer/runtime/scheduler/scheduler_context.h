@@ -275,7 +275,7 @@ private:
     // cores spare, pre-stage the consumers of any RUNNING flagged producer onto
     // those cores with not_ready=1 (gated). Touches no dependency state — the
     // task is released by the doorbell at its normal ready-pop (Hook 2).
-    int32_t try_speculative_prestage(int32_t thread_idx);
+    int32_t try_speculative_early_dispatch(int32_t thread_idx);
 
     // Stage the already-claimed range [start, start+count) of consumer `c` onto
     // thread_idx's idle (RUNNING slot) then pending (gated-pending, promote-on-FIN)
@@ -351,7 +351,7 @@ private:
     );
 
     bool enter_drain_mode(PTO2TaskSlotState *slot_state, int32_t block_num);
-    int32_t count_global_available(PTO2ResourceShape shape);
+    int32_t count_global_available(PTO2ResourceShape shape, uint8_t core_mask);
     void drain_worker_dispatch(int32_t block_num);
     void handle_drain_mode(int32_t thread_idx);
 

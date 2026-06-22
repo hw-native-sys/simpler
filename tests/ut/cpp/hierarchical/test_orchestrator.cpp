@@ -60,8 +60,8 @@ struct OrchestratorFixture : public ::testing::Test {
     // Helper: build a TaskArgs whose only tensor has the given (data, tag).
     static TaskArgs single_tensor_args(uint64_t data_ptr, TensorArgType tag) {
         TaskArgs a;
-        ContinuousTensor t{};
-        t.data = data_ptr;
+        Tensor t{};
+        t.buffer.addr = data_ptr;
         t.ndims = 1;
         t.shapes[0] = 1;
         t.dtype = DataType::UINT8;
@@ -223,8 +223,8 @@ TEST_F(OrchestratorFixture, GroupTaskStoresArgsListPerMember) {
     EXPECT_EQ(S(res.task_slot).task_args_list.size(), 2u);
 
     // args_view(i) yields each member's distinct tensor list.
-    EXPECT_EQ(S(res.task_slot).args_view(0).tensors[0].data, 0xA0u);
-    EXPECT_EQ(S(res.task_slot).args_view(1).tensors[0].data, 0xA1u);
+    EXPECT_EQ(S(res.task_slot).args_view(0).tensors(0).buffer.addr, 0xA0u);
+    EXPECT_EQ(S(res.task_slot).args_view(1).tensors(0).buffer.addr, 0xA1u);
 
     // Both keys registered as producers for the group slot.
     EXPECT_EQ(tm.lookup(TensorKey{0xA0, -1}), res.task_slot);
@@ -238,7 +238,7 @@ TEST_F(OrchestratorFixture, SingleTaskStoresTaskArgsDirectly) {
     EXPECT_FALSE(S(res.task_slot).is_group());
     EXPECT_EQ(S(res.task_slot).group_size(), 1);
     EXPECT_EQ(S(res.task_slot).task_args.tensor_count(), 1);
-    EXPECT_EQ(S(res.task_slot).args_view(0).tensors[0].data, 0xC0u);
+    EXPECT_EQ(S(res.task_slot).args_view(0).tensors(0).buffer.addr, 0xC0u);
 }
 
 TEST_F(OrchestratorFixture, OutputAutoAllocsFromHeapRing) {
@@ -247,8 +247,8 @@ TEST_F(OrchestratorFixture, OutputAutoAllocsFromHeapRing) {
     // data pointer that falls inside the allocator's mmap'd region, and
     // the TensorMap routes that pointer to the slot.
     TaskArgs args;
-    ContinuousTensor t{};
-    t.data = 0;
+    Tensor t{};
+    t.buffer.addr = 0;
     t.ndims = 1;
     t.shapes[0] = 1024;  // 1024 * 1 byte = 1024, one aligned slab
     t.dtype = DataType::UINT8;
@@ -257,7 +257,7 @@ TEST_F(OrchestratorFixture, OutputAutoAllocsFromHeapRing) {
     auto res = orch.submit_next_level(C(42), args, cfg);
     ASSERT_NE(res.task_slot, INVALID_SLOT);
 
-    uint64_t data = S(res.task_slot).task_args.tensor(0).data;
+    uint64_t data = S(res.task_slot).task_args.tensor(0).buffer.addr;
     ASSERT_NE(data, 0u);
     uintptr_t base = reinterpret_cast<uintptr_t>(allocator.heap_base(0));
     EXPECT_GE(data, base);
@@ -269,8 +269,8 @@ TEST_F(OrchestratorFixture, OutputAutoAllocsFromHeapRing) {
 
 TEST_F(OrchestratorFixture, RemoteOutputSidecarSkipsLocalAutoAllocAndRegistersRemoteKey) {
     TaskArgs args;
-    ContinuousTensor t{};
-    t.data = 0;
+    Tensor t{};
+    t.buffer.addr = 0;
     t.ndims = 1;
     t.shapes[0] = 1024;
     t.dtype = DataType::UINT8;
@@ -288,7 +288,7 @@ TEST_F(OrchestratorFixture, RemoteOutputSidecarSkipsLocalAutoAllocAndRegistersRe
 
     auto res = orch.submit_next_level(C(42), args, cfg, -1, {3}, sidecar);
     ASSERT_NE(res.task_slot, INVALID_SLOT);
-    EXPECT_EQ(S(res.task_slot).task_args.tensor(0).data, 0u);
+    EXPECT_EQ(S(res.task_slot).task_args.tensor(0).buffer.addr, 0u);
 
     TensorKey key = TensorKey::remote_buffer(TensorAddressKind::REMOTE_BUFFER, 3, 9, 2, 64);
     EXPECT_EQ(tm.lookup(key), res.task_slot);
@@ -305,8 +305,8 @@ TEST_F(OrchestratorFixture, RemoteBarePayloadFailsBeforeSlotCommit) {
 
 TEST_F(OrchestratorFixture, RemoteSidecarRejectsNonOwnerEligibleEndpointWithoutImport) {
     TaskArgs args;
-    ContinuousTensor t{};
-    t.data = 0;
+    Tensor t{};
+    t.buffer.addr = 0;
     t.ndims = 1;
     t.shapes[0] = 1;
     t.dtype = DataType::UINT8;
@@ -326,8 +326,8 @@ TEST_F(OrchestratorFixture, RemoteSidecarRejectsNonOwnerEligibleEndpointWithoutI
 
 TEST_F(OrchestratorFixture, RemoteInputSidecarUsesRemoteTensorMapKey) {
     TaskArgs output_args;
-    ContinuousTensor out{};
-    out.data = 0;
+    Tensor out{};
+    out.buffer.addr = 0;
     out.ndims = 1;
     out.shapes[0] = 1;
     out.dtype = DataType::UINT8;
@@ -347,7 +347,7 @@ TEST_F(OrchestratorFixture, RemoteInputSidecarUsesRemoteTensorMapKey) {
     rq.try_pop(ready);
 
     TaskArgs input_args;
-    ContinuousTensor in = out;
+    Tensor in = out;
     input_args.add_tensor(in, TensorArgType::INPUT);
     auto consumer = orch.submit_next_level(C(43), input_args, cfg, -1, {3}, output_sidecar);
 

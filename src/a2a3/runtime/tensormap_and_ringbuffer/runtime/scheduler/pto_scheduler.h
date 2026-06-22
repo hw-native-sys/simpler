@@ -912,7 +912,7 @@ struct PTO2SchedulerState {
     // fanout). When that producer is thread-local (e.g. a 16-block AIV op filling one
     // thread's cores), the other threads never see the consumer and its blocks on
     // their cores can't pre-stage. The first claimer pushes the partially-staged
-    // consumer here; every idle thread's prestage pass pops one, stages a range onto
+    // consumer here; every idle thread's early_dispatch pass pops one, stages a range onto
     // ITS OWN cores (range-claim via next_block_idx), and re-pushes if blocks remain
     // — exactly mirroring how a partially-dispatched SPMD task is re-pushed to the
     // ready queue (scheduler_dispatch: pop -> claim -> re-push). A stale/released
@@ -974,7 +974,7 @@ struct PTO2SchedulerState {
     }
 
     // Collects consumers released via the speculative-doorbell path during a
-    // single on_mixed_task_complete fanout walk, so their dispatch_fanin
+    // single on_task_complete fanout walk, so their dispatch_fanin
     // propagation runs AFTER the walk — never between two siblings' doorbells.
     struct SpecReleaseSink {
         static constexpr int CAP = 32;
@@ -1149,16 +1149,22 @@ struct PTO2SchedulerState {
 
     /**
      * Two-stage completion: second stage.
-     * Called exactly once when all subtasks of a mixed task are done
-     * (i.e., on_subtask_complete returned true).
-     * Handles fanout notification, fanin release, and self-consumption check.
+     * Called exactly once when all subtasks of a task are done (i.e.,
+     * on_subtask_complete returned true). Walks the consumer (fanout) list,
+     * decrements each consumer's fanin, pushes newly-ready ones, and rings
+     * doorbells for speculative hits.
+     *
+     * Non-PROFILING returns the consumer-walk count (= edges traversed). The
+     * Resolve swimlane bar reads it to label the bar with how many successors
+     * actually got resolved. PROFILING returns the richer CompletionStats
+     * whose `fanout_edges` carries the same number.
      */
 #if PTO2_SCHED_PROFILING
     CompletionStats
 #else
-    void
+    uint32_t
 #endif
-    on_mixed_task_complete(
+    on_task_complete(
         PTO2TaskSlotState &slot_state,
 #if PTO2_SCHED_PROFILING
         int thread_idx,
@@ -1168,6 +1174,8 @@ struct PTO2SchedulerState {
     ) {
 #if PTO2_SCHED_PROFILING
         CompletionStats stats = {0, 0, 0, true};
+#else
+        uint32_t consumer_walk_count = 0;
 #endif
 #if PTO2_SCHED_PROFILING
         extern uint64_t g_sched_lock_cycle[], g_sched_fanout_cycle[];
@@ -1202,7 +1210,7 @@ struct PTO2SchedulerState {
         //
         // Safe on silicon: the producer's slot is already COMPLETED here — every
         // SPMD block has FIN'd AND dcci-flushed its output to HBM before
-        // on_mixed_task_complete runs — so a released consumer never reads stale
+        // on_task_complete runs — so a released consumer never reads stale
         // producer output. (Batching used to align the released wave, but pushed
         // every doorbell to the end of the walk, defeating the whole point of
         // speculative early-dispatch: minimal producer-end -> consumer-start.)
@@ -1221,6 +1229,7 @@ struct PTO2SchedulerState {
                 stats.tasks_enqueued++;
             }
 #else
+            consumer_walk_count++;
             release_fanin_and_check_ready(consumer_slot, local_bufs, &rel_sink);
 #endif
             current = current->next;
@@ -1234,6 +1243,8 @@ struct PTO2SchedulerState {
         g_sched_push_wait_cycle[thread_idx] += push_wait;
         PTO2_SCHED_CYCLE_LAP(g_sched_fanout_cycle[thread_idx]);
         return stats;
+#else
+        return consumer_walk_count;
 #endif
     }
 
@@ -1312,7 +1323,7 @@ struct PTO2SchedulerState {
 
 // try_inline_complete_locked: short-circuit NotDeferred completions seen during
 // drain so they don't grow entries[]. Defined here (not in pto_async_wait.h)
-// because PTO2SchedulerState's on_mixed_task_complete signature is only known
+// because PTO2SchedulerState's on_task_complete signature is only known
 // after its full definition above.
 //
 // When the deferred_release_slot_states[] buffer is full, drain it via
@@ -1321,10 +1332,12 @@ struct PTO2SchedulerState {
 // rates don't surface as ASYNC_WAIT_OVERFLOW errors.
 inline bool
 AsyncWaitList::try_inline_complete_locked(AsyncWaitList::DrainCompletionSink &sink, PTO2TaskSlotState &slot_state) {
+    // Return value (CompletionStats / consumer-walk count) discarded:
+    // async-wait drain path has no Resolve swimlane bar attached.
 #if PTO2_SCHED_PROFILING
-    sink.sched->on_mixed_task_complete(slot_state, sink.thread_idx, sink.local_bufs);
+    (void)sink.sched->on_task_complete(slot_state, sink.thread_idx, sink.local_bufs);
 #else
-    sink.sched->on_mixed_task_complete(slot_state, sink.local_bufs);
+    (void)sink.sched->on_task_complete(slot_state, sink.local_bufs);
 #endif
     if (*sink.deferred_release_count >= sink.deferred_release_capacity) {
         while (*sink.deferred_release_count > 0) {
@@ -1401,10 +1414,12 @@ inline AsyncPollResult AsyncWaitList::poll_and_complete(
         }
 
         if (entry.normal_done && entry.waiting_completion_count <= 0) {
+            // Return value (CompletionStats / consumer-walk count) discarded:
+            // deferred-completion drain has no Resolve swimlane bar attached.
 #if PTO2_SCHED_PROFILING
-            sched->on_mixed_task_complete(*entry.slot_state, thread_idx, local_bufs);
+            (void)sched->on_task_complete(*entry.slot_state, thread_idx, local_bufs);
 #else
-            sched->on_mixed_task_complete(*entry.slot_state, local_bufs);
+            (void)sched->on_task_complete(*entry.slot_state, local_bufs);
 #endif
             // Drain deferred_release in place when the buffer fills — same
             // overflow-drain idiom used by complete_slot_task's inline path
@@ -1439,7 +1454,7 @@ inline AsyncPollResult AsyncWaitList::poll_and_complete(
 
 #if PTO2_SCHED_PROFILING
 struct PTO2SchedProfilingData {
-    // Sub-phase cycle breakdown within on_mixed_task_complete
+    // Sub-phase cycle breakdown within on_task_complete
     uint64_t lock_cycle;           // lock_fanout + state store + unlock
     uint64_t fanout_cycle;         // fanout traversal
     uint64_t fanin_cycle;          // fanin traversal

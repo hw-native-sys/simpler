@@ -208,24 +208,21 @@ void SchedulerContext::dispatch_mix_block_to_cluster(
     CoreTracker &tracker = core_trackers_[thread_idx];
     uint8_t cmask = slot_state.active_mask.core_mask();
     if (cmask & PTO2_SUBTASK_MASK_AIC) {
-        bool aic_to_pending = to_pending && !tracker.is_aic_core_idle(cluster_offset);
         dispatch_subtask_to_core(
             runtime, thread_idx, tracker.get_aic_core_offset(cluster_offset), slot_state, PTO2SubtaskSlot::AIC,
-            aic_to_pending, block_idx
+            to_pending, block_idx
         );
     }
     if (cmask & PTO2_SUBTASK_MASK_AIV0) {
-        bool aiv0_to_pending = to_pending && !tracker.is_aiv0_core_idle(cluster_offset);
         dispatch_subtask_to_core(
             runtime, thread_idx, tracker.get_aiv0_core_offset(cluster_offset), slot_state, PTO2SubtaskSlot::AIV0,
-            aiv0_to_pending, block_idx
+            to_pending, block_idx
         );
     }
     if (cmask & PTO2_SUBTASK_MASK_AIV1) {
-        bool aiv1_to_pending = to_pending && !tracker.is_aiv1_core_idle(cluster_offset);
         dispatch_subtask_to_core(
             runtime, thread_idx, tracker.get_aiv1_core_offset(cluster_offset), slot_state, PTO2SubtaskSlot::AIV1,
-            aiv1_to_pending, block_idx
+            to_pending, block_idx
         );
     }
 }
@@ -273,7 +270,8 @@ void SchedulerContext::dispatch_shape(
     if (entered_drain) return;
 
     bool is_pending = (phase == CoreTracker::DispatchPhase::PENDING);
-    auto cores = tracker.get_dispatchable_cores(shape, phase);
+    bool is_mix = (shape == PTO2ResourceShape::MIX);
+    auto cores = is_mix ? tracker.get_cluster_offset_states() : tracker.get_dispatchable_cores(shape, phase);
     if (!cores.has_value()) return;
 
     while (cores.has_value() && !entered_drain) {
@@ -285,13 +283,30 @@ void SchedulerContext::dispatch_shape(
         bool dispatched_any = false;
         for (int bi = 0; bi < got; bi++) {
             PTO2TaskSlotState *slot_state = batch[bi];
+            CoreTracker::BitStates selected_mix_clusters(0ULL);
+
+            if (is_mix) {
+                auto candidates = cores;
+                uint8_t cmask = slot_state->active_mask.core_mask();
+                auto wanted = is_pending ? CoreTracker::MixPlacement::PENDING : CoreTracker::MixPlacement::RUNNING;
+                while (candidates.has_value()) {
+                    int32_t cluster_offset = candidates.pop_first();
+                    if (tracker.classify_mix_cluster(cluster_offset, cmask) == wanted) {
+                        selected_mix_clusters |= CoreTracker::BitStates(1ULL << cluster_offset);
+                    }
+                }
+                if (!selected_mix_clusters.has_value()) {
+                    sched_->ready_queues[static_cast<int32_t>(shape)].push(slot_state);
+                    continue;
+                }
+            }
 
             if (slot_state->active_mask.requires_sync_start()) {
                 if (is_pending) {
                     sched_->ready_queues[static_cast<int32_t>(shape)].push(slot_state);
                     continue;
                 }
-                int32_t available = cores.count();
+                int32_t available = is_mix ? selected_mix_clusters.count() : cores.count();
                 if (available < slot_state->logical_block_num) {
                     if (!enter_drain_mode(slot_state, slot_state->logical_block_num)) {
                         sched_->ready_queues[static_cast<int32_t>(shape)].push(slot_state);
@@ -322,7 +337,8 @@ void SchedulerContext::dispatch_shape(
             // read after the push -- `next_block_idx` may already be advanced
             // by another scheduler that popped the slot.
             int32_t remaining = slot_state->logical_block_num - slot_state->next_block_idx;
-            int32_t claim = std::min(cores.count(), remaining);
+            int32_t available = is_mix ? selected_mix_clusters.count() : cores.count();
+            int32_t claim = std::min(available, remaining);
             int32_t start = slot_state->next_block_idx;
             slot_state->next_block_idx += claim;
 
@@ -331,7 +347,10 @@ void SchedulerContext::dispatch_shape(
             }
 
             for (int32_t b = 0; b < claim; b++) {
-                auto core_offset = cores.pop_first();
+                auto core_offset = is_mix ? selected_mix_clusters.pop_first() : cores.pop_first();
+                if (is_mix) {
+                    cores.clear_bit(core_offset);
+                }
                 dispatch_block(runtime, thread_idx, core_offset, *slot_state, shape, is_pending, start + b);
             }
             made_progress = true;
@@ -343,7 +362,7 @@ void SchedulerContext::dispatch_shape(
         if (!dispatched_any) break;
 
         if (!cores.has_value()) {
-            cores = tracker.get_dispatchable_cores(shape, phase);
+            cores = is_mix ? tracker.get_cluster_offset_states() : tracker.get_dispatchable_cores(shape, phase);
         }
     }
 }
@@ -750,9 +769,9 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
             for (int di = 0; di < dummy_got; di++) {
                 PTO2TaskSlotState &dummy_slot = *dummy_batch[di];
 #if PTO2_SCHED_PROFILING
-                sched_->on_mixed_task_complete(dummy_slot, thread_idx, local_bufs);
+                sched_->on_task_complete(dummy_slot, thread_idx, local_bufs);
 #else
-                sched_->on_mixed_task_complete(dummy_slot, local_bufs);
+                sched_->on_task_complete(dummy_slot, local_bufs);
 #endif
                 // Dummy tasks have no subtasks to retire and no fanout pre-conditions
                 // beyond their own producers; release self-reference so the slot can

@@ -240,8 +240,8 @@ struct PTO2TaskPayload {
             if (args.tag(i) != TensorArgType::OUTPUT) {
                 tensors[i].copy(*args.tensor(i).ptr);
             } else {
-                tensors[i].init_from_create_info(
-                    *args.tensor(i).create_info,
+                init_tensor_from_create_info(
+                    tensors[i], *args.tensor(i).create_info,
                     reinterpret_cast<void *>(reinterpret_cast<char *>(alloc_result.packed_base) + layout.offsets[i]),
                     layout.buffer_sizes[i]
                 );

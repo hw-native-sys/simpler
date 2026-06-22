@@ -39,10 +39,10 @@ from simpler.task_interface import (  # noqa: E402
     ChipCallable,
     ChipDomainContext,
     CommBufferSpec,
-    ContinuousTensor,
     CoreCallable,
     DataType,
     TaskArgs,
+    Tensor,
     TensorArgType,
 )
 from simpler.worker import Worker  # noqa: E402
@@ -155,7 +155,7 @@ def _scratch_buffers() -> list[CommBufferSpec]:
 
 def _add_domain_scratch(args: TaskArgs, domain: ChipDomainContext) -> None:
     args.add_tensor(
-        ContinuousTensor.make(
+        Tensor.make(
             data=domain.buffer_ptrs["scratch"],
             shapes=(COUNT,),
             dtype=DataType.FLOAT32,

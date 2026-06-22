@@ -133,10 +133,10 @@ _OFF_CONFIG = 16
 # ChipWorker.init(log_level, log_info_v) — not on per-task wire.
 _CFG_FMT = struct.Struct("=iiiiiiiQQQ1024s")
 # Args region starts after CONFIG, rounded up to 8 bytes so the first
-# ContinuousTensor.data (uint64_t at OFF_ARGS+8) is 8-byte aligned, avoiding
+# Tensor.data (uint64_t at OFF_ARGS+8) is 8-byte aligned, avoiding
 # SIGBUS on strict-alignment platforms (aarch64 atomics, some ARM cores).
 _OFF_ARGS = (_OFF_CONFIG + _CFG_FMT.size + 7) & ~7
-assert _OFF_ARGS % 8 == 0, "_OFF_ARGS must be 8-aligned for ContinuousTensor.data"
+assert _OFF_ARGS % 8 == 0, "_OFF_ARGS must be 8-aligned for Tensor.data"
 _OFF_TASK_CALLABLE_HASH = _OFF_ARGS
 _OFF_TASK_ARGS_BLOB = _OFF_TASK_CALLABLE_HASH + CALLABLE_HASH_DIGEST_BYTES
 # MAILBOX_ARGS_CAPACITY mirrors the C++ constexpr in worker_manager.h so the
@@ -568,7 +568,7 @@ def _read_args_from_mailbox(buf) -> TaskArgs:
     to C++ run use the zero-copy `run_prepared_from_blob` path
     instead — see those loops for the matching comment.
 
-    Delegates to the nanobind helper so the ContinuousTensor layout is
+    Delegates to the nanobind helper so the Tensor layout is
     parsed by C++ `read_blob` (single source of truth) instead of being
     reimplemented in Python.  The Python re-implementation that lived
     here previously dropped the `child_memory` byte (offset 33), which

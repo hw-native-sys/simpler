@@ -124,9 +124,9 @@ void SchedulerContext::complete_slot_task(
         }
     }
 
-    bool mixed_complete = sched_->on_subtask_complete(slot_state);
+    bool task_complete = sched_->on_subtask_complete(slot_state);
 
-    if (mixed_complete && slot_state.payload != nullptr &&
+    if (task_complete && slot_state.payload != nullptr &&
         slot_state.any_subtask_deferred.load(std::memory_order_acquire)) {
         while (!mailbox->try_push_normal_done(slot_state.task->task_id, reinterpret_cast<uint64_t>(&slot_state))) {
             sched_->async_wait_list.mpsc_skipped_count.fetch_add(1, std::memory_order_relaxed);
@@ -135,7 +135,7 @@ void SchedulerContext::complete_slot_task(
         defer_completion_to_consumer = true;
     }
 
-    if (mixed_complete && !defer_completion_to_consumer) {
+    if (task_complete && !defer_completion_to_consumer) {
 #if PTO2_PROFILING
         if (is_dump_args_enabled()) {
             dump_args_for_task<PTO2_SUBTASK_SLOT_COUNT>(
@@ -153,9 +153,9 @@ void SchedulerContext::complete_slot_task(
         // SCHED_PROFILING variant takes thread_idx for its per-thread atomic
         // counter side-effects (g_sched_*_atomic_count[thread_idx], consumed
         // by the otc_* log lines). Its return value is unused.
-        (void)sched_->on_mixed_task_complete(slot_state, thread_idx, local_bufs);
+        (void)sched_->on_task_complete(slot_state, thread_idx, local_bufs);
 #else
-        sched_->on_mixed_task_complete(slot_state, local_bufs);
+        sched_->on_task_complete(slot_state, local_bufs);
 #endif
 #if PTO2_PROFILING
         l2_swimlane.phase_complete_count++;
@@ -380,10 +380,14 @@ bool SchedulerContext::enter_drain_mode(PTO2TaskSlotState *slot_state, int32_t b
 }
 
 // Count total available resources across all scheduler threads for a given shape.
-int32_t SchedulerContext::count_global_available(PTO2ResourceShape shape) {
+int32_t SchedulerContext::count_global_available(PTO2ResourceShape shape, uint8_t core_mask) {
     int32_t total = 0;
     for (int32_t t = 0; t < active_sched_threads_; t++) {
-        total += core_trackers_[t].get_idle_core_offset_states(shape).count();
+        if (shape == PTO2ResourceShape::MIX) {
+            total += core_trackers_[t].count_mix_running_clusters(core_mask);
+        } else {
+            total += core_trackers_[t].get_idle_core_offset_states(shape).count();
+        }
     }
     return total;
 }
@@ -398,9 +402,12 @@ void SchedulerContext::drain_worker_dispatch(Runtime *runtime, int32_t block_num
         return;
     }
     PTO2ResourceShape shape = slot_state->active_mask.to_shape();
+    uint8_t core_mask = slot_state->active_mask.core_mask();
 
     for (int32_t t = 0; t < active_sched_threads_ && slot_state->next_block_idx < block_num; t++) {
-        auto valid = core_trackers_[t].get_idle_core_offset_states(shape);
+        auto valid = (shape == PTO2ResourceShape::MIX) ?
+                         core_trackers_[t].get_mix_running_cluster_offset_states(core_mask) :
+                         core_trackers_[t].get_idle_core_offset_states(shape);
         while (valid.has_value() && slot_state->next_block_idx < block_num) {
             dispatch_block(runtime, t, valid.pop_first(), *slot_state, shape, false, slot_state->next_block_idx);
             slot_state->next_block_idx++;
@@ -492,7 +499,7 @@ void SchedulerContext::handle_drain_mode(Runtime *runtime, int32_t thread_idx) {
         return;
     }
     PTO2ResourceShape shape = slot_state->active_mask.to_shape();
-    int32_t available = count_global_available(shape);
+    int32_t available = count_global_available(shape, slot_state->active_mask.core_mask());
 
     if (available < block_num) {
         // Insufficient resources -- reset drain fields so threads can resume

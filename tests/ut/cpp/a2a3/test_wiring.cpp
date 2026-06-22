@@ -13,7 +13,7 @@
  *
  * 1. wire_task()         — fanout wiring, early-finished detection,
  *                          fanin_count initialization, ready push
- * 2. on_mixed_task_complete() — COMPLETED transition, fanout traversal,
+ * 2. on_task_complete() — COMPLETED transition, fanout traversal,
  *                               consumer fanin release
  * 3. on_task_release()   — fanin traversal, producer release,
  *                          self-CONSUMED check
@@ -241,7 +241,7 @@ TEST_F(WiringTest, WireTaskMixedProducerStates) {
 }
 
 // =============================================================================
-// on_mixed_task_complete: notifies consumers via fanout chain
+// on_task_complete: notifies consumers via fanout chain
 // =============================================================================
 
 TEST_F(WiringTest, OnMixedTaskCompleteNotifiesConsumers) {
@@ -274,7 +274,7 @@ TEST_F(WiringTest, OnMixedTaskCompleteNotifiesConsumers) {
     dep_entries[1].next = &dep_entries[0];
     producer.fanout_head = &dep_entries[1];
 
-    sched.on_mixed_task_complete(producer);
+    sched.on_task_complete(producer);
 
     // Producer should be COMPLETED
     EXPECT_EQ(producer.task_state.load(), PTO2_TASK_COMPLETED);
