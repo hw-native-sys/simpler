@@ -288,16 +288,26 @@ class RemoteWorkerSpec:
     device_ids: tuple[int, ...] = ()
     num_sub_workers: int = 0
     transport: str = "sim"
+    session_listen_host: str | None = None
+    allow_wildcard_session_bind: bool = False
 
     def __post_init__(self) -> None:
         if not self.endpoint:
             raise ValueError("RemoteWorkerSpec.endpoint must be non-empty")
         if not self.platform:
             raise ValueError("RemoteWorkerSpec.platform must be non-empty")
+        if self.session_listen_host is not None and not self.session_listen_host:
+            raise ValueError("RemoteWorkerSpec.session_listen_host must be non-empty when set")
         object.__setattr__(self, "endpoint", str(self.endpoint))
         object.__setattr__(self, "platform", str(self.platform))
         object.__setattr__(self, "runtime", str(self.runtime))
         object.__setattr__(self, "transport", str(self.transport))
+        object.__setattr__(
+            self,
+            "session_listen_host",
+            None if self.session_listen_host is None else str(self.session_listen_host),
+        )
+        object.__setattr__(self, "allow_wildcard_session_bind", bool(self.allow_wildcard_session_bind))
         object.__setattr__(self, "device_ids", tuple(int(x) for x in self.device_ids))
         object.__setattr__(self, "num_sub_workers", int(self.num_sub_workers))
         if self.num_sub_workers < 0:
@@ -1407,6 +1417,10 @@ class Worker:
         return host, port
 
     @staticmethod
+    def _is_wildcard_session_host(host: str) -> bool:
+        return host in ("0.0.0.0", "::")
+
+    @staticmethod
     def _send_remote_daemon_json(sock: socket.socket, payload: dict[str, Any]) -> None:
         data = json.dumps(payload, sort_keys=True).encode("utf-8")
         sock.sendall(struct.pack("<I", len(data)) + data)
@@ -1453,7 +1467,11 @@ class Worker:
 
     def _build_remote_manifest(self, *, spec: RemoteWorkerSpec, worker_id: int, session_id: int) -> dict[str, Any]:
         daemon_host, _daemon_port = self._parse_remote_endpoint(spec.endpoint)
-        loopback = daemon_host in ("127.0.0.1", "localhost", "::1")
+        listen_host = spec.session_listen_host or ("127.0.0.1" if daemon_host == "localhost" else daemon_host)
+        if self._is_wildcard_session_host(listen_host) and not spec.allow_wildcard_session_bind:
+            raise ValueError(
+                "RemoteWorkerSpec wildcard session bind requires allow_wildcard_session_bind=True"
+            )
         return {
             "session_id": int(session_id),
             "parent_worker_level": int(self.level),
@@ -1465,7 +1483,7 @@ class Worker:
             "num_sub_workers": int(spec.num_sub_workers),
             "heap_ring_size": self._config.get("remote_heap_ring_size", None),
             "transport": spec.transport,
-            "listen_host": "127.0.0.1" if loopback else "0.0.0.0",
+            "listen_host": listen_host,
             "connect_host": daemon_host,
             "remote_task_dispatcher": self._remote_dispatcher_entries_for_worker(worker_id),
             "inner_l3_worker": [],

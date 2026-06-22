@@ -514,6 +514,55 @@ def test_remote_worker_id_stays_stable_when_local_worker_is_added_later(monkeypa
         worker.close()
 
 
+def test_remote_session_manifest_uses_endpoint_host_as_default_bind():
+    worker = Worker(level=4, num_sub_workers=0)
+    try:
+        loopback = worker._build_remote_manifest(
+            spec=RemoteWorkerSpec(endpoint="127.0.0.1:19073", platform="a2a3sim"),
+            worker_id=0,
+            session_id=1,
+        )
+        assert loopback["listen_host"] == "127.0.0.1"
+        assert loopback["connect_host"] == "127.0.0.1"
+
+        remote = worker._build_remote_manifest(
+            spec=RemoteWorkerSpec(endpoint="10.0.0.8:19073", platform="a2a3sim"),
+            worker_id=0,
+            session_id=1,
+        )
+        assert remote["listen_host"] == "10.0.0.8"
+        assert remote["connect_host"] == "10.0.0.8"
+    finally:
+        worker.close()
+
+
+def test_remote_session_manifest_requires_wildcard_bind_opt_in():
+    worker = Worker(level=4, num_sub_workers=0)
+    try:
+        spec = RemoteWorkerSpec(
+            endpoint="10.0.0.8:19073",
+            platform="a2a3sim",
+            session_listen_host="0.0.0.0",
+        )
+        with pytest.raises(ValueError, match="wildcard session bind"):
+            worker._build_remote_manifest(spec=spec, worker_id=0, session_id=1)
+
+        opted_in = worker._build_remote_manifest(
+            spec=RemoteWorkerSpec(
+                endpoint="10.0.0.8:19073",
+                platform="a2a3sim",
+                session_listen_host="0.0.0.0",
+                allow_wildcard_session_bind=True,
+            ),
+            worker_id=0,
+            session_id=1,
+        )
+        assert opted_in["listen_host"] == "0.0.0.0"
+        assert opted_in["connect_host"] == "10.0.0.8"
+    finally:
+        worker.close()
+
+
 def test_remote_submit_worker_affinity_uses_stable_worker_id_after_mixed_add_order():
     class FakeCOrchestrator:
         def submit_next_level(self, *args):
