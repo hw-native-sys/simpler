@@ -28,6 +28,7 @@
 #include "prepare_callable_common.h"
 #include "task_args.h"
 
+#include <dlfcn.h>
 #include <pthread.h>
 
 #include <chrono>
@@ -266,6 +267,11 @@ int prepare_callable(DeviceContextHandle ctx, int32_t callable_id, const void *c
             pthread_setspecific(g_runner_key, nullptr);
             return rc;
         }
+        auto host_dlopen_guard = RAIIScopeGuard([&artifacts]() {
+            if (artifacts.host_dlopen_handle != nullptr) {
+                dlclose(artifacts.host_dlopen_handle);
+            }
+        });
 
         std::vector<std::pair<int, uint64_t>> kernel_addrs;
         kernel_addrs.reserve(artifacts.kernel_addrs.size());
@@ -278,6 +284,9 @@ int prepare_callable(DeviceContextHandle ctx, int32_t callable_id, const void *c
                 callable_id, artifacts.host_dlopen_handle, artifacts.host_orch_func_ptr, std::move(kernel_addrs),
                 std::move(artifacts.signature)
             );
+            if (rc == 0) {
+                host_dlopen_guard.dismiss();
+            }
         } else {
             rc = runner->register_callable(
                 callable_id, artifacts.orch_so_data, artifacts.orch_so_size, artifacts.func_name.c_str(),
