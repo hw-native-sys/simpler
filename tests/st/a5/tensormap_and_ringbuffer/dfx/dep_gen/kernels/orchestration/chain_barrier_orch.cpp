@@ -42,17 +42,16 @@ static constexpr int32_t MAX_PRODUCERS = 500;
 
 extern "C" {
 
-__attribute__((visibility("default"))) PTO2OrchestrationConfig
-aicpu_orchestration_config(const ChipStorageTaskArgs &orch_args) {
+__attribute__((visibility("default"))) PTO2OrchestrationConfig aicpu_orchestration_config(const L2TaskArgs &orch_args) {
     (void)orch_args;
     return PTO2OrchestrationConfig{
         .expected_arg_count = 3,  // X, Y, scalar(N)
     };
 }
 
-__attribute__((visibility("default"))) void aicpu_orchestration_entry(const ChipStorageTaskArgs &orch_args) {
-    Tensor ext_X = from_tensor_arg(orch_args.tensor(0));
-    Tensor ext_Y = from_tensor_arg(orch_args.tensor(1));
+__attribute__((visibility("default"))) void aicpu_orchestration_entry(const L2TaskArgs &orch_args) {
+    const Tensor &ext_X = orch_args.tensor(0).ref();
+    const Tensor &ext_Y = orch_args.tensor(1).ref();
 
     uint64_t n_raw = orch_args.scalar(0);
     int32_t n = static_cast<int32_t>(n_raw);
@@ -67,7 +66,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
     // stays at SENTINEL through all of them — the host only checks the final
     // value, which proves the barrier waited for every producer to finish.
     for (int32_t i = 0; i < n; i++) {
-        Arg args;
+        L0TaskArgs args;
         args.add_inout(ext_X);
         producer_ids[i] = rt_submit_aic_task(FUNC_WRITE_CONST, args).task_id();
     }
@@ -76,14 +75,14 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
     // the dep_gen writer to emit base + overflow chain.
     PTO2TaskId barrier_id;
     {
-        Arg args;
+        L0TaskArgs args;
         args.set_dependencies(producer_ids, n);
         barrier_id = rt_submit_dummy_task(args).task_id();
     }
 
     // Consumer: explicit dep on barrier only, reads X, writes Y.
     {
-        Arg args;
+        L0TaskArgs args;
         PTO2TaskId consumer_deps[] = {barrier_id};
         args.set_dependencies(consumer_deps, 1);
         args.add_input(ext_X);

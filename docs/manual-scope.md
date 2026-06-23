@@ -5,7 +5,7 @@
 Keep manual scope small and explicit:
 
 - same submit API family as AUTO mode
-- explicit task-to-task deps via `Arg.set_dependencies(deps, count)`
+- explicit task-to-task deps via `L0TaskArgs.set_dependencies(deps, count)`
 - publish at submit time, same as AUTO mode
 - support allocation-as-task through `alloc_tensors(...).task_id()`
 
@@ -16,7 +16,7 @@ The v0 design keeps these rules:
 1. `PTO2_SCOPE(PTO2ScopeMode::MANUAL)` opts a scope into manual mode.
 2. `MANUAL` nested inside active `MANUAL` is allowed.
 3. `AUTO` nested inside active `MANUAL` is rejected.
-4. Manual deps are attached before submit through `Arg.set_dependencies(...)`.
+4. Manual deps are attached before submit through `L0TaskArgs.set_dependencies(...)`.
 5. No post-submit `add_dependency(...)` API exists.
 6. `alloc_tensors(...)` remains output-only and returns a task id.
 7. Scope handling stays close to upstream AUTO mode.
@@ -44,7 +44,7 @@ auto out = rt_submit_task(mixed_kernels, args);
 ### Explicit deps
 
 ```cpp
-Arg args;
+L0TaskArgs args;
 args.add_input(tensor);
 PTO2TaskId deps[] = {prev_task_id};
 args.set_dependencies(deps, 1);
@@ -52,7 +52,7 @@ args.set_dependencies(deps, 1);
 
 Rules:
 
-- `set_dependencies(...)` may be called at most once per Arg with `count > 0`;
+- `set_dependencies(...)` may be called at most once per L0TaskArgs with `count > 0`;
   build the full dep set on the caller's stack (or any buffer that outlives the
   submit) and pass `(ptr, count)` in a single call
 - `count == 0` is a valid "set empty" — it clears any previously stored deps,
@@ -85,7 +85,7 @@ the producer that later tasks must explicitly depend on.
 Manual scope v0 is:
 
 - AUTO-style submit and publish
-- plus explicit fanins from `Arg.set_dependencies(...)`
+- plus explicit fanins from `L0TaskArgs.set_dependencies(...)`
 - plus full TensorMap lookup / insert bypass for tasks submitted inside manual
   scope
 
@@ -134,21 +134,21 @@ For a submitted task:
 PTO2_SCOPE(PTO2ScopeMode::MANUAL) {
     auto alloc = alloc_tensors(tmp_ci);
 
-    Arg qk;
+    L0TaskArgs qk;
     qk.add_input(qi, kj);
     qk.add_output(sij_ci);
     PTO2TaskId qk_deps[] = {alloc.task_id()};
     qk.set_dependencies(qk_deps, 1);
     auto qk_out = rt_submit_aic_task(FUNC_QK, qk);
 
-    Arg sf;
+    L0TaskArgs sf;
     sf.add_input(qk_out.get_ref(0));
     sf.add_output(pij_ci, li_ci, mi_ci);
     PTO2TaskId sf_deps[] = {qk_out.task_id()};
     sf.set_dependencies(sf_deps, 1);
     auto sf_out = rt_submit_aiv_task(FUNC_SF, sf);
 
-    Arg up;
+    L0TaskArgs up;
     up.add_input(sf_out.get_ref(1), sf_out.get_ref(2), pv_out.get_ref(0));
     up.add_inout(mi, li, out_view, tmp);
     PTO2TaskId up_deps[] = {sf_out.task_id(), pv_out.task_id()};
@@ -165,7 +165,7 @@ needed on the first iteration:
 ```cpp
 PTO2TaskId prev_update = PTO2TaskId::invalid();
 for (...) {
-    Arg up = ...;
+    L0TaskArgs up = ...;
     PTO2TaskId up_deps[1];
     uint32_t up_dep_count = 0;
     if (prev_update.is_valid()) {
@@ -183,5 +183,5 @@ The a5 port uses the same manual-scope v0 runtime model as a2a3:
 - same `manual_begin_depth` state model
 - same `MANUAL`-inside-`MANUAL` behavior
 - same rejection of `AUTO` inside active `MANUAL`
-- same submit-time explicit dependency model through `Arg.set_dependencies(...)`
+- same submit-time explicit dependency model through `L0TaskArgs.set_dependencies(...)`
 - same submit-time TensorMap bypass for tasks submitted inside manual scope

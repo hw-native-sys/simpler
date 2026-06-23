@@ -54,22 +54,21 @@ static constexpr uint32_t FIFO_DEPTH = 2;
 
 extern "C" {
 
-__attribute__((visibility("default"))) PTO2OrchestrationConfig
-aicpu_orchestration_config(const ChipStorageTaskArgs &orch_args) {
+__attribute__((visibility("default"))) PTO2OrchestrationConfig aicpu_orchestration_config(const L2TaskArgs &orch_args) {
     (void)orch_args;
     return PTO2OrchestrationConfig{
         .expected_arg_count = 7,
     };
 }
 
-__attribute__((visibility("default"))) void aicpu_orchestration_entry(const ChipStorageTaskArgs &orch_args) {
-    uint64_t batch = orch_args.tensor(0).shapes[0];
-    uint64_t num_heads = orch_args.tensor(0).shapes[1];
-    uint64_t head_dim = orch_args.tensor(0).shapes[2];
-    DataType data_type = orch_args.tensor(0).dtype;
+__attribute__((visibility("default"))) void aicpu_orchestration_entry(const L2TaskArgs &orch_args) {
+    uint64_t batch = orch_args.tensor(0).ref().shapes[0];
+    uint64_t num_heads = orch_args.tensor(0).ref().shapes[1];
+    uint64_t head_dim = orch_args.tensor(0).ref().shapes[2];
+    DataType data_type = orch_args.tensor(0).ref().dtype;
 
-    uint64_t block_size = orch_args.tensor(1).shapes[1];
-    uint64_t max_num_blocks_per_req = orch_args.tensor(3).shapes[1];
+    uint64_t block_size = orch_args.tensor(1).ref().shapes[1];
+    uint64_t max_num_blocks_per_req = orch_args.tensor(3).ref().shapes[1];
     uint64_t scale_value = orch_args.scalar(0);
 
     // q_tile adapts to num_heads: use 64 when num_heads >= 64, else 16.
@@ -85,12 +84,12 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
     );
 
     // Wrap host tensors
-    void *query_ptr = orch_args.tensor(0).data_as<void>();
-    void *kc_ptr = orch_args.tensor(1).data_as<void>();
-    void *vc_ptr = orch_args.tensor(2).data_as<void>();
-    void *out_ptr = orch_args.tensor(5).data_as<void>();
+    void *query_ptr = orch_args.tensor(0).ref().data_as<void>();
+    void *kc_ptr = orch_args.tensor(1).ref().data_as<void>();
+    void *vc_ptr = orch_args.tensor(2).ref().data_as<void>();
+    void *out_ptr = orch_args.tensor(5).ref().data_as<void>();
 
-    uint64_t total_kv_blocks = orch_args.tensor(1).shapes[0];
+    uint64_t total_kv_blocks = orch_args.tensor(1).ref().shapes[0];
     uint64_t kv_total_rows = total_kv_blocks * block_size;
 
     uint32_t query_shapes[2] = {static_cast<uint32_t>(batch * num_heads), static_cast<uint32_t>(head_dim)};
@@ -104,10 +103,10 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
 
     uint32_t bt_shapes[2] = {static_cast<uint32_t>(batch), static_cast<uint32_t>(max_num_blocks_per_req)};
     Tensor block_table =
-        make_tensor_external(orch_args.tensor(3).data_as<void>(), bt_shapes, 2, DataType::INT32, false);
+        make_tensor_external(orch_args.tensor(3).ref().data_as<void>(), bt_shapes, 2, DataType::INT32, false);
     uint32_t cl_shapes[1] = {static_cast<uint32_t>(batch)};
     Tensor context_lens =
-        make_tensor_external(orch_args.tensor(4).data_as<void>(), cl_shapes, 1, DataType::INT32, false);
+        make_tensor_external(orch_args.tensor(4).ref().data_as<void>(), cl_shapes, 1, DataType::INT32, false);
 
     // GM FIFO buffers for TPUSH/TPOP (one set of slots per hardware block)
     uint32_t sij_fifo_total = static_cast<uint32_t>(SPMD_BLOCK_NUM) * SIJ_SLOT_SIZE * FIFO_DEPTH;
@@ -124,7 +123,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
     TensorCreateInfo oi_fifo_ci(oi_fifo_shapes, 1, DataType::INT32);
 
     PTO2_SCOPE() {
-        Arg args;
+        L0TaskArgs args;
         args.add_input(query);
         args.add_input(key_cache);
         args.add_input(value_cache);

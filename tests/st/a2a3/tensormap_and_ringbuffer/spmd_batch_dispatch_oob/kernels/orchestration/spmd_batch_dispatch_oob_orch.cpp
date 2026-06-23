@@ -29,29 +29,28 @@
 
 extern "C" {
 
-__attribute__((visibility("default"))) PTO2OrchestrationConfig
-aicpu_orchestration_config(const ChipStorageTaskArgs &orch_args) {
+__attribute__((visibility("default"))) PTO2OrchestrationConfig aicpu_orchestration_config(const L2TaskArgs &orch_args) {
     (void)orch_args;
     return PTO2OrchestrationConfig{
         .expected_arg_count = 1,
     };
 }
 
-static void submit_spmd_mix(Tensor &out, int16_t block_num, int64_t base_cl) {
+static void submit_spmd_mix(const Tensor &out, int16_t block_num, int64_t base_cl) {
     MixedKernels mk;
     mk.aic_kernel_id = FUNC_AIC;
     mk.aiv0_kernel_id = FUNC_AIV0;
     mk.aiv1_kernel_id = FUNC_AIV1;
 
-    Arg args;
+    L0TaskArgs args;
     args.add_inout(out);
     args.add_scalar(base_cl);
     args.launch_spec.set_block_num(block_num);
     rt_submit_task(mk, args);
 }
 
-__attribute__((visibility("default"))) void aicpu_orchestration_entry(const ChipStorageTaskArgs &orch_args) {
-    Tensor ext_output = from_tensor_arg(orch_args.tensor(0));
+__attribute__((visibility("default"))) void aicpu_orchestration_entry(const L2TaskArgs &orch_args) {
+    const Tensor &ext_output = orch_args.tensor(0).ref();
 
     // Two back-to-back tasks with block_num=48 (2x cluster count).
     // Both land in the ready queue simultaneously, triggering got=2 in

@@ -43,21 +43,20 @@ static constexpr int32_t SYNC_CL = SYNC_BLOCK_NUM * SLOTS_PER_BLOCK;      // 18
 
 extern "C" {
 
-__attribute__((visibility("default"))) PTO2OrchestrationConfig
-aicpu_orchestration_config(const ChipStorageTaskArgs &orch_args) {
+__attribute__((visibility("default"))) PTO2OrchestrationConfig aicpu_orchestration_config(const L2TaskArgs &orch_args) {
     (void)orch_args;  // NOLINT(readability/casting)
     return PTO2OrchestrationConfig{
         .expected_arg_count = 1,
     };
 }
 
-static void submit_mix(Tensor &out, int16_t block_num, int64_t base_cl, bool sync_start) {
+static void submit_mix(const Tensor &out, int16_t block_num, int64_t base_cl, bool sync_start) {
     MixedKernels mk;
     mk.aic_kernel_id = FUNC_SPMD_MIX_AIC;
     mk.aiv0_kernel_id = FUNC_SPMD_MIX_AIV0;
     mk.aiv1_kernel_id = FUNC_SPMD_MIX_AIV1;
 
-    Arg args;
+    L0TaskArgs args;
     args.add_inout(out);
     args.add_scalar(base_cl);
     args.launch_spec.set_core_num(block_num);
@@ -65,8 +64,8 @@ static void submit_mix(Tensor &out, int16_t block_num, int64_t base_cl, bool syn
     rt_submit_task(mk, args);
 }
 
-__attribute__((visibility("default"))) void aicpu_orchestration_entry(const ChipStorageTaskArgs &orch_args) {
-    Tensor ext_output = from_tensor_arg(orch_args.tensor(0));
+__attribute__((visibility("default"))) void aicpu_orchestration_entry(const L2TaskArgs &orch_args) {
+    const Tensor &ext_output = orch_args.tensor(0).ref();
 
     int64_t cl = 0;
 

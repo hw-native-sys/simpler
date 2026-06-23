@@ -61,11 +61,11 @@
 // Device orchestration function signature (loaded via dlopen).
 // The executor binds the current thread's PTO2Runtime into orchestration TLS
 // before calling the user entry.
-typedef void (*DeviceOrchestrationFunc)(const ChipStorageTaskArgs &orch_args);
+typedef void (*DeviceOrchestrationFunc)(const L2TaskArgs &orch_args);
 typedef void (*DeviceOrchestrationBindRuntimeFunc)(PTO2Runtime *rt);
 
 // Config function exported by orchestration .so
-typedef PTO2OrchestrationConfig (*DeviceOrchestrationConfigFunc)(const ChipStorageTaskArgs &orch_args);
+typedef PTO2OrchestrationConfig (*DeviceOrchestrationConfigFunc)(const L2TaskArgs &orch_args);
 
 // From orchestration/common.cpp linked into this DSO — updates g_current_runtime here (distinct from
 // framework_bind_runtime in the dlopen'd libdevice_orch_*.so).
@@ -132,9 +132,9 @@ struct AicpuExecutor {
     // Default-constructed: libc-backed backend, no ctx.
     DeviceArena runtime_arena_;
 
-    // Cached orch args pointer set by the orchestration thread before scheduler
-    // init; consumed by the (*p_func)(*orch_args_cached_) invocation below.
-    const ChipStorageTaskArgs *orch_args_cached_{nullptr};
+    // Entry-arg L2TaskArgs built (via create_from_chip_args) from get_orch_args()
+    // before scheduler init; consumed by the (*p_func)(orch_args_cached_) below.
+    L2TaskArgs orch_args_cached_;
 
     // Per-callable_id table. Single orch thread today, so first-write/read
     // race is not possible; if multiple orch threads are ever introduced,
@@ -398,9 +398,13 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
                 }
             }
 
+            // Build the entry-arg once per run; both the config call below and
+            // the orchestration entry (consumed at orch_args_cached_) use it.
+            orch_args_cached_.create_from_chip_args(runtime->get_orch_args());
+
             // Validate arg count on every run (reload or cache hit).
             if (*p_config_func != nullptr) {
-                PTO2OrchestrationConfig cfg = (*p_config_func)(runtime->get_orch_args());
+                PTO2OrchestrationConfig cfg = (*p_config_func)(orch_args_cached_);
                 LOG_INFO_V0("Thread %d: Config: expected_args=%d", thread_idx, cfg.expected_arg_count);
                 if (cfg.expected_arg_count > 0) {
                     const ChipStorageTaskArgs &args_validate = runtime->get_orch_args();
@@ -523,8 +527,6 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
             // With multi-ring, slot_states are per-ring inside the scheduler.
             runtime->set_slot_states_ptr(nullptr);
 
-            orch_args_cached_ = &args;
-
             // Wire scheduler context to the newly created PTO2Runtime before
             // releasing scheduler threads from runtime_init_ready_.
             sched_ctx_.bind_runtime(rt);
@@ -564,7 +566,7 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
                 (*p_bind)(rt);
             }
             rt_scope_begin(rt);
-            (*p_func)(*orch_args_cached_);
+            (*p_func)(orch_args_cached_);
             rt_scope_end(rt);
 
             // Flush the (potentially partially-filled) DepGenBuffer so the host
@@ -758,7 +760,7 @@ void AicpuExecutor::deinit(Runtime *runtime) {
     sched_thread_num_ = 0;
     orch_to_sched_ = false;
 
-    orch_args_cached_ = nullptr;
+    orch_args_cached_.reset();
     // orch_so_table_ entries are intentionally preserved across deinit: the
     // next run reuses cached handles when register_new_callable_id() returns
     // false. The destructor releases them at process teardown.

@@ -62,12 +62,12 @@ protected:
 TEST_F(OrchestratorFaninTest, DuplicateExplicitProducerAddsOneFanin) {
     orch.begin_scope();
 
-    Arg producer_args;
+    L0TaskArgs producer_args;
     TaskOutputTensors producer = orch.submit_dummy_task(producer_args);
     ASSERT_TRUE(producer.task_id().is_valid());
 
     PTO2TaskId deps[] = {producer.task_id(), producer.task_id()};
-    Arg consumer_args;
+    L0TaskArgs consumer_args;
     consumer_args.set_dependencies(deps, 2);
     TaskOutputTensors consumer = orch.submit_dummy_task(consumer_args);
     ASSERT_TRUE(consumer.task_id().is_valid());

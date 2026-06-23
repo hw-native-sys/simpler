@@ -37,23 +37,22 @@
 
 extern "C" {
 
-__attribute__((visibility("default"))) PTO2OrchestrationConfig
-aicpu_orchestration_config(const ChipStorageTaskArgs &orch_args) {
+__attribute__((visibility("default"))) PTO2OrchestrationConfig aicpu_orchestration_config(const L2TaskArgs &orch_args) {
     (void)orch_args;  // NOLINT(readability/casting)
     return PTO2OrchestrationConfig{
         .expected_arg_count = 4,
     };
 }
 
-__attribute__((visibility("default"))) void aicpu_orchestration_entry(const ChipStorageTaskArgs &orch_args) {
+__attribute__((visibility("default"))) void aicpu_orchestration_entry(const L2TaskArgs &orch_args) {
     // Tensor args
-    Tensor ext_A = from_tensor_arg(orch_args.tensor(0));
-    Tensor ext_B = from_tensor_arg(orch_args.tensor(1));
-    Tensor ext_C = from_tensor_arg(orch_args.tensor(2));
-    Tensor ext_config = from_tensor_arg(orch_args.tensor(3));
+    const Tensor &ext_A = orch_args.tensor(0).ref();
+    const Tensor &ext_B = orch_args.tensor(1).ref();
+    const Tensor &ext_C = orch_args.tensor(2).ref();
+    const Tensor &ext_config = orch_args.tensor(3).ref();
 
     // Read config from tensor data: [tile_size, grid_k, num_groups, incore_loop]
-    int64_t *host_config = orch_args.tensor(3).data_as<int64_t>();
+    int64_t *host_config = orch_args.tensor(3).ref().data_as<int64_t>();
     int tile_size = static_cast<int>(host_config[0]);
     int grid_k = static_cast<int>(host_config[1]);
     int num_groups = static_cast<int>(host_config[2]);
@@ -95,7 +94,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
             Tensor A_view = ext_A.view(group_shapes, a_view_offsets);
             uint32_t b_view_offsets[1] = {static_cast<uint32_t>(ab_offset)};
             Tensor B_view = ext_B.view(group_shapes, b_view_offsets);
-            Arg params_gemm;
+            L0TaskArgs params_gemm;
             params_gemm.add_input(A_view);
             params_gemm.add_input(B_view);
             params_gemm.add_output(group_ci);
@@ -103,7 +102,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
             TaskOutputTensors gemm_outs = rt_submit_aic_task(FUNC_GEMM_TILE, params_gemm);
             total_gemm++;
 
-            Arg params_add;
+            L0TaskArgs params_add;
             params_add.add_inout(C_view);
             params_add.add_input(gemm_outs.get_ref(0));
             params_add.add_input(ext_config);

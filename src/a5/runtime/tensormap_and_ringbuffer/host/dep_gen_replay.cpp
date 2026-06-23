@@ -413,7 +413,7 @@ void annot_pass(
         if (ptype == TensorArgType::OUTPUT) {
             continue;
         }
-        const Tensor *tensor = inputs.tensors[i].ptr;
+        const Tensor *tensor = &inputs.tensors[i].ref();
 
         // STEP A: creator retention.
         PTO2TaskId owner = tensor->owner_task_id;
@@ -543,7 +543,7 @@ dep_gen_replay_emit_deps_json(const DepGenRecord *records, size_t num_records, c
             tc = CORE_MAX_TENSOR_ARGS;
         }
         for (int32_t i = 0; i < tc; i++) {
-            tref_buf[i].ptr = reinterpret_cast<const Tensor *>(&rec.tensors[i][0]);
+            tref_buf[i] = reinterpret_cast<const Tensor *>(&rec.tensors[i][0]);
             atype_buf[i] = static_cast<TensorArgType>(rec.arg_types[i]);
         }
 
@@ -653,7 +653,7 @@ dep_gen_replay_emit_deps_json(const DepGenRecord *records, size_t num_records, c
                 // a placeholder "alloc" output slot.
                 slot.has_tensor_info = false;
             } else {
-                const Tensor &t = *tref_buf[i].ptr;
+                const Tensor &t = tref_buf[i].ref();
                 register_tensor(tensor_index, tensor_table, t);
                 slot.has_tensor_info = true;
                 slot.tensor_id = make_tensor_id(t.buffer.addr, t.version);

@@ -23,17 +23,17 @@
 extern "C" {
 
 __attribute__((visibility("default"))) PTO2OrchestrationConfig
-ffn_local_orchestration_config(const ChipStorageTaskArgs &orch_args) {
+ffn_local_orchestration_config(const L2TaskArgs &orch_args) {
     (void)orch_args;
     return PTO2OrchestrationConfig{.expected_arg_count = 3};
 }
 
-__attribute__((visibility("default"))) void ffn_local_orchestration(const ChipStorageTaskArgs &orch_args) {
-    Tensor x_shard = from_tensor_arg(orch_args.tensor(0));
-    Tensor w_shard = from_tensor_arg(orch_args.tensor(1));
-    Tensor partial_local = from_tensor_arg(orch_args.tensor(2));
+__attribute__((visibility("default"))) void ffn_local_orchestration(const L2TaskArgs &orch_args) {
+    const Tensor &x_shard = orch_args.tensor(0).ref();
+    const Tensor &w_shard = orch_args.tensor(1).ref();
+    const Tensor &partial_local = orch_args.tensor(2).ref();
 
-    Arg params;
+    L0TaskArgs params;
     params.add_input(x_shard);
     params.add_input(w_shard);
     params.add_output(partial_local);

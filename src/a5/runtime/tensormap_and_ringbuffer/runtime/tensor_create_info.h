@@ -89,8 +89,6 @@ public:
     uint32_t shapes[MAX_TENSOR_DIMS];  // → Tensor::shapes
 
     TensorCreateInfo() = default;
-
-    friend struct Arg;
 };
 
 // TensorCreateInfo layout must match Tensor cacheline 1 for memcpy optimization

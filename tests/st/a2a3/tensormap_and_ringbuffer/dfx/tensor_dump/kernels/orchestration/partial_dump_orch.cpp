@@ -15,24 +15,23 @@
 
 extern "C" {
 
-__attribute__((visibility("default"))) PTO2OrchestrationConfig
-aicpu_orchestration_config(const ChipStorageTaskArgs &orch_args) {
+__attribute__((visibility("default"))) PTO2OrchestrationConfig aicpu_orchestration_config(const L2TaskArgs &orch_args) {
     (void)orch_args;
     return PTO2OrchestrationConfig{
         .expected_arg_count = 3,
     };
 }
 
-__attribute__((visibility("default"))) void aicpu_orchestration_entry(const ChipStorageTaskArgs &orch_args) {
-    Tensor ext_a = from_tensor_arg(orch_args.tensor(0));
-    Tensor ext_b = from_tensor_arg(orch_args.tensor(1));
-    Tensor ext_f = from_tensor_arg(orch_args.tensor(2));
+__attribute__((visibility("default"))) void aicpu_orchestration_entry(const L2TaskArgs &orch_args) {
+    const Tensor &ext_a = orch_args.tensor(0).ref();
+    const Tensor &ext_b = orch_args.tensor(1).ref();
+    const Tensor &ext_f = orch_args.tensor(2).ref();
 
-    uint32_t size = orch_args.tensor(0).shapes[0];
+    uint32_t size = orch_args.tensor(0).ref().shapes[0];
     uint32_t inter_shapes[1] = {size};
     TensorCreateInfo inter_ci(inter_shapes, 1, DataType::FLOAT32);
 
-    Arg params_t0;
+    L0TaskArgs params_t0;
     params_t0.add_input(ext_a);
     params_t0.add_input(ext_b);
     params_t0.add_output(inter_ci);
@@ -40,7 +39,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
     const Tensor &c = outs_t0.get_ref(0);
 
     PTO2_SCOPE() {
-        Arg params_t1;
+        L0TaskArgs params_t1;
         params_t1.add_input(c);
         params_t1.add_output(inter_ci);
         float t1_addend = 1.0f;
@@ -52,7 +51,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
         TaskOutputTensors outs_t1 = rt_submit_aiv_task(1, params_t1);
         const Tensor &d = outs_t1.get_ref(0);
 
-        Arg params_t2;
+        L0TaskArgs params_t2;
         params_t2.add_input(c);
         params_t2.add_output(inter_ci);
         float t2_addend = 2.0f;
@@ -64,7 +63,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
         TaskOutputTensors outs_t2 = rt_submit_aiv_task(1, params_t2);
         const Tensor &e = outs_t2.get_ref(0);
 
-        Arg params_t3;
+        L0TaskArgs params_t3;
         params_t3.add_input(d);
         params_t3.add_input(e);
         params_t3.add_output(inter_ci);
@@ -78,7 +77,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
         TaskOutputTensors outs_t3 = rt_submit_aiv_task(2, params_t3);
         const Tensor &g = outs_t3.get_ref(0);
 
-        Arg params_t4;
+        L0TaskArgs params_t4;
         params_t4.add_input(g);
         params_t4.add_input(c);
         params_t4.add_output(ext_f);
