@@ -94,6 +94,20 @@ int get_orch_device_id();
 volatile uint32_t *get_reg_ptr(uint64_t reg_base_addr, RegId reg);
 
 /**
+ * Register-cell synchronizing accessors for the AICPU<->AICore handshake gate
+ * (COND / DATA_MAIN_BASE). Implemented per-variant:
+ *   sim/aicpu/inner_platform_regs.cpp     -- atomic acquire/release. The
+ *       simulated registers are plain host memory shared across host threads,
+ *       so the access itself must carry inter-thread happens-before (and be
+ *       visible to ThreadSanitizer) against the AICore side.
+ *   onboard/aicpu/inner_platform_regs.cpp -- plain Device-nGnRnE MMIO load/store
+ *       (atomics are not valid on Device memory); ordering is the caller's
+ *       explicit rmb()/wmb(), so the hardware path is the legacy behavior.
+ */
+uint32_t reg_load_acquire(const volatile uint32_t *p);
+void reg_store_release(volatile uint32_t *p, uint32_t v);
+
+/**
  * Read a register value from an AICore's register block
  *
  * No memory barrier is emitted. Callers that read a hand-off bit
@@ -119,7 +133,9 @@ uint64_t read_reg(uint64_t reg_base_addr, RegId reg);
  * @param value          Value to write (truncated to register width)
  */
 inline void write_reg(uint64_t reg_base_addr, RegId reg, uint64_t value) {
-    *reinterpret_cast<volatile uint32_t *>(reg_base_addr + reg_offset(reg)) = static_cast<uint32_t>(value);
+    reg_store_release(
+        reinterpret_cast<volatile uint32_t *>(reg_base_addr + reg_offset(reg)), static_cast<uint32_t>(value)
+    );
 }
 
 /**
