@@ -781,7 +781,7 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
     );
 
     // One-time init: assign perf buffers (one thread does it; others wait)
-    if (!pto2_init_done_.exchange(true, std::memory_order_acq_rel)) {
+    if (!pto2_init_claimed_.exchange(true, std::memory_order_acq_rel)) {
         LOG_INFO_V0("Thread %d: doing one-time init", thread_idx);
 
 #if PTO2_PROFILING

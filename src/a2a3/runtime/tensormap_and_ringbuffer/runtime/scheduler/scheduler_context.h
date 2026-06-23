@@ -180,7 +180,7 @@ private:
 #endif
 
     // --- One-time init coordination ---
-    std::atomic<bool> pto2_init_done_{false};
+    std::atomic<bool> pto2_init_claimed_{false};
     std::atomic<bool> pto2_init_complete_{false};
 
     // =========================================================================

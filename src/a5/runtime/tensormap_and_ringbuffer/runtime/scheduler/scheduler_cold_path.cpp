@@ -982,7 +982,7 @@ void SchedulerContext::deinit() {
     completed_tasks_.store(0, std::memory_order_release);
     total_tasks_ = 0;
     orchestrator_done_ = false;
-    init_done_.store(false, std::memory_order_release);
+    init_claimed_.store(false, std::memory_order_release);
     init_complete_.store(false, std::memory_order_release);
 
     // Reset core transition state

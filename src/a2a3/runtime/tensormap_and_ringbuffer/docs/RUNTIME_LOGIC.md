@@ -640,13 +640,13 @@ Built by the scheduler from `PTO2TaskDescriptor`:
 | Flag | Set by | Waited by | Purpose |
 | ---- | ------ | --------- | ------- |
 | `runtime_init_ready_` | Thread 3 | Threads 0-2 | Runtime and SM handle initialized |
-| `pto2_init_done_` | First init thread | Others | One-time memset of arrays started (exchange guard) |
+| `pto2_init_claimed_` | First init thread | Others | One-time memset of arrays started (exchange guard) |
 | `pto2_init_complete_` | Init thread | Thread 3 + others | One-time init of per-task arrays done |
 
 Startup sequence:
 
 1. Thread 3: create SM handle + runtime → set `runtime_init_ready_`
-2. Scheduler threads: wait for `runtime_init_ready_` → one thread wins `pto2_init_done_` exchange → memset per-task arrays → set `pto2_init_complete_`; other threads wait for `pto2_init_complete_`
+2. Scheduler threads: wait for `runtime_init_ready_` → one thread wins `pto2_init_claimed_` exchange → memset per-task arrays → set `pto2_init_complete_`; other threads wait for `pto2_init_complete_`
 3. Thread 3: wait for `pto2_init_complete_` → configure orchestrator-scheduler pointers
 4. Scheduler threads: enter main loop
 5. Thread 3: call orchestration function → set `orchestrator_done_`
