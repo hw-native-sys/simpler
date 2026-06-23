@@ -107,12 +107,13 @@ meaning, peak, and capacity use; `Max use` shows the selected risk metric,
 peak, capacity, use, peak scope, and peak site. For TensorMap, `Max use` also
 shows `Peak context ring_depth`, which is the scope/ring_depth context where
 the global TensorMap peak was observed. `task_window`, `heap`, and `dep_pool`
-put `High water` / `Live at exit` in the main resource-pressure chart, and put
-`Scope alloc` in a separate chart below it so small allocation changes stay
-readable. `tensormap` shows one global live-entry curve. Charts include
-scope-index ticks on x and observed-usage ticks on y. Percentages are rendered
-with two decimal places. The x-axis uses readable integer scope steps; the
-y-range is `peak * 1.1`, while y-grid ticks use readable integer or
+put `High water` / `Live at exit` in the main resource-pressure chart, and
+render the per-scope allocation curve in a separate chart below it so small
+allocation changes stay readable. `tensormap` shows one global live-entry
+curve. Charts include scope-index ticks on x and observed-usage ticks on y.
+Percentages are rendered with two decimal places. The x-axis uses readable
+integer scope steps; the y-range is `peak * 1.1`, while y-grid ticks use
+readable integer or
 human-friendly steps. Hovering a point shows a highlighted dot plus its metric,
 scope index, y value, and source site. Clicking any chart opens a larger modal
 view of that chart; closing the modal releases the cloned SVG.

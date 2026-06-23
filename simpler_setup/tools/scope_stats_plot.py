@@ -85,7 +85,7 @@ def _metrics(resource: str) -> list[Metric]:
         ),
         Metric(
             "scope_alloc",
-            "Scope alloc",
+            "Alloc per scope",
             "end.head - begin.head",
             "How much this scope advanced the allocation frontier.",
             lambda b, en: en.get(e, 0) - b.get(e, 0),
@@ -421,7 +421,7 @@ def _top_peaks_html(entries: list[dict]) -> str:
         "<p>Highlights the highest observed pressure, with capacity use and source site for quick diagnosis.</p>"
         "</div></div>"
         '<table class="peaks"><thead><tr><th>Resource</th><th>ring_depth</th><th>Metric</th>'
-        "<th>Peak</th><th>Capacity</th><th>Use</th><th>Site</th><th>Scope</th></tr></thead>"
+        "<th>Peak</th><th>Capacity</th><th>Use</th><th>Site</th><th>Scope Index</th></tr></thead>"
         f"<tbody>{''.join(rows)}</tbody></table></section>"
     )
 
@@ -512,7 +512,7 @@ def _svg_series_chart(series: list[dict], unit: str, show_axis_title: bool = Fal
         if len(series) == 1 and series[0]["metric"].key == "real_occupancy":
             axis_title = series[0]["metric"].label.lower()
         elif len(series) == 1 and series[0]["metric"].key == "scope_alloc":
-            axis_title = "scope alloc"
+            axis_title = "alloc per scope"
         else:
             axis_title = "high water / live at exit"
         parts.append(f'<text x="{_PAD_L}" y="16" class="axis-title">axis: {axis_title}</text>')
@@ -605,7 +605,7 @@ def _chart_stack_html(series: list[dict], unit: str) -> str:
         '<div class="chart-stack">'
         '<div class="chart-block"><div class="chart-heading">Resource pressure</div>'
         f"{_svg_series_chart(pressure_series, unit, show_axis_title=False)}</div>"
-        '<div class="chart-block"><div class="chart-heading">Scope alloc</div>'
+        '<div class="chart-block">'
         f"{_svg_series_chart(alloc_series, unit)}</div>"
         "</div>"
     )
@@ -670,7 +670,9 @@ def _resource_section(resource: str, meta: dict, pairs_by_ring: dict[int, list[t
             "Charts show scheduler-published dependency-list entry pressure with scope-index and observed-usage ticks."
         )
     else:
-        description = "Charts split resource pressure from Scope alloc, each with scope-index and observed-usage ticks."
+        description = (
+            "Charts split resource pressure from Alloc per scope, each with scope-index and observed-usage ticks."
+        )
     return (
         '<section class="panel resource">'
         f'<div class="section-head"><div><h2>{_esc(info.label)}</h2>'
@@ -736,9 +738,9 @@ tr:last-child td{border-bottom:0}
 .r-heap{background:var(--green)}
 .r-dep_pool{background:var(--amber)}
 .r-tensormap{background:var(--purple)}
-.m-scope_high_water{--series-color:var(--blue);stroke:var(--blue);fill:var(--blue);background:var(--blue)}
-.m-real_occupancy{--series-color:var(--orange);stroke:var(--orange);fill:var(--orange);background:var(--orange)}
-.m-scope_alloc{--series-color:var(--green);stroke:var(--green);fill:var(--green);background:var(--green)}
+.m-scope_high_water{--series-color:var(--red);stroke:var(--red);fill:var(--red);background:var(--red)}
+.m-real_occupancy{--series-color:var(--green);stroke:var(--green);fill:var(--green);background:var(--green)}
+.m-scope_alloc{--series-color:var(--blue);stroke:var(--blue);fill:var(--blue);background:var(--blue)}
 .m-tensormap_live{--series-color:var(--purple);stroke:var(--purple);fill:var(--purple);background:var(--purple)}
 .ring-panel{border:1px solid var(--border);border-radius:8px;margin-top:10px;background:#fff}
 .ring-panel summary{display:flex;align-items:center;gap:10px;cursor:pointer;padding:12px 14px}
