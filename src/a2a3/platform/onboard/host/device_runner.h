@@ -226,8 +226,10 @@ private:
     // finalize() only on the device-poison path (device_unusable_). Safe
     // because onboard work always holds an exclusive task-submit lock on the
     // card (.claude/rules/running-onboard.md) and the reset scopes to this card
-    // only (does not disturb other devices).
-    void force_reset_device();
+    // only (does not disturb other devices). Returns 0 on success, non-zero if
+    // the reset did not run or failed, so finalize() can keep a still-poisoned
+    // card flagged instead of clearing device_unusable_ unconditionally.
+    int force_reset_device();
 
     // Shared collectors (`l2_swimlane_collector_`, `dump_collector_`,
     // `pmu_collector_`, `scope_stats_collector_`) live on `DeviceRunnerBase`.
