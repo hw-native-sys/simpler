@@ -316,8 +316,7 @@ class TestPreparedCallable(SceneTestCase):
             prepared = False
             after_unreg = st_worker.aicpu_dlopen_count
             assert after_unreg - baseline == 1, (
-                f"unregister must NOT decrement the dlopen counter; "
-                f"baseline={baseline}, after_unreg={after_unreg}"
+                f"unregister must NOT decrement the dlopen counter; baseline={baseline}, after_unreg={after_unreg}"
             )
             chip_worker._prepare_callable_at_slot(_SLOT_PRIMARY, callable_obj)
             prepared = True

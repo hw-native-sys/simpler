@@ -255,8 +255,10 @@ int DeviceRunnerBase::ensure_binaries_loaded() {
     }
 
     if (dispatcher_so_binary_.empty()) {
-        LOG_ERROR("DeviceRunner: dispatcher SO bytes not provided; pass dispatcher_path through ChipWorker.init "
-                  "(RuntimeBinaries.dispatcher_path)");
+        LOG_ERROR(
+            "DeviceRunner: dispatcher SO bytes not provided; pass dispatcher_path through ChipWorker.init "
+            "(RuntimeBinaries.dispatcher_path)"
+        );
         return -1;
     }
 
