@@ -40,14 +40,20 @@ class TestBgemm(SceneTestCase):
                 "name": "GEMM",
                 "source": "kernels/mix/kernel_bgemm.cpp",
                 "core_type": "aic",
+                # Cooperative mix sharing one 3-tensor args[] (A, B, C). AIC
+                # reads A, B and produces C.
                 "signature": [D.IN, D.IN, D.OUT],
+                "arg_index": [0, 1, 2],
             },
             {
                 "func_id": 1,
                 "name": "ADD",
                 "source": "kernels/mix/kernel_bgemm.cpp",
                 "core_type": "aiv",
-                "signature": [D.INOUT, D.IN],
+                # AIV reads the same args[0..2] (kernel_bgemm.cpp: args[0]=A in,
+                # args[1]=B in, args[2]=C inout accumulator).
+                "signature": [D.IN, D.IN, D.INOUT],
+                "arg_index": [0, 1, 2],
             },
         ],
     }

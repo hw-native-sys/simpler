@@ -37,23 +37,24 @@ class TestSpmdSyncStartEdge(SceneTestCase):
                 "name": "SPMD_MIX_AIC",
                 "source": "../spmd_multiblock_mix/kernels/aic/kernel_spmd_mix.cpp",
                 "core_type": "aic",
-                # Cooperative MIX (AIC+AIV0+AIV1 share one args[]). Declare the
-                # payload signature on exactly ONE subtask so the args dump's
-                # per-subtask sum equals the payload (1 INOUT tensor); the AIVs
-                # stay empty or the sum would triple and the dump is skipped.
                 "signature": [D.INOUT],
+                "arg_index": [0],
             },
             {
                 "func_id": 1,
                 "name": "SPMD_MIX_AIV0",
                 "source": "../spmd_multiblock_mix/kernels/aiv/kernel_spmd_mix.cpp",
                 "core_type": "aiv",
+                "signature": [D.INOUT],
+                "arg_index": [0],
             },
             {
                 "func_id": 2,
                 "name": "SPMD_MIX_AIV1",
                 "source": "../spmd_multiblock_mix/kernels/aiv/kernel_spmd_mix.cpp",
                 "core_type": "aiv",
+                "signature": [D.INOUT],
+                "arg_index": [0],
             },
         ],
     }

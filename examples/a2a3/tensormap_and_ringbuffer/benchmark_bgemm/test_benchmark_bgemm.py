@@ -33,6 +33,7 @@ class TestBenchmarkBgemm(SceneTestCase):
                 "source": "kernels/aic/kernel_gemm_tile.cpp",
                 "core_type": "aic",
                 "signature": [D.IN, D.IN, D.OUT],
+                "arg_index": [0, 1, 2],
             },
             {
                 "func_id": 1,
@@ -40,6 +41,7 @@ class TestBenchmarkBgemm(SceneTestCase):
                 "source": "kernels/aiv/kernel_tile_add.cpp",
                 "core_type": "aiv",
                 "signature": [D.INOUT, D.IN],
+                "arg_index": [0, 1],
             },
         ],
     }

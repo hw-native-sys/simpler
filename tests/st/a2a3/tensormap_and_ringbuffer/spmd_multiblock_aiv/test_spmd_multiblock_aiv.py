@@ -40,11 +40,10 @@ class TestSpmdMultiblockAiv(SceneTestCase):
                 "name": "SPMD_WRITE_AIV",
                 "source": "kernels/aiv/kernel_spmd_write.cpp",
                 "core_type": "aiv",
-                # Declare the single output tensor so the args dump (which
-                # sums per-subtask signature tensors and matches them to the
-                # payload) captures it under func_id 0 — without it the count is
-                # 0 != payload 1 and the dump is skipped.
+                # Single-AIV task with one INOUT tensor at payload slot 0;
+                # arg_index maps it explicitly.
                 "signature": [D.INOUT],
+                "arg_index": [0],
             },
         ],
     }

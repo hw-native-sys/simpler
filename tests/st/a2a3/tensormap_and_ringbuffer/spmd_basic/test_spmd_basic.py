@@ -45,14 +45,25 @@ class TestSpmdBasic(SceneTestCase):
                 "name": "SPMD_READ_AIC",
                 "source": "kernels/aic/kernel_spmd_read.cpp",
                 "core_type": "aic",
-                # Cooperative MIX (AIC+AIV0+AIV1 share one args[]). Declare the
-                # payload signature on exactly ONE subtask so the args dump's
-                # per-subtask sum equals the payload (1 INOUT tensor); the AIVs
-                # stay empty or the sum would triple and the dump is skipped.
                 "signature": [D.INOUT],
+                "arg_index": [0],
             },
-            {"func_id": 1, "name": "SPMD_READ_AIV0", "source": "kernels/aiv/kernel_spmd_read.cpp", "core_type": "aiv"},
-            {"func_id": 2, "name": "SPMD_READ_AIV1", "source": "kernels/aiv/kernel_spmd_read.cpp", "core_type": "aiv"},
+            {
+                "func_id": 1,
+                "name": "SPMD_READ_AIV0",
+                "source": "kernels/aiv/kernel_spmd_read.cpp",
+                "core_type": "aiv",
+                "signature": [D.INOUT],
+                "arg_index": [0],
+            },
+            {
+                "func_id": 2,
+                "name": "SPMD_READ_AIV1",
+                "source": "kernels/aiv/kernel_spmd_read.cpp",
+                "core_type": "aiv",
+                "signature": [D.INOUT],
+                "arg_index": [0],
+            },
         ],
     }
 

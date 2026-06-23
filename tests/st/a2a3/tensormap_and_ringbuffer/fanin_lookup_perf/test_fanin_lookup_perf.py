@@ -39,9 +39,10 @@ class TestFaninLookupPerf(SceneTestCase):
                 "name": "WRITE_CONST",
                 "source": "kernels/aic/kernel_write_const_visible.cpp",
                 "core_type": "aic",
-                # Single-AIC task with one INOUT tensor (args[0]). Declared so
-                # the args dump's per-subtask sum matches the payload.
+                # Single-AIC task with one INOUT tensor at payload slot 0;
+                # arg_index maps it explicitly.
                 "signature": [D.INOUT],
+                "arg_index": [0],
             },
         ],
     }

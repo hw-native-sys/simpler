@@ -204,6 +204,7 @@ Example manifest (one input tensor captured before dispatch):
   "args": [
     {
       "task_id": "0x0000000200000a00",
+      "func_id": 0,
       "role": "input",
       "stage": "before_dispatch",
       "arg_index": 0,
@@ -226,6 +227,14 @@ Key fields:
 
 - `task_id` — runtime task identity. Use to correlate with swimlane / PMU
   output.
+- `func_id` — kernel id of the subtask that declared this arg (via its
+  incore `signature` + `arg_index`). The dump walks each active subtask
+  independently, so a tensor shared by a cooperative mix is emitted **once
+  per declaring subtask**, each under its own `func_id`; the sharing is
+  recoverable as the same `(task_id, arg_index)` appearing under more than
+  one `func_id`. Scalars are stamped with the first active subtask's
+  `func_id`. `-1` when unknown (the `host_build_graph` dump path, which does
+  not thread func_id).
 - `arg_index` — payload argument index. Tensor entries use the payload
   tensor index; scalar entries use `payload.tensor_count + scalar_index`.
   When scalar lvalue selection matched multiple scalar slots, the selected
@@ -274,8 +283,25 @@ spreadsheet.
 
 ### 3.4 Add dump support to a new test
 
-Only `host_build_graph` needs explicit wiring; other runtimes derive
-tensor view metadata automatically.
+For `tensormap_and_ringbuffer`, each incore declares two parallel,
+equal-length arrays in its `CALLABLE` entry — `signature` (each
+tensor's `ArgDirection`) and `arg_index` (the absolute payload slot it
+maps to). The dump reads them to give every captured tensor a direction
+(which sets its capture stage) and a `func_id`; geometry (shape, dtype,
+strides) is still derived automatically from the payload. `arg_index`
+is mandatory and must equal `signature` in length — `CoreCallable.build`
+raises otherwise. A tensor shared by a cooperative mix is declared by
+every subtask that uses it, and dumped once per subtask.
+
+A `signature` usually lists only tensor directions — scalars are
+independent (added via `add_scalar`) and are typically omitted. If a
+`SCALAR` direction *is* listed it must come after every tensor entry;
+the dump skips `SCALAR` entries and `arg_index` indexes only the tensor
+payload, so a scalar entry's `arg_index` value is immaterial (it exists
+only to keep the two arrays equal-length).
+
+`host_build_graph` has no incore signatures, so it needs explicit
+`TensorInfo` wiring instead (geometry is still automatic):
 
 ```cpp
 // In orchestration C++ (host_build_graph only)
@@ -398,13 +424,23 @@ Each runtime's scheduler dispatch code calls
 └──────────────────────────────────────┘
 ```
 
-`dump_args_for_task` walks the formal callable signature for
-non-scalar tensor slots, matches each tensor slot to a
-`TensorDumpInfo` (dtype + shape + strides + start offset + device
-address), and calls `dump_arg_record` for slots that match the
-current stage. Scalar values are dumped separately from the flat
-payload `scalars[]`; their dtype table is registered at submit time
-and emitted as a dump-only metadata record at `BEFORE_DISPATCH`.
+`dump_args_for_task` walks **each active subtask's** callable
+signature. For each non-scalar entry it reads the parallel `arg_index`
+to locate the absolute payload tensor slot that entry describes, builds
+a `TensorDumpInfo` (dtype + shape + strides + start offset + device
+address) for that slot, and calls `dump_arg_record` for entries whose
+role matches the current stage — stamping each record with that
+subtask's `func_id`. A tensor shared by a cooperative mix is thus
+emitted once per declaring subtask, each under its own `func_id`. A
+declared `arg_index` beyond the payload is skipped with a warning
+(memory safety); payload slots that no subtask declares are left
+undumped with a soft completeness warning. (The `host_build_graph` dump
+path is a separate overload that maps each signature entry to its slot
+positionally and stamps `func_id = -1`.) Scalar values are dumped
+separately from the flat payload `scalars[]`, once per task (stamped
+with the first active subtask's `func_id`); their dtype table is
+registered at submit time and emitted as a dump-only metadata record at
+`BEFORE_DISPATCH`.
 
 When dump is enabled, AICore executors also issue
 `pipe_barrier(PIPE_ALL)` after kernel execution and before writing

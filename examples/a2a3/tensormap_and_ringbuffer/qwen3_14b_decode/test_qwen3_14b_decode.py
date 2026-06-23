@@ -79,6 +79,7 @@ class TestQwen314BDecode(SceneTestCase):
                 "source": "kernels/aiv/copy_hidden.cpp",
                 "core_type": "aiv",
                 "signature": [D.OUT, D.IN],
+                "arg_index": [0, 1],
             },
             {
                 "func_id": 1,
@@ -86,6 +87,7 @@ class TestQwen314BDecode(SceneTestCase):
                 "source": "kernels/aiv/x_gamma.cpp",
                 "core_type": "aiv",
                 "signature": [D.INOUT, D.IN, D.IN],
+                "arg_index": [0, 1, 2],
             },
             {
                 "func_id": 2,
@@ -93,6 +95,7 @@ class TestQwen314BDecode(SceneTestCase):
                 "source": "kernels/aiv/rms_recip.cpp",
                 "core_type": "aiv",
                 "signature": [D.IN, D.INOUT],
+                "arg_index": [0, 1],
             },
             {
                 "func_id": 3,
@@ -100,6 +103,7 @@ class TestQwen314BDecode(SceneTestCase):
                 "source": "kernels/aiv/q_seed.cpp",
                 "core_type": "aiv",
                 "signature": [D.INOUT],
+                "arg_index": [0],
             },
             {
                 "func_id": 4,
@@ -107,6 +111,7 @@ class TestQwen314BDecode(SceneTestCase):
                 "source": "kernels/aic/q_proj.cpp",
                 "core_type": "aic",
                 "signature": [D.INOUT, D.IN, D.IN],
+                "arg_index": [0, 1, 2],
             },
             {
                 "func_id": 5,
@@ -114,6 +119,7 @@ class TestQwen314BDecode(SceneTestCase):
                 "source": "kernels/aiv/k_seed.cpp",
                 "core_type": "aiv",
                 "signature": [D.INOUT],
+                "arg_index": [0],
             },
             {
                 "func_id": 6,
@@ -121,6 +127,7 @@ class TestQwen314BDecode(SceneTestCase):
                 "source": "kernels/aic/k_proj.cpp",
                 "core_type": "aic",
                 "signature": [D.INOUT, D.IN, D.IN],
+                "arg_index": [0, 1, 2],
             },
             {
                 "func_id": 7,
@@ -128,6 +135,7 @@ class TestQwen314BDecode(SceneTestCase):
                 "source": "kernels/aiv/v_seed.cpp",
                 "core_type": "aiv",
                 "signature": [D.INOUT],
+                "arg_index": [0],
             },
             {
                 "func_id": 8,
@@ -135,6 +143,7 @@ class TestQwen314BDecode(SceneTestCase):
                 "source": "kernels/aic/v_proj.cpp",
                 "core_type": "aic",
                 "signature": [D.INOUT, D.IN, D.IN],
+                "arg_index": [0, 1, 2],
             },
             {
                 "func_id": 9,
@@ -142,6 +151,7 @@ class TestQwen314BDecode(SceneTestCase):
                 "source": "kernels/aiv/fa_work_build.cpp",
                 "core_type": "aiv",
                 "signature": [D.IN, D.INOUT, D.INOUT],
+                "arg_index": [0, 1, 2],
             },
             {
                 "func_id": 10,
@@ -149,6 +159,7 @@ class TestQwen314BDecode(SceneTestCase):
                 "source": "kernels/aiv/qk_gamma.cpp",
                 "core_type": "aiv",
                 "signature": [D.INOUT, D.INOUT, D.IN, D.IN, D.IN, D.IN, D.IN],
+                "arg_index": [0, 1, 2, 3, 4, 5, 6],
             },
             {
                 "func_id": 11,
@@ -156,6 +167,7 @@ class TestQwen314BDecode(SceneTestCase):
                 "source": "kernels/aiv/qk_recip.cpp",
                 "core_type": "aiv",
                 "signature": [D.INOUT, D.INOUT, D.IN, D.IN, D.IN],
+                "arg_index": [0, 1, 2, 3, 4],
             },
             {
                 "func_id": 12,
@@ -163,6 +175,7 @@ class TestQwen314BDecode(SceneTestCase):
                 "source": "kernels/aiv/rope_qkv.cpp",
                 "core_type": "aiv",
                 "signature": [D.IN, D.IN, D.IN, D.IN, D.IN, D.INOUT, D.INOUT, D.INOUT, D.IN, D.IN, D.IN, D.IN, D.IN],
+                "arg_index": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12],
             },
             {
                 "func_id": 13,
@@ -170,6 +183,7 @@ class TestQwen314BDecode(SceneTestCase):
                 "source": "kernels/aiv/down_seed.cpp",
                 "core_type": "aiv",
                 "signature": [D.INOUT],
+                "arg_index": [0],
             },
             {
                 "func_id": 14,
@@ -177,6 +191,7 @@ class TestQwen314BDecode(SceneTestCase):
                 "source": "kernels/aiv/gate_seed.cpp",
                 "core_type": "aiv",
                 "signature": [D.INOUT],
+                "arg_index": [0],
             },
             {
                 "func_id": 15,
@@ -184,6 +199,7 @@ class TestQwen314BDecode(SceneTestCase):
                 "source": "kernels/aiv/up_seed.cpp",
                 "core_type": "aiv",
                 "signature": [D.INOUT],
+                "arg_index": [0],
             },
             {
                 "func_id": 16,
@@ -191,6 +207,7 @@ class TestQwen314BDecode(SceneTestCase):
                 "source": "kernels/aic/fa_fused_aic.cpp",
                 "core_type": "aic",
                 "signature": [D.IN, D.INOUT, D.INOUT, D.INOUT, D.IN, D.IN, D.IN, D.IN, D.IN, D.IN, D.INOUT],
+                "arg_index": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10],
             },
             {
                 "func_id": 17,
@@ -198,6 +215,7 @@ class TestQwen314BDecode(SceneTestCase):
                 "source": "kernels/aiv/fa_fused_aiv.cpp",
                 "core_type": "aiv",
                 "signature": [D.IN, D.INOUT, D.INOUT, D.INOUT, D.IN, D.IN, D.IN, D.IN, D.IN, D.IN, D.INOUT],
+                "arg_index": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10],
             },
             {
                 "func_id": 18,
@@ -205,6 +223,7 @@ class TestQwen314BDecode(SceneTestCase):
                 "source": "kernels/aiv/online_softmax.cpp",
                 "core_type": "aiv",
                 "signature": [D.INOUT, D.IN, D.IN, D.IN, D.IN],
+                "arg_index": [0, 1, 2, 3, 4],
             },
             {
                 "func_id": 19,
@@ -212,6 +231,7 @@ class TestQwen314BDecode(SceneTestCase):
                 "source": "kernels/aiv/out_seed.cpp",
                 "core_type": "aiv",
                 "signature": [D.INOUT],
+                "arg_index": [0],
             },
             {
                 "func_id": 20,
@@ -219,6 +239,7 @@ class TestQwen314BDecode(SceneTestCase):
                 "source": "kernels/aiv/attn_fence.cpp",
                 "core_type": "aiv",
                 "signature": [D.IN, D.INOUT],
+                "arg_index": [0, 1],
             },
             {
                 "func_id": 21,
@@ -226,6 +247,7 @@ class TestQwen314BDecode(SceneTestCase):
                 "source": "kernels/aic/out_proj.cpp",
                 "core_type": "aic",
                 "signature": [D.IN, D.IN, D.INOUT],
+                "arg_index": [0, 1, 2],
             },
             {
                 "func_id": 22,
@@ -233,6 +255,7 @@ class TestQwen314BDecode(SceneTestCase):
                 "source": "kernels/aiv/residual_rms_cast.cpp",
                 "core_type": "aiv",
                 "signature": [D.INOUT, D.INOUT, D.IN, D.IN, D.IN],
+                "arg_index": [0, 1, 2, 3, 4],
             },
             {
                 "func_id": 23,
@@ -240,6 +263,7 @@ class TestQwen314BDecode(SceneTestCase):
                 "source": "kernels/aiv/residual_rms_cast_0.cpp",
                 "core_type": "aiv",
                 "signature": [D.INOUT, D.INOUT, D.IN, D.IN, D.IN],
+                "arg_index": [0, 1, 2, 3, 4],
             },
             {
                 "func_id": 24,
@@ -247,6 +271,7 @@ class TestQwen314BDecode(SceneTestCase):
                 "source": "kernels/aiv/residual_rms_cast_1.cpp",
                 "core_type": "aiv",
                 "signature": [D.INOUT, D.INOUT, D.IN, D.IN, D.IN],
+                "arg_index": [0, 1, 2, 3, 4],
             },
             {
                 "func_id": 25,
@@ -254,6 +279,7 @@ class TestQwen314BDecode(SceneTestCase):
                 "source": "kernels/aiv/residual_rms_cast_2.cpp",
                 "core_type": "aiv",
                 "signature": [D.INOUT, D.INOUT, D.IN, D.IN, D.IN],
+                "arg_index": [0, 1, 2, 3, 4],
             },
             {
                 "func_id": 26,
@@ -261,6 +287,7 @@ class TestQwen314BDecode(SceneTestCase):
                 "source": "kernels/aiv/residual_rms_cast_3.cpp",
                 "core_type": "aiv",
                 "signature": [D.INOUT, D.INOUT, D.IN, D.IN, D.IN],
+                "arg_index": [0, 1, 2, 3, 4],
             },
             {
                 "func_id": 27,
@@ -268,6 +295,7 @@ class TestQwen314BDecode(SceneTestCase):
                 "source": "kernels/aiv/post_rms_reduce.cpp",
                 "core_type": "aiv",
                 "signature": [D.IN, D.IN, D.INOUT],
+                "arg_index": [0, 1, 2],
             },
             {
                 "func_id": 28,
@@ -275,6 +303,7 @@ class TestQwen314BDecode(SceneTestCase):
                 "source": "kernels/aic/gate_proj.cpp",
                 "core_type": "aic",
                 "signature": [D.IN, D.IN, D.INOUT],
+                "arg_index": [0, 1, 2],
             },
             {
                 "func_id": 29,
@@ -282,6 +311,7 @@ class TestQwen314BDecode(SceneTestCase):
                 "source": "kernels/aic/up_proj.cpp",
                 "core_type": "aic",
                 "signature": [D.IN, D.IN, D.INOUT],
+                "arg_index": [0, 1, 2],
             },
             {
                 "func_id": 30,
@@ -289,6 +319,7 @@ class TestQwen314BDecode(SceneTestCase):
                 "source": "kernels/aiv/silu.cpp",
                 "core_type": "aiv",
                 "signature": [D.IN, D.INOUT, D.IN, D.IN],
+                "arg_index": [0, 1, 2, 3],
             },
             {
                 "func_id": 31,
@@ -296,6 +327,7 @@ class TestQwen314BDecode(SceneTestCase):
                 "source": "kernels/aic/down_proj.cpp",
                 "core_type": "aic",
                 "signature": [D.IN, D.IN, D.INOUT],
+                "arg_index": [0, 1, 2],
             },
             {
                 "func_id": 32,
@@ -303,6 +335,7 @@ class TestQwen314BDecode(SceneTestCase):
                 "source": "kernels/aiv/down_cast_residual.cpp",
                 "core_type": "aiv",
                 "signature": [D.IN, D.IN, D.INOUT],
+                "arg_index": [0, 1, 2],
             },
             {
                 "func_id": 33,
@@ -310,6 +343,7 @@ class TestQwen314BDecode(SceneTestCase):
                 "source": "kernels/aiv/out_consolidate.cpp",
                 "core_type": "aiv",
                 "signature": [D.INOUT, D.IN],
+                "arg_index": [0, 1],
             },
             {
                 "func_id": 34,
@@ -317,6 +351,7 @@ class TestQwen314BDecode(SceneTestCase):
                 "source": "kernels/aiv/copy_out.cpp",
                 "core_type": "aiv",
                 "signature": [D.OUT, D.IN],
+                "arg_index": [0, 1],
             },
         ],
     }

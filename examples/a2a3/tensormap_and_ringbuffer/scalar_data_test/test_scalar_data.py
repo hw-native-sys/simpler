@@ -35,12 +35,14 @@ class TestScalarData(SceneTestCase):
                 "source": "kernels/aiv/kernel_add.cpp",
                 "core_type": "aiv",
                 "signature": [D.IN, D.IN, D.OUT],
+                "arg_index": [0, 1, 2],
             },
             {
                 "func_id": 1,
                 "source": "kernels/aiv/kernel_noop.cpp",
                 "core_type": "aiv",
                 "signature": [],
+                "arg_index": [],
             },
         ],
     }
