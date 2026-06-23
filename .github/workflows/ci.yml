@@ -451,6 +451,7 @@ jobs:
 
       - name: Set up environment
         run: |
+          source /usr/local/Ascend/cann/set_env.sh
           python3 -m venv --system-site-packages .venv
           source .venv/bin/activate
           pip install --upgrade pip
@@ -461,6 +462,7 @@ jobs:
 
       - name: Run Python hardware unit tests
         run: |
+          source /usr/local/Ascend/cann/set_env.sh
           source .venv/bin/activate
           # Pin to the same commit pip install built host_runtime against, so
           # conftest does not reset build/pto-isa to HEAD (which would diverge
@@ -470,6 +472,7 @@ jobs:
 
       - name: Build and run C++ hardware unit tests
         run: |
+          source /usr/local/Ascend/cann/set_env.sh
           source .venv/bin/activate
           # pip install's build_runtimes.py already cloned pto-isa into
           # build/pto-isa at PTO_ISA_COMMIT; point this step's RuntimeBuilder at
@@ -492,6 +495,7 @@ jobs:
 
       - name: Build cann-examples/query (CANN host-API smoke)
         run: |
+          source /usr/local/Ascend/cann/set_env.sh
           cd tools/cann-examples/query
           cmake -B build .
           cmake --build build
@@ -499,6 +503,7 @@ jobs:
 
       - name: Build cann-examples/aicpu-device-query (device-side HAL probe smoke)
         run: |
+          source /usr/local/Ascend/cann/set_env.sh
           export CROSS=${ASCEND_HOME_PATH}/tools/hcc/bin/aarch64-target-linux-gnu
           cd tools/cann-examples/aicpu-device-query/device
           cmake -B build . -DCMAKE_C_COMPILER=${CROSS}-gcc -DCMAKE_CXX_COMPILER=${CROSS}-g++
@@ -509,6 +514,7 @@ jobs:
 
       - name: Build cann-examples/aicpu-kernel-launch (dispatcher bootstrap smoke)
         run: |
+          source /usr/local/Ascend/cann/set_env.sh
           export CROSS=${ASCEND_HOME_PATH}/tools/hcc/bin/aarch64-target-linux-gnu
           cd tools/cann-examples/aicpu-kernel-launch/device
           cmake -B build . -DCMAKE_C_COMPILER=${CROSS}-gcc -DCMAKE_CXX_COMPILER=${CROSS}-g++
@@ -530,6 +536,7 @@ jobs:
 
       - name: Set up environment
         run: |
+          source /usr/local/Ascend/cann/set_env.sh
           python3 -m venv --system-site-packages .venv
           source .venv/bin/activate
           pip install --upgrade pip
@@ -547,6 +554,7 @@ jobs:
 
       - name: Run pytest scene tests (a2a3)
         run: |
+          source /usr/local/Ascend/cann/set_env.sh
           source .venv/bin/activate
           python -m pytest examples tests/st --platform a2a3 --device ${DEVICE_RANGE} -v \
             --pto-session-timeout 600 --pto-isa-commit ${{ env.PTO_ISA_COMMIT }} --clone-protocol ssh --require-pto-isa
@@ -557,6 +565,7 @@ jobs:
       # propagation #742 fixed.
       - name: dep_gen smoke
         run: |
+          source /usr/local/Ascend/cann/set_env.sh
           source .venv/bin/activate
           python -m pytest tests/st/a2a3/tensormap_and_ringbuffer/dfx/dep_gen/test_dep_gen.py \
             --platform a2a3 --device ${DEVICE_RANGE} -p no:xdist --pto-session-timeout 600 \
@@ -564,6 +573,7 @@ jobs:
 
       - name: l2_swimlane smoke
         run: |
+          source /usr/local/Ascend/cann/set_env.sh
           source .venv/bin/activate
           python -m pytest tests/st/a2a3/tensormap_and_ringbuffer/dfx/l2_swimlane/ \
             --platform a2a3 --device ${DEVICE_RANGE} -p no:xdist --pto-session-timeout 600 \
@@ -571,6 +581,7 @@ jobs:
 
       - name: PMU smoke
         run: |
+          source /usr/local/Ascend/cann/set_env.sh
           source .venv/bin/activate
           python -m pytest tests/st/a2a3/tensormap_and_ringbuffer/dfx/pmu/test_pmu.py \
             --platform a2a3 --device ${DEVICE_RANGE} -p no:xdist --pto-session-timeout 600 \
@@ -578,6 +589,7 @@ jobs:
 
       - name: tensor_dump smoke
         run: |
+          source /usr/local/Ascend/cann/set_env.sh
           source .venv/bin/activate
           python -m pytest tests/st/a2a3/tensormap_and_ringbuffer/dfx/tensor_dump/test_tensor_dump.py \
             --platform a2a3 --device ${DEVICE_RANGE} -p no:xdist --pto-session-timeout 600 \

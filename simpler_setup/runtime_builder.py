@@ -159,6 +159,10 @@ class RuntimeBuilder:
         source_dirs = [str((config_dir / p).resolve()) for p in cfg["source_dirs"]]
         return include_dirs, source_dirs
 
+    def _requires_pto_isa_compat_validation(self) -> bool:
+        """Return True when this runtime embeds PTO-ISA headers into host code."""
+        return self._arch == "a2a3" and self._variant == "onboard"
+
     def _lookup_binaries(self, name: str, output_dir: Path) -> RuntimeBinaries:
         """Look up pre-built binaries from output_dir.
 
@@ -168,6 +172,11 @@ class RuntimeBuilder:
         Raises:
             FileNotFoundError: If any binary is missing.
         """
+        if self._requires_pto_isa_compat_validation():
+            from .pto_isa import validate_runtime_pto_isa_compatible  # noqa: PLC0415
+
+            validate_runtime_pto_isa_compatible(self._LIB_DIR)
+
         compiler = self._runtime_compiler
         paths = {}
         missing = []

@@ -28,6 +28,7 @@
 #include "prepare_callable_common.h"
 #include "task_args.h"
 
+#include <dlfcn.h>
 #include <pthread.h>
 
 #include <chrono>
@@ -48,7 +49,8 @@ extern "C" {
 int prepare_callable_impl(const ChipCallable *callable, uint64_t (*upload_fn)(const void *), CallableArtifacts *out);
 int bind_callable_to_runtime_impl(
     Runtime *runtime, const ChipStorageTaskArgs *orch_args, void *host_orch_func_ptr, const ArgDirection *signature,
-    int sig_count, uint64_t ring_task_window, uint64_t ring_heap, uint64_t ring_dep_pool
+    int sig_count, uint64_t ring_task_window, uint64_t ring_heap, uint64_t ring_dep_pool,
+    const uint64_t *ring_task_windows, const uint64_t *ring_heaps, const uint64_t *ring_dep_pools
 );
 int validate_runtime_impl(Runtime *runtime);
 
@@ -265,6 +267,11 @@ int prepare_callable(DeviceContextHandle ctx, int32_t callable_id, const void *c
             pthread_setspecific(g_runner_key, nullptr);
             return rc;
         }
+        auto host_dlopen_guard = RAIIScopeGuard([&artifacts]() {
+            if (artifacts.host_dlopen_handle != nullptr) {
+                dlclose(artifacts.host_dlopen_handle);
+            }
+        });
 
         std::vector<std::pair<int, uint64_t>> kernel_addrs;
         kernel_addrs.reserve(artifacts.kernel_addrs.size());
@@ -277,6 +284,9 @@ int prepare_callable(DeviceContextHandle ctx, int32_t callable_id, const void *c
                 callable_id, artifacts.host_dlopen_handle, artifacts.host_orch_func_ptr, std::move(kernel_addrs),
                 std::move(artifacts.signature)
             );
+            if (rc == 0) {
+                host_dlopen_guard.dismiss();
+            }
         } else {
             rc = runner->register_callable(
                 callable_id, artifacts.orch_so_data, artifacts.orch_so_size, artifacts.func_name.c_str(),
@@ -295,6 +305,7 @@ int run_prepared(
     DeviceContextHandle ctx, RuntimeHandle runtime, int32_t callable_id, const void *args, int block_dim,
     int aicpu_thread_num, int enable_l2_swimlane, int enable_dump_tensor, int enable_pmu, int enable_dep_gen,
     int enable_scope_stats, uint64_t ring_task_window, uint64_t ring_heap, uint64_t ring_dep_pool,
+    const uint64_t *ring_task_windows, const uint64_t *ring_heaps, const uint64_t *ring_dep_pools,
     const char *output_prefix, PtoRunTiming *out_timing
 ) {
     if (out_timing != NULL) {
@@ -343,7 +354,8 @@ int run_prepared(
 
         rc = bind_callable_to_runtime_impl(
             r, reinterpret_cast<const ChipStorageTaskArgs *>(args), bind_result.host_orch_func_ptr,
-            bind_result.signature, bind_result.sig_count, ring_task_window, ring_heap, ring_dep_pool
+            bind_result.signature, bind_result.sig_count, ring_task_window, ring_heap, ring_dep_pool, ring_task_windows,
+            ring_heaps, ring_dep_pools
         );
         if (rc != 0) {
             r->set_gm_sm_ptr(nullptr);

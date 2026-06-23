@@ -461,32 +461,7 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
                 );
             }
 
-            uint64_t task_window_size = PTO2_TASK_WINDOW_SIZE;
-            uint64_t heap_size = PTO2_HEAP_SIZE;
-
-            if (runtime->task_window_size > 0) {
-                task_window_size = runtime->task_window_size;
-            }
-            if (runtime->heap_size > 0) {
-                heap_size = runtime->heap_size;
-            }
-            int32_t dep_pool_capacity = PTO2_DEP_LIST_POOL_SIZE;
-            if (runtime->dep_pool_size > 0) {
-                dep_pool_capacity = static_cast<int32_t>(runtime->dep_pool_size);
-            }
-            LOG_INFO_V0(
-                "Thread %d: Ring sizes: task_window=%lu, heap=%lu, dep_pool=%d", thread_idx,
-                static_cast<uint64_t>(task_window_size), static_cast<uint64_t>(heap_size), dep_pool_capacity
-            );
-
-            // gm_heap pointer / dep_pool_capacity are encoded into the prebuilt
-            // runtime arena image at host build time, so we no longer fetch
-            // them here. They remain on the host Runtime instance and on the
-            // PTO2Runtime header for diagnostic purposes only.
-            (void)dep_pool_capacity;
-
             void *sm_ptr = runtime->get_gm_sm_ptr();
-            uint64_t sm_size = PTO2SharedMemoryHandle::calculate_size(task_window_size);
 
             // Prebuilt-arena fast path. Host has pre-populated the entire
             // runtime arena (PTO2Runtime + orchestrator/scheduler/tensor_map
@@ -508,6 +483,14 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
             // Wire every arena-internal pointer field (host wrote host-mirror
             // addresses; we overwrite them with device addresses).
             runtime_wire_arena_pointers(runtime_arena_, rt->prebuilt_layout, rt);
+            uint64_t sm_size = PTO2SharedMemoryHandle::calculate_size_per_ring(rt->prebuilt_layout.task_window_sizes);
+            for (int r = 0; r < PTO2_MAX_RING_DEPTH; ++r) {
+                LOG_INFO_V0(
+                    "Thread %d: Ring %d sizes: task_window=%" PRIu64 " heap=%" PRIu64 " dep_pool=%d", thread_idx, r,
+                    rt->prebuilt_layout.task_window_sizes[r], rt->prebuilt_layout.heap_sizes[r],
+                    rt->prebuilt_layout.dep_pool_capacities[r]
+                );
+            }
 
             // Reset SM state. setup_pointers + init_header_per_ring restore
             // ring flow-control counters, layout metadata, error flags, and
@@ -515,8 +498,11 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
             // fanin_count/active_mask zero — previously done inside
             // RingSchedState::init).
             memset(rt->sm_handle, 0, sizeof(*rt->sm_handle));
-            if (!rt->sm_handle->init(sm_ptr, sm_size, task_window_size, heap_size)) {
-                LOG_ERROR("Thread %d: sm_handle->init failed", thread_idx);
+            if (!rt->sm_handle->init_per_ring(
+                    sm_ptr, sm_size, rt->prebuilt_layout.task_window_sizes, rt->prebuilt_layout.heap_sizes
+                )) {
+                LOG_ERROR("Thread %d: sm_handle->init_per_ring failed", thread_idx);
+                rt = nullptr;
                 runtime_init_ready_.store(true, std::memory_order_release);
                 return -1;
             }
@@ -537,7 +523,7 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
                 for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
                     auto &alloc = orch.rings[r].task_allocator;
                     scope_stats_set_ring_capacity(
-                        r, alloc.window_size(), alloc.heap_capacity(), rt->prebuilt_layout.dep_pool_capacity
+                        r, alloc.window_size(), alloc.heap_capacity(), rt->prebuilt_layout.dep_pool_capacities[r]
                     );
                 }
                 scope_stats_set_tensormap_capacity(orch.tensor_map.pool_capacity());

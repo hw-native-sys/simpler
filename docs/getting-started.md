@@ -51,6 +51,10 @@ export PTO_ISA_ROOT=$(pwd)/build/pto-isa
 export PTO_ISA_ROOT=/path/to/your/pto-isa
 ```
 
+`PTO_ISA_ROOT` should point to a full pto-isa git checkout, not a headers-only copy.
+Install-time a2a3 onboard runtime builds record the PTO-ISA git commit so later
+runtime compatibility checks can detect mismatched ISA revisions.
+
 **Troubleshooting:**
 
 - If git is not available: Clone pto-isa manually and set `PTO_ISA_ROOT`

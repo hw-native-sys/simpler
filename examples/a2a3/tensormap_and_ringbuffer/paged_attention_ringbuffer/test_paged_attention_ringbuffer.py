@@ -69,10 +69,8 @@ class TestPagedAttentionRingbuffer(SceneTestCase):
         {
             "name": "ringbuffer_stress",
             "platforms": ["a2a3"],
-            # ring_heap must be a power of 2; the historical RUNTIME_ENV value
-            # 2621440 (2.5 MiB) was silently rejected by the env parser, so the
-            # case actually ran with the 256 MiB default. 4 MiB keeps the
-            # small-ring stress intent with a valid size.
+            # ring_heap is bytes per ring. Non power-of-2 sizes are accepted,
+            # but 4 MiB keeps the small-ring stress intent compact.
             "config": {
                 "aicpu_thread_num": 4,
                 "block_dim": 24,

@@ -180,7 +180,7 @@ private:
     uint64_t regs_{0};
 
     // --- One-time init coordination ---
-    std::atomic<bool> init_done_{false};
+    std::atomic<bool> init_claimed_{false};
     std::atomic<bool> init_complete_{false};
 
     // =========================================================================

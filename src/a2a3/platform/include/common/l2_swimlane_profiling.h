@@ -476,26 +476,49 @@ static_assert(sizeof(L2SwimlaneDataHeader) % 64 == 0, "L2SwimlaneDataHeader must
 //   (`g_orch_*_cycle`) — they answer "which sub-step dominates overall";
 //   the per-submit envelope answers "which submit was slow".
 
-/** Discriminator for the SCHED phase records (the orch side has no kind). */
+/** Discriminator for the SCHED phase records (the orch side has no kind).
+ *
+ * Three role classes, but they share one enum so the on-device record carries
+ * a single discriminator byte:
+ *
+ *   OUTER (mutually time-exclusive within an iter; emit advances _t0_phase):
+ *     Complete, Dispatch, Release, Wire, Dummy, EarlyDispatch.
+ *     Every iter is a sequence of zero-or-more outer bars + optional gap.
+ *
+ *   INNER (no anchor advance; Perfetto auto-nests by time containment):
+ *     Resolve. Only parents are Complete and Dummy — those are the two
+ *     FIN-observation sites that call on_task_complete.
+ *
+ *   SEPARATE-LANE (converter routes to Worker View pid=4, not the sched lane):
+ *     DummyTask. One zero-width marker per dummy so the DAG node is visually
+ *     present on its handling AICPU's lane; the surrounding Dummy outer bar
+ *     (sched lane) carries the actual drain time, and Resolve inside that
+ *     bar carries the consumer-release work.
+ */
 enum class L2SwimlaneSchedPhaseKind : uint32_t {
-    Complete = 0,  // Process completed tasks (fanin traversal)
-    Dispatch = 1,  // Dispatch ready tasks to idle cores
-    Release = 2,   // Deferred-release drain (on_task_release work)
-    // The following are nested inside their parent Complete/Dispatch bar
-    // (Perfetto stacks time-contained events on the same lane), except
-    // DummyTask which the converter routes to Worker View pid=4.
-    Resolve = 3,        // on_task_complete: walk consumer list, decrement fanin,
-                        // push newly-ready successors, ring doorbells for
-                        // speculative hits. tasks_processed = # consumers visited.
-    EarlyDispatch = 4,  // try_speculative_early_dispatch — speculative pre-staging
+    // Outer
+    Complete = 0,       // check_running_cores_for_completion: observe FINs +
+                        // run on_task_complete inline. tasks_processed = FIN'd
+                        // subtasks + sub-block retires this iter.
+    Dispatch = 1,       // dispatch_ready_tasks: publish ready tasks to AICore.
+                        // tasks_processed = subtasks published this iter.
+    Release = 2,        // Deferred-release drain (on_task_release work).
+                        // tasks_processed = slots released this iter.
+    Wire = 3,           // drain_wiring_queue: pop wired tasks into ready queues.
+                        // tasks_processed = wired count.
+    Dummy = 4,          // dummy_drain outer bar: covers handling of all dummies
+                        // popped this iter. tasks_processed = dummy_got count.
+    EarlyDispatch = 5,  // try_speculative_early_dispatch: speculative pre-staging
                         // of a flagged producer's consumer's gated blocks.
                         // tasks_processed = blocks staged this pass.
-    DummyTask = 5,      // Dummy (DAG fence / barrier node) identity marker
-                        // emitted once per dummy in dummy_drain. No AICore
-                        // presence; the converter renders this as a thin bar on
-                        // Worker View's DUMMY_T{thread} lane. tasks_processed =
-                        // task_token_raw low 32 bits. The surrounding Resolve
-                        // bar captures the consumer-release work that follows.
+    // Inner (parent: Complete | Dummy)
+    Resolve = 6,  // on_task_complete: walk consumer list, decrement fanin,
+                  // push newly-ready successors, ring doorbells for
+                  // speculative hits. tasks_processed = # consumers visited.
+    // Separate-lane (Worker View pid=4 AICPU_N)
+    DummyTask = 7,  // Per-dummy identity marker (zero-width). tasks_processed
+                    // = task_token_raw low 32 bits so deps.json flow arrows
+                    // can land on it.
 };
 
 /** Index layout of the queue-depth snapshot arrays below: AIC=0, AIV=1, MIX=2.
@@ -524,7 +547,7 @@ struct L2SwimlaneAicpuSchedPhaseRecord {
     uint64_t start_time;                                        // Phase start timestamp
     uint64_t end_time;                                          // Phase end timestamp
     uint32_t loop_iter;                                         // Scheduler-loop iteration number on this thread
-    L2SwimlaneSchedPhaseKind kind;                              // Complete or Dispatch
+    L2SwimlaneSchedPhaseKind kind;                              // see enum above
     uint32_t tasks_processed;                                   // Tasks processed in this phase batch
     uint32_t pop_hit;                                           // SCHED_DISPATCH delta since last emit (0 for Complete)
     uint32_t pop_miss;                                          // SCHED_DISPATCH delta since last emit (0 for Complete)

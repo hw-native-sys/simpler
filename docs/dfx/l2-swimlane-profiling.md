@@ -33,16 +33,20 @@ available.
   `l2_swimlane_records.json` with `deps.json` from
   [`dep_gen`](dep_gen.md) at post-process time; see
   [§3.5](#35-dependency-arrows-from-dep_gen).
-- **AICPU scheduler phases** — per-iteration breakdown into
-  `complete` / `dispatch` / `release` / `resolve` (Complete sub-bar
-  for the consumer-release walk) / `early_dispatch` (speculative
-  pre-staging). Idle iterations no longer emit a record on a2a3;
-  the host tooling reconstructs idle spans from the gap between
-  consecutive work records on the same thread. Legacy captures may
-  carry `scan` / `poll` / `idle` / `fanout` / `prestage` — current
-  a2a3 builds no longer emit them (PR #1079's Scan/Poll debug
-  overlay was removed; Fanout was renamed Resolve and now also
-  filters out <1 µs walks; Prestage was renamed EarlyDispatch).
+- **AICPU scheduler phases** — per-iteration breakdown into six
+  mutually time-exclusive **outer** phases (`complete` / `dispatch`
+  / `release` / `wire` / `dummy` / `early_dispatch`), one **inner**
+  phase that nests inside its parent outer (`resolve`, parent =
+  Complete or Dummy), and one **separate-lane** phase
+  (`dummy_task`, rendered on Worker View AICPU_N rather than on the
+  sched lane). Idle iterations no longer emit a record on a2a3; the
+  host tooling reconstructs idle spans from the gap between
+  consecutive work records on the same thread. See §3.2 for the
+  full per-phase table. Legacy captures may carry `scan` / `poll` /
+  `idle` / `fanout` / `prestage` — current a2a3 builds no longer
+  emit them (PR #1079's Scan/Poll debug overlay was removed;
+  Fanout was renamed Resolve and now also filters out <1 µs walks;
+  Prestage was renamed EarlyDispatch).
 - **Orchestrator submit envelope** — one record per `submit_task()`
   / `alloc_tensors()` call covering the whole submit's
   `[start, end]` window (`orch_submit` phase). Per-sub-step
@@ -211,14 +215,41 @@ Phase records (per scheduler thread, level >= 3 for
 | Field | Meaning |
 | ----- | ------- |
 | `start_time_us` / `end_time_us` | Phase start / end timestamps in microseconds (reader-side cycle→µs conversion) |
-| `phase` | Lowercase phase name. Scheduler: `complete` / `dispatch` / `release` / `resolve` / `early_dispatch`. Legacy (still parsed for old captures): `scan` / `poll` / `fanout` / `prestage` / `idle` — current a2a3 builds no longer emit Scan/Poll (PR #1079 debug overlay removed) or Prestage (renamed to EarlyDispatch); Fanout was renamed to Resolve. Orchestrator: `orch_submit` — one record per `submit_task()` / `alloc_tensors()` call spanning its full `[start, end]` window. Legacy per-sub-step strings (`orch_sync` / `orch_alloc` / `orch_params` / `orch_lookup` / `orch_insert` / `orch_fanin`) may appear in old captures. |
+| `phase` | Lowercase phase name. Scheduler: see the table below. Orchestrator: `orch_submit` — one record per `submit_task()` / `alloc_tensors()` call spanning its full `[start, end]` window. Legacy per-sub-step strings (`orch_sync` / `orch_alloc` / `orch_params` / `orch_lookup` / `orch_insert` / `orch_fanin`) may appear in old captures. |
 | `loop_iter` (scheduler) / `submit_idx` (orchestrator) | Iteration / submit-call counter for the producing thread |
-| `tasks_processed` (scheduler) / `task_id` (orchestrator) | Phase-specific union field |
+| `tasks_processed` (scheduler) / `task_id` (orchestrator) | Phase-specific union field (see per-phase table) |
 | `pop_hit` / `pop_miss` (dispatch only) | Ready-queue pop deltas since the previous dispatch emit |
 
-On disk the sched records carry a `kind` field (`complete` /
-`dispatch`); the reader renames it to `phase` so downstream code can
-keep a single discriminator name.
+Scheduler phase taxonomy — three role classes share one `phase`
+field but render differently in Perfetto:
+
+| Phase | Role | Lane | `tasks_processed` semantic |
+| ----- | ---- | ---- | -------------------------- |
+| `complete` | outer | sched (pid=2) | FIN'd subtasks + sub-block retires this iter |
+| `dispatch` | outer | sched | subtasks published this iter |
+| `release` | outer | sched | deferred-release slots drained this iter |
+| `wire` | outer | sched | tasks wired by `drain_wiring_queue` this iter |
+| `dummy` | outer | sched | dummies handled by `dummy_drain` this iter |
+| `early_dispatch` | outer | sched | blocks staged by speculative early-dispatch this pass |
+| `resolve` | inner | sched (nests in `complete` or `dummy`) | consumers visited in `on_task_complete` |
+| `dummy_task` | separate-lane | Worker View AICPU_N (pid=4) | dummy `task_id` low 32 bits (deps.json flow target) |
+
+Outer phases are mutually time-exclusive within an iter — each
+emit advances the per-thread phase anchor (`_t0_phase`). Inner
+phases (`resolve`) don't advance the anchor; Perfetto nests them
+under the parent outer bar via time containment. Separate-lane
+phases are routed to a different lane by the converter (Worker
+View AICPU_N), so they never overlap visually with the sched
+lane bars even when their timestamps fall inside an outer span.
+
+Legacy phases (`scan` / `poll` / `idle` / `fanout` / `prestage`)
+are still parsed for old captures but current a2a3/a5 builds no
+longer emit them. Renames: `fanout` → `resolve`, `prestage` →
+`early_dispatch`. Removed: Scan/Poll (PR #1079 debug overlay).
+
+On disk the sched records carry a `kind` field (string-encoded
+phase name); the reader renames it to `phase` so downstream code
+can keep a single discriminator name.
 
 `core_to_thread[]` (level >= 3) maps `core_id` (array index) to the
 scheduler thread index that retired that core's tasks (`-1` =
@@ -248,17 +279,26 @@ The output is `outputs/<case>_<ts>/merged_swimlane.json` (or your
 `-o` override). Open <https://ui.perfetto.dev/> and drag the file
 in. The trace contains:
 
-- **AICore View** — one swim-lane per AICore (AIC / AIV / mix
-  channel) showing each task's execution window. Task labels follow
-  the deps.json-dependent rule below.
-- **AICPU View** — one lane per task showing the AICPU
-  `dispatch_time_us → finish_time_us` window (level >= 2). Tasks here
-  carry the **same labels** as the AICore View — so they share the
-  same deps.json dependency below.
-- **AICPU Scheduler** — per-iteration scheduler phase blocks
-  (`complete` / `dispatch`) coloured by `phase` (level >= 3).
-- **AICPU Orchestrator** — per-submit `orch_submit` envelope blocks
-  (level >= 4).
+- **Orchestrator** (pid=1) — per-submit `orch_submit` envelope
+  blocks (level >= 4).
+- **AICPU Scheduler** (pid=2) — per-iteration scheduler phase
+  blocks coloured by `phase` (level >= 3). The six outer phases
+  (`complete` / `dispatch` / `release` / `wire` / `dummy` /
+  `early_dispatch`) appear as sibling bars on each scheduler
+  thread's lane; the `resolve` inner phase nests inside its
+  parent (`complete` or `dummy`).
+- **Scheduler View** (pid=3) — task-execution overlay using AICPU
+  dispatch/finish timestamps (level >= 2), with the same labels
+  as Worker View.
+- **Worker View** (pid=4) — one swim-lane per physical worker:
+  - `AIC_N` — matrix cores (kernel exec from level >= 1)
+  - `AIV_N` — vector cores (kernel exec from level >= 1)
+  - `AICPU_N` — AICPU acting as worker; carries `dummy_task`
+    zero-width markers (one per dummy drained by the sched
+    thread on AICPU N) and `alloc` bars (from `alloc_tensors()`
+    calls that the orchestrator on AICPU 0 inline-completed).
+    Both are activities the AICPU performs as a worker, so they
+    share the same lane tier as AIC/AIV.
 
 **Task labeling (AICore View and AICPU View) depends entirely on
 whether a `deps.json` is present** (see

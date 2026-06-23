@@ -78,6 +78,7 @@ NB_MODULE(_task_interface, m) {
     // --- Constants ---
     m.attr("MAX_TENSOR_DIMS") = MAX_TENSOR_DIMS;
     m.attr("MAX_REGISTERED_CALLABLE_IDS") = MAX_REGISTERED_CALLABLE_IDS;
+    m.attr("RUNTIME_ENV_RING_COUNT") = RUNTIME_ENV_RING_COUNT;
 
     // --- Tensor ---
     // The unified strided tensor descriptor. Constructed contiguous via make()
@@ -613,15 +614,80 @@ NB_MODULE(_task_interface, m) {
         });
 
     // --- RuntimeEnv (per-task PTO2_RING_* overrides; nested under CallConfig.runtime_env) ---
+    auto get_ring_values = [](const uint64_t values[RUNTIME_ENV_RING_COUNT]) -> std::vector<uint64_t> {
+        std::vector<uint64_t> out;
+        out.reserve(RUNTIME_ENV_RING_COUNT);
+        for (int i = 0; i < RUNTIME_ENV_RING_COUNT; ++i) {
+            out.push_back(values[i]);
+        }
+        return out;
+    };
+    auto set_ring_values = [](uint64_t values[RUNTIME_ENV_RING_COUNT], const std::vector<uint64_t> &input,
+                              const char *name) {
+        if (input.size() != RUNTIME_ENV_RING_COUNT) {
+            throw std::invalid_argument(
+                std::string("RuntimeEnv.") + name + " must contain exactly " + std::to_string(RUNTIME_ENV_RING_COUNT) +
+                " entries"
+            );
+        }
+        for (int i = 0; i < RUNTIME_ENV_RING_COUNT; ++i) {
+            values[i] = input[static_cast<size_t>(i)];
+        }
+    };
+    auto append_ring_values = [](std::ostringstream &os, const char *name,
+                                 const uint64_t values[RUNTIME_ENV_RING_COUNT]) {
+        os << ", " << name << "=[";
+        for (int i = 0; i < RUNTIME_ENV_RING_COUNT; ++i) {
+            if (i != 0) {
+                os << ", ";
+            }
+            os << values[i];
+        }
+        os << "]";
+    };
+
     nb::class_<RuntimeEnv>(m, "RuntimeEnv")
         .def(nb::init<>())
         .def_rw("ring_task_window", &RuntimeEnv::ring_task_window)
         .def_rw("ring_heap", &RuntimeEnv::ring_heap)
         .def_rw("ring_dep_pool", &RuntimeEnv::ring_dep_pool)
-        .def("__repr__", [](const RuntimeEnv &self) -> std::string {
+        .def_prop_rw(
+            "ring_task_windows",
+            [get_ring_values](const RuntimeEnv &self) {
+                return get_ring_values(self.ring_task_windows);
+            },
+            [set_ring_values](RuntimeEnv &self, const std::vector<uint64_t> &values) {
+                set_ring_values(self.ring_task_windows, values, "ring_task_windows");
+            }
+        )
+        .def_prop_rw(
+            "ring_heaps",
+            [get_ring_values](const RuntimeEnv &self) {
+                return get_ring_values(self.ring_heaps);
+            },
+            [set_ring_values](RuntimeEnv &self, const std::vector<uint64_t> &values) {
+                set_ring_values(self.ring_heaps, values, "ring_heaps");
+            }
+        )
+        .def_prop_rw(
+            "ring_dep_pools",
+            [get_ring_values](const RuntimeEnv &self) {
+                return get_ring_values(self.ring_dep_pools);
+            },
+            [set_ring_values](RuntimeEnv &self, const std::vector<uint64_t> &values) {
+                set_ring_values(self.ring_dep_pools, values, "ring_dep_pools");
+            }
+        )
+        .def("__repr__", [append_ring_values](const RuntimeEnv &self) -> std::string {
             std::ostringstream os;
             os << "RuntimeEnv(ring_task_window=" << self.ring_task_window << ", ring_heap=" << self.ring_heap
-               << ", ring_dep_pool=" << self.ring_dep_pool << ")";
+               << ", ring_dep_pool=" << self.ring_dep_pool;
+            if (self.per_ring_any()) {
+                append_ring_values(os, "ring_task_windows", self.ring_task_windows);
+                append_ring_values(os, "ring_heaps", self.ring_heaps);
+                append_ring_values(os, "ring_dep_pools", self.ring_dep_pools);
+            }
+            os << ")";
             return os.str();
         });
 
@@ -713,7 +779,7 @@ NB_MODULE(_task_interface, m) {
                 std::memcpy(c.output_prefix, s.data(), s.size());
             }
         )
-        .def("__repr__", [](const CallConfig &self) -> std::string {
+        .def("__repr__", [append_ring_values](const CallConfig &self) -> std::string {
             std::ostringstream os;
             os << "CallConfig(block_dim=" << self.block_dim << ", aicpu_thread_num=" << self.aicpu_thread_num
                << ", enable_l2_swimlane=" << self.enable_l2_swimlane
@@ -724,6 +790,11 @@ NB_MODULE(_task_interface, m) {
                 os << ", runtime_env.ring_task_window=" << self.runtime_env.ring_task_window
                    << ", runtime_env.ring_heap=" << self.runtime_env.ring_heap
                    << ", runtime_env.ring_dep_pool=" << self.runtime_env.ring_dep_pool;
+                if (self.runtime_env.per_ring_any()) {
+                    append_ring_values(os, "runtime_env.ring_task_windows", self.runtime_env.ring_task_windows);
+                    append_ring_values(os, "runtime_env.ring_heaps", self.runtime_env.ring_heaps);
+                    append_ring_values(os, "runtime_env.ring_dep_pools", self.runtime_env.ring_dep_pools);
+                }
             }
             if (self.output_prefix_set()) {
                 os << ", output_prefix='" << self.output_prefix << "'";

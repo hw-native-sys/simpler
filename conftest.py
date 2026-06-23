@@ -199,14 +199,14 @@ def pytest_addoption(parser):
         "--pto-isa-commit",
         action="store",
         default=None,
-        help="Pin pto-isa clone to this commit before running tests",
+        help=("Override the pto-isa revision before running tests. Default/latest: use the current checkout HEAD."),
     )
     parser.addoption(
         "--clone-protocol",
         action="store",
         default="ssh",
         choices=["ssh", "https"],
-        help="Protocol for cloning pto-isa when --pto-isa-commit is set",
+        help="Protocol for cloning pto-isa when PTO_ISA_ROOT is not already set",
     )
     parser.addoption(
         "--sanitizer",
@@ -449,7 +449,7 @@ def pytest_configure(config):
     # Pre-clone / refresh PTO-ISA up front so that (a) the requested
     # --clone-protocol is honored before SceneTestCase's lazy default-ssh
     # resolve, and (b) the local clone is fetched to origin/HEAD so a
-    # --pto-isa-commit request doesn't miss a recently-published commit.
+    # requested/default pto-isa commit doesn't miss a recently-published object.
     # Short-circuits when $PTO_ISA_ROOT already points to a user-managed clone.
     #
     # Pre-clone is an optimization, not a requirement: jobs that don't actually

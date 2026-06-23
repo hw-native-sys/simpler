@@ -1264,12 +1264,16 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
         # for it. (Idle is still tallied numerically by
         # sched_overhead_analysis.py Part 2 via gap reconstruction.)
         phase_colors = {
+            # Outer phases — mutually time-exclusive within an iter
             "complete": "good",  # green
             "dispatch": "terrible",  # red
             "release": "olive",  # deferred-release drain (on_task_release work)
-            "resolve": "vsync_highlight_color",  # nested in complete: walk consumer list + doorbells
-            "early_dispatch": "rail_animation",  # speculative early-dispatch (Hook 1) staging
-            # Rendered separately on Worker View; this color is a fallback if it ever lands on Sched.
+            "wire": "thread_state_running",  # drain_wiring_queue pass
+            "dummy": "grey",  # dummy_drain pass (Resolve nests inside)
+            "early_dispatch": "rail_animation",  # speculative early-dispatch staging
+            # Inner phase — nests inside Complete or Dummy via time containment
+            "resolve": "vsync_highlight_color",  # on_task_complete: walk consumer list
+            # Separate-lane (Worker View AICPU_N) — fallback color if it ever lands on Sched
             "dummy_task": "grey",
         }
 
@@ -1324,20 +1328,27 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
                     continue
                 finishes_per_complete[id(t_comp)] += 1
 
-        # Worker View (pid=4) DUMMY lanes: one per scheduler thread, used by
-        # the `dummy_task` phase below to surface DAG fence / barrier nodes.
-        # Tids 19000+thread_idx keep them visually grouped after the physical
+        # Worker View (pid=4) AICPU lanes: AICPU_N treated as a worker tier
+        # alongside AIC_N (matrix) and AIV_N (vector). DummyTask phases (per
+        # dummy DAG-node identity markers from the scheduler thread that
+        # drained them) and Alloc phases (per `alloc_tensors()` call from the
+        # orchestrator) both render on these lanes — they are the activities
+        # that an AICPU performs when it acts as a worker. The lane index is
+        # the AICPU id; with the current 1:1 sched-thread-to-AICPU mapping,
+        # `thread_idx` IS the AICPU id, and the single orch is on AICPU 0.
+        # Tids 19000+aicpu_id keep them visually grouped after the physical
         # AIC/AIV lanes (which sit at 10000+core_id*10).
-        DUMMY_TID_BASE = 19000  # noqa: N806
-        for thread_idx in range(len(scheduler_phases)):
+        AICPU_TID_BASE = 19000  # noqa: N806
+        num_aicpu_lanes = max(len(scheduler_phases), len(orchestrator_phases or []))
+        for aicpu_id in range(num_aicpu_lanes):
             events.append(
                 {
-                    "args": {"name": f"DUMMY_T{thread_idx}"},
+                    "args": {"name": f"AICPU_{aicpu_id}"},
                     "cat": "__metadata",
                     "name": "thread_name",
                     "ph": "M",
                     "pid": 4,
-                    "tid": DUMMY_TID_BASE + thread_idx,
+                    "tid": AICPU_TID_BASE + aicpu_id,
                 }
             )
 
@@ -1368,7 +1379,8 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
             #
             # `dummy_task` is special: it does NOT live on the sched track —
             # it represents a DAG fence node briefly inhabiting the AICPU as a
-            # virtual worker, so we route it to Worker View (pid=4) DUMMY_T{thr}.
+            # virtual worker, so we route it to Worker View (pid=4) AICPU_N
+            # (where N = the AICPU id of the sched thread that drained it).
             for record in thread_records:
                 phase = record.get("phase", "unknown")
                 if phase == "dummy_task":
@@ -1389,13 +1401,13 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
                             "name": f"dummy(t{task_id_low32})",
                             "ph": "X",
                             "pid": 4,
-                            "tid": DUMMY_TID_BASE + thread_idx,
+                            "tid": AICPU_TID_BASE + thread_idx,
                             "ts": start_us,
                             "dur": dur,
                         }
                     )
                     continue
-                if phase not in ("complete", "dispatch", "release", "resolve", "early_dispatch"):
+                if phase not in ("complete", "dispatch", "release", "resolve", "early_dispatch", "wire", "dummy"):
                     continue
                 start_us = record["start_time_us"]
                 end_us = record["end_time_us"]
@@ -1581,23 +1593,25 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
                     if rec.get("phase") == "dummy_task":
                         dummy_low32.add(rec.get("tasks_processed", 0))
 
-        # ALLOC lane metadata on Worker View (pid=4). One ALLOC_T{orch_idx}
-        # lane per orchestrator thread (mirror DUMMY_T{thread_idx} convention).
-        # Tids 18000+orch_idx keep ALLOC lanes grouped just before the DUMMY
-        # lanes (tids 19000+) so the Worker View reads:
-        #   AIC_* / AIV_* / ALLOC_T* / DUMMY_T*
-        ALLOC_TID_BASE = 18000  # noqa: N806
-        for orch_idx in range(len(orchestrator_phases)):
-            events.append(
-                {
-                    "args": {"name": f"ALLOC_T{orch_idx}"},
-                    "cat": "__metadata",
-                    "name": "thread_name",
-                    "ph": "M",
-                    "pid": 4,
-                    "tid": ALLOC_TID_BASE + orch_idx,
-                }
-            )
+        # Alloc bars land on the same AICPU_N lane that hosts the orchestrator
+        # (one AICPU lane per AICPU; the orch is on AICPU 0 in the single-orch
+        # case). The AICPU lane metadata is emitted by the scheduler_phases
+        # block above (via AICPU_TID_BASE). If there are orch records but no
+        # sched records (level=4 with no SCHED_PHASES data), emit them here so
+        # the alloc bars below have valid lane metadata.
+        AICPU_TID_BASE = 19000  # noqa: N806
+        if not scheduler_phases:
+            for orch_idx in range(len(orchestrator_phases)):
+                events.append(
+                    {
+                        "args": {"name": f"AICPU_{orch_idx}"},
+                        "cat": "__metadata",
+                        "name": "thread_name",
+                        "ph": "M",
+                        "pid": 4,
+                        "tid": AICPU_TID_BASE + orch_idx,
+                    }
+                )
 
         for orch_idx, thread_records in enumerate(orchestrator_phases):
             tid = 4000 + orch_idx
@@ -1634,8 +1648,9 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
                 # Classification: orch_submit envelopes whose task_id is NOT in
                 # the AICore record set AND NOT in DummyTask phases are
                 # alloc_tensors() calls. Render a parallel "alloc(...)" bar on
-                # Worker View pid=4 ALLOC_T{orch_idx} so DAG nodes for alloc
-                # tasks are visible (matches the DUMMY_T treatment).
+                # the Worker View AICPU_{orch_idx} lane so the DAG node is
+                # visible (matches the dummy treatment — both are AICPU acting
+                # as worker).
                 if phase == "orch_submit" and task_id >= 0:
                     is_regular = task_id in regular_task_ids
                     task_low32 = task_id & 0xFFFFFFFF
@@ -1653,7 +1668,7 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
                                 "name": f"alloc({format_task_display(task_id)})",
                                 "ph": "X",
                                 "pid": 4,
-                                "tid": ALLOC_TID_BASE + orch_idx,
+                                "tid": AICPU_TID_BASE + orch_idx,
                                 "ts": start_us,
                                 "dur": max(dur, 0.02),
                             }

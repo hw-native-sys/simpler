@@ -174,7 +174,7 @@ struct PTO2FaninPool;      // Forward declaration
 struct PTO2FaninSpillEntry {
     PTO2TaskSlotState *slot_state;
 };
-static_assert(sizeof(PTO2FaninSpillEntry) == sizeof(PTO2TaskSlotState *));
+static_assert(sizeof(PTO2FaninSpillEntry) == sizeof(uintptr_t));
 
 /**
  * Dependency list entry (singly-linked list node)

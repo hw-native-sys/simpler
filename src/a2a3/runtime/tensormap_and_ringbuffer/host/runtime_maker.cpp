@@ -34,18 +34,26 @@
 #include <cinttypes>
 #include <cstddef>
 #include <cstdint>
+#include <cctype>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
+#include <string>
 
 #include "../common/pto_runtime_status.h"
 #include "../runtime/pto_runtime2.h"
 #include "../runtime/pto_shared_memory.h"
 #include "../runtime/runtime.h"
+#include "../../../../common/task_interface/call_config.h"
 #include "callable.h"
 #include "common/platform_config.h"
 #include "common/unified_log.h"
 #include "utils/device_arena.h"
 #include "prepare_callable_common.h"
+
+static_assert(
+    RUNTIME_ENV_RING_COUNT == PTO2_MAX_RING_DEPTH, "RuntimeEnv ring count must match PTO2 runtime ring depth"
+);
 
 // Helper: return current time in milliseconds
 static int64_t _now_ms() {
@@ -54,25 +62,194 @@ static int64_t _now_ms() {
     return static_cast<int64_t>(tv.tv_sec) * 1000 + tv.tv_usec / 1000;
 }
 
-/**
- * Parse an environment variable as uint64_t with optional power-of-2 constraint.
- * Returns the parsed value on success, or 0 if unset or validation fails.
- */
-static uint64_t parse_env_uint64(const char *name, uint64_t min_val, bool require_power_of_2) {
-    const char *env = std::getenv(name);
-    if (!env) return 0;
-    char *endptr;
+static bool is_power_of_2_u64(uint64_t value) { return value != 0 && (value & (value - 1)) == 0; }
+
+template <typename T>
+static std::string format_ring_array(const T (&values)[PTO2_MAX_RING_DEPTH]) {
+    std::string out = "[";
+    for (int r = 0; r < PTO2_MAX_RING_DEPTH; ++r) {
+        if (r != 0) {
+            out += ", ";
+        }
+        out += std::to_string(values[r]);
+    }
+    out += "]";
+    return out;
+}
+
+static std::string trim_copy(const std::string &input) {
+    size_t begin = 0;
+    while (begin < input.size() && std::isspace(static_cast<unsigned char>(input[begin]))) {
+        ++begin;
+    }
+    size_t end = input.size();
+    while (end > begin && std::isspace(static_cast<unsigned char>(input[end - 1]))) {
+        --end;
+    }
+    return input.substr(begin, end - begin);
+}
+
+static bool parse_uint_token(
+    const char *name, const std::string &raw, uint64_t min_val, uint64_t max_val, bool require_power_of_2, uint64_t *out
+) {
+    std::string token = trim_copy(raw);
+    if (token.empty()) {
+        LOG_WARN("%s has an empty value in '%s', ignored", name, raw.c_str());
+        return false;
+    }
+
+    if (token[0] == '-') {
+        LOG_WARN("%s=%s invalid (must be a non-negative integer), ignored", name, token.c_str());
+        return false;
+    }
+    char *endptr = nullptr;
     errno = 0;
-    uint64_t val = strtoull(env, &endptr, 10);
-    if (errno == ERANGE || endptr == env || *endptr != '\0' || val < min_val) {
-        LOG_WARN("%s=%s invalid (must be a valid integer >= %" PRIu64 "), ignored", name, env, min_val);
-        return 0;
+    unsigned long long parsed = std::strtoull(token.c_str(), &endptr, 10);
+    if (errno == ERANGE || endptr == token.c_str() || *endptr != '\0') {
+        LOG_WARN("%s=%s invalid (must be a non-negative integer), ignored", name, token.c_str());
+        return false;
     }
-    if (require_power_of_2 && (val & (val - 1)) != 0) {
-        LOG_WARN("%s=%s invalid (must be a power of 2, >= %" PRIu64 "), ignored", name, env, min_val);
-        return 0;
+    uint64_t val = static_cast<uint64_t>(parsed);
+
+    if (val < min_val || val > max_val) {
+        LOG_WARN(
+            "%s=%s invalid (must be in [%" PRIu64 ", %" PRIu64 "]), ignored", name, token.c_str(), min_val, max_val
+        );
+        return false;
     }
-    return static_cast<uint64_t>(val);
+    if (require_power_of_2 && !is_power_of_2_u64(val)) {
+        LOG_WARN("%s=%s invalid (must be a power of 2), ignored", name, token.c_str());
+        return false;
+    }
+    *out = val;
+    return true;
+}
+
+static void apply_env_ring_values(
+    const char *name, uint64_t min_val, uint64_t max_val, bool require_power_of_2, uint64_t out[PTO2_MAX_RING_DEPTH]
+) {
+    const char *env = std::getenv(name);
+    if (!env) return;
+
+    std::string text(env);
+    if (text.find(',') == std::string::npos) {
+        uint64_t value = 0;
+        if (!parse_uint_token(name, text, min_val, max_val, require_power_of_2, &value)) {
+            return;
+        }
+        for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
+            out[r] = value;
+        }
+        return;
+    }
+
+    uint64_t parsed[PTO2_MAX_RING_DEPTH]{};
+    size_t pos = 0;
+    for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
+        size_t comma = text.find(',', pos);
+        std::string token = text.substr(pos, comma == std::string::npos ? std::string::npos : comma - pos);
+        if (!parse_uint_token(name, token, min_val, max_val, require_power_of_2, &parsed[r])) {
+            return;
+        }
+        if (comma == std::string::npos) {
+            if (r != PTO2_MAX_RING_DEPTH - 1) {
+                LOG_WARN(
+                    "%s=%s invalid (expected exactly %d comma-separated values), ignored", name, env,
+                    PTO2_MAX_RING_DEPTH
+                );
+                return;
+            }
+            pos = text.size();
+        } else {
+            pos = comma + 1;
+        }
+    }
+    if (pos < text.size() || (!text.empty() && text.back() == ',')) {
+        LOG_WARN("%s=%s invalid (expected exactly %d comma-separated values), ignored", name, env, PTO2_MAX_RING_DEPTH);
+        return;
+    }
+    for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
+        out[r] = parsed[r];
+    }
+}
+
+static bool resolve_ring_config(
+    uint64_t ring_task_window, uint64_t ring_heap, uint64_t ring_dep_pool, const uint64_t *ring_task_windows,
+    const uint64_t *ring_heaps, const uint64_t *ring_dep_pools, uint64_t eff_task_window_sizes[PTO2_MAX_RING_DEPTH],
+    uint64_t eff_heap_sizes[PTO2_MAX_RING_DEPTH], int32_t eff_dep_pool_capacities[PTO2_MAX_RING_DEPTH]
+) {
+    uint64_t dep_pool_values[PTO2_MAX_RING_DEPTH];
+    for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
+        eff_task_window_sizes[r] = PTO2_TASK_WINDOW_SIZE;
+        eff_heap_sizes[r] = PTO2_HEAP_SIZE;
+        dep_pool_values[r] = PTO2_DEP_LIST_POOL_SIZE;
+    }
+
+    apply_env_ring_values("PTO2_RING_TASK_WINDOW", 4, static_cast<uint64_t>(INT32_MAX), true, eff_task_window_sizes);
+    apply_env_ring_values("PTO2_RING_HEAP", 1024, std::numeric_limits<uint64_t>::max(), false, eff_heap_sizes);
+    apply_env_ring_values("PTO2_RING_DEP_POOL", 4, static_cast<uint64_t>(INT32_MAX), false, dep_pool_values);
+
+    if (ring_task_window != 0) {
+        if (ring_task_window < 4 || ring_task_window > static_cast<uint64_t>(INT32_MAX) ||
+            !is_power_of_2_u64(ring_task_window)) {
+            LOG_ERROR(
+                "runtime_env.ring_task_window=%" PRIu64 " must be a power of 2 in [4, INT32_MAX]", ring_task_window
+            );
+            return false;
+        }
+        for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
+            eff_task_window_sizes[r] = ring_task_window;
+        }
+    }
+    if (ring_heap != 0) {
+        if (ring_heap < 1024) {
+            LOG_ERROR("runtime_env.ring_heap=%" PRIu64 " must be >= 1024", ring_heap);
+            return false;
+        }
+        for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
+            eff_heap_sizes[r] = ring_heap;
+        }
+    }
+    if (ring_dep_pool != 0) {
+        if (ring_dep_pool < 4 || ring_dep_pool > static_cast<uint64_t>(INT32_MAX)) {
+            LOG_ERROR("runtime_env.ring_dep_pool=%" PRIu64 " must be in [4, INT32_MAX]", ring_dep_pool);
+            return false;
+        }
+        for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
+            dep_pool_values[r] = ring_dep_pool;
+        }
+    }
+
+    for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
+        if (ring_task_windows != nullptr && ring_task_windows[r] != 0) {
+            eff_task_window_sizes[r] = ring_task_windows[r];
+        }
+        if (ring_heaps != nullptr && ring_heaps[r] != 0) {
+            eff_heap_sizes[r] = ring_heaps[r];
+        }
+        if (ring_dep_pools != nullptr && ring_dep_pools[r] != 0) {
+            dep_pool_values[r] = ring_dep_pools[r];
+        }
+
+        if (eff_task_window_sizes[r] < 4 || eff_task_window_sizes[r] > static_cast<uint64_t>(INT32_MAX) ||
+            !is_power_of_2_u64(eff_task_window_sizes[r])) {
+            LOG_ERROR(
+                "ring_task_windows[%d]=%" PRIu64 " must be a power of 2 in [4, INT32_MAX]", r, eff_task_window_sizes[r]
+            );
+            return false;
+        }
+        if (eff_heap_sizes[r] < 1024) {
+            LOG_ERROR("ring_heaps[%d]=%" PRIu64 " must be >= 1024", r, eff_heap_sizes[r]);
+            return false;
+        }
+        if (dep_pool_values[r] < 4 || dep_pool_values[r] > static_cast<uint64_t>(INT32_MAX)) {
+            LOG_ERROR("ring_dep_pools[%d]=%" PRIu64 " must be in [4, INT32_MAX]", r, dep_pool_values[r]);
+            return false;
+        }
+        eff_dep_pool_capacities[r] = static_cast<int32_t>(dep_pool_values[r]);
+    }
+
+    return true;
 }
 
 static int32_t pto2_read_runtime_status(Runtime *runtime, PTO2SharedMemoryHeader *host_header) {
@@ -164,7 +341,8 @@ prepare_callable_impl(const ChipCallable *callable, uint64_t (*upload_fn)(const 
  */
 extern "C" int bind_callable_to_runtime_impl(
     Runtime *runtime, const ChipStorageTaskArgs *orch_args, void *host_orch_func_ptr, const ArgDirection *signature,
-    int sig_count, uint64_t ring_task_window, uint64_t ring_heap, uint64_t ring_dep_pool
+    int sig_count, uint64_t ring_task_window, uint64_t ring_heap, uint64_t ring_dep_pool,
+    const uint64_t *ring_task_windows, const uint64_t *ring_heaps, const uint64_t *ring_dep_pools
 ) {
     if (runtime == nullptr) {
         LOG_ERROR("Runtime pointer is null");
@@ -187,6 +365,23 @@ extern "C" int bind_callable_to_runtime_impl(
     LOG_INFO_V0("RT2 bind: %d tensors + %d scalars, device orchestration mode", tensor_count, scalar_count);
 
     int64_t t_total_start = _now_ms();
+
+    uint64_t eff_task_window_sizes[PTO2_MAX_RING_DEPTH];
+    uint64_t eff_heap_sizes[PTO2_MAX_RING_DEPTH];
+    int32_t eff_dep_pool_capacities[PTO2_MAX_RING_DEPTH];
+    if (!resolve_ring_config(
+            ring_task_window, ring_heap, ring_dep_pool, ring_task_windows, ring_heaps, ring_dep_pools,
+            eff_task_window_sizes, eff_heap_sizes, eff_dep_pool_capacities
+        )) {
+        return -1;
+    }
+    const std::string task_window_log = format_ring_array(eff_task_window_sizes);
+    const std::string heap_log = format_ring_array(eff_heap_sizes);
+    const std::string dep_pool_log = format_ring_array(eff_dep_pool_capacities);
+    LOG_INFO_V0(
+        "Ring buffer sizes: task_window=%s heap=%s dep_pool=%s", task_window_log.c_str(), heap_log.c_str(),
+        dep_pool_log.c_str()
+    );
 
     // Build device args: copy from input, replace host tensor pointers with device pointers
     ChipStorageTaskArgs device_args;
@@ -255,49 +450,26 @@ extern "C" int bind_callable_to_runtime_impl(
         LOG_INFO_V0("Orchestrator-to-scheduler transition: %s", runtime->orch_to_sched ? "enabled" : "disabled");
     }
 
-    // Ring buffer size overrides: per-task CallConfig value wins over the
-    // env var; both fall back to the compile-time default when zero.
-    {
-        runtime->task_window_size =
-            ring_task_window ? ring_task_window : parse_env_uint64("PTO2_RING_TASK_WINDOW", 4, true);
-        runtime->heap_size = ring_heap ? ring_heap : parse_env_uint64("PTO2_RING_HEAP", 1024, true);
-        runtime->dep_pool_size = ring_dep_pool ? ring_dep_pool : parse_env_uint64("PTO2_RING_DEP_POOL", 4, false);
-        if (runtime->task_window_size || runtime->heap_size || runtime->dep_pool_size) {
-            LOG_INFO_V0(
-                "Ring buffer overrides: task_window=%" PRIu64 " heap=%" PRIu64 " dep_pool=%" PRIu64,
-                (uint64_t)(runtime->task_window_size ? runtime->task_window_size : PTO2_TASK_WINDOW_SIZE),
-                (uint64_t)(runtime->heap_size ? runtime->heap_size : PTO2_HEAP_SIZE),
-                (uint64_t)(runtime->dep_pool_size ? runtime->dep_pool_size : PTO2_DEP_LIST_POOL_SIZE)
-            );
-        }
-    }
-
-    // Resolve effective sizes (env override or compile-time default)
-    uint64_t eff_heap_size = runtime->heap_size ? runtime->heap_size : PTO2_HEAP_SIZE;
-    uint64_t eff_task_window_size = runtime->task_window_size ? runtime->task_window_size : PTO2_TASK_WINDOW_SIZE;
-
     // Lay out the per-Worker static device arena. GM heap, PTO2 shared memory,
     // and the prebuilt runtime arena all live in a single backing allocation;
     // setup_static_arena reserves the three regions and commits in one shot.
     // Owned by DeviceRunner across runs — do NOT record in tensor_pairs_; the
     // free is deferred to DeviceRunner::finalize(). The runtime-arena size is
     // determined by replaying the reserve sequence on a host-side arena.
-    uint64_t total_heap_size = eff_heap_size * PTO2_MAX_RING_DEPTH;
-    uint64_t sm_size = PTO2SharedMemoryHandle::calculate_size(eff_task_window_size);
-    // dep_pool_size comes from a uint64 env var; reject values that don't fit
-    // the int32_t layout-sizing path rather than silently truncating.
-    int32_t eff_dep_pool_capacity = PTO2_DEP_LIST_POOL_SIZE;
-    if (runtime->dep_pool_size != 0) {
-        if (runtime->dep_pool_size > static_cast<uint64_t>(INT32_MAX)) {
-            LOG_ERROR("PTO2_RING_DEP_POOL=%" PRIu64 " exceeds INT32_MAX", runtime->dep_pool_size);
+    uint64_t total_heap_size = 0;
+    for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
+        if (eff_heap_sizes[r] > std::numeric_limits<uint64_t>::max() - total_heap_size) {
+            LOG_ERROR("Total ring heap size overflows uint64_t");
             return -1;
         }
-        eff_dep_pool_capacity = static_cast<int32_t>(runtime->dep_pool_size);
+        total_heap_size += eff_heap_sizes[r];
     }
+    uint64_t sm_size = PTO2SharedMemoryHandle::calculate_size_per_ring(eff_task_window_sizes);
 
     int64_t t_prebuilt_start = _now_ms();
     DeviceArena host_arena;  // libc malloc backend by default
-    PTO2RuntimeArenaLayout layout = runtime_reserve_layout(host_arena, eff_task_window_size, eff_dep_pool_capacity);
+    PTO2RuntimeArenaLayout layout =
+        runtime_reserve_layout(host_arena, eff_task_window_sizes, eff_heap_sizes, eff_dep_pool_capacities);
     if (host_arena.commit(DeviceArena::kDefaultBaseAlign) == nullptr) {
         LOG_ERROR("Failed to commit host arena for prebuilt runtime image");
         return -1;
@@ -348,7 +520,7 @@ extern "C" int bind_callable_to_runtime_impl(
     // reset) + a handful of device-only field fixups.
     // -------------------------------------------------------------------------
     PTO2Runtime *rt =
-        runtime_init_data_from_layout(host_arena, layout, PTO2_MODE_EXECUTE, sm_ptr, sm_size, gm_heap, eff_heap_size);
+        runtime_init_data_from_layout(host_arena, layout, PTO2_MODE_EXECUTE, sm_ptr, sm_size, gm_heap, eff_heap_sizes);
     if (rt == nullptr) {
         LOG_ERROR("runtime_init_data_from_layout failed");
         return -1;

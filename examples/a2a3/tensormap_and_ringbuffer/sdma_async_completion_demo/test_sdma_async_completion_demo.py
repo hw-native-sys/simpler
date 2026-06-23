@@ -189,11 +189,6 @@ def run(
         worker.close()
 
 
-@pytest.mark.skip(
-    reason="onboard a2a3 SDMA STARS completion path broken "
-    "(aclnnShmemSdmaStarsQueryGetWorkspaceSize failed); disabled from CI "
-    "pending fix, see hw-native-sys/simpler#1067"
-)
 @pytest.mark.platforms(["a2a3"])
 @pytest.mark.runtime("tensormap_and_ringbuffer")
 @pytest.mark.device_count(2)

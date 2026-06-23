@@ -12,7 +12,7 @@ tier, separate from the top-level execution knobs (`block_dim`, …):
 | field | unit | constraint |
 | ----- | ---- | ---------- |
 | `ring_task_window` | tasks | power of 2, >= 4 |
-| `ring_heap` | bytes / ring | power of 2, >= 1024 |
+| `ring_heap` | bytes / ring | >= 1024 |
 | `ring_dep_pool` | entries | 4 .. INT32_MAX |
 
 Precedence per value: **`runtime_env` field > `PTO2_RING_*` env var >
