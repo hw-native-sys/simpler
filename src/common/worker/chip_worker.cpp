@@ -13,6 +13,7 @@
 
 #include <dlfcn.h>
 
+#include <cstring>
 #include <fstream>
 #include <stdexcept>
 #include <string>
@@ -319,13 +320,19 @@ RunTiming ChipWorker::run(int32_t callable_id, const ChipStorageTaskArgs *args, 
     }
 
     void *rt = runtime_buf_.data();
+    uint64_t ring_task_windows[RUNTIME_ENV_RING_COUNT];
+    uint64_t ring_heaps[RUNTIME_ENV_RING_COUNT];
+    uint64_t ring_dep_pools[RUNTIME_ENV_RING_COUNT];
+    std::memcpy(ring_task_windows, config.runtime_env.ring_task_windows, sizeof(ring_task_windows));
+    std::memcpy(ring_heaps, config.runtime_env.ring_heaps, sizeof(ring_heaps));
+    std::memcpy(ring_dep_pools, config.runtime_env.ring_dep_pools, sizeof(ring_dep_pools));
 
     PtoRunTiming timing{0, 0};
     int rc = run_prepared_fn_(
         device_ctx_, rt, callable_id, args, config.block_dim, config.aicpu_thread_num, config.enable_l2_swimlane,
         config.enable_dump_tensor, config.enable_pmu, config.enable_dep_gen, config.enable_scope_stats,
         config.runtime_env.ring_task_window, config.runtime_env.ring_heap, config.runtime_env.ring_dep_pool,
-        config.output_prefix, &timing
+        ring_task_windows, ring_heaps, ring_dep_pools, config.output_prefix, &timing
     );
     if (rc != 0) {
         throw std::runtime_error("run_prepared failed with code " + std::to_string(rc));

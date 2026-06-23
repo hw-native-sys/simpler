@@ -17,7 +17,7 @@ it was handed.
 
     runtime_env fields (0 / unset => fall back to env var / compile default):
       ring_task_window   power of 2, >= 4
-      ring_heap          bytes per ring, power of 2, >= 1024
+      ring_heap          bytes per ring, >= 1024
       ring_dep_pool      4 .. INT32_MAX
     Precedence: runtime_env field > PTO2_RING_* env var > compile-time default.
 

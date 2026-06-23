@@ -1096,6 +1096,12 @@ class SceneTestCase:
         config.runtime_env.ring_task_window = runtime_env.get("ring_task_window", 0)
         config.runtime_env.ring_heap = runtime_env.get("ring_heap", 0)
         config.runtime_env.ring_dep_pool = runtime_env.get("ring_dep_pool", 0)
+        if "ring_task_windows" in runtime_env:
+            config.runtime_env.ring_task_windows = runtime_env["ring_task_windows"]
+        if "ring_heaps" in runtime_env:
+            config.runtime_env.ring_heaps = runtime_env["ring_heaps"]
+        if "ring_dep_pools" in runtime_env:
+            config.runtime_env.ring_dep_pools = runtime_env["ring_dep_pools"]
         config.enable_l2_swimlane = enable_l2_swimlane
         config.enable_dump_tensor = enable_dump_args
         config.enable_pmu = enable_pmu  # 0=disabled, >0=enabled with event type

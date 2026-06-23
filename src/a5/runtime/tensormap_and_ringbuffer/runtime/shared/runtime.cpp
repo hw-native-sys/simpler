@@ -37,9 +37,6 @@ Runtime::Runtime() {
     memset(aicpu_allowed_cpus, 0, sizeof(aicpu_allowed_cpus));
     aicpu_allowed_cpu_count = 0;
     aicpu_launch_count = 0;
-    task_window_size = 0;
-    heap_size = 0;
-    dep_pool_size = 0;
     orch_to_sched = false;
 
     // Initialize profiling state

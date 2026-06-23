@@ -224,11 +224,6 @@ public:
     // src/a5/runtime/host_build_graph/runtime/runtime.h for rationale.
     int32_t aicpu_launch_count;
 
-    // Ring buffer size overrides (0 = use compile-time defaults)
-    uint64_t task_window_size;
-    uint64_t heap_size;
-    uint64_t dep_pool_size;
-
     // PTO2 integration: kernel_id -> GM function_bin_addr mapping
     // NOTE: Made public for direct access from aicore code
     uint64_t func_id_to_addr_[RUNTIME_MAX_FUNC_ID];
