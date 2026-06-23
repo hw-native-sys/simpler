@@ -273,6 +273,7 @@ int prepare_callable(DeviceContextHandle ctx, int32_t callable_id, const void *c
             kernel_addrs.emplace_back(c.func_id, c.device_addr);
         }
 
+        bool needs_aicpu_prewarm = false;
         if (artifacts.host_dlopen_handle != nullptr) {
             rc = runner->register_callable_host_orch(
                 callable_id, artifacts.host_dlopen_handle, artifacts.host_orch_func_ptr, std::move(kernel_addrs),
@@ -283,6 +284,15 @@ int prepare_callable(DeviceContextHandle ctx, int32_t callable_id, const void *c
                 callable_id, artifacts.orch_so_data, artifacts.orch_so_size, artifacts.func_name.c_str(),
                 artifacts.config_name.c_str(), std::move(kernel_addrs), std::move(artifacts.signature)
             );
+            if (rc == 0) {
+                needs_aicpu_prewarm = true;
+            }
+        }
+        if (rc == 0 && needs_aicpu_prewarm) {
+            rc = runner->prewarm_callable(callable_id);
+            if (rc != 0) {
+                runner->unregister_callable(callable_id);
+            }
         }
         pthread_setspecific(g_runner_key, nullptr);
         return rc;
@@ -367,6 +377,14 @@ int run_prepared(
             validate_runtime_impl(r);
             pthread_setspecific(g_runner_key, nullptr);
             return rc;
+        }
+        if (r->register_new_callable_id()) {
+            rc = runner->commit_aicpu_callable_load(r->get_active_callable_id());
+            if (rc != 0) {
+                validate_runtime_impl(r);
+                pthread_setspecific(g_runner_key, nullptr);
+                return rc;
+            }
         }
 
         rc = validate_runtime_impl(r);

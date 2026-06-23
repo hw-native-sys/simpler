@@ -264,6 +264,7 @@ bool LoadAicpuOp::GenerateAicpuOpJson(const std::string &json_path, const std::s
     };
     std::vector<AicpuOpConfig> op_configs = {
         make_cfg(KernelNames::RunName),
+        make_cfg(KernelNames::PrewarmName),
     };
     json_file << "{\n";
     for (size_t i = 0; i < op_configs.size(); ++i) {
@@ -348,7 +349,7 @@ int LoadAicpuOp::Init() {
     }
     LOG_INFO_V2("LoadAicpuOp: Loaded inner SO via JSON, handle=%p", binary_handle_);
 
-    const char *symbol_names[] = {KernelNames::RunName};
+    const char *symbol_names[] = {KernelNames::RunName, KernelNames::PrewarmName};
     for (const char *name : symbol_names) {
         std::string lookup_name = MakeUniqueOpType(name, inner_fp_);
         rtFuncHandle func_handle = nullptr;

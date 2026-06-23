@@ -11,7 +11,8 @@
 
 Mirrors tests/st/a2a3/tensormap_and_ringbuffer/prepared_callable. Reuses the
 vector_example orchestration + AIV kernels. Exercises:
-  - prepare one private callable slot, then run twice (second run proves the
+  - prepare one private callable slot, then run twice (prepare proves prewarm;
+    both runs prove the
     AICPU-side dlopen cache / host-side orch SO dedup is working — no re-upload).
   - Two distinct private callable slots sharing the same callable: verifies both
     produce correct output independently.
@@ -19,6 +20,8 @@ vector_example orchestration + AIV kernels. Exercises:
   - aicpu_dlopen_count assertions covering: same-slot repeat, multi-slot
     interleaving, double-prepare rejection, and unregister + re-prepare.
 """
+
+import copy
 
 import pytest
 import torch
@@ -175,7 +178,7 @@ class TestPreparedCallable(SceneTestCase):
         _compare_outputs(test_args, golden_args, output_names, self.RTOL, self.ATOL)
 
     def test_dlopen_count_same_slot_repeated_runs(self, st_platform, st_worker):
-        """Case A: prepare(primary) + run x5 -> dlopen_count delta == 1."""
+        """Case A: prepare(primary) prewarms once; run x5 adds no dlopens."""
         callable_obj, config, case = self._setup_dlopen_count_test(st_worker, st_platform)
         baseline = st_worker.aicpu_dlopen_count
         prepared = False
@@ -183,8 +186,10 @@ class TestPreparedCallable(SceneTestCase):
         try:
             chip_worker._prepare_callable_at_slot(_SLOT_PRIMARY, callable_obj)
             prepared = True
+            assert st_worker.aicpu_dlopen_count - baseline == 1
             for _ in range(5):
                 self._run_one(st_worker, _SLOT_PRIMARY, config, case)
+                assert st_worker.aicpu_dlopen_count - baseline == 1
             assert st_worker.aicpu_dlopen_count - baseline == 1, (
                 f"expected exactly 1 new dlopen for 5 runs of primary slot, "
                 f"got delta {st_worker.aicpu_dlopen_count - baseline}"
@@ -194,7 +199,7 @@ class TestPreparedCallable(SceneTestCase):
                 chip_worker._unregister_slot(_SLOT_PRIMARY)
 
     def test_dlopen_count_two_slots_alternating(self, st_platform, st_worker):
-        """Case B: prepare(primary)+prepare(secondary) + alternating runs x5 -> delta == 2."""
+        """Case B: two prepares prewarm two slots; alternating runs add none."""
         callable_obj, config, case = self._setup_dlopen_count_test(st_worker, st_platform)
         baseline = st_worker.aicpu_dlopen_count
         primary_prepared = False
@@ -203,11 +208,14 @@ class TestPreparedCallable(SceneTestCase):
         try:
             chip_worker._prepare_callable_at_slot(_SLOT_PRIMARY, callable_obj)
             primary_prepared = True
+            assert st_worker.aicpu_dlopen_count - baseline == 1
             chip_worker._prepare_callable_at_slot(_SLOT_SECONDARY, callable_obj)
             secondary_prepared = True
+            assert st_worker.aicpu_dlopen_count - baseline == 2
             for _ in range(5):
                 self._run_one(st_worker, _SLOT_PRIMARY, config, case)
                 self._run_one(st_worker, _SLOT_SECONDARY, config, case)
+                assert st_worker.aicpu_dlopen_count - baseline == 2
             assert st_worker.aicpu_dlopen_count - baseline == 2, (
                 f"expected exactly 2 new dlopens for two slots interleaved, "
                 f"got delta {st_worker.aicpu_dlopen_count - baseline}"
@@ -232,13 +240,36 @@ class TestPreparedCallable(SceneTestCase):
             if prepared:
                 chip_worker._unregister_slot(_SLOT_PRIMARY)
 
+    def test_prewarm_failure_rolls_back_registration(self, st_platform, st_worker):
+        """Case F: missing AICPU orch entry fails prepare and leaves no prepared slot."""
+
+        class MissingEntryCallable(type(self)):
+            CALLABLE = copy.deepcopy(type(self).CALLABLE)
+
+        MissingEntryCallable.CALLABLE["orchestration"]["function_name"] = "missing_aicpu_orchestration_entry"
+        bad_callable = MissingEntryCallable().build_callable(st_platform)
+        config = self._build_config(self.CASES[0]["config"])
+        case = self.CASES[0]
+        baseline = st_worker.aicpu_dlopen_count
+        chip_worker = self._chip_worker(st_worker)
+
+        with pytest.raises(RuntimeError):
+            chip_worker._prepare_callable_at_slot(_SLOT_PRIMARY, bad_callable)
+        assert st_worker.aicpu_dlopen_count == baseline
+
+        with pytest.raises(RuntimeError):
+            self._run_one(st_worker, _SLOT_PRIMARY, config, case)
+        assert st_worker.aicpu_dlopen_count == baseline
+
+        chip_worker._unregister_slot(_SLOT_PRIMARY)
+
     def test_dlopen_count_unregister_re_prepare(self, st_platform, st_worker):
-        """Case D: prepare+run+unregister+prepare+run -> delta == 2.
+        """Case D: prepare+unregister+prepare prewarms twice -> delta == 2.
 
         unregister erases the slot from aicpu_seen_callable_ids_, so the second
-        prepare/run pair sets register_new_callable_id_ again and the AICPU
-        does a fresh dlopen. The counter is monotonic (does NOT decrement on
-        unregister), so the delta after the second cycle is 2.
+        prepare prewarms the reused slot with a fresh AICPU dlopen. The counter
+        is monotonic (does NOT decrement on unregister), so the delta after the
+        second cycle is 2.
         """
         callable_obj, config, case = self._setup_dlopen_count_test(st_worker, st_platform)
         baseline = st_worker.aicpu_dlopen_count
@@ -247,16 +278,19 @@ class TestPreparedCallable(SceneTestCase):
         try:
             chip_worker._prepare_callable_at_slot(_SLOT_PRIMARY, callable_obj)
             prepared = True
+            assert st_worker.aicpu_dlopen_count - baseline == 1
             self._run_one(st_worker, _SLOT_PRIMARY, config, case)
             assert st_worker.aicpu_dlopen_count - baseline == 1
             chip_worker._unregister_slot(_SLOT_PRIMARY)
             prepared = False
             after_unreg = st_worker.aicpu_dlopen_count
             assert after_unreg - baseline == 1, (
-                f"unregister must NOT decrement the dlopen counter; baseline={baseline}, after_unreg={after_unreg}"
+                f"unregister must NOT decrement the dlopen counter; "
+                f"baseline={baseline}, after_unreg={after_unreg}"
             )
             chip_worker._prepare_callable_at_slot(_SLOT_PRIMARY, callable_obj)
             prepared = True
+            assert st_worker.aicpu_dlopen_count - baseline == 2
             self._run_one(st_worker, _SLOT_PRIMARY, config, case)
             assert st_worker.aicpu_dlopen_count - baseline == 2, (
                 f"after re-prepare expected counter +2 (two distinct AICPU dlopens), "

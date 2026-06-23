@@ -291,10 +291,10 @@ public:
 
     /**
      * Number of distinct callable_ids the AICPU has been asked to
-     * dlopen for. Monotonically increases on every first-sighting
-     * bind; `unregister_callable` does NOT decrement it. So a
-     * `prepare → run → unregister → re-prepare → run` sequence reports
-     * 2 (each AICPU dlopen counted once), even though only one cid is
+     * dlopen for. Monotonically increases when an AICPU load succeeds
+     * during prepare prewarm or first-run fallback; `unregister_callable`
+     * does NOT decrement it. So a `prepare → unregister → re-prepare`
+     * sequence reports 2 (each AICPU dlopen counted once), even though one cid is
      * currently registered.
      */
     size_t aicpu_dlopen_count() const { return aicpu_dlopen_total_; }
@@ -306,6 +306,21 @@ public:
      * never decrements.
      */
     size_t host_dlopen_count() const { return host_dlopen_total_; }
+
+    /**
+     * Device-orchestration callable prewarm used internally by
+     * prepare_callable(). Host-orchestration callables are a no-op.
+     * On success, AICPU has populated orch_so_table_[callable_id] and
+     * first run can advertise register_new_callable_id_=false.
+     */
+    int prewarm_callable(int32_t callable_id);
+
+    /**
+     * Commit host-side AICPU seen/counting state after a device-side SO load
+     * has returned success. Calling this before the device helper succeeds can
+     * make a later run advertise a false cache hit.
+     */
+    int commit_aicpu_callable_load(int32_t callable_id);
 
     // ---- Virtual entry points called by the shared c_api ----------------
     //
@@ -601,18 +616,15 @@ protected:
     int finalize_common();
 
     /**
-     * Stamp `runtime.{dev_orch_so_addr_, dev_orch_so_size_}` from the
-     * registered CallableState for `runtime.get_active_callable_id()`.
-     * The orch SO bytes were already H2D'd at `register_callable` time
-     * and are shared via `orch_so_dedup_` across cids; this method only
-     * refreshes the device-SO metadata onto the per-run Runtime and
-     * bumps the AICPU first-sighting counter when the cid is new since
-     * registration.
+     * Stamp registered callable metadata onto a Runtime without committing
+     * host seen/counting state. The device-side load must complete before
+     * commit_aicpu_callable_load() is called.
      *
      * @param runtime  Runtime whose device-SO metadata will be rewritten.
      * @return 0 on success, non-zero on failure.
      */
     int prepare_orch_so(Runtime &runtime);
+    int stamp_orch_so(Runtime &runtime, int32_t callable_id, bool force_reload);
 
     // ---- Group D state shared by both a2a3 and a5 -------------------------
     //
@@ -634,9 +646,9 @@ protected:
     // slice + symbol names needed to launch it. `orch_so_dedup_` shares
     // device buffers across callable_ids whose orch SO bytes have the
     // same ELF Build-ID hash (refcounted; freed when the count hits
-    // zero). `aicpu_seen_callable_ids_` tracks which ids have already
-    // been delivered to the AICPU at least once so `prepare_orch_so`
-    // can set `register_new_callable_id_` correctly on first sighting.
+    // zero). `aicpu_seen_callable_ids_` tracks which ids have completed a
+    // successful AICPU SO load so `prepare_orch_so` can advertise either a
+    // cache hit or a first-load fallback without committing early.
     struct CallableState {
         // trb path (AICPU dlopens orch SO from device buffer)
         uint64_t hash{0};
@@ -659,8 +671,8 @@ protected:
     std::unordered_map<int32_t, CallableState> callables_;
     std::unordered_map<uint64_t, OrchSoBuffer> orch_so_dedup_;
     std::unordered_set<int32_t> aicpu_seen_callable_ids_;
-    // Monotonic count of AICPU dlopens triggered (incremented on each
-    // first-sighting bind; never decremented). Diverges from
+    // Monotonic count of successful AICPU dlopens (incremented after prewarm
+    // or first-run fallback succeeds; never decremented). Diverges from
     // aicpu_seen_callable_ids_.size() once any cid is unregistered and
     // re-registered. Exposed via `aicpu_dlopen_count()` for tests.
     size_t aicpu_dlopen_total_{0};

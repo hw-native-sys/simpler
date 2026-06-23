@@ -158,17 +158,18 @@ int finalize_device(DeviceContextHandle ctx);
 /**
  * Stage a callable for repeated cheap launches under the given `callable_id`.
  *
- * Uploads child kernels into the DeviceRunner's func_id-keyed cache and
- * copies the orchestration SO bytes into a device-resident buffer keyed by
- * the SO's ELF Build-ID hash (so two callable_ids with identical SO share
- * one buffer). Subsequent `run_prepared(callable_id, ...)` calls reuse this
- * state.
+ * Uploads child kernels into the DeviceRunner's func_id-keyed cache, copies
+ * the orchestration SO bytes into a device-resident buffer keyed by the SO's
+ * ELF Build-ID hash (so two callable_ids with identical SO share one buffer),
+ * and prewarms device-orchestration callables by loading their AICPU-side SO
+ * table entry before the first real task. Subsequent
+ * `run_prepared(callable_id, ...)` calls reuse this state.
  *
  * `device_id` and the executor binaries are not threaded through this entry
  * — they were captured by `simpler_init` and live on the DeviceRunner.
  *
  * @return 0 on success, negative on error (NULL ctx, callable_id out of
- *         range, or upload/copy failure).
+ *         range, upload/copy failure, or AICPU prewarm failure).
  */
 int prepare_callable(DeviceContextHandle ctx, int32_t callable_id, const void *callable);
 
@@ -178,9 +179,10 @@ int prepare_callable(DeviceContextHandle ctx, int32_t callable_id, const void *c
  * Looks up the prepared state by `callable_id`, restores the kernel func_id ↔
  * dev_addr table onto a fresh Runtime, and dispatches without re-uploading
  * kernels or re-copying the orch SO. The AICPU side dispatches via
- * `orch_so_table_[callable_id]` (see runtime.h::set_active_callable_id). The
- * first run for a given callable_id sets `register_new_callable_id_` so the
- * AICPU does its one-time dlopen.
+ * `orch_so_table_[callable_id]` (see runtime.h::set_active_callable_id).
+ * Successful TRB prepare has already populated that table; if a future
+ * fallback leaves a callable prepared but not prewarmed, the first successful
+ * run commits the AICPU seen state only after the device-side load succeeds.
  *
  * `device_id` and the executor binaries are not threaded through this entry
  * — they were captured by `simpler_init` and live on the DeviceRunner.

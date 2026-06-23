@@ -26,8 +26,9 @@
  *
  *   2. Init (per-DeviceRunner): JSON-registers the runtime SO via
  *      `rtsBinaryLoadFromFile` (cpuKernelMode=0, kernelSo points at the
- *      preinstall basename), then resolves `simpler_aicpu_exec` to an
- *      `rtFuncHandle` via `rtsFuncGetByName`. JSON is per-process
+ *      preinstall basename), then resolves runtime SO entry points such as
+ *      `simpler_aicpu_exec` and `simpler_aicpu_prewarm_callable` to
+ *      `rtFuncHandle`s via `rtsFuncGetByName`. JSON is per-process
  *      (`/tmp/simpler_inner_<fp>_<pid>.json`) so concurrent multi-chip /
  *      multi-worker tests don't race on a shared file.
  *
@@ -104,9 +105,7 @@ public:
         rtStream_t stream, int device_id
     );
 
-    /**
-     * @brief JSON-register the runtime SO and resolve its Init/Exec handles.
-     */
+    /** @brief JSON-register the runtime SO and resolve its entry handles. */
     int Init();
 
     /** @brief Release binary handle + function handles + temporary JSON. */
@@ -139,6 +138,7 @@ private:
 // own JSON registration (no dispatcher hop at runtime).
 namespace KernelNames {
 constexpr const char *RunName = "simpler_aicpu_exec";  // multi-threaded exec
+constexpr const char *PrewarmName = "simpler_aicpu_prewarm_callable";
 }  // namespace KernelNames
 
 }  // namespace host

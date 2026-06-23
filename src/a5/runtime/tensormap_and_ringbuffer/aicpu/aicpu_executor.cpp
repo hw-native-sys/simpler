@@ -149,6 +149,7 @@ struct AicpuExecutor {
 
     // ===== Methods =====
     int32_t init(Runtime *runtime);
+    int32_t ensure_orch_so_loaded(Runtime *runtime, int32_t thread_idx);
     int32_t run(Runtime *runtime);
     void deinit(Runtime *runtime);
 
@@ -209,6 +210,145 @@ int32_t AicpuExecutor::init(Runtime *runtime) {
     return 0;
 }
 
+int32_t AicpuExecutor::ensure_orch_so_loaded(Runtime *runtime, int32_t thread_idx) {
+    if (runtime == nullptr) {
+        LOG_ERROR("Thread %d: runtime is nullptr", thread_idx);
+        return -1;
+    }
+
+    const int32_t callable_id = runtime->get_active_callable_id();
+    if (callable_id < 0 || callable_id >= MAX_REGISTERED_CALLABLE_IDS) {
+        LOG_ERROR("Thread %d: invalid callable_id %d (limit=%d)", thread_idx, callable_id, MAX_REGISTERED_CALLABLE_IDS);
+        return -1;
+    }
+
+    OrchSoEntry &entry = orch_so_table_[callable_id];
+    const bool reload_so = runtime->register_new_callable_id();
+    if (!reload_so) {
+        LOG_INFO_V0(
+            "Thread %d: Reusing cached orch SO handle=%p (callable_id=%d)", thread_idx, entry.handle, callable_id
+        );
+        if (entry.handle == nullptr || entry.func == nullptr) {
+            LOG_ERROR(
+                "Thread %d: reload=false but no cached SO handle/func for callable_id=%d", thread_idx, callable_id
+            );
+            return -1;
+        }
+        return 0;
+    }
+
+    LOG_INFO_V0("Thread %d: New orch SO detected (callable_id=%d), (re)loading", thread_idx, callable_id);
+    if (entry.handle != nullptr) {
+        dlclose(entry.handle);
+    }
+    if (entry.path[0] != '\0') {
+        unlink(entry.path);
+    }
+    entry = OrchSoEntry{};
+
+    const void *so_data = reinterpret_cast<const void *>(runtime->get_dev_orch_so_addr());
+    size_t so_size = runtime->get_dev_orch_so_size();
+    if (so_data == nullptr || so_size == 0) {
+        LOG_ERROR("Thread %d: Device orchestration SO not set", thread_idx);
+        return -1;
+    }
+
+    char so_path[256];
+    bool file_created = false;
+    const char *candidate_dirs[] = {
+        "/usr/lib64/aicpu_kernels/0/aicpu_kernels_device", "/usr/lib64", "/lib64", "/var/tmp", "/tmp"
+    };
+    const int32_t num_candidates = sizeof(candidate_dirs) / sizeof(candidate_dirs[0]);
+
+    for (int32_t i = 0; i < num_candidates && !file_created; i++) {
+        int32_t fd =
+            create_orch_so_file(candidate_dirs[i], callable_id, get_orch_device_id(), so_path, sizeof(so_path));
+        if (fd < 0) {
+            LOG_INFO_V0("Thread %d: Cannot create SO at %s (errno=%d), trying next path", thread_idx, so_path, errno);
+            continue;
+        }
+        ssize_t written = write(fd, so_data, so_size);
+        close(fd);
+        if (written != static_cast<ssize_t>(so_size)) {
+            LOG_INFO_V0("Thread %d: Cannot write SO to %s (errno=%d), trying next path", thread_idx, so_path, errno);
+            unlink(so_path);
+            continue;
+        }
+        file_created = true;
+        LOG_INFO_V0("Thread %d: Created SO file at %s (%zu bytes)", thread_idx, so_path, so_size);
+    }
+
+    if (!file_created) {
+        LOG_ERROR("Thread %d: Failed to create SO file in any candidate path", thread_idx);
+        return -1;
+    }
+
+    dlerror();
+    void *handle = dlopen(so_path, RTLD_LAZY | RTLD_LOCAL);
+    const char *dlopen_err = dlerror();
+    if (handle == nullptr) {
+        LOG_ERROR("Thread %d: dlopen failed: %s", thread_idx, dlopen_err ? dlopen_err : "unknown");
+        unlink(so_path);
+        return -1;
+    }
+    LOG_INFO_V0("Thread %d: dlopen succeeded, handle=%p", thread_idx, handle);
+
+    unlink(so_path);
+
+    const char *entry_symbol = runtime->get_device_orch_func_name();
+    if (entry_symbol == nullptr || entry_symbol[0] == '\0') {
+        entry_symbol = DEFAULT_ORCH_ENTRY_SYMBOL;
+    }
+    const char *config_symbol = runtime->get_device_orch_config_name();
+    if (config_symbol == nullptr || config_symbol[0] == '\0') {
+        config_symbol = DEFAULT_ORCH_CONFIG_SYMBOL;
+    }
+
+    dlerror();
+    DeviceOrchestrationFunc orch_func = reinterpret_cast<DeviceOrchestrationFunc>(dlsym(handle, entry_symbol));
+    const char *entry_dlsym_error = dlerror();
+    if (entry_dlsym_error != nullptr) {
+        LOG_ERROR("Thread %d: dlsym failed for entry symbol '%s': %s", thread_idx, entry_symbol, entry_dlsym_error);
+        dlclose(handle);
+        unlink(so_path);
+        return -1;
+    }
+    if (orch_func == nullptr) {
+        LOG_ERROR("Thread %d: dlsym returned NULL for entry symbol '%s'", thread_idx, entry_symbol);
+        dlclose(handle);
+        unlink(so_path);
+        return -1;
+    }
+
+    dlerror();
+    auto config_func = reinterpret_cast<DeviceOrchestrationConfigFunc>(dlsym(handle, config_symbol));
+    const char *config_dlsym_error = dlerror();
+    if (config_dlsym_error != nullptr || config_func == nullptr) {
+        LOG_ERROR(
+            "Thread %d: dlsym failed for config symbol '%s': %s", thread_idx, config_symbol,
+            config_dlsym_error ? config_dlsym_error : "NULL function pointer"
+        );
+        config_func = nullptr;
+    }
+
+    dlerror();
+    auto bind_runtime_func =
+        reinterpret_cast<DeviceOrchestrationBindRuntimeFunc>(dlsym(handle, "framework_bind_runtime"));
+    const char *bind_runtime_error = dlerror();
+    if (bind_runtime_error != nullptr) {
+        LOG_ERROR("Thread %d: dlsym failed for framework_bind_runtime: %s", thread_idx, bind_runtime_error);
+        bind_runtime_func = nullptr;
+    }
+
+    entry.handle = handle;
+    entry.func = orch_func;
+    entry.bind = bind_runtime_func;
+    entry.config_func = config_func;
+    snprintf(entry.path, sizeof(entry.path), "%s", so_path);
+    entry.in_use = true;
+    return 0;
+}
+
 /**
  * Shutdown AICore - Send exit signal via registers to all AICore kernels
  */
@@ -243,169 +383,17 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
                 runtime_init_ready_.store(true, std::memory_order_release);
                 return -1;
             }
-            void **p_handle = &orch_so_table_[callable_id].handle;
-            char *p_path = orch_so_table_[callable_id].path;
-            DeviceOrchestrationFunc *p_func = &orch_so_table_[callable_id].func;
-            DeviceOrchestrationBindRuntimeFunc *p_bind = &orch_so_table_[callable_id].bind;
-            DeviceOrchestrationConfigFunc *p_config_func = &orch_so_table_[callable_id].config_func;
-            const bool reload_so = runtime->register_new_callable_id();
-
-            if (reload_so) {
-                LOG_INFO_V0("Thread %d: New orch SO detected (callable_id=%d), (re)loading", thread_idx, callable_id);
-                if (*p_handle != nullptr) {
-                    dlclose(*p_handle);
-                    *p_handle = nullptr;
-                    *p_func = nullptr;
-                    *p_bind = nullptr;
-                    if (p_path[0] != '\0') {
-                        // Unlink the old file so the new open() lands on a
-                        // fresh inode — protects against SIGBUS / ETXTBSY when
-                        // the kernel still has the old mapping pinned.
-                        unlink(p_path);
-                        p_path[0] = '\0';
-                    }
-                }
-
-                const void *so_data = reinterpret_cast<const void *>(runtime->get_dev_orch_so_addr());
-                size_t so_size = runtime->get_dev_orch_so_size();
-
-                if (so_data == nullptr || so_size == 0) {
-                    LOG_ERROR("Thread %d: Device orchestration SO not set", thread_idx);
-                    // Unblock scheduler threads before returning so they don't spin forever.
-                    runtime_init_ready_.store(true, std::memory_order_release);
-                    return -1;
-                }
-
-                // Try multiple paths that may allow execution on AICPU
-                char so_path[256];
-                bool file_created = false;
-                const char *candidate_dirs[] = {
-                    "/usr/lib64/aicpu_kernels/0/aicpu_kernels_device", "/usr/lib64", "/lib64", "/var/tmp", "/tmp"
-                };
-                const int32_t num_candidates = sizeof(candidate_dirs) / sizeof(candidate_dirs[0]);
-
-                for (int32_t i = 0; i < num_candidates && !file_created; i++) {
-                    int32_t fd = create_orch_so_file(
-                        candidate_dirs[i], callable_id, get_orch_device_id(), so_path, sizeof(so_path)
-                    );
-                    if (fd < 0) {
-                        LOG_INFO_V0(
-                            "Thread %d: Cannot create SO at %s (errno=%d), trying next path", thread_idx, so_path, errno
-                        );
-                        continue;
-                    }
-                    ssize_t written = write(fd, so_data, so_size);
-                    close(fd);
-                    if (written != static_cast<ssize_t>(so_size)) {
-                        LOG_INFO_V0(
-                            "Thread %d: Cannot write SO to %s (errno=%d), trying next path", thread_idx, so_path, errno
-                        );
-                        unlink(so_path);
-                        continue;
-                    }
-                    file_created = true;
-                    LOG_INFO_V0("Thread %d: Created SO file at %s (%zu bytes)", thread_idx, so_path, so_size);
-                }
-
-                if (!file_created) {
-                    LOG_ERROR("Thread %d: Failed to create SO file in any candidate path", thread_idx);
-                    // Unblock scheduler threads before returning so they don't spin forever.
-                    runtime_init_ready_.store(true, std::memory_order_release);
-                    return -1;
-                }
-
-                dlerror();
-                void *handle = dlopen(so_path, RTLD_LAZY | RTLD_LOCAL);
-                const char *dlopen_err = dlerror();
-                if (handle == nullptr) {
-                    LOG_ERROR("Thread %d: dlopen failed: %s", thread_idx, dlopen_err ? dlopen_err : "unknown");
-                    unlink(so_path);
-                    // Unblock scheduler threads before returning so they don't spin forever.
-                    runtime_init_ready_.store(true, std::memory_order_release);
-                    return -1;
-                }
-                LOG_INFO_V0("Thread %d: dlopen succeeded, handle=%p", thread_idx, handle);
-
-                // Unlink the on-disk SO immediately: dlopen has already mmap'd
-                // the image, so the kernel keeps the inode alive until the
-                // matching dlclose / process exit. This prevents stale
-                // libdevice_orch_<pid>_<cid>.so files from accumulating in
-                // /tmp when child processes exit via os._exit(0), which skips
-                // ~AicpuExecutor (worker.py: _sub/_chip/_child loops).
-                unlink(so_path);
-
-                const char *entry_symbol = runtime->get_device_orch_func_name();
-                if (entry_symbol == nullptr || entry_symbol[0] == '\0') {
-                    entry_symbol = DEFAULT_ORCH_ENTRY_SYMBOL;
-                }
-                const char *config_symbol = runtime->get_device_orch_config_name();
-                if (config_symbol == nullptr || config_symbol[0] == '\0') {
-                    config_symbol = DEFAULT_ORCH_CONFIG_SYMBOL;
-                }
-
-                dlerror();
-                DeviceOrchestrationFunc orch_func =
-                    reinterpret_cast<DeviceOrchestrationFunc>(dlsym(handle, entry_symbol));
-                const char *entry_dlsym_error = dlerror();
-                if (entry_dlsym_error != nullptr) {
-                    LOG_ERROR(
-                        "Thread %d: dlsym failed for entry symbol '%s': %s", thread_idx, entry_symbol, entry_dlsym_error
-                    );
-                    dlclose(handle);
-                    unlink(so_path);
-                    // Unblock scheduler threads before returning so they don't spin forever.
-                    runtime_init_ready_.store(true, std::memory_order_release);
-                    return -1;
-                }
-                if (orch_func == nullptr) {
-                    LOG_ERROR("Thread %d: dlsym returned NULL for entry symbol '%s'", thread_idx, entry_symbol);
-                    dlclose(handle);
-                    unlink(so_path);
-                    // Unblock scheduler threads before returning so they don't spin forever.
-                    runtime_init_ready_.store(true, std::memory_order_release);
-                    return -1;
-                }
-
-                dlerror();
-                auto config_func = reinterpret_cast<DeviceOrchestrationConfigFunc>(dlsym(handle, config_symbol));
-                const char *config_dlsym_error = dlerror();
-                if (config_dlsym_error != nullptr || config_func == nullptr) {
-                    LOG_ERROR(
-                        "Thread %d: dlsym failed for config symbol '%s': %s", thread_idx, config_symbol,
-                        config_dlsym_error ? config_dlsym_error : "NULL function pointer"
-                    );
-                    config_func = nullptr;
-                }
-
-                dlerror();
-                auto bind_runtime_func =
-                    reinterpret_cast<DeviceOrchestrationBindRuntimeFunc>(dlsym(handle, "framework_bind_runtime"));
-                const char *bind_runtime_error = dlerror();
-                if (bind_runtime_error != nullptr) {
-                    LOG_ERROR("Thread %d: dlsym failed for framework_bind_runtime: %s", thread_idx, bind_runtime_error);
-                    bind_runtime_func = nullptr;
-                }
-
-                *p_handle = handle;
-                *p_func = orch_func;
-                *p_bind = bind_runtime_func;
-                *p_config_func = config_func;
-                snprintf(p_path, 256, "%s", so_path);
-                orch_so_table_[callable_id].in_use = true;
-            } else {
-                LOG_INFO_V0(
-                    "Thread %d: Reusing cached orch SO handle=%p (callable_id=%d)", thread_idx, *p_handle, callable_id
-                );
-                if (*p_handle == nullptr || *p_func == nullptr) {
-                    LOG_ERROR(
-                        "Thread %d: reload=false but no cached SO handle/func for callable_id=%d", thread_idx,
-                        callable_id
-                    );
-                    // Unblock scheduler threads before returning so they don't spin forever.
-                    runtime_init_ready_.store(true, std::memory_order_release);
-                    return -1;
-                }
+            int32_t load_rc = ensure_orch_so_loaded(runtime, thread_idx);
+            if (load_rc != 0) {
+                runtime_init_ready_.store(true, std::memory_order_release);
+                return load_rc;
             }
+            OrchSoEntry &entry = orch_so_table_[callable_id];
+            void **p_handle = &entry.handle;
+            char *p_path = entry.path;
+            DeviceOrchestrationFunc *p_func = &entry.func;
+            DeviceOrchestrationBindRuntimeFunc *p_bind = &entry.bind;
+            DeviceOrchestrationConfigFunc *p_config_func = &entry.config_func;
 
             // Validate arg count on every run (reload or cache hit).
             if (*p_config_func != nullptr) {
@@ -788,6 +776,21 @@ void AicpuExecutor::deinit(Runtime *runtime) {
 }
 
 // ===== Public Entry Point =====
+
+extern "C" int32_t aicpu_prewarm_callable(Runtime *runtime) {
+    if (runtime == nullptr) {
+        LOG_ERROR("%s", "aicpu_prewarm_callable: null Runtime pointer");
+        return -1;
+    }
+    int32_t rc = g_aicpu_executor.ensure_orch_so_loaded(runtime, /*thread_idx=*/0);
+    cache_invalidate_range(runtime, sizeof(Runtime));
+    if (rc != 0) {
+        LOG_ERROR("aicpu_prewarm_callable: SO load failed with rc=%d", rc);
+        return rc;
+    }
+    LOG_INFO_V0("aicpu_prewarm_callable: completed for callable_id=%d", runtime->get_active_callable_id());
+    return 0;
+}
 
 /**
  * aicpu_execute - Main AICPU kernel execution entry point

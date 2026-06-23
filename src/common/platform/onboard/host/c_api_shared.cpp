@@ -318,20 +318,30 @@ int prepare_callable(DeviceContextHandle ctx, int32_t callable_id, const void *c
 
         // hbg's prepare_callable_impl populates host_dlopen_handle; trb's
         // leaves it null and fills orch_so_data + func_name/config_name.
+        bool needs_aicpu_prewarm = false;
         if (artifacts.host_dlopen_handle != nullptr) {
             rc = runner->register_callable_host_orch(
                 callable_id, artifacts.host_dlopen_handle, artifacts.host_orch_func_ptr, std::move(kernel_addrs),
                 std::move(artifacts.signature)
             );
-            if (rc == 0) {
-                host_dlopen_guard.dismiss();
-            }
-            return rc;
+            if (rc != 0) return rc;
+            host_dlopen_guard.dismiss();
+        } else {
+            rc = runner->register_callable(
+                callable_id, artifacts.orch_so_data, artifacts.orch_so_size, artifacts.func_name.c_str(),
+                artifacts.config_name.c_str(), std::move(kernel_addrs), std::move(artifacts.signature)
+            );
+            if (rc != 0) return rc;
+            needs_aicpu_prewarm = true;
         }
-        return runner->register_callable(
-            callable_id, artifacts.orch_so_data, artifacts.orch_so_size, artifacts.func_name.c_str(),
-            artifacts.config_name.c_str(), std::move(kernel_addrs), std::move(artifacts.signature)
-        );
+        if (needs_aicpu_prewarm) {
+            rc = runner->prewarm_callable(callable_id);
+            if (rc != 0) {
+                runner->unregister_callable(callable_id);
+                return rc;
+            }
+        }
+        return 0;
     } catch (...) {
         return -1;
     }
@@ -424,6 +434,13 @@ int run_prepared(
         if (rc != 0) {
             validate_runtime_impl(r);
             return rc;
+        }
+        if (r->register_new_callable_id()) {
+            rc = runner->commit_aicpu_callable_load(r->get_active_callable_id());
+            if (rc != 0) {
+                validate_runtime_impl(r);
+                return rc;
+            }
         }
 
         rc = validate_runtime_impl(r);
