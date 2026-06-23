@@ -36,6 +36,11 @@ inline constexpr int CORE_MAX_SCALAR_ARGS = 16;
 inline constexpr int CHIP_MAX_SCALAR_ARGS = 128;
 inline constexpr uint32_t CALLABLE_ALIGN = 64;
 
+// L0 (Arg<>) capacity aliases. Kept next to the CORE_MAX_* source so size-only
+// consumers (e.g. pto2_dispatch_payload.h) need not include pto_types.h.
+#define MAX_TENSOR_ARGS CORE_MAX_TENSOR_ARGS
+#define MAX_SCALAR_ARGS CORE_MAX_SCALAR_ARGS
+
 // Minimum alignment of a child kernel binary's device address within a
 // ChipCallable. The device address is
 //   chip_dev + offsetof(ChipCallable, storage_) + child_offset(i)

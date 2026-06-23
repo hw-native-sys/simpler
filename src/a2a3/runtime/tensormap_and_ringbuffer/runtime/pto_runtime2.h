@@ -67,7 +67,7 @@ enum PTO2RuntimeMode {
 typedef struct PTO2Runtime PTO2Runtime;  // forward declare for ops signatures
 
 struct PTO2RuntimeOps {
-    TaskOutputTensors (*submit_task)(PTO2Runtime *rt, const MixedKernels &mixed_kernels, const Arg &args);
+    TaskOutputTensors (*submit_task)(PTO2Runtime *rt, const MixedKernels &mixed_kernels, const L0TaskArgs &args);
     void (*scope_begin)(PTO2Runtime *rt);
     void (*scope_end)(PTO2Runtime *rt);
     void (*orchestration_done)(PTO2Runtime *rt);
@@ -87,8 +87,8 @@ struct PTO2RuntimeOps {
     void (*set_tensor_data)(
         PTO2Runtime *rt, const Tensor &tensor, uint32_t ndims, const uint32_t indices[], uint64_t value
     );
-    TaskOutputTensors (*alloc_tensors)(PTO2Runtime *rt, const Arg &args);
-    TaskOutputTensors (*submit_dummy_task)(PTO2Runtime *rt, const Arg &args);
+    TaskOutputTensors (*alloc_tensors)(PTO2Runtime *rt, const L0TaskArgs &args);
+    TaskOutputTensors (*submit_dummy_task)(PTO2Runtime *rt, const L0TaskArgs &args);
     // Stash the call-site captured by PTO2ScopeGuard into the [ScopeStats]
     // collector. Always present in the struct to keep ops-table layout stable
     // across PTO2_PROFILING settings; set to nullptr at PTO2_PROFILING=0.

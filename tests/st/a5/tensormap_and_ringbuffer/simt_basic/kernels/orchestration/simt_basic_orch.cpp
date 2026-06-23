@@ -24,24 +24,23 @@
 
 extern "C" {
 
-__attribute__((visibility("default"))) PTO2OrchestrationConfig
-aicpu_orchestration_config(const ChipStorageTaskArgs &orch_args) {
+__attribute__((visibility("default"))) PTO2OrchestrationConfig aicpu_orchestration_config(const L2TaskArgs &orch_args) {
     (void)orch_args;  // NOLINT(readability/casting)
     return PTO2OrchestrationConfig{
         .expected_arg_count = 3,
     };
 }
 
-__attribute__((visibility("default"))) void aicpu_orchestration_entry(const ChipStorageTaskArgs &orch_args) {
-    Tensor src = from_tensor_arg(orch_args.tensor(0));
-    Tensor indices = from_tensor_arg(orch_args.tensor(1));
-    Tensor out = from_tensor_arg(orch_args.tensor(2));
+__attribute__((visibility("default"))) void aicpu_orchestration_entry(const L2TaskArgs &orch_args) {
+    const Tensor &src = orch_args.tensor(0).ref();
+    const Tensor &indices = orch_args.tensor(1).ref();
+    const Tensor &out = orch_args.tensor(2).ref();
 
     // PTO2_SCOPE ensures rt_submit_aiv_task flushes through the task
     // ringbuffer before the entry returns. No set_core_num — let the
     // runtime use the config's block_dim.
     PTO2_SCOPE() {
-        Arg args;
+        L0TaskArgs args;
         args.add_input(src);
         args.add_input(indices);
         args.add_output(out);

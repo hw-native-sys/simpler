@@ -39,8 +39,7 @@ extern "C" {
  * Orchestration config — the executor reads these values to set up
  * shared memory and runtime before calling aicpu_orchestration_entry.
  */
-__attribute__((visibility("default"))) PTO2OrchestrationConfig
-aicpu_orchestration_config(const ChipStorageTaskArgs &orch_args) {
+__attribute__((visibility("default"))) PTO2OrchestrationConfig aicpu_orchestration_config(const L2TaskArgs &orch_args) {
     (void)orch_args;  // NOLINT(readability/casting)
     return PTO2OrchestrationConfig{
         .expected_arg_count = 3,
@@ -52,20 +51,20 @@ aicpu_orchestration_config(const ChipStorageTaskArgs &orch_args) {
  * The executor wraps this call in PTO2_SCOPE, so we are already inside
  * the outer scope on entry.
  */
-__attribute__((visibility("default"))) void aicpu_orchestration_entry(const ChipStorageTaskArgs &orch_args) {
-    // golden shape = kernel shape, use from_tensor_arg() directly
-    Tensor ext_a = from_tensor_arg(orch_args.tensor(0));
-    Tensor ext_b = from_tensor_arg(orch_args.tensor(1));
-    Tensor ext_f = from_tensor_arg(orch_args.tensor(2));
+__attribute__((visibility("default"))) void aicpu_orchestration_entry(const L2TaskArgs &orch_args) {
+    // golden shape = kernel shape, use orch_args.tensor(i).ref() directly
+    const Tensor &ext_a = orch_args.tensor(0).ref();
+    const Tensor &ext_b = orch_args.tensor(1).ref();
+    const Tensor &ext_f = orch_args.tensor(2).ref();
 
-    uint32_t SIZE = orch_args.tensor(0).shapes[0];
+    uint32_t SIZE = orch_args.tensor(0).ref().shapes[0];
     LOG_INFO_V0("===============SIZE=%u", SIZE);
 
     uint32_t inter_shapes[1] = {SIZE};
     TensorCreateInfo inter_ci(inter_shapes, 1, DataType::FLOAT32);
 
     // t0: c = a + b (kernel_id=0, kernel_add) [outer scope]
-    Arg params_t0;
+    L0TaskArgs params_t0;
     params_t0.add_input(ext_a);
     params_t0.add_input(ext_b);
     params_t0.add_output(inter_ci);
@@ -76,7 +75,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
     // c flows in from outer scope (outer-scope tensors are visible to inner scopes).
     PTO2_SCOPE() {
         // t1: d = c + 1 (kernel_id=1, kernel_add_scalar)
-        Arg params_t1;
+        L0TaskArgs params_t1;
         params_t1.add_input(c);
         params_t1.add_output(inter_ci);
         params_t1.add_scalar(1.0f);
@@ -85,7 +84,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
         const Tensor &d = outs_t1.get_ref(0);
 
         // t2: e = c + 2 (kernel_id=1, kernel_add_scalar)
-        Arg params_t2;
+        L0TaskArgs params_t2;
         params_t2.add_input(c);
         params_t2.add_output(inter_ci);
         params_t2.add_scalar(2.0f);
@@ -94,7 +93,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
         const Tensor &e = outs_t2.get_ref(0);
 
         // t3: g = d * e (kernel_id=2, kernel_mul)
-        Arg params_t3;
+        L0TaskArgs params_t3;
         params_t3.add_input(d);
         params_t3.add_input(e);
         params_t3.add_output(inter_ci);
@@ -103,7 +102,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
         const Tensor &g = outs_t3.get_ref(0);
 
         // t4: f = g + c (kernel_id=0, kernel_add)
-        Arg params_t4;
+        L0TaskArgs params_t4;
         params_t4.add_input(g);
         params_t4.add_input(c);
         params_t4.add_output(ext_f);

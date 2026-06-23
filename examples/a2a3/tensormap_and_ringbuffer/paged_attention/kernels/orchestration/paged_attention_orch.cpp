@@ -69,15 +69,14 @@ inline uint64_t get_sys_cnt_aicpu() {
 
 extern "C" {
 
-__attribute__((visibility("default"))) PTO2OrchestrationConfig
-aicpu_orchestration_config(const ChipStorageTaskArgs &orch_args) {
+__attribute__((visibility("default"))) PTO2OrchestrationConfig aicpu_orchestration_config(const L2TaskArgs &orch_args) {
     (void)orch_args;
     return PTO2OrchestrationConfig{
         .expected_arg_count = 7,
     };
 }
 
-__attribute__((visibility("default"))) void aicpu_orchestration_entry(const ChipStorageTaskArgs &orch_args) {
+__attribute__((visibility("default"))) void aicpu_orchestration_entry(const L2TaskArgs &orch_args) {
 #ifdef ENABLE_PROFILING
     uint64_t prof_param_extract = 0;
     uint64_t prof_ext_tensor = 0;
@@ -97,13 +96,13 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
     INSTRUMENTATION_MARK_SET(g_TraCR_thread_idx, Read_Dimensions, 0);
 
     // Read dimensions from tensor metadata
-    uint64_t batch = orch_args.tensor(0).shapes[0];
-    uint64_t num_heads = orch_args.tensor(0).shapes[1];
-    uint64_t head_dim = orch_args.tensor(0).shapes[2];
-    DataType data_type = orch_args.tensor(0).dtype;
+    uint64_t batch = orch_args.tensor(0).ref().shapes[0];
+    uint64_t num_heads = orch_args.tensor(0).ref().shapes[1];
+    uint64_t head_dim = orch_args.tensor(0).ref().shapes[2];
+    DataType data_type = orch_args.tensor(0).ref().dtype;
 
-    uint64_t block_size = orch_args.tensor(1).shapes[1];
-    uint64_t block_num = orch_args.tensor(3).shapes[1];
+    uint64_t block_size = orch_args.tensor(1).ref().shapes[1];
+    uint64_t block_num = orch_args.tensor(3).ref().shapes[1];
 
     uint64_t scale_value = orch_args.scalar(0);
 
@@ -117,12 +116,12 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
     INSTRUMENTATION_MARK_SET(g_TraCR_thread_idx, Reshape_Kernels, 0);
 
     // Reshape tensors for kernel consumption (2D flattened)
-    void *query_ptr = orch_args.tensor(0).data_as<void>();
-    void *kc_ptr = orch_args.tensor(1).data_as<void>();
-    void *vc_ptr = orch_args.tensor(2).data_as<void>();
-    void *out_ptr = orch_args.tensor(5).data_as<void>();
+    void *query_ptr = orch_args.tensor(0).ref().data_as<void>();
+    void *kc_ptr = orch_args.tensor(1).ref().data_as<void>();
+    void *vc_ptr = orch_args.tensor(2).ref().data_as<void>();
+    void *out_ptr = orch_args.tensor(5).ref().data_as<void>();
 
-    uint64_t total_blocks_count = orch_args.tensor(1).shapes[0];
+    uint64_t total_blocks_count = orch_args.tensor(1).ref().shapes[0];
 
     uint32_t query_shapes[2] = {static_cast<uint32_t>(batch * num_heads), static_cast<uint32_t>(head_dim)};
     uint32_t key_cache_shapes[2] = {
@@ -140,10 +139,10 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
 
     uint32_t bt_shapes[2] = {static_cast<uint32_t>(batch), static_cast<uint32_t>(block_num)};
     Tensor block_table =
-        make_tensor_external(orch_args.tensor(3).data_as<void>(), bt_shapes, 2, DataType::INT32, false);
+        make_tensor_external(orch_args.tensor(3).ref().data_as<void>(), bt_shapes, 2, DataType::INT32, false);
     uint32_t cl_shapes[1] = {static_cast<uint32_t>(batch)};
     Tensor context_lens =
-        make_tensor_external(orch_args.tensor(4).data_as<void>(), cl_shapes, 1, DataType::INT32, false);
+        make_tensor_external(orch_args.tensor(4).ref().data_as<void>(), cl_shapes, 1, DataType::INT32, false);
 
     INSTRUMENTATION_MARK_SET(g_TraCR_thread_idx, Pre_Loop_Info, uint32_t(batch));
 
@@ -201,7 +200,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
                     PROF_INC(prof_view_count, 2);
                     CYCLE_COUNT_LAP(prof_tensor_view);
 
-                    Arg params_qk;
+                    L0TaskArgs params_qk;
                     params_qk.add_input(qi);
                     params_qk.add_input(kj);
                     params_qk.add_output(sij_ci);
@@ -217,7 +216,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
                     PROF_INC(prof_view_count, 1);
                     CYCLE_COUNT_LAP(prof_tensor_view);
 
-                    Arg params_sf;
+                    L0TaskArgs params_sf;
                     params_sf.add_input(sij_valid);
                     params_sf.add_output(pij_f16_ci);
                     params_sf.add_output(scalar_ci);
@@ -231,7 +230,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
                     PROF_INC(prof_submit_count, 1);
                     CYCLE_COUNT_LAP(prof_submit_task);
 
-                    Arg params_pv;
+                    L0TaskArgs params_pv;
                     params_pv.add_input(pij_f16);
                     params_pv.add_input(vj);
                     params_pv.add_output(tile2d_ci);
@@ -245,7 +244,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
                     uint64_t is_last = (bn == bn_this_batch - 1) ? 1 : 0;
                     CYCLE_COUNT_LAP(prof_param_extract);
 
-                    Arg params_up;
+                    L0TaskArgs params_up;
                     params_up.add_input(mi);
                     params_up.add_input(li);
                     params_up.add_input(oi_tmp);

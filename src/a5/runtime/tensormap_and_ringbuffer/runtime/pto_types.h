@@ -28,6 +28,7 @@
 #include <stdint.h>
 #include <string.h>
 
+#include <string>
 #include <type_traits>
 #include <utility>
 
@@ -42,14 +43,6 @@
 #include "task_args.h"
 #include "tensor.h"
 #include "tensor_create_info.h"  // runtime-only TensorCreateInfo + materialization helpers
-
-// Task arguments — alias the common CORE_MAX_* constants (single source of
-// truth in src/common/task_interface/arg_direction.h, transitively included
-// via task_args.h above). Keeping the MAX_TENSOR_ARGS / MAX_SCALAR_ARGS names
-// because they are referenced widely in this runtime (pto_runtime2_types.h,
-// pto2_dispatch_payload.h, intrinsic.h comments).
-#define MAX_TENSOR_ARGS CORE_MAX_TENSOR_ARGS
-#define MAX_SCALAR_ARGS CORE_MAX_SCALAR_ARGS
 
 typedef enum {
     ASYNC_ENGINE_SDMA = 0,
@@ -142,14 +135,42 @@ private:
 // TensorArgType is defined in tensor.h (included via task_args.h above)
 
 /**
- * Tagged union for a single Arg slot — either a Tensor* or a TensorCreateInfo value.
- * The active member is determined by TensorArgType (OUTPUT → create_info, else → ptr).
+ * Tagged reference to a single Arg slot — either a Tensor* or a
+ * TensorCreateInfo*. The active member is determined by the slot's
+ * TensorArgType tag (OUTPUT → create_info, else → tensor pointer).
+ *
+ * Minimal-permission: the union members are private; content is set only via
+ * operator=(ptr) and read via ref()/create_info(). Copy/move are deleted — a
+ * TensorRef is written in place inside an Arg's slot array, never passed by
+ * value.
  */
-union TensorRef {
-    const Tensor *ptr;
-    const TensorCreateInfo *create_info;
+class TensorRef {
+    union {
+        const Tensor *ptr_;
+        const TensorCreateInfo *create_info_;
+    };
+
+public:
     TensorRef() :
-        ptr(nullptr) {}
+        ptr_(nullptr) {}
+    TensorRef(const TensorRef &) = delete;
+    TensorRef(TensorRef &&) = delete;
+    TensorRef &operator=(const TensorRef &) = delete;
+    TensorRef &operator=(TensorRef &&) = delete;
+
+    TensorRef &operator=(const Tensor *p) {
+        ptr_ = p;
+        return *this;
+    }
+    TensorRef &operator=(const TensorCreateInfo *ci) {
+        create_info_ = ci;
+        return *this;
+    }
+
+    const Tensor &ref() const { return *ptr_; }
+    const TensorCreateInfo &create_info() const { return *create_info_; }
+    bool refers_to(const Tensor *t) const { return ptr_ == t; }
+    bool refers_to(const TensorCreateInfo *ci) const { return create_info_ == ci; }
 };
 
 /**
@@ -175,13 +196,32 @@ union TensorRef {
  *   TaskOutputTensors outs = rt_submit_aic_task(kernel_id, args);
  *   const Tensor& y = outs.get_ref(0);
  */
-struct Arg : TaskArgsTpl<TensorRef, uint64_t, MAX_TENSOR_ARGS, MAX_SCALAR_ARGS, TensorArgType> {
+template <size_t MaxT, size_t MaxS>
+struct Arg : TaskArgsTpl<TensorRef, uint64_t, MaxT, MaxS, TensorArgType> {
+    using Base = TaskArgsTpl<TensorRef, uint64_t, MaxT, MaxS, TensorArgType>;
+    // Make dependent-base members visible for unqualified use (two-phase lookup
+    // does not search a dependent base in a class template).
+    using Base::scalar_count_;
+    using Base::scalars_;
+    using Base::tags_;
+    using Base::tensor_count_;
+    using Base::tensors_;
+
+    // Minimal-permission: an Arg is built in place and consumed by reference;
+    // it is never copied/moved (it is a large object, and its TensorRef slots
+    // are non-copyable by design).
+    Arg() = default;
+    Arg(const Arg &) = delete;
+    Arg(Arg &&) = delete;
+    Arg &operator=(const Arg &) = delete;
+    Arg &operator=(Arg &&) = delete;
+
     bool has_error{false};
     const char *error_msg{nullptr};
     PTO2LaunchSpec launch_spec;  // SPMD launch parameters (block_num, etc.)
 
     void clear() {
-        TaskArgsTpl<TensorRef, uint64_t, MAX_TENSOR_ARGS, MAX_SCALAR_ARGS, TensorArgType>::clear();
+        Base::clear();
 #if PTO2_PROFILING
         dump_arg_selection_.clear();
 #endif
@@ -233,10 +273,11 @@ struct Arg : TaskArgsTpl<TensorRef, uint64_t, MAX_TENSOR_ARGS, MAX_SCALAR_ARGS, 
 
     template <typename... Args>
     void add_input(Args &&...args) {
-        if (!check_add_tensor_valid<false>(std::forward<Args>(args)...)) {
+        assert_add_tensor_args<false, Args...>();
+        if (!check_add_tensor_capacity(static_cast<int32_t>(sizeof...(Args)))) {
             return;
         }
-        ((tensors_[tensor_count_].ptr = &args, tags_[tensor_count_] = TensorArgType::INPUT, tensor_count_++), ...);
+        ((tensors_[tensor_count_] = &args, tags_[tensor_count_] = TensorArgType::INPUT, tensor_count_++), ...);
     }
 
     /// Batch add outputs — all Tensor or all TensorCreateInfo:
@@ -244,31 +285,31 @@ struct Arg : TaskArgsTpl<TensorRef, uint64_t, MAX_TENSOR_ARGS, MAX_SCALAR_ARGS, 
     ///   add_output(t1, t2)           — write-only existing tensors (OUTPUT_EXISTING)
     template <typename... Args>
     void add_output(Args &&...args) {
-        if (!check_add_tensor_valid<true>(std::forward<Args>(args)...)) return;
+        assert_add_tensor_args<true, Args...>();
+        if (!check_add_tensor_capacity(static_cast<int32_t>(sizeof...(Args)))) return;
         if constexpr ((std::is_same_v<std::decay_t<Args>, TensorCreateInfo> && ...)) {
-            ((tensors_[tensor_count_].create_info = &args, tags_[tensor_count_] = TensorArgType::OUTPUT,
-              tensor_count_++),
-             ...);
+            ((tensors_[tensor_count_] = &args, tags_[tensor_count_] = TensorArgType::OUTPUT, tensor_count_++), ...);
         } else {
-            ((tensors_[tensor_count_].ptr = &args, tags_[tensor_count_] = TensorArgType::OUTPUT_EXISTING,
-              tensor_count_++),
+            ((tensors_[tensor_count_] = &args, tags_[tensor_count_] = TensorArgType::OUTPUT_EXISTING, tensor_count_++),
              ...);
         }
     }
 
     template <typename... Args>
     void add_inout(Args &&...args) {
-        if (!check_add_tensor_valid<false>(std::forward<Args>(args)...)) {
+        assert_add_tensor_args<false, Args...>();
+        if (!check_add_tensor_capacity(static_cast<int32_t>(sizeof...(Args)))) {
             return;
         }
-        ((tensors_[tensor_count_].ptr = &args, tags_[tensor_count_] = TensorArgType::INOUT, tensor_count_++), ...);
+        ((tensors_[tensor_count_] = &args, tags_[tensor_count_] = TensorArgType::INOUT, tensor_count_++), ...);
     }
 
     /// No-dependency existing tensor: skips OverlapMap lookup, depends on creator only.
     template <typename... Args>
     void add_no_dep(Args &&...args) {
-        if (!check_add_tensor_valid<false>(std::forward<Args>(args)...)) return;
-        ((tensors_[tensor_count_].ptr = &args, tags_[tensor_count_] = TensorArgType::NO_DEP, tensor_count_++), ...);
+        assert_add_tensor_args<false, Args...>();
+        if (!check_add_tensor_capacity(static_cast<int32_t>(sizeof...(Args)))) return;
+        ((tensors_[tensor_count_] = &args, tags_[tensor_count_] = TensorArgType::NO_DEP, tensor_count_++), ...);
     }
 
     /**
@@ -327,16 +368,16 @@ struct Arg : TaskArgsTpl<TensorRef, uint64_t, MAX_TENSOR_ARGS, MAX_SCALAR_ARGS, 
     void add_scalar(Args &&...args) {
         static_assert(sizeof...(Args) >= 1, "add_scalar: at least one argument required");
         static_assert((is_supported_scalar_arg_v<Args> && ...), "add_scalar: all types must be arithmetic or enum");
-        if (scalar_count_ + sizeof...(Args) > MAX_SCALAR_ARGS) {
-            set_error("Too many scalar args (exceeds MAX_SCALAR_ARGS=16)");
+        if (scalar_count_ + sizeof...(Args) > MaxS) {
+            set_error(scalar_cap_msg());
             return;
         }
         (add_scalar_one(std::forward<Args>(args)), ...);
     }
 
     void add_scalars(const uint64_t *values, int count) {
-        if (count < 0 || scalar_count_ + count > MAX_SCALAR_ARGS) {
-            set_error("Too many scalar args (exceeds MAX_SCALAR_ARGS=16)");
+        if (count < 0 || scalar_count_ + count > MaxS) {
+            set_error(scalar_cap_msg());
             return;
         }
         memcpy(&scalars_[scalar_count_], values, count * sizeof(uint64_t));
@@ -353,8 +394,8 @@ struct Arg : TaskArgsTpl<TensorRef, uint64_t, MAX_TENSOR_ARGS, MAX_SCALAR_ARGS, 
      * Uses NEON to process 4 elements per iteration on aarch64.
      */
     void add_scalars_i32(const int32_t *values, int count) {
-        if (count < 0 || scalar_count_ + count > MAX_SCALAR_ARGS) {
-            set_error("Too many scalar args (exceeds MAX_SCALAR_ARGS=16)");
+        if (count < 0 || scalar_count_ + count > MaxS) {
+            set_error(scalar_cap_msg());
             return;
         }
         uint64_t *dst = &scalars_[scalar_count_];
@@ -390,8 +431,8 @@ struct Arg : TaskArgsTpl<TensorRef, uint64_t, MAX_TENSOR_ARGS, MAX_SCALAR_ARGS, 
             set_error("Source scalar range out of bounds in copy_scalars_from");
             return;
         }
-        if (scalar_count_ + count > MAX_SCALAR_ARGS) {
-            set_error("Too many scalar args (exceeds MAX_SCALAR_ARGS=16)");
+        if (scalar_count_ + count > MaxS) {
+            set_error(scalar_cap_msg());
             return;
         }
         memcpy(&scalars_[scalar_count_], &src.scalars_[src_offset], count * sizeof(uint64_t));
@@ -421,6 +462,18 @@ private:
         is_supported_scalar_arg_v<T>;
 #endif
 
+    // Capacity-overflow messages — spell the actual limit (MaxS/MaxT, whatever
+    // the instantiation is) into the text via std::to_string. Built once into a
+    // function-local static so set_error() can hold the const char* safely.
+    static const char *scalar_cap_msg() {
+        static const std::string msg = "Too many scalar args (max " + std::to_string(MaxS) + ")";
+        return msg.c_str();
+    }
+    static const char *tensor_cap_msg() {
+        static const std::string msg = "Too many tensor args (max " + std::to_string(MaxT) + ")";
+        return msg.c_str();
+    }
+
     template <typename T>
     void add_scalar_one(T &&value) {
         scalars_[scalar_count_] = to_u64(value);
@@ -448,7 +501,7 @@ private:
 
     void mark_dump_arg(const Tensor &tensor) {
         for (int32_t i = 0; i < tensor_count_; i++) {
-            if (tags_[i] != TensorArgType::OUTPUT && tensors_[i].ptr == &tensor) {
+            if (tags_[i] != TensorArgType::OUTPUT && tensors_[i].refers_to(&tensor)) {
                 dump_arg_selection_.mark_index(i);
                 return;
             }
@@ -458,7 +511,7 @@ private:
 
     void mark_dump_arg(const TensorCreateInfo &create_info) {
         for (int32_t i = 0; i < tensor_count_; i++) {
-            if (tags_[i] == TensorArgType::OUTPUT && tensors_[i].create_info == &create_info) {
+            if (tags_[i] == TensorArgType::OUTPUT && tensors_[i].refers_to(&create_info)) {
                 dump_arg_selection_.mark_index(i);
                 return;
             }
@@ -476,8 +529,11 @@ private:
     }
 #endif
 
+    // Compile-time validation: arg count, value category (reject temporaries —
+    // a stored &arg would dangle after the call), and element type. Driven
+    // purely by Args, with no runtime state.
     template <bool is_output, typename... Args>
-    bool check_add_tensor_valid(Args &&...) {
+    static void assert_add_tensor_args() {
         static_assert(sizeof...(Args) >= 1, "at least one argument required");
         static_assert(
             (std::is_lvalue_reference_v<Args> && ...),
@@ -492,6 +548,11 @@ private:
         } else {
             static_assert((std::is_same_v<std::decay_t<Args>, Tensor> && ...), "all arguments must be Tensor");
         }
+    }
+
+    // Runtime validation: tensor-before-scalar ordering + slot capacity. Records
+    // an error and returns false on violation.
+    bool check_add_tensor_capacity(int32_t count) {
         if (scalar_count_ != 0) {
             set_error(
                 "add_input/add_output/add_inout called after add_scalar: "
@@ -499,11 +560,42 @@ private:
             );
             return false;
         }
-        if (tensor_count_ + sizeof...(Args) > MAX_TENSOR_ARGS) {
-            set_error("Too many tensor args (exceeds MAX_TENSOR_ARGS=32)");
+        if (tensor_count_ + count > static_cast<int32_t>(MaxT)) {
+            set_error(tensor_cap_msg());
             return false;
         }
         return true;
+    }
+};
+
+// =============================================================================
+// Task-args layer aliases
+// =============================================================================
+//
+// L0TaskArgs — core-level container used to build and submit tasks inside
+//   orchestration (small, stack-friendly).
+using L0TaskArgs = Arg<MAX_TENSOR_ARGS, MAX_SCALAR_ARGS>;
+
+// L2TaskArgs — chip-level entry-arg holding the orchestration entry's
+// already-allocated inputs (capacity matches ChipStorageTaskArgs).
+// aicpu_orchestration_entry/config receive a const L2TaskArgs&.
+struct L2TaskArgs : Arg<CHIP_MAX_TENSOR_ARGS, CHIP_MAX_SCALAR_ARGS> {
+    // Build from the executor's ChipStorageTaskArgs: each input becomes a
+    // TensorRef pointing at src's Tensor, so `src` must outlive this (on the
+    // executor path src is runtime->orch_args_storage_, alive for the whole run).
+    void create_from_chip_args(const ChipStorageTaskArgs &src) {
+        reset();
+        for (int32_t i = 0; i < src.tensor_count(); ++i) {
+            // Entry inputs are external submit-time tensors; the entry binds them
+            // by const Tensor& (replacing from_tensor_arg's old version/manual_dep
+            // reset), so this invariant is what keeps that binding behavior-preserving.
+            const Tensor &t = src.tensor(i);
+            debug_assert(!t.manual_dep && t.version == 0);
+            add_input(t);
+        }
+        for (int32_t i = 0; i < src.scalar_count(); ++i) {
+            add_scalar(src.scalar(i));
+        }
     }
 };
 

@@ -91,7 +91,6 @@ enum class TensorArgType : int32_t {
  * constructor is private, so a *valid* Tensor (real buffer, row-major strides)
  * is obtained only through controlled entry points:
  *   - make_tensor_external(...)
- *   - from_tensor_arg(...)
  *   - TaskOutputTensors returned by submit(...)
  *   - Tensor::view() / reshape() / transpose() / permute() / slice() on an existing valid Tensor
  */

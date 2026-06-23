@@ -40,23 +40,22 @@
 
 extern "C" {
 
-__attribute__((visibility("default"))) PTO2OrchestrationConfig
-aicpu_orchestration_config(const ChipStorageTaskArgs &orch_args) {
+__attribute__((visibility("default"))) PTO2OrchestrationConfig aicpu_orchestration_config(const L2TaskArgs &orch_args) {
     (void)orch_args;  // NOLINT(readability/casting)
     return PTO2OrchestrationConfig{
         .expected_arg_count = 4,  // a, b, result, check
     };
 }
 
-__attribute__((visibility("default"))) void aicpu_orchestration_entry(const ChipStorageTaskArgs &orch_args) {
+__attribute__((visibility("default"))) void aicpu_orchestration_entry(const L2TaskArgs &orch_args) {
     // External tensors from golden.py
-    Tensor ext_a = from_tensor_arg(orch_args.tensor(0));
-    Tensor ext_b = from_tensor_arg(orch_args.tensor(1));
-    Tensor ext_result = from_tensor_arg(orch_args.tensor(2));
-    Tensor ext_check = from_tensor_arg(orch_args.tensor(3));
+    const Tensor &ext_a = orch_args.tensor(0).ref();
+    const Tensor &ext_b = orch_args.tensor(1).ref();
+    const Tensor &ext_result = orch_args.tensor(2).ref();
+    const Tensor &ext_check = orch_args.tensor(3).ref();
 
-    uint32_t SIZE = orch_args.tensor(0).shapes[0];
-    LOG_INFO_V0("scalar_data_test: SIZE=%u, check_size=%u", SIZE, orch_args.tensor(3).shapes[0]);
+    uint32_t SIZE = orch_args.tensor(0).ref().shapes[0];
+    LOG_INFO_V0("scalar_data_test: SIZE=%u, check_size=%u", SIZE, orch_args.tensor(3).ref().shapes[0]);
 
     uint32_t inter_shapes[1] = {SIZE};
     TensorCreateInfo inter_ci(inter_shapes, 1, DataType::FLOAT32);
@@ -64,7 +63,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
     // =========================================================
     // Step 1: c = a + b (runtime-created tensor, kernel_add)
     // =========================================================
-    Arg params_c;
+    L0TaskArgs params_c;
     params_c.add_input(ext_a);
     params_c.add_input(ext_b);
     params_c.add_output(inter_ci);
@@ -119,7 +118,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
     //   Buffer already exists, so the noop just registers dependency
     // =========================================================
     {
-        Arg args;
+        L0TaskArgs args;
         args.add_inout(scalar_tensor);
         rt_submit_aiv_task(FUNC_NOOP, args);
     }
@@ -170,7 +169,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
     idx[0] = 0;
     set_tensor_data(d, 1, idx, 10.0f);
 
-    Arg params_e;
+    L0TaskArgs params_e;
     params_e.add_input(d);
     params_e.add_input(ext_a);
     params_e.add_output(inter_ci);
@@ -199,7 +198,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
     //   instead of add_input() so TensorMap tracks the access chain.
     // =========================================================
     {
-        Arg args;
+        L0TaskArgs args;
         args.add_input(c);
         args.add_input(ext_b);
         args.add_output(inter_ci);
@@ -231,7 +230,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
     //   set_tensor_data auto-waits for the noop to complete.
     // =========================================================
     {
-        Arg args;
+        L0TaskArgs args;
         args.add_output(ext_b);  // write-only: creates TensorMap entry (not add_input!)
         rt_submit_aiv_task(FUNC_NOOP, args);
     }
@@ -253,7 +252,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
     // Step 13: result = a + b (external output via add_output, kernel_add)
     // =========================================================
     {
-        Arg args;
+        L0TaskArgs args;
         args.add_input(ext_a);
         args.add_input(ext_b);
         args.add_output(ext_result);

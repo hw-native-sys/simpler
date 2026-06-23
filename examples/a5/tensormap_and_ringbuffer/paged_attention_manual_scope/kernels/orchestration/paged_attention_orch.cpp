@@ -61,15 +61,14 @@ inline uint64_t get_sys_cnt_aicpu() {
 
 extern "C" {
 
-__attribute__((visibility("default"))) PTO2OrchestrationConfig
-aicpu_orchestration_config(const ChipStorageTaskArgs &orch_args) {
+__attribute__((visibility("default"))) PTO2OrchestrationConfig aicpu_orchestration_config(const L2TaskArgs &orch_args) {
     (void)orch_args;  // NOLINT(readability/casting)
     return PTO2OrchestrationConfig{
         .expected_arg_count = 7,
     };
 }
 
-__attribute__((visibility("default"))) void build_paged_attention_graph(const ChipStorageTaskArgs &orch_args) {
+__attribute__((visibility("default"))) void build_paged_attention_graph(const L2TaskArgs &orch_args) {
     uint64_t prof_param_extract = 0;
     uint64_t prof_ext_tensor = 0;
     uint64_t prof_scope = 0;
@@ -84,13 +83,13 @@ __attribute__((visibility("default"))) void build_paged_attention_graph(const Ch
     CYCLE_COUNT_START();
 
     // Read dimensions from tensor metadata
-    uint64_t batch = orch_args.tensor(0).shapes[0];
-    uint64_t num_heads = orch_args.tensor(0).shapes[1];
-    uint64_t head_dim = orch_args.tensor(0).shapes[2];
-    DataType data_type = orch_args.tensor(0).dtype;
+    uint64_t batch = orch_args.tensor(0).ref().shapes[0];
+    uint64_t num_heads = orch_args.tensor(0).ref().shapes[1];
+    uint64_t head_dim = orch_args.tensor(0).ref().shapes[2];
+    DataType data_type = orch_args.tensor(0).ref().dtype;
 
-    uint64_t block_size = orch_args.tensor(1).shapes[1];
-    uint64_t block_num = orch_args.tensor(3).shapes[1];
+    uint64_t block_size = orch_args.tensor(1).ref().shapes[1];
+    uint64_t block_num = orch_args.tensor(3).ref().shapes[1];
 
     uint64_t scale_value = orch_args.scalar(0);
 
@@ -102,12 +101,12 @@ __attribute__((visibility("default"))) void build_paged_attention_graph(const Ch
     LOG_INFO_V9(">>>>>> batch = %" PRIu64, batch);
 
     // Reshape tensors for kernel consumption (2D flattened)
-    void *query_ptr = orch_args.tensor(0).data_as<void>();
-    void *kc_ptr = orch_args.tensor(1).data_as<void>();
-    void *vc_ptr = orch_args.tensor(2).data_as<void>();
-    void *out_ptr = orch_args.tensor(5).data_as<void>();
+    void *query_ptr = orch_args.tensor(0).ref().data_as<void>();
+    void *kc_ptr = orch_args.tensor(1).ref().data_as<void>();
+    void *vc_ptr = orch_args.tensor(2).ref().data_as<void>();
+    void *out_ptr = orch_args.tensor(5).ref().data_as<void>();
 
-    uint64_t total_blocks_count = orch_args.tensor(1).shapes[0];
+    uint64_t total_blocks_count = orch_args.tensor(1).ref().shapes[0];
 
     uint32_t query_shapes[2] = {static_cast<uint32_t>(batch * num_heads), static_cast<uint32_t>(head_dim)};
     uint32_t key_cache_shapes[2] = {
@@ -125,10 +124,10 @@ __attribute__((visibility("default"))) void build_paged_attention_graph(const Ch
 
     uint32_t bt_shapes[2] = {static_cast<uint32_t>(batch), static_cast<uint32_t>(block_num)};
     Tensor block_table =
-        make_tensor_external(orch_args.tensor(3).data_as<void>(), bt_shapes, 2, DataType::INT32, false);
+        make_tensor_external(orch_args.tensor(3).ref().data_as<void>(), bt_shapes, 2, DataType::INT32, false);
     uint32_t cl_shapes[1] = {static_cast<uint32_t>(batch)};
     Tensor context_lens =
-        make_tensor_external(orch_args.tensor(4).data_as<void>(), cl_shapes, 1, DataType::INT32, false);
+        make_tensor_external(orch_args.tensor(4).ref().data_as<void>(), cl_shapes, 1, DataType::INT32, false);
 
     // Create infos are loop-invariant — shapes depend only on q_tile/head_dim/block_size
     uint32_t tile2d_shapes[2] = {static_cast<uint32_t>(q_tile), static_cast<uint32_t>(head_dim)};
@@ -183,7 +182,7 @@ __attribute__((visibility("default"))) void build_paged_attention_graph(const Ch
                     prof_view_count += 2;
                     CYCLE_COUNT_LAP(prof_tensor_view);
 
-                    Arg params_qk;
+                    L0TaskArgs params_qk;
                     params_qk.add_input(qi);
                     params_qk.add_input(kj);
                     params_qk.add_output(sij_ci);
@@ -202,7 +201,7 @@ __attribute__((visibility("default"))) void build_paged_attention_graph(const Ch
                     // --- Primitive dep API (Arg + set_dependencies) ---
                     // Caller owns the deps buffer; Arg stores (ptr, count).
                     // Suited for codegen and for cases with a fixed dep set.
-                    Arg params_sf;
+                    L0TaskArgs params_sf;
                     params_sf.add_input(sij_valid);
                     params_sf.add_output(pij_f16_ci);
                     params_sf.add_output(scalar_ci);
@@ -218,7 +217,7 @@ __attribute__((visibility("default"))) void build_paged_attention_graph(const Ch
                     prof_submit_count++;
                     CYCLE_COUNT_LAP(prof_submit_task);
 
-                    Arg params_pv;
+                    L0TaskArgs params_pv;
                     params_pv.add_input(pij_f16);
                     params_pv.add_input(vj);
                     params_pv.add_output(tile2d_ci);
@@ -234,13 +233,13 @@ __attribute__((visibility("default"))) void build_paged_attention_graph(const Ch
                     uint64_t is_last = (bn == bn_this_batch - 1) ? 1 : 0;
                     CYCLE_COUNT_LAP(prof_param_extract);
 
-                    // --- Convenience dep API (ArgWithDeps + add_dep) ---
+                    // --- Convenience dep API (L0TaskArgsWithDeps + add_dep) ---
                     // Wrapper owns a stack-sized deps buffer and accepts
                     // incremental add_dep() calls; the submit overload binds
                     // them to the underlying Arg via set_dependencies(...).
                     // Suited for hand-written orch where the dep set is
                     // assembled conditionally across branches.
-                    ArgWithDeps<> params_up;
+                    L0TaskArgsWithDeps<> params_up;
                     params_up.add_input(mi);
                     params_up.add_input(li);
                     params_up.add_input(oi_tmp);

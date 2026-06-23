@@ -9,7 +9,6 @@
  * -----------------------------------------------------------------------------------------------------------
  */
 #include "common.h"
-#include "pto_orchestration_api.h"
 
 #ifdef __linux__
 #include <cxxabi.h>
@@ -23,6 +22,14 @@
 #endif
 
 struct PTO2Runtime;
+
+// Unified-log error sink. Forward-declared here rather than pulled via
+// common/unified_log.h: that header lives under common/log/include, which is
+// not on the orchestration .so build's include path. The symbol resolves at
+// link time for the runtime targets, and at dlopen time for the orchestration
+// .so (against the executor's unified_log_device), so onboard diagnostics still
+// reach the CANN device log.
+extern "C" void unified_log_error(const char *func, const char *fmt, ...);
 
 namespace {
 // Plain global (not thread_local) to avoid glibc TLSDESC stale-resolution
@@ -174,11 +181,17 @@ AssertionError::AssertionError(const char *condition, const char *file, int line
     line_(line) {}
 
 [[noreturn]] void assert_impl(const char *condition, const char *file, int line) {
-    LOG_ERROR("\n========================================");
-    LOG_ERROR("Assertion failed: %s", condition);
-    LOG_ERROR("Location: %s:%d", file, line);
-    LOG_ERROR("%s", get_stacktrace(2).c_str());
-    LOG_ERROR("========================================\n");
+    // Use unified_log_error directly rather than the LOG_ERROR macro: that macro
+    // lives in pto_orchestration_api.h and expands to
+    // current_runtime()->ops->log_error, but the ops table's definition pulls in
+    // pto_types.h (Arg → __aicore__-only to_u64), which the AICore build of this
+    // TU cannot compile. unified_log_error reaches the same sink without that
+    // dependency.
+    unified_log_error(__FUNCTION__, "\n========================================");
+    unified_log_error(__FUNCTION__, "Assertion failed: %s", condition);
+    unified_log_error(__FUNCTION__, "Location: %s:%d", file, line);
+    unified_log_error(__FUNCTION__, "%s", get_stacktrace(2).c_str());
+    unified_log_error(__FUNCTION__, "========================================\n");
 
     throw AssertionError(condition, file, line);
 }

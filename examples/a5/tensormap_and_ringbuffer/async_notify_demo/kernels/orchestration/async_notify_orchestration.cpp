@@ -17,29 +17,28 @@
 extern "C" {
 
 __attribute__((visibility("default"))) PTO2OrchestrationConfig
-async_notify_orchestration_config(const ChipStorageTaskArgs &orch_args) {
+async_notify_orchestration_config(const L2TaskArgs &orch_args) {
     (void)orch_args;
     return PTO2OrchestrationConfig{.expected_arg_count = 5};
 }
 
-__attribute__((visibility("default"))) PTO2OrchestrationConfig
-aicpu_orchestration_config(const ChipStorageTaskArgs &orch_args) {
+__attribute__((visibility("default"))) PTO2OrchestrationConfig aicpu_orchestration_config(const L2TaskArgs &orch_args) {
     return async_notify_orchestration_config(orch_args);
 }
 
-__attribute__((visibility("default"))) void async_notify_orchestration(const ChipStorageTaskArgs &orch_args) {
+__attribute__((visibility("default"))) void async_notify_orchestration(const L2TaskArgs &orch_args) {
     if (orch_args.tensor_count() + orch_args.scalar_count() != 5) {
         LOG_ERROR("async_notify_demo: expected 5 args");
         return;
     }
 
-    Tensor input = from_tensor_arg(orch_args.tensor(0));
-    Tensor output = from_tensor_arg(orch_args.tensor(1));
-    Tensor result = from_tensor_arg(orch_args.tensor(2));
-    Tensor notify_counter = from_tensor_arg(orch_args.tensor(3));
+    const Tensor &input = orch_args.tensor(0).ref();
+    const Tensor &output = orch_args.tensor(1).ref();
+    const Tensor &result = orch_args.tensor(2).ref();
+    const Tensor &notify_counter = orch_args.tensor(3).ref();
     auto *comm_ctx = reinterpret_cast<CommContext *>(static_cast<uintptr_t>(orch_args.scalar(0)));
 
-    Arg params_producer;
+    L0TaskArgs params_producer;
     params_producer.add_input(input);
     params_producer.add_output(output);
     params_producer.add_scalar(notify_counter.buffer.addr);
@@ -48,14 +47,14 @@ __attribute__((visibility("default"))) void async_notify_orchestration(const Chi
 
     uint32_t notify_token_shape[1] = {1};
     TensorCreateInfo notify_token_info(notify_token_shape, 1, DataType::INT32);
-    Arg params_notify;
+    L0TaskArgs params_notify;
     params_notify.add_output(notify_token_info);
     params_notify.add_scalar(notify_counter.buffer.addr);
     params_notify.add_scalar(static_cast<uint64_t>(1));
     TaskOutputTensors notify_outputs = rt_submit_aiv_task(2, params_notify);
     Tensor notify_token = notify_outputs.get_ref(0);
 
-    Arg params_consumer;
+    L0TaskArgs params_consumer;
     params_consumer.add_input(notify_token);
     params_consumer.add_input(output);
     params_consumer.add_output(result);
