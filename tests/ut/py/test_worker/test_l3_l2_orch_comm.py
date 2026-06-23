@@ -74,6 +74,7 @@ class _FakeClient:
         self.requests = []
         self.next_region_id = 1
         self.wait_timeout_once = False
+        self.wait_copy_failed_once = False
 
     def submit(self, request, timeout_s: float):
         self.requests.append((request, timeout_s))
@@ -107,6 +108,17 @@ class _FakeClient:
                 matched=False,
                 desc=None,
                 message="SIGNAL_WAIT timed out",
+            )
+        if request.cmd == L3L2OrchCommCmd.SIGNAL_WAIT and self.wait_copy_failed_once:
+            self.wait_copy_failed_once = False
+            return L3L2OrchCommResponse(
+                status=-1,
+                error_kind=6,
+                region_id=request.region_id,
+                observed_counter=0,
+                matched=False,
+                desc=None,
+                message="SIGNAL_WAIT load failed",
             )
         if request.cmd == L3L2OrchCommCmd.SIGNAL_TEST:
             matched = request.counter_operand <= 3
@@ -481,6 +493,22 @@ def test_counter_wait_timeout_does_not_poison_region():
         assert region.descriptor_scalars()[1] == 1
         counter.notify(3, NotifyOp.Set)
         assert fake_client.requests[-1][0].cmd == L3L2OrchCommCmd.SIGNAL_NOTIFY
+    finally:
+        worker._close_l3_l2_orch_comm()
+        shm.close()
+        shm.unlink()
+
+
+def test_counter_wait_copy_failure_poisons_region():
+    worker, shm, _fake_c_worker, fake_client = _make_started_worker()
+    try:
+        region = worker._create_l3_l2_region(0, 4, 128)
+        counter = region.counter(0)
+        fake_client.wait_copy_failed_once = True
+        with pytest.raises(RuntimeError, match="SIGNAL_WAIT load failed"):
+            counter.wait(3, WaitCmp.GE, timeout=0.001)
+        with pytest.raises(RuntimeError, match="poisoned"):
+            region.descriptor_scalars()
     finally:
         worker._close_l3_l2_orch_comm()
         shm.close()

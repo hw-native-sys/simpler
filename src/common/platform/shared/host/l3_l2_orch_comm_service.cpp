@@ -161,6 +161,10 @@ void L3L2OrchCommService::loop() {
 }
 
 void L3L2OrchCommService::execute_request(const L3L2OrchCommRequest &request, L3L2OrchCommResponse *response) {
+    if (request.reserved0 != 0) {
+        set_response(response, -1, ServiceError::BAD_REQUEST, request.region_id, "reserved0 must be zero");
+        return;
+    }
     switch (static_cast<L3L2OrchCommCmd>(request.cmd)) {
     case L3L2OrchCommCmd::ALLOC_REGION:
         alloc_region(request, response);

@@ -100,6 +100,36 @@ inline uint64_t l3_l2_orch_endpoint_now() {
 #endif
 }
 
+inline uint64_t l3_l2_orch_endpoint_timer_frequency_hz() {
+#if defined(__aarch64__)
+    uint64_t value = 0;
+    __asm__ volatile("mrs %0, cntfrq_el0" : "=r"(value));
+    return value;
+#else
+    return 1'000'000'000ULL;
+#endif
+}
+
+inline uint64_t l3_l2_orch_endpoint_ticks_to_ns(uint64_t elapsed_ticks, uint64_t frequency_hz) {
+    if (frequency_hz == 0) {
+        return UINT64_MAX;
+    }
+    __uint128_t elapsed_ns = static_cast<__uint128_t>(elapsed_ticks) * 1'000'000'000ULL / frequency_hz;
+    if (elapsed_ns > UINT64_MAX) {
+        return UINT64_MAX;
+    }
+    return static_cast<uint64_t>(elapsed_ns);
+}
+
+inline uint64_t l3_l2_orch_endpoint_elapsed_ns(uint64_t start_tick, uint64_t now_tick, uint64_t frequency_hz) {
+#if defined(__aarch64__)
+    return l3_l2_orch_endpoint_ticks_to_ns(now_tick - start_tick, frequency_hz);
+#else
+    (void)frequency_hz;
+    return now_tick - start_tick;
+#endif
+}
+
 class L3L2OrchEndpoint {
 public:
     explicit L3L2OrchEndpoint(const L3L2OrchRegionDesc &desc) :
@@ -283,13 +313,15 @@ public:
         }
 
         uint64_t start = l3_l2_orch_endpoint_now();
+        uint64_t frequency_hz = l3_l2_orch_endpoint_timer_frequency_hz();
         while (true) {
             int32_t current = load_counter(counter_addr);
             *observed = current;
             if (l3_l2_orch_comm_compare_counter(current, cmp_value, cmp)) {
                 return true;
             }
-            if (timeout == 0 || l3_l2_orch_endpoint_now() - start >= timeout) {
+            uint64_t now = l3_l2_orch_endpoint_now();
+            if (timeout == 0 || l3_l2_orch_endpoint_elapsed_ns(start, now, frequency_hz) >= timeout) {
                 set_error(
                     L3L2EndpointErrorKind::SIGNAL_TIMEOUT, "signal_wait", desc_.region_id, counter_addr, cmp_value,
                     current, "wait timed out"

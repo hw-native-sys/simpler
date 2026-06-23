@@ -53,6 +53,10 @@ TEST(L3L2OrchEndpointTest, DecodesDescriptorScalarsAndCounterRange) {
     EXPECT_EQ(counter_addr, desc.counter_base + 8);
 }
 
+TEST(L3L2OrchEndpointTest, ConvertsCounterTicksToNanoseconds) {
+    EXPECT_EQ(l3_l2_orch_endpoint_ticks_to_ns(50'000'000, 50'000'000), 1'000'000'000);
+}
+
 TEST(L3L2OrchEndpointTest, PayloadWriteCopiesSmallMetadataIntoPayloadRange) {
     RegionStorage storage{};
     L3L2OrchEndpoint endpoint(make_desc(&storage));

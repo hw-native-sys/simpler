@@ -46,6 +46,11 @@ class WaitCmp(IntEnum):
     LE = 5
 
 
+class _ServiceError(IntEnum):
+    COPY_FAILED = 6
+    SIGNAL_TIMEOUT = 7
+
+
 _STATE_IDLE = 0
 _STATE_READY = 1
 _STATE_DONE = 3
@@ -264,7 +269,10 @@ class L3L2OrchCounter:
         )
         if response.status != 0:
             msg = response.message or "L3-L2 counter wait timed out"
-            raise TimeoutError(f"{msg}; observed={int(response.observed_counter)}")
+            if int(response.error_kind) == int(_ServiceError.SIGNAL_TIMEOUT):
+                raise TimeoutError(f"{msg}; observed={int(response.observed_counter)}")
+            self._region._poison()
+            raise RuntimeError(f"{msg}; observed={int(response.observed_counter)}")
         return int(response.observed_counter)
 
 

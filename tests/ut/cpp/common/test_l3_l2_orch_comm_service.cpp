@@ -186,6 +186,21 @@ TEST_F(ServiceFixture, PayloadWriteAndReadRoundTripThroughService) {
     EXPECT_EQ(std::memcmp(src, dst, sizeof(src)), 0);
 }
 
+TEST_F(ServiceFixture, RejectsNonzeroReserved0BeforeCommandDispatch) {
+    L3L2OrchCommRequest req{};
+    req.cmd = static_cast<uint32_t>(L3L2OrchCommCmd::ALLOC_REGION);
+    req.payload_bytes = 128;
+    req.counter_bytes = 128;
+    req.reserved0 = 1;
+
+    L3L2OrchCommResponse resp = submit(req);
+
+    EXPECT_NE(resp.status, 0);
+    EXPECT_EQ(resp.error_kind, 1u);
+    EXPECT_EQ(resp.desc.region_id, 0u);
+    EXPECT_NE(std::strstr(resp.message, "reserved0"), nullptr);
+}
+
 TEST_F(ServiceFixture, PayloadCopyFailurePoisonsOnlyAffectedRegion) {
     L3L2OrchRegionDesc first = alloc_region();
     L3L2OrchRegionDesc second = alloc_region();

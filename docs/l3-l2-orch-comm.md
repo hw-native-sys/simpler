@@ -68,6 +68,10 @@ wait_aicore_done();
 ep.signal_notify(completion_addr, seq, L3L2OrchNotifyOp::Set);
 ```
 
+The L2 endpoint `signal_wait` timeout argument is in nanoseconds. The Python
+`counter.wait(..., timeout=timeout_s)` API takes seconds and converts them to
+nanoseconds before submitting the service command.
+
 `payload_read` on L2 returns a GM view. It does not copy tensor bytes. Large
 outputs should be written directly by AICore into an output view in the region.
 L2 `payload_write` is byte-oriented and intended for small metadata or status
@@ -150,6 +154,14 @@ The service handles `ALLOC_REGION`, `FREE_REGION`, `PAYLOAD_WRITE`,
 `PAYLOAD_READ`, `SIGNAL_NOTIFY`, `SIGNAL_TEST`, and `SIGNAL_WAIT`. It runs on
 the L2Host side, not inside the L2 AICPU orchestration task.
 
+Each worker has one L3-L2 client and one single-threaded service. All regions
+on the same worker therefore share one command lane. A long blocking
+`SIGNAL_WAIT` on one region can delay payload, notify, test, wait, and free
+commands for other regions on that worker. When other same-worker region
+commands need to make progress, prefer short wait timeouts with polling, place
+independent traffic on another worker, or wait for future multi-threaded
+service support.
+
 ## 4. Signal Counters
 
 Signal primitives are address-based `int32_t` counter operations. The bottom
@@ -171,7 +183,8 @@ addresses:
 ```cpp
 ep.signal_notify(counter_addr, value, L3L2OrchNotifyOp::Set);
 ep.signal_test(counter_addr, cmp_value, L3L2OrchWaitCmp::GE, &result);
-ep.signal_wait(counter_addr, cmp_value, L3L2OrchWaitCmp::GE, timeout, &observed);
+ep.signal_wait(
+    counter_addr, cmp_value, L3L2OrchWaitCmp::GE, timeout, &observed);
 ```
 
 `NotifyOp` supports:
@@ -203,10 +216,16 @@ time out, and does not poison the region. Use `wait(..., timeout=positive)`
 when the caller needs to block until the comparison matches or the timeout
 expires.
 
-`signal_notify` is the release-publish point for writes ordered before the
-notify. A matched `signal_test` or `signal_wait` is the acquire-observe point
-before reading protected data. A failed `signal_test` does not establish
-acquire semantics.
+At the abstract API level, `signal_notify` is the publish point for writes
+ordered before the notify. A matched `signal_test` or `signal_wait` is the
+observe point before reading protected data. A failed `signal_test` does not
+establish observe semantics.
+
+That contract is not provided by Host-side `atomic_thread_fence` calls alone.
+Cross-agent payload and counter visibility comes from successful payload
+command completion, backend DMA ordering, endpoint cache maintenance on onboard
+builds, and wrapper-level sequencing that publishes only after prior writes are
+complete.
 
 Primitive signal code does not impose sequence monotonicity and does not treat
 `observed > cmp_value` as a protocol error. Queue, stream, or channel wrappers
