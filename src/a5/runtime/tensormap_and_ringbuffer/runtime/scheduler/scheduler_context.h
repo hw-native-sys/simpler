@@ -101,10 +101,6 @@ public:
     bool is_completed() const { return completed_.load(std::memory_order_acquire); }
     int32_t completed_tasks_count() const { return completed_tasks_.load(std::memory_order_acquire); }
 
-    // Block until the first scheduler thread has finished one-time PTO2 init.
-    // Called by the orchestrator thread in device-orch mode.
-    void wait_init_complete() const;
-
 private:
     // =========================================================================
     // State
@@ -178,10 +174,6 @@ private:
 
     // Platform AICore-register base array (set by AicpuExecutor before init()).
     uint64_t regs_{0};
-
-    // --- One-time init coordination ---
-    std::atomic<bool> init_claimed_{false};
-    std::atomic<bool> init_complete_{false};
 
     // =========================================================================
     // Core management (scheduler_cold_path.cpp)

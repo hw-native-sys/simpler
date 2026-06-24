@@ -543,9 +543,6 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
 
             runtime_init_ready_.store(true, std::memory_order_release);
 
-            // Wait for scheduler's one-time init to complete
-            sched_ctx_.wait_init_complete();
-
 #if PTO2_PROFILING
             if (get_l2_swimlane_level() >= L2SwimlaneLevel::ORCH_PHASES) {
                 l2_swimlane_aicpu_set_orch_thread_idx(thread_idx);
@@ -558,11 +555,10 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
 #endif
 
             // dep_gen plugs into the orchestrator thread (single-instance subsystem):
-            // set the per-thread queue index and pop the initial buffer before any
-            // submit_task can fire inside orch_func_.
+            // record the per-thread ready_queue index before any submit_task fires
+            // inside orch_func_.
             if (is_dep_gen_enabled()) {
                 dep_gen_aicpu_set_orch_thread_idx(thread_idx);
-                dep_gen_aicpu_init();
             }
 
 #if PTO2_PROFILING

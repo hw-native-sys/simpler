@@ -13,12 +13,15 @@
  * @file dep_gen_collector_aicpu.h
  * @brief AICPU-side dep_gen (SubmitTrace) capture interface
  *
- * Lifecycle (called from aicpu_executor.cpp + pto_orchestrator.cpp):
+ * Lifecycle (called from scheduler cold path + aicpu_executor.cpp):
+ *   dep_gen_aicpu_init()                — pop the initial DepGenBuffer from
+ *                                         the (single) instance's free_queue.
+ *                                         Runs in SchedulerContext::init() on
+ *                                         the single-threaded cold path.
  *   dep_gen_aicpu_set_orch_thread_idx() — record which AICPU thread runs the
  *                                         orchestrator (used to select the
  *                                         per-thread ready_queue on flush).
- *   dep_gen_aicpu_init()                — pop the initial DepGenBuffer from
- *                                         the (single) instance's free_queue.
+ *                                         Runs later on the orchestrator thread.
  *   [submit_task loop]
  *     dep_gen_aicpu_record_submit()     — append one DepGenRecord; rotate
  *                                         buffer when full.
@@ -64,7 +67,11 @@ void dep_gen_aicpu_set_orch_thread_idx(int thread_idx);
  * Pre-conditions:
  *   - Host has set the data base via set_platform_dep_gen_base()
  *   - dep_gen is enabled via set_dep_gen_enabled(true)
- *   - dep_gen_aicpu_set_orch_thread_idx() has been called
+ *
+ * The initial pop only touches instance 0's free_queue, so it does not depend
+ * on the orchestrator thread index; dep_gen_aicpu_set_orch_thread_idx() may run
+ * after this (and does — on the orchestrator thread), as long as it precedes
+ * the first record_submit.
  *
  * If the free_queue is empty at init (host bug), the function leaves the
  * current buffer as null and subsequent record_submit calls will bump

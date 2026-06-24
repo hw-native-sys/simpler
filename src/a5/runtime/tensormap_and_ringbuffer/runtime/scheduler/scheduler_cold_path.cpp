@@ -14,6 +14,7 @@
 #include <cstdio>
 
 #include "common/unified_log.h"
+#include "aicpu/dep_gen_collector_aicpu.h"
 #include "aicpu/device_time.h"
 #include "aicpu/l2_swimlane_collector_aicpu.h"
 #include "aicpu/platform_regs.h"
@@ -881,12 +882,14 @@ int32_t SchedulerContext::init(
         if (l2_swimlane_level_ >= L2SwimlaneLevel::SCHED_PHASES) {
             // When orchestrator phases merge into scheduler threads
             // (PTO2_ORCH_TO_SCHED=1), phase records flow through
-            // aicpu_thread_num_ pools — matches the same branch in
-            // dump_args_init (scheduler_dispatch.cpp).
+            // aicpu_thread_num_ pools — matches the same branch in the
+            // dump_args_init call below.
             // Sched phase pool count = number of scheduler threads.
-            // sched_thread_num_ <= 0 is the "use all AICPU threads as
-            // scheduler threads" sentinel (see assign_cores_to_threads'
-            // active_sched_threads_ normalization). Without this
+            // This block runs before assign_cores_to_threads, so the
+            // active_sched_threads_ member isn't set yet — recompute the same
+            // normalization locally: sched_thread_num_ <= 0 is the "use all
+            // AICPU threads as scheduler threads" sentinel (see
+            // assign_cores_to_threads' active_sched_threads_). Without this
             // normalization here, init_phase would prime zero sched pools
             // and all sched_phase emits would silently drop.
             const int active_sched = (sched_thread_num_ > 0) ? sched_thread_num_ : aicpu_thread_num_;
@@ -909,6 +912,29 @@ int32_t SchedulerContext::init(
     }
     if (!assign_cores_to_threads()) {
         return -1;
+    }
+
+    // Profiling-subsystem buffer/state init: single-threaded cold path, so the
+    // "do it once" guarantee is structural (no CAS needed). Runs after
+    // handshake_all_cores / assign_cores_to_threads because pmu_aicpu_init needs
+    // physical_core_ids_ / cores_total_num_. Mirrors the l2_swimlane_aicpu_init
+    // convention above; the per-thread *_set_orch_thread_idx setters stay on the
+    // orchestrator thread (see aicpu_executor.cpp).
+#if PTO2_PROFILING
+    if (is_dump_args_enabled()) {
+        dump_args_init(orch_to_sched_ ? aicpu_thread_num_ : active_sched_threads_);
+    }
+    if (is_pmu_enabled()) {
+        pmu_aicpu_init(physical_core_ids_, cores_total_num_);
+        LOG_INFO_V0("PMU profiling started on %d cores", cores_total_num_);
+    }
+#endif
+    // dep_gen is host-driven (SubmitTrace) and gated independently of
+    // PTO2_PROFILING. init() only pops the initial buffer from instance 0's
+    // free_queue; the orchestrator thread still records its idx via
+    // dep_gen_aicpu_set_orch_thread_idx() before the first record_submit.
+    if (is_dep_gen_enabled()) {
+        dep_gen_aicpu_init();
     }
 
     // Initialize task counters. Task count comes from PTO2 shared memory.
@@ -982,8 +1008,6 @@ void SchedulerContext::deinit() {
     completed_tasks_.store(0, std::memory_order_release);
     total_tasks_ = 0;
     orchestrator_done_ = false;
-    init_claimed_.store(false, std::memory_order_release);
-    init_complete_.store(false, std::memory_order_release);
 
     // Reset core transition state
     transition_requested_.store(false, std::memory_order_release);
@@ -1007,12 +1031,6 @@ void SchedulerContext::deinit() {
     sched_ = nullptr;
     rt_ = nullptr;
     func_id_to_addr_ = nullptr;
-}
-
-void SchedulerContext::wait_init_complete() const {
-    while (!init_complete_.load(std::memory_order_acquire)) {
-        SPIN_WAIT_HINT();
-    }
 }
 
 void SchedulerContext::bind_runtime(PTO2Runtime *rt) {

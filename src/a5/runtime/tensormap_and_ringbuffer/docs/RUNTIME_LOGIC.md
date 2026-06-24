@@ -550,7 +550,7 @@ Public surface (called from `AicpuExecutor::init/run/deinit`):
 | `shutdown(thread_idx)` | per thread on exit | `platform_deinit_aicore_regs` for this thread's cores |
 | `on_orchestration_done(runtime, rt, thread_idx, total_tasks)` | orchestrator thread | Publish core assignments, latch task count, fold inline-completed tasks, flip `orchestrator_done_`, drive orch→sched core transition (or `emergency_shutdown` on fatal) |
 | `deinit()` | once per run | Reset every scheduler-owned field to its post-construction default |
-| Read-only accessors | various | `aic_count()` / `aiv_count()` / `is_completed()` / `completed_tasks_count()` / `wait_pto2_init_complete()` |
+| Read-only accessors | various | `aic_count()` / `aiv_count()` / `is_completed()` / `completed_tasks_count()` |
 
 Private internals are split across three .cpp files by responsibility:
 
@@ -640,16 +640,17 @@ Built by the scheduler from `PTO2TaskDescriptor`:
 | Flag | Set by | Waited by | Purpose |
 | ---- | ------ | --------- | ------- |
 | `runtime_init_ready_` | Thread 3 | Threads 0-2 | Runtime and SM handle initialized |
-| `init_claimed_` | First init thread | Others | One-time memset of arrays started (exchange guard) |
-| `init_complete_` | Init thread | Thread 3 + others | One-time init of per-task arrays done |
+
+Profiling-subsystem init (`dump_args` / `pmu` / `dep_gen` / `l2_swimlane`) runs
+once in `SchedulerContext::init()` on the single-threaded cold path, before any
+scheduler/orchestrator thread starts — so it needs no cross-thread init
+handshake.
 
 Startup sequence:
 
 1. Thread 3: create SM handle + runtime → set `runtime_init_ready_`
-2. Scheduler threads: wait for `runtime_init_ready_` → one thread wins `init_claimed_` exchange → memset per-task arrays → set `init_complete_`; other threads wait for `init_complete_`
-3. Thread 3: wait for `init_complete_` → configure orchestrator-scheduler pointers
-4. Scheduler threads: enter main loop
-5. Thread 3: call orchestration function → set `orchestrator_done_`
+2. Scheduler threads: wait for `runtime_init_ready_` → enter main loop
+3. Thread 3: configure orchestrator-scheduler pointers → call orchestration function → set `orchestrator_done_`
 
 ---
 
