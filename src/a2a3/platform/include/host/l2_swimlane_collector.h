@@ -91,12 +91,13 @@ struct L2SwimlaneModule {
     /**
      * batch_size for proactive_replenish's alloc fallback. Sized so that a
      * fully empty recycled pool refills to the configured per-instance
-     * ceiling in one tick. Sched and orch phase pools share the per-thread
-     * batch sizing.
+     * ceiling in one tick. Sched and orch phase pools are sized independently
+     * (PLATFORM_PROF_{SCHED,ORCH}_BUFFERS_PER_THREAD).
      */
     static constexpr int batch_size(int kind) {
         constexpr int kPerfBatch = PLATFORM_PROF_BUFFERS_PER_CORE - PLATFORM_PROF_SLOT_COUNT;
-        constexpr int kPhaseBatch = PLATFORM_PROF_BUFFERS_PER_THREAD - PLATFORM_PROF_SLOT_COUNT;
+        constexpr int kSchedBatch = PLATFORM_PROF_SCHED_BUFFERS_PER_THREAD - PLATFORM_PROF_SLOT_COUNT;
+        constexpr int kOrchBatch = PLATFORM_PROF_ORCH_BUFFERS_PER_THREAD - PLATFORM_PROF_SLOT_COUNT;
         constexpr int kAicoreBatch = PLATFORM_AICORE_BUFFERS_PER_CORE - PLATFORM_PROF_SLOT_COUNT;
         int b = kPerfBatch;
         switch (static_cast<L2SwimlaneBufferKind>(kind)) {
@@ -104,10 +105,10 @@ struct L2SwimlaneModule {
             b = kPerfBatch;
             break;
         case L2SwimlaneBufferKind::AicpuSchedPhase:
-            b = kPhaseBatch;
+            b = kSchedBatch;
             break;
         case L2SwimlaneBufferKind::AicpuOrchPhase:
-            b = kPhaseBatch;
+            b = kOrchBatch;
             break;
         case L2SwimlaneBufferKind::AicoreTask:
             b = kAicoreBatch;

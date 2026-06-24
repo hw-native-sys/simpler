@@ -152,10 +152,19 @@ constexpr int PLATFORM_PROF_SLOT_COUNT = 4;
 constexpr int PLATFORM_PROF_BUFFERS_PER_CORE = 8;
 
 /**
- * L2SwimlaneAicpuPhaseBuffer pre-allocation count per AICPU thread.
- * 1 goes into the free_queue at init, the rest into the recycled pool.
+ * Host preallocation count per AICPU thread for the two phase pools, split per
+ * kind (sched vs orch) because their throughput is asymmetric — a single shared
+ * value over-provisions the lighter one. 1 buffer seeds the free_queue at init,
+ * the rest the recycled pool.
+ *
+ * Floor for both: SLOT_COUNT(4) + 1 = 5 (free_queue fillable + 1 active buffer).
+ * Pure host preallocation — zero ABI (the device-visible ready_queue is decoupled
+ * below, held at the original 16). Right-sized from 16 by the a2a3 audit and
+ * mirrored here (arch-independent theory, a5-silicon validation pending); rationale
+ * in docs/dfx/dfx-buffer-capacity-audit.md.
  */
-constexpr int PLATFORM_PROF_BUFFERS_PER_THREAD = 16;
+constexpr int PLATFORM_PROF_SCHED_BUFFERS_PER_THREAD = 6;
+constexpr int PLATFORM_PROF_ORCH_BUFFERS_PER_THREAD = 8;
 
 /**
  * Per-core L2SwimlaneAicoreTaskBuffer pre-allocation count.
@@ -169,10 +178,17 @@ constexpr int PLATFORM_AICORE_BUFFERS_PER_CORE = 4;
  * Ready queue capacity for performance data collection
  * Queue holds ReadyQueueEntry structs for buffers ready to be read by Host.
  * Sized to match pre-allocation total across all cores and threads.
+ *
+ * The phase term is sized to the ORIGINAL per-thread count (16), decoupled from
+ * PLATFORM_PROF_{SCHED,ORCH}_BUFFERS_PER_THREAD, on purpose: this array sizes the
+ * device-visible L2SwimlaneDataHeader::queues[], so shrinking the host
+ * preallocation must NOT shrink it (that would change the shm layout = ABI).
  */
-constexpr int PLATFORM_PROF_READYQUEUE_SIZE = PLATFORM_MAX_CORES * PLATFORM_PROF_BUFFERS_PER_CORE +
-                                              2 * PLATFORM_MAX_AICPU_THREADS * PLATFORM_PROF_BUFFERS_PER_THREAD +
-                                              PLATFORM_MAX_CORES * PLATFORM_AICORE_BUFFERS_PER_CORE;
+constexpr int PLATFORM_PROF_READYQUEUE_BUFFERS_PER_THREAD = 16;
+constexpr int PLATFORM_PROF_READYQUEUE_SIZE =
+    PLATFORM_MAX_CORES * PLATFORM_PROF_BUFFERS_PER_CORE +
+    2 * PLATFORM_MAX_AICPU_THREADS * PLATFORM_PROF_READYQUEUE_BUFFERS_PER_THREAD +
+    PLATFORM_MAX_CORES * PLATFORM_AICORE_BUFFERS_PER_CORE;
 
 // PLATFORM_PHASE_RECORDS_PER_THREAD lives in l2_swimlane_profiling.h (16384) —
 // kept beside the buffer types that use it. Do not redeclare here.
@@ -281,8 +297,14 @@ constexpr int PLATFORM_PMU_SLOT_COUNT = 4;
 
 /**
  * Number of PmuBuffers pre-allocated per core (initial pool size).
+ * Sized at 2 = 2× the Little's Law need (L≈1: PMU records are produced at the
+ * slow fixed sampling rate, decoupled from submit, and the 64 B record drains
+ * instantly, so peak in-flight is 1). Was 4 (a 4× over-provision). Mirrors the
+ * a2a3 change (validated zero-drop on a2a3 silicon); the L≈1 argument is
+ * arch-independent, but **a5-silicon onboard validation is still pending**.
+ * See docs/dfx/dfx-buffer-capacity-audit.md.
  */
-constexpr int PLATFORM_PMU_BUFFERS_PER_CORE = 4;
+constexpr int PLATFORM_PMU_BUFFERS_PER_CORE = 2;
 
 /**
  * Ready queue capacity for PMU data per AICPU thread.
@@ -300,10 +322,18 @@ constexpr int PLATFORM_PMU_TIMEOUT_SECONDS = 30;
 
 /**
  * Number of DepGenRecord entries per DepGenBuffer.
- * Each DepGenRecord is ~2.3 KB (16 Tensor blobs + small header), so a buffer
- * is ~74 KB. Mirrors a2a3 sizing — same orchestrator submit cadence.
+ * Each DepGenRecord is 4672 B (16 Tensor blobs + small header). At 4×1024 =
+ * 4096 in-flight records (~19 MB), aligning dep_gen's in-flight count with the
+ * scope_stats / l2 AicoreTask pools (also 4096) per the #977 cross-subsystem
+ * review. History: original 32 (dropped 50% on unroll Case1) → #977 commit
+ * overshot to 2048 → 1024 here (#977 Primary's actual proposal). Flood drops
+ * are rate-bound, not capacity-bound — buffer sizing cannot fix them; real
+ * dependency-paced workloads never drop. dep_gen is opt-in (--enable-dep-gen).
+ * a5 record size (4672 B) and cohort (4096) are identical to a2a3, so the same
+ * 1024 applies; **a5-silicon validation still pending**. See
+ * docs/dfx/dfx-buffer-capacity-audit.md.
  */
-constexpr int PLATFORM_DEP_GEN_RECORDS_PER_BUFFER = 32;
+constexpr int PLATFORM_DEP_GEN_RECORDS_PER_BUFFER = 1024;
 
 /**
  * SPSC free_queue slot count for dep_gen buffers (Host→Device hand-off depth).
@@ -346,8 +376,14 @@ constexpr int PLATFORM_SCOPE_STATS_SLOT_COUNT = 8;
 
 /**
  * Pre-allocated ScopeStatsBuffer count per orchestrator instance.
+ * Sized at 4 = 4× the Little's Law need (L≈1: scope_stats records are produced
+ * per scope enter/exit, decoupled from submit volume, 52 B record drains
+ * instantly, peak in-flight 1). Was 8 (an 8× over-provision). Mirrors the a2a3
+ * change (validated zero-drop on a2a3); L≈1 is arch-independent, but
+ * **a5-silicon validation still pending**. See
+ * docs/dfx/dfx-buffer-capacity-audit.md.
  */
-constexpr int PLATFORM_SCOPE_STATS_BUFFERS_PER_INSTANCE = 8;
+constexpr int PLATFORM_SCOPE_STATS_BUFFERS_PER_INSTANCE = 4;
 
 /**
  * Ready queue capacity for scope_stats (per AICPU thread). scope_stats is

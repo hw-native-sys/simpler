@@ -841,7 +841,7 @@ benchmark is not perturbed.
   AICPU increments `dropped_record_count` and continues; the host's
   `reconcile_counters()` reports `collected + dropped == total` per
   pool. If `dropped > 0`, raise `PLATFORM_PROF_BUFFERS_PER_CORE` /
-  `PLATFORM_PROF_BUFFERS_PER_THREAD` so the recycle pool has more
+  `PLATFORM_PROF_{SCHED,ORCH}_BUFFERS_PER_THREAD` so the recycle pool has more
   headroom.
 - A non-zero `current_buf_ptr` after `stop()` is logged as ERROR
   and never recovered — host treats device flush as the sole data
@@ -901,7 +901,7 @@ or `name_map_<case>.json` was not produced. See [profiling-name-map.md](../profi
 because the buffer pool ran out. On a2a3 check
 `reconcile_counters()` output for non-zero `dropped`; raise
 `PLATFORM_PROF_BUFFERS_PER_CORE` /
-`PLATFORM_PROF_BUFFERS_PER_THREAD`. On a5 raise
+`PLATFORM_PROF_{SCHED,ORCH}_BUFFERS_PER_THREAD`. On a5 raise
 `PLATFORM_PROF_BUFFER_SIZE`.
 
 **`current_buf_ptr` non-empty at finalize on a2a3.** The host logs
