@@ -18,9 +18,6 @@ concurrency:
   group: sanitizers-${{ github.ref }}
   cancel-in-progress: true
 
-env:
-  PTO_ISA_COMMIT: ddafa8da9c760ecd13fe9fe2833d6ee55fb20bd8
-
 jobs:
   sanitizer-sim:
     runs-on: ubuntu-latest
@@ -38,6 +35,9 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v5
+
+      - name: Load pinned pto-isa commit
+        uses: ./.github/actions/read-pto-isa
 
       - name: Set up C++ compiler
         run: |

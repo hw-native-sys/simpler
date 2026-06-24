@@ -12,14 +12,6 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
-env:
-  # Single source of truth for the pinned pto-isa revision. Drives BOTH the
-  # build (`pip install` threads it into build_runtimes.py via
-  # SIMPLER_PTO_ISA_COMMIT, so host_runtime.so embeds these pto-isa headers)
-  # and the run (scene tests check it out via `--pto-isa-commit`). Bump here to
-  # update both at once — never pin one without the other (issue #1067).
-  PTO_ISA_COMMIT: ddafa8da9c760ecd13fe9fe2833d6ee55fb20bd8
-
 jobs:
   # ---------- Pre-commit hooks (format, lint, clang-tidy) ----------
   pre-commit:
@@ -182,6 +174,9 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v5
 
+      - name: Load pinned pto-isa commit
+        uses: ./.github/actions/read-pto-isa
+
       - name: Set up C++ compiler
         run: |
           if [[ "${{ runner.os }}" == "Linux" ]]; then
@@ -265,6 +260,9 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v5
+
+      - name: Load pinned pto-isa commit
+        uses: ./.github/actions/read-pto-isa
 
       - name: Set up C++ compiler
         run: |
@@ -449,6 +447,9 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v5
 
+      - name: Load pinned pto-isa commit
+        uses: ./.github/actions/read-pto-isa
+
       - name: Set up environment
         run: |
           source /usr/local/Ascend/cann/set_env.sh
@@ -533,6 +534,9 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v5
+
+      - name: Load pinned pto-isa commit
+        uses: ./.github/actions/read-pto-isa
 
       - name: Set up environment
         run: |
@@ -649,6 +653,9 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v5
 
+      - name: Load pinned pto-isa commit
+        uses: ./.github/actions/read-pto-isa
+
       - name: Set up environment
         run: |
           python3 -m venv --system-site-packages .venv
@@ -716,6 +723,9 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v5
+
+      - name: Load pinned pto-isa commit
+        uses: ./.github/actions/read-pto-isa
 
       - name: Set up environment
         run: |
