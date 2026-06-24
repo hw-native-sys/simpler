@@ -389,7 +389,10 @@ static_assert(
 // (rather than folding scope + consumers into one count) lets a consumer reach
 // fanout_refcount == (fanout_count & ~PTO2_FANOUT_SCOPE_BIT) while the scope bit
 // is still unset -- i.e. "all consumers done but scope still open" stays
-// distinguishable from "fully consumed".
+// distinguishable from "fully consumed". The heap/task deadlock detector keys
+// off exactly that complement: that condition with state==COMPLETED means the
+// head can only be released by scope_end, which a blocked orchestrator can
+// never reach -> provable deadlock.
 static constexpr uint32_t PTO2_FANOUT_SCOPE_BIT = 0x80000000u;
 
 struct alignas(64) PTO2TaskSlotState {

@@ -58,6 +58,8 @@ bool PTO2FaninPool::ensure_space(PTO2SharedMemoryRingHeader &ring, int32_t neede
 
     int spin_count = 0;
     int32_t prev_last_alive = ring.fc.last_task_alive.load(std::memory_order_acquire);
+    uint64_t block_cycle0 = 0;  // wall-clock anchor for the deadlock backstop
+    bool block_timing = false;  // false until the first no-reclaim-progress spin
     while (available() < needed) {
         reclaim(ring, prev_last_alive);
         if (available() >= needed) return true;
@@ -68,35 +70,45 @@ bool PTO2FaninPool::ensure_space(PTO2SharedMemoryRingHeader &ring, int32_t neede
         if (cur_last_alive > prev_last_alive) {
             spin_count = 0;
             prev_last_alive = cur_last_alive;
-        }
-
-        if (spin_count >= PTO2_DEP_POOL_SPIN_LIMIT) {
-            int32_t current = ring.fc.current_task_index.load(std::memory_order_acquire);
-            LOG_ERROR("========================================");
-            LOG_ERROR("FATAL: Fanin Spill Pool Deadlock Detected!");
-            LOG_ERROR("========================================");
-            LOG_ERROR("Fanin spill pool cannot reclaim space after %d spins (no progress).", spin_count);
-            LOG_ERROR(
-                "  - Pool used:     %d / %d (%.1f%%)", used(), capacity,
-                (capacity > 0) ? (100.0 * used() / capacity) : 0.0
-            );
-            LOG_ERROR("  - Pool top:      %d (linear)", top);
-            LOG_ERROR("  - Pool tail:     %d (linear)", tail);
-            LOG_ERROR("  - High water:    %d", high_water);
-            LOG_ERROR("  - Needed:        %d entries", needed);
-            LOG_ERROR("  - last_task_alive: %d (stuck here)", cur_last_alive);
-            LOG_ERROR("  - current_task:    %d", current);
-            LOG_ERROR("  - In-flight tasks: %d", current - cur_last_alive);
-            LOG_ERROR("Diagnosis:");
-            LOG_ERROR("  last_task_alive is not advancing, so fanin spill pool tail");
-            LOG_ERROR("  cannot reclaim. Check TaskRing diagnostics for root cause.");
-            LOG_ERROR("Solution:");
-            LOG_ERROR("  Increase fanin spill pool capacity (current: %d, recommended: %d)", capacity, high_water * 2);
-            LOG_ERROR("  Compile-time: PTO2_DEP_LIST_POOL_SIZE in pto_runtime2_types.h");
-            LOG_ERROR("  Runtime env:  PTO2_RING_DEP_POOL=%d", high_water * 2);
-            LOG_ERROR("========================================");
-            latch_pool_error(error_code_ptr, PTO2_ERROR_DEP_POOL_OVERFLOW);
-            return false;
+            block_timing = false;
+        } else if ((spin_count & 1023) == 0) {
+            // Absolute-time backstop, matching the task allocator: stable across
+            // chips/contention, unlike a fixed spin count. get_sys_cnt_aicpu()
+            // is an MMIO read, so sample it only once per 1024 spins.
+            uint64_t now = get_sys_cnt_aicpu();
+            if (!block_timing) {
+                block_cycle0 = now;
+                block_timing = true;
+            } else if (now - block_cycle0 >= PTO2_ALLOC_DEADLOCK_TIMEOUT_CYCLES) {
+                int32_t current = ring.fc.current_task_index.load(std::memory_order_acquire);
+                LOG_ERROR("========================================");
+                LOG_ERROR("FATAL: Fanin Spill Pool Deadlock Detected!");
+                LOG_ERROR("========================================");
+                LOG_ERROR("Fanin spill pool cannot reclaim space after ~500 ms (no progress).");
+                LOG_ERROR(
+                    "  - Pool used:     %d / %d (%.1f%%)", used(), capacity,
+                    (capacity > 0) ? (100.0 * used() / capacity) : 0.0
+                );
+                LOG_ERROR("  - Pool top:      %d (linear)", top);
+                LOG_ERROR("  - Pool tail:     %d (linear)", tail);
+                LOG_ERROR("  - High water:    %d", high_water);
+                LOG_ERROR("  - Needed:        %d entries", needed);
+                LOG_ERROR("  - last_task_alive: %d (stuck here)", cur_last_alive);
+                LOG_ERROR("  - current_task:    %d", current);
+                LOG_ERROR("  - In-flight tasks: %d", current - cur_last_alive);
+                LOG_ERROR("Diagnosis:");
+                LOG_ERROR("  last_task_alive is not advancing, so fanin spill pool tail");
+                LOG_ERROR("  cannot reclaim. Check TaskRing diagnostics for root cause.");
+                LOG_ERROR("Solution:");
+                LOG_ERROR(
+                    "  Increase fanin spill pool capacity (current: %d, recommended: %d)", capacity, high_water * 2
+                );
+                LOG_ERROR("  Compile-time: PTO2_DEP_LIST_POOL_SIZE in pto_runtime2_types.h");
+                LOG_ERROR("  Runtime env:  PTO2_RING_DEP_POOL=%d", high_water * 2);
+                LOG_ERROR("========================================");
+                latch_pool_error(error_code_ptr, PTO2_ERROR_DEP_POOL_OVERFLOW);
+                return false;
+            }
         }
         SPIN_WAIT_HINT();
     }

@@ -40,6 +40,8 @@
 
 #include "pto_runtime2_types.h"
 #include "pto_shared_memory.h"
+#include "aicpu/device_time.h"       // get_sys_cnt_aicpu (deadlock wall-clock backstop)
+#include "common/platform_config.h"  // PLATFORM_PROF_SYS_CNT_FREQ (deadlock wall-clock)
 #include "common/unified_log.h"
 
 #if PTO2_PROFILING
@@ -51,8 +53,12 @@
 
 // Block notification interval (in spin counts)
 #define PTO2_BLOCK_NOTIFY_INTERVAL 10000
-// Alloc spin limit - after this, report deadlock and exit
-#define PTO2_ALLOC_SPIN_LIMIT 100000
+// Heap/task deadlock is detected structurally (head task COMPLETED + all
+// consumers released + scope still open -> only scope_end can free it, which a
+// blocked orchestrator can never reach). This wall-clock value is only a
+// backstop for the residual case the structural test can't prove locally; it is
+// an ABSOLUTE TIME (not a spin count), so it is stable across chips/contention.
+#define PTO2_ALLOC_DEADLOCK_TIMEOUT_CYCLES (PLATFORM_PROF_SYS_CNT_FREQ / 2)  // 500 ms
 
 // Dep pool spin limit - if exceeded, dep pool capacity too small for workload
 #define PTO2_DEP_POOL_SPIN_LIMIT 100000
@@ -90,9 +96,10 @@ public:
     void init(
         PTO2TaskDescriptor *descriptors, int32_t window_size, std::atomic<int32_t> *current_index_ptr,
         std::atomic<int32_t> *last_alive_ptr, void *heap_base, uint64_t heap_size, std::atomic<int32_t> *error_code_ptr,
-        int32_t initial_local_task_id = 0
+        PTO2TaskSlotState *slot_states = nullptr, int32_t initial_local_task_id = 0
     ) {
         descriptors_ = descriptors;
+        slot_states_ = slot_states;
         window_size_ = window_size;
         window_mask_ = window_size - 1;
         current_index_ptr_ = current_index_ptr;
@@ -125,6 +132,8 @@ public:
         int32_t last_alive = prev_last_alive;
         update_heap_tail(last_alive);
         bool blocked_on_heap = false;
+        uint64_t block_cycle0 = 0;  // wall-clock anchor for the deadlock backstop
+        bool block_timing = false;  // false until the first no-reclaim-progress spin
 #if PTO2_ORCH_PROFILING
         uint64_t wait_start = 0;
         bool waiting = false;
@@ -157,19 +166,41 @@ public:
             last_alive = last_alive_ptr_->load(std::memory_order_acquire);
             update_heap_tail(last_alive);
             if (last_alive > prev_last_alive) {
+                // Reclaim advanced -> productive backpressure, not a deadlock.
                 spin_count = 0;
                 prev_last_alive = last_alive;
-            } else {
+                block_timing = false;
+            } else if ((spin_count & 1023) == 0) {
+                // Reclaim watermark is stuck. Run the deadlock checks only once
+                // per 1024 spins: get_sys_cnt_aicpu() is an MMIO read and
+                // head_blocked_on_scope_end() walks the head slot, neither of
+                // which needs to fire on every hot spin (1024 spins is far below
+                // the wall-clock timeout, so detection latency is unaffected).
+                // (1) Structural, immediate: if the head task is COMPLETED with
+                // every consumer released but its scope still open, only
+                // scope_end can free it and a blocked orchestrator can never
+                // call it -> provable deadlock now.
+                if (head_blocked_on_scope_end(last_alive)) {
+                    report_deadlock(output_size, blocked_on_heap, /*scope_gated=*/true);
+                    return {-1, -1, nullptr, nullptr};
+                }
+                // (2) Wall-clock backstop for the residual case the local head
+                // test can't prove (e.g. a closed sibling whose consumer is
+                // deferred). Absolute time, not a spin count.
+                uint64_t now = get_sys_cnt_aicpu();
+                if (!block_timing) {
+                    block_cycle0 = now;
+                    block_timing = true;
+                } else if (now - block_cycle0 >= PTO2_ALLOC_DEADLOCK_TIMEOUT_CYCLES) {
+                    report_deadlock(output_size, blocked_on_heap, /*scope_gated=*/false);
+                    return {-1, -1, nullptr, nullptr};
+                }
                 if (spin_count % PTO2_BLOCK_NOTIFY_INTERVAL == 0) {
                     LOG_WARN(
                         "[TaskAllocator] BLOCKED: tasks=%d/%d, heap=%" PRIu64 "/%" PRIu64 ", on=%s, spins=%d",
                         local_task_id_ - last_alive, window_size_, heap_top_, heap_size_,
                         blocked_on_heap ? "heap" : "task", spin_count
                     );
-                }
-                if (spin_count >= PTO2_ALLOC_SPIN_LIMIT) {
-                    report_deadlock(output_size, blocked_on_heap);
-                    return {-1, -1, nullptr, nullptr};
                 }
             }
             SPIN_WAIT_HINT();
@@ -207,7 +238,6 @@ public:
     // the end (next allocation). heap_top - heap_tail == heap_used_bytes().
     uint64_t heap_tail() const { return heap_tail_; }
     uint64_t heap_capacity() const { return heap_size_; }
-
     uint64_t heap_used_bytes() const {
         if (heap_size_ == 0) return 0;
         return (heap_top_ + heap_size_ - heap_tail_) % heap_size_;
@@ -216,6 +246,9 @@ public:
 private:
     // --- Task Ring ---
     PTO2TaskDescriptor *descriptors_ = nullptr;
+    // Parallel to descriptors_, indexed by task_id & window_mask_. Read-only here,
+    // used by the deadlock detector to inspect the head task's state + fanout.
+    PTO2TaskSlotState *slot_states_ = nullptr;
     int32_t window_size_ = 0;
     int32_t window_mask_ = 0;
     std::atomic<int32_t> *current_index_ptr_ = nullptr;
@@ -345,9 +378,32 @@ private:
 #endif
 
     /**
-     * Report deadlock with targeted diagnostics.
+     * Structural deadlock test on the reclaim head.
+     *
+     * The head (oldest un-CONSUMED task, at last_task_alive) gates all
+     * reclamation. If it is COMPLETED and every consumer reference is released
+     * (low bits of fanout_refcount == consumer count) but the scope reference
+     * (bit31) is still unset, the only release left is its scope_end. Because
+     * this is evaluated while the orchestrator is blocked in alloc(), scope_end
+     * can never be reached -> provable deadlock, no timeout required.
+     *
+     * The COMPLETED guard is mandatory: a zero-consumer task has
+     * refcount == 0 == (count & ~SCOPE_BIT) from birth, before it has run.
      */
-    void report_deadlock(int32_t requested_output_size, bool heap_blocked) {
+    bool head_blocked_on_scope_end(int32_t head_task_id) const {
+        if (slot_states_ == nullptr) return false;
+        PTO2TaskSlotState &h = slot_states_[head_task_id & window_mask_];
+        if (h.task_state.load(std::memory_order_acquire) != PTO2_TASK_COMPLETED) return false;
+        uint32_t rc = h.fanout_refcount.load(std::memory_order_acquire);
+        return rc == (h.fanout_count & ~PTO2_FANOUT_SCOPE_BIT);
+    }
+
+    /**
+     * Report deadlock with targeted diagnostics. scope_gated == true means the
+     * head-of-line structural test proved it (waiting only on scope_end);
+     * false means the wall-clock backstop fired.
+     */
+    void report_deadlock(int32_t requested_output_size, bool heap_blocked, bool scope_gated) {
         int32_t last_alive = last_alive_ptr_->load(std::memory_order_acquire);
         int32_t active_tasks = local_task_id_ - last_alive;
         uint64_t htail = heap_tail_;
@@ -359,7 +415,16 @@ private:
             LOG_ERROR("FATAL: Task Allocator Deadlock - Task Ring Full!");
         }
         LOG_ERROR("========================================");
-        LOG_ERROR("No progress after %d spins.", PTO2_ALLOC_SPIN_LIMIT);
+        if (scope_gated) {
+            LOG_ERROR("Head task %d COMPLETED, all consumers released, scope still open ->", last_alive);
+            LOG_ERROR("only scope_end can free it and the orchestrator is blocked here.");
+            LOG_ERROR("Provable head-of-line deadlock.");
+        } else {
+            LOG_ERROR(
+                "No reclaim progress for ~500 ms (%" PRIu64 " cycles wall clock).",
+                (uint64_t)PTO2_ALLOC_DEADLOCK_TIMEOUT_CYCLES
+            );
+        }
         LOG_ERROR(
             "  Task ring:  current=%d, last_alive=%d, active=%d/%d (%.1f%%)", local_task_id_, last_alive, active_tasks,
             window_size_, 100.0 * active_tasks / window_size_
@@ -371,24 +436,32 @@ private:
         if (heap_blocked) {
             LOG_ERROR("  Requested:  %d bytes", requested_output_size);
         }
-        LOG_ERROR("Diagnosis:");
-        LOG_ERROR("  last_task_alive is stuck at %d, meaning task %d", last_alive, last_alive);
-        LOG_ERROR("  cannot transition to CONSUMED. Possible causes:");
-        LOG_ERROR("  1. Task %d still executing (subtasks not complete)", last_alive);
-        LOG_ERROR("  2. Task %d fanout not fully released (downstream not done)", last_alive);
-        LOG_ERROR("  3. Scope reference not released (scope_end not called)");
-        LOG_ERROR("  4. Orchestrator blocked here -> can't call scope_end -> circular wait");
-        LOG_ERROR("Solution:");
-        if (heap_blocked) {
+        // Head-task state dump: what the reclaim watermark is actually waiting on.
+        if (slot_states_ != nullptr) {
+            PTO2TaskSlotState &h = slot_states_[last_alive & window_mask_];
+            uint32_t fc = h.fanout_count;
+            uint32_t rc = h.fanout_refcount.load(std::memory_order_acquire);
             LOG_ERROR(
-                "  Increase heap size (current: %" PRIu64 ", recommended: %" PRIu64 ")", heap_size_, heap_size_ * 2
+                "  Head task %d: state=%d, consumers=%u/%u, scope_released=%d", last_alive,
+                static_cast<int>(h.task_state.load(std::memory_order_acquire)), rc & ~PTO2_FANOUT_SCOPE_BIT,
+                fc & ~PTO2_FANOUT_SCOPE_BIT, (rc & PTO2_FANOUT_SCOPE_BIT) ? 1 : 0
             );
-            LOG_ERROR("  Compile-time: PTO2_HEAP_SIZE in pto_runtime2_types.h");
-            LOG_ERROR("  Runtime env:  PTO2_RING_HEAP=<bytes> (e.g. %" PRIu64 ")", heap_size_ * 2);
+        }
+        LOG_ERROR("Solution:");
+        if (scope_gated) {
+            LOG_ERROR("  The open scope's own allocation exceeds this ring. Either:");
+            LOG_ERROR("  1. Split the scope / reduce per-scope allocation (reclaim sooner), or");
+            LOG_ERROR("  2. Size the ring >= the scope's peak live-set (heap*2 may not be enough).");
+        } else if (heap_blocked) {
+            LOG_ERROR(
+                "  Increase heap (current: %" PRIu64 "); env PTO2_RING_HEAP=<pow2> (e.g. %" PRIu64 ")", heap_size_,
+                heap_size_ * 2
+            );
         } else {
-            LOG_ERROR("  Increase task window size (current: %d, recommended: %d)", window_size_, active_tasks * 2);
-            LOG_ERROR("  Compile-time: PTO2_TASK_WINDOW_SIZE in pto_runtime2_types.h");
-            LOG_ERROR("  Runtime env:  PTO2_RING_TASK_WINDOW=<power-of-2> (e.g. %d)", active_tasks * 2);
+            LOG_ERROR(
+                "  Increase task window (current: %d); env PTO2_RING_TASK_WINDOW=<pow2> (e.g. %d)", window_size_,
+                active_tasks * 2
+            );
         }
         LOG_ERROR("========================================");
         if (error_code_ptr_) {
