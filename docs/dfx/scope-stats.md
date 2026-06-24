@@ -24,7 +24,9 @@ resulting `scope_stats/scope_stats.jsonl` into an HTML report.
 Pass the flag to any T&R example or scene test:
 
 ```bash
-python tests/st/<case>/test_<name>.py -p a2a3 -d 0 --enable-scope-stats
+CASE=...
+NAME=...
+python "tests/st/${CASE}/test_${NAME}.py" -p a2a3 -d 0 --enable-scope-stats
 ```
 
 The flag is bit 4 of `enable_profiling_flag`; on a T&R run it turns on
@@ -37,6 +39,35 @@ The run writes `scope_stats/scope_stats.jsonl` under the per-task
 output prefix. It is NDJSON: line 1 is run metadata, every subsequent
 line is one scope sample. See [§3](#3-output-scope_statsjsonl) for the
 schema.
+
+The metadata line is also the quickest way to verify per-ring runtime sizing.
+For example, after running with:
+
+```bash
+CASE=...
+NAME=...
+PTO2_RING_TASK_WINDOW=8192,16384,131072,524288 \
+PTO2_RING_HEAP=134217728,268435456,402653184,536870912 \
+PTO2_RING_DEP_POOL=4096,8192,16384,32768 \
+python "tests/st/${CASE}/test_${NAME}.py" -p a2a3 -d 0 --enable-scope-stats
+```
+
+inspect the first line:
+
+```bash
+python - <<'PY' path/to/output_prefix/scope_stats/scope_stats.jsonl
+import json, sys
+with open(sys.argv[1]) as f:
+    meta = json.loads(f.readline())
+print("task_window_max =", meta["task_window_max"])
+print("heap_max        =", meta["heap_max"])
+print("dep_pool_max    =", meta["dep_pool_max"])
+PY
+```
+
+The three arrays are indexed by `ring` (`0..3`) and should match the effective
+runtime configuration. Per-sample `ring` values show which scope-depth rings
+were actually touched by the run; they are scope records, not task counts.
 
 ### Step 3 — Visualize with `scope_stats_plot.py`
 
@@ -76,12 +107,13 @@ meaning, peak, and capacity use; `Max use` shows the selected risk metric,
 peak, capacity, use, peak scope, and peak site. For TensorMap, `Max use` also
 shows `Peak context ring_depth`, which is the scope/ring_depth context where
 the global TensorMap peak was observed. `task_window`, `heap`, and `dep_pool`
-put `High water` / `Live at exit` in the main resource-pressure chart, and put
-`Scope alloc` in a separate chart below it so small allocation changes stay
-readable. `tensormap` shows one global live-entry curve. Charts include
-scope-index ticks on x and observed-usage ticks on y. Percentages are rendered
-with two decimal places. The x-axis uses readable integer scope steps; the
-y-range is `peak * 1.1`, while y-grid ticks use readable integer or
+put `High water` / `Live at exit` in the main resource-pressure chart, and
+render the per-scope allocation curve in a separate chart below it so small
+allocation changes stay readable. `tensormap` shows one global live-entry
+curve. Charts include scope-index ticks on x and observed-usage ticks on y.
+Percentages are rendered with two decimal places. The x-axis uses readable
+integer scope steps; the y-range is `peak * 1.1`, while y-grid ticks use
+readable integer or
 human-friendly steps. Hovering a point shows a highlighted dot plus its metric,
 scope index, y value, and source site. Clicking any chart opens a larger modal
 view of that chart; closing the modal releases the cloned SVG.
@@ -92,16 +124,18 @@ and common patterns.
 
 | Metric | Formula | What it tells you |
 | ------ | ------- | ----------------- |
-| `scope_high_water` | `end.head − begin.tail` | Highest occupancy the scope held — residual not yet released on entry, plus what this scope added. The true peak. |
-| `real_occupancy` | `end.head − end.tail` | What is still occupied at scope exit (the live level on leaving). |
-| `scope_alloc` | `end.head − begin.head` | How far the allocation frontier advanced — this scope's own net (unreleased) allocation. |
+| `scope_high_water` | `end.head − begin.tail` | Upper bound on the occupancy this scope reached — entry backlog plus everything this scope allocated, *without* subtracting what was released mid-scope. Not a realized peak, and not bounded by capacity: a scope that streams more than `cap` reports more than `cap`. |
+| `real_occupancy` | `end.head − end.tail` | What is still occupied at scope exit (the live level on leaving). Always in `[0, cap]`. |
+| `scope_alloc` | `end.head − begin.head` | How far the allocation frontier advanced over the scope — this scope's total allocation throughput (can exceed `cap`). |
 
 For `task_window`, `heap`, and `dep_pool`, `head` / `tail` mean that
 resource's allocation frontier and released boundary at the sampled scope
-boundary. Ring-buffer occupancy is non-negative, so a negative delta is folded
-back by one buffer length (`(head + cap − tail) % cap`) — a wrap past the
-buffer end. `tensormap` is reported as a single in-use value (no head/tail), so
-it shows only the `real_occupancy` curve.
+boundary. All three are reported as **monotonic, non-wrapping** counters
+(byte totals for `heap`, entry counters for the others), so every delta above
+is an exact, non-negative subtraction regardless of how many times the
+underlying ring wrapped during the scope — no wrap correction is applied.
+`tensormap` is reported as a single in-use value (no head/tail), so it shows
+only the `real_occupancy` curve.
 
 ## 2. What gets captured
 
@@ -127,10 +161,13 @@ it shows only the `real_occupancy` curve.
 ## 3. Output: `scope_stats.jsonl`
 
 NDJSON. Line 1 is run metadata; each subsequent line is one scope
-sample (`begin` or `end`). Schema version 5:
+sample (`begin` or `end`). Schema version 6 (bumped from 5 when
+`heap_start`/`heap_end` changed from wrapping ring offsets to monotonic
+cumulative bytes — a `version == 5` file's heap fields wrap, a `version == 6`
+file's do not):
 
 ```json
-{"version": 5, "fatal": false, "dropped": 0, "total": 4, "task_window_max": [8, 4], "heap_max": [268435456, 268435456], "dep_pool_max": [1024, 1024], "tensormap_max": 65536}
+{"version": 6, "fatal": false, "dropped": 0, "total": 4, "task_window_max": [8, 4], "heap_max": [268435456, 268435456], "dep_pool_max": [1024, 1024], "tensormap_max": 65536}
 {"site": "example_orchestration.cpp:77", "phase": "begin", "depth": 1, "ring": 1, "task_window_start": 0, "task_window_end": 0, "heap_start": 0, "heap_end": 0, "dep_pool_start": 1, "dep_pool_end": 1, "tensormap": 0}
 {"site": "example_orchestration.cpp:77", "phase": "end", "depth": 1, "ring": 1, "task_window_start": 0, "task_window_end": 4, "heap_start": 0, "heap_end": 8192, "dep_pool_start": 1, "dep_pool_end": 6, "tensormap": 5}
 ```
@@ -139,7 +176,7 @@ Metadata line (line 1):
 
 | Field | Type | Meaning |
 | ----- | ---- | ------- |
-| `version` | int | Schema version (`5`) |
+| `version` | int | Schema version (`6`) |
 | `fatal` | bool | `true` iff a fatal was latched during the run; records past it are diagnostic-only |
 | `dropped` | uint | Records dropped on device (free_queue empty / ready_queue full); `0` on a healthy run |
 | `total` | uint | Total records the device attempted (collected + dropped) |
@@ -158,8 +195,8 @@ Per-sample lines, oldest-first:
 | `ring` | int | Ring this scope used; indexes `task_window_max` / `heap_max` / `dep_pool_max` |
 | `task_window_start` | int | Task-window ring tail at this boundary |
 | `task_window_end` | int | Task-window ring head at this boundary |
-| `heap_start` | uint | Heap ring tail (released boundary) in bytes |
-| `heap_end` | uint | Heap ring head (allocation frontier) in bytes |
+| `heap_start` | uint | Heap reclaim boundary — monotonic cumulative bytes reclaimed (non-wrapping) |
+| `heap_end` | uint | Heap allocation frontier — monotonic cumulative bytes allocated (non-wrapping) |
 | `dep_pool_start` | int | Scheduler-published dependency-list pool tail at this boundary |
 | `dep_pool_end` | int | Scheduler-published dependency-list pool top at this boundary |
 | `tensormap` | int | Tensormap entries in use |
@@ -300,6 +337,8 @@ ScopeStatsCollector                platform scope_stats_collector_aicpu.cpp
       │                         │         └─ emit record, append to buffer;
   stop() (drain + join)         └──────────── push full buffer to ready_queue
   reconcile_counters()               orch exit: flush remaining buffers
+    recover current_buf_ptr
+    if abnormal exit left one
   write_jsonl()
 ```
 

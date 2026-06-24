@@ -152,6 +152,58 @@ class TestRuntimeBuilderErrors:
             builder.get_binaries("anything", build=True)
 
 
+class TestRuntimeBuilderPtoIsaValidation:
+    """Test PTO-ISA compatibility validation is scoped to affected runtimes."""
+
+    @pytest.mark.parametrize(
+        ("platform", "should_validate"),
+        [
+            ("a2a3", True),
+            ("a2a3sim", False),
+            ("a5", False),
+            ("a5sim", False),
+        ],
+    )
+    def test_pto_isa_validation_only_runs_for_a2a3_onboard(self, tmp_path, monkeypatch, platform, should_validate):
+        from simpler_setup import pto_isa  # noqa: PLC0415
+        from simpler_setup.platform_info import TARGETS, parse_platform  # noqa: PLC0415
+        from simpler_setup.runtime_builder import RuntimeBuilder  # noqa: PLC0415
+
+        class _Target:
+            def __init__(self, name):
+                self._name = name
+
+            def get_binary_name(self):
+                return f"lib{self._name}.so"
+
+        calls = []
+
+        def _fail_if_called(lib_dir):
+            calls.append(lib_dir)
+            raise RuntimeError("pto-isa validation called")
+
+        monkeypatch.setattr(pto_isa, "validate_runtime_pto_isa_compatible", _fail_if_called)
+
+        builder = RuntimeBuilder.__new__(RuntimeBuilder)
+        builder.platform = platform
+        builder._arch, builder._variant = parse_platform(platform)
+        builder._LIB_DIR = tmp_path / "lib"
+        builder._runtime_compiler = type(
+            "Compiler",
+            (),
+            {f"{target}_target": _Target(target) for target in TARGETS},
+        )()
+
+        if should_validate:
+            with pytest.raises(RuntimeError, match="pto-isa validation called"):
+                builder._lookup_binaries("test_rt", tmp_path / "out")
+            assert calls == [builder._LIB_DIR]
+        else:
+            with pytest.raises(FileNotFoundError, match="Pre-built runtime binaries not found"):
+                builder._lookup_binaries("test_rt", tmp_path / "out")
+            assert calls == []
+
+
 # --- Build integration tests (mocked compilation) ---
 
 

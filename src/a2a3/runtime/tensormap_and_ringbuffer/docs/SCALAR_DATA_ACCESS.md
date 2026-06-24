@@ -60,7 +60,7 @@ args.add_output(ci);
 **Mechanism**:
 
 1. `ci.set_initial_value(value)` marks the create-info with an initial value before submission
-2. `add_output(ci)` stores a pointer to `ci` in `Arg` (the original must remain valid until submit)
+2. `add_output(ci)` stores a pointer to `ci` in `L0TaskArgs` (the original must remain valid until submit)
 3. During payload init, the output tensor is materialized via `init_from_create_info()` which triggers the fill
 4. Fill strategy:
    - Small buffer (< 64 B): element-by-element memcpy directly into dst
@@ -70,7 +70,7 @@ args.add_output(ci);
 
 ## 5. Scalar Dependencies via 1-Element Tensors
 
-Traditional scalars (`Arg::add_scalar`) are one-way inputs with no TensorMap tracking. For cross-task scalar values, use a 1-element tensor as the carrier:
+Traditional scalars (`L0TaskArgs::add_scalar`) are one-way inputs with no TensorMap tracking. For cross-task scalar values, use a 1-element tensor as the carrier:
 
 ```cpp
 uint32_t shapes[1] = {1};
@@ -78,7 +78,7 @@ TensorCreateInfo scalar_ci(shapes, 1, DataType::FLOAT32);
 
 // Submit with initial value and keep the returned tensor
 scalar_ci.set_initial_value(float_to_u64(77.0f));
-Arg args;
+L0TaskArgs args;
 args.add_output(scalar_ci);
 TaskOutputTensors outs = rt_submit_aiv_task(FUNC_NOOP, args);
 const Tensor& scalar_tensor = outs.get_ref(0);

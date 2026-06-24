@@ -156,12 +156,12 @@ def pytest_addoption(parser):
         "Onboard only — ignored on sim and L3.",
     )
     parser.addoption(
-        "--dump-tensor",
+        "--dump-args",
         nargs="?",
         const=1,
         type=int,
         default=0,
-        help="Dump per-task tensor I/O at runtime. Level: 0=off, 1=partial (only "
+        help="Dump per-task args at runtime. Level: 0=off, 1=partial (only "
         "tasks marked via Arg::dump(...), default when given without a value), 2=full (all tasks), "
         "3=full_json_only (all tasks, JSON metadata only, no .bin payload).",
     )
@@ -188,17 +188,25 @@ def pytest_addoption(parser):
         help="Enable per-scope peak collection and emit <output_prefix>/scope_stats.jsonl (per-scope ring-fill peaks).",
     )
     parser.addoption(
+        "--enable-swimlane-overhead",
+        action="store_true",
+        default=False,
+        help="Add the 8 Overhead Analysis counter tracks (per-engine "
+        "idle/ready/overhead + system all/has overhead) to the swimlane JSON. "
+        "Requires --enable-l2-swimlane + deps.json (re-run with --enable-dep-gen if absent).",
+    )
+    parser.addoption(
         "--pto-isa-commit",
         action="store",
         default=None,
-        help="Pin pto-isa clone to this commit before running tests",
+        help=("Override the pto-isa revision before running tests. Default/latest: use the current checkout HEAD."),
     )
     parser.addoption(
         "--clone-protocol",
         action="store",
         default="ssh",
         choices=["ssh", "https"],
-        help="Protocol for cloning pto-isa when --pto-isa-commit is set",
+        help="Protocol for cloning pto-isa when PTO_ISA_ROOT is not already set",
     )
     parser.addoption(
         "--sanitizer",
@@ -441,7 +449,7 @@ def pytest_configure(config):
     # Pre-clone / refresh PTO-ISA up front so that (a) the requested
     # --clone-protocol is honored before SceneTestCase's lazy default-ssh
     # resolve, and (b) the local clone is fetched to origin/HEAD so a
-    # --pto-isa-commit request doesn't miss a recently-published commit.
+    # requested/default pto-isa commit doesn't miss a recently-published object.
     # Short-circuits when $PTO_ISA_ROOT already points to a user-managed clone.
     #
     # Pre-clone is an optimization, not a requirement: jobs that don't actually

@@ -18,36 +18,35 @@
 
 extern "C" {
 
-__attribute__((visibility("default"))) PTO2OrchestrationConfig
-aicpu_orchestration_config(const ChipStorageTaskArgs &orch_args) {
+__attribute__((visibility("default"))) PTO2OrchestrationConfig aicpu_orchestration_config(const L2TaskArgs &orch_args) {
     (void)orch_args;
     return PTO2OrchestrationConfig{
         .expected_arg_count = 16,
     };
 }
 
-__attribute__((visibility("default"))) void aicpu_orchestration_entry(const ChipStorageTaskArgs &orch_args) {
+__attribute__((visibility("default"))) void aicpu_orchestration_entry(const L2TaskArgs &orch_args) {
     int64_t block_dim = static_cast<int64_t>(orch_args.scalar(0));
 
     LOG_INFO_V1("SPMD PA highperf: block_dim=%" PRId64, block_dim);
 
-    Tensor query = from_tensor_arg(orch_args.tensor(0));
-    Tensor key_cache = from_tensor_arg(orch_args.tensor(1));
-    Tensor value_cache = from_tensor_arg(orch_args.tensor(2));
-    Tensor block_table = from_tensor_arg(orch_args.tensor(3));
-    Tensor out = from_tensor_arg(orch_args.tensor(4));
-    Tensor s_gm = from_tensor_arg(orch_args.tensor(5));
-    Tensor p_gm = from_tensor_arg(orch_args.tensor(6));
-    Tensor o_tmp_gm = from_tensor_arg(orch_args.tensor(7));
-    Tensor go_gm = from_tensor_arg(orch_args.tensor(8));
-    Tensor o_core_tmp_gm = from_tensor_arg(orch_args.tensor(9));
-    Tensor l_gm = from_tensor_arg(orch_args.tensor(10));
-    Tensor gm_k16 = from_tensor_arg(orch_args.tensor(11));
-    Tensor gm_v16 = from_tensor_arg(orch_args.tensor(12));
-    Tensor tiling = from_tensor_arg(orch_args.tensor(13));
-    Tensor null_tensor = from_tensor_arg(orch_args.tensor(14));
+    const Tensor &query = orch_args.tensor(0).ref();
+    const Tensor &key_cache = orch_args.tensor(1).ref();
+    const Tensor &value_cache = orch_args.tensor(2).ref();
+    const Tensor &block_table = orch_args.tensor(3).ref();
+    const Tensor &out = orch_args.tensor(4).ref();
+    const Tensor &s_gm = orch_args.tensor(5).ref();
+    const Tensor &p_gm = orch_args.tensor(6).ref();
+    const Tensor &o_tmp_gm = orch_args.tensor(7).ref();
+    const Tensor &go_gm = orch_args.tensor(8).ref();
+    const Tensor &o_core_tmp_gm = orch_args.tensor(9).ref();
+    const Tensor &l_gm = orch_args.tensor(10).ref();
+    const Tensor &gm_k16 = orch_args.tensor(11).ref();
+    const Tensor &gm_v16 = orch_args.tensor(12).ref();
+    const Tensor &tiling = orch_args.tensor(13).ref();
+    const Tensor &null_tensor = orch_args.tensor(14).ref();
 
-    Arg args;
+    L0TaskArgs args;
     args.add_input(query);
     args.add_input(key_cache);
     args.add_input(value_cache);

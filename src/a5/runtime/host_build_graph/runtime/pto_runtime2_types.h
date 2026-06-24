@@ -12,13 +12,7 @@
 #ifndef SRC_A5_RUNTIME_HOST_BUILD_GRAPH_RUNTIME_PTO_RUNTIME2_TYPES_H_
 #define SRC_A5_RUNTIME_HOST_BUILD_GRAPH_RUNTIME_PTO_RUNTIME2_TYPES_H_
 
-// =============================================================================
-// Profiling Configuration
-// =============================================================================
-
-#ifndef PTO2_PROFILING
-#define PTO2_PROFILING 1
-#endif
+#include "profiling_config.h"
 
 // =============================================================================
 // Tensor Dump Configuration

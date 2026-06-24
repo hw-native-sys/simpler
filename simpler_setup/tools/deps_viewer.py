@@ -8,31 +8,31 @@
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
 """
-deps.json → pan-zoom HTML dependency-graph viewer.
+deps.json → text or pan-zoom HTML dependency-graph viewer.
 
 deps.json is the host-replay-rebuilt task graph (one edge per producer→consumer
 pair, complete across the full submit_task trace — superset of fanout). This
-tool runs the graph through Graphviz to produce an SVG and wraps it in a
-self-contained HTML page with a minimal drag-to-pan + wheel-to-zoom shim
-(no JS dependency, no CDN, opens offline in any browser).
+tool supports two output formats:
 
-The HTML format scales to any graph the browser's SVG renderer can handle
-(practically up to ~50k nodes when paired with ``--engine sfdp``); the only
-gotcha is that high zoom slightly blurs text — that's a CSS-transform tradeoff
-in exchange for 60fps GPU-composited pan/zoom even on huge graphs.
+- text (default): a grep-friendly task index plus per-task predecessor /
+  successor detail blocks
+- html: Graphviz SVG wrapped in a self-contained pan/zoom HTML page
 
-When ``l2_swimlane_records.json`` is colocated with ``deps.json``, node labels are
-enriched with the per-task ``func_id`` and ``core_type`` so a node reads as
-``t12 · kernel_mul · aiv`` rather than just ``t12``; nodes are colored by
-core_type (AIC blue, AIV orange).
+In text mode the default view shows task identity ``(ring, local)`` together
+with ``kind=`` and ``func_id=``. Text-mode ``func_id=`` comes only from the
+three-slot ``kernel_ids`` layout and preserves ``[aic,aiv0,aiv1]`` with
+inactive slots kept as ``-1``; ``alloc`` / ``dummy`` tasks render as
+``func_id=none``. In HTML mode nodes are labeled ``(ring, local)`` only; they
+are colored by ``core_type`` when a perf sidecar is colocated (AIC blue, AIV
+orange).
 
 Usage:
-    python -m simpler_setup.tools.deps_to_graph DEPS_JSON [-o OUT] [--engine ENGINE]
-    python -m simpler_setup.tools.deps_to_graph                          # newest under outputs/
-    python -m simpler_setup.tools.deps_to_graph deps.json
-    python -m simpler_setup.tools.deps_to_graph deps.json --engine sfdp  # force-directed (for big graphs)
+    python -m simpler_setup.tools.deps_viewer DEPS_JSON
+    python -m simpler_setup.tools.deps_viewer DEPS_JSON --format text
+    python -m simpler_setup.tools.deps_viewer DEPS_JSON --format html --engine sfdp
 
-Requires Graphviz installed (``brew install graphviz`` / ``apt install graphviz``).
+HTML output requires Graphviz installed (``brew install graphviz`` /
+``apt install graphviz``). Text output does not.
 """
 
 import argparse
@@ -62,6 +62,13 @@ def _normalize_task_id(v):
 # Same coercion semantics — alias so the call sites read as "this is a
 # tensor_id, not a task_id". Both encode 64-bit unsigned values as JSON strings.
 _normalize_tensor_id = _normalize_task_id
+
+
+def _normalize_small_int(v):
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return None
 
 
 def _node_id(task_id):
@@ -106,6 +113,13 @@ def _make_task_formatter(nodes):
     return fmt
 
 
+def _sort_task_id_key(v):
+    tid = _normalize_task_id(v)
+    if tid is None:
+        return (1, str(v))
+    return (0, tid)
+
+
 def _load_deps_edges(deps_path):
     """Parse deps.json into renderer-friendly pieces.
 
@@ -116,14 +130,13 @@ def _load_deps_edges(deps_path):
             arrow here.
         nodes: sorted list of all referenced task ids.
         annotations: dict[(pred, succ) -> list[dict]] of annotation rows
-            (one per annotated edge), keyed in insertion order so
-            ``--show-tensor-info`` can resolve per-edge tensor identities
-            and target the right input port on the consumer node.
+            (one per annotated edge), keyed in insertion order so HTML edge
+            rendering can resolve per-edge tensor identities and target the
+            right input port on the consumer node.
         tensor_table: dict[tensor_id -> dict] from the tensors[] block.
         task_table: dict[task_id -> dict] from the tasks[] block,
-            carrying the per-arg input/output slot info that the
-            ``--show-tensor-info`` view renders as compartments inside each
-            task node.
+            carrying the per-arg input/output slot info that the HTML view
+            renders as compartments inside each task node.
     """
     with open(deps_path) as f:
         data = json.load(f)
@@ -145,17 +158,12 @@ def _load_deps_edges(deps_path):
         if key not in seen:
             seen.add(key)
             edges.append(key)
-        # Shallow-copy + coerce uint64 tensor_id (string) to int once at
-        # ingestion so all downstream consumers can treat it as a plain int.
         edge_copy = dict(e)
         if "tensor_id" in edge_copy:
             edge_copy["tensor_id"] = _normalize_tensor_id(edge_copy["tensor_id"])
         annotations.setdefault(key, []).append(edge_copy)
     tensors_raw = data.get("tensors", []) if isinstance(data.get("tensors"), list) else []
     tensor_table: dict[int, dict] = {}
-    # Assign short human-friendly names (T0, T1, ...) by order of appearance
-    # in tensors[] so two references to the same underlying tensor share a
-    # name across the rendered graph.
     for ord_idx, t in enumerate(tensors_raw):
         if not isinstance(t, dict):
             continue
@@ -172,9 +180,6 @@ def _load_deps_edges(deps_path):
             continue
         tid = _normalize_task_id(t.get("task_id"))
         if tid is not None:
-            # Shallow-copy args so backfill below doesn't mutate the raw JSON.
-            # Also coerce each arg's tensor_id (uint64 string) to int so the
-            # backfill and view logic can compare with plain `==`.
             entry = dict(t)
             args_copy = []
             for a in t.get("args", []):
@@ -187,7 +192,7 @@ def _load_deps_edges(deps_path):
             entry["args"] = args_copy
             task_table[tid] = entry
     _backfill_output_tensor_ids(task_table, annotations)
-    return edges, sorted(nodes), annotations, tensor_table, task_table
+    return sorted(edges), sorted(nodes), annotations, tensor_table, task_table
 
 
 def _backfill_output_tensor_ids(task_table, annotations):
@@ -215,9 +220,6 @@ def _backfill_output_tensor_ids(task_table, annotations):
             pred_task = task_table.get(pred)
             if not pred_task:
                 continue
-            # Skip if this tensor_id is already attached to one of pred's
-            # output slots (e.g. INOUT / OUTPUT_EXISTING captured at submit
-            # time, or a previous backfill on this same loop).
             already_known = False
             unassigned = []
             for a in pred_task.get("args", []):
@@ -236,6 +238,46 @@ def _backfill_output_tensor_ids(task_table, annotations):
             if len(unassigned) == 1:
                 unassigned[0]["tensor_id"] = tid
                 unassigned[0]["inferred"] = True
+
+
+def _kernel_ids_slots(task_entry):
+    """Return the raw kernel_ids list as-is, padded/truncated to exactly 3 slots."""
+    if not isinstance(task_entry, dict):
+        return [-1, -1, -1]
+    kernel_ids = task_entry.get("kernel_ids")
+    if not isinstance(kernel_ids, list):
+        return [-1, -1, -1]
+    slots = []
+    for i in range(3):
+        if i < len(kernel_ids):
+            v = _normalize_small_int(kernel_ids[i])
+            slots.append(v if v is not None else -1)
+        else:
+            slots.append(-1)
+    return slots
+
+
+def _merge_task_meta_with_kernel_ids(meta, task_table, func_names=None):
+    merged = {task_id: dict(entry) for task_id, entry in meta.items()}
+    for task_id, task_entry in task_table.items():
+        slots = _kernel_ids_slots(task_entry)
+        valid_ids = [i for i in slots if i >= 0]
+        if not valid_ids:
+            continue
+        entry = merged.setdefault(task_id, {})
+        if entry.get("func_id") is None:
+            entry["func_id"] = valid_ids[0]
+        entry["func_ids"] = valid_ids
+        entry["_kernel_slots"] = slots
+        if func_names:
+            entry["func_labels"] = [
+                func_names.get(str(slot)) or func_names.get(slot) or f"f{slot}" if slot >= 0 else "-1" for slot in slots
+            ]
+            if not entry.get("func_name") and entry["func_labels"]:
+                entry["func_name"] = entry["func_labels"][0]
+        elif any(s >= 0 for s in slots):
+            entry["func_labels"] = [f"f{slot}" if slot >= 0 else "-1" for slot in slots]
+    return merged
 
 
 def _load_task_meta(deps_path, func_names=None):
@@ -268,7 +310,6 @@ def _load_task_meta(deps_path, func_names=None):
         print(f"Warning: couldn't read {perf_path}: {e}", file=sys.stderr)
         return {}
 
-    # First pass: collect every (core_type, func_id) tuple per task_id.
     by_tid: dict[int, list[dict]] = {}
     for task in perf.get("tasks", []):
         tid = _normalize_task_id(task.get("task_id"))
@@ -281,8 +322,6 @@ def _load_task_meta(deps_path, func_names=None):
         core_types = {e.get("core_type") for e in entries if e.get("core_type")}
         if len(core_types) > 1:
             core_type = "mix"
-            # Prefer the AIC entry's func_id (cube usually carries the "main"
-            # op in mixed kernels) so the label reads sensibly.
             primary = next((e for e in entries if e.get("core_type") == "aic"), entries[0])
         else:
             core_type = next(iter(core_types), None)
@@ -301,32 +340,16 @@ def _load_task_meta(deps_path, func_names=None):
     return meta
 
 
-def _label(task_id, meta, fmt_task, have_perf=False):
+def _label(task_id, meta, task_table, fmt_task):
     base = fmt_task(task_id)
-    m = meta.get(_normalize_task_id(task_id))
-    if not m:
-        # Node referenced by deps but absent from the perf sidecar: alloc_tensors
-        # task (see emit_dot docstring). Surface that in the label so the user
-        # knows the dashed-note style isn't just "missing data". When no perf
-        # sidecar exists at all, we can't tell — fall back to bare id.
-        return f"{base} · alloc" if have_perf else base
-    parts = [base]
-    fn = m.get("func_name") or (f"f{m['func_id']}" if m.get("func_id") is not None else None)
-    if fn:
-        parts.append(fn)
-    # core_type is intentionally NOT in the label — node shape (box/ellipse) and
-    # color already encode it, and the HUD legend at the top-right of the page
-    # spells out the mapping. Keeps labels short on dense graphs.
-    return " · ".join(parts)
+    kind = _task_kind(_normalize_task_id(task_id), meta, task_table)
+    if kind == "alloc":
+        return f"{base} · alloc"
+    if kind == "dummy":
+        return f"{base} · dummy"
+    return base
 
 
-# Per-core-type visual styling. AIC (cube unit) is a box; AIV (vector unit)
-# is an ellipse; "mix" (single submit_task spanning both core types) is a
-# diamond; "alloc" — a task that came from ``alloc_tensors`` (got a real
-# task_id and shows up as a producer in deps via ``owner_task_id``, but
-# never dispatched a kernel so no l2_swimlane record and no func_id) — is a
-# dashed gray note. Distinct shape AND color so each stays readable even
-# without color (B&W print, accessibility, etc.).
 _CORE_STYLE = {
     "aic": {"shape": "box", "style": "rounded,filled", "fillcolor": "#66A3FF"},
     "aiv": {"shape": "ellipse", "style": "filled", "fillcolor": "#FFB366"},
@@ -378,14 +401,9 @@ def _arg_row_html(arg, tensor_table, side):
     slot of a task node.
 
     Line 1: ``arg<idx> <ARG_TYPE>[ ?] <Tname>:<dtype>``  — slot identity.
-    Line 2: ``raw: [...]``                              — full underlying buffer shape (from tensors[]).
-    Line 3: ``shape: [...]``                            — slice this slot actually accesses.
-    Line 4: ``offset: [...]``                           — slice start offset into the raw buffer.
-
-    The 4-line breakdown makes "is this the whole tensor or a sub-region?" a
-    visual diff (raw vs shape), rather than a numeric one. OUTPUT slots whose
-    tensor_id wasn't captured at submit time render as a single ``(alloc)``
-    line — there is nothing more we can say honestly.
+    Line 2: ``storage: <N> elems``                       — underlying buffer size.
+    Line 3: ``shape: [...]``                            — slice this slot accesses.
+    Line 4: ``offset: [...]``                           — slice start offset into the buffer.
     """
     idx = arg.get("idx")
     arg_type = arg.get("type", "?")
@@ -393,16 +411,12 @@ def _arg_row_html(arg, tensor_table, side):
     bg = _INPUT_BG if side == "in" else _OUTPUT_BG
     tid = arg.get("tensor_id")
     if tid is None:
-        # OUTPUT slot whose tensor_id couldn't be recovered (e.g. multiple
-        # OUTPUT slots on the same task, so the post-hoc backfill bailed out).
         body = f"arg{idx} {arg_type} (alloc)"
         return f'<TR><TD ALIGN="LEFT" PORT="{port}" BGCOLOR="{bg}">{_html_escape(body)}</TD></TR>'
 
     tname = _short_tensor_label(tid, tensor_table)
     dtype = arg.get("dtype")
     shape = arg.get("shape")
-    # Strided-Tensor per-slot descriptor: start_offset is uint64 quoted as
-    # string, stride is per-dim int32 array.
     start_offset = arg.get("start_offset")
     strides = arg.get("strides")
     buffer_numel = None
@@ -411,8 +425,6 @@ def _arg_row_html(arg, tensor_table, side):
         buffer_numel = tt.get("buffer_numel")
         if dtype is None:
             dtype = tt.get("dtype")
-    # Backfilled OUTPUT slots have tensor_id but no captured shape/stride —
-    # treat them as accessing the whole underlying buffer.
     if arg.get("inferred"):
         if shape is None and buffer_numel is not None:
             shape = [int(buffer_numel)]
@@ -442,12 +454,9 @@ def _arg_row_html(arg, tensor_table, side):
 def _task_node_html(task_id, task_entry, meta_entry, tensor_table, fmt_task):
     """Build a Graphviz HTML-like label for a task node showing:
         - input rows (top)     INPUT + INOUT slots
-        - identity header      "(ring, local) · func_name"
+        - identity header      "(ring, local)"
         - output rows (bottom) INOUT + OUTPUT_EXISTING + OUTPUT slots
     INOUT slots appear in BOTH compartments (read-then-write semantics).
-
-    The header background reflects the core_type (aic/aiv/mix/alloc) so the
-    legend mapping carries over from the plain view.
     """
     args = task_entry.get("args") if task_entry else None
     if not isinstance(args, list):
@@ -457,12 +466,7 @@ def _task_node_html(task_id, task_entry, meta_entry, tensor_table, fmt_task):
     core_type = meta_entry.get("core_type") if meta_entry else None
     header_bg = _CORE_HEADER_COLOR.get(core_type if isinstance(core_type, str) else "", _HEADER_FALLBACK)
 
-    identity = fmt_task(task_id)
-    func_name = None
-    if meta_entry:
-        m = meta_entry
-        func_name = m.get("func_name") or (f"f{m['func_id']}" if m.get("func_id") is not None else None)
-    header_label = identity + ((" · " + func_name) if func_name else "")
+    header_label = fmt_task(task_id)
 
     rows = []
     for a in inputs:
@@ -470,23 +474,13 @@ def _task_node_html(task_id, task_entry, meta_entry, tensor_table, fmt_task):
     rows.append(f'<TR><TD ALIGN="CENTER" BGCOLOR="{header_bg}"><B>{_html_escape(header_label)}</B></TD></TR>')
     for a in outputs:
         rows.append(_arg_row_html(a, tensor_table, "out"))
-    if not inputs and not outputs:
-        # No captured args (alloc task, or pre-feature artifact). Fall back to
-        # just the header row so the node still shows the task identity.
-        pass
 
     table = '<TABLE BORDER="0" CELLBORDER="1" CELLSPACING="0" CELLPADDING="3">' + "".join(rows) + "</TABLE>"
     return table
 
 
 def _producer_output_port(pred_task_entry, edge_tensor_id):
-    """For an annotated edge into a node rendered in show-tensor-info mode,
-    find which OUTPUT / OUTPUT_EXISTING / INOUT slot of the producer task
-    carries the same tensor_id. Returns the port name (``out_<idx>``) or
-    None if no slot matches — typically an OUTPUT slot whose tensor_id was
-    not captured at submit time (the runtime materializes the buffer
-    post-submit), in which case the edge attaches to the node body.
-    """
+    """Resolve the producer-side HTML port for an annotated edge when possible."""
     if not pred_task_entry or edge_tensor_id is None:
         return None
     args = pred_task_entry.get("args")
@@ -500,6 +494,95 @@ def _producer_output_port(pred_task_entry, edge_tensor_id):
     return None
 
 
+def _task_kind(task_id, meta, task_table):
+    task_entry = task_table.get(task_id)
+    if isinstance(task_entry, dict):
+        slots = _kernel_ids_slots(task_entry)
+        if any(slot >= 0 for slot in slots):
+            return "submit"
+        return "dummy"
+    entry = meta.get(task_id)
+    if isinstance(entry, dict):
+        slots = entry.get("_kernel_slots")
+        if isinstance(slots, list) and any(slot >= 0 for slot in slots):
+            return "submit"
+    return "alloc"
+
+
+def _task_func_id_label(task_id, meta, task_table):
+    kind = _task_kind(task_id, meta, task_table)
+    if kind in ("alloc", "dummy"):
+        return "func_id=none"
+    entry = meta.get(task_id)
+    if entry:
+        slots = entry.get("_kernel_slots")
+        if isinstance(slots, list) and slots:
+            return "func_id=[" + ",".join(str(slot) for slot in slots) + "]"
+    return "func_id=unknown"
+
+
+def emit_text(edges, nodes, meta, deps_path, annotations=None, tensor_table=None, task_table=None):
+    """Render deps.json as grep-friendly plain text.
+
+    Output shape:
+        SUMMARY
+        TASK INDEX
+        per-task detail blocks with FANIN / FANOUT peer lists
+    """
+    annotations = annotations or {}
+    tensor_table = tensor_table or {}
+    task_table = task_table or {}
+    sorted_nodes = sorted(nodes, key=_sort_task_id_key)
+    fmt_task = _make_task_formatter(sorted_nodes)
+    have_perf = bool(meta)
+    have_func_name_map = any(entry.get("func_name") for entry in meta.values())
+
+    pred_map = {tid: set() for tid in sorted_nodes}
+    succ_map = {tid: set() for tid in sorted_nodes}
+    for pred, succ in edges:
+        pred_map.setdefault(succ, set()).add(pred)
+        succ_map.setdefault(pred, set()).add(succ)
+    annotated_edges = sum(len(rows) for rows in annotations.values())
+
+    lines = [
+        "SUMMARY",
+        f"  source_deps_json: {deps_path}",
+        f"  tasks: {len(sorted_nodes)}",
+        f"  unique_task_edges: {len(edges)}",
+        f"  annotated_edges: {annotated_edges}",
+        f"  tensors: {len(tensor_table)}",
+        f"  perf_sidecar: {'yes' if have_perf else 'no'}",
+        f"  func_name_map: {'yes' if have_func_name_map else 'no'}",
+        "",
+        "TASK INDEX",
+    ]
+    for task_id in sorted_nodes:
+        kind = _task_kind(task_id, meta, task_table)
+        func_label = _task_func_id_label(task_id, meta, task_table)
+        lines.append(
+            f"TASK {fmt_task(task_id)} kind={kind} {func_label} "
+            f"fanin={len(pred_map.get(task_id, set()))} fanout={len(succ_map.get(task_id, set()))}"
+        )
+
+    for task_id in sorted_nodes:
+        kind = _task_kind(task_id, meta, task_table)
+        func_label = _task_func_id_label(task_id, meta, task_table)
+        lines.append("")
+        lines.append(f"=== TASK {fmt_task(task_id)} kind={kind} {func_label} ===")
+
+        pred_peers = sorted(pred_map.get(task_id, set()), key=_sort_task_id_key)
+        lines.append(f"FANIN {len(pred_peers)}")
+        for pred_tid in pred_peers:
+            lines.append(f"  <- {fmt_task(pred_tid)}")
+
+        succ_peers = sorted(succ_map.get(task_id, set()), key=_sort_task_id_key)
+        lines.append(f"FANOUT {len(succ_peers)}")
+        for succ_tid in succ_peers:
+            lines.append(f"  -> {fmt_task(succ_tid)}")
+
+    return "\n".join(lines) + "\n"
+
+
 def emit_dot(edges, nodes, meta, direction="LR", annotations=None, tensor_table=None, task_table=None):
     """Graphviz DOT source. Used internally to feed the layout engine before
     wrapping the SVG in HTML.
@@ -507,28 +590,15 @@ def emit_dot(edges, nodes, meta, direction="LR", annotations=None, tensor_table=
     Two rendering modes selected by whether ``task_table`` is non-empty:
 
     1. Plain mode (``task_table`` is None or empty) — bare shape/color nodes,
-       bare arrows. Same as the default view. Used for v1 artifacts or when
-       the user did not pass ``--show-tensor-info``.
-    2. Show-tensor-info mode (``task_table`` non-empty) — every task whose
-       args were captured renders as an HTML-table node with input rows
-       above an identity header and output rows below. Edges terminate on
-       the consumer's ``in_<arg_idx>`` port, and originate from the
+       bare arrows. Used when only task-level structure is available.
+    2. Rich mode (``task_table`` non-empty) — every task whose args were
+       captured renders as an HTML-table node with input rows above an
+       identity header and output rows below. Edges terminate on the
+       consumer's ``in_<arg_idx>`` port, and originate from the
        producer's ``out_<arg_idx>`` port whenever the producer slot's
-       tensor_id matches the edge's tensor_id (i.e. INOUT / OUTPUT_EXISTING
-       sources). When that match is unavailable (typical for OUTPUT slots,
-       whose tensor_id is materialized post-submit), the edge attaches to
-       the producer node body.
-
-    Nodes that appear as edge endpoints but are absent from the perf-records
-    sidecar are tagged as ``alloc``: in practice these are tasks created by
-    ``alloc_tensors`` (which gets a real task_id and is referenced via
-    ``owner_task_id`` from downstream consumers, but never dispatches a
-    kernel and therefore has no perf entry). When no perf sidecar exists at
-    all (``meta`` empty) we can't disambiguate and fall back to the default
-    style for every node.
+       tensor_id matches the edge's tensor_id.
     """
     fmt_task = _make_task_formatter(nodes)
-    have_perf = bool(meta)
     show_tensor = bool(task_table)
     annotations = annotations or {}
     tensor_table = tensor_table or {}
@@ -536,14 +606,6 @@ def emit_dot(edges, nodes, meta, direction="LR", annotations=None, tensor_table=
     lines = [
         "digraph deps {",
         f"  rankdir={direction};",
-        # `concentrate=true` merges shared edge prefixes through virtual
-        # nodes. Without it, deep DAGs with heavy fan-in (e.g. dep_gen
-        # capture of a >300-wide barrier reached through a tensormap
-        # producer chain) explode the dot position-assignment pass into
-        # ~N²/2 internal virtual nodes and SIGSEGV graphviz. With it,
-        # parallel edges collapse and the layout completes; rank ordering
-        # (the LR DAG shape) is unaffected — only the visual edge routing
-        # is denser.
         "  concentrate=true;",
         '  node [fontname="Helvetica", fontsize=10];',
         '  edge [color="#888"];',
@@ -551,36 +613,27 @@ def emit_dot(edges, nodes, meta, direction="LR", annotations=None, tensor_table=
     for n in nodes:
         m = meta.get(n)
         if show_tensor and n in task_table:
-            # HTML-table node with input/output compartments.
             html = _task_node_html(n, task_table.get(n), m, tensor_table, fmt_task)
             lines.append(f"  {_node_id(n)} [shape=none, margin=0, label=<{html}>];")
             continue
-        if m:
+        kind = _task_kind(n, meta, task_table)
+        if kind == "submit" and m:
             style = _node_style(m.get("core_type"))
-        elif have_perf:
+        elif kind == "alloc":
             style = _CORE_STYLE["alloc"]
         else:
             style = _DEFAULT_STYLE
-        # Escape any backslash / double-quote in the label.
-        label = _label(n, meta, fmt_task, have_perf=have_perf).replace("\\", "\\\\").replace('"', '\\"')
+        label = _label(n, meta, task_table, fmt_task).replace("\\", "\\\\").replace('"', '\\"')
         attrs = f'label="{label}", shape={style["shape"]}, style="{style["style"]}", fillcolor="{style["fillcolor"]}"'
         lines.append(f"  {_node_id(n)} [{attrs}];")
     for pred, succ in edges:
         if not show_tensor:
             lines.append(f"  {_node_id(pred)} -> {_node_id(succ)};")
             continue
-        # show-tensor mode: route each annotated edge into the right input
-        # port; pick one representative annotation per (pred, succ) for the
-        # producer-port match (multiple annotations sharing the pair all
-        # target the same arg in practice — distinct args produce distinct
-        # edges).
         rows = annotations.get((pred, succ), [])
         if not rows:
             lines.append(f"  {_node_id(pred)} -> {_node_id(succ)};")
             continue
-        # One arrow per annotation row, so distinct (arg, tensor) sources
-        # between the same task pair stay legible (e.g. a task fed two
-        # different slices of the same producer).
         for row in rows:
             arg = row.get("arg")
             tid = row.get("tensor_id")
@@ -588,8 +641,9 @@ def emit_dot(edges, nodes, meta, direction="LR", annotations=None, tensor_table=
             tail = ""
             head = ""
             edge_attrs = []
-            if isinstance(arg, int) and arg >= 0:
-                head = f":in_{arg}:w"
+            arg_idx = _normalize_small_int(arg)
+            if arg_idx is not None and arg_idx >= 0:
+                head = f":in_{arg_idx}:w"
             out_port = _producer_output_port(task_table.get(pred), tid)
             if out_port:
                 tail = f":{out_port}:e"
@@ -606,11 +660,7 @@ def emit_dot(edges, nodes, meta, direction="LR", annotations=None, tensor_table=
 
 
 def render_svg(dot_text, engine="dot"):
-    """Pipe DOT through the Graphviz layout engine and return raw SVG bytes.
-
-    Raises FileNotFoundError if the engine binary is not on PATH; RuntimeError
-    if the engine returns a non-zero exit code.
-    """
+    """Pipe DOT through the Graphviz layout engine and return raw SVG bytes."""
     if shutil.which(engine) is None:
         raise FileNotFoundError(
             f"Graphviz '{engine}' not found on PATH. Install graphviz: brew install graphviz / apt install graphviz"
@@ -627,10 +677,6 @@ def render_svg(dot_text, engine="dot"):
     return proc.stdout
 
 
-# Self-contained HTML wrapper. Drag-to-pan + wheel-to-zoom in vanilla JS.
-# The SVG is inlined so the file is single-page and works offline. We use CSS
-# transform (translate + scale) rather than mutating the SVG viewBox — that
-# keeps pan/zoom on the GPU compositor for 60fps performance on large graphs.
 _HTML_TEMPLATE = """<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -692,29 +738,24 @@ _HTML_TEMPLATE = """<!DOCTYPE html>
   const stage = document.getElementById('stage');
   const svg = stage.querySelector('svg');
   if (!svg) return;
-  // Drop fixed width/height so the SVG renders at its natural size; we control
-  // scale via CSS transform.
   svg.removeAttribute('width');
   svg.removeAttribute('height');
 
   let scale = 1, tx = 0, ty = 0;
   const apply = () => {{ svg.style.transform = `translate(${{tx}}px, ${{ty}}px) scale(${{scale}})`; }};
 
-  // Wheel zoom about cursor.
   stage.addEventListener('wheel', (e) => {{
     e.preventDefault();
     const rect = stage.getBoundingClientRect();
     const cx = e.clientX - rect.left, cy = e.clientY - rect.top;
     const factor = Math.exp(-e.deltaY * 0.001);
     const newScale = Math.min(20, Math.max(0.02, scale * factor));
-    // Keep the point under the cursor fixed in screen space.
     tx = cx - (cx - tx) * (newScale / scale);
     ty = cy - (cy - ty) * (newScale / scale);
     scale = newScale;
     apply();
   }}, {{ passive: false }});
 
-  // Drag to pan.
   let dragging = false, lastX = 0, lastY = 0;
   stage.addEventListener('mousedown', (e) => {{
     dragging = true; lastX = e.clientX; lastY = e.clientY;
@@ -728,10 +769,8 @@ _HTML_TEMPLATE = """<!DOCTYPE html>
   }});
   window.addEventListener('mouseup', () => {{ dragging = false; stage.classList.remove('panning'); }});
 
-  // 'f' = fit-to-view, 'r' = reset to 1:1.
   const fit = () => {{
     const bb = svg.getBoundingClientRect();
-    // bb is in current-transform coordinates, so undo the transform first.
     const naturalW = bb.width / scale, naturalH = bb.height / scale;
     const sx = stage.clientWidth / naturalW, sy = stage.clientHeight / naturalH;
     scale = Math.min(sx, sy) * 0.95;
@@ -743,7 +782,6 @@ _HTML_TEMPLATE = """<!DOCTYPE html>
     if (e.key === 'f') fit();
     else if (e.key === 'r') {{ scale = 1; tx = 0; ty = 0; apply(); }}
   }});
-  // Auto-fit on first paint.
   requestAnimationFrame(fit);
 }})();
 </script>
@@ -774,8 +812,6 @@ def emit_html(
     )
     svg_bytes = render_svg(dot, engine=engine)
     svg_text = svg_bytes.decode("utf-8", errors="replace")
-    # Strip the XML prolog / DOCTYPE that graphviz emits — inlining keeps the
-    # <svg> root only.
     if "<svg" in svg_text:
         svg_text = svg_text[svg_text.index("<svg") :]
     return _HTML_TEMPLATE.format(
@@ -799,10 +835,7 @@ def _find_latest_deps_json():
 
 
 def _load_func_names_json(path):
-    """Load func_id → name mapping from a JSON file (``callable_id_to_name``
-    shape, as written by ``scene_test._dump_name_map``, or a flat dict).
-    Returns {} on failure.
-    """
+    """Load func_id → name mapping from a JSON file."""
     try:
         with open(path) as f:
             data = json.load(f)
@@ -813,10 +846,7 @@ def _load_func_names_json(path):
 
 
 def _autoload_name_map(deps_path):
-    """Look for a ``name_map_*.json`` next to deps.json (written by
-    ``scene_test._dump_name_map`` when the case ran with diagnostics on).
-    Returns {} if no candidate exists; the newest match wins on ties.
-    """
+    """Look for a ``name_map_*.json`` next to deps.json."""
     candidates = sorted(Path(deps_path).parent.glob("name_map_*.json"), key=lambda p: p.stat().st_mtime)
     if not candidates:
         return {}
@@ -825,48 +855,74 @@ def _autoload_name_map(deps_path):
 
 def _build_parser():
     p = argparse.ArgumentParser(
-        description="Render deps.json as a pan/zoom HTML dependency graph.",
+        description="Render deps.json as text or pan/zoom HTML dependency graph.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""\
 Examples:
-  %(prog)s                                    # newest deps.json under ./outputs/
+  %(prog)s                                    # newest deps.json under ./outputs/, default text output
   %(prog)s outputs/.../deps.json
-  %(prog)s deps.json -o my_graph.html
-  %(prog)s deps.json --engine sfdp            # force-directed (recommended >1000 nodes)
-  %(prog)s deps.json --func-names names.json  # label nodes with kernel names
+  %(prog)s deps.json --format text -o graph.txt
+  %(prog)s deps.json --format html --engine sfdp
+  %(prog)s deps.json --format html --show-tensor-info
 """,
     )
     p.add_argument("input", nargs="?", help="Path to deps.json (default: newest under ./outputs/).")
-    p.add_argument("-o", "--output", help="Output HTML path (default: same dir as input, deps_graph.html).")
+    p.add_argument("-o", "--output", help="Output path (default: deps_viewer.txt for text, deps_viewer.html for html).")
+    p.add_argument(
+        "--format",
+        choices=["text", "html"],
+        default="text",
+        help="Output format: text (default) or html.",
+    )
     p.add_argument(
         "--engine",
         choices=["dot", "neato", "sfdp", "fdp", "circo", "twopi"],
         default="dot",
-        help="Graphviz layout engine. 'dot' for hierarchical (<500 nodes), 'sfdp' for force-directed (10k+ nodes).",
+        help="Graphviz layout engine for HTML output.",
     )
     p.add_argument(
         "--direction",
         choices=["TB", "LR", "BT", "RL"],
         default="LR",
-        help="Flow direction for hierarchical layouts (default: LR; ignored by sfdp/neato).",
+        help="Flow direction for hierarchical HTML layouts.",
     )
     p.add_argument(
         "--func-names",
-        help="JSON with callable_id_to_name (or flat {func_id: name}) for label enrichment.",
+        help="JSON file with callable_id_to_name (or flat {func_id: name}) for task-label enrichment.",
     )
     p.add_argument(
         "--show-tensor-info",
         action="store_true",
         help=(
-            "Label every edge with the consuming tensor's slice description "
-            "(source, tensor id, [offset:+shape]). Default: off (clean task-pair arrows)."
+            "For HTML output, render per-task input/output tensor details and route edges to specific arg ports. "
+            "Default: off."
         ),
     )
     return p
 
 
-def main():
-    args = _build_parser().parse_args()
+def _argv_has_option(argv, name):
+    return any(arg == name or arg.startswith(f"{name}=") for arg in argv)
+
+
+def _validate_args(args, argv):
+    if args.format == "html":
+        return 0
+    html_only = ["--engine", "--direction", "--show-tensor-info"]
+    for option in html_only:
+        if _argv_has_option(argv, option):
+            print(f"error: {option} is only valid with --format html", file=sys.stderr)
+            return 2
+    return 0
+
+
+def main(argv=None):
+    argv = list(sys.argv[1:] if argv is None else argv)
+    parser = _build_parser()
+    args = parser.parse_args(argv)
+    rc = _validate_args(args, argv)
+    if rc != 0:
+        return rc
 
     input_path = args.input or _find_latest_deps_json()
     if input_path is None:
@@ -878,19 +934,35 @@ def main():
         return 1
 
     edges, nodes, annotations, tensor_table, task_table = _load_deps_edges(input_path)
-    # Explicit --func-names wins over the auto-discovered sibling file.
     func_names = _load_func_names_json(args.func_names) if args.func_names else _autoload_name_map(input_path)
     meta = _load_task_meta(input_path, func_names=func_names)
-    # Some workloads (embarrassingly parallel kernels, scope-fenced iterations
-    # that never reuse a tensor) produce no deps edges. Without the perf-records
-    # union the graph would be empty even though tasks ran. Seed isolated nodes
-    # from meta so every recorded task shows up, with its mix/aic/aiv shape.
+    meta = _merge_task_meta_with_kernel_ids(meta, task_table, func_names=func_names)
     if meta:
-        nodes = sorted(set(nodes) | set(meta.keys()))
+        nodes = sorted(set(nodes) | set(meta.keys()), key=_sort_task_id_key)
 
-    # --show-tensor-info renders each task as an HTML-table node with
-    # input/output compartments; without the flag we keep the bare shape view.
-    rendered_task_table = task_table if args.show_tensor_info else None
+    out = (
+        Path(args.output)
+        if args.output
+        else input_path.parent / ("deps_viewer.txt" if args.format == "text" else "deps_viewer.html")
+    )
+    if args.format == "text":
+        text = emit_text(
+            edges,
+            nodes,
+            meta,
+            input_path,
+            annotations=annotations,
+            tensor_table=tensor_table,
+            task_table=task_table,
+        )
+        out.write_text(text)
+        annotated_edges = sum(len(rows) for rows in annotations.values())
+        print(
+            f"Wrote {out} "
+            f"({len(nodes)} tasks, {len(edges)} unique edges, "
+            f"{annotated_edges} annotated edges, format=text)"
+        )
+        return 0
 
     html = emit_html(
         edges,
@@ -900,12 +972,10 @@ def main():
         engine=args.engine,
         annotations=annotations,
         tensor_table=tensor_table,
-        task_table=rendered_task_table,
+        task_table=task_table if args.show_tensor_info else None,
     )
-
-    out = Path(args.output) if args.output else input_path.parent / "deps_graph.html"
     out.write_text(html)
-    print(f"Wrote {out} ({len(nodes)} nodes, {len(edges)} edges, engine={args.engine})")
+    print(f"Wrote {out} ({len(nodes)} nodes, {len(edges)} edges, engine={args.engine}, format=html)")
     return 0
 
 

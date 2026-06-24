@@ -49,7 +49,6 @@
 #include "pto_tensormap.h"
 #include "pto_types.h"  // TensorRef
 #include "tensor.h"
-#include "tensor_arg.h"  // TensorArgType
 
 /**
  * View struct for inputs to compute_task_fanin / register_task_outputs.
@@ -93,7 +92,7 @@ compute_task_fanin(const DepInputs &inputs, PTO2TensorMap &tensor_map, bool in_m
             continue;
         }
 
-        const Tensor *tensor = inputs.tensors[i].ptr;
+        const Tensor *tensor = &inputs.tensors[i].ref();
 
         // Step A: creator retention — all existing tensors extend their creator lifetime.
         PTO2TaskId owner = tensor->owner_task_id;
@@ -145,7 +144,7 @@ register_task_outputs(const DepInputs &inputs, PTO2TaskId task_id, PTO2TensorMap
     for (int32_t i = 0; i < inputs.tensor_count; i++) {
         TensorArgType ptype = inputs.arg_types[i];
         if (ptype == TensorArgType::INOUT || ptype == TensorArgType::OUTPUT_EXISTING) {
-            const Tensor *tensor = inputs.tensors[i].ptr;
+            const Tensor *tensor = &inputs.tensors[i].ref();
             if (!tensor->manual_dep) {
                 tensor_map.insert(*tensor, task_id);
             }

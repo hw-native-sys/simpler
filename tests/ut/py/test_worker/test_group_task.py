@@ -28,9 +28,9 @@ import struct
 from multiprocessing.shared_memory import SharedMemory
 
 from simpler.task_interface import (
-    ContinuousTensor,
     DataType,
     TaskArgs,
+    Tensor,
     TensorArgType,
 )
 from simpler.worker import Worker
@@ -59,7 +59,7 @@ def _sync_args(ptr: int, tag: TensorArgType) -> TaskArgs:
     value just needs to be a unique non-zero key.
     """
     args = TaskArgs()
-    args.add_tensor(ContinuousTensor.make(ptr, (1,), DataType.UINT8), tag)
+    args.add_tensor(Tensor.make(ptr, (1,), DataType.UINT8), tag)
     return args
 
 

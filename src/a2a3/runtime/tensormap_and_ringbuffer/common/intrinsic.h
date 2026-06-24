@@ -97,7 +97,7 @@ static constexpr int32_t PTO2_EXT_PARAMS_COUNT = 2;
 
 /**
  * Args[] suffix indices for context pointers.
- * Derived from MAX_TENSOR_ARGS(16) + MAX_SCALAR_ARGS(32).
+ * Derived from MAX_TENSOR_ARGS(32) + MAX_SCALAR_ARGS(16).
  * Users should not depend on these values; use the Get* functions below.
  */
 static constexpr int32_t SPMD_LOCAL_CONTEXT_INDEX = 48;

@@ -203,61 +203,51 @@ observed task and tensor — that is not an error.
 
 ---
 
-## 5. Visualizing — `deps_to_graph.py`
+## 5. Visualizing — `deps_viewer.py`
 
-`simpler_setup/tools/deps_to_graph.py` turns `deps.json` into a
-self-contained pan/zoom HTML page (Graphviz SVG + inline vanilla-JS
-drag-pan + wheel-zoom). Open the file in any browser, no internet
-needed:
+`simpler_setup/tools/deps_viewer.py` turns `deps.json` into either a
+plain-text dependency view (default) or a self-contained pan/zoom HTML page
+(Graphviz SVG + inline vanilla-JS drag-pan + wheel-zoom). The text view is
+optimized for grep / diff / "what does task X depend on?" debugging; the HTML
+view stays available when you want a visual layout.
 
 ```bash
-# Newest deps.json under outputs/
-python -m simpler_setup.tools.deps_to_graph
+# Newest deps.json under outputs/ -> deps_viewer.txt
+python -m simpler_setup.tools.deps_viewer
 
-# Specific path
-python -m simpler_setup.tools.deps_to_graph outputs/.../deps.json
+# Specific path -> deps_viewer.txt next to deps.json
+python -m simpler_setup.tools.deps_viewer outputs/.../deps.json
 
-# Big graphs: use force-directed layout (recommended >1000 nodes)
-python -m simpler_setup.tools.deps_to_graph deps.json --engine sfdp
+# Explicit HTML output
+python -m simpler_setup.tools.deps_viewer outputs/.../deps.json --format html
 
-# Show per-edge tensor slice annotations on the arrows.
-# Off by default — the bare task-pair graph stays readable on dense workloads;
-# turn this on when you actually need to inspect which slice an edge carries.
-python -m simpler_setup.tools.deps_to_graph deps.json --show-tensor-info
+# HTML output with per-task tensor details
+python -m simpler_setup.tools.deps_viewer outputs/.../deps.json --format html --show-tensor-info
+
+# Big HTML graphs: use force-directed layout (recommended >1000 nodes)
+python -m simpler_setup.tools.deps_viewer deps.json --format html --engine sfdp
+
 ```
 
-`--show-tensor-info` rewrites every task as an HTML-table node with two
-compartments:
+The default text output contains:
 
-- **Top rows (blue)** are the consumed inputs (slots of type `INPUT`
-  and `INOUT`).
-- **Middle header** is the task identity (`(ring, local) · func_name`),
-  background-colored by core_type (aic / aiv / mix / alloc).
-- **Bottom rows (orange)** are the produced outputs (`INOUT`,
-  `OUTPUT_EXISTING`, and `OUTPUT` slots).
+- `SUMMARY` — input path plus task / edge / tensor counts.
+  - `tasks`: number of task ids rendered in the output
+  - `unique_task_edges`: number of unique `(pred, succ)` task pairs
+  - `annotated_edges`: number of annotated edge rows across all task pairs
+  - `perf_sidecar`: `yes` when `l2_swimlane_records.json` was successfully loaded
+  - `func_name_map`: `yes` when at least one task label resolved to a named `func_name`
+    from either an explicit `--func-names` file or an auto-discovered sibling
+    `name_map_*.json`. When the `kernel_ids` fallback is used, `func_id=` shows an
+    aligned 3-slot integer array in `[aic,aiv0,aiv1]` order; inactive slots remain
+    `-1`. `func_name_map` stays `no` unless a real human-readable name was resolved.
+- `TASK INDEX` — one line per task with `kind=` + `func_id=` and unique `fanin=` /
+  `fanout=` counts for quick grep.
+- `TASK DETAILS` — one block per task with `FANIN` / `FANOUT` peer task references
+  (task-adjacency-only, no tensor detail).
 
-Each arg row carries a 4-line block:
-
-```text
-arg<i> <ARG_TYPE>[ ?] <Tname>:<dtype>
-storage:      <buffer_numel> elems   # underlying buffer size
-shape:        [...]                  # slice this slot accesses
-strides:      [...]                  # per-dim element strides
-start_offset: <N> (elem)             # slice start in the underlying buffer
-```
-
-`<Tname>` is `T<idx>` from `tensors[]` order, so two slots referencing
-the same underlying buffer share a name across the whole graph.
-`raw != shape` is a visual cue that the slot accesses a sub-region.
-The trailing `?` on an `OUTPUT` row marks a tensor_id that the viewer
-backfilled from a downstream `creator` edge (the runtime hadn't
-materialized a Tensor at `submit_task` time, so the raw blob was zero).
-
-Edges in this mode route from the producer's `out_<idx>` row directly
-to the consumer's `in_<arg>` row, so "which output of X feeds which
-input of Y" reads off the picture. `explicit`-source edges render as
-dashed grey arrows; `tensormap` edges whose `overlap` is not `covered`
-carry a small red label so partial-overlap cases stand out.
+In text mode, HTML-only flags such as `--engine` and `--direction` are
+rejected rather than silently ignored.
 
 Node visual encoding (legend top-right of the rendered HTML):
 
@@ -268,10 +258,12 @@ Node visual encoding (legend top-right of the rendered HTML):
 | Green diamond | mix — single `submit_task` with `MixedKernels` spanning both core types |
 | Gray dashed note | alloc — task from `alloc_tensors` (got a task_id, references downstream via `owner_task_id`, but never dispatched a kernel so has no perf record) |
 
-Labels read as `(ring, local) · func_name · core_type-implicit-via-shape`.
-When a colocated `l2_swimlane_records.json` is present the func_id is enriched
-with the kernel name via the sibling `name_map_<case>.json` (written by
-SceneTest's `_dump_name_map`).
+Node labels read as `(ring, local)` only — no func_name or func_id is
+shown in the HTML view. The text output (`deps_viewer.txt`) carries the
+`kind=` + `func_id=` labels; the HTML view focuses on structural layout and stays
+agnostic to function naming. When you need per-task tensor rows (storage / shape /
+strides / start_offset) and arg-port edge routing, rerun the HTML export with
+`--show-tensor-info`.
 
 Browser controls in the HTML viewer:
 
@@ -283,7 +275,9 @@ Browser controls in the HTML viewer:
 The HTML scales to graphs the browser's SVG renderer can handle — in
 practice, ~50k nodes with `--engine sfdp`. Past that, you want a
 canvas/WebGL viewer (Cytoscape.js, sigma.js), which is out of scope
-for this tool.
+for this tool. The default text output does not depend on Graphviz and is the
+preferred mode for large graphs that need fast generation or grep-first
+inspection.
 
 ---
 
@@ -325,12 +319,12 @@ slots that overlay normal record slots in the buffer.
 | Submit `explicit_dep_count` | Chain shape | Per-submit slots used |
 | --------------------------- | ----------- | --------------------- |
 | `0 ≤ dc ≤ 64` | base only — fast path, no chain bookkeeping | 1 |
-| `65 ≤ dc ≤ 390` | base (64 deps) + 1 overflow (up to 326 deps) | 2 |
-| `391 ≤ dc ≤ 716` | base + 2 overflow | 3 |
-| general | base + `⌈(dc − 64) / 326⌉` overflow | `1 + ⌈(dc − 64) / 326⌉` |
+| `65 ≤ dc ≤ 646` | base (64 deps) + 1 overflow (up to 582 deps) | 2 |
+| `647 ≤ dc ≤ 1228` | base + 2 overflow | 3 |
+| general | base + `⌈(dc − 64) / 582⌉` overflow | `1 + ⌈(dc − 64) / 582⌉` |
 
-**Wire format.** An overflow record reinterprets the same 2624-byte slot
-as `{ task_id (8) + flags (4) + dep_count (2) + _reserved (2) + deps[326] }` —
+**Wire format.** An overflow record reinterprets the same 4672-byte slot
+as `{ task_id (8) + flags (4) + dep_count (2) + _reserved (2) + deps[582] }` —
 no tensor blobs (those live on the base record). Replay distinguishes
 the two views by `flags & DEP_GEN_FLAG_OVERFLOW`. Chain records always
 share the base's `task_id`, and the last one sets
@@ -347,9 +341,9 @@ base via `task_id`.
 
 **Truncation tail.** A submit whose chain exceeds the buffer's slot
 budget (`PLATFORM_DEP_GEN_RECORDS_PER_BUFFER = 32` slots → roughly
-`64 + 31 × 326 = 10170` deps max in the best case) is logged via
+`64 + 31 × 582 = 18106` deps max in the best case) is logged via
 `LOG_ERROR` and truncated to the largest dc that fits. Runtime
-correctness is unaffected — `Arg::set_dependencies` keeps the full dep
+correctness is unaffected — `L0TaskArgs::set_dependencies` keeps the full dep
 list; only the dep_gen replay graph loses the tail.
 
 ---
@@ -358,13 +352,13 @@ list; only the dep_gen replay graph loses the tail.
 
 | Layer | File | Role |
 | ----- | ---- | ---- |
-| Shared-mem layout | `src/{a2a3,a5}/platform/include/common/dep_gen.h` | `DepGenRecord` (2624 B base, cache-line aligned, ≤64 inline explicit_deps) + `DepGenOverflowRecord` chain view (≤326 deps per slot) + SPSC ring + per-thread ready queue. Byte-identical layout across platforms. |
+| Shared-mem layout | `src/{a2a3,a5}/platform/include/common/dep_gen.h` | `DepGenRecord` (4672 B base, cache-line aligned, ≤64 inline explicit_deps) + `DepGenOverflowRecord` chain view (≤582 deps per slot) + SPSC ring + per-thread ready queue. Byte-identical layout across platforms. |
 | AICPU writer | `src/{a2a3,a5}/platform/{include,shared}/aicpu/dep_gen_collector_aicpu.{h,cpp}` | Single-instance write path; weak-fallback exported to host build. a5 reuses the a2a3 source verbatim — the writer accesses its own device-side view of shared memory, independent of how host↔device transport is implemented. |
 | Host collector | `src/{a2a3,a5}/platform/{include/host,shared/host}/dep_gen_collector.{h,cpp}` | `ProfilerBase<DepGenCollector, DepGenModule>` — drains ring → `records_` vector. On a5 (no SVM) it uses the base `alloc_paired_buffer`, which malloc's a host shadow + `copy_to_device`'s it and registers it via `add_malloc_shadow` so teardown can free it; `reconcile_counters` explicitly `copy_from_device`'s the BufferState before reading, and `finalize` lets `BufferPoolManager::clear_mappings()` release all shadows as the single source of truth. |
 | Capture call site | `src/{a2a3,a5}/runtime/tensormap_and_ringbuffer/runtime/pto_orchestrator.cpp` `submit_task_common` | One conditional block that snapshots inputs into the ring when `is_dep_gen_enabled()`; fires for both `submit_task` and `submit_dummy_task`. **a2a3 only:** the schema additionally carries `kernel_id[3] = {aic, aiv0, aiv1}` so the swimlane post-processor can resolve `task_id → kernel` from `deps.json` at level=1 where the AICore record is the sole device-side identity source. Inactive subslots stay at `INVALID_KERNEL_ID = -1`. |
 | Replay | `src/{a2a3,a5}/runtime/tensormap_and_ringbuffer/host/dep_gen_replay.{h,cpp}` | Pure CPU; runs dual-pass differential replay — `compute_task_fanin` (oracle) + inlined STEP A/B mirror (annotated) against two `PTO2TensorMap` instances. Emits `deps.json` when both passes agree per record. Platform-agnostic — a5 reuses the a2a3 source verbatim. |
 | Device-runner hookup | `src/{a2a3,a5}/platform/{onboard,sim}/host/device_runner.cpp` | post-`reconcile_counters` calls `dep_gen_replay_emit_deps_json(records.data(), records.size(), deps_path)` |
-| Viewer | `simpler_setup/tools/deps_to_graph.py` | `deps.json` → pan/zoom HTML |
+| Viewer | `simpler_setup/tools/deps_viewer.py` | `deps.json` → text (default) or pan/zoom HTML |
 | Test | `tests/st/{a2a3,a5}/tensormap_and_ringbuffer/dfx/dep_gen/test_dep_gen.py` + `test_dep_gen_chain.py` | Smoke test + 6-edge validation against `vector_example` orchestration (both platforms share byte-identical orchestration code). |
 
 Supported on both a2a3 and a5. The a5 host collector differs from a2a3 only in its host↔device transport path (a5 has no SVM, so all transfers go through `profiling_copy_to_device` / `profiling_copy_from_device` instead of relying on `halHostRegister`'s shared mapping); the AICPU writer, shared-memory ABI, runtime call site, and replay are platform-agnostic.

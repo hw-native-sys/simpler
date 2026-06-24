@@ -1,7 +1,7 @@
 # Profiling Framework
 
-Shared host-side infrastructure that the PMU, L2Swimlane, and TensorDump
-collectors are built on. The framework headers live in
+Shared host-side infrastructure that the PMU, L2Swimlane, TensorDump, and
+ScopeStats collectors are built on. The framework headers live in
 [`src/common/platform/include/host/`](../src/common/platform/include/host/)
 and are consumed verbatim by both a2a3 and a5 collectors (PR #944
 unified the previously-divergent per-arch copies into one set). This page
@@ -11,7 +11,8 @@ the collectors themselves still carry.
 The per-collector pages
 ([pmu-profiling.md](dfx/pmu-profiling.md),
 [l2-swimlane-profiling.md](dfx/l2-swimlane-profiling.md),
-[tensor-dump.md](dfx/tensor-dump.md))
+[tensor-dump.md](dfx/tensor-dump.md),
+[scope-stats.md](dfx/scope-stats.md))
 describe the data each subsystem collects and how it enables it on-device.
 
 ## 1. Why a shared framework
@@ -343,14 +344,14 @@ changes capture that:
    the same for any remaining mappings (per-state buffers and the shm
    region itself).
 
-Each collector's `reconcile_counters` is purely passive — same shape as
-a2a3. It pulls the post-`stop()` `BufferState`s, logs an error if any
-`current_buf_ptr` still references a non-empty buffer (a device flush
-bug, since AICPU is the only writer that can clear it), and runs the
-three-bucket cross-check
-`collected_on_host + dropped + mismatch == device_total` against
-device-side counters per pool. Host never reads from `current_buf_ptr`
-to recover records — recovering would mask AICPU flush bugs.
+Most collectors keep `reconcile_counters` passive — same shape as a2a3. It
+pulls the post-`stop()` `BufferState`s, logs an error if any
+`current_buf_ptr` still references a non-empty buffer (a device flush bug,
+since AICPU is the only writer that can clear it), and runs the collector's
+counter cross-check/accounting against device-side counters. TensorDump and
+ScopeStats are the recovery-oriented exceptions: on abnormal exit they may
+recover a non-empty `current_buf_ptr` host-side before export, so already
+recorded dump metadata or scope samples still reach the output files.
 
 ### 8.1 Profiling state lives on `KernelArgs`, not `Handshake`
 
@@ -361,7 +362,7 @@ per-core ring/reg addresses travel through `KernelArgs`:
 
 | `KernelArgs` field | Producer | Consumer |
 | ------------------ | -------- | -------- |
-| `enable_profiling_flag` (bitmask) | host (DeviceRunner) | AICPU `kernel.cpp` → `set_l2_swimlane_enabled` / `set_pmu_enabled` / `set_dump_tensor_enabled`; AICore `KERNEL_ENTRY` → `set_aicore_profiling_flag` |
+| `enable_profiling_flag` (bitmask) | host (DeviceRunner) | AICPU `kernel.cpp` → `set_l2_swimlane_enabled` / `set_pmu_enabled` / `set_dump_args_enabled`; AICore `KERNEL_ENTRY` → `set_aicore_profiling_flag` |
 | `aicore_l2_swimlane_ring_addrs` (table) | host (`L2SwimlaneCollector::initialize`) | AICore `KERNEL_ENTRY` indexes `table[block_idx]` → `set_aicore_l2_swimlane_ring` |
 | `aicore_pmu_ring_addrs` (table) | host (`PmuCollector::init`) | AICore `KERNEL_ENTRY` → `set_aicore_pmu_ring` |
 | `regs` (per-physical-core register-base table) | host (already required for AICPU MMIO) | AICore `KERNEL_ENTRY` resolves `regs[get_physical_core_id()]` → `set_aicore_pmu_reg_base`; AICore `aicore_execute` caches the value at Phase-3 |

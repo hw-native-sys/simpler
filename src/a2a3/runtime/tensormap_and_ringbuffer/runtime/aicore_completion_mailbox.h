@@ -39,7 +39,7 @@ static_assert(
 // observation flattened from a DeferredCompletionEntry. TASK_NORMAL_DONE
 // carries the slot_state pointer in `addr` so the consumer can finalize the
 // AsyncWaitEntry.slot_state binding for tasks whose conditions arrived
-// before the FIN thread saw mixed_complete. New kinds may be added in future
+// before the FIN thread saw task_complete. New kinds may be added in future
 // without growing the message — the `_pad[5]` slack is reserved for
 // kind-specific payload extension.
 #define MSG_KIND_CONDITION 0u

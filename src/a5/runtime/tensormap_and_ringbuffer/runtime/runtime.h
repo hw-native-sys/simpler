@@ -116,6 +116,10 @@ struct TensorPair {
     void *host_ptr;
     void *dev_ptr;
     size_t size;
+    // false for read-only INPUT tensors: they are never written by the kernel,
+    // so the end-of-run D2H copy-back is skipped. OUTPUT/INOUT/unknown
+    // keep the safe default of copying back.
+    bool needs_copy_back = true;
 };
 
 /**
@@ -127,6 +131,11 @@ struct HostApi {
     void (*device_free)(void *dev_ptr);
     int (*copy_to_device)(void *dev_ptr, const void *host_ptr, size_t size);
     int (*copy_from_device)(void *host_ptr, const void *dev_ptr, size_t size);
+    // Set a device buffer to a byte value (device-side, no PCIe). Used to
+    // zero-init pure OUTPUT buffers in lieu of an H2D copy-in. May be
+    // null on backends that don't wire it; callers must fall back to
+    // copy_to_device.
+    int (*device_memset)(void *dev_ptr, int value, size_t size);
     // Commit the three per-Worker pooled regions (PTO2 GM heap, PTO2 shared
     // memory, trb prebuilt runtime arena) as three independent device
     // allocations. `runtime_arena_size == 0` skips the third region (hbg
@@ -214,11 +223,6 @@ public:
     // popcount(OCCUPY) via the topology probe. See the matching field in
     // src/a5/runtime/host_build_graph/runtime/runtime.h for rationale.
     int32_t aicpu_launch_count;
-
-    // Ring buffer size overrides (0 = use compile-time defaults)
-    uint64_t task_window_size;
-    uint64_t heap_size;
-    uint64_t dep_pool_size;
 
     // PTO2 integration: kernel_id -> GM function_bin_addr mapping
     // NOTE: Made public for direct access from aicore code

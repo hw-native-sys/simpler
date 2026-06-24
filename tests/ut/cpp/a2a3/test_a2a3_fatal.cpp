@@ -51,7 +51,7 @@ static_assert(offsetof(FakeRuntime, ops) == 0);  // Guard: reinterpret_cast belo
 
 FakeRuntime *as_fake(PTO2Runtime *rt) { return reinterpret_cast<FakeRuntime *>(rt); }
 
-TaskOutputTensors fake_submit(PTO2Runtime *rt, const MixedKernels &, const Arg &) {
+TaskOutputTensors fake_submit(PTO2Runtime *rt, const MixedKernels &, const L0TaskArgs &) {
     as_fake(rt)->submit_calls++;
     return TaskOutputTensors{};
 }
@@ -90,10 +90,12 @@ void fake_set_tensor_data(PTO2Runtime *rt, const Tensor &, uint32_t, const uint3
     as_fake(rt)->set_calls++;
 }
 
-TaskOutputTensors fake_alloc_tensors(PTO2Runtime *rt, const Arg &) {
+TaskOutputTensors fake_alloc_tensors(PTO2Runtime *rt, const L0TaskArgs &) {
     as_fake(rt)->alloc_calls++;
     return TaskOutputTensors{};
 }
+
+TaskOutputTensors fake_submit_dummy(PTO2Runtime *, const L0TaskArgs &) { return TaskOutputTensors{}; }
 
 const PTO2RuntimeOps kFakeOps = {
     .submit_task = fake_submit,
@@ -109,6 +111,8 @@ const PTO2RuntimeOps kFakeOps = {
     .get_tensor_data = fake_get_tensor_data,
     .set_tensor_data = fake_set_tensor_data,
     .alloc_tensors = fake_alloc_tensors,
+    .submit_dummy_task = fake_submit_dummy,
+    .scope_set_site = nullptr,
 };
 
 class RuntimeBindingGuard {
@@ -131,7 +135,7 @@ TEST(A2A3Fatal, ApiShortCircuitsAfterFatal) {
     RuntimeBindingGuard bind(reinterpret_cast<PTO2Runtime *>(&runtime));
 
     MixedKernels mixed{};
-    Arg args;
+    L0TaskArgs args;
     uint32_t indices[1] = {0};
     uint32_t shape[1] = {1};
     Tensor tensor = make_tensor_external(reinterpret_cast<void *>(0x1), shape, 1);
@@ -170,7 +174,7 @@ TEST(A2A3Fatal, ExplicitFatalRoutesThroughOps) {
     EXPECT_FALSE(runtime.last_fatal_func.empty());
 
     MixedKernels mixed{};
-    Arg args;
+    L0TaskArgs args;
     EXPECT_TRUE(rt_submit_task(mixed, args).empty());
     EXPECT_EQ(runtime.submit_calls, 0);
 }

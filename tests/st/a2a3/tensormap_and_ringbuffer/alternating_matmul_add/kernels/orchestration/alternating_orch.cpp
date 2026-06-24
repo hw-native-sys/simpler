@@ -39,22 +39,21 @@ static constexpr uint64_t ADD_ELEMS = 128 * 128;
 
 extern "C" {
 
-__attribute__((visibility("default"))) PTO2OrchestrationConfig
-aicpu_orchestration_config(const ChipStorageTaskArgs &orch_args) {
+__attribute__((visibility("default"))) PTO2OrchestrationConfig aicpu_orchestration_config(const L2TaskArgs &orch_args) {
     (void)orch_args;  // NOLINT(readability/casting)
     return PTO2OrchestrationConfig{
         .expected_arg_count = 11,
     };
 }
 
-__attribute__((visibility("default"))) void aicpu_orchestration_entry(const ChipStorageTaskArgs &orch_args) {
+__attribute__((visibility("default"))) void aicpu_orchestration_entry(const L2TaskArgs &orch_args) {
     // Tensor args
-    Tensor ext_A = from_tensor_arg(orch_args.tensor(0));
-    Tensor ext_B = from_tensor_arg(orch_args.tensor(1));
-    Tensor ext_C = from_tensor_arg(orch_args.tensor(2));
-    Tensor ext_X = from_tensor_arg(orch_args.tensor(3));
-    Tensor ext_Y = from_tensor_arg(orch_args.tensor(4));
-    Tensor ext_Z = from_tensor_arg(orch_args.tensor(5));
+    const Tensor &ext_A = orch_args.tensor(0).ref();
+    const Tensor &ext_B = orch_args.tensor(1).ref();
+    const Tensor &ext_C = orch_args.tensor(2).ref();
+    const Tensor &ext_X = orch_args.tensor(3).ref();
+    const Tensor &ext_Y = orch_args.tensor(4).ref();
+    const Tensor &ext_Z = orch_args.tensor(5).ref();
 
     // Scalar config args
     int batch = static_cast<int>(orch_args.scalar(0));
@@ -92,7 +91,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
             Tensor B_view = ext_B.view(matmul_group_shapes, view_offsets);
             Tensor C_view = ext_C.view(matmul_group_shapes, view_offsets);
 
-            Arg params_matmul;
+            L0TaskArgs params_matmul;
             params_matmul.add_input(A_view);
             params_matmul.add_input(B_view);
             params_matmul.add_output(C_view);
@@ -112,7 +111,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
             Tensor Y_view = ext_Y.view(add_group_shapes, view_offsets);
             Tensor Z_view = ext_Z.view(add_group_shapes, view_offsets);
 
-            Arg params_add;
+            L0TaskArgs params_add;
             params_add.add_input(X_view);
             params_add.add_input(Y_view);
             params_add.add_output(Z_view);

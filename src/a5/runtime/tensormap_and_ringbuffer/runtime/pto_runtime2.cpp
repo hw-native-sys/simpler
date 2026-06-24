@@ -41,15 +41,15 @@ __attribute__((weak, visibility("hidden"))) uint64_t get_sys_cnt_aicpu() { retur
 // Orchestration Ops Table (function-pointer dispatch for orchestration .so)
 // =============================================================================
 
-static TaskOutputTensors submit_task_impl(PTO2Runtime *rt, const MixedKernels &mixed_kernels, const Arg &args) {
+static TaskOutputTensors submit_task_impl(PTO2Runtime *rt, const MixedKernels &mixed_kernels, const L0TaskArgs &args) {
     return rt->orchestrator.submit_task(mixed_kernels, args);
 }
 
-static TaskOutputTensors alloc_tensors_impl(PTO2Runtime *rt, const Arg &args) {
+static TaskOutputTensors alloc_tensors_impl(PTO2Runtime *rt, const L0TaskArgs &args) {
     return rt->orchestrator.alloc_tensors(args);
 }
 
-static TaskOutputTensors submit_dummy_task_impl(PTO2Runtime *rt, const Arg &args) {
+static TaskOutputTensors submit_dummy_task_impl(PTO2Runtime *rt, const L0TaskArgs &args) {
     return rt->orchestrator.submit_dummy_task(args);
 }
 

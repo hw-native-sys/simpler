@@ -83,6 +83,7 @@ public:
     void free_tensor(void *dev_ptr);
     int copy_to_device(void *dev_ptr, const void *host_ptr, size_t bytes);
     int copy_from_device(void *host_ptr, const void *dev_ptr, size_t bytes);
+    int device_memset(void *dev_ptr, int value, size_t bytes);
 
     int register_callable(
         int32_t callable_id, const void *orch_so_data, size_t orch_so_size, const char *func_name,

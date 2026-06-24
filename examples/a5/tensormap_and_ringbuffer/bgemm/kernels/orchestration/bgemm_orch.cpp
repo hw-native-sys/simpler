@@ -32,7 +32,7 @@
  * Intermediate result P flows via TPUSH/TPOP (VEC_FIFO), bypassing GM.
  * Dependencies are automatic via TensorMap overlap detection.
  *
- * Arg layout: [A, B, C]  — shape/dtype/size in ContinuousTensor metadata
+ * Arg layout: [A, B, C]  — shape/dtype/size in Tensor metadata
  */
 
 #include <cstdint>
@@ -53,19 +53,18 @@ static constexpr uint32_t TILE_ELEMS = TILE * TILE;  // 4096 elements
 
 extern "C" {
 
-__attribute__((visibility("default"))) PTO2OrchestrationConfig
-aicpu_orchestration_config(const ChipStorageTaskArgs &orch_args) {
+__attribute__((visibility("default"))) PTO2OrchestrationConfig aicpu_orchestration_config(const L2TaskArgs &orch_args) {
     (void)orch_args;  // NOLINT(readability/casting)
     return PTO2OrchestrationConfig{
         .expected_arg_count = 3,
     };
 }
 
-__attribute__((visibility("default"))) void aicpu_orchestration_entry(const ChipStorageTaskArgs &orch_args) {
+__attribute__((visibility("default"))) void aicpu_orchestration_entry(const L2TaskArgs &orch_args) {
     // 1D external tensors for the full A, B, C arrays
-    Tensor ext_A = from_tensor_arg(orch_args.tensor(0));
-    Tensor ext_B = from_tensor_arg(orch_args.tensor(1));
-    Tensor ext_C = from_tensor_arg(orch_args.tensor(2));
+    const Tensor &ext_A = orch_args.tensor(0).ref();
+    const Tensor &ext_B = orch_args.tensor(1).ref();
+    const Tensor &ext_C = orch_args.tensor(2).ref();
 
     LOG_INFO_V0("[bgemm_orch] Grid: %dx%dx%d, Batch: %d, Tile: %d", GRID_M, GRID_K, GRID_N, BATCH, TILE);
 
@@ -97,7 +96,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
                         Tensor B_view = ext_B.view(tile_shapes, b_view_offsets);
 
                         // P = A[m,k] @ B[k,n], then C[m,n] += P
-                        Arg args;
+                        L0TaskArgs args;
                         args.add_input(A_view);
                         args.add_input(B_view);
                         args.add_inout(C_view);

@@ -42,7 +42,7 @@ std::string MakeInnerSoBasename(uint64_t fp, int device_id) {
 }
 
 // Per-runtime unique opType — different LoadAicpuOp instances in the same
-// process may register the same plain symbol names (simpler_aicpu_init / _exec);
+// process may register the same plain symbol name (simpler_aicpu_exec);
 // suffixing with the runtime SO fingerprint keeps CANN's global op registry
 // from collapsing distinct registrations.
 std::string MakeUniqueOpType(const char *base, uint64_t fp) {
@@ -263,7 +263,6 @@ bool LoadAicpuOp::GenerateAicpuOpJson(const std::string &json_path, const std::s
         return c;
     };
     std::vector<AicpuOpConfig> op_configs = {
-        make_cfg(KernelNames::InitName),
         make_cfg(KernelNames::RunName),
     };
     json_file << "{\n";
@@ -349,7 +348,7 @@ int LoadAicpuOp::Init() {
     }
     LOG_INFO_V2("LoadAicpuOp: Loaded inner SO via JSON, handle=%p", binary_handle_);
 
-    const char *symbol_names[] = {KernelNames::InitName, KernelNames::RunName};
+    const char *symbol_names[] = {KernelNames::RunName};
     for (const char *name : symbol_names) {
         std::string lookup_name = MakeUniqueOpType(name, inner_fp_);
         rtFuncHandle func_handle = nullptr;

@@ -143,7 +143,7 @@ using DumpFreeCallback = profiling_common::ProfFreeCallback;
 // =============================================================================
 
 /**
- * Collected tensor metadata + payload bytes
+ * Collected arg metadata + payload bytes
  */
 struct DumpedTensor {
     uint64_t task_id;
@@ -152,6 +152,7 @@ struct DumpedTensor {
     TensorDumpStage stage;
     uint8_t dtype;
     uint8_t ndims;
+    uint8_t flags;
     TensorDumpKind kind;
     uint64_t scalar_value;
     uint64_t start_offset;                     // 1D element offset of the view origin
@@ -186,7 +187,7 @@ public:
      * buffers are pushed into each thread's free_queue; the rest go into
      * the BufferPoolManager's recycled pool.
      *
-     * `output_prefix` is the per-task directory under which `tensor_dump/`
+     * `output_prefix` is the per-task directory under which `args_dump/`
      * lands. Required (non-empty); CallConfig::validate() enforces this
      * upstream. Stored on the collector so the lazily-started writer thread
      * (kicked off inside on_buffer_collected) can derive its run_dir
@@ -198,8 +199,8 @@ public:
      * @param register_cb       Host-visibility callback (nullptr on a5)
      * @param free_cb           Memory free callback
      * @param user_data         Opaque pointer forwarded to callbacks
-     * @param output_prefix     Per-task directory; tensor_dump/ subdir lands here
-     * @param dump_tensor_level OFF / PARTIAL (only Arg::dump()-marked tasks) /
+     * @param output_prefix     Per-task directory; args_dump/ subdir lands here
+     * @param dump_tensor_level OFF / PARTIAL (only Arg::dump()-marked args) /
      *                          FULL / FULL_JSON_ONLY (every task's metadata to
      *                          JSON, no payload or .bin). Written to
      *                          DumpDataHeader so the AICPU latches the mode
@@ -221,17 +222,15 @@ public:
     void on_buffer_collected(const DumpReadyBufferInfo &info);
 
     /**
-     * Write collected dumps to <output_prefix>/tensor_dump/{*.bin, *.json}.
-     * Sorts tensors by (task_id, subtask_id, func_id, stage, arg_index, role).
+     * Write collected dumps to <output_prefix>/args_dump/{*.bin, *.json}.
+     * Sorts args by (task_id, subtask_id, func_id, stage, arg_index, role).
      */
     int export_dump_files();
 
     /**
-     * After stop(), perform purely-passive accounting:
-     *   - LOG_ERROR any non-zero DumpBufferState::current_buf_ptr with
-     *     records (device flush should always succeed-or-bump-dropped, so
-     *     a non-empty leftover indicates an AICPU flush bug — host does
-     *     NOT recover, to avoid masking the bug).
+     * After stop():
+     *   - Recover records from any non-empty DumpBufferState::current_buf_ptr
+     *     left behind by abnormal exit before device-side flush ran.
      *   - Accumulate device-side dropped_record_count into
      *     total_dropped_record_count_ for the final anomaly report.
      * Must be called after stop().
@@ -262,7 +261,7 @@ private:
     int num_dump_threads_{0};
 
     // Per-task output directory captured at initialize() time. The writer
-    // thread builds run_dir_ = output_prefix_ / "tensor_dump" lazily on the
+    // thread builds run_dir_ = output_prefix_ / "args_dump" lazily on the
     // first on_buffer_collected.
     std::string output_prefix_;
 
@@ -275,7 +274,7 @@ private:
     };
     std::vector<ArenaInfo> arenas_;
 
-    // Collected dump tensors (metadata only; payloads live in tensors.bin)
+    // Collected dump args (metadata only; payloads live in args.bin)
     std::vector<DumpedTensor> collected_;
     std::mutex collected_mutex_;
 
@@ -294,7 +293,7 @@ private:
     void process_dump_buffer(const DumpReadyBufferInfo &info);
     void start_writer_thread_once();
 
-    // Writer thread: streams tensor payloads to a single tensors.bin
+    // Writer thread: streams arg payloads to a single args.bin
     std::thread writer_thread_;
     std::mutex write_mutex_;
     std::condition_variable write_cv_;

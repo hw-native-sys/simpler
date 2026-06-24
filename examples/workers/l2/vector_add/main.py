@@ -44,9 +44,9 @@ from simpler.task_interface import (
     CallConfig,
     ChipCallable,
     ChipStorageTaskArgs,
-    ContinuousTensor,
     CoreCallable,
     DataType,
+    Tensor,
 )
 from simpler.worker import Worker
 
@@ -146,12 +146,12 @@ def _run(worker: Worker, chip_handle: CallableHandle):
     worker.copy_to(dev_b, host_b.data_ptr(), NBYTES)
 
     # --- 3. Build TaskArgs describing the tensors visible to the orchestration ---
-    # Each tensor is a ContinuousTensor(data_ptr, shape, dtype). Order must
+    # Each tensor is a Tensor(data_ptr, shape, dtype). Order must
     # match the ``signature`` list in the ChipCallable (IN, IN, OUT).
     args = ChipStorageTaskArgs()
-    args.add_tensor(ContinuousTensor.make(dev_a, (N_ROWS, N_COLS), DataType.FLOAT32))
-    args.add_tensor(ContinuousTensor.make(dev_b, (N_ROWS, N_COLS), DataType.FLOAT32))
-    args.add_tensor(ContinuousTensor.make(dev_out, (N_ROWS, N_COLS), DataType.FLOAT32))
+    args.add_tensor(Tensor.make(dev_a, (N_ROWS, N_COLS), DataType.FLOAT32))
+    args.add_tensor(Tensor.make(dev_b, (N_ROWS, N_COLS), DataType.FLOAT32))
+    args.add_tensor(Tensor.make(dev_out, (N_ROWS, N_COLS), DataType.FLOAT32))
 
     # --- 4. Run. CallConfig() defaults are fine for this kernel. ---
     config = CallConfig()

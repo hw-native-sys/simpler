@@ -20,6 +20,7 @@ Lock file under build/ serializes concurrent clones from parallel processes.
 """
 
 import fcntl
+import json
 import logging
 import os
 import shutil
@@ -33,6 +34,148 @@ logger = logging.getLogger(__name__)
 
 _PTO_ISA_HTTPS = "https://github.com/hw-native-sys/pto-isa.git"
 _PTO_ISA_SSH = "git@github.com:hw-native-sys/pto-isa.git"
+_UNPINNED_COMMIT_VALUES = {"", "head", "latest", "none"}
+PTO_ISA_BUILD_METADATA = "pto_isa_build.json"
+_RUN_PTO_ISA_COMMIT_ENV = "SIMPLER_RUN_PTO_ISA_COMMIT"
+_RUN_PTO_ISA_ROOT_ENV = "SIMPLER_RUN_PTO_ISA_ROOT"
+
+
+def resolve_pto_isa_commit(commit: Optional[str] = None) -> Optional[str]:
+    """Resolve the pto-isa revision requested for managed clones.
+
+    Explicit CLI/API values, or SIMPLER_PTO_ISA_COMMIT, request a concrete
+    revision. When no revision is requested, keep the original behavior and use
+    the current checkout HEAD. "latest", "head", or "none" also opt into HEAD.
+    """
+    requested = commit if commit is not None else os.environ.get("SIMPLER_PTO_ISA_COMMIT")
+    if requested is not None:
+        value = requested.strip()
+        if value.lower() in _UNPINNED_COMMIT_VALUES:
+            return None
+        return value
+    return None
+
+
+def get_pto_isa_head(pto_isa_root: str) -> str:
+    """Return the full git HEAD SHA for a PTO-ISA checkout, or empty if unknown."""
+    try:
+        result = _run_git(["rev-parse", "HEAD"], cwd=Path(pto_isa_root), timeout=5)
+        return result.stdout.strip() if result.returncode == 0 else ""
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def _record_runtime_pto_isa(pto_isa_root: str) -> None:
+    """Expose the resolved runtime PTO-ISA revision to host runtime lookup."""
+    actual_commit = get_pto_isa_head(pto_isa_root)
+    if actual_commit:
+        os.environ[_RUN_PTO_ISA_COMMIT_ENV] = actual_commit
+    else:
+        # Avoid carrying a stale value from an earlier checkout. If PTO_ISA_ROOT
+        # is not a git checkout, validation must fail rather than guess.
+        os.environ.pop(_RUN_PTO_ISA_COMMIT_ENV, None)
+    os.environ[_RUN_PTO_ISA_ROOT_ENV] = str(Path(pto_isa_root).resolve())
+
+
+def _commits_match(left: str, right: str) -> bool:
+    if left == right:
+        return True
+    if len(left) >= 7 and right.startswith(left):
+        return True
+    return len(right) >= 7 and left.startswith(right)
+
+
+def pto_isa_build_metadata_path(lib_dir: Path) -> Path:
+    """Return the build metadata path under build/lib."""
+    return lib_dir / PTO_ISA_BUILD_METADATA
+
+
+def write_pto_isa_build_metadata(
+    lib_dir: Path,
+    pto_isa_root: str,
+    requested_commit: Optional[str] = None,
+) -> None:
+    """Record the PTO-ISA revision used to build installed runtime binaries."""
+    resolved_request = resolve_pto_isa_commit(requested_commit)
+    actual_commit = get_pto_isa_head(pto_isa_root)
+    if not actual_commit:
+        raise RuntimeError(
+            "Cannot record PTO-ISA build revision: "
+            f"{pto_isa_root} is not a git checkout or git HEAD is unavailable. "
+            "Building a2a3 onboard runtimes requires a traceable PTO-ISA commit for runtime compatibility "
+            "validation. Point PTO_ISA_ROOT to a full pto-isa git checkout, or unset PTO_ISA_ROOT so simpler "
+            "can clone pto-isa into build/pto-isa."
+        )
+    metadata = {
+        "schema_version": 1,
+        "pto_isa_commit": actual_commit,
+        "requested_commit": resolved_request or "latest",
+        "pto_isa_root": str(Path(pto_isa_root).resolve()),
+    }
+    lib_dir.mkdir(parents=True, exist_ok=True)
+    pto_isa_build_metadata_path(lib_dir).write_text(json.dumps(metadata, indent=2, sort_keys=True) + "\n")
+
+
+def read_pto_isa_build_metadata(lib_dir: Path) -> Optional[dict]:
+    """Read installed runtime PTO-ISA metadata, if present."""
+    metadata_path = pto_isa_build_metadata_path(lib_dir)
+    if not metadata_path.is_file():
+        return None
+    try:
+        payload = json.loads(metadata_path.read_text())
+    except (json.JSONDecodeError, OSError) as e:
+        raise RuntimeError(f"Invalid PTO-ISA build metadata at {metadata_path}: {e}") from e
+    if not isinstance(payload, dict):
+        raise RuntimeError(f"Invalid PTO-ISA build metadata at {metadata_path}: expected JSON object")
+    return payload
+
+
+def _resolve_runtime_pto_isa_commit_for_validation() -> str:
+    run_commit = os.environ.get(_RUN_PTO_ISA_COMMIT_ENV, "").strip()
+    if run_commit:
+        return run_commit
+
+    env_root = os.environ.get("PTO_ISA_ROOT")
+    if env_root and Path(env_root).is_dir():
+        actual_commit = get_pto_isa_head(env_root)
+        if actual_commit:
+            return actual_commit
+        logger.warning(
+            "PTO_ISA_ROOT=%s is not a git checkout or git HEAD is unavailable; "
+            "falling back to resolved PTO-ISA commit for compatibility validation",
+            env_root,
+        )
+
+    requested_commit = resolve_pto_isa_commit(None)
+    if requested_commit:
+        return requested_commit
+
+    raise RuntimeError(
+        "Cannot verify PTO-ISA runtime revision: no concrete PTO-ISA git checkout or explicit commit is available."
+    )
+
+
+def validate_runtime_pto_isa_compatible(lib_dir: Path) -> None:
+    """Raise when installed runtime binaries and this run use different PTO-ISA commits."""
+    metadata = read_pto_isa_build_metadata(lib_dir)
+    if metadata is None:
+        return
+    run_commit = _resolve_runtime_pto_isa_commit_for_validation()
+
+    build_commit = str(metadata.get("pto_isa_commit", "")).strip()
+    if not build_commit:
+        return
+    if _commits_match(build_commit, run_commit):
+        return
+
+    metadata_path = pto_isa_build_metadata_path(lib_dir)
+    raise RuntimeError(
+        "PTO-ISA version mismatch: installed simpler runtimes were built with "
+        f"pto-isa {build_commit}, but this run uses {run_commit}.\n"
+        f"Build metadata: {metadata_path}\n"
+        "Reinstall simpler with the same ISA revision, or rerun with "
+        f"--pto-isa-commit {build_commit}."
+    )
 
 
 def get_pto_isa_clone_path() -> Path:
@@ -211,8 +354,10 @@ def ensure_pto_isa_root(
     if env_root and Path(env_root).is_dir():
         if verbose:
             logger.info(f"Using existing PTO_ISA_ROOT: {env_root}")
+        _record_runtime_pto_isa(env_root)
         return env_root
 
+    commit = resolve_pto_isa_commit(commit)
     clone_path = get_pto_isa_clone_path()
     lock_path = clone_path.parent / ".pto-isa.lock"
     lock_path.parent.mkdir(parents=True, exist_ok=True)
@@ -233,6 +378,7 @@ def ensure_pto_isa_root(
             f"  or manually clone to {clone_path}:\n"
             f"    git clone {_repo_url(clone_protocol)} {clone_path}"
         )
+    _record_runtime_pto_isa(resolved)
     return resolved
 
 

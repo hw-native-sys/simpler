@@ -68,6 +68,11 @@ __attribute__((weak, visibility("hidden"))) void dep_gen_aicpu_record_submit(
 // builds fall back to this weak `false`. Gating here still skips the
 // cross-agent occupancy reads that feed the sample when scope_stats is disabled.
 extern "C" __attribute__((weak, visibility("hidden"))) bool is_scope_stats_enabled() { return false; }
+
+// Heap-ring wrap report, called from the allocator (pto_ring_buffer.h) on each
+// wrap. Strong definition lives in the AICPU collector; host builds fall back to
+// this weak no-op so the runtime translation unit stays self-contained.
+extern "C" __attribute__((weak, visibility("hidden"))) void scope_stats_note_heap_wrap(int) {}
 #endif
 
 // =============================================================================
@@ -207,13 +212,32 @@ void PTO2OrchestratorState::report_fatal(int32_t error_code, const char *func, c
     va_end(args);
 }
 
+static uint32_t next_fanin_seen_epoch(PTO2OrchestratorState *orch) {
+    uint32_t next = orch->fanin_seen_current_epoch + 1;
+    if (next == 0) {
+        for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
+            memset(
+                orch->fanin_seen_epoch[r], 0,
+                static_cast<size_t>(orch->sm_header->rings[r].task_window_size) * sizeof(uint32_t)
+            );
+        }
+        next = 1;
+    }
+    orch->fanin_seen_current_epoch = next;
+    return next;
+}
+
 struct PTO2FaninBuilder {
-    PTO2FaninBuilder(PTO2FaninPool &spill_pool) :
+    PTO2FaninBuilder(PTO2OrchestratorState *orch, PTO2FaninPool &spill_pool, uint32_t seen_epoch) :
         count(0),
         spill_start(0),
+        orch(orch),
+        seen_epoch(seen_epoch),
         spill_pool(spill_pool) {}
     int32_t count{0};
     int32_t spill_start{0};
+    PTO2OrchestratorState *orch{nullptr};
+    uint32_t seen_epoch{0};
     PTO2FaninPool &spill_pool;
     PTO2TaskSlotState *inline_slots[PTO2_FANIN_INLINE_CAP];
 
@@ -222,26 +246,25 @@ struct PTO2FaninBuilder {
         return for_each_fanin_storage(inline_slots, count, spill_start, spill_pool, static_cast<Fn &&>(fn));
     }
 
-    bool contains(PTO2TaskSlotState *prod_state) const {
-        bool found = false;
-        for_each([&](PTO2TaskSlotState *slot_state) {
-            if (slot_state == prod_state) {
-                found = true;
-                return false;
-            }
-            return true;
-        });
-        if (found) {
+    bool mark_seen(uint8_t prod_ring, int32_t prod_slot) {
+        if (prod_ring >= PTO2_MAX_RING_DEPTH || prod_slot < 0) {
+            return false;
+        }
+        uint32_t *seen = orch->fanin_seen_epoch[prod_ring];
+        uint32_t slot = static_cast<uint32_t>(prod_slot);
+        if (seen[slot] == seen_epoch) {
             return true;
         }
+        seen[slot] = seen_epoch;
         return false;
     }
 };
 
 static bool append_fanin_or_fail(
-    PTO2OrchestratorState *orch, PTO2TaskSlotState *prod_state, PTO2FaninBuilder *fanin_builder, uint8_t ring_id
+    PTO2OrchestratorState *orch, uint8_t prod_ring, int32_t prod_slot, PTO2TaskSlotState *prod_state,
+    PTO2FaninBuilder *fanin_builder, uint8_t ring_id
 ) {
-    if (fanin_builder->contains(prod_state)) {
+    if (fanin_builder->mark_seen(prod_ring, prod_slot)) {
         return true;
     }
 
@@ -279,7 +302,7 @@ struct PTO2PreparedTask {
     PTO2TaskSlotState *slot_state = nullptr;
 };
 
-static PTO2OutputLayout calculate_output_layout(const Arg &args) {
+static PTO2OutputLayout calculate_output_layout(const L0TaskArgs &args) {
     PTO2OutputLayout layout;
     for (int32_t i = 0; i < args.tensor_count(); i++) {
         if (args.tag(i) != TensorArgType::OUTPUT) {
@@ -287,7 +310,7 @@ static PTO2OutputLayout calculate_output_layout(const Arg &args) {
         }
         layout.offsets[i] = layout.total_output_size;
         layout.buffer_sizes[i] =
-            PTO2_ALIGN_UP(args.tensor(i).create_info->buffer_size_bytes(), PTO2_PACKED_OUTPUT_ALIGN);
+            PTO2_ALIGN_UP(args.tensor(i).create_info().buffer_size_bytes(), PTO2_PACKED_OUTPUT_ALIGN);
         layout.total_output_size += layout.buffer_sizes[i];
     }
     return layout;
@@ -340,7 +363,7 @@ static void prefetch_payload(PTO2TaskPayload *payload, int32_t tensor_count, int
 }
 
 static bool prepare_task(
-    PTO2OrchestratorState *orch, const Arg &args, int32_t total_output_size, ActiveMask active_mask,
+    PTO2OrchestratorState *orch, const L0TaskArgs &args, int32_t total_output_size, ActiveMask active_mask,
     PTO2PreparedTask *out
 ) {
     uint8_t ring_id = orch->current_ring_id();
@@ -512,8 +535,8 @@ void PTO2OrchestratorState::end_scope() {
 // computation (explicit_deps + auto), output registration, slot init, and pushes
 // to the scheduler wiring queue.
 static TaskOutputTensors submit_task_common(
-    PTO2OrchestratorState *orch, const Arg &args, ActiveMask active_mask, int32_t aic_kernel_id, int32_t aiv0_kernel_id,
-    int32_t aiv1_kernel_id
+    PTO2OrchestratorState *orch, const L0TaskArgs &args, ActiveMask active_mask, int32_t aic_kernel_id,
+    int32_t aiv0_kernel_id, int32_t aiv1_kernel_id
 ) {
     CYCLE_COUNT_START();
     TaskOutputTensors result;
@@ -554,7 +577,7 @@ static TaskOutputTensors submit_task_common(
             // OUTPUT slots carry create_info (not yet a Tensor); skip them —
             // they have no producer to look up and replay's per-tensor loop
             // also skips OUTPUT.
-            tensor_ptrs[i] = (args.tag(i) == TensorArgType::OUTPUT) ? nullptr : args.tensor(i).ptr;
+            tensor_ptrs[i] = (args.tag(i) == TensorArgType::OUTPUT) ? nullptr : &args.tensor(i).ref();
             arg_types_u8[i] = static_cast<uint8_t>(args.tag(i));
         }
         const int32_t kernel_ids_capture[3] = {aic_kernel_id, aiv0_kernel_id, aiv1_kernel_id};
@@ -565,7 +588,7 @@ static TaskOutputTensors submit_task_common(
         );
     }
 
-    PTO2FaninBuilder fanin_builder(orch->rings[ring_id].fanin_pool);
+    PTO2FaninBuilder fanin_builder(orch, orch->rings[ring_id].fanin_pool, next_fanin_seen_epoch(orch));
 
     CYCLE_COUNT_LAP(g_orch_alloc_cycle);
 
@@ -592,14 +615,16 @@ static TaskOutputTensors submit_task_common(
             );
             return result;
         }
-        PTO2SharedMemoryRingHeader &dep_ring = orch->sm_header->rings[dep_task_id.ring()];
+        uint8_t dep_ring_id = dep_task_id.ring();
+        PTO2SharedMemoryRingHeader &dep_ring = orch->sm_header->rings[dep_ring_id];
         int32_t dep_local_task_id = static_cast<int32_t>(dep_task_id.local());
         int32_t dep_last_task_alive = dep_ring.fc.last_task_alive.load(std::memory_order_acquire);
         if (dep_local_task_id < dep_last_task_alive) {
             continue;
         }
-        PTO2TaskSlotState *producer_slot_state = &dep_ring.get_slot_state_by_task_id(dep_local_task_id);
-        if (!append_fanin_or_fail(orch, producer_slot_state, &fanin_builder, ring_id)) {
+        int32_t dep_slot = dep_ring.get_slot_by_task_id(dep_local_task_id);
+        PTO2TaskSlotState *producer_slot_state = &dep_ring.get_slot_state_by_slot(dep_slot);
+        if (!append_fanin_or_fail(orch, dep_ring_id, dep_slot, producer_slot_state, &fanin_builder, ring_id)) {
             return result;
         }
     }
@@ -611,9 +636,11 @@ static TaskOutputTensors submit_task_common(
     };
 
     auto runtime_emit = [&](PTO2TaskId producer_task_id) -> bool {
-        PTO2TaskSlotState *prod_state =
-            &orch->sm_header->rings[producer_task_id.ring()].get_slot_state_by_task_id(producer_task_id.local());
-        return append_fanin_or_fail(orch, prod_state, &fanin_builder, ring_id);
+        uint8_t prod_ring = producer_task_id.ring();
+        PTO2SharedMemoryRingHeader &producer_ring = orch->sm_header->rings[prod_ring];
+        int32_t prod_slot = producer_ring.get_slot_by_task_id(static_cast<int32_t>(producer_task_id.local()));
+        PTO2TaskSlotState *prod_state = &producer_ring.get_slot_state_by_slot(prod_slot);
+        return append_fanin_or_fail(orch, prod_ring, prod_slot, prod_state, &fanin_builder, ring_id);
     };
 
     if (!compute_task_fanin(dep_inputs, orch->tensor_map, orch->in_manual_scope(), runtime_emit)) {
@@ -658,18 +685,18 @@ static TaskOutputTensors submit_task_common(
 
     payload.init(args, result, prepared.alloc_result, layout);
 #if PTO2_PROFILING
-    if (is_dump_tensor_enabled()) {
+    if (is_dump_args_enabled()) {
         if (args.scalar_count() > 0) {
-            set_dump_tensor_task_scalar_dtypes(
+            set_dump_args_task_scalar_dtypes(
                 task_id.raw, static_cast<uint32_t>(args.scalar_count()), args.scalar_dtypes()
             );
         }
-        // Selective vs full dump is latched at dump_tensor_init from DumpDataHeader
+        // Selective vs full dump is latched at dump_args_init from DumpDataHeader
         // (host-decided before any dispatch), so it is race-free regardless of
-        // submission order. Here we only record each marked task's arg mask, which
-        // selective collection consults.
-        if (args.tensor_dump_arg_mask() != 0) {
-            set_dump_tensor_task_mask(task_id.raw, args.tensor_dump_arg_mask());
+        // submission order. Here we only record each marked task's arg mask and
+        // metadata flags, which selective collection consults.
+        if (args.dump_arg_mask() != 0) {
+            set_dump_args_task_mask(task_id.raw, args.dump_arg_mask(), args.dump_arg_index_ambiguous_mask());
         }
     }
 #endif
@@ -701,7 +728,7 @@ static TaskOutputTensors submit_task_common(
     return result;
 }
 
-TaskOutputTensors PTO2OrchestratorState::submit_task(const MixedKernels &mixed_kernels, const Arg &args) {
+TaskOutputTensors PTO2OrchestratorState::submit_task(const MixedKernels &mixed_kernels, const L0TaskArgs &args) {
     auto *orch = this;
 
     // Orchestration API should short-circuit after fatal, but keep this entry
@@ -772,7 +799,7 @@ TaskOutputTensors PTO2OrchestratorState::submit_task(const MixedKernels &mixed_k
 // AICore dispatch. Empty active_mask routes the slot to the DUMMY ready
 // bucket; dispatch loop short-circuits to completion. Accepts the same Arg
 // shape as submit_task; scalars are permitted but never consumed.
-TaskOutputTensors PTO2OrchestratorState::submit_dummy_task(const Arg &args) {
+TaskOutputTensors PTO2OrchestratorState::submit_dummy_task(const L0TaskArgs &args) {
     auto *orch = this;
 
     if (orch->fatal) {
@@ -794,7 +821,7 @@ TaskOutputTensors PTO2OrchestratorState::submit_dummy_task(const Arg &args) {
     return submit_task_common(orch, args, ActiveMask{}, INVALID_KERNEL_ID, INVALID_KERNEL_ID, INVALID_KERNEL_ID);
 }
 
-TaskOutputTensors PTO2OrchestratorState::alloc_tensors(const Arg &args) {
+TaskOutputTensors PTO2OrchestratorState::alloc_tensors(const L0TaskArgs &args) {
     auto *orch = this;
     // Orchestration API should short-circuit after fatal, but keep this entry
     // robust as a no-op in case a caller reaches it directly.
@@ -865,7 +892,7 @@ TaskOutputTensors PTO2OrchestratorState::alloc_tensors(const Arg &args) {
     if (prepared.slot_state != nullptr) {
         // Hidden alloc tasks complete inline in the orchestrator before any
         // consumer can exist, so they have no fanout to notify and no worker
-        // subtasks to retire. Running the full on_mixed_task_complete path
+        // subtasks to retire. Running the full on_task_complete path
         // would only pay unnecessary fanout_lock / traversal overhead here.
         // The generic slot initialization done in prepare_task() is still
         // required so scope_end can release the producer-side reference and

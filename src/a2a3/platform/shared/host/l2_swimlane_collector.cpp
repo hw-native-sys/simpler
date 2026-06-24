@@ -764,7 +764,7 @@ int L2SwimlaneCollector::export_swimlane_json() {
     // file size). Column order is documented in the schema comment at the top
     // of swimlane_converter.py's v2 reader.
     //
-    //   aicore_tasks: [core_id, task_token_raw, reg_task_id, start_cycles, end_cycles]
+    //   aicore_tasks: [core_id, task_token_raw, reg_task_id, start_cycles, end_cycles, receive_to_start_cycles]
     //   aicpu_tasks:  [core_id, reg_task_id, dispatch_cycles, finish_cycles]
     {
         // copy_aicore_buffer already drops r.start_time == 0 slots when
@@ -776,7 +776,7 @@ int L2SwimlaneCollector::export_swimlane_json() {
             for (const auto &r : collected_aicore_records_[core_idx]) {
                 if (!first) outfile << ",";
                 outfile << "\n    [" << core_idx << ", " << r.task_token_raw << ", " << r.reg_task_id << ", "
-                        << r.start_time << ", " << r.end_time << "]";
+                        << r.start_time << ", " << r.end_time << ", " << r.receive_to_start_cycles << "]";
                 first = false;
                 total++;
             }
@@ -813,6 +813,18 @@ int L2SwimlaneCollector::export_swimlane_json() {
                 return "complete";
             case L2SwimlaneSchedPhaseKind::Dispatch:
                 return "dispatch";
+            case L2SwimlaneSchedPhaseKind::Release:
+                return "release";
+            case L2SwimlaneSchedPhaseKind::Wire:
+                return "wire";
+            case L2SwimlaneSchedPhaseKind::Dummy:
+                return "dummy";
+            case L2SwimlaneSchedPhaseKind::EarlyDispatch:
+                return "early_dispatch";
+            case L2SwimlaneSchedPhaseKind::Resolve:
+                return "resolve";
+            case L2SwimlaneSchedPhaseKind::DummyTask:
+                return "dummy_task";
             }
             return "unknown";
         };

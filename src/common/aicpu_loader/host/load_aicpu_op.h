@@ -26,10 +26,10 @@
  *
  *   2. Init (per-DeviceRunner): JSON-registers the runtime SO via
  *      `rtsBinaryLoadFromFile` (cpuKernelMode=0, kernelSo points at the
- *      preinstall basename), then resolves `simpler_aicpu_init` and
- *      `simpler_aicpu_exec` to `rtFuncHandle`s via `rtsFuncGetByName`. JSON
- *      is per-process (`/tmp/simpler_inner_<fp>_<pid>.json`) so concurrent
- *      multi-chip / multi-worker tests don't race on a shared file.
+ *      preinstall basename), then resolves `simpler_aicpu_exec` to an
+ *      `rtFuncHandle` via `rtsFuncGetByName`. JSON is per-process
+ *      (`/tmp/simpler_inner_<fp>_<pid>.json`) so concurrent multi-chip /
+ *      multi-worker tests don't race on a shared file.
  *
  *   3. LaunchBuiltInOp (per-task): `rtsLaunchCpuKernel` on the cached
  *      `rtFuncHandle`. No per-launch string marshalling, no global op
@@ -117,8 +117,8 @@ public:
      *
      * @param stream       RTS stream
      * @param k_args       Kernel arguments
-     * @param aicpu_num    Number of AICPU threads (1 for Init, N for Exec)
-     * @param func_name    Lookup key in func_handles_ (KernelNames::InitName/RunName)
+     * @param aicpu_num    Number of AICPU threads
+     * @param func_name    Lookup key in func_handles_ (KernelNames::RunName)
      * @return 0 on success, error code on failure
      */
     int LaunchBuiltInOp(rtStream_t stream, KernelArgs *k_args, int aicpu_num, const std::string &func_name);
@@ -135,11 +135,10 @@ private:
     int AicpuKernelLaunch(rtFuncHandle func_handle, rtStream_t stream, KernelArgs *k_args, int aicpu_num);
 };
 
-// Runtime SO's actual exported symbol names. Both are looked up via the
-// runtime SO's own JSON registration (no dispatcher hop at runtime).
+// Runtime SO's actual exported symbol name. Looked up via the runtime SO's
+// own JSON registration (no dispatcher hop at runtime).
 namespace KernelNames {
-constexpr const char *InitName = "simpler_aicpu_init";  // single-threaded init
-constexpr const char *RunName = "simpler_aicpu_exec";   // multi-threaded exec
+constexpr const char *RunName = "simpler_aicpu_exec";  // multi-threaded exec
 }  // namespace KernelNames
 
 }  // namespace host

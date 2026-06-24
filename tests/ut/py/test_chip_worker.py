@@ -9,7 +9,7 @@
 """Tests for CallConfig and ChipWorker state machine."""
 
 import pytest
-from _task_interface import CallConfig, _ChipWorker  # pyright: ignore[reportMissingImports]
+from _task_interface import CallConfig, RuntimeEnv, _ChipWorker  # pyright: ignore[reportMissingImports]
 
 # ============================================================================
 # CallConfig tests
@@ -78,6 +78,92 @@ class TestCallConfig:
         r = repr(config)
         assert "block_dim=0" in r
         assert "enable_l2_swimlane=0" in r
+        # Ring sizing only shows in repr when set.
+        assert "ring_heap" not in r
+
+    def test_runtime_env_defaults_and_roundtrip(self):
+        config = CallConfig()
+        # Nested runtime_env tier — writes through the internal reference.
+        assert config.runtime_env.ring_task_window == 0
+        assert config.runtime_env.ring_heap == 0
+        assert config.runtime_env.ring_dep_pool == 0
+        assert config.runtime_env.ring_task_windows == [0, 0, 0, 0]
+        assert config.runtime_env.ring_heaps == [0, 0, 0, 0]
+        assert config.runtime_env.ring_dep_pools == [0, 0, 0, 0]
+        config.runtime_env.ring_task_window = 64
+        config.runtime_env.ring_heap = 2621440
+        config.runtime_env.ring_dep_pool = 256
+        config.runtime_env.ring_task_windows = [16, 32, 128, 256]
+        config.runtime_env.ring_heaps = [
+            10 * 1024 * 1024,
+            64 * 1024 * 1024,
+            1536 * 1024 * 1024,
+            4 * 1024 * 1024 * 1024,
+        ]
+        config.runtime_env.ring_dep_pools = [64, 128, 256, 512]
+        assert config.runtime_env.ring_task_window == 64
+        assert config.runtime_env.ring_heap == 2621440
+        assert config.runtime_env.ring_dep_pool == 256
+        assert config.runtime_env.ring_task_windows == [16, 32, 128, 256]
+        assert config.runtime_env.ring_heaps == [
+            10 * 1024 * 1024,
+            64 * 1024 * 1024,
+            1536 * 1024 * 1024,
+            4 * 1024 * 1024 * 1024,
+        ]
+        assert config.runtime_env.ring_dep_pools == [64, 128, 256, 512]
+        config.validate()
+        r = repr(config)
+        assert "runtime_env.ring_task_window=64" in r
+        assert "runtime_env.ring_heap=2621440" in r
+        assert "runtime_env.ring_dep_pool=256" in r
+        assert "runtime_env.ring_task_windows=[16, 32, 128, 256]" in r
+
+    def test_runtime_env_whole_object_assignment(self):
+        re = RuntimeEnv()
+        re.ring_heap = 1024
+        re.ring_heaps = [1024, 2048, 3072, 4096]
+        config = CallConfig()
+        config.runtime_env = re
+        assert config.runtime_env.ring_heap == 1024
+        assert config.runtime_env.ring_heaps == [1024, 2048, 3072, 4096]
+
+    def test_runtime_env_per_ring_length_validation(self):
+        config = CallConfig()
+        with pytest.raises(ValueError):
+            config.runtime_env.ring_task_windows = [16, 32, 64]
+
+    @pytest.mark.parametrize(
+        ("field", "value"),
+        [
+            ("ring_task_window", 3),  # below min 4
+            ("ring_task_window", 48),  # not a power of 2
+            ("ring_heap", 512),  # below min 1024
+            ("ring_dep_pool", 3),  # below min 4
+            ("ring_dep_pool", 2**31),  # above INT32_MAX
+        ],
+    )
+    def test_runtime_env_validate_rejects(self, field, value):
+        config = CallConfig()
+        setattr(config.runtime_env, field, value)
+        with pytest.raises(ValueError):
+            config.validate()
+
+    def test_runtime_env_per_ring_validate_rejects(self):
+        config = CallConfig()
+        config.runtime_env.ring_task_windows = [16, 32, 48, 64]
+        with pytest.raises(ValueError):
+            config.validate()
+
+        config = CallConfig()
+        config.runtime_env.ring_heaps = [1024, 512, 2048, 4096]
+        with pytest.raises(ValueError):
+            config.validate()
+
+        config = CallConfig()
+        config.runtime_env.ring_dep_pools = [4, 8, 2**31, 16]
+        with pytest.raises(ValueError):
+            config.validate()
 
 
 # ============================================================================
@@ -219,3 +305,73 @@ class TestChipWorkerPython:
         worker = ChipWorker()
         with pytest.raises(TypeError, match="CallableHandle returned by ChipWorker.prepare_callable"):
             worker.run(0, ChipStorageTaskArgs(), CallConfig())
+
+
+# ============================================================================
+# Mailbox CallConfig wire round-trip
+# ============================================================================
+
+
+class TestMailboxConfigRoundtrip:
+    def test_config_roundtrip(self):
+        # Guards the worker mailbox ABI: pack a CallConfig with _CFG_FMT, then
+        # decode it with _read_config_from_mailbox and assert every field
+        # survives. Catches field-order / offset drift in the packed layout
+        # before it surfaces as a forked-worker failure.
+        from simpler.worker import (  # noqa: PLC0415  # pyright: ignore[reportAttributeAccessIssue]
+            _CFG_FMT,
+            _OFF_CONFIG,
+            _read_config_from_mailbox,
+        )
+
+        cfg = CallConfig()
+        cfg.block_dim = 7
+        cfg.aicpu_thread_num = 2
+        cfg.enable_l2_swimlane = 3
+        cfg.enable_dump_tensor = 2
+        cfg.enable_pmu = 5
+        cfg.enable_dep_gen = True
+        cfg.enable_scope_stats = True
+        cfg.runtime_env.ring_task_window = 64
+        cfg.runtime_env.ring_heap = 4 * 1024 * 1024
+        cfg.runtime_env.ring_dep_pool = 256
+        cfg.runtime_env.ring_task_windows = [16, 32, 128, 256]
+        cfg.runtime_env.ring_heaps = [1024, 2048, 4096, 8192]
+        cfg.runtime_env.ring_dep_pools = [64, 128, 256, 512]
+        cfg.output_prefix = "/tmp/out"
+
+        buf = bytearray(_OFF_CONFIG + _CFG_FMT.size)
+        _CFG_FMT.pack_into(
+            buf,
+            _OFF_CONFIG,
+            cfg.block_dim,
+            cfg.aicpu_thread_num,
+            cfg.enable_l2_swimlane,
+            int(cfg.enable_dump_tensor),
+            cfg.enable_pmu,
+            int(cfg.enable_dep_gen),
+            int(cfg.enable_scope_stats),
+            cfg.runtime_env.ring_task_window,
+            cfg.runtime_env.ring_heap,
+            cfg.runtime_env.ring_dep_pool,
+            *cfg.runtime_env.ring_task_windows,
+            *cfg.runtime_env.ring_heaps,
+            *cfg.runtime_env.ring_dep_pools,
+            cfg.output_prefix.encode(),
+        )
+
+        decoded = _read_config_from_mailbox(memoryview(buf))
+        assert decoded.block_dim == 7
+        assert decoded.aicpu_thread_num == 2
+        assert decoded.enable_l2_swimlane == 3
+        assert decoded.enable_dump_tensor == 2
+        assert decoded.enable_pmu == 5
+        assert decoded.enable_dep_gen is True
+        assert decoded.enable_scope_stats is True
+        assert decoded.runtime_env.ring_task_window == 64
+        assert decoded.runtime_env.ring_heap == 4 * 1024 * 1024
+        assert decoded.runtime_env.ring_dep_pool == 256
+        assert decoded.runtime_env.ring_task_windows == [16, 32, 128, 256]
+        assert decoded.runtime_env.ring_heaps == [1024, 2048, 4096, 8192]
+        assert decoded.runtime_env.ring_dep_pools == [64, 128, 256, 512]
+        assert decoded.output_prefix == "/tmp/out"

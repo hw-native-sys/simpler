@@ -72,7 +72,8 @@ def _metrics(resource: str) -> list[Metric]:
             "scope_high_water",
             "High water",
             "end.head - begin.tail",
-            "Peak pressure seen by this scope, including backlog already live on entry.",
+            "Occupancy upper bound for this scope: entry backlog plus everything it allocated, "
+            "not a realized peak and not bounded by capacity.",
             lambda b, en: en.get(e, 0) - b.get(s, 0),
         ),
         Metric(
@@ -84,7 +85,7 @@ def _metrics(resource: str) -> list[Metric]:
         ),
         Metric(
             "scope_alloc",
-            "Scope alloc",
+            "Alloc per scope",
             "end.head - begin.head",
             "How much this scope advanced the allocation frontier.",
             lambda b, en: en.get(e, 0) - b.get(e, 0),
@@ -113,12 +114,6 @@ def _resource_has_data(pairs_by_ring: dict[int, list[tuple[dict, dict]]], resour
     return any(
         s in begin and e in begin and s in end and e in end for pairs in pairs_by_ring.values() for begin, end in pairs
     )
-
-
-def _wrap(delta: int, size: int | None) -> int:
-    if size and delta < 0:
-        return delta + size
-    return delta
 
 
 def _pair_by_ring(records: list[dict]) -> dict[int, list[tuple[dict, dict]]]:
@@ -188,13 +183,15 @@ def _use_bar_html(ratio: float | None) -> str:
     )
 
 
-def _series_for_resource(pairs: list[tuple[dict, dict]], resource: str, size: int | None) -> list[dict]:
+def _series_for_resource(pairs: list[tuple[dict, dict]], resource: str) -> list[dict]:
     info = RESOURCES[resource]
     sites = [end.get("site", "?") for _begin, end in pairs]
     rings = [end.get("ring", begin.get("ring")) for begin, end in pairs]
     series = []
     for metric in _metrics(resource):
-        raw_values = [_wrap(metric.fn(begin, end), size) for begin, end in pairs]
+        # head/tail are monotonic non-wrapping counters, so each delta is exact
+        # and non-negative — no wrap correction needed (see docs/dfx/scope-stats.md).
+        raw_values = [metric.fn(begin, end) for begin, end in pairs]
         values = [v / info.divisor for v in raw_values]
         if values:
             peak_idx = max(range(len(values)), key=values.__getitem__)
@@ -230,7 +227,7 @@ def _risk_entry(meta: dict, resource: str, ring: int | None, pairs: list[tuple[d
     info = RESOURCES[resource]
     size = _resource_size(meta, resource, 0 if ring is None else ring)
     cap = (size / info.divisor) if size is not None else None
-    series = _series_for_resource(pairs, resource, size)
+    series = _series_for_resource(pairs, resource)
     risk = next((s for s in series if s["metric"].key == info.risk_metric), series[0])
     ratio = risk["peak"] / cap if cap else None
     return {
@@ -424,7 +421,7 @@ def _top_peaks_html(entries: list[dict]) -> str:
         "<p>Highlights the highest observed pressure, with capacity use and source site for quick diagnosis.</p>"
         "</div></div>"
         '<table class="peaks"><thead><tr><th>Resource</th><th>ring_depth</th><th>Metric</th>'
-        "<th>Peak</th><th>Capacity</th><th>Use</th><th>Site</th><th>Scope</th></tr></thead>"
+        "<th>Peak</th><th>Capacity</th><th>Use</th><th>Site</th><th>Scope Index</th></tr></thead>"
         f"<tbody>{''.join(rows)}</tbody></table></section>"
     )
 
@@ -515,7 +512,7 @@ def _svg_series_chart(series: list[dict], unit: str, show_axis_title: bool = Fal
         if len(series) == 1 and series[0]["metric"].key == "real_occupancy":
             axis_title = series[0]["metric"].label.lower()
         elif len(series) == 1 and series[0]["metric"].key == "scope_alloc":
-            axis_title = "scope alloc"
+            axis_title = "alloc per scope"
         else:
             axis_title = "high water / live at exit"
         parts.append(f'<text x="{_PAD_L}" y="16" class="axis-title">axis: {axis_title}</text>')
@@ -608,7 +605,7 @@ def _chart_stack_html(series: list[dict], unit: str) -> str:
         '<div class="chart-stack">'
         '<div class="chart-block"><div class="chart-heading">Resource pressure</div>'
         f"{_svg_series_chart(pressure_series, unit, show_axis_title=False)}</div>"
-        '<div class="chart-block"><div class="chart-heading">Scope alloc</div>'
+        '<div class="chart-block">'
         f"{_svg_series_chart(alloc_series, unit)}</div>"
         "</div>"
     )
@@ -616,7 +613,7 @@ def _chart_stack_html(series: list[dict], unit: str) -> str:
 
 def _scope_group_section(resource: str, title: str, pairs: list[tuple[dict, dict]], size: int | None) -> str:
     info = RESOURCES[resource]
-    series = _series_for_resource(pairs, resource, size)
+    series = _series_for_resource(pairs, resource)
     cap = size / info.divisor if size is not None else None
     risk = next((s for s in series if s["metric"].key == info.risk_metric), series[0])
     ratio = risk["peak"] / cap if cap else None
@@ -673,7 +670,9 @@ def _resource_section(resource: str, meta: dict, pairs_by_ring: dict[int, list[t
             "Charts show scheduler-published dependency-list entry pressure with scope-index and observed-usage ticks."
         )
     else:
-        description = "Charts split resource pressure from Scope alloc, each with scope-index and observed-usage ticks."
+        description = (
+            "Charts split resource pressure from Alloc per scope, each with scope-index and observed-usage ticks."
+        )
     return (
         '<section class="panel resource">'
         f'<div class="section-head"><div><h2>{_esc(info.label)}</h2>'
@@ -739,9 +738,9 @@ tr:last-child td{border-bottom:0}
 .r-heap{background:var(--green)}
 .r-dep_pool{background:var(--amber)}
 .r-tensormap{background:var(--purple)}
-.m-scope_high_water{--series-color:var(--blue);stroke:var(--blue);fill:var(--blue);background:var(--blue)}
-.m-real_occupancy{--series-color:var(--orange);stroke:var(--orange);fill:var(--orange);background:var(--orange)}
-.m-scope_alloc{--series-color:var(--green);stroke:var(--green);fill:var(--green);background:var(--green)}
+.m-scope_high_water{--series-color:var(--red);stroke:var(--red);fill:var(--red);background:var(--red)}
+.m-real_occupancy{--series-color:var(--green);stroke:var(--green);fill:var(--green);background:var(--green)}
+.m-scope_alloc{--series-color:var(--blue);stroke:var(--blue);fill:var(--blue);background:var(--blue)}
 .m-tensormap_live{--series-color:var(--purple);stroke:var(--purple);fill:var(--purple);background:var(--purple)}
 .ring-panel{border:1px solid var(--border);border-radius:8px;margin-top:10px;background:#fff}
 .ring-panel summary{display:flex;align-items:center;gap:10px;cursor:pointer;padding:12px 14px}

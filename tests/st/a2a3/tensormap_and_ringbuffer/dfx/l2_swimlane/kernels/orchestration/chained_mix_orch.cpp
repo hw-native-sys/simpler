@@ -47,23 +47,22 @@ static constexpr uint32_t TILE_ELEMS = 128 * 128;
 
 extern "C" {
 
-__attribute__((visibility("default"))) PTO2OrchestrationConfig
-aicpu_orchestration_config(const ChipStorageTaskArgs &orch_args) {
+__attribute__((visibility("default"))) PTO2OrchestrationConfig aicpu_orchestration_config(const L2TaskArgs &orch_args) {
     (void)orch_args;
     return PTO2OrchestrationConfig{
         .expected_arg_count = 8,
     };
 }
 
-__attribute__((visibility("default"))) void aicpu_orchestration_entry(const ChipStorageTaskArgs &orch_args) {
-    Tensor ext_A = from_tensor_arg(orch_args.tensor(0));
-    Tensor ext_B = from_tensor_arg(orch_args.tensor(1));
-    Tensor ext_D = from_tensor_arg(orch_args.tensor(2));
-    Tensor ext_E = from_tensor_arg(orch_args.tensor(3));
-    Tensor ext_ws_aic = from_tensor_arg(orch_args.tensor(4));
-    Tensor ext_ws_aiv = from_tensor_arg(orch_args.tensor(5));
-    Tensor ext_aic_out = from_tensor_arg(orch_args.tensor(6));
-    Tensor ext_aiv_out = from_tensor_arg(orch_args.tensor(7));
+__attribute__((visibility("default"))) void aicpu_orchestration_entry(const L2TaskArgs &orch_args) {
+    const Tensor &ext_A = orch_args.tensor(0).ref();
+    const Tensor &ext_B = orch_args.tensor(1).ref();
+    const Tensor &ext_D = orch_args.tensor(2).ref();
+    const Tensor &ext_E = orch_args.tensor(3).ref();
+    const Tensor &ext_ws_aic = orch_args.tensor(4).ref();
+    const Tensor &ext_ws_aiv = orch_args.tensor(5).ref();
+    const Tensor &ext_aic_out = orch_args.tensor(6).ref();
+    const Tensor &ext_aiv_out = orch_args.tensor(7).ref();
 
     uint32_t slot_shape[1] = {TILE_ELEMS};
     uint32_t off_slot0[1] = {0};
@@ -81,7 +80,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
         MixedKernels mk;
         mk.aic_kernel_id = FUNC_MATMUL;
         mk.aiv0_kernel_id = FUNC_ADD;
-        Arg args;
+        L0TaskArgs args;
         args.add_input(ext_A);
         args.add_input(ext_B);
         args.add_output(ws_aic_slot0);
@@ -98,7 +97,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
         MixedKernels mk;
         mk.aic_kernel_id = FUNC_MATMUL;
         mk.aiv0_kernel_id = FUNC_ADD;
-        Arg args;
+        L0TaskArgs args;
         args.add_input(ws_aic_slot0);
         args.add_input(ext_B);
         args.add_output(ws_aic_slot1);
@@ -113,7 +112,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
         MixedKernels mk;
         mk.aic_kernel_id = FUNC_MATMUL;
         mk.aiv0_kernel_id = FUNC_ADD;
-        Arg args;
+        L0TaskArgs args;
         args.add_input(ws_aic_slot1);
         args.add_input(ext_B);
         args.add_output(ext_aic_out);

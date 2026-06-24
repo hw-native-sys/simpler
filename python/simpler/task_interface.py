@@ -9,13 +9,13 @@
 # ruff: noqa: PLW0603, PLC0415
 """Public Python API for task_interface nanobind bindings.
 
-Re-exports the canonical C++ types (DataType, ContinuousTensor, ChipStorageTaskArgs,
+Re-exports the canonical C++ types (DataType, Tensor, ChipStorageTaskArgs,
 TaskArgs, TensorArgType) plus ``scalar_to_uint64``. Torch-aware helpers
 (``make_tensor_arg``, ``torch_dtype_to_datatype``) live in
 ``simpler_setup.torch_interop`` — this module has no torch dependency.
 
 Usage:
-    from simpler.task_interface import DataType, ContinuousTensor, ChipStorageTaskArgs
+    from simpler.task_interface import DataType, Tensor, ChipStorageTaskArgs
     from simpler_setup.torch_interop import make_tensor_arg
 """
 
@@ -27,20 +27,21 @@ from dataclasses import dataclass
 from typing import Any
 
 from _task_interface import (  # pyright: ignore[reportMissingImports]
-    CONTINUOUS_TENSOR_MAX_DIMS,
     MAILBOX_ERROR_MSG_SIZE,
     MAILBOX_OFF_ERROR_MSG,
     MAILBOX_SIZE,
     MAX_REGISTERED_CALLABLE_IDS,
+    MAX_TENSOR_DIMS,
     ArgDirection,
     CallConfig,
     ChipCallable,
     ChipStorageTaskArgs,
-    ContinuousTensor,
     CoreCallable,
     DataType,
+    RuntimeEnv,
     TaskArgs,
     TaskState,
+    Tensor,
     TensorArgType,
     WorkerType,
     _ChipWorker,
@@ -55,8 +56,8 @@ __all__ = [
     "DataType",
     "get_element_size",
     "get_dtype_name",
-    "CONTINUOUS_TENSOR_MAX_DIMS",
-    "ContinuousTensor",
+    "MAX_TENSOR_DIMS",
+    "Tensor",
     "ChipStorageTaskArgs",
     "TensorArgType",
     "TaskArgs",
@@ -64,6 +65,7 @@ __all__ = [
     "CoreCallable",
     "ChipCallable",
     "CallConfig",
+    "RuntimeEnv",
     "ChipWorker",
     "arg_direction_name",
     "scalar_to_uint64",

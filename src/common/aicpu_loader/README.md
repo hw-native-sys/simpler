@@ -17,9 +17,9 @@ concurrent bootstrap on a shared file corrupted the mmap'd image and faulted
 The dispatcher SO itself is **never** persisted to disk and **never** dispatches
 at per-task launch time. After bootstrap, the host registers the preinstall
 file via `rtsBinaryLoadFromFile` (JSON load, cpuKernelMode=0) and
-resolves `simpler_aicpu_init` / `simpler_aicpu_exec` once via
+resolves `simpler_aicpu_exec` once via
 `rtsFuncGetByName`; per-task launches go through `rtsLaunchCpuKernel` on the
-cached `rtFuncHandle`s. The main `aicpu_scheduler` owns the dlopen of the
+cached `rtFuncHandle`. The main `aicpu_scheduler` owns the dlopen of the
 preinstall file; the dispatcher is out of the picture once bootstrap returns.
 
 The source is runtime-agnostic. It is built per-arch under

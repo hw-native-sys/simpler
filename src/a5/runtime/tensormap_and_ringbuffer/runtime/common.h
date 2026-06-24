@@ -14,80 +14,26 @@
 #include <stdio.h>
 #include <stdlib.h>
 
-#include <stdexcept>
-#include <string>
+// Assertion macros (always_assert / debug_assert), AssertionError, and the
+// MAYBE_UNINITIALIZED diagnostics live in the shared header so the unified
+// Tensor (src/common/task_interface/tensor.h) can use them without depending
+// on this runtime-specific header. assert_impl / get_stacktrace are defined in
+// orchestration/common.cpp for runtime targets.
+#include "assert_compat.h"
 
-/**
- * Get the current stack trace, including file paths and line numbers.
- * Implemented in common.cpp.
- */
-std::string get_stacktrace(int skip_frames = 1);
-
-/**
- * Assertion failure exception with condition, file, line, and stack trace.
- */
-class AssertionError : public std::runtime_error {
-public:
-    AssertionError(const char *condition, const char *file, int line);
-
-    const char *condition() const { return condition_; }
-    const char *file() const { return file_; }
-    int line() const { return line_; }
-
-private:
-    const char *condition_;
-    const char *file_;
-    int line_;
-};
-
-/**
- * Assertion failure handler.
- * Implemented in common.cpp.
- */
-[[noreturn]] void assert_impl(const char *condition, const char *file, int line);
-
-/**
- * debug_assert macro:
- * checks the condition in debug builds and throws with a stack trace on failure.
- * It is a no-op in release builds (NDEBUG).
- */
-#ifdef NDEBUG
-#define debug_assert(cond) ((void)0)
-#else
-#define debug_assert(cond)                          \
-    do {                                            \
-        if (!(cond)) {                              \
-            assert_impl(#cond, __FILE__, __LINE__); \
-        }                                           \
-    } while (0)
+// Framework-internal TLS bridge. The executor binds the current thread's
+// runtime before invoking the orchestration entry, so orchestration helpers can
+// fetch the current PTO2Runtime without explicit parameter threading. Declared
+// here (rather than in pto_orchestration_api.h) so framework TUs the AICore
+// build also compiles — notably orchestration/common.cpp — see these symbols
+// without pulling in pto_types.h, whose Arg::add_scalar → to_u64 path is
+// __aicore__-only and would break the ccec build.
+#ifdef __cplusplus
+extern "C" {
 #endif
-
-/**
- * always_assert macro:
- * checks the condition in both debug and release builds.
- */
-#define always_assert(cond)                         \
-    do {                                            \
-        if (!(cond)) {                              \
-            assert_impl(#cond, __FILE__, __LINE__); \
-        }                                           \
-    } while (0)
-
-#define PTO_PRAGMA(x) _Pragma(#x)
-
-#if defined(__clang__)
-#define MAYBE_UNINITIALIZED_BEGIN                          \
-    PTO_PRAGMA(clang diagnostic push)                      \
-    PTO_PRAGMA(clang diagnostic ignored "-Wuninitialized") \
-    PTO_PRAGMA(clang diagnostic ignored "-Wsometimes-uninitialized")
-#define MAYBE_UNINITIALIZED_END PTO_PRAGMA(clang diagnostic pop)
-#elif defined(__GNUC__)
-#define MAYBE_UNINITIALIZED_BEGIN                        \
-    PTO_PRAGMA(GCC diagnostic push)                      \
-    PTO_PRAGMA(GCC diagnostic ignored "-Wuninitialized") \
-    PTO_PRAGMA(GCC diagnostic ignored "-Wmaybe-uninitialized")
-#define MAYBE_UNINITIALIZED_END PTO_PRAGMA(GCC diagnostic pop)
-#else
-#define MAYBE_UNINITIALIZED_BEGIN
-#define MAYBE_UNINITIALIZED_END
+struct PTO2Runtime;
+PTO2Runtime *framework_current_runtime(void);
+void framework_bind_runtime(PTO2Runtime *rt);
+#ifdef __cplusplus
+}
 #endif

@@ -86,6 +86,7 @@ public:
     void free_tensor(void *dev_ptr);
     int copy_to_device(void *dev_ptr, const void *host_ptr, std::size_t bytes);
     int copy_from_device(void *host_ptr, const void *dev_ptr, std::size_t bytes);
+    int device_memset(void *dev_ptr, int value, std::size_t bytes);
 
     /**
      * Commit the three per-Worker pooled regions (PTO2 GM heap, PTO2
@@ -347,7 +348,7 @@ public:
      * @param stream       AICPU stream
      * @param k_args       Kernel arguments
      * @param kernel_name  Name of the kernel to launch (e.g.
-     *                     `host::KernelNames::InitName` / `RunName`)
+     *                     `host::KernelNames::RunName`)
      * @param aicpu_num    Number of AICPU instances to launch
      * @return 0 on success, error code on failure
      */

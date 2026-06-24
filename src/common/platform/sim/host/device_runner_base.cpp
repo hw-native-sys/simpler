@@ -196,6 +196,11 @@ int SimDeviceRunnerBase::copy_from_device(void *host_ptr, const void *dev_ptr, s
     return 0;
 }
 
+int SimDeviceRunnerBase::device_memset(void *dev_ptr, int value, size_t bytes) {
+    std::memset(dev_ptr, value, bytes);
+    return 0;
+}
+
 int SimDeviceRunnerBase::prepare_orch_so(Runtime &runtime) {
     const int32_t cid = runtime.get_active_callable_id();
     if (cid < 0) {

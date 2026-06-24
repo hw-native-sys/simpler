@@ -25,6 +25,12 @@ static constexpr int32_t MAX_GATE_THREADS = 16;
 
 static std::atomic<uint16_t> g_cpumask{0};
 
+// Per-thread exec/slot index set by BOTH gates (legacy a2a3 + filter a5):
+// -1 = dropped, otherwise this thread's index among the launched threads.
+// Read via platform_aicpu_affinity_thread_idx(); used as the run-wall buffer
+// slot and (filter gate) the sched/orch role id.
+static thread_local int32_t tl_exec_idx = -1;
+
 /**
  * This function determines which threads to use. 
  * 
@@ -54,7 +60,7 @@ bool platform_aicpu_affinity_gate(int32_t logical_count, int32_t total_launched)
     int how_many_on_top = __builtin_popcount(g_cpumask >> cpu);
     bool will_be_used = how_many_on_top <= logical_count ? true : false;
 
-    LOG_INFO_V0("Thread[%d] how_many_on_top=%d, logical_count=%d, will_be_used=%d", cpu, how_many_on_top, logical_count, will_be_used);
+    LOG_INFO_V9("[TraCR] Thread[%d] how_many_on_top=%d, logical_count=%d, will_be_used=%d", cpu, how_many_on_top, logical_count, will_be_used);
 
     return will_be_used;
 }
@@ -71,11 +77,6 @@ bool platform_aicpu_affinity_gate(int32_t logical_count, int32_t total_launched)
 // State is shared with the legacy gate where harmless (s_reported,
 // s_gate_init, s_gate_ready, s_cleanup) — only one variant runs in any
 // given build (a2a3 uses the legacy gate; a5 onboard uses this one).
-
-// Per-thread output of the filter gate. -1 = dropped (this thread was not
-// in allowed_cpus when the CAS-winner classified). Otherwise = position in
-// allowed_cpus[0..allowed_count-1], used downstream as sched/orch role id.
-static thread_local int32_t tl_filter_exec_idx = -1;
 
 // Per-launch barrier + classification state, parallel to the legacy gate.
 // Two counters: s_filter_claim hands out a unique slot via fetch_add so each
@@ -94,7 +95,7 @@ static int32_t s_filter_thread_cpu[MAX_GATE_THREADS];
 static int32_t s_filter_thread_exec_idx[MAX_GATE_THREADS];
 
 bool platform_aicpu_affinity_gate_filter(const int32_t *allowed_cpus, int32_t allowed_count, int32_t total_launched) {
-    tl_filter_exec_idx = -1;
+    tl_exec_idx = -1;
 
     // Bound-check both inputs against the static slot buffers
     // (s_filter_thread_cpu[MAX_GATE_THREADS] etc.) before any indexing.
@@ -167,10 +168,10 @@ bool platform_aicpu_affinity_gate_filter(const int32_t *allowed_cpus, int32_t al
 
     bool survive;
     if (idx < total_launched && idx < MAX_GATE_THREADS) {
-        tl_filter_exec_idx = s_filter_thread_exec_idx[idx];
-        survive = (tl_filter_exec_idx >= 0);
+        tl_exec_idx = s_filter_thread_exec_idx[idx];
+        survive = (tl_exec_idx >= 0);
     } else {
-        tl_filter_exec_idx = -1;
+        tl_exec_idx = -1;
         survive = false;
     }
 
@@ -184,14 +185,12 @@ bool platform_aicpu_affinity_gate_filter(const int32_t *allowed_cpus, int32_t al
     }
 
     if (survive) {
-        const char *role = (tl_filter_exec_idx == allowed_count - 1) ? "orch" : "sched";
-        LOG_INFO_V0(
-            "AICPU filter gate: thread idx=%d cpu=%d exec_idx=%d ACTIVE(%s)", idx, cpu, tl_filter_exec_idx, role
-        );
+        const char *role = (tl_exec_idx == allowed_count - 1) ? "orch" : "sched";
+        LOG_INFO_V0("AICPU filter gate: thread idx=%d cpu=%d exec_idx=%d ACTIVE(%s)", idx, cpu, tl_exec_idx, role);
     } else {
         LOG_INFO_V0("AICPU filter gate: thread idx=%d cpu=%d DROPPED", idx, cpu);
     }
     return survive;
 }
 
-int32_t platform_aicpu_affinity_thread_idx() { return tl_filter_exec_idx; }
+int32_t platform_aicpu_affinity_thread_idx() { return tl_exec_idx; }

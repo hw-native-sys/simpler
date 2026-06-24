@@ -14,8 +14,8 @@ In tensormap_and_ringbuffer, the orchestration function runs on AICPU and builds
 Your orchestration shared object must export:
 
 ```cpp
-extern "C" PTO2OrchestrationConfig aicpu_orchestration_config(const ChipStorageTaskArgs &orch_args);
-extern "C" void aicpu_orchestration_entry(const ChipStorageTaskArgs &orch_args);
+extern "C" PTO2OrchestrationConfig aicpu_orchestration_config(const L2TaskArgs &orch_args);
+extern "C" void aicpu_orchestration_entry(const L2TaskArgs &orch_args);
 ```
 
 Both symbols are loaded by AICPU via `dlopen` in `src/runtime/tensormap_and_ringbuffer/aicpu/aicpu_executor.cpp`.
@@ -35,18 +35,18 @@ Validate `arg_count` in `aicpu_orchestration_config` and interpret pointers as d
 1. Wrap orchestration in scopes with `PTO2_SCOPE()` to control tensor lifetimes.
 2. Use `make_tensor_external` for existing device buffers and `TensorCreateInfo` + `add_output(...)` for runtime-created intermediates.
 3. Use `add_inout(...)` for existing tensors that a kernel writes.
-4. Build `Arg` with `add_input`, `add_output`, `add_inout` for tensors and `add_scalar` for scalars.
+4. Build `L0TaskArgs` with `add_input`, `add_output`, `add_inout` for tensors and `add_scalar` for scalars.
    > **Constraint**: All tensor parameters (`add_input` / `add_output` / `add_inout`) **must** be added before any scalar parameters (`add_scalar` / `add_scalars`). Violating this order will trigger an assertion failure. This is because the runtime dispatches tensor arguments first in kernel args, followed by scalars, and the layout must match.
 
    ```cpp
    // Correct
-   Arg p;
+   L0TaskArgs p;
    p.add_input(a);
    p.add_inout(b);
    p.add_scalar(val);    // scalars after all tensors
 
    // Wrong — triggers assertion
-   Arg p;
+   L0TaskArgs p;
    p.add_scalar(val);    // scalar added too early
    p.add_input(a);       // assertion: "scalar must add after all tensor added"
    ```

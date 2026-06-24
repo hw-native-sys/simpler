@@ -14,6 +14,9 @@
 #include <cstdlib>
 #include <mutex>
 #include <stdexcept>
+#include <utility>
+
+#include "remote_endpoint.h"
 
 // ---------------------------------------------------------------------------
 // Fork hygiene
@@ -71,6 +74,18 @@ void Worker::add_worker(WorkerType type, void *mailbox) {
     else manager_.add_sub(mailbox);
 }
 
+void Worker::add_remote_l3_socket(
+    int32_t endpoint_id, uint64_t session_id, const std::string &transport_name, const std::string &host, uint16_t port,
+    const std::string &health_host, uint16_t health_port, double timeout_s
+) {
+    if (initialized_) throw std::runtime_error("Worker: add_remote_l3_socket after init");
+    auto transport = std::make_unique<RemoteL3SocketTransport>(host, port, health_host, health_port, timeout_s);
+    transport->expect_hello_ready(session_id, endpoint_id, transport_name);
+    manager_.add_next_level_endpoint(
+        std::make_unique<RemoteL3Endpoint>(endpoint_id, session_id, transport_name, std::move(transport))
+    );
+}
+
 void Worker::init() {
     if (initialized_) throw std::runtime_error("Worker: already initialized");
 
@@ -78,8 +93,8 @@ void Worker::init() {
 
     // Start WorkerManager first — creates WorkerThreads.
     // The on_complete callback routes through the Scheduler's worker_done().
-    manager_.start(&allocator_, [this](TaskSlot slot) {
-        scheduler_.worker_done(slot);
+    manager_.start(&allocator_, [this](WorkerCompletion completion) {
+        scheduler_.worker_done(std::move(completion));
     });
 
     Scheduler::Config cfg;

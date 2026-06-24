@@ -64,15 +64,16 @@ constexpr int PLATFORM_MAX_AICPU_THREADS_JUST_FOR_LAUNCH = 6;
  * Passed to aclrtSetOpExecuteTimeOutV2 so that STARS actively monitors
  * AICore task execution and kills ops that exceed this threshold.
  */
-constexpr uint64_t PLATFORM_OP_EXECUTE_TIMEOUT_US = 1000000;  // 1s
+constexpr uint64_t PLATFORM_OP_EXECUTE_TIMEOUT_US = 3000000;  // 3s
 
 /**
  * Host-side stream synchronization timeout (milliseconds).
  * Passed to aclrtSynchronizeStreamWithTimeout to detect stream sync hangs.
- * Must be longer than PLATFORM_OP_EXECUTE_TIMEOUT_US to allow STARS
- * enough time to kill the timed-out op and propagate the notification.
+ * Must be longer than PLATFORM_OP_EXECUTE_TIMEOUT_US so the host waits for
+ * STARS to reap the timed-out op and surface the error, rather than giving up
+ * first.
  */
-constexpr int PLATFORM_STREAM_SYNC_TIMEOUT_MS = 2000;  // 2s (> op timeout 1s)
+constexpr int PLATFORM_STREAM_SYNC_TIMEOUT_MS = 4000;  // 4s (> op-exec 3s)
 
 // =============================================================================
 // Derived Platform Limits
@@ -208,7 +209,7 @@ constexpr int PLATFORM_DUMP_SLOT_COUNT = 4;
 constexpr uint64_t PLATFORM_DUMP_AVG_TENSOR_BYTES = 65536;
 
 /**
- * Maximum tensor dimensions (matches RUNTIME_MAX_TENSOR_DIMS).
+ * Maximum tensor dimensions (matches MAX_TENSOR_DIMS).
  */
 constexpr int PLATFORM_DUMP_MAX_DIMS = 5;
 

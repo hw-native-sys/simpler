@@ -31,6 +31,7 @@
 
 #include <atomic>
 
+#include "profiling_config.h"
 #include "pto_constants.h"
 #include "pto_runtime_status.h"
 #include "pto2_dispatch_payload.h"
@@ -48,38 +49,6 @@
 #include "spin_hint.h"
 #else
 #define SPIN_WAIT_HINT() ((void)0)
-#endif
-
-// =============================================================================
-// Profiling Configuration
-// =============================================================================
-
-#ifndef PTO2_PROFILING
-#define PTO2_PROFILING 1
-#endif
-
-#ifndef PTO2_ORCH_PROFILING
-#define PTO2_ORCH_PROFILING 0
-#endif
-
-#ifndef PTO2_SCHED_PROFILING
-#define PTO2_SCHED_PROFILING 0
-#endif
-
-#ifndef PTO2_TENSORMAP_PROFILING
-#define PTO2_TENSORMAP_PROFILING 0
-#endif
-
-#if PTO2_ORCH_PROFILING && !PTO2_PROFILING
-#error "PTO2_ORCH_PROFILING requires PTO2_PROFILING=1"
-#endif
-
-#if PTO2_SCHED_PROFILING && !PTO2_PROFILING
-#error "PTO2_SCHED_PROFILING requires PTO2_PROFILING=1"
-#endif
-
-#if PTO2_TENSORMAP_PROFILING && !PTO2_ORCH_PROFILING
-#error "PTO2_TENSORMAP_PROFILING requires PTO2_ORCH_PROFILING=1"
 #endif
 
 #if PTO2_ORCH_PROFILING || PTO2_SCHED_PROFILING
@@ -188,7 +157,7 @@ struct PTO2FaninPool;      // Forward declaration
 struct PTO2FaninSpillEntry {
     PTO2TaskSlotState *slot_state;
 };
-static_assert(sizeof(PTO2FaninSpillEntry) == sizeof(PTO2TaskSlotState *));
+static_assert(sizeof(PTO2FaninSpillEntry) == sizeof(uintptr_t));
 
 /**
  * Dependency list entry (singly-linked list node)
@@ -243,14 +212,14 @@ struct PTO2TaskPayload {
     int32_t fanin_spill_start{0};   // Linear start index in fanin spill pool (0 = no spill)
     PTO2FaninPool *fanin_spill_pool{nullptr};
     PTO2TaskSlotState *fanin_inline_slot_states[PTO2_FANIN_INLINE_CAP];
-    // === Cache lines 9-40 (2048B) — tensors (alignas(64) forces alignment) ===
+    // === Cache lines 9-72 (4096B) — tensors (alignas(64) forces alignment) ===
     Tensor tensors[MAX_TENSOR_ARGS];
-    // === Cache lines 41-44 (256B) — scalars ===
+    // === Cache lines 73-74 (128B) — scalars ===
     uint64_t scalars[MAX_SCALAR_ARGS];
 
     // Layout verification (size checks that don't need offsetof).
     static_assert(sizeof(Tensor) == 128, "Tensor must be 2 cache lines");
-    static_assert(MAX_SCALAR_ARGS * sizeof(uint64_t) == 256, "scalar region must be 256B (4 cache lines)");
+    static_assert(MAX_SCALAR_ARGS * sizeof(uint64_t) == 128, "scalar region must be 128B (2 cache lines)");
 
     /**
      * Initialize payload: copy tensors, store scalars.
@@ -262,17 +231,19 @@ struct PTO2TaskPayload {
      * @param args                Task arguments (tensors + scalars)
      * @param result  Materialized output tensors (from TensorCreateInfo path)
      */
-    void init(const Arg &args, TaskOutputTensors &result, PTO2TaskAllocResult &alloc_result, PTO2OutputLayout &layout) {
+    void init(
+        const L0TaskArgs &args, TaskOutputTensors &result, PTO2TaskAllocResult &alloc_result, PTO2OutputLayout &layout
+    ) {
         tensor_count = args.tensor_count();
         scalar_count = args.scalar_count();
 
         // int32_t out_idx = 0;
         for (int32_t i = 0; i < args.tensor_count(); i++) {
             if (args.tag(i) != TensorArgType::OUTPUT) {
-                tensors[i].copy(*args.tensor(i).ptr);
+                tensors[i].copy(args.tensor(i).ref());
             } else {
-                tensors[i].init_from_create_info(
-                    *args.tensor(i).create_info,
+                init_tensor_from_create_info(
+                    tensors[i], args.tensor(i).create_info(),
                     reinterpret_cast<void *>(reinterpret_cast<char *>(alloc_result.packed_base) + layout.offsets[i]),
                     layout.buffer_sizes[i]
                 );
@@ -280,7 +251,7 @@ struct PTO2TaskPayload {
                 result.materialize_output(tensors[i]);
             }
         }
-        // Round up to cache line boundary. Both arrays are 1024B so no overrun.
+        // Round up to cache line boundary. Both arrays are 128B so no overrun.
         // Eliminates branches; extra bytes within the same CL have zero additional cost.
         memcpy(scalars, args.scalars(), PTO2_ALIGN_UP(args.scalar_count() * sizeof(uint64_t), 64));
     }

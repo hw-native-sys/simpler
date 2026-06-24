@@ -116,6 +116,7 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, in
     // Register encoding: AICPU_IDLE_TASK_ID=idle, task_id=task, AICORE_EXIT_SIGNAL=exit
     uint32_t reg_val = AICPU_IDLE_TASK_ID;
     uint32_t last_reg_val = AICPU_IDLE_TASK_ID;
+    bool exiting = false;
 
     while (true) {
         reg_val = static_cast<uint32_t>(read_reg(RegId::DATA_MAIN_BASE));
@@ -132,6 +133,29 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, in
         }
 
         {
+            // receive_time marks the moment AICPU's full "task is ready to
+            // execute" signal landed on this core. Paired with start_time
+            // (captured after the per-task dcci + ack pair) it lets DFX split
+            // head_OH into the AICPU→AICore-ready propagation (dispatch_ts →
+            // receive_time, hardware + scheduling-bound) and the AICore-local
+            // critical-path prep (receive_time → start_time, software-tunable).
+            // Stored in the record as a 32-bit delta `start_time - receive_time`.
+            //
+            // For the common path (not_ready == 0) the new task_id on
+            // DATA_MAIN_BASE is itself the ready signal, so receive_time is
+            // stamped immediately and local_setup covers dcci + ack.
+            //
+            // For the speculative early-dispatch path (not_ready == 1) the
+            // dcci ran BEFORE the dependency-wait spin, so its cost is hidden
+            // behind the doorbell-wait — not on the critical path between
+            // "task genuinely ready" and "kernel begins". receive_time is
+            // re-stamped after the doorbell arrives, so propagation absorbs
+            // both the original NoC delivery AND any speculation overshoot,
+            // while local_setup stays the pure ack-on-critical-path cost. This
+            // makes local_setup the clean "AICore prep we can't hide" figure
+            // for both paths.
+            uint64_t receive_time = get_sys_cnt_aicore();
+
             uint32_t task_id = reg_val;  // Decode: register holds task_id directly
 
             // Select dual-buffer slot: same bit as AICPU used when writing payload
@@ -139,6 +163,45 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, in
 
             // Invalidate payload buffer (AICPU updates its content each dispatch)
             dcci(exec_payload, ENTIRE_DATA_CACHE);
+
+            // Speculative early-dispatch gate. A not-ready task was staged on
+            // this core before its dependencies resolved; wait until AICPU rings
+            // the doorbell (DATA_MAIN_BASE high 32 == task_id) before executing.
+            // The ACK is deferred until AFTER the gate so the scheduler keeps the
+            // core off-limits (pending_occupied stays set, no ACK->pending_freed)
+            // while the task is gated — preventing a real task from being
+            // dual-issued behind it. The kernel's own input dcci runs inside
+            // execute_task() below — strictly AFTER this gate — so predecessor
+            // outputs are visible. not_ready == 0 (the common path) skips this.
+            if (exec_payload->not_ready) {
+                while (true) {
+                    // Honor teardown: shutdown overwrites the low half with EXIT.
+                    // Check it on the doorbell-match iteration too, so an EXIT that
+                    // races in right after the matching doorbell still wins over
+                    // executing the gated task.
+                    if (read_dmb_high32() == task_id) {
+                        if (static_cast<uint32_t>(read_reg(RegId::DATA_MAIN_BASE)) == AICORE_EXIT_SIGNAL) {
+                            exiting = true;
+                        }
+                        break;
+                    }
+                    if (static_cast<uint32_t>(read_reg(RegId::DATA_MAIN_BASE)) == AICORE_EXIT_SIGNAL) {
+                        exiting = true;
+                        break;
+                    }
+                    SPIN_WAIT_HINT();
+                }
+                if (exiting) {
+                    write_reg(RegId::COND, AICORE_EXITED_VALUE);
+                    break;
+                }
+                // Re-stamp receive_time at the moment the doorbell landed: the
+                // dcci above ran during the speculative-staging window
+                // (overlapped with the dependency wait, off the critical path).
+                // Propagation now absorbs the speculation overshoot; local_setup
+                // = start - receive stays the pure ack-on-critical-path cost.
+                receive_time = get_sys_cnt_aicore();
+            }
 
             write_reg(RegId::COND, MAKE_ACK_VALUE(task_id));
 
@@ -175,16 +238,21 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, in
             //     under SPMD (block_num > num_cores) and MIX cluster spread,
             //     where multiple dispatches of the same task share the same
             //     task_token_raw.
+            last_reg_val = reg_val;
+            write_reg(RegId::COND, MAKE_FIN_VALUE(task_id));
+
+            // Sample end_time AFTER the FIN write so the op-event end marks the
+            // moment the AICPU can first observe completion — any compute-end ->
+            // FIN gap (epilogue / write-back) shows directly on the bar instead
+            // of being inferred. The record write itself stays off the critical
+            // path (it runs after FIN, so it no longer delays completion).
             if (l2_swimlane_enabled) {
                 uint64_t end_time = get_sys_cnt_aicore();
                 uint64_t task_token_raw = exec_payload->local_context.async_ctx.task_token.raw;
                 l2_swimlane_aicore_record_task(
-                    l2_swimlane_head, &l2_swimlane_local, task_token_raw, task_id, start_time, end_time
+                    l2_swimlane_head, &l2_swimlane_local, task_token_raw, task_id, receive_time, start_time, end_time
                 );
             }
-
-            last_reg_val = reg_val;
-            write_reg(RegId::COND, MAKE_FIN_VALUE(task_id));
         }
     }
 

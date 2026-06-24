@@ -359,7 +359,8 @@ int prepare_callable_impl(const ChipCallable *callable, uint64_t (*upload_fn)(co
  */
 int bind_callable_to_runtime_impl(
     Runtime *runtime, const ChipStorageTaskArgs *orch_args, void *host_orch_func_ptr, const ArgDirection *signature,
-    int sig_count
+    int sig_count, uint64_t /*ring_task_window*/, uint64_t /*ring_heap*/, uint64_t /*ring_dep_pool*/,
+    const uint64_t * /*ring_task_windows*/, const uint64_t * /*ring_heaps*/, const uint64_t * /*ring_dep_pools*/
 ) {
     if (runtime == nullptr) {
         LOG_ERROR("Runtime pointer is null");

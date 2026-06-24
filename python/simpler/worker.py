@@ -72,6 +72,7 @@ from typing import Any, Optional
 import cloudpickle
 from _task_interface import (  # pyright: ignore[reportMissingImports]
     MAX_REGISTERED_CALLABLE_IDS,
+    RUNTIME_ENV_RING_COUNT,
     RunTiming,
     WorkerType,
     _mailbox_load_i32,
@@ -127,15 +128,17 @@ _OFF_CALLABLE = 8
 _OFF_CONFIG = 16
 # Packed CallConfig wire layout — must match call_config.h byte for byte:
 # 7 int32 (block_dim, aicpu_thread_num, enable_l2_swimlane, enable_dump_tensor,
-# enable_pmu, enable_dep_gen, enable_scope_stats) + 1024-byte NUL-terminated
-# output_prefix. Log config travels separately via ChipWorker.init(log_level,
-# log_info_v) — not on per-task wire.
-_CFG_FMT = struct.Struct("=iiiiiii1024s")
+# enable_pmu, enable_dep_gen, enable_scope_stats) + uint64 ring sizing
+# overrides (3 scalar fields + 3 x RUNTIME_ENV_RING_COUNT per-ring arrays) + 1024-byte
+# NUL-terminated output_prefix. Log config travels separately via
+# ChipWorker.init(log_level, log_info_v) — not on per-task wire.
+_RUNTIME_ENV_UINT64_FIELD_COUNT = 3 + 3 * RUNTIME_ENV_RING_COUNT
+_CFG_FMT = struct.Struct("=iiiiiii" + ("Q" * _RUNTIME_ENV_UINT64_FIELD_COUNT) + "1024s")
 # Args region starts after CONFIG, rounded up to 8 bytes so the first
-# ContinuousTensor.data (uint64_t at OFF_ARGS+8) is 8-byte aligned, avoiding
+# Tensor.data (uint64_t at OFF_ARGS+8) is 8-byte aligned, avoiding
 # SIGBUS on strict-alignment platforms (aarch64 atomics, some ARM cores).
 _OFF_ARGS = (_OFF_CONFIG + _CFG_FMT.size + 7) & ~7
-assert _OFF_ARGS % 8 == 0, "_OFF_ARGS must be 8-aligned for ContinuousTensor.data"
+assert _OFF_ARGS % 8 == 0, "_OFF_ARGS must be 8-aligned for Tensor.data"
 _OFF_TASK_CALLABLE_HASH = _OFF_ARGS
 _OFF_TASK_ARGS_BLOB = _OFF_TASK_CALLABLE_HASH + CALLABLE_HASH_DIGEST_BYTES
 # MAILBOX_ARGS_CAPACITY mirrors the C++ constexpr in worker_manager.h so the
@@ -567,7 +570,7 @@ def _read_args_from_mailbox(buf) -> TaskArgs:
     to C++ run use the zero-copy `run_prepared_from_blob` path
     instead — see those loops for the matching comment.
 
-    Delegates to the nanobind helper so the ContinuousTensor layout is
+    Delegates to the nanobind helper so the Tensor layout is
     parsed by C++ `read_blob` (single source of truth) instead of being
     reimplemented in Python.  The Python re-implementation that lived
     here previously dropped the `child_memory` byte (offset 33), which
@@ -1014,7 +1017,23 @@ def _chip_process_loop(
 
 def _read_config_from_mailbox(buf: memoryview) -> "CallConfig":
     """Reconstruct a CallConfig from the unified mailbox layout."""
-    block_dim, aicpu_tn, swl, dt, pmu, dep_gen, scope_stats, prefix_bytes = _CFG_FMT.unpack_from(buf, _OFF_CONFIG)
+    (
+        block_dim,
+        aicpu_tn,
+        swl,
+        dt,
+        pmu,
+        dep_gen,
+        scope_stats,
+        ring_task_window,
+        ring_heap,
+        ring_dep_pool,
+        *ring_values,
+        prefix_bytes,
+    ) = _CFG_FMT.unpack_from(buf, _OFF_CONFIG)
+    ring_task_windows = list(ring_values[:RUNTIME_ENV_RING_COUNT])
+    ring_heaps = list(ring_values[RUNTIME_ENV_RING_COUNT : 2 * RUNTIME_ENV_RING_COUNT])
+    ring_dep_pools = list(ring_values[2 * RUNTIME_ENV_RING_COUNT : 3 * RUNTIME_ENV_RING_COUNT])
     cfg = CallConfig()
     cfg.block_dim = block_dim
     cfg.aicpu_thread_num = aicpu_tn
@@ -1023,6 +1042,12 @@ def _read_config_from_mailbox(buf: memoryview) -> "CallConfig":
     cfg.enable_pmu = pmu
     cfg.enable_dep_gen = bool(dep_gen)
     cfg.enable_scope_stats = bool(scope_stats)
+    cfg.runtime_env.ring_task_window = ring_task_window
+    cfg.runtime_env.ring_heap = ring_heap
+    cfg.runtime_env.ring_dep_pool = ring_dep_pool
+    cfg.runtime_env.ring_task_windows = ring_task_windows
+    cfg.runtime_env.ring_heaps = ring_heaps
+    cfg.runtime_env.ring_dep_pools = ring_dep_pools
     # NUL-terminated C string in a 1024-byte field.
     cfg.output_prefix = prefix_bytes.split(b"\x00", 1)[0].decode("utf-8")
     return cfg

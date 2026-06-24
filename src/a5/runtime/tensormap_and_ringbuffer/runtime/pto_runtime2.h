@@ -67,7 +67,7 @@ enum PTO2RuntimeMode {
 typedef struct PTO2Runtime PTO2Runtime;  // forward declare for ops signatures
 
 struct PTO2RuntimeOps {
-    TaskOutputTensors (*submit_task)(PTO2Runtime *rt, const MixedKernels &mixed_kernels, const Arg &args);
+    TaskOutputTensors (*submit_task)(PTO2Runtime *rt, const MixedKernels &mixed_kernels, const L0TaskArgs &args);
     void (*scope_begin)(PTO2Runtime *rt);
     void (*scope_end)(PTO2Runtime *rt);
     void (*orchestration_done)(PTO2Runtime *rt);
@@ -87,8 +87,8 @@ struct PTO2RuntimeOps {
     void (*set_tensor_data)(
         PTO2Runtime *rt, const Tensor &tensor, uint32_t ndims, const uint32_t indices[], uint64_t value
     );
-    TaskOutputTensors (*alloc_tensors)(PTO2Runtime *rt, const Arg &args);
-    TaskOutputTensors (*submit_dummy_task)(PTO2Runtime *rt, const Arg &args);
+    TaskOutputTensors (*alloc_tensors)(PTO2Runtime *rt, const L0TaskArgs &args);
+    TaskOutputTensors (*submit_dummy_task)(PTO2Runtime *rt, const L0TaskArgs &args);
 
     // Stash the call-site captured by PTO2ScopeGuard into the [ScopeStats]
     // collector. Always present to keep ops-table layout stable across
@@ -111,9 +111,9 @@ struct PTO2RuntimeArenaLayout {
     size_t off_mailbox{0};
 
     // Cached parameters (re-used by init_data + wire stages).
-    uint64_t task_window_size{0};
-    uint64_t heap_size{0};
-    int32_t dep_pool_capacity{0};
+    uint64_t task_window_sizes[PTO2_MAX_RING_DEPTH]{};
+    uint64_t heap_sizes[PTO2_MAX_RING_DEPTH]{};
+    int32_t dep_pool_capacities[PTO2_MAX_RING_DEPTH]{};
 
     // Total arena byte size post-commit. Used by host to size the prebuilt
     // image buffer and as the rtMemcpy length.
@@ -173,6 +173,10 @@ struct PTO2Runtime {
 PTO2RuntimeArenaLayout runtime_reserve_layout(
     DeviceArena &arena, uint64_t task_window_size, int32_t dep_pool_capacity = PTO2_DEP_LIST_POOL_SIZE
 );
+PTO2RuntimeArenaLayout runtime_reserve_layout(
+    DeviceArena &arena, const uint64_t task_window_sizes[PTO2_MAX_RING_DEPTH],
+    const uint64_t heap_sizes[PTO2_MAX_RING_DEPTH], const int32_t dep_pool_capacities[PTO2_MAX_RING_DEPTH]
+);
 
 /**
  * Phase 2 — write the data half of the runtime arena: standalone fields,
@@ -192,6 +196,10 @@ PTO2RuntimeArenaLayout runtime_reserve_layout(
 PTO2Runtime *runtime_init_data_from_layout(
     DeviceArena &arena, const PTO2RuntimeArenaLayout &layout, PTO2RuntimeMode mode, void *sm_dev_base, uint64_t sm_size,
     void *gm_heap_dev_base, uint64_t heap_size
+);
+PTO2Runtime *runtime_init_data_from_layout(
+    DeviceArena &arena, const PTO2RuntimeArenaLayout &layout, PTO2RuntimeMode mode, void *sm_dev_base, uint64_t sm_size,
+    void *gm_heap_dev_base, const uint64_t heap_sizes[PTO2_MAX_RING_DEPTH]
 );
 
 /**

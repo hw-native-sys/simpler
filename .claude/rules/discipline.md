@@ -59,3 +59,30 @@ benefit — write a new entry there **and add it to the index in
 unlinked entry is invisible to the next person; the index is the only
 discovery surface. Future-you will re-derive the same conclusion
 otherwise.
+
+## 5. Every CI failure on your PR is yours to triage
+
+A red check on your PR is not "done" until you have read the actual
+failure log and named the real cause. CI health is a shared
+responsibility of every PR and every developer — a failing pipeline is
+everyone's problem, not just the author of the change that happens to
+have caused it.
+
+- **Read the log, don't guess.** Pull the failing job's output
+  (`gh run view --job "$JOB_ID" --log-failed`), find the actual failing test
+  or error line, and state the root cause. The job name and a hunch are
+  not a diagnosis.
+- **"Unrelated to my change" is a conclusion, not a default.** Earn it:
+  show your diff doesn't touch the failing path, and ideally that the
+  same failure reproduces on `main` or a sibling job. Only then call it
+  pre-existing.
+- **Unrelated and flaky still aren't "ignore."** Re-run it; if it
+  persists, flag it to the maintainers, file/append an issue, and link
+  the run. Never leave a red PR with a silent "it's flaky" — that is how
+  a real regression hides behind assumed flakiness.
+- **A PR is not green-and-done while any required check is red,**
+  regardless of whose change caused it.
+
+This is the converse of the `running-onboard.md` anti-pattern (don't read
+"ci passed" as proof a fix worked): equally, don't wave away "ci failed"
+as someone else's problem.

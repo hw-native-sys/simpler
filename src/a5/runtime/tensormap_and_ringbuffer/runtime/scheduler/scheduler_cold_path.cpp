@@ -18,6 +18,7 @@
 #include "aicpu/l2_swimlane_collector_aicpu.h"
 #include "aicpu/platform_regs.h"
 #include "aicpu/pmu_collector_aicpu.h"
+#include "aicpu/tensor_dump_aicpu.h"
 #include "common/memory_barrier.h"
 #include "common/l2_swimlane_profiling.h"
 #include "common/platform_config.h"
@@ -381,6 +382,24 @@ int32_t SchedulerContext::handle_timeout_exit(
     latch_scheduler_error(header, thread_idx, PTO2_ERROR_SCHEDULER_TIMEOUT);
     if (!completed_.exchange(true, std::memory_order_acq_rel)) {
         log_shutdown_stall_snapshot(thread_idx, idle_iterations, last_progress_count);
+#if PTO2_PROFILING
+        // Capture the in-flight kernels' partial output before signalling the
+        // cores to exit, so the dump reflects the live stuck state.
+        if (is_dump_args_enabled()) {
+            dump_running_task_outputs<PTO2_SUBTASK_SLOT_COUNT>(
+                thread_idx, cores_total_num_,
+                [this](int32_t cid) {
+                    return core_exec_states_[cid].running_slot_state;
+                },
+                [](ActiveMask active_mask, int raw_subtask_id) {
+                    return active_mask.subtask_active(static_cast<PTO2SubtaskSlot>(raw_subtask_id));
+                },
+                [this](int32_t func_id) {
+                    return get_function_bin_addr(func_id);
+                }
+            );
+        }
+#endif
         emergency_shutdown(runtime);
     }
 #if PTO2_PROFILING
@@ -863,7 +882,7 @@ int32_t SchedulerContext::init(
             // When orchestrator phases merge into scheduler threads
             // (PTO2_ORCH_TO_SCHED=1), phase records flow through
             // aicpu_thread_num_ pools — matches the same branch in
-            // dump_tensor_init (scheduler_dispatch.cpp).
+            // dump_args_init (scheduler_dispatch.cpp).
             // Sched phase pool count = number of scheduler threads.
             // sched_thread_num_ <= 0 is the "use all AICPU threads as
             // scheduler threads" sentinel (see assign_cores_to_threads'
@@ -963,7 +982,7 @@ void SchedulerContext::deinit() {
     completed_tasks_.store(0, std::memory_order_release);
     total_tasks_ = 0;
     orchestrator_done_ = false;
-    init_done_.store(false, std::memory_order_release);
+    init_claimed_.store(false, std::memory_order_release);
     init_complete_.store(false, std::memory_order_release);
 
     // Reset core transition state

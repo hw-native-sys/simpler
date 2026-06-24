@@ -31,7 +31,19 @@ from pathlib import Path
 from simpler_setup.scene_test import _outputs_dir, _sanitize_for_filename
 from simpler_setup.tools.swimlane_converter import read_perf_data
 
-_REQUIRED_TASK_FIELDS = ("task_id", "func_id", "core_id", "core_type", "start_time_us", "end_time_us")
+_REQUIRED_TASK_FIELDS = (
+    "task_id",
+    "func_id",
+    "core_id",
+    "core_type",
+    "start_time_us",
+    "end_time_us",
+    # receive_time_us / local_setup_us are populated unconditionally by the
+    # AICore-side capture (v3 schema). propagation_us requires AICPU dispatch_ts
+    # and is therefore only present at level≥2 — not in this required-set.
+    "receive_time_us",
+    "local_setup_us",
+)
 
 
 def validate_perf_artifact(case_label: str, *, expected_task_count: int | None = None) -> None:
@@ -68,7 +80,7 @@ def validate_perf_artifact(case_label: str, *, expected_task_count: int | None =
             f"got {len(tasks)} perf records, expected {expected_task_count} under {perf}"
         )
     # Spot-check a single record's required fields — guards against drift in
-    # the swimlane schema that swimlane_converter.py / deps_to_graph.py rely on.
+    # the swimlane schema that swimlane_converter.py / deps_viewer.py rely on.
     first = tasks[0]
     for key in _REQUIRED_TASK_FIELDS:
         assert key in first, f"perf record missing required field '{key}': {first}"
@@ -97,25 +109,28 @@ def validate_perf_artifact(case_label: str, *, expected_task_count: int | None =
     # straight from the raw artifacts — any regression in either the runtime
     # capture path or the parser arithmetic fails here in the same CI step
     # that produced the data.
-    result = subprocess.run(
-        [
-            sys.executable,
-            "-m",
-            "simpler_setup.tools.sched_overhead_analysis",
-            "--l2-swimlane-records-json",
-            str(perf),
-        ],
-        check=True,
-        timeout=120,
-        capture_output=True,
-        text=True,
-    )
-    for header in ("Part 1:", "Part 2:", "Part 3:"):
+    # sched_overhead_analysis now REQUIRES the DAG (deps.json). The l2_swimlane
+    # CI smoke captures it alongside the perf JSON (--enable-dep-gen), so pass it
+    # explicitly. (For accurate user-facing timing, deps must be a SEPARATE
+    # capture — dep_gen perturbs timing — but the count-based differential below
+    # is timing-independent, so the co-run smoke is fine here.)
+    sched_cmd = [
+        sys.executable,
+        "-m",
+        "simpler_setup.tools.sched_overhead_analysis",
+        "--l2-swimlane-records-json",
+        str(perf),
+    ]
+    deps_sibling = Path(perf).parent / "deps.json"
+    if deps_sibling.exists():
+        sched_cmd += ["--deps-json", str(deps_sibling)]
+    result = subprocess.run(sched_cmd, check=True, timeout=120, capture_output=True, text=True)
+    for header in ("Part 1:", "Part 2:", "Part 5:", "Part 6:"):
         assert header in result.stdout, f"sched_overhead missing section header '{header}'\nstdout:\n{result.stdout}"
     # Bad pattern: AICPU didn't capture real cycle counters → tool "succeeds"
-    # but every metric is 0. Match the line that's printed unconditionally
-    # in Part 2 and assert its value is non-zero.
-    m = re.search(r"Avg scheduler loop iteration:\s+([\d.]+)\s+us", result.stdout)
+    # but every metric is 0. Match the loop-iteration line printed unconditionally
+    # in Part 6 and assert its value is non-zero (reported in ns now).
+    m = re.search(r"Avg scheduler loop iteration:\s+([\d.]+)\s+ns", result.stdout)
     assert m, f"sched_overhead stdout missing 'Avg scheduler loop iteration'\nstdout:\n{result.stdout}"
     assert float(m.group(1)) > 0.0, (
         f"sched_overhead reports zero loop iteration (avg_loop_us={m.group(1)}). "

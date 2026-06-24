@@ -216,9 +216,6 @@ worker.run(callable, args, CallConfig(block_dim, aicpu_thread_num))
        │
        ├─→ Copy Runtime to device memory
        │
-       ├─→ LaunchAiCpuKernel (init kernel)
-       │    └─→ Execute on AICPU: Initialize handshake
-       │
        ├─→ LaunchAiCpuKernel (main scheduler kernel)
        │    └─→ Execute on AICPU: Task scheduler loop
        │         ├─→ Find initially ready tasks

@@ -77,6 +77,7 @@ def build_all(
     platforms: Optional[list] = None,
     clone_protocol: str = "ssh",
     sanitizer: str = "none",
+    pto_isa_commit: Optional[str] = None,
 ) -> None:
     """Build all runtime variants for the given platforms.
 
@@ -90,6 +91,9 @@ def build_all(
         sanitizer: Sanitizer preset (asan/ubsan/tsan/none) or raw `-fsanitize`
             token list. Only host-compiled targets honor it; see
             BuildTarget.gen_cmake_args.
+        pto_isa_commit: optional pto-isa commit override for the onboard a2a3
+            host build. None preserves the original behavior and uses the
+            current checkout HEAD.
     """
     # Override default paths to respect CLI args
     RuntimeBuilder._LIB_DIR = lib_dir
@@ -113,6 +117,7 @@ def build_all(
         return
 
     logger.info(f"Building for platforms: {', '.join(platforms)}")
+    pto_isa_root_for_metadata: Optional[str] = None
 
     # a2a3 onboard host_runtime hard-depends on pto-isa headers + CANN-9.0
     # aclnn syms (cf. src/a2a3/platform/onboard/host/CMakeLists.txt
@@ -121,10 +126,16 @@ def build_all(
     # CMakeLists invocation) is the one actually used, instead of relying on
     # the fallback in RuntimeCompiler._init_a2a3. No-ops when PTO_ISA_ROOT
     # is already set. Skipped when only sim platforms are being built.
+    #
+    # pto_isa_commit can override the current checkout HEAD used by the
+    # managed clone. The actual git HEAD used for this build is recorded after
+    # the runtime build completes and later compared with the run-time checkout.
     if "a2a3" in platforms:
         from simpler_setup.pto_isa import ensure_pto_isa_root  # noqa: PLC0415
 
-        os.environ["PTO_ISA_ROOT"] = ensure_pto_isa_root(clone_protocol=clone_protocol, verbose=True)
+        pto_isa_root = ensure_pto_isa_root(commit=pto_isa_commit, clone_protocol=clone_protocol, verbose=True)
+        os.environ["PTO_ISA_ROOT"] = pto_isa_root
+        pto_isa_root_for_metadata = pto_isa_root
 
     # libsimpler_log.so and libcpu_sim_context.so are process-global (one per
     # host toolchain, not per arch/variant) — build them once before iterating
@@ -186,6 +197,11 @@ def build_all(
         # LoadAicpuOp::BootstrapDispatcher (see src/common/host/load_aicpu_op.cpp
         # and src/common/aicpu_dispatcher/aicpu_dispatcher.h for architecture).
 
+    if pto_isa_root_for_metadata is not None:
+        from simpler_setup.pto_isa import write_pto_isa_build_metadata  # noqa: PLC0415
+
+        write_pto_isa_build_metadata(lib_dir, pto_isa_root_for_metadata, requested_commit=pto_isa_commit)
+
 
 def main():
     parser = argparse.ArgumentParser(description="Pre-build runtime binaries for available platforms")
@@ -229,6 +245,14 @@ def main():
             "Default: none. asan/tsan are mutually exclusive (separate builds)."
         ),
     )
+    parser.add_argument(
+        "--pto-isa-commit",
+        default=None,
+        help=(
+            "Override the pto-isa revision before building onboard "
+            "a2a3 host_runtime. Default/latest: use the current checkout HEAD."
+        ),
+    )
     args = parser.parse_args()
 
     logging.basicConfig(
@@ -254,6 +278,7 @@ def main():
         platforms=args.platforms,
         clone_protocol=args.clone_protocol,
         sanitizer=args.sanitizer,
+        pto_isa_commit=args.pto_isa_commit,
     )
 
 

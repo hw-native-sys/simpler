@@ -10,6 +10,29 @@ from grabbing the same device, keeps the `--list` queue accurate, and keeps
 local runs comparable to CI (CI always wraps pytest in `task-submit`, see
 `.github/workflows/ci.yml`).
 
+## Autonomous invocation — detect capability, then run without asking
+
+When a task needs the NPU, do **not** ask the user for permission to run it.
+Detect-then-run:
+
+1. **Detect silicon capability** for the arch the work targets (`a2a3` /
+   `a5`) via the `onboard-arch-precheck` skill:
+
+   ```bash
+   .claude/skills/onboard-arch-precheck/check.sh a2a3   # exit 0 ⇒ this box can run a2a3 onboard
+   ```
+
+   Sim variants (`a2a3sim` / `a5sim`) are silicon-agnostic — always runnable.
+
+2. **Check `task-submit`** is on `PATH` (`command -v task-submit`).
+
+3. **If both hold, invoke directly** through `task-submit` (per the Rule
+   below) — no "shall I run it?" prompt. Run it and report the results.
+
+Only fall back to asking the user when the precheck fails (the box's silicon
+does not match the requested arch) or `task-submit` is absent — i.e. when the
+box genuinely cannot run the work as requested.
+
 ## Rule
 
 **Any hardware (onboard) work on this box — stress repro, perf benchmarks,

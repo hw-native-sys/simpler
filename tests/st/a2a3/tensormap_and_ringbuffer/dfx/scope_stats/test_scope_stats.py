@@ -18,7 +18,7 @@ runtime takes care of the ``set_pending_site`` / ``scope_stats_begin`` /
 ``scope_stats_end`` calls. Schema lives in ``docs/dfx/scope-stats.md`` §3.
 
 Output (``scope_stats.jsonl``): line 1 is run metadata
-(``{"version":5,"fatal":bool,"dropped":uint,"total":uint}``); each subsequent
+(``{"version":6,"fatal":bool,"dropped":uint,"total":uint}``); each subsequent
 line is one scope-boundary record carrying task/heap/dep_pool start-end.
 """
 
@@ -118,7 +118,7 @@ class TestScopeStats(SceneTestCase):
         lines = [ln for ln in path.read_text().splitlines() if ln.strip()]
         assert lines, f"scope_stats.jsonl empty under {matches[-1]}"
         meta = json.loads(lines[0])
-        assert meta.get("version") == 5, f"unexpected schema version: {meta!r}"
+        assert meta.get("version") == 6, f"unexpected schema version: {meta!r}"
         assert meta.get("fatal") is False, f"run latched fatal: {meta!r}"
         assert meta.get("dropped", 0) == 0, f"records dropped on device: {meta!r}"
         assert "dep_pool_max" in meta, f"metadata missing dep_pool_max: {meta!r}"

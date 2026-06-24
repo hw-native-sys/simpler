@@ -326,23 +326,47 @@ int DeviceRunner::run(Runtime &runtime, int block_dim, int launch_aicpu_num) {
         dep_gen_collector_.start(thread_factory);
     }
 
-    LOG_INFO_V0("=== launch_aicpu_kernel %s ===", host::KernelNames::InitName);
-    rc = launch_aicpu_kernel(stream_aicpu_, &kernel_args_.args, host::KernelNames::InitName, 1);
-    if (rc != 0) {
-        LOG_ERROR("launch_aicpu_kernel (init) failed: %d", rc);
-        return rc;
-    }
-
-    // Init kernel populated runtime.workers[i].core_type via the AICore
-    // handshake. Publish the table to the L2 swimlane collector so the
-    // AICORE_TIMING (level=1) host emit path can label lanes ("aic"/"aiv")
-    // without consulting an AICPU record.
+    // workers[i].core_type is written by the AICore kernel during its
+    // AICPU<->AICore handshake (aicore_executor.cpp), launched further below,
+    // so the values read here reflect the most recent prior run's handshake
+    // still resident in device memory (unset on the first run of a freshly-
+    // loaded runtime). Publish the table to the L2 swimlane collector so the
+    // AICORE_TIMING (level=1) host emit path can label lanes ("aic"/"aiv").
     if (enable_l2_swimlane_ && l2_swimlane_collector_.is_initialized()) {
         std::vector<CoreType> core_types(num_aicore);
         for (int i = 0; i < num_aicore; i++) {
             core_types[i] = runtime.workers[i].core_type;
         }
         l2_swimlane_collector_.set_core_types(core_types.data(), num_aicore);
+    }
+
+    // Launch the AICore worker BEFORE the AICPU Run task. This is a first-launch
+    // latency optimization, not a correctness requirement (the handshake is
+    // launch-order-independent). When the AICPU Run task is launched first it
+    // immediately occupies the device (spinning in handshake_all_cores), and the
+    // first AICore launch — which lazily loads the kernel binary onto the device
+    // inside rtKernelLaunchWithHandleV2 — then takes ~1.4 s instead of ~0.4 ms
+    // (measured a5; the exact device-side contention is not pinned, see the
+    // investigation doc). Submitting the AICore first does that load on an idle
+    // device, then the AICPU spins and finds the AICore already up.
+    //
+    // Defense-in-depth for the op-timeout family (#1019): that ~1.4 s slow launch
+    // is what trips the op-execute timeout when it is tight. #1035 widened the
+    // timeout 1 s -> 3 s so the slow launch no longer wedges, but this ordering
+    // removes the slow launch itself, so the wedge cannot return if the timeout
+    // is ever tightened or a slower device pushes the launch past it. See
+    // docs/investigations/2026-06-pa-unroll-207001-optimeout-window.md.
+    LOG_INFO_V0("=== launch_aicore_kernel ===");
+    rc = kernel_args_.init_device_kernel_args(mem_alloc_);
+    if (rc != 0) {
+        LOG_ERROR("init_device_kernel_args failed: %d", rc);
+        return rc;
+    }
+    rc = launch_aicore_kernel(stream_aicore_, kernel_args_.device_k_args_);
+    if (rc != 0) {
+        LOG_ERROR("launch_aicore_kernel failed: %d", rc);
+        recover_device_or_mark_unusable(rc);
+        return rc;
     }
 
     LOG_INFO_V0("=== launch_aicpu_kernel %s ===", host::KernelNames::RunName);
@@ -357,18 +381,11 @@ int DeviceRunner::run(Runtime &runtime, int block_dim, int launch_aicpu_num) {
     rc = launch_aicpu_kernel(stream_aicpu_, &kernel_args_.args, host::KernelNames::RunName, aicpu_launch_n);
     if (rc != 0) {
         LOG_ERROR("launch_aicpu_kernel (main) failed: %d", rc);
-        return rc;
-    }
-
-    LOG_INFO_V0("=== launch_aicore_kernel ===");
-    rc = kernel_args_.init_device_kernel_args(mem_alloc_);
-    if (rc != 0) {
-        LOG_ERROR("init_device_kernel_args failed: %d", rc);
-        return rc;
-    }
-    rc = launch_aicore_kernel(stream_aicore_, kernel_args_.device_k_args_);
-    if (rc != 0) {
-        LOG_ERROR("launch_aicore_kernel failed: %d", rc);
+        // The AICore worker was already launched above and is now spinning in
+        // the handshake waiting for this AICPU Run task. If the Run launch
+        // fails, that AICore is orphaned and will spin to the op-timeout,
+        // poisoning the device — so recover/mark-unusable here (matches the
+        // launch_aicore failure path).
         recover_device_or_mark_unusable(rc);
         return rc;
     }
@@ -381,6 +398,15 @@ int DeviceRunner::run(Runtime &runtime, int block_dim, int launch_aicpu_num) {
         // run, so attempt recovery / mark-unusable here too, not only on the
         // launch-error path above.
         recover_device_or_mark_unusable(rc);
+        // On an AICPU-detected scheduler hang the device flushed its diagnostic
+        // buffers during emergency_shutdown before returning the timeout rc.
+        // Export them here too — otherwise the success-only teardown below is
+        // skipped and the dumped tensors (the stuck task's inputs plus every
+        // completed task's in/out) are streamed to .bin but left without the
+        // JSON manifest, i.e. unusable for triage. reconcile/export are not
+        // idempotent, so this runs only on the error return; the success path
+        // still exports exactly once below.
+        teardown_shared_collectors_after_run();
         return rc;
     }
 

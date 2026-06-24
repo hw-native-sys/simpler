@@ -22,36 +22,35 @@
 
 extern "C" {
 
-__attribute__((visibility("default"))) PTO2OrchestrationConfig
-aicpu_orchestration_config(const ChipStorageTaskArgs &orch_args) {
+__attribute__((visibility("default"))) PTO2OrchestrationConfig aicpu_orchestration_config(const L2TaskArgs &orch_args) {
     (void)orch_args;
     return PTO2OrchestrationConfig{
         .expected_arg_count = 20,
     };
 }
 
-__attribute__((visibility("default"))) void aicpu_orchestration_entry(const ChipStorageTaskArgs &orch_args) {
+__attribute__((visibility("default"))) void aicpu_orchestration_entry(const L2TaskArgs &orch_args) {
     // External tensors
-    Tensor ext_hidden_states = from_tensor_arg(orch_args.tensor(0));
-    Tensor ext_input_rms_weight = from_tensor_arg(orch_args.tensor(1));
-    Tensor ext_wq = from_tensor_arg(orch_args.tensor(2));
-    Tensor ext_wk = from_tensor_arg(orch_args.tensor(3));
-    Tensor ext_wv = from_tensor_arg(orch_args.tensor(4));
-    Tensor ext_q_norm_weight = from_tensor_arg(orch_args.tensor(5));
-    Tensor ext_k_norm_weight = from_tensor_arg(orch_args.tensor(6));
-    Tensor ext_seq_lens = from_tensor_arg(orch_args.tensor(7));
-    Tensor ext_block_table = from_tensor_arg(orch_args.tensor(8));
-    Tensor ext_slot_mapping = from_tensor_arg(orch_args.tensor(9));
-    Tensor ext_rope_cos = from_tensor_arg(orch_args.tensor(10));
-    Tensor ext_rope_sin = from_tensor_arg(orch_args.tensor(11));
-    Tensor ext_k_cache = from_tensor_arg(orch_args.tensor(12));
-    Tensor ext_v_cache = from_tensor_arg(orch_args.tensor(13));
-    Tensor ext_wo = from_tensor_arg(orch_args.tensor(14));
-    Tensor ext_post_rms_weight = from_tensor_arg(orch_args.tensor(15));
-    Tensor ext_w_gate = from_tensor_arg(orch_args.tensor(16));
-    Tensor ext_w_up = from_tensor_arg(orch_args.tensor(17));
-    Tensor ext_w_down = from_tensor_arg(orch_args.tensor(18));
-    Tensor ext_out = from_tensor_arg(orch_args.tensor(19));
+    const Tensor &ext_hidden_states = orch_args.tensor(0).ref();
+    const Tensor &ext_input_rms_weight = orch_args.tensor(1).ref();
+    const Tensor &ext_wq = orch_args.tensor(2).ref();
+    const Tensor &ext_wk = orch_args.tensor(3).ref();
+    const Tensor &ext_wv = orch_args.tensor(4).ref();
+    const Tensor &ext_q_norm_weight = orch_args.tensor(5).ref();
+    const Tensor &ext_k_norm_weight = orch_args.tensor(6).ref();
+    const Tensor &ext_seq_lens = orch_args.tensor(7).ref();
+    const Tensor &ext_block_table = orch_args.tensor(8).ref();
+    const Tensor &ext_slot_mapping = orch_args.tensor(9).ref();
+    const Tensor &ext_rope_cos = orch_args.tensor(10).ref();
+    const Tensor &ext_rope_sin = orch_args.tensor(11).ref();
+    const Tensor &ext_k_cache = orch_args.tensor(12).ref();
+    const Tensor &ext_v_cache = orch_args.tensor(13).ref();
+    const Tensor &ext_wo = orch_args.tensor(14).ref();
+    const Tensor &ext_post_rms_weight = orch_args.tensor(15).ref();
+    const Tensor &ext_w_gate = orch_args.tensor(16).ref();
+    const Tensor &ext_w_up = orch_args.tensor(17).ref();
+    const Tensor &ext_w_down = orch_args.tensor(18).ref();
+    const Tensor &ext_out = orch_args.tensor(19).ref();
 
     PTO2_SCOPE() {
         uint32_t current_hidden_ci_shapes[2] = {16, 5120};
@@ -85,14 +84,14 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
         const Tensor &k_proj_norm = alloc_0.get_ref(6);
         const Tensor &attn_out = alloc_0.get_ref(7);
         const Tensor &all_q_padded = alloc_0.get_ref(8);
-        int64_t user_batch = (int64_t)orch_args.tensor(0).shapes[0];
+        int64_t user_batch = (int64_t)orch_args.tensor(0).ref().shapes[0];
         int64_t batch_padded = (((user_batch + 15) / 16) * 16);
         for (int64_t b0 = 0; b0 < batch_padded; b0 += 16) {
             PTO2_SCOPE() {
                 int64_t cur_valid = std::min<int64_t>((user_batch - b0), 16);
 
                 // Task 0: copy_hidden
-                Arg params_t0;
+                L0TaskArgs params_t0;
                 params_t0.add_output(current_hidden);
                 params_t0.add_input(ext_hidden_states);
                 params_t0.add_scalar(b0);
@@ -110,7 +109,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
                 int64_t cur_valid__ssa_v1 = std::min<int64_t>((user_batch - b0), 16);
 
                 // Task 1: rmsnorm
-                Arg params_t1;
+                L0TaskArgs params_t1;
                 params_t1.add_input(current_hidden);
                 params_t1.add_output(normed_tile);
                 params_t1.add_input(ext_input_rms_weight);
@@ -121,7 +120,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
                 for (int64_t ob_chunk = 0; ob_chunk < 80; ob_chunk += 4) {
                     PTO2_SCOPE() {
                         // Task 2: q_proj
-                        Arg params_t2;
+                        L0TaskArgs params_t2;
                         params_t2.add_output(q_proj);
                         params_t2.add_input(normed_tile__rv_v2);
                         params_t2.add_input(ext_wq);
@@ -134,7 +133,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
                 for (int64_t ob_chunk = 0; ob_chunk < 16; ob_chunk += 4) {
                     PTO2_SCOPE() {
                         // Task 3: kv_proj
-                        Arg params_t3;
+                        L0TaskArgs params_t3;
                         params_t3.add_output(k_proj);
                         params_t3.add_output(v_proj);
                         params_t3.add_input(normed_tile__rv_v2);
@@ -152,7 +151,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
         for (int64_t b0 = 0; b0 < batch_padded; b0 += 16) {
             PTO2_SCOPE() {
                 // Task 4: qk_norm
-                Arg params_t4;
+                L0TaskArgs params_t4;
                 params_t4.add_output(q_proj_norm);
                 params_t4.add_input(q_proj);
                 params_t4.add_input(ext_q_norm_weight);
@@ -167,7 +166,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
         }
 
         // Task 5: q_pad
-        Arg params_t5;
+        L0TaskArgs params_t5;
         params_t5.add_output(all_q_padded);
         rt_submit_aiv_task(5, params_t5);
         const Tensor &all_q_padded__rv_v2 = all_q_padded;
@@ -196,12 +195,12 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
                 const Tensor &all_cur_mi = alloc_2.get_ref(4);
                 const Tensor &all_cur_li = alloc_2.get_ref(5);
                 size_t idx_ctx_len = b;
-                int32_t ctx_len = static_cast<int32_t *>(orch_args.tensor(7).data_as<void>())[idx_ctx_len];
+                int32_t ctx_len = static_cast<int32_t *>(orch_args.tensor(7).ref().data_as<void>())[idx_ctx_len];
                 int64_t pos = (static_cast<int64_t>(ctx_len) - 1);
                 int64_t ctx_blocks = ((static_cast<int64_t>(ctx_len) + 255) / 256);
                 int64_t block_table_base = (b * 2);
                 size_t idx_slot = b;
-                int32_t slot = static_cast<int32_t *>(orch_args.tensor(9).data_as<void>())[idx_slot];
+                int32_t slot = static_cast<int32_t *>(orch_args.tensor(9).ref().data_as<void>())[idx_slot];
                 int64_t slot_block = (static_cast<int64_t>(slot) / 256);
                 int64_t slot_offset = (static_cast<int64_t>(slot) - (slot_block * 256));
                 uint32_t cos_row_shapes[2] = {1, 128};
@@ -225,7 +224,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
                 for (int64_t ki_chunk = 0; ki_chunk < 8; ki_chunk += 8) {
                     PTO2_SCOPE() {
                         // Task 6: rope_kv_cache
-                        Arg params_t6;
+                        L0TaskArgs params_t6;
                         params_t6.add_inout(all_q_padded__rv_v2);
                         params_t6.add_output(ext_k_cache);
                         params_t6.add_output(ext_v_cache);
@@ -252,7 +251,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
                 for (int64_t sb_chunk = 0; sb_chunk < ctx_blocks; sb_chunk += 64) {
                     PTO2_SCOPE() {
                         // Task 7: qk_matmul
-                        Arg params_t7;
+                        L0TaskArgs params_t7;
                         params_t7.add_output(all_raw_scores);
                         params_t7.add_input(all_q_padded__rv_v2);
                         params_t7.add_input(ext_block_table);
@@ -268,7 +267,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
                 for (int64_t sb_chunk = 0; sb_chunk < ctx_blocks; sb_chunk += 64) {
                     PTO2_SCOPE() {
                         // Task 8: softmax
-                        Arg params_t8;
+                        L0TaskArgs params_t8;
                         params_t8.add_output(all_cur_li);
                         params_t8.add_output(all_cur_mi);
                         params_t8.add_output(all_exp_padded);
@@ -285,7 +284,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
                 for (int64_t sb_chunk = 0; sb_chunk < ctx_blocks; sb_chunk += 64) {
                     PTO2_SCOPE() {
                         // Task 9: sv_matmul
-                        Arg params_t9;
+                        L0TaskArgs params_t9;
                         params_t9.add_output(all_oi_tmp);
                         params_t9.add_input(ext_block_table);
                         params_t9.add_input(all_exp_padded);
@@ -299,7 +298,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
                 }
 
                 // Task 10: online_softmax
-                Arg params_t10;
+                L0TaskArgs params_t10;
                 params_t10.add_output(attn_row_padded);
                 params_t10.add_input(all_oi_tmp);
                 params_t10.add_input(all_cur_mi);
@@ -309,7 +308,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
                 const Tensor &attn_row_padded__rv_v2 = attn_row_padded;
 
                 // Task 11: attention_writeback
-                Arg params_t11;
+                L0TaskArgs params_t11;
                 params_t11.add_output(attn_row);
                 params_t11.add_input(attn_row_padded__rv_v2);
                 rt_submit_aiv_task(11, params_t11);
@@ -337,7 +336,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
                         int64_t o0 = (ob * 64);
 
                         // Task 12: out_proj
-                        Arg params_t12;
+                        L0TaskArgs params_t12;
                         params_t12.add_input(attn_out);
                         params_t12.add_input(ext_wo);
                         params_t12.add_inout(ret0__out);
@@ -347,7 +346,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
                         const Tensor &o_acc = ret0__out;
 
                         // Task 13: out_proj_residual
-                        Arg params_t13;
+                        L0TaskArgs params_t13;
                         params_t13.add_input(current_hidden);
                         params_t13.add_input(o_acc);
                         params_t13.add_inout(resid1_tile);
@@ -360,7 +359,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
                 }
 
                 // Task 14: post_rmsnorm
-                Arg params_t14;
+                L0TaskArgs params_t14;
                 params_t14.add_input(resid1_tile);
                 params_t14.add_output(post_norm_tile);
                 params_t14.add_input(ext_post_rms_weight);
@@ -378,7 +377,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
                         int64_t o0__ssa_v1 = (ob * 256);
 
                         // Task 15: gate_proj
-                        Arg params_t15;
+                        L0TaskArgs params_t15;
                         params_t15.add_input(post_norm_tile__rv_v2);
                         params_t15.add_input(ext_w_gate);
                         params_t15.add_inout(ret0__out_1);
@@ -387,7 +386,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
                         const Tensor &gate_acc = ret0__out_1;
 
                         // Task 16: up_proj
-                        Arg params_t16;
+                        L0TaskArgs params_t16;
                         params_t16.add_input(post_norm_tile__rv_v2);
                         params_t16.add_input(ext_w_up);
                         params_t16.add_inout(ret0__out_2);
@@ -396,7 +395,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
                         const Tensor &up_acc = ret0__out_2;
 
                         // Task 17: silu
-                        Arg params_t17;
+                        L0TaskArgs params_t17;
                         params_t17.add_input(gate_acc);
                         params_t17.add_input(up_acc);
                         params_t17.add_inout(mlp_tile);
@@ -414,7 +413,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
                         int64_t d0 = (dob * 128);
 
                         // Task 18: down_proj
-                        Arg params_t18;
+                        L0TaskArgs params_t18;
                         params_t18.add_input(mlp_tile);
                         params_t18.add_input(ext_w_down);
                         params_t18.add_inout(fp32_chunk_gm);
@@ -423,7 +422,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
                         const Tensor &fp32_chunk_gm__ssa_v1 = fp32_chunk_gm;
 
                         // Task 19: down_proj_residual
-                        Arg params_t19;
+                        L0TaskArgs params_t19;
                         params_t19.add_input(fp32_chunk_gm__ssa_v1);
                         params_t19.add_input(resid1_tile);
                         params_t19.add_inout(next_hidden);
@@ -441,7 +440,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
                 int64_t cur_valid__ssa_v3 = std::min<int64_t>((user_batch - b0), 16);
 
                 // Task 20: copy_out
-                Arg params_t20;
+                L0TaskArgs params_t20;
                 params_t20.add_output(ext_out);
                 params_t20.add_input(current_hidden__ssa_v8);
                 params_t20.add_scalar(b0);

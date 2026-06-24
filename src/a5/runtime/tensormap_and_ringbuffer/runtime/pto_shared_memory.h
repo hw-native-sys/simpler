@@ -95,17 +95,23 @@ struct alignas(64) PTO2SharedMemoryRingHeader {
     PTO2TaskPayload *task_payloads;
     PTO2TaskSlotState *slot_states;
 
+    int32_t get_slot_by_task_id(int32_t local_task_id) { return local_task_id & task_window_mask; }
+
     PTO2TaskDescriptor &get_task_by_slot(int32_t slot) { return task_descriptors[slot]; }
 
-    PTO2TaskDescriptor &get_task_by_task_id(int32_t local_id) { return task_descriptors[local_id & task_window_mask]; }
+    PTO2TaskDescriptor &get_task_by_task_id(int32_t local_id) {
+        return task_descriptors[get_slot_by_task_id(local_id)];
+    }
 
     PTO2TaskPayload &get_payload_by_slot(int32_t slot) { return task_payloads[slot]; }
 
-    PTO2TaskPayload &get_payload_by_task_id(int32_t local_id) { return task_payloads[local_id & task_window_mask]; }
+    PTO2TaskPayload &get_payload_by_task_id(int32_t local_id) { return task_payloads[get_slot_by_task_id(local_id)]; }
 
     PTO2TaskSlotState &get_slot_state_by_slot(int32_t slot) { return slot_states[slot]; }
 
-    PTO2TaskSlotState &get_slot_state_by_task_id(int32_t local_id) { return slot_states[local_id & task_window_mask]; }
+    PTO2TaskSlotState &get_slot_state_by_task_id(int32_t local_id) {
+        return slot_states[get_slot_by_task_id(local_id)];
+    }
 };
 
 /**
@@ -181,6 +187,10 @@ struct PTO2SharedMemoryHandle {
     // init_header. Returns false when `sm_size` is too small for the requested
     // `task_window_size`.
     bool init(void *sm_base, uint64_t sm_size, uint64_t task_window_size, uint64_t heap_size);
+    bool init_per_ring(
+        void *sm_base, uint64_t sm_size, const uint64_t task_window_sizes[PTO2_MAX_RING_DEPTH],
+        const uint64_t heap_sizes[PTO2_MAX_RING_DEPTH]
+    );
 
     void destroy();
     void print_layout();

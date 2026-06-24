@@ -34,9 +34,6 @@ Runtime::Runtime() {
     worker_count = 0;
     aicpu_thread_num = 1;
     ready_queue_shards = RUNTIME_DEFAULT_READY_QUEUE_SHARDS;
-    task_window_size = 0;
-    heap_size = 0;
-    dep_pool_size = 0;
     orch_to_sched = false;
 
     // Initialize device orchestration state

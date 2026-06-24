@@ -9,7 +9,8 @@
 # -----------------------------------------------------------------------------------------------------------
 """Paged attention with small ring buffer sizes — stress test for ring rotation/reclamation.
 
-Tests RUNTIME_ENV (PTO2_RING_TASK_WINDOW, PTO2_RING_HEAP, PTO2_RING_DEP_POOL),
+Drives per-case ring sizing through ``config.runtime_env`` (ring_task_window /
+ring_heap / ring_dep_pool) rather than the process-global PTO2_RING_* env, plus
 INOUT tensors, bfloat16, and AIC+AIV mixed execution.
 """
 
@@ -29,11 +30,6 @@ class TestPagedAttentionRingbuffer(SceneTestCase):
 
     RTOL = 1e-3
     ATOL = 1e-3
-    RUNTIME_ENV = {
-        "PTO2_RING_TASK_WINDOW": "64",
-        "PTO2_RING_HEAP": "2621440",
-        "PTO2_RING_DEP_POOL": "256",
-    }
 
     CALLABLE = {
         "orchestration": {
@@ -73,7 +69,17 @@ class TestPagedAttentionRingbuffer(SceneTestCase):
         {
             "name": "ringbuffer_stress",
             "platforms": ["a2a3"],
-            "config": {"aicpu_thread_num": 4, "block_dim": 24},
+            # ring_heap is bytes per ring. Non power-of-2 sizes are accepted,
+            # but 4 MiB keeps the small-ring stress intent compact.
+            "config": {
+                "aicpu_thread_num": 4,
+                "block_dim": 24,
+                "runtime_env": {
+                    "ring_task_window": 64,
+                    "ring_heap": 4 * 1024 * 1024,
+                    "ring_dep_pool": 256,
+                },
+            },
             "params": {
                 "batch": 32,
                 "num_heads": 16,

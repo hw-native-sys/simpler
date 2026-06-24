@@ -61,11 +61,11 @@
 // Device orchestration function signature (loaded via dlopen).
 // The executor binds the current thread's PTO2Runtime into orchestration TLS
 // before calling the user entry.
-typedef void (*DeviceOrchestrationFunc)(const ChipStorageTaskArgs &orch_args);
+typedef void (*DeviceOrchestrationFunc)(const L2TaskArgs &orch_args);
 typedef void (*DeviceOrchestrationBindRuntimeFunc)(PTO2Runtime *rt);
 
 // Config function exported by orchestration .so
-typedef PTO2OrchestrationConfig (*DeviceOrchestrationConfigFunc)(const ChipStorageTaskArgs &orch_args);
+typedef PTO2OrchestrationConfig (*DeviceOrchestrationConfigFunc)(const L2TaskArgs &orch_args);
 
 // From orchestration/common.cpp linked into this DSO — updates g_current_runtime here (distinct from
 // framework_bind_runtime in the dlopen'd libdevice_orch_*.so).
@@ -132,9 +132,9 @@ struct AicpuExecutor {
     // Default-constructed: libc-backed backend, no ctx.
     DeviceArena runtime_arena_;
 
-    // Cached orch args pointer set by the orchestration thread before scheduler
-    // init; consumed by the (*p_func)(*orch_args_cached_) invocation below.
-    const ChipStorageTaskArgs *orch_args_cached_{nullptr};
+    // Entry-arg L2TaskArgs built (via create_from_chip_args) from get_orch_args()
+    // before scheduler init; consumed by the (*p_func)(orch_args_cached_) below.
+    L2TaskArgs orch_args_cached_;
 
     // Per-callable_id table. Single orch thread today, so first-write/read
     // race is not possible; if multiple orch threads are ever introduced,
@@ -398,9 +398,13 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
                 }
             }
 
+            // Build the entry-arg once per run; both the config call below and
+            // the orchestration entry (consumed at orch_args_cached_) use it.
+            orch_args_cached_.create_from_chip_args(runtime->get_orch_args());
+
             // Validate arg count on every run (reload or cache hit).
             if (*p_config_func != nullptr) {
-                PTO2OrchestrationConfig cfg = (*p_config_func)(runtime->get_orch_args());
+                PTO2OrchestrationConfig cfg = (*p_config_func)(orch_args_cached_);
                 LOG_INFO_V0("Thread %d: Config: expected_args=%d", thread_idx, cfg.expected_arg_count);
                 if (cfg.expected_arg_count > 0) {
                     const ChipStorageTaskArgs &args_validate = runtime->get_orch_args();
@@ -439,10 +443,10 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
             int32_t arg_count = args.tensor_count() + args.scalar_count();
             LOG_INFO_V0("Thread %d: sm_ptr=%p, arg_count=%d", thread_idx, runtime->get_gm_sm_ptr(), arg_count);
             for (int32_t i = 0; i < args.tensor_count() && i < 20; i++) {
-                const ContinuousTensor &t = args.tensor(i);
+                const Tensor &t = args.tensor(i);
                 LOG_INFO_V0(
                     "Thread %d: orch_args[%d] = TENSOR(data=0x%lx, ndims=%u, dtype=%u)", thread_idx, i,
-                    static_cast<uint64_t>(t.data), t.ndims, static_cast<unsigned>(t.dtype)
+                    static_cast<uint64_t>(t.buffer.addr), t.ndims, static_cast<unsigned>(t.dtype)
                 );
             }
             for (int32_t i = 0; i < args.scalar_count() && (args.tensor_count() + i) < 20; i++) {
@@ -452,32 +456,7 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
                 );
             }
 
-            uint64_t task_window_size = PTO2_TASK_WINDOW_SIZE;
-            uint64_t heap_size = PTO2_HEAP_SIZE;
-
-            if (runtime->task_window_size > 0) {
-                task_window_size = runtime->task_window_size;
-            }
-            if (runtime->heap_size > 0) {
-                heap_size = runtime->heap_size;
-            }
-            int32_t dep_pool_capacity = PTO2_DEP_LIST_POOL_SIZE;
-            if (runtime->dep_pool_size > 0) {
-                dep_pool_capacity = static_cast<int32_t>(runtime->dep_pool_size);
-            }
-            LOG_INFO_V0(
-                "Thread %d: Ring sizes: task_window=%lu, heap=%lu, dep_pool=%d", thread_idx,
-                static_cast<uint64_t>(task_window_size), static_cast<uint64_t>(heap_size), dep_pool_capacity
-            );
-
-            // gm_heap pointer / dep_pool_capacity are encoded into the prebuilt
-            // runtime arena image at host build time, so we no longer fetch
-            // them here. They remain on the host Runtime instance and on the
-            // PTO2Runtime header for diagnostic purposes only.
-            (void)dep_pool_capacity;
-
             void *sm_ptr = runtime->get_gm_sm_ptr();
-            uint64_t sm_size = PTO2SharedMemoryHandle::calculate_size(task_window_size);
 
             // Prebuilt-arena fast path. Host has pre-populated the entire
             // runtime arena (PTO2Runtime + orchestrator/scheduler/tensor_map
@@ -499,6 +478,14 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
             // Wire every arena-internal pointer field (host wrote host-mirror
             // addresses; we overwrite them with device addresses).
             runtime_wire_arena_pointers(runtime_arena_, rt->prebuilt_layout, rt);
+            uint64_t sm_size = PTO2SharedMemoryHandle::calculate_size_per_ring(rt->prebuilt_layout.task_window_sizes);
+            for (int r = 0; r < PTO2_MAX_RING_DEPTH; ++r) {
+                LOG_INFO_V0(
+                    "Thread %d: Ring %d sizes: task_window=%" PRIu64 " heap=%" PRIu64 " dep_pool=%d", thread_idx, r,
+                    rt->prebuilt_layout.task_window_sizes[r], rt->prebuilt_layout.heap_sizes[r],
+                    rt->prebuilt_layout.dep_pool_capacities[r]
+                );
+            }
 
             // Reset SM state. setup_pointers + init_header_per_ring restore
             // ring flow-control counters, layout metadata, error flags, and
@@ -506,8 +493,11 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
             // fanin_count/active_mask zero — previously done inside
             // RingSchedState::init).
             memset(rt->sm_handle, 0, sizeof(*rt->sm_handle));
-            if (!rt->sm_handle->init(sm_ptr, sm_size, task_window_size, heap_size)) {
-                LOG_ERROR("Thread %d: sm_handle->init failed", thread_idx);
+            if (!rt->sm_handle->init_per_ring(
+                    sm_ptr, sm_size, rt->prebuilt_layout.task_window_sizes, rt->prebuilt_layout.heap_sizes
+                )) {
+                LOG_ERROR("Thread %d: sm_handle->init_per_ring failed", thread_idx);
+                rt = nullptr;
                 runtime_init_ready_.store(true, std::memory_order_release);
                 return -1;
             }
@@ -527,7 +517,7 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
                 for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
                     auto &alloc = orch.rings[r].task_allocator;
                     scope_stats_set_ring_capacity(
-                        r, alloc.window_size(), alloc.heap_capacity(), rt->prebuilt_layout.dep_pool_capacity
+                        r, alloc.window_size(), alloc.heap_capacity(), rt->prebuilt_layout.dep_pool_capacities[r]
                     );
                 }
                 scope_stats_set_tensormap_capacity(orch.tensor_map.pool_capacity());
@@ -536,8 +526,6 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
 
             // With multi-ring, slot_states are per-ring inside the scheduler.
             runtime->set_slot_states_ptr(nullptr);
-
-            orch_args_cached_ = &args;
 
             // Wire scheduler context to the newly created PTO2Runtime before
             // releasing scheduler threads from runtime_init_ready_.
@@ -578,7 +566,7 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
                 (*p_bind)(rt);
             }
             rt_scope_begin(rt);
-            (*p_func)(*orch_args_cached_);
+            (*p_func)(orch_args_cached_);
             rt_scope_end(rt);
 
             // Flush the (potentially partially-filled) DepGenBuffer so the host
@@ -772,7 +760,7 @@ void AicpuExecutor::deinit(Runtime *runtime) {
     sched_thread_num_ = 0;
     orch_to_sched_ = false;
 
-    orch_args_cached_ = nullptr;
+    orch_args_cached_.reset();
     // orch_so_table_ entries are intentionally preserved across deinit: the
     // next run reuses cached handles when register_new_callable_id() returns
     // false. The destructor releases them at process teardown.

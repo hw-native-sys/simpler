@@ -8,6 +8,11 @@ PTO Runtime2 uses a hierarchical profiling system with compile-time macros to co
 
 ## Profiling Macro Hierarchy
 
+Defaults and dependency validation are centralized in
+`src/common/task_interface/profiling_config.h`. Runtime headers include that
+file before using the macros, so both a2a3 and a5 share the same default
+values and compile-time checks.
+
 ```text
 PTO2_PROFILING (base level, default=1)
 ├── PTO2_ORCH_PROFILING (orchestrator, default=0, requires PTO2_PROFILING=1)
@@ -43,7 +48,7 @@ Each sub-level macro requires `PTO2_PROFILING=1`:
 
 - Debug/diagnostic logs (always present)
 - Progress tracking (`PTO2 progress: completed=...`)
-- Stall detection and dump (triggered only after `MAX_IDLE_ITERATIONS` idle loops)
+- Stall detection and dump (triggered after the `SCHEDULER_TIMEOUT_MS` wall-clock no-progress budget)
 - Deadlock/livelock detection (`diagnose_stuck_state`, called on stall)
 
 **What's NOT compiled:**
@@ -385,13 +390,23 @@ PTO2_TENSORMAP_PROFILING=1
 
 ### At compile time
 
+Pass compile definitions through the build command or CI `CXXFLAGS`.
+This overrides the defaults in `profiling_config.h` without changing source.
+
 ```bash
-# In CMakeLists.txt or build command
-add_definitions(-DPTO2_PROFILING=1)
-add_definitions(-DPTO2_ORCH_PROFILING=1)
+# Example: disable all profiling code
+CXXFLAGS="-DPTO2_PROFILING=0" pip install --no-build-isolation -e .
+
+# Example: enable orchestrator and tensormap profiling
+CXXFLAGS="-DPTO2_ORCH_PROFILING=1 -DPTO2_TENSORMAP_PROFILING=1" \
+    pip install --no-build-isolation -e .
 ```
 
 ### In source code (before including headers)
+
+Source-level overrides are only for local experiments. They must appear before
+any header includes `profiling_config.h`; do not add duplicated fallback
+definitions to runtime headers.
 
 ```cpp
 #define PTO2_PROFILING 1
@@ -435,7 +450,7 @@ add_definitions(-DPTO2_ORCH_PROFILING=1)
 
 ### Code Locations
 
-- Macro definitions: `src/a2a3/runtime/tensormap_and_ringbuffer/runtime/pto_runtime2_types.h`
+- Macro defaults and validation: `src/common/task_interface/profiling_config.h`
 - Scheduler profiling: `src/a2a3/runtime/tensormap_and_ringbuffer/runtime/scheduler/scheduler_dispatch.cpp` and `scheduler_cold_path.cpp`
 - Orchestrator profiling: `src/a2a3/runtime/tensormap_and_ringbuffer/aicpu/aicpu_executor.cpp`
 - TensorMap profiling: `src/a2a3/runtime/tensormap_and_ringbuffer/runtime/pto_tensormap.h`

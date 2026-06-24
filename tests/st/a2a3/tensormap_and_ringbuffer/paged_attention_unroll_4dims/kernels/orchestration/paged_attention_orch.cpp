@@ -42,27 +42,26 @@ extern "C" {
  * Orchestration config — the executor reads these values to set up
  * shared memory and runtime before calling aicpu_orchestration_entry.
  */
-__attribute__((visibility("default"))) PTO2OrchestrationConfig
-aicpu_orchestration_config(const ChipStorageTaskArgs &orch_args) {
+__attribute__((visibility("default"))) PTO2OrchestrationConfig aicpu_orchestration_config(const L2TaskArgs &orch_args) {
     (void)orch_args;
     return PTO2OrchestrationConfig{
         .expected_arg_count = 7,
     };
 }
 
-__attribute__((visibility("default"))) void aicpu_orchestration_entry(const ChipStorageTaskArgs &orch_args) {
+__attribute__((visibility("default"))) void aicpu_orchestration_entry(const L2TaskArgs &orch_args) {
     // Read dimensions from tensor metadata
     // query: shape=[batch, seq_len, num_heads, head_dim]
-    uint64_t batch = orch_args.tensor(0).shapes[0];
-    uint64_t num_heads = orch_args.tensor(0).shapes[2];
-    uint64_t head_dim = orch_args.tensor(0).shapes[3];
-    DataType data_type = orch_args.tensor(0).dtype;
+    uint64_t batch = orch_args.tensor(0).ref().shapes[0];
+    uint64_t num_heads = orch_args.tensor(0).ref().shapes[2];
+    uint64_t head_dim = orch_args.tensor(0).ref().shapes[3];
+    DataType data_type = orch_args.tensor(0).ref().dtype;
 
     // key_cache: shape=[total_blocks, block_size, kv_head_num, head_dim]
-    uint64_t block_size = orch_args.tensor(1).shapes[1];
+    uint64_t block_size = orch_args.tensor(1).ref().shapes[1];
 
     // block_table: shape=[batch, max_num_blocks_per_req]
-    uint64_t block_num = orch_args.tensor(3).shapes[1];
+    uint64_t block_num = orch_args.tensor(3).ref().shapes[1];
 
     // scale from scalar arg
     uint64_t scale_value = orch_args.scalar(0);
@@ -70,13 +69,13 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
     uint64_t q_loop = (num_heads + q_tile - 1) / q_tile;
 
     // External 4D tensors inherit shape/dtype from TaskArg (golden provides 4D).
-    Tensor query = from_tensor_arg(orch_args.tensor(0));
-    Tensor key_cache = from_tensor_arg(orch_args.tensor(1));
-    Tensor value_cache = from_tensor_arg(orch_args.tensor(2));
-    Tensor block_table = from_tensor_arg(orch_args.tensor(3));
-    Tensor out = from_tensor_arg(orch_args.tensor(5));
+    const Tensor &query = orch_args.tensor(0).ref();
+    const Tensor &key_cache = orch_args.tensor(1).ref();
+    const Tensor &value_cache = orch_args.tensor(2).ref();
+    const Tensor &block_table = orch_args.tensor(3).ref();
+    const Tensor &out = orch_args.tensor(5).ref();
 
-    int *host_context_lens = orch_args.tensor(4).data_as<int>();
+    int *host_context_lens = orch_args.tensor(4).ref().data_as<int>();
 
     // Loop-invariant shape descriptors: 4D data tiles (1, 1, q_tile, head_dim),
     // 3D scalar vectors (1, 1, q_tile).
@@ -112,7 +111,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
 
                 // Reusable Arg objects — reset() before each use avoids
                 // repeated stack-frame construction in the inner loop.
-                Arg params_qk, params_sf, params_pv, params_up;
+                L0TaskArgs params_qk, params_sf, params_pv, params_up;
 
                 for (uint64_t bn = 0; bn < bn_this_batch; bn += N_UNROLL) {
                     uint64_t n_blocks = std::min((uint64_t)N_UNROLL, bn_this_batch - bn);

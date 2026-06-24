@@ -40,7 +40,7 @@
 #include "../task_interface/call_config.h"
 #include "../task_interface/data_type.h"
 #include "../task_interface/task_args.h"
-#include "../task_interface/tensor_arg.h"
+#include "../task_interface/tensor.h"
 #include "ring.h"
 #include "scope.h"
 #include "tensormap.h"
@@ -77,13 +77,13 @@ public:
     );
 
     // Allocate an intermediate buffer from the Worker's HeapRing (MAP_SHARED,
-    // visible to forked child workers). Returns a ContinuousTensor whose
-    // `.data` points into the ring.
+    // visible to forked child workers). Returns a contiguous Tensor whose
+    // `.buffer.addr` points into the ring.
     //
     // Lifetime: aligned with a synthetic task slot. The buffer is reclaimed
     // (FIFO, via last_alive) once every downstream consumer tagging the
     // pointer has reached CONSUMED and scope_end has released the scope ref.
-    ContinuousTensor alloc(const std::vector<uint32_t> &shape, DataType dtype);
+    Tensor alloc(const std::vector<uint32_t> &shape, DataType dtype);
 
     // Memory management on a specific next-level worker. Thread-safe:
     // can be called from the orch thread while the target worker is
@@ -99,14 +99,16 @@ public:
     // null data are auto-allocated from the HeapRing.
     // `worker`: logical worker id for affinity (-1 = unconstrained).
     SubmitResult submit_next_level(
-        const CallableIdentity &callable, const TaskArgs &args, const CallConfig &config, int8_t worker = -1
+        const CallableIdentity &callable, const TaskArgs &args, const CallConfig &config, int8_t worker = -1,
+        const std::vector<int32_t> &eligible_endpoint_ids = {}, const RemoteTaskArgsSidecar &remote_sidecar = {}
     );
 
     // Submit a group of NEXT_LEVEL tasks: N args -> N workers, 1 DAG node.
     // `workers`: per-args affinity (empty = all unconstrained).
     SubmitResult submit_next_level_group(
         const CallableIdentity &callable, const std::vector<TaskArgs> &args_list, const CallConfig &config,
-        const std::vector<int8_t> &workers = {}
+        const std::vector<int8_t> &workers = {}, const std::vector<std::vector<int32_t>> &eligible_endpoint_ids = {},
+        const std::vector<RemoteTaskArgsSidecar> &remote_sidecars = {}
     );
 
     // Submit a SUB task by registered callable identity.
@@ -150,7 +152,7 @@ public:
     // Called by Scheduler (via Worker) when a task becomes CONSUMED:
     // erases TensorMap entries, releases the allocator slot (and implicitly
     // the slot's heap slab via last_alive).
-    // Returns true iff this call performed the COMPLETED -> CONSUMED transition.
+    // Returns true iff this call performed the COMPLETED/FAILED -> CONSUMED transition.
     // Idempotent: concurrent callers (release_ref vs try_consume) race on a
     // CAS — only the winner returns true and runs cleanup; losers return false.
     bool on_consumed(TaskSlot slot);
@@ -190,18 +192,22 @@ private:
     // can patch `tensor.data` on OUTPUT tensors flagged for auto-allocation.
     SubmitResult submit_impl(
         WorkerType worker_type, const CallableIdentity &callable, const CallConfig &config,
-        std::vector<TaskArgs> args_list, std::vector<int8_t> affinities = {}
+        std::vector<TaskArgs> args_list, std::vector<int8_t> affinities = {},
+        std::vector<std::vector<int32_t>> eligible_endpoint_ids = {},
+        std::vector<RemoteTaskArgsSidecar> remote_sidecars = {}
     );
 
     // Size, in aligned bytes, an OUTPUT tensor should occupy in the HeapRing.
-    static uint64_t output_alloc_bytes(const ContinuousTensor &t);
+    static uint64_t output_alloc_bytes(const Tensor &t);
 
     // Rewrite any OUTPUT tensors with a null data pointer to point into a
     // freshly-allocated HeapRing slab. Returns the total aligned byte span
     // consumed, and populates `slot` / `heap_ptr` / `heap_end_offset` via the
     // output params (reused for book-keeping on the slot state). Throws on
     // back-pressure timeout.
-    AllocResult reserve_outputs_and_slot(std::vector<TaskArgs> &args_list);
+    AllocResult reserve_outputs_and_slot(
+        std::vector<TaskArgs> &args_list, const std::vector<RemoteTaskArgsSidecar> &remote_sidecars
+    );
 
     // Walk the tags of each TaskArgs in `args_list`, accumulating producer
     // slots (for INPUT/INOUT tags) and registering outputs in the tensormap
@@ -209,10 +215,20 @@ private:
     // `affinities` maps args_list[i] → worker id for TensorKey construction.
     void infer_deps(
         TaskSlot slot, const std::vector<TaskArgs> &args_list, const std::vector<int8_t> &affinities,
-        std::vector<TaskSlot> &producers, std::vector<TensorKey> &output_keys
+        const std::vector<RemoteTaskArgsSidecar> &remote_sidecars, std::vector<TaskSlot> &producers,
+        std::vector<TensorKey> &output_keys
     );
+    void validate_endpoint_eligibility(
+        WorkerType worker_type, size_t args_count, const std::vector<int8_t> &affinities,
+        const std::vector<std::vector<int32_t>> &eligible_endpoint_ids
+    ) const;
+    void validate_remote_sidecars(
+        const std::vector<TaskArgs> &args_list, const std::vector<RemoteTaskArgsSidecar> &remote_sidecars,
+        const std::vector<std::vector<int32_t>> &eligible_endpoint_ids
+    ) const;
 
     // Release one fanout reference on 'slot'.
     // If all references are released → transition to CONSUMED.
     void release_ref(TaskSlot slot);
+    void try_consume(TaskSlot slot);
 };

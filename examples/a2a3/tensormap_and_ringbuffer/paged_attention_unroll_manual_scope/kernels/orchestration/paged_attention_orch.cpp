@@ -65,15 +65,14 @@ extern "C" {
  * Orchestration config — the executor reads these values to set up
  * shared memory and runtime before calling aicpu_orchestration_entry.
  */
-__attribute__((visibility("default"))) PTO2OrchestrationConfig
-aicpu_orchestration_config(const ChipStorageTaskArgs &orch_args) {
+__attribute__((visibility("default"))) PTO2OrchestrationConfig aicpu_orchestration_config(const L2TaskArgs &orch_args) {
     (void)orch_args;
     return PTO2OrchestrationConfig{
         .expected_arg_count = 7,
     };
 }
 
-__attribute__((visibility("default"))) void aicpu_orchestration_entry(const ChipStorageTaskArgs &orch_args) {
+__attribute__((visibility("default"))) void aicpu_orchestration_entry(const L2TaskArgs &orch_args) {
 #ifdef ENABLE_PROFILING
     uint64_t prof_param_extract = 0;
     uint64_t prof_ext_tensor = 0;
@@ -91,16 +90,16 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
 
     // Read dimensions from tensor metadata
     // query: shape=[batch, num_heads, head_dim]
-    uint64_t batch = orch_args.tensor(0).shapes[0];
-    uint64_t num_heads = orch_args.tensor(0).shapes[1];
-    uint64_t head_dim = orch_args.tensor(0).shapes[2];
-    DataType data_type = orch_args.tensor(0).dtype;
+    uint64_t batch = orch_args.tensor(0).ref().shapes[0];
+    uint64_t num_heads = orch_args.tensor(0).ref().shapes[1];
+    uint64_t head_dim = orch_args.tensor(0).ref().shapes[2];
+    DataType data_type = orch_args.tensor(0).ref().dtype;
 
     // key_cache: shape=[total_blocks, block_size, kv_head_num, head_dim]
-    uint64_t block_size = orch_args.tensor(1).shapes[1];
+    uint64_t block_size = orch_args.tensor(1).ref().shapes[1];
 
     // block_table: shape=[batch, max_num_blocks_per_req]
-    uint64_t block_num = orch_args.tensor(3).shapes[1];
+    uint64_t block_num = orch_args.tensor(3).ref().shapes[1];
 
     // scale from scalar arg
     uint64_t scale_value = orch_args.scalar(0);
@@ -110,12 +109,12 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
     CYCLE_COUNT_LAP(prof_param_extract);
 
     // Reshape tensors for kernel consumption (2D flattened)
-    void *query_ptr = orch_args.tensor(0).data_as<void>();
-    void *kc_ptr = orch_args.tensor(1).data_as<void>();
-    void *vc_ptr = orch_args.tensor(2).data_as<void>();
-    void *out_ptr = orch_args.tensor(5).data_as<void>();
+    void *query_ptr = orch_args.tensor(0).ref().data_as<void>();
+    void *kc_ptr = orch_args.tensor(1).ref().data_as<void>();
+    void *vc_ptr = orch_args.tensor(2).ref().data_as<void>();
+    void *out_ptr = orch_args.tensor(5).ref().data_as<void>();
 
-    uint64_t total_blocks_count = orch_args.tensor(1).shapes[0];
+    uint64_t total_blocks_count = orch_args.tensor(1).ref().shapes[0];
 
     uint32_t query_shapes[2] = {static_cast<uint32_t>(batch * num_heads), static_cast<uint32_t>(head_dim)};
     uint32_t key_cache_shapes[2] = {
@@ -132,10 +131,10 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
 
     uint32_t bt_shapes[2] = {static_cast<uint32_t>(batch), static_cast<uint32_t>(block_num)};
     Tensor block_table =
-        make_tensor_external(orch_args.tensor(3).data_as<void>(), bt_shapes, 2, DataType::INT32, false);
+        make_tensor_external(orch_args.tensor(3).ref().data_as<void>(), bt_shapes, 2, DataType::INT32, false);
     uint32_t cl_shapes[1] = {static_cast<uint32_t>(batch)};
     Tensor context_lens =
-        make_tensor_external(orch_args.tensor(4).data_as<void>(), cl_shapes, 1, DataType::INT32, false);
+        make_tensor_external(orch_args.tensor(4).ref().data_as<void>(), cl_shapes, 1, DataType::INT32, false);
 
 #ifdef ENABLE_PROFILING
     CYCLE_COUNT_LAP(prof_ext_tensor);
@@ -184,7 +183,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
 
                 // Reusable Arg objects — reset() before each use avoids
                 // repeated stack-frame construction in the inner loop.
-                Arg params_qk, params_sf, params_pv, params_up;
+                L0TaskArgs params_qk, params_sf, params_pv, params_up;
 
                 for (uint64_t bn = 0; bn < bn_this_batch; bn += N_UNROLL) {
                     uint64_t n_blocks = std::min(static_cast<uint64_t>(N_UNROLL), bn_this_batch - bn);
