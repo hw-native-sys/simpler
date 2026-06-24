@@ -248,42 +248,58 @@ inline std::atomic<int32_t> *ring_last_task_alive_addr(void *sm_dev_base, int ri
     );
 }
 
-// Walk the per-ring SM layout (same arithmetic as setup_pointers_per_ring)
-// to compute ring `ring_id`'s task_descriptors device address. Accepts a
-// per-ring window-size array so the helper's signature mirrors
-// `PTO2SharedMemoryHandle::setup_pointers_per_ring` and cannot silently
-// disagree with the SM layout when (hypothetically) ring sizes diverge.
+// Byte offsets (from the SM base) of one ring's three segments. The per-ring
+// layout is: header, then for each ring descriptors -> payloads -> slot_states,
+// every segment PTO2_ALIGN_UP-padded.
+struct PTO2RingSegmentOffsets {
+    uint64_t descriptors;
+    uint64_t payloads;
+    uint64_t slot_states;
+    uint64_t end;  // offset just past this ring's slot_states (next ring's start; total SM size for the last ring)
+};
+
+// Single source of truth for the per-ring SM layout. Returns offsets (not
+// pointers), so it serves BOTH the host-side pointer setup
+// (`setup_pointers_per_ring`, which adds `sm_base`) and the device-address
+// helpers below (which add `sm_dev_base`). Adding or reordering a per-ring
+// segment is a one-line edit here; every consumer follows automatically, so the
+// layout walk can never silently disagree across call sites.
+inline PTO2RingSegmentOffsets
+ring_segment_offsets(const uint64_t task_window_sizes[PTO2_MAX_RING_DEPTH], int ring_id) noexcept {
+    assert(ring_id >= 0 && ring_id < PTO2_MAX_RING_DEPTH && "pto2_sm_layout: ring_id out of range");
+    uint64_t off = PTO2_ALIGN_UP(sizeof(PTO2SharedMemoryHeader), PTO2_ALIGN_SIZE);
+    for (int r = 0; r < ring_id; r++) {
+        off += PTO2_ALIGN_UP(task_window_sizes[r] * sizeof(PTO2TaskDescriptor), PTO2_ALIGN_SIZE);
+        off += PTO2_ALIGN_UP(task_window_sizes[r] * sizeof(PTO2TaskPayload), PTO2_ALIGN_SIZE);
+        off += PTO2_ALIGN_UP(task_window_sizes[r] * sizeof(PTO2TaskSlotState), PTO2_ALIGN_SIZE);
+    }
+    PTO2RingSegmentOffsets o{};
+    o.descriptors = off;
+    off += PTO2_ALIGN_UP(task_window_sizes[ring_id] * sizeof(PTO2TaskDescriptor), PTO2_ALIGN_SIZE);
+    o.payloads = off;
+    off += PTO2_ALIGN_UP(task_window_sizes[ring_id] * sizeof(PTO2TaskPayload), PTO2_ALIGN_SIZE);
+    o.slot_states = off;
+    off += PTO2_ALIGN_UP(task_window_sizes[ring_id] * sizeof(PTO2TaskSlotState), PTO2_ALIGN_SIZE);
+    o.end = off;
+    return o;
+}
+
+// Device address of ring `ring_id`'s task_descriptors array.
 inline PTO2TaskDescriptor *ring_task_descriptors_addr(
     void *sm_dev_base, const uint64_t task_window_sizes[PTO2_MAX_RING_DEPTH], int ring_id
 ) noexcept {
-    assert(ring_id >= 0 && ring_id < PTO2_MAX_RING_DEPTH && "pto2_sm_layout: ring_id out of range");
-    char *p = static_cast<char *>(sm_dev_base);
-    p += PTO2_ALIGN_UP(sizeof(PTO2SharedMemoryHeader), PTO2_ALIGN_SIZE);
-    for (int r = 0; r < ring_id; r++) {
-        p += PTO2_ALIGN_UP(task_window_sizes[r] * sizeof(PTO2TaskDescriptor), PTO2_ALIGN_SIZE);
-        p += PTO2_ALIGN_UP(task_window_sizes[r] * sizeof(PTO2TaskPayload), PTO2_ALIGN_SIZE);
-        p += PTO2_ALIGN_UP(task_window_sizes[r] * sizeof(PTO2TaskSlotState), PTO2_ALIGN_SIZE);
-    }
-    return reinterpret_cast<PTO2TaskDescriptor *>(p);
+    return reinterpret_cast<PTO2TaskDescriptor *>(
+        static_cast<char *>(sm_dev_base) + ring_segment_offsets(task_window_sizes, ring_id).descriptors
+    );
 }
 
-// Same walk as ring_task_descriptors_addr, then skip this ring's descriptors +
-// payloads to reach its slot_states array (used by the allocator's deadlock
-// detector to inspect the head task's state/fanout). Mirrors
-// setup_pointers_per_ring's descriptors -> payloads -> slot_states ordering.
+// Device address of ring `ring_id`'s slot_states array (used by the allocator's
+// deadlock detector to inspect the head task's state/fanout).
 inline PTO2TaskSlotState *
 ring_slot_states_addr(void *sm_dev_base, const uint64_t task_window_sizes[PTO2_MAX_RING_DEPTH], int ring_id) noexcept {
-    assert(ring_id >= 0 && ring_id < PTO2_MAX_RING_DEPTH && "pto2_sm_layout: ring_id out of range");
-    char *p = static_cast<char *>(sm_dev_base);
-    p += PTO2_ALIGN_UP(sizeof(PTO2SharedMemoryHeader), PTO2_ALIGN_SIZE);
-    for (int r = 0; r < ring_id; r++) {
-        p += PTO2_ALIGN_UP(task_window_sizes[r] * sizeof(PTO2TaskDescriptor), PTO2_ALIGN_SIZE);
-        p += PTO2_ALIGN_UP(task_window_sizes[r] * sizeof(PTO2TaskPayload), PTO2_ALIGN_SIZE);
-        p += PTO2_ALIGN_UP(task_window_sizes[r] * sizeof(PTO2TaskSlotState), PTO2_ALIGN_SIZE);
-    }
-    p += PTO2_ALIGN_UP(task_window_sizes[ring_id] * sizeof(PTO2TaskDescriptor), PTO2_ALIGN_SIZE);
-    p += PTO2_ALIGN_UP(task_window_sizes[ring_id] * sizeof(PTO2TaskPayload), PTO2_ALIGN_SIZE);
-    return reinterpret_cast<PTO2TaskSlotState *>(p);
+    return reinterpret_cast<PTO2TaskSlotState *>(
+        static_cast<char *>(sm_dev_base) + ring_segment_offsets(task_window_sizes, ring_id).slot_states
+    );
 }
 
 }  // namespace pto2_sm_layout
