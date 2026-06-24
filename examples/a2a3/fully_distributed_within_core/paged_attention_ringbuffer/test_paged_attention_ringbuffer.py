@@ -1,0 +1,115 @@
+#!/usr/bin/env python3
+# Copyright (c) PyPTO Contributors.
+# This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+# CANN Open Software License Agreement Version 2.0 (the "License").
+# Please refer to the License for details. You may not use this file except in compliance with the License.
+# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+# INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+# See LICENSE in the root of the software repository for the full text of the License.
+# -----------------------------------------------------------------------------------------------------------
+"""Paged attention with small ring buffer sizes — stress test for ring rotation/reclamation.
+
+Drives per-case ring sizing through ``config.runtime_env`` (ring_task_window /
+ring_heap / ring_dep_pool) rather than the process-global PTO2_RING_* env, plus
+INOUT tensors, bfloat16, and AIC+AIV mixed execution.
+"""
+
+import torch
+from simpler.task_interface import ArgDirection as D
+
+from simpler_setup import Scalar, SceneTestCase, TaskArgsBuilder, Tensor, scene_test
+from simpler_setup.goldens.paged_attention import compute_golden as _pa_compute_golden  # noqa: PLC0415
+from simpler_setup.goldens.paged_attention import generate_inputs as _pa_generate_inputs  # noqa: PLC0415
+
+PA_KERNELS = "../../../../tests/st/a2a3/tensormap_and_ringbuffer/batch_paged_attention/kernels"
+
+
+@scene_test(level=2, runtime="fully_distributed_within_core")
+class TestPagedAttentionRingbuffer(SceneTestCase):
+    """Paged attention with small ring buffer sizes for stress testing."""
+
+    RTOL = 1e-3
+    ATOL = 1e-3
+
+    CALLABLE = {
+        "orchestration": {
+            "source": f"{PA_KERNELS}/orchestration/paged_attention_orch.cpp",
+            "function_name": "aicpu_orchestration_entry",
+            "signature": [D.IN, D.IN, D.IN, D.IN, D.IN, D.OUT],
+        },
+        "incores": [
+            {
+                "func_id": 0,
+                "source": f"{PA_KERNELS}/aic/aic_qk_matmul.cpp",
+                "core_type": "aic",
+                "signature": [D.IN, D.IN, D.OUT],
+            },
+            {
+                "func_id": 2,
+                "source": f"{PA_KERNELS}/aic/aic_pv_matmul.cpp",
+                "core_type": "aic",
+                "signature": [D.IN, D.IN, D.OUT],
+            },
+            {
+                "func_id": 1,
+                "source": f"{PA_KERNELS}/aiv/aiv_softmax_prepare.cpp",
+                "core_type": "aiv",
+                "signature": [D.IN, D.OUT, D.OUT, D.OUT],
+            },
+            {
+                "func_id": 3,
+                "source": f"{PA_KERNELS}/aiv/aiv_online_update.cpp",
+                "core_type": "aiv",
+                "signature": [D.IN, D.IN, D.IN, D.INOUT, D.INOUT, D.INOUT, D.INOUT],
+            },
+        ],
+    }
+
+    CASES = [
+        {
+            "name": "ringbuffer_stress",
+            "platforms": ["a2a3"],
+            # ring_heap is bytes per ring. Non power-of-2 sizes are accepted,
+            # but 4 MiB keeps the small-ring stress intent compact.
+            "config": {
+                "aicpu_thread_num": 4,
+                "block_dim": 24,
+                "runtime_env": {
+                    "ring_task_window": 64,
+                    "ring_heap": 4 * 1024 * 1024,
+                    "ring_dep_pool": 256,
+                },
+            },
+            "params": {
+                "batch": 32,
+                "num_heads": 16,
+                "kv_head_num": 1,
+                "head_dim": 128,
+                "block_size": 128,
+                "context_len": 4096,
+                "max_model_len": 32768,
+                "dtype": "bfloat16",
+            },
+        },
+    ]
+
+    def generate_args(self, params):
+        inputs = _pa_generate_inputs(params)
+        specs = []
+        for name, val in inputs:
+            if isinstance(val, torch.Tensor):
+                specs.append(Tensor(name, val))
+            else:
+                specs.append(Scalar(name, val))
+        return TaskArgsBuilder(*specs)
+
+    def compute_golden(self, args, params):
+        tensors = {s.name: s.value for s in args.specs if isinstance(s, Tensor)}
+        _pa_compute_golden(tensors, params)
+        for s in args.specs:
+            if isinstance(s, Tensor) and s.name in tensors:
+                getattr(args, s.name)[:] = tensors[s.name]
+
+
+if __name__ == "__main__":
+    SceneTestCase.run_module(__name__)
