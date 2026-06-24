@@ -173,10 +173,55 @@ recovery is possible after all:
 Verified on a5: a pooled `hang → noop` pair, hang FAILED (trigger, not retried),
 noop **PASSED** 3/3 (force-reset recovered the card and the victim ran). The
 `fixture rebuild-then-skip` path remains as the fallback when a force reset ever
-fails (and on a2a3, which has no force-reset).
+fails or is never triggered (the a2a3 mirror has the same
+`force_reset_device` — see "a2a3 hardware verification" below).
 
 This is the recovery layer; the triggering test itself is still red (retrying it
 on a fresh card is a separate, later step).
+
+## a2a3 hardware verification + option B (2026-06-23)
+
+The "no a2a3 silicon on this box" caveat is environment-specific to the original
+a5 dev box. On an **a2a3** box (Ascend910 / NPU 9392, exclusive `task-submit`
+lock) the chain was measured directly with the `tests/st/aicore_op_timeout`
+hang kernel:
+
+| Measurement (10×, a2a3) | Result |
+| ----------------------- | ------ |
+| op-timeout poison triggered | 10/10, reaped in ~3.9 s (507018) |
+| in-process rebuild after force-reset (`INPROCESS_REINIT_OK`) | 10/10 |
+| fresh-process recovery (`FRESH_INIT_OK`) | 10/10 |
+
+So `aclrtResetDeviceForce` **does** clear the poison on a2a3 — when it runs.
+
+**The gap is the trigger, not the reset.** `force_reset_device()` only fires
+when `device_unusable_` is set, which `recover_device_or_mark_unusable()` sets
+**only if the bounded `aclrtSynchronizeDeviceWithTimeout` drain itself errors**.
+When that drain *returns success on a still-poisoned card* (a false-negative —
+timing/workload dependent), the flag stays clear, force-reset is skipped, the
+rebuild's `Worker.init()` fails 507899, and the runtime poison-skips. Real CI
+evidence: run **27742754024** job `st-onboard-a2a3`, worker gw3 —
+`TestPagedAttentionManualScope` FAILED (507018, drain reported *success*), then
+**16** tensormap_and_ringbuffer L2 classes SKIPPED, losing coverage. The local
+probe instead hit the drain-*fails* branch (507015 → force-reset → recovered),
+which is why a standalone probe and CI can disagree on the same arch.
+
+**Option B (issue #1110): dispatcher fresh-process retry.** Independent of
+whether force-reset was triggered, the dispatcher re-runs the poison-skipped
+classes in a fresh subprocess (= clean card, which the 10/10 above confirms
+recovers) so they keep coverage. The two `st_worker` poison guards register
+`(selector, nodeid)` into a per-runtime JSONL sink (`O_APPEND`, survives the
+xdist-worker → L2-subprocess → dispatcher boundaries); the dispatcher reads
+exactly that sink after the L2 subprocess exits and re-runs only those classes
+via `--case ClassName::` with the sink env stripped (single bounded pass).
+Collection is strictly sink-based, never `outcome == "skipped"`, so legitimate
+skips (`@pytest.mark.skip`, platform-required, `No cases matched`) are never
+retried. Implemented in `conftest.py` (`_register_l2_poison_skip`,
+`_read_l2_poison_sink`, `_l2_poison_retry`, the L2 dispatch loop).
+
+Fixing the trigger gate itself (make the recovery decision observable /
+self-checked rather than trusting the drain rc) is the complementary
+issue **#1111**; B is the hardware-independent coverage floor underneath it.
 
 ## Why this shape
 
@@ -191,35 +236,41 @@ The same three guards are mirrored into `src/a2a3/` (the a2a3 device_runner
 had none of them; #1005 was a5-only). a2a3 has the identical
 `device_unusable_` / `recover_device_or_mark_unusable` / `force_reset_device`
 chain wired into its `run()` / `finalize()`. The mechanism is CANN-level
-(`aclrtResetDeviceForce`), so it is expected to behave as on a5, but a2a3
-**was not hardware-verified locally** — this dev box is Ascend950PR (a5) only;
-the `st-onboard-a2a3` CI job is the a2a3 verification channel.
+(`aclrtResetDeviceForce`); it was originally CI-verified only (the first dev box
+was Ascend950PR / a5), and is now also hardware-verified on an a2a3 box —
+force-reset recovers 10/10 when triggered, but the drain-success false-negative
+means it is not always triggered (see "a2a3 hardware verification + option B").
 
 ## When to reconsider
 
 - The triggering test is still reported failed (its `207001` is likely
   transient). Adding a bounded retry (≤3 attempts) of just that test on a
   freshly-reset card would turn the last red into green — a follow-up step.
-- a2a3 now carries the mirrored guards (see "Why this shape") but they are
-  CI-verified only — no a2a3 silicon on this box. If the `st-onboard-a2a3`
-  job ever shows the force reset failing or not recovering on real a2a3
-  hardware, revisit `force_reset_device()` there (the CANN force-reset
-  semantics may differ from a5).
+- a2a3 force-reset is now hardware-verified (recovers 10/10 when triggered),
+  but `recover_device_or_mark_unusable()` gates it on the bounded drain's rc, so
+  a drain-success false-negative skips it and the runtime poison-skips. Making
+  that recovery decision observable / self-checked (return the reset rc,
+  conditionally clear `device_unusable_`, probe the card post-reset) is issue
+  **#1111**; option B (#1110) is the coverage backstop until that lands.
 
 ## References
 
 - CI run 27090242388, job `st-onboard-a5` (`gh run view --job 79952403308`) —
   original 8-failure cascade. CI run 27182822054 — post-#1005 contained run
-  (`1 failed, 13 skipped`).
+  (`1 failed, 13 skipped`). CI run 27742754024, job `st-onboard-a2a3` (gw3) —
+  a2a3 cascade: 1 FAILED + 16 SKIPPED after a drain-success false-negative.
 - Containment (#1005): `src/a5/platform/onboard/host/device_runner.{h,cpp}`
   (`device_unusable_`, `recover_device_or_mark_unusable`), `conftest.py`
   (`pytest_runtest_makereport`, `_register_l2_pool_heal`).
 - Force-reset recovery: `src/a5/platform/onboard/host/device_runner.{h,cpp}`
   (`force_reset_device`, called from `finalize()` on the `device_unusable_`
   path).
-- a2a3 mirror (CI-verified only): `src/a2a3/platform/onboard/host/`
-  `device_runner.{h,cpp}` — identical `device_unusable_` /
+- a2a3 mirror (now hardware-verified, 2026-06-23): `src/a2a3/platform/onboard/`
+  `host/device_runner.{h,cpp}` — identical `device_unusable_` /
   `recover_device_or_mark_unusable` / `force_reset_device` chain.
+- Option B dispatcher retry (#1110): `conftest.py` (`_register_l2_poison_skip`,
+  `_read_l2_poison_sink`, `_l2_poison_retry`, the L2 dispatch loop). Related:
+  #1111 (make the in-place recovery decision observable / self-checked).
 - `DeviceRunnerBase::finalize_common` — prior note on why finalize skips a
   pre-destroy stream sync on the error-state stream.
 - `.claude/rules/running-onboard.md` — `task-submit` device isolation.
