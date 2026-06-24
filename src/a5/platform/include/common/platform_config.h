@@ -281,8 +281,14 @@ constexpr int PLATFORM_PMU_SLOT_COUNT = 4;
 
 /**
  * Number of PmuBuffers pre-allocated per core (initial pool size).
+ * In-flight buffers needed (Little's Law L = produce-rate × recycle-latency) is
+ * ~1: PMU records are produced at the slow fixed sampling rate (decoupled from
+ * submit) and the 64 B record drains instantly, so peak in-flight is 1. 2 keeps
+ * a 2× margin; was 4 (a 4× over-provision). Mirrors the a2a3 change (validated
+ * zero-drop on a2a3); the argument is arch-independent, but a5-silicon onboard
+ * validation is still pending.
  */
-constexpr int PLATFORM_PMU_BUFFERS_PER_CORE = 4;
+constexpr int PLATFORM_PMU_BUFFERS_PER_CORE = 2;
 
 /**
  * Ready queue capacity for PMU data per AICPU thread.
@@ -300,10 +306,17 @@ constexpr int PLATFORM_PMU_TIMEOUT_SECONDS = 30;
 
 /**
  * Number of DepGenRecord entries per DepGenBuffer.
- * Each DepGenRecord is ~2.3 KB (16 Tensor blobs + small header), so a buffer
- * is ~74 KB. Mirrors a2a3 sizing — same orchestrator submit cadence.
+ * Each DepGenRecord is 4672 B (16 Tensor blobs + small header). 4 buffers ×
+ * 1024 records = 4096 in-flight records (~19 MB), aligning dep_gen's in-flight
+ * count with the scope_stats / l2 AicoreTask pools (also 4096) per the issue
+ * #977 cross-subsystem review. 1024 is #977 Primary's proposal; the original 32
+ * dropped 50% of records on paged_attention_unroll Case1. Flood drops are
+ * rate-bound, not capacity-bound — buffer sizing cannot fix them; real
+ * dependency-paced workloads never drop. dep_gen is opt-in (--enable-dep-gen).
+ * a5 record size (4672 B) and cohort (4096) are identical to a2a3, so the same
+ * 1024 applies; a5-silicon validation still pending.
  */
-constexpr int PLATFORM_DEP_GEN_RECORDS_PER_BUFFER = 32;
+constexpr int PLATFORM_DEP_GEN_RECORDS_PER_BUFFER = 1024;
 
 /**
  * SPSC free_queue slot count for dep_gen buffers (Host→Device hand-off depth).
@@ -346,8 +359,14 @@ constexpr int PLATFORM_SCOPE_STATS_SLOT_COUNT = 8;
 
 /**
  * Pre-allocated ScopeStatsBuffer count per orchestrator instance.
+ * In-flight buffers needed (Little's Law L = produce-rate × recycle-latency) is
+ * ~1: scope_stats records are produced per scope enter/exit (decoupled from
+ * submit volume) and the 52 B record drains instantly, so peak in-flight is 1.
+ * 4 keeps margin; was 8 (an 8× over-provision). Mirrors the a2a3 change
+ * (validated zero-drop on a2a3); the argument is arch-independent, but
+ * a5-silicon validation still pending.
  */
-constexpr int PLATFORM_SCOPE_STATS_BUFFERS_PER_INSTANCE = 8;
+constexpr int PLATFORM_SCOPE_STATS_BUFFERS_PER_INSTANCE = 4;
 
 /**
  * Ready queue capacity for scope_stats (per AICPU thread). scope_stats is

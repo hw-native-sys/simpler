@@ -240,8 +240,13 @@ constexpr int PLATFORM_PMU_SLOT_COUNT = 4;
 
 /**
  * Pre-allocated PmuBuffer count per AICore.
+ * In-flight buffers needed (Little's Law L = produce-rate × recycle-latency) is
+ * ~1: PMU records are produced at the slow fixed sampling rate (decoupled from
+ * submit) and the 64 B record drains instantly, so the host never lets more
+ * than 1 buffer be borrowed. 2 keeps a 2× margin; was 4 (a 4× over-provision).
+ * Validated zero-drop onboard a2a3 under a 65536-submit flood.
  */
-constexpr int PLATFORM_PMU_BUFFERS_PER_CORE = 4;
+constexpr int PLATFORM_PMU_BUFFERS_PER_CORE = 2;
 
 /**
  * Ready queue capacity for PMU data collection.
@@ -260,19 +265,41 @@ constexpr int PLATFORM_PMU_TIMEOUT_SECONDS = 30;
 
 /**
  * Number of DepGenRecord entries per DepGenBuffer.
- * Each DepGenRecord is ~2.3 KB (16 Tensor blobs + small header), so a buffer
- * of 32 records is ~74 KB — sized to fit a typical example's submit count
- * (~100-200) in a few buffers.
+ * Each DepGenRecord is 4672 B (16 Tensor blobs + small header). 4 buffers ×
+ * 1024 records = 4096 in-flight records (~19 MB), which aligns dep_gen's
+ * in-flight count with the scope_stats / l2 AicoreTask pools (also 4096) per
+ * the issue #977 cross-subsystem review. 1024 is #977 Primary's proposal; the
+ * original 32 dropped 50% of records on paged_attention_unroll Case1.
+ * Drops depend on submit ARRIVAL RATE, not total count: records are produced at
+ * submit_task time on the AICPU, so a dependency-paced workload (real decoder,
+ * submits gated by compute) drains faster than it fills and never drops, while
+ * an independent-submit flood (paged_attention Case1, 65536 back-to-back
+ * submits) outruns host drain and drops ~24576/65536. That drop is rate-bound,
+ * not capacity-bound — onboard a2a3, doubling RECORDS / BUFFERS / SLOT_COUNT
+ * each left it unchanged — so buffer sizing is not the lever for floods; 4096
+ * in-flight covers the largest realistic single-scope decoder burst.
+ * dep_gen is opt-in (--enable-dep-gen).
  */
-constexpr int PLATFORM_DEP_GEN_RECORDS_PER_BUFFER = 32;
+constexpr int PLATFORM_DEP_GEN_RECORDS_PER_BUFFER = 1024;
 
 /**
  * SPSC free_queue slot count for dep_gen buffers (Host→Device hand-off depth).
+ * Caps how many empty buffers the device can pre-borrow before it starves;
+ * top_up_free_queue refills the ring only up to SLOT_COUNT. Tunable up to 15
+ * within the fixed 128 B DepGenFreeQueue layout (see dep_gen.h), but onboard
+ * tests showed raising it does not reduce flood drops (the drop is rate-bound,
+ * not capacity-bound — see RECORDS_PER_BUFFER above), so it stays at the
+ * default 4.
  */
 constexpr int PLATFORM_DEP_GEN_SLOT_COUNT = 4;
 
 /**
  * Pre-allocated DepGenBuffer count per orchestrator instance.
+ * 4 buffers × 1024 records = 4096 in-flight records (~19 MB per instance).
+ * Must be ≥ SLOT_COUNT to fill the free_queue ring; any beyond SLOT_COUNT seed
+ * the host recycled pool. Raising it does not cut flood drops on its own (the
+ * device is bounded by SLOT_COUNT, and the drop is rate-bound anyway) — see the
+ * RECORDS_PER_BUFFER comment. dep_gen is opt-in (--enable-dep-gen).
  */
 constexpr int PLATFORM_DEP_GEN_BUFFERS_PER_INSTANCE = 4;
 
@@ -306,8 +333,13 @@ constexpr int PLATFORM_SCOPE_STATS_SLOT_COUNT = 8;
 
 /**
  * Pre-allocated ScopeStatsBuffer count per orchestrator instance.
+ * In-flight buffers needed (Little's Law L = produce-rate × recycle-latency) is
+ * ~1: scope_stats records are produced per scope enter/exit (decoupled from
+ * submit volume) and the 52 B record drains instantly, so the host never lets
+ * more than 1 buffer be borrowed. 4 keeps margin; was 8 (an 8× over-provision).
+ * Validated zero-drop onboard a2a3 under a 65536-submit flood.
  */
-constexpr int PLATFORM_SCOPE_STATS_BUFFERS_PER_INSTANCE = 8;
+constexpr int PLATFORM_SCOPE_STATS_BUFFERS_PER_INSTANCE = 4;
 
 /**
  * Ready queue capacity for scope_stats (per AICPU thread). scope_stats is
