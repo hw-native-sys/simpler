@@ -12,7 +12,7 @@
 /**
  * CallConfig — per-NEXT_LEVEL-task config. Carries execution knobs
  * (block_dim, aicpu_thread_num), per-task runtime-environment overrides
- * (`runtime_env.ring_task_window` / `.ring_heap` / `.ring_dep_pool`, plus per-ring variants) plus the five parallel
+ * (`runtime_env.ring_task_window` / `.ring_heap` / `.ring_dep_pool`, each a per-ring array) plus the five parallel
  * diagnostics sub-features under the profiling umbrella: `enable_l2_swimlane` (swimlane), `enable_dump_tensor`,
  * `enable_pmu`, `enable_dep_gen`, and `enable_scope_stats`. All five require `output_prefix` because they each write
  * sibling artifacts into that directory
@@ -47,42 +47,36 @@
 #include <cstdint>
 #include <cstring>
 #include <stdexcept>
-#include <string>
 
 inline constexpr int RUNTIME_ENV_RING_COUNT = 4;
-inline constexpr int RUNTIME_ENV_SCALAR_FIELD_COUNT = 3;
-inline constexpr int RUNTIME_ENV_PER_RING_FIELD_GROUPS = 3;
-inline constexpr int RUNTIME_ENV_UINT64_FIELD_COUNT =
-    RUNTIME_ENV_SCALAR_FIELD_COUNT + RUNTIME_ENV_PER_RING_FIELD_GROUPS * RUNTIME_ENV_RING_COUNT;
+inline constexpr int RUNTIME_ENV_FIELD_GROUPS = 3;  // ring_task_window, ring_heap, ring_dep_pool
+inline constexpr int RUNTIME_ENV_UINT64_FIELD_COUNT = RUNTIME_ENV_FIELD_GROUPS * RUNTIME_ENV_RING_COUNT;
 
 #pragma pack(push, 1)
 // Per-task runtime-environment overrides — the programmatic equivalent of the
 // `PTO2_RING_*` env vars, grouped under their own sub-struct so they read as a
 // distinct configuration tier from the top-level execution knobs (block_dim,
 // aicpu_thread_num). Consumed by tensormap_and_ringbuffer only; other runtimes
-// ignore them. 0 = unset; precedence: field > PTO2_RING_* env var >
-// compile-time default. ring_heap is bytes per ring. The scalar fields retain
-// #1042 behavior (broadcast to every ring); the array fields selectively
-// override individual scope-depth rings for #1029.
+// ignore them.
+//
+// Each resource is a per-scope-depth-ring array (index 0..3). A 0 entry is
+// unset and falls through to the next precedence tier: per-ring entry >
+// PTO2_RING_* env var > compile-time default. ring_heap is bytes per ring.
+// The Python/scene-test layer accepts a scalar and broadcasts it to every ring
+// before populating these arrays, so a one-value "size all rings the same"
+// request arrives here as [v, v, v, v].
 struct RuntimeEnv {
-    uint64_t ring_task_window = 0;
-    uint64_t ring_heap = 0;
-    uint64_t ring_dep_pool = 0;
-    uint64_t ring_task_windows[RUNTIME_ENV_RING_COUNT] = {};
-    uint64_t ring_heaps[RUNTIME_ENV_RING_COUNT] = {};
-    uint64_t ring_dep_pools[RUNTIME_ENV_RING_COUNT] = {};
+    uint64_t ring_task_window[RUNTIME_ENV_RING_COUNT] = {};
+    uint64_t ring_heap[RUNTIME_ENV_RING_COUNT] = {};
+    uint64_t ring_dep_pool[RUNTIME_ENV_RING_COUNT] = {};
 
-    bool per_ring_any() const noexcept {
+    bool any() const noexcept {
         for (int i = 0; i < RUNTIME_ENV_RING_COUNT; ++i) {
-            if (ring_task_windows[i] != 0 || ring_heaps[i] != 0 || ring_dep_pools[i] != 0) {
+            if (ring_task_window[i] != 0 || ring_heap[i] != 0 || ring_dep_pool[i] != 0) {
                 return true;
             }
         }
         return false;
-    }
-
-    bool any() const noexcept {
-        return ring_task_window != 0 || ring_heap != 0 || ring_dep_pool != 0 || per_ring_any();
     }
 
     // Throws if a ring sizing override violates the ring buffer's constraints.
@@ -90,30 +84,25 @@ struct RuntimeEnv {
         auto pow2 = [](uint64_t v) {
             return (v & (v - 1)) == 0;
         };
-        auto validate_task_window = [&](uint64_t value, const char *name) {
+        auto validate_task_window = [&](uint64_t value) {
             if (value != 0 && (value < 4 || value > INT32_MAX || !pow2(value))) {
-                throw std::invalid_argument(
-                    std::string("RuntimeEnv: ") + name + " must be a power of 2 in [4, INT32_MAX]"
-                );
+                throw std::invalid_argument("RuntimeEnv: ring_task_window must be a power of 2 in [4, INT32_MAX]");
             }
         };
-        auto validate_heap = [&](uint64_t value, const char *name) {
+        auto validate_heap = [&](uint64_t value) {
             if (value != 0 && value < 1024) {
-                throw std::invalid_argument(std::string("RuntimeEnv: ") + name + " must be >= 1024 (bytes per ring)");
+                throw std::invalid_argument("RuntimeEnv: ring_heap must be >= 1024 (bytes per ring)");
             }
         };
-        auto validate_dep_pool = [&](uint64_t value, const char *name) {
+        auto validate_dep_pool = [&](uint64_t value) {
             if (value != 0 && (value < 4 || value > INT32_MAX)) {
-                throw std::invalid_argument(std::string("RuntimeEnv: ") + name + " must be in [4, INT32_MAX]");
+                throw std::invalid_argument("RuntimeEnv: ring_dep_pool must be in [4, INT32_MAX]");
             }
         };
-        validate_task_window(ring_task_window, "ring_task_window");
-        validate_heap(ring_heap, "ring_heap");
-        validate_dep_pool(ring_dep_pool, "ring_dep_pool");
         for (int i = 0; i < RUNTIME_ENV_RING_COUNT; ++i) {
-            validate_task_window(ring_task_windows[i], "ring_task_windows");
-            validate_heap(ring_heaps[i], "ring_heaps");
-            validate_dep_pool(ring_dep_pools[i], "ring_dep_pools");
+            validate_task_window(ring_task_window[i]);
+            validate_heap(ring_heap[i]);
+            validate_dep_pool(ring_dep_pool[i]);
         }
     }
 };

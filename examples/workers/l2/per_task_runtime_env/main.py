@@ -16,18 +16,14 @@ scope-depth ring sized independently). Ring sizing is a per-run knob carried on
 ``CallConfig`` — no process-wide ``PTO2_RING_*`` env export needed, and each
 ``worker.run`` binds its ring buffers from the config it was handed.
 
-    runtime_env fields (0 / unset => fall back to env var / compile default):
-      scalar (broadcast to every ring):
+    Each runtime_env field takes EITHER a scalar (broadcast to every ring) OR a
+    4-entry list (one per scope-depth ring 0..3; a 0 entry falls through). Unset
+    (0) falls back to the env var / compile default.
         ring_task_window    power of 2 in [4, INT32_MAX]
         ring_heap           bytes per ring, >= 1024
         ring_dep_pool       4 .. INT32_MAX
-      per-ring arrays (exactly 4 entries, indexed by scope-depth ring 0..3;
-      a 0 entry falls through to the scalar / env / default tier):
-        ring_task_windows   [w0, w1, w2, w3]
-        ring_heaps          [h0, h1, h2, h3]   bytes per ring
-        ring_dep_pools      [d0, d1, d2, d3]
     Precedence per resource and ring:
-      per-ring field > scalar field > per-ring env > scalar env > default.
+      per-ring CallConfig entry > per-ring env > scalar env > default.
 
 See ../vector_add/main.py for the full L2 lifecycle walk-through; this example
 reuses that kernel verbatim and only varies the per-run ring configuration.
@@ -67,22 +63,15 @@ N_COLS = 128
 N_ELEMS = N_ROWS * N_COLS
 NBYTES = N_ELEMS * 4  # float32
 
-# RuntimeEnv keys a config dict may carry. Scalar keys broadcast one value to
-# every ring; the array keys size the four scope-depth rings independently.
-RING_FIELDS = (
-    "ring_task_window",
-    "ring_heap",
-    "ring_dep_pool",
-    "ring_task_windows",
-    "ring_heaps",
-    "ring_dep_pools",
-)
+# RuntimeEnv keys a config dict may carry. Each takes a scalar (broadcast to
+# every ring) or a 4-entry list (one value per scope-depth ring).
+RING_FIELDS = ("ring_task_window", "ring_heap", "ring_dep_pool")
 
 # (label, runtime_env dict or None). None => no override; falls back to the
 # PTO2_RING_* env var / compile-time default. Same kernel + same inputs run
 # under every sizing, so all of them produce identical (correct) output.
 RING_CONFIGS = [
-    # Scalar form: one value broadcast to every ring (the #1042 behavior).
+    # Scalar form: one value broadcast to every ring.
     ("scalar_small", {"ring_task_window": 16, "ring_heap": 1 * 1024 * 1024, "ring_dep_pool": 64}),
     ("scalar_large", {"ring_task_window": 128, "ring_heap": 8 * 1024 * 1024, "ring_dep_pool": 256}),
     # Per-ring form: each scope-depth ring (0..3) sized independently. Ring 0 is
@@ -92,9 +81,9 @@ RING_CONFIGS = [
     (
         "per_ring",
         {
-            "ring_task_windows": [128, 64, 32, 16],
-            "ring_heaps": [8 * 1024 * 1024, 4 * 1024 * 1024, 2 * 1024 * 1024, 1 * 1024 * 1024],
-            "ring_dep_pools": [256, 128, 64, 64],
+            "ring_task_window": [128, 64, 32, 16],
+            "ring_heap": [8 * 1024 * 1024, 4 * 1024 * 1024, 2 * 1024 * 1024, 1 * 1024 * 1024],
+            "ring_dep_pool": [256, 128, 64, 64],
         },
     ),
     ("env_or_default", None),

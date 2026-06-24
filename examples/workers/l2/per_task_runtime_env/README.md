@@ -9,21 +9,22 @@ carried on `CallConfig` — not a process-wide env export.
 ## What it shows
 
 `CallConfig.runtime_env` groups the ring overrides as a distinct config tier,
-separate from the top-level execution knobs (`block_dim`, …). Each resource
-comes in a scalar field and a 4-entry per-ring array:
+separate from the top-level execution knobs (`block_dim`, …). Each resource is a
+single field that accepts **either** a scalar (broadcast to every ring) **or** a
+4-entry list (one value per scope-depth ring):
 
-| scalar field | per-ring array | unit | constraint (per value) |
-| ------------ | -------------- | ---- | ---------------------- |
-| `ring_task_window` | `ring_task_windows` | tasks | power of 2 in [4, INT32_MAX] |
-| `ring_heap` | `ring_heaps` | bytes / ring | >= 1024 |
-| `ring_dep_pool` | `ring_dep_pools` | entries | 4 .. INT32_MAX |
+| field | unit | constraint (per value) |
+| ----- | ---- | ---------------------- |
+| `ring_task_window` | tasks | power of 2 in [4, INT32_MAX] |
+| `ring_heap` | bytes / ring | >= 1024 |
+| `ring_dep_pool` | entries | 4 .. INT32_MAX |
 
-The array fields must contain exactly **4 entries**, indexed by scope-depth
-ring `0..3` (depth `>=3` maps to ring 3). A `0` entry — or a field left unset —
-falls through to the next precedence tier:
+A list must contain exactly **4 entries**, indexed by scope-depth ring `0..3`
+(depth `>=3` maps to ring 3). A `0` entry — or a field left unset — falls
+through to the next precedence tier:
 
 ```text
-per-ring field > scalar field > per-ring env > scalar env > compile-time default
+per-ring CallConfig entry > per-ring env > scalar env > compile-time default
 ```
 
 ```python
@@ -33,10 +34,10 @@ cfg.runtime_env.ring_task_window = 128
 cfg.runtime_env.ring_heap = 8 * 1024 * 1024   # bytes per ring
 cfg.runtime_env.ring_dep_pool = 256
 
-# Per-ring: size rings 0..3 independently (overrides the scalar tier per ring).
-cfg.runtime_env.ring_task_windows = [128, 64, 32, 16]
-cfg.runtime_env.ring_heaps = [8 * 1024 * 1024, 4 * 1024 * 1024, 2 * 1024 * 1024, 1 * 1024 * 1024]
-cfg.runtime_env.ring_dep_pools = [256, 128, 64, 64]
+# ...or a 4-entry list: size rings 0..3 independently.
+cfg.runtime_env.ring_task_window = [128, 64, 32, 16]
+cfg.runtime_env.ring_heap = [8 * 1024 * 1024, 4 * 1024 * 1024, 2 * 1024 * 1024, 1 * 1024 * 1024]
+cfg.runtime_env.ring_dep_pool = [256, 128, 64, 64]
 worker.run(chip_handle, args, cfg)
 ```
 

@@ -56,8 +56,7 @@ extern "C" {
 int prepare_callable_impl(const ChipCallable *callable, uint64_t (*upload_fn)(const void *), CallableArtifacts *out);
 int bind_callable_to_runtime_impl(
     Runtime *runtime, const ChipStorageTaskArgs *orch_args, void *host_orch_func_ptr, const ArgDirection *signature,
-    int sig_count, uint64_t ring_task_window, uint64_t ring_heap, uint64_t ring_dep_pool,
-    const uint64_t *ring_task_windows, const uint64_t *ring_heaps, const uint64_t *ring_dep_pools
+    int sig_count, const uint64_t *ring_task_window, const uint64_t *ring_heap, const uint64_t *ring_dep_pool
 );
 int validate_runtime_impl(Runtime *runtime);
 
@@ -340,8 +339,7 @@ int prepare_callable(DeviceContextHandle ctx, int32_t callable_id, const void *c
 int run_prepared(
     DeviceContextHandle ctx, RuntimeHandle runtime, int32_t callable_id, const void *args, int block_dim,
     int aicpu_thread_num, int enable_l2_swimlane, int enable_dump_tensor, int enable_pmu, int enable_dep_gen,
-    int enable_scope_stats, uint64_t ring_task_window, uint64_t ring_heap, uint64_t ring_dep_pool,
-    const uint64_t *ring_task_windows, const uint64_t *ring_heaps, const uint64_t *ring_dep_pools,
+    int enable_scope_stats, const uint64_t *ring_task_window, const uint64_t *ring_heap, const uint64_t *ring_dep_pool,
     const char *output_prefix, PtoRunTiming *out_timing
 ) {
     if (out_timing != NULL) {
@@ -402,8 +400,7 @@ int run_prepared(
         // Per-run binding (tensor args, GM heap, SM alloc)
         rc = bind_callable_to_runtime_impl(
             r, reinterpret_cast<const ChipStorageTaskArgs *>(args), bind_result.host_orch_func_ptr,
-            bind_result.signature, bind_result.sig_count, ring_task_window, ring_heap, ring_dep_pool, ring_task_windows,
-            ring_heaps, ring_dep_pools
+            bind_result.signature, bind_result.sig_count, ring_task_window, ring_heap, ring_dep_pool
         );
         if (rc != 0) {
             r->set_gm_sm_ptr(nullptr);

@@ -190,20 +190,19 @@ int prepare_callable(DeviceContextHandle ctx, int32_t callable_id, const void *c
  * entry and partially populated on early-error returns.
  *
  * `ring_task_window` / `ring_heap` / `ring_dep_pool` are per-task ring sizing
- * overrides (0 = unset, scalar value broadcasts to every ring). The three
- * per-ring arrays have four entries each and selectively override individual
- * ring depths when an entry is nonzero. Precedence per ring: per-ring entry >
- * scalar per-task value > PTO2_RING_* env var > compile-time default.
- * Consumed by tensormap_and_ringbuffer only; other runtime variants accept
- * and ignore them.
+ * overrides, each a per-scope-depth-ring array of RUNTIME_ENV_RING_COUNT
+ * entries (0 = unset). A nonzero entry overrides that ring; a 0 entry falls
+ * through. Precedence per ring: per-ring entry > PTO2_RING_* env var >
+ * compile-time default. A "size every ring the same" request is broadcast to
+ * all entries by the caller. Consumed by tensormap_and_ringbuffer only; other
+ * runtime variants accept and ignore them.
  *
  * @return 0 on success, negative on error (no prep state, NULL ctx, etc.).
  */
 int run_prepared(
     DeviceContextHandle ctx, RuntimeHandle runtime, int32_t callable_id, const void *args, int block_dim,
     int aicpu_thread_num, int enable_l2_swimlane, int enable_dump_tensor, int enable_pmu, int enable_dep_gen,
-    int enable_scope_stats, uint64_t ring_task_window, uint64_t ring_heap, uint64_t ring_dep_pool,
-    const uint64_t *ring_task_windows, const uint64_t *ring_heaps, const uint64_t *ring_dep_pools,
+    int enable_scope_stats, const uint64_t *ring_task_window, const uint64_t *ring_heap, const uint64_t *ring_dep_pool,
     const char *output_prefix, PtoRunTiming *out_timing
 );
 
