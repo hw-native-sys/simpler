@@ -262,9 +262,57 @@ struct PTO2FaninBuilder {
 
 static bool append_fanin_or_fail(
     PTO2OrchestratorState *orch, uint8_t prod_ring, int32_t prod_slot, PTO2TaskSlotState *prod_state,
-    PTO2FaninBuilder *fanin_builder, uint8_t ring_id
+    PTO2TaskId producer_task_id, PTO2FaninBuilder *fanin_builder, uint8_t ring_id
 ) {
-    if (fanin_builder->mark_seen(prod_ring, prod_slot)) {
+    // Decide-and-claim under the producer's fanout_lock. Two conditions make this
+    // resolved slot a non-dependency, and both must be checked together with the
+    // fanout_count++ so the producer cannot slip from live to consumed/reused in
+    // between:
+    //   (1) Generation mismatch — the producer was CONSUMED, its slot
+    //       reset_for_reuse'd and rebound to a newer task. The cached
+    //       owner_task_id still resolves to this slot, but it no longer holds our
+    //       producer; ++'ing it would corrupt an unrelated task.
+    //   (2) Already CONSUMED in place — finished, output ready, no real edge.
+    // In either case, adding it to the fanin and bumping fanout_count would leave
+    // a stale ++/release pair (wire_task drops the fanout edge but keeps the fanin
+    // slot, so on_task_release still release_producer()'s it) that desyncs the
+    // slot's refcount (rc != fc) and wedges in-order reclaim. Claiming a live
+    // producer under the lock pins it: fanout_count now counts us, so it cannot
+    // reach CONSUMED (rc == fc) until we release it in on_task_release, keeping the
+    // slot's generation stable until then. check_and_handle_consumed flips
+    // COMPLETED->CONSUMED under the same lock, so the check and the ++ are atomic
+    // against the consume. fanout_count is lock-protected per the
+    // PTO2TaskSlotState contract.
+    //
+    // Dedup (mark_seen) happens HERE, gated on a live producer — NOT before the
+    // gone check. mark_seen keys only on (ring, slot); a stale owner that resolves
+    // to a reused slot must not record it as seen, or a later dependency on the
+    // live generation in the same submission would hit mark_seen and be skipped
+    // without claiming it (dropped edge). Marking only when !gone keeps the dedup
+    // keyed to the live producer, and doing it before the ++ still suppresses a
+    // double-count for a producer named twice in one submission.
+    prod_state->lock_fanout();
+    bool gone = prod_state->task == nullptr || prod_state->task->task_id.local() != producer_task_id.local() ||
+                prod_state->task_state.load(std::memory_order_acquire) == PTO2_TASK_CONSUMED;
+    bool claim = !gone && !fanin_builder->mark_seen(prod_ring, prod_slot);
+    if (claim) {
+        // Low bits hold the consumer count; bit31 is the scope ref. The consumer
+        // count must never carry into bit31 (would corrupt the scope-release
+        // flag) — true for any sane fanout (<< 2^31).
+        assert(
+            (prod_state->fanout_count & ~PTO2_FANOUT_SCOPE_BIT) < (PTO2_FANOUT_SCOPE_BIT - 1) &&
+            "fanout consumer count overflow into scope bit"
+        );
+        prod_state->fanout_count++;
+    }
+    prod_state->unlock_fanout();
+#if PTO2_ORCH_PROFILING
+    // lock + unlock always; one fanout_count store when we actually claim.
+    g_orch_args_atomic_count += claim ? 3 : 2;
+#endif
+    // gone (stale/consumed) or an already-seen duplicate live producer: no new
+    // fanin edge either way.
+    if (!claim) {
         return true;
     }
 
@@ -624,7 +672,9 @@ static TaskOutputTensors submit_task_common(
         }
         int32_t dep_slot = dep_ring.get_slot_by_task_id(dep_local_task_id);
         PTO2TaskSlotState *producer_slot_state = &dep_ring.get_slot_state_by_slot(dep_slot);
-        if (!append_fanin_or_fail(orch, dep_ring_id, dep_slot, producer_slot_state, &fanin_builder, ring_id)) {
+        if (!append_fanin_or_fail(
+                orch, dep_ring_id, dep_slot, producer_slot_state, dep_task_id, &fanin_builder, ring_id
+            )) {
             return result;
         }
     }
@@ -640,7 +690,7 @@ static TaskOutputTensors submit_task_common(
         PTO2SharedMemoryRingHeader &producer_ring = orch->sm_header->rings[prod_ring];
         int32_t prod_slot = producer_ring.get_slot_by_task_id(static_cast<int32_t>(producer_task_id.local()));
         PTO2TaskSlotState *prod_state = &producer_ring.get_slot_state_by_slot(prod_slot);
-        return append_fanin_or_fail(orch, prod_ring, prod_slot, prod_state, &fanin_builder, ring_id);
+        return append_fanin_or_fail(orch, prod_ring, prod_slot, prod_state, producer_task_id, &fanin_builder, ring_id);
     };
 
     if (!compute_task_fanin(dep_inputs, orch->tensor_map, orch->in_manual_scope(), runtime_emit)) {
@@ -665,15 +715,11 @@ static TaskOutputTensors submit_task_common(
     task.packed_buffer_base = prepared.alloc_result.packed_base;
     task.packed_buffer_end = prepared.alloc_result.packed_end;
 
-    // Increment fanout_count on each producer (no lock — only orch writes this field).
-    // Prevents premature CONSUMED: scope_end's release_producer checks fanout_refcount == fanout_count.
-    for_each_fanin_storage(
-        fanin_builder.inline_slots, fanin_builder.count, fanin_builder.spill_start, fanin_builder.spill_pool,
-        [](PTO2TaskSlotState *producer) {
-            producer->fanout_count++;
-        }
-    );
-
+    // fanout_count was already incremented per live producer inside
+    // append_fanin_or_fail, atomically with the consumed/generation check under
+    // the producer's fanout_lock. Doing it there (rather than a separate pass
+    // here) is what prevents a producer from transitioning to CONSUMED between
+    // the dependency decision and the claim.
     int32_t inline_count = std::min(fanin_builder.count, PTO2_FANIN_INLINE_CAP);
     // Store fanin metadata in payload for scheduler to iterate
     payload.fanin_actual_count = fanin_builder.count;
@@ -702,9 +748,6 @@ static TaskOutputTensors submit_task_common(
 #endif
 
     CYCLE_COUNT_LAP(g_orch_args_cycle);
-#if PTO2_ORCH_PROFILING
-    g_orch_args_atomic_count += 2;  // fanout_lock.store + fanout_count.store
-#endif
 
     // === STEP 6: push to wiring queue ===
     // Deferred wiring: orchestrator only stores dependency metadata and increments

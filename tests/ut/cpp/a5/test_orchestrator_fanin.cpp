@@ -80,5 +80,8 @@ TEST_F(OrchestratorFaninTest, DuplicateExplicitProducerAddsOneFanin) {
     ASSERT_NE(consumer_slot.payload, nullptr);
     EXPECT_EQ(consumer_slot.payload->fanin_actual_count, 1);
     EXPECT_EQ(consumer_slot.payload->fanin_inline_slot_states[0], &producer_slot);
-    EXPECT_EQ(producer_slot.fanout_count, 2);
+    // fanout_count is bit-packed: bit31 (PTO2_FANOUT_SCOPE_BIT) is the owning-scope
+    // ref, low bits the consumer count. The duplicate explicit dep is deduped to a
+    // single consumer, so this is scope + 1.
+    EXPECT_EQ(producer_slot.fanout_count, PTO2_FANOUT_SCOPE_BIT + 1);
 }

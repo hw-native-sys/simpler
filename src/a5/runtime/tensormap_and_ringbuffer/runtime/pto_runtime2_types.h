@@ -284,10 +284,24 @@ static_assert(
  * - fanin_count set once at submission, read-only after (hot path for ready check)
  * - task_state, fanin_refcount, fanout_refcount updated atomically
  */
+
+// fanout_count / fanout_refcount bit encoding (both uint32):
+//   bits [30:0] = consumer references (count: # consumers; refcount: # released)
+//   bit  [31]   = the owning scope's reference (PTO2_FANOUT_SCOPE_BIT)
+// fanout_count is seeded to PTO2_FANOUT_SCOPE_BIT and ++'d per consumer, so it
+// ends as (SCOPE_BIT | num_consumers). release adds 1 (consumer completion) or
+// SCOPE_BIT (scope_end). CONSUMED iff fanout_refcount == fanout_count (every
+// consumer released AND scope bit set). Keeping the scope ref in a distinct bit
+// (rather than folding scope + consumers into one count) lets a consumer reach
+// fanout_refcount == (fanout_count & ~PTO2_FANOUT_SCOPE_BIT) while the scope bit
+// is still unset -- i.e. "all consumers done but scope still open" stays
+// distinguishable from "fully consumed".
+static constexpr uint32_t PTO2_FANOUT_SCOPE_BIT = 0x80000000u;
+
 struct alignas(64) PTO2TaskSlotState {
     // Fanout lock + list (accessed together under lock in on_task_complete)
     std::atomic<int32_t> fanout_lock;  // Per-task spinlock (0=unlocked, 1=locked)
-    int32_t fanout_count;              // 1 (owning scope) + number of consumers
+    uint32_t fanout_count;             // SCOPE_BIT (owning scope) | number of consumers
 
     PTO2DepListEntry *fanout_head;  // Pointer to first fanout entry (nullptr = empty)
 
@@ -299,7 +313,7 @@ struct alignas(64) PTO2TaskSlotState {
     int32_t fanin_count;                  // Number of producer dependencies (set once by wiring)
 
     // Fanout refcount (accessed with fanout_count in check_and_handle_consumed)
-    std::atomic<int32_t> fanout_refcount;  // Dynamic: counts released references
+    std::atomic<uint32_t> fanout_refcount;  // Dynamic: low bits = released consumers, bit31 = scope released
 
     // --- Per-slot constant, re-bound by orch::prepare_task each submit ---
     // Value is the same on every reuse (&task_payloads[slot] / &task_descriptors[slot]),
@@ -357,7 +371,7 @@ struct alignas(64) PTO2TaskSlotState {
      */
     void reset_for_reuse() {
         fanout_lock.store(0, std::memory_order_relaxed);
-        fanout_count = 1;
+        fanout_count = PTO2_FANOUT_SCOPE_BIT;  // bit31 = owning-scope ref; consumers ++ into low bits
         fanout_head = nullptr;
         fanin_refcount.store(0, std::memory_order_relaxed);
         fanout_refcount.store(0, std::memory_order_relaxed);

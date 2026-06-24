@@ -791,20 +791,33 @@ struct PTO2SchedulerState {
     }
 
     void check_and_handle_consumed(PTO2TaskSlotState &slot_state) {
-        if (slot_state.fanout_refcount.load(std::memory_order_acquire) != slot_state.fanout_count) return;
-
-        PTO2TaskState expected = PTO2_TASK_COMPLETED;
-        if (!slot_state.task_state.compare_exchange_strong(
+        // Read fanout_refcount/fanout_count and flip COMPLETED->CONSUMED under
+        // fanout_lock. The orchestrator claims producers (fanout_count++) under the
+        // same lock, so the consume decision is serialized against a concurrent
+        // claim: either the ++ lands first (count then exceeds refcount, so we do
+        // not consume and the producer stays pinned until released) or the consume
+        // lands first (the orchestrator then observes CONSUMED and skips the
+        // claim). Without this lock a claim racing the consume desyncs the slot's
+        // refcount and wedges in-order reclaim.
+        bool became_consumed = false;
+        slot_state.lock_fanout();
+        if (slot_state.fanout_refcount.load(std::memory_order_acquire) == slot_state.fanout_count) {
+            PTO2TaskState expected = PTO2_TASK_COMPLETED;
+            became_consumed = slot_state.task_state.compare_exchange_strong(
                 expected, PTO2_TASK_CONSUMED, std::memory_order_acq_rel, std::memory_order_acquire
-            )) {
-            return;
+            );
         }
+        slot_state.unlock_fanout();
+        if (!became_consumed) return;
 
 #if PTO2_SCHED_PROFILING
         tasks_consumed.fetch_add(1, std::memory_order_relaxed);
 #endif
 
         int32_t ring_id = slot_state.ring_id;
+        // advance_ring_pointers (and the reset_for_reuse it triggers) MUST run
+        // outside fanout_lock: reset_for_reuse stores fanout_lock=0 and would
+        // clobber a held lock. Safe here — the slot is CONSUMED and quiescent.
         // Try-lock — if another thread is advancing this ring, it will scan our CONSUMED task
         int32_t expected_lock = 0;
         if (ring_sched_states[ring_id].advance_lock.compare_exchange_strong(
@@ -817,28 +830,32 @@ struct PTO2SchedulerState {
 
 #if PTO2_ORCH_PROFILING || PTO2_SCHED_PROFILING
     void check_and_handle_consumed(PTO2TaskSlotState &slot_state, uint64_t &atomic_count) {
-        int32_t fc = slot_state.fanout_count;
-        int32_t rc = slot_state.fanout_refcount.load(std::memory_order_acquire);
-
-        atomic_count += 2;  // fanout_count.load + fanout_refcount.load
-
-        if (rc != fc) return;
-
-        PTO2TaskState expected = PTO2_TASK_COMPLETED;
-        if (!slot_state.task_state.compare_exchange_strong(
+        // See the non-profiling overload for why the read + COMPLETED->CONSUMED
+        // flip is serialized against the orchestrator's claim under fanout_lock.
+        bool became_consumed = false;
+        slot_state.lock_fanout();
+        atomic_count += 1;  // lock CAS
+        uint32_t fc = slot_state.fanout_count;
+        uint32_t rc = slot_state.fanout_refcount.load(std::memory_order_acquire);
+        atomic_count += 1;  // fanout_refcount.load (fanout_count is a plain read under lock)
+        if (rc == fc) {
+            PTO2TaskState expected = PTO2_TASK_COMPLETED;
+            became_consumed = slot_state.task_state.compare_exchange_strong(
                 expected, PTO2_TASK_CONSUMED, std::memory_order_acq_rel, std::memory_order_acquire
-            )) {
-            atomic_count += 1;  // failed CAS
-            return;
+            );
+            atomic_count += 1;  // CAS
         }
-
-        atomic_count += 1;  // successful CAS
+        slot_state.unlock_fanout();
+        atomic_count += 1;  // unlock store
+        if (!became_consumed) return;
 
 #if PTO2_SCHED_PROFILING
         tasks_consumed.fetch_add(1, std::memory_order_relaxed);
 #endif
 
         int32_t ring_id = slot_state.ring_id;
+        // advance_ring_pointers + reset_for_reuse run outside fanout_lock (reset
+        // stores fanout_lock=0). Safe — the slot is CONSUMED and quiescent.
         // Try-lock — if another thread is advancing this ring, it will scan our CONSUMED task
         int32_t expected_lock = 0;
         if (ring_sched_states[ring_id].advance_lock.compare_exchange_strong(
@@ -858,9 +875,25 @@ struct PTO2SchedulerState {
         check_and_handle_consumed(slot_state);
     }
 
+    // Scope-end release: sets bit31 (PTO2_FANOUT_SCOPE_BIT) instead of bumping a
+    // consumer ref. Called exactly once per task from on_scope_end. Keeping it a
+    // distinct add lets a consumer release leave the scope bit unset, so "all
+    // consumers done but scope still open" stays distinguishable from "fully
+    // consumed".
+    void release_producer_scope(PTO2TaskSlotState &slot_state) {
+        slot_state.fanout_refcount.fetch_add(PTO2_FANOUT_SCOPE_BIT, std::memory_order_acq_rel);
+        check_and_handle_consumed(slot_state);
+    }
+
 #if PTO2_ORCH_PROFILING || PTO2_SCHED_PROFILING
     void release_producer(PTO2TaskSlotState &slot_state, uint64_t &atomic_count) {
         slot_state.fanout_refcount.fetch_add(1, std::memory_order_acq_rel);
+        atomic_count += 1;  // fanout_refcount.fetch_add
+        check_and_handle_consumed(slot_state, atomic_count);
+    }
+
+    void release_producer_scope(PTO2TaskSlotState &slot_state, uint64_t &atomic_count) {
+        slot_state.fanout_refcount.fetch_add(PTO2_FANOUT_SCOPE_BIT, std::memory_order_acq_rel);
         atomic_count += 1;  // fanout_refcount.fetch_add
         check_and_handle_consumed(slot_state, atomic_count);
     }
@@ -951,13 +984,13 @@ struct PTO2SchedulerState {
         if (count > 0) __builtin_prefetch(task_slot_states[0], 1, 0);
         for (int32_t i = 0; i < count; i++) {
             if (i + 1 < count) __builtin_prefetch(task_slot_states[i + 1], 1, 0);
-            release_producer(*task_slot_states[i], g_orch_scope_end_atomic_count);
+            release_producer_scope(*task_slot_states[i], g_orch_scope_end_atomic_count);
         }
 #else
         if (count > 0) __builtin_prefetch(task_slot_states[0], 1, 0);
         for (int32_t i = 0; i < count; i++) {
             if (i + 1 < count) __builtin_prefetch(task_slot_states[i + 1], 1, 0);
-            release_producer(*task_slot_states[i]);
+            release_producer_scope(*task_slot_states[i]);
         }
 #endif
     }
