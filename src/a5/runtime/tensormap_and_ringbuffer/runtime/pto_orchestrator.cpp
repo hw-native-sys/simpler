@@ -754,8 +754,23 @@ static TaskOutputTensors submit_task_common(
     // fanout_count. The actual fanout_head wiring (lock + dep_pool + early_finished)
     // is handled asynchronously by scheduler thread 0 via the wiring queue.
     // Push to global wiring queue — scheduler sets fanin_count, wires fanout, checks readiness
-    while (!sched->wiring.queue.push(&cur_slot_state)) {
-        SPIN_WAIT_HINT();
+    if (!sched->wiring.queue.push(&cur_slot_state)) {
+        // producer_blocked is the wiring deadlock detector's "orchestrator is
+        // stuck in push" observable: set ONLY while we actually spin (queue
+        // full), cleared on exit, so the just-filled-then-scope_end case (push
+        // succeeded, no spin) never trips a false deadlock. Also poll the shared
+        // orch_error_code so a fatal latched by any party (e.g. that detector)
+        // breaks this otherwise-unbounded spin and unwinds orchestration.
+        sched->wiring.producer_blocked.store(1, std::memory_order_release);
+        while (!sched->wiring.queue.push(&cur_slot_state)) {
+            if (orch->sm_header->orch_error_code.load(std::memory_order_acquire) != PTO2_ERROR_NONE) {
+                orch->fatal = true;
+                sched->wiring.producer_blocked.store(0, std::memory_order_release);
+                return result;
+            }
+            SPIN_WAIT_HINT();
+        }
+        sched->wiring.producer_blocked.store(0, std::memory_order_release);
     }
 
     CYCLE_COUNT_LAP(g_orch_fanin_cycle);
