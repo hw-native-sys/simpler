@@ -26,7 +26,10 @@ static constexpr int32_t CPUS_PER_CLUSTER = 4;
 // threads and never approaches this bound.
 static constexpr int32_t MAX_GATE_THREADS = 16;
 
-static std::atomic<uint64_t> s_cpumask{0};
+// Bit i is set once thread-slot i has written its s_thread_cpu[] report. Keyed
+// on the reporting slot (not the cpu) so the barrier still reaches
+// total_launched when two unpinned threads share a cpu (sim).
+static std::atomic<uint64_t> s_done_mask{0};
 static std::atomic<int32_t> s_reported{0};
 static std::atomic<int32_t> s_gate_init{0};
 static std::atomic<int32_t> s_gate_ready{0};
@@ -44,17 +47,28 @@ static inline int32_t popcount64(uint64_t v) { return __builtin_popcountll(stati
 
 bool platform_aicpu_affinity_gate(int32_t logical_count, int32_t total_launched) {
     tl_exec_idx = -1;
+
+    // Bound-check both inputs against the static slot buffers (s_thread_cpu[],
+    // s_thread_survive[], both MAX_GATE_THREADS) before any indexing. Without
+    // this, total_launched > MAX_GATE_THREADS makes the classifier loop read
+    // s_thread_cpu[tid] and write s_thread_survive[tid] out of bounds; a
+    // negative count would bypass the bounds checks entirely. Mirrors the
+    // validation in platform_aicpu_affinity_gate_filter().
+    if (total_launched <= 0 || total_launched > MAX_GATE_THREADS || logical_count < 0) {
+        LOG_ERROR(
+            "AICPU affinity gate: invalid config logical_count=%d total_launched=%d (max=%d) — dropping all threads",
+            logical_count, total_launched, MAX_GATE_THREADS
+        );
+        return false;
+    }
     if (logical_count >= total_launched) {
         // No over-launch (unreachable for a2a3, where logical < total always):
         // every thread survives. Leave tl_exec_idx = -1 so no run-wall slot is
-        // claimed on this degenerate path — and, crucially, do NOT touch
-        // s_reported here: this early return has no barrier/cleanup to reset
-        // it, so incrementing it would leak state into the next launch
-        // (s_reported is reset only by the full path's last-thread cleanup).
+        // claimed on this degenerate path.
         return true;
     }
 
-    // Assign thread index
+    // Assign this thread a reporting slot.
     int32_t idx = s_reported.fetch_add(1, std::memory_order_acq_rel);
 
     // Report CPU
@@ -65,21 +79,20 @@ bool platform_aicpu_affinity_gate(int32_t logical_count, int32_t total_launched)
 #else
     int32_t cpu = -1;
 #endif
-
-    int32_t normalized_cpu = -1;
-    if (cpu >= 0) {
-        if (cpu < 63) {
-            s_cpumask.fetch_or(1ULL << cpu, std::memory_order_release);
-        }
-        normalized_cpu = cpu % AICPU_CORES_PER_CHIP;
-    }
+    int32_t normalized_cpu = (cpu >= 0) ? cpu % AICPU_CORES_PER_CHIP : -1;
     if (idx < MAX_GATE_THREADS) {
         s_thread_cpu[idx] = normalized_cpu;
     }
 
-    // Barrier: wait until all total_launched threads have reported
-    while (popcount64(s_cpumask.load(std::memory_order_acquire)) < total_launched &&
-           s_reported.load(std::memory_order_acquire) < total_launched) {}
+    // Barrier: publish this slot (the release pairs with the acquire load below
+    // so the s_thread_cpu[] write above is visible), then wait until every slot
+    // has reported. The old barrier released on s_reported, which is bumped
+    // *before* the write, so the classifier below could run on half-written or
+    // stale slots and non-deterministically keep cluster #0.
+    if (idx < 64) {
+        s_done_mask.fetch_or(1ULL << idx, std::memory_order_release);
+    }
+    while (popcount64(s_done_mask.load(std::memory_order_acquire)) < total_launched) {}
 
     // CAS winner does cluster classification
     int32_t expected = 0;
@@ -140,15 +153,10 @@ bool platform_aicpu_affinity_gate(int32_t logical_count, int32_t total_launched)
     bool survive = (idx < total_launched) ? s_thread_survive[idx] : false;
 
     // Last thread resets state for next invocation
-    int32_t finished = s_reported.load(std::memory_order_acquire);
-    (void)finished;
-    // Reset is deferred: the statics persist but are re-initialized by the CAS winner
-    // on next call. We reset the atomics after all threads have read their result.
-    // Use a second atomic counter for cleanup.
     static std::atomic<int32_t> s_cleanup{0};
     int32_t cleanup_idx = s_cleanup.fetch_add(1, std::memory_order_acq_rel);
     if (cleanup_idx + 1 == total_launched) {
-        s_cpumask.store(0, std::memory_order_release);
+        s_done_mask.store(0, std::memory_order_release);
         s_reported.store(0, std::memory_order_release);
         s_gate_init.store(0, std::memory_order_release);
         s_gate_ready.store(0, std::memory_order_release);
