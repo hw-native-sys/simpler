@@ -1298,6 +1298,13 @@ void AicpuExecutor::diagnose_stuck_state(
 
 // ===== Public Entry Point =====
 
+extern "C" int aicpu_prewarm_callable(Runtime *runtime) {
+    // host_build_graph resolves orchestration on the host during prepare.
+    // There is no AICPU orch_so_table_ state to prewarm.
+    (void)runtime;
+    return 0;
+}
+
 /**
  * aicpu_execute - Main AICPU kernel execution entry point
  *
