@@ -359,10 +359,8 @@ struct PTO2SchedulerLayout
     size_t off_ready_queue_slots[PTO2_NUM_RESOURCE_SHAPES];
     size_t off_dummy_ready_queue_slots;
     size_t off_pending_spsc_buffer;
-    size_t off_pending_buffer;
     uint64_t ready_queue_capacity;
     uint64_t spsc_capacity;
-    uint64_t pending_capacity;
 };
 
 struct PTO2SchedulerState
@@ -422,23 +420,21 @@ struct PTO2SchedulerState
     // the dispatch loop and completed inline -- never goes to AICore.
     PTO2ReadyQueue dummy_ready_queue;
 
-    // Thread 0 exclusive: circular FIFO of tasks awaiting fanin readiness.
-    // SPSC queue receives slot_states from the orchestrator; thread 0 drains
-    // them into the pending ring and polls fanin readiness. Storing the FIFO
-    // out of band (instead of intrusively in PTO2TaskSlotState) keeps the
-    // task struct free of scheduler-private state.
+    // Thread 0 exclusive: bounded SPSC drain → classify → route. The
+    // orchestrator pushes slot_states into the SPSC queue; thread 0 drains
+    // a batch per scheduler iter, classifies each task's fanin state, and
+    // routes terminally — either to a ready queue (all fanins met) or onto
+    // a producer's wake_list (first unmet). No intermediate FIFO: each
+    // drained task is classified once, never re-queued. The wake-list-only
+    // redesign made classify_fanin_state's decision terminal, so the
+    // previously-needed pending FIFO became dead weight on the critical
+    // path.
     struct alignas(64) PendingState
     {
         static constexpr int BACKOFF_LIMIT = 32;
         static constexpr int DRAIN_BATCH = 30;
-        static constexpr int POLL_MAX_PER_ITER = 128;
 
         // --- Thread 0 exclusive ---
-        PTO2TaskSlotState **pending_buf{nullptr};  // capacity slots, arena-owned
-        uint32_t pending_cap{0};
-        uint32_t pending_mask{0};
-        uint32_t pending_head_idx{0};  // next pop
-        uint32_t pending_tail_idx{0};  // next push
         int backoff_counter{0};
         PTO2TaskSlotState *drain_buf[DRAIN_BATCH];
 
@@ -447,9 +443,6 @@ struct PTO2SchedulerState
 
         // --- Orchestrator write, thread 0 read ---
         alignas(64) std::atomic<bool> orch_needs_drain{false};
-
-        uint32_t pending_count() const { return pending_tail_idx - pending_head_idx; }
-        bool pending_empty() const { return pending_tail_idx == pending_head_idx; }
     } wiring;
 
     alignas(64) AsyncWaitList async_wait_list;
@@ -459,22 +452,6 @@ struct PTO2SchedulerState
         PTO2ResourceShape shape = slot_state->active_mask.to_shape();
         if (shape == PTO2ResourceShape::DUMMY) dummy_ready_queue.push(slot_state);
         else ready_queues[static_cast<int32_t>(shape)].push(slot_state);
-    }
-
-    // Append slot to the tail of the pending FIFO.
-    void pending_push_back(PTO2TaskSlotState *s)
-    {
-        wiring.pending_buf[wiring.pending_tail_idx & wiring.pending_mask] = s;
-        wiring.pending_tail_idx++;
-    }
-
-    // Pop the head of the pending FIFO (or nullptr).
-    PTO2TaskSlotState *pending_pop_front()
-    {
-        if (wiring.pending_empty()) return nullptr;
-        PTO2TaskSlotState *s = wiring.pending_buf[wiring.pending_head_idx & wiring.pending_mask];
-        wiring.pending_head_idx++;
-        return s;
     }
 
     bool fanin_satisfied(PTO2TaskSlotState *s) const
@@ -488,16 +465,13 @@ struct PTO2SchedulerState
         return true;
     }
 
-    // First-unmet classification used by the pending poll and wake_list
-    // drain. Returns:
+    // First-unmet classification used by the wiring-queue drain and the
+    // wake_list rescan. Returns:
     //   -1: all fanins met (route directly to ready)
     //   ≥0: index of the first unmet fanin (register on its producer's
-    //       wake list). The polling-only path used to distinguish
-    //       "exactly-1 unmet" from "2+ unmet" so the 2+ case could be
-    //       re-queued for the next polling cycle; the wake-list-only
-    //       redesign instead always registers on the first unmet (rescan
-    //       on wake via on_mixed_task_complete), eliminating the
-    //       O(pending × fanin) per-iteration polling cost.
+    //       wake list). Decision is terminal — tasks are never re-queued
+    //       for polling; rescans happen lazily on producer completion via
+    //       on_mixed_task_complete's wake_list drain.
     int classify_fanin_state(PTO2TaskSlotState *s) const
     {
         const PTO2TaskPayload &p = *s->payload;
@@ -536,22 +510,21 @@ struct PTO2SchedulerState
         }
     }
 
-    // Thread 0 entry point: drain SPSC into pending list, then poll pending
-    // for newly-ready tasks. Not-ready tasks rotate to the tail.
-    // Returns >0 if anything moved (SPSC drained OR tasks routed to ready);
-    // 0 signals no productive work.
+    // Thread 0 entry point: drain a bounded batch from the orchestrator's
+    // SPSC queue, then classify+route each drained task terminally. Returns
+    // the count of routed tasks (also the drained count — each drained task
+    // is classified once and never re-queued).
     //
     // Sub-phase timing pointers (optional). If non-null, cumulative cycle/
-    // iteration counters for Stage 1 (SPSC drain) and Stage 2 (pending poll)
+    // iteration counters for Stage 1 (SPSC drain) and Stage 2 (classify+route)
     // are accumulated into them.
     int drain_wiring_queue(bool force_drain = false,
                            uint64_t *spsc_cyc_out = nullptr, uint64_t *spsc_iters_out = nullptr,
                            uint64_t *poll_cyc_out = nullptr, uint64_t *poll_iters_out = nullptr)
     {
-        // Stage 1: drain SPSC → pending FIFO tail
+        // Stage 1: drain SPSC → drain_buf
         uint64_t t0 = spsc_cyc_out ? get_sys_cnt_aicpu() : 0;
         int drained = wiring.queue.pop_batch(wiring.drain_buf, PendingState::DRAIN_BATCH);
-        for (int i = 0; i < drained; i++) pending_push_back(wiring.drain_buf[i]);
         if (spsc_cyc_out)
         {
             *spsc_cyc_out += get_sys_cnt_aicpu() - t0;
@@ -559,7 +532,7 @@ struct PTO2SchedulerState
         }
 
         // Backoff when nothing to do and orchestrator isn't pressing
-        if (drained == 0 && wiring.pending_empty())
+        if (drained == 0)
         {
             if (!force_drain && !wiring.orch_needs_drain.load(std::memory_order_acquire) && wiring.backoff_counter < PendingState::BACKOFF_LIMIT)
             {
@@ -569,21 +542,15 @@ struct PTO2SchedulerState
         }
         wiring.backoff_counter = 0;
 
-        // Stage 2: drain pending FIFO. Each task gets scanned exactly once
-        // here — its state is either "all met → ready_queue" or "register
-        // on the first unmet producer's wake_list and leave". Tasks never
-        // re-enter pending FIFO; re-scans happen lazily on wake via
-        // on_mixed_task_complete's wake_list drain (see below). This
-        // eliminates the O(pending × fanin) per-iteration polling cost
-        // that hurt host time under chains of multi-fanin tasks.
+        // Stage 2: classify + route each drained task in-line. Each task's
+        // state is "all met → ready_queue" or "first unmet → register on that
+        // producer's wake_list". Tasks are scanned exactly once here;
+        // re-scans on producer completion happen via on_mixed_task_complete's
+        // wake_list drain.
         uint64_t t1 = poll_cyc_out ? get_sys_cnt_aicpu() : 0;
-        int routed = 0;
-        int to_visit = static_cast<int>(wiring.pending_count());
-        if (to_visit > PendingState::POLL_MAX_PER_ITER) to_visit = PendingState::POLL_MAX_PER_ITER;
-        for (int i = 0; i < to_visit; i++)
+        for (int i = 0; i < drained; i++)
         {
-            PTO2TaskSlotState *s = pending_pop_front();
-            if (s == nullptr) break;
+            PTO2TaskSlotState *s = wiring.drain_buf[i];
             int state = classify_fanin_state(s);
             if (state < 0)
             {
@@ -591,11 +558,10 @@ struct PTO2SchedulerState
             }
             else
             {
-                // First unmet at index `state`; register on that producer
-                // and leave the FIFO. Producer is in fanin_ring_ids[state]
-                // (may differ from the consumer's ring under multi-ring
-                // fanin). When the producer completes its wake_list drain
-                // will rescan and either push to ready or re-register on
+                // Producer is in fanin_ring_ids[state] (may differ from
+                // the consumer's ring under multi-ring fanin). When the
+                // producer completes, its wake_list drain rescans this
+                // consumer and either pushes to ready or re-registers on
                 // the next unmet producer.
                 int32_t prod_local = s->payload->fanin_local_ids[state];
                 uint8_t prod_ring = s->payload->fanin_ring_ids[state];
@@ -603,7 +569,6 @@ struct PTO2SchedulerState
                 PTO2TaskSlotState *producer = &ring.get_slot_state_by_task_id(prod_local);
                 register_wake(producer, s);
             }
-            routed++;
         }
         if (poll_cyc_out)
         {
@@ -611,7 +576,7 @@ struct PTO2SchedulerState
             if (poll_iters_out) (*poll_iters_out)++;
         }
 
-        return drained + routed;
+        return drained;
     }
 
     int get_ready_tasks_batch(PTO2ResourceShape shape, PTO2LocalReadyBuffer &local_buf, PTO2TaskSlotState **out, int max_count)
@@ -735,12 +700,10 @@ struct PTO2SchedulerState
         PTO2SchedulerLayout layout{};
         layout.ready_queue_capacity = PTO2_READY_QUEUE_SIZE;
         layout.spsc_capacity = PTO2_WRIRING_QUEUE_SIZE;
-        layout.pending_capacity = PTO2_TASK_WINDOW_SIZE;  // bounded by per-ring slot window
 
         for (int i = 0; i < PTO2_NUM_RESOURCE_SHAPES; i++) layout.off_ready_queue_slots[i] = ready_queue_reserve_layout(arena, PTO2_READY_QUEUE_SIZE);
         layout.off_dummy_ready_queue_slots = ready_queue_reserve_layout(arena, PTO2_READY_QUEUE_SIZE);
         layout.off_pending_spsc_buffer = PTO2SpscQueue::reserve_layout(arena, PTO2_WRIRING_QUEUE_SIZE);
-        layout.off_pending_buffer = arena.reserve(layout.pending_capacity * sizeof(PTO2TaskSlotState *), PTO2_ALIGN_SIZE);
         return layout;
     }
 
@@ -758,12 +721,6 @@ struct PTO2SchedulerState
 
         if (!sched->wiring.queue.init_data_from_layout(arena, layout.off_pending_spsc_buffer, layout.spsc_capacity)) return false;
 
-        if (layout.pending_capacity == 0 || (layout.pending_capacity & (layout.pending_capacity - 1)) != 0) return false;
-        sched->wiring.pending_buf = static_cast<PTO2TaskSlotState **>(arena.region_ptr(layout.off_pending_buffer));
-        sched->wiring.pending_cap = static_cast<uint32_t>(layout.pending_capacity);
-        sched->wiring.pending_mask = sched->wiring.pending_cap - 1;
-        sched->wiring.pending_head_idx = 0;
-        sched->wiring.pending_tail_idx = 0;
         sched->wiring.backoff_counter = 0;
 
         return true;
@@ -775,7 +732,6 @@ struct PTO2SchedulerState
         for (int i = 0; i < PTO2_NUM_RESOURCE_SHAPES; i++) ready_queue_wire_arena_pointers(&sched->ready_queues[i], arena, layout.off_ready_queue_slots[i]);
         ready_queue_wire_arena_pointers(&sched->dummy_ready_queue, arena, layout.off_dummy_ready_queue_slots);
         sched->wiring.queue.wire_arena_pointers(arena, layout.off_pending_spsc_buffer);
-        sched->wiring.pending_buf = static_cast<PTO2TaskSlotState **>(arena.region_ptr(layout.off_pending_buffer));
     }
 
     // Forget per-region pointers; arena owns the backing memory.
@@ -784,7 +740,6 @@ struct PTO2SchedulerState
         PTO2SchedulerState *sched = this;
         for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) sched->ring_sched_states[r].destroy();
         sched->wiring.queue.destroy();
-        sched->wiring.pending_buf = nullptr;
         for (int i = 0; i < PTO2_NUM_RESOURCE_SHAPES; i++) ready_queue_destroy(&sched->ready_queues[i]);
         ready_queue_destroy(&sched->dummy_ready_queue);
     }

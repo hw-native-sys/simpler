@@ -57,8 +57,8 @@ struct alignas(64) SchedulerThreadProfile
     uint64_t cores_scanned{0};
     uint64_t async_wait_cycles{0};
     uint64_t drain_wiring_cycles{0};
-    uint64_t spsc_drain_cycles{0};    // sub-phase of drain_wiring: SPSC → pending FIFO
-    uint64_t pending_poll_cycles{0};  // sub-phase of drain_wiring: pending FIFO → ready
+    uint64_t spsc_drain_cycles{0};    // sub-phase of drain_wiring: SPSC pop_batch into drain_buf
+    uint64_t pending_poll_cycles{0};  // sub-phase of drain_wiring: classify+route each drained task
     uint64_t dummy_drain_cycles{0};
     uint64_t dispatch_cycles{0};
     uint64_t idle_spin_cycles{0};

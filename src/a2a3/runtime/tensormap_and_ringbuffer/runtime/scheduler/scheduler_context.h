@@ -283,7 +283,7 @@ public:
             }
 
             // Phase 3: Drain wiring queue (thread 0 only). Pass cumulative
-            // sub-phase counters (SPSC drain stage 1 / pending-FIFO poll
+            // sub-phase counters (SPSC drain stage 1 / classify+route
             // stage 2) so drain_wiring_queue accumulates into them.
             if (thread_idx == 0)
             {
