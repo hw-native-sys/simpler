@@ -95,9 +95,9 @@ enum DepGenRecordFlags : uint32_t {
  *     cache lines
  *   - tensors[] (32 × 128 B opaque blobs) at the tail; covers ~88% of the entry
  *
- * Total size: 8 + 4 + 4 + 64*8 + 32 + 12 (kernel_id) + 4 (pad) + 32*128
+ * Total size: 8 + 4 + 4 + 64*8 + 32 + 12 (kernel_id) + 4 (block_num) + 32*128
  *           = 4672 bytes.
- * Aligned to 64 B → 4672 B (already a multiple of 64). kernel_id + _pad0
+ * Aligned to 64 B → 4672 B (already a multiple of 64). kernel_id + block_num
  * together pad tensors[] up to offset 576 = 9 * 64 so each 128-byte tensor
  * blob covers exactly two cache lines instead of straddling three.
  */
@@ -109,7 +109,7 @@ struct DepGenRecord {
     uint64_t explicit_deps[DEP_GEN_MAX_EXPLICIT_DEPS];  // PTO2TaskId::raw, length = explicit_dep_count
     uint8_t arg_types[CORE_MAX_TENSOR_ARGS];            // TensorArgType, length = tensor_count
     int32_t kernel_id[3];  // per-subslot kernel id (AIC, AIV0, AIV1); INVALID_KERNEL_ID = -1
-    uint8_t _pad0[4];      // align tensors[] to 64 B (offset 576)
+    uint32_t block_num;    // SPMD logical block count; 1 means non-SPMD
     uint8_t tensors[CORE_MAX_TENSOR_ARGS][DEP_GEN_TENSOR_SIZE];  // opaque Tensor blobs
 } __attribute__((aligned(64)));
 

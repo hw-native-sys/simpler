@@ -202,6 +202,7 @@ struct TaskTableEntry {
     uint64_t task_id;
     bool in_manual_scope;
     int32_t kernel_id[3];  // per-subslot {AIC, AIV0, AIV1}, -1 = inactive
+    uint32_t block_num;
     std::vector<TaskArgEntry> args;
 };
 
@@ -328,6 +329,7 @@ bool write_deps_json(
         // (and the swimlane host post-processor) use it to resolve task_id →
         // kernel without the AICore record carrying the field itself.
         out << ",\"kernel_ids\":[" << t.kernel_id[0] << ',' << t.kernel_id[1] << ',' << t.kernel_id[2] << ']';
+        out << ",\"block_num\":" << t.block_num;
         out << ",\"args\":[";
         for (size_t a = 0; a < t.args.size(); a++) {
             if (a > 0) out << ',';
@@ -642,6 +644,7 @@ dep_gen_replay_emit_deps_json(const DepGenRecord *records, size_t num_records, c
         task_entry.kernel_id[0] = rec.kernel_id[0];
         task_entry.kernel_id[1] = rec.kernel_id[1];
         task_entry.kernel_id[2] = rec.kernel_id[2];
+        task_entry.block_num = rec.block_num > 0 ? rec.block_num : 1u;
         task_entry.args.reserve(tc);
         for (int32_t i = 0; i < tc; i++) {
             TaskArgEntry slot{};

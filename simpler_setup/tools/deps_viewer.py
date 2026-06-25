@@ -19,12 +19,13 @@ tool supports two output formats:
 - html: Graphviz SVG wrapped in a self-contained pan/zoom HTML page
 
 In text mode the default view shows task identity ``(ring, local)`` together
-with ``kind=`` and ``func_id=``. Text-mode ``func_id=`` comes only from the
-three-slot ``kernel_ids`` layout and preserves ``[aic,aiv0,aiv1]`` with
-inactive slots kept as ``-1``; ``alloc`` / ``dummy`` tasks render as
-``func_id=none``. In HTML mode nodes are labeled ``(ring, local)`` only; they
-are colored by ``core_type`` when a perf sidecar is colocated (AIC blue, AIV
-orange).
+with ``kind=``, ``func_id=``, and SPMD block num when applicable. Text-mode
+``func_id=`` comes only from the three-slot ``kernel_ids`` layout and preserves
+``[aic,aiv0,aiv1]`` with inactive slots kept as ``-1``; ``alloc`` / ``dummy``
+tasks render as ``func_id=none``. ``SPMD block num = N`` is the logical block
+num captured from ``block_num``. In HTML mode SPMD nodes use a red border plus a
+transparent right-side ``xN`` block num label; nodes are colored by
+``core_type`` when a perf sidecar is colocated (AIC blue, AIV orange).
 
 Usage:
     python -m simpler_setup.tools.deps_viewer DEPS_JSON
@@ -277,6 +278,15 @@ def _merge_task_meta_with_kernel_ids(meta, task_table, func_names=None):
                 entry["func_name"] = entry["func_labels"][0]
         elif any(s >= 0 for s in slots):
             entry["func_labels"] = [f"f{slot}" if slot >= 0 else "-1" for slot in slots]
+        if not entry.get("core_type"):
+            has_aic = slots[0] >= 0
+            has_aiv = slots[1] >= 0 or slots[2] >= 0
+            if has_aic and has_aiv:
+                entry["core_type"] = "mix"
+            elif has_aic:
+                entry["core_type"] = "aic"
+            elif has_aiv:
+                entry["core_type"] = "aiv"
     return merged
 
 
@@ -342,7 +352,8 @@ def _load_task_meta(deps_path, func_names=None):
 
 def _label(task_id, meta, task_table, fmt_task):
     base = fmt_task(task_id)
-    kind = _task_kind(_normalize_task_id(task_id), meta, task_table)
+    normalized_task_id = _normalize_task_id(task_id)
+    kind = _task_kind(normalized_task_id, meta, task_table)
     if kind == "alloc":
         return f"{base} · alloc"
     if kind == "dummy":
@@ -379,10 +390,15 @@ _CORE_HEADER_COLOR = {
 _INPUT_BG = "#EAF2FF"
 _OUTPUT_BG = "#FFF2E5"
 _HEADER_FALLBACK = "#D8D8D8"
+_SPMD_COLOR = "#C62828"
 
 
 def _html_escape(text):
     return str(text).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;")
+
+
+def _dot_escape_label(text):
+    return str(text).replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
 
 
 def _short_tensor_label(tid, tensor_table):
@@ -465,17 +481,16 @@ def _task_node_html(task_id, task_entry, meta_entry, tensor_table, fmt_task):
     outputs = [a for a in args if a.get("type") in ("INOUT", "OUTPUT", "OUTPUT_EXISTING")]
     core_type = meta_entry.get("core_type") if meta_entry else None
     header_bg = _CORE_HEADER_COLOR.get(core_type if isinstance(core_type, str) else "", _HEADER_FALLBACK)
-
-    header_label = fmt_task(task_id)
+    border_attrs = f'BORDER="1" COLOR="{_SPMD_COLOR}"' if _task_block_num(task_entry) > 1 else 'BORDER="0"'
 
     rows = []
     for a in inputs:
         rows.append(_arg_row_html(a, tensor_table, "in"))
-    rows.append(f'<TR><TD ALIGN="CENTER" BGCOLOR="{header_bg}"><B>{_html_escape(header_label)}</B></TD></TR>')
+    rows.append(f'<TR><TD ALIGN="CENTER" BGCOLOR="{header_bg}"><B>{_html_escape(fmt_task(task_id))}</B></TD></TR>')
     for a in outputs:
         rows.append(_arg_row_html(a, tensor_table, "out"))
 
-    table = '<TABLE BORDER="0" CELLBORDER="1" CELLSPACING="0" CELLPADDING="3">' + "".join(rows) + "</TABLE>"
+    table = f'<TABLE {border_attrs} CELLBORDER="1" CELLSPACING="0" CELLPADDING="3">' + "".join(rows) + "</TABLE>"
     return table
 
 
@@ -521,6 +536,43 @@ def _task_func_id_label(task_id, meta, task_table):
     return "func_id=unknown"
 
 
+def _task_block_num(task_entry):
+    if not isinstance(task_entry, dict):
+        return 1
+    block_num = _normalize_small_int(task_entry.get("block_num"))
+    if block_num is None or block_num < 1:
+        return 1
+    return block_num
+
+
+def _task_blocks_text(task_entry):
+    block_num = _task_block_num(task_entry)
+    if block_num <= 1:
+        return ""
+    return f"SPMD block num = {block_num}"
+
+
+def _plain_node_attrs(task_id, meta, task_table, fmt_task):
+    meta_entry = meta.get(task_id)
+    kind = _task_kind(task_id, meta, task_table)
+    if kind == "submit" and meta_entry:
+        style = _node_style(meta_entry.get("core_type"))
+    elif kind == "alloc":
+        style = _CORE_STYLE["alloc"]
+    else:
+        style = _DEFAULT_STYLE
+
+    task_entry = task_table.get(task_id)
+    label = _dot_escape_label(_label(task_id, meta, task_table, fmt_task))
+    label_attr = f'label="{label}"'
+    style_attr = style["style"]
+    if _task_block_num(task_entry) > 1:
+        extra = f', color="{_SPMD_COLOR}", penwidth=1.5'
+    else:
+        extra = ""
+    return f'{label_attr}, shape={style["shape"]}, style="{style_attr}", fillcolor="{style["fillcolor"]}"{extra}'
+
+
 def emit_text(edges, nodes, meta, deps_path, annotations=None, tensor_table=None, task_table=None):
     """Render deps.json as grep-friendly plain text.
 
@@ -559,16 +611,20 @@ def emit_text(edges, nodes, meta, deps_path, annotations=None, tensor_table=None
     for task_id in sorted_nodes:
         kind = _task_kind(task_id, meta, task_table)
         func_label = _task_func_id_label(task_id, meta, task_table)
+        block_label = _task_blocks_text(task_table.get(task_id))
+        task_labels = " ".join(label for label in (func_label, block_label) if label)
         lines.append(
-            f"TASK {fmt_task(task_id)} kind={kind} {func_label} "
+            f"TASK {fmt_task(task_id)} kind={kind} {task_labels} "
             f"fanin={len(pred_map.get(task_id, set()))} fanout={len(succ_map.get(task_id, set()))}"
         )
 
     for task_id in sorted_nodes:
         kind = _task_kind(task_id, meta, task_table)
         func_label = _task_func_id_label(task_id, meta, task_table)
+        block_label = _task_blocks_text(task_table.get(task_id))
+        task_labels = " ".join(label for label in (func_label, block_label) if label)
         lines.append("")
-        lines.append(f"=== TASK {fmt_task(task_id)} kind={kind} {func_label} ===")
+        lines.append(f"=== TASK {fmt_task(task_id)} kind={kind} {task_labels} ===")
 
         pred_peers = sorted(pred_map.get(task_id, set()), key=_sort_task_id_key)
         lines.append(f"FANIN {len(pred_peers)}")
@@ -583,11 +639,20 @@ def emit_text(edges, nodes, meta, deps_path, annotations=None, tensor_table=None
     return "\n".join(lines) + "\n"
 
 
-def emit_dot(edges, nodes, meta, direction="LR", annotations=None, tensor_table=None, task_table=None):
+def emit_dot(
+    edges,
+    nodes,
+    meta,
+    direction="LR",
+    annotations=None,
+    tensor_table=None,
+    task_table=None,
+    show_tensor_info=None,
+):
     """Graphviz DOT source. Used internally to feed the layout engine before
     wrapping the SVG in HTML.
 
-    Two rendering modes selected by whether ``task_table`` is non-empty:
+    Two rendering modes selected by ``show_tensor_info``:
 
     1. Plain mode (``task_table`` is None or empty) — bare shape/color nodes,
        bare arrows. Used when only task-level structure is available.
@@ -599,10 +664,10 @@ def emit_dot(edges, nodes, meta, direction="LR", annotations=None, tensor_table=
        tensor_id matches the edge's tensor_id.
     """
     fmt_task = _make_task_formatter(nodes)
-    show_tensor = bool(task_table)
     annotations = annotations or {}
     tensor_table = tensor_table or {}
     task_table = task_table or {}
+    show_tensor = bool(task_table) if show_tensor_info is None else bool(show_tensor_info and task_table)
     lines = [
         "digraph deps {",
         f"  rankdir={direction};",
@@ -616,16 +681,7 @@ def emit_dot(edges, nodes, meta, direction="LR", annotations=None, tensor_table=
             html = _task_node_html(n, task_table.get(n), m, tensor_table, fmt_task)
             lines.append(f"  {_node_id(n)} [shape=none, margin=0, label=<{html}>];")
             continue
-        kind = _task_kind(n, meta, task_table)
-        if kind == "submit" and m:
-            style = _node_style(m.get("core_type"))
-        elif kind == "alloc":
-            style = _CORE_STYLE["alloc"]
-        else:
-            style = _DEFAULT_STYLE
-        label = _label(n, meta, task_table, fmt_task).replace("\\", "\\\\").replace('"', '\\"')
-        attrs = f'label="{label}", shape={style["shape"]}, style="{style["style"]}", fillcolor="{style["fillcolor"]}"'
-        lines.append(f"  {_node_id(n)} [{attrs}];")
+        lines.append(f"  {_node_id(n)} [{_plain_node_attrs(n, meta, task_table, fmt_task)}];")
     for pred, succ in edges:
         if not show_tensor:
             lines.append(f"  {_node_id(pred)} -> {_node_id(succ)};")
@@ -677,32 +733,73 @@ def render_svg(dot_text, engine="dot"):
     return proc.stdout
 
 
+def _spmd_badges_json(nodes, task_table):
+    task_table = task_table or {}
+    badges = {}
+    for task_id in nodes:
+        block_num = _task_block_num(task_table.get(task_id))
+        if block_num > 1:
+            badges[_node_id(task_id)] = block_num
+    return json.dumps(badges, sort_keys=True, separators=(",", ":"))
+
+
 _HTML_TEMPLATE = """<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
 <title>deps.json — {n_nodes} nodes, {n_edges} edges</title>
 <style>
-  html, body {{ margin: 0; height: 100%; background: #fafafa; font-family: -apple-system, sans-serif; }}
-  #hud {{ position: fixed; top: 8px; left: 8px; background: #fff; padding: 6px 10px;
-         border: 1px solid #ddd; border-radius: 4px; font-size: 12px; z-index: 10;
-         box-shadow: 0 1px 3px rgba(0,0,0,0.08); }}
-  #hud kbd {{ font-family: ui-monospace, monospace; background: #f0f0f0;
-              padding: 1px 4px; border-radius: 2px; }}
-  #legend {{ position: fixed; top: 8px; right: 8px; background: #fff; padding: 6px 10px;
-             border: 1px solid #ddd; border-radius: 4px; font-size: 12px; z-index: 10;
-             box-shadow: 0 1px 3px rgba(0,0,0,0.08); display: flex; gap: 12px; align-items: center; }}
-  #legend .swatch {{ display: inline-flex; align-items: center; gap: 4px; }}
+  html, body {{
+    margin: 0; height: 100%; background: #f8fafc;
+    font-family: Inter, ui-sans-serif, system-ui, -apple-system, sans-serif;
+    color: #0f172a; overflow: hidden; -webkit-font-smoothing: antialiased;
+    text-rendering: optimizeLegibility;
+  }}
+  #hud, #legend {{
+    position: fixed; z-index: 10; display: flex; align-items: center;
+    background: rgba(255,255,255,0.94); border: 1px solid rgba(203,213,225,0.9);
+    border-radius: 10px; color: #0f172a; font-size: 12px;
+    box-shadow: 0 10px 26px rgba(15,23,42,0.10); backdrop-filter: blur(10px);
+  }}
+  #hud {{ top: 12px; left: 12px; gap: 8px; padding: 8px 12px; }}
+  #hud .stat {{ font-weight: 600; color: #020617; }}
+  #hud .muted {{ color: #cbd5e1; }}
+  #hud .divider {{ width: 1px; height: 16px; margin: 0 4px; background: #e2e8f0; }}
+  #hud kbd {{
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace; background: #f1f5f9;
+    border: 1px solid #cbd5e1; color: #334155; padding: 1px 5px; border-radius: 5px;
+  }}
+  #legend {{
+    top: 12px; right: 12px; gap: 12px; padding: 8px 12px;
+    flex-wrap: wrap; max-width: min(760px, calc(100vw - 24px));
+  }}
+  #legend .swatch {{ display: inline-flex; align-items: center; gap: 6px; color: #334155; white-space: nowrap; }}
   #legend svg {{ display: block; }}
-  #stage {{ width: 100vw; height: 100vh; overflow: hidden; cursor: grab; }}
+  #stage {{ width: 100vw; height: 100vh; overflow: hidden; cursor: grab; background:
+    radial-gradient(circle at 20px 20px, rgba(100,116,139,0.18) 1px, transparent 1px), #eef2f7;
+    background-size: 24px 24px; }}
   #stage.panning {{ cursor: grabbing; }}
-  #stage > svg {{ transform-origin: 0 0; transition: none; max-width: none; }}
+  #stage > svg {{
+    transform-origin: 0 0; transition: none; max-width: none; overflow: visible;
+    filter: drop-shadow(0 16px 28px rgba(15,23,42,0.10));
+  }}
+  #stage .node path, #stage .node ellipse, #stage .node polygon {{
+    filter: drop-shadow(0 3px 4px rgba(15,23,42,0.18));
+  }}
+  #stage .edge path, #stage .edge polygon {{ opacity: 0.78; }}
 </style>
 </head>
 <body>
 <div id="hud">
-  {n_nodes} nodes · {n_edges} edges &nbsp;|&nbsp;
-  <kbd>drag</kbd> pan &nbsp; <kbd>wheel</kbd> zoom &nbsp; <kbd>f</kbd> fit &nbsp; <kbd>r</kbd> reset
+  <span class="stat">{n_nodes} nodes</span>
+  <span class="muted">·</span>
+  <span class="stat">{n_edges} edges</span>
+  <span class="divider"></span>
+  <kbd>drag</kbd><span>pan</span>
+  <kbd>wheel</kbd><span>zoom</span>
+  <kbd>f</kbd><span>fit</span>
+  <kbd>r</kbd><span>reset</span>
 </div>
 <div id="legend">
   <span class="swatch">
@@ -729,6 +826,15 @@ _HTML_TEMPLATE = """<!DOCTYPE html>
     </svg>
     alloc
   </span>
+  <span class="swatch">
+    <svg width="34" height="14" viewBox="0 0 34 14">
+      <rect x="1" y="2" width="18" height="10" rx="3" ry="3" fill="none"
+            stroke="#C62828" stroke-width="1"/>
+      <text x="20" y="8" fill="#C62828"
+            font-family="Helvetica, sans-serif" font-size="7" font-weight="700">xN</text>
+    </svg>
+    SPMD block num
+  </span>
 </div>
 <div id="stage">
 {svg_body}
@@ -740,6 +846,42 @@ _HTML_TEMPLATE = """<!DOCTYPE html>
   if (!svg) return;
   svg.removeAttribute('width');
   svg.removeAttribute('height');
+  const spmdBlocks = {spmd_badges_json};
+  const svgNS = 'http://www.w3.org/2000/svg';
+
+  function svgEl(name, attrs) {{
+    const el = document.createElementNS(svgNS, name);
+    for (const [key, value] of Object.entries(attrs)) {{
+      el.setAttribute(key, value);
+    }}
+    return el;
+  }}
+
+  function addSpmdBadges() {{
+    for (const [nodeId, blocks] of Object.entries(spmdBlocks)) {{
+      const title = Array.from(svg.querySelectorAll('g.node > title')).find((item) => item.textContent === nodeId);
+      if (!title) continue;
+      const group = title.parentElement;
+      const graph = group ? group.parentElement : null;
+      if (!group || !graph || graph.querySelector(`.spmd-badge[data-node-id="${{nodeId}}"]`)) continue;
+
+      const box = group.getBBox();
+      const text = `x${{blocks}}`;
+      const x = box.x + box.width + 1;
+      const y = box.y + box.height / 2 - 3;
+      const badge = svgEl('g', {{ class: 'spmd-badge', 'data-node-id': nodeId }});
+      badge.appendChild(svgEl('title', {{}}));
+      badge.lastChild.textContent = `SPMD block num: ${{blocks}}`;
+
+      badge.appendChild(svgEl('text', {{
+        x, y, fill: '#C62828', 'font-family': 'Helvetica, sans-serif',
+        'font-size': 8, 'font-weight': 700,
+      }}));
+      badge.lastChild.textContent = text;
+      graph.appendChild(badge);
+    }}
+  }}
+  addSpmdBadges();
 
   let scale = 1, tx = 0, ty = 0;
   const apply = () => {{ svg.style.transform = `translate(${{tx}}px, ${{ty}}px) scale(${{scale}})`; }};
@@ -799,6 +941,7 @@ def emit_html(
     annotations=None,
     tensor_table=None,
     task_table=None,
+    show_tensor_info=None,
 ):
     """Build the pan/zoom HTML page: DOT → Graphviz SVG → inline into template."""
     dot = emit_dot(
@@ -809,6 +952,7 @@ def emit_html(
         annotations=annotations,
         tensor_table=tensor_table,
         task_table=task_table,
+        show_tensor_info=show_tensor_info,
     )
     svg_bytes = render_svg(dot, engine=engine)
     svg_text = svg_bytes.decode("utf-8", errors="replace")
@@ -818,6 +962,7 @@ def emit_html(
         n_nodes=len(nodes),
         n_edges=len(edges),
         svg_body=svg_text,
+        spmd_badges_json=_spmd_badges_json(nodes, task_table),
     )
 
 
@@ -972,7 +1117,8 @@ def main(argv=None):
         engine=args.engine,
         annotations=annotations,
         tensor_table=tensor_table,
-        task_table=task_table if args.show_tensor_info else None,
+        task_table=task_table,
+        show_tensor_info=args.show_tensor_info,
     )
     out.write_text(html)
     print(f"Wrote {out} ({len(nodes)} nodes, {len(edges)} edges, engine={args.engine}, format=html)")

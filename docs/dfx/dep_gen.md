@@ -35,8 +35,8 @@ race — which is why deps.json now fully replaces the removed `fanout[]`.
 
 - **Capture point.** `pto_orchestrator::submit_task` writes a
   `DepGenRecord` (task_id, scope flag, tensor blobs, arg types,
-  explicit deps) into a per-thread shared-memory ring buffer for every
-  call when `enable_dep_gen` is on.
+  explicit deps, kernel ids, and SPMD block num) into a per-thread
+  shared-memory ring buffer for every call when `enable_dep_gen` is on.
 - **In-memory drain.** The host `DepGenCollector` (background mgmt
   thread, ProfilerBase machinery shared with PMU / L2 Perf / Tensor
   Dump) drains the ring into a `std::vector<DepGenRecord>` resident on
@@ -109,8 +109,8 @@ The standard SceneTest path
 ```json
 {
   "tasks": [
-    {"task_id": "0",          "scope": "auto", "args": []},
-    {"task_id": "4294967296", "scope": "auto", "args": [
+    {"task_id": "0",          "scope": "auto", "kernel_ids": [-1,-1,-1], "block_num": 1, "args": []},
+    {"task_id": "4294967296", "scope": "auto", "kernel_ids": [7,-1,-1], "block_num": 4, "args": [
       {"idx": 0, "type": "INPUT", "tensor_id": "13451765318376212391",
        "dtype": "FLOAT32", "shape": [16384],
        "start_offset": "0", "strides": [1]}
@@ -158,8 +158,11 @@ local = raw & 0xFFFFFFFF
 
 One entry per task observed in the trace. `scope` is `"manual"` when the
 submit happened inside a manual scope (no automatic dependency wiring)
-and `"auto"` otherwise. Tools that only need task-pair edges can ignore
-this block.
+and `"auto"` otherwise. `kernel_ids` is the per-subslot
+`[aic,aiv0,aiv1]` kernel id triple, with inactive subslots encoded as
+`-1`. `block_num` is the SPMD logical block num for the submit; `1`
+means a normal single-block task and values greater than `1` identify
+SPMD tasks. Tools that only need task-pair edges can ignore this block.
 
 ### `tensors[]`
 
@@ -241,8 +244,9 @@ The default text output contains:
     `name_map_*.json`. When the `kernel_ids` fallback is used, `func_id=` shows an
     aligned 3-slot integer array in `[aic,aiv0,aiv1]` order; inactive slots remain
     `-1`. `func_name_map` stays `no` unless a real human-readable name was resolved.
-- `TASK INDEX` — one line per task with `kind=` + `func_id=` and unique `fanin=` /
-  `fanout=` counts for quick grep.
+- `TASK INDEX` — one line per task with `kind=` + `func_id=` and unique
+  `fanin=` / `fanout=` counts for quick grep. SPMD tasks additionally carry
+  `SPMD block num = N`, where `N` is the captured logical block num.
 - `TASK DETAILS` — one block per task with `FANIN` / `FANOUT` peer task references
   (task-adjacency-only, no tensor detail).
 
@@ -257,13 +261,14 @@ Node visual encoding (legend top-right of the rendered HTML):
 | Orange ellipse | AIV (vector) — kernel ran on the vector unit |
 | Green diamond | mix — single `submit_task` with `MixedKernels` spanning both core types |
 | Gray dashed note | alloc — task from `alloc_tensors` (got a task_id, references downstream via `owner_task_id`, but never dispatched a kernel so has no perf record) |
+| Red border + right-side `xN` label | SPMD task with `block_num=N` |
 
-Node labels read as `(ring, local)` only — no func_name or func_id is
-shown in the HTML view. The text output (`deps_viewer.txt`) carries the
-`kind=` + `func_id=` labels; the HTML view focuses on structural layout and stays
-agnostic to function naming. When you need per-task tensor rows (storage / shape /
-strides / start_offset) and arg-port edge routing, rerun the HTML export with
-`--show-tensor-info`.
+Node labels read as `(ring, local)` with a red border and right-side `xN` block num label for SPMD
+tasks. The text output (`deps_viewer.txt`) carries the full `kind=` +
+`func_id=` labels and adds `SPMD block num = N` only for SPMD tasks; the HTML
+view keeps the graph focused on structure and the SPMD marker.
+When you need per-task tensor rows (storage / shape / strides / start_offset)
+and arg-port edge routing, rerun the HTML export with `--show-tensor-info`.
 
 Browser controls in the HTML viewer:
 
@@ -352,10 +357,10 @@ list; only the dep_gen replay graph loses the tail.
 
 | Layer | File | Role |
 | ----- | ---- | ---- |
-| Shared-mem layout | `src/{a2a3,a5}/platform/include/common/dep_gen.h` | `DepGenRecord` (4672 B base, cache-line aligned, ≤64 inline explicit_deps) + `DepGenOverflowRecord` chain view (≤582 deps per slot) + SPSC ring + per-thread ready queue. Byte-identical layout across platforms. |
+| Shared-mem layout | `src/{a2a3,a5}/platform/include/common/dep_gen.h` | `DepGenRecord` (4672 B base, cache-line aligned, ≤64 inline explicit_deps, per-task `block_num`) + `DepGenOverflowRecord` chain view (≤582 deps per slot) + SPSC ring + per-thread ready queue. Byte-identical layout across platforms. |
 | AICPU writer | `src/{a2a3,a5}/platform/{include,shared}/aicpu/dep_gen_collector_aicpu.{h,cpp}` | Single-instance write path; weak-fallback exported to host build. a5 reuses the a2a3 source verbatim — the writer accesses its own device-side view of shared memory, independent of how host↔device transport is implemented. |
 | Host collector | `src/{a2a3,a5}/platform/{include/host,shared/host}/dep_gen_collector.{h,cpp}` | `ProfilerBase<DepGenCollector, DepGenModule>` — drains ring → `records_` vector. On a5 (no SVM) it uses the base `alloc_paired_buffer`, which malloc's a host shadow + `copy_to_device`'s it and registers it via `add_malloc_shadow` so teardown can free it; `reconcile_counters` explicitly `copy_from_device`'s the BufferState before reading, and `finalize` lets `BufferPoolManager::clear_mappings()` release all shadows as the single source of truth. |
-| Capture call site | `src/{a2a3,a5}/runtime/tensormap_and_ringbuffer/runtime/pto_orchestrator.cpp` `submit_task_common` | One conditional block that snapshots inputs into the ring when `is_dep_gen_enabled()`; fires for both `submit_task` and `submit_dummy_task`. **a2a3 only:** the schema additionally carries `kernel_id[3] = {aic, aiv0, aiv1}` so the swimlane post-processor can resolve `task_id → kernel` from `deps.json` at level=1 where the AICore record is the sole device-side identity source. Inactive subslots stay at `INVALID_KERNEL_ID = -1`. |
+| Capture call site | `src/{a2a3,a5}/runtime/tensormap_and_ringbuffer/runtime/pto_orchestrator.cpp` `submit_task_common` | One conditional block that snapshots inputs into the ring when `is_dep_gen_enabled()`; fires for both `submit_task` and `submit_dummy_task`. The schema carries `kernel_ids[3] = {aic, aiv0, aiv1}` so the swimlane post-processor can resolve `task_id → kernel` from `deps.json` at level=1 where the AICore record is the sole device-side identity source. Inactive subslots stay at `INVALID_KERNEL_ID = -1`. It also carries the SPMD logical block num (`block_num` on a2a3, `core_num` on a5's launch spec) as `tasks[].block_num`. |
 | Replay | `src/{a2a3,a5}/runtime/tensormap_and_ringbuffer/host/dep_gen_replay.{h,cpp}` | Pure CPU; runs dual-pass differential replay — `compute_task_fanin` (oracle) + inlined STEP A/B mirror (annotated) against two `PTO2TensorMap` instances. Emits `deps.json` when both passes agree per record. Platform-agnostic — a5 reuses the a2a3 source verbatim. |
 | Device-runner hookup | `src/{a2a3,a5}/platform/{onboard,sim}/host/device_runner.cpp` | post-`reconcile_counters` calls `dep_gen_replay_emit_deps_json(records.data(), records.size(), deps_path)` |
 | Viewer | `simpler_setup/tools/deps_viewer.py` | `deps.json` → text (default) or pan/zoom HTML |
