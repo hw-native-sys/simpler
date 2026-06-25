@@ -397,9 +397,10 @@ public:
         return rc;
     }
 
-    // Upstream-compatible overload: accepts thread_idx (ignored — polling
-    // scheduler's bookkeeping is thread-agnostic at this point).
-    void on_orchestration_done(Runtime *runtime, PTO2Runtime *rt, int32_t total_tasks, int32_t /*thread_idx*/)
+    // Upstream-compatible overload: signature is (runtime, rt, thread_idx, total_tasks).
+    // thread_idx is ignored — polling scheduler's bookkeeping is thread-agnostic at
+    // this point.
+    void on_orchestration_done(Runtime *runtime, PTO2Runtime *rt, int32_t /*thread_idx*/, int32_t total_tasks)
     {
         on_orchestration_done(runtime, rt, total_tasks);
     }
