@@ -43,6 +43,7 @@
 #include "common/unified_log.h"
 
 // Register-based communication
+#include "aicpu/platform_aicpu_affinity.h"
 #include "aicpu/platform_regs.h"
 #include "common/platform_config.h"
 
@@ -353,9 +354,17 @@ int32_t AicpuExecutor::ensure_orch_so_loaded(Runtime *runtime, int32_t thread_id
  * Shutdown AICore - Send exit signal via registers to all AICore kernels
  */
 int32_t AicpuExecutor::run(Runtime *runtime) {
-    int32_t thread_idx = thread_idx_++;
+    int32_t affinity_exec_idx = platform_aicpu_affinity_thread_idx();
+    int32_t thread_idx = (affinity_exec_idx >= 0) ? affinity_exec_idx : (thread_idx_++);
+    if (thread_idx < 0 || thread_idx >= aicpu_thread_num_ || thread_idx >= MAX_AICPU_THREADS) {
+        LOG_ERROR(
+            "Thread index %d out of bounds (active=%d max=%d exec_idx=%d)", thread_idx, aicpu_thread_num_,
+            MAX_AICPU_THREADS, affinity_exec_idx
+        );
+        return -1;
+    }
     int32_t run_rc = 0;
-    LOG_INFO_V0("Thread %d: Start", thread_idx);
+    LOG_INFO_V0("Thread %d: Start (exec_idx=%d)", thread_idx, affinity_exec_idx);
 
     // Orchestrator check
     if (thread_idx >= sched_thread_num_) {

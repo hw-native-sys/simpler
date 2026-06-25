@@ -18,177 +18,27 @@
 
 #include "common/unified_log.h"
 
-static constexpr int32_t AICPU_CORES_PER_CHIP = 8;
-static constexpr int32_t MAX_CLUSTERS = 2;
-static constexpr int32_t CPUS_PER_CLUSTER = 4;
 // 16 = headroom for a5's launch budget (14 logical user cpus on the
 // 0x7ffe SKU) + a small over-launch margin. a2a3 only ever launches 6
 // threads and never approaches this bound.
 static constexpr int32_t MAX_GATE_THREADS = 16;
 
-// Bit i is set once thread-slot i has written its s_thread_cpu[] report. Keyed
-// on the reporting slot (not the cpu) so the barrier still reaches
-// total_launched when two unpinned threads share a cpu (sim).
-static std::atomic<uint64_t> s_done_mask{0};
-static std::atomic<int32_t> s_reported{0};
-static std::atomic<int32_t> s_gate_init{0};
-static std::atomic<int32_t> s_gate_ready{0};
-
-static int32_t s_thread_cpu[MAX_GATE_THREADS];
-static bool s_thread_survive[MAX_GATE_THREADS];
-
-// Per-thread exec/slot index set by BOTH gates (legacy a2a3 + filter a5):
-// -1 = dropped, otherwise this thread's index among the launched threads.
+// Per-thread exec/slot index set by the filter gate:
+// -1 = dropped, otherwise this thread's index in allowed_cpus[].
 // Read via platform_aicpu_affinity_thread_idx(); used as the run-wall buffer
-// slot and (filter gate) the sched/orch role id.
+// slot and the sched/orch role id.
 static thread_local int32_t tl_exec_idx = -1;
 
-static inline int32_t popcount64(uint64_t v) { return __builtin_popcountll(static_cast<unsigned long long>(v)); }
-
-bool platform_aicpu_affinity_gate(int32_t logical_count, int32_t total_launched) {
-    tl_exec_idx = -1;
-
-    // Bound-check both inputs against the static slot buffers (s_thread_cpu[],
-    // s_thread_survive[], both MAX_GATE_THREADS) before any indexing. Without
-    // this, total_launched > MAX_GATE_THREADS makes the classifier loop read
-    // s_thread_cpu[tid] and write s_thread_survive[tid] out of bounds; a
-    // negative count would bypass the bounds checks entirely. Mirrors the
-    // validation in platform_aicpu_affinity_gate_filter().
-    if (total_launched <= 0 || total_launched > MAX_GATE_THREADS || logical_count < 0) {
-        LOG_ERROR(
-            "AICPU affinity gate: invalid config logical_count=%d total_launched=%d (max=%d) — dropping all threads",
-            logical_count, total_launched, MAX_GATE_THREADS
-        );
-        return false;
-    }
-    if (logical_count >= total_launched) {
-        // No over-launch (unreachable for a2a3, where logical < total always):
-        // every thread survives. Leave tl_exec_idx = -1 so no run-wall slot is
-        // claimed on this degenerate path.
-        return true;
-    }
-
-    // Assign this thread a reporting slot.
-    int32_t idx = s_reported.fetch_add(1, std::memory_order_acq_rel);
-
-    // Report CPU
-#if defined(__aarch64__)
-    int32_t cpu = sched_getcpu();
-#elif defined(__x86_64__)
-    int32_t cpu = sched_getcpu();
-#else
-    int32_t cpu = -1;
-#endif
-    int32_t normalized_cpu = (cpu >= 0) ? cpu % AICPU_CORES_PER_CHIP : -1;
-    if (idx < MAX_GATE_THREADS) {
-        s_thread_cpu[idx] = normalized_cpu;
-    }
-
-    // Barrier: publish this slot (the release pairs with the acquire load below
-    // so the s_thread_cpu[] write above is visible), then wait until every slot
-    // has reported. The old barrier released on s_reported, which is bumped
-    // *before* the write, so the classifier below could run on half-written or
-    // stale slots and non-deterministically keep cluster #0.
-    if (idx < 64) {
-        s_done_mask.fetch_or(1ULL << idx, std::memory_order_release);
-    }
-    while (popcount64(s_done_mask.load(std::memory_order_acquire)) < total_launched) {}
-
-    // CAS winner does cluster classification
-    int32_t expected = 0;
-    if (s_gate_init.compare_exchange_strong(expected, 1, std::memory_order_acq_rel, std::memory_order_acquire)) {
-        // Initialize survive flags
-        for (int32_t i = 0; i < total_launched; ++i) {
-            s_thread_survive[i] = false;
-        }
-
-        struct ClusterInfo {
-            int32_t count{0};
-            int32_t tids[MAX_GATE_THREADS];
-        };
-        ClusterInfo clusters[MAX_CLUSTERS];
-
-        for (int32_t tid = 0; tid < total_launched; ++tid) {
-            int32_t c = s_thread_cpu[tid];
-            if (c < 0) continue;
-            int32_t cluster_id = c / CPUS_PER_CLUSTER;
-            if (cluster_id < 0 || cluster_id >= MAX_CLUSTERS) continue;
-            ClusterInfo &info = clusters[cluster_id];
-            if (info.count < MAX_GATE_THREADS) info.tids[info.count++] = tid;
-        }
-
-        int32_t major_id = (clusters[0].count >= clusters[1].count) ? 0 : 1;
-        int32_t minor_id = 1 - major_id;
-        int32_t major_cnt = clusters[major_id].count;
-        int32_t minor_cnt = clusters[minor_id].count;
-
-        LOG_INFO_V0(
-            "AICPU affinity gate: major=%d(cnt=%d) minor=%d(cnt=%d) logical=%d", major_id, major_cnt, minor_id,
-            minor_cnt, logical_count
-        );
-
-        if (major_cnt == logical_count && minor_cnt == (total_launched - logical_count)) {
-            // Expected topology: major cluster threads survive
-            for (int32_t i = 0; i < clusters[major_id].count; ++i) {
-                s_thread_survive[clusters[major_id].tids[i]] = true;
-            }
-        } else {
-            // Unexpected topology: fall back to first logical_count threads
-            LOG_WARN(
-                "AICPU affinity gate: unexpected topology (major=%d minor=%d), "
-                "falling back to index-based cutoff",
-                major_cnt, minor_cnt
-            );
-            for (int32_t i = 0; i < logical_count && i < total_launched; ++i) {
-                s_thread_survive[i] = true;
-            }
-        }
-
-        s_gate_ready.store(1, std::memory_order_release);
-    }
-
-    // Wait for classification to complete
-    while (s_gate_ready.load(std::memory_order_acquire) == 0) {}
-
-    bool survive = (idx < total_launched) ? s_thread_survive[idx] : false;
-
-    // Last thread resets state for next invocation
-    static std::atomic<int32_t> s_cleanup{0};
-    int32_t cleanup_idx = s_cleanup.fetch_add(1, std::memory_order_acq_rel);
-    if (cleanup_idx + 1 == total_launched) {
-        s_done_mask.store(0, std::memory_order_release);
-        s_reported.store(0, std::memory_order_release);
-        s_gate_init.store(0, std::memory_order_release);
-        s_gate_ready.store(0, std::memory_order_release);
-        s_cleanup.store(0, std::memory_order_release);
-    }
-
-    if (!survive) {
-        LOG_INFO_V0("AICPU affinity gate: thread idx=%d cpu=%d DROPPED", idx, normalized_cpu);
-    } else {
-        LOG_INFO_V0("AICPU affinity gate: thread idx=%d cpu=%d ACTIVE", idx, normalized_cpu);
-    }
-
-    // Publish this thread's slot index (survivors only) for the run-wall
-    // buffer; dropped threads report -1 so they never claim a slot.
-    tl_exec_idx = survive ? idx : -1;
-    return survive;
-}
-
 // =============================================================================
-// Filter-style gate (a5 onboard).
+// Filter-style gate (onboard).
 // =============================================================================
 //
 // All `total_launched` threads enter, each reads sched_getcpu() and reports
 // to s_filter_thread_cpu[]. After the barrier, the CAS-winner classifies:
 // for each report, look up cpu_id in `allowed_cpus[]`; if found, the thread
 // survives and gets exec_idx = index in allowed_cpus[]. Misses are dropped.
-//
-// State is shared with the legacy gate where harmless (s_reported,
-// s_gate_init, s_gate_ready, s_cleanup) — only one variant runs in any
-// given build (a2a3 uses the legacy gate; a5 onboard uses this one).
 
-// Per-launch barrier + classification state, parallel to the legacy gate.
+// Per-launch barrier + classification state.
 // Two counters: s_filter_claim hands out a unique slot via fetch_add so each
 // thread writes to a distinct s_filter_thread_cpu[idx]. s_filter_published
 // is bumped (release) AFTER the cpu write — the classification barrier
@@ -251,6 +101,7 @@ bool platform_aicpu_affinity_gate_filter(const int32_t *allowed_cpus, int32_t al
         // sink cpu when launch_count >= popcount(OCCUPY)). The first thread
         // that lands on each allowed cpu wins; later duplicates are dropped.
         bool slot_filled[MAX_GATE_THREADS] = {false};
+        int32_t filled_count = 0;
         for (int32_t tid = 0; tid < total_launched && tid < MAX_GATE_THREADS; ++tid) {
             int32_t my_cpu = s_filter_thread_cpu[tid];
             if (my_cpu < 0) continue;
@@ -258,8 +109,33 @@ bool platform_aicpu_affinity_gate_filter(const int32_t *allowed_cpus, int32_t al
                 if (allowed_cpus[a] == my_cpu && !slot_filled[a]) {
                     s_filter_thread_exec_idx[tid] = a;
                     slot_filled[a] = true;
+                    ++filled_count;
                     break;
                 }
+            }
+        }
+
+        // Forward-progress guard: launch_count=popcount(OCCUPY) is expected
+        // to give one representative for each host-selected cpu_id, but some
+        // runtime dispatch patterns can duplicate a cpu and miss another one.
+        // If that happens, keep the exact-match assignments and fill the
+        // missing exec slots by reported thread order so sched/orch roles are
+        // still all present instead of timing out the AICore side.
+        if (filled_count < allowed_count) {
+            LOG_WARN(
+                "AICPU filter gate: only matched %d/%d allowed cpus; filling missing exec slots by report order",
+                filled_count, allowed_count
+            );
+            int32_t next_slot = 0;
+            for (int32_t tid = 0; tid < total_launched && tid < MAX_GATE_THREADS && filled_count < allowed_count;
+                 ++tid) {
+                if (s_filter_thread_exec_idx[tid] >= 0) continue;
+                while (next_slot < allowed_count && slot_filled[next_slot])
+                    ++next_slot;
+                if (next_slot >= allowed_count) break;
+                s_filter_thread_exec_idx[tid] = next_slot;
+                slot_filled[next_slot] = true;
+                ++filled_count;
             }
         }
 

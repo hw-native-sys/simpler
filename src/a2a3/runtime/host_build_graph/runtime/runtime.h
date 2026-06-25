@@ -222,6 +222,15 @@ public:
     // Task storage
     Task tasks[RUNTIME_MAX_TASKS];  // Fixed-size task array
 
+    // Filter-style affinity gate input (a2a3 onboard). Placed AFTER `tasks`
+    // because AICore reads runtime->tasks[] by offset. Host fills these before
+    // launch from AICPU OCCUPY; the device gate keeps threads whose
+    // sched_getcpu() lands on one of the cpu_ids. The array position is the
+    // deterministic exec_idx used by AicpuExecutor for stable core assignment.
+    int32_t aicpu_allowed_cpus[16];
+    int32_t aicpu_allowed_cpu_count;
+    int32_t aicpu_launch_count;
+
 private:
     int next_task_id;  // Next available task ID
 

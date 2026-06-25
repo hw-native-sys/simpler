@@ -92,9 +92,21 @@ extern "C" __attribute__((visibility("default"))) int simpler_aicpu_exec(void *a
     set_scope_stats_enabled(GET_PROFILING_FLAG(k_args->enable_profiling_flag, PROFILING_FLAG_SCOPE_STATS));
     set_platform_scope_stats_base(k_args->scope_stats_data_base);
 
-    // Affinity gate: drop excess threads before entering runtime
-    if (!platform_aicpu_affinity_gate(runtime->aicpu_thread_num, PLATFORM_MAX_AICPU_THREADS_JUST_FOR_LAUNCH)) {
-        LOG_INFO_V0("Thread dropped by cluster affinity");
+    // Filter-style affinity gate. Host computed ALLOWED_CPUS from AICPU
+    // OCCUPY and wrote it into Runtime; the device side only matches
+    // sched_getcpu() against that table and exposes the table position as
+    // exec_idx.
+    if (runtime->aicpu_allowed_cpu_count <= 0 || runtime->aicpu_launch_count <= 0) {
+        LOG_ERROR(
+            "AICPU affinity inputs missing: allowed_cpu_count=%d launch_count=%d (host probe must run before exec)",
+            runtime->aicpu_allowed_cpu_count, runtime->aicpu_launch_count
+        );
+        return -1;
+    }
+    if (!platform_aicpu_affinity_gate_filter(
+            runtime->aicpu_allowed_cpus, runtime->aicpu_allowed_cpu_count, runtime->aicpu_launch_count
+        )) {
+        LOG_INFO_V0("Thread dropped by filter affinity gate");
         return 0;
     }
 
