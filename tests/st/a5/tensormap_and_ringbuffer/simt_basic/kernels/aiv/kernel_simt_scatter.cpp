@@ -77,16 +77,13 @@ static __aicore__ void simt_scatter_impl(__gm__ float *src, __gm__ int32_t *idx,
     set_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
     wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
 
-    // Element-scatter on both sim and onboard. The CPU sim backend exposes
-    // only a non-templated MSCATTER whose impl is already per-element, while
-    // the a5 onboard backend defaults the non-templated form to Coalesce::Row
-    // and gates the templated overloads behind PTO_NPU_ARCH_A5, so onboard
-    // must select Coalesce::Elem explicitly. See pto-isa#164.
-#ifdef __CPU_SIM
-    MSCATTER(outGlobal, srcTile, idxTile);
-#else
+    // Element-scatter on both sim and onboard via one instruction. The
+    // non-templated MSCATTER defaults to Coalesce::Row, so element-scatter
+    // must select Coalesce::Elem explicitly. pto-isa#166 (pinned via
+    // simpler#1156) opens the templated overloads to __CPU_SIM as well as
+    // PTO_NPU_ARCH_A5, so the same explicit call now compiles and runs
+    // identically on both backends — no __CPU_SIM fork. See pto-isa#164/#166.
     MSCATTER<Coalesce::Elem, ScatterAtomicOp::None, ScatterOOB::Skip>(outGlobal, srcTile, idxTile);
-#endif
 
     pipe_sync();
 }
