@@ -120,10 +120,10 @@ void WorkerEndpoint::control_comm_init(const char *) { throw_unsupported_control
 // LocalMailboxEndpoint — mailbox helpers
 // =============================================================================
 
-LocalMailboxEndpoint::LocalMailboxEndpoint(int32_t endpoint_id, void *mailbox) :
+LocalMailboxEndpoint::LocalMailboxEndpoint(int32_t worker_id, void *mailbox) :
     mailbox_(mailbox) {
     if (mailbox == nullptr) throw std::invalid_argument("LocalMailboxEndpoint: null mailbox");
-    caps_.endpoint_id = endpoint_id;
+    caps_.worker_id = worker_id;
 }
 
 MailboxState LocalMailboxEndpoint::read_mailbox_state() const {
@@ -198,7 +198,7 @@ const WorkerEndpointCaps &WorkerThread::caps() const {
     return endpoint_->caps();
 }
 
-int32_t WorkerThread::endpoint_id() const { return caps().endpoint_id; }
+int32_t WorkerThread::worker_id() const { return caps().worker_id; }
 
 // =============================================================================
 // WorkerThread — main loop + per-mode dispatch
@@ -334,7 +334,7 @@ WorkerCompletion LocalMailboxEndpoint::run(Ring *ring, const WorkerDispatch &dis
         write_mailbox_state(MailboxState::IDLE);
         completion.outcome = EndpointOutcome::TASK_FAILURE;
         completion.error_message =
-            "LocalMailboxEndpoint::run: child failed (endpoint=" + std::to_string(caps_.endpoint_id) +
+            "LocalMailboxEndpoint::run: child failed (worker_id=" + std::to_string(caps_.worker_id) +
             ", code=" + std::to_string(error_code) + "): " + msg;
         return completion;
     }
@@ -348,7 +348,14 @@ WorkerCompletion LocalMailboxEndpoint::run(Ring *ring, const WorkerDispatch &dis
 // WorkerManager
 // =============================================================================
 
-void WorkerManager::add_next_level(void *mailbox) { next_level_entries_.push_back(mailbox); }
+void WorkerManager::add_next_level(void *mailbox) {
+    add_next_level_at(static_cast<int32_t>(next_level_entries_.size()), mailbox);
+}
+
+void WorkerManager::add_next_level_at(int32_t worker_id, void *mailbox) {
+    if (worker_id < 0) throw std::invalid_argument("WorkerManager::add_next_level_at: negative worker_id");
+    next_level_entries_.push_back(LocalNextLevelEntry{worker_id, mailbox});
+}
 
 void WorkerManager::add_next_level_endpoint(std::unique_ptr<WorkerEndpoint> endpoint) {
     if (!endpoint) throw std::invalid_argument("WorkerManager::add_next_level_endpoint: null endpoint");
@@ -360,45 +367,52 @@ void WorkerManager::add_sub(void *mailbox) { sub_entries_.push_back(mailbox); }
 void WorkerManager::start(Ring *ring, const OnCompleteFn &on_complete) {
     if (ring == nullptr) throw std::invalid_argument("WorkerManager::start: null ring");
 
-    std::vector<int32_t> next_level_endpoint_ids;
-    next_level_endpoint_ids.reserve(next_level_entries_.size() + next_level_endpoint_entries_.size());
-    auto register_next_level_endpoint_id = [&](int32_t endpoint_id) {
-        if (endpoint_id < 0) {
-            throw std::runtime_error("WorkerManager::start: endpoint must have a stable endpoint_id");
+    std::vector<int32_t> next_level_worker_ids;
+    next_level_worker_ids.reserve(next_level_entries_.size() + next_level_endpoint_entries_.size());
+    auto register_next_level_worker_id = [&](int32_t worker_id) {
+        if (worker_id < 0) {
+            throw std::runtime_error("WorkerManager::start: NEXT_LEVEL worker must have a stable worker_id");
         }
-        if (std::find(next_level_endpoint_ids.begin(), next_level_endpoint_ids.end(), endpoint_id) !=
-            next_level_endpoint_ids.end()) {
+        if (std::find(next_level_worker_ids.begin(), next_level_worker_ids.end(), worker_id) !=
+            next_level_worker_ids.end()) {
             throw std::runtime_error(
-                "WorkerManager::start: duplicate NEXT_LEVEL endpoint_id " + std::to_string(endpoint_id)
+                "WorkerManager::start: duplicate NEXT_LEVEL worker_id " + std::to_string(worker_id)
             );
         }
-        next_level_endpoint_ids.push_back(endpoint_id);
+        next_level_worker_ids.push_back(worker_id);
     };
-    for (size_t i = 0; i < next_level_entries_.size(); ++i) {
-        register_next_level_endpoint_id(static_cast<int32_t>(i));
+    for (const auto &entry : next_level_entries_) {
+        register_next_level_worker_id(entry.worker_id);
     }
     for (const auto &endpoint : next_level_endpoint_entries_) {
-        register_next_level_endpoint_id(endpoint->caps().endpoint_id);
+        register_next_level_worker_id(endpoint->caps().worker_id);
     }
 
-    auto make_threads = [&](const std::vector<void *> &entries, std::vector<std::unique_ptr<WorkerThread>> &threads,
-                            int32_t endpoint_offset) {
+    auto make_next_level_threads = [&]() {
+        for (const auto &entry : next_level_entries_) {
+            auto wt = std::make_unique<WorkerThread>();
+            auto endpoint = std::make_unique<LocalMailboxEndpoint>(entry.worker_id, entry.mailbox);
+            wt->start(ring, this, on_complete, std::move(endpoint));
+            next_level_threads_.push_back(std::move(wt));
+        }
+    };
+    auto make_sub_threads = [&](const std::vector<void *> &entries,
+                                std::vector<std::unique_ptr<WorkerThread>> &threads) {
         for (size_t i = 0; i < entries.size(); ++i) {
             auto wt = std::make_unique<WorkerThread>();
-            auto endpoint =
-                std::make_unique<LocalMailboxEndpoint>(endpoint_offset + static_cast<int32_t>(i), entries[i]);
+            auto endpoint = std::make_unique<LocalMailboxEndpoint>(static_cast<int32_t>(i), entries[i]);
             wt->start(ring, this, on_complete, std::move(endpoint));
             threads.push_back(std::move(wt));
         }
     };
-    make_threads(next_level_entries_, next_level_threads_, 0);
+    make_next_level_threads();
     for (auto &endpoint : next_level_endpoint_entries_) {
         auto wt = std::make_unique<WorkerThread>();
         wt->start(ring, this, on_complete, std::move(endpoint));
         next_level_threads_.push_back(std::move(wt));
     }
     next_level_endpoint_entries_.clear();
-    make_threads(sub_entries_, sub_threads_, 0);
+    make_sub_threads(sub_entries_, sub_threads_);
 }
 
 void WorkerManager::report_error(std::exception_ptr e) {
@@ -457,16 +471,16 @@ std::vector<WorkerThread *> WorkerManager::pick_n_idle(WorkerType type, int n) c
     return result;
 }
 
-WorkerThread *WorkerManager::get_worker(WorkerType type, int logical_id) const {
+WorkerThread *WorkerManager::get_worker_by_index(WorkerType type, int worker_index) const {
     auto &threads = (type == WorkerType::NEXT_LEVEL) ? next_level_threads_ : sub_threads_;
-    if (logical_id < 0 || static_cast<size_t>(logical_id) >= threads.size()) return nullptr;
-    return threads[static_cast<size_t>(logical_id)].get();
+    if (worker_index < 0 || static_cast<size_t>(worker_index) >= threads.size()) return nullptr;
+    return threads[static_cast<size_t>(worker_index)].get();
 }
 
-WorkerThread *WorkerManager::get_worker_by_endpoint_id(WorkerType type, int32_t endpoint_id) const {
+WorkerThread *WorkerManager::get_worker_by_id(WorkerType type, int32_t worker_id) const {
     auto &threads = (type == WorkerType::NEXT_LEVEL) ? next_level_threads_ : sub_threads_;
     for (auto &wt : threads) {
-        if (wt->endpoint_id() == endpoint_id) return wt.get();
+        if (wt->worker_id() == worker_id) return wt.get();
     }
     return nullptr;
 }
@@ -477,16 +491,16 @@ WorkerThread *WorkerManager::pick_idle_excluding(WorkerType type, const std::vec
 }
 
 WorkerThread *WorkerManager::pick_idle_excluding_eligible(
-    WorkerType type, const std::vector<WorkerThread *> &exclude, const std::vector<int32_t> &eligible_endpoint_ids
+    WorkerType type, const std::vector<WorkerThread *> &exclude, const std::vector<int32_t> &eligible_worker_ids
 ) const {
     auto &threads = (type == WorkerType::NEXT_LEVEL) ? next_level_threads_ : sub_threads_;
     for (auto &wt : threads) {
         if (!wt->idle()) continue;
-        if (!eligible_endpoint_ids.empty()) {
+        if (!eligible_worker_ids.empty()) {
             bool eligible = false;
-            int32_t endpoint_id = wt->endpoint_id();
-            for (int32_t id : eligible_endpoint_ids) {
-                if (id == endpoint_id) {
+            int32_t worker_id = wt->worker_id();
+            for (int32_t id : eligible_worker_ids) {
+                if (id == worker_id) {
                     eligible = true;
                     break;
                 }
@@ -824,10 +838,10 @@ RemoteBufferExport WorkerThread::control_remote_export(
 }
 
 RemoteBufferHandle WorkerThread::control_remote_import(
-    int32_t importer_endpoint_id, const RemoteBufferExport &export_desc, uint32_t requested_access_flags
+    int32_t importer_worker_id, const RemoteBufferExport &export_desc, uint32_t requested_access_flags
 ) {
     if (!endpoint_) throw std::runtime_error("control_remote_import: null endpoint");
-    return endpoint_->control_remote_import(importer_endpoint_id, export_desc, requested_access_flags);
+    return endpoint_->control_remote_import(importer_worker_id, export_desc, requested_access_flags);
 }
 
 void WorkerThread::control_remote_release_import(const RemoteBufferHandle &handle) {
@@ -970,7 +984,7 @@ private:
 }  // namespace
 
 void WorkerManager::control_prepare(int worker_id, const uint8_t *digest) {
-    auto *wt = get_worker(WorkerType::NEXT_LEVEL, worker_id);
+    auto *wt = get_worker_by_id(WorkerType::NEXT_LEVEL, worker_id);
     if (wt == nullptr) {
         throw std::runtime_error("control_prepare: invalid worker_id " + std::to_string(worker_id));
     }
@@ -978,7 +992,7 @@ void WorkerManager::control_prepare(int worker_id, const uint8_t *digest) {
 }
 
 void WorkerManager::control_alloc_domain(int worker_id, const char *request_shm_name, const char *reply_shm_name) {
-    auto *wt = get_worker(WorkerType::NEXT_LEVEL, worker_id);
+    auto *wt = get_worker_by_id(WorkerType::NEXT_LEVEL, worker_id);
     if (wt == nullptr) {
         throw std::runtime_error("control_alloc_domain: invalid worker_id " + std::to_string(worker_id));
     }
@@ -986,7 +1000,7 @@ void WorkerManager::control_alloc_domain(int worker_id, const char *request_shm_
 }
 
 void WorkerManager::control_release_domain(int worker_id, const char *request_shm_name) {
-    auto *wt = get_worker(WorkerType::NEXT_LEVEL, worker_id);
+    auto *wt = get_worker_by_id(WorkerType::NEXT_LEVEL, worker_id);
     if (wt == nullptr) {
         throw std::runtime_error("control_release_domain: invalid worker_id " + std::to_string(worker_id));
     }
@@ -994,7 +1008,7 @@ void WorkerManager::control_release_domain(int worker_id, const char *request_sh
 }
 
 void WorkerManager::control_comm_init(int worker_id, const char *request_shm_name) {
-    auto *wt = get_worker(WorkerType::NEXT_LEVEL, worker_id);
+    auto *wt = get_worker_by_id(WorkerType::NEXT_LEVEL, worker_id);
     if (wt == nullptr) {
         throw std::runtime_error("control_comm_init: invalid worker_id " + std::to_string(worker_id));
     }
@@ -1004,15 +1018,15 @@ void WorkerManager::control_comm_init(int worker_id, const char *request_shm_nam
 ControlResult WorkerManager::control_digest_only(
     WorkerType type, int worker_id, uint64_t sub_cmd, const uint8_t *digest, double timeout_s
 ) {
-    auto &threads = (type == WorkerType::NEXT_LEVEL) ? next_level_threads_ : sub_threads_;
     const char *type_name = (type == WorkerType::NEXT_LEVEL) ? "NEXT_LEVEL" : "SUB";
     ControlResult result{type_name, static_cast<int32_t>(worker_id), false, ""};
-    if (worker_id < 0 || static_cast<size_t>(worker_id) >= threads.size()) {
+    WorkerThread *wt = get_worker_by_id(type, worker_id);
+    if (wt == nullptr) {
         result.error_message = "invalid worker_id " + std::to_string(worker_id);
         return result;
     }
     try {
-        threads[static_cast<size_t>(worker_id)]->control_generic(sub_cmd, nullptr, 0, timeout_s, digest);
+        wt->control_generic(sub_cmd, nullptr, 0, timeout_s, digest);
         result.ok = true;
     } catch (const std::exception &e) {
         result.error_message = strip_control_prefix(e.what(), "control_generic");
@@ -1021,13 +1035,13 @@ ControlResult WorkerManager::control_digest_only(
 }
 
 ControlResult WorkerManager::control_remote_prepare_register(
-    int endpoint_id, remote_l3::RemoteRegistryTarget target_registry, CallableKind callable_kind, const void *payload,
+    int worker_id, remote_l3::RemoteRegistryTarget target_registry, CallableKind callable_kind, const void *payload,
     size_t payload_size, const uint8_t *digest
 ) {
-    ControlResult result{"NEXT_LEVEL", static_cast<int32_t>(endpoint_id), false, ""};
-    WorkerThread *wt = get_worker_by_endpoint_id(WorkerType::NEXT_LEVEL, endpoint_id);
+    ControlResult result{"NEXT_LEVEL", static_cast<int32_t>(worker_id), false, ""};
+    WorkerThread *wt = get_worker_by_id(WorkerType::NEXT_LEVEL, worker_id);
     if (wt == nullptr) {
-        result.error_message = "invalid endpoint_id " + std::to_string(endpoint_id);
+        result.error_message = "invalid worker_id " + std::to_string(worker_id);
         return result;
     }
     try {
@@ -1040,12 +1054,12 @@ ControlResult WorkerManager::control_remote_prepare_register(
 }
 
 ControlResult WorkerManager::control_remote_commit_register(
-    int endpoint_id, remote_l3::RemoteRegistryTarget target_registry, CallableKind callable_kind, const uint8_t *digest
+    int worker_id, remote_l3::RemoteRegistryTarget target_registry, CallableKind callable_kind, const uint8_t *digest
 ) {
-    ControlResult result{"NEXT_LEVEL", static_cast<int32_t>(endpoint_id), false, ""};
-    WorkerThread *wt = get_worker_by_endpoint_id(WorkerType::NEXT_LEVEL, endpoint_id);
+    ControlResult result{"NEXT_LEVEL", static_cast<int32_t>(worker_id), false, ""};
+    WorkerThread *wt = get_worker_by_id(WorkerType::NEXT_LEVEL, worker_id);
     if (wt == nullptr) {
-        result.error_message = "invalid endpoint_id " + std::to_string(endpoint_id);
+        result.error_message = "invalid worker_id " + std::to_string(worker_id);
         return result;
     }
     try {
@@ -1058,12 +1072,12 @@ ControlResult WorkerManager::control_remote_commit_register(
 }
 
 ControlResult WorkerManager::control_remote_abort_register(
-    int endpoint_id, remote_l3::RemoteRegistryTarget target_registry, CallableKind callable_kind, const uint8_t *digest
+    int worker_id, remote_l3::RemoteRegistryTarget target_registry, CallableKind callable_kind, const uint8_t *digest
 ) {
-    ControlResult result{"NEXT_LEVEL", static_cast<int32_t>(endpoint_id), false, ""};
-    WorkerThread *wt = get_worker_by_endpoint_id(WorkerType::NEXT_LEVEL, endpoint_id);
+    ControlResult result{"NEXT_LEVEL", static_cast<int32_t>(worker_id), false, ""};
+    WorkerThread *wt = get_worker_by_id(WorkerType::NEXT_LEVEL, worker_id);
     if (wt == nullptr) {
-        result.error_message = "invalid endpoint_id " + std::to_string(endpoint_id);
+        result.error_message = "invalid worker_id " + std::to_string(worker_id);
         return result;
     }
     try {
@@ -1076,12 +1090,12 @@ ControlResult WorkerManager::control_remote_abort_register(
 }
 
 ControlResult WorkerManager::control_remote_unregister(
-    int endpoint_id, remote_l3::RemoteRegistryTarget target_registry, CallableKind callable_kind, const uint8_t *digest
+    int worker_id, remote_l3::RemoteRegistryTarget target_registry, CallableKind callable_kind, const uint8_t *digest
 ) {
-    ControlResult result{"NEXT_LEVEL", static_cast<int32_t>(endpoint_id), false, ""};
-    WorkerThread *wt = get_worker_by_endpoint_id(WorkerType::NEXT_LEVEL, endpoint_id);
+    ControlResult result{"NEXT_LEVEL", static_cast<int32_t>(worker_id), false, ""};
+    WorkerThread *wt = get_worker_by_id(WorkerType::NEXT_LEVEL, worker_id);
     if (wt == nullptr) {
-        result.error_message = "invalid endpoint_id " + std::to_string(endpoint_id);
+        result.error_message = "invalid worker_id " + std::to_string(worker_id);
         return result;
     }
     try {
@@ -1093,18 +1107,18 @@ ControlResult WorkerManager::control_remote_unregister(
     return result;
 }
 
-RemoteBufferHandle WorkerManager::control_remote_malloc(int endpoint_id, size_t size) {
-    WorkerThread *wt = get_worker_by_endpoint_id(WorkerType::NEXT_LEVEL, endpoint_id);
+RemoteBufferHandle WorkerManager::control_remote_malloc(int worker_id, size_t size) {
+    WorkerThread *wt = get_worker_by_id(WorkerType::NEXT_LEVEL, worker_id);
     if (wt == nullptr) {
-        throw std::runtime_error("control_remote_malloc: invalid endpoint_id " + std::to_string(endpoint_id));
+        throw std::runtime_error("control_remote_malloc: invalid worker_id " + std::to_string(worker_id));
     }
     return wt->control_remote_malloc(size);
 }
 
 void WorkerManager::control_remote_free(const RemoteBufferHandle &handle) {
-    WorkerThread *wt = get_worker_by_endpoint_id(WorkerType::NEXT_LEVEL, handle.endpoint_id);
+    WorkerThread *wt = get_worker_by_id(WorkerType::NEXT_LEVEL, handle.worker_id);
     if (wt == nullptr) {
-        throw std::runtime_error("control_remote_free: invalid endpoint_id " + std::to_string(handle.endpoint_id));
+        throw std::runtime_error("control_remote_free: invalid worker_id " + std::to_string(handle.worker_id));
     }
     wt->control_remote_free(handle);
 }
@@ -1112,9 +1126,9 @@ void WorkerManager::control_remote_free(const RemoteBufferHandle &handle) {
 void WorkerManager::control_remote_copy_to(
     const RemoteBufferHandle &handle, uint64_t offset, const void *src, size_t size
 ) {
-    WorkerThread *wt = get_worker_by_endpoint_id(WorkerType::NEXT_LEVEL, handle.endpoint_id);
+    WorkerThread *wt = get_worker_by_id(WorkerType::NEXT_LEVEL, handle.worker_id);
     if (wt == nullptr) {
-        throw std::runtime_error("control_remote_copy_to: invalid endpoint_id " + std::to_string(handle.endpoint_id));
+        throw std::runtime_error("control_remote_copy_to: invalid worker_id " + std::to_string(handle.worker_id));
     }
     wt->control_remote_copy_to(handle, offset, src, size);
 }
@@ -1122,9 +1136,9 @@ void WorkerManager::control_remote_copy_to(
 void WorkerManager::control_remote_copy_from(
     void *dst, const RemoteBufferHandle &handle, uint64_t offset, size_t size
 ) {
-    WorkerThread *wt = get_worker_by_endpoint_id(WorkerType::NEXT_LEVEL, handle.endpoint_id);
+    WorkerThread *wt = get_worker_by_id(WorkerType::NEXT_LEVEL, handle.worker_id);
     if (wt == nullptr) {
-        throw std::runtime_error("control_remote_copy_from: invalid endpoint_id " + std::to_string(handle.endpoint_id));
+        throw std::runtime_error("control_remote_copy_from: invalid worker_id " + std::to_string(handle.worker_id));
     }
     wt->control_remote_copy_from(dst, handle, offset, size);
 }
@@ -1133,30 +1147,30 @@ RemoteBufferExport WorkerManager::control_remote_export(
     const RemoteBufferHandle &handle, uint64_t offset, uint64_t size, uint32_t access_flags,
     const std::string &transport_profile
 ) {
-    WorkerThread *wt = get_worker_by_endpoint_id(WorkerType::NEXT_LEVEL, handle.owner_endpoint_id);
+    WorkerThread *wt = get_worker_by_id(WorkerType::NEXT_LEVEL, handle.owner_worker_id);
     if (wt == nullptr) {
         throw std::runtime_error(
-            "control_remote_export: invalid owner endpoint_id " + std::to_string(handle.owner_endpoint_id)
+            "control_remote_export: invalid owner worker_id " + std::to_string(handle.owner_worker_id)
         );
     }
     return wt->control_remote_export(handle, offset, size, access_flags, transport_profile);
 }
 
 RemoteBufferHandle WorkerManager::control_remote_import(
-    int32_t importer_endpoint_id, const RemoteBufferExport &export_desc, uint32_t requested_access_flags
+    int32_t importer_worker_id, const RemoteBufferExport &export_desc, uint32_t requested_access_flags
 ) {
-    WorkerThread *wt = get_worker_by_endpoint_id(WorkerType::NEXT_LEVEL, importer_endpoint_id);
+    WorkerThread *wt = get_worker_by_id(WorkerType::NEXT_LEVEL, importer_worker_id);
     if (wt == nullptr) {
-        throw std::runtime_error("control_remote_import: invalid endpoint_id " + std::to_string(importer_endpoint_id));
+        throw std::runtime_error("control_remote_import: invalid worker_id " + std::to_string(importer_worker_id));
     }
-    return wt->control_remote_import(importer_endpoint_id, export_desc, requested_access_flags);
+    return wt->control_remote_import(importer_worker_id, export_desc, requested_access_flags);
 }
 
 void WorkerManager::control_remote_release_import(const RemoteBufferHandle &handle) {
-    WorkerThread *wt = get_worker_by_endpoint_id(WorkerType::NEXT_LEVEL, handle.endpoint_id);
+    WorkerThread *wt = get_worker_by_id(WorkerType::NEXT_LEVEL, handle.worker_id);
     if (wt == nullptr) {
         throw std::runtime_error(
-            "control_remote_release_import: invalid endpoint_id " + std::to_string(handle.endpoint_id)
+            "control_remote_release_import: invalid worker_id " + std::to_string(handle.worker_id)
         );
     }
     wt->control_remote_release_import(handle);
@@ -1167,7 +1181,7 @@ WorkerManager::broadcast_register_all(const void *blob_ptr, size_t blob_size, co
     std::vector<ControlResult> results;
     results.reserve(next_level_threads_.size());
     for (size_t i = 0; i < next_level_threads_.size(); ++i) {
-        results.push_back(ControlResult{"NEXT_LEVEL", static_cast<int32_t>(i), true, ""});
+        results.push_back(ControlResult{"NEXT_LEVEL", next_level_threads_[i]->worker_id(), true, ""});
     }
     if (next_level_threads_.empty()) return results;
 
@@ -1201,7 +1215,7 @@ WorkerManager::broadcast_register_all(const void *blob_ptr, size_t blob_size, co
     for (auto &result : results) {
         if (!result.ok && result.error_message.find("hash=") == std::string::npos) {
             result.error_message = "Worker.register(hash=" + hash + ") failed on next_level " +
-                                   std::to_string(result.worker_index) + ": " + result.error_message;
+                                   std::to_string(result.worker_id) + ": " + result.error_message;
         }
     }
     return results;
@@ -1220,7 +1234,8 @@ std::vector<std::string> WorkerManager::broadcast_unregister_all(const uint8_t *
                 next_level_threads_[i]->control_unregister(digest);
             } catch (const std::exception &e) {
                 std::string msg = strip_control_prefix(e.what(), "control_unregister");
-                per_worker[i] = std::string("next_level ") + std::to_string(i) + ": " + msg;
+                per_worker[i] = std::string("next_level worker_id ") +
+                                std::to_string(next_level_threads_[i]->worker_id()) + ": " + msg;
             }
         });
     }
@@ -1242,7 +1257,7 @@ std::vector<ControlResult> WorkerManager::broadcast_control_all(
     std::vector<ControlResult> results;
     results.reserve(threads.size());
     for (size_t i = 0; i < threads.size(); ++i) {
-        results.push_back(ControlResult{type_name, static_cast<int32_t>(i), true, ""});
+        results.push_back(ControlResult{type_name, threads[i]->worker_id(), true, ""});
     }
     if (threads.empty()) return results;
 

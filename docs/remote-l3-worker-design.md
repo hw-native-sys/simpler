@@ -43,18 +43,21 @@ Implemented:
 - Explicit endpoint outcomes: success, task failure, endpoint failure, and
   skipped group members. Failed producers poison downstream consumers instead
   of completing successfully.
-- Stable NEXT_LEVEL `endpoint_id` metadata, submit-time endpoint eligibility,
-  worker affinity validation against eligibility, and Scheduler selection from
-  only eligible idle endpoints.
+- Stable NEXT_LEVEL `worker_id` metadata shared by local and remote
+  children, submit-time worker eligibility, worker affinity validation
+  against eligibility, and Scheduler selection from only eligible idle
+  workers.
 - C++ remote tensor sidecars, remote-aware `TensorKey` values, and submit-time
   rejection of remote sidecars against local endpoints, bare host pointers, and
   remote null OUTPUT tensors without a sidecar.
 - Python `RemoteCallable("module:qualname")`, `PYTHON_IMPORT`, and
   `REMOTE_TASK_DISPATCHER` callable identity. Registration requires an
-  explicit `workers=[...]` list naming ids returned by `add_remote_worker()`.
-- Python `RemoteBufferHandle`, `RemoteTensorRef`, and `RemoteTaskArgs`
-  wrappers. They keep `Tensor.data == 0` and carry the remote
-  descriptor sidecar into C++ submit.
+  explicit `workers=[...]` list naming worker ids returned by
+  `add_remote_worker()`.
+- Python `RemoteBufferHandle` and `RemoteTensorRef` wrappers. `TaskArgs`
+  accepts `RemoteTensorRef` through `add_tensor(...)`, keeps
+  `Tensor.data == 0`, and carries the remote descriptor sidecar into C++
+  submit.
 - Canonical little-endian `remote_wire.{h,cpp}` frame codec with bounds checks
   for TASK payloads, remote tensor descriptors, COMPLETION, CONTROL_REPLY, and
   ordered command-lane sequencing.
@@ -79,7 +82,7 @@ Goals:
 
 - Preserve the Orchestrator/Scheduler DAG model.
 - Replace the local mailbox endpoint under `WorkerThread` with a pluggable
-  NEXT_LEVEL endpoint.
+  NEXT_LEVEL worker endpoint.
 - Support HCOMM-backed remote communication profiles for A2 RoCE, A3 HCCS,
   and A5 UB.
 - Carry task dispatch, control commands, completion, error messages, and
@@ -134,7 +137,7 @@ Relevant code paths:
     `MAILBOX_OFF_ERROR_MSG`.
 - `src/common/hierarchical/orchestrator.{h,cpp}`
   - `submit_next_level()` stores `TaskArgs`, `CallConfig`,
-    `CallableIdentity`, and optional worker affinity in a parent-side slot.
+  `CallableIdentity`, and optional worker affinity in a parent-side slot.
   - Dependency inference happens before dispatch from tags in `TaskArgs`.
 - `src/common/task_interface/task_args.h`
   - Process dispatch writes `[T][S][Tensor x T][uint64 x S]`.
@@ -228,21 +231,24 @@ the negotiated feature set. This mirrors the distributed-system convention that
 a worker or actor becomes visible only after runtime and dependency
 initialization has completed.
 
-## Endpoint Identity and Callable Routing
+## Worker Identity and Callable Routing
 
 Remote scheduling needs explicit callable resolver scopes and an explicit
-mapping from callable identities to eligible NEXT_LEVEL endpoints. The current
+mapping from callable identities to eligible NEXT_LEVEL workers. The current
 scheduler can otherwise choose any idle worker, which is only correct when
 every NEXT_LEVEL child has the same callable registry.
 
 Required contracts:
 
-- Every local or remote NEXT_LEVEL child has a stable `endpoint_id` equal to
-  its logical worker id in `WorkerManager`.
+- Every local or remote NEXT_LEVEL child has a stable `worker_id` assigned
+  when the Python facade adds that child. Python callers pass the integer
+  worker id returned by `add_worker()` or `add_remote_worker()`. The id is
+  independent of the C++ worker-thread vector index, so adding later local or
+  remote children cannot renumber ids already returned to user code.
 - `register(callable, workers=...)` is the single public registration API.
   Local Python/callable objects keep the existing local registration path.
   `RemoteCallable` descriptors use the remote control path and bind the
-  returned `CallableHandle.hashid` to one or more remote endpoint ids.
+  returned `CallableHandle.hashid` to one or more remote worker ids.
 - PR866 extends the PR #891 callable identity surface with one parent-facing
   remote callable kind, `PYTHON_IMPORT`, and one parent-facing resolver scope,
   `REMOTE_TASK_DISPATCHER`. `RemoteCallable("pkg.module:orch_fn")`
@@ -250,9 +256,9 @@ Required contracts:
   `PYTHON_IMPORT`, whose resolver scope is `REMOTE_TASK_DISPATCHER`, and whose
   `hashid` is computed from the canonical remote import descriptor.
 - The first implementation requires `RemoteCallable` registration to pass an
-  explicit non-empty `workers=[...]` list. Future releases may replace raw
-  worker ids with named remote pools or placement policies, but implicit
-  broadcast to all remote endpoints is not part of the contract.
+  explicit non-empty `workers=[...]` list of stable remote worker ids. Future
+  releases may replace these ids with named remote pools or placement policies,
+  but implicit broadcast to all remote endpoints is not part of the contract.
 - Bootstrap manifests are generated by the parent. Users provide remote
   callable descriptors; users do not hand-author raw `hashid -> callable`
   maps.
@@ -284,7 +290,7 @@ Required contracts:
     `orch.submit_next_level(...)` or `orch.submit_sub(...)`.
 - The remote TASK dispatcher is not a Worker and must not reimplement
   Scheduler, Orchestrator, TensorMap, or drain semantics. It is an RPC entry
-  adapter that resolves the outer callable, materializes `RemoteTaskArgs`,
+  adapter that resolves the outer callable, materializes `RemoteTaskArgsWire`,
   calls the embedded `inner_worker`, and wraps completion/error reporting.
 - Resolver location is selected by execution context, not by a second identity
   dimension. A remote TASK frame always resolves in the remote TASK dispatcher
@@ -294,7 +300,7 @@ Required contracts:
   places, not that the two registries share executable slots or eligibility.
 - Dynamic Python callable registration follows the public visibility and
   hashid lifecycle semantics from local dynamic registration: registration is
-  synchronous per selected endpoint, future TASK frames may use the hashid only
+  synchronous per selected worker, future TASK frames may use the hashid only
   after the control reply succeeds, unregister clears stale callable state, and
   TASK/control ordering prevents a TASK from observing a partially registered
   hashid.
@@ -303,25 +309,26 @@ Required contracts:
   negotiated feature because they require Ray-like environment and serializer
   compatibility checks that local fork/COW registration does not need.
 - Multi-endpoint `register(..., workers=[...])` is all-or-nothing by
-  default. The parent sends a prepare phase to every selected endpoint, commits
+  default. The parent sends a prepare phase to every selected worker, commits
   hashid only after every prepare succeeds, and exposes the hashid to future
-  TASK frames only after every commit reply succeeds. If any endpoint fails
+  TASK frames only after every commit reply succeeds. If any worker fails
   prepare or commit, the parent aborts the transaction, keeps the hashid
-  invisible, and either rolls back successful endpoints or marks endpoints with
+  invisible, and either rolls back successful workers or marks workers with
   unknown state failed.
 - Final multi-endpoint unregister uses a tombstone state for the selected
-  endpoint/hashid pairs. The hashid remains dispatchable through any other live
+  worker/hashid pairs. The hashid remains dispatchable through any other live
   handle that still owns a reference. Once the final reference is dropped for
-  an endpoint, that endpoint/hashid pair is unavailable for dispatch until
-  cleanup is confirmed or the endpoint is removed from eligibility and marked
-  failed. Failed-register rollback whose cleanup cannot be confirmed marks that
-  endpoint/hashid pair cleanup-uncertain and unusable for the current session.
-- `TaskSlotState` stores the final eligible endpoint set for the slot. This is
-  the intersection of endpoints that can resolve the callable hashid and
-  endpoints that can access every tensor/buffer referenced by the slot.
-- If the user passes `worker=N`, submit-time validation checks that endpoint
-  `N` is eligible for that hashid and for the slot's tensor sidecars.
-- If `worker=-1`, the Scheduler chooses only from idle endpoints in the
+  a worker, that worker/hashid pair is unavailable for dispatch until cleanup
+  is confirmed or the worker is removed from eligibility and marked failed.
+  Failed-register rollback whose cleanup cannot be confirmed marks that
+  worker/hashid pair cleanup-uncertain and unusable for the current session.
+- `TaskSlotState` stores the final eligible worker-id set for the slot. This is
+  the intersection of workers that can resolve the callable hashid and workers
+  that can access every tensor/buffer referenced by the slot.
+- If the user passes `worker=worker_id`, submit-time validation checks that
+  the worker id is eligible for that hashid and for the slot's tensor
+  sidecars.
+- If `worker=-1`, the Scheduler chooses only from idle workers in the
   slot's eligible set.
 - Group submit validates each affinity independently. Unconstrained group
   members are assigned distinct idle eligible endpoints.
@@ -356,7 +363,11 @@ l3_handle = w4.register(
 w4.init()
 ```
 
-`add_worker(local_worker)` remains unchanged and continues to use fork/shm.
+`add_worker(local_worker)` still uses fork/shm, but it now returns the local
+child's stable NEXT_LEVEL worker id from the same id space as
+`add_remote_worker(...)`. Mixed local/remote registration order therefore does
+not change worker ids already returned to the caller. Callers should pass the
+returned ids back to `worker=` or `workers=[...]`.
 
 Dynamic remote registration uses the same hashid lifecycle whether the
 descriptor is installed at bootstrap or through a later control frame. If a
@@ -389,7 +400,7 @@ threads:
 session_id
 parent_worker_level
 remote_worker_level = 3
-endpoint_id
+worker_id
 platform, runtime, build flag
 device_ids, num_sub_workers, heap_ring_size
 callable registry:
@@ -425,7 +436,7 @@ add or remove entries in either registry location after bootstrap:
 For a TASK frame, the session runner:
 
 1. Validates the session and sequence number.
-2. Decodes `RemoteTaskArgs`.
+2. Decodes `RemoteTaskArgsWire`.
 3. Translates remote tensor descriptors into local `Tensor` values.
 4. Looks up the L3 orchestration function in the remote TASK dispatcher
    registry by hashid.
@@ -483,13 +494,13 @@ Public Python uses a sidecar representation:
   implementation does not auto-allocate remote outputs during submit.
 
 Parent-side slots therefore store existing `TaskArgs`, an optional
-`RemoteTaskArgsView`, eligible endpoint ids, and captured remote-buffer refs.
+`RemoteTaskArgsView`, eligible worker ids, and captured remote-buffer refs.
 
 `Orchestrator::infer_deps()` builds `TensorKey` from remote handle metadata
 when a sidecar exists. The first implementation intentionally preserves the
 current exact-start TensorMap semantics: local fork/shm keys use
-`(ptr, worker)`, while remote keys use
-`(address_kind, owner_endpoint_id, buffer_id, generation, offset)`. The tensor
+`(ptr, worker_id)`, while remote keys use
+`(address_kind, owner_worker_id, buffer_id, generation, offset)`. The tensor
 byte length is bounds-checked by the descriptor but does not participate in
 dependency lookup. This means two remote tensors that reference overlapping
 byte ranges with different offsets are not automatically ordered, matching the
@@ -516,7 +527,7 @@ Required parent-side behavior:
 - Downstream consumers of a failed producer are marked failed/skipped and are
   not dispatched.
 - `drain()` waits for bookkeeping and cleanup, then raises the first root
-  error with remote host, endpoint id, hashid, and sequence in the message.
+  error with remote host, worker id, hashid, and sequence in the message.
 
 Local mailbox dispatch keeps first-error-wins only for final error reporting.
 It must not mark a failed child dispatch as successful `COMPLETED`. The remote
@@ -533,12 +544,12 @@ parent owns the visible handle state; the session runner owns remote physical
 memory and imported mappings.
 
 The v1 peer-buffer model separates owner allocations from imported mappings.
-`EXPORT_BUFFER` runs on the owner endpoint and returns an opaque
-session-scoped descriptor. `IMPORT_BUFFER` runs on the importer endpoint and
+`EXPORT_BUFFER` runs on the owner worker and returns an opaque
+session-scoped descriptor. `IMPORT_BUFFER` runs on the importer worker and
 creates an importer-local mapping handle. `RELEASE_IMPORT` tears down only that
 importer-local mapping; owner physical free waits until imports and captured
 slot refs have drained. Imported handles keep the original owner
-`(owner_endpoint_id, buffer_id, generation, offset)` as the dependency
+`(owner_worker_id, buffer_id, generation, offset)` as the dependency
 identity, so owner and peer views of the same logical buffer range serialize
 through the same TensorMap key.
 
@@ -576,8 +587,8 @@ The recommended first cut is conservative:
 
 1. Land the endpoint abstraction and local adapter. **Implemented.**
 2. Add remote tensor sidecars and endpoint eligibility metadata.
-   **Implemented for C++ submit, Python `RemoteTaskArgs`, owner buffers, and
-   imported simulation buffers.**
+   **Implemented for C++ submit, Python `TaskArgs.add_tensor(RemoteTensorRef(...))`,
+   owner buffers, and imported simulation buffers.**
 3. Add the versioned frame codec and the independent health-lane contract.
    **Implemented for the socket-backed simulation transport.**
 4. Add remote callable registration with all-or-nothing multi-endpoint

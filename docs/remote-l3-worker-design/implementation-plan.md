@@ -36,11 +36,11 @@ Status for the local PR #866 cut:
      without yet changing all downstream DAG poisoning behavior.
    - Add local adapter regression tests for existing L3/L4 examples.
 
-2. Endpoint eligibility metadata. **Implemented.**
-   - Assign each NEXT_LEVEL child a stable `endpoint_id`.
-   - Store `callable hashid -> eligible endpoint ids` in parent runtime
+2. Worker eligibility metadata. **Implemented.**
+   - Assign each NEXT_LEVEL child a stable `worker_id`.
+   - Store `callable hashid -> eligible worker ids` in parent runtime
      metadata.
-   - Extend submit slots with final eligible endpoint sets computed as
+   - Extend submit slots with final eligible worker-id sets computed as
      callable eligibility intersected with tensor/buffer data eligibility.
    - Teach Scheduler/WorkerManager to pick only eligible idle workers.
    - Validate `worker=` affinity against the slot's final eligible set.
@@ -124,10 +124,10 @@ Status for the local PR #866 cut:
      and abort controls. Keep the hashid invisible until every selected
      endpoint commits, and mark uncertain endpoints failed rather than leaving a
      partially visible hashid.
-   - Implement final-unregister tombstones per endpoint/hashid pair. Do not
+   - Implement final-unregister tombstones per worker/hashid pair. Do not
      block dispatch through other live handles that still reference the same
      hashid. If failed-register rollback cleanup is uncertain, block only the
-     affected endpoint/hashid pair for the current session.
+     affected worker/hashid pair for the current session.
    - Keep `INNER_L3_WORKER` as a remote-internal install target, not a
      parent-facing handle scope. Never assume a parent TASK hashid names an
      inner chip/sub callable.
@@ -198,7 +198,7 @@ Status for the local PR #866 cut:
    - Add owner export records and importer-local mapping records for
      `EXPORT_BUFFER`, `IMPORT_BUFFER`, and `RELEASE_IMPORT`.
    - De-duplicate live imports by
-     `(importer_endpoint_id, owner_endpoint_id, buffer_id, generation, offset,
+     `(importer_worker_id, owner_worker_id, buffer_id, generation, offset,
      nbytes, access_flags, transport_profile)` when the transport profile
      supports reuse; otherwise return distinct `import_id` values and ref-count
      each mapping independently.
@@ -228,7 +228,7 @@ Status for the local PR #866 cut:
     - Keep RDMA/HCOMM fallback for bulk transfers.
 
 13. Remote `allocate_domain()` future work.
-    - Extend `CommDomainHandle` to carry remote endpoint ids.
+    - Extend `CommDomainHandle` to carry remote worker ids.
     - Allocate/import windows collectively across remote workers.
     - Preserve deferred release after `drain()`.
 
@@ -247,7 +247,7 @@ Status for the local PR #866 cut:
 | Failed dependency | Consumer of failed remote producer is not dispatched. |
 | Remote hashid mapping | Daemon resolves an outer remote-orch hashid. |
 | Remote dep key | Shared remote buffer serializes through TensorMap. |
-| Remote import eligibility | Imported peer handle makes only the importer endpoint eligible. |
+| Remote import eligibility | Imported peer handle makes only the importer worker eligible. |
 | Remote import dep key | Owner and imported views use the same owner-based TensorMap key. |
 | Raw pointer rejection | Unstaged host pointer fails before slot commit. |
 | Wire data zero | Non-zero remote TASK tensor data is rejected. |
@@ -265,7 +265,7 @@ Status for the local PR #866 cut:
 | Callable visibility | TASK with hashid works only after register reply. |
 | Prepare partial fail | Multi-endpoint register stays invisible and aborts prepared peers. |
 | Commit partial fail | Committed/uncertain endpoint hashids are cleaned or blocked. |
-| Abort cleanup fail | Only affected endpoint/hashid pair becomes cleanup-uncertain. |
+| Abort cleanup fail | Only affected worker/hashid pair becomes cleanup-uncertain. |
 | Unregister tombstone | Final unregister keeps tombstone until endpoint cleanup. |
 | Command-lane order | TASK cannot overtake register/unregister control. |
 | Health during task | Health remains live while command lane runs a task. |
@@ -382,7 +382,7 @@ Rules:
 
 Error reporting:
 
-- The first root failure message includes remote host, endpoint id,
+- The first root failure message includes remote host, worker id,
   callable hashid, and sequence.
 - Poisoned downstream slots should reference the root producer slot instead of
   overwriting the first-error-wins message.

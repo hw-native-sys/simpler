@@ -37,7 +37,7 @@ TEST(RemoteWire, FrameRoundTripValidatesHeader) {
     remote_l3::FrameHeader header;
     header.frame_type = remote_l3::FrameType::TASK;
     header.session_id = 7;
-    header.endpoint_id = 2;
+    header.worker_id = 2;
     header.sequence = 9;
 
     auto encoded = remote_l3::encode_frame(header, payload);
@@ -45,7 +45,7 @@ TEST(RemoteWire, FrameRoundTripValidatesHeader) {
 
     EXPECT_EQ(decoded.header.frame_type, remote_l3::FrameType::TASK);
     EXPECT_EQ(decoded.header.session_id, 7u);
-    EXPECT_EQ(decoded.header.endpoint_id, 2);
+    EXPECT_EQ(decoded.header.worker_id, 2);
     EXPECT_EQ(decoded.header.sequence, 9u);
     EXPECT_EQ(decoded.header.payload_bytes, payload.size());
     EXPECT_EQ(decoded.payload, payload);
@@ -58,7 +58,7 @@ TEST(RemoteWire, FrameRejectsBadVersionFlagsAndUnknownType) {
     remote_l3::FrameHeader header;
     header.frame_type = remote_l3::FrameType::HEALTH;
     header.session_id = 7;
-    header.endpoint_id = 2;
+    header.worker_id = 2;
     header.sequence = 9;
     auto encoded = remote_l3::encode_frame(header, {});
 
@@ -123,7 +123,7 @@ TEST(RemoteWire, HostInlineDescriptorBoundsAreChecked) {
     RemoteTensorSidecar sidecar;
     sidecar.present = true;
     sidecar.desc.address_space = RemoteAddressSpace::HOST_INLINE;
-    sidecar.desc.owner_endpoint_id = 0;
+    sidecar.desc.owner_worker_id = 0;
     sidecar.desc.buffer_id = 0;
     sidecar.desc.offset = 0;
     sidecar.desc.nbytes = 2;
@@ -149,7 +149,7 @@ TEST(RemoteWire, NonHostInlineDescriptorRejectsInlinePayloadFields) {
     RemoteTensorSidecar sidecar;
     sidecar.present = true;
     sidecar.desc.address_space = RemoteAddressSpace::REMOTE_DEVICE;
-    sidecar.desc.owner_endpoint_id = 3;
+    sidecar.desc.owner_worker_id = 3;
     sidecar.desc.buffer_id = 9;
     sidecar.desc.generation = 1;
     sidecar.desc.nbytes = 4;
@@ -166,7 +166,7 @@ TEST(RemoteWire, NonHostInlineDescriptorRejectsMissingBufferIdentity) {
     RemoteTensorSidecar sidecar;
     sidecar.present = true;
     sidecar.desc.address_space = RemoteAddressSpace::REMOTE_DEVICE;
-    sidecar.desc.owner_endpoint_id = 3;
+    sidecar.desc.owner_worker_id = 3;
     sidecar.desc.buffer_id = 9;
     sidecar.desc.generation = 1;
     sidecar.desc.nbytes = 4;
@@ -213,7 +213,7 @@ TEST(RemoteWire, CompletionAndControlReplyMatchSequences) {
 
 TEST(RemoteWire, RemoteBufferExportImportControlsRoundTrip) {
     remote_l3::ExportBufferRequest export_request;
-    export_request.owner_endpoint_id = 3;
+    export_request.owner_worker_id = 3;
     export_request.buffer_id = 11;
     export_request.generation = 2;
     export_request.offset = 16;
@@ -224,12 +224,12 @@ TEST(RemoteWire, RemoteBufferExportImportControlsRoundTrip) {
     auto export_request_bytes = remote_l3::encode_export_buffer_request(export_request);
     auto decoded_export_request =
         remote_l3::decode_export_buffer_request(export_request_bytes.data(), export_request_bytes.size());
-    EXPECT_EQ(decoded_export_request.owner_endpoint_id, 3);
+    EXPECT_EQ(decoded_export_request.owner_worker_id, 3);
     EXPECT_EQ(decoded_export_request.offset, 16u);
     EXPECT_EQ(decoded_export_request.transport_profile, "sim");
 
     RemoteBufferExport export_result;
-    export_result.owner_endpoint_id = 3;
+    export_result.owner_worker_id = 3;
     export_result.buffer_id = 11;
     export_result.generation = 2;
     export_result.address_space = RemoteAddressSpace::REMOTE_WINDOW;
@@ -249,19 +249,19 @@ TEST(RemoteWire, RemoteBufferExportImportControlsRoundTrip) {
     EXPECT_EQ(decoded_export_result.transport_descriptor, export_result.transport_descriptor);
 
     remote_l3::ImportBufferRequest import_request;
-    import_request.importer_endpoint_id = 4;
+    import_request.importer_worker_id = 4;
     import_request.requested_access_flags = remote_l3::REMOTE_BUFFER_ACCESS_READ;
     import_request.export_desc = export_result;
     auto import_request_bytes = remote_l3::encode_import_buffer_request(import_request);
     auto decoded_import_request =
         remote_l3::decode_import_buffer_request(import_request_bytes.data(), import_request_bytes.size());
-    EXPECT_EQ(decoded_import_request.importer_endpoint_id, 4);
+    EXPECT_EQ(decoded_import_request.importer_worker_id, 4);
     EXPECT_EQ(decoded_import_request.requested_access_flags, remote_l3::REMOTE_BUFFER_ACCESS_READ);
-    EXPECT_EQ(decoded_import_request.export_desc.owner_endpoint_id, 3);
+    EXPECT_EQ(decoded_import_request.export_desc.owner_worker_id, 3);
 
     RemoteBufferHandle import_result;
-    import_result.endpoint_id = 4;
-    import_result.owner_endpoint_id = 3;
+    import_result.worker_id = 4;
+    import_result.owner_worker_id = 3;
     import_result.buffer_id = 11;
     import_result.generation = 2;
     import_result.import_id = 7;
@@ -273,25 +273,25 @@ TEST(RemoteWire, RemoteBufferExportImportControlsRoundTrip) {
     auto import_result_bytes = remote_l3::encode_import_buffer_result(import_result);
     auto decoded_import_result =
         remote_l3::decode_import_buffer_result(import_result_bytes.data(), import_result_bytes.size());
-    EXPECT_EQ(decoded_import_result.endpoint_id, 4);
-    EXPECT_EQ(decoded_import_result.owner_endpoint_id, 3);
+    EXPECT_EQ(decoded_import_result.worker_id, 4);
+    EXPECT_EQ(decoded_import_result.owner_worker_id, 3);
     EXPECT_EQ(decoded_import_result.import_id, 7u);
 
     remote_l3::ReleaseImportRequest release_request;
-    release_request.importer_endpoint_id = 4;
-    release_request.owner_endpoint_id = 3;
+    release_request.importer_worker_id = 4;
+    release_request.owner_worker_id = 3;
     release_request.buffer_id = 11;
     release_request.generation = 2;
     release_request.import_id = 7;
     auto release_bytes = remote_l3::encode_release_import_request(release_request);
     auto decoded_release = remote_l3::decode_release_import_request(release_bytes.data(), release_bytes.size());
-    EXPECT_EQ(decoded_release.importer_endpoint_id, 4);
+    EXPECT_EQ(decoded_release.importer_worker_id, 4);
     EXPECT_EQ(decoded_release.import_id, 7u);
 }
 
 TEST(RemoteWire, RemoteBufferControlsRejectInvalidAccessAndReservedBytes) {
     remote_l3::ExportBufferRequest request;
-    request.owner_endpoint_id = 3;
+    request.owner_worker_id = 3;
     request.buffer_id = 11;
     request.generation = 2;
     request.nbytes = 64;

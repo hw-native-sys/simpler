@@ -70,9 +70,9 @@ void append_u64(std::vector<uint8_t> &out, uint64_t v) {
 }
 
 std::vector<uint8_t>
-malloc_result(int32_t endpoint_id, uint64_t buffer_id, uint64_t generation, int32_t address_space, uint64_t nbytes) {
+malloc_result(int32_t worker_id, uint64_t buffer_id, uint64_t generation, int32_t address_space, uint64_t nbytes) {
     std::vector<uint8_t> out;
-    append_i32(out, endpoint_id);
+    append_i32(out, worker_id);
     append_u64(out, buffer_id);
     append_u64(out, generation);
     append_i32(out, address_space);
@@ -166,7 +166,7 @@ public:
             remote_l3::FrameHeader header;
             header.frame_type = remote_l3::FrameType::CONTROL_REPLY;
             header.session_id = submitted.header.session_id;
-            header.endpoint_id = submitted.header.endpoint_id;
+            header.worker_id = submitted.header.worker_id;
             header.sequence = sequence;
             return remote_l3::encode_frame(header, remote_l3::encode_control_reply(payload));
         }
@@ -182,7 +182,7 @@ public:
         remote_l3::FrameHeader header;
         header.frame_type = remote_l3::FrameType::COMPLETION;
         header.session_id = submitted.header.session_id;
-        header.endpoint_id = submitted.header.endpoint_id;
+        header.worker_id = submitted.header.worker_id;
         header.sequence = sequence;
         return remote_l3::encode_frame(header, remote_l3::encode_completion(payload));
     }
@@ -292,8 +292,8 @@ TEST(RemoteEndpoint, RemoteMallocAcceptsValidOwnerHandle) {
 
     RemoteBufferHandle handle = endpoint.control_remote_malloc(64);
 
-    EXPECT_EQ(handle.endpoint_id, 3);
-    EXPECT_EQ(handle.owner_endpoint_id, 3);
+    EXPECT_EQ(handle.worker_id, 3);
+    EXPECT_EQ(handle.owner_worker_id, 3);
     EXPECT_EQ(handle.buffer_id, 9u);
     EXPECT_EQ(handle.generation, 2u);
     EXPECT_EQ(handle.import_id, 0u);
@@ -328,8 +328,8 @@ TEST(RemoteEndpoint, RemoteBufferControlsRejectOutOfRangeSlices) {
     auto *transport = new FakeRemoteTransport();
     RemoteL3Endpoint endpoint(3, 99, "fake", std::unique_ptr<RemoteL3Transport>(transport));
     RemoteBufferHandle handle;
-    handle.endpoint_id = 3;
-    handle.owner_endpoint_id = 3;
+    handle.worker_id = 3;
+    handle.owner_worker_id = 3;
     handle.buffer_id = 9;
     handle.generation = 2;
     handle.address_space = RemoteAddressSpace::REMOTE_DEVICE;

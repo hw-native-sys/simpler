@@ -19,11 +19,16 @@ Usage:
     from simpler_setup.torch_interop import make_tensor_arg
 """
 
+from __future__ import annotations
+
 import ctypes
 import os
 import threading
 import uuid
+import weakref
 from dataclasses import dataclass
+from enum import IntEnum
+from math import prod
 from typing import Any
 
 from _task_interface import (  # pyright: ignore[reportMissingImports]
@@ -61,6 +66,10 @@ __all__ = [
     "ChipStorageTaskArgs",
     "TensorArgType",
     "TaskArgs",
+    "RemoteAddressSpace",
+    "RemoteBufferHandle",
+    "RemoteBufferExport",
+    "RemoteTensorRef",
     "ArgDirection",
     "CoreCallable",
     "ChipCallable",
@@ -84,6 +93,631 @@ __all__ = [
 ]
 
 COMM_MAX_RANK_NUM = 64
+
+
+class RemoteAddressSpace(IntEnum):
+    HOST_INLINE = 1
+    REMOTE_DEVICE = 2
+    REMOTE_WINDOW = 3
+    UB_LDST = 4
+
+
+_REMOTE_BUFFER_ACCESS_READ = 1 << 0
+_REMOTE_BUFFER_ACCESS_WRITE = 1 << 1
+_REMOTE_BUFFER_ACCESS_READ_WRITE = _REMOTE_BUFFER_ACCESS_READ | _REMOTE_BUFFER_ACCESS_WRITE
+_REMOTE_BUFFER_HANDLE_TOKEN = object()
+_REMOTE_BUFFER_EXPORT_TOKEN = object()
+
+
+class RemoteBufferHandle:
+    __slots__ = (
+        "_worker_id",
+        "_owner_worker_id",
+        "_buffer_id",
+        "_generation",
+        "_import_id",
+        "_address_space",
+        "_nbytes",
+        "_offset",
+        "_remote_addr",
+        "_rkey_or_token",
+        "_ub_ldst_va",
+        "_access_flags",
+        "_released",
+        "_live_slot_refs",
+        "_live_import_refs",
+        "_owner_handle_ref",
+    )
+
+    def __init__(  # noqa: PLR0913
+        self,
+        *,
+        worker_id: int,
+        owner_worker_id: int | None = None,
+        buffer_id: int,
+        generation: int,
+        import_id: int = 0,
+        address_space: RemoteAddressSpace = RemoteAddressSpace.REMOTE_DEVICE,
+        nbytes: int = 0,
+        offset: int = 0,
+        remote_addr: int = 0,
+        rkey_or_token: int = 0,
+        ub_ldst_va: int = 0,
+        access_flags: int = 3,
+        released: bool = False,
+        owner_handle_ref: RemoteBufferHandle | None = None,
+        _internal_token: object | None = None,
+    ) -> None:
+        address_space = RemoteAddressSpace(int(address_space))
+        if _internal_token is not _REMOTE_BUFFER_HANDLE_TOKEN:
+            raise TypeError("RemoteBufferHandle values are returned by Worker.remote_malloc/import")
+
+        self._worker_id = int(worker_id)
+        self._owner_worker_id = int(worker_id if owner_worker_id is None else owner_worker_id)
+        self._buffer_id = int(buffer_id)
+        self._generation = int(generation)
+        self._import_id = int(import_id)
+        self._address_space = address_space
+        self._nbytes = int(nbytes)
+        self._offset = int(offset)
+        self._remote_addr = int(remote_addr)
+        self._rkey_or_token = int(rkey_or_token)
+        self._ub_ldst_va = int(ub_ldst_va)
+        self._access_flags = int(access_flags)
+        self._released = bool(released)
+        self._live_slot_refs = 0
+        self._live_import_refs = 0
+        self._owner_handle_ref = owner_handle_ref
+
+        if self._worker_id < 0:
+            raise ValueError("RemoteBufferHandle.worker_id must be non-negative")
+        if self._owner_worker_id < 0:
+            raise ValueError("RemoteBufferHandle.owner_worker_id must be non-negative")
+        if self._buffer_id < 0 or self._generation < 0 or self._import_id < 0:
+            raise ValueError("RemoteBufferHandle ids must be non-negative")
+        if self._nbytes < 0:
+            raise ValueError("RemoteBufferHandle.nbytes must be non-negative")
+        if self._offset < 0:
+            raise ValueError("RemoteBufferHandle.offset must be non-negative")
+        if self._address_space != RemoteAddressSpace.HOST_INLINE and self._buffer_id == 0:
+            raise ValueError("RemoteBufferHandle.buffer_id must be non-zero for remote buffers")
+        if self._address_space == RemoteAddressSpace.REMOTE_DEVICE and self._worker_id != self._owner_worker_id:
+            raise ValueError("REMOTE_DEVICE handles must be consumed on their owner worker")
+        if (
+            self._address_space in (RemoteAddressSpace.REMOTE_WINDOW, RemoteAddressSpace.UB_LDST)
+            and self._import_id == 0
+        ):
+            raise ValueError("imported remote handles require a non-zero import_id")
+        if self._access_flags & ~0x3:
+            raise ValueError("RemoteBufferHandle.access_flags contains unknown bits")
+
+    @classmethod
+    def _from_remote_allocation(
+        cls,
+        *,
+        worker_id: int,
+        buffer_id: int,
+        generation: int,
+        address_space: RemoteAddressSpace,
+        nbytes: int,
+        remote_addr: int = 0,
+        rkey_or_token: int = 0,
+        ub_ldst_va: int = 0,
+        released: bool = False,
+    ) -> RemoteBufferHandle:
+        return cls(
+            worker_id=worker_id,
+            owner_worker_id=worker_id,
+            buffer_id=buffer_id,
+            generation=generation,
+            import_id=0,
+            address_space=address_space,
+            nbytes=nbytes,
+            offset=0,
+            remote_addr=remote_addr,
+            rkey_or_token=rkey_or_token,
+            ub_ldst_va=ub_ldst_va,
+            access_flags=3,
+            released=released,
+            _internal_token=_REMOTE_BUFFER_HANDLE_TOKEN,
+        )
+
+    @classmethod
+    def _from_imported_mapping(  # noqa: PLR0913
+        cls,
+        *,
+        worker_id: int,
+        owner_worker_id: int,
+        buffer_id: int,
+        generation: int,
+        import_id: int,
+        address_space: RemoteAddressSpace,
+        nbytes: int,
+        offset: int,
+        remote_addr: int = 0,
+        rkey_or_token: int = 0,
+        ub_ldst_va: int = 0,
+        access_flags: int = 0,
+        released: bool = False,
+        owner_handle_ref: RemoteBufferHandle | None = None,
+    ) -> RemoteBufferHandle:
+        return cls(
+            worker_id=worker_id,
+            owner_worker_id=owner_worker_id,
+            buffer_id=buffer_id,
+            generation=generation,
+            import_id=import_id,
+            address_space=address_space,
+            nbytes=nbytes,
+            offset=offset,
+            remote_addr=remote_addr,
+            rkey_or_token=rkey_or_token,
+            ub_ldst_va=ub_ldst_va,
+            access_flags=access_flags,
+            released=released,
+            owner_handle_ref=owner_handle_ref,
+            _internal_token=_REMOTE_BUFFER_HANDLE_TOKEN,
+        )
+
+    @property
+    def worker_id(self) -> int:
+        return self._worker_id
+
+    @property
+    def owner_worker_id(self) -> int:
+        return self._owner_worker_id
+
+    @property
+    def import_id(self) -> int:
+        return self._import_id
+
+    @property
+    def address_space(self) -> RemoteAddressSpace:
+        return self._address_space
+
+    @property
+    def nbytes(self) -> int:
+        return self._nbytes
+
+    @property
+    def released(self) -> bool:
+        return self._released
+
+    @property
+    def access_flags(self) -> int:
+        return self._access_flags
+
+    @property
+    def is_imported(self) -> bool:
+        return self._import_id != 0
+
+    def _mark_released(self) -> None:
+        self._released = True
+
+    def _acquire_slot_ref(self) -> None:
+        if self._released:
+            raise RuntimeError("RemoteBufferHandle has already been released")
+        self._live_slot_refs += 1
+
+    def _release_slot_ref(self) -> None:
+        if self._live_slot_refs <= 0:
+            raise RuntimeError("RemoteBufferHandle live slot refs underflow")
+        self._live_slot_refs -= 1
+
+    def _acquire_import_ref(self) -> None:
+        if self._released:
+            raise RuntimeError("RemoteBufferHandle has already been released")
+        self._live_import_refs += 1
+
+    def _release_import_ref(self) -> None:
+        if self._live_import_refs <= 0:
+            raise RuntimeError("RemoteBufferHandle live import refs underflow")
+        self._live_import_refs -= 1
+
+    def __repr__(self) -> str:
+        return (
+            "RemoteBufferHandle("
+            f"worker_id={self.worker_id}, owner_worker_id={self.owner_worker_id}, "
+            f"address_space={self.address_space.name}, nbytes={self.nbytes}, released={self.released})"
+        )
+
+
+class RemoteBufferExport:
+    """Opaque descriptor returned by ``Worker.remote_export``.
+
+    The transport fields are intentionally kept private so callers cannot forge
+    or log remote keys by accidentally treating the export as a plain dataclass.
+    """
+
+    __slots__ = (
+        "_owner_worker_id",
+        "_buffer_id",
+        "_generation",
+        "_address_space",
+        "_offset",
+        "_nbytes",
+        "_export_id",
+        "_remote_addr",
+        "_rkey_or_token",
+        "_ub_ldst_va",
+        "_access_flags",
+        "_transport_profile",
+        "_transport_descriptor",
+        "_owner_handle",
+        "_worker_owner_id",
+        "_sealed",
+    )
+
+    def __init__(  # noqa: PLR0913
+        self,
+        *,
+        owner_worker_id: int,
+        buffer_id: int,
+        generation: int,
+        address_space: RemoteAddressSpace,
+        offset: int,
+        nbytes: int,
+        export_id: int,
+        remote_addr: int,
+        rkey_or_token: int,
+        ub_ldst_va: int,
+        access_flags: int,
+        transport_profile: str,
+        transport_descriptor: bytes = b"",
+        _owner_handle: RemoteBufferHandle | None = None,
+        _worker_owner_id: str | None = None,
+        _internal_token: object | None = None,
+    ) -> None:
+        if _internal_token is not _REMOTE_BUFFER_EXPORT_TOKEN:
+            raise TypeError("RemoteBufferExport values are returned by Worker.remote_export")
+        object.__setattr__(self, "_sealed", False)
+        object.__setattr__(self, "_owner_worker_id", int(owner_worker_id))
+        object.__setattr__(self, "_buffer_id", int(buffer_id))
+        object.__setattr__(self, "_generation", int(generation))
+        object.__setattr__(self, "_address_space", RemoteAddressSpace(int(address_space)))
+        object.__setattr__(self, "_offset", int(offset))
+        object.__setattr__(self, "_nbytes", int(nbytes))
+        object.__setattr__(self, "_export_id", int(export_id))
+        object.__setattr__(self, "_remote_addr", int(remote_addr))
+        object.__setattr__(self, "_rkey_or_token", int(rkey_or_token))
+        object.__setattr__(self, "_ub_ldst_va", int(ub_ldst_va))
+        object.__setattr__(self, "_access_flags", int(access_flags))
+        object.__setattr__(self, "_transport_profile", str(transport_profile))
+        object.__setattr__(self, "_transport_descriptor", bytes(transport_descriptor))
+        object.__setattr__(self, "_owner_handle", _owner_handle)
+        object.__setattr__(self, "_worker_owner_id", None if _worker_owner_id is None else str(_worker_owner_id))
+
+        for name in (
+            "_owner_worker_id",
+            "_buffer_id",
+            "_generation",
+            "_offset",
+            "_nbytes",
+            "_export_id",
+            "_remote_addr",
+            "_rkey_or_token",
+            "_ub_ldst_va",
+            "_access_flags",
+        ):
+            if int(getattr(self, name)) < 0:
+                raise ValueError(f"RemoteBufferExport.{name[1:]} must be non-negative")
+        if self._owner_worker_id < 0 or self._buffer_id == 0 or self._generation == 0 or self._export_id == 0:
+            raise ValueError("RemoteBufferExport requires live owner buffer identity and export_id")
+        if self._nbytes <= 0:
+            raise ValueError("RemoteBufferExport.nbytes must be positive")
+        if self._address_space not in (RemoteAddressSpace.REMOTE_WINDOW, RemoteAddressSpace.UB_LDST):
+            raise ValueError("RemoteBufferExport address_space must be REMOTE_WINDOW or UB_LDST")
+        if self._access_flags == 0 or self._access_flags & ~_REMOTE_BUFFER_ACCESS_READ_WRITE:
+            raise ValueError("RemoteBufferExport.access_flags must use read/write bits")
+        object.__setattr__(self, "_sealed", True)
+
+    @classmethod
+    def _from_remote_export(  # noqa: PLR0913
+        cls,
+        *,
+        owner_worker_id: int,
+        buffer_id: int,
+        generation: int,
+        address_space: RemoteAddressSpace,
+        offset: int,
+        nbytes: int,
+        export_id: int,
+        remote_addr: int,
+        rkey_or_token: int,
+        ub_ldst_va: int,
+        access_flags: int,
+        transport_profile: str,
+        transport_descriptor: bytes = b"",
+        _owner_handle: RemoteBufferHandle | None = None,
+        worker_owner_id: str | None = None,
+    ) -> RemoteBufferExport:
+        return cls(
+            owner_worker_id=owner_worker_id,
+            buffer_id=buffer_id,
+            generation=generation,
+            address_space=address_space,
+            offset=offset,
+            nbytes=nbytes,
+            export_id=export_id,
+            remote_addr=remote_addr,
+            rkey_or_token=rkey_or_token,
+            ub_ldst_va=ub_ldst_va,
+            access_flags=access_flags,
+            transport_profile=transport_profile,
+            transport_descriptor=transport_descriptor,
+            _owner_handle=_owner_handle,
+            _worker_owner_id=worker_owner_id,
+            _internal_token=_REMOTE_BUFFER_EXPORT_TOKEN,
+        )
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        if getattr(self, "_sealed", False):
+            raise AttributeError("RemoteBufferExport is immutable")
+        object.__setattr__(self, name, value)
+
+    @property
+    def owner_worker_id(self) -> int:
+        return self._owner_worker_id
+
+    @property
+    def address_space(self) -> RemoteAddressSpace:
+        return self._address_space
+
+    @property
+    def offset(self) -> int:
+        return self._offset
+
+    @property
+    def nbytes(self) -> int:
+        return self._nbytes
+
+    @property
+    def access_flags(self) -> int:
+        return self._access_flags
+
+    @property
+    def transport_profile(self) -> str:
+        return self._transport_profile
+
+    def __repr__(self) -> str:
+        return (
+            "RemoteBufferExport("
+            f"owner_worker_id={self.owner_worker_id}, address_space={self.address_space.name}, "
+            f"offset={self.offset}, nbytes={self.nbytes}, access_flags={self.access_flags}, "
+            f"transport_profile={self.transport_profile!r})"
+        )
+
+
+@dataclass(frozen=True)
+class _RemoteTensorDesc:
+    address_space: RemoteAddressSpace
+    owner_worker_id: int = -1
+    buffer_id: int = 0
+    offset: int = 0
+    nbytes: int = 0
+    remote_addr: int = 0
+    rkey_or_token: int = 0
+    generation: int = 0
+    inline_payload_offset: int = 0
+    inline_payload_len: int = 0
+    flags: int = 0
+
+
+@dataclass(frozen=True)
+class _RemoteTensorSidecar:
+    present: bool
+    desc: _RemoteTensorDesc
+    handle: RemoteBufferHandle | None = None
+
+
+@dataclass(frozen=True)
+class _RemoteTaskArgsSidecar:
+    tensors: tuple[_RemoteTensorSidecar | None, ...] = ()
+    inline_payload: bytes = b""
+
+
+@dataclass(frozen=True)
+class RemoteTensorRef:
+    handle: RemoteBufferHandle
+    offset: int = 0
+    shape: tuple[int, ...] = ()
+    dtype: DataType = DataType.FLOAT32
+    nbytes: int | None = None
+    inline_payload: bytes = b""
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.handle, RemoteBufferHandle):
+            raise TypeError("RemoteTensorRef.handle must be a RemoteBufferHandle")
+        shape = tuple(int(x) for x in self.shape)
+        if any(x < 0 for x in shape):
+            raise ValueError("RemoteTensorRef.shape entries must be non-negative")
+        object.__setattr__(self, "shape", shape)
+        object.__setattr__(self, "offset", int(self.offset))
+        if self.offset < 0:
+            raise ValueError("RemoteTensorRef.offset must be non-negative")
+        nbytes = _remote_tensor_nbytes(shape, self.dtype) if self.nbytes is None else int(self.nbytes)
+        object.__setattr__(self, "nbytes", nbytes)
+        payload = bytes(self.inline_payload)
+        object.__setattr__(self, "inline_payload", payload)
+        if nbytes < 0:
+            raise ValueError("RemoteTensorRef.nbytes must be non-negative")
+        if self.handle.address_space == RemoteAddressSpace.HOST_INLINE:
+            if len(payload) != nbytes:
+                raise ValueError("HOST_INLINE payload length must match RemoteTensorRef.nbytes")
+        elif payload:
+            raise ValueError("inline_payload is only valid for HOST_INLINE RemoteTensorRef")
+        if self.handle.nbytes and self.offset + nbytes > self.handle.nbytes:
+            raise ValueError("RemoteTensorRef range exceeds RemoteBufferHandle.nbytes")
+        if self.handle.released:
+            raise ValueError("RemoteTensorRef cannot reference a released RemoteBufferHandle")
+
+    @classmethod
+    def host_inline(cls, payload: bytes, *, shape: tuple[int, ...], dtype: DataType) -> RemoteTensorRef:
+        data = bytes(payload)
+        shape_tuple = tuple(int(x) for x in shape)
+        if any(x < 0 for x in shape_tuple):
+            raise ValueError("RemoteTensorRef.shape entries must be non-negative")
+        expected_nbytes = _remote_tensor_nbytes(shape_tuple, dtype)
+        if len(data) != expected_nbytes:
+            raise ValueError("HOST_INLINE payload length must match shape*dtype size")
+        handle = RemoteBufferHandle(
+            worker_id=0,
+            owner_worker_id=0,
+            buffer_id=0,
+            generation=0,
+            address_space=RemoteAddressSpace.HOST_INLINE,
+            nbytes=expected_nbytes,
+            _internal_token=_REMOTE_BUFFER_HANDLE_TOKEN,
+        )
+        return cls(handle=handle, offset=0, shape=shape_tuple, dtype=dtype, nbytes=expected_nbytes, inline_payload=data)
+
+
+@dataclass
+class _RemoteTaskArgsStorage:
+    sidecars: list[_RemoteTensorSidecar | None]
+    inline_payload: bytearray
+
+
+_TASK_ARGS_ADD_TENSOR = TaskArgs.add_tensor
+_TASK_ARGS_CLEAR = TaskArgs.clear
+_REMOTE_TASK_ARGS_STORAGE: weakref.WeakKeyDictionary[TaskArgs, _RemoteTaskArgsStorage] = weakref.WeakKeyDictionary()
+_REMOTE_TASK_ARGS_STORAGE_LOCK = threading.Lock()
+
+
+def _sidecar_from_ref(storage: _RemoteTaskArgsStorage, ref: RemoteTensorRef) -> _RemoteTensorSidecar:
+    handle = ref.handle
+    inline_offset = 0
+    inline_len = 0
+    if handle.address_space == RemoteAddressSpace.HOST_INLINE:
+        inline_offset = len(storage.inline_payload)
+        inline_len = len(ref.inline_payload)
+        storage.inline_payload.extend(ref.inline_payload)
+    nbytes = ref.nbytes
+    assert nbytes is not None
+
+    desc = _RemoteTensorDesc(
+        address_space=handle.address_space,
+        owner_worker_id=0 if handle.address_space == RemoteAddressSpace.HOST_INLINE else handle.owner_worker_id,
+        buffer_id=0 if handle.address_space == RemoteAddressSpace.HOST_INLINE else handle._buffer_id,
+        offset=0 if handle.address_space == RemoteAddressSpace.HOST_INLINE else handle._offset + ref.offset,
+        nbytes=int(nbytes),
+        remote_addr=0 if handle.address_space == RemoteAddressSpace.HOST_INLINE else handle._remote_addr,
+        rkey_or_token=0 if handle.address_space == RemoteAddressSpace.HOST_INLINE else handle._rkey_or_token,
+        generation=0 if handle.address_space == RemoteAddressSpace.HOST_INLINE else handle._generation,
+        inline_payload_offset=inline_offset,
+        inline_payload_len=inline_len,
+        flags=0,
+    )
+    handle_ref = None if handle.address_space == RemoteAddressSpace.HOST_INLINE else handle
+    return _RemoteTensorSidecar(True, desc, handle_ref)
+
+
+def _storage_for_remote_task_args(args: TaskArgs) -> _RemoteTaskArgsStorage:
+    with _REMOTE_TASK_ARGS_STORAGE_LOCK:
+        storage = _REMOTE_TASK_ARGS_STORAGE.get(args)
+        if storage is None or len(storage.sidecars) != args.tensor_count():
+            storage = _RemoteTaskArgsStorage([None for _ in range(args.tensor_count())], bytearray())
+            _REMOTE_TASK_ARGS_STORAGE[args] = storage
+        return storage
+
+
+def _task_args_add_tensor(
+    self: TaskArgs, tensor: Tensor | RemoteTensorRef, tag: TensorArgType = TensorArgType.INPUT
+) -> None:
+    if isinstance(tensor, RemoteTensorRef):
+        storage = _storage_for_remote_task_args(self)
+        metadata = Tensor.make(0, tensor.shape, tensor.dtype)
+        _TASK_ARGS_ADD_TENSOR(self, metadata, tag)
+        storage.sidecars.append(_sidecar_from_ref(storage, tensor))
+        return
+    if not isinstance(tensor, Tensor):
+        raise TypeError("TaskArgs.add_tensor expects Tensor or RemoteTensorRef")
+    _TASK_ARGS_ADD_TENSOR(self, tensor, tag)
+    with _REMOTE_TASK_ARGS_STORAGE_LOCK:
+        storage = _REMOTE_TASK_ARGS_STORAGE.get(self)
+        if storage is not None:
+            storage.sidecars.append(None)
+
+
+def _task_args_clear(self: TaskArgs) -> None:
+    _TASK_ARGS_CLEAR(self)
+    with _REMOTE_TASK_ARGS_STORAGE_LOCK:
+        _REMOTE_TASK_ARGS_STORAGE.pop(self, None)
+
+
+TaskArgs.add_tensor = _task_args_add_tensor
+TaskArgs.clear = _task_args_clear
+
+
+def _remote_tensor_nbytes(shape: tuple[int, ...], dtype: DataType) -> int:
+    element_count = int(prod(shape)) if shape else 1
+    return element_count * int(get_element_size(dtype))
+
+
+def _empty_remote_sidecar_for(args: TaskArgs) -> _RemoteTaskArgsSidecar:
+    return _RemoteTaskArgsSidecar(tuple(None for _ in range(args.tensor_count())), b"")
+
+
+def _remote_sidecar_for(args: TaskArgs) -> _RemoteTaskArgsSidecar | None:
+    with _REMOTE_TASK_ARGS_STORAGE_LOCK:
+        storage = _REMOTE_TASK_ARGS_STORAGE.get(args)
+        if storage is None:
+            return None
+        if len(storage.sidecars) != args.tensor_count():
+            _REMOTE_TASK_ARGS_STORAGE.pop(args, None)
+            return None
+        return _RemoteTaskArgsSidecar(tuple(storage.sidecars), bytes(storage.inline_payload))
+
+
+def _remote_access_label(flags: int) -> str:
+    flags = int(flags)
+    if flags == _REMOTE_BUFFER_ACCESS_READ:
+        return "read"
+    if flags == _REMOTE_BUFFER_ACCESS_WRITE:
+        return "write"
+    if flags == _REMOTE_BUFFER_ACCESS_READ_WRITE:
+        return "readwrite"
+    return f"0x{flags:x}"
+
+
+def _required_remote_access_for_tag(tag: TensorArgType) -> int:
+    if tag == TensorArgType.INPUT:
+        return _REMOTE_BUFFER_ACCESS_READ
+    if tag in (TensorArgType.OUTPUT, TensorArgType.OUTPUT_EXISTING):
+        return _REMOTE_BUFFER_ACCESS_WRITE
+    if tag in (TensorArgType.INOUT, TensorArgType.NO_DEP):
+        return _REMOTE_BUFFER_ACCESS_READ_WRITE
+    raise ValueError(f"unsupported TensorArgType for remote tensor: {tag!r}")
+
+
+def _validate_remote_sidecar_access(args: TaskArgs, remote_sidecar: _RemoteTaskArgsSidecar | None) -> None:
+    if remote_sidecar is None:
+        return
+    tensor_count = int(args.tensor_count())
+    if len(remote_sidecar.tensors) != tensor_count:
+        raise ValueError("remote tensor sidecar count does not match TaskArgs tensor count")
+
+    for idx, tensor_sidecar in enumerate(remote_sidecar.tensors):
+        if tensor_sidecar is None or not tensor_sidecar.present:
+            continue
+        tag = args.tag(idx)
+        required = _required_remote_access_for_tag(tag)
+        desc = tensor_sidecar.desc
+        if RemoteAddressSpace(int(desc.address_space)) == RemoteAddressSpace.HOST_INLINE:
+            granted = _REMOTE_BUFFER_ACCESS_READ
+        else:
+            handle = tensor_sidecar.handle
+            if not isinstance(handle, RemoteBufferHandle):
+                raise TypeError(f"remote tensor {idx} sidecar handle must be a RemoteBufferHandle")
+            if handle.released:
+                raise ValueError(f"remote tensor {idx} references a released RemoteBufferHandle")
+            granted = int(handle.access_flags)
+        if required & ~granted:
+            tag_name = getattr(tag, "name", str(tag))
+            raise ValueError(
+                f"remote tensor {idx} tag {tag_name} requires {_remote_access_label(required)} access; "
+                f"handle grants {_remote_access_label(granted)}"
+            )
 
 
 class _CommContextStruct(ctypes.Structure):
@@ -184,7 +818,7 @@ class CommDomainHandle:
         *,
         name: str,
         workers: tuple[int, ...],
-        contexts: dict[int, "ChipDomainContext"],
+        contexts: dict[int, ChipDomainContext],
         allocation_id: int,
         _release_fn,
     ) -> None:
@@ -197,7 +831,7 @@ class CommDomainHandle:
         self._released = False
         self._freed = False
 
-    def __getitem__(self, chip_idx: int) -> "ChipDomainContext":
+    def __getitem__(self, chip_idx: int) -> ChipDomainContext:
         if self._released:
             raise RuntimeError(
                 f"CommDomainHandle({self.name!r}) already released; do not pass it to submit_* "
@@ -246,7 +880,7 @@ class CommDomainHandle:
         # release and runs it after drain.  Worker also flips _freed.
         self._release_fn(self)
 
-    def __enter__(self) -> "CommDomainHandle":
+    def __enter__(self) -> CommDomainHandle:
         return self
 
     def __exit__(self, *_):

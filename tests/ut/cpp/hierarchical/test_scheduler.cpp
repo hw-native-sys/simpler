@@ -209,9 +209,10 @@ private:
 
 class FakeEndpoint final : public WorkerEndpoint {
 public:
-    explicit FakeEndpoint(int32_t endpoint_id) {
+    explicit FakeEndpoint(int32_t worker_id, std::atomic<int> *prepare_count = nullptr) :
+        prepare_count_(prepare_count) {
         caps_.kind = WorkerEndpointKind::REMOTE_L3;
-        caps_.endpoint_id = endpoint_id;
+        caps_.worker_id = worker_id;
         caps_.remote = true;
         caps_.transport = "test-remote";
     }
@@ -227,8 +228,13 @@ public:
         return completion;
     }
 
+    void control_prepare(const uint8_t *) override {
+        if (prepare_count_ != nullptr) prepare_count_->fetch_add(1, std::memory_order_relaxed);
+    }
+
 private:
     WorkerEndpointCaps caps_;
+    std::atomic<int> *prepare_count_{nullptr};
 };
 
 // ---------------------------------------------------------------------------
@@ -321,7 +327,7 @@ struct SchedulerFixture : public ::testing::Test {
 // Tests
 // ---------------------------------------------------------------------------
 
-TEST(WorkerManagerTest, StartRejectsDuplicateNextLevelEndpointId) {
+TEST(WorkerManagerTest, StartRejectsDuplicateNextLevelWorkerId) {
     alignas(8) std::array<char, MAILBOX_SIZE> mailbox{};
     Ring allocator;
     allocator.init(/*heap_bytes=*/0);
@@ -335,12 +341,32 @@ TEST(WorkerManagerTest, StartRejectsDuplicateNextLevelEndpointId) {
         manager.start(&allocator, [](WorkerCompletion) {});
     } catch (const std::runtime_error &e) {
         threw = true;
-        EXPECT_NE(std::string(e.what()).find("duplicate NEXT_LEVEL endpoint_id 0"), std::string::npos);
+        EXPECT_NE(std::string(e.what()).find("duplicate NEXT_LEVEL worker_id 0"), std::string::npos);
     }
 
     manager.stop();
     allocator.shutdown();
     EXPECT_TRUE(threw);
+}
+
+TEST(WorkerManagerTest, ControlPrepareUsesStableNextLevelWorkerId) {
+    Ring allocator;
+    allocator.init(/*heap_bytes=*/0);
+    WorkerManager manager;
+    std::atomic<int> worker7_prepares{0};
+    std::atomic<int> worker3_prepares{0};
+
+    manager.add_next_level_endpoint(std::make_unique<FakeEndpoint>(7, &worker7_prepares));
+    manager.add_next_level_endpoint(std::make_unique<FakeEndpoint>(3, &worker3_prepares));
+    manager.start(&allocator, [](WorkerCompletion) {});
+
+    std::array<uint8_t, CALLABLE_HASH_DIGEST_SIZE> digest{};
+    manager.control_prepare(3, digest.data());
+
+    manager.stop();
+    allocator.shutdown();
+    EXPECT_EQ(worker7_prepares.load(std::memory_order_relaxed), 0);
+    EXPECT_EQ(worker3_prepares.load(std::memory_order_relaxed), 1);
 }
 
 TEST_F(SchedulerFixture, IndependentTaskDispatchedAndConsumed) {
@@ -612,6 +638,97 @@ TEST_F(GroupSchedulerFixture, AffinityMustBeInEligibleEndpointSet) {
     EXPECT_THROW((void)orch.submit_next_level(C(56), args, cfg, 0, {1}), std::invalid_argument);
 }
 
+TEST_F(GroupSchedulerFixture, UnknownEligibleWorkerIdIsRejectedBeforeScheduling) {
+    TaskArgs args = single_tensor_args(0xE3, TensorArgType::OUTPUT);
+    EXPECT_THROW((void)orch.submit_next_level(C(59), args, cfg, -1, {99}), std::invalid_argument);
+}
+
+TEST(SchedulerWorkerAffinityTest, NextLevelAffinityUsesWorkerIdNotVectorIndex) {
+    TensorMap tm;
+    Ring allocator;
+    Scope scope;
+    ReadyQueue rq_next_level;
+    ReadyQueue rq_sub;
+    Orchestrator orch;
+    MockMailboxWorker worker_a;
+    MockMailboxWorker worker_b;
+    WorkerManager manager;
+    Scheduler sched;
+    CallConfig cfg;
+    std::vector<TaskSlot> consumed_slots;
+    std::mutex consumed_mu;
+
+    allocator.init(/*heap_bytes=*/1ULL << 20);
+    orch.init(&tm, &allocator, &scope, &rq_next_level, &rq_sub, &manager);
+
+    worker_a.start();
+    worker_b.start();
+    manager.add_next_level_at(7, worker_a.mailbox_ptr());
+    manager.add_next_level_at(9, worker_b.mailbox_ptr());
+    manager.start(&allocator, [&sched](WorkerCompletion completion) {
+        sched.worker_done(std::move(completion));
+    });
+
+    Scheduler::Config c;
+    c.ring = &allocator;
+    c.ready_next_level_queue = &rq_next_level;
+    c.ready_sub_queue = &rq_sub;
+    c.manager = &manager;
+    c.on_consumed_cb = [&orch, &consumed_slots, &consumed_mu](TaskSlot s) {
+        orch.on_consumed(s);
+        std::lock_guard<std::mutex> lk(consumed_mu);
+        consumed_slots.push_back(s);
+    };
+    sched.start(c);
+
+    auto wait_consumed_slot = [&consumed_slots, &consumed_mu](TaskSlot slot) {
+        bool consumed = false;
+        auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(1000);
+        while (std::chrono::steady_clock::now() < deadline) {
+            {
+                std::lock_guard<std::mutex> lk(consumed_mu);
+                consumed = std::find(consumed_slots.begin(), consumed_slots.end(), slot) != consumed_slots.end();
+            }
+            if (consumed) break;
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        EXPECT_TRUE(consumed);
+    };
+
+    TaskArgs args = single_tensor_args(0xE2, TensorArgType::OUTPUT);
+    auto res = orch.submit_next_level(C(58), args, cfg, 9);
+
+    worker_b.wait_running();
+    EXPECT_FALSE(worker_a.is_running.load());
+    EXPECT_TRUE(worker_b.is_running.load());
+    EXPECT_EQ(worker_a.dispatched_count(), 0);
+    EXPECT_EQ(worker_b.dispatched_count(), 1);
+
+    if (worker_a.is_running.load()) worker_a.complete();
+    if (worker_b.is_running.load()) worker_b.complete();
+
+    wait_consumed_slot(res.task_slot);
+
+    TaskArgs a0 = single_tensor_args(0xE6, TensorArgType::OUTPUT);
+    TaskArgs a1 = single_tensor_args(0xE7, TensorArgType::OUTPUT);
+    auto group_res = orch.submit_next_level_group(C(61), {a0, a1}, cfg, {}, {{7}, {9}});
+
+    worker_a.wait_running();
+    worker_b.wait_running();
+    EXPECT_TRUE(worker_a.is_running.load());
+    EXPECT_TRUE(worker_b.is_running.load());
+    EXPECT_EQ(worker_a.dispatched_count(), 1);
+    EXPECT_EQ(worker_b.dispatched_count(), 2);
+
+    worker_a.complete();
+    worker_b.complete();
+    wait_consumed_slot(group_res.task_slot);
+
+    sched.stop();
+    manager.stop();
+    allocator.shutdown();
+}
+
 TEST_F(GroupSchedulerFixture, RemoteSidecarRejectsLocalEndpointEligibility) {
     TaskArgs args;
     Tensor tensor{};
@@ -625,7 +742,7 @@ TEST_F(GroupSchedulerFixture, RemoteSidecarRejectsLocalEndpointEligibility) {
     sidecar.tensors.resize(1);
     sidecar.tensors[0].present = true;
     sidecar.tensors[0].desc.address_space = RemoteAddressSpace::REMOTE_DEVICE;
-    sidecar.tensors[0].desc.owner_endpoint_id = 7;
+    sidecar.tensors[0].desc.owner_worker_id = 7;
     sidecar.tensors[0].desc.buffer_id = 11;
     sidecar.tensors[0].desc.generation = 1;
     sidecar.tensors[0].desc.nbytes = 1;

@@ -36,7 +36,7 @@ public:
     );
     ~RemoteL3SocketTransport() override;
 
-    void expect_hello_ready(uint64_t session_id, int32_t endpoint_id, const std::string &comm_profile);
+    void expect_hello_ready(uint64_t session_id, int32_t worker_id, const std::string &comm_profile);
     void submit_frame(const std::vector<uint8_t> &frame) override;
     std::vector<uint8_t> wait_for_reply(remote_l3::FrameType frame_type, uint64_t sequence) override;
     void shutdown() override;
@@ -57,7 +57,7 @@ private:
 
     void connect_socket();
     void close_socket();
-    void start_health_monitor(uint64_t session_id, int32_t endpoint_id);
+    void start_health_monitor(uint64_t session_id, int32_t worker_id);
     void stop_health_monitor();
     void mark_health_failed(const std::string &message);
     void check_health();
@@ -70,8 +70,7 @@ private:
 class RemoteL3Endpoint : public WorkerEndpoint {
 public:
     RemoteL3Endpoint(
-        int32_t endpoint_id, uint64_t session_id, std::string transport_name,
-        std::unique_ptr<RemoteL3Transport> transport
+        int32_t worker_id, uint64_t session_id, std::string transport_name, std::unique_ptr<RemoteL3Transport> transport
     );
 
     const WorkerEndpointCaps &caps() const override { return caps_; }
@@ -101,7 +100,7 @@ public:
         const std::string &transport_profile
     ) override;
     RemoteBufferHandle control_remote_import(
-        int32_t importer_endpoint_id, const RemoteBufferExport &export_desc, uint32_t requested_access_flags
+        int32_t importer_worker_id, const RemoteBufferExport &export_desc, uint32_t requested_access_flags
     ) override;
     void control_remote_release_import(const RemoteBufferHandle &handle) override;
 

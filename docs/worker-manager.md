@@ -41,6 +41,7 @@ public:
     // MAP_SHARED region; the real worker (a `ChipWorker` for NEXT_LEVEL,
     // a Python callable for SUB) lives in the forked child.
     void add_next_level(void *mailbox);
+    void add_next_level_at(int32_t worker_id, void *mailbox);
     void add_next_level_endpoint(std::unique_ptr<WorkerEndpoint> endpoint);
     void add_sub       (void *mailbox);
 
@@ -51,18 +52,27 @@ public:
     // Scheduler API
     WorkerThread *pick_idle(WorkerType type) const;
     std::vector<WorkerThread *> pick_n_idle(WorkerType type, int n) const;
-    WorkerThread *get_worker_by_endpoint_id(WorkerType type, int32_t endpoint_id) const;
+    WorkerThread *get_worker_by_id(WorkerType type, int32_t worker_id) const;
     WorkerThread *pick_idle_excluding_eligible(WorkerType type,
                                                const std::vector<WorkerThread *> &exclude,
-                                               const std::vector<int32_t> &eligible_endpoint_ids) const;
+                                               const std::vector<int32_t> &eligible_worker_ids) const;
 
 private:
-    std::vector<void *> next_level_entries_;
+    struct LocalNextLevelEntry {
+        int32_t worker_id;
+        void *mailbox;
+    };
+    std::vector<LocalNextLevelEntry> next_level_entries_;
     std::vector<void *> sub_entries_;
     std::vector<std::unique_ptr<WorkerThread>> next_level_threads_;
     std::vector<std::unique_ptr<WorkerThread>> sub_threads_;
 };
 ```
+
+`add_next_level_at(...)` is used by the Python `Worker` facade when local L4
+children share the NEXT_LEVEL worker id space with remote L3 workers.
+Python local Worker children use explicit worker ids rather than deriving
+the public worker id from the local worker vector index.
 
 ### Responsibilities
 
@@ -70,8 +80,8 @@ private:
   calls
 - **Idle selection**: `pick_idle(type)` finds a WorkerThread whose queue is
   empty; returns nullptr if none available
-- **Endpoint eligibility**: remote-aware NEXT_LEVEL slots carry final eligible
-  endpoint ids. Scheduler dispatch calls `pick_idle_excluding_eligible()` so a
+- **Worker eligibility**: remote-aware NEXT_LEVEL slots carry final eligible
+  worker ids. Scheduler dispatch calls `pick_idle_excluding_eligible()` so a
   task cannot land on a worker that lacks the callable or tensor sidecars.
 
 ---
@@ -95,7 +105,7 @@ public:
     void dispatch(WorkerDispatch d);       // slot id + group sub-index
     bool idle() const;
     const WorkerEndpointCaps &caps() const;
-    int32_t endpoint_id() const;
+    int32_t worker_id() const;
 
 private:
     Ring *ring_;                       // reads slot state via ring->slot_state(id)
@@ -229,8 +239,9 @@ forked worker kind still follows the existing pattern:
 1. Define the worker entry point.
 2. Write a child-process loop that polls the mailbox, decodes the args blob,
    and invokes that entry point.
-3. Register the mailbox via `manager.add_next_level(mailbox)` or
-   `manager.add_sub(mailbox)`.
+3. Register the mailbox via `manager.add_next_level_at(worker_id, mailbox)`
+   for explicit NEXT_LEVEL worker ids, `manager.add_next_level(mailbox)` for
+   the legacy local default, or `manager.add_sub(mailbox)`.
 
 Remote L3 is different. It cannot reuse the mailbox wire format because the
 remote side does not share virtual addresses, fork-time COW registries, POSIX
