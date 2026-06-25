@@ -241,9 +241,9 @@ jobs:
             --platform a2a3sim --device 0-15 -p no:xdist --pto-session-timeout 600 \
             --enable-pmu 2 --clone-protocol https --pto-isa-commit ${{ env.PTO_ISA_COMMIT }}
 
-      - name: tensor_dump smoke
+      - name: args_dump smoke
         run: |
-          pytest tests/st/a2a3/tensormap_and_ringbuffer/dfx/tensor_dump/test_tensor_dump.py \
+          pytest tests/st/a2a3/tensormap_and_ringbuffer/dfx/args_dump/test_args_dump.py \
             --platform a2a3sim --device 0-15 -p no:xdist --pto-session-timeout 600 \
             --dump-args --clone-protocol https --pto-isa-commit ${{ env.PTO_ISA_COMMIT }}
 
@@ -591,11 +591,11 @@ jobs:
             --platform a2a3 --device ${DEVICE_RANGE} -p no:xdist --pto-session-timeout 600 \
             --enable-pmu 2 --clone-protocol ssh --pto-isa-commit ${{ env.PTO_ISA_COMMIT }}
 
-      - name: tensor_dump smoke
+      - name: args_dump smoke
         run: |
           source /usr/local/Ascend/cann/set_env.sh
           source .venv/bin/activate
-          python -m pytest tests/st/a2a3/tensormap_and_ringbuffer/dfx/tensor_dump/test_tensor_dump.py \
+          python -m pytest tests/st/a2a3/tensormap_and_ringbuffer/dfx/args_dump/test_args_dump.py \
             --platform a2a3 --device ${DEVICE_RANGE} -p no:xdist --pto-session-timeout 600 \
             --dump-args --clone-protocol ssh --pto-isa-commit ${{ env.PTO_ISA_COMMIT }}
 

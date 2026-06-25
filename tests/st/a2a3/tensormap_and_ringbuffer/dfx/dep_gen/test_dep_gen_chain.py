@@ -65,7 +65,7 @@ class TestDepGenChain(SceneTestCase):
                 "source": f"{DUMMY_KERNELS}/aic/kernel_write_const.cpp",
                 "core_type": "aic",
                 # Single-AIC task with one INOUT tensor (args[0]). Declared so
-                # the tensor dump's per-subtask sum matches the payload.
+                # the args dump's per-subtask sum matches the payload.
                 "signature": [D.INOUT],
             },
             {

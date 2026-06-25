@@ -12,7 +12,7 @@ no repo checkout required.
 - **[swimlane_converter](#swimlane_converter)** — perf JSON → Chrome Trace Event (Perfetto)
 - **[sched_overhead_analysis](#sched_overhead_analysis)** — scheduler overhead / Tail OH breakdown
 - **[device_log_timing](#device_log_timing)** — Total / Orch / Sched from a CANN device log (no swimlane JSON)
-- **[dump_viewer](#dump_viewer)** — inspect / export args dumps (see [docs/tensor-dump.md](../../docs/dfx/tensor-dump.md) for full workflow)
+- **[dump_viewer](#dump_viewer)** — inspect / export args dumps (see [docs/args-dump.md](../../docs/dfx/args-dump.md) for full workflow)
 - **[deps_viewer](#deps_viewer)** — `deps.json` (dep_gen) → text or pan/zoom HTML dependency graph
 
 Auto-detection paths (`outputs/*/l2_swimlane_records.json`, `outputs/*/args_dump/`)
@@ -326,7 +326,7 @@ at view time.
 ## dump_viewer
 
 Inspect and export args captured by the runtime args-dump feature.
-See [docs/tensor-dump.md](../../docs/dfx/tensor-dump.md) for the full capture workflow;
+See [docs/args-dump.md](../../docs/dfx/args-dump.md) for the full capture workflow;
 this section only documents CLI invocation.
 
 ### Basic Usage

@@ -63,7 +63,7 @@ class TestSpmdSyncStartStress(SceneTestCase):
                 "source": "../spmd_multiblock_mix/kernels/aic/kernel_spmd_mix.cpp",
                 "core_type": "aic",
                 # Cooperative MIX (AIC+AIV0+AIV1 share one args[]). Declare the
-                # payload signature on exactly ONE subtask so the tensor dump's
+                # payload signature on exactly ONE subtask so the args dump's
                 # per-subtask sum equals the payload (1 INOUT tensor); the AIVs
                 # stay empty or the sum would triple and the dump is skipped.
                 "signature": [D.INOUT],

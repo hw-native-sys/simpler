@@ -747,7 +747,7 @@ NB_MODULE(_task_interface, m) {
             },
             // Accept either an int dump level (0=off, 1=partial, 2=full,
             // 3=full_json_only) or a Python bool. `True` maps to level 1
-            // (partial) — the default when --dump-tensor is passed without a
+            // (partial) — the default when --dump-args is passed without a
             // value; `False` maps to 0.
             [](CallConfig &c, nb::object v) {
                 if (PyBool_Check(v.ptr())) {

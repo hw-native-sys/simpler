@@ -409,7 +409,7 @@ public:
 
     /**
      * Directory under which all diagnostic artifacts
-     * (l2_swimlane_records.json / tensor_dump/ / pmu.csv) land. Required
+     * (l2_swimlane_records.json / args_dump/ / pmu.csv) land. Required
      * (non-empty) when any diagnostic is enabled; `CallConfig::validate()`
      * enforces this contract upstream.
      */
