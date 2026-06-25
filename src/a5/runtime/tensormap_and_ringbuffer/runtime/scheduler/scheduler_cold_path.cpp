@@ -928,14 +928,15 @@ int32_t SchedulerContext::init(
         pmu_aicpu_init(physical_core_ids_, cores_total_num_);
         LOG_INFO_V0("PMU profiling started on %d cores", cores_total_num_);
     }
-#endif
-    // dep_gen is host-driven (SubmitTrace) and gated independently of
-    // PTO2_PROFILING. init() only pops the initial buffer from instance 0's
-    // free_queue; the orchestrator thread still records its idx via
+    // dep_gen is host-driven (SubmitTrace) — runtime-gated by the host flag —
+    // and compiles out with the other profiling subsystems at PTO2_PROFILING=0.
+    // init() only pops the initial buffer from instance 0's free_queue; the
+    // orchestrator thread still records its idx via
     // dep_gen_aicpu_set_orch_thread_idx() before the first record_submit.
     if (is_dep_gen_enabled()) {
         dep_gen_aicpu_init();
     }
+#endif
 
     // Initialize task counters. Task count comes from PTO2 shared memory.
     if (runtime->get_gm_sm_ptr()) {

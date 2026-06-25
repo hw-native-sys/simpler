@@ -698,6 +698,7 @@ static TaskOutputTensors submit_task_common(
     // these records offline to reconstruct the complete dep graph — the sole
     // source of truth for fanout now that the swimlane hot path no longer
     // records it.
+#if PTO2_PROFILING
     if (is_dep_gen_enabled()) {
         const void *tensor_ptrs[MAX_TENSOR_ARGS];
         // TensorArgType is `enum class : int32_t` (4 bytes); the on-disk record
@@ -726,6 +727,7 @@ static TaskOutputTensors submit_task_common(
             args.launch_spec.block_num(), kernel_ids_capture
         );
     }
+#endif
 
     PTO2FaninBuilder fanin_builder(orch, orch->rings[ring_id].fanin_pool, next_fanin_seen_epoch(orch));
 

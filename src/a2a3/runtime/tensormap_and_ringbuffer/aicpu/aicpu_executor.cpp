@@ -539,6 +539,7 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
             }
 #endif
 
+#if PTO2_PROFILING
             // dep_gen plugs into the orchestrator thread (single-instance subsystem):
             // record the per-thread ready_queue index before any submit_task fires
             // inside orch_func_.
@@ -546,7 +547,6 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
                 dep_gen_aicpu_set_orch_thread_idx(thread_idx);
             }
 
-#if PTO2_PROFILING
             // scope_stats streams scope_end records off the orchestrator thread:
             // record the per-thread ready_queue index. No-op (writer shared
             // state null) when scope_stats is disabled; the current buffer is
@@ -565,12 +565,12 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
             (*p_func)(orch_args_cached_);
             rt_scope_end(rt);
 
+#if PTO2_PROFILING
             // Flush the (potentially partially-filled) DepGenBuffer so the host
             // collector can pick it up before this orchestrator thread joins.
             if (is_dep_gen_enabled()) {
                 dep_gen_aicpu_flush();
             }
-#if PTO2_PROFILING
             // Push the partially-filled scope_stats buffer so the host gets the
             // final scope_end records. Idempotent / no-op when disabled.
             scope_stats_aicpu_flush_buffers();

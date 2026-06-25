@@ -809,7 +809,13 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
     // pollute per-task PMU counters, so skip the PENDING pre-load phase.
     // Cached at function scope: is_pmu_enabled() is extern "C" and the
     // compiler cannot hoist it across the dispatch loop on its own.
+#if PTO2_PROFILING
     const bool pmu_active = is_pmu_enabled();
+#else
+    // PMU is definitionally off when profiling is compiled out; hard-set false
+    // so dispatch keeps its overlapping (non-single-issue) fast path.
+    constexpr bool pmu_active = false;
+#endif
 
 #if PTO2_PROFILING
     l2_swimlane.sched_start_ts = get_sys_cnt_aicpu();

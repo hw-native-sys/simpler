@@ -522,6 +522,19 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
 
     bool cores_released = false;
 
+    // PMU runs require single-issue dispatch — overlapping in-flight tasks
+    // pollute per-task PMU counters. Cached at function scope (parity with
+    // a2a3): is_pmu_enabled() is extern "C" and the compiler cannot hoist it
+    // across the dispatch loop on its own, and the value is loop-invariant
+    // (PMU is latched once at kernel entry).
+#if PTO2_PROFILING
+    const bool pmu_active = is_pmu_enabled();
+#else
+    // PMU is definitionally off when profiling is compiled out; hard-set false
+    // so dispatch keeps its overlapping (non-single-issue) fast path.
+    constexpr bool pmu_active = false;
+#endif
+
 #if PTO2_PROFILING
     l2_swimlane.sched_start_ts = get_sys_cnt_aicpu();
 #endif
@@ -810,7 +823,7 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
 
         // Phase 4: MIX-strict-priority dispatch with phase-split and
         // cross-thread idle gating. See dispatch_ready_tasks for the policy.
-        const bool pmu_active = is_pmu_enabled();
+        // pmu_active is cached at function scope above (loop-invariant).
         dispatch_ready_tasks(runtime, thread_idx, tracker, local_bufs, pmu_active, made_progress, try_pushed);
 
 #if PTO2_PROFILING
