@@ -173,6 +173,21 @@ static void apply_env_ring_values(
     }
 }
 
+// ring_task_window / ring_heap / ring_dep_pool point into the #pragma pack(1)
+// RuntimeEnv wire struct (call_config.h), so their uint64_t entries are only
+// byte-aligned — runtime_env sits at offset 28 in CallConfig (after 7 int32_t),
+// i.e. 4-byte but not 8-byte aligned. Reading them as `base[idx]` is an
+// unaligned 8-byte load: UB, and fatal under UBSan (-fsanitize=alignment). Copy
+// the bytes out instead. A null base means "no per-task overrides" -> 0 (unset).
+static uint64_t read_ring_override(const uint64_t *base, int idx) {
+    if (base == nullptr) {
+        return 0;
+    }
+    uint64_t value;
+    std::memcpy(&value, base + idx, sizeof(value));
+    return value;
+}
+
 // Each of ring_task_window / ring_heap / ring_dep_pool is a per-ring array of
 // PTO2_MAX_RING_DEPTH entries (0 = unset). Precedence per ring: per-task entry >
 // PTO2_RING_* env value > compile-time default. A "size all rings the same"
@@ -194,14 +209,17 @@ static bool resolve_ring_config(
     apply_env_ring_values("PTO2_RING_DEP_POOL", 4, static_cast<uint64_t>(INT32_MAX), false, dep_pool_values);
 
     for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
-        if (ring_task_window != nullptr && ring_task_window[r] != 0) {
-            eff_task_window_sizes[r] = ring_task_window[r];
+        const uint64_t task_window_override = read_ring_override(ring_task_window, r);
+        const uint64_t heap_override = read_ring_override(ring_heap, r);
+        const uint64_t dep_pool_override = read_ring_override(ring_dep_pool, r);
+        if (task_window_override != 0) {
+            eff_task_window_sizes[r] = task_window_override;
         }
-        if (ring_heap != nullptr && ring_heap[r] != 0) {
-            eff_heap_sizes[r] = ring_heap[r];
+        if (heap_override != 0) {
+            eff_heap_sizes[r] = heap_override;
         }
-        if (ring_dep_pool != nullptr && ring_dep_pool[r] != 0) {
-            dep_pool_values[r] = ring_dep_pool[r];
+        if (dep_pool_override != 0) {
+            dep_pool_values[r] = dep_pool_override;
         }
 
         if (eff_task_window_sizes[r] < 4 || eff_task_window_sizes[r] > static_cast<uint64_t>(INT32_MAX) ||
