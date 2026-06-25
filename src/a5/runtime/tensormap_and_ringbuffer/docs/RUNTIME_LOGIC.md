@@ -199,7 +199,7 @@ The ring buffer mechanism provides **flow control** between the orchestrator (pr
 
 **Heap Ring back-pressure**: When the heap has insufficient contiguous space, `PTO2TaskAllocator::alloc` spin-waits until the scheduler advances `heap_tail` past completed tasks' output buffers.
 
-**TensorMap pool back-pressure**: When the entry pool is exhausted, `new_entry()` spin-waits on `PTO2TensorMap::sync_tensormap(force=true)` until cleanup frees entries (see Section 5.4).
+**TensorMap pool back-pressure**: Before STEP 4 registers a task's outputs, the orchestrator's `ensure_tensormap_capacity` reserves pool space for the inserts. When the shared entry pool is exhausted, it reclaims retired entries across all rings and spin-waits until reclaim actually frees entries, with a 500 ms wall-clock deadlock backstop (see Section 5.4).
 
 This back-pressure is essential for correctness with small ring sizes — for example, with `PTO2_RING_TASK_WINDOW=16` and 208 tasks, the orchestrator blocks ~192 times, each time waiting for the scheduler to drain completed tasks before continuing.
 
@@ -265,7 +265,7 @@ Unlike the Task Ring and Heap Ring, TensorMap entries are **not** managed by a r
 
 1. **Free list first**: `free_entry_list[]` stores pointers to released entries. Allocation pops from here (O(1)).
 2. **Bump allocation**: if free list is empty, `entry_pool[next_entry_idx++]` allocates from the end of the pool.
-3. **Blocking reclaim**: if the pool is fully exhausted, `PTO2TensorMap::sync_tensormap(force=true)` reads the latest `last_task_alive` and calls `cleanup_retired` to batch-free all entries belonging to retired tasks, returning them to the free list.
+3. **Blocking reclaim**: if the pool is short of the inserts a task needs, the orchestrator's `ensure_tensormap_capacity` reads the latest `last_task_alive` for every ring and calls `reclaim_retired_all` (`cleanup_retired` per ring) to batch-free entries belonging to retired tasks, returning them to the free list, before the inserts proceed.
 
 This design avoids the complexity of ring-based wrapping while still being bounded by `PTO2_TENSORMAP_POOL_SIZE` (default 65536 entries).
 
@@ -292,7 +292,7 @@ This uses the **per-task entry chain** (`task_entry_head[task_slot]`) — each t
 
 **Layer 3 — Back-Pressure on Pool Exhaustion** (blocking):
 
-If both the free list and bump region are depleted, `new_entry()` blocks until `PTO2TensorMap::sync_tensormap(force=true)` frees entries by advancing `last_task_alive` through `cleanup_retired`.
+Before STEP 4 inserts a task's outputs, `ensure_tensormap_capacity` checks the free list + bump region against the task's needed entry count. If short, it reclaims retired entries across all rings and blocks until reclaim frees enough entries. Progress is measured by entries actually freed, not by watermark movement — a ring can retire zero-output tasks, advancing `last_task_alive` without freeing any entry. A pool that frees nothing for a 500 ms wall-clock timeout is a genuine deadlock: it latches `PTO2_ERROR_TENSORMAP_OVERFLOW` and unwinds, matching the task allocator and fanin spill pool.
 
 This forms a back-pressure mechanism analogous to the Task Ring's flow control.
 

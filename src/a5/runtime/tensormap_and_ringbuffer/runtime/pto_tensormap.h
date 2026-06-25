@@ -389,6 +389,28 @@ struct PTO2TensorMap {
     // these accessors stay gated by PTO2_PROFILING).
     int32_t current_used() const { return next_entry_idx - free_num; }
     int32_t pool_capacity() const { return pool_size; }
+    int32_t free_entries() const { return pool_size - current_used(); }
+
+    // Reclaim retired entries across every ring, advancing each ring's cleanup
+    // cursor (last_cleanup[r]) to the supplied watermark. Returns the summed
+    // last_task_alive across rings — the monotone progress signal the
+    // orchestrator's exhaustion back-pressure loop watches to tell a transient
+    // shortage (some ring still retiring tasks) from a wedged pool (no ring
+    // advancing). Idempotent per watermark: a ring whose alive has not passed
+    // last_cleanup[r] is skipped, so it never double-frees.
+    int64_t reclaim_retired_all(const int32_t sm_last_task_alive[PTO2_MAX_RING_DEPTH]) {
+        int64_t alive_sum = 0;
+        for (int32_t r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
+            int32_t alive = sm_last_task_alive[r];
+            sync_validity(r, alive);
+            if (alive > last_cleanup[r]) {
+                cleanup_retired(r, last_cleanup[r], alive);
+                last_cleanup[r] = alive;
+            }
+            alive_sum += alive;
+        }
+        return alive_sum;
+    }
 
     // new_entry only allocates memory, does not assign attributes
     PTO2TensorMapEntry *new_entry() {

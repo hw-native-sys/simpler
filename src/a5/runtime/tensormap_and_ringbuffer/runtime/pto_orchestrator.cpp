@@ -577,6 +577,102 @@ void PTO2OrchestratorState::end_scope() {
 // Task Submission
 // =============================================================================
 
+// Ensure the tensormap entry pool has room for `needed` inserts before STEP 4
+// registers this task's outputs. The pool is watermark-reclaimed like the
+// task/heap/fanin pools — retired tasks' entries free once last_task_alive
+// advances — so an exhausted pool is back-pressure, not a hard error. Reclaim
+// across all rings (entries from every ring share one pool); if still short,
+// spin until reclaim actually frees entries, with the same 500 ms wall-clock
+// backstop as the task allocator and fanin spill pool. A pool that stays full
+// (no entry freed) is a genuine deadlock: latch PTO2_ERROR_TENSORMAP_OVERFLOW
+// and bail. Returns false on deadlock or on a fatal already latched by another
+// party. Cold path — the fast path returns immediately when the pool has room.
+static bool ensure_tensormap_capacity(PTO2OrchestratorState *orch, int32_t needed) {
+    PTO2TensorMap &tm = orch->tensor_map;
+    if (tm.free_entries() >= needed) {
+        return true;
+    }
+
+    int32_t alive[PTO2_MAX_RING_DEPTH];
+    auto read_alive = [&]() {
+        for (int32_t r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
+            // Relaxed: a self-correcting poll re-read every reclaim tick, so a stale
+            // watermark only defers reclaim one tick and never over-frees.
+            alive[r] = orch->sm_header->rings[r].fc.last_task_alive.load(std::memory_order_relaxed);
+        }
+    };
+
+    read_alive();
+    int64_t cur_alive_sum = tm.reclaim_retired_all(alive);  // kept for the deadlock diagnostic
+    int32_t prev_free = tm.free_entries();
+    if (prev_free >= needed) {
+        return true;
+    }
+
+    int spin_count = 0;
+    uint64_t block_cycle0 = 0;  // wall-clock anchor for the deadlock backstop
+    bool block_timing = false;  // false until the first no-reclaim-progress tick
+    while (tm.free_entries() < needed) {
+        spin_count++;
+
+        // Reclaim (and the all-ring watermark reads it needs) is the costly part of
+        // this spin and the only path that frees entries; gate it to a periodic tick.
+        // Cold path, but the spin itself is tight.
+        if ((spin_count & 31) == 0) {
+            read_alive();
+            cur_alive_sum = tm.reclaim_retired_all(alive);
+            int32_t cur_free = tm.free_entries();
+            if (cur_free >= needed) {
+                return true;
+            }
+            // Progress is entries actually freed, NOT watermark movement: a ring can
+            // retire zero-output tasks (count_registrable_outputs == 0), advancing
+            // last_task_alive without freeing any entry. Gating the backstop on
+            // free_entries() keeps a wedged pool from dodging the timeout while some
+            // unrelated ring keeps draining.
+            if (cur_free > prev_free) {
+                spin_count = 0;
+                prev_free = cur_free;
+                block_timing = false;
+            }
+        }
+
+        if ((spin_count & 1023) == 0) {
+            // A fatal latched elsewhere breaks this otherwise-unbounded spin.
+            if (orch->sm_header->orch_error_code.load(std::memory_order_acquire) != PTO2_ERROR_NONE) {
+                return false;
+            }
+            // Absolute-time backstop, matching the task allocator: stable across
+            // chips/contention, unlike a fixed spin count. get_sys_cnt_aicpu()
+            // is an MMIO read, so sample it only once per 1024 spins.
+            uint64_t now = get_sys_cnt_aicpu();
+            if (!block_timing) {
+                block_cycle0 = now;
+                block_timing = true;
+            } else if (now - block_cycle0 >= PTO2_ALLOC_DEADLOCK_TIMEOUT_CYCLES) {
+                LOG_ERROR("========================================");
+                LOG_ERROR("FATAL: TensorMap Entry Pool Deadlock Detected!");
+                LOG_ERROR("========================================");
+                LOG_ERROR("TensorMap entry pool freed no entries for ~500 ms while a task waits.");
+                LOG_ERROR("  - Pool used:   %d / %d", tm.current_used(), tm.pool_capacity());
+                LOG_ERROR("  - Needed:      %d entries", needed);
+                LOG_ERROR("  - last_task_alive (sum across rings): %" PRId64, cur_alive_sum);
+                LOG_ERROR("Diagnosis:");
+                LOG_ERROR("  No retiring task is freeing tensormap entries (last_task_alive may");
+                LOG_ERROR("  still move on rings with no registered outputs). Check TaskRing");
+                LOG_ERROR("  diagnostics for the stalled producer.");
+                LOG_ERROR("Solution:");
+                LOG_ERROR("  Increase PTO2_TENSORMAP_POOL_SIZE (current: %d).", tm.pool_capacity());
+                LOG_ERROR("========================================");
+                orch_mark_fatal(orch, PTO2_ERROR_TENSORMAP_OVERFLOW);
+                return false;
+            }
+        }
+        SPIN_WAIT_HINT();
+    }
+    return true;
+}
+
 // Shared body for submit_task / submit_dummy_task. Caller has already validated
 // args.has_error, decided active_mask (empty for dummy), and resolved the per-slot
 // kernel_ids (all INVALID_KERNEL_ID for dummy). Performs tensormap sync, fanin
@@ -700,6 +796,14 @@ static TaskOutputTensors submit_task_common(
     CYCLE_COUNT_LAP(g_orch_lookup_cycle);
 
     // === STEP 4: Register outputs/inouts in TensorMap (must be separate from lookup) ===
+    // Reserve pool capacity for this task's inserts before registering. The pool
+    // is shared across rings and reclaimed as last_task_alive advances; an
+    // exhausted pool back-pressures here (and detects a wedged watermark) rather
+    // than tripping new_entry()'s hard assert mid-registration.
+    int32_t tensormap_needed = count_registrable_outputs(dep_inputs, orch->in_manual_scope());
+    if (tensormap_needed > 0 && !ensure_tensormap_capacity(orch, tensormap_needed)) {
+        return result;
+    }
     register_task_outputs(dep_inputs, task_id, orch->tensor_map, orch->in_manual_scope());
 
     CYCLE_COUNT_LAP(g_orch_insert_cycle);
