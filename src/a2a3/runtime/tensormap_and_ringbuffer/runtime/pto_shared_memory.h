@@ -223,7 +223,7 @@ struct PTO2SharedMemoryHandle
         sm_base = sm_base_arg;
         sm_size = sm_size_arg;
         is_owner = false;
-        setup_pointers(task_window_sizes[0]);
+        setup_pointers_per_ring(task_window_sizes);
         init_header_per_ring(task_window_sizes, heap_sizes);
         return true;
     }
