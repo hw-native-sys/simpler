@@ -115,7 +115,7 @@ public:
      * @brief Launch a runtime SO entry point via rtsLaunchCpuKernel.
      *
      * @param stream       RTS stream
-     * @param k_args       Kernel arguments
+     * @param k_args       Front-less KernelArgs payload (runtime_args @ 0)
      * @param aicpu_num    Number of AICPU threads
      * @param func_name    Lookup key in func_handles_ (KernelNames::RunName)
      * @return 0 on success, error code on failure

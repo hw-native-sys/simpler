@@ -361,7 +361,7 @@ public:
      * bootstrap).
      *
      * @param stream       AICPU stream
-     * @param k_args       Kernel arguments
+     * @param k_args       Front-less KernelArgs payload (runtime_args @ 0)
      * @param kernel_name  Name of the kernel to launch (e.g.
      *                     `host::KernelNames::RunName`)
      * @param aicpu_num    Number of AICPU instances to launch
@@ -379,10 +379,8 @@ public:
      * manifested in CI as 207001 at `rtKernelLaunchWithHandleV2` with a
      * 507899 cascade at `rtStreamCreate`.
      *
-     * `k_args` reaches the AICore kernel through `rtArgsEx_t`; whether
-     * it is a host-resident or device-resident `KernelArgs` pointer is
-     * decided by the subclass's `run()` (a2a3 passes host; a5 passes
-     * device).
+     * `k_args` reaches the AICore kernel through `rtArgsEx_t` as a
+     * device-resident KernelArgs payload pointer.
      */
     int launch_aicore_kernel(rtStream_t stream, KernelArgs *k_args);
 
@@ -595,7 +593,6 @@ protected:
      * a5's `rtDeviceReset`). Everything else lives here:
      *
      *   - rtStreamDestroy for both persistent streams
-     *   - kernel_args_.finalize_device_args
      *   - aicore_bin_handle_ + binaries_loaded_ reset
      *   - chip_callable_buffers_ free + clear
      *   - orch_so_dedup_ free + clear
@@ -754,7 +751,6 @@ protected:
     // simpler_init, freed in the subclass `finalize()`.
     void *device_wall_dev_ptr_{nullptr};
     uint64_t device_wall_ns_{0};
-    DeviceArgs device_args_;
 
     // True after AICPU SO loaded; reset by the subclass's `finalize()`.
     bool binaries_loaded_{false};

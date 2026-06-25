@@ -15,7 +15,6 @@
  * kernels on Ascend devices using CANN runtime APIs.
  *
  * Key Components:
- * - DeviceArgs: AICPU device argument structure
  * - KernelArgsHelper: Helper for managing kernel arguments with device memory
  * - DeviceRunner: kernel launching and execution
  */
@@ -45,7 +44,7 @@
 #include "common/unified_log.h"
 #include "utils/device_arena.h"
 #include "device_runner_base.h"     // common DeviceRunnerBase
-#include "device_runner_helpers.h"  // common DeviceArgs + KernelArgsHelper
+#include "device_runner_helpers.h"  // common KernelArgsHelper
 #include "host/function_cache.h"
 #include "host/memory_allocator.h"
 #include "host/l2_swimlane_collector.h"
@@ -186,7 +185,7 @@ private:
     // worker_count_, executor + dispatcher bytes, aicore_bin_handle_,
     // load_aicpu_op_, mem_alloc_, the three DeviceArenas + their cached
     // sizes, persistent AICPU/AICore streams, kernel_args_, device_wall_*,
-    // device_args_, binaries_loaded_) is inherited from `DeviceRunnerBase`.
+    // binaries_loaded_) is inherited from `DeviceRunnerBase`.
 
     // Group D state (`chip_callable_buffers_`, `callables_`,
     // `orch_so_dedup_`, `aicpu_seen_callable_ids_`, `aicpu_dlopen_total_`,

@@ -287,20 +287,6 @@ int DeviceRunnerBase::ensure_binaries_loaded() {
     }
     LOG_INFO_V2("DeviceRunner: inner SO registered (runtime entry handles ready)");
 
-    // H2D the per-task DeviceArgs struct itself. device_args_.aicpu_so_bin/len
-    // stay zero — our own per-task AICPU code (launched via rtsLaunchCpuKernel
-    // against the cached rtFuncHandle on LoadAicpuOp) never reads them, and
-    // the dispatcher-bootstrap KernelArgs (KERNEL_TYPE_AICPU_KFC) builds its
-    // own DeviceArgs view inside BootstrapDispatcher rather than reading
-    // ours. The "load-bearing on a5" finding documented prior to #864/#870
-    // no longer reproduces against current HEAD — see PR removing
-    // AicpuSoInfo (CI on both archs green).
-    rc = kernel_args_.init_device_args(device_args_, mem_alloc_);
-    if (rc != 0) {
-        LOG_ERROR("init_device_args failed: %d", rc);
-        return rc;
-    }
-
     // Release host bytes — bootstrap is done. Per-task launches go through
     // the cached rtFuncHandle owned by LoadAicpuOp; dispatcher SO bytes are
     // never referenced again; the aicpu kernel SO's host buffer is no longer
@@ -738,10 +724,6 @@ int DeviceRunnerBase::finalize_common() {
         stream_aicore_ = nullptr;
     }
 
-    // Cleanup kernel args (deviceArgs); device-side KernelArgs + runtime args
-    // are released by runtime_args_cleanup RAII so they also unwind on errors.
-    capture(kernel_args_.finalize_device_args());
-
     // load_aicpu_op_ has no per-task host-side state to release —
     // rtsLaunchCpuKernel does not hand back any per-launch handle, and the
     // dispatcher itself was a transient libaicpu_extend_kernels dlopen.
@@ -994,11 +976,10 @@ int DeviceRunnerBase::sync_run_streams() {
 }
 
 void DeviceRunnerBase::read_device_wall_ns() {
-    // Pull the platform-level device wall (ns) back from the 8-byte
-    // device buffer that AICPU writes through via
-    // KernelArgs::device_wall_data_base. (We can't use the
-    // device_k_args_ shadow here — CANN's rtAicpuKernelLaunchExWithArgs
-    // copies KernelArgs into AICPU-private memory at launch, so AICPU's
+    // Pull the platform-level device wall (ns) back from the 8-byte device
+    // buffer that AICPU writes through via KernelArgs::device_wall_data_base.
+    // (We can't use the device_k_args_ shadow here — CANN copies the
+    // KernelArgs payload into AICPU-private memory at launch, so AICPU's
     // writes to its local copy don't propagate to device_k_args_.)
     // Failure path is a soft warn — wall stays zero.
     device_wall_ns_ = 0;

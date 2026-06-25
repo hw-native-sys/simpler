@@ -22,40 +22,6 @@
 
 #include "common/unified_log.h"
 
-int KernelArgsHelper::init_device_args(const DeviceArgs &host_device_args, MemoryAllocator &allocator) {
-    allocator_ = &allocator;
-
-    // Allocate device memory for device_args
-    if (args.device_args == nullptr) {
-        uint64_t device_args_size = sizeof(DeviceArgs);
-        void *device_args_dev = allocator_->alloc(device_args_size);
-        if (device_args_dev == nullptr) {
-            LOG_ERROR("Alloc for device_args failed");
-            return -1;
-        }
-        args.device_args = reinterpret_cast<DeviceArgs *>(device_args_dev);
-    }
-    // Copy host_device_args to device memory via device_args
-    int rc =
-        rtMemcpy(args.device_args, sizeof(DeviceArgs), &host_device_args, sizeof(DeviceArgs), RT_MEMCPY_HOST_TO_DEVICE);
-    if (rc != 0) {
-        LOG_ERROR("rtMemcpy failed: %d", rc);
-        allocator_->free(args.device_args);
-        args.device_args = nullptr;
-        return rc;
-    }
-    return 0;
-}
-
-int KernelArgsHelper::finalize_device_args() {
-    if (args.device_args != nullptr && allocator_ != nullptr) {
-        int rc = allocator_->free(args.device_args);
-        args.device_args = nullptr;
-        return rc;
-    }
-    return 0;
-}
-
 int KernelArgsHelper::init_runtime_args(const Runtime &host_runtime, MemoryAllocator &allocator) {
     allocator_ = &allocator;
 

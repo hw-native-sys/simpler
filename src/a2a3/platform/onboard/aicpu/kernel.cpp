@@ -48,7 +48,7 @@ extern "C" int aicpu_prewarm_callable(Runtime *arg);
  * only writes this SO to the preinstall path — it does not dlsym this symbol
  * itself.
  *
- * @param arg Pointer to KernelArgs structure containing runtime_args
+ * @param arg Pointer to the front-less KernelArgs payload (runtime_args @ 0)
  * @return 0 on success, non-zero on error
  */
 extern "C" __attribute__((visibility("default"))) int simpler_aicpu_exec(void *arg) {
@@ -60,8 +60,7 @@ extern "C" __attribute__((visibility("default"))) int simpler_aicpu_exec(void *a
         return -1;
     }
 
-    // Extract Runtime from KernelArgs
-    auto k_args = (KernelArgs *)arg;
+    KernelArgs *k_args = reinterpret_cast<KernelArgs *>(arg);
     Runtime *runtime = k_args->runtime_args;
 
     if (runtime == nullptr) {
@@ -143,7 +142,7 @@ extern "C" __attribute__((visibility("default"))) int simpler_aicpu_prewarm_call
         return -1;
     }
 
-    auto k_args = (KernelArgs *)arg;
+    KernelArgs *k_args = reinterpret_cast<KernelArgs *>(arg);
     Runtime *runtime = k_args->runtime_args;
     if (runtime == nullptr) {
         LOG_ERROR("%s", "Invalid prewarm runtime_args: null pointer");

@@ -34,15 +34,26 @@ Python process (ChipWorker)
     |
     +-- DeviceRunner (handle-based, one per ChipWorker)
     |     |
-    |     +-- rtMemcpy(aicpu_binary → device HBM)    ← NOT dlopen, binary blob upload
-    |     +-- rtRegisterAllKernel(aicore_binary)      ← CANN kernel registration
-    |     +-- rtAicpuKernelLaunchExWithArgs(...)       ← device-side execution
+    |     +-- LoadAicpuOp::BootstrapDispatcher()
+    |     |     |
+    |     |     +-- rtAicpuKernelLaunchExWithArgs(KERNEL_TYPE_AICPU_KFC)
+    |     |           dispatcher writes simpler_inner_<fp>_<device_id>.so
+    |     |
+    |     +-- LoadAicpuOp::Init()
+    |     |     |
+    |     |     +-- rtsBinaryLoadFromFile(...)       ← register preinstall runtime SO
+    |     |     +-- rtsFuncGetByName(...)            ← cache AICPU entry handles
+    |     |
+    |     +-- rtsLaunchCpuKernel(...)                ← per-task AICPU launches
+    |     +-- rtRegisterAllKernel(aicore_binary)     ← CANN kernel registration
     |
     +-- dlopen("libascend_hal.so", RTLD_NOW | RTLD_LOCAL)  ← CANN HAL (profiling only)
 ```
 
 Key difference: onboard does **not** dlopen AICPU/AICore as host-side SOs.
-They are binary blobs uploaded to device memory and executed by CANN runtime.
+The runtime AICPU SO is written once to the device preinstall path through
+the dispatcher bootstrap, then registered and launched by CANN runtime handles.
+AICore remains a CANN-registered binary blob.
 
 ## RTLD Flags and Rationale
 
@@ -240,18 +251,26 @@ Applies to all 4 runtime executors: a2a3 (hbg, tmr), a5 (hbg, tmr).
 | Resource | Caching | Lifecycle |
 | -------- | ------- | --------- |
 | Host runtime | `ChipWorker::lib_handle_` | Per-runtime-group: shared across tasks in same group |
-| AICPU binary | `AicpuSoInfo` in DeviceRunner | Per-runtime-group: uploaded to device HBM once, reused |
+| Dispatcher SO bytes | `DeviceRunnerBase::dispatcher_so_binary_` | Init-only: passed to `LoadAicpuOp::BootstrapDispatcher`, then cleared |
+| Runtime AICPU SO | Preinstall file `simpler_inner_<fp>_<device_id>.so` | Written once through dispatcher bootstrap, then registered via `rtsBinaryLoadFromFile` |
+| AICPU entry handles | `LoadAicpuOp` cached `rtFuncHandle`s | Per-runtime-group: reused by `rtsLaunchCpuKernel` on every task |
 | AICore binary | `rtRegisterAllKernel` handle | Per-run: registered each `launch_aicore_kernel()` call |
 | Kernel binaries | `func_id_to_addr_` (device GM addresses) | Per-task: uploaded to device GM, cached by func_id |
 | CANN HAL | `g_hal_handle` (file-scope static) | Process lifetime: loaded once for profiling, never closed |
 
 ### Key difference
 
-Onboard caches more aggressively — the DeviceRunner persists
-across tasks within a runtime group, and the AICPU binary stays in device memory. Simulation
-re-loads AICPU/AICore SOs every `run()` call because the SO's internal
-static state (`g_aicpu_executor`) must be fresh for each task when
+Onboard caches more aggressively. The `DeviceRunner` persists across tasks
+within a runtime group, the runtime AICPU SO is preinstalled once through the
+dispatcher bootstrap, and per-task launches reuse cached `rtFuncHandle`s.
+Simulation re-loads AICPU/AICore SOs every `run()` call because the SO's
+internal static state (`g_aicpu_executor`) must be fresh for each task when
 different tasks have different configurations.
+
+Onboard per-task launches pass the front-less `KernelArgs` payload directly to
+`rtsLaunchCpuKernel` with no CANN launch front: runtime state flows through
+`runtime_args` (at offset 0) and the other profiling/logging/register fields.
+AICore receives only a device copy of that same `KernelArgs` payload.
 
 ## Execution Lifecycle
 
@@ -302,13 +321,26 @@ device_worker_main(device_id)
     ChipWorker.init(device_id, bins)                    # Python wrapper
       ctypes.CDLL(libsimpler_log.so, RTLD_GLOBAL)       # once per process
       simpler_log_init(log_level, log_info_v)
-      _ChipWorker.init(host_path, aicpu_path, aicore_path, device_id)   # C++
+      _ChipWorker.init(host_path, aicpu_path, aicore_path,
+                       dispatcher_path, device_id)       # C++
         dlopen(host_runtime.so, RTLD_LOCAL)
         create_device_context()
-        simpler_init(ctx, device_id, aicpu*, aicpu_size, aicore*, aicore_size)
+        simpler_init(ctx, device_id,
+                     aicpu*, aicpu_size, aicore*, aicore_size,
+                     dispatcher*, dispatcher_size)
           dlog_setlevel(HostLogger.level())               sync CANN dlog before context open
           DeviceRunner::attach_current_thread(device_id)  rtSetDevice()
           DeviceRunner::set_executors(aicpu, aicore)
+          DeviceRunner::set_dispatcher_binary(dispatcher)
+          DeviceRunner::ensure_device_initialized()
+            rtStreamCreate(AICPU + AICore)
+            LoadAicpuOp::BootstrapDispatcher()
+              rtAicpuKernelLaunchExWithArgs(KERNEL_TYPE_AICPU_KFC)
+              dispatcher writes simpler_inner_<fp>_<device_id>.so
+            LoadAicpuOp::Init()
+              rtsBinaryLoadFromFile()
+              rtsFuncGetByName(simpler_aicpu_exec, ...)
+            init CANN runtime-launch compatibility payload
 
     for each callable:
         ChipWorker.prepare_callable(callable)   # returns opaque handle
@@ -321,8 +353,8 @@ device_worker_main(device_id)
               bind_prepared_callable_to_runtime()
               bind_prepared_to_runtime_impl()  rtMalloc, rtMemcpy to device
               DeviceRunner::run()
-                ensure_binaries_loaded()       rtMemcpy AICPU SO to HBM (once)
-                rtAicpuKernelLaunchExWithArgs() launch on device
+                ensure_binaries_loaded()       already done by init
+                rtsLaunchCpuKernel()           cached rtFuncHandle
                 rtStreamSynchronize()          wait for completion
                 launch_aicore_kernel()         rtRegisterAllKernel + rtKernelLaunch
               validate_runtime_impl()          rtMemcpy results back to host

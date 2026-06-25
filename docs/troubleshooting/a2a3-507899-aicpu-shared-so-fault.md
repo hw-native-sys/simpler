@@ -88,11 +88,12 @@ Make the staged SO names **per-device** so paired dies never touch the same
 file:
 
 - Dispatcher inner SO: `simpler_inner_<fp>_<device_id>.so`
-  (`src/common/aicpu_dispatcher/aicpu_dispatcher.cpp` `MakeInnerSoPath`,
-  `src/common/host/load_aicpu_op.cpp` `MakeInnerSoBasename`). The real
-  `device_id` (was hardcoded `0`) is threaded from `DeviceRunner` through
-  `BootstrapDispatcher` into both the host JSON reader name and the device-side
-  writer (`DeviceArgs.device_id`). Bootstrap cache keyed by `(fp, device_id)`.
+  (`src/common/aicpu_loader/device/aicpu_dispatcher.cpp` `MakeInnerSoPath`,
+  `src/common/aicpu_loader/host/load_aicpu_op.cpp`
+  `MakeInnerSoBasename`). The real `device_id` (was hardcoded `0`) is
+  threaded from `DeviceRunner` through `BootstrapDispatcher` into both the host
+  JSON reader name and the device-side writer (`DeviceArgs.device_id`).
+  Bootstrap cache keyed by `(fp, device_id)`.
 - AICPU executor orchestration SO: `libdevice_orch_<pid>_<cid>_<device_id>.so`
   (`create_orch_so_file`). `device_id` reaches the executor via a new
   `KernelArgs.device_id` field → `set_orch_device_id()` in `kernel.cpp` →

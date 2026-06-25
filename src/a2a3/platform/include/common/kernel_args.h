@@ -10,19 +10,22 @@
  */
 /**
  * @file kernel_args.h
- * @brief KernelArgs Structure - Shared between Host, AICPU, and AICore
+ * @brief KernelArgs payload - Shared between Host, AICPU, and AICore
  *
- * This structure is used to pass arguments to both AICPU and AICore kernels.
- * It contains pointers to device memory for arguments and runtime data.
+ * This structure is the Simpler runtime payload read by AICPU and AICore
+ * kernels. It contains pointers to device memory for runtime data, profiling
+ * buffers, and platform state.
  *
  * Platform Support:
  * - a2a3: Real hardware with CANN runtime compatibility
  * - a2a3sim: Host-based simulation using standard memory
  *
  * Memory Layout (a2a3):
- * This structure's layout is hardcoded in libaicpu_extend_kernels.so, which
- * expects specific offsets for deviceArgs fields. The unused[5] array provides
- * the required offset alignment for compatibility with the CANN runtime.
+ * This platform struct is the front-less per-task runtime payload, passed
+ * directly to the onboard AICPU launch (rtsLaunchCpuKernel) and copied to
+ * device memory for AICore — no CANN launch front is needed on this path.
+ * The bootstrap dispatcher has its own private KernelArgs/DeviceArgs ABI in
+ * src/common/aicpu_loader/device/aicpu_dispatcher.cpp.
  *
  * Memory Layout (a2a3sim):
  * For simulation, the layout is maintained for API compatibility, though
@@ -32,10 +35,10 @@
 #ifndef PLATFORM_COMMON_KERNEL_ARGS_H_
 #define PLATFORM_COMMON_KERNEL_ARGS_H_
 
+#include <cstddef>
 #include <cstdint>
 
 // Forward declarations
-class DeviceArgs;
 class Runtime;
 
 #ifdef __cplusplus
@@ -50,13 +53,12 @@ extern "C" {
 #endif
 
 /**
- * Kernel arguments structure
+ * Kernel arguments payload
  *
- * This structure is passed to AICPU kernels by the host.
+ * This structure is the payload passed to AICPU kernels by the host and copied
+ * to device memory for AICore kernels.
  *
  * Field Access Patterns:
- * - unused[5]: Padding for alignment with CANN runtime expectations
- * - device_args: Written by host, read by AICPU (contains aicpu_so_bin/aicpu_so_len)
  * - runtime_args: Written by host, read by AICPU (task runtime, includes
  *   handshake buffers)
  * - dump_data_base: Written by host, read by AICPU platform layer; zero when
@@ -73,31 +75,27 @@ extern "C" {
  * - bit2: PMU enabled
  * - bit3: dep_gen capture enabled
  *
- * Field Access Patterns:
- *       - AICPU: receives KernelArgs* via DynTileFwkBackendKernelServer
- *       - AICore: receives KernelArgs* via KERNEL_ENTRY
+ * Consumer paths:
+ *       - AICPU: receives this KernelArgs directly via rtsLaunchCpuKernel
+ *       - AICore: receives device KernelArgs* via KERNEL_ENTRY
  */
 struct KernelArgs {
-    uint64_t unused[5] = {0};                               // Alignment padding (required by CANN runtime offset)
-    DeviceArgs *device_args{nullptr};                       // Device arguments (AICPU reads, contains SO info)
     __may_used_by_aicore__ Runtime *runtime_args{nullptr};  // Task runtime in device memory
     uint64_t regs{0};                                       // Per-core register base address array (platform-specific)
     uint64_t ffts_base_addr{0};                             // FFTS base address for AICore
     uint64_t dump_data_base{0};  // Dump shared memory base address; use explicit flags to detect enablement
-    uint64_t l2_swimlane_data_base{
-        0
-    };  // L2 swimlane shared memory base address; use explicit flags to detect enablement
+    // L2 swimlane shared memory base address; use explicit flags to detect enablement
+    uint64_t l2_swimlane_data_base{0};
     uint64_t pmu_data_base{0};          // PMU shared memory base address; use explicit flags to detect enablement
     uint64_t pmu_reg_addrs{0};          // Per-core PMU MMIO register base address array (onboard only; 0 on sim)
     uint64_t dep_gen_data_base{0};      // dep_gen shared memory base address; use explicit flags to detect enablement
     uint64_t scope_stats_data_base{0};  // ScopeStatsBuffer shared memory base; 0 when scope_stats is off.
                                         // Allocated by host's ScopeStatsCollector, read+written by AICPU's
                                         // scope_stats_collector via set_platform_scope_stats_base.
-    uint64_t l2_swimlane_aicore_rotation_table{
-        0
-    };  // Device ptr to a uint64_t[num_aicore] table holding each core's
-        // L2SwimlaneAicoreTaskBuffer address. AICore kernel entry indexes by block_idx
-        // and forwards into platform set/get state. 0 when L2 swimlane is off.
+    // Device ptr to a uint64_t[num_aicore] table holding each core's
+    // L2SwimlaneAicoreTaskBuffer address. AICore kernel entry indexes by block_idx
+    // and forwards into platform set/get state. 0 when L2 swimlane is off.
+    uint64_t l2_swimlane_aicore_rotation_table{0};
     uint32_t log_level{1};              // Severity floor: 0=DEBUG, 1=INFO, 2=WARN, 3=ERROR, 4=NUL
     uint32_t log_info_v{5};             // INFO verbosity threshold (0..9); default V5
     uint32_t enable_profiling_flag{0};  // Profiling umbrella bitmask; dump_tensor|l2_swimlane|pmu|dep_gen|scope_stats
@@ -105,8 +103,8 @@ struct KernelArgs {
 
     // Device pointer to the run-wall buffer the platform AICPU entry writes.
     // Allocated once and kept resident, reset each run. Onboard AICPU receives
-    // KernelArgs as a CANN-private copy (see rtAicpuKernelLaunchExWithArgs in
-    // launch_aicpu_kernel), so an inline field would be write-only from AICPU;
+    // KernelArgs as a CANN-private copy (see launch_aicpu_kernel), so an
+    // inline field would be write-only from AICPU;
     // the dedicated host-allocated buffer's address travels via this field.
     // Onboard layout: one { start_cycle, end_cycle } pair per launched AICPU
     // thread (PLATFORM_MAX_AICPU_THREADS_JUST_FOR_LAUNCH pairs, raw sys-counter
@@ -120,10 +118,11 @@ struct KernelArgs {
     // staged orchestration SO name (libdevice_orch_<pid>_<cid>_<device_id>.so):
     // paired a2a3 dies share the preinstall filesystem, and a content/pid-only
     // name risks a cross-die write/execute collision (see simpler_inner fix).
-    // Trailing field — keeps the CANN-fixed front offsets and AICore-read
-    // fields in place.
     uint32_t device_id{0};
 };
+
+static_assert(offsetof(KernelArgs, runtime_args) == 0, "KernelArgs::runtime_args offset drift");
+static_assert(offsetof(KernelArgs, regs) == 8, "KernelArgs::regs offset drift");
 
 #ifdef __cplusplus
 }
