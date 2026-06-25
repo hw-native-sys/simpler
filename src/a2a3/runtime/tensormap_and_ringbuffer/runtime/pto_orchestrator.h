@@ -610,28 +610,34 @@ inline TaskOutputTensors submit_task_common(PTO2OrchestratorState *orch, const L
     task.packed_buffer_base = prepared.alloc_result.packed_base;
     task.packed_buffer_end = prepared.alloc_result.packed_end;
 
-    // Push this consumer's local_id into each producer's last_consumer high-
-    // water-mark, replacing the per-completion fanout_refcount notification.
-    // Reclamation gates on the per-ring completed_watermark reaching this
-    // value. Only update for same-ring fanin: cross-ring consumers live in a
-    // different local_id space, so their id is meaningless to the producer's
-    // ring's watermark. Cross-ring producer slots reclaim on scope_end /
-    // ring wrap instead — acceptable since cross-ring fanin (e.g.
-    // alloc_tensors output) is sparse.
+    // Single pass over fanin_builder:
+    //   - Copy local_id/ring_id into payload so the scheduler can index the
+    //     producer's ring's completion_flags from the consumer side.
+    //   - Push this consumer's local_id into each same-ring producer's
+    //     last_consumer high-water-mark, replacing the per-completion
+    //     fanout_refcount notification. Reclamation gates on the per-ring
+    //     completed_watermark reaching this value. Only update for same-ring
+    //     fanin: cross-ring consumers live in a different local_id space,
+    //     so their id is meaningless to the producer's ring's watermark.
+    //     Cross-ring producer slots reclaim on scope_end / ring wrap instead
+    //     — acceptable since cross-ring fanin (e.g. alloc_tensors output)
+    //     is sparse.
+    // Use fanin_builder.ring_ids[i] (cache-warm SOA slice) for the same-ring
+    // check so cross-ring iters skip the slot_state dereference entirely.
     const uint8_t self_ring = task_id.ring();
     const int32_t self_local = static_cast<int32_t>(task_id.local());
-    for (int32_t i = 0; i < fanin_builder.count; i++)
-    {
-        PTO2TaskSlotState *prod = fanin_builder.slots[i];
-        if (prod->ring_id != self_ring) continue;
-        if (self_local > prod->last_consumer_local_id) prod->last_consumer_local_id = self_local;
-    }
-
     payload.fanin_count = fanin_builder.count;
     for (int32_t i = 0; i < fanin_builder.count; i++)
     {
-        payload.fanin_local_ids[i] = fanin_builder.local_ids[i];
-        payload.fanin_ring_ids[i] = fanin_builder.ring_ids[i];
+        const int32_t local = fanin_builder.local_ids[i];
+        const uint8_t ring = fanin_builder.ring_ids[i];
+        payload.fanin_local_ids[i] = local;
+        payload.fanin_ring_ids[i] = ring;
+        if (ring == self_ring)
+        {
+            PTO2TaskSlotState *prod = fanin_builder.slots[i];
+            if (self_local > prod->last_consumer_local_id) prod->last_consumer_local_id = self_local;
+        }
     }
 
     payload.init(args, result, prepared.alloc_result, layout);
