@@ -48,7 +48,7 @@ Each sub-level macro requires `PTO2_PROFILING=1`:
 
 - Debug/diagnostic logs (always present)
 - Progress tracking (`PTO2 progress: completed=...`)
-- Stall detection and dump (triggered after the `SCHEDULER_TIMEOUT_MS` wall-clock no-progress budget)
+- Stall detection and dump (triggered only after `MAX_IDLE_ITERATIONS` idle loops)
 - Deadlock/livelock detection (`diagnose_stuck_state`, called on stall)
 
 **What's NOT compiled:**
@@ -255,7 +255,7 @@ Identity fields the AICPU side used to write at level 1 (`func_id`,
   collector (`L2SwimlaneCollector::set_core_types`).
 
 AICore buffer rotation no longer piggy-backs on `complete_task`. AICPU
-counts dispatches per core in the dispatch path (scheduler_dispatch in
+counts dispatches per core in the dispatch path (scheduler_context in
 tensormap_and_ringbuffer; aicpu_executor in host_build_graph) and rotates
 the AICore buffer when the count is about to cross a
 `PLATFORM_AICORE_BUFFER_SIZE` boundary — strictly before
@@ -428,7 +428,7 @@ definitions to runtime headers.
 ### Code Locations
 
 - Macro defaults and validation: `src/common/task_interface/profiling_config.h`
-- Scheduler profiling: `src/a2a3/runtime/tensormap_and_ringbuffer/runtime/scheduler/scheduler_dispatch.cpp` and `scheduler_cold_path.cpp`
+- Scheduler profiling: `src/a2a3/runtime/tensormap_and_ringbuffer/runtime/scheduler_context.h`
 - Orchestrator profiling: `src/a2a3/runtime/tensormap_and_ringbuffer/aicpu/aicpu_executor.cpp`
 - TensorMap profiling: `src/a2a3/runtime/tensormap_and_ringbuffer/runtime/pto_tensormap.h`
 

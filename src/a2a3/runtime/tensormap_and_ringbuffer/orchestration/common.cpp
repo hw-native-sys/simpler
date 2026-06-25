@@ -10,6 +10,13 @@
  */
 #include "common.h"
 
+// LOG_ERROR can't be pulled from common/unified_log.h here because that header
+// would re-#define LOG_INFO_V0..V9 already provided by pto_orchestration_api.h
+// (orchestration routes them through the runtime ops table). For the limited
+// use inside this file, write directly to stderr.
+#include <cstdio>
+#define LOG_ERROR(fmt, ...) std::fprintf(stderr, "[ERROR] " fmt "\n", ##__VA_ARGS__)
+
 #ifdef __linux__
 #include <cxxabi.h>
 #include <dlfcn.h>

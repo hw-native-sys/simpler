@@ -17,13 +17,8 @@
 #include "aicore_completion_mailbox_types.h"
 #include "pto_runtime_status.h"
 
-// CompletionToken is the runtime-internal POD that backend submit handlers
-// produce and the generic register_completion_condition() consumes. It is the
-// ABI contract for "this is one completion to wait on" — independent of which
-// backend (SDMA, RoCE, notification counter, ...) generated it. Each backend's
-// (poll, retire) pair is registered in pto_async_wait.h's ops table, keyed by
-// completion_type.
-struct CompletionToken {
+struct CompletionToken
+{
     uint64_t addr;
     uint32_t expected_value;
     uint32_t engine;
@@ -31,13 +26,15 @@ struct CompletionToken {
     uint64_t backend_cookie;
 };
 
-enum class CompletionPollState : uint8_t {
+enum class CompletionPollState : uint8_t
+{
     PENDING = 0,
     READY = 1,
     FAILED = 2,
 };
 
-struct CompletionPollResult {
+struct CompletionPollResult
+{
     CompletionPollState state{CompletionPollState::PENDING};
     int32_t error_code{PTO2_ERROR_NONE};
 };

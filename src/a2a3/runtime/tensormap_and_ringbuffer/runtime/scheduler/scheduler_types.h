@@ -19,80 +19,65 @@
 #include "pto_runtime2_types.h"
 #include "spin_hint.h"
 
-// =============================================================================
-// Profiling macros (compile-time gated)
-// =============================================================================
-
-#if PTO2_PROFILING
-#include "aicpu/device_time.h"
-// Accumulated nanoseconds per sub-step
-#define CYCLE_COUNT_START() uint64_t _t0 = get_sys_cnt_aicpu(), _t1
-#define CYCLE_COUNT_LAP(acc)       \
-    do {                           \
-        _t1 = get_sys_cnt_aicpu(); \
-        acc += (_t1 - _t0);        \
-        _t0 = _t1;                 \
-    } while (0)
-#else
-#define CYCLE_COUNT_START()
-#define CYCLE_COUNT_LAP(acc)
-#endif
-
-// =============================================================================
-// Scheduler constants
-// =============================================================================
-
 constexpr int32_t MAX_AICPU_THREADS = PLATFORM_MAX_AICPU_THREADS;
 
-// Periodic cadence (in idle iterations) for emitting the per-thread STALL
-// diagnostic while no progress is being made. Purely an observability knob,
-// independent of the wall-clock timeout below: small enough to fire a few times
-// before the budget expires, large enough not to flood device_log.
+// PLATFORM_MAX_IDLE_ITERATIONS was removed upstream; fixed cadence matches a5's
+// equivalent (used only for per-thread diagnostic logging, not for the fatal-
+// timeout path which uses wall-clock).
 constexpr int32_t STALL_LOG_INTERVAL = 480000;
 constexpr int32_t FATAL_ERROR_CHECK_INTERVAL = 1024;  // Check orchestrator error every N idle iters
 
-// Wall-clock budget for declaring "no progress = scheduler timeout". Replaces
-// the per-thread iteration-count cap that once lived here as MAX_IDLE_ITERATIONS
-// for the fatal-latch decision; STALL_LOG_INTERVAL above keeps the per-thread
-// diagnostic cadence.
-//
-// Using wall-clock here is load-bearing for distributed runs: with per-thread
-// iteration counts, a pure-idle thread spinning ~115 ns/iter hits the cap in
-// ~92 ms while a sibling thread polling a RUNNING task takes ~200 ms for the
-// same iteration count. The fast spinner racing ahead and latching fatal
-// kills the slower-but-correct poller mid-poll — see the distributed
-// startup-skew scenario in issue #897.
-//
-// The budget is platform-defined (PLATFORM_SCHEDULER_TIMEOUT_MS in spin_hint.h).
-// Onboard keeps it below the STARS op-execute and host stream-sync budgets so
-// the AICPU can flush diagnostics before the host-visible timeout chain fires.
-// Sim has no STARS or ACL stream-sync timeout, but uses the same no-progress
-// watchdog shape. See spin_hint.h for the per-variant rationale.
 constexpr int32_t SCHEDULER_TIMEOUT_MS = PLATFORM_SCHEDULER_TIMEOUT_MS;
-constexpr uint64_t SCHEDULER_TIMEOUT_CYCLES =
-    static_cast<uint64_t>(SCHEDULER_TIMEOUT_MS) * (PLATFORM_PROF_SYS_CNT_FREQ / 1000);
+constexpr uint64_t SCHEDULER_TIMEOUT_CYCLES = static_cast<uint64_t>(SCHEDULER_TIMEOUT_MS) * (PLATFORM_PROF_SYS_CNT_FREQ / 1000);
 constexpr int32_t STALL_DUMP_READY_MAX = 8;
 constexpr int32_t STALL_DUMP_WAIT_MAX = 4;
 constexpr int32_t STALL_DUMP_CORE_MAX = 8;
 constexpr int32_t PROGRESS_VERBOSE_THRESHOLD = 10;  // log every completion for the first N tasks
 constexpr int32_t PROGRESS_LOG_INTERVAL = 250;      // log every N completions after threshold
 
-// =============================================================================
-// Control flow signal from cold-path helpers back to the main dispatch loop.
-// =============================================================================
-
-enum class LoopAction : int8_t {
+enum class LoopAction : int8_t
+{
     NONE,        // cold path did not trigger; proceed normally
     BREAK_LOOP,  // equivalent to 'break' from the while(true) loop
 };
 
-// =============================================================================
-// Per-core state: one cache line per core to eliminate false sharing
-// and co-locate all hot-path fields for minimal cache misses.
-// Dual-slot layout: running (currently executing) + pending (pre-loaded, awaiting hardware pickup).
-// =============================================================================
+// Per-thread phase profiling. Accumulates cumulative cycle counts and entry
+// counts for each phase of resolve_and_dispatch's main loop. Dumped once at
+// loop exit via LOG_INFO_V9 — the hot path only does cycle counter math.
+struct alignas(64) SchedulerThreadProfile
+{
+    uint64_t total_cycles{0};
+    uint64_t completion_cycles{0};
+    // Sub-phase of completion: time spent INSIDE complete_slot_task, and
+    // count of times it ran (one per subtask completion observed).
+    uint64_t complete_task_cycles{0};
+    uint64_t complete_task_calls{0};
+    // Sub-phase of completion: count of cores scanned per iter (proxy for
+    // cond_ptr read cost; aggregate / completion_iters = avg cores/iter).
+    uint64_t cores_scanned{0};
+    uint64_t async_wait_cycles{0};
+    uint64_t drain_wiring_cycles{0};
+    uint64_t spsc_drain_cycles{0};    // sub-phase of drain_wiring: SPSC → pending FIFO
+    uint64_t pending_poll_cycles{0};  // sub-phase of drain_wiring: pending FIFO → ready
+    uint64_t dummy_drain_cycles{0};
+    uint64_t dispatch_cycles{0};
+    uint64_t idle_spin_cycles{0};
+    uint64_t completion_iters{0};
+    uint64_t async_wait_iters{0};
+    uint64_t drain_wiring_iters{0};
+    uint64_t spsc_drain_iters{0};
+    uint64_t pending_poll_iters{0};
+    uint64_t pending_poll_skipped{0};  // (a) gate hits: poll calls skipped due to no new completions
+    uint64_t dummy_drain_iters{0};
+    uint64_t dispatch_iters{0};
+    uint64_t idle_iters{0};
+    uint64_t total_iters{0};
 
-struct alignas(64) CoreExecState {
+    void reset() { *this = SchedulerThreadProfile{}; }
+};
+
+struct alignas(64) CoreExecState
+{
     // --- Hot fields (completion + dispatch, every iteration) ---
     uint64_t reg_addr;                      // offset  0: register base address (set once in handshake)
     PTO2TaskSlotState *running_slot_state;  // offset  8: slot state for running task (nullptr = empty)
@@ -103,35 +88,17 @@ struct alignas(64) CoreExecState {
     PTO2SubtaskSlot running_subslot;        // offset 36: which subtask slot is running
     PTO2SubtaskSlot pending_subslot;        // offset 37: which subtask slot is pending
     uint8_t pad0_[2];                       // offset 38: alignment padding
-    // Precomputed COND register pointer; resolved once in handshake so the
-    // hot completion poll does a single volatile load instead of recomputing
-    // reg_base + reg_offset(COND) on every iteration.
-    volatile uint32_t *cond_ptr;  // offset 40: precomputed pointer to COND register
-#if PTO2_PROFILING
-    // --- Profiling fields (dispatch path, compile-time gated) ---
-    uint64_t running_dispatch_timestamp;  // offset 48: AICPU dispatch timestamp for running task
-    uint64_t pending_dispatch_timestamp;  // offset 56: AICPU dispatch timestamp for pending task
-#else
+    volatile uint32_t *cond_ptr;            // offset 40: precomputed pointer to COND register
     // --- Cold fields (init/diagnostics only, never in hot path) ---
     int32_t worker_id;          // offset 48: index in runtime.dev.workers[]
     uint32_t physical_core_id;  // offset 52: hardware physical core ID
     CoreType core_type;         // offset 56: AIC or AIV (enum class : int32_t)
     uint8_t pad2_[4];           // offset 60: pad to 64 bytes
-#endif
 };
 static_assert(sizeof(CoreExecState) == 64, "CoreExecState must occupy exactly one cache line");
 
-// =============================================================================
-// CoreTracker: cluster-based bitmask tracker for idle/running core state.
-//
-// core_states_ encodes per-cluster core idle/running in 3 bits per cluster:
-//   bit i*3   = AIC of cluster i   (1 = idle, 0 = running)
-//   bit i*3+1 = AIV0 of cluster i
-//   bit i*3+2 = AIV1 of cluster i
-// Max 21 clusters per tracker (63 bits in uint64_t).
-// =============================================================================
-
-class alignas(64) CoreTracker {
+class alignas(64) CoreTracker
+{
 public:
     static inline int32_t MAX_CORE_PER_THREAD = 63;
     static constexpr int32_t MAX_CLUSTERS = 63 / 3;
@@ -139,31 +106,69 @@ public:
 public:
     CoreTracker() = default;
 
-    class BitStates {
+    class BitStates
+    {
     public:
         BitStates() = default;
 
         explicit BitStates(uint64_t states) :
-            states_(states) {}
-        void init() { states_ = 0; }
+            states_(states)
+        {}
+        void init()
+        {
+            states_ = 0;
+        }
 
-        BitStates operator~() const { return BitStates(~states_); }
-        BitStates operator&(const BitStates &other) const { return BitStates(states_ & other.states_); }
-        BitStates operator|(const BitStates &other) const { return BitStates(states_ | other.states_); }
-        BitStates operator^(const BitStates &other) const { return BitStates(states_ ^ other.states_); }
-        BitStates operator>>(int32_t offset) const { return BitStates(states_ >> offset); }
-        BitStates operator<<(int32_t offset) const { return BitStates(states_ << offset); }
-        void operator&=(const BitStates &other) { states_ &= other.states_; }
-        void operator|=(const BitStates &other) { states_ |= other.states_; }
-        void operator^=(const BitStates &other) { states_ ^= other.states_; }
+        BitStates operator~() const
+        {
+            return BitStates(~states_);
+        }
+        BitStates operator&(const BitStates &other) const
+        {
+            return BitStates(states_ & other.states_);
+        }
+        BitStates operator|(const BitStates &other) const
+        {
+            return BitStates(states_ | other.states_);
+        }
+        BitStates operator^(const BitStates &other) const
+        {
+            return BitStates(states_ ^ other.states_);
+        }
+        BitStates operator>>(int32_t offset) const
+        {
+            return BitStates(states_ >> offset);
+        }
+        BitStates operator<<(int32_t offset) const
+        {
+            return BitStates(states_ << offset);
+        }
+        void operator&=(const BitStates &other)
+        {
+            states_ &= other.states_;
+        }
+        void operator|=(const BitStates &other)
+        {
+            states_ |= other.states_;
+        }
+        void operator^=(const BitStates &other)
+        {
+            states_ ^= other.states_;
+        }
 
-        bool has_value() const { return states_ > 0; }
-        int32_t count() const { return __builtin_popcountll(states_); }
-        void clear_bit(int32_t offset) { states_ &= ~(1ULL << offset); }
+        bool has_value() const
+        {
+            return states_ > 0;
+        }
+        int32_t count() const
+        {
+            return __builtin_popcountll(states_);
+        }
 
         // Extract the lowest set bit from mask, clear it, and return its position.
         // Returns -1 if mask is empty.
-        int32_t pop_first() {
+        int32_t pop_first()
+        {
             if (states_ == 0) return -1;
             int32_t pos = __builtin_ctzll(states_);
             states_ &= states_ - 1;
@@ -175,66 +180,73 @@ public:
     };
 
 public:
-    void init(int32_t cluster_count) {
+    void init(int32_t cluster_count)
+    {
         cluster_count_ = cluster_count;
         aic_mask_.init();
         aiv_mask_.init();
         pending_occupied_.init();
-        for (int32_t i = 0; i < cluster_count; i++) {
+        for (int32_t i = 0; i < cluster_count; i++)
+        {
             aic_mask_ |= BitStates(1ULL << (i * 3));
             aiv_mask_ |= BitStates(6ULL << (i * 3));
         }
         core_states_ = aic_mask_ | aiv_mask_;
     }
 
-    void set_cluster(int32_t cluster_idx, int32_t aic_wid, int32_t aiv0_wid, int32_t aiv1_wid) {
+    void set_cluster(int32_t cluster_idx, int32_t aic_wid, int32_t aiv0_wid, int32_t aiv1_wid)
+    {
         core_id_map_[cluster_idx * 3] = aic_wid;
         core_id_map_[cluster_idx * 3 + 1] = aiv0_wid;
         core_id_map_[cluster_idx * 3 + 2] = aiv1_wid;
     }
 
-    int32_t get_cluster_count() const { return cluster_count_; }
+    int32_t get_cluster_count() const
+    {
+        return cluster_count_;
+    }
 
     // --- Running core queries ---
 
     template <CoreType CT>
-    bool has_running_cores() const {
-        if constexpr (CT == CoreType::AIC) {
-            return ((~core_states_) & aic_mask_).has_value();
-        } else {
-            return ((~core_states_) & aiv_mask_).has_value();
-        }
+    bool has_running_cores() const
+    {
+        if constexpr (CT == CoreType::AIC) return ((~core_states_) & aic_mask_).has_value();
+        else return ((~core_states_) & aiv_mask_).has_value();
     }
 
-    bool has_any_running_cores() const { return ((~core_states_) & (aic_mask_ | aiv_mask_)).has_value(); }
+    bool has_any_running_cores() const
+    {
+        return ((~core_states_) & (aic_mask_ | aiv_mask_)).has_value();
+    }
 
     template <CoreType CT>
-    int32_t get_running_count() const {
-        if constexpr (CT == CoreType::AIC) {
-            return ((~core_states_) & aic_mask_).count();
-        } else {
-            return ((~core_states_) & aiv_mask_).count();
-        }
+    int32_t get_running_count() const
+    {
+        if constexpr (CT == CoreType::AIC) return ((~core_states_) & aic_mask_).count();
+        else return ((~core_states_) & aiv_mask_).count();
     }
 
     // Return an opaque bitmask for iterating running cores of a given type.
     // Use pop_first() to extract core bit offsets one at a time.
     template <CoreType CT>
-    BitStates get_running_cores() const {
-        if constexpr (CT == CoreType::AIC) {
-            return (~core_states_) & aic_mask_;
-        } else {
-            return (~core_states_) & aiv_mask_;
-        }
+    BitStates get_running_cores() const
+    {
+        if constexpr (CT == CoreType::AIC) return (~core_states_) & aic_mask_;
+        else return (~core_states_) & aiv_mask_;
     }
 
-    BitStates get_all_running_cores() const { return (~core_states_) & (aic_mask_ | aiv_mask_); }
-    BitStates get_cluster_offset_states() const { return aic_mask_; }
+    BitStates get_all_running_cores() const
+    {
+        return (~core_states_) & (aic_mask_ | aiv_mask_);
+    }
 
     // --- Cluster matching ---
 
-    BitStates get_valid_cluster_offset_states(PTO2ResourceShape shape) const {
-        switch (shape) {
+    BitStates get_valid_cluster_offset_states(PTO2ResourceShape shape) const
+    {
+        switch (shape)
+        {
         case PTO2ResourceShape::AIC:
             return core_states_ & aic_mask_;
         case PTO2ResourceShape::AIV:
@@ -249,143 +261,116 @@ public:
         return BitStates(0ULL);
     }
 
-    int32_t get_aic_core_id(int32_t cluster_offset) const { return core_id_map_[cluster_offset]; }
-    int32_t get_aiv0_core_id(int32_t cluster_offset) const { return core_id_map_[cluster_offset + 1]; }
-    int32_t get_aiv1_core_id(int32_t cluster_offset) const { return core_id_map_[cluster_offset + 2]; }
+    int32_t get_aic_core_id(int32_t cluster_offset) const
+    {
+        return core_id_map_[cluster_offset];
+    }
+    int32_t get_aiv0_core_id(int32_t cluster_offset) const
+    {
+        return core_id_map_[cluster_offset + 1];
+    }
+    int32_t get_aiv1_core_id(int32_t cluster_offset) const
+    {
+        return core_id_map_[cluster_offset + 2];
+    }
 
-    int32_t get_aic_core_offset(int32_t cluster_offset) const { return cluster_offset; }
-    int32_t get_aiv0_core_offset(int32_t cluster_offset) const { return cluster_offset + 1; }
-    int32_t get_aiv1_core_offset(int32_t cluster_offset) const { return cluster_offset + 2; }
+    int32_t get_aic_core_offset(int32_t cluster_offset) const
+    {
+        return cluster_offset;
+    }
+    int32_t get_aiv0_core_offset(int32_t cluster_offset) const
+    {
+        return cluster_offset + 1;
+    }
+    int32_t get_aiv1_core_offset(int32_t cluster_offset) const
+    {
+        return cluster_offset + 2;
+    }
 
-    bool is_aic_core_idle(int32_t cluster_offset) const {
+    bool is_aic_core_idle(int32_t cluster_offset) const
+    {
         return ((core_states_ >> cluster_offset) & BitStates(1ULL)).has_value();
     }
-    bool is_aiv0_core_idle(int32_t cluster_offset) const {
+    bool is_aiv0_core_idle(int32_t cluster_offset) const
+    {
         return ((core_states_ >> (cluster_offset + 1)) & BitStates(1ULL)).has_value();
     }
-    bool is_aiv1_core_idle(int32_t cluster_offset) const {
+    bool is_aiv1_core_idle(int32_t cluster_offset) const
+    {
         return ((core_states_ >> (cluster_offset + 2)) & BitStates(1ULL)).has_value();
     }
 
     // --- State mutation ---
 
     // Toggle bit at the given bit offset (running <-> idle)
-    void change_core_state(int32_t bit_offset) { core_states_ ^= BitStates(1ULL << bit_offset); }
+    void change_core_state(int32_t bit_offset)
+    {
+        core_states_ ^= BitStates(1ULL << bit_offset);
+    }
 
-    // --- Pending-occupied tracking ---
-    // Tracks whether a core's pending payload slot is occupied (awaiting hardware ACK).
-    // SET on dispatch (both running-first and pending), CLEAR on idle or pending_freed.
-
-    void set_pending_occupied(int32_t bit_offset) { pending_occupied_ |= BitStates(1ULL << bit_offset); }
-    void clear_pending_occupied(int32_t bit_offset) {
+    void set_pending_occupied(int32_t bit_offset)
+    {
+        pending_occupied_ |= BitStates(1ULL << bit_offset);
+    }
+    void clear_pending_occupied(int32_t bit_offset)
+    {
         pending_occupied_ ^= (pending_occupied_ & BitStates(1ULL << bit_offset));
     }
 
     // --- Two-phase dispatch queries ---
 
-    // Idle dispatch: returns bit offsets of idle cores for the given shape.
-    // For AIC: 1 bit per cluster (core offset == cluster offset).
-    // For AIV: 1 bit per AIV core (2 bits per cluster at aiv_mask_ positions).
-    // Only AIC needs pending_occupied filtering: by invariant, idle cores (core_states_ bit=1)
-    // always have pending_occupied=0, so AIV/MIX need no extra filtering.
-    // Skipping the AIC-centric filter also fixes a latent bug where a running+pending AIC core
-    // would incorrectly block AIV idle dispatch on the same cluster.
-    BitStates get_idle_core_offset_states(PTO2ResourceShape shape) const {
-        if (shape == PTO2ResourceShape::AIC) {
-            return get_valid_cluster_offset_states(shape) & ~(pending_occupied_ & aic_mask_);
-        }
-        if (shape == PTO2ResourceShape::AIV) {
-            return core_states_ & aiv_mask_;
-        }
+    BitStates get_idle_core_offset_states(PTO2ResourceShape shape) const
+    {
+        if (shape == PTO2ResourceShape::AIC) return get_valid_cluster_offset_states(shape) & ~(pending_occupied_ & aic_mask_);
+        if (shape == PTO2ResourceShape::AIV) return core_states_ & aiv_mask_;
         return get_valid_cluster_offset_states(shape);  // MIX: cluster-level
     }
 
-    // Pending dispatch: returns bit offsets of cores eligible for pending-slot dispatch.
-    // AIC: 1 bit per cluster (aic_mask_ positions). AIV: 1 bit per AIV core (aiv_mask_ positions).
-    // Runtime MIX dispatch uses classify_mix_cluster() so the decision follows the task's active_mask.
-    enum class MixPlacement : uint8_t { RUNNING, PENDING, REJECT };
-
-    // A MIX block must place all cores named by active_mask the same way:
-    // all idle means running placement, all running means pending placement,
-    // and any mixed state is retried later.
-    MixPlacement classify_mix_cluster(int32_t cluster_offset, uint8_t core_mask) const {
-        BitStates used(0ULL);
-        if (core_mask & PTO2_SUBTASK_MASK_AIC) {
-            used |= BitStates(1ULL << cluster_offset);
-        }
-        if (core_mask & PTO2_SUBTASK_MASK_AIV0) {
-            used |= BitStates(1ULL << (cluster_offset + 1));
-        }
-        if (core_mask & PTO2_SUBTASK_MASK_AIV1) {
-            used |= BitStates(1ULL << (cluster_offset + 2));
-        }
-        if (!used.has_value() || (pending_occupied_ & used).has_value()) {
-            return MixPlacement::REJECT;
-        }
-
-        BitStates idle = core_states_ & used;
-        if (idle.count() == used.count()) {
-            return MixPlacement::RUNNING;
-        }
-        if (!idle.has_value()) {
-            return MixPlacement::PENDING;
-        }
-        return MixPlacement::REJECT;
-    }
-
-    BitStates get_mix_running_cluster_offset_states(uint8_t core_mask) const {
-        BitStates result(0ULL);
-        BitStates candidates = get_cluster_offset_states();
-        while (candidates.has_value()) {
-            int32_t cluster_offset = candidates.pop_first();
-            if (classify_mix_cluster(cluster_offset, core_mask) == MixPlacement::RUNNING) {
-                result |= BitStates(1ULL << cluster_offset);
-            }
-        }
-        return result;
-    }
-
-    int32_t count_mix_running_clusters(uint8_t core_mask) const {
-        return get_mix_running_cluster_offset_states(core_mask).count();
-    }
-
-    BitStates get_pending_core_offset_states(PTO2ResourceShape shape) const {
-        if (shape == PTO2ResourceShape::MIX) {
-            // Shape-level query kept conservative for legacy callers/tests.
-            // The real MIX dispatch path applies active_mask in classify_mix_cluster().
+    BitStates get_pending_core_offset_states(PTO2ResourceShape shape) const
+    {
+        if (shape == PTO2ResourceShape::MIX)
+        {
             // Any core without a pending payload can accept a dispatch (idle or running).
             BitStates available = ~pending_occupied_;
-            BitStates mix_available =
-                (available & aic_mask_) & ((available >> 1) & aic_mask_) & ((available >> 2) & aic_mask_);
-            // Pending MIX can only reuse a fully-running cluster. Partially-running clusters
-            // could split one MIX block across immediate and pending placement.
+            BitStates mix_available = (available & aic_mask_) & ((available >> 1) & aic_mask_) & ((available >> 2) & aic_mask_);
+            // Exclude fully-idle clusters (handled by IDLE phase) to prevent double-dispatch.
             BitStates running = ~core_states_;
-            BitStates cluster_all_running =
-                (running & aic_mask_) & ((running >> 1) & aic_mask_) & ((running >> 2) & aic_mask_);
-            return mix_available & cluster_all_running;
+            BitStates cluster_has_running = (running & aic_mask_) | ((running >> 1) & aic_mask_) | ((running >> 2) & aic_mask_);
+            return mix_available & cluster_has_running;
         }
-        if (shape == PTO2ResourceShape::AIC) {
-            return (~core_states_) & aic_mask_ & ~(pending_occupied_ & aic_mask_);
-        }
+        if (shape == PTO2ResourceShape::AIC) return (~core_states_) & aic_mask_ & ~(pending_occupied_ & aic_mask_);
         // AIV
         return (~core_states_) & aiv_mask_ & ~pending_occupied_;
     }
 
     // --- Two-phase dispatch unified query ---
 
-    enum class DispatchPhase : uint8_t { IDLE, PENDING };
+    enum class DispatchPhase : uint8_t
+    {
+        IDLE,
+        PENDING
+    };
 
-    BitStates get_dispatchable_cores(PTO2ResourceShape shape, DispatchPhase phase) const {
-        return (phase == DispatchPhase::IDLE) ? get_idle_core_offset_states(shape) :
-                                                get_pending_core_offset_states(shape);
+    BitStates get_dispatchable_cores(PTO2ResourceShape shape, DispatchPhase phase) const
+    {
+        return (phase == DispatchPhase::IDLE) ? get_idle_core_offset_states(shape) : get_pending_core_offset_states(shape);
     }
 
     // --- Bit offset <-> worker_id mapping ---
 
-    int32_t get_core_id_by_offset(int32_t offset) const { return core_id_map_[offset]; }
+    int32_t get_core_id_by_offset(int32_t offset) const
+    {
+        return core_id_map_[offset];
+    }
 
-    const int32_t *core_ids() const { return core_id_map_; }
-    int32_t core_num() const { return cluster_count_ * 3; }
+    const int32_t *core_ids() const
+    {
+        return core_id_map_;
+    }
+    int32_t core_num() const
+    {
+        return cluster_count_ * 3;
+    }
 
 private:
     int32_t cluster_count_;
@@ -396,12 +381,8 @@ private:
     int32_t core_id_map_[63];  // bit_position -> worker_id, max 21 clusters * 3
 };
 
-// =============================================================================
-// SlotTransition: pure event signals from a single register poll.
-// true = event occurred, false = no-op (maintain current state).
-// =============================================================================
-
-struct SlotTransition {
+struct SlotTransition
+{
     bool running_done = false;   // running task completed
     bool pending_done = false;   // pending task completed
     bool running_freed = false;  // running slot data should be released
@@ -409,55 +390,13 @@ struct SlotTransition {
     bool matched = false;        // some case was hit (otherwise skip apply)
 };
 
-// =============================================================================
-// Profiling counters (compile-time gated)
-// =============================================================================
-
-#if PTO2_PROFILING
-struct alignas(64) SchedL2SwimlaneCounters {
-    bool l2_swimlane_enabled{false};
-    uint64_t sched_start_ts{0};
-    uint64_t sched_complete_cycle{0};
-    uint64_t sched_dispatch_cycle{0};
-    uint64_t sched_wiring_cycle{0};
-    uint64_t sched_idle_cycle{0};
-    uint64_t sched_loop_count{0};
-    uint32_t phase_complete_count{0};
-    // Sub-block retires that did NOT finish a slot (SPMD blocks of a multi-block
-    // task retiring one at a time). Counted separately so the Complete-phase
-    // emit can fire on poll iterations that only retired sub-blocks — otherwise
-    // the serial-harvest tail of an SPMD slot is invisible (no slot completes
-    // until the last block, leaving the scheduler lane blank for that window).
-    uint32_t phase_subretire_count{0};
-    uint32_t phase_dispatch_count{0};
-    // Per-emit delta is (current - *_at_last_emit). Accumulated only when
-    // l2_swimlane_level_ >= SCHED_PHASES.
-    uint64_t pop_hit{0};
-    uint64_t pop_miss{0};
-    uint64_t pop_hit_at_last_emit{0};
-    uint64_t pop_miss_at_last_emit{0};
-#if PTO2_SCHED_PROFILING
-    uint32_t phase_wiring_count{0};
-    uint64_t complete_probe_count{0};
-    uint64_t complete_hit_count{0};
-    uint64_t sched_complete_perf_cycle{0};
-    uint64_t sched_dispatch_pop_cycle{0};
-    uint64_t sched_dispatch_setup_cycle{0};
-#endif
-    void reset() { *this = SchedL2SwimlaneCounters{}; }
-};
-#endif
-
-// =============================================================================
-// sync_start drain coordination
-// =============================================================================
-
 // When sync_start_pending != 0, all scheduler threads skip dispatch
 // (only process completions) until the drain worker finishes launching all blocks.
-struct alignas(64) SyncStartDrainState {
-    std::atomic<int32_t> sync_start_pending{0};    // 0=normal; -1=initializing; >0=active (value=block_num)
-    std::atomic<int32_t> drain_worker_elected{0};  // 0=none; >0: elected thread's (thread_idx+1)
-    std::atomic<uint32_t> drain_ack_mask{0};       // bit per thread; all-set = all threads reached ack barrier
+struct alignas(64) SyncStartDrainState
+{
+    std::atomic<int32_t> sync_start_pending{0};              // 0=normal; -1=initializing; >0=active (value=block_num)
+    std::atomic<int32_t> drain_worker_elected{0};            // 0=none; >0: elected thread's (thread_idx+1)
+    std::atomic<uint32_t> drain_ack_mask{0};                 // bit per thread; all-set = all threads reached ack barrier
     std::atomic<PTO2TaskSlotState *> pending_task{nullptr};  // held task (not re-queued)
     int32_t _pad[10];
 };
