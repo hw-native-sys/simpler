@@ -72,6 +72,11 @@ bool PTO2FaninPool::ensure_space(PTO2SharedMemoryRingHeader &ring, int32_t neede
             prev_last_alive = cur_last_alive;
             block_timing = false;
         } else if ((spin_count & 1023) == 0) {
+            // A fatal latched elsewhere breaks this otherwise-unbounded spin; the
+            // caller maps the failed ensure_space to orch_mark_fatal. Cold path.
+            if (error_code_ptr != nullptr && error_code_ptr->load(std::memory_order_acquire) != PTO2_ERROR_NONE) {
+                return false;
+            }
             // Absolute-time backstop, matching the task allocator: stable across
             // chips/contention, unlike a fixed spin count. get_sys_cnt_aicpu()
             // is an MMIO read, so sample it only once per 1024 spins.

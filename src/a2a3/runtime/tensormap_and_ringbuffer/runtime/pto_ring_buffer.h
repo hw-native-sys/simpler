@@ -171,6 +171,13 @@ public:
                 prev_last_alive = last_alive;
                 block_timing = false;
             } else if ((spin_count & 1023) == 0) {
+                // A fatal latched elsewhere (e.g. the scheduler-side wiring
+                // deadlock detector) breaks this otherwise-unbounded spin; the
+                // caller maps the failed alloc to orch_mark_fatal. Polled on the
+                // cold path only -- error_code_ptr_ is orch_error_code.
+                if (error_code_ptr_ != nullptr && error_code_ptr_->load(std::memory_order_acquire) != PTO2_ERROR_NONE) {
+                    return {-1, -1, nullptr, nullptr};
+                }
                 // Reclaim watermark is stuck. Run the deadlock checks only once
                 // per 1024 spins: get_sys_cnt_aicpu() is an MMIO read and
                 // head_blocked_on_scope_end() walks the head slot, neither of
