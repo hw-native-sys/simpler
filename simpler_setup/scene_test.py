@@ -579,6 +579,48 @@ def _dump_name_map(mapping: dict, output_path: Path) -> Path | None:
     return output_path
 
 
+def _inject_dist_swimlane_names(callable_spec: dict) -> None:
+    """Resolve incore func_ids -> names in a distributed-runtime swimlane.
+
+    The fully_distributed_within_core engine writes a Chrome-trace swimlane to
+    ``$PTO_DIST_SWIMLANE`` whose events carry only ``func_id`` (the device has
+    no incore name — ``CoreCallable`` stores none). When that capture happened
+    this run, rewrite each event's label to the kernel name from the CALLABLE
+    spec (``func_id -> name``) and stamp ``args.name`` so both Perfetto and
+    ``simpler_setup.tools.dist_swimlane_render`` show e.g. ``GEMM``/``ADD``
+    instead of ``f0``/``f1``. No-op when the env var is unset, the file is
+    absent, or the spec carries no names.
+    """
+    import json as _json  # noqa: PLC0415
+
+    path = os.environ.get("PTO_DIST_SWIMLANE")
+    if not path or not os.path.isfile(path):
+        return
+    names = _extract_name_map(callable_spec).get("callable_id_to_name", {})
+    if not names:
+        return
+    try:
+        with open(path) as f:
+            data = _json.load(f)
+    except (OSError, ValueError):
+        return
+    changed = False
+    for e in data.get("traceEvents", []):
+        if e.get("ph") != "X":
+            continue
+        args = e.get("args", {})
+        nm = names.get(str(args.get("func_id")))
+        if nm is None:
+            continue
+        args["name"] = nm
+        tid = args.get("task_id")
+        e["name"] = f"{nm}#{tid}" if tid is not None else nm
+        changed = True
+    if changed:
+        with open(path, "w") as f:
+            _json.dump(data, f, indent=2)
+
+
 def _parse_case_selector(value: str) -> tuple[str | None, str | None]:
     """Parse one ``--case`` value into ``(class_name, case_name)``.
 
@@ -1250,6 +1292,10 @@ class SceneTestCase:
         if timings:
             _log_round_timings(timings)
 
+        # If a distributed-runtime swimlane was captured (PTO_DIST_SWIMLANE),
+        # label its events with the incore function names from the spec.
+        _inject_dist_swimlane_names(self.CALLABLE)
+
     def _run_and_validate_l3(  # noqa: PLR0913 -- threads CLI diagnostic flags + L3 ns context
         self,
         worker,
@@ -1338,6 +1384,10 @@ class SceneTestCase:
 
         if timings:
             _log_round_timings(timings)
+
+        # If a distributed-runtime swimlane was captured (PTO_DIST_SWIMLANE),
+        # label its events with the incore function names from the spec.
+        _inject_dist_swimlane_names(self.CALLABLE)
 
     # ------------------------------------------------------------------
     # pytest auto test method

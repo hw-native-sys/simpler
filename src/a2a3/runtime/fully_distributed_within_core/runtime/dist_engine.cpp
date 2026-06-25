@@ -23,9 +23,15 @@
  *   2. on each rt_submit_*, races to claim the task on one of two global
  *      cursors (cube for AIC-anchored, vector for AIV-only). The winner is
  *      owner = builder = executor and builds the task into its private ring;
- *   3. runs a run-ahead loop: orchestrate until the private ring is full
- *      (back-pressure drains ready tasks inline), then after orchestration
- *      returns, drains the ring to completion. A task is ready once all its
+ *   3. runs an EXECUTE-FIRST run-ahead loop: on every submit point it first
+ *      drains ready owned tasks (and pulls follower deposits), THEN claims at
+ *      most this one new task. Because claim+build is fast but execute is slow,
+ *      interleaving execution with claiming stops a fast core from greedily
+ *      claiming a full ring of consecutive tasks: while it executes a long task
+ *      other cores advance the cursor and claim subsequent tasks (load balance,
+ *      see docs §6/§6.1). The ring (small, kPrivateSlots) only back-pressures
+ *      when genuinely full of not-yet-ready tasks. After orchestration returns,
+ *      a final loop drains the ring to completion. A task is ready once all its
  *      fan-in producers have set their entry in the global completion-flag
  *      ring; on completion the owner sets its own flag (release).
  *
@@ -49,6 +55,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <string>
+#include <vector>
 
 #include "callable.h"
 #include "common/core_type.h"
@@ -70,7 +78,12 @@ namespace {
 // wrap (>= total tasks); the GM output heap is a BOUNDED RING reclaimed by the
 // completion frontier (M4, §9.5/§11.4) rather than a run-sized bump.
 // -----------------------------------------------------------------------------
-constexpr int32_t kPrivateSlots = 8;       // PRIVATE_TASK_SLOT_NUM (back-pressure cap)
+// Kept deliberately SMALL: the out-of-order window is num_cores * kPrivateSlots,
+// and this also caps how far a single core can run ahead of "ready-to-execute".
+// A large ring lets one fast core greedily claim a long run of consecutive tasks
+// and serialize them while other cores starve (load imbalance, docs §6.1). OoO
+// capacity should come from the core-count dimension, not a deep per-core ring.
+constexpr int32_t kPrivateSlots = 4;       // PRIVATE_TASK_SLOT_NUM (back-pressure cap)
 // Ring slots a core reserves for draining block.won deposits addressed to its
 // lane. Self-claimed tasks (consumers / single-core / own anchor subtask) may
 // only occupy kPrivateSlots - kWonReserve slots, so a follower can ALWAYS pull
@@ -159,6 +172,17 @@ struct DistTensorMap {
 // and will execute itself. Holds its own copy of the argument Tensors so it can
 // be executed at any later point (deferred past further orchestration).
 // -----------------------------------------------------------------------------
+// One executed (sub)task, recorded only when swimlane tracing is on. Laid out
+// in the exported Chrome trace by physical block (pid) and lane (tid).
+struct TraceEvent {
+    int32_t task_id;
+    int32_t func_id;   // kernel id (e.g. 0=GEMM, 1=ADD); -1 if unknown
+    int32_t lane;      // AIC=0 / AIV0=1 / AIV1=2
+    uint8_t multicore;
+    double ts_us;      // start, microseconds from g_trace_epoch
+    double dur_us;     // execution duration, microseconds
+};
+
 struct RingSlot {
     bool occupied;
     // A slot can be reserved (occupied=true) before it is fully populated: the
@@ -169,6 +193,7 @@ struct RingSlot {
     // task_id/fanin/won linkage. build_ring_slot sets it; execute_slot clears it.
     bool built;
     int32_t task_id;
+    int32_t func_id;  // kernel id of this slot's lane (swimlane label); -1 if none
     uint64_t function_bin_addr;
 
     int32_t tensor_count;
@@ -204,6 +229,7 @@ struct RingSlot {
 // -----------------------------------------------------------------------------
 struct BuiltSubtask {
     bool present;
+    int32_t func_id;  // kernel id of this lane's subtask (swimlane label); -1 if none
     uint64_t function_bin_addr;
     int32_t tensor_count;
     int32_t scalar_count;
@@ -238,6 +264,7 @@ struct CoreLayout {
 // -----------------------------------------------------------------------------
 struct DistCore {
     CoreType role;
+    int32_t core_idx;      // index into g_dist.cores[] (for trace ownership)
     int32_t block_id;      // physical block this core belongs to
     int32_t lane;          // LaneId within the block (AIC / AIV0 / AIV1)
     int32_t sub_block_id;
@@ -253,6 +280,10 @@ struct DistCore {
     Tensor outpool[kOutPoolSlots];
     int32_t outpool_head;
 
+    // Per-core swimlane events (only populated when tracing is on). Owned solely
+    // by this core's worker thread, so push_back is lock-free.
+    std::vector<TraceEvent> trace;
+
     void reset(CoreType r, int32_t block, int32_t lane_id) {
         role = r;
         block_id = block;
@@ -264,6 +295,7 @@ struct DistCore {
         occupied_count = 0;
         owned_total = 0;
         outpool_head = 0;
+        trace.clear();
         for (int32_t i = 0; i < kPrivateSlots; i++) {
             slots[i].occupied = false;
             slots[i].built = false;
@@ -320,6 +352,17 @@ struct DistGlobal {
 
 DistGlobal g_dist;
 thread_local DistCore *g_self = nullptr;
+
+// Swimlane tracing (set PTO_DIST_SWIMLANE=<path> to enable). When off, the
+// per-task timing capture is skipped entirely so a normal run pays nothing.
+bool g_trace_on = false;
+uint64_t g_trace_epoch_ns = 0;
+
+inline uint64_t now_ns() {
+    return static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch())
+            .count());
+}
 
 // Opt-in per-core tracing (set PTO_DIST_TRACE=1). Off by default so a passing
 // run is quiet; fatal/error/heap-exhaustion diagnostics are always emitted.
@@ -407,11 +450,21 @@ uint64_t resolve_kernel_addr(Runtime *runtime, int32_t kernel_id) {
 // Execute one owned task, then publish its completion flag (release). In sim all
 // cores share the address space, so the release/acquire pair is the visibility
 // barrier between the kernel's output writes and a consumer's input reads.
-void execute_slot(RingSlot &s) {
+void execute_slot(DistCore *self, RingSlot &s) {
     typedef void (*KernelFn)(int64_t *);
     if (s.function_bin_addr != 0) {
-        KernelFn fn = reinterpret_cast<KernelFn>(s.function_bin_addr);
-        fn(reinterpret_cast<int64_t *>(s.args));
+        if (g_trace_on) {
+            const uint64_t t0 = now_ns();
+            KernelFn fn = reinterpret_cast<KernelFn>(s.function_bin_addr);
+            fn(reinterpret_cast<int64_t *>(s.args));
+            const uint64_t t1 = now_ns();
+            self->trace.push_back(TraceEvent{
+                s.task_id, s.func_id, self->lane, static_cast<uint8_t>(s.is_multicore ? 1 : 0),
+                (t0 - g_trace_epoch_ns) / 1000.0, (t1 - t0) / 1000.0});
+        } else {
+            KernelFn fn = reinterpret_cast<KernelFn>(s.function_bin_addr);
+            fn(reinterpret_cast<int64_t *>(s.args));
+        }
     }
     if (s.is_multicore) {
         // Joint ownership: the co-owner that drives remaining to zero (the last
@@ -447,7 +500,7 @@ int32_t drain_phase_b(DistCore *self) {
             }
         }
         if (!ready) continue;
-        execute_slot(s);
+        execute_slot(self, s);
         self->occupied_count--;
         freed++;
     }
@@ -480,12 +533,13 @@ inline bool lane_active(const ActiveMask &M, int32_t lane) {
 // in; args[] is (re)built to point at this slot's own copies so the slot is
 // self-contained and executable at any later time.
 void build_ring_slot(
-    RingSlot &s, int32_t task_id, uint64_t fn_addr, const Tensor *tensors, int32_t tc, const uint64_t *scalars,
-    int32_t sc, const int32_t *fanin, int32_t fc, int32_t sub_block_id, bool is_multicore, int32_t won_block,
-    int32_t won_slot
+    RingSlot &s, int32_t task_id, int32_t func_id, uint64_t fn_addr, const Tensor *tensors, int32_t tc,
+    const uint64_t *scalars, int32_t sc, const int32_t *fanin, int32_t fc, int32_t sub_block_id, bool is_multicore,
+    int32_t won_block, int32_t won_slot
 ) {
     s.occupied = true;
     s.task_id = task_id;
+    s.func_id = func_id;
     s.function_bin_addr = fn_addr;
     s.built = true;  // fully populated below — now safe for Phase B to execute
     s.tensor_count = tc;
@@ -556,8 +610,8 @@ void drain_block_won(DistCore *self) {
         }
         const BuiltSubtask &b = w.lane[self->lane];
         build_ring_slot(
-            self->slots[si], w.task_id, b.function_bin_addr, b.tensors, b.tensor_count, b.scalars, b.scalar_count,
-            b.fanin, b.fanin_count, b.sub_block_id, /*is_multicore=*/true, self->block_id, i
+            self->slots[si], w.task_id, b.func_id, b.function_bin_addr, b.tensors, b.tensor_count, b.scalars,
+            b.scalar_count, b.fanin, b.fanin_count, b.sub_block_id, /*is_multicore=*/true, self->block_id, i
         );
         self->occupied_count++;
         self->owned_total++;
@@ -577,6 +631,18 @@ TaskOutputTensors dist_submit_impl(PTO2Runtime *, const MixedKernels &mixed, con
     DistCore *self = g_self;
     if (self == nullptr) return TaskOutputTensors{};
     Runtime *runtime = g_dist.runtime;
+
+    // EXECUTE-FIRST (docs §6 step 0+1, §6.1): before claiming this task, pull any
+    // follower deposits and execute every ready owned task. This interleaves
+    // execution with claiming so a fast core does not burst-claim a full ring of
+    // consecutive tasks; while it executes a (long) task other cores advance the
+    // cursor and claim subsequent ones. The deterministic replay below (id bump,
+    // heap bump, map maintenance) is unaffected — draining only runs/flags tasks
+    // this core already owns. Every core does this on every submit point.
+    if (!fatal_set()) {
+        drain_block_won(self);
+        drain_phase_b(self);
+    }
 
     const int32_t N = self->local_index++;
     const ActiveMask M = mixed.to_active_mask();
@@ -808,6 +874,7 @@ TaskOutputTensors dist_submit_impl(PTO2Runtime *, const MixedKernels &mixed, con
             if (L == own_lane || !lane_active(M, L)) continue;
             BuiltSubtask &b = w.lane[L];
             b.present = true;
+            b.func_id = kernel_id_for_lane(mixed, L);
             b.function_bin_addr = resolve_kernel_addr(runtime, kernel_id_for_lane(mixed, L));
             b.tensor_count = tc;
             b.scalar_count = sc;
@@ -822,9 +889,10 @@ TaskOutputTensors dist_submit_impl(PTO2Runtime *, const MixedKernels &mixed, con
     }
 
     const int32_t own_sub_block = (own_lane == LANE_AIV1) ? 1 : 0;
+    const int32_t own_func_id = kernel_id_for_lane(mixed, own_lane);
     build_ring_slot(
-        self->slots[si], N, resolve_kernel_addr(runtime, kernel_id_for_lane(mixed, own_lane)), built, tc, scalars, sc,
-        fanin, fc, own_sub_block, is_multicore, won_block, won_slot
+        self->slots[si], N, own_func_id, resolve_kernel_addr(runtime, own_func_id), built, tc, scalars, sc, fanin, fc,
+        own_sub_block, is_multicore, won_block, won_slot
     );
     self->occupied_count++;
     self->owned_total++;
@@ -913,6 +981,12 @@ void dist_set_tensor_data(PTO2Runtime *, const Tensor &tensor, uint32_t ndims, c
 TaskOutputTensors dist_alloc_tensors(PTO2Runtime *, const L0TaskArgs &args) {
     DistCore *self = g_self;
     if (self == nullptr) return TaskOutputTensors{};
+    // EXECUTE-FIRST (docs §6 step 0+1, §6.1): every submit point first seeks an
+    // execution opportunity before advancing the deterministic replay below.
+    if (!fatal_set()) {
+        drain_block_won(self);
+        drain_phase_b(self);
+    }
     const int32_t N = self->local_index++;
     const int32_t tc = args.tensor_count();
     if (N >= kFlagCap) {
@@ -1060,6 +1134,7 @@ void dist_core_main(void *runtime_v, int core_idx, int core_type_int) {
     // ignores it, so 0 is correct for the M2 single-core scope.
     const CoreLayout lay = g_dist.layout[core_idx];
     self->reset(role, lay.block_id, lay.lane);
+    self->core_idx = core_idx;
     g_self = self;
     if (dist_trace()) fprintf(stderr, "[dist] core %d role=%d block=%d lane=%d START\n", core_idx, core_type_int,
                               lay.block_id, lay.lane);
@@ -1137,6 +1212,11 @@ void *dist_engine_register(
         const long h = atol(e);
         if (h >= 0) g_dist.H = static_cast<int32_t>(h);
     }
+    // Swimlane tracing gate. Capture the epoch now so every core's event ts is
+    // relative to the same run start.
+    g_trace_on = (getenv("PTO_DIST_SWIMLANE") != nullptr);
+    g_trace_epoch_ns = now_ns();
+
     g_dist.cube_cursor.store(-1, std::memory_order_relaxed);
     g_dist.vector_cursor.store(-1, std::memory_order_relaxed);
     g_dist.frontier.store(-1, std::memory_order_relaxed);
@@ -1192,4 +1272,68 @@ void *dist_engine_register(
     std::atomic_thread_fence(std::memory_order_release);
     rt->ops = &g_dist_ops;
     return reinterpret_cast<void *>(&dist_core_main);
+}
+
+void dist_engine_dump_trace() {
+    if (!g_trace_on) return;
+    const char *path = getenv("PTO_DIST_SWIMLANE");
+    if (path == nullptr || path[0] == '\0') return;
+    FILE *f = fopen(path, "w");
+    if (f == nullptr) {
+        fprintf(stderr, "[dist_engine] cannot open swimlane file %s for write\n", path);
+        return;
+    }
+
+    auto lane_name = [](int32_t lane) -> const char * {
+        switch (lane) {
+            case LANE_AIC: return "AIC";
+            case LANE_AIV0: return "AIV0";
+            case LANE_AIV1: return "AIV1";
+            default: return "?";
+        }
+    };
+
+    // Chrome Trace Event Format (https://ui.perfetto.dev / chrome://tracing).
+    // pid = physical block, tid = lane → each block is a 3-lane swimlane.
+    fprintf(f, "{\n  \"displayTimeUnit\": \"ns\",\n  \"traceEvents\": [\n");
+    bool first = true;
+    const int32_t nw = g_dist.num_workers;
+
+    // Lane/process name metadata first (so idle lanes still appear).
+    for (int32_t c = 0; c < nw && c < RUNTIME_MAX_WORKER; c++) {
+        DistCore &co = g_dist.cores[c];
+        if (co.block_id < 0 || co.lane < 0) continue;
+        if (!first) fprintf(f, ",\n");
+        first = false;
+        fprintf(f,
+                "    {\"ph\":\"M\",\"name\":\"process_name\",\"pid\":%d,\"args\":{\"name\":\"block%d\"}}",
+                co.block_id, co.block_id);
+        fprintf(f, ",\n    {\"ph\":\"M\",\"name\":\"thread_name\",\"pid\":%d,\"tid\":%d,"
+                   "\"args\":{\"name\":\"%s (core%d)\"}}",
+                co.block_id, co.lane, lane_name(co.lane), c);
+    }
+
+    // Duration events, one per executed (sub)task.
+    for (int32_t c = 0; c < nw && c < RUNTIME_MAX_WORKER; c++) {
+        DistCore &co = g_dist.cores[c];
+        if (co.block_id < 0 || co.lane < 0) continue;
+        for (const TraceEvent &e : co.trace) {
+            char name[48];
+            if (e.func_id >= 0) {
+                snprintf(name, sizeof(name), "f%d#%d", e.func_id, e.task_id);
+            } else {
+                snprintf(name, sizeof(name), "task#%d", e.task_id);
+            }
+            if (!first) fprintf(f, ",\n");
+            first = false;
+            fprintf(f,
+                    "    {\"ph\":\"X\",\"name\":\"%s\",\"pid\":%d,\"tid\":%d,\"ts\":%.3f,\"dur\":%.3f,"
+                    "\"args\":{\"task_id\":%d,\"func_id\":%d,\"core\":%d,\"mc\":%d}}",
+                    name, co.block_id, co.lane, e.ts_us, e.dur_us, e.task_id, e.func_id, c, e.multicore);
+        }
+    }
+
+    fprintf(f, "\n  ]\n}\n");
+    fclose(f);
+    fprintf(stderr, "[dist_engine] swimlane trace written to %s\n", path);
 }

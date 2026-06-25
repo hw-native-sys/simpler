@@ -345,13 +345,18 @@ claim 是单写者、无 orphan、无跨 block 双重认领。
 
 AICPU 模型的全局任务环被移除。两个结构替代它们：
 
-- **每核私有任务环** —— 每个核拥有一个小环，存放它已认领的任务，保存每个任务的
+- **每核私有任务环** —— 每个核拥有一个**小**环，存放它已认领的任务，保存每个任务的
   descriptor + payload + 本地状态（kernel id、args、fan-in producer id）。其他核都不读它；
   无锁。容量：
 
   ```cpp
-  #define PRIVATE_TASK_SLOT_NUM 8
+  #define PRIVATE_TASK_SLOT_NUM 4   // 故意取小：见下方“为何要小”与 §6.1
   ```
+
+  **这个容量是关键调优旋钮，不是越大越好。** 全系统的乱序窗口 = **核数 × `PRIVATE_TASK_SLOT_NUM`**，
+  同时它也封顶了**单个核能比“当前就绪可执行”超前认领多少个任务**。把它开大会让某个快核一口气
+  抢入一长串连续任务再独自串行执行，造成严重负载倾斜（详见 §6.1）。因此应**保持其很小**（如 2–4），
+  让乱序能力主要来自“核数”维度；具体值按 kernel 时长 / 访存延迟实测调优。
 
 - **全局 `task_completed_flag` 环** —— *唯一*全局共享的 per-task 状态：每个任务 id 一个
   一次性置位的布尔，标记完成。各核轮询它以检查某个 fan-in producer 是否已完成。
@@ -370,7 +375,7 @@ AICPU 模型的全局任务环被移除。两个结构替代它们：
 | 作用 | **执行队列**：存放本核已拥有、要*亲自执行*的（子）任务 | anchor → follower 的**投递/交接箱**：暂存多核任务中 anchor 没亲自构建的其余激活槽子任务 |
 | 谁读写 | 仅本核读写，单一 owner、无锁 | anchor 插入（release）、follower 抽取（acquire）、`remaining` 原子递减 |
 | 谁会用到 | 所有任务（含单核 1C/1V） | **仅多核任务（2V / MIX）**；单核任务根本不碰它 |
-| 容量含义 | 默认 8：封顶“单核可超前多少” | 默认 8：封顶“anchor 相对 follower 可超前多少”，满则触发反压（§11.2） |
+| 容量含义 | 默认小（如 4）：封顶“单核可超前多少”，故意取小以抑制负载倾斜（§6.1） | 默认 8：封顶“anchor 相对 follower 可超前多少”，满则触发反压（§11.2） |
 
 **真正的执行永远只发生在各核自己的私有任务环里。** `block.won` 不是执行环，只是把多核子任务从
 anchor **搬运**到 follower 私有环的中转站。两者如何配合：
@@ -390,13 +395,20 @@ remaining 归零时释放该 block.won 条目。
 单核任务（1C / 1V）的胜者直接把唯一子任务写进自己的私有环执行，**没有配对、没有投递、不写
 `block.won`**。
 
-## 6. 核执行循环（Run-Ahead）
+## 6. 核执行循环（执行优先的 Run-Ahead）
 
-每个核运行下面的循环。编排**向前跑（run ahead）**，认领并构建（子）任务，直到私有环填满，
-然后通过执行就绪任务来腾空。填满环就是反压信号。该循环从单个物理核 `self` 的视角写出，它在
-所在 block 中的角色是 `{AIC, AIV0, AIV1}` 之一。竞争按**任务类型**进行（vector 任务由 AIV0/AIV1
-同等竞争）；单核任务胜者独自执行，多核任务胜者作 anchor 并把其余子任务推送给同 block 伙伴
-（§3、§3.1）。
+每个核运行下面的循环。其核心准则是 **“执行优先、认领其次、一次只认领一个”**：每轮循环都
+**先寻找执行机会**（腾空私有环里任何已就绪的任务），**再至多认领一个**新任务——而**不是**先把
+私有环一口气抢满、再开始执行。编排仍会**向前跑（run ahead）**，但只在没有就绪任务可执行时才
+逐个认领，借此把“单核超前认领”限制在很小的范围。这一改动的动机见 §6.1。
+
+该循环从单个物理核 `self` 的视角写出，它在所在 block 中的角色是 `{AIC, AIV0, AIV1}` 之一。
+竞争按**任务类型**进行（vector 任务由 AIV0/AIV1 同等竞争）；单核任务胜者独自执行，多核任务
+胜者作 anchor 并把其余子任务推送给同 block 伙伴（§3、§3.1）。
+
+> 术语对照：本文其余处（§3.1、§11）沿用旧称 **“Phase B”** 指代下方**步骤 1**（执行 / 腾空就绪
+> 任务），**“Phase A”** 指代**步骤 2**（认领新任务）。差别仅在于:执行优先版**每轮只认领一个**、且
+> **认领与执行严格交替**，不再“先把环填满再统一腾空”。
 
 ```text
 # 全局（所有核共享），一个共享任务 id 空间（§2、§3.1）：
@@ -408,58 +420,26 @@ remaining 归零时释放该 block.won 条目。
 #   local_current_task_index : 本核已到达的任务 id
 
 loop:
-    # --- 阶段 A：在编排中向前跑 ---
-    while 私有环有空槽 AND 编排未结束:
-        推进编排到下一个 submit 点                        # 任务 id N
-        local_current_task_index = N
-        M = task.active_mask                             # 记录 1C+1V vs 1C+2V 等
+    # ============================================================================
+    # 执行优先：每轮循环按 步骤0 → 步骤1 → 步骤2 顺序走，一轮只认领【一个】新任务。
+    # 关键修正：不再“先把环填满再执行”。先腾空就绪任务（步骤1），再认领一个（步骤2）；
+    # 认领后立刻回到循环顶部，下一轮又先找执行机会。核在执行一个长任务期间不推进认领，
+    # 这段时间其它核会推进 cursor 认领后续任务 → 负载自然均衡（理由见 §6.1）。
+    # ============================================================================
 
-        # (1) TensorMap 维护是无条件的（胜者、败者、follower 都做）—— §4：
-        #     - 查 INPUT/INOUT tensor    → fan-in producer 任务 id
-        #     - 插 OUTPUT + INOUT tensor → 以本任务 id 作为 producer
-        update_tensormap(task)
-
-        # (2) 确定本任务的类型与 cursor（§2、§3）：
-        #     竞争资格按“类型”，不按固定槽角色：cube 任务由 AIC 竞争；
-        #     vector 任务由所有 AIV 核（AIV0 与 AIV1）竞争。
-        T         = (cube if M.has(aic) else vector)     # 有 AIC → cube；否则 vector（含 1V 与 2V）
-        cursor[T] = (cube_cursor if T==cube else vector_cursor)
-
-        if my_type(self) == T:
-            # 我是该类型的合格竞争者（vector 任务时 AIV0/AIV1 都在此参与）。
-            if popcount(M) > 1 AND block.won 已满:                 # 多核反压：先于认领检查（§11.3）
-                break                                             # 让位给有空闲的 block / 稍后重试；退出 Phase A 去 Phase B
-            # 单原子推进：返回旧值；旧值 < N 即我赢。恰一胜者且无跳过见 §11.1。
-            old = atomic_fetch_max(cursor[T], N)                  # N = local_current_task_index
-            if old < N:                                           # WIN：我是 owner/anchor
-                fanin_ids = resolve_fanin(task)                   # 一次性解析整任务 fan-in（本地 TensorMap）
-                if popcount(M) == 1:
-                    # 单核（1C 或 1V）：我独自执行那唯一的子任务，
-                    # 与我是 AIV0 还是 AIV1 无关，无配对、无推送。
-                    把该唯一子任务构建进一个空闲私有环槽
-                else:
-                    # 多核（2V / MIX）：我是 anchor。构建我自己物理角色对应的槽，
-                    # 把其余激活槽推送给同 block 伙伴（以 id 为键，互不串扰）。§3.1
-                    把我自己角色的槽对应的子任务构建进一个空闲私有环槽
-                    block.won[N] = { active_mask:M, kernels, args, fanin_ids,
-                                     remaining: popcount(M) }      # block-shared（§3.1）
-            # else（old >= N）：已有一个 T 类型的核认领了 N（它跑在前面）→ 跳过
-        # else: 类型不匹配（例如 AIC 核遇到 1V 任务）→ 只做了 TensorMap，跳过
-
-    # --- 抽取 anchor 推送给我的多核子任务（异步，非阻塞）---
+    # --- 步骤 0：抽取 anchor 推送给我的多核子任务（异步、非阻塞）---
     # 同 block 的 anchor 胜出某多核任务后，会把它没亲自构建的其余激活槽放进 block.won。
-    # 本核按自己的物理角色（AIV0→aiv0 / AIV1→aiv1 …）抽取属于自己的那个槽。
+    # 本核按自己的物理角色（AIV0→aiv0 / AIV1→aiv1）抽取属于自己的那个槽。取空就停，不等待。
     while 私有环有空槽 AND block.won 有“我角色对应槽”尚未被本核构建的待处理项:
         从 block.won 取出该子任务，构建进一个空闲私有环槽    # fan-in 已由 anchor 解析好
-        # 注：取空就停；没有投递时不等待，本核继续做自己的活
 
-    # --- 阶段 B：从私有环中腾空就绪的（子）任务 ---
+    # --- 步骤 1：寻找执行机会，腾空就绪的（子）任务（执行优先）---
+    # 每轮都先做这一步：只要 fan-in 已满足就执行，绝不等环填满才开始执行。
     freed = 0
     for each 私有环中已占用的槽:
         if 所有 fan-in producer 的 task_completed_flag == true:    # 依赖已满足（pull）
-            execute(slot)                                          # 调用我的 incore 函数
-            # 完成：多核任务只有一个全局标志，由其共同 owner 中
-            # 最后完成的子任务置位（§3.1）。
+            execute(slot)                                          # 调用我的 incore 函数（长耗时）
+            # 完成：多核任务只有一个全局标志，由其共同 owner 中最后完成的子任务置位（§3.1）。
             if slot.is_multicore:
                 if atomic_dec(block.won[slot.task_id].remaining) == 0:
                     task_completed_flag[slot.task_id] = true       # 最后一个子任务胜出
@@ -469,14 +449,54 @@ loop:
             free(slot)                                             # 释放我自己的槽；无 fanout 计数
             freed++
 
-    if freed == 0:
-        # 环已满且无就绪任务：持续重扫，直到某个 producer（在别的核上）
-        # 置位了我们正在等待的标志，然后执行它。
-        continue            # 重扫阶段 B
-    # 至少腾出一个槽 → 回到阶段 A 去认领更多任务
+    # --- 步骤 2：至多认领【一个】新任务（仅当环有空槽且编排未结束）---
+    # 一次只认领一个，认领后立即回到步骤 0/1 找执行机会，避免一口气把环抢满。
+    # 若步骤 1 没有就绪任务可执行（freed==0），步骤 2 仍会认领一个 → 这就是受控的 run-ahead：
+    # 没活可干时才逐个超前认领，且超前量被私有环容量（很小）封顶。
+    if 私有环有空槽 AND 编排未结束:
+        推进编排到下一个 submit 点                            # 任务 id N
+        local_current_task_index = N
+        M = task.active_mask                                  # 记录 1C+1V vs 1C+2V 等
 
-    if 编排已结束 AND 私有环为空:
-        break               # 本核完成
+        # (a) TensorMap 维护是无条件的（胜者、败者、follower 都做）—— §4：
+        #     - 查 INPUT/INOUT tensor    → fan-in producer 任务 id
+        #     - 插 OUTPUT + INOUT tensor → 以本任务 id 作为 producer
+        update_tensormap(task)
+
+        # (b) 确定本任务的类型与 cursor（§2、§3）：cube 任务由 AIC 竞争；
+        #     vector 任务由所有 AIV 核（AIV0 与 AIV1）竞争。
+        T         = (cube if M.has(aic) else vector)          # 有 AIC → cube；否则 vector（含 1V 与 2V）
+        cursor[T] = (cube_cursor if T==cube else vector_cursor)
+
+        if my_type(self) == T:
+            # 我是该类型的合格竞争者（vector 任务时 AIV0/AIV1 都在此参与）。
+            if popcount(M) > 1 AND block.won 已满:             # 多核反压：本轮不认领（§11.3）
+                pass                                          # 留待步骤 1 腾空 block.won 后的下一轮再试
+            else:
+                # 单原子推进：返回旧值；旧值 < N 即我赢。恰一胜者且无跳过见 §11.1。
+                old = atomic_fetch_max(cursor[T], N)          # N = local_current_task_index
+                if old < N:                                   # WIN：我是 owner/anchor
+                    fanin_ids = resolve_fanin(task)           # 一次性解析整任务 fan-in（本地 TensorMap）
+                    if popcount(M) == 1:
+                        # 单核（1C 或 1V）：独自执行那唯一子任务，与 AIV0/AIV1 身份无关，无配对、无推送。
+                        把该唯一子任务构建进一个空闲私有环槽
+                    else:
+                        # 多核（2V / MIX）：我是 anchor。构建我自己物理角色对应的槽，
+                        # 把其余激活槽推送给同 block 伙伴（以 id 为键，互不串扰）。§3.1
+                        把我自己角色的槽对应的子任务构建进一个空闲私有环槽
+                        block.won[N] = { active_mask:M, kernels, args, fanin_ids,
+                                         remaining: popcount(M) }      # block-shared（§3.1）
+                # else（old >= N）：已有一个 T 类型的核认领了 N（它跑在前面）→ 跳过
+        # else: 类型不匹配（例如 AIC 核遇到 1V 任务）→ 只做了 TensorMap，跳过
+
+    # --- 步骤 3：终止与前向进展 ---
+    if 编排已结束 AND 私有环为空 AND 无针对我的待抽取投递（收尾条件见 §7）:
+        break                                                 # 本核完成
+    if freed == 0 AND (私有环已满 OR 编排已结束):
+        # 这一轮既没执行成任何任务、也无法（或无需）再认领：
+        # 唯一能取得进展的是别的核置位我等待的某个完成标志 → 自旋后重扫步骤 1。
+        spin_wait()
+    # 否则回到 loop 顶部：继续“执行优先、再认领一个”
 ```
 
 性质：
@@ -490,11 +510,39 @@ loop:
 - **每任务一个标志，由最后一个子任务置位。** 单核任务直接置 `task_completed_flag`；多核任务
   递减一个 block-local 计数器（= `popcount(active_mask)`），由最后完成的子任务置位。消费者
   始终看到一个原子完成信号。
-- **反压** = 私有环填满（`PRIVATE_TASK_SLOT_NUM` 个槽）。
+- **执行优先、一次认领一个。** 每轮循环先腾空就绪任务、再至多认领一个；不再“填满环才执行”。
+  这是把单核的“超前认领”量压到很小、避免负载倾斜的关键（§6.1）。
+- **反压** = 私有环填满（`PRIVATE_TASK_SLOT_NUM` 个槽）。私有环很小，所以单核任何时刻最多只
+  比“已就绪可执行”超前这么几个任务。
 - **即时回收槽**：每个共同 owner 在*自己*的子任务完成时释放*自己*的槽。没有全局环尾推进，
   没有跨核的槽复位协调，因为环是私有的。
-- **前向进展**：环满且无就绪任务时重扫（自旋），直到另一个核的完成标志解锁某个任务；一旦腾出
+- **前向进展**：环满且无就绪任务时自旋重扫，直到另一个核的完成标志解锁某个任务；一旦腾出
   一个槽，该核就回到编排去竞争新任务。
+
+### 6.1 为什么“执行优先 + 小环”——乱序窗口与负载均衡
+
+**乱序（out-of-order, OoO）窗口 = 核数 × 私有环槽数。** 这是整个系统在任一时刻能“同时在飞”
+并允许乱序执行的（子）任务上限。它决定了无依赖的后续任务能否绕过排在前面、但尚未就绪的任务
+被尽早执行（避免 head-of-line blocking）。
+
+**旧设计（填满环再执行）为什么会负载倾斜。** `claim + build` 极快，而 `execute` 很慢。若每个核
+都“先把私有环填满再开始执行”，那么跑得最靠前的核会在极短时间内把**一连串连续的任务**全部
+`atomic_fetch_max` 抢进自己的环（把 `cursor` 一路推高），随后独自长时间串行执行这一串任务；
+其它核因 `cursor` 已被推高而**抢不到**这段连续 id → 严重负载不均衡。更糟的是 head-of-line：
+环里靠前但未就绪的任务会一直占着槽，挡住它后面其实已就绪、本可被别的核分担的任务。
+
+**两点改进。**
+
+1. **执行优先（本节伪代码）。** 每轮先腾空就绪任务、只认领一个新任务。核在执行一个长任务期间
+   **不推进认领**，这段时间里其它核会推进 `cursor` 认领后续任务 → 工作自然铺开。认领不再是
+   “抢满即止”的突发，而是“没就绪活干时才逐个超前”的受控行为。
+2. **保持私有环小（缩小 `PRIVATE_TASK_SLOT_NUM`）。** OoO 能力主要应由**核数**这一维度提供，
+   而不是把单核的环开大——开大只会让单核一次能独吞更长的连续任务串，放大倾斜。把环取较小值
+   （如 2–4）即可在保留足够乱序窗口（核数已经不小）的同时，把单核超前量压到最低。环大小应按
+   访存延迟 / kernel 时长实测调优，而非默认开大。
+
+> 一句话：乱序靠“多核 × 小环”，不靠“单核 × 大环”。执行优先确保快核在执行长任务时把后续认领
+> 让给其它核；小环确保即便要超前，超前量也很小。
 
 ## 7. 终止
 
@@ -529,7 +577,7 @@ anchor 推送最后的多核子任务。这不是 per-task 串行阻塞，只发
 | `cursor[T]`：`cube_cursor` / `vector_cursor` | **全局共享** | 每个类型的 claim 高水位线；到达 `N` 时 `old < N` 即胜出并拥有该任务（§2、§3.1） | 单条 `atomic_fetch_max(cursor[T], N)`（无则 CAS 回路），acq-rel；无跳过性证明见 §11.1 |
 | `task_completed_flag` 连续完成前沿 `F` / 回收前沿 `R` | **全局共享** | `F` = 全已完成前缀；`R = F − H` 决定堆/标志环回收（§9.5、§11.3、§11.4） | `F` 协作式 CAS 推进；`R` 派生；单调 |
 | `local_current_task_index` | **每核私有** | 编排进度游标；每次 submit `++` | 普通标量 |
-| **私有任务环**（`PRIVATE_TASK_SLOT_NUM = 8`） | **每核私有** | 保存已拥有的（子）任务：descriptor + payload + 本地状态 + fan-in producer id | 无（单一 owner，无锁） |
+| **私有任务环**（`PRIVATE_TASK_SLOT_NUM`，默认小，如 4） | **每核私有** | 保存已拥有的（子）任务：descriptor + payload + 本地状态 + fan-in producer id；故意取小（OoO 窗口 = 核数 × 槽数，§6.1） | 无（单一 owner，无锁） |
 | `task_completed_flag` 环 | **全局共享** | 每任务 id 一个一次性置位布尔；唯一共享的 per-task 状态 | 最后一个（子）任务 owner 做 release 存储；消费者做 acquire 加载（轮询） |
 | **`block.won[N]` —— 以 id 为键的子任务投递表** | **block-共享** | anchor → follower 的**推送**通道，以任务 id 为键：`{active_mask M, 各激活槽 kernels/args, 已解析 fan-in, 剩余计数}`。anchor 胜出时把其余激活槽子任务投递进来；follower **异步抽取**属于自己槽的项（不阻塞、不按走位等待）。承载每任务剩余计数，互不串扰（§3.1）。填满时 anchor 暂缓认领新多核任务（反压） | anchor 插入（release）；follower 抽取（acquire）；`remaining` 原子递减；最后一个子任务完成时释放条目 |
 
@@ -718,12 +766,12 @@ anchor 推送最后的多核子任务。这不是 per-task 串行阻塞，只发
 
 ### 11.2 `block.won` 容量与反压（原“`block.won` 投递表大小与偏移”）
 
-- **容量**：每 block 一个小定长环，`BLOCK_WON_SLOTS`（默认 = `PRIVATE_TASK_SLOT_NUM` = 8）个条目，
+- **容量**：每 block 一个小定长环，`BLOCK_WON_SLOTS`（默认 = `PRIVATE_TASK_SLOT_NUM`）个条目，
   每条目 = 一个多核任务推送给本 block 的子任务集 + 剩余计数。界限依据：anchor 的超前量本就被其
-  自身私有环（8）封顶，每赢一个多核任务至多占 anchor 1 个环槽 + 1 个 `block.won` 条目，故 8 足够
-  （可更小）。
-- **反压（已落入 §6 伪代码）**：anchor 在**认领之前**检查 `block.won` 是否有空位；满则**不认领**
-  （不执行 `fetch_max`），退出 Phase A 去 Phase B 执行就绪任务（从而让 follower 抽取、腾空
+  自身私有环（很小，§5/§6.1）封顶，每赢一个多核任务至多占 anchor 1 个环槽 + 1 个 `block.won`
+  条目，故与私有环同样大小即足够（可更小）。
+- **反压（已落入 §6 伪代码）**：anchor 在**认领之前**（步骤 2）检查 `block.won` 是否有空位；满则
+  **本轮不认领**（不执行 `fetch_max`），下一轮回到步骤 1 执行就绪任务（从而让 follower 抽取、腾空
   `block.won`）。被让出的多核任务由**另一个有空闲的 block 的 anchor 认领**（天然负载均衡）或本核
   稍后重试。
 - **无死锁**：根任务无依赖恒就绪；执行持续腾空私有环与 `block.won`；DAG 无环 → 前向进展恒成立。

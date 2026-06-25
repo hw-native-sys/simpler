@@ -596,6 +596,9 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
                 while (__atomic_load_n(&runtime->dist.done_count, __ATOMIC_ACQUIRE) < num_workers) {
                     SPIN_WAIT_HINT();
                 }
+                // All workers done (single-threaded here): emit the per-core
+                // execution swimlane if PTO_DIST_SWIMLANE is set (else no-op).
+                dist_engine_dump_trace();
                 rt->ops = saved_ops;
                 if (dist_trace)
                     fprintf(stderr, "[dist] Thread %d: all %d distributed workers finished\n", thread_idx, num_workers);

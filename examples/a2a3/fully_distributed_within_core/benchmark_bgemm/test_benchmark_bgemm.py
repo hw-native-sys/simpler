@@ -85,6 +85,22 @@ class TestBenchmarkBgemm(SceneTestCase):
             "config": {"aicpu_thread_num": 4, "block_dim": 3},
             "params": {"matmul_add_task_num": 32, "incore_data_size": 64, "incore_loop": 1, "grid_k": 4},
         },
+        {
+            # Full-core swimlane visualization: block_dim == a2a3sim capacity
+            # (PLATFORM_MAX_BLOCKDIM=24 → 24 AIC + 48 AIV = 72 cores). 240 GEMM
+            # (1C) + 240 ADD (1V) tasks so every one of the 24 AIC blocks gets
+            # ~10 GEMMs, filling all lanes. Manual (opt-in) so it does not slow
+            # the default suite. Capture a swimlane with:
+            #   PTO_DIST_SWIMLANE=$PWD/outputs/dist_swimlane/bgemm_fullcore.json \
+            #     python test_benchmark_bgemm.py -p a2a3sim --case FullCore24 --manual include
+            #   python -m simpler_setup.tools.dist_swimlane_render \
+            #     outputs/dist_swimlane/bgemm_fullcore.json --names 0=GEMM,1=ADD
+            "name": "FullCore24",
+            "manual": True,
+            "platforms": ["a2a3sim", "a2a3"],
+            "config": {"aicpu_thread_num": 4, "block_dim": 24},
+            "params": {"matmul_add_task_num": 240, "incore_data_size": 128, "incore_loop": 4, "grid_k": 2},
+        },
     ]
 
     def generate_args(self, params):
