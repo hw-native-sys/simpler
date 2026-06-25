@@ -158,17 +158,18 @@ int finalize_device(DeviceContextHandle ctx);
 /**
  * Stage a callable for repeated cheap launches under the given `callable_id`.
  *
- * Uploads child kernels into the DeviceRunner's func_id-keyed cache and
- * copies the orchestration SO bytes into a device-resident buffer keyed by
- * the SO's ELF Build-ID hash (so two callable_ids with identical SO share
- * one buffer). Subsequent `run_prepared(callable_id, ...)` calls reuse this
- * state.
+ * Uploads child kernels into the DeviceRunner's func_id-keyed cache, copies
+ * the orchestration SO bytes into a device-resident buffer keyed by the SO's
+ * ELF Build-ID hash (so two callable_ids with identical SO share one buffer),
+ * and prewarms device-orchestration callables by loading their AICPU-side SO
+ * table entry before the first real task. Subsequent
+ * `run_prepared(callable_id, ...)` calls reuse this state.
  *
  * `device_id` and the executor binaries are not threaded through this entry
  * — they were captured by `simpler_init` and live on the DeviceRunner.
  *
  * @return 0 on success, negative on error (NULL ctx, callable_id out of
- *         range, or upload/copy failure).
+ *         range, upload/copy failure, or AICPU prewarm failure).
  */
 int prepare_callable(DeviceContextHandle ctx, int32_t callable_id, const void *callable);
 
@@ -178,9 +179,10 @@ int prepare_callable(DeviceContextHandle ctx, int32_t callable_id, const void *c
  * Looks up the prepared state by `callable_id`, restores the kernel func_id ↔
  * dev_addr table onto a fresh Runtime, and dispatches without re-uploading
  * kernels or re-copying the orch SO. The AICPU side dispatches via
- * `orch_so_table_[callable_id]` (see runtime.h::set_active_callable_id). The
- * first run for a given callable_id sets `register_new_callable_id_` so the
- * AICPU does its one-time dlopen.
+ * `orch_so_table_[callable_id]` (see runtime.h::set_active_callable_id).
+ * Successful TRB prepare has already populated that table; if a future
+ * fallback leaves a callable prepared but not prewarmed, the first successful
+ * run commits the AICPU seen state only after the device-side load succeeds.
  *
  * `device_id` and the executor binaries are not threaded through this entry
  * — they were captured by `simpler_init` and live on the DeviceRunner.
@@ -190,20 +192,19 @@ int prepare_callable(DeviceContextHandle ctx, int32_t callable_id, const void *c
  * entry and partially populated on early-error returns.
  *
  * `ring_task_window` / `ring_heap` / `ring_dep_pool` are per-task ring sizing
- * overrides (0 = unset, scalar value broadcasts to every ring). The three
- * per-ring arrays have four entries each and selectively override individual
- * ring depths when an entry is nonzero. Precedence per ring: per-ring entry >
- * scalar per-task value > PTO2_RING_* env var > compile-time default.
- * Consumed by tensormap_and_ringbuffer only; other runtime variants accept
- * and ignore them.
+ * overrides, each a per-scope-depth-ring array of RUNTIME_ENV_RING_COUNT
+ * entries (0 = unset). A nonzero entry overrides that ring; a 0 entry falls
+ * through. Precedence per ring: per-ring entry > PTO2_RING_* env var >
+ * compile-time default. A "size every ring the same" request is broadcast to
+ * all entries by the caller. Consumed by tensormap_and_ringbuffer only; other
+ * runtime variants accept and ignore them.
  *
  * @return 0 on success, negative on error (no prep state, NULL ctx, etc.).
  */
 int run_prepared(
     DeviceContextHandle ctx, RuntimeHandle runtime, int32_t callable_id, const void *args, int block_dim,
     int aicpu_thread_num, int enable_l2_swimlane, int enable_dump_tensor, int enable_pmu, int enable_dep_gen,
-    int enable_scope_stats, uint64_t ring_task_window, uint64_t ring_heap, uint64_t ring_dep_pool,
-    const uint64_t *ring_task_windows, const uint64_t *ring_heaps, const uint64_t *ring_dep_pools,
+    int enable_scope_stats, const uint64_t *ring_task_window, const uint64_t *ring_heap, const uint64_t *ring_dep_pool,
     const char *output_prefix, PtoRunTiming *out_timing
 );
 

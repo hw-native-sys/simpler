@@ -530,6 +530,12 @@ struct alignas(64) PTO2SpscQueue {
         uint64_t t = tail_.load(std::memory_order_acquire);
         return h - t;
     }
+
+    // Full ⟺ the producer's next push() would fail: size has reached the
+    // usable capacity (mask_ = capacity - 1, one slot reserved as sentinel).
+    // Used by the wiring-queue deadlock detector to prove the orchestrator is
+    // blocked in push().
+    bool full() const { return size() >= mask_; }
 };
 
 static_assert(sizeof(PTO2SpscQueue) == 5 * 64, "PTO2SpscQueue must be exactly 5 cache lines (320B)");
@@ -580,6 +586,10 @@ struct PTO2SchedulerState {
 
         // --- Cache Line 1+: Thread 0 only (wiring dep_pool) ---
         alignas(64) PTO2DepListPool dep_pool;
+        // One-shot latch for the wiring-queue deadlock report (thread 0 only):
+        // the drain breaks on dep_pool exhaustion every call while wedged, so
+        // the tier-1 structural diagnostic is emitted once, not per call.
+        bool dep_deadlock_reported = false;
 #if PTO2_PROFILING
         // Published only for scope_stats; orchestrator must not read dep_pool's non-atomic counters directly.
         alignas(64) std::atomic<int32_t> dep_pool_snapshot_tail;
@@ -662,6 +672,13 @@ struct PTO2SchedulerState {
 
         // --- Orchestrator write, thread 0 read ---
         alignas(64) std::atomic<bool> orch_needs_drain{false};
+        // Set to 1 only while the orchestrator is actually spinning in
+        // queue.push() (queue full), cleared on a successful push. The wiring
+        // deadlock detector reads this as the producer-blocked observable: it
+        // proves the orchestrator is stuck BEFORE its scope_end, as opposed to
+        // having just filled the queue with its last in-scope push and being
+        // about to call scope_end (which would release the head -> no deadlock).
+        std::atomic<int32_t> producer_blocked{0};
     } wiring;
 
     static_assert(
@@ -724,6 +741,48 @@ struct PTO2SchedulerState {
                         rss.publish_dep_pool_snapshot();
                     }
 #endif
+                    // dep_pool can't reclaim because the reclaim watermark is
+                    // wedged. This runs on the scheduler thread, so unlike
+                    // alloc()'s detector it cannot self-observe that the
+                    // orchestrator is blocked; wiring.producer_blocked is the
+                    // external certificate -- the orchestrator sets it ONLY while
+                    // it is actually spinning in queue.push() (cleared on a
+                    // successful push), so the "just filled the queue then called
+                    // scope_end" case (push succeeded -> flag stays 0) cannot trip
+                    // a false report. With the producer provably stuck in push
+                    // (program-order before its scope_end) AND the head COMPLETED,
+                    // all consumers released, scope still open (only scope_end
+                    // frees it), scope_end can never run -> provable head-of-line
+                    // deadlock. The producer-blocked gate also pins the head:
+                    // scope_end has not run, so the scope-gated head cannot be
+                    // CONSUMED/reset concurrently while we read it.
+                    if (!rss.dep_deadlock_reported && wiring.producer_blocked.load(std::memory_order_acquire) != 0) {
+                        int32_t last_alive = rss.last_task_alive;
+                        PTO2TaskSlotState &h = rss.ring->get_slot_state_by_task_id(last_alive);
+                        // Read the head under its fanout_lock: fanout_count is a
+                        // lock-protected field, and one snapshot keeps the check
+                        // and the report consistent.
+                        h.lock_fanout();
+                        int32_t state = h.task_state.load(std::memory_order_acquire);
+                        uint32_t fc = h.fanout_count;
+                        uint32_t rc = h.fanout_refcount.load(std::memory_order_acquire);
+                        h.unlock_fanout();
+                        bool head_scope_gated = (state == PTO2_TASK_COMPLETED) && (rc == (fc & ~PTO2_FANOUT_SCOPE_BIT));
+                        if (head_scope_gated) {
+                            rss.dep_deadlock_reported = true;
+                            report_wiring_deadlock(rss, wfanin, last_alive, state, fc, rc);
+                            // Latch the shared fatal so both sides exit fast off
+                            // one error code: the scheduler cold-path poll
+                            // (handle_orchestrator_exit) emergency_shutdowns, and
+                            // the orchestrator's push spin breaks out and unwinds.
+                            if (rss.dep_pool.error_code_ptr != nullptr) {
+                                int32_t expected = PTO2_ERROR_NONE;
+                                rss.dep_pool.error_code_ptr->compare_exchange_strong(
+                                    expected, PTO2_ERROR_DEP_POOL_OVERFLOW, std::memory_order_acq_rel
+                                );
+                            }
+                        }
+                    }
                     break;  // not enough dep_pool space — keep remainder for next call
                 }
             }
@@ -734,6 +793,31 @@ struct PTO2SchedulerState {
         }
 
         return wired;
+    }
+
+    // Tier-1 structural diagnostic for a provable wiring-queue deadlock (head
+    // COMPLETED + all consumers released + scope still open, dep_pool exhausted,
+    // orchestrator provably blocked in push). The head snapshot (state/fc/rc) is
+    // taken under fanout_lock by the caller and passed in, so the report agrees
+    // with the check and reads no lock-protected field unlocked.
+    void report_wiring_deadlock(
+        RingSchedState &rss, int32_t wfanin, int32_t last_alive, int32_t state, uint32_t fc, uint32_t rc
+    ) {
+        LOG_ERROR("========================================");
+        LOG_ERROR("FATAL: Wiring-Queue Deadlock - Dep Pool Exhausted!");
+        LOG_ERROR("========================================");
+        LOG_ERROR("Head task %d COMPLETED, all consumers released, scope still open ->", last_alive);
+        LOG_ERROR("only scope_end can free it, but the orchestrator is blocked on a full wiring");
+        LOG_ERROR("queue (in push, before its scope_end). Provable head-of-line deadlock.");
+        LOG_ERROR(
+            "  Head task %d: state=%d, consumers=%u/%u, scope_released=%d", last_alive, state,
+            rc & ~PTO2_FANOUT_SCOPE_BIT, fc & ~PTO2_FANOUT_SCOPE_BIT, (rc & PTO2_FANOUT_SCOPE_BIT) ? 1 : 0
+        );
+        LOG_ERROR("  Dep pool:   used=%d/%d, needed=%d entries", rss.dep_pool.used(), rss.dep_pool.capacity, wfanin);
+        LOG_ERROR("Solution:");
+        LOG_ERROR("  The open scope's fanout exceeds the dep pool. Either split the scope, or");
+        LOG_ERROR("  raise PTO2_RING_DEP_POOL (compile-time PTO2_DEP_LIST_POOL_SIZE).");
+        LOG_ERROR("========================================");
     }
 
     // Route a ready slot to the right global queue. Dummy tasks (empty
@@ -791,20 +875,33 @@ struct PTO2SchedulerState {
     }
 
     void check_and_handle_consumed(PTO2TaskSlotState &slot_state) {
-        if (slot_state.fanout_refcount.load(std::memory_order_acquire) != slot_state.fanout_count) return;
-
-        PTO2TaskState expected = PTO2_TASK_COMPLETED;
-        if (!slot_state.task_state.compare_exchange_strong(
+        // Read fanout_refcount/fanout_count and flip COMPLETED->CONSUMED under
+        // fanout_lock. The orchestrator claims producers (fanout_count++) under the
+        // same lock, so the consume decision is serialized against a concurrent
+        // claim: either the ++ lands first (count then exceeds refcount, so we do
+        // not consume and the producer stays pinned until released) or the consume
+        // lands first (the orchestrator then observes CONSUMED and skips the
+        // claim). Without this lock a claim racing the consume desyncs the slot's
+        // refcount and wedges in-order reclaim.
+        bool became_consumed = false;
+        slot_state.lock_fanout();
+        if (slot_state.fanout_refcount.load(std::memory_order_acquire) == slot_state.fanout_count) {
+            PTO2TaskState expected = PTO2_TASK_COMPLETED;
+            became_consumed = slot_state.task_state.compare_exchange_strong(
                 expected, PTO2_TASK_CONSUMED, std::memory_order_acq_rel, std::memory_order_acquire
-            )) {
-            return;
+            );
         }
+        slot_state.unlock_fanout();
+        if (!became_consumed) return;
 
 #if PTO2_SCHED_PROFILING
         tasks_consumed.fetch_add(1, std::memory_order_relaxed);
 #endif
 
         int32_t ring_id = slot_state.ring_id;
+        // advance_ring_pointers (and the reset_for_reuse it triggers) MUST run
+        // outside fanout_lock: reset_for_reuse stores fanout_lock=0 and would
+        // clobber a held lock. Safe here — the slot is CONSUMED and quiescent.
         // Try-lock — if another thread is advancing this ring, it will scan our CONSUMED task
         int32_t expected_lock = 0;
         if (ring_sched_states[ring_id].advance_lock.compare_exchange_strong(
@@ -817,28 +914,32 @@ struct PTO2SchedulerState {
 
 #if PTO2_ORCH_PROFILING || PTO2_SCHED_PROFILING
     void check_and_handle_consumed(PTO2TaskSlotState &slot_state, uint64_t &atomic_count) {
-        int32_t fc = slot_state.fanout_count;
-        int32_t rc = slot_state.fanout_refcount.load(std::memory_order_acquire);
-
-        atomic_count += 2;  // fanout_count.load + fanout_refcount.load
-
-        if (rc != fc) return;
-
-        PTO2TaskState expected = PTO2_TASK_COMPLETED;
-        if (!slot_state.task_state.compare_exchange_strong(
+        // See the non-profiling overload for why the read + COMPLETED->CONSUMED
+        // flip is serialized against the orchestrator's claim under fanout_lock.
+        bool became_consumed = false;
+        slot_state.lock_fanout();
+        atomic_count += 1;  // lock CAS
+        uint32_t fc = slot_state.fanout_count;
+        uint32_t rc = slot_state.fanout_refcount.load(std::memory_order_acquire);
+        atomic_count += 1;  // fanout_refcount.load (fanout_count is a plain read under lock)
+        if (rc == fc) {
+            PTO2TaskState expected = PTO2_TASK_COMPLETED;
+            became_consumed = slot_state.task_state.compare_exchange_strong(
                 expected, PTO2_TASK_CONSUMED, std::memory_order_acq_rel, std::memory_order_acquire
-            )) {
-            atomic_count += 1;  // failed CAS
-            return;
+            );
+            atomic_count += 1;  // CAS
         }
-
-        atomic_count += 1;  // successful CAS
+        slot_state.unlock_fanout();
+        atomic_count += 1;  // unlock store
+        if (!became_consumed) return;
 
 #if PTO2_SCHED_PROFILING
         tasks_consumed.fetch_add(1, std::memory_order_relaxed);
 #endif
 
         int32_t ring_id = slot_state.ring_id;
+        // advance_ring_pointers + reset_for_reuse run outside fanout_lock (reset
+        // stores fanout_lock=0). Safe — the slot is CONSUMED and quiescent.
         // Try-lock — if another thread is advancing this ring, it will scan our CONSUMED task
         int32_t expected_lock = 0;
         if (ring_sched_states[ring_id].advance_lock.compare_exchange_strong(
@@ -858,9 +959,25 @@ struct PTO2SchedulerState {
         check_and_handle_consumed(slot_state);
     }
 
+    // Scope-end release: sets bit31 (PTO2_FANOUT_SCOPE_BIT) instead of bumping a
+    // consumer ref. Called exactly once per task from on_scope_end. Keeping it a
+    // distinct add lets a consumer release leave the scope bit unset, so "all
+    // consumers done but scope still open" stays distinguishable from "fully
+    // consumed".
+    void release_producer_scope(PTO2TaskSlotState &slot_state) {
+        slot_state.fanout_refcount.fetch_add(PTO2_FANOUT_SCOPE_BIT, std::memory_order_acq_rel);
+        check_and_handle_consumed(slot_state);
+    }
+
 #if PTO2_ORCH_PROFILING || PTO2_SCHED_PROFILING
     void release_producer(PTO2TaskSlotState &slot_state, uint64_t &atomic_count) {
         slot_state.fanout_refcount.fetch_add(1, std::memory_order_acq_rel);
+        atomic_count += 1;  // fanout_refcount.fetch_add
+        check_and_handle_consumed(slot_state, atomic_count);
+    }
+
+    void release_producer_scope(PTO2TaskSlotState &slot_state, uint64_t &atomic_count) {
+        slot_state.fanout_refcount.fetch_add(PTO2_FANOUT_SCOPE_BIT, std::memory_order_acq_rel);
         atomic_count += 1;  // fanout_refcount.fetch_add
         check_and_handle_consumed(slot_state, atomic_count);
     }
@@ -951,13 +1068,13 @@ struct PTO2SchedulerState {
         if (count > 0) __builtin_prefetch(task_slot_states[0], 1, 0);
         for (int32_t i = 0; i < count; i++) {
             if (i + 1 < count) __builtin_prefetch(task_slot_states[i + 1], 1, 0);
-            release_producer(*task_slot_states[i], g_orch_scope_end_atomic_count);
+            release_producer_scope(*task_slot_states[i], g_orch_scope_end_atomic_count);
         }
 #else
         if (count > 0) __builtin_prefetch(task_slot_states[0], 1, 0);
         for (int32_t i = 0; i < count; i++) {
             if (i + 1 < count) __builtin_prefetch(task_slot_states[i + 1], 1, 0);
-            release_producer(*task_slot_states[i]);
+            release_producer_scope(*task_slot_states[i]);
         }
 #endif
     }

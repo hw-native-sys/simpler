@@ -31,7 +31,7 @@ KERNELS_BASE = "../../../../../../examples/a2a3/tensormap_and_ringbuffer/vector_
 
 
 @scene_test(level=2, runtime="tensormap_and_ringbuffer")
-class TestTensorDump(SceneTestCase):
+class TestArgsDump(SceneTestCase):
     """args_dump capture smoke, level-aware on the ``--dump-args`` level.
 
     Uses ``partial_dump_orch`` (5 tasks; four carry ``dump(...)`` markers) so a
@@ -103,7 +103,7 @@ class TestTensorDump(SceneTestCase):
         level = int(request.config.getoption("--dump-args", default=0))
         if not level:
             return
-        safe_label = _sanitize_for_filename("TestTensorDump_default")
+        safe_label = _sanitize_for_filename("TestArgsDump_default")
         matches = sorted(_outputs_dir().glob(f"{safe_label}_*"), key=lambda p: p.stat().st_mtime)
         assert matches, "args dump output directory missing"
         dump_dir = matches[-1] / "args_dump"

@@ -201,15 +201,14 @@ int SimDeviceRunnerBase::device_memset(void *dev_ptr, int value, size_t bytes) {
     return 0;
 }
 
-int SimDeviceRunnerBase::prepare_orch_so(Runtime &runtime) {
-    const int32_t cid = runtime.get_active_callable_id();
+int SimDeviceRunnerBase::stamp_orch_so(Runtime &runtime, int32_t cid, bool force_reload) {
     if (cid < 0) {
-        LOG_ERROR("prepare_orch_so: no active callable_id; prepared-callable flow required");
+        LOG_ERROR("stamp_orch_so: invalid callable_id=%d", cid);
         return -1;
     }
     auto it = callables_.find(cid);
     if (it == callables_.end()) {
-        LOG_ERROR("prepare_orch_so: callable_id=%d not registered", cid);
+        LOG_ERROR("stamp_orch_so: callable_id=%d not registered", cid);
         return -1;
     }
     const auto &state = it->second;
@@ -220,17 +219,71 @@ int SimDeviceRunnerBase::prepare_orch_so(Runtime &runtime) {
         runtime.set_active_callable_id(cid, /*is_new=*/false);
         return 0;
     }
-    const bool first_sighting = aicpu_seen_callable_ids_.insert(cid).second;
-    if (first_sighting) {
-        ++aicpu_dlopen_total_;
-    }
+    const bool needs_load = force_reload || (aicpu_seen_callable_ids_.count(cid) == 0);
     runtime.set_dev_orch_so(state.dev_orch_so_addr, state.dev_orch_so_size);
-    runtime.set_active_callable_id(cid, first_sighting);
+    runtime.set_device_orch_func_name(state.func_name.c_str());
+    runtime.set_device_orch_config_name(state.config_name.c_str());
+    runtime.set_active_callable_id(cid, needs_load);
     LOG_INFO_V0(
-        "Orch SO prepared cid=%d hash=0x%lx %zu bytes (is_new=%d)", cid, state.hash, state.dev_orch_so_size,
-        first_sighting ? 1 : 0
+        "Orch SO stamped cid=%d hash=0x%lx %zu bytes (needs_load=%d)", cid, state.hash, state.dev_orch_so_size,
+        needs_load ? 1 : 0
     );
     return 0;
+}
+
+int SimDeviceRunnerBase::prepare_orch_so(Runtime &runtime) {
+    const int32_t cid = runtime.get_active_callable_id();
+    if (cid < 0) {
+        LOG_ERROR("prepare_orch_so: no active callable_id; prepared-callable flow required");
+        return -1;
+    }
+    return stamp_orch_so(runtime, cid, /*force_reload=*/false);
+}
+
+int SimDeviceRunnerBase::commit_aicpu_callable_load(int32_t cid) {
+    auto it = callables_.find(cid);
+    if (it == callables_.end()) {
+        LOG_ERROR("commit_aicpu_callable_load: callable_id=%d not registered", cid);
+        return -1;
+    }
+    if (it->second.host_dlopen_handle != nullptr) {
+        return 0;
+    }
+    const bool inserted = aicpu_seen_callable_ids_.insert(cid).second;
+    if (inserted) {
+        ++aicpu_dlopen_total_;
+        LOG_INFO_V0("AICPU callable load committed cid=%d (count=%zu)", cid, aicpu_dlopen_total_);
+    }
+    return 0;
+}
+
+int SimDeviceRunnerBase::prewarm_callable(int32_t callable_id) {
+    auto it = callables_.find(callable_id);
+    if (it == callables_.end()) {
+        LOG_ERROR("prewarm_callable: callable_id=%d not registered", callable_id);
+        return -1;
+    }
+    if (it->second.host_dlopen_handle != nullptr) {
+        return 0;
+    }
+
+    int rc = ensure_device_initialized();
+    if (rc != 0) {
+        LOG_ERROR("prewarm_callable: ensure_device_initialized failed: %d", rc);
+        return rc;
+    }
+
+    Runtime runtime;
+    rc = stamp_orch_so(runtime, callable_id, /*force_reload=*/true);
+    if (rc != 0) return rc;
+
+    rc = invoke_aicpu_prewarm(runtime);
+    if (rc != 0) {
+        LOG_ERROR("prewarm_callable: invoke_aicpu_prewarm failed: %d", rc);
+        return rc;
+    }
+
+    return commit_aicpu_callable_load(callable_id);
 }
 
 int SimDeviceRunnerBase::register_callable(

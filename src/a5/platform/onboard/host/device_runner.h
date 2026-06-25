@@ -226,8 +226,11 @@ private:
     // Called from finalize() only on the device-poison path (device_unusable_).
     // Safe because onboard work always holds an exclusive task-submit lock on
     // the card (.claude/rules/running-onboard.md) and the reset is verified to
-    // scope to this card only (does not disturb other devices).
-    void force_reset_device();
+    // scope to this card only (does not disturb other devices). Returns 0 on
+    // success, non-zero if the reset did not run or failed, so finalize() can
+    // keep a still-poisoned card flagged instead of clearing device_unusable_
+    // unconditionally.
+    int force_reset_device();
 
     /**
      * Initialize performance profiling device buffers

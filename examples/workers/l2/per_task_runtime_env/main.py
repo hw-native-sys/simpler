@@ -9,17 +9,21 @@
 # -----------------------------------------------------------------------------------------------------------
 """L2 Worker API demo — per-task ring sizing via ``CallConfig.runtime_env``.
 
-Runs the same vector_add kernel three times on one L2 Worker, each time with a
-different ``CallConfig.runtime_env`` (ring buffer sizing). Ring sizing is a
-per-run knob carried on ``CallConfig`` — no process-wide ``PTO2_RING_*`` env
-export needed, and each ``worker.run`` binds its ring buffers from the config
-it was handed.
+Runs the same vector_add kernel several times on one L2 Worker, each time with
+a different ``CallConfig.runtime_env`` (ring buffer sizing) — covering both the
+scalar form (one value broadcast to every ring) and the per-ring form (each
+scope-depth ring sized independently). Ring sizing is a per-run knob carried on
+``CallConfig`` — no process-wide ``PTO2_RING_*`` env export needed, and each
+``worker.run`` binds its ring buffers from the config it was handed.
 
-    runtime_env fields (0 / unset => fall back to env var / compile default):
-      ring_task_window   power of 2, >= 4
-      ring_heap          bytes per ring, >= 1024
-      ring_dep_pool      4 .. INT32_MAX
-    Precedence: runtime_env field > PTO2_RING_* env var > compile-time default.
+    Each runtime_env field takes EITHER a scalar (broadcast to every ring) OR a
+    4-entry list (one per scope-depth ring 0..3; a 0 entry falls through). Unset
+    (0) falls back to the env var / compile default.
+        ring_task_window    power of 2 in [4, INT32_MAX]
+        ring_heap           bytes per ring, >= 1024
+        ring_dep_pool       4 .. INT32_MAX
+    Precedence per resource and ring:
+      per-ring CallConfig entry > per-ring env > scalar env > default.
 
 See ../vector_add/main.py for the full L2 lifecycle walk-through; this example
 reuses that kernel verbatim and only varies the per-run ring configuration.
@@ -59,12 +63,29 @@ N_COLS = 128
 N_ELEMS = N_ROWS * N_COLS
 NBYTES = N_ELEMS * 4  # float32
 
+# RuntimeEnv keys a config dict may carry. Each takes a scalar (broadcast to
+# every ring) or a 4-entry list (one value per scope-depth ring).
+RING_FIELDS = ("ring_task_window", "ring_heap", "ring_dep_pool")
+
 # (label, runtime_env dict or None). None => no override; falls back to the
 # PTO2_RING_* env var / compile-time default. Same kernel + same inputs run
-# under every sizing, so all three produce identical (correct) output.
+# under every sizing, so all of them produce identical (correct) output.
 RING_CONFIGS = [
-    ("small_ring", {"ring_task_window": 16, "ring_heap": 1 * 1024 * 1024, "ring_dep_pool": 64}),
-    ("large_ring", {"ring_task_window": 128, "ring_heap": 8 * 1024 * 1024, "ring_dep_pool": 256}),
+    # Scalar form: one value broadcast to every ring.
+    ("scalar_small", {"ring_task_window": 16, "ring_heap": 1 * 1024 * 1024, "ring_dep_pool": 64}),
+    ("scalar_large", {"ring_task_window": 128, "ring_heap": 8 * 1024 * 1024, "ring_dep_pool": 256}),
+    # Per-ring form: each scope-depth ring (0..3) sized independently. Ring 0 is
+    # the shallow ring the kernel actually drives, so it gets the most headroom;
+    # the deeper rings taper down. Confirm the effective sizes with
+    # --enable-scope-stats (see scope_stats/scope_stats.jsonl).
+    (
+        "per_ring",
+        {
+            "ring_task_window": [128, 64, 32, 16],
+            "ring_heap": [8 * 1024 * 1024, 4 * 1024 * 1024, 2 * 1024 * 1024, 1 * 1024 * 1024],
+            "ring_dep_pool": [256, 128, 64, 64],
+        },
+    ),
     ("env_or_default", None),
 ]
 
@@ -115,12 +136,16 @@ def build_chip_callable(platform: str) -> ChipCallable:
 
 
 def _make_config(ring: Optional[dict]) -> CallConfig:
-    """Build a CallConfig, attaching this run's ring sizing under runtime_env."""
+    """Build a CallConfig, attaching this run's ring sizing under runtime_env.
+
+    Sets whichever of the scalar / per-ring keys the dict carries; the same
+    helper serves both the scalar and per-ring configs above.
+    """
     cfg = CallConfig()
     if ring is not None:
-        cfg.runtime_env.ring_task_window = ring["ring_task_window"]
-        cfg.runtime_env.ring_heap = ring["ring_heap"]
-        cfg.runtime_env.ring_dep_pool = ring["ring_dep_pool"]
+        for key in RING_FIELDS:
+            if key in ring:
+                setattr(cfg.runtime_env, key, ring[key])
     return cfg
 
 

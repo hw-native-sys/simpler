@@ -37,7 +37,7 @@ class TestSpmdSyncStartAiv(SceneTestCase):
                 "source": "../spmd_multiblock_aiv/kernels/aiv/kernel_spmd_write.cpp",
                 "core_type": "aiv",
                 # Single-AIV task: one INOUT tensor in args[]. Declare it so the
-                # tensor dump's per-subtask sum matches the payload (1).
+                # args dump's per-subtask sum matches the payload (1).
                 "signature": [D.INOUT],
             },
         ],

@@ -12,13 +12,21 @@
 #pragma once
 #include <cstdint>
 
+// Upper bound on AICPU gate threads / slots, and the size of the
+// `aicpu_allowed_cpus[]` table the host writes into Runtime. Single source of
+// truth: the filter gate barriers/classifies at most this many threads, and
+// `allowed_count` (the number of survivor cpu_ids) is bounded by it — so the
+// Runtime ABI array must be exactly this long. Keep the runtime structs and
+// the gate in lockstep by referencing this constant instead of a literal.
+constexpr int32_t MAX_GATE_THREADS = 16;
+
 // Returns true if this thread should call aicpu_execute().
 // Returns false if this thread should exit (dropped).
 // logical_count: desired active threads (from runtime.aicpu_thread_num)
 // total_launched: actual threads launched (PLATFORM_MAX_AICPU_THREADS_JUST_FOR_LAUNCH)
 //
-// Used by a2a3 (cluster-majority heuristic) and a5 sim. a5 onboard uses the
-// _filter variant below instead.
+// Used by sim platforms. a2a3/a5 onboard use the _filter variant below
+// instead.
 bool platform_aicpu_affinity_gate(int32_t logical_count, int32_t total_launched);
 
 // Filter-style affinity gate. Every launched thread reads sched_getcpu(),
@@ -28,11 +36,9 @@ bool platform_aicpu_affinity_gate(int32_t logical_count, int32_t total_launched)
 // platform_aicpu_affinity_thread_idx() and drives role assignment
 // downstream (sched / orch).
 //
-// Convention used by a5: indices 0..allowed_count-2 are scheduler slots,
-// index allowed_count-1 is the orchestrator slot. The host builds
-// `allowed_cpus` from device-side OCCUPY + DSMI CPU_TOPO via
-// `pto::a5::compute_allowed_cpus` (see
-// src/a5/platform/onboard/host/aicpu_topology_probe.h) and passes the
+// Convention used by tensormap_and_ringbuffer: indices 0..allowed_count-2
+// are scheduler slots, index allowed_count-1 is the orchestrator slot. The
+// host builds `allowed_cpus` from platform topology/OCCUPY and passes the
 // array down through the Runtime struct.
 //
 // total_launched is the number of AICPU threads CANN actually launched

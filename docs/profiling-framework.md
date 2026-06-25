@@ -11,7 +11,7 @@ the collectors themselves still carry.
 The per-collector pages
 ([pmu-profiling.md](dfx/pmu-profiling.md),
 [l2-swimlane-profiling.md](dfx/l2-swimlane-profiling.md),
-[tensor-dump.md](dfx/tensor-dump.md),
+[args-dump.md](dfx/args-dump.md),
 [scope-stats.md](dfx/scope-stats.md))
 describe the data each subsystem collects and how it enables it on-device.
 
@@ -296,7 +296,7 @@ Existing collectors are the canonical examples:
 - [`PmuCollector`](../src/a2a3/platform/include/host/pmu_collector.h)
   — single kind, per-core instances. See [pmu-profiling.md](dfx/pmu-profiling.md).
 - [`TensorDumpCollector`](../src/a2a3/platform/include/host/tensor_dump_collector.h)
-  — single kind, per-AICPU-thread instances. See [tensor-dump.md](dfx/tensor-dump.md).
+  — single kind, per-AICPU-thread instances. See [args-dump.md](dfx/args-dump.md).
 - [`L2SwimlaneCollector`](../src/a2a3/platform/include/host/l2_swimlane_collector.h)
   — two kinds (perf records + phase markers), per-core / per-thread
   instances; the canonical multi-kind example. See

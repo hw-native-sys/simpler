@@ -390,7 +390,7 @@ TEST_F(TaskAllocatorTest, TaskIdNearInt32Max) {
     last_alive.store(INT32_MAX - 2);
     allocator.init(
         descriptors.data(), WINDOW_SIZE, &current_index, &last_alive, heap_buf, HEAP_SIZE, &error_code,
-        /*initial_local_task_id=*/INT32_MAX - 2
+        /*slot_states=*/nullptr, /*initial_local_task_id=*/INT32_MAX - 2
     );
 
     auto r1 = allocator.alloc(0);

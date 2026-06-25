@@ -13,13 +13,13 @@ name: Sanitizers
 on:
   schedule:
     - cron: "0 18 * * *"  # 02:00 Beijing
+  # Manual trigger so a flaky nightly can be re-run on demand to confirm it
+  # reproduces (and now that reports are captured, to inspect the stack).
+  workflow_dispatch:
 
 concurrency:
   group: sanitizers-${{ github.ref }}
   cancel-in-progress: true
-
-env:
-  PTO_ISA_COMMIT: ddafa8da9c760ecd13fe9fe2833d6ee55fb20bd8
 
 jobs:
   sanitizer-sim:
@@ -38,6 +38,9 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v5
+
+      - name: Load pinned pto-isa commit
+        uses: ./.github/actions/read-pto-isa
 
       - name: Set up C++ compiler
         run: |
@@ -67,8 +70,32 @@ jobs:
         run: |
           # Sim unifies host compilation on g++-15, so preload g++-15's runtime.
           LIB=$(g++-15 -print-file-name=lib${{ matrix.sanitizer }}.so)
+          # Also preload g++-15's libstdc++. ASan resolves its __cxa_throw
+          # interceptor at init via dlsym(RTLD_NEXT, ...); the runtime is dlopen'd
+          # into a plain C Python where libstdc++ is not yet mapped, so that
+          # lookup returns null and the first C++ throw from the runtime aborts
+          # with "CHECK failed: ... real___cxa_throw != 0" (seen on the prewarm
+          # rollback test, which throws by design). Mapping libstdc++ up front
+          # makes the real symbol resolvable. Must be g++-15's, matching $LIB.
+          LIBSTDCXX=$(g++-15 -print-file-name=libstdc++.so)
           ARCH=$(echo "${{ matrix.platform }}" | sed 's/sim$//')
           PC="tests/st/$ARCH/tensormap_and_ringbuffer/prepared_callable"
+          # Why the report needs explicit capture: pytest's default fd-capture
+          # buffers each test's stdout/stderr in memory and prints it at test
+          # teardown. A sanitizer abort (abort_on_error=1) kills the process
+          # mid-test, so teardown never runs and that buffer is discarded —
+          # leaving only the parent's faulthandler "Fatal Python error: Aborted"
+          # with no sanitizer stack (that line survives because faulthandler
+          # holds the original fd). Two fixes, below:
+          #   1. `log_path` routes each process's sanitizer report to a per-pid
+          #      file, written at report time independent of fd capture, so it
+          #      survives the abort. Forked chip children (worker.py os.fork)
+          #      inherit the env and get their own files; uploaded as an artifact.
+          #   2. pytest `-s` disables capture so the report also reaches the live
+          #      job log inline (and recovers non-sanitizer abort/assert messages,
+          #      which never go to log_path).
+          LOGDIR="$GITHUB_WORKSPACE/sanitizer-logs"
+          mkdir -p "$LOGDIR"
           # dlopen_count tests are excluded everywhere: they assert exact dlopen
           # accounting that the sanitizers perturb by interposing dlopen.
           if [ "${{ matrix.sanitizer }}" = "tsan" ]; then
@@ -82,7 +109,7 @@ jobs:
             TARGETS="$PC"
             MAXPAR=1
             KFILTER="not dlopen_count"
-            export TSAN_OPTIONS=halt_on_error=0:exitcode=0
+            export TSAN_OPTIONS=halt_on_error=0:exitcode=0:log_path="$LOGDIR/tsan"
           else
             # ASAN (~1.7x) + UBSan. Like TSAN, the chip-fork L3 cases
             # (dynamic_register is all level=3) livelock on the 4-vCPU runner
@@ -93,10 +120,22 @@ jobs:
             TARGETS="$PC"
             MAXPAR=2
             KFILTER="not parallel_broadcast and not dlopen_count"
-            export ASAN_OPTIONS=detect_leaks=0:abort_on_error=1:halt_on_error=1
-            export UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1
+            export ASAN_OPTIONS=detect_leaks=0:abort_on_error=1:halt_on_error=1:log_path="$LOGDIR/asan"
+            export UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1:log_path="$LOGDIR/ubsan"
           fi
-          LD_PRELOAD="$LIB" pytest $TARGETS --platform ${{ matrix.platform }} \
+          # -s (no capture) so the report/abort message also reaches the live
+          # job log inline, not just the uploaded per-pid file.
+          LD_PRELOAD="$LIB $LIBSTDCXX" pytest $TARGETS --platform ${{ matrix.platform }} \
             --device 0-7 --max-parallel "$MAXPAR" -k "$KFILTER" \
-            --sanitizer ${{ matrix.sanitizer }} -v --pto-session-timeout 600 \
+            --sanitizer ${{ matrix.sanitizer }} -v -s --pto-session-timeout 600 \
             --pto-isa-commit ${{ env.PTO_ISA_COMMIT }} --clone-protocol https --require-pto-isa
+
+      - name: Upload sanitizer logs (${{ matrix.sanitizer }}, ${{ matrix.platform }})
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sanitizer-logs-${{ matrix.sanitizer }}-${{ matrix.platform }}
+          path: sanitizer-logs/
+          # ASAN writes a file only on error, so a clean run leaves the dir
+          # empty — don't fail the upload (or the job) over that.
+          if-no-files-found: ignore

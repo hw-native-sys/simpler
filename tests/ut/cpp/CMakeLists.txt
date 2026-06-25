@@ -470,6 +470,31 @@ target_link_libraries(test_host_log_off PRIVATE
 )
 add_test(NAME test_host_log_off COMMAND test_host_log_off)
 
+# a2a3 host-side AICPU affinity selection (compute_allowed_cpus). Pure logic —
+# no CANN headers, no hardware: compile the probe .cpp alongside the test. The
+# test provides its own no-op logger stubs, so no logger sources are linked.
+# The dlopen/dlsym HAL path is never exercised by these tests (only
+# compute_allowed_cpus is), but the .cpp references libdl symbols, so link it.
+# Regression barrier for issue #1045 (all survivors in one cluster).
+set(A2A3_ONBOARD_HOST_DIR ${CMAKE_SOURCE_DIR}/../../../src/a2a3/platform/onboard/host)
+add_executable(test_a2a3_aicpu_affinity_select
+    a2a3/test_aicpu_affinity_select.cpp
+    ${A2A3_ONBOARD_HOST_DIR}/aicpu_topology_probe.cpp
+)
+target_include_directories(test_a2a3_aicpu_affinity_select PRIVATE
+    ${GTEST_INCLUDE_DIRS}
+    ${A2A3_ONBOARD_HOST_DIR}
+    ${SIMPLER_LOG_DIR}/include
+)
+target_link_libraries(test_a2a3_aicpu_affinity_select PRIVATE
+    ${GTEST_MAIN_LIB}
+    ${GTEST_LIB}
+    ${CMAKE_DL_LIBS}
+    pthread
+)
+add_test(NAME test_a2a3_aicpu_affinity_select COMMAND test_a2a3_aicpu_affinity_select)
+set_tests_properties(test_a2a3_aicpu_affinity_select PROPERTIES LABELS "no_hardware")
+
 # Hardware-gated tests.  Block is only entered when the project is configured
 # with -DSIMPLER_ENABLE_HARDWARE_TESTS=ON.  CI's no-hw `ut` job does not pass
 # this flag, so nothing here is compiled there — this is the structural

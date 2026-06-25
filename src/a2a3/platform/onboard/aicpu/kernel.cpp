@@ -36,9 +36,10 @@
 
 // Forward declaration of aicpu_execute (implemented in aicpu_executor.cpp)
 extern "C" int aicpu_execute(Runtime *arg);
+extern "C" int aicpu_prewarm_callable(Runtime *arg);
 
 /**
- * AICPU kernel main execution entry point — the runtime SO's sole entry point.
+ * AICPU kernel main execution entry point.
  *
  * Called per-thread by the main aicpu_scheduler. Host registers this SO via
  * `rtsBinaryLoadFromFile` (JSON load, cpuKernelMode=0) and resolves this
@@ -91,9 +92,21 @@ extern "C" __attribute__((visibility("default"))) int simpler_aicpu_exec(void *a
     set_scope_stats_enabled(GET_PROFILING_FLAG(k_args->enable_profiling_flag, PROFILING_FLAG_SCOPE_STATS));
     set_platform_scope_stats_base(k_args->scope_stats_data_base);
 
-    // Affinity gate: drop excess threads before entering runtime
-    if (!platform_aicpu_affinity_gate(runtime->aicpu_thread_num, PLATFORM_MAX_AICPU_THREADS_JUST_FOR_LAUNCH)) {
-        LOG_INFO_V0("Thread dropped by cluster affinity");
+    // Filter-style affinity gate. Host computed ALLOWED_CPUS from AICPU
+    // OCCUPY and wrote it into Runtime; the device side only matches
+    // sched_getcpu() against that table and exposes the table position as
+    // exec_idx.
+    if (runtime->aicpu_allowed_cpu_count <= 0 || runtime->aicpu_launch_count <= 0) {
+        LOG_ERROR(
+            "AICPU affinity inputs missing: allowed_cpu_count=%d launch_count=%d (host probe must run before exec)",
+            runtime->aicpu_allowed_cpu_count, runtime->aicpu_launch_count
+        );
+        return -1;
+    }
+    if (!platform_aicpu_affinity_gate_filter(
+            runtime->aicpu_allowed_cpus, runtime->aicpu_allowed_cpu_count, runtime->aicpu_launch_count
+        )) {
+        LOG_INFO_V0("Thread dropped by filter affinity gate");
         return 0;
     }
 
@@ -121,4 +134,32 @@ extern "C" __attribute__((visibility("default"))) int simpler_aicpu_exec(void *a
     }
 
     return rc;
+}
+
+extern "C" __attribute__((visibility("default"))) int simpler_aicpu_prewarm_callable(void *arg) {
+    init_log_switch();
+    if (arg == nullptr) {
+        LOG_ERROR("%s", "Invalid prewarm kernel arguments: null pointer");
+        return -1;
+    }
+
+    auto k_args = (KernelArgs *)arg;
+    Runtime *runtime = k_args->runtime_args;
+    if (runtime == nullptr) {
+        LOG_ERROR("%s", "Invalid prewarm runtime_args: null pointer");
+        return -1;
+    }
+
+    set_log_level(static_cast<int>(k_args->log_level));
+    set_log_info_v(static_cast<int>(k_args->log_info_v));
+    set_orch_device_id(static_cast<int>(k_args->device_id));
+
+    LOG_INFO_V0("%s", "simpler_aicpu_prewarm_callable: prewarming callable");
+    int rc = aicpu_prewarm_callable(runtime);
+    if (rc != 0) {
+        LOG_ERROR("simpler_aicpu_prewarm_callable: prewarm failed with rc=%d", rc);
+        return rc;
+    }
+    LOG_INFO_V0("%s", "simpler_aicpu_prewarm_callable: prewarm completed");
+    return 0;
 }

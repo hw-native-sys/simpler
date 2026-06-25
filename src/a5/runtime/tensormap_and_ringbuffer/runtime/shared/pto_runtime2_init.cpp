@@ -287,12 +287,13 @@ bool PTO2OrchestratorState::init_data_from_layout(
     for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
         void *ring_heap_base = reinterpret_cast<char *>(gm_heap) + heap_offset;
         auto *task_descs_dev = pto2_sm_layout::ring_task_descriptors_addr(sm_dev_base, task_window_sizes, r);
+        auto *slot_states_dev = pto2_sm_layout::ring_slot_states_addr(sm_dev_base, task_window_sizes, r);
         auto *cur_idx_dev = pto2_sm_layout::ring_current_task_index_addr(sm_dev_base, r);
         auto *last_alive_dev = pto2_sm_layout::ring_last_task_alive_addr(sm_dev_base, r);
 
         orch->rings[r].task_allocator.init(
             task_descs_dev, static_cast<int32_t>(task_window_sizes[r]), cur_idx_dev, last_alive_dev, ring_heap_base,
-            heap_sizes[r], orch_err
+            heap_sizes[r], orch_err, slot_states_dev
         );
         heap_offset += heap_sizes[r];
 

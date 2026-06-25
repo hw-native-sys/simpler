@@ -39,6 +39,7 @@
 #include "common/core_type.h"
 #include "common/platform_config.h"
 #include "common/unified_log.h"
+#include "host/raii_scope_guard.h"
 #include "host_log.h"
 #include "utils/elf_build_id.h"
 // `runtime.h` (pulled in via `device_runner_helpers.h` in the base header)
@@ -278,13 +279,13 @@ int DeviceRunnerBase::ensure_binaries_loaded() {
     }
     LOG_INFO_V2("DeviceRunner: inner SO uploaded to preinstall via dispatcher bootstrap");
 
-    // JSON-register the inner SO and resolve the simpler_aicpu_exec handle.
+    // JSON-register the inner SO and resolve its runtime entry handles.
     rc = load_aicpu_op_.Init();
     if (rc != 0) {
         LOG_ERROR("LoadAicpuOp::Init failed: %d", rc);
         return rc;
     }
-    LOG_INFO_V2("DeviceRunner: inner SO registered (simpler_aicpu_exec handle ready)");
+    LOG_INFO_V2("DeviceRunner: inner SO registered (runtime entry handles ready)");
 
     // H2D the per-task DeviceArgs struct itself. device_args_.aicpu_so_bin/len
     // stay zero — our own per-task AICPU code (launched via rtsLaunchCpuKernel
@@ -434,43 +435,115 @@ uint64_t DeviceRunnerBase::upload_chip_callable_buffer(const ChipCallable *calla
     return chip_dev;
 }
 
-int DeviceRunnerBase::prepare_orch_so(Runtime &runtime) {
+int DeviceRunnerBase::stamp_orch_so(Runtime &runtime, int32_t cid, bool force_reload) {
     // Registered-callable flow only: the SO bytes were already H2D'd at
     // register_callable time. Stamp dev_orch_so on the runtime and mark
-    // `is_new` based on whether the AICPU has seen this cid since
-    // registration.
-    const int32_t cid = runtime.get_active_callable_id();
+    // `is_new` based on whether the AICPU has committed a successful load
+    // for this cid since registration.
     if (cid < 0) {
-        LOG_ERROR("prepare_orch_so: no active callable_id; registered-callable flow required");
+        LOG_ERROR("stamp_orch_so: invalid callable_id=%d", cid);
         return -1;
     }
     auto it = callables_.find(cid);
     if (it == callables_.end()) {
-        LOG_ERROR("prepare_orch_so: callable_id=%d not registered", cid);
+        LOG_ERROR("stamp_orch_so: callable_id=%d not registered", cid);
         return -1;
     }
     const auto &state = it->second;
     // hbg variant: orch SO never crosses the host/device boundary, so the
-    // AICPU does no per-cid dlopen. Skip the orch_so_table_ bookkeeping
-    // (and the AICPU dlopen counter) and clear the device-orch metadata.
+    // AICPU does no per-cid dlopen. Skip orch_so_table_ bookkeeping and clear
+    // device-orch metadata.
     if (state.host_dlopen_handle != nullptr) {
         runtime.set_dev_orch_so(0, 0);
         runtime.set_active_callable_id(cid, /*is_new=*/false);
         return 0;
     }
-    const bool first_sighting = aicpu_seen_callable_ids_.insert(cid).second;
-    if (first_sighting) {
-        ++aicpu_dlopen_total_;
-    }
+    const bool needs_load = force_reload || (aicpu_seen_callable_ids_.count(cid) == 0);
     runtime.set_dev_orch_so(state.dev_orch_so_addr, state.dev_orch_so_size);
-    // The c_api caller passed is_new=false; refresh with the authoritative
-    // first_sighting flag before AICPU consumes register_new_callable_id_.
-    runtime.set_active_callable_id(cid, first_sighting);
+    runtime.set_device_orch_func_name(state.func_name.c_str());
+    runtime.set_device_orch_config_name(state.config_name.c_str());
+    runtime.set_active_callable_id(cid, needs_load);
     LOG_INFO_V0(
-        "Orch SO prepared cid=%d hash=0x%lx %zu bytes (is_new=%d)", cid, state.hash, state.dev_orch_so_size,
-        first_sighting ? 1 : 0
+        "Orch SO stamped cid=%d hash=0x%lx %zu bytes (needs_load=%d)", cid, state.hash, state.dev_orch_so_size,
+        needs_load ? 1 : 0
     );
     return 0;
+}
+
+int DeviceRunnerBase::prepare_orch_so(Runtime &runtime) {
+    const int32_t cid = runtime.get_active_callable_id();
+    if (cid < 0) {
+        LOG_ERROR("prepare_orch_so: no active callable_id; registered-callable flow required");
+        return -1;
+    }
+    return stamp_orch_so(runtime, cid, /*force_reload=*/false);
+}
+
+int DeviceRunnerBase::commit_aicpu_callable_load(int32_t cid) {
+    auto it = callables_.find(cid);
+    if (it == callables_.end()) {
+        LOG_ERROR("commit_aicpu_callable_load: callable_id=%d not registered", cid);
+        return -1;
+    }
+    const auto &state = it->second;
+    if (state.host_dlopen_handle != nullptr) {
+        return 0;
+    }
+    const bool inserted = aicpu_seen_callable_ids_.insert(cid).second;
+    if (inserted) {
+        ++aicpu_dlopen_total_;
+        LOG_INFO_V0("AICPU callable load committed cid=%d (count=%zu)", cid, aicpu_dlopen_total_);
+    }
+    return 0;
+}
+
+int DeviceRunnerBase::prewarm_callable(int32_t callable_id) {
+    auto it = callables_.find(callable_id);
+    if (it == callables_.end()) {
+        LOG_ERROR("prewarm_callable: callable_id=%d not registered", callable_id);
+        return -1;
+    }
+    if (it->second.host_dlopen_handle != nullptr) {
+        return 0;
+    }
+
+    int rc = ensure_device_initialized();
+    if (rc != 0) {
+        LOG_ERROR("prewarm_callable: ensure_device_initialized failed: %d", rc);
+        return rc;
+    }
+
+    Runtime runtime;
+    rc = stamp_orch_so(runtime, callable_id, /*force_reload=*/true);
+    if (rc != 0) return rc;
+
+    rc = init_runtime_args_with_metadata(runtime);
+    if (rc != 0) return rc;
+    auto runtime_args_cleanup = RAIIScopeGuard([this]() {
+        kernel_args_.finalize_runtime_args();
+    });
+
+    LOG_INFO_V0("=== launch_aicpu_kernel %s ===", host::KernelNames::PrewarmName);
+    rc = launch_aicpu_kernel(stream_aicpu_, &kernel_args_.args, host::KernelNames::PrewarmName, /*aicpu_num=*/1);
+    if (rc != 0) {
+        LOG_ERROR("prewarm_callable: launch_aicpu_kernel failed: %d", rc);
+        return rc;
+    }
+
+    rc = aclrtSynchronizeStreamWithTimeout(stream_aicpu_, PLATFORM_STREAM_SYNC_TIMEOUT_MS);
+    if (rc == ACL_ERROR_RT_STREAM_SYNC_TIMEOUT) {
+        LOG_ERROR(
+            "prewarm_callable: stream sync timeout timeout_ms=%d device_id=%d", PLATFORM_STREAM_SYNC_TIMEOUT_MS,
+            device_id_
+        );
+        return rc;
+    }
+    if (rc != 0) {
+        LOG_ERROR("prewarm_callable: aclrtSynchronizeStreamWithTimeout failed: %d", rc);
+        return rc;
+    }
+
+    return commit_aicpu_callable_load(callable_id);
 }
 
 int DeviceRunnerBase::register_callable(

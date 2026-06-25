@@ -1091,17 +1091,13 @@ class SceneTestCase:
         config.aicpu_thread_num = config_dict.get("aicpu_thread_num", 3)
         # Per-task ring sizing (tensormap_and_ringbuffer only; 0 = unset),
         # nested under the "runtime_env" key. Takes precedence over the
-        # PTO2_RING_* env vars / RUNTIME_ENV.
+        # PTO2_RING_* env vars / RUNTIME_ENV. Each value is either a scalar
+        # (broadcast to every ring) or a list of RUNTIME_ENV_RING_COUNT ints
+        # (per-ring); the binding accepts both forms.
         runtime_env = config_dict.get("runtime_env", {})
         config.runtime_env.ring_task_window = runtime_env.get("ring_task_window", 0)
         config.runtime_env.ring_heap = runtime_env.get("ring_heap", 0)
         config.runtime_env.ring_dep_pool = runtime_env.get("ring_dep_pool", 0)
-        if "ring_task_windows" in runtime_env:
-            config.runtime_env.ring_task_windows = runtime_env["ring_task_windows"]
-        if "ring_heaps" in runtime_env:
-            config.runtime_env.ring_heaps = runtime_env["ring_heaps"]
-        if "ring_dep_pools" in runtime_env:
-            config.runtime_env.ring_dep_pools = runtime_env["ring_dep_pools"]
         config.enable_l2_swimlane = enable_l2_swimlane
         config.enable_dump_tensor = enable_dump_args
         config.enable_pmu = enable_pmu  # 0=disabled, >0=enabled with event type

@@ -38,7 +38,7 @@ class TestPagedAttentionUnrollTpushPop(SceneTestCase):
                 "source": "kernels/mix/paged_attention_parallel.cpp",
                 "core_type": "aic",
                 # Declare the full 9-tensor layout here (AIV entry left empty)
-                # so the tensor dump — which sums per-subtask signature tensors
+                # so the args dump — which sums per-subtask signature tensors
                 # and matches them to the payload — captures all args under
                 # func_id 0. Consumed only by the dump; dispatch ignores it.
                 "signature": [D.IN, D.IN, D.IN, D.IN, D.IN, D.INOUT, D.OUT, D.OUT, D.OUT],

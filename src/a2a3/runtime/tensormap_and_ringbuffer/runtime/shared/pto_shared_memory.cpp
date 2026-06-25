@@ -36,19 +36,9 @@ uint64_t PTO2SharedMemoryHandle::calculate_size(uint64_t task_window_size) {
 }
 
 uint64_t PTO2SharedMemoryHandle::calculate_size_per_ring(const uint64_t task_window_sizes[PTO2_MAX_RING_DEPTH]) {
-    uint64_t size = 0;
-
-    // Header (aligned to cache line)
-    size += PTO2_ALIGN_UP(sizeof(PTO2SharedMemoryHeader), PTO2_ALIGN_SIZE);
-
-    // Per-ring task descriptors and payloads
-    for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
-        size += PTO2_ALIGN_UP(task_window_sizes[r] * sizeof(PTO2TaskDescriptor), PTO2_ALIGN_SIZE);
-        size += PTO2_ALIGN_UP(task_window_sizes[r] * sizeof(PTO2TaskPayload), PTO2_ALIGN_SIZE);
-        size += PTO2_ALIGN_UP(task_window_sizes[r] * sizeof(PTO2TaskSlotState), PTO2_ALIGN_SIZE);
-    }
-
-    return size;
+    // Total SM size = offset just past the last ring, from the single source of
+    // truth for the layout (pto2_sm_layout::ring_segment_offsets).
+    return pto2_sm_layout::ring_segment_offsets(task_window_sizes, PTO2_MAX_RING_DEPTH - 1).end;
 }
 
 // =============================================================================
@@ -56,23 +46,18 @@ uint64_t PTO2SharedMemoryHandle::calculate_size_per_ring(const uint64_t task_win
 // =============================================================================
 
 void PTO2SharedMemoryHandle::setup_pointers_per_ring(const uint64_t task_window_sizes[PTO2_MAX_RING_DEPTH]) {
-    char *ptr = (char *)sm_base;
+    char *base = (char *)sm_base;
+    header = (PTO2SharedMemoryHeader *)base;
 
-    // Header
-    header = (PTO2SharedMemoryHeader *)ptr;
-    ptr += PTO2_ALIGN_UP(sizeof(PTO2SharedMemoryHeader), PTO2_ALIGN_SIZE);
-
-    // Per-ring task descriptors, payloads, and slot states
+    // Per-ring descriptors / payloads / slot_states — offsets from the single
+    // source of truth (pto2_sm_layout::ring_segment_offsets), so this setup and
+    // the device-address helpers cannot drift.
     for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
+        auto off = pto2_sm_layout::ring_segment_offsets(task_window_sizes, r);
         auto &ring = header->rings[r];
-        ring.task_descriptors = (PTO2TaskDescriptor *)ptr;
-        ptr += PTO2_ALIGN_UP(task_window_sizes[r] * sizeof(PTO2TaskDescriptor), PTO2_ALIGN_SIZE);
-
-        ring.task_payloads = (PTO2TaskPayload *)ptr;
-        ptr += PTO2_ALIGN_UP(task_window_sizes[r] * sizeof(PTO2TaskPayload), PTO2_ALIGN_SIZE);
-
-        ring.slot_states = (PTO2TaskSlotState *)ptr;
-        ptr += PTO2_ALIGN_UP(task_window_sizes[r] * sizeof(PTO2TaskSlotState), PTO2_ALIGN_SIZE);
+        ring.task_descriptors = (PTO2TaskDescriptor *)(base + off.descriptors);
+        ring.task_payloads = (PTO2TaskPayload *)(base + off.payloads);
+        ring.slot_states = (PTO2TaskSlotState *)(base + off.slot_states);
     }
 }
 

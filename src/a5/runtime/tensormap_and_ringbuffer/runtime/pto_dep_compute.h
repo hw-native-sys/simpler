@@ -152,4 +152,28 @@ register_task_outputs(const DepInputs &inputs, PTO2TaskId task_id, PTO2TensorMap
     }
 }
 
+/**
+ * Count the tensormap entries register_task_outputs() will insert for this task.
+ *
+ * Mirrors register_task_outputs()'s selection exactly (INOUT / OUTPUT_EXISTING,
+ * excluding manual_dep), so the returned value is the precise number of
+ * new_entry() calls that step makes. The orchestrator uses it to reserve pool
+ * capacity before inserting. Returns 0 in a manual scope (no registration).
+ */
+inline int32_t count_registrable_outputs(const DepInputs &inputs, bool in_manual_scope) {
+    if (in_manual_scope) {
+        return 0;
+    }
+    int32_t needed = 0;
+    for (int32_t i = 0; i < inputs.tensor_count; i++) {
+        TensorArgType ptype = inputs.arg_types[i];
+        if (ptype == TensorArgType::INOUT || ptype == TensorArgType::OUTPUT_EXISTING) {
+            if (!inputs.tensors[i].ref().manual_dep) {
+                needed++;
+            }
+        }
+    }
+    return needed;
+}
+
 #endif  // SRC_A5_RUNTIME_TENSORMAP_AND_RINGBUFFER_RUNTIME_PTO_DEP_COMPUTE_H_

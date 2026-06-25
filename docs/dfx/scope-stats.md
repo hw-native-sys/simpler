@@ -309,7 +309,7 @@ render `used/cap` without a second device→host query.
 | PMU | platform only | all runtimes | reads hardware registers |
 | L2 swimlane | platform only | all runtimes | reads AICore ring buffers |
 | dep_gen | platform only | all runtimes | traces `submit_task` |
-| tensor dump | platform only | all runtimes | dumps tensor data |
+| args dump | platform only | all runtimes | dumps argument data |
 | **scope stats** | **platform API + runtime call sites** | **T&R only** | runtime extracts values, platform tracks peaks |
 
 ### 4.4 Symbol resolution

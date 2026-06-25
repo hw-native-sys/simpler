@@ -497,33 +497,6 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
         static_cast<uint64_t>(header->rings[0].task_window_size)
     );
 
-    // One-time init: assign perf buffers (one thread does it; others wait).
-    // l2_swimlane_aicpu_init / l2_swimlane_aicpu_init_phase already ran eagerly in
-    // SchedulerContext::init() so the orchestrator thread can read the
-    // promoted g_l2_swimlane_level before caching it on rt->orchestrator. Only
-    // dump_tensor / pmu init remain dispatch-time because they depend on
-    // handshake-derived core IDs / counts.
-    if (!init_claimed_.exchange(true, std::memory_order_acq_rel)) {
-        LOG_INFO_V0("Thread %d: doing one-time init", thread_idx);
-
-#if PTO2_PROFILING
-        if (is_dump_args_enabled()) {
-            dump_args_init(orch_to_sched_ ? aicpu_thread_num_ : sched_thread_num_);
-        }
-        if (is_pmu_enabled()) {
-            pmu_aicpu_init(physical_core_ids_, cores_total_num_);
-            LOG_INFO_V0("PMU profiling started on %d cores", cores_total_num_);
-        }
-#endif
-
-        LOG_INFO_V0("Thread %d: one-time init done", thread_idx);
-        init_complete_.store(true, std::memory_order_release);
-    } else {
-        while (!init_complete_.load(std::memory_order_acquire)) {
-            SPIN_WAIT_HINT();
-        }
-    }
-
     LOG_INFO_V0("Thread %d: PTO2 dispatch starting with %d cores", thread_idx, tracker.core_num());
     int32_t cur_thread_completed = 0;
     // Non-zero once a scheduler-hang timeout latches; returned in place of the

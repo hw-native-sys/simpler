@@ -82,7 +82,8 @@ void rt_report_fatal(PTO2Runtime *rt, int32_t error_code, const char *func, cons
 // Checks owner metadata (lifecycle anchor) and OverlapMap (modifier writers).
 // For reads: wait until each producer COMPLETED (done writing).
 // For writes: also wait until all consumers done reading
-//   (fanout_refcount >= fanout_count - 1, excluding scope reference).
+//   (consumer low bits of fanout_refcount >= consumer count, excluding the
+//    bit31 scope reference).
 // Uses cycle-based timeout (checked every 1024 spins).
 // Returns false on timeout (sets orch.fatal).
 MAYBE_UNINITIALIZED_BEGIN
@@ -109,14 +110,22 @@ static bool wait_for_tensor_ready(PTO2Runtime *rt, const Tensor &tensor, bool wa
         int32_t spin_count = 0;
         while (slot.task_state.load(std::memory_order_acquire) < PTO2_TASK_COMPLETED) {
             SPIN_WAIT_HINT();
-            if ((++spin_count & 1023) == 0 && get_sys_cnt_aicpu() - t0 > PTO2_TENSOR_DATA_TIMEOUT_CYCLES) {
-                orch.report_fatal(
-                    PTO2_ERROR_TENSOR_WAIT_TIMEOUT, caller,
-                    "Timeout (%llu cycles): producer (ring=%d, local=%d) not completed",
-                    (unsigned long long)PTO2_TENSOR_DATA_TIMEOUT_CYCLES, ring_id, local_id
-                );
-                failed = true;
-                return;
+            if ((++spin_count & 1023) == 0) {
+                // A fatal latched elsewhere (e.g. the scheduler-side wiring
+                // deadlock detector) breaks this wait; cold path only.
+                if (orch.sm_header->orch_error_code.load(std::memory_order_acquire) != PTO2_ERROR_NONE) {
+                    failed = true;
+                    return;
+                }
+                if (get_sys_cnt_aicpu() - t0 > PTO2_TENSOR_DATA_TIMEOUT_CYCLES) {
+                    orch.report_fatal(
+                        PTO2_ERROR_TENSOR_WAIT_TIMEOUT, caller,
+                        "Timeout (%llu cycles): producer (ring=%d, local=%d) not completed",
+                        (unsigned long long)PTO2_TENSOR_DATA_TIMEOUT_CYCLES, ring_id, local_id
+                    );
+                    failed = true;
+                    return;
+                }
             }
         }
     };
@@ -126,16 +135,25 @@ static bool wait_for_tensor_ready(PTO2Runtime *rt, const Tensor &tensor, bool wa
         int32_t local_id = slot.task->task_id.local();
         uint64_t t0 = get_sys_cnt_aicpu();
         int32_t spin_count = 0;
-        while (slot.fanout_refcount.load(std::memory_order_acquire) < slot.fanout_count - 1) {
+        while ((slot.fanout_refcount.load(std::memory_order_acquire) & ~PTO2_FANOUT_SCOPE_BIT) <
+               (slot.fanout_count & ~PTO2_FANOUT_SCOPE_BIT)) {
             SPIN_WAIT_HINT();
-            if ((++spin_count & 1023) == 0 && get_sys_cnt_aicpu() - t0 > PTO2_TENSOR_DATA_TIMEOUT_CYCLES) {
-                orch.report_fatal(
-                    PTO2_ERROR_TENSOR_WAIT_TIMEOUT, caller,
-                    "Timeout (%llu cycles): consumers of producer (ring=%d, local=%d) not done",
-                    (unsigned long long)PTO2_TENSOR_DATA_TIMEOUT_CYCLES, ring_id, local_id
-                );
-                failed = true;
-                return;
+            if ((++spin_count & 1023) == 0) {
+                // A fatal latched elsewhere (e.g. the scheduler-side wiring
+                // deadlock detector) breaks this wait; cold path only.
+                if (orch.sm_header->orch_error_code.load(std::memory_order_acquire) != PTO2_ERROR_NONE) {
+                    failed = true;
+                    return;
+                }
+                if (get_sys_cnt_aicpu() - t0 > PTO2_TENSOR_DATA_TIMEOUT_CYCLES) {
+                    orch.report_fatal(
+                        PTO2_ERROR_TENSOR_WAIT_TIMEOUT, caller,
+                        "Timeout (%llu cycles): consumers of producer (ring=%d, local=%d) not done",
+                        (unsigned long long)PTO2_TENSOR_DATA_TIMEOUT_CYCLES, ring_id, local_id
+                    );
+                    failed = true;
+                    return;
+                }
             }
         }
     };

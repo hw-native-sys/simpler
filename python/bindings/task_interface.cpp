@@ -614,6 +614,10 @@ NB_MODULE(_task_interface, m) {
         });
 
     // --- RuntimeEnv (per-task PTO2_RING_* overrides; nested under CallConfig.runtime_env) ---
+    // Each ring resource is exposed as ONE property that accepts either an int
+    // (broadcast to every ring) or a list of RUNTIME_ENV_RING_COUNT ints
+    // (per-ring). The value always reads back as a list — the wire layout is the
+    // four-entry array, so a broadcast scalar is stored as [v, v, v, v].
     auto get_ring_values = [](const uint64_t values[RUNTIME_ENV_RING_COUNT]) -> std::vector<uint64_t> {
         std::vector<uint64_t> out;
         out.reserve(RUNTIME_ENV_RING_COUNT);
@@ -622,21 +626,38 @@ NB_MODULE(_task_interface, m) {
         }
         return out;
     };
-    auto set_ring_values = [](uint64_t values[RUNTIME_ENV_RING_COUNT], const std::vector<uint64_t> &input,
-                              const char *name) {
-        if (input.size() != RUNTIME_ENV_RING_COUNT) {
-            throw std::invalid_argument(
-                std::string("RuntimeEnv.") + name + " must contain exactly " + std::to_string(RUNTIME_ENV_RING_COUNT) +
-                " entries"
-            );
+    auto set_ring_values = [](uint64_t values[RUNTIME_ENV_RING_COUNT], nb::handle obj, const char *name) {
+        uint64_t scalar = 0;
+        if (nb::try_cast<uint64_t>(obj, scalar)) {  // int -> broadcast to every ring
+            for (int i = 0; i < RUNTIME_ENV_RING_COUNT; ++i) {
+                values[i] = scalar;
+            }
+            return;
         }
-        for (int i = 0; i < RUNTIME_ENV_RING_COUNT; ++i) {
-            values[i] = input[static_cast<size_t>(i)];
+        std::vector<uint64_t> input;
+        if (nb::try_cast<std::vector<uint64_t>>(obj, input)) {  // list -> per-ring
+            if (input.size() != RUNTIME_ENV_RING_COUNT) {
+                throw std::invalid_argument(
+                    std::string("RuntimeEnv.") + name + " list must contain exactly " +
+                    std::to_string(RUNTIME_ENV_RING_COUNT) + " entries"
+                );
+            }
+            for (int i = 0; i < RUNTIME_ENV_RING_COUNT; ++i) {
+                values[i] = input[static_cast<size_t>(i)];
+            }
+            return;
         }
+        throw std::invalid_argument(
+            std::string("RuntimeEnv.") + name + " must be an int (broadcast) or a list of " +
+            std::to_string(RUNTIME_ENV_RING_COUNT) + " ints"
+        );
     };
-    auto append_ring_values = [](std::ostringstream &os, const char *name,
+    auto append_ring_values = [](std::ostringstream &os, const char *name, bool leading_comma,
                                  const uint64_t values[RUNTIME_ENV_RING_COUNT]) {
-        os << ", " << name << "=[";
+        if (leading_comma) {
+            os << ", ";
+        }
+        os << name << "=[";
         for (int i = 0; i < RUNTIME_ENV_RING_COUNT; ++i) {
             if (i != 0) {
                 os << ", ";
@@ -648,45 +669,39 @@ NB_MODULE(_task_interface, m) {
 
     nb::class_<RuntimeEnv>(m, "RuntimeEnv")
         .def(nb::init<>())
-        .def_rw("ring_task_window", &RuntimeEnv::ring_task_window)
-        .def_rw("ring_heap", &RuntimeEnv::ring_heap)
-        .def_rw("ring_dep_pool", &RuntimeEnv::ring_dep_pool)
         .def_prop_rw(
-            "ring_task_windows",
+            "ring_task_window",
             [get_ring_values](const RuntimeEnv &self) {
-                return get_ring_values(self.ring_task_windows);
+                return get_ring_values(self.ring_task_window);
             },
-            [set_ring_values](RuntimeEnv &self, const std::vector<uint64_t> &values) {
-                set_ring_values(self.ring_task_windows, values, "ring_task_windows");
+            [set_ring_values](RuntimeEnv &self, nb::handle value) {
+                set_ring_values(self.ring_task_window, value, "ring_task_window");
             }
         )
         .def_prop_rw(
-            "ring_heaps",
+            "ring_heap",
             [get_ring_values](const RuntimeEnv &self) {
-                return get_ring_values(self.ring_heaps);
+                return get_ring_values(self.ring_heap);
             },
-            [set_ring_values](RuntimeEnv &self, const std::vector<uint64_t> &values) {
-                set_ring_values(self.ring_heaps, values, "ring_heaps");
+            [set_ring_values](RuntimeEnv &self, nb::handle value) {
+                set_ring_values(self.ring_heap, value, "ring_heap");
             }
         )
         .def_prop_rw(
-            "ring_dep_pools",
+            "ring_dep_pool",
             [get_ring_values](const RuntimeEnv &self) {
-                return get_ring_values(self.ring_dep_pools);
+                return get_ring_values(self.ring_dep_pool);
             },
-            [set_ring_values](RuntimeEnv &self, const std::vector<uint64_t> &values) {
-                set_ring_values(self.ring_dep_pools, values, "ring_dep_pools");
+            [set_ring_values](RuntimeEnv &self, nb::handle value) {
+                set_ring_values(self.ring_dep_pool, value, "ring_dep_pool");
             }
         )
         .def("__repr__", [append_ring_values](const RuntimeEnv &self) -> std::string {
             std::ostringstream os;
-            os << "RuntimeEnv(ring_task_window=" << self.ring_task_window << ", ring_heap=" << self.ring_heap
-               << ", ring_dep_pool=" << self.ring_dep_pool;
-            if (self.per_ring_any()) {
-                append_ring_values(os, "ring_task_windows", self.ring_task_windows);
-                append_ring_values(os, "ring_heaps", self.ring_heaps);
-                append_ring_values(os, "ring_dep_pools", self.ring_dep_pools);
-            }
+            os << "RuntimeEnv(";
+            append_ring_values(os, "ring_task_window", false, self.ring_task_window);
+            append_ring_values(os, "ring_heap", true, self.ring_heap);
+            append_ring_values(os, "ring_dep_pool", true, self.ring_dep_pool);
             os << ")";
             return os.str();
         });
@@ -732,7 +747,7 @@ NB_MODULE(_task_interface, m) {
             },
             // Accept either an int dump level (0=off, 1=partial, 2=full,
             // 3=full_json_only) or a Python bool. `True` maps to level 1
-            // (partial) — the default when --dump-tensor is passed without a
+            // (partial) — the default when --dump-args is passed without a
             // value; `False` maps to 0.
             [](CallConfig &c, nb::object v) {
                 if (PyBool_Check(v.ptr())) {
@@ -787,14 +802,9 @@ NB_MODULE(_task_interface, m) {
                << ", enable_dep_gen=" << (self.enable_dep_gen ? "True" : "False")
                << ", enable_scope_stats=" << (self.enable_scope_stats ? "True" : "False");
             if (self.runtime_env.any()) {
-                os << ", runtime_env.ring_task_window=" << self.runtime_env.ring_task_window
-                   << ", runtime_env.ring_heap=" << self.runtime_env.ring_heap
-                   << ", runtime_env.ring_dep_pool=" << self.runtime_env.ring_dep_pool;
-                if (self.runtime_env.per_ring_any()) {
-                    append_ring_values(os, "runtime_env.ring_task_windows", self.runtime_env.ring_task_windows);
-                    append_ring_values(os, "runtime_env.ring_heaps", self.runtime_env.ring_heaps);
-                    append_ring_values(os, "runtime_env.ring_dep_pools", self.runtime_env.ring_dep_pools);
-                }
+                append_ring_values(os, "runtime_env.ring_task_window", true, self.runtime_env.ring_task_window);
+                append_ring_values(os, "runtime_env.ring_heap", true, self.runtime_env.ring_heap);
+                append_ring_values(os, "runtime_env.ring_dep_pool", true, self.runtime_env.ring_dep_pool);
             }
             if (self.output_prefix_set()) {
                 os << ", output_prefix='" << self.output_prefix << "'";

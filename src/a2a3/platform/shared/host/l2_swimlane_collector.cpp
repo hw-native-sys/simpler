@@ -264,10 +264,10 @@ int L2SwimlaneCollector::initialize(
     }
 
     // Step 6: Initialize per-thread phase pools — both sched and orch. Each
-    // pool is sized to PLATFORM_PROF_BUFFERS_PER_THREAD buffers (1 in
-    // free_queue, rest in the recycled pool tagged by kind). Templated on the
+    // pool is sized to its own PLATFORM_PROF_{SCHED,ORCH}_BUFFERS_PER_THREAD
+    // (1 in free_queue, rest in the recycled pool tagged by kind). Templated on the
     // concrete TypedBuffer so the `count` zero-store uses the matching layout
-    // — sched and orch buffers have DIFFERENT sizes (40B vs 32B records),
+    // — sched and orch buffers have DIFFERENT sizes (64B vs 32B records),
     // so a single cast type for both would land the count store past the end
     // of the orch allocation and corrupt the heap.
     // state_count pool states are zeroed (so the host's [0, PLATFORM_MAX)
@@ -276,7 +276,7 @@ int L2SwimlaneCollector::initialize(
     // equal; orch is a single instance (pool 0), so it zeroes all slots but
     // allocates buffers for just pool 0 — no buffers wasted on unused slots.
     auto init_phase_pools = [&](auto buffer_tag, L2SwimlaneAicpuTaskPool *(*get_state)(void *, int, int),
-                                int state_count, int buffer_count, ProfBufferType recycle_kind,
+                                int state_count, int buffer_count, int buffers_per_thread, ProfBufferType recycle_kind,
                                 const char *kind_label) -> int {
         using Buffer = typename decltype(buffer_tag)::type;
         constexpr size_t buffer_bytes = sizeof(Buffer);
@@ -284,7 +284,7 @@ int L2SwimlaneCollector::initialize(
             auto *state = get_state(perf_host_ptr, num_aicore, t);
             memset(state, 0, sizeof(L2SwimlaneAicpuTaskPool));
             if (t >= buffer_count) continue;  // zeroed state only; no buffers (unused slot)
-            for (int s = 0; s < PLATFORM_PROF_BUFFERS_PER_THREAD; s++) {
+            for (int s = 0; s < buffers_per_thread; s++) {
                 void *host_buf_ptr = nullptr;
                 void *dev_buf_ptr = alloc_single_buffer(buffer_bytes, &host_buf_ptr);
                 if (dev_buf_ptr == nullptr) {
@@ -323,7 +323,8 @@ int L2SwimlaneCollector::initialize(
     // allocate buffers for just one pool while still zeroing all MAX states.
     if (init_phase_pools(
             SchedTag{}, get_sched_phase_buffer_state, /*state_count=*/num_phase_threads,
-            /*buffer_count=*/num_phase_threads, ProfBufferType::AICPU_SCHED_PHASE, "sched"
+            /*buffer_count=*/num_phase_threads, /*buffers_per_thread=*/PLATFORM_PROF_SCHED_BUFFERS_PER_THREAD,
+            ProfBufferType::AICPU_SCHED_PHASE, "sched"
         ) != 0) {
         return -1;
     }
@@ -332,13 +333,13 @@ int L2SwimlaneCollector::initialize(
     };
     if (init_phase_pools(
             OrchTag{}, orch_get_state, /*state_count=*/num_phase_threads, /*buffer_count=*/1,
-            ProfBufferType::AICPU_ORCH_PHASE, "orch"
+            /*buffers_per_thread=*/PLATFORM_PROF_ORCH_BUFFERS_PER_THREAD, ProfBufferType::AICPU_ORCH_PHASE, "orch"
         ) != 0) {
         return -1;
     }
     LOG_DEBUG(
-        "Initialized %d sched (+1 orch) PhaseBufferStates: 1 buffer/thread, %d in recycled pool each",
-        num_phase_threads, PLATFORM_PROF_BUFFERS_PER_THREAD - 1
+        "Initialized %d sched (%d buf/thread) + 1 orch (%d buf) PhaseBufferStates", num_phase_threads,
+        PLATFORM_PROF_SCHED_BUFFERS_PER_THREAD, PLATFORM_PROF_ORCH_BUFFERS_PER_THREAD
     );
 
     wmb();

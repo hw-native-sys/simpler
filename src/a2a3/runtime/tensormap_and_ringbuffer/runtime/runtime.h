@@ -39,6 +39,7 @@
 #include "common/core_type.h"
 #include "common/l2_swimlane_profiling.h"
 #include "common/platform_config.h"
+#include "aicpu/platform_aicpu_affinity.h"  // MAX_GATE_THREADS (aicpu_allowed_cpus bound)
 #include "pto2_dispatch_payload.h"
 #include "task_args.h"
 
@@ -200,6 +201,15 @@ public:
     // The orch thread also dispatches when env PTO2_ORCH_TO_SCHED is set.
     int aicpu_thread_num;
     int ready_queue_shards;  // Number of ready queue shards (1..MAX_AICPU_THREADS, default MAX-1)
+
+    // Filter-style affinity gate input (a2a3 onboard). Host fills these
+    // before launch from AICPU OCCUPY, and the device gate keeps threads whose
+    // sched_getcpu() lands on one of the cpu_ids. The array position is the
+    // deterministic exec_idx used by AicpuExecutor for sched/orch role
+    // assignment; the highest active index is the orchestrator slot.
+    int32_t aicpu_allowed_cpus[MAX_GATE_THREADS];
+    int32_t aicpu_allowed_cpu_count;
+    int32_t aicpu_launch_count;
 
     // PTO2 integration: kernel_id -> GM function_bin_addr mapping
     // NOTE: Made public for direct access from aicore code

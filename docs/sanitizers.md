@@ -77,8 +77,11 @@ pip install --no-build-isolation --config-settings=cmake.define.SIMPLER_SANITIZE
 
 # 2. Run, preloading the matching runtime. Sim unifies on g++-15, so preload
 #    g++-15's runtime — plain g++'s would mismatch the kernels' ABI (see
-#    invariant 1) and fail at load.
-LD_PRELOAD=$(g++-15 -print-file-name=libasan.so) \
+#    invariant 1) and fail at load. Preload g++-15's libstdc++ too, or ASan
+#    can't resolve its __cxa_throw interceptor (libstdc++ isn't mapped into the
+#    plain C Python when ASan inits) and the first C++ throw from the runtime
+#    aborts with "CHECK failed: ... real___cxa_throw != 0".
+LD_PRELOAD="$(g++-15 -print-file-name=libasan.so) $(g++-15 -print-file-name=libstdc++.so)" \
 ASAN_OPTIONS=detect_leaks=0:abort_on_error=1:halt_on_error=1 \
 UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1 \
 pytest examples tests/st --platform a2a3sim --sanitizer asan -v
@@ -94,6 +97,27 @@ pytest examples tests/st --platform a2a3sim --sanitizer tsan -v
 
 `detect_leaks=0` is recommended initially — LSan false-positives on the device
 custom arenas until suppressions are added (see the scope investigation).
+
+Capturing the report through an abort: pytest's default fd-capture buffers a
+test's output in memory and prints it only at teardown. A sanitizer abort
+(`abort_on_error=1`) kills the process mid-test, so teardown never runs and the
+buffer is discarded — the job log shows only `Fatal Python error: Aborted` with
+no sanitizer stack. Two ways to recover it, used together:
+
+- `log_path` writes each process's report to a per-pid file at report time,
+  independent of fd capture, so it survives the abort. Forked chip children
+  (`worker.py` `os.fork`) inherit the env and get their own files.
+- pytest `-s` (`--capture=no`) sends output straight to the real stderr fd, so
+  the report — and any non-sanitizer abort/assert message, which never reaches
+  `log_path` — also appears inline.
+
+```bash
+ASAN_OPTIONS=detect_leaks=0:abort_on_error=1:halt_on_error=1:log_path=/tmp/asan \
+... pytest ... -s        # report lands in /tmp/asan.$PID (per process) and on the console
+```
+
+The nightly `Sanitizers` workflow does both and uploads the files as a
+`sanitizer-logs-<sanitizer>-<platform>` artifact.
 
 ## Presets
 

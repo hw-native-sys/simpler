@@ -45,6 +45,9 @@ Runtime::Runtime() {
     initial_ready_count = 0;
     worker_count = 0;
     aicpu_thread_num = 1;
+    memset(aicpu_allowed_cpus, 0, sizeof(aicpu_allowed_cpus));
+    aicpu_allowed_cpu_count = 0;
+    aicpu_launch_count = 0;
     tensor_info_storage_ = nullptr;
     tensor_info_storage_bytes_ = 0;
     tensor_allocation_storage_ = nullptr;

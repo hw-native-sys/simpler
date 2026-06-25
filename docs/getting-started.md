@@ -55,11 +55,114 @@ export PTO_ISA_ROOT=/path/to/your/pto-isa
 Install-time a2a3 onboard runtime builds record the PTO-ISA git commit so later
 runtime compatibility checks can detect mismatched ISA revisions.
 
+**Revision selection and compatibility checks:**
+
+PTO-ISA is resolved in two separate phases:
+
+- **Install/build time:** `pip install` may build the a2a3 onboard host runtime.
+  That runtime embeds PTO-ISA SDMA headers, so the PTO-ISA checkout used during
+  installation becomes part of the installed runtime binary.
+- **Test/run time:** pytest and the scene-test runner resolve PTO-ISA again for
+  kernel compilation. A user may choose a different PTO-ISA checkout or commit
+  for a particular test run.
+
+Because those two phases happen independently, the selected PTO-ISA revisions
+can drift. `simpler` records the actual build-time git commit for a2a3 onboard
+runtimes and checks it later against the run-time commit. The check does not
+change how PTO-ISA is selected; it only compares the concrete revisions that
+the existing resolution logic selected.
+
+The checkout selection step decides which PTO-ISA directory `simpler` will use.
+It follows this order:
+
+1. If `PTO_ISA_ROOT` points to an existing directory, that directory wins.
+   `simpler` treats it as user-managed and uses it as-is.
+2. If `PTO_ISA_ROOT` is not set, `simpler` uses the managed checkout at
+   `build/pto-isa`, cloning it on first use if necessary.
+3. If a concrete commit is requested and the managed checkout is being used,
+   `simpler` checks out that commit.
+4. If no commit is requested, or the requested value is `latest`, `head`, or
+   `none`, `simpler` keeps the existing HEAD/latest behavior and uses the
+   checkout's current HEAD.
+
+This is only the checkout selection order. The compatibility check later uses a
+separate commit lookup order so it can compare the installed runtime's recorded
+build commit with the concrete commit selected for the current run.
+
+One important consequence: `PTO_ISA_ROOT` is a path, not a commit selector. If
+you export `PTO_ISA_ROOT=/path/to/pto-isa`, `simpler` will not automatically
+checkout `--pto-isa-commit "$PTO_ISA_COMMIT"` inside that directory. To run
+with a specific commit while using a custom `PTO_ISA_ROOT`, checkout that
+commit in the PTO-ISA repository yourself before running `simpler`.
+
+At install time, pass a concrete PTO-ISA commit through CMake when building
+a2a3 onboard runtimes:
+
+```bash
+export PTO_ISA_COMMIT=0123456789abcdef0123456789abcdef01234567
+pip install --no-build-isolation \
+  --config-settings=cmake.define.SIMPLER_PTO_ISA_COMMIT="$PTO_ISA_COMMIT" \
+  -e .
+```
+
+At test/run time, pass the matching commit through pytest or the scene-test
+runner:
+
+```bash
+export PTO_ISA_COMMIT=0123456789abcdef0123456789abcdef01234567
+pytest examples --platform a2a3 --pto-isa-commit "$PTO_ISA_COMMIT"
+python path/to/scene_test.py --platform a2a3 --pto-isa-commit "$PTO_ISA_COMMIT"
+```
+
+`SIMPLER_PTO_ISA_COMMIT="$PTO_ISA_COMMIT"` can also provide the concrete commit
+when the CLI option is omitted. Leaving both unset preserves the current
+checkout HEAD behavior. For reproducible a2a3 onboard runs, prefer passing the
+same concrete commit at install time and run time.
+
+For a2a3 onboard runtimes, `pip install` records the actual PTO-ISA git HEAD
+used to build `host_runtime.so` in `build/lib/pto_isa_build.json`. The recorded
+value comes from `git rev-parse HEAD` in the resolved PTO-ISA checkout; it is
+not inferred from the requested option. If the install-time checkout is not a
+real git checkout, `simpler` cannot record a trustworthy build revision for
+this compatibility check.
+
+Later, when an a2a3 onboard runtime binary is looked up, compatibility
+validation uses a different order to identify the run-time PTO-ISA commit for
+comparison:
+
+1. `SIMPLER_RUN_PTO_ISA_COMMIT`, which `simpler` sets internally after the
+   test/run-time checkout selection step records the selected checkout's git
+   HEAD.
+2. `PTO_ISA_ROOT`'s current git HEAD, when `PTO_ISA_ROOT` points to a git
+   checkout and the recorded run-time commit is unavailable.
+3. A concrete `SIMPLER_PTO_ISA_COMMIT` value, as a fallback for cases where no
+   git checkout commit can be read.
+
+If the build commit and run-time commit differ, `simpler` fails early on the
+host side before loading the runtime binary. The error reports both commits and
+points to `build/lib/pto_isa_build.json`, which you can inspect to see the
+PTO-ISA commit recorded at install time:
+
+```bash
+cat build/lib/pto_isa_build.json
+```
+
+This makes the configuration problem visible before kernel/runtime ABI
+mismatches can turn into less direct failures.
+
+The compatibility check is scoped to a2a3 onboard runtime lookup. a5, a2a3sim,
+and a5sim are not blocked by this a2a3 onboard metadata. Existing installs that
+do not have `build/lib/pto_isa_build.json` also continue to work; they simply
+skip this compatibility check.
+
 **Troubleshooting:**
 
 - If git is not available: Clone pto-isa manually and set `PTO_ISA_ROOT`
 - If clone fails due to network: Try again or clone manually
 - If SSH clone fails (e.g., in CI): Use `--clone-protocol https` or clone manually with HTTPS
+- If a2a3 onboard runtime lookup reports a PTO-ISA mismatch: Reinstall
+  `simpler` with the same PTO-ISA commit used for the run, or rerun with the
+  commit recorded in `build/lib/pto_isa_build.json`
 
 Note: For the simulation platform (`a2a3sim`), PTO ISA headers are optional and only needed if your kernels use PTO ISA intrinsics.
 

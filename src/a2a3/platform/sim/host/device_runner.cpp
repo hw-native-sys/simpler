@@ -85,9 +85,19 @@ int DeviceRunner::ensure_binaries_loaded() {
             *out = sym;
             return true;
         };
+        auto load_optional_sym = [this](const char *name, void **out) {
+            dlerror();
+            void *sym = dlsym(aicpu_so_handle_, name);
+            if (sym == nullptr) {
+                LOG_DEBUG("Optional dlsym skipped for %s: %s", name, dlerror());
+            }
+            *out = sym;
+        };
 
         if (!load_sym("aicpu_execute", reinterpret_cast<void **>(&aicpu_execute_func_))) return -1;
+        load_optional_sym("aicpu_prewarm_callable", reinterpret_cast<void **>(&aicpu_prewarm_func_));
         if (!load_sym("set_platform_regs", reinterpret_cast<void **>(&set_platform_regs_func_))) return -1;
+        load_optional_sym("set_orch_device_id", reinterpret_cast<void **>(&set_orch_device_id_func_));
         if (!load_sym("set_platform_dump_base", reinterpret_cast<void **>(&set_platform_dump_base_func_))) return -1;
         if (!load_sym("set_dump_args_enabled", reinterpret_cast<void **>(&set_dump_args_enabled_func_))) return -1;
         if (!load_sym("set_platform_l2_swimlane_base", reinterpret_cast<void **>(&set_platform_l2_swimlane_base_func_)))
@@ -166,6 +176,15 @@ int DeviceRunner::ensure_binaries_loaded() {
     }
 
     return 0;
+}
+
+int DeviceRunner::invoke_aicpu_prewarm(Runtime &runtime) {
+    if (aicpu_prewarm_func_ == nullptr || set_orch_device_id_func_ == nullptr) {
+        LOG_ERROR("Prewarm functions not loaded. Call ensure_binaries_loaded first.");
+        return -1;
+    }
+    set_orch_device_id_func_(device_id_);
+    return aicpu_prewarm_func_(&runtime);
 }
 
 int DeviceRunner::run(Runtime &runtime, int block_dim, int launch_aicpu_num) {
@@ -392,17 +411,21 @@ int DeviceRunner::run(Runtime &runtime, int block_dim, int launch_aicpu_num) {
 
     LOG_INFO_V0("Allocated simulated PMU registers: %d cores x 0x%x bytes", num_aicore, SIM_REG_BLOCK_SIZE);
 
+    const bool needs_orch_device_id = runtime.register_new_callable_id();
     if (aicpu_execute_func_ == nullptr || aicore_execute_func_ == nullptr || set_platform_regs_func_ == nullptr ||
-        set_platform_dump_base_func_ == nullptr || set_dump_args_enabled_func_ == nullptr ||
-        set_platform_pmu_base_func_ == nullptr || set_platform_pmu_reg_addrs_func_ == nullptr ||
-        set_pmu_enabled_func_ == nullptr || set_platform_dep_gen_base_func_ == nullptr ||
-        set_dep_gen_enabled_func_ == nullptr || set_scope_stats_enabled_func_ == nullptr ||
-        set_platform_scope_stats_base_func_ == nullptr) {
+        (needs_orch_device_id && set_orch_device_id_func_ == nullptr) || set_platform_dump_base_func_ == nullptr ||
+        set_dump_args_enabled_func_ == nullptr || set_platform_pmu_base_func_ == nullptr ||
+        set_platform_pmu_reg_addrs_func_ == nullptr || set_pmu_enabled_func_ == nullptr ||
+        set_platform_dep_gen_base_func_ == nullptr || set_dep_gen_enabled_func_ == nullptr ||
+        set_scope_stats_enabled_func_ == nullptr || set_platform_scope_stats_base_func_ == nullptr) {
         LOG_ERROR("Executor functions not loaded. Call ensure_binaries_loaded first.");
         return -1;
     }
 
     set_platform_regs_func_(kernel_args_.regs);
+    if (set_orch_device_id_func_ != nullptr) {
+        set_orch_device_id_func_(device_id_);
+    }
     set_platform_dump_base_func_(kernel_args_.dump_data_base);
     set_dump_args_enabled_func_(enable_dump_tensor_);
     set_platform_l2_swimlane_base_func_(kernel_args_.l2_swimlane_data_base);
@@ -571,7 +594,9 @@ void DeviceRunner::unload_executor_binaries() {
         dlclose(aicpu_so_handle_);
         aicpu_so_handle_ = nullptr;
         aicpu_execute_func_ = nullptr;
+        aicpu_prewarm_func_ = nullptr;
         set_platform_regs_func_ = nullptr;
+        set_orch_device_id_func_ = nullptr;
         set_platform_dump_base_func_ = nullptr;
         set_dump_args_enabled_func_ = nullptr;
         set_platform_l2_swimlane_base_func_ = nullptr;

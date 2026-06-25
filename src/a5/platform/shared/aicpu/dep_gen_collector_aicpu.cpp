@@ -162,7 +162,8 @@ void dep_gen_aicpu_init() {
 
 void dep_gen_aicpu_record_submit(
     uint64_t task_id_raw, bool in_manual_scope, int tensor_count, const void *const *tensor_ptrs,
-    const uint8_t *arg_types, int explicit_dep_count, const uint64_t *explicit_deps_raw, const int32_t kernel_ids[3]
+    const uint8_t *arg_types, int explicit_dep_count, const uint64_t *explicit_deps_raw, int block_num,
+    const int32_t kernel_ids[3]
 ) {
     if (!g_enable_dep_gen || s_dep_gen_state == nullptr) {
         return;
@@ -257,6 +258,7 @@ void dep_gen_aicpu_record_submit(
     }
     rec->flags = base_flags;
     rec->tensor_count = static_cast<uint16_t>(tc);
+    rec->block_num = block_num > 0 ? static_cast<uint32_t>(block_num) : 1u;
 
     int base_dc = (dc < DEP_GEN_MAX_EXPLICIT_DEPS) ? dc : DEP_GEN_MAX_EXPLICIT_DEPS;
     rec->explicit_dep_count = static_cast<uint16_t>(base_dc);

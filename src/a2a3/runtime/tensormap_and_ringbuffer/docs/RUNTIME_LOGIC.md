@@ -199,7 +199,7 @@ The ring buffer mechanism provides **flow control** between the orchestrator (pr
 
 **Heap Ring back-pressure**: When the heap has insufficient contiguous space, `PTO2TaskAllocator::alloc` spin-waits until the scheduler advances `heap_tail` past completed tasks' output buffers.
 
-**TensorMap pool back-pressure**: When the entry pool is exhausted, `new_entry()` spin-waits on `PTO2TensorMap::sync_tensormap(force=true)` until cleanup frees entries (see Section 5.4).
+**TensorMap pool back-pressure**: Before STEP 4 registers a task's outputs, the orchestrator's `ensure_tensormap_capacity` reserves pool space for the inserts. When the shared entry pool is exhausted, it reclaims retired entries across all rings and spin-waits until reclaim actually frees entries, with a 500 ms wall-clock deadlock backstop (see Section 5.4).
 
 This back-pressure is essential for correctness with small ring sizes — for example, with `PTO2_RING_TASK_WINDOW=16` and 208 tasks, the orchestrator blocks ~192 times, each time waiting for the scheduler to drain completed tasks before continuing.
 
@@ -265,7 +265,7 @@ Unlike the Task Ring and Heap Ring, TensorMap entries are **not** managed by a r
 
 1. **Free list first**: `free_entry_list[]` stores pointers to released entries. Allocation pops from here (O(1)).
 2. **Bump allocation**: if free list is empty, `entry_pool[next_entry_idx++]` allocates from the end of the pool.
-3. **Blocking reclaim**: if the pool is fully exhausted, `PTO2TensorMap::sync_tensormap(force=true)` reads the latest `last_task_alive` and calls `cleanup_retired` to batch-free all entries belonging to retired tasks, returning them to the free list.
+3. **Blocking reclaim**: if the pool is short of the inserts a task needs, the orchestrator's `ensure_tensormap_capacity` reads the latest `last_task_alive` for every ring and calls `reclaim_retired_all` (`cleanup_retired` per ring) to batch-free entries belonging to retired tasks, returning them to the free list, before the inserts proceed.
 
 This design avoids the complexity of ring-based wrapping while still being bounded by `PTO2_TENSORMAP_POOL_SIZE` (default 65536 entries).
 
@@ -292,7 +292,7 @@ This uses the **per-task entry chain** (`task_entry_head[task_slot]`) — each t
 
 **Layer 3 — Back-Pressure on Pool Exhaustion** (blocking):
 
-If both the free list and bump region are depleted, `new_entry()` blocks until `PTO2TensorMap::sync_tensormap(force=true)` frees entries by advancing `last_task_alive` through `cleanup_retired`.
+Before STEP 4 inserts a task's outputs, `ensure_tensormap_capacity` checks the free list + bump region against the task's needed entry count. If short, it reclaims retired entries across all rings and blocks until reclaim frees enough entries. Progress is measured by entries actually freed, not by watermark movement — a ring can retire zero-output tasks, advancing `last_task_alive` without freeing any entry. A pool that frees nothing for a 500 ms wall-clock timeout is a genuine deadlock: it latches `PTO2_ERROR_TENSORMAP_OVERFLOW` and unwinds, matching the task allocator and fanin spill pool.
 
 This forms a back-pressure mechanism analogous to the Task Ring's flow control.
 
@@ -550,7 +550,7 @@ Public surface (called from `AicpuExecutor::init/run/deinit`):
 | `shutdown(thread_idx)` | per thread on exit | `platform_deinit_aicore_regs` for this thread's cores; PMU finalize when enabled |
 | `on_orchestration_done(runtime, rt, thread_idx, total_tasks)` | orchestrator thread | Publish core assignments, latch task count, fold inline-completed tasks, flip `orchestrator_done_`, drive orch→sched core transition (or `emergency_shutdown` on fatal) |
 | `deinit()` | once per run | Reset every scheduler-owned field to its post-construction default |
-| Read-only accessors | various | `aic_count()` / `aiv_count()` / `is_completed()` / `completed_tasks_count()` / `wait_pto2_init_complete()` |
+| Read-only accessors | various | `aic_count()` / `aiv_count()` / `is_completed()` / `completed_tasks_count()` |
 
 Private internals are split across three .cpp files by responsibility:
 
@@ -640,16 +640,17 @@ Built by the scheduler from `PTO2TaskDescriptor`:
 | Flag | Set by | Waited by | Purpose |
 | ---- | ------ | --------- | ------- |
 | `runtime_init_ready_` | Thread 3 | Threads 0-2 | Runtime and SM handle initialized |
-| `pto2_init_claimed_` | First init thread | Others | One-time memset of arrays started (exchange guard) |
-| `pto2_init_complete_` | Init thread | Thread 3 + others | One-time init of per-task arrays done |
+
+Profiling-subsystem init (`dump_args` / `pmu` / `dep_gen` / `l2_swimlane`) runs
+once in `SchedulerContext::init()` on the single-threaded cold path, before any
+scheduler/orchestrator thread starts — so it needs no cross-thread init
+handshake.
 
 Startup sequence:
 
 1. Thread 3: create SM handle + runtime → set `runtime_init_ready_`
-2. Scheduler threads: wait for `runtime_init_ready_` → one thread wins `pto2_init_claimed_` exchange → memset per-task arrays → set `pto2_init_complete_`; other threads wait for `pto2_init_complete_`
-3. Thread 3: wait for `pto2_init_complete_` → configure orchestrator-scheduler pointers
-4. Scheduler threads: enter main loop
-5. Thread 3: call orchestration function → set `orchestrator_done_`
+2. Scheduler threads: wait for `runtime_init_ready_` → enter main loop
+3. Thread 3: configure orchestrator-scheduler pointers → call orchestration function → set `orchestrator_done_`
 
 ---
 

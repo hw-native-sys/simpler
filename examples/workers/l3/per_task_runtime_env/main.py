@@ -7,14 +7,19 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""L3 Worker API demo — one orchestration dispatches two L2 tasks, each sized
-with its OWN ring buffers.
+"""L3 Worker API demo — one orchestration dispatches several L2 tasks, each
+sized with its OWN ring buffers.
 
 This is the headline use case for ``CallConfig.runtime_env``: an L3 fans out
 several heterogeneous L2 tasks in one launch, and each L2 needs a different
 ring footprint (a heavy task wants a big heap / wide window; a light one is
 fine with the default). Before this knob, all L2 tasks in one L3 launch shared
 the process-wide ``PTO2_RING_*`` env and could not be sized independently.
+
+The demo dispatches three L2 tasks: two use the scalar form (one ring value
+broadcast to every ring), and a third passes 4-entry lists for
+``ring_task_window`` / ``ring_heap`` / ``ring_dep_pool`` to size each of the four
+scope-depth rings independently.
 
 The key line is inside ``orch_fn``: each ``submit_next_level`` gets its OWN
 ``CallConfig`` whose ``runtime_env`` is set per task. That per-task config
@@ -56,11 +61,17 @@ VECTOR_ADD_KERNELS = os.path.join(HERE, "..", "..", "l2", "vector_add", "kernels
 N_ROWS = 128
 N_COLS = 128
 
+# RuntimeEnv keys an L2 spec may carry. Each takes a scalar (broadcast to every
+# ring) or a 4-entry list (one value per scope-depth ring 0..3).
+RING_FIELDS = ("ring_task_window", "ring_heap", "ring_dep_pool")
+
 # One entry per L2 task dispatched by the orchestration. Each carries its own
-# ring sizing; the inputs differ so the two golden checks are independent.
+# ring sizing; the inputs differ so the golden checks are independent. The first
+# two tasks use the scalar form (one value broadcast to every ring); the third
+# passes 4-entry lists to size each scope-depth ring independently.
 L2_TASKS = [
     {
-        "label": "l2_small",
+        "label": "l2_scalar_small",
         "a": 2.0,
         "b": 3.0,
         "ring_task_window": 16,
@@ -68,12 +79,20 @@ L2_TASKS = [
         "ring_dep_pool": 64,
     },
     {
-        "label": "l2_large",
+        "label": "l2_scalar_large",
         "a": 5.0,
         "b": 7.0,
         "ring_task_window": 128,
         "ring_heap": 8 * 1024 * 1024,
         "ring_dep_pool": 256,
+    },
+    {
+        "label": "l2_per_ring",
+        "a": 1.0,
+        "b": 4.0,
+        "ring_task_window": [128, 64, 32, 16],
+        "ring_heap": [8 * 1024 * 1024, 4 * 1024 * 1024, 2 * 1024 * 1024, 1 * 1024 * 1024],
+        "ring_dep_pool": [256, 128, 64, 64],
     },
 ]
 
@@ -81,7 +100,7 @@ L2_TASKS = [
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("-p", "--platform", required=True, choices=["a2a3sim", "a2a3"])
-    parser.add_argument("-d", "--device", type=int, default=0, help="Single device id; the two L2 tasks run serially.")
+    parser.add_argument("-d", "--device", type=int, default=0, help="Single device id; the L2 tasks run serially.")
     return parser.parse_args()
 
 
@@ -142,9 +161,9 @@ def _l2_config(base: CallConfig, spec: dict) -> CallConfig:
     cfg.enable_dep_gen = base.enable_dep_gen
     cfg.enable_scope_stats = base.enable_scope_stats
     cfg.output_prefix = base.output_prefix
-    cfg.runtime_env.ring_task_window = spec["ring_task_window"]
-    cfg.runtime_env.ring_heap = spec["ring_heap"]
-    cfg.runtime_env.ring_dep_pool = spec["ring_dep_pool"]
+    for key in RING_FIELDS:
+        if key in spec:
+            setattr(cfg.runtime_env, key, spec[key])
     return cfg
 
 
@@ -188,7 +207,7 @@ def run(platform: str, device_id: int) -> int:
                 print(f"[per_task_runtime_env] submit '{spec['label']}': runtime_env={cfg.runtime_env!r}")
                 orch.submit_next_level(chip_handle, chip_args, cfg)
 
-        print("[per_task_runtime_env] running DAG (2 L2 tasks, distinct rings)...")
+        print(f"[per_task_runtime_env] running DAG ({len(L2_TASKS)} L2 tasks, distinct rings)...")
         worker.run(orch_fn, args=None, config=CallConfig())
 
         for i, spec in enumerate(L2_TASKS):

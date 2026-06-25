@@ -17,6 +17,7 @@
 #include "aicpu/device_log.h"
 #include "aicpu/device_time.h"
 #include "aicpu/l2_swimlane_collector_aicpu.h"
+#include "aicpu/platform_aicpu_affinity.h"
 #include "aicpu/platform_regs.h"
 #include "aicpu/pmu_collector_aicpu.h"
 #include "aicpu/tensor_dump_aicpu.h"
@@ -1084,9 +1085,17 @@ int AicpuExecutor::resolve_and_dispatch(Runtime &runtime, int thread_idx, const 
 }
 
 int AicpuExecutor::run(Runtime *runtime) {
-    int thread_idx = thread_idx_++;
+    int affinity_exec_idx = platform_aicpu_affinity_thread_idx();
+    int thread_idx = (affinity_exec_idx >= 0) ? affinity_exec_idx : (thread_idx_++);
+    if (thread_idx < 0 || thread_idx >= aicpu_thread_num_ || thread_idx >= MAX_AICPU_THREADS) {
+        LOG_ERROR(
+            "Thread index %d out of bounds (active=%d max=%d exec_idx=%d)", thread_idx, aicpu_thread_num_,
+            MAX_AICPU_THREADS, affinity_exec_idx
+        );
+        return -1;
+    }
 
-    LOG_INFO_V0("Thread %d: Start", thread_idx);
+    LOG_INFO_V0("Thread %d: Start (exec_idx=%d)", thread_idx, affinity_exec_idx);
 
     const int *cur_thread_cores = core_assignments_[thread_idx];
 
@@ -1297,6 +1306,13 @@ void AicpuExecutor::diagnose_stuck_state(
 }
 
 // ===== Public Entry Point =====
+
+extern "C" int aicpu_prewarm_callable(Runtime *runtime) {
+    // host_build_graph resolves orchestration on the host during prepare.
+    // There is no AICPU orch_so_table_ state to prewarm.
+    (void)runtime;
+    return 0;
+}
 
 /**
  * aicpu_execute - Main AICPU kernel execution entry point
