@@ -179,9 +179,92 @@ is a worked example — the AIC and AIV classes grew `pto_block_idx`,
 down from `kernel_entry` into `UnpadAttentionDecoderAic::SetArgs` and
 `UnpadAttentionDecoderAiv::SetArgs`.
 
+### When the no-arg call is inside the pto-isa tile-pipe library
+
+The porting checklist above assumes you own every `get_subblockid()` call
+site. You do **not** when the kernel drives the pto-isa tile-pipe library
+(`TPUSH` / `TPOP` / `TFREE` with `TileSplitAxis::TILE_UP_DOWN` or
+`TILE_LEFT_RIGHT`): those templates compute their per-AIV FIFO offset from the
+**no-arg** `get_subblockid()` internally
+(`TPush.hpp::pushVec2GMFiFo` / `popVecTileFromGMFiFo` —
+`subAIVOffset = get_subblockid() * rows * cols * sizeof(T)`), and you cannot
+thread `args` into a third-party library template.
+
+Under simpler's MIX dispatch that library call returns 0 for both lanes, so its
+auto-split contributes nothing and **both AIV lanes read/write the same FIFO
+half**. The other half is never produced; attention then reads uninitialised GM
+and the output is wrong/partial (observed as `NaN` in the qwen3 case here).
+
+**Do not** bridge it with a file-scope cache:
+
+```cpp
+// WRONG — the .o will not load. See §4.
+[[block_local]] static int32_t lane;   // per-core static
+#define get_subblockid() lane          // redirect the library's no-arg call
+// ... lane = get_sub_block_id(args); once in kernel_entry
+```
+
+A `[[block_local]]` (or any non-const) static is read via a `.text` relocation
+that the AICore loader rejects (§4), and AICore forbids ordinary global/static
+data, so there is no relocation-free global to redirect into either.
+
+The working pattern (as in `spmd_paged_attention`) leaves the library's
+`get_subblockid()` at its native 0 and adds the per-lane offset **explicitly**
+on the tile-pipe, computed from `get_sub_block_id(args)`:
+
+```cpp
+int32_t lane = get_sub_block_id(args);                        // 0 or 1, real lane
+// TILE_UP_DOWN splits an M×N tile by rows; AIV1 starts one sub-tile in.
+pipe.cons.setEntryOffset(lane * Rows * Cols * sizeof(ConsT)); // C2V pop side
+pipe.prod.setEntryOffset(lane * Rows * Cols * sizeof(ProdT)); // V2C push side
+```
+
+The library adds `get_subblockid() * bytes` (= 0) **plus** your `entryOffset`,
+so the explicit offset now carries the entire lane split. Set it once after the
+pipe is constructed; `entryOffset` persists across `TPUSH` / `TPOP`. See
+`examples/a2a3/tensormap_and_ringbuffer/qwen3_14b_decode/kernels/aiv/fa_fused_aiv.cpp`
+for a worked example.
+
 ---
 
-## 4. Hard constraints — what AICore physically cannot do
+## 4. The AICore loader runs raw `.text` only
+
+simpler loads a kernel by copying the **literal `.text` section bytes** out of
+the compiled `.o` and jumping to them
+([`simpler_setup/elf_parser.py`](../simpler_setup/elf_parser.py)). It does
+**not**:
+
+- apply ELF relocations (`.rela.text`), or
+- merge out-of-line template instantiations (`.text._Z*` COMDAT groups).
+
+If a kernel `.o` carries either, the loader refuses it with
+"AICore loader cannot extract a runnable payload …" rather than load a binary
+whose `BL`/`B` targets are left as `imm26 = 0` — those would branch to garbage
+on device, producing CANN 507018 watchdog timeouts or silently-wrong partial
+output (the failure modes behind issue #900, PR #830 / issue #831). The loader
+is strict **by design**; it is not relaxed to let "benign" relocations through.
+
+Two things produce a rejected `.o`:
+
+| Cause | Why it relocates | Fix |
+| ----- | ---------------- | --- |
+| Out-of-line call to another function (a non-inlined `static` helper, or a template instantiation emitted to its own section) | `BL <fn>` needs an `R_AARCH64_CALL26` relocation the loader can't apply | Mark every function in the call chain `__attribute__((always_inline))` so the compiler folds them into one `.text` |
+| Reading a non-const global / `static` / `[[block_local]]` variable | The address load needs a relocation against the data symbol | Don't use module-level mutable data on AICore — pass the value as a function argument down from `kernel_entry` |
+
+Verify a kernel object before chasing a device hang:
+
+```bash
+readelf -SW kernel.o | grep -E '\.text'  # want only ".text"; ".text._Z*" or ".rela.text" = reject
+readelf -r  kernel.o                      # want: no relocation entries
+```
+
+This is exactly why §3's sub-block-id fix uses an explicit `setEntryOffset`
+argument rather than a cached `[[block_local]]` static: the static would
+reintroduce a `.rela.text` the loader rejects.
+
+---
+
+## 5. Hard constraints — what AICore physically cannot do
 
 These are not design preferences; the hardware refuses or the chip
 hangs. They cap what protocol the kernel author can ask of the AICore
@@ -219,7 +302,7 @@ update — for example, a counter, a profiling slot, or a
 ring-buffer-style record — it must go through GM with `dcci`. There
 is no "fast direct register" alternative on the AICore side.
 
-### 4.1 AIC vs AIV on SPR self-access — single-run measurements
+### 5.1 AIC vs AIV on SPR self-access — single-run measurements
 
 These were sampled on a3 silicon during the experiment that produced
 [`mmio-performance.md`](hardware/mmio-performance.md). They are
@@ -257,7 +340,7 @@ with `-DCCE_AICORE_ARCH=dav-c220-cube` for AIC and once with
 `-DCCE_AICORE_ARCH=dav-c220-vec` for AIV; both findings need the
 AIC/AIV comparison to be meaningful.
 
-## 5. Related
+## 6. Related
 
 - [`src/a2a3/runtime/tensormap_and_ringbuffer/common/intrinsic.h`](../src/a2a3/runtime/tensormap_and_ringbuffer/common/intrinsic.h)
   — declarations of the args-based accessors and the
