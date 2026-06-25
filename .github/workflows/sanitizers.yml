@@ -16,6 +16,7 @@ on:
   # Manual trigger so a flaky nightly can be re-run on demand to confirm it
   # reproduces (and now that reports are captured, to inspect the stack).
   workflow_dispatch:
+  pull_request:
 
 concurrency:
   group: sanitizers-${{ github.ref }}
