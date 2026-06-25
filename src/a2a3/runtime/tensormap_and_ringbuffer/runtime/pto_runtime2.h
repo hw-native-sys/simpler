@@ -55,7 +55,14 @@ struct PTO2RuntimeOps
     bool (*is_fatal)(PTO2Runtime *rt);
     void (*report_fatal)(PTO2Runtime *rt, int32_t error_code, const char *func, const char *fmt, ...);
 
-    // Logging (populated by runtime, called by orchestration)
+    // Logging (populated by runtime, called by orchestration).
+    // ABI-aligned with pto_orchestration_api.h's PTO2RuntimeOps: log_error,
+    // log_warn, log_debug, log_info_v in this exact order. Mismatched layout
+    // here causes the orch SO to call wrong function pointers via rt->ops,
+    // which manifests as silent hangs in the dlopen'd orchestration code.
+    void (*log_error)(const char *func, const char *fmt, ...);
+    void (*log_warn)(const char *func, const char *fmt, ...);
+    void (*log_debug)(const char *func, const char *fmt, ...);
     // INFO with explicit verbosity tier (v ∈ [0, 9]; gating done inside).
     void (*log_info_v)(const char *func, int v, const char *fmt, ...);
 
@@ -288,9 +295,36 @@ inline void rt_report_fatal(PTO2Runtime *rt, int32_t error_code, const char *fun
     va_end(args);
 }
 
-// Orchestration-side logging dispatcher: orchestration .so calls
-// LOG_INFO_V<n>(fmt, ...) which routes through this op into the unified log.
-// The verbosity gate lives inside unified_log_info_v.
+// Orchestration-side logging dispatchers: orchestration .so calls
+// LOG_*(fmt, ...) which routes through these ops into the unified log.
+// Verbosity gates live inside the unified_log_* primitives.
+inline void rt_log_error(const char *func, const char *fmt, ...)
+{
+    va_list args;
+    va_start(args, fmt);
+    char message[1024];
+    vsnprintf(message, sizeof(message), fmt, args);
+    va_end(args);
+    unified_log_error(func, "%s", message);
+}
+inline void rt_log_warn(const char *func, const char *fmt, ...)
+{
+    va_list args;
+    va_start(args, fmt);
+    char message[1024];
+    vsnprintf(message, sizeof(message), fmt, args);
+    va_end(args);
+    unified_log_warn(func, "%s", message);
+}
+inline void rt_log_debug(const char *func, const char *fmt, ...)
+{
+    va_list args;
+    va_start(args, fmt);
+    char message[1024];
+    vsnprintf(message, sizeof(message), fmt, args);
+    va_end(args);
+    unified_log_debug(func, "%s", message);
+}
 inline void rt_log_info_v(const char *func, int v, const char *fmt, ...)
 {
     va_list args;
@@ -464,6 +498,9 @@ inline const PTO2RuntimeOps s_runtime_ops = {
     .orchestration_done = rt_orchestration_done,
     .is_fatal = is_fatal_impl,
     .report_fatal = rt_report_fatal,
+    .log_error = rt_log_error,
+    .log_warn = rt_log_warn,
+    .log_debug = rt_log_debug,
     .log_info_v = rt_log_info_v,
     .get_tensor_data = get_tensor_data,
     .set_tensor_data = set_tensor_data,
