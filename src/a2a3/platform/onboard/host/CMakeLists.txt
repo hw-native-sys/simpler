@@ -161,11 +161,16 @@ endif()
 # Link against CANN runtime libraries
 # ascend_hal is dynamically loaded at runtime via dlopen in device_runner
 # when performance profiling is enabled
+# HcclGetRootInfo/HcclCommInitRootInfo are declared weak in CANN's hccl_comm.h.
+# Under a toolchain that defaults to --as-needed (Ubuntu/conda gcc on x86), a
+# weak undefined ref does not mark libhcomm "needed", so its DT_NEEDED is
+# dropped and the symbols resolve to NULL at runtime -> SIGSEGV on the first
+# HcclGetRootInfo call. Force the dependency so it survives any default. See #1018.
 target_link_libraries(host_runtime
     PRIVATE
         runtime
         ascendcl
-        ${HCCL_LINK_TARGETS}
+        -Wl,--no-as-needed ${HCCL_LINK_TARGETS} -Wl,--as-needed
         dl
 )
 
