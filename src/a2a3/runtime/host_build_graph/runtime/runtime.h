@@ -40,6 +40,7 @@
 #include "common/core_type.h"
 #include "common/l2_swimlane_profiling.h"
 #include "common/platform_config.h"
+#include "aicpu/platform_aicpu_affinity.h"  // MAX_GATE_THREADS (aicpu_allowed_cpus bound)
 #include "pto_runtime2_types.h"
 #include "tensor_info.h"
 
@@ -227,7 +228,7 @@ public:
     // launch from AICPU OCCUPY; the device gate keeps threads whose
     // sched_getcpu() lands on one of the cpu_ids. The array position is the
     // deterministic exec_idx used by AicpuExecutor for stable core assignment.
-    int32_t aicpu_allowed_cpus[16];
+    int32_t aicpu_allowed_cpus[MAX_GATE_THREADS];
     int32_t aicpu_allowed_cpu_count;
     int32_t aicpu_launch_count;
 

@@ -39,6 +39,7 @@
 #include "common/core_type.h"
 #include "common/l2_swimlane_profiling.h"
 #include "common/platform_config.h"
+#include "aicpu/platform_aicpu_affinity.h"  // MAX_GATE_THREADS (aicpu_allowed_cpus bound)
 #include "pto2_dispatch_payload.h"
 #include "task_args.h"
 
@@ -206,7 +207,7 @@ public:
     // sched_getcpu() lands on one of the cpu_ids. The array position is the
     // deterministic exec_idx used by AicpuExecutor for sched/orch role
     // assignment; the highest active index is the orchestrator slot.
-    int32_t aicpu_allowed_cpus[16];
+    int32_t aicpu_allowed_cpus[MAX_GATE_THREADS];
     int32_t aicpu_allowed_cpu_count;
     int32_t aicpu_launch_count;
 

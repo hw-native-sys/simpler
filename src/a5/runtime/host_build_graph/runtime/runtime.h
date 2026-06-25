@@ -39,6 +39,7 @@
 
 #include "common/core_type.h"
 #include "common/platform_config.h"
+#include "aicpu/platform_aicpu_affinity.h"  // MAX_GATE_THREADS (aicpu_allowed_cpus bound)
 #include "tensor_info.h"
 
 // Logging macros using unified logging interface
@@ -237,9 +238,9 @@ public:
     // sched_getcpu() lands on one of these cpu_ids; exec_idx = position in
     // this array drives sched/orch role assignment. Indices 0..count-2 are
     // scheduler slots, index count-1 is the orchestrator slot. Sized to
-    // PLATFORM_MAX_AICPU_THREADS_JUST_FOR_LAUNCH for headroom — current
-    // policy is 4 sched + 1 orch = 5 active.
-    int32_t aicpu_allowed_cpus[16];
+    // MAX_GATE_THREADS (the shared gate/ABI bound, ≥ any launch count) for
+    // headroom — current policy is 4 sched + 1 orch = 5 active.
+    int32_t aicpu_allowed_cpus[MAX_GATE_THREADS];
     int32_t aicpu_allowed_cpu_count;
     // Actual AICPU thread launch count for this run. Set by the host
     // topology probe to popcount(OCCUPY) so CANN spreads threads across

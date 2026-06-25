@@ -12,6 +12,14 @@
 #pragma once
 #include <cstdint>
 
+// Upper bound on AICPU gate threads / slots, and the size of the
+// `aicpu_allowed_cpus[]` table the host writes into Runtime. Single source of
+// truth: the filter gate barriers/classifies at most this many threads, and
+// `allowed_count` (the number of survivor cpu_ids) is bounded by it — so the
+// Runtime ABI array must be exactly this long. Keep the runtime structs and
+// the gate in lockstep by referencing this constant instead of a literal.
+constexpr int32_t MAX_GATE_THREADS = 16;
+
 // Returns true if this thread should call aicpu_execute().
 // Returns false if this thread should exit (dropped).
 // logical_count: desired active threads (from runtime.aicpu_thread_num)

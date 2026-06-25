@@ -18,10 +18,10 @@
 
 #include "common/unified_log.h"
 
-// 16 = headroom for a5's launch budget (14 logical user cpus on the
-// 0x7ffe SKU) + a small over-launch margin. a2a3 only ever launches 6
-// threads and never approaches this bound.
-static constexpr int32_t MAX_GATE_THREADS = 16;
+// MAX_GATE_THREADS (= 16) is defined in aicpu/platform_aicpu_affinity.h, the
+// single source of truth shared with the Runtime ABI. 16 = headroom for a5's
+// launch budget (14 logical user cpus on the 0x7ffe SKU) + a small over-launch
+// margin. a2a3 only ever launches 6 threads and never approaches this bound.
 
 // Per-thread exec/slot index set by the filter gate:
 // -1 = dropped, otherwise this thread's index in allowed_cpus[].
