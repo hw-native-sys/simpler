@@ -851,7 +851,7 @@ def _decode_async_run_request(payload: bytes) -> tuple[bytes, bytes, CallConfig]
         raise RuntimeError(f"RUN_ASYNC payload too small: {len(payload)} bytes")
     digest = bytes(payload[_ASYNC_RUN_OFF_DIGEST : _ASYNC_RUN_OFF_DIGEST + CALLABLE_HASH_DIGEST_BYTES])
     cfg = _read_config_from_bytes(payload, _ASYNC_RUN_OFF_CONFIG)
-    return digest, bytes(payload[_ASYNC_RUN_OFF_ARGS_BLOB :]), cfg
+    return digest, bytes(payload[_ASYNC_RUN_OFF_ARGS_BLOB:]), cfg
 
 
 def _copy_call_config(config: CallConfig | None) -> CallConfig:
@@ -1286,7 +1286,7 @@ def _complete_child_unregister(state: _ChildUnregisterState, error: BaseExceptio
         state.cv.notify_all()
 
 
-def _prepare_child_register_bytes(
+def _prepare_child_register_bytes(  # noqa: PLR0913
     cw: ChipWorker,
     registry: dict[int, Any],
     identity_table: dict[bytes, int],
@@ -1622,7 +1622,7 @@ def _run_chip_main_loop(  # noqa: PLR0912, PLR0913, PLR0915 -- unified TASK_READ
                         digest = _read_control_digest(buf)
                         payload_size = struct.unpack_from("Q", buf, _CTRL_OFF_ARG0)[0]
                         shm_name = _read_shm_name(buf, _OFF_ARGS)
-                        callable_bytes = bytearray(_read_raw_payload_from_shm(shm_name, int(payload_size)))
+                        callable_bytes = _read_raw_payload_from_shm(shm_name, int(payload_size))
                         reg_state = _ChildRegisterState()
                         handle_id = next_register_handle
                         next_register_handle += 1
@@ -2841,7 +2841,9 @@ class Worker:
         completed = True
         return RegisterHandle(lambda: handle, lambda: completed)
 
-    def _l2_submit_register_async(self, handle: CallableHandle, target: ChipCallable, *, is_new: bool) -> RegisterHandle:
+    def _l2_submit_register_async(
+        self, handle: CallableHandle, target: ChipCallable, *, is_new: bool
+    ) -> RegisterHandle:
         if not is_new:
             completed = True
             return RegisterHandle(lambda: handle, lambda: completed)
@@ -3564,9 +3566,10 @@ class Worker:
                 self._complete_unregister_state(unreg_state)
                 return UnregisterHandle(lambda: self._wait_unregister_state(unreg_state), lambda: unreg_state.completed)
 
-        assert self._worker is not None
+        worker_endpoint = self._worker
+        assert worker_endpoint is not None
         try:
-            submitted = list(self._worker.broadcast_unregister_async_all(digest))
+            submitted = list(worker_endpoint.broadcast_unregister_async_all(digest))
         except BaseException as e:  # noqa: BLE001
             with self._registry_lock:
                 if remove_target:
@@ -3588,12 +3591,14 @@ class Worker:
             self._complete_unregister_state(unreg_state, err)
             return UnregisterHandle(lambda: self._wait_unregister_state(unreg_state), lambda: unreg_state.completed)
 
+        state_for_wait = state
+
         def wait_remote() -> None:
             try:
                 wait_errors: list[str] = []
                 for result in submitted:
                     try:
-                        self._worker.control_wait_unregister(int(result.worker_id), int(result.remote_handle))
+                        worker_endpoint.control_wait_unregister(int(result.worker_id), int(result.remote_handle))
                     except BaseException as exc:  # noqa: BLE001
                         wait_errors.append(f"{result.worker_type}[{int(result.worker_id)}]: {exc}")
                 if wait_errors:
@@ -3611,7 +3616,7 @@ class Worker:
                 if remove_target:
                     with self._registry_lock:
                         current = self._identity_registry.get(digest)
-                        if current is state and current.ref_count <= 0:
+                        if current is not None and current is state_for_wait and current.ref_count <= 0:
                             self._callable_registry.pop(cid, None)
                             self._identity_registry.pop(digest, None)
                         self._pending_unregister_cids.discard(cid)

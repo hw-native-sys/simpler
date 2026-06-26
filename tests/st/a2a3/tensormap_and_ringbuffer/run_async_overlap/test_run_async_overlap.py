@@ -3,7 +3,7 @@
 # This program is free software, you can redistribute it and/or modify it under the terms and conditions of
 # CANN Open Software License Agreement Version 2.0 (the "License").
 # Please refer to the License for details. You may not use this file except in compliance with the License.
-# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EXPRESS OR IMPLIED,
+# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
@@ -44,7 +44,9 @@ from simpler_setup.pto_isa import ensure_pto_isa_root  # noqa: E402
 from simpler_setup.torch_interop import make_tensor_arg  # noqa: E402
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-VECTOR_EXAMPLE = os.path.abspath(os.path.join(HERE, "../../../../../examples/a2a3/tensormap_and_ringbuffer/vector_example"))
+VECTOR_EXAMPLE = os.path.abspath(
+    os.path.join(HERE, "../../../../../examples/a2a3/tensormap_and_ringbuffer/vector_example")
+)
 RUNTIME = "tensormap_and_ringbuffer"
 N_ROWS = 128
 N_COLS = 128
@@ -85,6 +87,7 @@ def build_repeat_vector_add_callable(platform: str) -> ChipCallable:
     )
     core_callable = CoreCallable.build(
         signature=[ArgDirection.IN, ArgDirection.IN, ArgDirection.OUT],
+        arg_index=[0, 1, 2],
         binary=kernel_bytes,
     )
     return ChipCallable.build(
@@ -112,6 +115,7 @@ def build_vector_add_callable(platform: str) -> ChipCallable:
     )
     core_callable = CoreCallable.build(
         signature=[ArgDirection.IN, ArgDirection.IN, ArgDirection.OUT],
+        arg_index=[0, 1, 2],
         binary=kernel_bytes,
     )
     return ChipCallable.build(
@@ -140,7 +144,9 @@ def make_vector_args(host_a: torch.Tensor, host_out: torch.Tensor, dev_w: int):
     return args
 
 
-def run(platform: str, device: int, repeat_count: int, *, skip_register: bool = False, dag_baseline: bool = False) -> None:
+def run(
+    platform: str, device: int, repeat_count: int, *, skip_register: bool = False, dag_baseline: bool = False
+) -> None:
     repeat_callable = None if skip_register else build_repeat_vector_add_callable(platform)
     vector_callable = build_vector_add_callable(platform)
 
@@ -171,6 +177,7 @@ def run(platform: str, device: int, repeat_count: int, *, skip_register: bool = 
             print(f"[run_async_overlap] dag_baseline max_diff={max_diff:.3e}")
             assert torch.allclose(host_out, expected, rtol=1e-5, atol=1e-5)
             return
+
         def run_c1(orch, _args, _cfg):
             orch.submit_next_level(c1_handle, c1_args, cfg, worker=0)
 
