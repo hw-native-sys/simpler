@@ -46,7 +46,7 @@
 #include "hccl/hccl_comm.h"
 #include "hccl/hccl_types.h"
 #ifdef SIMPLER_ENABLE_PTO_SDMA_WORKSPACE
-#include "pto/npu/comm/async/sdma/sdma_workspace_manager.hpp"
+#include "pto/comm/async/sdma/sdma_workspace_manager.hpp"
 #endif
 
 // Thin wrappers around the HCCL public APIs we use. Kept as a translation
