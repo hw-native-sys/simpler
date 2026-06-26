@@ -560,6 +560,7 @@ protected:
      * @return 0 on success, the underlying init_runtime_args rc on failure.
      */
     int init_runtime_args_with_metadata(Runtime &runtime);
+    int init_runtime_args_with_metadata(Runtime &runtime, KernelArgsHelper &helper);
 
     /**
      * Start collector mgmt + poll threads for the four shared
@@ -746,7 +747,9 @@ protected:
     // `finalize()`. `nullptr` before init.
     rtStream_t stream_aicpu_{nullptr};
     rtStream_t stream_aicore_{nullptr};
+    rtStream_t stream_aicpu_prewarm_{nullptr};
     KernelArgsHelper kernel_args_;
+    KernelArgsHelper prewarm_kernel_args_;
 
     // Platform-level device wall buffer: 8-byte device-resident slot
     // whose address rides on `KernelArgs.device_wall_data_base`. AICPU

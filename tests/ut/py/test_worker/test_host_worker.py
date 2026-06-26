@@ -107,11 +107,19 @@ def _slot_for(worker: Worker, handle: CallableHandle) -> int:
 
 
 class _FakeControlResult:
-    def __init__(self, worker_type: str, worker_id: int = 0, ok: bool = True, error_message: str = ""):
+    def __init__(
+        self,
+        worker_type: str,
+        worker_id: int = 0,
+        ok: bool = True,
+        error_message: str = "",
+        remote_handle: int = 1,
+    ):
         self.worker_type = worker_type
         self.worker_id = worker_id
         self.ok = ok
         self.error_message = error_message
+        self.remote_handle = remote_handle
 
 
 def _chip_payload_shm(callable_obj: ChipCallable) -> SharedMemory:
@@ -454,13 +462,14 @@ class TestLifecycle:
         callable_obj = ChipCallable.build(signature=[], func_name="x", binary=b"\x00", children=[])
         observed = {}
 
-        def fake_post_init_register(target, digest, *, is_new):
+        def fake_post_init_register_async(target, digest, *, is_new):
             observed["target"] = target
             observed["digest"] = digest
             observed["is_new"] = is_new
             observed["locked"] = hw._registry_lock.locked()
+            return []
 
-        hw._post_init_register = fake_post_init_register
+        hw._post_init_register_async = fake_post_init_register_async
 
         handle = hw.register(callable_obj)
 
@@ -1183,9 +1192,12 @@ class TestLifecycle:
         calls = []
 
         class FakeWorker:
-            def broadcast_register_all(self, blob_ptr, blob_size, digest):
+            def broadcast_register_async_all(self, blob_ptr, blob_size, digest):
                 calls.append(("binary_register", blob_size, digest))
                 return [_FakeControlResult("NEXT_LEVEL", 0, True)]
+
+            def control_wait_register(self, worker_id, handle_id):
+                calls.append(("wait_register", worker_id, handle_id))
 
         hw = Worker(level=3, num_sub_workers=1)
         hw._initialized = True
@@ -1202,7 +1214,9 @@ class TestLifecycle:
         assert hw._identity_registry[first.digest].ref_count == 2
         assert calls == [
             ("binary_register", int(callable_obj.buffer_size()), first.digest),
+            ("wait_register", 0, 1),
             ("binary_register", int(callable_obj.buffer_size()), second.digest),
+            ("wait_register", 0, 1),
         ]
 
     def test_duplicate_chip_prepare_partial_failure_preserves_existing_handle(self):
@@ -1212,12 +1226,15 @@ class TestLifecycle:
             def __init__(self):
                 self.register_count = 0
 
-            def broadcast_register_all(self, blob_ptr, blob_size, digest):
+            def broadcast_register_async_all(self, blob_ptr, blob_size, digest):
                 self.register_count += 1
                 calls.append(("binary_register", self.register_count, digest))
                 if self.register_count == 1:
                     return [_FakeControlResult("NEXT_LEVEL", 0, True), _FakeControlResult("NEXT_LEVEL", 1, True)]
                 return [_FakeControlResult("NEXT_LEVEL", 0, True), _FakeControlResult("NEXT_LEVEL", 1, False, "boom")]
+
+            def control_wait_register(self, worker_id, handle_id):
+                calls.append(("wait_register", worker_id, handle_id))
 
             def control_digest_only(self, worker_type, worker_id, sub_cmd, digest, timeout_s=None):
                 calls.append(("cleanup_one", worker_type, worker_id, sub_cmd, digest))
@@ -1239,6 +1256,8 @@ class TestLifecycle:
         assert first.digest not in hw._uncertain_hashids
         assert calls == [
             ("binary_register", 1, first.digest),
+            ("wait_register", 0, 1),
+            ("wait_register", 1, 1),
             ("binary_register", 2, first.digest),
             ("cleanup_one", WorkerType.NEXT_LEVEL, 0, _CTRL_UNREGISTER, first.digest),
         ]
@@ -1247,7 +1266,7 @@ class TestLifecycle:
         calls = []
 
         class FakeWorker:
-            def broadcast_register_all(self, blob_ptr, blob_size, digest):
+            def broadcast_register_async_all(self, blob_ptr, blob_size, digest):
                 calls.append(("binary_register", digest))
                 raise RuntimeError("register failed")
 
