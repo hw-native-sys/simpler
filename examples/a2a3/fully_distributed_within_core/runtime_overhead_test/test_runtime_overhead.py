@@ -1,0 +1,265 @@
+#!/usr/bin/env python3
+# Copyright (c) PyPTO Contributors.
+# This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+# CANN Open Software License Agreement Version 2.0 (the "License").
+# Please refer to the License for details. You may not use this file except in compliance with the License.
+# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+# INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+# See LICENSE in the root of the software repository for the full text of the License.
+# -----------------------------------------------------------------------------------------------------------
+"""Runtime overhead benchmark for the fully_distributed_within_core runtime.
+
+Goal: isolate the cost of *on-core orchestration + claim race + scheduling*
+(everything the distributed runtime does instead of an AICPU scheduler) from
+the cost of the kernels themselves, and see how that cost scales with the
+number of physical blocks (cores).
+
+Method:
+  * Reuse the ``benchmark_bgemm`` workload (same orchestration + GEMM/ADD
+    incores) — referenced directly, not duplicated.
+  * Set ``PTO_DIST_SKIP_EXEC=1`` so the engine skips every incore kernel call
+    and treats each (sub)task as 0-cost, while keeping all ownership/completion
+    bookkeeping. The wall clock then reflects orchestration/scheduling only.
+  * Sweep ``block_dim`` (1 block = 1 AIC + 2 AIV) and report the program wall
+    clock for each, so the relative overhead across core counts is visible.
+
+a2a3sim caps ``block_dim`` at PLATFORM_MAX_BLOCKDIM = 24 (24 AIC + 48 AIV = 72
+cores); 48 *blocks* is not representable (that 48 is the AIV-core count at the
+24-block max). The default sweep is therefore 1 / 12 / 24.
+
+Run (standalone driver produces the comparison table)::
+
+    python test_runtime_overhead.py -p a2a3sim
+    python test_runtime_overhead.py -p a2a3sim --blocks 1,12,24 --rounds 5 --tasks 480
+    python test_runtime_overhead.py -p a2a3sim --exec        # include kernel work (baseline)
+
+The class is also a valid SceneTestCase (cases marked manual), so the workload
+can be golden-checked the normal way with kernels enabled::
+
+    python test_runtime_overhead.py -p a2a3sim --case Blk24 --manual only
+"""
+
+import torch
+from simpler.task_interface import ArgDirection as D
+
+from simpler_setup import SceneTestCase, TaskArgsBuilder, Tensor, scene_test
+
+# The bgemm incore/orchestration sources live in the sibling example; reference
+# them so this benchmark exercises exactly that workload without duplication.
+_BGEMM = "../benchmark_bgemm/kernels"
+
+
+@scene_test(level=2, runtime="fully_distributed_within_core")
+class TestRuntimeOverhead(SceneTestCase):
+    RTOL = 1e-3
+    ATOL = 1e-3
+
+    CALLABLE = {
+        "orchestration": {
+            "source": f"{_BGEMM}/orchestration/bgemm_orch.cpp",
+            "function_name": "aicpu_orchestration_entry",
+            "signature": [D.IN, D.IN, D.OUT, D.IN],
+        },
+        "incores": [
+            {
+                "func_id": 0,
+                "name": "GEMM",
+                "source": f"{_BGEMM}/aic/kernel_gemm_tile.cpp",
+                "core_type": "aic",
+                "signature": [D.IN, D.IN, D.OUT],
+            },
+            {
+                "func_id": 1,
+                "name": "ADD",
+                "source": f"{_BGEMM}/aiv/kernel_tile_add.cpp",
+                "core_type": "aiv",
+                "signature": [D.INOUT, D.IN],
+            },
+        ],
+    }
+
+    # Cases for the normal (golden-checked, kernels-on) pytest path. All manual
+    # so the benchmark never slows the default suite; the headline artifact is
+    # the standalone comparison table below.
+    _BENCH_PARAMS = {"matmul_add_task_num": 480, "incore_data_size": 128, "incore_loop": 4, "grid_k": 2}
+    CASES = [
+        {
+            "name": "Blk1",
+            "manual": True,
+            "platforms": ["a2a3sim", "a2a3"],
+            "config": {"aicpu_thread_num": 4, "block_dim": 1},
+            "params": _BENCH_PARAMS,
+        },
+        {
+            "name": "Blk2",
+            "manual": True,
+            "platforms": ["a2a3sim", "a2a3"],
+            "config": {"aicpu_thread_num": 4, "block_dim": 2},
+            "params": _BENCH_PARAMS,
+        },
+        {
+            "name": "Blk12",
+            "manual": True,
+            "platforms": ["a2a3sim", "a2a3"],
+            "config": {"aicpu_thread_num": 4, "block_dim": 12},
+            "params": _BENCH_PARAMS,
+        },
+        {
+            "name": "Blk24",
+            "manual": True,
+            "platforms": ["a2a3sim", "a2a3"],
+            "config": {"aicpu_thread_num": 4, "block_dim": 24},
+            "params": _BENCH_PARAMS,
+        },
+    ]
+
+    def generate_args(self, params):
+        tile_size = params["incore_data_size"]
+        incore_loop = params["incore_loop"]
+        grid_k = params["grid_k"]
+        num_groups = params["matmul_add_task_num"] // grid_k
+        A = torch.randn(num_groups, grid_k, incore_loop, tile_size, tile_size, dtype=torch.float32) * 0.01
+        B = torch.randn(num_groups, grid_k, incore_loop, tile_size, tile_size, dtype=torch.float32) * 0.01
+        C = torch.zeros(incore_loop * num_groups, tile_size, tile_size, dtype=torch.float32)
+        config = torch.tensor([tile_size, grid_k, num_groups, incore_loop], dtype=torch.int64)
+        return TaskArgsBuilder(
+            Tensor("A", A.flatten()), Tensor("B", B.flatten()), Tensor("C", C.flatten()), Tensor("config", config)
+        )
+
+    def compute_golden(self, args, params):
+        tile_size = params["incore_data_size"]
+        incore_loop = params["incore_loop"]
+        grid_k = params["grid_k"]
+        num_groups = params["matmul_add_task_num"] // grid_k
+        A = args.A.reshape(num_groups, grid_k, incore_loop, tile_size, tile_size)
+        B = args.B.reshape(num_groups, grid_k, incore_loop, tile_size, tile_size)
+        C = args.C.reshape(incore_loop * num_groups, tile_size, tile_size)
+        C[:] = 0.0
+        for group in range(num_groups):
+            for k_idx in range(grid_k):
+                for i in range(incore_loop):
+                    C[group * incore_loop + i] += torch.matmul(A[group, k_idx, i], B[group, k_idx, i])
+
+
+# ---------------------------------------------------------------------------
+# Standalone comparison driver: sweep block_dim, print a wall-clock table.
+# ---------------------------------------------------------------------------
+
+
+def _bench(platform, block_dims, params, rounds, skip_exec, warmup, device):
+    """Run the workload once per block_dim and return per-config timings (us)."""
+    import os  # noqa: PLC0415
+    import statistics  # noqa: PLC0415
+    import time  # noqa: PLC0415
+    from pathlib import Path  # noqa: PLC0415
+
+    from simpler_setup.scene_test import _build_chip_task_args, _resolve_callable_paths  # noqa: PLC0415
+
+    # Engine reads PTO_DIST_SKIP_EXEC at dist_engine_register (once per run()).
+    if skip_exec:
+        os.environ["PTO_DIST_SKIP_EXEC"] = "1"
+    else:
+        os.environ.pop("PTO_DIST_SKIP_EXEC", None)
+
+    # The standalone path skips scene_test's per-class setup, so resolve the
+    # (relative) bgemm kernel sources against this file's directory ourselves.
+    _resolve_callable_paths(TestRuntimeOverhead, Path(__file__).parent)
+
+    inst = TestRuntimeOverhead()
+    orch_sig = TestRuntimeOverhead.CALLABLE["orchestration"]["signature"]
+
+    worker = TestRuntimeOverhead._create_worker(platform, device)
+    results = []
+    try:
+        callable_obj = inst.build_callable(platform)
+        handle = worker.register(callable_obj)
+
+        for bd in block_dims:
+            cfg = inst._build_config({"aicpu_thread_num": 4, "block_dim": bd})
+
+            def _one_run():
+                args = inst.generate_args(params)
+                chip_args, _ = _build_chip_task_args(args, orch_sig)
+                t0 = time.perf_counter()
+                timing = worker.run(handle, chip_args, config=cfg)
+                wall_us = (time.perf_counter() - t0) * 1e6
+                dev_us = float(getattr(timing, "device_wall_us", 0.0) or 0.0)
+                host_us = float(getattr(timing, "host_wall_us", 0.0) or 0.0)
+                return wall_us, host_us, dev_us
+
+            for _ in range(warmup):
+                _one_run()
+            samples = [_one_run() for _ in range(rounds)]
+            wall = statistics.median(s[0] for s in samples)
+            host = statistics.median(s[1] for s in samples)
+            dev = statistics.median(s[2] for s in samples)
+            results.append((bd, wall, host, dev))
+            print(f"  block_dim={bd:>2} ({bd * 3:>3} cores): wall={wall / 1000:8.3f} ms  device={dev / 1000:8.3f} ms")
+    finally:
+        worker.close()
+    return results
+
+
+def _print_table(results, params, rounds, skip_exec):
+    task_num = params["matmul_add_task_num"]
+    # bgemm submits one GEMM (1C) and one ADD (1V) per matmul-add unit.
+    total_tasks = task_num * 2
+    # The on-device orchestrator wall is the metric of interest: it is the pure
+    # on-core orchestration + claim race + scheduling cost. The host wall is
+    # dominated by fixed Python/sim-launch overhead and is shown only for context.
+    base_dev = results[0][3] if results else 0.0
+    mode = "skip-exec (orchestration/scheduling only)" if skip_exec else "with kernels"
+    print()
+    print(f"Runtime overhead — fully_distributed_within_core [{mode}]")
+    print(f"workload=bgemm  matmul_add_task_num={task_num}  (~{total_tasks} tasks)  rounds={rounds} (median)")
+    print()
+    header = (
+        f"| {'blocks':>6} | {'cores':>5} | {'device (ms)':>11} | {'us/task':>8} "
+        f"| {'dev vs 1blk':>11} | {'host (ms)':>10} |"
+    )
+    sep = "|" + "-" * 8 + "|" + "-" * 7 + "|" + "-" * 13 + "|" + "-" * 10 + "|" + "-" * 13 + "|" + "-" * 12 + "|"
+    print(header)
+    print(sep)
+    for bd, wall, _host, dev in results:
+        ratio = (dev / base_dev) if base_dev > 0 else 0.0
+        us_task = dev / total_tasks if total_tasks else 0.0
+        print(
+            f"| {bd:>6} | {bd * 3:>5} | {dev / 1000:>11.3f} | {us_task:>8.2f} "
+            f"| {ratio:>10.2f}× | {wall / 1000:>10.3f} |"
+        )
+    print()
+    print("device (ms) = on-core orchestration + claim race + scheduling wall (PTO2 profiling).")
+    print("host (ms)   = Python wall incl. fixed sim-launch overhead (context only).")
+
+
+def main():
+    import argparse  # noqa: PLC0415
+
+    p = argparse.ArgumentParser(description="fully_distributed_within_core runtime-overhead benchmark")
+    p.add_argument("-p", "--platform", required=True)
+    p.add_argument("-d", "--device", type=int, default=0)
+    p.add_argument("--blocks", default="1,2,12,24", help="comma-separated block_dim values (a2a3sim max 24)")
+    p.add_argument("--rounds", type=int, default=5, help="timed rounds per config (median reported)")
+    p.add_argument("--warmup", type=int, default=1, help="untimed warmup rounds per config")
+    p.add_argument("--tasks", type=int, default=480, help="matmul_add_task_num")
+    p.add_argument("--data-size", type=int, default=128)
+    p.add_argument("--loop", type=int, default=4)
+    p.add_argument("--grid-k", type=int, default=2)
+    p.add_argument("--exec", action="store_true", help="actually run kernels (default: skip for overhead isolation)")
+    args = p.parse_args()
+
+    block_dims = [int(x) for x in args.blocks.split(",") if x.strip()]
+    params = {
+        "matmul_add_task_num": args.tasks,
+        "incore_data_size": args.data_size,
+        "incore_loop": args.loop,
+        "grid_k": args.grid_k,
+    }
+    skip_exec = not args.exec
+    print(f"Benchmarking block_dims={block_dims} on {args.platform} (skip_exec={skip_exec}) ...")
+    results = _bench(args.platform, block_dims, params, args.rounds, skip_exec, args.warmup, args.device)
+    _print_table(results, params, args.rounds, skip_exec)
+
+
+if __name__ == "__main__":
+    main()

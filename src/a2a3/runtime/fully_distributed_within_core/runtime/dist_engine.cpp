@@ -358,6 +358,15 @@ thread_local DistCore *g_self = nullptr;
 bool g_trace_on = false;
 uint64_t g_trace_epoch_ns = 0;
 
+// Orchestration/scheduling overhead isolation (set PTO_DIST_SKIP_EXEC=1). When
+// on, execute_slot skips the actual incore kernel call — every (sub)task is
+// treated as 0-cost and "completes" instantly — while ALL ownership/completion
+// bookkeeping runs unchanged, so the loop terminates identically. This lets a
+// benchmark measure the pure cost of on-core orchestration + claim race +
+// scheduling, independent of kernel work. Outputs are NOT computed (run with
+// golden checks disabled). See examples/.../runtime_overhead_test.
+bool g_skip_exec = false;
+
 inline uint64_t now_ns() {
     return static_cast<uint64_t>(
         std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch())
@@ -452,7 +461,9 @@ uint64_t resolve_kernel_addr(Runtime *runtime, int32_t kernel_id) {
 // barrier between the kernel's output writes and a consumer's input reads.
 void execute_slot(DistCore *self, RingSlot &s) {
     typedef void (*KernelFn)(int64_t *);
-    if (s.function_bin_addr != 0) {
+    // PTO_DIST_SKIP_EXEC: treat the incore task as 0-cost — skip the kernel call
+    // but keep every flag/frontier/slot update below so termination is identical.
+    if (s.function_bin_addr != 0 && !g_skip_exec) {
         if (g_trace_on) {
             const uint64_t t0 = now_ns();
             KernelFn fn = reinterpret_cast<KernelFn>(s.function_bin_addr);
@@ -1216,6 +1227,8 @@ void *dist_engine_register(
     // relative to the same run start.
     g_trace_on = (getenv("PTO_DIST_SWIMLANE") != nullptr);
     g_trace_epoch_ns = now_ns();
+    // Overhead-isolation gate (skip incore kernel calls, keep all bookkeeping).
+    g_skip_exec = (getenv("PTO_DIST_SKIP_EXEC") != nullptr);
 
     g_dist.cube_cursor.store(-1, std::memory_order_relaxed);
     g_dist.vector_cursor.store(-1, std::memory_order_relaxed);
