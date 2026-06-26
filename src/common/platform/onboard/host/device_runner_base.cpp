@@ -563,14 +563,6 @@ int DeviceRunnerBase::prewarm_callable(int32_t callable_id) {
             return rc;
         }
     }
-    if (prewarm_kernel_args_.args.device_args == nullptr) {
-        rc = prewarm_kernel_args_.init_device_args(device_args_, mem_alloc_);
-        if (rc != 0) {
-            LOG_ERROR("prewarm_callable: init_device_args(prewarm) failed: %d", rc);
-            return rc;
-        }
-    }
-
     Runtime runtime;
     rc = stamp_orch_so(runtime, callable_id, /*force_reload=*/true);
     if (rc != 0) return rc;
@@ -804,11 +796,11 @@ int DeviceRunnerBase::finalize_common() {
         stream_aicpu_prewarm_ = nullptr;
     }
 
-    // Cleanup kernel args (deviceArgs); device-side KernelArgs + runtime args
+    // Cleanup kernel args; device-side KernelArgs + runtime args
     // are released by runtime_args_cleanup RAII so they also unwind on errors.
-    capture(kernel_args_.finalize_device_args());
+    capture(kernel_args_.finalize_device_kernel_args());
     capture(prewarm_kernel_args_.finalize_runtime_args());
-    capture(prewarm_kernel_args_.finalize_device_args());
+    capture(prewarm_kernel_args_.finalize_device_kernel_args());
 
     // load_aicpu_op_ has no per-task host-side state to release —
     // rtsLaunchCpuKernel does not hand back any per-launch handle, and the
