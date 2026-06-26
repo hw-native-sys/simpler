@@ -21,6 +21,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v5
         with:
+          submodules: recursive
           fetch-depth: 0
 
       - name: Install build and lint tools
@@ -71,6 +72,8 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v5
+        with:
+          submodules: recursive
 
       - name: Set up C++ compiler (Linux)
         if: runner.os == 'Linux'
@@ -113,6 +116,8 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v5
+        with:
+          submodules: recursive
 
       - name: Set up Python ${{ matrix.python-version }}
         uses: actions/setup-python@v6
@@ -173,6 +178,8 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v5
+        with:
+          submodules: recursive
 
       - name: Load pinned pto-isa commit
         uses: ./.github/actions/read-pto-isa
@@ -260,6 +267,8 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v5
+        with:
+          submodules: recursive
 
       - name: Load pinned pto-isa commit
         uses: ./.github/actions/read-pto-isa
@@ -350,6 +359,8 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v5
+        with:
+          submodules: recursive
 
       - name: Set up C++ compiler
         run: |
@@ -446,6 +457,8 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v5
+        with:
+          submodules: recursive
 
       - name: Load pinned pto-isa commit
         uses: ./.github/actions/read-pto-isa
@@ -534,6 +547,8 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v5
+        with:
+          submodules: recursive
 
       - name: Load pinned pto-isa commit
         uses: ./.github/actions/read-pto-isa
@@ -610,6 +625,7 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v5
         with:
+          submodules: recursive
           fetch-depth: 0
       - name: Check file changes
         id: check
@@ -652,6 +668,8 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v5
+        with:
+          submodules: recursive
 
       - name: Load pinned pto-isa commit
         uses: ./.github/actions/read-pto-isa
@@ -723,6 +741,8 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v5
+        with:
+          submodules: recursive
 
       - name: Load pinned pto-isa commit
         uses: ./.github/actions/read-pto-isa
