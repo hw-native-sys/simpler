@@ -427,13 +427,31 @@ struct DistCore {
 };
 
 // -----------------------------------------------------------------------------
+// Cursor sharding (docs §6.6). Each per-anchor-type claim cursor is split into
+// kCursorShards independent sub-cursors; task id N claims on shard (N %
+// kCursorShards). The shard is a pure function of N (identical on every core, no
+// worker partitioning), so the claim semantics are byte-for-byte equivalent to a
+// single cursor (exactly one owner per task, every core eligible) — sharding
+// ONLY spreads the CAS traffic across kCursorShards cache lines, cutting the
+// false-sharing / coherence contention that dominated us/task at high core
+// counts (§6.5). Each sub-cursor is padded to its own cache line so adjacent
+// shards never share a line; all entries init to -1 (no id claimed yet).
+constexpr int32_t kCursorShards = 4;
+constexpr size_t kCacheLine = 64;
+
+struct alignas(kCacheLine) PaddedCursor {
+    std::atomic<int32_t> v;
+    uint8_t pad[kCacheLine - sizeof(std::atomic<int32_t>)];
+};
+
+// -----------------------------------------------------------------------------
 // Global engine state (shared by all worker threads in this process). Cursors +
 // flags live here rather than in GM because in sim every core is a host thread
 // in one address space; the GM output heap below is a real shared buffer.
 // -----------------------------------------------------------------------------
 struct DistGlobal {
-    std::atomic<int32_t> cube_cursor;     // highest claimed AIC-anchored task id
-    std::atomic<int32_t> vector_cursor;   // highest claimed AIV-only task id
+    PaddedCursor cube_cursor[kCursorShards];    // highest claimed AIC-anchored id, per shard
+    PaddedCursor vector_cursor[kCursorShards];  // highest claimed AIV-only id, per shard
     std::atomic<uint8_t> flags[kFlagCap]; // completion-flag ring (1 == task done)
 
     // M4 reclamation (§9.5/§11.4). `frontier` (F) is the global continuous
@@ -874,7 +892,10 @@ TaskOutputTensors dist_submit_impl(PTO2Runtime *, const MixedKernels &mixed, con
         anchor_is_cube ? (self->role == CoreType::AIC) : (self->role == CoreType::AIV);
     bool is_winner = false;
     if (type_match) {
-        std::atomic<int32_t> &cursor = anchor_is_cube ? g_dist.cube_cursor : g_dist.vector_cursor;
+        // Pick the shard for this task (§6.6): shard = N % kCursorShards, a pure
+        // function of the task id so every core targets the same sub-cursor for N.
+        PaddedCursor *cursors = anchor_is_cube ? g_dist.cube_cursor : g_dist.vector_cursor;
+        std::atomic<int32_t> &cursor = cursors[N % kCursorShards].v;
         is_winner = claim(cursor, N);
     }
 
@@ -1257,9 +1278,16 @@ const PTO2RuntimeOps g_dist_ops = {
 // -----------------------------------------------------------------------------
 void dist_dump_state(int) {
     fprintf(stderr, "\n===== DIST STATE DUMP =====\n");
-    fprintf(stderr, "cube_cursor=%d vector_cursor=%d frontier=%d H=%d ring=%zuB replay_done=%d/%d num_blocks=%d fatal=%d\n",
-            g_dist.cube_cursor.load(), g_dist.vector_cursor.load(), g_dist.frontier.load(), g_dist.H,
-            g_dist.heap_size, g_dist.replay_done.load(), g_dist.num_workers, g_dist.num_blocks, g_dist.fatal.load());
+    fprintf(stderr, "frontier=%d H=%d ring=%zuB replay_done=%d/%d num_blocks=%d fatal=%d\n",
+            g_dist.frontier.load(), g_dist.H, g_dist.heap_size, g_dist.replay_done.load(),
+            g_dist.num_workers, g_dist.num_blocks, g_dist.fatal.load());
+    fprintf(stderr, "cube_cursor[%d]=", kCursorShards);
+    for (int32_t s = 0; s < kCursorShards; s++)
+        fprintf(stderr, "%d%s", g_dist.cube_cursor[s].v.load(), s + 1 < kCursorShards ? "," : "");
+    fprintf(stderr, " vector_cursor[%d]=", kCursorShards);
+    for (int32_t s = 0; s < kCursorShards; s++)
+        fprintf(stderr, "%d%s", g_dist.vector_cursor[s].v.load(), s + 1 < kCursorShards ? "," : "");
+    fprintf(stderr, "\n");
     for (int32_t c = 0; c < g_dist.num_workers && c < RUNTIME_MAX_WORKER; c++) {
         DistCore &co = g_dist.cores[c];
         fprintf(stderr, "core %d role=%d blk=%d lane=%d replayed=%d occ=%d owned=%d\n", c,
@@ -1389,8 +1417,10 @@ void *dist_engine_register(
     // Overhead-isolation gate (skip incore kernel calls, keep all bookkeeping).
     g_skip_exec = (getenv("PTO_DIST_SKIP_EXEC") != nullptr);
 
-    g_dist.cube_cursor.store(-1, std::memory_order_relaxed);
-    g_dist.vector_cursor.store(-1, std::memory_order_relaxed);
+    for (int32_t s = 0; s < kCursorShards; s++) {
+        g_dist.cube_cursor[s].v.store(-1, std::memory_order_relaxed);
+        g_dist.vector_cursor[s].v.store(-1, std::memory_order_relaxed);
+    }
     g_dist.frontier.store(-1, std::memory_order_relaxed);
     for (int32_t i = 0; i < kFlagCap; i++) g_dist.flags[i].store(0, std::memory_order_relaxed);
     g_dist.fatal.store(0, std::memory_order_relaxed);

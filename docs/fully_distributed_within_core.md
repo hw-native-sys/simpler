@@ -733,6 +733,129 @@ SPMD 各核 map 完全一致与全部 golden 正确性（bgemm / paged_attention
 mix_coown 等用例校验通过）。复现：
 `python examples/a2a3/fully_distributed_within_core/runtime_overhead_test/test_runtime_overhead.py -p a2a3sim --blocks 1 --tasks 3840`。
 
+**附带优化：把认领门提前，让败者跳过 fan-in 查找。** 见 §6.4 上文同名段落——把 anchor 类型判定 +
+cursor 认领提前到 map 操作之前，fan-in `lookup` 改为赢家专属，`built[]` 组装移到认领之后。这是"负载
+随核数摊销"能显现的关键优化，效果见下节 §6.5。
+
+### 6.5 核数 scale up 时 us/task 为何回升：cursor CAS 等共享原子的竞争
+
+**测试条件（截至本节最新）。** workload=`benchmark_bgemm`，`PTO_DIST_SKIP_EXEC=1`（跳过 incore
+执行，只测编排/调度墙钟），`device` 为片上编排墙钟（PTO2 profiling），多轮取中位数。`--blocks` 默认
+随平台：macOS `1-4`、Linux `1-13`。运行用项目自带 `.venv` 解释器（含编译好的 `_task_interface` 绑定）。
+当前代码含三项优化：哈希 + H 回收的 TensorMap（§6.4）、`built[]` 后置、**winner-only fan-in**。复现：
+`./.venv/bin/python examples/a2a3/fully_distributed_within_core/runtime_overhead_test/test_runtime_overhead.py -p a2a3sim --tasks 4000`。
+
+**结果 1：单核（block=1）随任务数仍是 O(N)。** 固定 1 block 扫 batch（`--tasks`，总任务约 2×）：
+
+| matmul_add_task_num | ~tasks | device (ms) | us/task |
+| ------------------: | -----: | ----------: | ------: |
+|                1000 |  ~2000 |        2.08 |    1.04 |
+|                4000 |  ~8000 |        3.99 |    0.50 |
+
+任务量 ×4、device 仅约 ×2、`us/task` 反而下降 → per-core 编排算法是 O(N)（§6.4 的 TensorMap 改造之效）。
+
+**结果 2：多核（Mac，tasks=4000，blocks 1–4）device 随核数回升。**
+
+| blocks | cores | device (ms) | us/task | dev vs 1blk |
+| -----: | ----: | ----------: | ------: | ----------: |
+|      1 |     3 |        3.99 |    0.50 |       1.00× |
+|      2 |     6 |        3.22 |    0.40 |       0.81× |
+|      3 |     9 |        4.46 |    0.56 |       1.12× |
+|      4 |    12 |        9.14 |    1.14 |       2.29× |
+
+winner-only fan-in 使中低核数出现摊销（2 block 一度低于 1 block，约 0.8×；多轮中 `dev vs 1blk` 多在
+0.7–1.3× 间）；但核数继续增大时 `device` 仍会**回升**（如上 4 block；Mac 上 12 线程超订使该档方差很大，
+不同轮在 1.1×–2.3× 间跳）。下面分析这部分回升的算法性根因。
+
+**根因：认领走的是对单个共享 cursor 的 CAS 循环 fetch_max。**
+
+```text
+bool claim(cursor, N):
+    c = cursor.load()
+    loop:
+      if N <= c: return false          // 落后核只 load、不写（便宜）
+      if cursor.CAS(c -> N): return true // 争胜:在同一条 cache line 上 CAS
+```
+
+认领**按类型共享同一个 cursor**：所有 AIC 核抢 `cube_cursor`、所有 AIV 核抢 `vector_cursor`。于是：
+
+* **单一热点 cache line。** `block_dim=B` 时，cube 任务由 `B` 个 AIC 核、vector 任务由 `2B` 个 AIV 核
+  对同一原子量每任务 load+CAS。该 line 在竞争核间反复转移独占权（MESI），竞争核越多 → 单次 CAS 延迟
+  越高、失败重试越多、一致性流量越大。`device` 取最慢核墙钟，最慢核要排队等这条线 → device 随 B 回升。
+  （AIV 数是 AIC 的 2 倍，故 vector 认领竞争更重——bgemm 的 ADD(1V) 即走此路。）
+* **skip-exec 放大竞争。** 跳过执行后每任务 0 代价，各核近**锁步**推进 → 对任意任务 N 几乎同时争抢 cursor，
+  达最坏竞争。真实执行时 kernel 耗时让各核去同步、认领被自然错开，竞争反而小。**故本测试是 cursor 竞争
+  的悲观上界。**
+
+**其它随核数增长的全局原子（次要但同向）：**
+
+| 原子 | 访问模式 | 随核数扩展 |
+| --- | --- | --- |
+| `cube/vector_cursor` CAS（认领） | 每核每任务，单一热点线 | **强（主因）** |
+| `frontier` CAS（`advance_frontier`） | 每次完成扩展前缀时 CAS 单一 `frontier` | 中–强 |
+| `flags[N]` 完成标志（`uint8_t`，64 个/行） | 相邻任务标志**伪共享** | 中 |
+| `block.won`（state/remaining/drained） | **每 block 局部，仅 3 核内** | 否（不随总核数涨） |
+
+此外**仿真特有**：每个核是 host 线程，核多→线程多→在物理核上**超订** + 跨 NUMA，放大 device 抖动
+（非算法因素，Mac 上尤甚；干净曲线应在 Linux 用 §6.3 的绑核测）。
+
+**小结与缓解方向。** us/task 在核数增大时回升，主因是**全局单热点 cursor 的 CAS 竞争**（其次为 frontier
+CAS 与 flag 伪共享），而非每核的 map 维护（那块已 O(N) 且被 winner-only fan-in 进一步减负）。若要把这条
+曲线进一步压平，可考虑去掉"全局单热点"：
+
+* **批量认领（claim stride）**：一次 CAS 抢一段连续 id，把 N 次 CAS 摊销成 N/stride 次；
+* **分片认领（cursor sharding）**：把 `cube/vector_cursor` 各扩成 `G` 个，按 `task_index % G` 选 cursor，
+  把单热点 CAS 摊到 `G` 条 cache line（详见 §6.6——认领语义与单一 cursor 等价，不引入偏差/不均衡）；
+* `flags` 按 cache line 对齐分散以消伪共享。
+
+这些都属于"认领/完成同步"层的可选优化，与 §6.4 的 map 改造正交；当前实现优先保证正确性与确定性，认领
+仍用最简单的全局 cursor。
+
+### 6.6 cursor 分片（sharding）：按 `task_index % G` 切 cursor，认领效果与单一 cursor 等价
+
+§6.5 把"分片认领"列为压平 cursor CAS 竞争的方向之一。本节给出**具体方案**并论证一个重要结论：**只要按
+`task_index` 给 cursor 变量分片、而绝不对 worker 分组，分片在"认领任务"上的语义与单一全局 cursor 完全一致
+——不产生额外进度偏差、不加剧 worker 间负载不均衡，仅把对 cursor 的访存竞争摊到 `G` 条 cache line 上。**
+
+**方案。** 把今天的两个全局 cursor（`cube_cursor` / `vector_cursor`，§11.1）各扩成 `G` 个：
+`cube_cursor[G]` / `vector_cursor[G]`。某任务 id `N` 做认领时，访问 `vector_cursor[N % G]`（cube 任务同理用
+`cube_cursor[N % G]`），即 **shard = `N % G`**。`claim` 仍是同一套 CAS-loop fetch_max（§11.1）。关键在于：
+**shard 只由 task_index `N` 决定**，而 `N` 在每个核上完全一致（各核 replay 同一条 submit 流），所以**任一核
+认领 `N` 时算出的 shard 相同、访问的是同一个 `cursor[N%G]`**——**没有"哪些核只能碰哪个 shard"的核分组**。
+
+**为什么认领效果与单一 cursor 完全一致。**
+
+* **仍是"每任务恰好一个 owner、不漏不重"。** `vector_cursor[g]` 只承接 `N ≡ g (mod G)` 的那串 id
+  （`g, g+G, g+2G, …`），它们被每个核**按序**处理 → 在该 residue 子序列上仍是单调 fetch_max，首个把它从
+  `<N` 推到 `N` 的核独占 `N`。这与单 cursor 在全序列上的不变式**逐字相同**，只是把"一条单调序列"拆成 `G`
+  条交织的单调子序列，每条仍单调、连续、无跳过。
+* **任一核都能赢任一任务（工作窃取原样保留）。** shard 由 `N`、而非核身份决定，每个核处理到 `N` 就去抢
+  `cursor[N%G]`，**没有核被排除在任何任务之外**。于是"谁空谁抢下一个 id"的窃取式负载均衡**完全保留**，
+  不会出现某组核闲、另一组过载。
+* **不产生额外进度偏差。** 不存在"各自独立推进的分片"：每个核都走完整条流，对连续的 `N, N+1, N+2, …`
+  轮流落在 `cursor[0..G-1]` 上，故 `G` 个 cursor 始终贴着**同一条认领前沿**、彼此相差不超过约 `Δ+G`
+  （`Δ` 为单核 run-ahead 上界）。整体推进仍由**同一个全局完成前沿 `F` + 同一个私有环 run-ahead 上限**封顶
+  （与是否分片无关），所以偏差与单 cursor 时**一模一样**。
+* **确定性不变。** 认领只决定"谁执行"，不改变 id、不改变 per-core map 的 replay/insert 顺序，golden 结果不变。
+
+**结论（直接回答"是否等价"）。** **是。** 按 `N % G` 给 cursor 变量分片，在**认领语义、负载分布、推进/偏差、
+确定性**四个方面与单一全局 cursor 等价；**唯一区别**是把对一条 cursor cache line 的 CAS 竞争分摊到 `G` 条
+独立 line，降低访存争用。因此 cursor sharding **不会**带来更大的进度偏差，也**不会**加剧 worker 间负载不
+均衡——它**只**降低了竞争这个 cursor 的访存代价。
+
+**一处要点：收益何时兑现，以及 `G` 怎么取。** 对**同一个** id `N`，认领前沿上的核仍然撞同一个
+`cursor[N%G]`；分摊之所以有效，是因为各核在任一时刻分布在一段**连续 id 窗口**上（核 A 在 `N`、核 B 在
+`N+1` …，窗口宽约 run-ahead `Δ`），这些连续 id 落在不同的 `cursor[N%G]` 上。**只要在飞 id 窗口 ≥ G**，
+CAS 写竞争就被摊到 ≈ `G` 条 line。故 `G` 取到"每条 line 的竞争核数不再是瓶颈"即可（量级上
+`G ~ 同类型核数 / 期望每线核数`），不必更大；`G=1` 即退回今天的实现，零行为变化。
+
+**务必区分：分片 cursor 变量 ≠ 给 worker 分组。** 上面的等价性**只**在"shard 由 `task_index` 决定、所有核
+对所有任务一律可竞争"时成立。若改成另一种做法——**按核/按 block 把 id 空间静态切给不相交的核组、各组只
+认领自己那片 id**——那就是"分 worker"，会引入**独立分片进度**（慢分片顶住全局完成前沿 `F`、拖慢回收）与
+**工作窃取丢失**（某组核闲、另一组过载的负载不均衡）。那种核分组才需要额外的"显式认领窗口 + 跨分片窃取
+兜底"等机制来补救，得不偿失。**本方案刻意避免它**：我们分片的是 **cursor 变量（按 `task_index % G`）**，
+不是 worker——这正是它能与单一 cursor 等价、却又降竞争的原因。
+
 ## 7. 终止
 
 一个核在其编排不再产生任务**且**私有环为空（所有拥有的任务都已执行）时结束。对 follower
@@ -932,7 +1055,7 @@ anchor 推送最后的多核子任务。这不是 per-task 串行阻塞，只发
 | ---- | ---- | ---- |
 | `W` | 全局窗口（`task_completed_flag` 环、复制 TensorMap、GM 堆共用），2 的幂 | ≥ `Δ + H` |
 | `Δ` | 任一核相对全局完成前沿可向前跑的最大 id 跨度（由反压封顶） | 由 `PRIVATE_TASK_SLOT_NUM`、堆容量决定 |
-| `H` | 依赖跨度上界：任一 producer 的最后消费者 id ≤ producer id + `H` | 按图配置 |
+| `H` | 依赖跨度上界：任一 producer 的最后消费者 id ≤ producer id + `H`。**由 SCOPE 决定**（PC 退出 scope 即终结其内变量可见性，故 `H` = 最大 scope 任务跨度，详见 §6.6） | 真实 PYPTO 随 scope 动态定界；a2a3 原型用保守常数 `kHDefault=64`（`PTO_DIST_H` 覆盖）近似 |
 | `F` | 全局连续完成前沿：使所有 id ≤ `F` 的任务都已完成的最大前缀 | 运行期推进 |
 | `R` | 回收前沿 `= F − H`：id ≤ `R` 的输出可安全回收 | 由 `F` 推导 |
 | `BLOCK_WON_SLOTS` | 每 block 的 `block.won` 投递环容量 | `PRIVATE_TASK_SLOT_NUM`(=8) |
@@ -978,8 +1101,13 @@ anchor 推送最后的多核子任务。这不是 per-task 串行阻塞，只发
 
 ### 11.4 GM 堆细化：`H`、容量、前沿推导、外逃输出（原“GM 输出堆的细化”）
 
-- **`H`（依赖跨度上界）**：配置上界。运行期校验：若某消费者的 producer id < (当前 − `H`)，或某分配
-  将覆盖尚不可回收的区域，即判为容量/配置错误（类比旧模型的 heap-deadlock 诊断）→ 调大 `H`/堆。
+- **`H`（依赖跨度上界）**：**由 SCOPE 决定，不是固化常数**（详见 §6.6）。tensor 的可见域就是其所在
+  `PTO2_SCOPE`；orchestrator 的 PC 退出该 scope 后，scope 内变量不再可见、不会被后续任务引用，故依赖
+  跨度天然被"所在 scope 的任务跨度"封顶，`H` ≈ 最大 scope 任务数（+ 并发 scope 余量）。真实 PYPTO 据此
+  随 scope 进出动态定界（按 scope 深度分环，内层 scope 完成即独立回收，见 a5 `MULTI_RING.md`）。
+  **本 a2a3 原型**（`dist_scope_begin/end` 为空 stub）用保守常数 `kHDefault=64`（`PTO_DIST_H` 覆盖）作为
+  "最大 scope 跨度"的静态上界近似。运行期校验：若某消费者的 producer id < (当前 − `H`)，或某分配将覆盖
+  尚不可回收的区域，即判为容量/配置错误（类比旧模型的 heap-deadlock 诊断）→ 调大 `H`/堆，或细化 scope。
 - **堆/arena 容量** ≥ 工作集 = 窗口 `(R, top]` 内各任务输出大小之和；超出则报诊断。
 - **`F`（连续完成前沿）**：全局原子、单调。**协作式推进**——任一核置位 `flag(N)` 后，
   `while flag(F+1) == true: CAS(F, F, F+1)`。无锁、任意核可推进、开销摊薄。
