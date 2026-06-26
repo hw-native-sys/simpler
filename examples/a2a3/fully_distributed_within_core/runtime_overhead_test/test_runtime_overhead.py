@@ -45,6 +45,8 @@ can be golden-checked the normal way with kernels enabled::
     python test_runtime_overhead.py -p a2a3sim --case Blk24 --manual only
 """
 
+import sys
+
 import torch
 from simpler.task_interface import ArgDirection as D
 
@@ -330,8 +332,9 @@ def main():
     p.add_argument("-d", "--device", type=int, default=0)
     p.add_argument(
         "--blocks",
-        default="1-24",
-        help="block_dim values: comma list and/or a-b ranges, e.g. '1,2,12,24' or '1-24' (a2a3sim max 24)",
+        default=None,
+        help="block_dim values: comma list and/or a-b ranges, e.g. '1,2,12,24' or '1-24' (a2a3sim max 24). "
+        "Default is platform-aware: macOS -> '1-2' (few physical cores), Linux -> '1-13'.",
     )
     p.add_argument("--rounds", type=int, default=5, help="timed rounds per config (median reported)")
     p.add_argument("--warmup", type=int, default=1, help="untimed warmup rounds per config")
@@ -373,8 +376,16 @@ def main():
     else:
         os.environ.pop("PTO_SIM_AICORE_NUMA_NODE", None)
 
+    # Platform-aware default block sweep: macOS hosts have few physical cores
+    # (heavy oversubscription past a couple of blocks makes the wall meaningless),
+    # so default to '1-2'; Linux dev boxes default to '1-13'.
+    blocks_spec = args.blocks
+    if blocks_spec is None:
+        blocks_spec = "1-2" if sys.platform == "darwin" else "1-13"
+        print(f"--blocks not given; using platform default '{blocks_spec}' ({sys.platform}).")
+
     block_dims = []
-    for tok in args.blocks.split(","):
+    for tok in blocks_spec.split(","):
         tok = tok.strip()
         if not tok:
             continue

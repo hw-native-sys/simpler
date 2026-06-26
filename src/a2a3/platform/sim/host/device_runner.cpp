@@ -548,6 +548,7 @@ int DeviceRunner::run(Runtime &runtime, int block_dim, int launch_aicpu_num) {
         aicore_threads.push_back(create_thread([this, &runtime, i, core_type, physical_core_id, target_cpu,
                                                 pin_verbose]() {
             if (target_cpu >= 0) {
+#if defined(__linux__)
                 cpu_set_t set;
                 CPU_ZERO(&set);
                 CPU_SET(target_cpu, &set);
@@ -559,6 +560,11 @@ int DeviceRunner::run(Runtime &runtime, int block_dim, int launch_aicpu_num) {
                         sched_getcpu()
                     );
                 }
+#else
+                // CPU affinity (sched_setaffinity/cpu_set_t/sched_getcpu) is Linux-only;
+                // on other hosts (e.g. macOS) AICore pinning is a no-op.
+                (void)pin_verbose;
+#endif
             }
             aicore_execute_func_(
                 &runtime, i, core_type, physical_core_id, kernel_args_.regs, kernel_args_.enable_profiling_flag,
