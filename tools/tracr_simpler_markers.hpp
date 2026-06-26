@@ -17,6 +17,16 @@
 #include <atomic>
 #include <string_view>
 
+// sched_getcpu() is a glibc/Linux-only API, but the simulator/host build also
+// compiles on non-Linux targets (e.g. the macOS packaging CI). Route the TraCR
+// call sites through this portable shim instead of calling sched_getcpu directly.
+#if defined(__linux__)
+#include <sched.h>
+inline int tracr_getcpu() { return sched_getcpu(); }
+#else
+inline int tracr_getcpu() { return -1; }
+#endif
+
 // Global TraCR thread idx counter
 inline std::atomic<int> g_TraCR_thread_idx_counter{0};
 

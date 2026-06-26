@@ -177,7 +177,7 @@ int32_t AicpuExecutor::init(Runtime *runtime) {
         return 0;
     }
 
-    INSTRUMENTATION_MARK_SET(g_TraCR_thread_idx, Initializing, uint32_t(sched_getcpu()));
+    INSTRUMENTATION_MARK_SET(g_TraCR_thread_idx, Initializing, uint32_t(tracr_getcpu()));
 
     LOG_INFO_V0("AicpuExecutor: Initializing");
 
@@ -887,7 +887,7 @@ extern "C" int32_t aicpu_execute(Runtime *runtime) {
 
     // INIT TraCR all threads coming in
     TRACR_START();
-    LOG_INFO_V9("[TraCR] thread[%d:%d] start ENABLE_TRACR=%d", g_TraCR_thread_idx, sched_getcpu(), INSTRUMENTATION_ACTIVE);
+    LOG_INFO_V9("[TraCR] thread[%d:%d] start ENABLE_TRACR=%d", g_TraCR_thread_idx, tracr_getcpu(), INSTRUMENTATION_ACTIVE);
 
 
     g_aicpu_executor.init(runtime);

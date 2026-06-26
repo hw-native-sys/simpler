@@ -75,7 +75,12 @@ include(${CMAKE_CURRENT_SOURCE_DIR}/../../../../../tools/tracr.cmake)
 tracr_enable(aicpu_kernel)
 
 # TODO: move this somewhere such that EVERY platform launches this once. Placing this here is hacky...
-include(${CMAKE_CURRENT_SOURCE_DIR}/../../../../../tools/tracr_postprocessing_script.cmake)
+# Only build the host-side trace post-processor when TraCR is enabled: it is an
+# offline analysis tool, and it pulls in Linux-only APIs (sched_getcpu) that do
+# not compile on the macOS packaging build.
+if(BUILD_TRACR)
+    include(${CMAKE_CURRENT_SOURCE_DIR}/../../../../../tools/tracr_postprocessing_script.cmake)
+endif()
 
 # Optional: to make the Orchestrator run independently (i.e. finalize before letting the schedulers run)
 option(INDEP_ORCH "Run Orchestrator independent from the Schedulers" OFF)
