@@ -58,7 +58,7 @@ function(tracr_enable target)
         # TraCR threads capacity (default is 1<<20 ~= 1 million traces per thread = ~17MB per thread buffer size)
         set(TRACR_CAPACITY "" CACHE STRING "Optional TraCR buffer capacity (empty = use internal default)")
 
-        if(NOT TRACR_CAPACITY STREQUAL "")
+        if(NOT "${TRACR_CAPACITY}" STREQUAL "")
             message(STATUS "TraCR adding capacity: ${TRACR_CAPACITY}")
 
             if(NOT TRACR_CAPACITY MATCHES "^[0-9]+$")
@@ -89,7 +89,7 @@ function(tracr_enable target)
             TRACR_POLICY_IGNORE_IF_FULL
         )
 
-        if(NOT TRACR_POLICY STREQUAL "")
+        if(NOT "${TRACR_POLICY}" STREQUAL "")
             if(TRACR_POLICY STREQUAL "TRACR_POLICY_PERIODIC")
                 message(STATUS "TraCR adding policy: 'TRACR_POLICY_PERIODIC'")
                 target_compile_definitions(${target} PRIVATE TRACR_POLICY_PERIODIC)

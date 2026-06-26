@@ -819,7 +819,9 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
 #ifdef INDEP_ORCH
     INSTRUMENTATION_MARK_SET(g_TraCR_thread_idx, Barrier, orchestrator_done_);
     LOG_INFO_V9("[TraCR] Thread %d: Waiting before the Orch to finish: %d, orchestrator_done_=%d", g_TraCR_thread_idx, g_TraCR_thread_idx_counter.load(), orchestrator_done_);
-    while (!orchestrator_done_){};
+    while (!orchestrator_done_) {
+        SPIN_WAIT_HINT();
+    }
 #endif
 
 #if PTO2_PROFILING
