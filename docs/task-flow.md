@@ -58,7 +58,7 @@ to C++:
 
 | Context | Namespace | How it's consumed |
 | ------- | --------- | ----------------- |
-| `w3.submit_next_level(handle, …)` dispatched to a chip child | `LOCAL_CHIP` | child resolves digest to its private chip slot, then calls `ChipWorker::run(local_slot, …)` |
+| `w3.submit_next_level(handle, …)` dispatched to a chip child | `LOCAL_CHIP` | child resolves digest to its private chip slot, copies args, and enqueues the run on its chip run lane |
 | `w4.submit_next_level(handle, …)` dispatched to an L3 `Worker` child | `LOCAL_PYTHON` | child resolves digest to an orchestration function and calls `inner_worker.run(orch_fn, …)` |
 | remote `w4.submit_next_level(handle, …)` dispatched to remote L3 | `REMOTE_TASK_DISPATCHER` | remote endpoint resolves digest in its dispatcher registry and calls its embedded L3 Worker |
 | `w3.submit_sub(handle, …)` dispatched to a SUB child | `LOCAL_PYTHON` | child resolves digest to a Python callable and calls `fn(args)` |
@@ -188,7 +188,8 @@ View does **not** own memory. Valid for the duration of a single
      │ child decodes header → builds TaskArgsView over the blob bytes
      ▼
     child resolves digest -> local slot
-    ChipWorker::run(local_slot, view, config)  (in the forked child)
+    child copies args and enqueues run_prepared_from_blob(local_slot, ...)
+    on the child-local chip run lane
 
      │ (L2 ABI edge)
      ▼
@@ -381,11 +382,17 @@ reclaim independently of outer-scope tasks. See
 
 ## 8. Data flow on completion
 
-When the child finishes the kernel, it writes `TASK_DONE` to the mailbox;
-`LocalMailboxEndpoint::run` exits its spin-poll, reads the mailbox error
-fields, and returns a `WorkerCompletion`. `MAILBOX_OFF_ERROR == 0` maps to
-success; a non-zero child error maps to task failure. The parent
-`WorkerThread` pushes that completion onto `Scheduler::completion_queue_`.
+For chip children, the child copies the task payload out of the mailbox,
+pins the private callable slot, enqueues the work on its chip run lane, and
+publishes `TASK_RUNNING`. `LocalMailboxEndpoint::run` still waits until the
+same mailbox reaches `TASK_DONE`. When the chip run lane finishes the kernel,
+it writes `TASK_DONE`; the parent reads the mailbox error fields and returns a
+`WorkerCompletion`. `MAILBOX_OFF_ERROR == 0` maps to success; a non-zero child
+error maps to task failure. The parent `WorkerThread` pushes that completion
+onto `Scheduler::completion_queue_`.
+
+Sub-worker and Worker-child dispatches publish `TASK_DONE` directly after the
+Python callable or inner `Worker.run()` returns.
 
 At this point:
 
@@ -473,7 +480,7 @@ L4 parent process
 | 1 | L4 parent Python | `w4.run(my_l4_orch)` → `scope_begin` → `my_l4_orch(orch4, ...)` |
 | 2 | L4 `Orchestrator.submit_next_level` | the L3 callable handle digest is stored in the slot's callable identity; slot pushed to L4's ready queue |
 | 3 | L4 Scheduler | pop slot; pick idle WorkerThread → the L3 child's mailbox |
-| 4 | L4 WorkerThread (PROCESS) | encode `(callable digest, config, args_blob)` into mailbox; write `TASK_READY`; spin-poll |
+| 4 | L4 WorkerThread (PROCESS) | encode `(callable digest, config, args_blob)` into mailbox; write `TASK_READY`; wait for completion |
 | 5 | L3 child `_child_worker_loop` | wake on `TASK_READY`; read digest → child-local slot → `my_l3_orch` |
 | 6 | L3 child | `inner_worker.run(my_l3_orch, args, cfg)` → `scope_begin` → `my_l3_orch(orch3, ...)` |
 | 7 | L3 `Orchestrator.submit_sub` | `l3_sub_handle` digest dispatched to L3's own sub worker child |
@@ -524,14 +531,15 @@ Step-by-step (one chip worker):
 | 2 | `Worker::run` | `scope_begin` → call `my_orch(&orch_, args.view(), cfg)` |
 | 3 | `Orchestrator::submit_next_level` | `slot = ring.alloc()`; move `chip_args` into `slot.task_args`; walk tags → `tensormap.lookup(a.data)`, `tensormap.lookup(b.data)`, `tensormap.insert(c.data, slot)`; push ready |
 | 4 | Scheduler thread | pop `slot`; `wt = manager.pick_idle(NEXT_LEVEL)` (WT_chip_0); `wt->dispatch(slot)` |
-| 5 | WT_chip_0 parent side | encode mailbox: write reserved callable field, `config`, digest prefix, `write_blob` of task_args; set `TASK_READY`; spin-poll |
-| 6 | chip_0 child process | wake on `TASK_READY`; resolve digest to local slot; `read_blob` → `view`; call `ChipWorker::run(local_slot, view, cfg)` |
-| 7 | `ChipWorker::run` | assemble `ChipStorageTaskArgs` POD (memcpy view); call `pto2_run_runtime(local_slot, &chip_storage, &cfg)` |
-| 8 | runtime.so | translate host ptrs → device ptrs; dispatch AICPU / AICore; write output into `c`'s shm |
-| 9 | chip_0 child | `run` returns; write `TASK_DONE` |
-| 10 | WT_chip_0 parent | see `TASK_DONE`; push success completion |
-| 11 | Scheduler | mark slot COMPLETED; fanout release (none in this DAG); scope_end will release scope ref |
-| 12 | `Worker::run` returns | user's `w3.run(...)` returns; `c` contains result in shm, visible to user |
+| 5 | WT_chip_0 parent side | encode mailbox: write reserved callable field, `config`, digest prefix, `write_blob` of task_args; set `TASK_READY`; wait for completion |
+| 6 | chip_0 child process | wake on `TASK_READY`; resolve digest to local slot; copy `args_blob`; enqueue run; publish `TASK_RUNNING` |
+| 7 | chip run lane | call `run_prepared_from_blob(local_slot, copied_args, cfg)` |
+| 8 | `ChipWorker::run` path | assemble `ChipStorageTaskArgs` POD (memcpy view); call `pto2_run_runtime(local_slot, &chip_storage, &cfg)` |
+| 9 | runtime.so | translate host ptrs → device ptrs; dispatch AICPU / AICore; write output into `c`'s shm |
+| 10 | chip run lane | `run` returns; release in-flight slot ref; write `TASK_DONE` |
+| 11 | WT_chip_0 parent | see `TASK_DONE`; push success completion |
+| 12 | Scheduler | mark slot COMPLETED; fanout release (none in this DAG); scope_end will release scope ref |
+| 13 | `Worker::run` returns | user's `w3.run(...)` returns; `c` contains result in shm, visible to user |
 
 ---
 

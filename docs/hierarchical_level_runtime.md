@@ -115,11 +115,15 @@ See [scheduler.md](scheduler.md) for the dispatch loop and coordination.
 The **execution layer**. `WorkerManager` holds two pools of `WorkerThread`s
 (next-level pool and sub pool). Each `WorkerThread` owns one std::thread that
 encodes `(callable, config, args_blob)` into a `MAILBOX_SIZE`-byte shared
-memory region, signals the pre-forked Python child, and spin-polls
-  `TASK_DONE`, returning an explicit completion outcome to the Scheduler.
+memory region, signals the pre-forked Python child, and waits for
+`TASK_DONE`, returning an explicit completion outcome to the Scheduler.
+Chip children may first publish `TASK_RUNNING` after copying the payload and
+enqueueing the run on their child-local run lane; selected async controls can
+use the mailbox during that running window.
 
 - Next-level (chip) children run `_chip_process_loop`, which constructs a
-  `ChipWorker` and dispatches each kernel through it.
+  `ChipWorker`, owns child-local run/register lanes, and dispatches each
+  kernel through the run lane.
 - SUB children run `_sub_worker_loop`, which decodes the args blob into a
   `TaskArgs` and calls the registered Python callable as `fn(args)`. There
   is no C++ `SubWorker` class — SUB workers exist only as a worker-type
@@ -149,8 +153,8 @@ what flows through `ChipWorker::run`.
                  │                                 │ pop ready_queue
                  │                                 │ pick idle WorkerThread
                  │                                 │ wt.dispatch(slot_id) ──────► WorkerThread
-                 │                                 │                              encode mailbox → spin-poll TASK_DONE
-                 │                                 │                              (blocking; child runs the kernel)
+                 │                                 │                              encode mailbox → wait TASK_DONE
+                 │                                 │                              (chip child may publish TASK_RUNNING)
                  │                                 │◄── completion_queue ────── on_complete_(completion)
                  │                                 │ on_task_complete:
                  │                                 │   success → COMPLETED
