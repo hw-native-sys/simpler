@@ -25,13 +25,16 @@ Method:
 
 a2a3sim caps ``block_dim`` at PLATFORM_MAX_BLOCKDIM = 24 (24 AIC + 48 AIV = 72
 cores); 48 *blocks* is not representable (that 48 is the AIV-core count at the
-24-block max). The default sweep is therefore 1 / 12 / 24.
+24-block max). The default sweep is the full ramp 1..24 (``--blocks 1-24``);
+pass an explicit list/range to narrow it (e.g. ``--blocks 1,2,12,24``).
 
 Run (standalone driver produces the comparison table)::
 
     python test_runtime_overhead.py -p a2a3sim
     python test_runtime_overhead.py -p a2a3sim --blocks 1,12,24 --rounds 5 --tasks 480
     python test_runtime_overhead.py -p a2a3sim --exec        # include kernel work (baseline)
+    python test_runtime_overhead.py -p a2a3sim --bind node:0,1   # pin sim threads to NUMA nodes 0,1
+    python test_runtime_overhead.py -p a2a3sim --bind cpu:0-79    # pin to an explicit CPU range
 
 The class is also a valid SceneTestCase (cases marked manual), so the workload
 can be golden-checked the normal way with kernels enabled::
@@ -142,6 +145,78 @@ class TestRuntimeOverhead(SceneTestCase):
 
 
 # ---------------------------------------------------------------------------
+# CPU-affinity (core-binding) control.
+#
+# The sim runs every AICore/AICPU "core" as a host std::thread; those threads
+# inherit the launching process's CPU-affinity mask, so binding the Python
+# process here pins the whole simulation without external numactl/taskset (and
+# without numactl --membind, whose memory pinning starved allocations and added
+# noise). Threads are created lazily inside worker.run(), so applying the mask
+# before the first run is sufficient for all of them.
+# ---------------------------------------------------------------------------
+
+
+def _parse_cpu_list(spec):
+    """Parse a CPU list like '0-3,8,10-12' into a set of ints."""
+    cpus = set()
+    for tok in spec.split(","):
+        tok = tok.strip()
+        if not tok:
+            continue
+        if "-" in tok:
+            lo, hi = (int(v) for v in tok.split("-", 1))
+            cpus.update(range(lo, hi + 1))
+        else:
+            cpus.add(int(tok))
+    return cpus
+
+
+def _node_cpus(nodes_spec):
+    """Union the online CPUs of the given NUMA node(s), e.g. '0,1'."""
+    cpus = set()
+    for node in _parse_cpu_list(nodes_spec):
+        path = f"/sys/devices/system/node/node{node}/cpulist"
+        with open(path) as f:  # noqa: PTH123
+            cpus |= _parse_cpu_list(f.read().strip())
+    return cpus
+
+
+def _apply_cpu_binding(bind):
+    """Apply a core-binding strategy to this process; return the bound cpu set.
+
+    Strategies (``--bind``):
+      * ``none``                : no pinning (sim threads float over all CPUs).
+      * ``node:<nodes>``        : pin to all CPUs of the given NUMA node(s),
+                                  e.g. ``node:0`` or ``node:0,1``.
+      * ``cpu:<list>`` / ``<list>`` : pin to an explicit CPU list/range,
+                                  e.g. ``cpu:0-79`` or ``0,1,2``.
+    """
+    import os  # noqa: PLC0415
+
+    spec = (bind or "none").strip()
+    online = os.sched_getaffinity(0) if hasattr(os, "sched_getaffinity") else None
+
+    if spec.lower() in ("", "none"):
+        cpus = online
+    elif spec.lower().startswith("node:"):
+        cpus = _node_cpus(spec[len("node:") :])
+    elif spec.lower().startswith("cpu:"):
+        cpus = _parse_cpu_list(spec[len("cpu:") :])
+    else:
+        cpus = _parse_cpu_list(spec)
+
+    if spec.lower() not in ("", "none") and cpus:
+        if not hasattr(os, "sched_setaffinity"):
+            raise RuntimeError("os.sched_setaffinity unavailable on this platform")
+        os.sched_setaffinity(0, cpus)
+        cpus = os.sched_getaffinity(0)  # echo back what the OS actually accepted
+
+    n = len(cpus) if cpus else 0
+    print(f"CPU binding: strategy='{spec}' -> {n} physical cores" + (f" {sorted(cpus)}" if cpus and n <= 32 else ""))
+    return cpus
+
+
+# ---------------------------------------------------------------------------
 # Standalone comparison driver: sweep block_dim, print a wall-clock table.
 # ---------------------------------------------------------------------------
 
@@ -177,9 +252,14 @@ def _bench(platform, block_dims, params, rounds, skip_exec, warmup, device):
         for bd in block_dims:
             cfg = inst._build_config({"aicpu_thread_num": 4, "block_dim": bd})
 
+            # Build args/chip_args once per block_dim (data content is irrelevant
+            # to orchestration/scheduling timing, and skip-exec never reads it).
+            # Hoisting it out of the timed loop keeps large --tasks sweeps fast:
+            # otherwise every round re-runs torch.randn over multi-GB tensors.
+            args = inst.generate_args(params)
+            chip_args, _ = _build_chip_task_args(args, orch_sig)
+
             def _one_run():
-                args = inst.generate_args(params)
-                chip_args, _ = _build_chip_task_args(args, orch_sig)
                 t0 = time.perf_counter()
                 timing = worker.run(handle, chip_args, config=cfg)
                 wall_us = (time.perf_counter() - t0) * 1e6
@@ -200,7 +280,7 @@ def _bench(platform, block_dims, params, rounds, skip_exec, warmup, device):
     return results
 
 
-def _print_table(results, params, rounds, skip_exec):
+def _print_table(results, params, rounds, skip_exec, bind_spec="none", bind_ncores=0):
     task_num = params["matmul_add_task_num"]
     # bgemm submits one GEMM (1C) and one ADD (1V) per matmul-add unit.
     total_tasks = task_num * 2
@@ -209,9 +289,16 @@ def _print_table(results, params, rounds, skip_exec):
     # dominated by fixed Python/sim-launch overhead and is shown only for context.
     base_dev = results[0][3] if results else 0.0
     mode = "skip-exec (orchestration/scheduling only)" if skip_exec else "with kernels"
+    # Echo the active core-binding so the table is self-describing (the bound
+    # physical-core count is the key axis when comparing pinned vs unpinned runs
+    # and over/under-subscription effects — see docs §6.3).
+    bind_str = f"unpinned ({bind_ncores} cores available)" if bind_spec in ("", "none") else (
+        f"{bind_ncores} physical cores (strategy='{bind_spec}')"
+    )
     print()
     print(f"Runtime overhead — fully_distributed_within_core [{mode}]")
     print(f"workload=bgemm  matmul_add_task_num={task_num}  (~{total_tasks} tasks)  rounds={rounds} (median)")
+    print(f"cpu_bind={bind_str}")
     print()
     header = (
         f"| {'blocks':>6} | {'cores':>5} | {'device (ms)':>11} | {'us/task':>8} "
@@ -238,7 +325,11 @@ def main():
     p = argparse.ArgumentParser(description="fully_distributed_within_core runtime-overhead benchmark")
     p.add_argument("-p", "--platform", required=True)
     p.add_argument("-d", "--device", type=int, default=0)
-    p.add_argument("--blocks", default="1,2,12,24", help="comma-separated block_dim values (a2a3sim max 24)")
+    p.add_argument(
+        "--blocks",
+        default="1-24",
+        help="block_dim values: comma list and/or a-b ranges, e.g. '1,2,12,24' or '1-24' (a2a3sim max 24)",
+    )
     p.add_argument("--rounds", type=int, default=5, help="timed rounds per config (median reported)")
     p.add_argument("--warmup", type=int, default=1, help="untimed warmup rounds per config")
     p.add_argument("--tasks", type=int, default=480, help="matmul_add_task_num")
@@ -246,9 +337,28 @@ def main():
     p.add_argument("--loop", type=int, default=4)
     p.add_argument("--grid-k", type=int, default=2)
     p.add_argument("--exec", action="store_true", help="actually run kernels (default: skip for overhead isolation)")
+    p.add_argument(
+        "--bind",
+        default="none",
+        help="CPU core-binding strategy: 'none' | 'node:<nodes>' (e.g. node:0,1) | "
+        "'cpu:<list>' or bare '<list>' (e.g. cpu:0-79). Pins all sim threads via "
+        "sched_setaffinity, no external numactl needed.",
+    )
     args = p.parse_args()
 
-    block_dims = [int(x) for x in args.blocks.split(",") if x.strip()]
+    bound_cpus = _apply_cpu_binding(args.bind)
+    bind_ncores = len(bound_cpus) if bound_cpus else 0
+
+    block_dims = []
+    for tok in args.blocks.split(","):
+        tok = tok.strip()
+        if not tok:
+            continue
+        if "-" in tok:
+            lo, hi = (int(v) for v in tok.split("-", 1))
+            block_dims.extend(range(lo, hi + 1))
+        else:
+            block_dims.append(int(tok))
     params = {
         "matmul_add_task_num": args.tasks,
         "incore_data_size": args.data_size,
@@ -258,7 +368,7 @@ def main():
     skip_exec = not args.exec
     print(f"Benchmarking block_dims={block_dims} on {args.platform} (skip_exec={skip_exec}) ...")
     results = _bench(args.platform, block_dims, params, args.rounds, skip_exec, args.warmup, args.device)
-    _print_table(results, params, args.rounds, skip_exec)
+    _print_table(results, params, args.rounds, skip_exec, args.bind, bind_ncores)
 
 
 if __name__ == "__main__":
