@@ -113,6 +113,7 @@ struct PTO2RuntimeArenaLayout {
     uint64_t task_window_sizes[PTO2_MAX_RING_DEPTH]{};
     uint64_t heap_sizes[PTO2_MAX_RING_DEPTH]{};
     int32_t dep_pool_capacities[PTO2_MAX_RING_DEPTH]{};
+    int32_t scheduler_timeout_ms{0};
 
     // Total arena byte size post-commit. Used by host to size the prebuilt
     // image buffer and as the rtMemcpy length.

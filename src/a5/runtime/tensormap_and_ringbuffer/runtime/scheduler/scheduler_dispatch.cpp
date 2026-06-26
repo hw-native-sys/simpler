@@ -589,6 +589,11 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
     // "now" so the first budget cycle starts when this thread does, not at
     // an undefined value.
     uint64_t last_progress_ts = get_sys_cnt_aicpu();
+    uint64_t scheduler_timeout_cycles = SCHEDULER_TIMEOUT_CYCLES;
+    if (rt_ != nullptr && rt_->prebuilt_layout.scheduler_timeout_ms > 0) {
+        scheduler_timeout_cycles =
+            static_cast<uint64_t>(rt_->prebuilt_layout.scheduler_timeout_ms) * (PLATFORM_PROF_SYS_CNT_FREQ / 1000);
+    }
 
     while (true) {
         if (completed_.load(std::memory_order_acquire)) {
@@ -891,7 +896,7 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
             // case) — refresh last_progress_ts and keep spinning. The
             // STALL diagnostic above still fires periodically so
             // observability is preserved.
-            if (get_sys_cnt_aicpu() - last_progress_ts > SCHEDULER_TIMEOUT_CYCLES) {
+            if (get_sys_cnt_aicpu() - last_progress_ts > scheduler_timeout_cycles) {
                 bool self_owns = self_owns_running_task(thread_idx);
                 bool global_stuck = !self_owns && total_tasks_ > 0 &&
                                     completed_tasks_.load(std::memory_order_relaxed) < total_tasks_ &&

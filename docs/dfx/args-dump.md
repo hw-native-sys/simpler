@@ -923,6 +923,21 @@ SCHEDULER_TIMEOUT_MS (2 s, onboard)  <  PLATFORM_OP_EXECUTE_TIMEOUT_US (3 s)  < 
    flushes + dumps in-flight              and poisons the context                and surfaces the error
 ```
 
+These defaults can be overridden without rebuilding by setting
+`PTO2_SCHEDULER_TIMEOUT_MS`, `PTO2_OP_EXECUTE_TIMEOUT_US`, and
+`PTO2_STREAM_SYNC_TIMEOUT_MS`. Invalid values, or onboard combinations that
+break the ordering above, are ignored with a warning and fall back to the
+defaults. The onboard host also requires stream-sync to cover the scheduler
+budget plus a 1.5 s scheduler-arming guard for cold init work before the
+no-progress timer starts. This guard covers fixed/cold costs such as kernel
+registration, orchestration SO dlopen, runtime init, and AICore handshake.
+It cannot know the graph-specific maximum orchestration producer wall time, so
+callers that raise scheduler/op timeouts must also size
+`PTO2_STREAM_SYNC_TIMEOUT_MS` for their worst-case orchestration window. Sim
+builds do not have STARS or ACL stream-sync timeouts, but scheduler overrides
+are still parsed and applied independently so slow CPU-sim kernels can raise
+the no-progress budget without onboard-only ordering limits.
+
 - **Device-side graceful flush (primary).** At 2 s of no progress
   the AICPU declares the hang, runs the end-of-loop flush, *and*
   dumps the **partial output** of every task still RUNNING on a core
@@ -953,8 +968,8 @@ only recover what was already in the buffer. The chain lives in
 `spin_hint.h` (`PLATFORM_SCHEDULER_TIMEOUT_MS`, surfaced as
 `SCHEDULER_TIMEOUT_MS` — 2 s onboard, 5 s in sim where there is no STARS to
 race) and `platform_config.h` (`PLATFORM_OP_EXECUTE_TIMEOUT_US` /
-`PLATFORM_STREAM_SYNC_TIMEOUT_MS`), along with the `#897` distributed-skew
-trade-off.
+`PLATFORM_STREAM_SYNC_TIMEOUT_MS`). The env overrides use those constants as
+their unset fallback and keep the `#897` distributed-skew trade-off.
 
 ## 9. Related docs
 

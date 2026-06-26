@@ -96,10 +96,11 @@ public:
     void init(
         PTO2TaskDescriptor *descriptors, int32_t window_size, std::atomic<int32_t> *current_index_ptr,
         std::atomic<int32_t> *last_alive_ptr, void *heap_base, uint64_t heap_size, std::atomic<int32_t> *error_code_ptr,
-        PTO2TaskSlotState *slot_states = nullptr, int32_t initial_local_task_id = 0
+        PTO2TaskSlotState *slot_states = nullptr, int32_t initial_local_task_id = 0, uint8_t ring_id = 0
     ) {
         descriptors_ = descriptors;
         slot_states_ = slot_states;
+        ring_id_ = ring_id;
         window_size_ = window_size;
         window_mask_ = window_size - 1;
         current_index_ptr_ = current_index_ptr;
@@ -204,9 +205,10 @@ public:
                 }
                 if (spin_count % PTO2_BLOCK_NOTIFY_INTERVAL == 0) {
                     LOG_WARN(
-                        "[TaskAllocator] BLOCKED: tasks=%d/%d, heap=%" PRIu64 "/%" PRIu64 ", on=%s, spins=%d",
-                        local_task_id_ - last_alive, window_size_, heap_top_, heap_size_,
-                        blocked_on_heap ? "heap" : "task", spin_count
+                        "[TaskAllocator ring=%u] BLOCKED: tasks=%d/%d, heap_used=%" PRIu64 "/%" PRIu64
+                        ", heap_available=%" PRIu64 ", heap_cursor=%" PRIu64 ", on=%s, spins=%d",
+                        static_cast<unsigned>(ring_id_), local_task_id_ - last_alive, window_size_, heap_used_bytes(),
+                        heap_size_, heap_available(), heap_top_, blocked_on_heap ? "heap" : "task", spin_count
                     );
                 }
             }
@@ -256,6 +258,7 @@ private:
     // Parallel to descriptors_, indexed by task_id & window_mask_. Read-only here,
     // used by the deadlock detector to inspect the head task's state + fanout.
     PTO2TaskSlotState *slot_states_ = nullptr;
+    uint8_t ring_id_ = 0;
     int32_t window_size_ = 0;
     int32_t window_mask_ = 0;
     std::atomic<int32_t> *current_index_ptr_ = nullptr;
@@ -417,9 +420,9 @@ private:
 
         LOG_ERROR("========================================");
         if (heap_blocked) {
-            LOG_ERROR("FATAL: Task Allocator Deadlock - Heap Exhausted!");
+            LOG_ERROR("FATAL: Task Allocator Deadlock - Heap Exhausted! ring=%u", static_cast<unsigned>(ring_id_));
         } else {
-            LOG_ERROR("FATAL: Task Allocator Deadlock - Task Ring Full!");
+            LOG_ERROR("FATAL: Task Allocator Deadlock - Task Ring Full! ring=%u", static_cast<unsigned>(ring_id_));
         }
         LOG_ERROR("========================================");
         if (scope_gated) {
@@ -433,12 +436,12 @@ private:
             );
         }
         LOG_ERROR(
-            "  Task ring:  current=%d, last_alive=%d, active=%d/%d (%.1f%%)", local_task_id_, last_alive, active_tasks,
-            window_size_, 100.0 * active_tasks / window_size_
+            "  Task ring %u: current=%d, last_alive=%d, active=%d/%d (%.1f%%)", static_cast<unsigned>(ring_id_),
+            local_task_id_, last_alive, active_tasks, window_size_, 100.0 * active_tasks / window_size_
         );
         LOG_ERROR(
-            "  Heap ring:  top=%" PRIu64 ", tail=%" PRIu64 ", size=%" PRIu64 ", available=%" PRIu64, heap_top_, htail,
-            heap_size_, heap_available()
+            "  Heap ring %u: top=%" PRIu64 ", tail=%" PRIu64 ", size=%" PRIu64 ", used=%" PRIu64 ", available=%" PRIu64,
+            static_cast<unsigned>(ring_id_), heap_top_, htail, heap_size_, heap_used_bytes(), heap_available()
         );
         if (heap_blocked) {
             LOG_ERROR("  Requested:  %d bytes", requested_output_size);
@@ -461,13 +464,19 @@ private:
             LOG_ERROR("  2. Size the ring >= the scope's peak live-set (heap*2 may not be enough).");
         } else if (heap_blocked) {
             LOG_ERROR(
-                "  Increase heap (current: %" PRIu64 "); env PTO2_RING_HEAP=<pow2> (e.g. %" PRIu64 ")", heap_size_,
+                "  Increase heap (current: %" PRIu64 "); env PTO2_RING_HEAP=<bytes> (e.g. %" PRIu64 ")", heap_size_,
                 heap_size_ * 2
+            );
+            LOG_ERROR(
+                "  If one increase completes, it was under-provisioned; otherwise debug the stuck head consumer."
             );
         } else {
             LOG_ERROR(
                 "  Increase task window (current: %d); env PTO2_RING_TASK_WINDOW=<pow2> (e.g. %d)", window_size_,
                 active_tasks * 2
+            );
+            LOG_ERROR(
+                "  If one increase completes, it was under-provisioned; otherwise debug the stuck head consumer."
             );
         }
         LOG_ERROR("========================================");

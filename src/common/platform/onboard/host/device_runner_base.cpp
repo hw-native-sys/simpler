@@ -49,6 +49,50 @@
 // `print_handshake_results` / `bind_callable_to_runtime` /
 // `prepare_orch_so`.
 
+namespace {
+
+HostRuntimeTimeoutConfig resolve_onboard_timeout_config() {
+    RuntimeTimeoutConfig order_defaults{
+        PLATFORM_OP_EXECUTE_TIMEOUT_US, PLATFORM_STREAM_SYNC_TIMEOUT_MS, PLATFORM_ONBOARD_SCHEDULER_TIMEOUT_MS
+    };
+    HostRuntimeTimeoutConfig defaults{PLATFORM_OP_EXECUTE_TIMEOUT_US, PLATFORM_STREAM_SYNC_TIMEOUT_MS};
+    RuntimeTimeoutParseStatus parse_status;
+    HostRuntimeTimeoutConfig cfg = resolve_host_runtime_timeout_config(order_defaults, &parse_status);
+
+    if (parse_status.op_execute_env_set && !parse_status.op_execute_valid) {
+        const char *op_env = std::getenv(PTO2_OP_EXECUTE_TIMEOUT_US_ENV);
+        LOG_WARN(
+            "%s=%s invalid, using default %llu", PTO2_OP_EXECUTE_TIMEOUT_US_ENV, op_env,
+            (unsigned long long)order_defaults.op_execute_timeout_us
+        );
+    }
+
+    if (parse_status.stream_sync_env_set && !parse_status.stream_sync_valid) {
+        const char *sync_env = std::getenv(PTO2_STREAM_SYNC_TIMEOUT_MS_ENV);
+        LOG_WARN(
+            "%s=%s invalid, using default %d", PTO2_STREAM_SYNC_TIMEOUT_MS_ENV, sync_env,
+            order_defaults.stream_sync_timeout_ms
+        );
+    }
+
+    bool host_timeout_env_set = parse_status.op_execute_env_set || parse_status.stream_sync_env_set;
+    RuntimeTimeoutConfig order_cfg{
+        cfg.op_execute_timeout_us, cfg.stream_sync_timeout_ms, PLATFORM_ONBOARD_SCHEDULER_TIMEOUT_MS
+    };
+    RuntimeTimeoutOrderStatus order_status = validate_runtime_timeout_order(order_cfg);
+    if (host_timeout_env_set && order_status != RuntimeTimeoutOrderStatus::OK) {
+        LOG_WARN(
+            "Ignoring PTO2 timeout env overrides: %s (scheduler=%d ms, op_execute=%llu us, stream_sync=%d ms)",
+            runtime_timeout_order_status_name(order_status), PLATFORM_ONBOARD_SCHEDULER_TIMEOUT_MS,
+            (unsigned long long)cfg.op_execute_timeout_us, cfg.stream_sync_timeout_ms
+        );
+        return defaults;
+    }
+    return cfg;
+}
+
+}  // namespace
+
 DeviceRunnerBase::DeviceRunnerBase() :
     gm_heap_arena_(&arena_alloc_trampoline, &arena_free_trampoline, &mem_alloc_),
     gm_sm_arena_(&arena_alloc_trampoline, &arena_free_trampoline, &mem_alloc_),
@@ -238,6 +282,7 @@ int DeviceRunnerBase::attach_current_thread(int device_id) {
     }
 
     if (device_id_ == -1) {
+        timeout_config_ = resolve_onboard_timeout_config();
         configure_aicore_op_timeout();
     }
 
@@ -247,15 +292,16 @@ int DeviceRunnerBase::attach_current_thread(int device_id) {
 
 void DeviceRunnerBase::configure_aicore_op_timeout() {
     uint64_t actual_timeout = 0;
-    int rc = aclrtSetOpExecuteTimeOutV2(PLATFORM_OP_EXECUTE_TIMEOUT_US, &actual_timeout);
+    int rc = aclrtSetOpExecuteTimeOutV2(timeout_config_.op_execute_timeout_us, &actual_timeout);
     if (rc != 0) {
         LOG_ERROR(
-            "aclrtSetOpExecuteTimeOutV2(%llu us) failed: %d", (unsigned long long)PLATFORM_OP_EXECUTE_TIMEOUT_US, rc
+            "aclrtSetOpExecuteTimeOutV2(%llu us) failed: %d", (unsigned long long)timeout_config_.op_execute_timeout_us,
+            rc
         );
     } else {
         LOG_INFO_V0(
             "aclrtSetOpExecuteTimeOutV2: requested=%llu us, actual=%llu us",
-            (unsigned long long)PLATFORM_OP_EXECUTE_TIMEOUT_US, (unsigned long long)actual_timeout
+            (unsigned long long)timeout_config_.op_execute_timeout_us, (unsigned long long)actual_timeout
         );
     }
 }
@@ -1008,11 +1054,11 @@ int DeviceRunnerBase::prepare_runtime_for_launch(Runtime &runtime, int block_dim
 
 int DeviceRunnerBase::sync_run_streams() {
     LOG_INFO_V0("=== aclrtSynchronizeStreamWithTimeout stream_aicpu_ ===");
-    int rc = aclrtSynchronizeStreamWithTimeout(stream_aicpu_, PLATFORM_STREAM_SYNC_TIMEOUT_MS);
+    int rc = aclrtSynchronizeStreamWithTimeout(stream_aicpu_, timeout_config_.stream_sync_timeout_ms);
     if (rc == ACL_ERROR_RT_STREAM_SYNC_TIMEOUT) {
         LOG_ERROR(
             "Stream sync timeout: stream=AICPU timeout_ms=%d device_id=%d block_dim=%d",
-            PLATFORM_STREAM_SYNC_TIMEOUT_MS, device_id_, block_dim_
+            timeout_config_.stream_sync_timeout_ms, device_id_, block_dim_
         );
         return rc;
     }
@@ -1022,11 +1068,11 @@ int DeviceRunnerBase::sync_run_streams() {
     }
 
     LOG_INFO_V0("=== aclrtSynchronizeStreamWithTimeout stream_aicore_ ===");
-    rc = aclrtSynchronizeStreamWithTimeout(stream_aicore_, PLATFORM_STREAM_SYNC_TIMEOUT_MS);
+    rc = aclrtSynchronizeStreamWithTimeout(stream_aicore_, timeout_config_.stream_sync_timeout_ms);
     if (rc == ACL_ERROR_RT_STREAM_SYNC_TIMEOUT) {
         LOG_ERROR(
             "Stream sync timeout: stream=AICore timeout_ms=%d device_id=%d block_dim=%d",
-            PLATFORM_STREAM_SYNC_TIMEOUT_MS, device_id_, block_dim_
+            timeout_config_.stream_sync_timeout_ms, device_id_, block_dim_
         );
         return rc;
     }

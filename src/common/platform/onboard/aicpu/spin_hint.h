@@ -21,6 +21,8 @@
 
 #include <cstdint>
 
+#include "common/platform_config.h"
+
 #define SPIN_WAIT_HINT() ((void)0)
 
 // Wall-clock budget (ms) of no task progress before the dispatch loop aborts
@@ -33,7 +35,8 @@
 // slow distributed startup can false-latch; if that bites, raise this together
 // with the op-exec / stream-sync timeouts. The sim build keeps the full 5 s (no
 // STARS to race). The runtime consumes it as SCHEDULER_TIMEOUT_MS (see
-// scheduler_types.h).
-constexpr int32_t PLATFORM_SCHEDULER_TIMEOUT_MS = 2000;
+// scheduler_types.h). Host may override this per run via
+// PTO2_SCHEDULER_TIMEOUT_MS after validating the timeout ordering.
+constexpr int32_t PLATFORM_SCHEDULER_TIMEOUT_MS = PLATFORM_ONBOARD_SCHEDULER_TIMEOUT_MS;
 
 #endif  // PLATFORM_A2A3_AICPU_SPIN_HINT_H_

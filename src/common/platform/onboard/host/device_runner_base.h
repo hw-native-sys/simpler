@@ -58,6 +58,7 @@
 #include "host/l2_swimlane_collector.h"
 #include "host/memory_allocator.h"
 #include "host/pmu_collector.h"
+#include "host/runtime_timeout_config.h"
 #include "host/scope_stats_collector.h"
 #include "host/tensor_dump_collector.h"
 #include "prepare_callable_common.h"
@@ -532,10 +533,10 @@ protected:
 
     /**
      * Wait for both per-Worker streams (AICPU first, then AICore) with
-     * `PLATFORM_STREAM_SYNC_TIMEOUT_MS`. Distinguishes the timeout
-     * sentinel `ACL_ERROR_RT_STREAM_SYNC_TIMEOUT` with a stream-id and
-     * (device, block_dim) context in the log. Returns the first
-     * non-zero rc encountered.
+     * the resolved stream-sync timeout.
+     * Distinguishes the timeout
+     * sentinel `ACL_ERROR_RT_STREAM_SYNC_TIMEOUT` with a stream-id and (device,
+     * block_dim) context in the log. Returns the first non-zero rc encountered.
      */
     int sync_run_streams();
 
@@ -695,6 +696,7 @@ protected:
     int block_dim_{0};
     int cores_per_blockdim_{PLATFORM_CORES_PER_BLOCKDIM};
     int worker_count_{0};  // Stored for print_handshake_results
+    HostRuntimeTimeoutConfig timeout_config_{PLATFORM_OP_EXECUTE_TIMEOUT_US, PLATFORM_STREAM_SYNC_TIMEOUT_MS};
 
     // Executor binaries — populated once via `set_executors()` during
     // simpler_init. `aicore_kernel_binary_` is consumed once by
