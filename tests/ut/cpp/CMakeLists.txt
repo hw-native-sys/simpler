@@ -369,6 +369,23 @@ add_common_utils_test(test_elf_build_id common/test_elf_build_id.cpp)
 add_common_utils_test(test_runtime_orch_so common/test_runtime_orch_so.cpp)
 add_common_utils_test(test_device_arena common/test_device_arena.cpp)
 add_common_utils_test(test_l3_l2_orch_comm common/test_l3_l2_orch_comm.cpp)
+add_executable(test_l3_l2_message_queue
+    common/test_l3_l2_message_queue.cpp
+    stubs/test_stubs.cpp
+)
+target_include_directories(test_l3_l2_message_queue PRIVATE
+    ${GTEST_INCLUDE_DIRS}
+    ${CMAKE_SOURCE_DIR}/../../../src/a2a3/platform/include
+    ${CMAKE_SOURCE_DIR}/../../../src/common/platform/include
+)
+target_link_libraries(test_l3_l2_message_queue PRIVATE
+    ${GTEST_MAIN_LIB}
+    ${GTEST_LIB}
+    pthread
+)
+add_test(NAME test_l3_l2_message_queue COMMAND test_l3_l2_message_queue)
+set_tests_properties(test_l3_l2_message_queue PROPERTIES LABELS "no_hardware")
+
 add_executable(test_l3_l2_orch_endpoint
     common/test_l3_l2_orch_endpoint.cpp
     stubs/test_stubs.cpp
