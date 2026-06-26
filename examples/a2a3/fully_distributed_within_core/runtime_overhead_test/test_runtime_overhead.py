@@ -35,6 +35,9 @@ Run (standalone driver produces the comparison table)::
     python test_runtime_overhead.py -p a2a3sim --exec        # include kernel work (baseline)
     python test_runtime_overhead.py -p a2a3sim --bind node:0,1   # pin sim threads to NUMA nodes 0,1
     python test_runtime_overhead.py -p a2a3sim --bind cpu:0-79    # pin to an explicit CPU range
+    # Confine the AICore working set to ONE NUMA node (1:1 thread->cpu) while
+    # auxiliary threads ride the wider --bind set; needs cores=block*3 <= node size:
+    python test_runtime_overhead.py -p a2a3sim --blocks 1-13 --bind node:1,2,3 --aicore-numa 2
 
 The class is also a valid SceneTestCase (cases marked manual), so the workload
 can be golden-checked the normal way with kernels enabled::
@@ -84,7 +87,7 @@ class TestRuntimeOverhead(SceneTestCase):
     # Cases for the normal (golden-checked, kernels-on) pytest path. All manual
     # so the benchmark never slows the default suite; the headline artifact is
     # the standalone comparison table below.
-    _BENCH_PARAMS = {"matmul_add_task_num": 480, "incore_data_size": 128, "incore_loop": 4, "grid_k": 2}
+    _BENCH_PARAMS = {"matmul_add_task_num": 1000, "incore_data_size": 128, "incore_loop": 4, "grid_k": 2}
     CASES = [
         {
             "name": "Blk1",
@@ -332,8 +335,8 @@ def main():
     )
     p.add_argument("--rounds", type=int, default=5, help="timed rounds per config (median reported)")
     p.add_argument("--warmup", type=int, default=1, help="untimed warmup rounds per config")
-    p.add_argument("--tasks", type=int, default=480, help="matmul_add_task_num")
-    p.add_argument("--data-size", type=int, default=128)
+    p.add_argument("--tasks", type=int, default=1000, help="matmul_add_task_num (total tasks = 2x; batch)")
+    p.add_argument("--data-size", type=int, default=128, help="incore tile shape (NxN)")
     p.add_argument("--loop", type=int, default=4)
     p.add_argument("--grid-k", type=int, default=2)
     p.add_argument("--exec", action="store_true", help="actually run kernels (default: skip for overhead isolation)")
@@ -344,10 +347,31 @@ def main():
         "'cpu:<list>' or bare '<list>' (e.g. cpu:0-79). Pins all sim threads via "
         "sched_setaffinity, no external numactl needed.",
     )
+    p.add_argument(
+        "--aicore-numa",
+        type=int,
+        default=None,
+        help="Pin every AICore sim thread 1:1 into this single NUMA node (sets "
+        "PTO_SIM_AICORE_NUMA_NODE), keeping the AICore working set inside one node. "
+        "Use a node with >= cores (=block_dim*3) CPUs; combine with --bind on a few "
+        "idle nodes so auxiliary threads don't oversubscribe the AICore node.",
+    )
     args = p.parse_args()
+
+    import os  # noqa: PLC0415
 
     bound_cpus = _apply_cpu_binding(args.bind)
     bind_ncores = len(bound_cpus) if bound_cpus else 0
+
+    if args.aicore_numa is not None:
+        os.environ["PTO_SIM_AICORE_NUMA_NODE"] = str(args.aicore_numa)
+        node_cpus = sorted(_node_cpus(str(args.aicore_numa)))
+        print(
+            f"AICore pinning: every AICore thread -> NUMA node {args.aicore_numa} "
+            f"({len(node_cpus)} cpus: {min(node_cpus)}..{max(node_cpus)}), 1:1 exclusive"
+        )
+    else:
+        os.environ.pop("PTO_SIM_AICORE_NUMA_NODE", None)
 
     block_dims = []
     for tok in args.blocks.split(","):

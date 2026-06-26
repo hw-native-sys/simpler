@@ -16,15 +16,22 @@
 
 #include "device_runner.h"
 
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
+
 #include <dlfcn.h>
+#include <sched.h>
 #include <stdlib.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
 #include <atomic>
+#include <cerrno>
 #include <chrono>
 #include <cstdio>
 #include <cstring>
+#include <fstream>
 #include <functional>
 #include <string>
 #include <vector>
@@ -52,6 +59,60 @@ extern "C" __attribute__((weak, visibility("hidden"))) int dep_gen_replay_emit_d
 ) {
     LOG_DEBUG("dep_gen replay not implemented for this runtime — deps.json skipped");
     return -1;
+}
+
+// --- AICore single-NUMA pinning (opt-in via PTO_SIM_AICORE_NUMA_NODE) --------
+// When the env var names a NUMA node, each AICore sim thread `i` is pinned 1:1
+// to the i-th CPU of that node. This keeps the entire AICore working set inside
+// one NUMA node (no cross-node cursor/claim contention) and gives every core
+// exclusive use of a physical CPU. Auxiliary threads (AICPU over-launch,
+// collectors, host) are deliberately left unpinned so they don't oversubscribe
+// the node. Returns the node's CPU list (empty if unset/invalid). The node must
+// hold at least `num_aicore` CPUs for strict single-core-per-thread placement.
+static std::vector<int> sim_aicore_pin_cpus(int &out_node) {
+    out_node = -1;
+    const char *env = std::getenv("PTO_SIM_AICORE_NUMA_NODE");
+    if (env == nullptr || env[0] == '\0') {
+        return {};
+    }
+    int node = std::atoi(env);
+    char path[160];
+    std::snprintf(path, sizeof(path), "/sys/devices/system/node/node%d/cpulist", node);
+    std::ifstream f(path);
+    if (!f.good()) {
+        LOG_ERROR("PTO_SIM_AICORE_NUMA_NODE=%d: cannot open %s; AICore pinning disabled", node, path);
+        return {};
+    }
+    std::string line;
+    std::getline(f, line);
+    std::vector<int> cpus;
+    size_t i = 0;
+    while (i < line.size()) {
+        if (line[i] < '0' || line[i] > '9') {
+            i++;
+            continue;
+        }
+        int a = 0;
+        while (i < line.size() && line[i] >= '0' && line[i] <= '9') {
+            a = a * 10 + (line[i] - '0');
+            i++;
+        }
+        if (i < line.size() && line[i] == '-') {
+            i++;
+            int b = 0;
+            while (i < line.size() && line[i] >= '0' && line[i] <= '9') {
+                b = b * 10 + (line[i] - '0');
+                i++;
+            }
+            for (int c = a; c <= b; c++) {
+                cpus.push_back(c);
+            }
+        } else {
+            cpus.push_back(a);
+        }
+    }
+    out_node = node;
+    return cpus;
 }
 
 DeviceRunner::~DeviceRunner() { finalize(); }
@@ -457,11 +518,48 @@ int DeviceRunner::run(Runtime &runtime, int block_dim, int launch_aicpu_num) {
     }
 
     LOG_INFO_V0("Launching %d AICore thread(s)", num_aicore);
+    const bool pin_verbose = std::getenv("PTO_SIM_AICORE_PIN_VERBOSE") != nullptr;
+    int aicore_pin_node = -1;
+    std::vector<int> aicore_pin_cpus = sim_aicore_pin_cpus(aicore_pin_node);
+    if (!aicore_pin_cpus.empty()) {
+        if (num_aicore > static_cast<int>(aicore_pin_cpus.size())) {
+            LOG_WARN(
+                "AICore pin: num_aicore=%d exceeds NUMA node %d cpu count=%zu; threads will wrap around the node "
+                "(no longer one-core-per-thread). Restrict block_dim so cores<=node size for strict placement.",
+                num_aicore, aicore_pin_node, aicore_pin_cpus.size()
+            );
+        }
+        LOG_INFO_V0(
+            "AICore pin: confining %d AICore thread(s) to NUMA node %d (cpus %d..%d, 1:1)", num_aicore,
+            aicore_pin_node, aicore_pin_cpus.front(), aicore_pin_cpus.back()
+        );
+        if (pin_verbose) {
+            std::fprintf(
+                stderr, "[aicore-pin] confining %d AICore thread(s) to NUMA node %d (cpus %d..%d, 1:1)\n",
+                num_aicore, aicore_pin_node, aicore_pin_cpus.front(), aicore_pin_cpus.back()
+            );
+        }
+    }
     std::vector<std::thread> aicore_threads;
     for (int i = 0; i < num_aicore; i++) {
         CoreType core_type = runtime.workers[i].core_type;
         uint32_t physical_core_id = static_cast<uint32_t>(i);
-        aicore_threads.push_back(create_thread([this, &runtime, i, core_type, physical_core_id]() {
+        int target_cpu = aicore_pin_cpus.empty() ? -1 : aicore_pin_cpus[i % aicore_pin_cpus.size()];
+        aicore_threads.push_back(create_thread([this, &runtime, i, core_type, physical_core_id, target_cpu,
+                                                pin_verbose]() {
+            if (target_cpu >= 0) {
+                cpu_set_t set;
+                CPU_ZERO(&set);
+                CPU_SET(target_cpu, &set);
+                if (sched_setaffinity(0, sizeof(set), &set) != 0) {
+                    LOG_ERROR("AICore thread %d: sched_setaffinity(cpu=%d) failed (errno=%d)", i, target_cpu, errno);
+                } else if (pin_verbose) {
+                    std::fprintf(
+                        stderr, "[aicore-pin] thread %d -> cpu %d (running on cpu %d)\n", i, target_cpu,
+                        sched_getcpu()
+                    );
+                }
+            }
             aicore_execute_func_(
                 &runtime, i, core_type, physical_core_id, kernel_args_.regs, kernel_args_.enable_profiling_flag,
                 kernel_args_.l2_swimlane_aicore_rotation_table

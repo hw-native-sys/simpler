@@ -367,6 +367,12 @@ struct WonSlot {
 
 struct BlockWon {
     WonSlot slots[kPrivateSlots];
+    // Monotone "has any anchor ever published a deposit into this block?" flag.
+    // Lets follower drains short-circuit the per-slot scan for workloads with no
+    // multi-core (e.g. 2V) tasks — the common case (bgemm is all single-core), so
+    // every AIV core skips a 4-slot won-scan on every submit. Never reset within a
+    // session; once true the scan path is taken (those workloads have real work).
+    std::atomic<int32_t> any_pub;
 };
 
 enum LaneId : int32_t { LANE_AIC = 0, LANE_AIV0 = 1, LANE_AIV1 = 2, LANE_NONE = -1 };
@@ -616,6 +622,11 @@ void execute_slot(DistCore *self, RingSlot &s) {
 // once all its fan-in producers have set their completion flag (acquire).
 // Returns the number of slots freed this pass.
 int32_t drain_phase_b(DistCore *self) {
+    // Fast path: an empty private ring has nothing to drain. Skips the per-slot
+    // scan on every submit point (called twice per task, on every core) when the
+    // ring is empty — the common case for fine-grained / skip-exec workloads.
+    // Behavior-identical: the loop below is a no-op when occupied_count == 0.
+    if (self->occupied_count == 0) return 0;
     int32_t freed = 0;
     for (int32_t i = 0; i < kPrivateSlots; i++) {
         RingSlot &s = self->slots[i];
@@ -708,6 +719,7 @@ int32_t alloc_won_slot(int32_t block) {
 bool has_pending_won(DistCore *self) {
     if (self->lane == LANE_AIC || self->lane == LANE_NONE) return false;
     BlockWon &bw = g_dist.blocks[self->block_id];
+    if (bw.any_pub.load(std::memory_order_acquire) == 0) return false;  // no deposit ever published
     for (int32_t i = 0; i < kPrivateSlots; i++) {
         WonSlot &w = bw.slots[i];
         if (w.state.load(std::memory_order_acquire) != 1) continue;
@@ -723,6 +735,9 @@ bool has_pending_won(DistCore *self) {
 void drain_block_won(DistCore *self) {
     if (self->lane == LANE_AIC || self->lane == LANE_NONE) return;  // AIC is never a follower
     BlockWon &bw = g_dist.blocks[self->block_id];
+    // Fast path: if no anchor has ever published a deposit into this block, there
+    // is nothing to drain — skip the per-slot scan on every submit (hot path).
+    if (bw.any_pub.load(std::memory_order_acquire) == 0) return;
     for (int32_t i = 0; i < kPrivateSlots; i++) {
         WonSlot &w = bw.slots[i];
         if (w.state.load(std::memory_order_acquire) != 1) continue;
@@ -1021,6 +1036,7 @@ TaskOutputTensors dist_submit_impl(PTO2Runtime *, const MixedKernels &mixed, con
             b.sub_block_id = (L == LANE_AIV1) ? 1 : 0;
         }
         std::atomic_thread_fence(std::memory_order_release);
+        g_dist.blocks[won_block].any_pub.store(1, std::memory_order_release);  // enable follower drains
         w.state.store(1, std::memory_order_release);  // publish the deposits to followers
     }
 
@@ -1394,6 +1410,7 @@ void *dist_engine_register(
         g_dist.layout[aic_ids[b]] = CoreLayout{b, LANE_AIC};
         if (2 * b < naiv) g_dist.layout[aiv_ids[2 * b]] = CoreLayout{b, LANE_AIV0};
         if (2 * b + 1 < naiv) g_dist.layout[aiv_ids[2 * b + 1]] = CoreLayout{b, LANE_AIV1};
+        g_dist.blocks[b].any_pub.store(0, std::memory_order_relaxed);
         for (int32_t s = 0; s < kPrivateSlots; s++) {
             g_dist.blocks[b].slots[s].state.store(0, std::memory_order_relaxed);
         }
