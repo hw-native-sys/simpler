@@ -627,7 +627,10 @@ struct PTO2SchedulerState
         while (waiter != nullptr && waiter != WAKE_LIST_SENTINEL)
         {
             PTO2TaskSlotState *next = waiter->next_in_wake_list;
-            waiter->next_in_wake_list = nullptr;
+            // next_in_wake_list left as-is: every re-registration via
+            // register_wake() overwrites the field before the CAS publishes
+            // the consumer, and reset_for_reuse() clears it on slot reuse.
+            // No reader between here and the next overwrite/reset.
             // Fast path: single-fanin waiters were waiting on *us* (the only
             // possible fanin). No rescan needed — push straight to ready.
             // Saves one classify_fanin_state call (a byte read in
