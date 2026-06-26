@@ -858,28 +858,53 @@ TaskOutputTensors dist_submit_impl(PTO2Runtime *, const MixedKernels &mixed, con
     // submit stays ~O(N) instead of O(N^2). See DistTensorMap.
     self->map.advance_retire(N, g_dist.H);
 
-    // (b) Fan-in resolution: look up producers of INPUT/INOUT regions BEFORE
-    // this task registers its own writes.
-    int32_t fanin[kMaxFanin];
-    int32_t fc = 0;
-    for (int32_t i = 0; i < tc; i++) {
-        const TensorArgType tag = args.tag(i);
-        if (tag != TensorArgType::INPUT && tag != TensorArgType::INOUT) continue;
-        const Tensor &t = args.tensor(i).ref();
-        if (t.manual_dep) continue;
-        const int32_t p = self->map.lookup(t);
-        if (p < 0) continue;
-        bool dup = false;
-        for (int32_t k = 0; k < fc; k++)
-            if (fanin[k] == p) {
-                dup = true;
-                break;
-            }
-        if (!dup && fc < kMaxFanin) fanin[fc++] = p;
+    // (b) Anchor type + claim race FIRST — resolved from the mask alone (no map
+    // ops, no Tensor copies). Deciding the winner up front lets the ~2/3 of cores
+    // that fail type_match / lose the race SKIP the fan-in lookup below; they only
+    // still perform the unconditional output insert (so every core's duplicate
+    // TensorMap stays identical — §4). Competition is by anchor TYPE (§2/§3.1):
+    // cube tasks (any AIC subtask) contested by AIC cores; vector tasks (AIV-only,
+    // incl. 2V) by AIV cores. The cursor CAS touches no map state, so doing it
+    // before the insert below does not affect the deterministic map replay.
+    const uint8_t cmask = M.core_mask();
+    const int32_t pc = __builtin_popcount(cmask);
+    const bool has_aic = (cmask & PTO2_SUBTASK_MASK_AIC) != 0;
+    const bool anchor_is_cube = has_aic;
+    const bool type_match =
+        anchor_is_cube ? (self->role == CoreType::AIC) : (self->role == CoreType::AIV);
+    bool is_winner = false;
+    if (type_match) {
+        std::atomic<int32_t> &cursor = anchor_is_cube ? g_dist.cube_cursor : g_dist.vector_cursor;
+        is_winner = claim(cursor, N);
     }
 
-    // (c) Register this task as the producer of its OUTPUT / INOUT / existing
-    // outputs (every core, so all maps stay identical).
+    // (c) Fan-in resolution — WINNER ONLY. Look up producers of INPUT/INOUT regions
+    // BEFORE this task registers its own writes (so an INOUT does not self-match).
+    // Losers never consume fanin, so they skip these lookups entirely; correctness
+    // is unaffected because the map state read here is identical on every core and
+    // only the owner needs the result.
+    int32_t fanin[kMaxFanin];
+    int32_t fc = 0;
+    if (is_winner) {
+        for (int32_t i = 0; i < tc; i++) {
+            const TensorArgType tag = args.tag(i);
+            if (tag != TensorArgType::INPUT && tag != TensorArgType::INOUT) continue;
+            const Tensor &t = args.tensor(i).ref();
+            if (t.manual_dep) continue;
+            const int32_t p = self->map.lookup(t);
+            if (p < 0) continue;
+            bool dup = false;
+            for (int32_t k = 0; k < fc; k++)
+                if (fanin[k] == p) {
+                    dup = true;
+                    break;
+                }
+            if (!dup && fc < kMaxFanin) fanin[fc++] = p;
+        }
+    }
+
+    // (d) Register this task as the producer of its OUTPUT / INOUT / existing
+    // outputs — UNCONDITIONAL (every core, so all duplicate maps stay identical).
     uint32_t out_idx = 0;
     for (int32_t i = 0; i < tc; i++) {
         const TensorArgType tag = args.tag(i);
@@ -891,20 +916,7 @@ TaskOutputTensors dist_submit_impl(PTO2Runtime *, const MixedKernels &mixed, con
         }
     }
 
-    // (d) Anchor type + claim race. Competition is by anchor TYPE (§2/§3.1): cube
-    // tasks (any task with an AIC subtask) are contested by AIC cores; vector tasks
-    // (AIV-only, incl. 2V) by AIV cores (AIV0 and AIV1 equally). Resolved from the
-    // mask alone — no per-task Tensor copies — so losers bail out cheaply here.
-    const uint8_t cmask = M.core_mask();
-    const int32_t pc = __builtin_popcount(cmask);
-    const bool has_aic = (cmask & PTO2_SUBTASK_MASK_AIC) != 0;
-    const bool anchor_is_cube = has_aic;
-    const bool type_match =
-        anchor_is_cube ? (self->role == CoreType::AIC) : (self->role == CoreType::AIV);
-    if (!type_match) return result;  // wrong type for this task: only TensorMap was updated
-
-    std::atomic<int32_t> &cursor = anchor_is_cube ? g_dist.cube_cursor : g_dist.vector_cursor;
-    if (!claim(cursor, N)) return result;  // lost the race (another core of this type owns N)
+    if (!is_winner) return result;  // wrong type or lost the race: map updated, nothing to build
 
     // (e) Winner only: assemble the shared argument Tensors (identical for every
     // active lane of a multi-core task — they share the task tensors, each lane
