@@ -817,19 +817,25 @@ inline void TRACR_FINALIZE(Runtime *runtime) {
 #ifdef ENABLE_TRACR
     LOG_INFO_V9("[TraCR] thread[%d] dumping the #traces: %lu %p", g_TraCR_thread_idx, tracrThread->_traceIdx, runtime->tracrData_);
 
-    if (tracrThread->_traceIdx > 0) {
-        TraCR::Payload* tracrData = reinterpret_cast<TraCR::Payload*>(runtime->tracrData_);
-        const size_t payload_size = tracrThread->_traceIdx * sizeof(TraCR::Payload);
+    if (g_TraCR_thread_idx >= 0 && g_TraCR_thread_idx < runtime->aicpu_thread_num) {
+        if (runtime->tracrData_ != nullptr && tracrThread->_traceIdx > 0) {
+            TraCR::Payload* tracrData = reinterpret_cast<TraCR::Payload*>(runtime->tracrData_);
+            const size_t payload_size = tracrThread->_traceIdx * sizeof(TraCR::Payload);
 
-        std::memcpy(
-            &tracrData[g_TraCR_thread_idx * TraCR::CAPACITY], 
-            tracrThread->_traces.data(),
-            payload_size
-        );
+            std::memcpy(
+                &tracrData[g_TraCR_thread_idx * TraCR::CAPACITY],
+                tracrThread->_traces.data(),
+                payload_size
+            );
+        }
+
+        if (runtime->tracrDataSizes_ != nullptr) {
+            size_t* tracrDataSizes = reinterpret_cast<size_t*>(runtime->tracrDataSizes_);
+            tracrDataSizes[g_TraCR_thread_idx] = tracrThread->_traceIdx;
+        }
+    } else {
+        LOG_ERROR("[TraCR] thread index %d out of bounds (max=%d)", g_TraCR_thread_idx, runtime->aicpu_thread_num);
     }
-
-    size_t* tracrDataSizes = reinterpret_cast<size_t*>(runtime->tracrDataSizes_);
-    tracrDataSizes[g_TraCR_thread_idx] = tracrThread->_traceIdx;
 #endif
 
     if (g_TraCR_thread_idx == 0) {
