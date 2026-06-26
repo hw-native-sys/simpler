@@ -116,6 +116,69 @@ task-submit --device auto --device-num 1 \
 Sim variants (`a2a3sim`, `a5sim`) pass the precheck unconditionally — they
 are silicon-agnostic. The precheck is purely about onboard invocations.
 
+## Device logs: redirect them out of the shared default
+
+The AICPU/CCECPU device log (where `report_deadlock`, `HandleTaskTimeout`,
+stall diagnostics, AICore faults, and the `PTO2_PROFILING` Total/Orch/Sched
+markers land — the ground truth behind a host-side `507018`) defaults to:
+
+```text
+~/ascend/log/debug/device-<id>/device-<pid>_<timestamp>.log
+```
+
+That directory is **shared across every user/process on the box**, so finding
+*your* run's log means guessing by pid/timestamp and racing other writers.
+`ASCEND_PROCESS_LOG_PATH` redirects it to a directory you control.
+
+**`export` and `--env` are equivalent** — `task-submit` inherits the caller's
+environment, so you do *not* need `--env`:
+
+```bash
+# these two are the same; the dir MUST exist first (the driver fopens, no mkdir)
+export ASCEND_PROCESS_LOG_PATH="$LOGDIR"   # then: task-submit --run "..."
+task-submit --env ASCEND_PROCESS_LOG_PATH="$LOGDIR" --run "..."
+```
+
+**Recommended: put the device log under the run's own output dir** so it is
+isolated from other users and co-located with that run's artifacts. For a
+simpler scene test the per-case root is `outputs/<case>_<ts>/`; for a JIT
+example it is `build_output/_jit_*/dfx_outputs/`. Make an `ascend/` subdir
+under it and point the var there:
+
+```bash
+LOGDIR="$PWD/outputs/<case>/ascend"   # or .../dfx_outputs/ascend
+mkdir -p "$LOGDIR"
+export ASCEND_PROCESS_LOG_PATH="$LOGDIR"
+task-submit --device auto --device-num 1 --run "python ... -d \$TASK_DEVICE"
+# this run's device log is now at $LOGDIR/device-<id>/device-*.log
+```
+
+Then read it directly (`$LOGDIR/device-*/device-*.log`) — no more `grep`-ing
+`~/ascend/log/debug/` and guessing which file is yours.
+
+## `507018` triage: classify the mechanism before concluding
+
+`507018` (and `507014` / `507899`) is a **generic host-side code** —
+`run_prepared failed` / `aclrtSynchronizeStreamWithTimeout failed`. Several
+*distinct* on-device mechanisms all surface as the same code. Do NOT call it a
+"deadlock" or "OOM" from the host error alone — **read the device log and grep
+for the signature that actually fired:**
+
+| device-log signature | mechanism | note |
+| -------------------- | --------- | ---- |
+| `FATAL: Task Allocator Deadlock` / `Provable head-of-line` | ring/heap or dep-pool **deadlock** (alloc can't reclaim) | AICPU detector: 500ms backstop (`PTO2_ALLOC_DEADLOCK_TIMEOUT_CYCLES`) or immediate structural `head_blocked_on_scope_end`. Real capacity/scope deadlock. |
+| `Timeout (N cycles): producer/consumers ...` | **SPIN** wait on a specific producer/consumer | `pto_runtime2.cpp`. |
+| `HandleTaskTimeout` / `kill aicpu-sd` | **OS op-execute timeout** | STARS/tsdaemon, default 3s (`PLATFORM_OP_EXECUTE_TIMEOUT_US`). **A 3s kill ≠ deadlock** — the op was merely long or stalled. Raise this constant to measure true on-device duration. |
+| `log_stall_diagnostics` (cores idle + tasks `state=WAIT fanin 0/N` + `completed` frozen) | **forward-progress stall** | No dedicated detector — intermittent races (often contention-triggered) land here and are reaped only by the op-timeout above. |
+
+Decisive rule: **if a capacity/deadlock detector did NOT fire (counts of
+`Task Allocator Deadlock` / `Timeout (cycles)` are 0) and only
+`HandleTaskTimeout` did, it is NOT a proven deadlock or capacity bug** — it is a
+long/stalled op. A capacity exhaustion would trip its own detector; silence ⇒
+look for a race or just-too-slow, not "the ring is too small". For the
+device-side Total / Orch / Sched breakdown of a (completed) run, use
+`python -m simpler_setup.tools.device_log_timing` (see `simpler_setup/tools/README.md`).
+
 ## Anti-patterns
 
 - ❌ Bash `for i in $(seq 1 50); do pytest ... --device 8 & pytest ... --device 9 & wait; done`
@@ -129,6 +192,9 @@ are silicon-agnostic. The precheck is purely about onboard invocations.
 - ❌ Bypassing `onboard-arch-precheck` — the `--platform` mismatch failure
   modes are silent (look like real bugs) and burn hours of investigation
   time. Always run the gate.
+- ❌ Fishing your run's device log out of the shared `~/ascend/log/debug/`
+  by pid/timestamp guesswork. Set `ASCEND_PROCESS_LOG_PATH` to a per-run
+  dir up front (see "Device logs" above) so the log is isolated and known.
 
 ## Quick reference
 
@@ -140,5 +206,8 @@ are silicon-agnostic. The precheck is purely about onboard invocations.
 - **Wait for a submitted task** — `task-submit --wait <task-id>`
 - **Cancel pending** — `task-submit --cancel <task-id>`
 - **Per-die utilization + process table** — `npu-smi info`
+- **Redirect device log to the run's output** —
+  `mkdir -p <outdir>/ascend && export ASCEND_PROCESS_LOG_PATH=<outdir>/ascend`
+  (== `task-submit --env ASCEND_PROCESS_LOG_PATH=...`; dir must pre-exist)
 
 `task-submit --help` for the full surface.

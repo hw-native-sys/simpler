@@ -31,18 +31,21 @@ class TestVectorExample(SceneTestCase):
                 "source": "kernels/aiv/kernel_add.cpp",
                 "core_type": "aiv",
                 "signature": [D.IN, D.IN, D.OUT],
+                "arg_index": [0, 1, 2],
             },
             {
                 "func_id": 1,
                 "source": "kernels/aiv/kernel_add_scalar.cpp",
                 "core_type": "aiv",
                 "signature": [D.IN, D.OUT],
+                "arg_index": [0, 1],
             },
             {
                 "func_id": 2,
                 "source": "kernels/aiv/kernel_mul.cpp",
                 "core_type": "aiv",
                 "signature": [D.IN, D.IN, D.OUT],
+                "arg_index": [0, 1, 2],
             },
         ],
     }

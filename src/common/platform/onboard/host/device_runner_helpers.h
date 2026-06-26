@@ -17,10 +17,8 @@
  * the arch's own `device_runner.h` rather than being declared here.
  *
  * Current contents:
- *   - `DeviceArgs`: per-task AICPU device-args struct (offsets fixed by
- *     libaicpu_extend_kernels' ABI; layout identical on both archs).
  *   - `KernelArgsHelper`: host-side `KernelArgs` wrapper with device-memory
- *     management for the 3 H2D copies (`DeviceArgs`, `Runtime`, `KernelArgs`).
+ *     management for the H2D `Runtime` and `KernelArgs` copies.
  *
  * Future migrations (see `.docs/ONBOARD_HOST_COMMON_REFACTOR.md`):
  *   - `DeviceRunnerBase` (lifecycle + registration + profiling init).
@@ -35,23 +33,6 @@
 #include "common/kernel_args.h"  // arch-specific KernelArgs layout
 #include "host/memory_allocator.h"
 #include "runtime.h"
-
-/**
- * DeviceArgs structure for AICPU device arguments.
- *
- * Layout offsets are still nominally fixed by libaicpu_extend_kernels.so for
- * `aicpu_so_bin` / `aicpu_so_len` (at offsets 96 / 104), but per-task AICPU
- * launches go through `rtsLaunchCpuKernel` against the cached `rtFuncHandle`
- * on `LoadAicpuOp` — none of our code reads these fields. The fields are
- * kept (zero-initialized, never assigned) so the H2D struct layout matches
- * the historical contract on both archs; the runner-side `AicpuSoInfo`
- * allocation that used to back them was removed in PR #877.
- */
-struct DeviceArgs {
-    uint64_t unused[12] = {0};
-    uint64_t aicpu_so_bin{0};
-    uint64_t aicpu_so_len{0};
-};
 
 /**
  * Helper class for managing `KernelArgs` with device memory.
@@ -71,18 +52,6 @@ struct KernelArgsHelper {
     KernelArgs args;
     MemoryAllocator *allocator_{nullptr};
     KernelArgs *device_k_args_{nullptr};  // Device copy of KernelArgs for AICore
-
-    /**
-     * Initialize device arguments by allocating device memory and copying data.
-     *
-     * @param host_device_args  Host-side device arguments to copy.
-     * @param allocator         Memory allocator to use.
-     * @return 0 on success, error code on failure.
-     */
-    int init_device_args(const DeviceArgs &host_device_args, MemoryAllocator &allocator);
-
-    /** Free device memory allocated for device arguments. */
-    int finalize_device_args();
 
     /**
      * Initialize runtime arguments by allocating device memory and copying data.
@@ -111,9 +80,8 @@ struct KernelArgsHelper {
     /**
      * Implicit conversion operators for seamless use with runtime APIs.
      *
-     * These allow `KernelArgsHelper` to be used wherever `KernelArgs *` is
-     * expected, enabling transparent device memory management while
-     * maintaining API compatibility.
+     * These allow `KernelArgsHelper` to be used wherever a payload
+     * `KernelArgs *` is expected.
      */
     operator KernelArgs *() { return &args; }
     KernelArgs *operator&() { return &args; }

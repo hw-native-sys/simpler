@@ -206,14 +206,16 @@ void Scheduler::dispatch_ready() {
             std::vector<WorkerThread *> workers;
             for (int i = 0; i < N; i++) {
                 WorkerThread *wt = nullptr;
-                int8_t affinity = s.get_affinity(i);
+                int32_t affinity = s.get_affinity(i);
                 if (affinity >= 0) {
-                    wt = manager_->get_worker(s.worker_type, affinity);
-                    if (wt && (!wt->idle() || !s.endpoint_allowed(i, wt->endpoint_id())))
+                    wt = (s.worker_type == WorkerType::NEXT_LEVEL)
+                        ? manager_->get_worker_by_id(s.worker_type, affinity)
+                        : manager_->get_worker_by_index(s.worker_type, affinity);
+                    if (wt && (!wt->idle() || !s.worker_allowed(i, wt->worker_id())))
                         wt = nullptr;
                 } else {
                     wt = manager_->pick_idle_excluding_eligible(
-                        s.worker_type, workers, s.eligible_endpoints_for(i));
+                        s.worker_type, workers, s.eligible_workers_for(i));
                 }
                 if (!wt) break;
                 workers.push_back(wt);
@@ -240,14 +242,17 @@ and encodes it into the per-WT mailbox — see
 [worker-manager.md](worker-manager.md) §3 for the dispatch protocol.
 
 **Pick-idle back-pressure**: when the manager cannot provide enough idle
-workers that also satisfy affinity and endpoint eligibility, the slot is
+workers that also satisfy affinity and worker eligibility, the slot is
 pushed back onto *its* queue and that queue's drain halts; the other-type
 queue's drain continues. The ring's back-pressure at the Orch side already
 caps the total number of in-flight tasks across both types.
 
-Endpoint eligibility is opaque scheduling metadata. The Scheduler compares
-endpoint ids and capability bits exposed through `WorkerEndpoint::caps()`, but
+Worker eligibility is opaque scheduling metadata. The Scheduler compares
+worker ids and capability bits exposed through `WorkerEndpoint::caps()`, but
 does not inspect HCOMM, RDMA, socket, or remote buffer internals.
+For NEXT_LEVEL affinity, `s.get_affinity(i)` is a stable worker id and can
+be different from the `next_level_threads_` vector index. SUB affinity is not
+public and keeps the internal index semantics.
 
 ---
 

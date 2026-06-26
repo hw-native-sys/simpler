@@ -81,6 +81,8 @@ public:
     void free(uint64_t ptr);
     void copy_to(uint64_t dst, uint64_t src, size_t size);
     void copy_from(uint64_t dst, uint64_t src, size_t size);
+    void l3_l2_orch_comm_init(uint64_t control_block_addr, size_t control_block_size);
+    void l3_l2_orch_comm_shutdown();
 
     /// Distributed communication primitives (optional — only available when
     /// the bound runtime exports comm_*).  Wraps the backend-neutral C API
@@ -149,6 +151,8 @@ private:
     using UnregisterCallableFn = int (*)(void *, int32_t);
     using GetAicpuDlopenCountFn = size_t (*)(void *);
     using FinalizeDeviceFn = int (*)(void *);
+    using L3L2OrchCommInitFn = int (*)(void *, void *, size_t);
+    using L3L2OrchCommShutdownFn = int (*)(void *);
     using EnsureAclReadyFn = int (*)(void *, int);
     using CreateCommStreamFn = void *(*)(void *);
     using DestroyCommStreamFn = int (*)(void *, void *);
@@ -195,6 +199,8 @@ private:
     GetAicpuDlopenCountFn get_aicpu_dlopen_count_fn_ = nullptr;
     GetAicpuDlopenCountFn get_host_dlopen_count_fn_ = nullptr;
     FinalizeDeviceFn finalize_device_fn_ = nullptr;
+    L3L2OrchCommInitFn l3_l2_orch_comm_init_fn_ = nullptr;
+    L3L2OrchCommShutdownFn l3_l2_orch_comm_shutdown_fn_ = nullptr;
     EnsureAclReadyFn ensure_acl_ready_fn_ = nullptr;
     CreateCommStreamFn create_comm_stream_fn_ = nullptr;
     DestroyCommStreamFn destroy_comm_stream_fn_ = nullptr;

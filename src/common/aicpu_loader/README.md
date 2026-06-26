@@ -28,6 +28,28 @@ sibling of each runtime's host_runtime.so. A single process binding multiple
 runtimes can share one dispatcher SO on disk; the host process-level
 fingerprint cache deduplicates bootstrap calls by inner-SO Build-ID.
 
+## Argument ABI boundaries
+
+The dispatcher bootstrap uses a private `DeviceArgs` ABI. Host-side
+`LoadAicpuOp::BootstrapDispatcher()` writes a `device_args_ptr` into the
+bootstrap `KernelArgs` front slot at offset 40. The device-side dispatcher
+reads that pointer as an extended `DeviceArgs` object:
+
+```text
+DeviceArgs + 96:  aicpu_so_bin
+DeviceArgs + 104: aicpu_so_len
+DeviceArgs + 112: device_id
+DeviceArgs + 120: inner_so_bin
+DeviceArgs + 128: inner_so_len
+```
+
+This private bootstrap structure is distinct from the platform runtime
+`KernelArgs` payload used by per-task launches. Per-task AICPU launch passes
+the front-less `KernelArgs` payload directly to `rtsLaunchCpuKernel` (no CANN
+launch front): `runtime_args` is at offset 0, followed by profiling/logging
+fields, register tables, and `device_id`. AICore receives only the same
+front-less `KernelArgs` via a host-owned device copy.
+
 ## Exported entry points
 
 Three C-style symbols are exposed; `libaicpu_extend_kernels.so::SetTileFwkKernelMap`
@@ -38,7 +60,7 @@ dlsym's all three at load time, but only DynInit does real work:
 3. `DynTileFwkBackendKernelServer`          — stub
 
 See `aicpu_dispatcher.h` for the bootstrap protocol details (extended DeviceArgs
-with `inner_so_bin`/`inner_so_len`, FNV-1a content fingerprint).
+with `inner_so_bin`/`inner_so_len`, Build-ID-derived fingerprint).
 
 ## See also
 

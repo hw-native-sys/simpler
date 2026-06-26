@@ -106,7 +106,7 @@ def build_chip_callable(platform: str) -> ChipCallable:
             from simpler_setup.elf_parser import extract_text_section  # noqa: PLC0415
 
             bytes_ = extract_text_section(bytes_)
-        children.append((func_id, CoreCallable.build(signature=sig, binary=bytes_)))
+        children.append((func_id, CoreCallable.build(signature=sig, arg_index=list(range(len(sig))), binary=bytes_)))
 
     orch_bytes = kc.compile_orchestration(
         runtime_name=runtime,

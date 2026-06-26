@@ -65,14 +65,19 @@ class TestL2SwimlaneMixed(SceneTestCase):
                 "name": "MATMUL",
                 "source": "../../mixed_example/kernels/aic/kernel_matmul.cpp",
                 "core_type": "aic",
+                # Offset-packed mix (chained_mix_orch.cpp): MATMUL reads the
+                # first 3 args of the bundle.
                 "signature": [D.IN, D.IN, D.OUT],
+                "arg_index": [0, 1, 2],
             },
             {
                 "func_id": 1,
                 "name": "ADD",
                 "source": "../../mixed_example/kernels/aiv/kernel_add.cpp",
                 "core_type": "aiv",
+                # ADD reads the next 3 args (slots 3..5).
                 "signature": [D.IN, D.IN, D.OUT],
+                "arg_index": [3, 4, 5],
             },
         ],
     }

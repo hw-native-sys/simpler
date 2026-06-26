@@ -76,7 +76,7 @@ enum class RemoteRegistryTarget : uint32_t {
 struct FrameHeader {
     FrameType frame_type{FrameType::HELLO};
     uint64_t session_id{0};
-    int32_t endpoint_id{-1};
+    int32_t worker_id{-1};
     uint64_t sequence{0};
     uint32_t payload_bytes{0};
     uint32_t flags{0};
@@ -89,7 +89,7 @@ struct DecodedFrame {
 
 struct HelloPayload {
     uint64_t session_id{0};
-    int32_t endpoint_id{-1};
+    int32_t worker_id{-1};
     uint32_t protocol_version{PROTOCOL_VERSION};
     std::string comm_profile;
     uint64_t feature_flags{0};
@@ -131,7 +131,7 @@ struct ControlReplyPayload {
 };
 
 struct ExportBufferRequest {
-    int32_t owner_endpoint_id{-1};
+    int32_t owner_worker_id{-1};
     uint64_t buffer_id{0};
     uint64_t generation{0};
     uint64_t offset{0};
@@ -141,14 +141,14 @@ struct ExportBufferRequest {
 };
 
 struct ImportBufferRequest {
-    int32_t importer_endpoint_id{-1};
+    int32_t importer_worker_id{-1};
     uint32_t requested_access_flags{0};
     RemoteBufferExport export_desc{};
 };
 
 struct ReleaseImportRequest {
-    int32_t importer_endpoint_id{-1};
-    int32_t owner_endpoint_id{-1};
+    int32_t importer_worker_id{-1};
+    int32_t owner_worker_id{-1};
     uint64_t buffer_id{0};
     uint64_t generation{0};
     uint64_t import_id{0};

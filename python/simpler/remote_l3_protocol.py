@@ -96,7 +96,7 @@ class RemoteAddressSpace(enum.IntEnum):
 class FrameHeader:
     frame_type: FrameType
     session_id: int
-    endpoint_id: int
+    worker_id: int
     sequence: int
     payload_bytes: int = 0
     flags: int = 0
@@ -111,7 +111,7 @@ class Frame:
 @dataclass(frozen=True)
 class HelloPayload:
     session_id: int
-    endpoint_id: int
+    worker_id: int
     protocol_version: int
     comm_profile: str
     feature_flags: int
@@ -121,7 +121,7 @@ class HelloPayload:
 @dataclass(frozen=True)
 class RemoteTensorDesc:
     address_space: RemoteAddressSpace
-    owner_endpoint_id: int
+    owner_worker_id: int
     buffer_id: int
     offset: int
     nbytes: int
@@ -179,7 +179,7 @@ class DigestCallableCommand:
 
 @dataclass(frozen=True)
 class ExportBufferRequest:
-    owner_endpoint_id: int
+    owner_worker_id: int
     buffer_id: int
     generation: int
     offset: int
@@ -190,7 +190,7 @@ class ExportBufferRequest:
 
 @dataclass(frozen=True)
 class ExportBufferResult:
-    owner_endpoint_id: int
+    owner_worker_id: int
     buffer_id: int
     generation: int
     address_space: RemoteAddressSpace
@@ -207,15 +207,15 @@ class ExportBufferResult:
 
 @dataclass(frozen=True)
 class ImportBufferRequest:
-    importer_endpoint_id: int
+    importer_worker_id: int
     requested_access_flags: int
     export_desc: ExportBufferResult
 
 
 @dataclass(frozen=True)
 class ImportBufferResult:
-    importer_endpoint_id: int
-    owner_endpoint_id: int
+    importer_worker_id: int
+    owner_worker_id: int
     buffer_id: int
     generation: int
     import_id: int
@@ -232,8 +232,8 @@ class ImportBufferResult:
 
 @dataclass(frozen=True)
 class ReleaseImportRequest:
-    importer_endpoint_id: int
-    owner_endpoint_id: int
+    importer_worker_id: int
+    owner_worker_id: int
     buffer_id: int
     generation: int
     import_id: int
@@ -329,17 +329,12 @@ def _validate_access_flags(flags: int, field_name: str) -> None:
 
 
 def _validate_export_result_identity(result: ExportBufferResult) -> None:
-    if result.owner_endpoint_id < 0 or result.buffer_id == 0 or result.generation == 0:
+    if result.owner_worker_id < 0 or result.buffer_id == 0 or result.generation == 0:
         raise ValueError("remote_wire: export result requires live owner buffer identity")
 
 
 def _validate_import_result_identity(result: ImportBufferResult) -> None:
-    if (
-        result.importer_endpoint_id < 0
-        or result.owner_endpoint_id < 0
-        or result.buffer_id == 0
-        or result.generation == 0
-    ):
+    if result.importer_worker_id < 0 or result.owner_worker_id < 0 or result.buffer_id == 0 or result.generation == 0:
         raise ValueError("remote_wire: import result requires live imported buffer identity")
 
 
@@ -355,7 +350,7 @@ def encode_frame(header: FrameHeader, payload: bytes) -> bytes:
             PROTOCOL_VERSION,
             int(header.frame_type),
             int(header.session_id),
-            int(header.endpoint_id),
+            int(header.worker_id),
             int(header.sequence),
             len(payload),
             int(header.flags),
@@ -369,7 +364,7 @@ def decode_frame(data: bytes) -> Frame:
         raise ValueError("remote_wire: truncated frame header")
     if data[:4] != MAGIC:
         raise ValueError("remote_wire: bad frame magic")
-    version, raw_type, session_id, endpoint_id, sequence, payload_bytes, flags = struct.unpack_from("<IIQiQII", data, 4)
+    version, raw_type, session_id, worker_id, sequence, payload_bytes, flags = struct.unpack_from("<IIQiQII", data, 4)
     if version != PROTOCOL_VERSION:
         raise ValueError("remote_wire: unsupported frame version")
     try:
@@ -383,7 +378,7 @@ def decode_frame(data: bytes) -> Frame:
     if len(data) - FRAME_HEADER_BYTES != payload_bytes:
         raise ValueError("remote_wire: frame payload length mismatch")
     return Frame(
-        FrameHeader(frame_type, int(session_id), int(endpoint_id), int(sequence), int(payload_bytes), int(flags)),
+        FrameHeader(frame_type, int(session_id), int(worker_id), int(sequence), int(payload_bytes), int(flags)),
         data[FRAME_HEADER_BYTES:],
     )
 
@@ -412,7 +407,7 @@ def send_frame(sock: socket.socket, header: FrameHeader, payload: bytes = b"") -
 
 def encode_hello(payload: HelloPayload) -> bytes:
     out = bytearray()
-    out.extend(struct.pack("<QiI", int(payload.session_id), int(payload.endpoint_id), int(payload.protocol_version)))
+    out.extend(struct.pack("<QiI", int(payload.session_id), int(payload.worker_id), int(payload.protocol_version)))
     _put_string(out, payload.comm_profile, MAX_STRING_BYTES, "HELLO.comm_profile")
     out.extend(struct.pack("<QI", int(payload.feature_flags), int(payload.ready_state)))
     return bytes(out)
@@ -453,7 +448,7 @@ def decode_tensor(reader: _Reader) -> Tensor:
 def decode_remote_tensor_desc(reader: _Reader) -> RemoteTensorDesc:
     return RemoteTensorDesc(
         address_space=RemoteAddressSpace(reader.u32()),
-        owner_endpoint_id=reader.i32(),
+        owner_worker_id=reader.i32(),
         buffer_id=reader.u64(),
         offset=reader.u64(),
         nbytes=reader.u64(),
@@ -473,7 +468,7 @@ def _validate_desc(desc: RemoteTensorDesc, inline_payload_len: int) -> None:
         raise ValueError("remote_wire: RemoteTensorDesc offset+nbytes overflows")
     if desc.address_space == RemoteAddressSpace.HOST_INLINE:
         if (
-            desc.owner_endpoint_id != 0
+            desc.owner_worker_id != 0
             or desc.buffer_id != 0
             or desc.remote_addr != 0
             or desc.rkey_or_token != 0
@@ -487,8 +482,8 @@ def _validate_desc(desc: RemoteTensorDesc, inline_payload_len: int) -> None:
     else:
         if desc.inline_payload_offset != 0 or desc.inline_payload_len != 0:
             raise ValueError("remote_wire: non-HOST_INLINE inline fields must be zero")
-        if desc.owner_endpoint_id < 0:
-            raise ValueError("remote_wire: remote descriptor owner endpoint must be non-negative")
+        if desc.owner_worker_id < 0:
+            raise ValueError("remote_wire: remote descriptor owner worker must be non-negative")
         if desc.buffer_id == 0 or desc.generation == 0:
             raise ValueError("remote_wire: remote descriptor buffer_id and generation must be non-zero")
 
@@ -668,7 +663,7 @@ def encode_export_buffer_result(result: ExportBufferResult) -> bytes:
     out.extend(
         struct.pack(
             "<iQQIQQQQQQI",
-            int(result.owner_endpoint_id),
+            int(result.owner_worker_id),
             int(result.buffer_id),
             int(result.generation),
             int(result.address_space),
@@ -695,7 +690,7 @@ def encode_export_buffer_result(result: ExportBufferResult) -> bytes:
 def decode_export_buffer_request(data: bytes) -> ExportBufferRequest:
     reader = _Reader(data)
     request = ExportBufferRequest(
-        owner_endpoint_id=reader.i32(),
+        owner_worker_id=reader.i32(),
         buffer_id=reader.u64(),
         generation=reader.u64(),
         offset=reader.u64(),
@@ -706,7 +701,7 @@ def decode_export_buffer_request(data: bytes) -> ExportBufferRequest:
     if reader.u32() != 0:
         raise ValueError("remote_wire: EXPORT_BUFFER reserved field must be zero")
     reader.done("EXPORT_BUFFER")
-    if request.owner_endpoint_id < 0 or request.buffer_id == 0 or request.generation == 0:
+    if request.owner_worker_id < 0 or request.buffer_id == 0 or request.generation == 0:
         raise ValueError("remote_wire: EXPORT_BUFFER requires live owner buffer identity")
     if request.nbytes <= 0:
         raise ValueError("remote_wire: EXPORT_BUFFER nbytes must be non-zero")
@@ -717,7 +712,7 @@ def decode_export_buffer_request(data: bytes) -> ExportBufferRequest:
 def decode_export_buffer_result(data: bytes) -> ExportBufferResult:
     reader = _Reader(data)
     result = ExportBufferResult(
-        owner_endpoint_id=reader.i32(),
+        owner_worker_id=reader.i32(),
         buffer_id=reader.u64(),
         generation=reader.u64(),
         address_space=RemoteAddressSpace(reader.u32()),
@@ -745,7 +740,7 @@ def decode_export_buffer_result(data: bytes) -> ExportBufferResult:
 
 def decode_import_buffer_request(data: bytes) -> ImportBufferRequest:
     reader = _Reader(data)
-    importer_endpoint_id = reader.i32()
+    importer_worker_id = reader.i32()
     requested_access_flags = reader.u32()
     export_start = reader.offset
     if len(data) < export_start + 4:
@@ -755,12 +750,12 @@ def decode_import_buffer_request(data: bytes) -> ImportBufferRequest:
     if reader.u32() != 0:
         raise ValueError("remote_wire: IMPORT_BUFFER reserved field must be zero")
     reader.done("IMPORT_BUFFER")
-    if importer_endpoint_id < 0:
-        raise ValueError("remote_wire: IMPORT_BUFFER importer endpoint must be non-negative")
+    if importer_worker_id < 0:
+        raise ValueError("remote_wire: IMPORT_BUFFER importer worker must be non-negative")
     _validate_access_flags(requested_access_flags, "IMPORT_BUFFER requested_access_flags")
     if requested_access_flags & ~export_desc.access_flags:
         raise ValueError("remote_wire: IMPORT_BUFFER requested access is not a subset of export access")
-    return ImportBufferRequest(importer_endpoint_id, requested_access_flags, export_desc)
+    return ImportBufferRequest(importer_worker_id, requested_access_flags, export_desc)
 
 
 def encode_import_buffer_result(result: ImportBufferResult) -> bytes:
@@ -774,8 +769,8 @@ def encode_import_buffer_result(result: ImportBufferResult) -> bytes:
     out.extend(
         struct.pack(
             "<iiQQQIQQQQQI",
-            int(result.importer_endpoint_id),
-            int(result.owner_endpoint_id),
+            int(result.importer_worker_id),
+            int(result.owner_worker_id),
             int(result.buffer_id),
             int(result.generation),
             int(result.import_id),
@@ -797,8 +792,8 @@ def encode_import_buffer_result(result: ImportBufferResult) -> bytes:
 def decode_release_import_request(data: bytes) -> ReleaseImportRequest:
     reader = _Reader(data)
     request = ReleaseImportRequest(
-        importer_endpoint_id=reader.i32(),
-        owner_endpoint_id=reader.i32(),
+        importer_worker_id=reader.i32(),
+        owner_worker_id=reader.i32(),
         buffer_id=reader.u64(),
         generation=reader.u64(),
         import_id=reader.u64(),
@@ -807,8 +802,8 @@ def decode_release_import_request(data: bytes) -> ReleaseImportRequest:
         raise ValueError("remote_wire: RELEASE_IMPORT reserved field must be zero")
     reader.done("RELEASE_IMPORT")
     if (
-        request.importer_endpoint_id < 0
-        or request.owner_endpoint_id < 0
+        request.importer_worker_id < 0
+        or request.owner_worker_id < 0
         or request.buffer_id == 0
         or request.generation == 0
         or request.import_id == 0

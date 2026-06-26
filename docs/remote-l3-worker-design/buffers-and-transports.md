@@ -1,7 +1,7 @@
 # Remote L3 Buffers and Transports
 
 This document defines remote buffer lifetime and backend transport contracts
-for remote L3 NEXT_LEVEL endpoints.
+for remote L3 NEXT_LEVEL workers.
 
 ## Buffer Handles
 
@@ -13,8 +13,8 @@ Parent-side handle:
 
 ```text
 RemoteBufferHandle:
-  endpoint_id
-  owner_endpoint_id
+  worker_id
+  owner_worker_id
   buffer_id
   generation
   import_id
@@ -29,11 +29,11 @@ RemoteBufferHandle:
   live_slot_refs
 ```
 
-For an owner allocation, `endpoint_id == owner_endpoint_id` and
-`import_id == 0`. For an imported peer mapping, `endpoint_id` is the importer
-that can consume the handle, `owner_endpoint_id` is the endpoint that owns the
+For an owner allocation, `worker_id == owner_worker_id` and
+`import_id == 0`. For an imported peer mapping, `worker_id` is the importer
+that can consume the handle, `owner_worker_id` is the endpoint that owns the
 physical allocation, and `import_id` names the importer-local mapping. The
-public Python object stays opaque; it may expose endpoint, owner endpoint, size,
+public Python object stays opaque; it may expose worker id, owner worker id, size,
 address space, and release state, but not raw transport keys.
 
 `buffer_id` may be reused only with a new `generation`. Stale completions,
@@ -45,6 +45,8 @@ reported as session errors.
 Remote memory APIs return handles, not bare integer pointers:
 
 ```python
+# l3_worker_id and peer_l3_worker_id are worker ids returned by
+# add_remote_worker(...), not C++ worker-thread vector indices.
 buf = w4.remote_malloc(worker=l3_worker_id, nbytes=4096)
 w4.remote_copy_to(buf, host_ptr, 4096)
 
@@ -71,14 +73,16 @@ explicitly imported, staged, or materialized into a local-addressable
 staging produced a handle.
 
 `remote_export()` returns an opaque session-scoped export descriptor. It does
-not create a new user-releasable allocation. `remote_import()` consumes that
-descriptor on a target endpoint and returns an imported `RemoteBufferHandle`.
+not expose transport keys such as remote addresses, rkeys/tokens, UB LD/ST
+addresses, or transport descriptors, and it does not create a new
+user-releasable allocation. `remote_import()` consumes that descriptor on a
+target endpoint and returns an imported `RemoteBufferHandle`.
 `remote_release_import()` releases the importer-local mapping after all slot
 refs on that imported handle have drained. `remote_free()` on the owner handle
 releases the owner allocation after all imports and slot refs have drained.
 
-Current status: Python exposes `RemoteBufferHandle`, `RemoteTensorRef`, and
-`RemoteTaskArgs`. `RemoteTaskArgs.add_tensor(RemoteTensorRef(...), tag)` stores
+Current status: Python exposes `RemoteBufferHandle` and `RemoteTensorRef`.
+`TaskArgs.add_tensor(RemoteTensorRef(...), tag)` stores
 `Tensor.data == 0` in the underlying `TaskArgs` and keeps the remote
 descriptor in a same-index sidecar. Public `remote_malloc`, `remote_free`,
 `remote_copy_to`, `remote_copy_from`, `remote_export`, `remote_import`, and
@@ -96,8 +100,12 @@ Python-facing rules:
 - `RemoteTensorRef` is not converted to a fake integer pointer.
 - `RemoteBufferHandle` is opaque to user code. Users may inspect endpoint,
   size, and release state, but not transport keys such as `rkey`.
+- Submit validates the remote handle's access flags against the tensor tag:
+  `INPUT` requires read, `OUTPUT` and `OUTPUT_EXISTING` require write, and
+  `INOUT` and remote `NO_DEP` require read/write. `NO_DEP` skips dependency
+  inference only; it does not weaken remote memory access requirements.
 - A `TaskArgs` containing any remote sidecar is legal only when the final
-  selected endpoint set contains remote endpoints that can consume every
+  selected worker-id set contains remote workers that can consume every
   referenced sidecar.
 - Local `submit_next_level()` rejects remote sidecars before slot commit unless
   an explicit import/staging API has converted them into local-addressable
@@ -199,22 +207,22 @@ same physical buffer:
 
 ```text
 owner handle:
-  endpoint_id = owner_endpoint_id = owner endpoint
+  worker_id = owner_worker_id = owner worker
   buffer_id/generation = owner allocation identity
   import_id = 0
   address_space = REMOTE_DEVICE
 
 imported handle:
-  endpoint_id = importer endpoint
-  owner_endpoint_id = original owner endpoint
+  worker_id = importer worker
+  owner_worker_id = original owner worker
   buffer_id/generation = owner allocation identity
   import_id = importer-local mapping id
   address_space = REMOTE_WINDOW or UB_LDST
 ```
 
 The parent builds TASK descriptors from the handle that will be consumed by
-the selected endpoint. For owner handles, the selected endpoint must be the
-owner. For imported handles, the selected endpoint must be the importer. In
+the selected worker. For owner handles, the selected worker must be the
+owner. For imported handles, the selected worker must be the importer. In
 both cases the descriptor preserves the original owner identity so dependency
 tracking sees all views of the same buffer as the same producer/consumer key
 when their logical start offset matches.
@@ -228,16 +236,16 @@ allocation range with a bounded access mask:
 - Submit validation rejects a tensor whose tag requires an access bit that the
   handle does not carry.
 
-`EXPORT_BUFFER` is sent only to the owner endpoint and returns an opaque
+`EXPORT_BUFFER` is sent only to the owner worker and returns an opaque
 transport descriptor. The parent may keep this descriptor long enough to import
-the range into one or more peer endpoints, but Python user code must not depend
+the range into one or more peer workers, but Python user code must not depend
 on raw `rkey`, HCOMM descriptor, or UB address values.
 
-`IMPORT_BUFFER` is sent to each importer endpoint. A successful reply creates
-data eligibility for that endpoint only. It does not make the owner endpoint,
+`IMPORT_BUFFER` is sent to each importer worker. A successful reply creates
+data eligibility for that worker only. It does not make the owner worker,
 other importers, or local fork/shm endpoints eligible.
 
-`RELEASE_IMPORT` is sent only to the importer endpoint. It tears down the
+`RELEASE_IMPORT` is sent only to the importer worker. It tears down the
 importer-local mapping and removes that imported handle from future endpoint
 eligibility. It does not free the owner allocation and does not release imports
 on other endpoints.
@@ -277,14 +285,15 @@ terminal cleanup path as successful slots.
 
 ## Dependency Keys
 
-`TensorKey` must grow beyond the current `{ptr, int8 worker}` shape for remote
-buffers while preserving the current exact-start lookup semantics. Today, local
-dependency tracking keys only on a tensor's start pointer and worker id; shape
-and byte length do not participate in lookup. Remote keys follow the same rule:
+`TensorKey` must grow beyond the current `{ptr, int32 worker_id}` shape for
+remote buffers while preserving the current exact-start lookup semantics.
+Today, local dependency tracking keys only on a tensor's start pointer and
+worker id; shape and byte length do not participate in lookup. Remote keys
+follow the same rule:
 
 ```text
 address_kind
-owner_endpoint_id
+owner_worker_id
 buffer_id
 offset_begin
 generation

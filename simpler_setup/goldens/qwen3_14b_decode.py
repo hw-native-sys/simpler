@@ -6,242 +6,258 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""Golden reference for the Qwen3-14B 1-layer decode SceneTestCase.
+"""Golden reference + fixture for the Qwen3-14B 2-layer decode SceneTestCase.
 
-Mirrors the device pipeline in ``qwen3_14b_decode/kernels/orchestration/qwen3_decode.cpp``:
-RMSNorm → QKV projection → per-head Q/K RMS → RoPE → KV-cache write → paged
-attention (online softmax) → output projection + residual → post-RMSNorm →
-SwiGLU FFN → down-proj + residual.
+Ported from pypto-lib ``models/qwen3/14b/decode_layer.py`` (entry
+``decode_fwd_layers`` with ``_CHUNK_NLAYERS == 2``): a fused chunk of two
+consecutive Qwen3-14B decode layers, hidden -> hidden, no LM head. Weights and
+the paged KV pool are STACKED along dim 0 (one slice per layer); the two layers
+use the same (replicated) weights — matching the lib's ``--validate-fwd``
+const-layer-0 stack — but each reads/writes its own KV pool. The inter-layer
+hidden is carried in FP32 (no per-layer bf16 round); the only chunk-boundary
+casts are ``copy_hidden`` (bf16 input embed) and ``copy_out`` (FP32->bf16).
 
-KV cache layout (must match the kernels byte-for-byte):
-    row = (block_idx * NUM_KV_HEADS + kv_head_idx) * BLOCK_SIZE + pos_in_block
+Parameter regime matches ``stress_profile.py`` (the vLLM serving stress run):
+BATCH=16 (CONCURRENCY, aligned with decode kernel BATCH=16), MAX_SEQ=5500
+(= max_model_len), and a fixed decode sequence length of 3500 (the ~3500-token
+prompt). ``MAX_SEQ`` MUST match the harvested kernels' codegen-time value.
 
-where ``block_idx`` is what ``block_table`` contains and ``slot_mapping[b]``
-encodes the write position as ``slot_block * BLOCK_SIZE + slot_offset``.
-
-Weight matrices are stored in ``[in_features, out_features]`` layout — the
-kernels consume them directly without a transpose — so the matmul is
-``y = x @ w`` rather than the more common ``y = x @ w.T``.
+KV-cache layout per layer pool: row = (phys_page * NUM_KV_HEADS + kv_head) *
+BLOCK_SIZE + pos_in_block; layer L's pool starts at L * CACHE_ROWS.
+Weight matrices are ``[in_features, out_features]`` -> ``y = x @ w``.
 """
 
-import math
+from __future__ import annotations
 
 import torch
 
 from simpler_setup.scene_test import TaskArgsBuilder, Tensor
 
-# Qwen3-14B architectural constants — baked into the kernels.
-HIDDEN = 5120
-KV_HIDDEN = 1024
-HEAD_DIM = 128
+# ── Model architecture (Qwen3-14B) ──
 NUM_HEADS = 40
 NUM_KV_HEADS = 8
-HEADS_PER_KV = NUM_HEADS // NUM_KV_HEADS  # 5
+HEAD_DIM = 128
 INTERMEDIATE = 17408
-BLOCK_SIZE = 256
-BLOCKS_PER_BATCH = 2  # qwen3_decode.cpp pins block_table to 2 entries per batch
-MAX_SEQ = 4096
+BATCH = 16
 EPS = 1e-6
-ROPE_THETA = 1_000_000.0
+
+HIDDEN = NUM_HEADS * HEAD_DIM  # 5120
+KV_HIDDEN = NUM_KV_HEADS * HEAD_DIM  # 1024
+Q_PER_KV = NUM_HEADS // NUM_KV_HEADS  # 5
+HALF_DIM = HEAD_DIM // 2  # 64
+ATTN_SCALE = 1.0 / (HEAD_DIM**0.5)
+ROPE_THETA = 1.0e4
+
+# ── Chunk / paging (must match the harvested kernels) ──
+N_LAYERS = 2
+MAX_SEQ = 5500  # = stress_profile max_model_len; codegen-time KV-pool / RoPE sizing
+SEQ_TILE = 128
+BLOCK_SIZE = SEQ_TILE
+MAX_CTX_BLOCKS = (MAX_SEQ + SEQ_TILE - 1) // SEQ_TILE  # 43 @ 5500
+MAX_BLOCKS_PER_SEQ = MAX_CTX_BLOCKS
+NUM_PAGES = BATCH * MAX_BLOCKS_PER_SEQ
+CACHE_ROWS = NUM_PAGES * NUM_KV_HEADS * BLOCK_SIZE  # rows of ONE layer's paged pool
+
+DEFAULT_SEQ_LEN = 3500  # the stress prompt length (~3500 tokens)
+
+# Ordered entry args of decode_fwd_layers (orchestration signature order).
+INPUT_NAMES = (
+    "hidden_states",
+    "input_rms_weight",
+    "wq",
+    "wk",
+    "wv",
+    "q_norm_weight",
+    "k_norm_weight",
+    "seq_lens",
+    "block_table",
+    "slot_mapping",
+    "rope_cos",
+    "rope_sin",
+    "k_cache",
+    "v_cache",
+    "wo",
+    "w_gate",
+    "w_up",
+    "w_down",
+    "post_rms_weight",
+)
 
 
-def _rms_norm(x: torch.Tensor, weight: torch.Tensor, eps: float = EPS) -> torch.Tensor:
-    """Standard LLaMA-style RMSNorm: ``x * rsqrt(mean(x**2) + eps) * weight``.
+def _bf16(t: torch.Tensor) -> torch.Tensor:
+    return t.to(torch.bfloat16).to(torch.float32)
 
-    ``weight`` may be ``[N]`` or ``[1, N]`` (the kernels' FP32 gammas are stored
-    as ``[1, HIDDEN]`` / ``[1, HEAD_DIM]``); both broadcast against a 1-D ``x``.
+
+def _rmsnorm_inv(x: torch.Tensor) -> torch.Tensor:
+    return torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + EPS)
+
+
+def _rope_half(vec: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+    lo, hi = vec[..., :HALF_DIM], vec[..., HALF_DIM:]
+    cos_lo, cos_hi = cos[..., :HALF_DIM], cos[..., HALF_DIM:]
+    sin_lo, sin_hi = sin[..., :HALF_DIM], sin[..., HALF_DIM:]
+    return torch.cat([lo * cos_lo - hi * sin_lo, hi * cos_hi + lo * sin_hi], dim=-1)
+
+
+def _paged_block_table_slot_mapping(seq_lens: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Identity paging within a layer pool (same for every layer)."""
+    block_table = torch.arange(BATCH * MAX_BLOCKS_PER_SEQ, dtype=torch.int32)
+    slot_mapping = torch.empty(BATCH, dtype=torch.int32)
+    for b in range(BATCH):
+        pos = int(seq_lens[b].item()) - 1
+        logical_block = pos // BLOCK_SIZE
+        phys_page = b * MAX_BLOCKS_PER_SEQ + logical_block
+        slot_mapping[b] = phys_page * BLOCK_SIZE + (pos % BLOCK_SIZE)
+    return block_table, slot_mapping
+
+
+def generate_inputs(seed: int = 1234, seq_len: int = DEFAULT_SEQ_LEN) -> TaskArgsBuilder:
+    """Deterministic fixture for decode_fwd_layers (N=2), stacked x2 along dim 0.
+
+    Every lane uses sequence length ``seq_len`` (default 3500, the stress prompt).
+    Per-layer weights are replicated (stack0) so layer 1 reuses layer 0's weights,
+    matching the lib's const-layer-0 stacked-fwd reference; each layer still has
+    its own KV pool.
     """
-    x32 = x.float()
-    inv = torch.rsqrt(x32.pow(2).mean(dim=-1, keepdim=True) + eps)
-    w = weight.float().reshape(-1)
-    return (x32 * inv * w).to(x.dtype)
+    if not (1 <= seq_len <= MAX_SEQ):
+        raise ValueError(f"seq_len must be in [1, {MAX_SEQ}], got {seq_len}")
+    g = torch.Generator().manual_seed(seed)
+
+    def rn(shape, std=1.0, bias=0.0):
+        return torch.empty(shape).normal_(0.0, std, generator=g) + bias
+
+    def s0(t):  # replicate along dim 0 (one slice per layer)
+        return torch.cat([t] * N_LAYERS, dim=0).contiguous()
+
+    seq_lens = torch.full([BATCH], seq_len, dtype=torch.int32)
+    block_table, slot_mapping = _paged_block_table_slot_mapping(seq_lens)
+
+    posv = torch.arange(MAX_SEQ).float().unsqueeze(1)
+    inv_freq = 1.0 / (ROPE_THETA ** (torch.arange(0, HALF_DIM).float() / HALF_DIM))
+    ang = posv * inv_freq.unsqueeze(0)
+    rope_cos = torch.cat([ang.cos(), ang.cos()], dim=1).float()
+    rope_sin = torch.cat([ang.sin(), ang.sin()], dim=1).float()
+
+    tensors = {
+        "hidden_states": rn([BATCH, HIDDEN], 1.0).to(torch.bfloat16),
+        "input_rms_weight": s0(rn([1, HIDDEN], 0.1, 1.0).float()),
+        "wq": s0(rn([HIDDEN, HIDDEN], 0.02).to(torch.bfloat16)),
+        "wk": s0(rn([HIDDEN, KV_HIDDEN], 0.02).to(torch.bfloat16)),
+        "wv": s0(rn([HIDDEN, KV_HIDDEN], 0.02).to(torch.bfloat16)),
+        "q_norm_weight": s0(rn([1, HEAD_DIM], 0.1, 1.0).float()),
+        "k_norm_weight": s0(rn([1, HEAD_DIM], 0.1, 1.0).float()),
+        "seq_lens": seq_lens,
+        "block_table": block_table,
+        "slot_mapping": slot_mapping,
+        "rope_cos": rope_cos,
+        "rope_sin": rope_sin,
+        "k_cache": s0(rn([CACHE_ROWS, HEAD_DIM], 0.01).to(torch.bfloat16)),
+        "v_cache": s0(rn([CACHE_ROWS, HEAD_DIM], 0.02, 0.3).to(torch.bfloat16)),
+        "wo": s0(rn([HIDDEN, HIDDEN], 0.0006).to(torch.bfloat16)),
+        "w_gate": s0(rn([HIDDEN, INTERMEDIATE], 0.02).to(torch.bfloat16)),
+        "w_up": s0(rn([HIDDEN, INTERMEDIATE], 0.02).to(torch.bfloat16)),
+        "w_down": s0(rn([INTERMEDIATE, HIDDEN], 0.0004).to(torch.bfloat16)),
+        "post_rms_weight": s0(rn([1, HIDDEN], 0.1, 1.0).float()),
+    }
+    specs = [Tensor(name, tensors[name]) for name in INPUT_NAMES]
+    specs.append(Tensor("out", torch.zeros([BATCH, HIDDEN], dtype=torch.bfloat16)))
+    return TaskArgsBuilder(*specs)
 
 
-def _build_rope_tables(max_seq: int, head_dim: int, theta: float) -> tuple[torch.Tensor, torch.Tensor]:
-    """Standard RoPE precomputed cos/sin tables, shape ``[max_seq, head_dim]``.
-
-    Within a head_dim row the first ``head_dim // 2`` entries pair against the
-    second half, matching the split that ``rope_kv_cache.cpp`` performs on the
-    Q/K tiles (``cos_lo / cos_hi`` halves).
+def _one_layer(args, layer: int, x: torch.Tensor) -> torch.Tensor:
+    """One decode layer of the chunk. ``x`` is the FP32 layer input; returns the
+    FP32 residual-stream output (down + h1, NO bf16 round). Also writes the
+    current token's RoPE'd K / raw V into THIS layer's KV pool (for INOUT compare).
     """
-    half = head_dim // 2
-    freqs = 1.0 / (theta ** (torch.arange(0, half, dtype=torch.float32) / half))
-    pos = torch.arange(max_seq, dtype=torch.float32).unsqueeze(1)  # [max_seq, 1]
-    angles = pos * freqs.unsqueeze(0)  # [max_seq, half]
-    cos = torch.cat([angles.cos(), angles.cos()], dim=-1)
-    sin = torch.cat([angles.sin(), angles.sin()], dim=-1)
-    return cos, sin
+    hb, ib, cb = layer * HIDDEN, layer * INTERMEDIATE, layer * CACHE_ROWS
+    irw = args.input_rms_weight.float()[layer]  # [H]
+    wq = args.wq[hb : hb + HIDDEN].float()
+    wk = args.wk[hb : hb + HIDDEN].float()
+    wv = args.wv[hb : hb + HIDDEN].float()
+    qn = args.q_norm_weight.float()[layer]
+    kn = args.k_norm_weight.float()[layer]
+    wo = args.wo[hb : hb + HIDDEN].float()
+    wg = args.w_gate[hb : hb + HIDDEN].float()
+    wu = args.w_up[hb : hb + HIDDEN].float()
+    wd = args.w_down[ib : ib + INTERMEDIATE].float()
+    post_gamma = args.post_rms_weight.float()[layer]
+
+    seq_lens = args.seq_lens
+    block_table = args.block_table
+    slot_mapping = args.slot_mapping
+    rope_cos = args.rope_cos.float()
+    rope_sin = args.rope_sin.float()
+    k_cache = args.k_cache[cb : cb + CACHE_ROWS].float()  # this layer's pool
+    v_cache = args.v_cache[cb : cb + CACHE_ROWS].float()
+
+    inv_rms = _rmsnorm_inv(x)
+    normed = _bf16(x * irw)
+    q_proj = normed @ wq
+    k_proj = normed @ wk
+    v_proj = normed @ wv
+    qh = (q_proj * inv_rms).reshape(BATCH, NUM_HEADS, HEAD_DIM)
+    qh = qh * _rmsnorm_inv(qh) * qn
+    kh = (k_proj * inv_rms).reshape(BATCH, NUM_KV_HEADS, HEAD_DIM)
+    kh = kh * _rmsnorm_inv(kh) * kn
+    v_heads = (v_proj * inv_rms).reshape(BATCH, NUM_KV_HEADS, HEAD_DIM)
+
+    attn_out = torch.zeros(BATCH, HIDDEN)
+    cur_k, cur_v = {}, {}
+    for b in range(BATCH):
+        slen = int(seq_lens[b].item())
+        p = slen - 1
+        cos_p, sin_p = rope_cos[p], rope_sin[p]
+        q_b = _bf16(_rope_half(qh[b], cos_p, sin_p))
+        k_cur = _bf16(_rope_half(kh[b], cos_p, sin_p))
+        v_cur = _bf16(v_heads[b])
+        n_blocks = (slen + BLOCK_SIZE - 1) // BLOCK_SIZE
+        for kvh in range(NUM_KV_HEADS):
+            k_lane = torch.empty(slen, HEAD_DIM)
+            v_lane = torch.empty(slen, HEAD_DIM)
+            for sb in range(n_blocks):
+                pbid = int(block_table[b * MAX_BLOCKS_PER_SEQ + sb].item())
+                row = (pbid * NUM_KV_HEADS + kvh) * BLOCK_SIZE
+                lo = sb * BLOCK_SIZE
+                blk = min(BLOCK_SIZE, slen - lo)
+                k_lane[lo : lo + blk] = k_cache[row : row + blk]
+                v_lane[lo : lo + blk] = v_cache[row : row + blk]
+            k_lane[p] = k_cur[kvh]
+            v_lane[p] = v_cur[kvh]
+            cur_k[(b, kvh)] = k_cur[kvh]
+            cur_v[(b, kvh)] = v_cur[kvh]
+            for j in range(Q_PER_KV):
+                hq = kvh * Q_PER_KV + j
+                scores = (q_b[hq].unsqueeze(0) * k_lane).sum(-1) * ATTN_SCALE
+                w = torch.softmax(scores, dim=-1)
+                attn_out[b, hq * HEAD_DIM : (hq + 1) * HEAD_DIM] = (w.unsqueeze(-1) * v_lane).sum(0)
+    attn_out = _bf16(attn_out)
+
+    attn_proj = attn_out @ wo
+    h1 = x + attn_proj  # FP32 residual (no bf16 round — inter-layer carry)
+    post_inv = _rmsnorm_inv(h1)
+    mlp_in = _bf16(h1 * post_gamma)
+    gate = mlp_in @ wg
+    up = mlp_in @ wu
+    sg = gate * post_inv
+    su = up * post_inv
+    mlp = _bf16(sg * torch.sigmoid(sg) * su)
+    down = mlp @ wd
+
+    # Write the current token into THIS layer's pool (INOUT compare).
+    for b in range(BATCH):
+        slot = int(slot_mapping[b].item())
+        sblk, soff = slot // BLOCK_SIZE, slot % BLOCK_SIZE
+        for kvh in range(NUM_KV_HEADS):
+            row = cb + (sblk * NUM_KV_HEADS + kvh) * BLOCK_SIZE + soff
+            args.k_cache[row] = cur_k[(b, kvh)].to(torch.bfloat16)
+            args.v_cache[row] = cur_v[(b, kvh)].to(torch.bfloat16)
+
+    return down + h1  # FP32
 
 
-def _apply_rope(x: torch.Tensor, cos_row: torch.Tensor, sin_row: torch.Tensor) -> torch.Tensor:
-    """Rotate the (head_dim) vector by the position-specific cos/sin row.
-
-    Matches the lo/hi split in ``rope_kv_cache.cpp``: pair element ``i`` with
-    element ``i + head_dim/2`` and apply the 2-D rotation.
-    """
-    half = x.shape[-1] // 2
-    x_lo = x[..., :half]
-    x_hi = x[..., half:]
-    cos_lo = cos_row[..., :half]
-    sin_lo = sin_row[..., :half]
-    cos_hi = cos_row[..., half:]
-    sin_hi = sin_row[..., half:]
-    rot_lo = x_lo * cos_lo - x_hi * sin_lo
-    rot_hi = x_hi * cos_hi + x_lo * sin_hi
-    return torch.cat([rot_lo, rot_hi], dim=-1)
-
-
-def _silu(x: torch.Tensor) -> torch.Tensor:
-    return x * torch.sigmoid(x)
-
-
-def _cache_row(block_idx: int, kv_head: int, pos_in_block: int) -> int:
-    """Flat-cache row index used by ``rope_kv_cache`` (write) and ``qk_matmul`` (read)."""
-    return (block_idx * NUM_KV_HEADS + kv_head) * BLOCK_SIZE + pos_in_block
-
-
-def generate_inputs(user_batch: int, seq_len: int) -> TaskArgsBuilder:
-    """Produce the 20 ordered tensors the orchestration consumes.
-
-    Cache sizing assumes ``seq_len <= BLOCK_SIZE`` (single block per batch). The
-    block table is one block per batch (with the second slot unused but
-    present, to match the orchestration's hardcoded ``block_table_base = b * 2``).
-    """
-    if seq_len < 1 or seq_len > BLOCK_SIZE:
-        raise ValueError(f"seq_len must be in [1, {BLOCK_SIZE}], got {seq_len}")
-
-    num_blocks = user_batch  # one block per batch
-    kv_cache_rows = num_blocks * NUM_KV_HEADS * BLOCK_SIZE
-
-    hidden_states = torch.randn(user_batch, HIDDEN, dtype=torch.bfloat16) * 0.02
-    # Norm gammas are read as FP32 by rmsnorm/qk_norm/post_rmsnorm — see the
-    # `float*` arg type in each kernel's static function signature.
-    input_rms_weight = torch.randn(1, HIDDEN, dtype=torch.float32)
-    wq = torch.randn(HIDDEN, NUM_HEADS * HEAD_DIM, dtype=torch.bfloat16) * 0.02
-    wk = torch.randn(HIDDEN, KV_HIDDEN, dtype=torch.bfloat16) * 0.02
-    wv = torch.randn(HIDDEN, KV_HIDDEN, dtype=torch.bfloat16) * 0.02
-    q_norm_weight = torch.randn(1, HEAD_DIM, dtype=torch.float32)
-    k_norm_weight = torch.randn(1, HEAD_DIM, dtype=torch.float32)
-
-    seq_lens = torch.full((user_batch,), seq_len, dtype=torch.int32)
-    block_table = torch.zeros((user_batch, BLOCKS_PER_BATCH), dtype=torch.int32)
-    for b in range(user_batch):
-        block_table[b, 0] = b  # one unique block per batch
-
-    slot_mapping = torch.zeros(user_batch, dtype=torch.int32)
-    for b in range(user_batch):
-        slot_mapping[b] = b * BLOCK_SIZE + (seq_len - 1)
-
-    cos_table, sin_table = _build_rope_tables(MAX_SEQ, HEAD_DIM, ROPE_THETA)
-    rope_cos = cos_table.contiguous()  # FP32
-    rope_sin = sin_table.contiguous()  # FP32
-
-    k_cache = (torch.randn(kv_cache_rows, HEAD_DIM, dtype=torch.bfloat16) * 0.02).contiguous()
-    v_cache = (torch.randn(kv_cache_rows, HEAD_DIM, dtype=torch.bfloat16) * 0.02).contiguous()
-
-    wo = torch.randn(NUM_HEADS * HEAD_DIM, HIDDEN, dtype=torch.bfloat16) * 0.02
-    post_rms_weight = torch.randn(1, HIDDEN, dtype=torch.float32)
-    w_gate = torch.randn(HIDDEN, INTERMEDIATE, dtype=torch.bfloat16) * 0.02
-    w_up = torch.randn(HIDDEN, INTERMEDIATE, dtype=torch.bfloat16) * 0.02
-    w_down = torch.randn(INTERMEDIATE, HIDDEN, dtype=torch.bfloat16) * 0.02
-
-    out = torch.zeros(user_batch, HIDDEN, dtype=torch.bfloat16)
-
-    return TaskArgsBuilder(
-        Tensor("hidden_states", hidden_states),
-        Tensor("input_rms_weight", input_rms_weight),
-        Tensor("wq", wq),
-        Tensor("wk", wk),
-        Tensor("wv", wv),
-        Tensor("q_norm_weight", q_norm_weight),
-        Tensor("k_norm_weight", k_norm_weight),
-        Tensor("seq_lens", seq_lens),
-        Tensor("block_table", block_table),
-        Tensor("slot_mapping", slot_mapping),
-        Tensor("rope_cos", rope_cos),
-        Tensor("rope_sin", rope_sin),
-        Tensor("k_cache", k_cache),
-        Tensor("v_cache", v_cache),
-        Tensor("wo", wo),
-        Tensor("post_rms_weight", post_rms_weight),
-        Tensor("w_gate", w_gate),
-        Tensor("w_up", w_up),
-        Tensor("w_down", w_down),
-        Tensor("out", out),
-    )
-
-
-def compute_golden(args: TaskArgsBuilder, user_batch: int, seq_len: int) -> None:
-    """Compute the expected ``out``, ``k_cache``, ``v_cache`` in-place on ``args``."""
-    scale = 1.0 / math.sqrt(HEAD_DIM)
-
-    hidden_states = args.hidden_states
-    wq = args.wq.float()
-    wk = args.wk.float()
-    wv = args.wv.float()
-    wo = args.wo.float()
-    w_gate = args.w_gate.float()
-    w_up = args.w_up.float()
-    w_down = args.w_down.float()
-    rope_cos = args.rope_cos
-    rope_sin = args.rope_sin
-
-    for b in range(user_batch):
-        pos = seq_len - 1
-        slot = int(args.slot_mapping[b].item())
-        slot_block = slot // BLOCK_SIZE
-        slot_offset = slot - slot_block * BLOCK_SIZE
-
-        residual_in = hidden_states[b].float()
-        normed = _rms_norm(hidden_states[b], args.input_rms_weight).float()
-
-        q = (normed @ wq).reshape(NUM_HEADS, HEAD_DIM)
-        k = (normed @ wk).reshape(NUM_KV_HEADS, HEAD_DIM)
-        v = (normed @ wv).reshape(NUM_KV_HEADS, HEAD_DIM)
-
-        q_normed = torch.stack([_rms_norm(q[h], args.q_norm_weight).float() for h in range(NUM_HEADS)])
-        k_normed = torch.stack([_rms_norm(k[h], args.k_norm_weight).float() for h in range(NUM_KV_HEADS)])
-
-        cos_row = rope_cos[pos].float()
-        sin_row = rope_sin[pos].float()
-        q_roped = torch.stack([_apply_rope(q_normed[h], cos_row, sin_row) for h in range(NUM_HEADS)])
-        k_roped = torch.stack([_apply_rope(k_normed[h], cos_row, sin_row) for h in range(NUM_KV_HEADS)])
-
-        # Write the new K/V vector into the cache at slot_mapping position.
-        for h in range(NUM_KV_HEADS):
-            row = _cache_row(slot_block, h, slot_offset)
-            args.k_cache[row] = k_roped[h].to(torch.bfloat16)
-            args.v_cache[row] = v.to(torch.bfloat16)[h]
-
-        # Gather the [seq_len] context rows for each kv_head from the block table.
-        k_ctx = torch.zeros(NUM_KV_HEADS, seq_len, HEAD_DIM, dtype=torch.float32)
-        v_ctx = torch.zeros(NUM_KV_HEADS, seq_len, HEAD_DIM, dtype=torch.float32)
-        for p in range(seq_len):
-            ctx_block_slot = p // BLOCK_SIZE
-            ctx_in_block = p - ctx_block_slot * BLOCK_SIZE
-            ctx_block = int(args.block_table[b, ctx_block_slot].item())
-            for h in range(NUM_KV_HEADS):
-                row = _cache_row(ctx_block, h, ctx_in_block)
-                k_ctx[h, p] = args.k_cache[row].float()
-                v_ctx[h, p] = args.v_cache[row].float()
-
-        # GQA attention: each query head attends to its kv-head group.
-        attn_out = torch.zeros(NUM_HEADS, HEAD_DIM, dtype=torch.float32)
-        for qh in range(NUM_HEADS):
-            kv_head = qh // HEADS_PER_KV
-            scores = (q_roped[qh] @ k_ctx[kv_head].T) * scale  # [seq_len]
-            probs = torch.softmax(scores, dim=-1)
-            attn_out[qh] = probs @ v_ctx[kv_head]
-
-        attn_flat = attn_out.reshape(NUM_HEADS * HEAD_DIM).to(torch.bfloat16)
-
-        # Output projection + residual (residual is the original BF16 hidden_states).
-        resid1 = residual_in + (attn_flat.float() @ wo)
-
-        normed2 = _rms_norm(resid1.to(torch.bfloat16), args.post_rms_weight).float()
-        gate = normed2 @ w_gate
-        up = normed2 @ w_up
-        mlp = (_silu(gate) * up).to(torch.bfloat16).float()
-        final = resid1 + mlp @ w_down
-
-        args.out[b] = final.to(torch.bfloat16)
+def compute_golden(args: TaskArgsBuilder) -> None:
+    """Fill ``args.out`` (and INOUT k_cache/v_cache) for the 2-layer decode chunk."""
+    cur = args.hidden_states.float()  # copy_hidden: bf16 input embedded as FP32
+    for layer in range(N_LAYERS):
+        cur = _one_layer(args, layer, cur)
+    args.out[:] = cur.to(torch.bfloat16)  # copy_out: single FP32->bf16 round

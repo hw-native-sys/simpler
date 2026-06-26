@@ -151,6 +151,7 @@ static constexpr uint64_t CTRL_RELEASE_DOMAIN = 8;
 static constexpr uint64_t CTRL_COMM_INIT = 9;
 static constexpr uint64_t CTRL_PY_REGISTER = 10;
 static constexpr uint64_t CTRL_PY_UNREGISTER = 11;
+static constexpr uint64_t CTRL_L3_L2_ORCH_COMM_INIT = 13;
 
 // Control args reuse the task mailbox region (mutually exclusive with task dispatch):
 //   offset 16: uint64 arg0 (size for malloc/register; ptr for free; dst for copy)
@@ -170,7 +171,7 @@ static constexpr ptrdiff_t CTRL_OFF_RESULT = 40;
 
 struct ControlResult {
     std::string worker_type;
-    int32_t worker_index{0};
+    int32_t worker_id{0};
     bool ok{false};
     std::string error_message;
 };
@@ -184,7 +185,7 @@ enum class WorkerEndpointKind : int32_t {
 
 struct WorkerEndpointCaps {
     WorkerEndpointKind kind{WorkerEndpointKind::LOCAL_MAILBOX};
-    int32_t endpoint_id{-1};
+    int32_t worker_id{-1};
     bool remote{false};
     bool supports_task_dispatch{true};
     bool supports_control{true};
@@ -229,7 +230,7 @@ public:
         const std::string &transport_profile
     );
     virtual RemoteBufferHandle control_remote_import(
-        int32_t importer_endpoint_id, const RemoteBufferExport &export_desc, uint32_t requested_access_flags
+        int32_t importer_worker_id, const RemoteBufferExport &export_desc, uint32_t requested_access_flags
     );
     virtual void control_remote_release_import(const RemoteBufferHandle &handle);
     virtual void control_generic(
@@ -238,11 +239,12 @@ public:
     virtual void control_alloc_domain(const char *request_shm_name, const char *reply_shm_name);
     virtual void control_release_domain(const char *request_shm_name);
     virtual void control_comm_init(const char *request_shm_name);
+    virtual void control_l3_l2_orch_comm_init(const char *control_shm_name);
 };
 
 class LocalMailboxEndpoint : public WorkerEndpoint {
 public:
-    LocalMailboxEndpoint(int32_t endpoint_id, void *mailbox);
+    LocalMailboxEndpoint(int32_t worker_id, void *mailbox);
 
     const WorkerEndpointCaps &caps() const override { return caps_; }
     WorkerCompletion run(Ring *ring, const WorkerDispatch &dispatch) override;
@@ -278,7 +280,7 @@ public:
         const std::string &transport_profile
     ) override;
     RemoteBufferHandle control_remote_import(
-        int32_t importer_endpoint_id, const RemoteBufferExport &export_desc, uint32_t requested_access_flags
+        int32_t importer_worker_id, const RemoteBufferExport &export_desc, uint32_t requested_access_flags
     ) override;
     void control_remote_release_import(const RemoteBufferHandle &handle) override;
     void control_generic(
@@ -287,6 +289,7 @@ public:
     void control_alloc_domain(const char *request_shm_name, const char *reply_shm_name) override;
     void control_release_domain(const char *request_shm_name) override;
     void control_comm_init(const char *request_shm_name) override;
+    void control_l3_l2_orch_comm_init(const char *control_shm_name) override;
 
 private:
     WorkerEndpointCaps caps_;
@@ -349,7 +352,7 @@ public:
     // True if the worker has no active task.
     bool idle() const { return idle_.load(std::memory_order_acquire); }
     const WorkerEndpointCaps &caps() const;
-    int32_t endpoint_id() const;
+    int32_t worker_id() const;
 
     void stop();
 
@@ -404,7 +407,7 @@ public:
         const std::string &transport_profile
     );
     RemoteBufferHandle control_remote_import(
-        int32_t importer_endpoint_id, const RemoteBufferExport &export_desc, uint32_t requested_access_flags
+        int32_t importer_worker_id, const RemoteBufferExport &export_desc, uint32_t requested_access_flags
     );
     void control_remote_release_import(const RemoteBufferHandle &handle);
     void control_generic(
@@ -423,6 +426,7 @@ public:
     // Lazy comm_init driver — payload shm carries (rank, nranks, rootinfo_path).
     // Caller dispatches in parallel to every chip; child runs cw.comm_init.
     void control_comm_init(const char *request_shm_name);
+    void control_l3_l2_orch_comm_init(const char *control_shm_name);
 
 private:
     Ring *ring_{nullptr};
@@ -453,6 +457,7 @@ public:
     // region; the real worker (a `ChipWorker` for NEXT_LEVEL, a Python
     // callable for SUB) lives in the forked child.
     void add_next_level(void *mailbox);
+    void add_next_level_at(int32_t worker_id, void *mailbox);
     void add_next_level_endpoint(std::unique_ptr<WorkerEndpoint> endpoint);
     void add_sub(void *mailbox);
 
@@ -462,14 +467,14 @@ public:
     WorkerThread *pick_idle(WorkerType type) const;
     std::vector<WorkerThread *> pick_n_idle(WorkerType type, int n) const;
 
-    // Direct index into the worker pool by logical id (0-based).
-    WorkerThread *get_worker(WorkerType type, int logical_id) const;
-    WorkerThread *get_worker_by_endpoint_id(WorkerType type, int32_t endpoint_id) const;
+    // Direct index into the worker pool (0-based).
+    WorkerThread *get_worker_by_index(WorkerType type, int worker_index) const;
+    WorkerThread *get_worker_by_id(WorkerType type, int32_t worker_id) const;
 
     // Pick one idle worker NOT in `exclude`. Returns nullptr if none available.
     WorkerThread *pick_idle_excluding(WorkerType type, const std::vector<WorkerThread *> &exclude) const;
     WorkerThread *pick_idle_excluding_eligible(
-        WorkerType type, const std::vector<WorkerThread *> &exclude, const std::vector<int32_t> &eligible_endpoint_ids
+        WorkerType type, const std::vector<WorkerThread *> &exclude, const std::vector<int32_t> &eligible_worker_ids
     ) const;
 
     bool any_busy() const;
@@ -486,25 +491,26 @@ public:
     void control_alloc_domain(int worker_id, const char *request_shm_name, const char *reply_shm_name);
     void control_release_domain(int worker_id, const char *request_shm_name);
     void control_comm_init(int worker_id, const char *request_shm_name);
+    void control_l3_l2_orch_comm_init(int worker_id, const char *control_shm_name);
     ControlResult
     control_digest_only(WorkerType type, int worker_id, uint64_t sub_cmd, const uint8_t *digest, double timeout_s);
     ControlResult control_remote_prepare_register(
-        int endpoint_id, remote_l3::RemoteRegistryTarget target_registry, CallableKind callable_kind,
-        const void *payload, size_t payload_size, const uint8_t *digest
+        int worker_id, remote_l3::RemoteRegistryTarget target_registry, CallableKind callable_kind, const void *payload,
+        size_t payload_size, const uint8_t *digest
     );
     ControlResult control_remote_commit_register(
-        int endpoint_id, remote_l3::RemoteRegistryTarget target_registry, CallableKind callable_kind,
+        int worker_id, remote_l3::RemoteRegistryTarget target_registry, CallableKind callable_kind,
         const uint8_t *digest
     );
     ControlResult control_remote_abort_register(
-        int endpoint_id, remote_l3::RemoteRegistryTarget target_registry, CallableKind callable_kind,
+        int worker_id, remote_l3::RemoteRegistryTarget target_registry, CallableKind callable_kind,
         const uint8_t *digest
     );
     ControlResult control_remote_unregister(
-        int endpoint_id, remote_l3::RemoteRegistryTarget target_registry, CallableKind callable_kind,
+        int worker_id, remote_l3::RemoteRegistryTarget target_registry, CallableKind callable_kind,
         const uint8_t *digest
     );
-    RemoteBufferHandle control_remote_malloc(int endpoint_id, size_t size);
+    RemoteBufferHandle control_remote_malloc(int worker_id, size_t size);
     void control_remote_free(const RemoteBufferHandle &handle);
     void control_remote_copy_to(const RemoteBufferHandle &handle, uint64_t offset, const void *src, size_t size);
     void control_remote_copy_from(void *dst, const RemoteBufferHandle &handle, uint64_t offset, size_t size);
@@ -513,7 +519,7 @@ public:
         const std::string &transport_profile
     );
     RemoteBufferHandle control_remote_import(
-        int32_t importer_endpoint_id, const RemoteBufferExport &export_desc, uint32_t requested_access_flags
+        int32_t importer_worker_id, const RemoteBufferExport &export_desc, uint32_t requested_access_flags
     );
     void control_remote_release_import(const RemoteBufferHandle &handle);
 
@@ -546,7 +552,11 @@ public:
     void clear_error();
 
 private:
-    std::vector<void *> next_level_entries_;
+    struct LocalNextLevelEntry {
+        int32_t worker_id{-1};
+        void *mailbox{nullptr};
+    };
+    std::vector<LocalNextLevelEntry> next_level_entries_;
     std::vector<void *> sub_entries_;
     std::vector<std::unique_ptr<WorkerEndpoint>> next_level_endpoint_entries_;
 

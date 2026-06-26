@@ -109,6 +109,8 @@ void ChipWorker::init(
         get_aicpu_dlopen_count_fn_ = load_symbol<GetAicpuDlopenCountFn>(handle, "get_aicpu_dlopen_count");
         get_host_dlopen_count_fn_ = load_symbol<GetAicpuDlopenCountFn>(handle, "get_host_dlopen_count");
         finalize_device_fn_ = load_symbol<FinalizeDeviceFn>(handle, "finalize_device");
+        l3_l2_orch_comm_init_fn_ = load_symbol<L3L2OrchCommInitFn>(handle, "l3_l2_orch_comm_init_ctx");
+        l3_l2_orch_comm_shutdown_fn_ = load_symbol<L3L2OrchCommShutdownFn>(handle, "l3_l2_orch_comm_shutdown_ctx");
         // ACL lifecycle + comm_* are part of the uniform host_runtime.so ABI.
         // Every platform runtime exports all of them — runtimes that do not
         // have a real backend (today: a5) ship not-supported stubs rather
@@ -190,6 +192,8 @@ void ChipWorker::init(
         get_aicpu_dlopen_count_fn_ = nullptr;
         get_host_dlopen_count_fn_ = nullptr;
         finalize_device_fn_ = nullptr;
+        l3_l2_orch_comm_init_fn_ = nullptr;
+        l3_l2_orch_comm_shutdown_fn_ = nullptr;
         ensure_acl_ready_fn_ = nullptr;
         create_comm_stream_fn_ = nullptr;
         destroy_comm_stream_fn_ = nullptr;
@@ -228,6 +232,8 @@ void ChipWorker::init(
         get_aicpu_dlopen_count_fn_ = nullptr;
         get_host_dlopen_count_fn_ = nullptr;
         finalize_device_fn_ = nullptr;
+        l3_l2_orch_comm_init_fn_ = nullptr;
+        l3_l2_orch_comm_shutdown_fn_ = nullptr;
         ensure_acl_ready_fn_ = nullptr;
         create_comm_stream_fn_ = nullptr;
         destroy_comm_stream_fn_ = nullptr;
@@ -253,6 +259,9 @@ void ChipWorker::finalize() {
     // communicator handles and streams before tearing down the device context.
     clear_comm_sessions();
 
+    if (device_ctx_ != nullptr && l3_l2_orch_comm_shutdown_fn_ != nullptr && initialized_) {
+        l3_l2_orch_comm_shutdown_fn_(device_ctx_);
+    }
     if (device_ctx_ != nullptr && finalize_device_fn_ != nullptr && initialized_) {
         finalize_device_fn_(device_ctx_);
     }
@@ -277,6 +286,8 @@ void ChipWorker::finalize() {
     get_aicpu_dlopen_count_fn_ = nullptr;
     get_host_dlopen_count_fn_ = nullptr;
     finalize_device_fn_ = nullptr;
+    l3_l2_orch_comm_init_fn_ = nullptr;
+    l3_l2_orch_comm_shutdown_fn_ = nullptr;
     ensure_acl_ready_fn_ = nullptr;
     create_comm_stream_fn_ = nullptr;
     destroy_comm_stream_fn_ = nullptr;
@@ -493,6 +504,38 @@ void ChipWorker::copy_from(uint64_t dst, uint64_t src, size_t size) {
         copy_from_device_ctx_fn_(device_ctx_, reinterpret_cast<void *>(dst), reinterpret_cast<const void *>(src), size);
     if (rc != 0) {
         throw std::runtime_error("copy_from failed with code " + std::to_string(rc));
+    }
+}
+
+void ChipWorker::l3_l2_orch_comm_init(uint64_t control_block_addr, size_t control_block_size) {
+    if (!initialized_) {
+        throw std::runtime_error("ChipWorker not initialized; call init() first");
+    }
+    if (control_block_addr == 0 || control_block_size == 0) {
+        throw std::runtime_error("l3_l2_orch_comm_init requires a non-null control block and nonzero size");
+    }
+    if (l3_l2_orch_comm_init_fn_ == nullptr) {
+        throw std::runtime_error("l3_l2_orch_comm_init is not supported by this runtime");
+    }
+    int rc = l3_l2_orch_comm_init_fn_(device_ctx_, reinterpret_cast<void *>(control_block_addr), control_block_size);
+    if (rc == PTO_RUNTIME_ERR_UNSUPPORTED) {
+        throw std::runtime_error("l3_l2_orch_comm_init is not supported by this platform/runtime");
+    }
+    if (rc != 0) {
+        throw std::runtime_error("l3_l2_orch_comm_init failed with code " + std::to_string(rc));
+    }
+}
+
+void ChipWorker::l3_l2_orch_comm_shutdown() {
+    if (!initialized_) {
+        throw std::runtime_error("ChipWorker not initialized; call init() first");
+    }
+    if (l3_l2_orch_comm_shutdown_fn_ == nullptr) {
+        throw std::runtime_error("l3_l2_orch_comm_shutdown is not supported by this runtime");
+    }
+    int rc = l3_l2_orch_comm_shutdown_fn_(device_ctx_);
+    if (rc != 0) {
+        throw std::runtime_error("l3_l2_orch_comm_shutdown failed with code " + std::to_string(rc));
     }
 }
 

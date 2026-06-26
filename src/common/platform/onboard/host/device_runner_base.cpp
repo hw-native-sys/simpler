@@ -32,6 +32,7 @@
 #include <cassert>
 #include <cstdint>
 #include <cstring>
+#include <limits>
 
 #include "callable.h"
 #include "callable_protocol.h"
@@ -41,6 +42,7 @@
 #include "common/unified_log.h"
 #include "host/raii_scope_guard.h"
 #include "host_log.h"
+#include "pto_runtime_c_api.h"
 #include "utils/elf_build_id.h"
 // `runtime.h` (pulled in via `device_runner_helpers.h` in the base header)
 // supplies the per-arch `Handshake` + `Runtime` types used by
@@ -70,6 +72,64 @@ int DeviceRunnerBase::copy_from_device(void *host_ptr, const void *dev_ptr, std:
 
 int DeviceRunnerBase::device_memset(void *dev_ptr, int value, std::size_t bytes) {
     return aclrtMemset(dev_ptr, bytes, value, bytes);
+}
+
+int DeviceRunnerBase::l3_l2_orch_comm_init(void *control_block, size_t control_block_size) {
+    if (!l3_l2_orch_comm_supported()) {
+        return PTO_RUNTIME_ERR_UNSUPPORTED;
+    }
+    return l3_l2_orch_comm_service_.start(this, control_block, control_block_size);
+}
+
+int DeviceRunnerBase::l3_l2_orch_comm_shutdown() {
+    if (!l3_l2_orch_comm_supported()) {
+        return 0;
+    }
+    return l3_l2_orch_comm_service_.stop();
+}
+
+void *DeviceRunnerBase::l3_l2_allocate_region_bytes(uint64_t bytes) {
+    if (bytes == 0 || bytes > std::numeric_limits<size_t>::max()) {
+        return nullptr;
+    }
+    void *ptr = allocate_tensor(static_cast<size_t>(bytes));
+    if (ptr == nullptr) {
+        return nullptr;
+    }
+    std::lock_guard<std::mutex> lk(l3_l2_alloc_mu_);
+    l3_l2_allocations_.insert(ptr);
+    return ptr;
+}
+
+void DeviceRunnerBase::l3_l2_free_region_bytes(void *ptr) {
+    if (ptr == nullptr) {
+        return;
+    }
+    std::lock_guard<std::mutex> lk(l3_l2_alloc_mu_);
+    auto it = l3_l2_allocations_.find(ptr);
+    if (it == l3_l2_allocations_.end()) {
+        return;
+    }
+    free_tensor(ptr);
+    l3_l2_allocations_.erase(it);
+}
+
+int DeviceRunnerBase::l3_l2_copy_to_device(void *dev_ptr, const void *host_ptr, uint64_t bytes) {
+    if (bytes > std::numeric_limits<size_t>::max()) {
+        return -1;
+    }
+    return copy_to_device(dev_ptr, host_ptr, static_cast<size_t>(bytes));
+}
+
+int DeviceRunnerBase::l3_l2_copy_from_device(void *host_ptr, const void *dev_ptr, uint64_t bytes) {
+    if (bytes > std::numeric_limits<size_t>::max()) {
+        return -1;
+    }
+    return copy_from_device(host_ptr, dev_ptr, static_cast<size_t>(bytes));
+}
+
+std::thread DeviceRunnerBase::l3_l2_create_service_thread(std::function<void()> fn) {
+    return create_thread(std::move(fn));
 }
 
 void *DeviceRunnerBase::acquire_pooled_gm_heap() {
@@ -286,20 +346,6 @@ int DeviceRunnerBase::ensure_binaries_loaded() {
         return rc;
     }
     LOG_INFO_V2("DeviceRunner: inner SO registered (runtime entry handles ready)");
-
-    // H2D the per-task DeviceArgs struct itself. device_args_.aicpu_so_bin/len
-    // stay zero — our own per-task AICPU code (launched via rtsLaunchCpuKernel
-    // against the cached rtFuncHandle on LoadAicpuOp) never reads them, and
-    // the dispatcher-bootstrap KernelArgs (KERNEL_TYPE_AICPU_KFC) builds its
-    // own DeviceArgs view inside BootstrapDispatcher rather than reading
-    // ours. The "load-bearing on a5" finding documented prior to #864/#870
-    // no longer reproduces against current HEAD — see PR removing
-    // AicpuSoInfo (CI on both archs green).
-    rc = kernel_args_.init_device_args(device_args_, mem_alloc_);
-    if (rc != 0) {
-        LOG_ERROR("init_device_args failed: %d", rc);
-        return rc;
-    }
 
     // Release host bytes — bootstrap is done. Per-task launches go through
     // the cached rtFuncHandle owned by LoadAicpuOp; dispatcher SO bytes are
@@ -722,6 +768,8 @@ int DeviceRunnerBase::finalize_common() {
         if (err != 0 && rc == 0) rc = err;
     };
 
+    capture(l3_l2_orch_comm_shutdown());
+
     // Streams are persistent for the DeviceRunner's lifetime; destroy them here.
     // Intentionally no pre-destroy sync: when a run hits the AICore op-timeout
     // chain (PR #718), the AICPU stream surfaces ACL_ERROR_RT_AICPU_EXCEPTION
@@ -737,10 +785,6 @@ int DeviceRunnerBase::finalize_common() {
         capture(rtStreamDestroy(stream_aicore_));
         stream_aicore_ = nullptr;
     }
-
-    // Cleanup kernel args (deviceArgs); device-side KernelArgs + runtime args
-    // are released by runtime_args_cleanup RAII so they also unwind on errors.
-    capture(kernel_args_.finalize_device_args());
 
     // load_aicpu_op_ has no per-task host-side state to release —
     // rtsLaunchCpuKernel does not hand back any per-launch handle, and the
@@ -994,11 +1038,10 @@ int DeviceRunnerBase::sync_run_streams() {
 }
 
 void DeviceRunnerBase::read_device_wall_ns() {
-    // Pull the platform-level device wall (ns) back from the 8-byte
-    // device buffer that AICPU writes through via
-    // KernelArgs::device_wall_data_base. (We can't use the
-    // device_k_args_ shadow here — CANN's rtAicpuKernelLaunchExWithArgs
-    // copies KernelArgs into AICPU-private memory at launch, so AICPU's
+    // Pull the platform-level device wall (ns) back from the 8-byte device
+    // buffer that AICPU writes through via KernelArgs::device_wall_data_base.
+    // (We can't use the device_k_args_ shadow here — CANN copies the
+    // KernelArgs payload into AICPU-private memory at launch, so AICPU's
     // writes to its local copy don't propagate to device_k_args_.)
     // Failure path is a soft warn — wall stays zero.
     device_wall_ns_ = 0;

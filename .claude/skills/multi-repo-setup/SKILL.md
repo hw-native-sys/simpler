@@ -127,6 +127,28 @@ source .venv/bin/activate
 pip install --no-build-isolation .   # needs PTO_ISA_ROOT set (Step 2.5)
 ```
 
+**Re-editing simpler later → the runtime `.so` may NOT recompile.** Non-editable
+`pip install .` (and `--force-reinstall`) rebuilds the *Python wheel* but can
+**silently skip the runtime build** (the runtime builder skips when outputs
+already exist), so a fresh C++ edit to `src/{arch}/runtime|platform/*` does not
+take effect — you keep running the old binary (real footgun: a runtime fix or
+diagnostic you added appears to do nothing). After editing simpler's C++, either
+verify the installed `.so` actually changed, or rebuild it via the cmake cache
+and sync to **both** load locations (`build/lib` AND the installed
+`.venv/.../simpler_setup/_assets/build/lib`):
+
+```bash
+BD=build/cache/{arch}/onboard/tensormap_and_ringbuffer/{aicpu|host|aicore}
+cmake --build "$BD" -j                       # incremental; recompiles changed .cpp
+SO="$BD/libaicpu_kernel.so"                   # or libhost_runtime.so / aicore_kernel.o
+for d in $(find .venv build/lib -path "*onboard*tensormap_and_ringbuffer*$(basename "$SO")"); do cp "$SO" "$d"; done
+strings "$SO" | grep '<your-marker>'          # confirm your change is in the binary
+```
+
+(CI/dev normally "use `-e .`" — editable rebuilds incrementally on reinstall; but
+multi-repo prefers non-editable to avoid the `_simpler_editable.pth` leak, so you
+must take the verify-or-cmake-build step above instead.)
+
 ### Either way: verify which simpler actually loaded
 
 A previous session may have left a user-site editable hook

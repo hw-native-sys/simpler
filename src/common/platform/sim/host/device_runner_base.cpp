@@ -14,6 +14,8 @@
 #include <stdlib.h>
 
 #include <cstdio>
+#include <cstdlib>
+#include <limits>
 #include <string>
 #include <utility>
 
@@ -199,6 +201,56 @@ int SimDeviceRunnerBase::copy_from_device(void *host_ptr, const void *dev_ptr, s
 int SimDeviceRunnerBase::device_memset(void *dev_ptr, int value, size_t bytes) {
     std::memset(dev_ptr, value, bytes);
     return 0;
+}
+
+int SimDeviceRunnerBase::l3_l2_orch_comm_init(void *control_block, size_t control_block_size) {
+    return l3_l2_orch_comm_service_.start(this, control_block, control_block_size);
+}
+
+int SimDeviceRunnerBase::l3_l2_orch_comm_shutdown() { return l3_l2_orch_comm_service_.stop(); }
+
+void *SimDeviceRunnerBase::l3_l2_allocate_region_bytes(uint64_t bytes) {
+    if (bytes == 0 || bytes > std::numeric_limits<size_t>::max()) {
+        return nullptr;
+    }
+    void *ptr = nullptr;
+    if (posix_memalign(&ptr, L3L2_ORCH_COMM_COUNTER_BASE_ALIGNMENT, static_cast<size_t>(bytes)) != 0) {
+        return nullptr;
+    }
+    std::lock_guard<std::mutex> lk(l3_l2_alloc_mu_);
+    l3_l2_allocations_.insert(ptr);
+    return ptr;
+}
+
+void SimDeviceRunnerBase::l3_l2_free_region_bytes(void *ptr) {
+    if (ptr == nullptr) {
+        return;
+    }
+    std::lock_guard<std::mutex> lk(l3_l2_alloc_mu_);
+    auto it = l3_l2_allocations_.find(ptr);
+    if (it == l3_l2_allocations_.end()) {
+        return;
+    }
+    std::free(ptr);
+    l3_l2_allocations_.erase(it);
+}
+
+int SimDeviceRunnerBase::l3_l2_copy_to_device(void *dev_ptr, const void *host_ptr, uint64_t bytes) {
+    if (bytes > std::numeric_limits<size_t>::max()) {
+        return -1;
+    }
+    return copy_to_device(dev_ptr, host_ptr, static_cast<size_t>(bytes));
+}
+
+int SimDeviceRunnerBase::l3_l2_copy_from_device(void *host_ptr, const void *dev_ptr, uint64_t bytes) {
+    if (bytes > std::numeric_limits<size_t>::max()) {
+        return -1;
+    }
+    return copy_from_device(host_ptr, dev_ptr, static_cast<size_t>(bytes));
+}
+
+std::thread SimDeviceRunnerBase::l3_l2_create_service_thread(std::function<void()> fn) {
+    return create_thread(std::move(fn));
 }
 
 int SimDeviceRunnerBase::stamp_orch_so(Runtime &runtime, int32_t cid, bool force_reload) {

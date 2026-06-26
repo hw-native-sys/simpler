@@ -115,7 +115,8 @@ struct alignas(64) TensorDumpRecord {
     uint64_t scalar_value;    // Valid when kind == TensorDumpKind::SCALAR
     uint8_t kind;             // TensorDumpKind
     uint8_t flags;            // TENSOR_DUMP_RECORD_FLAG_*
-    uint8_t pad0[14];         // Preserve 64B cache-line layout + scalar_value + kind
+    uint16_t func_id;         // kernel id of the subtask that declared this arg; 0xFFFF if unknown
+    uint8_t pad0[12];         // keep cache line 1 = 64B (2 + 12 = 14)
 
     // === Cache line 2 (64B) — strided view descriptor ===
     // start_offset placed first for 8B alignment without padding gaps; total = 8 + 20 + 20 = 48B.
@@ -264,9 +265,10 @@ struct TensorDumpInfo {
     uint32_t arg_index;
     uint64_t buffer_addr;
     uint64_t scalar_value;
+    int32_t func_id;  // kernel id of the subtask that declared this arg; -1 if unknown
     uint8_t kind;
     uint8_t flags;
-    uint8_t pad[14];
+    uint8_t pad[10];
     uint64_t start_offset;                     // 1D ELEMENT offset of the view origin
     uint32_t shapes[PLATFORM_DUMP_MAX_DIMS];   // Current view shape
     uint32_t strides[PLATFORM_DUMP_MAX_DIMS];  // Element stride per dimension (strictly > 0, type-enforced)

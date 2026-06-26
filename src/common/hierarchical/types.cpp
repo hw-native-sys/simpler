@@ -26,7 +26,7 @@ void TaskSlotState::reset() {
     }
     fanout_released.store(0, std::memory_order_relaxed);
     output_keys.clear();
-    eligible_endpoint_ids.clear();
+    eligible_worker_ids.clear();
     fanin_producers.clear();
     failure_message.clear();
     worker_type = WorkerType::NEXT_LEVEL;

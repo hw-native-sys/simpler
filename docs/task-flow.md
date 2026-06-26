@@ -85,7 +85,7 @@ optional negotiated PR #839 serialized Python callable payloads, and
 becomes visible only after the selected endpoint replies success.
 The current Python surface implements `RemoteCallable("module:qualname")` as
 the required `PYTHON_IMPORT` baseline and requires an explicit `workers=[...]`
-list naming remote endpoint ids.
+list naming remote worker ids returned by `add_remote_worker(...)`.
 
 ---
 
@@ -113,8 +113,8 @@ public:
 `TensorArgType` has five values (matches existing `tensor.h:45-51`):
 `INPUT`, `OUTPUT`, `INOUT`, `OUTPUT_EXISTING`, `NO_DEP`.
 
-For remote L3 submits, public Python uses `RemoteTaskArgs` as a wrapper around
-the same `TaskArgs` builder. Each `RemoteTensorRef` appends a normal
+For remote L3 submits, public Python still uses the same `TaskArgs` builder.
+`TaskArgs.add_tensor(RemoteTensorRef(...), tag)` appends a normal
 `Tensor` metadata entry with `data == 0` plus a hidden remote
 sidecar at the same tensor index. The local mailbox path rejects non-empty
 remote sidecars; the remote framed path encodes the sidecar as a
@@ -297,6 +297,11 @@ and calls `submit_next_level` / `submit_sub`. These Python methods return
 
 ```python
 class Orchestrator:
+    # `worker=-1` means unconstrained. Non-negative affinities are stable
+    # NEXT_LEVEL worker ids. For local Python Worker children and remote
+    # L3 dispatch, these are returned by add_worker(...) or
+    # add_remote_worker(...). For L3 ChipCallable dispatch, worker ids are
+    # the existing chip worker ids.
     def submit_next_level(self, handle, args, config=None, *, worker=-1) -> None: ...
     def submit_next_level_group(self, handle, args_list, config=None, *, workers=None) -> None: ...
     def submit_sub(self, handle, args=None) -> None: ...
@@ -418,11 +423,16 @@ def my_l3_orch(orch, args, config):
 # L4 parent
 w4 = Worker(level=4, num_sub_workers=0)
 l3_handle = w4.register(my_l3_orch) # register L3 orch fn in Python dict
-w4.add_worker(l3)                   # add un-init'd L3 Worker as child
+l3_worker_id = w4.add_worker(l3)    # add un-init'd L3 Worker as child
 w4.init()
 
 def my_l4_orch(orch, args, config):
-    orch.submit_next_level(l3_handle, TaskArgs(), CallConfig())
+    orch.submit_next_level(
+        l3_handle,
+        TaskArgs(),
+        CallConfig(),
+        worker=l3_worker_id,
+    )
 
 w4.run(my_l4_orch)
 w4.close()
@@ -442,7 +452,7 @@ On first `run()`, the deferred `_start_hierarchical()`:
    own children are forked lazily on L3's first `run()`.
 3. Child enters `_child_worker_loop(mailbox, registry, inner_worker)`
 4. **Parent**: registers each mailbox with L4's Worker via
-   `add_next_level_worker(mailbox_addr)`
+   `add_next_level_worker_at(worker_id, mailbox_addr)`
 
 ```text
 L4 parent process

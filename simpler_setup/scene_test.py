@@ -946,12 +946,32 @@ def _compile_chip_callable_from_spec(spec, platform, runtime, cache_key):
 
     kernel_binaries = []
     for k in incores:
+        # arg_index is mandatory and parallel to signature; check here so the
+        # offending incore is named (the C++ build error has no such context).
+        if ("signature" in k) != ("arg_index" in k):
+            missing = "arg_index" if "signature" in k else "signature"
+            raise ValueError(
+                f"CALLABLE incore func_id={k.get('func_id')} ({k.get('source')}): "
+                f"missing required '{missing}' (signature and arg_index must both be declared)"
+            )
+        signature = k.get("signature", [])
+        arg_index = k.get("arg_index", [])
+        if len(arg_index) != len(signature):
+            raise ValueError(
+                f"CALLABLE incore func_id={k.get('func_id')} ({k.get('source')}): "
+                f"arg_index length ({len(arg_index)}) must equal signature length ({len(signature)})"
+            )
         incore = kc.compile_incore(
             k["source"], core_type=k["core_type"], pto_isa_root=pto_isa_root, extra_include_dirs=inc_dirs
         )
         if not is_sim:
             incore = extract_text_section(incore)
-        kernel_binaries.append((k["func_id"], CoreCallable.build(signature=k.get("signature", []), binary=incore)))
+        kernel_binaries.append(
+            (
+                k["func_id"],
+                CoreCallable.build(signature=signature, binary=incore, arg_index=arg_index),
+            )
+        )
 
     chip_callable = ChipCallable.build(
         signature=orch.get("signature", []),

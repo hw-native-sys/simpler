@@ -32,25 +32,25 @@ void Orchestrator::init(
 }
 
 uint64_t Orchestrator::malloc(int worker_id, size_t size) {
-    auto *wt = manager_->get_worker(WorkerType::NEXT_LEVEL, worker_id);
+    auto *wt = manager_->get_worker_by_id(WorkerType::NEXT_LEVEL, worker_id);
     if (!wt) throw std::runtime_error("Orchestrator::malloc: invalid worker_id");
     return wt->control_malloc(size);
 }
 
 void Orchestrator::free(int worker_id, uint64_t ptr) {
-    auto *wt = manager_->get_worker(WorkerType::NEXT_LEVEL, worker_id);
+    auto *wt = manager_->get_worker_by_id(WorkerType::NEXT_LEVEL, worker_id);
     if (!wt) throw std::runtime_error("Orchestrator::free: invalid worker_id");
     wt->control_free(ptr);
 }
 
 void Orchestrator::copy_to(int worker_id, uint64_t dst, uint64_t src, size_t size) {
-    auto *wt = manager_->get_worker(WorkerType::NEXT_LEVEL, worker_id);
+    auto *wt = manager_->get_worker_by_id(WorkerType::NEXT_LEVEL, worker_id);
     if (!wt) throw std::runtime_error("Orchestrator::copy_to: invalid worker_id");
     wt->control_copy_to(dst, src, size);
 }
 
 void Orchestrator::copy_from(int worker_id, uint64_t dst, uint64_t src, size_t size) {
-    auto *wt = manager_->get_worker(WorkerType::NEXT_LEVEL, worker_id);
+    auto *wt = manager_->get_worker_by_id(WorkerType::NEXT_LEVEL, worker_id);
     if (!wt) throw std::runtime_error("Orchestrator::copy_from: invalid worker_id");
     wt->control_copy_from(dst, src, size);
 }
@@ -103,7 +103,7 @@ Tensor Orchestrator::alloc(const std::vector<uint32_t> &shape, DataType dtype) {
 
     uint64_t ptr = reinterpret_cast<uint64_t>(ar.heap_ptr);
     if (ptr != 0) {
-        TensorKey key{ptr, -1};  // alloc is always host memory
+        TensorKey key = TensorKey::local_host(ptr);
         tensormap_->insert(key, ar.slot);
         s.output_keys.push_back(key);
     }
@@ -148,28 +148,28 @@ Tensor Orchestrator::alloc(const std::vector<uint32_t> &shape, DataType dtype) {
 // =============================================================================
 
 SubmitResult Orchestrator::submit_next_level(
-    const CallableIdentity &callable, const TaskArgs &args, const CallConfig &config, int8_t worker,
-    const std::vector<int32_t> &eligible_endpoint_ids, const RemoteTaskArgsSidecar &remote_sidecar
+    const CallableIdentity &callable, const TaskArgs &args, const CallConfig &config, int32_t worker_id,
+    const std::vector<int32_t> &eligible_worker_ids, const RemoteTaskArgsSidecar &remote_sidecar
 ) {
-    std::vector<int8_t> affinities;
-    if (worker >= 0) affinities = {worker};
-    std::vector<std::vector<int32_t>> endpoint_sets;
-    if (!eligible_endpoint_ids.empty()) endpoint_sets = {eligible_endpoint_ids};
+    std::vector<int32_t> affinities;
+    if (worker_id >= 0) affinities = {worker_id};
+    std::vector<std::vector<int32_t>> worker_id_sets;
+    if (!eligible_worker_ids.empty()) worker_id_sets = {eligible_worker_ids};
     std::vector<RemoteTaskArgsSidecar> sidecars;
     if (!remote_sidecar.tensors.empty() || !remote_sidecar.inline_payload.empty()) sidecars = {remote_sidecar};
     return submit_impl(
-        WorkerType::NEXT_LEVEL, callable, config, {args}, std::move(affinities), std::move(endpoint_sets),
+        WorkerType::NEXT_LEVEL, callable, config, {args}, std::move(affinities), std::move(worker_id_sets),
         std::move(sidecars)
     );
 }
 
 SubmitResult Orchestrator::submit_next_level_group(
     const CallableIdentity &callable, const std::vector<TaskArgs> &args_list, const CallConfig &config,
-    const std::vector<int8_t> &workers, const std::vector<std::vector<int32_t>> &eligible_endpoint_ids,
+    const std::vector<int32_t> &worker_ids, const std::vector<std::vector<int32_t>> &eligible_worker_ids,
     const std::vector<RemoteTaskArgsSidecar> &remote_sidecars
 ) {
     return submit_impl(
-        WorkerType::NEXT_LEVEL, callable, config, args_list, workers, eligible_endpoint_ids, remote_sidecars
+        WorkerType::NEXT_LEVEL, callable, config, args_list, worker_ids, eligible_worker_ids, remote_sidecars
     );
 }
 
@@ -187,13 +187,13 @@ SubmitResult Orchestrator::submit_sub_group(const CallableIdentity &callable, co
 
 SubmitResult Orchestrator::submit_impl(
     WorkerType worker_type, const CallableIdentity &callable, const CallConfig &config, std::vector<TaskArgs> args_list,
-    std::vector<int8_t> affinities, std::vector<std::vector<int32_t>> eligible_endpoint_ids,
+    std::vector<int32_t> affinities, std::vector<std::vector<int32_t>> eligible_worker_ids,
     std::vector<RemoteTaskArgsSidecar> remote_sidecars
 ) {
     if (args_list.empty()) throw std::invalid_argument("Orchestrator: args_list must not be empty");
     config.validate();
-    validate_endpoint_eligibility(worker_type, args_list.size(), affinities, eligible_endpoint_ids);
-    validate_remote_sidecars(args_list, remote_sidecars, eligible_endpoint_ids);
+    validate_worker_eligibility(worker_type, args_list.size(), affinities, eligible_worker_ids);
+    validate_remote_sidecars(args_list, remote_sidecars, eligible_worker_ids);
 
     // Fail-fast: if a previously-dispatched task has already failed, abort
     // this submit before any bookkeeping so the orch fn unwinds promptly
@@ -226,7 +226,7 @@ SubmitResult Orchestrator::submit_impl(
     s.worker_type = worker_type;
     s.callable = callable;
     s.config = config;
-    s.eligible_endpoint_ids = std::move(eligible_endpoint_ids);
+    s.eligible_worker_ids = std::move(eligible_worker_ids);
 
     // --- Step 2: Walk tags → tensormap.lookup (deps) + tensormap.insert
     // (outputs). Must happen before we move args_list into the slot because
@@ -317,44 +317,55 @@ SubmitResult Orchestrator::submit_impl(
     return SubmitResult{slot};
 }
 
-void Orchestrator::validate_endpoint_eligibility(
-    WorkerType worker_type, size_t args_count, const std::vector<int8_t> &affinities,
-    const std::vector<std::vector<int32_t>> &eligible_endpoint_ids
+void Orchestrator::validate_worker_eligibility(
+    WorkerType worker_type, size_t args_count, const std::vector<int32_t> &affinities,
+    const std::vector<std::vector<int32_t>> &eligible_worker_ids
 ) const {
     if (!affinities.empty() && affinities.size() != args_count) {
         throw std::invalid_argument(
-            "Orchestrator: workers affinity length " + std::to_string(affinities.size()) +
-            " does not match args length " + std::to_string(args_count)
+            "Orchestrator: affinity length " + std::to_string(affinities.size()) + " does not match args length " +
+            std::to_string(args_count)
         );
     }
-    if (!eligible_endpoint_ids.empty() && eligible_endpoint_ids.size() != args_count) {
+    if (!eligible_worker_ids.empty() && eligible_worker_ids.size() != args_count) {
         throw std::invalid_argument(
-            "Orchestrator: eligible endpoint-set length " + std::to_string(eligible_endpoint_ids.size()) +
+            "Orchestrator: eligible worker-id set length " + std::to_string(eligible_worker_ids.size()) +
             " does not match args length " + std::to_string(args_count)
         );
     }
 
+    const std::vector<int32_t> empty_eligible;
     for (size_t i = 0; i < args_count; ++i) {
-        const auto &eligible = eligible_endpoint_ids.empty() ? std::vector<int32_t>{} : eligible_endpoint_ids[i];
-        if (!eligible_endpoint_ids.empty() && eligible.empty()) {
+        const auto &eligible = eligible_worker_ids.empty() ? empty_eligible : eligible_worker_ids[i];
+        if (!eligible_worker_ids.empty() && eligible.empty()) {
             throw std::invalid_argument(
-                "Orchestrator: final eligible endpoint set is empty for member " + std::to_string(i)
+                "Orchestrator: final eligible worker-id set is empty for member " + std::to_string(i)
             );
         }
-        int8_t affinity = affinities.empty() ? int8_t(-1) : affinities[i];
+        if (manager_ != nullptr && !eligible_worker_ids.empty()) {
+            for (int32_t worker_id : eligible) {
+                if (manager_->get_worker_by_id(worker_type, worker_id) == nullptr) {
+                    throw std::invalid_argument(
+                        "Orchestrator: eligible worker-id " + std::to_string(worker_id) + " is not a registered worker"
+                    );
+                }
+            }
+        }
+        int32_t affinity = affinities.empty() ? -1 : affinities[i];
         if (affinity < 0) continue;
 
         if (manager_ != nullptr) {
-            auto *wt = manager_->get_worker(worker_type, affinity);
+            auto *wt = worker_type == WorkerType::NEXT_LEVEL ? manager_->get_worker_by_id(worker_type, affinity) :
+                                                               manager_->get_worker_by_index(worker_type, affinity);
             if (wt == nullptr) {
                 throw std::invalid_argument(
-                    "Orchestrator: worker affinity " + std::to_string(affinity) + " is not a registered endpoint"
+                    "Orchestrator: worker affinity " + std::to_string(affinity) + " is not a registered worker"
                 );
             }
-            int32_t endpoint_id = wt->endpoint_id();
-            bool allowed = eligible_endpoint_ids.empty();
+            int32_t worker_id = wt->worker_id();
+            bool allowed = eligible_worker_ids.empty();
             for (int32_t id : eligible) {
-                if (id == endpoint_id) {
+                if (id == worker_id) {
                     allowed = true;
                     break;
                 }
@@ -362,10 +373,10 @@ void Orchestrator::validate_endpoint_eligibility(
             if (!allowed) {
                 throw std::invalid_argument(
                     "Orchestrator: worker affinity " + std::to_string(affinity) +
-                    " is not in the slot's final eligible endpoint set"
+                    " is not in the slot's final eligible worker-id set"
                 );
             }
-        } else if (!eligible_endpoint_ids.empty()) {
+        } else if (affinity >= 0 && !eligible_worker_ids.empty()) {
             bool allowed = false;
             for (int32_t id : eligible) {
                 if (id == affinity) {
@@ -376,7 +387,7 @@ void Orchestrator::validate_endpoint_eligibility(
             if (!allowed) {
                 throw std::invalid_argument(
                     "Orchestrator: worker affinity " + std::to_string(affinity) +
-                    " is not in the slot's final eligible endpoint set"
+                    " is not in the slot's final eligible worker-id set"
                 );
             }
         }
@@ -385,7 +396,7 @@ void Orchestrator::validate_endpoint_eligibility(
 
 void Orchestrator::validate_remote_sidecars(
     const std::vector<TaskArgs> &args_list, const std::vector<RemoteTaskArgsSidecar> &remote_sidecars,
-    const std::vector<std::vector<int32_t>> &eligible_endpoint_ids
+    const std::vector<std::vector<int32_t>> &eligible_worker_ids
 ) const {
     if (remote_sidecars.empty()) return;
     if (remote_sidecars.size() != args_list.size()) {
@@ -394,8 +405,8 @@ void Orchestrator::validate_remote_sidecars(
             " does not match args length " + std::to_string(args_list.size())
         );
     }
-    if (eligible_endpoint_ids.empty()) {
-        throw std::invalid_argument("Orchestrator: remote sidecars require an explicit eligible endpoint set");
+    if (eligible_worker_ids.empty()) {
+        throw std::invalid_argument("Orchestrator: remote sidecars require an explicit eligible worker-id set");
     }
     for (size_t g = 0; g < args_list.size(); ++g) {
         const TaskArgs &args = args_list[g];
@@ -404,17 +415,17 @@ void Orchestrator::validate_remote_sidecars(
         if (sidecar.tensors.size() != static_cast<size_t>(args.tensor_count())) {
             throw std::invalid_argument("Orchestrator: remote sidecar tensor count does not match TaskArgs");
         }
-        for (int32_t endpoint_id : eligible_endpoint_ids[g]) {
+        for (int32_t worker_id : eligible_worker_ids[g]) {
             if (manager_ == nullptr) continue;
-            WorkerThread *wt = manager_->get_worker_by_endpoint_id(WorkerType::NEXT_LEVEL, endpoint_id);
+            WorkerThread *wt = manager_->get_worker_by_id(WorkerType::NEXT_LEVEL, worker_id);
             if (wt == nullptr) {
                 throw std::invalid_argument(
-                    "Orchestrator: remote sidecar names an unknown endpoint " + std::to_string(endpoint_id)
+                    "Orchestrator: remote sidecar names an unknown worker " + std::to_string(worker_id)
                 );
             }
             if (!wt->caps().remote) {
                 throw std::invalid_argument(
-                    "Orchestrator: remote sidecar cannot be submitted to local endpoint " + std::to_string(endpoint_id)
+                    "Orchestrator: remote sidecar cannot be submitted to local worker " + std::to_string(worker_id)
                 );
             }
         }
@@ -437,23 +448,22 @@ void Orchestrator::validate_remote_sidecars(
                 throw std::invalid_argument("Orchestrator: remote child-memory tensor requires a sidecar");
             }
             if (tensor_sidecar.present && tensor_sidecar.desc.address_space != RemoteAddressSpace::HOST_INLINE) {
-                if (tensor_sidecar.desc.owner_endpoint_id < 0) {
-                    throw std::invalid_argument("Orchestrator: remote tensor sidecar has invalid owner endpoint");
+                if (tensor_sidecar.desc.owner_worker_id < 0) {
+                    throw std::invalid_argument("Orchestrator: remote tensor sidecar has invalid owner worker");
                 }
-                bool has_allowed_endpoint = false;
-                for (int32_t endpoint_id : eligible_endpoint_ids[g]) {
-                    has_allowed_endpoint = true;
+                bool has_allowed_worker = false;
+                for (int32_t worker_id : eligible_worker_ids[g]) {
+                    has_allowed_worker = true;
                     if (tensor_sidecar.desc.address_space == RemoteAddressSpace::REMOTE_DEVICE &&
-                        endpoint_id != tensor_sidecar.desc.owner_endpoint_id) {
+                        worker_id != tensor_sidecar.desc.owner_worker_id) {
                         throw std::invalid_argument(
-                            "Orchestrator: remote tensor sidecar requires IMPORT_BUFFER before submitting to "
-                            "endpoint " +
-                            std::to_string(endpoint_id)
+                            "Orchestrator: remote tensor sidecar requires IMPORT_BUFFER before submitting to worker " +
+                            std::to_string(worker_id)
                         );
                     }
                 }
-                if (!has_allowed_endpoint) {
-                    throw std::invalid_argument("Orchestrator: remote tensor has no final eligible endpoint");
+                if (!has_allowed_worker) {
+                    throw std::invalid_argument("Orchestrator: remote tensor has no final eligible worker");
                 }
             }
         }
@@ -517,7 +527,7 @@ AllocResult Orchestrator::reserve_outputs_and_slot(
 // =============================================================================
 
 void Orchestrator::infer_deps(
-    TaskSlot slot, const std::vector<TaskArgs> &args_list, const std::vector<int8_t> &affinities,
+    TaskSlot slot, const std::vector<TaskArgs> &args_list, const std::vector<int32_t> &affinities,
     const std::vector<RemoteTaskArgsSidecar> &remote_sidecars, std::vector<TaskSlot> &producers,
     std::vector<TensorKey> &output_keys
 ) {
@@ -551,7 +561,7 @@ void Orchestrator::infer_deps(
     //                      reserve_outputs_and_slot before this step)
     //   NO_DEP           → skip
     for (size_t g = 0; g < args_list.size(); ++g) {
-        int8_t worker_id = (g < affinities.size()) ? affinities[g] : int8_t(-1);
+        int32_t worker_id = (g < affinities.size()) ? affinities[g] : -1;
         const TaskArgs &a = args_list[g];
         for (int32_t i = 0; i < a.tensor_count(); ++i) {
             const Tensor &t = a.tensor(i);
@@ -566,7 +576,7 @@ void Orchestrator::infer_deps(
                                                  TensorAddressKind::HOST_INLINE :
                                                  TensorAddressKind::REMOTE_BUFFER;
                     key = TensorKey::remote_buffer(
-                        kind, desc.owner_endpoint_id, desc.buffer_id, desc.generation, desc.offset
+                        kind, desc.owner_worker_id, desc.buffer_id, desc.generation, desc.offset
                     );
                     has_key = true;
                 }

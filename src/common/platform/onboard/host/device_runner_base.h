@@ -54,6 +54,7 @@
 #include "utils/device_arena.h"
 #include "device_runner_helpers.h"
 #include "aicpu_loader/host/load_aicpu_op.h"
+#include "host/l3_l2_orch_comm_service.h"
 #include "host/l2_swimlane_collector.h"
 #include "host/memory_allocator.h"
 #include "host/pmu_collector.h"
@@ -70,7 +71,7 @@
  * `destroy_device_context` sees, so the non-virtual `~DeviceRunnerBase`
  * is safe — it never runs as a virtual base destructor.
  */
-class DeviceRunnerBase {
+class DeviceRunnerBase : public L3L2OrchCommBackend {
 public:
     // Public virtual dtor so the shared c_api can `delete` a polymorphic
     // `DeviceRunnerBase *` (the `destroy_device_context` entrypoint). Each
@@ -87,6 +88,8 @@ public:
     int copy_to_device(void *dev_ptr, const void *host_ptr, std::size_t bytes);
     int copy_from_device(void *host_ptr, const void *dev_ptr, std::size_t bytes);
     int device_memset(void *dev_ptr, int value, std::size_t bytes);
+    int l3_l2_orch_comm_init(void *control_block, size_t control_block_size);
+    int l3_l2_orch_comm_shutdown();
 
     /**
      * Commit the three per-Worker pooled regions (PTO2 GM heap, PTO2
@@ -354,6 +357,8 @@ public:
      */
     virtual void set_dep_gen_enabled(bool /*enable*/) {}
 
+    virtual bool l3_l2_orch_comm_supported() const { return true; }
+
     /**
      * Launch an AICPU kernel. Internal helper used by the subclass's
      * `run()`; thin wrapper that dispatches through `load_aicpu_op_`'s
@@ -361,7 +366,7 @@ public:
      * bootstrap).
      *
      * @param stream       AICPU stream
-     * @param k_args       Kernel arguments
+     * @param k_args       Front-less KernelArgs payload (runtime_args @ 0)
      * @param kernel_name  Name of the kernel to launch (e.g.
      *                     `host::KernelNames::RunName`)
      * @param aicpu_num    Number of AICPU instances to launch
@@ -379,10 +384,8 @@ public:
      * manifested in CI as 207001 at `rtKernelLaunchWithHandleV2` with a
      * 507899 cascade at `rtStreamCreate`.
      *
-     * `k_args` reaches the AICore kernel through `rtArgsEx_t`; whether
-     * it is a host-resident or device-resident `KernelArgs` pointer is
-     * decided by the subclass's `run()` (a2a3 passes host; a5 passes
-     * device).
+     * `k_args` reaches the AICore kernel through `rtArgsEx_t` as a
+     * device-resident KernelArgs payload pointer.
      */
     int launch_aicore_kernel(rtStream_t stream, KernelArgs *k_args);
 
@@ -595,7 +598,6 @@ protected:
      * a5's `rtDeviceReset`). Everything else lives here:
      *
      *   - rtStreamDestroy for both persistent streams
-     *   - kernel_args_.finalize_device_args
      *   - aicore_bin_handle_ + binaries_loaded_ reset
      *   - chip_callable_buffers_ free + clear
      *   - orch_so_dedup_ free + clear
@@ -754,7 +756,6 @@ protected:
     // simpler_init, freed in the subclass `finalize()`.
     void *device_wall_dev_ptr_{nullptr};
     uint64_t device_wall_ns_{0};
-    DeviceArgs device_args_;
 
     // True after AICPU SO loaded; reset by the subclass's `finalize()`.
     bool binaries_loaded_{false};
@@ -780,6 +781,17 @@ protected:
     L2SwimlaneLevel l2_swimlane_level_{L2SwimlaneLevel::DISABLED};  // resolved from set_l2_swimlane_enabled()
     PmuEventType pmu_event_type_{PmuEventType::PIPE_UTILIZATION};   // resolved from set_pmu_enabled()
     std::string output_prefix_{};                                   // diagnostic artifact root directory
+
+private:
+    void *l3_l2_allocate_region_bytes(uint64_t bytes) override;
+    void l3_l2_free_region_bytes(void *ptr) override;
+    int l3_l2_copy_to_device(void *dev_ptr, const void *host_ptr, uint64_t bytes) override;
+    int l3_l2_copy_from_device(void *host_ptr, const void *dev_ptr, uint64_t bytes) override;
+    std::thread l3_l2_create_service_thread(std::function<void()> fn) override;
+
+    L3L2OrchCommService l3_l2_orch_comm_service_;
+    std::mutex l3_l2_alloc_mu_;
+    std::unordered_set<void *> l3_l2_allocations_;
 };
 
 #endif  // SIMPLER_COMMON_PLATFORM_ONBOARD_HOST_DEVICE_RUNNER_BASE_H

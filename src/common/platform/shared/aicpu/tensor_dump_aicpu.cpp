@@ -688,6 +688,9 @@ int dump_arg_record(int thread_idx, const TensorDumpInfo &info) {
     rec->scalar_value = is_scalar ? info.scalar_value : 0;
     rec->kind = info.kind;
     rec->flags = info.flags;
+    // kernel_id is bounded by RUNTIME_MAX_FUNC_ID (1024), far below the 0xFFFF
+    // "unknown" sentinel, so this narrowing is lossless and never collides.
+    rec->func_id = static_cast<uint16_t>(info.func_id);  // -1 -> 0xFFFF (unknown)
     rec->start_offset = info.start_offset;
     for (int d = 0; d < info.ndims && d < PLATFORM_DUMP_MAX_DIMS; d++) {
         rec->shapes[d] = info.shapes[d];

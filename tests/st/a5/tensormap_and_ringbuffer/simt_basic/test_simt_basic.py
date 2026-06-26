@@ -44,6 +44,7 @@ class TestSimtBasic(SceneTestCase):
                 "source": "kernels/aiv/kernel_simt_scatter.cpp",
                 "core_type": "aiv",
                 "signature": [D.IN, D.IN, D.OUT],
+                "arg_index": [0, 1, 2],
             },
         ],
     }

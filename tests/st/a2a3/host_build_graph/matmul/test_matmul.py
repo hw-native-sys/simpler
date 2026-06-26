@@ -38,18 +38,21 @@ class TestMatmulHostBuildGraph(SceneTestCase):
                 "source": "kernels/aiv/kernel_log_sqrt.cpp",
                 "core_type": "aiv",
                 "signature": [D.IN, D.OUT],
+                "arg_index": [0, 1],
             },
             {
                 "func_id": 1,
                 "source": "kernels/aic/kernel_matmul.cpp",
                 "core_type": "aic",
                 "signature": [D.IN, D.IN, D.OUT],
+                "arg_index": [0, 1, 2],
             },
             {
                 "func_id": 2,
                 "source": "kernels/aiv/kernel_add_exp.cpp",
                 "core_type": "aiv",
                 "signature": [D.IN, D.IN, D.OUT],
+                "arg_index": [0, 1, 2],
             },
         ],
     }

@@ -107,7 +107,7 @@ inline void dump_args_for_task(
         return;
     }
     const CoreCallable *callables[MaxSubtaskSlots] = {};
-    int32_t total_tensor_args = 0;
+    int32_t first_active_fid = -1;  // task-shared scalars are stamped with this
 
     for (int raw_subtask_id = 0; raw_subtask_id < MaxSubtaskSlots; raw_subtask_id++) {
         if (!is_subtask_active(slot_state.active_mask, raw_subtask_id)) {
@@ -119,58 +119,88 @@ inline void dump_args_for_task(
             return;
         }
         callables[slot_idx] = reinterpret_cast<const CoreCallable *>(callable_addr);
-        total_tensor_args += count_callable_tensor_args(*callables[slot_idx]);
+        if (first_active_fid < 0) {
+            first_active_fid = slot_state.task->kernel_id[slot_idx];
+        }
     }
 
-    if (total_tensor_args != pl.tensor_count) {
-        if (try_log_dump_args_layout_mismatch()) {
-            LOG_WARN(
-                "Thread %d: args dump skipped for task 0x%" PRIx64
-                ": active callable tensor args (%d) do not match payload tensor args (%d). "
-                "Task-level dump assumes payload tensor args are concatenated by active subtask order.",
-                thread_idx, static_cast<uint64_t>(slot_state.task->task_id.raw), total_tensor_args, pl.tensor_count
-            );
-        }
+    // Reject negative too: tensor_count is signed and would wrap when cast below.
+    if (pl.tensor_count < 0 || pl.tensor_count > CORE_MAX_TENSOR_ARGS) {
         return;
     }
 
     rmb();
 
-    int32_t tensor_index = 0;
+    // Walk each active subtask independently. Its signature declares, via the
+    // arg_index, which absolute payload tensor slots it touches; every such
+    // tensor is dumped with this subtask's func_id. A slot shared by a
+    // cooperative mix is therefore emitted once per declaring subtask (each with
+    // its own func_id) — the sharing is recoverable downstream as the same
+    // (task_id, arg_index) appearing under more than one func_id.
+    bool covered[CORE_MAX_TENSOR_ARGS] = {};
+    int32_t covered_count = 0;
+
     for (int raw_subtask_id = 0; raw_subtask_id < MaxSubtaskSlots; raw_subtask_id++) {
         if (!is_subtask_active(slot_state.active_mask, raw_subtask_id)) {
             continue;
         }
-        int32_t slot_idx = raw_subtask_id;
-        const CoreCallable &callable = *callables[slot_idx];
+        int32_t fid = slot_state.task->kernel_id[raw_subtask_id];
+        const CoreCallable &callable = *callables[raw_subtask_id];
         for (int32_t sig_idx = 0; sig_idx < callable.sig_count(); sig_idx++) {
             ArgDirection dir = callable.sig(sig_idx);
             if (dir == ArgDirection::SCALAR) {
                 continue;
             }
-            TensorDumpRole role;
-            bool dump_tensor = get_dump_arg_role_from_direction(dir, &role) && should_dump_arg_at_stage(role, stage) &&
-                               should_dump_arg(dump_arg_mask, tensor_index);
-            if (dump_tensor) {
-                const auto &t = pl.tensors[tensor_index];
-                TensorDumpInfo info = {};
-                info.buffer_addr = t.buffer.addr;
-                info.dtype = static_cast<uint8_t>(t.dtype);
-                info.ndims = static_cast<uint8_t>(t.ndims);
-                info.start_offset = t.start_offset;
-                for (uint32_t d = 0; d < t.ndims && d < PLATFORM_DUMP_MAX_DIMS; d++) {
-                    info.shapes[d] = t.shapes[d];
-                    info.strides[d] = t.strides[d];
+            uint32_t slot = callable.arg_index(sig_idx);
+            if (slot >= static_cast<uint32_t>(pl.tensor_count)) {
+                // Out of payload range: skip this tensor (memory safety), warn.
+                if (try_log_dump_args_layout_mismatch()) {
+                    LOG_WARN(
+                        "Thread %d: task 0x%" PRIx64 ": incore arg_index %u is out of payload range (%d); "
+                        "skipping that tensor.",
+                        thread_idx, static_cast<uint64_t>(slot_state.task->task_id.raw), slot, pl.tensor_count
+                    );
                 }
-                info.task_id = slot_state.task->task_id.raw;
-                info.arg_index = static_cast<uint32_t>(tensor_index);
-                info.role = role;
-                info.stage = stage;
-                info.kind = static_cast<uint8_t>(TensorDumpKind::TENSOR);
-                dump_arg_record(thread_idx, info);
+                continue;
             }
-            tensor_index++;
+            if (!covered[slot]) {
+                covered[slot] = true;
+                covered_count++;
+            }
+            TensorDumpRole role;
+            if (!get_dump_arg_role_from_direction(dir, &role) || !should_dump_arg_at_stage(role, stage) ||
+                !should_dump_arg(dump_arg_mask, slot)) {
+                continue;
+            }
+            const auto &t = pl.tensors[slot];
+            TensorDumpInfo info = {};
+            info.buffer_addr = t.buffer.addr;
+            info.dtype = static_cast<uint8_t>(t.dtype);
+            info.ndims = static_cast<uint8_t>(t.ndims);
+            info.start_offset = t.start_offset;
+            for (uint32_t d = 0; d < t.ndims && d < PLATFORM_DUMP_MAX_DIMS; d++) {
+                info.shapes[d] = t.shapes[d];
+                info.strides[d] = t.strides[d];
+            }
+            info.task_id = slot_state.task->task_id.raw;
+            info.arg_index = slot;
+            info.role = role;
+            info.stage = stage;
+            info.kind = static_cast<uint8_t>(TensorDumpKind::TENSOR);
+            info.func_id = fid;
+            dump_arg_record(thread_idx, info);
         }
+    }
+
+    if (covered_count != pl.tensor_count && try_log_dump_args_layout_mismatch()) {
+        // Soft: some payload tensor slots were declared by no active subtask's
+        // arg_index, so they are not dumped (an un-migrated incore arg_index, or
+        // genuinely unused padding).
+        LOG_WARN(
+            "Thread %d: task 0x%" PRIx64
+            ": incore arg_index union (%d) does not cover all payload tensors (%d); the rest are not dumped.",
+            thread_idx, static_cast<uint64_t>(slot_state.task->task_id.raw), covered_count, pl.tensor_count
+        );
     }
 
     // Scalars are stored once in the task payload; keep them out of the
@@ -195,6 +225,9 @@ inline void dump_args_for_task(
             info.ndims = 0;
             info.arg_index = static_cast<uint32_t>(scalar_arg_index);
             info.kind = static_cast<uint8_t>(TensorDumpKind::SCALAR);
+            // Scalars are dumped once per task (not per subtask); stamp them with
+            // the first active subtask's func_id.
+            info.func_id = first_active_fid;
             info.scalar_value = pl.scalars[scalar_index];
             if (has_dump_arg_flag(dump_arg_flags, scalar_arg_index)) {
                 info.flags = TENSOR_DUMP_RECORD_FLAG_ARG_INDEX_AMBIGUOUS;
@@ -315,6 +348,7 @@ inline void dump_args_for_task(
         const auto &t = tensor_info[tensor_arg_index];
         TensorDumpInfo info = {};
         info.task_id = task_id;
+        info.func_id = -1;  // host_build_graph overload does not thread func_id -> unknown
         info.role = role;
         info.stage = stage;
         info.dtype = static_cast<uint8_t>(t.dtype);

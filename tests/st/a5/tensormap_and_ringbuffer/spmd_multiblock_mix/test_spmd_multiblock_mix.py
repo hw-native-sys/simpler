@@ -36,9 +36,30 @@ class TestSpmdMultiblockMix(SceneTestCase):
             "signature": [D.INOUT],
         },
         "incores": [
-            {"func_id": 0, "name": "SPMD_MIX_AIC", "source": "kernels/aic/kernel_spmd_mix.cpp", "core_type": "aic"},
-            {"func_id": 1, "name": "SPMD_MIX_AIV0", "source": "kernels/aiv/kernel_spmd_mix.cpp", "core_type": "aiv"},
-            {"func_id": 2, "name": "SPMD_MIX_AIV1", "source": "kernels/aiv/kernel_spmd_mix.cpp", "core_type": "aiv"},
+            {
+                "func_id": 0,
+                "name": "SPMD_MIX_AIC",
+                "source": "kernels/aic/kernel_spmd_mix.cpp",
+                "core_type": "aic",
+                "signature": [D.INOUT],
+                "arg_index": [0],
+            },
+            {
+                "func_id": 1,
+                "name": "SPMD_MIX_AIV0",
+                "source": "kernels/aiv/kernel_spmd_mix.cpp",
+                "core_type": "aiv",
+                "signature": [D.INOUT],
+                "arg_index": [0],
+            },
+            {
+                "func_id": 2,
+                "name": "SPMD_MIX_AIV1",
+                "source": "kernels/aiv/kernel_spmd_mix.cpp",
+                "core_type": "aiv",
+                "signature": [D.INOUT],
+                "arg_index": [0],
+            },
         ],
     }
 

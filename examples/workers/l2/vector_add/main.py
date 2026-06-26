@@ -114,6 +114,7 @@ def build_chip_callable(platform: str) -> ChipCallable:
     # (and only) ``rt_submit_aiv_task(0, ...)`` in vector_add_orch.cpp.
     core_callable = CoreCallable.build(
         signature=[ArgDirection.IN, ArgDirection.IN, ArgDirection.OUT],
+        arg_index=[0, 1, 2],
         binary=kernel_bytes,
     )
 

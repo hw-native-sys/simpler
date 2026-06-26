@@ -10,7 +10,7 @@ It is updated as each documented feature is completed and verified.
 | Step | Documented feature | Status | Notes |
 | ---- | ------------------ | ------ | ----- |
 | 1 | Endpoint interface and local adapter | In progress | Local adapter and remote sim endpoint are implemented; HCOMM endpoint adapters remain. |
-| 2 | Endpoint eligibility metadata | In progress | Callable endpoint sets are intersected with owner/imported remote sidecar eligibility. |
+| 2 | Worker eligibility metadata | In progress | Callable worker-id sets are intersected with owner/imported remote sidecar eligibility. |
 | 3 | Remote task sidecars and dependency keys | In progress | Public `TaskArgs.add_tensor(RemoteTensorRef(...))` API, remote TensorMap keys, and remote payload-sidecar rejection are implemented. |
 | 4 | Failed task poisoning | In progress | Remote task-failure poisoning and session-exit endpoint failure are verified; explicit health-expiry-only coverage remains. |
 | 5 | Versioned remote frame codec | In progress | TASK/COMPLETION/CONTROL_REPLY/HELLO/CONTROL/HEALTH exist; core fuzz/bounds coverage is present, with more exhaustive corpus testing still possible. |
@@ -139,8 +139,8 @@ It is updated as each documented feature is completed and verified.
   installed the import-path callable into `inner_worker`, and a remote orch
   resolved the handle with `get_inner_handle()` and submitted a `SUB` task.
 - Remote imported-buffer integration:
-  owner endpoint export plus peer endpoint import allowed a remote TASK to run
-  on the importer endpoint and mutate the owner's shared simulated buffer.
+  owner worker export plus peer worker import allowed a remote TASK to run
+  on the importer worker and mutate the owner's shared simulated buffer.
 - C++ no-hardware ctest:
   `ctest --test-dir tests/ut/cpp/build-fetch -LE requires_hardware
   --output-on-failure` passed with `39/39` tests.

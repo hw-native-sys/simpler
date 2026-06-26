@@ -147,6 +147,7 @@ using DumpFreeCallback = profiling_common::ProfFreeCallback;
  */
 struct DumpedTensor {
     uint64_t task_id;
+    int32_t func_id;  // kernel id of the subtask that declared this arg; -1 if unknown
     uint32_t arg_index;
     TensorDumpRole role;
     TensorDumpStage stage;

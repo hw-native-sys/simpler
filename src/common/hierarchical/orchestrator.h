@@ -97,17 +97,17 @@ public:
     // by Worker.register(); the child resolves its digest to a private slot.
     // Tags inside `args` drive dependency inference; OUTPUT tensors with
     // null data are auto-allocated from the HeapRing.
-    // `worker`: logical worker id for affinity (-1 = unconstrained).
+    // `worker_id`: stable NEXT_LEVEL worker id for affinity (-1 = unconstrained).
     SubmitResult submit_next_level(
-        const CallableIdentity &callable, const TaskArgs &args, const CallConfig &config, int8_t worker = -1,
-        const std::vector<int32_t> &eligible_endpoint_ids = {}, const RemoteTaskArgsSidecar &remote_sidecar = {}
+        const CallableIdentity &callable, const TaskArgs &args, const CallConfig &config, int32_t worker_id = -1,
+        const std::vector<int32_t> &eligible_worker_ids = {}, const RemoteTaskArgsSidecar &remote_sidecar = {}
     );
 
-    // Submit a group of NEXT_LEVEL tasks: N args -> N workers, 1 DAG node.
-    // `workers`: per-args affinity (empty = all unconstrained).
+    // Submit a group of NEXT_LEVEL tasks: N args -> N worker selections, 1 DAG node.
+    // `worker_ids`: per-args stable NEXT_LEVEL worker id affinity.
     SubmitResult submit_next_level_group(
         const CallableIdentity &callable, const std::vector<TaskArgs> &args_list, const CallConfig &config,
-        const std::vector<int8_t> &workers = {}, const std::vector<std::vector<int32_t>> &eligible_endpoint_ids = {},
+        const std::vector<int32_t> &worker_ids = {}, const std::vector<std::vector<int32_t>> &eligible_worker_ids = {},
         const std::vector<RemoteTaskArgsSidecar> &remote_sidecars = {}
     );
 
@@ -192,8 +192,8 @@ private:
     // can patch `tensor.data` on OUTPUT tensors flagged for auto-allocation.
     SubmitResult submit_impl(
         WorkerType worker_type, const CallableIdentity &callable, const CallConfig &config,
-        std::vector<TaskArgs> args_list, std::vector<int8_t> affinities = {},
-        std::vector<std::vector<int32_t>> eligible_endpoint_ids = {},
+        std::vector<TaskArgs> args_list, std::vector<int32_t> affinities = {},
+        std::vector<std::vector<int32_t>> eligible_worker_ids = {},
         std::vector<RemoteTaskArgsSidecar> remote_sidecars = {}
     );
 
@@ -212,19 +212,19 @@ private:
     // Walk the tags of each TaskArgs in `args_list`, accumulating producer
     // slots (for INPUT/INOUT tags) and registering outputs in the tensormap
     // (for OUTPUT/INOUT/OUTPUT_EXISTING tags). NO_DEP tags are skipped.
-    // `affinities` maps args_list[i] → worker id for TensorKey construction.
+    // `affinities` maps args_list[i] to worker id for TensorKey construction.
     void infer_deps(
-        TaskSlot slot, const std::vector<TaskArgs> &args_list, const std::vector<int8_t> &affinities,
+        TaskSlot slot, const std::vector<TaskArgs> &args_list, const std::vector<int32_t> &affinities,
         const std::vector<RemoteTaskArgsSidecar> &remote_sidecars, std::vector<TaskSlot> &producers,
         std::vector<TensorKey> &output_keys
     );
-    void validate_endpoint_eligibility(
-        WorkerType worker_type, size_t args_count, const std::vector<int8_t> &affinities,
-        const std::vector<std::vector<int32_t>> &eligible_endpoint_ids
+    void validate_worker_eligibility(
+        WorkerType worker_type, size_t args_count, const std::vector<int32_t> &affinities,
+        const std::vector<std::vector<int32_t>> &eligible_worker_ids
     ) const;
     void validate_remote_sidecars(
         const std::vector<TaskArgs> &args_list, const std::vector<RemoteTaskArgsSidecar> &remote_sidecars,
-        const std::vector<std::vector<int32_t>> &eligible_endpoint_ids
+        const std::vector<std::vector<int32_t>> &eligible_worker_ids
     ) const;
 
     // Release one fanout reference on 'slot'.
