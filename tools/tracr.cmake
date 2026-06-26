@@ -46,7 +46,11 @@ function(tracr_enable target)
     )
 
     # --- include the directories ---
-    target_include_directories(${target} PRIVATE
+    # SYSTEM: TraCR and its vendored third-party headers (e.g. extern/nlohmann
+    # json) are external to simpler and don't compile cleanly under the build's
+    # -Wall -Wextra -Werror (modern clang flags nlohmann's deprecated literal
+    # operators). Marking them system suppresses warnings from those headers.
+    target_include_directories(${target} SYSTEM PRIVATE
         ${TRACR_INCLUDE_DIR}
     )
 
