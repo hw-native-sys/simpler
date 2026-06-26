@@ -557,6 +557,31 @@ loop:
 > 或把 JSON 直接拖入 [Perfetto](https://ui.perfetto.dev/) 交互查看。incore 函数名由 `scene_test`
 > 在捕获后从 CALLABLE spec 注入（叶子 `CoreCallable` 不携带名字），故图例显示 GEMM/ADD 而非 f0/f1。
 
+### 6.2 实测：编排/调度开销随核数的代价
+
+全分布式模式用"无中心调度器"换来的代价是：**编排被每个核完整重放（SPMD），且认领要在共享 cursor
+上原子竞争**。为了把这部分纯开销与 kernel 计算分离测量，`dist_engine` 提供一个环境变量门控
+`PTO_DIST_SKIP_EXEC=1`：置位后 `execute_slot` **跳过 incore kernel 调用**（每个子任务当 0 代价
+瞬时完成），但**保留全部 ownership/完成/frontier 簿记**，核循环照常终止。这样测得的片上编排墙钟
+就只反映 orchestration + claim race + scheduling。
+
+下表用 `benchmark_bgemm`（`matmul_add_task_num=480`，约 960 个任务）在 a2a3sim 上扫 `block_dim`
+（1 block = 1 AIC + 2 AIV），取多轮中位数。`device` 为片上编排墙钟（PTO2 profiling），是关注指标；
+`host` 含 Python/sim 启动等固定开销，仅作参照。复现：
+`python examples/a2a3/fully_distributed_within_core/runtime_overhead_test/test_runtime_overhead.py -p a2a3sim`。
+
+| blocks | cores | device 编排墙钟 (ms) | us/task | 相对 1 block |
+| -----: | ----: | -------------------: | ------: | -----------: |
+|      1 |     3 |                 3.93 |    4.09 |        1.00× |
+|      2 |     6 |                 4.71 |    4.91 |        1.20× |
+|     12 |    36 |                21.23 |   22.11 |        5.41× |
+|     24 |    72 |                42.87 |   44.65 |       10.92× |
+
+**结论。** 纯编排/调度墙钟**随核数近线性增长**（3→72 核约 11×）：核越多，重复重放的编排和 cursor
+竞争越多。少核时增量很小（2 块仅比 1 块高约 20%），随核数增大才陡升。这部分固定开销要靠**真实
+kernel 执行被多核并行摊薄**来回本——本实验故意跳过执行，所以只暴露开销本身。它也说明：私有环要小、
+执行优先（§6.1）等设计的价值，正是让有限的核尽快投入真实执行，而不是把时间耗在超前认领/竞争上。
+
 ## 7. 终止
 
 一个核在其编排不再产生任务**且**私有环为空（所有拥有的任务都已执行）时结束。对 follower
