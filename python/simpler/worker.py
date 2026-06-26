@@ -364,7 +364,7 @@ class _ChildRegisterState:
 @dataclass
 class _ChildRegisterRequest:
     digest: bytes
-    callable_bytes: bytes
+    callable_bytes: bytearray
     state: _ChildRegisterState
 
 
@@ -1622,7 +1622,7 @@ def _run_chip_main_loop(  # noqa: PLR0912, PLR0913, PLR0915 -- unified TASK_READ
                         digest = _read_control_digest(buf)
                         payload_size = struct.unpack_from("Q", buf, _CTRL_OFF_ARG0)[0]
                         shm_name = _read_shm_name(buf, _OFF_ARGS)
-                        callable_bytes = _read_raw_payload_from_shm(shm_name, int(payload_size))
+                        callable_bytes = bytearray(_read_raw_payload_from_shm(shm_name, int(payload_size)))
                         reg_state = _ChildRegisterState()
                         handle_id = next_register_handle
                         next_register_handle += 1
