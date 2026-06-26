@@ -60,18 +60,28 @@ constexpr int PLATFORM_MAX_AICPU_THREADS = 4;
 constexpr int PLATFORM_MAX_AICPU_THREADS_JUST_FOR_LAUNCH = 6;
 
 /**
- * AICore op execution timeout (microseconds).
+ * Default AICore op execution timeout (microseconds).
  * Passed to aclrtSetOpExecuteTimeOutV2 so that STARS actively monitors
  * AICore task execution and kills ops that exceed this threshold.
+ * Overridden at runtime by PTO2_OP_EXECUTE_TIMEOUT_US when that env var
+ * is valid.
  */
 constexpr uint64_t PLATFORM_OP_EXECUTE_TIMEOUT_US = 3000000;  // 3s
 
 /**
- * Host-side stream synchronization timeout (milliseconds).
+ * Default onboard AICPU scheduler no-progress timeout (milliseconds).
+ * Shared with host-side timeout ordering validation; sim keeps its own
+ * wider budget in spin_hint.h because there is no STARS timeout to race.
+ */
+constexpr int32_t PLATFORM_ONBOARD_SCHEDULER_TIMEOUT_MS = 2000;
+
+/**
+ * Default host-side stream synchronization timeout (milliseconds).
  * Passed to aclrtSynchronizeStreamWithTimeout to detect stream sync hangs.
  * Must be longer than PLATFORM_OP_EXECUTE_TIMEOUT_US so the host waits for
- * STARS to reap the timed-out op and surface the error, rather than giving up
- * first.
+ * STARS to reap the timed-out op and surface the error, rather than giving
+ * up first. Overridden at runtime by PTO2_STREAM_SYNC_TIMEOUT_MS when that
+ * env var is valid.
  */
 constexpr int PLATFORM_STREAM_SYNC_TIMEOUT_MS = 4000;  // 4s (> op-exec 3s)
 

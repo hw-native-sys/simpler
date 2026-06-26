@@ -439,6 +439,8 @@ target_link_libraries(test_l3_l2_orch_comm_sim_runner PRIVATE
 add_test(NAME test_l3_l2_orch_comm_sim_runner COMMAND test_l3_l2_orch_comm_sim_runner)
 set_tests_properties(test_l3_l2_orch_comm_sim_runner PROPERTIES LABELS "no_hardware")
 
+add_common_utils_test(test_runtime_timeout_config common/test_runtime_timeout_config.cpp)
+
 add_executable(test_scope_stats_collector
     common/test_scope_stats_collector.cpp
     ${CMAKE_SOURCE_DIR}/../../../src/common/platform/shared/host/scope_stats_collector.cpp

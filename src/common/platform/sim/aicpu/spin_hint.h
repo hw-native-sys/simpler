@@ -55,7 +55,8 @@
 // STARS reaps). A generous budget also avoids false timeouts when an
 // oversubscribed CPU-sim kernel (e.g. matmul-heavy) makes real but slow
 // progress; raise further if a slow kernel still false-times-out. The runtime
-// consumes it as SCHEDULER_TIMEOUT_MS (see scheduler_types.h).
+// consumes it as SCHEDULER_TIMEOUT_MS (see scheduler_types.h). Host may
+// override this per run via PTO2_SCHEDULER_TIMEOUT_MS.
 constexpr int32_t PLATFORM_SCHEDULER_TIMEOUT_MS = 5000;
 
 #endif  // PLATFORM_A2A3SIM_AICPU_SPIN_HINT_H_

@@ -48,6 +48,8 @@
 #include "callable.h"
 #include "common/platform_config.h"
 #include "common/unified_log.h"
+#include "host/platform_compile_info.h"
+#include "host/runtime_timeout_config.h"
 #include "utils/device_arena.h"
 #include "prepare_callable_common.h"
 
@@ -241,6 +243,32 @@ static bool resolve_ring_config(
     }
 
     return true;
+}
+
+static int32_t resolve_scheduler_timeout_ms() {
+    RuntimeTimeoutParseStatus parse_status;
+    RuntimeTimeoutConfig cfg = resolve_runtime_timeout_config(
+        RuntimeTimeoutConfig{PLATFORM_OP_EXECUTE_TIMEOUT_US, PLATFORM_STREAM_SYNC_TIMEOUT_MS, 0}, &parse_status
+    );
+    if (!parse_status.scheduler_env_set) {
+        return 0;
+    }
+    if (!parse_status.scheduler_valid) {
+        const char *env = std::getenv(PTO2_SCHEDULER_TIMEOUT_MS_ENV);
+        LOG_WARN("%s=%s invalid, using platform scheduler timeout", PTO2_SCHEDULER_TIMEOUT_MS_ENV, env);
+        return 0;
+    }
+
+    RuntimeTimeoutOrderStatus status = validate_runtime_timeout_order_for_platform(cfg, get_platform());
+    if (status != RuntimeTimeoutOrderStatus::OK) {
+        LOG_WARN(
+            "Ignoring %s=%d: %s (op_execute=%llu us, stream_sync=%d ms)", PTO2_SCHEDULER_TIMEOUT_MS_ENV,
+            cfg.scheduler_timeout_ms, runtime_timeout_order_status_name(status),
+            (unsigned long long)cfg.op_execute_timeout_us, cfg.stream_sync_timeout_ms
+        );
+        return 0;
+    }
+    return cfg.scheduler_timeout_ms;
 }
 
 static int32_t pto2_read_runtime_status(Runtime *runtime, PTO2SharedMemoryHeader *host_header) {
@@ -459,6 +487,7 @@ extern "C" int bind_callable_to_runtime_impl(
     DeviceArena host_arena;  // libc malloc backend by default
     PTO2RuntimeArenaLayout layout =
         runtime_reserve_layout(host_arena, eff_task_window_sizes, eff_heap_sizes, eff_dep_pool_capacities);
+    layout.scheduler_timeout_ms = resolve_scheduler_timeout_ms();
     if (host_arena.commit(DeviceArena::kDefaultBaseAlign) == nullptr) {
         LOG_ERROR("Failed to commit host arena for prebuilt runtime image");
         return -1;

@@ -518,7 +518,7 @@ void DeviceRunner::recover_device_or_mark_unusable(int aicore_rc) {
     // force reset (a soft reset/drain does not), so always mark the runner
     // unusable here: run() fails fast and finalize() force-resets the card, so
     // the next Worker.init lands clean regardless of what the drain reported.
-    int sync_rc = aclrtSynchronizeDeviceWithTimeout(PLATFORM_STREAM_SYNC_TIMEOUT_MS);
+    int sync_rc = aclrtSynchronizeDeviceWithTimeout(timeout_config_.stream_sync_timeout_ms);
     if (sync_rc != ACL_SUCCESS) {
         LOG_ERROR(
             "AICore error %d: bounded device drain failed: %d (force reset will follow in finalize)", aicore_rc, sync_rc
@@ -623,7 +623,7 @@ int DeviceRunner::force_reset_device() {
             LOG_ERROR("force_reset_device: could not bind device %d; reset skipped", device_id_);
             return -1;
         }
-        (void)aclrtSynchronizeDeviceWithTimeout(PLATFORM_STREAM_SYNC_TIMEOUT_MS);
+        (void)aclrtSynchronizeDeviceWithTimeout(timeout_config_.stream_sync_timeout_ms);
         aclError rc = aclrtResetDeviceForce(device_id_);
         if (rc != ACL_SUCCESS) {
             LOG_ERROR("force_reset_device: aclrtResetDeviceForce(%d) failed: %d", device_id_, static_cast<int>(rc));
