@@ -116,18 +116,79 @@ constexpr int32_t kHDefault = 64;
 // (e.g. an INOUT accumulation chain) replace in place; new regions append.
 // Every core builds an identical map by replaying the same submit stream.
 // -----------------------------------------------------------------------------
+// Intrusive entry, modeled on PTO2TensorMapEntry (tensormap_and_ringbuffer) but
+// compact: it keys overlap on a byte range [lo, hi) instead of mirroring a full
+// Tensor cache line, since the distributed map only needs producer lookup.
+//   - bucket chain (doubly linked) — O(1) unlink during cleanup
+//   - task chain (singly linked)   — cleanup frees a retired task's entries by
+//                                     walking ITS chain, never scanning the pool
 struct MapEntry {
-    uint64_t buf_addr;  // Tensor.buffer.addr (GM buffer base, bytes)
-    uint64_t lo;        // byte offset of view origin within buffer
-    uint64_t hi;        // byte offset one-past the view extent
-    int32_t producer;   // task id that last wrote this region
+    uint64_t buf_addr;       // Tensor.buffer.addr (GM buffer base, bytes) — hash key
+    uint64_t lo;             // byte offset of view origin within buffer
+    uint64_t hi;             // byte offset one-past the view extent
+    int32_t producer;        // task id that wrote this region
+    int32_t bucket;          // owning bucket index, or -1 when free
+    int32_t next_in_bucket;  // bucket-chain links (entry indices, -1 = none)
+    int32_t prev_in_bucket;
+    int32_t next_in_task;    // task-chain link (entry index, -1 = none)
 };
 
+// Hash buckets (power of 2). Hashing by buffer BASE address groups every
+// sub-region of one buffer into one chain; overlap is then tested per entry.
+constexpr int32_t kMapBuckets = 1 << 13;  // 8192
+constexpr int32_t kMapBucketShift = 13;   // log2(kMapBuckets)
+// Per-task entry-head window (power of 2). Task `id` parks its entries under
+// slot id & (kTaskWindow-1); the slot is recycled by id + kTaskWindow. cleanup
+// retires a task once it leaves the H span, so kTaskWindow MUST exceed H (with
+// margin) or a slot could be reused before its prior task is cleaned. Validated
+// against g_dist.H at register time.
+constexpr int32_t kTaskWindow = 1 << 10;  // 1024  (>> kHDefault = 64)
+constexpr int32_t kTaskWindowMask = kTaskWindow - 1;
+
+// Per-core producer map ("full per-core duplicate TensorMap"), a direct compact
+// port of tensormap_and_ringbuffer's PTO2TensorMap (hash table + bucket chains +
+// per-task entry tracking + free list + lazy invalidation + cleanup_retired).
+//
+// WHY (vs. the original O(count) linear array, which made submit O(N^2)):
+// bgemm writes hundreds of disjoint tiles of ONE flattened output buffer, so the
+// old `entries[count]` grew with the whole run and every lookup/insert rescanned
+// it. Following the proven runtime, we instead:
+//   * hash by buffer base + chain — distinct buffers cost O(1);
+//   * RETIRE by H window — an entry whose producer is older than `alive_floor`
+//     (= N - H) can never be a fan-in of any future task (a consumer of producer
+//     p has id <= p + H, §9.5/§11.4, the same bound under which p's GM heap region
+//     is recycled), so cleanup frees it. This bounds each chain to ~the live
+//     H-window instead of the entire run → O(N*H) ~ O(N).
+// Like the reference, insert ALWAYS links a fresh entry under its producer's task
+// chain (no in-place replace), so cleanup_retired can free a task's entries via
+// that chain without scanning; lookup returns the MAX (newest) overlapping
+// producer, which subsumes the old replace-in-place semantics.
+//
+// `alive_floor` is N-derived (deterministic, identical on every core), never
+// frontier-based (timing-dependent), so every per-core map — including the free
+// list and cleanup progress — evolves identically. Determinism is preserved.
 struct DistTensorMap {
     MapEntry entries[kMapCap];
-    int32_t count;
+    int32_t buckets[kMapBuckets];     // bucket head entry idx, or -1
+    int32_t task_heads[kTaskWindow];  // per-task entry-chain head idx, or -1
+    int32_t free_head;                // recycled-slot free list head, or -1
+    int32_t high_water;               // next never-used slot in `entries`
+    int32_t alive_floor;              // producer < alive_floor == retired
+    int32_t cleaned_upto;             // tasks < cleaned_upto already freed
 
-    void reset() { count = 0; }
+    void reset() {
+        free_head = -1;
+        high_water = 0;
+        alive_floor = 0;
+        cleaned_upto = 0;
+        for (int32_t i = 0; i < kMapBuckets; i++) buckets[i] = -1;
+        for (int32_t i = 0; i < kTaskWindow; i++) task_heads[i] = -1;
+    }
+
+    static uint32_t hash(uint64_t addr) {
+        addr *= 0x9E3779B97F4A7C15ULL;  // golden-ratio multiplicative mix
+        return static_cast<uint32_t>(addr >> (64 - kMapBucketShift));
+    }
 
     static void byte_range(const Tensor &t, uint64_t &addr, uint64_t &lo, uint64_t &hi) {
         const uint64_t esz = get_element_size(t.dtype);
@@ -136,29 +197,85 @@ struct DistTensorMap {
         hi = (t.start_offset + t.extent_elem()) * esz;
     }
 
-    // Record `producer` as the writer of `t`'s region (replace exact match).
+    int32_t alloc_slot() {
+        if (free_head >= 0) {
+            const int32_t s = free_head;
+            free_head = entries[s].next_in_bucket;
+            return s;
+        }
+        if (high_water < kMapCap) return high_water++;
+        return -1;  // pool exhausted (live H-window exceeds kMapCap)
+    }
+
+    // Unlink `idx` from its bucket chain (O(1) via prev) and push to the free list.
+    void free_entry(int32_t idx) {
+        MapEntry &e = entries[idx];
+        if (e.prev_in_bucket < 0) buckets[e.bucket] = e.next_in_bucket;
+        else entries[e.prev_in_bucket].next_in_bucket = e.next_in_bucket;
+        if (e.next_in_bucket >= 0) entries[e.next_in_bucket].prev_in_bucket = e.prev_in_bucket;
+        e.bucket = -1;
+        e.next_in_bucket = free_head;
+        free_head = idx;
+    }
+
+    // Free every entry produced by retired tasks [cleaned_upto, new_floor) by
+    // walking each task's own chain (never the whole pool). Mirrors PTO2TensorMap
+    // ::cleanup_retired. Advances alive_floor so lookups skip the freed window.
+    void advance_retire(int32_t N, int32_t H) {
+        const int32_t new_floor = N - H;
+        if (new_floor <= cleaned_upto) {  // nothing newly retired
+            if (new_floor > alive_floor) alive_floor = new_floor;
+            return;
+        }
+        for (int32_t id = cleaned_upto; id < new_floor; id++) {
+            int32_t cur = task_heads[id & kTaskWindowMask];
+            while (cur >= 0) {
+                const int32_t nxt = entries[cur].next_in_task;
+                debug_assert(entries[cur].producer == id);
+                free_entry(cur);
+                cur = nxt;
+            }
+            task_heads[id & kTaskWindowMask] = -1;
+        }
+        cleaned_upto = new_floor;
+        alive_floor = new_floor;
+    }
+
+    // Link a fresh entry for `producer`'s write of `t`'s region. Always a new
+    // entry (no in-place replace) so it parks under producer's task chain.
     void insert(const Tensor &t, int32_t producer) {
         uint64_t addr, lo, hi;
         byte_range(t, addr, lo, hi);
-        for (int32_t i = 0; i < count; i++) {
-            MapEntry &e = entries[i];
-            if (e.buf_addr == addr && e.lo == lo && e.hi == hi) {
-                e.producer = producer;
-                return;
-            }
-        }
-        if (count < kMapCap) {
-            entries[count++] = MapEntry{addr, lo, hi, producer};
-        }
+        const int32_t s = alloc_slot();
+        if (s < 0) return;  // pool full within the live window (should not happen)
+        const uint32_t b = hash(addr);
+        MapEntry &e = entries[s];
+        e.buf_addr = addr;
+        e.lo = lo;
+        e.hi = hi;
+        e.producer = producer;
+        e.bucket = static_cast<int32_t>(b);
+        // Insert at bucket head.
+        e.prev_in_bucket = -1;
+        e.next_in_bucket = buckets[b];
+        if (buckets[b] >= 0) entries[buckets[b]].prev_in_bucket = s;
+        buckets[b] = s;
+        // Insert at task-chain head.
+        const int32_t slot = producer & kTaskWindowMask;
+        e.next_in_task = task_heads[slot];
+        task_heads[slot] = s;
     }
 
-    // Most-recent producer whose region overlaps `t`, or -1 if none.
+    // Most-recent producer whose region overlaps `t`, or -1 if none. Entries
+    // below alive_floor are treated as already retired (skipped — defensive,
+    // since cleanup has usually freed them already).
     int32_t lookup(const Tensor &t) const {
         uint64_t addr, lo, hi;
         byte_range(t, addr, lo, hi);
         int32_t best = -1;
-        for (int32_t i = 0; i < count; i++) {
-            const MapEntry &e = entries[i];
+        for (int32_t cur = buckets[hash(addr)]; cur >= 0; cur = entries[cur].next_in_bucket) {
+            const MapEntry &e = entries[cur];
+            if (e.producer < alive_floor) continue;
             if (e.buf_addr == addr && lo < e.hi && e.lo < hi) {
                 if (e.producer > best) best = e.producer;
             }
@@ -721,6 +838,11 @@ TaskOutputTensors dist_submit_impl(PTO2Runtime *, const MixedKernels &mixed, con
     // rather than an assertion crash mid-replay.
     if (fatal_set()) return result;
 
+    // Retire producer-map entries that have left the H span (deterministic,
+    // N-derived) before this task's lookups/inserts. Bounds chain length so
+    // submit stays ~O(N) instead of O(N^2). See DistTensorMap.
+    self->map.advance_retire(N, g_dist.H);
+
     // (b) Fan-in resolution: look up producers of INPUT/INOUT regions BEFORE
     // this task registers its own writes.
     int32_t fanin[kMaxFanin];
@@ -754,10 +876,29 @@ TaskOutputTensors dist_submit_impl(PTO2Runtime *, const MixedKernels &mixed, con
         }
     }
 
-    // (d) Assemble the shared argument Tensors once (identical for every active
-    // lane of a multi-core task — they operate on the same task tensors, each
-    // lane writing its designated output(s) per the kernels). Inputs are copied
-    // from the args; outputs are the materialized heap-addressed descriptors.
+    // (d) Anchor type + claim race. Competition is by anchor TYPE (§2/§3.1): cube
+    // tasks (any task with an AIC subtask) are contested by AIC cores; vector tasks
+    // (AIV-only, incl. 2V) by AIV cores (AIV0 and AIV1 equally). Resolved from the
+    // mask alone — no per-task Tensor copies — so losers bail out cheaply here.
+    const uint8_t cmask = M.core_mask();
+    const int32_t pc = __builtin_popcount(cmask);
+    const bool has_aic = (cmask & PTO2_SUBTASK_MASK_AIC) != 0;
+    const bool anchor_is_cube = has_aic;
+    const bool type_match =
+        anchor_is_cube ? (self->role == CoreType::AIC) : (self->role == CoreType::AIV);
+    if (!type_match) return result;  // wrong type for this task: only TensorMap was updated
+
+    std::atomic<int32_t> &cursor = anchor_is_cube ? g_dist.cube_cursor : g_dist.vector_cursor;
+    if (!claim(cursor, N)) return result;  // lost the race (another core of this type owns N)
+
+    // (e) Winner only: assemble the shared argument Tensors (identical for every
+    // active lane of a multi-core task — they share the task tensors, each lane
+    // writing its designated output per the kernels). Inputs are copied from the
+    // args; outputs are the materialized heap-addressed descriptors. Done AFTER
+    // the claim so the ~2/3 of cores that fail type_match / lose the race never
+    // pay these tc x sizeof(Tensor) copies.
+    const uint64_t *scalars = args.scalars();
+    const int32_t sc = args.scalar_count();
     Tensor built[MAX_TENSOR_ARGS];
     {
         uint32_t bo = 0;
@@ -770,22 +911,6 @@ TaskOutputTensors dist_submit_impl(PTO2Runtime *, const MixedKernels &mixed, con
             }
         }
     }
-    const uint64_t *scalars = args.scalars();
-    const int32_t sc = args.scalar_count();
-    const uint8_t cmask = M.core_mask();
-    const int32_t pc = __builtin_popcount(cmask);
-    const bool has_aic = (cmask & PTO2_SUBTASK_MASK_AIC) != 0;
-
-    // (e) Claim race. Competition is by anchor TYPE (§2/§3.1): cube tasks (any
-    // task with an AIC subtask) are contested by AIC cores; vector tasks (AIV-only,
-    // incl. 2V) by AIV cores (AIV0 and AIV1 equally).
-    const bool anchor_is_cube = has_aic;
-    const bool type_match =
-        anchor_is_cube ? (self->role == CoreType::AIC) : (self->role == CoreType::AIV);
-    if (!type_match) return result;  // wrong type for this task: only TensorMap was updated
-
-    std::atomic<int32_t> &cursor = anchor_is_cube ? g_dist.cube_cursor : g_dist.vector_cursor;
-    if (!claim(cursor, N)) return result;  // lost the race (another core of this type owns N)
 
     // ---- Winner = owner (single-core) / anchor (multi-core). ----
     // Back-pressure for self-claimed work: wait until the ring has a non-reserved
@@ -949,6 +1074,7 @@ void dist_log_info_v(const char *, int, const char *, ...) {}
 // tensors (no producer) are accessed immediately. Consumer (WAR) tracking is not
 // modeled, mirroring the centralized runtime's documented INPUT-reader limitation.
 void wait_producer_ready(DistCore *self, const Tensor &t) {
+    // Cold path (get/set_tensor_data); uses the map's current alive_floor.
     const int32_t p = self->map.lookup(t);
     if (p < 0) return;
     uint64_t wd = 0;
@@ -1074,6 +1200,7 @@ TaskOutputTensors dist_alloc_tensors(PTO2Runtime *, const L0TaskArgs &args) {
     if (fatal_set()) return result;
 
     // Register producer for each allocated output, then complete inline (no kernel).
+    self->map.advance_retire(N, g_dist.H);
     uint32_t out_idx = 0;
     for (int32_t i = 0; i < tc; i++) {
         if (args.tag(i) != TensorArgType::OUTPUT) continue;
@@ -1223,6 +1350,10 @@ void *dist_engine_register(
         const long h = atol(e);
         if (h >= 0) g_dist.H = static_cast<int32_t>(h);
     }
+    // The producer map recycles a task's entry-head slot kTaskWindow tasks later;
+    // cleanup retires a task once it leaves the H span, so H must stay below the
+    // window (with margin) or a slot could be reused before its task is cleaned.
+    always_assert(g_dist.H < kTaskWindow - 1);
     // Swimlane tracing gate. Capture the epoch now so every core's event ts is
     // relative to the same run start.
     g_trace_on = (getenv("PTO_DIST_SWIMLANE") != nullptr);
