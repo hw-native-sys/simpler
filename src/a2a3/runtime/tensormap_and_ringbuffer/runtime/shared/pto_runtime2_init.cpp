@@ -301,7 +301,7 @@ bool PTO2OrchestratorState::init_data_from_layout(
 
         orch->rings[r].task_allocator.init(
             task_descs_dev, static_cast<int32_t>(task_window_sizes[r]), cur_idx_dev, last_alive_dev, ring_heap_base,
-            heap_sizes[r], orch_err, slot_states_dev
+            heap_sizes[r], orch_err, slot_states_dev, /*initial_local_task_id=*/0, /*ring_id=*/r
         );
         heap_offset += heap_sizes[r];
 

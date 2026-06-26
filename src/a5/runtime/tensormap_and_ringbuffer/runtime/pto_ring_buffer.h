@@ -96,9 +96,10 @@ public:
     void init(
         PTO2TaskDescriptor *descriptors, int32_t window_size, std::atomic<int32_t> *current_index_ptr,
         std::atomic<int32_t> *last_alive_ptr, void *heap_base, uint64_t heap_size, std::atomic<int32_t> *error_code_ptr,
-        PTO2TaskSlotState *slot_states = nullptr, int32_t initial_local_task_id = 0
+        PTO2TaskSlotState *slot_states = nullptr, int32_t initial_local_task_id = 0, int32_t ring_id = 0
     ) {
         descriptors_ = descriptors;
+        ring_id_ = ring_id;
         slot_states_ = slot_states;
         window_size_ = window_size;
         window_mask_ = window_size - 1;
@@ -251,6 +252,11 @@ public:
     }
 
 private:
+    // --- Identity ---
+    // This allocator's ring index (scope depth, saturated at PTO2_MAX_RING_DEPTH-1).
+    // Set once at init() so the deadlock dump can name which ring exhausted.
+    int32_t ring_id_ = 0;
+
     // --- Task Ring ---
     PTO2TaskDescriptor *descriptors_ = nullptr;
     // Parallel to descriptors_, indexed by task_id & window_mask_. Read-only here,
@@ -417,9 +423,9 @@ private:
 
         LOG_ERROR("========================================");
         if (heap_blocked) {
-            LOG_ERROR("FATAL: Task Allocator Deadlock - Heap Exhausted!");
+            LOG_ERROR("FATAL: Task Allocator Deadlock - Heap Exhausted! (ring=%d)", ring_id_);
         } else {
-            LOG_ERROR("FATAL: Task Allocator Deadlock - Task Ring Full!");
+            LOG_ERROR("FATAL: Task Allocator Deadlock - Task Ring Full! (ring=%d)", ring_id_);
         }
         LOG_ERROR("========================================");
         if (scope_gated) {

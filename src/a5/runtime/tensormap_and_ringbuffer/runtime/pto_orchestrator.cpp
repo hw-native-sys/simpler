@@ -423,6 +423,18 @@ static bool prepare_task(
 
     out->alloc_result = allocator.alloc(total_output_size);
     if (out->alloc_result.failed()) {
+        // The allocator named its ring_id; add the live scope depth it can't see.
+        // ring_id saturates at PTO2_MAX_RING_DEPTH-1, so deeper scopes all collapse
+        // onto the last ring -- print scope_depth to disambiguate which one.
+        // scope_stack_top is a 0-based top index; +1 matches the scope_depth
+        // convention in check_scope_can_accept_task. Snapshot it for a single
+        // consistent read (orchestrator is single-threaded, so no race).
+        const int32_t scope_top = orch->scope_stack_top;
+        LOG_ERROR(
+            "Stuck scope: scope_depth=%d -> ring=%d (PTO2_MAX_RING_DEPTH=%d)%s", scope_top + 1, ring_id,
+            PTO2_MAX_RING_DEPTH,
+            scope_top >= PTO2_MAX_RING_DEPTH ? " [ring saturated: deeper scopes share this ring]" : ""
+        );
         orch_mark_fatal(orch, PTO2_ERROR_HEAP_RING_DEADLOCK);
         return false;
     }
