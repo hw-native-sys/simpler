@@ -1,0 +1,8429 @@
+{
+  "displayTimeUnit": "ns",
+  "traceEvents": [
+    {
+      "ph": "M",
+      "name": "process_name",
+      "pid": 0,
+      "args": {
+        "name": "block0"
+      }
+    },
+    {
+      "ph": "M",
+      "name": "thread_name",
+      "pid": 0,
+      "tid": 0,
+      "args": {
+        "name": "AIC (core0)"
+      }
+    },
+    {
+      "ph": "M",
+      "name": "process_name",
+      "pid": 1,
+      "args": {
+        "name": "block1"
+      }
+    },
+    {
+      "ph": "M",
+      "name": "thread_name",
+      "pid": 1,
+      "tid": 0,
+      "args": {
+        "name": "AIC (core1)"
+      }
+    },
+    {
+      "ph": "M",
+      "name": "process_name",
+      "pid": 2,
+      "args": {
+        "name": "block2"
+      }
+    },
+    {
+      "ph": "M",
+      "name": "thread_name",
+      "pid": 2,
+      "tid": 0,
+      "args": {
+        "name": "AIC (core2)"
+      }
+    },
+    {
+      "ph": "M",
+      "name": "process_name",
+      "pid": 3,
+      "args": {
+        "name": "block3"
+      }
+    },
+    {
+      "ph": "M",
+      "name": "thread_name",
+      "pid": 3,
+      "tid": 0,
+      "args": {
+        "name": "AIC (core3)"
+      }
+    },
+    {
+      "ph": "M",
+      "name": "process_name",
+      "pid": 4,
+      "args": {
+        "name": "block4"
+      }
+    },
+    {
+      "ph": "M",
+      "name": "thread_name",
+      "pid": 4,
+      "tid": 0,
+      "args": {
+        "name": "AIC (core4)"
+      }
+    },
+    {
+      "ph": "M",
+      "name": "process_name",
+      "pid": 5,
+      "args": {
+        "name": "block5"
+      }
+    },
+    {
+      "ph": "M",
+      "name": "thread_name",
+      "pid": 5,
+      "tid": 0,
+      "args": {
+        "name": "AIC (core5)"
+      }
+    },
+    {
+      "ph": "M",
+      "name": "process_name",
+      "pid": 6,
+      "args": {
+        "name": "block6"
+      }
+    },
+    {
+      "ph": "M",
+      "name": "thread_name",
+      "pid": 6,
+      "tid": 0,
+      "args": {
+        "name": "AIC (core6)"
+      }
+    },
+    {
+      "ph": "M",
+      "name": "process_name",
+      "pid": 7,
+      "args": {
+        "name": "block7"
+      }
+    },
+    {
+      "ph": "M",
+      "name": "thread_name",
+      "pid": 7,
+      "tid": 0,
+      "args": {
+        "name": "AIC (core7)"
+      }
+    },
+    {
+      "ph": "M",
+      "name": "process_name",
+      "pid": 8,
+      "args": {
+        "name": "block8"
+      }
+    },
+    {
+      "ph": "M",
+      "name": "thread_name",
+      "pid": 8,
+      "tid": 0,
+      "args": {
+        "name": "AIC (core8)"
+      }
+    },
+    {
+      "ph": "M",
+      "name": "process_name",
+      "pid": 9,
+      "args": {
+        "name": "block9"
+      }
+    },
+    {
+      "ph": "M",
+      "name": "thread_name",
+      "pid": 9,
+      "tid": 0,
+      "args": {
+        "name": "AIC (core9)"
+      }
+    },
+    {
+      "ph": "M",
+      "name": "process_name",
+      "pid": 10,
+      "args": {
+        "name": "block10"
+      }
+    },
+    {
+      "ph": "M",
+      "name": "thread_name",
+      "pid": 10,
+      "tid": 0,
+      "args": {
+        "name": "AIC (core10)"
+      }
+    },
+    {
+      "ph": "M",
+      "name": "process_name",
+      "pid": 11,
+      "args": {
+        "name": "block11"
+      }
+    },
+    {
+      "ph": "M",
+      "name": "thread_name",
+      "pid": 11,
+      "tid": 0,
+      "args": {
+        "name": "AIC (core11)"
+      }
+    },
+    {
+      "ph": "M",
+      "name": "process_name",
+      "pid": 12,
+      "args": {
+        "name": "block12"
+      }
+    },
+    {
+      "ph": "M",
+      "name": "thread_name",
+      "pid": 12,
+      "tid": 0,
+      "args": {
+        "name": "AIC (core12)"
+      }
+    },
+    {
+      "ph": "M",
+      "name": "process_name",
+      "pid": 13,
+      "args": {
+        "name": "block13"
+      }
+    },
+    {
+      "ph": "M",
+      "name": "thread_name",
+      "pid": 13,
+      "tid": 0,
+      "args": {
+        "name": "AIC (core13)"
+      }
+    },
+    {
+      "ph": "M",
+      "name": "process_name",
+      "pid": 14,
+      "args": {
+        "name": "block14"
+      }
+    },
+    {
+      "ph": "M",
+      "name": "thread_name",
+      "pid": 14,
+      "tid": 0,
+      "args": {
+        "name": "AIC (core14)"
+      }
+    },
+    {
+      "ph": "M",
+      "name": "process_name",
+      "pid": 15,
+      "args": {
+        "name": "block15"
+      }
+    },
+    {
+      "ph": "M",
+      "name": "thread_name",
+      "pid": 15,
+      "tid": 0,
+      "args": {
+        "name": "AIC (core15)"
+      }
+    },
+    {
+      "ph": "M",
+      "name": "process_name",
+      "pid": 16,
+      "args": {
+        "name": "block16"
+      }
+    },
+    {
+      "ph": "M",
+      "name": "thread_name",
+      "pid": 16,
+      "tid": 0,
+      "args": {
+        "name": "AIC (core16)"
+      }
+    },
+    {
+      "ph": "M",
+      "name": "process_name",
+      "pid": 17,
+      "args": {
+        "name": "block17"
+      }
+    },
+    {
+      "ph": "M",
+      "name": "thread_name",
+      "pid": 17,
+      "tid": 0,
+      "args": {
+        "name": "AIC (core17)"
+      }
+    },
+    {
+      "ph": "M",
+      "name": "process_name",
+      "pid": 18,
+      "args": {
+        "name": "block18"
+      }
+    },
+    {
+      "ph": "M",
+      "name": "thread_name",
+      "pid": 18,
+      "tid": 0,
+      "args": {
+        "name": "AIC (core18)"
+      }
+    },
+    {
+      "ph": "M",
+      "name": "process_name",
+      "pid": 19,
+      "args": {
+        "name": "block19"
+      }
+    },
+    {
+      "ph": "M",
+      "name": "thread_name",
+      "pid": 19,
+      "tid": 0,
+      "args": {
+        "name": "AIC (core19)"
+      }
+    },
+    {
+      "ph": "M",
+      "name": "process_name",
+      "pid": 20,
+      "args": {
+        "name": "block20"
+      }
+    },
+    {
+      "ph": "M",
+      "name": "thread_name",
+      "pid": 20,
+      "tid": 0,
+      "args": {
+        "name": "AIC (core20)"
+      }
+    },
+    {
+      "ph": "M",
+      "name": "process_name",
+      "pid": 21,
+      "args": {
+        "name": "block21"
+      }
+    },
+    {
+      "ph": "M",
+      "name": "thread_name",
+      "pid": 21,
+      "tid": 0,
+      "args": {
+        "name": "AIC (core21)"
+      }
+    },
+    {
+      "ph": "M",
+      "name": "process_name",
+      "pid": 22,
+      "args": {
+        "name": "block22"
+      }
+    },
+    {
+      "ph": "M",
+      "name": "thread_name",
+      "pid": 22,
+      "tid": 0,
+      "args": {
+        "name": "AIC (core22)"
+      }
+    },
+    {
+      "ph": "M",
+      "name": "process_name",
+      "pid": 23,
+      "args": {
+        "name": "block23"
+      }
+    },
+    {
+      "ph": "M",
+      "name": "thread_name",
+      "pid": 23,
+      "tid": 0,
+      "args": {
+        "name": "AIC (core23)"
+      }
+    },
+    {
+      "ph": "M",
+      "name": "process_name",
+      "pid": 0,
+      "args": {
+        "name": "block0"
+      }
+    },
+    {
+      "ph": "M",
+      "name": "thread_name",
+      "pid": 0,
+      "tid": 1,
+      "args": {
+        "name": "AIV0 (core24)"
+      }
+    },
+    {
+      "ph": "M",
+      "name": "process_name",
+      "pid": 0,
+      "args": {
+        "name": "block0"
+      }
+    },
+    {
+      "ph": "M",
+      "name": "thread_name",
+      "pid": 0,
+      "tid": 2,
+      "args": {
+        "name": "AIV1 (core25)"
+      }
+    },
+    {
+      "ph": "M",
+      "name": "process_name",
+      "pid": 1,
+      "args": {
+        "name": "block1"
+      }
+    },
+    {
+      "ph": "M",
+      "name": "thread_name",
+      "pid": 1,
+      "tid": 1,
+      "args": {
+        "name": "AIV0 (core26)"
+      }
+    },
+    {
+      "ph": "M",
+      "name": "process_name",
+      "pid": 1,
+      "args": {
+        "name": "block1"
+      }
+    },
+    {
+      "ph": "M",
+      "name": "thread_name",
+      "pid": 1,
+      "tid": 2,
+      "args": {
+        "name": "AIV1 (core27)"
+      }
+    },
+    {
+      "ph": "M",
+      "name": "process_name",
+      "pid": 2,
+      "args": {
+        "name": "block2"
+      }
+    },
+    {
+      "ph": "M",
+      "name": "thread_name",
+      "pid": 2,
+      "tid": 1,
+      "args": {
+        "name": "AIV0 (core28)"
+      }
+    },
+    {
+      "ph": "M",
+      "name": "process_name",
+      "pid": 2,
+      "args": {
+        "name": "block2"
+      }
+    },
+    {
+      "ph": "M",
+      "name": "thread_name",
+      "pid": 2,
+      "tid": 2,
+      "args": {
+        "name": "AIV1 (core29)"
+      }
+    },
+    {
+      "ph": "M",
+      "name": "process_name",
+      "pid": 3,
+      "args": {
+        "name": "block3"
+      }
+    },
+    {
+      "ph": "M",
+      "name": "thread_name",
+      "pid": 3,
+      "tid": 1,
+      "args": {
+        "name": "AIV0 (core30)"
+      }
+    },
+    {
+      "ph": "M",
+      "name": "process_name",
+      "pid": 3,
+      "args": {
+        "name": "block3"
+      }
+    },
+    {
+      "ph": "M",
+      "name": "thread_name",
+      "pid": 3,
+      "tid": 2,
+      "args": {
+        "name": "AIV1 (core31)"
+      }
+    },
+    {
+      "ph": "M",
+      "name": "process_name",
+      "pid": 4,
+      "args": {
+        "name": "block4"
+      }
+    },
+    {
+      "ph": "M",
+      "name": "thread_name",
+      "pid": 4,
+      "tid": 1,
+      "args": {
+        "name": "AIV0 (core32)"
+      }
+    },
+    {
+      "ph": "M",
+      "name": "process_name",
+      "pid": 4,
+      "args": {
+        "name": "block4"
+      }
+    },
+    {
+      "ph": "M",
+      "name": "thread_name",
+      "pid": 4,
+      "tid": 2,
+      "args": {
+        "name": "AIV1 (core33)"
+      }
+    },
+    {
+      "ph": "M",
+      "name": "process_name",
+      "pid": 5,
+      "args": {
+        "name": "block5"
+      }
+    },
+    {
+      "ph": "M",
+      "name": "thread_name",
+      "pid": 5,
+      "tid": 1,
+      "args": {
+        "name": "AIV0 (core34)"
+      }
+    },
+    {
+      "ph": "M",
+      "name": "process_name",
+      "pid": 5,
+      "args": {
+        "name": "block5"
+      }
+    },
+    {
+      "ph": "M",
+      "name": "thread_name",
+      "pid": 5,
+      "tid": 2,
+      "args": {
+        "name": "AIV1 (core35)"
+      }
+    },
+    {
+      "ph": "M",
+      "name": "process_name",
+      "pid": 6,
+      "args": {
+        "name": "block6"
+      }
+    },
+    {
+      "ph": "M",
+      "name": "thread_name",
+      "pid": 6,
+      "tid": 1,
+      "args": {
+        "name": "AIV0 (core36)"
+      }
+    },
+    {
+      "ph": "M",
+      "name": "process_name",
+      "pid": 6,
+      "args": {
+        "name": "block6"
+      }
+    },
+    {
+      "ph": "M",
+      "name": "thread_name",
+      "pid": 6,
+      "tid": 2,
+      "args": {
+        "name": "AIV1 (core37)"
+      }
+    },
+    {
+      "ph": "M",
+      "name": "process_name",
+      "pid": 7,
+      "args": {
+        "name": "block7"
+      }
+    },
+    {
+      "ph": "M",
+      "name": "thread_name",
+      "pid": 7,
+      "tid": 1,
+      "args": {
+        "name": "AIV0 (core38)"
+      }
+    },
+    {
+      "ph": "M",
+      "name": "process_name",
+      "pid": 7,
+      "args": {
+        "name": "block7"
+      }
+    },
+    {
+      "ph": "M",
+      "name": "thread_name",
+      "pid": 7,
+      "tid": 2,
+      "args": {
+        "name": "AIV1 (core39)"
+      }
+    },
+    {
+      "ph": "M",
+      "name": "process_name",
+      "pid": 8,
+      "args": {
+        "name": "block8"
+      }
+    },
+    {
+      "ph": "M",
+      "name": "thread_name",
+      "pid": 8,
+      "tid": 1,
+      "args": {
+        "name": "AIV0 (core40)"
+      }
+    },
+    {
+      "ph": "M",
+      "name": "process_name",
+      "pid": 8,
+      "args": {
+        "name": "block8"
+      }
+    },
+    {
+      "ph": "M",
+      "name": "thread_name",
+      "pid": 8,
+      "tid": 2,
+      "args": {
+        "name": "AIV1 (core41)"
+      }
+    },
+    {
+      "ph": "M",
+      "name": "process_name",
+      "pid": 9,
+      "args": {
+        "name": "block9"
+      }
+    },
+    {
+      "ph": "M",
+      "name": "thread_name",
+      "pid": 9,
+      "tid": 1,
+      "args": {
+        "name": "AIV0 (core42)"
+      }
+    },
+    {
+      "ph": "M",
+      "name": "process_name",
+      "pid": 9,
+      "args": {
+        "name": "block9"
+      }
+    },
+    {
+      "ph": "M",
+      "name": "thread_name",
+      "pid": 9,
+      "tid": 2,
+      "args": {
+        "name": "AIV1 (core43)"
+      }
+    },
+    {
+      "ph": "M",
+      "name": "process_name",
+      "pid": 10,
+      "args": {
+        "name": "block10"
+      }
+    },
+    {
+      "ph": "M",
+      "name": "thread_name",
+      "pid": 10,
+      "tid": 1,
+      "args": {
+        "name": "AIV0 (core44)"
+      }
+    },
+    {
+      "ph": "M",
+      "name": "process_name",
+      "pid": 10,
+      "args": {
+        "name": "block10"
+      }
+    },
+    {
+      "ph": "M",
+      "name": "thread_name",
+      "pid": 10,
+      "tid": 2,
+      "args": {
+        "name": "AIV1 (core45)"
+      }
+    },
+    {
+      "ph": "M",
+      "name": "process_name",
+      "pid": 11,
+      "args": {
+        "name": "block11"
+      }
+    },
+    {
+      "ph": "M",
+      "name": "thread_name",
+      "pid": 11,
+      "tid": 1,
+      "args": {
+        "name": "AIV0 (core46)"
+      }
+    },
+    {
+      "ph": "M",
+      "name": "process_name",
+      "pid": 11,
+      "args": {
+        "name": "block11"
+      }
+    },
+    {
+      "ph": "M",
+      "name": "thread_name",
+      "pid": 11,
+      "tid": 2,
+      "args": {
+        "name": "AIV1 (core47)"
+      }
+    },
+    {
+      "ph": "M",
+      "name": "process_name",
+      "pid": 12,
+      "args": {
+        "name": "block12"
+      }
+    },
+    {
+      "ph": "M",
+      "name": "thread_name",
+      "pid": 12,
+      "tid": 1,
+      "args": {
+        "name": "AIV0 (core48)"
+      }
+    },
+    {
+      "ph": "M",
+      "name": "process_name",
+      "pid": 12,
+      "args": {
+        "name": "block12"
+      }
+    },
+    {
+      "ph": "M",
+      "name": "thread_name",
+      "pid": 12,
+      "tid": 2,
+      "args": {
+        "name": "AIV1 (core49)"
+      }
+    },
+    {
+      "ph": "M",
+      "name": "process_name",
+      "pid": 13,
+      "args": {
+        "name": "block13"
+      }
+    },
+    {
+      "ph": "M",
+      "name": "thread_name",
+      "pid": 13,
+      "tid": 1,
+      "args": {
+        "name": "AIV0 (core50)"
+      }
+    },
+    {
+      "ph": "M",
+      "name": "process_name",
+      "pid": 13,
+      "args": {
+        "name": "block13"
+      }
+    },
+    {
+      "ph": "M",
+      "name": "thread_name",
+      "pid": 13,
+      "tid": 2,
+      "args": {
+        "name": "AIV1 (core51)"
+      }
+    },
+    {
+      "ph": "M",
+      "name": "process_name",
+      "pid": 14,
+      "args": {
+        "name": "block14"
+      }
+    },
+    {
+      "ph": "M",
+      "name": "thread_name",
+      "pid": 14,
+      "tid": 1,
+      "args": {
+        "name": "AIV0 (core52)"
+      }
+    },
+    {
+      "ph": "M",
+      "name": "process_name",
+      "pid": 14,
+      "args": {
+        "name": "block14"
+      }
+    },
+    {
+      "ph": "M",
+      "name": "thread_name",
+      "pid": 14,
+      "tid": 2,
+      "args": {
+        "name": "AIV1 (core53)"
+      }
+    },
+    {
+      "ph": "M",
+      "name": "process_name",
+      "pid": 15,
+      "args": {
+        "name": "block15"
+      }
+    },
+    {
+      "ph": "M",
+      "name": "thread_name",
+      "pid": 15,
+      "tid": 1,
+      "args": {
+        "name": "AIV0 (core54)"
+      }
+    },
+    {
+      "ph": "M",
+      "name": "process_name",
+      "pid": 15,
+      "args": {
+        "name": "block15"
+      }
+    },
+    {
+      "ph": "M",
+      "name": "thread_name",
+      "pid": 15,
+      "tid": 2,
+      "args": {
+        "name": "AIV1 (core55)"
+      }
+    },
+    {
+      "ph": "M",
+      "name": "process_name",
+      "pid": 16,
+      "args": {
+        "name": "block16"
+      }
+    },
+    {
+      "ph": "M",
+      "name": "thread_name",
+      "pid": 16,
+      "tid": 1,
+      "args": {
+        "name": "AIV0 (core56)"
+      }
+    },
+    {
+      "ph": "M",
+      "name": "process_name",
+      "pid": 16,
+      "args": {
+        "name": "block16"
+      }
+    },
+    {
+      "ph": "M",
+      "name": "thread_name",
+      "pid": 16,
+      "tid": 2,
+      "args": {
+        "name": "AIV1 (core57)"
+      }
+    },
+    {
+      "ph": "M",
+      "name": "process_name",
+      "pid": 17,
+      "args": {
+        "name": "block17"
+      }
+    },
+    {
+      "ph": "M",
+      "name": "thread_name",
+      "pid": 17,
+      "tid": 1,
+      "args": {
+        "name": "AIV0 (core58)"
+      }
+    },
+    {
+      "ph": "M",
+      "name": "process_name",
+      "pid": 17,
+      "args": {
+        "name": "block17"
+      }
+    },
+    {
+      "ph": "M",
+      "name": "thread_name",
+      "pid": 17,
+      "tid": 2,
+      "args": {
+        "name": "AIV1 (core59)"
+      }
+    },
+    {
+      "ph": "M",
+      "name": "process_name",
+      "pid": 18,
+      "args": {
+        "name": "block18"
+      }
+    },
+    {
+      "ph": "M",
+      "name": "thread_name",
+      "pid": 18,
+      "tid": 1,
+      "args": {
+        "name": "AIV0 (core60)"
+      }
+    },
+    {
+      "ph": "M",
+      "name": "process_name",
+      "pid": 18,
+      "args": {
+        "name": "block18"
+      }
+    },
+    {
+      "ph": "M",
+      "name": "thread_name",
+      "pid": 18,
+      "tid": 2,
+      "args": {
+        "name": "AIV1 (core61)"
+      }
+    },
+    {
+      "ph": "M",
+      "name": "process_name",
+      "pid": 19,
+      "args": {
+        "name": "block19"
+      }
+    },
+    {
+      "ph": "M",
+      "name": "thread_name",
+      "pid": 19,
+      "tid": 1,
+      "args": {
+        "name": "AIV0 (core62)"
+      }
+    },
+    {
+      "ph": "M",
+      "name": "process_name",
+      "pid": 19,
+      "args": {
+        "name": "block19"
+      }
+    },
+    {
+      "ph": "M",
+      "name": "thread_name",
+      "pid": 19,
+      "tid": 2,
+      "args": {
+        "name": "AIV1 (core63)"
+      }
+    },
+    {
+      "ph": "M",
+      "name": "process_name",
+      "pid": 20,
+      "args": {
+        "name": "block20"
+      }
+    },
+    {
+      "ph": "M",
+      "name": "thread_name",
+      "pid": 20,
+      "tid": 1,
+      "args": {
+        "name": "AIV0 (core64)"
+      }
+    },
+    {
+      "ph": "M",
+      "name": "process_name",
+      "pid": 20,
+      "args": {
+        "name": "block20"
+      }
+    },
+    {
+      "ph": "M",
+      "name": "thread_name",
+      "pid": 20,
+      "tid": 2,
+      "args": {
+        "name": "AIV1 (core65)"
+      }
+    },
+    {
+      "ph": "M",
+      "name": "process_name",
+      "pid": 21,
+      "args": {
+        "name": "block21"
+      }
+    },
+    {
+      "ph": "M",
+      "name": "thread_name",
+      "pid": 21,
+      "tid": 1,
+      "args": {
+        "name": "AIV0 (core66)"
+      }
+    },
+    {
+      "ph": "M",
+      "name": "process_name",
+      "pid": 21,
+      "args": {
+        "name": "block21"
+      }
+    },
+    {
+      "ph": "M",
+      "name": "thread_name",
+      "pid": 21,
+      "tid": 2,
+      "args": {
+        "name": "AIV1 (core67)"
+      }
+    },
+    {
+      "ph": "M",
+      "name": "process_name",
+      "pid": 22,
+      "args": {
+        "name": "block22"
+      }
+    },
+    {
+      "ph": "M",
+      "name": "thread_name",
+      "pid": 22,
+      "tid": 1,
+      "args": {
+        "name": "AIV0 (core68)"
+      }
+    },
+    {
+      "ph": "M",
+      "name": "process_name",
+      "pid": 22,
+      "args": {
+        "name": "block22"
+      }
+    },
+    {
+      "ph": "M",
+      "name": "thread_name",
+      "pid": 22,
+      "tid": 2,
+      "args": {
+        "name": "AIV1 (core69)"
+      }
+    },
+    {
+      "ph": "M",
+      "name": "process_name",
+      "pid": 23,
+      "args": {
+        "name": "block23"
+      }
+    },
+    {
+      "ph": "M",
+      "name": "thread_name",
+      "pid": 23,
+      "tid": 1,
+      "args": {
+        "name": "AIV0 (core70)"
+      }
+    },
+    {
+      "ph": "M",
+      "name": "process_name",
+      "pid": 23,
+      "args": {
+        "name": "block23"
+      }
+    },
+    {
+      "ph": "M",
+      "name": "thread_name",
+      "pid": 23,
+      "tid": 2,
+      "args": {
+        "name": "AIV1 (core71)"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "GEMM#24",
+      "pid": 0,
+      "tid": 0,
+      "ts": 5030.041,
+      "dur": 24249.959,
+      "args": {
+        "task_id": 24,
+        "func_id": 0,
+        "core": 0,
+        "mc": 0,
+        "name": "GEMM"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "GEMM#54",
+      "pid": 0,
+      "tid": 0,
+      "ts": 29297.125,
+      "dur": 32959.5,
+      "args": {
+        "task_id": 54,
+        "func_id": 0,
+        "core": 0,
+        "mc": 0,
+        "name": "GEMM"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "GEMM#82",
+      "pid": 0,
+      "tid": 0,
+      "ts": 62270.833,
+      "dur": 60093.417,
+      "args": {
+        "task_id": 82,
+        "func_id": 0,
+        "core": 0,
+        "mc": 0,
+        "name": "GEMM"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "GEMM#148",
+      "pid": 0,
+      "tid": 0,
+      "ts": 122401.958,
+      "dur": 34399.083,
+      "args": {
+        "task_id": 148,
+        "func_id": 0,
+        "core": 0,
+        "mc": 0,
+        "name": "GEMM"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "GEMM#180",
+      "pid": 0,
+      "tid": 0,
+      "ts": 156811.333,
+      "dur": 46998.208,
+      "args": {
+        "task_id": 180,
+        "func_id": 0,
+        "core": 0,
+        "mc": 0,
+        "name": "GEMM"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "GEMM#222",
+      "pid": 0,
+      "tid": 0,
+      "ts": 203826.583,
+      "dur": 49256.833,
+      "args": {
+        "task_id": 222,
+        "func_id": 0,
+        "core": 0,
+        "mc": 0,
+        "name": "GEMM"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "GEMM#274",
+      "pid": 0,
+      "tid": 0,
+      "ts": 253111.083,
+      "dur": 30790.833,
+      "args": {
+        "task_id": 274,
+        "func_id": 0,
+        "core": 0,
+        "mc": 0,
+        "name": "GEMM"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "GEMM#304",
+      "pid": 0,
+      "tid": 0,
+      "ts": 283934.208,
+      "dur": 105604.792,
+      "args": {
+        "task_id": 304,
+        "func_id": 0,
+        "core": 0,
+        "mc": 0,
+        "name": "GEMM"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "GEMM#408",
+      "pid": 0,
+      "tid": 0,
+      "ts": 389595.25,
+      "dur": 43741.083,
+      "args": {
+        "task_id": 408,
+        "func_id": 0,
+        "core": 0,
+        "mc": 0,
+        "name": "GEMM"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "GEMM#456",
+      "pid": 0,
+      "tid": 0,
+      "ts": 433367.958,
+      "dur": 21803.458,
+      "args": {
+        "task_id": 456,
+        "func_id": 0,
+        "core": 0,
+        "mc": 0,
+        "name": "GEMM"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "GEMM#466",
+      "pid": 0,
+      "tid": 0,
+      "ts": 455179.0,
+      "dur": 35348.458,
+      "args": {
+        "task_id": 466,
+        "func_id": 0,
+        "core": 0,
+        "mc": 0,
+        "name": "GEMM"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "GEMM#14",
+      "pid": 1,
+      "tid": 0,
+      "ts": 3561.625,
+      "dur": 29861.416,
+      "args": {
+        "task_id": 14,
+        "func_id": 0,
+        "core": 1,
+        "mc": 0,
+        "name": "GEMM"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "GEMM#60",
+      "pid": 1,
+      "tid": 0,
+      "ts": 33432.041,
+      "dur": 67548.292,
+      "args": {
+        "task_id": 60,
+        "func_id": 0,
+        "core": 1,
+        "mc": 0,
+        "name": "GEMM"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "GEMM#118",
+      "pid": 1,
+      "tid": 0,
+      "ts": 100994.333,
+      "dur": 75356.167,
+      "args": {
+        "task_id": 118,
+        "func_id": 0,
+        "core": 1,
+        "mc": 0,
+        "name": "GEMM"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "GEMM#196",
+      "pid": 1,
+      "tid": 0,
+      "ts": 176378.75,
+      "dur": 32058.333,
+      "args": {
+        "task_id": 196,
+        "func_id": 0,
+        "core": 1,
+        "mc": 0,
+        "name": "GEMM"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "GEMM#228",
+      "pid": 1,
+      "tid": 0,
+      "ts": 208452.25,
+      "dur": 69108.583,
+      "args": {
+        "task_id": 228,
+        "func_id": 0,
+        "core": 1,
+        "mc": 0,
+        "name": "GEMM"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "GEMM#296",
+      "pid": 1,
+      "tid": 0,
+      "ts": 277592.75,
+      "dur": 66368.833,
+      "args": {
+        "task_id": 296,
+        "func_id": 0,
+        "core": 1,
+        "mc": 0,
+        "name": "GEMM"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "GEMM#362",
+      "pid": 1,
+      "tid": 0,
+      "ts": 343995.666,
+      "dur": 15728.584,
+      "args": {
+        "task_id": 362,
+        "func_id": 0,
+        "core": 1,
+        "mc": 0,
+        "name": "GEMM"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "GEMM#380",
+      "pid": 1,
+      "tid": 0,
+      "ts": 359735.291,
+      "dur": 56199.709,
+      "args": {
+        "task_id": 380,
+        "func_id": 0,
+        "core": 1,
+        "mc": 0,
+        "name": "GEMM"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "GEMM#436",
+      "pid": 1,
+      "tid": 0,
+      "ts": 415969.291,
+      "dur": 65775.459,
+      "args": {
+        "task_id": 436,
+        "func_id": 0,
+        "core": 1,
+        "mc": 0,
+        "name": "GEMM"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "GEMM#26",
+      "pid": 2,
+      "tid": 0,
+      "ts": 5108.0,
+      "dur": 65956.291,
+      "args": {
+        "task_id": 26,
+        "func_id": 0,
+        "core": 2,
+        "mc": 0,
+        "name": "GEMM"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "GEMM#90",
+      "pid": 2,
+      "tid": 0,
+      "ts": 71111.875,
+      "dur": 40014.708,
+      "args": {
+        "task_id": 90,
+        "func_id": 0,
+        "core": 2,
+        "mc": 0,
+        "name": "GEMM"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "GEMM#132",
+      "pid": 2,
+      "tid": 0,
+      "ts": 111137.625,
+      "dur": 40683.0,
+      "args": {
+        "task_id": 132,
+        "func_id": 0,
+        "core": 2,
+        "mc": 0,
+        "name": "GEMM"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "GEMM#172",
+      "pid": 2,
+      "tid": 0,
+      "ts": 151836.166,
+      "dur": 65193.542,
+      "args": {
+        "task_id": 172,
+        "func_id": 0,
+        "core": 2,
+        "mc": 0,
+        "name": "GEMM"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "GEMM#238",
+      "pid": 2,
+      "tid": 0,
+      "ts": 217053.875,
+      "dur": 49605.666,
+      "args": {
+        "task_id": 238,
+        "func_id": 0,
+        "core": 2,
+        "mc": 0,
+        "name": "GEMM"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "GEMM#290",
+      "pid": 2,
+      "tid": 0,
+      "ts": 266706.958,
+      "dur": 61557.458,
+      "args": {
+        "task_id": 290,
+        "func_id": 0,
+        "core": 2,
+        "mc": 0,
+        "name": "GEMM"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "GEMM#346",
+      "pid": 2,
+      "tid": 0,
+      "ts": 328315.708,
+      "dur": 50557.5,
+      "args": {
+        "task_id": 346,
+        "func_id": 0,
+        "core": 2,
+        "mc": 0,
+        "name": "GEMM"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "GEMM#392",
+      "pid": 2,
+      "tid": 0,
+      "ts": 378899.166,
+      "dur": 32673.209,
+      "args": {
+        "task_id": 392,
+        "func_id": 0,
+        "core": 2,
+        "mc": 0,
+        "name": "GEMM"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "GEMM#434",
+      "pid": 2,
+      "tid": 0,
+      "ts": 411601.708,
+      "dur": 44578.083,
+      "args": {
+        "task_id": 434,
+        "func_id": 0,
+        "core": 2,
+        "mc": 0,
+        "name": "GEMM"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "GEMM#468",
+      "pid": 2,
+      "tid": 0,
+      "ts": 456204.541,
+      "dur": 31525.375,
+      "args": {
+        "task_id": 468,
+        "func_id": 0,
+        "core": 2,
+        "mc": 0,
+        "name": "GEMM"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "GEMM#42",
+      "pid": 3,
+      "tid": 0,
+      "ts": 14318.291,
+      "dur": 59195.25,
+      "args": {
+        "task_id": 42,
+        "func_id": 0,
+        "core": 3,
+        "mc": 0,
+        "name": "GEMM"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "GEMM#94",
+      "pid": 3,
+      "tid": 0,
+      "ts": 73525.875,
+      "dur": 34565.833,
+      "args": {
+        "task_id": 94,
+        "func_id": 0,
+        "core": 3,
+        "mc": 0,
+        "name": "GEMM"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "GEMM#136",
+      "pid": 3,
+      "tid": 0,
+      "ts": 115117.625,
+      "dur": 60943.333,
+      "args": {
+        "task_id": 136,
+        "func_id": 0,
+        "core": 3,
+        "mc": 0,
+        "name": "GEMM"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "GEMM#194",
+      "pid": 3,
+      "tid": 0,
+      "ts": 176082.458,
+      "dur": 31112.292,
+      "args": {
+        "task_id": 194,
+        "func_id": 0,
+        "core": 3,
+        "mc": 0,
+        "name": "GEMM"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "GEMM#226",
+      "pid": 3,
+      "tid": 0,
+      "ts": 207207.708,
+      "dur": 39909.708,
+      "args": {
+        "task_id": 226,
+        "func_id": 0,
+        "core": 3,
+        "mc": 0,
+        "name": "GEMM"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "GEMM#266",
+      "pid": 3,
+      "tid": 0,
+      "ts": 247136.291,
+      "dur": 41294.459,
+      "args": {
+        "task_id": 266,
+        "func_id": 0,
+        "core": 3,
+        "mc": 0,
+        "name": "GEMM"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "GEMM#310",
+      "pid": 3,
+      "tid": 0,
+      "ts": 288451.833,
+      "dur": 54002.708,
+      "args": {
+        "task_id": 310,
+        "func_id": 0,
+        "core": 3,
+        "mc": 0,
+        "name": "GEMM"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "GEMM#358",
+      "pid": 3,
+      "tid": 0,
+      "ts": 342512.25,
+      "dur": 37543.458,
+      "args": {
+        "task_id": 358,
+        "func_id": 0,
+        "core": 3,
+        "mc": 0,
+        "name": "GEMM"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "GEMM#396",
+      "pid": 3,
+      "tid": 0,
+      "ts": 380082.041,
+      "dur": 22583.125,
+      "args": {
+        "task_id": 396,
+        "func_id": 0,
+        "core": 3,
+        "mc": 0,
+        "name": "GEMM"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "GEMM#422",
+      "pid": 3,
+      "tid": 0,
+      "ts": 402682.416,
+      "dur": 84861.334,
+      "args": {
+        "task_id": 422,
+        "func_id": 0,
+        "core": 3,
+        "mc": 0,
+        "name": "GEMM"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "GEMM#28",
+      "pid": 4,
+      "tid": 0,
+      "ts": 7495.291,
+      "dur": 70940.5,
+      "args": {
+        "task_id": 28,
+        "func_id": 0,
+        "core": 4,
+        "mc": 0,
+        "name": "GEMM"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "GEMM#102",
+      "pid": 4,
+      "tid": 0,
+      "ts": 78451.833,
+      "dur": 58783.708,
+      "args": {
+        "task_id": 102,
+        "func_id": 0,
+        "core": 4,
+        "mc": 0,
+        "name": "GEMM"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "GEMM#158",
+      "pid": 4,
+      "tid": 0,
+      "ts": 137251.583,
+      "dur": 75440.75,
+      "args": {
+        "task_id": 158,
+        "func_id": 0,
+        "core": 4,
+        "mc": 0,
+        "name": "GEMM"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "GEMM#232",
+      "pid": 4,
+      "tid": 0,
+      "ts": 212744.916,
+      "dur": 46413.875,
+      "args": {
+        "task_id": 232,
+        "func_id": 0,
+        "core": 4,
+        "mc": 0,
+        "name": "GEMM"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "GEMM#280",
+      "pid": 4,
+      "tid": 0,
+      "ts": 259182.583,
+      "dur": 51298.042,
+      "args": {
+        "task_id": 280,
+        "func_id": 0,
+        "core": 4,
+        "mc": 0,
+        "name": "GEMM"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "GEMM#330",
+      "pid": 4,
+      "tid": 0,
+      "ts": 310509.375,
+      "dur": 24049.25,
+      "args": {
+        "task_id": 330,
+        "func_id": 0,
+        "core": 4,
+        "mc": 0,
+        "name": "GEMM"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "GEMM#352",
+      "pid": 4,
+      "tid": 0,
+      "ts": 334570.75,
+      "dur": 54480.041,
+      "args": {
+        "task_id": 352,
+        "func_id": 0,
+        "core": 4,
+        "mc": 0,
+        "name": "GEMM"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "GEMM#406",
+      "pid": 4,
+      "tid": 0,
+      "ts": 389110.458,
+      "dur": 73649.833,
+      "args": {
+        "task_id": 406,
+        "func_id": 0,
+        "core": 4,
+        "mc": 0,
+        "name": "GEMM"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "GEMM#476",
+      "pid": 4,
+      "tid": 0,
+      "ts": 462840.416,
+      "dur": 23486.959,
+      "args": {
+        "task_id": 476,
+        "func_id": 0,
+        "core": 4,
+        "mc": 0,
+        "name": "GEMM"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "GEMM#46",
+      "pid": 5,
+      "tid": 0,
+      "ts": 22077.25,
+      "dur": 50477.833,
+      "args": {
+        "task_id": 46,
+        "func_id": 0,
+        "core": 5,
+        "mc": 0,
+        "name": "GEMM"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "GEMM#92",
+      "pid": 5,
+      "tid": 0,
+      "ts": 72564.458,
+      "dur": 39186.458,
+      "args": {
+        "task_id": 92,
+        "func_id": 0,
+        "core": 5,
+        "mc": 0,
+        "name": "GEMM"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "GEMM#134",
+      "pid": 5,
+      "tid": 0,
+      "ts": 111764.583,
+      "dur": 63130.5,
+      "args": {
+        "task_id": 134,
+        "func_id": 0,
+        "core": 5,
+        "mc": 0,
+        "name": "GEMM"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "GEMM#192",
+      "pid": 5,
+      "tid": 0,
+      "ts": 174936.708,
+      "dur": 12266.333,
+      "args": {
+        "task_id": 192,
+        "func_id": 0,
+        "core": 5,
+        "mc": 0,
+        "name": "GEMM"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "GEMM#204",
+      "pid": 5,
+      "tid": 0,
+      "ts": 187209.333,
+      "dur": 68895.583,
+      "args": {
+        "task_id": 204,
+        "func_id": 0,
+        "core": 5,
+        "mc": 0,
+        "name": "GEMM"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "GEMM#278",
+      "pid": 5,
+      "tid": 0,
+      "ts": 256139.0,
+      "dur": 67520.375,
+      "args": {
+        "task_id": 278,
+        "func_id": 0,
+        "core": 5,
+        "mc": 0,
+        "name": "GEMM"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "GEMM#340",
+      "pid": 5,
+      "tid": 0,
+      "ts": 323690.333,
+      "dur": 44183.167,
+      "args": {
+        "task_id": 340,
+        "func_id": 0,
+        "core": 5,
+        "mc": 0,
+        "name": "GEMM"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "GEMM#390",
+      "pid": 5,
+      "tid": 0,
+      "ts": 367901.416,
+      "dur": 63459.625,
+      "args": {
+        "task_id": 390,
+        "func_id": 0,
+        "core": 5,
+        "mc": 0,
+        "name": "GEMM"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "GEMM#454",
+      "pid": 5,
+      "tid": 0,
+      "ts": 431401.541,
+      "dur": 44316.667,
+      "args": {
+        "task_id": 454,
+        "func_id": 0,
+        "core": 5,
+        "mc": 0,
+        "name": "GEMM"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "GEMM#38",
+      "pid": 6,
+      "tid": 0,
+      "ts": 9350.708,
+      "dur": 20394.083,
+      "args": {
+        "task_id": 38,
+        "func_id": 0,
+        "core": 6,
+        "mc": 0,
+        "name": "GEMM"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "GEMM#56",
+      "pid": 6,
+      "tid": 0,
+      "ts": 29754.291,
+      "dur": 13406.084,
+      "args": {
+        "task_id": 56,
+        "func_id": 0,
+        "core": 6,
+        "mc": 0,
+        "name": "GEMM"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "GEMM#66",
+      "pid": 6,
+      "tid": 0,
+      "ts": 43163.875,
+      "dur": 10266.833,
+      "args": {
+        "task_id": 66,
+        "func_id": 0,
+        "core": 6,
+        "mc": 0,
+        "name": "GEMM"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "GEMM#74",
+      "pid": 6,
+      "tid": 0,
+      "ts": 53433.166,
+      "dur": 10372.125,
+      "args": {
+        "task_id": 74,
+        "func_id": 0,
+        "core": 6,
+        "mc": 0,
+        "name": "GEMM"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "GEMM#84",
+      "pid": 6,
+      "tid": 0,
+      "ts": 63808.25,
+      "dur": 10258.916,
+      "args": {
+        "task_id": 84,
+        "func_id": 0,
+        "core": 6,
+        "mc": 0,
+        "name": "GEMM"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "GEMM#96",
+      "pid": 6,
+      "tid": 0,
+      "ts": 74070.875,
+      "dur": 18425.916,
+      "args": {
+        "task_id": 96,
+        "func_id": 0,
+        "core": 6,
+        "mc": 0,
+        "name": "GEMM"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "GEMM#112",
+      "pid": 6,
+      "tid": 0,
+      "ts": 92506.875,
+      "dur": 12162.666,
+      "args": {
+        "task_id": 112,
+        "func_id": 0,
+        "core": 6,
+        "mc": 0,
+        "name": "GEMM"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "GEMM#126",
+      "pid": 6,
+      "tid": 0,
+      "ts": 104674.083,
+      "dur": 16791.042,
+      "args": {
+        "task_id": 126,
+        "func_id": 0,
+        "core": 6,
+        "mc": 0,
+        "name": "GEMM"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "GEMM#144",
+      "pid": 6,
+      "tid": 0,
+      "ts": 121470.958,
+      "dur": 13621.417,
+      "args": {
+        "task_id": 144,
+        "func_id": 0,
+        "core": 6,
+        "mc": 0,
+        "name": "GEMM"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "GEMM#156",
+      "pid": 6,
+      "tid": 0,
+      "ts": 135097.416,
+      "dur": 16374.792,
+      "args": {
+        "task_id": 156,
+        "func_id": 0,
+        "core": 6,
+        "mc": 0,
+        "name": "GEMM"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "GEMM#170",
+      "pid": 6,
+      "tid": 0,
+      "ts": 151477.458,
+      "dur": 17647.708,
+      "args": {
+        "task_id": 170,
+        "func_id": 0,
+        "core": 6,
+        "mc": 0,
+        "name": "GEMM"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "GEMM#188",
+      "pid": 6,
+      "tid": 0,
+      "ts": 169132.208,
+      "dur": 19298.75,
+      "args": {
+        "task_id": 188,
+        "func_id": 0,
+        "core": 6,
+        "mc": 0,
+        "name": "GEMM"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "GEMM#206",
+      "pid": 6,
+      "tid": 0,
+      "ts": 188454.958,
+      "dur": 49302.792,
+      "args": {
+        "task_id": 206,
+        "func_id": 0,
+        "core": 6,
+        "mc": 0,
+        "name": "GEMM"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "GEMM#254",
+      "pid": 6,
+      "tid": 0,
+      "ts": 237798.333,
+      "dur": 60942.625,
+      "args": {
+        "task_id": 254,
+        "func_id": 0,
+        "core": 6,
+        "mc": 0,
+        "name": "GEMM"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "GEMM#318",
+      "pid": 6,
+      "tid": 0,
+      "ts": 298771.583,
+      "dur": 47959.625,
+      "args": {
+        "task_id": 318,
+        "func_id": 0,
+        "core": 6,
+        "mc": 0,
+        "name": "GEMM"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "GEMM#368",
+      "pid": 6,
+      "tid": 0,
+      "ts": 346757.958,
+      "dur": 64675.167,
+      "args": {
+        "task_id": 368,
+        "func_id": 0,
+        "core": 6,
+        "mc": 0,
+        "name": "GEMM"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "GEMM#430",
+      "pid": 6,
+      "tid": 0,
+      "ts": 411470.916,
+      "dur": 18057.542,
+      "args": {
+        "task_id": 430,
+        "func_id": 0,
+        "core": 6,
+        "mc": 0,
+        "name": "GEMM"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "GEMM#450",
+      "pid": 6,
+      "tid": 0,
+      "ts": 429552.833,
+      "dur": 50991.833,
+      "args": {
+        "task_id": 450,
+        "func_id": 0,
+        "core": 6,
+        "mc": 0,
+        "name": "GEMM"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "GEMM#32",
+      "pid": 7,
+      "tid": 0,
+      "ts": 7822.208,
+      "dur": 47579.875,
+      "args": {
+        "task_id": 32,
+        "func_id": 0,
+        "core": 7,
+        "mc": 0,
+        "name": "GEMM"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "GEMM#78",
+      "pid": 7,
+      "tid": 0,
+      "ts": 55411.916,
+      "dur": 73540.417,
+      "args": {
+        "task_id": 78,
+        "func_id": 0,
+        "core": 7,
+        "mc": 0,
+        "name": "GEMM"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "GEMM#152",
+      "pid": 7,
+      "tid": 0,
+      "ts": 128974.0,
+      "dur": 18682.25,
+      "args": {
+        "task_id": 152,
+        "func_id": 0,
+        "core": 7,
+        "mc": 0,
+        "name": "GEMM"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "GEMM#164",
+      "pid": 7,
+      "tid": 0,
+      "ts": 147661.958,
+      "dur": 47817.0,
+      "args": {
+        "task_id": 164,
+        "func_id": 0,
+        "core": 7,
+        "mc": 0,
+        "name": "GEMM"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "GEMM#214",
+      "pid": 7,
+      "tid": 0,
+      "ts": 195497.083,
+      "dur": 52703.333,
+      "args": {
+        "task_id": 214,
+        "func_id": 0,
+        "core": 7,
+        "mc": 0,
+        "name": "GEMM"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "GEMM#268",
+      "pid": 7,
+      "tid": 0,
+      "ts": 248246.208,
+      "dur": 52186.5,
+      "args": {
+        "task_id": 268,
+        "func_id": 0,
+        "core": 7,
+        "mc": 0,
+        "name": "GEMM"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "GEMM#320",
+      "pid": 7,
+      "tid": 0,
+      "ts": 300480.208,
+      "dur": 45463.5,
+      "args": {
+        "task_id": 320,
+        "func_id": 0,
+        "core": 7,
+        "mc": 0,
+        "name": "GEMM"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "GEMM#366",
+      "pid": 7,
+      "tid": 0,
+      "ts": 345968.791,
+      "dur": 38700.709,
+      "args": {
+        "task_id": 366,
+        "func_id": 0,
+        "core": 7,
+        "mc": 0,
+        "name": "GEMM"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "GEMM#400",
+      "pid": 7,
+      "tid": 0,
+      "ts": 384692.208,
+      "dur": 42090.917,
+      "args": {
+        "task_id": 400,
+        "func_id": 0,
+        "core": 7,
+        "mc": 0,
+        "name": "GEMM"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "GEMM#442",
+      "pid": 7,
+      "tid": 0,
+      "ts": 426811.75,
+      "dur": 27488.625,
+      "args": {
+        "task_id": 442,
+        "func_id": 0,
+        "core": 7,
+        "mc": 0,
+        "name": "GEMM"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "GEMM#464",
+      "pid": 7,
+      "tid": 0,
+      "ts": 454316.875,
+      "dur": 42386.5,
+      "args": {
+        "task_id": 464,
+        "func_id": 0,
+        "core": 7,
+        "mc": 0,
+        "name": "GEMM"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "GEMM#62",
+      "pid": 8,
+      "tid": 0,
+      "ts": 41052.083,
+      "dur": 35623.375,
+      "args": {
+        "task_id": 62,
+        "func_id": 0,
+        "core": 8,
+        "mc": 0,
+        "name": "GEMM"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "GEMM#100",
+      "pid": 8,
+      "tid": 0,
+      "ts": 76687.041,
+      "dur": 87119.209,
+      "args": {
+        "task_id": 100,
+        "func_id": 0,
+        "core": 8,
+        "mc": 0,
+        "name": "GEMM"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "GEMM#186",
+      "pid": 8,
+      "tid": 0,
+      "ts": 163831.958,
+      "dur": 56073.292,
+      "args": {
+        "task_id": 186,
+        "func_id": 0,
+        "core": 8,
+        "mc": 0,
+        "name": "GEMM"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "GEMM#244",
+      "pid": 8,
+      "tid": 0,
+      "ts": 219961.166,
+      "dur": 22755.084,
+      "args": {
+        "task_id": 244,
+        "func_id": 0,
+        "core": 8,
+        "mc": 0,
+        "name": "GEMM"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "GEMM#264",
+      "pid": 8,
+      "tid": 0,
+      "ts": 242726.541,
+      "dur": 55964.5,
+      "args": {
+        "task_id": 264,
+        "func_id": 0,
+        "core": 8,
+        "mc": 0,
+        "name": "GEMM"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "GEMM#316",
+      "pid": 8,
+      "tid": 0,
+      "ts": 298717.0,
+      "dur": 55541.666,
+      "args": {
+        "task_id": 316,
+        "func_id": 0,
+        "core": 8,
+        "mc": 0,
+        "name": "GEMM"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "GEMM#374",
+      "pid": 8,
+      "tid": 0,
+      "ts": 354294.125,
+      "dur": 39730.958,
+      "args": {
+        "task_id": 374,
+        "func_id": 0,
+        "core": 8,
+        "mc": 0,
+        "name": "GEMM"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "GEMM#410",
+      "pid": 8,
+      "tid": 0,
+      "ts": 394072.458,
+      "dur": 77961.208,
+      "args": {
+        "task_id": 410,
+        "func_id": 0,
+        "core": 8,
+        "mc": 0,
+        "name": "GEMM"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "GEMM#10",
+      "pid": 9,
+      "tid": 0,
+      "ts": 721.833,
+      "dur": 28289.625,
+      "args": {
+        "task_id": 10,
+        "func_id": 0,
+        "core": 9,
+        "mc": 0,
+        "name": "GEMM"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "GEMM#52",
+      "pid": 9,
+      "tid": 0,
+      "ts": 29060.958,
+      "dur": 75849.125,
+      "args": {
+        "task_id": 52,
+        "func_id": 0,
+        "core": 9,
+        "mc": 0,
+        "name": "GEMM"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "GEMM#128",
+      "pid": 9,
+      "tid": 0,
+      "ts": 104927.041,
+      "dur": 54917.667,
+      "args": {
+        "task_id": 128,
+        "func_id": 0,
+        "core": 9,
+        "mc": 0,
+        "name": "GEMM"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "GEMM#182",
+      "pid": 9,
+      "tid": 0,
+      "ts": 159881.041,
+      "dur": 60415.125,
+      "args": {
+        "task_id": 182,
+        "func_id": 0,
+        "core": 9,
+        "mc": 0,
+        "name": "GEMM"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "GEMM#246",
+      "pid": 9,
+      "tid": 0,
+      "ts": 220325.5,
+      "dur": 45066.833,
+      "args": {
+        "task_id": 246,
+        "func_id": 0,
+        "core": 9,
+        "mc": 0,
+        "name": "GEMM"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "GEMM#288",
+      "pid": 9,
+      "tid": 0,
+      "ts": 265411.875,
+      "dur": 28484.375,
+      "args": {
+        "task_id": 288,
+        "func_id": 0,
+        "core": 9,
+        "mc": 0,
+        "name": "GEMM"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "GEMM#312",
+      "pid": 9,
+      "tid": 0,
+      "ts": 293914.0,
+      "dur": 48583.958,
+      "args": {
+        "task_id": 312,
+        "func_id": 0,
+        "core": 9,
+        "mc": 0,
+        "name": "GEMM"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "GEMM#360",
+      "pid": 9,
+      "tid": 0,
+      "ts": 342524.166,
+      "dur": 43929.75,
+      "args": {
+        "task_id": 360,
+        "func_id": 0,
+        "core": 9,
+        "mc": 0,
+        "name": "GEMM"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "GEMM#402",
+      "pid": 9,
+      "tid": 0,
+      "ts": 386480.875,
+      "dur": 37530.0,
+      "args": {
+        "task_id": 402,
+        "func_id": 0,
+        "core": 9,
+        "mc": 0,
+        "name": "GEMM"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "GEMM#440",
+      "pid": 9,
+      "tid": 0,
+      "ts": 424035.291,
+      "dur": 42066.792,
+      "args": {
+        "task_id": 440,
+        "func_id": 0,
+        "core": 9,
+        "mc": 0,
+        "name": "GEMM"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "GEMM#478",
+      "pid": 9,
+      "tid": 0,
+      "ts": 466129.708,
+      "dur": 22346.75,
+      "args": {
+        "task_id": 478,
+        "func_id": 0,
+        "core": 9,
+        "mc": 0,
+        "name": "GEMM"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "GEMM#20",
+      "pid": 10,
+      "tid": 0,
+      "ts": 4529.25,
+      "dur": 47050.625,
+      "args": {
+        "task_id": 20,
+        "func_id": 0,
+        "core": 10,
+        "mc": 0,
+        "name": "GEMM"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "GEMM#70",
+      "pid": 10,
+      "tid": 0,
+      "ts": 51588.916,
+      "dur": 68993.042,
+      "args": {
+        "task_id": 70,
+        "func_id": 0,
+        "core": 10,
+        "mc": 0,
+        "name": "GEMM"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "GEMM#140",
+      "pid": 10,
+      "tid": 0,
+      "ts": 120600.375,
+      "dur": 78769.875,
+      "args": {
+        "task_id": 140,
+        "func_id": 0,
+        "core": 10,
+        "mc": 0,
+        "name": "GEMM"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "GEMM#216",
+      "pid": 10,
+      "tid": 0,
+      "ts": 199395.791,
+      "dur": 42119.209,
+      "args": {
+        "task_id": 216,
+        "func_id": 0,
+        "core": 10,
+        "mc": 0,
+        "name": "GEMM"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "GEMM#262",
+      "pid": 10,
+      "tid": 0,
+      "ts": 241561.583,
+      "dur": 46683.417,
+      "args": {
+        "task_id": 262,
+        "func_id": 0,
+        "core": 10,
+        "mc": 0,
+        "name": "GEMM"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "GEMM#308",
+      "pid": 10,
+      "tid": 0,
+      "ts": 288268.666,
+      "dur": 57239.542,
+      "args": {
+        "task_id": 308,
+        "func_id": 0,
+        "core": 10,
+        "mc": 0,
+        "name": "GEMM"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "GEMM#364",
+      "pid": 10,
+      "tid": 0,
+      "ts": 345562.083,
+      "dur": 55157.542,
+      "args": {
+        "task_id": 364,
+        "func_id": 0,
+        "core": 10,
+        "mc": 0,
+        "name": "GEMM"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "GEMM#418",
+      "pid": 10,
+      "tid": 0,
+      "ts": 400751.833,
+      "dur": 70627.125,
+      "args": {
+        "task_id": 418,
+        "func_id": 0,
+        "core": 10,
+        "mc": 0,
+        "name": "GEMM"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "GEMM#6",
+      "pid": 11,
+      "tid": 0,
+      "ts": 321.416,
+      "dur": 31966.584,
+      "args": {
+        "task_id": 6,
+        "func_id": 0,
+        "core": 11,
+        "mc": 0,
+        "name": "GEMM"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "GEMM#58",
+      "pid": 11,
+      "tid": 0,
+      "ts": 32295.458,
+      "dur": 49952.625,
+      "args": {
+        "task_id": 58,
+        "func_id": 0,
+        "core": 11,
+        "mc": 0,
+        "name": "GEMM"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "GEMM#108",
+      "pid": 11,
+      "tid": 0,
+      "ts": 82260.125,
+      "dur": 66053.458,
+      "args": {
+        "task_id": 108,
+        "func_id": 0,
+        "core": 11,
+        "mc": 0,
+        "name": "GEMM"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "GEMM#166",
+      "pid": 11,
+      "tid": 0,
+      "ts": 148348.541,
+      "dur": 84617.625,
+      "args": {
+        "task_id": 166,
+        "func_id": 0,
+        "core": 11,
+        "mc": 0,
+        "name": "GEMM"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "GEMM#252",
+      "pid": 11,
+      "tid": 0,
+      "ts": 233002.416,
+      "dur": 21218.417,
+      "args": {
+        "task_id": 252,
+        "func_id": 0,
+        "core": 11,
+        "mc": 0,
+        "name": "GEMM"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "GEMM#276",
+      "pid": 11,
+      "tid": 0,
+      "ts": 254232.875,
+      "dur": 25404.875,
+      "args": {
+        "task_id": 276,
+        "func_id": 0,
+        "core": 11,
+        "mc": 0,
+        "name": "GEMM"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "GEMM#298",
+      "pid": 11,
+      "tid": 0,
+      "ts": 279649.375,
+      "dur": 73999.875,
+      "args": {
+        "task_id": 298,
+        "func_id": 0,
+        "core": 11,
+        "mc": 0,
+        "name": "GEMM"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "GEMM#372",
+      "pid": 11,
+      "tid": 0,
+      "ts": 353719.375,
+      "dur": 43358.75,
+      "args": {
+        "task_id": 372,
+        "func_id": 0,
+        "core": 11,
+        "mc": 0,
+        "name": "GEMM"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "GEMM#412",
+      "pid": 11,
+      "tid": 0,
+      "ts": 397120.916,
+      "dur": 72366.334,
+      "args": {
+        "task_id": 412,
+        "func_id": 0,
+        "core": 11,
+        "mc": 0,
+        "name": "GEMM"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "GEMM#12",
+      "pid": 12,
+      "tid": 0,
+      "ts": 2463.166,
+      "dur": 88729.917,
+      "args": {
+        "task_id": 12,
+        "func_id": 0,
+        "core": 12,
+        "mc": 0,
+        "name": "GEMM"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "GEMM#110",
+      "pid": 12,
+      "tid": 0,
+      "ts": 91236.208,
+      "dur": 25139.375,
+      "args": {
+        "task_id": 110,
+        "func_id": 0,
+        "core": 12,
+        "mc": 0,
+        "name": "GEMM"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "GEMM#138",
+      "pid": 12,
+      "tid": 0,
+      "ts": 116383.75,
+      "dur": 76343.958,
+      "args": {
+        "task_id": 138,
+        "func_id": 0,
+        "core": 12,
+        "mc": 0,
+        "name": "GEMM"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "GEMM#212",
+      "pid": 12,
+      "tid": 0,
+      "ts": 192755.083,
+      "dur": 16312.708,
+      "args": {
+        "task_id": 212,
+        "func_id": 0,
+        "core": 12,
+        "mc": 0,
+        "name": "GEMM"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "GEMM#230",
+      "pid": 12,
+      "tid": 0,
+      "ts": 209075.625,
+      "dur": 53180.541,
+      "args": {
+        "task_id": 230,
+        "func_id": 0,
+        "core": 12,
+        "mc": 0,
+        "name": "GEMM"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "GEMM#286",
+      "pid": 12,
+      "tid": 0,
+      "ts": 262282.0,
+      "dur": 47731.708,
+      "args": {
+        "task_id": 286,
+        "func_id": 0,
+        "core": 12,
+        "mc": 0,
+        "name": "GEMM"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "GEMM#328",
+      "pid": 12,
+      "tid": 0,
+      "ts": 310035.291,
+      "dur": 19459.875,
+      "args": {
+        "task_id": 328,
+        "func_id": 0,
+        "core": 12,
+        "mc": 0,
+        "name": "GEMM"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "GEMM#348",
+      "pid": 12,
+      "tid": 0,
+      "ts": 329506.583,
+      "dur": 75584.208,
+      "args": {
+        "task_id": 348,
+        "func_id": 0,
+        "core": 12,
+        "mc": 0,
+        "name": "GEMM"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "GEMM#424",
+      "pid": 12,
+      "tid": 0,
+      "ts": 405138.375,
+      "dur": 22554.333,
+      "args": {
+        "task_id": 424,
+        "func_id": 0,
+        "core": 12,
+        "mc": 0,
+        "name": "GEMM"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "GEMM#446",
+      "pid": 12,
+      "tid": 0,
+      "ts": 427723.458,
+      "dur": 57875.208,
+      "args": {
+        "task_id": 446,
+        "func_id": 0,
+        "core": 12,
+        "mc": 0,
+        "name": "GEMM"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "GEMM#4",
+      "pid": 13,
+      "tid": 0,
+      "ts": 278.458,
+      "dur": 19697.083,
+      "args": {
+        "task_id": 4,
+        "func_id": 0,
+        "core": 13,
+        "mc": 0,
+        "name": "GEMM"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "GEMM#44",
+      "pid": 13,
+      "tid": 0,
+      "ts": 19984.083,
+      "dur": 50777.208,
+      "args": {
+        "task_id": 44,
+        "func_id": 0,
+        "core": 13,
+        "mc": 0,
+        "name": "GEMM"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "GEMM#88",
+      "pid": 13,
+      "tid": 0,
+      "ts": 70771.333,
+      "dur": 32713.708,
+      "args": {
+        "task_id": 88,
+        "func_id": 0,
+        "core": 13,
+        "mc": 0,
+        "name": "GEMM"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "GEMM#122",
+      "pid": 13,
+      "tid": 0,
+      "ts": 103498.875,
+      "dur": 110731.083,
+      "args": {
+        "task_id": 122,
+        "func_id": 0,
+        "core": 13,
+        "mc": 0,
+        "name": "GEMM"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "GEMM#236",
+      "pid": 13,
+      "tid": 0,
+      "ts": 214267.5,
+      "dur": 37709.583,
+      "args": {
+        "task_id": 236,
+        "func_id": 0,
+        "core": 13,
+        "mc": 0,
+        "name": "GEMM"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "GEMM#272",
+      "pid": 13,
+      "tid": 0,
+      "ts": 252027.125,
+      "dur": 59647.541,
+      "args": {
+        "task_id": 272,
+        "func_id": 0,
+        "core": 13,
+        "mc": 0,
+        "name": "GEMM"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "GEMM#332",
+      "pid": 13,
+      "tid": 0,
+      "ts": 311729.416,
+      "dur": 27345.0,
+      "args": {
+        "task_id": 332,
+        "func_id": 0,
+        "core": 13,
+        "mc": 0,
+        "name": "GEMM"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "GEMM#356",
+      "pid": 13,
+      "tid": 0,
+      "ts": 339090.958,
+      "dur": 43838.833,
+      "args": {
+        "task_id": 356,
+        "func_id": 0,
+        "core": 13,
+        "mc": 0,
+        "name": "GEMM"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "GEMM#398",
+      "pid": 13,
+      "tid": 0,
+      "ts": 382956.958,
+      "dur": 77372.708,
+      "args": {
+        "task_id": 398,
+        "func_id": 0,
+        "core": 13,
+        "mc": 0,
+        "name": "GEMM"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "GEMM#474",
+      "pid": 13,
+      "tid": 0,
+      "ts": 460381.625,
+      "dur": 20160.666,
+      "args": {
+        "task_id": 474,
+        "func_id": 0,
+        "core": 13,
+        "mc": 0,
+        "name": "GEMM"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "GEMM#34",
+      "pid": 14,
+      "tid": 0,
+      "ts": 8091.0,
+      "dur": 44697.333,
+      "args": {
+        "task_id": 34,
+        "func_id": 0,
+        "core": 14,
+        "mc": 0,
+        "name": "GEMM"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "GEMM#72",
+      "pid": 14,
+      "tid": 0,
+      "ts": 52800.208,
+      "dur": 67940.542,
+      "args": {
+        "task_id": 72,
+        "func_id": 0,
+        "core": 14,
+        "mc": 0,
+        "name": "GEMM"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "GEMM#142",
+      "pid": 14,
+      "tid": 0,
+      "ts": 120760.958,
+      "dur": 49544.375,
+      "args": {
+        "task_id": 142,
+        "func_id": 0,
+        "core": 14,
+        "mc": 0,
+        "name": "GEMM"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "GEMM#190",
+      "pid": 14,
+      "tid": 0,
+      "ts": 170322.125,
+      "dur": 33391.208,
+      "args": {
+        "task_id": 190,
+        "func_id": 0,
+        "core": 14,
+        "mc": 0,
+        "name": "GEMM"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "GEMM#220",
+      "pid": 14,
+      "tid": 0,
+      "ts": 203725.041,
+      "dur": 46147.375,
+      "args": {
+        "task_id": 220,
+        "func_id": 0,
+        "core": 14,
+        "mc": 0,
+        "name": "GEMM"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "GEMM#270",
+      "pid": 14,
+      "tid": 0,
+      "ts": 249898.833,
+      "dur": 47645.667,
+      "args": {
+        "task_id": 270,
+        "func_id": 0,
+        "core": 14,
+        "mc": 0,
+        "name": "GEMM"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "GEMM#314",
+      "pid": 14,
+      "tid": 0,
+      "ts": 297595.958,
+      "dur": 67813.917,
+      "args": {
+        "task_id": 314,
+        "func_id": 0,
+        "core": 14,
+        "mc": 0,
+        "name": "GEMM"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "GEMM#388",
+      "pid": 14,
+      "tid": 0,
+      "ts": 365449.666,
+      "dur": 32143.292,
+      "args": {
+        "task_id": 388,
+        "func_id": 0,
+        "core": 14,
+        "mc": 0,
+        "name": "GEMM"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "GEMM#414",
+      "pid": 14,
+      "tid": 0,
+      "ts": 397609.541,
+      "dur": 75845.375,
+      "args": {
+        "task_id": 414,
+        "func_id": 0,
+        "core": 14,
+        "mc": 0,
+        "name": "GEMM"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "GEMM#36",
+      "pid": 15,
+      "tid": 0,
+      "ts": 8435.333,
+      "dur": 46579.292,
+      "args": {
+        "task_id": 36,
+        "func_id": 0,
+        "core": 15,
+        "mc": 0,
+        "name": "GEMM"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "GEMM#76",
+      "pid": 15,
+      "tid": 0,
+      "ts": 55024.208,
+      "dur": 67307.25,
+      "args": {
+        "task_id": 76,
+        "func_id": 0,
+        "core": 15,
+        "mc": 0,
+        "name": "GEMM"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "GEMM#146",
+      "pid": 15,
+      "tid": 0,
+      "ts": 122352.041,
+      "dur": 32488.375,
+      "args": {
+        "task_id": 146,
+        "func_id": 0,
+        "core": 15,
+        "mc": 0,
+        "name": "GEMM"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "GEMM#174",
+      "pid": 15,
+      "tid": 0,
+      "ts": 154850.125,
+      "dur": 63847.0,
+      "args": {
+        "task_id": 174,
+        "func_id": 0,
+        "core": 15,
+        "mc": 0,
+        "name": "GEMM"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "GEMM#242",
+      "pid": 15,
+      "tid": 0,
+      "ts": 218722.791,
+      "dur": 42984.542,
+      "args": {
+        "task_id": 242,
+        "func_id": 0,
+        "core": 15,
+        "mc": 0,
+        "name": "GEMM"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "GEMM#284",
+      "pid": 15,
+      "tid": 0,
+      "ts": 261752.333,
+      "dur": 43674.542,
+      "args": {
+        "task_id": 284,
+        "func_id": 0,
+        "core": 15,
+        "mc": 0,
+        "name": "GEMM"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "GEMM#326",
+      "pid": 15,
+      "tid": 0,
+      "ts": 305468.5,
+      "dur": 58419.375,
+      "args": {
+        "task_id": 326,
+        "func_id": 0,
+        "core": 15,
+        "mc": 0,
+        "name": "GEMM"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "GEMM#386",
+      "pid": 15,
+      "tid": 0,
+      "ts": 363921.166,
+      "dur": 46999.917,
+      "args": {
+        "task_id": 386,
+        "func_id": 0,
+        "core": 15,
+        "mc": 0,
+        "name": "GEMM"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "GEMM#428",
+      "pid": 15,
+      "tid": 0,
+      "ts": 410947.0,
+      "dur": 19617.041,
+      "args": {
+        "task_id": 428,
+        "func_id": 0,
+        "core": 15,
+        "mc": 0,
+        "name": "GEMM"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "GEMM#452",
+      "pid": 15,
+      "tid": 0,
+      "ts": 430580.333,
+      "dur": 49961.542,
+      "args": {
+        "task_id": 452,
+        "func_id": 0,
+        "core": 15,
+        "mc": 0,
+        "name": "GEMM"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "GEMM#0",
+      "pid": 16,
+      "tid": 0,
+      "ts": 211.041,
+      "dur": 23758.375,
+      "args": {
+        "task_id": 0,
+        "func_id": 0,
+        "core": 16,
+        "mc": 0,
+        "name": "GEMM"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "GEMM#48",
+      "pid": 16,
+      "tid": 0,
+      "ts": 23978.041,
+      "dur": 80379.584,
+      "args": {
+        "task_id": 48,
+        "func_id": 0,
+        "core": 16,
+        "mc": 0,
+        "name": "GEMM"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "GEMM#124",
+      "pid": 16,
+      "tid": 0,
+      "ts": 104404.041,
+      "dur": 39957.334,
+      "args": {
+        "task_id": 124,
+        "func_id": 0,
+        "core": 16,
+        "mc": 0,
+        "name": "GEMM"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "GEMM#162",
+      "pid": 16,
+      "tid": 0,
+      "ts": 144374.75,
+      "dur": 45530.541,
+      "args": {
+        "task_id": 162,
+        "func_id": 0,
+        "core": 16,
+        "mc": 0,
+        "name": "GEMM"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "GEMM#208",
+      "pid": 16,
+      "tid": 0,
+      "ts": 189924.125,
+      "dur": 27883.25,
+      "args": {
+        "task_id": 208,
+        "func_id": 0,
+        "core": 16,
+        "mc": 0,
+        "name": "GEMM"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "GEMM#240",
+      "pid": 16,
+      "tid": 0,
+      "ts": 217832.916,
+      "dur": 102498.709,
+      "args": {
+        "task_id": 240,
+        "func_id": 0,
+        "core": 16,
+        "mc": 0,
+        "name": "GEMM"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "GEMM#338",
+      "pid": 16,
+      "tid": 0,
+      "ts": 320378.625,
+      "dur": 41655.208,
+      "args": {
+        "task_id": 338,
+        "func_id": 0,
+        "core": 16,
+        "mc": 0,
+        "name": "GEMM"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "GEMM#384",
+      "pid": 16,
+      "tid": 0,
+      "ts": 362060.208,
+      "dur": 65543.75,
+      "args": {
+        "task_id": 384,
+        "func_id": 0,
+        "core": 16,
+        "mc": 0,
+        "name": "GEMM"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "GEMM#444",
+      "pid": 16,
+      "tid": 0,
+      "ts": 427640.958,
+      "dur": 44199.917,
+      "args": {
+        "task_id": 444,
+        "func_id": 0,
+        "core": 16,
+        "mc": 0,
+        "name": "GEMM"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "GEMM#30",
+      "pid": 17,
+      "tid": 0,
+      "ts": 7518.833,
+      "dur": 68115.583,
+      "args": {
+        "task_id": 30,
+        "func_id": 0,
+        "core": 17,
+        "mc": 0,
+        "name": "GEMM"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "GEMM#98",
+      "pid": 17,
+      "tid": 0,
+      "ts": 75647.791,
+      "dur": 51076.542,
+      "args": {
+        "task_id": 98,
+        "func_id": 0,
+        "core": 17,
+        "mc": 0,
+        "name": "GEMM"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "GEMM#150",
+      "pid": 17,
+      "tid": 0,
+      "ts": 126763.083,
+      "dur": 23869.917,
+      "args": {
+        "task_id": 150,
+        "func_id": 0,
+        "core": 17,
+        "mc": 0,
+        "name": "GEMM"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "GEMM#168",
+      "pid": 17,
+      "tid": 0,
+      "ts": 150649.875,
+      "dur": 55761.0,
+      "args": {
+        "task_id": 168,
+        "func_id": 0,
+        "core": 17,
+        "mc": 0,
+        "name": "GEMM"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "GEMM#224",
+      "pid": 17,
+      "tid": 0,
+      "ts": 206432.041,
+      "dur": 53413.459,
+      "args": {
+        "task_id": 224,
+        "func_id": 0,
+        "core": 17,
+        "mc": 0,
+        "name": "GEMM"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "GEMM#282",
+      "pid": 17,
+      "tid": 0,
+      "ts": 259871.791,
+      "dur": 43916.459,
+      "args": {
+        "task_id": 282,
+        "func_id": 0,
+        "core": 17,
+        "mc": 0,
+        "name": "GEMM"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "GEMM#324",
+      "pid": 17,
+      "tid": 0,
+      "ts": 303809.416,
+      "dur": 56398.584,
+      "args": {
+        "task_id": 324,
+        "func_id": 0,
+        "core": 17,
+        "mc": 0,
+        "name": "GEMM"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "GEMM#382",
+      "pid": 17,
+      "tid": 0,
+      "ts": 360264.666,
+      "dur": 19591.959,
+      "args": {
+        "task_id": 382,
+        "func_id": 0,
+        "core": 17,
+        "mc": 0,
+        "name": "GEMM"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "GEMM#394",
+      "pid": 17,
+      "tid": 0,
+      "ts": 379864.541,
+      "dur": 77727.625,
+      "args": {
+        "task_id": 394,
+        "func_id": 0,
+        "core": 17,
+        "mc": 0,
+        "name": "GEMM"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "GEMM#472",
+      "pid": 17,
+      "tid": 0,
+      "ts": 457698.708,
+      "dur": 14770.875,
+      "args": {
+        "task_id": 472,
+        "func_id": 0,
+        "core": 17,
+        "mc": 0,
+        "name": "GEMM"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "GEMM#50",
+      "pid": 18,
+      "tid": 0,
+      "ts": 24296.083,
+      "dur": 44538.417,
+      "args": {
+        "task_id": 50,
+        "func_id": 0,
+        "core": 18,
+        "mc": 0,
+        "name": "GEMM"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "GEMM#86",
+      "pid": 18,
+      "tid": 0,
+      "ts": 68843.5,
+      "dur": 41773.25,
+      "args": {
+        "task_id": 86,
+        "func_id": 0,
+        "core": 18,
+        "mc": 0,
+        "name": "GEMM"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "GEMM#130",
+      "pid": 18,
+      "tid": 0,
+      "ts": 110645.458,
+      "dur": 45140.25,
+      "args": {
+        "task_id": 130,
+        "func_id": 0,
+        "core": 18,
+        "mc": 0,
+        "name": "GEMM"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "GEMM#178",
+      "pid": 18,
+      "tid": 0,
+      "ts": 155800.958,
+      "dur": 27484.208,
+      "args": {
+        "task_id": 178,
+        "func_id": 0,
+        "core": 18,
+        "mc": 0,
+        "name": "GEMM"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "GEMM#200",
+      "pid": 18,
+      "tid": 0,
+      "ts": 183294.541,
+      "dur": 56959.667,
+      "args": {
+        "task_id": 200,
+        "func_id": 0,
+        "core": 18,
+        "mc": 0,
+        "name": "GEMM"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "GEMM#260",
+      "pid": 18,
+      "tid": 0,
+      "ts": 240278.625,
+      "dur": 31319.625,
+      "args": {
+        "task_id": 260,
+        "func_id": 0,
+        "core": 18,
+        "mc": 0,
+        "name": "GEMM"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "GEMM#294",
+      "pid": 18,
+      "tid": 0,
+      "ts": 271613.958,
+      "dur": 54718.167,
+      "args": {
+        "task_id": 294,
+        "func_id": 0,
+        "core": 18,
+        "mc": 0,
+        "name": "GEMM"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "GEMM#342",
+      "pid": 18,
+      "tid": 0,
+      "ts": 326356.875,
+      "dur": 30769.25,
+      "args": {
+        "task_id": 342,
+        "func_id": 0,
+        "core": 18,
+        "mc": 0,
+        "name": "GEMM"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "GEMM#376",
+      "pid": 18,
+      "tid": 0,
+      "ts": 357150.041,
+      "dur": 64067.75,
+      "args": {
+        "task_id": 376,
+        "func_id": 0,
+        "core": 18,
+        "mc": 0,
+        "name": "GEMM"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "GEMM#438",
+      "pid": 18,
+      "tid": 0,
+      "ts": 421259.291,
+      "dur": 30580.084,
+      "args": {
+        "task_id": 438,
+        "func_id": 0,
+        "core": 18,
+        "mc": 0,
+        "name": "GEMM"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "GEMM#462",
+      "pid": 18,
+      "tid": 0,
+      "ts": 451857.666,
+      "dur": 41557.084,
+      "args": {
+        "task_id": 462,
+        "func_id": 0,
+        "core": 18,
+        "mc": 0,
+        "name": "GEMM"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "GEMM#16",
+      "pid": 19,
+      "tid": 0,
+      "ts": 3581.291,
+      "dur": 56266.375,
+      "args": {
+        "task_id": 16,
+        "func_id": 0,
+        "core": 19,
+        "mc": 0,
+        "name": "GEMM"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "GEMM#80",
+      "pid": 19,
+      "tid": 0,
+      "ts": 59865.166,
+      "dur": 41697.125,
+      "args": {
+        "task_id": 80,
+        "func_id": 0,
+        "core": 19,
+        "mc": 0,
+        "name": "GEMM"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "GEMM#120",
+      "pid": 19,
+      "tid": 0,
+      "ts": 101586.125,
+      "dur": 84889.541,
+      "args": {
+        "task_id": 120,
+        "func_id": 0,
+        "core": 19,
+        "mc": 0,
+        "name": "GEMM"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "GEMM#202",
+      "pid": 19,
+      "tid": 0,
+      "ts": 186504.833,
+      "dur": 27330.0,
+      "args": {
+        "task_id": 202,
+        "func_id": 0,
+        "core": 19,
+        "mc": 0,
+        "name": "GEMM"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "GEMM#234",
+      "pid": 19,
+      "tid": 0,
+      "ts": 213847.625,
+      "dur": 53531.5,
+      "args": {
+        "task_id": 234,
+        "func_id": 0,
+        "core": 19,
+        "mc": 0,
+        "name": "GEMM"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "GEMM#292",
+      "pid": 19,
+      "tid": 0,
+      "ts": 267409.291,
+      "dur": 44948.584,
+      "args": {
+        "task_id": 292,
+        "func_id": 0,
+        "core": 19,
+        "mc": 0,
+        "name": "GEMM"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "GEMM#334",
+      "pid": 19,
+      "tid": 0,
+      "ts": 312381.375,
+      "dur": 21283.416,
+      "args": {
+        "task_id": 334,
+        "func_id": 0,
+        "core": 19,
+        "mc": 0,
+        "name": "GEMM"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "GEMM#350",
+      "pid": 19,
+      "tid": 0,
+      "ts": 333674.958,
+      "dur": 66841.417,
+      "args": {
+        "task_id": 350,
+        "func_id": 0,
+        "core": 19,
+        "mc": 0,
+        "name": "GEMM"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "GEMM#416",
+      "pid": 19,
+      "tid": 0,
+      "ts": 400554.541,
+      "dur": 27569.042,
+      "args": {
+        "task_id": 416,
+        "func_id": 0,
+        "core": 19,
+        "mc": 0,
+        "name": "GEMM"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "GEMM#448",
+      "pid": 19,
+      "tid": 0,
+      "ts": 428145.125,
+      "dur": 55158.958,
+      "args": {
+        "task_id": 448,
+        "func_id": 0,
+        "core": 19,
+        "mc": 0,
+        "name": "GEMM"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "GEMM#8",
+      "pid": 20,
+      "tid": 0,
+      "ts": 465.416,
+      "dur": 13702.542,
+      "args": {
+        "task_id": 8,
+        "func_id": 0,
+        "core": 20,
+        "mc": 0,
+        "name": "GEMM"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "GEMM#40",
+      "pid": 20,
+      "tid": 0,
+      "ts": 14176.0,
+      "dur": 37223.958,
+      "args": {
+        "task_id": 40,
+        "func_id": 0,
+        "core": 20,
+        "mc": 0,
+        "name": "GEMM"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "GEMM#68",
+      "pid": 20,
+      "tid": 0,
+      "ts": 51413.291,
+      "dur": 90006.667,
+      "args": {
+        "task_id": 68,
+        "func_id": 0,
+        "core": 20,
+        "mc": 0,
+        "name": "GEMM"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "GEMM#160",
+      "pid": 20,
+      "tid": 0,
+      "ts": 141484.041,
+      "dur": 40144.834,
+      "args": {
+        "task_id": 160,
+        "func_id": 0,
+        "core": 20,
+        "mc": 0,
+        "name": "GEMM"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "GEMM#198",
+      "pid": 20,
+      "tid": 0,
+      "ts": 181641.625,
+      "dur": 56219.666,
+      "args": {
+        "task_id": 198,
+        "func_id": 0,
+        "core": 20,
+        "mc": 0,
+        "name": "GEMM"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "GEMM#256",
+      "pid": 20,
+      "tid": 0,
+      "ts": 237919.041,
+      "dur": 63216.042,
+      "args": {
+        "task_id": 256,
+        "func_id": 0,
+        "core": 20,
+        "mc": 0,
+        "name": "GEMM"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "GEMM#322",
+      "pid": 20,
+      "tid": 0,
+      "ts": 301167.833,
+      "dur": 25547.458,
+      "args": {
+        "task_id": 322,
+        "func_id": 0,
+        "core": 20,
+        "mc": 0,
+        "name": "GEMM"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "GEMM#344",
+      "pid": 20,
+      "tid": 0,
+      "ts": 326741.541,
+      "dur": 32550.584,
+      "args": {
+        "task_id": 344,
+        "func_id": 0,
+        "core": 20,
+        "mc": 0,
+        "name": "GEMM"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "GEMM#378",
+      "pid": 20,
+      "tid": 0,
+      "ts": 359330.25,
+      "dur": 49324.25,
+      "args": {
+        "task_id": 378,
+        "func_id": 0,
+        "core": 20,
+        "mc": 0,
+        "name": "GEMM"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "GEMM#426",
+      "pid": 20,
+      "tid": 0,
+      "ts": 408685.208,
+      "dur": 65099.917,
+      "args": {
+        "task_id": 426,
+        "func_id": 0,
+        "core": 20,
+        "mc": 0,
+        "name": "GEMM"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "GEMM#22",
+      "pid": 21,
+      "tid": 0,
+      "ts": 4797.25,
+      "dur": 76004.583,
+      "args": {
+        "task_id": 22,
+        "func_id": 0,
+        "core": 21,
+        "mc": 0,
+        "name": "GEMM"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "GEMM#106",
+      "pid": 21,
+      "tid": 0,
+      "ts": 80818.208,
+      "dur": 49925.542,
+      "args": {
+        "task_id": 106,
+        "func_id": 0,
+        "core": 21,
+        "mc": 0,
+        "name": "GEMM"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "GEMM#154",
+      "pid": 21,
+      "tid": 0,
+      "ts": 130770.916,
+      "dur": 61550.0,
+      "args": {
+        "task_id": 154,
+        "func_id": 0,
+        "core": 21,
+        "mc": 0,
+        "name": "GEMM"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "GEMM#210",
+      "pid": 21,
+      "tid": 0,
+      "ts": 192342.541,
+      "dur": 33872.5,
+      "args": {
+        "task_id": 210,
+        "func_id": 0,
+        "core": 21,
+        "mc": 0,
+        "name": "GEMM"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "GEMM#248",
+      "pid": 21,
+      "tid": 0,
+      "ts": 226231.375,
+      "dur": 57675.458,
+      "args": {
+        "task_id": 248,
+        "func_id": 0,
+        "core": 21,
+        "mc": 0,
+        "name": "GEMM"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "GEMM#306",
+      "pid": 21,
+      "tid": 0,
+      "ts": 283934.75,
+      "dur": 65088.833,
+      "args": {
+        "task_id": 306,
+        "func_id": 0,
+        "core": 21,
+        "mc": 0,
+        "name": "GEMM"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "GEMM#370",
+      "pid": 21,
+      "tid": 0,
+      "ts": 349058.666,
+      "dur": 38469.625,
+      "args": {
+        "task_id": 370,
+        "func_id": 0,
+        "core": 21,
+        "mc": 0,
+        "name": "GEMM"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "GEMM#404",
+      "pid": 21,
+      "tid": 0,
+      "ts": 387548.583,
+      "dur": 48652.375,
+      "args": {
+        "task_id": 404,
+        "func_id": 0,
+        "core": 21,
+        "mc": 0,
+        "name": "GEMM"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "GEMM#460",
+      "pid": 21,
+      "tid": 0,
+      "ts": 436242.416,
+      "dur": 41012.542,
+      "args": {
+        "task_id": 460,
+        "func_id": 0,
+        "core": 21,
+        "mc": 0,
+        "name": "GEMM"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "GEMM#2",
+      "pid": 22,
+      "tid": 0,
+      "ts": 243.041,
+      "dur": 42271.042,
+      "args": {
+        "task_id": 2,
+        "func_id": 0,
+        "core": 22,
+        "mc": 0,
+        "name": "GEMM"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "GEMM#64",
+      "pid": 22,
+      "tid": 0,
+      "ts": 42526.208,
+      "dur": 52081.75,
+      "args": {
+        "task_id": 64,
+        "func_id": 0,
+        "core": 22,
+        "mc": 0,
+        "name": "GEMM"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "GEMM#114",
+      "pid": 22,
+      "tid": 0,
+      "ts": 94619.625,
+      "dur": 60903.666,
+      "args": {
+        "task_id": 114,
+        "func_id": 0,
+        "core": 22,
+        "mc": 0,
+        "name": "GEMM"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "GEMM#176",
+      "pid": 22,
+      "tid": 0,
+      "ts": 155564.375,
+      "dur": 47788.875,
+      "args": {
+        "task_id": 176,
+        "func_id": 0,
+        "core": 22,
+        "mc": 0,
+        "name": "GEMM"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "GEMM#218",
+      "pid": 22,
+      "tid": 0,
+      "ts": 203369.75,
+      "dur": 35371.583,
+      "args": {
+        "task_id": 218,
+        "func_id": 0,
+        "core": 22,
+        "mc": 0,
+        "name": "GEMM"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "GEMM#258",
+      "pid": 22,
+      "tid": 0,
+      "ts": 238759.041,
+      "dur": 44863.792,
+      "args": {
+        "task_id": 258,
+        "func_id": 0,
+        "core": 22,
+        "mc": 0,
+        "name": "GEMM"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "GEMM#302",
+      "pid": 22,
+      "tid": 0,
+      "ts": 283645.0,
+      "dur": 33383.041,
+      "args": {
+        "task_id": 302,
+        "func_id": 0,
+        "core": 22,
+        "mc": 0,
+        "name": "GEMM"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "GEMM#336",
+      "pid": 22,
+      "tid": 0,
+      "ts": 317045.583,
+      "dur": 83948.833,
+      "args": {
+        "task_id": 336,
+        "func_id": 0,
+        "core": 22,
+        "mc": 0,
+        "name": "GEMM"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "GEMM#420",
+      "pid": 22,
+      "tid": 0,
+      "ts": 401085.958,
+      "dur": 56362.833,
+      "args": {
+        "task_id": 420,
+        "func_id": 0,
+        "core": 22,
+        "mc": 0,
+        "name": "GEMM"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "GEMM#470",
+      "pid": 22,
+      "tid": 0,
+      "ts": 457514.75,
+      "dur": 27396.041,
+      "args": {
+        "task_id": 470,
+        "func_id": 0,
+        "core": 22,
+        "mc": 0,
+        "name": "GEMM"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "GEMM#18",
+      "pid": 23,
+      "tid": 0,
+      "ts": 4074.041,
+      "dur": 74989.334,
+      "args": {
+        "task_id": 18,
+        "func_id": 0,
+        "core": 23,
+        "mc": 0,
+        "name": "GEMM"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "GEMM#104",
+      "pid": 23,
+      "tid": 0,
+      "ts": 79107.541,
+      "dur": 20165.25,
+      "args": {
+        "task_id": 104,
+        "func_id": 0,
+        "core": 23,
+        "mc": 0,
+        "name": "GEMM"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "GEMM#116",
+      "pid": 23,
+      "tid": 0,
+      "ts": 99277.125,
+      "dur": 63374.166,
+      "args": {
+        "task_id": 116,
+        "func_id": 0,
+        "core": 23,
+        "mc": 0,
+        "name": "GEMM"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "GEMM#184",
+      "pid": 23,
+      "tid": 0,
+      "ts": 162673.083,
+      "dur": 68465.917,
+      "args": {
+        "task_id": 184,
+        "func_id": 0,
+        "core": 23,
+        "mc": 0,
+        "name": "GEMM"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "GEMM#250",
+      "pid": 23,
+      "tid": 0,
+      "ts": 231165.5,
+      "dur": 48580.5,
+      "args": {
+        "task_id": 250,
+        "func_id": 0,
+        "core": 23,
+        "mc": 0,
+        "name": "GEMM"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "GEMM#300",
+      "pid": 23,
+      "tid": 0,
+      "ts": 279769.583,
+      "dur": 58075.625,
+      "args": {
+        "task_id": 300,
+        "func_id": 0,
+        "core": 23,
+        "mc": 0,
+        "name": "GEMM"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "GEMM#354",
+      "pid": 23,
+      "tid": 0,
+      "ts": 337874.916,
+      "dur": 73526.0,
+      "args": {
+        "task_id": 354,
+        "func_id": 0,
+        "core": 23,
+        "mc": 0,
+        "name": "GEMM"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "GEMM#432",
+      "pid": 23,
+      "tid": 0,
+      "ts": 411488.541,
+      "dur": 23106.0,
+      "args": {
+        "task_id": 432,
+        "func_id": 0,
+        "core": 23,
+        "mc": 0,
+        "name": "GEMM"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "GEMM#458",
+      "pid": 23,
+      "tid": 0,
+      "ts": 434612.333,
+      "dur": 53234.667,
+      "args": {
+        "task_id": 458,
+        "func_id": 0,
+        "core": 23,
+        "mc": 0,
+        "name": "GEMM"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "ADD#67",
+      "pid": 0,
+      "tid": 1,
+      "ts": 108424.833,
+      "dur": 661.958,
+      "args": {
+        "task_id": 67,
+        "func_id": 1,
+        "core": 24,
+        "mc": 0,
+        "name": "ADD"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "ADD#69",
+      "pid": 0,
+      "tid": 1,
+      "ts": 141488.541,
+      "dur": 335.709,
+      "args": {
+        "task_id": 69,
+        "func_id": 1,
+        "core": 24,
+        "mc": 0,
+        "name": "ADD"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "ADD#71",
+      "pid": 0,
+      "tid": 1,
+      "ts": 141827.375,
+      "dur": 215.291,
+      "args": {
+        "task_id": 71,
+        "func_id": 1,
+        "core": 24,
+        "mc": 0,
+        "name": "ADD"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "ADD#357",
+      "pid": 0,
+      "tid": 1,
+      "ts": 384519.25,
+      "dur": 254.125,
+      "args": {
+        "task_id": 357,
+        "func_id": 1,
+        "core": 24,
+        "mc": 0,
+        "name": "ADD"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "ADD#393",
+      "pid": 0,
+      "tid": 1,
+      "ts": 419629.5,
+      "dur": 272.916,
+      "args": {
+        "task_id": 393,
+        "func_id": 1,
+        "core": 24,
+        "mc": 0,
+        "name": "ADD"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "ADD#391",
+      "pid": 0,
+      "tid": 1,
+      "ts": 435066.958,
+      "dur": 132.583,
+      "args": {
+        "task_id": 391,
+        "func_id": 1,
+        "core": 24,
+        "mc": 0,
+        "name": "ADD"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "ADD#133",
+      "pid": 0,
+      "tid": 2,
+      "ts": 153331.208,
+      "dur": 479.167,
+      "args": {
+        "task_id": 133,
+        "func_id": 1,
+        "core": 25,
+        "mc": 0,
+        "name": "ADD"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "ADD#137",
+      "pid": 0,
+      "tid": 2,
+      "ts": 184318.958,
+      "dur": 238.333,
+      "args": {
+        "task_id": 137,
+        "func_id": 1,
+        "core": 25,
+        "mc": 0,
+        "name": "ADD"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "ADD#135",
+      "pid": 0,
+      "tid": 2,
+      "ts": 184558.166,
+      "dur": 213.459,
+      "args": {
+        "task_id": 135,
+        "func_id": 1,
+        "core": 25,
+        "mc": 0,
+        "name": "ADD"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "ADD#397",
+      "pid": 0,
+      "tid": 2,
+      "ts": 408414.333,
+      "dur": 136.458,
+      "args": {
+        "task_id": 397,
+        "func_id": 1,
+        "core": 25,
+        "mc": 0,
+        "name": "ADD"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "ADD#429",
+      "pid": 0,
+      "tid": 2,
+      "ts": 435059.0,
+      "dur": 126.625,
+      "args": {
+        "task_id": 429,
+        "func_id": 1,
+        "core": 25,
+        "mc": 0,
+        "name": "ADD"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "ADD#431",
+      "pid": 0,
+      "tid": 2,
+      "ts": 435186.583,
+      "dur": 99.583,
+      "args": {
+        "task_id": 431,
+        "func_id": 1,
+        "core": 25,
+        "mc": 0,
+        "name": "ADD"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "ADD#229",
+      "pid": 1,
+      "tid": 1,
+      "ts": 285148.5,
+      "dur": 240.458,
+      "args": {
+        "task_id": 229,
+        "func_id": 1,
+        "core": 26,
+        "mc": 0,
+        "name": "ADD"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "ADD#231",
+      "pid": 1,
+      "tid": 1,
+      "ts": 285389.458,
+      "dur": 96.792,
+      "args": {
+        "task_id": 231,
+        "func_id": 1,
+        "core": 26,
+        "mc": 0,
+        "name": "ADD"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "ADD#233",
+      "pid": 1,
+      "tid": 1,
+      "ts": 285487.125,
+      "dur": 110.541,
+      "args": {
+        "task_id": 233,
+        "func_id": 1,
+        "core": 26,
+        "mc": 0,
+        "name": "ADD"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "ADD#57",
+      "pid": 1,
+      "tid": 2,
+      "ts": 50585.041,
+      "dur": 404.042,
+      "args": {
+        "task_id": 57,
+        "func_id": 1,
+        "core": 27,
+        "mc": 0,
+        "name": "ADD"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "ADD#59",
+      "pid": 1,
+      "tid": 2,
+      "ts": 86413.5,
+      "dur": 220.916,
+      "args": {
+        "task_id": 59,
+        "func_id": 1,
+        "core": 27,
+        "mc": 0,
+        "name": "ADD"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "ADD#55",
+      "pid": 1,
+      "tid": 2,
+      "ts": 109363.875,
+      "dur": 97.25,
+      "args": {
+        "task_id": 55,
+        "func_id": 1,
+        "core": 27,
+        "mc": 0,
+        "name": "ADD"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "ADD#329",
+      "pid": 1,
+      "tid": 2,
+      "ts": 336349.166,
+      "dur": 2710.459,
+      "args": {
+        "task_id": 329,
+        "func_id": 1,
+        "core": 27,
+        "mc": 0,
+        "name": "ADD"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "ADD#301",
+      "pid": 1,
+      "tid": 2,
+      "ts": 339060.083,
+      "dur": 232.5,
+      "args": {
+        "task_id": 301,
+        "func_id": 1,
+        "core": 27,
+        "mc": 0,
+        "name": "ADD"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "ADD#365",
+      "pid": 1,
+      "tid": 2,
+      "ts": 401726.583,
+      "dur": 134.125,
+      "args": {
+        "task_id": 365,
+        "func_id": 1,
+        "core": 27,
+        "mc": 0,
+        "name": "ADD"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "ADD#49",
+      "pid": 2,
+      "tid": 1,
+      "ts": 108367.75,
+      "dur": 757.458,
+      "args": {
+        "task_id": 49,
+        "func_id": 1,
+        "core": 28,
+        "mc": 0,
+        "name": "ADD"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "ADD#51",
+      "pid": 2,
+      "tid": 1,
+      "ts": 109125.666,
+      "dur": 96.834,
+      "args": {
+        "task_id": 51,
+        "func_id": 1,
+        "core": 28,
+        "mc": 0,
+        "name": "ADD"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "ADD#53",
+      "pid": 2,
+      "tid": 1,
+      "ts": 109223.833,
+      "dur": 111.042,
+      "args": {
+        "task_id": 53,
+        "func_id": 1,
+        "core": 28,
+        "mc": 0,
+        "name": "ADD"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "ADD#359",
+      "pid": 2,
+      "tid": 1,
+      "ts": 391132.708,
+      "dur": 131.792,
+      "args": {
+        "task_id": 359,
+        "func_id": 1,
+        "core": 28,
+        "mc": 0,
+        "name": "ADD"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "ADD#361",
+      "pid": 2,
+      "tid": 1,
+      "ts": 391264.791,
+      "dur": 129.417,
+      "args": {
+        "task_id": 361,
+        "func_id": 1,
+        "core": 28,
+        "mc": 0,
+        "name": "ADD"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "ADD#363",
+      "pid": 2,
+      "tid": 1,
+      "ts": 391397.833,
+      "dur": 98.5,
+      "args": {
+        "task_id": 363,
+        "func_id": 1,
+        "core": 28,
+        "mc": 0,
+        "name": "ADD"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "ADD#261",
+      "pid": 2,
+      "tid": 2,
+      "ts": 274247.25,
+      "dur": 515.625,
+      "args": {
+        "task_id": 261,
+        "func_id": 1,
+        "core": 29,
+        "mc": 0,
+        "name": "ADD"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "ADD#263",
+      "pid": 2,
+      "tid": 2,
+      "ts": 291234.625,
+      "dur": 303.375,
+      "args": {
+        "task_id": 263,
+        "func_id": 1,
+        "core": 29,
+        "mc": 0,
+        "name": "ADD"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "ADD#259",
+      "pid": 2,
+      "tid": 2,
+      "ts": 307523.458,
+      "dur": 102.333,
+      "args": {
+        "task_id": 259,
+        "func_id": 1,
+        "core": 29,
+        "mc": 0,
+        "name": "ADD"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "ADD#273",
+      "pid": 3,
+      "tid": 1,
+      "ts": 320994.583,
+      "dur": 472.875,
+      "args": {
+        "task_id": 273,
+        "func_id": 1,
+        "core": 30,
+        "mc": 0,
+        "name": "ADD"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "ADD#275",
+      "pid": 3,
+      "tid": 1,
+      "ts": 321468.0,
+      "dur": 218.041,
+      "args": {
+        "task_id": 275,
+        "func_id": 1,
+        "core": 30,
+        "mc": 0,
+        "name": "ADD"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "ADD#277",
+      "pid": 3,
+      "tid": 1,
+      "ts": 321688.041,
+      "dur": 236.5,
+      "args": {
+        "task_id": 277,
+        "func_id": 1,
+        "core": 30,
+        "mc": 0,
+        "name": "ADD"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "ADD#139",
+      "pid": 3,
+      "tid": 2,
+      "ts": 202315.708,
+      "dur": 399.625,
+      "args": {
+        "task_id": 139,
+        "func_id": 1,
+        "core": 31,
+        "mc": 0,
+        "name": "ADD"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "ADD#141",
+      "pid": 3,
+      "tid": 2,
+      "ts": 202715.75,
+      "dur": 233.833,
+      "args": {
+        "task_id": 141,
+        "func_id": 1,
+        "core": 31,
+        "mc": 0,
+        "name": "ADD"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "ADD#143",
+      "pid": 3,
+      "tid": 2,
+      "ts": 202953.541,
+      "dur": 284.709,
+      "args": {
+        "task_id": 143,
+        "func_id": 1,
+        "core": 31,
+        "mc": 0,
+        "name": "ADD"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "ADD#449",
+      "pid": 3,
+      "tid": 2,
+      "ts": 484212.416,
+      "dur": 450.584,
+      "args": {
+        "task_id": 449,
+        "func_id": 1,
+        "core": 31,
+        "mc": 0,
+        "name": "ADD"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "ADD#451",
+      "pid": 3,
+      "tid": 2,
+      "ts": 484663.458,
+      "dur": 215.75,
+      "args": {
+        "task_id": 451,
+        "func_id": 1,
+        "core": 31,
+        "mc": 0,
+        "name": "ADD"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "ADD#453",
+      "pid": 3,
+      "tid": 2,
+      "ts": 484882.166,
+      "dur": 236.417,
+      "args": {
+        "task_id": 453,
+        "func_id": 1,
+        "core": 31,
+        "mc": 0,
+        "name": "ADD"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "ADD#285",
+      "pid": 4,
+      "tid": 1,
+      "ts": 307561.833,
+      "dur": 404.708,
+      "args": {
+        "task_id": 285,
+        "func_id": 1,
+        "core": 32,
+        "mc": 0,
+        "name": "ADD"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "ADD#287",
+      "pid": 4,
+      "tid": 1,
+      "ts": 310037.791,
+      "dur": 100.167,
+      "args": {
+        "task_id": 287,
+        "func_id": 1,
+        "core": 32,
+        "mc": 0,
+        "name": "ADD"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "ADD#283",
+      "pid": 4,
+      "tid": 1,
+      "ts": 320624.166,
+      "dur": 329.334,
+      "args": {
+        "task_id": 283,
+        "func_id": 1,
+        "core": 32,
+        "mc": 0,
+        "name": "ADD"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "ADD#115",
+      "pid": 4,
+      "tid": 2,
+      "ts": 163293.25,
+      "dur": 405.416,
+      "args": {
+        "task_id": 115,
+        "func_id": 1,
+        "core": 33,
+        "mc": 0,
+        "name": "ADD"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "ADD#117",
+      "pid": 4,
+      "tid": 2,
+      "ts": 163699.291,
+      "dur": 239.709,
+      "args": {
+        "task_id": 117,
+        "func_id": 1,
+        "core": 33,
+        "mc": 0,
+        "name": "ADD"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "ADD#119",
+      "pid": 4,
+      "tid": 2,
+      "ts": 184303.25,
+      "dur": 217.125,
+      "args": {
+        "task_id": 119,
+        "func_id": 1,
+        "core": 33,
+        "mc": 0,
+        "name": "ADD"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "ADD#413",
+      "pid": 4,
+      "tid": 2,
+      "ts": 473828.083,
+      "dur": 122.708,
+      "args": {
+        "task_id": 413,
+        "func_id": 1,
+        "core": 33,
+        "mc": 0,
+        "name": "ADD"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "ADD#411",
+      "pid": 4,
+      "tid": 2,
+      "ts": 473951.0,
+      "dur": 96.375,
+      "args": {
+        "task_id": 411,
+        "func_id": 1,
+        "core": 33,
+        "mc": 0,
+        "name": "ADD"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "ADD#427",
+      "pid": 4,
+      "tid": 2,
+      "ts": 474048.833,
+      "dur": 96.333,
+      "args": {
+        "task_id": 427,
+        "func_id": 1,
+        "core": 33,
+        "mc": 0,
+        "name": "ADD"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "ADD#213",
+      "pid": 5,
+      "tid": 1,
+      "ts": 209078.25,
+      "dur": 226.25,
+      "args": {
+        "task_id": 213,
+        "func_id": 1,
+        "core": 34,
+        "mc": 0,
+        "name": "ADD"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "ADD#215",
+      "pid": 5,
+      "tid": 1,
+      "ts": 255441.625,
+      "dur": 219.291,
+      "args": {
+        "task_id": 215,
+        "func_id": 1,
+        "core": 34,
+        "mc": 0,
+        "name": "ADD"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "ADD#211",
+      "pid": 5,
+      "tid": 1,
+      "ts": 258939.958,
+      "dur": 109.958,
+      "args": {
+        "task_id": 211,
+        "func_id": 1,
+        "core": 34,
+        "mc": 0,
+        "name": "ADD"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "ADD#471",
+      "pid": 5,
+      "tid": 1,
+      "ts": 488975.291,
+      "dur": 99.709,
+      "args": {
+        "task_id": 471,
+        "func_id": 1,
+        "core": 34,
+        "mc": 0,
+        "name": "ADD"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "ADD#73",
+      "pid": 5,
+      "tid": 2,
+      "ts": 121273.875,
+      "dur": 415.791,
+      "args": {
+        "task_id": 73,
+        "func_id": 1,
+        "core": 35,
+        "mc": 0,
+        "name": "ADD"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "ADD#75",
+      "pid": 5,
+      "tid": 2,
+      "ts": 121690.416,
+      "dur": 213.584,
+      "args": {
+        "task_id": 75,
+        "func_id": 1,
+        "core": 35,
+        "mc": 0,
+        "name": "ADD"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "ADD#77",
+      "pid": 5,
+      "tid": 2,
+      "ts": 124383.0,
+      "dur": 359.458,
+      "args": {
+        "task_id": 77,
+        "func_id": 1,
+        "core": 35,
+        "mc": 0,
+        "name": "ADD"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "ADD#373",
+      "pid": 5,
+      "tid": 2,
+      "ts": 401703.875,
+      "dur": 264.666,
+      "args": {
+        "task_id": 373,
+        "func_id": 1,
+        "core": 35,
+        "mc": 0,
+        "name": "ADD"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "ADD#371",
+      "pid": 5,
+      "tid": 2,
+      "ts": 424346.25,
+      "dur": 244.75,
+      "args": {
+        "task_id": 371,
+        "func_id": 1,
+        "core": 35,
+        "mc": 0,
+        "name": "ADD"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "ADD#379",
+      "pid": 5,
+      "tid": 2,
+      "ts": 424796.583,
+      "dur": 283.583,
+      "args": {
+        "task_id": 379,
+        "func_id": 1,
+        "core": 35,
+        "mc": 0,
+        "name": "ADD"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "ADD#295",
+      "pid": 6,
+      "tid": 1,
+      "ts": 326371.583,
+      "dur": 234.917,
+      "args": {
+        "task_id": 295,
+        "func_id": 1,
+        "core": 36,
+        "mc": 0,
+        "name": "ADD"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "ADD#297",
+      "pid": 6,
+      "tid": 1,
+      "ts": 352397.708,
+      "dur": 245.292,
+      "args": {
+        "task_id": 297,
+        "func_id": 1,
+        "core": 36,
+        "mc": 0,
+        "name": "ADD"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "ADD#299",
+      "pid": 6,
+      "tid": 1,
+      "ts": 362772.708,
+      "dur": 213.292,
+      "args": {
+        "task_id": 299,
+        "func_id": 1,
+        "core": 36,
+        "mc": 0,
+        "name": "ADD"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "ADD#163",
+      "pid": 6,
+      "tid": 2,
+      "ts": 191363.625,
+      "dur": 405.625,
+      "args": {
+        "task_id": 163,
+        "func_id": 1,
+        "core": 37,
+        "mc": 0,
+        "name": "ADD"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "ADD#165",
+      "pid": 6,
+      "tid": 2,
+      "ts": 202234.583,
+      "dur": 253.375,
+      "args": {
+        "task_id": 165,
+        "func_id": 1,
+        "core": 37,
+        "mc": 0,
+        "name": "ADD"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "ADD#167",
+      "pid": 6,
+      "tid": 2,
+      "ts": 236709.958,
+      "dur": 357.542,
+      "args": {
+        "task_id": 167,
+        "func_id": 1,
+        "core": 37,
+        "mc": 0,
+        "name": "ADD"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "ADD#435",
+      "pid": 6,
+      "tid": 2,
+      "ts": 457045.25,
+      "dur": 99.75,
+      "args": {
+        "task_id": 435,
+        "func_id": 1,
+        "core": 37,
+        "mc": 0,
+        "name": "ADD"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "ADD#445",
+      "pid": 6,
+      "tid": 2,
+      "ts": 474227.125,
+      "dur": 117.583,
+      "args": {
+        "task_id": 445,
+        "func_id": 1,
+        "core": 37,
+        "mc": 0,
+        "name": "ADD"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "ADD#97",
+      "pid": 7,
+      "tid": 1,
+      "ts": 102170.333,
+      "dur": 454.375,
+      "args": {
+        "task_id": 97,
+        "func_id": 1,
+        "core": 38,
+        "mc": 0,
+        "name": "ADD"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "ADD#99",
+      "pid": 7,
+      "tid": 1,
+      "ts": 126762.5,
+      "dur": 100.166,
+      "args": {
+        "task_id": 99,
+        "func_id": 1,
+        "core": 38,
+        "mc": 0,
+        "name": "ADD"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "ADD#101",
+      "pid": 7,
+      "tid": 1,
+      "ts": 173283.166,
+      "dur": 256.375,
+      "args": {
+        "task_id": 101,
+        "func_id": 1,
+        "core": 38,
+        "mc": 0,
+        "name": "ADD"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "ADD#343",
+      "pid": 7,
+      "tid": 1,
+      "ts": 374145.75,
+      "dur": 101.708,
+      "args": {
+        "task_id": 343,
+        "func_id": 1,
+        "core": 38,
+        "mc": 0,
+        "name": "ADD"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "ADD#383",
+      "pid": 7,
+      "tid": 1,
+      "ts": 424452.583,
+      "dur": 104.25,
+      "args": {
+        "task_id": 383,
+        "func_id": 1,
+        "core": 38,
+        "mc": 0,
+        "name": "ADD"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "ADD#421",
+      "pid": 7,
+      "tid": 1,
+      "ts": 457527.333,
+      "dur": 118.458,
+      "args": {
+        "task_id": 421,
+        "func_id": 1,
+        "core": 38,
+        "mc": 0,
+        "name": "ADD"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "ADD#145",
+      "pid": 7,
+      "tid": 2,
+      "ts": 137317.375,
+      "dur": 502.333,
+      "args": {
+        "task_id": 145,
+        "func_id": 1,
+        "core": 39,
+        "mc": 0,
+        "name": "ADD"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "ADD#149",
+      "pid": 7,
+      "tid": 2,
+      "ts": 157669.625,
+      "dur": 188.041,
+      "args": {
+        "task_id": 149,
+        "func_id": 1,
+        "core": 39,
+        "mc": 0,
+        "name": "ADD"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "ADD#147",
+      "pid": 7,
+      "tid": 2,
+      "ts": 157858.583,
+      "dur": 98.167,
+      "args": {
+        "task_id": 147,
+        "func_id": 1,
+        "core": 39,
+        "mc": 0,
+        "name": "ADD"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "ADD#389",
+      "pid": 7,
+      "tid": 2,
+      "ts": 401801.5,
+      "dur": 135.125,
+      "args": {
+        "task_id": 389,
+        "func_id": 1,
+        "core": 39,
+        "mc": 0,
+        "name": "ADD"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "ADD#405",
+      "pid": 7,
+      "tid": 2,
+      "ts": 440873.083,
+      "dur": 123.875,
+      "args": {
+        "task_id": 405,
+        "func_id": 1,
+        "core": 39,
+        "mc": 0,
+        "name": "ADD"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "ADD#407",
+      "pid": 7,
+      "tid": 2,
+      "ts": 462774.25,
+      "dur": 100.541,
+      "args": {
+        "task_id": 407,
+        "func_id": 1,
+        "core": 39,
+        "mc": 0,
+        "name": "ADD"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "ADD#129",
+      "pid": 8,
+      "tid": 1,
+      "ts": 163317.583,
+      "dur": 497.375,
+      "args": {
+        "task_id": 129,
+        "func_id": 1,
+        "core": 40,
+        "mc": 0,
+        "name": "ADD"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "ADD#131",
+      "pid": 8,
+      "tid": 1,
+      "ts": 163816.875,
+      "dur": 216.0,
+      "args": {
+        "task_id": 131,
+        "func_id": 1,
+        "core": 40,
+        "mc": 0,
+        "name": "ADD"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "ADD#127",
+      "pid": 8,
+      "tid": 1,
+      "ts": 191908.458,
+      "dur": 118.0,
+      "args": {
+        "task_id": 127,
+        "func_id": 1,
+        "core": 40,
+        "mc": 0,
+        "name": "ADD"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "ADD#417",
+      "pid": 8,
+      "tid": 1,
+      "ts": 435231.916,
+      "dur": 119.334,
+      "args": {
+        "task_id": 417,
+        "func_id": 1,
+        "core": 40,
+        "mc": 0,
+        "name": "ADD"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "ADD#415",
+      "pid": 8,
+      "tid": 1,
+      "ts": 474183.041,
+      "dur": 102.542,
+      "args": {
+        "task_id": 415,
+        "func_id": 1,
+        "core": 40,
+        "mc": 0,
+        "name": "ADD"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "ADD#437",
+      "pid": 8,
+      "tid": 1,
+      "ts": 484540.333,
+      "dur": 242.875,
+      "args": {
+        "task_id": 437,
+        "func_id": 1,
+        "core": 40,
+        "mc": 0,
+        "name": "ADD"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "ADD#21",
+      "pid": 8,
+      "tid": 2,
+      "ts": 62493.25,
+      "dur": 402.416,
+      "args": {
+        "task_id": 21,
+        "func_id": 1,
+        "core": 41,
+        "mc": 0,
+        "name": "ADD"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "ADD#23",
+      "pid": 8,
+      "tid": 2,
+      "ts": 86414.541,
+      "dur": 223.834,
+      "args": {
+        "task_id": 23,
+        "func_id": 1,
+        "core": 41,
+        "mc": 0,
+        "name": "ADD"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "ADD#19",
+      "pid": 8,
+      "tid": 2,
+      "ts": 91656.416,
+      "dur": 99.042,
+      "args": {
+        "task_id": 19,
+        "func_id": 1,
+        "core": 41,
+        "mc": 0,
+        "name": "ADD"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "ADD#327",
+      "pid": 8,
+      "tid": 2,
+      "ts": 373356.0,
+      "dur": 265.291,
+      "args": {
+        "task_id": 327,
+        "func_id": 1,
+        "core": 41,
+        "mc": 0,
+        "name": "ADD"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "ADD#315",
+      "pid": 8,
+      "tid": 2,
+      "ts": 373621.708,
+      "dur": 213.333,
+      "args": {
+        "task_id": 315,
+        "func_id": 1,
+        "core": 41,
+        "mc": 0,
+        "name": "ADD"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "ADD#341",
+      "pid": 8,
+      "tid": 2,
+      "ts": 373842.5,
+      "dur": 237.708,
+      "args": {
+        "task_id": 341,
+        "func_id": 1,
+        "core": 41,
+        "mc": 0,
+        "name": "ADD"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "ADD#1",
+      "pid": 9,
+      "tid": 1,
+      "ts": 24333.541,
+      "dur": 227.875,
+      "args": {
+        "task_id": 1,
+        "func_id": 1,
+        "core": 42,
+        "mc": 0,
+        "name": "ADD"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "ADD#5",
+      "pid": 9,
+      "tid": 1,
+      "ts": 24562.208,
+      "dur": 113.167,
+      "args": {
+        "task_id": 5,
+        "func_id": 1,
+        "core": 42,
+        "mc": 0,
+        "name": "ADD"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "ADD#3",
+      "pid": 9,
+      "tid": 1,
+      "ts": 51072.291,
+      "dur": 232.125,
+      "args": {
+        "task_id": 3,
+        "func_id": 1,
+        "core": 42,
+        "mc": 0,
+        "name": "ADD"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "ADD#281",
+      "pid": 9,
+      "tid": 1,
+      "ts": 310506.958,
+      "dur": 113.125,
+      "args": {
+        "task_id": 281,
+        "func_id": 1,
+        "core": 42,
+        "mc": 0,
+        "name": "ADD"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "ADD#279",
+      "pid": 9,
+      "tid": 1,
+      "ts": 324567.041,
+      "dur": 201.5,
+      "args": {
+        "task_id": 279,
+        "func_id": 1,
+        "core": 42,
+        "mc": 0,
+        "name": "ADD"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "ADD#303",
+      "pid": 9,
+      "tid": 1,
+      "ts": 340543.208,
+      "dur": 262.5,
+      "args": {
+        "task_id": 303,
+        "func_id": 1,
+        "core": 42,
+        "mc": 0,
+        "name": "ADD"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "ADD#85",
+      "pid": 9,
+      "tid": 2,
+      "ts": 74452.25,
+      "dur": 452.291,
+      "args": {
+        "task_id": 85,
+        "func_id": 1,
+        "core": 43,
+        "mc": 0,
+        "name": "ADD"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "ADD#89",
+      "pid": 9,
+      "tid": 2,
+      "ts": 108444.833,
+      "dur": 262.833,
+      "args": {
+        "task_id": 89,
+        "func_id": 1,
+        "core": 43,
+        "mc": 0,
+        "name": "ADD"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "ADD#87",
+      "pid": 9,
+      "tid": 2,
+      "ts": 110636.333,
+      "dur": 100.708,
+      "args": {
+        "task_id": 87,
+        "func_id": 1,
+        "core": 43,
+        "mc": 0,
+        "name": "ADD"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "ADD#325",
+      "pid": 9,
+      "tid": 2,
+      "ts": 362394.833,
+      "dur": 251.958,
+      "args": {
+        "task_id": 325,
+        "func_id": 1,
+        "core": 43,
+        "mc": 0,
+        "name": "ADD"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "ADD#367",
+      "pid": 9,
+      "tid": 2,
+      "ts": 408417.166,
+      "dur": 103.375,
+      "args": {
+        "task_id": 367,
+        "func_id": 1,
+        "core": 43,
+        "mc": 0,
+        "name": "ADD"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "ADD#355",
+      "pid": 9,
+      "tid": 2,
+      "ts": 419526.416,
+      "dur": 241.0,
+      "args": {
+        "task_id": 355,
+        "func_id": 1,
+        "core": 43,
+        "mc": 0,
+        "name": "ADD"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "ADD#237",
+      "pid": 10,
+      "tid": 1,
+      "ts": 255385.0,
+      "dur": 445.166,
+      "args": {
+        "task_id": 237,
+        "func_id": 1,
+        "core": 44,
+        "mc": 0,
+        "name": "ADD"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "ADD#239",
+      "pid": 10,
+      "tid": 1,
+      "ts": 270738.833,
+      "dur": 244.833,
+      "args": {
+        "task_id": 239,
+        "func_id": 1,
+        "core": 44,
+        "mc": 0,
+        "name": "ADD"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "ADD#235",
+      "pid": 10,
+      "tid": 1,
+      "ts": 291130.333,
+      "dur": 100.292,
+      "args": {
+        "task_id": 235,
+        "func_id": 1,
+        "core": 44,
+        "mc": 0,
+        "name": "ADD"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "ADD#169",
+      "pid": 10,
+      "tid": 2,
+      "ts": 206709.375,
+      "dur": 217.75,
+      "args": {
+        "task_id": 169,
+        "func_id": 1,
+        "core": 45,
+        "mc": 0,
+        "name": "ADD"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "ADD#171",
+      "pid": 10,
+      "tid": 2,
+      "ts": 206927.25,
+      "dur": 96.958,
+      "args": {
+        "task_id": 171,
+        "func_id": 1,
+        "core": 45,
+        "mc": 0,
+        "name": "ADD"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "ADD#173",
+      "pid": 10,
+      "tid": 2,
+      "ts": 217176.75,
+      "dur": 256.333,
+      "args": {
+        "task_id": 173,
+        "func_id": 1,
+        "core": 45,
+        "mc": 0,
+        "name": "ADD"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "ADD#461",
+      "pid": 10,
+      "tid": 2,
+      "ts": 484195.083,
+      "dur": 353.083,
+      "args": {
+        "task_id": 461,
+        "func_id": 1,
+        "core": 45,
+        "mc": 0,
+        "name": "ADD"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "ADD#473",
+      "pid": 10,
+      "tid": 2,
+      "ts": 484550.5,
+      "dur": 234.166,
+      "args": {
+        "task_id": 473,
+        "func_id": 1,
+        "core": 45,
+        "mc": 0,
+        "name": "ADD"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "ADD#459",
+      "pid": 10,
+      "tid": 2,
+      "ts": 488296.958,
+      "dur": 250.375,
+      "args": {
+        "task_id": 459,
+        "func_id": 1,
+        "core": 45,
+        "mc": 0,
+        "name": "ADD"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "ADD#13",
+      "pid": 11,
+      "tid": 1,
+      "ts": 91204.333,
+      "dur": 236.875,
+      "args": {
+        "task_id": 13,
+        "func_id": 1,
+        "core": 46,
+        "mc": 0,
+        "name": "ADD"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "ADD#15",
+      "pid": 11,
+      "tid": 1,
+      "ts": 91441.5,
+      "dur": 96.166,
+      "args": {
+        "task_id": 15,
+        "func_id": 1,
+        "core": 46,
+        "mc": 0,
+        "name": "ADD"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "ADD#17",
+      "pid": 11,
+      "tid": 1,
+      "ts": 91539.083,
+      "dur": 115.0,
+      "args": {
+        "task_id": 17,
+        "func_id": 1,
+        "core": 46,
+        "mc": 0,
+        "name": "ADD"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "ADD#335",
+      "pid": 11,
+      "tid": 1,
+      "ts": 362462.916,
+      "dur": 221.834,
+      "args": {
+        "task_id": 335,
+        "func_id": 1,
+        "core": 46,
+        "mc": 0,
+        "name": "ADD"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "ADD#337",
+      "pid": 11,
+      "tid": 1,
+      "ts": 401813.416,
+      "dur": 124.459,
+      "args": {
+        "task_id": 337,
+        "func_id": 1,
+        "core": 46,
+        "mc": 0,
+        "name": "ADD"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "ADD#339",
+      "pid": 11,
+      "tid": 1,
+      "ts": 401940.916,
+      "dur": 98.25,
+      "args": {
+        "task_id": 339,
+        "func_id": 1,
+        "core": 46,
+        "mc": 0,
+        "name": "ADD"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "ADD#189",
+      "pid": 11,
+      "tid": 2,
+      "ts": 191017.5,
+      "dur": 1002.791,
+      "args": {
+        "task_id": 189,
+        "func_id": 1,
+        "core": 47,
+        "mc": 0,
+        "name": "ADD"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "ADD#191",
+      "pid": 11,
+      "tid": 2,
+      "ts": 207548.458,
+      "dur": 106.708,
+      "args": {
+        "task_id": 191,
+        "func_id": 1,
+        "core": 47,
+        "mc": 0,
+        "name": "ADD"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "ADD#187",
+      "pid": 11,
+      "tid": 2,
+      "ts": 241400.333,
+      "dur": 104.458,
+      "args": {
+        "task_id": 187,
+        "func_id": 1,
+        "core": 47,
+        "mc": 0,
+        "name": "ADD"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "ADD#443",
+      "pid": 11,
+      "tid": 2,
+      "ts": 484804.458,
+      "dur": 231.958,
+      "args": {
+        "task_id": 443,
+        "func_id": 1,
+        "core": 47,
+        "mc": 0,
+        "name": "ADD"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "ADD#465",
+      "pid": 11,
+      "tid": 2,
+      "ts": 496858.958,
+      "dur": 119.375,
+      "args": {
+        "task_id": 465,
+        "func_id": 1,
+        "core": 47,
+        "mc": 0,
+        "name": "ADD"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "ADD#81",
+      "pid": 12,
+      "tid": 1,
+      "ts": 102164.166,
+      "dur": 474.417,
+      "args": {
+        "task_id": 81,
+        "func_id": 1,
+        "core": 48,
+        "mc": 0,
+        "name": "ADD"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "ADD#83",
+      "pid": 12,
+      "tid": 1,
+      "ts": 124371.083,
+      "dur": 603.0,
+      "args": {
+        "task_id": 83,
+        "func_id": 1,
+        "core": 48,
+        "mc": 0,
+        "name": "ADD"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "ADD#79",
+      "pid": 12,
+      "tid": 1,
+      "ts": 137344.208,
+      "dur": 234.458,
+      "args": {
+        "task_id": 79,
+        "func_id": 1,
+        "core": 48,
+        "mc": 0,
+        "name": "ADD"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "ADD#345",
+      "pid": 12,
+      "tid": 1,
+      "ts": 362372.25,
+      "dur": 255.041,
+      "args": {
+        "task_id": 345,
+        "func_id": 1,
+        "core": 48,
+        "mc": 0,
+        "name": "ADD"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "ADD#381",
+      "pid": 12,
+      "tid": 1,
+      "ts": 419599.125,
+      "dur": 262.0,
+      "args": {
+        "task_id": 381,
+        "func_id": 1,
+        "core": 48,
+        "mc": 0,
+        "name": "ADD"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "ADD#387",
+      "pid": 12,
+      "tid": 1,
+      "ts": 440859.958,
+      "dur": 106.5,
+      "args": {
+        "task_id": 387,
+        "func_id": 1,
+        "core": 48,
+        "mc": 0,
+        "name": "ADD"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "ADD#153",
+      "pid": 12,
+      "tid": 2,
+      "ts": 153300.166,
+      "dur": 473.0,
+      "args": {
+        "task_id": 153,
+        "func_id": 1,
+        "core": 49,
+        "mc": 0,
+        "name": "ADD"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "ADD#151",
+      "pid": 12,
+      "tid": 2,
+      "ts": 164116.416,
+      "dur": 270.0,
+      "args": {
+        "task_id": 151,
+        "func_id": 1,
+        "core": 49,
+        "mc": 0,
+        "name": "ADD"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "ADD#155",
+      "pid": 12,
+      "tid": 2,
+      "ts": 202287.375,
+      "dur": 246.458,
+      "args": {
+        "task_id": 155,
+        "func_id": 1,
+        "core": 49,
+        "mc": 0,
+        "name": "ADD"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "ADD#395",
+      "pid": 12,
+      "tid": 2,
+      "ts": 457688.833,
+      "dur": 326.417,
+      "args": {
+        "task_id": 395,
+        "func_id": 1,
+        "core": 49,
+        "mc": 0,
+        "name": "ADD"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "ADD#419",
+      "pid": 12,
+      "tid": 2,
+      "ts": 474325.083,
+      "dur": 177.333,
+      "args": {
+        "task_id": 419,
+        "func_id": 1,
+        "core": 49,
+        "mc": 0,
+        "name": "ADD"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "ADD#447",
+      "pid": 12,
+      "tid": 2,
+      "ts": 487007.916,
+      "dur": 221.709,
+      "args": {
+        "task_id": 447,
+        "func_id": 1,
+        "core": 49,
+        "mc": 0,
+        "name": "ADD"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "ADD#37",
+      "pid": 13,
+      "tid": 1,
+      "ts": 60552.833,
+      "dur": 402.708,
+      "args": {
+        "task_id": 37,
+        "func_id": 1,
+        "core": 50,
+        "mc": 0,
+        "name": "ADD"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "ADD#39",
+      "pid": 13,
+      "tid": 1,
+      "ts": 60956.208,
+      "dur": 211.208,
+      "args": {
+        "task_id": 39,
+        "func_id": 1,
+        "core": 50,
+        "mc": 0,
+        "name": "ADD"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "ADD#41",
+      "pid": 13,
+      "tid": 1,
+      "ts": 61170.75,
+      "dur": 231.916,
+      "args": {
+        "task_id": 41,
+        "func_id": 1,
+        "core": 50,
+        "mc": 0,
+        "name": "ADD"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "ADD#305",
+      "pid": 13,
+      "tid": 1,
+      "ts": 391086.125,
+      "dur": 254.375,
+      "args": {
+        "task_id": 305,
+        "func_id": 1,
+        "core": 50,
+        "mc": 0,
+        "name": "ADD"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "ADD#307",
+      "pid": 13,
+      "tid": 1,
+      "ts": 391341.0,
+      "dur": 217.583,
+      "args": {
+        "task_id": 307,
+        "func_id": 1,
+        "core": 50,
+        "mc": 0,
+        "name": "ADD"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "ADD#309",
+      "pid": 13,
+      "tid": 1,
+      "ts": 391564.375,
+      "dur": 235.916,
+      "args": {
+        "task_id": 309,
+        "func_id": 1,
+        "core": 50,
+        "mc": 0,
+        "name": "ADD"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "ADD#91",
+      "pid": 13,
+      "tid": 2,
+      "ts": 111174.25,
+      "dur": 232.5,
+      "args": {
+        "task_id": 91,
+        "func_id": 1,
+        "core": 51,
+        "mc": 0,
+        "name": "ADD"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "ADD#93",
+      "pid": 13,
+      "tid": 2,
+      "ts": 121870.416,
+      "dur": 234.584,
+      "args": {
+        "task_id": 93,
+        "func_id": 1,
+        "core": 51,
+        "mc": 0,
+        "name": "ADD"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "ADD#95",
+      "pid": 13,
+      "tid": 2,
+      "ts": 122106.791,
+      "dur": 210.875,
+      "args": {
+        "task_id": 95,
+        "func_id": 1,
+        "core": 51,
+        "mc": 0,
+        "name": "ADD"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "ADD#375",
+      "pid": 13,
+      "tid": 2,
+      "ts": 408348.583,
+      "dur": 274.417,
+      "args": {
+        "task_id": 375,
+        "func_id": 1,
+        "core": 51,
+        "mc": 0,
+        "name": "ADD"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "ADD#369",
+      "pid": 13,
+      "tid": 2,
+      "ts": 420571.291,
+      "dur": 272.625,
+      "args": {
+        "task_id": 369,
+        "func_id": 1,
+        "core": 51,
+        "mc": 0,
+        "name": "ADD"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "ADD#377",
+      "pid": 13,
+      "tid": 2,
+      "ts": 424629.25,
+      "dur": 120.125,
+      "args": {
+        "task_id": 377,
+        "func_id": 1,
+        "core": 51,
+        "mc": 0,
+        "name": "ADD"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "ADD#253",
+      "pid": 14,
+      "tid": 1,
+      "ts": 255423.75,
+      "dur": 487.5,
+      "args": {
+        "task_id": 253,
+        "func_id": 1,
+        "core": 52,
+        "mc": 0,
+        "name": "ADD"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "ADD#257",
+      "pid": 14,
+      "tid": 1,
+      "ts": 301745.375,
+      "dur": 264.458,
+      "args": {
+        "task_id": 257,
+        "func_id": 1,
+        "core": 52,
+        "mc": 0,
+        "name": "ADD"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "ADD#255",
+      "pid": 14,
+      "tid": 1,
+      "ts": 302012.166,
+      "dur": 215.0,
+      "args": {
+        "task_id": 255,
+        "func_id": 1,
+        "core": 52,
+        "mc": 0,
+        "name": "ADD"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "ADD#45",
+      "pid": 14,
+      "tid": 2,
+      "ts": 73111.375,
+      "dur": 428.791,
+      "args": {
+        "task_id": 45,
+        "func_id": 1,
+        "core": 53,
+        "mc": 0,
+        "name": "ADD"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "ADD#43",
+      "pid": 14,
+      "tid": 2,
+      "ts": 73542.0,
+      "dur": 215.25,
+      "args": {
+        "task_id": 43,
+        "func_id": 1,
+        "core": 53,
+        "mc": 0,
+        "name": "ADD"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "ADD#47",
+      "pid": 14,
+      "tid": 2,
+      "ts": 73757.833,
+      "dur": 210.417,
+      "args": {
+        "task_id": 47,
+        "func_id": 1,
+        "core": 53,
+        "mc": 0,
+        "name": "ADD"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "ADD#321",
+      "pid": 14,
+      "tid": 2,
+      "ts": 353278.666,
+      "dur": 286.084,
+      "args": {
+        "task_id": 321,
+        "func_id": 1,
+        "core": 53,
+        "mc": 0,
+        "name": "ADD"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "ADD#323",
+      "pid": 14,
+      "tid": 2,
+      "ts": 353566.75,
+      "dur": 212.583,
+      "args": {
+        "task_id": 323,
+        "func_id": 1,
+        "core": 53,
+        "mc": 0,
+        "name": "ADD"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "ADD#319",
+      "pid": 14,
+      "tid": 2,
+      "ts": 363970.208,
+      "dur": 214.208,
+      "args": {
+        "task_id": 319,
+        "func_id": 1,
+        "core": 53,
+        "mc": 0,
+        "name": "ADD"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "ADD#33",
+      "pid": 15,
+      "tid": 1,
+      "ts": 61581.083,
+      "dur": 410.75,
+      "args": {
+        "task_id": 33,
+        "func_id": 1,
+        "core": 54,
+        "mc": 0,
+        "name": "ADD"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "ADD#35",
+      "pid": 15,
+      "tid": 1,
+      "ts": 61993.291,
+      "dur": 212.0,
+      "args": {
+        "task_id": 35,
+        "func_id": 1,
+        "core": 54,
+        "mc": 0,
+        "name": "ADD"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "ADD#31",
+      "pid": 15,
+      "tid": 1,
+      "ts": 88686.625,
+      "dur": 210.875,
+      "args": {
+        "task_id": 31,
+        "func_id": 1,
+        "core": 54,
+        "mc": 0,
+        "name": "ADD"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "ADD#313",
+      "pid": 15,
+      "tid": 1,
+      "ts": 352370.041,
+      "dur": 270.75,
+      "args": {
+        "task_id": 313,
+        "func_id": 1,
+        "core": 54,
+        "mc": 0,
+        "name": "ADD"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "ADD#333",
+      "pid": 15,
+      "tid": 1,
+      "ts": 352642.625,
+      "dur": 230.541,
+      "args": {
+        "task_id": 333,
+        "func_id": 1,
+        "core": 54,
+        "mc": 0,
+        "name": "ADD"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "ADD#311",
+      "pid": 15,
+      "tid": 1,
+      "ts": 401789.5,
+      "dur": 111.125,
+      "args": {
+        "task_id": 311,
+        "func_id": 1,
+        "core": 54,
+        "mc": 0,
+        "name": "ADD"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "ADD#181",
+      "pid": 15,
+      "tid": 2,
+      "ts": 207172.5,
+      "dur": 252.458,
+      "args": {
+        "task_id": 181,
+        "func_id": 1,
+        "core": 55,
+        "mc": 0,
+        "name": "ADD"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "ADD#183",
+      "pid": 15,
+      "tid": 2,
+      "ts": 224178.166,
+      "dur": 109.417,
+      "args": {
+        "task_id": 183,
+        "func_id": 1,
+        "core": 55,
+        "mc": 0,
+        "name": "ADD"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "ADD#185",
+      "pid": 15,
+      "tid": 2,
+      "ts": 236762.541,
+      "dur": 250.959,
+      "args": {
+        "task_id": 185,
+        "func_id": 1,
+        "core": 55,
+        "mc": 0,
+        "name": "ADD"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "ADD#467",
+      "pid": 15,
+      "tid": 2,
+      "ts": 496994.208,
+      "dur": 98.75,
+      "args": {
+        "task_id": 467,
+        "func_id": 1,
+        "core": 55,
+        "mc": 0,
+        "name": "ADD"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "ADD#269",
+      "pid": 16,
+      "tid": 1,
+      "ts": 301790.583,
+      "dur": 492.417,
+      "args": {
+        "task_id": 269,
+        "func_id": 1,
+        "core": 56,
+        "mc": 0,
+        "name": "ADD"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "ADD#271",
+      "pid": 16,
+      "tid": 1,
+      "ts": 302285.291,
+      "dur": 214.0,
+      "args": {
+        "task_id": 271,
+        "func_id": 1,
+        "core": 56,
+        "mc": 0,
+        "name": "ADD"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "ADD#267",
+      "pid": 16,
+      "tid": 1,
+      "ts": 302502.583,
+      "dur": 210.542,
+      "args": {
+        "task_id": 267,
+        "func_id": 1,
+        "core": 56,
+        "mc": 0,
+        "name": "ADD"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "ADD#241",
+      "pid": 16,
+      "tid": 2,
+      "ts": 320677.666,
+      "dur": 578.084,
+      "args": {
+        "task_id": 241,
+        "func_id": 1,
+        "core": 57,
+        "mc": 0,
+        "name": "ADD"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "ADD#243",
+      "pid": 16,
+      "tid": 2,
+      "ts": 321256.375,
+      "dur": 284.125,
+      "args": {
+        "task_id": 243,
+        "func_id": 1,
+        "core": 57,
+        "mc": 0,
+        "name": "ADD"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "ADD#245",
+      "pid": 16,
+      "tid": 2,
+      "ts": 321544.541,
+      "dur": 236.542,
+      "args": {
+        "task_id": 245,
+        "func_id": 1,
+        "core": 57,
+        "mc": 0,
+        "name": "ADD"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "ADD#25",
+      "pid": 17,
+      "tid": 1,
+      "ts": 39923.625,
+      "dur": 408.458,
+      "args": {
+        "task_id": 25,
+        "func_id": 1,
+        "core": 58,
+        "mc": 0,
+        "name": "ADD"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "ADD#27",
+      "pid": 17,
+      "tid": 1,
+      "ts": 73201.25,
+      "dur": 217.958,
+      "args": {
+        "task_id": 27,
+        "func_id": 1,
+        "core": 58,
+        "mc": 0,
+        "name": "ADD"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "ADD#29",
+      "pid": 17,
+      "tid": 1,
+      "ts": 88406.75,
+      "dur": 241.083,
+      "args": {
+        "task_id": 29,
+        "func_id": 1,
+        "core": 58,
+        "mc": 0,
+        "name": "ADD"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "ADD#289",
+      "pid": 17,
+      "tid": 1,
+      "ts": 301673.75,
+      "dur": 276.791,
+      "args": {
+        "task_id": 289,
+        "func_id": 1,
+        "core": 58,
+        "mc": 0,
+        "name": "ADD"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "ADD#331",
+      "pid": 17,
+      "tid": 1,
+      "ts": 340308.208,
+      "dur": 103.625,
+      "args": {
+        "task_id": 331,
+        "func_id": 1,
+        "core": 58,
+        "mc": 0,
+        "name": "ADD"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "ADD#317",
+      "pid": 17,
+      "tid": 1,
+      "ts": 362431.541,
+      "dur": 286.042,
+      "args": {
+        "task_id": 317,
+        "func_id": 1,
+        "core": 58,
+        "mc": 0,
+        "name": "ADD"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "ADD#121",
+      "pid": 17,
+      "tid": 2,
+      "ts": 191161.333,
+      "dur": 464.958,
+      "args": {
+        "task_id": 121,
+        "func_id": 1,
+        "core": 59,
+        "mc": 0,
+        "name": "ADD"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "ADD#125",
+      "pid": 17,
+      "tid": 2,
+      "ts": 191630.5,
+      "dur": 244.791,
+      "args": {
+        "task_id": 125,
+        "func_id": 1,
+        "core": 59,
+        "mc": 0,
+        "name": "ADD"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "ADD#123",
+      "pid": 17,
+      "tid": 2,
+      "ts": 220213.25,
+      "dur": 222.416,
+      "args": {
+        "task_id": 123,
+        "func_id": 1,
+        "core": 59,
+        "mc": 0,
+        "name": "ADD"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "ADD#441",
+      "pid": 17,
+      "tid": 2,
+      "ts": 474178.416,
+      "dur": 434.709,
+      "args": {
+        "task_id": 441,
+        "func_id": 1,
+        "core": 59,
+        "mc": 0,
+        "name": "ADD"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "ADD#439",
+      "pid": 17,
+      "tid": 2,
+      "ts": 484958.208,
+      "dur": 101.208,
+      "args": {
+        "task_id": 439,
+        "func_id": 1,
+        "core": 59,
+        "mc": 0,
+        "name": "ADD"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "ADD#477",
+      "pid": 17,
+      "tid": 2,
+      "ts": 488271.916,
+      "dur": 258.0,
+      "args": {
+        "task_id": 477,
+        "func_id": 1,
+        "core": 59,
+        "mc": 0,
+        "name": "ADD"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "ADD#61",
+      "pid": 18,
+      "tid": 1,
+      "ts": 102153.041,
+      "dur": 486.292,
+      "args": {
+        "task_id": 61,
+        "func_id": 1,
+        "core": 60,
+        "mc": 0,
+        "name": "ADD"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "ADD#63",
+      "pid": 18,
+      "tid": 1,
+      "ts": 102639.625,
+      "dur": 211.291,
+      "args": {
+        "task_id": 63,
+        "func_id": 1,
+        "core": 60,
+        "mc": 0,
+        "name": "ADD"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "ADD#65",
+      "pid": 18,
+      "tid": 1,
+      "ts": 102853.0,
+      "dur": 245.708,
+      "args": {
+        "task_id": 65,
+        "func_id": 1,
+        "core": 60,
+        "mc": 0,
+        "name": "ADD"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "ADD#347",
+      "pid": 18,
+      "tid": 1,
+      "ts": 384625.916,
+      "dur": 233.667,
+      "args": {
+        "task_id": 347,
+        "func_id": 1,
+        "core": 60,
+        "mc": 0,
+        "name": "ADD"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "ADD#349",
+      "pid": 18,
+      "tid": 1,
+      "ts": 408263.458,
+      "dur": 121.833,
+      "args": {
+        "task_id": 349,
+        "func_id": 1,
+        "core": 60,
+        "mc": 0,
+        "name": "ADD"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "ADD#351",
+      "pid": 18,
+      "tid": 1,
+      "ts": 408555.5,
+      "dur": 225.458,
+      "args": {
+        "task_id": 351,
+        "func_id": 1,
+        "core": 60,
+        "mc": 0,
+        "name": "ADD"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "ADD#177",
+      "pid": 18,
+      "tid": 2,
+      "ts": 206621.583,
+      "dur": 216.333,
+      "args": {
+        "task_id": 177,
+        "func_id": 1,
+        "core": 61,
+        "mc": 0,
+        "name": "ADD"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "ADD#179",
+      "pid": 18,
+      "tid": 2,
+      "ts": 206838.5,
+      "dur": 98.458,
+      "args": {
+        "task_id": 179,
+        "func_id": 1,
+        "core": 61,
+        "mc": 0,
+        "name": "ADD"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "ADD#175",
+      "pid": 18,
+      "tid": 2,
+      "ts": 224058.375,
+      "dur": 100.291,
+      "args": {
+        "task_id": 175,
+        "func_id": 1,
+        "core": 61,
+        "mc": 0,
+        "name": "ADD"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "ADD#457",
+      "pid": 18,
+      "tid": 2,
+      "ts": 455992.125,
+      "dur": 112.708,
+      "args": {
+        "task_id": 457,
+        "func_id": 1,
+        "core": 61,
+        "mc": 0,
+        "name": "ADD"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "ADD#455",
+      "pid": 18,
+      "tid": 2,
+      "ts": 485126.083,
+      "dur": 99.958,
+      "args": {
+        "task_id": 455,
+        "func_id": 1,
+        "core": 61,
+        "mc": 0,
+        "name": "ADD"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "ADD#479",
+      "pid": 18,
+      "tid": 2,
+      "ts": 488664.0,
+      "dur": 101.625,
+      "args": {
+        "task_id": 479,
+        "func_id": 1,
+        "core": 61,
+        "mc": 0,
+        "name": "ADD"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "ADD#105",
+      "pid": 19,
+      "tid": 1,
+      "ts": 102812.875,
+      "dur": 510.5,
+      "args": {
+        "task_id": 105,
+        "func_id": 1,
+        "core": 62,
+        "mc": 0,
+        "name": "ADD"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "ADD#107",
+      "pid": 19,
+      "tid": 1,
+      "ts": 137159.25,
+      "dur": 300.25,
+      "args": {
+        "task_id": 107,
+        "func_id": 1,
+        "core": 62,
+        "mc": 0,
+        "name": "ADD"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "ADD#103",
+      "pid": 19,
+      "tid": 1,
+      "ts": 183261.791,
+      "dur": 245.875,
+      "args": {
+        "task_id": 103,
+        "func_id": 1,
+        "core": 62,
+        "mc": 0,
+        "name": "ADD"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "ADD#353",
+      "pid": 19,
+      "tid": 1,
+      "ts": 391015.75,
+      "dur": 293.166,
+      "args": {
+        "task_id": 353,
+        "func_id": 1,
+        "core": 62,
+        "mc": 0,
+        "name": "ADD"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "ADD#385",
+      "pid": 19,
+      "tid": 1,
+      "ts": 434999.458,
+      "dur": 141.0,
+      "args": {
+        "task_id": 385,
+        "func_id": 1,
+        "core": 62,
+        "mc": 0,
+        "name": "ADD"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "ADD#425",
+      "pid": 19,
+      "tid": 1,
+      "ts": 435141.458,
+      "dur": 117.625,
+      "args": {
+        "task_id": 425,
+        "func_id": 1,
+        "core": 62,
+        "mc": 0,
+        "name": "ADD"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "ADD#199",
+      "pid": 19,
+      "tid": 2,
+      "ts": 241295.25,
+      "dur": 481.208,
+      "args": {
+        "task_id": 199,
+        "func_id": 1,
+        "core": 63,
+        "mc": 0,
+        "name": "ADD"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "ADD#201",
+      "pid": 19,
+      "tid": 2,
+      "ts": 241777.916,
+      "dur": 244.0,
+      "args": {
+        "task_id": 201,
+        "func_id": 1,
+        "core": 63,
+        "mc": 0,
+        "name": "ADD"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "ADD#203",
+      "pid": 19,
+      "tid": 2,
+      "ts": 242025.375,
+      "dur": 219.083,
+      "args": {
+        "task_id": 203,
+        "func_id": 1,
+        "core": 63,
+        "mc": 0,
+        "name": "ADD"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "ADD#157",
+      "pid": 20,
+      "tid": 1,
+      "ts": 161478.916,
+      "dur": 413.709,
+      "args": {
+        "task_id": 157,
+        "func_id": 1,
+        "core": 64,
+        "mc": 0,
+        "name": "ADD"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "ADD#161",
+      "pid": 20,
+      "tid": 1,
+      "ts": 182115.625,
+      "dur": 122.708,
+      "args": {
+        "task_id": 161,
+        "func_id": 1,
+        "core": 64,
+        "mc": 0,
+        "name": "ADD"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "ADD#159",
+      "pid": 20,
+      "tid": 1,
+      "ts": 220199.125,
+      "dur": 219.166,
+      "args": {
+        "task_id": 159,
+        "func_id": 1,
+        "core": 64,
+        "mc": 0,
+        "name": "ADD"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "ADD#409",
+      "pid": 20,
+      "tid": 1,
+      "ts": 434980.833,
+      "dur": 129.375,
+      "args": {
+        "task_id": 409,
+        "func_id": 1,
+        "core": 64,
+        "mc": 0,
+        "name": "ADD"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "ADD#475",
+      "pid": 20,
+      "tid": 1,
+      "ts": 484818.75,
+      "dur": 217.75,
+      "args": {
+        "task_id": 475,
+        "func_id": 1,
+        "core": 64,
+        "mc": 0,
+        "name": "ADD"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "ADD#423",
+      "pid": 20,
+      "tid": 1,
+      "ts": 487892.375,
+      "dur": 222.25,
+      "args": {
+        "task_id": 423,
+        "func_id": 1,
+        "core": 64,
+        "mc": 0,
+        "name": "ADD"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "ADD#9",
+      "pid": 20,
+      "tid": 2,
+      "ts": 21466.833,
+      "dur": 418.5,
+      "args": {
+        "task_id": 9,
+        "func_id": 1,
+        "core": 65,
+        "mc": 0,
+        "name": "ADD"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "ADD#7",
+      "pid": 20,
+      "tid": 2,
+      "ts": 40521.208,
+      "dur": 212.875,
+      "args": {
+        "task_id": 7,
+        "func_id": 1,
+        "core": 65,
+        "mc": 0,
+        "name": "ADD"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "ADD#11",
+      "pid": 20,
+      "tid": 2,
+      "ts": 40756.916,
+      "dur": 212.292,
+      "args": {
+        "task_id": 11,
+        "func_id": 1,
+        "core": 65,
+        "mc": 0,
+        "name": "ADD"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "ADD#265",
+      "pid": 20,
+      "tid": 2,
+      "ts": 302213.333,
+      "dur": 249.167,
+      "args": {
+        "task_id": 265,
+        "func_id": 1,
+        "core": 65,
+        "mc": 0,
+        "name": "ADD"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "ADD#293",
+      "pid": 20,
+      "tid": 2,
+      "ts": 320521.291,
+      "dur": 534.042,
+      "args": {
+        "task_id": 293,
+        "func_id": 1,
+        "core": 65,
+        "mc": 0,
+        "name": "ADD"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "ADD#291",
+      "pid": 20,
+      "tid": 2,
+      "ts": 336365.5,
+      "dur": 349.0,
+      "args": {
+        "task_id": 291,
+        "func_id": 1,
+        "core": 65,
+        "mc": 0,
+        "name": "ADD"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "ADD#223",
+      "pid": 21,
+      "tid": 1,
+      "ts": 257707.083,
+      "dur": 710.0,
+      "args": {
+        "task_id": 223,
+        "func_id": 1,
+        "core": 66,
+        "mc": 0,
+        "name": "ADD"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "ADD#225",
+      "pid": 21,
+      "tid": 1,
+      "ts": 259856.916,
+      "dur": 122.084,
+      "args": {
+        "task_id": 225,
+        "func_id": 1,
+        "core": 66,
+        "mc": 0,
+        "name": "ADD"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "ADD#227",
+      "pid": 21,
+      "tid": 1,
+      "ts": 259979.75,
+      "dur": 96.041,
+      "args": {
+        "task_id": 227,
+        "func_id": 1,
+        "core": 66,
+        "mc": 0,
+        "name": "ADD"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "ADD#217",
+      "pid": 21,
+      "tid": 2,
+      "ts": 241570.791,
+      "dur": 339.125,
+      "args": {
+        "task_id": 217,
+        "func_id": 1,
+        "core": 67,
+        "mc": 0,
+        "name": "ADD"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "ADD#219",
+      "pid": 21,
+      "tid": 2,
+      "ts": 241911.041,
+      "dur": 221.917,
+      "args": {
+        "task_id": 219,
+        "func_id": 1,
+        "core": 67,
+        "mc": 0,
+        "name": "ADD"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "ADD#221",
+      "pid": 21,
+      "tid": 2,
+      "ts": 255476.333,
+      "dur": 300.708,
+      "args": {
+        "task_id": 221,
+        "func_id": 1,
+        "core": 67,
+        "mc": 0,
+        "name": "ADD"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "ADD#249",
+      "pid": 22,
+      "tid": 1,
+      "ts": 285143.333,
+      "dur": 245.083,
+      "args": {
+        "task_id": 249,
+        "func_id": 1,
+        "core": 68,
+        "mc": 0,
+        "name": "ADD"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "ADD#251",
+      "pid": 22,
+      "tid": 1,
+      "ts": 285389.166,
+      "dur": 96.667,
+      "args": {
+        "task_id": 251,
+        "func_id": 1,
+        "core": 68,
+        "mc": 0,
+        "name": "ADD"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "ADD#247",
+      "pid": 22,
+      "tid": 1,
+      "ts": 324435.458,
+      "dur": 100.208,
+      "args": {
+        "task_id": 247,
+        "func_id": 1,
+        "core": 68,
+        "mc": 0,
+        "name": "ADD"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "ADD#193",
+      "pid": 22,
+      "tid": 2,
+      "ts": 190983.875,
+      "dur": 656.5,
+      "args": {
+        "task_id": 193,
+        "func_id": 1,
+        "core": 69,
+        "mc": 0,
+        "name": "ADD"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "ADD#195",
+      "pid": 22,
+      "tid": 2,
+      "ts": 207541.75,
+      "dur": 110.041,
+      "args": {
+        "task_id": 195,
+        "func_id": 1,
+        "core": 69,
+        "mc": 0,
+        "name": "ADD"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "ADD#197",
+      "pid": 22,
+      "tid": 2,
+      "ts": 208488.666,
+      "dur": 118.959,
+      "args": {
+        "task_id": 197,
+        "func_id": 1,
+        "core": 69,
+        "mc": 0,
+        "name": "ADD"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "ADD#433",
+      "pid": 22,
+      "tid": 2,
+      "ts": 435261.333,
+      "dur": 123.708,
+      "args": {
+        "task_id": 433,
+        "func_id": 1,
+        "core": 69,
+        "mc": 0,
+        "name": "ADD"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "ADD#469",
+      "pid": 22,
+      "tid": 2,
+      "ts": 488566.708,
+      "dur": 237.083,
+      "args": {
+        "task_id": 469,
+        "func_id": 1,
+        "core": 69,
+        "mc": 0,
+        "name": "ADD"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "ADD#463",
+      "pid": 22,
+      "tid": 2,
+      "ts": 493542.916,
+      "dur": 99.584,
+      "args": {
+        "task_id": 463,
+        "func_id": 1,
+        "core": 69,
+        "mc": 0,
+        "name": "ADD"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "ADD#109",
+      "pid": 23,
+      "tid": 1,
+      "ts": 153282.25,
+      "dur": 493.0,
+      "args": {
+        "task_id": 109,
+        "func_id": 1,
+        "core": 70,
+        "mc": 0,
+        "name": "ADD"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "ADD#111",
+      "pid": 23,
+      "tid": 1,
+      "ts": 153775.875,
+      "dur": 222.083,
+      "args": {
+        "task_id": 111,
+        "func_id": 1,
+        "core": 70,
+        "mc": 0,
+        "name": "ADD"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "ADD#113",
+      "pid": 23,
+      "tid": 1,
+      "ts": 154000.208,
+      "dur": 237.458,
+      "args": {
+        "task_id": 113,
+        "func_id": 1,
+        "core": 70,
+        "mc": 0,
+        "name": "ADD"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "ADD#401",
+      "pid": 23,
+      "tid": 1,
+      "ts": 435124.541,
+      "dur": 130.459,
+      "args": {
+        "task_id": 401,
+        "func_id": 1,
+        "core": 70,
+        "mc": 0,
+        "name": "ADD"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "ADD#403",
+      "pid": 23,
+      "tid": 1,
+      "ts": 435255.666,
+      "dur": 101.5,
+      "args": {
+        "task_id": 403,
+        "func_id": 1,
+        "core": 70,
+        "mc": 0,
+        "name": "ADD"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "ADD#399",
+      "pid": 23,
+      "tid": 1,
+      "ts": 460914.541,
+      "dur": 101.792,
+      "args": {
+        "task_id": 399,
+        "func_id": 1,
+        "core": 70,
+        "mc": 0,
+        "name": "ADD"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "ADD#205",
+      "pid": 23,
+      "tid": 2,
+      "ts": 257757.791,
+      "dur": 565.167,
+      "args": {
+        "task_id": 205,
+        "func_id": 1,
+        "core": 71,
+        "mc": 0,
+        "name": "ADD"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "ADD#207",
+      "pid": 23,
+      "tid": 2,
+      "ts": 258324.208,
+      "dur": 321.167,
+      "args": {
+        "task_id": 207,
+        "func_id": 1,
+        "core": 71,
+        "mc": 0,
+        "name": "ADD"
+      }
+    },
+    {
+      "ph": "X",
+      "name": "ADD#209",
+      "pid": 23,
+      "tid": 2,
+      "ts": 258647.541,
+      "dur": 121.584,
+      "args": {
+        "task_id": 209,
+        "func_id": 1,
+        "core": 71,
+        "mc": 0,
+        "name": "ADD"
+      }
+    }
+  ]
+}

@@ -17,6 +17,8 @@
  */
 
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <pthread.h>
 
 #include "inner_kernel.h"
@@ -42,16 +44,55 @@ static pthread_key_t g_l2_swimlane_aicore_head_key;
 static pthread_key_t g_aicore_pmu_ring_key;
 static pthread_key_t g_pmu_reg_base_key;
 static pthread_once_t g_tls_once = PTHREAD_ONCE_INIT;
+// True once create_tls_keys() has successfully created ALL keys; gates the
+// unload-time delete so we never pthread_key_delete a stale/uncreated key.
+static bool g_tls_keys_ready = false;
+
+// All pthread keys owned by this DSO, in creation order. destroy_tls_keys()
+// rolls these back at unload so a per-run dlopen/dlclose cycle is net-zero on
+// the process-wide TLS key pool (see destroy_tls_keys()).
+static pthread_key_t *const g_all_keys[] = {
+    &g_reg_base_key,
+    &g_core_id_key,
+    &g_block_idx_key,
+    &g_aicore_profiling_flag_key,
+    &g_l2_swimlane_aicore_head_slot_key,
+    &g_l2_swimlane_aicore_head_key,
+    &g_aicore_pmu_ring_key,
+    &g_pmu_reg_base_key,
+};
+constexpr int kNumTlsKeys = sizeof(g_all_keys) / sizeof(g_all_keys[0]);
 
 static void create_tls_keys() {
-    pthread_key_create(&g_reg_base_key, nullptr);
-    pthread_key_create(&g_core_id_key, nullptr);
-    pthread_key_create(&g_block_idx_key, nullptr);
-    pthread_key_create(&g_aicore_profiling_flag_key, nullptr);
-    pthread_key_create(&g_l2_swimlane_aicore_head_slot_key, nullptr);
-    pthread_key_create(&g_l2_swimlane_aicore_head_key, nullptr);
-    pthread_key_create(&g_aicore_pmu_ring_key, nullptr);
-    pthread_key_create(&g_pmu_reg_base_key, nullptr);
+    for (int i = 0; i < kNumTlsKeys; i++) {
+        if (pthread_key_create(g_all_keys[i], nullptr) != 0) {
+            // The process-wide pthread key pool (PTHREAD_KEYS_MAX, 1024) is
+            // exhausted. Roll back what we created and fail loudly: silently
+            // leaving a key at 0 makes sim_get_reg_base() return NULL and
+            // crashes write_reg() on a NULL register base (hard-to-debug
+            // SIGSEGV). With destroy_tls_keys() reclaiming keys on unload this
+            // path should never be hit.
+            for (int j = 0; j < i; j++) pthread_key_delete(*g_all_keys[j]);
+            fprintf(stderr, "[aicore_sim] FATAL: pthread_key_create failed at key %d/%d — TLS key pool exhausted\n", i,
+                    kNumTlsKeys);
+            abort();
+        }
+    }
+    g_tls_keys_ready = true;
+}
+
+// Release this DSO's pthread TLS keys when it is unloaded (dlclose). The AICore
+// kernel .so is dlopen/dlclose'd once per run (device_runner.cpp reloads it
+// because the kernel binary can vary per case), and glibc does NOT reclaim a
+// DSO's pthread keys on unload. Without this, every run leaked these keys and
+// after ~PTHREAD_KEYS_MAX/kNumTlsKeys runs pthread_key_create() began failing
+// (EAGAIN), leaving the keys at 0 → sim_get_reg_base() == NULL → write_reg()
+// NULL-deref SIGSEGV mid-sweep. All AICore worker threads are joined before the
+// DSO is dlclose'd, so deleting the keys here is race-free.
+__attribute__((destructor)) static void destroy_tls_keys() {
+    if (!g_tls_keys_ready) return;
+    for (int i = 0; i < kNumTlsKeys; i++) pthread_key_delete(*g_all_keys[i]);
+    g_tls_keys_ready = false;
 }
 
 volatile uint8_t *sim_get_reg_base() { return static_cast<volatile uint8_t *>(pthread_getspecific(g_reg_base_key)); }
