@@ -47,7 +47,7 @@ def _build_chip_callable(platform: str) -> ChipCallable:
     if not platform.endswith("sim"):
         aic_bytes = extract_text_section(aic_bytes)
 
-    aic_core = CoreCallable.build(signature=[], arg_index=[], binary=aic_bytes)
+    aic_core = CoreCallable.build(signature=[], binary=aic_bytes)
     return ChipCallable.build(
         signature=[],
         func_name="aicpu_orchestration_entry",

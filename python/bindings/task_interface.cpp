@@ -386,27 +386,17 @@ NB_MODULE(_task_interface, m) {
     nb::class_<PyCoreCallable>(m, "CoreCallable")
         .def_static(
             "build",
-            [](std::vector<ArgDirection> signature, nb::bytes binary,
-               std::vector<uint32_t> arg_index) -> PyCoreCallable {
-                // arg_index is mandatory and parallel to signature (an empty
-                // signature legitimately pairs with an empty arg_index).
-                if (arg_index.size() != signature.size()) {
-                    throw std::invalid_argument(
-                        "CoreCallable.build: arg_index is required and must be parallel to signature "
-                        "(equal length)"
-                    );
-                }
+            [](std::vector<ArgDirection> signature, nb::bytes binary) -> PyCoreCallable {
                 auto bin_ptr = reinterpret_cast<const void *>(binary.c_str());
                 auto bin_size = static_cast<uint32_t>(binary.size());
                 auto buf = make_callable<CORE_MAX_TENSOR_ARGS>(
-                    signature.data(), arg_index.data(), static_cast<int32_t>(signature.size()), bin_ptr, bin_size
+                    signature.data(), static_cast<int32_t>(signature.size()), bin_ptr, bin_size
                 );
                 return PyCoreCallable{std::move(buf)};
             },
-            nb::arg("signature"), nb::arg("binary"), nb::arg("arg_index") = std::vector<uint32_t>{},
-            "Build a CoreCallable from a signature list and binary bytes. arg_index "
-            "(parallel to signature, same length) gives each tensor's absolute payload "
-            "slot for the tensor dump; required (must equal signature length)."
+            nb::arg("signature"), nb::arg("binary"),
+            "Build a CoreCallable from a signature list and binary bytes. The dump "
+            "maps signature entry i to payload slot i positionally."
         )
 
         .def(
@@ -415,14 +405,6 @@ NB_MODULE(_task_interface, m) {
                 return self.get().sig(i);
             },
             nb::arg("i"), "Return the ArgDirection at signature index i."
-        )
-
-        .def(
-            "arg_index",
-            [](const PyCoreCallable &self, int32_t i) -> uint32_t {
-                return self.get().arg_index(i);
-            },
-            nb::arg("i"), "Return the payload arg_index that signature entry i describes."
         )
 
         .def_prop_ro(

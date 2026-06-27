@@ -48,46 +48,45 @@ class TestMixedExample(SceneTestCase):
                 D.OUT,
             ],
         },
+        # No arg_index: each incore declares the FULL mix-task signature; the dump
+        # maps signature entry i to payload slot i positionally. func 0/1/2 form
+        # the 9-tensor mix (A,B,C,D,E,F,G,H,I); func 3/4 form the 6-tensor mix.
+        # Narrower tasks (standalone, 2-subtask) supply a prefix of that layout.
         "incores": [
             {
                 "func_id": 0,
                 "name": "MATMUL",
                 "source": "kernels/aic/kernel_matmul.cpp",
                 "core_type": "aic",
-                "signature": [D.IN, D.IN, D.OUT],
-                "arg_index": [0, 1, 2],
+                "signature": [D.IN, D.IN, D.OUT, D.IN, D.IN, D.OUT, D.IN, D.IN, D.OUT],
             },
             {
                 "func_id": 1,
                 "name": "ADD",
                 "source": "kernels/aiv/kernel_add.cpp",
                 "core_type": "aiv",
-                "signature": [D.IN, D.IN, D.OUT],
-                "arg_index": [3, 4, 5],
+                "signature": [D.IN, D.IN, D.OUT, D.IN, D.IN, D.OUT, D.IN, D.IN, D.OUT],
             },
             {
                 "func_id": 2,
                 "name": "MUL",
                 "source": "kernels/aiv/kernel_mul.cpp",
                 "core_type": "aiv",
-                "signature": [D.IN, D.IN, D.OUT],
-                "arg_index": [6, 7, 8],
+                "signature": [D.IN, D.IN, D.OUT, D.IN, D.IN, D.OUT, D.IN, D.IN, D.OUT],
             },
             {
                 "func_id": 3,
                 "name": "ADD_STANDALONE",
                 "source": "kernels/aiv/kernel_add_standalone.cpp",
                 "core_type": "aiv",
-                "signature": [D.IN, D.IN, D.OUT],
-                "arg_index": [0, 1, 2],
+                "signature": [D.IN, D.IN, D.OUT, D.IN, D.IN, D.OUT],
             },
             {
                 "func_id": 4,
                 "name": "MUL_STANDALONE",
                 "source": "kernels/aiv/kernel_mul_standalone.cpp",
                 "core_type": "aiv",
-                "signature": [D.IN, D.IN, D.OUT],
-                "arg_index": [3, 4, 5],
+                "signature": [D.IN, D.IN, D.OUT, D.IN, D.IN, D.OUT],
             },
         ],
     }

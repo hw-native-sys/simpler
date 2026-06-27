@@ -106,7 +106,6 @@ def build_allreduce_callable(platform: str) -> ChipCallable:
     )
     core_callable = CoreCallable.build(
         signature=[ArgDirection.IN, ArgDirection.OUT, ArgDirection.INOUT],
-        arg_index=[0, 1, 2],
         binary=kernel_bytes,
     )
     return ChipCallable.build(

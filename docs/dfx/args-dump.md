@@ -204,7 +204,7 @@ Example manifest (one input tensor captured before dispatch):
   "args": [
     {
       "task_id": "0x0000000200000a00",
-      "func_id": 0,
+      "func_id": [0],
       "role": "input",
       "stage": "before_dispatch",
       "arg_index": 0,
@@ -227,18 +227,19 @@ Key fields:
 
 - `task_id` — runtime task identity. Use to correlate with swimlane / PMU
   output.
-- `func_id` — kernel id of the subtask that declared this arg (via its
-  incore `signature` + `arg_index`). The dump walks each active subtask
-  independently, so a tensor shared by a cooperative mix is emitted **once
-  per declaring subtask**, each under its own `func_id`; the sharing is
-  recoverable as the same `(task_id, arg_index)` appearing under more than
-  one `func_id`. Scalars are stamped with the first active subtask's
-  `func_id`. `-1` when unknown (the `host_build_graph` dump path, which does
-  not thread func_id).
-- `arg_index` — payload argument index. Tensor entries use the payload
-  tensor index; scalar entries use `payload.tensor_count + scalar_index`.
-  When scalar lvalue selection matched multiple scalar slots, the selected
-  first-match scalar entry carries `arg_index_ambiguous: true`.
+- `func_id` — **array** of the task's active-subtask kernel ids (its mix
+  membership). A single-kernel task is `[N]`; a cooperative or packed mix is
+  `[i, j, ...]` (one entry per active subtask). The dump emits each payload
+  tensor **once** with this array, so a mix is recoverable by grouping on
+  `task_id` and reading the func set. `[-1]` when unknown (the
+  `host_build_graph` dump path, which does not thread func_id). Note: the
+  array is the task's mix set, **not** a claim that each listed kernel reads
+  this specific slot.
+- `arg_index` — payload argument index (the slot this tensor occupies).
+  Tensor entries use the payload tensor index; scalar entries use
+  `payload.tensor_count + scalar_index`. When scalar lvalue selection matched
+  multiple scalar slots, the selected first-match scalar entry carries
+  `arg_index_ambiguous: true`.
 - `role` / `stage` — `input` / `output` / `inout`, captured
   `before_dispatch` / `after_completion`.
 - `kind` — `tensor` for arena-backed payloads, `scalar` for
@@ -283,22 +284,26 @@ spreadsheet.
 
 ### 3.4 Add dump support to a new test
 
-For `tensormap_and_ringbuffer`, each incore declares two parallel,
-equal-length arrays in its `CALLABLE` entry — `signature` (each
-tensor's `ArgDirection`) and `arg_index` (the absolute payload slot it
-maps to). The dump reads them to give every captured tensor a direction
-(which sets its capture stage) and a `func_id`; geometry (shape, dtype,
-strides) is still derived automatically from the payload. `arg_index`
-is mandatory and must equal `signature` in length — `CoreCallable.build`
-raises otherwise. A tensor shared by a cooperative mix is declared by
-every subtask that uses it, and dumped once per subtask.
+For `tensormap_and_ringbuffer`, each incore declares a `signature` (each
+tensor's `ArgDirection`) in its `CALLABLE` entry. The dump maps signature
+entry `i` to payload tensor slot `i` **positionally** — there is no
+`arg_index`. The signature gives every captured tensor a direction (which
+sets its capture stage); geometry (shape, dtype, strides) is derived
+automatically from the payload.
+
+The signature must cover the task's full payload: for a **mix task**
+(multiple subtasks sharing one `args[]`) every cooperating incore declares
+the **complete** task signature, in payload order. A narrower task that
+dispatches only a prefix of that layout (e.g. a standalone kernel, or a
+2-subtask mix of a 3-subtask shape) supplies a prefix — the dump records
+the slots present and skips the rest. The dump is driven by the **widest**
+active subtask's signature, so at least one cooperating incore must declare
+the full-width layout.
 
 A `signature` usually lists only tensor directions — scalars are
 independent (added via `add_scalar`) and are typically omitted. If a
-`SCALAR` direction *is* listed it must come after every tensor entry;
-the dump skips `SCALAR` entries and `arg_index` indexes only the tensor
-payload, so a scalar entry's `arg_index` value is immaterial (it exists
-only to keep the two arrays equal-length).
+`SCALAR` direction *is* listed it must come after every tensor entry; the
+dump skips `SCALAR` entries (they do not consume a positional tensor slot).
 
 `host_build_graph` has no incore signatures, so it needs explicit
 `TensorInfo` wiring instead (geometry is still automatic):
@@ -424,22 +429,22 @@ Each runtime's scheduler dispatch code calls
 └──────────────────────────────────────┘
 ```
 
-`dump_args_for_task` walks **each active subtask's** callable
-signature. For each non-scalar entry it reads the parallel `arg_index`
-to locate the absolute payload tensor slot that entry describes, builds
-a `TensorDumpInfo` (dtype + shape + strides + start offset + device
-address) for that slot, and calls `dump_arg_record` for entries whose
-role matches the current stage — stamping each record with that
-subtask's `func_id`. A tensor shared by a cooperative mix is thus
-emitted once per declaring subtask, each under its own `func_id`. A
-declared `arg_index` beyond the payload is skipped with a warning
-(memory safety); payload slots that no subtask declares are left
-undumped with a soft completeness warning. (The `host_build_graph` dump
-path is a separate overload that maps each signature entry to its slot
-positionally and stamps `func_id = -1`.) Scalar values are dumped
-separately from the flat payload `scalars[]`, once per task (stamped
-with the first active subtask's `func_id`); their dtype table is
-registered at submit time and emitted as a dump-only metadata record at
+`dump_args_for_task` first collects the task's active-subtask kernel ids
+(the `func_id` array), then walks the **widest active subtask's** callable
+signature **once**. Signature entry `i` maps to payload tensor slot `i`
+positionally; for each non-scalar entry it builds a `TensorDumpInfo`
+(dtype + shape + strides + start offset + device address) for that slot
+and calls `dump_arg_record` for entries whose role matches the current
+stage — stamping every record with the **whole** func_id array. Each
+payload tensor is thus emitted **once** (not duplicated per subtask); a
+mix is recoverable as the func set carried on each slot. A signature entry
+beyond the payload is skipped (memory safety — a prefix-dispatched task);
+payload slots the signature does not reach are left undumped with a soft
+completeness warning. (The `host_build_graph` dump path is a separate
+overload that also maps positionally and stamps `func_id = [-1]`.) Scalar
+values are dumped separately from the flat payload `scalars[]`, once per
+task (with the same func_id array); their dtype table is registered at
+submit time and emitted as a dump-only metadata record at
 `BEFORE_DISPATCH`.
 
 When dump is enabled, AICore executors also issue

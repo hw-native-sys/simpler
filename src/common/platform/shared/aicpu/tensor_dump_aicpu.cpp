@@ -690,7 +690,11 @@ int dump_arg_record(int thread_idx, const TensorDumpInfo &info) {
     rec->flags = info.flags;
     // kernel_id is bounded by RUNTIME_MAX_FUNC_ID (1024), far below the 0xFFFF
     // "unknown" sentinel, so this narrowing is lossless and never collides.
-    rec->func_id = static_cast<uint16_t>(info.func_id);  // -1 -> 0xFFFF (unknown)
+    // func_ids carries the task's active-subtask set (its mix membership).
+    rec->func_count = static_cast<uint8_t>(info.func_count);
+    for (int32_t i = 0; i < info.func_count && i < TENSOR_DUMP_MAX_FUNC_IDS; i++) {
+        rec->func_ids[i] = static_cast<uint16_t>(info.func_ids[i]);  // -1 -> 0xFFFF (unknown)
+    }
     rec->start_offset = info.start_offset;
     for (int d = 0; d < info.ndims && d < PLATFORM_DUMP_MAX_DIMS; d++) {
         rec->shapes[d] = info.shapes[d];

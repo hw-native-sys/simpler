@@ -46,7 +46,6 @@ class TestSpmdBasic(SceneTestCase):
                 "source": "kernels/aic/kernel_spmd_read.cpp",
                 "core_type": "aic",
                 "signature": [D.INOUT],
-                "arg_index": [0],
             },
             {
                 "func_id": 1,
@@ -54,7 +53,6 @@ class TestSpmdBasic(SceneTestCase):
                 "source": "kernels/aiv/kernel_spmd_read.cpp",
                 "core_type": "aiv",
                 "signature": [D.INOUT],
-                "arg_index": [0],
             },
             {
                 "func_id": 2,
@@ -62,7 +60,6 @@ class TestSpmdBasic(SceneTestCase):
                 "source": "kernels/aiv/kernel_spmd_read.cpp",
                 "core_type": "aiv",
                 "signature": [D.INOUT],
-                "arg_index": [0],
             },
         ],
     }

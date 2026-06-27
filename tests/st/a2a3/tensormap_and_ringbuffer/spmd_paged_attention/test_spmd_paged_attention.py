@@ -48,7 +48,6 @@ class TestPagedAttentionUnrollTpushPop(SceneTestCase):
                 # dump records each tensor once per declaring subtask, under its
                 # own func_id. Consumed only by the dump; dispatch ignores it.
                 "signature": [D.IN, D.IN, D.IN, D.IN, D.IN, D.INOUT, D.OUT, D.OUT, D.OUT],
-                "arg_index": [0, 1, 2, 3, 4, 5, 6, 7, 8],
             },
             {
                 "func_id": 1,
@@ -56,7 +55,6 @@ class TestPagedAttentionUnrollTpushPop(SceneTestCase):
                 "source": "kernels/mix/paged_attention_parallel.cpp",
                 "core_type": "aiv",
                 "signature": [D.IN, D.IN, D.IN, D.IN, D.IN, D.INOUT, D.OUT, D.OUT, D.OUT],
-                "arg_index": [0, 1, 2, 3, 4, 5, 6, 7, 8],
             },
         ],
     }

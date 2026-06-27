@@ -80,9 +80,9 @@ def _build_vector_callable(platform: str, *, extra_unused_child: bool = False) -
         raw = kc.compile_incore(path, core_type="aiv", pto_isa_root=pto_isa_root, extra_include_dirs=inc_dirs)
         return raw if platform.endswith("sim") else extract_text_section(raw)
 
-    add = CoreCallable.build(signature=[D.IN, D.IN, D.OUT], arg_index=[0, 1, 2], binary=_aiv(_AIV_ADD))
-    add_scalar = CoreCallable.build(signature=[D.IN, D.OUT], arg_index=[0, 1], binary=_aiv(_AIV_ADD_SCALAR))
-    mul = CoreCallable.build(signature=[D.IN, D.IN, D.OUT], arg_index=[0, 1, 2], binary=_aiv(_AIV_MUL))
+    add = CoreCallable.build(signature=[D.IN, D.IN, D.OUT], binary=_aiv(_AIV_ADD))
+    add_scalar = CoreCallable.build(signature=[D.IN, D.OUT], binary=_aiv(_AIV_ADD_SCALAR))
+    mul = CoreCallable.build(signature=[D.IN, D.IN, D.OUT], binary=_aiv(_AIV_MUL))
 
     children = [(0, add), (1, add_scalar), (2, mul)]
     if extra_unused_child:

@@ -46,7 +46,6 @@ class TestSpmdMultiblockMix(SceneTestCase):
                 # records that tensor once per declaring subtask, each under its
                 # own func_id.
                 "signature": [D.INOUT],
-                "arg_index": [0],
             },
             {
                 "func_id": 1,
@@ -54,7 +53,6 @@ class TestSpmdMultiblockMix(SceneTestCase):
                 "source": "kernels/aiv/kernel_spmd_mix.cpp",
                 "core_type": "aiv",
                 "signature": [D.INOUT],
-                "arg_index": [0],
             },
             {
                 "func_id": 2,
@@ -62,7 +60,6 @@ class TestSpmdMultiblockMix(SceneTestCase):
                 "source": "kernels/aiv/kernel_spmd_mix.cpp",
                 "core_type": "aiv",
                 "signature": [D.INOUT],
-                "arg_index": [0],
             },
         ],
     }

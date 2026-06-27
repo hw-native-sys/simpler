@@ -770,15 +770,11 @@ class TestCoreCallable:
     def test_build_and_access(self):
         sig = [ArgDirection.IN, ArgDirection.OUT, ArgDirection.SCALAR]
         binary = b"\x01\x02\x03\x04"
-        cc = CoreCallable.build(signature=sig, binary=binary, arg_index=[1, 3, 7])
+        cc = CoreCallable.build(signature=sig, binary=binary)
         assert cc.sig_count == 3
         assert cc.sig(0) == ArgDirection.IN
         assert cc.sig(1) == ArgDirection.OUT
         assert cc.sig(2) == ArgDirection.SCALAR
-        # arg_index round-trips through the binding (stored values, not positions)
-        assert cc.arg_index(0) == 1
-        assert cc.arg_index(1) == 3
-        assert cc.arg_index(2) == 7
         assert cc.binary_size == 4
 
     def test_empty_signature(self):
@@ -786,37 +782,30 @@ class TestCoreCallable:
         assert cc.sig_count == 0
         assert cc.binary_size == 1
 
-    def test_arg_index_required(self):
-        # arg_index is mandatory and must be parallel (equal length) to signature.
-        with pytest.raises((ValueError, RuntimeError)):
-            CoreCallable.build(signature=[ArgDirection.IN, ArgDirection.OUT], binary=b"\x00")
-        with pytest.raises((ValueError, RuntimeError)):
-            CoreCallable.build(signature=[ArgDirection.IN], binary=b"\x00", arg_index=[0, 1])
-
     def test_large_binary(self):
         binary = bytes(range(256)) * 40  # 10240 bytes
-        cc = CoreCallable.build(signature=[ArgDirection.IN], binary=binary, arg_index=[0])
+        cc = CoreCallable.build(signature=[ArgDirection.IN], binary=binary)
         assert cc.binary_size == 10240
 
     def test_empty_binary(self):
-        cc = CoreCallable.build(signature=[ArgDirection.IN, ArgDirection.OUT], binary=b"", arg_index=[0, 1])
+        cc = CoreCallable.build(signature=[ArgDirection.IN, ArgDirection.OUT], binary=b"")
         assert cc.sig_count == 2
         assert cc.binary_size == 0
 
     def test_buffer_ptr_and_size(self):
-        cc = CoreCallable.build(signature=[ArgDirection.IN], binary=b"\x00" * 100, arg_index=[0])
+        cc = CoreCallable.build(signature=[ArgDirection.IN], binary=b"\x00" * 100)
         assert cc.buffer_ptr() != 0
         assert cc.buffer_size() > 100
 
     def test_sig_out_of_range(self):
-        cc = CoreCallable.build(signature=[ArgDirection.IN], binary=b"\x00", arg_index=[0])
+        cc = CoreCallable.build(signature=[ArgDirection.IN], binary=b"\x00")
         with pytest.raises((IndexError, RuntimeError)):
             cc.sig(1)
         with pytest.raises((IndexError, RuntimeError)):
             cc.sig(-1)
 
     def test_repr(self):
-        cc = CoreCallable.build(signature=[ArgDirection.IN, ArgDirection.OUT], binary=b"\x00" * 8, arg_index=[0, 1])
+        cc = CoreCallable.build(signature=[ArgDirection.IN, ArgDirection.OUT], binary=b"\x00" * 8)
         r = repr(cc)
         assert "CoreCallable" in r
         assert "sig_count=2" in r
@@ -830,7 +819,7 @@ class TestCoreCallable:
 
 class TestChipCallable:
     def _make_child(self, sig, binary):
-        return CoreCallable.build(signature=sig, binary=binary, arg_index=list(range(len(sig))))
+        return CoreCallable.build(signature=sig, binary=binary)
 
     def test_build_with_children(self):
         child0 = self._make_child([ArgDirection.IN], b"\x01\x02\x03\x04")

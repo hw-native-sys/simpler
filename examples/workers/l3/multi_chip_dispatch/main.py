@@ -97,7 +97,6 @@ def build_chip_callable(platform: str) -> ChipCallable:
     )
     core_callable = CoreCallable.build(
         signature=[ArgDirection.IN, ArgDirection.IN, ArgDirection.OUT],
-        arg_index=[0, 1, 2],
         binary=kernel_bytes,
     )
     return ChipCallable.build(

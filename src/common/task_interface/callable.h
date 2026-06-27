@@ -57,10 +57,6 @@ struct Callable;
 template <int MaxSig>
 struct Callable<void, MaxSig, 0> {
     ArgDirection signature_[MaxSig];
-    // Parallel to signature_ (both hold sig_count_ entries): signature_[i]
-    // describes the payload tensor at absolute index arg_index_[i]. The tensor
-    // dump uses it to map each declared tensor to an explicit payload slot.
-    uint32_t arg_index_[MaxSig];
     int32_t sig_count_;
     uint32_t binary_size_;
     uint64_t resolved_addr_;
@@ -69,10 +65,6 @@ struct Callable<void, MaxSig, 0> {
     ArgDirection sig(int32_t i) const {
         if (i < 0 || i >= sig_count_) throw std::out_of_range("Callable: sig index out of range");
         return signature_[i];
-    }
-    uint32_t arg_index(int32_t i) const {
-        if (i < 0 || i >= sig_count_) throw std::out_of_range("Callable: arg_index out of range");
-        return arg_index_[i];
     }
     int32_t sig_count() const { return sig_count_; }
     uint32_t binary_size() const { return binary_size_; }
@@ -93,9 +85,8 @@ private:
     Callable() = default;
 
     template <int MS>
-    friend std::vector<uint8_t> make_callable(
-        const ArgDirection *sig, const uint32_t *arg_index, int32_t sig_count, const void *binary, uint32_t binary_size
-    );
+    friend std::vector<uint8_t>
+    make_callable(const ArgDirection *sig, int32_t sig_count, const void *binary, uint32_t binary_size);
 };
 
 // ============================================================================
@@ -190,12 +181,11 @@ static_assert(
 // ============================================================================
 
 template <int MaxSig>
-std::vector<uint8_t> make_callable(
-    const ArgDirection *sig, const uint32_t *arg_index, int32_t sig_count, const void *binary, uint32_t binary_size
-) {
+std::vector<uint8_t>
+make_callable(const ArgDirection *sig, int32_t sig_count, const void *binary, uint32_t binary_size) {
     if (sig_count > MaxSig) throw std::invalid_argument("make_callable: sig_count exceeds MaxSig");
-    if (sig_count > 0 && (sig == nullptr || arg_index == nullptr))
-        throw std::invalid_argument("make_callable: sig and arg_index are required when sig_count > 0");
+    if (sig_count > 0 && sig == nullptr)
+        throw std::invalid_argument("make_callable: sig is required when sig_count > 0");
 
     using T = Callable<void, MaxSig, 0>;
     size_t aligned_header = T::binary_data_offset();
@@ -205,9 +195,6 @@ std::vector<uint8_t> make_callable(
     T *obj = reinterpret_cast<T *>(buf.data());
     for (int32_t i = 0; i < sig_count; ++i) {
         obj->signature_[i] = sig[i];
-        // arg_index_ is parallel to signature_: arg_index_[i] is the absolute
-        // payload tensor slot that signature_[i] describes.
-        obj->arg_index_[i] = arg_index[i];
     }
     obj->sig_count_ = sig_count;
     obj->binary_size_ = binary_size;

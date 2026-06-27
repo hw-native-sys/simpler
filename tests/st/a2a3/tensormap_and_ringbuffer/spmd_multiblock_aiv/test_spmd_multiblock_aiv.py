@@ -40,10 +40,8 @@ class TestSpmdMultiblockAiv(SceneTestCase):
                 "name": "SPMD_WRITE_AIV",
                 "source": "kernels/aiv/kernel_spmd_write.cpp",
                 "core_type": "aiv",
-                # Single-AIV task with one INOUT tensor at payload slot 0;
-                # arg_index maps it explicitly.
+                # Single-AIV task with one INOUT tensor at payload slot 0.
                 "signature": [D.INOUT],
-                "arg_index": [0],
             },
         ],
     }

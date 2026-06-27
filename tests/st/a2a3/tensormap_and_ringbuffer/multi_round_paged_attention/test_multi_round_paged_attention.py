@@ -40,7 +40,6 @@ class TestMultiRoundPagedAttention(SceneTestCase):
                 "source": f"{_PA_KERNELS}/aic/aic_qk_matmul.cpp",
                 "core_type": "aic",
                 "signature": [D.IN, D.IN, D.OUT],
-                "arg_index": [0, 1, 2],
             },
             {
                 "func_id": 1,
@@ -48,7 +47,6 @@ class TestMultiRoundPagedAttention(SceneTestCase):
                 "source": f"{_PA_KERNELS}/aiv/aiv_softmax_prepare.cpp",
                 "core_type": "aiv",
                 "signature": [D.IN, D.OUT, D.OUT, D.OUT],
-                "arg_index": [0, 1, 2, 3],
             },
             {
                 "func_id": 2,
@@ -56,7 +54,6 @@ class TestMultiRoundPagedAttention(SceneTestCase):
                 "source": f"{_PA_KERNELS}/aic/aic_pv_matmul.cpp",
                 "core_type": "aic",
                 "signature": [D.IN, D.IN, D.OUT],
-                "arg_index": [0, 1, 2],
             },
             {
                 "func_id": 3,
@@ -64,7 +61,6 @@ class TestMultiRoundPagedAttention(SceneTestCase):
                 "source": f"{_PA_KERNELS}/aiv/aiv_online_update.cpp",
                 "core_type": "aiv",
                 "signature": [D.IN, D.IN, D.IN, D.INOUT, D.INOUT, D.INOUT, D.INOUT],
-                "arg_index": [0, 1, 2, 3, 4, 5, 6],
             },
         ],
     }

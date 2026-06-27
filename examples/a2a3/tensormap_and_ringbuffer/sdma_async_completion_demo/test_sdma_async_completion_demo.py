@@ -81,7 +81,6 @@ def build_chip_callable(platform: str, pto_isa_commit: str | None, clone_protoco
                 func_id,
                 CoreCallable.build(
                     signature=[ArgDirection.IN, ArgDirection.OUT, ArgDirection.OUT, ArgDirection.IN],
-                    arg_index=[0, 1, 2, 3],
                     binary=kernel,
                 ),
             )
