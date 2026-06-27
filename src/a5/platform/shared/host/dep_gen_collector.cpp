@@ -115,23 +115,26 @@ int DepGenCollector::init(
     // free_queue contents) to device.
     profiling_copy_to_device(shm_dev_local, shm_host_local, shm_size);
 
+    LOG_INFO_V0(
+        "DepGen collector initialized: %d threads, SHM=0x%lx (records held in memory until replay)", num_threads,
+        reinterpret_cast<unsigned long>(shm_dev_local)
+    );
+    guard.commit();
+    // Publish members + memory context only after the rollback guard is
+    // disarmed; initialized_ is published last. set_memory_context copy-assigns
+    // std::function members and can throw std::bad_alloc, so keeping it (and the
+    // initialized_ store) before commit would let the guard free the shm/buffers
+    // on unwind while initialized_ is already true — finalize() would then skip
+    // its !initialized_ early-return and double-free what the guard released.
+    // start(tf) gates on shm_host_ (published by set_memory_context), so this is
+    // the moment the collector becomes startable.
     shm_dev_ = shm_dev_local;
     shm_size_ = shm_size;
-    initialized_ = true;
-
-    // Re-set_memory_context now that the shm region is ready. start(tf) gates
-    // on shm_host_ being non-null, so this is the moment the collector
-    // becomes startable.
     set_memory_context(
         alloc_cb, register_cb, free_cb, profiling_copy_to_device_for_ops, profiling_copy_from_device_for_ops,
         shm_dev_local, shm_host_local, shm_size, device_id
     );
-
-    LOG_INFO_V0(
-        "DepGen collector initialized: %d threads, SHM=0x%lx (records held in memory until replay)", num_threads,
-        reinterpret_cast<unsigned long>(shm_dev_)
-    );
-    guard.commit();
+    initialized_ = true;
     return 0;
 }
 
