@@ -31,6 +31,10 @@
 
 namespace {
 
+static constexpr size_t ASYNC_RUN_OFF_DIGEST = 0;
+static constexpr size_t ASYNC_RUN_OFF_CONFIG = ASYNC_RUN_OFF_DIGEST + CALLABLE_HASH_DIGEST_SIZE;
+static constexpr size_t ASYNC_RUN_OFF_ARGS_BLOB = (ASYNC_RUN_OFF_CONFIG + sizeof(CallConfig) + 7) & ~size_t{7};
+
 // Read the child-written error message from the mailbox, guaranteeing
 // NUL-termination even if the child wrote exactly MAILBOX_ERROR_MSG_SIZE
 // bytes without a terminator.
@@ -62,6 +66,73 @@ namespace {
     throw std::runtime_error(std::string(op_name) + " is not supported by this WorkerEndpoint");
 }
 
+std::atomic<uint64_t> g_shm_counter{0};
+
+std::string make_shm_name() {
+    char buf[CTRL_SHM_NAME_BYTES];
+    int pid = static_cast<int>(getpid());
+    uint64_t counter = g_shm_counter.fetch_add(1, std::memory_order_relaxed);
+    int n = std::snprintf(buf, sizeof(buf), "simpler-cb-%d-%llu", pid, static_cast<unsigned long long>(counter));
+    if (n < 0 || static_cast<size_t>(n) >= sizeof(buf)) {
+        throw std::runtime_error("broadcast_register: shm name overflow");
+    }
+    return std::string(buf);
+}
+
+std::string strip_control_prefix(const std::string &msg, const std::string &op_name) {
+    const std::string needle = op_name + " failed on child: ";
+    if (msg.compare(0, needle.size(), needle) == 0) {
+        return msg.substr(needle.size());
+    }
+    return msg;
+}
+
+class PosixShmHolder {
+public:
+    PosixShmHolder(const std::string &name, size_t size) :
+        name_(name),
+        size_(size) {
+        std::string full_name = "/" + name_;
+        fd_ = shm_open(full_name.c_str(), O_CREAT | O_RDWR | O_EXCL, 0600);
+        if (fd_ < 0) {
+            throw std::runtime_error(
+                std::string("broadcast_register: shm_open(") + full_name + ") failed: " + std::strerror(errno)
+            );
+        }
+        if (ftruncate(fd_, static_cast<off_t>(size)) != 0) {
+            int err = errno;
+            ::close(fd_);
+            shm_unlink(full_name.c_str());
+            throw std::runtime_error(std::string("broadcast_register: ftruncate failed: ") + std::strerror(err));
+        }
+        addr_ = mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd_, 0);
+        if (addr_ == MAP_FAILED) {
+            int err = errno;
+            ::close(fd_);
+            shm_unlink(full_name.c_str());
+            addr_ = nullptr;
+            throw std::runtime_error(std::string("broadcast_register: mmap failed: ") + std::strerror(err));
+        }
+    }
+    ~PosixShmHolder() {
+        if (addr_ != nullptr) munmap(addr_, size_);
+        if (fd_ >= 0) ::close(fd_);
+        std::string full_name = "/" + name_;
+        shm_unlink(full_name.c_str());
+    }
+    PosixShmHolder(const PosixShmHolder &) = delete;
+    PosixShmHolder &operator=(const PosixShmHolder &) = delete;
+
+    void *addr() { return addr_; }
+    const std::string &name() const { return name_; }
+
+private:
+    std::string name_;
+    size_t size_{0};
+    int fd_{-1};
+    void *addr_{nullptr};
+};
+
 }  // namespace
 
 uint64_t WorkerEndpoint::control_malloc(size_t) { throw_unsupported_control("control_malloc"); }
@@ -72,6 +143,18 @@ void WorkerEndpoint::control_prepare(const uint8_t *) { throw_unsupported_contro
 void WorkerEndpoint::control_register(const char *, size_t, const uint8_t *) {
     throw_unsupported_control("control_register");
 }
+uint64_t WorkerEndpoint::control_register_async(const char *, size_t, const uint8_t *) {
+    throw_unsupported_control("control_register_async");
+}
+uint64_t WorkerEndpoint::control_run_async(const uint8_t *, const TaskArgs &, const CallConfig &) {
+    throw_unsupported_control("control_run_async");
+}
+void WorkerEndpoint::control_wait_register(uint64_t) { throw_unsupported_control("control_wait_register"); }
+RunTiming WorkerEndpoint::control_wait_run(uint64_t) { throw_unsupported_control("control_wait_run"); }
+uint64_t WorkerEndpoint::control_unregister_async(const uint8_t *) {
+    throw_unsupported_control("control_unregister_async");
+}
+void WorkerEndpoint::control_wait_unregister(uint64_t) { throw_unsupported_control("control_wait_unregister"); }
 void WorkerEndpoint::control_unregister(const uint8_t *) { throw_unsupported_control("control_unregister"); }
 void WorkerEndpoint::control_remote_prepare_register(
     remote_l3::RemoteRegistryTarget, CallableKind, const uint8_t *, const void *, size_t
@@ -154,6 +237,13 @@ void LocalMailboxEndpoint::write_mailbox_state(MailboxState s) {
 #else
     __atomic_store(ptr, &v, __ATOMIC_RELEASE);
 #endif
+}
+
+bool LocalMailboxEndpoint::compare_exchange_mailbox_state(MailboxState expected, MailboxState desired) {
+    volatile int32_t *ptr = reinterpret_cast<volatile int32_t *>(mbox() + MAILBOX_OFF_STATE);
+    int32_t expected_v = static_cast<int32_t>(expected);
+    int32_t desired_v = static_cast<int32_t>(desired);
+    return __atomic_compare_exchange_n(ptr, &expected_v, desired_v, false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
 }
 
 void LocalMailboxEndpoint::shutdown_child() { write_mailbox_state(MailboxState::SHUTDOWN); }
@@ -266,62 +356,65 @@ WorkerCompletion LocalMailboxEndpoint::run(Ring *ring, const WorkerDispatch &dis
     completion.task_slot = dispatch.task_slot;
     completion.group_index = group_index;
 
-    // Hold mailbox_mu_ for the entire round trip (write payload + state +
-    // spin-poll TASK_DONE + reset to IDLE). Any control_* request from the
-    // orch thread waits for the dispatch to finish before claiming the
-    // mailbox; without this they would race on MAILBOX_OFF_STATE.
-    std::lock_guard<std::mutex> lk(mailbox_mu_);
-    if (mailbox_control_timed_out_) {
-        completion.outcome = EndpointOutcome::ENDPOINT_FAILURE;
-        completion.error_message = "LocalMailboxEndpoint::run: mailbox has an unresolved timed-out control command";
-        return completion;
+    {
+        std::lock_guard<std::mutex> lk(mailbox_mu_);
+        if (mailbox_control_timed_out_) {
+            completion.outcome = EndpointOutcome::ENDPOINT_FAILURE;
+            completion.error_message = "LocalMailboxEndpoint::run: mailbox has an unresolved timed-out control command";
+            return completion;
+        }
+
+        // Clear the child-writable error fields so stale bytes from a prior
+        // dispatch cannot masquerade as a fresh failure.
+        int32_t zero_err = 0;
+        std::memcpy(mbox() + MAILBOX_OFF_ERROR, &zero_err, sizeof(int32_t));
+        std::memset(mbox() + MAILBOX_OFF_ERROR_MSG, 0, MAILBOX_ERROR_MSG_SIZE);
+
+        uint64_t reserved_callable = 0;
+        std::memcpy(mbox() + MAILBOX_OFF_CALLABLE, &reserved_callable, sizeof(uint64_t));
+
+        // Write config as a single packed POD block (see call_config.h).
+        std::memcpy(mbox() + MAILBOX_OFF_CONFIG, &s.config, sizeof(CallConfig));
+
+        // Write length-prefixed TaskArgs blob: [T][S][tensors][scalars].
+        size_t blob_bytes = TASK_ARGS_BLOB_HEADER_SIZE + static_cast<size_t>(view.tensor_count) * sizeof(Tensor) +
+                            static_cast<size_t>(view.scalar_count) * sizeof(uint64_t);
+        if (blob_bytes > MAILBOX_ARGS_CAPACITY) {
+            completion.outcome = EndpointOutcome::ENDPOINT_FAILURE;
+            completion.error_message = "LocalMailboxEndpoint::run: args blob exceeds mailbox capacity: need " +
+                                       std::to_string(blob_bytes) + " bytes, capacity " +
+                                       std::to_string(MAILBOX_ARGS_CAPACITY) +
+                                       " bytes, tensors=" + std::to_string(view.tensor_count) +
+                                       ", scalars=" + std::to_string(view.scalar_count);
+            return completion;
+        }
+        uint8_t *hash_dst = reinterpret_cast<uint8_t *>(mbox() + MAILBOX_OFF_TASK_CALLABLE_HASH);
+        std::memcpy(hash_dst, s.callable.digest.data(), CALLABLE_HASH_DIGEST_SIZE);
+
+        uint8_t *d = reinterpret_cast<uint8_t *>(mbox() + MAILBOX_OFF_TASK_ARGS_BLOB);
+        std::memcpy(d + 0, &view.tensor_count, sizeof(int32_t));
+        std::memcpy(d + 4, &view.scalar_count, sizeof(int32_t));
+        if (view.tensor_count > 0) {
+            std::memcpy(
+                d + TASK_ARGS_BLOB_HEADER_SIZE, view.tensor_bytes,
+                static_cast<size_t>(view.tensor_count) * sizeof(Tensor)
+            );
+        }
+        if (view.scalar_count > 0) {
+            std::memcpy(
+                d + TASK_ARGS_BLOB_HEADER_SIZE + static_cast<size_t>(view.tensor_count) * sizeof(Tensor), view.scalars,
+                static_cast<size_t>(view.scalar_count) * sizeof(uint64_t)
+            );
+        }
+
+        write_mailbox_state(MailboxState::TASK_READY);
+        while (true) {
+            MailboxState state = read_mailbox_state();
+            if (state == MailboxState::TASK_RUNNING || state == MailboxState::TASK_DONE) break;
+            std::this_thread::sleep_for(std::chrono::microseconds(50));
+        }
     }
 
-    // Clear the child-writable error fields so stale bytes from a prior
-    // dispatch cannot masquerade as a fresh failure.
-    int32_t zero_err = 0;
-    std::memcpy(mbox() + MAILBOX_OFF_ERROR, &zero_err, sizeof(int32_t));
-    std::memset(mbox() + MAILBOX_OFF_ERROR_MSG, 0, MAILBOX_ERROR_MSG_SIZE);
-
-    uint64_t reserved_callable = 0;
-    std::memcpy(mbox() + MAILBOX_OFF_CALLABLE, &reserved_callable, sizeof(uint64_t));
-
-    // Write config as a single packed POD block (see call_config.h).
-    std::memcpy(mbox() + MAILBOX_OFF_CONFIG, &s.config, sizeof(CallConfig));
-
-    // Write length-prefixed TaskArgs blob: [T][S][tensors][scalars].
-    size_t blob_bytes = TASK_ARGS_BLOB_HEADER_SIZE + static_cast<size_t>(view.tensor_count) * sizeof(Tensor) +
-                        static_cast<size_t>(view.scalar_count) * sizeof(uint64_t);
-    if (blob_bytes > MAILBOX_ARGS_CAPACITY) {
-        completion.outcome = EndpointOutcome::ENDPOINT_FAILURE;
-        completion.error_message =
-            "LocalMailboxEndpoint::run: args blob exceeds mailbox capacity: need " + std::to_string(blob_bytes) +
-            " bytes, capacity " + std::to_string(MAILBOX_ARGS_CAPACITY) +
-            " bytes, tensors=" + std::to_string(view.tensor_count) + ", scalars=" + std::to_string(view.scalar_count);
-        return completion;
-    }
-    uint8_t *hash_dst = reinterpret_cast<uint8_t *>(mbox() + MAILBOX_OFF_TASK_CALLABLE_HASH);
-    std::memcpy(hash_dst, s.callable.digest.data(), CALLABLE_HASH_DIGEST_SIZE);
-
-    uint8_t *d = reinterpret_cast<uint8_t *>(mbox() + MAILBOX_OFF_TASK_ARGS_BLOB);
-    std::memcpy(d + 0, &view.tensor_count, sizeof(int32_t));
-    std::memcpy(d + 4, &view.scalar_count, sizeof(int32_t));
-    if (view.tensor_count > 0) {
-        std::memcpy(
-            d + TASK_ARGS_BLOB_HEADER_SIZE, view.tensor_bytes, static_cast<size_t>(view.tensor_count) * sizeof(Tensor)
-        );
-    }
-    if (view.scalar_count > 0) {
-        std::memcpy(
-            d + TASK_ARGS_BLOB_HEADER_SIZE + static_cast<size_t>(view.tensor_count) * sizeof(Tensor), view.scalars,
-            static_cast<size_t>(view.scalar_count) * sizeof(uint64_t)
-        );
-    }
-
-    // Signal child process.
-    write_mailbox_state(MailboxState::TASK_READY);
-
-    // Spin-poll until child signals TASK_DONE.
     while (read_mailbox_state() != MailboxState::TASK_DONE) {
         std::this_thread::sleep_for(std::chrono::microseconds(50));
     }
@@ -556,15 +649,39 @@ void LocalMailboxEndpoint::run_control_command(const char *op_name, double timeo
     if (mailbox_control_timed_out_) {
         throw std::runtime_error(std::string(op_name) + " failed: mailbox has an unresolved timed-out control command");
     }
-    int32_t zero_err = 0;
-    std::memcpy(mbox() + MAILBOX_OFF_ERROR, &zero_err, sizeof(int32_t));
-    std::memset(mbox() + MAILBOX_OFF_ERROR_MSG, 0, MAILBOX_ERROR_MSG_SIZE);
-    write_mailbox_state(MailboxState::CONTROL_REQUEST);
     auto deadline = std::chrono::steady_clock::time_point::max();
     if (timeout_s >= 0.0) {
         deadline =
             std::chrono::steady_clock::now() +
             std::chrono::duration_cast<std::chrono::steady_clock::duration>(std::chrono::duration<double>(timeout_s));
+    }
+    uint64_t sub_cmd = 0;
+    std::memcpy(&sub_cmd, mbox() + MAILBOX_OFF_CALLABLE, sizeof(uint64_t));
+    bool can_overlap_task = sub_cmd == CTRL_REGISTER_ASYNC || sub_cmd == CTRL_WAIT_REGISTER ||
+                            sub_cmd == CTRL_RUN_ASYNC || sub_cmd == CTRL_WAIT_RUN || sub_cmd == CTRL_UNREGISTER_ASYNC ||
+                            sub_cmd == CTRL_WAIT_UNREGISTER;
+    MailboxState restore_state = MailboxState::IDLE;
+    while (true) {
+        MailboxState current = read_mailbox_state();
+        if (current == MailboxState::TASK_DONE || (current == MailboxState::TASK_RUNNING && !can_overlap_task)) {
+            if (std::chrono::steady_clock::now() >= deadline) {
+                mailbox_control_timed_out_ = true;
+                throw std::runtime_error(std::string(op_name) + " timed out waiting for task dispatch to finish");
+            }
+            std::this_thread::sleep_for(std::chrono::microseconds(50));
+            continue;
+        }
+        if (current == MailboxState::IDLE || current == MailboxState::INIT_DONE ||
+            current == MailboxState::TASK_RUNNING) {
+            restore_state = (current == MailboxState::TASK_RUNNING) ? MailboxState::TASK_RUNNING : MailboxState::IDLE;
+            if (compare_exchange_mailbox_state(current, MailboxState::CONTROL_REQUEST)) break;
+            continue;
+        }
+        if (std::chrono::steady_clock::now() >= deadline) {
+            mailbox_control_timed_out_ = true;
+            throw std::runtime_error(std::string(op_name) + " timed out waiting for control mailbox availability");
+        }
+        std::this_thread::sleep_for(std::chrono::microseconds(50));
     }
     while (read_mailbox_state() != MailboxState::CONTROL_DONE) {
         if (std::chrono::steady_clock::now() >= deadline) {
@@ -576,10 +693,10 @@ void LocalMailboxEndpoint::run_control_command(const char *op_name, double timeo
     std::memcpy(&err, mbox() + MAILBOX_OFF_ERROR, sizeof(int32_t));
     if (err != 0) {
         std::string msg = read_error_msg(mbox());
-        write_mailbox_state(MailboxState::IDLE);
+        write_mailbox_state(restore_state);
         throw std::runtime_error(std::string(op_name) + " failed on child: " + msg);
     }
-    write_mailbox_state(MailboxState::IDLE);
+    write_mailbox_state(restore_state);
 }
 
 uint64_t LocalMailboxEndpoint::control_malloc(size_t size) {
@@ -614,6 +731,81 @@ void LocalMailboxEndpoint::control_register(const char *shm_name, size_t blob_si
     std::memcpy(mbox() + MAILBOX_OFF_ARGS, shm_name, name_len);
     std::memset(mbox() + MAILBOX_OFF_ARGS + name_len, 0, CTRL_SHM_NAME_BYTES - name_len);
     run_control_command("control_register");
+}
+
+uint64_t LocalMailboxEndpoint::control_register_async(const char *shm_name, size_t blob_size, const uint8_t *digest) {
+    std::lock_guard<std::mutex> lk(mailbox_mu_);
+    uint64_t sub_cmd = CTRL_REGISTER_ASYNC;
+    std::memcpy(mbox() + MAILBOX_OFF_CALLABLE, &sub_cmd, sizeof(uint64_t));
+    uint64_t payload_size = static_cast<uint64_t>(blob_size);
+    std::memcpy(mbox() + CTRL_OFF_ARG0, &payload_size, sizeof(uint64_t));
+    write_control_digest(mbox(), digest);
+    size_t name_len = std::strlen(shm_name);
+    if (name_len + 1 > CTRL_SHM_NAME_BYTES) {
+        throw std::runtime_error(std::string("control_register_async: shm name too long: ") + shm_name);
+    }
+    std::memcpy(mbox() + MAILBOX_OFF_ARGS, shm_name, name_len);
+    std::memset(mbox() + MAILBOX_OFF_ARGS + name_len, 0, CTRL_SHM_NAME_BYTES - name_len);
+    run_control_command("control_register_async");
+    return read_control_result(mbox());
+}
+
+uint64_t
+LocalMailboxEndpoint::control_run_async(const uint8_t *digest, const TaskArgs &args, const CallConfig &config) {
+    size_t args_blob_size = task_args_blob_size(args);
+    size_t payload_size = ASYNC_RUN_OFF_ARGS_BLOB + args_blob_size;
+    std::string shm_name = make_shm_name();
+    PosixShmHolder shm(shm_name, payload_size);
+    auto *payload = static_cast<uint8_t *>(shm.addr());
+    std::memset(payload, 0, payload_size);
+    std::memcpy(payload + ASYNC_RUN_OFF_DIGEST, digest, CALLABLE_HASH_DIGEST_SIZE);
+    std::memcpy(payload + ASYNC_RUN_OFF_CONFIG, &config, sizeof(CallConfig));
+    write_blob(payload + ASYNC_RUN_OFF_ARGS_BLOB, args);
+
+    std::lock_guard<std::mutex> lk(mailbox_mu_);
+    uint64_t sub_cmd = CTRL_RUN_ASYNC;
+    std::memcpy(mbox() + MAILBOX_OFF_CALLABLE, &sub_cmd, sizeof(uint64_t));
+    uint64_t staged_payload_size = static_cast<uint64_t>(payload_size);
+    std::memcpy(mbox() + CTRL_OFF_ARG0, &staged_payload_size, sizeof(uint64_t));
+    write_control_digest(mbox(), digest);
+    size_t name_len = shm.name().size();
+    if (name_len + 1 > CTRL_SHM_NAME_BYTES) {
+        throw std::runtime_error(std::string("control_run_async: shm name too long: ") + shm.name());
+    }
+    std::memcpy(mbox() + MAILBOX_OFF_ARGS, shm.name().data(), name_len);
+    std::memset(mbox() + MAILBOX_OFF_ARGS + name_len, 0, CTRL_SHM_NAME_BYTES - name_len);
+    run_control_command("control_run_async");
+    return read_control_result(mbox());
+}
+
+void LocalMailboxEndpoint::control_wait_register(uint64_t handle_id) {
+    std::lock_guard<std::mutex> lk(mailbox_mu_);
+    write_control_args(mbox(), CTRL_WAIT_REGISTER, handle_id);
+    run_control_command("control_wait_register");
+}
+
+RunTiming LocalMailboxEndpoint::control_wait_run(uint64_t handle_id) {
+    std::lock_guard<std::mutex> lk(mailbox_mu_);
+    write_control_args(mbox(), CTRL_WAIT_RUN, handle_id);
+    run_control_command("control_wait_run");
+    uint64_t host_wall_ns = read_control_result(mbox());
+    uint64_t device_wall_ns = 0;
+    std::memcpy(&device_wall_ns, mbox() + CTRL_OFF_RESULT1, sizeof(uint64_t));
+    return RunTiming{host_wall_ns, device_wall_ns};
+}
+
+uint64_t LocalMailboxEndpoint::control_unregister_async(const uint8_t *digest) {
+    std::lock_guard<std::mutex> lk(mailbox_mu_);
+    write_control_args(mbox(), CTRL_UNREGISTER_ASYNC);
+    write_control_digest(mbox(), digest);
+    run_control_command("control_unregister_async");
+    return read_control_result(mbox());
+}
+
+void LocalMailboxEndpoint::control_wait_unregister(uint64_t handle_id) {
+    std::lock_guard<std::mutex> lk(mailbox_mu_);
+    write_control_args(mbox(), CTRL_WAIT_UNREGISTER, handle_id);
+    run_control_command("control_wait_unregister");
 }
 
 void LocalMailboxEndpoint::control_unregister(const uint8_t *digest) {
@@ -787,6 +979,36 @@ void WorkerThread::control_register(const char *shm_name, size_t blob_size, cons
     endpoint_->control_register(shm_name, blob_size, digest);
 }
 
+uint64_t WorkerThread::control_register_async(const char *shm_name, size_t blob_size, const uint8_t *digest) {
+    if (!endpoint_) throw std::runtime_error("control_register_async: null endpoint");
+    return endpoint_->control_register_async(shm_name, blob_size, digest);
+}
+
+uint64_t WorkerThread::control_run_async(const uint8_t *digest, const TaskArgs &args, const CallConfig &config) {
+    if (!endpoint_) throw std::runtime_error("control_run_async: null endpoint");
+    return endpoint_->control_run_async(digest, args, config);
+}
+
+void WorkerThread::control_wait_register(uint64_t handle_id) {
+    if (!endpoint_) throw std::runtime_error("control_wait_register: null endpoint");
+    endpoint_->control_wait_register(handle_id);
+}
+
+RunTiming WorkerThread::control_wait_run(uint64_t handle_id) {
+    if (!endpoint_) throw std::runtime_error("control_wait_run: null endpoint");
+    return endpoint_->control_wait_run(handle_id);
+}
+
+uint64_t WorkerThread::control_unregister_async(const uint8_t *digest) {
+    if (!endpoint_) throw std::runtime_error("control_unregister_async: null endpoint");
+    return endpoint_->control_unregister_async(digest);
+}
+
+void WorkerThread::control_wait_unregister(uint64_t handle_id) {
+    if (!endpoint_) throw std::runtime_error("control_wait_unregister: null endpoint");
+    endpoint_->control_wait_unregister(handle_id);
+}
+
 void WorkerThread::control_unregister(const uint8_t *digest) {
     if (!endpoint_) throw std::runtime_error("control_unregister: null endpoint");
     endpoint_->control_unregister(digest);
@@ -917,97 +1139,45 @@ bool WorkerManager::any_busy() const {
 // Dynamic register/unregister broadcast (POSIX shm staging + parallel fan-out)
 // =============================================================================
 
-namespace {
-
-// Process-wide monotonic counter so concurrent broadcasts do not collide on shm
-// name. Atomic increment is enough — no need to lock.
-std::atomic<uint64_t> g_shm_counter{0};
-
-// Build the per-broadcast POSIX shm name. The name itself does NOT carry the
-// leading '/' that shm_open requires (Python's multiprocessing.SharedMemory
-// uses the same convention, so the child Python side reads the field as a
-// plain name). Caller adds '/' when opening.
-std::string make_shm_name() {
-    char buf[CTRL_SHM_NAME_BYTES];
-    int pid = static_cast<int>(getpid());
-    uint64_t counter = g_shm_counter.fetch_add(1, std::memory_order_relaxed);
-    int n = std::snprintf(buf, sizeof(buf), "simpler-cb-%d-%llu", pid, static_cast<unsigned long long>(counter));
-    if (n < 0 || static_cast<size_t>(n) >= sizeof(buf)) {
-        throw std::runtime_error("broadcast_register: shm name overflow");
-    }
-    return std::string(buf);
-}
-
-// Strip the outer "<op_name> failed on child: " prefix that
-// run_control_command prepends to every control failure, so the broadcast
-// caller can surface the child-side message (`register hash=sha256:...
-// chip=<id>: <reason>`) directly under its own one-line Worker.register prefix.
-std::string strip_control_prefix(const std::string &msg, const std::string &op_name) {
-    const std::string needle = op_name + " failed on child: ";
-    if (msg.compare(0, needle.size(), needle) == 0) {
-        return msg.substr(needle.size());
-    }
-    return msg;
-}
-
-// RAII guard for a POSIX shm segment: create on construction, unlink on
-// destruction. mmaps the region so the staged blob can be memcpy'd in
-// place; the mmap is released in the destructor as well. The shm is only
-// unlinked once — children open by name *before* this guard is destroyed.
-class PosixShmHolder {
-public:
-    PosixShmHolder(const std::string &name, size_t size) :
-        name_(name),
-        size_(size) {
-        std::string full_name = "/" + name_;
-        fd_ = shm_open(full_name.c_str(), O_CREAT | O_RDWR | O_EXCL, 0600);
-        if (fd_ < 0) {
-            throw std::runtime_error(
-                std::string("broadcast_register: shm_open(") + full_name + ") failed: " + std::strerror(errno)
-            );
-        }
-        if (ftruncate(fd_, static_cast<off_t>(size)) != 0) {
-            int err = errno;
-            ::close(fd_);
-            shm_unlink(full_name.c_str());
-            throw std::runtime_error(std::string("broadcast_register: ftruncate failed: ") + std::strerror(err));
-        }
-        addr_ = mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd_, 0);
-        if (addr_ == MAP_FAILED) {
-            int err = errno;
-            ::close(fd_);
-            shm_unlink(full_name.c_str());
-            addr_ = nullptr;
-            throw std::runtime_error(std::string("broadcast_register: mmap failed: ") + std::strerror(err));
-        }
-    }
-    ~PosixShmHolder() {
-        if (addr_ != nullptr) munmap(addr_, size_);
-        if (fd_ >= 0) ::close(fd_);
-        std::string full_name = "/" + name_;
-        shm_unlink(full_name.c_str());
-    }
-    PosixShmHolder(const PosixShmHolder &) = delete;
-    PosixShmHolder &operator=(const PosixShmHolder &) = delete;
-
-    void *addr() { return addr_; }
-    const std::string &name() const { return name_; }
-
-private:
-    std::string name_;
-    size_t size_{0};
-    int fd_{-1};
-    void *addr_{nullptr};
-};
-
-}  // namespace
-
 void WorkerManager::control_prepare(int worker_id, const uint8_t *digest) {
     auto *wt = get_worker_by_id(WorkerType::NEXT_LEVEL, worker_id);
     if (wt == nullptr) {
         throw std::runtime_error("control_prepare: invalid worker_id " + std::to_string(worker_id));
     }
     wt->control_prepare(digest);
+}
+
+uint64_t
+WorkerManager::control_run_async(int worker_id, const uint8_t *digest, const TaskArgs &args, const CallConfig &config) {
+    auto *wt = get_worker_by_id(WorkerType::NEXT_LEVEL, worker_id);
+    if (wt == nullptr) {
+        throw std::runtime_error("control_run_async: invalid worker_id " + std::to_string(worker_id));
+    }
+    return wt->control_run_async(digest, args, config);
+}
+
+RunTiming WorkerManager::control_wait_run(int worker_id, uint64_t handle_id) {
+    auto *wt = get_worker_by_id(WorkerType::NEXT_LEVEL, worker_id);
+    if (wt == nullptr) {
+        throw std::runtime_error("control_wait_run: invalid worker_id " + std::to_string(worker_id));
+    }
+    return wt->control_wait_run(handle_id);
+}
+
+void WorkerManager::control_wait_register(int worker_id, uint64_t handle_id) {
+    auto *wt = get_worker_by_id(WorkerType::NEXT_LEVEL, worker_id);
+    if (wt == nullptr) {
+        throw std::runtime_error("control_wait_register: invalid worker_id " + std::to_string(worker_id));
+    }
+    wt->control_wait_register(handle_id);
+}
+
+void WorkerManager::control_wait_unregister(int worker_id, uint64_t handle_id) {
+    auto *wt = get_worker_by_id(WorkerType::NEXT_LEVEL, worker_id);
+    if (wt == nullptr) {
+        throw std::runtime_error("control_wait_unregister: invalid worker_id " + std::to_string(worker_id));
+    }
+    wt->control_wait_unregister(handle_id);
 }
 
 void WorkerManager::control_alloc_domain(int worker_id, const char *request_shm_name, const char *reply_shm_name) {
@@ -1248,6 +1418,45 @@ WorkerManager::broadcast_register_all(const void *blob_ptr, size_t blob_size, co
     return results;
 }
 
+std::vector<AsyncControlResult>
+WorkerManager::broadcast_register_async_all(const void *blob_ptr, size_t blob_size, const uint8_t *digest) {
+    std::vector<AsyncControlResult> results;
+    results.reserve(next_level_threads_.size());
+    for (size_t i = 0; i < next_level_threads_.size(); ++i) {
+        results.push_back(AsyncControlResult{"NEXT_LEVEL", next_level_threads_[i]->worker_id(), true, 0, ""});
+    }
+    if (next_level_threads_.empty()) return results;
+
+    std::string shm_name = make_shm_name();
+    PosixShmHolder shm(shm_name, blob_size);
+    std::memcpy(shm.addr(), blob_ptr, blob_size);
+
+    std::vector<std::thread> workers;
+    workers.reserve(next_level_threads_.size());
+    for (size_t i = 0; i < next_level_threads_.size(); ++i) {
+        workers.emplace_back([this, i, digest, blob_size, name = shm.name(), &results]() {
+            try {
+                results[i].remote_handle =
+                    next_level_threads_[i]->control_register_async(name.c_str(), blob_size, digest);
+            } catch (const std::exception &e) {
+                results[i].ok = false;
+                results[i].error_message = strip_control_prefix(e.what(), "control_register_async");
+            }
+        });
+    }
+    for (auto &t : workers)
+        t.join();
+
+    std::string hash = format_digest(digest);
+    for (auto &result : results) {
+        if (!result.ok && result.error_message.find("hash=") == std::string::npos) {
+            result.error_message = "Worker.register_async(hash=" + hash + ") failed on next_level " +
+                                   std::to_string(result.worker_id) + ": " + result.error_message;
+        }
+    }
+    return results;
+}
+
 std::vector<std::string> WorkerManager::broadcast_unregister_all(const uint8_t *digest) {
     std::vector<std::string> errors;
     if (next_level_threads_.empty()) return errors;
@@ -1273,6 +1482,39 @@ std::vector<std::string> WorkerManager::broadcast_unregister_all(const uint8_t *
         if (!msg.empty()) errors.push_back(std::move(msg));
     }
     return errors;
+}
+
+std::vector<AsyncControlResult> WorkerManager::broadcast_unregister_async_all(const uint8_t *digest) {
+    std::vector<AsyncControlResult> results;
+    results.reserve(next_level_threads_.size());
+    for (size_t i = 0; i < next_level_threads_.size(); ++i) {
+        results.push_back(AsyncControlResult{"NEXT_LEVEL", next_level_threads_[i]->worker_id(), true, 0, ""});
+    }
+    if (next_level_threads_.empty()) return results;
+
+    std::vector<std::thread> workers;
+    workers.reserve(next_level_threads_.size());
+    for (size_t i = 0; i < next_level_threads_.size(); ++i) {
+        workers.emplace_back([this, i, digest, &results]() {
+            try {
+                results[i].remote_handle = next_level_threads_[i]->control_unregister_async(digest);
+            } catch (const std::exception &e) {
+                results[i].ok = false;
+                results[i].error_message = strip_control_prefix(e.what(), "control_unregister_async");
+            }
+        });
+    }
+    for (auto &t : workers)
+        t.join();
+
+    std::string hash = format_digest(digest);
+    for (auto &result : results) {
+        if (!result.ok && result.error_message.find("hash=") == std::string::npos) {
+            result.error_message = "Worker.unregister_async(hash=" + hash + ") failed on next_level " +
+                                   std::to_string(result.worker_id) + ": " + result.error_message;
+        }
+    }
+    return results;
 }
 
 std::vector<ControlResult> WorkerManager::broadcast_control_all(

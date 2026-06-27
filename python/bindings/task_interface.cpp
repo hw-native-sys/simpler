@@ -903,6 +903,7 @@ NB_MODULE(_task_interface, m) {
         .def(
             "prepare_callable",
             [](ChipWorker &self, int32_t callable_id, const PyChipCallable &callable) {
+                nb::gil_scoped_release release;
                 self.prepare_callable(callable_id, callable.buffer_.data());
             },
             nb::arg("callable_id"), nb::arg("callable"),
@@ -912,6 +913,7 @@ NB_MODULE(_task_interface, m) {
         .def(
             "prepare_callable_from_blob",
             [](ChipWorker &self, int32_t callable_id, uint64_t blob_ptr) {
+                nb::gil_scoped_release release;
                 self.prepare_callable(callable_id, reinterpret_cast<const void *>(blob_ptr));
             },
             nb::arg("callable_id"), nb::arg("blob_ptr"),
@@ -925,6 +927,7 @@ NB_MODULE(_task_interface, m) {
         .def(
             "run",
             [](ChipWorker &self, int32_t callable_id, ChipStorageTaskArgs &args, const CallConfig &config) {
+                nb::gil_scoped_release release;
                 return self.run(callable_id, &args, config);
             },
             nb::arg("callable_id"), nb::arg("args"), nb::arg("config"),
@@ -935,6 +938,7 @@ NB_MODULE(_task_interface, m) {
             "run",
             [](ChipWorker &self, int32_t callable_id, TaskArgs &args, const CallConfig &config) {
                 TaskArgsView view = make_view(args);
+                nb::gil_scoped_release release;
                 return self.run(callable_id, view, config);
             },
             nb::arg("callable_id"), nb::arg("args"), nb::arg("config"),
@@ -952,6 +956,7 @@ NB_MODULE(_task_interface, m) {
                 // loops never re-implement the tensor/scalar layout in Python
                 // (where it has historically dropped fields like child_memory).
                 TaskArgsView view = read_blob(reinterpret_cast<const uint8_t *>(args_blob_ptr), blob_capacity);
+                nb::gil_scoped_release release;
                 return self.run(callable_id, view, config);
             },
             nb::arg("callable_id"), nb::arg("args_blob_ptr"), nb::arg("blob_capacity"), nb::arg("config"),
@@ -963,6 +968,7 @@ NB_MODULE(_task_interface, m) {
         .def(
             "unregister_callable",
             [](ChipWorker &self, int32_t callable_id) {
+                nb::gil_scoped_release release;
                 self.unregister_callable(callable_id);
             },
             nb::arg("callable_id"),

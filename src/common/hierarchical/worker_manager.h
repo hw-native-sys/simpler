@@ -69,6 +69,7 @@ enum class MailboxState : int32_t {
     // across distributed ranks so cross-rank init skew never charges against
     // the per-rank PLATFORM_STREAM_SYNC_TIMEOUT_MS budget (issue #897).
     INIT_DONE = 6,
+    TASK_RUNNING = 7,
 };
 
 // Sized so the args region can hold any TaskArgs the runtime itself accepts
@@ -151,7 +152,14 @@ static constexpr uint64_t CTRL_RELEASE_DOMAIN = 8;
 static constexpr uint64_t CTRL_COMM_INIT = 9;
 static constexpr uint64_t CTRL_PY_REGISTER = 10;
 static constexpr uint64_t CTRL_PY_UNREGISTER = 11;
+static constexpr uint64_t CTRL_PY_IMPORT_REGISTER = 12;
 static constexpr uint64_t CTRL_L3_L2_ORCH_COMM_INIT = 13;
+static constexpr uint64_t CTRL_REGISTER_ASYNC = 14;
+static constexpr uint64_t CTRL_WAIT_REGISTER = 15;
+static constexpr uint64_t CTRL_RUN_ASYNC = 16;
+static constexpr uint64_t CTRL_WAIT_RUN = 17;
+static constexpr uint64_t CTRL_UNREGISTER_ASYNC = 18;
+static constexpr uint64_t CTRL_WAIT_UNREGISTER = 19;
 
 // Control args reuse the task mailbox region (mutually exclusive with task dispatch):
 //   offset 16: uint64 arg0 (size for malloc/register; ptr for free; dst for copy)
@@ -162,6 +170,7 @@ static constexpr ptrdiff_t CTRL_OFF_ARG0 = 16;
 static constexpr ptrdiff_t CTRL_OFF_ARG1 = 24;
 static constexpr ptrdiff_t CTRL_OFF_ARG2 = 32;
 static constexpr ptrdiff_t CTRL_OFF_RESULT = 40;
+static constexpr ptrdiff_t CTRL_OFF_RESULT1 = 48;
 
 // CTRL_REGISTER puts the NUL-terminated POSIX shm name at MAILBOX_OFF_ARGS,
 // the exact staged blob size at CTRL_OFF_ARG0, and the callable digest
@@ -173,6 +182,14 @@ struct ControlResult {
     std::string worker_type;
     int32_t worker_id{0};
     bool ok{false};
+    std::string error_message;
+};
+
+struct AsyncControlResult {
+    std::string worker_type;
+    int32_t worker_id{0};
+    bool ok{false};
+    uint64_t remote_handle{0};
     std::string error_message;
 };
 
@@ -206,6 +223,12 @@ public:
     virtual void control_copy_from(uint64_t dst, uint64_t src, size_t size);
     virtual void control_prepare(const uint8_t *digest);
     virtual void control_register(const char *shm_name, size_t blob_size, const uint8_t *digest);
+    virtual uint64_t control_register_async(const char *shm_name, size_t blob_size, const uint8_t *digest);
+    virtual uint64_t control_run_async(const uint8_t *digest, const TaskArgs &args, const CallConfig &config);
+    virtual void control_wait_register(uint64_t handle_id);
+    virtual RunTiming control_wait_run(uint64_t handle_id);
+    virtual uint64_t control_unregister_async(const uint8_t *digest);
+    virtual void control_wait_unregister(uint64_t handle_id);
     virtual void control_unregister(const uint8_t *digest);
     virtual void control_remote_prepare_register(
         remote_l3::RemoteRegistryTarget target_registry, CallableKind callable_kind, const uint8_t *digest,
@@ -256,6 +279,12 @@ public:
     void control_copy_from(uint64_t dst, uint64_t src, size_t size) override;
     void control_prepare(const uint8_t *digest) override;
     void control_register(const char *shm_name, size_t blob_size, const uint8_t *digest) override;
+    uint64_t control_register_async(const char *shm_name, size_t blob_size, const uint8_t *digest) override;
+    uint64_t control_run_async(const uint8_t *digest, const TaskArgs &args, const CallConfig &config) override;
+    void control_wait_register(uint64_t handle_id) override;
+    RunTiming control_wait_run(uint64_t handle_id) override;
+    uint64_t control_unregister_async(const uint8_t *digest) override;
+    void control_wait_unregister(uint64_t handle_id) override;
     void control_unregister(const uint8_t *digest) override;
     void control_remote_prepare_register(
         remote_l3::RemoteRegistryTarget target_registry, CallableKind callable_kind, const uint8_t *digest,
@@ -300,6 +329,7 @@ private:
     char *mbox() const { return static_cast<char *>(mailbox_); }
     MailboxState read_mailbox_state() const;
     void write_mailbox_state(MailboxState s);
+    bool compare_exchange_mailbox_state(MailboxState expected, MailboxState desired);
     void run_control_command(const char *op_name, double timeout_s = -1.0);
 };
 
@@ -364,10 +394,10 @@ public:
     // thread may be running a task. Issues a control command via the
     // mailbox and blocks until the child responds.
     //
-    // The mailbox is a single shared region; dispatch_process and the
-    // control_* methods both write its state field. They serialize on
-    // `mailbox_mu_` so a control request issued mid-dispatch waits for
-    // TASK_DONE before claiming the mailbox.
+    // The mailbox is a single shared region; task dispatch owns the payload
+    // until the child acknowledges TASK_RUNNING. After that, control_* may
+    // claim the state field while the child run lane continues from its
+    // private args copy.
     uint64_t control_malloc(size_t size);
     void control_free(uint64_t ptr);
     void control_copy_to(uint64_t dst, uint64_t src, size_t size);
@@ -380,10 +410,15 @@ public:
     // Dynamic post-init register/unregister of a ChipCallable identity.
     // `shm_name` is the (NUL-terminated, ≤ CTRL_SHM_NAME_BYTES-1) POSIX shm
     // name where the ChipCallable bytes are staged; `blob_size` is the exact
-    // byte span to read from that shm. Both methods hold mailbox_mu_, so a
-    // CTRL_REGISTER concurrent with dispatch_process waits for the in-flight
-    // TASK_DONE before claiming the mailbox.
+    // byte span to read from that shm. Async run/register/unregister controls
+    // can overlap TASK_RUNNING after the child has copied the task args.
     void control_register(const char *shm_name, size_t blob_size, const uint8_t *digest);
+    uint64_t control_register_async(const char *shm_name, size_t blob_size, const uint8_t *digest);
+    uint64_t control_run_async(const uint8_t *digest, const TaskArgs &args, const CallConfig &config);
+    void control_wait_register(uint64_t handle_id);
+    RunTiming control_wait_run(uint64_t handle_id);
+    uint64_t control_unregister_async(const uint8_t *digest);
+    void control_wait_unregister(uint64_t handle_id);
     void control_unregister(const uint8_t *digest);
     void control_remote_prepare_register(
         remote_l3::RemoteRegistryTarget target_registry, CallableKind callable_kind, const uint8_t *digest,
@@ -418,8 +453,8 @@ public:
     // request payload (header + rank_ids + buffer_nbytes); for alloc the child
     // writes its (device_ctx, local_window_base, buffer_ptrs) into
     // `reply_shm_name`.  Both names are NUL-terminated and ≤
-    // CTRL_SHM_NAME_BYTES-1.  Holds mailbox_mu_ so it serialises with task
-    // dispatch on the same chip mailbox.
+    // CTRL_SHM_NAME_BYTES-1.  Memory/domain controls still wait for any
+    // in-flight task dispatch to finish before claiming the mailbox.
     void control_alloc_domain(const char *request_shm_name, const char *reply_shm_name);
     void control_release_domain(const char *request_shm_name);
 
@@ -483,6 +518,10 @@ public:
     // over WorkerThread::control_prepare; exposed at manager level so the
     // Python facade can prewarm without reaching into individual WorkerThreads.
     void control_prepare(int worker_id, const uint8_t *digest);
+    uint64_t control_run_async(int worker_id, const uint8_t *digest, const TaskArgs &args, const CallConfig &config);
+    RunTiming control_wait_run(int worker_id, uint64_t handle_id);
+    void control_wait_register(int worker_id, uint64_t handle_id);
+    void control_wait_unregister(int worker_id, uint64_t handle_id);
 
     // Forward CTRL_ALLOC_DOMAIN / CTRL_RELEASE_DOMAIN to a specific NEXT_LEVEL
     // worker.  Used by the Python orch facade to drive collective domain
@@ -530,6 +569,9 @@ public:
     // target so the Python facade can clean up only targets that confirmed
     // install/refcount increment on a partial failure.
     std::vector<ControlResult> broadcast_register_all(const void *blob_ptr, size_t blob_size, const uint8_t *digest);
+    std::vector<AsyncControlResult>
+    broadcast_register_async_all(const void *blob_ptr, size_t blob_size, const uint8_t *digest);
+    std::vector<AsyncControlResult> broadcast_unregister_async_all(const uint8_t *digest);
 
     // Best-effort: broadcast CTRL_UNREGISTER for `digest` to every NEXT_LEVEL
     // worker in parallel. Returns a vector of per-worker error strings

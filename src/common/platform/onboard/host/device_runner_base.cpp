@@ -604,25 +604,33 @@ int DeviceRunnerBase::prewarm_callable(int32_t callable_id) {
         LOG_ERROR("prewarm_callable: ensure_device_initialized failed: %d", rc);
         return rc;
     }
-
+    if (stream_aicpu_prewarm_ == nullptr) {
+        rc = rtStreamCreate(&stream_aicpu_prewarm_, 0);
+        if (rc != 0) {
+            LOG_ERROR("prewarm_callable: rtStreamCreate(prewarm) failed: %d", rc);
+            return rc;
+        }
+    }
     Runtime runtime;
     rc = stamp_orch_so(runtime, callable_id, /*force_reload=*/true);
     if (rc != 0) return rc;
 
-    rc = init_runtime_args_with_metadata(runtime);
+    rc = init_runtime_args_with_metadata(runtime, prewarm_kernel_args_);
     if (rc != 0) return rc;
     auto runtime_args_cleanup = RAIIScopeGuard([this]() {
-        kernel_args_.finalize_runtime_args();
+        prewarm_kernel_args_.finalize_runtime_args();
     });
 
     LOG_INFO_V0("=== launch_aicpu_kernel %s ===", host::KernelNames::PrewarmName);
-    rc = launch_aicpu_kernel(stream_aicpu_, &kernel_args_.args, host::KernelNames::PrewarmName, /*aicpu_num=*/1);
+    rc = launch_aicpu_kernel(
+        stream_aicpu_prewarm_, &prewarm_kernel_args_.args, host::KernelNames::PrewarmName, /*aicpu_num=*/1
+    );
     if (rc != 0) {
         LOG_ERROR("prewarm_callable: launch_aicpu_kernel failed: %d", rc);
         return rc;
     }
 
-    rc = aclrtSynchronizeStreamWithTimeout(stream_aicpu_, PLATFORM_STREAM_SYNC_TIMEOUT_MS);
+    rc = aclrtSynchronizeStreamWithTimeout(stream_aicpu_prewarm_, PLATFORM_STREAM_SYNC_TIMEOUT_MS);
     if (rc == ACL_ERROR_RT_STREAM_SYNC_TIMEOUT) {
         LOG_ERROR(
             "prewarm_callable: stream sync timeout timeout_ms=%d device_id=%d", PLATFORM_STREAM_SYNC_TIMEOUT_MS,
@@ -831,6 +839,16 @@ int DeviceRunnerBase::finalize_common() {
         capture(rtStreamDestroy(stream_aicore_));
         stream_aicore_ = nullptr;
     }
+    if (stream_aicpu_prewarm_ != nullptr) {
+        capture(rtStreamDestroy(stream_aicpu_prewarm_));
+        stream_aicpu_prewarm_ = nullptr;
+    }
+
+    // Cleanup kernel args; device-side KernelArgs + runtime args
+    // are released by runtime_args_cleanup RAII so they also unwind on errors.
+    capture(kernel_args_.finalize_device_kernel_args());
+    capture(prewarm_kernel_args_.finalize_runtime_args());
+    capture(prewarm_kernel_args_.finalize_device_kernel_args());
 
     // load_aicpu_op_ has no per-task host-side state to release —
     // rtsLaunchCpuKernel does not hand back any per-launch handle, and the
@@ -1118,7 +1136,11 @@ void DeviceRunnerBase::read_device_wall_ns() {
 }
 
 int DeviceRunnerBase::init_runtime_args_with_metadata(Runtime &runtime) {
-    int rc = kernel_args_.init_runtime_args(runtime, mem_alloc_);
+    return init_runtime_args_with_metadata(runtime, kernel_args_);
+}
+
+int DeviceRunnerBase::init_runtime_args_with_metadata(Runtime &runtime, KernelArgsHelper &helper) {
+    int rc = helper.init_runtime_args(runtime, mem_alloc_);
     if (rc != 0) {
         LOG_ERROR("init_runtime_args failed: %d", rc);
         return rc;
@@ -1127,10 +1149,10 @@ int DeviceRunnerBase::init_runtime_args_with_metadata(Runtime &runtime) {
     // HostLogger is the single source of truth for log config (seeded by
     // libsimpler_log.so via simpler_log_init before host_runtime.so was even
     // dlopen'd). Read it directly when populating KernelArgs.
-    kernel_args_.args.log_level = static_cast<uint32_t>(HostLogger::get_instance().level());
-    kernel_args_.args.log_info_v = static_cast<uint32_t>(HostLogger::get_instance().info_v());
+    helper.args.log_level = static_cast<uint32_t>(HostLogger::get_instance().level());
+    helper.args.log_info_v = static_cast<uint32_t>(HostLogger::get_instance().info_v());
     // Device ordinal for the AICPU executor's per-device orchestration-SO name.
-    kernel_args_.args.device_id = static_cast<uint32_t>(device_id_);
+    helper.args.device_id = static_cast<uint32_t>(device_id_);
     return 0;
 }
 

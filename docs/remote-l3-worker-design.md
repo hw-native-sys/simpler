@@ -131,8 +131,11 @@ Relevant code paths:
   - `_child_worker_loop()` runs a nested `Worker` child via shm mailbox.
   - `_run_chip_main_loop()` handles task and control mailbox states.
 - `src/common/hierarchical/worker_manager.{h,cpp}`
-  - `WorkerThread` owns one local mailbox and blocks until `TASK_DONE`.
-  - Control commands share the same mailbox and serialize on `mailbox_mu_`.
+  - `WorkerThread` owns one local mailbox and waits until `TASK_DONE`.
+  - The mailbox lock serializes payload writes and task acknowledgement.
+    After a chip child publishes `TASK_RUNNING`, selected async controls can
+    temporarily claim the same mailbox and restore `TASK_RUNNING` after
+    `CONTROL_DONE`.
   - Errors are reported through `MAILBOX_OFF_ERROR` and
     `MAILBOX_OFF_ERROR_MSG`.
 - `src/common/hierarchical/orchestrator.{h,cpp}`

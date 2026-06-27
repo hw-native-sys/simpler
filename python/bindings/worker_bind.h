@@ -242,6 +242,13 @@ inline void bind_worker(nb::module_ &m) {
         .def_ro("ok", &ControlResult::ok)
         .def_ro("error_message", &ControlResult::error_message);
 
+    nb::class_<AsyncControlResult>(m, "AsyncControlResult")
+        .def_ro("worker_type", &AsyncControlResult::worker_type)
+        .def_ro("worker_id", &AsyncControlResult::worker_id)
+        .def_ro("ok", &AsyncControlResult::ok)
+        .def_ro("remote_handle", &AsyncControlResult::remote_handle)
+        .def_ro("error_message", &AsyncControlResult::error_message);
+
     // --- TaskState ---
     nb::enum_<TaskState>(m, "TaskState")
         .value("FREE", TaskState::FREE)
@@ -422,10 +429,10 @@ inline void bind_worker(nb::module_ &m) {
         )
 
         // --- Mailbox control plane (parent side) ---
-        // These hold the per-WorkerThread mailbox_mu_ inside C++, so they
-        // serialize against dispatch_process without any Python-side lock.
-        // Release the GIL during the spin-poll wait so other Python threads
-        // (e.g. a concurrent Worker.run) can keep running.
+        // These hold the per-WorkerThread mailbox_mu_ only while claiming and
+        // driving a control request. TASK_RUNNING dispatches release that
+        // mutex after the child has copied its args, so control requests can
+        // overlap the child run lane.
         .def(
             "control_prepare",
             [](Worker &self, int worker_id, nb::object digest) {
@@ -447,6 +454,54 @@ inline void bind_worker(nb::module_ &m) {
             nb::arg("blob_ptr"), nb::arg("blob_size"), nb::arg("digest"),
             "Stage `blob_size` bytes from `blob_ptr` into a POSIX shm and broadcast "
             "CTRL_REGISTER to every NEXT_LEVEL child in parallel. Returns per-child status."
+        )
+        .def(
+            "broadcast_register_async_all",
+            [](Worker &self, uint64_t blob_ptr, uint64_t blob_size, nb::object digest) {
+                std::string digest_bytes = bytes_from_digest_arg(digest);
+                nb::gil_scoped_release release;
+                return self.broadcast_register_async_all(
+                    blob_ptr, blob_size, reinterpret_cast<const uint8_t *>(digest_bytes.data())
+                );
+            },
+            nb::arg("blob_ptr"), nb::arg("blob_size"), nb::arg("digest"),
+            "Broadcast CTRL_REGISTER_ASYNC to every NEXT_LEVEL child and return remote register handles."
+        )
+        .def(
+            "control_run_async",
+            [](Worker &self, int worker_id, nb::object digest, const TaskArgs &args, const CallConfig &config) {
+                std::string digest_bytes = bytes_from_digest_arg(digest);
+                nb::gil_scoped_release release;
+                return self.control_run_async(
+                    worker_id, reinterpret_cast<const uint8_t *>(digest_bytes.data()), args, config
+                );
+            },
+            nb::arg("worker_id"), nb::arg("digest"), nb::arg("args"), nb::arg("config"),
+            "Submit one chip-callable run to a NEXT_LEVEL child run lane and return its remote handle."
+        )
+        .def(
+            "control_wait_run",
+            [](Worker &self, int worker_id, uint64_t handle_id) {
+                nb::gil_scoped_release release;
+                return self.control_wait_run(worker_id, handle_id);
+            },
+            nb::arg("worker_id"), nb::arg("handle_id"), "Wait for a remote chip run handle and return RunTiming."
+        )
+        .def(
+            "control_wait_register",
+            [](Worker &self, int worker_id, uint64_t handle_id) {
+                nb::gil_scoped_release release;
+                self.control_wait_register(worker_id, handle_id);
+            },
+            nb::arg("worker_id"), nb::arg("handle_id"), "Wait for a remote async register handle."
+        )
+        .def(
+            "control_wait_unregister",
+            [](Worker &self, int worker_id, uint64_t handle_id) {
+                nb::gil_scoped_release release;
+                self.control_wait_unregister(worker_id, handle_id);
+            },
+            nb::arg("worker_id"), nb::arg("handle_id"), "Wait for a remote async unregister handle."
         )
         .def(
             "control_digest_only",
@@ -676,6 +731,16 @@ inline void bind_worker(nb::module_ &m) {
             "Returns a list of per-child error strings (empty on full success)."
         )
         .def(
+            "broadcast_unregister_async_all",
+            [](Worker &self, nb::object digest) {
+                std::string digest_bytes = bytes_from_digest_arg(digest);
+                nb::gil_scoped_release release;
+                return self.broadcast_unregister_async_all(reinterpret_cast<const uint8_t *>(digest_bytes.data()));
+            },
+            nb::arg("digest"),
+            "Broadcast CTRL_UNREGISTER_ASYNC to every NEXT_LEVEL child and return remote unregister handles."
+        )
+        .def(
             "broadcast_control_all",
             [](Worker &self, WorkerType worker_type, uint64_t sub_cmd, nb::object payload, nb::object digest,
                nb::object timeout_s) {
@@ -708,8 +773,8 @@ inline void bind_worker(nb::module_ &m) {
         .def(
             "control_alloc_domain", &Worker::control_alloc_domain, nb::arg("worker_id"), nb::arg("request_shm_name"),
             nb::arg("reply_shm_name"), nb::call_guard<nb::gil_scoped_release>(),
-            "Drive one NEXT_LEVEL chip child through CTRL_ALLOC_DOMAIN.  Holds mailbox_mu_ "
-            "so it serialises with task dispatch on the same mailbox.  Caller fans out to all "
+            "Drive one NEXT_LEVEL chip child through CTRL_ALLOC_DOMAIN. Memory/domain controls "
+            "wait behind in-flight task dispatch. Caller fans out to all "
             "participating chips in parallel (one Python thread per chip)."
         )
         .def(

@@ -99,6 +99,18 @@ public:
     // Forward CTRL_PREPARE to a specific NEXT_LEVEL worker (prewarm path
     // used by the Python facade at end of _start_hierarchical).
     void control_prepare(int worker_id, const uint8_t *digest) { manager_.control_prepare(worker_id, digest); }
+    uint64_t control_run_async(int worker_id, const uint8_t *digest, const TaskArgs &args, const CallConfig &config) {
+        return manager_.control_run_async(worker_id, digest, args, config);
+    }
+    RunTiming control_wait_run(int worker_id, uint64_t handle_id) {
+        return manager_.control_wait_run(worker_id, handle_id);
+    }
+    void control_wait_register(int worker_id, uint64_t handle_id) {
+        manager_.control_wait_register(worker_id, handle_id);
+    }
+    void control_wait_unregister(int worker_id, uint64_t handle_id) {
+        manager_.control_wait_unregister(worker_id, handle_id);
+    }
 
     // Drive a single chip child through one CommDomain alloc / release.  The
     // Python orch facade is expected to call this on every participating chip
@@ -178,6 +190,15 @@ public:
         return manager_.broadcast_register_all(
             reinterpret_cast<const void *>(blob_ptr), static_cast<size_t>(blob_size), digest
         );
+    }
+    std::vector<AsyncControlResult>
+    broadcast_register_async_all(uint64_t blob_ptr, uint64_t blob_size, const uint8_t *digest) {
+        return manager_.broadcast_register_async_all(
+            reinterpret_cast<const void *>(blob_ptr), static_cast<size_t>(blob_size), digest
+        );
+    }
+    std::vector<AsyncControlResult> broadcast_unregister_async_all(const uint8_t *digest) {
+        return manager_.broadcast_unregister_async_all(digest);
     }
     std::vector<std::string> broadcast_unregister_all(const uint8_t *digest) {
         return manager_.broadcast_unregister_all(digest);

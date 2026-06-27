@@ -63,6 +63,7 @@ import ctypes
 import importlib
 import json
 import os
+import queue
 import re
 import signal
 import socket
@@ -71,7 +72,7 @@ import sys
 import threading
 import time
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from multiprocessing.shared_memory import SharedMemory
 from typing import Any
 
@@ -107,6 +108,7 @@ from .task_interface import (
     CallConfig,
     ChipCallable,
     ChipDomainContext,
+    ChipStorageTaskArgs,
     ChipWorker,
     CommBufferSpec,
     CommDomainHandle,
@@ -175,6 +177,7 @@ _CONTROL_DONE = 5
 # INIT_DONE before allowing any dispatch — keeps cross-rank init skew out
 # of the per-rank host-side stream sync budget (issue #897).
 _INIT_DONE = 6
+_TASK_RUNNING = 7
 
 # Control sub-commands (written at _OFF_CALLABLE as uint64)
 _CTRL_MALLOC = 0
@@ -210,6 +213,12 @@ _CTRL_PY_REGISTER = 10
 _CTRL_PY_UNREGISTER = 11
 _CTRL_PY_IMPORT_REGISTER = 12
 _CTRL_L3_L2_ORCH_COMM_INIT = 13
+_CTRL_REGISTER_ASYNC = 14
+_CTRL_WAIT_REGISTER = 15
+_CTRL_RUN_ASYNC = 16
+_CTRL_WAIT_RUN = 17
+_CTRL_UNREGISTER_ASYNC = 18
+_CTRL_WAIT_UNREGISTER = 19
 
 # Layout of the CTRL_COMM_INIT request shm.
 _COMM_INIT_HEADER = struct.Struct("<II")  # rank (u32), nranks (u32)
@@ -254,6 +263,11 @@ _CTRL_OFF_ARG0 = 16
 _CTRL_OFF_ARG1 = 24
 _CTRL_OFF_ARG2 = 32
 _CTRL_OFF_RESULT = 40
+_CTRL_OFF_RESULT1 = 48
+
+_ASYNC_RUN_OFF_DIGEST = 0
+_ASYNC_RUN_OFF_CONFIG = _ASYNC_RUN_OFF_DIGEST + CALLABLE_HASH_DIGEST_BYTES
+_ASYNC_RUN_OFF_ARGS_BLOB = (_ASYNC_RUN_OFF_CONFIG + _CFG_FMT.size + 7) & ~7
 
 
 @dataclass
@@ -267,6 +281,177 @@ class _CallableRegistration:
     payload_digest: bytes
     payload: bytes | None = None
     eligible_worker_ids: tuple[int, ...] = ()
+
+
+@dataclass
+class _LocalRunState:
+    cv: threading.Condition = field(default_factory=threading.Condition)
+    completed: bool = False
+    result: RunTiming | None = None
+    error: BaseException | None = None
+
+
+@dataclass
+class _LocalRunRequest:
+    slot_id: int
+    args: ChipStorageTaskArgs | TaskArgs
+    config: CallConfig
+    state: _LocalRunState
+
+
+@dataclass
+class _LocalRegisterState:
+    cv: threading.Condition = field(default_factory=threading.Condition)
+    completed: bool = False
+    error: BaseException | None = None
+
+
+@dataclass
+class _LocalRegisterRequest:
+    digest: bytes
+    slot_id: int
+    callable_bytes: bytes
+    state: _LocalRegisterState
+
+
+@dataclass
+class _UnregisterState:
+    cv: threading.Condition = field(default_factory=threading.Condition)
+    completed: bool = False
+    error: BaseException | None = None
+
+
+@dataclass
+class _DagRunState:
+    cv: threading.Condition = field(default_factory=threading.Condition)
+    completed: bool = False
+    result: RunTiming | None = None
+    error: BaseException | None = None
+
+
+@dataclass
+class _DagRunRequest:
+    orch_fn: Any
+    args: Any
+    config: CallConfig
+    state: _DagRunState
+
+
+@dataclass
+class _ChildRunState:
+    cv: threading.Condition = field(default_factory=threading.Condition)
+    completed: bool = False
+    result: RunTiming | None = None
+    error: BaseException | None = None
+
+
+@dataclass
+class _ChildRunRequest:
+    cid: int
+    args_blob: bytes
+    config: CallConfig
+    state: _ChildRunState
+    publish_task_done: bool = False
+
+
+@dataclass
+class _ChildRegisterState:
+    cv: threading.Condition = field(default_factory=threading.Condition)
+    completed: bool = False
+    error: BaseException | None = None
+
+
+@dataclass
+class _ChildRegisterRequest:
+    digest: bytes
+    callable_bytes: bytearray
+    state: _ChildRegisterState
+
+
+@dataclass
+class _ChildUnregisterState:
+    cv: threading.Condition = field(default_factory=threading.Condition)
+    completed: bool = False
+    error: BaseException | None = None
+
+
+@dataclass
+class _ChildUnregisterRequest:
+    digest: bytes
+    cid: int
+    state: _ChildUnregisterState
+
+
+class RunHandle:
+    """Completion handle returned by Worker.run_async()."""
+
+    def __init__(self, waiter, completed_probe) -> None:
+        self._waiter = waiter
+        self._completed_probe = completed_probe
+        self._cached: RunTiming | None = None
+        self._waited = False
+        self._lock = threading.Lock()
+
+    @property
+    def completed(self) -> bool:
+        if self._waited:
+            return True
+        return bool(self._completed_probe())
+
+    def wait(self) -> RunTiming:
+        with self._lock:
+            if not self._waited:
+                self._cached = self._waiter()
+                self._waited = True
+            assert self._cached is not None
+            return self._cached
+
+
+class RegisterHandle:
+    """Completion handle returned by Worker.register_async()."""
+
+    def __init__(self, waiter, completed_probe) -> None:
+        self._waiter = waiter
+        self._completed_probe = completed_probe
+        self._cached: CallableHandle | None = None
+        self._waited = False
+        self._lock = threading.Lock()
+
+    @property
+    def completed(self) -> bool:
+        if self._waited:
+            return True
+        return bool(self._completed_probe())
+
+    def wait(self) -> CallableHandle:
+        with self._lock:
+            if not self._waited:
+                self._cached = self._waiter()
+                self._waited = True
+            assert self._cached is not None
+            return self._cached
+
+
+class UnregisterHandle:
+    """Completion handle returned by Worker.unregister_async()."""
+
+    def __init__(self, waiter, completed_probe) -> None:
+        self._waiter = waiter
+        self._completed_probe = completed_probe
+        self._waited = False
+        self._lock = threading.Lock()
+
+    @property
+    def completed(self) -> bool:
+        if self._waited:
+            return True
+        return bool(self._completed_probe())
+
+    def wait(self) -> None:
+        with self._lock:
+            if not self._waited:
+                self._waiter()
+                self._waited = True
 
 
 @dataclass(frozen=True)
@@ -528,6 +713,10 @@ def _validate_chip_payload_digest(
     _validate_descriptor_digest(expected=digest, descriptor=descriptor, context=context)
 
 
+def _chip_callable_bytes(target: ChipCallable) -> bytes:
+    return ctypes.string_at(int(target.buffer_ptr()), int(target.buffer_size()))
+
+
 def _read_py_callable_payload_from_shm(shm_name: str) -> bytes:
     shm = SharedMemory(name=shm_name)
     shm_buf = shm.buf
@@ -555,7 +744,7 @@ def _read_py_callable_payload_from_shm(shm_name: str) -> bytes:
 
 
 def _read_raw_payload_from_shm(shm_name: str, payload_size: int) -> bytes:
-    shm = SharedMemory(name=shm_name)
+    shm = _attach_cpp_owned_shm(shm_name)
     shm_buf = shm.buf
     assert shm_buf is not None
     try:
@@ -568,7 +757,7 @@ def _read_raw_payload_from_shm(shm_name: str, payload_size: int) -> bytes:
 
 
 def _read_chip_callable_from_shm(shm_name: str, payload_size: int) -> ChipCallable:
-    shm = SharedMemory(name=shm_name)
+    shm = _attach_cpp_owned_shm(shm_name)
     shm_buf = shm.buf
     assert shm_buf is not None
     try:
@@ -592,6 +781,19 @@ def _load_py_callable_from_shm(shm_name: str):
     return _load_py_callable_from_payload(_read_py_callable_payload_from_shm(shm_name))
 
 
+def _attach_cpp_owned_shm(shm_name: str) -> SharedMemory:
+    shm = SharedMemory(name=shm_name)
+    normalized = shm_name.lstrip("/")
+    if normalized.startswith("simpler-cb-"):
+        try:
+            from multiprocessing import resource_tracker  # noqa: PLC0415
+
+            resource_tracker.unregister(shm._name, "shared_memory")  # pyright: ignore[reportAttributeAccessIssue]
+        except Exception:
+            pass
+    return shm
+
+
 def _load_py_import_target(target: str):
     module_name, qualname = parse_python_import_target(target)
     obj = importlib.import_module(module_name)
@@ -612,6 +814,88 @@ def _read_task_digest(buf) -> bytes:
 
 def _format_digest(digest: bytes) -> str:
     return "sha256:" + digest.hex()
+
+
+def _read_config_from_bytes(data: bytes | bytearray | memoryview, offset: int) -> CallConfig:
+    (
+        block_dim,
+        aicpu_tn,
+        swl,
+        dt,
+        pmu,
+        dep_gen,
+        scope_stats,
+        *ring_values,
+        prefix_bytes,
+    ) = _CFG_FMT.unpack_from(data, offset)
+    ring_task_window = list(ring_values[:RUNTIME_ENV_RING_COUNT])
+    ring_heap = list(ring_values[RUNTIME_ENV_RING_COUNT : 2 * RUNTIME_ENV_RING_COUNT])
+    ring_dep_pool = list(ring_values[2 * RUNTIME_ENV_RING_COUNT : 3 * RUNTIME_ENV_RING_COUNT])
+    cfg = CallConfig()
+    cfg.block_dim = block_dim
+    cfg.aicpu_thread_num = aicpu_tn
+    cfg.enable_l2_swimlane = swl
+    cfg.enable_dump_tensor = int(dt)
+    cfg.enable_pmu = pmu
+    cfg.enable_dep_gen = bool(dep_gen)
+    cfg.enable_scope_stats = bool(scope_stats)
+    cfg.runtime_env.ring_task_window = ring_task_window
+    cfg.runtime_env.ring_heap = ring_heap
+    cfg.runtime_env.ring_dep_pool = ring_dep_pool
+    cfg.output_prefix = prefix_bytes.split(b"\x00", 1)[0].decode("utf-8")
+    return cfg
+
+
+def _decode_async_run_request(payload: bytes) -> tuple[bytes, bytes, CallConfig]:
+    if len(payload) < _ASYNC_RUN_OFF_ARGS_BLOB + 8:
+        raise RuntimeError(f"RUN_ASYNC payload too small: {len(payload)} bytes")
+    digest = bytes(payload[_ASYNC_RUN_OFF_DIGEST : _ASYNC_RUN_OFF_DIGEST + CALLABLE_HASH_DIGEST_BYTES])
+    cfg = _read_config_from_bytes(payload, _ASYNC_RUN_OFF_CONFIG)
+    return digest, bytes(payload[_ASYNC_RUN_OFF_ARGS_BLOB:]), cfg
+
+
+def _copy_call_config(config: CallConfig | None) -> CallConfig:
+    src = config if config is not None else CallConfig()
+    dst = CallConfig()
+    dst.block_dim = src.block_dim
+    dst.aicpu_thread_num = src.aicpu_thread_num
+    dst.enable_l2_swimlane = src.enable_l2_swimlane
+    dst.enable_dump_tensor = int(src.enable_dump_tensor)
+    dst.enable_pmu = src.enable_pmu
+    dst.enable_dep_gen = bool(src.enable_dep_gen)
+    dst.enable_scope_stats = bool(src.enable_scope_stats)
+    dst.runtime_env.ring_task_window = list(src.runtime_env.ring_task_window)
+    dst.runtime_env.ring_heap = list(src.runtime_env.ring_heap)
+    dst.runtime_env.ring_dep_pool = list(src.runtime_env.ring_dep_pool)
+    dst.output_prefix = src.output_prefix
+    return dst
+
+
+def _copy_run_args(args, *, prefer_task_args: bool) -> ChipStorageTaskArgs | TaskArgs:
+    if args is None:
+        return TaskArgs() if prefer_task_args else ChipStorageTaskArgs()
+    if isinstance(args, TaskArgs):
+        copied = TaskArgs()
+        for i in range(args.tensor_count()):
+            copied.add_tensor(args.tensor(i), args.tag(i))
+        for i in range(args.scalar_count()):
+            copied.add_scalar(args.scalar(i))
+        return copied
+    if isinstance(args, ChipStorageTaskArgs):
+        if prefer_task_args:
+            copied_task = TaskArgs()
+            for i in range(args.tensor_count()):
+                copied_task.add_tensor(args.tensor(i))
+            for i in range(args.scalar_count()):
+                copied_task.add_scalar(args.scalar(i))
+            return copied_task
+        copied_chip = ChipStorageTaskArgs()
+        for i in range(args.tensor_count()):
+            copied_chip.add_tensor(args.tensor(i))
+        for i in range(args.scalar_count()):
+            copied_chip.add_scalar(args.scalar(i))
+        return copied_chip
+    raise TypeError("run_async args must be TaskArgs, ChipStorageTaskArgs, or None")
 
 
 def _handle_py_callable_control(
@@ -954,6 +1238,122 @@ def _ensure_prepared(cw, registry, prepared, cid: int, *, lazy: bool, device_id:
     prepared.add(cid)
 
 
+def _wait_child_run_state(state: _ChildRunState) -> RunTiming:
+    with state.cv:
+        while not state.completed:
+            state.cv.wait()
+        if state.error is not None:
+            raise state.error
+        assert state.result is not None
+        return state.result
+
+
+def _wait_child_register_state(state: _ChildRegisterState) -> None:
+    with state.cv:
+        while not state.completed:
+            state.cv.wait()
+        if state.error is not None:
+            raise state.error
+
+
+def _wait_child_unregister_state(state: _ChildUnregisterState) -> None:
+    with state.cv:
+        while not state.completed:
+            state.cv.wait()
+        if state.error is not None:
+            raise state.error
+
+
+def _complete_child_run(state: _ChildRunState, *, result: RunTiming | None = None, error: BaseException | None = None):
+    with state.cv:
+        state.result = result
+        state.error = error
+        state.completed = True
+        state.cv.notify_all()
+
+
+def _complete_child_register(state: _ChildRegisterState, error: BaseException | None = None) -> None:
+    with state.cv:
+        state.error = error
+        state.completed = True
+        state.cv.notify_all()
+
+
+def _complete_child_unregister(state: _ChildUnregisterState, error: BaseException | None = None) -> None:
+    with state.cv:
+        state.error = error
+        state.completed = True
+        state.cv.notify_all()
+
+
+def _prepare_child_register_bytes(  # noqa: PLR0913
+    cw: ChipWorker,
+    registry: dict[int, Any],
+    identity_table: dict[bytes, int],
+    identity_refs: dict[bytes, int],
+    prepared: set[int],
+    registry_lock: threading.Condition,
+    digest: bytes,
+    callable_bytes: bytearray,
+    *,
+    chip_platform: str,
+    chip_runtime: str,
+    device_id: int,
+) -> int:
+    callable_obj = ChipCallable.from_bytes(bytes(callable_bytes))
+    _validate_chip_payload_digest(
+        callable_obj,
+        digest,
+        platform=chip_platform,
+        runtime=chip_runtime,
+        context=f"chip_process dev={device_id}",
+    )
+    with registry_lock:
+        if digest in identity_table:
+            identity_refs[digest] = identity_refs.get(digest, 1) + 1
+            return int(identity_table[digest])
+        cid = _install_local_identity(registry, identity_table, identity_refs, digest, callable_obj)
+        if int(cid) in prepared:
+            try:
+                cw._unregister_slot(int(cid))
+            except Exception:  # noqa: BLE001
+                pass
+            prepared.discard(int(cid))
+        exported = ctypes.c_char.from_buffer(callable_bytes)
+        try:
+            cw._impl.prepare_callable_from_blob(int(cid), ctypes.addressof(exported))
+        except Exception:
+            if registry.get(int(cid)) is callable_obj:
+                registry.pop(int(cid), None)
+            identity_table.pop(digest, None)
+            identity_refs.pop(digest, None)
+            raise
+        finally:
+            del exported
+        prepared.add(int(cid))
+        return int(cid)
+
+
+def _unregister_child_digest(
+    cw: ChipWorker,
+    registry: dict[int, Any],
+    identity_table: dict[bytes, int],
+    identity_refs: dict[bytes, int],
+    prepared: set[int],
+    registry_lock: threading.Condition,
+    active_cids: dict[int, int],
+    digest: bytes,
+) -> None:
+    with registry_lock:
+        cid, removed = _remove_local_identity(registry, identity_table, identity_refs, digest)
+        if not removed or cid is None:
+            return
+        while active_cids.get(int(cid), 0) > 0:
+            registry_lock.wait()
+        cw._unregister_slot(int(cid))
+        prepared.discard(int(cid))
+
+
 def _run_chip_main_loop(  # noqa: PLR0912, PLR0913, PLR0915 -- unified TASK_READY / CONTROL_REQUEST state machine
     cw: ChipWorker,
     buf: memoryview,
@@ -984,42 +1384,187 @@ def _run_chip_main_loop(  # noqa: PLR0912, PLR0913, PLR0915 -- unified TASK_READ
     """
     prepared: set[int] = set()
     l3_l2_control_shms: list[SharedMemory] = []
+    registry_cv = threading.Condition(threading.RLock())
+    active_cids: dict[int, int] = {}
+    tombstoned_cids: set[int] = set()
+    tombstoned_digests: set[bytes] = set()
+    deferred_unregister: dict[int, _ChildUnregisterState] = {}
+    digest_by_cid: dict[int, bytes] = {int(cid): digest for digest, cid in identity_table.items()}
+    run_queue: queue.Queue = queue.Queue()
+    control_queue: queue.Queue = queue.Queue()
+    run_states: dict[int, _ChildRunState] = {}
+    register_states: dict[int, _ChildRegisterState] = {}
+    unregister_states: dict[int, _ChildUnregisterState] = {}
+    next_run_handle = 1
+    next_register_handle = 1
+    next_unregister_handle = 1
+
+    def child_native_unregister_and_finish(cid: int, digest: bytes, state: _ChildUnregisterState) -> None:
+        try:
+            cw._unregister_slot(int(cid))
+            _complete_child_unregister(state)
+        except BaseException as e:  # noqa: BLE001
+            _complete_child_unregister(state, e)
+        finally:
+            with registry_cv:
+                registry.pop(int(cid), None)
+                prepared.discard(int(cid))
+                tombstoned_cids.discard(int(cid))
+                tombstoned_digests.discard(digest)
+                deferred_unregister.pop(int(cid), None)
+                digest_by_cid.pop(int(cid), None)
+                registry_cv.notify_all()
+
+    def release_child_inflight(cid: int) -> None:
+        cleanup_state: _ChildUnregisterState | None = None
+        cleanup_digest = b""
+        with registry_cv:
+            count = active_cids.get(int(cid), 0)
+            if count <= 1:
+                active_cids.pop(int(cid), None)
+                if int(cid) in tombstoned_cids:
+                    cleanup_state = deferred_unregister.get(int(cid))
+                    cleanup_digest = digest_by_cid.get(int(cid), b"")
+            else:
+                active_cids[int(cid)] = count - 1
+            registry_cv.notify_all()
+        if cleanup_state is not None:
+            child_native_unregister_and_finish(int(cid), cleanup_digest, cleanup_state)
+
+    def hold_child_cid_for_run(digest: bytes) -> int:
+        with registry_cv:
+            cid = identity_table.get(digest)
+            if cid is None or int(cid) in tombstoned_cids:
+                raise RuntimeError(f"callable hash {_format_digest(digest)} not registered")
+            _ensure_prepared(cw, registry, prepared, int(cid), lazy=True, device_id=device_id)
+            active_cids[int(cid)] = active_cids.get(int(cid), 0) + 1
+            digest_by_cid[int(cid)] = digest
+            return int(cid)
+
+    def submit_child_unregister(digest: bytes, state: _ChildUnregisterState) -> None:
+        cleanup_cid: int | None = None
+        cleanup_digest = b""
+        with registry_cv:
+            cid = identity_table.get(digest)
+            if cid is None:
+                _complete_child_unregister(state)
+                return
+            refs = identity_refs.get(digest, 1) - 1
+            if refs > 0:
+                identity_refs[digest] = refs
+                _complete_child_unregister(state)
+                return
+
+            cid_i = int(cid)
+            identity_refs.pop(digest, None)
+            identity_table.pop(digest, None)
+            tombstoned_cids.add(cid_i)
+            tombstoned_digests.add(digest)
+            digest_by_cid[cid_i] = digest
+
+            if active_cids.get(cid_i, 0) == 0:
+                cleanup_cid = cid_i
+                cleanup_digest = digest
+            else:
+                deferred_unregister[cid_i] = state
+
+        if cleanup_cid is not None:
+            child_native_unregister_and_finish(cleanup_cid, cleanup_digest, state)
+
+    def publish_task_done() -> None:
+        while _mailbox_load_i32(state_addr) in (_CONTROL_REQUEST, _CONTROL_DONE):
+            time.sleep(0.00001)
+        _mailbox_store_i32(state_addr, _TASK_DONE)
+
+    def run_thread_loop() -> None:
+        while True:
+            req = run_queue.get()
+            if req is None:
+                break
+            try:
+                args_blob = bytearray(req.args_blob)
+                exported = ctypes.c_char.from_buffer(args_blob)
+                try:
+                    timing = cw._impl.run_prepared_from_blob(
+                        int(req.cid),
+                        ctypes.addressof(exported),
+                        len(args_blob),
+                        req.config,
+                    )
+                finally:
+                    del exported
+                code = 0
+                msg = ""
+                if req.publish_task_done and on_task_done_success is not None:
+                    code, msg = on_task_done_success()
+                _complete_child_run(req.state, result=timing)
+            except BaseException as e:  # noqa: BLE001
+                code = 1
+                msg = _format_exc(f"chip_process dev={device_id}", e)
+                _complete_child_run(req.state, error=e)
+            finally:
+                release_child_inflight(int(req.cid))
+                if req.publish_task_done:
+                    _write_error(buf, code, msg)
+                    publish_task_done()
+
+    def control_thread_loop() -> None:
+        while True:
+            req = control_queue.get()
+            if req is None:
+                break
+            try:
+                with registry_cv:
+                    if req.digest in tombstoned_digests:
+                        raise RuntimeError(f"callable hash {_format_digest(req.digest)} is pending unregister")
+                    cid = _prepare_child_register_bytes(
+                        cw,
+                        registry,
+                        identity_table,
+                        identity_refs,
+                        prepared,
+                        registry_cv,
+                        req.digest,
+                        req.callable_bytes,
+                        chip_platform=chip_platform,
+                        chip_runtime=chip_runtime,
+                        device_id=device_id,
+                    )
+                    digest_by_cid[int(cid)] = req.digest
+                _complete_child_register(req.state)
+            except BaseException as e:  # noqa: BLE001
+                _complete_child_register(req.state, e)
+
+    run_thread = threading.Thread(target=run_thread_loop, name=f"simpler-chip-run-{device_id}", daemon=True)
+    control_thread = threading.Thread(
+        target=control_thread_loop,
+        name=f"simpler-chip-control-{device_id}",
+        daemon=True,
+    )
+    run_thread.start()
+    control_thread.start()
     try:
         while True:
             state = _mailbox_load_i32(state_addr)
             if state == _TASK_READY:
                 digest = _read_task_digest(buf)
-                cid = identity_table.get(digest)
                 cfg = _read_config_from_mailbox(buf)
+                args_blob = bytes(buf[_OFF_TASK_ARGS_BLOB : _OFF_TASK_ARGS_BLOB + _MAILBOX_ARGS_CAPACITY])
 
                 code = 0
                 msg = ""
+                cid: int | None = None
+                run_state: _ChildRunState | None = None
                 try:
-                    if cid is None:
-                        raise RuntimeError(f"callable hash {_format_digest(digest)} not registered")
-                    _ensure_prepared(cw, registry, prepared, cid, lazy=True, device_id=device_id)
-                    # Hand the mailbox bytes straight to C++ (zero-copy zero-decode):
-                    # the blob layout is what `write_blob` already wrote, so re-parsing
-                    # it in Python is N×40B of avoidable work and a permanent
-                    # opportunity to drop a field.  C++ reinterpret_cast<ChipStorageTaskArgs*>
-                    # is the source of truth.
-                    cw._impl.run_prepared_from_blob(
-                        cid, mailbox_addr + _OFF_TASK_ARGS_BLOB, _MAILBOX_ARGS_CAPACITY, cfg
-                    )
+                    cid = hold_child_cid_for_run(digest)
+                    run_state = _ChildRunState()
+                    run_queue.put(_ChildRunRequest(int(cid), args_blob, cfg, run_state, True))
+                    _mailbox_store_i32(state_addr, _TASK_RUNNING)
                 except Exception as e:  # noqa: BLE001
                     code = 1
                     msg = _format_exc(f"chip_process dev={device_id}", e)
-
-                # On a successful kernel run, give the caller a chance to do
-                # post-run work (e.g. store_to_host D2H staging) before the
-                # parent sees TASK_DONE. The kernel's failure path skips the
-                # hook because the device output region is undefined and
-                # staging garbage would mask the real error in post-mortems.
-                if code == 0 and on_task_done_success is not None:
-                    code, msg = on_task_done_success()
-
-                _write_error(buf, code, msg)
-                _mailbox_store_i32(state_addr, _TASK_DONE)
+                    _write_error(buf, code, msg)
+                    _mailbox_store_i32(state_addr, _TASK_DONE)
             elif state == _CONTROL_REQUEST:
                 sub_cmd = struct.unpack_from("Q", buf, _OFF_CALLABLE)[0]
                 code = 0
@@ -1044,68 +1589,100 @@ def _run_chip_main_loop(  # noqa: PLR0912, PLR0913, PLR0915 -- unified TASK_READ
                         cw.copy_from(dst, src, n)
                     elif sub_cmd == _CTRL_PREPARE:
                         digest = _read_control_digest(buf)
-                        cid = identity_table.get(digest)
-                        if cid is None:
-                            raise RuntimeError(
-                                f"prepare chip={device_id}: callable hash {_format_digest(digest)} not registered"
-                            )
-                        _ensure_prepared(cw, registry, prepared, int(cid), lazy=False, device_id=device_id)
+                        with registry_cv:
+                            cid = identity_table.get(digest)
+                            if cid is None or int(cid) in tombstoned_cids:
+                                raise RuntimeError(
+                                    f"prepare chip={device_id}: callable hash {_format_digest(digest)} not registered"
+                                )
+                            _ensure_prepared(cw, registry, prepared, int(cid), lazy=False, device_id=device_id)
                     elif sub_cmd == _CTRL_REGISTER:
                         digest = _read_control_digest(buf)
                         payload_size = struct.unpack_from("Q", buf, _CTRL_OFF_ARG0)[0]
-                        raw = bytes(buf[_OFF_ARGS : _OFF_ARGS + _CTRL_SHM_NAME_BYTES])
-                        nul = raw.find(b"\x00")
-                        shm_name = raw[: nul if nul >= 0 else _CTRL_SHM_NAME_BYTES].decode("utf-8", "replace")
-                        shm = SharedMemory(name=shm_name)
-                        shm_buf = shm.buf
-                        assert shm_buf is not None
-                        try:
-                            if payload_size <= 0 or payload_size > shm.size:
-                                raise RuntimeError(
-                                    f"CTRL_REGISTER payload size mismatch: payload={payload_size}, shm={shm.size}"
-                                )
-                            callable_obj = ChipCallable.from_bytes(bytes(shm_buf[:payload_size]))
-                            _validate_chip_payload_digest(
-                                callable_obj,
+                        shm_name = _read_shm_name(buf, _OFF_ARGS)
+                        callable_bytes = bytearray(_read_raw_payload_from_shm(shm_name, int(payload_size)))
+                        with registry_cv:
+                            if digest in tombstoned_digests:
+                                raise RuntimeError(f"callable hash {_format_digest(digest)} is pending unregister")
+                            cid = _prepare_child_register_bytes(
+                                cw,
+                                registry,
+                                identity_table,
+                                identity_refs,
+                                prepared,
+                                registry_cv,
                                 digest,
-                                platform=chip_platform,
-                                runtime=chip_runtime,
-                                context=f"chip_process dev={device_id}",
+                                callable_bytes,
+                                chip_platform=chip_platform,
+                                chip_runtime=chip_runtime,
+                                device_id=device_id,
                             )
-                            if digest in identity_table:
-                                identity_refs[digest] = identity_refs.get(digest, 1) + 1
-                            else:
-                                cid = _install_local_identity(
-                                    registry, identity_table, identity_refs, digest, callable_obj
-                                )
-                                # Self-heal when a prior unregister popped the local
-                                # identity table but failed before clearing device
-                                # prepared state for the reusable private slot.
-                                if int(cid) in prepared:
-                                    try:
-                                        cw._unregister_slot(int(cid))
-                                    except Exception:  # noqa: BLE001
-                                        pass
-                                    prepared.discard(int(cid))
-                                exported = ctypes.c_char.from_buffer(shm_buf)
-                                try:
-                                    addr = ctypes.addressof(exported)
-                                    cw._impl.prepare_callable_from_blob(int(cid), addr)
-                                finally:
-                                    del exported
-                                prepared.add(int(cid))
+                            digest_by_cid[int(cid)] = digest
+                    elif sub_cmd == _CTRL_REGISTER_ASYNC:
+                        digest = _read_control_digest(buf)
+                        payload_size = struct.unpack_from("Q", buf, _CTRL_OFF_ARG0)[0]
+                        shm_name = _read_shm_name(buf, _OFF_ARGS)
+                        callable_bytes = bytearray(_read_raw_payload_from_shm(shm_name, int(payload_size)))
+                        reg_state = _ChildRegisterState()
+                        handle_id = next_register_handle
+                        next_register_handle += 1
+                        register_states[handle_id] = reg_state
+                        control_queue.put(_ChildRegisterRequest(digest, callable_bytes, reg_state))
+                        struct.pack_into("Q", buf, _CTRL_OFF_RESULT, int(handle_id))
+                    elif sub_cmd == _CTRL_WAIT_REGISTER:
+                        handle_id = int(struct.unpack_from("Q", buf, _CTRL_OFF_ARG0)[0])
+                        reg_state = register_states.get(handle_id)
+                        if reg_state is None:
+                            raise RuntimeError(f"WAIT_REGISTER unknown handle {handle_id}")
+                        try:
+                            _wait_child_register_state(reg_state)
                         finally:
-                            shm_buf.release()
-                            # Release the local mmap as soon as prepare returns;
-                            # prepare_callable has already H2D-copied the bytes to
-                            # device GM, so the child no longer needs the shm.
-                            shm.close()
+                            register_states.pop(handle_id, None)
+                    elif sub_cmd == _CTRL_RUN_ASYNC:
+                        payload_size = struct.unpack_from("Q", buf, _CTRL_OFF_ARG0)[0]
+                        shm_name = _read_shm_name(buf, _OFF_ARGS)
+                        payload = _read_raw_payload_from_shm(shm_name, int(payload_size))
+                        digest, args_blob, cfg = _decode_async_run_request(payload)
+                        run_state = _ChildRunState()
+                        handle_id = next_run_handle
+                        next_run_handle += 1
+                        run_states[handle_id] = run_state
+                        cid = hold_child_cid_for_run(digest)
+                        run_queue.put(_ChildRunRequest(cid, args_blob, cfg, run_state))
+                        struct.pack_into("Q", buf, _CTRL_OFF_RESULT, int(handle_id))
+                    elif sub_cmd == _CTRL_WAIT_RUN:
+                        handle_id = int(struct.unpack_from("Q", buf, _CTRL_OFF_ARG0)[0])
+                        run_state = run_states.get(handle_id)
+                        if run_state is None:
+                            raise RuntimeError(f"WAIT_RUN unknown handle {handle_id}")
+                        try:
+                            timing = _wait_child_run_state(run_state)
+                        finally:
+                            run_states.pop(handle_id, None)
+                        struct.pack_into("Q", buf, _CTRL_OFF_RESULT, int(timing.host_wall_ns))
+                        struct.pack_into("Q", buf, _CTRL_OFF_RESULT1, int(timing.device_wall_ns))
                     elif sub_cmd == _CTRL_UNREGISTER:
                         digest = _read_control_digest(buf)
-                        cid, removed = _remove_local_identity(registry, identity_table, identity_refs, digest)
-                        if removed and cid is not None:
-                            cw._unregister_slot(int(cid))
-                            prepared.discard(int(cid))
+                        unreg_state = _ChildUnregisterState()
+                        submit_child_unregister(digest, unreg_state)
+                        _wait_child_unregister_state(unreg_state)
+                    elif sub_cmd == _CTRL_UNREGISTER_ASYNC:
+                        digest = _read_control_digest(buf)
+                        unreg_state = _ChildUnregisterState()
+                        handle_id = next_unregister_handle
+                        next_unregister_handle += 1
+                        unregister_states[handle_id] = unreg_state
+                        submit_child_unregister(digest, unreg_state)
+                        struct.pack_into("Q", buf, _CTRL_OFF_RESULT, int(handle_id))
+                    elif sub_cmd == _CTRL_WAIT_UNREGISTER:
+                        handle_id = int(struct.unpack_from("Q", buf, _CTRL_OFF_ARG0)[0])
+                        unreg_state = unregister_states.get(handle_id)
+                        if unreg_state is None:
+                            raise RuntimeError(f"WAIT_UNREGISTER unknown handle {handle_id}")
+                        try:
+                            _wait_child_unregister_state(unreg_state)
+                        finally:
+                            unregister_states.pop(handle_id, None)
                     elif sub_cmd == _CTRL_ALLOC_DOMAIN:
                         _handle_ctrl_alloc_domain(cw, buf)
                     elif sub_cmd == _CTRL_RELEASE_DOMAIN:
@@ -1118,16 +1695,33 @@ def _run_chip_main_loop(  # noqa: PLR0912, PLR0913, PLR0915 -- unified TASK_READ
                         raise RuntimeError(f"unknown control sub-command {int(sub_cmd)}")
                 except Exception as e:  # noqa: BLE001
                     code = 1
-                    if sub_cmd in (_CTRL_REGISTER, _CTRL_UNREGISTER):
-                        op = "register" if sub_cmd == _CTRL_REGISTER else "unregister"
+                    if sub_cmd in (
+                        _CTRL_REGISTER,
+                        _CTRL_REGISTER_ASYNC,
+                        _CTRL_WAIT_REGISTER,
+                        _CTRL_UNREGISTER,
+                        _CTRL_UNREGISTER_ASYNC,
+                        _CTRL_WAIT_UNREGISTER,
+                    ):
+                        op = (
+                            "register"
+                            if sub_cmd in (_CTRL_REGISTER, _CTRL_REGISTER_ASYNC, _CTRL_WAIT_REGISTER)
+                            else "unregister"
+                        )
                         msg = _format_exc(f"{op} hash={_format_digest(_read_control_digest(buf))} chip={device_id}", e)
                     else:
                         msg = _format_exc(f"chip_process dev={device_id} ctrl={int(sub_cmd)}", e)
                 _write_error(buf, code, msg)
                 _mailbox_store_i32(state_addr, _CONTROL_DONE)
+            elif state == _TASK_RUNNING:
+                time.sleep(0.00001)
             elif state == _SHUTDOWN:
                 break
     finally:
+        run_queue.put(None)
+        control_queue.put(None)
+        run_thread.join()
+        control_thread.join()
         if l3_l2_control_shms:
             try:
                 cw.l3_l2_orch_comm_shutdown()
@@ -1208,34 +1802,7 @@ def _chip_process_loop(
 
 def _read_config_from_mailbox(buf: memoryview) -> CallConfig:
     """Reconstruct a CallConfig from the unified mailbox layout."""
-    (
-        block_dim,
-        aicpu_tn,
-        swl,
-        dt,
-        pmu,
-        dep_gen,
-        scope_stats,
-        *ring_values,
-        prefix_bytes,
-    ) = _CFG_FMT.unpack_from(buf, _OFF_CONFIG)
-    ring_task_window = list(ring_values[:RUNTIME_ENV_RING_COUNT])
-    ring_heap = list(ring_values[RUNTIME_ENV_RING_COUNT : 2 * RUNTIME_ENV_RING_COUNT])
-    ring_dep_pool = list(ring_values[2 * RUNTIME_ENV_RING_COUNT : 3 * RUNTIME_ENV_RING_COUNT])
-    cfg = CallConfig()
-    cfg.block_dim = block_dim
-    cfg.aicpu_thread_num = aicpu_tn
-    cfg.enable_l2_swimlane = swl
-    cfg.enable_dump_tensor = int(dt)
-    cfg.enable_pmu = pmu
-    cfg.enable_dep_gen = bool(dep_gen)
-    cfg.enable_scope_stats = bool(scope_stats)
-    cfg.runtime_env.ring_task_window = ring_task_window
-    cfg.runtime_env.ring_heap = ring_heap
-    cfg.runtime_env.ring_dep_pool = ring_dep_pool
-    # NUL-terminated C string in a 1024-byte field.
-    cfg.output_prefix = prefix_bytes.split(b"\x00", 1)[0].decode("utf-8")
-    return cfg
+    return _read_config_from_bytes(buf, _OFF_CONFIG)
 
 
 def _child_worker_loop(
@@ -1387,10 +1954,20 @@ class Worker:
 
         # Level-2 internals
         self._chip_worker: ChipWorker | None = None
+        self._run_queue: queue.Queue | None = None
+        self._run_thread: threading.Thread | None = None
+        self._register_queue: queue.Queue | None = None
+        self._register_thread: threading.Thread | None = None
+        self._run_thread_stop = False
+        self._slot_inflight: dict[int, int] = {}
+        self._slot_tombstoned: set[int] = set()
+        self._slot_pending_unregister: dict[int, _UnregisterState] = {}
 
         # Level-3+ internals
         self._worker: _Worker | None = None
         self._orch: Orchestrator | None = None
+        self._dag_run_queue: queue.Queue | None = None
+        self._dag_run_thread: threading.Thread | None = None
         self._chip_shms: list[SharedMemory] = []
         self._chip_pids: list[int] = []
         self._sub_shms: list[SharedMemory] = []
@@ -1482,6 +2059,154 @@ class Worker:
         if timeout_s <= 0:
             raise ValueError("Worker remote_session_timeout_s must be positive")
         return timeout_s
+
+    def _start_l2_lanes(self) -> None:
+        if self._run_thread is not None:
+            return
+        self._run_queue = queue.Queue()
+        self._register_queue = queue.Queue()
+        self._run_thread_stop = False
+        self._run_thread = threading.Thread(target=self._l2_run_thread_loop, name="simpler-l2-run", daemon=True)
+        self._register_thread = threading.Thread(
+            target=self._l2_register_thread_loop,
+            name="simpler-l2-register",
+            daemon=True,
+        )
+        self._run_thread.start()
+        self._register_thread.start()
+
+    def _stop_l2_lanes(self) -> None:
+        q = self._run_queue
+        t = self._run_thread
+        rq = self._register_queue
+        rt = self._register_thread
+        if q is None or t is None:
+            return
+        self._run_thread_stop = True
+        q.put(None)
+        if rq is not None:
+            rq.put(None)
+        t.join()
+        if rt is not None:
+            rt.join()
+        self._run_queue = None
+        self._run_thread = None
+        self._register_queue = None
+        self._register_thread = None
+
+    def _start_l2_run_lane(self) -> None:
+        self._start_l2_lanes()
+
+    def _stop_l2_run_lane(self) -> None:
+        self._stop_l2_lanes()
+
+    def _complete_local_register(self, state: _LocalRegisterState, error: BaseException | None = None) -> None:
+        with state.cv:
+            state.error = error
+            state.completed = True
+            state.cv.notify_all()
+
+    def _wait_local_register(self, state: _LocalRegisterState) -> None:
+        with state.cv:
+            while not state.completed:
+                state.cv.wait()
+            if state.error is not None:
+                raise state.error
+
+    def _l2_run_thread_loop(self) -> None:
+        assert self._run_queue is not None
+        while True:
+            req = self._run_queue.get()
+            if req is None:
+                break
+            assert isinstance(req, _LocalRunRequest)
+            try:
+                assert self._chip_worker is not None
+                timing = self._chip_worker._run_slot(req.slot_id, req.args, req.config)
+                with req.state.cv:
+                    req.state.result = timing
+                    req.state.completed = True
+                    req.state.cv.notify_all()
+            except BaseException as e:  # noqa: BLE001
+                with req.state.cv:
+                    req.state.error = e
+                    req.state.completed = True
+                    req.state.cv.notify_all()
+            finally:
+                self._release_l2_slot_inflight(req.slot_id)
+
+    def _l2_register_thread_loop(self) -> None:
+        assert self._register_queue is not None
+        while True:
+            req = self._register_queue.get()
+            if req is None:
+                break
+            assert isinstance(req, _LocalRegisterRequest)
+            try:
+                assert self._chip_worker is not None
+                callable_obj = ChipCallable.from_bytes(req.callable_bytes)
+                platform = str(self._config.get("platform", ""))
+                runtime = str(self._config.get("runtime", ""))
+                _validate_chip_payload_digest(
+                    callable_obj,
+                    req.digest,
+                    platform=platform,
+                    runtime=runtime,
+                    context="Worker.register_async level=2",
+                )
+                self._chip_worker._prepare_callable_at_slot(req.slot_id, callable_obj)
+                self._complete_local_register(req.state)
+            except BaseException as e:  # noqa: BLE001
+                self._complete_local_register(req.state, e)
+
+    def _complete_unregister_state(self, state: _UnregisterState, error: BaseException | None = None) -> None:
+        with state.cv:
+            state.error = error
+            state.completed = True
+            state.cv.notify_all()
+
+    def _wait_unregister_state(self, state: _UnregisterState) -> None:
+        with state.cv:
+            while not state.completed:
+                state.cv.wait()
+            if state.error is not None:
+                raise state.error
+
+    def _release_l2_slot_inflight(self, slot_id: int) -> None:
+        cleanup_state: _UnregisterState | None = None
+        cleanup_digest = b""
+        with self._registry_lock:
+            count = self._slot_inflight.get(int(slot_id), 0)
+            if count <= 1:
+                self._slot_inflight.pop(int(slot_id), None)
+                if int(slot_id) in self._slot_tombstoned:
+                    cleanup_state = self._slot_pending_unregister.get(int(slot_id))
+                    for digest, state in self._identity_registry.items():
+                        if state.slot_id == int(slot_id):
+                            cleanup_digest = digest
+                            break
+            else:
+                self._slot_inflight[int(slot_id)] = count - 1
+        if cleanup_state is not None:
+            self._l2_native_unregister_and_finish(int(slot_id), cleanup_digest, cleanup_state)
+
+    def _l2_native_unregister_and_finish(self, slot_id: int, digest: bytes, state: _UnregisterState) -> None:
+        try:
+            assert self._chip_worker is not None
+            self._chip_worker._unregister_slot(int(slot_id))
+            self._complete_unregister_state(state)
+        except BaseException as e:  # noqa: BLE001
+            if digest:
+                self._uncertain_hashids.add(digest)
+            self._complete_unregister_state(state, e)
+        finally:
+            with self._registry_lock:
+                self._callable_registry.pop(int(slot_id), None)
+                if digest:
+                    self._identity_registry.pop(digest, None)
+                self._pending_unregister_cids.discard(int(slot_id))
+                self._slot_tombstoned.discard(int(slot_id))
+                self._slot_pending_unregister.pop(int(slot_id), None)
 
     @staticmethod
     def _send_remote_daemon_json(sock: socket.socket, payload: dict[str, Any]) -> None:
@@ -2062,6 +2787,95 @@ class Worker:
             return self._resolve_handle_locked(handle, expected_namespace=expected_namespace)
 
     def register(self, target, *, workers: list[int] | None = None) -> CallableHandle:
+        if isinstance(target, ChipCallable) and not isinstance(target, RemoteCallable):
+            return self.register_async(target, workers=workers).wait()
+        return self._register_sync_impl(target, workers=workers)
+
+    def register_async(self, target, *, workers: list[int] | None = None) -> RegisterHandle:
+        if not isinstance(target, ChipCallable) or isinstance(target, RemoteCallable):
+            raise TypeError("Worker.register_async only supports ChipCallable")
+        if workers is not None:
+            raise TypeError("Worker.register_async: workers= is only supported for synchronous RemoteCallable register")
+
+        if self.level >= 3 and self._initialized:
+            with self._hierarchical_start_cv:
+                while self._hierarchical_start_state == "starting":
+                    self._hierarchical_start_cv.wait()
+                if self._hierarchical_start_state == "failed":
+                    raise RuntimeError("Worker hierarchical startup failed; close this Worker and create a new one")
+            reg = _build_callable_registration(self, target, workers=workers)
+            with self._registry_lock:
+                handle, is_new = self._install_registration_locked(reg)
+            try:
+                submitted = self._post_init_register_async(target, handle.digest, is_new=is_new)
+            except Exception:
+                with self._registry_lock:
+                    self._rollback_handle_locked(handle)
+                raise
+
+            completed = False
+
+            def wait() -> CallableHandle:
+                nonlocal completed
+                try:
+                    if submitted:
+                        self._wait_async_register_results(handle.digest, submitted)
+                    completed = True
+                    return handle
+                except Exception:
+                    with self._registry_lock:
+                        self._rollback_handle_locked(handle)
+                    raise
+
+            return RegisterHandle(wait, lambda: completed)
+
+        if self.level == 2 and self._initialized:
+            reg = _build_callable_registration(self, target, workers=workers)
+            with self._registry_lock:
+                handle, is_new = self._install_registration_locked(reg)
+            return self._l2_submit_register_async(handle, target, is_new=is_new)
+
+        reg = _build_callable_registration(self, target, workers=workers)
+        with self._registry_lock:
+            handle, _is_new = self._install_registration_locked(reg)
+        completed = True
+        return RegisterHandle(lambda: handle, lambda: completed)
+
+    def _l2_submit_register_async(
+        self, handle: CallableHandle, target: ChipCallable, *, is_new: bool
+    ) -> RegisterHandle:
+        if not is_new:
+            completed = True
+            return RegisterHandle(lambda: handle, lambda: completed)
+        if self._register_queue is None:
+            raise RuntimeError("Worker.register_async: L2 register lane is not started")
+        with self._registry_lock:
+            slot_id = int(self._identity_registry[handle.digest].slot_id)
+        state = _LocalRegisterState()
+        self._register_queue.put(
+            _LocalRegisterRequest(
+                digest=handle.digest,
+                slot_id=slot_id,
+                callable_bytes=_chip_callable_bytes(target),
+                state=state,
+            )
+        )
+        completed = False
+
+        def wait() -> CallableHandle:
+            nonlocal completed
+            try:
+                self._wait_local_register(state)
+            except Exception:
+                with self._registry_lock:
+                    self._rollback_handle_locked(handle)
+                raise
+            completed = True
+            return handle
+
+        return RegisterHandle(wait, lambda: completed or state.completed)
+
+    def _register_sync_impl(self, target, *, workers: list[int] | None = None) -> CallableHandle:
         """Register a callable for dispatch and return an opaque handle.
 
         Integer execution slots remain private to the local target process.
@@ -2504,9 +3318,9 @@ class Worker:
         """Broadcast a new ChipCallable to every NEXT_LEVEL child via C++.
 
         Delegates the entire shm-staging + per-child mailbox handshake to
-        ``_Worker.broadcast_register_all``, which holds per-WorkerThread
-        ``mailbox_mu_`` so the broadcast serializes against any in-flight
-        dispatch on each child mailbox. No Python lock required.
+        ``_Worker.broadcast_register_all``. Public ``register`` now reaches
+        the async path, but this helper remains for internal synchronous
+        cleanup paths.
         """
         # Chip children are forked lazily on the first Worker.run() via
         # _start_hierarchical; before that point the chip mailboxes have no
@@ -2530,6 +3344,69 @@ class Worker:
                 with self._registry_lock:
                     self._uncertain_hashids.add(digest)
             raise RuntimeError(self._format_register_partial_failure(digest, errors, cleanup_errors))
+
+    def _post_init_register_async(self, target: ChipCallable, digest: bytes, *, is_new: bool) -> list[Any]:
+        if not getattr(self, "_hierarchical_started", False):
+            return []
+        assert self._worker is not None
+        try:
+            results = self._worker.broadcast_register_async_all(
+                int(target.buffer_ptr()),
+                int(target.buffer_size()),
+                digest,
+            )
+        except Exception:
+            cleanup_errors = self._cleanup_chip_registration(digest) if is_new else []
+            if cleanup_errors:
+                with self._registry_lock:
+                    self._uncertain_hashids.add(digest)
+            raise
+        errors = self._control_errors(list(results))
+        if errors:
+            cleanup_errors = self._cleanup_async_register_successes(list(results), digest)
+            if cleanup_errors:
+                with self._registry_lock:
+                    self._uncertain_hashids.add(digest)
+            raise RuntimeError(self._format_register_partial_failure(digest, errors, cleanup_errors))
+        return list(results)
+
+    def _wait_async_register_results(self, digest: bytes, results: list[Any]) -> None:
+        assert self._worker is not None
+        errors: list[str] = []
+        completed: list[Any] = []
+        for result in results:
+            try:
+                self._worker.control_wait_register(int(result.worker_id), int(result.remote_handle))
+                completed.append(result)
+            except Exception as exc:  # noqa: BLE001
+                errors.append(f"{result.worker_type}[{int(result.worker_id)}]: {exc}")
+        if errors:
+            cleanup_errors = self._cleanup_async_register_successes(completed, digest)
+            if cleanup_errors:
+                with self._registry_lock:
+                    self._uncertain_hashids.add(digest)
+            raise RuntimeError(self._format_register_partial_failure(digest, errors, cleanup_errors))
+
+    def _cleanup_async_register_successes(self, results: list[Any], digest: bytes) -> list[str]:
+        if self._worker is None:
+            return []
+        errors: list[str] = []
+        for result in results:
+            if not result.ok:
+                continue
+            try:
+                cleanup = self._worker.control_digest_only(
+                    WorkerType.NEXT_LEVEL,
+                    int(result.worker_id),
+                    _CTRL_UNREGISTER,
+                    digest,
+                    timeout_s=self._py_control_timeout_s,
+                )
+                if not cleanup.ok:
+                    errors.append(f"{cleanup.worker_type}[{cleanup.worker_id}]: {cleanup.error_message}")
+            except Exception as exc:  # noqa: BLE001
+                errors.append(f"{result.worker_type}[{int(result.worker_id)}]: {exc}")
+        return errors
 
     @staticmethod
     def _format_register_partial_failure(digest: bytes, errors: list[str], cleanup_errors: list[str]) -> str:
@@ -2603,7 +3480,158 @@ class Worker:
                 self._identity_registry.pop(digest, None)
             return True
 
+    @staticmethod
+    def _is_chip_callable_handle(handle_or_slot) -> bool:
+        return (
+            isinstance(handle_or_slot, CallableHandle)
+            and handle_or_slot.kind == "CHIP_CALLABLE"
+            and handle_or_slot.target_namespace == "LOCAL_CHIP"
+        )
+
+    def unregister_async(self, handle_or_slot) -> UnregisterHandle:
+        if not self._is_chip_callable_handle(handle_or_slot):
+            raise TypeError("Worker.unregister_async only supports ChipCallable handles")
+        assert isinstance(handle_or_slot, CallableHandle)
+        state = _UnregisterState()
+
+        if not self._initialized:
+            with self._registry_lock:
+                _handle_id, digest, info = self._coerce_handle_state(handle_or_slot)
+                self._live_handles.pop(handle_or_slot._handle_id, None)
+                info.ref_count -= 1
+                if info.ref_count <= 0:
+                    self._callable_registry.pop(info.slot_id, None)
+                    self._identity_registry.pop(digest, None)
+            self._complete_unregister_state(state)
+            return UnregisterHandle(lambda: self._wait_unregister_state(state), lambda: state.completed)
+
+        if self.level == 2:
+            return self._l2_unregister_async(handle_or_slot, state)
+        if self.level >= 3:
+            return self._l3_unregister_async(handle_or_slot, state)
+        raise ValueError(f"Worker: level {self.level} not supported")
+
+    def _l2_unregister_async(self, handle: CallableHandle, unreg_state: _UnregisterState) -> UnregisterHandle:
+        cleanup_slot_id = -1
+        cleanup_digest = b""
+        with self._registry_lock:
+            _handle_id, digest, state = self._coerce_handle_state(handle)
+            slot_id = int(state.slot_id)
+            if slot_id in self._pending_unregister_cids:
+                raise KeyError("UNREGISTER_TOMBSTONE_ACTIVE: callable handle already pending unregister")
+            self._live_handles.pop(handle._handle_id, None)
+            state.ref_count -= 1
+            if state.ref_count > 0:
+                self._complete_unregister_state(unreg_state)
+                return UnregisterHandle(lambda: self._wait_unregister_state(unreg_state), lambda: unreg_state.completed)
+
+            self._pending_unregister_cids.add(slot_id)
+            self._slot_tombstoned.add(slot_id)
+            self._slot_pending_unregister[slot_id] = unreg_state
+            if self._slot_inflight.get(slot_id, 0) == 0:
+                cleanup_slot_id = slot_id
+                cleanup_digest = digest
+
+        if cleanup_slot_id >= 0:
+            self._l2_native_unregister_and_finish(cleanup_slot_id, cleanup_digest, unreg_state)
+        return UnregisterHandle(lambda: self._wait_unregister_state(unreg_state), lambda: unreg_state.completed)
+
+    def _l3_unregister_async(self, handle: CallableHandle, unreg_state: _UnregisterState) -> UnregisterHandle:
+        with self._hierarchical_start_cv:
+            while self._hierarchical_start_state == "starting":
+                self._hierarchical_start_cv.wait()
+            if self._hierarchical_start_state == "failed":
+                raise RuntimeError("Worker hierarchical startup failed; close this Worker and create a new one")
+            started = self._hierarchical_start_state == "started" or getattr(self, "_hierarchical_started", False)
+
+        remove_target = False
+        cid = -1
+        digest = b""
+        with self._registry_lock:
+            _handle_id, digest, state = self._coerce_handle_state(handle)
+            cid = int(state.slot_id)
+            if cid in self._pending_unregister_cids:
+                raise KeyError("UNREGISTER_TOMBSTONE_ACTIVE: callable handle already pending unregister")
+            self._live_handles.pop(handle._handle_id, None)
+            state.ref_count -= 1
+            remove_target = state.ref_count <= 0
+            if remove_target:
+                self._pending_unregister_cids.add(cid)
+
+            if not started:
+                if remove_target:
+                    self._callable_registry.pop(cid, None)
+                    self._identity_registry.pop(digest, None)
+                    self._pending_unregister_cids.discard(cid)
+                self._complete_unregister_state(unreg_state)
+                return UnregisterHandle(lambda: self._wait_unregister_state(unreg_state), lambda: unreg_state.completed)
+
+        worker_endpoint = self._worker
+        assert worker_endpoint is not None
+        try:
+            submitted = list(worker_endpoint.broadcast_unregister_async_all(digest))
+        except BaseException as e:  # noqa: BLE001
+            with self._registry_lock:
+                if remove_target:
+                    self._uncertain_hashids.add(digest)
+                    self._pending_unregister_cids.discard(cid)
+            self._complete_unregister_state(unreg_state, e)
+            return UnregisterHandle(lambda: self._wait_unregister_state(unreg_state), lambda: unreg_state.completed)
+
+        errors = self._control_errors(submitted)
+        if errors:
+            err = RuntimeError(
+                f"UNREGISTER_PARTIAL_FAILURE: Worker.unregister(hash={_format_digest(digest)}) failed on "
+                f"{len(errors)} child workers; first error: {errors[0]}"
+            )
+            with self._registry_lock:
+                if remove_target:
+                    self._uncertain_hashids.add(digest)
+                    self._pending_unregister_cids.discard(cid)
+            self._complete_unregister_state(unreg_state, err)
+            return UnregisterHandle(lambda: self._wait_unregister_state(unreg_state), lambda: unreg_state.completed)
+
+        state_for_wait = state
+
+        def wait_remote() -> None:
+            try:
+                wait_errors: list[str] = []
+                for result in submitted:
+                    try:
+                        worker_endpoint.control_wait_unregister(int(result.worker_id), int(result.remote_handle))
+                    except BaseException as exc:  # noqa: BLE001
+                        wait_errors.append(f"{result.worker_type}[{int(result.worker_id)}]: {exc}")
+                if wait_errors:
+                    raise RuntimeError(
+                        f"UNREGISTER_PARTIAL_FAILURE: Worker.unregister(hash={_format_digest(digest)}) failed on "
+                        f"{len(wait_errors)} child workers; first error: {wait_errors[0]}"
+                    )
+                self._complete_unregister_state(unreg_state)
+            except BaseException as e:  # noqa: BLE001
+                with self._registry_lock:
+                    if remove_target:
+                        self._uncertain_hashids.add(digest)
+                self._complete_unregister_state(unreg_state, e)
+            finally:
+                if remove_target:
+                    with self._registry_lock:
+                        current = self._identity_registry.get(digest)
+                        if current is not None and current is state_for_wait and current.ref_count <= 0:
+                            self._callable_registry.pop(cid, None)
+                            self._identity_registry.pop(digest, None)
+                        self._pending_unregister_cids.discard(cid)
+
+        waiter = threading.Thread(target=wait_remote, name="simpler-l3-unregister-wait", daemon=True)
+        waiter.start()
+        return UnregisterHandle(lambda: self._wait_unregister_state(unreg_state), lambda: unreg_state.completed)
+
     def unregister(self, handle_or_slot) -> None:
+        if self._is_chip_callable_handle(handle_or_slot):
+            self.unregister_async(handle_or_slot).wait()
+            return
+        self._unregister_non_chip_sync(handle_or_slot)
+
+    def _unregister_non_chip_sync(self, handle_or_slot) -> None:
         """Drop a ``CallableHandle`` from the registry and propagate cleanup.
 
         Symmetric to ``Worker.register`` for the dynamic post-init path.
@@ -2878,13 +3906,32 @@ class Worker:
 
         self._chip_worker = ChipWorker()
         self._chip_worker.init(device_id, binaries)
+        self._start_l2_lanes()
 
         # Pre-warm any registered ChipCallable so the first run(handle, …)
         # does not pay the H2D upload cost.
         assert self._chip_worker is not None
-        for cid, target in self._callable_registry.items():
+        for cid, target in list(self._callable_registry.items()):
             if isinstance(target, ChipCallable):
-                self._chip_worker._prepare_callable_at_slot(cid, target)
+                digest = b""
+                with self._registry_lock:
+                    for known_digest, state in self._identity_registry.items():
+                        if state.slot_id == int(cid):
+                            digest = known_digest
+                            break
+                if not digest:
+                    raise RuntimeError(f"Worker.init(level=2): no digest for callable slot {cid}")
+                state = _LocalRegisterState()
+                assert self._register_queue is not None
+                self._register_queue.put(
+                    _LocalRegisterRequest(
+                        digest=digest,
+                        slot_id=int(cid),
+                        callable_bytes=_chip_callable_bytes(target),
+                        state=state,
+                    )
+                )
+                self._wait_local_register(state)
 
     def _init_hierarchical(self) -> None:
         device_ids = self._config.get("device_ids", [])
@@ -3191,6 +4238,7 @@ class Worker:
         self._close_remote_sessions(remote_sessions)
         if self._chip_worker is not None:
             try:
+                self._stop_l2_run_lane()
                 self._chip_worker.finalize()
             except BaseException:  # noqa: BLE001
                 pass
@@ -3733,8 +4781,8 @@ class Worker:
 
     # ------------------------------------------------------------------
     # memory management — forward to C++ Orchestrator, which holds
-    # per-WorkerThread mailbox_mu_ so these are safe to call concurrently
-    # with in-flight dispatch on the same chip mailbox.
+    # per-WorkerThread mailbox control. Memory/domain controls intentionally
+    # wait behind in-flight task dispatch.
     # ------------------------------------------------------------------
 
     def _check_chip_worker_id(self, worker_id: int) -> None:
@@ -3755,6 +4803,7 @@ class Worker:
         if self.level == 2:
             assert self._chip_worker is not None
             return self._chip_worker.malloc(size)
+        self._start_hierarchical()
         self._check_chip_worker_id(worker_id)
         assert self._orch is not None
         return self._orch.malloc(worker_id, size)
@@ -3765,6 +4814,7 @@ class Worker:
             assert self._chip_worker is not None
             self._chip_worker.free(ptr)
             return
+        self._start_hierarchical()
         self._check_chip_worker_id(worker_id)
         assert self._orch is not None
         self._orch.free(worker_id, ptr)
@@ -3775,6 +4825,7 @@ class Worker:
             assert self._chip_worker is not None
             self._chip_worker.copy_to(dst, src, size)
             return
+        self._start_hierarchical()
         self._check_chip_worker_id(worker_id)
         assert self._orch is not None
         self._orch.copy_to(worker_id, dst, src, size)
@@ -3785,9 +4836,122 @@ class Worker:
             assert self._chip_worker is not None
             self._chip_worker.copy_from(dst, src, size)
             return
+        self._start_hierarchical()
         self._check_chip_worker_id(worker_id)
         assert self._orch is not None
         self._orch.copy_from(worker_id, dst, src, size)
+
+    @staticmethod
+    def _wait_local_run(state: _LocalRunState) -> RunTiming:
+        with state.cv:
+            while not state.completed:
+                state.cv.wait()
+            if state.error is not None:
+                raise state.error
+            assert state.result is not None
+            return state.result
+
+    @staticmethod
+    def _wait_dag_run(state: _DagRunState) -> RunTiming:
+        with state.cv:
+            while not state.completed:
+                state.cv.wait()
+            if state.error is not None:
+                raise state.error
+            assert state.result is not None
+            return state.result
+
+    def _complete_dag_run(
+        self,
+        state: _DagRunState,
+        *,
+        result: RunTiming | None = None,
+        error: BaseException | None = None,
+    ) -> None:
+        with state.cv:
+            state.result = result
+            state.error = error
+            state.completed = True
+            state.cv.notify_all()
+
+    def _start_dag_run_lane(self) -> None:
+        if self._dag_run_thread is not None:
+            return
+        self._dag_run_queue = queue.Queue()
+        self._dag_run_thread = threading.Thread(
+            target=self._dag_run_thread_loop,
+            name="simpler-l3-dag-run",
+            daemon=True,
+        )
+        self._dag_run_thread.start()
+
+    def _stop_dag_run_lane(self) -> None:
+        q = self._dag_run_queue
+        t = self._dag_run_thread
+        if q is None or t is None:
+            return
+        q.put(None)
+        t.join()
+        self._dag_run_queue = None
+        self._dag_run_thread = None
+
+    def _dag_run_thread_loop(self) -> None:
+        assert self._dag_run_queue is not None
+        while True:
+            req = self._dag_run_queue.get()
+            if req is None:
+                break
+            assert isinstance(req, _DagRunRequest)
+            try:
+                timing = self._run_dag_sync_impl(req.orch_fn, req.args, req.config)
+                self._complete_dag_run(req.state, result=timing)
+            except BaseException as e:  # noqa: BLE001
+                self._complete_dag_run(req.state, error=e)
+
+    def _l2_submit_run_async(self, handle: CallableHandle, args=None, config=None) -> RunHandle:
+        assert self._initialized, "Worker not initialized; call init() first"
+        if self._run_queue is None:
+            raise RuntimeError("Worker.run_async: L2 run lane is not started")
+        cfg = _copy_call_config(config)
+        with self._registry_lock:
+            state_info = self._resolve_handle_locked(handle, expected_namespace="LOCAL_CHIP")
+            slot_id = int(state_info.slot_id)
+            if slot_id in self._slot_tombstoned or slot_id in self._pending_unregister_cids:
+                raise KeyError("callable handle is pending unregister")
+            self._slot_inflight[slot_id] = self._slot_inflight.get(slot_id, 0) + 1
+        run_state = _LocalRunState()
+        self._run_queue.put(
+            _LocalRunRequest(
+                slot_id=slot_id,
+                args=_copy_run_args(args, prefer_task_args=False),
+                config=cfg,
+                state=run_state,
+            )
+        )
+        return RunHandle(lambda: self._wait_local_run(run_state), lambda: run_state.completed)
+
+    def run_async(self, callable, args=None, config=None) -> RunHandle:
+        """Run asynchronously with level-specific semantics.
+
+        L2 submits a direct ChipCallable handle to the local run lane.
+        L3+ submits the whole orchestration function to the per-worker DAG lane.
+        """
+        assert self._initialized, "Worker not initialized; call init() first"
+        if self.level == 2:
+            return self._l2_submit_run_async(callable, args, config)
+
+        self._start_dag_run_lane()
+        assert self._dag_run_queue is not None
+        state = _DagRunState()
+        self._dag_run_queue.put(
+            _DagRunRequest(
+                orch_fn=callable,
+                args=args,
+                config=_copy_call_config(config),
+                state=state,
+            )
+        )
+        return RunHandle(lambda: self._wait_dag_run(state), lambda: state.completed)
 
     # ------------------------------------------------------------------
     # run — uniform entry point
@@ -3814,13 +4978,14 @@ class Worker:
         device timings are not aggregated here.
         """
         assert self._initialized, "Worker not initialized; call init() first"
-        cfg = config if config is not None else CallConfig()
 
         if self.level == 2:
-            assert self._chip_worker is not None
-            state = self._resolve_handle(callable, expected_namespace="LOCAL_CHIP")
-            return self._chip_worker._run_slot(state.slot_id, args, cfg)
+            return self.run_async(callable, args, config).wait()
 
+        return self.run_async(callable, args, config).wait()
+
+    def _run_dag_sync_impl(self, callable, args=None, config=None) -> RunTiming:
+        cfg = config if config is not None else CallConfig()
         self._start_hierarchical()
         assert self._orch is not None
         assert self._worker is not None
@@ -3919,8 +5084,10 @@ class Worker:
 
         if self.level == 2:
             if self._chip_worker:
+                self._stop_l2_lanes()
                 self._chip_worker.finalize()
         else:
+            self._stop_dag_run_lane()
             if self._worker:
                 self._worker.close()
                 self._worker = None

@@ -163,10 +163,19 @@ WorkerCompletion LocalMailboxEndpoint::run(Ring *ring, WorkerDispatch d) {
     const TaskArgs &args = s.is_group() ? s.task_args_list[d.group_index] : s.task_args;
     write_blob(m + MAILBOX_OFF_TASK_ARGS_BLOB, args);
 
-    // Signal child
+    // Signal child. The chip child may acknowledge TASK_RUNNING after it has
+    // copied the args blob and enqueued the run on its private run lane; sub
+    // and Worker-child paths may go straight to TASK_DONE.
     write_state(mailbox_, MailboxState::TASK_READY);
+    while (true) {
+        MailboxState state = read_state(mailbox_);
+        if (state == MailboxState::TASK_RUNNING ||
+            state == MailboxState::TASK_DONE)
+            break;
+        std::this_thread::sleep_for(std::chrono::microseconds(50));
+    }
 
-    // Poll for completion
+    // Poll for final completion.
     while (read_state(mailbox_) != MailboxState::TASK_DONE)
         std::this_thread::sleep_for(std::chrono::microseconds(50));
 
@@ -187,15 +196,53 @@ Parent-side cost per dispatch:
 - Poll loop with `sleep_for(50us)` (not busy-wait)
 - One explicit completion outcome: success, task failure, or endpoint failure
 
-Total ~nanoseconds overhead; the wait is dominated by actual kernel execution.
+The parent `run(...)` call still blocks until `TASK_DONE` and returns one
+`WorkerCompletion`. The mailbox lock is held only through the payload write
+and the `TASK_RUNNING` / `TASK_DONE` acknowledgement. After `TASK_RUNNING`,
+the parent run path releases the mailbox lock while it continues waiting for
+final completion. The early `TASK_RUNNING` state is a control-channel handoff
+point, not a task completion: it means the child has copied the task payload
+out of the mailbox so selected async controls can temporarily claim the
+mailbox while the task run lane continues.
 
 ### 3.2 Child loop
 
 The child loop lives in Python — see `_chip_process_loop` and
 `_sub_worker_loop` in `python/simpler/worker.py`. Each child polls
-`MAILBOX_OFF_STATE`, decodes the digest-prefixed args blob on `TASK_READY`,
-resolves the digest to its private local slot/callable, writes back any error,
-and publishes `TASK_DONE`.
+`MAILBOX_OFF_STATE` and decodes the digest-prefixed args blob on
+`TASK_READY`.
+
+Chip children have separate run and register lanes inside the child process:
+
+```text
+TASK_READY:
+  digest -> private chip slot
+  copy config and TaskArgs blob out of the mailbox
+  increment the slot's in-flight run count
+  enqueue run request on the chip run lane
+  publish TASK_RUNNING
+
+chip run lane:
+  run_prepared_from_blob(private_slot, copied_args, config)
+  decrement in-flight run count
+  if slot is tombstoned and in-flight count is zero:
+      native unregister/free private slot
+      complete pending unregister handle
+  publish TASK_DONE for mailbox-dispatched tasks
+```
+
+While a chip child is in `TASK_RUNNING`, the parent may issue
+`CTRL_REGISTER_ASYNC`, `CTRL_WAIT_REGISTER`, `CTRL_RUN_ASYNC`,
+`CTRL_WAIT_RUN`, `CTRL_UNREGISTER_ASYNC`, or `CTRL_WAIT_UNREGISTER`.
+The control command claims the mailbox as `CONTROL_REQUEST`, the child
+publishes `CONTROL_DONE`, and the parent restores `TASK_RUNNING` so the
+original dispatch can continue waiting for `TASK_DONE`. Memory and CommDomain
+controls are still serialized behind the running task.
+
+Sub-worker and Worker-child loops do not have a chip run lane. They keep the
+historical synchronous behavior: resolve the digest, execute the Python
+callable or inner `Worker.run()`, write back any error, and publish
+`TASK_DONE`.
 The child inherits the parent's full address space at fork time, so:
 
 - ChipCallable objects (pre-fork allocated) are COW-visible at the same VA
