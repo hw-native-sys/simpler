@@ -64,13 +64,11 @@ constexpr int32_t FATAL_ERROR_CHECK_INTERVAL = 1024;  // Check orchestrator erro
 // kills the slower-but-correct poller mid-poll — see the distributed
 // startup-skew scenario in issue #897.
 //
-// The budget is platform-defined (PLATFORM_SCHEDULER_TIMEOUT_MS in spin_hint.h)
-// because the safe value differs per variant: onboard trims it to 2 s so the
-// AICPU detects a hang and flushes its diagnostics (tensor dump, in-flight
-// partial output) before STARS reaps the op and poisons the context (chain:
-// this < op-exec < host stream-sync, platform_config.h); sim has no STARS to
-// race and keeps the full 5 s #897 headroom. See spin_hint.h for the per-variant
-// rationale.
+// The budget is platform-defined (PLATFORM_SCHEDULER_TIMEOUT_MS in spin_hint.h).
+// Onboard keeps it below the STARS op-execute and host stream-sync budgets so
+// the AICPU can flush diagnostics before the host-visible timeout chain fires.
+// Sim has no STARS or ACL stream-sync timeout, but uses the same no-progress
+// watchdog shape. See spin_hint.h for the per-variant rationale.
 constexpr int32_t SCHEDULER_TIMEOUT_MS = PLATFORM_SCHEDULER_TIMEOUT_MS;
 constexpr uint64_t SCHEDULER_TIMEOUT_CYCLES =
     static_cast<uint64_t>(SCHEDULER_TIMEOUT_MS) * (PLATFORM_PROF_SYS_CNT_FREQ / 1000);

@@ -169,32 +169,6 @@ resolve_runtime_timeout_config(const RuntimeTimeoutConfig &defaults, RuntimeTime
     return cfg;
 }
 
-inline HostRuntimeTimeoutConfig
-resolve_host_runtime_timeout_config(const RuntimeTimeoutConfig &defaults, RuntimeTimeoutParseStatus *status = nullptr) {
-    HostRuntimeTimeoutConfig cfg{defaults.op_execute_timeout_us, defaults.stream_sync_timeout_ms};
-    if (status != nullptr) {
-        *status = RuntimeTimeoutParseStatus{};
-    }
-    const char *op_env = std::getenv(PTO2_OP_EXECUTE_TIMEOUT_US_ENV);
-    if (op_env != nullptr) {
-        if (status != nullptr) status->op_execute_env_set = true;
-        bool ok = apply_runtime_timeout_override(
-            PTO2_OP_EXECUTE_TIMEOUT_US_ENV, op_env, 1, std::numeric_limits<uint64_t>::max(), &cfg.op_execute_timeout_us
-        );
-        if (status != nullptr) status->op_execute_valid = ok;
-    }
-    const char *sync_env = std::getenv(PTO2_STREAM_SYNC_TIMEOUT_MS_ENV);
-    if (sync_env != nullptr) {
-        if (status != nullptr) status->stream_sync_env_set = true;
-        bool ok = apply_runtime_timeout_override(
-            PTO2_STREAM_SYNC_TIMEOUT_MS_ENV, sync_env, 1, static_cast<uint64_t>(std::numeric_limits<int32_t>::max()),
-            &cfg.stream_sync_timeout_ms
-        );
-        if (status != nullptr) status->stream_sync_valid = ok;
-    }
-    return cfg;
-}
-
 inline RuntimeTimeoutOrderStatus validate_runtime_timeout_order(const RuntimeTimeoutConfig &cfg) {
     uint64_t scheduler_timeout_us = static_cast<uint64_t>(cfg.scheduler_timeout_ms) * 1000;
     uint64_t stream_sync_timeout_us = static_cast<uint64_t>(cfg.stream_sync_timeout_ms) * 1000;

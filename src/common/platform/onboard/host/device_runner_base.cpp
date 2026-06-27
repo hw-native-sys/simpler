@@ -55,9 +55,8 @@ HostRuntimeTimeoutConfig resolve_onboard_timeout_config() {
     RuntimeTimeoutConfig order_defaults{
         PLATFORM_OP_EXECUTE_TIMEOUT_US, PLATFORM_STREAM_SYNC_TIMEOUT_MS, PLATFORM_ONBOARD_SCHEDULER_TIMEOUT_MS
     };
-    HostRuntimeTimeoutConfig defaults{PLATFORM_OP_EXECUTE_TIMEOUT_US, PLATFORM_STREAM_SYNC_TIMEOUT_MS};
     RuntimeTimeoutParseStatus parse_status;
-    HostRuntimeTimeoutConfig cfg = resolve_host_runtime_timeout_config(order_defaults, &parse_status);
+    RuntimeTimeoutConfig cfg = resolve_runtime_timeout_config(order_defaults, &parse_status);
 
     if (parse_status.op_execute_env_set && !parse_status.op_execute_valid) {
         const char *op_env = std::getenv(PTO2_OP_EXECUTE_TIMEOUT_US_ENV);
@@ -75,20 +74,26 @@ HostRuntimeTimeoutConfig resolve_onboard_timeout_config() {
         );
     }
 
-    bool host_timeout_env_set = parse_status.op_execute_env_set || parse_status.stream_sync_env_set;
-    RuntimeTimeoutConfig order_cfg{
-        cfg.op_execute_timeout_us, cfg.stream_sync_timeout_ms, PLATFORM_ONBOARD_SCHEDULER_TIMEOUT_MS
-    };
-    RuntimeTimeoutOrderStatus order_status = validate_runtime_timeout_order(order_cfg);
+    if (parse_status.scheduler_env_set && !parse_status.scheduler_valid) {
+        const char *sched_env = std::getenv(PTO2_SCHEDULER_TIMEOUT_MS_ENV);
+        LOG_WARN(
+            "%s=%s invalid, using default %d", PTO2_SCHEDULER_TIMEOUT_MS_ENV, sched_env,
+            order_defaults.scheduler_timeout_ms
+        );
+    }
+
+    bool host_timeout_env_set =
+        parse_status.op_execute_env_set || parse_status.stream_sync_env_set || parse_status.scheduler_env_set;
+    RuntimeTimeoutOrderStatus order_status = validate_runtime_timeout_order(cfg);
     if (host_timeout_env_set && order_status != RuntimeTimeoutOrderStatus::OK) {
         LOG_WARN(
             "Ignoring PTO2 timeout env overrides: %s (scheduler=%d ms, op_execute=%llu us, stream_sync=%d ms)",
-            runtime_timeout_order_status_name(order_status), PLATFORM_ONBOARD_SCHEDULER_TIMEOUT_MS,
+            runtime_timeout_order_status_name(order_status), cfg.scheduler_timeout_ms,
             (unsigned long long)cfg.op_execute_timeout_us, cfg.stream_sync_timeout_ms
         );
-        return defaults;
+        return HostRuntimeTimeoutConfig{order_defaults.op_execute_timeout_us, order_defaults.stream_sync_timeout_ms};
     }
-    return cfg;
+    return HostRuntimeTimeoutConfig{cfg.op_execute_timeout_us, cfg.stream_sync_timeout_ms};
 }
 
 }  // namespace

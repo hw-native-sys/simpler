@@ -93,14 +93,13 @@ constexpr int PLATFORM_MAX_AICPU_THREADS_JUST_FOR_LAUNCH = 14;
  * Overridden at runtime by PTO2_OP_EXECUTE_TIMEOUT_US when that env var
  * is valid.
  */
-constexpr uint64_t PLATFORM_OP_EXECUTE_TIMEOUT_US = 3000000;  // 3s
+constexpr uint64_t PLATFORM_OP_EXECUTE_TIMEOUT_US = 45000000;  // 45s
 
 /**
  * Default onboard AICPU scheduler no-progress timeout (milliseconds).
- * Shared with host-side timeout ordering validation; sim keeps its own
- * wider budget in spin_hint.h because there is no STARS timeout to race.
+ * Shared with host-side timeout ordering validation.
  */
-constexpr int32_t PLATFORM_ONBOARD_SCHEDULER_TIMEOUT_MS = 2000;
+constexpr int32_t PLATFORM_ONBOARD_SCHEDULER_TIMEOUT_MS = 10000;
 
 /**
  * Default host-side stream synchronization timeout (milliseconds).
@@ -110,7 +109,7 @@ constexpr int32_t PLATFORM_ONBOARD_SCHEDULER_TIMEOUT_MS = 2000;
  * up first. Overridden at runtime by PTO2_STREAM_SYNC_TIMEOUT_MS when that
  * env var is valid.
  */
-constexpr int PLATFORM_STREAM_SYNC_TIMEOUT_MS = 4000;  // 4s (> op-exec 3s)
+constexpr int PLATFORM_STREAM_SYNC_TIMEOUT_MS = 50000;  // 50s (> op-exec 45s)
 
 // =============================================================================
 // Derived Platform Limits

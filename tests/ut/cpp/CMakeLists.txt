@@ -440,6 +440,13 @@ add_test(NAME test_l3_l2_orch_comm_sim_runner COMMAND test_l3_l2_orch_comm_sim_r
 set_tests_properties(test_l3_l2_orch_comm_sim_runner PROPERTIES LABELS "no_hardware")
 
 add_common_utils_test(test_runtime_timeout_config common/test_runtime_timeout_config.cpp)
+target_include_directories(test_runtime_timeout_config PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../../src/a2a3/platform/include
+)
+add_common_utils_test(test_runtime_timeout_config_a5 common/test_runtime_timeout_config.cpp)
+target_include_directories(test_runtime_timeout_config_a5 PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../../src/a5/platform/include
+)
 
 add_executable(test_scope_stats_collector
     common/test_scope_stats_collector.cpp
