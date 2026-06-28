@@ -11,7 +11,7 @@ no repo checkout required.
 
 - **[swimlane_converter](#swimlane_converter)** — perf JSON → Chrome Trace Event (Perfetto)
 - **[sched_overhead_analysis](#sched_overhead_analysis)** — scheduler overhead / Tail OH breakdown
-- **[device_log_timing](#device_log_timing)** — Total / Orch / Sched from a CANN device log (no swimlane JSON)
+- **[strace_timing](#strace_timing)** — per-stage `run_prepared` breakdown (host + AICPU phases) from `[STRACE]` log markers → TPOT table, per-round table (`--rounds-table`), or Perfetto JSON
 - **[dump_viewer](#dump_viewer)** — inspect / export args dumps (see [docs/args-dump.md](../../docs/dfx/args-dump.md) for full workflow)
 - **[deps_viewer](#deps_viewer)** — `deps.json` (dep_gen) → text or pan/zoom HTML dependency graph
 
@@ -156,8 +156,8 @@ python -m simpler_setup.tools.sched_overhead_analysis \
 ```
 
 > `deps.json` is topology-invariant — capture it once per graph and reuse it for
-> any number of swimlane runs. For Total / Orch / Sched timing from a plain run,
-> use [`device_log_timing`](#device_log_timing) instead.
+> any number of swimlane runs. For Host / Device / Effective / Orch / Sched timing
+> from a plain run, use [`strace_timing --rounds-table`](#strace_timing) instead.
 
 ### Command-Line Options
 
@@ -180,51 +180,39 @@ The perf JSON must be captured at l2_swimlane_level >= 3 so that `aicpu_schedule
 
 ---
 
-## device_log_timing
+## strace_timing
 
-Print per-round **Total / Orch / Sched** timing parsed from a CANN device log's
-`PTO2_PROFILING` orch/sched markers. Unlike `sched_overhead_analysis` (which
-reads the swimlane JSON), this needs **no swimlane capture** — use it for a
-plain benchmark run, a `--rounds N` sweep, or an external workload that never
-produces an `l2_swimlane_records.json`.
-
-### Basic Usage
+Per-stage breakdown of every `run_prepared()` from `[STRACE]` host-trace
+markers in a log (host stderr or CANN device log). The runtime emits one
+`[STRACE]` line per span on scope exit (RAII, gated on `SIMPLER_PROFILING`,
+`LOG_INFO_V9`), including the AICPU device-phase subdivision (`clk=dev`). See
+[docs/dfx/host-trace.md](../../docs/dfx/host-trace.md) for the marker grammar.
 
 ```bash
-# Explicit file or glob (quote the glob so the shell doesn't expand it; a glob
-# parses all matched rotated files)
-python -m simpler_setup.tools.device_log_timing \
-    --device-log '~/ascend/log/debug/device-0/device-*.log'
+# Per-callable TPOT table (decode = most-invoked hid bucket; prefill = once-seen)
+python -m simpler_setup.tools.strace_timing path/to/log
 
-# Auto-pick the newest log under device-<id>/
-python -m simpler_setup.tools.device_log_timing -d 0
+# Per-round Host/Device/Orch/Sched table (the benchmark/--rounds N view)
+python -m simpler_setup.tools.strace_timing path/to/log --rounds-table
+
+# Also emit a Chrome-trace / Perfetto JSON (lane = pid → host call tree)
+python -m simpler_setup.tools.strace_timing path/to/log --trace-out strace.json
 ```
 
-To get the same table emitted automatically by the test harness, pass
-`--enable-device-log-timing` to `scene_test` / pytest (onboard L2 only; works
-with `--rounds N`). See [docs/dfx/l2-timing.md](../../docs/dfx/l2-timing.md) for
-the full guide, including the `RunTiming` host_wall / device_wall numbers and
-how they relate to Orch / Sched / Total.
+Groups spans by `(pid, inv)`, rebuilds each invocation's tree from `depth`,
+buckets by callable hash `hid`, and reports each callable's mean `run_prepared`
+plus per-stage means. It reads the host-emitted `[STRACE]` lines and shows the
+host stages (`bind`/`runner_run`/`validate`) alongside the AICPU phases.
 
-### Command-Line Options
-
-| Option | Description |
-| ------ | ----------- |
-| `--device-log` | Path / dir / glob of a CANN device log. A glob parses every matched (rotated) file. |
-| `-d`, `--device-id` | Device id: auto-pick the newest log under `device-<id>/`. |
-
-### CANN device-log environment variables
-
-| Env var | Effect |
-| ------- | ------ |
-| `ASCEND_PROCESS_LOG_PATH` | Relocates the log root to `$ASCEND_PROCESS_LOG_PATH/debug` (highest precedence, above `ASCEND_WORK_PATH/log/debug` and the `<euid-home>/ascend/log/debug` default). Resolved automatically. |
-| `ASCEND_SLOG_PRINT_TO_STDOUT=1` | Routes CANN logs to stdout — **no device log file is written**; the CLI errors out and the harness flag skips. Unset it (or set `0`) to capture device timing. |
-| `ASCEND_HOST_LOG_FILE_NUM` | Rotated files retained per process (default 10). Each file caps at 20 MB; a long run can rotate mid-run, so the harness reads **all** files written after the run started, and a `--device-log` glob parses all matches. |
-
-The default root (no relocation env var) is `<euid-home>/ascend/log/debug`,
-using the effective uid's passwd home (e.g. `/root` under sudo / `task-submit`),
-which is where the driver actually writes device logs — not `$HOME`, which sudo
-often leaves pointing at the invoking user.
+`--rounds-table` renders one row per invocation of the busiest `hid` —
+**Host** always, plus **Device / Effective / Orch / Sched** when present, in the
+format `tools/benchmark_rounds.sh` parses. `Effective` is the orch∪sched merged
+window (`max(orch_end,sched_end) − min(orch_start,sched_start)`, the old
+device-log "Total"), recomputed from the orch/sched markers' `ts`+`dur` — no
+device log needed. The scene test only *emits* the markers to stderr; tee a run
+to a file (`python test_*.py … --rounds N > run.log 2>&1`) and pass `run.log`
+here. Because grouping is per `(pid, inv)`, this captures **L3 multi-round**
+(every chip-child invocation), not just round 0.
 
 ---
 

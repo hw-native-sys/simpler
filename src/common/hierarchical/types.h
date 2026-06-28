@@ -437,17 +437,3 @@ private:
     std::condition_variable cv_;
     bool shutdown_{false};
 };
-
-// =============================================================================
-// RunTiming — wall-clock breakdown returned by ChipWorker::run
-// =============================================================================
-
-// host_wall_ns is the steady_clock delta wrapping the dispatch; device_wall_ns
-// is on-NPU wall captured by the platform AICPU entry (see KernelArgs::
-// device_wall_ns). Mirrors PtoRunTiming in src/common/worker/pto_runtime_c_api.h
-// so the value flows through unchanged from the dlsym ABI up to the Python
-// binding.
-struct RunTiming {
-    uint64_t host_wall_ns = 0;
-    uint64_t device_wall_ns = 0;
-};

@@ -325,169 +325,6 @@ def _temporary_env(env_updates):
                 os.environ[k] = v
 
 
-def _log_round_timings(timings):
-    """Print per-round + summary host/device wall (µs) for multi-round runs.
-
-    Replaces the device-log scraping that ``tools/benchmark_rounds.sh`` used to
-    do — Worker.run now returns the timing directly, so the per-round table
-    can be emitted by the framework without grep+awk over device logs.
-
-    Output goes to ``print`` (not ``logger.info``) because benchmark numbers
-    are a user-facing artifact and the project's default log level suppresses
-    INFO in standalone test_*.py runs.
-
-    ``timings`` is a list of (host_wall_us, device_wall_us) tuples. The device
-    column reports 0 when the runtime was built without PTO2_PROFILING (the
-    default build has it on) or when an L3+ DAG is in use (per-task device
-    cycles aren't aggregated).
-    """
-    if not timings:
-        return
-    n = len(timings)
-    host_vals = sorted(t[0] for t in timings)
-    dev_vals = sorted(t[1] for t in timings)
-    host_avg = sum(host_vals) / n
-    # Device avg averages over non-zero rounds only. When --rounds > 1 the
-    # framework restricts enable_l2_swimlane (and thus orch_summary capture)
-    # to round 0, so the other rounds report 0; including those zeros in the
-    # average would silently halve / quarter the reported device wall and
-    # mislead the benchmark consumer. dev_count carries the sample size into
-    # the summary line for transparency.
-    dev_nonzero = [v for v in dev_vals if v > 0.0]
-    dev_count = len(dev_nonzero)
-    dev_avg = (sum(dev_nonzero) / dev_count) if dev_count else 0.0
-    show_device = dev_count > 0
-
-    header = f"  {'Round':<6}  {'Host (us)':>12}"
-    if show_device:
-        header += f"  {'Device (us)':>12}"
-    print(header)
-    print("  " + "-" * (len(header) - 2))
-    for i, (h, d) in enumerate(timings):
-        line = f"  {i:<6d}  {h:>12.1f}"
-        if show_device:
-            line += f"  {d:>12.1f}"
-        print(line)
-    summary = f"  Avg Host: {host_avg:.1f} us"
-    if show_device:
-        summary += f"  |  Avg Device: {dev_avg:.1f} us [{dev_count}/{n} rounds captured]"
-    summary += f"  ({n} rounds)"
-    print(summary)
-
-    trim = 10
-    if n > 2 * trim:
-        tc = n - 2 * trim
-        host_trim = sum(host_vals[trim:-trim]) / tc
-        msg = f"  Trimmed Avg Host: {host_trim:.1f} us"
-        if show_device and dev_count > 2 * trim:
-            dev_nonzero_sorted = sorted(dev_nonzero)
-            dev_trim_count = dev_count - 2 * trim
-            dev_trim = sum(dev_nonzero_sorted[trim:-trim]) / dev_trim_count
-            msg += f"  |  Trimmed Avg Device: {dev_trim:.1f} us"
-        msg += f"  (dropped {trim} low + {trim} high, {tc} rounds used)"
-        print(msg)
-
-
-def _get_device_log_dir(device_id) -> Path:
-    """Return the CANN device log directory for *device_id*.
-
-    Delegates to ``device_log_resolver.get_log_root`` so the log-relocation env
-    vars (ASCEND_PROCESS_LOG_PATH / ASCEND_WORK_PATH) are honored in one place.
-    """
-    from .tools.device_log_resolver import get_log_root  # noqa: PLC0415
-
-    return get_log_root() / f"device-{device_id}"
-
-
-def _snapshot_time() -> int:
-    """Record current time as a baseline for detecting device logs written after this point."""
-    import time  # noqa: PLC0415
-
-    return time.time_ns()
-
-
-def _snapshot_log_offsets(log_dir: Path) -> dict[str, int]:
-    """Byte size of each existing ``*.log`` in *log_dir*, keyed by path string.
-
-    Lets the post-run parser read only the bytes this run appends, so blocks an
-    earlier case wrote into the same (reused-process) log file are not counted.
-    """
-    offsets: dict[str, int] = {}
-    if log_dir.exists():
-        for p in log_dir.glob("*.log"):
-            try:
-                offsets[str(p)] = p.stat().st_size
-            except FileNotFoundError:
-                continue
-    return offsets
-
-
-def _print_device_log_timing(device_id, before_time, baseline_offsets, expected_rounds, timeout=20.0):
-    """Read the freshest device log and print per-round Total / Orch / Sched.
-
-    Driven by ``--enable-device-log-timing``. The orch/sched ``LOG_INFO_V9``
-    markers are emitted every round by ``PTO2_PROFILING`` (default-on, and
-    independent of ``--enable-l2-swimlane``), so this works for any ``--rounds``
-    count — unlike the swimlane-backed device column in ``_log_round_timings``,
-    which only captures round 0 when ``--rounds > 1``.
-
-    CANN flushes the device log asynchronously, so this polls until the fresh
-    logs both exist (mtime past ``before_time``) and carry at least
-    ``expected_rounds`` timing blocks, rather than reading once and racing the
-    flush. CANN also rotates the log at 20 MB, so a long run's blocks may span
-    several files; all files written after ``before_time`` are read in mtime
-    order, not just the newest. ``baseline_offsets`` (from ``_snapshot_log_offsets``)
-    caps each pre-existing file's read to the bytes appended after the run began.
-    """
-    import time  # noqa: PLC0415
-
-    from .tools.device_log_timing import format_device_log_timing, parse_device_log_timing  # noqa: PLC0415
-
-    if os.environ.get("ASCEND_SLOG_PRINT_TO_STDOUT") == "1":
-        logger.warning(
-            "device-log timing: ASCEND_SLOG_PRINT_TO_STDOUT=1 routes CANN logs to stdout, not to a "
-            "device log file — the orch/sched timing markers are in the run output above, not parseable here."
-        )
-        return
-
-    log_dir = _get_device_log_dir(device_id)
-    deadline = time.monotonic() + timeout
-    fresh: list[Path] = []
-    rounds = []
-    while time.monotonic() < deadline:
-        if log_dir.exists():
-            # stat() once per file, skipping any that vanish mid-scan from log
-            # rotation (the case this reader handles), then sort on the cached mtime.
-            paths_with_mtime = []
-            for p in log_dir.glob("*.log"):
-                try:
-                    mtime = p.stat().st_mtime_ns
-                except FileNotFoundError:
-                    continue
-                if mtime > before_time:
-                    paths_with_mtime.append((mtime, p))
-            paths_with_mtime.sort()
-            fresh = [p for _, p in paths_with_mtime]
-            if fresh:
-                rounds = parse_device_log_timing(fresh, offsets=baseline_offsets)
-                if len(rounds) >= expected_rounds:
-                    break
-        time.sleep(0.5)
-
-    if not fresh:
-        logger.warning("device-log timing: no device log written after run under %s", log_dir)
-        return
-    if len(rounds) < expected_rounds:
-        logger.warning(
-            "device-log timing: only %d/%d round blocks flushed within %.0fs (CANN async log lag)",
-            len(rounds),
-            expected_rounds,
-            timeout,
-        )
-    source = fresh[-1] if len(fresh) == 1 else f"{len(fresh)} files under {log_dir}"
-    print(format_device_log_timing(rounds, source=source))
-
-
 def _resolve_callable_paths(cls, cls_dir):
     """Resolve relative source paths in CALLABLE against cls_dir."""
     callable_spec = cls.CALLABLE
@@ -845,7 +682,6 @@ def run_class_cases(  # noqa: PLR0913 -- shared layer-5 entry; kwargs mirror CLI
     enable_pmu,
     enable_dep_gen,
     enable_scope_stats,
-    enable_device_log_timing=False,
     enable_swimlane_overhead=False,
 ):
     """Execute a pre-filtered list of cases for one class (layers 5-6).
@@ -857,19 +693,6 @@ def run_class_cases(  # noqa: PLR0913 -- shared layer-5 entry; kwargs mirror CLI
     cls_name = type(cls_inst).__name__
     callable_spec = getattr(type(cls_inst), "CALLABLE", None)
     diagnostics_on = enable_l2_swimlane or enable_dump_args or enable_pmu or enable_dep_gen or enable_scope_stats
-    # device-log timing wraps each case here (not inside _run_and_validate*),
-    # the same way swimlane conversion does — _run_and_validate_l2 is overridden
-    # by some SceneTestCase subclasses, so threading a kwarg through it would
-    # break those overrides. Onboard L2 only; the orch/sched markers don't exist
-    # on sim and an L3 run spans multiple chip logs.
-    dlt_on = (
-        enable_device_log_timing
-        and getattr(cls_inst, "_st_level", None) == 2
-        and not str(worker._config.get("platform", "")).endswith("sim")
-    )
-    dlt_device_id = worker._config.get("device_id", 0)
-    if enable_device_log_timing and getattr(cls_inst, "_st_level", None) == 3:
-        logger.warning("device-log timing is not supported for L3 (multi-chip); ignoring")
     for case in cases:
         case_label = f"{cls_name}_{case['name']}"
         # Per-case directory the runtime writes into. Required (non-empty) when
@@ -878,8 +701,6 @@ def run_class_cases(  # noqa: PLR0913 -- shared layer-5 entry; kwargs mirror CLI
         # l2_swimlane_records.json / deps.json), so it pulls output_prefix the
         # same way the other DFX flags do.
         prefix = _build_output_prefix(case_label) if diagnostics_on else Path("")
-        dlt_baseline = _snapshot_time() if dlt_on else None
-        dlt_offsets = _snapshot_log_offsets(_get_device_log_dir(dlt_device_id)) if dlt_on else None
         try:
             cls_inst._run_and_validate(
                 worker,
@@ -907,8 +728,6 @@ def run_class_cases(  # noqa: PLR0913 -- shared layer-5 entry; kwargs mirror CLI
                 _graph_case_dep_gen(case_label, prefix, callable_spec=callable_spec)
             if enable_scope_stats:
                 _plot_case_scope_stats(case_label, prefix)
-            if dlt_baseline is not None:
-                _print_device_log_timing(dlt_device_id, dlt_baseline, dlt_offsets, rounds)
 
 
 def _compare_outputs(test_args, golden_args, output_names, rtol, atol):
@@ -1233,8 +1052,12 @@ class SceneTestCase:
             for name in output_names:
                 initial_outputs[name] = getattr(test_args, name).clone()
 
-        # Execute rounds
-        timings = []  # populated only when rounds > 1
+        # Execute rounds. The platform emits `[STRACE]` host/device markers to
+        # stderr on every run; multi-round timing is obtained by teeing stderr
+        # to a file and parsing it offline with
+        # `python -m simpler_setup.tools.strace_timing <log> --rounds-table`
+        # (the scene test no longer captures/parses inline). See
+        # docs/dfx/l2-timing.md.
         for round_idx in range(rounds):
             if round_idx > 0:
                 for name, initial in initial_outputs.items():
@@ -1256,15 +1079,10 @@ class SceneTestCase:
             )
 
             with _temporary_env(self._resolve_env()):
-                timing = worker.run(handle, chip_args, config=config)
-            if rounds > 1 and timing is not None:
-                timings.append((timing.host_wall_us, timing.device_wall_us))
+                worker.run(handle, chip_args, config=config)
 
             if not skip_golden:
                 _compare_outputs(test_args, golden_args, output_names, self.RTOL, self.ATOL)
-
-        if timings:
-            _log_round_timings(timings)
 
     def _run_and_validate_l3(  # noqa: PLR0913 -- threads CLI diagnostic flags + L3 ns context
         self,
@@ -1318,8 +1136,11 @@ class SceneTestCase:
         # Get orch function (plain function from CALLABLE)
         orch_fn = self.CALLABLE["orchestration"]
 
-        # Execute rounds
-        timings = []
+        # Execute rounds. As for L2 (see _run_and_validate_l2), per-round timing
+        # is obtained offline from the `[STRACE]` stderr markers via
+        # `strace_timing --rounds-table`; the L3 chip children emit their own
+        # markers (grouped by (pid, inv)), so multi-round works without any
+        # inline fd capture here.
         for round_idx in range(rounds):
             if round_idx > 0:
                 for name, initial in initial_tensors.items():
@@ -1343,17 +1164,10 @@ class SceneTestCase:
                 orch_fn(orch, _ns, _test_args, _config)
 
             with _temporary_env(self._resolve_env()):
-                timing = worker.run(task_orch)
-            if rounds > 1 and timing is not None:
-                # L3+ DAGs surface host wall only; device_wall_us is 0 because
-                # per-task device cycles aren't aggregated up to Worker.run.
-                timings.append((timing.host_wall_us, timing.device_wall_us))
+                worker.run(task_orch)
 
             if not skip_golden:
                 _compare_outputs(test_args, golden_args, all_tensor_names, self.RTOL, self.ATOL)
-
-        if timings:
-            _log_round_timings(timings)
 
     # ------------------------------------------------------------------
     # pytest auto test method
@@ -1388,9 +1202,6 @@ class SceneTestCase:
         enable_pmu = request.config.getoption("--enable-pmu", default=0)
         enable_dep_gen = self._effective_enable_dep_gen(request, warn=True)
         enable_scope_stats = request.config.getoption("--enable-scope-stats", default=False)
-        # device-log timing is cheap (PTO2_PROFILING markers, one block/round)
-        # so unlike the heavy diagnostics it is NOT disabled when --rounds > 1.
-        enable_device_log_timing = request.config.getoption("--enable-device-log-timing", default=False)
         enable_swimlane_overhead = request.config.getoption("--enable-swimlane-overhead", default=False)
         if rounds > 1:
             if enable_l2_swimlane:
@@ -1446,7 +1257,6 @@ class SceneTestCase:
             enable_pmu=enable_pmu,
             enable_dep_gen=enable_dep_gen,
             enable_scope_stats=enable_scope_stats,
-            enable_device_log_timing=enable_device_log_timing,
             enable_swimlane_overhead=enable_swimlane_overhead,
         )
 
@@ -1507,13 +1317,6 @@ class SceneTestCase:
             metavar="PERF_LEVEL",
             help="Enable L2 swimlane. Bare flag=level 4 (full). "
             "1=AICore timing, 2=+dispatch/fanout, 3=+sched phases, 4=+orch phases",
-        )
-        parser.add_argument(
-            "--enable-device-log-timing",
-            action="store_true",
-            help="After the run, parse the CANN device log and print per-round Total / Orch / "
-            "Sched timing (from PTO2_PROFILING markers; no swimlane needed). Works with --rounds N "
-            "(one row per round). Onboard only — ignored on sim and L3.",
         )
         parser.add_argument(
             "--dump-args",
@@ -1755,7 +1558,11 @@ class SceneTestCase:
                         callable_obj = {**chip_handles}
                     for case in selected_by_cls[cls]:
                         label = f"{cls.__name__}::{case['name']}"
-                        print(f"  {label} ... ", end="", flush=True)
+                        # Newline-terminated: the run emits [STRACE] markers to
+                        # stderr mid-case, which would otherwise concatenate onto
+                        # this line in a merged (2>&1) view. PASSED/FAILED below
+                        # repeat the label so each line stands alone.
+                        print(f"  {label} ...", flush=True)
                         try:
                             run_class_cases(
                                 worker,
@@ -1770,12 +1577,11 @@ class SceneTestCase:
                                 enable_pmu=args.enable_pmu,
                                 enable_dep_gen=args.enable_dep_gen,
                                 enable_scope_stats=args.enable_scope_stats,
-                                enable_device_log_timing=args.enable_device_log_timing,
                                 enable_swimlane_overhead=args.enable_swimlane_overhead,
                             )
-                            print("PASSED")
+                            print(f"  {label} PASSED")
                         except Exception as e:  # noqa: BLE001
-                            print(f"FAILED: {e}")
+                            print(f"  {label} FAILED: {e}")
                             ok = False
                             if args.exitfirst:
                                 raise SystemExit(1) from None
@@ -1815,8 +1621,6 @@ def _dispatch_test_phases_standalone(module_name, selected_by_cls, args):  # noq
         common.append("--enable-dep-gen")
     if args.enable_scope_stats:
         common.append("--enable-scope-stats")
-    if args.enable_device_log_timing:
-        common.append("--enable-device-log-timing")
     if args.enable_swimlane_overhead:
         common.append("--enable-swimlane-overhead")
 

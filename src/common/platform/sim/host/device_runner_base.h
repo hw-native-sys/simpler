@@ -41,6 +41,7 @@
 #include "prepare_callable_common.h"
 #include "utils/device_arena.h"
 #include "common/kernel_args.h"
+#include "common/device_phase.h"
 #include "common/l2_swimlane_profiling.h"
 #include "common/platform_config.h"
 #include "common/unified_log.h"
@@ -112,6 +113,16 @@ public:
     }
     int device_id() const { return device_id_; }
     uint64_t last_device_wall_ns() const { return device_wall_ns_; }
+    // Per-phase AICPU wall (ns) from the most recent run; RunWall aliases
+    // last_device_wall_ns(). 0 for a phase that was never stamped. Used to emit
+    // device-phase trace markers from the sim c_api, mirroring onboard.
+    uint64_t last_device_phase_ns(AicpuPhase phase) const { return device_phase_ns_[static_cast<int>(phase)]; }
+    // Per-phase start offset (ns) on a common device-clock timeline (origin =
+    // earliest sub-phase start), so device spans carry a device-domain `ts` and
+    // the orch∪sched "Effective" window is computable. 0 for RunWall / unstamped.
+    uint64_t last_device_phase_start_ns(AicpuPhase phase) const {
+        return device_phase_start_ns_[static_cast<int>(phase)];
+    }
 
     void set_l2_swimlane_enabled(int level) {
         l2_swimlane_level_ = static_cast<L2SwimlaneLevel>(level);
@@ -196,6 +207,10 @@ protected:
     // last_device_wall_ns(). Allocated lazily in run(), freed in finalize().
     void *device_wall_dev_ptr_{nullptr};
     uint64_t device_wall_ns_{0};
+    uint64_t device_phase_ns_[NUM_AICPU_PHASES] = {0};
+    // Per-phase start offset (ns) from the earliest sub-phase start; see
+    // last_device_phase_start_ns().
+    uint64_t device_phase_start_ns_[NUM_AICPU_PHASES] = {0};
 
     // Chip-callable buffer pool (sim path). Keyed by FNV-1a 64-bit content
     // hash. Each entry owns a host scratch holding the ChipCallable with each

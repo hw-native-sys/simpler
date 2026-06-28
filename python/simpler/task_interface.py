@@ -1147,10 +1147,11 @@ class ChipWorker:
                 the AICore stream allows (``aclrtGetStreamResLimit`` on
                 onboard, ``PLATFORM_MAX_BLOCKDIM`` on sim).
 
-        Returns a :class:`RunTiming` with host + device wall.
+        Returns ``None``. Per-stage run timing is emitted as ``[STRACE]`` log
+        markers by the platform — see ``docs/dfx/host-trace.md``.
         """
         state = self._resolve_handle(handle)
-        return self._run_slot(state.slot_id, args, config, **kwargs)
+        self._run_slot(state.slot_id, args, config, **kwargs)
 
     def unregister_callable(self, handle) -> None:
         """Drop one live callable handle and release its private resources when final."""
@@ -1175,7 +1176,8 @@ class ChipWorker:
             config = CallConfig()
         for k, v in kwargs.items():
             setattr(config, k, v)
-        return self._impl.run(int(callable_id), args, config)
+        # Returns None; per-stage timing is emitted as `[STRACE]` log markers.
+        self._impl.run(int(callable_id), args, config)
 
     def _unregister_slot(self, callable_id):
         self._impl.unregister_callable(int(callable_id))

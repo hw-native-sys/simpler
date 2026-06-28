@@ -150,14 +150,6 @@ def pytest_addoption(parser):
         "1=AICore timing, 2=+dispatch/fanout, 3=+sched phases, 4=+orch phases",
     )
     parser.addoption(
-        "--enable-device-log-timing",
-        action="store_true",
-        default=False,
-        help="After the run, parse the CANN device log and print per-round Total / Orch / "
-        "Sched timing (from PTO2_PROFILING markers; no swimlane needed). Works with --rounds N. "
-        "Onboard only — ignored on sim and L3.",
-    )
-    parser.addoption(
         "--dump-args",
         nargs="?",
         const=1,

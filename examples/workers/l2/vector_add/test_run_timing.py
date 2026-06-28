@@ -6,29 +6,42 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""Hardware ST asserting Worker.run returns a usable RunTiming.
+"""Hardware ST asserting run_prepared emits ``[STRACE]`` host-trace markers.
 
-Reuses the vector_add example's kernel + ChipCallable build so this test
-doesn't drag in its own kernel sources. The contract being verified:
+``Worker.run`` no longer returns a RunTiming — per-stage timing is emitted by
+the platform as ``[STRACE]`` log markers (see docs/dfx/host-trace.md). Reuses
+the vector_add example's kernel + ChipCallable build so this test doesn't drag
+in its own kernel sources. The contract being verified:
 
-    * `worker.run(...)` returns a `RunTiming` instance (not None).
-    * `host_wall_us` is strictly positive — there's no way a real dispatch
-      took zero steady-clock time, so this would catch a regression where
-      the C ABI stopped writing the timing back to the out-param.
-    * `device_wall_us` is strictly positive on the default build, even
-      without `--enable-l2-swimlane`. The orch_summary write was decoupled
-      from the swimlane shared-region path so device timing is always
-      available when PTO2_PROFILING is compiled in (default).
-    * `host_wall_us > device_wall_us` — host wall must wrap the device
-      dispatch, so the host clock should always read longer.
+    * a real dispatch emits an ``[STRACE] ... name=run_prepared ... dur=<ns>``
+      marker (the host wall around the dispatch) with a strictly positive
+      duration — there's no way a real run took zero steady-clock time;
+    * the device-domain wall marker
+      (``name=run_prepared.runner_run.device_wall``) is present with a positive
+      duration on the default SIMPLER_PROFILING build.
+
+Markers go to stderr via the unified host logger, captured here with ``capfd``.
 """
 
+import re
+
 import pytest
-from _task_interface import RunTiming  # pyright: ignore[reportMissingImports]
 from simpler.task_interface import CallConfig, ChipStorageTaskArgs, DataType, Tensor
 from simpler.worker import Worker
 
 from .main import N_COLS, N_ELEMS, N_ROWS, NBYTES, build_chip_callable
+
+_STRACE_RE = re.compile(r"\[STRACE\] .*\bname=(?P<name>\S+)\b.*\bdur=(?P<dur>\d+)")
+
+
+def _strace_durs(captured: str, name: str) -> list:
+    """Return the dur (ns) of every [STRACE] marker with the given span name."""
+    out = []
+    for line in captured.splitlines():
+        m = _STRACE_RE.search(line)
+        if m and m["name"] == name:
+            out.append(int(m["dur"]))
+    return out
 
 
 def _drive_one_run(platform: str, device_id: int, *, enable_l2_swimlane: bool = False):
@@ -63,10 +76,11 @@ def _drive_one_run(platform: str, device_id: int, *, enable_l2_swimlane: bool = 
         config = CallConfig()
         config.enable_l2_swimlane = enable_l2_swimlane
 
-        timing = worker.run(chip_handle, args, config)
+        # run() returns None; timing is emitted as [STRACE] markers on stderr.
+        assert worker.run(chip_handle, args, config) is None
 
         # Verify the output is sane (so we know the kernel actually ran and
-        # the timing isn't from an early-error path).
+        # the markers aren't from an early-error path).
         host_out = torch.zeros(N_ROWS, N_COLS, dtype=torch.float32)
         worker.copy_from(host_out.data_ptr(), dev_out, NBYTES)
         worker.free(dev_a)
@@ -77,7 +91,6 @@ def _drive_one_run(platform: str, device_id: int, *, enable_l2_swimlane: bool = 
             f"{float(torch.max(torch.abs(host_out - (host_a + host_b)))):.3e} "
             f"(N_ELEMS={N_ELEMS})"
         )
-        return timing
     finally:
         worker.close()
 
@@ -85,31 +98,23 @@ def _drive_one_run(platform: str, device_id: int, *, enable_l2_swimlane: bool = 
 @pytest.mark.platforms(["a2a3sim", "a2a3"])
 @pytest.mark.runtime("tensormap_and_ringbuffer")
 @pytest.mark.device_count(1)
-def test_worker_run_returns_run_timing(st_platform, st_device_ids):
-    timing = _drive_one_run(st_platform, int(st_device_ids[0]))
+def test_run_prepared_emits_strace_markers(st_platform, st_device_ids, capfd):
+    _drive_one_run(st_platform, int(st_device_ids[0]))
+    err = capfd.readouterr().err
 
-    assert isinstance(timing, RunTiming), (
-        f"Worker.run must return a RunTiming (got {type(timing).__name__}); "
-        f"a None return means the ChipWorker Python wrapper dropped the C++ return value."
+    # Host wall: the run_prepared root span. A real dispatch can't take 0 ns.
+    host_durs = _strace_durs(err, "run_prepared")
+    assert host_durs, (
+        "no `[STRACE] ... name=run_prepared` marker found on stderr; "
+        "run_prepared stopped emitting host-trace markers (SIMPLER_PROFILING off, "
+        "or the host logger V9 tier was suppressed)."
     )
-    # Host wall is measured with steady_clock around the dispatch; even on
-    # sim it covers thread + IPC overhead so the only way to see 0 is a
-    # bug in the out-param plumbing.
-    assert timing.host_wall_us > 0.0, f"host_wall_us must be > 0, got {timing.host_wall_us}"
-    assert timing.host_wall_ns > 0, f"host_wall_ns must be > 0, got {timing.host_wall_ns}"
-    # device_wall must also be > 0 without --enable-l2-swimlane after the
-    # Phase B decoupling: orch_summary is written unconditionally when
-    # PTO2_PROFILING is on (default build). Hitting 0 here means either:
-    #   - the AICPU's l2_swimlane_aicpu_write_orch_summary path regressed back
-    #     under an is_l2_swimlane_enabled() gate, or
-    #   - the host stopped reading the phase header after the run.
-    assert timing.device_wall_us > 0.0, (
-        f"device_wall_us must be > 0 on the default PTO2_PROFILING build, got {timing.device_wall_us}; "
-        f"regression in the orch_summary capture path."
+    assert max(host_durs) > 0, f"run_prepared marker dur must be > 0 ns, got {host_durs}"
+
+    # Device-domain wall: the on-NPU AICPU wall, emitted after readback.
+    dev_durs = _strace_durs(err, "run_prepared.runner_run.device_wall")
+    assert dev_durs, (
+        "no device_wall [STRACE] marker found; the AICPU phase buffer readback "
+        "or marker emission regressed on the default SIMPLER_PROFILING build."
     )
-    assert timing.device_wall_ns > 0
-    # Host wall must wrap the device dispatch — anything else points at
-    # a steady-clock / cycle-conversion bug.
-    assert timing.host_wall_us >= timing.device_wall_us, (
-        f"host_wall_us ({timing.host_wall_us}) must wrap device_wall_us ({timing.device_wall_us})"
-    )
+    assert max(dev_durs) > 0, f"device_wall marker dur must be > 0 ns, got {dev_durs}"

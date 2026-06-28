@@ -180,3 +180,5 @@ bool platform_aicpu_affinity_gate_filter(const int32_t *allowed_cpus, int32_t al
 }
 
 int32_t platform_aicpu_affinity_thread_idx() { return tl_exec_idx; }
+
+void platform_aicpu_affinity_set_thread_idx(int32_t idx) { tl_exec_idx = idx; }

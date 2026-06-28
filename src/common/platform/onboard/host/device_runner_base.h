@@ -50,6 +50,7 @@
 
 #include "arg_direction.h"
 #include "callable.h"
+#include "common/device_phase.h"
 #include "common/l2_swimlane_profiling.h"
 #include "utils/device_arena.h"
 #include "device_runner_helpers.h"
@@ -202,6 +203,27 @@ public:
     uint64_t last_device_wall_ns() const { return device_wall_ns_; }
 
     /**
+     * Per-phase AICPU wall (ns) from the most recently completed run, reduced
+     * across threads as max(end) - min(start). Returns 0 for a phase that was
+     * never stamped (e.g. a platform whose AICPU does not emit that phase).
+     * AicpuPhase::RunWall aliases last_device_wall_ns(). Used by the host to
+     * emit device-phase trace markers; see run_prepared in c_api_shared.
+     */
+    uint64_t last_device_phase_ns(AicpuPhase phase) const { return device_phase_ns_[static_cast<int>(phase)]; }
+
+    /**
+     * Per-phase start offset (ns) on a common device-clock timeline shared by
+     * all sub-phases of the run (origin = the earliest sub-phase start). Lets
+     * the host emit each device span with a device-domain `ts` so the
+     * orchestrator/scheduler windows are comparable (their union is the
+     * "Effective" window) and the sub-phases nest correctly. 0 for RunWall (the
+     * origin) and for any phase never stamped.
+     */
+    uint64_t last_device_phase_start_ns(AicpuPhase phase) const {
+        return device_phase_start_ns_[static_cast<int>(phase)];
+    }
+
+    /**
      * Upload an entire ChipCallable buffer to device memory in one shot.
      * Walks child_offsets_ to compute total byte size, allocates device
      * GM once, fixes up each child's resolved_addr_ in an internal host
@@ -282,6 +304,19 @@ public:
      * calls without a matching `prepare_callable`.
      */
     bool has_callable(int32_t callable_id) const;
+
+    /**
+     * Content-derived stable identity for a registered callable: the
+     * ELF Build-ID 64-bit hash of its orchestration SO (CallableState::hash,
+     * computed at register_callable time via elf_build_id_64). Returns 0 when
+     * the callable_id is not registered.
+     *
+     * Stable across slot reuse (unlike callable_id, which is a recyclable
+     * slot index) and across processes / runs (same SO bytes → same hash),
+     * so DFX trace markers use it as the `hid` grouping key to attribute
+     * per-stage timing to a specific callable.
+     */
+    uint64_t callable_hash(int32_t callable_id) const;
 
     /**
      * Replay a previously-registered callable's state onto a fresh
@@ -750,14 +785,20 @@ protected:
     rtStream_t stream_aicore_{nullptr};
     KernelArgsHelper kernel_args_;
 
-    // Platform-level device wall buffer: 8-byte device-resident slot
-    // whose address rides on `KernelArgs.device_wall_data_base`. AICPU
-    // writes the run wall (ns) through that pointer; subclass `run()`
-    // pulls it back via `copy_from_device` after stream sync and
-    // caches it for `last_device_wall_ns()`. Allocated once at
-    // simpler_init, freed in the subclass `finalize()`.
+    // Platform-level device phase buffer: device-resident
+    // AicpuPhaseRecord[NUM_AICPU_PHASES] per launched AICPU thread (thread-
+    // major), whose address rides on `KernelArgs.device_wall_data_base`. AICPU
+    // stamps raw sys-counter cycles per phase through that pointer; subclass
+    // `run()` pulls it back via `read_device_wall_ns()` after stream sync and
+    // caches the per-phase ns spans for `last_device_phase_ns()` (and RunWall
+    // for `last_device_wall_ns()`). Allocated once at simpler_init, freed in the
+    // subclass `finalize()`.
     void *device_wall_dev_ptr_{nullptr};
     uint64_t device_wall_ns_{0};
+    uint64_t device_phase_ns_[NUM_AICPU_PHASES] = {0};
+    // Per-phase start offset (ns) from the earliest sub-phase start; see
+    // last_device_phase_start_ns(). Populated alongside device_phase_ns_.
+    uint64_t device_phase_start_ns_[NUM_AICPU_PHASES] = {0};
 
     // True after AICPU SO loaded; reset by the subclass's `finalize()`.
     bool binaries_loaded_{false};

@@ -84,3 +84,5 @@ bool platform_aicpu_affinity_gate_filter(
 }
 
 int32_t platform_aicpu_affinity_thread_idx() { return tl_filter_exec_idx; }
+
+void platform_aicpu_affinity_set_thread_idx(int32_t idx) { tl_filter_exec_idx = idx; }

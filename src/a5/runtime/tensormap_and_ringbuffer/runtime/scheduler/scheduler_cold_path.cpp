@@ -15,6 +15,7 @@
 
 #include "common/unified_log.h"
 #include "aicpu/dep_gen_collector_aicpu.h"
+#include "aicpu/device_phase_aicpu.h"
 #include "aicpu/device_time.h"
 #include "aicpu/l2_swimlane_collector_aicpu.h"
 #include "aicpu/platform_regs.h"
@@ -405,11 +406,16 @@ int32_t SchedulerContext::handle_timeout_exit(
     }
 #if PTO2_PROFILING
     uint64_t sched_timeout_ts = get_sys_cnt_aicpu();
+    aicpu_phase_set_window(
+        AicpuPhase::SchedWindow, static_cast<uint64_t>(sched_start_ts), static_cast<uint64_t>(sched_timeout_ts)
+    );
+#if PTO2_SCHED_PROFILING
     LOG_INFO_V9(
         "Thread %d: sched_start=%" PRIu64 " sched_end(timeout)=%" PRIu64 " sched_cost=%.3fus", thread_idx,
         static_cast<uint64_t>(sched_start_ts), static_cast<uint64_t>(sched_timeout_ts),
         cycles_to_us(sched_timeout_ts - sched_start_ts)
     );
+#endif
 #endif
     return -PTO2_ERROR_SCHEDULER_TIMEOUT;
 }
@@ -418,11 +424,19 @@ int32_t SchedulerContext::handle_timeout_exit(
 void SchedulerContext::log_l2_swimlane_summary(int32_t thread_idx, int32_t cur_thread_completed) {
     auto &l2_swimlane = sched_l2_swimlane_[thread_idx];
     uint64_t sched_end_ts = get_sys_cnt_aicpu();
+    // Ride the sched window home to the host phase buffer (the host reduces
+    // across sched threads → the `Sched` [STRACE] marker). The verbose
+    // per-thread device-log line below is now opt-in deep-dive.
+    aicpu_phase_set_window(
+        AicpuPhase::SchedWindow, static_cast<uint64_t>(l2_swimlane.sched_start_ts), static_cast<uint64_t>(sched_end_ts)
+    );
+#if PTO2_SCHED_PROFILING
     LOG_INFO_V9(
         "Thread %d: sched_start=%" PRIu64 " sched_end=%" PRIu64 " sched_cost=%.3fus", thread_idx,
         static_cast<uint64_t>(l2_swimlane.sched_start_ts), static_cast<uint64_t>(sched_end_ts),
         cycles_to_us(sched_end_ts - l2_swimlane.sched_start_ts)
     );
+#endif
 
     uint64_t sched_total = l2_swimlane.sched_wiring_cycle + l2_swimlane.sched_complete_cycle +
                            l2_swimlane.sched_scan_cycle + l2_swimlane.sched_dispatch_cycle +

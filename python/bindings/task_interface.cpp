@@ -838,59 +838,9 @@ NB_MODULE(_task_interface, m) {
     // one, change the other.
     m.attr("DEFAULT_LOG_THRESHOLD") = 20;  // V5 = Python INFO
 
-    // --- RunTiming ---
-    // Returned by ChipWorker.run_prepared* / Worker.run. Cycles → ns conversion
-    // happens on the platform side (frequency known there); units exposed to
-    // Python are µs as floats to match historical benchmark_rounds.sh output.
-    nb::class_<RunTiming>(m, "RunTiming")
-        .def(nb::init<>())
-        .def(
-            "__init__",
-            [](RunTiming *self, uint64_t host_wall_ns, uint64_t device_wall_ns) {
-                new (self) RunTiming{host_wall_ns, device_wall_ns};
-            },
-            nb::arg("host_wall_ns"), nb::arg("device_wall_ns") = 0,
-            "Construct with explicit ns values (used by the Python Worker.run "
-            "wrapper to surface host-side timing for L3+ DAGs)."
-        )
-        .def_prop_ro(
-            "host_wall_us",
-            [](const RunTiming &t) {
-                return t.host_wall_ns / 1000.0;
-            },
-            "Host steady-clock wall around the dispatch, in microseconds."
-        )
-        .def_prop_ro(
-            "device_wall_us",
-            [](const RunTiming &t) {
-                return t.device_wall_ns / 1000.0;
-            },
-            "Full on-NPU kernel wall, in microseconds: earliest simpler_aicpu_exec "
-            "start -> latest simpler_aicpu_exec end across launched threads (run + "
-            "teardown), NOT just the orch span — "
-            "it is larger than the device-log Orch/Sched/Total. Populated whenever the "
-            "runtime was built with PTO2_PROFILING (the default); independent of "
-            "enable_l2_swimlane after the orch_summary capture was decoupled from the "
-            "swimlane shared region. Zero only on a PTO2_PROFILING-off build."
-        )
-        .def_prop_ro(
-            "host_wall_ns",
-            [](const RunTiming &t) {
-                return t.host_wall_ns;
-            }
-        )
-        .def_prop_ro(
-            "device_wall_ns",
-            [](const RunTiming &t) {
-                return t.device_wall_ns;
-            }
-        )
-        .def("__repr__", [](const RunTiming &t) {
-            std::ostringstream os;
-            os << "RunTiming(host_wall_us=" << t.host_wall_ns / 1000.0
-               << ", device_wall_us=" << t.device_wall_ns / 1000.0 << ")";
-            return os.str();
-        });
+    // Per-stage run timing (host wall, on-NPU device wall + AICPU phase
+    // breakdown) is no longer returned from run(); the platform emits it as
+    // `[STRACE]` log markers — parse with simpler_setup.tools.strace_timing.
 
     // --- ChipWorker ---
     nb::class_<ChipWorker>(m, "_ChipWorker")
@@ -925,21 +875,21 @@ NB_MODULE(_task_interface, m) {
         .def(
             "run",
             [](ChipWorker &self, int32_t callable_id, ChipStorageTaskArgs &args, const CallConfig &config) {
-                return self.run(callable_id, &args, config);
+                self.run(callable_id, &args, config);
             },
             nb::arg("callable_id"), nb::arg("args"), nb::arg("config"),
-            "Launch a callable_id previously staged via prepare_callable. "
-            "Returns RunTiming with host/device wall."
+            "Launch a callable_id previously staged via prepare_callable. Returns "
+            "None; per-stage timing is emitted as `[STRACE]` log markers."
         )
         .def(
             "run",
             [](ChipWorker &self, int32_t callable_id, TaskArgs &args, const CallConfig &config) {
                 TaskArgsView view = make_view(args);
-                return self.run(callable_id, view, config);
+                self.run(callable_id, view, config);
             },
             nb::arg("callable_id"), nb::arg("args"), nb::arg("config"),
             "Launch a callable_id from a TaskArgs (used for in-process callers). "
-            "Returns RunTiming."
+            "Returns None; timing is emitted as `[STRACE]` log markers."
         )
         .def(
             "run_prepared_from_blob",
@@ -952,7 +902,7 @@ NB_MODULE(_task_interface, m) {
                 // loops never re-implement the tensor/scalar layout in Python
                 // (where it has historically dropped fields like child_memory).
                 TaskArgsView view = read_blob(reinterpret_cast<const uint8_t *>(args_blob_ptr), blob_capacity);
-                return self.run(callable_id, view, config);
+                self.run(callable_id, view, config);
             },
             nb::arg("callable_id"), nb::arg("args_blob_ptr"), nb::arg("blob_capacity"), nb::arg("config"),
             "Launch a callable_id from a raw mailbox-blob pointer + capacity "

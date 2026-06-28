@@ -15,6 +15,7 @@
 #include "common/platform_config.h"
 #include "aicpu/dep_gen_collector_aicpu.h"
 #include "aicpu/device_log.h"
+#include "aicpu/device_phase_aicpu.h"
 #include "aicpu/device_time.h"
 #include "aicpu/l2_swimlane_collector_aicpu.h"
 #include "aicpu/platform_regs.h"
@@ -119,14 +120,13 @@ extern "C" __attribute__((visibility("default"))) int simpler_aicpu_exec(void *a
         return 0;
     }
 
-    // Run-wall: record this thread's start into its own slot (plain store,
-    // no cross-thread contention). Slot = affinity-gate exec index.
-    const int32_t wall_slot = platform_aicpu_affinity_thread_idx();
-    uint64_t *const wall = reinterpret_cast<uint64_t *>(k_args->device_wall_data_base);
-    const bool wall_ok = wall != nullptr && wall_slot >= 0 && wall_slot < PLATFORM_MAX_AICPU_THREADS_JUST_FOR_LAUNCH;
-    if (wall_ok) {
-        wall[wall_slot * 2] = get_sys_cnt_aicpu();
-    }
+    // Publish the phase-buffer base so the finer preamble/so_load/graph_build/
+    // post_orch + orch/sched phases stamped inside aicpu_execute / the scheduler
+    // resolve their per-thread slot via platform_aicpu_affinity_thread_idx()
+    // (no C++ thread_local — see docs/dynamic-linking.md). Idempotent across the
+    // concurrent exec threads (same base). Run-wall is stamped here.
+    set_platform_phase_base(k_args->device_wall_data_base);
+    aicpu_phase_start(AicpuPhase::RunWall);
 
     LOG_INFO_V0("%s", "simpler_aicpu_exec: Calling aicpu_execute with Runtime");
     int rc = aicpu_execute(runtime);
@@ -138,9 +138,7 @@ extern "C" __attribute__((visibility("default"))) int simpler_aicpu_exec(void *a
 
     // Run-wall: record this thread's end into its own slot (plain store).
     // Host reduces max(end) - min(start) → ns (see wall-capture note above).
-    if (wall_ok) {
-        wall[wall_slot * 2 + 1] = get_sys_cnt_aicpu();
-    }
+    aicpu_phase_end(AicpuPhase::RunWall);
 
     return rc;
 }

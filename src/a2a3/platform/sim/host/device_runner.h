@@ -60,6 +60,7 @@ private:
     void (*set_platform_regs_func_)(uint64_t){nullptr};
     void (*set_orch_device_id_func_)(int){nullptr};
     void (*set_platform_dump_base_func_)(uint64_t){nullptr};
+    void (*set_platform_phase_base_func_)(uint64_t){nullptr};
     void (*set_dump_args_enabled_func_)(bool){nullptr};
     void (*set_platform_l2_swimlane_base_func_)(uint64_t){nullptr};
     void (*set_platform_l2_swimlane_aicore_rotation_table_func_)(uint64_t){nullptr};

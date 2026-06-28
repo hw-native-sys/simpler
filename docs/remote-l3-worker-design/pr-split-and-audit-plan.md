@@ -239,7 +239,8 @@ Scope:
 
 - Callable descriptors, digest/hashid identity, and target namespaces.
 - `ChipWorker.prepare_callable()` handle semantics.
-- `ChipWorker.run()` and `Worker.run()` timing return contract.
+- `ChipWorker.run()` and `Worker.run()` run contract (return `None`; timing is
+  observed out-of-band via `[STRACE]` markers, not a return value).
 - Python import callable descriptors needed by remote registration.
 - Focused Python unit tests.
 
@@ -248,7 +249,8 @@ Acceptance criteria:
 - Target-private slots are not public routing IDs.
 - Prepare rollback and unregister refcount behavior are tested.
 - Descriptor hashing is stable.
-- `RunTiming` introspection contract is preserved.
+- `run()` returns `None`; timing is observed via `[STRACE]` markers (no
+  `RunTiming` return value).
 
 PR 3: remote wire codec.
 

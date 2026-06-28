@@ -277,7 +277,6 @@ class TestChipWorkerPython:
 
             def run(self, slot, args, config):
                 self.runs.append((slot, args, config))
-                return "timing"
 
             def unregister_callable(self, slot):
                 self.unregistered.append(slot)
@@ -296,7 +295,8 @@ class TestChipWorkerPython:
         assert fake.prepared == [(0, callable_obj)]
 
         args = ChipStorageTaskArgs()
-        assert worker.run(first, args, CallConfig()) == "timing"
+        # run() returns None now; verify dispatch via the recorded call.
+        assert worker.run(first, args, CallConfig()) is None
         assert fake.runs[0][0] == 0
 
         worker.unregister_callable(first)

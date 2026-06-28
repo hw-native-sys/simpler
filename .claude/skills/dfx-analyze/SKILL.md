@@ -15,26 +15,27 @@ Per-DFX docs: `docs/dfx/` (`l2-timing.md`, `sched-overhead-model.md`,
 
 | You want… | Tool | Needs |
 | --------- | ---- | ----- |
-| Per-run **Total / Orch / Sched** device timing | `device_log_timing` | nothing extra — `PTO2_PROFILING` markers are in every device log (compile-time default on, **NOT** gated by swimlane) |
+| Per-run **Host / Device / Effective / Orch / Sched** timing | `strace_timing --rounds-table` | nothing extra — `[STRACE]` markers are on stderr (`SIMPLER_PROFILING`, compile-time default on, **NOT** gated by swimlane) |
 | AICPU **scheduler overhead / Tail-OH / critical-path** breakdown | `sched_overhead_analysis` | a `--enable-l2-swimlane` (level≥3) run + `--enable-dep-gen` run |
 | Swimlane → **Perfetto** Chrome trace | `swimlane_converter` | `--enable-l2-swimlane` run (`--overhead` track needs deps.json too) |
 | Task **dependency graph** (text / HTML) | `deps_viewer` | `--enable-dep-gen` run → `deps.json` |
 | **Per-scope ring-fill peaks** (task_window / heap / tensormap) | `scope_stats_plot` | `--enable-scope-stats` run → `scope_stats.jsonl` |
 | Inspect / export **args dumps** | `dump_viewer` | `--enable-dump-tensor` run → `args_dump/` |
 
-## First reflex: Total/Orch/Sched needs nothing extra
+## First reflex: Host/Device/Orch/Sched needs nothing extra
 
 To answer "where did the time go / is this AICPU-orchestration bound", you do
-**not** need swimlane or custom logging — just run, then:
+**not** need swimlane or custom logging — just tee the run's stderr, then:
 
 ```bash
-python -m simpler_setup.tools.device_log_timing -d <device_id>   # latest log for that die
-# or: --device-log <path/to/device-*.log>
-# prints per-round Total / Orch / Sched (us); Orch≈Sched≈Total ⇒ AICPU-bound.
+python test_*.py -p <platform> -d <device> --rounds N --skip-golden > run.log 2>&1
+python -m simpler_setup.tools.strace_timing run.log --rounds-table
+# prints per-round Host / Device / Effective / Orch / Sched (us);
+# Orch≈Sched≈Effective ⇒ AICPU-bound. (Effective = orch∪sched window.)
 ```
 
-Make the device log easy to find: redirect it under the run's output dir via
-`ASCEND_PROCESS_LOG_PATH` (see `.claude/rules/running-onboard.md` → "Device logs").
+For the per-thread `loops`/`tasks_scheduled` deep-dive (not in the markers),
+rebuild with `PTO2_SCHED_PROFILING=1` and read the device log directly.
 
 ## Where the inputs are written
 
