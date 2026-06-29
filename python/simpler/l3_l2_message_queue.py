@@ -118,13 +118,16 @@ def _checked_add_u64(lhs: int, rhs: int) -> int:
 
 
 def _tensor_like_nbytes(buffer: Any) -> int | None:
-    nbytes_attr = getattr(buffer, "nbytes", None)
+    nbytes_attr: Any = getattr(buffer, "nbytes", None)
     if nbytes_attr is not None:
-        return int(nbytes_attr() if callable(nbytes_attr) else nbytes_attr)
-    numel = getattr(buffer, "numel", None)
-    element_size = getattr(buffer, "element_size", None)
+        nbytes_value: Any = nbytes_attr() if callable(nbytes_attr) else nbytes_attr
+        return int(nbytes_value)
+    numel: Any = getattr(buffer, "numel", None)
+    element_size: Any = getattr(buffer, "element_size", None)
     if callable(numel) and callable(element_size):
-        return int(numel()) * int(element_size())
+        numel_value: Any = numel()
+        element_size_value: Any = element_size()
+        return int(numel_value) * int(element_size_value)
     return None
 
 
@@ -151,7 +154,7 @@ def _host_byte_span(buffer: Any, nbytes: int, *, writable: bool) -> _HostByteSpa
             ptr = ctypes.addressof(ctypes.c_char.from_buffer(byte_view))
         return _HostByteSpan(nbytes=nbytes, ptr=ptr, view=byte_view)
 
-    data_ptr = getattr(buffer, "data_ptr", None)
+    data_ptr: Any = getattr(buffer, "data_ptr", None)
     if callable(data_ptr):
         is_contiguous = getattr(buffer, "is_contiguous", None)
         if callable(is_contiguous) and not bool(is_contiguous()):
@@ -165,7 +168,8 @@ def _host_byte_span(buffer: Any, nbytes: int, *, writable: bool) -> _HostByteSpa
             raise ValueError("L3-L2 queue ordinary host tensor-like buffer must expose nbytes")
         if available < nbytes:
             raise ValueError(f"L3-L2 queue nbytes={nbytes} exceeds ordinary host buffer size {available}")
-        ptr = int(data_ptr())
+        ptr_value: Any = data_ptr()
+        ptr = int(ptr_value)
         if ptr <= 0 and nbytes > 0:
             raise ValueError("L3-L2 queue ordinary host tensor-like buffer must have a nonzero data_ptr")
         return _HostByteSpan(nbytes=nbytes, ptr=ptr, view=None)
@@ -347,8 +351,10 @@ class L3L2Queue:
     def _ensure_staging_capacity(self, nbytes: int) -> Tensor:
         nbytes = int(nbytes)
         if self._staging_tensor is None or self._staging_nbytes < nbytes:
-            self._staging_tensor = self._orch.alloc([nbytes], DataType.UINT8)
-            self._staging_nbytes = int(self._staging_tensor.nbytes())
+            tensor: Tensor = self._orch.alloc([nbytes], DataType.UINT8)
+            self._staging_tensor = tensor
+            self._staging_nbytes = int(tensor.nbytes())
+            return tensor
         return self._staging_tensor
 
     def _copy_host_span_to_tensor(self, span: _HostByteSpan, tensor: Tensor) -> None:

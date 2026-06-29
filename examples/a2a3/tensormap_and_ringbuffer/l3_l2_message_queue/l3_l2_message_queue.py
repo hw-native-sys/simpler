@@ -17,7 +17,7 @@ import struct
 
 from simpler.l3_l2_message_queue import L3L2QueueOpcode
 from simpler.task_interface import ArgDirection as D
-from simpler.task_interface import CallConfig, ChipCallable, CoreCallable, DataType, TaskArgs, scalar_to_uint64
+from simpler.task_interface import CallConfig, ChipCallable, CoreCallable, TaskArgs, scalar_to_uint64
 from simpler.worker import Worker
 
 from simpler_setup.elf_parser import extract_text_section
@@ -33,6 +33,15 @@ _QUEUE_DEPTH = 4
 _INPUT_ARENA_BYTES = 4096
 _OUTPUT_ARENA_BYTES = 4096
 _SCALAR = ctypes.c_float(7.0)
+
+
+def _build_core_callable(signature: list[D], binary: bytes) -> CoreCallable:
+    try:
+        return CoreCallable.build(signature=signature, binary=binary)
+    except ValueError as exc:
+        if "arg_index" not in str(exc):
+            raise
+        return CoreCallable.build(signature=signature, arg_index=list(range(len(signature))), binary=binary)
 
 
 def _build_chip_callable(platform: str) -> ChipCallable:
@@ -59,7 +68,7 @@ def _build_chip_callable(platform: str) -> ChipCallable:
         signature=[],
         func_name="l3_l2_message_queue_orchestration",
         binary=orch,
-        children=[(0, CoreCallable.build(signature=[D.IN, D.OUT], arg_index=[0, 1], binary=aiv))],
+        children=[(0, _build_core_callable([D.IN, D.OUT], aiv))],
     )
 
 
