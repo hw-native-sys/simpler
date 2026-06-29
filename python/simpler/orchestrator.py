@@ -187,6 +187,19 @@ class Orchestrator:
                 raise TypeError("RemoteTensorRef is only supported for RemoteCallable NEXT_LEVEL submits")
             remote_sidecar = None
         _validate_remote_sidecar_access(c_args, remote_sidecar)
+        # Mirror any registered post-fork host buffers into their shm (H2D) and
+        # reject host tensors the chip child cannot see (issue #1027). Only the
+        # LOCAL_CHIP path dereferences raw host pointers in the forked child.
+        if target_namespace == "LOCAL_CHIP" and self._worker is not None:
+            staged_len = len(self._worker._pending_host_copyback)
+            try:
+                self._worker._stage_host_buffers_for_chip_submit(c_args)
+            except BaseException:
+                # Staging appends D2H copybacks as it walks; if it aborts the
+                # submit never happens, so drop the copybacks it queued or a later
+                # clean drain would flush stale shm into those outputs.
+                del self._worker._pending_host_copyback[staged_len:]
+                raise
         final_worker_ids = _remote_data_eligible_worker_ids(remote_sidecar, eligible_worker_ids)
         cpp_worker_id = int(worker)
         captured_refs = self._worker._capture_remote_sidecar_refs(remote_sidecar) if self._worker is not None else []
@@ -249,6 +262,18 @@ class Orchestrator:
         if remote_sidecars is not None:
             for c_args, remote_sidecar in zip(c_args_list, remote_sidecars):
                 _validate_remote_sidecar_access(c_args, remote_sidecar)
+        # Stage + validate registered/post-fork host buffers for chip dispatch
+        # (issue #1027), same as the single submit path.
+        if target_namespace == "LOCAL_CHIP" and self._worker is not None:
+            staged_len = len(self._worker._pending_host_copyback)
+            try:
+                for c_args in c_args_list:
+                    self._worker._stage_host_buffers_for_chip_submit(c_args)
+            except BaseException:
+                # Roll back copybacks queued for every c_args staged so far; the
+                # group submit never happens, so none of them must survive.
+                del self._worker._pending_host_copyback[staged_len:]
+                raise
         worker_id_sets = (
             [
                 _remote_data_eligible_worker_ids(remote_sidecar, eligible_worker_ids)
