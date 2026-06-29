@@ -432,6 +432,22 @@ public:
         sched_ = &rt->scheduler;
     }
 
+    // Serial orch->sched mode pre-dispatch gate. Spin until the orchestrator
+    // marks itself done; thread 0 may drain the wiring SPSC in the meantime
+    // so the orchestrator's submit_task pushes don't back-pressure. Other
+    // threads idle on the orchestrator_done_ flag.
+    void wait_for_orchestration_done_before_dispatch(Runtime * /*runtime*/, int32_t thread_idx)
+    {
+        while (!orchestrator_done_)
+        {
+            if (thread_idx == 0 && sched_ != nullptr)
+            {
+                sched_->drain_wiring_queue(false);
+            }
+            SPIN_WAIT_HINT();
+        }
+    }
+
     int32_t aic_count() const
     {
         return aic_count_;
