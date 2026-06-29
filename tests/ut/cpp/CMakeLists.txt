@@ -183,6 +183,10 @@ function(add_hierarchical_test name src)
         ${GTEST_LIB}
         pthread
     )
+    # worker_manager.cpp uses shm_open/shm_unlink; librt on glibc < 2.34, libSystem on macOS.
+    if(UNIX AND NOT APPLE)
+        target_link_libraries(${name} PRIVATE rt)
+    endif()
     add_test(NAME ${name} COMMAND ${name})
 endfunction()
 
