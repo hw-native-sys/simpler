@@ -29,7 +29,7 @@ class TestMatmulHostBuildGraph(SceneTestCase):
     CALLABLE = {
         "orchestration": {
             "source": "kernels/orchestration/matmul_orch.cpp",
-            "function_name": "build_matmul_graph",
+            "function_name": "aicpu_orchestration_entry",
             "signature": [D.IN, D.IN, D.IN, D.OUT],
         },
         "incores": [
@@ -61,7 +61,7 @@ class TestMatmulHostBuildGraph(SceneTestCase):
         {
             "name": "default",
             "platforms": ["a2a3sim", "a2a3"],
-            "config": {"aicpu_thread_num": 3, "block_dim": 3},
+            "config": {"aicpu_thread_num": 4, "block_dim": 3},
             "params": {},
         },
     ]

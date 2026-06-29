@@ -9,169 +9,81 @@
  * -----------------------------------------------------------------------------------------------------------
  */
 /**
- * Matmul Example Orchestration Function Implementation
+ * Matmul diamond orchestration — submit_task / TensorMap form
  *
- * Builds the task graph for formula: F = exp(sqrt(log(A)) @ W1 + sqrt(log(A)) @ W2)
+ * Builds: F = exp(sqrt(log(A)) @ W1 + sqrt(log(A)) @ W2)
  *
- * Task graph (diamond topology):
- *       t0 (sqrt+log, AIV)
+ *       t0 (sqrt(log), AIV)
  *      /  \
  *    t1    t2   (matmul, AIC)
  *      \  /
  *       t3 (add+exp, AIV)
  *
- * This orchestration function:
- * 1. Receives ChipStorageTaskArgs with tensor metadata (pointers, shapes, dtypes)
- * 2. Allocates device memory via orchestration API helpers
- * 3. Copies input data to device via orchestration API helpers
- * 4. Records output tensor for copy-back during finalize
- * 5. Builds the task graph with 4 tasks (2 AIV + 2 AIC)
+ * Dependencies are discovered by the TensorMap from the add_input/add_output
+ * directions. Intermediate b is FP16 (matmul input); c, d are FP32.
+ *
+ * Arg layout: [a (IN, fp16), w1 (IN, fp16), w2 (IN, fp16), f (OUT, fp32)].
  */
 
-#include <cstdint>
-#include <iostream>
+#include <stdint.h>
 
-#include "orchestration_api.h"  // NOLINT(build/include_subdir)
+#include "pto_orchestration_api.h"  // NOLINT(build/include_subdir)
+
+#define FUNC_LOG_SQRT 0
+#define FUNC_MATMUL 1
+#define FUNC_ADD_EXP 2
 
 extern "C" {
 
-int build_matmul_graph(OrchestrationRuntime *runtime, const ChipStorageTaskArgs &orch_args) {
-    // Validate argument count
-    // Expected orch_args: [a, w1, w2, f] — 4 tensors
-    if (orch_args.tensor_count() < 4) {
-        std::cerr << "build_matmul_graph: Expected at least 4 tensors, got " << orch_args.tensor_count() << '\n';
-        return -1;
-    }
+__attribute__((visibility("default"))) PTO2OrchestrationConfig aicpu_orchestration_config(const L2TaskArgs &orch_args) {
+    (void)orch_args;
+    return PTO2OrchestrationConfig{
+        .expected_arg_count = 4,
+    };
+}
 
-    // Extract host pointers and sizes from tensor metadata
-    void *host_a = orch_args.tensor(0).data_as<void>();
-    void *host_w1 = orch_args.tensor(1).data_as<void>();
-    void *host_w2 = orch_args.tensor(2).data_as<void>();
-    void *host_f = orch_args.tensor(3).data_as<void>();
-    size_t size_a = orch_args.tensor(0).nbytes();
-    size_t size_w1 = orch_args.tensor(1).nbytes();
-    size_t size_w2 = orch_args.tensor(2).nbytes();
-    size_t size_f = orch_args.tensor(3).nbytes();
-    uint32_t SIZE = orch_args.tensor(0).shapes[0];
+__attribute__((visibility("default"))) void aicpu_orchestration_entry(const L2TaskArgs &orch_args) {
+    const Tensor &a = orch_args.tensor(0).ref();
+    const Tensor &w1 = orch_args.tensor(1).ref();
+    const Tensor &w2 = orch_args.tensor(2).ref();
+    const Tensor &f = orch_args.tensor(3).ref();  // external output, written in place
 
-    std::cout << "\n=== build_matmul_graph: Creating Task Runtime ===" << '\n';
-    std::cout << "Formula: F = exp(sqrt(log(A)) @ W1 + sqrt(log(A)) @ W2)\n";
-    std::cout << "SIZE: " << SIZE << " elements\n";
+    uint32_t SIZE = a.shapes[0];
+    uint32_t shapes[1] = {SIZE};
+    TensorCreateInfo b_ci(shapes, 1, DataType::FLOAT16);  // sqrt(log(A)) — half
+    TensorCreateInfo cd_ci(shapes, 1, DataType::FLOAT32);
 
-    // Allocate device memory and copy inputs
-    std::cout << "\n=== Allocating Device Memory ===" << '\n';
+    // task0: b = sqrt(log(a))
+    L0TaskArgs p0;
+    p0.add_input(a);
+    p0.add_output(b_ci);
+    TaskOutputTensors b_out = rt_submit_aiv_task(FUNC_LOG_SQRT, p0);
+    Tensor b = b_out.get_ref(0);
 
-    void *dev_a = device_malloc(runtime, size_a);
-    if (!dev_a) {
-        std::cerr << "Error: Failed to allocate device memory for A\n";
-        return -1;
-    }
-    copy_to_device(runtime, dev_a, host_a, size_a);
-    std::cout << "Tensor A: " << size_a << " bytes copied to device\n";
+    // task1: c = b @ w1
+    L0TaskArgs p1;
+    p1.add_input(b);
+    p1.add_input(w1);
+    p1.add_output(cd_ci);
+    TaskOutputTensors c_out = rt_submit_aic_task(FUNC_MATMUL, p1);
+    Tensor c = c_out.get_ref(0);
 
-    void *dev_w1 = device_malloc(runtime, size_w1);
-    if (!dev_w1) {
-        std::cerr << "Error: Failed to allocate device memory for W1\n";
-        device_free(runtime, dev_a);
-        return -1;
-    }
-    copy_to_device(runtime, dev_w1, host_w1, size_w1);
-    std::cout << "Tensor W1: " << size_w1 << " bytes copied to device\n";
+    // task2: d = b @ w2
+    L0TaskArgs p2;
+    p2.add_input(b);
+    p2.add_input(w2);
+    p2.add_output(cd_ci);
+    TaskOutputTensors d_out = rt_submit_aic_task(FUNC_MATMUL, p2);
+    Tensor d = d_out.get_ref(0);
 
-    void *dev_w2 = device_malloc(runtime, size_w2);
-    if (!dev_w2) {
-        std::cerr << "Error: Failed to allocate device memory for W2\n";
-        device_free(runtime, dev_a);
-        device_free(runtime, dev_w1);
-        return -1;
-    }
-    copy_to_device(runtime, dev_w2, host_w2, size_w2);
-    std::cout << "Tensor W2: " << size_w2 << " bytes copied to device\n";
+    // task3: f = exp(c + d)
+    L0TaskArgs p3;
+    p3.add_input(c);
+    p3.add_input(d);
+    p3.add_output(f);
+    rt_submit_aiv_task(FUNC_ADD_EXP, p3);
 
-    void *dev_f = device_malloc(runtime, size_f);
-    if (!dev_f) {
-        std::cerr << "Error: Failed to allocate device memory for F\n";
-        device_free(runtime, dev_a);
-        device_free(runtime, dev_w1);
-        device_free(runtime, dev_w2);
-        return -1;
-    }
-    // Record output tensor for copy-back during finalize
-    record_tensor_pair(runtime, host_f, dev_f, size_f);
-    std::cout << "Tensor F (output): " << size_f << " bytes allocated\n";
-
-    // Allocate intermediate tensors (b, c, d)
-    // dev_b is half precision (output of log_sqrt kernel, input to matmul)
-    // dev_c, dev_d are float precision (output of matmul kernels)
-    size_t BYTES_HALF = SIZE * sizeof(uint16_t);        // half = 2 bytes
-    size_t BYTES_FLOAT = SIZE * sizeof(float);          // float = 4 bytes
-    void *dev_b = device_malloc(runtime, BYTES_HALF);   // sqrt(log(A)) - half output
-    void *dev_c = device_malloc(runtime, BYTES_FLOAT);  // B @ W1 - float output
-    void *dev_d = device_malloc(runtime, BYTES_FLOAT);  // B @ W2 - float output
-
-    if (!dev_b || !dev_c || !dev_d) {
-        std::cerr << "Error: Failed to allocate intermediate tensors\n";
-        device_free(runtime, dev_a);
-        device_free(runtime, dev_w1);
-        device_free(runtime, dev_w2);
-        device_free(runtime, dev_f);
-        if (dev_b) device_free(runtime, dev_b);
-        if (dev_c) device_free(runtime, dev_c);
-        if (dev_d) device_free(runtime, dev_d);
-        return -1;
-    }
-
-    std::cout << "Allocated intermediate tensors: B (" << BYTES_HALF << " bytes, half), C (" << BYTES_FLOAT
-              << " bytes, float), D (" << BYTES_FLOAT << " bytes, float)\n";
-
-    // Task 0: B = sqrt(log(A)) (func_id=0: kernel_log_sqrt, AIV)
-    uint64_t args_t0[3];
-    args_t0[0] = reinterpret_cast<uint64_t>(dev_a);  // src
-    args_t0[1] = reinterpret_cast<uint64_t>(dev_b);  // out
-    args_t0[2] = SIZE;                               // size
-    int t0 = add_task(runtime, args_t0, 3, 0, CoreType::AIV);
-
-    // Task 1: C = B @ W1 (func_id=1: kernel_matmul, AIC)
-    uint64_t args_t1[4];
-    args_t1[0] = reinterpret_cast<uint64_t>(dev_b);   // src0 (left matrix)
-    args_t1[1] = reinterpret_cast<uint64_t>(dev_w1);  // src1 (right matrix)
-    args_t1[2] = reinterpret_cast<uint64_t>(dev_c);   // out
-    args_t1[3] = SIZE;                                // size
-    int t1 = add_task(runtime, args_t1, 4, 1, CoreType::AIC);
-
-    // Task 2: D = B @ W2 (func_id=1: kernel_matmul, AIC)
-    uint64_t args_t2[4];
-    args_t2[0] = reinterpret_cast<uint64_t>(dev_b);   // src0 (left matrix)
-    args_t2[1] = reinterpret_cast<uint64_t>(dev_w2);  // src1 (right matrix)
-    args_t2[2] = reinterpret_cast<uint64_t>(dev_d);   // out
-    args_t2[3] = SIZE;                                // size
-    int t2 = add_task(runtime, args_t2, 4, 1, CoreType::AIC);
-
-    // Task 3: F = exp(C + D) (func_id=2: kernel_add_exp, AIV)
-    uint64_t args_t3[4];
-    args_t3[0] = reinterpret_cast<uint64_t>(dev_c);  // src0
-    args_t3[1] = reinterpret_cast<uint64_t>(dev_d);  // src1
-    args_t3[2] = reinterpret_cast<uint64_t>(dev_f);  // out
-    args_t3[3] = SIZE;                               // size
-    int t3 = add_task(runtime, args_t3, 4, 2, CoreType::AIV);
-
-    // Add dependencies (diamond: t0→t1→t3, t0→t2→t3)
-    add_successor(runtime, t0, t1);  // t0 → t1
-    add_successor(runtime, t0, t2);  // t0 → t2
-    add_successor(runtime, t1, t3);  // t1 → t3
-    add_successor(runtime, t2, t3);  // t2 → t3
-
-    std::cout << "\nTasks:\n";
-    std::cout << "  task" << t0 << ": B = sqrt(log(A))   [AIV]\n";
-    std::cout << "  task" << t1 << ": C = B @ W1         [AIC]\n";
-    std::cout << "  task" << t2 << ": D = B @ W2         [AIC]\n";
-    std::cout << "  task" << t3 << ": F = exp(C + D)     [AIV]\n";
-    std::cout << "Dependencies: t0→t1→t3, t0→t2→t3 (diamond)\n";
-
-    std::cout << "Created runtime with " << get_task_count(runtime) << " tasks\n";
-    print_runtime(runtime);
-
-    return 0;
+    LOG_INFO_V9("[matmul_orch] Submitted 4-task diamond");
 }
 
 }  // extern "C"

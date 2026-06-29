@@ -9,16 +9,20 @@
  * -----------------------------------------------------------------------------------------------------------
  */
 /**
- * Element-wise Log then Sqrt Kernel
+ * Element-wise log then sqrt kernel (submit_task / Tensor* ABI)
  *
- * Implements: out[i] = sqrt(log(src[i]))
+ * Implements: out[i] = sqrt(log(src[i])).  Both input and output are half
+ * precision for matmul compatibility.  Single 128x128 tile.
  *
- * This kernel performs element-wise natural logarithm followed by square root.
- * Both input and output are half precision for matmul compatibility.
+ * Args (Tensor*):
+ *   args[0] = src (INPUT, half)
+ *   args[1] = out (OUTPUT, half)
  */
 
 #include <cstdint>
 #include <pto/pto-inst.hpp>
+
+#include "tensor.h"
 
 using namespace pto;
 
@@ -32,28 +36,18 @@ using namespace pto;
 #define __aicore__ [aicore]
 #endif
 
-/**
- * Log + Sqrt kernel implementation (half precision in/out)
- *
- * Unified signature: all arguments passed via int64_t array
- * @param args  Argument array:
- *              args[0] = src pointer (input tensor, half)
- *              args[1] = out pointer (output tensor, half)
- *              args[2] = size (number of elements)
- */
 extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ int64_t *args) {
-    // Unpack arguments
-    __gm__ half *src = reinterpret_cast<__gm__ half *>(args[0]);
-    __gm__ half *out = reinterpret_cast<__gm__ half *>(args[1]);
-    int size = static_cast<int>(args[2]);
+    __gm__ Tensor *src_tensor = reinterpret_cast<__gm__ Tensor *>(args[0]);
+    __gm__ Tensor *out_tensor = reinterpret_cast<__gm__ Tensor *>(args[1]);
 
-    // Configuration
+    __gm__ half *src = reinterpret_cast<__gm__ half *>(src_tensor->buffer.addr) + src_tensor->start_offset;
+    __gm__ half *out = reinterpret_cast<__gm__ half *>(out_tensor->buffer.addr) + out_tensor->start_offset;
+
     constexpr int kTRows_ = 128;
     constexpr int kTCols_ = 128;
     constexpr int vRows = 128;
     constexpr int vCols = 128;
 
-    // Half types for input and output
     using DynShapeDim5Half = Shape<1, 1, 1, vRows, vCols>;
     using DynStridDim5Half = Stride<1, 1, 1, kTCols_, 1>;
     using GlobalDataHalf = GlobalTensor<half, DynShapeDim5Half, DynStridDim5Half>;

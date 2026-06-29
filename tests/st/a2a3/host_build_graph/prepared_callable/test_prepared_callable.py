@@ -59,7 +59,7 @@ class TestPreparedCallableHbg(SceneTestCase):
     CALLABLE = {
         "orchestration": {
             "source": f"{_VECTOR_KERNELS}/orchestration/example_orch.cpp",
-            "function_name": "build_example_graph",
+            "function_name": "aicpu_orchestration_entry",
             "signature": [D.IN, D.IN, D.OUT],
         },
         "incores": [
@@ -87,7 +87,7 @@ class TestPreparedCallableHbg(SceneTestCase):
         ],
     }
 
-    _COMMON_CONFIG = {"aicpu_thread_num": 3, "block_dim": 3}
+    _COMMON_CONFIG = {"aicpu_thread_num": 4, "block_dim": 3}
     _PLATFORMS = ["a2a3sim", "a2a3"]
 
     CASES = [

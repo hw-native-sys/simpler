@@ -9,15 +9,21 @@
  * -----------------------------------------------------------------------------------------------------------
  */
 /**
- * Tile-based Element-wise Addition Kernel (Vector Core)
+ * Tiled accumulate-add kernel (AIV, submit_task / Tensor* ABI)
  *
- * Computes: output = input_a + input_b (64x64 tile addition)
- * Uses TADD instruction
+ * Implements: C[i] = C[i] + P[i] in place over a single 64x64 tile.
+ *
+ * Args (Tensor*):
+ *   args[0] = C (INOUT)
+ *   args[1] = P (INPUT)
  */
 
 #include <cstdint>
+
 #include <pto/pto-inst.hpp>
 #include <pto/common/constants.hpp>
+
+#include "tensor.h"
 
 using namespace pto;
 
@@ -32,9 +38,11 @@ using namespace pto;
 #endif
 
 extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ int64_t *args) {
-    __gm__ float *input_a = reinterpret_cast<__gm__ float *>(args[0]);
-    __gm__ float *input_b = reinterpret_cast<__gm__ float *>(args[1]);
-    __gm__ float *output = reinterpret_cast<__gm__ float *>(args[2]);
+    __gm__ Tensor *c_tensor = reinterpret_cast<__gm__ Tensor *>(args[0]);
+    __gm__ Tensor *p_tensor = reinterpret_cast<__gm__ Tensor *>(args[1]);
+
+    __gm__ float *c_ptr = reinterpret_cast<__gm__ float *>(c_tensor->buffer.addr) + c_tensor->start_offset;
+    __gm__ float *p_ptr = reinterpret_cast<__gm__ float *>(p_tensor->buffer.addr) + p_tensor->start_offset;
 
     constexpr int TILE = 64;
 
@@ -43,25 +51,24 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
     using GlobalData = GlobalTensor<float, DynShapeDim5, DynStridDim5>;
     using TileData = Tile<TileType::Vec, float, TILE, TILE, BLayout::RowMajor, -1, -1>;
 
-    TileData aTile(TILE, TILE);
-    TileData bTile(TILE, TILE);
+    TileData cTile(TILE, TILE);
+    TileData pTile(TILE, TILE);
     TileData outTile(TILE, TILE);
-    TASSIGN(aTile, 0x0);
-    TASSIGN(bTile, 0x10000);
+    TASSIGN(cTile, 0x0);
+    TASSIGN(pTile, 0x10000);
     TASSIGN(outTile, 0x20000);
 
-    GlobalData aGlobal(input_a);
-    GlobalData bGlobal(input_b);
-    GlobalData outGlobal(output);
+    GlobalData cGlobal(c_ptr);
+    GlobalData pGlobal(p_ptr);
 
-    TLOAD(aTile, aGlobal);
-    TLOAD(bTile, bGlobal);
+    TLOAD(cTile, cGlobal);
+    TLOAD(pTile, pGlobal);
     set_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
     wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
-    TADD(outTile, aTile, bTile);
+    TADD(outTile, cTile, pTile);
     set_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
     wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
-    TSTORE(outGlobal, outTile);
+    TSTORE(cGlobal, outTile);
 
     pipe_sync();
 }

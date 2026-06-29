@@ -9,16 +9,20 @@
  * -----------------------------------------------------------------------------------------------------------
  */
 /**
- * Element-wise Add then Exp Kernel
+ * Element-wise add then exp kernel (submit_task / Tensor* ABI)
  *
- * Implements: out[i] = exp(src0[i] + src1[i])
+ * Implements: out[i] = exp(src0[i] + src1[i]).  Single 128x128 tile.
  *
- * This kernel performs element-wise addition of two tensors followed by
- * exponential operation.
+ * Args (Tensor*):
+ *   args[0] = src0 (INPUT, float)
+ *   args[1] = src1 (INPUT, float)
+ *   args[2] = out  (OUTPUT, float)
  */
 
 #include <cstdint>
 #include <pto/pto-inst.hpp>
+
+#include "tensor.h"
 
 using namespace pto;
 
@@ -32,24 +36,15 @@ using namespace pto;
 #define __aicore__ [aicore]
 #endif
 
-/**
- * Add + Exp kernel implementation
- *
- * Unified signature: all arguments passed via int64_t array
- * @param args  Argument array:
- *              args[0] = src0 pointer (first input tensor)
- *              args[1] = src1 pointer (second input tensor)
- *              args[2] = out pointer (output tensor)
- *              args[3] = size (number of elements)
- */
 extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ int64_t *args) {
-    // Unpack arguments
-    __gm__ float *src0 = reinterpret_cast<__gm__ float *>(args[0]);
-    __gm__ float *src1 = reinterpret_cast<__gm__ float *>(args[1]);
-    __gm__ float *out = reinterpret_cast<__gm__ float *>(args[2]);
-    int size = static_cast<int>(args[3]);
+    __gm__ Tensor *src0_tensor = reinterpret_cast<__gm__ Tensor *>(args[0]);
+    __gm__ Tensor *src1_tensor = reinterpret_cast<__gm__ Tensor *>(args[1]);
+    __gm__ Tensor *out_tensor = reinterpret_cast<__gm__ Tensor *>(args[2]);
 
-    // Configuration: float, 128, 128, 128, 128
+    __gm__ float *src0 = reinterpret_cast<__gm__ float *>(src0_tensor->buffer.addr) + src0_tensor->start_offset;
+    __gm__ float *src1 = reinterpret_cast<__gm__ float *>(src1_tensor->buffer.addr) + src1_tensor->start_offset;
+    __gm__ float *out = reinterpret_cast<__gm__ float *>(out_tensor->buffer.addr) + out_tensor->start_offset;
+
     constexpr int kTRows_ = 128;
     constexpr int kTCols_ = 128;
     constexpr int vRows = 128;
@@ -60,7 +55,6 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
     using GlobalData = GlobalTensor<float, DynShapeDim5, DynStridDim5>;
     using TileData = Tile<TileType::Vec, float, kTRows_, kTCols_, BLayout::RowMajor, -1, -1>;
 
-    // Optimized memory: only 3 tiles needed (reuse for intermediate and output)
     TileData src0Tile(vRows, vCols);
     TileData src1Tile(vRows, vCols);
     TileData dstTile(vRows, vCols);
@@ -76,9 +70,7 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
     TLOAD(src1Tile, src1Global);
     set_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
     wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
-    // Add: result in src0Tile (reuse)
     TADD(src0Tile, src0Tile, src1Tile);
-    // Exp: result in dstTile
     TEXP(dstTile, src0Tile);
     set_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
     wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);

@@ -8,68 +8,53 @@
  * See LICENSE in the root of the software repository for the full text of the License.
  * -----------------------------------------------------------------------------------------------------------
  */
-
 /**
- * Runtime Class - Task Dependency Runtime Management
+ * Runtime Class - Device Execution and Handshake Control
  *
- * This is a simplified, standalone runtime class for managing task
- * dependencies. Tasks are stored in a fixed-size array with compile-time
- * configurable bounds. Each task has:
- * - Unique ID (array index)
- * - Arguments (uint64_t array)
- * - Fanin (predecessor count)
- * - Fanout (array of successor task IDs)
+ * This class manages device-side execution through AICPU-AICore handshake
+ * protocol. Task graph construction is handled by PTO2Runtime; this class
+ * only handles:
+ * - Handshake buffers for AICPU-AICore communication
+ * - Execution parameters (block_dim, aicpu_thread_num)
+ * - Tensor pair management for host-device memory tracking
+ * - Device orchestration state (gm_sm_ptr_, orch_args_)
+ * - Function address mapping (func_id_to_addr_)
  *
- * The runtime maintains a ready queue for tasks with fanin == 0.
- *
- * Based on patterns from pto_runtime.h/c but simplified for educational
- * and lightweight scheduling use cases.
+ * Task dispatch uses a per-core PTO2DispatchPayload written by the scheduler.
+ * At dispatch time, build_payload() copies tensor pointers and scalars from
+ * the task payload into the per-core args[], populates SPMD context, then
+ * signals AICore via DATA_MAIN_BASE.
  */
 
-#ifndef SRC_A2A3_RUNTIME_HOST_BUILD_GRAPH_RUNTIME_RUNTIME_H_
-#define SRC_A2A3_RUNTIME_HOST_BUILD_GRAPH_RUNTIME_RUNTIME_H_
+#ifndef SRC_A2A3_RUNTIME_TENSORMAP_AND_RINGBUFFER_RUNTIME_RUNTIME_H_
+#define SRC_A2A3_RUNTIME_TENSORMAP_AND_RINGBUFFER_RUNTIME_RUNTIME_H_
 
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>   // for fprintf, printf
 #include <string.h>  // for memset
 
-#include <atomic>
 #include <vector>
 
 #include "common/core_type.h"
 #include "common/l2_swimlane_profiling.h"
 #include "common/platform_config.h"
 #include "aicpu/platform_aicpu_affinity.h"  // MAX_GATE_THREADS (aicpu_allowed_cpus bound)
-#include "pto_runtime2_types.h"
-#include "tensor_info.h"
-
-// Logging macros using unified logging interface
-#include "common/unified_log.h"
+#include "pto2_dispatch_payload.h"
+#include "task_args.h"
 
 // =============================================================================
 // Configuration Macros
 // =============================================================================
 
-#ifndef RUNTIME_MAX_TASKS
-#define RUNTIME_MAX_TASKS 131072
-#endif
-
-#ifndef RUNTIME_MAX_ARGS
-#define RUNTIME_MAX_ARGS 16
-#endif
-
-#ifndef RUNTIME_MAX_FANOUT
-#define RUNTIME_MAX_FANOUT 128
-#endif
-
-#ifndef RUNTIME_MAX_WORKER
-#define RUNTIME_MAX_WORKER PLATFORM_MAX_CORES_PER_THREAD
-#endif
-
-#ifndef RUNTIME_MAX_FUNC_ID
+#define RUNTIME_MAX_ARGS 128
+#define RUNTIME_MAX_WORKER 72  // 24 AIC + 48 AIV cores
 #define RUNTIME_MAX_FUNC_ID 1024
-#endif
+#define RUNTIME_MAX_ORCH_SO_SIZE (4 * 1024 * 1024)  // 4MB max for orchestration SO
+#define RUNTIME_MAX_ORCH_SYMBOL_NAME 64
+
+// Default ready queue shards: one shard per worker thread (total minus orchestrator)
+constexpr int RUNTIME_DEFAULT_READY_QUEUE_SHARDS = PLATFORM_MAX_AICPU_THREADS - 1;
 
 // =============================================================================
 // Data Structures
@@ -84,8 +69,8 @@
  * Protocol State Machine:
  * 1. Initialization: AICPU sets aicpu_ready=1
  * 2. Acknowledgment: AICore sets aicore_done=core_id+1
- * 3. Task Dispatch: AICPU writes DATA_MAIN_BASE with the task_id after publishing Task*
- * 4. Task Execution: AICore reads the task and executes
+ * 3. Task Dispatch: AICPU writes DATA_MAIN_BASE after updating the per-core payload
+ * 4. Task Execution: AICore reads the cached PTO2DispatchPayload and executes
  * 5. Task Completion: AICore writes FIN to COND; AICPU observes completion
  * 6. Shutdown: AICPU sets control=1, AICore exits
  *
@@ -103,14 +88,13 @@
  * Field Access Patterns:
  * - aicpu_ready: Written by AICPU, read by AICore
  * - aicore_done: Written by AICore, read by AICPU
- * - task: Written by AICPU, read by AICore (0 = no task assigned)
+ * - task: Written by AICPU, read by AICore (0 = not ready, non-zero = PTO2DispatchPayload*)
  * - core_type: Written by AICPU, read by AICore (CoreType::AIC or CoreType::AIV)
- * - physical_core_id: Written by AICPU, read by AICore (physical core ID)
  */
 struct Handshake {
     volatile uint32_t aicpu_ready;        // AICPU ready signal: 0=not ready, 1=ready
     volatile uint32_t aicore_done;        // AICore ready signal: 0=not ready, core_id+1=ready
-    volatile uint64_t task;               // Task pointer: 0=no task, non-zero=Task* address
+    volatile uint64_t task;               // Init: PTO2DispatchPayload* (set before aicpu_ready); runtime: unused
     volatile CoreType core_type;          // Core type: CoreType::AIC or CoreType::AIV
     volatile uint32_t physical_core_id;   // Physical core ID
     volatile uint32_t aicpu_regs_ready;   // AICPU register init done: 0=pending, 1=done
@@ -125,6 +109,10 @@ struct TensorPair {
     void *host_ptr;
     void *dev_ptr;
     size_t size;
+    // false for read-only INPUT tensors: they are never written by the kernel,
+    // so the end-of-run D2H copy-back is skipped. OUTPUT/INOUT/unknown
+    // keep the safe default of copying back.
+    bool needs_copy_back = true;
 };
 
 /**
@@ -136,17 +124,27 @@ struct HostApi {
     void (*device_free)(void *dev_ptr);
     int (*copy_to_device)(void *dev_ptr, const void *host_ptr, size_t size);
     int (*copy_from_device)(void *host_ptr, const void *dev_ptr, size_t size);
-    // Device-side memset (zero-init pure OUTPUT buffers in lieu of an H2D
-    // copy-in). Unused by host_build_graph; present only so the platform
-    // layer can populate the same HostApi shape regardless of runtime variant.
+    // Set a device buffer to a byte value (device-side, no PCIe). Used to
+    // zero-init pure OUTPUT buffers in lieu of an H2D copy-in. May be
+    // null on backends that don't wire it; callers must fall back to
+    // copy_to_device.
     int (*device_memset)(void *dev_ptr, int value, size_t size);
-    // PTO2 static-arena hooks. The host_build_graph runtime does not currently
-    // use these — the fields exist only so the platform layer's
-    // pto_runtime_c_api.cpp can populate the same HostApi struct regardless of
-    // which runtime variant it is built against. Unset for this variant; do
-    // not call. hbg-side callers pass runtime_arena_size == 0 (hbg has no
-    // prebuilt runtime arena).
+    // Commit the three per-Worker pooled regions (PTO2 GM heap, PTO2 shared
+    // memory, trb prebuilt runtime arena) as three independent device
+    // allocations. `runtime_arena_size == 0` skips the third region (hbg
+    // path: hbg has no prebuilt runtime arena). Idempotent on identical
+    // sizes; returns 0 on success, -1 on allocation failure.
     int (*setup_static_arena)(size_t gm_heap_size, size_t gm_sm_size, size_t runtime_arena_size);
+    // Return the per-Worker pooled pointer for the PTO2 GM heap / shared
+    // memory / prebuilt runtime arena. setup_static_arena must have already
+    // committed the relevant region; the returned pointer is owned by the
+    // DeviceRunner and freed in `DeviceRunner::finalize()` — do NOT pass it
+    // to device_free or record it in `tensor_pairs_`.
+    //
+    // acquire_pooled_runtime_arena is trb-only — the runtime-arena region is
+    // only committed when setup_static_arena was invoked with
+    // runtime_arena_size > 0. Calling it on the hbg path
+    // (setup_static_arena(...,0)) returns nullptr (not undefined).
     void *(*acquire_pooled_gm_heap)();
     void *(*acquire_pooled_gm_sm)();
     void *(*acquire_pooled_runtime_arena)();
@@ -166,48 +164,27 @@ struct HostApi {
 };
 
 /**
- * Task entry in the runtime
+ * Task structure - Compatibility stub for platform layer
  *
- * Each task has a unique ID (its index in the task array), arguments,
- * and dependency information (fanin/fanout).
+ * RT2 uses PTO2DispatchPayload instead of Task for task dispatch.
+ * This stub exists only for API compatibility with device_runner.cpp.
+ * Since get_task_count() returns 0, this struct is never actually used.
  */
-typedef struct {
-    int task_id;                      // Unique task identifier
-    int func_id;                      // Function identifier
-    uint64_t args[RUNTIME_MAX_ARGS];  // Task arguments
-    int num_args;                     // Number of valid arguments
-
-    // Runtime function pointer address (NEW)
-    // This is the GM address where the kernel binary resides
-    // It's cast to a function pointer at runtime: (KernelFunc)function_bin_addr
-    uint64_t function_bin_addr;  // Address of kernel in device GM memory
-
-    // Core type specification
-    // Specifies which core type this task should run on
-    CoreType core_type;  // CoreType::AIC or CoreType::AIV
-
-    // Dependency tracking (using PTO runtime terminology)
-    std::atomic<int> fanin;          // Number of predecessors (dependencies)
-    int fanout[RUNTIME_MAX_FANOUT];  // Successor task IDs
-    int fanout_count;                // Number of successors
-
-    // DFX-specific fields
-    uint64_t start_time;  // Start time of the task
-    uint64_t end_time;    // End time of the task
-} Task;
+struct Task {
+    int func_id;
+    uint64_t function_bin_addr;
+};
 
 // =============================================================================
 // Runtime Class
 // =============================================================================
 
 /**
- * Runtime class for task dependency management
+ * Runtime class for device execution and handshake control
  *
- * Maintains a fixed-size array of tasks and uses a Queue for ready tasks.
- * Tasks are allocated monotonically and never reused within the same
- * runtime instance.
- *
- * Dependencies are managed manually via add_successor().
+ * This class manages AICPU-AICore communication through handshake buffers.
+ * Task graph construction is handled by PTO2Runtime; this class only handles
+ * execution control and device orchestration state.
  */
 class Runtime {
 public:
@@ -215,47 +192,70 @@ public:
     Handshake workers[RUNTIME_MAX_WORKER];  // Worker (AICore) handshake buffers
     int worker_count;                       // Number of active workers
 
-    // Total AICPU threads launched on this run. host_build_graph has no
-    // orchestrator/scheduler split — every thread dispatches tasks in
-    // round-robin across the assigned cores. See AicpuExecutor::init.
+    // Execution parameters for AICPU scheduling.
+    //
+    // aicpu_thread_num is the *total* AICPU thread count launched on this run
+    // (= orch + schedulers). AicpuExecutor splits this into one orchestrator
+    // thread (highest idx, runs aicpu_orchestration_entry) and the remaining
+    // aicpu_thread_num-1 scheduler threads that dispatch tasks to AICore.
+    // The orch thread also dispatches when env PTO2_ORCH_TO_SCHED is set.
     int aicpu_thread_num;
+    int ready_queue_shards;  // Number of ready queue shards (1..MAX_AICPU_THREADS, default MAX-1)
 
-    // Task storage
-    Task tasks[RUNTIME_MAX_TASKS];  // Fixed-size task array
-
-    // Filter-style affinity gate input (a2a3 onboard). Placed AFTER `tasks`
-    // because AICore reads runtime->tasks[] by offset. Host fills these before
-    // launch from AICPU OCCUPY; the device gate keeps threads whose
+    // Filter-style affinity gate input (a2a3 onboard). Host fills these
+    // before launch from AICPU OCCUPY, and the device gate keeps threads whose
     // sched_getcpu() lands on one of the cpu_ids. The array position is the
-    // deterministic exec_idx used by AicpuExecutor for stable core assignment.
+    // deterministic exec_idx used by AicpuExecutor for sched/orch role
+    // assignment; the highest active index is the orchestrator slot.
     int32_t aicpu_allowed_cpus[MAX_GATE_THREADS];
     int32_t aicpu_allowed_cpu_count;
     int32_t aicpu_launch_count;
 
-private:
-    int next_task_id;  // Next available task ID
-
-    // Initial ready tasks (computed once, read-only after)
-    int initial_ready_tasks[RUNTIME_MAX_TASKS];
-    int initial_ready_count;
-
-    // Function address mapping (for API compatibility with rt2)
+    // PTO2 integration: kernel_id -> GM function_bin_addr mapping
+    // NOTE: Made public for direct access from aicore code
     uint64_t func_id_to_addr_[RUNTIME_MAX_FUNC_ID];
 
+    // Orchestrator-to-scheduler transition control
+    // When true, orchestrator threads convert to scheduler threads after orchestration completes.
+    // When false (default), orchestrator threads exit after orchestration without dispatching tasks.
+    // Controlled via PTO2_ORCH_TO_SCHED environment variable.
+    bool orch_to_sched;
+
+    // Total tasks submitted by the host orchestrator — handed to the scheduler
+    // (SchedulerContext::on_orchestration_done) in place of latching the SM ring
+    // head on device. host_build_graph builds the whole graph on the host, so
+    // the boot thread reads this instead of counting SM ring heads.
+    int32_t host_total_tasks;
+
+private:
     // Kernel binary tracking for cleanup
     int registered_kernel_func_ids_[RUNTIME_MAX_FUNC_ID];
     int registered_kernel_count_;
 
-    // Tensor info metadata for tensor dump
-    void *tensor_info_storage_;
-    uint64_t tensor_info_storage_bytes_;
-    uint32_t tensor_info_offsets_[RUNTIME_MAX_TASKS];
-    uint16_t tensor_info_counts_[RUNTIME_MAX_TASKS];
+    void *gm_sm_ptr_;                        // GM pointer to PTO2 shared memory (device)
+    void *gm_heap_ptr_;                      // GM heap for orchestrator output buffers (device)
+    void *slot_states_ptr_;                  // Pointer to PTO2TaskSlotState array (scheduler-private, for profiling)
+    ChipStorageTaskArgs orch_args_storage_;  // Copy of args for device
 
-    // Device allocation ranges used to recover tensor buffer addresses from task.args[]
-    void *tensor_allocation_storage_;
-    uint64_t tensor_allocation_storage_bytes_;
-    uint32_t tensor_allocation_count_;
+    // Prebuilt-arena fast path (trb only). Set by the host before rtMemcpy'ing
+    // Runtime to device; AICPU reads them in the boot path to skip
+    // runtime_create_from_sm and reuse the pooled, prebuilt arena buffer
+    // (already populated by runtime_init_data_from_layout + wire on host).
+    void *prebuilt_arena_base_;
+    size_t prebuilt_runtime_offset_;
+
+    // Orchestration metadata set by the platform host (DeviceRunner) when
+    // registering a callable. host_build_graph runs the orchestrator on the
+    // host, so the device side no longer reads the SO bytes / symbol names —
+    // but the platform registration path still writes them through these
+    // setters (shared with tensormap_and_ringbuffer), so the fields and their
+    // setters are part of the platform↔runtime ABI and must stay.
+    uint64_t dev_orch_so_addr_;
+    uint64_t dev_orch_so_size_;
+    int32_t active_callable_id_;
+    bool register_new_callable_id_;
+    char device_orch_func_name_[RUNTIME_MAX_ORCH_SYMBOL_NAME];
+    char device_orch_config_name_[RUNTIME_MAX_ORCH_SYMBOL_NAME];
 
 public:
     /**
@@ -264,192 +264,67 @@ public:
     Runtime();
 
     // =========================================================================
-    // Task Management
+    // Performance Profiling
     // =========================================================================
 
-    /**
-     * Allocate a new task with the given arguments
-     *
-     * @param args      Array of uint64_t arguments
-     * @param num_args  Number of arguments (must be <= RUNTIME_MAX_ARGS)
-     * @param func_id   Function identifier
-     * @param core_type Core type for this task (CoreType::AIC or CoreType::AIV)
-     * @return Task ID (>= 0) on success, -1 on failure
-     */
-    int add_task(uint64_t *args, int num_args, int func_id, CoreType core_type = CoreType::AIC);
-
-    /**
-     * Add a dependency edge: from_task -> to_task
-     *
-     * This adds to_task to from_task's fanout array and increments
-     * to_task's fanin counter.
-     *
-     * @param from_task  Producer task ID
-     * @param to_task    Consumer task ID (depends on from_task)
-     */
-    void add_successor(int from_task, int to_task);
-
     // =========================================================================
-    // Query Methods
+    // Shared-memory / orchestration argument plumbing
     // =========================================================================
 
-    /**
-     * Get a pointer to a task by ID
-     *
-     * @param task_id  Task ID to query
-     * @return Pointer to task, or nullptr if invalid ID
-     */
-    Task *get_task(int task_id);
+    void *get_gm_sm_ptr() const;
+    void *get_gm_heap_ptr() const;
+    const ChipStorageTaskArgs &get_orch_args() const;
+    void set_gm_sm_ptr(void *p);
+    void set_gm_heap(void *p);
+    void set_slot_states_ptr(void *p);
+    void set_orch_args(const ChipStorageTaskArgs &args);
 
-    /**
-     * Get the total number of tasks in the runtime
-     *
-     * @return Total task count
-     */
-    int get_task_count() const;
+    // Prebuilt-arena fast path (trb only). Set by host's
+    // bind_callable_to_runtime_impl; consumed by AICPU at boot to attach a
+    // DeviceArena to `prebuilt_arena_base_` and pick up the PTO2Runtime at
+    // `prebuilt_arena_base_ + prebuilt_runtime_offset_`. Both stay zero on
+    // first construction (Runtime() ctor zeros them) so a non-prebuilt boot
+    // path can still detect "no prebuilt image set" via nullptr.
+    void set_prebuilt_arena(void *arena_base, size_t runtime_off);
+    void *get_prebuilt_arena_base() const;
+    size_t get_prebuilt_runtime_offset() const;
 
-    /**
-     * Get initially ready tasks (fanin == 0) as entry point for execution
-     *
-     * This scans all tasks and populates the provided array with task IDs
-     * that have no dependencies (fanin == 0). The runtime can use this
-     * as the starting point for task scheduling.
-     *
-     * @param ready_tasks  Array to populate with ready task IDs (can be
-     * nullptr)
-     * @return Number of initially ready tasks
-     */
-    int get_initial_ready_tasks(int *ready_tasks);
+    // Orchestration metadata written by the platform host (DeviceRunner) at
+    // callable registration. Shared ABI with tensormap_and_ringbuffer; the
+    // host_build_graph device side no longer reads them (host-orch builds the
+    // graph on the host), so only the setters + register_new_callable_id() /
+    // get_active_callable_id() the platform reads are exposed.
+    void set_dev_orch_so(uint64_t dev_addr, uint64_t size);
+    void set_active_callable_id(int32_t callable_id, bool is_new);
+    int32_t get_active_callable_id() const;
+    bool register_new_callable_id() const;
+    void set_device_orch_func_name(const char *name);
+    void set_device_orch_config_name(const char *name);
 
-    // =========================================================================
-    // Utility Methods
-    // =========================================================================
-
-    /**
-     * Print the runtime structure to stdout
-     *
-     * Shows task table with fanin/fanout information.
-     */
-    void print_runtime() const;
-
-    // =========================================================================
-    // Tensor Info Metadata
-    // =========================================================================
-
-    void set_tensor_info_storage(void *ptr, uint64_t bytes) {
-        tensor_info_storage_ = ptr;
-        tensor_info_storage_bytes_ = bytes;
-    }
-
-    void clear_tensor_info_storage() {
-        tensor_info_storage_ = nullptr;
-        tensor_info_storage_bytes_ = 0;
-    }
-
-    void set_tensor_info_range(int task_id, uint32_t offset, uint16_t count) {
-        if (task_id < 0 || task_id >= RUNTIME_MAX_TASKS) return;
-        tensor_info_offsets_[task_id] = offset;
-        tensor_info_counts_[task_id] = count;
-    }
-
-    const TensorInfo *get_tensor_info(int task_id, int *count) const {
-        if (count != nullptr) {
-            *count = 0;
-        }
-        if (task_id < 0 || task_id >= RUNTIME_MAX_TASKS || tensor_info_storage_ == nullptr) {
-            return nullptr;
-        }
-        uint16_t tensor_info_count = tensor_info_counts_[task_id];
-        if (tensor_info_count == 0) {
-            return nullptr;
-        }
-        if (count != nullptr) {
-            *count = static_cast<int>(tensor_info_count);
-        }
-        const TensorInfo *base = reinterpret_cast<const TensorInfo *>(tensor_info_storage_);
-        return base + tensor_info_offsets_[task_id];
-    }
-
-    void *get_tensor_info_storage() const { return tensor_info_storage_; }
-
-    uint64_t get_tensor_info_storage_bytes() const { return tensor_info_storage_bytes_; }
-
-    void set_tensor_allocation_storage(void *ptr, uint32_t count, uint64_t bytes) {
-        tensor_allocation_storage_ = ptr;
-        tensor_allocation_count_ = count;
-        tensor_allocation_storage_bytes_ = bytes;
-    }
-
-    void clear_tensor_allocation_storage() {
-        tensor_allocation_storage_ = nullptr;
-        tensor_allocation_count_ = 0;
-        tensor_allocation_storage_bytes_ = 0;
-    }
-
-    bool is_tensor_buffer_addr(uint64_t addr) const {
-        if (tensor_allocation_storage_ == nullptr || tensor_allocation_count_ == 0) {
-            return false;
-        }
-        const TensorAllocationInfo *allocations =
-            reinterpret_cast<const TensorAllocationInfo *>(tensor_allocation_storage_);
-        for (uint32_t i = 0; i < tensor_allocation_count_; i++) {
-            if (allocations[i].contains(addr)) {
-                return true;
-            }
-        }
-        return false;
-    }
-
-    void *get_tensor_allocation_storage() const { return tensor_allocation_storage_; }
-
-    uint64_t get_tensor_allocation_storage_bytes() const { return tensor_allocation_storage_bytes_; }
-
-    // =========================================================================
-    // Device Orchestration (stub for API compatibility)
-    // =========================================================================
-
-    /**
-     * Set PTO2 shared memory pointer (stub for host_build_graph).
-     * This is a no-op for host orchestration; only used by rt2.
-     */
-    void set_gm_sm_ptr(void *) { /* no-op */ }
-
-    /**
-     * Get function binary address by func_id.
-     * Used by platform layer to resolve kernel addresses.
-     */
-    uint64_t get_function_bin_addr(int func_id) const {
-        if (func_id < 0 || func_id >= RUNTIME_MAX_FUNC_ID) return 0;
-        return func_id_to_addr_[func_id];
-    }
-
-    /**
-     * Set function binary address for a func_id.
-     * Called by platform layer after kernel registration.
-     */
+    uint64_t get_function_bin_addr(int func_id) const;
     void set_function_bin_addr(int func_id, uint64_t addr);
-
     /**
      * Replay a previously-uploaded kernel address onto a fresh Runtime
      * without recording it in registered_kernel_func_ids_. Used by
-     * DeviceRunner::bind_callable_to_runtime when restoring kernels
-     * across run_prepared invocations: the prepared callable owns the
-     * kernel binaries' device memory until unregister, so
-     * validate_runtime_impl must NOT free them.
+     * DeviceRunner::bind_callable_to_runtime so prepared kernel
+     * binaries are not freed by validate_runtime_impl across runs.
      */
-    void replay_function_bin_addr(int func_id, uint64_t addr) {
-        if (func_id < 0 || func_id >= RUNTIME_MAX_FUNC_ID) return;
-        func_id_to_addr_[func_id] = addr;
-    }
+    void replay_function_bin_addr(int func_id, uint64_t addr);
 
-    int get_registered_kernel_count() const { return registered_kernel_count_; }
+    int get_registered_kernel_count() const;
+    int get_registered_kernel_func_id(int index) const;
+    void clear_registered_kernels();
 
-    int get_registered_kernel_func_id(int index) const {
-        if (index < 0 || index >= registered_kernel_count_) return -1;
-        return registered_kernel_func_ids_[index];
-    }
+    // =========================================================================
+    // Deprecated API (for platform compatibility, always returns 0/nullptr)
+    // Task graph is now managed by PTO2Runtime, not Runtime
+    // =========================================================================
 
-    void clear_registered_kernels() { registered_kernel_count_ = 0; }
+    /** @deprecated Task count is now in PTO2 shared memory */
+    int get_task_count() const { return 0; }
+
+    /** @deprecated RT2 uses PTO2DispatchPayload, not Task. Always returns nullptr. */
+    Task *get_task(int) { return nullptr; }
 
     // =========================================================================
     // Host API (host-only, not copied to device)
@@ -459,60 +334,13 @@ public:
     // NOTE: Placed at end of class to avoid affecting device memory layout
     HostApi host_api;
 
-    // Device orchestration SO metadata: device buffer pointer + size (host
-    // populates these via DeviceRunner::prepare_orch_so before launch).
-    // host_build_graph runtime variant currently does not load device
-    // orchestration SOs, but DeviceRunner is shared with the other variants
-    // and unconditionally writes these fields, so they must exist.
-    uint64_t dev_orch_so_addr_{0};
-    uint64_t dev_orch_so_size_{0};
-
-    // Per-callable_id dispatch. hbg orch runs on host, so AICPU never reads
-    // `active_callable_id_`; the field exists for parity with the
-    // shared platform layer (DeviceRunner stamps it on every run).
-    int32_t active_callable_id_{-1};
-    bool register_new_callable_id_{false};
-
-    // Device-orchestration entry/config symbol names (trb path). Always
-    // empty on this hbg variant — included for API parity so the shared
-    // platform layer can call set_device_orch_func_name unconditionally.
-    char device_orch_func_name_[64]{};
-    char device_orch_config_name_[64]{};
-
-    void set_device_orch_func_name(const char *name) {
-        device_orch_func_name_[0] = '\0';
-        if (name) {
-            strncpy(device_orch_func_name_, name, sizeof(device_orch_func_name_) - 1);
-            device_orch_func_name_[sizeof(device_orch_func_name_) - 1] = '\0';
-        }
-    }
-    const char *get_device_orch_func_name() const { return device_orch_func_name_; }
-    void set_device_orch_config_name(const char *name) {
-        device_orch_config_name_[0] = '\0';
-        if (name) {
-            strncpy(device_orch_config_name_, name, sizeof(device_orch_config_name_) - 1);
-            device_orch_config_name_[sizeof(device_orch_config_name_) - 1] = '\0';
-        }
-    }
-    const char *get_device_orch_config_name() const { return device_orch_config_name_; }
-
-    void set_dev_orch_so(uint64_t dev_addr, uint64_t size) {
-        dev_orch_so_addr_ = dev_addr;
-        dev_orch_so_size_ = size;
-    }
-    void set_active_callable_id(int32_t callable_id, bool is_new) {
-        active_callable_id_ = callable_id;
-        register_new_callable_id_ = is_new;
-    }
-    int32_t get_active_callable_id() const { return active_callable_id_; }
-    bool register_new_callable_id() const { return register_new_callable_id_; }
-
     // Host-side tensor ledger for D2H copy-back at finalize. Populated by
-    // runtime_maker.cpp from orch_args at bind time; iterated in
+    // runtime_maker.cpp from orch_args at bind time, then iterated in
     // validate_runtime_impl. Not read by AICPU/AICore — the device-side
     // Runtime image carries the std::vector control block as harmless
-    // garbage, identical to host_api above. No fixed cap.
+    // garbage, identical to host_api above. No fixed cap — grows with the
+    // chip-level entry-tensor count.
     std::vector<TensorPair> tensor_pairs_;
 };
 
-#endif  // SRC_A2A3_RUNTIME_HOST_BUILD_GRAPH_RUNTIME_RUNTIME_H_
+#endif  // SRC_A2A3_RUNTIME_TENSORMAP_AND_RINGBUFFER_RUNTIME_RUNTIME_H_

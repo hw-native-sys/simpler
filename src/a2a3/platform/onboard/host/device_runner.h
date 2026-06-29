@@ -114,6 +114,14 @@ public:
      */
     int run(Runtime &runtime, int block_dim, int launch_aicpu_num = 1) override;
 
+    // SVM map/unmap a device buffer into host address space via
+    // halHostRegister(DEV_SVM_MAP_HOST) / halHostUnregister. host_build_graph
+    // uses these so its host-side orchestrator can read control tensors whose
+    // buffer.addr is a device address. The returned host VA may differ from
+    // dev_ptr — callers must use it for host access.
+    void *svm_register(void *dev_ptr, std::size_t bytes) override;
+    void svm_unregister(void *dev_ptr) override;
+
     /**
      * a2a3-only `dep_gen` enablement setter. The shared
      * `set_l2_swimlane_enabled`, `set_dump_tensor_enabled`,

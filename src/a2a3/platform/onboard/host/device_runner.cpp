@@ -961,6 +961,43 @@ int DeviceRunner::init_scope_stats(int num_threads, int device_id) {
     return 0;
 }
 
+void *DeviceRunner::svm_register(void *dev_ptr, std::size_t bytes) {
+    if (dev_ptr == nullptr || bytes == 0) {
+        return nullptr;
+    }
+    if (load_hal_if_needed() != 0) {
+        LOG_ERROR("svm_register: failed to load ascend_hal: %s", dlerror());
+        return nullptr;
+    }
+    HalHostRegisterFn fn = get_halHostRegister();
+    if (fn == nullptr) {
+        LOG_ERROR("svm_register: halHostRegister symbol not found: %s", dlerror());
+        return nullptr;
+    }
+    void *host_va = nullptr;
+    int rc = fn(dev_ptr, bytes, DEV_SVM_MAP_HOST, device_id_, &host_va);
+    if (rc != 0) {
+        LOG_ERROR("svm_register: halHostRegister failed for dev_ptr %p (rc=%d)", dev_ptr, rc);
+        return nullptr;
+    }
+    return host_va;
+}
+
+void DeviceRunner::svm_unregister(void *dev_ptr) {
+    if (dev_ptr == nullptr) {
+        return;
+    }
+    // halHostUnregister is keyed by the device pointer (mirrors the profiling
+    // finalize path); the HAL maps it back to the host VA internally.
+    HalHostUnregisterFn fn = get_halHostUnregister();
+    if (fn != nullptr) {
+        int rc = fn(dev_ptr, device_id_);
+        if (rc != 0) {
+            LOG_ERROR("svm_unregister: halHostUnregister failed for dev_ptr %p (rc=%d)", dev_ptr, rc);
+        }
+    }
+}
+
 void DeviceRunner::finalize_collectors() {
     auto unregister_cb = [](void *dev_ptr, int device_id) -> int {
         HalHostUnregisterFn fn = get_halHostUnregister();

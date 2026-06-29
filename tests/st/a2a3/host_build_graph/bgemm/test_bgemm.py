@@ -37,7 +37,7 @@ class TestBgemmHostBuildGraph(SceneTestCase):
     CALLABLE = {
         "orchestration": {
             "source": "kernels/orchestration/bgemm_orch.cpp",
-            "function_name": "build_bgemm_graph",
+            "function_name": "aicpu_orchestration_entry",
             "signature": [D.IN, D.IN, D.OUT],
         },
         "incores": [
@@ -62,7 +62,7 @@ class TestBgemmHostBuildGraph(SceneTestCase):
         {
             "name": "default",
             "platforms": ["a2a3sim", "a2a3"],
-            "config": {"aicpu_thread_num": 3, "block_dim": 24},
+            "config": {"aicpu_thread_num": 4, "block_dim": 24},
             "params": {},
         },
     ]
