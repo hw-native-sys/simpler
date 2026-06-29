@@ -9,18 +9,20 @@
  * -----------------------------------------------------------------------------------------------------------
  */
 /**
- * Element-wise Tensor Multiplication Kernel
+ * Element-wise multiplication kernel (submit_task / Tensor* ABI)
  *
- * Implements: out[i] = src0[i] * src1[i]
+ * Implements: out[i] = src0[i] * src1[i] over a single 128x128 tile.
  *
- * This kernel performs element-wise multiplication of two tensors. It's
- * compiled separately as a standalone kernel and linked with the dispatcher
- * using function pointers, demonstrating the separation pattern used in
- * production systems where kernel binaries are loaded dynamically.
+ * Args (Tensor*):
+ *   args[0] = src0 (INPUT)
+ *   args[1] = src1 (INPUT)
+ *   args[2] = out  (OUTPUT)
  */
 
 #include <cstdint>
 #include <pto/pto-inst.hpp>
+
+#include "tensor.h"
 
 using namespace pto;
 
@@ -34,24 +36,15 @@ using namespace pto;
 #define __aicore__ [aicore]
 #endif
 
-/**
- * Element-wise multiplication kernel implementation
- *
- * Unified signature: all arguments passed via int64_t array
- * @param args  Argument array:
- *              args[0] = src0 pointer (first input tensor)
- *              args[1] = src1 pointer (second input tensor)
- *              args[2] = out pointer (output tensor)
- *              args[3] = size (number of elements)
- */
 extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ int64_t *args) {
-    // Unpack arguments (order matches runtimemaker.cpp)
-    __gm__ float *src0 = reinterpret_cast<__gm__ float *>(args[0]);
-    __gm__ float *src1 = reinterpret_cast<__gm__ float *>(args[1]);
-    __gm__ float *out = reinterpret_cast<__gm__ float *>(args[2]);
-    int size = static_cast<int>(args[3]);
+    __gm__ Tensor *src0_tensor = reinterpret_cast<__gm__ Tensor *>(args[0]);
+    __gm__ Tensor *src1_tensor = reinterpret_cast<__gm__ Tensor *>(args[1]);
+    __gm__ Tensor *out_tensor = reinterpret_cast<__gm__ Tensor *>(args[2]);
 
-    // Configuration: float, 128, 128, 128, 128
+    __gm__ float *src0 = reinterpret_cast<__gm__ float *>(src0_tensor->buffer.addr) + src0_tensor->start_offset;
+    __gm__ float *src1 = reinterpret_cast<__gm__ float *>(src1_tensor->buffer.addr) + src1_tensor->start_offset;
+    __gm__ float *out = reinterpret_cast<__gm__ float *>(out_tensor->buffer.addr) + out_tensor->start_offset;
+
     constexpr int kTRows_ = 128;
     constexpr int kTCols_ = 128;
     constexpr int vRows = 128;

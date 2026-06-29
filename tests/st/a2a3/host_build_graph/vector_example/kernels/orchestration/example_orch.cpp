@@ -9,152 +9,83 @@
  * -----------------------------------------------------------------------------------------------------------
  */
 /**
- * Example Orchestration Function Implementation
+ * Example Orchestration Function — submit_task / TensorMap form
  *
- * Builds the task graph for formula: (a + b + 1)(a + b + 2)
+ * Builds the task graph for: f = (a + b + 1) * (a + b + 2)
  *
- * This orchestration function:
- * 1. Receives ChipStorageTaskArgs with tensor metadata (pointers, shapes, dtypes)
- * 2. Allocates device memory via orchestration API helpers
- * 3. Copies input data to device via orchestration API helpers
- * 4. Records output tensor for copy-back during finalize
- * 5. Builds the task graph
+ * Dependencies are discovered automatically by the TensorMap from the
+ * add_input/add_output directions: c is produced by task0 and consumed by
+ * task1/task2; d and e are produced by task1/task2 and consumed by task3.
+ *
+ * Arg layout: [a (IN), b (IN), f (OUT)] — 3 external tensors. The intermediate
+ * tensors c, d, e are allocated by the runtime from the HeapRing.
  */
 
-#include <iostream>
+#include <stdint.h>
 
-#include "orchestration_api.h"  // NOLINT(build/include_subdir)
+#include "pto_orchestration_api.h"  // NOLINT(build/include_subdir)
+
+#define FUNC_ADD 0         // c = a + b
+#define FUNC_ADD_SCALAR 1  // out = src + scalar
+#define FUNC_MUL 2         // f = d * e
 
 extern "C" {
 
-int build_example_graph(OrchestrationRuntime *runtime, const ChipStorageTaskArgs &orch_args) {
-    // Validate argument count
-    // Expected orch_args: [a, b, f] — 3 tensors
-    if (orch_args.tensor_count() < 3) {
-        std::cerr << "build_example_graph: Expected at least 3 tensors, got " << orch_args.tensor_count() << '\n';
-        return -1;
-    }
+__attribute__((visibility("default"))) PTO2OrchestrationConfig aicpu_orchestration_config(const L2TaskArgs &orch_args) {
+    (void)orch_args;
+    return PTO2OrchestrationConfig{
+        .expected_arg_count = 3,
+    };
+}
 
-    // Extract host pointers, sizes, and element count from tensor metadata
-    void *host_a = orch_args.tensor(0).data_as<void>();
-    void *host_b = orch_args.tensor(1).data_as<void>();
-    void *host_f = orch_args.tensor(2).data_as<void>();
-    size_t size_a = orch_args.tensor(0).nbytes();
-    size_t size_b = orch_args.tensor(1).nbytes();
-    size_t size_f = orch_args.tensor(2).nbytes();
-    uint32_t SIZE = orch_args.tensor(0).shapes[0];
+__attribute__((visibility("default"))) void aicpu_orchestration_entry(const L2TaskArgs &orch_args) {
+    const Tensor &a = orch_args.tensor(0).ref();
+    const Tensor &b = orch_args.tensor(1).ref();
+    const Tensor &f = orch_args.tensor(2).ref();  // external output, written in place
 
-    std::cout << "\n=== build_example_graph: Creating Task Runtime ===" << '\n';
-    std::cout << "Formula: (a + b + 1)(a + b + 2)\n";
-    std::cout << "SIZE: " << SIZE << " elements\n";
+    uint32_t SIZE = a.shapes[0];
+    uint32_t inter_shapes[1] = {SIZE};
+    TensorCreateInfo inter_ci(inter_shapes, 1, DataType::FLOAT32);
 
-    // Allocate device memory and copy inputs
-    std::cout << "\n=== Allocating Device Memory ===" << '\n';
-
-    void *dev_a = device_malloc(runtime, size_a);
-    if (!dev_a) {
-        std::cerr << "Error: Failed to allocate device memory for a\n";
-        return -1;
-    }
-    copy_to_device(runtime, dev_a, host_a, size_a);
-    std::cout << "Tensor a: " << size_a << " bytes copied to device\n";
-
-    void *dev_b = device_malloc(runtime, size_b);
-    if (!dev_b) {
-        std::cerr << "Error: Failed to allocate device memory for b\n";
-        device_free(runtime, dev_a);
-        return -1;
-    }
-    copy_to_device(runtime, dev_b, host_b, size_b);
-    std::cout << "Tensor b: " << size_b << " bytes copied to device\n";
-
-    void *dev_f = device_malloc(runtime, size_f);
-    if (!dev_f) {
-        std::cerr << "Error: Failed to allocate device memory for f\n";
-        device_free(runtime, dev_a);
-        device_free(runtime, dev_b);
-        return -1;
-    }
-    // Record output tensor for copy-back during finalize
-    record_tensor_pair(runtime, host_f, dev_f, size_f);
-    std::cout << "Tensor f (output): " << size_f << " bytes allocated\n";
-
-    // Allocate intermediate tensors (c, d, e)
-    size_t BYTES = SIZE * sizeof(float);
-    void *dev_c = device_malloc(runtime, BYTES);
-    void *dev_d = device_malloc(runtime, BYTES);
-    void *dev_e = device_malloc(runtime, BYTES);
-
-    if (!dev_c || !dev_d || !dev_e) {
-        std::cerr << "Error: Failed to allocate intermediate tensors\n";
-        device_free(runtime, dev_a);
-        device_free(runtime, dev_b);
-        device_free(runtime, dev_f);
-        if (dev_c) device_free(runtime, dev_c);
-        if (dev_d) device_free(runtime, dev_d);
-        if (dev_e) device_free(runtime, dev_e);
-        return -1;
-    }
-
-    std::cout << "Allocated intermediate tensors c, d, e\n";
-
-    // Helper union to encode float scalar as uint64_t
     union {
         float f32;
         uint64_t u64;
-    } scalar_converter;
+    } sconv;
 
-    // Task 0: c = a + b (func_id=0: kernel_add, AIV)
-    uint64_t args_t0[4];
-    args_t0[0] = reinterpret_cast<uint64_t>(dev_a);  // src0
-    args_t0[1] = reinterpret_cast<uint64_t>(dev_b);  // src1
-    args_t0[2] = reinterpret_cast<uint64_t>(dev_c);  // out
-    args_t0[3] = SIZE;                               // size
-    int t0 = add_task(runtime, args_t0, 4, 0, CoreType::AIV);
+    // task0: c = a + b
+    L0TaskArgs p_add;
+    p_add.add_input(a);
+    p_add.add_input(b);
+    p_add.add_output(inter_ci);
+    TaskOutputTensors c_out = rt_submit_aiv_task(FUNC_ADD, p_add);
+    Tensor c = c_out.get_ref(0);
 
-    // Task 1: d = c + 1 (func_id=1: kernel_add_scalar, AIV)
-    uint64_t args_t1[4];
-    args_t1[0] = reinterpret_cast<uint64_t>(dev_c);  // src
-    scalar_converter.f32 = 1.0f;
-    args_t1[1] = scalar_converter.u64;               // scalar=1.0
-    args_t1[2] = reinterpret_cast<uint64_t>(dev_d);  // out
-    args_t1[3] = SIZE;                               // size
-    int t1 = add_task(runtime, args_t1, 4, 1, CoreType::AIV);
+    // task1: d = c + 1
+    L0TaskArgs p_d;
+    p_d.add_input(c);
+    p_d.add_output(inter_ci);
+    sconv.f32 = 1.0f;
+    p_d.add_scalar(sconv.u64);
+    TaskOutputTensors d_out = rt_submit_aiv_task(FUNC_ADD_SCALAR, p_d);
+    Tensor d = d_out.get_ref(0);
 
-    // Task 2: e = c + 2 (func_id=1: kernel_add_scalar, AIV)
-    uint64_t args_t2[4];
-    args_t2[0] = reinterpret_cast<uint64_t>(dev_c);  // src
-    scalar_converter.f32 = 2.0f;
-    args_t2[1] = scalar_converter.u64;               // scalar=2.0
-    args_t2[2] = reinterpret_cast<uint64_t>(dev_e);  // out
-    args_t2[3] = SIZE;                               // size
-    int t2 = add_task(runtime, args_t2, 4, 1, CoreType::AIV);
+    // task2: e = c + 2
+    L0TaskArgs p_e;
+    p_e.add_input(c);
+    p_e.add_output(inter_ci);
+    sconv.f32 = 2.0f;
+    p_e.add_scalar(sconv.u64);
+    TaskOutputTensors e_out = rt_submit_aiv_task(FUNC_ADD_SCALAR, p_e);
+    Tensor e = e_out.get_ref(0);
 
-    // Task 3: f = d * e (func_id=2: kernel_mul, AIV)
-    uint64_t args_t3[4];
-    args_t3[0] = reinterpret_cast<uint64_t>(dev_d);  // src0
-    args_t3[1] = reinterpret_cast<uint64_t>(dev_e);  // src1
-    args_t3[2] = reinterpret_cast<uint64_t>(dev_f);  // out
-    args_t3[3] = SIZE;                               // size
-    int t3 = add_task(runtime, args_t3, 4, 2, CoreType::AIV);
+    // task3: f = d * e  (write into the external output tensor)
+    L0TaskArgs p_mul;
+    p_mul.add_input(d);
+    p_mul.add_input(e);
+    p_mul.add_output(f);
+    rt_submit_aiv_task(FUNC_MUL, p_mul);
 
-    // Add dependencies
-    add_successor(runtime, t0, t1);  // t0 → t1
-    add_successor(runtime, t0, t2);  // t0 → t2
-    add_successor(runtime, t1, t3);  // t1 → t3
-    add_successor(runtime, t2, t3);  // t2 → t3
-
-    std::cout << "\nTasks:\n";
-    std::cout << "  task" << t0 << ": c = a + b\n";
-    std::cout << "  task" << t1 << ": d = c + 1\n";
-    std::cout << "  task" << t2 << ": e = c + 2\n";
-    std::cout << "  task" << t3 << ": f = d * e\n";
-    std::cout << "Dependencies: t0→t1, t0→t2, t1→t3, t2→t3\n";
-
-    std::cout << "Created runtime with " << get_task_count(runtime) << " tasks\n";
-    print_runtime(runtime);
-
-    return 0;
+    LOG_INFO_V9("[example_orch] Submitted 4 tasks for f = (a + b + 1) * (a + b + 2)");
 }
 
 }  // extern "C"

@@ -9,143 +9,90 @@
  * -----------------------------------------------------------------------------------------------------------
  */
 /**
- * BGEMM Orchestration Function (Host Build Graph Runtime)
+ * BGEMM orchestration — submit_task / TensorMap form
  *
- * Builds the task graph for tiled matrix multiplication: C = A @ B
+ * Tiled C = A @ B, tile 64x64, grid 4x4x4.  Per output tile (m,n), for each k:
+ *   P_k = A[m,k] @ B[k,n]   (gemm_tile, AIC)  — fresh runtime-allocated buffer
+ *   C[m,n] += P_k           (tile_add, AIV, INOUT C tile)
  *
- * Configuration:
- *   - Tile size: 64 x 64
- *   - Grid: 4 x 4 x 4 (GRID_M x GRID_K x GRID_N)
+ * All dependencies are TensorMap-derived:
+ *   - gemm_k -> add_k via the freshly-allocated P_k.
+ *   - add_{k-1} -> add_k via the C[m,n] tile (add_inout overlap).
+ * Allocating a fresh P per k (instead of reusing one P buffer per tile) removes
+ * the write-after-read hazard the explicit-edge version needed an extra edge
+ * for. C arrives zero-initialized (pure OUTPUT), so the accumulation is exact.
  *
- * Memory layout (tile-first):
- *   A: [BATCH, GRID_M, GRID_K, TILE_M, TILE_K]
- *   B: [BATCH, GRID_K, GRID_N, TILE_K, TILE_N]
- *   C: [BATCH, GRID_M, GRID_N, TILE_M, TILE_N]
- *
- * Task graph per output tile:
- *   for k in [0, GRID_K):
- *     P = A[m,k] @ B[k,n]    (gemm_tile on Cube core)
- *     C[m,n] = C[m,n] + P    (tile_add on Vector core)
+ * Arg layout: [A (IN), B (IN), C (OUT)] — flattened 1-D tile-first tensors.
  */
 
-#include <iostream>
-#include <vector>
+#include <stdint.h>
 
-#include "orchestration_api.h"  // NOLINT(build/include_subdir)
+#include "pto_orchestration_api.h"  // NOLINT(build/include_subdir)
+
+#define FUNC_GEMM 0
+#define FUNC_TILE_ADD 1
 
 extern "C" {
 
-constexpr int TILE = 64;
-constexpr int GRID_M = 4;
-constexpr int GRID_K = 4;
-constexpr int GRID_N = 4;
-constexpr int BATCH = 1;
+static constexpr int TILE = 64;
+static constexpr int GRID_M = 4;
+static constexpr int GRID_K = 4;
+static constexpr int GRID_N = 4;
+static constexpr int BATCH = 1;
+static constexpr uint32_t TILE_ELEMS = TILE * TILE;
 
-constexpr size_t TILE_BYTES = TILE * TILE * sizeof(float);
+__attribute__((visibility("default"))) PTO2OrchestrationConfig aicpu_orchestration_config(const L2TaskArgs &orch_args) {
+    (void)orch_args;
+    return PTO2OrchestrationConfig{
+        .expected_arg_count = 3,
+    };
+}
 
-int build_bgemm_graph(OrchestrationRuntime *runtime, const ChipStorageTaskArgs &orch_args) {
-    // Expected orch_args: [A, B, C] — 3 tensors
-    if (orch_args.tensor_count() < 3) {
-        std::cerr << "build_bgemm_graph: Expected at least 3 tensors, got " << orch_args.tensor_count() << '\n';
-        return -1;
-    }
+__attribute__((visibility("default"))) void aicpu_orchestration_entry(const L2TaskArgs &orch_args) {
+    const Tensor &a = orch_args.tensor(0).ref();
+    const Tensor &b = orch_args.tensor(1).ref();
+    const Tensor &c = orch_args.tensor(2).ref();
 
-    void *host_A = orch_args.tensor(0).data_as<void>();
-    void *host_B = orch_args.tensor(1).data_as<void>();
-    void *host_C = orch_args.tensor(2).data_as<void>();
-    size_t size_A = orch_args.tensor(0).nbytes();
-    size_t size_B = orch_args.tensor(1).nbytes();
-    size_t size_C = orch_args.tensor(2).nbytes();
+    uint32_t tile_shape[1] = {TILE_ELEMS};
+    TensorCreateInfo p_ci(tile_shape, 1, DataType::FLOAT32);
 
-    std::cout << "\n=== build_bgemm_graph ===" << '\n';
-    std::cout << "Grid: " << GRID_M << " x " << GRID_K << " x " << GRID_N << '\n';
-
-    // Allocate device memory and copy inputs
-    void *dev_A = device_malloc(runtime, size_A);
-    if (!dev_A) return -1;
-    copy_to_device(runtime, dev_A, host_A, size_A);
-
-    void *dev_B = device_malloc(runtime, size_B);
-    if (!dev_B) {
-        device_free(runtime, dev_A);
-        return -1;
-    }
-    copy_to_device(runtime, dev_B, host_B, size_B);
-
-    void *dev_C = device_malloc(runtime, size_C);
-    if (!dev_C) {
-        device_free(runtime, dev_A);
-        device_free(runtime, dev_B);
-        return -1;
-    }
-    copy_to_device(runtime, dev_C, host_C, size_C);
-    record_tensor_pair(runtime, host_C, dev_C, size_C);
-
-    // Allocate intermediate P buffers (one per C tile)
-    constexpr int NUM_P_BUFFERS = BATCH * GRID_M * GRID_N;
-    std::vector<void *> dev_P(NUM_P_BUFFERS, nullptr);
-    for (int i = 0; i < NUM_P_BUFFERS; i++) {
-        dev_P[i] = device_malloc(runtime, TILE_BYTES);
-        if (!dev_P[i]) {
-            for (int j = 0; j < i; j++) {
-                device_free(runtime, dev_P[j]);
-            }
-            device_free(runtime, dev_A);
-            device_free(runtime, dev_B);
-            device_free(runtime, dev_C);
-            return -1;
-        }
-    }
-
-    // Track last add task for each C tile (for K accumulation dependency)
-    std::vector<int> last_add_task(BATCH * GRID_M * GRID_N, -1);
-
-    // Build task graph: 4-level tiling loop
     for (int batch = 0; batch < BATCH; batch++) {
         for (int m_idx = 0; m_idx < GRID_M; m_idx++) {
             for (int n_idx = 0; n_idx < GRID_N; n_idx++) {
                 for (int k_idx = 0; k_idx < GRID_K; k_idx++) {
-                    // Calculate tile offsets
-                    size_t A_offset = (batch * GRID_M * GRID_K + m_idx * GRID_K + k_idx) * TILE_BYTES;
-                    size_t B_offset = (batch * GRID_K * GRID_N + k_idx * GRID_N + n_idx) * TILE_BYTES;
-                    size_t C_offset = (batch * GRID_M * GRID_N + m_idx * GRID_N + n_idx) * TILE_BYTES;
+                    uint32_t a_off[1] = {
+                        static_cast<uint32_t>((batch * GRID_M * GRID_K + m_idx * GRID_K + k_idx) * TILE_ELEMS)
+                    };
+                    uint32_t b_off[1] = {
+                        static_cast<uint32_t>((batch * GRID_K * GRID_N + k_idx * GRID_N + n_idx) * TILE_ELEMS)
+                    };
+                    uint32_t c_off[1] = {
+                        static_cast<uint32_t>((batch * GRID_M * GRID_N + m_idx * GRID_N + n_idx) * TILE_ELEMS)
+                    };
 
-                    int c_tile_idx = batch * GRID_M * GRID_N + m_idx * GRID_N + n_idx;
+                    Tensor a_view = a.view(tile_shape, a_off);
+                    Tensor b_view = b.view(tile_shape, b_off);
+                    Tensor c_view = c.view(tile_shape, c_off);
 
-                    // Task 1: P = A[m,k] @ B[k,n] (gemm_tile on Cube core)
-                    uint64_t args_gemm[6];
-                    args_gemm[0] = reinterpret_cast<uint64_t>(static_cast<char *>(dev_A) + A_offset);
-                    args_gemm[1] = reinterpret_cast<uint64_t>(static_cast<char *>(dev_B) + B_offset);
-                    args_gemm[2] = reinterpret_cast<uint64_t>(dev_P[c_tile_idx]);
-                    args_gemm[3] = TILE;
-                    args_gemm[4] = TILE;
-                    args_gemm[5] = TILE;
-                    int t_gemm = add_task(runtime, args_gemm, 6, 0, CoreType::AIC);
+                    // P_k = A[m,k] @ B[k,n]
+                    L0TaskArgs p_gemm;
+                    p_gemm.add_input(a_view);
+                    p_gemm.add_input(b_view);
+                    p_gemm.add_output(p_ci);
+                    TaskOutputTensors p_out = rt_submit_aic_task(FUNC_GEMM, p_gemm);
+                    Tensor p = p_out.get_ref(0);
 
-                    // Task 2: C[m,n] = C[m,n] + P (tile_add on Vector core)
-                    uint64_t args_add[5];
-                    args_add[0] = reinterpret_cast<uint64_t>(static_cast<char *>(dev_C) + C_offset);
-                    args_add[1] = reinterpret_cast<uint64_t>(dev_P[c_tile_idx]);
-                    args_add[2] = reinterpret_cast<uint64_t>(static_cast<char *>(dev_C) + C_offset);
-                    args_add[3] = TILE;
-                    args_add[4] = TILE;
-                    int t_add = add_task(runtime, args_add, 5, 1, CoreType::AIV);
-
-                    // Dependency: gemm must complete before add
-                    add_successor(runtime, t_gemm, t_add);
-
-                    // Dependency: previous add must complete before current gemm (K accumulation)
-                    if (last_add_task[c_tile_idx] >= 0) {
-                        add_successor(runtime, last_add_task[c_tile_idx], t_gemm);
-                    }
-                    last_add_task[c_tile_idx] = t_add;
+                    // C[m,n] += P_k
+                    L0TaskArgs p_add;
+                    p_add.add_inout(c_view);
+                    p_add.add_input(p);
+                    rt_submit_aiv_task(FUNC_TILE_ADD, p_add);
                 }
             }
         }
     }
 
-    std::cout << "Created " << get_task_count(runtime) << " tasks\n";
-    return 0;
+    LOG_INFO_V9("[bgemm_orch] Submitted tiled C = A @ B");
 }
 
 }  // extern "C"

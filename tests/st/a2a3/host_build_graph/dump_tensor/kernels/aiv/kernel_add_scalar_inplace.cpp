@@ -8,9 +8,20 @@
  * See LICENSE in the root of the software repository for the full text of the License.
  * -----------------------------------------------------------------------------------------------------------
  */
+/**
+ * In-place scalar addition kernel (submit_task / Tensor* ABI)
+ *
+ * Implements: inout[i] = inout[i] + scalar over a single 128x128 tile.
+ *
+ * Args:
+ *   args[0] = inout (INOUT, Tensor*)
+ *   args[1] = scalar (float bits packed in uint64_t — tensors precede scalars)
+ */
 
 #include <cstdint>
 #include <pto/pto-inst.hpp>
+
+#include "tensor.h"
 
 using namespace pto;
 
@@ -25,14 +36,16 @@ using namespace pto;
 #endif
 
 extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ int64_t *args) {
-    __gm__ float *inout = reinterpret_cast<__gm__ float *>(args[0]);
+    __gm__ Tensor *inout_tensor = reinterpret_cast<__gm__ Tensor *>(args[0]);
 
     union {
         uint64_t u64;
         float f32;
     } converter;
-    converter.u64 = args[1];
+    converter.u64 = static_cast<uint64_t>(args[1]);
     float scalar = converter.f32;
+
+    __gm__ float *inout = reinterpret_cast<__gm__ float *>(inout_tensor->buffer.addr) + inout_tensor->start_offset;
 
     constexpr int kTRows_ = 128;
     constexpr int kTCols_ = 128;

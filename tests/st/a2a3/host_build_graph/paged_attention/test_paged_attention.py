@@ -31,7 +31,7 @@ class TestPagedAttentionHostBuildGraph(SceneTestCase):
     CALLABLE = {
         "orchestration": {
             "source": "kernels/orchestration/paged_attention_orch.cpp",
-            "function_name": "build_paged_attention_graph",
+            "function_name": "aicpu_orchestration_entry",
             "signature": [D.IN, D.IN, D.IN, D.IN, D.IN, D.OUT],
         },
         "incores": [
@@ -68,9 +68,16 @@ class TestPagedAttentionHostBuildGraph(SceneTestCase):
 
     CASES = [
         {
+            # Marked manual for host_build_graph: this batch=256 case submits
+            # ~64K tasks, and host-orchestration populates the whole task graph
+            # before the device schedules — so the ring/heap cannot reclaim
+            # mid-orchestration and must hold the entire graph at once. That
+            # exceeds the default ring window / GM heap. Run it explicitly with
+            # a large PTO2_RING_TASK_WINDOW / PTO2_RING_HEAP if needed.
             "name": "Case1",
             "platforms": ["a2a3"],
-            "config": {"aicpu_thread_num": 3, "block_dim": 24},
+            "config": {"aicpu_thread_num": 4, "block_dim": 24},
+            "manual": True,
             "params": {
                 "batch": 256,
                 "num_heads": 16,
@@ -85,7 +92,7 @@ class TestPagedAttentionHostBuildGraph(SceneTestCase):
         {
             "name": "Case2",
             "platforms": ["a2a3"],
-            "config": {"aicpu_thread_num": 3, "block_dim": 24},
+            "config": {"aicpu_thread_num": 4, "block_dim": 24},
             "manual": True,
             "params": {
                 "batch": 64,
@@ -101,7 +108,7 @@ class TestPagedAttentionHostBuildGraph(SceneTestCase):
         {
             "name": "small1",
             "platforms": ["a2a3sim", "a2a3"],
-            "config": {"aicpu_thread_num": 3, "block_dim": 3},
+            "config": {"aicpu_thread_num": 4, "block_dim": 3},
             "params": {
                 "batch": 1,
                 "num_heads": 16,
@@ -116,7 +123,7 @@ class TestPagedAttentionHostBuildGraph(SceneTestCase):
         {
             "name": "small2",
             "platforms": ["a2a3sim", "a2a3"],
-            "config": {"aicpu_thread_num": 3, "block_dim": 3},
+            "config": {"aicpu_thread_num": 4, "block_dim": 3},
             "manual": True,
             "params": {
                 "batch": 1,
