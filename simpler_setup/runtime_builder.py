@@ -9,6 +9,7 @@
 import fcntl
 import json
 import logging
+import os
 import shutil
 import subprocess
 from concurrent.futures import ThreadPoolExecutor
@@ -41,38 +42,56 @@ def _get_git_head(repo_root: Path) -> str:
         return ""
 
 
-def _invalidate_cache_if_stale(target_cache_dir: Path, current_commit: str) -> None:
-    """Clear target_cache_dir if it was built from a different git commit.
+def _abbrev_stamp(stamp: str) -> str:
+    """Abbreviate each commit in a (possibly composite) cache stamp for logging.
+
+    The stamp is ``<runtime_sha>`` or ``<runtime_sha>:pto-isa=<isa_sha>``.
+    Truncating the whole string (e.g. ``stamp[:20]``) hides a pto-isa-only
+    change: the 40-char runtime sha prefix is identical, so both the old and
+    new stamps render the same — masking exactly the bump the log is meant to
+    surface (issue #1139). Shorten each sha segment independently so a
+    pto-isa-only change stays visible.
+    """
+    runtime, sep, isa = stamp.partition(":pto-isa=")
+    if sep:
+        return f"{runtime[:12]}:pto-isa={isa[:12]}"
+    return runtime[:12]
+
+
+def _invalidate_cache_if_stale(target_cache_dir: Path, current_stamp: str) -> None:
+    """Clear target_cache_dir if it was built from a different source stamp.
 
     git does not update file mtimes on checkout, so cmake's incremental build
-    cannot detect that source files changed. Comparing the HEAD commit stored
-    at last build time against the current HEAD is a reliable signal that
-    sources may have changed and a clean rebuild is needed.
+    cannot detect that source files changed. Comparing the stamp stored at last
+    build time against the current one is a reliable signal that sources may
+    have changed and a clean rebuild is needed. The stamp is the runtime repo
+    HEAD, extended with the pto-isa commit for builds that embed pto-isa
+    headers (see RuntimeBuilder._build_cache_stamp).
 
-    When the current commit can't be determined (no git, transient failure),
+    When the current stamp can't be determined (no git, transient failure),
     fall through to a clean rebuild — a fresh compile is cheap relative to
     the risk of linking against stale objects.
     """
-    if not current_commit:
+    if not current_stamp:
         if target_cache_dir.is_dir():
-            logger.info("git HEAD unavailable, clearing cmake cache: %s", target_cache_dir)
+            logger.info("build stamp unavailable, clearing cmake cache: %s", target_cache_dir)
             shutil.rmtree(target_cache_dir)
         target_cache_dir.mkdir(parents=True, exist_ok=True)
         return
     commit_file = target_cache_dir / _GIT_COMMIT_FILE
     if commit_file.is_file():
-        cached_commit = commit_file.read_text().strip()
-        if cached_commit == current_commit:
+        cached_stamp = commit_file.read_text().strip()
+        if cached_stamp == current_stamp:
             return
         logger.info(
-            "git HEAD changed (%s → %s), clearing cmake cache: %s",
-            cached_commit[:12],
-            current_commit[:12],
+            "build stamp changed (%s → %s), clearing cmake cache: %s",
+            _abbrev_stamp(cached_stamp),
+            _abbrev_stamp(current_stamp),
             target_cache_dir,
         )
         shutil.rmtree(target_cache_dir)
     target_cache_dir.mkdir(parents=True, exist_ok=True)
-    commit_file.write_text(current_commit + "\n")
+    commit_file.write_text(current_stamp + "\n")
 
 
 @dataclass
@@ -160,8 +179,69 @@ class RuntimeBuilder:
         return include_dirs, source_dirs
 
     def _requires_pto_isa_compat_validation(self) -> bool:
-        """Return True when this runtime embeds PTO-ISA headers into host code."""
+        """Return True when this runtime embeds PTO-ISA headers into host code.
+
+        Scoped on arch/variant, not on ``SIMPLER_ENABLE_PTO_SDMA_WORKSPACE``
+        (the actual flag that pulls pto-isa headers into the host .so). This is
+        deliberately coarser: should a2a3 onboard ever turn that workspace off,
+        a pto-isa bump would still invalidate this target's cache even though it
+        no longer embeds pto-isa. That over-invalidation only costs an extra
+        recompile — it can never serve a stale object — so erring wide is the
+        safe direction, and keeping the scope arch/variant-based matches the
+        cmake-side define gating in src/a2a3/platform/onboard/host/CMakeLists.txt.
+        """
         return self._arch == "a2a3" and self._variant == "onboard"
+
+    def _resolve_build_pto_isa_commit(self) -> str:
+        """Return the pto-isa commit baked into this build, or "" when irrelevant.
+
+        Only a2a3 onboard host code embeds pto-isa headers, so a pto-isa bump
+        must invalidate that build's cmake cache even when the runtime repo
+        HEAD is unchanged (issue #1139: a stale host_runtime.so compiled
+        against the old headers otherwise survives a reinstall). For every
+        other arch/variant the pto-isa revision does not affect the compiled
+        objects, so return "" and leave the stamp keyed on the runtime HEAD.
+
+        SIMPLER_RUN_PTO_ISA_COMMIT is exported by
+        ``simpler_setup.pto_isa.ensure_pto_isa_root`` as the resolved revision;
+        it matches the commit ``write_pto_isa_build_metadata`` records.
+        """
+        if not self._requires_pto_isa_compat_validation():
+            return ""
+        commit = os.environ.get("SIMPLER_RUN_PTO_ISA_COMMIT", "").strip()
+        if commit:
+            return commit
+        root = os.environ.get("PTO_ISA_ROOT", "").strip()
+        if root:
+            from .pto_isa import get_pto_isa_head  # noqa: PLC0415
+
+            commit = get_pto_isa_head(root)
+            if commit:
+                # The CMake ccache-bust define (CMakeLists.txt) reads this env
+                # var, not PTO_ISA_ROOT's HEAD. Write the resolved commit back
+                # so that define stays in lockstep with the stamp computed here
+                # — otherwise the cmake cache invalidates but ccache can still
+                # serve the stale host_runtime object (issue #1139).
+                os.environ["SIMPLER_RUN_PTO_ISA_COMMIT"] = commit
+            return commit
+        return ""
+
+    def _build_cache_stamp(self) -> str:
+        """Stamp identifying the sources this build was compiled from.
+
+        Combines the runtime repo HEAD with the pto-isa commit (a2a3 onboard
+        only) so the cmake cache is invalidated whenever either changes. An
+        empty runtime HEAD is preserved verbatim so the
+        ``_invalidate_cache_if_stale`` 'unavailable → clean rebuild' path still
+        fires rather than being masked by a present pto-isa commit.
+        """
+        runtime_commit = _get_git_head(PROJECT_ROOT)
+        if not runtime_commit:
+            return ""
+        pto_isa_commit = self._resolve_build_pto_isa_commit()
+        if pto_isa_commit:
+            return f"{runtime_commit}:pto-isa={pto_isa_commit}"
+        return runtime_commit
 
     def _lookup_binaries(self, name: str, output_dir: Path) -> RuntimeBinaries:
         """Look up pre-built binaries from output_dir.
@@ -268,7 +348,7 @@ class RuntimeBuilder:
 
         compiler = self._runtime_compiler
 
-        current_commit = _get_git_head(PROJECT_ROOT)
+        cache_stamp = self._build_cache_stamp()
 
         def _compile_target(target: str) -> Path:
             include_dirs, source_dirs = self._resolve_target_dirs(config_dir, build_config, target)
@@ -282,7 +362,7 @@ class RuntimeBuilder:
             lock_path = cache_dir / f".{target}.lock"
             with open(lock_path, "w") as lock_fd:
                 fcntl.flock(lock_fd, fcntl.LOCK_EX)
-                _invalidate_cache_if_stale(cache_dir / target, current_commit)
+                _invalidate_cache_if_stale(cache_dir / target, cache_stamp)
                 return compiler.compile(  # type: ignore[return-value]
                     target,
                     include_dirs,
