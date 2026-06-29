@@ -11,6 +11,7 @@ import ctypes
 import math
 import struct
 from multiprocessing.shared_memory import SharedMemory
+from typing import Optional
 
 import pytest
 from simpler.l3_l2_message_queue import (
@@ -65,7 +66,7 @@ class _FakeClient:
         self.payload = bytearray()
         self.counters: dict[int, int] = {}
         self.peer_abort = False
-        self.fail_next_cmd: L3L2OrchCommCmd | None = None
+        self.fail_next_cmd: Optional[L3L2OrchCommCmd] = None
 
     def submit(self, request, timeout_s: float):
         self.requests.append((request, timeout_s))
@@ -182,7 +183,7 @@ def _publish_output(
     seq: int = 1,
     payload: bytes = b"",
     opcode: int = int(L3L2QueueOpcode.DATA),
-    payload_offset: int | None = None,
+    payload_offset: Optional[int] = None,
 ) -> None:
     if payload_offset is None:
         payload_offset = queue.layout.output_arena_offset if payload else 0
@@ -349,9 +350,7 @@ def test_enqueue_replays_released_descriptors_before_reusing_input_arena():
         fake_client.counters[queue.layout.input_desc_head_offset] = 1
         queue.input.enqueue(second, nbytes=80, timeout=0.001)
 
-        payload_offsets = [
-            offset for offset, data in fake_client.payload_writes if len(data) == 80
-        ]
+        payload_offsets = [offset for offset, data in fake_client.payload_writes if len(data) == 80]
         assert payload_offsets == [queue.layout.input_arena_offset, queue.layout.input_arena_offset]
     finally:
         _close(worker, shm)
@@ -578,8 +577,7 @@ def test_output_payload_offset_mismatch_poisons_before_payload_read():
         assert fake_client.counters[L3L2_QUEUE_L3_ABORT_FLAG_OFFSET] == 1
         assert all(
             not (
-                req.cmd == L3L2OrchCommCmd.PAYLOAD_READ
-                and req.payload_offset == queue.layout.output_arena_offset + 16
+                req.cmd == L3L2OrchCommCmd.PAYLOAD_READ and req.payload_offset == queue.layout.output_arena_offset + 16
             )
             for req, _timeout in fake_client.requests
         )
