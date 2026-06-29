@@ -32,6 +32,9 @@ python test_*.py -p <platform> -d <device> --rounds N --skip-golden > run.log 2>
 python -m simpler_setup.tools.strace_timing run.log --rounds-table
 # prints per-round Host / Device / Effective / Orch / Sched (us);
 # Orch≈Sched≈Effective ⇒ AICPU-bound. (Effective = orch∪sched window.)
+# --tree instead shows the nested span tree (device_wall → preamble/so_load/
+#   graph_build → config_validate/arena_wire/sm_reset prep + orch/sched → post_orch).
+# SIMPLER_DEVICE_PROFILING=0 drops the device clk=dev markers (host spans stay).
 ```
 
 For the per-thread `loops`/`tasks_scheduled` deep-dive (not in the markers),

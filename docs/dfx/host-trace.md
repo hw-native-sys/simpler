@@ -48,12 +48,12 @@ run_prepared                                   (= host_wall)
 │  └─ run_prepared.bind.prebuilt    (prebuilt runtime-arena image build + upload)
 ├─ run_prepared.runner_run          (launch + blocking sync on the AICPU)
 │  └─ run_prepared.runner_run.device_wall      (whole on-NPU AICPU wall)
-│     └─ .{preamble,so_load,graph_build,post_orch,orch,sched}
+│     └─ .{preamble,so_load,graph_build,config_validate,arena_wire,sm_reset,post_orch,orch,sched}
 │           device-domain (clk=dev): AICPU subdivision of the on-NPU wall
 └─ run_prepared.validate
 ```
 
-The `device_wall` + its `.{preamble,so_load,graph_build,post_orch,orch,sched}`
+The `device_wall` + its `.{preamble,so_load,graph_build,config_validate,arena_wire,sm_reset,post_orch,orch,sched}`
 spans are **device-domain**, tagged `clk=dev`. They are not host `steady_clock`
 spans: the AICPU stamps raw sys-counter cycles into a host-allocated buffer
 (whose address rides on `KernelArgs::device_wall_data_base`), the host reads it

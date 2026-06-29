@@ -236,10 +236,13 @@ tees the run and renders the Host/Device/Effective/Orch/Sched table with
 come from the markers (onboard and sim) — no CANN device log is read.
 
 For a per-stage breakdown of `Host`/`Device` (host `bind`/`runner_run`/`validate`
-plus the AICPU `preamble`/`so_load`/`graph_build`/`post_orch` subdivision), parse
-the `[STRACE]` markers with `simpler_setup/tools/strace_timing.py` — see
+plus the AICPU `preamble`/`so_load`/`graph_build`
+(`config_validate`/`arena_wire`/`sm_reset` prep sub-phases)/`post_orch`
+subdivision), parse the `[STRACE]` markers with
+`simpler_setup/tools/strace_timing.py` (add `--tree` for the nested view) — see
 [docs/dfx/host-trace.md](../../../docs/dfx/host-trace.md). Same `SIMPLER_PROFILING`
-gate, no extra flag.
+gate, no extra flag (set `SIMPLER_DEVICE_PROFILING=0` to drop only the device
+`clk=dev` markers).
 
 ### Single Mode
 
