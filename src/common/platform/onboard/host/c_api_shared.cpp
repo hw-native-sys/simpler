@@ -35,6 +35,7 @@
 
 #include <chrono>
 #include <cstdlib>
+#include <cstring>
 #include <utility>
 #include <vector>
 
@@ -375,6 +376,20 @@ int prepare_callable(DeviceContextHandle ctx, int32_t callable_id, const void *c
     }
 }
 
+// Runtime gate for device-domain phase emission. SIMPLER_DEVICE_PROFILING=0
+// suppresses the device (clk=dev) markers so a deployment can profile host and
+// device independently; any other value (or unset) keeps them on. Host-side
+// [STRACE] spans are unaffected — they ride SIMPLER_PROFILING + the log level.
+// Read once and cached: getenv is not thread-safe against setenv, and the value
+// is a process-lifetime config knob.
+static bool device_profiling_enabled() {
+    static const bool enabled = [] {
+        const char *v = std::getenv("SIMPLER_DEVICE_PROFILING");
+        return v == nullptr || std::strcmp(v, "0") != 0;
+    }();
+    return enabled;
+}
+
 // Emit device-domain trace markers for the AICPU phases. RunWall (the whole
 // on-NPU wall, i.e. the former RunTiming.device_wall) is emitted at depth 2
 // under runner_run; its preamble/so_load/graph_build/post_orch subdivisions are
@@ -382,6 +397,7 @@ int prepare_callable(DeviceContextHandle ctx, int32_t callable_id, const void *c
 // STRACE_DEV_SPAN_AT self-compiles to nothing when profiling is off, so no extra
 // gate is needed here.
 static void emit_device_phase_markers(DeviceRunnerBase *runner) {
+    if (!device_profiling_enabled()) return;
     const uint64_t run_wall_ns = runner->last_device_phase_ns(AicpuPhase::RunWall);
     if (run_wall_ns != 0) {
         STRACE_DEV_SPAN_AT("run_prepared.runner_run.device_wall", 0, static_cast<long long>(run_wall_ns), 2);
@@ -394,10 +410,18 @@ static void emit_device_phase_markers(DeviceRunnerBase *runner) {
         {AicpuPhase::Preamble, "run_prepared.runner_run.device_wall.preamble"},
         {AicpuPhase::SoLoad, "run_prepared.runner_run.device_wall.so_load"},
         {AicpuPhase::GraphBuild, "run_prepared.runner_run.device_wall.graph_build"},
+        {AicpuPhase::ConfigValidate, "run_prepared.runner_run.device_wall.config_validate"},
+        {AicpuPhase::ArenaWire, "run_prepared.runner_run.device_wall.arena_wire"},
+        {AicpuPhase::SmReset, "run_prepared.runner_run.device_wall.sm_reset"},
         {AicpuPhase::PostOrch, "run_prepared.runner_run.device_wall.post_orch"},
         {AicpuPhase::OrchWindow, "run_prepared.runner_run.device_wall.orch"},
         {AicpuPhase::SchedWindow, "run_prepared.runner_run.device_wall.sched"},
     };
+    // RunWall is emitted above as device_wall; every other phase is in the table.
+    static_assert(
+        sizeof(kPhases) / sizeof(kPhases[0]) == NUM_AICPU_PHASES - 1,
+        "kPhases[] must list every AicpuPhase except RunWall — add the new phase here"
+    );
     for (const auto &p : kPhases) {
         const uint64_t ns = runner->last_device_phase_ns(p.phase);
         if (ns != 0) {

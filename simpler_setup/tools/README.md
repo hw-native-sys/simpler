@@ -11,7 +11,7 @@ no repo checkout required.
 
 - **[swimlane_converter](#swimlane_converter)** — perf JSON → Chrome Trace Event (Perfetto)
 - **[sched_overhead_analysis](#sched_overhead_analysis)** — scheduler overhead / Tail OH breakdown
-- **[strace_timing](#strace_timing)** — per-stage `run_prepared` breakdown (host + AICPU phases) from `[STRACE]` log markers → TPOT table, per-round table (`--rounds-table`), or Perfetto JSON
+- **[strace_timing](#strace_timing)** — per-stage `run_prepared` breakdown (host + AICPU phases) from `[STRACE]` log markers → TPOT table, per-round table (`--rounds-table`), nested tree (`--tree`), or Perfetto JSON
 - **[dump_viewer](#dump_viewer)** — inspect / export args dumps (see [docs/args-dump.md](../../docs/dfx/args-dump.md) for full workflow)
 - **[deps_viewer](#deps_viewer)** — `deps.json` (dep_gen) → text or pan/zoom HTML dependency graph
 
@@ -195,7 +195,12 @@ python -m simpler_setup.tools.strace_timing path/to/log
 # Per-round Host/Device/Orch/Sched table (the benchmark/--rounds N view)
 python -m simpler_setup.tools.strace_timing path/to/log --rounds-table
 
-# Also emit a Chrome-trace / Perfetto JSON (lane = pid → host call tree)
+# Indented nested span tree per callable (run_prepared → bind / runner_run →
+# device_wall → preamble/config_validate/arena_wire/sm_reset/orch/sched/post_orch)
+python -m simpler_setup.tools.strace_timing path/to/log --tree
+
+# Also emit a Chrome-trace / Perfetto JSON (one named lane per invocation, with
+# separate host and device(clk=dev) tracks; nested by span containment)
 python -m simpler_setup.tools.strace_timing path/to/log --trace-out strace.json
 ```
 

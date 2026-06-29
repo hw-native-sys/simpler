@@ -230,9 +230,12 @@ the child's `RunTiming`, so they never reach a return value.
 Simpler surfaces them instead as **`[STRACE]` host-trace markers** — one
 line per `run_prepared` stage
 (`bind`/`bind.args`/`bind.prebuilt`/`runner_run`/`validate`) plus the AICPU
-device-phase subdivision (`preamble`/`so_load`/`graph_build`/`post_orch`).
+device-phase subdivision (`preamble`/`so_load`/`graph_build` — with
+`config_validate`/`arena_wire`/`sm_reset` prep sub-phases — /`post_orch`,
+`orch`/`sched`).
 `strace_timing.py` groups by `(pid, inv)`, rebuilds each invocation's span
-tree from `depth`, and prints per-callable means; see
+tree from `depth`, and prints per-callable means (add `--tree` for the nested
+view); see
 [docs/dfx/host-trace.md](../../../docs/dfx/host-trace.md) for the marker
 grammar and span tree. The L3-side tensor-management ask is
 [pypto-serving #44](https://github.com/hw-native-sys/pypto-serving/issues/44).

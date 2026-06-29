@@ -116,7 +116,7 @@ extern "C" __attribute__((visibility("default"))) int simpler_aicpu_exec(void *a
     // (no C++ thread_local — see docs/dynamic-linking.md). Idempotent across the
     // concurrent exec threads (same base). Run-wall is stamped here.
     set_platform_phase_base(k_args->device_wall_data_base);
-    aicpu_phase_start(AicpuPhase::RunWall);
+    AicpuPhaseScope run_wall(AicpuPhase::RunWall);
 
     LOG_INFO_V0("%s", "simpler_aicpu_exec: Calling aicpu_execute with Runtime");
     int rc = aicpu_execute(runtime);
@@ -126,10 +126,8 @@ extern "C" __attribute__((visibility("default"))) int simpler_aicpu_exec(void *a
     }
     LOG_INFO_V0("%s", "simpler_aicpu_exec: aicpu_execute completed successfully");
 
-    // Run-wall: record this thread's end into its own slot (plain store).
-    // Host reduces max(end) - min(start) → ns (see wall-capture note above).
-    aicpu_phase_end(AicpuPhase::RunWall);
-
+    // Run-wall end is stamped by run_wall's destructor (covers the early return
+    // above too); host reduces max(end) - min(start) → ns.
     return rc;
 }
 

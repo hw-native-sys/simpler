@@ -90,4 +90,36 @@ inline void aicpu_phase_set_window(AicpuPhase phase, uint64_t start_cycle, uint6
     records[static_cast<int>(phase)].end_cycle = end_cycle;
 }
 
+/**
+ * RAII guard: stamp `phase`'s start on construction, end on destruction. The
+ * device analogue of the host `StraceScope` — but it only writes the per-thread
+ * cycle slot (no logging: the AICPU hot path must not log, per the codestyle
+ * rule; the host re-emits the readback as the marker). Bracket a phase region
+ * with its own `{}` scope so the start/end are visually obvious and every exit
+ * path (including an early `return`) records the end:
+ *
+ *     {
+ *         AicpuPhaseScope _g(AicpuPhase::ArenaWire);
+ *         ...                              // end stamped at the closing }
+ *     }
+ *
+ * Each AicpuPhase has its own fixed slot, so nested scopes (e.g. RunWall ⊃
+ * GraphBuild ⊃ SmReset, each its own guard) record independently and never
+ * interfere; a phase must still fire at most once per run (a second guard for
+ * the same phase would overwrite the slot).
+ */
+class AicpuPhaseScope {
+public:
+    explicit AicpuPhaseScope(AicpuPhase phase) :
+        phase_(phase) {
+        aicpu_phase_start(phase_);
+    }
+    ~AicpuPhaseScope() { aicpu_phase_end(phase_); }
+    AicpuPhaseScope(const AicpuPhaseScope &) = delete;
+    AicpuPhaseScope &operator=(const AicpuPhaseScope &) = delete;
+
+private:
+    AicpuPhase phase_;
+};
+
 #endif  // PLATFORM_AICPU_DEVICE_PHASE_AICPU_H_
