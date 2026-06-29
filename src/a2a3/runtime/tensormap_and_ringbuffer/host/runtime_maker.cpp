@@ -471,6 +471,15 @@ extern "C" int bind_callable_to_runtime_impl(
         LOG_INFO_V0("Orchestrator-to-scheduler transition: %s", runtime->orch_to_sched ? "enabled" : "disabled");
     }
 
+    // Read serial orchestrator -> scheduler start gate from environment.
+    {
+        const char *env_val = std::getenv("PTO2_SERIAL_ORCH_SCHED");
+        runtime->serial_orch_sched = env_val && (env_val[0] == '1' || env_val[0] == 't' || env_val[0] == 'T');
+        LOG_INFO_V0(
+            "Serial orchestrator-to-scheduler start gate: %s", runtime->serial_orch_sched ? "enabled" : "disabled"
+        );
+    }
+
     // Lay out the per-Worker static device arena. GM heap, PTO2 shared memory,
     // and the prebuilt runtime arena all live in a single backing allocation;
     // setup_static_arena reserves the three regions and commits in one shot.

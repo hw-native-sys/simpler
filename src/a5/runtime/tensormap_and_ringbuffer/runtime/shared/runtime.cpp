@@ -38,6 +38,7 @@ Runtime::Runtime() {
     aicpu_allowed_cpu_count = 0;
     aicpu_launch_count = 0;
     orch_to_sched = false;
+    serial_orch_sched = false;
 
     // Initialize profiling state
 

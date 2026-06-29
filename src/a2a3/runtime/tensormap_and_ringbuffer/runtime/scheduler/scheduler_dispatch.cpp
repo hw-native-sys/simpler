@@ -1029,7 +1029,7 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
         // Phase 3: Drain wiring queue (thread 0 only)
         int wired = 0;
         if (thread_idx == 0) {
-            wired = sched_->drain_wiring_queue(orchestrator_done_);
+            wired = sched_->drain_wiring_queue(orchestrator_done_.load(std::memory_order_relaxed));
             if (wired > 0) {
                 made_progress = true;
 #if PTO2_SCHED_PROFILING

@@ -629,17 +629,18 @@ Built by the scheduler from `PTO2TaskDescriptor`:
 
 1. **Host** compiles the orchestration source into a shared library (`.so`)
 2. The SO binary is embedded into `Runtime.device_orch_so_storage_[]` and copied to device
-3. **AICPU Thread 3** writes the SO to a temp file, calls `dlopen`
+3. The orchestrator thread writes the SO to a temp file, calls `dlopen`
 4. `dlsym("aicpu_orchestration_config")` returns configuration (expected arg count)
 5. `dlsym("aicpu_orchestration_entry")` returns the orchestration function pointer
-6. Thread 3 creates a `PTO2Runtime`, calls the orchestration function within a `PTO2_SCOPE`
+6. The orchestrator thread creates a `PTO2Runtime`, calls the orchestration function within a `PTO2_SCOPE`
 7. After orchestration completes: `dlclose`, delete temp file
 
 ### 10.3 Thread Startup Synchronization
 
 | Flag | Set by | Waited by | Purpose |
 | ---- | ------ | --------- | ------- |
-| `runtime_init_ready_` | Thread 3 | Threads 0-2 | Runtime and SM handle initialized |
+| `runtime_init_ready_` | Orchestrator thread | Scheduler threads | Runtime and SM handle initialized |
+| `orchestrator_done_` | Orchestrator thread | Scheduler threads when `PTO2_SERIAL_ORCH_SCHED=1` | Full task graph built |
 
 Profiling-subsystem init (`dump_args` / `pmu` / `dep_gen` / `l2_swimlane`) runs
 once in `SchedulerContext::init()` on the single-threaded cold path, before any
@@ -648,9 +649,19 @@ handshake.
 
 Startup sequence:
 
-1. Thread 3: create SM handle + runtime → set `runtime_init_ready_`
+1. Orchestrator thread: create SM handle + runtime → set `runtime_init_ready_`
 2. Scheduler threads: wait for `runtime_init_ready_` → enter main loop
-3. Thread 3: configure orchestrator-scheduler pointers → call orchestration function → set `orchestrator_done_`
+3. Orchestrator thread: configure orchestrator-scheduler pointers → call orchestration function → set `orchestrator_done_`
+
+With `PTO2_SERIAL_ORCH_SCHED=1`, scheduler threads still wait for
+`runtime_init_ready_` first, then additionally wait for `orchestrator_done_`
+before entering `resolve_and_dispatch()`. The default is off, preserving the
+current overlapped orch/sched pipeline. Serial mode is intended for measurement
+and debugging. During the serial wait, scheduler thread 0 may drain deferred
+wiring records to prevent bounded wiring-queue backpressure, but it does not
+dispatch AICore work until `orchestrator_done_` is set. Large graphs may still
+require larger task-ring, heap, or dependency-pool capacity because no task
+execution/reclaim happens during graph build.
 
 ---
 

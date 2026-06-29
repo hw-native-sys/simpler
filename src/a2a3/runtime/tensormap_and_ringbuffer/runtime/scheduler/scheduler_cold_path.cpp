@@ -74,7 +74,7 @@ LoopAction SchedulerContext::handle_orchestrator_exit(
         return LoopAction::BREAK_LOOP;
     }
 
-    bool orch_done = orchestrator_done_;
+    bool orch_done = orchestrator_done_.load(std::memory_order_acquire);
     if (!orch_done) return LoopAction::NONE;
 
     task_count = total_tasks_;
@@ -963,7 +963,7 @@ int32_t SchedulerContext::init(
     completed_tasks_.store(0, std::memory_order_release);
 
     // Device orchestration: the orchestrator thread flips this when the graph is built.
-    orchestrator_done_ = false;
+    orchestrator_done_.store(false, std::memory_order_release);
 
     // Clear per-core dispatch payloads
     memset(payload_per_core_, 0, sizeof(payload_per_core_));
@@ -1011,7 +1011,7 @@ void SchedulerContext::deinit() {
     // Reset task counters and orchestrator state
     completed_tasks_.store(0, std::memory_order_release);
     total_tasks_ = 0;
-    orchestrator_done_ = false;
+    orchestrator_done_.store(false, std::memory_order_release);
 
     // Reset core transition state
     transition_requested_.store(false, std::memory_order_release);
@@ -1042,6 +1042,25 @@ void SchedulerContext::bind_runtime(PTO2Runtime *rt) {
     sched_ = &rt->scheduler;
 }
 
+void SchedulerContext::wait_for_orchestration_done_before_dispatch(Runtime *runtime, int32_t thread_idx) {
+    while (!orchestration_done() && !completed_.load(std::memory_order_acquire)) {
+        if (thread_idx == 0 && sched_ != nullptr) {
+            // Use the wiring subsystem's normal batch/backoff policy while
+            // waiting. This still honors orch_needs_drain/producer_blocked
+            // signals without force-draining an empty queue every spin.
+            int wired = sched_->drain_wiring_queue(/*force_drain=*/false);
+            if (wired > 0) {
+                continue;
+            }
+        }
+        if (sched_ != nullptr && sched_->sm_header != nullptr &&
+            check_idle_fatal_error(thread_idx, sched_->sm_header, runtime) == LoopAction::BREAK_LOOP) {
+            break;
+        }
+        SPIN_WAIT_HINT();
+    }
+}
+
 // =============================================================================
 // Post-orchestration bookkeeping. Runs on the orchestrator thread once the
 // build phase finishes; folds inline-completed tasks, flips orchestrator_done_,
@@ -1069,7 +1088,7 @@ void SchedulerContext::on_orchestration_done(
         rt->scheduler.tasks_completed.fetch_add(inline_completed, std::memory_order_relaxed);
 #endif
     }
-    orchestrator_done_ = true;
+    orchestrator_done_.store(true, std::memory_order_release);
 
     // Check for fatal error from orchestration; if so, shut down immediately.
     int32_t orch_err = 0;

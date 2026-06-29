@@ -18,7 +18,7 @@
 #   - Sched     run_prepared.runner_run.device_wall.sched span
 #
 # Usage:
-#   ./tools/benchmark_rounds.sh [-p <platform>] [-d <device>] [-n <rounds>] [-r <runtime>]
+#   ./tools/benchmark_rounds.sh [-p <platform>] [-d <device>] [-n <rounds>] [-r <runtime>] [--serial-orch-sched]
 #
 # Edit the EXAMPLE_CASES map below to control which examples and cases to run.
 
@@ -49,6 +49,7 @@ ROUNDS=100
 PLATFORM=a2a3
 RUNTIME=tensormap_and_ringbuffer
 VERBOSE=0
+SERIAL_ORCH_SCHED=0
 EXTRA_ARGS=()
 
 while [[ $# -gt 0 ]]; do
@@ -73,12 +74,16 @@ while [[ $# -gt 0 ]]; do
             VERBOSE=1
             shift
             ;;
+        --serial-orch-sched)
+            SERIAL_ORCH_SCHED=1
+            shift
+            ;;
         --help|-h)
             cat <<'USAGE'
 benchmark_rounds.sh — run all examples and report per-round timing from [STRACE] markers
 
 Usage:
-  ./tools/benchmark_rounds.sh [-p <platform>] [-d <device>] [-n <rounds>] [-r <runtime>] [-v]
+  ./tools/benchmark_rounds.sh [-p <platform>] [-d <device>] [-n <rounds>] [-r <runtime>] [-v] [--serial-orch-sched]
 
 Options:
   -p, --platform Platform to run on (default: a2a3)
@@ -86,6 +91,9 @@ Options:
   -n, --rounds   Override number of rounds for each example (default: 100)
   -r, --runtime  Runtime to benchmark: tensormap_and_ringbuffer (default)
   -v, --verbose  Save detailed test_*.py output to a timestamped log file
+  --serial-orch-sched
+                 Run each case twice: default parallel mode, then serial
+                 orch->sched mode with PTO2_SERIAL_ORCH_SCHED=1.
   -h, --help     Show this help
 
 All other options are passed through to the underlying `python test_*.py`
@@ -179,16 +187,19 @@ parse_timing() {
 }
 
 # ---------------------------------------------------------------------------
-# run_bench <example> <example_dir> [case_name]
+# run_bench <example> <example_dir> [case_name] [mode]
 #   Run one benchmark invocation (via `python test_*.py`) and parse timing
 #   from the [STRACE] markers in its stderr. Skips the example if it has no
 #   test_*.py. Sets global PASS / FAIL counters.
 # ---------------------------------------------------------------------------
 run_bench() {
     local example="$1" example_dir="$2" case_name="${3:-}"
+    local mode="${4:-parallel}"
 
     if [[ -n "$case_name" ]]; then
-        echo "  ---- $case_name ----"
+        echo "  ---- $case_name [$mode] ----"
+    else
+        echo "  ---- $mode ----"
     fi
 
     local fw_stdout_file
@@ -219,7 +230,12 @@ run_bench() {
     # Run example, capturing stdout+stderr — the [STRACE] markers are on stderr.
     vlog "Running: ${run_cmd[*]}"
     local rc=0
-    "${run_cmd[@]}" > "$fw_stdout_file" 2>&1 || rc=$?
+    if [[ "$mode" == "serial" ]]; then
+        vlog "Environment: PTO2_SERIAL_ORCH_SCHED=1"
+        PTO2_SERIAL_ORCH_SCHED=1 "${run_cmd[@]}" > "$fw_stdout_file" 2>&1 || rc=$?
+    else
+        "${run_cmd[@]}" > "$fw_stdout_file" 2>&1 || rc=$?
+    fi
     if [[ -n "$VERBOSE_LOG" && -s "$fw_stdout_file" ]]; then
         cat "$fw_stdout_file" >> "$VERBOSE_LOG"
     fi
@@ -263,6 +279,7 @@ run_bench() {
     fi
 
     SUMMARY_NAMES+=("$label")
+    SUMMARY_MODE+=("$mode")
     SUMMARY_HOST+=("$avg_host")
     SUMMARY_DEVICE+=("$avg_device")
     SUMMARY_EFFECTIVE+=("$avg_effective")
@@ -278,6 +295,7 @@ FAIL=0
 
 # Summary collection arrays
 SUMMARY_NAMES=()
+SUMMARY_MODE=()
 SUMMARY_HOST=()
 SUMMARY_DEVICE=()
 SUMMARY_EFFECTIVE=()
@@ -322,11 +340,17 @@ for example in "${EXAMPLE_ORDER[@]}"; do
     fi
 
     if [[ -z "${case_list:-}" ]]; then
-        run_bench "$example" "$EXAMPLE_DIR"
+        run_bench "$example" "$EXAMPLE_DIR" "" "parallel"
+        if [[ $SERIAL_ORCH_SCHED -eq 1 ]]; then
+            run_bench "$example" "$EXAMPLE_DIR" "" "serial"
+        fi
     else
         IFS=',' read -ra cases <<< "$case_list"
         for c in "${cases[@]}"; do
-            run_bench "$example" "$EXAMPLE_DIR" "$c"
+            run_bench "$example" "$EXAMPLE_DIR" "$c" "parallel"
+            if [[ $SERIAL_ORCH_SCHED -eq 1 ]]; then
+                run_bench "$example" "$EXAMPLE_DIR" "$c" "serial"
+            fi
         done
     fi
 done
@@ -351,8 +375,8 @@ if [[ ${#SUMMARY_NAMES[@]} -gt 0 ]]; then
     echo "================================================================"
     echo ""
 
-    _hdr=$(printf "  %-40s" "Example")
-    _sep=$(printf "  %-40s" "----------------------------------------")
+    _hdr=$(printf "  %-40s  %-8s" "Example" "Mode")
+    _sep=$(printf "  %-40s  %-8s" "----------------------------------------" "--------")
     if [[ $_has_host      -eq 1 ]]; then _hdr=$(printf "%s  %12s" "$_hdr" "Host (us)");      _sep=$(printf "%s  %12s" "$_sep" "------------"); fi
     if [[ $_has_device    -eq 1 ]]; then _hdr=$(printf "%s  %12s" "$_hdr" "Device (us)");    _sep=$(printf "%s  %12s" "$_sep" "------------"); fi
     if [[ $_has_effective -eq 1 ]]; then _hdr=$(printf "%s  %14s" "$_hdr" "Effective (us)"); _sep=$(printf "%s  %14s" "$_sep" "--------------"); fi
@@ -363,6 +387,7 @@ if [[ ${#SUMMARY_NAMES[@]} -gt 0 ]]; then
 
     for _i in "${!SUMMARY_NAMES[@]}"; do
         _row=$(printf "  %-40s" "${SUMMARY_NAMES[$_i]}")
+        _row=$(printf "%s  %-8s" "$_row" "${SUMMARY_MODE[$_i]}")
         if [[ $_has_host      -eq 1 ]]; then _row=$(printf "%s  %12s" "$_row" "${SUMMARY_HOST[$_i]}");      fi
         if [[ $_has_device    -eq 1 ]]; then _row=$(printf "%s  %12s" "$_row" "${SUMMARY_DEVICE[$_i]}");    fi
         if [[ $_has_effective -eq 1 ]]; then _row=$(printf "%s  %14s" "$_row" "${SUMMARY_EFFECTIVE[$_i]}"); fi
@@ -370,6 +395,46 @@ if [[ ${#SUMMARY_NAMES[@]} -gt 0 ]]; then
         if [[ $_has_sched     -eq 1 ]]; then _row=$(printf "%s  %12s" "$_row" "${SUMMARY_SCHED[$_i]}");     fi
         echo "$_row"
     done
+
+    if [[ $SERIAL_ORCH_SCHED -eq 1 ]]; then
+        echo ""
+        echo "================================================================"
+        echo "  Serial vs Parallel Delta ($RUNTIME)"
+        echo "================================================================"
+        echo ""
+        printf "  %-40s  %-8s  %12s  %12s  %12s  %12s\n" \
+            "Example" "Metric" "Parallel" "Serial" "Delta" "Change (%)"
+        printf "  %-40s  %-8s  %12s  %12s  %12s  %12s\n" \
+            "----------------------------------------" "--------" "------------" "------------" "------------" "------------"
+
+        print_delta_row() {
+            local name="$1" metric="$2" base="$3" serial="$4"
+            [[ "$base" == "-" || "$serial" == "-" ]] && return
+            awk -v name="$name" -v metric="$metric" -v base="$base" -v serial="$serial" '
+                BEGIN {
+                    delta = serial - base
+                    change = (base == 0) ? 0 : delta * 100.0 / base
+                    printf "  %-40s  %-8s  %12.1f  %12.1f  %+12.1f  %+12.2f\n", name, metric, base, serial, delta, change
+                }'
+        }
+
+        for _i in "${!SUMMARY_NAMES[@]}"; do
+            [[ "${SUMMARY_MODE[$_i]}" == "serial" ]] || continue
+            _base_idx=""
+            for _j in "${!SUMMARY_NAMES[@]}"; do
+                if [[ "${SUMMARY_NAMES[$_j]}" == "${SUMMARY_NAMES[$_i]}" && "${SUMMARY_MODE[$_j]}" == "parallel" ]]; then
+                    _base_idx="$_j"
+                    break
+                fi
+            done
+            [[ -n "$_base_idx" ]] || continue
+            print_delta_row "${SUMMARY_NAMES[$_i]}" "Host"   "${SUMMARY_HOST[$_base_idx]}"   "${SUMMARY_HOST[$_i]}"
+            print_delta_row "${SUMMARY_NAMES[$_i]}" "Device" "${SUMMARY_DEVICE[$_base_idx]}" "${SUMMARY_DEVICE[$_i]}"
+            print_delta_row "${SUMMARY_NAMES[$_i]}" "Effective" "${SUMMARY_EFFECTIVE[$_base_idx]}" "${SUMMARY_EFFECTIVE[$_i]}"
+            print_delta_row "${SUMMARY_NAMES[$_i]}" "Orch"      "${SUMMARY_ORCH[$_base_idx]}"      "${SUMMARY_ORCH[$_i]}"
+            print_delta_row "${SUMMARY_NAMES[$_i]}" "Sched"     "${SUMMARY_SCHED[$_base_idx]}"     "${SUMMARY_SCHED[$_i]}"
+        done
+    fi
 fi
 
 # ---------------------------------------------------------------------------

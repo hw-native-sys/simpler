@@ -22,9 +22,11 @@ Optional benchmark arguments forwarded to `tools/benchmark_rounds.sh`:
 /benchmark
 /benchmark -d 4 -n 50
 /benchmark -d 4 -d 6
+/benchmark --serial-orch-sched
 ```
 
-Extra arguments (`-n`, `-r`, etc.) are forwarded to `tools/benchmark_rounds.sh`.
+Extra arguments (`-n`, `-r`, `--serial-orch-sched`, etc.) are forwarded to
+`tools/benchmark_rounds.sh`.
 
 ### Device arguments (`-d`)
 
@@ -113,6 +115,10 @@ WORKTREE_ABS="/home/user/simpler/tmp/worktree_baseline_20260331_102302"
 ```bash
 ./tools/benchmark_rounds.sh $BENCH_ARGS -r "$RUNTIME" 2>&1 | tee "tmp/benchmark_${TIMESTAMP}.txt"
 ```
+
+Use `--serial-orch-sched` to run each case once in the default overlapped mode
+and once with `PTO2_SERIAL_ORCH_SCHED=1`, then emit serial-vs-parallel
+Delta/Change tables.
 
 ### Compare Mode
 

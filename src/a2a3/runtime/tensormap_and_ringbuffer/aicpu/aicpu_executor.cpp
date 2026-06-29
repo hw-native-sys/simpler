@@ -114,6 +114,7 @@ struct OrchSoEntry {
 struct AicpuExecutor {
     int32_t sched_thread_num_;
     bool orch_to_sched_{false};
+    bool serial_orch_sched_{false};
 
     // ===== Thread management state =====
     std::atomic<int32_t> thread_idx_{0};
@@ -190,6 +191,7 @@ int32_t AicpuExecutor::init(Runtime *runtime) {
     if (aicpu_thread_num_ == 0) aicpu_thread_num_ = 1;
     sched_thread_num_ = aicpu_thread_num_ - 1;
     orch_to_sched_ = runtime->orch_to_sched;
+    serial_orch_sched_ = runtime->serial_orch_sched;
 
     if (aicpu_thread_num_ < 1 || aicpu_thread_num_ > MAX_AICPU_THREADS) {
         LOG_ERROR("Invalid aicpu_thread_num: %d", aicpu_thread_num_);
@@ -717,6 +719,9 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
             LOG_ERROR("Thread %d: rt is null after orchestrator error, skipping dispatch", thread_idx);
         } else {
             sched_ctx_.bind_runtime(rt);
+            if (serial_orch_sched_) {
+                sched_ctx_.wait_for_orchestration_done_before_dispatch(runtime, thread_idx);
+            }
             int32_t completed = sched_ctx_.resolve_and_dispatch(runtime, thread_idx);
             if (completed < 0) {
                 LOG_ERROR("Thread %d: Scheduler failed with rc=%d", thread_idx, completed);
@@ -777,6 +782,7 @@ void AicpuExecutor::deinit(Runtime *runtime) {
     aicpu_thread_num_ = 0;
     sched_thread_num_ = 0;
     orch_to_sched_ = false;
+    serial_orch_sched_ = false;
 
     orch_args_cached_.reset();
     // orch_so_table_ entries are intentionally preserved across deinit: the
