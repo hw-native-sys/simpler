@@ -47,8 +47,12 @@ class _FakeCWorker:
 class _FakeCOrch:
     def __init__(self):
         self._buffers = []
+        self.fail_next_alloc = False
 
     def alloc(self, shape, dtype):
+        if self.fail_next_alloc:
+            self.fail_next_alloc = False
+            raise RuntimeError("injected staging allocation failure")
         nbytes = math.prod(int(x) for x in shape) * int(get_element_size(dtype))
         storage_t = ctypes.c_uint8 * nbytes
         storage = storage_t()
@@ -352,6 +356,7 @@ def test_enqueue_registered_tensor_uses_fast_path_without_staging():
     try:
         queue = orch.create_l3_l2_queue(worker_id=0, depth=4, input_arena_bytes=128, output_arena_bytes=128)
         host = orch.alloc([16], DataType.UINT8)
+        alloc_count = len(orch._o._buffers)
         fake_client.requests.clear()
         fake_client.payload_writes.clear()
 
@@ -361,6 +366,7 @@ def test_enqueue_registered_tensor_uses_fast_path_without_staging():
         assert queue.layout.input_arena_offset in payload_write_offsets
         assert queue.layout.input_desc_offset in payload_write_offsets
         assert all(req.cmd != L3L2OrchCommCmd.ALLOC_REGION for req, _timeout in fake_client.requests)
+        assert len(orch._o._buffers) == alloc_count
     finally:
         _close(worker, shm)
 
@@ -382,16 +388,41 @@ def test_enqueue_replays_released_descriptors_before_reusing_input_arena():
         _close(worker, shm)
 
 
-def test_enqueue_rejects_ordinary_host_bytes_before_shared_mutation():
+def test_enqueue_accepts_ordinary_host_bytes_with_lazy_staging():
     orch, worker, shm, fake_client = _make_orchestrator()
     try:
         queue = orch.create_l3_l2_queue(worker_id=0, depth=4, input_arena_bytes=128, output_arena_bytes=128)
+        alloc_count = len(orch._o._buffers)
         fake_client.requests.clear()
+        fake_client.payload_writes.clear()
 
-        with pytest.raises(ValueError, match="registered.*orch.alloc"):
-            queue.input.enqueue(b"ordinary", nbytes=8, timeout=0.001)
+        queue.input.enqueue(b"ordinary", nbytes=8, timeout=0.001)
+
+        assert (queue.layout.input_arena_offset, b"ordinary") in fake_client.payload_writes
+        assert queue.layout.input_desc_offset in [offset for offset, _data in fake_client.payload_writes]
+        assert fake_client.counters[queue.layout.input_desc_tail_offset] == 1
+        assert fake_client.counters.get(L3L2_QUEUE_L3_ABORT_FLAG_OFFSET, 0) == 0
+        assert len(orch._o._buffers) == alloc_count + 1
+        assert queue.region.descriptor_scalars()[1] == 1
+    finally:
+        _close(worker, shm)
+
+
+def test_staging_allocation_failure_does_not_poison():
+    orch, worker, shm, fake_client = _make_orchestrator()
+    try:
+        queue = orch.create_l3_l2_queue(worker_id=0, depth=4, input_arena_bytes=128, output_arena_bytes=128)
+        orch._o.fail_next_alloc = True
+        fake_client.requests.clear()
+        fake_client.payload_writes.clear()
+
+        with pytest.raises(RuntimeError, match="staging allocation"):
+            queue.input.enqueue(bytearray(b"ordinary"), nbytes=8, timeout=0.001)
 
         assert fake_client.requests == []
+        assert fake_client.payload_writes == []
+        assert fake_client.counters.get(queue.layout.input_desc_tail_offset, 0) == 0
+        assert fake_client.counters.get(L3L2_QUEUE_L3_ABORT_FLAG_OFFSET, 0) == 0
         assert queue.region.descriptor_scalars()[1] == 1
     finally:
         _close(worker, shm)
@@ -469,7 +500,27 @@ def test_try_dequeue_into_empty_returns_none_without_abort():
         _close(worker, shm)
 
 
-def test_output_read_rejects_ordinary_buffer_before_shared_mutation():
+def test_output_read_into_ordinary_buffer_uses_lazy_staging():
+    orch, worker, shm, fake_client = _make_orchestrator()
+    try:
+        queue = orch.create_l3_l2_queue(worker_id=0, depth=4, input_arena_bytes=128, output_arena_bytes=128)
+        _publish_output(fake_client, queue, payload=b"abcdefghijklmnop")
+        handle = queue.output.peek(timeout=0.001)
+        output = bytearray(16)
+        fake_client.requests.clear()
+
+        queue.output.read_into(handle, output)
+        queue.output.release(handle)
+
+        assert bytes(output) == b"abcdefghijklmnop"
+        assert any(req.cmd == L3L2OrchCommCmd.PAYLOAD_READ for req, _timeout in fake_client.requests)
+        assert fake_client.counters[queue.layout.output_desc_head_offset] == 1
+        assert fake_client.counters.get(L3L2_QUEUE_L3_ABORT_FLAG_OFFSET, 0) == 0
+    finally:
+        _close(worker, shm)
+
+
+def test_output_read_rejects_readonly_ordinary_buffer_before_release():
     orch, worker, shm, fake_client = _make_orchestrator()
     try:
         queue = orch.create_l3_l2_queue(worker_id=0, depth=4, input_arena_bytes=128, output_arena_bytes=128)
@@ -477,11 +528,12 @@ def test_output_read_rejects_ordinary_buffer_before_shared_mutation():
         handle = queue.output.peek(timeout=0.001)
         fake_client.requests.clear()
 
-        with pytest.raises(ValueError, match="registered.*orch.alloc"):
-            queue.output.read_into(handle, bytearray(16))
+        with pytest.raises(ValueError, match="writable"):
+            queue.output.read_into(handle, b"readonly-read-buf")
 
-        assert fake_client.requests == []
+        assert all(req.cmd != L3L2OrchCommCmd.PAYLOAD_READ for req, _timeout in fake_client.requests)
         assert fake_client.counters.get(queue.layout.output_desc_head_offset, 0) == 0
+        assert fake_client.counters.get(L3L2_QUEUE_L3_ABORT_FLAG_OFFSET, 0) == 0
     finally:
         _close(worker, shm)
 

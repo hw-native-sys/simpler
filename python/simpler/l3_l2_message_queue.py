@@ -46,6 +46,13 @@ _DESC = struct.Struct("<4Q")
 _POLL_INTERVAL_S = 0.00005
 
 
+@dataclass(frozen=True)
+class _HostByteSpan:
+    nbytes: int
+    ptr: int | None
+    view: memoryview | None
+
+
 class L3L2QueueOpcode(IntEnum):
     INVALID = 0
     DATA = 1
@@ -108,6 +115,63 @@ def _checked_add_u64(lhs: int, rhs: int) -> int:
     if lhs < 0 or rhs < 0 or result > _UINT64_MAX:
         raise ValueError("L3-L2 queue layout calculation overflowed uint64")
     return result
+
+
+def _tensor_like_nbytes(buffer: Any) -> int | None:
+    nbytes_attr = getattr(buffer, "nbytes", None)
+    if nbytes_attr is not None:
+        return int(nbytes_attr() if callable(nbytes_attr) else nbytes_attr)
+    numel = getattr(buffer, "numel", None)
+    element_size = getattr(buffer, "element_size", None)
+    if callable(numel) and callable(element_size):
+        return int(numel()) * int(element_size())
+    return None
+
+
+def _host_byte_span(buffer: Any, nbytes: int, *, writable: bool) -> _HostByteSpan:
+    nbytes = int(nbytes)
+    try:
+        view = memoryview(buffer)
+    except TypeError:
+        view = None
+
+    if view is not None:
+        if not view.c_contiguous:
+            raise ValueError("L3-L2 queue ordinary host buffer must be C-contiguous")
+        if int(view.nbytes) < nbytes:
+            raise ValueError(f"L3-L2 queue nbytes={nbytes} exceeds ordinary host buffer size {int(view.nbytes)}")
+        try:
+            byte_view = view if view.itemsize == 1 and view.format in {"B", "b", "c"} else view.cast("B")
+        except (TypeError, ValueError) as exc:
+            raise ValueError("L3-L2 queue ordinary host buffer must be viewable as bytes") from exc
+        if writable and byte_view.readonly:
+            raise ValueError("L3-L2 queue output target must be a writable ordinary host buffer")
+        ptr = None
+        if not byte_view.readonly:
+            ptr = ctypes.addressof(ctypes.c_char.from_buffer(byte_view))
+        return _HostByteSpan(nbytes=nbytes, ptr=ptr, view=byte_view)
+
+    data_ptr = getattr(buffer, "data_ptr", None)
+    if callable(data_ptr):
+        is_contiguous = getattr(buffer, "is_contiguous", None)
+        if callable(is_contiguous) and not bool(is_contiguous()):
+            raise ValueError("L3-L2 queue ordinary host tensor-like buffer must be contiguous")
+        device = getattr(buffer, "device", None)
+        device_type = getattr(device, "type", device)
+        if device_type is not None and str(device_type) != "cpu":
+            raise ValueError("L3-L2 queue ordinary host tensor-like buffer must be on CPU")
+        available = _tensor_like_nbytes(buffer)
+        if available is None:
+            raise ValueError("L3-L2 queue ordinary host tensor-like buffer must expose nbytes")
+        if available < nbytes:
+            raise ValueError(f"L3-L2 queue nbytes={nbytes} exceeds ordinary host buffer size {available}")
+        ptr = int(data_ptr())
+        if ptr <= 0 and nbytes > 0:
+            raise ValueError("L3-L2 queue ordinary host tensor-like buffer must have a nonzero data_ptr")
+        return _HostByteSpan(nbytes=nbytes, ptr=ptr, view=None)
+
+    access = "writable" if writable else "readable"
+    raise ValueError(f"L3-L2 queue requires a registered Tensor or {access} contiguous ordinary host buffer")
 
 
 def make_l3_l2_queue_layout(depth: int, input_arena_bytes: int, output_arena_bytes: int) -> L3L2QueueLayout:
@@ -211,6 +275,8 @@ class L3L2Queue:
         self._input_payload_head = 0
         self._output_payload_head = 0
         self._output_active: L3L2QueueMessage | None = None
+        self._staging_tensor: Tensor | None = None
+        self._staging_nbytes = 0
         self._stop_published = False
         self.input = _L3InputQueue(self)
         self.output = _L3OutputQueue(self)
@@ -267,11 +333,41 @@ class L3L2Queue:
 
     def _validate_registered_buffer(self, buffer: Any, nbytes: int) -> Tensor:
         if not isinstance(buffer, Tensor):
-            raise ValueError("L3-L2 queue PR1 requires a registered Tensor returned by orch.alloc(...)")
+            raise ValueError("L3-L2 queue requires a registered Tensor returned by orch.alloc(...)")
         self._region._owner._validate_l3_l2_orch_comm_host_buffer(buffer)
         if int(nbytes) > int(buffer.nbytes()):
             raise ValueError(f"L3-L2 queue nbytes={nbytes} exceeds registered Tensor size {int(buffer.nbytes())}")
         return buffer
+
+    def _registered_buffer_or_none(self, buffer: Any, nbytes: int) -> Tensor | None:
+        if not isinstance(buffer, Tensor):
+            return None
+        return self._validate_registered_buffer(buffer, nbytes)
+
+    def _ensure_staging_capacity(self, nbytes: int) -> Tensor:
+        nbytes = int(nbytes)
+        if self._staging_tensor is None or self._staging_nbytes < nbytes:
+            self._staging_tensor = self._orch.alloc([nbytes], DataType.UINT8)
+            self._staging_nbytes = int(self._staging_tensor.nbytes())
+        return self._staging_tensor
+
+    def _copy_host_span_to_tensor(self, span: _HostByteSpan, tensor: Tensor) -> None:
+        if span.nbytes == 0:
+            return
+        if span.ptr is not None:
+            ctypes.memmove(int(tensor.data), span.ptr, span.nbytes)
+            return
+        assert span.view is not None
+        ctypes.memmove(int(tensor.data), span.view[: span.nbytes].tobytes(), span.nbytes)
+
+    def _copy_tensor_to_host_span(self, tensor: Tensor, span: _HostByteSpan) -> None:
+        if span.nbytes == 0:
+            return
+        if span.ptr is not None:
+            ctypes.memmove(span.ptr, int(tensor.data), span.nbytes)
+            return
+        assert span.view is not None
+        span.view[: span.nbytes] = ctypes.string_at(int(tensor.data), span.nbytes)
 
     def _refresh_counter(self, offset: int, local_value: int, depth: int) -> int:
         result = self._signal_test(offset, local_value & 0xFFFF_FFFF, WaitCmp.NE)
@@ -416,17 +512,25 @@ class _L3InputQueue:
         if nbytes < 0:
             raise ValueError("L3-L2 queue nbytes must be non-negative")
         payload_tensor = None
+        staged_span = None
         if nbytes == 0:
             if buffer_or_none is not None:
                 raise ValueError("L3-L2 queue zero-byte enqueue requires buffer_or_none == None")
         else:
-            payload_tensor = queue._validate_registered_buffer(buffer_or_none, nbytes)
+            payload_tensor = queue._registered_buffer_or_none(buffer_or_none, nbytes)
+            if payload_tensor is None:
+                staged_span = _host_byte_span(buffer_or_none, nbytes, writable=False)
 
         queue._ensure_live()
         if queue._stop_published:
             return False
         if opcode == L3L2QueueOpcode.STOP and nbytes != 0:
             raise ValueError("L3-L2 queue STOP must be zero-byte")
+        if nbytes > queue._layout.input_arena_bytes:
+            return False
+        if staged_span is not None:
+            payload_tensor = queue._ensure_staging_capacity(nbytes)
+            queue._copy_host_span_to_tensor(staged_span, payload_tensor)
 
         old_head = queue._input_head
         queue._input_head = queue._refresh_counter(
@@ -435,8 +539,6 @@ class _L3InputQueue:
         if queue._input_head != old_head:
             queue._replay_released_input_descriptors(old_head, queue._input_head)
         if queue._input_tail - queue._input_head >= queue._layout.depth:
-            return False
-        if nbytes > queue._layout.input_arena_bytes:
             return False
 
         payload_offset = 0
@@ -526,8 +628,14 @@ class _L3OutputQueue:
             if buffer is not None:
                 raise ValueError("L3-L2 queue zero-byte output read requires buffer == None")
             return
-        target = queue._validate_registered_buffer(buffer, handle.payload_nbytes)
+        target = queue._registered_buffer_or_none(buffer, handle.payload_nbytes)
+        target_span = None
+        if target is None:
+            target_span = _host_byte_span(buffer, handle.payload_nbytes, writable=True)
+            target = queue._ensure_staging_capacity(handle.payload_nbytes)
         queue._run_primitive(queue._region.payload_read, handle.payload_offset, target, nbytes=handle.payload_nbytes)
+        if target_span is not None:
+            queue._copy_tensor_to_host_span(target, target_span)
 
     def release(self, handle: L3L2QueueMessage) -> None:
         queue = self._queue
