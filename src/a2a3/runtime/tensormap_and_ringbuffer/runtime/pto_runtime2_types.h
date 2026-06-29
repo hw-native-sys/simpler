@@ -157,8 +157,21 @@ struct PTO2OutputLayout {
  */
 struct PTO2TaskSlotState;  // Forward declaration
 struct PTO2FaninPool;      // Forward declaration
+// Fanin spill entry. Packs the producer slot pointer together with the per-edge
+// DepKind in the low bit of the pointer (PTO2TaskSlotState is alignas(64), so the
+// low 6 bits are free). bit0 == 1 -> EXECUTION, bit0 == 0 -> RESOURCE. This keeps
+// sizeof == sizeof(uintptr_t) so the spill pool memory footprint is unchanged.
 struct PTO2FaninSpillEntry {
-    PTO2TaskSlotState *slot_state;
+    uintptr_t packed_{0};
+
+    PTO2TaskSlotState *slot_state() const {
+        return reinterpret_cast<PTO2TaskSlotState *>(packed_ & ~static_cast<uintptr_t>(1));
+    }
+    DepKind dep_kind() const { return (packed_ & 1) ? DepKind::EXECUTION : DepKind::RESOURCE; }
+    void set(PTO2TaskSlotState *s, DepKind k) {
+        packed_ = reinterpret_cast<uintptr_t>(s) | (k == DepKind::EXECUTION ? static_cast<uintptr_t>(1) : 0);
+    }
+    void clear() { packed_ = 0; }
 };
 static_assert(sizeof(PTO2FaninSpillEntry) == sizeof(uintptr_t));
 
@@ -264,6 +277,13 @@ struct PTO2TaskPayload {
     std::atomic<uint8_t> dispatch_propagated{0};  // PRODUCER side: once-guard for fanout propagation
     std::atomic<uint8_t> spec_chain_active{0};    // inherited early-dispatch flag (auto-chain past codegen flag)
     uint8_t spec_chain_depth{0};                  // auto-chain depth; inherited = parent+1, capped
+    // Per-inline-fanin-slot DepKind: bit i == 1 -> slot i is RESOURCE,
+    // bit i == 0 -> slot i is EXECUTION. Sized to PTO2_FANIN_INLINE_CAP (64)
+    // bits. Sits in the cache-line-8 padding gap (offset 568) so sizeof and the
+    // tensors[] offset (576) are unchanged. Set by the orchestrator from the
+    // FaninBuilder before the slot is pushed to the wiring queue; read by
+    // on_task_release to skip release_producer for EXECUTION edges.
+    uint64_t fanin_inline_dep_kind_mask{0};
     // === Cache lines 9-72 (4096B) — tensors (alignas(64) forces alignment) ===
     Tensor tensors[MAX_TENSOR_ARGS];
     // === Cache lines 73-74 (128B) — scalars ===
@@ -348,6 +368,7 @@ struct PTO2TaskPayload {
         dispatch_propagated.store(0, std::memory_order_relaxed);
         spec_chain_active.store(0, std::memory_order_relaxed);
         spec_chain_depth = 0;
+        fanin_inline_dep_kind_mask = 0;
     }
 };
 

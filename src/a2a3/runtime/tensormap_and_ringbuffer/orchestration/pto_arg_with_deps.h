@@ -69,26 +69,31 @@ public:
     // the convenience layer reach dependencies only through add_dep() below.
 
     /**
-     * Append one or more dependencies to the bundled buffer. May be called
-     * multiple times; deps accumulate. Variadic accepts any non-zero number
-     * of PTO2TaskId arguments.
+     * Append one or more RESOURCE (retention) dependencies to the bundled
+     * buffer. The producer is retained (its slot/heap stay alive) until this
+     * consumer completes — use this when the consumer reads a tensor whose
+     * buffer the producer allocated. May be called multiple times; deps
+     * accumulate. Variadic accepts any non-zero number of PTO2TaskId arguments.
      *
      * Overflow (more than MAX_DEP_COUNT total) records an error on the
      * underlying Arg; the error surfaces at submit time.
      */
     template <typename... Ids>
     void add_dep(Ids... ids) {
-        static_assert(sizeof...(Ids) >= 1, "add_dep: at least one task id is required");
-        static_assert(
-            (std::is_same_v<std::decay_t<Ids>, PTO2TaskId> && ...), "add_dep: all arguments must be PTO2TaskId"
-        );
-        if (count_ + sizeof...(Ids) > MAX_DEP_COUNT) {
-            L0TaskArgs::set_error(
-                "L0TaskArgsWithDeps::add_dep: dep count exceeds MAX_DEP_COUNT (bump the template arg)"
-            );
-            return;
-        }
-        ((deps_[count_++] = ids), ...);
+        add_dep_impl<DepKind::RESOURCE>(ids...);
+    }
+
+    /**
+     * Append one or more EXECUTION (ordering-only) dependencies. The producer
+     * is NOT retained — it may be CONSUMED (slot/heap reclaimed) as soon as it
+     * completes and notifies this consumer, without waiting for this consumer
+     * to finish. Use this when the consumer only reads a tensor the producer
+     * modified (the buffer was allocated by someone else), so the producer's
+     * slot/heap are not needed by this consumer.
+     */
+    template <typename... Ids>
+    void add_dep_exec(Ids... ids) {
+        add_dep_impl<DepKind::EXECUTION>(ids...);
     }
 
     /**
@@ -111,12 +116,28 @@ public:
      */
     L0TaskArgs &finalize_for_submit() {
         L0TaskArgs::set_dependencies(nullptr, 0);
-        L0TaskArgs::set_dependencies(deps_, count_);
+        L0TaskArgs::set_dependencies_with_kinds(deps_, kinds_, count_);
         return *this;
     }
 
 private:
+    template <DepKind Kind, typename... Ids>
+    void add_dep_impl(Ids... ids) {
+        static_assert(sizeof...(Ids) >= 1, "add_dep: at least one task id is required");
+        static_assert(
+            (std::is_same_v<std::decay_t<Ids>, PTO2TaskId> && ...), "add_dep: all arguments must be PTO2TaskId"
+        );
+        if (count_ + sizeof...(Ids) > MAX_DEP_COUNT) {
+            L0TaskArgs::set_error(
+                "L0TaskArgsWithDeps::add_dep: dep count exceeds MAX_DEP_COUNT (bump the template arg)"
+            );
+            return;
+        }
+        ((kinds_[count_] = Kind, deps_[count_] = ids, ++count_), ...);
+    }
+
     PTO2TaskId deps_[MAX_DEP_COUNT];
+    DepKind kinds_[MAX_DEP_COUNT];
     uint32_t count_ = 0;
 };
 

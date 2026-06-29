@@ -310,6 +310,9 @@ TEST_F(WiringTest, OnTaskReleaseReleasesProducers) {
     payload.fanin_actual_count = 2;
     payload.fanin_inline_slot_states[0] = &producers[0];
     payload.fanin_inline_slot_states[1] = &producers[1];
+    // Mark both inline edges RESOURCE so on_task_release calls release_producer
+    // on them (EXECUTION edges are skipped). Bits 0..1 set = RESOURCE.
+    payload.fanin_inline_dep_kind_mask = 0x3;
     // Need a valid fanin_spill_pool even though we don't spill
     PTO2FaninPool dummy_pool{};
     PTO2FaninSpillEntry dummy_entries[4];

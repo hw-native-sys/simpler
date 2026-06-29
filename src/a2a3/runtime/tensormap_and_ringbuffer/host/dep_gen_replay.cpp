@@ -22,9 +22,13 @@
  *     Drives `compute_task_fanin` (the same template the device orchestrator
  *     uses in pto_orchestrator.cpp:submit_task) against `tm_oracle`. Emits
  *     only PTO2TaskId values — the canonical set of producer IDs the runtime
- *     would have wired. We never widen this template's emit signature: this
- *     pass IS the contract, and any future change to `compute_task_fanin`
- *     automatically refreshes the oracle.
+ *     would have wired. The template's emit signature now carries a DepKind
+ *     (RESOURCE for Step A creator, EXECUTION for Step B modifier); the oracle
+ *     ignores it because the producer-ID SET is what the differential check
+ *     compares, and the RESOURCE/EXECUTION split changes only retention
+ *     accounting (not which edges exist). Any future change to
+ *     `compute_task_fanin` that alters the producer SET still refreshes the
+ *     oracle automatically.
  *
  *   ANNOT pass (this file's feature):
  *     Inlines the same STEP A (creator retention) + STEP B (tensormap lookup)
@@ -694,7 +698,14 @@ dep_gen_replay_emit_deps_json(const DepGenRecord *records, size_t num_records, c
         }
 
         // ============ ORACLE pass — drive compute_task_fanin ============
-        bool ok = compute_task_fanin(inputs, tm_oracle, in_manual_scope, [&](PTO2TaskId producer) -> bool {
+        // The oracle records only the producer-ID SET (kind-agnostic) to compare
+        // against the ANNOT pass's set. compute_task_fanin now emits a DepKind
+        // per edge (RESOURCE for Step A creator, EXECUTION for Step B modifier);
+        // the oracle ignores it — the SET of producers is unchanged by the
+        // RESOURCE/EXECUTION split (only retention accounting changes, which the
+        // replay does not model). The ANNOT pass records EdgeSource
+        // (CREATOR/TENSORMAP) which carries the same distinction for deps.json.
+        bool ok = compute_task_fanin(inputs, tm_oracle, in_manual_scope, [&](PTO2TaskId producer, DepKind) -> bool {
             oracle_preds.insert(producer.raw);
             return true;
         });

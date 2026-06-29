@@ -847,7 +847,12 @@ struct PTO2SchedulerState {
 
         if (wfanin != 0) {
             int32_t early_finished = 0;
-            for_each_fanin_slot_state(*wp, [&](PTO2TaskSlotState *producer) {
+            for_each_fanin_slot_state(*wp, [&](PTO2TaskSlotState *producer, DepKind kind) {
+                // Both RESOURCE and EXECUTION edges are prepended to the
+                // producer's fanout_head: the producer must notify every
+                // consumer (ordering) on completion, regardless of whether the
+                // edge also carries retention. The kind only affects the
+                // retention release timing (see below + on_task_release).
                 producer->lock_fanout();
                 int32_t pstate = producer->task_state.load(std::memory_order_acquire);
                 if (pstate >= PTO2_TASK_COMPLETED) {
@@ -856,6 +861,20 @@ struct PTO2SchedulerState {
                     producer->fanout_head = rss.dep_pool.prepend(producer->fanout_head, ws);
                 }
                 producer->unlock_fanout();
+                // EXECUTION edges claimed a fanout_count++ pin at submit only to
+                // keep the producer's slot stable across submit->wire (prevent
+                // CONSUME+reuse that this generation-unchecked path can't detect).
+                // Now that the consumer is wired (in fanout_head, to be notified
+                // at the producer's completion, or already early_finished), the
+                // pin is no longer needed — release it immediately so the producer
+                // can be CONSUMED as soon as it completes + its scope/RESOURCE
+                // consumers release, WITHOUT waiting for this EXECUTION consumer
+                // to finish. RESOURCE pins are NOT released here: the consumer
+                // reads the producer's allocated buffer, so the producer must stay
+                // alive until the consumer's own on_task_release.
+                if (kind == DepKind::EXECUTION) {
+                    release_producer(*producer);
+                }
             });
 
             // Seed dispatch_fanin with producers already complete at wiring
@@ -1382,7 +1401,17 @@ struct PTO2SchedulerState {
     int32_t on_task_release(PTO2TaskSlotState &slot_state) {
 #endif
         PTO2TaskPayload *payload = slot_state.payload;
-        for_each_fanin_slot_state(*payload, [&](PTO2TaskSlotState *producer_slot_state) {
+        for_each_fanin_slot_state(*payload, [&](PTO2TaskSlotState *producer_slot_state, DepKind kind) {
+            // Only RESOURCE edges claimed a retention reference (fanout_count++)
+            // at submit; EXECUTION edges carry ordering only and must NOT be
+            // released here — releasing them would desync the producer's
+            // fanout_refcount (bumping it without a matching fanout_count) and
+            // break the rc == fc consume invariant. The producer's on_task_complete
+            // fanout walk already notified this consumer (release_fanin) for both
+            // kinds, so skipping release_producer for EXECUTION loses nothing.
+            if (kind != DepKind::RESOURCE) {
+                return;
+            }
 #if PTO2_SCHED_PROFILING
             release_producer(*producer_slot_state, fanin_atomics);
 #else

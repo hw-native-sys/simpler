@@ -41,7 +41,7 @@ protected:
     PTO2FaninPool pool{};
 
     void SetUp() override {
-        entries.assign(POOL_CAP, PTO2FaninSpillEntry{nullptr});
+        entries.assign(POOL_CAP, PTO2FaninSpillEntry{});
         error_code.store(PTO2_ERROR_NONE);
         pool.init(entries.data(), POOL_CAP, &error_code);
     }
@@ -165,7 +165,7 @@ protected:
     alignas(64) PTO2TaskSlotState slots[64];
 
     void SetUp() override {
-        spill_entries.assign(POOL_CAP, PTO2FaninSpillEntry{nullptr});
+        spill_entries.assign(POOL_CAP, PTO2FaninSpillEntry{});
         error_code.store(PTO2_ERROR_NONE);
         spill_pool.init(spill_entries.data(), POOL_CAP, &error_code);
         memset(slots, 0, sizeof(slots));
@@ -179,7 +179,7 @@ TEST_F(ForEachFaninTest, InlineOnlyVoid) {
     }
 
     std::vector<PTO2TaskSlotState *> visited;
-    for_each_fanin_storage(inline_slots, 5, 0, spill_pool, [&](PTO2TaskSlotState *s) {
+    for_each_fanin_storage(inline_slots, 5, 0, spill_pool, 0, [&](PTO2TaskSlotState *s, DepKind) {
         visited.push_back(s);
     });
 
@@ -196,7 +196,7 @@ TEST_F(ForEachFaninTest, InlineOnlyBoolEarlyReturn) {
     }
 
     int count = 0;
-    bool result = for_each_fanin_storage(inline_slots, 5, 0, spill_pool, [&](PTO2TaskSlotState *) -> bool {
+    bool result = for_each_fanin_storage(inline_slots, 5, 0, spill_pool, 0, [&](PTO2TaskSlotState *, DepKind) -> bool {
         count++;
         return count < 3;  // stop after 3rd
     });
@@ -211,7 +211,7 @@ TEST_F(ForEachFaninTest, InlineOnlyBoolAllTrue) {
         inline_slots[i] = &slots[i];
     }
 
-    bool result = for_each_fanin_storage(inline_slots, 3, 0, spill_pool, [](PTO2TaskSlotState *) -> bool {
+    bool result = for_each_fanin_storage(inline_slots, 3, 0, spill_pool, 0, [](PTO2TaskSlotState *, DepKind) -> bool {
         return true;
     });
 
@@ -221,7 +221,7 @@ TEST_F(ForEachFaninTest, InlineOnlyBoolAllTrue) {
 TEST_F(ForEachFaninTest, ZeroFanin) {
     PTO2TaskSlotState *inline_slots[PTO2_FANIN_INLINE_CAP] = {};
     int count = 0;
-    for_each_fanin_storage(inline_slots, 0, 0, spill_pool, [&](PTO2TaskSlotState *) {
+    for_each_fanin_storage(inline_slots, 0, 0, spill_pool, 0, [&](PTO2TaskSlotState *, DepKind) {
         count++;
     });
     EXPECT_EQ(count, 0);
@@ -241,12 +241,12 @@ TEST_F(ForEachFaninTest, SpillNoWrap) {
     // Allocate 2 spill entries
     auto *s0 = spill_pool.alloc();
     int32_t spill_start = spill_pool.top - 1;
-    s0->slot_state = &slots[16];
+    s0->set(&slots[16], DepKind::RESOURCE);
     auto *s1 = spill_pool.alloc();
-    s1->slot_state = &slots[17];
+    s1->set(&slots[17], DepKind::RESOURCE);
 
     std::vector<PTO2TaskSlotState *> visited;
-    for_each_fanin_storage(inline_slots, 18, spill_start, spill_pool, [&](PTO2TaskSlotState *s) {
+    for_each_fanin_storage(inline_slots, 18, spill_start, spill_pool, 0, [&](PTO2TaskSlotState *s, DepKind) {
         visited.push_back(s);
     });
 
@@ -278,11 +278,11 @@ TEST_F(ForEachFaninTest, SpillWithWrap) {
     for (int i = 0; i < 4; i++) {
         auto *e = spill_pool.alloc();
         ASSERT_NE(e, nullptr);
-        e->slot_state = &slots[16 + i];
+        e->set(&slots[16 + i], DepKind::RESOURCE);
     }
 
     std::vector<PTO2TaskSlotState *> visited;
-    for_each_fanin_storage(inline_slots, 20, spill_start, spill_pool, [&](PTO2TaskSlotState *s) {
+    for_each_fanin_storage(inline_slots, 20, spill_start, spill_pool, 0, [&](PTO2TaskSlotState *s, DepKind) {
         visited.push_back(s);
     });
 
@@ -310,14 +310,15 @@ TEST_F(ForEachFaninTest, SpillBoolEarlyReturnInSpillRegion) {
     int32_t spill_start = spill_pool.top;
     for (int i = 0; i < 4; i++) {
         auto *e = spill_pool.alloc();
-        e->slot_state = &slots[16 + i];
+        e->set(&slots[16 + i], DepKind::RESOURCE);
     }
 
     int count = 0;
-    bool result = for_each_fanin_storage(inline_slots, 20, spill_start, spill_pool, [&](PTO2TaskSlotState *) -> bool {
-        count++;
-        return count < 17;  // stop on 17th (first spill entry)
-    });
+    bool result =
+        for_each_fanin_storage(inline_slots, 20, spill_start, spill_pool, 0, [&](PTO2TaskSlotState *, DepKind) -> bool {
+            count++;
+            return count < 17;  // stop on 17th (first spill entry)
+        });
 
     EXPECT_FALSE(result);
     EXPECT_EQ(count, 17);

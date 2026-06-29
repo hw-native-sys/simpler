@@ -66,6 +66,40 @@ enum class PTO2ScopeMode : uint8_t {
 };
 
 /**
+ * Dependency edge kind.
+ *
+ * RESOURCE  — "resource dependency": the consumer reads a tensor whose buffer
+ *             was created (allocated) by the producer (Step A creator retention,
+ *             or an explicit dep the user marks as resource). The producer's
+ *             slot + packed heap output must stay alive until the consumer
+ *             completes, so the edge claims a fanout retention reference
+ *             (fanout_count++) that the consumer releases in on_task_release.
+ *
+ * EXECUTION — "pure execution dependency": the consumer only reads a tensor the
+ *             producer modified (Step B tensormap modifier lookup, or an
+ *             explicit dep the user marks as execution-only). The underlying
+ *             buffer was allocated by someone else, so the producer's slot/heap
+ *             need NOT stay alive for the consumer. The edge only carries
+ *             ordering (consumer fanin + producer fanout notification); it does
+ *             NOT claim a retention reference, so the producer can be CONSUMED
+ *             (and its slot/heap reclaimed) as soon as its RESOURCE consumers
+ *             and owning scope release it — without waiting for EXECUTION
+ *             consumers.
+ *
+ * RESOURCE is strictly stronger than EXECUTION: a RESOURCE edge implies both
+ * ordering AND retention, an EXECUTION edge implies only ordering. When the
+ * same producer is reached via both kinds in one submit, RESOURCE must win
+ * (the producer is retained once). compute_task_fanin guarantees this by
+ * emitting all RESOURCE edges (Step A) before all EXECUTION edges (Step B),
+ * and the call site splits explicit deps by kind around it (RESOURCE before,
+ * EXECUTION after) so mark_seen's first-claim dedup always favors RESOURCE.
+ */
+enum class DepKind : uint8_t {
+    RESOURCE = 0,
+    EXECUTION = 1,
+};
+
+/**
  * TaskOutputTensors — returned by submit, holds materialized output Tensors.
  *
  * Only runtime-created outputs are stored here, indexed in add_output order.
@@ -238,6 +272,7 @@ struct Arg : TaskArgsTpl<TensorRef, uint64_t, MaxT, MaxS, TensorArgType> {
 #endif
         explicit_deps_ = nullptr;
         explicit_dep_count_ = 0;
+        explicit_dep_kinds_ = nullptr;
         allow_early_resolve_ = false;
     }
 
@@ -346,6 +381,7 @@ struct Arg : TaskArgsTpl<TensorRef, uint64_t, MaxT, MaxS, TensorArgType> {
         if (count == 0) {
             explicit_deps_ = nullptr;
             explicit_dep_count_ = 0;
+            explicit_dep_kinds_ = nullptr;
             return;
         }
         if (deps == nullptr) {
@@ -358,6 +394,38 @@ struct Arg : TaskArgsTpl<TensorRef, uint64_t, MaxT, MaxS, TensorArgType> {
         }
         explicit_deps_ = deps;
         explicit_dep_count_ = count;
+        // kinds_ left null -> all deps default to DepKind::RESOURCE (backward
+        // compatible: a plain set_dependencies treats every dep as a resource
+        // dependency that retains the producer until the consumer completes).
+        explicit_dep_kinds_ = nullptr;
+    }
+
+    /**
+     * Same as set_dependencies() but also attaches a per-dep DepKind array.
+     * Used by the convenience layer (L0TaskArgsWithDeps) to distinguish
+     * RESOURCE (retention) from EXECUTION (ordering-only) explicit deps. The
+     * kinds array must outlive the submit (same lifetime rule as deps). A null
+     * kinds array with count > 0 is rejected; use set_dependencies() instead
+     * for the all-RESOURCE default.
+     */
+    void set_dependencies_with_kinds(const PTO2TaskId *deps, const DepKind *kinds, uint32_t count) {
+        if (count == 0) {
+            explicit_deps_ = nullptr;
+            explicit_dep_count_ = 0;
+            explicit_dep_kinds_ = nullptr;
+            return;
+        }
+        if (deps == nullptr || kinds == nullptr) {
+            set_error("set_dependencies_with_kinds: deps and kinds must not be null when count > 0");
+            return;
+        }
+        if (explicit_deps_ != nullptr) {
+            set_error("set_dependencies_with_kinds: may be called at most once per Arg");
+            return;
+        }
+        explicit_deps_ = deps;
+        explicit_dep_kinds_ = kinds;
+        explicit_dep_count_ = count;
     }
 
     uint32_t explicit_dep_count() const { return explicit_dep_count_; }
@@ -367,7 +435,19 @@ struct Arg : TaskArgsTpl<TensorRef, uint64_t, MaxT, MaxS, TensorArgType> {
         return explicit_deps_[index];
     }
 
+    /**
+     * Kind of the i-th explicit dep. Returns RESOURCE when no per-dep kinds
+     * array was attached (plain set_dependencies), so existing callers behave
+     * exactly as before.
+     */
+    DepKind explicit_dep_kind(uint32_t index) const {
+        always_assert(index < explicit_dep_count_);
+        return explicit_dep_kinds_ ? explicit_dep_kinds_[index] : DepKind::RESOURCE;
+    }
+
     const PTO2TaskId *explicit_deps_data() const { return explicit_deps_; }
+
+    const DepKind *explicit_dep_kinds_data() const { return explicit_dep_kinds_; }
 
     /**
      * Add scalar values. Types are deduced per argument; each value is
@@ -462,10 +542,13 @@ struct Arg : TaskArgsTpl<TensorRef, uint64_t, MaxT, MaxS, TensorArgType> {
 
 private:
     // Caller-owned dependency array; lifetime must extend through submit.
+    // kinds_ is optional: null means "all RESOURCE" (the set_dependencies
+    // default). Set via set_dependencies_with_kinds() for per-dep kinds.
 #if PTO2_PROFILING
     DumpArgSelection dump_arg_selection_;
 #endif
     const PTO2TaskId *explicit_deps_{nullptr};
+    const DepKind *explicit_dep_kinds_{nullptr};
     uint32_t explicit_dep_count_{0};
 #if PTO2_PROFILING
     template <typename T>

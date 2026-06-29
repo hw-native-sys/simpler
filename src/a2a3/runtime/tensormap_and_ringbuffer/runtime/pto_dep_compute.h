@@ -22,6 +22,23 @@
  *   register_task_outputs  — STEP 4 in submit_task: tensormap.insert for INOUT and
  *                            OUTPUT_EXISTING tensors. No callbacks.
  *
+ * Dependency edge kinds (see DepKind in pto_types.h):
+ *   Step A (creator / owner_task_id) emits DepKind::RESOURCE  — the consumer reads the
+ *       producer's allocated buffer, so the producer must be retained until the consumer
+ *       completes.
+ *   Step B (tensormap modifier lookup) emits DepKind::EXECUTION — the producer only
+ *       modified an already-allocated buffer, so only ordering (not retention) is needed.
+ *
+ * RESOURCE is strictly stronger than EXECUTION. compute_task_fanin runs in TWO passes
+ * (all Step A RESOURCE emits first, then all Step B EXECUTION emits) so that when the
+ * same producer is reached via both a creator edge and a modifier edge in one submit,
+ * the runtime's mark_seen first-claim dedup always favors RESOURCE (retention wins).
+ * The call site splits explicit deps by kind around this call (RESOURCE before,
+ * EXECUTION after) for the same reason. Step A does not read or mutate the tensormap,
+ * so reordering Step A ahead of Step B leaves the tensormap state and the emitted
+ * producer SET identical to the old single-pass; only the edge ORDER changes (which
+ * is irrelevant to fanin/fanout accounting).
+ *
  * STEP 1 (explicit_deps) is intentionally left at the runtime call site because its
  * `last_task_alive` shortcut + unchecked slot lookup is subtly different from the
  * `slot_state->task->task_id == producer` reuse check in STEP 3. Unifying them would
@@ -29,7 +46,7 @@
  * the minor structural overlap. Replay handles STEP 1 with a one-line loop of its own.
  *
  * The Emit callback contract:
- *   bool emit(PTO2TaskId producer);
+ *   bool emit(PTO2TaskId producer, DepKind kind);
  *     - return true to continue (whether or not the producer was actually recorded —
  *       producer-not-alive / dedup-hit / etc. all return true silently)
  *     - return false to signal fatal (e.g. fanin spill overflow); caller bails
@@ -69,10 +86,12 @@ struct DepInputs {
  * Compute fanin for a task being submitted (STEP 3: Step A creator retention +
  * Step B tensormap modifier lookup).
  *
- * For each non-OUTPUT tensor:
- *   - If owner_task_id is valid, emit(owner)
- *   - For INPUT/INOUT (and not manual_dep), tensor_map.lookup(*tensor) and emit
- *     each matching producer. INOUT+COVERED triggers tensor_map.remove_entry(entry).
+ * Two passes (RESOURCE before EXECUTION — see file header):
+ *   Pass 1 (Step A): for every non-OUTPUT tensor with a valid owner_task_id,
+ *       emit(owner, RESOURCE). Step A never reads/mutates the tensormap.
+ *   Pass 2 (Step B): for INPUT/INOUT (not manual_dep), tensor_map.lookup and
+ *       emit(producer, EXECUTION) for each overlapping entry. INOUT+COVERED
+ *       triggers tensor_map.remove_entry(entry).
  *
  * @return true on success (or producer-skipped-silently); false if emit signaled
  *         fatal — caller should propagate (after any fatal bookkeeping done by emit).
@@ -84,35 +103,35 @@ compute_task_fanin(const DepInputs &inputs, PTO2TensorMap &tensor_map, bool in_m
         return true;
     }
 
+    // -------- Pass 1: Step A — creator retention (RESOURCE) --------
     for (int32_t i = 0; i < inputs.tensor_count; i++) {
-        TensorArgType ptype = inputs.arg_types[i];
-        if (ptype == TensorArgType::OUTPUT) {
-            // Runtime-created OUTPUT tensors are not looked up in the TensorMap since
-            // they have no dependencies.
+        if (inputs.arg_types[i] == TensorArgType::OUTPUT) {
+            // Runtime-created OUTPUT tensors have no creator dependency to look up.
             continue;
         }
-
         const Tensor *tensor = &inputs.tensors[i].ref();
-
-        // Step A: creator retention — all existing tensors extend their creator lifetime.
         PTO2TaskId owner = tensor->owner_task_id;
         if (owner.is_valid()) {
-            if (!emit(owner)) {
+            if (!emit(owner, DepKind::RESOURCE)) {
                 return false;
             }
         }
+    }
 
-        // Step B: only INPUT/INOUT need modifier dependency lookup.
+    // -------- Pass 2: Step B — tensormap modifier lookup (EXECUTION) --------
+    for (int32_t i = 0; i < inputs.tensor_count; i++) {
+        TensorArgType ptype = inputs.arg_types[i];
         if (ptype != TensorArgType::INPUT && ptype != TensorArgType::INOUT) {
             continue;
         }
+        const Tensor *tensor = &inputs.tensors[i].ref();
         if (tensor->manual_dep) {
             continue;
         }
 
         bool fatal = false;
         tensor_map.lookup(*tensor, [&](PTO2TensorMapEntry &entry, OverlapStatus overlap_status) -> bool {
-            if (!emit(entry.producer_task_id)) {
+            if (!emit(entry.producer_task_id, DepKind::EXECUTION)) {
                 fatal = true;
                 return false;  // stop iteration
             }

@@ -245,10 +245,16 @@ struct PTO2FaninBuilder {
     uint32_t seen_epoch{0};
     PTO2FaninPool &spill_pool;
     PTO2TaskSlotState *inline_slots[PTO2_FANIN_INLINE_CAP];
+    // bit i == 1 -> inline fanin slot i is a RESOURCE (retention) edge;
+    // bit i == 0 -> EXECUTION (ordering-only) edge. Mirrors
+    // PTO2TaskPayload::fanin_inline_dep_kind_mask, copied into it at submit.
+    uint64_t inline_kind_mask{0};
 
     template <typename Fn>
     PTO2FaninForEachReturn<Fn> for_each(Fn &&fn) const {
-        return for_each_fanin_storage(inline_slots, count, spill_start, spill_pool, static_cast<Fn &&>(fn));
+        return for_each_fanin_storage(
+            inline_slots, count, spill_start, spill_pool, inline_kind_mask, static_cast<Fn &&>(fn)
+        );
     }
 
     bool mark_seen(uint8_t prod_ring, int32_t prod_slot) {
@@ -267,27 +273,29 @@ struct PTO2FaninBuilder {
 
 static bool append_fanin_or_fail(
     PTO2OrchestratorState *orch, uint8_t prod_ring, int32_t prod_slot, PTO2TaskSlotState *prod_state,
-    PTO2TaskId producer_task_id, PTO2FaninBuilder *fanin_builder, uint8_t ring_id
+    PTO2TaskId producer_task_id, PTO2FaninBuilder *fanin_builder, uint8_t ring_id, DepKind kind
 ) {
     // Decide-and-claim under the producer's fanout_lock. Two conditions make this
     // resolved slot a non-dependency, and both must be checked together with the
-    // fanout_count++ so the producer cannot slip from live to consumed/reused in
-    // between:
+    // (RESOURCE-only) fanout_count++ so the producer cannot slip from live to
+    // consumed/reused in between:
     //   (1) Generation mismatch — the producer was CONSUMED, its slot
     //       reset_for_reuse'd and rebound to a newer task. The cached
     //       owner_task_id still resolves to this slot, but it no longer holds our
     //       producer; ++'ing it would corrupt an unrelated task.
     //   (2) Already CONSUMED in place — finished, output ready, no real edge.
-    // In either case, adding it to the fanin and bumping fanout_count would leave
-    // a stale ++/release pair (wire_task drops the fanout edge but keeps the fanin
-    // slot, so on_task_release still release_producer()'s it) that desyncs the
-    // slot's refcount (rc != fc) and wedges in-order reclaim. Claiming a live
-    // producer under the lock pins it: fanout_count now counts us, so it cannot
-    // reach CONSUMED (rc == fc) until we release it in on_task_release, keeping the
-    // slot's generation stable until then. check_and_handle_consumed flips
-    // COMPLETED->CONSUMED under the same lock, so the check and the ++ are atomic
-    // against the consume. fanout_count is lock-protected per the
-    // PTO2TaskSlotState contract.
+    // In either case, adding it to the fanin and (for RESOURCE) bumping
+    // fanout_count would leave a stale ++/release pair that desyncs the slot's
+    // refcount (rc != fc) and wedges in-order reclaim. Claiming a live producer
+    // under the lock pins it (RESOURCE only): fanout_count now counts us, so it
+    // cannot reach CONSUMED (rc == fc) until we release it in on_task_release,
+    // keeping the slot's generation stable until then. EXECUTION edges do NOT
+    // bump fanout_count — the producer may be CONSUMED without this consumer
+    // releasing it, which is correct because this consumer does not read the
+    // producer's packed output buffer (only a shared buffer the producer modified).
+    // check_and_handle_consumed flips COMPLETED->CONSUMED under the same lock, so
+    // the check and the ++ are atomic against the consume. fanout_count is
+    // lock-protected per the PTO2TaskSlotState contract.
     //
     // Dedup (mark_seen) happens HERE, gated on a live producer — NOT before the
     // gone check. mark_seen keys only on (ring, slot); a stale owner that resolves
@@ -296,6 +304,32 @@ static bool append_fanin_or_fail(
     // without claiming it (dropped edge). Marking only when !gone keeps the dedup
     // keyed to the live producer, and doing it before the ++ still suppresses a
     // double-count for a producer named twice in one submission.
+    //
+    // BOTH RESOURCE and EXECUTION edges fanout_count++ here. The ++ pins the
+    // producer's slot so it cannot be CONSUMED + reset_for_reuse between this
+    // submit and the consumer's wire_task — without it, wire_task (which has no
+    // generation check) could read a reused slot and prepend the consumer to the
+    // WRONG task's fanout_head (cross-scope race). The difference between the two
+    // kinds is only WHO releases this pin:
+    //   RESOURCE  -> released by the consumer's on_task_release (late: the
+    //                producer stays alive until the consumer finishes, because the
+    //                consumer reads the producer's allocated buffer).
+    //   EXECUTION -> released by wire_task right after wiring (early: the
+    //                consumer only reads a shared buffer the producer modified, so
+    //                the producer's slot/heap are not needed once the consumer is
+    //                wired and will be notified at the producer's completion).
+    // Thus an EXECUTION producer is retained only for the submit->wire window
+    // (one scheduler drain), not for the consumer's whole lifetime — the
+    // consume-timing win — while the pin eliminates the reuse race.
+    //
+    // Kind ordering: the call site emits all RESOURCE edges (explicit-RESOURCE +
+    // Step A) before all EXECUTION edges (Step B + explicit-EXECUTION), so when
+    // the same producer is reached via both kinds, the RESOURCE claim lands first
+    // and the later EXECUTION emit is deduped (mark_seen true -> claim false).
+    // Thus a producer that is BOTH a creator (RESOURCE) and a modifier (EXECUTION)
+    // of tensors read by this consumer is retained once via the RESOURCE edge
+    // (released late) — the EXECUTION edge is correctly subsumed (RESOURCE is
+    // strictly stronger: late release ⊇ early release).
     prod_state->lock_fanout();
     bool gone = prod_state->task == nullptr || prod_state->task->task_id.local() != producer_task_id.local() ||
                 prod_state->task_state.load(std::memory_order_acquire) == PTO2_TASK_CONSUMED;
@@ -322,6 +356,9 @@ static bool append_fanin_or_fail(
     }
 
     if (fanin_builder->count < PTO2_FANIN_INLINE_CAP) {
+        if (kind == DepKind::RESOURCE) {
+            fanin_builder->inline_kind_mask |= (1ULL << fanin_builder->count);
+        }
         fanin_builder->inline_slots[fanin_builder->count++] = prod_state;
         return true;
     }
@@ -340,7 +377,7 @@ static bool append_fanin_or_fail(
     if (fanin_builder->count == PTO2_FANIN_INLINE_CAP) {
         fanin_builder->spill_start = spill_idx;
     }
-    entry->slot_state = prod_state;
+    entry->set(prod_state, kind);
     fanin_builder->count++;
     return true;
 }
@@ -746,46 +783,70 @@ static TaskOutputTensors submit_task_common(
 
     CYCLE_COUNT_LAP(g_orch_sync_cycle);
 
-    for (uint32_t i = 0; i < args.explicit_dep_count(); i++) {
+    // === STEP 1a: explicit RESOURCE dependencies ===
+    // Processed BEFORE STEP 3 so that, when the same producer is named both
+    // explicitly (RESOURCE) and via an auto Step-A creator edge, the explicit
+    // RESOURCE claim lands first and the auto edge dedups against it (RESOURCE
+    // wins). Explicit EXECUTION deps are deferred to STEP 1b (after STEP 3) for
+    // the symmetric reason: an auto Step-A RESOURCE edge must win over a user
+    // explicit-EXECUTION edge to the same producer (the runtime knows the
+    // producer's buffer is read, so retention is required regardless of the
+    // user's label).
+    auto process_explicit_dep = [&](uint32_t i) -> bool {
         PTO2TaskId dep_task_id = args.explicit_dep(i);
         if (!dep_task_id.is_valid()) {
             orch->report_fatal(
                 PTO2_ERROR_INVALID_ARGS, __FUNCTION__, "Arg.set_dependencies(...) requires valid task ids"
             );
-            return result;
+            return false;
         }
         uint8_t dep_ring_id = dep_task_id.ring();
         PTO2SharedMemoryRingHeader &dep_ring = orch->sm_header->rings[dep_ring_id];
         int32_t dep_local_task_id = static_cast<int32_t>(dep_task_id.local());
         int32_t dep_last_task_alive = dep_ring.fc.last_task_alive.load(std::memory_order_acquire);
         if (dep_local_task_id < dep_last_task_alive) {
-            continue;
+            return true;  // producer already retired — no edge
         }
         int32_t dep_slot = dep_ring.get_slot_by_task_id(dep_local_task_id);
         PTO2TaskSlotState *producer_slot_state = &dep_ring.get_slot_state_by_slot(dep_slot);
-        if (!append_fanin_or_fail(
-                orch, dep_ring_id, dep_slot, producer_slot_state, dep_task_id, &fanin_builder, ring_id
-            )) {
-            return result;
+        return append_fanin_or_fail(
+            orch, dep_ring_id, dep_slot, producer_slot_state, dep_task_id, &fanin_builder, ring_id,
+            args.explicit_dep_kind(i)
+        );
+    };
+    for (uint32_t i = 0; i < args.explicit_dep_count(); i++) {
+        if (args.explicit_dep_kind(i) == DepKind::RESOURCE) {
+            if (!process_explicit_dep(i)) {
+                return result;
+            }
         }
     }
 
-    // === STEP 3: Lookup inputs (creator retention + tensormap modifier lookup) ===
+    // === STEP 3: Lookup inputs (creator retention RESOURCE + tensormap modifier EXECUTION) ===
     DepInputs dep_inputs{
         args.tensor_count(),       args.tensor_data(), args.tag_data(), static_cast<int32_t>(args.explicit_dep_count()),
         args.explicit_deps_data(),
     };
 
-    auto runtime_emit = [&](PTO2TaskId producer_task_id) -> bool {
+    auto runtime_emit = [&](PTO2TaskId producer_task_id, DepKind kind) -> bool {
         uint8_t prod_ring = producer_task_id.ring();
         PTO2SharedMemoryRingHeader &producer_ring = orch->sm_header->rings[prod_ring];
         int32_t prod_slot = producer_ring.get_slot_by_task_id(static_cast<int32_t>(producer_task_id.local()));
         PTO2TaskSlotState *prod_state = &producer_ring.get_slot_state_by_slot(prod_slot);
-        return append_fanin_or_fail(orch, prod_ring, prod_slot, prod_state, producer_task_id, &fanin_builder, ring_id);
+        return append_fanin_or_fail(orch, prod_ring, prod_slot, prod_state, producer_task_id, &fanin_builder, ring_id, kind);
     };
 
     if (!compute_task_fanin(dep_inputs, orch->tensor_map, orch->in_manual_scope(), runtime_emit)) {
         return result;
+    }
+
+    // === STEP 1b: explicit EXECUTION dependencies (after STEP 3) ===
+    for (uint32_t i = 0; i < args.explicit_dep_count(); i++) {
+        if (args.explicit_dep_kind(i) == DepKind::EXECUTION) {
+            if (!process_explicit_dep(i)) {
+                return result;
+            }
+        }
     }
 
     CYCLE_COUNT_LAP(g_orch_lookup_cycle);
@@ -824,6 +885,7 @@ static TaskOutputTensors submit_task_common(
     payload.fanin_actual_count = fanin_builder.count;
     payload.fanin_spill_start = fanin_builder.spill_start;
     payload.fanin_spill_pool = &fanin_builder.spill_pool;
+    payload.fanin_inline_dep_kind_mask = fanin_builder.inline_kind_mask;
     for (int i = 0; i < inline_count; i++) {
         payload.fanin_inline_slot_states[i] = fanin_builder.inline_slots[i];
     }
@@ -1044,6 +1106,7 @@ TaskOutputTensors PTO2OrchestratorState::alloc_tensors(const L0TaskArgs &args) {
     payload.fanin_actual_count = 0;
     payload.fanin_spill_start = 0;
     payload.fanin_spill_pool = &orch->rings[prepared.task_id.ring()].fanin_pool;
+    payload.fanin_inline_dep_kind_mask = 0;
     CYCLE_COUNT_LAP(g_orch_args_cycle);
 
     if (prepared.slot_state != nullptr) {
