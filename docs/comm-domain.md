@@ -148,7 +148,85 @@ with orch.allocate_domain(...) as handle:
 
 ---
 
-## 6. Examples
+## 6. Host tensor visibility for `worker.run`
+
+A host tensor passed to `worker.run(...)` / `orch.submit_next_level(...)` is
+ultimately dereferenced from the forked chip child, not the parent, so its
+memory must be reachable there. Zero-copy requires born-shared memory (a virtual
+address is not portable across the fork, so the child can only reach the same
+physical pages via a MAP_SHARED backing established at allocation time), which is
+why the buffer is worker-allocated rather than a user tensor. Two sources are
+legal:
+
+| Source | How | Why it works |
+| ------ | --- | ------------ |
+| **fork-inherited** | `tensor.share_memory_()` **before the chip children are forked** (i.e. before the first `Worker.run()`) | the child inherits the MAP_SHARED page at fork |
+| **worker-allocated post-fork** | `worker.create_host_buffer(nbytes)` after the chips exist | born-shared memory attached into every child, **zero-copy** |
+
+The chip children are forked lazily on the **first** `run()`. A host tensor
+created after that — the natural dynamic-shape serving pattern — is invisible to
+the children unless it lives in a `create_host_buffer` buffer:
+
+```python
+worker = Worker(level=3, ...); worker.register(chip); worker.init()
+worker.run(orch0, ...)                          # forks the chips
+
+buf_h = worker.create_host_buffer(tokens * hidden_size * 4)   # born-shared, post-fork
+buf_o = worker.create_host_buffer(batch * vocab * 4)
+try:
+    hidden = torch.frombuffer(buf_h.buffer, dtype=torch.float32).view(tokens, hidden_size)
+    out    = torch.frombuffer(buf_o.buffer, dtype=torch.float32).view(batch, vocab)
+    for step in batches:
+        fill(hidden); worker.run(orch, ...)     # no per-run copy — child reads/writes the same pages
+        use(out)
+    del hidden, out                             # drop views before free
+finally:
+    worker.free_host_buffer(buf_h)
+    worker.free_host_buffer(buf_o)
+```
+
+**Create once, reuse many runs.** `create_host_buffer` maps a shm into each
+child and keeps it mapped; the child reads and writes the same physical pages
+the parent sees, so there is **no per-run copy**. Build the tensor over
+`buf.buffer` (buffer protocol — `torch.frombuffer` / `np.frombuffer`) once and
+reuse it; a sub-view (slice) that fits inside the buffer is resolved
+automatically. simpler stays framework-free — torch/numpy appear only on the
+caller's side.
+
+**Unregistered post-fork tensors are forwarded unvalidated.** A tensor that is
+neither fork-inherited nor from `create_host_buffer` is passed through as-is:
+the fork-inherited case is the common legitimate one, so it must keep working.
+An anonymous post-fork tensor forwarded this way reads stale/unmapped memory in
+the child — allocate it with `create_host_buffer` instead.
+
+### Contract / limits
+
+- **Zero-copy is a live shared medium.** The buffer's pages are shared with the
+  child; during a `run` the child is reading/writing them, so the parent must
+  not read or write the buffer until `run` returns (same contract as a
+  fork-inherited `.share_memory_()` tensor). In-run cross-task ordering (a
+  producer task's output read by a consumer task) is still enforced by the
+  runtime's OverlapMap, keyed on the host address — no host-side copy involved.
+- **Shape varies within `nbytes`.** A tensor built over the buffer may take any
+  shape whose bytes fit; a view that runs past the buffer raises before dispatch
+  (`overruns its host buffer`). To grow beyond `nbytes`, free and re-create a
+  larger buffer. Do not free a buffer while a `run` using it is in flight, and
+  drop every tensor/`memoryview` over `buffer.buffer` before `free_host_buffer`
+  (or `close()`) so the shm can be released promptly.
+- **`orch.copy_to` is the unmanaged low-level path.** `create_host_buffer`
+  covers the `run` / `submit_next_level` host-tensor args. The explicit
+  `orch.copy_to(src=tensor.data_ptr())` staging path (§5) is *not* validated —
+  its `src` must be fork-inherited (`.share_memory_()` before the first `run()`)
+  or a `create_host_buffer` buffer.
+- **Fork-inherited anonymous memory is copy-on-write, hence stale.** Even a
+  tensor the child legitimately inherited is only useful as a *live* input if it
+  is MAP_SHARED: anonymous (non-`share_memory_`) pages are COW, so writes the
+  parent makes *after* fork do not reach the child. A live input must be
+  file-backed (`.share_memory_()` before `init()`) or a `create_host_buffer` one.
+
+---
+
+## 7. Examples
 
 - `examples/workers/l3/allreduce_distributed/` — single domain, PTO-ISA remote
   reads over the window.

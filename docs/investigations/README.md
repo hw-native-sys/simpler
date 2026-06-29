@@ -84,6 +84,7 @@ that ...".
 
 Newest first.
 
+- [2026-07 — Post-fork zero-copy host buffers are per-run performance-neutral](2026-07-post-fork-zerocopy-per-run-neutral.md) — `create_host_buffer` only removes a host-side visibility copy; the per-run device H2D is registration-agnostic, so don't expect/claim a per-run speedup
 - [2026-06 — Gating the two residual profiling enable() calls on the orch/scheduler hot path](2026-06-orch-profiling-enable-gates-hot-path.md) — gated under existing `PTO2_PROFILING`; magnitude unmeasured, no new macro
 - [2026-06 — Replacing COND with GM+dcci for AICore→AICPU notification](2026-06-cond-vs-gm-notification.md)
 - [2026-06 — Letting AICore directly read or write the SPR MMIO window](2026-06-aicore-mmio-to-spr.md)
