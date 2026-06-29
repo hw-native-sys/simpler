@@ -142,3 +142,36 @@ TEST_F(OrchestratorFaninTest, SubmitPathHeapDeadlockLogReportsRingAndRealHeapSta
     EXPECT_NE(log.find("available=1024"), std::string::npos);
     EXPECT_EQ(log.find("PTO2_RING_HEAP=<pow2>"), std::string::npos);
 }
+
+// Regression for issue #1188: scope_tasks_cap must equal the real in-flight budget
+// (sum of the runtime per-ring windows), not the compile-time PTO2_SCOPE_TASKS_CAP.
+// reserve_layout only computes offsets, so no commit()/backing is needed here.
+TEST(OrchestratorLayoutScopeTasksCap, FollowsRuntimeWindowSum) {
+    auto cap_for = [](const int32_t windows[PTO2_MAX_RING_DEPTH]) {
+        DeviceArena arena;
+        int32_t cap = PTO2OrchestratorState::reserve_layout(arena, windows).scope_tasks_cap;
+        arena.release();
+        return cap;
+    };
+
+    int32_t windows[PTO2_MAX_RING_DEPTH];
+
+    // Default window: cap == the old compile-time value (no behavior change).
+    for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++)
+        windows[r] = PTO2_TASK_WINDOW_SIZE;
+    EXPECT_EQ(cap_for(windows), PTO2_TASK_WINDOW_SIZE * PTO2_MAX_RING_DEPTH);
+    EXPECT_EQ(cap_for(windows), PTO2_SCOPE_TASKS_CAP);
+
+    // Shrunk window: cap shrinks to the real budget (no over-allocation).
+    for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++)
+        windows[r] = 4;
+    EXPECT_EQ(cap_for(windows), 4 * PTO2_MAX_RING_DEPTH);
+
+    // Enlarged window past the compile default: cap grows to match the rings, so a
+    // large scope no longer hits a premature SCOPE_TASKS_OVERFLOW (the bug fixed).
+    const int32_t big = PTO2_TASK_WINDOW_SIZE * 2;
+    for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++)
+        windows[r] = big;
+    EXPECT_EQ(cap_for(windows), big * PTO2_MAX_RING_DEPTH);
+    EXPECT_GT(cap_for(windows), PTO2_SCOPE_TASKS_CAP);
+}

@@ -471,10 +471,10 @@ static bool prepare_task(
 static void scope_tasks_push(PTO2OrchestratorState *orch, PTO2TaskSlotState *task_slot_state) {
     if (orch->scope_tasks_size >= orch->scope_tasks_capacity) {
         // scope_tasks lives in the per-Worker arena (single backing allocation),
-        // so realloc is not legal. Capacity == PTO2_SCOPE_TASKS_CAP ==
-        // PTO2_TASK_WINDOW_SIZE × PTO2_MAX_RING_DEPTH, the total in-flight slot
-        // budget — hitting it means every ring is saturated, so no further push
-        // could succeed regardless of buffer growth.
+        // so realloc is not legal. Capacity is the total in-flight slot budget
+        // (sum of the per-ring task windows; see reserve_layout) — hitting it means
+        // every ring is saturated, so no further push could succeed regardless of
+        // buffer growth.
         orch->report_fatal(
             PTO2_ERROR_SCOPE_TASKS_OVERFLOW, __FUNCTION__,
             "scope_tasks buffer saturated at %d entries (all rings full)", orch->scope_tasks_capacity
