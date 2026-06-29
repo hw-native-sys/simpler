@@ -38,11 +38,11 @@ set(SIMPLER_PTO_CLONE_PROTOCOL "ssh" CACHE STRING
 
 # Override the pto-isa revision used when `build_runtimes.py` builds the
 # onboard a2a3 host runtime (which compiles the pto-isa SDMA headers into
-# host_runtime.so). Empty (default) preserves the original behavior and uses
-# the current checkout HEAD. Override at `pip install` time via
+# host_runtime.so). Empty (default) uses pto_isa.pin. Use latest/head/none to
+# explicitly track origin/HEAD. Override at `pip install` time via
 #   pip install --config-settings=cmake.define.SIMPLER_PTO_ISA_COMMIT=<sha> .
 set(SIMPLER_PTO_ISA_COMMIT "" CACHE STRING
-    "Override pto-isa commit for onboard a2a3 host build (empty/latest = HEAD)")
+    "Override pto-isa commit for onboard a2a3 host build (empty = pto_isa.pin; latest/head/none = HEAD)")
 
 # Compiler sanitizer for host-compiled targets (sim runtime/kernels and the
 # onboard host runtime). Default `none`. Preset (asan/ubsan/tsan) or a raw
@@ -52,7 +52,7 @@ set(SIMPLER_SANITIZER "none" CACHE STRING
     "Sanitizer for host targets during install (none/asan/ubsan/tsan)")
 
 # Pass --pto-isa-commit only when explicitly overridden; an empty cache var
-# leaves the flag off so build_runtimes uses the current checkout HEAD.
+# leaves the flag off so build_runtimes uses pto_isa.pin by default.
 if(NOT SIMPLER_PTO_ISA_COMMIT STREQUAL "")
     set(_pto_isa_commit_arg --pto-isa-commit "${SIMPLER_PTO_ISA_COMMIT}")
 endif()
@@ -75,4 +75,8 @@ if(SKBUILD_MODE)
     install(DIRECTORY ${CMAKE_SOURCE_DIR}/build/lib/
             DESTINATION simpler_setup/_assets/build/lib
             OPTIONAL)
+    if(EXISTS "${CMAKE_SOURCE_DIR}/pto_isa.pin")
+        install(FILES ${CMAKE_SOURCE_DIR}/pto_isa.pin
+                DESTINATION simpler_setup/_assets)
+    endif()
 endif()

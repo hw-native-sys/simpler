@@ -14,7 +14,10 @@ at compile time), `SceneTestCase.run_module` (pin via `-c`).
 
 Resolution order for ensure_pto_isa_root():
   1. PTO_ISA_ROOT environment variable (if set and points to a directory)
-  2. PROJECT_ROOT / build / pto-isa (auto-clone if missing)
+  2. Explicit commit argument / SIMPLER_PTO_ISA_COMMIT
+  3. PROJECT_ROOT / pto_isa.pin
+  4. PROJECT_ROOT / build / pto-isa at origin/HEAD when explicitly unpinned
+     or when the pin is missing
 
 Lock file under build/ serializes concurrent clones from parallel processes.
 """
@@ -23,6 +26,7 @@ import fcntl
 import json
 import logging
 import os
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -35,17 +39,46 @@ logger = logging.getLogger(__name__)
 _PTO_ISA_HTTPS = "https://github.com/hw-native-sys/pto-isa.git"
 _PTO_ISA_SSH = "git@github.com:hw-native-sys/pto-isa.git"
 _UNPINNED_COMMIT_VALUES = {"", "head", "latest", "none"}
+_PTO_ISA_PIN_RE = re.compile(r"^[0-9a-fA-F]{40}$")
+PTO_ISA_PIN_FILE = "pto_isa.pin"
 PTO_ISA_BUILD_METADATA = "pto_isa_build.json"
 _RUN_PTO_ISA_COMMIT_ENV = "SIMPLER_RUN_PTO_ISA_COMMIT"
 _RUN_PTO_ISA_ROOT_ENV = "SIMPLER_RUN_PTO_ISA_ROOT"
 
 
+def read_pto_isa_pin(pin_path: Optional[Path] = None) -> Optional[str]:
+    """Read the repository PTO-ISA pin, returning None only when absent/empty."""
+    path = pin_path or (PROJECT_ROOT / PTO_ISA_PIN_FILE)
+    try:
+        value = path.read_text().strip()
+    except FileNotFoundError:
+        logger.warning(
+            "pto_isa.pin not found at %s; falling back to latest pto-isa (origin/HEAD). "
+            "Local build may diverge from CI.",
+            path,
+        )
+        return None
+    except OSError as e:
+        raise RuntimeError(f"Failed to read PTO-ISA pin at {path}: {e}") from e
+
+    if not value:
+        logger.warning(
+            "pto_isa.pin at %s is empty; falling back to latest pto-isa (origin/HEAD). "
+            "Local build may diverge from CI.",
+            path,
+        )
+        return None
+    if not _PTO_ISA_PIN_RE.fullmatch(value):
+        raise RuntimeError(f"Invalid PTO-ISA pin at {path}: expected a 40-character hex SHA, got {value!r}")
+    return value
+
+
 def resolve_pto_isa_commit(commit: Optional[str] = None) -> Optional[str]:
     """Resolve the pto-isa revision requested for managed clones.
 
-    Explicit CLI/API values, or SIMPLER_PTO_ISA_COMMIT, request a concrete
-    revision. When no revision is requested, keep the original behavior and use
-    the current checkout HEAD. "latest", "head", or "none" also opt into HEAD.
+    Explicit CLI/API values win over SIMPLER_PTO_ISA_COMMIT. When neither is
+    provided, use pto_isa.pin. "latest", "head", "none", and an explicit empty
+    Python/API or environment value opt into the current remote HEAD behavior.
     """
     requested = commit if commit is not None else os.environ.get("SIMPLER_PTO_ISA_COMMIT")
     if requested is not None:
@@ -53,13 +86,13 @@ def resolve_pto_isa_commit(commit: Optional[str] = None) -> Optional[str]:
         if value.lower() in _UNPINNED_COMMIT_VALUES:
             return None
         return value
-    return None
+    return read_pto_isa_pin()
 
 
 def get_pto_isa_head(pto_isa_root: str) -> str:
     """Return the full git HEAD SHA for a PTO-ISA checkout, or empty if unknown."""
     try:
-        result = _run_git(["rev-parse", "HEAD"], cwd=Path(pto_isa_root), timeout=5)
+        result = _run_git_resilient(["rev-parse", "HEAD"], cwd=Path(pto_isa_root), timeout=5)
         return result.stdout.strip() if result.returncode == 0 else ""
     except Exception:  # noqa: BLE001
         return ""
@@ -223,6 +256,34 @@ def _run_git(
     )
 
 
+def _is_dubious_ownership_error(stderr: str) -> bool:
+    return "detected dubious ownership" in stderr and "safe.directory" in stderr
+
+
+def _run_git_with_safe_directory(
+    args: list, cwd: Path, timeout: int = 30, check: bool = False
+) -> subprocess.CompletedProcess:
+    return _run_git(["-c", f"safe.directory={cwd.resolve()}", *args], cwd=cwd, timeout=timeout, check=check)
+
+
+def _run_git_resilient(
+    args: list,
+    cwd: Path,
+    timeout: int = 30,
+    check: bool = False,
+    verbose: bool = False,
+) -> subprocess.CompletedProcess:
+    """Run git, retrying dubious-ownership failures with a per-command safe.directory."""
+    result = _run_git(args, cwd=cwd, timeout=timeout, check=False)
+    if result.returncode != 0 and _is_dubious_ownership_error(result.stderr):
+        if verbose:
+            logger.info(f"Using pto-isa safe.directory for {cwd}")
+        result = _run_git_with_safe_directory(args, cwd=cwd, timeout=timeout, check=False)
+    if check and result.returncode != 0:
+        raise subprocess.CalledProcessError(result.returncode, ["git", *args], result.stdout, result.stderr)
+    return result
+
+
 def _discard_incomplete_clone(target: Path, verbose: bool) -> None:
     """Remove `target` if it exists but isn't a usable clone.
 
@@ -299,20 +360,26 @@ def _clone(target: Path, commit: Optional[str], clone_protocol: str, verbose: bo
         return False
 
 
-def checkout_pto_isa_commit(clone_path: Path, commit: str, verbose: bool = False) -> None:
-    """Switch an existing clone to `commit` if it isn't already there (idempotent)."""
+def checkout_pto_isa_commit(clone_path: Path, commit: str, verbose: bool = False) -> bool:
+    """Switch an existing clone to `commit` if needed. Return False on failure."""
     try:
-        result = _run_git(["rev-parse", "--short", "HEAD"], cwd=clone_path, timeout=5)
-        current = result.stdout.strip() if result.returncode == 0 else ""
+        result = _run_git_resilient(["rev-parse", "--short", "HEAD"], cwd=clone_path, timeout=5, verbose=verbose)
+        if result.returncode != 0:
+            logger.warning(f"Failed to read pto-isa HEAD before checking out {commit}: {result.stderr}")
+            return False
+        current = result.stdout.strip()
         if current and not commit.startswith(current) and not current.startswith(commit):
             if verbose:
                 logger.info(f"pto-isa at {current}, checking out {commit}...")
-            _run_git(["fetch", "origin"], cwd=clone_path, timeout=120, check=True)
-            _run_git(["checkout", commit], cwd=clone_path, timeout=30, check=True)
+            _run_git_resilient(["fetch", "origin"], cwd=clone_path, timeout=120, check=True, verbose=verbose)
+            _run_git_resilient(["checkout", commit], cwd=clone_path, timeout=30, check=True, verbose=verbose)
+        return True
     except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
         logger.warning(f"Failed to checkout pto-isa commit {commit}: {e.stderr if hasattr(e, 'stderr') else e}")
+        return False
     except Exception as e:  # noqa: BLE001
         logger.warning(f"Unexpected error checking out pto-isa commit {commit}: {e}")
+        return False
 
 
 def _update_to_latest(clone_path: Path, verbose: bool) -> None:
@@ -320,8 +387,8 @@ def _update_to_latest(clone_path: Path, verbose: bool) -> None:
     try:
         if verbose:
             logger.info("Updating pto-isa to latest...")
-        _run_git(["fetch", "origin"], cwd=clone_path, timeout=120, check=True)
-        _run_git(["reset", "--hard", "origin/HEAD"], cwd=clone_path, timeout=30, check=True)
+        _run_git_resilient(["fetch", "origin"], cwd=clone_path, timeout=120, check=True, verbose=verbose)
+        _run_git_resilient(["reset", "--hard", "origin/HEAD"], cwd=clone_path, timeout=30, check=True, verbose=verbose)
     except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
         logger.warning(f"Failed to update pto-isa to latest: {e.stderr if hasattr(e, 'stderr') else e}")
     except Exception as e:  # noqa: BLE001
@@ -339,12 +406,11 @@ def ensure_pto_isa_root(
     Args:
         commit: if provided, check out this revision after clone/in existing clone.
         clone_protocol: "ssh" (default) or "https".
-        update_if_exists: when `commit` is None and a clone already exists,
-            fetch origin and reset to origin/HEAD. Conftest passes True to
-            guarantee the local clone isn't stale (in particular, to ensure
-            any later `-c <commit>` request resolves to a real commit rather
-            than a missing object in an old clone). Lazy callers pass False
-            to avoid redundant network traffic since conftest already ran.
+        update_if_exists: when the resolved commit is None and a clone already
+            exists, fetch origin and reset to origin/HEAD. Conftest passes True
+            so explicit latest/head/none runs are refreshed up front. Lazy
+            callers pass False to avoid redundant network traffic since
+            conftest already ran.
         verbose: log progress via `logger.info` / `logger.warning`.
 
     Raises:
@@ -397,12 +463,13 @@ def _ensure_locked(
                 return None
             if verbose:
                 logger.info("pto-isa already cloned by another process")
-            if commit:
-                checkout_pto_isa_commit(clone_path, commit, verbose=verbose)
+            if commit and not checkout_pto_isa_commit(clone_path, commit, verbose=verbose):
+                return None
             elif update_if_exists:
                 _update_to_latest(clone_path, verbose=verbose)
     elif commit:
-        checkout_pto_isa_commit(clone_path, commit, verbose=verbose)
+        if not checkout_pto_isa_commit(clone_path, commit, verbose=verbose):
+            return None
     elif update_if_exists:
         _update_to_latest(clone_path, verbose=verbose)
 

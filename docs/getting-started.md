@@ -77,13 +77,23 @@ It follows this order:
 
 1. If `PTO_ISA_ROOT` points to an existing directory, that directory wins.
    `simpler` treats it as user-managed and uses it as-is.
-2. If `PTO_ISA_ROOT` is not set, `simpler` uses the managed checkout at
-   `build/pto-isa`, cloning it on first use if necessary.
-3. If a concrete commit is requested and the managed checkout is being used,
-   `simpler` checks out that commit.
-4. If no commit is requested, or the requested value is `latest`, `head`, or
-   `none`, `simpler` keeps the existing HEAD/latest behavior and uses the
-   checkout's current HEAD.
+2. If the managed checkout is being used and `--pto-isa-commit` or the CMake
+   `SIMPLER_PTO_ISA_COMMIT` define supplies a value, that value wins.
+3. If no CLI/CMake value is supplied and `SIMPLER_PTO_ISA_COMMIT` is set in
+   the environment, that environment value wins.
+4. If no explicit value is requested, `simpler` checks out the commit recorded
+   in `pto_isa.pin`.
+5. If `pto_isa.pin` is missing, `simpler` warns and falls back to the latest
+   `origin/HEAD` behavior for downstream checkout compatibility.
+
+For explicit values in steps 2 and 3, a concrete SHA/tag/ref checks out that
+revision. The values `latest`, `head`, and `none` are explicit opt-outs from
+the pin and use `origin/HEAD`. For the CMake cache variable, the empty string is
+the default value and means "use `pto_isa.pin`"; use `latest`, `head`, or `none`
+for an explicit CMake opt-out.
+
+When the managed checkout is selected, `simpler` uses `build/pto-isa`, cloning
+it on first use if necessary.
 
 This is only the checkout selection order. The compatibility check later uses a
 separate commit lookup order so it can compare the installed runtime's recorded
@@ -115,9 +125,10 @@ python path/to/scene_test.py --platform a2a3 --pto-isa-commit "$PTO_ISA_COMMIT"
 ```
 
 `SIMPLER_PTO_ISA_COMMIT="$PTO_ISA_COMMIT"` can also provide the concrete commit
-when the CLI option is omitted. Leaving both unset preserves the current
-checkout HEAD behavior. For reproducible a2a3 onboard runs, prefer passing the
-same concrete commit at install time and run time.
+when the CLI option is omitted. Leaving both unset uses `pto_isa.pin`, so a
+plain local install and test run match the repository pin. To explicitly track
+the remote default branch instead, pass `--pto-isa-commit latest` or set
+`SIMPLER_PTO_ISA_COMMIT=latest`.
 
 For a2a3 onboard runtimes, `pip install` records the actual PTO-ISA git HEAD
 used to build `host_runtime.so` in `build/lib/pto_isa_build.json`. The recorded
@@ -135,8 +146,9 @@ comparison:
    HEAD.
 2. `PTO_ISA_ROOT`'s current git HEAD, when `PTO_ISA_ROOT` points to a git
    checkout and the recorded run-time commit is unavailable.
-3. A concrete `SIMPLER_PTO_ISA_COMMIT` value, as a fallback for cases where no
-   git checkout commit can be read.
+3. The resolved concrete request from `SIMPLER_PTO_ISA_COMMIT` or `pto_isa.pin`,
+   as a fallback for cases where no git checkout commit can be read. Explicit
+   `latest`/`head`/`none` without a readable git checkout remains unverifiable.
 
 If the build commit and run-time commit differ, `simpler` fails early on the
 host side before loading the runtime binary. The error reports both commits and
