@@ -824,6 +824,19 @@ int DeviceRunnerBase::finalize_common() {
         if (err != 0 && rc == 0) rc = err;
     };
 
+    // Teardown invariant: finalize_common() is the single place that releases
+    // every RTS/device-owning resource, and the subclass runs it BEFORE its
+    // device reset / aclFinalize. Several base-class members have destructors
+    // that themselves call an RTS API -- LoadAicpuOp::~ -> rtsBinaryUnload,
+    // MemoryAllocator::~ -> finalize -> rtFree, DeviceArena::~ -> release ->
+    // rtFree. A member destructor runs (per C++ rules) only AFTER finalize()
+    // returns, i.e. AFTER aclFinalize has torn down the RTS context, and
+    // touching an RTS interface on a dead context segfaults on a5 (a2a3 happens
+    // to tolerate it). So each such member is released explicitly here while RTS
+    // is live; every release is idempotent (guarded on a handle / committed_ /
+    // raw_base_ flag) so the eventual destructor no-ops. Any new member owning
+    // an RTS/device resource must be released here, with an idempotent
+    // destructor as the backstop. See issue #1197.
     capture(l3_l2_orch_comm_shutdown());
 
     // Streams are persistent for the DeviceRunner's lifetime; destroy them here.
@@ -842,9 +855,11 @@ int DeviceRunnerBase::finalize_common() {
         stream_aicore_ = nullptr;
     }
 
-    // load_aicpu_op_ has no per-task host-side state to release —
-    // rtsLaunchCpuKernel does not hand back any per-launch handle, and the
-    // dispatcher itself was a transient libaicpu_extend_kernels dlopen.
+    // LoadAicpuOp holds a binary_handle_ from rtsBinaryLoadFromFile; unload it
+    // here while RTS is live so ~LoadAicpuOp's idempotent Finalize() no-ops
+    // instead of unloading after aclFinalize (see the invariant above).
+    load_aicpu_op_.Finalize();
+
     // aicore_bin_handle_ was registered once via rtRegisterAllKernel; CANN
     // releases its device-side state when the device context tears down.
     aicore_bin_handle_ = nullptr;

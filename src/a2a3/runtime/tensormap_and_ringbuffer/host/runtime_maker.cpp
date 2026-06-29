@@ -633,6 +633,24 @@ extern "C" int validate_runtime_impl(Runtime *runtime) {
             "PTO2 runtime failed: orch_error_code=%d sched_error_code=%d runtime_status=%d", orch_error_code,
             sched_error_code, runtime_status
         );
+        // A scheduler no-progress timeout (code 100) carries a device-classified
+        // sub-reason + locators so the failure line is self-diagnosing without a
+        // device-log dive. The full stall snapshot stays in the device log / plog.
+        if (sched_error_code == PTO2_ERROR_SCHEDULER_TIMEOUT) {
+            int32_t detail = host_header.sched_stall_detail.load(std::memory_order_acquire);
+            LOG_ERROR(
+                "PTO2 scheduler timeout sub_class=%s (detail=%d) completed=%d/%d running=%d ready=%d waiting=%d "
+                "orch_done=%d stuck_task_id=%" PRId64 " stuck_core=%d",
+                stall_detail_name(detail), detail, host_header.sched_stall_completed.load(std::memory_order_relaxed),
+                host_header.sched_stall_total.load(std::memory_order_relaxed),
+                host_header.sched_stall_cnt_running.load(std::memory_order_relaxed),
+                host_header.sched_stall_cnt_ready.load(std::memory_order_relaxed),
+                host_header.sched_stall_cnt_waiting.load(std::memory_order_relaxed),
+                host_header.sched_stall_orch_done.load(std::memory_order_relaxed),
+                host_header.sched_stall_task_id.load(std::memory_order_relaxed),
+                host_header.sched_stall_core.load(std::memory_order_relaxed)
+            );
+        }
         skip_tensor_copy_back = true;
     } else {
         graph_out_ptr = host_header.graph_output_ptr;

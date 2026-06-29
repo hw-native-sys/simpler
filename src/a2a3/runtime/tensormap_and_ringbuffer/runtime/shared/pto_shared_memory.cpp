@@ -165,6 +165,15 @@ void PTO2SharedMemoryHandle::init_header_per_ring(
     header->sched_error_bitmap.store(0, std::memory_order_relaxed);
     header->sched_error_code.store(PTO2_ERROR_NONE, std::memory_order_relaxed);
     header->sched_error_thread.store(-1, std::memory_order_relaxed);
+    header->sched_stall_detail.store(PTO2_STALL_DETAIL_NONE, std::memory_order_relaxed);
+    header->sched_stall_completed.store(0, std::memory_order_relaxed);
+    header->sched_stall_total.store(0, std::memory_order_relaxed);
+    header->sched_stall_cnt_running.store(0, std::memory_order_relaxed);
+    header->sched_stall_cnt_ready.store(0, std::memory_order_relaxed);
+    header->sched_stall_cnt_waiting.store(0, std::memory_order_relaxed);
+    header->sched_stall_orch_done.store(0, std::memory_order_relaxed);
+    header->sched_stall_task_id.store(-1, std::memory_order_relaxed);
+    header->sched_stall_core.store(-1, std::memory_order_relaxed);
 
     // Per-ring slot_states reset. Previously lived in
     // PTO2SchedulerState::RingSchedState::init(), but it writes into
