@@ -590,7 +590,16 @@ struct PTO2SchedulerState
 
     bool on_subtask_complete(PTO2TaskSlotState &slot_state)
     {
-        int16_t prev = slot_state.completed_subtasks.fetch_add(1, std::memory_order_acq_rel);
+        // Relaxed fetch_add: completed_subtasks is a pure counter with no
+        // other observers piggybacking state through it. The only readers
+        // are this fetch_add itself (per-subtask) and reset_for_reuse's
+        // relaxed init. Real publication of the producer's completion to
+        // consumer threads happens downstream in on_mixed_task_complete via
+        // completion_flag.store(release) + wake_list_head.exchange(acq_rel)
+        // — those are the AICPU↔AICPU sync edges. The producer→consumer
+        // GM data ordering is handled by AICore-side cache coherence
+        // independent of this counter's ordering.
+        int16_t prev = slot_state.completed_subtasks.fetch_add(1, std::memory_order_relaxed);
         return (prev + 1) == slot_state.total_required_subtasks;
     }
 
