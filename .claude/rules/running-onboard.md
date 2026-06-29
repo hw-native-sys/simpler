@@ -168,7 +168,7 @@ for the signature that actually fired:**
 | -------------------- | --------- | ---- |
 | `FATAL: Task Allocator Deadlock` / `Provable head-of-line` | ring/heap or dep-pool **deadlock** (alloc can't reclaim) | AICPU detector: 500ms backstop (`PTO2_ALLOC_DEADLOCK_TIMEOUT_CYCLES`) or immediate structural `head_blocked_on_scope_end`. Real capacity/scope deadlock. |
 | `Timeout (N cycles): producer/consumers ...` | **SPIN** wait on a specific producer/consumer | `pto_runtime2.cpp`. |
-| `HandleTaskTimeout` / `kill aicpu-sd` | **OS op-execute timeout** | STARS/tsdaemon, default 3s (`PLATFORM_OP_EXECUTE_TIMEOUT_US`). **A 3s kill ≠ deadlock** — the op was merely long or stalled. Raise this constant to measure true on-device duration. |
+| `HandleTaskTimeout` / `kill aicpu-sd` | **OS op-execute timeout** | STARS/tsdaemon, default 45s (`PLATFORM_OP_EXECUTE_TIMEOUT_US`). **A 45s kill ≠ deadlock** — the op was merely long or stalled. Raise this constant to measure true on-device duration. |
 | `log_stall_diagnostics` (cores idle + tasks `state=WAIT fanin 0/N` + `completed` frozen) | **forward-progress stall** | No dedicated detector — intermittent races (often contention-triggered) land here and are reaped only by the op-timeout above. |
 
 Decisive rule: **if a capacity/deadlock detector did NOT fire (counts of
@@ -176,8 +176,11 @@ Decisive rule: **if a capacity/deadlock detector did NOT fire (counts of
 `HandleTaskTimeout` did, it is NOT a proven deadlock or capacity bug** — it is a
 long/stalled op. A capacity exhaustion would trip its own detector; silence ⇒
 look for a race or just-too-slow, not "the ring is too small". For the
-device-side Total / Orch / Sched breakdown of a (completed) run, use
-`python -m simpler_setup.tools.device_log_timing` (see `simpler_setup/tools/README.md`).
+host/device timing breakdown of a (completed) run, parse its `[STRACE]` markers
+with `python -m simpler_setup.tools.strace_timing <log> --rounds-table` (see
+`simpler_setup/tools/README.md`); for the per-thread `loops`/`tasks_scheduled`
+deep-dive, rebuild with `PTO2_SCHED_PROFILING=1` and read the device log
+directly.
 
 ## Anti-patterns
 

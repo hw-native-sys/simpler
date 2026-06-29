@@ -64,10 +64,8 @@ class TestDepGenChain(SceneTestCase):
                 "name": "WRITE_CONST",
                 "source": f"{DUMMY_KERNELS}/aic/kernel_write_const.cpp",
                 "core_type": "aic",
-                # Single-AIC task with one INOUT tensor at payload slot 0;
-                # arg_index maps it explicitly.
+                # Single-AIC task with one INOUT tensor at payload slot 0.
                 "signature": [D.INOUT],
-                "arg_index": [0],
             },
             {
                 "func_id": 1,
@@ -76,7 +74,6 @@ class TestDepGenChain(SceneTestCase):
                 "core_type": "aic",
                 # Single-AIC task: copies args[0] -> args[1] (IN, INOUT).
                 "signature": [D.IN, D.INOUT],
-                "arg_index": [0, 1],
             },
         ],
     }

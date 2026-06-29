@@ -814,12 +814,18 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
     // pollute per-task PMU counters, so skip the PENDING pre-load phase.
     // Cached at function scope: is_pmu_enabled() is extern "C" and the
     // compiler cannot hoist it across the dispatch loop on its own.
+#if PTO2_PROFILING
     const bool pmu_active = is_pmu_enabled();
+#else
+    // PMU is definitionally off when profiling is compiled out; hard-set false
+    // so dispatch keeps its overlapping (non-single-issue) fast path.
+    constexpr bool pmu_active = false;
+#endif
 
 #ifdef INDEP_ORCH
-    INSTRUMENTATION_MARK_SET(g_TraCR_thread_idx, Barrier, orchestrator_done_);
-    LOG_INFO_V9("[TraCR] Thread %d: Waiting before the Orch to finish: %d, orchestrator_done_=%d", g_TraCR_thread_idx, g_TraCR_thread_idx_counter.load(), orchestrator_done_);
-    while (!orchestrator_done_) {
+    INSTRUMENTATION_MARK_SET(g_TraCR_thread_idx, Barrier, orchestrator_done_.load(std::memory_order_relaxed));
+    LOG_INFO_V9("[TraCR] Thread %d: Waiting before the Orch to finish: %d, orchestrator_done_=%d", g_TraCR_thread_idx, g_TraCR_thread_idx_counter.load(), orchestrator_done_.load(std::memory_order_relaxed));
+    while (!orchestrator_done_.load(std::memory_order_acquire)) {
         SPIN_WAIT_HINT();
     }
 #endif
@@ -1038,7 +1044,7 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
         // Phase 3: Drain wiring queue (thread 0 only)
         int wired = 0;
         if (thread_idx == 0) {
-            wired = sched_->drain_wiring_queue(orchestrator_done_);
+            wired = sched_->drain_wiring_queue(orchestrator_done_.load(std::memory_order_relaxed));
             if (wired > 0) {
                 made_progress = true;
                 INSTRUMENTATION_MARK_SET(g_TraCR_thread_idx, Phase3, 0);

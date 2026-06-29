@@ -47,6 +47,7 @@
 #include "../../../../common/task_interface/call_config.h"
 #include "callable.h"
 #include "common/platform_config.h"
+#include "common/strace.h"
 #include "common/unified_log.h"
 #include "host/platform_compile_info.h"
 #include "host/runtime_timeout_config.h"
@@ -404,57 +405,60 @@ extern "C" int bind_callable_to_runtime_impl(
     ChipStorageTaskArgs device_args;
 
     int64_t t_args_start = _now_ms();
-    for (int i = 0; i < tensor_count; i++) {
-        Tensor t = orch_args->tensor(i);
+    {
+        STRACE_A("run_prepared.bind.args", "");
+        for (int i = 0; i < tensor_count; i++) {
+            Tensor t = orch_args->tensor(i);
 
-        if (t.is_child_memory()) {
-            LOG_INFO_V0("  Tensor %d: child memory, pass-through (0x%" PRIx64 ")", i, t.buffer.addr);
+            if (t.is_child_memory()) {
+                LOG_INFO_V0("  Tensor %d: child memory, pass-through (0x%" PRIx64 ")", i, t.buffer.addr);
+                device_args.add_tensor(t);
+                continue;
+            }
+
+            void *host_ptr = reinterpret_cast<void *>(static_cast<uintptr_t>(t.buffer.addr));
+            size_t size = static_cast<size_t>(t.nbytes());
+
+            void *dev_ptr = runtime->host_api.device_malloc(size);
+            if (dev_ptr == nullptr) {
+                LOG_ERROR("Failed to allocate device memory for tensor %d", i);
+                return -1;
+            }
+
+            // Pure write-only OUTPUT buffers carry no meaningful host content, so
+            // the H2D copy-in is wasted. Zero them on-device instead (cheap HBM
+            // memset, no PCIe) so any region the kernel leaves unwritten reads as 0
+            // rather than pooled-allocator garbage. INOUT (read-before-write)
+            // and IN keep the H2D copy. Falls back to copy_to_device if a backend
+            // did not wire device_memset.
+            bool is_pure_output = (signature != nullptr && i < sig_count && signature[i] == ArgDirection::OUT);
+            int rc;
+            if (is_pure_output && runtime->host_api.device_memset != nullptr) {
+                rc = runtime->host_api.device_memset(dev_ptr, 0, size);
+            } else {
+                rc = runtime->host_api.copy_to_device(dev_ptr, host_ptr, size);
+            }
+            if (rc != 0) {
+                LOG_ERROR("Failed to stage tensor %d to device", i);
+                runtime->host_api.device_free(dev_ptr);
+                return -1;
+            }
+            // Read-only INPUT tensors are never written by the kernel, so there is
+            // no point copying them back D2H at the end. Index the signature
+            // by the orch tensor index `i` (child_memory tensors are skipped above
+            // but do not consume a separate signature slot — scalars follow the
+            // tensor entries). Anything not provably IN keeps the safe default of
+            // copying back.
+            bool needs_copy_back = !(signature != nullptr && i < sig_count && signature[i] == ArgDirection::IN);
+            runtime->tensor_pairs_.push_back({host_ptr, dev_ptr, size, needs_copy_back});
+            LOG_INFO_V0("  Tensor %d: %zu bytes at %p", i, size, dev_ptr);
+
+            t.buffer.addr = reinterpret_cast<uint64_t>(dev_ptr);
             device_args.add_tensor(t);
-            continue;
         }
-
-        void *host_ptr = reinterpret_cast<void *>(static_cast<uintptr_t>(t.buffer.addr));
-        size_t size = static_cast<size_t>(t.nbytes());
-
-        void *dev_ptr = runtime->host_api.device_malloc(size);
-        if (dev_ptr == nullptr) {
-            LOG_ERROR("Failed to allocate device memory for tensor %d", i);
-            return -1;
+        for (int i = 0; i < scalar_count; i++) {
+            device_args.add_scalar(orch_args->scalar(i));
         }
-
-        // Pure write-only OUTPUT buffers carry no meaningful host content, so
-        // the H2D copy-in is wasted. Zero them on-device instead (cheap HBM
-        // memset, no PCIe) so any region the kernel leaves unwritten reads as 0
-        // rather than pooled-allocator garbage. INOUT (read-before-write)
-        // and IN keep the H2D copy. Falls back to copy_to_device if a backend
-        // did not wire device_memset.
-        bool is_pure_output = (signature != nullptr && i < sig_count && signature[i] == ArgDirection::OUT);
-        int rc;
-        if (is_pure_output && runtime->host_api.device_memset != nullptr) {
-            rc = runtime->host_api.device_memset(dev_ptr, 0, size);
-        } else {
-            rc = runtime->host_api.copy_to_device(dev_ptr, host_ptr, size);
-        }
-        if (rc != 0) {
-            LOG_ERROR("Failed to stage tensor %d to device", i);
-            runtime->host_api.device_free(dev_ptr);
-            return -1;
-        }
-        // Read-only INPUT tensors are never written by the kernel, so there is
-        // no point copying them back D2H at the end. Index the signature
-        // by the orch tensor index `i` (child_memory tensors are skipped above
-        // but do not consume a separate signature slot — scalars follow the
-        // tensor entries). Anything not provably IN keeps the safe default of
-        // copying back.
-        bool needs_copy_back = !(signature != nullptr && i < sig_count && signature[i] == ArgDirection::IN);
-        runtime->tensor_pairs_.push_back({host_ptr, dev_ptr, size, needs_copy_back});
-        LOG_INFO_V0("  Tensor %d: %zu bytes at %p", i, size, dev_ptr);
-
-        t.buffer.addr = reinterpret_cast<uint64_t>(dev_ptr);
-        device_args.add_tensor(t);
-    }
-    for (int i = 0; i < scalar_count; i++) {
-        device_args.add_scalar(orch_args->scalar(i));
     }
     int64_t t_args_end = _now_ms();
 
@@ -465,6 +469,15 @@ extern "C" int bind_callable_to_runtime_impl(
             runtime->orch_to_sched = true;
         }
         LOG_INFO_V0("Orchestrator-to-scheduler transition: %s", runtime->orch_to_sched ? "enabled" : "disabled");
+    }
+
+    // Read serial orchestrator -> scheduler start gate from environment.
+    {
+        const char *env_val = std::getenv("PTO2_SERIAL_ORCH_SCHED");
+        runtime->serial_orch_sched = env_val && (env_val[0] == '1' || env_val[0] == 't' || env_val[0] == 'T');
+        LOG_INFO_V0(
+            "Serial orchestrator-to-scheduler start gate: %s", runtime->serial_orch_sched ? "enabled" : "disabled"
+        );
     }
 
     // Lay out the per-Worker static device arena. GM heap, PTO2 shared memory,
@@ -484,91 +497,95 @@ extern "C" int bind_callable_to_runtime_impl(
     uint64_t sm_size = PTO2SharedMemoryHandle::calculate_size_per_ring(eff_task_window_sizes);
 
     int64_t t_prebuilt_start = _now_ms();
-    DeviceArena host_arena;  // libc malloc backend by default
-    PTO2RuntimeArenaLayout layout =
-        runtime_reserve_layout(host_arena, eff_task_window_sizes, eff_heap_sizes, eff_dep_pool_capacities);
-    layout.scheduler_timeout_ms = resolve_scheduler_timeout_ms();
-    if (host_arena.commit(DeviceArena::kDefaultBaseAlign) == nullptr) {
-        LOG_ERROR("Failed to commit host arena for prebuilt runtime image");
-        return -1;
+    {
+        STRACE("run_prepared.bind.prebuilt");
+        DeviceArena host_arena;  // libc malloc backend by default
+        PTO2RuntimeArenaLayout layout =
+            runtime_reserve_layout(host_arena, eff_task_window_sizes, eff_heap_sizes, eff_dep_pool_capacities);
+        layout.scheduler_timeout_ms = resolve_scheduler_timeout_ms();
+        if (host_arena.commit(DeviceArena::kDefaultBaseAlign) == nullptr) {
+            LOG_ERROR("Failed to commit host arena for prebuilt runtime image");
+            return -1;
+        }
+
+        int64_t t_setup_start = _now_ms();
+        if (runtime->host_api.setup_static_arena(total_heap_size, sm_size, layout.arena_size) != 0) {
+            LOG_ERROR("Failed to setup pooled static arena");
+            return -1;
+        }
+        int64_t t_setup_end = _now_ms();
+
+        int64_t t_heap_start = _now_ms();
+        void *gm_heap = runtime->host_api.acquire_pooled_gm_heap();
+        int64_t t_heap_end = _now_ms();
+        if (gm_heap == nullptr) {
+            LOG_ERROR("Failed to acquire pooled GM heap");
+            return -1;
+        }
+        runtime->set_gm_heap(gm_heap);
+
+        int64_t t_sm_start = _now_ms();
+        void *sm_ptr = runtime->host_api.acquire_pooled_gm_sm();
+        int64_t t_sm_end = _now_ms();
+        if (sm_ptr == nullptr) {
+            LOG_ERROR("Failed to acquire pooled PTO2 shared memory");
+            return -1;
+        }
+        runtime->set_gm_sm_ptr(sm_ptr);
+
+        void *runtime_arena_dev = runtime->host_api.acquire_pooled_runtime_arena();
+        if (runtime_arena_dev == nullptr) {
+            LOG_ERROR("Failed to acquire pooled runtime arena");
+            return -1;
+        }
+
+        // Set up device orchestration state
+        runtime->set_orch_args(device_args);
+
+        // -------------------------------------------------------------------------
+        // Build the prebuilt runtime-arena image on host.
+        //
+        // We pre-compute every byte the AICPU's runtime arena would otherwise have
+        // to write at boot: layout offsets, sub-structure init data, and pointers
+        // back to the SM / GM heap. Then we rtMemcpy the image into the pooled
+        // runtime-arena region that DeviceRunner keeps alive across runs. AICPU
+        // boot becomes attach + wire (cheap pointer fixup) + sm_handle->init (SM
+        // reset) + a handful of device-only field fixups.
+        // -------------------------------------------------------------------------
+        PTO2Runtime *rt = runtime_init_data_from_layout(
+            host_arena, layout, PTO2_MODE_EXECUTE, sm_ptr, sm_size, gm_heap, eff_heap_sizes
+        );
+        if (rt == nullptr) {
+            LOG_ERROR("runtime_init_data_from_layout failed");
+            return -1;
+        }
+        runtime_wire_arena_pointers(host_arena, layout, rt);
+
+        // Stash the layout inside the PTO2Runtime image so the AICPU can recover
+        // every arena-internal offset after rtMemcpy. The runtime arena's device
+        // base does NOT travel in this image — it's on the host Runtime
+        // (set_prebuilt_arena below), since the AICPU needs that pointer
+        // *before* it can dereference the image.
+        rt->prebuilt_layout = layout;
+
+        int rc_upload = runtime->host_api.copy_to_device(runtime_arena_dev, host_arena.base(), layout.arena_size);
+        if (rc_upload != 0) {
+            LOG_ERROR("Failed to rtMemcpy prebuilt runtime arena to device (rc=%d)", rc_upload);
+            return -1;
+        }
+        runtime->set_prebuilt_arena(runtime_arena_dev, layout.off_runtime);
+        int64_t t_prebuilt_end = _now_ms();
+
+        LOG_INFO_V0("Device orchestration ready: %d tensors + %d scalars", tensor_count, scalar_count);
+
+        int64_t t_total_end = _now_ms();
+        LOG_INFO_V0("TIMING: args_malloc_copy = %" PRId64 "ms", t_args_end - t_args_start);
+        LOG_INFO_V0("TIMING: static_arena_setup = %" PRId64 "ms", t_setup_end - t_setup_start);
+        LOG_INFO_V0("TIMING: gm_heap_acquire = %" PRId64 "ms", t_heap_end - t_heap_start);
+        LOG_INFO_V0("TIMING: shared_mem_acquire = %" PRId64 "ms", t_sm_end - t_sm_start);
+        LOG_INFO_V0("TIMING: prebuilt_runtime_arena = %" PRId64 "ms", t_prebuilt_end - t_prebuilt_start);
+        LOG_INFO_V0("TIMING: total_init_runtime_impl = %" PRId64 "ms", t_total_end - t_total_start);
     }
-
-    int64_t t_setup_start = _now_ms();
-    if (runtime->host_api.setup_static_arena(total_heap_size, sm_size, layout.arena_size) != 0) {
-        LOG_ERROR("Failed to setup pooled static arena");
-        return -1;
-    }
-    int64_t t_setup_end = _now_ms();
-
-    int64_t t_heap_start = _now_ms();
-    void *gm_heap = runtime->host_api.acquire_pooled_gm_heap();
-    int64_t t_heap_end = _now_ms();
-    if (gm_heap == nullptr) {
-        LOG_ERROR("Failed to acquire pooled GM heap");
-        return -1;
-    }
-    runtime->set_gm_heap(gm_heap);
-
-    int64_t t_sm_start = _now_ms();
-    void *sm_ptr = runtime->host_api.acquire_pooled_gm_sm();
-    int64_t t_sm_end = _now_ms();
-    if (sm_ptr == nullptr) {
-        LOG_ERROR("Failed to acquire pooled PTO2 shared memory");
-        return -1;
-    }
-    runtime->set_gm_sm_ptr(sm_ptr);
-
-    void *runtime_arena_dev = runtime->host_api.acquire_pooled_runtime_arena();
-    if (runtime_arena_dev == nullptr) {
-        LOG_ERROR("Failed to acquire pooled runtime arena");
-        return -1;
-    }
-
-    // Set up device orchestration state
-    runtime->set_orch_args(device_args);
-
-    // -------------------------------------------------------------------------
-    // Build the prebuilt runtime-arena image on host.
-    //
-    // We pre-compute every byte the AICPU's runtime arena would otherwise have
-    // to write at boot: layout offsets, sub-structure init data, and pointers
-    // back to the SM / GM heap. Then we rtMemcpy the image into the pooled
-    // runtime-arena region that DeviceRunner keeps alive across runs. AICPU
-    // boot becomes attach + wire (cheap pointer fixup) + sm_handle->init (SM
-    // reset) + a handful of device-only field fixups.
-    // -------------------------------------------------------------------------
-    PTO2Runtime *rt =
-        runtime_init_data_from_layout(host_arena, layout, PTO2_MODE_EXECUTE, sm_ptr, sm_size, gm_heap, eff_heap_sizes);
-    if (rt == nullptr) {
-        LOG_ERROR("runtime_init_data_from_layout failed");
-        return -1;
-    }
-    runtime_wire_arena_pointers(host_arena, layout, rt);
-
-    // Stash the layout inside the PTO2Runtime image so the AICPU can recover
-    // every arena-internal offset after rtMemcpy. The runtime arena's device
-    // base does NOT travel in this image — it's on the host Runtime
-    // (set_prebuilt_arena below), since the AICPU needs that pointer
-    // *before* it can dereference the image.
-    rt->prebuilt_layout = layout;
-
-    int rc_upload = runtime->host_api.copy_to_device(runtime_arena_dev, host_arena.base(), layout.arena_size);
-    if (rc_upload != 0) {
-        LOG_ERROR("Failed to rtMemcpy prebuilt runtime arena to device (rc=%d)", rc_upload);
-        return -1;
-    }
-    runtime->set_prebuilt_arena(runtime_arena_dev, layout.off_runtime);
-    int64_t t_prebuilt_end = _now_ms();
-
-    LOG_INFO_V0("Device orchestration ready: %d tensors + %d scalars", tensor_count, scalar_count);
-
-    int64_t t_total_end = _now_ms();
-    LOG_INFO_V0("TIMING: args_malloc_copy = %" PRId64 "ms", t_args_end - t_args_start);
-    LOG_INFO_V0("TIMING: static_arena_setup = %" PRId64 "ms", t_setup_end - t_setup_start);
-    LOG_INFO_V0("TIMING: gm_heap_acquire = %" PRId64 "ms", t_heap_end - t_heap_start);
-    LOG_INFO_V0("TIMING: shared_mem_acquire = %" PRId64 "ms", t_sm_end - t_sm_start);
-    LOG_INFO_V0("TIMING: prebuilt_runtime_arena = %" PRId64 "ms", t_prebuilt_end - t_prebuilt_start);
-    LOG_INFO_V0("TIMING: total_init_runtime_impl = %" PRId64 "ms", t_total_end - t_total_start);
 
     return 0;
 }

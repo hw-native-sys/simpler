@@ -147,7 +147,8 @@ using DumpFreeCallback = profiling_common::ProfFreeCallback;
  */
 struct DumpedTensor {
     uint64_t task_id;
-    int32_t func_id;  // kernel id of the subtask that declared this arg; -1 if unknown
+    int32_t func_ids[TENSOR_DUMP_MAX_FUNC_IDS];  // task's active-subtask set (mix membership); -1 unknown
+    int32_t func_count;                          // number of valid entries in func_ids
     uint32_t arg_index;
     TensorDumpRole role;
     TensorDumpStage stage;
@@ -224,7 +225,7 @@ public:
 
     /**
      * Write collected dumps to <output_prefix>/args_dump/{*.bin, *.json}.
-     * Sorts args by (task_id, subtask_id, func_id, stage, arg_index, role).
+     * Sorts args by (task_id, stage, arg_index, role).
      */
     int export_dump_files();
 

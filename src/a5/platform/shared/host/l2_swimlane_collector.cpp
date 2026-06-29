@@ -243,15 +243,19 @@ int L2SwimlaneCollector::initialize(
     // direct access to `&ac_state->head` device addresses, no
     // host-to-device translation needed). AICore reads
     // rotation_table[block_idx] at kernel entry.
+    // Held in a local and published to aicore_ring_addr_table_dev_ only after
+    // guard.commit() (see end of this function). The alloc registers the buffer
+    // in the rollback guard, so a later init failure frees it via
+    // release_all_owned; assigning the member here would leave it dangling.
+    void *rotation_table_dev = nullptr;
     {
         size_t table_bytes = static_cast<size_t>(num_aicore) * sizeof(uint64_t);
         void *rotation_table_host = nullptr;
-        void *rotation_table_dev = alloc_paired_buffer(table_bytes, &rotation_table_host);
+        rotation_table_dev = alloc_paired_buffer(table_bytes, &rotation_table_host);
         if (rotation_table_dev == nullptr) {
             LOG_ERROR("Failed to allocate l2_swimlane_aicore_rotation_table (rotation) table (%zu bytes)", table_bytes);
             return -1;
         }
-        aicore_ring_addr_table_dev_ = rotation_table_dev;
     }
 
     // Step 6: Initialize per-thread phase pools — both sched and orch. Each
@@ -347,14 +351,12 @@ int L2SwimlaneCollector::initialize(
     // kernel_args.l2_swimlane_data_base (read back via get_l2_swimlane_setup_device_ptr()).
     LOG_DEBUG("L2 swimlane device base = 0x%lx", reinterpret_cast<uint64_t>(perf_dev_ptr));
 
-    perf_shared_mem_dev_ = perf_dev_ptr;
-    // Refresh memory context with the now-known SHM tuple. start(tf) (inherited)
-    // gates on shm_host_, so this is the moment the collector becomes startable.
-    set_memory_context(
-        alloc_cb, register_cb, free_cb, profiling_copy_to_device_for_ops, profiling_copy_from_device_for_ops,
-        perf_dev_ptr, perf_host_ptr, total_size, device_id
-    );
-
+    // Reserve the per-core / per-thread record vectors while the rollback guard
+    // is still armed, so a std::bad_alloc here unwinds through the guard and
+    // frees every buffer. Publication of the device pointers and the memory
+    // context is deferred to after commit (below): otherwise a throw here would
+    // leave perf_shared_mem_dev_ dangling and shm_host_ non-null, which would
+    // make is_initialized() report true and finalize() double-free.
     collected_perf_records_.assign(num_aicore_, {});
     collected_aicore_records_.assign(num_aicore_, {});
     collected_sched_phase_records_.assign(PLATFORM_MAX_AICPU_THREADS, {});
@@ -362,6 +364,17 @@ int L2SwimlaneCollector::initialize(
 
     LOG_INFO_V0("Performance profiling initialized (dynamic buffer mode)");
     guard.commit();
+    // Publish device-buffer members + memory context only after the rollback
+    // guard is disarmed: on a failed init they stay nullptr / shm_host_ stays
+    // null, so is_initialized() is false and finalize() never frees buffers the
+    // guard already freed. set_memory_context publishes shm_host_; start(tf)
+    // gates on it, so this is the moment the collector becomes startable.
+    perf_shared_mem_dev_ = perf_dev_ptr;
+    aicore_ring_addr_table_dev_ = rotation_table_dev;
+    set_memory_context(
+        alloc_cb, register_cb, free_cb, profiling_copy_to_device_for_ops, profiling_copy_from_device_for_ops,
+        perf_dev_ptr, perf_host_ptr, total_size, device_id
+    );
     return 0;
 }
 

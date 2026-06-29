@@ -96,7 +96,6 @@ def build_chip_callable(platform: str, pto_isa_commit: str | None) -> ChipCallab
     )
     core_callable = CoreCallable.build(
         signature=[ArgDirection.IN, ArgDirection.OUT, ArgDirection.INOUT],
-        arg_index=[0, 1, 2],
         binary=kernel_bytes,
     )
     return ChipCallable.build(

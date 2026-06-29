@@ -26,6 +26,7 @@
 #include <tracr_simpler_markers.hpp>
 
 #include "aicpu/device_time.h"
+#include "aicpu/device_phase_aicpu.h"
 #include "aicpu/orch_so_file.h"
 #include "callable_protocol.h"
 #include "pto2_dispatch_payload.h"
@@ -116,6 +117,7 @@ struct OrchSoEntry {
 struct AicpuExecutor {
     int32_t sched_thread_num_;
     bool orch_to_sched_{false};
+    bool serial_orch_sched_{false};
 
     // ===== Thread management state =====
     std::atomic<int32_t> thread_idx_{0};
@@ -194,6 +196,7 @@ int32_t AicpuExecutor::init(Runtime *runtime) {
     if (aicpu_thread_num_ == 0) aicpu_thread_num_ = 1;
     sched_thread_num_ = aicpu_thread_num_ - 1;
     orch_to_sched_ = runtime->orch_to_sched;
+    serial_orch_sched_ = runtime->serial_orch_sched;
 
     if (aicpu_thread_num_ < 1 || aicpu_thread_num_ > MAX_AICPU_THREADS) {
         LOG_ERROR("Invalid aicpu_thread_num: %d", aicpu_thread_num_);
@@ -237,9 +240,16 @@ int32_t AicpuExecutor::ensure_orch_so_loaded(Runtime *runtime, int32_t thread_id
             );
             return -1;
         }
-        return 0;
+        return 0;  // cached: no dlopen, SoLoad stays unstamped (~0)
     }
 
+    // First/changed callable: this is the real orch-SO dlopen — the SoLoad phase.
+    // RAII end-stamp so every return path below closes the phase.
+    struct SoLoadPhaseGuard {
+        ~SoLoadPhaseGuard() { aicpu_phase_end(AicpuPhase::SoLoad); }
+    };
+    aicpu_phase_start(AicpuPhase::SoLoad);
+    SoLoadPhaseGuard so_load_guard;
     LOG_INFO_V0("Thread %d: New orch SO detected (callable_id=%d), (re)loading", thread_idx, callable_id);
     if (entry.handle != nullptr) {
         dlclose(entry.handle);
@@ -369,12 +379,20 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
         return -1;
     }
     int32_t run_rc = 0;
+    // Publish the resolved index so per-thread readers in this `.so` (notably
+    // the AICPU phase-record slot) agree with the executor. On sim the basic
+    // affinity gate leaves the index unset (-1); without this the sub-phase
+    // stamps below would have no valid slot and silently drop. Idempotent
+    // onboard, where the filter gate already set this same value.
+    platform_aicpu_affinity_set_thread_idx(thread_idx);
     LOG_INFO_V0("Thread %d: Start (exec_idx=%d)", thread_idx, affinity_exec_idx);
 
     // Orchestrator check
     if (thread_idx >= sched_thread_num_) {
 #if PTO2_PROFILING
         uint64_t orch_cycle_start = 0;
+#endif
+#if PTO2_ORCH_PROFILING
         int32_t pto2_submitted_tasks = -1;
 #endif
         // Orchestrator thread: load + run the device orchestration SO. The braces
@@ -546,6 +564,7 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
             }
 #endif
 
+#if PTO2_PROFILING
             // dep_gen plugs into the orchestrator thread (single-instance subsystem):
             // record the per-thread ready_queue index before any submit_task fires
             // inside orch_func_.
@@ -553,7 +572,6 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
                 dep_gen_aicpu_set_orch_thread_idx(thread_idx);
             }
 
-#if PTO2_PROFILING
             // scope_stats streams scope_end records off the orchestrator thread:
             // record the per-thread ready_queue index. No-op (writer shared
             // state null) when scope_stats is disabled; the current buffer is
@@ -573,12 +591,12 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
             (*p_func)(orch_args_cached_);
             rt_scope_end(rt);
 
+#if PTO2_PROFILING
             // Flush the (potentially partially-filled) DepGenBuffer so the host
             // collector can pick it up before this orchestrator thread joins.
             if (is_dep_gen_enabled()) {
                 dep_gen_aicpu_flush();
             }
-#if PTO2_PROFILING
             // Push the partially-filled scope_stats buffer so the host gets the
             // final scope_end records. Idempotent / no-op when disabled.
             scope_stats_aicpu_flush_buffers();
@@ -667,7 +685,7 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
                 }
             }
 
-#if PTO2_PROFILING
+#if PTO2_ORCH_PROFILING
             pto2_submitted_tasks = total_tasks;
 #endif
 
@@ -678,6 +696,11 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
         }
 #if PTO2_PROFILING
         uint64_t orch_end_ts = get_sys_cnt_aicpu();
+        // Ride the orch window home to the host phase buffer so the host emits
+        // it as an `Orch` [STRACE] marker (the everyday path). The verbose
+        // per-thread device-log line below is now opt-in deep-dive.
+        aicpu_phase_set_window(AicpuPhase::OrchWindow, static_cast<uint64_t>(orch_cycle_start), orch_end_ts);
+#if PTO2_ORCH_PROFILING
         LOG_INFO_V9(
             "Thread %d: orch_start=%" PRIu64 " orch_end=%" PRIu64 " orch_cost=%.3fus", thread_idx,
             static_cast<uint64_t>(orch_cycle_start), static_cast<uint64_t>(orch_end_ts),
@@ -689,7 +712,8 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
                 sched_ctx_.completed_tasks_count()
             );
         }
-#endif
+#endif  // PTO2_ORCH_PROFILING
+#endif  // PTO2_PROFILING
         LOG_INFO_V0("Thread %d: Orchestrator completed", thread_idx);
     }
 
@@ -704,6 +728,9 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
         } else {
             INSTRUMENTATION_MARK_SET(g_TraCR_thread_idx, Scheduling, thread_idx);
             sched_ctx_.bind_runtime(rt);
+            if (serial_orch_sched_) {
+                sched_ctx_.wait_for_orchestration_done_before_dispatch(runtime, thread_idx);
+            }
             int32_t completed = sched_ctx_.resolve_and_dispatch(runtime, thread_idx);
             if (completed < 0) {
                 LOG_ERROR("Thread %d: Scheduler failed with rc=%d", thread_idx, completed);
@@ -765,6 +792,7 @@ void AicpuExecutor::deinit(Runtime *runtime) {
     aicpu_thread_num_ = 0;
     sched_thread_num_ = 0;
     orch_to_sched_ = false;
+    serial_orch_sched_ = false;
 
     orch_args_cached_.reset();
     // orch_so_table_ entries are intentionally preserved across deinit: the
@@ -890,6 +918,7 @@ extern "C" int32_t aicpu_execute(Runtime *runtime) {
     LOG_INFO_V9("[TraCR] thread[%d:%d] start ENABLE_TRACR=%d", g_TraCR_thread_idx, tracr_getcpu(), INSTRUMENTATION_ACTIVE);
 
 
+    aicpu_phase_start(AicpuPhase::Preamble);
     g_aicpu_executor.init(runtime);
 
     while (!g_aicpu_executor.init_done_.load(std::memory_order_acquire)) {
@@ -898,12 +927,16 @@ extern "C" int32_t aicpu_execute(Runtime *runtime) {
             return -1;
         }
     }
+    aicpu_phase_end(AicpuPhase::Preamble);
 
+    aicpu_phase_start(AicpuPhase::GraphBuild);
     int32_t rc = g_aicpu_executor.run(runtime);
+    aicpu_phase_end(AicpuPhase::GraphBuild);
     if (rc != 0) {
         LOG_ERROR("aicpu_execute: Thread execution failed with rc=%d", rc);
     }
 
+    aicpu_phase_start(AicpuPhase::PostOrch);
     int32_t runtime_rc = read_pto2_runtime_status(runtime);
 
     // Last thread cleans up
@@ -911,6 +944,7 @@ extern "C" int32_t aicpu_execute(Runtime *runtime) {
         LOG_INFO_V0("aicpu_execute: Last thread finished, cleaning up");
         g_aicpu_executor.deinit(runtime);
     }
+    aicpu_phase_end(AicpuPhase::PostOrch);
 
     INSTRUMENTATION_MARK_RESET(g_TraCR_thread_idx);
     // Finalize TraCR all threads coming in

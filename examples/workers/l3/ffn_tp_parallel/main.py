@@ -108,7 +108,6 @@ def build_ffn_local_callable(platform: str, pto_isa_commit: str | None) -> ChipC
     )
     core_callable = CoreCallable.build(
         signature=[ArgDirection.IN, ArgDirection.IN, ArgDirection.OUT],
-        arg_index=[0, 1, 2],
         binary=kernel_bytes,
     )
     return ChipCallable.build(
@@ -140,7 +139,6 @@ def build_allreduce_sum_callable(platform: str, pto_isa_commit: str | None) -> C
     )
     core_callable = CoreCallable.build(
         signature=[ArgDirection.IN, ArgDirection.OUT, ArgDirection.INOUT],
-        arg_index=[0, 1, 2],
         binary=kernel_bytes,
     )
     return ChipCallable.build(

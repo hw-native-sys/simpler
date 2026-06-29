@@ -84,6 +84,7 @@ that ...".
 
 Newest first.
 
+- [2026-06 — Gating the two residual profiling enable() calls on the orch/scheduler hot path](2026-06-orch-profiling-enable-gates-hot-path.md) — gated under existing `PTO2_PROFILING`; magnitude unmeasured, no new macro
 - [2026-06 — Replacing COND with GM+dcci for AICore→AICPU notification](2026-06-cond-vs-gm-notification.md)
 - [2026-06 — Letting AICore directly read or write the SPR MMIO window](2026-06-aicore-mmio-to-spr.md)
 - [2026-06 — PA-unroll 207001: an op-timeout-window issue fixed by #1035, not a launch-order bug](2026-06-pa-unroll-207001-optimeout-window.md)

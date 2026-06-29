@@ -114,7 +114,6 @@ def build_chip_callable(platform: str) -> ChipCallable:
     # (and only) ``rt_submit_aiv_task(0, ...)`` in vector_add_orch.cpp.
     core_callable = CoreCallable.build(
         signature=[ArgDirection.IN, ArgDirection.IN, ArgDirection.OUT],
-        arg_index=[0, 1, 2],
         binary=kernel_bytes,
     )
 
@@ -157,8 +156,9 @@ def _run(worker: Worker, chip_handle: CallableHandle):
     # --- 4. Run. CallConfig() defaults are fine for this kernel. ---
     config = CallConfig()
     print("[vector_add] running on device...")
-    timing = worker.run(chip_handle, args, config)
-    print(f"[vector_add] {timing}")
+    # run() returns None; per-stage timing is emitted as [STRACE] log markers
+    # (see docs/dfx/host-trace.md) — parse with simpler_setup.tools.strace_timing.
+    worker.run(chip_handle, args, config)
 
     # --- 5. D2H copy back + verify ---
     worker.copy_from(host_out.data_ptr(), dev_out, NBYTES)
@@ -172,7 +172,6 @@ def _run(worker: Worker, chip_handle: CallableHandle):
     print(f"[vector_add] max |host_out - expected| = {max_diff:.3e}")
     assert torch.allclose(host_out, expected, rtol=1e-5, atol=1e-5)
     print("[vector_add] golden check PASSED")
-    return timing
 
 
 def run(platform: str, device_id: int) -> int:

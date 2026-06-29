@@ -62,21 +62,18 @@ class TestArgsDump(SceneTestCase):
                 "source": f"{KERNELS_BASE}/aiv/kernel_add.cpp",
                 "core_type": "aiv",
                 "signature": [D.IN, D.IN, D.OUT],
-                "arg_index": [0, 1, 2],
             },
             {
                 "func_id": 1,
                 "source": f"{KERNELS_BASE}/aiv/kernel_add_scalar.cpp",
                 "core_type": "aiv",
                 "signature": [D.IN, D.OUT],
-                "arg_index": [0, 1],
             },
             {
                 "func_id": 2,
                 "source": f"{KERNELS_BASE}/aiv/kernel_mul.cpp",
                 "core_type": "aiv",
                 "signature": [D.IN, D.IN, D.OUT],
-                "arg_index": [0, 1, 2],
             },
         ],
     }
@@ -138,6 +135,27 @@ class TestArgsDump(SceneTestCase):
         assert all(t.get("stage") == "before_dispatch" for t in scalar_entries), scalar_entries
         assert all(t.get("bin_size") == 0 for t in scalar_entries), scalar_entries
         assert all("value" in t for t in scalar_entries), scalar_entries
+
+        # func_id array (#1181): every entry carries its task's active-subtask
+        # membership. partial_dump_orch dispatches all tasks via single-kernel
+        # rt_submit_aiv_task, so each func_id must be a one-element array holding
+        # a declared func_id, consistent across that task's entries; and all three
+        # dispatched kernels (0/1/2) appear. Without this a wholly broken func_id
+        # emit still PASSes. (Exact task_id->func mapping is not pinned: it shifts
+        # between partial/full modes and add/mul are structurally indistinguishable.)
+        per_task_func = {}
+        seen_func = set()
+        for t in tensors:
+            fid = t.get("func_id")
+            assert isinstance(fid, list) and len(fid) == 1, (
+                f"{t['task_id']} arg {t.get('arg_index')} ({t.get('kind')}): "
+                f"func_id={fid} — single-kernel task must be a one-element array"
+            )
+            assert fid[0] in (0, 1, 2), f"{t['task_id']}: func_id {fid} outside declared range 0/1/2"
+            prev = per_task_func.setdefault(t["task_id"], fid[0])
+            assert prev == fid[0], f"{t['task_id']}: func_id differs across entries ({prev} vs {fid[0]})"
+            seen_func.add(fid[0])
+        assert seen_func == {0, 1, 2}, f"dump should cover all dispatched kernels 0/1/2, got {sorted(seen_func)}"
 
         # Level-aware checks operate on the tensor entries.
         tensor_entries = [t for t in tensors if t.get("kind") == "tensor"]

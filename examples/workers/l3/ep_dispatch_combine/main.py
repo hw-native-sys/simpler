@@ -218,9 +218,9 @@ def build_chip_callable(platform: str, pto_isa_commit: str | None) -> ChipCallab
         config_name="ep_dispatch_combine_orchestration_config",
         binary=orch_bytes,
         children=[
-            (0, CoreCallable.build(signature=sig_dispatch, arg_index=[0, 1, 2, 3, 4, 5, 6, 7, 8], binary=dispatch_bin)),
-            (1, CoreCallable.build(signature=sig_local_expert, arg_index=[0, 1, 2, 3], binary=local_expert_bin)),
-            (2, CoreCallable.build(signature=sig_combine, arg_index=[0, 1, 2, 3], binary=combine_bin)),
+            (0, CoreCallable.build(signature=sig_dispatch, binary=dispatch_bin)),
+            (1, CoreCallable.build(signature=sig_local_expert, binary=local_expert_bin)),
+            (2, CoreCallable.build(signature=sig_combine, binary=combine_bin)),
         ],
     )
 

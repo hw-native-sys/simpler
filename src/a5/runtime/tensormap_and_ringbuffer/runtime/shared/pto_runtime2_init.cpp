@@ -229,7 +229,22 @@ PTO2OrchestratorLayout PTO2OrchestratorState::reserve_layout(
     const int32_t dep_pool_capacities[PTO2_MAX_RING_DEPTH]
 ) {
     PTO2OrchestratorLayout layout{};
-    layout.scope_tasks_cap = PTO2_SCOPE_TASKS_CAP;
+    // scope_tasks holds every task in the open scope across all rings, so its cap
+    // is the real in-flight budget = sum of the (runtime) per-ring windows. Using
+    // the compile-time PTO2_SCOPE_TASKS_CAP instead under-sized the buffer when
+    // ring_task_window was enlarged past the default (premature SCOPE_TASKS_OVERFLOW)
+    // and over-allocated it when shrunk. See issue #1188.
+    //
+    // Accumulate in int64: each window is validated <= INT32_MAX individually, but
+    // the sum of PTO2_MAX_RING_DEPTH windows can exceed it — a bare int32 sum would
+    // wrap to a negative/undersized cap. Bound the result before narrowing.
+    int64_t scope_tasks_cap = 0;
+    for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
+        always_assert(task_window_sizes[r] > 0);
+        scope_tasks_cap += task_window_sizes[r];
+    }
+    always_assert(scope_tasks_cap <= std::numeric_limits<int32_t>::max());
+    layout.scope_tasks_cap = static_cast<int32_t>(scope_tasks_cap);
     layout.scope_stack_capacity = PTO2_MAX_SCOPE_DEPTH;
     for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
         layout.dep_pool_capacities[r] = dep_pool_capacities[r];

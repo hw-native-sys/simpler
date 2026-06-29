@@ -22,9 +22,11 @@ Optional benchmark arguments forwarded to `tools/benchmark_rounds.sh`:
 /benchmark
 /benchmark -d 4 -n 50
 /benchmark -d 4 -d 6
+/benchmark --serial-orch-sched
 ```
 
-Extra arguments (`-n`, `-r`, etc.) are forwarded to `tools/benchmark_rounds.sh`.
+Extra arguments (`-n`, `-r`, `--serial-orch-sched`, etc.) are forwarded to
+`tools/benchmark_rounds.sh`.
 
 ### Device arguments (`-d`)
 
@@ -113,6 +115,10 @@ WORKTREE_ABS="/home/user/simpler/tmp/worktree_baseline_20260331_102302"
 ```bash
 ./tools/benchmark_rounds.sh $BENCH_ARGS -r "$RUNTIME" 2>&1 | tee "tmp/benchmark_${TIMESTAMP}.txt"
 ```
+
+Use `--serial-orch-sched` to run each case once in the default overlapped mode
+and once with `PTO2_SERIAL_ORCH_SCHED=1`, then emit serial-vs-parallel
+Delta/Change tables.
 
 ### Compare Mode
 
@@ -214,15 +220,26 @@ git -C "$PROJECT_ROOT" worktree remove "$WORKTREE_ABS" --force
 
 ## Step 6: Report Results
 
-Parse all five `<Metric> Trimmed Avg:` lines per example (`Host`, `Device`, `Total`, `Sched`, `Orch`) from benchmark output.
+Parse all five `Avg <Metric>:` lines per example (`Host`, `Device`, `Effective`, `Orch`, `Sched`) from benchmark output.
 
 | Metric | Source | What it captures |
 | ------ | ------ | ---------------- |
-| Host | `RunTiming.host_wall_us` | steady_clock around dispatch (Python overhead included) |
-| Device | `RunTiming.device_wall_us` | AICPU mailbox `orch_start` → `orch_end` |
-| Total | device log | full span across `sched_*` / `orch_*` events |
-| Sched | device log | `sched_start` → `sched_end` |
-| Orch | device log | `orch_start` → `orch_end` |
+| Host | `[STRACE]` `run_prepared` span | steady_clock around dispatch (Python overhead included); rendered from markers by `strace_timing --rounds-table` |
+| Device | `[STRACE]` `run_prepared.runner_run.device_wall` span | full on-NPU AICPU run wall (`AicpuPhase::RunWall`, `max(end) − min(start)` across threads) — the whole run + teardown, strictly larger than the windows below |
+| Effective | orch/sched markers' device-domain `ts`+`dur` | `max(orch_end,sched_end) − min(orch_start,sched_start)` — the orch∪sched merged window (the old device-log "Total"), now pure-marker |
+| Orch | `[STRACE]` `…device_wall.orch` span (`--rounds-table`) | orchestrator (graph-build) window |
+| Sched | `[STRACE]` `…device_wall.sched` span (`--rounds-table`) | scheduler dispatch/execution window |
+
+The scene test only *emits* `[STRACE]` markers to stderr; `benchmark_rounds.sh`
+tees the run and renders the Host/Device/Effective/Orch/Sched table with
+`python -m simpler_setup.tools.strace_timing <log> --rounds-table`. All columns
+come from the markers (onboard and sim) — no CANN device log is read.
+
+For a per-stage breakdown of `Host`/`Device` (host `bind`/`runner_run`/`validate`
+plus the AICPU `preamble`/`so_load`/`graph_build`/`post_orch` subdivision), parse
+the `[STRACE]` markers with `simpler_setup/tools/strace_timing.py` — see
+[docs/dfx/host-trace.md](../../../docs/dfx/host-trace.md). Same `SIMPLER_PROFILING`
+gate, no extra flag.
 
 ### Single Mode
 
@@ -230,16 +247,16 @@ Parse all five `<Metric> Trimmed Avg:` lines per example (`Host`, `Device`, `Tot
 Benchmark at: <short SHA>
 Args: -d 4 -n 100
 
-Example                          Host (us)   Device (us)   Total (us)   Sched (us)   Orch (us)
--------------------------------  ---------   -----------   ----------   ----------   ---------
-alternating_matmul_add           480000.0        9050.0       1235.5       1235.4       820.3
-benchmark_bgemm                  370000.0        7100.0        892.1        892.0       650.2
+Example                          Host (us)   Device (us)   Effective (us)    Orch (us)   Sched (us)
+-------------------------------  ---------   -----------   --------------   ----------   ----------
+alternating_matmul_add           480000.0        9050.0         1235.5          820.3       1235.4
+benchmark_bgemm                  370000.0        7100.0          892.1          650.2        892.0
 ...
 ```
 
 ### Compare Mode
 
-Show comparison table per metric (one row per metric per example), **grouped by runtime**. `Total` is the headline metric used in the overall summary; the other four are sub-rows for context:
+Show comparison table per metric (one row per metric per example), **grouped by runtime**. `Effective` is the headline metric used in the overall summary; the other four are sub-rows for context:
 
 ```text
 Merge-base: <short SHA>  →  HEAD: <short SHA> (+ uncommitted)
@@ -253,16 +270,16 @@ Example                      Base (us)   HEAD (us)   Delta (us)   Change (%)
 alternating_matmul_add         1240.1      1235.5        -4.6       -0.37%
   (host)                     480000.0    470000.0    -10000.0       -2.08%
   (device)                     9000.0      8800.0       -200.0       -2.22%
-  (sched)                      1240.0      1235.4        -4.6       -0.37%
   (orch)                        830.0       820.3        -9.7       -1.17%
+  (sched)                      1240.0      1235.4        -4.6       -0.37%
 benchmark_bgemm                 890.3       892.1        +1.8       +0.20%
   (host)                     370000.0    370500.0      +500.0       +0.14%
   (device)                     7100.0      7080.0       -20.0       -0.28%
-  (sched)                       890.2       892.0        +1.8       +0.20%
   (orch)                        650.0       650.2        +0.2       +0.03%
+  (sched)                       890.2       892.0        +1.8       +0.20%
 ...
 
-Overall: X of Y examples improved, Z regressed   (based on Total)
+Overall: X of Y examples improved, Z regressed   (based on Effective)
 ```
 
 If baseline and current ran on **different devices**, add a note:
@@ -285,7 +302,7 @@ If any example shows > 5% regression, highlight it explicitly.
 | ----- | ------ |
 | No idle device and no `-d` specified | Prompt user to specify device ID |
 | Benchmark script fails | Report which examples failed; continue with remaining |
-| No timing data | Warn: "No timing markers — ensure `PTO2_PROFILING` is enabled" |
+| No timing data | Warn: "No timing markers — ensure `SIMPLER_PROFILING` is enabled" |
 | All examples fail | Check: did you run `pip install -e .` in the worktree venv? |
 | Worktree creation fails | Fall back to stash/checkout approach or report error |
 | `Pre-built runtime binaries not found` | The venv `pip install -e .` should have built these; re-run it |
@@ -301,6 +318,6 @@ If any example shows > 5% regression, highlight it explicitly.
 - [ ] (Compare mode) Baseline completed — venv activated, `pwd` confirmed worktree path before running
 - [ ] Current completed in main workspace
 - [ ] Worktree cleaned up (compare mode)
-- [ ] Results table presented with Host / Device / Total / Sched / Orch times
+- [ ] Results table presented with Host / Device / Effective / Orch / Sched times
 - [ ] (Compare mode) Device difference noted if applicable
 - [ ] (Compare mode) Regressions > 2% flagged

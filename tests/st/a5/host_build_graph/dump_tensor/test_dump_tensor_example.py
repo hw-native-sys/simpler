@@ -36,14 +36,12 @@ class TestDumpTensorExample(SceneTestCase):
                 "source": "kernels/aiv/kernel_add.cpp",
                 "core_type": "aiv",
                 "signature": [D.IN, D.IN, D.OUT],
-                "arg_index": [0, 1, 2],
             },
             {
                 "func_id": 1,
                 "source": "kernels/aiv/kernel_add_scalar_inplace.cpp",
                 "core_type": "aiv",
                 "signature": [D.INOUT],
-                "arg_index": [0],
             },
         ],
     }

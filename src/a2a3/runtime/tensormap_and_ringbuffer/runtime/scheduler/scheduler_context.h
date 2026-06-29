@@ -94,6 +94,11 @@ public:
     // mode where rt is created by the orchestrator thread after init().
     void bind_runtime(PTO2Runtime *rt);
 
+    // Serial orch->sched mode pre-dispatch wait. Thread 0 may drain deferred
+    // wiring to keep the bounded wiring queue from back-pressuring orchestration,
+    // but no AICore dispatch happens before orchestrator_done_.
+    void wait_for_orchestration_done_before_dispatch(Runtime *runtime, int32_t thread_idx);
+
     // =========================================================================
     // State queries / external synchronization points
     // =========================================================================
@@ -102,6 +107,7 @@ public:
     int32_t aiv_count() const { return aiv_count_; }
     bool is_completed() const { return completed_.load(std::memory_order_acquire); }
     int32_t completed_tasks_count() const { return completed_tasks_.load(std::memory_order_acquire); }
+    bool orchestration_done() const { return orchestrator_done_.load(std::memory_order_relaxed); }
 
 private:
     // =========================================================================
@@ -142,8 +148,7 @@ private:
     std::atomic<int32_t> completed_tasks_{0};
     int32_t total_tasks_{0};
     // Device orchestration: set by last orchestrator when graph is built; schedulers poll it.
-    // volatile prevents the compiler from hoisting the load out of spin loops.
-    volatile bool orchestrator_done_{false};
+    std::atomic<bool> orchestrator_done_{false};
     std::atomic<bool> completed_{false};
     uint64_t *func_id_to_addr_{nullptr};
 

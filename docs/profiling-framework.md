@@ -15,6 +15,12 @@ The per-collector pages
 [scope-stats.md](dfx/scope-stats.md))
 describe the data each subsystem collects and how it enables it on-device.
 
+For everyday per-run timing (no collector, always on under `SIMPLER_PROFILING`):
+[l2-timing.md](dfx/l2-timing.md) covers host_wall / device_wall (`[STRACE]` markers) +
+device-log Orch/Sched/Total, and [host-trace.md](dfx/host-trace.md) +
+[device-phases.md](dfx/device-phases.md) cover the `[STRACE]` per-stage
+breakdown of `run_prepared` (host stages + AICPU phase subdivision).
+
 ## 1. Why a shared framework
 
 Each profiling subsystem on a2a3 needs the same plumbing on the host:

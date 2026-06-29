@@ -16,6 +16,14 @@
 #define PTO2_PROFILING 1
 #endif
 
+// Gate for the host-side `[STRACE]` run-timing trace facility
+// (src/common/log/include/common/strace.h). Separate from PTO2_PROFILING (which
+// gates the device orch/sched markers) so the host trace can be toggled
+// independently; default on, mirroring PTO2_PROFILING.
+#ifndef SIMPLER_PROFILING
+#define SIMPLER_PROFILING 1
+#endif
+
 #ifndef PTO2_ORCH_PROFILING
 #define PTO2_ORCH_PROFILING 0
 #endif

@@ -225,6 +225,12 @@ public:
     // Those are the pointers with the allocated memory on the device
     void *tracrData_;
     void *tracrDataSizes_;
+    
+    // Serial orchestrator -> scheduler start control.
+    // When true, scheduler threads wait until orchestration has fully built the
+    // task graph before entering resolve_and_dispatch().
+    // Controlled via PTO2_SERIAL_ORCH_SCHED environment variable.
+    bool serial_orch_sched;
 
 private:
     // Kernel binary tracking for cleanup

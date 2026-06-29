@@ -99,14 +99,20 @@ int PmuCollector::init(
     // table is filled fully by the host. AICore resolves its own PMU MMIO
     // base at kernel entry from `KernelArgs::regs[get_physical_core_id()]`,
     // so no separate PMU reg-address table is needed.
-    aicore_rings_dev_.assign(num_cores, nullptr);
+    // Held in locals and published to the aicore_rings_dev_ / aicore_ring_addrs_*
+    // members only after guard.commit() (see end of this function). The table
+    // alloc registers in the rollback guard and each ring is added via
+    // add_direct_ptr, so a later init failure frees them; assigning the members
+    // here would leave them dangling at freed memory.
+    std::vector<void *> aicore_rings_dev_local(num_cores, nullptr);
     size_t table_size = static_cast<size_t>(num_cores) * sizeof(uint64_t);
-    aicore_ring_addrs_dev_ = alloc_paired_buffer(table_size, &aicore_ring_addrs_host_);
-    if (aicore_ring_addrs_dev_ == nullptr) {
+    void *ring_addrs_host_local = nullptr;
+    void *ring_addrs_dev_local = alloc_paired_buffer(table_size, &ring_addrs_host_local);
+    if (ring_addrs_dev_local == nullptr) {
         LOG_ERROR("PmuCollector: failed to allocate aicore ring address table (%zu bytes)", table_size);
         return -1;
     }
-    std::memset(aicore_ring_addrs_host_, 0, table_size);
+    std::memset(ring_addrs_host_local, 0, table_size);
 
     // ---- Allocate per-core PmuBuffers; populate free_queues + recycled pool ----
     const size_t buf_size = sizeof(PmuBuffer);
@@ -120,10 +126,10 @@ int PmuCollector::init(
             LOG_ERROR("PmuCollector: failed to allocate PmuAicoreRing for core %d", c);
             return -1;
         }
-        aicore_rings_dev_[c] = ring_dev;
+        aicore_rings_dev_local[c] = ring_dev;
         guard.add_direct_ptr(ring_dev);
         state->aicore_ring_ptr = reinterpret_cast<uint64_t>(ring_dev);
-        reinterpret_cast<uint64_t *>(aicore_ring_addrs_host_)[c] = reinterpret_cast<uint64_t>(ring_dev);
+        reinterpret_cast<uint64_t *>(ring_addrs_host_local)[c] = reinterpret_cast<uint64_t>(ring_dev);
 
         for (int b = 0; b < PLATFORM_PMU_BUFFERS_PER_CORE; b++) {
             void *host_ptr = nullptr;
@@ -145,7 +151,7 @@ int PmuCollector::init(
     }
 
     // Push the populated ring address table to device.
-    profiling_copy_to_device(aicore_ring_addrs_dev_, aicore_ring_addrs_host_, table_size);
+    profiling_copy_to_device(ring_addrs_dev_local, ring_addrs_host_local, table_size);
 
     // Push the entire initialized shm region (header + BufferStates +
     // free_queue contents) to device.
@@ -170,22 +176,27 @@ int PmuCollector::init(
         csv_header_ = std::move(header);
     }
 
-    initialized_ = true;
+    LOG_INFO_V0(
+        "PMU collector initialized: %d cores, %d threads, SHM=0x%lx, CSV=%s (opened on first record)", num_cores,
+        num_threads, reinterpret_cast<unsigned long>(shm_dev_local), csv_path_.c_str()
+    );
+    guard.commit();
+    // Publish device-buffer members, the shm/memory context, and the
+    // initialized_ flag only after the rollback guard is disarmed. On a failed
+    // init they stay at their defaults — initialized_ stays false, so
+    // is_initialized() reports false and finalize() never runs against buffers
+    // the guard already freed. set_memory_context also publishes shm_host_;
+    // start(tf) gates on it, so this is the moment the collector becomes
+    // startable. initialized_ is published last, once everything else is set.
+    aicore_rings_dev_ = std::move(aicore_rings_dev_local);
+    aicore_ring_addrs_dev_ = ring_addrs_dev_local;
+    aicore_ring_addrs_host_ = ring_addrs_host_local;
     shm_dev_ = shm_dev_local;
-
-    // Re-set_memory_context now that the shm region is ready. start(tf)
-    // gates on shm_host_ being non-null, so this is the moment the
-    // collector becomes startable.
     set_memory_context(
         alloc_cb, register_cb, free_cb, profiling_copy_to_device_for_ops, profiling_copy_from_device_for_ops,
         shm_dev_local, shm_host_local, shm_size, device_id
     );
-
-    LOG_INFO_V0(
-        "PMU collector initialized: %d cores, %d threads, SHM=0x%lx, CSV=%s (opened on first record)", num_cores,
-        num_threads, reinterpret_cast<unsigned long>(shm_dev_), csv_path_.c_str()
-    );
-    guard.commit();
+    initialized_ = true;
     return 0;
 }
 

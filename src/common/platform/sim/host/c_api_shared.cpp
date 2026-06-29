@@ -36,6 +36,8 @@
 #include <utility>
 #include <vector>
 
+#include "common/device_phase.h"
+#include "common/strace.h"
 #include "common/unified_log.h"
 #include "cpu_sim_context.h"
 #include "host/raii_scope_guard.h"
@@ -333,16 +335,43 @@ int prepare_callable(DeviceContextHandle ctx, int32_t callable_id, const void *c
     }
 }
 
+// Emit device-domain phase markers (RunWall + its 4 AICPU subdivisions),
+// mirroring the onboard c_api. Phases never stamped (0 ns) are skipped.
+// STRACE_DEV_SPAN_AT self-compiles to nothing when profiling is off.
+static void emit_device_phase_markers(SimDeviceRunnerBase *runner) {
+    const uint64_t run_wall_ns = runner->last_device_phase_ns(AicpuPhase::RunWall);
+    if (run_wall_ns != 0) {
+        STRACE_DEV_SPAN_AT("run_prepared.runner_run.device_wall", 0, static_cast<long long>(run_wall_ns), 2);
+    }
+    struct PhaseName {
+        AicpuPhase phase;
+        const char *name;
+    };
+    static const PhaseName kPhases[] = {
+        {AicpuPhase::Preamble, "run_prepared.runner_run.device_wall.preamble"},
+        {AicpuPhase::SoLoad, "run_prepared.runner_run.device_wall.so_load"},
+        {AicpuPhase::GraphBuild, "run_prepared.runner_run.device_wall.graph_build"},
+        {AicpuPhase::PostOrch, "run_prepared.runner_run.device_wall.post_orch"},
+        {AicpuPhase::OrchWindow, "run_prepared.runner_run.device_wall.orch"},
+        {AicpuPhase::SchedWindow, "run_prepared.runner_run.device_wall.sched"},
+    };
+    for (const auto &p : kPhases) {
+        const uint64_t ns = runner->last_device_phase_ns(p.phase);
+        if (ns != 0) {
+            STRACE_DEV_SPAN_AT(
+                p.name, static_cast<long long>(runner->last_device_phase_start_ns(p.phase)), static_cast<long long>(ns),
+                3
+            );
+        }
+    }
+}
+
 int run_prepared(
     DeviceContextHandle ctx, RuntimeHandle runtime, int32_t callable_id, const void *args, int block_dim,
     int aicpu_thread_num, int enable_l2_swimlane, int enable_dump_tensor, int enable_pmu, int enable_dep_gen,
     int enable_scope_stats, const uint64_t *ring_task_window, const uint64_t *ring_heap, const uint64_t *ring_dep_pool,
-    const char *output_prefix, PtoRunTiming *out_timing
+    const char *output_prefix
 ) {
-    if (out_timing != NULL) {
-        out_timing->host_wall_ns = 0;
-        out_timing->device_wall_ns = 0;
-    }
     if (ctx == NULL || runtime == NULL) return -1;
     SimDeviceRunnerBase *runner = static_cast<SimDeviceRunnerBase *>(ctx);
 
@@ -354,7 +383,9 @@ int run_prepared(
     pthread_once(&g_runner_key_once, create_runner_key);
     pthread_setspecific(g_runner_key, ctx);
 
-    const auto host_t0 = std::chrono::steady_clock::now();
+    STRACE_NEW_INV();
+    STRACE_SET_HID(static_cast<uint64_t>(callable_id));
+    STRACE("run_prepared");
 
     try {
         Runtime *r = new (runtime) Runtime();
@@ -383,10 +414,13 @@ int run_prepared(
             return rc;
         }
 
-        rc = bind_callable_to_runtime_impl(
-            r, reinterpret_cast<const ChipStorageTaskArgs *>(args), bind_result.host_orch_func_ptr,
-            bind_result.signature, bind_result.sig_count, ring_task_window, ring_heap, ring_dep_pool
-        );
+        {
+            STRACE("run_prepared.bind");
+            rc = bind_callable_to_runtime_impl(
+                r, reinterpret_cast<const ChipStorageTaskArgs *>(args), bind_result.host_orch_func_ptr,
+                bind_result.signature, bind_result.sig_count, ring_task_window, ring_heap, ring_dep_pool
+            );
+        }
         if (rc != 0) {
             r->set_gm_sm_ptr(nullptr);
             validate_runtime_impl(r);
@@ -401,7 +435,10 @@ int run_prepared(
         runner->set_scope_stats_enabled(enable_scope_stats != 0);
         runner->set_output_prefix(output_prefix);
 
-        rc = runner->run(*r, block_dim, aicpu_thread_num);
+        {
+            STRACE("run_prepared.runner_run");
+            rc = runner->run(*r, block_dim, aicpu_thread_num);
+        }
         if (rc != 0) {
             validate_runtime_impl(r);
             pthread_setspecific(g_runner_key, nullptr);
@@ -416,14 +453,12 @@ int run_prepared(
             }
         }
 
-        rc = validate_runtime_impl(r);
-        pthread_setspecific(g_runner_key, nullptr);
-        if (out_timing != NULL) {
-            const auto host_t1 = std::chrono::steady_clock::now();
-            out_timing->host_wall_ns =
-                static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(host_t1 - host_t0).count());
-            out_timing->device_wall_ns = runner->last_device_wall_ns();
+        {
+            STRACE("run_prepared.validate");
+            rc = validate_runtime_impl(r);
         }
+        pthread_setspecific(g_runner_key, nullptr);
+        emit_device_phase_markers(runner);
         return rc;
     } catch (...) {
         pthread_setspecific(g_runner_key, nullptr);

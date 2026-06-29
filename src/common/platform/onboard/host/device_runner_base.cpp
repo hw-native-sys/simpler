@@ -55,9 +55,8 @@ HostRuntimeTimeoutConfig resolve_onboard_timeout_config() {
     RuntimeTimeoutConfig order_defaults{
         PLATFORM_OP_EXECUTE_TIMEOUT_US, PLATFORM_STREAM_SYNC_TIMEOUT_MS, PLATFORM_ONBOARD_SCHEDULER_TIMEOUT_MS
     };
-    HostRuntimeTimeoutConfig defaults{PLATFORM_OP_EXECUTE_TIMEOUT_US, PLATFORM_STREAM_SYNC_TIMEOUT_MS};
     RuntimeTimeoutParseStatus parse_status;
-    HostRuntimeTimeoutConfig cfg = resolve_host_runtime_timeout_config(order_defaults, &parse_status);
+    RuntimeTimeoutConfig cfg = resolve_runtime_timeout_config(order_defaults, &parse_status);
 
     if (parse_status.op_execute_env_set && !parse_status.op_execute_valid) {
         const char *op_env = std::getenv(PTO2_OP_EXECUTE_TIMEOUT_US_ENV);
@@ -75,20 +74,26 @@ HostRuntimeTimeoutConfig resolve_onboard_timeout_config() {
         );
     }
 
-    bool host_timeout_env_set = parse_status.op_execute_env_set || parse_status.stream_sync_env_set;
-    RuntimeTimeoutConfig order_cfg{
-        cfg.op_execute_timeout_us, cfg.stream_sync_timeout_ms, PLATFORM_ONBOARD_SCHEDULER_TIMEOUT_MS
-    };
-    RuntimeTimeoutOrderStatus order_status = validate_runtime_timeout_order(order_cfg);
+    if (parse_status.scheduler_env_set && !parse_status.scheduler_valid) {
+        const char *sched_env = std::getenv(PTO2_SCHEDULER_TIMEOUT_MS_ENV);
+        LOG_WARN(
+            "%s=%s invalid, using default %d", PTO2_SCHEDULER_TIMEOUT_MS_ENV, sched_env,
+            order_defaults.scheduler_timeout_ms
+        );
+    }
+
+    bool host_timeout_env_set =
+        parse_status.op_execute_env_set || parse_status.stream_sync_env_set || parse_status.scheduler_env_set;
+    RuntimeTimeoutOrderStatus order_status = validate_runtime_timeout_order(cfg);
     if (host_timeout_env_set && order_status != RuntimeTimeoutOrderStatus::OK) {
         LOG_WARN(
             "Ignoring PTO2 timeout env overrides: %s (scheduler=%d ms, op_execute=%llu us, stream_sync=%d ms)",
-            runtime_timeout_order_status_name(order_status), PLATFORM_ONBOARD_SCHEDULER_TIMEOUT_MS,
+            runtime_timeout_order_status_name(order_status), cfg.scheduler_timeout_ms,
             (unsigned long long)cfg.op_execute_timeout_us, cfg.stream_sync_timeout_ms
         );
-        return defaults;
+        return HostRuntimeTimeoutConfig{order_defaults.op_execute_timeout_us, order_defaults.stream_sync_timeout_ms};
     }
-    return cfg;
+    return HostRuntimeTimeoutConfig{cfg.op_execute_timeout_us, cfg.stream_sync_timeout_ms};
 }
 
 }  // namespace
@@ -760,6 +765,11 @@ int DeviceRunnerBase::unregister_callable(int32_t callable_id) {
 
 bool DeviceRunnerBase::has_callable(int32_t callable_id) const { return callables_.count(callable_id) != 0; }
 
+uint64_t DeviceRunnerBase::callable_hash(int32_t callable_id) const {
+    auto it = callables_.find(callable_id);
+    return it == callables_.end() ? 0 : it->second.hash;
+}
+
 BindCallableResult DeviceRunnerBase::bind_callable_to_runtime(Runtime &runtime, int32_t callable_id) {
     auto it = callables_.find(callable_id);
     if (it == callables_.end()) {
@@ -962,30 +972,34 @@ int DeviceRunnerBase::validate_launch_aicpu_num(int launch_aicpu_num) {
 }
 
 void DeviceRunnerBase::ensure_device_wall_buffer() {
-    // Run-wall slots: one { start_cycle, end_cycle } pair per launched AICPU
-    // thread. Each surviving AICPU thread writes its own slot (plain stores,
-    // no atomics); read_device_wall_ns() reduces max(end) - min(start). The
-    // buffer is allocated once (lazy) but RESET every run so a stale prior
-    // run cannot leak into the reduction.
-    constexpr int kWallSlots = PLATFORM_MAX_AICPU_THREADS_JUST_FOR_LAUNCH;
-    constexpr size_t kWallBytes = static_cast<size_t>(kWallSlots) * 2 * sizeof(uint64_t);
+    // Per-thread fixed AICPU phase records (thread-major:
+    // AicpuPhaseRecord[NUM_AICPU_PHASES] per launched AICPU thread). Slot
+    // AicpuPhase::RunWall keeps the original whole-run wall; the rest subdivide
+    // the on-NPU portion. Each surviving AICPU thread writes its own records
+    // (plain stores, no atomics); read_device_phases() reduces RunWall as
+    // max(end) - min(start) and surfaces the other phases as trace markers. The
+    // buffer is allocated once (lazy) but RESET every run so a stale prior run
+    // cannot leak into the reduction.
+    constexpr int kThreads = PLATFORM_MAX_AICPU_THREADS_JUST_FOR_LAUNCH;
+    constexpr int kRecords = kThreads * NUM_AICPU_PHASES;
+    constexpr size_t kBytes = static_cast<size_t>(kRecords) * sizeof(AicpuPhaseRecord);
     if (device_wall_dev_ptr_ == nullptr) {
-        device_wall_dev_ptr_ = allocate_tensor(kWallBytes);
+        device_wall_dev_ptr_ = allocate_tensor(kBytes);
         if (device_wall_dev_ptr_ != nullptr) {
             kernel_args_.args.device_wall_data_base = reinterpret_cast<uint64_t>(device_wall_dev_ptr_);
         }
     }
     if (device_wall_dev_ptr_ != nullptr) {
-        uint64_t init[kWallSlots * 2];
-        for (int i = 0; i < kWallSlots; ++i) {
-            init[i * 2] = UINT64_MAX;  // start: MAX so min() ignores unused slots
-            init[i * 2 + 1] = 0;       // end: 0 so max() ignores unused slots
+        AicpuPhaseRecord init[kRecords];
+        for (int i = 0; i < kRecords; ++i) {
+            init[i].start_cycle = kPhaseUnset;  // start: sentinel so min()/unset-check ignore unused slots
+            init[i].end_cycle = 0;              // end: 0 so max() ignores unused slots
         }
         if (copy_to_device(device_wall_dev_ptr_, init, sizeof(init)) != 0) {
-            // Reset failed — disable wall capture for this run so stale slot
-            // data can't leak into the reduction. Cleared pointer means the
-            // buffer is re-allocated (and re-reset) on the next run.
-            LOG_WARN("device_wall reset H2D failed; disabling wall capture this run");
+            // Reset failed — disable capture for this run so stale slot data
+            // can't leak into the reduction. Cleared pointer means the buffer
+            // is re-allocated (and re-reset) on the next run.
+            LOG_WARN("device_phase reset H2D failed; disabling phase capture this run");
             free_tensor(device_wall_dev_ptr_);
             device_wall_dev_ptr_ = nullptr;
             kernel_args_.args.device_wall_data_base = 0;
@@ -1084,37 +1098,52 @@ int DeviceRunnerBase::sync_run_streams() {
 }
 
 void DeviceRunnerBase::read_device_wall_ns() {
-    // Pull the platform-level device wall (ns) back from the 8-byte device
-    // buffer that AICPU writes through via KernelArgs::device_wall_data_base.
-    // (We can't use the device_k_args_ shadow here — CANN copies the
-    // KernelArgs payload into AICPU-private memory at launch, so AICPU's
-    // writes to its local copy don't propagate to device_k_args_.)
-    // Failure path is a soft warn — wall stays zero.
+    // Pull the per-thread AICPU phase records back from the device buffer that
+    // AICPU writes through via KernelArgs::device_wall_data_base. (We can't use
+    // the device_k_args_ shadow here — CANN's rtAicpuKernelLaunchExWithArgs
+    // copies KernelArgs into AICPU-private memory at launch, so AICPU's writes
+    // to its local copy don't propagate to device_k_args_.) Failure path is a
+    // soft warn — wall + phases stay zero.
     device_wall_ns_ = 0;
+    for (int p = 0; p < NUM_AICPU_PHASES; ++p) {
+        device_phase_ns_[p] = 0;
+        device_phase_start_ns_[p] = 0;
+    }
     if (device_wall_dev_ptr_ == nullptr) return;
 
-    constexpr int kWallSlots = PLATFORM_MAX_AICPU_THREADS_JUST_FOR_LAUNCH;
-    uint64_t buf[kWallSlots * 2] = {};
+    constexpr int kThreads = PLATFORM_MAX_AICPU_THREADS_JUST_FOR_LAUNCH;
+    constexpr int kRecords = kThreads * NUM_AICPU_PHASES;
+    AicpuPhaseRecord buf[kRecords] = {};
     int wall_rc = rtMemcpy(buf, sizeof(buf), device_wall_dev_ptr_, sizeof(buf), RT_MEMCPY_DEVICE_TO_HOST);
     if (wall_rc != 0) {
-        LOG_WARN("rtMemcpy(device_wall) D2H failed: %d", wall_rc);
+        LOG_WARN("rtMemcpy(device_phase) D2H failed: %d", wall_rc);
         return;
     }
 
-    // Reduce the per-thread slots: wall = max(end) - min(start) in cycles,
-    // converted to ns. Unused/dropped slots stay at { MAX, 0 } from the reset
-    // and are skipped by the sentinel checks.
-    uint64_t min_start = UINT64_MAX;
-    uint64_t max_end = 0;
-    for (int i = 0; i < kWallSlots; ++i) {
-        uint64_t s = buf[i * 2];
-        uint64_t e = buf[i * 2 + 1];
-        if (s != UINT64_MAX && s < min_start) min_start = s;
-        if (e > max_end) max_end = e;
+    // Reduce across threads: per phase, min(start) + span = max(end) - min(start)
+    // in cycles. RunWall (slot 0) is published as device_wall_ns_ for backward
+    // compatibility; its duration is the whole-run wall.
+    uint64_t start_cycles[NUM_AICPU_PHASES];
+    uint64_t span_cycles[NUM_AICPU_PHASES];
+    reduce_aicpu_phase_windows(buf, kThreads, start_cycles, span_cycles);
+
+    // Origin = earliest sub-phase start (Preamble..SchedWindow share the device
+    // clock; RunWall is the bracket at offset 0). Sub-phase start offsets from
+    // this origin give a common device-clock timeline so the orchestrator and
+    // scheduler windows are comparable (their union is the "Effective" window).
+    uint64_t origin = kPhaseUnset;
+    for (int p = static_cast<int>(AicpuPhase::Preamble); p < NUM_AICPU_PHASES; ++p) {
+        if (start_cycles[p] != kPhaseUnset && start_cycles[p] < origin) origin = start_cycles[p];
     }
-    if (min_start != UINT64_MAX && max_end > min_start) {
-        device_wall_ns_ = static_cast<uint64_t>(cycles_to_us(max_end - min_start) * 1000.0);
+
+    for (int p = 0; p < NUM_AICPU_PHASES; ++p) {
+        device_phase_ns_[p] = span_cycles[p] > 0 ? static_cast<uint64_t>(cycles_to_us(span_cycles[p]) * 1000.0) : 0;
+        if (p != static_cast<int>(AicpuPhase::RunWall) && start_cycles[p] != kPhaseUnset && origin != kPhaseUnset &&
+            start_cycles[p] >= origin) {
+            device_phase_start_ns_[p] = static_cast<uint64_t>(cycles_to_us(start_cycles[p] - origin) * 1000.0);
+        }
     }
+    device_wall_ns_ = device_phase_ns_[static_cast<int>(AicpuPhase::RunWall)];
 }
 
 int DeviceRunnerBase::init_runtime_args_with_metadata(Runtime &runtime) {

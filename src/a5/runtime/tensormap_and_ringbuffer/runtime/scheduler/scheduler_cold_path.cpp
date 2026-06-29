@@ -15,6 +15,7 @@
 
 #include "common/unified_log.h"
 #include "aicpu/dep_gen_collector_aicpu.h"
+#include "aicpu/device_phase_aicpu.h"
 #include "aicpu/device_time.h"
 #include "aicpu/l2_swimlane_collector_aicpu.h"
 #include "aicpu/platform_regs.h"
@@ -73,7 +74,7 @@ LoopAction SchedulerContext::handle_orchestrator_exit(
         return LoopAction::BREAK_LOOP;
     }
 
-    bool orch_done = orchestrator_done_;
+    bool orch_done = orchestrator_done_.load(std::memory_order_acquire);
     if (!orch_done) return LoopAction::NONE;
 
     task_count = total_tasks_;
@@ -405,11 +406,16 @@ int32_t SchedulerContext::handle_timeout_exit(
     }
 #if PTO2_PROFILING
     uint64_t sched_timeout_ts = get_sys_cnt_aicpu();
+    aicpu_phase_set_window(
+        AicpuPhase::SchedWindow, static_cast<uint64_t>(sched_start_ts), static_cast<uint64_t>(sched_timeout_ts)
+    );
+#if PTO2_SCHED_PROFILING
     LOG_INFO_V9(
         "Thread %d: sched_start=%" PRIu64 " sched_end(timeout)=%" PRIu64 " sched_cost=%.3fus", thread_idx,
         static_cast<uint64_t>(sched_start_ts), static_cast<uint64_t>(sched_timeout_ts),
         cycles_to_us(sched_timeout_ts - sched_start_ts)
     );
+#endif
 #endif
     return -PTO2_ERROR_SCHEDULER_TIMEOUT;
 }
@@ -418,11 +424,19 @@ int32_t SchedulerContext::handle_timeout_exit(
 void SchedulerContext::log_l2_swimlane_summary(int32_t thread_idx, int32_t cur_thread_completed) {
     auto &l2_swimlane = sched_l2_swimlane_[thread_idx];
     uint64_t sched_end_ts = get_sys_cnt_aicpu();
+    // Ride the sched window home to the host phase buffer (the host reduces
+    // across sched threads → the `Sched` [STRACE] marker). The verbose
+    // per-thread device-log line below is now opt-in deep-dive.
+    aicpu_phase_set_window(
+        AicpuPhase::SchedWindow, static_cast<uint64_t>(l2_swimlane.sched_start_ts), static_cast<uint64_t>(sched_end_ts)
+    );
+#if PTO2_SCHED_PROFILING
     LOG_INFO_V9(
         "Thread %d: sched_start=%" PRIu64 " sched_end=%" PRIu64 " sched_cost=%.3fus", thread_idx,
         static_cast<uint64_t>(l2_swimlane.sched_start_ts), static_cast<uint64_t>(sched_end_ts),
         cycles_to_us(sched_end_ts - l2_swimlane.sched_start_ts)
     );
+#endif
 
     uint64_t sched_total = l2_swimlane.sched_wiring_cycle + l2_swimlane.sched_complete_cycle +
                            l2_swimlane.sched_scan_cycle + l2_swimlane.sched_dispatch_cycle +
@@ -928,14 +942,15 @@ int32_t SchedulerContext::init(
         pmu_aicpu_init(physical_core_ids_, cores_total_num_);
         LOG_INFO_V0("PMU profiling started on %d cores", cores_total_num_);
     }
-#endif
-    // dep_gen is host-driven (SubmitTrace) and gated independently of
-    // PTO2_PROFILING. init() only pops the initial buffer from instance 0's
-    // free_queue; the orchestrator thread still records its idx via
+    // dep_gen is host-driven (SubmitTrace) — runtime-gated by the host flag —
+    // and compiles out with the other profiling subsystems at PTO2_PROFILING=0.
+    // init() only pops the initial buffer from instance 0's free_queue; the
+    // orchestrator thread still records its idx via
     // dep_gen_aicpu_set_orch_thread_idx() before the first record_submit.
     if (is_dep_gen_enabled()) {
         dep_gen_aicpu_init();
     }
+#endif
 
     // Initialize task counters. Task count comes from PTO2 shared memory.
     if (runtime->get_gm_sm_ptr()) {
@@ -959,7 +974,7 @@ int32_t SchedulerContext::init(
     completed_tasks_.store(0, std::memory_order_release);
 
     // Device orchestration: the orchestrator thread flips this when the graph is built.
-    orchestrator_done_ = false;
+    orchestrator_done_.store(false, std::memory_order_release);
 
     // Clear per-core dispatch payloads
     memset(payload_per_core_, 0, sizeof(payload_per_core_));
@@ -1007,7 +1022,7 @@ void SchedulerContext::deinit() {
     // Reset task counters and orchestrator state
     completed_tasks_.store(0, std::memory_order_release);
     total_tasks_ = 0;
-    orchestrator_done_ = false;
+    orchestrator_done_.store(false, std::memory_order_release);
 
     // Reset core transition state
     transition_requested_.store(false, std::memory_order_release);
@@ -1038,6 +1053,25 @@ void SchedulerContext::bind_runtime(PTO2Runtime *rt) {
     sched_ = &rt->scheduler;
 }
 
+void SchedulerContext::wait_for_orchestration_done_before_dispatch(Runtime *runtime, int32_t thread_idx) {
+    while (!orchestration_done() && !completed_.load(std::memory_order_acquire)) {
+        if (thread_idx == 0 && sched_ != nullptr) {
+            // Use the wiring subsystem's normal batch/backoff policy while
+            // waiting. This still honors orch_needs_drain/producer_blocked
+            // signals without force-draining an empty queue every spin.
+            int wired = sched_->drain_wiring_queue(/*force_drain=*/false);
+            if (wired > 0) {
+                continue;
+            }
+        }
+        if (sched_ != nullptr && sched_->sm_header != nullptr &&
+            check_idle_fatal_error(thread_idx, sched_->sm_header, runtime) == LoopAction::BREAK_LOOP) {
+            break;
+        }
+        SPIN_WAIT_HINT();
+    }
+}
+
 // =============================================================================
 // Post-orchestration bookkeeping. Runs on the orchestrator thread once the
 // build phase finishes; folds inline-completed tasks, flips orchestrator_done_,
@@ -1063,7 +1097,7 @@ void SchedulerContext::on_orchestration_done(
         rt->scheduler.tasks_completed.fetch_add(inline_completed, std::memory_order_relaxed);
 #endif
     }
-    orchestrator_done_ = true;
+    orchestrator_done_.store(true, std::memory_order_release);
 
     // Check for fatal error from orchestration; if so, shut down immediately.
     int32_t orch_err = 0;

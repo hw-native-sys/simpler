@@ -170,6 +170,8 @@ jobs:
     if: needs.detect-changes.outputs.a2a3_changed == 'true'
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
+    env:
+      PTO2_SCHEDULER_TIMEOUT_MS: "5000"
     strategy:
       matrix:
         os: [ubuntu-latest, macos-latest]
@@ -259,6 +261,8 @@ jobs:
     if: needs.detect-changes.outputs.a5_changed == 'true'
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
+    env:
+      PTO2_SCHEDULER_TIMEOUT_MS: "5000"
     strategy:
       matrix:
         os: [ubuntu-latest, macos-latest]
@@ -453,6 +457,10 @@ jobs:
   ut-a2a3:
     runs-on: [self-hosted, a2a3]
     timeout-minutes: 30
+    env:
+      PTO2_SCHEDULER_TIMEOUT_MS: "2000"
+      PTO2_OP_EXECUTE_TIMEOUT_US: "3000000"
+      PTO2_STREAM_SYNC_TIMEOUT_MS: "4000"
 
     steps:
       - name: Checkout repository
@@ -543,6 +551,10 @@ jobs:
     if: needs.detect-changes.outputs.a2a3_changed == 'true'
     runs-on: [self-hosted, a2a3]
     timeout-minutes: 60
+    env:
+      PTO2_SCHEDULER_TIMEOUT_MS: "2000"
+      PTO2_OP_EXECUTE_TIMEOUT_US: "3000000"
+      PTO2_STREAM_SYNC_TIMEOUT_MS: "4000"
 
     steps:
       - name: Checkout repository
@@ -664,6 +676,10 @@ jobs:
   ut-a5:
     runs-on: [self-hosted, a5]
     timeout-minutes: 30
+    env:
+      PTO2_SCHEDULER_TIMEOUT_MS: "2000"
+      PTO2_OP_EXECUTE_TIMEOUT_US: "3000000"
+      PTO2_STREAM_SYNC_TIMEOUT_MS: "4000"
 
     steps:
       - name: Checkout repository
@@ -737,6 +753,10 @@ jobs:
     if: needs.detect-changes.outputs.a5_changed == 'true'
     runs-on: [self-hosted, a5]
     timeout-minutes: 60
+    env:
+      PTO2_SCHEDULER_TIMEOUT_MS: "2000"
+      PTO2_OP_EXECUTE_TIMEOUT_US: "3000000"
+      PTO2_STREAM_SYNC_TIMEOUT_MS: "4000"
 
     steps:
       - name: Checkout repository

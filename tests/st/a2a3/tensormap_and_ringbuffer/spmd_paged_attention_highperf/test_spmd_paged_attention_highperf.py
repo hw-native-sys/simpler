@@ -140,7 +140,6 @@ class TestSpmdPagedAttentionHighPerf(SceneTestCase):
                     D.IN,
                     D.IN,
                 ],
-                "arg_index": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14],
             },
             {
                 "func_id": 1,
@@ -164,7 +163,6 @@ class TestSpmdPagedAttentionHighPerf(SceneTestCase):
                     D.IN,
                     D.IN,
                 ],
-                "arg_index": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14],
             },
         ],
     }

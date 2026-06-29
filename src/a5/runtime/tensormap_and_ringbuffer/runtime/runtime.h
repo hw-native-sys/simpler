@@ -235,6 +235,12 @@ public:
     // Controlled via PTO2_ORCH_TO_SCHED environment variable.
     bool orch_to_sched;
 
+    // Serial orchestrator -> scheduler start control.
+    // When true, scheduler threads wait until orchestration has fully built the
+    // task graph before entering resolve_and_dispatch().
+    // Controlled via PTO2_SERIAL_ORCH_SCHED environment variable.
+    bool serial_orch_sched;
+
 private:
     // Kernel binary tracking for cleanup
     int registered_kernel_func_ids_[RUNTIME_MAX_FUNC_ID];

@@ -69,7 +69,6 @@ import socket
 import struct
 import sys
 import threading
-import time
 import uuid
 from dataclasses import dataclass
 from multiprocessing.shared_memory import SharedMemory
@@ -79,7 +78,6 @@ import cloudpickle
 from _task_interface import (  # pyright: ignore[reportMissingImports]
     MAX_REGISTERED_CALLABLE_IDS,
     RUNTIME_ENV_RING_COUNT,
-    RunTiming,
     WorkerType,
     _mailbox_load_i32,
     _mailbox_store_i32,
@@ -3793,7 +3791,7 @@ class Worker:
     # run — uniform entry point
     # ------------------------------------------------------------------
 
-    def run(self, callable, args=None, config=None) -> RunTiming:
+    def run(self, callable, args=None, config=None) -> None:
         """Execute one task (L2) or one DAG (L3+) synchronously.
 
         Dispatch:
@@ -3806,12 +3804,12 @@ class Worker:
         ``args``  : TaskArgs (optional)
         ``config``: CallConfig (optional, default-constructed if None)
 
-        Returns a :class:`RunTiming` with ``host_wall_us`` (Python wall-clock
-        around the dispatch) and ``device_wall_us`` (on-NPU orchestrator wall,
-        populated whenever the runtime was built with ``PTO2_PROFILING`` —
-        the default build has it on). For L3+ DAGs, ``host_wall_us`` covers
-        the whole orch fn and ``device_wall_us`` is unset (0) — per-task
-        device timings are not aggregated here.
+        Returns ``None``. Per-stage run timing (host wall, on-NPU device wall +
+        AICPU phase breakdown) is no longer returned — the platform emits it as
+        ``[STRACE]`` log markers from each L2 ``run_prepared``, so the L3
+        dispatcher and its L2 children are observed uniformly. Parse the markers
+        with ``simpler_setup.tools.strace_timing`` (see
+        ``docs/dfx/host-trace.md``).
         """
         assert self._initialized, "Worker not initialized; call init() first"
         cfg = config if config is not None else CallConfig()
@@ -3819,7 +3817,8 @@ class Worker:
         if self.level == 2:
             assert self._chip_worker is not None
             state = self._resolve_handle(callable, expected_namespace="LOCAL_CHIP")
-            return self._chip_worker._run_slot(state.slot_id, args, cfg)
+            self._chip_worker._run_slot(state.slot_id, args, cfg)
+            return None
 
         self._start_hierarchical()
         assert self._orch is not None
@@ -3830,7 +3829,6 @@ class Worker:
         # poked it.
         self._orch._clear_error()
         self._orch._scope_begin()
-        t_start = time.perf_counter_ns()
         try:
             callable(self._orch, args, cfg)
         finally:
@@ -3867,11 +3865,9 @@ class Worker:
                 self._execute_pending_domain_releases()
                 if self._live_domains:
                     self._release_all_live_domains()
-        # device_wall stays 0 for L3+: aggregating per-task device cycles
-        # across a DAG isn't implemented here (would need accumulation in the
-        # ring scheduler). Callers wanting per-task device wall should issue
-        # individual run calls.
-        return RunTiming(time.perf_counter_ns() - t_start, 0)
+        # L3+ returns None like every other worker level; per-L2-child timing
+        # is emitted as `[STRACE]` markers from each run_prepared.
+        return None
 
     @property
     def aicpu_dlopen_count(self) -> int:
@@ -3978,6 +3974,3 @@ class Worker:
 
     def __exit__(self, *_: Any) -> None:
         self.close()
-
-
-Worker.run.__annotations__["return"] = RunTiming

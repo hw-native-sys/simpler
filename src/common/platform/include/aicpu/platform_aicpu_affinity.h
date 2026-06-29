@@ -57,3 +57,16 @@ bool platform_aicpu_affinity_gate_filter(const int32_t *allowed_cpus, int32_t al
 // aicpu_executor as the per-launch role identifier (sched 0..N-2 / orch
 // N-1).
 int32_t platform_aicpu_affinity_thread_idx();
+
+// Publish this thread's resolved exec index into the affinity TLS.
+//
+// Onboard, the filter gate already assigns the index, so this is a redundant
+// (same-value) store. Sim's basic gate does NOT assign an exec index, so
+// platform_aicpu_affinity_thread_idx() would return -1 inside the AICPU `.so`;
+// the executor resolves the real index (via its own fallback counter) and
+// publishes it here so every per-thread reader in the `.so` agrees — in
+// particular the per-thread AICPU phase-record slot
+// (aicpu_phase_self_records()), which otherwise has no valid index on sim and
+// drops every sub-phase stamp. Must be called on the executing thread, before
+// any phase stamping.
+void platform_aicpu_affinity_set_thread_idx(int32_t idx);

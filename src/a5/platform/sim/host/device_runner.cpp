@@ -30,6 +30,7 @@
 #include <string>
 #include <vector>
 
+#include "aicpu/device_phase_aicpu.h"
 #include "aicpu/platform_aicpu_affinity.h"
 #include "callable_protocol.h"
 #include "common/memory_barrier.h"
@@ -108,6 +109,7 @@ int DeviceRunner::ensure_binaries_loaded() {
         if (!load_sym("set_platform_regs", reinterpret_cast<void **>(&set_platform_regs_func_))) return -1;
         load_optional_sym("set_orch_device_id", reinterpret_cast<void **>(&set_orch_device_id_func_));
         if (!load_sym("set_platform_dump_base", reinterpret_cast<void **>(&set_platform_dump_base_func_))) return -1;
+        if (!load_sym("set_platform_phase_base", reinterpret_cast<void **>(&set_platform_phase_base_func_))) return -1;
         if (!load_sym("set_dump_args_enabled", reinterpret_cast<void **>(&set_dump_args_enabled_func_))) return -1;
         if (!load_sym("set_platform_l2_swimlane_base", reinterpret_cast<void **>(&set_platform_l2_swimlane_base_func_)))
             return -1;
@@ -368,10 +370,10 @@ int DeviceRunner::run(Runtime &runtime, int block_dim, int launch_aicpu_num) {
     const bool needs_orch_device_id = runtime.register_new_callable_id();
     if (aicpu_execute_func_ == nullptr || aicore_execute_func_ == nullptr || set_platform_regs_func_ == nullptr ||
         (needs_orch_device_id && set_orch_device_id_func_ == nullptr) || set_platform_dump_base_func_ == nullptr ||
-        set_dump_args_enabled_func_ == nullptr || set_platform_pmu_base_func_ == nullptr ||
-        set_pmu_enabled_func_ == nullptr || set_platform_dep_gen_base_func_ == nullptr ||
-        set_dep_gen_enabled_func_ == nullptr || set_scope_stats_enabled_func_ == nullptr ||
-        set_platform_scope_stats_base_func_ == nullptr) {
+        set_platform_phase_base_func_ == nullptr || set_dump_args_enabled_func_ == nullptr ||
+        set_platform_pmu_base_func_ == nullptr || set_pmu_enabled_func_ == nullptr ||
+        set_platform_dep_gen_base_func_ == nullptr || set_dep_gen_enabled_func_ == nullptr ||
+        set_scope_stats_enabled_func_ == nullptr || set_platform_scope_stats_base_func_ == nullptr) {
         LOG_ERROR("Executor functions not loaded. Call ensure_binaries_loaded first.");
         return -1;
     }
@@ -422,6 +424,19 @@ int DeviceRunner::run(Runtime &runtime, int block_dim, int launch_aicpu_num) {
     }
     const auto sim_t0 = std::chrono::steady_clock::now();
 
+    // AICPU phase capture (preamble/so_load/graph_build/post_orch + orch/sched).
+    // The sim AICPU threads run the same aicpu_execute as onboard; the phase
+    // buffer base is published into the dlopen'd runtime SO via the dlsym'd
+    // set_platform_phase_base (crossing the host↔SO boundary like the dump base),
+    // and each thread resolves its slot from platform_aicpu_affinity_thread_idx()
+    // — no C++ thread_local. Local buffer: sim runs in-process so its lifetime
+    // spans the join below; reduced into device_phase_ns_ after.
+    constexpr int kPhaseThreads = PLATFORM_MAX_AICPU_THREADS_JUST_FOR_LAUNCH;
+    std::vector<AicpuPhaseRecord> phase_buf(
+        static_cast<size_t>(kPhaseThreads) * NUM_AICPU_PHASES, AicpuPhaseRecord{kPhaseUnset, 0}
+    );
+    set_platform_phase_base_func_(reinterpret_cast<uint64_t>(phase_buf.data()));
+
     for (int i = 0; i < over_launch; i++) {
         aicpu_threads.push_back(create_thread([this, &runtime, launch_aicpu_num, over_launch, &aicpu_rc, sim_t0]() {
             if (!platform_aicpu_affinity_gate(launch_aicpu_num, over_launch)) {
@@ -467,6 +482,31 @@ int DeviceRunner::run(Runtime &runtime, int block_dim, int launch_aicpu_num) {
     if (device_wall_dev_ptr_ != nullptr) {
         device_wall_ns_ = *static_cast<uint64_t *>(device_wall_dev_ptr_);
     }
+
+    // Reduce the AICPU phase records (cycles → ns via the sim sys-cnt freq).
+    // RunWall keeps the steady_clock device_wall above for a single source.
+    // Per-phase start offsets (from the earliest sub-phase start) give the
+    // device spans a device-domain `ts`, so the orch∪sched "Effective" window
+    // is computable and the sub-phases nest correctly.
+    uint64_t phase_start[NUM_AICPU_PHASES];
+    uint64_t phase_cycles[NUM_AICPU_PHASES];
+    reduce_aicpu_phase_windows(phase_buf.data(), kPhaseThreads, phase_start, phase_cycles);
+    auto cyc_to_ns = [](uint64_t c) {
+        return static_cast<uint64_t>(c * 1'000'000'000.0 / static_cast<double>(PLATFORM_PROF_SYS_CNT_FREQ));
+    };
+    uint64_t origin = kPhaseUnset;
+    for (int p = static_cast<int>(AicpuPhase::Preamble); p < NUM_AICPU_PHASES; ++p) {
+        if (phase_start[p] != kPhaseUnset && phase_start[p] < origin) origin = phase_start[p];
+    }
+    for (int p = 0; p < NUM_AICPU_PHASES; ++p) {
+        device_phase_ns_[p] = cyc_to_ns(phase_cycles[p]);
+        device_phase_start_ns_[p] = 0;
+        if (p != static_cast<int>(AicpuPhase::RunWall) && phase_start[p] != kPhaseUnset && origin != kPhaseUnset &&
+            phase_start[p] >= origin) {
+            device_phase_start_ns_[p] = cyc_to_ns(phase_start[p] - origin);
+        }
+    }
+    device_phase_ns_[static_cast<int>(AicpuPhase::RunWall)] = device_wall_ns_;
 
     int runtime_rc = aicpu_rc.load(std::memory_order_acquire);
     if (runtime_rc != 0) {

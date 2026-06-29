@@ -457,28 +457,33 @@ static int alloc_windows_via_ipc(CommHandle h, uint64_t win_size) {
         }
     }
 
-    // Now we know every peer's device id. Enable cross-card P2P and poll
-    // until ENABLED. Mirrors hcomm/.../p2p_mgmt.cc::EnableP2P + WaitP2PEnabled.
+    // Now we know every peer's device id. Enable cross-card P2P, then run a
+    // best-effort confirmation poll. aclrtDeviceEnablePeerAccess is the
+    // operative call: it resolves the peer's physical id via the HCCL adapter
+    // and opens the HCCS route. Its success is what matters.
     for (int p = 0; p < nranks; ++p) {
         if (p == rank) continue;
         aclError r = aclrtDeviceEnablePeerAccess(peers[p].device_id, 0);
         if (r != ACL_SUCCESS) {
-            // Non-fatal but lossy: CANN 9.x does not expose a dedicated
-            // "already enabled" error code, so we cannot tell a benign
-            // re-enable from a real P2P failure (e.g. missing P2P link)
-            // here.  The subsequent aclrtDevicePeerAccessStatus poll is
-            // the real source of truth — it returns status=1 if access
-            // is genuinely up, and times out (30s) otherwise.  Failures
-            // that matter therefore still surface, just one stage later.
+            // CANN 9.x has no dedicated "already enabled" code, so a non-success
+            // here may be a benign re-enable. The poll below is confirmation only.
             LOG_WARN(
-                "[comm rank %d] ipc: EnablePeerAccess(peer_dev=%d) -> %d (deferring to status poll)", rank,
-                peers[p].device_id, static_cast<int>(r)
+                "[comm rank %d] ipc: EnablePeerAccess(peer_dev=%d) -> %d", rank, peers[p].device_id, static_cast<int>(r)
             );
         }
     }
+    // Confirmation poll. aclrtDevicePeerAccessStatus and EnablePeerAccess
+    // interpret the peer device-id differently under ASCEND_VISIBLE_DEVICES
+    // remapping: in the fork-per-chip model each process aclrtSetDevice's only
+    // its own device, so the status query cannot resolve the peer's logical id
+    // to a physical one and reports status=0 indefinitely even when P2P is up
+    // (enable succeeded + full-HCCS topology). So confirm quickly where the API
+    // is reliable (ARM/openEuler, non-remapped) and fall through with a warning
+    // otherwise; the file_barrier below still synchronizes every rank's enable,
+    // and a genuinely dead link surfaces as a kernel-side TWAIT hang. See #1018.
     for (int p = 0; p < nranks; ++p) {
         if (p == rank) continue;
-        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
         while (true) {
             int32_t status = 0;
             aclError r = aclrtDevicePeerAccessStatus(myDevice, peers[p].device_id, &status);
@@ -492,12 +497,12 @@ static int alloc_windows_via_ipc(CommHandle h, uint64_t win_size) {
             }
             if (status == 1) break;
             if (std::chrono::steady_clock::now() >= deadline) {
-                LOG_ERROR(
-                    "[comm rank %d] ipc: P2P enable timeout peer=%d peer_dev=%d status=%d", rank, p, peers[p].device_id,
-                    status
+                LOG_WARN(
+                    "[comm rank %d] ipc: P2P status unconfirmed peer=%d peer_dev=%d status=%d "
+                    "(proceeding after best-effort enable attempt, see device-remap note)",
+                    rank, p, peers[p].device_id, status
                 );
-                aclrtFree(localBuf);
-                return -1;
+                break;
             }
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
         }
@@ -544,7 +549,11 @@ static int alloc_windows_via_ipc(CommHandle h, uint64_t win_size) {
     for (int p = 0; p < nranks; ++p) {
         if (p == rank) continue;
         void *peerVa = nullptr;
-        aret = aclrtIpcMemImportByKey(&peerVa, peers[p].name, 0);
+        // ENABLE_PEER_ACCESS: the imported buffer lives on a peer device, so the
+        // import must request cross-device peer access. Without it the driver's
+        // halShmemOpenHandle rejects the cross-card handle (drvRetCode=8 ->
+        // rtsIpcMemImportByKey 507899). This is the proper API for peer access.
+        aret = aclrtIpcMemImportByKey(&peerVa, peers[p].name, ACL_RT_IPC_MEM_IMPORT_FLAG_ENABLE_PEER_ACCESS);
         if (aret != ACL_SUCCESS) {
             LOG_ERROR(
                 "[comm rank %d] ipc: ImportByKey(peer=%d pid=%d) -> %d", rank, p, peers[p].pid, static_cast<int>(aret)
@@ -714,30 +723,32 @@ static int domain_alloc_via_ipc(
         }
     }
 
-    // Enable cross-card P2P for every domain peer and poll until ENABLED.
-    // The orch-only allocate_domain model has no base comm_alloc_windows to
-    // own the P2P route, so each allocation must (idempotently) ensure it.
-    // aclrtDeviceEnablePeerAccess is process-global and per device-pair, so
-    // once any allocation has opened a given pair, later ones simply observe
-    // it already enabled — the call + status poll is cheap in that case.
-    // Without this, the IPC VA import below still succeeds, but device-side
-    // cross-chip access from kernels silently fails, so peer TWAIT /
-    // notification writes never land and the scheduler times out.  The
-    // aclrtDevicePeerAccessStatus poll is the source of truth (status==1) and
-    // surfaces a genuinely missing P2P link as a 30s timeout.
+    // Enable cross-card P2P for every domain peer, then a best-effort
+    // confirmation poll. The orch-only allocate_domain model has no base
+    // comm_alloc_windows to own the P2P route, so each allocation must
+    // (idempotently) ensure it. aclrtDeviceEnablePeerAccess is process-global
+    // and per device-pair; once any allocation opens a pair, later ones simply
+    // observe it. The enable is the operative call (resolves the peer physical
+    // id via the HCCL adapter and opens the HCCS route).
     for (int p = 0; p < subset_n; ++p) {
         if (p == my_dr) continue;
         aclError r = aclrtDeviceEnablePeerAccess(peers[p].device_id, 0);
         if (r != ACL_SUCCESS) {
             LOG_WARN(
-                "[comm rank %d] alloc_domain: EnablePeerAccess(peer_dev=%d) -> %d (deferring to status poll)", h->rank,
-                peers[p].device_id, static_cast<int>(r)
+                "[comm rank %d] alloc_domain: EnablePeerAccess(peer_dev=%d) -> %d", h->rank, peers[p].device_id,
+                static_cast<int>(r)
             );
         }
     }
+    // See the device-remap note in alloc_windows_via_ipc: under
+    // ASCEND_VISIBLE_DEVICES remapping aclrtDevicePeerAccessStatus cannot
+    // resolve a peer that this fork'd single-device process never set, so it
+    // reports status=0 even when P2P is up. Confirm quickly where reliable,
+    // else fall through with a warning; the file_barrier below synchronizes
+    // every rank's enable and a dead link surfaces as a kernel-side hang.
     for (int p = 0; p < subset_n; ++p) {
         if (p == my_dr) continue;
-        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
         while (true) {
             int32_t status = 0;
             aclError r = aclrtDevicePeerAccessStatus(myDevice, peers[p].device_id, &status);
@@ -751,12 +762,12 @@ static int domain_alloc_via_ipc(
             }
             if (status == 1) break;
             if (std::chrono::steady_clock::now() >= deadline) {
-                LOG_ERROR(
-                    "[comm rank %d] alloc_domain: P2P enable timeout peer_dr=%d peer_dev=%d status=%d", h->rank, p,
-                    peers[p].device_id, status
+                LOG_WARN(
+                    "[comm rank %d] alloc_domain: P2P status unconfirmed peer_dr=%d peer_dev=%d status=%d "
+                    "(proceeding after best-effort enable attempt, see device-remap note)",
+                    h->rank, p, peers[p].device_id, status
                 );
-                aclrtFree(localBuf);
-                return -1;
+                break;
             }
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
         }
@@ -805,7 +816,11 @@ static int domain_alloc_via_ipc(
     for (int p = 0; p < subset_n; ++p) {
         if (p == my_dr) continue;
         void *peerVa = nullptr;
-        aret = aclrtIpcMemImportByKey(&peerVa, peers[p].name, 0);
+        // ENABLE_PEER_ACCESS: the imported buffer lives on a peer device, so the
+        // import must request cross-device peer access. Without it the driver's
+        // halShmemOpenHandle rejects the cross-card handle (drvRetCode=8 ->
+        // rtsIpcMemImportByKey 507899). This is the proper API for peer access.
+        aret = aclrtIpcMemImportByKey(&peerVa, peers[p].name, ACL_RT_IPC_MEM_IMPORT_FLAG_ENABLE_PEER_ACCESS);
         if (aret != ACL_SUCCESS) {
             LOG_ERROR(
                 "[comm rank %d] alloc_domain: ImportByKey(peer_dr=%d pid=%d) -> %d", h->rank, p, peers[p].pid,

@@ -67,7 +67,7 @@ def _build_chip_callable(platform: str) -> ChipCallable:
         signature=[],
         func_name="l3_l2_orch_comm_orchestration",
         binary=orch,
-        children=[(0, CoreCallable.build(signature=[D.IN, D.OUT], arg_index=[0, 1], binary=aiv))],
+        children=[(0, CoreCallable.build(signature=[D.IN, D.OUT], binary=aiv))],
     )
 
 

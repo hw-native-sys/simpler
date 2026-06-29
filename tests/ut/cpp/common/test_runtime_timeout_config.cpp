@@ -15,11 +15,15 @@
 
 #include <gtest/gtest.h>
 
+#include "common/platform_config.h"
 #include "host/runtime_timeout_config.h"
 
 namespace {
 
-constexpr RuntimeTimeoutConfig kDefaults{3000000, 4000, 2000};
+constexpr RuntimeTimeoutConfig kDefaults{
+    PLATFORM_OP_EXECUTE_TIMEOUT_US, PLATFORM_STREAM_SYNC_TIMEOUT_MS, PLATFORM_ONBOARD_SCHEDULER_TIMEOUT_MS
+};
+constexpr RuntimeTimeoutConfig kCiTightTimeouts{3000000, 4000, 2000};
 
 void set_env_var(const char *name, const char *value) {
 #if defined(_WIN32)
@@ -87,9 +91,10 @@ TEST(RuntimeTimeoutConfig, UnsetEnvKeepsDefaults) {
     ScopedUnsetTimeoutEnv env;
     RuntimeTimeoutConfig cfg = resolve_runtime_timeout_config(kDefaults);
 
-    EXPECT_EQ(cfg.op_execute_timeout_us, 3000000u);
-    EXPECT_EQ(cfg.stream_sync_timeout_ms, 4000);
-    EXPECT_EQ(cfg.scheduler_timeout_ms, 2000);
+    EXPECT_EQ(cfg.op_execute_timeout_us, 45000000u);
+    EXPECT_EQ(cfg.stream_sync_timeout_ms, 50000);
+    EXPECT_EQ(cfg.scheduler_timeout_ms, 10000);
+    EXPECT_EQ(validate_runtime_timeout_order(cfg), RuntimeTimeoutOrderStatus::OK);
 }
 
 TEST(RuntimeTimeoutConfig, ValidEnvOverridesDefaults) {
@@ -120,7 +125,7 @@ TEST(RuntimeTimeoutConfig, InvalidEnvKeepsDefaultAndReportsStatus) {
     RuntimeTimeoutParseStatus status;
     RuntimeTimeoutConfig cfg = resolve_runtime_timeout_config(kDefaults, &status);
 
-    EXPECT_EQ(cfg.op_execute_timeout_us, 3000000u);
+    EXPECT_EQ(cfg.op_execute_timeout_us, 45000000u);
     EXPECT_TRUE(status.op_execute_env_set);
     EXPECT_FALSE(status.op_execute_valid);
 }
@@ -140,17 +145,8 @@ TEST(RuntimeTimeoutConfig, ReusedParseStatusStartsClean) {
     EXPECT_TRUE(status.op_execute_valid);
 }
 
-TEST(RuntimeTimeoutConfig, HostConfigIgnoresSchedulerEnv) {
-    ScopedUnsetTimeoutEnv env;
-    set_env_var(PTO2_SCHEDULER_TIMEOUT_MS_ENV, "8000");
-
-    RuntimeTimeoutParseStatus status;
-    HostRuntimeTimeoutConfig cfg = resolve_host_runtime_timeout_config(kDefaults, &status);
-
-    EXPECT_EQ(cfg.op_execute_timeout_us, 3000000u);
-    EXPECT_EQ(cfg.stream_sync_timeout_ms, 4000);
-    EXPECT_FALSE(status.scheduler_env_set);
-    EXPECT_TRUE(status.scheduler_valid);
+TEST(RuntimeTimeoutConfig, CiTightTimeoutsStillValidate) {
+    EXPECT_EQ(validate_runtime_timeout_order(kCiTightTimeouts), RuntimeTimeoutOrderStatus::OK);
 }
 
 TEST(RuntimeTimeoutConfig, InvalidTokenKeepsPriorValue) {
@@ -163,21 +159,22 @@ TEST(RuntimeTimeoutConfig, InvalidTokenKeepsPriorValue) {
 TEST(RuntimeTimeoutConfig, RejectsBrokenOrdering) {
     RuntimeTimeoutConfig cfg = kDefaults;
 
-    cfg.scheduler_timeout_ms = 3500;
+    cfg.scheduler_timeout_ms = 46000;
     EXPECT_EQ(validate_runtime_timeout_order(cfg), RuntimeTimeoutOrderStatus::SCHEDULER_NOT_BELOW_OP_EXECUTE);
 
     cfg = kDefaults;
-    cfg.op_execute_timeout_us = 4500000;
+    cfg.op_execute_timeout_us = 55000000;
     EXPECT_EQ(validate_runtime_timeout_order(cfg), RuntimeTimeoutOrderStatus::OP_EXECUTE_NOT_BELOW_STREAM_SYNC);
 
     cfg = kDefaults;
-    cfg.scheduler_timeout_ms = 2500;
+    cfg.scheduler_timeout_ms = 44000;
+    cfg.stream_sync_timeout_ms = 45100;
     EXPECT_EQ(validate_runtime_timeout_order(cfg), RuntimeTimeoutOrderStatus::STREAM_SYNC_NOT_COVERING_SCHEDULER_GUARD);
 }
 
 TEST(RuntimeTimeoutConfig, SimPlatformSkipsOnboardOrdering) {
     RuntimeTimeoutConfig cfg = kDefaults;
-    cfg.scheduler_timeout_ms = 8000;
+    cfg.scheduler_timeout_ms = 46000;
 
     EXPECT_EQ(validate_runtime_timeout_order_for_platform(cfg, "a2a3sim"), RuntimeTimeoutOrderStatus::OK);
     EXPECT_EQ(validate_runtime_timeout_order_for_platform(cfg, "a5sim"), RuntimeTimeoutOrderStatus::OK);

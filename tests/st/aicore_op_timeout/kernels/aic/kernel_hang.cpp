@@ -11,8 +11,9 @@
 
 /**
  * AIC kernel that never returns. The STARS op-execution watchdog
- * (PLATFORM_OP_EXECUTE_TIMEOUT_US, ~1 s) must reap it; this kernel exists
- * to exercise the 3-layer host timeout chain added in PR #718.
+ * (PLATFORM_OP_EXECUTE_TIMEOUT_US) must reap it;
+ * this kernel exists to
+ * exercise the 3-layer host timeout chain added in PR #718.
  */
 
 #include <cstdint>
