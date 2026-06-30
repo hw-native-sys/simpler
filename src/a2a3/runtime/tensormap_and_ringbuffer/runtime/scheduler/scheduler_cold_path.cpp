@@ -686,12 +686,17 @@ int32_t SchedulerContext::handshake_all_cores(Runtime *runtime) {
 
     LOG_INFO_V0("Handshaking with %d cores", cores_total_num_);
 
-    // Step 1: Write per-core payload addresses and send handshake signal.
-    // OUT_OF_ORDER_STORE_BARRIER() ensures task is globally visible before
-    // aicpu_ready=1, so AICore reads the correct payload pointer after waking up.
+    // Step 1: Write per-core payload addresses, then release all cores. The
+    // task pointers are written first and published with a single barrier, then
+    // aicpu_ready is raised for every core. One barrier (not one per core)
+    // suffices: the barrier guarantees every task store is globally visible
+    // before any aicpu_ready store, which is the only ordering AICore relies on
+    // (it reads task only after observing aicpu_ready==1).
     for (int32_t i = 0; i < cores_total_num_; i++) {
         all_handshakes[i].task = reinterpret_cast<uint64_t>(&payload_per_core_[i][0]);
-        OUT_OF_ORDER_STORE_BARRIER();
+    }
+    OUT_OF_ORDER_STORE_BARRIER();
+    for (int32_t i = 0; i < cores_total_num_; i++) {
         all_handshakes[i].aicpu_ready = 1;
     }
     OUT_OF_ORDER_STORE_BARRIER();
@@ -699,68 +704,96 @@ int32_t SchedulerContext::handshake_all_cores(Runtime *runtime) {
     // Get platform physical cores count for validation
     uint32_t max_physical_cores_count = platform_get_physical_cores_count();
 
-    // Step 2: Wait for all cores to respond, collect core type and register addresses
+    // Step 2: collect responses from all cores. The 72 AICore cores wake and
+    // advance their handshake phases in parallel, so we sweep — poll every
+    // outstanding core per pass and service whichever are ready — rather than
+    // blocking on core i before looking at core i+1. A per-core blocking loop
+    // serializes the wakeups (Σ per-core latency); sweeping overlaps them
+    // (≈ max per-core latency + one drain of the GM-flag polls). The flags are
+    // GM reads (not the nGnRE MMIO reg window), so the polls are not forced
+    // serial the way RegId::COND polling is.
     bool handshake_failed = false;
-    for (int32_t i = 0; i < cores_total_num_; i++) {
-        Handshake *hank = &all_handshakes[i];
+    uint64_t *regs = reinterpret_cast<uint64_t *>(regs_);
+    bool regs_phase_done[RUNTIME_MAX_WORKER] = {false};
+    uint64_t reg_addr_of[RUNTIME_MAX_WORKER] = {0};
 
-        while (hank->aicore_regs_ready == 0) {
-            SPIN_WAIT_HINT();
-        }
+    // Sweep A: wait for aicore_regs_ready, init that core's regs, ack with
+    // aicpu_regs_ready=1. Servicing a ready core (regs init + ack) carries no
+    // cross-core dependency, so it is done in-pass while other cores are still
+    // waking.
+    for (int32_t remaining = cores_total_num_; remaining > 0;) {
+        for (int32_t i = 0; i < cores_total_num_; i++) {
+            if (regs_phase_done[i]) continue;
+            Handshake *hank = &all_handshakes[i];
+            if (hank->aicore_regs_ready == 0) {
+                SPIN_WAIT_HINT();
+                continue;
+            }
 
-        uint32_t physical_core_id = hank->physical_core_id;
+            uint32_t physical_core_id = hank->physical_core_id;
+            if (physical_core_id >= max_physical_cores_count) {
+                LOG_ERROR(
+                    "Core %d reported invalid physical_core_id=%u (platform max=%u)", i, physical_core_id,
+                    max_physical_cores_count
+                );
+                handshake_failed = true;
+                regs_phase_done[i] = true;
+                remaining--;
+                continue;
+            }
 
-        if (physical_core_id >= max_physical_cores_count) {
-            LOG_ERROR(
-                "Core %d reported invalid physical_core_id=%u (platform max=%u)", i, physical_core_id,
-                max_physical_cores_count
-            );
-            handshake_failed = true;
-            continue;
-        }
-
-        uint64_t *regs = reinterpret_cast<uint64_t *>(regs_);
-        uint64_t reg_addr = regs[physical_core_id];
-
-        // Initialize AICore registers after discovery (first round)
-        platform_init_aicore_regs(reg_addr);
-        OUT_OF_ORDER_STORE_BARRIER();
-        hank->aicpu_regs_ready = 1;
-
-        OUT_OF_ORDER_STORE_BARRIER();
-
-        while (hank->aicore_done == 0) {
-            SPIN_WAIT_HINT();
-        }
-
-        CoreType type = hank->core_type;
-
-        core_exec_states_[i].reg_addr = reg_addr;
-        core_exec_states_[i].cond_ptr = get_reg_ptr(reg_addr, RegId::COND);
-
+            uint64_t reg_addr = regs[physical_core_id];
+            reg_addr_of[i] = reg_addr;
+            platform_init_aicore_regs(reg_addr);
+            OUT_OF_ORDER_STORE_BARRIER();
+            hank->aicpu_regs_ready = 1;
 #if PTO2_PROFILING
-        // Record physical_core_id for PMU init later (CoreExecState has no room
-        // for this field under PTO2_PROFILING).
-        physical_core_ids_[i] = physical_core_id;
+            physical_core_ids_[i] = physical_core_id;
 #endif
 #if !PTO2_PROFILING
-        core_exec_states_[i].worker_id = i;
-        core_exec_states_[i].physical_core_id = physical_core_id;
-        core_exec_states_[i].core_type = type;
+            core_exec_states_[i].physical_core_id = physical_core_id;
 #endif
-
-        if (type == CoreType::AIC) {
-            aic_worker_ids_[aic_count_++] = i;
-            LOG_INFO_V0("Core %d: AIC, physical_id=%u, reg_addr=0x%lx", i, physical_core_id, reg_addr);
-        } else {
-            aiv_worker_ids_[aiv_count_++] = i;
-            LOG_INFO_V0("Core %d: AIV, physical_id=%u, reg_addr=0x%lx", i, physical_core_id, reg_addr);
+            regs_phase_done[i] = true;
+            remaining--;
         }
     }
+    OUT_OF_ORDER_STORE_BARRIER();
 
     if (handshake_failed) {
         emergency_shutdown(runtime);
         return -1;
+    }
+
+    // Sweep B: wait for aicore_done, latch core type + register pointers. Same
+    // sweep so the second round-trip's wakeups also overlap.
+    bool done_phase_done[RUNTIME_MAX_WORKER] = {false};
+    for (int32_t remaining = cores_total_num_; remaining > 0;) {
+        for (int32_t i = 0; i < cores_total_num_; i++) {
+            if (done_phase_done[i]) continue;
+            Handshake *hank = &all_handshakes[i];
+            if (hank->aicore_done == 0) {
+                SPIN_WAIT_HINT();
+                continue;
+            }
+
+            CoreType type = hank->core_type;
+            uint64_t reg_addr = reg_addr_of[i];
+            core_exec_states_[i].reg_addr = reg_addr;
+            core_exec_states_[i].cond_ptr = get_reg_ptr(reg_addr, RegId::COND);
+#if !PTO2_PROFILING
+            core_exec_states_[i].worker_id = i;
+            core_exec_states_[i].core_type = type;
+#endif
+            if (type == CoreType::AIC) {
+                aic_worker_ids_[aic_count_++] = i;
+                LOG_INFO_V0("Core %d: AIC, reg_addr=0x%lx", i, reg_addr);
+            } else {
+                aiv_worker_ids_[aiv_count_++] = i;
+                LOG_INFO_V0("Core %d: AIV, reg_addr=0x%lx", i, reg_addr);
+            }
+            done_phase_done[i] = true;
+            remaining--;
+        }
     }
 
     LOG_INFO_V0("Core discovery complete: %d AIC, %d AIV", aic_count_, aiv_count_);
