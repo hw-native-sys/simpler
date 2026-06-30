@@ -50,6 +50,7 @@
 #include <atomic>
 #include <chrono>
 #include <csignal>
+#include <ctime>
 #include <cstdarg>
 #include <cstdint>
 #include <cstdio>
@@ -311,8 +312,13 @@ struct TraceEvent {
     int32_t lane;     // AIC=0 / AIV0=1 / AIV1=2
     uint8_t multicore;
     TracePhase phase;
-    double ts_us;   // start, microseconds from g_trace_epoch
-    double dur_us;  // span duration, microseconds
+    double ts_us;   // start, microseconds from g_trace_epoch (wall clock)
+    double dur_us;  // span duration, microseconds (wall clock)
+    // CPU time this thread actually accrued during the span (CLOCK_THREAD_CPUTIME_ID).
+    // On an oversubscribed host wall dur_us inflates while the thread is descheduled;
+    // cpu_us does not, so a large dur_us with small cpu_us == "swapped out, not work".
+    // Only meaningful for non-kernel overhead spans (kernel spans set it to dur_us).
+    double cpu_us;
 };
 
 struct RingSlot {
@@ -542,20 +548,32 @@ inline uint64_t now_ns() {
     );
 }
 
+// Per-thread CPU time (excludes time the thread spends descheduled). Used to
+// tell genuine work from host-oversubscription stalls in the swimlane.
+inline uint64_t thread_cpu_ns() {
+    struct timespec ts;
+    clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts);
+    return static_cast<uint64_t>(ts.tv_sec) * 1000000000ull + static_cast<uint64_t>(ts.tv_nsec);
+}
+
 // Snapshot the clock only when tracing is on (callers pass the result as a span
 // start). Returns 0 otherwise so the matching trace_overhead() is a no-op.
 inline uint64_t trace_now() { return g_trace_on ? now_ns() : 0; }
+inline uint64_t trace_now_cpu() { return g_trace_on ? thread_cpu_ns() : 0; }
 
 // Record a non-kernel overhead span [t0_ns, now) on this core's lane (alloc /
-// claim+build / deposit drain). No-op unless tracing is on. Kernel spans are
-// pushed inline in execute_slot (they also carry the multicore flag).
-inline void trace_overhead(DistCore *self, int32_t task_id, int32_t func_id, TracePhase phase, uint64_t t0_ns) {
+// claim+build / deposit drain). dur_us is wall clock; cpu_us is this thread's
+// CPU time over the span (small cpu with large dur == descheduled, not work).
+// No-op unless tracing is on. Kernel spans are pushed inline in execute_slot.
+inline void
+trace_overhead(DistCore *self, int32_t task_id, int32_t func_id, TracePhase phase, uint64_t t0_ns, uint64_t t0_cpu) {
     if (!g_trace_on) return;
     const uint64_t t1 = now_ns();
+    const uint64_t c1 = thread_cpu_ns();
     self->trace.push_back(
         TraceEvent{
             task_id, func_id, self->lane, /*multicore=*/0, phase, (t0_ns - g_trace_epoch_ns) / 1000.0,
-            (t1 - t0_ns) / 1000.0
+            (t1 - t0_ns) / 1000.0, (c1 - t0_cpu) / 1000.0
         }
     );
 }
@@ -670,7 +688,7 @@ void execute_slot(DistCore *self, RingSlot &s) {
             self->trace.push_back(
                 TraceEvent{
                     s.task_id, s.func_id, self->lane, static_cast<uint8_t>(s.is_multicore ? 1 : 0), TracePhase::Kernel,
-                    (t0 - g_trace_epoch_ns) / 1000.0, sim_ns / 1000.0
+                    (t0 - g_trace_epoch_ns) / 1000.0, sim_ns / 1000.0, sim_ns / 1000.0
                 }
             );
         }
@@ -685,7 +703,7 @@ void execute_slot(DistCore *self, RingSlot &s) {
             self->trace.push_back(
                 TraceEvent{
                     s.task_id, s.func_id, self->lane, static_cast<uint8_t>(s.is_multicore ? 1 : 0), TracePhase::Kernel,
-                    (t0 - g_trace_epoch_ns) / 1000.0, (t1 - t0) / 1000.0
+                    (t0 - g_trace_epoch_ns) / 1000.0, (t1 - t0) / 1000.0, (t1 - t0) / 1000.0
                 }
             );
         } else {
@@ -857,13 +875,14 @@ void drain_block_won(DistCore *self) {
         }
         const BuiltSubtask &b = w.lane[self->lane];
         const uint64_t t_won0 = trace_now();
+        const uint64_t t_won0_cpu = trace_now_cpu();
         build_ring_slot(
             self->slots[si], w.task_id, b.func_id, b.function_bin_addr, b.tensors, b.tensor_count, b.scalars,
             b.scalar_count, b.fanin, b.fanin_count, b.sub_block_id, /*is_multicore=*/true, self->block_id, i
         );
         self->occupied_count++;
         self->owned_total++;
-        trace_overhead(self, w.task_id, b.func_id, TracePhase::DrainWon, t_won0);
+        trace_overhead(self, w.task_id, b.func_id, TracePhase::DrainWon, t_won0, t_won0_cpu);
     }
 }
 
@@ -899,6 +918,7 @@ TaskOutputTensors dist_submit_impl(PTO2Runtime *, const MixedKernels &mixed, con
     // which the drain above (and later drains) may have just run; that is why the
     // start is taken *after* the execute-first drain, not at function entry.
     const uint64_t t_submit0 = trace_now();
+    const uint64_t t_submit0_cpu = trace_now_cpu();
     const int32_t N = self->local_index++;
     const ActiveMask M = mixed.to_active_mask();
     const int32_t tc = args.tensor_count();
@@ -1035,7 +1055,7 @@ TaskOutputTensors dist_submit_impl(PTO2Runtime *, const MixedKernels &mixed, con
     }
 
     if (!is_winner) {
-        trace_overhead(self, N, -1, TracePhase::Replay, t_submit0);
+        trace_overhead(self, N, -1, TracePhase::Replay, t_submit0, t_submit0_cpu);
         return result;  // wrong type or lost the race: map updated, nothing to build
     }
 
@@ -1066,8 +1086,9 @@ TaskOutputTensors dist_submit_impl(PTO2Runtime *, const MixedKernels &mixed, con
     // close the Build span now and time the spins separately as RingBp. Without
     // this split the spin time was misattributed to "build" (it dominated build
     // under a small ring / few blocks — it is dependency/slot wait, not cost).
-    trace_overhead(self, N, -1, TracePhase::Build, t_submit0);
+    trace_overhead(self, N, -1, TracePhase::Build, t_submit0, t_submit0_cpu);
     const uint64_t t_bp0 = trace_now();
+    const uint64_t t_bp0_cpu = trace_now_cpu();
 
     // Back-pressure for self-claimed work: wait until the ring has a non-reserved
     // slot free, draining block.won deposits + ready tasks meanwhile. The reserve
@@ -1117,7 +1138,7 @@ TaskOutputTensors dist_submit_impl(PTO2Runtime *, const MixedKernels &mixed, con
     }
     // Time spent in the two back-pressure spins above (ring-slot wait + heap
     // reclaim wait) — dependency/slot WAITING, kept separate from Build.
-    trace_overhead(self, N, -1, TracePhase::RingBp, t_bp0);
+    trace_overhead(self, N, -1, TracePhase::RingBp, t_bp0, t_bp0_cpu);
 
     int32_t si = alloc_ring_slot(self);
     if (si < 0) {  // should not happen given the back-pressure gate above
@@ -1291,6 +1312,7 @@ TaskOutputTensors dist_alloc_tensors(PTO2Runtime *, const L0TaskArgs &args) {
         drain_phase_b(self);
     }
     const uint64_t t_alloc0 = trace_now();  // swimlane: time this alloc's replay+pace
+    const uint64_t t_alloc0_cpu = trace_now_cpu();
     const int32_t N = self->local_index++;
     const int32_t tc = args.tensor_count();
     if (N >= kFlagCap) {
@@ -1363,7 +1385,7 @@ TaskOutputTensors dist_alloc_tensors(PTO2Runtime *, const L0TaskArgs &args) {
     // unchanged; this only drops the lagging cores' redundant pass).
     bool is_winner = claim(g_dist.alloc_cursor[N % kCursorShards].v, N);
     if (!is_winner) {
-        trace_overhead(self, N, -1, TracePhase::Replay, t_alloc0);
+        trace_overhead(self, N, -1, TracePhase::Replay, t_alloc0, t_alloc0_cpu);
         return result;
     }
 
@@ -1396,7 +1418,7 @@ TaskOutputTensors dist_alloc_tensors(PTO2Runtime *, const L0TaskArgs &args) {
     // (e) Winner completes inline (no kernel runs).
     g_dist.flags[N & (kFlagCap - 1)].store(1, std::memory_order_release);
     advance_frontier();
-    trace_overhead(self, N, -1, TracePhase::Alloc, t_alloc0);
+    trace_overhead(self, N, -1, TracePhase::Alloc, t_alloc0, t_alloc0_cpu);
     return result;
 }
 
@@ -1684,6 +1706,17 @@ void dist_engine_dump_trace() {
             "\"args\":{\"name\":\"%s (core%d)\"}}",
             co.block_id, co.lane, lane_name(co.lane), c
         );
+        // Shadow lane (tid + 10): the SAME spans drawn with width = cpu_us instead
+        // of wall dur. A span whose wall row is long but whose cpu row is short was
+        // descheduled (host oversubscription), not doing work; equal-length rows
+        // mean real CPU time (e.g. ringbp's sched_yield spin). Lets the swimlane
+        // show CPU cost visually, side by side, without opening each span.
+        fprintf(
+            f,
+            ",\n    {\"ph\":\"M\",\"name\":\"thread_name\",\"pid\":%d,\"tid\":%d,"
+            "\"args\":{\"name\":\"%s·cpu (core%d)\"}}",
+            co.block_id, co.lane + 10, lane_name(co.lane), c
+        );
     }
 
     auto phase_name = [](TracePhase p) -> const char * {
@@ -1726,8 +1759,15 @@ void dist_engine_dump_trace() {
             fprintf(
                 f,
                 "    {\"ph\":\"X\",\"name\":\"%s\",\"pid\":%d,\"tid\":%d,\"ts\":%.3f,\"dur\":%.3f,"
-                "\"args\":{\"phase\":\"%s\",\"task_id\":%d,\"func_id\":%d,\"core\":%d,\"mc\":%d}}",
-                name, co.block_id, co.lane, e.ts_us, e.dur_us, ph, e.task_id, e.func_id, c, e.multicore
+                "\"args\":{\"phase\":\"%s\",\"task_id\":%d,\"func_id\":%d,\"core\":%d,\"mc\":%d,\"cpu_us\":%.3f}}",
+                name, co.block_id, co.lane, e.ts_us, e.dur_us, ph, e.task_id, e.func_id, c, e.multicore, e.cpu_us
+            );
+            // Shadow event on lane+10: same start, width = cpu_us (real CPU time).
+            fprintf(
+                f,
+                ",\n    {\"ph\":\"X\",\"name\":\"%s\",\"pid\":%d,\"tid\":%d,\"ts\":%.3f,\"dur\":%.3f,"
+                "\"args\":{\"phase\":\"%s\",\"task_id\":%d,\"wall_us\":%.3f}}",
+                name, co.block_id, co.lane + 10, e.ts_us, e.cpu_us, ph, e.task_id, e.dur_us
             );
         }
     }
