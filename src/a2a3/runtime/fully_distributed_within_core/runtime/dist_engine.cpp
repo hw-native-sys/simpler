@@ -546,6 +546,15 @@ struct DistGlobal {
     // finished replaying the submit stream (§7 tail-idle).
     std::atomic<int32_t> replay_done;
 
+    // Startup barrier: every worker thread bumps this on entry and spins until it
+    // reaches num_workers before beginning replay. In sim each "core" is a host
+    // pthread that the OS schedules in one at a time (hundreds of µs apart on a
+    // busy box), so without this the first-claimed tasks start executing while
+    // later cores have not even been scheduled — the swimlane shows a long
+    // cold-start stagger that is host-scheduling noise, not engine behavior.
+    // Aligning the start makes the trace reflect steady-state contention.
+    std::atomic<int32_t> started_count;
+
     DistCore cores[RUNTIME_MAX_WORKER];
 };
 
@@ -1549,6 +1558,21 @@ void dist_core_main(void *runtime_v, int core_idx, int core_type_int) {
             stderr, "[dist] core %d role=%d block=%d lane=%d START\n", core_idx, core_type_int, lay.block_id, lay.lane
         );
 
+    // Startup barrier: wait until every worker thread has been scheduled in and
+    // reached this point before anyone begins replay. In sim the OS brings the
+    // host threads up one at a time, so without this the cores that start early
+    // race ahead and the swimlane's first-task stagger reflects thread-wakeup
+    // skew rather than engine scheduling. Bare spin (no yield) per the AICPU
+    // spin-wait convention. Skipped under fatal so a failed run still tears down.
+    if (!fatal_set()) {
+        g_dist.started_count.fetch_add(1, std::memory_order_acq_rel);
+        uint64_t wd_start = 0;
+        while (g_dist.started_count.load(std::memory_order_acquire) < g_dist.num_workers && !fatal_set()) {
+            SPIN_WAIT_HINT();
+            watchdog(wd_start);
+        }
+    }
+
     // Replay the full orchestration submit stream: build the per-core map and
     // claim/build owned tasks into the private ring (back-pressure inline). MIX
     // anchors deposit follower subtasks into block.won during this replay.
@@ -1650,6 +1674,7 @@ void *dist_engine_register(
         g_dist.flags[i].store(0, std::memory_order_relaxed);
     g_dist.fatal.store(0, std::memory_order_relaxed);
     g_dist.replay_done.store(0, std::memory_order_relaxed);
+    g_dist.started_count.store(0, std::memory_order_relaxed);
     g_dist.orch_func = orch_func;
     g_dist.orch_args = orch_args;
     g_dist.rt = rt;
