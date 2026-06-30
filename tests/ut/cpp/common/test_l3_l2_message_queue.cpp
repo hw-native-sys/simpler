@@ -13,6 +13,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <limits>
 #include <type_traits>
 
 #include <gtest/gtest.h>
@@ -125,6 +126,25 @@ TEST(L3L2MessageQueueTest, LayoutRejectsInvalidDepthArenaAndCounterBytes) {
     };
     EXPECT_FALSE(l3_l2_queue_validate_region(make_desc(&storage, 256, 320), args, &layout));
     EXPECT_TRUE(l3_l2_queue_validate_region(make_desc(&storage, 512, 384), args, &layout));
+}
+
+TEST(L3L2MessageQueueTest, LayoutOverflowFailsClosedWithoutModifyingOutput) {
+    L3L2QueueLayout layout{
+        7, 11, 13, 17, 19, 23, 29, 31, 37, 41, 43, 47, 53, 59, 61,
+    };
+    const L3L2QueueLayout original = layout;
+
+    EXPECT_FALSE(l3_l2_queue_make_layout(2, std::numeric_limits<uint64_t>::max() - 63, 64, &layout));
+
+    EXPECT_EQ(layout.depth, original.depth);
+    EXPECT_EQ(layout.input_desc_offset, original.input_desc_offset);
+    EXPECT_EQ(layout.output_desc_offset, original.output_desc_offset);
+    EXPECT_EQ(layout.input_arena_offset, original.input_arena_offset);
+    EXPECT_EQ(layout.output_arena_offset, original.output_arena_offset);
+    EXPECT_EQ(layout.input_arena_bytes, original.input_arena_bytes);
+    EXPECT_EQ(layout.output_arena_bytes, original.output_arena_bytes);
+    EXPECT_EQ(layout.payload_bytes, original.payload_bytes);
+    EXPECT_EQ(layout.counter_bytes, original.counter_bytes);
 }
 
 TEST(L3L2MessageQueueTest, DescriptorSlotEncodingIsStable) {
@@ -428,6 +448,29 @@ TEST(L3L2MessageQueueTest, InputApplicationErrorIsNormalMessageAndDoesNotSetAbor
 
     EXPECT_EQ(queue.error().kind, L3L2QueueErrorKind::NONE);
     EXPECT_EQ(storage.counters[counter_index(L3L2_QUEUE_L2_ABORT_FLAG_OFFSET)], 0);
+}
+
+TEST(L3L2MessageQueueTest, InputReleaseRejectsCallerMutatedHandleMetadata) {
+    RegionStorage storage{};
+    L3L2QueueArgs args{
+        l3_l2_queue_magic_version(),
+        2,
+        64,
+        64,
+    };
+    L3L2QueueEndpoint queue(make_desc(&storage), args);
+    ASSERT_EQ(queue.error().kind, L3L2QueueErrorKind::NONE) << queue.error().message;
+    publish_input_desc(&storage, queue.layout(), 1, L3L2QueueOpcode::DATA, queue.layout().input_arena_offset, 16);
+
+    L3L2QueueInputHandle handle{};
+    ASSERT_TRUE(queue.input().try_peek(&handle)) << queue.error().message;
+    handle.payload_nbytes = 0;
+
+    EXPECT_FALSE(queue.input().release(handle));
+
+    EXPECT_EQ(queue.error().kind, L3L2QueueErrorKind::OWNERSHIP);
+    EXPECT_EQ(storage.counters[counter_index(L3L2_QUEUE_INPUT_DESC_HEAD_OFFSET)], 0);
+    EXPECT_EQ(storage.counters[counter_index(L3L2_QUEUE_L2_ABORT_FLAG_OFFSET)], 1);
 }
 
 TEST(L3L2MessageQueueTest, InputStopReleaseRejectsLaterPublishedInputAsInvalidState) {
