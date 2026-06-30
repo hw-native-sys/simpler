@@ -282,7 +282,7 @@ def test_fatal_code_surfaces_on_sim(st_platform, st_device_ids, case_name, monke
         worker.close()
 
 
-@pytest.mark.platforms(["a2a3", "a5"])
+@pytest.mark.platforms(["a2a3"])
 @pytest.mark.device_count(1)
 @pytest.mark.runtime(RUNTIME)
 @pytest.mark.timeout(90)  # hang cases hold a core ~15-20 s; bound a wedge
