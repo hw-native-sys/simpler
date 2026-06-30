@@ -38,6 +38,7 @@
 #include "common/unified_log.h"
 #include "cpu_sim_context.h"
 #include "host/raii_scope_guard.h"
+#include "host/runtime_timeout_config.h"
 #include "runtime.h"
 
 // dep_gen_replay_emit_deps_json: strong symbol provided by
@@ -108,6 +109,19 @@ int DeviceRunner::ensure_binaries_loaded() {
         load_optional_sym("simpler_aicpu_register_callable", reinterpret_cast<void **>(&aicpu_register_callable_func_));
         if (!load_sym("set_platform_regs", reinterpret_cast<void **>(&set_platform_regs_func_))) return -1;
         load_optional_sym("set_orch_device_id", reinterpret_cast<void **>(&set_orch_device_id_func_));
+        load_optional_sym("set_scheduler_timeout_ms", reinterpret_cast<void **>(&set_scheduler_timeout_ms_func_));
+        if (set_scheduler_timeout_ms_func_ != nullptr) {
+            // Per-device one-shot latch (mirrors the onboard InitArgs path):
+            // honor PTO2_SCHEDULER_TIMEOUT_MS once at SO load, not per run. 0 ->
+            // the scheduler keeps its compile-time default. Sim skips the
+            // op/stream ordering check (validate_runtime_timeout_order is onboard).
+            RuntimeTimeoutParseStatus sched_status;
+            RuntimeTimeoutConfig sched_cfg =
+                resolve_runtime_timeout_config(RuntimeTimeoutConfig{1, 1, 0}, &sched_status);
+            set_scheduler_timeout_ms_func_(
+                (sched_status.scheduler_env_set && sched_status.scheduler_valid) ? sched_cfg.scheduler_timeout_ms : 0
+            );
+        }
         if (!load_sym("set_platform_dump_base", reinterpret_cast<void **>(&set_platform_dump_base_func_))) return -1;
         if (!load_sym("set_platform_phase_base", reinterpret_cast<void **>(&set_platform_phase_base_func_))) return -1;
         if (!load_sym("set_dump_args_enabled", reinterpret_cast<void **>(&set_dump_args_enabled_func_))) return -1;

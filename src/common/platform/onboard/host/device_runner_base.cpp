@@ -91,15 +91,25 @@ HostRuntimeTimeoutConfig resolve_onboard_timeout_config() {
     bool host_timeout_env_set =
         parse_status.op_execute_env_set || parse_status.stream_sync_env_set || parse_status.scheduler_env_set;
     RuntimeTimeoutOrderStatus order_status = validate_runtime_timeout_order(cfg);
+    // The scheduler override is forwarded to the device (via InitArgs at init)
+    // only when explicitly set, valid, and consistent with the op/stream
+    // ordering. 0 means "no override" — the AICPU scheduler then keeps its
+    // compile-time default. op/stream remain host-side acl knobs.
+    int32_t scheduler_override = (parse_status.scheduler_env_set && parse_status.scheduler_valid &&
+                                  order_status == RuntimeTimeoutOrderStatus::OK) ?
+                                     cfg.scheduler_timeout_ms :
+                                     0;
     if (host_timeout_env_set && order_status != RuntimeTimeoutOrderStatus::OK) {
         LOG_WARN(
             "Ignoring PTO2 timeout env overrides: %s (scheduler=%d ms, op_execute=%llu us, stream_sync=%d ms)",
             runtime_timeout_order_status_name(order_status), cfg.scheduler_timeout_ms,
             (unsigned long long)cfg.op_execute_timeout_us, cfg.stream_sync_timeout_ms
         );
-        return HostRuntimeTimeoutConfig{order_defaults.op_execute_timeout_us, order_defaults.stream_sync_timeout_ms};
+        return HostRuntimeTimeoutConfig{
+            order_defaults.op_execute_timeout_us, order_defaults.stream_sync_timeout_ms, scheduler_override
+        };
     }
-    return HostRuntimeTimeoutConfig{cfg.op_execute_timeout_us, cfg.stream_sync_timeout_ms};
+    return HostRuntimeTimeoutConfig{cfg.op_execute_timeout_us, cfg.stream_sync_timeout_ms, scheduler_override};
 }
 
 }  // namespace
@@ -374,6 +384,9 @@ int DeviceRunnerBase::ensure_aicpu_init_launched() {
     init_args.device_id = static_cast<uint32_t>(device_id_);
     init_args.log_level = static_cast<uint32_t>(HostLogger::get_instance().level());
     init_args.log_info_v = static_cast<uint32_t>(HostLogger::get_instance().info_v());
+    // Per-device scheduler watchdog override, resolved once at attach into
+    // timeout_config_. 0 -> the AICPU scheduler keeps its compile-time default.
+    init_args.scheduler_timeout_ms = timeout_config_.scheduler_timeout_ms;
 
     LOG_INFO_V0("=== launch_aicpu_payload %s ===", host::KernelNames::InitName);
     int rc = launch_aicpu_payload(

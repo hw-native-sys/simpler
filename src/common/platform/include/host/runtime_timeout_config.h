@@ -40,6 +40,10 @@ struct RuntimeTimeoutConfig {
 struct HostRuntimeTimeoutConfig {
     uint64_t op_execute_timeout_us;
     int32_t stream_sync_timeout_ms;
+    // AICPU scheduler no-progress watchdog override (ms). 0 means "no env
+    // override" — the device falls back to its compile-time default
+    // (SCHEDULER_TIMEOUT_CYCLES). Latched once per device into InitArgs.
+    int32_t scheduler_timeout_ms{0};
 };
 
 struct RuntimeTimeoutParseStatus {

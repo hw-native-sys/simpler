@@ -13,6 +13,7 @@
 #include "common/unified_log.h"
 #include "common/kernel_args.h"
 #include "common/platform_config.h"
+#include "aicpu/aicpu_device_config.h"
 #include "aicpu/dep_gen_collector_aicpu.h"
 #include "aicpu/device_log.h"
 #include "aicpu/device_phase_aicpu.h"
@@ -148,6 +149,7 @@ extern "C" __attribute__((visibility("default"))) int simpler_aicpu_init(void *a
     set_log_level(static_cast<int>(init_args->log_level));
     set_log_info_v(static_cast<int>(init_args->log_info_v));
     set_orch_device_id(static_cast<int>(init_args->device_id));
+    set_scheduler_timeout_ms(static_cast<int>(init_args->scheduler_timeout_ms));
 
     LOG_INFO_V0("%s", "simpler_aicpu_init: per-device invariants latched");
     return 0;

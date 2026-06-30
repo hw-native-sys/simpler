@@ -98,15 +98,13 @@ struct PTO2RuntimeOps {
 
 /**
  * Sizing half of the runtime-arena layout: the capacities that *define* the
- * layout (the input to runtime_reserve_layout) plus the scheduler timeout.
- * Stable per (callable_id, ring config); re-read at AICPU boot to reconstruct
- * ring/heap/dep-pool capacities and the scheduler no-progress budget.
+ * layout (the input to runtime_reserve_layout). Stable per (callable_id, ring
+ * config); re-read at AICPU boot to reconstruct ring/heap/dep-pool capacities.
  */
 struct ArenaSizingKey {
     uint64_t task_window_sizes[PTO2_MAX_RING_DEPTH]{};
     uint64_t heap_sizes[PTO2_MAX_RING_DEPTH]{};
     int32_t dep_pool_capacities[PTO2_MAX_RING_DEPTH]{};
-    int32_t scheduler_timeout_ms{0};
 };
 
 /**

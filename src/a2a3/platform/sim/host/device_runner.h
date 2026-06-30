@@ -61,6 +61,7 @@ private:
     void (*aicore_execute_func_)(Runtime *, int, CoreType, uint32_t, uint64_t, uint32_t, uint64_t){nullptr};
     void (*set_platform_regs_func_)(uint64_t){nullptr};
     void (*set_orch_device_id_func_)(int){nullptr};
+    void (*set_scheduler_timeout_ms_func_)(int){nullptr};
     void (*set_platform_dump_base_func_)(uint64_t){nullptr};
     void (*set_platform_phase_base_func_)(uint64_t){nullptr};
     void (*set_dump_args_enabled_func_)(bool){nullptr};

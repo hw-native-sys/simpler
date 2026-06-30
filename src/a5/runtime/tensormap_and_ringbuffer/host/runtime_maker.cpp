@@ -50,7 +50,6 @@
 #include "common/strace.h"
 #include "common/unified_log.h"
 #include "host/platform_compile_info.h"
-#include "host/runtime_timeout_config.h"
 #include "utils/device_arena.h"
 #include "prepare_callable_common.h"
 
@@ -246,32 +245,6 @@ static bool resolve_ring_config(
     return true;
 }
 
-static int32_t resolve_scheduler_timeout_ms() {
-    RuntimeTimeoutParseStatus parse_status;
-    RuntimeTimeoutConfig cfg = resolve_runtime_timeout_config(
-        RuntimeTimeoutConfig{PLATFORM_OP_EXECUTE_TIMEOUT_US, PLATFORM_STREAM_SYNC_TIMEOUT_MS, 0}, &parse_status
-    );
-    if (!parse_status.scheduler_env_set) {
-        return 0;
-    }
-    if (!parse_status.scheduler_valid) {
-        const char *env = std::getenv(PTO2_SCHEDULER_TIMEOUT_MS_ENV);
-        LOG_WARN("%s=%s invalid, using platform scheduler timeout", PTO2_SCHEDULER_TIMEOUT_MS_ENV, env);
-        return 0;
-    }
-
-    RuntimeTimeoutOrderStatus status = validate_runtime_timeout_order_for_platform(cfg, get_platform());
-    if (status != RuntimeTimeoutOrderStatus::OK) {
-        LOG_WARN(
-            "Ignoring %s=%d: %s (op_execute=%llu us, stream_sync=%d ms)", PTO2_SCHEDULER_TIMEOUT_MS_ENV,
-            cfg.scheduler_timeout_ms, runtime_timeout_order_status_name(status),
-            (unsigned long long)cfg.op_execute_timeout_us, cfg.stream_sync_timeout_ms
-        );
-        return 0;
-    }
-    return cfg.scheduler_timeout_ms;
-}
-
 static int32_t pto2_read_runtime_status(Runtime *runtime, PTO2SharedMemoryHeader *host_header) {
     if (runtime == nullptr || host_header == nullptr) {
         return 0;
@@ -348,13 +321,11 @@ register_callable_impl(const ChipCallable *callable, uint64_t (*upload_fn)(const
 // Effective ring sizing for one (callable_id, config): the input half of the
 // arena description. Resolved once per config from per-task overrides + env +
 // compile-time defaults; depends on nothing that varies per run. `total_heap`
-// and `sm_size` are the derived backing-allocation sizes; `scheduler_timeout_ms`
-// is the resolved per-platform scheduler no-progress budget.
+// and `sm_size` are the derived backing-allocation sizes.
 struct ArenaSizingConfig {
     uint64_t task_window_sizes[PTO2_MAX_RING_DEPTH];
     uint64_t heap_sizes[PTO2_MAX_RING_DEPTH];
     int32_t dep_pool_capacities[PTO2_MAX_RING_DEPTH];
-    int32_t scheduler_timeout_ms;
     uint64_t total_heap;
     uint64_t sm_size;
 };
@@ -369,7 +340,7 @@ struct StaticArenaPtrs {
 
 // per-(cid,config): resolve the arena sizing. Pure host arithmetic over
 // per-task overrides, PTO2_RING_* env, and compile-time defaults; derives the
-// total heap (with overflow check) and SM sizes and the scheduler timeout.
+// total heap (with overflow check) and SM sizes.
 // Returns false on an invalid ring config or a heap-size overflow.
 static bool resolve_arena_sizing(
     const uint64_t *ring_task_window, const uint64_t *ring_heap, const uint64_t *ring_dep_pool, ArenaSizingConfig *out
@@ -397,7 +368,6 @@ static bool resolve_arena_sizing(
         out->total_heap += out->heap_sizes[r];
     }
     out->sm_size = PTO2SharedMemoryHandle::calculate_size_per_ring(out->task_window_sizes);
-    out->scheduler_timeout_ms = resolve_scheduler_timeout_ms();
     return true;
 }
 
@@ -554,7 +524,6 @@ static bool build_runtime_image(
 ) {
     PTO2RuntimeArenaLayout layout =
         runtime_reserve_layout(*host_arena, sizing.task_window_sizes, sizing.heap_sizes, sizing.dep_pool_capacities);
-    layout.sizing.scheduler_timeout_ms = sizing.scheduler_timeout_ms;
     if (host_arena->commit(DeviceArena::kDefaultBaseAlign) == nullptr) {
         LOG_ERROR("Failed to commit host arena for prebuilt runtime image");
         return false;
