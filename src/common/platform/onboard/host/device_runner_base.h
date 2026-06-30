@@ -94,6 +94,24 @@ public:
     int l3_l2_orch_comm_shutdown();
 
     /**
+     * Map a device buffer into the host address space and return a
+     * host-readable VA (or nullptr on failure); svm_unregister releases it.
+     * Used by host_build_graph, whose orchestrator runs on the host and needs
+     * to read control tensors (e.g. paged_attention's context_lens) whose
+     * buffer.addr is a device address. On a2a3 onboard this wraps
+     * halHostRegister(DEV_SVM_MAP_HOST); the returned VA may differ from
+     * dev_ptr, so callers must use it, not dev_ptr, for host access.
+     * Register/unregister must be paired (unregister before free_tensor).
+     * Base default: unsupported (returns nullptr / no-op); a2a3 overrides.
+     */
+    virtual void *svm_register(void *dev_ptr, std::size_t bytes) {
+        (void)dev_ptr;
+        (void)bytes;
+        return nullptr;
+    }
+    virtual void svm_unregister(void *dev_ptr) { (void)dev_ptr; }
+
+    /**
      * Commit the three per-Worker pooled regions (PTO2 GM heap, PTO2
      * shared memory, trb prebuilt runtime arena) as three independent
      * device allocations. Must be called before any `acquire_pooled_*`.

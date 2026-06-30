@@ -9,18 +9,20 @@
  * -----------------------------------------------------------------------------------------------------------
  */
 /**
- * Scalar Addition Kernel
+ * Scalar addition kernel (submit_task / Tensor* ABI)
  *
- * Implements: out[i] = src[i] + scalar
+ * Implements: out[i] = src[i] + scalar over a single 128x128 tile.
  *
- * This kernel adds a scalar value to each element of a tensor. It's compiled
- * separately as a standalone kernel and linked with the dispatcher using
- * function pointers, demonstrating the separation pattern used in production
- * systems where kernel binaries are loaded dynamically.
+ * Args:
+ *   args[0] = src (INPUT, Tensor*)
+ *   args[1] = out (OUTPUT, Tensor*)
+ *   args[2] = scalar (float bits packed in uint64_t — tensors precede scalars)
  */
 
 #include <cstdint>
 #include <pto/pto-inst.hpp>
+
+#include "tensor.h"
 
 using namespace pto;
 
@@ -34,32 +36,20 @@ using namespace pto;
 #define __aicore__ [aicore]
 #endif
 
-/**
- * Scalar addition kernel implementation
- *
- * Unified signature: all arguments passed via int64_t array
- * @param args  Argument array:
- *              args[0] = src pointer (input tensor)
- *              args[1] = scalar value (as uint64_t, needs conversion to float)
- *              args[2] = out pointer (output tensor)
- *              args[3] = size (number of elements)
- */
 extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ int64_t *args) {
-    // Unpack arguments
-    __gm__ float *src = reinterpret_cast<__gm__ float *>(args[0]);
+    __gm__ Tensor *src_tensor = reinterpret_cast<__gm__ Tensor *>(args[0]);
+    __gm__ Tensor *out_tensor = reinterpret_cast<__gm__ Tensor *>(args[1]);
 
-    // Convert scalar from uint64_t to float
     union {
         uint64_t u64;
         float f32;
     } converter;
-    converter.u64 = args[1];
+    converter.u64 = static_cast<uint64_t>(args[2]);
     float scalar = converter.f32;
 
-    __gm__ float *out = reinterpret_cast<__gm__ float *>(args[2]);
-    int size = static_cast<int>(args[3]);
+    __gm__ float *src = reinterpret_cast<__gm__ float *>(src_tensor->buffer.addr) + src_tensor->start_offset;
+    __gm__ float *out = reinterpret_cast<__gm__ float *>(out_tensor->buffer.addr) + out_tensor->start_offset;
 
-    // Configuration: float, 128, 128, 128, 128
     constexpr int kTRows_ = 128;
     constexpr int kTCols_ = 128;
     constexpr int vRows = 128;

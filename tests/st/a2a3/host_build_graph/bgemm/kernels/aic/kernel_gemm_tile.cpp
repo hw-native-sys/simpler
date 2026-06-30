@@ -9,16 +9,23 @@
  * -----------------------------------------------------------------------------------------------------------
  */
 /**
- * Tile-based Matrix Multiplication Kernel (Cube Core)
+ * Tiled GEMM kernel (AIC, submit_task / Tensor* ABI)
  *
- * Computes: output = input_a @ input_b (64x64 tile matmul)
- * Uses TMATMUL instruction
+ * Implements: P = A @ B for a single 64x64 tile.
+ *
+ * Args (Tensor*):
+ *   args[0] = A (INPUT)
+ *   args[1] = B (INPUT)
+ *   args[2] = P (OUTPUT)
  */
 
 #include <cstdint>
+
 #include <pto/pto-inst.hpp>
 #include <pto/common/constants.hpp>
 #include <pto/common/pto_tile.hpp>
+
+#include "tensor.h"
 
 using namespace pto;
 
@@ -41,9 +48,13 @@ AICORE constexpr inline T CeilAlign(T num_1, T num_2) {
 }
 
 extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ int64_t *args) {
-    __gm__ float *input_a = reinterpret_cast<__gm__ float *>(args[0]);
-    __gm__ float *input_b = reinterpret_cast<__gm__ float *>(args[1]);
-    __gm__ float *output = reinterpret_cast<__gm__ float *>(args[2]);
+    __gm__ Tensor *a_tensor = reinterpret_cast<__gm__ Tensor *>(args[0]);
+    __gm__ Tensor *b_tensor = reinterpret_cast<__gm__ Tensor *>(args[1]);
+    __gm__ Tensor *p_tensor = reinterpret_cast<__gm__ Tensor *>(args[2]);
+
+    __gm__ float *input_a = reinterpret_cast<__gm__ float *>(a_tensor->buffer.addr) + a_tensor->start_offset;
+    __gm__ float *input_b = reinterpret_cast<__gm__ float *>(b_tensor->buffer.addr) + b_tensor->start_offset;
+    __gm__ float *output = reinterpret_cast<__gm__ float *>(p_tensor->buffer.addr) + p_tensor->start_offset;
 
     constexpr int TILE = 64;
     constexpr int blockAlign = C0_SIZE_BYTE / sizeof(float);

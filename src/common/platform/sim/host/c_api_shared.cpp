@@ -115,6 +115,23 @@ static int device_memset(void *dev_ptr, int value, size_t size) {
     }
 }
 
+// SVM map/unmap bridge for host_build_graph (see onboard c_api_shared for
+// rationale). On sim the "device" pointer is already host-readable, so
+// svm_register is identity. Non-static so hbg runtime_maker can extern-call it.
+void *svm_register_via_runner(void *dev_ptr, size_t size) {
+    try {
+        return current_runner()->svm_register(dev_ptr, size);
+    } catch (...) {
+        return nullptr;
+    }
+}
+
+void svm_unregister_via_runner(void *dev_ptr) {
+    try {
+        current_runner()->svm_unregister(dev_ptr);
+    } catch (...) {}
+}
+
 static uint64_t upload_chip_callable_buffer_wrapper(const void *callable) {
     try {
         return current_runner()->upload_chip_callable_buffer(static_cast<const ChipCallable *>(callable));

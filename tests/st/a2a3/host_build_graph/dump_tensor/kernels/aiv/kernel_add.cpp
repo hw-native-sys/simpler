@@ -8,9 +8,21 @@
  * See LICENSE in the root of the software repository for the full text of the License.
  * -----------------------------------------------------------------------------------------------------------
  */
+/**
+ * Element-wise addition kernel (submit_task / Tensor* ABI)
+ *
+ * Implements: out[i] = src0[i] + src1[i] over a single 128x128 tile.
+ *
+ * Args (Tensor*):
+ *   args[0] = src0 (INPUT)
+ *   args[1] = src1 (INPUT)
+ *   args[2] = out  (OUTPUT)
+ */
 
 #include <cstdint>
 #include <pto/pto-inst.hpp>
+
+#include "tensor.h"
 
 using namespace pto;
 
@@ -25,9 +37,13 @@ using namespace pto;
 #endif
 
 extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ int64_t *args) {
-    __gm__ float *src0 = reinterpret_cast<__gm__ float *>(args[0]);
-    __gm__ float *src1 = reinterpret_cast<__gm__ float *>(args[1]);
-    __gm__ float *out = reinterpret_cast<__gm__ float *>(args[2]);
+    __gm__ Tensor *src0_tensor = reinterpret_cast<__gm__ Tensor *>(args[0]);
+    __gm__ Tensor *src1_tensor = reinterpret_cast<__gm__ Tensor *>(args[1]);
+    __gm__ Tensor *out_tensor = reinterpret_cast<__gm__ Tensor *>(args[2]);
+
+    __gm__ float *src0 = reinterpret_cast<__gm__ float *>(src0_tensor->buffer.addr) + src0_tensor->start_offset;
+    __gm__ float *src1 = reinterpret_cast<__gm__ float *>(src1_tensor->buffer.addr) + src1_tensor->start_offset;
+    __gm__ float *out = reinterpret_cast<__gm__ float *>(out_tensor->buffer.addr) + out_tensor->start_offset;
 
     constexpr int kTRows_ = 128;
     constexpr int kTCols_ = 128;

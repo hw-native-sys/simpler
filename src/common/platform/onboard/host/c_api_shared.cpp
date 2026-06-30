@@ -118,6 +118,25 @@ static int device_memset(void *dev_ptr, int value, size_t size) {
     }
 }
 
+// SVM map/unmap bridge for host_build_graph's host-side orchestrator. Reaches
+// the per-thread DeviceRunner via current_runner() — NOT routed through the
+// Runtime.host_api struct, so the tensormap_and_ringbuffer / a5 HostApi ABI is
+// untouched. Non-static so the hbg runtime_maker (linked into the same
+// host_runtime .so) can call it directly via an extern declaration.
+void *svm_register_via_runner(void *dev_ptr, size_t size) {
+    try {
+        return current_runner()->svm_register(dev_ptr, size);
+    } catch (...) {
+        return nullptr;
+    }
+}
+
+void svm_unregister_via_runner(void *dev_ptr) {
+    try {
+        current_runner()->svm_unregister(dev_ptr);
+    } catch (...) {}
+}
+
 static uint64_t upload_chip_callable_buffer_wrapper(const void *callable) {
     try {
         return current_runner()->upload_chip_callable_buffer(static_cast<const ChipCallable *>(callable));

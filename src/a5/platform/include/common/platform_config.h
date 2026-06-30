@@ -279,6 +279,19 @@ constexpr int PLATFORM_DUMP_READYQUEUE_SIZE = PLATFORM_MAX_AICPU_THREADS * PLATF
  */
 constexpr int PLATFORM_DUMP_TIMEOUT_SECONDS = 30;
 
+/**
+ * Dump-args mask pool dimensions. The pool is keyed by (ring_id, slot) packed
+ * from a PTO2 task_id, so it must span the largest ring depth and task window
+ * any runtime built against this platform can use. The dump infra is shared by
+ * every runtime (device-orch tensormap_and_ringbuffer at ring depth 4 and the
+ * single-ring host-orch host_build_graph), so these are sized to the maximum
+ * rather than coupled to one runtime's pto_runtime2_types.h — a runtime that
+ * lowers its own PTO2_MAX_RING_DEPTH must not shrink the pool other runtimes
+ * rely on (see set_dump_args_task_mask's ring_id bound check).
+ */
+constexpr uint32_t PLATFORM_DUMP_MASK_POOL_MAX_RINGS = 4;
+constexpr uint32_t PLATFORM_DUMP_MASK_POOL_MAX_SLOTS = 16384;
+
 // =============================================================================
 // PMU Profiling Configuration
 // =============================================================================

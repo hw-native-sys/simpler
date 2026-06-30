@@ -90,6 +90,16 @@ public:
     int l3_l2_orch_comm_init(void *control_block, size_t control_block_size);
     int l3_l2_orch_comm_shutdown();
 
+    // SVM map/unmap for host_build_graph's host-side orchestrator. On sim,
+    // allocate_tensor returns a plain host pointer, so the "device" address is
+    // already host-readable — svm_register is identity and svm_unregister a
+    // no-op. Mirrors the onboard DeviceRunnerBase API (separate class trees).
+    void *svm_register(void *dev_ptr, size_t bytes) {
+        (void)bytes;
+        return dev_ptr;
+    }
+    void svm_unregister(void *dev_ptr) { (void)dev_ptr; }
+
     int register_callable(
         int32_t callable_id, const void *orch_so_data, size_t orch_so_size, const char *func_name,
         const char *config_name, std::vector<std::pair<int, uint64_t>> kernel_addrs, std::vector<ArgDirection> signature
