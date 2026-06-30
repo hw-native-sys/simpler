@@ -419,7 +419,7 @@ def test_staging_allocation_failure_does_not_poison():
         with pytest.raises(RuntimeError, match="staging allocation"):
             queue.input.enqueue(bytearray(b"ordinary"), nbytes=8, timeout=0.001)
 
-        assert fake_client.requests == []
+        assert all(req.cmd != L3L2OrchCommCmd.PAYLOAD_WRITE for req, _timeout in fake_client.requests)
         assert fake_client.payload_writes == []
         assert fake_client.counters.get(queue.layout.input_desc_tail_offset, 0) == 0
         assert fake_client.counters.get(L3L2_QUEUE_L3_ABORT_FLAG_OFFSET, 0) == 0
@@ -620,6 +620,26 @@ def test_try_enqueue_full_queue_returns_false_without_poison_or_publish():
         _close(worker, shm)
 
 
+def test_try_enqueue_full_queue_ordinary_buffer_does_not_stage():
+    orch, worker, shm, fake_client = _make_orchestrator()
+    try:
+        queue = orch.create_l3_l2_queue(worker_id=0, depth=2, input_arena_bytes=128, output_arena_bytes=128)
+        queue.input.enqueue(None, nbytes=0, timeout=0.001)
+        queue.input.enqueue(None, nbytes=0, timeout=0.001)
+        alloc_count = len(orch._o._buffers)
+        fake_client.requests.clear()
+        fake_client.payload_writes.clear()
+
+        assert queue.input.try_enqueue(bytearray(b"x"), nbytes=1) is False
+
+        assert fake_client.payload_writes == []
+        assert len(orch._o._buffers) == alloc_count
+        assert fake_client.counters[queue.layout.input_desc_tail_offset] == 2
+        assert fake_client.counters.get(L3L2_QUEUE_L3_ABORT_FLAG_OFFSET, 0) == 0
+    finally:
+        _close(worker, shm)
+
+
 def test_enqueue_after_stop_rejects_locally_without_polling_or_abort():
     orch, worker, shm, fake_client = _make_orchestrator()
     try:
@@ -649,6 +669,28 @@ def test_try_enqueue_payload_larger_than_arena_returns_false_without_poison_or_p
 
         assert fake_client.payload_writes == []
         assert fake_client.counters.get(queue.layout.input_desc_tail_offset, 0) == 0
+        assert fake_client.counters.get(L3L2_QUEUE_L3_ABORT_FLAG_OFFSET, 0) == 0
+    finally:
+        _close(worker, shm)
+
+
+def test_try_enqueue_wraparound_arena_full_ordinary_buffer_does_not_stage_or_advance_tail():
+    orch, worker, shm, fake_client = _make_orchestrator()
+    try:
+        queue = orch.create_l3_l2_queue(worker_id=0, depth=4, input_arena_bytes=128, output_arena_bytes=128)
+        first = orch.alloc([112], DataType.UINT8)
+        queue.input.enqueue(first, nbytes=112, timeout=0.001)
+        alloc_count = len(orch._o._buffers)
+        old_payload_tail = queue._input_payload_tail
+        fake_client.requests.clear()
+        fake_client.payload_writes.clear()
+
+        assert queue.input.try_enqueue(bytearray(b"x" * 32), nbytes=32) is False
+
+        assert fake_client.payload_writes == []
+        assert len(orch._o._buffers) == alloc_count
+        assert queue._input_payload_tail == old_payload_tail
+        assert fake_client.counters[queue.layout.input_desc_tail_offset] == 1
         assert fake_client.counters.get(L3L2_QUEUE_L3_ABORT_FLAG_OFFSET, 0) == 0
     finally:
         _close(worker, shm)

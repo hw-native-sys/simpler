@@ -23,8 +23,9 @@ constexpr uint64_t kQueueTimeoutNs = 5000000000ULL;
 void report_queue_error(const L3L2QueueEndpoint &queue) {
     const L3L2QueueError &err = queue.error();
     rt_report_fatal(
-        PTO2_ERROR_EXPLICIT_ORCH_FATAL, "L3-L2 queue error op=%s kind=%u region=%llu msg=%s", err.op,
-        static_cast<unsigned>(err.kind), static_cast<unsigned long long>(err.region_id), err.message
+        PTO2_ERROR_EXPLICIT_ORCH_FATAL, "L3-L2 queue error op=%s kind=%u region=%llu msg=%s",
+        err.op ? err.op : "unknown", static_cast<unsigned>(err.kind), static_cast<unsigned long long>(err.region_id),
+        err.message ? err.message : "unknown"
     );
 }
 

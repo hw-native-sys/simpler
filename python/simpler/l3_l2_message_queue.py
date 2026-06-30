@@ -534,10 +534,6 @@ class _L3InputQueue:
             raise ValueError("L3-L2 queue STOP must be zero-byte")
         if nbytes > queue._layout.input_arena_bytes:
             return False
-        if staged_span is not None:
-            payload_tensor = queue._ensure_staging_capacity(nbytes)
-            queue._copy_host_span_to_tensor(staged_span, payload_tensor)
-
         old_head = queue._input_head
         queue._input_head = queue._refresh_counter(
             queue._layout.input_desc_head_offset, queue._input_head, queue._layout.depth
@@ -548,16 +544,20 @@ class _L3InputQueue:
             return False
 
         payload_offset = 0
+        next_payload_tail = queue._input_payload_tail
         if nbytes != 0:
-            arena_pos = queue._input_payload_tail % queue._layout.input_arena_bytes
+            arena_pos = next_payload_tail % queue._layout.input_arena_bytes
             if arena_pos + nbytes > queue._layout.input_arena_bytes:
-                queue._input_payload_tail += queue._layout.input_arena_bytes - arena_pos
+                next_payload_tail += queue._layout.input_arena_bytes - arena_pos
                 arena_pos = 0
-            if queue._input_payload_tail + nbytes - queue._input_payload_head > queue._layout.input_arena_bytes:
+            if next_payload_tail + nbytes - queue._input_payload_head > queue._layout.input_arena_bytes:
                 return False
+            if staged_span is not None:
+                payload_tensor = queue._ensure_staging_capacity(nbytes)
+                queue._copy_host_span_to_tensor(staged_span, payload_tensor)
             payload_offset = queue._layout.input_arena_offset + arena_pos
             queue._run_primitive(queue._region.payload_write, payload_offset, payload_tensor, nbytes=nbytes)
-            queue._input_payload_tail += nbytes
+            queue._input_payload_tail = next_payload_tail + nbytes
 
         seq = queue._input_tail + 1
         slot_index = queue._input_tail & (queue._layout.depth - 1)
