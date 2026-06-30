@@ -501,7 +501,7 @@ static bool ensure_static_arenas(Runtime *runtime, const ArenaSizingConfig &sizi
         runtime_reserve_layout(sizing_arena, sizing.task_window_sizes, sizing.heap_sizes, sizing.dep_pool_capacities);
 
     int64_t t_setup_start = _now_ms();
-    if (runtime->host_api.setup_static_arena(sizing.total_heap, sizing.sm_size, layout.arena_size) != 0) {
+    if (runtime->host_api.setup_static_arena(sizing.total_heap, sizing.sm_size, layout.offsets.arena_size) != 0) {
         LOG_ERROR("Failed to setup pooled static arena");
         return false;
     }
@@ -558,7 +558,7 @@ static bool build_runtime_image(
 ) {
     PTO2RuntimeArenaLayout layout =
         runtime_reserve_layout(*host_arena, sizing.task_window_sizes, sizing.heap_sizes, sizing.dep_pool_capacities);
-    layout.scheduler_timeout_ms = sizing.scheduler_timeout_ms;
+    layout.sizing.scheduler_timeout_ms = sizing.scheduler_timeout_ms;
     if (host_arena->commit(DeviceArena::kDefaultBaseAlign) == nullptr) {
         LOG_ERROR("Failed to commit host arena for prebuilt runtime image");
         return false;
@@ -587,12 +587,13 @@ static bool bind_launch_state(
 ) {
     runtime->set_orch_args(device_args);
 
-    int rc_upload = runtime->host_api.copy_to_device(ptrs.runtime_arena_dev, host_arena.base(), layout.arena_size);
+    int rc_upload =
+        runtime->host_api.copy_to_device(ptrs.runtime_arena_dev, host_arena.base(), layout.offsets.arena_size);
     if (rc_upload != 0) {
         LOG_ERROR("Failed to rtMemcpy prebuilt runtime arena to device (rc=%d)", rc_upload);
         return false;
     }
-    runtime->set_prebuilt_arena(ptrs.runtime_arena_dev, layout.off_runtime);
+    runtime->set_prebuilt_arena(ptrs.runtime_arena_dev, layout.offsets.off_runtime);
     return true;
 }
 

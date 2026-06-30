@@ -96,28 +96,48 @@ struct PTO2RuntimeOps {
 };
 
 /**
- * Layout descriptor for the prebuilt runtime arena. Holds all sub-region
- * offsets (orchestrator / scheduler / sm_handle wrapper / runtime header /
- * AICore mailbox) plus the layout-defining capacities. Produced once on the
- * host by runtime_reserve_layout(); consumed by runtime_init_data_from_layout
- * and runtime_wire_arena_pointers.
+ * Sizing half of the runtime-arena layout: the capacities that *define* the
+ * layout (the input to runtime_reserve_layout) plus the scheduler timeout.
+ * Stable per (callable_id, ring config); re-read at AICPU boot to reconstruct
+ * ring/heap/dep-pool capacities and the scheduler no-progress budget.
  */
-struct PTO2RuntimeArenaLayout {
+struct ArenaSizingKey {
+    uint64_t task_window_sizes[PTO2_MAX_RING_DEPTH]{};
+    uint64_t heap_sizes[PTO2_MAX_RING_DEPTH]{};
+    int32_t dep_pool_capacities[PTO2_MAX_RING_DEPTH]{};
+    int32_t scheduler_timeout_ms{0};
+};
+
+/**
+ * Offset half of the runtime-arena layout: every sub-region offset
+ * (sm_handle wrapper / orchestrator / scheduler / runtime header / AICore
+ * mailbox) plus the committed arena byte size. The *output* of
+ * runtime_reserve_layout; consumed by runtime_init_data_from_layout and
+ * runtime_wire_arena_pointers (the AICPU re-wires arena-internal pointers
+ * from these after rtMemcpy).
+ */
+struct ArenaOffsets {
     size_t off_sm_handle{0};
     PTO2OrchestratorLayout orch;
     PTO2SchedulerLayout sched;
     size_t off_runtime{0};
     size_t off_mailbox{0};
 
-    // Cached parameters (re-used by init_data + wire stages).
-    uint64_t task_window_sizes[PTO2_MAX_RING_DEPTH]{};
-    uint64_t heap_sizes[PTO2_MAX_RING_DEPTH]{};
-    int32_t dep_pool_capacities[PTO2_MAX_RING_DEPTH]{};
-    int32_t scheduler_timeout_ms{0};
-
     // Total arena byte size post-commit. Used by host to size the prebuilt
     // image buffer and as the rtMemcpy length.
     size_t arena_size{0};
+};
+
+/**
+ * Layout descriptor for the prebuilt runtime arena. Two named halves with
+ * distinct lifetimes/semantics: `sizing` is the layout-defining input
+ * (capacities + scheduler timeout), `offsets` is the computed sub-region
+ * offsets + arena size. Produced once on the host by runtime_reserve_layout();
+ * consumed by runtime_init_data_from_layout and runtime_wire_arena_pointers.
+ */
+struct PTO2RuntimeArenaLayout {
+    ArenaSizingKey sizing;
+    ArenaOffsets offsets;
 };
 
 /**

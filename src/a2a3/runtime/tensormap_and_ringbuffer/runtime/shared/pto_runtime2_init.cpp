@@ -399,22 +399,22 @@ PTO2RuntimeArenaLayout runtime_reserve_layout(
     PTO2RuntimeArenaLayout layout{};
 
     for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
-        layout.task_window_sizes[r] = task_window_sizes[r];
-        layout.heap_sizes[r] = heap_sizes[r];
-        layout.dep_pool_capacities[r] = dep_pool_capacities[r];
+        layout.sizing.task_window_sizes[r] = task_window_sizes[r];
+        layout.sizing.heap_sizes[r] = heap_sizes[r];
+        layout.sizing.dep_pool_capacities[r] = dep_pool_capacities[r];
     }
 
-    layout.off_sm_handle = arena.reserve(sizeof(PTO2SharedMemoryHandle), alignof(PTO2SharedMemoryHandle));
+    layout.offsets.off_sm_handle = arena.reserve(sizeof(PTO2SharedMemoryHandle), alignof(PTO2SharedMemoryHandle));
     int32_t task_window_sizes_i32[PTO2_MAX_RING_DEPTH];
     for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
         task_window_sizes_i32[r] = static_cast<int32_t>(task_window_sizes[r]);
     }
-    layout.orch = PTO2OrchestratorState::reserve_layout(arena, task_window_sizes_i32, dep_pool_capacities);
-    layout.sched = PTO2SchedulerState::reserve_layout(arena, dep_pool_capacities);
-    layout.off_runtime = arena.reserve(sizeof(PTO2Runtime), PTO2_ALIGN_SIZE);
-    layout.off_mailbox = arena.reserve(sizeof(AICoreCompletionMailbox), alignof(AICoreCompletionMailbox));
+    layout.offsets.orch = PTO2OrchestratorState::reserve_layout(arena, task_window_sizes_i32, dep_pool_capacities);
+    layout.offsets.sched = PTO2SchedulerState::reserve_layout(arena, dep_pool_capacities);
+    layout.offsets.off_runtime = arena.reserve(sizeof(PTO2Runtime), PTO2_ALIGN_SIZE);
+    layout.offsets.off_mailbox = arena.reserve(sizeof(AICoreCompletionMailbox), alignof(AICoreCompletionMailbox));
 
-    layout.arena_size = arena.total_size();
+    layout.offsets.arena_size = arena.total_size();
     return layout;
 }
 
@@ -433,10 +433,10 @@ PTO2Runtime *runtime_init_data_from_layout(
     DeviceArena &arena, const PTO2RuntimeArenaLayout &layout, PTO2RuntimeMode mode, void *sm_dev_base,
     uint64_t /*sm_size*/, void *gm_heap_dev_base, const uint64_t heap_sizes[PTO2_MAX_RING_DEPTH]
 ) {
-    PTO2Runtime *rt = static_cast<PTO2Runtime *>(arena.region_ptr(layout.off_runtime));
+    PTO2Runtime *rt = static_cast<PTO2Runtime *>(arena.region_ptr(layout.offsets.off_runtime));
     memset(rt, 0, sizeof(*rt));
 
-    auto *sm_wrap = static_cast<PTO2SharedMemoryHandle *>(arena.region_ptr(layout.off_sm_handle));
+    auto *sm_wrap = static_cast<PTO2SharedMemoryHandle *>(arena.region_ptr(layout.offsets.off_sm_handle));
     memset(sm_wrap, 0, sizeof(*sm_wrap));
 
     // rt->ops is filled by the AICPU at boot.
@@ -451,25 +451,25 @@ PTO2Runtime *runtime_init_data_from_layout(
     rt->total_cycles = 0;
 
     if (!rt->orchestrator.init_data_from_layout(
-            layout.orch, arena, sm_dev_base, gm_heap_dev_base, heap_sizes, layout.task_window_sizes
+            layout.offsets.orch, arena, sm_dev_base, gm_heap_dev_base, heap_sizes, layout.sizing.task_window_sizes
         )) {
         return nullptr;
     }
-    if (!rt->scheduler.init_data_from_layout(layout.sched, arena, sm_dev_base)) {
+    if (!rt->scheduler.init_data_from_layout(layout.offsets.sched, arena, sm_dev_base)) {
         return nullptr;
     }
 
-    auto *mailbox = static_cast<AICoreCompletionMailbox *>(arena.region_ptr(layout.off_mailbox));
+    auto *mailbox = static_cast<AICoreCompletionMailbox *>(arena.region_ptr(layout.offsets.off_mailbox));
     memset(mailbox, 0, sizeof(*mailbox));
 
     return rt;
 }
 
 void runtime_wire_arena_pointers(DeviceArena &arena, const PTO2RuntimeArenaLayout &layout, PTO2Runtime *rt) {
-    rt->sm_handle = static_cast<PTO2SharedMemoryHandle *>(arena.region_ptr(layout.off_sm_handle));
-    rt->aicore_mailbox = static_cast<AICoreCompletionMailbox *>(arena.region_ptr(layout.off_mailbox));
-    rt->orchestrator.wire_arena_pointers(layout.orch, arena, &rt->scheduler);
-    rt->scheduler.wire_arena_pointers(layout.sched, arena);
+    rt->sm_handle = static_cast<PTO2SharedMemoryHandle *>(arena.region_ptr(layout.offsets.off_sm_handle));
+    rt->aicore_mailbox = static_cast<AICoreCompletionMailbox *>(arena.region_ptr(layout.offsets.off_mailbox));
+    rt->orchestrator.wire_arena_pointers(layout.offsets.orch, arena, &rt->scheduler);
+    rt->scheduler.wire_arena_pointers(layout.offsets.sched, arena);
 }
 
 void runtime_destroy(PTO2Runtime *rt, DeviceArena & /*arena*/) {

@@ -603,9 +603,9 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
     // an undefined value.
     uint64_t last_progress_ts = get_sys_cnt_aicpu();
     uint64_t scheduler_timeout_cycles = SCHEDULER_TIMEOUT_CYCLES;
-    if (rt_ != nullptr && rt_->prebuilt_layout.scheduler_timeout_ms > 0) {
-        scheduler_timeout_cycles =
-            static_cast<uint64_t>(rt_->prebuilt_layout.scheduler_timeout_ms) * (PLATFORM_PROF_SYS_CNT_FREQ / 1000);
+    if (rt_ != nullptr && rt_->prebuilt_layout.sizing.scheduler_timeout_ms > 0) {
+        scheduler_timeout_cycles = static_cast<uint64_t>(rt_->prebuilt_layout.sizing.scheduler_timeout_ms) *
+                                   (PLATFORM_PROF_SYS_CNT_FREQ / 1000);
     }
 
     while (true) {
