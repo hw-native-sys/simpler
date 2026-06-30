@@ -1090,9 +1090,16 @@ void SchedulerContext::deinit() {
         core_exec_states_[i].pending_reg_task_id = AICPU_TASK_INVALID;
     }
 
-    // Clear per-core dispatch payloads
-    memset(payload_per_core_, 0, sizeof(payload_per_core_));
-    memset(deferred_slab_per_core_, 0, sizeof(deferred_slab_per_core_));
+    // No per-core memset of payload_per_core_ / deferred_slab_per_core_ here
+    // (~300 KB across all cores). Both are fully re-initialized at dispatch
+    // before they can be read: dispatch_task sets deferred_slab->count = 0 /
+    // error_code = NONE and build_payload() overwrites every payload field
+    // (function addr, args[], contexts, not_ready) on the exact [core][buf_idx]
+    // about to run. The consumer side cannot reach a stale slot either: the
+    // drain only services a core's running_reg_task_id, and the loop above
+    // already reset every core_exec_states_[].running/pending_reg_task_id to
+    // AICPU_TASK_INVALID — so no FIN for an undispatched slot is processed, and
+    // the count-gated consumer never reads entries[] past the fresh count.
 
     // Reset sync-start drain coordination — a previous run that aborted mid-drain
     // would otherwise leave dirty pending/elected/ack state for the next reuse.
