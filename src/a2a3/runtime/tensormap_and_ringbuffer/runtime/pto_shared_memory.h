@@ -306,16 +306,12 @@ private:
         header->sched_error_code.store(PTO2_ERROR_NONE, std::memory_order_relaxed);
         header->sched_error_thread.store(-1, std::memory_order_relaxed);
 
-        for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++)
-        {
-            auto &ring = header->rings[r];
-            for (uint64_t i = 0; i < task_window_sizes[r]; i++)
-            {
-                ring.slot_states[i].bind_ring(static_cast<uint8_t>(r));
-                ring.slot_states[i].reset_for_reuse();
-                ring.slot_states[i].active_mask = ActiveMask{};
-            }
-        }
+        // No per-slot loop: prepare_task() resets each slot when the allocator
+        // hands it out (bind_ring + reset_for_reuse + per-submit fields). The
+        // scheduler only scans submitted task_ids [last_task_alive,
+        // current_task_index), so unsubmitted slots are never read. Cost moves
+        // from O(sum(task_window_sizes)) every run to O(tasks actually
+        // submitted) — and stays on the device. Mirrors upstream #1199.
     }
     void setup_pointers(uint64_t task_window_size)
     {

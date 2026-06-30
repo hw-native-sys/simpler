@@ -507,6 +507,19 @@ inline bool prepare_task(PTO2OrchestratorState *orch, const L0TaskArgs &args, in
 
     prefetch_payload(out->payload, args.tensor_count(), args.scalar_count());
 
+    // Reset the fanout/wake-list/subtask bookkeeping for this reuse. The allocator
+    // only returns a slot whose previous incarnation is fully consumed (alloc spins
+    // until completed_watermark passes its last_consumer_local_id), and the slot is
+    // not published to any scheduler thread until the wiring.queue.push at the end
+    // of submit_task_common — so this reset is race-free. Doing it here (not relying
+    // on the scheduler's eager reset-after-CONSUMED, which only covers the
+    // contiguously-reclaimed tail within a single run) makes every reused slot
+    // self-clean across runs, which lets the per-boot SM init skip its O(window)
+    // per-slot loop. bind_ring is slot-invariant but cheap to re-assert on the
+    // already-dirtied cache line. Mirrors upstream #1199.
+    out->slot_state->bind_ring(ring_id);
+    out->slot_state->reset_for_reuse();
+
     out->slot_state->bind_buffers(out->payload, out->task);
 
     // Clear the polling-fast completion byte for the newly-allocated slot.
