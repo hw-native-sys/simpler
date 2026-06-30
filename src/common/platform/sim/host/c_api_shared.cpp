@@ -305,7 +305,7 @@ int prepare_callable(DeviceContextHandle ctx, int32_t callable_id, const void *c
             kernel_addrs.emplace_back(c.func_id, c.device_addr);
         }
 
-        bool needs_aicpu_prewarm = false;
+        bool needs_aicpu_register = false;
         if (artifacts.host_dlopen_handle != nullptr) {
             rc = runner->register_callable_host_orch(
                 callable_id, artifacts.host_dlopen_handle, artifacts.host_orch_func_ptr, std::move(kernel_addrs),
@@ -320,11 +320,11 @@ int prepare_callable(DeviceContextHandle ctx, int32_t callable_id, const void *c
                 artifacts.config_name.c_str(), std::move(kernel_addrs), std::move(artifacts.signature)
             );
             if (rc == 0) {
-                needs_aicpu_prewarm = true;
+                needs_aicpu_register = true;
             }
         }
-        if (rc == 0 && needs_aicpu_prewarm) {
-            rc = runner->prewarm_callable(callable_id);
+        if (rc == 0 && needs_aicpu_register) {
+            rc = runner->aicpu_register_callable(callable_id);
             if (rc != 0) {
                 runner->unregister_callable(callable_id);
             }

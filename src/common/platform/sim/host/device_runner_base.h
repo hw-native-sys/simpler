@@ -102,7 +102,7 @@ public:
     bool has_callable(int32_t callable_id) const;
     BindCallableResult bind_callable_to_runtime(Runtime &runtime, int32_t callable_id);
     uint64_t upload_chip_callable_buffer(const ChipCallable *callable);
-    int prewarm_callable(int32_t callable_id);
+    int aicpu_register_callable(int32_t callable_id);
     int commit_aicpu_callable_load(int32_t callable_id);
 
     void print_handshake_results();
@@ -149,7 +149,7 @@ protected:
     // --- Helpers usable by subclass run() / finalize() -------------------
     int ensure_device_initialized();
     virtual int ensure_binaries_loaded() = 0;
-    virtual int invoke_aicpu_prewarm(Runtime &runtime) = 0;
+    virtual int invoke_aicpu_register_callable(Runtime &runtime) = 0;
     int prepare_orch_so(Runtime &runtime);
     int stamp_orch_so(Runtime &runtime, int32_t callable_id, bool force_reload);
 

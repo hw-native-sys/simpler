@@ -105,7 +105,7 @@ int DeviceRunner::ensure_binaries_loaded() {
         };
 
         if (!load_sym("aicpu_execute", reinterpret_cast<void **>(&aicpu_execute_func_))) return -1;
-        load_optional_sym("aicpu_prewarm_callable", reinterpret_cast<void **>(&aicpu_prewarm_func_));
+        load_optional_sym("aicpu_register_callable", reinterpret_cast<void **>(&aicpu_register_callable_func_));
         if (!load_sym("set_platform_regs", reinterpret_cast<void **>(&set_platform_regs_func_))) return -1;
         load_optional_sym("set_orch_device_id", reinterpret_cast<void **>(&set_orch_device_id_func_));
         if (!load_sym("set_platform_dump_base", reinterpret_cast<void **>(&set_platform_dump_base_func_))) return -1;
@@ -179,13 +179,27 @@ int DeviceRunner::ensure_binaries_loaded() {
     return 0;
 }
 
-int DeviceRunner::invoke_aicpu_prewarm(Runtime &runtime) {
-    if (aicpu_prewarm_func_ == nullptr || set_orch_device_id_func_ == nullptr) {
-        LOG_ERROR("Prewarm functions not loaded. Call ensure_binaries_loaded first.");
+int DeviceRunner::invoke_aicpu_register_callable(Runtime &runtime) {
+    if (aicpu_register_callable_func_ == nullptr || set_orch_device_id_func_ == nullptr) {
+        LOG_ERROR("Register-callable functions not loaded. Call ensure_binaries_loaded first.");
         return -1;
     }
     set_orch_device_id_func_(device_id_);
-    return aicpu_prewarm_func_(&runtime);
+    // Extract the orch-SO descriptor from the stamped Runtime into the small
+    // RegisterCallableArgs the renamed entry expects (sim shares process
+    // memory, so the name pointers stay valid for the synchronous call).
+    RegisterCallableArgs reg_args{};
+    reg_args.active_callable_id = runtime.get_active_callable_id();
+    reg_args.register_new = runtime.register_new_callable_id() ? 1 : 0;
+    reg_args.dev_orch_so_addr = runtime.get_dev_orch_so_addr();
+    reg_args.dev_orch_so_size = runtime.get_dev_orch_so_size();
+    const char *func_name = runtime.get_device_orch_func_name();
+    const char *config_name = runtime.get_device_orch_config_name();
+    snprintf(reg_args.device_orch_func_name, sizeof(reg_args.device_orch_func_name), "%s", func_name ? func_name : "");
+    snprintf(
+        reg_args.device_orch_config_name, sizeof(reg_args.device_orch_config_name), "%s", config_name ? config_name : ""
+    );
+    return aicpu_register_callable_func_(&reg_args);
 }
 
 int DeviceRunner::run(Runtime &runtime, int block_dim, int launch_aicpu_num) {
@@ -572,7 +586,7 @@ void DeviceRunner::unload_executor_binaries() {
         dlclose(aicpu_so_handle_);
         aicpu_so_handle_ = nullptr;
         aicpu_execute_func_ = nullptr;
-        aicpu_prewarm_func_ = nullptr;
+        aicpu_register_callable_func_ = nullptr;
         set_platform_regs_func_ = nullptr;
         set_orch_device_id_func_ = nullptr;
         set_platform_dump_base_func_ = nullptr;

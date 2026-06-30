@@ -41,6 +41,12 @@
 // Forward declarations
 class Runtime;
 
+// Symbol-name capacity for the device orchestration entry/config functions.
+// Must match RUNTIME_MAX_ORCH_SYMBOL_NAME in the runtime's runtime.h; a
+// static_assert in the TMARB AICPU executor (where both headers are visible)
+// enforces the equality.
+#define INIT_ARGS_MAX_ORCH_SYMBOL_NAME 64
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -85,8 +91,6 @@ struct KernelArgs {
     uint64_t scope_stats_data_base{0};  // ScopeStatsBuffer device pointer; 0 when scope_stats is off.
                                         // a5 has no halHostRegister — host keeps a separate shadow and
                                         // refreshes it via rtMemcpy DEVICE_TO_HOST at dump time.
-    uint32_t log_level{1};              // Severity floor: 0=DEBUG, 1=INFO, 2=WARN, 3=ERROR, 4=NUL
-    uint32_t log_info_v{5};             // INFO verbosity threshold (0..9); default V5
     uint32_t enable_profiling_flag{0};  // Profiling umbrella bitmask; dump_tensor|l2_swimlane|pmu|dep_gen|scope_stats
     uint32_t _pad{0};                   // Alignment padding
 
@@ -95,10 +99,6 @@ struct KernelArgs {
     // See the a2a3 kernel_args.h for the full design rationale (CANN's
     // AICPU args copy makes inline fields write-only).
     uint64_t device_wall_data_base{0};
-    // ACL device ordinal. Pushed to the AICPU so the executor can suffix the
-    // staged orchestration SO name (libdevice_orch_<pid>_<cid>_<device_id>.so),
-    // mirroring the per-device simpler_inner preinstall fix.
-    uint32_t device_id{0};
     // Opaque always-false guard read by the AICore SIMT meta anchor (AIV
     // KERNEL_ENTRY). The host never sets it non-zero; its only purpose is to be
     // a runtime-valued condition the compiler cannot constant-fold, so the
@@ -109,6 +109,43 @@ struct KernelArgs {
 
 static_assert(offsetof(KernelArgs, runtime_args) == 0, "KernelArgs::runtime_args offset drift");
 static_assert(offsetof(KernelArgs, regs) == 8, "KernelArgs::regs offset drift");
+
+/**
+ * InitArgs - per-device one-shot invariants
+ *
+ * Uploaded once at worker init via the `simpler_aicpu_init` entry, before any
+ * register_callable/exec launch. Carries the values fixed for the lifetime of
+ * the device context (orch device id, log config) so they no longer ride on
+ * the per-run KernelArgs: latched once into the resident AICPU SO globals and
+ * surviving every subsequent per-task launch.
+ *
+ * `regs` is intentionally NOT here — on a5 the per-core register table is also
+ * read by the AICore KERNEL_ENTRY off the per-run device KernelArgs copy, so it
+ * stays in KernelArgs.
+ */
+struct InitArgs {
+    uint32_t device_id{0};   // ACL device ordinal -> set_orch_device_id
+    uint32_t log_level{1};   // Severity floor: 0=DEBUG, 1=INFO, 2=WARN, 3=ERROR, 4=NUL
+    uint32_t log_info_v{5};  // INFO verbosity threshold (0..9); default V5
+};
+
+/**
+ * RegisterCallableArgs - device orchestration SO registration payload
+ *
+ * Uploaded by the host register_callable path via `simpler_aicpu_register_callable`.
+ * Carries only the orchestration-SO descriptor the AICPU executor needs to
+ * (re)dlopen a callable's device-orch SO — extracted from Runtime so the
+ * register path no longer H2D's a full Runtime. On hbg this is all-zero
+ * (host-side orchestration; no device dlopen) and the entry is a no-op.
+ */
+struct RegisterCallableArgs {
+    int32_t active_callable_id{-1};                                  // orch_so_table_ slot
+    uint32_t register_new{0};                                        // 1 -> (re)dlopen, 0 -> reuse cached handle
+    uint64_t dev_orch_so_addr{0};                                    // device address of the orch SO image
+    uint64_t dev_orch_so_size{0};                                    // orch SO image size in bytes
+    char device_orch_func_name[INIT_ARGS_MAX_ORCH_SYMBOL_NAME]{};    // entry symbol
+    char device_orch_config_name[INIT_ARGS_MAX_ORCH_SYMBOL_NAME]{};  // config symbol
+};
 
 #ifdef __cplusplus
 }

@@ -309,10 +309,10 @@ int SimDeviceRunnerBase::commit_aicpu_callable_load(int32_t cid) {
     return 0;
 }
 
-int SimDeviceRunnerBase::prewarm_callable(int32_t callable_id) {
+int SimDeviceRunnerBase::aicpu_register_callable(int32_t callable_id) {
     auto it = callables_.find(callable_id);
     if (it == callables_.end()) {
-        LOG_ERROR("prewarm_callable: callable_id=%d not registered", callable_id);
+        LOG_ERROR("aicpu_register_callable: callable_id=%d not registered", callable_id);
         return -1;
     }
     if (it->second.host_dlopen_handle != nullptr) {
@@ -321,7 +321,7 @@ int SimDeviceRunnerBase::prewarm_callable(int32_t callable_id) {
 
     int rc = ensure_device_initialized();
     if (rc != 0) {
-        LOG_ERROR("prewarm_callable: ensure_device_initialized failed: %d", rc);
+        LOG_ERROR("aicpu_register_callable: ensure_device_initialized failed: %d", rc);
         return rc;
     }
 
@@ -329,9 +329,9 @@ int SimDeviceRunnerBase::prewarm_callable(int32_t callable_id) {
     rc = stamp_orch_so(runtime, callable_id, /*force_reload=*/true);
     if (rc != 0) return rc;
 
-    rc = invoke_aicpu_prewarm(runtime);
+    rc = invoke_aicpu_register_callable(runtime);
     if (rc != 0) {
-        LOG_ERROR("prewarm_callable: invoke_aicpu_prewarm failed: %d", rc);
+        LOG_ERROR("aicpu_register_callable: invoke_aicpu_register_callable failed: %d", rc);
         return rc;
     }
 

@@ -22,6 +22,7 @@
 #include "aicpu/pmu_collector_aicpu.h"
 #include "aicpu/tensor_dump_aicpu.h"
 #include "callable.h"
+#include "common/kernel_args.h"
 #include "common/memory_barrier.h"
 #include "common/l2_swimlane_profiling.h"
 #include "common/platform_config.h"
@@ -1307,10 +1308,10 @@ void AicpuExecutor::diagnose_stuck_state(
 
 // ===== Public Entry Point =====
 
-extern "C" int aicpu_prewarm_callable(Runtime *runtime) {
+extern "C" int aicpu_register_callable(const RegisterCallableArgs *args) {
     // host_build_graph resolves orchestration on the host during prepare.
-    // There is no AICPU orch_so_table_ state to prewarm.
-    (void)runtime;
+    // There is no AICPU orch_so_table_ state to register.
+    (void)args;
     return 0;
 }
 

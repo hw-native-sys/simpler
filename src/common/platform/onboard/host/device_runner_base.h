@@ -347,12 +347,14 @@ public:
     size_t host_dlopen_count() const { return host_dlopen_total_; }
 
     /**
-     * Device-orchestration callable prewarm used internally by
-     * prepare_callable(). Host-orchestration callables are a no-op.
-     * On success, AICPU has populated orch_so_table_[callable_id] and
-     * first run can advertise register_new_callable_id_=false.
+     * Device-orchestration callable registration used internally by
+     * prepare_callable(): launches `simpler_aicpu_register_callable` with a
+     * RegisterCallableArgs descriptor so the AICPU (re)dlopens the callable's
+     * orch SO. Host-orchestration callables are a no-op. On success, AICPU has
+     * populated orch_so_table_[callable_id] and first run can advertise
+     * register_new_callable_id_=false.
      */
-    int prewarm_callable(int32_t callable_id);
+    int aicpu_register_callable(int32_t callable_id);
 
     /**
      * Commit host-side AICPU seen/counting state after a device-side SO load
@@ -409,6 +411,20 @@ public:
      * @return 0 on success, error code on failure
      */
     int launch_aicpu_kernel(rtStream_t stream, KernelArgs *k_args, const char *kernel_name, int aicpu_num);
+
+    /**
+     * Launch an AICPU entry with an arbitrary launch-arg payload. Used by the
+     * non-exec entries whose payload is not KernelArgs: `simpler_aicpu_init`
+     * (InitArgs) and `simpler_aicpu_register_callable` (RegisterCallableArgs).
+     *
+     * @param stream       AICPU stream
+     * @param args         Payload pointer (host memory; CANN copies it in)
+     * @param args_size    Payload size in bytes
+     * @param kernel_name  Name of the kernel to launch
+     * @param aicpu_num    Number of AICPU instances to launch
+     * @return 0 on success, error code on failure
+     */
+    int launch_aicpu_payload(rtStream_t stream, void *args, size_t args_size, const char *kernel_name, int aicpu_num);
 
     /**
      * Launch an AICore kernel. Lazy-registers the kernel binary
@@ -492,6 +508,16 @@ protected:
      * @return 0 on success, error code on failure.
      */
     int ensure_binaries_loaded();
+
+    /**
+     * Per-device one-shot launch of `simpler_aicpu_init`, latching the
+     * invariants (orch device id, log config) into the resident AICPU SO
+     * globals. Idempotent via `aicpu_init_launched_`; called from
+     * `ensure_device_initialized()` after the binaries are loaded.
+     *
+     * @return 0 on success, error code on failure.
+     */
+    int ensure_aicpu_init_launched();
 
     /**
      * Query the maximum block_dim the stream can host.
@@ -802,6 +828,8 @@ protected:
 
     // True after AICPU SO loaded; reset by the subclass's `finalize()`.
     bool binaries_loaded_{false};
+    // Per-device one-shot guard for the simpler_aicpu_init launch.
+    bool aicpu_init_launched_{false};
 
     // Shared diagnostics collectors. Each subclass initializes its own
     // (a2a3 wraps `halHostRegister`/`Unregister` callbacks, a5 uses

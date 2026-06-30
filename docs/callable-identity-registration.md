@@ -59,11 +59,14 @@ materialization. A successful registration installs the target-local
 state before the first dispatch, `prepare_callable()` also prewarms that state
 before returning success.
 
-For `tensormap_and_ringbuffer`, prewarm runs a private AICPU entry,
-`simpler_aicpu_prewarm_callable`, after the orchestration SO bytes and child
-kernel addresses have already been staged. The AICPU prewarm may materialize
-the orchestration SO into a temporary file, `dlopen` it, resolve the
-entry/config/bind symbols, and populate `orch_so_table_[callable_id]`. It must
+For `tensormap_and_ringbuffer`, this prepare-ahead step runs a private AICPU
+entry, `simpler_aicpu_register_callable`, after the orchestration SO bytes and
+child kernel addresses have already been staged. The host passes a small
+`RegisterCallableArgs` descriptor (callable id, orch-SO device address/size,
+entry/config symbol names) extracted from the staged `CallableState` — not a
+full `Runtime`. The AICPU entry may materialize the orchestration SO into a
+temporary file, `dlopen` it, resolve the entry/config/bind symbols, and
+populate `orch_so_table_[callable_id]`. It must
 stop before any real task execution: it does not call the orchestration entry,
 does not configure runtime arguments from user task inputs, does not create a
 `PTO2Runtime`, does not enter runtime scopes, and does not submit scheduler or

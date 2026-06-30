@@ -264,7 +264,8 @@ bool LoadAicpuOp::GenerateAicpuOpJson(const std::string &json_path, const std::s
     };
     std::vector<AicpuOpConfig> op_configs = {
         make_cfg(KernelNames::RunName),
-        make_cfg(KernelNames::PrewarmName),
+        make_cfg(KernelNames::InitName),
+        make_cfg(KernelNames::RegisterCallableName),
     };
     json_file << "{\n";
     for (size_t i = 0; i < op_configs.size(); ++i) {
@@ -349,7 +350,7 @@ int LoadAicpuOp::Init() {
     }
     LOG_INFO_V2("LoadAicpuOp: Loaded inner SO via JSON, handle=%p", binary_handle_);
 
-    const char *symbol_names[] = {KernelNames::RunName, KernelNames::PrewarmName};
+    const char *symbol_names[] = {KernelNames::RunName, KernelNames::InitName, KernelNames::RegisterCallableName};
     for (const char *name : symbol_names) {
         std::string lookup_name = MakeUniqueOpType(name, inner_fp_);
         rtFuncHandle func_handle = nullptr;
@@ -370,10 +371,16 @@ int LoadAicpuOp::Init() {
     return 0;
 }
 
-int LoadAicpuOp::AicpuKernelLaunch(rtFuncHandle func_handle, rtStream_t stream, KernelArgs *k_args, int aicpu_num) {
+int LoadAicpuOp::AicpuKernelLaunch(
+    rtFuncHandle func_handle, rtStream_t stream, void *args, size_t args_size, int aicpu_num
+) {
+    if (args == nullptr || args_size == 0) {
+        LOG_ERROR("AicpuKernelLaunch: invalid arguments (args is null or args_size is 0)");
+        return -1;
+    }
     rtCpuKernelArgs_t cpu_args = {};
-    cpu_args.baseArgs.args = k_args;
-    cpu_args.baseArgs.argsSize = sizeof(KernelArgs);
+    cpu_args.baseArgs.args = args;
+    cpu_args.baseArgs.argsSize = args_size;
 
     rtKernelLaunchCfg_t kernelLaunchCfg = {nullptr, 0U};
     auto launchKernelAttr = std::make_unique<rtLaunchKernelAttr_t>();
@@ -388,13 +395,15 @@ int LoadAicpuOp::AicpuKernelLaunch(rtFuncHandle func_handle, rtStream_t stream, 
     return 0;
 }
 
-int LoadAicpuOp::LaunchBuiltInOp(rtStream_t stream, KernelArgs *k_args, int aicpu_num, const std::string &func_name) {
+int LoadAicpuOp::LaunchBuiltInOp(
+    rtStream_t stream, void *args, size_t args_size, int aicpu_num, const std::string &func_name
+) {
     auto it = func_handles_.find(func_name);
     if (it == func_handles_.end()) {
         LOG_ERROR("Function not found: %s", func_name.c_str());
         return -1;
     }
-    return AicpuKernelLaunch(it->second, stream, k_args, aicpu_num);
+    return AicpuKernelLaunch(it->second, stream, args, args_size, aicpu_num);
 }
 
 }  // namespace host

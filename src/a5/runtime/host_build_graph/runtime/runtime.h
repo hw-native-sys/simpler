@@ -510,6 +510,11 @@ public:
         dev_orch_so_addr_ = dev_addr;
         dev_orch_so_size_ = size;
     }
+    // hbg resolves orchestration on the host, so these stay zero; the getters
+    // exist only so the shared sim register-callable path compiles against this
+    // variant (it reads the descriptor but the AICPU entry is a no-op here).
+    uint64_t get_dev_orch_so_addr() const { return dev_orch_so_addr_; }
+    uint64_t get_dev_orch_so_size() const { return dev_orch_so_size_; }
     void set_active_callable_id(int32_t callable_id, bool is_new) {
         active_callable_id_ = callable_id;
         register_new_callable_id_ = is_new;

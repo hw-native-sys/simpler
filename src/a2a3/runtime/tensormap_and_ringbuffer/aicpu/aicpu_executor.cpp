@@ -26,6 +26,7 @@
 #include "aicpu/device_phase_aicpu.h"
 #include "aicpu/orch_so_file.h"
 #include "callable_protocol.h"
+#include "common/kernel_args.h"
 #include "pto2_dispatch_payload.h"
 #include "runtime.h"
 #include "spin_hint.h"
@@ -149,6 +150,13 @@ struct AicpuExecutor {
 
     // ===== Methods =====
     int32_t init(Runtime *runtime);
+    // Core orch-SO (re)load, driven by the extracted descriptor values. Both
+    // the run-path Runtime* wrapper and the register_callable entry delegate
+    // here so neither has to know the other's argument source.
+    int32_t ensure_orch_so_loaded_core(
+        int32_t callable_id, bool register_new, uint64_t dev_orch_so_addr, uint64_t dev_orch_so_size,
+        const char *entry_symbol, const char *config_symbol, int32_t thread_idx
+    );
     int32_t ensure_orch_so_loaded(Runtime *runtime, int32_t thread_idx);
     int32_t run(Runtime *runtime);
     void deinit(Runtime *runtime);
@@ -167,6 +175,14 @@ struct AicpuExecutor {
 };
 
 static AicpuExecutor g_aicpu_executor;
+
+// The register_callable payload mirrors the runtime's orch symbol-name
+// capacity; keep the two in lockstep so a name that fits in Runtime also fits
+// in RegisterCallableArgs.
+static_assert(
+    INIT_ARGS_MAX_ORCH_SYMBOL_NAME == RUNTIME_MAX_ORCH_SYMBOL_NAME,
+    "RegisterCallableArgs orch-symbol capacity must match RUNTIME_MAX_ORCH_SYMBOL_NAME"
+);
 
 // ===== AicpuExecutor Method Implementations =====
 
@@ -216,15 +232,24 @@ int32_t AicpuExecutor::ensure_orch_so_loaded(Runtime *runtime, int32_t thread_id
         LOG_ERROR("Thread %d: runtime is nullptr", thread_idx);
         return -1;
     }
+    return ensure_orch_so_loaded_core(
+        runtime->get_active_callable_id(), runtime->register_new_callable_id(), runtime->get_dev_orch_so_addr(),
+        runtime->get_dev_orch_so_size(), runtime->get_device_orch_func_name(), runtime->get_device_orch_config_name(),
+        thread_idx
+    );
+}
 
-    const int32_t callable_id = runtime->get_active_callable_id();
+int32_t AicpuExecutor::ensure_orch_so_loaded_core(
+    int32_t callable_id, bool register_new, uint64_t dev_orch_so_addr, uint64_t dev_orch_so_size,
+    const char *entry_symbol_in, const char *config_symbol_in, int32_t thread_idx
+) {
     if (callable_id < 0 || callable_id >= MAX_REGISTERED_CALLABLE_IDS) {
         LOG_ERROR("Thread %d: invalid callable_id %d (limit=%d)", thread_idx, callable_id, MAX_REGISTERED_CALLABLE_IDS);
         return -1;
     }
 
     OrchSoEntry &entry = orch_so_table_[callable_id];
-    const bool reload_so = runtime->register_new_callable_id();
+    const bool reload_so = register_new;
     if (!reload_so) {
         LOG_INFO_V0(
             "Thread %d: Reusing cached orch SO handle=%p (callable_id=%d)", thread_idx, entry.handle, callable_id
@@ -251,8 +276,8 @@ int32_t AicpuExecutor::ensure_orch_so_loaded(Runtime *runtime, int32_t thread_id
     }
     entry = OrchSoEntry{};
 
-    const void *so_data = reinterpret_cast<const void *>(runtime->get_dev_orch_so_addr());
-    size_t so_size = runtime->get_dev_orch_so_size();
+    const void *so_data = reinterpret_cast<const void *>(dev_orch_so_addr);
+    size_t so_size = dev_orch_so_size;
     if (so_data == nullptr || so_size == 0) {
         LOG_ERROR("Thread %d: Device orchestration SO not set", thread_idx);
         return -1;
@@ -302,11 +327,11 @@ int32_t AicpuExecutor::ensure_orch_so_loaded(Runtime *runtime, int32_t thread_id
     // libdevice_orch_<pid>_<cid>.so files when worker children exit via os._exit.
     unlink(so_path);
 
-    const char *entry_symbol = runtime->get_device_orch_func_name();
+    const char *entry_symbol = entry_symbol_in;
     if (entry_symbol == nullptr || entry_symbol[0] == '\0') {
         entry_symbol = DEFAULT_ORCH_ENTRY_SYMBOL;
     }
-    const char *config_symbol = runtime->get_device_orch_config_name();
+    const char *config_symbol = config_symbol_in;
     if (config_symbol == nullptr || config_symbol[0] == '\0') {
         config_symbol = DEFAULT_ORCH_CONFIG_SYMBOL;
     }
@@ -822,18 +847,23 @@ void AicpuExecutor::deinit(Runtime *runtime) {
 
 // ===== Public Entry Point =====
 
-extern "C" int32_t aicpu_prewarm_callable(Runtime *runtime) {
-    if (runtime == nullptr) {
-        LOG_ERROR("%s", "aicpu_prewarm_callable: null Runtime pointer");
+extern "C" int32_t aicpu_register_callable(const RegisterCallableArgs *args) {
+    if (args == nullptr) {
+        LOG_ERROR("%s", "aicpu_register_callable: null RegisterCallableArgs pointer");
         return -1;
     }
-    int32_t rc = g_aicpu_executor.ensure_orch_so_loaded(runtime, /*thread_idx=*/0);
-    cache_invalidate_range(runtime, sizeof(Runtime));
+    // `args` is the launch-arg payload CANN copies into the AICPU arg space
+    // (same coherent channel exec reads KernelArgs fields from) — no HBM deref,
+    // so unlike the old prewarm path there is no Runtime to cache-invalidate.
+    int32_t rc = g_aicpu_executor.ensure_orch_so_loaded_core(
+        args->active_callable_id, args->register_new != 0, args->dev_orch_so_addr, args->dev_orch_so_size,
+        args->device_orch_func_name, args->device_orch_config_name, /*thread_idx=*/0
+    );
     if (rc != 0) {
-        LOG_ERROR("aicpu_prewarm_callable: SO load failed with rc=%d", rc);
+        LOG_ERROR("aicpu_register_callable: SO load failed with rc=%d", rc);
         return rc;
     }
-    LOG_INFO_V0("aicpu_prewarm_callable: completed for callable_id=%d", runtime->get_active_callable_id());
+    LOG_INFO_V0("aicpu_register_callable: completed for callable_id=%d", args->active_callable_id);
     return 0;
 }
 
