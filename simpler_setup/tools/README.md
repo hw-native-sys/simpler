@@ -62,6 +62,27 @@ python -m simpler_setup.tools.swimlane_converter outputs/<case>_<ts>/l2_swimlane
 > alongside the perf JSON (and `--deps-json` isn't passed), the trace
 > still renders but has no arrows; the converter prints a warning.
 
+### SPMD dependency visualization
+
+For SPMD logical tasks (`block_num > 1` in `deps.json`), dependency
+arrows anchor on representative subtask rows on physical core lanes
+(not a dedicated block-level track). SPMD tasks use the minimum-`core_id`
+subtask row per `core_type` as the dependency anchor; MIX-type SPMD
+tasks pick the minimum separately for AIC and AIV. See
+[docs/dfx/l2-swimlane-profiling.md §3.5](../../docs/dfx/l2-swimlane-profiling.md#35-dependency-arrows-from-dep_gen).
+
+Each logical `(pred, succ)` edge emits flows for the Cartesian product
+of pred/succ anchor rows (`|pred_anchors| × |succ_anchors|`), not a
+per-subtask crossbar.
+
+SPMD lane labels append `_spmd` before `(rXtY)` unless the function
+name already contains `spmd` (case-insensitive), e.g.
+`v_proj_spmd(r2t10)` vs `SPMD_WRITE_AIV(t0)`.
+
+With `-v`, the converter prints
+`dependency arrows anchor on min core_id subtask per core_type` when
+SPMD tasks are present.
+
 ### Command-Line Options
 
 | Option | Short | Description |

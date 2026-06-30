@@ -456,6 +456,30 @@ Flow events: 0 (no deps.json — re-run dep_gen and pass --deps-json to add arro
 That's the rerun breadcrumb — keep an eye on it, it's the signal
 that something dropped on the way from dep_gen to converter.
 
+**SPMD dependency arrows.** For logical tasks with `block_num > 1`,
+dependency / `hb_violation` flows connect via **anchor pairing** on
+physical core lanes — there is no dedicated `SPMD (block-level)` track.
+
+SPMD tasks use the minimum-`core_id` subtask row per `core_type` as the
+dependency anchor; MIX-type SPMD tasks pick the minimum separately for
+AIC and AIV.
+
+Non-SPMD tasks (including MIX multi-slot kernels with `block_num == 1`)
+keep every subtask row as an endpoint (N×N pairing unchanged).
+
+For each logical `(pred, succ)` edge from `deps.json`, the converter
+emits flows between the Cartesian product of pred/succ anchor rows
+(`|pred_anchors| × |succ_anchors|`), not a per-subtask crossbar.
+
+**SPMD lane labels.** Logical SPMD tasks append `_spmd` before the
+`(rXtY)` suffix unless the function name already contains `spmd`
+(case-insensitive), e.g. `v_proj_spmd(r2t10)` vs `SPMD_WRITE_AIV(t0)`.
+
+Flow events carry `input_task_count` / `output_task_count` (SPMD
+`block_num`) to annotate fan degree. These arrows visualize **block-level**
+`deps.json` edges on representative subtasks — they do **not** imply
+runtime per-instance dependency resolution.
+
 **What you do NOT need to script:**
 
 - Pairing input shape / RNG seed across the two launches — `deps.json`
@@ -481,7 +505,10 @@ What the swimlane shows:
   `dep_gen` run is available, `swimlane_converter` emits flow events
   so Perfetto draws arrows between predecessor and successor tasks
   — see [§3.5](#35-dependency-arrows-from-dep_gen). Without
-  `deps.json` the trace is correct but unarrowed.
+  `deps.json` the trace is correct but unarrowed. For SPMD tasks,
+  dependency arrows use the minimum-`core_id` subtask row per
+  `core_type` as the anchor; MIX-type SPMD tasks pick the
+  minimum-`core_id` subtask separately for AIC and AIV.
 - **Scheduler-loop time decomposition.** Per-iteration AICPU
   phase records show how long the scheduler spent in each of
   its two work phases (complete / dispatch); idle is recovered
