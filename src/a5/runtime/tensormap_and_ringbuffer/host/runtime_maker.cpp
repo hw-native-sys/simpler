@@ -462,17 +462,17 @@ extern "C" int bind_callable_to_runtime_impl(
     {
         const char *env_val = std::getenv("PTO2_ORCH_TO_SCHED");
         if (env_val && (env_val[0] == '1' || env_val[0] == 't' || env_val[0] == 'T')) {
-            runtime->orch_to_sched = true;
+            runtime->dev.orch_to_sched = true;
         }
-        LOG_INFO_V0("Orchestrator-to-scheduler transition: %s", runtime->orch_to_sched ? "enabled" : "disabled");
+        LOG_INFO_V0("Orchestrator-to-scheduler transition: %s", runtime->dev.orch_to_sched ? "enabled" : "disabled");
     }
 
     // Read serial orchestrator -> scheduler start gate from environment.
     {
         const char *env_val = std::getenv("PTO2_SERIAL_ORCH_SCHED");
-        runtime->serial_orch_sched = env_val && (env_val[0] == '1' || env_val[0] == 't' || env_val[0] == 'T');
+        runtime->dev.serial_orch_sched = env_val && (env_val[0] == '1' || env_val[0] == 't' || env_val[0] == 'T');
         LOG_INFO_V0(
-            "Serial orchestrator-to-scheduler start gate: %s", runtime->serial_orch_sched ? "enabled" : "disabled"
+            "Serial orchestrator-to-scheduler start gate: %s", runtime->dev.serial_orch_sched ? "enabled" : "disabled"
         );
     }
 

@@ -134,7 +134,7 @@ extern "C" void aicore_execute_wrapper(
     //   physical_core_id [block_dim..3*block_dim-1]    = AIV pairs
     //                                                    (AIV0_c0, AIV1_c0, AIV0_c1, AIV1_c1, ...)
     // This mirrors the runtime's CoreTracker cluster assignment.
-    uint32_t block_dim = static_cast<uint32_t>(runtime->worker_count) / PLATFORM_CORES_PER_BLOCKDIM;
+    uint32_t block_dim = static_cast<uint32_t>(runtime->get_worker_count()) / PLATFORM_CORES_PER_BLOCKDIM;
     uint32_t cluster_id;
     uint32_t subblock_id;
     if (core_type == CoreType::AIC) {

@@ -282,6 +282,27 @@ public:
     Runtime();
 
     // =========================================================================
+    // Accessors for the launch/affinity fields.
+    //
+    // Mirror the trb Runtime's accessor surface (which forwards into its `dev`
+    // sub-struct) so the shared platform layer compiles against either variant.
+    // host_build_graph keeps these fields as flat public members, so the
+    // accessors just return them; layout and sizeof are unchanged.
+    // =========================================================================
+
+    int get_worker_count() const { return worker_count; }
+    void set_worker_count(int n) { worker_count = n; }
+    int get_aicpu_thread_num() const { return aicpu_thread_num; }
+    void set_aicpu_thread_num(int n) { aicpu_thread_num = n; }
+    Handshake *get_workers() { return workers; }
+    int32_t get_aicpu_allowed_cpu_count() const { return aicpu_allowed_cpu_count; }
+    void set_aicpu_allowed_cpu_count(int32_t n) { aicpu_allowed_cpu_count = n; }
+    int32_t get_aicpu_launch_count() const { return aicpu_launch_count; }
+    void set_aicpu_launch_count(int32_t n) { aicpu_launch_count = n; }
+    int32_t *get_aicpu_allowed_cpus() { return aicpu_allowed_cpus; }
+    size_t aicpu_allowed_cpus_capacity() const { return sizeof(aicpu_allowed_cpus) / sizeof(aicpu_allowed_cpus[0]); }
+
+    // =========================================================================
     // Task Management
     // =========================================================================
 
@@ -474,53 +495,14 @@ public:
     // NOTE: Placed at end of class to avoid affecting device memory layout
     HostApi host_api;
 
-    // Device orchestration SO metadata (see a2a3 host_build_graph runtime.h).
-    uint64_t dev_orch_so_addr_{0};
-    uint64_t dev_orch_so_size_{0};
     // Per-callable_id dispatch. hbg orch runs on host, so AICPU never reads
-    // `active_callable_id_`; the field exists for parity with the
-    // shared platform layer (DeviceRunner stamps it on every run).
+    // `active_callable_id_`; the field exists for parity with the shared
+    // platform layer (DeviceRunner stamps it on every run via
+    // set_active_callable_id).
     int32_t active_callable_id_{-1};
-    bool register_new_callable_id_{false};
 
-    // Device-orchestration entry/config symbol names (trb path). Always
-    // empty on this hbg variant — included for API parity so the shared
-    // platform layer can call set_device_orch_func_name unconditionally.
-    char device_orch_func_name_[64]{};
-    char device_orch_config_name_[64]{};
-
-    void set_device_orch_func_name(const char *name) {
-        device_orch_func_name_[0] = '\0';
-        if (name) {
-            strncpy(device_orch_func_name_, name, sizeof(device_orch_func_name_) - 1);
-            device_orch_func_name_[sizeof(device_orch_func_name_) - 1] = '\0';
-        }
-    }
-    const char *get_device_orch_func_name() const { return device_orch_func_name_; }
-    void set_device_orch_config_name(const char *name) {
-        device_orch_config_name_[0] = '\0';
-        if (name) {
-            strncpy(device_orch_config_name_, name, sizeof(device_orch_config_name_) - 1);
-            device_orch_config_name_[sizeof(device_orch_config_name_) - 1] = '\0';
-        }
-    }
-    const char *get_device_orch_config_name() const { return device_orch_config_name_; }
-
-    void set_dev_orch_so(uint64_t dev_addr, uint64_t size) {
-        dev_orch_so_addr_ = dev_addr;
-        dev_orch_so_size_ = size;
-    }
-    // hbg resolves orchestration on the host, so these stay zero; the getters
-    // exist only so the shared sim register-callable path compiles against this
-    // variant (it reads the descriptor but the AICPU entry is a no-op here).
-    uint64_t get_dev_orch_so_addr() const { return dev_orch_so_addr_; }
-    uint64_t get_dev_orch_so_size() const { return dev_orch_so_size_; }
-    void set_active_callable_id(int32_t callable_id, bool is_new) {
-        active_callable_id_ = callable_id;
-        register_new_callable_id_ = is_new;
-    }
+    void set_active_callable_id(int32_t callable_id) { active_callable_id_ = callable_id; }
     int32_t get_active_callable_id() const { return active_callable_id_; }
-    bool register_new_callable_id() const { return register_new_callable_id_; }
 
     // Host-side tensor ledger for D2H copy-back at finalize. Populated by
     // runtime_maker.cpp from orch_args at bind time; iterated in
@@ -529,5 +511,11 @@ public:
     // garbage, identical to host_api above. No fixed cap.
     std::vector<TensorPair> tensor_pairs_;
 };
+
+// Number of bytes of the Runtime image copied to the device. host_build_graph
+// uploads the whole object (AICore reads tasks[] etc. by offset), so this is
+// sizeof(Runtime). Mirrors the trb declaration so the shared
+// device_runner_helpers.cpp copy path is runtime-agnostic.
+size_t runtime_device_copy_size(const Runtime &rt);
 
 #endif  // SRC_A5_RUNTIME_HOST_BUILD_GRAPH_RUNTIME_RUNTIME_H_

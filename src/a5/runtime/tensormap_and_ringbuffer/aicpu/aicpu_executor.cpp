@@ -205,11 +205,11 @@ int32_t AicpuExecutor::init(Runtime *runtime) {
     // Read execution parameters from runtime. The 0 → 1 fixup runs before the
     // sched_thread_num_ derivation so a zero input doesn't leave the scheduler
     // count at -1.
-    aicpu_thread_num_ = runtime->aicpu_thread_num;
+    aicpu_thread_num_ = runtime->dev.aicpu_thread_num;
     if (aicpu_thread_num_ == 0) aicpu_thread_num_ = 1;
     sched_thread_num_ = aicpu_thread_num_ - 1;
-    orch_to_sched_ = runtime->orch_to_sched;
-    serial_orch_sched_ = runtime->serial_orch_sched;
+    orch_to_sched_ = runtime->dev.orch_to_sched;
+    serial_orch_sched_ = runtime->dev.serial_orch_sched;
 
     if (aicpu_thread_num_ < 1 || aicpu_thread_num_ > MAX_AICPU_THREADS) {
         LOG_ERROR("Invalid aicpu_thread_num: %d", aicpu_thread_num_);
@@ -783,10 +783,11 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
 }
 
 void AicpuExecutor::deinit(Runtime *runtime) {
-    // 1. Invalidate AICPU cache for Runtime address range.
-    //    Next round's Host DMA (rtMemcpy) writes fresh Runtime to HBM but
-    //    bypasses this cache. Invalidating now ensures next round reads from HBM.
-    cache_invalidate_range(runtime, sizeof(Runtime));
+    // 1. Invalidate AICPU cache for the device-copied Runtime range (`dev`).
+    //    Next round's Host DMA (rtMemcpy) writes fresh bytes to HBM but
+    //    bypasses this cache. Invalidating now ensures next round reads from
+    //    HBM. Only `dev` is uploaded, so only `dev` needs invalidation.
+    cache_invalidate_range(runtime, sizeof(runtime->dev));
 
     // Reset all SchedulerContext-owned state in one place.
     sched_ctx_.deinit();

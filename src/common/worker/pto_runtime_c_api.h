@@ -213,7 +213,7 @@ int simpler_run(
  *
  * AICPU-side dlopen state in `orch_so_table_[callable_id]` is NOT released by
  * this call. It is reclaimed lazily when the cid is reused (the next
- * `register_new_callable_id()` triggers `dlclose` + reload), or at process
+ * `launch_device_register` triggers `dlclose` + reload), or at process
  * exit. Long-running processes that register / unregister cids without ever
  * reusing them will hold the AICPU SO handle until shutdown.
  *

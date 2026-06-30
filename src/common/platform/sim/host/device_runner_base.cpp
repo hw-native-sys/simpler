@@ -253,7 +253,10 @@ std::thread SimDeviceRunnerBase::l3_l2_create_service_thread(std::function<void(
     return create_thread(std::move(fn));
 }
 
-int SimDeviceRunnerBase::stamp_orch_so(Runtime &runtime, int32_t cid, bool force_reload) {
+int SimDeviceRunnerBase::stamp_orch_so(Runtime &runtime, int32_t cid) {
+    // Registered-callable flow only: the orch SO was already delivered to the
+    // sim AICPU at launch_device_register time. A run just needs the active
+    // callable_id so the AICPU dispatches the right orch_so_table_ slot.
     if (cid < 0) {
         LOG_ERROR("stamp_orch_so: invalid callable_id=%d", cid);
         return -1;
@@ -263,23 +266,7 @@ int SimDeviceRunnerBase::stamp_orch_so(Runtime &runtime, int32_t cid, bool force
         LOG_ERROR("stamp_orch_so: callable_id=%d not registered", cid);
         return -1;
     }
-    const auto &state = it->second;
-    // hbg: orch SO never crosses host/device — clear device-orch metadata
-    // and skip AICPU bookkeeping.
-    if (state.host_dlopen_handle != nullptr) {
-        runtime.set_dev_orch_so(0, 0);
-        runtime.set_active_callable_id(cid, /*is_new=*/false);
-        return 0;
-    }
-    const bool needs_load = force_reload || (aicpu_seen_callable_ids_.count(cid) == 0);
-    runtime.set_dev_orch_so(state.dev_orch_so_addr, state.dev_orch_so_size);
-    runtime.set_device_orch_func_name(state.func_name.c_str());
-    runtime.set_device_orch_config_name(state.config_name.c_str());
-    runtime.set_active_callable_id(cid, needs_load);
-    LOG_INFO_V0(
-        "Orch SO stamped cid=%d hash=0x%lx %zu bytes (needs_load=%d)", cid, state.hash, state.dev_orch_so_size,
-        needs_load ? 1 : 0
-    );
+    runtime.set_active_callable_id(cid);
     return 0;
 }
 
@@ -289,7 +276,7 @@ int SimDeviceRunnerBase::prepare_orch_so(Runtime &runtime) {
         LOG_ERROR("prepare_orch_so: no active callable_id; prepared-callable flow required");
         return -1;
     }
-    return stamp_orch_so(runtime, cid, /*force_reload=*/false);
+    return stamp_orch_so(runtime, cid);
 }
 
 int SimDeviceRunnerBase::commit_device_register(int32_t cid) {
@@ -325,11 +312,19 @@ int SimDeviceRunnerBase::launch_device_register(int32_t callable_id) {
         return rc;
     }
 
-    Runtime runtime;
-    rc = stamp_orch_so(runtime, callable_id, /*force_reload=*/true);
-    if (rc != 0) return rc;
+    // Build the orch-SO descriptor straight from CallableState — no throwaway
+    // Runtime + stamp round-trip. Mirrors the onboard launch_device_register.
+    const CallableState &state = it->second;
+    RegisterCallableArgs reg_args{};
+    reg_args.active_callable_id = callable_id;
+    reg_args.dev_orch_so_addr = state.dev_orch_so_addr;
+    reg_args.dev_orch_so_size = state.dev_orch_so_size;
+    snprintf(reg_args.device_orch_func_name, sizeof(reg_args.device_orch_func_name), "%s", state.func_name.c_str());
+    snprintf(
+        reg_args.device_orch_config_name, sizeof(reg_args.device_orch_config_name), "%s", state.config_name.c_str()
+    );
 
-    rc = invoke_device_register(runtime);
+    rc = invoke_device_register(reg_args);
     if (rc != 0) {
         LOG_ERROR("launch_device_register: invoke_device_register failed: %d", rc);
         return rc;
@@ -472,9 +467,9 @@ BindCallableResult SimDeviceRunnerBase::bind_callable_to_runtime(Runtime &runtim
         }
         runtime.replay_function_bin_addr(kv.first, kv.second);
     }
-    runtime.set_device_orch_func_name(state.func_name.c_str());
-    runtime.set_device_orch_config_name(state.config_name.c_str());
-    runtime.set_active_callable_id(callable_id, /*is_new=*/false);
+    // The AICPU dispatches the orch SO via this callable_id; the SO descriptor
+    // was already delivered at launch_device_register time.
+    runtime.set_active_callable_id(callable_id);
     return {
         0, state.host_orch_func_ptr, state.signature.empty() ? nullptr : state.signature.data(),
         static_cast<int>(state.signature.size())
@@ -572,10 +567,11 @@ void SimDeviceRunnerBase::print_handshake_results() {
     }
 
     LOG_DEBUG("Handshake results for %d cores:", worker_count_);
+    Handshake *workers = last_runtime_->get_workers();
     for (int i = 0; i < worker_count_; i++) {
         LOG_DEBUG(
-            "  Core %d: aicore_done=%d aicpu_ready=%d task=%d", i, last_runtime_->workers[i].aicore_done,
-            last_runtime_->workers[i].aicpu_ready, last_runtime_->workers[i].task
+            "  Core %d: aicore_done=%d aicpu_ready=%d task=%d", i, workers[i].aicore_done, workers[i].aicpu_ready,
+            workers[i].task
         );
     }
 }

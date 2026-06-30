@@ -271,32 +271,33 @@ int DeviceRunner::run(Runtime &runtime, int block_dim, int launch_aicpu_num) {
     {
         std::vector<pto::a2a3::AicpuLogicalCpu> user_cpus;
         std::vector<int32_t> allowed;
-        runtime.aicpu_allowed_cpu_count = 0;
-        runtime.aicpu_launch_count = 0;
+        runtime.set_aicpu_allowed_cpu_count(0);
+        runtime.set_aicpu_launch_count(0);
         if (!pto::a2a3::probe_aicpu_topology(static_cast<uint32_t>(device_id_), user_cpus)) {
             LOG_ERROR("A2A3 AICPU topology probe failed; cannot configure affinity gate");
             return -1;
         }
-        if (!pto::a2a3::compute_allowed_cpus(user_cpus, runtime.aicpu_thread_num, allowed)) {
+        if (!pto::a2a3::compute_allowed_cpus(user_cpus, runtime.get_aicpu_thread_num(), allowed)) {
             LOG_ERROR(
                 "A2A3 AICPU topology has %zu user cpus, cannot fit %d active threads", user_cpus.size(),
-                runtime.aicpu_thread_num
+                runtime.get_aicpu_thread_num()
             );
             return -1;
         }
-        const size_t cap = sizeof(runtime.aicpu_allowed_cpus) / sizeof(runtime.aicpu_allowed_cpus[0]);
+        const size_t cap = runtime.aicpu_allowed_cpus_capacity();
         if (allowed.size() > cap) {
             LOG_ERROR("A2A3 compute_allowed_cpus returned %zu > cap %zu", allowed.size(), cap);
             return -1;
         }
+        int32_t *allowed_cpus = runtime.get_aicpu_allowed_cpus();
         for (size_t i = 0; i < allowed.size(); ++i)
-            runtime.aicpu_allowed_cpus[i] = allowed[i];
-        runtime.aicpu_allowed_cpu_count = static_cast<int32_t>(allowed.size());
+            allowed_cpus[i] = allowed[i];
+        runtime.set_aicpu_allowed_cpu_count(static_cast<int32_t>(allowed.size()));
         int32_t launch_n = static_cast<int32_t>(user_cpus.size());
         if (launch_n > PLATFORM_MAX_AICPU_THREADS_JUST_FOR_LAUNCH) {
             launch_n = PLATFORM_MAX_AICPU_THREADS_JUST_FOR_LAUNCH;
         }
-        runtime.aicpu_launch_count = launch_n;
+        runtime.set_aicpu_launch_count(launch_n);
 
         std::string dump;
         for (size_t i = 0; i < allowed.size(); ++i) {
@@ -306,7 +307,7 @@ int DeviceRunner::run(Runtime &runtime, int block_dim, int launch_aicpu_num) {
         }
         LOG_INFO_V0(
             "A2A3 AICPU ALLOWED_CPUS = [%s] (active=%d, launch=%d, user_cpus=%zu)", dump.c_str(),
-            runtime.aicpu_thread_num, runtime.aicpu_launch_count, user_cpus.size()
+            runtime.get_aicpu_thread_num(), runtime.get_aicpu_launch_count(), user_cpus.size()
         );
     }
 
@@ -317,7 +318,7 @@ int DeviceRunner::run(Runtime &runtime, int block_dim, int launch_aicpu_num) {
 
     // Initialize per-subsystem shared memory.
     if (enable_l2_swimlane_) {
-        rc = init_l2_swimlane(num_aicore, runtime.aicpu_thread_num, device_id_);
+        rc = init_l2_swimlane(num_aicore, runtime.get_aicpu_thread_num(), device_id_);
         if (rc != 0) {
             LOG_ERROR("init_l2_swimlane failed: %d", rc);
             return rc;
@@ -410,7 +411,7 @@ int DeviceRunner::run(Runtime &runtime, int block_dim, int launch_aicpu_num) {
     if (enable_l2_swimlane_ && l2_swimlane_collector_.is_initialized()) {
         std::vector<CoreType> core_types(num_aicore);
         for (int i = 0; i < num_aicore; i++) {
-            core_types[i] = runtime.workers[i].core_type;
+            core_types[i] = runtime.get_workers()[i].core_type;
         }
         l2_swimlane_collector_.set_core_types(core_types.data(), num_aicore);
     }
@@ -435,7 +436,7 @@ int DeviceRunner::run(Runtime &runtime, int block_dim, int launch_aicpu_num) {
     }
 
     LOG_INFO_V0("=== launch_aicpu_kernel %s ===", host::KernelNames::RunName);
-    int aicpu_launch_n = (runtime.aicpu_launch_count > 0) ? runtime.aicpu_launch_count : launch_aicpu_num;
+    int aicpu_launch_n = (runtime.get_aicpu_launch_count() > 0) ? runtime.get_aicpu_launch_count() : launch_aicpu_num;
     rc = launch_aicpu_kernel(stream_aicpu_, &kernel_args_.args, host::KernelNames::RunName, aicpu_launch_n);
     if (rc != 0) {
         LOG_ERROR("launch_aicpu_kernel (main) failed: %d", rc);
@@ -830,7 +831,7 @@ int DeviceRunner::init_l2_swimlane(int num_aicore, int aicpu_thread_num, int dev
 }
 
 int DeviceRunner::init_tensor_dump(Runtime &runtime, int device_id) {
-    int num_dump_threads = runtime.aicpu_thread_num;
+    int num_dump_threads = runtime.get_aicpu_thread_num();
 
     auto alloc_cb = [this](size_t size) -> void * {
         return mem_alloc_.alloc(size);

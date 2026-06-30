@@ -515,7 +515,9 @@ void DeviceRunnerBase::print_handshake_results() {
     // Allocate temporary buffer to read handshake data from device
     std::vector<Handshake> workers(worker_count_);
     size_t total_size = sizeof(Handshake) * worker_count_;
-    rtMemcpy(workers.data(), total_size, kernel_args_.args.runtime_args->workers, total_size, RT_MEMCPY_DEVICE_TO_HOST);
+    rtMemcpy(
+        workers.data(), total_size, kernel_args_.args.runtime_args->get_workers(), total_size, RT_MEMCPY_DEVICE_TO_HOST
+    );
 
     LOG_DEBUG("Handshake results for %d cores:", worker_count_);
     for (int i = 0; i < worker_count_; i++) {
@@ -582,11 +584,11 @@ uint64_t DeviceRunnerBase::upload_chip_callable_buffer(const ChipCallable *calla
     return chip_dev;
 }
 
-int DeviceRunnerBase::stamp_orch_so(Runtime &runtime, int32_t cid, bool force_reload) {
-    // Registered-callable flow only: the SO bytes were already H2D'd at
-    // record_device_orch_callable time. Stamp dev_orch_so on the runtime and mark
-    // `is_new` based on whether the AICPU has committed a successful load
-    // for this cid since registration.
+int DeviceRunnerBase::stamp_orch_so(Runtime &runtime, int32_t cid) {
+    // Registered-callable flow only: the orch SO was already H2D'd and
+    // dlopen'd device-side at record_device_orch_callable / launch_device_register
+    // time. All that remains for a run is to tell the AICPU which orch_so_table_
+    // slot to dispatch — the active callable_id.
     if (cid < 0) {
         LOG_ERROR("stamp_orch_so: invalid callable_id=%d", cid);
         return -1;
@@ -596,24 +598,7 @@ int DeviceRunnerBase::stamp_orch_so(Runtime &runtime, int32_t cid, bool force_re
         LOG_ERROR("stamp_orch_so: callable_id=%d not registered", cid);
         return -1;
     }
-    const auto &state = it->second;
-    // hbg variant: orch SO never crosses the host/device boundary, so the
-    // AICPU does no per-cid dlopen. Skip orch_so_table_ bookkeeping and clear
-    // device-orch metadata.
-    if (state.host_dlopen_handle != nullptr) {
-        runtime.set_dev_orch_so(0, 0);
-        runtime.set_active_callable_id(cid, /*is_new=*/false);
-        return 0;
-    }
-    const bool needs_load = force_reload || (aicpu_seen_callable_ids_.count(cid) == 0);
-    runtime.set_dev_orch_so(state.dev_orch_so_addr, state.dev_orch_so_size);
-    runtime.set_device_orch_func_name(state.func_name.c_str());
-    runtime.set_device_orch_config_name(state.config_name.c_str());
-    runtime.set_active_callable_id(cid, needs_load);
-    LOG_INFO_V0(
-        "Orch SO stamped cid=%d hash=0x%lx %zu bytes (needs_load=%d)", cid, state.hash, state.dev_orch_so_size,
-        needs_load ? 1 : 0
-    );
+    runtime.set_active_callable_id(cid);
     return 0;
 }
 
@@ -623,7 +608,7 @@ int DeviceRunnerBase::prepare_orch_so(Runtime &runtime) {
         LOG_ERROR("prepare_orch_so: no active callable_id; registered-callable flow required");
         return -1;
     }
-    return stamp_orch_so(runtime, cid, /*force_reload=*/false);
+    return stamp_orch_so(runtime, cid);
 }
 
 int DeviceRunnerBase::commit_device_register(int32_t cid) {
@@ -849,14 +834,12 @@ BindCallableResult DeviceRunnerBase::bind_callable_to_runtime(Runtime &runtime, 
         }
         runtime.replay_function_bin_addr(kv.first, kv.second);
     }
-    runtime.set_device_orch_func_name(state.func_name.c_str());
-    runtime.set_device_orch_config_name(state.config_name.c_str());
-    // Stamp callable_id with is_new=false; prepare_orch_so refreshes the flag
-    // with the authoritative first_sighting answer right before launch.
-    runtime.set_active_callable_id(callable_id, /*is_new=*/false);
+    // Tell the AICPU which orch_so_table_ slot this run dispatches. The orch SO
+    // descriptor itself was delivered at register time via RegisterCallableArgs.
+    runtime.set_active_callable_id(callable_id);
     // hbg path: host_orch_func_ptr travels back to the c_api caller, which
     // hands it to bind_callable_to_runtime_impl. trb path: stays null and
-    // the device-side orch SO is resolved from the symbol names above.
+    // the device-side orch SO was resolved at register time.
     return {
         0, state.host_orch_func_ptr, state.signature.empty() ? nullptr : state.signature.data(),
         static_cast<int>(state.signature.size())
@@ -1120,17 +1103,18 @@ int DeviceRunnerBase::prepare_runtime_for_launch(Runtime &runtime, int block_dim
         return -1;
     }
 
-    runtime.worker_count = num_aicore;
+    runtime.set_worker_count(num_aicore);
     worker_count_ = num_aicore;  // Stored for print_handshake_results in destructor
-    runtime.aicpu_thread_num = launch_aicpu_num;
+    runtime.set_aicpu_thread_num(launch_aicpu_num);
 
     // First `block_dim` cores are AIC; remaining ~2/3 are AIV.
     int num_aic = block_dim;
+    Handshake *workers = runtime.get_workers();
     for (int i = 0; i < num_aicore; i++) {
-        runtime.workers[i].aicpu_ready = 0;
-        runtime.workers[i].aicore_done = 0;
-        runtime.workers[i].task = 0;
-        runtime.workers[i].core_type = (i < num_aic) ? CoreType::AIC : CoreType::AIV;
+        workers[i].aicpu_ready = 0;
+        workers[i].aicore_done = 0;
+        workers[i].task = 0;
+        workers[i].core_type = (i < num_aic) ? CoreType::AIC : CoreType::AIV;
     }
 
     // Set function_bin_addr for all tasks: Runtime::func_id_to_addr_[] stores

@@ -40,7 +40,7 @@ public:
 
 private:
     int ensure_binaries_loaded() override;
-    int invoke_device_register(Runtime &runtime) override;
+    int invoke_device_register(const RegisterCallableArgs &reg_args) override;
     void unload_executor_binaries();
 
     int init_l2_swimlane(int num_aicore, int aicpu_thread_num, int device_id);

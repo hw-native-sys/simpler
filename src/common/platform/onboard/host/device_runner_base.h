@@ -349,10 +349,10 @@ public:
     /**
      * Device-orchestration callable registration used internally by
      * simpler_register_callable(): launches `simpler_aicpu_register_callable` with a
-     * RegisterCallableArgs descriptor so the AICPU (re)dlopens the callable's
+     * RegisterCallableArgs descriptor so the AICPU dlopens the callable's
      * orch SO. Host-orchestration callables are a no-op. On success, AICPU has
-     * populated orch_so_table_[callable_id] and first run can advertise
-     * register_new_callable_id_=false.
+     * populated orch_so_table_[callable_id] and subsequent runs only need to
+     * stamp the active callable_id.
      */
     int launch_device_register(int32_t callable_id);
 
@@ -581,8 +581,9 @@ protected:
     /**
      * Per-run Runtime setup: derives `num_aicore = block_dim *
      * cores_per_blockdim_`, range-checks against `RUNTIME_MAX_WORKER`,
-     * publishes `runtime.worker_count`, `worker_count_`,
-     * `runtime.aicpu_thread_num`, zero-initializes the handshake
+     * publishes `worker_count`, `worker_count_`,
+     * `aicpu_thread_num` (via the Runtime accessors), zero-initializes
+     * the handshake
      * worker array with AIC/AIV core typing (first `block_dim` cores
      * are AIC, remaining are AIV), and rewrites each task's
      * `function_bin_addr` from `runtime.get_function_bin_addr(func_id)
@@ -678,15 +679,16 @@ protected:
     int finalize_common();
 
     /**
-     * Stamp registered callable metadata onto a Runtime without committing
-     * host seen/counting state. The device-side load must complete before
-     * commit_device_register() is called.
+     * Stamp the active callable_id onto a Runtime so the AICPU knows which
+     * orch_so_table_ slot to dispatch. The orch SO itself was already delivered
+     * device-side at register time (launch_device_register), so nothing else
+     * needs rewriting per run.
      *
-     * @param runtime  Runtime whose device-SO metadata will be rewritten.
+     * @param runtime  Runtime whose active callable_id will be set.
      * @return 0 on success, non-zero on failure.
      */
     int prepare_orch_so(Runtime &runtime);
-    int stamp_orch_so(Runtime &runtime, int32_t callable_id, bool force_reload);
+    int stamp_orch_so(Runtime &runtime, int32_t callable_id);
 
     // ---- Group D state shared by both a2a3 and a5 -------------------------
     //

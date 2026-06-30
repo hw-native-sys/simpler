@@ -149,9 +149,12 @@ protected:
     // --- Helpers usable by subclass run() / finalize() -------------------
     int ensure_device_initialized();
     virtual int ensure_binaries_loaded() = 0;
-    virtual int invoke_device_register(Runtime &runtime) = 0;
+    // Hand the orch-SO descriptor to the sim AICPU register entry. Built
+    // directly from CallableState by launch_device_register — no Runtime
+    // round-trip.
+    virtual int invoke_device_register(const RegisterCallableArgs &reg_args) = 0;
     int prepare_orch_so(Runtime &runtime);
-    int stamp_orch_so(Runtime &runtime, int32_t callable_id, bool force_reload);
+    int stamp_orch_so(Runtime &runtime, int32_t callable_id);
 
     // Bulk-free the shared callable / chip-callable / orch-SO state. Subclass
     // finalize() calls this before mem_alloc_.finalize(). Idempotent.

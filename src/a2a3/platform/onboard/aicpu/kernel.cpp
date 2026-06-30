@@ -90,15 +90,15 @@ extern "C" __attribute__((visibility("default"))) int simpler_aicpu_exec(void *a
     // OCCUPY and wrote it into Runtime; the device side only matches
     // sched_getcpu() against that table and exposes the table position as
     // exec_idx.
-    if (runtime->aicpu_allowed_cpu_count <= 0 || runtime->aicpu_launch_count <= 0) {
+    if (runtime->get_aicpu_allowed_cpu_count() <= 0 || runtime->get_aicpu_launch_count() <= 0) {
         LOG_ERROR(
             "AICPU affinity inputs missing: allowed_cpu_count=%d launch_count=%d (host probe must run before exec)",
-            runtime->aicpu_allowed_cpu_count, runtime->aicpu_launch_count
+            runtime->get_aicpu_allowed_cpu_count(), runtime->get_aicpu_launch_count()
         );
         return -1;
     }
     if (!platform_aicpu_affinity_gate_filter(
-            runtime->aicpu_allowed_cpus, runtime->aicpu_allowed_cpu_count, runtime->aicpu_launch_count
+            runtime->get_aicpu_allowed_cpus(), runtime->get_aicpu_allowed_cpu_count(), runtime->get_aicpu_launch_count()
         )) {
         LOG_INFO_V0("Thread dropped by filter affinity gate");
         return 0;

@@ -693,8 +693,8 @@ int32_t SchedulerContext::shutdown(int32_t thread_idx) {
 // Handshake with all AICore workers; discover core type and reg address.
 // =============================================================================
 int32_t SchedulerContext::handshake_all_cores(Runtime *runtime) {
-    Handshake *all_handshakes = reinterpret_cast<Handshake *>(runtime->workers);
-    cores_total_num_ = runtime->worker_count;
+    Handshake *all_handshakes = reinterpret_cast<Handshake *>(runtime->dev.workers);
+    cores_total_num_ = runtime->dev.worker_count;
 
     // Validate cores_total_num_ before using as array index
     if (cores_total_num_ == 0 || cores_total_num_ > RUNTIME_MAX_WORKER) {
@@ -927,7 +927,7 @@ void SchedulerContext::reassign_cores_for_all_threads() {
 // =============================================================================
 void SchedulerContext::emergency_shutdown(Runtime *runtime) {
     LOG_WARN("Emergency shutdown: sending exit signal to all initialized cores");
-    Handshake *all_handshakes = reinterpret_cast<Handshake *>(runtime->workers);
+    Handshake *all_handshakes = reinterpret_cast<Handshake *>(runtime->dev.workers);
     int32_t timeout_count = 0;
     for (int32_t i = 0; i < cores_total_num_; i++) {
         Handshake *hank = &all_handshakes[i];
@@ -973,7 +973,7 @@ int32_t SchedulerContext::init(
     // prior enabled launch's level can't leak into the phase-record gates in
     // scheduler_dispatch (`>= SCHED_PHASES`).
     if (is_l2_swimlane_enabled()) {
-        l2_swimlane_aicpu_init(runtime->worker_count);
+        l2_swimlane_aicpu_init(runtime->dev.worker_count);
         l2_swimlane_level_ = get_l2_swimlane_level();
         if (l2_swimlane_level_ >= L2SwimlaneLevel::SCHED_PHASES) {
             // When orchestrator phases merge into scheduler threads
@@ -993,7 +993,7 @@ int32_t SchedulerContext::init(
             // Orch phase is a single instance (PR #971 design), so the orch
             // pool count is always 1 regardless of orch_to_sched mode.
             const int orch_phase_threads = 1;
-            l2_swimlane_aicpu_init_phase(runtime->worker_count, sched_phase_threads, orch_phase_threads);
+            l2_swimlane_aicpu_init_phase(runtime->dev.worker_count, sched_phase_threads, orch_phase_threads);
         }
     } else {
         l2_swimlane_level_ = L2SwimlaneLevel::DISABLED;
@@ -1077,7 +1077,7 @@ int32_t SchedulerContext::init(
         }
     }
 
-    func_id_to_addr_ = runtime->func_id_to_addr_;
+    func_id_to_addr_ = runtime->dev.func_id_to_addr_;
 
     return 0;
 }

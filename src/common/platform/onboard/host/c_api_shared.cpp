@@ -523,13 +523,6 @@ int simpler_run(
             validate_runtime_impl(r);
             return rc;
         }
-        if (r->register_new_callable_id()) {
-            rc = runner->commit_device_register(r->get_active_callable_id());
-            if (rc != 0) {
-                validate_runtime_impl(r);
-                return rc;
-            }
-        }
 
         {
             STRACE("simpler_run.validate");
