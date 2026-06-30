@@ -614,7 +614,13 @@ def _inject_dist_swimlane_names(callable_spec: dict) -> None:
             continue
         args["name"] = nm
         tid = args.get("task_id")
-        e["name"] = f"{nm}#{tid}" if tid is not None else nm
+        # A distributed-runtime span carries a `phase` (kernel / build / alloc /
+        # replay / drain_won). The func_id -> name map only knows the kernel
+        # label, so prefix non-kernel phases to keep e.g. a task's `build` span
+        # distinct from its `kernel` span on the same lane (both share func_id).
+        phase = args.get("phase")
+        label = nm if (phase in (None, "kernel")) else f"{phase}:{nm}"
+        e["name"] = f"{label}#{tid}" if tid is not None else label
         changed = True
     if changed:
         with open(path, "w") as f:

@@ -291,15 +291,28 @@ struct DistTensorMap {
 // and will execute itself. Holds its own copy of the argument Tensors so it can
 // be executed at any later point (deferred past further orchestration).
 // -----------------------------------------------------------------------------
-// One executed (sub)task, recorded only when swimlane tracing is on. Laid out
-// in the exported Chrome trace by physical block (pid) and lane (tid).
+// One traced span on a core's timeline, recorded only when swimlane tracing is
+// on. `phase` distinguishes the orchestration stage so the exported lane shows
+// not just kernel execution but also the work between kernels (alloc, claim/
+// build, deposit drains). Laid out in the Chrome trace by physical block (pid)
+// and lane (tid).
+enum class TracePhase : int32_t {
+    Kernel = 0,    // incore kernel execution (or busy-wait replay)
+    Alloc = 1,     // dist_alloc_tensors body (materialize + reclaim back-pressure)
+    Build = 2,     // claim WON + build_ring_slot (this core owns/builds the task)
+    DrainWon = 3,  // drain_block_won pulled+built a follower deposit
+    Replay = 4,    // submit replayed but claim LOST (per-core map/heap bookkeeping only)
+    RingBp = 5,    // winner spun on ring/heap back-pressure (waiting for a free slot / reclaim)
+};
+
 struct TraceEvent {
     int32_t task_id;
     int32_t func_id;  // kernel id (e.g. 0=GEMM, 1=ADD); -1 if unknown
     int32_t lane;     // AIC=0 / AIV0=1 / AIV1=2
     uint8_t multicore;
+    TracePhase phase;
     double ts_us;   // start, microseconds from g_trace_epoch
-    double dur_us;  // execution duration, microseconds
+    double dur_us;  // span duration, microseconds
 };
 
 struct RingSlot {
@@ -379,6 +392,12 @@ struct BlockWon {
 
 enum LaneId : int32_t { LANE_AIC = 0, LANE_AIV0 = 1, LANE_AIV1 = 2, LANE_NONE = -1 };
 
+// Per-core trace-vector reserve count, set once at register time: 0 when swimlane
+// tracing is off (DistCore::reset then never reserves, so a normal run pays
+// nothing), else a generous upper bound on spans/core so push_back never
+// reallocs mid-run (stable heap layout). Defined here so DistCore::reset sees it.
+int32_t g_trace_reserve = 0;
+
 struct CoreLayout {
     int32_t block_id;  // physical block index
     int32_t lane;      // LaneId of this core within its block
@@ -421,6 +440,11 @@ struct DistCore {
         owned_total = 0;
         outpool_head = 0;
         trace.clear();
+        // Pre-size the trace vector only when tracing is on (see g_trace_on),
+        // so push_back never reallocs mid-run (a realloc would perturb the heap
+        // layout — exactly the kind of disturbance that historically interacted
+        // badly with the sim; keep it stable). Costs nothing on a normal run.
+        if (g_trace_reserve > 0) trace.reserve(g_trace_reserve);
         for (int32_t i = 0; i < kPrivateSlots; i++) {
             slots[i].occupied = false;
             slots[i].built = false;
@@ -454,6 +478,7 @@ struct alignas(kCacheLine) PaddedCursor {
 struct DistGlobal {
     PaddedCursor cube_cursor[kCursorShards];    // highest claimed AIC-anchored id, per shard
     PaddedCursor vector_cursor[kCursorShards];  // highest claimed AIV-only id, per shard
+    PaddedCursor alloc_cursor[kCursorShards];   // highest claimed kernel-less alloc id, per shard
     std::atomic<uint8_t> flags[kFlagCap];       // completion-flag ring (1 == task done)
 
     // M4 reclamation (§9.5/§11.4). `frontier` (F) is the global continuous
@@ -514,6 +539,24 @@ inline uint64_t now_ns() {
     return static_cast<uint64_t>(
         std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch())
             .count()
+    );
+}
+
+// Snapshot the clock only when tracing is on (callers pass the result as a span
+// start). Returns 0 otherwise so the matching trace_overhead() is a no-op.
+inline uint64_t trace_now() { return g_trace_on ? now_ns() : 0; }
+
+// Record a non-kernel overhead span [t0_ns, now) on this core's lane (alloc /
+// claim+build / deposit drain). No-op unless tracing is on. Kernel spans are
+// pushed inline in execute_slot (they also carry the multicore flag).
+inline void trace_overhead(DistCore *self, int32_t task_id, int32_t func_id, TracePhase phase, uint64_t t0_ns) {
+    if (!g_trace_on) return;
+    const uint64_t t1 = now_ns();
+    self->trace.push_back(
+        TraceEvent{
+            task_id, func_id, self->lane, /*multicore=*/0, phase, (t0_ns - g_trace_epoch_ns) / 1000.0,
+            (t1 - t0_ns) / 1000.0
+        }
     );
 }
 
@@ -626,7 +669,7 @@ void execute_slot(DistCore *self, RingSlot &s) {
             // TraceEvent timestamps/durations are microseconds (swimlane unit).
             self->trace.push_back(
                 TraceEvent{
-                    s.task_id, s.func_id, self->lane, static_cast<uint8_t>(s.is_multicore ? 1 : 0),
+                    s.task_id, s.func_id, self->lane, static_cast<uint8_t>(s.is_multicore ? 1 : 0), TracePhase::Kernel,
                     (t0 - g_trace_epoch_ns) / 1000.0, sim_ns / 1000.0
                 }
             );
@@ -641,7 +684,7 @@ void execute_slot(DistCore *self, RingSlot &s) {
             const uint64_t t1 = now_ns();
             self->trace.push_back(
                 TraceEvent{
-                    s.task_id, s.func_id, self->lane, static_cast<uint8_t>(s.is_multicore ? 1 : 0),
+                    s.task_id, s.func_id, self->lane, static_cast<uint8_t>(s.is_multicore ? 1 : 0), TracePhase::Kernel,
                     (t0 - g_trace_epoch_ns) / 1000.0, (t1 - t0) / 1000.0
                 }
             );
@@ -813,12 +856,14 @@ void drain_block_won(DistCore *self) {
             return;
         }
         const BuiltSubtask &b = w.lane[self->lane];
+        const uint64_t t_won0 = trace_now();
         build_ring_slot(
             self->slots[si], w.task_id, b.func_id, b.function_bin_addr, b.tensors, b.tensor_count, b.scalars,
             b.scalar_count, b.fanin, b.fanin_count, b.sub_block_id, /*is_multicore=*/true, self->block_id, i
         );
         self->occupied_count++;
         self->owned_total++;
+        trace_overhead(self, w.task_id, b.func_id, TracePhase::DrainWon, t_won0);
     }
 }
 
@@ -848,6 +893,12 @@ TaskOutputTensors dist_submit_impl(PTO2Runtime *, const MixedKernels &mixed, con
         drain_phase_b(self);
     }
 
+    // Swimlane: time the per-task replay (map/heap bookkeeping + claim) and the
+    // winner-only build that follow — the "between kernels" work this op adds to
+    // this core's lane. The kernel span itself is recorded inside execute_slot,
+    // which the drain above (and later drains) may have just run; that is why the
+    // start is taken *after* the execute-first drain, not at function entry.
+    const uint64_t t_submit0 = trace_now();
     const int32_t N = self->local_index++;
     const ActiveMask M = mixed.to_active_mask();
     const int32_t tc = args.tensor_count();
@@ -983,7 +1034,10 @@ TaskOutputTensors dist_submit_impl(PTO2Runtime *, const MixedKernels &mixed, con
         }
     }
 
-    if (!is_winner) return result;  // wrong type or lost the race: map updated, nothing to build
+    if (!is_winner) {
+        trace_overhead(self, N, -1, TracePhase::Replay, t_submit0);
+        return result;  // wrong type or lost the race: map updated, nothing to build
+    }
 
     // (e) Winner only: assemble the shared argument Tensors (identical for every
     // active lane of a multi-core task — they share the task tensors, each lane
@@ -1007,6 +1061,14 @@ TaskOutputTensors dist_submit_impl(PTO2Runtime *, const MixedKernels &mixed, con
     }
 
     // ---- Winner = owner (single-core) / anchor (multi-core). ----
+    // The real per-task build work (claim + fan-in lookup + built[] assembly)
+    // ends here; the two back-pressure spins below are WAITING, not work, so
+    // close the Build span now and time the spins separately as RingBp. Without
+    // this split the spin time was misattributed to "build" (it dominated build
+    // under a small ring / few blocks — it is dependency/slot wait, not cost).
+    trace_overhead(self, N, -1, TracePhase::Build, t_submit0);
+    const uint64_t t_bp0 = trace_now();
+
     // Back-pressure for self-claimed work: wait until the ring has a non-reserved
     // slot free, draining block.won deposits + ready tasks meanwhile. The reserve
     // guarantees a follower can still pull its (ready) deposits when the rest of
@@ -1053,6 +1115,9 @@ TaskOutputTensors dist_submit_impl(PTO2Runtime *, const MixedKernels &mixed, con
         }
         if (fatal_set()) return result;
     }
+    // Time spent in the two back-pressure spins above (ring-slot wait + heap
+    // reclaim wait) — dependency/slot WAITING, kept separate from Build.
+    trace_overhead(self, N, -1, TracePhase::RingBp, t_bp0);
 
     int32_t si = alloc_ring_slot(self);
     if (si < 0) {  // should not happen given the back-pressure gate above
@@ -1225,6 +1290,7 @@ TaskOutputTensors dist_alloc_tensors(PTO2Runtime *, const L0TaskArgs &args) {
         drain_block_won(self);
         drain_phase_b(self);
     }
+    const uint64_t t_alloc0 = trace_now();  // swimlane: time this alloc's replay+pace
     const int32_t N = self->local_index++;
     const int32_t tc = args.tensor_count();
     if (N >= kFlagCap) {
@@ -1253,33 +1319,8 @@ TaskOutputTensors dist_alloc_tensors(PTO2Runtime *, const L0TaskArgs &args) {
         if ((task_base % ring) + total > ring) task_base = ((task_base / ring) + 1) * ring;
     }
 
-    // Heap reclaim back-pressure (same window test as submit). An alloc bumps the
-    // heap like any output; drain this core's ring while the live window overflows.
-    if (total > 0 && g_dist.heap_base != nullptr) {
-        const uint64_t want_next = task_base + total;
-        uint64_t wd_heap = 0;
-        while (!fatal_set()) {
-            const int32_t f = g_dist.frontier.load(std::memory_order_acquire);
-            const int32_t R = f - g_dist.H;
-            const uint64_t vstart_live = (R < 0) ? 0 : g_dist.vend[R].load(std::memory_order_relaxed);
-            if (want_next - vstart_live <= ring) break;
-            if (f >= N - 1) {
-                set_fatal();
-                fprintf(
-                    stderr, "[dist_engine] heap ring %zu B too small for H=%d window at alloc %d (live=%llu B)\n", ring,
-                    g_dist.H, N, (unsigned long long)(want_next - vstart_live)
-                );
-                return TaskOutputTensors{};
-            }
-            drain_block_won(self);
-            if (drain_phase_b(self) == 0) {
-                SPIN_WAIT_HINT();
-                watchdog(wd_heap);
-            }
-        }
-        if (fatal_set()) return TaskOutputTensors{};
-    }
-
+    // (a) Materialize outputs + publish the deterministic heap layout — EVERY core
+    // (like dist_submit_impl step (a)), so duplicate maps and vend[] stay identical.
     uint64_t off = 0;
     TaskOutputTensors result;
     for (int32_t i = 0; i < tc; i++) {
@@ -1303,7 +1344,7 @@ TaskOutputTensors dist_alloc_tensors(PTO2Runtime *, const L0TaskArgs &args) {
     if (N >= 0 && N < kFlagCap) g_dist.vend[N].store(self->heap_next, std::memory_order_relaxed);
     if (fatal_set()) return result;
 
-    // Register producer for each allocated output, then complete inline (no kernel).
+    // (b) Register this alloc as producer of each output — EVERY core (map parity).
     self->map.advance_retire(N, g_dist.H);
     uint32_t out_idx = 0;
     for (int32_t i = 0; i < tc; i++) {
@@ -1311,8 +1352,51 @@ TaskOutputTensors dist_alloc_tensors(PTO2Runtime *, const L0TaskArgs &args) {
         self->map.insert(result.get_ref(out_idx), N);
         out_idx++;
     }
+
+    // (c) Single-owner election (mirrors dist_submit_impl's claim). The first core
+    // to reach this alloc id wins; that core is by construction at/ahead of the
+    // completion frontier (N is not yet done, so F < N), hence the winner-only
+    // back-pressure below can never see heap_next < vend[F-H] and never underflows.
+    // Losers have finished the deterministic bookkeeping above and return — the
+    // winner alone paces reclaim and publishes the completion flag (the leading
+    // core was the one gating completion before this change too, so timing is
+    // unchanged; this only drops the lagging cores' redundant pass).
+    bool is_winner = claim(g_dist.alloc_cursor[N % kCursorShards].v, N);
+    if (!is_winner) {
+        trace_overhead(self, N, -1, TracePhase::Replay, t_alloc0);
+        return result;
+    }
+
+    // (d) Winner-only heap reclaim back-pressure: drain this core's ring while the
+    // live virtual window [vend[F-H], heap_next) would overflow the physical ring.
+    if (total > 0 && g_dist.heap_base != nullptr) {
+        uint64_t wd_heap = 0;
+        while (!fatal_set()) {
+            const int32_t f = g_dist.frontier.load(std::memory_order_acquire);
+            const int32_t R = f - g_dist.H;
+            const uint64_t vstart_live = (R < 0) ? 0 : g_dist.vend[R].load(std::memory_order_relaxed);
+            if (self->heap_next - vstart_live <= ring) break;  // window fits — region free
+            if (f >= N - 1) {
+                set_fatal();
+                fprintf(
+                    stderr, "[dist_engine] heap ring %zu B too small for H=%d window at alloc %d (live=%llu B)\n", ring,
+                    g_dist.H, N, (unsigned long long)(self->heap_next - vstart_live)
+                );
+                return result;
+            }
+            drain_block_won(self);
+            if (drain_phase_b(self) == 0) {
+                SPIN_WAIT_HINT();
+                watchdog(wd_heap);
+            }
+        }
+        if (fatal_set()) return result;
+    }
+
+    // (e) Winner completes inline (no kernel runs).
     g_dist.flags[N & (kFlagCap - 1)].store(1, std::memory_order_release);
     advance_frontier();
+    trace_overhead(self, N, -1, TracePhase::Alloc, t_alloc0);
     return result;
 }
 
@@ -1483,12 +1567,18 @@ void *dist_engine_register(
     // relative to the same run start.
     g_trace_on = (getenv("PTO_DIST_SWIMLANE") != nullptr);
     g_trace_epoch_ns = now_ns();
+    // Per-core span reserve: 0 when off (reset never reserves → zero overhead on a
+    // normal run); a generous bound when on so push_back never reallocs for the
+    // sizes we actually analyze (a realloc would perturb heap layout + add timing
+    // noise to the very gaps we measure). Best-effort: a huge trace may still grow.
+    g_trace_reserve = g_trace_on ? (1 << 16) : 0;
     // Overhead-isolation gate (skip incore kernel calls, keep all bookkeeping).
     g_skip_exec = (getenv("PTO_DIST_SKIP_EXEC") != nullptr);
 
     for (int32_t s = 0; s < kCursorShards; s++) {
         g_dist.cube_cursor[s].v.store(-1, std::memory_order_relaxed);
         g_dist.vector_cursor[s].v.store(-1, std::memory_order_relaxed);
+        g_dist.alloc_cursor[s].v.store(-1, std::memory_order_relaxed);
     }
     g_dist.frontier.store(-1, std::memory_order_relaxed);
     for (int32_t i = 0; i < kFlagCap; i++)
@@ -1596,13 +1686,37 @@ void dist_engine_dump_trace() {
         );
     }
 
-    // Duration events, one per executed (sub)task.
+    auto phase_name = [](TracePhase p) -> const char * {
+        switch (p) {
+        case TracePhase::Kernel:
+            return "kernel";
+        case TracePhase::Alloc:
+            return "alloc";
+        case TracePhase::Build:
+            return "build";
+        case TracePhase::DrainWon:
+            return "drain_won";
+        case TracePhase::Replay:
+            return "replay";
+        case TracePhase::RingBp:
+            return "ringbp";
+        default:
+            return "?";
+        }
+    };
+
+    // Duration events: kernel executions + the non-kernel overhead spans (alloc /
+    // claim+build / replay-only / deposit drain) that fill a lane between kernels.
+    // Whatever is left uncovered on a lane is genuine idle (dependency-wait spin).
     for (int32_t c = 0; c < nw && c < RUNTIME_MAX_WORKER; c++) {
         DistCore &co = g_dist.cores[c];
         if (co.block_id < 0 || co.lane < 0) continue;
         for (const TraceEvent &e : co.trace) {
-            char name[48];
-            if (e.func_id >= 0) {
+            const char *ph = phase_name(e.phase);
+            char name[64];
+            if (e.phase != TracePhase::Kernel) {
+                snprintf(name, sizeof(name), "%s#%d", ph, e.task_id);
+            } else if (e.func_id >= 0) {
                 snprintf(name, sizeof(name), "f%d#%d", e.func_id, e.task_id);
             } else {
                 snprintf(name, sizeof(name), "task#%d", e.task_id);
@@ -1612,8 +1726,8 @@ void dist_engine_dump_trace() {
             fprintf(
                 f,
                 "    {\"ph\":\"X\",\"name\":\"%s\",\"pid\":%d,\"tid\":%d,\"ts\":%.3f,\"dur\":%.3f,"
-                "\"args\":{\"task_id\":%d,\"func_id\":%d,\"core\":%d,\"mc\":%d}}",
-                name, co.block_id, co.lane, e.ts_us, e.dur_us, e.task_id, e.func_id, c, e.multicore
+                "\"args\":{\"phase\":\"%s\",\"task_id\":%d,\"func_id\":%d,\"core\":%d,\"mc\":%d}}",
+                name, co.block_id, co.lane, e.ts_us, e.dur_us, ph, e.task_id, e.func_id, c, e.multicore
             );
         }
     }
