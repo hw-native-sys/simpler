@@ -175,22 +175,10 @@ void PTO2SharedMemoryHandle::init_header_per_ring(
     header->sched_stall_task_id.store(-1, std::memory_order_relaxed);
     header->sched_stall_core.store(-1, std::memory_order_relaxed);
 
-    // Per-ring slot_states reset. Previously lived in
-    // PTO2SchedulerState::RingSchedState::init(), but it writes into
-    // ring->slot_states[] which is SM-side storage — keeping it here lets
-    // host-side prebuilt-arena init skip all SM dereferences.
-    // bind_ring() pins the ring_id (slot-invariant after this point);
-    // reset_for_reuse() prepares dynamic fanout/refcount fields so the first
-    // submit doesn't need an explicit reset.
-    for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
-        auto &ring = header->rings[r];
-        for (uint64_t i = 0; i < task_window_sizes[r]; i++) {
-            ring.slot_states[i].bind_ring(static_cast<uint8_t>(r));
-            ring.slot_states[i].reset_for_reuse();
-            ring.slot_states[i].fanin_count = 0;
-            ring.slot_states[i].active_mask = ActiveMask{};
-        }
-    }
+    // No per-slot loop: prepare_task resets each slot when it allocates it, and
+    // the scheduler only scans submitted task_ids [last_task_alive,
+    // current_task_index), so unsubmitted slots are never read. Per-boot reset
+    // is just the header fields above; per-slot state is set lazily at submit.
 }
 
 // =============================================================================
