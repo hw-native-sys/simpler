@@ -48,6 +48,7 @@ class Job:
     build_cmd: Callable[[list[int]], list[str]]  # Given allocated ids → argv
     cwd: str | None = None
     env: dict | None = None
+    nodeid: str | None = None  # pytest nodeid, when the caller has one
 
 
 @dataclass
@@ -57,6 +58,7 @@ class JobResult:
     device_ids: list[int]
     output: str = ""  # Captured combined stdout+stderr
     duration_s: float = 0.0
+    nodeid: str | None = None
 
 
 @dataclass
@@ -270,6 +272,7 @@ def run_jobs(
                 device_ids=rj.device_ids,
                 output="".join(rj.output_lines),
                 duration_s=duration,
+                nodeid=rj.job.nodeid,
             )
             state.results.append(res)
             if rc != 0:
@@ -328,6 +331,7 @@ def run_jobs(
                         device_ids=rj.device_ids,
                         output="".join(rj.output_lines),
                         duration_s=duration,
+                        nodeid=rj.job.nodeid,
                     )
                 )
         _active_state = None
