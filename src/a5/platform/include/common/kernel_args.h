@@ -75,8 +75,13 @@ extern "C" {
  *       - AICore: receives device KernelArgs* via KERNEL_ENTRY
  */
 struct KernelArgs {
+    // Offset-locked front: the front-less launch protocol and the device
+    // entries require runtime_args @ 0 and regs @ 8 (see static_asserts below).
     __may_used_by_aicore__ Runtime *runtime_args{nullptr};  // Task runtime in device memory
     uint64_t regs{0};                                       // Per-core register base address array (platform-specific)
+    // Remaining 64-bit fields grouped before the 32-bit tail so the struct needs
+    // no interior alignment padding. Order among these is free (device reads by
+    // field name, not offset); only runtime_args/regs are offset-locked.
     uint64_t dump_data_base{0};  // Dump shared memory base address; use explicit flags to detect enablement
     // L2 swimlane shared memory base address; use explicit flags to detect enablement
     uint64_t l2_swimlane_data_base{0};
@@ -91,14 +96,13 @@ struct KernelArgs {
     uint64_t scope_stats_data_base{0};  // ScopeStatsBuffer device pointer; 0 when scope_stats is off.
                                         // a5 has no halHostRegister — host keeps a separate shadow and
                                         // refreshes it via rtMemcpy DEVICE_TO_HOST at dump time.
-    uint32_t enable_profiling_flag{0};  // Profiling umbrella bitmask; dump_tensor|l2_swimlane|pmu|dep_gen|scope_stats
-    uint32_t _pad{0};                   // Alignment padding
-
     // Device pointer to an 8-byte buffer that the platform AICPU entry writes
     // the run-wall (ns) into. Allocated once at simpler_init, kept resident.
     // See the a2a3 kernel_args.h for the full design rationale (CANN's
     // AICPU args copy makes inline fields write-only).
     uint64_t device_wall_data_base{0};
+    // 32-bit tail (two adjacent uint32_t — no interior padding).
+    uint32_t enable_profiling_flag{0};  // Profiling umbrella bitmask; dump_tensor|l2_swimlane|pmu|dep_gen|scope_stats
     // Opaque always-false guard read by the AICore SIMT meta anchor (AIV
     // KERNEL_ENTRY). The host never sets it non-zero; its only purpose is to be
     // a runtime-valued condition the compiler cannot constant-fold, so the

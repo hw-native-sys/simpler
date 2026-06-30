@@ -49,6 +49,12 @@
 // `print_handshake_results` / `bind_callable_to_runtime` /
 // `prepare_orch_so`.
 
+// Implemented by each runtime's host part (runtime_maker.cpp). Reports the
+// AICPU entry symbols this runtime exports beyond the base {exec, init} set, so
+// the common AICPU loader carries no runtime-specific symbol knowledge. TMARB
+// returns simpler_aicpu_register_callable; host_build_graph returns none.
+extern "C" const char *const *runtime_extra_aicpu_symbols(size_t *count);
+
 namespace {
 
 HostRuntimeTimeoutConfig resolve_onboard_timeout_config() {
@@ -426,8 +432,16 @@ int DeviceRunnerBase::ensure_binaries_loaded() {
     }
     LOG_INFO_V2("DeviceRunner: inner SO uploaded to preinstall via dispatcher bootstrap");
 
-    // JSON-register the inner SO and resolve its runtime entry handles.
-    rc = load_aicpu_op_.Init();
+    // JSON-register the inner SO and resolve its runtime entry handles. The
+    // runtime reports any AICPU entries it exports beyond the base set so the
+    // loader stays runtime-agnostic.
+    std::vector<std::string> extra_symbols;
+    size_t extra_count = 0;
+    const char *const *extra = runtime_extra_aicpu_symbols(&extra_count);
+    for (size_t i = 0; i < extra_count && extra != nullptr; ++i) {
+        if (extra[i] != nullptr) extra_symbols.emplace_back(extra[i]);
+    }
+    rc = load_aicpu_op_.Init(extra_symbols);
     if (rc != 0) {
         LOG_ERROR("LoadAicpuOp::Init failed: %d", rc);
         return rc;

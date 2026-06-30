@@ -820,12 +820,17 @@ void AicpuExecutor::deinit(Runtime *runtime) {
 
 // ===== Public Entry Point =====
 
-extern "C" int32_t aicpu_register_callable(const RegisterCallableArgs *args) {
-    if (args == nullptr) {
-        LOG_ERROR("%s", "aicpu_register_callable: null RegisterCallableArgs pointer");
+// Device orchestration SO registration entry. Exported directly by the runtime
+// (not via a platform forwarding shell): registration is a TMARB-only ability,
+// so the symbol lives where the capability does. host_build_graph does not
+// export it at all (host-side orchestration has nothing to register).
+extern "C" __attribute__((visibility("default"))) int simpler_aicpu_register_callable(void *arg) {
+    if (arg == nullptr) {
+        LOG_ERROR("%s", "simpler_aicpu_register_callable: null RegisterCallableArgs pointer");
         return -1;
     }
-    // `args` is the launch-arg payload CANN copies into the AICPU arg space
+    const RegisterCallableArgs *args = reinterpret_cast<const RegisterCallableArgs *>(arg);
+    // `arg` is the launch-arg payload CANN copies into the AICPU arg space
     // (same coherent channel exec reads KernelArgs fields from) — no HBM deref,
     // so unlike the old prewarm path there is no Runtime to cache-invalidate.
     int32_t rc = g_aicpu_executor.load_orch_so(
@@ -833,10 +838,10 @@ extern "C" int32_t aicpu_register_callable(const RegisterCallableArgs *args) {
         args->device_orch_config_name, /*thread_idx=*/0
     );
     if (rc != 0) {
-        LOG_ERROR("aicpu_register_callable: SO load failed with rc=%d", rc);
+        LOG_ERROR("simpler_aicpu_register_callable: SO load failed with rc=%d", rc);
         return rc;
     }
-    LOG_INFO_V0("aicpu_register_callable: completed for callable_id=%d", args->active_callable_id);
+    LOG_INFO_V0("simpler_aicpu_register_callable: completed for callable_id=%d", args->active_callable_id);
     return 0;
 }
 

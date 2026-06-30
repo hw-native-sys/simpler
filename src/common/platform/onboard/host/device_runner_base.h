@@ -611,13 +611,11 @@ protected:
     void read_device_wall_ns();
 
     /**
-     * H2D the Runtime struct via `kernel_args_.init_runtime_args` and
-     * publish log config + device ordinal into KernelArgs. AICPU reads
-     * these at launch — log_level / log_info_v are sourced from
-     * `HostLogger::get_instance()` (the single source of truth seeded
-     * by `simpler_log_init` before host_runtime.so loaded); device_id
-     * is the per-device suffix the AICPU executor uses for the
-     * per-device orchestration-SO name.
+     * H2D the Runtime struct via `kernel_args_.init_runtime_args`. Log config
+     * and device ordinal are NOT published here: they are per-device invariants
+     * latched once into the AICPU SO globals by `simpler_aicpu_init`
+     * (`ensure_aicpu_init_launched`) at device init, not carried per-run on
+     * KernelArgs.
      *
      * @return 0 on success, the underlying init_runtime_args rc on failure.
      */

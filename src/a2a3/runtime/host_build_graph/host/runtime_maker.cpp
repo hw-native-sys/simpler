@@ -504,6 +504,17 @@ int validate_runtime_impl(Runtime *runtime) {
     return rc;
 }
 
+// host_build_graph resolves orchestration on the host, so it exports no AICPU
+// entries beyond the base {simpler_aicpu_exec, simpler_aicpu_init} — in
+// particular it does not export simpler_aicpu_register_callable. Reporting an
+// empty extra-symbol set keeps the common AICPU loader from looking for it.
+const char *const *runtime_extra_aicpu_symbols(size_t *count) {
+    if (count != nullptr) {
+        *count = 0;
+    }
+    return nullptr;
+}
+
 #ifdef __cplusplus
 } /* extern "C" */
 #endif

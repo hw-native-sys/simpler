@@ -48,6 +48,7 @@
 #include <cstdint>
 #include <string>
 #include <unordered_map>
+#include <vector>
 
 #include "common/kernel_args.h"
 #include "runtime/runtime/rts/rts_kernel.h"
@@ -106,8 +107,17 @@ public:
         rtStream_t stream, int device_id
     );
 
-    /** @brief JSON-register the runtime SO and resolve its entry handles. */
-    int Init();
+    /**
+     * @brief JSON-register the runtime SO and resolve its entry handles.
+     *
+     * @param extra_symbols  Runtime-specific AICPU entry symbols beyond the base
+     *                       set ({RunName, InitName}, exported by every runtime).
+     *                       Each runtime's host part reports what it additionally
+     *                       exports — e.g. TMARB adds RegisterCallableName, while
+     *                       host_build_graph reports none. This keeps the common
+     *                       loader free of any runtime-specific symbol knowledge.
+     */
+    int Init(const std::vector<std::string> &extra_symbols);
 
     /** @brief Release binary handle + function handles + temporary JSON. */
     void Finalize();
@@ -132,6 +142,9 @@ private:
     uint64_t inner_fp_ = 0;
     int device_id_ = 0;
     std::string inner_so_basename_;
+    // Full set of AICPU entry symbols to JSON-register and resolve: the base
+    // {RunName, InitName} plus the runtime-reported extras passed to Init().
+    std::vector<std::string> kernel_symbols_;
 
     bool GenerateAicpuOpJson(const std::string &json_path, const std::string &kernel_so);
     int AicpuKernelLaunch(rtFuncHandle func_handle, rtStream_t stream, void *args, size_t args_size, int aicpu_num);

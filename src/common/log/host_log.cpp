@@ -129,8 +129,8 @@ void HostLogger::log_info_v(int v, const char *func, const char *fmt, ...) {
 // Called once early in ChipWorker::init (before host_runtime.so is even
 // dlopen'd) to seed the process-wide HostLogger from the user's
 // `simpler` Python logger snapshot. Consumers that need the current value
-// later (host_runtime.so populating KernelArgs.log_level) read it via
-// HostLogger::get_instance().level() / .info_v() directly; the value never
+// later (host_runtime.so populating InitArgs.log_level at device init) read it
+// via HostLogger::get_instance().level() / .info_v() directly; the value never
 // has to travel through any other SO's C ABI.
 //
 // Severity layout matches CANN dlog (0=DEBUG..4=NUL); info_v ∈ [0,9].
