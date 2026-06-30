@@ -127,13 +127,17 @@ _OFF_ERROR = 4
 _OFF_CALLABLE = 8
 _OFF_CONFIG = 16
 # Packed CallConfig wire layout — must match call_config.h byte for byte:
-# 7 int32 (block_dim, aicpu_thread_num, enable_l2_swimlane, enable_dump_tensor,
-# enable_pmu, enable_dep_gen, enable_scope_stats) + uint64 ring sizing
-# overrides (3 scalar fields + 3 x RUNTIME_ENV_RING_COUNT per-ring arrays) + 1024-byte
+# 8 int32 (block_dim, aicpu_thread_num, enable_l2_swimlane, enable_dump_tensor,
+# enable_pmu, enable_dep_gen, enable_scope_stats, use_example_exec_time) + uint64
+# ring sizing overrides (3 scalar fields + 3 x RUNTIME_ENV_RING_COUNT per-ring
+# arrays) + CALLCONFIG_MAX_EXAMPLE_FUNCS int32 example_exec_time_ns + 1024-byte
 # NUL-terminated output_prefix. Log config travels separately via
 # ChipWorker.init(log_level, log_info_v) — not on per-task wire.
 _RUNTIME_ENV_UINT64_FIELD_COUNT = 3 + 3 * RUNTIME_ENV_RING_COUNT
-_CFG_FMT = struct.Struct("=iiiiiii" + ("Q" * _RUNTIME_ENV_UINT64_FIELD_COUNT) + "1024s")
+_CALLCONFIG_MAX_EXAMPLE_FUNCS = 64
+_CFG_FMT = struct.Struct(
+    "=iiiiiiii" + ("Q" * _RUNTIME_ENV_UINT64_FIELD_COUNT) + ("i" * _CALLCONFIG_MAX_EXAMPLE_FUNCS) + "1024s"
+)
 # Args region starts after CONFIG, rounded up to 8 bytes so the first
 # Tensor.data (uint64_t at OFF_ARGS+8) is 8-byte aligned, avoiding
 # SIGBUS on strict-alignment platforms (aarch64 atomics, some ARM cores).
@@ -1017,6 +1021,7 @@ def _chip_process_loop(
 
 def _read_config_from_mailbox(buf: memoryview) -> "CallConfig":
     """Reconstruct a CallConfig from the unified mailbox layout."""
+    _f = _CFG_FMT.unpack_from(buf, _OFF_CONFIG)
     (
         block_dim,
         aicpu_tn,
@@ -1025,12 +1030,16 @@ def _read_config_from_mailbox(buf: memoryview) -> "CallConfig":
         pmu,
         dep_gen,
         scope_stats,
+        use_example,
         ring_task_window,
         ring_heap,
         ring_dep_pool,
-        *ring_values,
-        prefix_bytes,
-    ) = _CFG_FMT.unpack_from(buf, _OFF_CONFIG)
+    ) = _f[:11]
+    _ring_base = 11
+    ring_values = _f[_ring_base : _ring_base + 3 * RUNTIME_ENV_RING_COUNT]
+    _ex_base = _ring_base + 3 * RUNTIME_ENV_RING_COUNT
+    example_values = _f[_ex_base : _ex_base + _CALLCONFIG_MAX_EXAMPLE_FUNCS]
+    prefix_bytes = _f[-1]
     ring_task_windows = list(ring_values[:RUNTIME_ENV_RING_COUNT])
     ring_heaps = list(ring_values[RUNTIME_ENV_RING_COUNT : 2 * RUNTIME_ENV_RING_COUNT])
     ring_dep_pools = list(ring_values[2 * RUNTIME_ENV_RING_COUNT : 3 * RUNTIME_ENV_RING_COUNT])
@@ -1042,12 +1051,14 @@ def _read_config_from_mailbox(buf: memoryview) -> "CallConfig":
     cfg.enable_pmu = pmu
     cfg.enable_dep_gen = bool(dep_gen)
     cfg.enable_scope_stats = bool(scope_stats)
+    cfg.use_example_exec_time = use_example
     cfg.runtime_env.ring_task_window = ring_task_window
     cfg.runtime_env.ring_heap = ring_heap
     cfg.runtime_env.ring_dep_pool = ring_dep_pool
     cfg.runtime_env.ring_task_windows = ring_task_windows
     cfg.runtime_env.ring_heaps = ring_heaps
     cfg.runtime_env.ring_dep_pools = ring_dep_pools
+    cfg.example_exec_time_ns = list(example_values)
     # NUL-terminated C string in a 1024-byte field.
     cfg.output_prefix = prefix_bytes.split(b"\x00", 1)[0].decode("utf-8")
     return cfg

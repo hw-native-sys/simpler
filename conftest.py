@@ -150,6 +150,15 @@ def pytest_addoption(parser):
         "1=AICore timing, 2=+dispatch/fanout, 3=+sched phases, 4=+orch phases",
     )
     parser.addoption(
+        "--use-example-exec-time",
+        action="store_true",
+        default=False,
+        help="(fully_distributed_within_core sim only) Replace each incore kernel with a "
+        "busy-wait of its CALLABLE example_execute_time (microseconds) instead of running "
+        "the real kernel, so a fast sim run reflects measured on-hardware kernel durations "
+        "plus orchestration overhead. Other runtimes reject this flag.",
+    )
+    parser.addoption(
         "--enable-device-log-timing",
         action="store_true",
         default=False,

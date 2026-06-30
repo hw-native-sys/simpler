@@ -763,6 +763,30 @@ NB_MODULE(_task_interface, m) {
                 c.enable_scope_stats = v ? 1 : 0;
             }
         )
+        .def_rw("use_example_exec_time", &CallConfig::use_example_exec_time)
+        // Per-func reference durations (nanoseconds), indexed by func_id; a
+        // CALLCONFIG_MAX_EXAMPLE_FUNCS-length list. Surfaced as a Python list;
+        // shorter input is zero-padded, longer is rejected.
+        .def_prop_rw(
+            "example_exec_time_ns",
+            [](const CallConfig &c) {
+                return std::vector<int32_t>(
+                    c.example_exec_time_ns, c.example_exec_time_ns + CALLCONFIG_MAX_EXAMPLE_FUNCS
+                );
+            },
+            [](CallConfig &c, const std::vector<int32_t> &v) {
+                if (v.size() > static_cast<size_t>(CALLCONFIG_MAX_EXAMPLE_FUNCS)) {
+                    throw std::invalid_argument(
+                        "CallConfig.example_exec_time_ns length " + std::to_string(v.size()) +
+                        " exceeds CALLCONFIG_MAX_EXAMPLE_FUNCS (" + std::to_string(CALLCONFIG_MAX_EXAMPLE_FUNCS) + ")"
+                    );
+                }
+                std::memset(c.example_exec_time_ns, 0, sizeof(c.example_exec_time_ns));
+                for (size_t i = 0; i < v.size(); ++i) {
+                    c.example_exec_time_ns[i] = v[i];
+                }
+            }
+        )
         .def_prop_rw(
             "output_prefix",
             [](const CallConfig &c) -> std::string {

@@ -197,6 +197,12 @@ int prepare_callable(DeviceContextHandle ctx, int32_t callable_id, const void *c
  * Consumed by tensormap_and_ringbuffer only; other runtime variants accept
  * and ignore them.
  *
+ * `use_example_exec_time` + `example_exec_time_ns` drive the sim-only
+ * trace-driven replay feature: when nonzero, a supporting runtime busy-waits
+ * example_exec_time_ns[func_id] nanoseconds in place of the real kernel.
+ * Plumbed to the runtime via the weak runtime_apply_example_exec_time hook
+ * below; only fully_distributed_within_core implements it.
+ *
  * @return 0 on success, negative on error (no prep state, NULL ctx, etc.).
  */
 int run_prepared(
@@ -204,8 +210,20 @@ int run_prepared(
     int aicpu_thread_num, int enable_l2_swimlane, int enable_dump_tensor, int enable_pmu, int enable_dep_gen,
     int enable_scope_stats, uint64_t ring_task_window, uint64_t ring_heap, uint64_t ring_dep_pool,
     const uint64_t *ring_task_windows, const uint64_t *ring_heaps, const uint64_t *ring_dep_pools,
-    const char *output_prefix, PtoRunTiming *out_timing
+    const char *output_prefix, int use_example_exec_time, const int32_t *example_exec_time_ns, PtoRunTiming *out_timing
 );
+
+/*
+ * Sim-only trace-driven replay hook. run_prepared calls this after binding the
+ * callable so a runtime that opts in can stash the per-func reference durations
+ * (example_exec_time_ns[func_id], nanoseconds) on its Runtime and busy-wait
+ * them instead of running the real kernel. example_exec_time_ns has
+ * CALLCONFIG_MAX_EXAMPLE_FUNCS entries. A weak no-op default lives in each
+ * platform's c_api_shared so runtimes that don't support the feature need no
+ * change; fully_distributed_within_core overrides it with a strong definition.
+ */
+extern "C" void
+runtime_apply_example_exec_time(void *runtime, int use_example_exec_time, const int32_t *example_exec_time_ns);
 
 /**
  * Drop the prepared state for `callable_id` and release the per-id share of

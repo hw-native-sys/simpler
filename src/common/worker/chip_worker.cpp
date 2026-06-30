@@ -332,7 +332,8 @@ RunTiming ChipWorker::run(int32_t callable_id, const ChipStorageTaskArgs *args, 
         device_ctx_, rt, callable_id, args, config.block_dim, config.aicpu_thread_num, config.enable_l2_swimlane,
         config.enable_dump_tensor, config.enable_pmu, config.enable_dep_gen, config.enable_scope_stats,
         config.runtime_env.ring_task_window, config.runtime_env.ring_heap, config.runtime_env.ring_dep_pool,
-        ring_task_windows, ring_heaps, ring_dep_pools, config.output_prefix, &timing
+        ring_task_windows, ring_heaps, ring_dep_pools, config.output_prefix, config.use_example_exec_time,
+        config.example_exec_time_ns, &timing
     );
     if (rc != 0) {
         throw std::runtime_error("run_prepared failed with code " + std::to_string(rc));

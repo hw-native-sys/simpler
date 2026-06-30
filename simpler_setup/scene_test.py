@@ -614,7 +614,13 @@ def _inject_dist_swimlane_names(callable_spec: dict) -> None:
             continue
         args["name"] = nm
         tid = args.get("task_id")
-        e["name"] = f"{nm}#{tid}" if tid is not None else nm
+        # A distributed-runtime span carries a `phase` (kernel / build / alloc /
+        # replay / drain_won). The func_id -> name map only knows the kernel
+        # label, so prefix non-kernel phases to keep e.g. a task's `build` span
+        # distinct from its `kernel` span on the same lane (both share func_id).
+        phase = args.get("phase")
+        label = nm if (phase in (None, "kernel")) else f"{phase}:{nm}"
+        e["name"] = f"{label}#{tid}" if tid is not None else label
         changed = True
     if changed:
         with open(path, "w") as f:
@@ -1149,12 +1155,41 @@ class SceneTestCase:
         config.enable_pmu = enable_pmu  # 0=disabled, >0=enabled with event type
         config.enable_dep_gen = enable_dep_gen
         config.enable_scope_stats = enable_scope_stats
+        # Sim-only trace-driven replay: only fully_distributed_within_core
+        # implements it; every other runtime rejects the flag here so no other
+        # runtime needs to adapt (the C++ side leaves it a weak no-op). When on,
+        # each incore's CALLABLE example_exec_time_ns (nanoseconds) is plumbed
+        # to the runtime, which busy-waits it instead of running the real kernel.
+        if getattr(self, "_st_use_example_exec_time", 0):
+            if self._st_runtime != "fully_distributed_within_core":
+                raise NotImplementedError(
+                    "--use-example-exec-time is only supported by the "
+                    "fully_distributed_within_core runtime, not "
+                    f"{self._st_runtime!r}"
+                )
+            config.use_example_exec_time = 1
+            config.example_exec_time_ns = self._collect_example_exec_time_ns()
         # `output_prefix` is required by CallConfig::validate() whenever any
         # diagnostic flag is enabled. Caller threads it down from the per-case
         # directory built by _build_output_prefix().
         if output_prefix:
             config.output_prefix = str(output_prefix)
         return config
+
+    def _collect_example_exec_time_ns(self):
+        """Per-func reference durations (nanoseconds) keyed by func_id, read from
+        the CALLABLE ``incores`` ``example_exec_time_ns`` fields (an integer
+        nanosecond count). A func without the field stays 0 (runs for real under
+        use_example_exec_time)."""
+        incores = self.CALLABLE.get("incores", [])
+        max_fid = max((k.get("func_id", -1) for k in incores), default=-1)
+        table = [0] * (max_fid + 1)
+        for k in incores:
+            fid = k.get("func_id")
+            ns = k.get("example_exec_time_ns")
+            if ns is not None and isinstance(fid, int) and fid >= 0:
+                table[fid] = int(ns)
+        return table
 
     def _resolve_env(self):
         env = self.RUNTIME_ENV
@@ -1422,6 +1457,16 @@ class SceneTestCase:
         enable_pmu = request.config.getoption("--enable-pmu", default=0)
         enable_dep_gen = self._effective_enable_dep_gen(request, warn=True)
         enable_scope_stats = request.config.getoption("--enable-scope-stats", default=False)
+        # Sim-only trace-driven replay switch; consumed in _build_config (which
+        # enforces the fully_distributed_within_core-only constraint and reads
+        # the per-func durations from CALLABLE). Stashed on the instance so it
+        # reaches _build_config without threading through every run variant.
+        self._st_use_example_exec_time = 1 if request.config.getoption("--use-example-exec-time", default=False) else 0
+        # With trace-driven replay on, incore kernels are skipped (busy-wait
+        # only) so their outputs are never computed — force-skip the golden
+        # comparison regardless of --skip-golden.
+        if self._st_use_example_exec_time:
+            skip_golden = True
         # device-log timing is cheap (PTO2_PROFILING markers, one block/round)
         # so unlike the heavy diagnostics it is NOT disabled when --rounds > 1.
         enable_device_log_timing = request.config.getoption("--enable-device-log-timing", default=False)

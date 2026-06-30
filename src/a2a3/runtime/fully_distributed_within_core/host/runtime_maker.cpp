@@ -690,3 +690,22 @@ extern "C" int validate_runtime_impl(Runtime *runtime) {
 
     return rc;
 }
+
+// Strong override of the weak runtime_apply_example_exec_time hook declared in
+// pto_runtime_c_api.h. fully_distributed_within_core is the only runtime that
+// implements the sim-only trace-driven replay feature: stash the per-func
+// reference durations on the Runtime so execute_slot busy-waits
+// example_exec_time_ns_[func_id] in place of the real incore kernel. A func
+// left at 0 (or func_id beyond the table) still runs for real. See
+// call_config.h::use_example_exec_time.
+extern "C" void
+runtime_apply_example_exec_time(void *runtime, int use_example_exec_time, const int32_t *example_exec_time_ns) {
+    Runtime *rt = static_cast<Runtime *>(runtime);
+    rt->use_example_exec_time_ = (use_example_exec_time != 0);
+    for (int i = 0; i < RUNTIME_MAX_FUNC_ID; ++i) {
+        rt->example_exec_time_ns_[i] =
+            (use_example_exec_time != 0 && example_exec_time_ns != nullptr && i < CALLCONFIG_MAX_EXAMPLE_FUNCS) ?
+                example_exec_time_ns[i] :
+                0;
+    }
+}

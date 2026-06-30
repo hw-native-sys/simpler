@@ -55,6 +55,11 @@ inline constexpr int RUNTIME_ENV_PER_RING_FIELD_GROUPS = 3;
 inline constexpr int RUNTIME_ENV_UINT64_FIELD_COUNT =
     RUNTIME_ENV_SCALAR_FIELD_COUNT + RUNTIME_ENV_PER_RING_FIELD_GROUPS * RUNTIME_ENV_RING_COUNT;
 
+// Capacity of the per-func reference-duration table carried for the sim-only
+// trace-driven replay feature (see use_example_exec_time below). func_ids at or
+// above this are simply not eligible for the feature (run for real).
+inline constexpr int CALLCONFIG_MAX_EXAMPLE_FUNCS = 64;
+
 #pragma pack(push, 1)
 // Per-task runtime-environment overrides — the programmatic equivalent of the
 // `PTO2_RING_*` env vars, grouped under their own sub-struct so they read as a
@@ -126,7 +131,20 @@ struct CallConfig {
     int32_t enable_pmu = 0;  // 0 = disabled; >0 = enabled, value selects event type
     int32_t enable_dep_gen = 0;
     int32_t enable_scope_stats = 0;  // writes <output_prefix>/scope_stats/scope_stats.jsonl
-    RuntimeEnv runtime_env;          // per-task PTO2_RING_* overrides
+    // Sim-only trace-driven replay. ONLY fully_distributed_within_core implements
+    // it; every other runtime must reject use_example_exec_time != 0 (the
+    // scene-test layer enforces this so no other runtime needs to adapt). When on,
+    // execute_slot skips the real incore kernel and busy-waits
+    // example_exec_time_ns[func_id] instead, so a fast sim run reflects measured
+    // on-hardware kernel durations. 0 = off (kernels run for real, golden valid).
+    int32_t use_example_exec_time = 0;
+    RuntimeEnv runtime_env;  // per-task PTO2_RING_* overrides
+    // Per-func reference kernel duration in nanoseconds, indexed by func_id
+    // (int32 caps at ~2.1 s, ample for a kernel).
+    // 0 = unset: that func runs for real even under use_example_exec_time (so a
+    // partially-annotated CALLABLE still works). Consumed only when
+    // use_example_exec_time != 0.
+    int32_t example_exec_time_ns[CALLCONFIG_MAX_EXAMPLE_FUNCS] = {};
     char output_prefix[1024] = {};
 
     bool diagnostics_any() const noexcept {
@@ -154,6 +172,7 @@ struct CallConfig {
 #pragma pack(pop)
 static_assert(sizeof(RuntimeEnv) == RUNTIME_ENV_UINT64_FIELD_COUNT * sizeof(uint64_t), "RuntimeEnv wire layout drift");
 static_assert(
-    sizeof(CallConfig) == 7 * sizeof(int32_t) + RUNTIME_ENV_UINT64_FIELD_COUNT * sizeof(uint64_t) + 1024,
+    sizeof(CallConfig) ==
+        (8 + CALLCONFIG_MAX_EXAMPLE_FUNCS) * sizeof(int32_t) + RUNTIME_ENV_UINT64_FIELD_COUNT * sizeof(uint64_t) + 1024,
     "CallConfig wire layout drift"
 );

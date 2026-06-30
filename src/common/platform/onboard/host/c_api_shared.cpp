@@ -337,12 +337,22 @@ int prepare_callable(DeviceContextHandle ctx, int32_t callable_id, const void *c
     }
 }
 
+// Weak no-op default for the trace-driven replay hook (see
+// pto_runtime_c_api.h). fully_distributed_within_core's runtime_maker provides
+// a strong override; every other runtime links this no-op.
+extern "C" __attribute__((weak)) void
+runtime_apply_example_exec_time(void *runtime, int use_example_exec_time, const int32_t *example_exec_time_ns) {
+    (void)runtime;
+    (void)use_example_exec_time;
+    (void)example_exec_time_ns;
+}
+
 int run_prepared(
     DeviceContextHandle ctx, RuntimeHandle runtime, int32_t callable_id, const void *args, int block_dim,
     int aicpu_thread_num, int enable_l2_swimlane, int enable_dump_tensor, int enable_pmu, int enable_dep_gen,
     int enable_scope_stats, uint64_t ring_task_window, uint64_t ring_heap, uint64_t ring_dep_pool,
     const uint64_t *ring_task_windows, const uint64_t *ring_heaps, const uint64_t *ring_dep_pools,
-    const char *output_prefix, PtoRunTiming *out_timing
+    const char *output_prefix, int use_example_exec_time, const int32_t *example_exec_time_ns, PtoRunTiming *out_timing
 ) {
     if (out_timing != NULL) {
         out_timing->host_wall_ns = 0;
@@ -419,6 +429,7 @@ int run_prepared(
         runner->set_dep_gen_enabled(enable_dep_gen != 0);
         runner->set_scope_stats_enabled(enable_scope_stats != 0);
         runner->set_output_prefix(output_prefix);
+        runtime_apply_example_exec_time(r, use_example_exec_time, example_exec_time_ns);
 
         rc = runner->run(*r, block_dim, aicpu_thread_num);
         if (rc != 0) {
