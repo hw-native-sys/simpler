@@ -434,6 +434,27 @@ struct DistCore {
     // by this core's worker thread, so push_back is lock-free.
     std::vector<TraceEvent> trace;
 
+    // Per-core static dependency edges (tracing only): one per fan-in resolved at
+    // build time — {consumer_task, producer_task}. Dumped as Chrome-trace flow
+    // events (producer's span -> consumer's span) so the swimlane shows the full
+    // dependency graph; following the arrows hop-by-hop walks the chain "what is
+    // this task waiting on, and what is THAT waiting on". Recorded by whichever
+    // core builds the task, so every executed task contributes its in-edges.
+    struct DepEdge {
+        int32_t consumer_task;
+        int32_t producer_task;
+    };
+    std::vector<DepEdge> dep_edges;
+
+    // Per-core SLOT-RELEASE edges (tracing only): why a ringbp actually stalls.
+    // When task N's owner enters the ring back-pressure, it is waiting not on N's
+    // data producers but on the tasks ALREADY occupying its private ring to
+    // execute (free a slot). Snapshot those occupants ({waiter=N, occupant}).
+    // Dumped as flow events occupant-kernel -> ringbp: the occupant's execution is
+    // the release event that ends the wait. Chains with dep_edges: ringbp -> its
+    // ring occupant (slot edge) -> that occupant's data producers (dep edges).
+    std::vector<DepEdge> slot_edges;
+
     void reset(CoreType r, int32_t block, int32_t lane_id) {
         role = r;
         block_id = block;
@@ -451,6 +472,10 @@ struct DistCore {
         // layout — exactly the kind of disturbance that historically interacted
         // badly with the sim; keep it stable). Costs nothing on a normal run.
         if (g_trace_reserve > 0) trace.reserve(g_trace_reserve);
+        dep_edges.clear();
+        if (g_trace_reserve > 0) dep_edges.reserve(g_trace_reserve);
+        slot_edges.clear();
+        if (g_trace_reserve > 0) slot_edges.reserve(g_trace_reserve);
         for (int32_t i = 0; i < kPrivateSlots; i++) {
             slots[i].occupied = false;
             slots[i].built = false;
@@ -882,6 +907,10 @@ void drain_block_won(DistCore *self) {
         );
         self->occupied_count++;
         self->owned_total++;
+        if (g_trace_on) {
+            for (int32_t k = 0; k < b.fanin_count; k++)
+                self->dep_edges.push_back({w.task_id, b.fanin[k]});
+        }
         trace_overhead(self, w.task_id, b.func_id, TracePhase::DrainWon, t_won0, t_won0_cpu);
     }
 }
@@ -1095,6 +1124,16 @@ TaskOutputTensors dist_submit_impl(PTO2Runtime *, const MixedKernels &mixed, con
     // guarantees a follower can still pull its (ready) deposits when the rest of
     // the ring is full of not-yet-ready consumers (no priority inversion).
     uint64_t wd_self = 0;
+    // Swimlane (slot-release edges): if we are about to actually wait, snapshot the
+    // tasks currently occupying our ring — those are what must execute to free a
+    // slot, i.e. what this ringbp truly waits on. The ring only shrinks during the
+    // wait, so the entry snapshot is the complete set.
+    if (g_trace_on && self->occupied_count >= kPrivateSlots - kWonReserve) {
+        for (int32_t i = 0; i < kPrivateSlots; i++) {
+            const RingSlot &rs = self->slots[i];
+            if (rs.occupied && rs.built) self->slot_edges.push_back({N, rs.task_id});
+        }
+    }
     while (self->occupied_count >= kPrivateSlots - kWonReserve && !fatal_set()) {
         drain_block_won(self);
         if (drain_phase_b(self) == 0) {
@@ -1218,6 +1257,10 @@ TaskOutputTensors dist_submit_impl(PTO2Runtime *, const MixedKernels &mixed, con
     self->occupied_count++;
     self->owned_total++;
 
+    if (g_trace_on) {
+        for (int32_t k = 0; k < fc; k++)
+            self->dep_edges.push_back({N, fanin[k]});
+    }
     return result;
 }
 
@@ -1685,20 +1728,29 @@ void dist_engine_dump_trace() {
     };
 
     // Chrome Trace Event Format (https://ui.perfetto.dev / chrome://tracing).
-    // pid = physical block, tid = lane → each block is a 3-lane swimlane.
+    // Two process groups: pid = block_id is the WALL-clock swimlane; pid =
+    // block_id + kCpuPid is a parallel CPU-time swimlane (same spans, width =
+    // cpu_us). process_sort_index forces all wall groups above all cpu groups.
+    // Dependency arrows (flow events) are emitted only in the cpu group so they
+    // stay within the cpu lanes instead of tangling across the wall lanes.
+    constexpr int32_t kCpuPid = 1000;
     fprintf(f, "{\n  \"displayTimeUnit\": \"ns\",\n  \"traceEvents\": [\n");
     bool first = true;
     const int32_t nw = g_dist.num_workers;
 
-    // Lane/process name metadata first (so idle lanes still appear).
+    // Lane/process name + sort metadata first (so idle lanes still appear).
     for (int32_t c = 0; c < nw && c < RUNTIME_MAX_WORKER; c++) {
         DistCore &co = g_dist.cores[c];
         if (co.block_id < 0 || co.lane < 0) continue;
         if (!first) fprintf(f, ",\n");
         first = false;
         fprintf(
-            f, "    {\"ph\":\"M\",\"name\":\"process_name\",\"pid\":%d,\"args\":{\"name\":\"block%d\"}}", co.block_id,
-            co.block_id
+            f, "    {\"ph\":\"M\",\"name\":\"process_name\",\"pid\":%d,\"args\":{\"name\":\"block%d (wall)\"}}",
+            co.block_id, co.block_id
+        );
+        fprintf(
+            f, ",\n    {\"ph\":\"M\",\"name\":\"process_sort_index\",\"pid\":%d,\"args\":{\"sort_index\":%d}}",
+            co.block_id, co.block_id
         );
         fprintf(
             f,
@@ -1706,16 +1758,27 @@ void dist_engine_dump_trace() {
             "\"args\":{\"name\":\"%s (core%d)\"}}",
             co.block_id, co.lane, lane_name(co.lane), c
         );
-        // Shadow lane (tid + 10): the SAME spans drawn with width = cpu_us instead
-        // of wall dur. A span whose wall row is long but whose cpu row is short was
-        // descheduled (host oversubscription), not doing work; equal-length rows
-        // mean real CPU time (e.g. ringbp's sched_yield spin). Lets the swimlane
-        // show CPU cost visually, side by side, without opening each span.
+        fprintf(
+            f, ",\n    {\"ph\":\"M\",\"name\":\"process_name\",\"pid\":%d,\"args\":{\"name\":\"block%d (cpu)\"}}",
+            co.block_id + kCpuPid, co.block_id
+        );
+        fprintf(
+            f, ",\n    {\"ph\":\"M\",\"name\":\"process_sort_index\",\"pid\":%d,\"args\":{\"sort_index\":%d}}",
+            co.block_id + kCpuPid, co.block_id + kCpuPid
+        );
         fprintf(
             f,
             ",\n    {\"ph\":\"M\",\"name\":\"thread_name\",\"pid\":%d,\"tid\":%d,"
-            "\"args\":{\"name\":\"%s·cpu (core%d)\"}}",
-            co.block_id, co.lane + 10, lane_name(co.lane), c
+            "\"args\":{\"name\":\"%s (core%d)\"}}",
+            co.block_id + kCpuPid, co.lane, lane_name(co.lane), c
+        );
+        // CPU-group kernel sub-lane (tid = lane + 3): kernel spans live here so a
+        // ringbp bar that time-contains its releasing kernel does not nest+hide it.
+        fprintf(
+            f,
+            ",\n    {\"ph\":\"M\",\"name\":\"thread_name\",\"pid\":%d,\"tid\":%d,"
+            "\"args\":{\"name\":\"%s·kernel (core%d)\"}}",
+            co.block_id + kCpuPid, co.lane + 3, lane_name(co.lane), c
         );
     }
 
@@ -1738,9 +1801,44 @@ void dist_engine_dump_trace() {
         }
     };
 
-    // Duration events: kernel executions + the non-kernel overhead spans (alloc /
-    // claim+build / replay-only / deposit drain) that fill a lane between kernels.
-    // Whatever is left uncovered on a lane is genuine idle (dependency-wait spin).
+    // Index: task_id -> its kernel span location in the CPU group, so a dep edge
+    // can anchor an arrow at the producer's and consumer's actual spans.
+    struct SpanLoc {
+        int32_t pid;
+        int32_t tid;
+        double ts_us;
+        double dur_us;
+    };
+    // In the CPU group, kernel spans go on a SEPARATE sub-lane (tid = lane +
+    // kCpuKernelLane) from the build/ringbp/replay/alloc spans (tid = lane). A
+    // ringbp span time-contains the kernel that ends its wait, so on one lane
+    // perfetto would nest the kernel inside the ringbp bar and hide it; splitting
+    // the kernel onto its own row keeps both visible.
+    constexpr int32_t kCpuKernelLane = 3;
+    std::vector<SpanLoc> kloc(static_cast<size_t>(kFlagCap), SpanLoc{-1, -1, 0.0, 0.0});
+    for (int32_t c = 0; c < nw && c < RUNTIME_MAX_WORKER; c++) {
+        DistCore &co = g_dist.cores[c];
+        if (co.block_id < 0 || co.lane < 0) continue;
+        for (const TraceEvent &e : co.trace) {
+            if (e.phase != TracePhase::Kernel || e.task_id < 0 || e.task_id >= kFlagCap) continue;
+            kloc[static_cast<size_t>(e.task_id)] =
+                SpanLoc{co.block_id + kCpuPid, co.lane + kCpuKernelLane, e.ts_us, e.cpu_us};
+        }
+    }
+    // Index: task_id -> its ringbp span in the CPU group (the arrow head for a
+    // slot-release edge anchors at the ringbp's END = when the wait was satisfied).
+    std::vector<SpanLoc> rbloc(static_cast<size_t>(kFlagCap), SpanLoc{-1, -1, 0.0, 0.0});
+    for (int32_t c = 0; c < nw && c < RUNTIME_MAX_WORKER; c++) {
+        DistCore &co = g_dist.cores[c];
+        if (co.block_id < 0 || co.lane < 0) continue;
+        for (const TraceEvent &e : co.trace) {
+            if (e.phase != TracePhase::RingBp || e.task_id < 0 || e.task_id >= kFlagCap) continue;
+            rbloc[static_cast<size_t>(e.task_id)] = SpanLoc{co.block_id + kCpuPid, co.lane, e.ts_us, e.cpu_us};
+        }
+    }
+
+    // Duration events: kernel + non-kernel overhead spans, emitted once in the
+    // wall group (pid=block) and once in the cpu group (pid=block+kCpuPid).
     for (int32_t c = 0; c < nw && c < RUNTIME_MAX_WORKER; c++) {
         DistCore &co = g_dist.cores[c];
         if (co.block_id < 0 || co.lane < 0) continue;
@@ -1762,13 +1860,73 @@ void dist_engine_dump_trace() {
                 "\"args\":{\"phase\":\"%s\",\"task_id\":%d,\"func_id\":%d,\"core\":%d,\"mc\":%d,\"cpu_us\":%.3f}}",
                 name, co.block_id, co.lane, e.ts_us, e.dur_us, ph, e.task_id, e.func_id, c, e.multicore, e.cpu_us
             );
-            // Shadow event on lane+10: same start, width = cpu_us (real CPU time).
             fprintf(
                 f,
                 ",\n    {\"ph\":\"X\",\"name\":\"%s\",\"pid\":%d,\"tid\":%d,\"ts\":%.3f,\"dur\":%.3f,"
-                "\"args\":{\"phase\":\"%s\",\"task_id\":%d,\"wall_us\":%.3f}}",
-                name, co.block_id, co.lane + 10, e.ts_us, e.cpu_us, ph, e.task_id, e.dur_us
+                "\"args\":{\"phase\":\"%s\",\"task_id\":%d,\"func_id\":%d,\"wall_us\":%.3f}}",
+                name, co.block_id + kCpuPid, e.phase == TracePhase::Kernel ? co.lane + kCpuKernelLane : co.lane,
+                e.ts_us, e.cpu_us, ph, e.task_id, e.func_id, e.dur_us
             );
+        }
+    }
+
+    // Flow events: the full static dependency graph. One arrow per dep edge, in
+    // the cpu group, from the PRODUCER kernel span's end to the CONSUMER kernel
+    // span's start (time always forward: a producer completes before its consumer
+    // runs). Click any task and follow arrows backward hop-by-hop to walk the
+    // chain "what was this waiting on, and what was THAT waiting on".
+    int32_t flow_id = 0;
+    for (int32_t c = 0; c < nw && c < RUNTIME_MAX_WORKER; c++) {
+        DistCore &co = g_dist.cores[c];
+        if (co.block_id < 0 || co.lane < 0) continue;
+        for (const DistCore::DepEdge &de : co.dep_edges) {
+            if (de.producer_task < 0 || de.producer_task >= kFlagCap) continue;
+            if (de.consumer_task < 0 || de.consumer_task >= kFlagCap) continue;
+            const SpanLoc &pr = kloc[static_cast<size_t>(de.producer_task)];
+            const SpanLoc &cs = kloc[static_cast<size_t>(de.consumer_task)];
+            if (pr.pid < 0 || cs.pid < 0) continue;  // need both kernel spans
+            fprintf(
+                f, ",\n    {\"ph\":\"s\",\"name\":\"dep\",\"cat\":\"dep\",\"id\":%d,\"pid\":%d,\"tid\":%d,\"ts\":%.3f}",
+                flow_id, pr.pid, pr.tid, pr.ts_us + pr.dur_us
+            );
+            fprintf(
+                f,
+                ",\n    {\"ph\":\"f\",\"name\":\"dep\",\"cat\":\"dep\",\"id\":%d,\"bp\":\"e\",\"pid\":%d,\"tid\":%d,"
+                "\"ts\":%.3f}",
+                flow_id, cs.pid, cs.tid, cs.ts_us
+            );
+            flow_id++;
+        }
+    }
+
+    // Flow events (cat="slot"): slot-release edges that explain a ringbp's stall.
+    // From the END of the occupant kernel's span (the moment it frees the slot) to
+    // the END of the waiting ringbp span. Chains with the dep arrows: ringbp
+    // --slot--> occupant kernel --dep--> the occupant's fan-in kernels.
+    for (int32_t c = 0; c < nw && c < RUNTIME_MAX_WORKER; c++) {
+        DistCore &co = g_dist.cores[c];
+        if (co.block_id < 0 || co.lane < 0) continue;
+        for (const DistCore::DepEdge &se : co.slot_edges) {
+            if (se.producer_task < 0 || se.producer_task >= kFlagCap) continue;  // occupant
+            if (se.consumer_task < 0 || se.consumer_task >= kFlagCap) continue;  // ringbp waiter
+            const SpanLoc &occ = kloc[static_cast<size_t>(se.producer_task)];
+            const SpanLoc &rb = rbloc[static_cast<size_t>(se.consumer_task)];
+            if (occ.pid < 0 || rb.pid < 0) continue;
+            double tail = occ.ts_us + occ.dur_us;      // occupant kernel end (slot freed)
+            const double head = rb.ts_us + rb.dur_us;  // ringbp end (wait satisfied)
+            if (tail > head) tail = head;              // keep forward in time
+            fprintf(
+                f,
+                ",\n    {\"ph\":\"s\",\"name\":\"slot\",\"cat\":\"slot\",\"id\":%d,\"pid\":%d,\"tid\":%d,\"ts\":%.3f}",
+                flow_id, occ.pid, occ.tid, tail
+            );
+            fprintf(
+                f,
+                ",\n    {\"ph\":\"f\",\"name\":\"slot\",\"cat\":\"slot\",\"id\":%d,\"bp\":\"e\",\"pid\":%d,\"tid\":%d,"
+                "\"ts\":%.3f}",
+                flow_id, rb.pid, rb.tid, head
+            );
+            flow_id++;
         }
     }
 
