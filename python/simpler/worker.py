@@ -3915,6 +3915,7 @@ class Worker:
         if self.level == 2:
             if self._chip_worker:
                 self._chip_worker.finalize()
+                self._chip_worker = None
         else:
             if self._worker:
                 self._worker.close()
