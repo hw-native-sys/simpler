@@ -606,9 +606,34 @@ uint64_t resolve_kernel_addr(Runtime *runtime, int32_t kernel_id) {
 // barrier between the kernel's output writes and a consumer's input reads.
 void execute_slot(DistCore *self, RingSlot &s) {
     typedef void (*KernelFn)(int64_t *);
-    // PTO_DIST_SKIP_EXEC: treat the incore task as 0-cost — skip the kernel call
-    // but keep every flag/frontier/slot update below so termination is identical.
-    if (s.function_bin_addr != 0 && !g_skip_exec) {
+    // Sim-only trace-driven replay (CallConfig::use_example_exec_time): when the
+    // host filled example_exec_time_ns_[func_id] > 0 for this func, "execute" it
+    // by busy-waiting that many nanoseconds instead of calling the real kernel,
+    // so a fast sim run reflects measured on-hardware kernel durations. 320 host
+    // cores >> 72 workers, so the spin does not contend; funcs left at 0 fall
+    // through to the real call below. See Runtime::example_exec_time_ns_.
+    const Runtime *rt = g_dist.runtime;
+    const int32_t sim_ns =
+        (rt != nullptr && rt->use_example_exec_time_ && s.func_id >= 0 && s.func_id < RUNTIME_MAX_FUNC_ID) ?
+            rt->example_exec_time_ns_[s.func_id] :
+            0;
+    if (sim_ns > 0) {
+        const uint64_t t0 = now_ns();
+        const uint64_t target = t0 + static_cast<uint64_t>(sim_ns);
+        while (now_ns() < target) { /* spin: emulate kernel busy time */
+        }
+        if (g_trace_on) {
+            // TraceEvent timestamps/durations are microseconds (swimlane unit).
+            self->trace.push_back(
+                TraceEvent{
+                    s.task_id, s.func_id, self->lane, static_cast<uint8_t>(s.is_multicore ? 1 : 0),
+                    (t0 - g_trace_epoch_ns) / 1000.0, sim_ns / 1000.0
+                }
+            );
+        }
+    } else if (s.function_bin_addr != 0 && !g_skip_exec) {
+        // PTO_DIST_SKIP_EXEC: treat the incore task as 0-cost — skip the kernel call
+        // but keep every flag/frontier/slot update below so termination is identical.
         if (g_trace_on) {
             const uint64_t t0 = now_ns();
             KernelFn fn = reinterpret_cast<KernelFn>(s.function_bin_addr);

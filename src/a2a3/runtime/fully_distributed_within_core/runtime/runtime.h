@@ -212,6 +212,15 @@ public:
     // NOTE: Made public for direct access from aicore code
     uint64_t func_id_to_addr_[RUNTIME_MAX_FUNC_ID];
 
+    // Sim-only trace-driven replay (CallConfig::use_example_exec_time). Filled by
+    // the host from CallConfig at bind time; read by execute_slot in dist_engine:
+    // when use_example_exec_time_ is set, a func whose example_exec_time_ns_[fid]
+    // is > 0 is "executed" by busy-waiting that many nanoseconds instead of
+    // calling the real kernel (funcs left at 0 still run for real). Public for
+    // direct AICore-side access, mirroring func_id_to_addr_.
+    bool use_example_exec_time_;
+    int32_t example_exec_time_ns_[RUNTIME_MAX_FUNC_ID];
+
     // Orchestrator-to-scheduler transition control
     // When true, orchestrator threads convert to scheduler threads after orchestration completes.
     // When false (default), orchestrator threads exit after orchestration without dispatching tasks.
