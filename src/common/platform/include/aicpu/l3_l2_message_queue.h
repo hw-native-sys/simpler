@@ -126,6 +126,19 @@ static inline uint64_t l3_l2_queue_align_up(uint64_t value, uint64_t align) {
     return remainder == 0 ? value : value + (align - remainder);
 }
 
+static inline bool l3_l2_queue_align_up_checked(uint64_t value, uint64_t align, uint64_t *out) {
+    if (out == nullptr || align == 0) {
+        return false;
+    }
+    uint64_t remainder = value % align;
+    uint64_t bump = remainder == 0 ? 0 : align - remainder;
+    if (l3_l2_orch_comm_add_overflows(value, bump)) {
+        return false;
+    }
+    *out = value + bump;
+    return true;
+}
+
 static inline bool l3_l2_queue_valid_opcode(L3L2QueueOpcode opcode) {
     return opcode == L3L2QueueOpcode::DATA || opcode == L3L2QueueOpcode::STOP || opcode == L3L2QueueOpcode::ERROR;
 }
@@ -141,14 +154,30 @@ l3_l2_queue_make_layout(uint64_t depth, uint64_t input_arena_bytes, uint64_t out
 
     uint64_t desc_ring_bytes = depth * L3L2_QUEUE_DESC_SLOT_BYTES;
     uint64_t input_desc_offset = 0;
+    if (l3_l2_orch_comm_add_overflows(input_desc_offset, desc_ring_bytes)) {
+        return false;
+    }
     uint64_t output_desc_offset = input_desc_offset + desc_ring_bytes;
-    uint64_t input_arena_offset =
-        l3_l2_queue_align_up(output_desc_offset + desc_ring_bytes, L3L2_QUEUE_PAYLOAD_ARENA_ALIGNMENT);
-    uint64_t output_arena_offset =
-        l3_l2_queue_align_up(input_arena_offset + input_arena_bytes, L3L2_QUEUE_PAYLOAD_ARENA_ALIGNMENT);
+    if (l3_l2_orch_comm_add_overflows(output_desc_offset, desc_ring_bytes)) {
+        return false;
+    }
+    uint64_t desc_end = output_desc_offset + desc_ring_bytes;
+    uint64_t input_arena_offset = 0;
+    if (!l3_l2_queue_align_up_checked(desc_end, L3L2_QUEUE_PAYLOAD_ARENA_ALIGNMENT, &input_arena_offset)) {
+        return false;
+    }
+    if (l3_l2_orch_comm_add_overflows(input_arena_offset, input_arena_bytes)) {
+        return false;
+    }
+    uint64_t input_arena_end = input_arena_offset + input_arena_bytes;
+    uint64_t output_arena_offset = 0;
+    if (!l3_l2_queue_align_up_checked(input_arena_end, L3L2_QUEUE_PAYLOAD_ARENA_ALIGNMENT, &output_arena_offset)) {
+        return false;
+    }
     if (l3_l2_orch_comm_add_overflows(output_arena_offset, output_arena_bytes)) {
         return false;
     }
+    uint64_t payload_bytes = output_arena_offset + output_arena_bytes;
 
     *out = L3L2QueueLayout{
         depth,
@@ -158,7 +187,7 @@ l3_l2_queue_make_layout(uint64_t depth, uint64_t input_arena_bytes, uint64_t out
         output_arena_offset,
         input_arena_bytes,
         output_arena_bytes,
-        output_arena_offset + output_arena_bytes,
+        payload_bytes,
         L3L2_QUEUE_INPUT_DESC_TAIL_OFFSET,
         L3L2_QUEUE_INPUT_DESC_HEAD_OFFSET,
         L3L2_QUEUE_OUTPUT_DESC_TAIL_OFFSET,
@@ -227,6 +256,7 @@ public:
             }
             uint64_t start = l3_l2_orch_endpoint_now();
             uint64_t frequency_hz = l3_l2_orch_endpoint_timer_frequency_hz();
+            uint64_t spins = 0;
             while (true) {
                 if (try_peek(out)) {
                     return true;
@@ -234,10 +264,13 @@ public:
                 if (parent_->error_.kind != L3L2QueueErrorKind::NONE) {
                     return false;
                 }
-                uint64_t now = l3_l2_orch_endpoint_now();
-                if (timeout_ns == 0 || l3_l2_orch_endpoint_elapsed_ns(start, now, frequency_hz) >= timeout_ns) {
-                    parent_->disambiguate_timeout();
-                    return false;
+                spins += 1;
+                if (timeout_ns == 0 || (spins & 1023ull) == 0) {
+                    uint64_t now = l3_l2_orch_endpoint_now();
+                    if (timeout_ns == 0 || l3_l2_orch_endpoint_elapsed_ns(start, now, frequency_hz) >= timeout_ns) {
+                        parent_->disambiguate_timeout();
+                        return false;
+                    }
                 }
             }
         }
@@ -322,6 +355,9 @@ public:
             *out = L3L2QueueInputHandle{slot.seq, opcode, slot.payload_offset, slot.payload_nbytes, view};
             active_ = true;
             active_seq_ = slot.seq;
+            active_opcode_ = opcode;
+            active_payload_offset_ = slot.payload_offset;
+            active_payload_nbytes_ = slot.payload_nbytes;
             return true;
         }
 
@@ -329,13 +365,15 @@ public:
             if (!parent_->ensure_live("input.release")) {
                 return false;
             }
-            if (!active_ || handle.seq != active_seq_ || handle.seq != parent_->input_head_ + 1) {
+            if (!active_ || handle.seq != active_seq_ || handle.seq != parent_->input_head_ + 1 ||
+                handle.opcode != active_opcode_ || handle.payload_offset != active_payload_offset_ ||
+                handle.payload_nbytes != active_payload_nbytes_) {
                 parent_->poison(L3L2QueueErrorKind::OWNERSHIP, "input.release", "input handle is not active");
                 return false;
             }
-            if (handle.payload_nbytes != 0) {
+            if (active_payload_nbytes_ != 0) {
                 parent_->advance_payload_head(
-                    parent_->input_payload_head_, handle.payload_offset, handle.payload_nbytes,
+                    parent_->input_payload_head_, active_payload_offset_, active_payload_nbytes_,
                     parent_->layout_.input_arena_offset, parent_->layout_.input_arena_bytes, "input.release"
                 );
                 if (parent_->error_.kind != L3L2QueueErrorKind::NONE) {
@@ -343,11 +381,14 @@ public:
                 }
             }
             parent_->input_head_ += 1;
-            if (handle.opcode == L3L2QueueOpcode::STOP) {
+            if (active_opcode_ == L3L2QueueOpcode::STOP) {
                 stopped_ = true;
             }
             active_ = false;
             active_seq_ = 0;
+            active_opcode_ = L3L2QueueOpcode::INVALID;
+            active_payload_offset_ = 0;
+            active_payload_nbytes_ = 0;
             return parent_->notify_counter(
                 parent_->layout_.input_desc_head_offset, static_cast<int32_t>(parent_->input_head_), "input.release"
             );
@@ -357,6 +398,9 @@ public:
         L3L2QueueEndpoint *parent_;
         bool active_{false};
         uint64_t active_seq_{0};
+        L3L2QueueOpcode active_opcode_{L3L2QueueOpcode::INVALID};
+        uint64_t active_payload_offset_{0};
+        uint64_t active_payload_nbytes_{0};
         bool stopped_{false};
     };
 
@@ -371,6 +415,7 @@ public:
             }
             uint64_t start = l3_l2_orch_endpoint_now();
             uint64_t frequency_hz = l3_l2_orch_endpoint_timer_frequency_hz();
+            uint64_t spins = 0;
             while (true) {
                 if (try_reserve(nbytes, out)) {
                     return true;
@@ -378,10 +423,13 @@ public:
                 if (parent_->error_.kind != L3L2QueueErrorKind::NONE) {
                     return false;
                 }
-                uint64_t now = l3_l2_orch_endpoint_now();
-                if (timeout_ns == 0 || l3_l2_orch_endpoint_elapsed_ns(start, now, frequency_hz) >= timeout_ns) {
-                    parent_->disambiguate_timeout();
-                    return false;
+                spins += 1;
+                if (timeout_ns == 0 || (spins & 1023ull) == 0) {
+                    uint64_t now = l3_l2_orch_endpoint_now();
+                    if (timeout_ns == 0 || l3_l2_orch_endpoint_elapsed_ns(start, now, frequency_hz) >= timeout_ns) {
+                        parent_->disambiguate_timeout();
+                        return false;
+                    }
                 }
             }
         }

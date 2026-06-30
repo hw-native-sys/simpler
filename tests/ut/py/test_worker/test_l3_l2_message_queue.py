@@ -210,6 +210,11 @@ def test_layout_rejects_invalid_pr1_parameters():
             make_l3_l2_queue_layout(depth, input_arena_bytes, output_arena_bytes)
 
 
+def test_layout_rejects_uint64_overflow_to_match_cpp_helper():
+    with pytest.raises(ValueError, match="overflowed uint64"):
+        make_l3_l2_queue_layout(2, (1 << 64) - 64, 64)
+
+
 @pytest.mark.parametrize(
     ("depth", "input_arena_bytes", "output_arena_bytes", "expected"),
     [
@@ -297,6 +302,25 @@ def test_create_l3_l2_queue_allocates_region_and_exposes_l2_task_scalars():
             queue.layout.l2_abort_flag_offset: 0,
         }
     finally:
+        _close(worker, shm)
+
+
+def test_create_l3_l2_queue_frees_region_on_post_region_alloc_failure():
+    orch, worker, shm, _fake_client = _make_orchestrator()
+    original_alloc = orch._o.alloc
+
+    def fail_alloc(_shape, _dtype):
+        raise RuntimeError("injected alloc failure")
+
+    orch._o.alloc = fail_alloc
+    try:
+        with pytest.raises(RuntimeError, match="injected alloc failure"):
+            orch.create_l3_l2_queue(worker_id=0, depth=4, input_arena_bytes=128, output_arena_bytes=128)
+
+        assert len(worker._live_l3_l2_regions) == 1
+        assert worker._live_l3_l2_regions[0]._released is True
+    finally:
+        orch._o.alloc = original_alloc
         _close(worker, shm)
 
 

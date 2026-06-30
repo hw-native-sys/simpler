@@ -40,6 +40,7 @@ L3L2_QUEUE_L3_ABORT_FLAG_OFFSET = 256
 L3L2_QUEUE_L2_ABORT_FLAG_OFFSET = 320
 L3L2_QUEUE_COUNTER_BYTES = 384
 L3L2_QUEUE_MAX_DEPTH = 1 << 30
+_UINT64_MAX = (1 << 64) - 1
 
 _DESC = struct.Struct("<4Q")
 _POLL_INTERVAL_S = 0.00005
@@ -92,8 +93,21 @@ def l3_l2_queue_magic_version() -> int:
 
 
 def _align_up(value: int, align: int) -> int:
+    if value < 0 or value > _UINT64_MAX:
+        raise ValueError("L3-L2 queue layout calculation overflowed uint64")
     remainder = value % align
-    return value if remainder == 0 else value + (align - remainder)
+    bump = 0 if remainder == 0 else align - remainder
+    result = value + bump
+    if result > _UINT64_MAX:
+        raise ValueError("L3-L2 queue layout calculation overflowed uint64")
+    return result
+
+
+def _checked_add_u64(lhs: int, rhs: int) -> int:
+    result = lhs + rhs
+    if lhs < 0 or rhs < 0 or result > _UINT64_MAX:
+        raise ValueError("L3-L2 queue layout calculation overflowed uint64")
+    return result
 
 
 def make_l3_l2_queue_layout(depth: int, input_arena_bytes: int, output_arena_bytes: int) -> L3L2QueueLayout:
@@ -108,11 +122,15 @@ def make_l3_l2_queue_layout(depth: int, input_arena_bytes: int, output_arena_byt
         raise ValueError("L3-L2 queue output_arena_bytes must be a positive 64-byte multiple")
 
     desc_ring_bytes = depth * L3L2_QUEUE_DESC_SLOT_BYTES
+    if desc_ring_bytes > _UINT64_MAX:
+        raise ValueError("L3-L2 queue layout calculation overflowed uint64")
     input_desc_offset = 0
-    output_desc_offset = input_desc_offset + desc_ring_bytes
-    input_arena_offset = _align_up(output_desc_offset + desc_ring_bytes, L3L2_QUEUE_PAYLOAD_ARENA_ALIGNMENT)
-    output_arena_offset = _align_up(input_arena_offset + input_arena_bytes, L3L2_QUEUE_PAYLOAD_ARENA_ALIGNMENT)
-    payload_bytes = output_arena_offset + output_arena_bytes
+    output_desc_offset = _checked_add_u64(input_desc_offset, desc_ring_bytes)
+    desc_end = _checked_add_u64(output_desc_offset, desc_ring_bytes)
+    input_arena_offset = _align_up(desc_end, L3L2_QUEUE_PAYLOAD_ARENA_ALIGNMENT)
+    input_arena_end = _checked_add_u64(input_arena_offset, input_arena_bytes)
+    output_arena_offset = _align_up(input_arena_end, L3L2_QUEUE_PAYLOAD_ARENA_ALIGNMENT)
+    payload_bytes = _checked_add_u64(output_arena_offset, output_arena_bytes)
     return L3L2QueueLayout(
         depth=depth,
         input_desc_offset=input_desc_offset,
@@ -146,18 +164,25 @@ def create_l3_l2_queue(
         payload_bytes=layout.payload_bytes,
         counter_bytes=layout.counter_bytes,
     )
-    desc_fields = orch.alloc([24], DataType.UINT8)
-    desc_seq = orch.alloc([8], DataType.UINT8)
-    desc_read = orch.alloc([L3L2_QUEUE_DESC_SLOT_BYTES], DataType.UINT8)
-    for offset in (
-        layout.input_desc_tail_offset,
-        layout.input_desc_head_offset,
-        layout.output_desc_tail_offset,
-        layout.output_desc_head_offset,
-        layout.l3_abort_flag_offset,
-        layout.l2_abort_flag_offset,
-    ):
-        region.counter(offset).notify(0, NotifyOp.Set)
+    try:
+        desc_fields = orch.alloc([24], DataType.UINT8)
+        desc_seq = orch.alloc([8], DataType.UINT8)
+        desc_read = orch.alloc([L3L2_QUEUE_DESC_SLOT_BYTES], DataType.UINT8)
+        for offset in (
+            layout.input_desc_tail_offset,
+            layout.input_desc_head_offset,
+            layout.output_desc_tail_offset,
+            layout.output_desc_head_offset,
+            layout.l3_abort_flag_offset,
+            layout.l2_abort_flag_offset,
+        ):
+            region.counter(offset).notify(0, NotifyOp.Set)
+    except Exception:
+        try:
+            region.free()
+        except Exception:
+            pass
+        raise
     return L3L2Queue(orch, region, layout, desc_fields, desc_seq, desc_read)
 
 
