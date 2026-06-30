@@ -305,6 +305,10 @@ public:
     void set_worker_count(int n) { dev.worker_count = n; }
     int get_aicpu_thread_num() const { return dev.aicpu_thread_num; }
     void set_aicpu_thread_num(int n) { dev.aicpu_thread_num = n; }
+    void *get_tracr_data() const { return dev.tracrData_; }
+    void set_tracr_data(void *p) { dev.tracrData_ = p; }
+    void *get_tracr_data_sizes() const { return dev.tracrDataSizes_; }
+    void set_tracr_data_sizes(void *p) { dev.tracrDataSizes_ = p; }
     Handshake *get_workers() { return dev.workers; }
     int32_t get_aicpu_allowed_cpu_count() const { return dev.aicpu_allowed_cpu_count; }
     void set_aicpu_allowed_cpu_count(int32_t n) { dev.aicpu_allowed_cpu_count = n; }

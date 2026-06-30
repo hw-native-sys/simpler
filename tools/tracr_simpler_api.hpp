@@ -118,13 +118,13 @@ int StoreTracrMetaData(RuntimeT &runtime) {
 
     // channel_names
     nlohmann::json channel_names = nlohmann::json::array();
-    for(int i = 0; i < runtime.aicpu_thread_num; ++i) {
+    for(int i = 0; i < runtime.get_aicpu_thread_num(); ++i) {
         channel_names.push_back("AICPU_" + std::to_string(i));
     }
-    for(int i = 0; i < int(runtime.worker_count/3); ++i) {
+    for(int i = 0; i < int(runtime.get_worker_count()/3); ++i) {
         channel_names.push_back("AICube_" + std::to_string(i));
     }
-    for(int i = 0; i < int(2*runtime.worker_count/3); ++i) {
+    for(int i = 0; i < int(2*runtime.get_worker_count()/3); ++i) {
         channel_names.push_back("AIVector_" + std::to_string(i));
     }
     channel_names.push_back("INVALID");
@@ -170,36 +170,36 @@ int StoreTracrData(DeviceRunnerT *device_runner, RuntimeT &runtime) {
     static_assert(std::is_trivially_copyable_v<TraCR::Payload>,
               "TraCR::Payload must be trivially copyable for raw binary dump");
 
-    if (runtime.tracrData_ == nullptr) {
+    if (runtime.get_tracr_data() == nullptr) {
         LOG_ERROR("runtime.tracrData_ is a nullptr");
         return -1;
     }
 
-    if (runtime.tracrDataSizes_ == nullptr) {
+    if (runtime.get_tracr_data_sizes() == nullptr) {
         LOG_ERROR("runtime.tracrDataSizes_ is a nullptr");
         return -1;
     }
 
-    if (runtime.aicpu_thread_num <= 0) {
-        LOG_ERROR("runtime.aicpu_thread_num is zero or negative: %d", runtime.aicpu_thread_num);
+    if (runtime.get_aicpu_thread_num() <= 0) {
+        LOG_ERROR("runtime.aicpu_thread_num is zero or negative: %d", runtime.get_aicpu_thread_num());
         return -1;
     }
-    
+
     // Download the tracrData_ from Device to Host
-    size_t size = sizeof(TraCR::Payload) * TraCR::CAPACITY * runtime.aicpu_thread_num;
-    std::vector<TraCR::Payload> tracrData(TraCR::CAPACITY * runtime.aicpu_thread_num);
+    size_t size = sizeof(TraCR::Payload) * TraCR::CAPACITY * runtime.get_aicpu_thread_num();
+    std::vector<TraCR::Payload> tracrData(TraCR::CAPACITY * runtime.get_aicpu_thread_num());
     int rc = device_runner->copy_from_device(reinterpret_cast<void*>(tracrData.data()),
-                                            reinterpret_cast<void*>(runtime.tracrData_), size);
+                                            reinterpret_cast<void*>(runtime.get_tracr_data()), size);
     if (rc != 0) {
         LOG_ERROR("device_runner->copy_from_device 'tracrData' failed rc=%d", rc);
         return rc;
     }
 
     // Download the tracrDataSizes_ from Device to Host
-    size = sizeof(size_t) * runtime.aicpu_thread_num;
-    std::vector<size_t> tracrDataSizes(runtime.aicpu_thread_num);
+    size = sizeof(size_t) * runtime.get_aicpu_thread_num();
+    std::vector<size_t> tracrDataSizes(runtime.get_aicpu_thread_num());
     rc = device_runner->copy_from_device(reinterpret_cast<void*>(tracrDataSizes.data()),
-                                            reinterpret_cast<void*>(runtime.tracrDataSizes_), size);
+                                            reinterpret_cast<void*>(runtime.get_tracr_data_sizes()), size);
     if (rc != 0) {
         LOG_ERROR("device_runner->copy_from_device 'tracrDataSizes' failed rc=%d", rc);
         return rc;
@@ -207,15 +207,15 @@ int StoreTracrData(DeviceRunnerT *device_runner, RuntimeT &runtime) {
 
     // Now, store the traces into '~/ascend/tracr/'
     tracr_dir = "~/ascend/tracr_" + std::to_string(sampleID++) + "/proc." + std::to_string(1000 + device_runner->device_id());
-    rc = TracrData2BTS(tracrData.data(), tracrDataSizes.data(), runtime.aicpu_thread_num);
+    rc = TracrData2BTS(tracrData.data(), tracrDataSizes.data(), runtime.get_aicpu_thread_num());
     if (rc != 0) {
         LOG_ERROR("TracrData2BTS() failed");
         return rc;
     }
 
     // Free device TraCR memory data placeholder
-    device_runner->free_tensor(runtime.tracrData_);
-    device_runner->free_tensor(runtime.tracrDataSizes_);
+    device_runner->free_tensor(runtime.get_tracr_data());
+    device_runner->free_tensor(runtime.get_tracr_data_sizes());
 
     rc = StoreTracrMetaData(runtime);
     if (rc != 0) {
@@ -233,20 +233,20 @@ int StoreTracrData(DeviceRunnerT *device_runner, RuntimeT &runtime) {
  */
 template <typename DeviceRunnerT, typename RuntimeT>
 int DevAllocTraCR(DeviceRunnerT *device_runner, RuntimeT &runtime) {
-    const size_t size = sizeof(TraCR::Payload) * runtime.aicpu_thread_num * TraCR::CAPACITY;
-    // LOG_INFO_V9("Device alloc start of size=%u, %p", size, runtime.tracrData_);
-    runtime.tracrData_ = device_runner->allocate_tensor(size);
-    if (runtime.tracrData_ == nullptr) {
+    const size_t size = sizeof(TraCR::Payload) * runtime.get_aicpu_thread_num() * TraCR::CAPACITY;
+    // LOG_INFO_V9("Device alloc start of size=%u, %p", size, runtime.get_tracr_data());
+    runtime.set_tracr_data(device_runner->allocate_tensor(size));
+    if (runtime.get_tracr_data() == nullptr) {
         LOG_ERROR("runtime.tracrData_: alloc %zu bytes failed", size);
         return -1;
     }
-    // LOG_INFO_V9("Device alloc start of size=%u, %p", size, runtime.tracrData_);
-    runtime.tracrDataSizes_ = device_runner->allocate_tensor(runtime.aicpu_thread_num * sizeof(size_t));
-    if (runtime.tracrDataSizes_ == nullptr) {
-        const size_t sizes_bytes = runtime.aicpu_thread_num * sizeof(size_t);
+    // LOG_INFO_V9("Device alloc start of size=%u, %p", size, runtime.get_tracr_data());
+    runtime.set_tracr_data_sizes(device_runner->allocate_tensor(runtime.get_aicpu_thread_num() * sizeof(size_t)));
+    if (runtime.get_tracr_data_sizes() == nullptr) {
+        const size_t sizes_bytes = runtime.get_aicpu_thread_num() * sizeof(size_t);
         LOG_ERROR("runtime.tracrDataSizes_: alloc %zu bytes failed", sizes_bytes);
-        device_runner->free_tensor(runtime.tracrData_);
-        runtime.tracrData_ = nullptr;
+        device_runner->free_tensor(runtime.get_tracr_data());
+        runtime.set_tracr_data(nullptr);
         return -1;
     }
     return 0;
