@@ -11,7 +11,7 @@ no repo checkout required.
 
 - **[swimlane_converter](#swimlane_converter)** — perf JSON → Chrome Trace Event (Perfetto)
 - **[sched_overhead_analysis](#sched_overhead_analysis)** — scheduler overhead / Tail OH breakdown
-- **[strace_timing](#strace_timing)** — per-stage `run_prepared` breakdown (host + AICPU phases) from `[STRACE]` log markers → TPOT table, per-round table (`--rounds-table`), nested tree (`--tree`), or Perfetto JSON
+- **[strace_timing](#strace_timing)** — per-stage `simpler_run` breakdown (host + AICPU phases) from `[STRACE]` log markers → TPOT table, per-round table (`--rounds-table`), nested tree (`--tree`), or Perfetto JSON
 - **[dump_viewer](#dump_viewer)** — inspect / export args dumps (see [docs/args-dump.md](../../docs/dfx/args-dump.md) for full workflow)
 - **[deps_viewer](#deps_viewer)** — `deps.json` (dep_gen) → text or pan/zoom HTML dependency graph
 
@@ -182,7 +182,7 @@ The perf JSON must be captured at l2_swimlane_level >= 3 so that `aicpu_schedule
 
 ## strace_timing
 
-Per-stage breakdown of every `run_prepared()` from `[STRACE]` host-trace
+Per-stage breakdown of every `simpler_run()` from `[STRACE]` host-trace
 markers in a log (host stderr or CANN device log). The runtime emits one
 `[STRACE]` line per span on scope exit (RAII, gated on `SIMPLER_PROFILING`,
 `LOG_INFO_V9`), including the AICPU device-phase subdivision (`clk=dev`). See
@@ -195,7 +195,7 @@ python -m simpler_setup.tools.strace_timing path/to/log
 # Per-round Host/Device/Orch/Sched table (the benchmark/--rounds N view)
 python -m simpler_setup.tools.strace_timing path/to/log --rounds-table
 
-# Indented nested span tree per callable (run_prepared → bind / runner_run →
+# Indented nested span tree per callable (simpler_run → bind / runner_run →
 # device_wall → preamble/config_validate/arena_wire/sm_reset/orch/sched/post_orch)
 python -m simpler_setup.tools.strace_timing path/to/log --tree
 
@@ -205,7 +205,7 @@ python -m simpler_setup.tools.strace_timing path/to/log --trace-out strace.json
 ```
 
 Groups spans by `(pid, inv)`, rebuilds each invocation's tree from `depth`,
-buckets by callable hash `hid`, and reports each callable's mean `run_prepared`
+buckets by callable hash `hid`, and reports each callable's mean `simpler_run`
 plus per-stage means. It reads the host-emitted `[STRACE]` lines and shows the
 host stages (`bind`/`runner_run`/`validate`) alongside the AICPU phases.
 

@@ -50,7 +50,7 @@ extern "C" {
 /* ===========================================================================
  * Runtime Implementation Functions (defined in runtime_maker.cpp)
  * =========================================================================== */
-int prepare_callable_impl(const ChipCallable *callable, uint64_t (*upload_fn)(const void *), CallableArtifacts *out);
+int register_callable_impl(const ChipCallable *callable, uint64_t (*upload_fn)(const void *), CallableArtifacts *out);
 int bind_callable_to_runtime_impl(
     Runtime *runtime, const ChipStorageTaskArgs *orch_args, void *host_orch_func_ptr, const ArgDirection *signature,
     int sig_count, const uint64_t *ring_task_window, const uint64_t *ring_heap, const uint64_t *ring_dep_pool
@@ -277,7 +277,7 @@ int simpler_init(
  * Per-callable_id preparation
  * =========================================================================== */
 
-int prepare_callable(DeviceContextHandle ctx, int32_t callable_id, const void *callable) {
+int simpler_register_callable(DeviceContextHandle ctx, int32_t callable_id, const void *callable) {
     if (ctx == NULL || callable == NULL) return -1;
     SimDeviceRunnerBase *runner = static_cast<SimDeviceRunnerBase *>(ctx);
 
@@ -286,7 +286,7 @@ int prepare_callable(DeviceContextHandle ctx, int32_t callable_id, const void *c
 
     try {
         CallableArtifacts artifacts;
-        int rc = prepare_callable_impl(
+        int rc = register_callable_impl(
             reinterpret_cast<const ChipCallable *>(callable), upload_chip_callable_buffer_wrapper, &artifacts
         );
         if (rc != 0) {
@@ -307,7 +307,7 @@ int prepare_callable(DeviceContextHandle ctx, int32_t callable_id, const void *c
 
         bool needs_aicpu_register = false;
         if (artifacts.host_dlopen_handle != nullptr) {
-            rc = runner->register_callable_host_orch(
+            rc = runner->record_host_orch_callable(
                 callable_id, artifacts.host_dlopen_handle, artifacts.host_orch_func_ptr, std::move(kernel_addrs),
                 std::move(artifacts.signature)
             );
@@ -315,7 +315,7 @@ int prepare_callable(DeviceContextHandle ctx, int32_t callable_id, const void *c
                 host_dlopen_guard.dismiss();
             }
         } else {
-            rc = runner->register_callable(
+            rc = runner->record_device_orch_callable(
                 callable_id, artifacts.orch_so_data, artifacts.orch_so_size, artifacts.func_name.c_str(),
                 artifacts.config_name.c_str(), std::move(kernel_addrs), std::move(artifacts.signature)
             );
@@ -324,7 +324,7 @@ int prepare_callable(DeviceContextHandle ctx, int32_t callable_id, const void *c
             }
         }
         if (rc == 0 && needs_aicpu_register) {
-            rc = runner->aicpu_register_callable(callable_id);
+            rc = runner->launch_device_register(callable_id);
             if (rc != 0) {
                 runner->unregister_callable(callable_id);
             }
@@ -357,22 +357,22 @@ static void emit_device_phase_markers(SimDeviceRunnerBase *runner) {
     if (!device_profiling_enabled()) return;
     const uint64_t run_wall_ns = runner->last_device_phase_ns(AicpuPhase::RunWall);
     if (run_wall_ns != 0) {
-        STRACE_DEV_SPAN_AT("run_prepared.runner_run.device_wall", 0, static_cast<long long>(run_wall_ns), 2);
+        STRACE_DEV_SPAN_AT("simpler_run.runner_run.device_wall", 0, static_cast<long long>(run_wall_ns), 2);
     }
     struct PhaseName {
         AicpuPhase phase;
         const char *name;
     };
     static const PhaseName kPhases[] = {
-        {AicpuPhase::Preamble, "run_prepared.runner_run.device_wall.preamble"},
-        {AicpuPhase::SoLoad, "run_prepared.runner_run.device_wall.so_load"},
-        {AicpuPhase::GraphBuild, "run_prepared.runner_run.device_wall.graph_build"},
-        {AicpuPhase::ConfigValidate, "run_prepared.runner_run.device_wall.config_validate"},
-        {AicpuPhase::ArenaWire, "run_prepared.runner_run.device_wall.arena_wire"},
-        {AicpuPhase::SmReset, "run_prepared.runner_run.device_wall.sm_reset"},
-        {AicpuPhase::PostOrch, "run_prepared.runner_run.device_wall.post_orch"},
-        {AicpuPhase::OrchWindow, "run_prepared.runner_run.device_wall.orch"},
-        {AicpuPhase::SchedWindow, "run_prepared.runner_run.device_wall.sched"},
+        {AicpuPhase::Preamble, "simpler_run.runner_run.device_wall.preamble"},
+        {AicpuPhase::SoLoad, "simpler_run.runner_run.device_wall.so_load"},
+        {AicpuPhase::GraphBuild, "simpler_run.runner_run.device_wall.graph_build"},
+        {AicpuPhase::ConfigValidate, "simpler_run.runner_run.device_wall.config_validate"},
+        {AicpuPhase::ArenaWire, "simpler_run.runner_run.device_wall.arena_wire"},
+        {AicpuPhase::SmReset, "simpler_run.runner_run.device_wall.sm_reset"},
+        {AicpuPhase::PostOrch, "simpler_run.runner_run.device_wall.post_orch"},
+        {AicpuPhase::OrchWindow, "simpler_run.runner_run.device_wall.orch"},
+        {AicpuPhase::SchedWindow, "simpler_run.runner_run.device_wall.sched"},
     };
     // RunWall is emitted above as device_wall; every other phase is in the table.
     static_assert(
@@ -390,7 +390,7 @@ static void emit_device_phase_markers(SimDeviceRunnerBase *runner) {
     }
 }
 
-int run_prepared(
+int simpler_run(
     DeviceContextHandle ctx, RuntimeHandle runtime, int32_t callable_id, const void *args, int block_dim,
     int aicpu_thread_num, int enable_l2_swimlane, int enable_dump_tensor, int enable_pmu, int enable_dep_gen,
     int enable_scope_stats, const uint64_t *ring_task_window, const uint64_t *ring_heap, const uint64_t *ring_dep_pool,
@@ -400,7 +400,7 @@ int run_prepared(
     SimDeviceRunnerBase *runner = static_cast<SimDeviceRunnerBase *>(ctx);
 
     if (!runner->has_callable(callable_id)) {
-        LOG_ERROR("run_prepared: callable_id=%d not prepared", callable_id);
+        LOG_ERROR("simpler_run: callable_id=%d not registered", callable_id);
         return -1;
     }
 
@@ -409,7 +409,7 @@ int run_prepared(
 
     STRACE_NEW_INV();
     STRACE_SET_HID(static_cast<uint64_t>(callable_id));
-    STRACE("run_prepared");
+    STRACE("simpler_run");
 
     try {
         Runtime *r = new (runtime) Runtime();
@@ -439,7 +439,7 @@ int run_prepared(
         }
 
         {
-            STRACE("run_prepared.bind");
+            STRACE("simpler_run.bind");
             rc = bind_callable_to_runtime_impl(
                 r, reinterpret_cast<const ChipStorageTaskArgs *>(args), bind_result.host_orch_func_ptr,
                 bind_result.signature, bind_result.sig_count, ring_task_window, ring_heap, ring_dep_pool
@@ -460,7 +460,7 @@ int run_prepared(
         runner->set_output_prefix(output_prefix);
 
         {
-            STRACE("run_prepared.runner_run");
+            STRACE("simpler_run.runner_run");
             rc = runner->run(*r, block_dim, aicpu_thread_num);
         }
         if (rc != 0) {
@@ -469,7 +469,7 @@ int run_prepared(
             return rc;
         }
         if (r->register_new_callable_id()) {
-            rc = runner->commit_aicpu_callable_load(r->get_active_callable_id());
+            rc = runner->commit_device_register(r->get_active_callable_id());
             if (rc != 0) {
                 validate_runtime_impl(r);
                 pthread_setspecific(g_runner_key, nullptr);
@@ -478,7 +478,7 @@ int run_prepared(
         }
 
         {
-            STRACE("run_prepared.validate");
+            STRACE("simpler_run.validate");
             rc = validate_runtime_impl(r);
         }
         pthread_setspecific(g_runner_key, nullptr);
@@ -490,7 +490,7 @@ int run_prepared(
     }
 }
 
-int unregister_callable(DeviceContextHandle ctx, int32_t callable_id) {
+int simpler_unregister_callable(DeviceContextHandle ctx, int32_t callable_id) {
     if (ctx == NULL) return -1;
     try {
         return static_cast<SimDeviceRunnerBase *>(ctx)->unregister_callable(callable_id);

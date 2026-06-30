@@ -282,10 +282,10 @@ extern "C" {
  * handle and resolved entry-symbol pointer are returned via
  * CallableArtifacts so the platform layer can hoist them into its
  * CallableState. Splitting this out of init_runtime_impl is what
- * the hbg prepare_callable / run_prepared path rests on — the dlopen runs
+ * the hbg simpler_register_callable / simpler_run path rests on — the dlopen runs
  * once per cid instead of every run.
  */
-int prepare_callable_impl(const ChipCallable *callable, uint64_t (*upload_fn)(const void *), CallableArtifacts *out) {
+int register_callable_impl(const ChipCallable *callable, uint64_t (*upload_fn)(const void *), CallableArtifacts *out) {
     if (callable == nullptr) {
         LOG_ERROR("Callable pointer is null");
         return -1;
@@ -297,7 +297,7 @@ int prepare_callable_impl(const ChipCallable *callable, uint64_t (*upload_fn)(co
     *out = CallableArtifacts{};
     out->signature.assign(callable->signature_, callable->signature_ + callable->sig_count());
 
-    LOG_INFO_V0("Registering %d kernel(s) in prepare_callable_impl", callable->child_count());
+    LOG_INFO_V0("Registering %d kernel(s) in register_callable_impl", callable->child_count());
     if (upload_and_collect_child_addrs(callable, upload_fn, &out->kernel_addrs) != 0) {
         LOG_ERROR("Failed to upload ChipCallable buffer");
         return -1;
@@ -473,7 +473,7 @@ int validate_runtime_impl(Runtime *runtime) {
     }
     LOG_INFO_V0("Freed %d device tensors", tensor_pair_count);
 
-    // Clear the per-run dispatch-table entries staged by prepare_callable_impl.
+    // Clear the per-run dispatch-table entries staged by register_callable_impl.
     // The underlying chip-callable device buffer is pool-managed by
     // DeviceRunner (keyed by content hash) and bulk-freed in
     // DeviceRunner::finalize().

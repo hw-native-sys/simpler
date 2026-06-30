@@ -31,7 +31,7 @@ public:
 
 private:
     int ensure_binaries_loaded() override { return 0; }
-    int invoke_aicpu_register_callable(Runtime &) override { return 0; }
+    int invoke_device_register(Runtime &) override { return 0; }
 };
 
 L3L2OrchCommResponse

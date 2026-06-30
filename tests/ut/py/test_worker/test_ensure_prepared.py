@@ -29,7 +29,7 @@ class TestEnsurePrepared:
 
         _ensure_prepared(cw, registry, prepared, 2, device_id=0)
 
-        cw._prepare_callable_at_slot.assert_called_once_with(2, callable_obj)
+        cw._register_callable_at_slot.assert_called_once_with(2, callable_obj)
         assert prepared == {2}
         # Preparation is a normal control-flow step now — no warning is emitted.
         assert capsys.readouterr().err == ""
@@ -41,7 +41,7 @@ class TestEnsurePrepared:
         # lookup never happens (otherwise registry.get would return None
         # and the helper would raise).
         _ensure_prepared(cw, {}, {5}, 5, device_id=0)
-        cw._prepare_callable_at_slot.assert_not_called()
+        cw._register_callable_at_slot.assert_not_called()
 
     def test_missing_cid_raises(self):
         with pytest.raises(RuntimeError, match="cid 9 not in registry"):

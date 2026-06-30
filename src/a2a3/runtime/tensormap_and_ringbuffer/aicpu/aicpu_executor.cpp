@@ -241,7 +241,7 @@ int32_t AicpuExecutor::load_orch_so(
     // Registration always (re)loads: the slot may have been reused after an
     // unregister, so dlclose any stale handle before dlopen'ing the new SO.
     // No AicpuPhase::SoLoad stamp here: that phase times the dlopen within a
-    // run_prepared launch, but loading now happens in the separate
+    // simpler_run launch, but loading now happens in the separate
     // register_callable launch which has no phase buffer (the run-path SoLoad
     // slot is simply 0 now that run never loads).
     LOG_INFO_V0("Thread %d: New orch SO detected (callable_id=%d), (re)loading", thread_idx, callable_id);

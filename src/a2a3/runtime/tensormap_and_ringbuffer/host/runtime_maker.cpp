@@ -297,7 +297,7 @@ static int32_t pto2_read_runtime_status(Runtime *runtime, PTO2SharedMemoryHeader
  * Stage the per-callable resources (kernel binaries + orchestration SO) into
  * the supplied runtime so a subsequent bind_callable_to_runtime_impl can use
  * them. This is the cacheable half of init_runtime_impl: nothing here depends
- * on per-run argument values, so the prepare_callable / run_prepared split
+ * on per-run argument values, so the simpler_register_callable / simpler_run split
  * lets us run this once per callable_id and amortize across runs.
  *
  * @param runtime   Pointer to pre-constructed Runtime (host_api populated)
@@ -305,7 +305,7 @@ static int32_t pto2_read_runtime_status(Runtime *runtime, PTO2SharedMemoryHeader
  * @return 0 on success, -1 on failure
  */
 extern "C" int
-prepare_callable_impl(const ChipCallable *callable, uint64_t (*upload_fn)(const void *), CallableArtifacts *out) {
+register_callable_impl(const ChipCallable *callable, uint64_t (*upload_fn)(const void *), CallableArtifacts *out) {
     if (callable == nullptr) {
         LOG_ERROR("Callable pointer is null");
         return -1;
@@ -317,7 +317,7 @@ prepare_callable_impl(const ChipCallable *callable, uint64_t (*upload_fn)(const 
     *out = CallableArtifacts{};
     out->signature.assign(callable->signature_, callable->signature_ + callable->sig_count());
 
-    LOG_INFO_V0("Registering %d kernel(s) in prepare_callable_impl", callable->child_count());
+    LOG_INFO_V0("Registering %d kernel(s) in register_callable_impl", callable->child_count());
     if (upload_and_collect_child_addrs(callable, upload_fn, &out->kernel_addrs) != 0) {
         LOG_ERROR("Failed to upload ChipCallable buffer");
         return -1;
@@ -349,10 +349,10 @@ prepare_callable_impl(const ChipCallable *callable, uint64_t (*upload_fn)(const 
  * Per-run binding: build device-side argument storage (tensor copy-out, GM
  * heap, PTO2 shared memory) and publish it to the runtime. Assumes the
  * callable-side state (kernel binaries, orch SO bytes, func/config names)
- * is already populated by prepare_callable_impl.
+ * is already populated by register_callable_impl.
  *
- * Splitting this from prepare_callable_impl matches the per-callable_id
- * design: register/run_prepared invokes this every call, while the prep
+ * Splitting this from register_callable_impl matches the per-callable_id
+ * design: register/run invokes this every call, while the prep
  * half runs only once per callable_id.
  *
  * @param runtime    Pointer to pre-constructed Runtime (host_api populated)
@@ -406,7 +406,7 @@ extern "C" int bind_callable_to_runtime_impl(
 
     int64_t t_args_start = _now_ms();
     {
-        STRACE_A("run_prepared.bind.args", "");
+        STRACE_A("simpler_run.bind.args", "");
         for (int i = 0; i < tensor_count; i++) {
             Tensor t = orch_args->tensor(i);
 
@@ -498,7 +498,7 @@ extern "C" int bind_callable_to_runtime_impl(
 
     int64_t t_prebuilt_start = _now_ms();
     {
-        STRACE("run_prepared.bind.prebuilt");
+        STRACE("simpler_run.bind.prebuilt");
         DeviceArena host_arena;  // libc malloc backend by default
         PTO2RuntimeArenaLayout layout =
             runtime_reserve_layout(host_arena, eff_task_window_sizes, eff_heap_sizes, eff_dep_pool_capacities);
@@ -717,7 +717,7 @@ extern "C" int validate_runtime_impl(Runtime *runtime) {
     }
     LOG_INFO_V0("Freed %d device allocations", tensor_pair_count);
 
-    // Clear the per-run dispatch-table entries staged by prepare_callable_impl.
+    // Clear the per-run dispatch-table entries staged by register_callable_impl.
     // The underlying chip-callable device buffer is pool-managed by
     // DeviceRunner (keyed by content hash) and bulk-freed in
     // DeviceRunner::finalize(); re-running the same callable repeatedly

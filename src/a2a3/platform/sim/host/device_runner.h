@@ -39,7 +39,7 @@ public:
 
 private:
     int ensure_binaries_loaded() override;
-    int invoke_aicpu_register_callable(Runtime &runtime) override;
+    int invoke_device_register(Runtime &runtime) override;
     void unload_executor_binaries();
 
     int init_l2_swimlane(int num_aicore, int aicpu_thread_num, int device_id);

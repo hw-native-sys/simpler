@@ -9,7 +9,7 @@
  * -----------------------------------------------------------------------------------------------------------
  */
 /**
- * Runtime-agnostic helper for the kernel-upload half of prepare_callable_impl.
+ * Runtime-agnostic helper for the kernel-upload half of register_callable_impl.
  *
  * Each runtime variant (host_build_graph, tensormap_and_ringbuffer, ...) needs
  * to: upload the ChipCallable buffer to device once, then translate each child
@@ -36,7 +36,7 @@ struct ChildKernelAddr {
 };
 
 /**
- * Output bundle from a runtime's prepare_callable_impl() — everything the
+ * Output bundle from a runtime's register_callable_impl() — everything the
  * platform layer needs to register a callable_id with its DeviceRunner.
  *
  * Replaces the per-field Runtime::pending_* sidecar that earlier callsites
@@ -51,7 +51,7 @@ struct ChildKernelAddr {
  *                       device by DeviceRunner; host does no dlopen)
  *
  * func_name / config_name are non-empty only for the trb path; the hbg path
- * resolves its entry symbol during prepare_callable_impl and stores the
+ * resolves its entry symbol during register_callable_impl and stores the
  * resulting function pointer in host_orch_func_ptr directly.
  */
 struct CallableArtifacts {

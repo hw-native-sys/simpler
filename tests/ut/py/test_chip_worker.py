@@ -195,16 +195,16 @@ class TestChipWorkerStateMachine:
         with pytest.raises(RuntimeError, match="device_id"):
             worker.init("/nonexistent/libfoo.so", "/dev/null", "/dev/null", "", -1)
 
-    def test_prepare_callable_before_init_raises(self):
+    def test_register_callable_before_init_raises(self):
         from _task_interface import ChipCallable  # noqa: PLC0415
 
         worker = _ChipWorker()
         callable_obj = ChipCallable.build(signature=[], func_name="test", binary=b"\x00", children=[])
         with pytest.raises(RuntimeError, match="not initialized"):
-            worker.prepare_callable(0, callable_obj)
+            worker.register_callable(0, callable_obj)
 
-    def test_prepare_callable_from_blob_before_init_raises(self):
-        # The from_blob overload shares the underlying ChipWorker::prepare_callable
+    def test_register_callable_from_blob_before_init_raises(self):
+        # The from_blob overload shares the underlying ChipWorker::register_callable
         # entrypoint with the typed overload, so it must enforce the same
         # initialization guard. This protects the dynamic-register IPC handler
         # (which is the sole caller) from silently no-op'ing on a stale worker.
@@ -213,7 +213,7 @@ class TestChipWorkerStateMachine:
         worker = _ChipWorker()
         callable_obj = ChipCallable.build(signature=[], func_name="test", binary=b"\x00", children=[])
         with pytest.raises(RuntimeError, match="not initialized"):
-            worker.prepare_callable_from_blob(0, callable_obj.buffer_ptr())
+            worker.register_callable_from_blob(0, callable_obj.buffer_ptr())
 
     def test_run_before_init_raises(self):
         from _task_interface import ChipStorageTaskArgs  # noqa: PLC0415
@@ -272,7 +272,7 @@ class TestChipWorkerPython:
                 self.aicpu_dlopen_count = 0
                 self.host_dlopen_count = 0
 
-            def prepare_callable(self, slot, callable_obj):
+            def register_callable(self, slot, callable_obj):
                 self.prepared.append((slot, callable_obj))
 
             def run(self, slot, args, config):
@@ -286,8 +286,8 @@ class TestChipWorkerPython:
         worker._impl = fake
         callable_obj = ChipCallable.build(signature=[], func_name="test", binary=b"\x00", children=[])
 
-        first = worker.prepare_callable(callable_obj)
-        second = worker.prepare_callable(callable_obj)
+        first = worker.register_callable(callable_obj)
+        second = worker.register_callable(callable_obj)
 
         assert isinstance(first, CallableHandle)
         assert not isinstance(first, int)
@@ -309,7 +309,7 @@ class TestChipWorkerPython:
         from simpler.task_interface import ChipWorker  # noqa: PLC0415  # pyright: ignore[reportAttributeAccessIssue]
 
         worker = ChipWorker()
-        with pytest.raises(TypeError, match="CallableHandle returned by ChipWorker.prepare_callable"):
+        with pytest.raises(TypeError, match="CallableHandle returned by ChipWorker.register_callable"):
             worker.run(0, ChipStorageTaskArgs(), CallConfig())
 
 

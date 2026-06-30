@@ -274,7 +274,7 @@ def test_fatal_code_surfaces_on_sim(st_platform, st_device_ids, case_name, monke
         pytest.skip("hang kernel would spin the simulator forever (no STARS watchdog on sim)")
     worker, handle, config = _make_worker(st_platform, int(st_device_ids[0]), case_name, monkeypatch)
     try:
-        with pytest.raises(RuntimeError, match=rf"(run_runtime|run_prepared) failed with code -{case['code']}\b"):
+        with pytest.raises(RuntimeError, match=rf"(run_runtime|run) failed with code -{case['code']}\b"):
             worker.run(handle, ChipStorageTaskArgs(), config)
         captured = capfd.readouterr()
         assert case["marker"] in captured.err + captured.out, f"missing '{case['marker']}' in host log"

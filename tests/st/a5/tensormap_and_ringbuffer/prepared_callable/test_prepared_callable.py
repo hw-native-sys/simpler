@@ -123,8 +123,8 @@ class TestPreparedCallable(SceneTestCase):
         chip_worker = self._chip_worker(worker)
 
         # 1) prepare two private slots with the SAME callable.
-        chip_worker._prepare_callable_at_slot(_SLOT_PRIMARY, callable_obj)
-        chip_worker._prepare_callable_at_slot(_SLOT_SECONDARY, callable_obj)
+        chip_worker._register_callable_at_slot(_SLOT_PRIMARY, callable_obj)
+        chip_worker._register_callable_at_slot(_SLOT_SECONDARY, callable_obj)
 
         # 2) run primary slot twice (second run proves dedup/cache hit)
         for _ in range(2):
@@ -184,7 +184,7 @@ class TestPreparedCallable(SceneTestCase):
         prepared = False
         chip_worker = self._chip_worker(st_worker)
         try:
-            chip_worker._prepare_callable_at_slot(_SLOT_PRIMARY, callable_obj)
+            chip_worker._register_callable_at_slot(_SLOT_PRIMARY, callable_obj)
             prepared = True
             assert st_worker.aicpu_dlopen_count - baseline == 1
             for _ in range(5):
@@ -206,10 +206,10 @@ class TestPreparedCallable(SceneTestCase):
         secondary_prepared = False
         chip_worker = self._chip_worker(st_worker)
         try:
-            chip_worker._prepare_callable_at_slot(_SLOT_PRIMARY, callable_obj)
+            chip_worker._register_callable_at_slot(_SLOT_PRIMARY, callable_obj)
             primary_prepared = True
             assert st_worker.aicpu_dlopen_count - baseline == 1
-            chip_worker._prepare_callable_at_slot(_SLOT_SECONDARY, callable_obj)
+            chip_worker._register_callable_at_slot(_SLOT_SECONDARY, callable_obj)
             secondary_prepared = True
             assert st_worker.aicpu_dlopen_count - baseline == 2
             for _ in range(5):
@@ -232,10 +232,10 @@ class TestPreparedCallable(SceneTestCase):
         prepared = False
         chip_worker = self._chip_worker(st_worker)
         try:
-            chip_worker._prepare_callable_at_slot(_SLOT_PRIMARY, callable_obj)
+            chip_worker._register_callable_at_slot(_SLOT_PRIMARY, callable_obj)
             prepared = True
             with pytest.raises(RuntimeError):
-                chip_worker._prepare_callable_at_slot(_SLOT_PRIMARY, callable_obj)
+                chip_worker._register_callable_at_slot(_SLOT_PRIMARY, callable_obj)
         finally:
             if prepared:
                 chip_worker._unregister_slot(_SLOT_PRIMARY)
@@ -254,7 +254,7 @@ class TestPreparedCallable(SceneTestCase):
         chip_worker = self._chip_worker(st_worker)
 
         with pytest.raises(RuntimeError):
-            chip_worker._prepare_callable_at_slot(_SLOT_PRIMARY, bad_callable)
+            chip_worker._register_callable_at_slot(_SLOT_PRIMARY, bad_callable)
         assert st_worker.aicpu_dlopen_count == baseline
 
         with pytest.raises(RuntimeError):
@@ -276,7 +276,7 @@ class TestPreparedCallable(SceneTestCase):
         prepared = False
         chip_worker = self._chip_worker(st_worker)
         try:
-            chip_worker._prepare_callable_at_slot(_SLOT_PRIMARY, callable_obj)
+            chip_worker._register_callable_at_slot(_SLOT_PRIMARY, callable_obj)
             prepared = True
             assert st_worker.aicpu_dlopen_count - baseline == 1
             self._run_one(st_worker, _SLOT_PRIMARY, config, case)
@@ -287,7 +287,7 @@ class TestPreparedCallable(SceneTestCase):
             assert after_unreg - baseline == 1, (
                 f"unregister must NOT decrement the dlopen counter; baseline={baseline}, after_unreg={after_unreg}"
             )
-            chip_worker._prepare_callable_at_slot(_SLOT_PRIMARY, callable_obj)
+            chip_worker._register_callable_at_slot(_SLOT_PRIMARY, callable_obj)
             prepared = True
             assert st_worker.aicpu_dlopen_count - baseline == 2
             self._run_one(st_worker, _SLOT_PRIMARY, config, case)

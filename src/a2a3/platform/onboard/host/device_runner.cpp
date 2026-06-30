@@ -494,7 +494,7 @@ int DeviceRunner::run(Runtime &runtime, int block_dim, int launch_aicpu_num) {
 }
 
 // `print_handshake_results`, `prepare_orch_so`, `register_callable`,
-// `register_callable_host_orch`, `unregister_callable`, `has_callable`,
+// `record_host_orch_callable`, `unregister_callable`, `has_callable`,
 // `bind_callable_to_runtime`, and `upload_chip_callable_buffer` live on
 // `DeviceRunnerBase`.
 

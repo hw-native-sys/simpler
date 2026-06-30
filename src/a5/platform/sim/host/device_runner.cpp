@@ -179,7 +179,7 @@ int DeviceRunner::ensure_binaries_loaded() {
     return 0;
 }
 
-int DeviceRunner::invoke_aicpu_register_callable(Runtime &runtime) {
+int DeviceRunner::invoke_device_register(Runtime &runtime) {
     if (aicpu_register_callable_func_ == nullptr || set_orch_device_id_func_ == nullptr) {
         LOG_ERROR("Register-callable functions not loaded. Call ensure_binaries_loaded first.");
         return -1;

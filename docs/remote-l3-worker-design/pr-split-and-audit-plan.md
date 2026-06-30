@@ -238,7 +238,7 @@ PR 2: callable identity and run contract.
 Scope:
 
 - Callable descriptors, digest/hashid identity, and target namespaces.
-- `ChipWorker.prepare_callable()` handle semantics.
+- `ChipWorker.register_callable()` handle semantics.
 - `ChipWorker.run()` and `Worker.run()` run contract (return `None`; timing is
   observed out-of-band via `[STRACE]` markers, not a return value).
 - Python import callable descriptors needed by remote registration.

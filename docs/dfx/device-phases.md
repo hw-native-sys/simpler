@@ -9,7 +9,7 @@ generalization to a fixed set of phases, and the design for variable phases.
 
 ## Fixed phases (implemented)
 
-The on-NPU portion of `run_prepared`'s blocking wait subdivides into a **small,
+The on-NPU portion of `simpler_run`'s blocking wait subdivides into a **small,
 closed set** of phases, each of which fires **exactly once per run per AICPU
 thread**. Because the cardinality is fixed, a plain indexed store suffices — no
 ring, no rotation, no recycling. This is the same model the original single
@@ -65,7 +65,7 @@ deep-dive — see [l2-timing.md](l2-timing.md).
 * Host reduces each phase across threads as `max(end) - min(start)` on readback
   (`DeviceRunnerBase::read_device_wall_ns`), caches per-phase ns
   (`last_device_phase_ns`), and emits each non-zero phase as a `clk=dev`
-  `[STRACE]` marker nested under `run_prepared.runner_run.device_wall`
+  `[STRACE]` marker nested under `simpler_run.runner_run.device_wall`
   (see [host-trace.md](host-trace.md)).
 
 ### Gating: `SIMPLER_DEVICE_PROFILING` (host/device split)
@@ -78,12 +78,12 @@ deployment can profile the two domains separately:
   suppresses the whole device-phase emit; any other value (or unset) keeps it on
   (**default on**). It does not affect the on-device stamping cost (cheap plain
   stores) — only whether the host re-emits the readback as markers.
-* **Host** (`run_prepared` / `bind` / `runner_run` / `validate` spans): no new
+* **Host** (`simpler_run` / `bind` / `runner_run` / `validate` spans): no new
   knob — they ride the compile-time `SIMPLER_PROFILING` macro and the log level
   (`LOG_INFO_V9`), so raising the log threshold drops them.
 
 `RunWall` is the whole on-NPU wall (the former `RunTiming.device_wall`); it is
-emitted as the `run_prepared.runner_run.device_wall` marker, not returned.
+emitted as the `simpler_run.runner_run.device_wall` marker, not returned.
 
 ### Reading the phases — they nest and overlap, don't sum them
 

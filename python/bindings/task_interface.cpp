@@ -833,24 +833,24 @@ NB_MODULE(_task_interface, m) {
         )
         .def("finalize", &ChipWorker::finalize)
         .def(
-            "prepare_callable",
+            "register_callable",
             [](ChipWorker &self, int32_t callable_id, const PyChipCallable &callable) {
-                self.prepare_callable(callable_id, callable.buffer_.data());
+                self.register_callable(callable_id, callable.buffer_.data());
             },
             nb::arg("callable_id"), nb::arg("callable"),
             "Stage a ChipCallable under callable_id for cheap repeated launches "
             "via run. Variants without per-callable_id support raise."
         )
         .def(
-            "prepare_callable_from_blob",
+            "register_callable_from_blob",
             [](ChipWorker &self, int32_t callable_id, uint64_t blob_ptr) {
-                self.prepare_callable(callable_id, reinterpret_cast<const void *>(blob_ptr));
+                self.register_callable(callable_id, reinterpret_cast<const void *>(blob_ptr));
             },
             nb::arg("callable_id"), nb::arg("blob_ptr"),
             "Stage a ChipCallable from a raw contiguous-buffer pointer (used by "
             "post-fork dynamic register handlers that receive the ChipCallable "
             "bytes via shared memory; see docs/callable-identity-registration.md). "
-            "Equivalent to prepare_callable(callable_id, ChipCallable) but accepts the "
+            "Equivalent to register_callable(callable_id, ChipCallable) but accepts the "
             "ChipCallable layout pointer directly so chip-child loops can prepare "
             "from shm without rebuilding a PyChipCallable wrapper."
         )
@@ -860,7 +860,7 @@ NB_MODULE(_task_interface, m) {
                 self.run(callable_id, &args, config);
             },
             nb::arg("callable_id"), nb::arg("args"), nb::arg("config"),
-            "Launch a callable_id previously staged via prepare_callable. Returns "
+            "Launch a callable_id previously staged via register_callable. Returns "
             "None; per-stage timing is emitted as `[STRACE]` log markers."
         )
         .def(
@@ -874,7 +874,7 @@ NB_MODULE(_task_interface, m) {
             "Returns None; timing is emitted as `[STRACE]` log markers."
         )
         .def(
-            "run_prepared_from_blob",
+            "run_from_blob",
             [](ChipWorker &self, int32_t callable_id, uint64_t args_blob_ptr, size_t blob_capacity,
                const CallConfig &config) {
                 // The mailbox region is the on-wire format `write_blob` produced;
@@ -909,11 +909,11 @@ NB_MODULE(_task_interface, m) {
             "Number of distinct callable entries the AICPU has dlopened for on the "
             "bound device. Equals 0 when not initialized or the runtime "
             "variant lacks prepared-callable registration. Tests assert this to verify "
-            "prepare_callable + repeated run do not redundantly dlopen."
+            "register_callable + repeated run do not redundantly dlopen."
         )
         .def_prop_ro(
             "host_dlopen_count", &ChipWorker::host_dlopen_count,
-            "Number of host-side dlopens triggered by prepare_callable on "
+            "Number of host-side dlopens triggered by register_callable on "
             "host_build_graph variants. Mirrors aicpu_dlopen_count for the "
             "host-orchestration path; 0 on device-orch variants."
         )

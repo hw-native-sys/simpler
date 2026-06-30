@@ -24,7 +24,7 @@
  *   - sizing:       get_runtime_size
  *   - device-mem:   device_malloc_ctx, device_free_ctx,
  *                   copy_to_device_ctx, copy_from_device_ctx
- *   - prepared run: prepare_callable, run_prepared, unregister_callable,
+ *   - prepared run: simpler_register_callable, simpler_run, unregister_callable,
  *                   get_aicpu_dlopen_count, get_host_dlopen_count
  *   - L3-L2 orch:   l3_l2_orch_comm_init_ctx,
  *                   l3_l2_orch_comm_shutdown_ctx
@@ -34,7 +34,7 @@
  *                   comm_get_window_size, comm_barrier, comm_destroy
  *
  * Memory management: caller allocates a buffer of get_runtime_size() bytes
- * and passes it to run_prepared(). Error codes: 0 = success, negative = error.
+ * and passes it to simpler_run(). Error codes: 0 = success, negative = error.
  */
 
 #ifndef SRC_COMMON_WORKER_PTO_RUNTIME_C_API_H_
@@ -110,8 +110,8 @@ int copy_from_device_ctx(DeviceContextHandle ctx, void *host_ptr, const void *de
  *      can re-attach their own caller threads idempotently.
  *
  *   3. Take ownership of the AICPU + AICore executor binaries (copied into
- *      DeviceRunner-owned vectors). All subsequent prepare_callable /
- *      run_prepared invocations reuse this resident pair — no binary bytes
+ *      DeviceRunner-owned vectors). All subsequent simpler_register_callable /
+ *      simpler_run invocations reuse this resident pair — no binary bytes
  *      cross the C ABI on per-run paths.
  *
  * Returns 0 on success, negative on attach failure.
@@ -140,7 +140,7 @@ int l3_l2_orch_comm_shutdown_ctx(DeviceContextHandle ctx);
  * Per-callable_id preparation
  *
  * The triplet below decouples the one-shot prep work (kernel upload + orch SO
- * H2D + caching keyed by `callable_id`) from each `run_prepared` invocation,
+ * H2D + caching keyed by `callable_id`) from each `simpler_run` invocation,
  * so the per-run cost shrinks to "rebuild Runtime args + launch". Callers
  * keep a stable small-int `callable_id` per ChipCallable; the platform side
  * caches the prepared state in a fixed-size table (cap 64, see
@@ -158,7 +158,7 @@ int l3_l2_orch_comm_shutdown_ctx(DeviceContextHandle ctx);
  * ELF Build-ID hash (so two callable_ids with identical SO share one buffer),
  * and prewarms device-orchestration callables by loading their AICPU-side SO
  * table entry before the first real task. Subsequent
- * `run_prepared(callable_id, ...)` calls reuse this state.
+ * `simpler_run(callable_id, ...)` calls reuse this state.
  *
  * `device_id` and the executor binaries are not threaded through this entry
  * — they were captured by `simpler_init` and live on the DeviceRunner.
@@ -166,10 +166,10 @@ int l3_l2_orch_comm_shutdown_ctx(DeviceContextHandle ctx);
  * @return 0 on success, negative on error (NULL ctx, callable_id out of
  *         range, upload/copy failure, or AICPU prewarm failure).
  */
-int prepare_callable(DeviceContextHandle ctx, int32_t callable_id, const void *callable);
+int simpler_register_callable(DeviceContextHandle ctx, int32_t callable_id, const void *callable);
 
 /**
- * Launch a callable previously staged via `prepare_callable`.
+ * Launch a callable previously staged via `simpler_register_callable`.
  *
  * Looks up the prepared state by `callable_id`, restores the kernel func_id ↔
  * dev_addr table onto a fresh Runtime, and dispatches without re-uploading
@@ -195,7 +195,7 @@ int prepare_callable(DeviceContextHandle ctx, int32_t callable_id, const void *c
  *
  * @return 0 on success, negative on error (no prep state, NULL ctx, etc.).
  */
-int run_prepared(
+int simpler_run(
     DeviceContextHandle ctx, RuntimeHandle runtime, int32_t callable_id, const void *args, int block_dim,
     int aicpu_thread_num, int enable_l2_swimlane, int enable_dump_tensor, int enable_pmu, int enable_dep_gen,
     int enable_scope_stats, const uint64_t *ring_task_window, const uint64_t *ring_heap, const uint64_t *ring_dep_pool,
@@ -208,7 +208,7 @@ int run_prepared(
  * hash-keyed refcount drops to zero (different callable_ids with identical
  * SO share one allocation).
  *
- * Kernel binaries uploaded by `prepare_callable` remain resident — they are
+ * Kernel binaries uploaded by `simpler_register_callable` remain resident — they are
  * shared across callables by func_id and only released by `finalize_device`.
  *
  * AICPU-side dlopen state in `orch_so_table_[callable_id]` is NOT released by
@@ -219,18 +219,18 @@ int run_prepared(
  *
  * @return 0 on success or if callable_id was not registered, negative on error.
  */
-int unregister_callable(DeviceContextHandle ctx, int32_t callable_id);
+int simpler_unregister_callable(DeviceContextHandle ctx, int32_t callable_id);
 
 /**
  * Number of distinct callable_ids the AICPU has been asked to dlopen for on
  * the device bound to `ctx`. Returns 0 on runtime variants without per-cid
- * registration support. Used by tests to assert that `prepare_callable` +
- * repeated `run_prepared` calls do not trigger redundant AICPU dlopens.
+ * registration support. Used by tests to assert that `simpler_register_callable` +
+ * repeated `simpler_run` calls do not trigger redundant AICPU dlopens.
  */
 size_t get_aicpu_dlopen_count(DeviceContextHandle ctx);
 
 /**
- * Number of host-side dlopens triggered by `prepare_callable` on the host
+ * Number of host-side dlopens triggered by `simpler_register_callable` on the host
  * orchestration variants (host_build_graph). Mirrors `get_aicpu_dlopen_count`
  * for the trb path. Returns 0 on runtime variants whose orchestration runs on
  * the device.

@@ -364,7 +364,7 @@ int DeviceRunnerBase::ensure_device_initialized() {
 int DeviceRunnerBase::ensure_aicpu_init_launched() {
     // Per-device one-shot: latch the invariants (orch device id, log config)
     // into the resident AICPU SO globals via simpler_aicpu_init, so exec /
-    // register_callable launches no longer carry them. The inner SO stays
+    // record_device_orch_callable launches no longer carry them. The inner SO stays
     // dlopen'd across launches, so a single init holds for the runner's life.
     if (aicpu_init_launched_) {
         return 0;
@@ -584,7 +584,7 @@ uint64_t DeviceRunnerBase::upload_chip_callable_buffer(const ChipCallable *calla
 
 int DeviceRunnerBase::stamp_orch_so(Runtime &runtime, int32_t cid, bool force_reload) {
     // Registered-callable flow only: the SO bytes were already H2D'd at
-    // register_callable time. Stamp dev_orch_so on the runtime and mark
+    // record_device_orch_callable time. Stamp dev_orch_so on the runtime and mark
     // `is_new` based on whether the AICPU has committed a successful load
     // for this cid since registration.
     if (cid < 0) {
@@ -626,10 +626,10 @@ int DeviceRunnerBase::prepare_orch_so(Runtime &runtime) {
     return stamp_orch_so(runtime, cid, /*force_reload=*/false);
 }
 
-int DeviceRunnerBase::commit_aicpu_callable_load(int32_t cid) {
+int DeviceRunnerBase::commit_device_register(int32_t cid) {
     auto it = callables_.find(cid);
     if (it == callables_.end()) {
-        LOG_ERROR("commit_aicpu_callable_load: callable_id=%d not registered", cid);
+        LOG_ERROR("commit_device_register: callable_id=%d not registered", cid);
         return -1;
     }
     const auto &state = it->second;
@@ -644,10 +644,10 @@ int DeviceRunnerBase::commit_aicpu_callable_load(int32_t cid) {
     return 0;
 }
 
-int DeviceRunnerBase::aicpu_register_callable(int32_t callable_id) {
+int DeviceRunnerBase::launch_device_register(int32_t callable_id) {
     auto it = callables_.find(callable_id);
     if (it == callables_.end()) {
-        LOG_ERROR("aicpu_register_callable: callable_id=%d not registered", callable_id);
+        LOG_ERROR("launch_device_register: callable_id=%d not registered", callable_id);
         return -1;
     }
     if (it->second.host_dlopen_handle != nullptr) {
@@ -656,7 +656,7 @@ int DeviceRunnerBase::aicpu_register_callable(int32_t callable_id) {
 
     int rc = ensure_device_initialized();
     if (rc != 0) {
-        LOG_ERROR("aicpu_register_callable: ensure_device_initialized failed: %d", rc);
+        LOG_ERROR("launch_device_register: ensure_device_initialized failed: %d", rc);
         return rc;
     }
 
@@ -678,27 +678,27 @@ int DeviceRunnerBase::aicpu_register_callable(int32_t callable_id) {
         stream_aicpu_, &reg_args, sizeof(reg_args), host::KernelNames::RegisterCallableName, /*aicpu_num=*/1
     );
     if (rc != 0) {
-        LOG_ERROR("aicpu_register_callable: launch_aicpu_payload failed: %d", rc);
+        LOG_ERROR("launch_device_register: launch_aicpu_payload failed: %d", rc);
         return rc;
     }
 
     rc = aclrtSynchronizeStreamWithTimeout(stream_aicpu_, PLATFORM_STREAM_SYNC_TIMEOUT_MS);
     if (rc == ACL_ERROR_RT_STREAM_SYNC_TIMEOUT) {
         LOG_ERROR(
-            "aicpu_register_callable: stream sync timeout timeout_ms=%d device_id=%d", PLATFORM_STREAM_SYNC_TIMEOUT_MS,
+            "launch_device_register: stream sync timeout timeout_ms=%d device_id=%d", PLATFORM_STREAM_SYNC_TIMEOUT_MS,
             device_id_
         );
         return rc;
     }
     if (rc != 0) {
-        LOG_ERROR("aicpu_register_callable: aclrtSynchronizeStreamWithTimeout failed: %d", rc);
+        LOG_ERROR("launch_device_register: aclrtSynchronizeStreamWithTimeout failed: %d", rc);
         return rc;
     }
 
-    return commit_aicpu_callable_load(callable_id);
+    return commit_device_register(callable_id);
 }
 
-int DeviceRunnerBase::register_callable(
+int DeviceRunnerBase::record_device_orch_callable(
     int32_t callable_id, const void *orch_so_data, size_t orch_so_size, const char *func_name, const char *config_name,
     std::vector<std::pair<int, uint64_t>> kernel_addrs, std::vector<ArgDirection> signature
 ) {
@@ -707,15 +707,17 @@ int DeviceRunnerBase::register_callable(
     // it by callable_id; rejecting an out-of-range id here keeps the host and
     // AICPU sides in sync and avoids an OOB access at run time.
     if (callable_id < 0 || callable_id >= MAX_REGISTERED_CALLABLE_IDS) {
-        LOG_ERROR("register_callable: callable_id=%d out of range [0, %d)", callable_id, MAX_REGISTERED_CALLABLE_IDS);
+        LOG_ERROR(
+            "record_device_orch_callable: callable_id=%d out of range [0, %d)", callable_id, MAX_REGISTERED_CALLABLE_IDS
+        );
         return -1;
     }
     if (orch_so_data == nullptr || orch_so_size == 0) {
-        LOG_ERROR("register_callable: empty orch SO for callable_id=%d", callable_id);
+        LOG_ERROR("record_device_orch_callable: empty orch SO for callable_id=%d", callable_id);
         return -1;
     }
     if (callables_.count(callable_id) != 0) {
-        LOG_ERROR("register_callable: callable_id=%d already registered", callable_id);
+        LOG_ERROR("record_device_orch_callable: callable_id=%d already registered", callable_id);
         return -1;
     }
 
@@ -729,12 +731,12 @@ int DeviceRunnerBase::register_callable(
     if (buf_it == orch_so_dedup_.end()) {
         void *buf = mem_alloc_.alloc(orch_so_size);
         if (buf == nullptr) {
-            LOG_ERROR("register_callable: alloc %zu bytes failed", orch_so_size);
+            LOG_ERROR("record_device_orch_callable: alloc %zu bytes failed", orch_so_size);
             return -1;
         }
         int rc = rtMemcpy(buf, orch_so_size, orch_so_data, orch_so_size, RT_MEMCPY_HOST_TO_DEVICE);
         if (rc != 0) {
-            LOG_ERROR("register_callable: rtMemcpy failed: %d", rc);
+            LOG_ERROR("record_device_orch_callable: rtMemcpy failed: %d", rc);
             mem_alloc_.free(buf);
             return rc;
         }
@@ -744,11 +746,13 @@ int DeviceRunnerBase::register_callable(
         entry.refcount = 1;
         orch_so_dedup_.emplace(hash, entry);
         dev_addr = reinterpret_cast<uint64_t>(buf);
-        LOG_INFO_V0("register_callable: hash=0x%lx new buffer %zu bytes", hash, orch_so_size);
+        LOG_INFO_V0("record_device_orch_callable: hash=0x%lx new buffer %zu bytes", hash, orch_so_size);
     } else {
         buf_it->second.refcount++;
         dev_addr = reinterpret_cast<uint64_t>(buf_it->second.dev_addr);
-        LOG_INFO_V0("register_callable: hash=0x%lx shared buffer (refcount=%d)", hash, buf_it->second.refcount);
+        LOG_INFO_V0(
+            "record_device_orch_callable: hash=0x%lx shared buffer (refcount=%d)", hash, buf_it->second.refcount
+        );
     }
 
     CallableState state;
@@ -763,22 +767,22 @@ int DeviceRunnerBase::register_callable(
     return 0;
 }
 
-int DeviceRunnerBase::register_callable_host_orch(
+int DeviceRunnerBase::record_host_orch_callable(
     int32_t callable_id, void *host_dlopen_handle, void *host_orch_func_ptr,
     std::vector<std::pair<int, uint64_t>> kernel_addrs, std::vector<ArgDirection> signature
 ) {
     if (callable_id < 0 || callable_id >= MAX_REGISTERED_CALLABLE_IDS) {
         LOG_ERROR(
-            "register_callable_host_orch: callable_id=%d out of range [0, %d)", callable_id, MAX_REGISTERED_CALLABLE_IDS
+            "record_host_orch_callable: callable_id=%d out of range [0, %d)", callable_id, MAX_REGISTERED_CALLABLE_IDS
         );
         return -1;
     }
     if (host_dlopen_handle == nullptr || host_orch_func_ptr == nullptr) {
-        LOG_ERROR("register_callable_host_orch: null handle/fn for callable_id=%d", callable_id);
+        LOG_ERROR("record_host_orch_callable: null handle/fn for callable_id=%d", callable_id);
         return -1;
     }
     if (callables_.count(callable_id) != 0) {
-        LOG_ERROR("register_callable_host_orch: callable_id=%d already registered", callable_id);
+        LOG_ERROR("record_host_orch_callable: callable_id=%d already registered", callable_id);
         return -1;
     }
 
@@ -789,7 +793,7 @@ int DeviceRunnerBase::register_callable_host_orch(
     state.signature = std::move(signature);
     callables_.emplace(callable_id, std::move(state));
     ++host_dlopen_total_;
-    LOG_INFO_V0("register_callable_host_orch: cid=%d (host dlopen #%zu)", callable_id, host_dlopen_total_);
+    LOG_INFO_V0("record_host_orch_callable: cid=%d (host dlopen #%zu)", callable_id, host_dlopen_total_);
     return 0;
 }
 

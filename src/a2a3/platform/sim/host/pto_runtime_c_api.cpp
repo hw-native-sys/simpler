@@ -11,7 +11,7 @@
 /**
  * PTO Runtime C API — a2a3 sim arch-specific entries.
  *
- * The shared c_api glue (simpler_init / prepare_callable / run_prepared /
+ * The shared c_api glue (simpler_init / simpler_register_callable / simpler_run /
  * device_*_ctx / etc.) lives in `src/common/platform/sim/host/c_api_shared.cpp`
  * and is linked into this same libhost_runtime.so. This file keeps only the
  * entries that need the concrete a2a3 sim `DeviceRunner` subclass

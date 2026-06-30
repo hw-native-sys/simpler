@@ -929,7 +929,7 @@ class ChipWorker:
 
         worker = ChipWorker()
         worker.init(device_id=0, bins=bins)
-        handle = worker.prepare_callable(chip_callable)
+        handle = worker.register_callable(chip_callable)
         worker.run(handle, args=orch_args, config=CallConfig())  # block_dim defaults to 0 = auto
         worker.unregister_callable(handle)
         worker.finalize()
@@ -1012,7 +1012,7 @@ class ChipWorker:
             int(device_id),
         )
         for slot_id, callable_obj in list(self._callable_registry.items()):
-            self._impl.prepare_callable(int(slot_id), callable_obj)
+            self._impl.register_callable(int(slot_id), callable_obj)
 
     def finalize(self):
         """Tear down everything: device resources and runtime library.
@@ -1030,7 +1030,7 @@ class ChipWorker:
             if slot_id not in self._callable_registry:
                 return slot_id
         raise RuntimeError(
-            "ChipWorker.prepare_callable: callable capacity exhausted "
+            "ChipWorker.register_callable: callable capacity exhausted "
             f"(MAX_REGISTERED_CALLABLE_IDS={MAX_REGISTERED_CALLABLE_IDS})"
         )
 
@@ -1063,7 +1063,7 @@ class ChipWorker:
         from .callable_identity import CallableHandle  # noqa: PLC0415
 
         if not isinstance(handle, CallableHandle):
-            raise TypeError("ChipWorker.run expects a CallableHandle returned by ChipWorker.prepare_callable")
+            raise TypeError("ChipWorker.run expects a CallableHandle returned by ChipWorker.register_callable")
         if handle._owner_id != self._owner_id:
             raise KeyError(f"CallableHandle {handle.hashid} does not belong to this ChipWorker")
         digest = self._live_handles.get(handle._handle_id)
@@ -1084,14 +1084,14 @@ class ChipWorker:
         with self._registry_lock:
             return self._resolve_handle_locked(handle)
 
-    def prepare_callable(self, callable):
+    def register_callable(self, callable):
         """Prepare a ``ChipCallable`` and return an opaque handle.
 
         The runtime still uses an integer slot internally, but the caller never
         chooses or observes it.
         """
         if not isinstance(callable, ChipCallable):
-            raise TypeError("ChipWorker.prepare_callable only supports ChipCallable targets")
+            raise TypeError("ChipWorker.register_callable only supports ChipCallable targets")
         from .callable_identity import (  # noqa: PLC0415
             _CallableIdentityState,
             build_chip_callable_descriptor,
@@ -1127,7 +1127,7 @@ class ChipWorker:
 
         if self.initialized:
             try:
-                self._impl.prepare_callable(int(slot_id), callable)
+                self._impl.register_callable(int(slot_id), callable)
             except Exception:
                 with self._registry_lock:
                     self._rollback_handle_locked(handle)
@@ -1135,10 +1135,10 @@ class ChipWorker:
         return handle
 
     def run(self, handle, args, config=None, **kwargs):
-        """Launch a callable previously returned by ``prepare_callable``.
+        """Launch a callable previously returned by ``register_callable``.
 
         Args:
-            handle: ``CallableHandle`` returned by ``prepare_callable``.
+            handle: ``CallableHandle`` returned by ``register_callable``.
             args: ChipStorageTaskArgs for this invocation.
             config: Optional CallConfig. If None, a default is created.
             **kwargs: Overrides applied to config (e.g. ``block_dim=8`` to
@@ -1168,8 +1168,8 @@ class ChipWorker:
         if self.initialized:
             self._impl.unregister_callable(int(slot_id))
 
-    def _prepare_callable_at_slot(self, callable_id, callable):
-        self._impl.prepare_callable(int(callable_id), callable)
+    def _register_callable_at_slot(self, callable_id, callable):
+        self._impl.register_callable(int(callable_id), callable)
 
     def _run_slot(self, callable_id, args, config=None, **kwargs):
         if config is None:

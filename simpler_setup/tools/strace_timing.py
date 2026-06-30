@@ -14,7 +14,7 @@ markers in ``src/common/log/include/common/strace.h``), gated by the
 compile-time ``SIMPLER_PROFILING`` macro (on by default) and emitted at
 ``LOG_INFO_V9``. Device-domain phases (AICPU subdivision of the on-NPU wall)
 are emitted by the host after readback as ``clk=dev`` spans nested under
-``run_prepared.runner_run.device_wall``.
+``simpler_run.runner_run.device_wall``.
 
 Marker grammar (matched anywhere on the line, so the CANN/host log prefix is
 ignored)::
@@ -22,7 +22,7 @@ ignored)::
     [STRACE] v=1 pid=<n> tid=<n> inv=<n> hid=<hex> depth=<n> name=<dotted> ts=<ns> dur=<ns> [k=v ...]
 
 Grouping:
-    * ``(pid, inv)`` identifies one ``run_prepared`` invocation — all its spans
+    * ``(pid, inv)`` identifies one ``simpler_run`` invocation — all its spans
       share these. ``inv`` is a process-wide id (atomic-allocated, so unique even
       across concurrent calls), NOT a token index.
     * ``hid`` is the callable's content hash (stable across slot reuse / runs).
@@ -32,7 +32,7 @@ Grouping:
       guessing): a span at depth d is a child of the most recent span at d-1.
 
 Outputs:
-    * a per-callable TPOT table (each invocation's run_prepared dur + the mean
+    * a per-callable TPOT table (each invocation's simpler_run dur + the mean
       of each sub-stage across invocations), and
     * optionally a Chrome-trace / Perfetto JSON (``--trace-out``): one ``ph:"X"``
       event per span, lane = pid, so the host call tree renders as nested
@@ -74,7 +74,7 @@ class Span:
 
 @dataclass
 class Invocation:
-    """All spans emitted by one run_prepared call (one (pid, inv) group)."""
+    """All spans emitted by one simpler_run call (one (pid, inv) group)."""
 
     pid: int
     inv: int
@@ -82,7 +82,7 @@ class Invocation:
     spans: list = field(default_factory=list)
 
     def root(self):
-        """The depth-0 span (run_prepared), or None if absent."""
+        """The depth-0 span (simpler_run), or None if absent."""
         for s in self.spans:
             if s.depth == 0:
                 return s
@@ -165,7 +165,7 @@ def print_tpot_table(buckets, label_for_hid=None, stream=sys.stdout):
         durs = [r.dur for r in roots]
         if durs:
             print(
-                f"  run_prepared: mean={_fmt_us(int(_mean(durs)))}us "
+                f"  simpler_run: mean={_fmt_us(int(_mean(durs)))}us "
                 f"min={_fmt_us(min(durs))}us max={_fmt_us(max(durs))}us",
                 file=stream,
             )
@@ -185,10 +185,10 @@ def print_tpot_table(buckets, label_for_hid=None, stream=sys.stdout):
 
 
 _ROUNDS_TABLE_NAMES = {
-    "host": "run_prepared",
-    "device": "run_prepared.runner_run.device_wall",
-    "orch": "run_prepared.runner_run.device_wall.orch",
-    "sched": "run_prepared.runner_run.device_wall.sched",
+    "host": "simpler_run",
+    "device": "simpler_run.runner_run.device_wall",
+    "orch": "simpler_run.runner_run.device_wall.orch",
+    "sched": "simpler_run.runner_run.device_wall.sched",
 }
 
 # Per-round table columns, in print order. "Effective" is the orch∪sched merged
@@ -366,7 +366,7 @@ def to_chrome_trace(invocations, buckets=None):
 
 def _print_inv_tree(inv, stream=sys.stdout):
     """Print one invocation's spans as a nested tree built from the dotted span
-    names (so e.g. ``run_prepared.bind.args`` nests under ``run_prepared.bind``),
+    names (so e.g. ``simpler_run.bind.args`` nests under ``simpler_run.bind``),
     NOT from depth+ts — host (steady_clock) and device (``clk=dev``) spans live
     on different clocks, so timestamp containment across domains is meaningless;
     the dotted name is the unambiguous parent link. Siblings are ordered by

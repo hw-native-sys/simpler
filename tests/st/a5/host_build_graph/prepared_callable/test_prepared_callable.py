@@ -126,8 +126,8 @@ class TestPreparedCallableHbgA5(SceneTestCase):
         config = self._build_config(config_dict)
         chip_worker = self._chip_worker(worker)
 
-        chip_worker._prepare_callable_at_slot(_SLOT_PRIMARY, callable_obj)
-        chip_worker._prepare_callable_at_slot(_SLOT_SECONDARY, callable_obj)
+        chip_worker._register_callable_at_slot(_SLOT_PRIMARY, callable_obj)
+        chip_worker._register_callable_at_slot(_SLOT_SECONDARY, callable_obj)
 
         for _ in range(2):
             test_args = self.generate_args(params)
@@ -172,7 +172,7 @@ class TestPreparedCallableHbgA5(SceneTestCase):
         prepared = False
         chip_worker = self._chip_worker(st_worker)
         try:
-            chip_worker._prepare_callable_at_slot(_SLOT_PRIMARY, callable_obj)
+            chip_worker._register_callable_at_slot(_SLOT_PRIMARY, callable_obj)
             prepared = True
             for _ in range(5):
                 self._run_one(st_worker, _SLOT_PRIMARY, config, case)
@@ -190,9 +190,9 @@ class TestPreparedCallableHbgA5(SceneTestCase):
         secondary_prepared = False
         chip_worker = self._chip_worker(st_worker)
         try:
-            chip_worker._prepare_callable_at_slot(_SLOT_PRIMARY, callable_obj)
+            chip_worker._register_callable_at_slot(_SLOT_PRIMARY, callable_obj)
             primary_prepared = True
-            chip_worker._prepare_callable_at_slot(_SLOT_SECONDARY, callable_obj)
+            chip_worker._register_callable_at_slot(_SLOT_SECONDARY, callable_obj)
             secondary_prepared = True
             for _ in range(5):
                 self._run_one(st_worker, _SLOT_PRIMARY, config, case)
@@ -210,10 +210,10 @@ class TestPreparedCallableHbgA5(SceneTestCase):
         prepared = False
         chip_worker = self._chip_worker(st_worker)
         try:
-            chip_worker._prepare_callable_at_slot(_SLOT_PRIMARY, callable_obj)
+            chip_worker._register_callable_at_slot(_SLOT_PRIMARY, callable_obj)
             prepared = True
             with pytest.raises(RuntimeError):
-                chip_worker._prepare_callable_at_slot(_SLOT_PRIMARY, callable_obj)
+                chip_worker._register_callable_at_slot(_SLOT_PRIMARY, callable_obj)
         finally:
             if prepared:
                 chip_worker._unregister_slot(_SLOT_PRIMARY)
@@ -228,14 +228,14 @@ class TestPreparedCallableHbgA5(SceneTestCase):
         prepared = False
         chip_worker = self._chip_worker(st_worker)
         try:
-            chip_worker._prepare_callable_at_slot(_SLOT_PRIMARY, callable_obj)
+            chip_worker._register_callable_at_slot(_SLOT_PRIMARY, callable_obj)
             prepared = True
             after_first_maps = _count_live_orch_so_mappings()
             assert st_worker.host_dlopen_count - baseline_count == 1
             assert after_first_maps == baseline_maps + 1
 
             with pytest.raises(RuntimeError):
-                chip_worker._prepare_callable_at_slot(_SLOT_PRIMARY, callable_obj)
+                chip_worker._register_callable_at_slot(_SLOT_PRIMARY, callable_obj)
 
             assert st_worker.host_dlopen_count - baseline_count == 1
             assert _count_live_orch_so_mappings() == after_first_maps
@@ -251,14 +251,14 @@ class TestPreparedCallableHbgA5(SceneTestCase):
         prepared = False
         chip_worker = self._chip_worker(st_worker)
         try:
-            chip_worker._prepare_callable_at_slot(_SLOT_PRIMARY, callable_obj)
+            chip_worker._register_callable_at_slot(_SLOT_PRIMARY, callable_obj)
             prepared = True
             self._run_one(st_worker, _SLOT_PRIMARY, config, case)
             assert st_worker.host_dlopen_count - baseline == 1
             chip_worker._unregister_slot(_SLOT_PRIMARY)
             prepared = False
             assert st_worker.host_dlopen_count - baseline == 1, "unregister must NOT decrement the host dlopen counter"
-            chip_worker._prepare_callable_at_slot(_SLOT_PRIMARY, callable_obj)
+            chip_worker._register_callable_at_slot(_SLOT_PRIMARY, callable_obj)
             prepared = True
             self._run_one(st_worker, _SLOT_PRIMARY, config, case)
             assert st_worker.host_dlopen_count - baseline == 2

@@ -207,7 +207,7 @@ public:
      * across threads as max(end) - min(start). Returns 0 for a phase that was
      * never stamped (e.g. a platform whose AICPU does not emit that phase).
      * AicpuPhase::RunWall aliases last_device_wall_ns(). Used by the host to
-     * emit device-phase trace markers; see run_prepared in c_api_shared.
+     * emit device-phase trace markers; see simpler_run in c_api_shared.
      */
     uint64_t last_device_phase_ns(AicpuPhase phase) const { return device_phase_ns_[static_cast<int>(phase)]; }
 
@@ -267,22 +267,22 @@ public:
      *                      without re-uploading.
      * @return 0 on success, negative on failure.
      */
-    int register_callable(
+    int record_device_orch_callable(
         int32_t callable_id, const void *orch_so_data, size_t orch_so_size, const char *func_name,
         const char *config_name, std::vector<std::pair<int, uint64_t>> kernel_addrs, std::vector<ArgDirection> signature
     );
 
     /**
-     * Host-orchestration variant of register_callable: stores a dlopen
+     * Host-orchestration variant of record_device_orch_callable: stores a dlopen
      * handle + entry-symbol pointer that runtime_maker resolved on the
      * host (host_build_graph variant). Mutually exclusive with the
      * trb-shaped overload — exactly one is invoked for a given
      * callable_id, picked by the C ABI based on which staging fields
-     * the runtime carries after prepare_callable_impl. dlopen handle
+     * the runtime carries after register_callable_impl. dlopen handle
      * is owned by `DeviceRunnerBase` from this call onward and
      * dlclose'd by `unregister_callable`. Increments `host_dlopen_total_`.
      */
-    int register_callable_host_orch(
+    int record_host_orch_callable(
         int32_t callable_id, void *host_dlopen_handle, void *host_orch_func_ptr,
         std::vector<std::pair<int, uint64_t>> kernel_addrs, std::vector<ArgDirection> signature
     );
@@ -300,15 +300,15 @@ public:
 
     /**
      * True iff `callable_id` has registered state staged via
-     * `register_callable*`. Lets the c_api layer reject `run_prepared`
-     * calls without a matching `prepare_callable`.
+     * `record_device_orch_callable*`. Lets the c_api layer reject `simpler_run`
+     * calls without a matching `simpler_register_callable`.
      */
     bool has_callable(int32_t callable_id) const;
 
     /**
      * Content-derived stable identity for a registered callable: the
      * ELF Build-ID 64-bit hash of its orchestration SO (CallableState::hash,
-     * computed at register_callable time via elf_build_id_64). Returns 0 when
+     * computed at record_device_orch_callable time via elf_build_id_64). Returns 0 when
      * the callable_id is not registered.
      *
      * Stable across slot reuse (unlike callable_id, which is a recyclable
@@ -340,7 +340,7 @@ public:
 
     /**
      * Number of host-side dlopen() invocations triggered by
-     * `register_callable_host_orch`. Mirrors `aicpu_dlopen_count` but
+     * `record_host_orch_callable`. Mirrors `aicpu_dlopen_count` but
      * counts the host_build_graph variant's host-side dlopens; it
      * never decrements.
      */
@@ -348,20 +348,20 @@ public:
 
     /**
      * Device-orchestration callable registration used internally by
-     * prepare_callable(): launches `simpler_aicpu_register_callable` with a
+     * simpler_register_callable(): launches `simpler_aicpu_register_callable` with a
      * RegisterCallableArgs descriptor so the AICPU (re)dlopens the callable's
      * orch SO. Host-orchestration callables are a no-op. On success, AICPU has
      * populated orch_so_table_[callable_id] and first run can advertise
      * register_new_callable_id_=false.
      */
-    int aicpu_register_callable(int32_t callable_id);
+    int launch_device_register(int32_t callable_id);
 
     /**
      * Commit host-side AICPU seen/counting state after a device-side SO load
      * has returned success. Calling this before the device helper succeeds can
      * make a later run advertise a false cache hit.
      */
-    int commit_aicpu_callable_load(int32_t callable_id);
+    int commit_device_register(int32_t callable_id);
 
     // ---- Virtual entry points called by the shared c_api ----------------
     //
@@ -389,7 +389,7 @@ public:
     virtual int finalize() = 0;
 
     /**
-     * dep_gen enablement setter. The shared c_api `run_prepared` calls this
+     * dep_gen enablement setter. The shared c_api `simpler_run` calls this
      * unconditionally; a2a3 and a5 override it to capture submit_task inputs.
      * The base default is a no-op for any arch that does not implement dep_gen.
      */
@@ -680,7 +680,7 @@ protected:
     /**
      * Stamp registered callable metadata onto a Runtime without committing
      * host seen/counting state. The device-side load must complete before
-     * commit_aicpu_callable_load() is called.
+     * commit_device_register() is called.
      *
      * @param runtime  Runtime whose device-SO metadata will be rewritten.
      * @return 0 on success, non-zero on failure.
@@ -739,7 +739,7 @@ protected:
     // re-registered. Exposed via `aicpu_dlopen_count()` for tests.
     size_t aicpu_dlopen_total_{0};
     // Monotonic count of host-side dlopens triggered (incremented on
-    // every `register_callable_host_orch` call; never decremented).
+    // every `record_host_orch_callable` call; never decremented).
     // Same re-register semantics as `aicpu_dlopen_total_`, but for hbg
     // variants.
     size_t host_dlopen_total_{0};
