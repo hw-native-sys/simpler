@@ -12,6 +12,7 @@
 #define SCHEDULER_CONTEXT_H
 
 #include "aicpu/platform_regs.h"
+#include "aicpu/l2_swimlane_collector_aicpu.h"
 #include "common/l2_swimlane_profiling.h"
 #include "scheduler/scheduler_types.h"
 
@@ -95,6 +96,24 @@ public:
         aicpu_thread_num_ = aicpu_thread_num;
         sched_thread_num_ = sched_thread_num;
         regs_ = regs_base;
+
+        // Initialize l2-swimlane buffers BEFORE handshake_all_cores so the
+        // AICore-side rotation table slots are populated when AICore reads
+        // them post-handshake. AICore stashes &rotation_table[block_idx] at
+        // entry; the slot CONTENTS (the actual record buffer pointer it later
+        // dereferences) are written here. handshake_all_cores sets
+        // aicpu_ready=1 per core, which is AICore's signal to proceed past
+        // Phase 1 — once it has the green light, it expects the slot to be
+        // initialized. See the contract comment in
+        // aicore/aicore_executor.cpp:105-110 and the parallel call in
+        // host_build_graph/aicpu/aicpu_executor.cpp:341. Without this call,
+        // --enable-l2-swimlane runs hit AICore-side memory corruption that
+        // surfaces as orch FLOW_CONTROL_DEADLOCK (paged_attention C1) or
+        // sched SCHEDULER_TIMEOUT (multi_round_paged_attention C1) depending
+        // on which AICore op first touches the uninitialized slot.
+        if (is_l2_swimlane_enabled()) {
+            l2_swimlane_aicpu_init(runtime->worker_count);
+        }
 
         // Discover cores and assign to scheduler threads.
         int32_t rc = handshake_all_cores(runtime);
