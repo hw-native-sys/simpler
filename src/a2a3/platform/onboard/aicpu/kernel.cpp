@@ -35,9 +35,10 @@
 // wall = max(end) - min(start). No single-threaded pre-pass is needed to
 // seed the start.
 
-// Forward declaration of aicpu_execute (implemented in aicpu_executor.cpp)
+// Forward declaration of aicpu_execute (implemented in aicpu_executor.cpp).
+// simpler_aicpu_register_callable is NOT declared/forwarded here: it is
+// exported directly by the TMARB runtime (host_build_graph does not export it).
 extern "C" int aicpu_execute(Runtime *arg);
-extern "C" int aicpu_register_callable(const RegisterCallableArgs *arg);
 
 /**
  * AICPU kernel main execution entry point.
@@ -149,23 +150,5 @@ extern "C" __attribute__((visibility("default"))) int simpler_aicpu_init(void *a
     set_orch_device_id(static_cast<int>(init_args->device_id));
 
     LOG_INFO_V0("%s", "simpler_aicpu_init: per-device invariants latched");
-    return 0;
-}
-
-extern "C" __attribute__((visibility("default"))) int simpler_aicpu_register_callable(void *arg) {
-    if (arg == nullptr) {
-        LOG_ERROR("%s", "Invalid register_callable kernel arguments: null pointer");
-        return -1;
-    }
-
-    RegisterCallableArgs *reg_args = reinterpret_cast<RegisterCallableArgs *>(arg);
-
-    LOG_INFO_V0("%s", "simpler_aicpu_register_callable: registering callable");
-    int rc = aicpu_register_callable(reg_args);
-    if (rc != 0) {
-        LOG_ERROR("simpler_aicpu_register_callable: registration failed with rc=%d", rc);
-        return rc;
-    }
-    LOG_INFO_V0("%s", "simpler_aicpu_register_callable: registration completed");
     return 0;
 }

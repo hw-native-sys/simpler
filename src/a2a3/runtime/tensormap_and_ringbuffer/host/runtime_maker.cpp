@@ -743,3 +743,15 @@ extern "C" int validate_runtime_impl(Runtime *runtime) {
 
     return rc;
 }
+
+// Extra AICPU entry symbols this runtime exports beyond the base
+// {simpler_aicpu_exec, simpler_aicpu_init}. TMARB resolves orchestration on the
+// device, so it exports simpler_aicpu_register_callable; the common AICPU loader
+// queries this so it carries no runtime-specific symbol knowledge.
+extern "C" const char *const *runtime_extra_aicpu_symbols(size_t *count) {
+    static const char *const kExtra[] = {"simpler_aicpu_register_callable"};
+    if (count != nullptr) {
+        *count = sizeof(kExtra) / sizeof(kExtra[0]);
+    }
+    return kExtra;
+}

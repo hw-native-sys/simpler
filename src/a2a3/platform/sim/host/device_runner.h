@@ -55,7 +55,9 @@ private:
     // a2a3 sim's dlsym'd function-pointer table. Loaded once via
     // ensure_binaries_loaded(), nulled on unload_executor_binaries().
     int (*aicpu_execute_func_)(Runtime *){nullptr};
-    int (*aicpu_register_callable_func_)(const RegisterCallableArgs *){nullptr};
+    // The runtime exports simpler_aicpu_register_callable(void*) directly (TMARB
+    // only; hbg does not export it). Optional dlsym: null on the hbg SO.
+    int (*aicpu_register_callable_func_)(void *){nullptr};
     void (*aicore_execute_func_)(Runtime *, int, CoreType, uint32_t, uint64_t, uint32_t, uint64_t){nullptr};
     void (*set_platform_regs_func_)(uint64_t){nullptr};
     void (*set_orch_device_id_func_)(int){nullptr};

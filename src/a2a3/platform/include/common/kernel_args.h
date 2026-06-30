@@ -86,9 +86,16 @@ extern "C" {
  *       - AICore: receives device KernelArgs* via KERNEL_ENTRY
  */
 struct KernelArgs {
+    // Offset-locked front: the front-less launch protocol and the device
+    // entries require runtime_args @ 0 and regs @ 8 (see static_asserts below).
     __may_used_by_aicore__ Runtime *runtime_args{nullptr};  // Task runtime in device memory
     uint64_t regs{0};                                       // Per-core register base address array (platform-specific)
-    uint64_t ffts_base_addr{0};                             // FFTS base address for AICore
+    // Remaining 64-bit fields. Grouped before the 32-bit tail so the struct
+    // needs no interior alignment padding — every uint64_t lands on its natural
+    // 8-byte boundary and the lone trailing uint32_t carries only harmless tail
+    // padding. Order among these is free (device reads by field name, not
+    // offset); only runtime_args/regs are offset-locked.
+    uint64_t ffts_base_addr{0};  // FFTS base address for AICore
     uint64_t dump_data_base{0};  // Dump shared memory base address; use explicit flags to detect enablement
     // L2 swimlane shared memory base address; use explicit flags to detect enablement
     uint64_t l2_swimlane_data_base{0};
@@ -102,9 +109,6 @@ struct KernelArgs {
     // L2SwimlaneAicoreTaskBuffer address. AICore kernel entry indexes by block_idx
     // and forwards into platform set/get state. 0 when L2 swimlane is off.
     uint64_t l2_swimlane_aicore_rotation_table{0};
-    uint32_t enable_profiling_flag{0};  // Profiling umbrella bitmask; dump_tensor|l2_swimlane|pmu|dep_gen|scope_stats
-    uint32_t _pad{0};                   // Alignment padding
-
     // Device pointer to the run-wall buffer the platform AICPU entry writes.
     // Allocated once and kept resident, reset each run. Onboard AICPU receives
     // KernelArgs as a CANN-private copy (see launch_aicpu_kernel), so an
@@ -118,11 +122,8 @@ struct KernelArgs {
     // single-uint64 wall_ns write-through (sim AICPU and host share memory).
     // Zero when the buffer was not allocated.
     uint64_t device_wall_data_base{0};
-    // ACL device ordinal. Pushed to the AICPU so the executor can suffix the
-    // staged orchestration SO name (libdevice_orch_<pid>_<cid>_<device_id>.so):
-    // paired a2a3 dies share the preinstall filesystem, and a content/pid-only
-    // name risks a cross-die write/execute collision (see simpler_inner fix).
-    uint32_t device_id{0};
+    // 32-bit tail.
+    uint32_t enable_profiling_flag{0};  // Profiling umbrella bitmask; dump_tensor|l2_swimlane|pmu|dep_gen|scope_stats
 };
 
 static_assert(offsetof(KernelArgs, runtime_args) == 0, "KernelArgs::runtime_args offset drift");

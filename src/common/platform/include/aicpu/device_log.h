@@ -19,9 +19,9 @@
  *     onboard fills it from CheckLogLevel(AICPU,...) (CANN-managed),
  *     sim fills it from set_log_level() called by the host (dlsym path).
  *   - INFO verbosity gating (V0..V9) is simpler-managed on both backends:
- *     g_log_info_v populated from set_log_info_v(); onboard receives the
- *     value via KernelArgs.log_info_v at kernel entry, sim receives it via
- *     dlsym from the host runner.
+ *     g_log_info_v populated from set_log_info_v(); onboard latches the value
+ *     once per device from InitArgs.log_info_v via simpler_aicpu_init, sim
+ *     receives it via dlsym from the host runner.
  *
  * Platform Support:
  * - a5     : Real hardware with CANN dlog API
