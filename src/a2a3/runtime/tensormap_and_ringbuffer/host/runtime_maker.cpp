@@ -477,10 +477,6 @@ static bool stage_device_args(
 // runtime. Behavior-only env reads (no new gates); kept here so the args and
 // image steps stay free of unrelated state.
 static void apply_orch_sched_env_flags(Runtime *runtime) {
-    const char *orch_env = std::getenv("PTO2_ORCH_TO_SCHED");
-    runtime->dev.orch_to_sched = orch_env && (orch_env[0] == '1' || orch_env[0] == 't' || orch_env[0] == 'T');
-    LOG_INFO_V0("Orchestrator-to-scheduler transition: %s", runtime->dev.orch_to_sched ? "enabled" : "disabled");
-
     const char *serial_env = std::getenv("PTO2_SERIAL_ORCH_SCHED");
     runtime->dev.serial_orch_sched =
         serial_env && (serial_env[0] == '1' || serial_env[0] == 't' || serial_env[0] == 'T');

@@ -114,7 +114,6 @@ struct OrchSoEntry {
 
 struct AicpuExecutor {
     int32_t sched_thread_num_;
-    bool orch_to_sched_{false};
     bool serial_orch_sched_{false};
 
     // ===== Thread management state =====
@@ -206,7 +205,6 @@ int32_t AicpuExecutor::init(Runtime *runtime) {
     aicpu_thread_num_ = runtime->dev.aicpu_thread_num;
     if (aicpu_thread_num_ == 0) aicpu_thread_num_ = 1;
     sched_thread_num_ = aicpu_thread_num_ - 1;
-    orch_to_sched_ = runtime->dev.orch_to_sched;
     serial_orch_sched_ = runtime->dev.serial_orch_sched;
 
     if (aicpu_thread_num_ < 1 || aicpu_thread_num_ > MAX_AICPU_THREADS) {
@@ -215,7 +213,7 @@ int32_t AicpuExecutor::init(Runtime *runtime) {
         return -1;
     }
 
-    if (sched_ctx_.init(runtime, aicpu_thread_num_, sched_thread_num_, orch_to_sched_, get_platform_regs()) != 0) {
+    if (sched_ctx_.init(runtime, aicpu_thread_num_, sched_thread_num_, get_platform_regs()) != 0) {
         init_failed_.store(true, std::memory_order_release);
         return -1;
     }
@@ -728,8 +726,8 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
         LOG_INFO_V0("Thread %d: Orchestrator completed", thread_idx);
     }
 
-    // Scheduler thread (orchestrator threads skip dispatch when orch_to_sched_ is false)
-    if (!sched_ctx_.is_completed() && (thread_idx < sched_thread_num_ || orch_to_sched_)) {
+    // Scheduler thread (orchestrator thread skips dispatch and exits after orchestration)
+    if (!sched_ctx_.is_completed() && thread_idx < sched_thread_num_) {
         // Device orchestration: wait for the primary orchestrator to initialize the SM header
         while (!runtime_init_ready_.load(std::memory_order_acquire)) {
             SPIN_WAIT_HINT();
@@ -802,7 +800,6 @@ void AicpuExecutor::deinit(Runtime *runtime) {
 
     aicpu_thread_num_ = 0;
     sched_thread_num_ = 0;
-    orch_to_sched_ = false;
     serial_orch_sched_ = false;
 
     orch_args_cached_.reset();

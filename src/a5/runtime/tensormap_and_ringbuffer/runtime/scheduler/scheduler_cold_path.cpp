@@ -94,21 +94,6 @@ LoopAction SchedulerContext::handle_orchestrator_exit(
     return LoopAction::NONE;
 }
 
-LoopAction SchedulerContext::handle_core_transition(bool &cores_released) {
-    if (!transition_requested_.load(std::memory_order_acquire)) return LoopAction::NONE;
-    if (!reassigned_.load(std::memory_order_acquire)) {
-        wait_reassign_.fetch_add(1, std::memory_order_release);
-        while (!reassigned_.load(std::memory_order_acquire)) {
-            if (completed_.load(std::memory_order_acquire)) {
-                return LoopAction::BREAK_LOOP;
-            }
-            SPIN_WAIT_HINT();
-        }
-    }
-    cores_released = true;
-    return LoopAction::NONE;
-}
-
 LoopAction
 SchedulerContext::check_idle_fatal_error(int32_t thread_idx, PTO2SharedMemoryHeader *header, Runtime *runtime) {
     if (completed_.load(std::memory_order_acquire)) {
@@ -327,7 +312,7 @@ void SchedulerContext::log_stall_diagnostics(
 
     // CLUSTER lines: one per cluster this thread owns.
     // cluster_id = local_cluster_idx * active_sched_threads_ + thread_idx, matching the
-    // round-robin assignment in assign_cores_to_threads / reassign_cores_for_all_threads.
+    // round-robin assignment in assign_cores_to_threads.
     int32_t ast = active_sched_threads_ > 0 ? active_sched_threads_ : aicpu_thread_num_;
     for (int32_t cli = 0; cli < tracker.get_cluster_count() && cli < STALL_DUMP_CORE_MAX; cli++) {
         int32_t offset = cli * 3;
@@ -852,76 +837,6 @@ bool SchedulerContext::assign_cores_to_threads() {
 }
 
 // =============================================================================
-// Reassign all cores across all threads (sched + orchestrator) after orchestration.
-// =============================================================================
-void SchedulerContext::reassign_cores_for_all_threads() {
-    LOG_INFO_V0(
-        "Reassigning cores (cluster-aligned) for %d threads: %d AIC, %d AIV", aicpu_thread_num_, aic_count_, aiv_count_
-    );
-
-    // Collect running worker_ids from all current trackers
-    bool running_cores[RUNTIME_MAX_WORKER] = {};
-    for (int32_t i = 0; i < aicpu_thread_num_; i++) {
-        auto all_running = core_trackers_[i].get_all_running_cores();
-        int32_t bp;
-        while ((bp = all_running.pop_first()) >= 0) {
-            running_cores[core_trackers_[i].get_core_id_by_offset(bp)] = true;
-        }
-    }
-
-    // Count clusters per thread (round-robin across all threads)
-    int32_t cluster_count = aic_count_;
-    int32_t clusters_per_thread[MAX_AICPU_THREADS] = {};
-    for (int32_t ci = 0; ci < cluster_count; ci++) {
-        clusters_per_thread[ci % aicpu_thread_num_]++;
-    }
-
-    // Re-init all trackers and reset core counts
-    for (int32_t i = 0; i < aicpu_thread_num_; i++) {
-        core_trackers_[i].init(clusters_per_thread[i]);
-    }
-
-    // Assign clusters round-robin and restore running state
-    int32_t cluster_idx_per_thread[MAX_AICPU_THREADS] = {};
-    for (int32_t ci = 0; ci < cluster_count; ci++) {
-        int32_t t = ci % aicpu_thread_num_;
-
-        int32_t aic_wid = aic_worker_ids_[ci];
-        int32_t aiv0_wid = aiv_worker_ids_[2 * ci];
-        int32_t aiv1_wid = aiv_worker_ids_[2 * ci + 1];
-
-        int32_t cl_idx = cluster_idx_per_thread[t]++;
-        core_trackers_[t].set_cluster(cl_idx, aic_wid, aiv0_wid, aiv1_wid);
-
-        // init() marks all idle; toggle cores that were running and restore pending_occupied
-        if (running_cores[aic_wid]) {
-            core_trackers_[t].change_core_state(cl_idx * 3);
-            core_trackers_[t].set_pending_occupied(cl_idx * 3);
-        }
-        if (running_cores[aiv0_wid]) {
-            core_trackers_[t].change_core_state(cl_idx * 3 + 1);
-            core_trackers_[t].set_pending_occupied(cl_idx * 3 + 1);
-        }
-        if (running_cores[aiv1_wid]) {
-            core_trackers_[t].change_core_state(cl_idx * 3 + 2);
-            core_trackers_[t].set_pending_occupied(cl_idx * 3 + 2);
-        }
-    }
-
-    // Log final distribution
-    LOG_INFO_V0("Core reassignment complete:");
-    for (int32_t t = 0; t < aicpu_thread_num_; t++) {
-        int32_t aic_running = core_trackers_[t].get_running_count<CoreType::AIC>();
-        int32_t aiv_running = core_trackers_[t].get_running_count<CoreType::AIV>();
-        LOG_INFO_V0(
-            "  Thread %d: %d cores, %d clusters (AIC running=%d, AIV running=%d)", t, core_trackers_[t].core_num(),
-            core_trackers_[t].get_cluster_count(), aic_running, aiv_running
-        );
-    }
-    active_sched_threads_ = aicpu_thread_num_;
-}
-
-// =============================================================================
 // Emergency shutdown: broadcast exit signal to every handshake'd core and
 // deinit their AICore register blocks. Idempotent.
 // =============================================================================
@@ -948,9 +863,8 @@ void SchedulerContext::emergency_shutdown(Runtime *runtime) {
 // =============================================================================
 // Lifecycle: init / deinit
 // =============================================================================
-int32_t SchedulerContext::init(
-    Runtime *runtime, int32_t aicpu_thread_num, int32_t sched_thread_num, bool orch_to_sched, uint64_t regs_base
-) {
+int32_t
+SchedulerContext::init(Runtime *runtime, int32_t aicpu_thread_num, int32_t sched_thread_num, uint64_t regs_base) {
     always_assert(runtime != nullptr);
 
     // Zero all per-core execution state before handshake
@@ -959,7 +873,6 @@ int32_t SchedulerContext::init(
     // Wire thread/transition configuration that handshake/assign need to read.
     aicpu_thread_num_ = aicpu_thread_num;
     sched_thread_num_ = sched_thread_num;
-    orch_to_sched_ = orch_to_sched;
     regs_ = regs_base;
 
 #if PTO2_PROFILING
@@ -976,10 +889,6 @@ int32_t SchedulerContext::init(
         l2_swimlane_aicpu_init(runtime->dev.worker_count);
         l2_swimlane_level_ = get_l2_swimlane_level();
         if (l2_swimlane_level_ >= L2SwimlaneLevel::SCHED_PHASES) {
-            // When orchestrator phases merge into scheduler threads
-            // (PTO2_ORCH_TO_SCHED=1), phase records flow through
-            // aicpu_thread_num_ pools — matches the same branch in the
-            // dump_args_init call below.
             // Sched phase pool count = number of scheduler threads.
             // This block runs before assign_cores_to_threads, so the
             // active_sched_threads_ member isn't set yet — recompute the same
@@ -988,10 +897,9 @@ int32_t SchedulerContext::init(
             // assign_cores_to_threads' active_sched_threads_). Without this
             // normalization here, init_phase would prime zero sched pools
             // and all sched_phase emits would silently drop.
-            const int active_sched = (sched_thread_num_ > 0) ? sched_thread_num_ : aicpu_thread_num_;
-            const int sched_phase_threads = orch_to_sched_ ? aicpu_thread_num_ : active_sched;
+            const int sched_phase_threads = (sched_thread_num_ > 0) ? sched_thread_num_ : aicpu_thread_num_;
             // Orch phase is a single instance (PR #971 design), so the orch
-            // pool count is always 1 regardless of orch_to_sched mode.
+            // pool count is always 1.
             const int orch_phase_threads = 1;
             l2_swimlane_aicpu_init_phase(runtime->dev.worker_count, sched_phase_threads, orch_phase_threads);
         }
@@ -1018,7 +926,7 @@ int32_t SchedulerContext::init(
     // orchestrator thread (see aicpu_executor.cpp).
 #if PTO2_PROFILING
     if (is_dump_args_enabled()) {
-        dump_args_init(orch_to_sched_ ? aicpu_thread_num_ : active_sched_threads_);
+        dump_args_init(active_sched_threads_);
     }
     if (is_pmu_enabled()) {
         pmu_aicpu_init(physical_core_ids_, cores_total_num_);
@@ -1112,11 +1020,6 @@ void SchedulerContext::deinit() {
     completed_tasks_.store(0, std::memory_order_release);
     total_tasks_ = 0;
     orchestrator_done_.store(false, std::memory_order_release);
-
-    // Reset core transition state
-    transition_requested_.store(false, std::memory_order_release);
-    wait_reassign_.store(0, std::memory_order_release);
-    reassigned_.store(false, std::memory_order_release);
     completed_.store(false, std::memory_order_release);
 
     // Reset core discovery and assignment state
@@ -1125,7 +1028,6 @@ void SchedulerContext::deinit() {
     cores_total_num_ = 0;
     aicpu_thread_num_ = 0;
     sched_thread_num_ = 0;
-    orch_to_sched_ = false;
     active_sched_threads_ = 0;
     for (int32_t t = 0; t < MAX_AICPU_THREADS; t++) {
         core_trackers_[t] = CoreTracker{};
@@ -1167,7 +1069,7 @@ void SchedulerContext::wait_for_orchestration_done_before_dispatch(Runtime *runt
 // and drives the orchestrator → scheduler core transition (or fatal shutdown).
 // =============================================================================
 void SchedulerContext::on_orchestration_done(
-    Runtime *runtime, PTO2Runtime *rt, int32_t thread_idx, int32_t total_tasks
+    Runtime *runtime, PTO2Runtime *rt, [[maybe_unused]] int32_t thread_idx, int32_t total_tasks
 ) {
 #if PTO2_PROFILING
     if (l2_swimlane_level_ >= L2SwimlaneLevel::ORCH_PHASES) {
@@ -1199,32 +1101,9 @@ void SchedulerContext::on_orchestration_done(
         }
     }
 
-    // Skip core transition on fatal error — cores already shut down above.
-    if (completed_.load(std::memory_order_acquire)) {
-        // Signal transition to unblock scheduler threads waiting at core transition
-        transition_requested_.store(true, std::memory_order_release);
-        reassigned_.store(true, std::memory_order_release);
-    } else if (orch_to_sched_) {
-        LOG_INFO_V0("Thread %d: Set orchestrator_done=true, requesting core transition", thread_idx);
-        transition_requested_.store(true, std::memory_order_release);
-
-        // Wait for scheduler threads to acknowledge transition request
-        while (wait_reassign_.load(std::memory_order_acquire) != sched_thread_num_) {
-            if (completed_.load(std::memory_order_acquire)) {
-                break;
-            }
-            SPIN_WAIT_HINT();
-        }
-        if (!completed_.load(std::memory_order_acquire)) {
-            reassign_cores_for_all_threads();
-            reassigned_.store(true, std::memory_order_release);
-        }
-    }
-
 #if PTO2_PROFILING
-    // Write core-to-thread mapping AFTER reassignment so the profiling data
-    // reflects the final distribution (all active_sched_threads_, including
-    // former orchestrator threads when orch_to_sched_ is enabled).
+    // Write the core-to-thread mapping so the profiling data reflects the
+    // scheduler threads' final core distribution.
     if (l2_swimlane_level_ >= L2SwimlaneLevel::SCHED_PHASES) {
         l2_swimlane_aicpu_init_core_assignments(cores_total_num_);
         for (int32_t t = 0; t < active_sched_threads_; t++) {

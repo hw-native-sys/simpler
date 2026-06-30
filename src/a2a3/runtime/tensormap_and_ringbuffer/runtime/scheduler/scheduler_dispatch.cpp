@@ -803,8 +803,6 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
     PTO2TaskSlotState *deferred_release_slot_states[PTO2_DEFERRED_RELEASE_CAP];
     int32_t deferred_release_count = 0;
 
-    bool cores_released = false;
-
     // PMU runs require single-issue dispatch — overlapping in-flight tasks
     // pollute per-task PMU counters, so skip the PENDING pre-load phase.
     // Cached at function scope: is_pmu_enabled() is extern "C" and the
@@ -913,11 +911,6 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
         int32_t task_count = 0;
         if (!tracker.has_any_running_cores()) {
             LoopAction action = handle_orchestrator_exit(thread_idx, header, runtime, task_count);
-            if (action == LoopAction::BREAK_LOOP) break;
-        }
-
-        if (!cores_released && orch_to_sched_) {
-            LoopAction action = handle_core_transition(cores_released);
             if (action == LoopAction::BREAK_LOOP) break;
         }
 

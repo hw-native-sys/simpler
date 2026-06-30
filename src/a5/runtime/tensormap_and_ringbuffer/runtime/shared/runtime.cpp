@@ -37,7 +37,6 @@ Runtime::Runtime() {
     memset(dev.aicpu_allowed_cpus, 0, sizeof(dev.aicpu_allowed_cpus));
     dev.aicpu_allowed_cpu_count = 0;
     dev.aicpu_launch_count = 0;
-    dev.orch_to_sched = false;
     dev.serial_orch_sched = false;
     dev.gm_sm_ptr_ = nullptr;
     dev.slot_states_ptr_ = nullptr;

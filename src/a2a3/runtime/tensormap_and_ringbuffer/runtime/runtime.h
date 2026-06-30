@@ -207,7 +207,6 @@ struct alignas(64) DeviceRuntimeLaunchDesc {
     // (= orch + schedulers). AicpuExecutor splits this into one orchestrator
     // thread (highest idx, runs aicpu_orchestration_entry) and the remaining
     // aicpu_thread_num-1 scheduler threads that dispatch tasks to AICore.
-    // The orch thread also dispatches when env PTO2_ORCH_TO_SCHED is set.
     int aicpu_thread_num;
     int ready_queue_shards;  // Number of ready queue shards (1..MAX_AICPU_THREADS, default MAX-1)
 
@@ -222,12 +221,6 @@ struct alignas(64) DeviceRuntimeLaunchDesc {
 
     // PTO2 integration: kernel_id -> GM function_bin_addr mapping
     uint64_t func_id_to_addr_[RUNTIME_MAX_FUNC_ID];
-
-    // Orchestrator-to-scheduler transition control
-    // When true, orchestrator threads convert to scheduler threads after orchestration completes.
-    // When false (default), orchestrator threads exit after orchestration without dispatching tasks.
-    // Controlled via PTO2_ORCH_TO_SCHED environment variable.
-    bool orch_to_sched;
 
     // Serial orchestrator -> scheduler start control.
     // When true, scheduler threads wait until orchestration has fully built the
