@@ -14,7 +14,7 @@ markers in ``src/common/log/include/common/strace.h``), gated by the
 compile-time ``SIMPLER_PROFILING`` macro (on by default) and emitted at
 ``LOG_INFO_V9``. Device-domain phases (AICPU subdivision of the on-NPU wall)
 are emitted by the host after readback as ``clk=dev`` spans nested under
-``run_prepared.runner_run.device_wall``.
+``simpler_run.runner_run.device_wall``.
 
 Marker grammar (matched anywhere on the line, so the CANN/host log prefix is
 ignored)::
@@ -22,7 +22,7 @@ ignored)::
     [STRACE] v=1 pid=<n> tid=<n> inv=<n> hid=<hex> depth=<n> name=<dotted> ts=<ns> dur=<ns> [k=v ...]
 
 Grouping:
-    * ``(pid, inv)`` identifies one ``run_prepared`` invocation — all its spans
+    * ``(pid, inv)`` identifies one ``simpler_run`` invocation — all its spans
       share these. ``inv`` is a process-wide id (atomic-allocated, so unique even
       across concurrent calls), NOT a token index.
     * ``hid`` is the callable's content hash (stable across slot reuse / runs).
@@ -32,7 +32,7 @@ Grouping:
       guessing): a span at depth d is a child of the most recent span at d-1.
 
 Outputs:
-    * a per-callable TPOT table (each invocation's run_prepared dur + the mean
+    * a per-callable TPOT table (each invocation's simpler_run dur + the mean
       of each sub-stage across invocations), and
     * optionally a Chrome-trace / Perfetto JSON (``--trace-out``): one ``ph:"X"``
       event per span, lane = pid, so the host call tree renders as nested
@@ -74,7 +74,7 @@ class Span:
 
 @dataclass
 class Invocation:
-    """All spans emitted by one run_prepared call (one (pid, inv) group)."""
+    """All spans emitted by one simpler_run call (one (pid, inv) group)."""
 
     pid: int
     inv: int
@@ -82,7 +82,7 @@ class Invocation:
     spans: list = field(default_factory=list)
 
     def root(self):
-        """The depth-0 span (run_prepared), or None if absent."""
+        """The depth-0 span (simpler_run), or None if absent."""
         for s in self.spans:
             if s.depth == 0:
                 return s
@@ -165,7 +165,7 @@ def print_tpot_table(buckets, label_for_hid=None, stream=sys.stdout):
         durs = [r.dur for r in roots]
         if durs:
             print(
-                f"  run_prepared: mean={_fmt_us(int(_mean(durs)))}us "
+                f"  simpler_run: mean={_fmt_us(int(_mean(durs)))}us "
                 f"min={_fmt_us(min(durs))}us max={_fmt_us(max(durs))}us",
                 file=stream,
             )
@@ -185,10 +185,10 @@ def print_tpot_table(buckets, label_for_hid=None, stream=sys.stdout):
 
 
 _ROUNDS_TABLE_NAMES = {
-    "host": "run_prepared",
-    "device": "run_prepared.runner_run.device_wall",
-    "orch": "run_prepared.runner_run.device_wall.orch",
-    "sched": "run_prepared.runner_run.device_wall.sched",
+    "host": "simpler_run",
+    "device": "simpler_run.runner_run.device_wall",
+    "orch": "simpler_run.runner_run.device_wall.orch",
+    "sched": "simpler_run.runner_run.device_wall.sched",
 }
 
 # Per-round table columns, in print order. "Effective" is the orch∪sched merged
@@ -300,10 +300,55 @@ def print_rounds_table(buckets, stream=sys.stdout):
         print(msg, file=stream)
 
 
-def to_chrome_trace(invocations):
-    """Build a Chrome-trace event list: one ph:X per span, lane = pid."""
+def _bucket_label(buckets, hid):
+    """Short human label for an hid: 'decode' (busiest bucket) / 'prefill' (once) / hid prefix."""
+    if not buckets:
+        return hid[:8]
+    ordered = sorted(buckets.items(), key=lambda kv: len(kv[1]), reverse=True)
+    if hid == ordered[0][0] and len(ordered[0][1]) > 1:
+        return "decode"
+    if len(buckets.get(hid, [])) == 1:
+        return "prefill"
+    return hid[:8]
+
+
+def to_chrome_trace(invocations, buckets=None):
+    """Build a Chrome-trace / Perfetto event list with readable nested tracks.
+
+    Each invocation gets its own named process lane ("decode inv=3" /
+    "prefill inv=1"), and within it host spans and device (``clk=dev``) spans go
+    to two separate threads — because host ``ts`` is steady_clock while device
+    ``ts`` is a device-clock offset, the two are NOT on a common timeline and
+    must not share a track. Within each track the spans nest by their own
+    ``ts``/``dur`` (Perfetto renders containment as nested slices), and ``depth``
+    is carried so the structure is unambiguous.
+    """
     events = []
+    lane_map = {}
     for inv in invocations:
+        label = _bucket_label(buckets, inv.hid) if buckets else inv.hid[:8]
+        # One process lane per invocation; host vs device on separate tracks.
+        # Key by (pid, inv): `inv` is only unique within a pid, so distinct
+        # processes (L3 parent + L2 children) can share inv values — mapping the
+        # pair to a dense lane id keeps their lanes from merging in Perfetto.
+        key = (inv.pid, inv.inv)
+        if key not in lane_map:
+            lane_map[key] = len(lane_map) + 1
+        lane = lane_map[key]
+        host_tid, dev_tid = 0, 1
+        events.append(
+            {
+                "ph": "M",
+                "name": "process_name",
+                "pid": lane,
+                "tid": host_tid,
+                "args": {"name": f"{label} inv={inv.inv} (pid={inv.pid})"},
+            }
+        )
+        events.append({"ph": "M", "name": "thread_name", "pid": lane, "tid": host_tid, "args": {"name": "host"}})
+        events.append(
+            {"ph": "M", "name": "thread_name", "pid": lane, "tid": dev_tid, "args": {"name": "device (clk=dev)"}}
+        )
         for s in inv.spans:
             events.append(
                 {
@@ -311,12 +356,75 @@ def to_chrome_trace(invocations):
                     "ph": "X",
                     "ts": s.ts / 1000.0,  # Chrome trace ts is microseconds
                     "dur": s.dur / 1000.0,
-                    "pid": s.pid,
-                    "tid": s.tid,
+                    "pid": lane,
+                    "tid": dev_tid if s.is_device else host_tid,
                     "args": {"inv": s.inv, "hid": s.hid, "depth": s.depth, "attrs": s.attrs},
                 }
             )
     return {"traceEvents": events, "displayTimeUnit": "ms"}
+
+
+def _print_inv_tree(inv, stream=sys.stdout):
+    """Print one invocation's spans as a nested tree built from the dotted span
+    names (so e.g. ``simpler_run.bind.args`` nests under ``simpler_run.bind``),
+    NOT from depth+ts — host (steady_clock) and device (``clk=dev``) spans live
+    on different clocks, so timestamp containment across domains is meaningless;
+    the dotted name is the unambiguous parent link. Siblings are ordered by
+    ``ts``. Device spans are tagged ``[dev]``; durations are µs."""
+    by_name = {s.name: s for s in inv.spans}
+    # children[parent_name] = [child span...]; a span's parent is its name minus
+    # the last dotted segment (if that prefix is itself a known span).
+    children = {}
+    roots = []
+    for s in inv.spans:
+        parent = s.name.rsplit(".", 1)[0] if "." in s.name else None
+        if parent is not None and parent in by_name:
+            children.setdefault(parent, []).append(s)
+        else:
+            roots.append(s)
+
+    def emit(s, indent):
+        tag = " [dev]" if s.is_device else ""
+        leaf = s.name.rsplit(".", 1)[-1] if "." in s.name else s.name
+        stream.write(f"{'  ' * indent}{leaf:<22}{tag:>6}  {s.dur / 1000.0:>12.1f} us\n")
+        kids = sorted(children.get(s.name, []), key=lambda x: x.ts)
+        # orch and sched run concurrently (see docs/dfx/device-phases.md): render
+        # them on ONE line, left = orch, right = sched, under their merged window
+        # `Effective = orch ∪ sched`, instead of as two sequential-looking rows.
+        has_sched = any(k.name.rsplit(".", 1)[-1] == "sched" for k in kids)
+        has_orch = any(k.name.rsplit(".", 1)[-1] == "orch" for k in kids)
+        for c in kids:
+            cleaf = c.name.rsplit(".", 1)[-1]
+            if cleaf == "orch" and has_sched:
+                sched = next(k for k in kids if k.name.rsplit(".", 1)[-1] == "sched")
+                eff = (max(c.ts + c.dur, sched.ts + sched.dur) - min(c.ts, sched.ts)) / 1000.0
+                base = "  " * (indent + 1)
+                # Effective = the merged orch ∪ sched window, with the two
+                # concurrent children shown side by side on the indented line
+                # below it (see docs/dfx/device-phases.md).
+                stream.write(f"{base}{'Effective':<22} [dev]  {eff:>12.1f} us\n")
+                stream.write(f"{base}  orch {c.dur / 1000.0:.1f}  ∥  sched {sched.dur / 1000.0:.1f}   (concurrent)\n")
+            elif cleaf == "sched" and has_orch:
+                continue  # shown beside orch on the Effective line above
+            else:
+                emit(c, indent + 1)
+
+    for r in sorted(roots, key=lambda x: x.ts):
+        emit(r, 0)
+
+
+def print_tree(buckets, stream=sys.stdout):
+    """Per-callable, per-invocation indented tree of spans (the nested view)."""
+    if not buckets:
+        print("No [STRACE] markers found.", file=stream)
+        return
+    ordered = sorted(buckets.items(), key=lambda kv: len(kv[1]), reverse=True)
+    for hid, invs in ordered:
+        label = _bucket_label(buckets, hid)
+        print(f"callable hid={hid} ({label}) — {len(invs)} invocation(s)", file=stream)
+        # Show the first invocation's tree as representative (they share structure).
+        _print_inv_tree(invs[0], stream=stream)
+        print(file=stream)
 
 
 def main(argv=None):
@@ -330,6 +438,12 @@ def main(argv=None):
         action="store_true",
         help="print a per-round Host/Device/Orch/Sched table (the format tools/benchmark_rounds.sh "
         "parses) instead of the per-callable TPOT table",
+    )
+    ap.add_argument(
+        "--tree",
+        action="store_true",
+        help="print an indented nested span tree per callable (device_wall → sub-phases), "
+        "instead of the per-callable TPOT table",
     )
     args = ap.parse_args(argv)
 
@@ -345,12 +459,14 @@ def main(argv=None):
 
     if args.rounds_table:
         print_rounds_table(buckets)
+    elif args.tree:
+        print_tree(buckets)
     else:
         print_tpot_table(buckets)
 
     if args.trace_out:
         with open(args.trace_out, "w", encoding="utf-8") as f:
-            json.dump(to_chrome_trace(invocations), f)
+            json.dump(to_chrome_trace(invocations, buckets), f)
         print(f"Wrote Chrome trace: {args.trace_out} ({len(spans)} spans)")
 
     return 0

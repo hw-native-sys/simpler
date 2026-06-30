@@ -1863,7 +1863,7 @@ class TestChipMainLoopDigestRegister:
         cw = MagicMock()
         cw._impl = MagicMock()
         cw._unregister_slot = MagicMock()
-        cw._impl.prepare_callable_from_blob = MagicMock()
+        cw._impl.register_callable_from_blob = MagicMock()
 
         callable_obj = _unique_chip_callable(7)
         digest = _chip_digest(callable_obj)
@@ -1882,8 +1882,8 @@ class TestChipMainLoopDigestRegister:
                 err = self._wait_for_done_and_reset(buf, state_addr)
                 assert err == 0
                 assert cw._unregister_slot.call_count == 0
-                cw._impl.prepare_callable_from_blob.assert_called_once()
-                assert cw._impl.prepare_callable_from_blob.call_args.args[0] == 0
+                cw._impl.register_callable_from_blob.assert_called_once()
+                assert cw._impl.register_callable_from_blob.call_args.args[0] == 0
             finally:
                 self._shutdown(state_addr)
                 t.join(timeout=2.0)
@@ -1927,7 +1927,7 @@ class TestChipMainLoopDigestRegister:
         cw = MagicMock()
         cw._impl = MagicMock()
         cw._unregister_slot = MagicMock()
-        cw._impl.prepare_callable_from_blob = MagicMock()
+        cw._impl.register_callable_from_blob = MagicMock()
 
         callable_obj = _unique_chip_callable(7)
         payload = ctypes.string_at(int(callable_obj.buffer_ptr()), int(callable_obj.buffer_size()))
@@ -1952,7 +1952,7 @@ class TestChipMainLoopDigestRegister:
                     payload_size=len(payload),
                 )
                 assert self._wait_for_done_and_reset(buf, state_addr) == 0
-                cw._impl.prepare_callable_from_blob.assert_called_once()
+                cw._impl.register_callable_from_blob.assert_called_once()
             finally:
                 self._shutdown(state_addr)
                 t.join(timeout=2.0)
@@ -1968,7 +1968,7 @@ class TestChipMainLoopDigestRegister:
         cw = MagicMock()
         cw._impl = MagicMock()
         cw._unregister_slot = MagicMock()
-        cw._impl.prepare_callable_from_blob = MagicMock()
+        cw._impl.register_callable_from_blob = MagicMock()
 
         callable_obj = _unique_chip_callable(7)
         wrong_digest = _chip_digest(_unique_chip_callable(8))
@@ -1990,7 +1990,7 @@ class TestChipMainLoopDigestRegister:
                 err = self._wait_for_done_and_reset(buf, state_addr)
                 assert err == 1
                 assert "HASHID_DESCRIPTOR_MISMATCH" in self._read_error_message(buf)
-                cw._impl.prepare_callable_from_blob.assert_not_called()
+                cw._impl.register_callable_from_blob.assert_not_called()
                 cw._unregister_slot.assert_not_called()
                 assert registry == {}
                 assert identity_table == {}
@@ -2010,7 +2010,7 @@ class TestChipMainLoopDigestRegister:
         cw = MagicMock()
         cw._impl = MagicMock()
         cw._unregister_slot = MagicMock()
-        cw._impl.prepare_callable_from_blob = MagicMock()
+        cw._impl.register_callable_from_blob = MagicMock()
 
         callable_obj = _unique_chip_callable(7)
         digest = _chip_digest(callable_obj)
@@ -2037,7 +2037,7 @@ class TestChipMainLoopDigestRegister:
                 )
                 assert self._wait_for_done_and_reset(buf, state_addr) == 0
                 assert cw._unregister_slot.call_count == 0
-                assert cw._impl.prepare_callable_from_blob.call_count == 1
+                assert cw._impl.register_callable_from_blob.call_count == 1
             finally:
                 self._shutdown(state_addr)
                 t.join(timeout=2.0)
@@ -2053,7 +2053,7 @@ class TestChipMainLoopDigestRegister:
         cw = MagicMock()
         cw._impl = MagicMock()
         cw._unregister_slot = MagicMock()
-        cw._impl.prepare_callable_from_blob = MagicMock()
+        cw._impl.register_callable_from_blob = MagicMock()
 
         callable_obj = _unique_chip_callable(7)
         digest = _chip_digest(callable_obj)

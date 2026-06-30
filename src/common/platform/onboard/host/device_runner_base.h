@@ -207,7 +207,7 @@ public:
      * across threads as max(end) - min(start). Returns 0 for a phase that was
      * never stamped (e.g. a platform whose AICPU does not emit that phase).
      * AicpuPhase::RunWall aliases last_device_wall_ns(). Used by the host to
-     * emit device-phase trace markers; see run_prepared in c_api_shared.
+     * emit device-phase trace markers; see simpler_run in c_api_shared.
      */
     uint64_t last_device_phase_ns(AicpuPhase phase) const { return device_phase_ns_[static_cast<int>(phase)]; }
 
@@ -267,22 +267,22 @@ public:
      *                      without re-uploading.
      * @return 0 on success, negative on failure.
      */
-    int register_callable(
+    int record_device_orch_callable(
         int32_t callable_id, const void *orch_so_data, size_t orch_so_size, const char *func_name,
         const char *config_name, std::vector<std::pair<int, uint64_t>> kernel_addrs, std::vector<ArgDirection> signature
     );
 
     /**
-     * Host-orchestration variant of register_callable: stores a dlopen
+     * Host-orchestration variant of record_device_orch_callable: stores a dlopen
      * handle + entry-symbol pointer that runtime_maker resolved on the
      * host (host_build_graph variant). Mutually exclusive with the
      * trb-shaped overload — exactly one is invoked for a given
      * callable_id, picked by the C ABI based on which staging fields
-     * the runtime carries after prepare_callable_impl. dlopen handle
+     * the runtime carries after register_callable_impl. dlopen handle
      * is owned by `DeviceRunnerBase` from this call onward and
      * dlclose'd by `unregister_callable`. Increments `host_dlopen_total_`.
      */
-    int register_callable_host_orch(
+    int record_host_orch_callable(
         int32_t callable_id, void *host_dlopen_handle, void *host_orch_func_ptr,
         std::vector<std::pair<int, uint64_t>> kernel_addrs, std::vector<ArgDirection> signature
     );
@@ -300,15 +300,15 @@ public:
 
     /**
      * True iff `callable_id` has registered state staged via
-     * `register_callable*`. Lets the c_api layer reject `run_prepared`
-     * calls without a matching `prepare_callable`.
+     * `record_device_orch_callable*`. Lets the c_api layer reject `simpler_run`
+     * calls without a matching `simpler_register_callable`.
      */
     bool has_callable(int32_t callable_id) const;
 
     /**
      * Content-derived stable identity for a registered callable: the
      * ELF Build-ID 64-bit hash of its orchestration SO (CallableState::hash,
-     * computed at register_callable time via elf_build_id_64). Returns 0 when
+     * computed at record_device_orch_callable time via elf_build_id_64). Returns 0 when
      * the callable_id is not registered.
      *
      * Stable across slot reuse (unlike callable_id, which is a recyclable
@@ -340,26 +340,28 @@ public:
 
     /**
      * Number of host-side dlopen() invocations triggered by
-     * `register_callable_host_orch`. Mirrors `aicpu_dlopen_count` but
+     * `record_host_orch_callable`. Mirrors `aicpu_dlopen_count` but
      * counts the host_build_graph variant's host-side dlopens; it
      * never decrements.
      */
     size_t host_dlopen_count() const { return host_dlopen_total_; }
 
     /**
-     * Device-orchestration callable prewarm used internally by
-     * prepare_callable(). Host-orchestration callables are a no-op.
-     * On success, AICPU has populated orch_so_table_[callable_id] and
-     * first run can advertise register_new_callable_id_=false.
+     * Device-orchestration callable registration used internally by
+     * simpler_register_callable(): launches `simpler_aicpu_register_callable` with a
+     * RegisterCallableArgs descriptor so the AICPU dlopens the callable's
+     * orch SO. Host-orchestration callables are a no-op. On success, AICPU has
+     * populated orch_so_table_[callable_id] and subsequent runs only need to
+     * stamp the active callable_id.
      */
-    int prewarm_callable(int32_t callable_id);
+    int launch_device_register(int32_t callable_id);
 
     /**
      * Commit host-side AICPU seen/counting state after a device-side SO load
      * has returned success. Calling this before the device helper succeeds can
      * make a later run advertise a false cache hit.
      */
-    int commit_aicpu_callable_load(int32_t callable_id);
+    int commit_device_register(int32_t callable_id);
 
     // ---- Virtual entry points called by the shared c_api ----------------
     //
@@ -387,7 +389,7 @@ public:
     virtual int finalize() = 0;
 
     /**
-     * dep_gen enablement setter. The shared c_api `run_prepared` calls this
+     * dep_gen enablement setter. The shared c_api `simpler_run` calls this
      * unconditionally; a2a3 and a5 override it to capture submit_task inputs.
      * The base default is a no-op for any arch that does not implement dep_gen.
      */
@@ -409,6 +411,20 @@ public:
      * @return 0 on success, error code on failure
      */
     int launch_aicpu_kernel(rtStream_t stream, KernelArgs *k_args, const char *kernel_name, int aicpu_num);
+
+    /**
+     * Launch an AICPU entry with an arbitrary launch-arg payload. Used by the
+     * non-exec entries whose payload is not KernelArgs: `simpler_aicpu_init`
+     * (InitArgs) and `simpler_aicpu_register_callable` (RegisterCallableArgs).
+     *
+     * @param stream       AICPU stream
+     * @param args         Payload pointer (host memory; CANN copies it in)
+     * @param args_size    Payload size in bytes
+     * @param kernel_name  Name of the kernel to launch
+     * @param aicpu_num    Number of AICPU instances to launch
+     * @return 0 on success, error code on failure
+     */
+    int launch_aicpu_payload(rtStream_t stream, void *args, size_t args_size, const char *kernel_name, int aicpu_num);
 
     /**
      * Launch an AICore kernel. Lazy-registers the kernel binary
@@ -494,6 +510,16 @@ protected:
     int ensure_binaries_loaded();
 
     /**
+     * Per-device one-shot launch of `simpler_aicpu_init`, latching the
+     * invariants (orch device id, log config) into the resident AICPU SO
+     * globals. Idempotent via `aicpu_init_launched_`; called from
+     * `ensure_device_initialized()` after the binaries are loaded.
+     *
+     * @return 0 on success, error code on failure.
+     */
+    int ensure_aicpu_init_launched();
+
+    /**
      * Query the maximum block_dim the stream can host.
      *
      * Uses `aclrtGetStreamResLimit(CUBE_CORE / VECTOR_CORE)` and
@@ -555,8 +581,9 @@ protected:
     /**
      * Per-run Runtime setup: derives `num_aicore = block_dim *
      * cores_per_blockdim_`, range-checks against `RUNTIME_MAX_WORKER`,
-     * publishes `runtime.worker_count`, `worker_count_`,
-     * `runtime.aicpu_thread_num`, zero-initializes the handshake
+     * publishes `worker_count`, `worker_count_`,
+     * `aicpu_thread_num` (via the Runtime accessors), zero-initializes
+     * the handshake
      * worker array with AIC/AIV core typing (first `block_dim` cores
      * are AIC, remaining are AIV), and rewrites each task's
      * `function_bin_addr` from `runtime.get_function_bin_addr(func_id)
@@ -585,13 +612,11 @@ protected:
     void read_device_wall_ns();
 
     /**
-     * H2D the Runtime struct via `kernel_args_.init_runtime_args` and
-     * publish log config + device ordinal into KernelArgs. AICPU reads
-     * these at launch — log_level / log_info_v are sourced from
-     * `HostLogger::get_instance()` (the single source of truth seeded
-     * by `simpler_log_init` before host_runtime.so loaded); device_id
-     * is the per-device suffix the AICPU executor uses for the
-     * per-device orchestration-SO name.
+     * H2D the Runtime struct via `kernel_args_.init_runtime_args`. Log config
+     * and device ordinal are NOT published here: they are per-device invariants
+     * latched once into the AICPU SO globals by `simpler_aicpu_init`
+     * (`ensure_aicpu_init_launched`) at device init, not carried per-run on
+     * KernelArgs.
      *
      * @return 0 on success, the underlying init_runtime_args rc on failure.
      */
@@ -654,15 +679,16 @@ protected:
     int finalize_common();
 
     /**
-     * Stamp registered callable metadata onto a Runtime without committing
-     * host seen/counting state. The device-side load must complete before
-     * commit_aicpu_callable_load() is called.
+     * Stamp the active callable_id onto a Runtime so the AICPU knows which
+     * orch_so_table_ slot to dispatch. The orch SO itself was already delivered
+     * device-side at register time (launch_device_register), so nothing else
+     * needs rewriting per run.
      *
-     * @param runtime  Runtime whose device-SO metadata will be rewritten.
+     * @param runtime  Runtime whose active callable_id will be set.
      * @return 0 on success, non-zero on failure.
      */
     int prepare_orch_so(Runtime &runtime);
-    int stamp_orch_so(Runtime &runtime, int32_t callable_id, bool force_reload);
+    int stamp_orch_so(Runtime &runtime, int32_t callable_id);
 
     // ---- Group D state shared by both a2a3 and a5 -------------------------
     //
@@ -715,7 +741,7 @@ protected:
     // re-registered. Exposed via `aicpu_dlopen_count()` for tests.
     size_t aicpu_dlopen_total_{0};
     // Monotonic count of host-side dlopens triggered (incremented on
-    // every `register_callable_host_orch` call; never decremented).
+    // every `record_host_orch_callable` call; never decremented).
     // Same re-register semantics as `aicpu_dlopen_total_`, but for hbg
     // variants.
     size_t host_dlopen_total_{0};
@@ -802,6 +828,8 @@ protected:
 
     // True after AICPU SO loaded; reset by the subclass's `finalize()`.
     bool binaries_loaded_{false};
+    // Per-device one-shot guard for the simpler_aicpu_init launch.
+    bool aicpu_init_launched_{false};
 
     // Shared diagnostics collectors. Each subclass initializes its own
     // (a2a3 wraps `halHostRegister`/`Unregister` callbacks, a5 uses

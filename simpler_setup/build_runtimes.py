@@ -92,8 +92,8 @@ def build_all(
             token list. Only host-compiled targets honor it; see
             BuildTarget.gen_cmake_args.
         pto_isa_commit: optional pto-isa commit override for the onboard a2a3
-            host build. None preserves the original behavior and uses the
-            current checkout HEAD.
+            host build. None uses pto_isa.pin; latest/head/none explicitly
+            tracks origin/HEAD.
     """
     # Override default paths to respect CLI args
     RuntimeBuilder._LIB_DIR = lib_dir
@@ -127,9 +127,9 @@ def build_all(
     # the fallback in RuntimeCompiler._init_a2a3. No-ops when PTO_ISA_ROOT
     # is already set. Skipped when only sim platforms are being built.
     #
-    # pto_isa_commit can override the current checkout HEAD used by the
-    # managed clone. The actual git HEAD used for this build is recorded after
-    # the runtime build completes and later compared with the run-time checkout.
+    # pto_isa_commit can override the repository pin used by the managed clone.
+    # The actual git HEAD used for this build is recorded after the runtime
+    # build completes and later compared with the run-time checkout.
     if "a2a3" in platforms:
         from simpler_setup.pto_isa import ensure_pto_isa_root  # noqa: PLC0415
 
@@ -250,7 +250,8 @@ def main():
         default=None,
         help=(
             "Override the pto-isa revision before building onboard "
-            "a2a3 host_runtime. Default/latest: use the current checkout HEAD."
+            "a2a3 host_runtime. Default: use pto_isa.pin. "
+            "Use latest/head/none to track origin/HEAD."
         ),
     )
     args = parser.parse_args()

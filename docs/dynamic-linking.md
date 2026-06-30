@@ -286,7 +286,7 @@ ChipWorker.init(device_id, bins)                       # Python wrapper
   _ChipWorker.init(host_path, aicpu_path, aicore_path, device_id)   # C++
     dlopen(host_runtime.so, RTLD_LOCAL)
     dlsym: create_device_context, destroy_device_context, simpler_init,
-           get_runtime_size, prepare_callable, run_prepared, unregister_callable,
+           get_runtime_size, register_callable, simpler_run, unregister_callable,
            finalize_device
     create_device_context() → DeviceContextHandle
     simpler_init(ctx, device_id, aicpu*, aicpu_size, aicore*, aicore_size)
@@ -296,7 +296,7 @@ ChipWorker.init(device_id, bins)                       # Python wrapper
       DeviceRunner::set_executors(aicpu, aicore)       binaries owned by runner
 
 ChipWorker.run(handle, args, config)                   # public wrapper path
-  run_prepared(ctx, buf, internal callable entry, args, block_dim, aicpu_thread_num, …)
+  simpler_run(ctx, buf, internal callable entry, args, block_dim, aicpu_thread_num, …)
     new (buf) Runtime()
     bind_prepared_callable_to_runtime(r, internal callable entry)
     bind_prepared_to_runtime_impl(r, args)
@@ -345,12 +345,12 @@ device_worker_main(device_id)
             init CANN runtime-launch compatibility payload
 
     for each callable:
-        ChipWorker.prepare_callable(callable)   # returns opaque handle
-          prepare_callable(ctx, internal callable entry, callable)
+        ChipWorker.register_callable(callable)   # returns opaque handle
+          register_callable(ctx, internal callable entry, callable)
             upload child kernels, copy orch SO to device buffer
         for each launch with that handle:
           ChipWorker.run(handle, args, config)
-            run_prepared(ctx, buf, internal callable entry, args, block_dim, aicpu_thread_num, …)
+            simpler_run(ctx, buf, internal callable entry, args, block_dim, aicpu_thread_num, …)
               new (buf) Runtime()
               bind_prepared_callable_to_runtime()
               bind_prepared_to_runtime_impl()  rtMalloc, rtMemcpy to device

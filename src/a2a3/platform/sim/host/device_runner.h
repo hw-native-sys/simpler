@@ -39,7 +39,7 @@ public:
 
 private:
     int ensure_binaries_loaded() override;
-    int invoke_aicpu_prewarm(Runtime &runtime) override;
+    int invoke_device_register(const RegisterCallableArgs &reg_args) override;
     void unload_executor_binaries();
 
     int init_l2_swimlane(int num_aicore, int aicpu_thread_num, int device_id);
@@ -55,7 +55,9 @@ private:
     // a2a3 sim's dlsym'd function-pointer table. Loaded once via
     // ensure_binaries_loaded(), nulled on unload_executor_binaries().
     int (*aicpu_execute_func_)(Runtime *){nullptr};
-    int (*aicpu_prewarm_func_)(Runtime *){nullptr};
+    // The runtime exports simpler_aicpu_register_callable(void*) directly (TMARB
+    // only; hbg does not export it). Optional dlsym: null on the hbg SO.
+    int (*aicpu_register_callable_func_)(void *){nullptr};
     void (*aicore_execute_func_)(Runtime *, int, CoreType, uint32_t, uint64_t, uint32_t, uint64_t){nullptr};
     void (*set_platform_regs_func_)(uint64_t){nullptr};
     void (*set_orch_device_id_func_)(int){nullptr};

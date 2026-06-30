@@ -113,7 +113,7 @@ struct alignas(64) CoreExecState {
     uint64_t pending_dispatch_timestamp;  // offset 56: AICPU dispatch timestamp for pending task
 #else
     // --- Cold fields (init/diagnostics only, never in hot path) ---
-    int32_t worker_id;          // offset 48: index in runtime.workers[]
+    int32_t worker_id;          // offset 48: index in runtime.dev.workers[]
     uint32_t physical_core_id;  // offset 52: hardware physical core ID
     CoreType core_type;         // offset 56: AIC or AIV (enum class : int32_t)
     uint8_t pad2_[4];           // offset 60: pad to 64 bytes

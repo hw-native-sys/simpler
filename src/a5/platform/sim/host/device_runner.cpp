@@ -105,7 +105,7 @@ int DeviceRunner::ensure_binaries_loaded() {
         };
 
         if (!load_sym("aicpu_execute", reinterpret_cast<void **>(&aicpu_execute_func_))) return -1;
-        load_optional_sym("aicpu_prewarm_callable", reinterpret_cast<void **>(&aicpu_prewarm_func_));
+        load_optional_sym("simpler_aicpu_register_callable", reinterpret_cast<void **>(&aicpu_register_callable_func_));
         if (!load_sym("set_platform_regs", reinterpret_cast<void **>(&set_platform_regs_func_))) return -1;
         load_optional_sym("set_orch_device_id", reinterpret_cast<void **>(&set_orch_device_id_func_));
         if (!load_sym("set_platform_dump_base", reinterpret_cast<void **>(&set_platform_dump_base_func_))) return -1;
@@ -179,13 +179,17 @@ int DeviceRunner::ensure_binaries_loaded() {
     return 0;
 }
 
-int DeviceRunner::invoke_aicpu_prewarm(Runtime &runtime) {
-    if (aicpu_prewarm_func_ == nullptr || set_orch_device_id_func_ == nullptr) {
-        LOG_ERROR("Prewarm functions not loaded. Call ensure_binaries_loaded first.");
+int DeviceRunner::invoke_device_register(const RegisterCallableArgs &reg_args) {
+    if (aicpu_register_callable_func_ == nullptr || set_orch_device_id_func_ == nullptr) {
+        LOG_ERROR("Register-callable functions not loaded. Call ensure_binaries_loaded first.");
         return -1;
     }
     set_orch_device_id_func_(device_id_);
-    return aicpu_prewarm_func_(&runtime);
+    // The descriptor was assembled from CallableState by the base
+    // launch_device_register; sim shares process memory so the name pointers
+    // in reg_args stay valid for this synchronous call. The AICPU entry's C ABI
+    // takes void* and only reads the args, so the const_cast is safe.
+    return aicpu_register_callable_func_(const_cast<RegisterCallableArgs *>(&reg_args));
 }
 
 int DeviceRunner::run(Runtime &runtime, int block_dim, int launch_aicpu_num) {
@@ -226,9 +230,9 @@ int DeviceRunner::run(Runtime &runtime, int block_dim, int launch_aicpu_num) {
         return -1;
     }
 
-    runtime.worker_count = num_aicore;
+    runtime.set_worker_count(num_aicore);
     worker_count_ = num_aicore;
-    runtime.aicpu_thread_num = launch_aicpu_num;
+    runtime.set_aicpu_thread_num(launch_aicpu_num);
 
     int num_aic = block_dim;
     uint32_t enable_profiling_flag = PROFILING_FLAG_NONE;
@@ -248,11 +252,12 @@ int DeviceRunner::run(Runtime &runtime, int block_dim, int launch_aicpu_num) {
         SET_PROFILING_FLAG(enable_profiling_flag, PROFILING_FLAG_SCOPE_STATS);
     }
 
+    Handshake *workers = runtime.get_workers();
     for (int i = 0; i < num_aicore; i++) {
-        runtime.workers[i].aicpu_ready = 0;
-        runtime.workers[i].aicore_done = 0;
-        runtime.workers[i].task = 0;
-        runtime.workers[i].core_type = (i < num_aic) ? CoreType::AIC : CoreType::AIV;
+        workers[i].aicpu_ready = 0;
+        workers[i].aicore_done = 0;
+        workers[i].task = 0;
+        workers[i].core_type = (i < num_aic) ? CoreType::AIC : CoreType::AIV;
     }
     kernel_args_.enable_profiling_flag = enable_profiling_flag;
 
@@ -276,7 +281,7 @@ int DeviceRunner::run(Runtime &runtime, int block_dim, int launch_aicpu_num) {
     last_runtime_ = &runtime;
 
     if (enable_l2_swimlane_) {
-        rc = init_l2_swimlane(num_aicore, runtime.aicpu_thread_num, device_id_);
+        rc = init_l2_swimlane(num_aicore, runtime.get_aicpu_thread_num(), device_id_);
         if (rc != 0) {
             LOG_ERROR("init_l2_swimlane failed: %d", rc);
             return rc;
@@ -285,7 +290,7 @@ int DeviceRunner::run(Runtime &runtime, int block_dim, int launch_aicpu_num) {
         // emit path can label lanes without an AICPU record.
         std::vector<CoreType> core_types(num_aicore);
         for (int i = 0; i < num_aicore; i++) {
-            core_types[i] = runtime.workers[i].core_type;
+            core_types[i] = runtime.get_workers()[i].core_type;
         }
         l2_swimlane_collector_.set_core_types(core_types.data(), num_aicore);
     }
@@ -367,13 +372,12 @@ int DeviceRunner::run(Runtime &runtime, int block_dim, int launch_aicpu_num) {
         "Allocated simulated registers: %d cores x 0x%x bytes (sparse: 3 pages)", num_aicore, SIM_REG_TOTAL_SIZE
     );
 
-    const bool needs_orch_device_id = runtime.register_new_callable_id();
     if (aicpu_execute_func_ == nullptr || aicore_execute_func_ == nullptr || set_platform_regs_func_ == nullptr ||
-        (needs_orch_device_id && set_orch_device_id_func_ == nullptr) || set_platform_dump_base_func_ == nullptr ||
-        set_platform_phase_base_func_ == nullptr || set_dump_args_enabled_func_ == nullptr ||
-        set_platform_pmu_base_func_ == nullptr || set_pmu_enabled_func_ == nullptr ||
-        set_platform_dep_gen_base_func_ == nullptr || set_dep_gen_enabled_func_ == nullptr ||
-        set_scope_stats_enabled_func_ == nullptr || set_platform_scope_stats_base_func_ == nullptr) {
+        set_platform_dump_base_func_ == nullptr || set_platform_phase_base_func_ == nullptr ||
+        set_dump_args_enabled_func_ == nullptr || set_platform_pmu_base_func_ == nullptr ||
+        set_pmu_enabled_func_ == nullptr || set_platform_dep_gen_base_func_ == nullptr ||
+        set_dep_gen_enabled_func_ == nullptr || set_scope_stats_enabled_func_ == nullptr ||
+        set_platform_scope_stats_base_func_ == nullptr) {
         LOG_ERROR("Executor functions not loaded. Call ensure_binaries_loaded first.");
         return -1;
     }
@@ -458,7 +462,7 @@ int DeviceRunner::run(Runtime &runtime, int block_dim, int launch_aicpu_num) {
     LOG_INFO_V0("Launching %d AICore thread(s)", num_aicore);
     std::vector<std::thread> aicore_threads;
     for (int i = 0; i < num_aicore; i++) {
-        CoreType core_type = runtime.workers[i].core_type;
+        CoreType core_type = runtime.get_workers()[i].core_type;
         uint32_t physical_core_id = static_cast<uint32_t>(i);
         aicore_threads.push_back(create_thread([this, &runtime, i, core_type, physical_core_id]() {
             aicore_execute_func_(
@@ -572,7 +576,7 @@ void DeviceRunner::unload_executor_binaries() {
         dlclose(aicpu_so_handle_);
         aicpu_so_handle_ = nullptr;
         aicpu_execute_func_ = nullptr;
-        aicpu_prewarm_func_ = nullptr;
+        aicpu_register_callable_func_ = nullptr;
         set_platform_regs_func_ = nullptr;
         set_orch_device_id_func_ = nullptr;
         set_platform_dump_base_func_ = nullptr;
@@ -686,7 +690,7 @@ int DeviceRunner::init_l2_swimlane(int num_aicore, int aicpu_thread_num, int dev
 }
 
 int DeviceRunner::init_tensor_dump(Runtime &runtime, int device_id) {
-    int num_dump_threads = runtime.aicpu_thread_num;
+    int num_dump_threads = runtime.get_aicpu_thread_num();
 
     int rc = dump_collector_.initialize(
         num_dump_threads, device_id, prof_alloc_cb, /*register_cb=*/nullptr, prof_free_cb, output_prefix_,

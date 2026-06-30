@@ -16,13 +16,13 @@ opt-in (`--enable-l2-swimlane`) and documented separately in
 
 ## 1. The markers — host_wall / device_wall
 
-`run_prepared()` emits one `[STRACE]` log line per stage (see
+`simpler_run()` emits one `[STRACE]` log line per stage (see
 [host-trace.md](host-trace.md)). The two headline walls:
 
 | Span | What it measures | Source |
 | ---- | ---------------- | ------ |
-| **`run_prepared`** (host_wall) | Host `steady_clock` delta wrapping the dispatch call — includes Python/host overhead. | host side, around the C-ABI run call |
-| **`run_prepared.runner_run.device_wall`** | **Full on-NPU kernel wall**: earliest `simpler_aicpu_exec` start to latest end across launched threads — i.e. **the whole run + teardown**. | Each `simpler_aicpu_exec` thread stamps its own `AicpuPhase::RunWall` slot in the per-thread `AicpuPhaseRecord` buffer (`KernelArgs.device_wall_data_base`, see `src/{arch}/platform/onboard/aicpu/kernel.cpp`); host reduces `max(end) - min(start)` each run |
+| **`simpler_run`** (host_wall) | Host `steady_clock` delta wrapping the dispatch call — includes Python/host overhead. | host side, around the C-ABI run call |
+| **`simpler_run.runner_run.device_wall`** | **Full on-NPU kernel wall**: earliest `simpler_aicpu_exec` start to latest end across launched threads — i.e. **the whole run + teardown**. | Each `simpler_aicpu_exec` thread stamps its own `AicpuPhase::RunWall` slot in the per-thread `AicpuPhaseRecord` buffer (`KernelArgs.device_wall_data_base`, see `src/{arch}/platform/onboard/aicpu/kernel.cpp`); host reduces `max(end) - min(start)` each run |
 
 Both are emitted whenever the runtime was built with `SIMPLER_PROFILING` (the
 default) — **independent of `--enable-l2-swimlane`**. The `device_wall` marker is
@@ -69,14 +69,14 @@ One column per `[STRACE]` wall found — **Host** always, plus **Device** /
 (onboard and sim both capture the device-domain subdivision). A column is hidden
 when every round read 0, and an individual phase whose duration rounds to 0 is
 not emitted. Because the offline tool groups markers by `(pid, inv)`, this works
-for **L3 multi-round too** (each chip-child's `run_prepared` is its own
+for **L3 multi-round too** (each chip-child's `simpler_run` is its own
 invocation).
 
 ### Column meanings
 
 | Column | Definition |
 | ------ | ---------- |
-| **Host** | `run_prepared` span — host wall incl. Python/dispatch overhead. |
+| **Host** | `simpler_run` span — host wall incl. Python/dispatch overhead. |
 | **Device** | `device_wall` span — full on-NPU wall incl. init/teardown. |
 | **Effective** | `max(orch_end, sched_end) − min(orch_start, sched_start)` — the orch∪sched merged window (the effective on-device execution window). Computed from the orch/sched markers' **device-domain** `ts`+`dur` (the device spans carry a device-clock start offset, not the host emit time). This is the old device-log "Total", now derived purely from the markers — no device log needed. |
 | **Orch** | `…device_wall.orch` span — orchestrator (graph-build) window. |

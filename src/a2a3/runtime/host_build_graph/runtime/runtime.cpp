@@ -232,3 +232,7 @@ void Runtime::set_function_bin_addr(int func_id, uint64_t addr) {
     }
     func_id_to_addr_[func_id] = addr;
 }
+
+// host_build_graph uploads the whole Runtime object (AICore reads tasks[] etc.
+// by offset), so the device copy size is the full struct.
+size_t runtime_device_copy_size(const Runtime &) { return sizeof(Runtime); }

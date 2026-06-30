@@ -391,6 +391,27 @@ private:
     // ownerless idle threads are the only observers — let one of them latch.
     bool no_thread_owns_running_task() const;
 
+    // One-glance classification of a no-progress timeout, derived from state the
+    // scheduler already holds at the stall. Reduces the multi-state snapshot to a
+    // dominant PTO2_STALL_DETAIL_* sub-class plus a few locator fields, which
+    // handle_timeout_exit propagates to host alongside the unchanged code 100.
+    struct StallClassification {
+        int32_t detail;         // PTO2_STALL_DETAIL_*
+        int32_t cnt_running;    // tasks observed RUNNING (on a core)
+        int32_t cnt_ready;      // fanin-satisfied but not dispatched
+        int32_t cnt_waiting;    // still waiting on fanin
+        int32_t completed;      // completed_tasks_ snapshot
+        int32_t total;          // total_tasks_ snapshot
+        int32_t orch_done;      // orchestrator_done flag (0/1)
+        int64_t stuck_task_id;  // S1: first RUNNING task's id (-1 if none)
+        int32_t stuck_core;     // S1: core hosting it (-1 if none)
+    };
+
+    // Scan the rings once (same ground truth as log_stall_diagnostics: a slot is
+    // RUNNING iff a core holds it as running_slot_state) and reduce to a
+    // StallClassification. Pure reads — safe to call from any scheduler thread.
+    __attribute__((noinline, cold)) StallClassification classify_stall_reason() const;
+
     __attribute__((noinline, cold)) int32_t handle_timeout_exit(
         int32_t thread_idx, PTO2SharedMemoryHeader *header, Runtime *runtime, int32_t idle_iterations,
         int32_t last_progress_count

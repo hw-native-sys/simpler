@@ -121,7 +121,7 @@ Two independent guards, both landed:
 2. **Fixture rebuild-then-skip (CI containment)** — `conftest.py`. A
    `pytest_runtest_makereport` hook stashes the call-phase exception; the
    `st_worker` L2 path heals **only** on a device-runtime `RuntimeError`
-   (`run_prepared failed …` / `prepare_callable failed …` / `DeviceRunner
+   (`simpler_run failed …` / `register_callable failed …` / `DeviceRunner
    marked unusable` / `simpler_init failed …`), never on golden mismatches.
    The heal `close()`s the pooled `Worker` and drops it so the next test
    **rebuilds**. Because the a5 rebuild's `Worker.init()` then fails (device

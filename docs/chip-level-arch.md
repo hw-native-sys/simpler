@@ -122,8 +122,8 @@ simpler_init(ctx, device_id,                          // attach + binary takeove
              aicpu_binary, aicpu_size,
              aicore_binary, aicore_size);
 size_t size = get_runtime_size();
-prepare_callable(ctx, cid, callable);                 // one-time per callable
-run_prepared(ctx, runtime, cid, args, block_dim,      // per-launch — no binaries
+register_callable(ctx, cid, callable);                 // one-time per callable
+simpler_run(ctx, runtime, cid, args, block_dim,      // per-launch — no binaries
              aicpu_thread_num,
              enable_l2_swimlane, enable_dump_tensor, enable_pmu, output_prefix);
 unregister_callable(ctx, cid);

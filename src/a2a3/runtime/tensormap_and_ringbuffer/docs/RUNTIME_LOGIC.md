@@ -620,7 +620,7 @@ Built by the scheduler from `PTO2TaskDescriptor`:
    once and returns the device address of the ChipCallable header.
 3. For each child, host computes
    `chip_dev + offsetof(ChipCallable, storage_) + callable->child_offset(i)`
-   and stores it in `Runtime.func_id_to_addr_[child_func_id(i)]`.
+   and stores it in `Runtime.dev.func_id_to_addr_[child_func_id(i)]`.
 4. When dispatching, the scheduler reads `func_id_to_addr_[fid]`, casts to
    `const CoreCallable*`, reads `resolved_addr_`, and copies that into
    `PTO2DispatchPayload.function_bin_addr`.

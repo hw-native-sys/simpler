@@ -29,6 +29,7 @@
 #include "aicpu/device_phase_aicpu.h"
 #include "aicpu/orch_so_file.h"
 #include "callable_protocol.h"
+#include "common/kernel_args.h"
 #include "pto2_dispatch_payload.h"
 #include "runtime.h"
 #include "spin_hint.h"
@@ -152,7 +153,14 @@ struct AicpuExecutor {
 
     // ===== Methods =====
     int32_t init(Runtime *runtime);
-    int32_t ensure_orch_so_loaded(Runtime *runtime, int32_t thread_idx);
+    // (Re)load a callable's orchestration SO into orch_so_table_[callable_id].
+    // Register-only: the register_callable entry calls this to dlopen and
+    // populate the slot. The run path never loads — it consumes an already
+    // registered slot (see run()), so loading is solely a registration step.
+    int32_t load_orch_so(
+        int32_t callable_id, uint64_t dev_orch_so_addr, uint64_t dev_orch_so_size, const char *entry_symbol,
+        const char *config_symbol, int32_t thread_idx
+    );
     int32_t run(Runtime *runtime);
     void deinit(Runtime *runtime);
 
@@ -170,6 +178,14 @@ struct AicpuExecutor {
 };
 
 static AicpuExecutor g_aicpu_executor;
+
+// The register_callable payload mirrors the runtime's orch symbol-name
+// capacity; keep the two in lockstep so a name that fits in Runtime also fits
+// in RegisterCallableArgs.
+static_assert(
+    INIT_ARGS_MAX_ORCH_SYMBOL_NAME == RUNTIME_MAX_ORCH_SYMBOL_NAME,
+    "RegisterCallableArgs orch-symbol capacity must match RUNTIME_MAX_ORCH_SYMBOL_NAME"
+);
 
 // ===== AicpuExecutor Method Implementations =====
 
@@ -192,11 +208,11 @@ int32_t AicpuExecutor::init(Runtime *runtime) {
     // Read execution parameters from runtime. The 0 → 1 fixup runs before the
     // sched_thread_num_ derivation so a zero input doesn't leave the scheduler
     // count at -1.
-    aicpu_thread_num_ = runtime->aicpu_thread_num;
+    aicpu_thread_num_ = runtime->dev.aicpu_thread_num;
     if (aicpu_thread_num_ == 0) aicpu_thread_num_ = 1;
     sched_thread_num_ = aicpu_thread_num_ - 1;
-    orch_to_sched_ = runtime->orch_to_sched;
-    serial_orch_sched_ = runtime->serial_orch_sched;
+    orch_to_sched_ = runtime->dev.orch_to_sched;
+    serial_orch_sched_ = runtime->dev.serial_orch_sched;
 
     if (aicpu_thread_num_ < 1 || aicpu_thread_num_ > MAX_AICPU_THREADS) {
         LOG_ERROR("Invalid aicpu_thread_num: %d", aicpu_thread_num_);
@@ -216,40 +232,23 @@ int32_t AicpuExecutor::init(Runtime *runtime) {
     return 0;
 }
 
-int32_t AicpuExecutor::ensure_orch_so_loaded(Runtime *runtime, int32_t thread_idx) {
-    if (runtime == nullptr) {
-        LOG_ERROR("Thread %d: runtime is nullptr", thread_idx);
-        return -1;
-    }
-
-    const int32_t callable_id = runtime->get_active_callable_id();
+int32_t AicpuExecutor::load_orch_so(
+    int32_t callable_id, uint64_t dev_orch_so_addr, uint64_t dev_orch_so_size, const char *entry_symbol_in,
+    const char *config_symbol_in, int32_t thread_idx
+) {
     if (callable_id < 0 || callable_id >= MAX_REGISTERED_CALLABLE_IDS) {
         LOG_ERROR("Thread %d: invalid callable_id %d (limit=%d)", thread_idx, callable_id, MAX_REGISTERED_CALLABLE_IDS);
         return -1;
     }
 
     OrchSoEntry &entry = orch_so_table_[callable_id];
-    const bool reload_so = runtime->register_new_callable_id();
-    if (!reload_so) {
-        LOG_INFO_V0(
-            "Thread %d: Reusing cached orch SO handle=%p (callable_id=%d)", thread_idx, entry.handle, callable_id
-        );
-        if (entry.handle == nullptr || entry.func == nullptr) {
-            LOG_ERROR(
-                "Thread %d: reload=false but no cached SO handle/func for callable_id=%d", thread_idx, callable_id
-            );
-            return -1;
-        }
-        return 0;  // cached: no dlopen, SoLoad stays unstamped (~0)
-    }
 
-    // First/changed callable: this is the real orch-SO dlopen — the SoLoad phase.
-    // RAII end-stamp so every return path below closes the phase.
-    struct SoLoadPhaseGuard {
-        ~SoLoadPhaseGuard() { aicpu_phase_end(AicpuPhase::SoLoad); }
-    };
-    aicpu_phase_start(AicpuPhase::SoLoad);
-    SoLoadPhaseGuard so_load_guard;
+    // Registration always (re)loads: the slot may have been reused after an
+    // unregister, so dlclose any stale handle before dlopen'ing the new SO.
+    // No AicpuPhase::SoLoad stamp here: that phase times the dlopen within a
+    // simpler_run launch, but loading now happens in the separate
+    // register_callable launch which has no phase buffer (the run-path SoLoad
+    // slot is simply 0 now that run never loads).
     LOG_INFO_V0("Thread %d: New orch SO detected (callable_id=%d), (re)loading", thread_idx, callable_id);
     if (entry.handle != nullptr) {
         dlclose(entry.handle);
@@ -260,8 +259,8 @@ int32_t AicpuExecutor::ensure_orch_so_loaded(Runtime *runtime, int32_t thread_id
     }
     entry = OrchSoEntry{};
 
-    const void *so_data = reinterpret_cast<const void *>(runtime->get_dev_orch_so_addr());
-    size_t so_size = runtime->get_dev_orch_so_size();
+    const void *so_data = reinterpret_cast<const void *>(dev_orch_so_addr);
+    size_t so_size = dev_orch_so_size;
     if (so_data == nullptr || so_size == 0) {
         LOG_ERROR("Thread %d: Device orchestration SO not set", thread_idx);
         return -1;
@@ -311,11 +310,11 @@ int32_t AicpuExecutor::ensure_orch_so_loaded(Runtime *runtime, int32_t thread_id
     // libdevice_orch_<pid>_<cid>.so files when worker children exit via os._exit.
     unlink(so_path);
 
-    const char *entry_symbol = runtime->get_device_orch_func_name();
+    const char *entry_symbol = entry_symbol_in;
     if (entry_symbol == nullptr || entry_symbol[0] == '\0') {
         entry_symbol = DEFAULT_ORCH_ENTRY_SYMBOL;
     }
-    const char *config_symbol = runtime->get_device_orch_config_name();
+    const char *config_symbol = config_symbol_in;
     if (config_symbol == nullptr || config_symbol[0] == '\0') {
         config_symbol = DEFAULT_ORCH_CONFIG_SYMBOL;
     }
@@ -399,8 +398,10 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
         // scope the per-callable dlopen / SO-table locals to this block.
         {
             // Per-callable_id dispatch: the orch SO state lives in
-            // `orch_so_table_[callable_id]` keyed by registration order;
-            // reload is governed by `register_new_callable_id_`.
+            // `orch_so_table_[callable_id]`, loaded once by the
+            // register_callable entry. The run path only consumes it — it never
+            // loads. A missing handle means run was reached without a prior
+            // successful registration, which is a caller/scheduling bug.
             const int32_t callable_id = runtime->get_active_callable_id();
             if (callable_id < 0 || callable_id >= MAX_REGISTERED_CALLABLE_IDS) {
                 LOG_ERROR(
@@ -409,79 +410,83 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
                 runtime_init_ready_.store(true, std::memory_order_release);
                 return -1;
             }
-            int32_t load_rc = ensure_orch_so_loaded(runtime, thread_idx);
-            if (load_rc != 0) {
+            if (orch_so_table_[callable_id].handle == nullptr || orch_so_table_[callable_id].func == nullptr) {
+                LOG_ERROR(
+                    "Thread %d: callable_id=%d not registered (no orch SO loaded); register before run", thread_idx,
+                    callable_id
+                );
                 runtime_init_ready_.store(true, std::memory_order_release);
-                return load_rc;
+                return -1;
             }
-            OrchSoEntry &entry = orch_so_table_[callable_id];
-            void **p_handle = &entry.handle;
-            char *p_path = entry.path;
-            DeviceOrchestrationFunc *p_func = &entry.func;
-            DeviceOrchestrationBindRuntimeFunc *p_bind = &entry.bind;
-            DeviceOrchestrationConfigFunc *p_config_func = &entry.config_func;
+            // graph_build front-matter phases (orch thread only); the scheduler
+            // threads spin-wait on runtime_init_ready_ across this whole region.
+            // Each sub-phase gets its own `{}` scope so the boundaries are
+            // visible and an early `return` still records the end via the guard
+            // dtor. The few values used past their phase (p_func / p_bind for the
+            // orch call below; rt / sm_ptr across phases) are declared out here.
+            DeviceOrchestrationFunc *p_func = nullptr;
+            DeviceOrchestrationBindRuntimeFunc *p_bind = nullptr;
+            void *sm_ptr = nullptr;
+            uint64_t sm_size = 0;
+            {
+                AicpuPhaseScope config_validate(AicpuPhase::ConfigValidate);
+                OrchSoEntry &entry = orch_so_table_[callable_id];
+                p_func = &entry.func;
+                p_bind = &entry.bind;
+                DeviceOrchestrationConfigFunc *p_config_func = &entry.config_func;
 
-            // Build the entry-arg once per run; both the config call below and
-            // the orchestration entry (consumed at orch_args_cached_) use it.
-            orch_args_cached_.create_from_chip_args(runtime->get_orch_args());
+                // Build the entry-arg once per run; both the config call below and
+                // the orchestration entry (consumed at orch_args_cached_) use it.
+                orch_args_cached_.create_from_chip_args(runtime->get_orch_args());
 
-            // Validate arg count on every run (reload or cache hit).
-            if (*p_config_func != nullptr) {
-                PTO2OrchestrationConfig cfg = (*p_config_func)(orch_args_cached_);
-                LOG_INFO_V0("Thread %d: Config: expected_args=%d", thread_idx, cfg.expected_arg_count);
-                if (cfg.expected_arg_count > 0) {
-                    const ChipStorageTaskArgs &args_validate = runtime->get_orch_args();
-                    int32_t actual_arg_count = args_validate.tensor_count() + args_validate.scalar_count();
-                    if (actual_arg_count < cfg.expected_arg_count) {
-                        LOG_ERROR(
-                            "Thread %d: arg_count %d < expected %d", thread_idx, actual_arg_count,
-                            cfg.expected_arg_count
-                        );
-                        // Clean up cached state so a subsequent run does a full reload.
-                        if (*p_handle != nullptr) {
-                            dlclose(*p_handle);
-                            *p_handle = nullptr;
+                // Validate arg count on every run against the registered SO.
+                if (*p_config_func != nullptr) {
+                    PTO2OrchestrationConfig cfg = (*p_config_func)(orch_args_cached_);
+                    LOG_INFO_V0("Thread %d: Config: expected_args=%d", thread_idx, cfg.expected_arg_count);
+                    if (cfg.expected_arg_count > 0) {
+                        const ChipStorageTaskArgs &args_validate = runtime->get_orch_args();
+                        int32_t actual_arg_count = args_validate.tensor_count() + args_validate.scalar_count();
+                        if (actual_arg_count < cfg.expected_arg_count) {
+                            LOG_ERROR(
+                                "Thread %d: arg_count %d < expected %d", thread_idx, actual_arg_count,
+                                cfg.expected_arg_count
+                            );
+                            // The registered SO is fine — these run args are
+                            // incompatible with it. Run only consumes the slot
+                            // (no reload), so leave the table intact and just
+                            // fail this run; unblock scheduler threads first so
+                            // they don't spin forever.
+                            runtime_init_ready_.store(true, std::memory_order_release);
+                            return -1;
                         }
-                        if (p_path[0] != '\0') {
-                            unlink(p_path);
-                            p_path[0] = '\0';
-                        }
-                        *p_func = nullptr;
-                        *p_bind = nullptr;
-                        *p_config_func = nullptr;
-                        orch_so_table_[callable_id].in_use = false;
-                        // Unblock scheduler threads before returning so they don't spin forever.
-                        runtime_init_ready_.store(true, std::memory_order_release);
-                        return -1;
                     }
+                } else {
+                    LOG_INFO_V0("Thread %d: No config function, using defaults", thread_idx);
                 }
-            } else {
-                LOG_INFO_V0("Thread %d: No config function, using defaults", thread_idx);
-            }
 
-            INSTRUMENTATION_MARK_SET(g_TraCR_thread_idx, Allocating, 0);
+                INSTRUMENTATION_MARK_SET(g_TraCR_thread_idx, Allocating, 0);
 
-            // sm_handle / rt are bound to *this* run's memory and must be
-            // (re)created every run, regardless of whether the SO itself was
-            // reused above.
-            const ChipStorageTaskArgs &args = runtime->get_orch_args();
-            int32_t arg_count = args.tensor_count() + args.scalar_count();
-            LOG_INFO_V0("Thread %d: sm_ptr=%p, arg_count=%d", thread_idx, runtime->get_gm_sm_ptr(), arg_count);
-            for (int32_t i = 0; i < args.tensor_count() && i < 20; i++) {
-                const Tensor &t = args.tensor(i);
-                LOG_INFO_V0(
-                    "Thread %d: orch_args[%d] = TENSOR(data=0x%lx, ndims=%u, dtype=%u)", thread_idx, i,
-                    static_cast<uint64_t>(t.buffer.addr), t.ndims, static_cast<unsigned>(t.dtype)
-                );
+                // sm_handle / rt are bound to *this* run's memory and must be
+                // (re)created every run, regardless of whether the SO itself was
+                // reused above.
+                const ChipStorageTaskArgs &args = runtime->get_orch_args();
+                int32_t arg_count = args.tensor_count() + args.scalar_count();
+                LOG_INFO_V0("Thread %d: sm_ptr=%p, arg_count=%d", thread_idx, runtime->get_gm_sm_ptr(), arg_count);
+                for (int32_t i = 0; i < args.tensor_count() && i < 20; i++) {
+                    const Tensor &t = args.tensor(i);
+                    LOG_INFO_V0(
+                        "Thread %d: orch_args[%d] = TENSOR(data=0x%lx, ndims=%u, dtype=%u)", thread_idx, i,
+                        static_cast<uint64_t>(t.buffer.addr), t.ndims, static_cast<unsigned>(t.dtype)
+                    );
+                }
+                for (int32_t i = 0; i < args.scalar_count() && (args.tensor_count() + i) < 20; i++) {
+                    LOG_INFO_V0(
+                        "Thread %d: orch_args[%d] = SCALAR(0x%lx)", thread_idx, args.tensor_count() + i,
+                        static_cast<uint64_t>(args.scalar(i))
+                    );
+                }
+                sm_ptr = runtime->get_gm_sm_ptr();
             }
-            for (int32_t i = 0; i < args.scalar_count() && (args.tensor_count() + i) < 20; i++) {
-                LOG_INFO_V0(
-                    "Thread %d: orch_args[%d] = SCALAR(0x%lx)", thread_idx, args.tensor_count() + i,
-                    static_cast<uint64_t>(args.scalar(i))
-                );
-            }
-
-            void *sm_ptr = runtime->get_gm_sm_ptr();
 
             // Prebuilt-arena fast path. Host has pre-populated the entire
             // runtime arena (PTO2Runtime + orchestrator/scheduler/tensor_map
@@ -490,26 +495,29 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
             // wire arena-internal pointers to their device addresses, reset
             // the SM, and finalize the few device-only fields the host could
             // not know at image-build time.
-            void *prebuilt_arena = runtime->get_prebuilt_arena_base();
-            size_t off_runtime = runtime->get_prebuilt_runtime_offset();
-            if (prebuilt_arena == nullptr) {
-                LOG_ERROR("Thread %d: prebuilt_arena_base is null", thread_idx);
-                runtime_init_ready_.store(true, std::memory_order_release);
-                return -1;
-            }
-            runtime_arena_.attach(prebuilt_arena, DeviceArena::kDefaultBaseAlign);
-            rt = reinterpret_cast<PTO2Runtime *>(static_cast<char *>(prebuilt_arena) + off_runtime);
+            {
+                AicpuPhaseScope arena_wire(AicpuPhase::ArenaWire);
+                void *prebuilt_arena = runtime->get_prebuilt_arena_base();
+                size_t off_runtime = runtime->get_prebuilt_runtime_offset();
+                if (prebuilt_arena == nullptr) {
+                    LOG_ERROR("Thread %d: prebuilt_arena_base is null", thread_idx);
+                    runtime_init_ready_.store(true, std::memory_order_release);
+                    return -1;
+                }
+                runtime_arena_.attach(prebuilt_arena, DeviceArena::kDefaultBaseAlign);
+                rt = reinterpret_cast<PTO2Runtime *>(static_cast<char *>(prebuilt_arena) + off_runtime);
 
-            // Wire every arena-internal pointer field (host wrote host-mirror
-            // addresses; we overwrite them with device addresses).
-            runtime_wire_arena_pointers(runtime_arena_, rt->prebuilt_layout, rt);
-            uint64_t sm_size = PTO2SharedMemoryHandle::calculate_size_per_ring(rt->prebuilt_layout.task_window_sizes);
-            for (int r = 0; r < PTO2_MAX_RING_DEPTH; ++r) {
-                LOG_INFO_V0(
-                    "Thread %d: Ring %d sizes: task_window=%" PRIu64 " heap=%" PRIu64 " dep_pool=%d", thread_idx, r,
-                    rt->prebuilt_layout.task_window_sizes[r], rt->prebuilt_layout.heap_sizes[r],
-                    rt->prebuilt_layout.dep_pool_capacities[r]
-                );
+                // Wire every arena-internal pointer field (host wrote host-mirror
+                // addresses; we overwrite them with device addresses).
+                runtime_wire_arena_pointers(runtime_arena_, rt->prebuilt_layout, rt);
+                sm_size = PTO2SharedMemoryHandle::calculate_size_per_ring(rt->prebuilt_layout.task_window_sizes);
+                for (int r = 0; r < PTO2_MAX_RING_DEPTH; ++r) {
+                    LOG_INFO_V0(
+                        "Thread %d: Ring %d sizes: task_window=%" PRIu64 " heap=%" PRIu64 " dep_pool=%d", thread_idx, r,
+                        rt->prebuilt_layout.task_window_sizes[r], rt->prebuilt_layout.heap_sizes[r],
+                        rt->prebuilt_layout.dep_pool_capacities[r]
+                    );
+                }
             }
 
             // Reset SM state. setup_pointers + init_header_per_ring restore
@@ -517,44 +525,55 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
             // the per-slot ring->slot_states[] (bind_ring + reset_for_reuse +
             // fanin_count/active_mask zero — previously done inside
             // RingSchedState::init).
-            memset(rt->sm_handle, 0, sizeof(*rt->sm_handle));
-            if (!rt->sm_handle->init_per_ring(
-                    sm_ptr, sm_size, rt->prebuilt_layout.task_window_sizes, rt->prebuilt_layout.heap_sizes
-                )) {
-                LOG_ERROR("Thread %d: sm_handle->init_per_ring failed", thread_idx);
-                rt = nullptr;
-                runtime_init_ready_.store(true, std::memory_order_release);
-                return -1;
-            }
-
-            // AICore completion mailbox lives in the arena; reset it each
-            // boot so stale completion notifications from a previous run do
-            // not leak.
-            memset(rt->aicore_mailbox, 0, sizeof(*rt->aicore_mailbox));
-
-            // Fill ops / core counts (host can't resolve s_runtime_ops's
-            // device address nor know the SchedulerContext's core fan-out).
-            runtime_finalize_after_wire(rt, sched_ctx_.aic_count(), sched_ctx_.aiv_count());
-#if PTO2_PROFILING
-            rt->orchestrator.l2_swimlane_level = get_l2_swimlane_level();
             {
-                auto &orch = rt->orchestrator;
-                for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
-                    auto &alloc = orch.rings[r].task_allocator;
-                    scope_stats_set_ring_capacity(
-                        r, alloc.window_size(), alloc.heap_capacity(), rt->prebuilt_layout.dep_pool_capacities[r]
-                    );
+                AicpuPhaseScope sm_reset(AicpuPhase::SmReset);
+                memset(rt->sm_handle, 0, sizeof(*rt->sm_handle));
+                if (!rt->sm_handle->init_per_ring(
+                        sm_ptr, sm_size, rt->prebuilt_layout.task_window_sizes, rt->prebuilt_layout.heap_sizes
+                    )) {
+                    LOG_ERROR("Thread %d: sm_handle->init_per_ring failed", thread_idx);
+                    rt = nullptr;
+                    runtime_init_ready_.store(true, std::memory_order_release);
+                    return -1;
                 }
-                scope_stats_set_tensormap_capacity(orch.tensor_map.pool_capacity());
-            }
+
+                // AICore completion mailbox lives in the pooled arena, so its
+                // head/tail/seq survive across runs and stay monotonic. We do
+                // NOT zero entries[] (256 KB): try_pop only reads a slot whose
+                // seq matches the exact current ticket, and a producer writes
+                // all payload before release-storing seq, so a prior run's stale
+                // seq can never false-match a fresh ticket. The only per-boot
+                // need is to discard any messages an error-aborted prior run
+                // left undrained (head > tail) so the new consumer starts empty;
+                // single-threaded here (no producers yet), tail := head does it.
+                rt->aicore_mailbox->tail.store(
+                    rt->aicore_mailbox->head.load(std::memory_order_acquire), std::memory_order_release
+                );
+
+                // Fill ops / core counts (host can't resolve s_runtime_ops's
+                // device address nor know the SchedulerContext's core fan-out).
+                runtime_finalize_after_wire(rt, sched_ctx_.aic_count(), sched_ctx_.aiv_count());
+#if PTO2_PROFILING
+                rt->orchestrator.l2_swimlane_level = get_l2_swimlane_level();
+                {
+                    auto &orch = rt->orchestrator;
+                    for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
+                        auto &alloc = orch.rings[r].task_allocator;
+                        scope_stats_set_ring_capacity(
+                            r, alloc.window_size(), alloc.heap_capacity(), rt->prebuilt_layout.dep_pool_capacities[r]
+                        );
+                    }
+                    scope_stats_set_tensormap_capacity(orch.tensor_map.pool_capacity());
+                }
 #endif
 
-            // With multi-ring, slot_states are per-ring inside the scheduler.
-            runtime->set_slot_states_ptr(nullptr);
+                // With multi-ring, slot_states are per-ring inside the scheduler.
+                runtime->set_slot_states_ptr(nullptr);
 
-            // Wire scheduler context to the newly created PTO2Runtime before
-            // releasing scheduler threads from runtime_init_ready_.
-            sched_ctx_.bind_runtime(rt);
+                // Wire scheduler context to the newly created PTO2Runtime before
+                // releasing scheduler threads from runtime_init_ready_.
+                sched_ctx_.bind_runtime(rt);
+            }
 
             runtime_init_ready_.store(true, std::memory_order_release);
 
@@ -758,7 +777,8 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
         finished_.store(true, std::memory_order_release);
         // Destroy PTO2 runtime. sm_handle / rt are recreated every run so we
         // always tear them down here, but we keep the per-cid orch SO entries
-        // alive for the next run's cache-hit reuse (see run() reload_so branch).
+        // alive — they are loaded once by register_callable and consumed by
+        // every subsequent run.
         if (rt != nullptr) {
             // Clear g_current_runtime in this DSO and in the orchestration SO before destroying rt.
             const int32_t callable_id = runtime->get_active_callable_id();
@@ -778,10 +798,11 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
 }
 
 void AicpuExecutor::deinit(Runtime *runtime) {
-    // 1. Invalidate AICPU cache for Runtime address range.
-    //    Next round's Host DMA (rtMemcpy) writes fresh Runtime to HBM but
-    //    bypasses this cache. Invalidating now ensures next round reads from HBM.
-    cache_invalidate_range(runtime, sizeof(Runtime));
+    // 1. Invalidate AICPU cache for the device-copied Runtime range (`dev`).
+    //    Next round's Host DMA (rtMemcpy) writes fresh bytes to HBM but
+    //    bypasses this cache. Invalidating now ensures next round reads from
+    //    HBM. Only `dev` is uploaded, so only `dev` needs invalidation.
+    cache_invalidate_range(runtime, sizeof(runtime->dev));
 
     // Reset all SchedulerContext-owned state in one place.
     sched_ctx_.deinit();
@@ -795,9 +816,9 @@ void AicpuExecutor::deinit(Runtime *runtime) {
     serial_orch_sched_ = false;
 
     orch_args_cached_.reset();
-    // orch_so_table_ entries are intentionally preserved across deinit: the
-    // next run reuses cached handles when register_new_callable_id() returns
-    // false. The destructor releases them at process teardown.
+    // orch_so_table_ entries are intentionally preserved across deinit: they
+    // are loaded once by register_callable and consumed by every subsequent
+    // run. The destructor releases them at process teardown.
 
     // Clear file-scope PTO2Runtime pointer (freed by orchestrator thread before deinit)
     rt = nullptr;
@@ -821,7 +842,7 @@ void AicpuExecutor::deinit(Runtime *runtime) {
 
 /**
  * init tracr profiler
- * 
+ *
  * NOTE: make sure g_TraCR_thread_idx starts at 0 and follows in the positive direction
  */
 inline void TRACR_START() {
@@ -836,7 +857,7 @@ inline void TRACR_START() {
 
 /**
  * finalizing tracr function
- * 
+ *
  * NOTE: make shure g_TraCR_thread_idx starts at 0 and follows in the positive direction
  */
 inline void TRACR_FINALIZE(Runtime *runtime) {
@@ -877,18 +898,28 @@ inline void TRACR_FINALIZE(Runtime *runtime) {
 }
 
 
-extern "C" int32_t aicpu_prewarm_callable(Runtime *runtime) {
-    if (runtime == nullptr) {
-        LOG_ERROR("%s", "aicpu_prewarm_callable: null Runtime pointer");
+// Device orchestration SO registration entry. Exported directly by the runtime
+// (not via a platform forwarding shell): registration is a TMARB-only ability,
+// so the symbol lives where the capability does. host_build_graph does not
+// export it at all (host-side orchestration has nothing to register).
+extern "C" __attribute__((visibility("default"))) int simpler_aicpu_register_callable(void *arg) {
+    if (arg == nullptr) {
+        LOG_ERROR("%s", "simpler_aicpu_register_callable: null RegisterCallableArgs pointer");
         return -1;
     }
-    int32_t rc = g_aicpu_executor.ensure_orch_so_loaded(runtime, /*thread_idx=*/0);
-    cache_invalidate_range(runtime, sizeof(Runtime));
+    const RegisterCallableArgs *args = reinterpret_cast<const RegisterCallableArgs *>(arg);
+    // `arg` is the launch-arg payload CANN copies into the AICPU arg space
+    // (same coherent channel exec reads KernelArgs fields from) — no HBM deref,
+    // so unlike the old prewarm path there is no Runtime to cache-invalidate.
+    int32_t rc = g_aicpu_executor.load_orch_so(
+        args->active_callable_id, args->dev_orch_so_addr, args->dev_orch_so_size, args->device_orch_func_name,
+        args->device_orch_config_name, /*thread_idx=*/0
+    );
     if (rc != 0) {
-        LOG_ERROR("aicpu_prewarm_callable: SO load failed with rc=%d", rc);
+        LOG_ERROR("simpler_aicpu_register_callable: SO load failed with rc=%d", rc);
         return rc;
     }
-    LOG_INFO_V0("aicpu_prewarm_callable: completed for callable_id=%d", runtime->get_active_callable_id());
+    LOG_INFO_V0("simpler_aicpu_register_callable: completed for callable_id=%d", args->active_callable_id);
     return 0;
 }
 
@@ -918,33 +949,43 @@ extern "C" int32_t aicpu_execute(Runtime *runtime) {
     LOG_INFO_V9("[TraCR] thread[%d:%d] start ENABLE_TRACR=%d", g_TraCR_thread_idx, tracr_getcpu(), INSTRUMENTATION_ACTIVE);
 
 
-    aicpu_phase_start(AicpuPhase::Preamble);
-    g_aicpu_executor.init(runtime);
-
-    while (!g_aicpu_executor.init_done_.load(std::memory_order_acquire)) {
-        if (g_aicpu_executor.init_failed_.load(std::memory_order_acquire)) {
-            LOG_ERROR("%s", "aicpu_execute: Initialization failed, aborting execution");
-            return -1;
+    // Each phase is bracketed by its own scope so the start/end boundaries are
+    // visible and an early `return` still records the end via the guard dtor.
+    // rc / runtime_rc are declared out here because they outlive their phase.
+    {
+        AicpuPhaseScope preamble(AicpuPhase::Preamble);
+        g_aicpu_executor.init(runtime);
+        while (!g_aicpu_executor.init_done_.load(std::memory_order_acquire)) {
+            if (g_aicpu_executor.init_failed_.load(std::memory_order_acquire)) {
+                LOG_ERROR("%s", "aicpu_execute: Initialization failed, aborting execution");
+                return -1;
+            }
         }
     }
-    aicpu_phase_end(AicpuPhase::Preamble);
 
-    aicpu_phase_start(AicpuPhase::GraphBuild);
-    int32_t rc = g_aicpu_executor.run(runtime);
-    aicpu_phase_end(AicpuPhase::GraphBuild);
+    int32_t rc = 0;
+    {
+        AicpuPhaseScope graph_build(AicpuPhase::GraphBuild);
+        rc = g_aicpu_executor.run(runtime);
+    }
     if (rc != 0) {
         LOG_ERROR("aicpu_execute: Thread execution failed with rc=%d", rc);
     }
 
-    aicpu_phase_start(AicpuPhase::PostOrch);
+    // PostOrch measures only the real teardown (deinit), and only on the last
+    // thread to finish. Stamping it on every thread would let an orchestrator
+    // thread that finished early (it submits then returns while the scheduler
+    // threads are still draining) open the window at its early exit, so the
+    // cross-thread max(end)-min(start) reduction would absorb the orch-waits-for-
+    // sched overlap into post_orch — inflating it well past the actual teardown.
+    // read_pto2_runtime_status is two atomic loads every thread needs, so it
+    // stays outside the scope.
     int32_t runtime_rc = read_pto2_runtime_status(runtime);
-
-    // Last thread cleans up
     if (g_aicpu_executor.finished_.load(std::memory_order_acquire)) {
+        AicpuPhaseScope post_orch(AicpuPhase::PostOrch);
         LOG_INFO_V0("aicpu_execute: Last thread finished, cleaning up");
         g_aicpu_executor.deinit(runtime);
     }
-    aicpu_phase_end(AicpuPhase::PostOrch);
 
     INSTRUMENTATION_MARK_RESET(g_TraCR_thread_idx);
     // Finalize TraCR all threads coming in

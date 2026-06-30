@@ -193,7 +193,10 @@ def pytest_addoption(parser):
         "--pto-isa-commit",
         action="store",
         default=None,
-        help=("Override the pto-isa revision before running tests. Default/latest: use the current checkout HEAD."),
+        help=(
+            "Override the pto-isa revision before running tests. "
+            "Default: use pto_isa.pin. Use latest/head/none to track origin/HEAD."
+        ),
     )
     parser.addoption(
         "--clone-protocol",

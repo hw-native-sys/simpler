@@ -9,6 +9,16 @@
  * -----------------------------------------------------------------------------------------------------------
  */
 
+/**
+ * Negative ST orchestration: PTO2_ERROR_EXPLICIT_ORCH_FATAL (code 9).
+ *
+ * The orchestration author's own escape hatch: rt_report_fatal() latches a
+ * user-chosen code (9 here) directly, no runtime resource needs to be exhausted.
+ * After the fatal, every subsequent orchestration API call must short-circuit to
+ * a no-op rather than fall through into runtime-side asserts or extra reporting,
+ * so this also exercises a few post-fatal calls.
+ */
+
 #include <stdint.h>
 
 #include "pto_orchestration_api.h"  // NOLINT(build/include_subdir)
@@ -31,8 +41,8 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const L2Ta
 
     rt_report_fatal(PTO2_ERROR_EXPLICIT_ORCH_FATAL, "st injected fatal");
 
-    // Exercise API short-circuit after fatal. These calls must become no-ops
-    // instead of falling through into runtime-side asserts or extra reporting.
+    // Exercise API short-circuit after fatal: these must become no-ops, not fall
+    // through into runtime-side asserts or extra reporting.
     L0TaskArgs alloc_args;
     (void)alloc_tensors(alloc_args);
 

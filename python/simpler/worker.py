@@ -714,7 +714,7 @@ def _read_args_from_mailbox(buf) -> TaskArgs:
     Used by the Python-targeted child loops (sub_worker, nested L4+ child)
     where the destination of `args` is a Python callable that needs a
     typed TaskArgs object.  The chip-child loops that immediately forward
-    to C++ run use the zero-copy `run_prepared_from_blob` path
+    to C++ run use the zero-copy `run_from_blob` path
     instead — see those loops for the matching comment.
 
     Delegates to the nanobind helper so the Tensor layout is
@@ -933,22 +933,13 @@ def _comm_base_handle(cw: ChipWorker) -> int:
     return int(handle)
 
 
-def _ensure_prepared(cw, registry, prepared, cid: int, *, lazy: bool, device_id: int) -> None:
+def _ensure_prepared(cw, registry, prepared, cid: int, *, device_id: int) -> None:
     if cid in prepared:
         return
     callable_obj = registry.get(cid)
     if callable_obj is None:
         raise RuntimeError(f"chip_process dev={device_id}: cid {cid} not in registry")
-    if lazy:
-        # Reaching the lazy branch means _CTRL_PREPARE prewarm did not run
-        # for this cid before the first TASK_READY; the child still does
-        # the work, but the resulting H2D + dlopen cost lands on the
-        # first task's latency.  Log so the gap is visible in stderr.
-        sys.stderr.write(
-            f"[chip_process pid={os.getpid()} dev={device_id}] WARN: lazy-prepare cid={cid}; prewarm path missed it\n"
-        )
-        sys.stderr.flush()
-    cw._prepare_callable_at_slot(cid, callable_obj)
+    cw._register_callable_at_slot(cid, callable_obj)
     prepared.add(cid)
 
 
@@ -969,16 +960,17 @@ def _run_chip_main_loop(  # noqa: PLR0912, PLR0913, PLR0915 -- unified TASK_READ
     """Unified TASK_READY / CONTROL_REQUEST / SHUTDOWN state machine.
 
     `on_task_done_success`, if provided, is invoked after a successful
-    ``run_prepared_from_blob`` and before publishing TASK_DONE. It must
+    ``run_from_blob`` and before publishing TASK_DONE. It must
     return ``(code, msg)`` — typically ``(0, "")`` on success, or an
     error tuple if the hook itself failed (e.g. D2H staging error).
     Returning a non-zero code overrides the kernel's success.
 
     TASK_READY carries a callable digest. The child resolves it to a
-    target-local slot, prepares that slot once, then runs it. ``_CTRL_PREPARE``
-    is the explicit pre-warm path (parent pushes after init() to amortise the
-    first H2D upload); TASK_READY preserves the historical lazy-prepare safety
-    net when the digest mapping exists but prewarm was missed.
+    target-local slot and runs it. The slot must already be prepared via
+    ``_CTRL_PREPARE`` (the explicit registration path the parent pushes after
+    init() to stage the H2D upload + device-orch load); a TASK_READY for an
+    unprepared slot is a control-flow error and fails the task rather than
+    lazily preparing it.
     """
     prepared: set[int] = set()
     l3_l2_control_shms: list[SharedMemory] = []
@@ -995,15 +987,22 @@ def _run_chip_main_loop(  # noqa: PLR0912, PLR0913, PLR0915 -- unified TASK_READ
                 try:
                     if cid is None:
                         raise RuntimeError(f"callable hash {_format_digest(digest)} not registered")
-                    _ensure_prepared(cw, registry, prepared, cid, lazy=True, device_id=device_id)
+                    # Run only consumes a prepared slot — it never lazily
+                    # prepares. The callable must have been staged via
+                    # _CTRL_PREPARE first; reaching TASK_READY without it is a
+                    # control-flow bug, so fail loudly instead of masking the
+                    # missing-prepare with a first-task latency spike.
+                    if cid not in prepared:
+                        raise RuntimeError(
+                            f"chip_process dev={device_id}: cid {cid} not prepared before TASK_READY "
+                            f"(register via _CTRL_PREPARE first)"
+                        )
                     # Hand the mailbox bytes straight to C++ (zero-copy zero-decode):
                     # the blob layout is what `write_blob` already wrote, so re-parsing
                     # it in Python is N×40B of avoidable work and a permanent
                     # opportunity to drop a field.  C++ reinterpret_cast<ChipStorageTaskArgs*>
                     # is the source of truth.
-                    cw._impl.run_prepared_from_blob(
-                        cid, mailbox_addr + _OFF_TASK_ARGS_BLOB, _MAILBOX_ARGS_CAPACITY, cfg
-                    )
+                    cw._impl.run_from_blob(cid, mailbox_addr + _OFF_TASK_ARGS_BLOB, _MAILBOX_ARGS_CAPACITY, cfg)
                 except Exception as e:  # noqa: BLE001
                     code = 1
                     msg = _format_exc(f"chip_process dev={device_id}", e)
@@ -1047,7 +1046,7 @@ def _run_chip_main_loop(  # noqa: PLR0912, PLR0913, PLR0915 -- unified TASK_READ
                             raise RuntimeError(
                                 f"prepare chip={device_id}: callable hash {_format_digest(digest)} not registered"
                             )
-                        _ensure_prepared(cw, registry, prepared, int(cid), lazy=False, device_id=device_id)
+                        _ensure_prepared(cw, registry, prepared, int(cid), device_id=device_id)
                     elif sub_cmd == _CTRL_REGISTER:
                         digest = _read_control_digest(buf)
                         payload_size = struct.unpack_from("Q", buf, _CTRL_OFF_ARG0)[0]
@@ -1088,14 +1087,14 @@ def _run_chip_main_loop(  # noqa: PLR0912, PLR0913, PLR0915 -- unified TASK_READ
                                 exported = ctypes.c_char.from_buffer(shm_buf)
                                 try:
                                     addr = ctypes.addressof(exported)
-                                    cw._impl.prepare_callable_from_blob(int(cid), addr)
+                                    cw._impl.register_callable_from_blob(int(cid), addr)
                                 finally:
                                     del exported
                                 prepared.add(int(cid))
                         finally:
                             shm_buf.release()
                             # Release the local mmap as soon as prepare returns;
-                            # prepare_callable has already H2D-copied the bytes to
+                            # register_callable has already H2D-copied the bytes to
                             # device GM, so the child no longer needs the shm.
                             shm.close()
                     elif sub_cmd == _CTRL_UNREGISTER:
@@ -2122,7 +2121,7 @@ class Worker:
             assert self._chip_worker is not None
             with self._registry_lock:
                 slot_id = self._identity_registry[handle.digest].slot_id
-            self._chip_worker._prepare_callable_at_slot(slot_id, target)
+            self._chip_worker._register_callable_at_slot(slot_id, target)
         return handle
 
     def _python_worker_types(self) -> list[WorkerType]:
@@ -2882,7 +2881,7 @@ class Worker:
         assert self._chip_worker is not None
         for cid, target in self._callable_registry.items():
             if isinstance(target, ChipCallable):
-                self._chip_worker._prepare_callable_at_slot(cid, target)
+                self._chip_worker._register_callable_at_slot(cid, target)
 
     def _init_hierarchical(self) -> None:
         device_ids = self._config.get("device_ids", [])
@@ -3806,7 +3805,7 @@ class Worker:
 
         Returns ``None``. Per-stage run timing (host wall, on-NPU device wall +
         AICPU phase breakdown) is no longer returned — the platform emits it as
-        ``[STRACE]`` log markers from each L2 ``run_prepared``, so the L3
+        ``[STRACE]`` log markers from each L2 ``simpler_run``, so the L3
         dispatcher and its L2 children are observed uniformly. Parse the markers
         with ``simpler_setup.tools.strace_timing`` (see
         ``docs/dfx/host-trace.md``).
@@ -3866,7 +3865,7 @@ class Worker:
                 if self._live_domains:
                     self._release_all_live_domains()
         # L3+ returns None like every other worker level; per-L2-child timing
-        # is emitted as `[STRACE]` markers from each run_prepared.
+        # is emitted as `[STRACE]` markers from each simpler_run.
         return None
 
     @property

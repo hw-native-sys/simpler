@@ -62,7 +62,7 @@ def _build_vector_callable(platform: str, *, extra_unused_child: bool = False) -
     """Compile the vector_example orchestration + 3 AIV kernels.
 
     Mirrors how SceneTestCase._compile_chip_callable_from_spec assembles
-    a ChipCallable, but inline so the test can call prepare_callable() on it both
+    a ChipCallable, but inline so the test can call register_callable() on it both
     before and after init().
     """
     from simpler.task_interface import CoreCallable  # noqa: PLC0415
@@ -306,7 +306,7 @@ def test_duplicate_prepare_same_hashid_survives_one_unregister(st_platform, st_d
     """prepare same hashid twice, unregister one handle, run the other.
 
     This is the hashid-specific post-start path: the second
-    ``prepare_callable(same_chip_callable)`` must return a distinct handle for
+    ``register_callable(same_chip_callable)`` must return a distinct handle for
     the same hashid. Unregistering one handle must only drop that public
     handle; the remaining handle must still dispatch successfully.
     """

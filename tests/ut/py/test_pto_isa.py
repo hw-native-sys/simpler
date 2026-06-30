@@ -10,10 +10,264 @@
 
 import json
 import os
+import subprocess
 
 import pytest
 
 from simpler_setup import pto_isa
+
+PIN_A = "a" * 40
+PIN_B = "b" * 40
+PIN_C = "c" * 40
+
+
+def test_read_pto_isa_pin_reads_valid_pin(tmp_path):
+    pin = tmp_path / "pto_isa.pin"
+    pin.write_text(f"{PIN_A}\n")
+
+    assert pto_isa.read_pto_isa_pin(pin) == PIN_A
+
+
+def test_read_pto_isa_pin_missing_warns_and_returns_none(tmp_path, caplog):
+    caplog.set_level("WARNING", logger="simpler_setup.pto_isa")
+
+    assert pto_isa.read_pto_isa_pin(tmp_path / "missing.pin") is None
+    assert "falling back to latest pto-isa" in caplog.text
+
+
+def test_read_pto_isa_pin_empty_warns_and_returns_none(tmp_path, caplog):
+    pin = tmp_path / "pto_isa.pin"
+    pin.write_text("\n")
+    caplog.set_level("WARNING", logger="simpler_setup.pto_isa")
+
+    assert pto_isa.read_pto_isa_pin(pin) is None
+    assert "is empty" in caplog.text
+
+
+def test_read_pto_isa_pin_rejects_invalid_content(tmp_path):
+    pin = tmp_path / "pto_isa.pin"
+    pin.write_text("not-a-sha\n")
+
+    with pytest.raises(RuntimeError, match="Invalid PTO-ISA pin"):
+        pto_isa.read_pto_isa_pin(pin)
+
+
+def test_resolve_pto_isa_commit_prefers_explicit_over_env_and_pin(monkeypatch):
+    monkeypatch.setenv("SIMPLER_PTO_ISA_COMMIT", PIN_B)
+    monkeypatch.setattr(pto_isa, "read_pto_isa_pin", lambda: PIN_C)
+
+    assert pto_isa.resolve_pto_isa_commit(PIN_A) == PIN_A
+
+
+def test_resolve_pto_isa_commit_prefers_env_over_pin(monkeypatch):
+    monkeypatch.setenv("SIMPLER_PTO_ISA_COMMIT", PIN_B)
+    monkeypatch.setattr(pto_isa, "read_pto_isa_pin", lambda: PIN_C)
+
+    assert pto_isa.resolve_pto_isa_commit() == PIN_B
+
+
+def test_resolve_pto_isa_commit_uses_pin_by_default(monkeypatch):
+    monkeypatch.delenv("SIMPLER_PTO_ISA_COMMIT", raising=False)
+    monkeypatch.setattr(pto_isa, "read_pto_isa_pin", lambda: PIN_C)
+
+    assert pto_isa.resolve_pto_isa_commit() == PIN_C
+
+
+@pytest.mark.parametrize("value", ["latest", "head", "none", ""])
+def test_resolve_pto_isa_commit_explicit_unpinned_values_return_none(value, monkeypatch):
+    monkeypatch.setenv("SIMPLER_PTO_ISA_COMMIT", PIN_B)
+    monkeypatch.setattr(pto_isa, "read_pto_isa_pin", lambda: PIN_C)
+
+    assert pto_isa.resolve_pto_isa_commit(value) is None
+
+
+def test_resolve_pto_isa_commit_env_latest_overrides_pin(monkeypatch):
+    monkeypatch.setenv("SIMPLER_PTO_ISA_COMMIT", "latest")
+    monkeypatch.setattr(pto_isa, "read_pto_isa_pin", lambda: PIN_C)
+
+    assert pto_isa.resolve_pto_isa_commit() is None
+
+
+def test_ensure_pto_isa_root_uses_pin_instead_of_latest_for_existing_clone(tmp_path, monkeypatch):
+    clone_path = tmp_path / "build" / "pto-isa"
+    (clone_path / "include").mkdir(parents=True)
+    checked_out = []
+    updated = []
+
+    monkeypatch.delenv("PTO_ISA_ROOT", raising=False)
+    monkeypatch.delenv("SIMPLER_PTO_ISA_COMMIT", raising=False)
+    monkeypatch.setattr(pto_isa, "read_pto_isa_pin", lambda: PIN_A)
+    monkeypatch.setattr(pto_isa, "get_pto_isa_clone_path", lambda: clone_path)
+    monkeypatch.setattr(
+        pto_isa,
+        "checkout_pto_isa_commit",
+        lambda path, commit, verbose=False: checked_out.append(commit) or True,
+    )
+    monkeypatch.setattr(pto_isa, "_update_to_latest", lambda path, verbose: updated.append(path))
+    monkeypatch.setattr(pto_isa, "_record_runtime_pto_isa", lambda root: None)
+
+    assert pto_isa.ensure_pto_isa_root(update_if_exists=True) == str(clone_path.resolve())
+    assert checked_out == [PIN_A]
+    assert updated == []
+
+
+def test_ensure_pto_isa_root_latest_still_updates_existing_clone(tmp_path, monkeypatch):
+    clone_path = tmp_path / "build" / "pto-isa"
+    (clone_path / "include").mkdir(parents=True)
+    checked_out = []
+    updated = []
+
+    monkeypatch.delenv("PTO_ISA_ROOT", raising=False)
+    monkeypatch.setattr(pto_isa, "read_pto_isa_pin", lambda: PIN_A)
+    monkeypatch.setattr(pto_isa, "get_pto_isa_clone_path", lambda: clone_path)
+    monkeypatch.setattr(
+        pto_isa,
+        "checkout_pto_isa_commit",
+        lambda path, commit, verbose=False: checked_out.append(commit) or True,
+    )
+    monkeypatch.setattr(pto_isa, "_update_to_latest", lambda path, verbose: updated.append(path))
+    monkeypatch.setattr(pto_isa, "_record_runtime_pto_isa", lambda root: None)
+
+    assert pto_isa.ensure_pto_isa_root(commit="latest", update_if_exists=True) == str(clone_path.resolve())
+    assert checked_out == []
+    assert updated == [clone_path]
+
+
+def test_checkout_pto_isa_commit_rejects_non_git_clone(tmp_path, monkeypatch, caplog):
+    calls = []
+
+    def fake_run_git(args, cwd=None, timeout=30, check=False):
+        calls.append(args)
+        return subprocess.CompletedProcess(["git", *args], returncode=128, stdout="", stderr="not a git repo")
+
+    monkeypatch.setattr(pto_isa, "_run_git", fake_run_git)
+    caplog.set_level("WARNING", logger="simpler_setup.pto_isa")
+
+    assert not pto_isa.checkout_pto_isa_commit(tmp_path, PIN_A)
+    assert calls == [["rev-parse", "--short", "HEAD"]]
+    assert "Failed to read pto-isa HEAD" in caplog.text
+
+
+def test_checkout_pto_isa_commit_marks_dubious_clone_safe_and_retries(tmp_path, monkeypatch):
+    calls = []
+    dubious = "fatal: detected dubious ownership in repository\nsafe.directory"
+    safe_arg = f"safe.directory={tmp_path.resolve()}"
+    normal_attempts = set()
+
+    def fake_run_git(args, cwd=None, timeout=30, check=False):
+        calls.append((args, cwd, check))
+        if (
+            args
+            in (
+                ["rev-parse", "--short", "HEAD"],
+                ["fetch", "origin"],
+                ["checkout", PIN_A],
+            )
+            and tuple(args) not in normal_attempts
+        ):
+            normal_attempts.add(tuple(args))
+            return subprocess.CompletedProcess(["git", *args], returncode=128, stdout="", stderr=dubious)
+        if args == ["-c", safe_arg, "rev-parse", "--short", "HEAD"]:
+            return subprocess.CompletedProcess(["git", *args], returncode=0, stdout="bbbbbbb\n", stderr="")
+        return subprocess.CompletedProcess(["git", *args], returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(pto_isa, "_run_git", fake_run_git)
+
+    assert pto_isa.checkout_pto_isa_commit(tmp_path, PIN_A)
+    assert calls == [
+        (["rev-parse", "--short", "HEAD"], tmp_path, False),
+        (["-c", safe_arg, "rev-parse", "--short", "HEAD"], tmp_path, False),
+        (["fetch", "origin"], tmp_path, False),
+        (["-c", safe_arg, "fetch", "origin"], tmp_path, False),
+        (["checkout", PIN_A], tmp_path, False),
+        (["-c", safe_arg, "checkout", PIN_A], tmp_path, False),
+    ]
+
+
+def test_get_pto_isa_head_retries_dubious_ownership(tmp_path, monkeypatch):
+    calls = []
+    dubious = "fatal: detected dubious ownership in repository\nsafe.directory"
+    safe_arg = f"safe.directory={tmp_path.resolve()}"
+
+    def fake_run_git(args, cwd=None, timeout=30, check=False):
+        calls.append((args, cwd, check))
+        if args == ["rev-parse", "HEAD"]:
+            return subprocess.CompletedProcess(["git", *args], returncode=128, stdout="", stderr=dubious)
+        if args == ["-c", safe_arg, "rev-parse", "HEAD"]:
+            return subprocess.CompletedProcess(["git", *args], returncode=0, stdout=f"{PIN_A}\n", stderr="")
+        return subprocess.CompletedProcess(["git", *args], returncode=1, stdout="", stderr="unexpected")
+
+    monkeypatch.setattr(pto_isa, "_run_git", fake_run_git)
+
+    assert pto_isa.get_pto_isa_head(str(tmp_path)) == PIN_A
+    assert calls == [
+        (["rev-parse", "HEAD"], tmp_path, False),
+        (["-c", safe_arg, "rev-parse", "HEAD"], tmp_path, False),
+    ]
+
+
+def test_update_to_latest_retries_dubious_ownership(tmp_path, monkeypatch):
+    calls = []
+    dubious = "fatal: detected dubious ownership in repository\nsafe.directory"
+    safe_arg = f"safe.directory={tmp_path.resolve()}"
+    normal_attempts = set()
+
+    def fake_run_git(args, cwd=None, timeout=30, check=False):
+        calls.append((args, cwd, check))
+        if args in (["fetch", "origin"], ["reset", "--hard", "origin/HEAD"]) and tuple(args) not in normal_attempts:
+            normal_attempts.add(tuple(args))
+            return subprocess.CompletedProcess(["git", *args], returncode=128, stdout="", stderr=dubious)
+        return subprocess.CompletedProcess(["git", *args], returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(pto_isa, "_run_git", fake_run_git)
+
+    pto_isa._update_to_latest(tmp_path, verbose=False)
+    assert calls == [
+        (["fetch", "origin"], tmp_path, False),
+        (["-c", safe_arg, "fetch", "origin"], tmp_path, False),
+        (["reset", "--hard", "origin/HEAD"], tmp_path, False),
+        (["-c", safe_arg, "reset", "--hard", "origin/HEAD"], tmp_path, False),
+    ]
+
+
+def test_ensure_pto_isa_root_rejects_existing_clone_when_pin_checkout_fails(tmp_path, monkeypatch):
+    clone_path = tmp_path / "build" / "pto-isa"
+    (clone_path / "include").mkdir(parents=True)
+    updated = []
+
+    monkeypatch.delenv("PTO_ISA_ROOT", raising=False)
+    monkeypatch.delenv("SIMPLER_PTO_ISA_COMMIT", raising=False)
+    monkeypatch.setattr(pto_isa, "read_pto_isa_pin", lambda: PIN_A)
+    monkeypatch.setattr(pto_isa, "get_pto_isa_clone_path", lambda: clone_path)
+    monkeypatch.setattr(pto_isa, "checkout_pto_isa_commit", lambda path, commit, verbose=False: False)
+    monkeypatch.setattr(pto_isa, "_update_to_latest", lambda path, verbose: updated.append(path))
+    monkeypatch.setattr(pto_isa, "_record_runtime_pto_isa", lambda root: None)
+
+    with pytest.raises(OSError, match="PTO-ISA not available"):
+        pto_isa.ensure_pto_isa_root(update_if_exists=True)
+    assert updated == []
+
+
+def test_ensure_pto_isa_root_rejects_clone_when_pin_checkout_fails_after_clone(tmp_path, monkeypatch):
+    clone_path = tmp_path / "build" / "pto-isa"
+    updated = []
+
+    def clone_then_fail(target, commit, clone_protocol, verbose):
+        (target / "include").mkdir(parents=True)
+        return False
+
+    monkeypatch.delenv("PTO_ISA_ROOT", raising=False)
+    monkeypatch.delenv("SIMPLER_PTO_ISA_COMMIT", raising=False)
+    monkeypatch.setattr(pto_isa, "read_pto_isa_pin", lambda: PIN_A)
+    monkeypatch.setattr(pto_isa, "get_pto_isa_clone_path", lambda: clone_path)
+    monkeypatch.setattr(pto_isa, "_clone", clone_then_fail)
+    monkeypatch.setattr(pto_isa, "checkout_pto_isa_commit", lambda path, commit, verbose=False: False)
+    monkeypatch.setattr(pto_isa, "_update_to_latest", lambda path, verbose: updated.append(path))
+    monkeypatch.setattr(pto_isa, "_record_runtime_pto_isa", lambda root: None)
+
+    with pytest.raises(OSError, match="PTO-ISA not available"):
+        pto_isa.ensure_pto_isa_root(update_if_exists=True)
+    assert updated == []
 
 
 def test_write_pto_isa_build_metadata_records_actual_head(tmp_path, monkeypatch):
@@ -49,6 +303,7 @@ def test_validate_runtime_pto_isa_rejects_when_run_commit_unavailable(tmp_path, 
     monkeypatch.delenv("SIMPLER_RUN_PTO_ISA_COMMIT", raising=False)
     monkeypatch.delenv("PTO_ISA_ROOT", raising=False)
     monkeypatch.delenv("SIMPLER_PTO_ISA_COMMIT", raising=False)
+    monkeypatch.setattr(pto_isa, "read_pto_isa_pin", lambda: None)
 
     with pytest.raises(RuntimeError, match="Cannot verify PTO-ISA runtime revision"):
         pto_isa.validate_runtime_pto_isa_compatible(tmp_path)

@@ -332,3 +332,77 @@ TEST(AICoreCompletionMailbox, ProducerInterleavedWithDrain) {
 
     destroy_mailbox(mb);
 }
+
+// =============================================================================
+// Cross-run reuse without zeroing entries[]. The pooled-arena fast path keeps
+// the mailbox's head/tail/seq monotonic across boots and resets per-boot with
+// tail := head (NOT a 256KB memset). This pins down the two invariants that
+// makes safe:
+//   1. After a full capacity wrap every slot holds a STALE seq from a prior
+//      generation; a fresh push's release-store of the new (larger) seq must be
+//      the only value try_pop accepts — the stale seq must never false-match.
+//   2. tail := head discards messages an error-aborted prior run left undrained
+//      (head > tail) so the next consumer starts empty.
+// =============================================================================
+
+TEST(AICoreCompletionMailbox, MonotonicSeqSurvivesCapacityWrapWithoutZeroing) {
+    AICoreCompletionMailbox *mb = fresh_mailbox();
+
+    // Drive head/tail one full capacity past the wrap point so every physical
+    // slot has been published once and now carries a stale seq in [1, CAPACITY].
+    // Each push is drained immediately so the ring never reports full.
+    PTO2TaskId token = make_token(7);
+    AICoreCompletionMsgView msg;
+    for (uint64_t i = 0; i < AICORE_COMPLETION_MAILBOX_CAPACITY + 17; i++) {
+        ASSERT_TRUE(
+            mb->try_push_condition(token, /*addr=*/i, /*expected=*/0, COMPLETION_ENGINE_SDMA, COMPLETION_TYPE_COUNTER)
+        );
+        ASSERT_TRUE(mb->try_pop(msg));
+        EXPECT_EQ(msg.addr, i);
+    }
+    ASSERT_FALSE(mb->try_pop(msg));  // drained: tail == head
+
+    // Slot 0 now physically holds seq=1 (from the very first push). The next
+    // push reuses it but publishes seq = head+1 (well past CAPACITY). try_pop
+    // must accept only that fresh value — proving stale seq cannot be replayed.
+    const uint64_t addr_after_wrap = 0xABCD1234ull;
+    ASSERT_TRUE(
+        mb->try_push_condition(token, addr_after_wrap, /*expected=*/3, COMPLETION_ENGINE_SDMA, COMPLETION_TYPE_COUNTER)
+    );
+    ASSERT_TRUE(mb->try_pop(msg));
+    EXPECT_EQ(msg.addr, addr_after_wrap);
+    EXPECT_EQ(msg.expected_value, 3u);
+    ASSERT_FALSE(mb->try_pop(msg));
+
+    destroy_mailbox(mb);
+}
+
+TEST(AICoreCompletionMailbox, TailEqualsHeadDiscardsUndrainedLeftovers) {
+    AICoreCompletionMailbox *mb = fresh_mailbox();
+
+    // Simulate a prior run that pushed messages but aborted before draining
+    // them all (error path): head advances, tail lags.
+    PTO2TaskId token = make_token(11);
+    for (int i = 0; i < 5; i++) {
+        ASSERT_TRUE(mb->try_push_condition(
+            token, /*addr=*/static_cast<uint64_t>(i), /*expected=*/0, COMPLETION_ENGINE_SDMA, COMPLETION_TYPE_COUNTER
+        ));
+    }
+    ASSERT_TRUE(mb->has_pending());
+
+    // Per-boot reset performed by the executor: tail := head (single-threaded,
+    // no producers running). The leftovers are discarded, not replayed.
+    mb->tail.store(mb->head.load(std::memory_order_acquire), std::memory_order_release);
+    EXPECT_FALSE(mb->has_pending());
+    AICoreCompletionMsgView msg;
+    EXPECT_FALSE(mb->try_pop(msg));
+
+    // The channel is fully usable afterward: a fresh push drains cleanly with
+    // its own seq, unaffected by the discarded generation.
+    ASSERT_TRUE(mb->try_push_normal_done(token, /*slot_state_addr=*/0xFEEDull));
+    ASSERT_TRUE(mb->try_pop(msg));
+    EXPECT_EQ(msg.kind, MSG_KIND_TASK_NORMAL_DONE);
+    EXPECT_EQ(msg.addr, 0xFEEDull);
+
+    destroy_mailbox(mb);
+}

@@ -35,9 +35,10 @@
 // wall = max(end) - min(start). No single-threaded pre-pass is needed to
 // seed the start.
 
-// Forward declaration of aicpu_execute (implemented in aicpu_executor.cpp)
+// Forward declaration of aicpu_execute (implemented in aicpu_executor.cpp).
+// simpler_aicpu_register_callable is NOT declared/forwarded here: it is
+// exported directly by the TMARB runtime (host_build_graph does not export it).
 extern "C" int aicpu_execute(Runtime *arg);
-extern "C" int aicpu_prewarm_callable(Runtime *arg);
 
 /**
  * AICPU kernel main execution entry point.
@@ -53,9 +54,8 @@ extern "C" int aicpu_prewarm_callable(Runtime *arg);
  * @return 0 on success, non-zero on error
  */
 extern "C" __attribute__((visibility("default"))) int simpler_aicpu_exec(void *arg) {
-    // Snapshot CANN log severity. Idempotent across the concurrent exec
-    // threads — same snapshot value.
-    init_log_switch();
+    // Log severity was snapshot once by simpler_aicpu_init at worker init; the
+    // resident SO keeps it across launches, so exec does not re-snapshot.
     if (arg == nullptr) {
         LOG_ERROR("%s", "Invalid kernel arguments: null pointer");
         return -1;
@@ -69,17 +69,12 @@ extern "C" __attribute__((visibility("default"))) int simpler_aicpu_exec(void *a
         return -1;
     }
 
-    // Push host-published log config into device globals.
-    set_log_level(static_cast<int>(k_args->log_level));
-    set_log_info_v(static_cast<int>(k_args->log_info_v));
-
-    // Store platform regs before calling aicpu_execute. Profiling enable
-    // bits live on KernelArgs::enable_profiling_flag now (no longer
-    // mirrored into Handshake), so decode the umbrella bitmask once and
-    // hand it to the existing platform-state setters.
+    // Per-device invariants (log config, orch device id) were latched once by
+    // simpler_aicpu_init at worker init. Profiling enable bits live on
+    // KernelArgs::enable_profiling_flag now (no longer mirrored into
+    // Handshake), so decode the umbrella bitmask once and hand it to the
+    // existing platform-state setters.
     set_platform_regs(k_args->regs);
-    // Device ordinal for per-device orchestration-SO naming in the executor.
-    set_orch_device_id(static_cast<int>(k_args->device_id));
     set_platform_dump_base(k_args->dump_data_base);
     set_dump_args_enabled(GET_PROFILING_FLAG(k_args->enable_profiling_flag, PROFILING_FLAG_DUMP_TENSOR));
     set_platform_l2_swimlane_base(k_args->l2_swimlane_data_base);
@@ -106,15 +101,15 @@ extern "C" __attribute__((visibility("default"))) int simpler_aicpu_exec(void *a
     // and we'd silently return success without ever calling aicpu_execute.
     // That's a host-side bug; fail loud so it surfaces instead of
     // producing nothing at runtime.
-    if (runtime->aicpu_allowed_cpu_count <= 0 || runtime->aicpu_launch_count <= 0) {
+    if (runtime->get_aicpu_allowed_cpu_count() <= 0 || runtime->get_aicpu_launch_count() <= 0) {
         LOG_ERROR(
             "AICPU affinity inputs missing: allowed_cpu_count=%d launch_count=%d (host probe must run before exec)",
-            runtime->aicpu_allowed_cpu_count, runtime->aicpu_launch_count
+            runtime->get_aicpu_allowed_cpu_count(), runtime->get_aicpu_launch_count()
         );
         return -1;
     }
     if (!platform_aicpu_affinity_gate_filter(
-            runtime->aicpu_allowed_cpus, runtime->aicpu_allowed_cpu_count, runtime->aicpu_launch_count
+            runtime->get_aicpu_allowed_cpus(), runtime->get_aicpu_allowed_cpu_count(), runtime->get_aicpu_launch_count()
         )) {
         LOG_INFO_V0("Thread dropped by filter affinity gate");
         return 0;
@@ -126,7 +121,7 @@ extern "C" __attribute__((visibility("default"))) int simpler_aicpu_exec(void *a
     // (no C++ thread_local — see docs/dynamic-linking.md). Idempotent across the
     // concurrent exec threads (same base). Run-wall is stamped here.
     set_platform_phase_base(k_args->device_wall_data_base);
-    aicpu_phase_start(AicpuPhase::RunWall);
+    AicpuPhaseScope run_wall(AicpuPhase::RunWall);
 
     LOG_INFO_V0("%s", "simpler_aicpu_exec: Calling aicpu_execute with Runtime");
     int rc = aicpu_execute(runtime);
@@ -136,37 +131,35 @@ extern "C" __attribute__((visibility("default"))) int simpler_aicpu_exec(void *a
     }
     LOG_INFO_V0("%s", "simpler_aicpu_exec: aicpu_execute completed successfully");
 
-    // Run-wall: record this thread's end into its own slot (plain store).
-    // Host reduces max(end) - min(start) → ns (see wall-capture note above).
-    aicpu_phase_end(AicpuPhase::RunWall);
-
+    // Run-wall end is stamped by run_wall's destructor (covers the early return
+    // above too); host reduces max(end) - min(start) → ns.
     return rc;
 }
 
-extern "C" __attribute__((visibility("default"))) int simpler_aicpu_prewarm_callable(void *arg) {
+/**
+ * AICPU per-device init entry point.
+ *
+ * Launched once at worker init (before any register_callable / exec), this
+ * latches the per-device invariants — log config and orchestration device id —
+ * into the resident AICPU SO globals. Because the inner SO stays dlopen'd in
+ * the AICPU OS process across launches, these globals survive every subsequent
+ * per-task launch, so exec / register_callable no longer re-push them.
+ *
+ * @param arg Pointer to an InitArgs payload
+ * @return 0 on success, non-zero on error
+ */
+extern "C" __attribute__((visibility("default"))) int simpler_aicpu_init(void *arg) {
     init_log_switch();
     if (arg == nullptr) {
-        LOG_ERROR("%s", "Invalid prewarm kernel arguments: null pointer");
+        LOG_ERROR("%s", "Invalid init kernel arguments: null pointer");
         return -1;
     }
 
-    KernelArgs *k_args = reinterpret_cast<KernelArgs *>(arg);
-    Runtime *runtime = k_args->runtime_args;
-    if (runtime == nullptr) {
-        LOG_ERROR("%s", "Invalid prewarm runtime_args: null pointer");
-        return -1;
-    }
+    InitArgs *init_args = reinterpret_cast<InitArgs *>(arg);
+    set_log_level(static_cast<int>(init_args->log_level));
+    set_log_info_v(static_cast<int>(init_args->log_info_v));
+    set_orch_device_id(static_cast<int>(init_args->device_id));
 
-    set_log_level(static_cast<int>(k_args->log_level));
-    set_log_info_v(static_cast<int>(k_args->log_info_v));
-    set_orch_device_id(static_cast<int>(k_args->device_id));
-
-    LOG_INFO_V0("%s", "simpler_aicpu_prewarm_callable: prewarming callable");
-    int rc = aicpu_prewarm_callable(runtime);
-    if (rc != 0) {
-        LOG_ERROR("simpler_aicpu_prewarm_callable: prewarm failed with rc=%d", rc);
-        return rc;
-    }
-    LOG_INFO_V0("%s", "simpler_aicpu_prewarm_callable: prewarm completed");
+    LOG_INFO_V0("%s", "simpler_aicpu_init: per-device invariants latched");
     return 0;
 }

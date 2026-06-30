@@ -1375,7 +1375,10 @@ class SceneTestCase:
             "-c",
             "--pto-isa-commit",
             default=None,
-            help=("Override the PTO-ISA revision before running. Default/latest: use the current checkout HEAD."),
+            help=(
+                "Override the PTO-ISA revision before running. Default: use pto_isa.pin. "
+                "Use latest/head/none to track origin/HEAD."
+            ),
         )
         parser.add_argument(
             "--clone-protocol",

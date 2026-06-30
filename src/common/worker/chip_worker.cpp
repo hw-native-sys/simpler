@@ -79,8 +79,8 @@ void ChipWorker::init(
     // those globals. The Python `ChipWorker` wrapper does this preload.
     //
     // Host runtime SO is loaded with RTLD_LOCAL so that different runtimes'
-    // identically-named symbols (simpler_init, prepare_callable,
-    // run_prepared, etc.) do not collide when switching runtimes within the
+    // identically-named symbols (simpler_init, simpler_register_callable,
+    // simpler_run, etc.) do not collide when switching runtimes within the
     // same process.
     // Cross-runtime isolation relies on -fno-gnu-unique (#453) allowing
     // dlclose to actually unload the previous runtime's SO before loading
@@ -103,9 +103,9 @@ void ChipWorker::init(
         copy_from_device_ctx_fn_ = load_symbol<CopyFromDeviceCtxFn>(handle, "copy_from_device_ctx");
         get_runtime_size_fn_ = load_symbol<GetRuntimeSizeFn>(handle, "get_runtime_size");
         simpler_init_fn_ = load_symbol<SimplerInitFn>(handle, "simpler_init");
-        prepare_callable_fn_ = load_symbol<PrepareCallableFn>(handle, "prepare_callable");
-        run_prepared_fn_ = load_symbol<RunPreparedFn>(handle, "run_prepared");
-        unregister_callable_fn_ = load_symbol<UnregisterCallableFn>(handle, "unregister_callable");
+        register_callable_fn_ = load_symbol<SimplerRegisterCallableFn>(handle, "simpler_register_callable");
+        run_fn_ = load_symbol<SimplerRunFn>(handle, "simpler_run");
+        unregister_callable_fn_ = load_symbol<SimplerUnregisterCallableFn>(handle, "simpler_unregister_callable");
         get_aicpu_dlopen_count_fn_ = load_symbol<GetAicpuDlopenCountFn>(handle, "get_aicpu_dlopen_count");
         get_host_dlopen_count_fn_ = load_symbol<GetAicpuDlopenCountFn>(handle, "get_host_dlopen_count");
         finalize_device_fn_ = load_symbol<FinalizeDeviceFn>(handle, "finalize_device");
@@ -150,7 +150,7 @@ void ChipWorker::init(
     // of the executor binaries to the DeviceRunner, and (onboard) sync CANN
     // dlog from HostLogger. Subsequent device-ops re-attach their caller
     // threads idempotently against the recorded device id; subsequent
-    // prepare_callable / run_prepared invocations reuse the cached binaries.
+    // register_callable / run invocations reuse the cached binaries.
     //
     // read_binary_file may throw — defer the dlsym/dlclose rollback to the
     // catch block so the buffers and any partially-resolved handle are torn
@@ -186,8 +186,8 @@ void ChipWorker::init(
         copy_from_device_ctx_fn_ = nullptr;
         get_runtime_size_fn_ = nullptr;
         simpler_init_fn_ = nullptr;
-        prepare_callable_fn_ = nullptr;
-        run_prepared_fn_ = nullptr;
+        register_callable_fn_ = nullptr;
+        run_fn_ = nullptr;
         unregister_callable_fn_ = nullptr;
         get_aicpu_dlopen_count_fn_ = nullptr;
         get_host_dlopen_count_fn_ = nullptr;
@@ -226,8 +226,8 @@ void ChipWorker::init(
         copy_from_device_ctx_fn_ = nullptr;
         get_runtime_size_fn_ = nullptr;
         simpler_init_fn_ = nullptr;
-        prepare_callable_fn_ = nullptr;
-        run_prepared_fn_ = nullptr;
+        register_callable_fn_ = nullptr;
+        run_fn_ = nullptr;
         unregister_callable_fn_ = nullptr;
         get_aicpu_dlopen_count_fn_ = nullptr;
         get_host_dlopen_count_fn_ = nullptr;
@@ -280,8 +280,8 @@ void ChipWorker::finalize() {
     copy_to_device_ctx_fn_ = nullptr;
     copy_from_device_ctx_fn_ = nullptr;
     get_runtime_size_fn_ = nullptr;
-    prepare_callable_fn_ = nullptr;
-    run_prepared_fn_ = nullptr;
+    register_callable_fn_ = nullptr;
+    run_fn_ = nullptr;
     unregister_callable_fn_ = nullptr;
     get_aicpu_dlopen_count_fn_ = nullptr;
     get_host_dlopen_count_fn_ = nullptr;
@@ -306,16 +306,16 @@ void ChipWorker::finalize() {
     finalized_ = true;
 }
 
-void ChipWorker::prepare_callable(int32_t callable_id, const void *callable) {
+void ChipWorker::register_callable(int32_t callable_id, const void *callable) {
     if (!initialized_) {
         throw std::runtime_error("ChipWorker not initialized; call init() first");
     }
     if (callable == nullptr) {
-        throw std::runtime_error("prepare_callable: callable must not be null");
+        throw std::runtime_error("register_callable: callable must not be null");
     }
-    int rc = prepare_callable_fn_(device_ctx_, callable_id, callable);
+    int rc = register_callable_fn_(device_ctx_, callable_id, callable);
     if (rc != 0) {
-        throw std::runtime_error("prepare_callable failed with code " + std::to_string(rc));
+        throw std::runtime_error("register_callable failed with code " + std::to_string(rc));
     }
 }
 
@@ -333,14 +333,14 @@ void ChipWorker::run(int32_t callable_id, const ChipStorageTaskArgs *args, const
     void *rt = runtime_buf_.data();
     // Per-stage timing is emitted by the platform as `[STRACE]` log markers, not
     // returned (see chip_worker.h::run).
-    int rc = run_prepared_fn_(
+    int rc = run_fn_(
         device_ctx_, rt, callable_id, args, config.block_dim, config.aicpu_thread_num, config.enable_l2_swimlane,
         config.enable_dump_tensor, config.enable_pmu, config.enable_dep_gen, config.enable_scope_stats,
         config.runtime_env.ring_task_window, config.runtime_env.ring_heap, config.runtime_env.ring_dep_pool,
         config.output_prefix
     );
     if (rc != 0) {
-        throw std::runtime_error("run_prepared failed with code " + std::to_string(rc));
+        throw std::runtime_error("run failed with code " + std::to_string(rc));
     }
 }
 

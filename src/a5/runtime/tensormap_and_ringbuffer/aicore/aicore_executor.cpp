@@ -63,7 +63,7 @@ __aicore__ __attribute__((always_inline)) static void execute_task(__gm__ PTO2Di
  * @param core_type Core type (AIC or AIV)
  */
 __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, int s_block_idx, CoreType core_type) {
-    __gm__ Handshake *my_hank = (__gm__ Handshake *)(&runtime->workers[s_block_idx]);
+    __gm__ Handshake *my_hank = (__gm__ Handshake *)(&runtime->dev.workers[s_block_idx]);
 
     // Phase 1: Wait for AICPU initialization signal
     while (my_hank->aicpu_ready == 0) {

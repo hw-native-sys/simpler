@@ -14,7 +14,7 @@
  *        atrace/systrace) emitted to the unified log.
  *
  * A consumer (e.g. pypto-serving) reads host-side per-stage timing of each
- * run_prepared() purely from the log — no code change on its side, no API
+ * simpler_run() purely from the log — no code change on its side, no API
  * contract. Markers go to the log (not a return value) because run() returns
  * nothing: an L3 parent and its L2 children are observed uniformly through the
  * one sink both processes share.
@@ -28,7 +28,7 @@
  *          align later by reusing the same prefix + adding fields)
  *   pid    process id  (L3 parent vs each L2 child are distinct pids)
  *   tid    thread id   (multi-threaded orch stays attributable)
- *   inv    process-wide run_prepared() invocation id (atomic-allocated, so
+ *   inv    process-wide simpler_run() invocation id (atomic-allocated, so
  *          (pid, inv) is unique even across concurrent calls) — grouping key
  *          ONLY (gathers one call's spans together); not a token index. Set
  *          once per call via StraceScope::next_inv().
@@ -137,11 +137,11 @@ public:
     StraceScope &operator=(const StraceScope &) = delete;
 
     /** Begin a new invocation: allocate a process-wide unique id and make it the
-     *  active id for this thread. Call once at run_prepared entry.
+     *  active id for this thread. Call once at simpler_run entry.
      *
      *  The id generator is a process-wide atomic, not the per-thread counter, so
      *  `(pid, inv)` uniquely identifies one invocation even when several threads
-     *  run run_prepared concurrently in the same process — otherwise each thread
+     *  run simpler_run concurrently in the same process — otherwise each thread
      *  would start at 1 and the parser would merge their spans. The resolved id
      *  is stored in the per-thread slot (`inv()`) so nested scopes / emit_span_at
      *  on this thread read the right value. */
@@ -196,7 +196,7 @@ emit_span_at(const char *name, long long ts_ns, long long dur_ns, int depth, con
 #define STRACE(name) ::simpler::strace::StraceScope STRACE_CAT(_strace_, __LINE__)(name)
 /** Like STRACE but appends a caller-formatted "k=v ..." attribute string. */
 #define STRACE_A(name, attrs) ::simpler::strace::StraceScope STRACE_CAT(_strace_, __LINE__)(name, attrs)
-/** Begin a new invocation group (call once per run_prepared); returns inv id. */
+/** Begin a new invocation group (call once per simpler_run); returns inv id. */
 #define STRACE_NEW_INV() ::simpler::strace::StraceScope::next_inv()
 /** Set the callable hash for subsequent spans on this thread. */
 #define STRACE_SET_HID(h) ::simpler::strace::StraceScope::set_hid(h)

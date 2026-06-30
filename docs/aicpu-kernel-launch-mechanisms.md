@@ -110,11 +110,22 @@ onboard Path A implementation:
    `rtsLaunchCpuKernel()` (`cpu_args.baseArgs.args = &kernel_args.args`,
    `argsSize = sizeof(KernelArgs)`). There is no CANN launch front on this
    path — `runtime_args` sits at offset 0 and the AICPU entry reads it directly.
+   Two sibling entries reuse the same launch mechanism with their own, smaller
+   payloads instead of `KernelArgs`:
+   - `simpler_aicpu_init` takes an `InitArgs` (device id + log config), launched
+     once per device at `ensure_device_initialized` time. It latches the
+     per-device invariants into the resident AICPU SO globals, so `exec` and
+     `register_callable` no longer re-push them.
+   - `simpler_aicpu_register_callable` takes a `RegisterCallableArgs` (orch-SO
+     descriptor extracted from `Runtime`), launched per callable on the
+     device-orchestration prepare path so the AICPU (re)dlopens its orch SO. hbg
+     is a no-op (host-side orchestration).
 3. **Shared per-task `KernelArgs` payload.**
    `src/{a2a3,a5}/platform/include/common/kernel_args.h` is front-less.
-   Runtime state is passed through `KernelArgs::runtime_args`,
-   profiling/logging fields, register tables, and `device_id`. AICore receives
-   only this payload through the host-owned device copy.
+   Runtime state is passed through `KernelArgs::runtime_args`, profiling buffer
+   bases, and register tables. AICore receives only this payload through the
+   host-owned device copy. Per-device invariants (device id, log config) are NOT
+   on `KernelArgs` — they travel once via `InitArgs`.
 
 Keep those channels distinct. The bootstrap ABI still uses the `DeviceArgs`
 name because the dispatcher really reads that structure. The platform per-task

@@ -1302,12 +1302,10 @@ void AicpuExecutor::diagnose_stuck_state(
 
 // ===== Public Entry Point =====
 
-extern "C" int aicpu_prewarm_callable(Runtime *runtime) {
-    // host_build_graph resolves orchestration on the host during prepare.
-    // There is no AICPU orch_so_table_ state to prewarm.
-    (void)runtime;
-    return 0;
-}
+// host_build_graph resolves orchestration on the host during prepare, so it has
+// no device-side registration: it deliberately does NOT export
+// simpler_aicpu_register_callable (only the TMARB runtime does). The host's
+// register launch is gated on the device-orch path and never targets hbg.
 
 /**
  * aicpu_execute - Main AICPU kernel execution entry point

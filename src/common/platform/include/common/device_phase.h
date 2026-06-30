@@ -39,7 +39,7 @@
 
 // Fixed AICPU run phases. Each fires once per run per thread. RunWall (slot 0)
 // is the whole-run wall preserved from the original device_wall buffer; the
-// rest subdivide the on-NPU portion of run_prepared's blocking wait. Append new
+// rest subdivide the on-NPU portion of simpler_run's blocking wait. Append new
 // fixed phases before Count (this is a small, closed set by design — variable
 // phases go to the L2 swimlane ring, not here).
 enum class AicpuPhase : uint32_t {
@@ -50,6 +50,12 @@ enum class AicpuPhase : uint32_t {
     PostOrch,     // AICore exec tail + drain after orchestration returns
     OrchWindow,   // orchestrator thread's submit window (former device-log orch_start/end)
     SchedWindow,  // scheduler thread's dispatch window (former device-log sched_start/end)
+    // graph_build front-matter sub-phases (orchestrator thread only, before the
+    // OrchWindow opens): the per-run prep the scheduler threads spin-wait on. New
+    // entries appended (not reordered) so existing slot indices stay stable.
+    ConfigValidate,  // config_func() + arg-count validate
+    ArenaWire,       // attach prebuilt runtime arena + wire device pointers
+    SmReset,         // SM/ring reset + finalize + bind, up to releasing the schedulers
     Count,
 };
 

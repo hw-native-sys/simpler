@@ -131,7 +131,7 @@ public:
     int finalize() override;
 
     // `upload_chip_callable_buffer`, `register_callable`,
-    // `register_callable_host_orch`, `unregister_callable`, `has_callable`,
+    // `record_host_orch_callable`, `unregister_callable`, `has_callable`,
     // `bind_callable_to_runtime`, `aicpu_dlopen_count`, and
     // `host_dlopen_count` are inherited from `DeviceRunnerBase`.
 

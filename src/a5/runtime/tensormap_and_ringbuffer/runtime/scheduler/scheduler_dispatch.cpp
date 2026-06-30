@@ -491,7 +491,7 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
         static_cast<uint64_t>(header->rings[0].task_window_size)
     );
 
-    Handshake *hank = static_cast<Handshake *>(runtime->workers);
+    Handshake *hank = static_cast<Handshake *>(runtime->dev.workers);
     LOG_INFO_V0(
         "Thread %d: hank=%p, window_size=%lu", thread_idx, static_cast<void *>(hank),
         static_cast<uint64_t>(header->rings[0].task_window_size)

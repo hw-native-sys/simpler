@@ -50,7 +50,7 @@ public:
     /// Terminal — the object cannot be reused after this.
     void finalize();
 
-    // Launch a cid previously staged via prepare_callable.
+    // Launch a cid previously staged via register_callable.
     // Materializes a ChipStorageTaskArgs from `args` (one memcpy of T*40B + S*8B
     // into a stack POD), then delegates to the overload below. Per-stage timing
     // (host wall, on-NPU device wall + AICPU phase breakdown) is emitted by the
@@ -64,13 +64,13 @@ public:
 
     // Per-callable_id preparation. Requires init() first and a callable_id
     // in [0, MAX_REGISTERED_CALLABLE_IDS) (cap 64).
-    void prepare_callable(int32_t callable_id, const void *callable);
+    void register_callable(int32_t callable_id, const void *callable);
     void unregister_callable(int32_t callable_id);
 
     /// Number of distinct callable_ids the AICPU has been asked to dlopen for
     /// on the bound device. Returns 0 when not initialized or the runtime
     /// variant has no per-cid registration support. Used by tests to assert
-    /// that prepare_callable + repeated run do not trigger redundant
+    /// that register_callable + repeated run do not trigger redundant
     /// AICPU dlopens.
     size_t aicpu_dlopen_count() const;
 
@@ -144,12 +144,12 @@ private:
     // CANN dlog sync. Reads the current log level off HostLogger itself.
     using SimplerInitFn =
         int (*)(void *, int, const uint8_t *, size_t, const uint8_t *, size_t, const uint8_t *, size_t);
-    using PrepareCallableFn = int (*)(void *, int32_t, const void *);
-    using RunPreparedFn = int (*)(
+    using SimplerRegisterCallableFn = int (*)(void *, int32_t, const void *);
+    using SimplerRunFn = int (*)(
         void *, void *, int32_t, const void *, int, int, int, int, int, int, int, const uint64_t *, const uint64_t *,
         const uint64_t *, const char *
     );
-    using UnregisterCallableFn = int (*)(void *, int32_t);
+    using SimplerUnregisterCallableFn = int (*)(void *, int32_t);
     using GetAicpuDlopenCountFn = size_t (*)(void *);
     using FinalizeDeviceFn = int (*)(void *);
     using L3L2OrchCommInitFn = int (*)(void *, void *, size_t);
@@ -194,9 +194,9 @@ private:
     CopyFromDeviceCtxFn copy_from_device_ctx_fn_ = nullptr;
     GetRuntimeSizeFn get_runtime_size_fn_ = nullptr;
     SimplerInitFn simpler_init_fn_ = nullptr;
-    PrepareCallableFn prepare_callable_fn_ = nullptr;
-    RunPreparedFn run_prepared_fn_ = nullptr;
-    UnregisterCallableFn unregister_callable_fn_ = nullptr;
+    SimplerRegisterCallableFn register_callable_fn_ = nullptr;
+    SimplerRunFn run_fn_ = nullptr;
+    SimplerUnregisterCallableFn unregister_callable_fn_ = nullptr;
     GetAicpuDlopenCountFn get_aicpu_dlopen_count_fn_ = nullptr;
     GetAicpuDlopenCountFn get_host_dlopen_count_fn_ = nullptr;
     FinalizeDeviceFn finalize_device_fn_ = nullptr;

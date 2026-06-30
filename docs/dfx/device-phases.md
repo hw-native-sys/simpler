@@ -9,7 +9,7 @@ generalization to a fixed set of phases, and the design for variable phases.
 
 ## Fixed phases (implemented)
 
-The on-NPU portion of `run_prepared`'s blocking wait subdivides into a **small,
+The on-NPU portion of `simpler_run`'s blocking wait subdivides into a **small,
 closed set** of phases, each of which fires **exactly once per run per AICPU
 thread**. Because the cardinality is fixed, a plain indexed store suffices — no
 ring, no rotation, no recycling. This is the same model the original single
@@ -22,10 +22,21 @@ run-wall `{start, end}` pair used, generalized to `N` pairs.
 | `RunWall` | whole-run AICPU wall (the legacy `device_wall`, slot 0) |
 | `Preamble` | executor init + wait-for-init before orchestration |
 | `SoLoad` | orchestration-SO `dlopen` (real cost only on a first/changed callable; ~0 when cached) |
-| `GraphBuild` | `orchestrate()` — submit tasks (the scheduler dispatches concurrently) |
-| `PostOrch` | runtime-status read + last-thread cleanup after orchestration |
+| `GraphBuild` | `orchestrate()` — submit tasks (the scheduler dispatches concurrently). **A container** for the three prep sub-phases below plus the `OrchWindow`/`SchedWindow` work. |
+| `ConfigValidate` | (inside `GraphBuild`, orch thread) `config_func()` + arg-count validate |
+| `ArenaWire` | (inside `GraphBuild`, orch thread) attach the prebuilt runtime arena + wire device pointers |
+| `SmReset` | (inside `GraphBuild`, orch thread) SM/ring reset + finalize + bind, up to releasing the scheduler threads |
+| `PostOrch` | last-thread teardown (`deinit`: cache-invalidate + scheduler-state reset) after the run completes — stamped only on the thread that finishes last, so it is the real teardown tail, strictly after `sched` |
 | `OrchWindow` | orchestrator thread's submit window (the former device-log `orch_start/end`) |
 | `SchedWindow` | scheduler thread's dispatch window (the former device-log `sched_start/end`) |
+
+`ConfigValidate` / `ArenaWire` / `SmReset` break out the per-run prep the
+orchestrator thread does **inside `GraphBuild`, before the `OrchWindow` opens**
+(the scheduler threads spin-wait on `runtime_init_ready_` across this whole
+region). Before they existed this was an unattributed front-matter gap — on a
+qwen3-14B 3.5k decode step it is ~22 ms, ~31 % of the device wall. They are
+stamped only on the orchestrator thread (sched threads leave the slots unset; the
+host reducer ignores them).
 
 `OrchWindow` / `SchedWindow` replace the device-log `Orch` / `Sched` lines for
 everyday use: the orchestrator and each scheduler thread store their
@@ -54,11 +65,83 @@ deep-dive — see [l2-timing.md](l2-timing.md).
 * Host reduces each phase across threads as `max(end) - min(start)` on readback
   (`DeviceRunnerBase::read_device_wall_ns`), caches per-phase ns
   (`last_device_phase_ns`), and emits each non-zero phase as a `clk=dev`
-  `[STRACE]` marker nested under `run_prepared.runner_run.device_wall`
+  `[STRACE]` marker nested under `simpler_run.runner_run.device_wall`
   (see [host-trace.md](host-trace.md)).
 
+### Gating: `SIMPLER_DEVICE_PROFILING` (host/device split)
+
+The device markers can be turned off independently of the host spans so a
+deployment can profile the two domains separately:
+
+* **Device** (`clk=dev` markers): the runtime env `SIMPLER_DEVICE_PROFILING`,
+  read once by `emit_device_phase_markers` in the host `c_api_shared`. `=0`
+  suppresses the whole device-phase emit; any other value (or unset) keeps it on
+  (**default on**). It does not affect the on-device stamping cost (cheap plain
+  stores) — only whether the host re-emits the readback as markers.
+* **Host** (`simpler_run` / `bind` / `runner_run` / `validate` spans): no new
+  knob — they ride the compile-time `SIMPLER_PROFILING` macro and the log level
+  (`LOG_INFO_V9`), so raising the log threshold drops them.
+
 `RunWall` is the whole on-NPU wall (the former `RunTiming.device_wall`); it is
-emitted as the `run_prepared.runner_run.device_wall` marker, not returned.
+emitted as the `simpler_run.runner_run.device_wall` marker, not returned.
+
+### Reading the phases — they nest and overlap, don't sum them
+
+The phases are **not a flat partition** of the wall — they nest, and some run
+concurrently. Use each span's `ts` (device-domain start offset) + `dur` to see
+the structure, not the bare durations:
+
+```text
+device_wall (RunWall)                 ── time flows top → bottom (sequential) ──
+│
+├─ preamble                              init + wait-for-init
+│
+├─ graph_build  (CONTAINER):
+│    │
+│    ├─ config_validate   ┐
+│    ├─ arena_wire        │  prep (sequential, orch thread)
+│    ├─ sm_reset          ┘
+│    │
+│    └─ Effective         ← orch & sched run SIDE BY SIDE (concurrent):
+│         ┌──── orch (OrchWindow) ────┐   ┌──── sched (SchedWindow) ────┐
+│         │ orchestrator submits tasks│   │ scheduler dispatches/drains │
+│         └───────────────────────────┘   └─────────────────────────────┘
+│              (finishes first)                 (outlasts orch)
+│
+└─ post_orch                             last-thread teardown (deinit), after sched
+```
+
+The vertical axis is time: `preamble → graph_build → post_orch` are **sequential**
+(top to bottom), and inside `graph_build` the prep phases are sequential too. Only
+`orch` and `sched` are drawn **side by side** because they are **concurrent** — both
+start when the schedulers are released, and `sched` outlasts `orch` (the scheduler
+keeps dispatching after the orchestrator has submitted everything). `«Effective»`
+is **not a stamped marker** — `orch` and `sched` are the two real spans, and
+`strace_timing` derives `Effective = max(orch_end, sched_end) −
+min(orch_start, sched_start)` (their merged window).
+
+So:
+
+* `device_wall ≈ preamble + graph_build + post_orch` (left-to-right, sequential
+  — `post_orch` is the teardown tail after `graph_build` returns).
+* `graph_build ≈ prep + Effective`, where `prep = config_validate + arena_wire +
+  sm_reset` (sequential) and `Effective = orch ∪ sched` (the concurrent window).
+  You **cannot** add `orch + sched` — they overlap; use their union `Effective`.
+* `graph_build − Effective` ≈ `prep` — the front matter, now broken out. See
+  [l2-timing.md](l2-timing.md) for how the rounds-table reports `Effective`.
+* `post_orch` is stamped **only on the thread that finishes last** (gated on
+  `finished_`), so it captures just the `deinit` teardown. (An earlier version
+  stamped it on every thread; an orchestrator thread that finished submitting
+  early then sat idle waiting for the scheduler, and the cross-thread
+  `max(end) − min(start)` reduction absorbed that orch-waits-for-sched overlap
+  into `post_orch` — inflating it to tens of ms. It is now the real teardown.)
+
+**Worked example** — qwen3-14B, 3.5k-context **decode** step on a2a3 (per-step
+means): `device_wall` ≈ 71 ms, of which `graph_build` ≈ 71 ms (the container),
+`Effective` ≈ 49 ms (`orch` ≈ 25 ms started at +22 ms, `sched` ≈ 49 ms), so the
+~22 ms before the windows open — `config_validate + arena_wire + sm_reset` — is a
+fixed per-decode prep cost that is now directly visible instead of only inferable
+as `graph_build − Effective`.
 
 ### Sim
 

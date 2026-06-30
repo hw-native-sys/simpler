@@ -183,6 +183,10 @@ function(add_hierarchical_test name src)
         ${GTEST_LIB}
         pthread
     )
+    # worker_manager.cpp uses shm_open/shm_unlink; librt on glibc < 2.34, libSystem on macOS.
+    if(UNIX AND NOT APPLE)
+        target_link_libraries(${name} PRIVATE rt)
+    endif()
     add_test(NAME ${name} COMMAND ${name})
 endfunction()
 
@@ -367,6 +371,12 @@ set_tests_properties(test_chip_callable_upload_immutable PROPERTIES LABELS "no_h
 # ---------------------------------------------------------------------------
 add_common_utils_test(test_elf_build_id common/test_elf_build_id.cpp)
 add_common_utils_test(test_runtime_orch_so common/test_runtime_orch_so.cpp)
+# RegisterCallableArgs lives in the arch platform headers (identical across
+# arches); pull in a2a3's so `common/kernel_args.h` resolves for this no-hardware
+# POD-shape test.
+target_include_directories(test_runtime_orch_so PRIVATE
+    ${CMAKE_SOURCE_DIR}/../../../src/a2a3/platform/include
+)
 add_common_utils_test(test_device_arena common/test_device_arena.cpp)
 add_common_utils_test(test_l3_l2_orch_comm common/test_l3_l2_orch_comm.cpp)
 add_executable(test_l3_l2_orch_endpoint

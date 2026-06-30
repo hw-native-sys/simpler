@@ -6,18 +6,18 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""Hardware ST asserting run_prepared emits ``[STRACE]`` host-trace markers.
+"""Hardware ST asserting simpler_run emits ``[STRACE]`` host-trace markers.
 
 ``Worker.run`` no longer returns a RunTiming — per-stage timing is emitted by
 the platform as ``[STRACE]`` log markers (see docs/dfx/host-trace.md). Reuses
 the vector_add example's kernel + ChipCallable build so this test doesn't drag
 in its own kernel sources. The contract being verified:
 
-    * a real dispatch emits an ``[STRACE] ... name=run_prepared ... dur=<ns>``
+    * a real dispatch emits an ``[STRACE] ... name=simpler_run ... dur=<ns>``
       marker (the host wall around the dispatch) with a strictly positive
       duration — there's no way a real run took zero steady-clock time;
     * the device-domain wall marker
-      (``name=run_prepared.runner_run.device_wall``) is present with a positive
+      (``name=simpler_run.runner_run.device_wall``) is present with a positive
       duration on the default SIMPLER_PROFILING build.
 
 Markers go to stderr via the unified host logger, captured here with ``capfd``.
@@ -98,21 +98,21 @@ def _drive_one_run(platform: str, device_id: int, *, enable_l2_swimlane: bool = 
 @pytest.mark.platforms(["a2a3sim", "a2a3"])
 @pytest.mark.runtime("tensormap_and_ringbuffer")
 @pytest.mark.device_count(1)
-def test_run_prepared_emits_strace_markers(st_platform, st_device_ids, capfd):
+def test_simpler_run_emits_strace_markers(st_platform, st_device_ids, capfd):
     _drive_one_run(st_platform, int(st_device_ids[0]))
     err = capfd.readouterr().err
 
-    # Host wall: the run_prepared root span. A real dispatch can't take 0 ns.
-    host_durs = _strace_durs(err, "run_prepared")
+    # Host wall: the simpler_run root span. A real dispatch can't take 0 ns.
+    host_durs = _strace_durs(err, "simpler_run")
     assert host_durs, (
-        "no `[STRACE] ... name=run_prepared` marker found on stderr; "
-        "run_prepared stopped emitting host-trace markers (SIMPLER_PROFILING off, "
+        "no `[STRACE] ... name=simpler_run` marker found on stderr; "
+        "simpler_run stopped emitting host-trace markers (SIMPLER_PROFILING off, "
         "or the host logger V9 tier was suppressed)."
     )
-    assert max(host_durs) > 0, f"run_prepared marker dur must be > 0 ns, got {host_durs}"
+    assert max(host_durs) > 0, f"simpler_run marker dur must be > 0 ns, got {host_durs}"
 
     # Device-domain wall: the on-NPU AICPU wall, emitted after readback.
-    dev_durs = _strace_durs(err, "run_prepared.runner_run.device_wall")
+    dev_durs = _strace_durs(err, "simpler_run.runner_run.device_wall")
     assert dev_durs, (
         "no device_wall [STRACE] marker found; the AICPU phase buffer readback "
         "or marker emission regressed on the default SIMPLER_PROFILING build."

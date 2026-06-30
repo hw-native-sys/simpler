@@ -27,8 +27,9 @@
  *   2. Init (per-DeviceRunner): JSON-registers the runtime SO via
  *      `rtsBinaryLoadFromFile` (cpuKernelMode=0, kernelSo points at the
  *      preinstall basename), then resolves runtime SO entry points such as
- *      `simpler_aicpu_exec` and `simpler_aicpu_prewarm_callable` to
- *      `rtFuncHandle`s via `rtsFuncGetByName`. JSON is per-process
+ *      `simpler_aicpu_exec`, `simpler_aicpu_init`, and
+ *      `simpler_aicpu_register_callable` to `rtFuncHandle`s via
+ *      `rtsFuncGetByName`. JSON is per-process
  *      (`/tmp/simpler_inner_<fp>_<pid>.json`) so concurrent multi-chip /
  *      multi-worker tests don't race on a shared file.
  *
@@ -47,6 +48,7 @@
 #include <cstdint>
 #include <string>
 #include <unordered_map>
+#include <vector>
 
 #include "common/kernel_args.h"
 #include "runtime/runtime/rts/rts_kernel.h"
@@ -105,8 +107,17 @@ public:
         rtStream_t stream, int device_id
     );
 
-    /** @brief JSON-register the runtime SO and resolve its entry handles. */
-    int Init();
+    /**
+     * @brief JSON-register the runtime SO and resolve its entry handles.
+     *
+     * @param extra_symbols  Runtime-specific AICPU entry symbols beyond the base
+     *                       set ({RunName, InitName}, exported by every runtime).
+     *                       Each runtime's host part reports what it additionally
+     *                       exports — e.g. TMARB adds RegisterCallableName, while
+     *                       host_build_graph reports none. This keeps the common
+     *                       loader free of any runtime-specific symbol knowledge.
+     */
+    int Init(const std::vector<std::string> &extra_symbols);
 
     /** @brief Release binary handle + function handles + temporary JSON. */
     void Finalize();
@@ -115,12 +126,14 @@ public:
      * @brief Launch a runtime SO entry point via rtsLaunchCpuKernel.
      *
      * @param stream       RTS stream
-     * @param k_args       Front-less KernelArgs payload (runtime_args @ 0)
+     * @param args         Launch-arg payload (KernelArgs for exec, InitArgs for
+     *                     init, RegisterCallableArgs for register_callable)
+     * @param args_size    Size of the payload in bytes
      * @param aicpu_num    Number of AICPU threads
-     * @param func_name    Lookup key in func_handles_ (KernelNames::RunName)
+     * @param func_name    Lookup key in func_handles_ (KernelNames::*)
      * @return 0 on success, error code on failure
      */
-    int LaunchBuiltInOp(rtStream_t stream, KernelArgs *k_args, int aicpu_num, const std::string &func_name);
+    int LaunchBuiltInOp(rtStream_t stream, void *args, size_t args_size, int aicpu_num, const std::string &func_name);
 
 private:
     void *binary_handle_ = nullptr;
@@ -129,16 +142,20 @@ private:
     uint64_t inner_fp_ = 0;
     int device_id_ = 0;
     std::string inner_so_basename_;
+    // Full set of AICPU entry symbols to JSON-register and resolve: the base
+    // {RunName, InitName} plus the runtime-reported extras passed to Init().
+    std::vector<std::string> kernel_symbols_;
 
     bool GenerateAicpuOpJson(const std::string &json_path, const std::string &kernel_so);
-    int AicpuKernelLaunch(rtFuncHandle func_handle, rtStream_t stream, KernelArgs *k_args, int aicpu_num);
+    int AicpuKernelLaunch(rtFuncHandle func_handle, rtStream_t stream, void *args, size_t args_size, int aicpu_num);
 };
 
 // Runtime SO's actual exported symbol name. Looked up via the runtime SO's
 // own JSON registration (no dispatcher hop at runtime).
 namespace KernelNames {
-constexpr const char *RunName = "simpler_aicpu_exec";  // multi-threaded exec
-constexpr const char *PrewarmName = "simpler_aicpu_prewarm_callable";
+constexpr const char *RunName = "simpler_aicpu_exec";   // multi-threaded exec
+constexpr const char *InitName = "simpler_aicpu_init";  // per-device one-shot invariants
+constexpr const char *RegisterCallableName = "simpler_aicpu_register_callable";
 }  // namespace KernelNames
 
 }  // namespace host

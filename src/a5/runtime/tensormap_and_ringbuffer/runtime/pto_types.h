@@ -582,7 +582,7 @@ using L0TaskArgs = Arg<MAX_TENSOR_ARGS, MAX_SCALAR_ARGS>;
 struct L2TaskArgs : Arg<CHIP_MAX_TENSOR_ARGS, CHIP_MAX_SCALAR_ARGS> {
     // Build from the executor's ChipStorageTaskArgs: each input becomes a
     // TensorRef pointing at src's Tensor, so `src` must outlive this (on the
-    // executor path src is runtime->orch_args_storage_, alive for the whole run).
+    // executor path src is runtime->dev.orch_args_storage_, alive for the whole run).
     void create_from_chip_args(const ChipStorageTaskArgs &src) {
         reset();
         for (int32_t i = 0; i < src.tensor_count(); ++i) {

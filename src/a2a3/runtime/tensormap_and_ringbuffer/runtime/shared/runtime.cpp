@@ -29,106 +29,57 @@ Runtime::Runtime() {
     // NOTE: host_api is initialized in InitRuntime() (host-only code)
     // because the CApi functions don't exist when compiled for device.
 
-    // Initialize handshake buffers
-    memset(workers, 0, sizeof(workers));
-    worker_count = 0;
-    aicpu_thread_num = 1;
-    ready_queue_shards = RUNTIME_DEFAULT_READY_QUEUE_SHARDS;
-    memset(aicpu_allowed_cpus, 0, sizeof(aicpu_allowed_cpus));
-    aicpu_allowed_cpu_count = 0;
-    aicpu_launch_count = 0;
-    orch_to_sched = false;
-    serial_orch_sched = false;
-
-    // Initialize device orchestration state
-    gm_sm_ptr_ = nullptr;
-    gm_heap_ptr_ = nullptr;
-    slot_states_ptr_ = nullptr;
-    orch_args_storage_.clear();
-    prebuilt_arena_base_ = nullptr;
-    prebuilt_runtime_offset_ = 0;
-
-    // Initialize device orchestration SO binary
-    dev_orch_so_addr_ = 0;
-    dev_orch_so_size_ = 0;
-    active_callable_id_ = -1;
-    register_new_callable_id_ = false;
-    device_orch_func_name_[0] = '\0';
-    device_orch_config_name_[0] = '\0';
-
-    // Initialize kernel binary tracking
-    registered_kernel_count_ = 0;
-
-    // Initialize function address mapping
+    // Initialize the device-copied descriptor (`dev`).
+    memset(dev.workers, 0, sizeof(dev.workers));
+    dev.worker_count = 0;
+    dev.aicpu_thread_num = 1;
+    dev.ready_queue_shards = RUNTIME_DEFAULT_READY_QUEUE_SHARDS;
+    memset(dev.aicpu_allowed_cpus, 0, sizeof(dev.aicpu_allowed_cpus));
+    dev.aicpu_allowed_cpu_count = 0;
+    dev.aicpu_launch_count = 0;
+    dev.orch_to_sched = false;
+    dev.serial_orch_sched = false;
+    dev.gm_sm_ptr_ = nullptr;
+    dev.slot_states_ptr_ = nullptr;
+    dev.orch_args_storage_.clear();
+    dev.prebuilt_arena_base_ = nullptr;
+    dev.prebuilt_runtime_offset_ = 0;
+    dev.active_callable_id_ = -1;
     for (int i = 0; i < RUNTIME_MAX_FUNC_ID; i++) {
-        func_id_to_addr_[i] = 0;
+        dev.func_id_to_addr_[i] = 0;
     }
+
+    // Initialize host-only tail.
+    gm_heap_ptr_ = nullptr;
+    registered_kernel_count_ = 0;
 }
 
 // =============================================================================
 // Device orchestration
 // =============================================================================
 
-void *Runtime::get_gm_sm_ptr() const { return gm_sm_ptr_; }
+void *Runtime::get_gm_sm_ptr() const { return dev.gm_sm_ptr_; }
 void *Runtime::get_gm_heap_ptr() const { return gm_heap_ptr_; }
-const ChipStorageTaskArgs &Runtime::get_orch_args() const { return orch_args_storage_; }
-void Runtime::set_gm_sm_ptr(void *p) { gm_sm_ptr_ = p; }
+const ChipStorageTaskArgs &Runtime::get_orch_args() const { return dev.orch_args_storage_; }
+void Runtime::set_gm_sm_ptr(void *p) { dev.gm_sm_ptr_ = p; }
 void Runtime::set_gm_heap(void *p) { gm_heap_ptr_ = p; }
-void Runtime::set_slot_states_ptr(void *p) { slot_states_ptr_ = p; }
-void Runtime::set_orch_args(const ChipStorageTaskArgs &args) { orch_args_storage_ = args; }
+void Runtime::set_slot_states_ptr(void *p) { dev.slot_states_ptr_ = p; }
+void Runtime::set_orch_args(const ChipStorageTaskArgs &args) { dev.orch_args_storage_ = args; }
 
 void Runtime::set_prebuilt_arena(void *arena_base, size_t runtime_off) {
-    prebuilt_arena_base_ = arena_base;
-    prebuilt_runtime_offset_ = runtime_off;
+    dev.prebuilt_arena_base_ = arena_base;
+    dev.prebuilt_runtime_offset_ = runtime_off;
 }
-void *Runtime::get_prebuilt_arena_base() const { return prebuilt_arena_base_; }
-size_t Runtime::get_prebuilt_runtime_offset() const { return prebuilt_runtime_offset_; }
+void *Runtime::get_prebuilt_arena_base() const { return dev.prebuilt_arena_base_; }
+size_t Runtime::get_prebuilt_runtime_offset() const { return dev.prebuilt_runtime_offset_; }
 
-// Device orchestration SO metadata (bytes live in a separate device buffer
-// owned by DeviceRunner; only the address/size travels in Runtime).
-void Runtime::set_dev_orch_so(uint64_t dev_addr, uint64_t size) {
-    dev_orch_so_addr_ = dev_addr;
-    dev_orch_so_size_ = size;
-}
+void Runtime::set_active_callable_id(int32_t callable_id) { dev.active_callable_id_ = callable_id; }
 
-uint64_t Runtime::get_dev_orch_so_addr() const { return dev_orch_so_addr_; }
-
-uint64_t Runtime::get_dev_orch_so_size() const { return dev_orch_so_size_; }
-
-void Runtime::set_active_callable_id(int32_t callable_id, bool is_new) {
-    active_callable_id_ = callable_id;
-    register_new_callable_id_ = is_new;
-}
-
-int32_t Runtime::get_active_callable_id() const { return active_callable_id_; }
-
-bool Runtime::register_new_callable_id() const { return register_new_callable_id_; }
-
-void Runtime::set_device_orch_func_name(const char *name) {
-    if (name == nullptr) {
-        device_orch_func_name_[0] = '\0';
-        return;
-    }
-    std::strncpy(device_orch_func_name_, name, RUNTIME_MAX_ORCH_SYMBOL_NAME - 1);
-    device_orch_func_name_[RUNTIME_MAX_ORCH_SYMBOL_NAME - 1] = '\0';
-}
-
-const char *Runtime::get_device_orch_func_name() const { return device_orch_func_name_; }
-
-void Runtime::set_device_orch_config_name(const char *name) {
-    if (name == nullptr) {
-        device_orch_config_name_[0] = '\0';
-        return;
-    }
-    std::strncpy(device_orch_config_name_, name, RUNTIME_MAX_ORCH_SYMBOL_NAME - 1);
-    device_orch_config_name_[RUNTIME_MAX_ORCH_SYMBOL_NAME - 1] = '\0';
-}
-
-const char *Runtime::get_device_orch_config_name() const { return device_orch_config_name_; }
+int32_t Runtime::get_active_callable_id() const { return dev.active_callable_id_; }
 
 uint64_t Runtime::get_function_bin_addr(int func_id) const {
     if (func_id < 0 || func_id >= RUNTIME_MAX_FUNC_ID) return 0;
-    return func_id_to_addr_[func_id];
+    return dev.func_id_to_addr_[func_id];
 }
 
 void Runtime::set_function_bin_addr(int func_id, uint64_t addr) {
@@ -136,7 +87,7 @@ void Runtime::set_function_bin_addr(int func_id, uint64_t addr) {
         LOG_ERROR("[Runtime] func_id=%d is out of range [0, %d)", func_id, RUNTIME_MAX_FUNC_ID);
         return;
     }
-    if (addr != 0 && func_id_to_addr_[func_id] == 0) {
+    if (addr != 0 && dev.func_id_to_addr_[func_id] == 0) {
         if (registered_kernel_count_ < RUNTIME_MAX_FUNC_ID) {
             registered_kernel_func_ids_[registered_kernel_count_++] = func_id;
         } else {
@@ -146,7 +97,7 @@ void Runtime::set_function_bin_addr(int func_id, uint64_t addr) {
             );
         }
     }
-    func_id_to_addr_[func_id] = addr;
+    dev.func_id_to_addr_[func_id] = addr;
 }
 
 void Runtime::replay_function_bin_addr(int func_id, uint64_t addr) {
@@ -154,7 +105,7 @@ void Runtime::replay_function_bin_addr(int func_id, uint64_t addr) {
         LOG_ERROR("[Runtime] func_id=%d is out of range [0, %d)", func_id, RUNTIME_MAX_FUNC_ID);
         return;
     }
-    func_id_to_addr_[func_id] = addr;
+    dev.func_id_to_addr_[func_id] = addr;
 }
 
 int Runtime::get_registered_kernel_count() const { return registered_kernel_count_; }
@@ -165,3 +116,7 @@ int Runtime::get_registered_kernel_func_id(int index) const {
 }
 
 void Runtime::clear_registered_kernels() { registered_kernel_count_ = 0; }
+
+// trb's device image is just the `dev` descriptor (the rest of Runtime is
+// host-only). Mirrors the host_build_graph definition (= sizeof(Runtime)).
+size_t runtime_device_copy_size(const Runtime &) { return sizeof(DeviceRuntimeLaunchDesc); }

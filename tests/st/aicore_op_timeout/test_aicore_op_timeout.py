@@ -93,7 +93,7 @@ def test_aicore_op_timeout_surfaces_as_runtime_error(st_platform, st_device_ids,
         # regression we care about is that the timeout chain reaps the hang
         # in single-digit seconds and surfaces *some* 507xxx code rather than
         # deadlocking.
-        with pytest.raises(RuntimeError, match=r"run_prepared failed with code 507(046|018|000)"):
+        with pytest.raises(RuntimeError, match=r"run failed with code 507(046|018|000)"):
             worker.run(handle, ChipStorageTaskArgs(), config)
         elapsed = time.monotonic() - t0
 

@@ -145,6 +145,21 @@ struct alignas(PTO2_ALIGN_SIZE) PTO2SharedMemoryHeader {
     std::atomic<uint32_t> sched_error_bitmap;  // Bit X set = thread X had error
     std::atomic<int32_t> sched_error_code;     // Last scheduler error code (last-writer-wins)
     std::atomic<int32_t> sched_error_thread;   // Thread index of last error writer
+
+    // Sub-classification + locators for a sched_error_code==100 timeout. Written
+    // by the scheduler thread that wins the code latch; read by host so it can
+    // distinguish device error TYPES (PTO2_STALL_DETAIL_*) without reading the
+    // device log. The full stall snapshot stays in the device log / plog — only
+    // this one class + a few locator ints cross the boundary.
+    std::atomic<int32_t> sched_stall_detail;       // PTO2_STALL_DETAIL_* (NONE when no timeout)
+    std::atomic<int32_t> sched_stall_completed;    // completed_tasks_ at timeout
+    std::atomic<int32_t> sched_stall_total;        // total_tasks_ at timeout
+    std::atomic<int32_t> sched_stall_cnt_running;  // tasks observed RUNNING (on a core)
+    std::atomic<int32_t> sched_stall_cnt_ready;    // tasks fanin-satisfied but not dispatched
+    std::atomic<int32_t> sched_stall_cnt_waiting;  // tasks still waiting on fanin
+    std::atomic<int32_t> sched_stall_orch_done;    // orchestrator_done flag at timeout (0/1)
+    std::atomic<int64_t> sched_stall_task_id;      // S1: stuck task_id (-1 if N/A)
+    std::atomic<int32_t> sched_stall_core;         // S1: stuck core id (-1 if N/A)
 };
 
 static_assert(

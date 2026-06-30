@@ -1,6 +1,6 @@
 # Host runtime trace markers — `[STRACE]`
 
-`run_prepared()` spans several host-side stages (`bind`, `runner_run`,
+`simpler_run()` spans several host-side stages (`bind`, `runner_run`,
 `validate`) plus, inside `runner_run`'s blocking wait, an on-NPU AICPU window
 that itself subdivides into preamble / SO-load / graph-build / post-orch. The
 two headline walls (`host_wall` / `device_wall`, see
@@ -32,7 +32,7 @@ One line per span, emitted on scope exit
 | ----- | ------- |
 | `v` | format version; the parser branches on it. Lets device-side markers align later by reusing the prefix + adding fields. |
 | `pid` `tid` | process / thread id — L3 parent and each L2 child are distinct pids, so they land on separate lanes. |
-| `inv` | process-wide `run_prepared` invocation id (allocated from an atomic, so `(pid, inv)` is unique even across concurrent calls) — **a grouping key only** (gathers one call's spans), NOT a token index. Set once per call. |
+| `inv` | process-wide `simpler_run` invocation id (allocated from an atomic, so `(pid, inv)` is unique even across concurrent calls) — **a grouping key only** (gathers one call's spans), NOT a token index. Set once per call. |
 | `hid` | callable content hash (ELF Build-ID 64), stable across slot reuse / processes / runs. The parser buckets by `hid`; the most-frequent bucket is decode (one invocation per token), a once-seen bucket is prefill. |
 | `depth` | thread-local nesting depth (`++` on enter, `--` on exit). The parser rebuilds the call tree from `depth` — **not** from timestamp containment. |
 | `name` | dotted span name (self-locating even without the tree). |
@@ -42,18 +42,18 @@ One line per span, emitted on scope exit
 ## Span tree
 
 ```text
-run_prepared                                   (= host_wall)
-├─ run_prepared.bind
-│  ├─ run_prepared.bind.args        (ntensor=N: per-tensor device_malloc + H2D)
-│  └─ run_prepared.bind.prebuilt    (prebuilt runtime-arena image build + upload)
-├─ run_prepared.runner_run          (launch + blocking sync on the AICPU)
-│  └─ run_prepared.runner_run.device_wall      (whole on-NPU AICPU wall)
-│     └─ .{preamble,so_load,graph_build,post_orch,orch,sched}
+simpler_run                                   (= host_wall)
+├─ simpler_run.bind
+│  ├─ simpler_run.bind.args        (ntensor=N: per-tensor device_malloc + H2D)
+│  └─ simpler_run.bind.prebuilt    (prebuilt runtime-arena image build + upload)
+├─ simpler_run.runner_run          (launch + blocking sync on the AICPU)
+│  └─ simpler_run.runner_run.device_wall      (whole on-NPU AICPU wall)
+│     └─ .{preamble,so_load,graph_build,config_validate,arena_wire,sm_reset,post_orch,orch,sched}
 │           device-domain (clk=dev): AICPU subdivision of the on-NPU wall
-└─ run_prepared.validate
+└─ simpler_run.validate
 ```
 
-The `device_wall` + its `.{preamble,so_load,graph_build,post_orch,orch,sched}`
+The `device_wall` + its `.{preamble,so_load,graph_build,config_validate,arena_wire,sm_reset,post_orch,orch,sched}`
 spans are **device-domain**, tagged `clk=dev`. They are not host `steady_clock`
 spans: the AICPU stamps raw sys-counter cycles into a host-allocated buffer
 (whose address rides on `KernelArgs::device_wall_data_base`), the host reads it
@@ -74,7 +74,7 @@ python -m simpler_setup.tools.strace_timing path/to/log --trace-out strace.json
 ```
 
 The tool groups by `(pid, inv)`, rebuilds each invocation's tree from `depth`,
-buckets by `hid`, and prints each callable's mean `run_prepared` plus per-stage
+buckets by `hid`, and prints each callable's mean `simpler_run` plus per-stage
 means. With `--trace-out` it writes one `ph:"X"` event per span keyed by pid, so
 the L3 parent and each L2 child render as separate lanes in
 [Perfetto](https://ui.perfetto.dev) / `chrome://tracing`.

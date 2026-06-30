@@ -432,6 +432,20 @@ static bool prepare_task(
     out->task = &orch->sm_header->rings[ring_id].task_descriptors[out->alloc_result.slot];
     out->payload = &orch->sm_header->rings[ring_id].task_payloads[out->alloc_result.slot];
 
+    // Reset the fanout/fanin bookkeeping for this reuse. The allocator only
+    // returns a slot whose previous occupant is CONSUMED and quiescent (alloc
+    // spins until last_task_alive passes it; in-order reclaim + acquire load),
+    // and the slot is not published to any scheduler thread until the
+    // wiring.queue.push at the end of submit_task_common — so this reset is
+    // race-free. Doing it here (not relying on the scheduler's eager
+    // reset-after-CONSUMED, which only covers the contiguously-reclaimed tail)
+    // makes every reused slot self-clean, which lets the per-boot SM init skip
+    // its O(window) per-slot loop. bind_ring is slot-invariant but cheap to
+    // re-assert on the already-dirtied cache line.
+    out->slot_state->bind_ring(ring_id);
+    out->slot_state->reset_for_reuse();
+    out->slot_state->fanin_count = 0;
+
     prefetch_payload(out->payload, args.tensor_count(), args.scalar_count());
 
     // Re-bind payload/task pointers each submit. Value is per-slot constant

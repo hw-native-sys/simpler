@@ -18,8 +18,8 @@
  * only authoritative source on the AICPU).
  *
  * Verbosity (V0..V9) is simpler-managed: g_log_info_v is set by
- * set_log_info_v() from the host-published KernelArgs.log_info_v before each
- * kernel run.
+ * set_log_info_v(), latched once per device from InitArgs.log_info_v by
+ * simpler_aicpu_init (not re-pushed per run).
  */
 
 #include "aicpu/device_log.h"

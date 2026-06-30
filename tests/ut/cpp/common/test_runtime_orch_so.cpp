@@ -8,65 +8,50 @@
  * See LICENSE in the root of the software repository for the full text of the License.
  * -----------------------------------------------------------------------------------------------------------
  */
-// Ensures the Runtime device-orchestration SO accessors round-trip correctly
-// on the tensormap_and_ringbuffer variant. This is the only variant that ships
-// both `set_dev_orch_so` / three getters (a2a3 + a5 share the implementation).
-//
-// We do NOT construct a full Runtime here — its ctor drags in the entire
-// runtime shim surface. Instead we directly test the pieces that matter to
-// the SO cache contract by default-initializing the fields and calling the
-// setter / getters via placement-new onto a zeroed buffer.
+// The orch-SO descriptor (device address/size + entry/config symbol names) is
+// carried to the AICPU register entry in a RegisterCallableArgs POD, no longer
+// stashed on Runtime. These tests pin that POD's shape — default-empty and a
+// round-trip of the fields the host fills from CallableState in
+// launch_device_register.
 
 #include <cstdint>
 #include <cstring>
+#include <string>
 
 #include <gtest/gtest.h>
 
-// Stub for pto2_ring_buffer internal assertion hook referenced transitively
-// by task_args.h include chain. Kept inline to avoid pulling the stubs layer.
-[[noreturn]] void assert_impl(const char *, const char *, int) { std::abort(); }
+#include "common/kernel_args.h"
 
-// Include runtime.cpp-compatible header set. The runtime constructor lives in
-// shared/runtime.cpp; to avoid link dependencies we only exercise the
-// getter/setter via a minimal sub-struct. This mirrors the memory layout of
-// Runtime's orch-SO fields exactly.
-struct DevOrchSoFields {
-    uint64_t dev_orch_so_addr_;
-    uint64_t dev_orch_so_size_;
-    bool has_new_orch_so_;
-
-    void set_dev_orch_so(uint64_t addr, uint64_t size, bool is_new) {
-        dev_orch_so_addr_ = addr;
-        dev_orch_so_size_ = size;
-        has_new_orch_so_ = is_new;
-    }
-    uint64_t get_dev_orch_so_addr() const { return dev_orch_so_addr_; }
-    uint64_t get_dev_orch_so_size() const { return dev_orch_so_size_; }
-    bool has_new_orch_so() const { return has_new_orch_so_; }
-};
-
-TEST(RuntimeOrchSo, DefaultIsEmpty) {
-    DevOrchSoFields f{};
-    EXPECT_EQ(f.get_dev_orch_so_addr(), 0u);
-    EXPECT_EQ(f.get_dev_orch_so_size(), 0u);
-    EXPECT_FALSE(f.has_new_orch_so());
+TEST(RegisterCallableArgs, DefaultIsEmpty) {
+    RegisterCallableArgs args{};
+    EXPECT_EQ(args.active_callable_id, -1);
+    EXPECT_EQ(args.dev_orch_so_addr, 0u);
+    EXPECT_EQ(args.dev_orch_so_size, 0u);
+    EXPECT_EQ(args.device_orch_func_name[0], '\0');
+    EXPECT_EQ(args.device_orch_config_name[0], '\0');
 }
 
-TEST(RuntimeOrchSo, SetRoundTrips) {
-    DevOrchSoFields f{};
-    f.set_dev_orch_so(0xdeadbeefULL, 4096, /*is_new=*/true);
-    EXPECT_EQ(f.get_dev_orch_so_addr(), 0xdeadbeefULL);
-    EXPECT_EQ(f.get_dev_orch_so_size(), 4096u);
-    EXPECT_TRUE(f.has_new_orch_so());
+TEST(RegisterCallableArgs, FieldsRoundTrip) {
+    RegisterCallableArgs args{};
+    args.active_callable_id = 3;
+    args.dev_orch_so_addr = 0xdeadbeefULL;
+    args.dev_orch_so_size = 4096;
+    snprintf(args.device_orch_func_name, sizeof(args.device_orch_func_name), "%s", "orch_entry");
+    snprintf(args.device_orch_config_name, sizeof(args.device_orch_config_name), "%s", "orch_config");
 
-    f.set_dev_orch_so(0xdeadbeefULL, 4096, /*is_new=*/false);  // same buffer, cache hit
-    EXPECT_FALSE(f.has_new_orch_so());
-    EXPECT_EQ(f.get_dev_orch_so_addr(), 0xdeadbeefULL);
+    EXPECT_EQ(args.active_callable_id, 3);
+    EXPECT_EQ(args.dev_orch_so_addr, 0xdeadbeefULL);
+    EXPECT_EQ(args.dev_orch_so_size, 4096u);
+    EXPECT_STREQ(args.device_orch_func_name, "orch_entry");
+    EXPECT_STREQ(args.device_orch_config_name, "orch_config");
 }
 
-TEST(RuntimeOrchSo, ZeroSizeMeansNoSO) {
-    DevOrchSoFields f{};
-    f.set_dev_orch_so(0, 0, false);
-    EXPECT_EQ(f.get_dev_orch_so_size(), 0u);
-    EXPECT_FALSE(f.has_new_orch_so());
+TEST(RegisterCallableArgs, SymbolNamesAreBounded) {
+    // The host fills the symbol names via snprintf with sizeof(field); a name at
+    // or past the bound must stay NUL-terminated inside the fixed array.
+    RegisterCallableArgs args{};
+    std::string long_name(INIT_ARGS_MAX_ORCH_SYMBOL_NAME * 2, 'x');
+    snprintf(args.device_orch_func_name, sizeof(args.device_orch_func_name), "%s", long_name.c_str());
+    EXPECT_EQ(args.device_orch_func_name[INIT_ARGS_MAX_ORCH_SYMBOL_NAME - 1], '\0');
+    EXPECT_EQ(std::strlen(args.device_orch_func_name), static_cast<size_t>(INIT_ARGS_MAX_ORCH_SYMBOL_NAME - 1));
 }

@@ -8,8 +8,8 @@ phase reports ~10 failed + ~23 errors at once. The surfaced Python errors are
 
 ```text
 RuntimeError: simpler_init failed with code 507899
-RuntimeError: prepare_callable failed with code -1
-RuntimeError: run_prepared failed with code 507018 / 507046 / 507901
+RuntimeError: register_callable failed with code -1
+RuntimeError: simpler_run failed with code 507018 / 507046 / 507901
 [ERROR] rtMalloc failed: 507899 (size=...)
 [ERROR] Failed to allocate device GM for ChipCallable buffer
 ```
