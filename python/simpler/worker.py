@@ -933,21 +933,12 @@ def _comm_base_handle(cw: ChipWorker) -> int:
     return int(handle)
 
 
-def _ensure_prepared(cw, registry, prepared, cid: int, *, lazy: bool, device_id: int) -> None:
+def _ensure_prepared(cw, registry, prepared, cid: int, *, device_id: int) -> None:
     if cid in prepared:
         return
     callable_obj = registry.get(cid)
     if callable_obj is None:
         raise RuntimeError(f"chip_process dev={device_id}: cid {cid} not in registry")
-    if lazy:
-        # Reaching the lazy branch means _CTRL_PREPARE prewarm did not run
-        # for this cid before the first TASK_READY; the child still does
-        # the work, but the resulting H2D + dlopen cost lands on the
-        # first task's latency.  Log so the gap is visible in stderr.
-        sys.stderr.write(
-            f"[chip_process pid={os.getpid()} dev={device_id}] WARN: lazy-prepare cid={cid}; prewarm path missed it\n"
-        )
-        sys.stderr.flush()
     cw._prepare_callable_at_slot(cid, callable_obj)
     prepared.add(cid)
 
@@ -975,10 +966,11 @@ def _run_chip_main_loop(  # noqa: PLR0912, PLR0913, PLR0915 -- unified TASK_READ
     Returning a non-zero code overrides the kernel's success.
 
     TASK_READY carries a callable digest. The child resolves it to a
-    target-local slot, prepares that slot once, then runs it. ``_CTRL_PREPARE``
-    is the explicit pre-warm path (parent pushes after init() to amortise the
-    first H2D upload); TASK_READY preserves the historical lazy-prepare safety
-    net when the digest mapping exists but prewarm was missed.
+    target-local slot and runs it. The slot must already be prepared via
+    ``_CTRL_PREPARE`` (the explicit registration path the parent pushes after
+    init() to stage the H2D upload + device-orch load); a TASK_READY for an
+    unprepared slot is a control-flow error and fails the task rather than
+    lazily preparing it.
     """
     prepared: set[int] = set()
     l3_l2_control_shms: list[SharedMemory] = []
@@ -995,7 +987,16 @@ def _run_chip_main_loop(  # noqa: PLR0912, PLR0913, PLR0915 -- unified TASK_READ
                 try:
                     if cid is None:
                         raise RuntimeError(f"callable hash {_format_digest(digest)} not registered")
-                    _ensure_prepared(cw, registry, prepared, cid, lazy=True, device_id=device_id)
+                    # Run only consumes a prepared slot — it never lazily
+                    # prepares. The callable must have been staged via
+                    # _CTRL_PREPARE first; reaching TASK_READY without it is a
+                    # control-flow bug, so fail loudly instead of masking the
+                    # missing-prepare with a first-task latency spike.
+                    if cid not in prepared:
+                        raise RuntimeError(
+                            f"chip_process dev={device_id}: cid {cid} not prepared before TASK_READY "
+                            f"(register via _CTRL_PREPARE first)"
+                        )
                     # Hand the mailbox bytes straight to C++ (zero-copy zero-decode):
                     # the blob layout is what `write_blob` already wrote, so re-parsing
                     # it in Python is N×40B of avoidable work and a permanent
@@ -1047,7 +1048,7 @@ def _run_chip_main_loop(  # noqa: PLR0912, PLR0913, PLR0915 -- unified TASK_READ
                             raise RuntimeError(
                                 f"prepare chip={device_id}: callable hash {_format_digest(digest)} not registered"
                             )
-                        _ensure_prepared(cw, registry, prepared, int(cid), lazy=False, device_id=device_id)
+                        _ensure_prepared(cw, registry, prepared, int(cid), device_id=device_id)
                     elif sub_cmd == _CTRL_REGISTER:
                         digest = _read_control_digest(buf)
                         payload_size = struct.unpack_from("Q", buf, _CTRL_OFF_ARG0)[0]

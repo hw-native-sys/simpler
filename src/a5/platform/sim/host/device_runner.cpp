@@ -190,7 +190,6 @@ int DeviceRunner::invoke_aicpu_register_callable(Runtime &runtime) {
     // memory, so the name pointers stay valid for the synchronous call).
     RegisterCallableArgs reg_args{};
     reg_args.active_callable_id = runtime.get_active_callable_id();
-    reg_args.register_new = runtime.register_new_callable_id() ? 1 : 0;
     reg_args.dev_orch_so_addr = runtime.get_dev_orch_so_addr();
     reg_args.dev_orch_so_size = runtime.get_dev_orch_so_size();
     const char *func_name = runtime.get_device_orch_func_name();

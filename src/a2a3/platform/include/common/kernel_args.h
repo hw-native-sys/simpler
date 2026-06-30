@@ -158,7 +158,6 @@ struct InitArgs {
  */
 struct RegisterCallableArgs {
     int32_t active_callable_id{-1};                                  // orch_so_table_ slot
-    uint32_t register_new{0};                                        // 1 -> (re)dlopen, 0 -> reuse cached handle
     uint64_t dev_orch_so_addr{0};                                    // device address of the orch SO image
     uint64_t dev_orch_so_size{0};                                    // orch SO image size in bytes
     char device_orch_func_name[INIT_ARGS_MAX_ORCH_SYMBOL_NAME]{};    // entry symbol

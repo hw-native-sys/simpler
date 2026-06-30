@@ -647,12 +647,11 @@ int DeviceRunnerBase::aicpu_register_callable(int32_t callable_id) {
     }
 
     // Build the orch-SO descriptor straight from CallableState — no full
-    // Runtime H2D as the old prewarm path did. This is the registration
-    // launch, so the AICPU always (re)dlopens the SO (register_new = 1).
+    // Runtime H2D as the old prewarm path did. Registration always (re)dlopens
+    // the SO device-side, so there is no per-callable "new?" bit to carry.
     const CallableState &state = it->second;
     RegisterCallableArgs reg_args{};
     reg_args.active_callable_id = callable_id;
-    reg_args.register_new = 1;
     reg_args.dev_orch_so_addr = state.dev_orch_so_addr;
     reg_args.dev_orch_so_size = state.dev_orch_so_size;
     snprintf(reg_args.device_orch_func_name, sizeof(reg_args.device_orch_func_name), "%s", state.func_name.c_str());
