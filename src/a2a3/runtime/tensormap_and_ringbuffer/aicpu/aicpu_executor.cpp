@@ -530,10 +530,18 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
                     return -1;
                 }
 
-                // AICore completion mailbox lives in the arena; reset it each
-                // boot so stale completion notifications from a previous run do
-                // not leak.
-                memset(rt->aicore_mailbox, 0, sizeof(*rt->aicore_mailbox));
+                // AICore completion mailbox lives in the pooled arena, so its
+                // head/tail/seq survive across runs and stay monotonic. We do
+                // NOT zero entries[] (256 KB): try_pop only reads a slot whose
+                // seq matches the exact current ticket, and a producer writes
+                // all payload before release-storing seq, so a prior run's stale
+                // seq can never false-match a fresh ticket. The only per-boot
+                // need is to discard any messages an error-aborted prior run
+                // left undrained (head > tail) so the new consumer starts empty;
+                // single-threaded here (no producers yet), tail := head does it.
+                rt->aicore_mailbox->tail.store(
+                    rt->aicore_mailbox->head.load(std::memory_order_acquire), std::memory_order_release
+                );
 
                 // Fill ops / core counts (host can't resolve s_runtime_ops's
                 // device address nor know the SchedulerContext's core fan-out).
