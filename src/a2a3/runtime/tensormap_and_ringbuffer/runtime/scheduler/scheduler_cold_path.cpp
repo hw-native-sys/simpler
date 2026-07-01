@@ -491,7 +491,7 @@ int32_t SchedulerContext::handle_timeout_exit(
 }
 
 #if PTO2_PROFILING
-void SchedulerContext::log_l2_swimlane_summary(int32_t thread_idx, int32_t cur_thread_completed) {
+void SchedulerContext::log_l2_swimlane_summary(int32_t thread_idx, [[maybe_unused]] int32_t cur_thread_completed) {
     auto &l2_swimlane = sched_l2_swimlane_[thread_idx];
     uint64_t sched_end_ts = get_sys_cnt_aicpu();
     // Ride the sched window home to the host phase buffer (the host reduces
@@ -506,13 +506,11 @@ void SchedulerContext::log_l2_swimlane_summary(int32_t thread_idx, int32_t cur_t
         static_cast<uint64_t>(l2_swimlane.sched_start_ts), static_cast<uint64_t>(sched_end_ts),
         cycles_to_us(sched_end_ts - l2_swimlane.sched_start_ts)
     );
-#endif
 
     uint64_t sched_total = l2_swimlane.sched_wiring_cycle + l2_swimlane.sched_complete_cycle +
                            l2_swimlane.sched_dispatch_cycle + l2_swimlane.sched_idle_cycle;
     if (sched_total == 0) sched_total = 1;
 
-#if PTO2_SCHED_PROFILING
     {
         PTO2SchedProfilingData sp = scheduler_get_profiling(thread_idx);
         uint64_t otc_total = sp.lock_cycle + sp.fanout_cycle + sp.fanin_cycle + sp.self_consumed_cycle;
@@ -627,11 +625,11 @@ void SchedulerContext::log_l2_swimlane_summary(int32_t thread_idx, int32_t cur_t
             );
         }
     }
-#endif
     LOG_INFO_V9(
         "Thread %d: Scheduler summary: total_time=%.3fus, loops=%" PRIu64 ", tasks_scheduled=%d", thread_idx,
         cycles_to_us(sched_total), static_cast<uint64_t>(l2_swimlane.sched_loop_count), cur_thread_completed
     );
+#endif
 }
 #endif
 
