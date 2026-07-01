@@ -33,34 +33,33 @@ inline std::atomic<int> g_TraCR_thread_idx_counter{0};
 // Global thread local thread idx placeholder
 inline thread_local int g_TraCR_thread_idx{-1};
 
-#define MARKER_TYPES        \
-    X(Orchestrating)        \
-    X(Read_Dimensions)      \
-    X(Reshape_Kernels)      \
-    X(Pre_Loop_Info)        \
-    X(PTO2_SCOPE_)          \
-    X(Scheduling)           \
-    X(Phase1)               \
-    X(Phase2)               \
-    X(Phase3)               \
-    X(Phase3b)              \
-    X(Phase4)               \
-    X(Drain)                \
-    X(Initializing)         \
-    X(De_Initializing)      \
-    X(DLL_loading)          \
-    X(Allocating)           \
-    X(Running_Task_Single)  \
-    X(Running_Task_Pair)    \
+#define MARKER_TYPES       \
+    X(Orchestrating)       \
+    X(Read_Dimensions)     \
+    X(Reshape_Kernels)     \
+    X(Pre_Loop_Info)       \
+    X(PTO2_SCOPE_)         \
+    X(Scheduling)          \
+    X(Phase1)              \
+    X(Phase2)              \
+    X(Phase3)              \
+    X(Phase3b)             \
+    X(Phase4)              \
+    X(Drain)               \
+    X(Initializing)        \
+    X(De_Initializing)     \
+    X(DLL_loading)         \
+    X(Allocating)          \
+    X(Running_Task_Single) \
+    X(Running_Task_Pair)   \
     X(Barrier)
-    
 
 enum MarkerType {
 #define X(name) name,
     MARKER_TYPES
 #undef X
 
-    MARKERTYPE_COUNT
+        MARKERTYPE_COUNT
 };
 
 constexpr std::string_view MarkerTypeNames[] = {

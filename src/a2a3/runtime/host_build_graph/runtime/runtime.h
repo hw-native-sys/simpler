@@ -190,7 +190,7 @@ public:
     // Those are the pointers with the allocated memory on the device
     void *tracrData_;
     void *tracrDataSizes_;
-    
+
     // Filter-style affinity gate input (a2a3 onboard). Placed AFTER `tasks`
     // because AICore reads runtime->tasks[] by offset. Host fills these before
     // launch from AICPU OCCUPY; the device gate keeps threads whose

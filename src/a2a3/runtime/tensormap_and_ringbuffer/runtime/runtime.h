@@ -179,7 +179,7 @@ struct alignas(64) DeviceRuntimeLaunchDesc {
     // Those are the pointers with the allocated memory on the device
     void *tracrData_;
     void *tracrDataSizes_;
-    
+
     // Serial orchestrator -> scheduler start control.
     // When true, scheduler threads wait until orchestration has fully built the
     // task graph before entering resolve_and_dispatch().

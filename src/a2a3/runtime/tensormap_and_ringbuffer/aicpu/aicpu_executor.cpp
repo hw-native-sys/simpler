@@ -835,7 +835,6 @@ void AicpuExecutor::deinit(Runtime *runtime) {
 
 // ===== Public Entry Point =====
 
-
 /**
  * init tracr profiler
  *
@@ -860,26 +859,27 @@ inline void TRACR_FINALIZE(Runtime *runtime) {
     (void)(runtime);
 
 #ifdef ENABLE_TRACR
-    LOG_INFO_V9("[TraCR] thread[%d] dumping the #traces: %lu %p", g_TraCR_thread_idx, tracrThread->_traceIdx, runtime->get_tracr_data());
+    LOG_INFO_V9(
+        "[TraCR] thread[%d] dumping the #traces: %lu %p", g_TraCR_thread_idx, tracrThread->_traceIdx,
+        runtime->get_tracr_data()
+    );
 
     if (g_TraCR_thread_idx >= 0 && g_TraCR_thread_idx < runtime->get_aicpu_thread_num()) {
         if (runtime->get_tracr_data() != nullptr && tracrThread->_traceIdx > 0) {
-            TraCR::Payload* tracrData = reinterpret_cast<TraCR::Payload*>(runtime->get_tracr_data());
+            TraCR::Payload *tracrData = reinterpret_cast<TraCR::Payload *>(runtime->get_tracr_data());
             const size_t payload_size = tracrThread->_traceIdx * sizeof(TraCR::Payload);
 
-            std::memcpy(
-                &tracrData[g_TraCR_thread_idx * TraCR::CAPACITY],
-                tracrThread->_traces.data(),
-                payload_size
-            );
+            std::memcpy(&tracrData[g_TraCR_thread_idx * TraCR::CAPACITY], tracrThread->_traces.data(), payload_size);
         }
 
         if (runtime->get_tracr_data_sizes() != nullptr) {
-            size_t* tracrDataSizes = reinterpret_cast<size_t*>(runtime->get_tracr_data_sizes());
+            size_t *tracrDataSizes = reinterpret_cast<size_t *>(runtime->get_tracr_data_sizes());
             tracrDataSizes[g_TraCR_thread_idx] = tracrThread->_traceIdx;
         }
     } else {
-        LOG_ERROR("[TraCR] thread index %d out of bounds (max=%d)", g_TraCR_thread_idx, runtime->get_aicpu_thread_num());
+        LOG_ERROR(
+            "[TraCR] thread index %d out of bounds (max=%d)", g_TraCR_thread_idx, runtime->get_aicpu_thread_num()
+        );
     }
 #endif
 
@@ -892,7 +892,6 @@ inline void TRACR_FINALIZE(Runtime *runtime) {
 
     g_TraCR_thread_idx = -1;
 }
-
 
 // Device orchestration SO registration entry. Exported directly by the runtime
 // (not via a platform forwarding shell): registration is a TMARB-only ability,
@@ -942,8 +941,9 @@ extern "C" int32_t aicpu_execute(Runtime *runtime) {
 
     // INIT TraCR all threads coming in
     TRACR_START();
-    LOG_INFO_V9("[TraCR] thread[%d:%d] start ENABLE_TRACR=%d", g_TraCR_thread_idx, tracr_getcpu(), INSTRUMENTATION_ACTIVE);
-
+    LOG_INFO_V9(
+        "[TraCR] thread[%d:%d] start ENABLE_TRACR=%d", g_TraCR_thread_idx, tracr_getcpu(), INSTRUMENTATION_ACTIVE
+    );
 
     // Each phase is bracketed by its own scope so the start/end boundaries are
     // visible and an early `return` still records the end via the guard dtor.

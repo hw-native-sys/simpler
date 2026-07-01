@@ -92,7 +92,6 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const L2Ta
 
     CYCLE_COUNT_START();
 
-
     INSTRUMENTATION_MARK_SET(g_TraCR_thread_idx, Read_Dimensions, 0);
 
     // Read dimensions from tensor metadata
@@ -158,7 +157,9 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const L2Ta
     PROF_INC(prof_make_count, 4);
     CYCLE_COUNT_LAP(prof_make_tensor);
 
-    LOG_INFO_V0("Thread %d: Orch PTO2_SCOPE loop: #batch=%" PRIu64 ", q_loop=%" PRIu64, g_TraCR_thread_idx, batch, q_loop);
+    LOG_INFO_V0(
+        "Thread %d: Orch PTO2_SCOPE loop: #batch=%" PRIu64 ", q_loop=%" PRIu64, g_TraCR_thread_idx, batch, q_loop
+    );
 
     for (uint64_t b_idx = 0; b_idx < batch; b_idx++) {
         uint32_t cl_idx[1] = {static_cast<uint32_t>(b_idx)};

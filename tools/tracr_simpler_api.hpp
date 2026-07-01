@@ -11,13 +11,13 @@
 
 /**
  * TraCR API functions for Simpler A2A3, A2A3sim, A5, A5sim
- * 
+ *
  * TODO: A5 not yet able to test
  */
 
 #pragma once
 
-#include <filesystem>           // C++17 or newer
+#include <filesystem>  // C++17 or newer
 #include <fstream>
 #include <array>
 #include <string>
@@ -42,16 +42,13 @@ std::string tracr_dir = "~/ascend/tracr/proc.1";
 /**
  * A function for defining the path of the TraCR traces in home
  */
-fs::path expand_user_path(const std::string& path)
-{
+fs::path expand_user_path(const std::string &path) {
     if (!path.empty() && path[0] == '~') {
-        const char* home = std::getenv("HOME");
-        if (!home)
-            throw std::runtime_error("HOME not set");
+        const char *home = std::getenv("HOME");
+        if (!home) throw std::runtime_error("HOME not set");
 
-        std::string sub = path.substr(1); // remove ~
-        if (!sub.empty() && sub[0] == '/')
-            sub = sub.substr(1); // remove leading slash
+        std::string sub = path.substr(1);                        // remove ~
+        if (!sub.empty() && sub[0] == '/') sub = sub.substr(1);  // remove leading slash
 
         return fs::path(home) / sub;
     }
@@ -59,26 +56,24 @@ fs::path expand_user_path(const std::string& path)
 }
 
 /**
- * 
+ *
  */
-inline int TracrData2BTS(const TraCR::Payload* tracrData, const size_t* tracrDataSizes, const size_t num_threads) {
+inline int TracrData2BTS(const TraCR::Payload *tracrData, const size_t *tracrDataSizes, const size_t num_threads) {
     fs::path base_dir = expand_user_path(tracr_dir);
 
     fs::create_directories(base_dir);
 
     for (uint32_t t = 0; t < num_threads; ++t) {
-        size_t num_traces = tracrDataSizes[t];  
+        size_t num_traces = tracrDataSizes[t];
 
-        if (num_traces == 0)
-            continue;
+        if (num_traces == 0) continue;
 
         if (num_traces > TraCR::CAPACITY) {
             LOG_ERROR("Thread %u exceeds CAPACITY", t);
             return -1;
         }
 
-        fs::path thread_dir =
-            base_dir / ("thread." + std::to_string(t + 1));
+        fs::path thread_dir = base_dir / ("thread." + std::to_string(t + 1));
 
         fs::create_directories(thread_dir);
 
@@ -90,13 +85,9 @@ inline int TracrData2BTS(const TraCR::Payload* tracrData, const size_t* tracrDat
             return -1;
         }
 
-        const TraCR::Payload* thread_ptr =
-            tracrData + t * TraCR::CAPACITY;
+        const TraCR::Payload *thread_ptr = tracrData + t * TraCR::CAPACITY;
 
-        out.write(
-            reinterpret_cast<const char*>(thread_ptr),
-            num_traces * sizeof(TraCR::Payload)
-        );
+        out.write(reinterpret_cast<const char *>(thread_ptr), num_traces * sizeof(TraCR::Payload));
 
         if (!out) {
             LOG_ERROR("Write failed for %s", file_path);
@@ -114,17 +105,17 @@ int StoreTracrMetaData(RuntimeT &runtime) {
     fs::path base_dir = expand_user_path(tracr_dir);
 
     // Add the metadata.json
-    nlohmann::json metadata;    
+    nlohmann::json metadata;
 
     // channel_names
     nlohmann::json channel_names = nlohmann::json::array();
-    for(int i = 0; i < runtime.get_aicpu_thread_num(); ++i) {
+    for (int i = 0; i < runtime.get_aicpu_thread_num(); ++i) {
         channel_names.push_back("AICPU_" + std::to_string(i));
     }
-    for(int i = 0; i < int(runtime.get_worker_count()/3); ++i) {
+    for (int i = 0; i < int(runtime.get_worker_count() / 3); ++i) {
         channel_names.push_back("AICube_" + std::to_string(i));
     }
-    for(int i = 0; i < int(2*runtime.get_worker_count()/3); ++i) {
+    for (int i = 0; i < int(2 * runtime.get_worker_count() / 3); ++i) {
         channel_names.push_back("AIVector_" + std::to_string(i));
     }
     channel_names.push_back("INVALID");
@@ -167,8 +158,9 @@ int StoreTracrMetaData(RuntimeT &runtime) {
  */
 template <typename DeviceRunnerT, typename RuntimeT>
 int StoreTracrData(DeviceRunnerT *device_runner, RuntimeT &runtime) {
-    static_assert(std::is_trivially_copyable_v<TraCR::Payload>,
-              "TraCR::Payload must be trivially copyable for raw binary dump");
+    static_assert(
+        std::is_trivially_copyable_v<TraCR::Payload>, "TraCR::Payload must be trivially copyable for raw binary dump"
+    );
 
     if (runtime.get_tracr_data() == nullptr) {
         LOG_ERROR("runtime.tracrData_ is a nullptr");
@@ -188,8 +180,9 @@ int StoreTracrData(DeviceRunnerT *device_runner, RuntimeT &runtime) {
     // Download the tracrData_ from Device to Host
     size_t size = sizeof(TraCR::Payload) * TraCR::CAPACITY * runtime.get_aicpu_thread_num();
     std::vector<TraCR::Payload> tracrData(TraCR::CAPACITY * runtime.get_aicpu_thread_num());
-    int rc = device_runner->copy_from_device(reinterpret_cast<void*>(tracrData.data()),
-                                            reinterpret_cast<void*>(runtime.get_tracr_data()), size);
+    int rc = device_runner->copy_from_device(
+        reinterpret_cast<void *>(tracrData.data()), reinterpret_cast<void *>(runtime.get_tracr_data()), size
+    );
     if (rc != 0) {
         LOG_ERROR("device_runner->copy_from_device 'tracrData' failed rc=%d", rc);
         return rc;
@@ -198,15 +191,17 @@ int StoreTracrData(DeviceRunnerT *device_runner, RuntimeT &runtime) {
     // Download the tracrDataSizes_ from Device to Host
     size = sizeof(size_t) * runtime.get_aicpu_thread_num();
     std::vector<size_t> tracrDataSizes(runtime.get_aicpu_thread_num());
-    rc = device_runner->copy_from_device(reinterpret_cast<void*>(tracrDataSizes.data()),
-                                            reinterpret_cast<void*>(runtime.get_tracr_data_sizes()), size);
+    rc = device_runner->copy_from_device(
+        reinterpret_cast<void *>(tracrDataSizes.data()), reinterpret_cast<void *>(runtime.get_tracr_data_sizes()), size
+    );
     if (rc != 0) {
         LOG_ERROR("device_runner->copy_from_device 'tracrDataSizes' failed rc=%d", rc);
         return rc;
     }
 
     // Now, store the traces into '~/ascend/tracr/'
-    tracr_dir = "~/ascend/tracr_" + std::to_string(sampleID++) + "/proc." + std::to_string(1000 + device_runner->device_id());
+    tracr_dir =
+        "~/ascend/tracr_" + std::to_string(sampleID++) + "/proc." + std::to_string(1000 + device_runner->device_id());
     rc = TracrData2BTS(tracrData.data(), tracrDataSizes.data(), runtime.get_aicpu_thread_num());
     if (rc != 0) {
         LOG_ERROR("TracrData2BTS() failed");
@@ -228,7 +223,7 @@ int StoreTracrData(DeviceRunnerT *device_runner, RuntimeT &runtime) {
 
 /**
  * A method for allocating memory on the device
- * 
+ *
  * Polymorphic to A2A3 and A5 (should be)
  */
 template <typename DeviceRunnerT, typename RuntimeT>

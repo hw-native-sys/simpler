@@ -80,9 +80,9 @@
 #define PTO2_HEAP_SIZE (256 * 1024 * 1024)  // 256MB per ring (1GB total)
 #endif
 
-#define PTO2_DEP_LIST_POOL_SIZE 16384       // Per-ring dependency list pool entries
-#define PTO2_TENSORMAP_POOL_SIZE (65536)    // TensorMap entry pool
-#define PTO2_TENSORMAP_NUM_BUCKETS 4096     // Power of 2 for fast hash (4096×8B=32KB fits L1)
+#define PTO2_DEP_LIST_POOL_SIZE 16384     // Per-ring dependency list pool entries
+#define PTO2_TENSORMAP_POOL_SIZE (65536)  // TensorMap entry pool
+#define PTO2_TENSORMAP_NUM_BUCKETS 4096   // Power of 2 for fast hash (4096×8B=32KB fits L1)
 
 // Scope management
 #define PTO2_MAX_SCOPE_DEPTH 64  // Maximum nesting depth
@@ -105,7 +105,6 @@
 #else
 #define PTO2_WRIRING_QUEUE_SIZE 1024  // Per-shape queue size
 #endif
-
 
 // Fanin storage
 #define PTO2_FANIN_INLINE_CAP 64

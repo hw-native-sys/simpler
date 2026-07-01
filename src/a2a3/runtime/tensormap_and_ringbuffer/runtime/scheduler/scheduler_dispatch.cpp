@@ -823,7 +823,10 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
 
 #ifdef INDEP_ORCH
     INSTRUMENTATION_MARK_SET(g_TraCR_thread_idx, Barrier, orchestrator_done_.load(std::memory_order_relaxed));
-    LOG_INFO_V9("[TraCR] Thread %d: Waiting before the Orch to finish: %d, orchestrator_done_=%d", g_TraCR_thread_idx, g_TraCR_thread_idx_counter.load(), orchestrator_done_.load(std::memory_order_relaxed));
+    LOG_INFO_V9(
+        "[TraCR] Thread %d: Waiting before the Orch to finish: %d, orchestrator_done_=%d", g_TraCR_thread_idx,
+        g_TraCR_thread_idx_counter.load(), orchestrator_done_.load(std::memory_order_relaxed)
+    );
     while (!orchestrator_done_.load(std::memory_order_acquire)) {
         SPIN_WAIT_HINT();
     }
@@ -1199,7 +1202,7 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
         // Phase 4: MIX-strict-priority dispatch with phase-split and
         // cross-thread idle gating. See dispatch_ready_tasks for the policy.
         INSTRUMENTATION_MARK_SET(g_TraCR_thread_idx, Phase4, 0);
-        
+
 #if PTO2_PROFILING
         uint64_t dispatch_t0 = (l2_swimlane_level_ >= L2SwimlaneLevel::SCHED_PHASES) ? get_sys_cnt_aicpu() : 0;
 #endif
