@@ -654,6 +654,12 @@ int DeviceRunner::finalize() {
     cached_gm_heap_size_ = 0;
     cached_gm_sm_size_ = 0;
     cached_runtime_arena_size_ = 0;
+    prebuilt_runtime_arena_cache_valid_ = false;
+    prebuilt_runtime_arena_cache_key_.clear();
+    prebuilt_runtime_arena_cache_gm_heap_base_ = nullptr;
+    prebuilt_runtime_arena_cache_sm_base_ = nullptr;
+    prebuilt_runtime_arena_cache_runtime_arena_base_ = nullptr;
+    prebuilt_runtime_arena_cache_image_.clear();
 
     mem_alloc_.finalize();
     clear_cpu_sim_shared_storage();

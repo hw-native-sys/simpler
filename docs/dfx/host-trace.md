@@ -45,7 +45,7 @@ One line per span, emitted on scope exit
 simpler_run                                   (= host_wall)
 ├─ simpler_run.bind
 │  ├─ simpler_run.bind.args        (ntensor=N: per-tensor device_malloc + H2D)
-│  └─ simpler_run.bind.prebuilt    (prebuilt runtime-arena image build + upload)
+│  └─ simpler_run.bind.prebuilt    (prebuilt runtime-arena cache hit or build + upload)
 ├─ simpler_run.runner_run          (launch + blocking sync on the AICPU)
 │  └─ simpler_run.runner_run.device_wall      (whole on-NPU AICPU wall)
 │     └─ .{preamble,so_load,graph_build,config_validate,arena_wire,sm_reset,post_orch,orch,sched}

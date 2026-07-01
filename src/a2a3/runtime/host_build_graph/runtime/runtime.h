@@ -150,6 +150,14 @@ struct HostApi {
     void *(*acquire_pooled_gm_heap)();
     void *(*acquire_pooled_gm_sm)();
     void *(*acquire_pooled_runtime_arena)();
+    bool (*lookup_prebuilt_runtime_arena_cache)(
+        uint64_t hash, const void *key_data, size_t key_size, void **gm_heap_base, void **sm_base,
+        void **runtime_arena_base, size_t *runtime_off, const void **image_data, size_t *image_size
+    );
+    void (*mark_prebuilt_runtime_arena_cached)(
+        uint64_t hash, const void *key_data, size_t key_size, void *gm_heap_base, void *sm_base,
+        void *runtime_arena_base, size_t runtime_off, const void *image_data, size_t image_size
+    );
     // Single-shot upload of the entire ChipCallable buffer. `callable` is a
     // `const ChipCallable *` (declared void* to avoid pulling task_interface
     // headers into runtime.h). DeviceRunner walks child_offsets_ to compute

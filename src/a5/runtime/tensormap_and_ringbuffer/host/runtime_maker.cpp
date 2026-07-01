@@ -39,6 +39,7 @@
 #include <cstring>
 #include <limits>
 #include <string>
+#include <vector>
 
 #include "../common/pto_runtime_status.h"
 #include "../runtime/pto_runtime2.h"
@@ -320,12 +321,14 @@ register_callable_impl(const ChipCallable *callable, uint64_t (*upload_fn)(const
 
 // Effective ring sizing for one (callable_id, config): the input half of the
 // arena description. Resolved once per config from per-task overrides + env +
-// compile-time defaults; depends on nothing that varies per run. `total_heap`
-// and `sm_size` are the derived backing-allocation sizes.
+// compile-time defaults; depends on nothing that varies per run.
 struct ArenaSizingConfig {
     uint64_t task_window_sizes[PTO2_MAX_RING_DEPTH];
     uint64_t heap_sizes[PTO2_MAX_RING_DEPTH];
     int32_t dep_pool_capacities[PTO2_MAX_RING_DEPTH];
+};
+
+struct ArenaStaticSizes {
     uint64_t total_heap;
     uint64_t sm_size;
 };
@@ -338,10 +341,44 @@ struct StaticArenaPtrs {
     void *runtime_arena_dev;
 };
 
-// per-(cid,config): resolve the arena sizing. Pure host arithmetic over
-// per-task overrides, PTO2_RING_* env, and compile-time defaults; derives the
-// total heap (with overflow check) and SM sizes.
-// Returns false on an invalid ring config or a heap-size overflow.
+struct PrebuiltRuntimeArenaCacheProbe {
+    uint64_t hash{0};
+    std::vector<uint8_t> serialized_key{};
+};
+
+static void hash_mix_u64(uint64_t *hash, uint64_t value) {
+    constexpr uint64_t kFnvPrime = 1099511628211ULL;
+    for (int i = 0; i < 8; i++) {
+        *hash ^= (value >> (i * 8)) & 0xff;
+        *hash *= kFnvPrime;
+    }
+}
+
+static void append_cache_key_u64(std::vector<uint8_t> *out, uint64_t value) {
+    for (int i = 0; i < 8; i++) {
+        out->push_back(static_cast<uint8_t>((value >> (i * 8)) & 0xff));
+    }
+}
+
+static PrebuiltRuntimeArenaCacheProbe make_prebuilt_runtime_arena_cache_probe(const ArenaSizingConfig &sizing) {
+    PrebuiltRuntimeArenaCacheProbe probe;
+    uint64_t hash = 1469598103934665603ULL;
+    probe.serialized_key.reserve(PTO2_MAX_RING_DEPTH * 3 * sizeof(uint64_t));
+    for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
+        hash_mix_u64(&hash, sizing.task_window_sizes[r]);
+        append_cache_key_u64(&probe.serialized_key, sizing.task_window_sizes[r]);
+        hash_mix_u64(&hash, sizing.heap_sizes[r]);
+        append_cache_key_u64(&probe.serialized_key, sizing.heap_sizes[r]);
+        hash_mix_u64(&hash, static_cast<uint32_t>(sizing.dep_pool_capacities[r]));
+        append_cache_key_u64(&probe.serialized_key, static_cast<uint32_t>(sizing.dep_pool_capacities[r]));
+    }
+    probe.hash = hash;
+    return probe;
+}
+
+// per-(cid,config): resolve the cache-key sizing knobs. Pure host parsing over
+// per-task overrides, PTO2_RING_* env, and compile-time defaults. Derived
+// allocation sizes are computed only on cache miss.
 static bool resolve_arena_sizing(
     const uint64_t *ring_task_window, const uint64_t *ring_heap, const uint64_t *ring_dep_pool, ArenaSizingConfig *out
 ) {
@@ -359,15 +396,19 @@ static bool resolve_arena_sizing(
         dep_pool_log.c_str()
     );
 
+    return true;
+}
+
+static bool derive_arena_static_sizes(const ArenaSizingConfig &sizing, ArenaStaticSizes *out) {
     out->total_heap = 0;
     for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
-        if (out->heap_sizes[r] > std::numeric_limits<uint64_t>::max() - out->total_heap) {
+        if (sizing.heap_sizes[r] > std::numeric_limits<uint64_t>::max() - out->total_heap) {
             LOG_ERROR("Total ring heap size overflows uint64_t");
             return false;
         }
-        out->total_heap += out->heap_sizes[r];
+        out->total_heap += sizing.heap_sizes[r];
     }
-    out->sm_size = PTO2SharedMemoryHandle::calculate_size_per_ring(out->task_window_sizes);
+    out->sm_size = PTO2SharedMemoryHandle::calculate_size_per_ring(sizing.task_window_sizes);
     return true;
 }
 
@@ -461,13 +502,15 @@ static void apply_orch_sched_env_flags(Runtime *runtime) {
 // shot. The runtime-arena size is recovered by replaying the (pure, cheap)
 // reserve sequence on a throwaway host arena. Idempotent across runs — the
 // pools are owned by DeviceRunner and freed in DeviceRunner::finalize().
-static bool ensure_static_arenas(Runtime *runtime, const ArenaSizingConfig &sizing, StaticArenaPtrs *out) {
+static bool ensure_static_arenas(
+    Runtime *runtime, const ArenaSizingConfig &sizing, const ArenaStaticSizes &sizes, StaticArenaPtrs *out
+) {
     DeviceArena sizing_arena;  // discarded; only its computed arena_size is read
     PTO2RuntimeArenaLayout layout =
         runtime_reserve_layout(sizing_arena, sizing.task_window_sizes, sizing.heap_sizes, sizing.dep_pool_capacities);
 
     int64_t t_setup_start = _now_ms();
-    if (runtime->host_api.setup_static_arena(sizing.total_heap, sizing.sm_size, layout.offsets.arena_size) != 0) {
+    if (runtime->host_api.setup_static_arena(sizes.total_heap, sizes.sm_size, layout.offsets.arena_size) != 0) {
         LOG_ERROR("Failed to setup pooled static arena");
         return false;
     }
@@ -518,8 +561,8 @@ static bool ensure_static_arenas(Runtime *runtime, const ArenaSizingConfig &sizi
 // host Runtime (bind_launch_state), since the AICPU needs that pointer *before*
 // it can dereference the image.
 static bool build_runtime_image(
-    const ArenaSizingConfig &sizing, const StaticArenaPtrs &ptrs, DeviceArena *host_arena,
-    PTO2RuntimeArenaLayout *out_layout
+    const ArenaSizingConfig &sizing, const ArenaStaticSizes &sizes, const StaticArenaPtrs &ptrs,
+    DeviceArena *host_arena, PTO2RuntimeArenaLayout *out_layout
 ) {
     PTO2RuntimeArenaLayout layout =
         runtime_reserve_layout(*host_arena, sizing.task_window_sizes, sizing.heap_sizes, sizing.dep_pool_capacities);
@@ -529,7 +572,7 @@ static bool build_runtime_image(
     }
 
     PTO2Runtime *rt = runtime_init_data_from_layout(
-        *host_arena, layout, PTO2_MODE_EXECUTE, ptrs.gm_sm, sizing.sm_size, ptrs.gm_heap, sizing.heap_sizes
+        *host_arena, layout, PTO2_MODE_EXECUTE, ptrs.gm_sm, sizes.sm_size, ptrs.gm_heap, sizing.heap_sizes
     );
     if (rt == nullptr) {
         LOG_ERROR("runtime_init_data_from_layout failed");
@@ -559,6 +602,51 @@ static bool bind_launch_state(
     }
     runtime->set_prebuilt_arena(ptrs.runtime_arena_dev, layout.offsets.off_runtime);
     return true;
+}
+
+static int bind_cached_runtime_image(
+    Runtime *runtime, const PrebuiltRuntimeArenaCacheProbe &probe, const ChipStorageTaskArgs &device_args
+) {
+    if (runtime->host_api.lookup_prebuilt_runtime_arena_cache == nullptr) {
+        return 1;
+    }
+
+    void *gm_heap = nullptr;
+    void *sm_ptr = nullptr;
+    void *runtime_arena_dev = nullptr;
+    size_t runtime_off = 0;
+    const void *cached_image = nullptr;
+    size_t cached_image_size = 0;
+    bool cache_hit = runtime->host_api.lookup_prebuilt_runtime_arena_cache(
+        probe.hash, probe.serialized_key.data(), probe.serialized_key.size(), &gm_heap, &sm_ptr, &runtime_arena_dev,
+        &runtime_off, &cached_image, &cached_image_size
+    );
+    if (!cache_hit) {
+        return 1;
+    }
+
+    runtime->set_orch_args(device_args);
+    int rc_upload = runtime->host_api.copy_to_device(runtime_arena_dev, cached_image, cached_image_size);
+    if (rc_upload != 0) {
+        LOG_ERROR("Failed to rtMemcpy cached prebuilt runtime arena to device (rc=%d)", rc_upload);
+        return -1;
+    }
+    runtime->set_gm_sm_ptr(sm_ptr);
+    runtime->set_prebuilt_arena(runtime_arena_dev, runtime_off);
+    return 0;
+}
+
+static void store_prebuilt_runtime_image(
+    Runtime *runtime, const PrebuiltRuntimeArenaCacheProbe &probe, const StaticArenaPtrs &ptrs,
+    const PTO2RuntimeArenaLayout &layout, const DeviceArena &host_arena
+) {
+    if (runtime->host_api.mark_prebuilt_runtime_arena_cached == nullptr) {
+        return;
+    }
+    runtime->host_api.mark_prebuilt_runtime_arena_cached(
+        probe.hash, probe.serialized_key.data(), probe.serialized_key.size(), ptrs.gm_heap, ptrs.gm_sm,
+        ptrs.runtime_arena_dev, layout.offsets.off_runtime, host_arena.base(), layout.offsets.arena_size
+    );
 }
 
 /**
@@ -621,19 +709,32 @@ extern "C" int bind_callable_to_runtime_impl(
     int64_t t_prebuilt_start = _now_ms();
     {
         STRACE("simpler_run.bind.prebuilt");
-        StaticArenaPtrs ptrs;
-        if (!ensure_static_arenas(runtime, sizing, &ptrs)) {
+        PrebuiltRuntimeArenaCacheProbe cache_probe = make_prebuilt_runtime_arena_cache_probe(sizing);
+        int cache_rc = bind_cached_runtime_image(runtime, cache_probe, device_args);
+        if (cache_rc < 0) {
             return -1;
         }
+        if (cache_rc != 0) {
+            ArenaStaticSizes sizes;
+            if (!derive_arena_static_sizes(sizing, &sizes)) {
+                return -1;
+            }
 
-        DeviceArena host_arena;  // libc malloc backend; owns the image until upload
-        PTO2RuntimeArenaLayout layout;
-        if (!build_runtime_image(sizing, ptrs, &host_arena, &layout)) {
-            return -1;
-        }
+            StaticArenaPtrs ptrs;
+            if (!ensure_static_arenas(runtime, sizing, sizes, &ptrs)) {
+                return -1;
+            }
 
-        if (!bind_launch_state(runtime, ptrs, host_arena, layout, device_args)) {
-            return -1;
+            DeviceArena host_arena;  // libc malloc backend; owns the image until upload
+            PTO2RuntimeArenaLayout layout;
+            if (!build_runtime_image(sizing, sizes, ptrs, &host_arena, &layout)) {
+                return -1;
+            }
+
+            if (!bind_launch_state(runtime, ptrs, host_arena, layout, device_args)) {
+                return -1;
+            }
+            store_prebuilt_runtime_image(runtime, cache_probe, ptrs, layout, host_arena);
         }
     }
     int64_t t_prebuilt_end = _now_ms();

@@ -158,6 +158,30 @@ static void *acquire_pooled_runtime_arena_wrapper() {
     }
 }
 
+static bool lookup_prebuilt_runtime_arena_cache_wrapper(
+    uint64_t hash, const void *key_data, size_t key_size, void **gm_heap_base, void **sm_base,
+    void **runtime_arena_base, size_t *runtime_off, const void **image_data, size_t *image_size
+) {
+    try {
+        return current_runner()->lookup_prebuilt_runtime_arena_cache(
+            hash, key_data, key_size, gm_heap_base, sm_base, runtime_arena_base, runtime_off, image_data, image_size
+        );
+    } catch (...) {
+        return false;
+    }
+}
+
+static void mark_prebuilt_runtime_arena_cached_wrapper(
+    uint64_t hash, const void *key_data, size_t key_size, void *gm_heap_base, void *sm_base, void *runtime_arena_base,
+    size_t runtime_off, const void *image_data, size_t image_size
+) {
+    try {
+        current_runner()->mark_prebuilt_runtime_arena_cached(
+            hash, key_data, key_size, gm_heap_base, sm_base, runtime_arena_base, runtime_off, image_data, image_size
+        );
+    } catch (...) {}
+}
+
 /* ===========================================================================
  * Public C API (resolved by ChipWorker via dlsym)
  *
@@ -478,6 +502,8 @@ int simpler_run(
         r->host_api.acquire_pooled_gm_heap = acquire_pooled_gm_heap_wrapper;
         r->host_api.acquire_pooled_gm_sm = acquire_pooled_gm_sm_wrapper;
         r->host_api.acquire_pooled_runtime_arena = acquire_pooled_runtime_arena_wrapper;
+        r->host_api.lookup_prebuilt_runtime_arena_cache = lookup_prebuilt_runtime_arena_cache_wrapper;
+        r->host_api.mark_prebuilt_runtime_arena_cached = mark_prebuilt_runtime_arena_cached_wrapper;
         r->host_api.upload_chip_callable_buffer = upload_chip_callable_buffer_wrapper;
 
         {

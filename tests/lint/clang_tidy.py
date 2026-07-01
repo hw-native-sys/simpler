@@ -97,6 +97,11 @@ def _strip_gcc_flags(command: str) -> str:
     return shlex.join(filtered_parts)
 
 
+def _strip_gcc_flags_from_args(arguments: list[str]) -> list[str]:
+    """Remove GCC-only flags from an argv-style compile command."""
+    return [arg for arg in arguments if arg not in _GCC_ONLY_FLAGS]
+
+
 def _resolve_target_dirs(config_dir: Path, build_config: dict, target: str) -> tuple[list[str], list[str]]:
     """Resolve include and source dirs for a target from build_config."""
     cfg = build_config[target]
@@ -162,6 +167,10 @@ def _parse_compile_database(raw: str, db_file: Path) -> list[dict]:
 
 def _load_compile_database(db_file: Path) -> tuple[str, list[dict]]:
     """Load a compile database, rebuilding its target cache dir when it is broken."""
+    if not db_file.is_file():
+        print(f"WARNING: compile database disappeared, skipping: {db_file}", file=sys.stderr)
+        return "", []
+
     raw = db_file.read_text()
     try:
         return raw, _parse_compile_database(raw, db_file)
@@ -169,8 +178,16 @@ def _load_compile_database(db_file: Path) -> tuple[str, list[dict]]:
         print(f"WARNING: invalid compile database detected: {exc}", file=sys.stderr)
         _reconfigure_compile_database(db_file)
 
+    if not db_file.is_file():
+        print(f"WARNING: compile database recovery produced no file, skipping: {db_file}", file=sys.stderr)
+        return "", []
+
     rebuilt_raw = db_file.read_text()
-    return rebuilt_raw, _parse_compile_database(rebuilt_raw, db_file)
+    try:
+        return rebuilt_raw, _parse_compile_database(rebuilt_raw, db_file)
+    except (ValueError, json.JSONDecodeError) as exc:
+        print(f"WARNING: recovered compile database is still invalid, skipping: {exc}", file=sys.stderr)
+        return "", []
 
 
 def _build_file_index() -> dict[str, list[Path]]:
@@ -191,6 +208,8 @@ def _build_file_index() -> dict[str, list[Path]]:
             for entry in entries:
                 if "command" in entry:
                     entry["command"] = _strip_gcc_flags(entry["command"])
+                if "arguments" in entry:
+                    entry["arguments"] = _strip_gcc_flags_from_args(entry["arguments"])
             db_file.write_text(json.dumps(entries, indent=2))
         for entry in entries:
             filepath = entry["file"]
