@@ -247,8 +247,9 @@ public:
      *
      * Callers compute child addresses as
      *     chip_dev + offsetof(ChipCallable, storage_) + child_offset(i)
-     * and write them to Runtime::func_id_to_addr_[fid] via
-     * Runtime::set_function_bin_addr().
+     * and record them in the callable's kernel_addrs table, which
+     * bind_callable_to_runtime replays into Runtime::func_id_to_addr_[fid]
+     * before each run.
      *
      * @param callable  Host-side ChipCallable pointer.
      * @return Device GM address of the ChipCallable header, or 0 on

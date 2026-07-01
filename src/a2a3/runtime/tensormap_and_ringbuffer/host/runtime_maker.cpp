@@ -882,21 +882,6 @@ extern "C" int validate_runtime_impl(Runtime *runtime, const HostApi *api) {
     }
     LOG_INFO_V0("Freed %d device allocations", tensor_pair_count);
 
-    // Clear the per-run dispatch-table entries staged by register_callable_impl.
-    // The underlying chip-callable device buffer is pool-managed by
-    // DeviceRunner (keyed by content hash) and bulk-freed in
-    // DeviceRunner::finalize(); re-running the same callable repeatedly
-    // should not re-upload.
-    int kernel_count = runtime->get_registered_kernel_count();
-    for (int i = 0; i < kernel_count; i++) {
-        int func_id = runtime->get_registered_kernel_func_id(i);
-        runtime->set_function_bin_addr(func_id, 0);
-    }
-    if (kernel_count > 0) {
-        LOG_INFO_V0("Cleared %d kernel dispatch-table entries", kernel_count);
-    }
-    runtime->clear_registered_kernels();
-
     // Clear tensor pairs
     runtime->tensor_pairs_.clear();
 

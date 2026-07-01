@@ -232,14 +232,6 @@ public:
     // copies sizeof(DeviceRuntimeLaunchDesc) bytes from offset 0.
     DeviceRuntimeLaunchDesc dev;
 
-private:
-    // ---- host-only tail (never uploaded to device) ----
-
-    // Kernel binary tracking for cleanup
-    int registered_kernel_func_ids_[RUNTIME_MAX_FUNC_ID];
-    int registered_kernel_count_;
-
-public:
     /**
      * Constructor - zero-initialize all arrays
      */
@@ -298,18 +290,12 @@ public:
     int32_t get_active_callable_id() const;
 
     uint64_t get_function_bin_addr(int func_id) const;
-    void set_function_bin_addr(int func_id, uint64_t addr);
     /**
-     * Replay a previously-uploaded kernel address onto a fresh Runtime
-     * without recording it in registered_kernel_func_ids_. Used by
-     * DeviceRunner::bind_callable_to_runtime so prepared kernel
-     * binaries are not freed by validate_runtime_impl across runs.
+     * Replay a previously-uploaded kernel address onto a fresh Runtime.
+     * Used by DeviceRunner::bind_callable_to_runtime to rebind prepared
+     * kernel binaries onto the runtime before each run.
      */
     void replay_function_bin_addr(int func_id, uint64_t addr);
-
-    int get_registered_kernel_count() const;
-    int get_registered_kernel_func_id(int index) const;
-    void clear_registered_kernels();
 
     // =========================================================================
     // Deprecated API (for platform compatibility, always returns 0/nullptr)

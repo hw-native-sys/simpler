@@ -76,7 +76,9 @@ struct HostApi {
     // bulk-freed in DeviceRunner::finalize(). Returns 0 on error or when
     // child_count() == 0. Caller computes child addrs as
     //     chip_dev + offsetof(ChipCallable, storage_) + child_offset(i)
-    // and stores them via runtime->set_function_bin_addr(fid, child_dev).
+    // and records them in the CallableArtifacts kernel_addrs table, which
+    // DeviceRunner::bind_callable_to_runtime replays onto the runtime's
+    // func_id_to_addr_ before each run.
     uint64_t (*upload_chip_callable_buffer)(const void *callable);
 };
 

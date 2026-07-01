@@ -205,10 +205,6 @@ private:
     // Function address mapping (for API compatibility with rt2)
     uint64_t func_id_to_addr_[RUNTIME_MAX_FUNC_ID];
 
-    // Kernel binary tracking for cleanup
-    int registered_kernel_func_ids_[RUNTIME_MAX_FUNC_ID];
-    int registered_kernel_count_;
-
     // Tensor info metadata for tensor dump
     void *tensor_info_storage_;
     uint64_t tensor_info_storage_bytes_;
@@ -408,32 +404,14 @@ public:
     }
 
     /**
-     * Set function binary address for a func_id.
-     * Called by platform layer after kernel registration.
-     */
-    void set_function_bin_addr(int func_id, uint64_t addr);
-
-    /**
-     * Replay a previously-uploaded kernel address onto a fresh Runtime
-     * without recording it in registered_kernel_func_ids_. Used by
-     * DeviceRunner::bind_callable_to_runtime when restoring kernels
-     * across simpler_run invocations: the prepared callable owns the
-     * kernel binaries' device memory until unregister, so
-     * validate_runtime_impl must NOT free them.
+     * Replay a previously-uploaded kernel address onto a fresh Runtime.
+     * Used by DeviceRunner::bind_callable_to_runtime to rebind prepared
+     * kernel binaries onto the runtime before each simpler_run invocation.
      */
     void replay_function_bin_addr(int func_id, uint64_t addr) {
         if (func_id < 0 || func_id >= RUNTIME_MAX_FUNC_ID) return;
         func_id_to_addr_[func_id] = addr;
     }
-
-    int get_registered_kernel_count() const { return registered_kernel_count_; }
-
-    int get_registered_kernel_func_id(int index) const {
-        if (index < 0 || index >= registered_kernel_count_) return -1;
-        return registered_kernel_func_ids_[index];
-    }
-
-    void clear_registered_kernels() { registered_kernel_count_ = 0; }
 
     // =========================================================================
     // Host-only state (not copied to device)

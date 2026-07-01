@@ -893,11 +893,10 @@ BindCallableResult DeviceRunnerBase::bind_callable_to_runtime(Runtime &runtime, 
     }
     const auto &state = it->second;
 
-    // Replay kernel addresses directly into runtime.func_id_to_addr_ without
-    // going through set_function_bin_addr. The latter records func_ids in
-    // registered_kernel_func_ids_, which validate_runtime_impl iterates to
-    // free kernel binaries — but registered kernels must survive across runs
-    // and are only freed by `finalize()` / `unregister_callable`.
+    // Replay each prepared kernel address into runtime.func_id_to_addr_.
+    // The kernel binaries are owned by the shared DeviceRunner pool and
+    // survive across runs — freed only by `finalize()`, never by
+    // validate_runtime_impl or `unregister_callable`.
     for (const auto &kv : state.kernel_addrs) {
         if (kv.first < 0 || kv.first >= RUNTIME_MAX_FUNC_ID) {
             LOG_ERROR("bind_callable_to_runtime: func_id=%d out of range", kv.first);
