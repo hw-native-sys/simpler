@@ -46,6 +46,8 @@ queue_magic_version
 depth
 input_arena_bytes
 output_arena_bytes
+payload_bytes
+counter_bytes
 ```
 
 L3 sends input messages through `queue.input`:
@@ -93,8 +95,11 @@ queue.free()
 ```
 
 `try_request_stop()` is the non-blocking form. `queue.free()` releases the L3
-handle. It does not synchronously free device memory; physical cleanup follows
-the underlying region lifetime model after submitted L2 work has drained.
+queue handle and marks the underlying `L3L2OrchRegion` handle released. It does
+not synchronously free device memory; physical cleanup follows the underlying
+region lifetime model after submitted L2 work has drained. Small Python wrapper
+scratch tensors used for descriptor staging are owned by the queue object and
+follow normal Python object lifetime.
 
 On L2, orchestration code receives the primitive descriptor and queue args,
 then constructs an endpoint:
@@ -106,6 +111,8 @@ L3L2QueueArgs queue_args{
     depth,
     input_arena_bytes,
     output_arena_bytes,
+    payload_bytes,
+    counter_bytes,
 };
 
 L3L2QueueEndpoint queue(desc, queue_args);
@@ -175,7 +182,7 @@ multiples. They do not need to be powers of two. A single message payload must
 fit as one contiguous span inside its direction's arena. Payloads are not split
 across arena wrap.
 
-The queue layout helper is shared by Python and C++:
+Python and C++ mirror the same deterministic queue layout calculation:
 
 ```text
 input_desc_offset
@@ -187,6 +194,10 @@ counter_bytes
 ```
 
 Python exposes this as `queue.layout`; L2 exposes it as `queue.layout()`.
+L3 passes the derived `payload_bytes` and `counter_bytes` to L2. L2 rejects
+initialization unless those values match both its local layout calculation and
+the primitive region descriptor sizes. Lockstep tests cover representative
+layout cases for the mirrored Python and C++ calculations.
 
 ## 3. Descriptor ABI
 
@@ -264,9 +275,18 @@ release descriptor and payload
 publish descriptor head counter
 ```
 
-All blocking queue operations require finite timeouts. Timeout under ordinary
-backpressure is not poison. After timeout, an endpoint samples the peer abort
-flag; if the peer flag is set, the local endpoint reports remote abort.
+All Python blocking queue operations require finite positive timeouts; passing
+`timeout <= 0` is a caller error and raises `ValueError`. Python `try_*` APIs
+are non-blocking and return `False` or `None` for ordinary no-progress.
+
+C++ blocking queue operations take `timeout_ns`; `timeout_ns == 0` is an
+immediate timeout probe. They return `false` on no-progress, timeout,
+validation failure, or poison. C++ `try_*` APIs are non-blocking and also
+return `false` for ordinary no-progress.
+
+Timeout under ordinary backpressure is not poison. After timeout, an endpoint
+samples the peer abort flag; if the peer flag is set, the local endpoint
+reports remote abort.
 
 ## 5. Ownership
 

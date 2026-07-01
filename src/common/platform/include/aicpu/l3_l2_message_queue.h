@@ -20,7 +20,7 @@
 
 static constexpr uint32_t L3L2_QUEUE_MAGIC = 0x4C335132u;  // "L3Q2"
 static constexpr uint16_t L3L2_QUEUE_ABI_MAJOR = 1;
-static constexpr uint16_t L3L2_QUEUE_ABI_MINOR = 0;
+static constexpr uint16_t L3L2_QUEUE_ABI_MINOR = 1;
 static constexpr uint64_t L3L2_QUEUE_DESC_SLOT_BYTES = 32;
 static constexpr uint64_t L3L2_QUEUE_DESC_RING_ALIGNMENT = 8;
 static constexpr uint64_t L3L2_QUEUE_PAYLOAD_ARENA_ALIGNMENT = 64;
@@ -94,6 +94,8 @@ struct L3L2QueueArgs {
     uint64_t depth;
     uint64_t input_arena_bytes;
     uint64_t output_arena_bytes;
+    uint64_t payload_bytes;
+    uint64_t counter_bytes;
 };
 
 struct L3L2QueueInputHandle {
@@ -209,7 +211,8 @@ l3_l2_queue_validate_region(const L3L2OrchRegionDesc &desc, const L3L2QueueArgs 
         !l3_l2_queue_make_layout(args.depth, args.input_arena_bytes, args.output_arena_bytes, &layout)) {
         return false;
     }
-    if (desc.payload_bytes < layout.payload_bytes || desc.counter_bytes < layout.counter_bytes) {
+    if (args.payload_bytes != layout.payload_bytes || args.counter_bytes != layout.counter_bytes ||
+        desc.payload_bytes != layout.payload_bytes || desc.counter_bytes != layout.counter_bytes) {
         return false;
     }
     if (out_layout != nullptr) {
@@ -345,6 +348,11 @@ public:
                        )) {
                 parent_->poison(L3L2QueueErrorKind::INVALID_DESCRIPTOR, "input.try_peek", "input payload out of arena");
                 return false;
+            } else if (!parent_->payload_matches_head(
+                           parent_->input_payload_head_, slot.payload_offset, slot.payload_nbytes,
+                           parent_->layout_.input_arena_offset, parent_->layout_.input_arena_bytes, "input.try_peek"
+                       )) {
+                return false;
             } else if (!parent_->endpoint_.payload_read(slot.payload_offset, slot.payload_nbytes, &view)) {
                 parent_->poison(
                     L3L2QueueErrorKind::ENDPOINT_ERROR, "input.try_peek", parent_->endpoint_.error().message
@@ -472,6 +480,8 @@ public:
                 uint64_t arena_bytes = parent_->layout_.output_arena_bytes;
                 uint64_t arena_pos = parent_->output_payload_tail_ % arena_bytes;
                 if (arena_pos + nbytes > arena_bytes) {
+                    // Payloads are never split across arena wrap. The skipped tail bytes are retired in the
+                    // monotonic virtual cursor even if this reservation later finds the arena full.
                     parent_->output_payload_tail_ += arena_bytes - arena_pos;
                     arena_pos = 0;
                 }
@@ -648,16 +658,33 @@ private:
         return offset >= arena_offset && offset + nbytes <= arena_offset + arena_bytes;
     }
 
+    bool payload_matches_head(
+        uint64_t cursor, uint64_t payload_offset, uint64_t nbytes, uint64_t arena_offset, uint64_t arena_bytes,
+        const char *op
+    ) {
+        if (nbytes == 0) {
+            return true;
+        }
+        uint64_t arena_pos = cursor % arena_bytes;
+        uint64_t expected_offset = arena_pos + nbytes > arena_bytes ? arena_offset : arena_offset + arena_pos;
+        if (payload_offset != expected_offset) {
+            poison(L3L2QueueErrorKind::INVALID_DESCRIPTOR, op, "payload replay offset mismatch");
+            return false;
+        }
+        return true;
+    }
+
     void advance_payload_head(
         uint64_t &cursor, uint64_t payload_offset, uint64_t nbytes, uint64_t arena_offset, uint64_t arena_bytes,
         const char *op
     ) {
-        uint64_t expected_offset = arena_offset + (cursor % arena_bytes);
+        uint64_t arena_pos = cursor % arena_bytes;
+        uint64_t expected_offset = arena_pos + nbytes > arena_bytes ? arena_offset : arena_offset + arena_pos;
         if (expected_offset != payload_offset) {
-            if (payload_offset != arena_offset) {
-                poison(L3L2QueueErrorKind::INVALID_DESCRIPTOR, op, "payload replay offset mismatch");
-                return;
-            }
+            poison(L3L2QueueErrorKind::INVALID_DESCRIPTOR, op, "payload replay offset mismatch");
+            return;
+        }
+        if (arena_pos + nbytes > arena_bytes) {
             cursor += arena_bytes - (cursor % arena_bytes);
         }
         cursor += nbytes;

@@ -28,7 +28,7 @@ from .task_interface import DataType, Tensor
 
 L3L2_QUEUE_MAGIC = 0x4C335132
 L3L2_QUEUE_ABI_MAJOR = 1
-L3L2_QUEUE_ABI_MINOR = 0
+L3L2_QUEUE_ABI_MINOR = 1
 L3L2_QUEUE_DESC_SLOT_BYTES = 32
 L3L2_QUEUE_PAYLOAD_ARENA_ALIGNMENT = 64
 L3L2_QUEUE_COUNTER_STRIDE = 64
@@ -235,6 +235,8 @@ class L3L2Queue:
             self._layout.depth,
             self._layout.input_arena_bytes,
             self._layout.output_arena_bytes,
+            self._layout.payload_bytes,
+            self._layout.counter_bytes,
         ]
 
     def try_request_stop(self) -> bool:

@@ -40,6 +40,19 @@ L3L2OrchRegionDesc make_desc(RegionStorage *storage, uint64_t payload_bytes = 51
 
 size_t counter_index(uint64_t offset) { return static_cast<size_t>(offset / sizeof(int32_t)); }
 
+L3L2QueueArgs make_args(uint64_t depth, uint64_t input_arena_bytes, uint64_t output_arena_bytes) {
+    L3L2QueueLayout layout{};
+    EXPECT_TRUE(l3_l2_queue_make_layout(depth, input_arena_bytes, output_arena_bytes, &layout));
+    return L3L2QueueArgs{
+        l3_l2_queue_magic_version(), depth, input_arena_bytes, output_arena_bytes, layout.payload_bytes,
+        layout.counter_bytes,
+    };
+}
+
+L3L2OrchRegionDesc make_desc(RegionStorage *storage, const L3L2QueueArgs &args) {
+    return make_desc(storage, args.payload_bytes, args.counter_bytes);
+}
+
 void publish_input_desc(
     RegionStorage *storage, const L3L2QueueLayout &layout, uint64_t seq, L3L2QueueOpcode opcode,
     uint64_t payload_offset = 0, uint64_t payload_nbytes = 0
@@ -118,14 +131,10 @@ TEST(L3L2MessageQueueTest, LayoutRejectsInvalidDepthArenaAndCounterBytes) {
     EXPECT_FALSE(l3_l2_queue_make_layout(2, 65, 64, &layout));
 
     RegionStorage storage{};
-    L3L2QueueArgs args{
-        l3_l2_queue_magic_version(),
-        2,
-        64,
-        64,
-    };
+    L3L2QueueArgs args = make_args(2, 64, 64);
     EXPECT_FALSE(l3_l2_queue_validate_region(make_desc(&storage, 256, 320), args, &layout));
-    EXPECT_TRUE(l3_l2_queue_validate_region(make_desc(&storage, 512, 384), args, &layout));
+    EXPECT_FALSE(l3_l2_queue_validate_region(make_desc(&storage, 512, 384), args, &layout));
+    EXPECT_TRUE(l3_l2_queue_validate_region(make_desc(&storage, args), args, &layout));
 }
 
 TEST(L3L2MessageQueueTest, LayoutOverflowFailsClosedWithoutModifyingOutput) {
@@ -171,6 +180,10 @@ TEST(L3L2MessageQueueTest, Low32ReconstructionAcceptsWrapAndRejectsImpossibleDel
     EXPECT_TRUE(l3_l2_queue_reconstruct_counter(0, 4, &value));
     EXPECT_EQ(value, 0x1'0000'0000ull);
 
+    value = (1ull << 31) - 2;
+    EXPECT_TRUE(l3_l2_queue_reconstruct_counter(static_cast<int32_t>(0x8000'0001u), 4, &value));
+    EXPECT_EQ(value, (1ull << 31) + 1);
+
     value = 100;
     EXPECT_TRUE(l3_l2_queue_reconstruct_counter(104, 4, &value));
     EXPECT_EQ(value, 104u);
@@ -184,13 +197,8 @@ TEST(L3L2MessageQueueTest, Low32ReconstructionAcceptsWrapAndRejectsImpossibleDel
 
 TEST(L3L2MessageQueueTest, L2InputPeekHandlesZeroByteDescriptorBeforeArenaValidation) {
     RegionStorage storage{};
-    L3L2QueueArgs args{
-        l3_l2_queue_magic_version(),
-        2,
-        64,
-        64,
-    };
-    L3L2QueueEndpoint queue(make_desc(&storage), args);
+    L3L2QueueArgs args = make_args(2, 64, 64);
+    L3L2QueueEndpoint queue(make_desc(&storage, args), args);
     ASSERT_EQ(queue.error().kind, L3L2QueueErrorKind::NONE) << queue.error().message;
 
     L3L2QueueDescSlot slot{};
@@ -211,13 +219,8 @@ TEST(L3L2MessageQueueTest, L2InputPeekHandlesZeroByteDescriptorBeforeArenaValida
 
 TEST(L3L2MessageQueueTest, L2InputPeekPoisonsZeroByteDescriptorWithNonzeroOffset) {
     RegionStorage storage{};
-    L3L2QueueArgs args{
-        l3_l2_queue_magic_version(),
-        2,
-        64,
-        64,
-    };
-    L3L2QueueEndpoint queue(make_desc(&storage), args);
+    L3L2QueueArgs args = make_args(2, 64, 64);
+    L3L2QueueEndpoint queue(make_desc(&storage, args), args);
     ASSERT_EQ(queue.error().kind, L3L2QueueErrorKind::NONE) << queue.error().message;
 
     L3L2QueueDescSlot slot{};
@@ -232,15 +235,67 @@ TEST(L3L2MessageQueueTest, L2InputPeekPoisonsZeroByteDescriptorWithNonzeroOffset
     EXPECT_EQ(storage.counters[80], 1);
 }
 
+TEST(L3L2MessageQueueTest, L2InputPeekExposesNonzeroPayloadBytes) {
+    RegionStorage storage{};
+    L3L2QueueArgs args = make_args(2, 64, 64);
+    L3L2QueueEndpoint queue(make_desc(&storage, args), args);
+    ASSERT_EQ(queue.error().kind, L3L2QueueErrorKind::NONE) << queue.error().message;
+    const std::array<uint8_t, 4> payload{{0x11, 0x22, 0x33, 0x44}};
+    std::memcpy(storage.payload.data() + queue.layout().input_arena_offset, payload.data(), payload.size());
+    publish_input_desc(
+        &storage, queue.layout(), 1, L3L2QueueOpcode::DATA, queue.layout().input_arena_offset, payload.size()
+    );
+
+    L3L2QueueInputHandle handle{};
+    ASSERT_TRUE(queue.input().try_peek(&handle)) << queue.error().message;
+
+    ASSERT_EQ(handle.payload_nbytes, payload.size());
+    const auto *observed = reinterpret_cast<const uint8_t *>(static_cast<uintptr_t>(handle.payload.gm_addr));
+    EXPECT_EQ(std::memcmp(observed, payload.data(), payload.size()), 0);
+    ASSERT_TRUE(queue.input().release(handle)) << queue.error().message;
+    EXPECT_EQ(queue.error().kind, L3L2QueueErrorKind::NONE);
+}
+
+TEST(L3L2MessageQueueTest, L2InputPeekAllowsArenaWrapAtExpectedPayloadHead) {
+    RegionStorage storage{};
+    L3L2QueueArgs args = make_args(2, 128, 64);
+    L3L2QueueEndpoint queue(make_desc(&storage, args), args);
+    ASSERT_EQ(queue.error().kind, L3L2QueueErrorKind::NONE) << queue.error().message;
+
+    publish_input_desc(&storage, queue.layout(), 1, L3L2QueueOpcode::DATA, queue.layout().input_arena_offset, 80);
+    L3L2QueueInputHandle first{};
+    ASSERT_TRUE(queue.input().try_peek(&first)) << queue.error().message;
+    ASSERT_TRUE(queue.input().release(first)) << queue.error().message;
+
+    publish_input_desc(&storage, queue.layout(), 2, L3L2QueueOpcode::DATA, queue.layout().input_arena_offset, 64);
+    L3L2QueueInputHandle second{};
+    ASSERT_TRUE(queue.input().try_peek(&second)) << queue.error().message;
+
+    EXPECT_EQ(second.payload_offset, queue.layout().input_arena_offset);
+    EXPECT_EQ(second.payload_nbytes, 64u);
+    ASSERT_TRUE(queue.input().release(second)) << queue.error().message;
+    EXPECT_EQ(queue.error().kind, L3L2QueueErrorKind::NONE);
+}
+
+TEST(L3L2MessageQueueTest, L2InputPeekRejectsPayloadOffsetMismatchBeforeRelease) {
+    RegionStorage storage{};
+    L3L2QueueArgs args = make_args(2, 128, 64);
+    L3L2QueueEndpoint queue(make_desc(&storage, args), args);
+    ASSERT_EQ(queue.error().kind, L3L2QueueErrorKind::NONE) << queue.error().message;
+    publish_input_desc(&storage, queue.layout(), 1, L3L2QueueOpcode::DATA, queue.layout().input_arena_offset + 64, 16);
+
+    L3L2QueueInputHandle handle{};
+    EXPECT_FALSE(queue.input().try_peek(&handle));
+
+    EXPECT_EQ(queue.error().kind, L3L2QueueErrorKind::INVALID_DESCRIPTOR);
+    EXPECT_EQ(storage.counters[counter_index(L3L2_QUEUE_INPUT_DESC_HEAD_OFFSET)], 0);
+    EXPECT_EQ(storage.counters[counter_index(L3L2_QUEUE_L2_ABORT_FLAG_OFFSET)], 1);
+}
+
 TEST(L3L2MessageQueueTest, L2OutputReservePublishWritesDescriptorAndTail) {
     RegionStorage storage{};
-    L3L2QueueArgs args{
-        l3_l2_queue_magic_version(),
-        2,
-        64,
-        64,
-    };
-    L3L2QueueEndpoint queue(make_desc(&storage), args);
+    L3L2QueueArgs args = make_args(2, 64, 64);
+    L3L2QueueEndpoint queue(make_desc(&storage, args), args);
     ASSERT_EQ(queue.error().kind, L3L2QueueErrorKind::NONE) << queue.error().message;
 
     L3L2QueueOutputReservation reservation{};
@@ -260,13 +315,8 @@ TEST(L3L2MessageQueueTest, L2OutputReservePublishWritesDescriptorAndTail) {
 
 TEST(L3L2MessageQueueTest, L2OutputReserveReplaysReleasedDescriptorsBeforeReusingArena) {
     RegionStorage storage{};
-    L3L2QueueArgs args{
-        l3_l2_queue_magic_version(),
-        4,
-        64,
-        128,
-    };
-    L3L2QueueEndpoint queue(make_desc(&storage), args);
+    L3L2QueueArgs args = make_args(4, 64, 128);
+    L3L2QueueEndpoint queue(make_desc(&storage, args), args);
     ASSERT_EQ(queue.error().kind, L3L2QueueErrorKind::NONE) << queue.error().message;
 
     L3L2QueueOutputReservation first{};
@@ -283,13 +333,8 @@ TEST(L3L2MessageQueueTest, L2OutputReserveReplaysReleasedDescriptorsBeforeReusin
 
 TEST(L3L2MessageQueueTest, RemoteAbortObservationDoesNotSetOwnAbortFlag) {
     RegionStorage storage{};
-    L3L2QueueArgs args{
-        l3_l2_queue_magic_version(),
-        2,
-        64,
-        64,
-    };
-    L3L2QueueEndpoint queue(make_desc(&storage), args);
+    L3L2QueueArgs args = make_args(2, 64, 64);
+    L3L2QueueEndpoint queue(make_desc(&storage, args), args);
     ASSERT_EQ(queue.error().kind, L3L2QueueErrorKind::NONE) << queue.error().message;
     storage.counters[64] = 1;
 
@@ -301,13 +346,8 @@ TEST(L3L2MessageQueueTest, RemoteAbortObservationDoesNotSetOwnAbortFlag) {
 
 TEST(L3L2MessageQueueTest, OrdinaryTimeoutDoesNotSetOwnAbortFlag) {
     RegionStorage storage{};
-    L3L2QueueArgs args{
-        l3_l2_queue_magic_version(),
-        2,
-        64,
-        64,
-    };
-    L3L2QueueEndpoint queue(make_desc(&storage), args);
+    L3L2QueueArgs args = make_args(2, 64, 64);
+    L3L2QueueEndpoint queue(make_desc(&storage, args), args);
     ASSERT_EQ(queue.error().kind, L3L2QueueErrorKind::NONE) << queue.error().message;
 
     EXPECT_EQ(queue.disambiguate_timeout(), L3L2QueueTimeoutStatus::ORDINARY_TIMEOUT);
@@ -318,13 +358,8 @@ TEST(L3L2MessageQueueTest, OrdinaryTimeoutDoesNotSetOwnAbortFlag) {
 
 TEST(L3L2MessageQueueTest, OutputCapacityEqualsDepthAndFullIsNoProgressWithoutAbort) {
     RegionStorage storage{};
-    L3L2QueueArgs args{
-        l3_l2_queue_magic_version(),
-        2,
-        64,
-        64,
-    };
-    L3L2QueueEndpoint queue(make_desc(&storage), args);
+    L3L2QueueArgs args = make_args(2, 64, 64);
+    L3L2QueueEndpoint queue(make_desc(&storage, args), args);
     ASSERT_EQ(queue.error().kind, L3L2QueueErrorKind::NONE) << queue.error().message;
 
     for (int i = 0; i < 2; ++i) {
@@ -342,13 +377,8 @@ TEST(L3L2MessageQueueTest, OutputCapacityEqualsDepthAndFullIsNoProgressWithoutAb
 
 TEST(L3L2MessageQueueTest, FullAndEmptyUseMonotonicCountersNotMaskedIndices) {
     RegionStorage storage{};
-    L3L2QueueArgs args{
-        l3_l2_queue_magic_version(),
-        2,
-        64,
-        64,
-    };
-    L3L2QueueEndpoint queue(make_desc(&storage), args);
+    L3L2QueueArgs args = make_args(2, 64, 64);
+    L3L2QueueEndpoint queue(make_desc(&storage, args), args);
     ASSERT_EQ(queue.error().kind, L3L2QueueErrorKind::NONE) << queue.error().message;
 
     for (int i = 0; i < 2; ++i) {
@@ -370,13 +400,8 @@ TEST(L3L2MessageQueueTest, FullAndEmptyUseMonotonicCountersNotMaskedIndices) {
 
 TEST(L3L2MessageQueueTest, OutputReserveTooLargeIsPreMutationNoProgressWithoutAbort) {
     RegionStorage storage{};
-    L3L2QueueArgs args{
-        l3_l2_queue_magic_version(),
-        2,
-        64,
-        64,
-    };
-    L3L2QueueEndpoint queue(make_desc(&storage), args);
+    L3L2QueueArgs args = make_args(2, 64, 64);
+    L3L2QueueEndpoint queue(make_desc(&storage, args), args);
     ASSERT_EQ(queue.error().kind, L3L2QueueErrorKind::NONE) << queue.error().message;
 
     L3L2QueueOutputReservation reservation{};
@@ -389,13 +414,8 @@ TEST(L3L2MessageQueueTest, OutputReserveTooLargeIsPreMutationNoProgressWithoutAb
 
 TEST(L3L2MessageQueueTest, OutputPublishApplicationErrorDoesNotSetAbortFlag) {
     RegionStorage storage{};
-    L3L2QueueArgs args{
-        l3_l2_queue_magic_version(),
-        2,
-        64,
-        64,
-    };
-    L3L2QueueEndpoint queue(make_desc(&storage), args);
+    L3L2QueueArgs args = make_args(2, 64, 64);
+    L3L2QueueEndpoint queue(make_desc(&storage, args), args);
     ASSERT_EQ(queue.error().kind, L3L2QueueErrorKind::NONE) << queue.error().message;
 
     L3L2QueueOutputReservation reservation{};
@@ -411,13 +431,8 @@ TEST(L3L2MessageQueueTest, OutputPublishApplicationErrorDoesNotSetAbortFlag) {
 
 TEST(L3L2MessageQueueTest, OutputPublishStaleReservationPoisonsAndSetsOwnAbortFlag) {
     RegionStorage storage{};
-    L3L2QueueArgs args{
-        l3_l2_queue_magic_version(),
-        2,
-        64,
-        64,
-    };
-    L3L2QueueEndpoint queue(make_desc(&storage), args);
+    L3L2QueueArgs args = make_args(2, 64, 64);
+    L3L2QueueEndpoint queue(make_desc(&storage, args), args);
     ASSERT_EQ(queue.error().kind, L3L2QueueErrorKind::NONE) << queue.error().message;
 
     L3L2QueueOutputReservation reservation{};
@@ -431,13 +446,8 @@ TEST(L3L2MessageQueueTest, OutputPublishStaleReservationPoisonsAndSetsOwnAbortFl
 
 TEST(L3L2MessageQueueTest, InputApplicationErrorIsNormalMessageAndDoesNotSetAbortFlag) {
     RegionStorage storage{};
-    L3L2QueueArgs args{
-        l3_l2_queue_magic_version(),
-        2,
-        64,
-        64,
-    };
-    L3L2QueueEndpoint queue(make_desc(&storage), args);
+    L3L2QueueArgs args = make_args(2, 64, 64);
+    L3L2QueueEndpoint queue(make_desc(&storage, args), args);
     ASSERT_EQ(queue.error().kind, L3L2QueueErrorKind::NONE) << queue.error().message;
     publish_input_desc(&storage, queue.layout(), 1, L3L2QueueOpcode::ERROR);
 
@@ -452,13 +462,8 @@ TEST(L3L2MessageQueueTest, InputApplicationErrorIsNormalMessageAndDoesNotSetAbor
 
 TEST(L3L2MessageQueueTest, InputReleaseRejectsCallerMutatedHandleMetadata) {
     RegionStorage storage{};
-    L3L2QueueArgs args{
-        l3_l2_queue_magic_version(),
-        2,
-        64,
-        64,
-    };
-    L3L2QueueEndpoint queue(make_desc(&storage), args);
+    L3L2QueueArgs args = make_args(2, 64, 64);
+    L3L2QueueEndpoint queue(make_desc(&storage, args), args);
     ASSERT_EQ(queue.error().kind, L3L2QueueErrorKind::NONE) << queue.error().message;
     publish_input_desc(&storage, queue.layout(), 1, L3L2QueueOpcode::DATA, queue.layout().input_arena_offset, 16);
 
@@ -475,13 +480,8 @@ TEST(L3L2MessageQueueTest, InputReleaseRejectsCallerMutatedHandleMetadata) {
 
 TEST(L3L2MessageQueueTest, InputStopReleaseRejectsLaterPublishedInputAsInvalidState) {
     RegionStorage storage{};
-    L3L2QueueArgs args{
-        l3_l2_queue_magic_version(),
-        2,
-        64,
-        64,
-    };
-    L3L2QueueEndpoint queue(make_desc(&storage), args);
+    L3L2QueueArgs args = make_args(2, 64, 64);
+    L3L2QueueEndpoint queue(make_desc(&storage, args), args);
     ASSERT_EQ(queue.error().kind, L3L2QueueErrorKind::NONE) << queue.error().message;
     publish_input_desc(&storage, queue.layout(), 1, L3L2QueueOpcode::STOP);
 
@@ -499,13 +499,8 @@ TEST(L3L2MessageQueueTest, InputStopReleaseRejectsLaterPublishedInputAsInvalidSt
 
 TEST(L3L2MessageQueueTest, NullInputPeekOutputIsPreMutationRejectionWithoutAbort) {
     RegionStorage storage{};
-    L3L2QueueArgs args{
-        l3_l2_queue_magic_version(),
-        2,
-        64,
-        64,
-    };
-    L3L2QueueEndpoint queue(make_desc(&storage), args);
+    L3L2QueueArgs args = make_args(2, 64, 64);
+    L3L2QueueEndpoint queue(make_desc(&storage, args), args);
     ASSERT_EQ(queue.error().kind, L3L2QueueErrorKind::NONE) << queue.error().message;
 
     EXPECT_FALSE(queue.input().try_peek(nullptr));
@@ -516,13 +511,8 @@ TEST(L3L2MessageQueueTest, NullInputPeekOutputIsPreMutationRejectionWithoutAbort
 
 TEST(L3L2MessageQueueTest, InputSecondPeekBeforeReleasePoisonsOwnershipAndSetsOwnAbortFlag) {
     RegionStorage storage{};
-    L3L2QueueArgs args{
-        l3_l2_queue_magic_version(),
-        2,
-        64,
-        64,
-    };
-    L3L2QueueEndpoint queue(make_desc(&storage), args);
+    L3L2QueueArgs args = make_args(2, 64, 64);
+    L3L2QueueEndpoint queue(make_desc(&storage, args), args);
     ASSERT_EQ(queue.error().kind, L3L2QueueErrorKind::NONE) << queue.error().message;
     publish_input_desc(&storage, queue.layout(), 1, L3L2QueueOpcode::DATA);
 
