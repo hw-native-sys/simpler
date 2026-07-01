@@ -19,7 +19,7 @@
 // Wire contract: parent and forked child move CallConfig with one memcpy.
 TEST(CallConfig, WireLayoutMatchesConstant) {
     EXPECT_EQ(sizeof(RuntimeEnv), RUNTIME_ENV_UINT64_FIELD_COUNT * sizeof(uint64_t));
-    EXPECT_EQ(sizeof(CallConfig), 7 * sizeof(int32_t) + RUNTIME_ENV_UINT64_FIELD_COUNT * sizeof(uint64_t) + 1024);
+    EXPECT_EQ(sizeof(CallConfig), 8 * sizeof(int32_t) + RUNTIME_ENV_UINT64_FIELD_COUNT * sizeof(uint64_t) + 1024);
 }
 
 TEST(CallConfig, RuntimeEnvDefaultsAreUnset) {

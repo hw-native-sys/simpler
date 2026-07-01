@@ -197,9 +197,9 @@ int simpler_register_callable(DeviceContextHandle ctx, int32_t callable_id, cons
  */
 int simpler_run(
     DeviceContextHandle ctx, RuntimeHandle runtime, int32_t callable_id, const void *args, int block_dim,
-    int aicpu_thread_num, int enable_l2_swimlane, int enable_dump_tensor, int enable_pmu, int enable_dep_gen,
-    int enable_scope_stats, const uint64_t *ring_task_window, const uint64_t *ring_heap, const uint64_t *ring_dep_pool,
-    const char *output_prefix
+    int aicpu_thread_num, int pipeline_strategy, int enable_l2_swimlane, int enable_dump_tensor, int enable_pmu,
+    int enable_dep_gen, int enable_scope_stats, const uint64_t *ring_task_window, const uint64_t *ring_heap,
+    const uint64_t *ring_dep_pool, const char *output_prefix
 );
 
 /**

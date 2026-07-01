@@ -334,10 +334,10 @@ void ChipWorker::run(int32_t callable_id, const ChipStorageTaskArgs *args, const
     // Per-stage timing is emitted by the platform as `[STRACE]` log markers, not
     // returned (see chip_worker.h::run).
     int rc = run_fn_(
-        device_ctx_, rt, callable_id, args, config.block_dim, config.aicpu_thread_num, config.enable_l2_swimlane,
-        config.enable_dump_tensor, config.enable_pmu, config.enable_dep_gen, config.enable_scope_stats,
-        config.runtime_env.ring_task_window, config.runtime_env.ring_heap, config.runtime_env.ring_dep_pool,
-        config.output_prefix
+        device_ctx_, rt, callable_id, args, config.block_dim, config.aicpu_thread_num, config.pipeline_strategy,
+        config.enable_l2_swimlane, config.enable_dump_tensor, config.enable_pmu, config.enable_dep_gen,
+        config.enable_scope_stats, config.runtime_env.ring_task_window, config.runtime_env.ring_heap,
+        config.runtime_env.ring_dep_pool, config.output_prefix
     );
     if (rc != 0) {
         throw std::runtime_error("run failed with code " + std::to_string(rc));

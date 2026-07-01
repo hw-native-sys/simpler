@@ -333,6 +333,7 @@ class TestMailboxConfigRoundtrip:
         cfg = CallConfig()
         cfg.block_dim = 7
         cfg.aicpu_thread_num = 2
+        cfg.pipeline_strategy = 2
         cfg.enable_l2_swimlane = 3
         cfg.enable_dump_tensor = 2
         cfg.enable_pmu = 5
@@ -349,6 +350,7 @@ class TestMailboxConfigRoundtrip:
             _OFF_CONFIG,
             cfg.block_dim,
             cfg.aicpu_thread_num,
+            cfg.pipeline_strategy,
             cfg.enable_l2_swimlane,
             int(cfg.enable_dump_tensor),
             cfg.enable_pmu,
@@ -363,6 +365,7 @@ class TestMailboxConfigRoundtrip:
         decoded = _read_config_from_mailbox(memoryview(buf))
         assert decoded.block_dim == 7
         assert decoded.aicpu_thread_num == 2
+        assert decoded.pipeline_strategy == 2
         assert decoded.enable_l2_swimlane == 3
         assert decoded.enable_dump_tensor == 2
         assert decoded.enable_pmu == 5
