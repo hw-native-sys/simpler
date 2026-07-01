@@ -16,6 +16,9 @@
 #include "pipe_sync.h"
 #include "tensor.h"  // NOLINT(build/include_subdir)
 
+// NOLINTNEXTLINE(build/namespaces)
+using namespace pto;
+
 #ifndef __gm__
 #define __gm__
 #endif
@@ -27,23 +30,32 @@
 extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ int64_t *args) {
     __gm__ Tensor *src_tensor = reinterpret_cast<__gm__ Tensor *>(args[0]);
     __gm__ Tensor *out_tensor = reinterpret_cast<__gm__ Tensor *>(args[1]);
-    float scalar = from_u64<float>(static_cast<uint64_t>(args[2]));
-
     __gm__ float *src = reinterpret_cast<__gm__ float *>(src_tensor->buffer.addr) + src_tensor->start_offset;
     __gm__ float *out = reinterpret_cast<__gm__ float *>(out_tensor->buffer.addr) + out_tensor->start_offset;
-    uint32_t n = static_cast<uint32_t>(src_tensor->shapes[0]);
-    for (uint32_t i = 0; i < n; ++i) {
-        out[i] = src[i] + scalar;
-    }
+    float scalar = from_u64<float>(static_cast<uint64_t>(args[2]));
 
-#if defined(__CCE_KT_TEST__) || defined(__CCE_AICORE__) || defined(__DAV_C220__)
-    dcci((__gm__ int32_t *)out, ENTIRE_DATA_CACHE, CACHELINE_OUT);
-#if defined(__CPU_SIM)
-    dsb(0);
-#else
-    dsb(DSB_DDR);
-#endif
-    pipe_barrier(PIPE_ALL);
-#endif
+    constexpr int kRows = 128;
+    constexpr int kCols = 128;
+    using DynShapeDim5 = Shape<1, 1, 1, kRows, kCols>;
+    using DynStrideDim5 = Stride<1, 1, 1, kCols, 1>;
+    using GlobalData = GlobalTensor<float, DynShapeDim5, DynStrideDim5>;
+    using TileData = Tile<TileType::Vec, float, kRows, kCols, BLayout::RowMajor, -1, -1>;
+
+    TileData src_tile(kRows, kCols);
+    TileData dst_tile(kRows, kCols);
+    TASSIGN(src_tile, 0x0);
+    TASSIGN(dst_tile, 0x10000);
+
+    GlobalData src_global(src);
+    GlobalData dst_global(out);
+
+    TLOAD(src_tile, src_global);
+    set_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
+    wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
+    TADDS(dst_tile, src_tile, scalar);
+    set_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
+    wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
+    TSTORE(dst_global, dst_tile);
+
     pipe_sync();
 }

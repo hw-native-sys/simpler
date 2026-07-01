@@ -19,6 +19,10 @@ namespace {
 constexpr uint32_t kTransformFuncId = 0;
 constexpr int kExpectedArgCount = 11;
 constexpr uint64_t kQueueTimeoutNs = 5000000000ULL;
+constexpr uint32_t kRows = 128;
+constexpr uint32_t kCols = 128;
+constexpr uint32_t kNumel = kRows * kCols;
+constexpr uint64_t kTensorBytes = static_cast<uint64_t>(kNumel) * sizeof(float);
 
 void report_queue_error(const L3L2QueueEndpoint &queue) {
     const L3L2QueueError &err = queue.error();
@@ -32,38 +36,35 @@ void report_queue_error(const L3L2QueueEndpoint &queue) {
 bool has_queue_error(const L3L2QueueEndpoint &queue) { return queue.error().kind != L3L2QueueErrorKind::NONE; }
 
 bool process_data_message(L3L2QueueEndpoint &queue, const L3L2QueueInputHandle &input, float scalar) {
-    if (input.payload_nbytes % sizeof(float) != 0) {
+    if (input.payload_nbytes != kTensorBytes) {
         rt_report_fatal(
-            PTO2_ERROR_EXPLICIT_ORCH_FATAL, "L3-L2 queue example input bytes not float-aligned: %llu",
-            static_cast<unsigned long long>(input.payload_nbytes)
+            PTO2_ERROR_EXPLICIT_ORCH_FATAL, "L3-L2 queue example expected %llu input bytes, got %llu",
+            static_cast<unsigned long long>(kTensorBytes), static_cast<unsigned long long>(input.payload_nbytes)
         );
         return false;
     }
 
     L3L2QueueOutputReservation output{};
-    if (!queue.output().reserve(input.payload_nbytes, kQueueTimeoutNs, &output)) {
+    if (!queue.output().reserve(kTensorBytes, kQueueTimeoutNs, &output)) {
         report_queue_error(queue);
         return false;
     }
-    if (input.payload_nbytes != 0) {
-        uint32_t numel = static_cast<uint32_t>(input.payload_nbytes / sizeof(float));
-        uint32_t shape[1] = {numel};
-        Tensor input_tensor = make_tensor_external(
-            reinterpret_cast<void *>(static_cast<uintptr_t>(input.payload.gm_addr)), shape, 1, DataType::FLOAT32
-        );
-        Tensor output_tensor = make_tensor_external(
-            reinterpret_cast<void *>(static_cast<uintptr_t>(output.payload.gm_addr)), shape, 1, DataType::FLOAT32
-        );
+    uint32_t shape[2] = {kRows, kCols};
+    Tensor input_tensor = make_tensor_external(
+        reinterpret_cast<void *>(static_cast<uintptr_t>(input.payload.gm_addr)), shape, 2, DataType::FLOAT32
+    );
+    Tensor output_tensor = make_tensor_external(
+        reinterpret_cast<void *>(static_cast<uintptr_t>(output.payload.gm_addr)), shape, 2, DataType::FLOAT32
+    );
 
-        L0TaskArgs params;
-        params.add_input(input_tensor);
-        params.add_output(output_tensor);
-        params.add_scalar(scalar);
-        rt_submit_aiv_task(kTransformFuncId, params);
+    L0TaskArgs params;
+    params.add_input(input_tensor);
+    params.add_output(output_tensor);
+    params.add_scalar(scalar);
+    rt_submit_aiv_task(kTransformFuncId, params);
 
-        uint32_t first_index[1] = {0};
-        (void)get_tensor_data<float>(output_tensor, 1, first_index);
-    }
+    uint32_t first_index[2] = {0, 0};
+    (void)get_tensor_data<float>(output_tensor, 2, first_index);
     if (!queue.output().publish(output, L3L2QueueOpcode::DATA)) {
         report_queue_error(queue);
         return false;
