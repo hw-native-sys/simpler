@@ -190,22 +190,6 @@ def pytest_addoption(parser):
         "Requires --enable-l2-swimlane + deps.json (re-run with --enable-dep-gen if absent).",
     )
     parser.addoption(
-        "--pto-isa-commit",
-        action="store",
-        default=None,
-        help=(
-            "Override the pto-isa revision before running tests. "
-            "Default: use pto_isa.pin. Use latest/head/none to track origin/HEAD."
-        ),
-    )
-    parser.addoption(
-        "--clone-protocol",
-        action="store",
-        default="ssh",
-        choices=["ssh", "https"],
-        help="Protocol for cloning pto-isa when PTO_ISA_ROOT is not already set",
-    )
-    parser.addoption(
         "--sanitizer",
         action="store",
         default="none",
@@ -441,14 +425,8 @@ def pytest_configure(config):
     log_level = config.getoption("--log-level", default=None)
     configure_logging(log_level or DEFAULT_LOG_LEVEL)
 
-    commit = config.getoption("--pto-isa-commit")
-    clone_protocol = config.getoption("--clone-protocol")
-    # Pre-clone / refresh PTO-ISA up front so that (a) the requested
-    # --clone-protocol is honored before SceneTestCase's lazy default-ssh
-    # resolve, and (b) the local clone is fetched to origin/HEAD so a
-    # requested/default pto-isa commit doesn't miss a recently-published object.
-    # Short-circuits when $PTO_ISA_ROOT already points to a user-managed clone.
-    #
+    # Pre-clone / refresh PTO-ISA up front so scene-test children inherit the
+    # pinned managed checkout resolved from pto_isa.pin.
     # Pre-clone is an optimization, not a requirement: jobs that don't actually
     # need PTO-ISA (e.g. pytest tests/ut on a runner without SSH keys) must not
     # be aborted when the eager clone fails. If an actual scene test later needs
@@ -458,12 +436,7 @@ def pytest_configure(config):
     # (CI scene-test jobs) want the session to die here rather than fan out
     # into device subprocesses that each re-attempt the clone.
     try:
-        root = ensure_pto_isa_root(
-            verbose=True,
-            commit=commit,
-            clone_protocol=clone_protocol,
-            update_if_exists=True,
-        )
+        root = ensure_pto_isa_root(verbose=True)
     except OSError as e:
         if config.getoption("--require-pto-isa"):
             pytest.exit(f"PTO-ISA required but unavailable: {e}", returncode=pytest.ExitCode.USAGE_ERROR)

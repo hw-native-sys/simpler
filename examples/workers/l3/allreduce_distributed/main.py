@@ -130,11 +130,11 @@ def parse_device_range(spec: str) -> list[int]:
     return ids
 
 
-def build_chip_callable(platform: str, mode: str, pto_isa_commit: str | None) -> ChipCallable:
+def build_chip_callable(platform: str, mode: str) -> ChipCallable:
     """Compile the selected allreduce kernel + orchestration shim."""
     kc = KernelCompiler(platform=platform)
     runtime = "tensormap_and_ringbuffer"
-    pto_isa_root = ensure_pto_isa_root(commit=pto_isa_commit, clone_protocol="https")
+    pto_isa_root = ensure_pto_isa_root()
     include_dirs = kc.get_orchestration_include_dirs(runtime)
 
     # The kernel resolves CommContext from "platform_comm/comm_context.h",
@@ -177,7 +177,6 @@ def run(
     device_ids: list[int],
     platform: str = "a2a3",
     mode: str = "onephase",
-    pto_isa_commit: str | None = None,
 ) -> int:
     """Core logic — callable from both CLI and pytest."""
     nranks = len(device_ids)
@@ -201,7 +200,7 @@ def run(
     host_outputs = [torch.zeros(ALLREDUCE_COUNT, dtype=torch.float32).share_memory_() for _ in range(nranks)]
 
     print(f"[allreduce] compiling {mode} kernel...")
-    chip_callable = build_chip_callable(platform, mode, pto_isa_commit)
+    chip_callable = build_chip_callable(platform, mode)
 
     worker = Worker(
         level=3,
@@ -283,10 +282,9 @@ def main() -> int:
         default="onephase",
         help="Allreduce algorithm variant: onephase (mesh direct), twophase (mesh RS+AG), ring (ring RS+AG).",
     )
-    parser.add_argument("--pto-isa-commit", default=None, help="Optional PTO ISA commit/tag to fetch before compiling.")
     cli = parser.parse_args()
 
-    return run(parse_device_range(cli.device), platform=cli.platform, mode=cli.mode, pto_isa_commit=cli.pto_isa_commit)
+    return run(parse_device_range(cli.device), platform=cli.platform, mode=cli.mode)
 
 
 if __name__ == "__main__":

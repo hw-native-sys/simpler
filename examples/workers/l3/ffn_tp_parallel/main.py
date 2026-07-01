@@ -77,10 +77,10 @@ def parse_device_range(spec: str) -> list[int]:
     return ids
 
 
-def _kernel_compiler(platform: str, pto_isa_commit: str | None) -> tuple[KernelCompiler, str, list[str], list[str]]:
+def _kernel_compiler(platform: str) -> tuple[KernelCompiler, str, list[str], list[str]]:
     kc = KernelCompiler(platform=platform)
     runtime = "tensormap_and_ringbuffer"
-    pto_isa_root = ensure_pto_isa_root(commit=pto_isa_commit, clone_protocol="https")
+    pto_isa_root = ensure_pto_isa_root()
     include_dirs = kc.get_orchestration_include_dirs(runtime)
     # The allreduce_sum kernel resolves CommContext from
     # "platform_comm/comm_context.h" under src/common/.
@@ -88,9 +88,9 @@ def _kernel_compiler(platform: str, pto_isa_commit: str | None) -> tuple[KernelC
     return kc, pto_isa_root, list(include_dirs), kernel_include_dirs
 
 
-def build_ffn_local_callable(platform: str, pto_isa_commit: str | None) -> ChipCallable:
+def build_ffn_local_callable(platform: str) -> ChipCallable:
     """AIC matmul: x_shard @ w_shard -> partial_local."""
-    kc, pto_isa_root, _, kernel_include_dirs = _kernel_compiler(platform, pto_isa_commit)
+    kc, pto_isa_root, _, kernel_include_dirs = _kernel_compiler(platform)
     runtime = "tensormap_and_ringbuffer"
 
     kernel_bytes = kc.compile_incore(
@@ -119,9 +119,9 @@ def build_ffn_local_callable(platform: str, pto_isa_commit: str | None) -> ChipC
     )
 
 
-def build_allreduce_sum_callable(platform: str, pto_isa_commit: str | None) -> ChipCallable:
+def build_allreduce_sum_callable(platform: str) -> ChipCallable:
     """AIV cross-rank sum (4-phase publish/notify/wait/accumulate)."""
-    kc, pto_isa_root, _, kernel_include_dirs = _kernel_compiler(platform, pto_isa_commit)
+    kc, pto_isa_root, _, kernel_include_dirs = _kernel_compiler(platform)
     runtime = "tensormap_and_ringbuffer"
 
     kernel_bytes = kc.compile_incore(
@@ -160,7 +160,6 @@ def make_rank_inputs(rank: int) -> tuple[torch.Tensor, torch.Tensor]:
 def run(
     device_ids: list[int],
     platform: str = "a2a3",
-    pto_isa_commit: str | None = None,
 ) -> int:
     nranks = len(device_ids)
     # scratch = mailbox(nranks * M*N floats) + signal tail (nranks int32).
@@ -178,8 +177,8 @@ def run(
     host_y = [torch.zeros(M, N, dtype=torch.float32).share_memory_() for _ in range(nranks)]
 
     print("[ffn_tp_parallel] compiling kernels...")
-    ffn_local_cc = build_ffn_local_callable(platform, pto_isa_commit)
-    allreduce_cc = build_allreduce_sum_callable(platform, pto_isa_commit)
+    ffn_local_cc = build_ffn_local_callable(platform)
+    allreduce_cc = build_allreduce_sum_callable(platform)
 
     worker = Worker(
         level=3,
@@ -275,10 +274,9 @@ def main() -> int:
 
     parser.add_argument("-p", "--platform", default="a2a3", help="Platform backend, e.g. a2a3 or a2a3sim.")
     parser.add_argument("-d", "--device", default="0-1", help="Device range, e.g. '0-1'. Two chips required.")
-    parser.add_argument("--pto-isa-commit", default=None, help="Optional PTO ISA commit/tag to fetch before compiling.")
     cli = parser.parse_args()
 
-    return run(parse_device_range(cli.device), platform=cli.platform, pto_isa_commit=cli.pto_isa_commit)
+    return run(parse_device_range(cli.device), platform=cli.platform)
 
 
 if __name__ == "__main__":

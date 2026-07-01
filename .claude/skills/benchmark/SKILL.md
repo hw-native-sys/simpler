@@ -77,15 +77,15 @@ npu-smi info
 
 Pick devices with **HBM-Usage = 0**. Find the longest consecutive sub-range (at most 4). If no idle device is found, prompt user to specify a device ID.
 
-## Step 3: Pin PTO-ISA
+## Step 3: Confirm PTO-ISA Pin
 
-Extract pinned commit from `.github/workflows/ci.yml`:
+PTO-ISA is selected by the repo-root `pto_isa.pin`. Record the pin in the
+benchmark notes so baseline and current runs can be compared against the same
+source revision:
 
 ```bash
-PTO_ISA_COMMIT=$(grep -oP '(?<=--pto-isa-commit )\w+' .github/workflows/ci.yml | head -1)
+PTO_ISA_PIN=$(tr -d '[:space:]' < pto_isa.pin)
 ```
-
-Append `-c $PTO_ISA_COMMIT` to benchmark args so the underlying `python test_*.py` invocation picks it up.
 
 ## Step 4: Prepare — Compute Absolute Paths
 
@@ -157,8 +157,11 @@ This gives the worktree its own `_task_interface.*.so` in `.venv/lib/python3.*/s
 Activate the venv so `benchmark_rounds.sh` (which calls `python3`) picks up the worktree's nanobind extension and Python bindings:
 
 ```bash
-# WORKTREE_ABS must be the literal absolute path (e.g. /home/user/simpler/tmp/worktree_baseline_20260331)
-cd "$WORKTREE_ABS" && source .venv/bin/activate && pwd && ./tools/benchmark_rounds.sh -d $BASELINE_DEVICE -c $PTO_ISA_COMMIT -r "$RUNTIME" \
+# WORKTREE_ABS must be the literal absolute path.
+cd "$WORKTREE_ABS" && \
+  source .venv/bin/activate && \
+  pwd && \
+  ./tools/benchmark_rounds.sh -d "$BASELINE_DEVICE" -r "$RUNTIME" \
   2>&1 | tee "${PROJECT_ROOT}/tmp/benchmark_baseline_${TIMESTAMP}_${RUNTIME}.txt"
 ```
 
@@ -168,7 +171,7 @@ cd "$WORKTREE_ABS" && source .venv/bin/activate && pwd && ./tools/benchmark_roun
 
 ```bash
 # Runs from the main workspace (Bash tool default cwd)
-./tools/benchmark_rounds.sh -d $CURRENT_DEVICE -c $PTO_ISA_COMMIT -r "$RUNTIME" \
+./tools/benchmark_rounds.sh -d $CURRENT_DEVICE -r "$RUNTIME" \
   2>&1 | tee "tmp/benchmark_current_${TIMESTAMP}_${RUNTIME}.txt"
 ```
 
@@ -207,11 +210,14 @@ done
 
 # 2. For each runtime (serially — one device, one process at a time):
 #    Baseline first (from worktree with venv activated)
-cd "$WORKTREE_ABS" && source .venv/bin/activate && pwd && ./tools/benchmark_rounds.sh -d $DEVICE -c $PTO_ISA_COMMIT -r "$RUNTIME" \
+cd "$WORKTREE_ABS" && \
+  source .venv/bin/activate && \
+  pwd && \
+  ./tools/benchmark_rounds.sh -d "$DEVICE" -r "$RUNTIME" \
   2>&1 | tee "${PROJECT_ROOT}/tmp/benchmark_baseline_${TIMESTAMP}_${RUNTIME}.txt"
 
 #    Then current (from main workspace — default cwd, no venv)
-./tools/benchmark_rounds.sh -d $DEVICE -c $PTO_ISA_COMMIT -r "$RUNTIME" \
+./tools/benchmark_rounds.sh -d $DEVICE -r "$RUNTIME" \
   2>&1 | tee "tmp/benchmark_current_${TIMESTAMP}_${RUNTIME}.txt"
 
 # 3. Cleanup

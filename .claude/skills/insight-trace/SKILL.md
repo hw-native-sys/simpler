@@ -388,8 +388,8 @@ variants in one `.so`. Do **not** split into two
 `--cce-aicore-arch=dav-c220-cube` + `dav-c220-vec` libs — that layout
 produces an empty OPPROF dump under `msprof op simulator`.
 
-Generic template (set `REPO_ROOT` / `PTO_ISA_ROOT` from the environment;
-adjust `project()` name only):
+Generic template (set `REPO_ROOT` from the environment; adjust
+`project()` name only):
 
 ```cmake
 cmake_minimum_required(VERSION 3.16)
@@ -408,8 +408,9 @@ if(NOT DEFINED ENV{ASCEND_HOME_PATH})
 endif()
 set(ASCEND_HOME_PATH $ENV{ASCEND_HOME_PATH})
 set(SOC_VERSION dav_2201 CACHE STRING "Simulator SoC version")
-set(PTO_ISA_ROOT $ENV{PTO_ISA_ROOT} CACHE PATH "PTO ISA root")
 set(REPO_ROOT $ENV{REPO_ROOT} CACHE PATH "simpler repo root")
+set(PTO_ISA_MANAGED_ROOT "${REPO_ROOT}/build/pto-isa" CACHE PATH
+    "managed PTO ISA root")
 
 add_compile_options(
     -D_FORTIFY_SOURCE=2 -O2 -std=c++17
@@ -434,8 +435,8 @@ set(CMAKE_CPP_COMPILE_OPTIONS
 )
 
 set(COMMON_INCLUDES
-    ${PTO_ISA_ROOT}/include
-    ${PTO_ISA_ROOT}/include/pto
+    ${PTO_ISA_MANAGED_ROOT}/include
+    ${PTO_ISA_MANAGED_ROOT}/include/pto
     ${REPO_ROOT}/src/a2a3/runtime/tensormap_and_ringbuffer/runtime
     ${REPO_ROOT}/src/a2a3/runtime/tensormap_and_ringbuffer/common
     ${REPO_ROOT}/src/common/task_interface
@@ -476,9 +477,9 @@ headers from another arch directory, append to `COMMON_INCLUDES`.
 ### File 5 — `run_collect.sh`
 
 Build + collect + export wrapped in one bash script so `task-submit` can
-run it under a single NPU lock. Generic template — set
-`CANN_HOME` / `PTO_ISA_ROOT` / `REPO_ROOT` to whatever this machine
-provides; do not hard-code absolute paths into the workspace:
+run it under a single NPU lock. Generic template — set `CANN_HOME` and
+`REPO_ROOT` to whatever this machine provides; do not hard-code absolute
+paths into the workspace:
 
 ```bash
 #!/usr/bin/env bash
@@ -486,10 +487,8 @@ set -euo pipefail
 
 # Required env (caller sets these — typical values are machine-specific):
 #   CANN_HOME       e.g. .../cann-x.y.z-betaN  (must contain set_env.sh)
-#   PTO_ISA_ROOT    path to the pto-isa repo checkout
 #   REPO_ROOT       path to the simpler repo checkout
 : "${CANN_HOME:?CANN_HOME must be set}"
-: "${PTO_ISA_ROOT:?PTO_ISA_ROOT must be set}"
 : "${REPO_ROOT:?REPO_ROOT must be set}"
 
 WS="${WS:-$(dirname "$(readlink -f "$0")")}"
@@ -498,6 +497,9 @@ DEVICE_ID="${TARGET_DEVICE_ID:-${NPU_LOCKED_DEVICE:-0}}"
 BUILD_DIR="$WS/build"
 COLLECT_DIR="$WS/msprof_collect"
 EXPORT_ROOT="$WS/insight_export"
+
+PYTHONPATH="$REPO_ROOT${PYTHONPATH:+:$PYTHONPATH}" python -c \
+  'from simpler_setup.pto_isa import ensure_pto_isa_root; ensure_pto_isa_root(verbose=True)'
 
 source "$CANN_HOME/../cann/set_env.sh" 2>/dev/null \
   || source "$CANN_HOME/set_env.sh"
@@ -509,7 +511,6 @@ mkdir -p "$BUILD_DIR" "$COLLECT_DIR" "$EXPORT_ROOT"
 
 cmake -G Ninja -S "$WS" -B "$BUILD_DIR" \
     -DSOC_VERSION="$SOC_VERSION" \
-    -DPTO_ISA_ROOT="$PTO_ISA_ROOT" \
     -DREPO_ROOT="$REPO_ROOT"
 cmake --build "$BUILD_DIR" --target replay_host
 
@@ -548,11 +549,11 @@ environment and run cmake:
 
 ```bash
 source "$CANN_HOME/set_env.sh"   # or the project's set_env wrapper
-export PTO_ISA_ROOT="..."
 export REPO_ROOT="..."
+PYTHONPATH="$REPO_ROOT${PYTHONPATH:+:$PYTHONPATH}" python -c \
+  'from simpler_setup.pto_isa import ensure_pto_isa_root; ensure_pto_isa_root(verbose=True)'
 cmake -G Ninja -S "$WS" -B "$WS/build" \
     -DSOC_VERSION=dav_2201 \
-    -DPTO_ISA_ROOT="$PTO_ISA_ROOT" \
     -DREPO_ROOT="$REPO_ROOT"
 cmake --build "$WS/build" --target replay_host
 nm -D "$WS/build/libreplay_kernel.so" | grep -E ' T (replay_entry|launch_replay)$'

@@ -8,15 +8,13 @@ description: Run the full simulation CI pipeline (examples + tests/st) on a2a3si
 Detection procedures referenced below live in
 [`../../lib/onboard-detection.md`](../../lib/onboard-detection.md).
 
-1. **Extract CI pins** (§D, sim jobs): `--pto-isa-commit` and
-   `--pto-session-timeout`.
+1. **Extract CI timeout** (§D, sim jobs): `--pto-session-timeout`.
 2. **Detect platform** (sim, §B).
 3. Run:
 
    ```bash
    pytest examples tests/st --platform <platform> \
-     --pto-session-timeout <timeout> --clone-protocol https \
-     --pto-isa-commit <commit> -v
+     --pto-session-timeout <timeout> -v
    ```
 
    xdist parallelism is auto-enabled via `--max-parallel`; see `docs/testing.md`.

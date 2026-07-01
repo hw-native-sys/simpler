@@ -84,7 +84,7 @@ def build_chip_callable(platform: str) -> ChipCallable:
     """Compile the vector_example orchestration + 3 AIV kernels into one ChipCallable."""
     kc = KernelCompiler(platform=platform)
     runtime = "tensormap_and_ringbuffer"
-    pto_isa_root = ensure_pto_isa_root(clone_protocol="https")
+    pto_isa_root = ensure_pto_isa_root()
     include_dirs = kc.get_orchestration_include_dirs(runtime)
 
     # Three AIV kernels — func_id matches the rt_submit_aiv_task(N, ...) calls in

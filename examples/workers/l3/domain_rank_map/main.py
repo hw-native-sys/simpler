@@ -89,7 +89,7 @@ def _scratch_buffers() -> list[CommBufferSpec]:
 def build_allreduce_callable(platform: str) -> ChipCallable:
     kc = KernelCompiler(platform=platform)
     runtime = "tensormap_and_ringbuffer"
-    pto_isa_root = ensure_pto_isa_root(clone_protocol="https")
+    pto_isa_root = ensure_pto_isa_root()
     include_dirs = kc.get_orchestration_include_dirs(runtime)
     kernel_include_dirs = list(include_dirs) + [str(kc.project_root / "src" / "common")]
     kernel_bytes = kc.compile_incore(

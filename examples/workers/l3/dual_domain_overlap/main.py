@@ -79,7 +79,7 @@ def parse_device_range(spec: str) -> list[int]:
 def _kernel_compiler(platform: str) -> tuple[KernelCompiler, str, list[str], list[str]]:
     kc = KernelCompiler(platform=platform)
     runtime = "tensormap_and_ringbuffer"
-    pto_isa_root = ensure_pto_isa_root(clone_protocol="https")
+    pto_isa_root = ensure_pto_isa_root()
     include_dirs = kc.get_orchestration_include_dirs(runtime)
     kernel_include_dirs = list(include_dirs) + [str(kc.project_root / "src" / "common")]
     return kc, pto_isa_root, list(include_dirs), kernel_include_dirs

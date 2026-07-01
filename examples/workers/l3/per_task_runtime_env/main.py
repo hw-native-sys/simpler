@@ -111,7 +111,7 @@ def build_chip_callable(platform: str) -> ChipCallable:
     """
     kc = KernelCompiler(platform=platform)
     runtime = "tensormap_and_ringbuffer"
-    pto_isa_root = ensure_pto_isa_root(clone_protocol="https")
+    pto_isa_root = ensure_pto_isa_root()
     include_dirs = kc.get_orchestration_include_dirs(runtime)
 
     kernel_bytes = kc.compile_incore(

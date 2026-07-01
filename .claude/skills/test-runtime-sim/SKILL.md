@@ -10,15 +10,13 @@ Detection procedures referenced below live in
 
 1. Validate that `$ARGUMENTS` is one of: `host_build_graph`,
    `tensormap_and_ringbuffer`. If not, list the valid runtimes and stop.
-2. **Extract CI pins** (§D, sim jobs): `--pto-isa-commit` and
-   `--pto-session-timeout`.
+2. **Extract CI timeout** (§D, sim jobs): `--pto-session-timeout`.
 3. **Detect platform** (sim, §B).
 4. Run:
 
    ```bash
    pytest examples tests/st --platform <platform> --runtime $ARGUMENTS \
-     --pto-session-timeout <timeout> --clone-protocol https \
-     --pto-isa-commit <commit> -v
+     --pto-session-timeout <timeout> -v
    ```
 
    xdist parallelism is auto-selected via `--max-parallel auto` (min of nproc

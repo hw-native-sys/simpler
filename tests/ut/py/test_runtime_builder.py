@@ -8,7 +8,6 @@
 # -----------------------------------------------------------------------------------------------------------
 """Tests for RuntimeBuilder class."""
 
-import os
 import textwrap
 from pathlib import Path
 from unittest.mock import patch
@@ -154,7 +153,7 @@ class TestRuntimeBuilderErrors:
 
 
 class TestRuntimeBuilderPtoIsaValidation:
-    """Test PTO-ISA compatibility validation is scoped to affected runtimes."""
+    """Test PTO-ISA metadata validation is scoped to affected runtimes."""
 
     @pytest.mark.parametrize(
         ("platform", "should_validate"),
@@ -179,11 +178,11 @@ class TestRuntimeBuilderPtoIsaValidation:
 
         calls = []
 
-        def _fail_if_called(lib_dir):
-            calls.append(lib_dir)
+        def _fail_if_called(lib_dir, runtime_key=None):
+            calls.append((lib_dir, runtime_key))
             raise RuntimeError("pto-isa validation called")
 
-        monkeypatch.setattr(pto_isa, "validate_runtime_pto_isa_compatible", _fail_if_called)
+        monkeypatch.setattr(pto_isa, "validate_runtime_pto_isa_current_pin", _fail_if_called)
 
         builder = RuntimeBuilder.__new__(RuntimeBuilder)
         builder.platform = platform
@@ -198,7 +197,7 @@ class TestRuntimeBuilderPtoIsaValidation:
         if should_validate:
             with pytest.raises(RuntimeError, match="pto-isa validation called"):
                 builder._lookup_binaries("test_rt", tmp_path / "out")
-            assert calls == [builder._LIB_DIR]
+            assert calls == [(builder._LIB_DIR, "a2a3/onboard/test_rt")]
         else:
             with pytest.raises(FileNotFoundError, match="Pre-built runtime binaries not found"):
                 builder._lookup_binaries("test_rt", tmp_path / "out")
@@ -312,6 +311,72 @@ class TestRuntimeBuilderGetBinaries:
         with pytest.raises(RuntimeError, match="cmake failed"):
             builder.get_binaries("test_rt", build=True)
 
+    @patch("simpler_setup.runtime_builder.RuntimeCompiler")
+    def test_a2a3_onboard_direct_build_writes_pto_isa_metadata(self, MockCompiler, tmp_path, monkeypatch):
+        """get_binaries(build=True) records PTO-ISA provenance for direct onboard builds."""
+        from simpler_setup import pto_isa  # noqa: PLC0415
+        from simpler_setup.runtime_builder import RuntimeBuilder  # noqa: PLC0415
+
+        self._make_runtime(tmp_path, "a2a3")
+        calls = []
+
+        mock_instance = MockCompiler.get_instance.return_value
+        mock_instance.compile.side_effect = lambda target, *a, **kw: (Path(kw["output_dir"]) / f"lib{target}.so")
+        mock_instance.compile_simpler_log.return_value = tmp_path / "build" / "lib" / "libsimpler_log.so"
+        monkeypatch.setattr(pto_isa, "read_pto_isa_pin", lambda: "a" * 40)
+        monkeypatch.setattr(pto_isa, "ensure_pto_isa_root", lambda verbose=False: "/tmp/pto-isa")
+        monkeypatch.setattr(
+            pto_isa,
+            "write_pto_isa_build_metadata",
+            lambda lib_dir, pto_isa_root, runtime_keys: calls.append((lib_dir, pto_isa_root, runtime_keys)),
+        )
+
+        builder = RuntimeBuilder(platform="a2a3")
+        builder.get_binaries("test_rt", build=True)
+
+        assert calls == [(RuntimeBuilder._LIB_DIR, "/tmp/pto-isa", ["a2a3/onboard/test_rt"])]
+
+    @patch("simpler_setup.runtime_builder.RuntimeCompiler")
+    def test_a2a3_onboard_host_build_passes_pto_isa_cmake_define(self, MockCompiler, tmp_path, monkeypatch):
+        """Host runtime ccache key includes the pinned PTO-ISA commit."""
+        from simpler_setup import pto_isa  # noqa: PLC0415
+        from simpler_setup.runtime_builder import RuntimeBuilder  # noqa: PLC0415
+
+        pin = "a" * 40
+        self._make_runtime(tmp_path, "a2a3")
+
+        mock_instance = MockCompiler.get_instance.return_value
+        mock_instance.compile.side_effect = lambda target, *a, **kw: (Path(kw["output_dir"]) / f"lib{target}.so")
+        mock_instance.compile_simpler_log.return_value = tmp_path / "build" / "lib" / "libsimpler_log.so"
+        monkeypatch.setattr(pto_isa, "read_pto_isa_pin", lambda: pin)
+        monkeypatch.setattr(pto_isa, "ensure_pto_isa_root", lambda verbose=False: "/tmp/pto-isa")
+        monkeypatch.setattr(pto_isa, "write_pto_isa_build_metadata", lambda *args: None)
+
+        builder = RuntimeBuilder(platform="a2a3")
+        builder.get_binaries("test_rt", build=True)
+
+        host_call = next(call for call in mock_instance.compile.call_args_list if call.args[0] == "host")
+        non_host_calls = [call for call in mock_instance.compile.call_args_list if call.args[0] != "host"]
+        assert host_call.kwargs["cmake_defines"] == {"SIMPLER_PTO_ISA_BUILD_COMMIT": pin}
+        assert all(call.kwargs["cmake_defines"] is None for call in non_host_calls)
+
+    @patch("simpler_setup.runtime_builder.RuntimeCompiler")
+    def test_sim_direct_build_does_not_write_pto_isa_metadata(self, MockCompiler, tmp_path, monkeypatch):
+        """get_binaries(build=True) only writes PTO-ISA metadata for onboard a2a3."""
+        from simpler_setup import pto_isa  # noqa: PLC0415
+        from simpler_setup.runtime_builder import RuntimeBuilder  # noqa: PLC0415
+
+        self._make_runtime(tmp_path, "a2a3")
+
+        mock_instance = MockCompiler.get_instance.return_value
+        mock_instance.compile.side_effect = lambda target, *a, **kw: (Path(kw["output_dir"]) / f"lib{target}.so")
+        mock_instance.compile_simpler_log.return_value = tmp_path / "build" / "lib" / "libsimpler_log.so"
+        mock_instance.compile_sim_context.return_value = tmp_path / "build" / "lib" / "libcpu_sim_context.so"
+        monkeypatch.setattr(pto_isa, "write_pto_isa_build_metadata", lambda *args: pytest.fail("unexpected metadata"))
+
+        builder = RuntimeBuilder(platform="a2a3sim")
+        builder.get_binaries("test_rt", build=True)
+
 
 # --- _invalidate_cache_if_stale unit tests ---
 
@@ -396,9 +461,10 @@ class TestBuildCacheStamp:
     def test_a2a3_onboard_folds_in_pto_isa_commit(self, monkeypatch):
         """a2a3 onboard with a resolved pto-isa commit → composite stamp."""
         import simpler_setup.runtime_builder as rb_module  # noqa: PLC0415
+        from simpler_setup import pto_isa  # noqa: PLC0415
 
         monkeypatch.setattr(rb_module, "_get_git_head", lambda _root: "runtime_sha")
-        monkeypatch.setenv("SIMPLER_RUN_PTO_ISA_COMMIT", "isa_sha")
+        monkeypatch.setattr(pto_isa, "read_pto_isa_pin", lambda: "isa_sha")
 
         builder = self._make_builder("a2a3")
         assert builder._build_cache_stamp() == "runtime_sha:pto-isa=isa_sha"
@@ -406,9 +472,10 @@ class TestBuildCacheStamp:
     def test_non_a2a3_onboard_uses_pure_runtime_sha(self, monkeypatch):
         """Other arch/variant ignores pto-isa → stamp keyed on runtime HEAD only."""
         import simpler_setup.runtime_builder as rb_module  # noqa: PLC0415
+        from simpler_setup import pto_isa  # noqa: PLC0415
 
         monkeypatch.setattr(rb_module, "_get_git_head", lambda _root: "runtime_sha")
-        monkeypatch.setenv("SIMPLER_RUN_PTO_ISA_COMMIT", "isa_sha")
+        monkeypatch.setattr(pto_isa, "read_pto_isa_pin", lambda: pytest.fail("unexpected pin read"))
 
         builder = self._make_builder("a2a3sim")
         assert builder._build_cache_stamp() == "runtime_sha"
@@ -416,16 +483,17 @@ class TestBuildCacheStamp:
     def test_empty_runtime_head_yields_empty_stamp(self, monkeypatch):
         """No runtime HEAD → empty stamp, preserving the 'unavailable → clean rebuild' path."""
         import simpler_setup.runtime_builder as rb_module  # noqa: PLC0415
+        from simpler_setup import pto_isa  # noqa: PLC0415
 
         monkeypatch.setattr(rb_module, "_get_git_head", lambda _root: "")
-        monkeypatch.setenv("SIMPLER_RUN_PTO_ISA_COMMIT", "isa_sha")
+        monkeypatch.setattr(pto_isa, "read_pto_isa_pin", lambda: pytest.fail("unexpected pin read"))
 
         builder = self._make_builder("a2a3")
         assert builder._build_cache_stamp() == ""
 
 
 class TestResolveBuildPtoIsaCommit:
-    """Test pto-isa commit resolution and cmake/ccache lockstep write-back."""
+    """Test PTO-ISA pin resolution used by runtime build cache keys."""
 
     def _make_builder(self, platform):
         from simpler_setup.platform_info import parse_platform  # noqa: PLC0415
@@ -437,38 +505,31 @@ class TestResolveBuildPtoIsaCommit:
         return builder
 
     def test_non_a2a3_onboard_returns_empty(self, monkeypatch):
-        monkeypatch.setenv("SIMPLER_RUN_PTO_ISA_COMMIT", "isa_sha")
+        from simpler_setup import pto_isa  # noqa: PLC0415
+
+        monkeypatch.setattr(pto_isa, "read_pto_isa_pin", lambda: pytest.fail("unexpected pin read"))
 
         builder = self._make_builder("a2a3sim")
         assert builder._resolve_build_pto_isa_commit() == ""
 
-    def test_prefers_run_commit_env(self, monkeypatch):
-        monkeypatch.setenv("SIMPLER_RUN_PTO_ISA_COMMIT", "isa_sha")
-        monkeypatch.setenv("PTO_ISA_ROOT", "/should/not/be/read")
+    def test_a2a3_onboard_reads_pin(self, monkeypatch):
+        from simpler_setup import pto_isa  # noqa: PLC0415
 
+        monkeypatch.setattr(pto_isa, "read_pto_isa_pin", lambda: "isa_sha")
         builder = self._make_builder("a2a3")
         assert builder._resolve_build_pto_isa_commit() == "isa_sha"
 
-    def test_fallback_resolves_root_and_writes_back_for_lockstep(self, monkeypatch):
-        """PTO_ISA_ROOT fallback must export the resolved commit so the cmake
-        ccache-bust define (which reads SIMPLER_RUN_PTO_ISA_COMMIT) stays in
-        lockstep with the stamp computed here (issue #1139)."""
+    def test_pin_error_propagates(self, monkeypatch):
         from simpler_setup import pto_isa  # noqa: PLC0415
 
-        monkeypatch.delenv("SIMPLER_RUN_PTO_ISA_COMMIT", raising=False)
-        monkeypatch.setenv("PTO_ISA_ROOT", "/some/pto-isa")
-        monkeypatch.setattr(pto_isa, "get_pto_isa_head", lambda _root: "resolved_sha")
+        def _raise_bad_pin():
+            raise RuntimeError("bad pin")
+
+        monkeypatch.setattr(pto_isa, "read_pto_isa_pin", _raise_bad_pin)
 
         builder = self._make_builder("a2a3")
-        assert builder._resolve_build_pto_isa_commit() == "resolved_sha"
-        assert os.environ["SIMPLER_RUN_PTO_ISA_COMMIT"] == "resolved_sha"
-
-    def test_unresolvable_returns_empty(self, monkeypatch):
-        monkeypatch.delenv("SIMPLER_RUN_PTO_ISA_COMMIT", raising=False)
-        monkeypatch.delenv("PTO_ISA_ROOT", raising=False)
-
-        builder = self._make_builder("a2a3")
-        assert builder._resolve_build_pto_isa_commit() == ""
+        with pytest.raises(RuntimeError, match="bad pin"):
+            builder._resolve_build_pto_isa_commit()
 
 
 # --- Full integration tests (real compilation) ---

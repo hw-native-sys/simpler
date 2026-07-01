@@ -42,10 +42,12 @@ co-located with the simpler you're testing). `$BUILD` =
 | repo | role | imports | GitHub URL | local clone |
 | ---- | ---- | ------- | ---------- | ----------- |
 | simpler | host runtime + DFX (this repo) | — | <https://github.com/hw-native-sys/simpler> | `$PWD` (the current worktree) |
-| pto-isa | ISA spec; sets `PTO_ISA_ROOT` (required to BUILD the simpler runtime) | — | <https://github.com/hw-native-sys/pto-isa> | `$BUILD/pto-isa` |
+| pto-isa | ISA spec | — | [pto-isa][pto-isa] | `$BUILD/pto-isa` |
 | pypto | compiler + Python frontend; vendors a simpler submodule at `runtime/` | simpler | <https://github.com/hw-native-sys/pypto> | `$BUILD/pypto` |
 | pypto-lib | model kernels (qwen3, deepseek, etc.) | pypto + simpler | <https://github.com/hw-native-sys/pypto-lib> | `$BUILD/pypto-lib` |
 | pypto-serving | serving stack + standalone model runners (qwen3 `npu_generate.py`) | pypto-lib + pypto + simpler | <https://github.com/hw-native-sys/pypto-serving> | `$BUILD/pypto-serving` |
+
+[pto-isa]: https://github.com/hw-native-sys/pto-isa
 | PTOAS | `ptoas` assembler — **provided globally**, no clone | — | (on dev box / CI) | `/usr/local/bin/ptoas-bin` via `pypto-setup` |
 
 The import chain is a stack: **pto-isa** (build-time spec) → **simpler**
@@ -95,15 +97,13 @@ Notes:
 - PTOAS / CANN / gcc-15 are **provided globally** — no download. Step 2.5's
   `pypto-setup --export` points `PTOAS_ROOT` at them.
 
-## Step 2.5: Toolchain env — `pypto-setup` + `PTO_ISA_ROOT`
+## Step 2.5: Toolchain env — `pypto-setup`
 
 The dev box and CI runners ship ptoas, CANN, and gcc-15 globally; the
-`pypto-setup` helper hands you the env in one line. `PTO_ISA_ROOT` is the
-one piece it does NOT set (it's per-user) — point it at the `build/` clone:
+`pypto-setup` helper hands you the env in one line:
 
 ```bash
 eval "$(pypto-setup --export)"          # exports PTOAS_ROOT, ASCEND_HOME_PATH, GCC15_ROOT, PATH
-export PTO_ISA_ROOT="$BUILD/pto-isa"    # required to BUILD the simpler runtime
 ```
 
 Run `pypto-setup` (no args) to see every global component, its path, and
@@ -111,8 +111,8 @@ whether it's present. Why each matters:
 
 - **`PTOAS_ROOT`** unset → the JIT compile silently sets `skip_ptoas=True` →
   no `kernel_config.py` emitted → the runtime can't assemble kernels onboard.
-- **`PTO_ISA_ROOT`** unset → the simpler runtime build fails with
-  `PTO-ISA not available`.
+- **PTO-ISA checkout unavailable** → the simpler runtime build fails with
+  `PTO-ISA not available`; manually clone pto-isa into `build/pto-isa`.
 
 ## Step 3: Override — pick which simpler the workload sees
 
@@ -133,13 +133,13 @@ pip install --no-build-isolation "$BUILD/simpler-main"
 ### Override B: this worktree's simpler (your PR branch)
 
 You want to test in-flight changes (current PR / dev branch) against the
-external workload. `PTO_ISA_ROOT` (Step 2.5) must be exported first — the
-install builds the onboard runtime against it. A stale simpler whose ABI
+external workload. The install builds the onboard runtime against the
+`pto_isa.pin` managed checkout. A stale simpler whose ABI
 doesn't match the pypto compiler surfaces as **507018** on the first run.
 
 ```bash
 source .venv/bin/activate
-pip install --no-build-isolation .   # needs PTO_ISA_ROOT set (Step 2.5)
+pip install --no-build-isolation .
 ```
 
 **Re-editing simpler later → the runtime `.so` may NOT recompile.** Non-editable
@@ -279,7 +279,7 @@ pypto-lib ... example"). That subset is the actual cross-repo gate.
 | `ModuleNotFoundError: No module named 'pypto'` | pypto not installed in this venv | reinstall pypto from your local clone |
 | `import simpler` resolves to wrong path | user-site `.pth` hook shadowing venv | remove `_simpler_editable.{pth,py}` from user-site |
 | `FileNotFoundError: kernel_config.py not found in ...` | `PTOAS_ROOT` unset → pypto auto-skips ptoas → no `kernel_config.py` emitted | `eval "$(pypto-setup --export)"` (Step 2.5) |
-| `OSError: PTO-ISA not available` (during simpler build) | `PTO_ISA_ROOT` unset | `export PTO_ISA_ROOT="$BUILD/pto-isa"` (Step 2.5) |
+| PTO-ISA unavailable | no checkout | clone into `build/pto-isa` |
 | script exits 0 but no device run | compile-only smoke fallback (golden data dir missing) | pass `--data-dir <golden>` or `--smoke` explicitly |
 | `aclrtSynchronizeStreamWithTimeout (AICPU) failed: 507018` | binary skew (simpler runtime vs pypto compiler ABI), OR device log is the only ground truth | rebuild simpler against the matching pypto (Step 3/4); then read `~/ascend/log/debug/device-N/device-<pid>_*.log` |
 | `BFloat16 did not match Float` at validate | golden data shape mismatch (data older than code) | regenerate golden via the workload's `gen_*_golden.py` |

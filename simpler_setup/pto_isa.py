@@ -6,18 +6,15 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""PTO-ISA dependency management: resolve or auto-clone the repo.
+"""PTO-ISA dependency management: resolve the pinned managed checkout.
 
-Single source of truth for locating / cloning / pinning the PTO-ISA repo.
-Callers: root conftest (session-level pre-clone), SceneTestCase (lazy resolve
-at compile time), `SceneTestCase.run_module` (pin via `-c`).
+``pto_isa.pin`` is the single source of truth for the PTO-ISA revision.
+``ensure_pto_isa_root()`` always manages ``PROJECT_ROOT/build/pto-isa``:
 
-Resolution order for ensure_pto_isa_root():
-  1. PTO_ISA_ROOT environment variable (if set and points to a directory)
-  2. Explicit commit argument (--pto-isa-commit CLI / API)
-  3. PROJECT_ROOT / pto_isa.pin
-  4. PROJECT_ROOT / build / pto-isa at origin/HEAD when explicitly unpinned
-     or when the pin is missing
+1. Read the required commit from ``pto_isa.pin``.
+2. Clone the managed checkout over HTTPS if it is missing.
+3. Checkout/reset the managed checkout to the pinned commit.
+4. Verify HEAD exactly matches the pin before returning.
 
 Lock file under build/ serializes concurrent clones from parallel processes.
 """
@@ -25,10 +22,10 @@ Lock file under build/ serializes concurrent clones from parallel processes.
 import fcntl
 import json
 import logging
-import os
 import re
 import shutil
 import subprocess
+from collections.abc import Iterable
 from pathlib import Path
 from typing import Optional
 
@@ -37,85 +34,35 @@ from .environment import PROJECT_ROOT
 logger = logging.getLogger(__name__)
 
 _PTO_ISA_HTTPS = "https://github.com/hw-native-sys/pto-isa.git"
-_PTO_ISA_SSH = "git@github.com:hw-native-sys/pto-isa.git"
-_UNPINNED_COMMIT_VALUES = {"", "head", "latest", "none"}
 _PTO_ISA_PIN_RE = re.compile(r"^[0-9a-fA-F]{40}$")
 PTO_ISA_PIN_FILE = "pto_isa.pin"
 PTO_ISA_BUILD_METADATA = "pto_isa_build.json"
-_RUN_PTO_ISA_COMMIT_ENV = "SIMPLER_RUN_PTO_ISA_COMMIT"
-_RUN_PTO_ISA_ROOT_ENV = "SIMPLER_RUN_PTO_ISA_ROOT"
 
 
-def read_pto_isa_pin(pin_path: Optional[Path] = None) -> Optional[str]:
-    """Read the repository PTO-ISA pin, returning None only when absent/empty."""
+def read_pto_isa_pin(pin_path: Optional[Path] = None) -> str:
+    """Read and validate the repository PTO-ISA pin."""
     path = pin_path or (PROJECT_ROOT / PTO_ISA_PIN_FILE)
     try:
         value = path.read_text().strip()
-    except FileNotFoundError:
-        logger.warning(
-            "pto_isa.pin not found at %s; falling back to latest pto-isa (origin/HEAD). "
-            "Local build may diverge from CI.",
-            path,
-        )
-        return None
+    except FileNotFoundError as e:
+        raise RuntimeError(f"PTO-ISA pin not found at {path}") from e
     except OSError as e:
         raise RuntimeError(f"Failed to read PTO-ISA pin at {path}: {e}") from e
 
     if not value:
-        logger.warning(
-            "pto_isa.pin at %s is empty; falling back to latest pto-isa (origin/HEAD). "
-            "Local build may diverge from CI.",
-            path,
-        )
-        return None
+        raise RuntimeError(f"Invalid PTO-ISA pin at {path}: expected a 40-character hex SHA, got an empty file")
     if not _PTO_ISA_PIN_RE.fullmatch(value):
         raise RuntimeError(f"Invalid PTO-ISA pin at {path}: expected a 40-character hex SHA, got {value!r}")
-    return value
-
-
-def resolve_pto_isa_commit(commit: Optional[str] = None) -> Optional[str]:
-    """Resolve the pto-isa revision requested for managed clones.
-
-    Explicit CLI/API values win over the repository pto_isa.pin. "latest",
-    "head", "none", and an explicit empty value opt into the current remote
-    HEAD behavior.
-    """
-    requested = commit
-    if requested is not None:
-        value = requested.strip()
-        if value.lower() in _UNPINNED_COMMIT_VALUES:
-            return None
-        return value
-    return read_pto_isa_pin()
+    return value.lower()
 
 
 def get_pto_isa_head(pto_isa_root: str) -> str:
     """Return the full git HEAD SHA for a PTO-ISA checkout, or empty if unknown."""
     try:
         result = _run_git_resilient(["rev-parse", "HEAD"], cwd=Path(pto_isa_root), timeout=5)
-        return result.stdout.strip() if result.returncode == 0 else ""
+        return result.stdout.strip().lower() if result.returncode == 0 else ""
     except Exception:  # noqa: BLE001
         return ""
-
-
-def _record_runtime_pto_isa(pto_isa_root: str) -> None:
-    """Expose the resolved runtime PTO-ISA revision to host runtime lookup."""
-    actual_commit = get_pto_isa_head(pto_isa_root)
-    if actual_commit:
-        os.environ[_RUN_PTO_ISA_COMMIT_ENV] = actual_commit
-    else:
-        # Avoid carrying a stale value from an earlier checkout. If PTO_ISA_ROOT
-        # is not a git checkout, validation must fail rather than guess.
-        os.environ.pop(_RUN_PTO_ISA_COMMIT_ENV, None)
-    os.environ[_RUN_PTO_ISA_ROOT_ENV] = str(Path(pto_isa_root).resolve())
-
-
-def _commits_match(left: str, right: str) -> bool:
-    if left == right:
-        return True
-    if len(left) >= 7 and right.startswith(left):
-        return True
-    return len(right) >= 7 and left.startswith(right)
 
 
 def pto_isa_build_metadata_path(lib_dir: Path) -> Path:
@@ -123,30 +70,73 @@ def pto_isa_build_metadata_path(lib_dir: Path) -> Path:
     return lib_dir / PTO_ISA_BUILD_METADATA
 
 
-def write_pto_isa_build_metadata(
-    lib_dir: Path,
-    pto_isa_root: str,
-    requested_commit: Optional[str] = None,
-) -> None:
-    """Record the PTO-ISA revision used to build installed runtime binaries."""
-    resolved_request = resolve_pto_isa_commit(requested_commit)
+def pto_isa_runtime_artifact_key(arch: str, variant: str, runtime_name: str) -> str:
+    """Return the metadata key for one runtime artifact set."""
+    return f"{arch}/{variant}/{runtime_name}"
+
+
+def _metadata_commit(payload: dict) -> str:
+    return (
+        str(
+            payload.get("required_commit_from_pin")
+            or payload.get("actual_checkout_commit")
+            or payload.get("pto_isa_commit", "")
+        )
+        .strip()
+        .lower()
+    )
+
+
+def _metadata_entry(required_commit: str, actual_commit: str, pto_isa_root: str) -> dict:
+    return {
+        "required_commit_from_pin": required_commit,
+        "actual_checkout_commit": actual_commit,
+        "pin_file": str((PROJECT_ROOT / PTO_ISA_PIN_FILE).resolve()),
+        "checkout_path": str(Path(pto_isa_root).resolve()),
+    }
+
+
+def write_pto_isa_build_metadata(lib_dir: Path, pto_isa_root: str, runtime_keys: Iterable[str] = ()) -> None:
+    """Record the pinned PTO-ISA revision used to build runtime binaries."""
+    required_commit = read_pto_isa_pin()
     actual_commit = get_pto_isa_head(pto_isa_root)
     if not actual_commit:
         raise RuntimeError(
             "Cannot record PTO-ISA build revision: "
             f"{pto_isa_root} is not a git checkout or git HEAD is unavailable. "
-            "Building a2a3 onboard runtimes requires a traceable PTO-ISA commit for runtime compatibility "
-            "validation. Point PTO_ISA_ROOT to a full pto-isa git checkout, or unset PTO_ISA_ROOT so simpler "
-            "can clone pto-isa into build/pto-isa."
+            "Building a2a3 onboard runtimes requires the managed build/pto-isa checkout."
         )
-    metadata = {
-        "schema_version": 1,
-        "pto_isa_commit": actual_commit,
-        "requested_commit": resolved_request or "latest",
-        "pto_isa_root": str(Path(pto_isa_root).resolve()),
-    }
+    if actual_commit != required_commit:
+        raise RuntimeError(
+            "PTO-ISA checkout mismatch while recording runtime build metadata: "
+            f"pto_isa.pin requires {required_commit}, but {pto_isa_root} is at {actual_commit}."
+        )
+
+    keys = [runtime_keys] if isinstance(runtime_keys, str) else sorted(dict.fromkeys(runtime_keys))
+    entry = _metadata_entry(required_commit, actual_commit, pto_isa_root)
     lib_dir.mkdir(parents=True, exist_ok=True)
-    pto_isa_build_metadata_path(lib_dir).write_text(json.dumps(metadata, indent=2, sort_keys=True) + "\n")
+    lock_path = lib_dir / ".pto_isa_build.lock"
+    with open(lock_path, "w") as lock_fd:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        existing = read_pto_isa_build_metadata(lib_dir) or {}
+        runtime_artifacts = {}
+        if existing.get("schema_version") == 3 and isinstance(existing.get("runtime_artifacts"), dict):
+            runtime_artifacts.update(existing["runtime_artifacts"])
+        for key in keys:
+            runtime_artifacts[key] = dict(entry)
+
+        metadata = {
+            "schema_version": 3,
+            "required_commit_from_pin": required_commit,
+            "actual_checkout_commit": actual_commit,
+            "pin_file": str((PROJECT_ROOT / PTO_ISA_PIN_FILE).resolve()),
+            "checkout_path": str(Path(pto_isa_root).resolve()),
+            "runtime_artifacts": runtime_artifacts,
+        }
+        metadata_path = pto_isa_build_metadata_path(lib_dir)
+        tmp_path = metadata_path.with_name(f".{metadata_path.name}.tmp")
+        tmp_path.write_text(json.dumps(metadata, indent=2, sort_keys=True) + "\n")
+        tmp_path.replace(metadata_path)
 
 
 def read_pto_isa_build_metadata(lib_dir: Path) -> Optional[dict]:
@@ -163,60 +153,46 @@ def read_pto_isa_build_metadata(lib_dir: Path) -> Optional[dict]:
     return payload
 
 
-def _resolve_runtime_pto_isa_commit_for_validation() -> str:
-    run_commit = os.environ.get(_RUN_PTO_ISA_COMMIT_ENV, "").strip()
-    if run_commit:
-        return run_commit
-
-    env_root = os.environ.get("PTO_ISA_ROOT")
-    if env_root and Path(env_root).is_dir():
-        actual_commit = get_pto_isa_head(env_root)
-        if actual_commit:
-            return actual_commit
-        logger.warning(
-            "PTO_ISA_ROOT=%s is not a git checkout or git HEAD is unavailable; "
-            "falling back to resolved PTO-ISA commit for compatibility validation",
-            env_root,
-        )
-
-    requested_commit = resolve_pto_isa_commit(None)
-    if requested_commit:
-        return requested_commit
-
-    raise RuntimeError(
-        "Cannot verify PTO-ISA runtime revision: no concrete PTO-ISA git checkout or explicit commit is available."
-    )
-
-
-def validate_runtime_pto_isa_compatible(lib_dir: Path) -> None:
-    """Raise when installed runtime binaries and this run use different PTO-ISA commits."""
+def validate_runtime_pto_isa_current_pin(lib_dir: Path, runtime_key: Optional[str] = None) -> None:
+    """Raise when pre-built runtime binaries do not match the current pin."""
     metadata = read_pto_isa_build_metadata(lib_dir)
     if metadata is None:
         return
-    run_commit = _resolve_runtime_pto_isa_commit_for_validation()
 
-    build_commit = str(metadata.get("pto_isa_commit", "")).strip()
-    if not build_commit:
-        return
-    if _commits_match(build_commit, run_commit):
-        return
-
+    required_commit = read_pto_isa_pin()
     metadata_path = pto_isa_build_metadata_path(lib_dir)
+    if metadata.get("schema_version") == 3 and runtime_key is not None:
+        artifacts = metadata.get("runtime_artifacts")
+        if not isinstance(artifacts, dict):
+            raise RuntimeError(f"Invalid PTO-ISA build metadata at {metadata_path}: expected runtime_artifacts object")
+        artifact = artifacts.get(runtime_key)
+        if artifact is None:
+            raise RuntimeError(
+                "Stale PTO-ISA runtime binaries: current pto_isa.pin requires "
+                f"{required_commit}, but {metadata_path} has no entry for runtime {runtime_key!r}.\n"
+                "Reinstall simpler or rebuild this runtime so build/lib matches pto_isa.pin."
+            )
+        if not isinstance(artifact, dict):
+            raise RuntimeError(
+                f"Invalid PTO-ISA build metadata at {metadata_path}: "
+                f"runtime_artifacts[{runtime_key!r}] must be a JSON object"
+            )
+        build_commit = _metadata_commit(artifact)
+    else:
+        build_commit = _metadata_commit(metadata)
+    if not build_commit or build_commit == required_commit:
+        return
+
     raise RuntimeError(
-        "PTO-ISA version mismatch: installed simpler runtimes were built with "
-        f"pto-isa {build_commit}, but this run uses {run_commit}.\n"
+        "Stale PTO-ISA runtime binaries: current pto_isa.pin requires "
+        f"{required_commit}, but installed runtimes were built for {build_commit}.\n"
         f"Build metadata: {metadata_path}\n"
-        "Reinstall simpler with the same ISA revision, or rerun with "
-        f"--pto-isa-commit {build_commit}."
+        "Reinstall simpler or rebuild runtimes so build/lib matches pto_isa.pin."
     )
 
 
 def get_pto_isa_clone_path() -> Path:
-    """Default auto-clone target for PTO-ISA, anchored to PROJECT_ROOT.
-
-    Lives under PROJECT_ROOT/build/ so each repo / worktree / venv has its own
-    isolated clone (no races when multiple worktrees pin different commits).
-    """
+    """Managed auto-clone target for PTO-ISA, anchored to PROJECT_ROOT."""
     return PROJECT_ROOT / "build" / "pto-isa"
 
 
@@ -233,19 +209,13 @@ def _is_git_available() -> bool:
         return False
 
 
-def _repo_url(clone_protocol: str) -> str:
-    return _PTO_ISA_HTTPS if clone_protocol == "https" else _PTO_ISA_SSH
-
-
 def _run_git(
-    args: list, cwd: Optional[Path] = None, timeout: int = 30, check: bool = False
+    args: list,
+    cwd: Optional[Path] = None,
+    timeout: int = 30,
+    check: bool = False,
 ) -> subprocess.CompletedProcess:
-    """Run a git subcommand.
-
-    Always captures stdout/stderr as text. `check=False` (default) returns the
-    CompletedProcess for manual returncode inspection; `check=True` raises
-    CalledProcessError on non-zero exit.
-    """
+    """Run a git subcommand and capture stdout/stderr as text."""
     return subprocess.run(
         ["git"] + args,
         check=check,
@@ -261,7 +231,10 @@ def _is_dubious_ownership_error(stderr: str) -> bool:
 
 
 def _run_git_with_safe_directory(
-    args: list, cwd: Path, timeout: int = 30, check: bool = False
+    args: list,
+    cwd: Path,
+    timeout: int = 30,
+    check: bool = False,
 ) -> subprocess.CompletedProcess:
     return _run_git(["-c", f"safe.directory={cwd.resolve()}", *args], cwd=cwd, timeout=timeout, check=check)
 
@@ -273,7 +246,7 @@ def _run_git_resilient(
     check: bool = False,
     verbose: bool = False,
 ) -> subprocess.CompletedProcess:
-    """Run git, retrying dubious-ownership failures with a per-command safe.directory."""
+    """Run git, retrying dubious-ownership failures with per-command safe.directory."""
     result = _run_git(args, cwd=cwd, timeout=timeout, check=False)
     if result.returncode != 0 and _is_dubious_ownership_error(result.stderr):
         if verbose:
@@ -285,19 +258,7 @@ def _run_git_resilient(
 
 
 def _discard_incomplete_clone(target: Path, verbose: bool) -> None:
-    """Remove `target` if it exists but isn't a usable clone.
-
-    A timed-out or aborted ``git clone`` leaves a non-empty directory behind;
-    a later attempt then fails with "destination path already exists and is
-    not an empty directory" — poisoning every retry and every parallel device
-    subprocess that re-attempts the clone. Clearing it keeps the failure local
-    to the one attempt that hit the transient error.
-
-    Handles whatever is squatting on the path: a real directory, a plain file,
-    or a (possibly broken) symlink — ``git clone`` rejects all three, but
-    ``Path.exists()`` is False for a broken symlink and ``shutil.rmtree``
-    refuses non-directories, so check ``lexists`` and unlink non-dirs.
-    """
+    """Remove `target` if it exists but is not a usable clone."""
     if not (target.exists() or target.is_symlink()) or _is_cloned(target):
         return
     if verbose:
@@ -308,8 +269,8 @@ def _discard_incomplete_clone(target: Path, verbose: bool) -> None:
         target.unlink(missing_ok=True)
 
 
-def _clone(target: Path, commit: Optional[str], clone_protocol: str, verbose: bool) -> bool:
-    """Clone PTO-ISA to `target`, optionally at `commit`. Returns True on success."""
+def _clone(target: Path, verbose: bool) -> bool:
+    """Clone PTO-ISA to `target` over HTTPS. Returns True on success."""
     if not _is_git_available():
         if verbose:
             logger.warning("git command not available, cannot clone pto-isa")
@@ -322,31 +283,18 @@ def _clone(target: Path, commit: Optional[str], clone_protocol: str, verbose: bo
             logger.warning(f"Failed to create clone parent dir: {e}")
         return False
 
-    # Clear any half-clone left by a previous failed attempt (this run or an
-    # earlier one) so `git clone` doesn't refuse a non-empty target.
     _discard_incomplete_clone(target, verbose)
-
-    repo_url = _repo_url(clone_protocol)
-    logger.info(f"Cloning pto-isa to {target} (first run, may take up to a minute)...")
+    logger.info(f"Cloning pto-isa to {target} over HTTPS (first run, may take up to a minute)...")
 
     try:
-        result = _run_git(["clone", repo_url, str(target)], timeout=300)
+        result = _run_git(["clone", _PTO_ISA_HTTPS, str(target)], timeout=300)
         if result.returncode != 0:
             if verbose:
                 logger.warning(f"Failed to clone pto-isa:\n{result.stderr}")
             _discard_incomplete_clone(target, verbose)
             return False
-
-        if commit:
-            result = _run_git(["checkout", commit], cwd=target, timeout=30)
-            if result.returncode != 0:
-                if verbose:
-                    logger.warning(f"Failed to checkout pto-isa commit {commit}:\n{result.stderr}")
-                return False
-
         if verbose:
-            suffix = f" at commit {commit}" if commit else ""
-            logger.info(f"pto-isa cloned successfully{suffix}: {target}")
+            logger.info(f"pto-isa cloned successfully: {target}")
         return True
     except subprocess.TimeoutExpired:
         if verbose:
@@ -361,18 +309,24 @@ def _clone(target: Path, commit: Optional[str], clone_protocol: str, verbose: bo
 
 
 def checkout_pto_isa_commit(clone_path: Path, commit: str, verbose: bool = False) -> bool:
-    """Switch an existing clone to `commit` if needed. Return False on failure."""
+    """Checkout/reset the managed clone to `commit`. Return False on failure."""
     try:
-        result = _run_git_resilient(["rev-parse", "--short", "HEAD"], cwd=clone_path, timeout=5, verbose=verbose)
+        _run_git_resilient(["reset", "--hard"], cwd=clone_path, timeout=30, check=True, verbose=verbose)
+        _run_git_resilient(["clean", "-fdx"], cwd=clone_path, timeout=30, check=True, verbose=verbose)
+        result = _run_git_resilient(["checkout", "--detach", commit], cwd=clone_path, timeout=30, verbose=verbose)
         if result.returncode != 0:
-            logger.warning(f"Failed to read pto-isa HEAD before checking out {commit}: {result.stderr}")
-            return False
-        current = result.stdout.strip()
-        if current and not commit.startswith(current) and not current.startswith(commit):
             if verbose:
-                logger.info(f"pto-isa at {current}, checking out {commit}...")
+                logger.info(f"pto-isa commit {commit} missing locally, fetching origin...")
             _run_git_resilient(["fetch", "origin"], cwd=clone_path, timeout=120, check=True, verbose=verbose)
-            _run_git_resilient(["checkout", commit], cwd=clone_path, timeout=30, check=True, verbose=verbose)
+            _run_git_resilient(
+                ["checkout", "--detach", commit], cwd=clone_path, timeout=30, check=True, verbose=verbose
+            )
+        _run_git_resilient(["reset", "--hard", commit], cwd=clone_path, timeout=30, check=True, verbose=verbose)
+        _run_git_resilient(["clean", "-fdx"], cwd=clone_path, timeout=30, check=True, verbose=verbose)
+        actual = get_pto_isa_head(str(clone_path))
+        if actual != commit:
+            logger.warning(f"pto-isa checkout verification failed: expected {commit}, got {actual or '<unknown>'}")
+            return False
         return True
     except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
         logger.warning(f"Failed to checkout pto-isa commit {commit}: {e.stderr if hasattr(e, 'stderr') else e}")
@@ -382,100 +336,48 @@ def checkout_pto_isa_commit(clone_path: Path, commit: str, verbose: bool = False
         return False
 
 
-def _update_to_latest(clone_path: Path, verbose: bool) -> None:
-    """Fetch and reset existing clone to the remote default branch."""
-    try:
-        if verbose:
-            logger.info("Updating pto-isa to latest...")
-        _run_git_resilient(["fetch", "origin"], cwd=clone_path, timeout=120, check=True, verbose=verbose)
-        _run_git_resilient(["reset", "--hard", "origin/HEAD"], cwd=clone_path, timeout=30, check=True, verbose=verbose)
-    except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
-        logger.warning(f"Failed to update pto-isa to latest: {e.stderr if hasattr(e, 'stderr') else e}")
-    except Exception as e:  # noqa: BLE001
-        logger.warning(f"Unexpected error updating pto-isa: {e}")
-
-
-def ensure_pto_isa_root(
-    commit: Optional[str] = None,
-    clone_protocol: str = "ssh",
-    update_if_exists: bool = False,
-    verbose: bool = False,
-) -> str:
-    """Resolve or auto-clone PTO-ISA. Return absolute path.
-
-    Args:
-        commit: if provided, check out this revision after clone/in existing clone.
-        clone_protocol: "ssh" (default) or "https".
-        update_if_exists: when the resolved commit is None and a clone already
-            exists, fetch origin and reset to origin/HEAD. Conftest passes True
-            so explicit latest/head/none runs are refreshed up front. Lazy
-            callers pass False to avoid redundant network traffic since
-            conftest already ran.
-        verbose: log progress via `logger.info` / `logger.warning`.
-
-    Raises:
-        OSError: when PTO_ISA_ROOT is unset and auto-clone fails.
-    """
-    env_root = os.environ.get("PTO_ISA_ROOT")
-    if env_root and Path(env_root).is_dir():
-        if verbose:
-            logger.info(f"Using existing PTO_ISA_ROOT: {env_root}")
-        _record_runtime_pto_isa(env_root)
-        return env_root
-
-    commit = resolve_pto_isa_commit(commit)
+def ensure_pto_isa_root(verbose: bool = False) -> str:
+    """Resolve the pinned managed PTO-ISA checkout. Return absolute path."""
+    required_commit = read_pto_isa_pin()
     clone_path = get_pto_isa_clone_path()
     lock_path = clone_path.parent / ".pto-isa.lock"
     lock_path.parent.mkdir(parents=True, exist_ok=True)
+
     with open(lock_path, "w") as lock_fd:
         fcntl.flock(lock_fd, fcntl.LOCK_EX)
-        resolved = _ensure_locked(
-            clone_path,
-            commit=commit,
-            clone_protocol=clone_protocol,
-            update_if_exists=update_if_exists,
-            verbose=verbose,
-        )
+        resolved = _ensure_locked(clone_path, required_commit=required_commit, verbose=verbose)
 
     if resolved is None:
         raise OSError(
             f"PTO-ISA not available.\n"
-            f"  Either export PTO_ISA_ROOT=/path/to/pto-isa,\n"
-            f"  or manually clone to {clone_path}:\n"
-            f"    git clone {_repo_url(clone_protocol)} {clone_path}"
+            f"  The managed checkout must live at {clone_path} and match {PROJECT_ROOT / PTO_ISA_PIN_FILE}.\n"
+            f"  If auto-clone failed, manually run:\n"
+            f"    git clone {_PTO_ISA_HTTPS} {clone_path}"
         )
-    _record_runtime_pto_isa(resolved)
     return resolved
 
 
-def _ensure_locked(
-    clone_path: Path,
-    commit: Optional[str],
-    clone_protocol: str,
-    update_if_exists: bool,
-    verbose: bool,
-) -> Optional[str]:
+def _ensure_locked(clone_path: Path, required_commit: str, verbose: bool) -> Optional[str]:
     """Inner logic executed while holding the file lock."""
     if not _is_cloned(clone_path):
-        if not _clone(clone_path, commit=commit, clone_protocol=clone_protocol, verbose=verbose):
-            # A parallel process may have won the race
+        if not _clone(clone_path, verbose=verbose):
             if not _is_cloned(clone_path):
                 return None
             if verbose:
                 logger.info("pto-isa already cloned by another process")
-            if commit and not checkout_pto_isa_commit(clone_path, commit, verbose=verbose):
-                return None
-            elif update_if_exists:
-                _update_to_latest(clone_path, verbose=verbose)
-    elif commit:
-        if not checkout_pto_isa_commit(clone_path, commit, verbose=verbose):
-            return None
-    elif update_if_exists:
-        _update_to_latest(clone_path, verbose=verbose)
+
+    if not checkout_pto_isa_commit(clone_path, required_commit, verbose=verbose):
+        return None
 
     if not _is_cloned(clone_path):
         if verbose:
             logger.warning(f"pto-isa path exists but missing include directory: {clone_path / 'include'}")
+        return None
+
+    actual_commit = get_pto_isa_head(str(clone_path))
+    if actual_commit != required_commit:
+        if verbose:
+            logger.warning(f"pto-isa HEAD mismatch: expected {required_commit}, got {actual_commit or '<unknown>'}")
         return None
 
     return str(clone_path.resolve())

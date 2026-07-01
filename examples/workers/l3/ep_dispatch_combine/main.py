@@ -140,14 +140,14 @@ def parse_device_range(spec: str) -> list[int]:
     return ids
 
 
-def build_chip_callable(platform: str, pto_isa_commit: str | None) -> ChipCallable:
+def build_chip_callable(platform: str) -> ChipCallable:
     """Compile the dispatch / local_expert / combine AIV kernels + their
     shared C++ orchestration shim into a single ChipCallable with three
     child callables.
     """
     kc = KernelCompiler(platform=platform)
     runtime = "tensormap_and_ringbuffer"
-    pto_isa_root = ensure_pto_isa_root(commit=pto_isa_commit, clone_protocol="https")
+    pto_isa_root = ensure_pto_isa_root()
     include_dirs = kc.get_orchestration_include_dirs(runtime)
     kernel_include_dirs = list(include_dirs) + [str(kc.project_root / "src" / "common")]
 
@@ -463,7 +463,6 @@ def _verify_routed_y(
 def run(
     device_ids: list[int],
     platform: str = "a2a3",
-    pto_isa_commit: str | None = None,
 ) -> int:
     """Core logic — callable from CLI and pytest."""
     nranks = len(device_ids)
@@ -520,7 +519,7 @@ def run(
 
     print("[ep_dispatch] compiling kernels...")
 
-    chip_callable = build_chip_callable(platform, pto_isa_commit)
+    chip_callable = build_chip_callable(platform)
 
     worker = Worker(
         level=3,
@@ -614,10 +613,9 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("-d", "--device", default="0-1", help="Device range, e.g. '0-1'. Two chips required.")
     parser.add_argument("-p", "--platform", default="a2a3", help="Platform backend, e.g. a2a3 or a2a3sim.")
-    parser.add_argument("--pto-isa-commit", default=None, help="Optional PTO ISA commit/tag to fetch before compiling.")
     cli = parser.parse_args()
 
-    return run(parse_device_range(cli.device), platform=cli.platform, pto_isa_commit=cli.pto_isa_commit)
+    return run(parse_device_range(cli.device), platform=cli.platform)
 
 
 if __name__ == "__main__":

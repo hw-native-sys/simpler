@@ -9,7 +9,6 @@
 import fcntl
 import json
 import logging
-import os
 import shutil
 import subprocess
 from concurrent.futures import ThreadPoolExecutor
@@ -178,7 +177,7 @@ class RuntimeBuilder:
         source_dirs = [str((config_dir / p).resolve()) for p in cfg["source_dirs"]]
         return include_dirs, source_dirs
 
-    def _requires_pto_isa_compat_validation(self) -> bool:
+    def _requires_pto_isa_metadata_validation(self) -> bool:
         """Return True when this runtime embeds PTO-ISA headers into host code.
 
         Scoped on arch/variant, not on ``SIMPLER_ENABLE_PTO_SDMA_WORKSPACE``
@@ -193,7 +192,7 @@ class RuntimeBuilder:
         return self._arch == "a2a3" and self._variant == "onboard"
 
     def _resolve_build_pto_isa_commit(self) -> str:
-        """Return the pto-isa commit baked into this build, or "" when irrelevant.
+        """Return the pinned pto-isa commit baked into this build.
 
         Only a2a3 onboard host code embeds pto-isa headers, so a pto-isa bump
         must invalidate that build's cmake cache even when the runtime repo
@@ -202,31 +201,17 @@ class RuntimeBuilder:
         other arch/variant the pto-isa revision does not affect the compiled
         objects, so return "" and leave the stamp keyed on the runtime HEAD.
 
-        SIMPLER_RUN_PTO_ISA_COMMIT is exported by
-        ``simpler_setup.pto_isa.ensure_pto_isa_root`` as the resolved revision;
-        it matches the commit ``write_pto_isa_build_metadata`` records.
+        ``pto_isa.pin`` is the single source of truth. If the pin is missing or
+        invalid, let ``read_pto_isa_pin`` raise so an a2a3 onboard build cannot
+        silently proceed with unknown PTO-ISA headers.
         """
-        if not self._requires_pto_isa_compat_validation():
+        if not self._requires_pto_isa_metadata_validation():
             return ""
-        commit = os.environ.get("SIMPLER_RUN_PTO_ISA_COMMIT", "").strip()
-        if commit:
-            return commit
-        root = os.environ.get("PTO_ISA_ROOT", "").strip()
-        if root:
-            from .pto_isa import get_pto_isa_head  # noqa: PLC0415
+        from .pto_isa import read_pto_isa_pin  # noqa: PLC0415
 
-            commit = get_pto_isa_head(root)
-            if commit:
-                # The CMake ccache-bust define (CMakeLists.txt) reads this env
-                # var, not PTO_ISA_ROOT's HEAD. Write the resolved commit back
-                # so that define stays in lockstep with the stamp computed here
-                # — otherwise the cmake cache invalidates but ccache can still
-                # serve the stale host_runtime object (issue #1139).
-                os.environ["SIMPLER_RUN_PTO_ISA_COMMIT"] = commit
-            return commit
-        return ""
+        return read_pto_isa_pin()
 
-    def _build_cache_stamp(self) -> str:
+    def _build_cache_stamp(self, pto_isa_commit: Optional[str] = None) -> str:
         """Stamp identifying the sources this build was compiled from.
 
         Combines the runtime repo HEAD with the pto-isa commit (a2a3 onboard
@@ -238,7 +223,8 @@ class RuntimeBuilder:
         runtime_commit = _get_git_head(PROJECT_ROOT)
         if not runtime_commit:
             return ""
-        pto_isa_commit = self._resolve_build_pto_isa_commit()
+        if pto_isa_commit is None:
+            pto_isa_commit = self._resolve_build_pto_isa_commit()
         if pto_isa_commit:
             return f"{runtime_commit}:pto-isa={pto_isa_commit}"
         return runtime_commit
@@ -252,10 +238,11 @@ class RuntimeBuilder:
         Raises:
             FileNotFoundError: If any binary is missing.
         """
-        if self._requires_pto_isa_compat_validation():
-            from .pto_isa import validate_runtime_pto_isa_compatible  # noqa: PLC0415
+        if self._requires_pto_isa_metadata_validation():
+            from . import pto_isa  # noqa: PLC0415
 
-            validate_runtime_pto_isa_compatible(self._LIB_DIR)
+            runtime_key = pto_isa.pto_isa_runtime_artifact_key(self._arch, self._variant, name)
+            pto_isa.validate_runtime_pto_isa_current_pin(self._LIB_DIR, runtime_key=runtime_key)
 
         compiler = self._runtime_compiler
         paths = {}
@@ -348,10 +335,14 @@ class RuntimeBuilder:
 
         compiler = self._runtime_compiler
 
-        cache_stamp = self._build_cache_stamp()
+        build_pto_isa_commit = self._resolve_build_pto_isa_commit()
+        cache_stamp = self._build_cache_stamp(build_pto_isa_commit)
 
         def _compile_target(target: str) -> Path:
             include_dirs, source_dirs = self._resolve_target_dirs(config_dir, build_config, target)
+            cmake_defines = None
+            if target == "host" and build_pto_isa_commit:
+                cmake_defines = {"SIMPLER_PTO_ISA_BUILD_COMMIT": build_pto_isa_commit}
             # compile() adds a {target}/ subdirectory inside build_dir
             cache_dir = self._CACHE_DIR / arch / variant / name
             cache_dir.mkdir(parents=True, exist_ok=True)
@@ -370,6 +361,7 @@ class RuntimeBuilder:
                     build_dir=str(cache_dir),
                     output_dir=output_dir,
                     dispatcher_dest=dispatcher_staging_dir if target == "aicpu" else None,
+                    cmake_defines=cmake_defines,
                 )
 
         logger.info("Compiling AICore, AICPU, Host in parallel...")
@@ -390,6 +382,15 @@ class RuntimeBuilder:
             sim_context_path = fut_sim_ctx.result() if fut_sim_ctx else None
 
         self._place_compile_commands(name)
+        if self._requires_pto_isa_metadata_validation():
+            from . import pto_isa  # noqa: PLC0415
+
+            runtime_key = pto_isa.pto_isa_runtime_artifact_key(self._arch, self._variant, name)
+            pto_isa.write_pto_isa_build_metadata(
+                self._LIB_DIR,
+                pto_isa.ensure_pto_isa_root(verbose=True),
+                [runtime_key],
+            )
         logger.info("Build complete!")
         # runtime_compiler stages libsimpler_aicpu_dispatcher.so into the
         # per-arch shared directory when target=='aicpu'. Surface it through

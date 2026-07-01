@@ -30,7 +30,6 @@ python main.py -p a2a3 -d 0-3
 | -------- | ------- | ----------- |
 | `-p`, `--platform` | `a2a3` | Platform backend (e.g., `a2a3`, `a2a3sim`, `a5`, `a5sim`) |
 | `-d`, `--device` | `0-1` | Device range (e.g., `0-1`, `0-3`). 2-16 chips supported. |
-| `--pto-isa-commit` | `None` | Optional PTO ISA commit/tag |
 
 ## File Structure
 

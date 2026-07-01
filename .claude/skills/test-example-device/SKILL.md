@@ -15,15 +15,13 @@ Detection / isolation procedures referenced below live in
    `/test-example-sim` instead and stop.
 3. **Precheck + detect platform** (§A) — derive the arch from `$ARGUMENTS`,
    gate on real silicon, then read the detected arch into `PLATFORM`.
-4. **Extract CI pins** (§D, `st-onboard-<platform>` job): `--pto-isa-commit`.
-5. **Select a single idle device** (§C) — or let `task-submit` pick via
+4. **Select a single idle device** (§C) — or let `task-submit` pick via
    `--device auto --device-num 1`.
-6. **Run through `task-submit`** (§E, `--device-num 1`). The underlying
+5. **Run through `task-submit`** (§E, `--device-num 1`). The underlying
    command:
 
    ```bash
-   python $ARGUMENTS/test_<name>.py -p <platform> -d $TASK_DEVICE \
-     --clone-protocol https --pto-isa-commit <commit>
+   python $ARGUMENTS/test_<name>.py -p <platform> -d $TASK_DEVICE
    ```
 
-7. Report pass/fail status with any error output.
+6. Report pass/fail status with any error output.

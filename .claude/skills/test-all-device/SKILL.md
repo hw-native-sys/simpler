@@ -12,16 +12,15 @@ Detection / isolation procedures referenced below live in
    instead and stop.
 2. **Precheck + detect platform** (§A) — gate on real silicon, then read the
    detected arch into `PLATFORM`.
-3. **Extract CI pins** (§D, `st-onboard-<platform>` job): `--pto-isa-commit`
-   and `--pto-session-timeout`.
+3. **Extract CI timeout** (§D, `st-onboard-<platform>` job):
+   `--pto-session-timeout`.
 4. **Select a device range** (§C, range ≤4) — or, when wrapping in
    `task-submit`, let it pick via `--device auto --device-num <range size>`.
 5. **Run through `task-submit`** (§E). The underlying command:
 
    ```bash
    pytest examples tests/st --platform <platform> --device <range-or-$TASK_DEVICE> \
-     --pto-session-timeout <timeout> --clone-protocol https \
-     --pto-isa-commit <commit> -v
+     --pto-session-timeout <timeout> -v
    ```
 
    Parallelism is auto-driven by `--device`: on hardware, one in-flight
