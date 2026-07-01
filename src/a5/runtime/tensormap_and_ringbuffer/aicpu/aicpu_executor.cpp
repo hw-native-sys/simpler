@@ -558,9 +558,6 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
                 }
 #endif
 
-                // With multi-ring, slot_states are per-ring inside the scheduler.
-                runtime->set_slot_states_ptr(nullptr);
-
                 // Wire scheduler context to the newly created PTO2Runtime before
                 // releasing scheduler threads from runtime_init_ready_.
                 sched_ctx_.bind_runtime(rt);

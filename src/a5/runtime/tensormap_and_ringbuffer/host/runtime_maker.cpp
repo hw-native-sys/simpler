@@ -514,7 +514,6 @@ static bool ensure_static_arenas(Runtime *runtime, const ArenaSizingConfig &sizi
         LOG_ERROR("Failed to acquire pooled GM heap");
         return false;
     }
-    runtime->set_gm_heap(out->gm_heap);
 
     int64_t t_sm_start = _now_ms();
     out->gm_sm = runtime->host_api.acquire_pooled_gm_sm();
