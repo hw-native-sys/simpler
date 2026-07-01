@@ -75,6 +75,19 @@ endif()
 # Create shared library
 add_library(host_runtime SHARED ${HOST_RUNTIME_SOURCES})
 
+# TraCR
+include(${CMAKE_CURRENT_SOURCE_DIR}/../../../../../tools/tracr.cmake)
+tracr_enable(host_runtime)
+
+# Optional: to make the Orchestrator run independently (i.e. finalize before letting the schedulers run)
+option(INDEP_ORCH "Run Orchestrator independent from the Schedulers" OFF)
+if(DEFINED ENV{INDEP_ORCH})
+    set(INDEP_ORCH $ENV{INDEP_ORCH})
+endif()
+if(INDEP_ORCH)
+    target_compile_definitions(host_runtime PRIVATE INDEP_ORCH)
+endif()
+
 # C++ standard (applied only to C++ files)
 set_target_properties(host_runtime PROPERTIES
     CXX_STANDARD 17

@@ -63,6 +63,19 @@ message(STATUS "AICpu kernel: ${NUM_AICPU_KERNEL_SOURCES} source files")
 message(VERBOSE "AICpu kernel sources: ${AICPU_KERNEL_SOURCES}")
 add_library(aicpu_kernel SHARED ${AICPU_KERNEL_SOURCES})
 
+# TraCR
+include(${CMAKE_CURRENT_SOURCE_DIR}/../../../../../tools/tracr.cmake)
+tracr_enable(aicpu_kernel)
+
+# Option to make the Orchestrator run independently (i.e. finalize before letting the schedulers run)
+option(INDEP_ORCH "Run Orchestrator independent from the Schedulers" OFF)
+if(DEFINED ENV{INDEP_ORCH})
+    set(INDEP_ORCH $ENV{INDEP_ORCH})
+endif()
+if(INDEP_ORCH)
+    target_compile_definitions(aicpu_kernel PRIVATE INDEP_ORCH)
+endif()
+
 option(WERROR "Treat compiler warnings as errors" ON)
 if(DEFINED ENV{SIMPLER_DISABLE_WARNINGS_AS_ERRORS})
     set(WERROR OFF)

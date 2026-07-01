@@ -29,6 +29,8 @@
 #include <string>
 #include <vector>
 
+#include <tracr_simpler_api.hpp>
+
 #include "aicpu/device_phase_aicpu.h"
 #include "aicpu/platform_aicpu_affinity.h"
 #include "callable_protocol.h"
@@ -252,6 +254,15 @@ int DeviceRunner::run(Runtime &runtime, int block_dim, int launch_aicpu_num) {
     runtime.set_worker_count(num_aicore);
     worker_count_ = num_aicore;
     runtime.set_aicpu_thread_num(launch_aicpu_num);
+
+    // Initialize TraCR memory on the device
+#ifdef ENABLE_TRACR
+    rc = DevAllocTraCR(this, runtime);
+    if (rc != 0) {
+        LOG_ERROR("DevAllocTraCR failed rc=%d", rc);
+        return rc;
+    }
+#endif
 
     int num_aic = block_dim;
     uint32_t enable_profiling_flag = PROFILING_FLAG_NONE;
@@ -570,6 +581,15 @@ int DeviceRunner::run(Runtime &runtime, int block_dim, int launch_aicpu_num) {
         LOG_ERROR("AICPU execution failed with rc=%d", runtime_rc);
         return runtime_rc;
     }
+
+    // Download and Free TraCR memory from Device and store in memory (~/ascend/)
+#ifdef ENABLE_TRACR
+    rc = StoreTracrData(this, runtime);
+    if (rc != 0) {
+        LOG_ERROR("FreeTraCR failed: %d", rc);
+        return -1;
+    }
+#endif
 
     // Tear down collectors. stop() joins mgmt then collector in the only safe
     // order (mgmt's final-drain pass into L2 has poll as its consumer).

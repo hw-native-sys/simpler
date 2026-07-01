@@ -186,6 +186,11 @@ public:
     // Task storage
     Task tasks[RUNTIME_MAX_TASKS];  // Fixed-size task array
 
+    // TraCR data placeholder
+    // Those are the pointers with the allocated memory on the device
+    void *tracrData_;
+    void *tracrDataSizes_;
+
     // Filter-style affinity gate input (a2a3 onboard). Placed AFTER `tasks`
     // because AICore reads runtime->tasks[] by offset. Host fills these before
     // launch from AICPU OCCUPY; the device gate keeps threads whose
@@ -235,6 +240,10 @@ public:
     void set_worker_count(int n) { worker_count = n; }
     int get_aicpu_thread_num() const { return aicpu_thread_num; }
     void set_aicpu_thread_num(int n) { aicpu_thread_num = n; }
+    void *get_tracr_data() const { return tracrData_; }
+    void set_tracr_data(void *p) { tracrData_ = p; }
+    void *get_tracr_data_sizes() const { return tracrDataSizes_; }
+    void set_tracr_data_sizes(void *p) { tracrDataSizes_ = p; }
     Handshake *get_workers() { return workers; }
     int32_t get_aicpu_allowed_cpu_count() const { return aicpu_allowed_cpu_count; }
     void set_aicpu_allowed_cpu_count(int32_t n) { aicpu_allowed_cpu_count = n; }

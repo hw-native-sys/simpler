@@ -70,6 +70,27 @@ endif()
 # Create shared library (host-compatible for dlopen)
 add_library(aicpu_kernel SHARED ${AICPU_SOURCES})
 
+# TraCR
+include(${CMAKE_CURRENT_SOURCE_DIR}/../../../../../tools/tracr.cmake)
+tracr_enable(aicpu_kernel)
+
+# TODO: move this somewhere such that EVERY platform launches this once. Placing this here is hacky...
+# Only build the host-side trace post-processor when TraCR is enabled: it is an
+# offline analysis tool, and it pulls in Linux-only APIs (sched_getcpu) that do
+# not compile on the macOS packaging build.
+if(BUILD_TRACR)
+    include(${CMAKE_CURRENT_SOURCE_DIR}/../../../../../tools/tracr_postprocessing_script.cmake)
+endif()
+
+# Optional: to make the Orchestrator run independently (i.e. finalize before letting the schedulers run)
+option(INDEP_ORCH "Run Orchestrator independent from the Schedulers" OFF)
+if(DEFINED ENV{INDEP_ORCH})
+    set(INDEP_ORCH $ENV{INDEP_ORCH})
+endif()
+if(INDEP_ORCH)
+    target_compile_definitions(aicpu_kernel PRIVATE INDEP_ORCH)
+endif()
+
 option(WERROR "Treat compiler warnings as errors" ON)
 if(DEFINED ENV{SIMPLER_DISABLE_WARNINGS_AS_ERRORS})
     set(WERROR OFF)

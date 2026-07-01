@@ -14,6 +14,9 @@
 #include <cinttypes>
 #include <limits>
 
+#include <tracr/tracr.hpp>
+#include <tracr_simpler_markers.hpp>
+
 #include "common.h"  // debug_assert
 
 #include "common/unified_log.h"
@@ -167,10 +170,12 @@ SchedulerContext::PublishHandle SchedulerContext::prepare_subtask_to_core(
     build_payload(payload, slot_state, subslot, async_ctx, block_idx);
 
     if (to_pending) {
+        INSTRUMENTATION_MARK_SET(sched_thread_num_ + 1 + core_id, Running_Task_Pair, 0);
         core_exec_state.pending_subslot = subslot;
         core_exec_state.pending_slot_state = &slot_state;
         core_exec_state.pending_reg_task_id = static_cast<int32_t>(reg_task_id);
     } else {
+        INSTRUMENTATION_MARK_SET(sched_thread_num_ + 1 + core_id, Running_Task_Single, 0);
         core_exec_state.running_subslot = subslot;
         core_exec_state.running_slot_state = &slot_state;
         core_exec_state.running_reg_task_id = static_cast<int32_t>(reg_task_id);
@@ -816,6 +821,17 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
     constexpr bool pmu_active = false;
 #endif
 
+#ifdef INDEP_ORCH
+    INSTRUMENTATION_MARK_SET(g_TraCR_thread_idx, Barrier, orchestrator_done_.load(std::memory_order_relaxed));
+    LOG_INFO_V9(
+        "[TraCR] Thread %d: Waiting before the Orch to finish: %d, orchestrator_done_=%d", g_TraCR_thread_idx,
+        g_TraCR_thread_idx_counter.load(), orchestrator_done_.load(std::memory_order_relaxed)
+    );
+    while (!orchestrator_done_.load(std::memory_order_acquire)) {
+        SPIN_WAIT_HINT();
+    }
+#endif
+
 #if PTO2_PROFILING
     l2_swimlane.sched_start_ts = get_sys_cnt_aicpu();
 #endif
@@ -924,6 +940,7 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
 #endif
 
         // Phase 1: Check running cores for completion
+        INSTRUMENTATION_MARK_SET(g_TraCR_thread_idx, Phase1, 0);
         int32_t completed_this_turn = 0;
 
         bool try_completed = tracker.has_any_running_cores();
@@ -1020,6 +1037,7 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
 
         // Phase 2 drain check
         if (drain_state_.sync_start_pending.load(std::memory_order_acquire) != 0) {
+            INSTRUMENTATION_MARK_SET(g_TraCR_thread_idx, Phase2, 0);
             handle_drain_mode(thread_idx);
             continue;
         }
@@ -1030,6 +1048,7 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
             wired = sched_->drain_wiring_queue(orchestrator_done_.load(std::memory_order_relaxed));
             if (wired > 0) {
                 made_progress = true;
+                INSTRUMENTATION_MARK_SET(g_TraCR_thread_idx, Phase3, 0);
 #if PTO2_SCHED_PROFILING
                 l2_swimlane.phase_wiring_count += wired;
 #endif
@@ -1066,6 +1085,12 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
             constexpr int DUMMY_DRAIN_BATCH = 16;
             PTO2TaskSlotState *dummy_batch[DUMMY_DRAIN_BATCH];
             int dummy_got = sched_->dummy_ready_queue.pop_batch(dummy_batch, DUMMY_DRAIN_BATCH);
+
+            if (dummy_got > 0) {
+                (void)(dummy_got);
+                INSTRUMENTATION_MARK_SET(g_TraCR_thread_idx, Phase3b, 0);
+            }
+
 #if PTO2_PROFILING
             // Dummy outer phase: covers handling of all dummies popped this
             // iter. Per-dummy DummyTask markers are emitted to a SEPARATE lane
@@ -1075,6 +1100,7 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
             uint64_t dummy_outer_t0 =
                 (dummy_got > 0 && l2_swimlane_level_ >= L2SwimlaneLevel::SCHED_PHASES) ? get_sys_cnt_aicpu() : 0;
 #endif
+
             for (int di = 0; di < dummy_got; di++) {
                 PTO2TaskSlotState &dummy_slot = *dummy_batch[di];
 
@@ -1175,6 +1201,8 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
 
         // Phase 4: MIX-strict-priority dispatch with phase-split and
         // cross-thread idle gating. See dispatch_ready_tasks for the policy.
+        INSTRUMENTATION_MARK_SET(g_TraCR_thread_idx, Phase4, 0);
+
 #if PTO2_PROFILING
         uint64_t dispatch_t0 = (l2_swimlane_level_ >= L2SwimlaneLevel::SCHED_PHASES) ? get_sys_cnt_aicpu() : 0;
 #endif
@@ -1334,6 +1362,7 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
                                   0;
 #endif
             while (deferred_release_count > 0) {
+                INSTRUMENTATION_MARK_SET(g_TraCR_thread_idx, Drain, 0);
 #if PTO2_SCHED_PROFILING
                 (void)sched_->on_task_release(*deferred_release_slot_states[--deferred_release_count], thread_idx);
 #else

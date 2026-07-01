@@ -13,6 +13,9 @@
 #include <cinttypes>
 #include <cstdio>
 
+#include <tracr/tracr.hpp>
+#include <tracr_simpler_markers.hpp>
+
 #include "common/unified_log.h"
 #include "aicpu/dep_gen_collector_aicpu.h"
 #include "aicpu/device_phase_aicpu.h"
@@ -984,6 +987,7 @@ SchedulerContext::init(Runtime *runtime, int32_t aicpu_thread_num, int32_t sched
 void SchedulerContext::deinit() {
     // Reset all per-core execution state
     for (int32_t i = 0; i < RUNTIME_MAX_WORKER; i++) {
+        INSTRUMENTATION_MARK_RESET(sched_thread_num_ + 1 + i);
         core_exec_states_[i] = {};
         core_exec_states_[i].running_reg_task_id = AICPU_TASK_INVALID;
         core_exec_states_[i].pending_reg_task_id = AICPU_TASK_INVALID;

@@ -28,6 +28,9 @@
 #include <iostream>
 #include <string>
 #include <vector>
+
+#include <tracr_simpler_api.hpp>
+
 #include "acl/acl.h"
 
 // Include HAL constants from CANN (header only, library loaded dynamically)
@@ -264,6 +267,15 @@ int DeviceRunner::run(Runtime &runtime, int block_dim, int launch_aicpu_num) {
 
     if (prepare_runtime_for_launch(runtime, block_dim, launch_aicpu_num) != 0) return -1;
 
+    // Initialize TraCR memory on the device
+#ifdef ENABLE_TRACR
+    // LOG_INFO_V9("[TraCR] thread[%d] DevAllocTraCR device_id_=%d", sched_getcpu(), device_id_);
+    rc = DevAllocTraCR(this, runtime);
+    if (rc != 0) {
+        LOG_ERROR("DevAllocTraCR failed rc=%d", rc);
+        return rc;
+    }
+#endif
     // a2a3 onboard now uses the same host-computed, device-filtered affinity
     // shape as a5. Host probes the AICPU user pool once, chooses the active
     // cpu_ids deterministically, writes them into Runtime, and the AICPU-side
@@ -470,6 +482,15 @@ int DeviceRunner::run(Runtime &runtime, int block_dim, int launch_aicpu_num) {
     }
 
     read_device_wall_ns();
+
+    // Download and Free TraCR memory from Device and store in memory (~/ascend/)
+#ifdef ENABLE_TRACR
+    rc = StoreTracrData(this, runtime);
+    if (rc != 0) {
+        LOG_ERROR("FreeTraCR failed: %d", rc);
+        return -1;
+    }
+#endif
 
     // Tear down collectors. stop() joins mgmt then collector in the only safe
     // order (mgmt's final-drain pass into L2 has poll as its consumer).
