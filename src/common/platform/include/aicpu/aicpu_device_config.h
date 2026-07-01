@@ -29,6 +29,17 @@ extern "C" {
 #endif
 
 /**
+ * Set the ACL device ordinal. Latched once per device by simpler_aicpu_init
+ * (from InitArgs.device_id) into this resident-SO global; the AICPU executor
+ * reads it to make the staged orchestration SO filename unique per device so
+ * paired dies sharing the preinstall filesystem never collide.
+ */
+void set_orch_device_id(int device_id);
+
+/** Get the ACL device ordinal set for the current run (0 if unset). */
+int get_orch_device_id();
+
+/**
  * Set the AICPU scheduler no-progress watchdog timeout (ms). Latched once per
  * device by simpler_aicpu_init (from InitArgs.scheduler_timeout_ms); read by
  * the scheduler dispatch loop each run. 0 means "no override" — the scheduler

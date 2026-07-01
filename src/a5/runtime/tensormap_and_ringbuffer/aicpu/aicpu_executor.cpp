@@ -46,6 +46,7 @@
 #include "common/unified_log.h"
 
 // Register-based communication
+#include "aicpu/aicpu_device_config.h"
 #include "aicpu/platform_regs.h"
 #include "common/platform_config.h"
 

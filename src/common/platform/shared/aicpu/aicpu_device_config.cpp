@@ -11,10 +11,15 @@
 #include "aicpu/aicpu_device_config.h"
 
 namespace {
-// Latched once per device by simpler_aicpu_init; survives every per-task launch
+// Latched once per device by simpler_aicpu_init; survive every per-task launch
 // because the AICPU inner SO stays dlopen'd for the runner's life.
+int g_orch_device_id = 0;
 int g_scheduler_timeout_ms = 0;
 }  // namespace
+
+void set_orch_device_id(int device_id) { g_orch_device_id = device_id; }
+
+int get_orch_device_id() { return g_orch_device_id; }
 
 void set_scheduler_timeout_ms(int timeout_ms) { g_scheduler_timeout_ms = timeout_ms; }
 

@@ -26,15 +26,10 @@
 #include "spin_hint.h"
 
 static uint64_t g_platform_regs = 0;
-static int g_orch_device_id = 0;
 
 void set_platform_regs(uint64_t regs) { g_platform_regs = regs; }
 
 uint64_t get_platform_regs() { return g_platform_regs; }
-
-void set_orch_device_id(int device_id) { g_orch_device_id = device_id; }
-
-int get_orch_device_id() { return g_orch_device_id; }
 
 void platform_init_aicore_regs(uint64_t reg_addr) {
     // Initialize task dispatch register to idle state
