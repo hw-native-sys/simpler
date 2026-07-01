@@ -229,6 +229,7 @@ PTO2Runtime *runtime_init_data_from_layout(
  * addresses) sides.
  */
 void runtime_wire_arena_pointers(DeviceArena &arena, const PTO2RuntimeArenaLayout &layout, PTO2Runtime *rt);
+bool runtime_reset_for_reuse(DeviceArena &arena, const PTO2RuntimeArenaLayout &layout, PTO2Runtime *rt);
 
 /**
  * AICPU-only Phase 4 — fill in the few fields the host could not know at

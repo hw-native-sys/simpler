@@ -627,11 +627,8 @@ static int bind_cached_runtime_image(
     }
 
     runtime->set_orch_args(device_args);
-    int rc_upload = api->copy_to_device(runtime_arena_dev, cached_image, cached_image_size);
-    if (rc_upload != 0) {
-        LOG_ERROR("Failed to rtMemcpy cached prebuilt runtime arena to device (rc=%d)", rc_upload);
-        return -1;
-    }
+    (void)cached_image;
+    (void)cached_image_size;
     runtime->set_gm_sm_ptr(sm_ptr);
     runtime->set_prebuilt_arena(runtime_arena_dev, runtime_off);
     return 0;

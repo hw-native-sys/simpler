@@ -477,13 +477,9 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
                 sm_ptr = runtime->get_gm_sm_ptr();
             }
 
-            // Prebuilt-arena fast path. Host has pre-populated the entire
-            // runtime arena (PTO2Runtime + orchestrator/scheduler/tensor_map
-            // sub-regions + sm_handle wrapper + mailbox) and uploaded it via
-            // rtMemcpy into the pooled runtime_arena buffer. We attach to it,
-            // wire arena-internal pointers to their device addresses, reset
-            // the SM, and finalize the few device-only fields the host could
-            // not know at image-build time.
+            // Prebuilt-arena fast path. Host uploads the runtime arena image
+            // on cache miss; cache hits reuse the resident device arena. AICPU
+            // re-wires arena-internal pointers to device addresses below.
             {
                 AicpuPhaseScope arena_wire(AicpuPhase::ArenaWire);
                 void *prebuilt_arena = runtime->get_prebuilt_arena_base();
@@ -510,10 +506,7 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
             }
 
             // Reset SM state. setup_pointers + init_header_per_ring restore
-            // ring flow-control counters, layout metadata, error flags, and
-            // the per-slot ring->slot_states[] (bind_ring + reset_for_reuse +
-            // fanin_count/active_mask zero — previously done inside
-            // RingSchedState::init).
+            // ring flow-control counters, layout metadata, and error flags.
             {
                 AicpuPhaseScope sm_reset(AicpuPhase::SmReset);
                 memset(rt->sm_handle, 0, sizeof(*rt->sm_handle));
@@ -522,6 +515,12 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
                         rt->prebuilt_layout.sizing.heap_sizes
                     )) {
                     LOG_ERROR("Thread %d: sm_handle->init_per_ring failed", thread_idx);
+                    rt = nullptr;
+                    runtime_init_ready_.store(true, std::memory_order_release);
+                    return -1;
+                }
+                if (!runtime_reset_for_reuse(runtime_arena_, rt->prebuilt_layout, rt)) {
+                    LOG_ERROR("Thread %d: runtime_reset_for_reuse failed", thread_idx);
                     rt = nullptr;
                     runtime_init_ready_.store(true, std::memory_order_release);
                     return -1;
