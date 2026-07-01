@@ -8,6 +8,7 @@
 # -----------------------------------------------------------------------------------------------------------
 """Tests for RuntimeBuilder class."""
 
+import os
 import textwrap
 from pathlib import Path
 from unittest.mock import patch
@@ -358,6 +359,116 @@ class TestInvalidateCacheIfStale:
         assert not (cache_dir / "stale_artifact.o").exists()
         assert not (cache_dir / _GIT_COMMIT_FILE).exists()
         assert cache_dir.is_dir()
+
+
+class TestAbbrevStamp:
+    """Stamp abbreviation must keep a pto-isa-only change visible in the log."""
+
+    def test_pure_runtime_sha_truncated(self):
+        from simpler_setup.runtime_builder import _abbrev_stamp  # noqa: PLC0415
+
+        assert _abbrev_stamp("0123456789abcdef0123456789abcdef01234567") == "0123456789ab"
+
+    def test_composite_keeps_both_segments_visible(self):
+        """A pto-isa-only bump shares the runtime prefix; both shas must show."""
+        from simpler_setup.runtime_builder import _abbrev_stamp  # noqa: PLC0415
+
+        runtime = "0123456789abcdef0123456789abcdef01234567"
+        old = _abbrev_stamp(f"{runtime}:pto-isa=aaaaaaaaaaaaaaaa")
+        new = _abbrev_stamp(f"{runtime}:pto-isa=bbbbbbbbbbbbbbbb")
+        assert old == "0123456789ab:pto-isa=aaaaaaaaaaaa"
+        assert new == "0123456789ab:pto-isa=bbbbbbbbbbbb"
+        assert old != new  # the bump is not hidden behind an identical prefix
+
+
+class TestBuildCacheStamp:
+    """Test cmake cache stamp composition (runtime HEAD + pto-isa commit)."""
+
+    def _make_builder(self, platform):
+        from simpler_setup.platform_info import parse_platform  # noqa: PLC0415
+        from simpler_setup.runtime_builder import RuntimeBuilder  # noqa: PLC0415
+
+        builder = RuntimeBuilder.__new__(RuntimeBuilder)
+        builder.platform = platform
+        builder._arch, builder._variant = parse_platform(platform)
+        return builder
+
+    def test_a2a3_onboard_folds_in_pto_isa_commit(self, monkeypatch):
+        """a2a3 onboard with a resolved pto-isa commit → composite stamp."""
+        import simpler_setup.runtime_builder as rb_module  # noqa: PLC0415
+
+        monkeypatch.setattr(rb_module, "_get_git_head", lambda _root: "runtime_sha")
+        monkeypatch.setenv("SIMPLER_RUN_PTO_ISA_COMMIT", "isa_sha")
+
+        builder = self._make_builder("a2a3")
+        assert builder._build_cache_stamp() == "runtime_sha:pto-isa=isa_sha"
+
+    def test_non_a2a3_onboard_uses_pure_runtime_sha(self, monkeypatch):
+        """Other arch/variant ignores pto-isa → stamp keyed on runtime HEAD only."""
+        import simpler_setup.runtime_builder as rb_module  # noqa: PLC0415
+
+        monkeypatch.setattr(rb_module, "_get_git_head", lambda _root: "runtime_sha")
+        monkeypatch.setenv("SIMPLER_RUN_PTO_ISA_COMMIT", "isa_sha")
+
+        builder = self._make_builder("a2a3sim")
+        assert builder._build_cache_stamp() == "runtime_sha"
+
+    def test_empty_runtime_head_yields_empty_stamp(self, monkeypatch):
+        """No runtime HEAD → empty stamp, preserving the 'unavailable → clean rebuild' path."""
+        import simpler_setup.runtime_builder as rb_module  # noqa: PLC0415
+
+        monkeypatch.setattr(rb_module, "_get_git_head", lambda _root: "")
+        monkeypatch.setenv("SIMPLER_RUN_PTO_ISA_COMMIT", "isa_sha")
+
+        builder = self._make_builder("a2a3")
+        assert builder._build_cache_stamp() == ""
+
+
+class TestResolveBuildPtoIsaCommit:
+    """Test pto-isa commit resolution and cmake/ccache lockstep write-back."""
+
+    def _make_builder(self, platform):
+        from simpler_setup.platform_info import parse_platform  # noqa: PLC0415
+        from simpler_setup.runtime_builder import RuntimeBuilder  # noqa: PLC0415
+
+        builder = RuntimeBuilder.__new__(RuntimeBuilder)
+        builder.platform = platform
+        builder._arch, builder._variant = parse_platform(platform)
+        return builder
+
+    def test_non_a2a3_onboard_returns_empty(self, monkeypatch):
+        monkeypatch.setenv("SIMPLER_RUN_PTO_ISA_COMMIT", "isa_sha")
+
+        builder = self._make_builder("a2a3sim")
+        assert builder._resolve_build_pto_isa_commit() == ""
+
+    def test_prefers_run_commit_env(self, monkeypatch):
+        monkeypatch.setenv("SIMPLER_RUN_PTO_ISA_COMMIT", "isa_sha")
+        monkeypatch.setenv("PTO_ISA_ROOT", "/should/not/be/read")
+
+        builder = self._make_builder("a2a3")
+        assert builder._resolve_build_pto_isa_commit() == "isa_sha"
+
+    def test_fallback_resolves_root_and_writes_back_for_lockstep(self, monkeypatch):
+        """PTO_ISA_ROOT fallback must export the resolved commit so the cmake
+        ccache-bust define (which reads SIMPLER_RUN_PTO_ISA_COMMIT) stays in
+        lockstep with the stamp computed here (issue #1139)."""
+        from simpler_setup import pto_isa  # noqa: PLC0415
+
+        monkeypatch.delenv("SIMPLER_RUN_PTO_ISA_COMMIT", raising=False)
+        monkeypatch.setenv("PTO_ISA_ROOT", "/some/pto-isa")
+        monkeypatch.setattr(pto_isa, "get_pto_isa_head", lambda _root: "resolved_sha")
+
+        builder = self._make_builder("a2a3")
+        assert builder._resolve_build_pto_isa_commit() == "resolved_sha"
+        assert os.environ["SIMPLER_RUN_PTO_ISA_COMMIT"] == "resolved_sha"
+
+    def test_unresolvable_returns_empty(self, monkeypatch):
+        monkeypatch.delenv("SIMPLER_RUN_PTO_ISA_COMMIT", raising=False)
+        monkeypatch.delenv("PTO_ISA_ROOT", raising=False)
+
+        builder = self._make_builder("a2a3")
+        assert builder._resolve_build_pto_isa_commit() == ""
 
 
 # --- Full integration tests (real compilation) ---

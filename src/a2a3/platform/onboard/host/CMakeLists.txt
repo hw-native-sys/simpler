@@ -115,6 +115,22 @@ if(SIMPLER_ENABLE_PTO_SDMA_WORKSPACE)
     target_compile_definitions(host_runtime PRIVATE SIMPLER_ENABLE_PTO_SDMA_WORKSPACE=1)
 endif()
 
+# Bake the resolved pto-isa commit into the compile command. pto-isa headers
+# (e.g. kSdmaMaxChan in sdma_workspace_manager.hpp) are compiled into this .so,
+# but a pto-isa update leaves the runtime repo HEAD — and the pto-isa header
+# mtimes — untouched, so a plain reinstall serves a stale object from ccache.
+# This define perturbs the ccache key so a pto-isa bump forces a real recompile.
+# It is intentionally unused in code (cache-bust only). See issue #1139.
+# SIMPLER_RUN_PTO_ISA_COMMIT is exported by ensure_pto_isa_root() before the build.
+# Gated on the env var (set for a2a3 onboard), not SIMPLER_ENABLE_PTO_SDMA_WORKSPACE:
+# if that workspace is ever turned off, a pto-isa bump still forces a recompile of a
+# target that no longer embeds pto-isa. That over-invalidation only costs a rebuild and
+# never serves a stale object, so erring wide is intentional (see _resolve_build_pto_isa_commit).
+if(NOT "$ENV{SIMPLER_RUN_PTO_ISA_COMMIT}" STREQUAL "")
+    target_compile_definitions(host_runtime PRIVATE
+        SIMPLER_PTO_ISA_BUILD_COMMIT="$ENV{SIMPLER_RUN_PTO_ISA_COMMIT}")
+endif()
+
 # Include directories - always include local headers
 target_include_directories(host_runtime
     PRIVATE
