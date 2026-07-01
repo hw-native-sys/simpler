@@ -53,6 +53,18 @@ public:
         last_alive_seen_ = 0;
     }
 
+    // Surgical reset for arena reuse: just the per-run counters. The
+    // arena-internal pointers (descriptors_, current_index_ptr_, etc.) are
+    // still valid, since wire_arena_pointers was called before this on the
+    // AICPU side.
+    void reset_for_reuse()
+    {
+        local_task_id_ = 0;
+        heap_top_ = 0;
+        heap_tail_ = 0;
+        last_alive_seen_ = 0;
+    }
+
     PTO2TaskAllocResult alloc(int32_t output_size)
     {
         uint64_t aligned_size = output_size > 0 ? PTO2_ALIGN_UP(static_cast<uint64_t>(output_size), PTO2_ALIGN_SIZE) : 0;

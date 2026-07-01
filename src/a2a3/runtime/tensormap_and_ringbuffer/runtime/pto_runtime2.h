@@ -246,14 +246,36 @@ inline void runtime_destroy(PTO2Runtime *rt, DeviceArena & /*arena*/)
     runtime_destroy(rt);
 }
 
-// Stub for the upstream arena-reuse path (#1234). The polling design has not
-// adopted arena caching / reset_for_reuse machinery; the AICPU reuse path in
-// aicpu_executor still references this symbol, so provide a no-op that
-// succeeds. The init_per_ring call immediately above this in
-// aicpu_executor already resets the SM header for the next run.
+// Upstream arena-reuse path (#1234). On cache hits the host skips the
+// arena re-upload, so the AICPU-side reset here is the only thing that
+// scrubs the previous run's orchestrator/scheduler state. Currently
+// re-runs init_data_from_layout on each sub-region followed by
+// wire_arena_pointers (init_data_from_layout wipes the struct via
+// *state = {}, so the wired pointers must be re-set). This adds ~2 ms of
+// Device wall vs upstream's surgical reset_for_reuse; a fully surgical
+// polling version is deferred as follow-up work (see the reset_for_reuse
+// methods added on PTO2OrchestratorState / PTO2SchedulerState /
+// PTO2TensorMap / PTO2TaskAllocator / PTO2ReadyQueue / PTO2SpscQueue for
+// the scaffolding — the last-mile issue is that ready_queue's
+// reset_for_reuse is a no-op and something in the surgical path leaves
+// state that trips a scheduler stall on the second run).
+inline void runtime_wire_arena_pointers(DeviceArena &arena, const PTO2RuntimeArenaLayout &layout, PTO2Runtime *rt);
+
 inline bool runtime_reset_for_reuse(DeviceArena & /*arena*/, const PTO2RuntimeArenaLayout & /*layout*/, PTO2Runtime *rt)
 {
-    return rt != nullptr;
+    if (rt == nullptr) return false;
+
+    rt->pending_scope_mode = PTO2ScopeMode::AUTO;
+    rt->total_cycles = 0;
+    rt->gm_heap_owned = false;
+
+    void *sm_dev_base = rt->sm_handle ? rt->sm_handle->sm_base : nullptr;
+    if (sm_dev_base == nullptr) return false;
+
+    rt->orchestrator.reset_for_reuse();
+    rt->scheduler.reset_for_reuse(sm_dev_base);
+
+    return true;
 }
 
 inline void runtime_set_mode(PTO2Runtime *rt, PTO2RuntimeMode mode)

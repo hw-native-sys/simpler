@@ -207,6 +207,29 @@ struct PTO2OrchestratorState
         orch->scheduler = scheduler_arg;
     }
 
+    // Surgical reset for the arena-reuse path (#1234). Only touches state that
+    // mutates across runs — leaves the arena-internal pointers wired by
+    // wire_arena_pointers alone, and skips the O(pool_size + num_buckets)
+    // tensor_map re-init in favour of an epoch bump (bucket_epochs and
+    // task_entry_head_epochs are compared against current_epoch on every
+    // lookup; a bump invalidates all stale entries in O(1)).
+    void reset_for_reuse()
+    {
+        auto *orch = this;
+        for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++)
+        {
+            orch->rings[r].task_allocator.reset_for_reuse();
+        }
+        orch->tensor_map.reset_for_reuse();
+        orch->scope_tasks_size = 0;
+        orch->scope_stack_top = -1;
+        orch->manual_begin_depth = PTO2_MAX_SCOPE_DEPTH;
+        orch->fatal = false;
+        orch->inline_completed_tasks = 0;
+        orch->fanin_seen_current_epoch++;
+        if (orch->fanin_seen_current_epoch == 0) orch->fanin_seen_current_epoch = 1;
+    }
+
     // Forget pointers; arena owns the backing buffers.
     void destroy()
     {

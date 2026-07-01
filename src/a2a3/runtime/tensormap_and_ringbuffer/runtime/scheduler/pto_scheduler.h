@@ -83,6 +83,10 @@ struct alignas(64) PTO2ReadyQueue
         return (e >= d) ? (e - d) : 0;
     }
 
+    // No-op: the sequence-based Vyukov MPMC queue is self-consistent across
+    // runs — every slot's sequence at end of run 1 equals the enqueue_pos
+    // where run 2's first push at that slot will land, so pushes/pops resume
+    // seamlessly without any reset.
     void reset_for_reuse() {}
 
     bool push(PTO2TaskSlotState *slot_state)
@@ -754,6 +758,29 @@ struct PTO2SchedulerState
         sched->wiring.queue.destroy();
         for (int i = 0; i < PTO2_NUM_RESOURCE_SHAPES; i++) ready_queue_destroy(&sched->ready_queues[i]);
         ready_queue_destroy(&sched->dummy_ready_queue);
+    }
+
+    // Surgical reset for arena reuse (#1234): resets per-run mutable state
+    // without redoing the O(ready_queue_capacity) buffer-zeroing that
+    // init_data_from_layout does. Ring pointer is re-set from sm_dev_base
+    // since we can't rely on the previous run's value being valid across
+    // arena reuse.
+    void reset_for_reuse(void *sm_dev_base)
+    {
+        PTO2SchedulerState *sched = this;
+        sched->sm_header = reinterpret_cast<PTO2SharedMemoryHeader *>(sm_dev_base);
+        for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++)
+        {
+            sched->ring_sched_states[r].ring = pto2_sm_layout::ring_header_addr(sm_dev_base, r);
+            sched->ring_sched_states[r].last_task_alive = 0;
+            sched->ring_sched_states[r].advance_lock.store(0, std::memory_order_relaxed);
+        }
+        for (int i = 0; i < PTO2_NUM_RESOURCE_SHAPES; i++) sched->ready_queues[i].reset_for_reuse();
+        sched->dummy_ready_queue.reset_for_reuse();
+        sched->wiring.queue.reset_for_reuse();
+        sched->wiring.backoff_counter = 0;
+        sched->wiring.orch_needs_drain.store(false, std::memory_order_relaxed);
+        sched->async_wait_list.reset_for_reuse();
     }
 };
 
