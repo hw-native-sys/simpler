@@ -138,6 +138,7 @@ bool process_first_pair(L3L2QueueEndpoint &queue, ActiveRequest *active, const L
     if (!release_input(queue, active[1].handle)) {
         return false;
     }
+    active[1] = {};
     if (!publish_aiv_output(
             queue, active[0].handle, active[0].handle, active[0].header.request_id, 10, 0, ADD_SCALAR, 10.0F
         ) ||
@@ -146,7 +147,11 @@ bool process_first_pair(L3L2QueueEndpoint &queue, ActiveRequest *active, const L
         )) {
         return false;
     }
-    return release_input(queue, active[0].handle);
+    if (!release_input(queue, active[0].handle)) {
+        return false;
+    }
+    active[0] = {};
+    return true;
 }
 
 bool remember_input_for_pair(ActiveRequest *active, const L3L2QueueInputHandle &input, const InputHeader &header) {
@@ -171,6 +176,12 @@ bool process_data_message(L3L2QueueEndpoint &queue, const L3L2QueueInputHandle &
         return false;
     }
     if (header.mode == 1) {
+        if (active[0].header.request_id != 0) {
+            rt_report_fatal(
+                PTO2_ERROR_EXPLICIT_ORCH_FATAL, "L3-L2 queue example received mode=1 while a request is pending"
+            );
+            return false;
+        }
         active[0].handle = input;
         active[0].header = header;
         return true;
@@ -202,7 +213,15 @@ bool finish_pending_inputs(L3L2QueueEndpoint &queue, ActiveRequest *active) {
         )) {
         return false;
     }
-    return release_input(queue, active[2].handle) && release_input(queue, active[3].handle);
+    if (!release_input(queue, active[2].handle)) {
+        return false;
+    }
+    active[2] = {};
+    if (!release_input(queue, active[3].handle)) {
+        return false;
+    }
+    active[3] = {};
+    return true;
 }
 
 }  // namespace

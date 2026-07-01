@@ -273,21 +273,40 @@ public:
         explicit InputQueue(L3L2QueueEndpoint *parent) :
             parent_(parent) {}
 
+        InputQueue(const InputQueue &) = delete;
+        InputQueue &operator=(const InputQueue &) = delete;
+        InputQueue(InputQueue &&) = delete;
+        InputQueue &operator=(InputQueue &&) = delete;
+
         ~InputQueue() { delete[] active_entries_; }
 
+        friend class L3L2QueueEndpoint;
+
+    private:
         bool initialize(uint64_t max_l2_input_inflight) {
-            entry_capacity_ = max_l2_input_inflight + 1;
-            active_entries_ = new (std::nothrow) ActiveInputEntry[entry_capacity_];
-            if (active_entries_ == nullptr) {
+            delete[] active_entries_;
+            active_entries_ = nullptr;
+            entry_capacity_ = 0;
+            active_count_ = 0;
+            active_non_stop_count_ = 0;
+            input_acquire_ = parent_->input_head_;
+            stop_observed_ = false;
+            drained_ = false;
+
+            ActiveInputEntry *entries = new (std::nothrow) ActiveInputEntry[max_l2_input_inflight + 1];
+            if (entries == nullptr) {
                 parent_->set_error(
                     L3L2QueueErrorKind::ENDPOINT_ERROR, "init", parent_->endpoint_.descriptor().region_id,
                     "input window allocation failed"
                 );
                 return false;
             }
+            active_entries_ = entries;
+            entry_capacity_ = max_l2_input_inflight + 1;
             return true;
         }
 
+    public:
         bool peek(uint64_t timeout_ns, L3L2QueueInputHandle *out) {
             if (out == nullptr) {
                 return false;
@@ -671,6 +690,11 @@ public:
         }
         input_queue_.initialize(config_.max_l2_input_inflight);
     }
+
+    L3L2QueueEndpoint(const L3L2QueueEndpoint &) = delete;
+    L3L2QueueEndpoint &operator=(const L3L2QueueEndpoint &) = delete;
+    L3L2QueueEndpoint(L3L2QueueEndpoint &&) = delete;
+    L3L2QueueEndpoint &operator=(L3L2QueueEndpoint &&) = delete;
 
     const L3L2QueueError &error() const { return error_; }
     const L3L2QueueLayout &layout() const { return layout_; }
