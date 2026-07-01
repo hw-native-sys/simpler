@@ -17,7 +17,7 @@
 
 namespace {
 
-constexpr int kExpectedArgCount = 10;
+constexpr int kExpectedArgCount = 12;
 constexpr uint32_t kInputWindowComputeFuncId = 0;
 constexpr uint64_t kQueueTimeoutNs = 5000000000ULL;
 constexpr uint64_t kInputWindow = 4;
@@ -152,10 +152,8 @@ __attribute__((visibility("default"))) void l3_l2_message_queue_input_window_orc
         orch_args.scalar(3), orch_args.scalar(4), orch_args.scalar(5),
     };
     L3L2QueueArgs queue_args{
-        orch_args.scalar(6),
-        orch_args.scalar(7),
-        orch_args.scalar(8),
-        orch_args.scalar(9),
+        orch_args.scalar(6), orch_args.scalar(7),  orch_args.scalar(8),
+        orch_args.scalar(9), orch_args.scalar(10), orch_args.scalar(11),
     };
     L3L2QueueEndpoint queue(desc, queue_args, L3L2QueueEndpointConfig{.max_l2_input_inflight = kInputWindow});
     if (has_queue_error(queue)) {
