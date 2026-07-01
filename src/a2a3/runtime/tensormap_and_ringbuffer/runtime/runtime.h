@@ -229,7 +229,6 @@ struct alignas(64) DeviceRuntimeLaunchDesc {
     bool serial_orch_sched;
 
     void *gm_sm_ptr_;                        // GM pointer to PTO2 shared memory (device)
-    void *slot_states_ptr_;                  // Pointer to PTO2TaskSlotState array (scheduler-private, for profiling)
     ChipStorageTaskArgs orch_args_storage_;  // Copy of args for device
 
     // Prebuilt-arena fast path (trb only). Set by the host before rtMemcpy'ing
@@ -273,8 +272,6 @@ private:
     int registered_kernel_func_ids_[RUNTIME_MAX_FUNC_ID];
     int registered_kernel_count_;
 
-    void *gm_heap_ptr_;  // GM heap for orchestrator output buffers (device); host-only bookkeeping
-
 public:
     /**
      * Constructor - zero-initialize all arrays
@@ -312,11 +309,8 @@ public:
     // =========================================================================
 
     void *get_gm_sm_ptr() const;
-    void *get_gm_heap_ptr() const;
     const ChipStorageTaskArgs &get_orch_args() const;
     void set_gm_sm_ptr(void *p);
-    void set_gm_heap(void *p);
-    void set_slot_states_ptr(void *p);
     void set_orch_args(const ChipStorageTaskArgs &args);
 
     // Prebuilt-arena fast path (trb only). Set by host's
