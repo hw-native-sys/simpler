@@ -24,6 +24,7 @@
 #include "pto_runtime_c_api.h"
 
 #include "callable.h"
+#include "call_config.h"
 #include "device_runner_base.h"
 #include "prepare_callable_common.h"
 #include "task_args.h"
@@ -51,11 +52,6 @@ extern "C" {
  * Runtime Implementation Functions (defined in runtime_maker.cpp)
  * =========================================================================== */
 int register_callable_impl(const ChipCallable *callable, uint64_t (*upload_fn)(const void *), CallableArtifacts *out);
-int bind_callable_to_runtime_impl(
-    Runtime *runtime, const HostApi *api, const ChipStorageTaskArgs *orch_args, void *host_orch_func_ptr,
-    const ArgDirection *signature, int sig_count, const uint64_t *ring_task_window, const uint64_t *ring_heap,
-    const uint64_t *ring_dep_pool
-);
 int validate_runtime_impl(Runtime *runtime, const HostApi *api);
 
 /* ===========================================================================
@@ -180,6 +176,26 @@ static void mark_prebuilt_runtime_arena_cached_wrapper(
         );
     } catch (...) {}
 }
+
+// The HostApi is a set of context-free function pointers: each wrapper above
+// recovers its runner from the thread-local current_runner(), so a single
+// filled table is valid for every runner and every run. Build it once at load
+// time rather than reassembling the 12 pointers on each simpler_run. Passed by
+// address into bind_callable_to_runtime_impl / validate_runtime_impl.
+static const HostApi g_host_api = {
+    .device_malloc = device_malloc,
+    .device_free = device_free,
+    .copy_to_device = copy_to_device,
+    .copy_from_device = copy_from_device,
+    .device_memset = device_memset,
+    .setup_static_arena = setup_static_arena_wrapper,
+    .acquire_pooled_gm_heap = acquire_pooled_gm_heap_wrapper,
+    .acquire_pooled_gm_sm = acquire_pooled_gm_sm_wrapper,
+    .acquire_pooled_runtime_arena = acquire_pooled_runtime_arena_wrapper,
+    .lookup_prebuilt_runtime_arena_cache = lookup_prebuilt_runtime_arena_cache_wrapper,
+    .mark_prebuilt_runtime_arena_cached = mark_prebuilt_runtime_arena_cached_wrapper,
+    .upload_chip_callable_buffer = upload_chip_callable_buffer_wrapper,
+};
 
 /* ===========================================================================
  * Public C API (resolved by ChipWorker via dlsym)
@@ -417,12 +433,9 @@ static void emit_device_phase_markers(SimDeviceRunnerBase *runner) {
 }
 
 int simpler_run(
-    DeviceContextHandle ctx, RuntimeHandle runtime, int32_t callable_id, const void *args, int block_dim,
-    int aicpu_thread_num, int enable_l2_swimlane, int enable_dump_tensor, int enable_pmu, int enable_dep_gen,
-    int enable_scope_stats, const uint64_t *ring_task_window, const uint64_t *ring_heap, const uint64_t *ring_dep_pool,
-    const char *output_prefix
+    DeviceContextHandle ctx, RuntimeHandle runtime, int32_t callable_id, const void *args, const CallConfig *config
 ) {
-    if (ctx == NULL || runtime == NULL) return -1;
+    if (ctx == NULL || runtime == NULL || config == NULL) return -1;
     SimDeviceRunnerBase *runner = static_cast<SimDeviceRunnerBase *>(ctx);
 
     if (!runner->has_callable(callable_id)) {
@@ -447,64 +460,41 @@ int simpler_run(
         });
 
         // Platform device-memory hooks. host_api is a platform capability, not
-        // runtime state — it lives here (local to simpler_run, covering the whole
-        // bind→run→validate span) and is passed explicitly into the runtime impls
-        // rather than stored on `Runtime`.
-        HostApi api{};
-        api.device_malloc = device_malloc;
-        api.device_free = device_free;
-        api.copy_to_device = copy_to_device;
-        api.copy_from_device = copy_from_device;
-        api.device_memset = device_memset;
-        api.setup_static_arena = setup_static_arena_wrapper;
-        api.acquire_pooled_gm_heap = acquire_pooled_gm_heap_wrapper;
-        api.acquire_pooled_gm_sm = acquire_pooled_gm_sm_wrapper;
-        api.acquire_pooled_runtime_arena = acquire_pooled_runtime_arena_wrapper;
-        api.lookup_prebuilt_runtime_arena_cache = lookup_prebuilt_runtime_arena_cache_wrapper;
-        api.mark_prebuilt_runtime_arena_cached = mark_prebuilt_runtime_arena_cached_wrapper;
-        api.upload_chip_callable_buffer = upload_chip_callable_buffer_wrapper;
-
-        auto bind_result = runner->bind_callable_to_runtime(*r, callable_id);
-        int rc = bind_result.rc;
-        if (rc != 0) {
-            pthread_setspecific(g_runner_key, nullptr);
-            return rc;
-        }
-
+        // runtime state — the shared g_host_api table (built once at load time)
+        // is passed explicitly into the runtime impls rather than stored on
+        // `Runtime` or reassembled per run.
+        int rc;
         {
             STRACE("simpler_run.bind");
-            rc = bind_callable_to_runtime_impl(
-                r, &api, reinterpret_cast<const ChipStorageTaskArgs *>(args), bind_result.host_orch_func_ptr,
-                bind_result.signature, bind_result.sig_count, ring_task_window, ring_heap, ring_dep_pool
+            // One-step bind: replay CallableState + run the per-run binding. The
+            // host_orch_func_ptr + signature stay inside the runner.
+            rc = runner->bind_callable_to_runtime(
+                *r, callable_id, &g_host_api, args, config->runtime_env.ring_task_window, config->runtime_env.ring_heap,
+                config->runtime_env.ring_dep_pool
             );
         }
         if (rc != 0) {
             r->set_gm_sm_ptr(nullptr);
-            validate_runtime_impl(r, &api);
+            validate_runtime_impl(r, &g_host_api);
             pthread_setspecific(g_runner_key, nullptr);
             return rc;
         }
 
-        runner->set_l2_swimlane_enabled(enable_l2_swimlane);
-        runner->set_dump_tensor_enabled(enable_dump_tensor);
-        runner->set_pmu_enabled(enable_pmu);
-        runner->set_dep_gen_enabled(enable_dep_gen != 0);
-        runner->set_scope_stats_enabled(enable_scope_stats != 0);
-        runner->set_output_prefix(output_prefix);
-
         {
             STRACE("simpler_run.runner_run");
-            rc = runner->run(*r, block_dim, aicpu_thread_num);
+            // run() latches the diagnostic enables from config via
+            // apply_call_config() and consumes block_dim / aicpu_thread_num.
+            rc = runner->run(*r, *config);
         }
         if (rc != 0) {
-            validate_runtime_impl(r, &api);
+            validate_runtime_impl(r, &g_host_api);
             pthread_setspecific(g_runner_key, nullptr);
             return rc;
         }
 
         {
             STRACE("simpler_run.validate");
-            rc = validate_runtime_impl(r, &api);
+            rc = validate_runtime_impl(r, &g_host_api);
         }
         pthread_setspecific(g_runner_key, nullptr);
         emit_device_phase_markers(runner);

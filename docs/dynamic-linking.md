@@ -296,11 +296,10 @@ ChipWorker.init(device_id, bins)                       # Python wrapper
       DeviceRunner::set_executors(aicpu, aicore)       binaries owned by runner
 
 ChipWorker.run(handle, args, config)                   # public wrapper path
-  simpler_run(ctx, buf, internal callable entry, args, block_dim, aicpu_thread_num, …)
+  simpler_run(ctx, buf, internal callable entry, args, config)
     new (buf) Runtime()
-    bind_prepared_callable_to_runtime(r, internal callable entry)
-    bind_prepared_to_runtime_impl(r, args)
-    DeviceRunner::run(r, block_dim, aicpu_thread_num)
+    DeviceRunner::bind_callable_to_runtime(r, cid, api, args, rings)  # replay + per-run bind
+    DeviceRunner::run(r, config)                        # applies config, resolves block_dim
       clear_cpu_sim_shared_storage()
       ensure_binaries_loaded()               dlopen aicpu/aicore SOs once
       launch AICPU + AICore threads
@@ -350,10 +349,9 @@ device_worker_main(device_id)
             upload child kernels, copy orch SO to device buffer
         for each launch with that handle:
           ChipWorker.run(handle, args, config)
-            simpler_run(ctx, buf, internal callable entry, args, block_dim, aicpu_thread_num, …)
+            simpler_run(ctx, buf, internal callable entry, args, config)
               new (buf) Runtime()
-              bind_prepared_callable_to_runtime()
-              bind_prepared_to_runtime_impl()  rtMalloc, rtMemcpy to device
+              bind_callable_to_runtime()       replay + rtMalloc, rtMemcpy to device
               DeviceRunner::run()
                 ensure_binaries_loaded()       already done by init
                 rtsLaunchCpuKernel()           cached rtFuncHandle

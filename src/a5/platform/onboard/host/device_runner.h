@@ -105,7 +105,7 @@ public:
      * are captured once by simpler_init (binaries) / libsimpler_log.so (log)
      * and read off DeviceRunner state / HostLogger here — no per-run args.
      */
-    int run(Runtime &runtime, int block_dim, int launch_aicpu_num = 1) override;
+    int run(Runtime &runtime, const CallConfig &config) override;
 
     // `set_l2_swimlane_enabled`, `set_dump_tensor_enabled`,
     // `set_pmu_enabled`, `set_scope_stats_enabled`, `set_output_prefix`,

@@ -372,9 +372,8 @@ int register_callable_impl(const ChipCallable *callable, uint64_t (*upload_fn)(c
 /**
  * Per-run binding for hbg: invoke the previously-resolved orchestration entry
  * point against the supplied args, then upload tensor info / allocation
- * storage. The c_api caller passes `host_orch_func_ptr` straight through from
- * DeviceRunner::bind_callable_to_runtime (which read it from
- * CallableState for this run's callable_id).
+ * storage. DeviceRunner::bind_callable_to_runtime passes `host_orch_func_ptr`
+ * straight through from CallableState for this run's callable_id.
  */
 int bind_callable_to_runtime_impl(
     Runtime *runtime, const HostApi *api, const ChipStorageTaskArgs *orch_args, void *host_orch_func_ptr,

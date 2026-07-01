@@ -64,6 +64,9 @@
 #include "host/tensor_dump_collector.h"
 #include "prepare_callable_common.h"
 
+struct HostApi;     // common/host_api.h — fwd-declared to keep task_interface headers out
+struct CallConfig;  // task_interface/call_config.h — per-run config threaded into run()
+
 /**
  * Common base class for both a2a3 and a5 onboard `DeviceRunner`s.
  *
@@ -328,14 +331,23 @@ public:
     uint64_t callable_hash(int32_t callable_id) const;
 
     /**
-     * Replay a previously-registered callable's state onto a fresh
-     * Runtime for a per-run binding. Writes back kernel addrs, orch
-     * entry-symbol names, and active_callable_id; returns the hbg
-     * `host_orch_func_ptr` (or nullptr on trb / on error) inside a
-     * `BindCallableResult` so the caller can destructure with
-     * structured bindings.
+     * Replay a previously-registered callable's state onto a fresh Runtime and
+     * complete the per-run binding in one step. Writes back kernel addrs and
+     * active_callable_id, then calls the runtime's bind_callable_to_runtime_impl
+     * with the CallableState-derived host_orch_func_ptr + signature (kept
+     * internal to the runner rather than returned across the c_api boundary).
+     *
+     * @param api               Platform device-memory hooks (g_host_api).
+     * @param orch_args         const ChipStorageTaskArgs* for this run (void* to
+     *                          keep task_interface headers out of this header).
+     * @param ring_task_window  Per-ring overrides (trb); ignored by hbg.
+     * @return 0 on success, non-zero on failure (unregistered id, out-of-range
+     *         func_id, or the underlying bind_callable_to_runtime_impl rc).
      */
-    BindCallableResult bind_callable_to_runtime(Runtime &runtime, int32_t callable_id);
+    int bind_callable_to_runtime(
+        Runtime &runtime, int32_t callable_id, const HostApi *api, const void *orch_args,
+        const uint64_t *ring_task_window, const uint64_t *ring_heap, const uint64_t *ring_dep_pool
+    );
 
     /**
      * Number of distinct callable_ids the AICPU has been asked to
@@ -384,9 +396,11 @@ public:
      * Execute a Runtime. Each arch implements its own `run()` — the bodies
      * are too divergent for a shared implementation (FFTS / dep_gen / ACL
      * register init on a2a3; MIX core handling on a5). See the subclass
-     * docs for the per-arch contract.
+     * docs for the per-arch contract. `config` carries block_dim (0 = auto),
+     * aicpu_thread_num, and the diagnostic enables; each arch calls
+     * `apply_call_config(config)` at entry to latch the `enable_*_` members.
      */
-    virtual int run(Runtime &runtime, int block_dim, int launch_aicpu_num = 1) = 0;
+    virtual int run(Runtime &runtime, const CallConfig &config) = 0;
 
     /**
      * Cleanup all resources. Each arch's `finalize()` wraps
@@ -452,8 +466,9 @@ public:
 
     /**
      * Enablement setters for the four shared diagnostics sub-features.
-     * Called by the c_api entry point before `run()`; downstream `run()`
-     * paths read the corresponding `enable_*_` members directly.
+     * Applied from the per-run CallConfig by `apply_call_config()` at `run()`
+     * entry; downstream `run()` paths read the corresponding `enable_*_`
+     * members directly.
      *
      * `set_dep_gen_enabled` is a2a3-only and lives on the subclass.
      */
@@ -470,6 +485,15 @@ public:
         pmu_event_type_ = resolve_pmu_event_type(enable_pmu);
     }
     void set_scope_stats_enabled(bool enable) { enable_scope_stats_ = enable; }
+
+    /**
+     * Latch this run's per-run diagnostic config onto the runner's `enable_*_`
+     * members before `run()` uses them. Each arch's `run()` calls this once at
+     * entry — the c_api no longer reaches in with individual set_*_enabled
+     * calls; it just threads the CallConfig through. Defined in the .cpp so this
+     * header does not need the full CallConfig definition.
+     */
+    void apply_call_config(const CallConfig &config);
 
     /**
      * Directory under which all diagnostic artifacts

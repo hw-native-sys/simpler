@@ -208,6 +208,14 @@ void Runtime::print_runtime() const {
     LOG_DEBUG("========================================================================");
 }
 
-// host_build_graph uploads the whole Runtime object (AICore reads tasks[] etc.
-// by offset), so the device copy size is the full struct.
-size_t runtime_device_copy_size(const Runtime &) { return sizeof(Runtime); }
+// host_build_graph uploads a variable-length prefix of the Runtime object:
+// everything up to and including the populated task slots. tasks[] is the last
+// device-read member, so this ships every device-read field while truncating the
+// unpopulated task tail and the host-only members declared after tasks[]. See
+// the static_asserts in runtime.h.
+size_t runtime_device_copy_size(const Runtime &rt) {
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Winvalid-offsetof"
+    return offsetof(Runtime, tasks) + static_cast<size_t>(rt.get_task_count()) * sizeof(Task);
+#pragma GCC diagnostic pop
+}

@@ -36,13 +36,16 @@
 
 #include "callable.h"
 #include "callable_protocol.h"
+#include "call_config.h"
 #include "chip_callable_layout.h"
 #include "common/core_type.h"
+#include "common/host_api.h"
 #include "common/platform_config.h"
 #include "common/unified_log.h"
 #include "host/raii_scope_guard.h"
 #include "host_log.h"
 #include "pto_runtime_c_api.h"
+#include "task_args.h"
 #include "utils/elf_build_id.h"
 // `runtime.h` (pulled in via `device_runner_helpers.h` in the base header)
 // supplies the per-arch `Handshake` + `Runtime` types used by
@@ -885,11 +888,25 @@ uint64_t DeviceRunnerBase::callable_hash(int32_t callable_id) const {
     return it == callables_.end() ? 0 : it->second.hash;
 }
 
-BindCallableResult DeviceRunnerBase::bind_callable_to_runtime(Runtime &runtime, int32_t callable_id) {
+// Per-run binding half, defined in each runtime's runtime_maker.cpp and linked
+// into this same host_runtime.so. Declared here (rather than only in
+// c_api_shared.cpp) so bind_callable_to_runtime can call it directly, keeping
+// the CallableState-derived host_orch_func_ptr / signature internal to the
+// runner instead of returning them across the c_api boundary.
+extern "C" int bind_callable_to_runtime_impl(
+    Runtime *runtime, const HostApi *api, const ChipStorageTaskArgs *orch_args, void *host_orch_func_ptr,
+    const ArgDirection *signature, int sig_count, const uint64_t *ring_task_window, const uint64_t *ring_heap,
+    const uint64_t *ring_dep_pool
+);
+
+int DeviceRunnerBase::bind_callable_to_runtime(
+    Runtime &runtime, int32_t callable_id, const HostApi *api, const void *orch_args, const uint64_t *ring_task_window,
+    const uint64_t *ring_heap, const uint64_t *ring_dep_pool
+) {
     auto it = callables_.find(callable_id);
     if (it == callables_.end()) {
         LOG_ERROR("bind_callable_to_runtime: callable_id=%d not registered", callable_id);
-        return {-1, nullptr, nullptr, 0};
+        return -1;
     }
     const auto &state = it->second;
 
@@ -900,20 +917,35 @@ BindCallableResult DeviceRunnerBase::bind_callable_to_runtime(Runtime &runtime, 
     for (const auto &kv : state.kernel_addrs) {
         if (kv.first < 0 || kv.first >= RUNTIME_MAX_FUNC_ID) {
             LOG_ERROR("bind_callable_to_runtime: func_id=%d out of range", kv.first);
-            return {-1, nullptr, nullptr, 0};
+            return -1;
         }
         runtime.replay_function_bin_addr(kv.first, kv.second);
     }
     // Tell the AICPU which orch_so_table_ slot this run dispatches. The orch SO
     // descriptor itself was delivered at register time via RegisterCallableArgs.
     runtime.set_active_callable_id(callable_id);
-    // hbg path: host_orch_func_ptr travels back to the c_api caller, which
-    // hands it to bind_callable_to_runtime_impl. trb path: stays null and
-    // the device-side orch SO was resolved at register time.
-    return {
-        0, state.host_orch_func_ptr, state.signature.empty() ? nullptr : state.signature.data(),
-        static_cast<int>(state.signature.size())
-    };
+
+    // Per-run binding (tensor args, GM heap, SM alloc). host_orch_func_ptr is
+    // non-null only on the hbg path; signature is the cached ChipCallable
+    // signature_[], plumbed end-to-end for per-tensor H2D/D2H direction
+    // decisions in runtime_maker (trb consumes it, hbg ignores it). Both stay
+    // internal to the runner now — they are no longer returned to the c_api.
+    return bind_callable_to_runtime_impl(
+        &runtime, api, reinterpret_cast<const ChipStorageTaskArgs *>(orch_args), state.host_orch_func_ptr,
+        state.signature.empty() ? nullptr : state.signature.data(), static_cast<int>(state.signature.size()),
+        ring_task_window, ring_heap, ring_dep_pool
+    );
+}
+
+void DeviceRunnerBase::apply_call_config(const CallConfig &config) {
+    set_l2_swimlane_enabled(config.enable_l2_swimlane);
+    set_dump_tensor_enabled(config.enable_dump_tensor);
+    set_pmu_enabled(config.enable_pmu);
+    // Virtual: a2a3 and a5 wire through to their enable_dep_gen_; an arch
+    // without dep_gen falls through to the base no-op.
+    set_dep_gen_enabled(config.enable_dep_gen != 0);
+    set_scope_stats_enabled(config.enable_scope_stats != 0);
+    set_output_prefix(config.output_prefix);
 }
 
 // =============================================================================

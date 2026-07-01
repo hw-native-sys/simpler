@@ -33,7 +33,7 @@ public:
     DeviceRunner() = default;
     ~DeviceRunner() override;
 
-    int run(Runtime &runtime, int block_dim, int launch_aicpu_num = 1) override;
+    int run(Runtime &runtime, const CallConfig &config) override;
     int finalize() override;
     void set_dep_gen_enabled(bool enable) override { enable_dep_gen_ = enable; }
 

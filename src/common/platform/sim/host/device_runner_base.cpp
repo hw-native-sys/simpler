@@ -22,9 +22,12 @@
 
 #include "callable.h"
 #include "callable_protocol.h"
+#include "call_config.h"
 #include "chip_callable_layout.h"
+#include "common/host_api.h"
 #include "cpu_sim_context.h"
 #include "host/raii_scope_guard.h"
+#include "task_args.h"
 #include "utils/elf_build_id.h"
 
 namespace simpler::common::sim_host {
@@ -512,27 +515,55 @@ int SimDeviceRunnerBase::unregister_callable(int32_t callable_id) {
 
 bool SimDeviceRunnerBase::has_callable(int32_t callable_id) const { return callables_.count(callable_id) != 0; }
 
-BindCallableResult SimDeviceRunnerBase::bind_callable_to_runtime(Runtime &runtime, int32_t callable_id) {
+// Per-run binding half, defined in each runtime's runtime_maker.cpp and linked
+// into this same sim runtime .so. Declared here (rather than only in
+// c_api_shared.cpp) so bind_callable_to_runtime can call it directly, keeping
+// the CallableState-derived host_orch_func_ptr / signature internal to the
+// runner instead of returning them across the c_api boundary.
+extern "C" int bind_callable_to_runtime_impl(
+    Runtime *runtime, const HostApi *api, const ChipStorageTaskArgs *orch_args, void *host_orch_func_ptr,
+    const ArgDirection *signature, int sig_count, const uint64_t *ring_task_window, const uint64_t *ring_heap,
+    const uint64_t *ring_dep_pool
+);
+
+int SimDeviceRunnerBase::bind_callable_to_runtime(
+    Runtime &runtime, int32_t callable_id, const HostApi *api, const void *orch_args, const uint64_t *ring_task_window,
+    const uint64_t *ring_heap, const uint64_t *ring_dep_pool
+) {
     auto it = callables_.find(callable_id);
     if (it == callables_.end()) {
         LOG_ERROR("bind_callable_to_runtime: callable_id=%d not registered", callable_id);
-        return {-1, nullptr, nullptr, 0};
+        return -1;
     }
     const auto &state = it->second;
     for (const auto &kv : state.kernel_addrs) {
         if (kv.first < 0 || kv.first >= RUNTIME_MAX_FUNC_ID) {
             LOG_ERROR("bind_callable_to_runtime: func_id=%d out of range", kv.first);
-            return {-1, nullptr, nullptr, 0};
+            return -1;
         }
         runtime.replay_function_bin_addr(kv.first, kv.second);
     }
     // The AICPU dispatches the orch SO via this callable_id; the SO descriptor
     // was already delivered at launch_device_register time.
     runtime.set_active_callable_id(callable_id);
-    return {
-        0, state.host_orch_func_ptr, state.signature.empty() ? nullptr : state.signature.data(),
-        static_cast<int>(state.signature.size())
-    };
+
+    // Per-run binding. host_orch_func_ptr + signature come from CallableState and
+    // stay inside the runner — no longer returned to the c_api.
+    return bind_callable_to_runtime_impl(
+        &runtime, api, reinterpret_cast<const ChipStorageTaskArgs *>(orch_args), state.host_orch_func_ptr,
+        state.signature.empty() ? nullptr : state.signature.data(), static_cast<int>(state.signature.size()),
+        ring_task_window, ring_heap, ring_dep_pool
+    );
+}
+
+void SimDeviceRunnerBase::apply_call_config(const CallConfig &config) {
+    set_l2_swimlane_enabled(config.enable_l2_swimlane);
+    set_dump_tensor_enabled(config.enable_dump_tensor);
+    set_pmu_enabled(config.enable_pmu);
+    // a2a3 and a5 override set_dep_gen_enabled; an arch without dep_gen no-ops.
+    set_dep_gen_enabled(config.enable_dep_gen != 0);
+    set_scope_stats_enabled(config.enable_scope_stats != 0);
+    set_output_prefix(config.output_prefix);
 }
 
 uint64_t SimDeviceRunnerBase::upload_chip_callable_buffer(const ChipCallable *callable) {

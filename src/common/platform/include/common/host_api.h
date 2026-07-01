@@ -18,11 +18,14 @@
  * Host API function pointers for device memory operations.
  * Allows a runtime to use pluggable device-memory backends.
  *
- * This is a platform capability, not runtime state: it is populated once per
- * simpler_run by the platform layer (onboard / sim c_api_shared.cpp) and passed
- * explicitly into bind_callable_to_runtime_impl / validate_runtime_impl. Shared
- * by every runtime variant (tensormap_and_ringbuffer / host_build_graph) and
- * arch (a2a3 / a5) so the field set stays defined in exactly one place.
+ * This is a platform capability, not runtime state: the platform layer
+ * (onboard / sim c_api_shared.cpp) builds one shared, const table of
+ * context-free function pointers at load time and passes it by address into
+ * bind_callable_to_runtime_impl / validate_runtime_impl. Each pointer recovers
+ * its runner from a thread-local, so the single table is valid for every runner
+ * and every run — it is not rebuilt per simpler_run. Shared by every runtime
+ * variant (tensormap_and_ringbuffer / host_build_graph) and arch (a2a3 / a5) so
+ * the field set stays defined in exactly one place.
  */
 struct HostApi {
     void *(*device_malloc)(size_t size);
