@@ -65,34 +65,23 @@ struct DepInputs {
     const PTO2TaskId *explicit_deps;  // length = explicit_dep_count (validity checked by caller)
 };
 
-/**
- * Compute fanin for a task being submitted (STEP 3: Step A creator retention +
- * Step B tensormap modifier lookup).
- *
- * For each non-OUTPUT tensor:
- *   - If owner_task_id is valid, emit(owner)
- *   - For INPUT/INOUT (and not manual_dep), tensor_map.lookup(*tensor) and emit
- *     each matching producer. INOUT+COVERED triggers tensor_map.remove_entry(entry).
- *
- * @return true on success (or producer-skipped-silently); false if emit signaled
- *         fatal — caller should propagate (after any fatal bookkeeping done by emit).
- */
-template <typename Emit>
-[[nodiscard]] inline bool
-compute_task_fanin(const DepInputs &inputs, PTO2TensorMap &tensor_map, bool in_manual_scope, Emit emit) {
+template <typename TensorAt, typename TagAt, typename Emit>
+[[nodiscard]] inline bool compute_task_fanin_impl(
+    int32_t tensor_count, TensorAt tensor_at, TagAt tag_at, PTO2TensorMap &tensor_map, bool in_manual_scope, Emit emit
+) {
     if (in_manual_scope) {
         return true;
     }
 
-    for (int32_t i = 0; i < inputs.tensor_count; i++) {
-        TensorArgType ptype = inputs.arg_types[i];
+    for (int32_t i = 0; i < tensor_count; i++) {
+        TensorArgType ptype = tag_at(i);
         if (ptype == TensorArgType::OUTPUT) {
             // Runtime-created OUTPUT tensors are not looked up in the TensorMap since
             // they have no dependencies.
             continue;
         }
 
-        const Tensor *tensor = &inputs.tensors[i].ref();
+        const Tensor *tensor = tensor_at(i);
 
         // Step A: creator retention — all existing tensors extend their creator lifetime.
         PTO2TaskId owner = tensor->owner_task_id;
@@ -109,7 +98,6 @@ compute_task_fanin(const DepInputs &inputs, PTO2TensorMap &tensor_map, bool in_m
         if (tensor->manual_dep) {
             continue;
         }
-
         bool fatal = false;
         tensor_map.lookup(*tensor, [&](PTO2TensorMapEntry &entry, OverlapStatus overlap_status) -> bool {
             if (!emit(entry.producer_task_id)) {
@@ -128,6 +116,69 @@ compute_task_fanin(const DepInputs &inputs, PTO2TensorMap &tensor_map, bool in_m
     return true;
 }
 
+template <typename TensorAt, typename TagAt>
+inline void register_task_outputs_impl(
+    int32_t tensor_count, TensorAt tensor_at, TagAt tag_at, PTO2TaskId task_id, PTO2TensorMap &tensor_map,
+    bool in_manual_scope
+) {
+    if (in_manual_scope) {
+        return;
+    }
+    for (int32_t i = 0; i < tensor_count; i++) {
+        TensorArgType ptype = tag_at(i);
+        if (ptype == TensorArgType::INOUT || ptype == TensorArgType::OUTPUT_EXISTING) {
+            const Tensor *tensor = tensor_at(i);
+            if (!tensor->manual_dep) {
+                tensor_map.insert(*tensor, task_id);
+            }
+        }
+    }
+}
+
+/**
+ * Compute fanin for a task being submitted (STEP 3: Step A creator retention +
+ * Step B tensormap modifier lookup).
+ *
+ * For each non-OUTPUT tensor:
+ *   - If owner_task_id is valid, emit(owner)
+ *   - For INPUT/INOUT (and not manual_dep), tensor_map.lookup(*tensor) and emit
+ *     each matching producer. INOUT+COVERED triggers tensor_map.remove_entry(entry).
+ *
+ * @return true on success (or producer-skipped-silently); false if emit signaled
+ *         fatal — caller should propagate (after any fatal bookkeeping done by emit).
+ */
+template <typename Emit>
+[[nodiscard]] inline bool
+compute_task_fanin(const DepInputs &inputs, PTO2TensorMap &tensor_map, bool in_manual_scope, Emit emit) {
+    return compute_task_fanin_impl(
+        inputs.tensor_count,
+        [&](int32_t i) {
+            return &inputs.tensors[i].ref();
+        },
+        [&](int32_t i) {
+            return inputs.arg_types[i];
+        },
+        tensor_map, in_manual_scope, emit
+    );
+}
+
+template <typename Emit>
+[[nodiscard]] inline bool compute_payload_task_fanin(
+    const PTO2TaskPayload &payload, const TensorArgType *arg_types, PTO2TensorMap &tensor_map, bool in_manual_scope,
+    Emit emit
+) {
+    return compute_task_fanin_impl(
+        payload.tensor_count,
+        [&](int32_t i) {
+            return &payload.tensors[i];
+        },
+        [&](int32_t i) {
+            return arg_types[i];
+        },
+        tensor_map, in_manual_scope, emit
+    );
+}
+
 /**
  * Register a task's outputs in the tensormap (STEP 4 in submit_task).
  *
@@ -138,42 +189,79 @@ compute_task_fanin(const DepInputs &inputs, PTO2TensorMap &tensor_map, bool in_m
  */
 inline void
 register_task_outputs(const DepInputs &inputs, PTO2TaskId task_id, PTO2TensorMap &tensor_map, bool in_manual_scope) {
-    if (in_manual_scope) {
-        return;
-    }
-    for (int32_t i = 0; i < inputs.tensor_count; i++) {
-        TensorArgType ptype = inputs.arg_types[i];
-        if (ptype == TensorArgType::INOUT || ptype == TensorArgType::OUTPUT_EXISTING) {
-            const Tensor *tensor = &inputs.tensors[i].ref();
-            if (!tensor->manual_dep) {
-                tensor_map.insert(*tensor, task_id);
-            }
-        }
-    }
+    register_task_outputs_impl(
+        inputs.tensor_count,
+        [&](int32_t i) {
+            return &inputs.tensors[i].ref();
+        },
+        [&](int32_t i) {
+            return inputs.arg_types[i];
+        },
+        task_id, tensor_map, in_manual_scope
+    );
 }
 
-/**
- * Count the tensormap entries register_task_outputs() will insert for this task.
- *
- * Mirrors register_task_outputs()'s selection exactly (INOUT / OUTPUT_EXISTING,
- * excluding manual_dep), so the returned value is the precise number of
- * new_entry() calls that step makes. The orchestrator uses it to reserve pool
- * capacity before inserting. Returns 0 in a manual scope (no registration).
- */
-inline int32_t count_registrable_outputs(const DepInputs &inputs, bool in_manual_scope) {
+inline void register_payload_task_outputs(
+    const PTO2TaskPayload &payload, const TensorArgType *arg_types, PTO2TaskId task_id, PTO2TensorMap &tensor_map,
+    bool in_manual_scope
+) {
+    register_task_outputs_impl(
+        payload.tensor_count,
+        [&](int32_t i) {
+            return &payload.tensors[i];
+        },
+        [&](int32_t i) {
+            return arg_types[i];
+        },
+        task_id, tensor_map, in_manual_scope
+    );
+}
+
+template <typename TensorAt, typename TagAt>
+inline int32_t
+count_registrable_outputs_impl(int32_t tensor_count, TensorAt tensor_at, TagAt tag_at, bool in_manual_scope) {
     if (in_manual_scope) {
         return 0;
     }
     int32_t needed = 0;
-    for (int32_t i = 0; i < inputs.tensor_count; i++) {
-        TensorArgType ptype = inputs.arg_types[i];
+    for (int32_t i = 0; i < tensor_count; i++) {
+        TensorArgType ptype = tag_at(i);
         if (ptype == TensorArgType::INOUT || ptype == TensorArgType::OUTPUT_EXISTING) {
-            if (!inputs.tensors[i].ref().manual_dep) {
+            const Tensor *tensor = tensor_at(i);
+            if (!tensor->manual_dep) {
                 needed++;
             }
         }
     }
     return needed;
+}
+
+inline int32_t count_registrable_outputs(const DepInputs &inputs, bool in_manual_scope) {
+    return count_registrable_outputs_impl(
+        inputs.tensor_count,
+        [&](int32_t i) {
+            return &inputs.tensors[i].ref();
+        },
+        [&](int32_t i) {
+            return inputs.arg_types[i];
+        },
+        in_manual_scope
+    );
+}
+
+inline int32_t count_payload_registrable_outputs(
+    const PTO2TaskPayload &payload, const TensorArgType *arg_types, bool in_manual_scope
+) {
+    return count_registrable_outputs_impl(
+        payload.tensor_count,
+        [&](int32_t i) {
+            return &payload.tensors[i];
+        },
+        [&](int32_t i) {
+            return arg_types[i];
+        },
+        in_manual_scope
+    );
 }
 
 #endif  // SRC_A2A3_RUNTIME_TENSORMAP_AND_RINGBUFFER_RUNTIME_PTO_DEP_COMPUTE_H_

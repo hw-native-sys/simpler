@@ -23,6 +23,7 @@
 #include <string.h>
 
 #include <limits>
+#include <new>
 
 #include "pto_orchestrator.h"
 #include "pto_runtime2.h"
@@ -337,7 +338,7 @@ bool PTO2OrchestratorState::init_data_from_layout(
     const uint64_t heap_sizes[PTO2_MAX_RING_DEPTH], const uint64_t task_window_sizes[PTO2_MAX_RING_DEPTH]
 ) {
     auto *orch = this;
-    *orch = PTO2OrchestratorState{};
+    new (orch) PTO2OrchestratorState();
 
     orch->sm_header = reinterpret_cast<PTO2SharedMemoryHeader *>(sm_dev_base);
     orch->gm_heap_base = gm_heap;
