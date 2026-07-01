@@ -30,8 +30,13 @@ _ORCH_SRC = os.path.join(_HERE, "kernels", "orchestration", "l3_l2_message_queue
 _AIV_SRC = os.path.join(_HERE, "kernels", "aiv", "kernel_queue_transform.cpp")
 _TIMEOUT_S = 5.0
 _QUEUE_DEPTH = 4
-_INPUT_ARENA_BYTES = 4096
-_OUTPUT_ARENA_BYTES = 4096
+_ROUNDS = 3
+_ROWS = 128
+_COLS = 128
+_NUMEL = _ROWS * _COLS
+_NBYTES = _NUMEL * 4
+_INPUT_ARENA_BYTES = _NBYTES * _ROUNDS
+_OUTPUT_ARENA_BYTES = _NBYTES * _ROUNDS
 _SCALAR = ctypes.c_float(7.0)
 
 
@@ -72,30 +77,29 @@ def _build_chip_callable(platform: str) -> ChipCallable:
     )
 
 
-def _pack_floats(values: list[float]) -> bytes:
-    return struct.pack(f"<{len(values)}f", *values)
+def _pack_tile(values: list[float]) -> bytes:
+    if len(values) != _NUMEL:
+        raise ValueError(f"L3-L2 queue example tile requires {_NUMEL} floats")
+    return struct.pack(f"<{_NUMEL}f", *values)
 
 
-def _unpack_floats(data: bytes | bytearray) -> tuple[float, ...]:
-    if not data:
-        return ()
-    return struct.unpack(f"<{len(data) // 4}f", bytes(data))
+def _unpack_tile(data: bytes | bytearray) -> tuple[float, ...]:
+    if len(data) != _NBYTES:
+        raise ValueError(f"L3-L2 queue example tile requires {_NBYTES} bytes")
+    return struct.unpack(f"<{_NUMEL}f", bytes(data))
 
 
-def _input_payloads() -> list[bytes]:
-    return [
-        _pack_floats([float(i) for i in range(16)]),
-        _pack_floats([float(100 + i) / 8.0 for i in range(32)]),
-        _pack_floats([float(1000 + i) / 16.0 for i in range(48)]),
-        b"",
-    ]
+def _make_input_payload(round_idx: int) -> tuple[bytes, list[float]]:
+    values = [float(round_idx * 1000 + (i % 251)) / 16.0 for i in range(_NUMEL)]
+    expected = [value + float(_SCALAR.value) for value in values]
+    return _pack_tile(values), expected
 
 
-def _expected_payload(payload: bytes) -> bytes:
-    if not payload:
-        return b""
-    values = [value + float(_SCALAR.value) for value in _unpack_floats(payload)]
-    return _pack_floats(values)
+def _assert_output_matches(data: bytes | bytearray, expected: list[float]) -> None:
+    values = _unpack_tile(data)
+    for i, want in enumerate(expected):
+        got = float(values[i])
+        assert abs(got - want) <= 1e-5, f"output[{i}] expected {want}, got {got}"
 
 
 def run_l3_l2_message_queue_example(platform: str, device_id: int) -> None:
@@ -128,25 +132,19 @@ def run_l3_l2_message_queue_example(platform: str, device_id: int) -> None:
             task_args.add_scalar(scalar_to_uint64(_SCALAR))
             orch_handle.submit_next_level(handle, task_args, cfg, worker=0)
 
-            payloads = _input_payloads()
-            for payload in payloads:
-                if payload:
-                    queue.input.enqueue(payload, nbytes=len(payload), timeout=_TIMEOUT_S)
-                else:
-                    queue.input.enqueue(None, nbytes=0, timeout=_TIMEOUT_S)
+            payloads = [_make_input_payload(round_idx) for round_idx in range(1, _ROUNDS + 1)]
+            for payload, _expected in payloads:
+                queue.input.enqueue(payload, nbytes=len(payload), timeout=_TIMEOUT_S)
             queue.request_stop(timeout=_TIMEOUT_S)
 
-            for seq, payload in enumerate(payloads, start=1):
+            for seq, (payload, expected) in enumerate(payloads, start=1):
                 message = queue.output.peek(timeout=_TIMEOUT_S)
                 assert message.seq == seq
                 assert message.opcode == L3L2QueueOpcode.DATA
                 assert message.payload_nbytes == len(payload)
-                if payload:
-                    output = bytearray(message.payload_nbytes)
-                    queue.output.read_into(message, output)
-                    assert bytes(output) == _expected_payload(payload)
-                else:
-                    queue.output.read_into(message, None)
+                output = bytearray(message.payload_nbytes)
+                queue.output.read_into(message, output)
+                _assert_output_matches(output, expected)
                 queue.output.release(message)
 
             queue.free()
