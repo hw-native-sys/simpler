@@ -112,7 +112,7 @@ public:
         // sched SCHEDULER_TIMEOUT (multi_round_paged_attention C1) depending
         // on which AICore op first touches the uninitialized slot.
         if (is_l2_swimlane_enabled()) {
-            l2_swimlane_aicpu_init(runtime->worker_count);
+            l2_swimlane_aicpu_init(runtime->dev.worker_count);
         }
 
         // Discover cores and assign to scheduler threads.
