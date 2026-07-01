@@ -292,6 +292,8 @@ def test_create_l3_l2_queue_allocates_region_and_exposes_l2_task_scalars():
             4,
             128,
             192,
+            queue.layout.payload_bytes,
+            queue.layout.counter_bytes,
         ]
         assert fake_client.counters == {
             queue.layout.input_desc_tail_offset: 0,
@@ -425,6 +427,23 @@ def test_dequeue_into_reads_and_releases_output():
         assert message.opcode == L3L2QueueOpcode.DATA
         assert ctypes.string_at(int(output.data), 16) == b"abcdefghijklmnop"
         assert fake_client.counters[queue.layout.output_desc_head_offset] == 1
+    finally:
+        _close(worker, shm)
+
+
+def test_output_error_opcode_is_delivered_without_poison():
+    orch, worker, shm, fake_client = _make_orchestrator()
+    try:
+        queue = orch.create_l3_l2_queue(worker_id=0, depth=4, input_arena_bytes=128, output_arena_bytes=128)
+        _publish_output(fake_client, queue, payload=b"error-detail", opcode=int(L3L2QueueOpcode.ERROR))
+        output = orch.alloc([12], DataType.UINT8)
+
+        message = queue.output.dequeue_into(output, timeout=0.001)
+
+        assert message.opcode == L3L2QueueOpcode.ERROR
+        assert ctypes.string_at(int(output.data), 12) == b"error-detail"
+        assert fake_client.counters[queue.layout.output_desc_head_offset] == 1
+        assert fake_client.counters.get(L3L2_QUEUE_L3_ABORT_FLAG_OFFSET, 0) == 0
     finally:
         _close(worker, shm)
 
