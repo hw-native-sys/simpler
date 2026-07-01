@@ -39,6 +39,7 @@
 #include <vector>
 
 #include "common/core_type.h"
+#include "common/host_api.h"
 #include "common/l2_swimlane_profiling.h"
 #include "common/platform_config.h"
 #include "aicpu/platform_aicpu_affinity.h"  // MAX_GATE_THREADS (aicpu_allowed_cpus bound)
@@ -114,62 +115,6 @@ struct TensorPair {
     // so the end-of-run D2H copy-back is skipped. OUTPUT/INOUT/unknown
     // keep the safe default of copying back.
     bool needs_copy_back = true;
-};
-
-/**
- * Host API function pointers for device memory operations.
- * Allows runtime to use pluggable device memory backends.
- */
-struct HostApi {
-    void *(*device_malloc)(size_t size);
-    void (*device_free)(void *dev_ptr);
-    int (*copy_to_device)(void *dev_ptr, const void *host_ptr, size_t size);
-    int (*copy_from_device)(void *host_ptr, const void *dev_ptr, size_t size);
-    // Set a device buffer to a byte value (device-side, no PCIe). Used to
-    // zero-init pure OUTPUT buffers in lieu of an H2D copy-in. May be
-    // null on backends that don't wire it; callers must fall back to
-    // copy_to_device.
-    int (*device_memset)(void *dev_ptr, int value, size_t size);
-    // Commit the three per-Worker pooled regions (PTO2 GM heap, PTO2 shared
-    // memory, trb prebuilt runtime arena) as three independent device
-    // allocations. `runtime_arena_size == 0` skips the third region (hbg
-    // path: hbg has no prebuilt runtime arena). Idempotent on identical
-    // sizes; returns 0 on success, -1 on allocation failure.
-    int (*setup_static_arena)(size_t gm_heap_size, size_t gm_sm_size, size_t runtime_arena_size);
-    // Return the per-Worker pooled pointer for the PTO2 GM heap / shared
-    // memory / prebuilt runtime arena. setup_static_arena must have already
-    // committed the relevant region; the returned pointer is owned by the
-    // DeviceRunner and freed in `DeviceRunner::finalize()` — do NOT pass it
-    // to device_free or record it in `tensor_pairs_`.
-    //
-    // acquire_pooled_runtime_arena is trb-only — the runtime-arena region is
-    // only committed when setup_static_arena was invoked with
-    // runtime_arena_size > 0. Calling it on the hbg path
-    // (setup_static_arena(...,0)) returns nullptr (not undefined).
-    void *(*acquire_pooled_gm_heap)();
-    void *(*acquire_pooled_gm_sm)();
-    void *(*acquire_pooled_runtime_arena)();
-    bool (*lookup_prebuilt_runtime_arena_cache)(
-        uint64_t hash, const void *key_data, size_t key_size, void **gm_heap_base, void **sm_base,
-        void **runtime_arena_base, size_t *runtime_off, const void **image_data, size_t *image_size
-    );
-    void (*mark_prebuilt_runtime_arena_cached)(
-        uint64_t hash, const void *key_data, size_t key_size, void *gm_heap_base, void *sm_base,
-        void *runtime_arena_base, size_t runtime_off, const void *image_data, size_t image_size
-    );
-    // Single-shot upload of the entire ChipCallable buffer. `callable` is a
-    // `const ChipCallable *` (declared void* to avoid pulling task_interface
-    // headers into runtime.h). DeviceRunner walks child_offsets_ to compute
-    // total byte size, allocates device GM once, fixes up each child's
-    // resolved_addr_ in an internal host scratch (onboard: device addr; sim:
-    // dlopen function pointer), H2D's once, and returns the device-side
-    // address of the ChipCallable header. Pool-managed: identical buffer
-    // contents (FNV-1a 64-bit) hit the dedup cache; all chip buffers are
-    // bulk-freed in DeviceRunner::finalize(). Returns 0 on error or when
-    // child_count() == 0. Caller computes child addrs as
-    //     chip_dev + offsetof(ChipCallable, storage_) + child_offset(i)
-    // and stores them via runtime->set_function_bin_addr(fid, child_dev).
-    uint64_t (*upload_chip_callable_buffer)(const void *callable);
 };
 
 /**
@@ -364,12 +309,8 @@ public:
     Task *get_task(int) { return nullptr; }
 
     // =========================================================================
-    // Host API (host-only, not copied to device)
+    // Host-only state (not copied to device)
     // =========================================================================
-
-    // Host API function pointers for device memory operations. Host-only:
-    // lives in the tail after `dev`, so it is never part of the device copy.
-    HostApi host_api;
 
     // Host-side tensor ledger for D2H copy-back at finalize. Populated by
     // runtime_maker.cpp from orch_args at bind time, then iterated in

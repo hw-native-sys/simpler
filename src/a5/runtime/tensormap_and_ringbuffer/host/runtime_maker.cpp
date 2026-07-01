@@ -246,7 +246,7 @@ static bool resolve_ring_config(
     return true;
 }
 
-static int32_t pto2_read_runtime_status(Runtime *runtime, PTO2SharedMemoryHeader *host_header) {
+static int32_t pto2_read_runtime_status(Runtime *runtime, const HostApi *api, PTO2SharedMemoryHeader *host_header) {
     if (runtime == nullptr || host_header == nullptr) {
         return 0;
     }
@@ -256,7 +256,7 @@ static int32_t pto2_read_runtime_status(Runtime *runtime, PTO2SharedMemoryHeader
         return 0;
     }
 
-    int hdr_rc = runtime->host_api.copy_from_device(host_header, pto2_sm, sizeof(PTO2SharedMemoryHeader));
+    int hdr_rc = api->copy_from_device(host_header, pto2_sm, sizeof(PTO2SharedMemoryHeader));
     if (hdr_rc != 0) {
         LOG_WARN("Failed to copy PTO2 header from device");
         return 0;
@@ -274,7 +274,7 @@ static int32_t pto2_read_runtime_status(Runtime *runtime, PTO2SharedMemoryHeader
  * on per-run argument values, so the simpler_register_callable / simpler_run split
  * lets us run this once per callable_id and amortize across runs.
  *
- * @param runtime   Pointer to pre-constructed Runtime (host_api populated)
+ * @param runtime   Pointer to pre-constructed Runtime
  * @param callable  ChipCallable carrying the orch SO + child kernel binaries
  * @return 0 on success, -1 on failure
  */
@@ -419,8 +419,8 @@ static bool derive_arena_static_sizes(const ArenaSizingConfig &sizing, ArenaStat
 // staged device_args / tensor_pairs_ stay owned by the caller's Runtime, which
 // frees them in validate_runtime_impl.
 static bool stage_device_args(
-    Runtime *runtime, const ChipStorageTaskArgs *orch_args, const ArgDirection *signature, int sig_count,
-    ChipStorageTaskArgs *out
+    Runtime *runtime, const HostApi *api, const ChipStorageTaskArgs *orch_args, const ArgDirection *signature,
+    int sig_count, ChipStorageTaskArgs *out
 ) {
     int tensor_count = orch_args->tensor_count();
     int scalar_count = orch_args->scalar_count();
@@ -439,7 +439,7 @@ static bool stage_device_args(
         void *host_ptr = reinterpret_cast<void *>(static_cast<uintptr_t>(t.buffer.addr));
         size_t size = static_cast<size_t>(t.nbytes());
 
-        void *dev_ptr = runtime->host_api.device_malloc(size);
+        void *dev_ptr = api->device_malloc(size);
         if (dev_ptr == nullptr) {
             LOG_ERROR("Failed to allocate device memory for tensor %d", i);
             return false;
@@ -453,14 +453,14 @@ static bool stage_device_args(
         // did not wire device_memset.
         bool is_pure_output = (signature != nullptr && i < sig_count && signature[i] == ArgDirection::OUT);
         int rc;
-        if (is_pure_output && runtime->host_api.device_memset != nullptr) {
-            rc = runtime->host_api.device_memset(dev_ptr, 0, size);
+        if (is_pure_output && api->device_memset != nullptr) {
+            rc = api->device_memset(dev_ptr, 0, size);
         } else {
-            rc = runtime->host_api.copy_to_device(dev_ptr, host_ptr, size);
+            rc = api->copy_to_device(dev_ptr, host_ptr, size);
         }
         if (rc != 0) {
             LOG_ERROR("Failed to stage tensor %d to device", i);
-            runtime->host_api.device_free(dev_ptr);
+            api->device_free(dev_ptr);
             return false;
         }
         // Read-only INPUT tensors are never written by the kernel, so there is
@@ -503,21 +503,22 @@ static void apply_orch_sched_env_flags(Runtime *runtime) {
 // reserve sequence on a throwaway host arena. Idempotent across runs — the
 // pools are owned by DeviceRunner and freed in DeviceRunner::finalize().
 static bool ensure_static_arenas(
-    Runtime *runtime, const ArenaSizingConfig &sizing, const ArenaStaticSizes &sizes, StaticArenaPtrs *out
+    Runtime *runtime, const HostApi *api, const ArenaSizingConfig &sizing, const ArenaStaticSizes &sizes,
+    StaticArenaPtrs *out
 ) {
     DeviceArena sizing_arena;  // discarded; only its computed arena_size is read
     PTO2RuntimeArenaLayout layout =
         runtime_reserve_layout(sizing_arena, sizing.task_window_sizes, sizing.heap_sizes, sizing.dep_pool_capacities);
 
     int64_t t_setup_start = _now_ms();
-    if (runtime->host_api.setup_static_arena(sizes.total_heap, sizes.sm_size, layout.offsets.arena_size) != 0) {
+    if (api->setup_static_arena(sizes.total_heap, sizes.sm_size, layout.offsets.arena_size) != 0) {
         LOG_ERROR("Failed to setup pooled static arena");
         return false;
     }
     int64_t t_setup_end = _now_ms();
 
     int64_t t_heap_start = _now_ms();
-    out->gm_heap = runtime->host_api.acquire_pooled_gm_heap();
+    out->gm_heap = api->acquire_pooled_gm_heap();
     int64_t t_heap_end = _now_ms();
     if (out->gm_heap == nullptr) {
         LOG_ERROR("Failed to acquire pooled GM heap");
@@ -525,7 +526,7 @@ static bool ensure_static_arenas(
     }
 
     int64_t t_sm_start = _now_ms();
-    out->gm_sm = runtime->host_api.acquire_pooled_gm_sm();
+    out->gm_sm = api->acquire_pooled_gm_sm();
     int64_t t_sm_end = _now_ms();
     if (out->gm_sm == nullptr) {
         LOG_ERROR("Failed to acquire pooled PTO2 shared memory");
@@ -533,7 +534,7 @@ static bool ensure_static_arenas(
     }
     runtime->set_gm_sm_ptr(out->gm_sm);
 
-    out->runtime_arena_dev = runtime->host_api.acquire_pooled_runtime_arena();
+    out->runtime_arena_dev = api->acquire_pooled_runtime_arena();
     if (out->runtime_arena_dev == nullptr) {
         LOG_ERROR("Failed to acquire pooled runtime arena");
         return false;
@@ -589,13 +590,12 @@ static bool build_runtime_image(
 // rtMemcpy the host image into the pooled runtime-arena region, and record the
 // device base + runtime offset the AICPU reads before dereferencing the image.
 static bool bind_launch_state(
-    Runtime *runtime, const StaticArenaPtrs &ptrs, const DeviceArena &host_arena, const PTO2RuntimeArenaLayout &layout,
-    const ChipStorageTaskArgs &device_args
+    Runtime *runtime, const HostApi *api, const StaticArenaPtrs &ptrs, const DeviceArena &host_arena,
+    const PTO2RuntimeArenaLayout &layout, const ChipStorageTaskArgs &device_args
 ) {
     runtime->set_orch_args(device_args);
 
-    int rc_upload =
-        runtime->host_api.copy_to_device(ptrs.runtime_arena_dev, host_arena.base(), layout.offsets.arena_size);
+    int rc_upload = api->copy_to_device(ptrs.runtime_arena_dev, host_arena.base(), layout.offsets.arena_size);
     if (rc_upload != 0) {
         LOG_ERROR("Failed to rtMemcpy prebuilt runtime arena to device (rc=%d)", rc_upload);
         return false;
@@ -605,9 +605,10 @@ static bool bind_launch_state(
 }
 
 static int bind_cached_runtime_image(
-    Runtime *runtime, const PrebuiltRuntimeArenaCacheProbe &probe, const ChipStorageTaskArgs &device_args
+    Runtime *runtime, const HostApi *api, const PrebuiltRuntimeArenaCacheProbe &probe,
+    const ChipStorageTaskArgs &device_args
 ) {
-    if (runtime->host_api.lookup_prebuilt_runtime_arena_cache == nullptr) {
+    if (api->lookup_prebuilt_runtime_arena_cache == nullptr) {
         return 1;
     }
 
@@ -617,7 +618,7 @@ static int bind_cached_runtime_image(
     size_t runtime_off = 0;
     const void *cached_image = nullptr;
     size_t cached_image_size = 0;
-    bool cache_hit = runtime->host_api.lookup_prebuilt_runtime_arena_cache(
+    bool cache_hit = api->lookup_prebuilt_runtime_arena_cache(
         probe.hash, probe.serialized_key.data(), probe.serialized_key.size(), &gm_heap, &sm_ptr, &runtime_arena_dev,
         &runtime_off, &cached_image, &cached_image_size
     );
@@ -626,7 +627,7 @@ static int bind_cached_runtime_image(
     }
 
     runtime->set_orch_args(device_args);
-    int rc_upload = runtime->host_api.copy_to_device(runtime_arena_dev, cached_image, cached_image_size);
+    int rc_upload = api->copy_to_device(runtime_arena_dev, cached_image, cached_image_size);
     if (rc_upload != 0) {
         LOG_ERROR("Failed to rtMemcpy cached prebuilt runtime arena to device (rc=%d)", rc_upload);
         return -1;
@@ -637,13 +638,13 @@ static int bind_cached_runtime_image(
 }
 
 static void store_prebuilt_runtime_image(
-    Runtime *runtime, const PrebuiltRuntimeArenaCacheProbe &probe, const StaticArenaPtrs &ptrs,
+    Runtime *runtime, const HostApi *api, const PrebuiltRuntimeArenaCacheProbe &probe, const StaticArenaPtrs &ptrs,
     const PTO2RuntimeArenaLayout &layout, const DeviceArena &host_arena
 ) {
-    if (runtime->host_api.mark_prebuilt_runtime_arena_cached == nullptr) {
+    if (api->mark_prebuilt_runtime_arena_cached == nullptr) {
         return;
     }
-    runtime->host_api.mark_prebuilt_runtime_arena_cached(
+    api->mark_prebuilt_runtime_arena_cached(
         probe.hash, probe.serialized_key.data(), probe.serialized_key.size(), ptrs.gm_heap, ptrs.gm_sm,
         ptrs.runtime_arena_dev, layout.offsets.off_runtime, host_arena.base(), layout.offsets.arena_size
     );
@@ -664,16 +665,21 @@ static void store_prebuilt_runtime_image(
  * (build_runtime_image), and per-run args (stage_device_args) + launch publish
  * (bind_launch_state).
  *
- * @param runtime    Pointer to pre-constructed Runtime (host_api populated)
+ * @param runtime    Pointer to pre-constructed Runtime
  * @param orch_args  Separated tensor/scalar arguments for this run
  * @return 0 on success, -1 on failure
  */
 extern "C" int bind_callable_to_runtime_impl(
-    Runtime *runtime, const ChipStorageTaskArgs *orch_args, void *host_orch_func_ptr, const ArgDirection *signature,
-    int sig_count, const uint64_t *ring_task_window, const uint64_t *ring_heap, const uint64_t *ring_dep_pool
+    Runtime *runtime, const HostApi *api, const ChipStorageTaskArgs *orch_args, void *host_orch_func_ptr,
+    const ArgDirection *signature, int sig_count, const uint64_t *ring_task_window, const uint64_t *ring_heap,
+    const uint64_t *ring_dep_pool
 ) {
     if (runtime == nullptr) {
         LOG_ERROR("Runtime pointer is null");
+        return -1;
+    }
+    if (api == nullptr) {
+        LOG_ERROR("HostApi pointer is null");
         return -1;
     }
     if (orch_args == nullptr) {
@@ -700,7 +706,7 @@ extern "C" int bind_callable_to_runtime_impl(
     }
 
     ChipStorageTaskArgs device_args;
-    if (!stage_device_args(runtime, orch_args, signature, sig_count, &device_args)) {
+    if (!stage_device_args(runtime, api, orch_args, signature, sig_count, &device_args)) {
         return -1;
     }
 
@@ -710,7 +716,7 @@ extern "C" int bind_callable_to_runtime_impl(
     {
         STRACE("simpler_run.bind.prebuilt");
         PrebuiltRuntimeArenaCacheProbe cache_probe = make_prebuilt_runtime_arena_cache_probe(sizing);
-        int cache_rc = bind_cached_runtime_image(runtime, cache_probe, device_args);
+        int cache_rc = bind_cached_runtime_image(runtime, api, cache_probe, device_args);
         if (cache_rc < 0) {
             return -1;
         }
@@ -721,7 +727,7 @@ extern "C" int bind_callable_to_runtime_impl(
             }
 
             StaticArenaPtrs ptrs;
-            if (!ensure_static_arenas(runtime, sizing, sizes, &ptrs)) {
+            if (!ensure_static_arenas(runtime, api, sizing, sizes, &ptrs)) {
                 return -1;
             }
 
@@ -731,10 +737,10 @@ extern "C" int bind_callable_to_runtime_impl(
                 return -1;
             }
 
-            if (!bind_launch_state(runtime, ptrs, host_arena, layout, device_args)) {
+            if (!bind_launch_state(runtime, api, ptrs, host_arena, layout, device_args)) {
                 return -1;
             }
-            store_prebuilt_runtime_image(runtime, cache_probe, ptrs, layout, host_arena);
+            store_prebuilt_runtime_image(runtime, api, cache_probe, ptrs, layout, host_arena);
         }
     }
     int64_t t_prebuilt_end = _now_ms();
@@ -759,9 +765,13 @@ extern "C" int bind_callable_to_runtime_impl(
  * @param runtime  Pointer to Runtime
  * @return 0 on success, -1 on failure
  */
-extern "C" int validate_runtime_impl(Runtime *runtime) {
+extern "C" int validate_runtime_impl(Runtime *runtime, const HostApi *api) {
     if (runtime == nullptr) {
         LOG_ERROR("Runtime pointer is null");
+        return -1;
+    }
+    if (api == nullptr) {
+        LOG_ERROR("HostApi pointer is null");
         return -1;
     }
 
@@ -783,7 +793,7 @@ extern "C" int validate_runtime_impl(Runtime *runtime) {
     PTO2SharedMemoryHeader host_header;
     memset(&host_header, 0, sizeof(host_header));
 
-    runtime_status = pto2_read_runtime_status(runtime, &host_header);
+    runtime_status = pto2_read_runtime_status(runtime, api, &host_header);
     if (runtime_status != 0) {
         int32_t orch_error_code = host_header.orch_error_code.load(std::memory_order_relaxed);
         int32_t sched_error_code = host_header.sched_error_code.load(std::memory_order_relaxed);
@@ -856,7 +866,7 @@ extern "C" int validate_runtime_impl(Runtime *runtime) {
                 first_output_tensor = false;
             }
 
-            int copy_rc = runtime->host_api.copy_from_device(pair.host_ptr, src_ptr, copy_size);
+            int copy_rc = api->copy_from_device(pair.host_ptr, src_ptr, copy_size);
             if (copy_rc != 0) {
                 LOG_ERROR("Failed to copy tensor %d from device: %d", i, copy_rc);
                 rc = copy_rc;
@@ -870,7 +880,7 @@ extern "C" int validate_runtime_impl(Runtime *runtime) {
     LOG_INFO_V0("=== Cleaning Up ===");
     for (int i = 0; i < tensor_pair_count; i++) {
         if (tensor_pairs[i].dev_ptr != nullptr) {
-            runtime->host_api.device_free(tensor_pairs[i].dev_ptr);
+            api->device_free(tensor_pairs[i].dev_ptr);
         }
     }
     LOG_INFO_V0("Freed %d device allocations", tensor_pair_count);

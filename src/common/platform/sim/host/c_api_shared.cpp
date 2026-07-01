@@ -52,10 +52,11 @@ extern "C" {
  * =========================================================================== */
 int register_callable_impl(const ChipCallable *callable, uint64_t (*upload_fn)(const void *), CallableArtifacts *out);
 int bind_callable_to_runtime_impl(
-    Runtime *runtime, const ChipStorageTaskArgs *orch_args, void *host_orch_func_ptr, const ArgDirection *signature,
-    int sig_count, const uint64_t *ring_task_window, const uint64_t *ring_heap, const uint64_t *ring_dep_pool
+    Runtime *runtime, const HostApi *api, const ChipStorageTaskArgs *orch_args, void *host_orch_func_ptr,
+    const ArgDirection *signature, int sig_count, const uint64_t *ring_task_window, const uint64_t *ring_heap,
+    const uint64_t *ring_dep_pool
 );
-int validate_runtime_impl(Runtime *runtime);
+int validate_runtime_impl(Runtime *runtime, const HostApi *api);
 
 /* ===========================================================================
  * Per-thread DeviceRunner binding
@@ -70,7 +71,8 @@ static SimDeviceRunnerBase *current_runner() {
 }
 
 /* ===========================================================================
- * Internal device-memory functions (used via Runtime.host_api, NOT dlsym'd)
+ * Internal device-memory functions (wired into a HostApi and passed to the
+ * runtime impls, NOT dlsym'd)
  * =========================================================================== */
 
 static void *device_malloc(size_t size) {
@@ -444,18 +446,23 @@ int simpler_run(
             r->~Runtime();
         });
 
-        r->host_api.device_malloc = device_malloc;
-        r->host_api.device_free = device_free;
-        r->host_api.copy_to_device = copy_to_device;
-        r->host_api.copy_from_device = copy_from_device;
-        r->host_api.device_memset = device_memset;
-        r->host_api.setup_static_arena = setup_static_arena_wrapper;
-        r->host_api.acquire_pooled_gm_heap = acquire_pooled_gm_heap_wrapper;
-        r->host_api.acquire_pooled_gm_sm = acquire_pooled_gm_sm_wrapper;
-        r->host_api.acquire_pooled_runtime_arena = acquire_pooled_runtime_arena_wrapper;
-        r->host_api.lookup_prebuilt_runtime_arena_cache = lookup_prebuilt_runtime_arena_cache_wrapper;
-        r->host_api.mark_prebuilt_runtime_arena_cached = mark_prebuilt_runtime_arena_cached_wrapper;
-        r->host_api.upload_chip_callable_buffer = upload_chip_callable_buffer_wrapper;
+        // Platform device-memory hooks. host_api is a platform capability, not
+        // runtime state — it lives here (local to simpler_run, covering the whole
+        // bind→run→validate span) and is passed explicitly into the runtime impls
+        // rather than stored on `Runtime`.
+        HostApi api{};
+        api.device_malloc = device_malloc;
+        api.device_free = device_free;
+        api.copy_to_device = copy_to_device;
+        api.copy_from_device = copy_from_device;
+        api.device_memset = device_memset;
+        api.setup_static_arena = setup_static_arena_wrapper;
+        api.acquire_pooled_gm_heap = acquire_pooled_gm_heap_wrapper;
+        api.acquire_pooled_gm_sm = acquire_pooled_gm_sm_wrapper;
+        api.acquire_pooled_runtime_arena = acquire_pooled_runtime_arena_wrapper;
+        api.lookup_prebuilt_runtime_arena_cache = lookup_prebuilt_runtime_arena_cache_wrapper;
+        api.mark_prebuilt_runtime_arena_cached = mark_prebuilt_runtime_arena_cached_wrapper;
+        api.upload_chip_callable_buffer = upload_chip_callable_buffer_wrapper;
 
         auto bind_result = runner->bind_callable_to_runtime(*r, callable_id);
         int rc = bind_result.rc;
@@ -467,13 +474,13 @@ int simpler_run(
         {
             STRACE("simpler_run.bind");
             rc = bind_callable_to_runtime_impl(
-                r, reinterpret_cast<const ChipStorageTaskArgs *>(args), bind_result.host_orch_func_ptr,
+                r, &api, reinterpret_cast<const ChipStorageTaskArgs *>(args), bind_result.host_orch_func_ptr,
                 bind_result.signature, bind_result.sig_count, ring_task_window, ring_heap, ring_dep_pool
             );
         }
         if (rc != 0) {
             r->set_gm_sm_ptr(nullptr);
-            validate_runtime_impl(r);
+            validate_runtime_impl(r, &api);
             pthread_setspecific(g_runner_key, nullptr);
             return rc;
         }
@@ -490,14 +497,14 @@ int simpler_run(
             rc = runner->run(*r, block_dim, aicpu_thread_num);
         }
         if (rc != 0) {
-            validate_runtime_impl(r);
+            validate_runtime_impl(r, &api);
             pthread_setspecific(g_runner_key, nullptr);
             return rc;
         }
 
         {
             STRACE("simpler_run.validate");
-            rc = validate_runtime_impl(r);
+            rc = validate_runtime_impl(r, &api);
         }
         pthread_setspecific(g_runner_key, nullptr);
         emit_device_phase_markers(runner);

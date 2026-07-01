@@ -38,6 +38,7 @@
 #include <vector>
 
 #include "common/core_type.h"
+#include "common/host_api.h"
 #include "common/platform_config.h"
 #include "aicpu/platform_aicpu_affinity.h"  // MAX_GATE_THREADS (aicpu_allowed_cpus bound)
 #include "tensor_info.h"
@@ -131,51 +132,6 @@ struct TensorPair {
     void *host_ptr;
     void *dev_ptr;
     size_t size;
-};
-
-/**
- * Host API function pointers for device memory operations.
- * Allows runtime to use pluggable device memory backends.
- */
-struct HostApi {
-    void *(*device_malloc)(size_t size);
-    void (*device_free)(void *dev_ptr);
-    int (*copy_to_device)(void *dev_ptr, const void *host_ptr, size_t size);
-    int (*copy_from_device)(void *host_ptr, const void *dev_ptr, size_t size);
-    // Device-side memset (zero-init pure OUTPUT buffers in lieu of an H2D
-    // copy-in). Unused by host_build_graph; present only so the platform
-    // layer can populate the same HostApi shape regardless of runtime variant.
-    int (*device_memset)(void *dev_ptr, int value, size_t size);
-    // PTO2 static-arena hooks. The host_build_graph runtime does not currently
-    // use these — the fields exist only so the platform layer's
-    // pto_runtime_c_api.cpp can populate the same HostApi struct regardless of
-    // which runtime variant it is built against. Unset for this variant; do
-    // not call.
-    int (*setup_static_arena)(size_t gm_heap_size, size_t gm_sm_size, size_t runtime_arena_size);
-    void *(*acquire_pooled_gm_heap)();
-    void *(*acquire_pooled_gm_sm)();
-    void *(*acquire_pooled_runtime_arena)();
-    bool (*lookup_prebuilt_runtime_arena_cache)(
-        uint64_t hash, const void *key_data, size_t key_size, void **gm_heap_base, void **sm_base,
-        void **runtime_arena_base, size_t *runtime_off, const void **image_data, size_t *image_size
-    );
-    void (*mark_prebuilt_runtime_arena_cached)(
-        uint64_t hash, const void *key_data, size_t key_size, void *gm_heap_base, void *sm_base,
-        void *runtime_arena_base, size_t runtime_off, const void *image_data, size_t image_size
-    );
-    // Single-shot upload of the entire ChipCallable buffer. `callable` is a
-    // `const ChipCallable *` (declared void* to avoid pulling task_interface
-    // headers into runtime.h). DeviceRunner walks child_offsets_ to compute
-    // total byte size, allocates device GM once, fixes up each child's
-    // resolved_addr_ in an internal host scratch (onboard: device addr; sim:
-    // dlopen function pointer), H2D's once, and returns the device-side
-    // address of the ChipCallable header. Pool-managed: identical buffer
-    // contents (FNV-1a 64-bit) hit the dedup cache; all chip buffers are
-    // bulk-freed in DeviceRunner::finalize(). Returns 0 on error or when
-    // child_count() == 0. Caller computes child addrs as
-    //     chip_dev + offsetof(ChipCallable, storage_) + child_offset(i)
-    // and stores them via runtime->set_function_bin_addr(fid, child_dev).
-    uint64_t (*upload_chip_callable_buffer)(const void *callable);
 };
 
 /**
@@ -496,12 +452,8 @@ public:
     void clear_registered_kernels() { registered_kernel_count_ = 0; }
 
     // =========================================================================
-    // Host API (host-only, not copied to device)
+    // Host-only state (not copied to device)
     // =========================================================================
-
-    // Host API function pointers for device memory operations
-    // NOTE: Placed at end of class to avoid affecting device memory layout
-    HostApi host_api;
 
     // Per-callable_id dispatch. hbg orch runs on host, so AICPU never reads
     // `active_callable_id_`; the field exists for parity with the shared
@@ -516,7 +468,7 @@ public:
     // runtime_maker.cpp from orch_args at bind time; iterated in
     // validate_runtime_impl. Not read by AICPU/AICore — the device-side
     // Runtime image carries the std::vector control block as harmless
-    // garbage, identical to host_api above. No fixed cap.
+    // garbage. No fixed cap.
     std::vector<TensorPair> tensor_pairs_;
 };
 

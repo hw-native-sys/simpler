@@ -48,6 +48,11 @@ namespace {
 struct OrchestrationRuntimeImpl {
     const OrchestrationRuntimeOps *ops;
     Runtime *runtime;
+    // Platform device-memory hooks. Host orchestration runs through the ops
+    // callbacks below, which need host_api but cannot take it as a parameter
+    // (fixed OrchestrationRuntimeOps ABI) — so it travels here, alongside the
+    // Runtime pointer, filled by bind_callable_to_runtime_impl.
+    const HostApi *host_api;
     struct TensorInfoBuilder *tensor_info_builder;
     struct TensorAllocationBuilder *tensor_allocation_builder;
 };
@@ -92,8 +97,22 @@ struct TensorAllocationBuilder {
     }
 };
 
+// Free every device buffer the orchestration recorded in the allocation
+// builder. Used on bind error paths: once tensor_pairs_ is cleared, the
+// finalize-time cleanup can no longer see these, so they must be freed here
+// or they leak.
+void free_tensor_allocations(const HostApi *api, const TensorAllocationBuilder &builder) {
+    for (const TensorAllocationInfo &allocation : builder.allocations) {
+        api->device_free(reinterpret_cast<void *>(static_cast<uintptr_t>(allocation.base_addr)));
+    }
+}
+
 Runtime *unwrap_runtime(OrchestrationRuntime *runtime) {
     return reinterpret_cast<OrchestrationRuntimeImpl *>(runtime)->runtime;
+}
+
+const HostApi *unwrap_host_api(OrchestrationRuntime *runtime) {
+    return reinterpret_cast<OrchestrationRuntimeImpl *>(runtime)->host_api;
 }
 
 TensorInfoBuilder *unwrap_tensor_info_builder(OrchestrationRuntime *runtime) {
@@ -139,18 +158,18 @@ int runtime_get_task_count(OrchestrationRuntime *runtime) { return unwrap_runtim
 void runtime_print_runtime(OrchestrationRuntime *runtime) { unwrap_runtime(runtime)->print_runtime(); }
 
 void *runtime_device_malloc(OrchestrationRuntime *runtime, size_t size) {
-    void *ptr = unwrap_runtime(runtime)->host_api.device_malloc(size);
+    void *ptr = unwrap_host_api(runtime)->device_malloc(size);
     unwrap_tensor_allocation_builder(runtime)->record_allocation(ptr, size);
     return ptr;
 }
 
 void runtime_device_free(OrchestrationRuntime *runtime, void *ptr) {
     unwrap_tensor_allocation_builder(runtime)->erase_allocation(ptr);
-    unwrap_runtime(runtime)->host_api.device_free(ptr);
+    unwrap_host_api(runtime)->device_free(ptr);
 }
 
 int runtime_copy_to_device(OrchestrationRuntime *runtime, void *dev_ptr, const void *host_ptr, size_t size) {
-    return unwrap_runtime(runtime)->host_api.copy_to_device(dev_ptr, host_ptr, size);
+    return unwrap_host_api(runtime)->copy_to_device(dev_ptr, host_ptr, size);
 }
 
 const OrchestrationRuntimeOps k_orchestration_runtime_ops = {
@@ -198,7 +217,7 @@ bool create_temp_so_file(const uint8_t *data, size_t size, std::string *out_path
     return true;
 }
 
-int upload_tensor_info_storage(Runtime *runtime, const TensorInfoBuilder &builder) {
+int upload_tensor_info_storage(Runtime *runtime, const HostApi *api, const TensorInfoBuilder &builder) {
     runtime->clear_tensor_info_storage();
     for (int task_id = 0; task_id < RUNTIME_MAX_TASKS; task_id++) {
         runtime->set_tensor_info_range(task_id, 0, 0);
@@ -225,16 +244,16 @@ int upload_tensor_info_storage(Runtime *runtime, const TensorInfoBuilder &builde
     }
 
     size_t tensor_info_bytes = compact_tensor_info.size() * sizeof(TensorInfo);
-    void *dev_tensor_info_storage = runtime->host_api.device_malloc(tensor_info_bytes);
+    void *dev_tensor_info_storage = api->device_malloc(tensor_info_bytes);
     if (dev_tensor_info_storage == nullptr) {
         LOG_ERROR("Failed to allocate tensor info storage (%zu bytes)", tensor_info_bytes);
         return -1;
     }
 
-    int rc = runtime->host_api.copy_to_device(dev_tensor_info_storage, compact_tensor_info.data(), tensor_info_bytes);
+    int rc = api->copy_to_device(dev_tensor_info_storage, compact_tensor_info.data(), tensor_info_bytes);
     if (rc != 0) {
         LOG_ERROR("Failed to copy tensor info storage to device: %d", rc);
-        runtime->host_api.device_free(dev_tensor_info_storage);
+        api->device_free(dev_tensor_info_storage);
         return rc;
     }
 
@@ -243,23 +262,23 @@ int upload_tensor_info_storage(Runtime *runtime, const TensorInfoBuilder &builde
     return 0;
 }
 
-int upload_tensor_allocation_storage(Runtime *runtime, const TensorAllocationBuilder &builder) {
+int upload_tensor_allocation_storage(Runtime *runtime, const HostApi *api, const TensorAllocationBuilder &builder) {
     runtime->clear_tensor_allocation_storage();
     if (builder.allocations.empty()) {
         return 0;
     }
 
     size_t allocation_bytes = builder.allocations.size() * sizeof(TensorAllocationInfo);
-    void *dev_allocation_storage = runtime->host_api.device_malloc(allocation_bytes);
+    void *dev_allocation_storage = api->device_malloc(allocation_bytes);
     if (dev_allocation_storage == nullptr) {
         LOG_ERROR("Failed to allocate tensor allocation storage (%zu bytes)", allocation_bytes);
         return -1;
     }
 
-    int rc = runtime->host_api.copy_to_device(dev_allocation_storage, builder.allocations.data(), allocation_bytes);
+    int rc = api->copy_to_device(dev_allocation_storage, builder.allocations.data(), allocation_bytes);
     if (rc != 0) {
         LOG_ERROR("Failed to copy tensor allocation storage to device: %d", rc);
-        runtime->host_api.device_free(dev_allocation_storage);
+        api->device_free(dev_allocation_storage);
         return rc;
     }
 
@@ -358,12 +377,16 @@ int register_callable_impl(const ChipCallable *callable, uint64_t (*upload_fn)(c
  * CallableState for this run's callable_id).
  */
 int bind_callable_to_runtime_impl(
-    Runtime *runtime, const ChipStorageTaskArgs *orch_args, void *host_orch_func_ptr, const ArgDirection *signature,
-    int sig_count, const uint64_t * /*ring_task_window*/, const uint64_t * /*ring_heap*/,
+    Runtime *runtime, const HostApi *api, const ChipStorageTaskArgs *orch_args, void *host_orch_func_ptr,
+    const ArgDirection *signature, int sig_count, const uint64_t * /*ring_task_window*/, const uint64_t * /*ring_heap*/,
     const uint64_t * /*ring_dep_pool*/
 ) {
     if (runtime == nullptr) {
         LOG_ERROR("Runtime pointer is null");
+        return -1;
+    }
+    if (api == nullptr) {
+        LOG_ERROR("HostApi pointer is null");
         return -1;
     }
     if (orch_args == nullptr) {
@@ -387,7 +410,7 @@ int bind_callable_to_runtime_impl(
     TensorInfoBuilder tensor_info_builder;
     TensorAllocationBuilder tensor_allocation_builder;
     OrchestrationRuntimeImpl orchestration_runtime = {
-        &k_orchestration_runtime_ops, runtime, &tensor_info_builder, &tensor_allocation_builder
+        &k_orchestration_runtime_ops, runtime, api, &tensor_info_builder, &tensor_allocation_builder
     };
 
     // hbg orch runs on the host, so it may legitimately need to dereference
@@ -401,24 +424,27 @@ int bind_callable_to_runtime_impl(
     int rc = orch_func(reinterpret_cast<OrchestrationRuntime *>(&orchestration_runtime), *orch_args);
     if (rc != 0) {
         LOG_ERROR("Orchestration function failed with code %d", rc);
+        free_tensor_allocations(api, tensor_allocation_builder);
         runtime->tensor_pairs_.clear();
         return rc;
     }
 
-    rc = upload_tensor_allocation_storage(runtime, tensor_allocation_builder);
+    rc = upload_tensor_allocation_storage(runtime, api, tensor_allocation_builder);
     if (rc != 0) {
         LOG_ERROR("Failed to upload tensor allocations: %d", rc);
+        free_tensor_allocations(api, tensor_allocation_builder);
         runtime->tensor_pairs_.clear();
         return rc;
     }
 
-    rc = upload_tensor_info_storage(runtime, tensor_info_builder);
+    rc = upload_tensor_info_storage(runtime, api, tensor_info_builder);
     if (rc != 0) {
         LOG_ERROR("Failed to upload tensor info storage: %d", rc);
         if (runtime->get_tensor_allocation_storage() != nullptr) {
-            runtime->host_api.device_free(runtime->get_tensor_allocation_storage());
+            api->device_free(runtime->get_tensor_allocation_storage());
             runtime->clear_tensor_allocation_storage();
         }
+        free_tensor_allocations(api, tensor_allocation_builder);
         runtime->tensor_pairs_.clear();
         return rc;
     }
@@ -438,9 +464,13 @@ int bind_callable_to_runtime_impl(
  * @param runtime  Pointer to Runtime
  * @return 0 on success, -1 on failure
  */
-int validate_runtime_impl(Runtime *runtime) {
+int validate_runtime_impl(Runtime *runtime, const HostApi *api) {
     if (runtime == nullptr) {
         LOG_ERROR("Runtime pointer is null");
+        return -1;
+    }
+    if (api == nullptr) {
+        LOG_ERROR("HostApi pointer is null");
         return -1;
     }
 
@@ -454,7 +484,7 @@ int validate_runtime_impl(Runtime *runtime) {
 
     for (int i = 0; i < tensor_pair_count; i++) {
         const TensorPair &pair = tensor_pairs[i];
-        int copy_rc = runtime->host_api.copy_from_device(pair.host_ptr, pair.dev_ptr, pair.size);
+        int copy_rc = api->copy_from_device(pair.host_ptr, pair.dev_ptr, pair.size);
         if (copy_rc != 0) {
             LOG_ERROR("Failed to copy tensor %d from device: %d", i, copy_rc);
             rc = copy_rc;
@@ -469,7 +499,7 @@ int validate_runtime_impl(Runtime *runtime) {
     // Cleanup device tensors
     LOG_INFO_V0("=== Cleaning Up ===");
     for (int i = 0; i < tensor_pair_count; i++) {
-        runtime->host_api.device_free(tensor_pairs[i].dev_ptr);
+        api->device_free(tensor_pairs[i].dev_ptr);
     }
     LOG_INFO_V0("Freed %d device tensors", tensor_pair_count);
 
@@ -488,11 +518,11 @@ int validate_runtime_impl(Runtime *runtime) {
     runtime->clear_registered_kernels();
 
     if (runtime->get_tensor_info_storage() != nullptr) {
-        runtime->host_api.device_free(runtime->get_tensor_info_storage());
+        api->device_free(runtime->get_tensor_info_storage());
         runtime->clear_tensor_info_storage();
     }
     if (runtime->get_tensor_allocation_storage() != nullptr) {
-        runtime->host_api.device_free(runtime->get_tensor_allocation_storage());
+        api->device_free(runtime->get_tensor_allocation_storage());
         runtime->clear_tensor_allocation_storage();
     }
 
