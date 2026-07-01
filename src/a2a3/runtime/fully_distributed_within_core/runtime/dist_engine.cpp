@@ -72,6 +72,36 @@
 #include "tensor.h"
 #include "tensor_create_info.h"
 
+// -----------------------------------------------------------------------------
+// Compile-time gates.
+//
+// PTO2_PROFILING comes from profiling_config.h (default 1; a CCEC build passes
+// -DPTO2_PROFILING=0). It is pulled in transitively via pto_types.h above, which
+// is included before this point — so the gate below sees the real value.
+//
+// DIST_TRACE_ENABLED — swimlane tracing (per-task span capture + JSON dump).
+// Reuses the project's PTO2_PROFILING macro: sim builds pass PTO2_PROFILING=1, so
+// tracing is on there; an AICore/CCEC build that does not pass the macro gets
+// `#if (PTO2_PROFILING + 0)` == `#if 0`, so all tracing code (and its host-only
+// std::vector / std::chrono / clock_gettime / fprintf usage) is compiled out.
+// No #ifndef fallback on purpose: undefined ⇒ off.
+#define DIST_TRACE_ENABLED (PTO2_PROFILING + 0)
+
+// DIST_SIM_HOST_CLOCK — sim-only host facilities (steady_clock now_ns() and the
+// use_example_exec_time busy-wait kernel emulation). Unavailable under CCEC.
+#if defined(__CCE_AICORE__) || defined(__DAV_C220__) || defined(__CCE_KT_TEST__)
+#define DIST_SIM_HOST_CLOCK 0
+#else
+#define DIST_SIM_HOST_CLOCK 1
+#endif
+
+// Tracing needs the host wall clock (now_ns lives under DIST_SIM_HOST_CLOCK), so
+// the two gates cannot diverge into "trace on, host clock off". In practice both
+// are off together on a CCEC build; assert it so a stray -D combination fails loud.
+#if DIST_TRACE_ENABLED && !DIST_SIM_HOST_CLOCK
+#error "DIST_TRACE_ENABLED requires DIST_SIM_HOST_CLOCK (swimlane uses the host clock)"
+#endif
+
 namespace {
 
 // -----------------------------------------------------------------------------
@@ -297,13 +327,16 @@ struct DistTensorMap {
 // not just kernel execution but also the work between kernels (alloc, claim/
 // build, deposit drains). Laid out in the Chrome trace by physical block (pid)
 // and lane (tid).
+#if DIST_TRACE_ENABLED
 enum class TracePhase : int32_t {
     Kernel = 0,    // incore kernel execution (or busy-wait replay)
     Alloc = 1,     // dist_alloc_tensors body (materialize + reclaim back-pressure)
-    Build = 2,     // claim WON + build_ring_slot (this core owns/builds the task)
+    Build = 2,     // winner-only: fan-in resolution + built[] assembly (up to back-pressure)
     DrainWon = 3,  // drain_block_won pulled+built a follower deposit
     Replay = 4,    // submit replayed but claim LOST (per-core map/heap bookkeeping only)
     RingBp = 5,    // winner spun on ring/heap back-pressure (waiting for a free slot / reclaim)
+    EfDrain = 6,   // execute-first drain at submit entry (deposits + ready owned tasks)
+    Commit = 7,    // winner-only: alloc ring/won slot + build_ring_slot (publish the task)
 };
 
 struct TraceEvent {
@@ -312,14 +345,17 @@ struct TraceEvent {
     int32_t lane;     // AIC=0 / AIV0=1 / AIV1=2
     uint8_t multicore;
     TracePhase phase;
-    double ts_us;   // start, microseconds from g_trace_epoch (wall clock)
-    double dur_us;  // span duration, microseconds (wall clock)
+    // Raw nanosecond timestamps — NO unit conversion on the hot path. The dump
+    // stage divides by 1000 to emit microseconds (the swimlane unit).
+    uint64_t ts_ns;   // start, ns from g_trace_epoch (wall clock)
+    uint64_t dur_ns;  // span duration, ns (wall clock)
     // CPU time this thread actually accrued during the span (CLOCK_THREAD_CPUTIME_ID).
-    // On an oversubscribed host wall dur_us inflates while the thread is descheduled;
-    // cpu_us does not, so a large dur_us with small cpu_us == "swapped out, not work".
-    // Only meaningful for non-kernel overhead spans (kernel spans set it to dur_us).
-    double cpu_us;
+    // On an oversubscribed host dur_ns inflates while the thread is descheduled;
+    // cpu_ns does not, so a large dur_ns with small cpu_ns == "swapped out, not work".
+    // Only meaningful for non-kernel overhead spans (kernel spans set it to dur_ns).
+    uint64_t cpu_ns;
 };
+#endif  // DIST_TRACE_ENABLED
 
 struct RingSlot {
     bool occupied;
@@ -398,11 +434,18 @@ struct BlockWon {
 
 enum LaneId : int32_t { LANE_AIC = 0, LANE_AIV0 = 1, LANE_AIV1 = 2, LANE_NONE = -1 };
 
-// Per-core trace-vector reserve count, set once at register time: 0 when swimlane
-// tracing is off (DistCore::reset then never reserves, so a normal run pays
-// nothing), else a generous upper bound on spans/core so push_back never
-// reallocs mid-run (stable heap layout). Defined here so DistCore::reset sees it.
+#if DIST_TRACE_ENABLED
+// Swimlane tracing globals. Defined here (before DistCore) so DistCore::reset can
+// see g_trace_reserve; g_trace_on / g_trace_epoch_ns sit alongside for one place.
+//   g_trace_on      — set from PTO_DIST_SWIMLANE at register time; gates capture.
+//   g_trace_epoch_ns — run-start epoch so every core's span ts is relative to it.
+//   g_trace_reserve — per-core span reserve: 0 when off (reset never reserves, so
+//     a normal run pays nothing), else a generous upper bound on spans/core so
+//     push_back never reallocs mid-run (stable heap layout).
+bool g_trace_on = false;
+uint64_t g_trace_epoch_ns = 0;
 int32_t g_trace_reserve = 0;
+#endif
 
 struct CoreLayout {
     int32_t block_id;  // physical block index
@@ -430,9 +473,18 @@ struct DistCore {
     Tensor outpool[kOutPoolSlots];
     int32_t outpool_head;
 
+#if DIST_TRACE_ENABLED
     // Per-core swimlane events (only populated when tracing is on). Owned solely
     // by this core's worker thread, so push_back is lock-free.
     std::vector<TraceEvent> trace;
+
+    // Running-cursor timestamps for lap-style tracing (see trace_lap). Each span is
+    // [trace_last_ns, now); after recording, the cursor advances to now, so the next
+    // span abuts this one with zero gap — the whole submit flow (incl. the orch
+    // round-trip between two submits) is covered by exactly one span each, no code
+    // path left un-timed. Reset at replay entry; wall + this-thread CPU clocks.
+    uint64_t trace_last_ns;
+    uint64_t trace_last_cpu;
 
     // Per-core static dependency edges (tracing only): one per fan-in resolved at
     // build time — {consumer_task, producer_task}. Dumped as Chrome-trace flow
@@ -454,6 +506,7 @@ struct DistCore {
     // the release event that ends the wait. Chains with dep_edges: ringbp -> its
     // ring occupant (slot edge) -> that occupant's data producers (dep edges).
     std::vector<DepEdge> slot_edges;
+#endif  // DIST_TRACE_ENABLED
 
     void reset(CoreType r, int32_t block, int32_t lane_id) {
         role = r;
@@ -466,6 +519,13 @@ struct DistCore {
         occupied_count = 0;
         owned_total = 0;
         outpool_head = 0;
+        for (int32_t i = 0; i < kPrivateSlots; i++) {
+            slots[i].occupied = false;
+            slots[i].built = false;
+        }
+#if DIST_TRACE_ENABLED
+        trace_last_ns = 0;
+        trace_last_cpu = 0;
         trace.clear();
         // Pre-size the trace vector only when tracing is on (see g_trace_on),
         // so push_back never reallocs mid-run (a realloc would perturb the heap
@@ -476,10 +536,7 @@ struct DistCore {
         if (g_trace_reserve > 0) dep_edges.reserve(g_trace_reserve);
         slot_edges.clear();
         if (g_trace_reserve > 0) slot_edges.reserve(g_trace_reserve);
-        for (int32_t i = 0; i < kPrivateSlots; i++) {
-            slots[i].occupied = false;
-            slots[i].built = false;
-        }
+#endif  // DIST_TRACE_ENABLED
     }
 };
 
@@ -561,11 +618,7 @@ struct DistGlobal {
 DistGlobal g_dist;
 thread_local DistCore *g_self = nullptr;
 
-// Swimlane tracing (set PTO_DIST_SWIMLANE=<path> to enable). When off, the
-// per-task timing capture is skipped entirely so a normal run pays nothing.
-bool g_trace_on = false;
-uint64_t g_trace_epoch_ns = 0;
-
+#if DIST_SIM_HOST_CLOCK
 // Orchestration/scheduling overhead isolation (set PTO_DIST_SKIP_EXEC=1). When
 // on, execute_slot skips the actual incore kernel call — every (sub)task is
 // treated as 0-cost and "completes" instantly — while ALL ownership/completion
@@ -581,9 +634,12 @@ inline uint64_t now_ns() {
             .count()
     );
 }
+#endif  // DIST_SIM_HOST_CLOCK
 
-// Per-thread CPU time (excludes time the thread spends descheduled). Used to
-// tell genuine work from host-oversubscription stalls in the swimlane.
+#if DIST_TRACE_ENABLED
+// Per-thread CPU time (excludes time the thread spends descheduled). Used only by
+// the swimlane to tell genuine work from host-oversubscription stalls, so it lives
+// under DIST_TRACE_ENABLED (not the sim-clock gate — busy-wait never needs it).
 inline uint64_t thread_cpu_ns() {
     struct timespec ts;
     clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts);
@@ -595,22 +651,62 @@ inline uint64_t thread_cpu_ns() {
 inline uint64_t trace_now() { return g_trace_on ? now_ns() : 0; }
 inline uint64_t trace_now_cpu() { return g_trace_on ? thread_cpu_ns() : 0; }
 
-// Record a non-kernel overhead span [t0_ns, now) on this core's lane (alloc /
-// claim+build / deposit drain). dur_us is wall clock; cpu_us is this thread's
-// CPU time over the span (small cpu with large dur == descheduled, not work).
-// No-op unless tracing is on. Kernel spans are pushed inline in execute_slot.
-inline void
-trace_overhead(DistCore *self, int32_t task_id, int32_t func_id, TracePhase phase, uint64_t t0_ns, uint64_t t0_cpu) {
+// Record a non-kernel overhead span [t0_ns, now) on this core's lane. Stores RAW
+// nanoseconds (no unit conversion on the hot path — the dump stage divides by
+// 1000). cpu_ns is this thread's CPU time over the span (small cpu with large dur
+// == descheduled, not work). No-op unless tracing is on.
+inline void trace_overhead_impl(
+    DistCore *self, int32_t task_id, int32_t func_id, TracePhase phase, uint64_t t0_ns, uint64_t t0_cpu
+) {
     if (!g_trace_on) return;
     const uint64_t t1 = now_ns();
     const uint64_t c1 = thread_cpu_ns();
     self->trace.push_back(
         TraceEvent{
-            task_id, func_id, self->lane, /*multicore=*/0, phase, (t0_ns - g_trace_epoch_ns) / 1000.0,
-            (t1 - t0_ns) / 1000.0, (c1 - t0_cpu) / 1000.0
+            task_id, func_id, self->lane, /*multicore=*/0, phase, t0_ns - g_trace_epoch_ns, t1 - t0_ns, c1 - t0_cpu
         }
     );
 }
+
+// Reset the lap cursor to "now" — call once at replay entry so the first lap span
+// measures from a well-defined origin (not from an uninitialized cursor).
+inline void trace_lap_reset_impl(DistCore *self) {
+    if (!g_trace_on) return;
+    self->trace_last_ns = now_ns();
+    self->trace_last_cpu = thread_cpu_ns();
+}
+
+// Lap-style span: record [trace_last_ns, now) then advance the cursor to now, so
+// the next lap continues seamlessly from here (same idiom as pto_orchestrator's
+// CYCLE_COUNT_LAP: acc += t1 - t0; t0 = t1). Every code path between two laps is
+// attributed to exactly one span — no gaps, no double-counting. Stores raw ns.
+inline void trace_lap_impl(DistCore *self, int32_t task_id, int32_t func_id, TracePhase phase) {
+    if (!g_trace_on) return;
+    const uint64_t t1 = now_ns();
+    const uint64_t c1 = thread_cpu_ns();
+    self->trace.push_back(
+        TraceEvent{
+            task_id, func_id, self->lane, /*multicore=*/0, phase, self->trace_last_ns - g_trace_epoch_ns,
+            t1 - self->trace_last_ns, c1 - self->trace_last_cpu
+        }
+    );
+    self->trace_last_ns = t1;
+    self->trace_last_cpu = c1;
+}
+
+// Trace call-site macros forward to the _impl inlines above; the #else branch below
+// expands them to nothing — so call sites need no #if, and the phase enum /
+// TraceEvent need not even exist when off (the preprocessor eats the whole argument
+// list, TracePhase::X included). Same idiom as pto_orchestrator's CYCLE_COUNT_LAP.
+#define TRACE_LAP(self, task_id, func_id, phase) trace_lap_impl((self), (task_id), (func_id), (phase))
+#define TRACE_LAP_RESET(self) trace_lap_reset_impl((self))
+#define TRACE_OVERHEAD(self, task_id, func_id, phase, t0_ns, t0_cpu) \
+    trace_overhead_impl((self), (task_id), (func_id), (phase), (t0_ns), (t0_cpu))
+#else  // !DIST_TRACE_ENABLED — tracing compiled out; call sites become no-ops.
+#define TRACE_LAP(self, task_id, func_id, phase) ((void)0)
+#define TRACE_LAP_RESET(self) ((void)0)
+#define TRACE_OVERHEAD(self, task_id, func_id, phase, t0_ns, t0_cpu) ((void)0)
+#endif  // DIST_TRACE_ENABLED
 
 // Opt-in per-core tracing (set PTO_DIST_TRACE=1). Off by default so a passing
 // run is quiet; fatal/error/heap-exhaustion diagnostics are always emitted.
@@ -699,8 +795,9 @@ uint64_t resolve_kernel_addr(Runtime *runtime, int32_t kernel_id) {
 // Execute one owned task, then publish its completion flag (release). In sim all
 // cores share the address space, so the release/acquire pair is the visibility
 // barrier between the kernel's output writes and a consumer's input reads.
-void execute_slot(DistCore *self, RingSlot &s) {
+void execute_slot([[maybe_unused]] DistCore *self, RingSlot &s) {
     typedef void (*KernelFn)(int64_t *);
+#if DIST_SIM_HOST_CLOCK
     // Sim-only trace-driven replay (CallConfig::use_example_exec_time): when the
     // host filled example_exec_time_ns_[func_id] > 0 for this func, "execute" it
     // by busy-waiting that many nanoseconds instead of calling the real kernel,
@@ -717,34 +814,44 @@ void execute_slot(DistCore *self, RingSlot &s) {
         const uint64_t target = t0 + static_cast<uint64_t>(sim_ns);
         while (now_ns() < target) { /* spin: emulate kernel busy time */
         }
+#if DIST_TRACE_ENABLED
         if (g_trace_on) {
-            // TraceEvent timestamps/durations are microseconds (swimlane unit).
             self->trace.push_back(
                 TraceEvent{
                     s.task_id, s.func_id, self->lane, static_cast<uint8_t>(s.is_multicore ? 1 : 0), TracePhase::Kernel,
-                    (t0 - g_trace_epoch_ns) / 1000.0, sim_ns / 1000.0, sim_ns / 1000.0
+                    t0 - g_trace_epoch_ns, static_cast<uint64_t>(sim_ns), static_cast<uint64_t>(sim_ns)
                 }
             );
         }
+#endif
     } else if (s.function_bin_addr != 0 && !g_skip_exec) {
         // PTO_DIST_SKIP_EXEC: treat the incore task as 0-cost — skip the kernel call
         // but keep every flag/frontier/slot update below so termination is identical.
+        KernelFn fn = reinterpret_cast<KernelFn>(s.function_bin_addr);
+#if DIST_TRACE_ENABLED
         if (g_trace_on) {
             const uint64_t t0 = now_ns();
-            KernelFn fn = reinterpret_cast<KernelFn>(s.function_bin_addr);
             fn(reinterpret_cast<int64_t *>(s.args));
             const uint64_t t1 = now_ns();
             self->trace.push_back(
                 TraceEvent{
                     s.task_id, s.func_id, self->lane, static_cast<uint8_t>(s.is_multicore ? 1 : 0), TracePhase::Kernel,
-                    (t0 - g_trace_epoch_ns) / 1000.0, (t1 - t0) / 1000.0, (t1 - t0) / 1000.0
+                    t0 - g_trace_epoch_ns, t1 - t0, t1 - t0
                 }
             );
         } else {
-            KernelFn fn = reinterpret_cast<KernelFn>(s.function_bin_addr);
             fn(reinterpret_cast<int64_t *>(s.args));
         }
+#else
+        fn(reinterpret_cast<int64_t *>(s.args));
+#endif
     }
+#else   // !DIST_SIM_HOST_CLOCK — AICore/CCEC: no host clock, no busy-wait emulation.
+    if (s.function_bin_addr != 0) {
+        KernelFn fn = reinterpret_cast<KernelFn>(s.function_bin_addr);
+        fn(reinterpret_cast<int64_t *>(s.args));
+    }
+#endif  // DIST_SIM_HOST_CLOCK
     if (s.is_multicore) {
         // Joint ownership: the co-owner that drives remaining to zero (the last
         // subtask to finish) publishes the single global completion flag (§3.1),
@@ -908,19 +1015,23 @@ void drain_block_won(DistCore *self) {
             return;
         }
         const BuiltSubtask &b = w.lane[self->lane];
+#if DIST_TRACE_ENABLED
         const uint64_t t_won0 = trace_now();
         const uint64_t t_won0_cpu = trace_now_cpu();
+#endif
         build_ring_slot(
             self->slots[si], w.task_id, b.func_id, b.function_bin_addr, b.tensors, b.tensor_count, b.scalars,
             b.scalar_count, b.fanin, b.fanin_count, b.sub_block_id, /*is_multicore=*/true, self->block_id, i
         );
         self->occupied_count++;
         self->owned_total++;
+#if DIST_TRACE_ENABLED
         if (g_trace_on) {
             for (int32_t k = 0; k < b.fanin_count; k++)
                 self->dep_edges.push_back({w.task_id, b.fanin[k]});
         }
-        trace_overhead(self, w.task_id, b.func_id, TracePhase::DrainWon, t_won0, t_won0_cpu);
+        trace_overhead_impl(self, w.task_id, b.func_id, TracePhase::DrainWon, t_won0, t_won0_cpu);
+#endif
     }
 }
 
@@ -945,18 +1056,20 @@ TaskOutputTensors dist_submit_impl(PTO2Runtime *, const MixedKernels &mixed, con
     // cursor and claim subsequent ones. The deterministic replay below (id bump,
     // heap bump, map maintenance) is unaffected — draining only runs/flags tasks
     // this core already owns. Every core does this on every submit point.
+    //
+    // Reset the lap cursor at entry so the runtime's spans never absorb the orch
+    // round-trip between two submits — that time is USER orchestration code, not
+    // runtime work, and would bias EfDrain if counted here. It is left un-timed on
+    // purpose (a deliberate gap between submits, not a runtime span).
+    TRACE_LAP_RESET(self);
     if (!fatal_set()) {
         drain_block_won(self);
         drain_phase_b(self);
     }
+    // Lap: the execute-first drain itself (deposits + ready owned kernels it ran).
+    // Kernels show separately on the kernel sub-lane; this is the drain's own scan.
+    TRACE_LAP(self, self->local_index, -1, TracePhase::EfDrain);
 
-    // Swimlane: time the per-task replay (map/heap bookkeeping + claim) and the
-    // winner-only build that follow — the "between kernels" work this op adds to
-    // this core's lane. The kernel span itself is recorded inside execute_slot,
-    // which the drain above (and later drains) may have just run; that is why the
-    // start is taken *after* the execute-first drain, not at function entry.
-    const uint64_t t_submit0 = trace_now();
-    const uint64_t t_submit0_cpu = trace_now_cpu();
     const int32_t N = self->local_index++;
     const ActiveMask M = mixed.to_active_mask();
     const int32_t tc = args.tensor_count();
@@ -1093,7 +1206,7 @@ TaskOutputTensors dist_submit_impl(PTO2Runtime *, const MixedKernels &mixed, con
     }
 
     if (!is_winner) {
-        trace_overhead(self, N, -1, TracePhase::Replay, t_submit0, t_submit0_cpu);
+        TRACE_LAP(self, N, -1, TracePhase::Replay);
         return result;  // wrong type or lost the race: map updated, nothing to build
     }
 
@@ -1124,15 +1237,14 @@ TaskOutputTensors dist_submit_impl(PTO2Runtime *, const MixedKernels &mixed, con
     // close the Build span now and time the spins separately as RingBp. Without
     // this split the spin time was misattributed to "build" (it dominated build
     // under a small ring / few blocks — it is dependency/slot wait, not cost).
-    trace_overhead(self, N, -1, TracePhase::Build, t_submit0, t_submit0_cpu);
-    const uint64_t t_bp0 = trace_now();
-    const uint64_t t_bp0_cpu = trace_now_cpu();
+    TRACE_LAP(self, N, -1, TracePhase::Build);
 
     // Back-pressure for self-claimed work: wait until the ring has a non-reserved
     // slot free, draining block.won deposits + ready tasks meanwhile. The reserve
     // guarantees a follower can still pull its (ready) deposits when the rest of
     // the ring is full of not-yet-ready consumers (no priority inversion).
     uint64_t wd_self = 0;
+#if DIST_TRACE_ENABLED
     // Swimlane (slot-release edges): if we are about to actually wait, snapshot the
     // tasks currently occupying our ring — those are what must execute to free a
     // slot, i.e. what this ringbp truly waits on. The ring only shrinks during the
@@ -1143,6 +1255,7 @@ TaskOutputTensors dist_submit_impl(PTO2Runtime *, const MixedKernels &mixed, con
             if (rs.occupied && rs.built) self->slot_edges.push_back({N, rs.task_id});
         }
     }
+#endif
     while (self->occupied_count >= kPrivateSlots - kWonReserve && !fatal_set()) {
         drain_block_won(self);
         if (drain_phase_b(self) == 0) {
@@ -1186,7 +1299,7 @@ TaskOutputTensors dist_submit_impl(PTO2Runtime *, const MixedKernels &mixed, con
     }
     // Time spent in the two back-pressure spins above (ring-slot wait + heap
     // reclaim wait) — dependency/slot WAITING, kept separate from Build.
-    trace_overhead(self, N, -1, TracePhase::RingBp, t_bp0, t_bp0_cpu);
+    TRACE_LAP(self, N, -1, TracePhase::RingBp);
 
     int32_t si = alloc_ring_slot(self);
     if (si < 0) {  // should not happen given the back-pressure gate above
@@ -1266,10 +1379,13 @@ TaskOutputTensors dist_submit_impl(PTO2Runtime *, const MixedKernels &mixed, con
     self->occupied_count++;
     self->owned_total++;
 
+#if DIST_TRACE_ENABLED
     if (g_trace_on) {
         for (int32_t k = 0; k < fc; k++)
             self->dep_edges.push_back({N, fanin[k]});
     }
+#endif
+    TRACE_LAP(self, N, -1, TracePhase::Commit);
     return result;
 }
 
@@ -1359,12 +1475,12 @@ TaskOutputTensors dist_alloc_tensors(PTO2Runtime *, const L0TaskArgs &args) {
     if (self == nullptr) return TaskOutputTensors{};
     // EXECUTE-FIRST (docs §6 step 0+1, §6.1): every submit point first seeks an
     // execution opportunity before advancing the deterministic replay below.
+    TRACE_LAP_RESET(self);  // exclude the inter-submit orch round-trip (user code) from runtime spans
     if (!fatal_set()) {
         drain_block_won(self);
         drain_phase_b(self);
     }
-    const uint64_t t_alloc0 = trace_now();  // swimlane: time this alloc's replay+pace
-    const uint64_t t_alloc0_cpu = trace_now_cpu();
+    TRACE_LAP(self, self->local_index, -1, TracePhase::EfDrain);
     const int32_t N = self->local_index++;
     const int32_t tc = args.tensor_count();
     if (N >= kFlagCap) {
@@ -1437,7 +1553,7 @@ TaskOutputTensors dist_alloc_tensors(PTO2Runtime *, const L0TaskArgs &args) {
     // unchanged; this only drops the lagging cores' redundant pass).
     bool is_winner = claim(g_dist.alloc_cursor[N % kCursorShards].v, N);
     if (!is_winner) {
-        trace_overhead(self, N, -1, TracePhase::Replay, t_alloc0, t_alloc0_cpu);
+        TRACE_LAP(self, N, -1, TracePhase::Replay);
         return result;
     }
 
@@ -1470,7 +1586,7 @@ TaskOutputTensors dist_alloc_tensors(PTO2Runtime *, const L0TaskArgs &args) {
     // (e) Winner completes inline (no kernel runs).
     g_dist.flags[N & (kFlagCap - 1)].store(1, std::memory_order_release);
     advance_frontier();
-    trace_overhead(self, N, -1, TracePhase::Alloc, t_alloc0, t_alloc0_cpu);
+    TRACE_LAP(self, N, -1, TracePhase::Alloc);
     return result;
 }
 
@@ -1576,6 +1692,7 @@ void dist_core_main(void *runtime_v, int core_idx, int core_type_int) {
     // Replay the full orchestration submit stream: build the per-core map and
     // claim/build owned tasks into the private ring (back-pressure inline). MIX
     // anchors deposit follower subtasks into block.won during this replay.
+    TRACE_LAP_RESET(self);  // origin for the first lap span (post-barrier, pre-replay)
     if (g_dist.orch_func != nullptr && g_dist.orch_args != nullptr && !fatal_set()) {
         g_dist.orch_func(*g_dist.orch_args);
     }
@@ -1652,6 +1769,7 @@ void *dist_engine_register(
     // cleanup retires a task once it leaves the H span, so H must stay below the
     // window (with margin) or a slot could be reused before its task is cleaned.
     always_assert(g_dist.H < kTaskWindow - 1);
+#if DIST_TRACE_ENABLED
     // Swimlane tracing gate. Capture the epoch now so every core's event ts is
     // relative to the same run start.
     g_trace_on = (getenv("PTO_DIST_SWIMLANE") != nullptr);
@@ -1661,8 +1779,11 @@ void *dist_engine_register(
     // sizes we actually analyze (a realloc would perturb heap layout + add timing
     // noise to the very gaps we measure). Best-effort: a huge trace may still grow.
     g_trace_reserve = g_trace_on ? (1 << 16) : 0;
+#endif
+#if DIST_SIM_HOST_CLOCK
     // Overhead-isolation gate (skip incore kernel calls, keep all bookkeeping).
     g_skip_exec = (getenv("PTO_DIST_SKIP_EXEC") != nullptr);
+#endif
 
     for (int32_t s = 0; s < kCursorShards; s++) {
         g_dist.cube_cursor[s].v.store(-1, std::memory_order_relaxed);
@@ -1729,6 +1850,7 @@ void *dist_engine_register(
     return reinterpret_cast<void *>(&dist_core_main);
 }
 
+#if DIST_TRACE_ENABLED
 void dist_engine_dump_trace() {
     if (!g_trace_on) return;
     const char *path = getenv("PTO_DIST_SWIMLANE");
@@ -1821,6 +1943,10 @@ void dist_engine_dump_trace() {
             return "replay";
         case TracePhase::RingBp:
             return "ringbp";
+        case TracePhase::EfDrain:
+            return "efdrain";
+        case TracePhase::Commit:
+            return "commit";
         default:
             return "?";
         }
@@ -1847,7 +1973,7 @@ void dist_engine_dump_trace() {
         for (const TraceEvent &e : co.trace) {
             if (e.phase != TracePhase::Kernel || e.task_id < 0 || e.task_id >= kFlagCap) continue;
             kloc[static_cast<size_t>(e.task_id)] =
-                SpanLoc{co.block_id + kCpuPid, co.lane + kCpuKernelLane, e.ts_us, e.cpu_us};
+                SpanLoc{co.block_id + kCpuPid, co.lane + kCpuKernelLane, e.ts_ns / 1000.0, e.cpu_ns / 1000.0};
         }
     }
     // Index: task_id -> its ringbp span in the CPU group (the arrow head for a
@@ -1858,7 +1984,8 @@ void dist_engine_dump_trace() {
         if (co.block_id < 0 || co.lane < 0) continue;
         for (const TraceEvent &e : co.trace) {
             if (e.phase != TracePhase::RingBp || e.task_id < 0 || e.task_id >= kFlagCap) continue;
-            rbloc[static_cast<size_t>(e.task_id)] = SpanLoc{co.block_id + kCpuPid, co.lane, e.ts_us, e.cpu_us};
+            rbloc[static_cast<size_t>(e.task_id)] =
+                SpanLoc{co.block_id + kCpuPid, co.lane, e.ts_ns / 1000.0, e.cpu_ns / 1000.0};
         }
     }
 
@@ -1879,18 +2006,23 @@ void dist_engine_dump_trace() {
             }
             if (!first) fprintf(f, ",\n");
             first = false;
+            // Convert raw ns -> us (swimlane unit) here, at dump time — never on the
+            // hot path (see TraceEvent).
+            const double ts_us = e.ts_ns / 1000.0;
+            const double dur_us = e.dur_ns / 1000.0;
+            const double cpu_us = e.cpu_ns / 1000.0;
             fprintf(
                 f,
                 "    {\"ph\":\"X\",\"name\":\"%s\",\"pid\":%d,\"tid\":%d,\"ts\":%.3f,\"dur\":%.3f,"
                 "\"args\":{\"phase\":\"%s\",\"task_id\":%d,\"func_id\":%d,\"core\":%d,\"mc\":%d,\"cpu_us\":%.3f}}",
-                name, co.block_id, co.lane, e.ts_us, e.dur_us, ph, e.task_id, e.func_id, c, e.multicore, e.cpu_us
+                name, co.block_id, co.lane, ts_us, dur_us, ph, e.task_id, e.func_id, c, e.multicore, cpu_us
             );
             fprintf(
                 f,
                 ",\n    {\"ph\":\"X\",\"name\":\"%s\",\"pid\":%d,\"tid\":%d,\"ts\":%.3f,\"dur\":%.3f,"
                 "\"args\":{\"phase\":\"%s\",\"task_id\":%d,\"func_id\":%d,\"wall_us\":%.3f}}",
-                name, co.block_id + kCpuPid, e.phase == TracePhase::Kernel ? co.lane + kCpuKernelLane : co.lane,
-                e.ts_us, e.cpu_us, ph, e.task_id, e.func_id, e.dur_us
+                name, co.block_id + kCpuPid, e.phase == TracePhase::Kernel ? co.lane + kCpuKernelLane : co.lane, ts_us,
+                cpu_us, ph, e.task_id, e.func_id, dur_us
             );
         }
     }
@@ -1959,3 +2091,7 @@ void dist_engine_dump_trace() {
     fclose(f);
     fprintf(stderr, "[dist_engine] swimlane trace written to %s\n", path);
 }
+#else   // !DIST_TRACE_ENABLED
+// Tracing compiled out: keep the public symbol so aicpu_executor.cpp still links.
+void dist_engine_dump_trace() {}
+#endif  // DIST_TRACE_ENABLED
