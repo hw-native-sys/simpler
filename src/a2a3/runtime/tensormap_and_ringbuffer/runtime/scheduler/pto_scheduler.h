@@ -846,6 +846,28 @@ struct PTO2SchedulerState {
         }
     }
 
+    uint64_t publish_ready_no_fanin(PTO2TaskSlotState *slot_state) {
+        slot_state->fanin_count = 1;
+        slot_state->fanin_refcount.store(1, std::memory_order_release);
+        slot_state->dep_pool_mark = 0;
+
+        uint64_t spin_count = 0;
+        PTO2ResourceShape shape = slot_state->active_mask.to_shape();
+        if (shape == PTO2ResourceShape::DUMMY) {
+            while (!dummy_ready_queue.push(slot_state)) {
+                spin_count++;
+                SPIN_WAIT_HINT();
+            }
+        } else {
+            auto &ready_queue = ready_queues[static_cast<int32_t>(shape)];
+            while (!ready_queue.push(slot_state)) {
+                spin_count++;
+                SPIN_WAIT_HINT();
+            }
+        }
+        return spin_count;
+    }
+
     /**
      * Wire fanout edges for a single task. Sets fanin_count, acquires each
      * producer's fanout_lock, allocates dep_pool entries for live producers,

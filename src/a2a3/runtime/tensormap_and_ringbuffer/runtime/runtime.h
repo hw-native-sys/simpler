@@ -43,6 +43,7 @@
 #include "common/l2_swimlane_profiling.h"
 #include "common/platform_config.h"
 #include "aicpu/platform_aicpu_affinity.h"  // MAX_GATE_THREADS (aicpu_allowed_cpus bound)
+#include "pipeline_strategy.h"
 #include "pto2_dispatch_payload.h"
 #include "task_args.h"
 
@@ -162,6 +163,8 @@ struct alignas(64) DeviceRuntimeLaunchDesc {
     // aicpu_thread_num-1 scheduler threads that dispatch tasks to AICore.
     int aicpu_thread_num;
     int ready_queue_shards;  // Number of ready queue shards (1..MAX_AICPU_THREADS, default MAX-1)
+    int pipeline_strategy;   // -1 = unset baseline, 2 = strategy2 layout
+    bool pipeline_defer_submit_disabled;
 
     // Filter-style affinity gate input (a2a3 onboard). Host fills these
     // before launch from AICPU OCCUPY, and the device gate keeps threads whose
@@ -243,6 +246,12 @@ public:
     void set_worker_count(int n) { dev.worker_count = n; }
     int get_aicpu_thread_num() const { return dev.aicpu_thread_num; }
     void set_aicpu_thread_num(int n) { dev.aicpu_thread_num = n; }
+    int get_pipeline_strategy() const { return dev.pipeline_strategy; }
+    void set_pipeline_strategy(int strategy) {
+        dev.pipeline_strategy = resolve_pipeline_strategy_with_env(strategy);
+        dev.pipeline_defer_submit_disabled = resolve_pipeline_defer_submit_disabled_with_env();
+    }
+    bool pipeline_defer_submit_disabled() const { return dev.pipeline_defer_submit_disabled; }
     Handshake *get_workers() { return dev.workers; }
     int32_t get_aicpu_allowed_cpu_count() const { return dev.aicpu_allowed_cpu_count; }
     void set_aicpu_allowed_cpu_count(int32_t n) { dev.aicpu_allowed_cpu_count = n; }

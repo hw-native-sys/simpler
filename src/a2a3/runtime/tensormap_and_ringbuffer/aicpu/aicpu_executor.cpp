@@ -55,6 +55,7 @@
 
 // CoreCallable for resolved dispatch address
 #include "callable.h"
+#include "pipeline_strategy.h"
 
 // Scheduler data structures (CoreExecState, CoreTracker, etc.)
 #include "scheduler/scheduler_types.h"
@@ -115,6 +116,11 @@ struct OrchSoEntry {
 
 struct AicpuExecutor {
     int32_t sched_thread_num_;
+    int32_t orch_thread_num_;
+    int32_t primary_orch_thread_idx_;
+    PipelineLayout pipeline_layout_{};
+    int32_t scheduler_index_by_thread_[MAX_AICPU_THREADS];
+    int32_t orchestrator_stage_by_thread_[MAX_AICPU_THREADS];
     bool serial_orch_sched_{false};
 
     // ===== Thread management state =====
@@ -160,6 +166,10 @@ struct AicpuExecutor {
     );
     int32_t run(Runtime *runtime);
     void deinit(Runtime *runtime);
+    void resolve_thread_layout(Runtime *runtime);
+    int32_t scheduler_idx_for_thread(int32_t thread_idx) const;
+    int32_t orch_stage_idx_for_thread(int32_t thread_idx) const;
+    int32_t scheduler_context_idx_for_thread(int32_t thread_idx) const;
 
     ~AicpuExecutor() {
         // Process-wide teardown (the single static instance dies here). Every
@@ -186,6 +196,95 @@ static_assert(
 
 // ===== AicpuExecutor Method Implementations =====
 
+void AicpuExecutor::resolve_thread_layout(Runtime *runtime) {
+    aicpu_thread_num_ = runtime->dev.aicpu_thread_num;
+    if (aicpu_thread_num_ == 0) aicpu_thread_num_ = 1;
+
+    for (int32_t i = 0; i < MAX_AICPU_THREADS; ++i) {
+        scheduler_index_by_thread_[i] = -1;
+        orchestrator_stage_by_thread_[i] = -1;
+    }
+
+    const int32_t raw_strategy = runtime->dev.pipeline_strategy;
+    bool use_baseline = raw_strategy < 0;
+
+    if (!use_baseline) {
+        if (raw_strategy != static_cast<int32_t>(PipelineStrategy::S2_O2_SPLIT_CTRL_STRATEGY2)) {
+            LOG_WARN("Pipeline strategy %d is not enabled; falling back to baseline layout", raw_strategy);
+            use_baseline = true;
+        } else {
+            pipeline_layout_ = resolve_pipeline_layout(raw_strategy);
+            int32_t requested_total = pipeline_layout_.scheduler_threads + pipeline_layout_.orchestrator_threads;
+            if (aicpu_thread_num_ < requested_total) {
+                LOG_WARN(
+                    "Pipeline strategy %s needs %d AICPU threads, got %d; falling back to baseline layout",
+                    pipeline_layout_.name, requested_total, aicpu_thread_num_
+                );
+                use_baseline = true;
+            }
+        }
+    }
+
+    if (use_baseline) {
+        pipeline_layout_ = resolve_pipeline_layout(PIPELINE_STRATEGY_UNSET_BASELINE);
+        orch_thread_num_ = 1;
+        sched_thread_num_ = aicpu_thread_num_ - orch_thread_num_;
+        for (int32_t i = 0; i < sched_thread_num_ && i < MAX_AICPU_THREADS; ++i) {
+            scheduler_index_by_thread_[i] = i;
+        }
+        if (sched_thread_num_ >= 0 && sched_thread_num_ < MAX_AICPU_THREADS) {
+            orchestrator_stage_by_thread_[sched_thread_num_] = 0;
+        }
+        runtime->dev.pipeline_strategy = PIPELINE_STRATEGY_UNSET_BASELINE;
+    } else {
+        sched_thread_num_ = pipeline_layout_.scheduler_threads;
+        orch_thread_num_ = pipeline_layout_.orchestrator_threads;
+        for (int32_t i = 0; i < aicpu_thread_num_ && i < PIPELINE_LAYOUT_MAX_THREADS; ++i) {
+            scheduler_index_by_thread_[i] = pipeline_layout_.scheduler_index_by_thread[i];
+            orchestrator_stage_by_thread_[i] = pipeline_layout_.orchestrator_stage_by_thread[i];
+        }
+        runtime->dev.pipeline_strategy = raw_strategy;
+    }
+
+    if (sched_thread_num_ < 0) sched_thread_num_ = 0;
+    primary_orch_thread_idx_ = -1;
+    for (int32_t i = 0; i < aicpu_thread_num_ && i < MAX_AICPU_THREADS; ++i) {
+        if (orchestrator_stage_by_thread_[i] == 0) {
+            primary_orch_thread_idx_ = i;
+            break;
+        }
+    }
+    if (primary_orch_thread_idx_ < 0) {
+        primary_orch_thread_idx_ = sched_thread_num_;
+    }
+}
+
+int32_t AicpuExecutor::scheduler_idx_for_thread(int32_t thread_idx) const {
+    if (thread_idx < 0 || thread_idx >= MAX_AICPU_THREADS) {
+        return -1;
+    }
+    return scheduler_index_by_thread_[thread_idx];
+}
+
+int32_t AicpuExecutor::orch_stage_idx_for_thread(int32_t thread_idx) const {
+    if (thread_idx < 0 || thread_idx >= MAX_AICPU_THREADS) {
+        return -1;
+    }
+    return orchestrator_stage_by_thread_[thread_idx];
+}
+
+int32_t AicpuExecutor::scheduler_context_idx_for_thread(int32_t thread_idx) const {
+    int32_t sched_idx = scheduler_idx_for_thread(thread_idx);
+    if (sched_idx >= 0) {
+        return sched_idx;
+    }
+    int32_t orch_stage_idx = orch_stage_idx_for_thread(thread_idx);
+    if (orch_stage_idx >= 0) {
+        return sched_thread_num_ + orch_stage_idx;
+    }
+    return thread_idx;
+}
+
 int32_t AicpuExecutor::init(Runtime *runtime) {
     bool expected = false;
     if (!initialized_.compare_exchange_strong(expected, true, std::memory_order_acq_rel, std::memory_order_acquire)) {
@@ -200,12 +299,7 @@ int32_t AicpuExecutor::init(Runtime *runtime) {
         return -1;
     }
 
-    // Read execution parameters from runtime. The 0 → 1 fixup runs before the
-    // sched_thread_num_ derivation so a zero input doesn't leave the scheduler
-    // count at -1.
-    aicpu_thread_num_ = runtime->dev.aicpu_thread_num;
-    if (aicpu_thread_num_ == 0) aicpu_thread_num_ = 1;
-    sched_thread_num_ = aicpu_thread_num_ - 1;
+    resolve_thread_layout(runtime);
     serial_orch_sched_ = runtime->dev.serial_orch_sched;
 
     if (aicpu_thread_num_ < 1 || aicpu_thread_num_ > MAX_AICPU_THREADS) {
@@ -213,6 +307,11 @@ int32_t AicpuExecutor::init(Runtime *runtime) {
         init_failed_.store(true, std::memory_order_release);
         return -1;
     }
+    LOG_INFO_V0(
+        "AicpuExecutor layout: strategy=%s threads=%d sched=%d orch=%d primary_orch=%d clusters=%s",
+        pipeline_layout_.name, aicpu_thread_num_, sched_thread_num_, orch_thread_num_, primary_orch_thread_idx_,
+        pipeline_layout_.cluster_layout
+    );
 
     if (sched_ctx_.init(runtime, aicpu_thread_num_, sched_thread_num_, get_platform_regs()) != 0) {
         init_failed_.store(true, std::memory_order_release);
@@ -379,9 +478,11 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
     // onboard, where the filter gate already set this same value.
     platform_aicpu_affinity_set_thread_idx(thread_idx);
     LOG_INFO_V0("Thread %d: Start (exec_idx=%d)", thread_idx, affinity_exec_idx);
+    int32_t scheduler_idx = scheduler_idx_for_thread(thread_idx);
+    int32_t orch_stage_idx = orch_stage_idx_for_thread(thread_idx);
 
     // Orchestrator check
-    if (thread_idx >= sched_thread_num_) {
+    if (orch_stage_idx == 0) {
 #if PTO2_PROFILING
         uint64_t orch_cycle_start = 0;
 #endif
@@ -545,6 +646,15 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
                 // Fill ops / core counts (host can't resolve s_runtime_ops's
                 // device address nor know the SchedulerContext's core fan-out).
                 runtime_finalize_after_wire(rt, sched_ctx_.aic_count(), sched_ctx_.aiv_count());
+                bool use_strategy2_submit_ctrl =
+                    pipeline_layout_.strategy == PipelineStrategy::S2_O2_SPLIT_CTRL_STRATEGY2;
+                bool use_deferred_submit = use_strategy2_submit_ctrl && sched_thread_num_ == 2 && orch_thread_num_ == 2;
+                if (runtime->dev.pipeline_defer_submit_disabled) {
+                    use_deferred_submit = false;
+                }
+                rt->orchestrator.enable_submit_pipeline(
+                    orch_thread_num_, false, use_deferred_submit, use_deferred_submit, use_deferred_submit
+                );
 #if PTO2_PROFILING
                 rt->orchestrator.l2_swimlane_level = get_l2_swimlane_level();
                 {
@@ -598,6 +708,7 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
             rt_scope_begin(rt);
             (*p_func)(orch_args_cached_);
             rt_scope_end(rt);
+            rt->orchestrator.stop_submit_pipeline();
 
 #if PTO2_PROFILING
             // Flush the (potentially partially-filled) DepGenBuffer so the host
@@ -723,10 +834,42 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
 #endif  // PTO2_ORCH_PROFILING
 #endif  // PTO2_PROFILING
         LOG_INFO_V0("Thread %d: Orchestrator completed", thread_idx);
+    } else if (orch_stage_idx > 0) {
+        LOG_INFO_V0(
+            "Thread %d: Orchestrator pipeline stage %d waiting for primary orchestrator", thread_idx, orch_stage_idx
+        );
+        while (!runtime_init_ready_.load(std::memory_order_acquire)) {
+            SPIN_WAIT_HINT();
+        }
+        if (rt != nullptr) {
+#if PTO2_PROFILING
+            if (get_l2_swimlane_level() >= L2SwimlaneLevel::ORCH_PHASES) {
+                l2_swimlane_aicpu_set_orch_thread_idx(thread_idx);
+            }
+            uint64_t orch_stage_cycle_start = get_sys_cnt_aicpu();
+            uint64_t orch_stage_active_cycles = rt->orchestrator.run_submit_pipeline_worker(orch_stage_idx, thread_idx);
+            uint64_t orch_stage_cycle_end = get_sys_cnt_aicpu();
+            if (rt->orchestrator.submit_pipeline_work_available.load(std::memory_order_acquire) ||
+                orch_stage_active_cycles > 0) {
+                LOG_INFO_V9(
+                    "Thread %d: orch_stage_start=%" PRIu64 " orch_stage_end=%" PRIu64
+                    " orch_stage=%d orch_stage_cost=%.3fus orch_stage_active_cost=%.3fus",
+                    thread_idx, static_cast<uint64_t>(orch_stage_cycle_start),
+                    static_cast<uint64_t>(orch_stage_cycle_end), orch_stage_idx,
+                    cycles_to_us(orch_stage_cycle_end - orch_stage_cycle_start), cycles_to_us(orch_stage_active_cycles)
+                );
+            }
+#else
+            (void)rt->orchestrator.run_submit_pipeline_worker(orch_stage_idx, thread_idx);
+#endif
+        } else {
+            LOG_ERROR("Thread %d: rt is null, skipping orchestrator pipeline stage %d", thread_idx, orch_stage_idx);
+        }
+        LOG_INFO_V0("Thread %d: Orchestrator pipeline stage %d completed", thread_idx, orch_stage_idx);
     }
 
     // Scheduler thread (orchestrator thread skips dispatch and exits after orchestration)
-    if (!sched_ctx_.is_completed() && thread_idx < sched_thread_num_) {
+    if (!sched_ctx_.is_completed() && scheduler_idx >= 0) {
         // Device orchestration: wait for the primary orchestrator to initialize the SM header
         while (!runtime_init_ready_.load(std::memory_order_acquire)) {
             SPIN_WAIT_HINT();
@@ -738,7 +881,7 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
             if (serial_orch_sched_) {
                 sched_ctx_.wait_for_orchestration_done_before_dispatch(runtime, thread_idx);
             }
-            int32_t completed = sched_ctx_.resolve_and_dispatch(runtime, thread_idx);
+            int32_t completed = sched_ctx_.resolve_and_dispatch(runtime, scheduler_idx);
             if (completed < 0) {
                 LOG_ERROR("Thread %d: Scheduler failed with rc=%d", thread_idx, completed);
                 run_rc = completed;
@@ -799,7 +942,14 @@ void AicpuExecutor::deinit(Runtime *runtime) {
 
     aicpu_thread_num_ = 0;
     sched_thread_num_ = 0;
+    orch_thread_num_ = 0;
+    primary_orch_thread_idx_ = -1;
+    pipeline_layout_ = {};
     serial_orch_sched_ = false;
+    for (int32_t i = 0; i < MAX_AICPU_THREADS; ++i) {
+        scheduler_index_by_thread_[i] = -1;
+        orchestrator_stage_by_thread_[i] = -1;
+    }
 
     orch_args_cached_.reset();
     // orch_so_table_ entries are intentionally preserved across deinit: they

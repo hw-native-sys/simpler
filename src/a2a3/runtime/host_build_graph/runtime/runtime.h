@@ -239,6 +239,9 @@ public:
     void set_worker_count(int n) { worker_count = n; }
     int get_aicpu_thread_num() const { return aicpu_thread_num; }
     void set_aicpu_thread_num(int n) { aicpu_thread_num = n; }
+    int get_pipeline_strategy() const { return -1; }
+    void set_pipeline_strategy(int) {}
+    bool pipeline_defer_submit_disabled() const { return false; }
     Handshake *get_workers() { return workers; }
     int32_t get_aicpu_allowed_cpu_count() const { return aicpu_allowed_cpu_count; }
     void set_aicpu_allowed_cpu_count(int32_t n) { aicpu_allowed_cpu_count = n; }

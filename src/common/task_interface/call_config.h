@@ -11,7 +11,7 @@
 
 /**
  * CallConfig — per-NEXT_LEVEL-task config. Carries execution knobs
- * (block_dim, aicpu_thread_num), per-task runtime-environment overrides
+ * (block_dim, aicpu_thread_num, pipeline_strategy), per-task runtime-environment overrides
  * (`runtime_env.ring_task_window` / `.ring_heap` / `.ring_dep_pool`, each a per-ring array) plus the five parallel
  * diagnostics sub-features under the profiling umbrella: `enable_l2_swimlane` (swimlane), `enable_dump_tensor`,
  * `enable_pmu`, `enable_dep_gen`, and `enable_scope_stats`. All five require `output_prefix` because they each write
@@ -110,6 +110,7 @@ struct RuntimeEnv {
 struct CallConfig {
     int32_t block_dim = 0;  // 0 = auto; resolved by DeviceRunner at run() time
     int32_t aicpu_thread_num = 3;
+    int32_t pipeline_strategy = -1;  // -1 = env/default baseline; 2 = strategy2 layout
     int32_t enable_l2_swimlane = 0;
     int32_t enable_dump_tensor = 0;
     int32_t enable_pmu = 0;  // 0 = disabled; >0 = enabled, value selects event type
@@ -143,6 +144,6 @@ struct CallConfig {
 #pragma pack(pop)
 static_assert(sizeof(RuntimeEnv) == RUNTIME_ENV_UINT64_FIELD_COUNT * sizeof(uint64_t), "RuntimeEnv wire layout drift");
 static_assert(
-    sizeof(CallConfig) == 7 * sizeof(int32_t) + RUNTIME_ENV_UINT64_FIELD_COUNT * sizeof(uint64_t) + 1024,
+    sizeof(CallConfig) == 8 * sizeof(int32_t) + RUNTIME_ENV_UINT64_FIELD_COUNT * sizeof(uint64_t) + 1024,
     "CallConfig wire layout drift"
 );

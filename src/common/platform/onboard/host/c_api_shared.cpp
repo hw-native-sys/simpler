@@ -461,9 +461,9 @@ static void emit_device_phase_markers(DeviceRunnerBase *runner) {
 
 int simpler_run(
     DeviceContextHandle ctx, RuntimeHandle runtime, int32_t callable_id, const void *args, int block_dim,
-    int aicpu_thread_num, int enable_l2_swimlane, int enable_dump_tensor, int enable_pmu, int enable_dep_gen,
-    int enable_scope_stats, const uint64_t *ring_task_window, const uint64_t *ring_heap, const uint64_t *ring_dep_pool,
-    const char *output_prefix
+    int aicpu_thread_num, int pipeline_strategy, int enable_l2_swimlane, int enable_dump_tensor, int enable_pmu,
+    int enable_dep_gen, int enable_scope_stats, const uint64_t *ring_task_window, const uint64_t *ring_heap,
+    const uint64_t *ring_dep_pool, const char *output_prefix
 ) {
     if (ctx == NULL || runtime == NULL) return -1;
     DeviceRunnerBase *runner = static_cast<DeviceRunnerBase *>(ctx);
@@ -488,6 +488,7 @@ int simpler_run(
         if (rc != 0) return rc;
 
         Runtime *r = new (runtime) Runtime();
+        r->set_pipeline_strategy(pipeline_strategy);
         // RAII the placement-new'd Runtime so its dtor fires on every exit
         // (normal returns, the rc-check early-returns below, AND the catch(...)
         // path). The prior manual `r->~Runtime()` on each return leaked the
