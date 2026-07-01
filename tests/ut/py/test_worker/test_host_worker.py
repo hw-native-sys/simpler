@@ -168,6 +168,23 @@ class TestLifecycle:
         with pytest.raises(TypeError, match="level 2 only supports ChipCallable"):
             hw.register(lambda args: None)
 
+    def test_close_releases_registered_callables(self):
+        # close() must drop every Worker-held reference to registered callables.
+        # A ChipCallable is a nanobind instance; if close() leaves it in one of
+        # the registries, a closed Worker kept alive past interpreter exit (e.g.
+        # a failing test's traceback pinning the frame's `worker` local) keeps
+        # the instance live, which blocks nanobind's module unload and prints a
+        # leak dump at shutdown.
+        hw = Worker(level=3, num_sub_workers=0)
+        hw.init()
+        handle = hw.register(_unique_chip_callable(1))
+        assert _slot_for(hw, handle) in hw._callable_registry
+        assert hw._identity_registry and hw._live_handles
+        hw.close()
+        assert hw._callable_registry == {}
+        assert hw._identity_registry == {}
+        assert hw._live_handles == {}
+
     def test_prepare_python_fn_after_init_before_start_succeeds(self):
         # init() allocates mailboxes but does not fork children. Python
         # callables prepared in this window still land in the startup
