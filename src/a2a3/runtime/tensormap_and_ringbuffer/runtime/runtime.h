@@ -39,6 +39,7 @@
 #include <vector>
 
 #include "common/core_type.h"
+#include "common/host_api.h"
 #include "common/l2_swimlane_profiling.h"
 #include "common/platform_config.h"
 #include "aicpu/platform_aicpu_affinity.h"  // MAX_GATE_THREADS (aicpu_allowed_cpus bound)
@@ -117,54 +118,6 @@ struct TensorPair {
 };
 
 /**
- * Host API function pointers for device memory operations.
- * Allows runtime to use pluggable device memory backends.
- */
-struct HostApi {
-    void *(*device_malloc)(size_t size);
-    void (*device_free)(void *dev_ptr);
-    int (*copy_to_device)(void *dev_ptr, const void *host_ptr, size_t size);
-    int (*copy_from_device)(void *host_ptr, const void *dev_ptr, size_t size);
-    // Set a device buffer to a byte value (device-side, no PCIe). Used to
-    // zero-init pure OUTPUT buffers in lieu of an H2D copy-in. May be
-    // null on backends that don't wire it; callers must fall back to
-    // copy_to_device.
-    int (*device_memset)(void *dev_ptr, int value, size_t size);
-    // Commit the three per-Worker pooled regions (PTO2 GM heap, PTO2 shared
-    // memory, trb prebuilt runtime arena) as three independent device
-    // allocations. `runtime_arena_size == 0` skips the third region (hbg
-    // path: hbg has no prebuilt runtime arena). Idempotent on identical
-    // sizes; returns 0 on success, -1 on allocation failure.
-    int (*setup_static_arena)(size_t gm_heap_size, size_t gm_sm_size, size_t runtime_arena_size);
-    // Return the per-Worker pooled pointer for the PTO2 GM heap / shared
-    // memory / prebuilt runtime arena. setup_static_arena must have already
-    // committed the relevant region; the returned pointer is owned by the
-    // DeviceRunner and freed in `DeviceRunner::finalize()` — do NOT pass it
-    // to device_free or record it in `tensor_pairs_`.
-    //
-    // acquire_pooled_runtime_arena is trb-only — the runtime-arena region is
-    // only committed when setup_static_arena was invoked with
-    // runtime_arena_size > 0. Calling it on the hbg path
-    // (setup_static_arena(...,0)) returns nullptr (not undefined).
-    void *(*acquire_pooled_gm_heap)();
-    void *(*acquire_pooled_gm_sm)();
-    void *(*acquire_pooled_runtime_arena)();
-    // Single-shot upload of the entire ChipCallable buffer. `callable` is a
-    // `const ChipCallable *` (declared void* to avoid pulling task_interface
-    // headers into runtime.h). DeviceRunner walks child_offsets_ to compute
-    // total byte size, allocates device GM once, fixes up each child's
-    // resolved_addr_ in an internal host scratch (onboard: device addr; sim:
-    // dlopen function pointer), H2D's once, and returns the device-side
-    // address of the ChipCallable header. Pool-managed: identical buffer
-    // contents (FNV-1a 64-bit) hit the dedup cache; all chip buffers are
-    // bulk-freed in DeviceRunner::finalize(). Returns 0 on error or when
-    // child_count() == 0. Caller computes child addrs as
-    //     chip_dev + offsetof(ChipCallable, storage_) + child_offset(i)
-    // and stores them via runtime->set_function_bin_addr(fid, child_dev).
-    uint64_t (*upload_chip_callable_buffer)(const void *callable);
-};
-
-/**
  * Task structure - Compatibility stub for platform layer
  *
  * RT2 uses PTO2DispatchPayload instead of Task for task dispatch.
@@ -207,7 +160,6 @@ struct alignas(64) DeviceRuntimeLaunchDesc {
     // (= orch + schedulers). AicpuExecutor splits this into one orchestrator
     // thread (highest idx, runs aicpu_orchestration_entry) and the remaining
     // aicpu_thread_num-1 scheduler threads that dispatch tasks to AICore.
-    // The orch thread also dispatches when env PTO2_ORCH_TO_SCHED is set.
     int aicpu_thread_num;
     int ready_queue_shards;  // Number of ready queue shards (1..MAX_AICPU_THREADS, default MAX-1)
 
@@ -223,12 +175,6 @@ struct alignas(64) DeviceRuntimeLaunchDesc {
     // PTO2 integration: kernel_id -> GM function_bin_addr mapping
     uint64_t func_id_to_addr_[RUNTIME_MAX_FUNC_ID];
 
-    // Orchestrator-to-scheduler transition control
-    // When true, orchestrator threads convert to scheduler threads after orchestration completes.
-    // When false (default), orchestrator threads exit after orchestration without dispatching tasks.
-    // Controlled via PTO2_ORCH_TO_SCHED environment variable.
-    bool orch_to_sched;
-
     // TraCR data placeholder
     // Those are the pointers with the allocated memory on the device
     void *tracrData_;
@@ -241,7 +187,6 @@ struct alignas(64) DeviceRuntimeLaunchDesc {
     bool serial_orch_sched;
 
     void *gm_sm_ptr_;                        // GM pointer to PTO2 shared memory (device)
-    void *slot_states_ptr_;                  // Pointer to PTO2TaskSlotState array (scheduler-private, for profiling)
     ChipStorageTaskArgs orch_args_storage_;  // Copy of args for device
 
     // Prebuilt-arena fast path (trb only). Set by the host before rtMemcpy'ing
@@ -285,8 +230,6 @@ private:
     int registered_kernel_func_ids_[RUNTIME_MAX_FUNC_ID];
     int registered_kernel_count_;
 
-    void *gm_heap_ptr_;  // GM heap for orchestrator output buffers (device); host-only bookkeeping
-
 public:
     /**
      * Constructor - zero-initialize all arrays
@@ -328,11 +271,8 @@ public:
     // =========================================================================
 
     void *get_gm_sm_ptr() const;
-    void *get_gm_heap_ptr() const;
     const ChipStorageTaskArgs &get_orch_args() const;
     void set_gm_sm_ptr(void *p);
-    void set_gm_heap(void *p);
-    void set_slot_states_ptr(void *p);
     void set_orch_args(const ChipStorageTaskArgs &args);
 
     // Prebuilt-arena fast path (trb only). Set by host's
@@ -378,12 +318,8 @@ public:
     Task *get_task(int) { return nullptr; }
 
     // =========================================================================
-    // Host API (host-only, not copied to device)
+    // Host-only state (not copied to device)
     // =========================================================================
-
-    // Host API function pointers for device memory operations. Host-only:
-    // lives in the tail after `dev`, so it is never part of the device copy.
-    HostApi host_api;
 
     // Host-side tensor ledger for D2H copy-back at finalize. Populated by
     // runtime_maker.cpp from orch_args at bind time, then iterated in

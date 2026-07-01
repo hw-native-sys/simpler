@@ -259,9 +259,9 @@ TEST(RuntimeArenaLayout, PerRingConfigInitializesRuntimeComponents) {
 
     EXPECT_EQ(rt->gm_heap_size, total_heap);
     for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
-        EXPECT_EQ(layout.task_window_sizes[r], ws[r]);
-        EXPECT_EQ(layout.heap_sizes[r], heaps[r]);
-        EXPECT_EQ(layout.dep_pool_capacities[r], dep_caps[r]);
+        EXPECT_EQ(layout.sizing.task_window_sizes[r], ws[r]);
+        EXPECT_EQ(layout.sizing.heap_sizes[r], heaps[r]);
+        EXPECT_EQ(layout.sizing.dep_pool_capacities[r], dep_caps[r]);
         EXPECT_EQ(rt->orchestrator.rings[r].task_allocator.window_size(), static_cast<int32_t>(ws[r]));
         EXPECT_EQ(rt->orchestrator.rings[r].task_allocator.heap_capacity(), heaps[r]);
         EXPECT_EQ(rt->orchestrator.rings[r].fanin_pool.capacity, dep_caps[r]);
@@ -283,7 +283,7 @@ TEST(RuntimeArenaLayout, RejectsOverflowingPerRingHeapSum) {
     EXPECT_EQ(runtime_init_data_from_layout(runtime_arena, layout, PTO2_MODE_EXECUTE, &sm, 0, &gm, heaps), nullptr);
 
     PTO2OrchestratorState orch{};
-    EXPECT_FALSE(orch.init_data_from_layout(layout.orch, runtime_arena, &sm, &gm, heaps, ws));
+    EXPECT_FALSE(orch.init_data_from_layout(layout.offsets.orch, runtime_arena, &sm, &gm, heaps, ws));
 }
 
 // =============================================================================

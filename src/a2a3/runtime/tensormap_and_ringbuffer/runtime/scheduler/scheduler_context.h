@@ -61,8 +61,7 @@ public:
     // - Binds func_id_to_addr_ / initial sched_ (if rt is already known)
     // - Captures AICore-register base (consumed by handshake_all_cores())
     // Returns 0 on success, negative on failure (handshake / assignment error).
-    int32_t
-    init(Runtime *runtime, int32_t aicpu_thread_num, int32_t sched_thread_num, bool orch_to_sched, uint64_t regs_base);
+    int32_t init(Runtime *runtime, int32_t aicpu_thread_num, int32_t sched_thread_num, uint64_t regs_base);
 
     // Reset all SchedulerContext-owned state to its post-construction defaults.
     // Called by AicpuExecutor::deinit() during per-run teardown.
@@ -152,15 +151,9 @@ private:
     std::atomic<bool> completed_{false};
     uint64_t *func_id_to_addr_{nullptr};
 
-    // --- Core-transition coordination ---
-    std::atomic<bool> transition_requested_{false};
-    std::atomic<int32_t> wait_reassign_{0};
-    std::atomic<bool> reassigned_{false};
-
     // --- Thread/core configuration ---
     int32_t active_sched_threads_{0};
     int32_t sched_thread_num_{0};
-    bool orch_to_sched_{false};
     int32_t aicpu_thread_num_{0};
     int32_t cores_total_num_{0};
 
@@ -189,9 +182,6 @@ private:
 
     // Assign discovered cores (cluster = 1 AIC + 2 AIV) round-robin across scheduler threads.
     bool assign_cores_to_threads();
-
-    // Re-distribute all cores across all threads after orchestration completes.
-    void reassign_cores_for_all_threads();
 
     // Emergency shutdown: broadcast exit signal to every handshake'd core and
     // deinit their AICore register blocks. Idempotent.
@@ -358,8 +348,6 @@ private:
 
     __attribute__((noinline, cold)) LoopAction
     handle_orchestrator_exit(int32_t thread_idx, PTO2SharedMemoryHeader *header, Runtime *runtime, int32_t &task_count);
-
-    __attribute__((noinline, cold)) LoopAction handle_core_transition(bool &cores_released);
 
     __attribute__((noinline, cold)) LoopAction
     check_idle_fatal_error(int32_t thread_idx, PTO2SharedMemoryHeader *header, Runtime *runtime);

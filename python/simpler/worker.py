@@ -3915,6 +3915,7 @@ class Worker:
         if self.level == 2:
             if self._chip_worker:
                 self._chip_worker.finalize()
+                self._chip_worker = None
         else:
             if self._worker:
                 self._worker.close()
@@ -3965,6 +3966,18 @@ class Worker:
             self._next_level_pids.clear()
             self._next_level_workers.clear()
             self._next_level_worker_ids.clear()
+
+        # Drop the Worker-held references to registered callables. These dicts
+        # pin ChipCallable/CoreCallable nanobind instances (and, via identity
+        # state, their payloads); if a closed Worker is kept alive past
+        # interpreter exit — e.g. a failing test's traceback pins the frame's
+        # `worker` local — any surviving instance prevents nanobind from
+        # unloading its module and triggers a leak dump at shutdown. Guard with
+        # _registry_lock, mirroring every other mutation of these three dicts.
+        with self._registry_lock:
+            self._callable_registry.clear()
+            self._identity_registry.clear()
+            self._live_handles.clear()
 
         self._initialized = False
 

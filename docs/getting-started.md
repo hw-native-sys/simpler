@@ -77,20 +77,16 @@ It follows this order:
 
 1. If `PTO_ISA_ROOT` points to an existing directory, that directory wins.
    `simpler` treats it as user-managed and uses it as-is.
-2. If the managed checkout is being used and `--pto-isa-commit` or the CMake
-   `SIMPLER_PTO_ISA_COMMIT` define supplies a value, that value wins.
-3. If no CLI/CMake value is supplied and `SIMPLER_PTO_ISA_COMMIT` is set in
-   the environment, that environment value wins.
-4. If no explicit value is requested, `simpler` checks out the commit recorded
+2. If the managed checkout is being used and `--pto-isa-commit` supplies a
+   value, that value wins.
+3. If no explicit value is requested, `simpler` checks out the commit recorded
    in `pto_isa.pin`.
-5. If `pto_isa.pin` is missing, `simpler` warns and falls back to the latest
+4. If `pto_isa.pin` is missing, `simpler` warns and falls back to the latest
    `origin/HEAD` behavior for downstream checkout compatibility.
 
-For explicit values in steps 2 and 3, a concrete SHA/tag/ref checks out that
+For the explicit value in step 2, a concrete SHA/tag/ref checks out that
 revision. The values `latest`, `head`, and `none` are explicit opt-outs from
-the pin and use `origin/HEAD`. For the CMake cache variable, the empty string is
-the default value and means "use `pto_isa.pin`"; use `latest`, `head`, or `none`
-for an explicit CMake opt-out.
+the pin and use `origin/HEAD`.
 
 When the managed checkout is selected, `simpler` uses `build/pto-isa`, cloning
 it on first use if necessary.
@@ -105,14 +101,14 @@ checkout `--pto-isa-commit "$PTO_ISA_COMMIT"` inside that directory. To run
 with a specific commit while using a custom `PTO_ISA_ROOT`, checkout that
 commit in the PTO-ISA repository yourself before running `simpler`.
 
-At install time, pass a concrete PTO-ISA commit through CMake when building
-a2a3 onboard runtimes:
+At install time, `pip install` builds a2a3 onboard runtimes against the
+commit recorded in `pto_isa.pin` by default. To build against a different
+commit without changing the pin, either point `PTO_ISA_ROOT` at a
+pre-checked-out pto-isa clone, or run `build_runtimes.py` manually:
 
 ```bash
 export PTO_ISA_COMMIT=0123456789abcdef0123456789abcdef01234567
-pip install --no-build-isolation \
-  --config-settings=cmake.define.SIMPLER_PTO_ISA_COMMIT="$PTO_ISA_COMMIT" \
-  -e .
+python simpler_setup/build_runtimes.py --pto-isa-commit "$PTO_ISA_COMMIT" --platforms a2a3
 ```
 
 At test/run time, pass the matching commit through pytest or the scene-test
@@ -124,11 +120,9 @@ pytest examples --platform a2a3 --pto-isa-commit "$PTO_ISA_COMMIT"
 python path/to/scene_test.py --platform a2a3 --pto-isa-commit "$PTO_ISA_COMMIT"
 ```
 
-`SIMPLER_PTO_ISA_COMMIT="$PTO_ISA_COMMIT"` can also provide the concrete commit
-when the CLI option is omitted. Leaving both unset uses `pto_isa.pin`, so a
-plain local install and test run match the repository pin. To explicitly track
-the remote default branch instead, pass `--pto-isa-commit latest` or set
-`SIMPLER_PTO_ISA_COMMIT=latest`.
+Leaving `--pto-isa-commit` unset uses `pto_isa.pin`, so a plain local install
+and test run match the repository pin. To explicitly track the remote default
+branch instead, pass `--pto-isa-commit latest`.
 
 For a2a3 onboard runtimes, `pip install` records the actual PTO-ISA git HEAD
 used to build `host_runtime.so` in `build/lib/pto_isa_build.json`. The recorded
@@ -146,9 +140,9 @@ comparison:
    HEAD.
 2. `PTO_ISA_ROOT`'s current git HEAD, when `PTO_ISA_ROOT` points to a git
    checkout and the recorded run-time commit is unavailable.
-3. The resolved concrete request from `SIMPLER_PTO_ISA_COMMIT` or `pto_isa.pin`,
-   as a fallback for cases where no git checkout commit can be read. Explicit
-   `latest`/`head`/`none` without a readable git checkout remains unverifiable.
+3. The resolved concrete request from `pto_isa.pin`, as a fallback for cases
+   where no git checkout commit can be read. Explicit `latest`/`head`/`none`
+   without a readable git checkout remains unverifiable.
 
 If the build commit and run-time commit differ, `simpler` fails early on the
 host side before loading the runtime binary. The error reports both commits and

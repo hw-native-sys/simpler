@@ -15,6 +15,7 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <limits>
 #include <string>
 #include <utility>
@@ -87,11 +88,13 @@ int SimDeviceRunnerBase::setup_static_arena(size_t gm_heap_size, size_t gm_sm_si
     // Idempotent for the production case (sizes do not change across a
     // worker's lifetime). If a caller asks for a larger layout on any
     // region, redo just that region.
-    auto commit_region = [](DeviceArena &arena, size_t &cached_size, size_t requested_size) -> int {
+    bool arena_changed = false;
+    auto commit_region = [&arena_changed](DeviceArena &arena, size_t &cached_size, size_t requested_size) -> int {
         if (requested_size == 0) {
             if (arena.is_committed() && cached_size != 0) {
                 arena.release();
                 cached_size = 0;
+                arena_changed = true;
             }
             return 0;
         }
@@ -100,6 +103,7 @@ int SimDeviceRunnerBase::setup_static_arena(size_t gm_heap_size, size_t gm_sm_si
         }
         arena.release();
         cached_size = 0;
+        arena_changed = true;
         arena.reserve(requested_size, DeviceArena::kDefaultBaseAlign);
         if (arena.commit(DeviceArena::kDefaultBaseAlign) == nullptr) {
             arena.release();
@@ -122,9 +126,64 @@ int SimDeviceRunnerBase::setup_static_arena(size_t gm_heap_size, size_t gm_sm_si
         cached_gm_heap_size_ = 0;
         cached_gm_sm_size_ = 0;
         cached_runtime_arena_size_ = 0;
+        prebuilt_runtime_arena_cache_valid_ = false;
+        prebuilt_runtime_arena_cache_key_.clear();
+        prebuilt_runtime_arena_cache_gm_heap_base_ = nullptr;
+        prebuilt_runtime_arena_cache_sm_base_ = nullptr;
+        prebuilt_runtime_arena_cache_runtime_arena_base_ = nullptr;
+        prebuilt_runtime_arena_cache_image_.clear();
         return -1;
     }
+    if (arena_changed) {
+        prebuilt_runtime_arena_cache_valid_ = false;
+        prebuilt_runtime_arena_cache_key_.clear();
+        prebuilt_runtime_arena_cache_gm_heap_base_ = nullptr;
+        prebuilt_runtime_arena_cache_sm_base_ = nullptr;
+        prebuilt_runtime_arena_cache_runtime_arena_base_ = nullptr;
+        prebuilt_runtime_arena_cache_image_.clear();
+    }
     return 0;
+}
+
+bool SimDeviceRunnerBase::lookup_prebuilt_runtime_arena_cache(
+    uint64_t hash, const void *key_data, size_t key_size, void **gm_heap_base, void **sm_base,
+    void **runtime_arena_base, size_t *runtime_off, const void **image_data, size_t *image_size
+) const {
+    if (!prebuilt_runtime_arena_cache_valid_ || prebuilt_runtime_arena_cache_hash_ != hash ||
+        prebuilt_runtime_arena_cache_key_.size() != key_size || key_data == nullptr || gm_heap_base == nullptr ||
+        sm_base == nullptr || runtime_arena_base == nullptr || runtime_off == nullptr || image_data == nullptr ||
+        image_size == nullptr) {
+        return false;
+    }
+    if (std::memcmp(prebuilt_runtime_arena_cache_key_.data(), key_data, key_size) != 0) {
+        return false;
+    }
+    *gm_heap_base = prebuilt_runtime_arena_cache_gm_heap_base_;
+    *sm_base = prebuilt_runtime_arena_cache_sm_base_;
+    *runtime_arena_base = prebuilt_runtime_arena_cache_runtime_arena_base_;
+    *runtime_off = prebuilt_runtime_arena_cache_runtime_off_;
+    *image_data = prebuilt_runtime_arena_cache_image_.data();
+    *image_size = prebuilt_runtime_arena_cache_image_.size();
+    return true;
+}
+
+void SimDeviceRunnerBase::mark_prebuilt_runtime_arena_cached(
+    uint64_t hash, const void *key_data, size_t key_size, void *gm_heap_base, void *sm_base, void *runtime_arena_base,
+    size_t runtime_off, const void *image_data, size_t image_size
+) {
+    prebuilt_runtime_arena_cache_valid_ = false;
+    prebuilt_runtime_arena_cache_hash_ = hash;
+    prebuilt_runtime_arena_cache_key_.assign(
+        static_cast<const uint8_t *>(key_data), static_cast<const uint8_t *>(key_data) + key_size
+    );
+    prebuilt_runtime_arena_cache_gm_heap_base_ = gm_heap_base;
+    prebuilt_runtime_arena_cache_sm_base_ = sm_base;
+    prebuilt_runtime_arena_cache_runtime_arena_base_ = runtime_arena_base;
+    prebuilt_runtime_arena_cache_runtime_off_ = runtime_off;
+    prebuilt_runtime_arena_cache_image_.assign(
+        static_cast<const uint8_t *>(image_data), static_cast<const uint8_t *>(image_data) + image_size
+    );
+    prebuilt_runtime_arena_cache_valid_ = true;
 }
 
 void *SimDeviceRunnerBase::acquire_pooled_gm_heap() {

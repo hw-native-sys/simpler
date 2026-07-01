@@ -155,8 +155,7 @@ void l2_swimlane_aicpu_flush(int thread_idx, const int *cur_thread_cores, int co
  *                                 to the L2Swimlane base
  * @param num_sched_phase_threads  Number of sched-phase pools to prime
  * @param num_orch_phase_threads   Number of orch-phase pools to prime
- *                                 (typically 1; in orch_to_sched mode =
- *                                 num_aicpu_threads)
+ *                                 (typically 1)
  */
 void l2_swimlane_aicpu_init_phase(int worker_count, int num_sched_phase_threads, int num_orch_phase_threads);
 
@@ -200,8 +199,7 @@ void l2_swimlane_aicpu_record_sched_phase(
  * Must be called once from the orchestrator thread before any
  * l2_swimlane_aicpu_record_orch_phase() calls.
  *
- * @param thread_idx Thread index for the orchestrator (typically num_sched_threads;
- *                   in orch_to_sched mode each scheduler thread sets its own)
+ * @param thread_idx Thread index for the orchestrator (typically num_sched_threads)
  */
 void l2_swimlane_aicpu_set_orch_thread_idx(int thread_idx);
 

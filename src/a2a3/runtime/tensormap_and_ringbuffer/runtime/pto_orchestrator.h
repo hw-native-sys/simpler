@@ -161,6 +161,10 @@ struct PTO2OrchestratorState {
         const PTO2OrchestratorLayout &layout, DeviceArena &arena, void *sm_dev_base, void *gm_heap,
         const uint64_t heap_sizes[PTO2_MAX_RING_DEPTH], const uint64_t task_window_sizes[PTO2_MAX_RING_DEPTH]
     );
+    bool reset_for_reuse(
+        const PTO2OrchestratorLayout &layout, void *sm_dev_base, void *gm_heap,
+        const uint64_t heap_sizes[PTO2_MAX_RING_DEPTH], const uint64_t task_window_sizes[PTO2_MAX_RING_DEPTH]
+    );
 
     // Phase 3b: write the arena-internal pointer fields (scope_tasks,
     // scope_begins, rings[].fanin_pool.base, tensor_map.{buckets,entry_pool,

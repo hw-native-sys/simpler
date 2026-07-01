@@ -14,7 +14,7 @@ at compile time), `SceneTestCase.run_module` (pin via `-c`).
 
 Resolution order for ensure_pto_isa_root():
   1. PTO_ISA_ROOT environment variable (if set and points to a directory)
-  2. Explicit commit argument / SIMPLER_PTO_ISA_COMMIT
+  2. Explicit commit argument (--pto-isa-commit CLI / API)
   3. PROJECT_ROOT / pto_isa.pin
   4. PROJECT_ROOT / build / pto-isa at origin/HEAD when explicitly unpinned
      or when the pin is missing
@@ -76,11 +76,11 @@ def read_pto_isa_pin(pin_path: Optional[Path] = None) -> Optional[str]:
 def resolve_pto_isa_commit(commit: Optional[str] = None) -> Optional[str]:
     """Resolve the pto-isa revision requested for managed clones.
 
-    Explicit CLI/API values win over SIMPLER_PTO_ISA_COMMIT. When neither is
-    provided, use pto_isa.pin. "latest", "head", "none", and an explicit empty
-    Python/API or environment value opt into the current remote HEAD behavior.
+    Explicit CLI/API values win over the repository pto_isa.pin. "latest",
+    "head", "none", and an explicit empty value opt into the current remote
+    HEAD behavior.
     """
-    requested = commit if commit is not None else os.environ.get("SIMPLER_PTO_ISA_COMMIT")
+    requested = commit
     if requested is not None:
         value = requested.strip()
         if value.lower() in _UNPINNED_COMMIT_VALUES:

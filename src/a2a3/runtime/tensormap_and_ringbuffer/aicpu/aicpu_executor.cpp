@@ -48,6 +48,7 @@
 #include "common/unified_log.h"
 
 // Register-based communication
+#include "aicpu/aicpu_device_config.h"
 #include "aicpu/platform_aicpu_affinity.h"
 #include "aicpu/platform_regs.h"
 #include "common/platform_config.h"
@@ -117,7 +118,6 @@ struct OrchSoEntry {
 
 struct AicpuExecutor {
     int32_t sched_thread_num_;
-    bool orch_to_sched_{false};
     bool serial_orch_sched_{false};
 
     // ===== Thread management state =====
@@ -211,7 +211,6 @@ int32_t AicpuExecutor::init(Runtime *runtime) {
     aicpu_thread_num_ = runtime->dev.aicpu_thread_num;
     if (aicpu_thread_num_ == 0) aicpu_thread_num_ = 1;
     sched_thread_num_ = aicpu_thread_num_ - 1;
-    orch_to_sched_ = runtime->dev.orch_to_sched;
     serial_orch_sched_ = runtime->dev.serial_orch_sched;
 
     if (aicpu_thread_num_ < 1 || aicpu_thread_num_ > MAX_AICPU_THREADS) {
@@ -220,7 +219,7 @@ int32_t AicpuExecutor::init(Runtime *runtime) {
         return -1;
     }
 
-    if (sched_ctx_.init(runtime, aicpu_thread_num_, sched_thread_num_, orch_to_sched_, get_platform_regs()) != 0) {
+    if (sched_ctx_.init(runtime, aicpu_thread_num_, sched_thread_num_, get_platform_regs()) != 0) {
         init_failed_.store(true, std::memory_order_release);
         return -1;
     }
@@ -488,13 +487,9 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
                 sm_ptr = runtime->get_gm_sm_ptr();
             }
 
-            // Prebuilt-arena fast path. Host has pre-populated the entire
-            // runtime arena (PTO2Runtime + orchestrator/scheduler/tensor_map
-            // sub-regions + sm_handle wrapper + mailbox) and uploaded it via
-            // rtMemcpy into the pooled runtime_arena buffer. We attach to it,
-            // wire arena-internal pointers to their device addresses, reset
-            // the SM, and finalize the few device-only fields the host could
-            // not know at image-build time.
+            // Prebuilt-arena fast path. Host uploads the runtime arena image
+            // on cache miss; cache hits reuse the resident device arena. AICPU
+            // re-wires arena-internal pointers to device addresses below.
             {
                 AicpuPhaseScope arena_wire(AicpuPhase::ArenaWire);
                 void *prebuilt_arena = runtime->get_prebuilt_arena_base();
@@ -510,28 +505,32 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
                 // Wire every arena-internal pointer field (host wrote host-mirror
                 // addresses; we overwrite them with device addresses).
                 runtime_wire_arena_pointers(runtime_arena_, rt->prebuilt_layout, rt);
-                sm_size = PTO2SharedMemoryHandle::calculate_size_per_ring(rt->prebuilt_layout.task_window_sizes);
+                sm_size = PTO2SharedMemoryHandle::calculate_size_per_ring(rt->prebuilt_layout.sizing.task_window_sizes);
                 for (int r = 0; r < PTO2_MAX_RING_DEPTH; ++r) {
                     LOG_INFO_V0(
                         "Thread %d: Ring %d sizes: task_window=%" PRIu64 " heap=%" PRIu64 " dep_pool=%d", thread_idx, r,
-                        rt->prebuilt_layout.task_window_sizes[r], rt->prebuilt_layout.heap_sizes[r],
-                        rt->prebuilt_layout.dep_pool_capacities[r]
+                        rt->prebuilt_layout.sizing.task_window_sizes[r], rt->prebuilt_layout.sizing.heap_sizes[r],
+                        rt->prebuilt_layout.sizing.dep_pool_capacities[r]
                     );
                 }
             }
 
             // Reset SM state. setup_pointers + init_header_per_ring restore
-            // ring flow-control counters, layout metadata, error flags, and
-            // the per-slot ring->slot_states[] (bind_ring + reset_for_reuse +
-            // fanin_count/active_mask zero — previously done inside
-            // RingSchedState::init).
+            // ring flow-control counters, layout metadata, and error flags.
             {
                 AicpuPhaseScope sm_reset(AicpuPhase::SmReset);
                 memset(rt->sm_handle, 0, sizeof(*rt->sm_handle));
                 if (!rt->sm_handle->init_per_ring(
-                        sm_ptr, sm_size, rt->prebuilt_layout.task_window_sizes, rt->prebuilt_layout.heap_sizes
+                        sm_ptr, sm_size, rt->prebuilt_layout.sizing.task_window_sizes,
+                        rt->prebuilt_layout.sizing.heap_sizes
                     )) {
                     LOG_ERROR("Thread %d: sm_handle->init_per_ring failed", thread_idx);
+                    rt = nullptr;
+                    runtime_init_ready_.store(true, std::memory_order_release);
+                    return -1;
+                }
+                if (!runtime_reset_for_reuse(runtime_arena_, rt->prebuilt_layout, rt)) {
+                    LOG_ERROR("Thread %d: runtime_reset_for_reuse failed", thread_idx);
                     rt = nullptr;
                     runtime_init_ready_.store(true, std::memory_order_release);
                     return -1;
@@ -560,15 +559,13 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
                     for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
                         auto &alloc = orch.rings[r].task_allocator;
                         scope_stats_set_ring_capacity(
-                            r, alloc.window_size(), alloc.heap_capacity(), rt->prebuilt_layout.dep_pool_capacities[r]
+                            r, alloc.window_size(), alloc.heap_capacity(),
+                            rt->prebuilt_layout.sizing.dep_pool_capacities[r]
                         );
                     }
                     scope_stats_set_tensormap_capacity(orch.tensor_map.pool_capacity());
                 }
 #endif
-
-                // With multi-ring, slot_states are per-ring inside the scheduler.
-                runtime->set_slot_states_ptr(nullptr);
 
                 // Wire scheduler context to the newly created PTO2Runtime before
                 // releasing scheduler threads from runtime_init_ready_.
@@ -736,8 +733,8 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
         LOG_INFO_V0("Thread %d: Orchestrator completed", thread_idx);
     }
 
-    // Scheduler thread (orchestrator threads skip dispatch when orch_to_sched_ is false)
-    if (!sched_ctx_.is_completed() && (thread_idx < sched_thread_num_ || orch_to_sched_)) {
+    // Scheduler thread (orchestrator thread skips dispatch and exits after orchestration)
+    if (!sched_ctx_.is_completed() && thread_idx < sched_thread_num_) {
         // Device orchestration: wait for the primary orchestrator to initialize the SM header
         while (!runtime_init_ready_.load(std::memory_order_acquire)) {
             SPIN_WAIT_HINT();
@@ -812,7 +809,6 @@ void AicpuExecutor::deinit(Runtime *runtime) {
 
     aicpu_thread_num_ = 0;
     sched_thread_num_ = 0;
-    orch_to_sched_ = false;
     serial_orch_sched_ = false;
 
     orch_args_cached_.reset();

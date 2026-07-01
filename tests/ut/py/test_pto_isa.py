@@ -52,40 +52,19 @@ def test_read_pto_isa_pin_rejects_invalid_content(tmp_path):
         pto_isa.read_pto_isa_pin(pin)
 
 
-def test_resolve_pto_isa_commit_prefers_explicit_over_env_and_pin(monkeypatch):
-    monkeypatch.setenv("SIMPLER_PTO_ISA_COMMIT", PIN_B)
-    monkeypatch.setattr(pto_isa, "read_pto_isa_pin", lambda: PIN_C)
-
+def test_resolve_pto_isa_commit_prefers_explicit_over_pin():
     assert pto_isa.resolve_pto_isa_commit(PIN_A) == PIN_A
 
 
-def test_resolve_pto_isa_commit_prefers_env_over_pin(monkeypatch):
-    monkeypatch.setenv("SIMPLER_PTO_ISA_COMMIT", PIN_B)
-    monkeypatch.setattr(pto_isa, "read_pto_isa_pin", lambda: PIN_C)
-
-    assert pto_isa.resolve_pto_isa_commit() == PIN_B
-
-
 def test_resolve_pto_isa_commit_uses_pin_by_default(monkeypatch):
-    monkeypatch.delenv("SIMPLER_PTO_ISA_COMMIT", raising=False)
     monkeypatch.setattr(pto_isa, "read_pto_isa_pin", lambda: PIN_C)
 
     assert pto_isa.resolve_pto_isa_commit() == PIN_C
 
 
 @pytest.mark.parametrize("value", ["latest", "head", "none", ""])
-def test_resolve_pto_isa_commit_explicit_unpinned_values_return_none(value, monkeypatch):
-    monkeypatch.setenv("SIMPLER_PTO_ISA_COMMIT", PIN_B)
-    monkeypatch.setattr(pto_isa, "read_pto_isa_pin", lambda: PIN_C)
-
+def test_resolve_pto_isa_commit_explicit_unpinned_values_return_none(value):
     assert pto_isa.resolve_pto_isa_commit(value) is None
-
-
-def test_resolve_pto_isa_commit_env_latest_overrides_pin(monkeypatch):
-    monkeypatch.setenv("SIMPLER_PTO_ISA_COMMIT", "latest")
-    monkeypatch.setattr(pto_isa, "read_pto_isa_pin", lambda: PIN_C)
-
-    assert pto_isa.resolve_pto_isa_commit() is None
 
 
 def test_ensure_pto_isa_root_uses_pin_instead_of_latest_for_existing_clone(tmp_path, monkeypatch):
@@ -95,7 +74,6 @@ def test_ensure_pto_isa_root_uses_pin_instead_of_latest_for_existing_clone(tmp_p
     updated = []
 
     monkeypatch.delenv("PTO_ISA_ROOT", raising=False)
-    monkeypatch.delenv("SIMPLER_PTO_ISA_COMMIT", raising=False)
     monkeypatch.setattr(pto_isa, "read_pto_isa_pin", lambda: PIN_A)
     monkeypatch.setattr(pto_isa, "get_pto_isa_clone_path", lambda: clone_path)
     monkeypatch.setattr(
@@ -236,7 +214,6 @@ def test_ensure_pto_isa_root_rejects_existing_clone_when_pin_checkout_fails(tmp_
     updated = []
 
     monkeypatch.delenv("PTO_ISA_ROOT", raising=False)
-    monkeypatch.delenv("SIMPLER_PTO_ISA_COMMIT", raising=False)
     monkeypatch.setattr(pto_isa, "read_pto_isa_pin", lambda: PIN_A)
     monkeypatch.setattr(pto_isa, "get_pto_isa_clone_path", lambda: clone_path)
     monkeypatch.setattr(pto_isa, "checkout_pto_isa_commit", lambda path, commit, verbose=False: False)
@@ -257,7 +234,6 @@ def test_ensure_pto_isa_root_rejects_clone_when_pin_checkout_fails_after_clone(t
         return False
 
     monkeypatch.delenv("PTO_ISA_ROOT", raising=False)
-    monkeypatch.delenv("SIMPLER_PTO_ISA_COMMIT", raising=False)
     monkeypatch.setattr(pto_isa, "read_pto_isa_pin", lambda: PIN_A)
     monkeypatch.setattr(pto_isa, "get_pto_isa_clone_path", lambda: clone_path)
     monkeypatch.setattr(pto_isa, "_clone", clone_then_fail)
@@ -302,7 +278,6 @@ def test_validate_runtime_pto_isa_rejects_when_run_commit_unavailable(tmp_path, 
     )
     monkeypatch.delenv("SIMPLER_RUN_PTO_ISA_COMMIT", raising=False)
     monkeypatch.delenv("PTO_ISA_ROOT", raising=False)
-    monkeypatch.delenv("SIMPLER_PTO_ISA_COMMIT", raising=False)
     monkeypatch.setattr(pto_isa, "read_pto_isa_pin", lambda: None)
 
     with pytest.raises(RuntimeError, match="Cannot verify PTO-ISA runtime revision"):
@@ -319,12 +294,12 @@ def test_validate_runtime_pto_isa_rejects_mismatch(tmp_path, monkeypatch):
         pto_isa.validate_runtime_pto_isa_compatible(tmp_path)
 
 
-def test_validate_runtime_pto_isa_uses_explicit_env_for_non_git_env_root(tmp_path, monkeypatch, caplog):
+def test_validate_runtime_pto_isa_uses_pin_for_non_git_env_root(tmp_path, monkeypatch, caplog):
     (tmp_path / pto_isa.PTO_ISA_BUILD_METADATA).write_text(
         json.dumps({"schema_version": 1, "pto_isa_commit": "build_sha"}) + "\n"
     )
     monkeypatch.delenv("SIMPLER_RUN_PTO_ISA_COMMIT", raising=False)
-    monkeypatch.setenv("SIMPLER_PTO_ISA_COMMIT", "build_sha")
+    monkeypatch.setattr(pto_isa, "read_pto_isa_pin", lambda: "build_sha")
     monkeypatch.setenv("PTO_ISA_ROOT", str(tmp_path / "pto-isa"))
     (tmp_path / "pto-isa").mkdir()
     monkeypatch.setattr(pto_isa, "get_pto_isa_head", lambda root: "")
@@ -334,12 +309,12 @@ def test_validate_runtime_pto_isa_uses_explicit_env_for_non_git_env_root(tmp_pat
     assert "falling back to resolved PTO-ISA commit" in caplog.text
 
 
-def test_validate_runtime_pto_isa_rejects_latest_with_non_git_env_root(tmp_path, monkeypatch):
+def test_validate_runtime_pto_isa_rejects_when_pin_missing_with_non_git_env_root(tmp_path, monkeypatch):
     (tmp_path / pto_isa.PTO_ISA_BUILD_METADATA).write_text(
         json.dumps({"schema_version": 1, "pto_isa_commit": "build_sha"}) + "\n"
     )
     monkeypatch.delenv("SIMPLER_RUN_PTO_ISA_COMMIT", raising=False)
-    monkeypatch.setenv("SIMPLER_PTO_ISA_COMMIT", "latest")
+    monkeypatch.setattr(pto_isa, "read_pto_isa_pin", lambda: None)
     monkeypatch.setenv("PTO_ISA_ROOT", str(tmp_path / "pto-isa"))
     (tmp_path / "pto-isa").mkdir()
     monkeypatch.setattr(pto_isa, "get_pto_isa_head", lambda root: "")

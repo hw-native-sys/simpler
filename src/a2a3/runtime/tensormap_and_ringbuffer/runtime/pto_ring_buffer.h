@@ -521,6 +521,15 @@ struct PTO2FaninPool {
         error_code_ptr = in_error_code_ptr;
     }
 
+    void reset_for_reuse(std::atomic<int32_t> *in_error_code_ptr) {
+        top = 1;
+        tail = 1;
+        high_water = 0;
+        reclaim_task_cursor = 0;
+        base[0].slot_state = nullptr;
+        error_code_ptr = in_error_code_ptr;
+    }
+
     void reclaim(PTO2SharedMemoryRingHeader &ring, int32_t sm_last_task_alive);
 
     bool ensure_space(PTO2SharedMemoryRingHeader &ring, int32_t needed);
@@ -685,6 +694,16 @@ struct PTO2DepListPool {
         base[0].slot_state = nullptr;
         base[0].next = nullptr;
 
+        error_code_ptr = in_error_code_ptr;
+    }
+
+    void reset_for_reuse(std::atomic<int32_t> *in_error_code_ptr) {
+        top = 1;
+        tail = 1;
+        high_water = 0;
+        last_reclaimed = 0;
+        base[0].slot_state = nullptr;
+        base[0].next = nullptr;
         error_code_ptr = in_error_code_ptr;
     }
 

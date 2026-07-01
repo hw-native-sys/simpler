@@ -57,17 +57,6 @@ void set_platform_regs(uint64_t regs);
  */
 uint64_t get_platform_regs();
 
-/**
- * Set the ACL device ordinal. Latched once per device by simpler_aicpu_init
- * (from InitArgs.device_id) into this resident-SO global; the executor reads it
- * to make the staged orchestration SO filename unique per device so paired dies
- * sharing the preinstall filesystem never collide.
- */
-void set_orch_device_id(int device_id);
-
-/** Get the ACL device ordinal set for the current run (0 if unset). */
-int get_orch_device_id();
-
 #ifdef __cplusplus
 }
 #endif

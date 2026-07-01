@@ -64,6 +64,8 @@ PTO2TensorMapLayout PTO2TensorMap::reserve_layout(
     layout.off_buckets = arena.reserve(
         static_cast<size_t>(new_num_buckets) * sizeof(PTO2TensorMapEntry *), alignof(PTO2TensorMapEntry *)
     );
+    layout.off_bucket_epochs =
+        arena.reserve(static_cast<size_t>(new_num_buckets) * sizeof(uint32_t), alignof(uint32_t));
     layout.off_entry_pool =
         arena.reserve(static_cast<size_t>(new_pool_size) * sizeof(PTO2TensorMapEntry), alignof(PTO2TensorMapEntry));
     layout.off_free_entry_list =
@@ -72,6 +74,8 @@ PTO2TensorMapLayout PTO2TensorMap::reserve_layout(
         layout.off_task_entry_heads[r] = arena.reserve(
             static_cast<size_t>(new_task_window_sizes[r]) * sizeof(PTO2TensorMapEntry *), alignof(PTO2TensorMapEntry *)
         );
+        layout.off_task_entry_head_epochs[r] =
+            arena.reserve(static_cast<size_t>(new_task_window_sizes[r]) * sizeof(uint32_t), alignof(uint32_t));
     }
     return layout;
 }
@@ -88,12 +92,14 @@ bool PTO2TensorMap::init_data_from_layout(const PTO2TensorMapLayout &layout, Dev
     // Address arena regions for data writes; do not store these in struct
     // fields (wire_arena_pointers does that).
     auto *buckets_arena = static_cast<PTO2TensorMapEntry **>(arena.region_ptr(layout.off_buckets));
+    auto *bucket_epochs_arena = static_cast<uint32_t *>(arena.region_ptr(layout.off_bucket_epochs));
     auto *entry_pool_arena = static_cast<PTO2TensorMapEntry *>(arena.region_ptr(layout.off_entry_pool));
     auto *free_list_arena = static_cast<PTO2TensorMapEntry **>(arena.region_ptr(layout.off_free_entry_list));
 
     // buckets[]: empty == nullptr.
     for (int32_t i = 0; i < num_buckets; i++) {
         buckets_arena[i] = nullptr;
+        bucket_epochs_arena[i] = 0;
     }
 
     // entry_pool: zero-init equivalent to the previous calloc(entry_pool, ...).
@@ -118,8 +124,10 @@ bool PTO2TensorMap::init_data_from_layout(const PTO2TensorMapLayout &layout, Dev
 
     for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
         auto *heads_arena = static_cast<PTO2TensorMapEntry **>(arena.region_ptr(layout.off_task_entry_heads[r]));
+        auto *head_epochs_arena = static_cast<uint32_t *>(arena.region_ptr(layout.off_task_entry_head_epochs[r]));
         for (int32_t i = 0; i < layout.task_window_sizes[r]; i++) {
             heads_arena[i] = nullptr;
+            head_epochs_arena[i] = 0;
         }
         task_window_sizes[r] = layout.task_window_sizes[r];
         last_task_alives[r] = 0;
@@ -129,12 +137,35 @@ bool PTO2TensorMap::init_data_from_layout(const PTO2TensorMapLayout &layout, Dev
     return true;
 }
 
+void PTO2TensorMap::reset_for_reuse(const PTO2TensorMapLayout &layout) {
+    num_buckets = layout.num_buckets;
+    pool_size = layout.pool_size;
+    next_entry_idx = 0;
+    free_num = 0;
+    current_epoch++;
+    if (current_epoch == 0) {
+        current_epoch = 1;
+        memset(bucket_epochs, 0, static_cast<size_t>(layout.num_buckets) * sizeof(uint32_t));
+        for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
+            memset(task_entry_head_epochs[r], 0, static_cast<size_t>(layout.task_window_sizes[r]) * sizeof(uint32_t));
+        }
+    }
+
+    for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
+        task_window_sizes[r] = layout.task_window_sizes[r];
+        last_task_alives[r] = 0;
+        last_cleanup[r] = 0;
+    }
+}
+
 void PTO2TensorMap::wire_arena_pointers(const PTO2TensorMapLayout &layout, DeviceArena &arena) {
     buckets = static_cast<PTO2TensorMapEntry **>(arena.region_ptr(layout.off_buckets));
+    bucket_epochs = static_cast<uint32_t *>(arena.region_ptr(layout.off_bucket_epochs));
     entry_pool = static_cast<PTO2TensorMapEntry *>(arena.region_ptr(layout.off_entry_pool));
     free_entry_list = static_cast<PTO2TensorMapEntry **>(arena.region_ptr(layout.off_free_entry_list));
     for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
         task_entry_heads[r] = static_cast<PTO2TensorMapEntry **>(arena.region_ptr(layout.off_task_entry_heads[r]));
+        task_entry_head_epochs[r] = static_cast<uint32_t *>(arena.region_ptr(layout.off_task_entry_head_epochs[r]));
     }
 }
 
@@ -143,10 +174,12 @@ void PTO2TensorMap::destroy() {
     // stray post-destroy access trips a nullptr dereference instead of reading
     // a recycled allocation.
     buckets = nullptr;
+    bucket_epochs = nullptr;
     entry_pool = nullptr;
     free_entry_list = nullptr;
     for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
         task_entry_heads[r] = nullptr;
+        task_entry_head_epochs[r] = nullptr;
     }
 }
 

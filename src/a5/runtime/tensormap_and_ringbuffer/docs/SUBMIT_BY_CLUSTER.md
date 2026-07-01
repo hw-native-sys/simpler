@@ -36,7 +36,7 @@ Legacy per-task submit (`kernel_id + worker_type`) cannot express atomic co-disp
 
 Design must preserve the current main runtime architecture:
 
-1. Executor threading split (orchestrator thread vs scheduler threads), and post-orchestrator transition (`transition_requested_` + `reassign_cores_for_all_threads()`).
+1. Executor threading split (orchestrator thread vs scheduler threads); the orchestrator thread exits after the task graph is built while scheduler threads dispatch to completion.
 2. Shared-memory hot/cold split (`PTO2TaskDescriptor` hot + `PTO2TaskPayload` cold).
 
 ## 5. Terminology
@@ -146,10 +146,8 @@ This project-defined flattened numbering is kept unchanged.
 ### 9.2 Cluster Ownership
 
 1. One cluster must be owned by one scheduler domain/thread at a time.
-2. No split-cluster ownership in either:
-   - initial `assign_cores_to_threads()`
-   - post-orchestrator `reassign_cores_for_all_threads()`
-3. Lane occupancy bookkeeping must remain consistent with ownership after reassignment.
+2. No split-cluster ownership in `assign_cores_to_threads()`.
+3. Lane occupancy bookkeeping must remain consistent with ownership.
 
 ## 10. Functional Requirements
 

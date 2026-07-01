@@ -74,9 +74,11 @@ struct Segment {
  */
 struct PTO2TensorMapLayout {
     size_t off_buckets;
+    size_t off_bucket_epochs;
     size_t off_entry_pool;
     size_t off_free_entry_list;
     size_t off_task_entry_heads[PTO2_MAX_RING_DEPTH];
+    size_t off_task_entry_head_epochs[PTO2_MAX_RING_DEPTH];
     int32_t num_buckets;
     int32_t pool_size;
     int32_t task_window_sizes[PTO2_MAX_RING_DEPTH];
@@ -359,7 +361,8 @@ static_assert(
 struct PTO2TensorMap {
     // Hash table buckets (fixed size, power of 2)
     PTO2TensorMapEntry **buckets;  // Array of offsets into entry_pool (-1 = empty)
-    int32_t num_buckets;           // Must be power of 2 for fast modulo
+    uint32_t *bucket_epochs;
+    int32_t num_buckets;  // Must be power of 2 for fast modulo
 
     // Entry pool as ring buffer
     PTO2TensorMapEntry *entry_pool;        // Ring buffer of entries
@@ -371,7 +374,9 @@ struct PTO2TensorMap {
     // Per-ring per-task entry tracking (for efficient bucket cleanup)
     // Indexed by [ring_id][local_id & (task_window_sizes[ring_id] - 1)]
     PTO2TensorMapEntry **task_entry_heads[PTO2_MAX_RING_DEPTH];
+    uint32_t *task_entry_head_epochs[PTO2_MAX_RING_DEPTH];
     int32_t task_window_sizes[PTO2_MAX_RING_DEPTH];  // Per-ring task window size (for slot masking)
+    uint32_t current_epoch{1};
 
     // Per-ring validity threshold (for lazy invalidation)
     int32_t last_task_alives[PTO2_MAX_RING_DEPTH];  // Cached from shared memory per ring
@@ -421,7 +426,6 @@ struct PTO2TensorMap {
         }
         always_assert(next_entry_idx < pool_size);
         PTO2TensorMapEntry *res = &entry_pool[next_entry_idx++];
-        debug_assert(res->bucket_index == -1);
         return res;
     }
 
@@ -479,6 +483,7 @@ struct PTO2TensorMap {
      * a host arena that holds the prebuilt image.
      */
     bool init_data_from_layout(const PTO2TensorMapLayout &layout, DeviceArena &arena);
+    void reset_for_reuse(const PTO2TensorMapLayout &layout);
 
     /**
      * Phase 3b: write the arena-internal pointer fields. Idempotent;
@@ -518,6 +523,9 @@ struct PTO2TensorMap {
     template <typename Fn>
     void lookup(const Tensor &tensor, Fn &&on_match) {
         uint32_t bucket_index = hash(tensor.buffer.addr);
+        if (bucket_epochs[bucket_index] != current_epoch) {
+            return;
+        }
         PTO2TensorMapEntry *cur_entry = buckets[bucket_index];
 
 #if PTO2_TENSORMAP_PROFILING
@@ -598,6 +606,9 @@ struct PTO2TensorMap {
         // Iterate through retired tasks on this ring and remove their entries
         for (int32_t local_id = old_last_task_alive; local_id < new_last_task_alive; local_id++) {
             int32_t task_slot = local_id & (task_window_sizes[ring_id] - 1);
+            if (task_entry_head_epochs[ring_id][task_slot] != current_epoch) {
+                continue;
+            }
             PTO2TensorMapEntry *cur_entry = task_entry_heads[ring_id][task_slot];
 
             while (cur_entry != nullptr) {
@@ -649,6 +660,10 @@ struct PTO2TensorMap {
         entry->producer_task_id = producer_task_id;
 
         // Insert at head of hash bucket
+        if (bucket_epochs[bucket_index] != current_epoch) {
+            buckets[bucket_index] = nullptr;
+            bucket_epochs[bucket_index] = current_epoch;
+        }
         entry->bucket_index = bucket_index;
         entry->next_in_bucket = buckets[bucket_index];
         if (entry->next_in_bucket != nullptr) {
@@ -658,6 +673,10 @@ struct PTO2TensorMap {
         entry->prev_in_bucket = nullptr;
 
         // Link to task's entry list
+        if (task_entry_head_epochs[ring_id][task_slot] != current_epoch) {
+            task_entry_heads[ring_id][task_slot] = nullptr;
+            task_entry_head_epochs[ring_id][task_slot] = current_epoch;
+        }
         entry->next_in_task = task_entry_heads[ring_id][task_slot];
         entry->prev_in_task = nullptr;
         if (entry->next_in_task != nullptr) {

@@ -37,10 +37,8 @@ Runtime::Runtime() {
     memset(dev.aicpu_allowed_cpus, 0, sizeof(dev.aicpu_allowed_cpus));
     dev.aicpu_allowed_cpu_count = 0;
     dev.aicpu_launch_count = 0;
-    dev.orch_to_sched = false;
     dev.serial_orch_sched = false;
     dev.gm_sm_ptr_ = nullptr;
-    dev.slot_states_ptr_ = nullptr;
     dev.orch_args_storage_.clear();
     dev.prebuilt_arena_base_ = nullptr;
     dev.prebuilt_runtime_offset_ = 0;
@@ -50,7 +48,6 @@ Runtime::Runtime() {
     }
 
     // Initialize host-only tail.
-    gm_heap_ptr_ = nullptr;
     registered_kernel_count_ = 0;
 }
 
@@ -59,11 +56,8 @@ Runtime::Runtime() {
 // =============================================================================
 
 void *Runtime::get_gm_sm_ptr() const { return dev.gm_sm_ptr_; }
-void *Runtime::get_gm_heap_ptr() const { return gm_heap_ptr_; }
 const ChipStorageTaskArgs &Runtime::get_orch_args() const { return dev.orch_args_storage_; }
 void Runtime::set_gm_sm_ptr(void *p) { dev.gm_sm_ptr_ = p; }
-void Runtime::set_gm_heap(void *p) { gm_heap_ptr_ = p; }
-void Runtime::set_slot_states_ptr(void *p) { dev.slot_states_ptr_ = p; }
 void Runtime::set_orch_args(const ChipStorageTaskArgs &args) { dev.orch_args_storage_ = args; }
 
 void Runtime::set_prebuilt_arena(void *arena_base, size_t runtime_off) {

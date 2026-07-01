@@ -16,6 +16,7 @@
 
 #include "common.h"  // debug_assert
 #include "common/unified_log.h"
+#include "aicpu/aicpu_device_config.h"
 #include "aicpu/device_time.h"
 #include "aicpu/platform_regs.h"
 #include "callable.h"
@@ -520,8 +521,6 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
     PTO2TaskSlotState *deferred_release_slot_states[PTO2_DEFERRED_RELEASE_CAP];
     int32_t deferred_release_count = 0;
 
-    bool cores_released = false;
-
     // PMU runs require single-issue dispatch — overlapping in-flight tasks
     // pollute per-task PMU counters. Cached at function scope (parity with
     // a2a3): is_pmu_enabled() is extern "C" and the compiler cannot hoist it
@@ -602,10 +601,14 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
     // "now" so the first budget cycle starts when this thread does, not at
     // an undefined value.
     uint64_t last_progress_ts = get_sys_cnt_aicpu();
+    // Per-device override latched once at worker init by simpler_aicpu_init
+    // (InitArgs.scheduler_timeout_ms -> resident-SO global). 0 means no
+    // override; fall back to the compile-time SCHEDULER_TIMEOUT_CYCLES.
     uint64_t scheduler_timeout_cycles = SCHEDULER_TIMEOUT_CYCLES;
-    if (rt_ != nullptr && rt_->prebuilt_layout.scheduler_timeout_ms > 0) {
+    const int32_t scheduler_timeout_ms_override = get_scheduler_timeout_ms();
+    if (scheduler_timeout_ms_override > 0) {
         scheduler_timeout_cycles =
-            static_cast<uint64_t>(rt_->prebuilt_layout.scheduler_timeout_ms) * (PLATFORM_PROF_SYS_CNT_FREQ / 1000);
+            static_cast<uint64_t>(scheduler_timeout_ms_override) * (PLATFORM_PROF_SYS_CNT_FREQ / 1000);
     }
 
     while (true) {
@@ -626,11 +629,6 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
         int32_t task_count = 0;
         if (!tracker.has_any_running_cores()) {
             LoopAction action = handle_orchestrator_exit(thread_idx, header, runtime, task_count);
-            if (action == LoopAction::BREAK_LOOP) break;
-        }
-
-        if (!cores_released && orch_to_sched_) {
-            LoopAction action = handle_core_transition(cores_released);
             if (action == LoopAction::BREAK_LOOP) break;
         }
 

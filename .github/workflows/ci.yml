@@ -477,10 +477,10 @@ jobs:
           python3 -m venv --system-site-packages .venv
           source .venv/bin/activate
           pip install --upgrade pip
-          # Pin the onboard a2a3 host_runtime build to the same pto-isa commit
-          # the scene tests check out (PTO_ISA_COMMIT), so host_runtime.so and
-          # the test-time kernels share one pto-isa revision (see issue #1067).
-          pip install --config-settings=cmake.define.SIMPLER_PTO_ISA_COMMIT="${PTO_ISA_COMMIT}" '.[test]'
+          # The host_runtime build resolves pto-isa from pto_isa.pin by default
+          # (which CI exports as PTO_ISA_COMMIT), so host_runtime.so and the
+          # test-time kernels share one pto-isa revision (see issue #1067).
+          pip install '.[test]'
 
       - name: Run Python hardware unit tests
         run: |
@@ -571,10 +571,10 @@ jobs:
           python3 -m venv --system-site-packages .venv
           source .venv/bin/activate
           pip install --upgrade pip
-          # Pin the onboard a2a3 host_runtime build to the same pto-isa commit
-          # the scene tests check out (PTO_ISA_COMMIT), so host_runtime.so and
-          # the test-time kernels share one pto-isa revision (see issue #1067).
-          pip install --config-settings=cmake.define.SIMPLER_PTO_ISA_COMMIT="${PTO_ISA_COMMIT}" '.[test]'
+          # The host_runtime build resolves pto-isa from pto_isa.pin by default
+          # (which CI exports as PTO_ISA_COMMIT), so host_runtime.so and the
+          # test-time kernels share one pto-isa revision (see issue #1067).
+          pip install '.[test]'
           # Warn if graphviz isn't installed on the runner — the dep_gen
           # smoke step needs `dot` to render deps_viewer. The Python
           # has_binary("dot") guard in the test will skip cleanly without
@@ -695,10 +695,10 @@ jobs:
           python3 -m venv --system-site-packages .venv
           source .venv/bin/activate
           pip install --upgrade pip
-          # Pin the onboard a2a3 host_runtime build to the same pto-isa commit
-          # the scene tests check out (PTO_ISA_COMMIT), so host_runtime.so and
-          # the test-time kernels share one pto-isa revision (see issue #1067).
-          pip install --config-settings=cmake.define.SIMPLER_PTO_ISA_COMMIT="${PTO_ISA_COMMIT}" '.[test]'
+          # The host_runtime build resolves pto-isa from pto_isa.pin by default
+          # (which CI exports as PTO_ISA_COMMIT), so host_runtime.so and the
+          # test-time kernels share one pto-isa revision (see issue #1067).
+          pip install '.[test]'
 
       - name: Run Python hardware unit tests (a5)
         run: |
@@ -772,10 +772,10 @@ jobs:
           python3 -m venv --system-site-packages .venv
           source .venv/bin/activate
           pip install --upgrade pip
-          # Pin the onboard a2a3 host_runtime build to the same pto-isa commit
-          # the scene tests check out (PTO_ISA_COMMIT), so host_runtime.so and
-          # the test-time kernels share one pto-isa revision (see issue #1067).
-          pip install --config-settings=cmake.define.SIMPLER_PTO_ISA_COMMIT="${PTO_ISA_COMMIT}" '.[test]'
+          # The host_runtime build resolves pto-isa from pto_isa.pin by default
+          # (which CI exports as PTO_ISA_COMMIT), so host_runtime.so and the
+          # test-time kernels share one pto-isa revision (see issue #1067).
+          pip install '.[test]'
 
       - name: Run pytest scene tests (a5)
         run: |

@@ -91,15 +91,25 @@ HostRuntimeTimeoutConfig resolve_onboard_timeout_config() {
     bool host_timeout_env_set =
         parse_status.op_execute_env_set || parse_status.stream_sync_env_set || parse_status.scheduler_env_set;
     RuntimeTimeoutOrderStatus order_status = validate_runtime_timeout_order(cfg);
+    // The scheduler override is forwarded to the device (via InitArgs at init)
+    // only when explicitly set, valid, and consistent with the op/stream
+    // ordering. 0 means "no override" — the AICPU scheduler then keeps its
+    // compile-time default. op/stream remain host-side acl knobs.
+    int32_t scheduler_override = (parse_status.scheduler_env_set && parse_status.scheduler_valid &&
+                                  order_status == RuntimeTimeoutOrderStatus::OK) ?
+                                     cfg.scheduler_timeout_ms :
+                                     0;
     if (host_timeout_env_set && order_status != RuntimeTimeoutOrderStatus::OK) {
         LOG_WARN(
             "Ignoring PTO2 timeout env overrides: %s (scheduler=%d ms, op_execute=%llu us, stream_sync=%d ms)",
             runtime_timeout_order_status_name(order_status), cfg.scheduler_timeout_ms,
             (unsigned long long)cfg.op_execute_timeout_us, cfg.stream_sync_timeout_ms
         );
-        return HostRuntimeTimeoutConfig{order_defaults.op_execute_timeout_us, order_defaults.stream_sync_timeout_ms};
+        return HostRuntimeTimeoutConfig{
+            order_defaults.op_execute_timeout_us, order_defaults.stream_sync_timeout_ms, scheduler_override
+        };
     }
-    return HostRuntimeTimeoutConfig{cfg.op_execute_timeout_us, cfg.stream_sync_timeout_ms};
+    return HostRuntimeTimeoutConfig{cfg.op_execute_timeout_us, cfg.stream_sync_timeout_ms, scheduler_override};
 }
 
 }  // namespace
@@ -204,6 +214,47 @@ void *DeviceRunnerBase::acquire_pooled_runtime_arena() {
     return runtime_arena_pool_.base();
 }
 
+bool DeviceRunnerBase::lookup_prebuilt_runtime_arena_cache(
+    uint64_t hash, const void *key_data, size_t key_size, void **gm_heap_base, void **sm_base,
+    void **runtime_arena_base, size_t *runtime_off, const void **image_data, size_t *image_size
+) const {
+    if (!prebuilt_runtime_arena_cache_valid_ || prebuilt_runtime_arena_cache_hash_ != hash ||
+        prebuilt_runtime_arena_cache_key_.size() != key_size || key_data == nullptr || gm_heap_base == nullptr ||
+        sm_base == nullptr || runtime_arena_base == nullptr || runtime_off == nullptr || image_data == nullptr ||
+        image_size == nullptr) {
+        return false;
+    }
+    if (std::memcmp(prebuilt_runtime_arena_cache_key_.data(), key_data, key_size) != 0) {
+        return false;
+    }
+    *gm_heap_base = prebuilt_runtime_arena_cache_gm_heap_base_;
+    *sm_base = prebuilt_runtime_arena_cache_sm_base_;
+    *runtime_arena_base = prebuilt_runtime_arena_cache_runtime_arena_base_;
+    *runtime_off = prebuilt_runtime_arena_cache_runtime_off_;
+    *image_data = prebuilt_runtime_arena_cache_image_.data();
+    *image_size = prebuilt_runtime_arena_cache_image_.size();
+    return true;
+}
+
+void DeviceRunnerBase::mark_prebuilt_runtime_arena_cached(
+    uint64_t hash, const void *key_data, size_t key_size, void *gm_heap_base, void *sm_base, void *runtime_arena_base,
+    size_t runtime_off, const void *image_data, size_t image_size
+) {
+    prebuilt_runtime_arena_cache_valid_ = false;
+    prebuilt_runtime_arena_cache_hash_ = hash;
+    prebuilt_runtime_arena_cache_key_.assign(
+        static_cast<const uint8_t *>(key_data), static_cast<const uint8_t *>(key_data) + key_size
+    );
+    prebuilt_runtime_arena_cache_gm_heap_base_ = gm_heap_base;
+    prebuilt_runtime_arena_cache_sm_base_ = sm_base;
+    prebuilt_runtime_arena_cache_runtime_arena_base_ = runtime_arena_base;
+    prebuilt_runtime_arena_cache_runtime_off_ = runtime_off;
+    prebuilt_runtime_arena_cache_image_.assign(
+        static_cast<const uint8_t *>(image_data), static_cast<const uint8_t *>(image_data) + image_size
+    );
+    prebuilt_runtime_arena_cache_valid_ = true;
+}
+
 int DeviceRunnerBase::setup_static_arena(size_t gm_heap_size, size_t gm_sm_size, size_t runtime_arena_size) {
     // Three independent device_malloc'd buffers: GM heap, PTO2 SM, prebuilt
     // runtime arena. Split out from a single large allocation because the
@@ -215,7 +266,8 @@ int DeviceRunnerBase::setup_static_arena(size_t gm_heap_size, size_t gm_sm_size,
     // worker's lifetime). If a caller asks for a larger layout on any
     // region, redo just that region — already-committed peers stay alive
     // so their callers don't have to re-acquire.
-    auto commit_region = [](DeviceArena &arena, size_t &cached_size, size_t requested_size) -> int {
+    bool arena_changed = false;
+    auto commit_region = [&arena_changed](DeviceArena &arena, size_t &cached_size, size_t requested_size) -> int {
         if (requested_size == 0) {
             // hbg's runtime_arena path: caller passed 0 and never reserved
             // a region. Leave the arena uncommitted; acquire_pooled_* will
@@ -223,6 +275,7 @@ int DeviceRunnerBase::setup_static_arena(size_t gm_heap_size, size_t gm_sm_size,
             if (arena.is_committed() && cached_size != 0) {
                 arena.release();
                 cached_size = 0;
+                arena_changed = true;
             }
             return 0;
         }
@@ -231,6 +284,7 @@ int DeviceRunnerBase::setup_static_arena(size_t gm_heap_size, size_t gm_sm_size,
         }
         arena.release();
         cached_size = 0;
+        arena_changed = true;
         arena.reserve(requested_size, DeviceArena::kDefaultBaseAlign);
         if (arena.commit(DeviceArena::kDefaultBaseAlign) == nullptr) {
             // commit() failure leaves committed_=false, so the next entry's
@@ -259,7 +313,21 @@ int DeviceRunnerBase::setup_static_arena(size_t gm_heap_size, size_t gm_sm_size,
         cached_gm_heap_size_ = 0;
         cached_gm_sm_size_ = 0;
         cached_runtime_arena_size_ = 0;
+        prebuilt_runtime_arena_cache_valid_ = false;
+        prebuilt_runtime_arena_cache_key_.clear();
+        prebuilt_runtime_arena_cache_gm_heap_base_ = nullptr;
+        prebuilt_runtime_arena_cache_sm_base_ = nullptr;
+        prebuilt_runtime_arena_cache_runtime_arena_base_ = nullptr;
+        prebuilt_runtime_arena_cache_image_.clear();
         return -1;
+    }
+    if (arena_changed) {
+        prebuilt_runtime_arena_cache_valid_ = false;
+        prebuilt_runtime_arena_cache_key_.clear();
+        prebuilt_runtime_arena_cache_gm_heap_base_ = nullptr;
+        prebuilt_runtime_arena_cache_sm_base_ = nullptr;
+        prebuilt_runtime_arena_cache_runtime_arena_base_ = nullptr;
+        prebuilt_runtime_arena_cache_image_.clear();
     }
     return 0;
 }
@@ -374,6 +442,9 @@ int DeviceRunnerBase::ensure_aicpu_init_launched() {
     init_args.device_id = static_cast<uint32_t>(device_id_);
     init_args.log_level = static_cast<uint32_t>(HostLogger::get_instance().level());
     init_args.log_info_v = static_cast<uint32_t>(HostLogger::get_instance().info_v());
+    // Per-device scheduler watchdog override, resolved once at attach into
+    // timeout_config_. 0 -> the AICPU scheduler keeps its compile-time default.
+    init_args.scheduler_timeout_ms = timeout_config_.scheduler_timeout_ms;
 
     LOG_INFO_V0("=== launch_aicpu_payload %s ===", host::KernelNames::InitName);
     int rc = launch_aicpu_payload(
@@ -958,6 +1029,12 @@ int DeviceRunnerBase::finalize_common() {
     gm_heap_arena_.release();
     gm_sm_arena_.release();
     runtime_arena_pool_.release();
+    prebuilt_runtime_arena_cache_valid_ = false;
+    prebuilt_runtime_arena_cache_key_.clear();
+    prebuilt_runtime_arena_cache_gm_heap_base_ = nullptr;
+    prebuilt_runtime_arena_cache_sm_base_ = nullptr;
+    prebuilt_runtime_arena_cache_runtime_arena_base_ = nullptr;
+    prebuilt_runtime_arena_cache_image_.clear();
 
     // Free the 8-byte device_wall buffer (allocated lazily in run()) while
     // mem_alloc_ and the device context are still live. free_tensor() routes

@@ -125,6 +125,8 @@ struct alignas(64) PTO2ReadyQueue {
         return (e >= d) ? (e - d) : 0;
     }
 
+    void reset_for_reuse() {}
+
     bool push(PTO2TaskSlotState *slot_state) {
         uint64_t pos;
         PTO2ReadyQueueSlot *slot;
@@ -484,6 +486,13 @@ struct alignas(64) PTO2SpscQueue {
         buffer_ = static_cast<PTO2TaskSlotState **>(arena.region_ptr(buffer_off));
     }
 
+    void reset_for_reuse() {
+        uint64_t h = head_.load(std::memory_order_relaxed);
+        tail_.store(h, std::memory_order_relaxed);
+        tail_cached_ = h;
+        head_cached_ = h;
+    }
+
     // Arena owns the buffer; here we only forget our pointer.
     void destroy() { buffer_ = nullptr; }
 
@@ -602,6 +611,7 @@ struct PTO2SchedulerState {
         // the device address of the SM ring header — computed via offset
         // arithmetic, no SM dereference.
         bool init_data_from_layout(void *sm_dev_base, int32_t ring_id);
+        void reset_for_reuse(void *sm_dev_base, int32_t ring_id, std::atomic<int32_t> *orch_err);
         void destroy();
 
         void sync_to_sm() { ring->fc.last_task_alive.store(last_task_alive, std::memory_order_release); }
@@ -1223,6 +1233,7 @@ struct PTO2SchedulerState {
     // scheduler only needs the SM header / ring header base addresses,
     // both window-size-independent.)
     bool init_data_from_layout(const PTO2SchedulerLayout &layout, DeviceArena &arena, void *sm_dev_base);
+    void reset_for_reuse(const PTO2SchedulerLayout &layout, void *sm_dev_base);
 
     // Phase 3b: write the arena-internal pointer fields
     // (ready_queues[].slots, dummy_ready_queue.slots, dep_pool.base for each

@@ -124,6 +124,14 @@ public:
     void *acquire_pooled_gm_heap();
     void *acquire_pooled_gm_sm();
     void *acquire_pooled_runtime_arena();
+    bool lookup_prebuilt_runtime_arena_cache(
+        uint64_t hash, const void *key_data, size_t key_size, void **gm_heap_base, void **sm_base,
+        void **runtime_arena_base, size_t *runtime_off, const void **image_data, size_t *image_size
+    ) const;
+    void mark_prebuilt_runtime_arena_cached(
+        uint64_t hash, const void *key_data, size_t key_size, void *gm_heap_base, void *sm_base,
+        void *runtime_arena_base, size_t runtime_off, const void *image_data, size_t image_size
+    );
 
     /**
      * Create a thread bound to this device. The thread calls
@@ -803,6 +811,14 @@ protected:
     size_t cached_gm_heap_size_{0};
     size_t cached_gm_sm_size_{0};
     size_t cached_runtime_arena_size_{0};
+    bool prebuilt_runtime_arena_cache_valid_{false};
+    uint64_t prebuilt_runtime_arena_cache_hash_{0};
+    std::vector<uint8_t> prebuilt_runtime_arena_cache_key_;
+    void *prebuilt_runtime_arena_cache_gm_heap_base_{nullptr};
+    void *prebuilt_runtime_arena_cache_sm_base_{nullptr};
+    void *prebuilt_runtime_arena_cache_runtime_arena_base_{nullptr};
+    size_t prebuilt_runtime_arena_cache_runtime_off_{0};
+    std::vector<uint8_t> prebuilt_runtime_arena_cache_image_;
 
     // Persistent AICPU / AICore streams created in
     // `ensure_device_initialized()` and torn down in the subclass's
