@@ -17,7 +17,7 @@
 namespace {
 
 constexpr uint32_t kTransformFuncId = 0;
-constexpr int kExpectedArgCount = 11;
+constexpr int kExpectedArgCount = 13;
 constexpr uint64_t kQueueTimeoutNs = 5000000000ULL;
 constexpr uint32_t kRows = 128;
 constexpr uint32_t kCols = 128;
@@ -91,10 +91,8 @@ __attribute__((visibility("default"))) void l3_l2_message_queue_orchestration(co
         orch_args.scalar(3), orch_args.scalar(4), orch_args.scalar(5),
     };
     L3L2QueueArgs queue_args{
-        orch_args.scalar(6),
-        orch_args.scalar(7),
-        orch_args.scalar(8),
-        orch_args.scalar(9),
+        orch_args.scalar(6), orch_args.scalar(7),  orch_args.scalar(8),
+        orch_args.scalar(9), orch_args.scalar(10), orch_args.scalar(11),
     };
     L3L2QueueEndpoint queue(desc, queue_args);
     if (has_queue_error(queue)) {
@@ -102,7 +100,7 @@ __attribute__((visibility("default"))) void l3_l2_message_queue_orchestration(co
         return;
     }
 
-    const float scalar = from_u64<float>(orch_args.scalar(10));
+    const float scalar = from_u64<float>(orch_args.scalar(12));
     for (;;) {
         L3L2QueueInputHandle input{};
         if (!queue.input().peek(kQueueTimeoutNs, &input)) {
