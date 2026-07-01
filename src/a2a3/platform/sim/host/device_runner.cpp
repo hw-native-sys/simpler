@@ -426,7 +426,9 @@ int DeviceRunner::run(Runtime &runtime, int block_dim, int launch_aicpu_num) {
         set_dump_args_enabled_func_ == nullptr || set_platform_pmu_base_func_ == nullptr ||
         set_platform_pmu_reg_addrs_func_ == nullptr || set_pmu_enabled_func_ == nullptr ||
         set_platform_dep_gen_base_func_ == nullptr || set_dep_gen_enabled_func_ == nullptr ||
-        set_scope_stats_enabled_func_ == nullptr || set_platform_scope_stats_base_func_ == nullptr) {
+        set_scope_stats_enabled_func_ == nullptr || set_platform_scope_stats_base_func_ == nullptr ||
+        set_platform_l2_swimlane_base_func_ == nullptr ||
+        set_platform_l2_swimlane_aicore_rotation_table_func_ == nullptr || set_l2_swimlane_enabled_func_ == nullptr) {
         LOG_ERROR("Executor functions not loaded. Call ensure_binaries_loaded first.");
         return -1;
     }
