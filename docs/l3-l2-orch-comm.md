@@ -3,6 +3,10 @@
 L3-L2 Orchestrator Communication lets an L3 Host Orchestrator exchange payload
 bytes and signal counters with a running L2 AICPU Orchestrator task.
 
+This page documents the low-level region, payload, and counter primitives. For
+the ordered SPSC message queue wrapper built on these primitives, see
+[l3-l2-message-queue.md](l3-l2-message-queue.md).
+
 The intended use case is in-flight interaction: L3 can write input payload,
 publish a data-ready counter, wait for L2/AICore completion, and read output
 payload without ending the L2 orchestration task. For where L3 and L2 sit in
