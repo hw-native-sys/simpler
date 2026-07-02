@@ -24,6 +24,7 @@
 #include "common/l2_swimlane_profiling.h"
 #include "common/memory_barrier.h"
 #include "common/platform_config.h"
+#include "device_time_fast.h"
 #include "pto_runtime2.h"
 #include "runtime.h"
 #include "spin_hint.h"
@@ -161,6 +162,10 @@ SchedulerContext::PublishHandle SchedulerContext::prepare_subtask_to_core(
     uint32_t buf_idx = reg_task_id & 1u;
     PTO2DispatchPayload &payload = payload_per_core_[core_id][buf_idx];
     DeferredCompletionSlab *deferred_slab = &deferred_slab_per_core_[core_id][buf_idx];
+    // Pull ownership of the per-core dispatch buffers before the hot stores below.
+    __builtin_prefetch(reinterpret_cast<const char *>(&payload), 1, 3);
+    __builtin_prefetch(reinterpret_cast<const char *>(&payload) + 64, 1, 3);
+    __builtin_prefetch(reinterpret_cast<const char *>(deferred_slab), 1, 3);
     deferred_slab->count = 0;
     deferred_slab->error_code = PTO2_ERROR_NONE;
     AsyncCtx async_ctx = AsyncCtx::make(slot_state.task->task_id, deferred_slab);
@@ -346,7 +351,7 @@ void SchedulerContext::dispatch_shape(
             uint64_t dispatch_ts = 0;
 #if PTO2_PROFILING
             if (l2_swimlane_level_ >= L2SwimlaneLevel::AICPU_TIMING) {
-                dispatch_ts = get_sys_cnt_aicpu();
+                dispatch_ts = fast_sys_cnt_aicpu();
             }
 #endif
             for (int i = 0; i < handle_count; i++) {
@@ -643,7 +648,7 @@ int32_t SchedulerContext::stage_consumer_blocks(
     CoreTracker &tracker = core_trackers_[thread_idx];
     // Stamp the real pre-stage time (NOT 0) so the swimlane shows these blocks
     // dispatched during the producer's run, not at trace start.
-    uint64_t early_dispatch_ts = get_sys_cnt_aicpu();
+    uint64_t early_dispatch_ts = fast_sys_cnt_aicpu();
     uint64_t my_cores[PTO2_SPEC_CORE_MASK_WORDS] = {0};  // cores this thread gated (for self-ring)
     int32_t staged = 0;
     int32_t block = start;

@@ -23,6 +23,7 @@
 #include "common/l2_swimlane_profiling.h"
 #include "common/memory_barrier.h"
 #include "common/platform_config.h"
+#include "device_time_fast.h"
 #include "pto_runtime2.h"
 #include "runtime.h"
 #include "spin_hint.h"
@@ -145,6 +146,10 @@ void SchedulerContext::dispatch_subtask_to_core(
     uint32_t buf_idx = reg_task_id & 1u;
     PTO2DispatchPayload &payload = payload_per_core_[core_id][buf_idx];
     DeferredCompletionSlab *deferred_slab = &deferred_slab_per_core_[core_id][buf_idx];
+    // Pull ownership of the per-core dispatch buffers before the hot stores below.
+    __builtin_prefetch(reinterpret_cast<const char *>(&payload), 1, 3);
+    __builtin_prefetch(reinterpret_cast<const char *>(&payload) + 64, 1, 3);
+    __builtin_prefetch(reinterpret_cast<const char *>(deferred_slab), 1, 3);
     deferred_slab->count = 0;
     deferred_slab->error_code = PTO2_ERROR_NONE;
     AsyncCtx async_ctx = AsyncCtx::make(slot_state.task->task_id, deferred_slab);
@@ -189,7 +194,7 @@ void SchedulerContext::dispatch_subtask_to_core(
     // immediately before the DATA_MAIN_BASE write.
 #if PTO2_PROFILING
     if (l2_swimlane_level_ >= L2SwimlaneLevel::AICPU_TIMING) {
-        uint64_t dispatch_ts = get_sys_cnt_aicpu();
+        uint64_t dispatch_ts = fast_sys_cnt_aicpu();
         if (to_pending) {
             core_exec_state.pending_dispatch_timestamp = dispatch_ts;
         } else {

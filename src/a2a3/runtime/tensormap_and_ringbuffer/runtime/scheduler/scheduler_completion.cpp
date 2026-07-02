@@ -18,6 +18,7 @@
 #include "common/l2_swimlane_profiling.h"
 #include "common/memory_barrier.h"
 #include "common/platform_config.h"
+#include "device_time_fast.h"
 #include "pto_runtime2.h"
 #include "runtime.h"
 #include "spin_hint.h"
@@ -506,7 +507,7 @@ void SchedulerContext::drain_worker_dispatch(int32_t block_num) {
         uint64_t dispatch_ts = 0;
 #if PTO2_PROFILING
         if (l2_swimlane_level_ >= L2SwimlaneLevel::AICPU_TIMING) {
-            dispatch_ts = get_sys_cnt_aicpu();
+            dispatch_ts = fast_sys_cnt_aicpu();
         }
 #endif
         for (int i = 0; i < handle_count; i++) {
