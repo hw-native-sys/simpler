@@ -36,9 +36,23 @@ PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 # --- tensormap_and_ringbuffer ---
 declare -A TMR_EXAMPLE_CASES=(
     [alternating_matmul_add]="Case1"
+    [benchmark_bgemm]="Case0"
+    [paged_attention_unroll]="Case1,Case2"
+    [paged_attention_unroll_manual_scope]="Case1,Case2"
+    [batch_paged_attention]="Case1"
+    # spmd_paged_attention temporarily disabled: pre-existing onboard stall
+    # (507018 S1:running-stalled), reproduces on baseline — see KNOWN_ISSUES.md.
+    # [spmd_paged_attention]="Case1,Case2"
+    [qwen3_14b_decode]="StressBatch16Seq3500"
 )
 TMR_EXAMPLE_ORDER=(
     alternating_matmul_add
+    benchmark_bgemm
+    paged_attention_unroll
+    paged_attention_unroll_manual_scope
+    batch_paged_attention
+    # spmd_paged_attention  # temporarily disabled — see KNOWN_ISSUES.md
+    qwen3_14b_decode
 )
 
 # ---------------------------------------------------------------------------

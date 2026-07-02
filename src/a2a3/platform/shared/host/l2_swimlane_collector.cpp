@@ -846,9 +846,7 @@ int L2SwimlaneCollector::export_swimlane_json() {
                     outfile << ", \"pop_hit\": " << pr.pop_hit << ", \"pop_miss\": " << pr.pop_miss;
                 }
                 // Queue-depth snapshots — [AIC, AIV, MIX] per L2SwimlaneAicpuSchedPhaseRecord docstring.
-                emit_depth_array("local_at_start", pr.local_depth_at_start);
                 emit_depth_array("shared_at_start", pr.shared_depth_at_start);
-                emit_depth_array("local_at_end", pr.local_depth_at_end);
                 emit_depth_array("shared_at_end", pr.shared_depth_at_end);
                 outfile << "}";
                 first = false;

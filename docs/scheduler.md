@@ -84,8 +84,8 @@ ReadyQueue ready_next_level_queue_;   // WorkerType::NEXT_LEVEL tasks
 ReadyQueue ready_sub_queue_;          // WorkerType::SUB tasks
 ```
 
-Matching L2's per-shape ready buffer (`PTO2_LocalReadyBuffer` fan-out to
-AIC / AIV / MIX queues), with the L3+ exception that we use `std::queue`
+Matching L2's per-shape ready queues (the shared MPMC `ready_queues[]` split
+by AIC / AIV / MIX), with the L3+ exception that we use `std::queue`
 (Allowed Exception 3: dynamic data structures on host) and only two
 worker types (Allowed Exception 2: `NEXT_LEVEL` + `SUB` at L3+, not
 AIC / AIV / MIX). `Orchestrator::submit_*` routes each slot to the queue

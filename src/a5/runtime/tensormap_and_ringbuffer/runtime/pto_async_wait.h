@@ -24,7 +24,6 @@
 #include "pto_runtime2_types.h"
 
 struct PTO2SchedulerState;
-struct PTO2LocalReadyBuffer;
 struct CompletionStats;
 
 inline constexpr int32_t MAX_ASYNC_WAITS = 64;
@@ -177,7 +176,6 @@ struct AsyncWaitList {
     // entries[]).
     struct DrainCompletionSink {
         PTO2SchedulerState *sched{nullptr};
-        PTO2LocalReadyBuffer *local_bufs{nullptr};
         PTO2TaskSlotState **deferred_release_slot_states{nullptr};
         int32_t *deferred_release_count{nullptr};
         int32_t deferred_release_capacity{0};
@@ -296,7 +294,7 @@ struct AsyncWaitList {
 
     template <bool Profiling>
     AsyncPollResult poll_and_complete(
-        AICoreCompletionMailbox *aicore_mailbox, PTO2SchedulerState *sched, PTO2LocalReadyBuffer *local_bufs,
+        AICoreCompletionMailbox *aicore_mailbox, PTO2SchedulerState *sched,
         PTO2TaskSlotState **deferred_release_slot_states, int32_t &deferred_release_count,
         int32_t deferred_release_capacity
 #if PTO2_SCHED_PROFILING

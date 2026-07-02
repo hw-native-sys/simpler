@@ -166,11 +166,9 @@ void l2_swimlane_aicpu_init_phase(int worker_count, int num_sched_phase_threads,
  * pool. Silently drops records when the buffer is full or the pool was not
  * primed (init failed for this thread).
  *
- * Queue-depth snapshots distinguish "task hidden in T0's local_buf" from
- * "shared queue has it but peers spin on the wrong shape" — the former shows
- * `local_depth > 0, shared_depth == 0` for the owning thread while peers see
- * `shared_depth == 0` until overflow. Pass nullptr for any of the four arrays
- * when not capturing (the record's corresponding slot is zero-filled).
+ * Queue-depth snapshots record the per-shape shared ready-queue occupancy at
+ * phase boundaries. Pass nullptr for either array when not capturing (the
+ * record's corresponding slot is zero-filled).
  *
  * @param thread_idx       Scheduler thread index
  * @param kind             Complete or Dispatch
@@ -180,16 +178,12 @@ void l2_swimlane_aicpu_init_phase(int worker_count, int num_sched_phase_threads,
  * @param tasks_processed  Tasks processed in this phase batch
  * @param pop_hit          Dispatch delta since last emit (0 for Complete)
  * @param pop_miss         Dispatch delta since last emit (0 for Complete)
- * @param local_at_start   Per-shape PTO2LocalReadyBuffer.count at phase start (size L2SWIMLANE_NUM_QUEUE_SHAPES; may be
- * nullptr)
  * @param shared_at_start  Per-shape sched.ready_queues[shape].size() at phase start (may be nullptr)
- * @param local_at_end     Per-shape PTO2LocalReadyBuffer.count at phase end (may be nullptr)
  * @param shared_at_end    Per-shape sched.ready_queues[shape].size() at phase end (may be nullptr)
  */
 void l2_swimlane_aicpu_record_sched_phase(
     int thread_idx, L2SwimlaneSchedPhaseKind kind, uint64_t start_time, uint64_t end_time, uint32_t loop_iter,
-    uint32_t tasks_processed, uint32_t pop_hit = 0, uint32_t pop_miss = 0, const int16_t *local_at_start = nullptr,
-    const int16_t *shared_at_start = nullptr, const int16_t *local_at_end = nullptr,
+    uint32_t tasks_processed, uint32_t pop_hit = 0, uint32_t pop_miss = 0, const int16_t *shared_at_start = nullptr,
     const int16_t *shared_at_end = nullptr
 );
 

@@ -188,27 +188,25 @@ TEST_F(SchedulerStateTest, ScopeEndBatchRelease) {
 }
 
 // =============================================================================
-// get_ready_tasks_batch: local buffer first
+// get_ready_tasks_batch: drains the shared ready queue
 // =============================================================================
 
-TEST_F(SchedulerStateTest, GetReadyTasksBatchLocalFirst) {
+TEST_F(SchedulerStateTest, GetReadyTasksBatchDrainsSharedQueue) {
     alignas(64) PTO2TaskSlotState slot_a, slot_b;
-    init_slot(slot_a, PTO2_TASK_PENDING, 0, 1);
+    // fanin_count = 1 so a single release_fanin_and_check_ready call drives each
+    // slot to ready (new_refcount 0->1 == fanin_count) and enqueues it.
+    init_slot(slot_a, PTO2_TASK_PENDING, 1, 1);
     init_slot(slot_b, PTO2_TASK_PENDING, 1, 1);
 
-    PTO2TaskSlotState *local_buf_storage[4];
-    PTO2LocalReadyBuffer local_buf;
-    local_buf.reset(local_buf_storage, 4);
-    local_buf.try_push(&slot_a);
-
-    // Use src API to route slot_b into the global ready queue
-    sched.release_fanin_and_check_ready(slot_b);
+    // Route both slots into the global ready queue via the src API.
+    ASSERT_TRUE(sched.release_fanin_and_check_ready(slot_a));
+    ASSERT_TRUE(sched.release_fanin_and_check_ready(slot_b));
 
     PTO2TaskSlotState *out[4];
-    int count = sched.get_ready_tasks_batch(PTO2ResourceShape::AIC, local_buf, out, 4);
+    int count = sched.get_ready_tasks_batch(PTO2ResourceShape::AIC, out, 4);
 
     EXPECT_EQ(count, 2);
-    // Local buffer drains first (LIFO), so slot_a comes first
+    // Shared queue is FIFO, so slot_a (pushed first) comes first.
     EXPECT_EQ(out[0], &slot_a);
     EXPECT_EQ(out[1], &slot_b);
 }

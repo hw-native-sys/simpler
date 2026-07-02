@@ -535,27 +535,22 @@ constexpr int L2SWIMLANE_NUM_QUEUE_SHAPES = 3;
  * (zero for Complete). Kept named, not "extra1"/"extra2", so the device-side
  * commit and the host-side JSON emit don't drift on which extra means which.
  *
- * Queue-depth snapshots (local_depth_*, shared_depth_*) record the per-shape
- * scheduler queue occupancy at phase boundaries. They surface the
- * dep-release-then-discovery latency that head OH alone can't distinguish from
- * register-write latency: a phase whose start sees `local_depth=N, shared=0`
- * and end sees `local_depth=N-K` shows that K tasks were popped from this
- * thread's private buffer (invisible to peer threads) — peers must spin until
- * those tasks overflow into shared. Filled with 0 below SCHED_PHASES.
+ * Queue-depth snapshots (shared_depth_*) record the per-shape scheduler ready
+ * queue occupancy at phase boundaries. They surface the dep-release-then-
+ * discovery latency that head OH alone can't distinguish from register-write
+ * latency. Filled with 0 below SCHED_PHASES.
  */
 struct L2SwimlaneAicpuSchedPhaseRecord {
-    uint64_t start_time;                                        // Phase start timestamp
-    uint64_t end_time;                                          // Phase end timestamp
-    uint32_t loop_iter;                                         // Scheduler-loop iteration number on this thread
-    L2SwimlaneSchedPhaseKind kind;                              // see enum above
-    uint32_t tasks_processed;                                   // Tasks processed in this phase batch
-    uint32_t pop_hit;                                           // SCHED_DISPATCH delta since last emit (0 for Complete)
-    uint32_t pop_miss;                                          // SCHED_DISPATCH delta since last emit (0 for Complete)
-    int16_t local_depth_at_start[L2SWIMLANE_NUM_QUEUE_SHAPES];  // this thread's PTO2LocalReadyBuffer.count
-    int16_t local_depth_at_end[L2SWIMLANE_NUM_QUEUE_SHAPES];
+    uint64_t start_time;            // Phase start timestamp
+    uint64_t end_time;              // Phase end timestamp
+    uint32_t loop_iter;             // Scheduler-loop iteration number on this thread
+    L2SwimlaneSchedPhaseKind kind;  // see enum above
+    uint32_t tasks_processed;       // Tasks processed in this phase batch
+    uint32_t pop_hit;               // SCHED_DISPATCH delta since last emit (0 for Complete)
+    uint32_t pop_miss;              // SCHED_DISPATCH delta since last emit (0 for Complete)
     int16_t shared_depth_at_start[L2SWIMLANE_NUM_QUEUE_SHAPES];  // sched->ready_queues[shape].size()
     int16_t shared_depth_at_end[L2SWIMLANE_NUM_QUEUE_SHAPES];
-    uint32_t _pad;  // 64B alignment padding
+    uint32_t _pad[4];  // 64B alignment padding
 };
 static_assert(sizeof(L2SwimlaneAicpuSchedPhaseRecord) == 64, "L2SwimlaneAicpuSchedPhaseRecord layout drift");
 
