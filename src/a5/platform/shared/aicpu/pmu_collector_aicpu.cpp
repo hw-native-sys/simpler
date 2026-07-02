@@ -288,7 +288,6 @@ void pmu_aicpu_complete_record(
         return;
     }
     PmuRecord *slot = &ring->dual_issue_slots[reg_task_id % PLATFORM_PMU_AICORE_RING_SIZE];
-    cache_invalidate_range(slot, sizeof(PmuRecord));
 
     if (static_cast<uint32_t>(slot->task_id) != reg_task_id) {
         // AICore hasn't published this slot yet — hard invariant violation,
