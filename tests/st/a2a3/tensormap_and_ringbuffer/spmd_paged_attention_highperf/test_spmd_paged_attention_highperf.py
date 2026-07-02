@@ -298,6 +298,38 @@ class TestSpmdPagedAttentionHighPerf(SceneTestCase):
                 "dtype": "float16",
             },
         },
+        {
+            "name": "b16_h40_kv8_s8192_bs128_fp16",
+            "manual": True,
+            "platforms": ["a2a3"],
+            "config": {"aicpu_thread_num": 4, "block_dim": 24},
+            "params": {
+                "batch": 16,
+                "num_heads": 40,
+                "num_kv_heads": 8,
+                "head_dim": 128,
+                "kv_seq": 8192,
+                "block_size": 128,
+                "block_dim": 24,
+                "dtype": "float16",
+            },
+        },
+        {
+            "name": "b16_h40_kv8_s16384_bs128_fp16",
+            "manual": True,
+            "platforms": ["a2a3"],
+            "config": {"aicpu_thread_num": 4, "block_dim": 24},
+            "params": {
+                "batch": 16,
+                "num_heads": 40,
+                "num_kv_heads": 8,
+                "head_dim": 128,
+                "kv_seq": 16384,
+                "block_size": 128,
+                "block_dim": 24,
+                "dtype": "float16",
+            },
+        },
     ]
 
     def generate_args(self, params):
