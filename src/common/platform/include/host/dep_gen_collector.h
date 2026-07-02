@@ -11,16 +11,16 @@
 
 /**
  * @file dep_gen_collector.h
- * @brief Host-side dep_gen (SubmitTrace) buffer allocation, streaming
- *        collection, and raw binary export.
+ * @brief Host-side dep_gen (SubmitTrace) buffer allocation and streaming
+ *        collection for in-memory replay.
  *
  * Architecture:
  * - BufferPoolManager<DepGenModule>: shared mgmt-thread infrastructure that
  *   polls per-thread ready queues, drains done-queue shards, and replenishes
  *   the single instance's free_queue from a unified recycled pool.
  * - DepGenCollector: collector thread shards pop full DepGenBuffers from the
- *   manager and append their DepGenRecords to a binary file
- *   (submit_trace.bin).
+ *   manager and append their DepGenRecords to an in-memory vector consumed by
+ *   host replay after device execution completes.
  *
  * Lifecycle:
  *   init()                       — Allocate header + 1 BufferState + N DepGenBuffers
@@ -36,14 +36,13 @@
  *                                  (incomplete graph; user gets a warning).
  *   finalize()                   — Free all device memory, unregister.
  *
- * Output format (submit_trace.bin): a fixed-size header followed by a
- * contiguous stream of DepGenRecord values. Replay (future PR) reads this
- * back. Layout intentionally trivial (no varint / framing) so the
- * `sizeof(DepGenRecord)` ABI in `common/dep_gen.h` is the only contract.
+ * Output contract: a contiguous in-memory stream of DepGenRecord values.
+ * Host replay consumes this stream directly; no submit_trace.bin intermediary
+ * is written by the collector.
  */
 
-#ifndef SRC_A5_PLATFORM_INCLUDE_HOST_DEP_GEN_COLLECTOR_H_
-#define SRC_A5_PLATFORM_INCLUDE_HOST_DEP_GEN_COLLECTOR_H_
+#ifndef SRC_COMMON_PLATFORM_INCLUDE_HOST_DEP_GEN_COLLECTOR_H_
+#define SRC_COMMON_PLATFORM_INCLUDE_HOST_DEP_GEN_COLLECTOR_H_
 
 #include <atomic>
 #include <cstddef>
@@ -180,7 +179,7 @@ public:
      * @param num_threads     Number of AICPU scheduling threads (so the
      *                        DataHeader sizes its per-thread ready queues)
      * @param alloc_cb        Memory allocation callback
-     * @param register_cb     halHostRegister callback (nullptr on a5)
+     * @param register_cb     halHostRegister callback (nullptr on non-SVM platforms)
      * @param free_cb         Memory free callback
      * @param device_id       Device ID
      * @return 0 on success, non-zero on failure
@@ -279,4 +278,4 @@ inline std::string make_deps_json_path(const std::string &output_dir) {
     return (dir / "deps.json").string();
 }
 
-#endif  // SRC_A5_PLATFORM_INCLUDE_HOST_DEP_GEN_COLLECTOR_H_
+#endif  // SRC_COMMON_PLATFORM_INCLUDE_HOST_DEP_GEN_COLLECTOR_H_

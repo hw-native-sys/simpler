@@ -99,7 +99,7 @@ Two separate concerns, often conflated:
   `rmb()` between the COND check and the slot reads.
 
 Concretely, the L2 swimlane staging-slot read in
-`src/{a2a3,a5}/platform/shared/aicpu/l2_swimlane_collector_aicpu.cpp` does
+`src/common/platform/shared/aicpu/l2_swimlane_collector_aicpu.cpp` does
 **not** call `cache_invalidate_range` on the slot, but it **does** call
 `rmb()` before reading `slot->task_id` and the timing fields. All of
 those fields are AICore writes covered by the AICore-side `dcci` in

@@ -470,7 +470,7 @@ add_executable(test_l3_l2_orch_comm_sim_runner
     ${CMAKE_SOURCE_DIR}/../../../src/common/platform/sim/sim_context/cpu_sim_context.cpp
     ${CMAKE_SOURCE_DIR}/../../../src/a2a3/runtime/tensormap_and_ringbuffer/runtime/shared/runtime.cpp
     ${CMAKE_SOURCE_DIR}/../../../src/a2a3/platform/sim/host/profiling_copy.cpp
-    ${CMAKE_SOURCE_DIR}/../../../src/a2a3/platform/shared/host/l2_swimlane_collector.cpp
+    ${CMAKE_SOURCE_DIR}/../../../src/common/platform/shared/host/l2_swimlane_collector.cpp
     ${CMAKE_SOURCE_DIR}/../../../src/a2a3/platform/shared/host/pmu_collector.cpp
     ${CMAKE_SOURCE_DIR}/../../../src/common/platform/shared/host/tensor_dump_collector.cpp
     ${CMAKE_SOURCE_DIR}/../../../src/common/platform/shared/host/scope_stats_collector.cpp
@@ -719,7 +719,7 @@ if(SIMPLER_ENABLE_HARDWARE_TESTS)
         ${PROJECT_ROOT}/src/common/platform/shared/host/tensor_dump_collector.cpp
         ${PROJECT_ROOT}/src/a5/platform/onboard/host/profiling_copy.cpp
         ${PROJECT_ROOT}/src/a5/platform/onboard/host/memory_allocator.cpp
-        ${PROJECT_ROOT}/src/a5/platform/shared/host/l2_swimlane_collector.cpp
+        ${PROJECT_ROOT}/src/common/platform/shared/host/l2_swimlane_collector.cpp
         ${PROJECT_ROOT}/src/a5/platform/shared/host/pmu_collector.cpp
     )
     target_compile_options(test_l3_l2_orch_comm_onboard_runner PRIVATE

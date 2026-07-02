@@ -54,7 +54,7 @@ def _task_id(ring: int, local: int) -> int:
 
 @scene_test(level=2, runtime="tensormap_and_ringbuffer")
 class TestDepGen(SceneTestCase):
-    """Vector example, run with dep_gen enabled, then verify submit_trace.bin."""
+    """Vector example, run with dep_gen enabled, then verify generated deps."""
 
     CALLABLE = {
         "orchestration": {

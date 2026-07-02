@@ -23,8 +23,8 @@
  * Memory operations are injected through callbacks for sim/onboard portability.
  */
 
-#ifndef SRC_A5_PLATFORM_INCLUDE_HOST_L2_SWIMLANE_COLLECTOR_H_
-#define SRC_A5_PLATFORM_INCLUDE_HOST_L2_SWIMLANE_COLLECTOR_H_
+#ifndef SRC_COMMON_PLATFORM_INCLUDE_HOST_L2_SWIMLANE_COLLECTOR_H_
+#define SRC_COMMON_PLATFORM_INCLUDE_HOST_L2_SWIMLANE_COLLECTOR_H_
 
 #include <cstddef>
 #include <cstdint>
@@ -321,7 +321,7 @@ public:
      *                                 JSON `version`.
      * @param alloc_cb                 Device memory allocation callback
      * @param register_cb              Memory registration callback (nullptr for
-     *                                 simulation)
+     *                                 simulation and non-SVM platforms)
      * @param free_cb                  Device memory free callback
      * @param user_data                Opaque pointer forwarded to callbacks
      * @param output_prefix            Per-task directory; l2_swimlane_records.json
@@ -508,4 +508,4 @@ private:
     void copy_aicore_buffer(const ReadyBufferInfo &info, int collector_shard);
 };
 
-#endif  // SRC_A5_PLATFORM_INCLUDE_HOST_L2_SWIMLANE_COLLECTOR_H_
+#endif  // SRC_COMMON_PLATFORM_INCLUDE_HOST_L2_SWIMLANE_COLLECTOR_H_
