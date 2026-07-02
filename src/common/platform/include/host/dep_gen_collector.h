@@ -41,8 +41,8 @@
  * `sizeof(DepGenRecord)` ABI in `common/dep_gen.h` is the only contract.
  */
 
-#ifndef SRC_A2A3_PLATFORM_INCLUDE_HOST_DEP_GEN_COLLECTOR_H_
-#define SRC_A2A3_PLATFORM_INCLUDE_HOST_DEP_GEN_COLLECTOR_H_
+#ifndef SRC_COMMON_PLATFORM_INCLUDE_HOST_DEP_GEN_COLLECTOR_H_
+#define SRC_COMMON_PLATFORM_INCLUDE_HOST_DEP_GEN_COLLECTOR_H_
 
 #include <atomic>
 #include <cstddef>
@@ -165,9 +165,8 @@ public:
      *
      * @param num_threads     Number of AICPU scheduling threads (so the
      *                        DataHeader sizes its per-thread ready queues)
-     * @param submit_trace_path  Output file path (.bin)
      * @param alloc_cb        Memory allocation callback
-     * @param register_cb     halHostRegister callback (nullptr in sim)
+     * @param register_cb     halHostRegister callback (nullptr on non-SVM platforms)
      * @param free_cb         Memory free callback
      * @param device_id       Device ID
      * @return 0 on success, non-zero on failure
@@ -231,10 +230,7 @@ private:
     // shm_host_ / device_id_ live on ProfilerBase (set via set_memory_context
     // in init()).
     void *shm_dev_ = nullptr;
-    bool shm_registered_ = false;
     size_t shm_size_ = 0;
-
-    bool buffers_registered_ = false;
 
     // In-memory record buffer — drained from the device ring on
     // on_buffer_collected() and consumed by the host replay directly (no
@@ -257,17 +253,9 @@ private:
 /**
  * Build the ``deps.json`` output path under the caller-provided per-task
  * directory. Filename is fixed (no timestamp) — the directory is the
- * per-task uniqueness boundary, mirroring make_pmu_csv_path() and the now-
- * removed make_dep_gen_path() for submit_trace.bin (deps.json is the only
- * on-disk dep_gen artifact since the in-memory capture refactor).
+ * per-task uniqueness boundary, mirroring make_pmu_csv_path().
  */
 inline std::string make_deps_json_path(const std::string &output_dir) {
-    // Use std::filesystem::path's operator/ for join — robust against trailing
-    // slashes or path quirks that bare string concat would silently pass
-    // through. The sibling make_pmu_csv_path / make_l2_swimlane_path still use
-    // string concat; converting those is a follow-up cleanup since the
-    // project's output_prefix paths come from scene_test.py's pathlib join
-    // (never trailing-slashed in practice).
     std::filesystem::path dir(output_dir);
     std::error_code ec;
     std::filesystem::create_directories(dir, ec);
@@ -277,4 +265,4 @@ inline std::string make_deps_json_path(const std::string &output_dir) {
     return (dir / "deps.json").string();
 }
 
-#endif  // SRC_A2A3_PLATFORM_INCLUDE_HOST_DEP_GEN_COLLECTOR_H_
+#endif  // SRC_COMMON_PLATFORM_INCLUDE_HOST_DEP_GEN_COLLECTOR_H_

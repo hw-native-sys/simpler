@@ -708,7 +708,7 @@ export_swimlane_json()             ← writes <output_prefix>/l2_swimlane_record
 finalize(unregister, free)
 ```
 
-[`L2SwimlaneCollector`](../src/a2a3/platform/include/host/l2_swimlane_collector.h)
+[`L2SwimlaneCollector`](../src/common/platform/include/host/l2_swimlane_collector.h)
 on a2a3 inherits from
 [`profiling_common::ProfilerBase<L2SwimlaneCollector, L2SwimlaneModule>`](../src/common/platform/include/host/profiler_base.h):
 the base class owns the mgmt thread, the poll thread, and the
@@ -836,7 +836,7 @@ l2_swimlane_collector_.export_swimlane_json()
 l2_swimlane_collector_.finalize()
 ```
 
-[`L2SwimlaneCollector`](../src/a5/platform/include/host/l2_swimlane_collector.h)
+[`L2SwimlaneCollector`](../src/common/platform/include/host/l2_swimlane_collector.h)
 on a5 inherits the same CRTP base
 ([`profiling_common::ProfilerBase`](../src/common/platform/include/host/profiler_base.h))
 as a2a3 and parameterizes

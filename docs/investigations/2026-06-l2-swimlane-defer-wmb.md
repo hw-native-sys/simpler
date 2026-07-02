@@ -22,7 +22,7 @@ which already wmb only at publication.
 ## What was tried
 
 Patch (3 hunks in
-`src/a2a3/platform/src/aicpu/l2_swimlane_collector_aicpu.cpp`):
+`src/common/platform/shared/aicpu/l2_swimlane_collector_aicpu.cpp`):
 
 1. Remove the `wmb()` immediately after `l2_swimlane_buf->count =
    new_count` in `l2_swimlane_aicpu_complete_task`.
@@ -107,7 +107,7 @@ Test design for the re-investigation should:
   `perf/swimlane-defer-wmb` local branch on 2026-06-01).
 - Related: `aicore_rotate` and `acquire_phase_slot` already use the
   publication-point wmb shape, see
-  `src/a2a3/platform/src/aicpu/l2_swimlane_collector_aicpu.cpp`.
+  `src/common/platform/shared/aicpu/l2_swimlane_collector_aicpu.cpp`.
 - DFX priorities memory note (user-level): "DFX path prioritizes
   accuracy and simplicity over performance — do not propose
   micro-optimizations on profiling / swimlane / diagnostics paths".
