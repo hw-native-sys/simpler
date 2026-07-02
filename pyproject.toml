@@ -26,7 +26,7 @@ simpler-remote-l3-session = "simpler.remote_l3_session:main"
 # ``torch.uint16`` / ``torch.uint32``, added in PyTorch 2.3). CI installs
 # torch via a custom index URL and does not rely on this pin; it is here
 # so ``pip install -e '.[test]'`` resolves a usable version for local devs.
-test = ["pytest>=6.0", "pytest-xdist>=3.0", "torch>=2.3"]
+test = ["pytest>=6.0", "pytest-xdist>=3.0", "torch>=2.3", "numpy"]
 
 [tool.ruff]
 line-length = 120
