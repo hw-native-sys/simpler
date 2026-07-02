@@ -50,12 +50,11 @@ public:
     void stop();
 
     // Scheduler API
-    WorkerThread *pick_idle(WorkerType type) const;
-    std::vector<WorkerThread *> pick_n_idle(WorkerType type, int n) const;
+    WorkerThread *get_worker_by_index(WorkerType type, int worker_index) const;
     WorkerThread *get_worker_by_id(WorkerType type, int32_t worker_id) const;
-    WorkerThread *pick_idle_excluding_eligible(WorkerType type,
-                                               const std::vector<WorkerThread *> &exclude,
-                                               const std::vector<int32_t> &eligible_worker_ids) const;
+    WorkerThread *pick_idle(WorkerType type,
+                            const std::vector<WorkerThread *> &exclude,
+                            const std::vector<int32_t> &eligible_worker_ids) const;
 
 private:
     struct LocalNextLevelEntry {
@@ -78,11 +77,12 @@ the public worker id from the local worker vector index.
 
 - **Pool ownership**: two `std::vector` pools, sized at init from `add_*`
   calls
-- **Idle selection**: `pick_idle(type)` finds a WorkerThread whose queue is
-  empty; returns nullptr if none available
-- **Worker eligibility**: remote-aware NEXT_LEVEL slots carry final eligible
-  worker ids. Scheduler dispatch calls `pick_idle_excluding_eligible()` so a
-  task cannot land on a worker that lacks the callable or tensor sidecars.
+- **Idle selection & eligibility**: `pick_idle(type, exclude, eligible_worker_ids)`
+  finds an idle WorkerThread whose queue is empty, skipping any in `exclude`
+  and (when `eligible_worker_ids` is non-empty) restricted to that set; returns
+  nullptr if none available. Remote-aware NEXT_LEVEL slots carry final eligible
+  worker ids, so a task cannot land on a worker that lacks the callable or
+  tensor sidecars.
 
 ---
 

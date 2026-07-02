@@ -464,16 +464,13 @@ public:
     void start(Ring *ring, const OnCompleteFn &on_complete);
     void stop();
 
-    WorkerThread *pick_idle(WorkerType type) const;
-    std::vector<WorkerThread *> pick_n_idle(WorkerType type, int n) const;
-
     // Direct index into the worker pool (0-based).
     WorkerThread *get_worker_by_index(WorkerType type, int worker_index) const;
     WorkerThread *get_worker_by_id(WorkerType type, int32_t worker_id) const;
 
-    // Pick one idle worker NOT in `exclude`. Returns nullptr if none available.
-    WorkerThread *pick_idle_excluding(WorkerType type, const std::vector<WorkerThread *> &exclude) const;
-    WorkerThread *pick_idle_excluding_eligible(
+    // Pick one idle worker NOT in `exclude`, restricted to `eligible_worker_ids`
+    // when that list is non-empty. Returns nullptr if none available.
+    WorkerThread *pick_idle(
         WorkerType type, const std::vector<WorkerThread *> &exclude, const std::vector<int32_t> &eligible_worker_ids
     ) const;
 
@@ -539,9 +536,6 @@ public:
         WorkerType type, uint64_t sub_cmd, const void *payload, size_t payload_size, const uint8_t *digest,
         double timeout_s
     );
-
-    // Write SHUTDOWN to every registered mailbox.
-    void shutdown_children();
 
     // Error propagation: first dispatch failure from any WorkerThread wins.
     // The orch thread inspects via `has_error()` / `take_error()` and
