@@ -494,13 +494,12 @@ static __aicore__ void fa_fused_aiv(
     set_vector_mask(-1, -1);
     int64_t v35 = sub_block_id;
     auto v36 = TPipe<0, Direction::DIR_BOTH, 8192, 4, 4, false>(v11, v34, v34);
-    // simpler's runtime leaves the AICore sub-block register at 0 for both AIV
-    // lanes, so the library's TILE_UP_DOWN auto-split (get_subblockid() * bytes)
-    // contributes nothing. Supply the per-lane offset explicitly from the
-    // runtime lane id, as spmd_paged_attention does. Tiles are 8x128:
-    // cons = C2V float pop, prod = V2C bf16 push.
-    v36.cons.setEntryOffset(static_cast<int>(sub_block_id) * 8 * 128 * static_cast<int>(sizeof(float)));
-    v36.prod.setEntryOffset(static_cast<int>(sub_block_id) * 8 * 128 * static_cast<int>(sizeof(bfloat16_t)));
+    // Thread the runtime AIV lane id (0/1) into the ISA TPipe so the library's
+    // TILE_UP_DOWN auto-split (laneId() * bytes) places each lane in its own
+    // GM ring-buffer half. simpler's PTO2 runtime leaves the CCE sub-block
+    // register at 0 for both lanes, so the lane must come from the runtime
+    // (get_sub_block_id / sub_block_id), not get_subblockid().
+    v36.setSubBlockId(sub_block_id);
     int32_t v37 = v1[v23];
     set_flag(PIPE_V, PIPE_MTE2, EVENT_ID0);
     set_flag(PIPE_MTE3, PIPE_V, EVENT_ID0);

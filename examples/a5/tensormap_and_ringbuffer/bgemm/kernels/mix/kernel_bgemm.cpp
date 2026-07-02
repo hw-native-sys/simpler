@@ -31,6 +31,7 @@
 #include <pto/common/fifo.hpp>
 
 #include "tensor.h"
+#include "intrinsic.h"
 
 using pto::BLayout;
 using pto::Direction;
@@ -159,7 +160,12 @@ extern "C" __aicore__ void kernel_entry(__gm__ int64_t *args) {
     // Vector side: TPOP result from cube → TLOAD C from GM → TADD → TSTORE
     // =========================================================================
     if constexpr (DAV_VEC) {
-        uint32_t subBlockIdx = get_subblockid();
+        // simpler's PTO2 runtime leaves the CCE sub-block register at 0 for both
+        // AIV lanes, so read the lane from the runtime GlobalContext and thread
+        // it into the ISA TPipe: the library's TILE_UP_DOWN auto-split then uses
+        // laneId() (the runtime lane) instead of the stale get_subblockid().
+        uint32_t subBlockIdx = static_cast<uint32_t>(get_sub_block_id(args));
+        mPipe.setSubBlockId(static_cast<int>(subBlockIdx));
 
         __gm__ float *c_ptr = reinterpret_cast<__gm__ float *>(c_tensor->buffer.addr) + c_tensor->start_offset;
         // Each vector sub-core handles its half: sub-core 0 → rows [0, VEC_M),

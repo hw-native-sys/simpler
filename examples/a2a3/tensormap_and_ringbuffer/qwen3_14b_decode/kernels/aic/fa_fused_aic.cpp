@@ -466,7 +466,7 @@ static __aicore__ void fa_fused_aic(
 static __aicore__ void fa_fused_aiv(
     __gm__ int32_t *v1, __gm__ float *v2, __gm__ float *v3, __gm__ float *v4, __gm__ int32_t *v5, __gm__ int32_t *v6,
     __gm__ int32_t *v7, __gm__ bfloat16_t *v8, __gm__ bfloat16_t *v9, __gm__ bfloat16_t *v10, __gm__ float *v11,
-    int64_t v12, int64_t v13, int32_t v14, int32_t v15
+    int64_t v12, int64_t v13, int32_t v14, int32_t v15, int32_t sub_block_id
 ) {
     SaturationMode v16 = SaturationMode::OFF;
     RoundMode v17 = RoundMode::CAST_ROUND;
@@ -492,8 +492,10 @@ static __aicore__ void fa_fused_aiv(
 #if defined(__DAV_VEC__)
     set_mask_norm();
     set_vector_mask(-1, -1);
-    int64_t v35 = get_subblockid();
+    int64_t v35 = sub_block_id;
     auto v36 = TPipe<0, Direction::DIR_BOTH, 8192, 4, 4, false>(v11, v34, v34);
+    // Thread the runtime AIV lane id into the ISA TPipe (see fa_fused_aiv.cpp).
+    v36.setSubBlockId(sub_block_id);
     int32_t v37 = v1[v23];
     set_flag(PIPE_V, PIPE_MTE2, EVENT_ID0);
     set_flag(PIPE_MTE3, PIPE_V, EVENT_ID0);

@@ -718,16 +718,15 @@ static __aicore__ void run_aiv(
     int32_t sub_block_id = get_sub_block_id(args);
     int64_t row_offset = sub_block_id * Cfg::SUB_QT;
 
-    // Entry offsets depend on the actual tile width (block_size for sij/pij, HEAD_DIM for oi).
-    // TILE_UP_DOWN splits Q_TILE rows into two SUB_QT halves; AIV1's data starts at
-    // SUB_QT * tile_width * sizeof(element) within the contiguous TPUSH'd tile.
-    int sij_sub_offset = sub_block_id * Cfg::SUB_QT * static_cast<int>(block_size) * static_cast<int>(sizeof(float));
-    int pij_sub_offset =
-        sub_block_id * Cfg::SUB_QT * static_cast<int>(block_size) * static_cast<int>(sizeof(bfloat16_t));
-    int oi_sub_offset = sub_block_id * Cfg::SUB_QT * HEAD_DIM * static_cast<int>(sizeof(float));
-    sij_pipe.cons.setEntryOffset(sij_sub_offset);
-    pij_pipe.prod.setEntryOffset(pij_sub_offset);
-    oi_pipe.cons.setEntryOffset(oi_sub_offset);
+    // Thread the runtime AIV lane id (0/1) into each ISA TPipe so the library's
+    // TILE_UP_DOWN auto-split (laneId() * bytes) places each lane in its own
+    // GM ring-buffer half. simpler's PTO2 runtime leaves the CCE sub-block
+    // register at 0 for both lanes, so the lane must come from the runtime
+    // (get_sub_block_id), not get_subblockid(). Replaces the prior manual
+    // cons/prod.setEntryOffset(lane * SUB_QT * tile_width * sizeof(T)) workaround.
+    sij_pipe.setSubBlockId(sub_block_id);
+    pij_pipe.setSubBlockId(sub_block_id);
+    oi_pipe.setSubBlockId(sub_block_id);
 
     // Mirror reverse-dependency disable on the AIV side (see run_aic for
     // the full forward-chain argument).
