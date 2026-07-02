@@ -123,7 +123,6 @@ constexpr int32_t kPrivateSlots = 4;  // PRIVATE_TASK_SLOT_NUM (back-pressure ca
 constexpr int32_t kWonReserve = 2;
 constexpr int32_t kMaxFanin = 16;        // max distinct producers a task waits on
 constexpr int32_t kOutPoolSlots = 1024;  // per-core ring of materialized output Tensors
-constexpr int32_t kMapCap = 16384;       // per-core producer-map capacity (distinct regions)
 constexpr int32_t kFlagCap = 1 << 16;    // global completion-flag ring (>= total tasks)
 
 // M4 GM-heap reclamation (§9.5/§11.4).
@@ -147,80 +146,109 @@ constexpr int32_t kHDefault = 64;
 // (e.g. an INOUT accumulation chain) replace in place; new regions append.
 // Every core builds an identical map by replaying the same submit stream.
 // -----------------------------------------------------------------------------
-// Intrusive entry, modeled on PTO2TensorMapEntry (tensormap_and_ringbuffer) but
-// compact: it keys overlap on a byte range [lo, hi) instead of mirroring a full
-// Tensor cache line, since the distributed map only needs producer lookup.
-//   - bucket chain (doubly linked) — O(1) unlink during cleanup
-//   - task chain (singly linked)   — cleanup frees a retired task's entries by
-//                                     walking ITS chain, never scanning the pool
+// A ring slot: a written region keyed by GM byte range [lo, hi) under buffer base
+// `buf_addr`, tagged with its producer task id. Compact (32B), NO chain links —
+// bucket membership is positional (index / kBucketCapMax) and ordering is the
+// append order, which is producer-monotonic (see KEY INVARIANT below).
 struct MapEntry {
-    uint64_t buf_addr;       // Tensor.buffer.addr (GM buffer base, bytes) — hash key
-    uint64_t lo;             // byte offset of view origin within buffer
-    uint64_t hi;             // byte offset one-past the view extent
-    int32_t producer;        // task id that wrote this region
-    int32_t bucket;          // owning bucket index, or -1 when free
-    int32_t next_in_bucket;  // bucket-chain links (entry indices, -1 = none)
-    int32_t prev_in_bucket;
-    int32_t next_in_task;  // task-chain link (entry index, -1 = none)
+    uint64_t buf_addr;  // Tensor.buffer.addr (GM buffer base, bytes) — hash key
+    uint64_t lo;        // byte offset of view origin within buffer
+    uint64_t hi;        // byte offset one-past the view extent
+    int32_t producer;   // task id that wrote this region
+    int32_t pad_;       // keep 32B slot size
 };
 
 // Hash buckets (power of 2). Hashing by buffer BASE address groups every
 // sub-region of one buffer into one chain; overlap is then tested per entry.
-constexpr int32_t kMapBuckets = 1 << 13;  // 8192
-constexpr int32_t kMapBucketShift = 13;   // log2(kMapBuckets)
-// Per-task entry-head window (power of 2). Task `id` parks its entries under
-// slot id & (kTaskWindow-1); the slot is recycled by id + kTaskWindow. cleanup
-// retires a task once it leaves the H span, so kTaskWindow MUST exceed H (with
-// margin) or a slot could be reused before its prior task is cleaned. Validated
-// against g_dist.H at register time.
-constexpr int32_t kTaskWindow = 1 << 10;  // 1024  (>> kHDefault = 64)
-constexpr int32_t kTaskWindowMask = kTaskWindow - 1;
+constexpr int32_t kRingBuckets = 128;     // number of hash buckets (power of 2)
+constexpr int32_t kRingBucketShift = 7;   // log2(kRingBuckets)
+// Per-bucket ring depth (compile-time max, power of 2 so `% cap` -> mask). Must
+// cover the live H-window of the HOTTEST bucket: bgemm writes hundreds of disjoint
+// tiles of ONE output buffer, which all hash to one bucket, so this is sized
+// generously. Overflow is a deterministic FATAL (docs §12.7.2.2) — raise cap
+// (Phase 2: PTO_DIST_TENSORMAP_RING_CAP) or lower H, never silently drop.
+// Memory per core = kRingBuckets * kBucketCapMax * sizeof(MapEntry) = 2 MiB.
+constexpr int32_t kBucketCapMax = 512;
 
-// Per-core producer map ("full per-core duplicate TensorMap"), a direct compact
-// port of tensormap_and_ringbuffer's PTO2TensorMap (hash table + bucket chains +
-// per-task entry tracking + free list + lazy invalidation + cleanup_retired).
+// Active per-bucket ring depth, chosen once per run in dist_engine_register()
+// (docs §12.7.2): `auto` derives it from the dependency-span H, an explicit
+// PTO_DIST_TENSORMAP_RING_CAP=N overrides. Always a power of 2 in [1, kBucketCapMax]
+// so lookup/insert use a mask, not a modulo. reset() copies it into the map.
+int32_t g_dist_ring_cap = kBucketCapMax;
+
+// TensorMap operation counters (env PTO_DIST_OVERHEAD). Count the actual map work
+// that differs between private (per-core replica) and shared (single global ring)
+// modes. Deterministic + platform-independent, so they quantify the private-vs-
+// shared orchestration overhead even where the host wall clock is unusable (sim
+// device_wall_us=0; macOS spin/oversubscription inflates makespan identically for
+// both modes, masking the logic difference). Gated by g_overhead_on so a normal
+// run pays nothing. Reset per run in register.
+//   inserts : region writes into the map — private ≈ C×D, shared ≈ D (the headline
+//             SPMD-floor difference: C = cores, D = distinct output regions).
+//   lookups : fan-in resolutions (identical count in both modes).
+//   scans   : ring slots examined across all lookups (per-lookup cost; shared also
+//             pays an atomic seq acquire on each scanned slot — private does not).
+bool g_overhead_on = false;
+std::atomic<uint64_t> g_tm_inserts{0};
+std::atomic<uint64_t> g_tm_lookups{0};
+std::atomic<uint64_t> g_tm_scans{0};
+
+// Round v up to the next power of 2, clamped to [1, kBucketCapMax].
+inline int32_t round_pow2_cap(int32_t v) {
+    if (v < 1) v = 1;
+    if (v > kBucketCapMax) return kBucketCapMax;
+    int32_t p = 1;
+    while (p < v) p <<= 1;
+    return p;
+}
+
+// Per-core producer map — RING-PER-BUCKET (docs §12, unified private/shared;
+// this is the "private" form: each core owns a full replica built by replaying
+// the same submit stream, so every replica is identical, only progress differs).
 //
-// WHY (vs. the original O(count) linear array, which made submit O(N^2)):
-// bgemm writes hundreds of disjoint tiles of ONE flattened output buffer, so the
-// old `entries[count]` grew with the whole run and every lookup/insert rescanned
-// it. Following the proven runtime, we instead:
-//   * hash by buffer base + chain — distinct buffers cost O(1);
-//   * RETIRE by H window — an entry whose producer is older than `alive_floor`
-//     (= N - H) can never be a fan-in of any future task (a consumer of producer
-//     p has id <= p + H, §9.5/§11.4, the same bound under which p's GM heap region
-//     is recycled), so cleanup frees it. This bounds each chain to ~the live
-//     H-window instead of the entire run → O(N*H) ~ O(N).
-// Like the reference, insert ALWAYS links a fresh entry under its producer's task
-// chain (no in-place replace), so cleanup_retired can free a task's entries via
-// that chain without scanning; lookup returns the MAX (newest) overlapping
-// producer, which subsumes the old replace-in-place semantics.
+// Structure: hash by buffer BASE into kRingBuckets buckets; each bucket is a
+// BOUNDED RING of `cap` contiguous slots with head/tail cursors.
+//   * insert  — reclaim retired head slots, then append at tail (tail++).
+//   * lookup  — scan tail-1 .. head; the FIRST overlap is the MAX producer.
+//   * retire  — O(1): raise alive_floor (= N - H). Physical reclaim is lazy
+//               (insert advances head past producer < alive_floor).
 //
-// `alive_floor` is N-derived (deterministic, identical on every core), never
-// frontier-based (timing-dependent), so every per-core map — including the free
-// list and cleanup progress — evolves identically. Determinism is preserved.
+// KEY INVARIANT (what makes the ring correct & simple): every core replays
+// submits in task-id order (local_index++ in dist_submit_impl/dist_alloc_tensors)
+// and insert always uses the current task id N. Hence entries appended to any one
+// bucket are MONOTONICALLY NON-DECREASING in producer id. So retired entries are
+// always at the head (reclaim = head++), and the newest overlapping producer is
+// the first hit when scanning from the tail. Verified by a differential test
+// against the former linked-list semantics over randomized SPMD-ordered streams.
+//
+// WHY ring vs the former bucket-chain + free-list + per-task chains (docs §12.3):
+// identical O(N*H) via the same H-window reclaim and identical lookup semantics
+// (max overlapping producer >= alive_floor), but contiguous storage (better
+// locality, no pointer chase), no per-entry link fields, and reclaim is a cursor
+// bump. `alive_floor` is N-derived (deterministic, identical on every core), so
+// replicas evolve in lockstep — determinism preserved.
 struct DistTensorMap {
-    MapEntry entries[kMapCap];
-    int32_t buckets[kMapBuckets];     // bucket head entry idx, or -1
-    int32_t task_heads[kTaskWindow];  // per-task entry-chain head idx, or -1
-    int32_t free_head;                // recycled-slot free list head, or -1
-    int32_t high_water;               // next never-used slot in `entries`
-    int32_t alive_floor;              // producer < alive_floor == retired
-    int32_t cleaned_upto;             // tasks < cleaned_upto already freed
+    static constexpr int32_t kStride = kBucketCapMax;  // per-bucket slot stride
+    MapEntry slots[kRingBuckets * kStride];
+    uint64_t head[kRingBuckets];  // reclaim cursor (oldest live slot, monotonic)
+    uint64_t tail[kRingBuckets];  // append cursor (next free slot, monotonic)
+    int32_t cap;                  // active per-bucket depth (power of 2, <= kBucketCapMax)
+    int32_t cap_mask;             // cap - 1 (fast `% cap`)
+    int32_t alive_floor;          // producer < alive_floor == retired
 
     void reset() {
-        free_head = -1;
-        high_water = 0;
+        cap = g_dist_ring_cap;  // run-configured (auto from H, or PTO_DIST_TENSORMAP_RING_CAP)
+        cap_mask = cap - 1;
         alive_floor = 0;
-        cleaned_upto = 0;
-        for (int32_t i = 0; i < kMapBuckets; i++)
-            buckets[i] = -1;
-        for (int32_t i = 0; i < kTaskWindow; i++)
-            task_heads[i] = -1;
+        for (int32_t b = 0; b < kRingBuckets; b++) {
+            head[b] = 0;
+            tail[b] = 0;
+        }
     }
 
     static uint32_t hash(uint64_t addr) {
         addr *= 0x9E3779B97F4A7C15ULL;  // golden-ratio multiplicative mix
-        return static_cast<uint32_t>(addr >> (64 - kMapBucketShift));
+        return static_cast<uint32_t>(addr >> (64 - kRingBucketShift));
     }
 
     static void byte_range(const Tensor &t, uint64_t &addr, uint64_t &lo, uint64_t &hi) {
@@ -230,90 +258,192 @@ struct DistTensorMap {
         hi = (t.start_offset + t.extent_elem()) * esz;
     }
 
-    int32_t alloc_slot() {
-        if (free_head >= 0) {
-            const int32_t s = free_head;
-            free_head = entries[s].next_in_bucket;
-            return s;
-        }
-        if (high_water < kMapCap) return high_water++;
-        return -1;  // pool exhausted (live H-window exceeds kMapCap)
+    // Advance a bucket's head past retired entries (producer < alive_floor).
+    // Entries are producer-ascending, so retired ones are always at the head.
+    void reclaim_bucket(int32_t b) {
+        while (head[b] < tail[b] &&
+               slots[b * kStride + static_cast<int32_t>(head[b] & cap_mask)].producer < alive_floor)
+            head[b]++;
     }
 
-    // Unlink `idx` from its bucket chain (O(1) via prev) and push to the free list.
-    void free_entry(int32_t idx) {
-        MapEntry &e = entries[idx];
-        if (e.prev_in_bucket < 0) buckets[e.bucket] = e.next_in_bucket;
-        else entries[e.prev_in_bucket].next_in_bucket = e.next_in_bucket;
-        if (e.next_in_bucket >= 0) entries[e.next_in_bucket].prev_in_bucket = e.prev_in_bucket;
-        e.bucket = -1;
-        e.next_in_bucket = free_head;
-        free_head = idx;
-    }
-
-    // Free every entry produced by retired tasks [cleaned_upto, new_floor) by
-    // walking each task's own chain (never the whole pool). Mirrors PTO2TensorMap
-    // ::cleanup_retired. Advances alive_floor so lookups skip the freed window.
+    // Retire is O(1): raise the floor. Physical slots reclaimed lazily by insert.
+    // Same contract as before: new_floor = N - H; lookups skip producer<floor.
     void advance_retire(int32_t N, int32_t H) {
         const int32_t new_floor = N - H;
-        if (new_floor <= cleaned_upto) {  // nothing newly retired
-            if (new_floor > alive_floor) alive_floor = new_floor;
-            return;
-        }
-        for (int32_t id = cleaned_upto; id < new_floor; id++) {
-            int32_t cur = task_heads[id & kTaskWindowMask];
-            while (cur >= 0) {
-                const int32_t nxt = entries[cur].next_in_task;
-                debug_assert(entries[cur].producer == id);
-                free_entry(cur);
-                cur = nxt;
-            }
-            task_heads[id & kTaskWindowMask] = -1;
-        }
-        cleaned_upto = new_floor;
-        alive_floor = new_floor;
+        if (new_floor > alive_floor) alive_floor = new_floor;
     }
 
-    // Link a fresh entry for `producer`'s write of `t`'s region. Always a new
-    // entry (no in-place replace) so it parks under producer's task chain.
+    // Append a fresh entry for `producer`'s write of `t`'s region at the ring tail.
     void insert(const Tensor &t, int32_t producer) {
+        if (g_overhead_on) g_tm_inserts.fetch_add(1, std::memory_order_relaxed);
         uint64_t addr, lo, hi;
         byte_range(t, addr, lo, hi);
-        const int32_t s = alloc_slot();
-        if (s < 0) return;  // pool full within the live window (should not happen)
-        const uint32_t b = hash(addr);
-        MapEntry &e = entries[s];
+        const int32_t b = static_cast<int32_t>(hash(addr));
+        reclaim_bucket(b);
+        if (tail[b] - head[b] >= static_cast<uint64_t>(cap)) {
+            // Ring full within the live window — a deterministic config error
+            // (docs §12.7.2.2). NEVER silently overwrite / drop a live producer.
+            fprintf(
+                stderr,
+                "[dist_engine] FATAL TensorMap ring overflow: bucket=%d cap=%d live=%llu — the live "
+                "dependency window for this bucket exceeds the ring depth. Raise PTO_DIST_TENSORMAP_RING_CAP "
+                "(<= %d) or lower PTO_DIST_H.\n",
+                b, cap, static_cast<unsigned long long>(tail[b] - head[b]), kBucketCapMax
+            );
+            fflush(stderr);
+            always_assert(false);
+            return;
+        }
+        MapEntry &e = slots[b * kStride + static_cast<int32_t>(tail[b] & cap_mask)];
         e.buf_addr = addr;
         e.lo = lo;
         e.hi = hi;
         e.producer = producer;
-        e.bucket = static_cast<int32_t>(b);
-        // Insert at bucket head.
-        e.prev_in_bucket = -1;
-        e.next_in_bucket = buckets[b];
-        if (buckets[b] >= 0) entries[buckets[b]].prev_in_bucket = s;
-        buckets[b] = s;
-        // Insert at task-chain head.
-        const int32_t slot = producer & kTaskWindowMask;
-        e.next_in_task = task_heads[slot];
-        task_heads[slot] = s;
+        tail[b]++;
     }
 
-    // Most-recent producer whose region overlaps `t`, or -1 if none. Entries
-    // below alive_floor are treated as already retired (skipped — defensive,
-    // since cleanup has usually freed them already).
+    // Most-recent producer whose region overlaps `t`, or -1 if none. Scans the
+    // bucket ring newest -> oldest; producer-ascending order means the first
+    // overlap encountered is the MAX overlapping producer.
     int32_t lookup(const Tensor &t) const {
+        if (g_overhead_on) g_tm_lookups.fetch_add(1, std::memory_order_relaxed);
         uint64_t addr, lo, hi;
         byte_range(t, addr, lo, hi);
-        int32_t best = -1;
-        for (int32_t cur = buckets[hash(addr)]; cur >= 0; cur = entries[cur].next_in_bucket) {
-            const MapEntry &e = entries[cur];
+        const int32_t b = static_cast<int32_t>(hash(addr));
+        for (uint64_t k = tail[b]; k > head[b]; k--) {
+            if (g_overhead_on) g_tm_scans.fetch_add(1, std::memory_order_relaxed);
+            const MapEntry &e = slots[b * kStride + static_cast<int32_t>((k - 1) & cap_mask)];
             if (e.producer < alive_floor) continue;
-            if (e.buf_addr == addr && lo < e.hi && e.lo < hi) {
-                if (e.producer > best) best = e.producer;
-            }
+            if (e.buf_addr == addr && lo < e.hi && e.lo < hi) return e.producer;
         }
-        return best;
+        return -1;
+    }
+};
+
+// -----------------------------------------------------------------------------
+// SHARED TensorMap (docs §12.4-§12.7) — a SINGLE global ring-per-bucket shared by
+// every core, selected by PTO_DIST_TENSORMAP_MODE=shared. Same hash/byte_range/
+// overlap semantics as the private map; the only differences (docs §12.3.2) are:
+//   * one copy instead of one-per-core;
+//   * only ONE core appends each task (vs every core in private);
+//   * concurrent readers, so slots carry a `seq` guard and cursors are atomic;
+//   * reclaim by a global floor (min core progress − H − 1) instead of per-core N−H.
+//
+// CORRECTNESS = PRIVATE (bit-identical results, the acceptance goal). Appends are
+// SERIALIZED IN TASK-ID ORDER by the global sequencer g_dist.tm_insert_next (see
+// tm_shared_claim_append): task N is appended exactly once, only after 0..N-1 are
+// appended. Because every core replays every task id in order and only advances
+// past task K after K is appended (the sequencer blocks it), by the time ANY core
+// resolves task N's fan-in the ring already holds every task < N — exactly what a
+// private replica holds at that point. lookup() then applies BOTH the temporal
+// filter (producer < N, §12.6) AND the retire floor (producer >= N−H, mirroring
+// the private map's alive_floor), so it returns the identical producer the private
+// replica would. Single serialized appender ⇒ no MPSC `reserve` needed; head/tail
+// are plain atomics and per-slot `seq` (defense against reader/append slot reuse
+// under host thread preemption, docs §12.7.1) guards concurrent readers. lookup()
+// takes exactly ONE acquire (the tail snapshot) and reads all slots below it with
+// RELAXED loads: because appends are serialized in id order and tail is monotonic,
+// observing tail via acquire already makes every published slot < tail visible, so
+// the per-slot seq is only an ABA guard (relaxed) — this amortizes the memory-order
+// cost to one acquire per lookup instead of one per scanned slot (docs §12.8.1).
+// -----------------------------------------------------------------------------
+struct SharedRingSlot {
+    uint64_t buf_addr;
+    uint64_t lo;
+    uint64_t hi;
+    int32_t producer;
+    int32_t pad_;
+    std::atomic<uint64_t> seq;  // absolute append index k when published; kSeqEmpty otherwise
+};
+
+struct SharedTensorMap {
+    static constexpr int32_t kStride = kBucketCapMax;
+    static constexpr uint64_t kSeqEmpty = ~0ull;
+    SharedRingSlot slots[kRingBuckets * kStride];
+    std::atomic<uint64_t> head[kRingBuckets];  // reclaim cursor (oldest live slot)
+    std::atomic<uint64_t> tail[kRingBuckets];  // publish cursor (next free slot)
+    int32_t cap;
+    int32_t cap_mask;
+
+    void reset() {
+        cap = g_dist_ring_cap;
+        cap_mask = cap - 1;
+        for (int32_t b = 0; b < kRingBuckets; b++) {
+            head[b].store(0, std::memory_order_relaxed);
+            tail[b].store(0, std::memory_order_relaxed);
+        }
+        for (int32_t i = 0; i < kRingBuckets * kStride; i++)
+            slots[i].seq.store(kSeqEmpty, std::memory_order_relaxed);
+    }
+
+    // Single-appender (serialized by g_dist.tm_insert_next). Reclaim retired head
+    // slots (producer <= reclaim_floor), then publish one entry at the tail.
+    void append(const Tensor &t, int32_t producer, int32_t reclaim_floor) {
+        if (g_overhead_on) g_tm_inserts.fetch_add(1, std::memory_order_relaxed);
+        uint64_t addr, lo, hi;
+        DistTensorMap::byte_range(t, addr, lo, hi);
+        const int32_t b = static_cast<int32_t>(DistTensorMap::hash(addr));
+        uint64_t h = head[b].load(std::memory_order_relaxed);
+        const uint64_t tl = tail[b].load(std::memory_order_relaxed);
+        while (h < tl &&
+               slots[b * kStride + static_cast<int32_t>(h & cap_mask)].producer <= reclaim_floor)
+            h++;
+        head[b].store(h, std::memory_order_release);
+        if (tl - h >= static_cast<uint64_t>(cap)) {
+            // Live dependency window for this bucket exceeds ring depth — a
+            // deterministic config error (docs §12.7.2). NEVER silently drop.
+            fprintf(
+                stderr,
+                "[dist_engine] FATAL shared TensorMap ring overflow: bucket=%d cap=%d live=%llu — the "
+                "live dependency window exceeds the ring depth. Raise PTO_DIST_TENSORMAP_RING_CAP (<= %d) "
+                "or lower PTO_DIST_H.\n",
+                b, cap, static_cast<unsigned long long>(tl - h), kBucketCapMax
+            );
+            fflush(stderr);
+            always_assert(false);
+            return;
+        }
+        const uint64_t k = tl;
+        SharedRingSlot &s = slots[b * kStride + static_cast<int32_t>(k & cap_mask)];
+        s.buf_addr = addr;
+        s.lo = lo;
+        s.hi = hi;
+        s.producer = producer;
+        s.seq.store(k, std::memory_order_release);       // publish slot fields
+        tail[b].store(k + 1, std::memory_order_release);  // publish new tail
+    }
+
+    // Most-recent producer overlapping `t` with producer in [floor, N), or -1.
+    // floor == N - H mirrors the private map's alive_floor; the < N temporal
+    // filter (docs §12.6) skips a fast core's future producers. Together they make
+    // the accepted set identical to the private replica's => identical results.
+    int32_t lookup(const Tensor &t, int32_t N, int32_t floor) const {
+        if (g_overhead_on) g_tm_lookups.fetch_add(1, std::memory_order_relaxed);
+        uint64_t addr, lo, hi;
+        DistTensorMap::byte_range(t, addr, lo, hi);
+        const int32_t b = static_cast<int32_t>(DistTensorMap::hash(addr));
+        // ONE acquire per lookup (docs §12.7.1). Appends are serialized in id order
+        // (the tm_insert_next release/acquire chain links append(k)→append(k+1) even
+        // across cores) and tail is monotonic, so this single acquire load of tail
+        // synchronizes-with EVERY append < tl: all their slot fields + seq stores are
+        // already visible. Per-slot reads below therefore use RELAXED — the seq
+        // compare stays only as an ABA guard against a slot being reclaimed+reused
+        // out from under the scan (head advancing concurrently). This drops the cost
+        // from "one acquire per scanned slot" to "one acquire per lookup", bringing
+        // shared's per-slot scan close to private's plain local read (§12.8.1).
+        const uint64_t tl = tail[b].load(std::memory_order_acquire);
+        const uint64_t h = head[b].load(std::memory_order_relaxed);
+        for (uint64_t k = tl; k > h; k--) {
+            if (g_overhead_on) g_tm_scans.fetch_add(1, std::memory_order_relaxed);
+            const uint64_t idx = k - 1;
+            const SharedRingSlot &s = slots[b * kStride + static_cast<int32_t>(idx & cap_mask)];
+            if (s.seq.load(std::memory_order_relaxed) != idx) continue;  // empty / reclaimed+reused slot
+            const int32_t p = s.producer;
+            if (p >= N) continue;      // temporal filter: skip future producers (§12.6)
+            if (p < floor) continue;   // retire floor: identical to private alive_floor (N-H)
+            if (s.buf_addr == addr && lo < s.hi && s.lo < hi) return p;
+        }
+        return -1;
     }
 };
 
@@ -612,8 +742,56 @@ struct DistGlobal {
     // Aligning the start makes the trace reflect steady-state contention.
     std::atomic<int32_t> started_count;
 
+    // ---- Shared TensorMap mode (docs §12; PTO_DIST_TENSORMAP_MODE=shared) ----
+    // One global ring shared by all cores (vs the per-core `DistCore::map`).
+    SharedTensorMap shared_map;
+    // Append sequencer: the next task id to be appended to `shared_map`. Serializes
+    // appends in task-id order so the ring is a faithful, complete replica of what
+    // any private core would hold at each task's fan-in resolution (=> identical
+    // results). A core appending task N CASes this from N to kTmAppendBusy, appends,
+    // then stores N+1. See tm_shared_claim_append.
+    std::atomic<int32_t> tm_insert_next;
+    // Per-core replay progress (local_index), published each task. The shared
+    // reclaim floor is (min over cores) − H − 1, so no live winner's window is
+    // ever evicted (docs §12.7.1 / §9.5).
+    std::atomic<int32_t> core_progress[RUNTIME_MAX_WORKER];
+
     DistCore cores[RUNTIME_MAX_WORKER];
 };
+
+// Shared-vs-private TensorMap mode, chosen once at register time (docs §12.2).
+bool g_tm_shared = false;
+// Sentinel parked in g_dist.tm_insert_next while a core is mid-append for a task
+// (task ids are >= 0, so a negative value is unambiguously "append in progress").
+constexpr int32_t kTmAppendBusy = -1;
+
+// Shared-mode run-ahead bound (docs §12.7.2). The shared ring's live window is
+// `Δ + H` where Δ = (fastest − slowest core) replay spread; a bucket overflows
+// when that window (times per-task regions / hash skew) exceeds `cap`. We cap Δ
+// so the window stays comfortably under `cap`, converting a would-be overflow
+// into BACK-PRESSURE (the append frontier waits, draining, until the slowest core
+// catches up). Set once in register from cap/H (env PTO_DIST_RUNAHEAD overrides;
+// 0 disables the throttle so overflow reverts to the deterministic FATAL). 0 in
+// private mode (private has no cross-core window — its reclaim is per-core N−H).
+int32_t g_tm_runahead_max = 0;
+
+// Dependency-graph signature (verification only, env PTO_DIST_DEPSIG). Each winner
+// XORs a hash of every resolved fan-in edge (consumer task N, producer p) into
+// g_dep_sig; XOR is order-independent, so the value depends only on the SET of
+// edges, not scheduling. private and shared modes must yield the identical
+// signature => shared resolves the same dependency graph (float accumulation-order
+// noise in the numeric golden makes bit-exact output comparison unreliable, so
+// this graph-level oracle is the correctness gate). Reset per run in register.
+std::atomic<uint64_t> g_dep_sig{0};
+std::atomic<uint64_t> g_dep_edges{0};
+inline void dep_sig_add(int32_t consumer, int32_t producer) {
+    uint64_t x = (static_cast<uint64_t>(static_cast<uint32_t>(consumer)) << 32) |
+                 static_cast<uint32_t>(producer);
+    x *= 0x9E3779B97F4A7C15ULL;  // mix so adjacent edges don't collide trivially
+    x ^= x >> 29;
+    g_dep_sig.fetch_xor(x, std::memory_order_relaxed);
+    g_dep_edges.fetch_add(1, std::memory_order_relaxed);
+}
 
 DistGlobal g_dist;
 thread_local DistCore *g_self = nullptr;
@@ -633,6 +811,42 @@ inline uint64_t now_ns() {
         std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch())
             .count()
     );
+}
+
+// On-core orchestration overhead summary (env PTO_DIST_OVERHEAD=1). Isolates the
+// distributed runtime's own cost from the Python/sim launch overhead that swamps
+// the host wall clock and from device_wall_us (which reads 0 for single cold sim
+// runs). Each core times its post-barrier replay-start (t0, a local) to its
+// drain-complete (t1), folds t0/t1/busy into the global min/max/sum atomics, then
+// bumps g_orch_recorded; the LAST core to finish (recorded == num_workers) owns
+// the complete picture and prints makespan = max(t1)-min(t0) + per-core busy
+// min/avg/max. Using the last finisher + actual recorded values (not an index
+// scan) is robust to sparse core_idx and needs no spin barrier. Under
+// PTO_DIST_SKIP_EXEC=1 (0-cost kernels) makespan IS the pure on-core
+// orchestration wall — the private-vs-shared metric. All seq_cst so the last
+// finisher observes every other core's folds. (g_overhead_on declared up top.)
+std::atomic<uint64_t> g_orch_t0_min{~0ull};
+std::atomic<uint64_t> g_orch_t1_max{0};
+std::atomic<uint64_t> g_orch_busy_min{~0ull};
+std::atomic<uint64_t> g_orch_busy_max{0};
+std::atomic<uint64_t> g_orch_busy_sum{0};
+// Replay-phase (orch_func) wall per core. This is the map-build + fan-in-lookup +
+// claim cost with NO drain-loop cross-core spin, so replay_us/task is the clean
+// per-task orchestration overhead (the private-vs-shared metric) — unlike busy_us
+// which is dominated by inter-core scheduling latency on an oversubscribed host.
+std::atomic<uint64_t> g_orch_replay_min{~0ull};
+std::atomic<uint64_t> g_orch_replay_max{0};
+std::atomic<uint64_t> g_orch_replay_sum{0};
+std::atomic<int32_t> g_orch_recorded{0};
+inline void atomic_min_u64(std::atomic<uint64_t> &a, uint64_t v) {
+    uint64_t cur = a.load(std::memory_order_seq_cst);
+    while (v < cur && !a.compare_exchange_weak(cur, v, std::memory_order_seq_cst)) {
+    }
+}
+inline void atomic_max_u64(std::atomic<uint64_t> &a, uint64_t v) {
+    uint64_t cur = a.load(std::memory_order_seq_cst);
+    while (v > cur && !a.compare_exchange_weak(cur, v, std::memory_order_seq_cst)) {
+    }
 }
 #endif  // DIST_SIM_HOST_CLOCK
 
@@ -1036,6 +1250,101 @@ void drain_block_won(DistCore *self) {
 }
 
 // -----------------------------------------------------------------------------
+// Shared TensorMap helpers (docs §12.4-§12.7). Only used when g_tm_shared.
+// -----------------------------------------------------------------------------
+
+// Slowest core's replay progress (min over all cores). O(num_workers).
+inline int32_t tm_shared_min_progress() {
+    int32_t mn = INT32_MAX;
+    const int32_t nw = g_dist.num_workers;
+    for (int32_t c = 0; c < nw; c++) {
+        const int32_t p = g_dist.core_progress[c].load(std::memory_order_relaxed);
+        if (p < mn) mn = p;
+    }
+    return mn;
+}
+
+// Global reclaim floor for the shared ring: producers <= this are retired. Based
+// on the SLOWEST core's replay progress so no live winner's [N-H, N) window is
+// ever evicted (docs §12.7.1 / §9.5). O(num_workers), called once per append.
+inline int32_t tm_shared_reclaim_floor() { return tm_shared_min_progress() - g_dist.H - 1; }
+
+// Sequenced, exactly-once append claim for task N (docs §12.4). Returns true iff
+// THIS core must perform the append (it won the sequencer at insert_next==N); the
+// caller then appends every output region via g_dist.shared_map.append(...) and
+// calls tm_shared_publish(N). Returns false if task N is already appended by
+// another core (nothing to do) — in that case it has spun (draining ready work)
+// until the append is visible, so the ring holds task N on return. Guarantees
+// appends happen strictly in id order (append N only when 0..N-1 are done), which
+// is what makes the shared ring content identical to a private replica.
+inline bool tm_shared_claim_append(DistCore *self, int32_t N) {
+    uint64_t wd = 0;
+    while (true) {
+        // Run-ahead back-pressure (docs §12.7.2): keep the append frontier within
+        // Δ_max of the slowest core so the shared ring's `Δ+H` live window stays
+        // under `cap`. We wait here WITHOUT holding the sequencer (insert_next is
+        // still == N, not BUSY), so cores behind N keep advancing (their
+        // claim_append returns immediately since insert_next > their id) and raise
+        // min_progress — which releases us. Deadlock-free; only throttles the
+        // frontier. Disabled when g_tm_runahead_max == 0 (=> overflow FATALs).
+        if (g_tm_runahead_max > 0 && (N - tm_shared_min_progress()) > g_tm_runahead_max) {
+            if (fatal_set()) return false;
+            drain_block_won(self);
+            if (drain_phase_b(self) == 0) {
+                SPIN_WAIT_HINT();
+                watchdog(wd);
+            }
+            continue;
+        }
+        const int32_t v = g_dist.tm_insert_next.load(std::memory_order_acquire);
+        if (v > N) return false;  // task N already appended and published
+        if (v == N) {
+            int32_t expect = N;
+            if (g_dist.tm_insert_next.compare_exchange_strong(
+                    expect, kTmAppendBusy, std::memory_order_acq_rel, std::memory_order_acquire))
+                return true;  // we own the append for N
+            // Lost the CAS (another core is appending N) — fall through to spin.
+        }
+        // v < N means a lower task is not yet appended, or v == kTmAppendBusy means
+        // someone is mid-append; either way help drain and retry until it advances.
+        if (fatal_set()) return false;
+        drain_block_won(self);
+        if (drain_phase_b(self) == 0) {
+            SPIN_WAIT_HINT();
+            watchdog(wd);
+        }
+    }
+}
+
+inline void tm_shared_publish(int32_t N) {
+    g_dist.tm_insert_next.store(N + 1, std::memory_order_release);
+}
+
+// Append every OUTPUT / INOUT / OUTPUT_EXISTING region of task N to the shared
+// ring, exactly once across all cores and strictly in id order. `outputs` are the
+// materialized OUTPUT tensors (from result); INOUT / OUTPUT_EXISTING come from
+// args. Called by EVERY core in shared mode (mirrors the unconditional private
+// insert), but only the sequencer winner actually writes the ring.
+inline void tm_shared_append_task(
+    DistCore *self, int32_t N, const L0TaskArgs &args, TaskOutputTensors &result
+) {
+    if (!tm_shared_claim_append(self, N)) return;
+    const int32_t rfloor = tm_shared_reclaim_floor();
+    const int32_t tc = args.tensor_count();
+    uint32_t out_idx = 0;
+    for (int32_t i = 0; i < tc; i++) {
+        const TensorArgType tag = args.tag(i);
+        if (tag == TensorArgType::OUTPUT) {
+            g_dist.shared_map.append(result.get_ref(out_idx), N, rfloor);
+            out_idx++;
+        } else if (tag == TensorArgType::INOUT || tag == TensorArgType::OUTPUT_EXISTING) {
+            g_dist.shared_map.append(args.tensor(i).ref(), N, rfloor);
+        }
+    }
+    tm_shared_publish(N);  // sequencer: 0..N now appended
+}
+
+// -----------------------------------------------------------------------------
 // Distributed submit op (replaces the centralized orchestrator submit).
 //
 // Every core runs this for every task (identical replay): materialize outputs
@@ -1142,8 +1451,13 @@ TaskOutputTensors dist_submit_impl(PTO2Runtime *, const MixedKernels &mixed, con
 
     // Retire producer-map entries that have left the H span (deterministic,
     // N-derived) before this task's lookups/inserts. Bounds chain length so
-    // submit stays ~O(N) instead of O(N^2). See DistTensorMap.
-    self->map.advance_retire(N, g_dist.H);
+    // submit stays ~O(N) instead of O(N^2). See DistTensorMap. In shared mode the
+    // per-core map is unused; instead publish this core's progress so the shared
+    // ring's global reclaim floor tracks the slowest core (docs §12.7.1).
+    if (g_tm_shared)
+        g_dist.core_progress[self->core_idx].store(N, std::memory_order_relaxed);
+    else
+        self->map.advance_retire(N, g_dist.H);
 
     // (b) Anchor type + claim race FIRST — resolved from the mask alone (no map
     // ops, no Tensor copies). Deciding the winner up front lets the ~2/3 of cores
@@ -1180,7 +1494,11 @@ TaskOutputTensors dist_submit_impl(PTO2Runtime *, const MixedKernels &mixed, con
             if (tag != TensorArgType::INPUT && tag != TensorArgType::INOUT) continue;
             const Tensor &t = args.tensor(i).ref();
             if (t.manual_dep) continue;
-            const int32_t p = self->map.lookup(t);
+            // Shared: query the one global ring with the same [N-H, N) window the
+            // private replica uses (temporal filter + retire floor) => identical
+            // producer. Private: query this core's replica (alive_floor already N-H).
+            const int32_t p =
+                g_tm_shared ? g_dist.shared_map.lookup(t, N, N - g_dist.H) : self->map.lookup(t);
             if (p < 0) continue;
             bool dup = false;
             for (int32_t k = 0; k < fc; k++)
@@ -1188,20 +1506,31 @@ TaskOutputTensors dist_submit_impl(PTO2Runtime *, const MixedKernels &mixed, con
                     dup = true;
                     break;
                 }
-            if (!dup && fc < kMaxFanin) fanin[fc++] = p;
+            if (!dup && fc < kMaxFanin) {
+                fanin[fc++] = p;
+                dep_sig_add(N, p);  // graph-signature verification (env PTO_DIST_DEPSIG)
+            }
         }
     }
 
     // (d) Register this task as the producer of its OUTPUT / INOUT / existing
-    // outputs — UNCONDITIONAL (every core, so all duplicate maps stay identical).
-    uint32_t out_idx = 0;
-    for (int32_t i = 0; i < tc; i++) {
-        const TensorArgType tag = args.tag(i);
-        if (tag == TensorArgType::OUTPUT) {
-            self->map.insert(result.get_ref(out_idx), N);
-            out_idx++;
-        } else if (tag == TensorArgType::INOUT || tag == TensorArgType::OUTPUT_EXISTING) {
-            self->map.insert(args.tensor(i).ref(), N);
+    // outputs. Private: UNCONDITIONAL (every core writes its own replica, so all
+    // stay identical — §4). Shared: EVERY core calls the sequencer, but only the
+    // one that wins the in-id-order append actually writes the single global ring
+    // (docs §12.4); it also blocks until 0..N are appended, so the ring is complete
+    // for any later fan-in resolution => identical content to a private replica.
+    if (g_tm_shared) {
+        tm_shared_append_task(self, N, args, result);
+    } else {
+        uint32_t out_idx = 0;
+        for (int32_t i = 0; i < tc; i++) {
+            const TensorArgType tag = args.tag(i);
+            if (tag == TensorArgType::OUTPUT) {
+                self->map.insert(result.get_ref(out_idx), N);
+                out_idx++;
+            } else if (tag == TensorArgType::INOUT || tag == TensorArgType::OUTPUT_EXISTING) {
+                self->map.insert(args.tensor(i).ref(), N);
+            }
         }
     }
 
@@ -1427,8 +1756,12 @@ void dist_log_info_v(const char *, int, const char *, ...) {}
 // tensors (no producer) are accessed immediately. Consumer (WAR) tracking is not
 // modeled, mirroring the centralized runtime's documented INPUT-reader limitation.
 void wait_producer_ready(DistCore *self, const Tensor &t) {
-    // Cold path (get/set_tensor_data); uses the map's current alive_floor.
-    const int32_t p = self->map.lookup(t);
+    // Cold path (get/set_tensor_data); uses the map's current alive_floor. In
+    // shared mode query the global ring with this core's [N-H, N) window (N =
+    // current replay position); an over-old hit only waits on an already-set flag.
+    const int32_t N = self->local_index;
+    const int32_t p =
+        g_tm_shared ? g_dist.shared_map.lookup(t, N, N - g_dist.H) : self->map.lookup(t);
     if (p < 0) return;
     uint64_t wd = 0;
     while (!fatal_set()) {
@@ -1534,13 +1867,20 @@ TaskOutputTensors dist_alloc_tensors(PTO2Runtime *, const L0TaskArgs &args) {
     if (N >= 0 && N < kFlagCap) g_dist.vend[N].store(self->heap_next, std::memory_order_relaxed);
     if (fatal_set()) return result;
 
-    // (b) Register this alloc as producer of each output — EVERY core (map parity).
-    self->map.advance_retire(N, g_dist.H);
-    uint32_t out_idx = 0;
-    for (int32_t i = 0; i < tc; i++) {
-        if (args.tag(i) != TensorArgType::OUTPUT) continue;
-        self->map.insert(result.get_ref(out_idx), N);
-        out_idx++;
+    // (b) Register this alloc as producer of each output. Private: EVERY core
+    // writes its replica (map parity). Shared: the in-id-order sequencer appends
+    // once to the single global ring (docs §12.4), same as dist_submit_impl (d).
+    if (g_tm_shared) {
+        g_dist.core_progress[self->core_idx].store(N, std::memory_order_relaxed);
+        tm_shared_append_task(self, N, args, result);
+    } else {
+        self->map.advance_retire(N, g_dist.H);
+        uint32_t out_idx = 0;
+        for (int32_t i = 0; i < tc; i++) {
+            if (args.tag(i) != TensorArgType::OUTPUT) continue;
+            self->map.insert(result.get_ref(out_idx), N);
+            out_idx++;
+        }
     }
 
     // (c) Single-owner election (mirrors dist_submit_impl's claim). The first core
@@ -1693,9 +2033,15 @@ void dist_core_main(void *runtime_v, int core_idx, int core_type_int) {
     // claim/build owned tasks into the private ring (back-pressure inline). MIX
     // anchors deposit follower subtasks into block.won during this replay.
     TRACE_LAP_RESET(self);  // origin for the first lap span (post-barrier, pre-replay)
+#if DIST_SIM_HOST_CLOCK
+    const uint64_t orch_t0 = g_overhead_on ? now_ns() : 0;
+#endif
     if (g_dist.orch_func != nullptr && g_dist.orch_args != nullptr && !fatal_set()) {
         g_dist.orch_func(*g_dist.orch_args);
     }
+#if DIST_SIM_HOST_CLOCK
+    const uint64_t orch_replay_end = g_overhead_on ? now_ns() : 0;
+#endif
 
     // Publish "my replay is done" so followers can eventually conclude that no
     // further block.won deposits will arrive for them (§7 tail-idle).
@@ -1723,6 +2069,66 @@ void dist_core_main(void *runtime_v, int core_idx, int core_type_int) {
         fprintf(
             stderr, "[dist] core %d role=%d DONE replayed=%d owned=%d fatal=%d\n", core_idx, core_type_int,
             self->local_index, self->owned_total, fatal_set() ? 1 : 0
+        );
+    }
+#if DIST_SIM_HOST_CLOCK
+    // On-core orchestration overhead summary (env PTO_DIST_OVERHEAD). Fold this
+    // core's [t0,t1] window into the global min/max/sum, then the LAST finisher
+    // prints. See g_overhead_on comment.
+    if (g_overhead_on) {
+        const uint64_t t1 = now_ns();
+        const uint64_t busy = (t1 > orch_t0) ? (t1 - orch_t0) : 0;
+        const uint64_t replay = (orch_replay_end > orch_t0) ? (orch_replay_end - orch_t0) : 0;
+        atomic_min_u64(g_orch_t0_min, orch_t0);
+        atomic_max_u64(g_orch_t1_max, t1);
+        atomic_min_u64(g_orch_busy_min, busy);
+        atomic_max_u64(g_orch_busy_max, busy);
+        g_orch_busy_sum.fetch_add(busy, std::memory_order_seq_cst);
+        atomic_min_u64(g_orch_replay_min, replay);
+        atomic_max_u64(g_orch_replay_max, replay);
+        g_orch_replay_sum.fetch_add(replay, std::memory_order_seq_cst);
+        const int32_t nw = g_dist.num_workers;
+        if (g_orch_recorded.fetch_add(1, std::memory_order_seq_cst) + 1 == nw) {
+            const double makespan_us =
+                (g_orch_t1_max.load(std::memory_order_seq_cst) - g_orch_t0_min.load(std::memory_order_seq_cst)) / 1000.0;
+            const uint64_t bsum = g_orch_busy_sum.load(std::memory_order_seq_cst);
+            const uint64_t rsum = g_orch_replay_sum.load(std::memory_order_seq_cst);
+            fprintf(
+                stderr,
+                "[dist] OVERHEAD mode=%s cores=%d skip_exec=%d makespan_us=%.1f "
+                "busy_us[min/avg/max]=%.1f/%.1f/%.1f "
+                "replay_us[min/avg/max]=%.1f/%.1f/%.1f\n",
+                g_tm_shared ? "shared" : "private", nw, g_skip_exec ? 1 : 0, makespan_us,
+                g_orch_busy_min.load(std::memory_order_seq_cst) / 1000.0, (bsum / static_cast<double>(nw)) / 1000.0,
+                g_orch_busy_max.load(std::memory_order_seq_cst) / 1000.0,
+                g_orch_replay_min.load(std::memory_order_seq_cst) / 1000.0, (rsum / static_cast<double>(nw)) / 1000.0,
+                g_orch_replay_max.load(std::memory_order_seq_cst) / 1000.0
+            );
+        }
+    }
+#endif
+    // Dependency-graph signature (env PTO_DIST_DEPSIG). Printed once (core 0) after
+    // the global drain barrier, so every task's fan-in is resolved and g_dep_sig is
+    // final. Must be identical between private and shared modes.
+    if (self->core_idx == 0 && getenv("PTO_DIST_DEPSIG") != nullptr) {
+        fprintf(
+            stderr, "[dist] DEPSIG mode=%s sig=%016llx edges=%llu\n", g_tm_shared ? "shared" : "private",
+            static_cast<unsigned long long>(g_dep_sig.load(std::memory_order_relaxed)),
+            static_cast<unsigned long long>(g_dep_edges.load(std::memory_order_relaxed))
+        );
+    }
+    // TensorMap op counts (env PTO_DIST_OVERHEAD). Safe to read at core 0 here:
+    // every core has finished replay (all_replayed gated the drain break), so all
+    // insert/lookup/scan folds are done and visible via the replay_done acq/rel
+    // barrier. This is the deterministic, platform-independent overhead metric
+    // (private inserts ≈ C×D vs shared ≈ D — the SPMD insert-floor difference).
+    if (self->core_idx == 0 && g_overhead_on) {
+        fprintf(
+            stderr, "[dist] TMOPS mode=%s cores=%d inserts=%llu lookups=%llu scans=%llu\n",
+            g_tm_shared ? "shared" : "private", g_dist.num_workers,
+            static_cast<unsigned long long>(g_tm_inserts.load(std::memory_order_relaxed)),
+            static_cast<unsigned long long>(g_tm_lookups.load(std::memory_order_relaxed)),
+            static_cast<unsigned long long>(g_tm_scans.load(std::memory_order_relaxed))
         );
     }
     g_self = nullptr;
@@ -1765,10 +2171,28 @@ void *dist_engine_register(
         const long h = atol(e);
         if (h >= 0) g_dist.H = static_cast<int32_t>(h);
     }
-    // The producer map recycles a task's entry-head slot kTaskWindow tasks later;
-    // cleanup retires a task once it leaves the H span, so H must stay below the
-    // window (with margin) or a slot could be reused before its task is cleaned.
-    always_assert(g_dist.H < kTaskWindow - 1);
+    // Ring-per-bucket per-bucket depth (docs §12.7.2). Default `auto`: derive from
+    // the dependency-span H — a bucket's live window is ~H tasks worth of entries,
+    // so cap = next_pow2(8*H) gives generous headroom for multiple regions/task and
+    // hash skew, clamped to [64, kBucketCapMax]. PTO_DIST_TENSORMAP_RING_CAP=N
+    // overrides (rounded up to a power of 2, clamped to kBucketCapMax); =auto keeps
+    // the derived value. Overflow within a run is still a deterministic FATAL in
+    // insert() (never a silent drop), so an under-sized override fails loudly.
+    {
+        int32_t derived = round_pow2_cap(g_dist.H > 0 ? 8 * g_dist.H : 64);
+        if (derived < 64) derived = 64;
+        g_dist_ring_cap = derived;
+        if (const char *e = getenv("PTO_DIST_TENSORMAP_RING_CAP")) {
+            if (strcmp(e, "auto") != 0) {
+                const long n = atol(e);
+                if (n > 0) g_dist_ring_cap = round_pow2_cap(static_cast<int32_t>(n));
+            }
+        }
+    }
+    // A bucket's live window spans ~H tasks worth of entries, so H must stay below
+    // the ring depth or insert() would overflow. (Necessary condition; true
+    // occupancy also depends on regions/task + hash skew, guarded by insert FATAL.)
+    always_assert(g_dist.H < g_dist_ring_cap - 1);
 #if DIST_TRACE_ENABLED
     // Swimlane tracing gate. Capture the epoch now so every core's event ts is
     // relative to the same run start.
@@ -1783,7 +2207,21 @@ void *dist_engine_register(
 #if DIST_SIM_HOST_CLOCK
     // Overhead-isolation gate (skip incore kernel calls, keep all bookkeeping).
     g_skip_exec = (getenv("PTO_DIST_SKIP_EXEC") != nullptr);
+    // On-core orchestration overhead summary gate (per-core makespan/busy print).
+    g_overhead_on = (getenv("PTO_DIST_OVERHEAD") != nullptr);
+    g_orch_recorded.store(0, std::memory_order_relaxed);
+    g_orch_t0_min.store(~0ull, std::memory_order_relaxed);
+    g_orch_t1_max.store(0, std::memory_order_relaxed);
+    g_orch_busy_min.store(~0ull, std::memory_order_relaxed);
+    g_orch_busy_max.store(0, std::memory_order_relaxed);
+    g_orch_busy_sum.store(0, std::memory_order_relaxed);
+    g_orch_replay_min.store(~0ull, std::memory_order_relaxed);
+    g_orch_replay_max.store(0, std::memory_order_relaxed);
+    g_orch_replay_sum.store(0, std::memory_order_relaxed);
 #endif
+    g_tm_inserts.store(0, std::memory_order_relaxed);
+    g_tm_lookups.store(0, std::memory_order_relaxed);
+    g_tm_scans.store(0, std::memory_order_relaxed);
 
     for (int32_t s = 0; s < kCursorShards; s++) {
         g_dist.cube_cursor[s].v.store(-1, std::memory_order_relaxed);
@@ -1796,6 +2234,31 @@ void *dist_engine_register(
     g_dist.fatal.store(0, std::memory_order_relaxed);
     g_dist.replay_done.store(0, std::memory_order_relaxed);
     g_dist.started_count.store(0, std::memory_order_relaxed);
+
+    // TensorMap mode (docs §12.2): private (default, per-core replica) or shared
+    // (one global ring-per-bucket). Selected once per run; never switched mid-run.
+    g_dep_sig.store(0, std::memory_order_relaxed);
+    g_dep_edges.store(0, std::memory_order_relaxed);
+    g_tm_shared = false;
+    if (const char *e = getenv("PTO_DIST_TENSORMAP_MODE"))
+        if (strcmp(e, "shared") == 0) g_tm_shared = true;
+    g_tm_runahead_max = 0;
+    if (g_tm_shared) {
+        g_dist.shared_map.reset();
+        g_dist.tm_insert_next.store(0, std::memory_order_relaxed);
+        for (int32_t i = 0; i < RUNTIME_MAX_WORKER; i++)
+            g_dist.core_progress[i].store(0, std::memory_order_relaxed);
+        // Bound run-ahead so the shared live window (Δ+H) stays well under cap,
+        // leaving headroom for per-task regions + hash skew. Default keeps the
+        // window <= ~3/4 cap; PTO_DIST_RUNAHEAD=N overrides (0 disables => FATAL
+        // on overflow instead of back-pressure).
+        g_tm_runahead_max = (3 * g_dist_ring_cap) / 4 - g_dist.H - 1;
+        if (g_tm_runahead_max < 1) g_tm_runahead_max = 1;
+        if (const char *e = getenv("PTO_DIST_RUNAHEAD")) {
+            const long v = atol(e);
+            if (v >= 0) g_tm_runahead_max = static_cast<int32_t>(v);
+        }
+    }
     g_dist.orch_func = orch_func;
     g_dist.orch_args = orch_args;
     g_dist.rt = rt;

@@ -56,6 +56,14 @@ from simpler_setup import SceneTestCase, TaskArgsBuilder, Tensor, scene_test
 # them so this benchmark exercises exactly that workload without duplication.
 _BGEMM = "../benchmark_bgemm/kernels"
 
+# Default shared-mode run-ahead bound for the overhead benchmark: a very large
+# window so the append-frontier throttle (PTO_DIST_RUNAHEAD, docs §12.7.2) never
+# fires and its back-pressure/drain never perturbs the orchestration timing we are
+# measuring. ~1e9 tasks >> any realistic task count, so the throttle is a no-op.
+# The deterministic TMOPS counts (§12.8.1) are unaffected by the throttle either
+# way; this only keeps the wall/makespan clean. Pass --runahead to re-enable it.
+_RUNAHEAD_WIDE_OPEN = 1 << 30
+
 
 @scene_test(level=2, runtime="fully_distributed_within_core")
 class TestRuntimeOverhead(SceneTestCase):
@@ -226,7 +234,7 @@ def _apply_cpu_binding(bind):
 # ---------------------------------------------------------------------------
 
 
-def _bench(platform, block_dims, params, rounds, skip_exec, warmup, device):
+def _bench(platform, block_dims, params, rounds, skip_exec, warmup, device, tm_mode=None, tm_cap=None, runahead=None):
     """Run the workload once per block_dim and return per-config timings (us)."""
     import os  # noqa: PLC0415
     import statistics  # noqa: PLC0415
@@ -240,6 +248,24 @@ def _bench(platform, block_dims, params, rounds, skip_exec, warmup, device):
         os.environ["PTO_DIST_SKIP_EXEC"] = "1"
     else:
         os.environ.pop("PTO_DIST_SKIP_EXEC", None)
+
+    # TensorMap knobs, also read once per run() at dist_engine_register. Set them
+    # here (pop when unset) so a value never leaks across processes/invocations.
+    #   * PTO_DIST_TENSORMAP_MODE : private | shared
+    #   * PTO_DIST_TENSORMAP_RING_CAP : per-bucket ring depth (int) | auto
+    #   * PTO_DIST_RUNAHEAD : shared-mode append-frontier run-ahead bound Δ_max
+    #       (tasks the fastest core may lead the slowest by before it back-pressures;
+    #        0 disables the throttle so a Δ+H overflow reverts to a deterministic
+    #        FATAL). Only meaningful in shared mode. See docs §12.7.2 / §12.10.
+    for var, val in (
+        ("PTO_DIST_TENSORMAP_MODE", tm_mode),
+        ("PTO_DIST_TENSORMAP_RING_CAP", tm_cap),
+        ("PTO_DIST_RUNAHEAD", runahead),
+    ):
+        if val is None:
+            os.environ.pop(var, None)
+        else:
+            os.environ[var] = str(val)
 
     # The standalone path skips scene_test's per-class setup, so resolve the
     # (relative) bgemm kernel sources against this file's directory ourselves.
@@ -344,6 +370,29 @@ def main():
     p.add_argument("--grid-k", type=int, default=2)
     p.add_argument("--exec", action="store_true", help="actually run kernels (default: skip for overhead isolation)")
     p.add_argument(
+        "--tensormap-mode",
+        choices=["private", "shared"],
+        default=None,
+        help="TensorMap mode (sets PTO_DIST_TENSORMAP_MODE). Default: engine default (private).",
+    )
+    p.add_argument(
+        "--tensormap-cap",
+        default=None,
+        help="per-bucket ring depth: int (power of 2) or 'auto' (sets PTO_DIST_TENSORMAP_RING_CAP).",
+    )
+    p.add_argument(
+        "--runahead",
+        type=int,
+        default=None,
+        help="shared-mode append-frontier run-ahead bound Δ_max: max tasks the fastest core may lead "
+        "the slowest before it back-pressures (drains ready work) instead of overflowing the shared "
+        "ring's Δ+H window. 0 disables the throttle (Δ+H overflow -> deterministic FATAL). Only "
+        "meaningful with --tensormap-mode shared. Sets PTO_DIST_RUNAHEAD. NOTE: for a clean overhead "
+        f"measurement this benchmark defaults to a very large window ({_RUNAHEAD_WIDE_OPEN}) so the "
+        "throttle's back-pressure never perturbs the timing; pass an explicit value to re-enable it. "
+        "See docs §12.7.2 / §12.10.",
+    )
+    p.add_argument(
         "--bind",
         default="none",
         help="CPU core-binding strategy: 'none' | 'node:<nodes>' (e.g. node:0,1) | "
@@ -401,8 +450,28 @@ def main():
         "grid_k": args.grid_k,
     }
     skip_exec = not args.exec
-    print(f"Benchmarking block_dims={block_dims} on {args.platform} (skip_exec={skip_exec}) ...")
-    results = _bench(args.platform, block_dims, params, args.rounds, skip_exec, args.warmup, args.device)
+    # For a clean overhead measurement, default the shared-mode throttle window to
+    # very large so its back-pressure never perturbs the timing (see comment on
+    # _RUNAHEAD_WIDE_OPEN). An explicit --runahead re-enables/overrides it.
+    runahead = args.runahead if args.runahead is not None else _RUNAHEAD_WIDE_OPEN
+    tm_note = (
+        f" tensormap_mode={args.tensormap_mode or 'default'}"
+        f" cap={args.tensormap_cap if args.tensormap_cap is not None else 'default'}"
+        f" runahead={runahead}{' (wide-open, throttle off)' if args.runahead is None else ''}"
+    )
+    print(f"Benchmarking block_dims={block_dims} on {args.platform} (skip_exec={skip_exec}){tm_note} ...")
+    results = _bench(
+        args.platform,
+        block_dims,
+        params,
+        args.rounds,
+        skip_exec,
+        args.warmup,
+        args.device,
+        tm_mode=args.tensormap_mode,
+        tm_cap=args.tensormap_cap,
+        runahead=runahead,
+    )
     _print_table(results, params, args.rounds, skip_exec, args.bind, bind_ncores)
 
 

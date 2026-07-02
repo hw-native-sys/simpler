@@ -1225,7 +1225,790 @@ anchor 推送最后的多核子任务。这不是 per-task 串行阻塞，只发
   动态配对方案（跨 block 均衡 MIX 工作；亦即 §3.2 讨论并暂不采用的“block 内先到先得代发布”等
   思路的归宿）**仅在未来核解除该硬件绑定时**才需要，届时再行设计，**本节不予裁定**。
 
-## 12. 相关文档
+## 12. TensorMap 构建与 Private / Shared 双模式（统一 ring-per-bucket）
+
+本章新增一个**正交的运行模式开关**：TensorMap（§4、§8.2、§9）既可以保持"每核全量复制"形态
+（private），也可以改为"全局共享一份"（shared）。二者由**命令行开关**在运行启动时一次性选定，
+贯穿整次运行不再切换。本章先回顾 TensorMap 如何被构建，再**论证两种模式统一采用同一套
+ring-per-bucket 数据结构**（§12.3 的 链表 vs ring 性能分析），随后定义两种模式仅有的差异、重点分析
+**shared 模式下无缓存一致性平台上的数据一致性问题**并给出解决方案，最后比较两种模式的性能、
+**论证 `auto` 定容的安全性与实现**（§12.7.2），并说明顶层入口（TensorMap 指针）如何被改造为支持双模。
+
+> **规范约定（本章基准）**：**private 与 shared 两种模式统一采用 ring-per-bucket（每桶一个有界环形
+> 缓冲，§12.7.1）作为唯一数据结构**；二者仅在"副本数 / 谁 insert / 并发纪律 / 回收阈值"四点上分叉
+> （对比见 §12.3.2）。之所以统一：§12.3 的分析表明 **ring 在 private 与 shared 下均不劣于链表、且多数
+> 维度更优**（§6.4 的 O(N) 收益来自"回收窗口 + 哈希分桶"而非"链表"这一存储形态，ring 完整继承之，
+> 另在局部性/内存/回收常数上取胜）。早期为 shared 考虑的"桶内链表 + 空闲链"方案因空闲链 ABA /
+> `next` 悬挂指针 / use-after-recycle 等一致性陷阱**已被否决**（§12.7 作对照基线保留）；§6.4 为 private
+> 实现的链表结构在本章分析下**亦被 ring 取代**（其回收窗口/哈希/winner-only 等洞见原样继承）。ring 的
+> 容量 `CAP`、溢出报错与命令行参数见 §12.7.2；`auto` 定容的安全性论证见 §12.7.2.3。
+
+### 12.1 TensorMap 的构建回顾
+
+TensorMap 把一个 tensor 区域 `[lo, hi)` 映射到其 **producer 任务 id**。它的构建规则在 §4 已定，
+此处重述为可被两种模式共用的"构建原语"：
+
+- **查（lookup）**：给定一个 `INPUT`/`INOUT` tensor 区间，找到与之重叠、且 producer id **最大**
+  （最新）的条目，作为该 fan-in 的 producer。`INOUT` 两侧都参与：先查（消费旧版本）再插
+  （产出新版本）。
+- **插（insert）**：给定一个 `OUTPUT` 或 `INOUT` tensor 区间，以**本任务 id** `N` 作为 producer
+  登记一条新条目。
+
+§6.4 曾为 **private 模式**把 `DistTensorMap` 物理结构定为"按 buffer 基址哈希分桶 + 桶内链表 + 按
+生产者任务的 entry 链 + 空闲链表 + lazy invalidation + `cleanup_retired` 按任务回收"，且 **insert 总是
+挂新条目**（不做就地替换），`lookup` 返回重叠者中 producer **最大**的那个。**但本章 §12.3 的性能分析
+表明该链表结构应被 ring-per-bucket 取代**——不仅 shared 必须用 ring（§12.7），private 用 ring 也全面
+不劣于链表且更省更快。故**两种模式统一采用 ring-per-bucket**；§6.4 的回收窗口（`N−H`）、哈希分桶、
+"多版本共存、不就地替换"、winner-only fan-in 等语义与洞见**原样继承**到 ring 实现（§12.5/§12.6）。
+
+两种模式的差异不在于"构建原语"或"数据结构"本身（统一为 ring），而只在于：**insert/lookup 作用在
+哪一份 map 上、由谁来执行、以及跨核可见性如何保证**（四点差异见 §12.3.2）。
+
+### 12.2 命令行开关
+
+新增一个启动期开关（环境变量与 CLI 同义，沿用 §6.3 的 `--bind` 风格）：
+
+```
+--tensormap-mode {private|shared}        # 等价环境变量 PTO_DIST_TENSORMAP_MODE
+--tensormap-ring-cap {N|auto}            # 等价环境变量 PTO_DIST_TENSORMAP_RING_CAP；private/shared 均生效
+```
+
+- `private`（**默认**）：每核一份全量复制 map，数据结构为 ring-per-bucket（每核私有、单线程纪律，§12.3.2）。
+- `shared`：全核共享**唯一一份** TensorMap，数据结构同为 ring-per-bucket（并发纪律 + per-slot `seq`，§12.7.1）。
+- `--tensormap-ring-cap`：**两种模式均生效**（两者都用 ring），设定每桶 ring 的定长槽数 `CAP`（2 的幂）。
+  默认 `auto` = 由依赖跨度 `H`（private）或 `Δ+H`（shared）与该桶静态区域分布推导（§12.7.2）。**`auto`
+  在两种模式下都能给出可证充分的容量**（§12.7.2.3）。
+
+开关在 runtime 初始化阶段被读取一次，据此构造对应形态的 TensorMap 句柄（§12.9）并选择对应的
+insert/lookup 实现。**运行期不切换**，避免中途一致性灾难。所有 per-core 编排循环（§6）通过同一
+组抽象 API（`tm_insert` / `tm_lookup`）访问 map，由句柄分发到 private 或 shared 的 ring 实现——上层
+伪代码不变。`--tensormap-ring-cap` 影响两种模式每桶 ring 的分配尺寸，完整论证（含 `auto` 安全性）
+见 §12.7.2。
+
+### 12.3 为何统一到 ring-per-bucket：链表 vs ring 性能分析
+
+**关键澄清（先破一个误解）。** §6.4 的 O(N) 收益**来自"按 H 窗口回收 + 哈希分桶"，与"链表 vs 数组"
+这一存储形态无关**。ring 完整保留同一个回收窗口（private 用确定性 `N−H`，shared 用全局前沿 `R`）
+与同一套哈希分桶，只把"桶内链表 + 空闲链"换成"桶内定长环 + 游标"。因此 **ring 继承 §6.4 的全部渐进
+收益（仍是 O(N)）**，差异只在**常数因子**（局部性、内存、回收开销）与**并发友好度**上——而这些都对
+ring 有利。
+
+#### 12.3.1 逐维度对比（同一模式下，链表 vs ring）
+
+| 维度 | 链表（原 §6.4） | ring-per-bucket | 谁更优 |
+| ---- | ---- | ---- | ---- |
+| **lookup 访存** | 指针跳转，节点随机布局，每跳可能一次 cache miss | 连续数组扫描，硬件预取友好，触达 cache line 更少 | **ring** |
+| **insert** | 从空闲链取节点 + 挂两条链（bucket 头 + 生产者链）指针操作 | `slots[tail%CAP]=e; tail++` 一次连续写 | **ring** |
+| **回收** | 沿生产者任务链逐节点摘除并归还空闲链 | `head++` 游标自增，不摘链、不归还 | **ring** |
+| **每 entry 内存** | payload + ~3 指针（bucket next / 生产者链 next / freelist next，≈24B） | payload only（下标隐式，无指针） | **ring** |
+| **容量弹性** | 不定长，随空闲链弹性伸缩，无"满"概念 | 定长 `CAP`，需定容；满则反压/报错 | **链表**（唯一劣势，auto 可证充分定容化解，§12.7.2.3） |
+| **并发（shared）** | 空闲链 CAS / ABA / use-after-recycle（§12.7 最难处） | per-slot `seq` + 游标，**无空闲链、无 next 指针** | **ring（决定性）** |
+| **并发（private）** | 无（每核私有），但仍付指针/空闲链簿记 | 无，且退化为**纯整数 head/tail**（无 `seq`、无原子） | **ring**（更省） |
+| **渐进复杂度** | O(N)（H 窗口回收之效） | O(N)（同一回收窗口） | 平 |
+| **确定性/回收阈值** | private `N−H` | private `N−H`，shared `R`（§12.7.1） | 平 |
+| **实现/验证面** | private 链表、shared ring → **两套结构** | 两模式**同一套 ring** | **ring（工程）** |
+
+**private 专门分析。** private 无跨核并发，ring 在此**退化为最简形态**：`head`/`tail` 是**普通整数**
+（无需 `seq`、无需原子、无 ABA），insert = "写槽 + `tail++`"，lookup = "从 `tail-1` 向 `head` 连续扫"，
+回收 = "`while slots[head%CAP].producer_id ≤ N−H: head++`"。相比 §6.4 链表，它**同为 O(N)**，但
+①lookup 连续扫描（链表是指针跳转，局部性差）；②每 entry 省约 3 指针 + 整条空闲链；③回收从"走生产者
+链 + 归还空闲池"简化为"游标自增"。**唯一代价**是定长 `CAP`——但 private 回收阈值是**确定性 `N−H`**、
+任务图**静态已知**，故每桶存活槽数上界**可在构建期精确算出**，`auto` 能给出**可证不溢出**的 `CAP`
+（§12.7.2.3）。故 private 下 ring **全面不劣于链表、且更省更快**。
+
+**shared 专门分析。** 已由 §12.7 定论：链表空闲链在无缓存一致性平台上引出 ABA / use-after-recycle
+两大最难陷阱，ring 用"游标自增回收 + per-slot `seq`"直接消去（§12.7.1）。故 shared **只能是 ring**。
+
+**结论。** ring 在 **private 与 shared 下均不劣于链表**：private 赢在常数因子（局部性/内存/回收）且退化
+到无原子最简形态，shared 则**只有** ring 可行；再加**只需维护/验证一套数据结构**的工程收益。因此
+本章**弃用 §6.4 的 private 链表，两模式统一为 ring**（§6.4 的回收窗口、哈希分桶、winner-only fan-in
+等洞见原样继承到 ring）。
+
+#### 12.3.2 统一之后：两种模式仅存的四点差异
+
+统一到 ring 后，private 与 shared **数据结构完全相同**，仅在下列四点分叉（其余——哈希分桶、多版本
+追加、时序过滤 lookup、`N−H`/`R` 回收窗口——完全共用）：
+
+| 分叉点 | private | shared |
+| ---- | ---- | ---- |
+| **副本数** | 每核一份（全量复制） | 全局唯一一份 |
+| **谁 insert** | **所有核**都 insert（各写自己副本，保持各核一致） | **仅 winner** insert（每任务恰好一核） |
+| **并发纪律** | 无：`head`/`tail` 为普通整数，无 `seq`、无原子、无 invalidate | per-slot `seq` acq-rel + `reserve`/`head` 原子 + writeback/invalidate（§12.7.1） |
+| **回收阈值** | 确定性 `N−H`，每核本地推进（§6.4 语义） | 全局 `R = min_progress−H−1`，协作推进（§12.7.1/§9.5） |
+
+- **一致性**：private 每核只读写自己的副本，**无跨核可见性问题**（producer 数据可见性仍由完成标志环
+  §11.5 保证）；shared 是并发单副本，一致性由 §12.7.1 的 `seq`/acq-rel/游标纪律保证。
+- **代价权衡**：private 内存 = `核数 × 单份`、每核为全部任务付 insert 地板；shared 内存 `1×`、insert
+  仅 winner，但引入跨核 invalidate 流量与热桶 `reserve` 竞争。完整取舍见 §12.8。
+- **lookup**：两模式都是"连续扫描 + 时序过滤取最新合法"（§12.6）；private 少了 per-slot `seq` 校验与
+  invalidate（纯本地读）。
+
+### 12.4 shared_tensormap —— 单副本 + winner-only insert
+
+> **核心观察**：claim race（§2）使走得最快的核（winner）在任务 id 序列上**领先**于其它核。winner
+> 先构建并执行靠前的任务，因此**它的 TensorMap 进度也领先**——它刚 insert 的条目，正是落后核稍后
+> lookup 时所需要的。于是存在一种可能：**让 winner 把它 insert 的条目直接发布给所有核共享**，
+> 落后核无需自己 insert、直接查这份共享 map 即可。
+
+shared 模式据此重新划分职责：
+
+- **形态**：全核共享**唯一一份** TensorMap，物理上驻留在一块全局可寻址的 GM 区域，组织为
+  **ring-per-bucket**——按 buffer 基址哈希分桶，**每个桶是一个定长 `CAP` 槽的有界环**（`RingBucket`，
+  §12.7.1），只有 `head`（回收游标）/ `tail`（发布游标）/ `reserve`（MPSC 抢槽游标）三个原子字，
+  外加每槽一个 `seq` 代戳。**没有链表节点、没有 `next` 指针、没有空闲链。**
+- **谁构建（insert）**：**仅 winner 做 insert**。败者与 follower 在走位到任务 `N` 时**不再** insert——
+  因为 winner 的 insert 已经（或即将）对全核可见，落后核重放 insert 既冗余又会与 winner 抢同一份
+  map。insert = `k = fetch_add(reserve, 1)` 抢一个确定下标 `k % CAP` → 写槽字段 → writeback →
+  release-store 该槽 `seq`（§12.7.1）。这一改动直接消除了 §6.3/§6.4 中"每核为全部任务 insert"的地板
+  开销，是 shared 模式在多核下的主要性能收益来源（§12.8）。
+- **谁查（lookup）**：任何核在赢得任务 `N`、需要解析 fan-in 时，都查这一份共享 ring：从 `reserve`
+  往 `head` 方向扫连续槽（无指针跳转），对每槽 acquire-read `seq` 校验有效后读字段，应用 §12.6
+  时序过滤取合法者中 producer 最大（§12.6）。
+- **回收**：由全局 reclaim 前沿 `R`（基于**各核进度最小值**，§9.5）驱动，**回收即游标自增**——当
+  `slots[head % CAP].producer_id ≤ R` 时 `head++`，既不摘链也不归还空闲池（§12.7.1）。
+- **溢出**：`fetch_add(reserve)` 后若 `reserve − head > CAP`（ring 满）则 winner **不覆写**、走
+  反压/报错路径（§12.7.2），绝不静默丢条目。
+
+shared 模式随即带来三个必须解决的问题：(A) INOUT 重写导致同一区域存在多个 producer 版本，如何
+在共享 ring 中表达（§12.5）；(B) 落后核 lookup 时如何避免看到"未来 producer"（§12.6）；(C) AI 核
+**无缓存一致性**，共享 ring 的跨核数据一致性如何保证（§12.7）。下面三节逐一展开，**均以 ring 为准**。
+
+### 12.5 INOUT 重写：多版本以 ring 槽共存（append，不摘链、不替换）
+
+INOUT tensor 既消费旧版本又产出新版本（§4）。在 claim race 下，同一区域可能被多个 winner 先后
+以 INOUT 方式写入，从而**同一区域在共享 ring 中存在多个 producer 版本**。private 模式里这不是问题
+（每核自己 insert，lookup 取最新即可）；shared 模式下，若试图"用新 producer **替换**旧槽"，
+会丢失旧版本——而落后核此刻可能仍需要旧版本作为它的 fan-in（它的"现在"还没到新 producer）。
+
+**规则（共享 ring 的多版本追加）：**
+
+1. **绝不就地替换 producer。** 当某区域的 producer 被更新（例如 INOUT 重写），**不**修改任何已发布
+   槽的字段（§12.7.1 的"发布即不可变"），而是**追加一条新槽**，其 producer id = winner 的任务 id `N`。
+2. **追加落在 ring 尾部。** `k = fetch_add(reserve, 1)` 抢一个确定下标 `k % CAP`，写入
+   `{producer_id=N, region, ...}`，writeback 后 release-store 该槽 `seq = k + lap*CAP`（§12.7.1）。
+   旧槽**原样保留**在环内，仍携带它更老的 producer id，直到 `head` 越过它被回收。
+3. **lookup 取"最新可见且合法"者。** 从 `reserve` 往 `head` 方向扫环内有效槽（seq 校验通过），在所有
+   与查询区间重叠者中，选 producer id 最大、但又满足下节 §12.6 时序合法性的那一个。
+
+如此，同一区域的多版本 producer 在共享 ring 中以**按 append 次序（≈producer id 升序）排列的连续槽**
+共存，旧版本随 reclaim 前沿 `R` 推进、`head++` 而被回收（§12.7.1）。相比被否决的链表方案，ring 用
+"下标 + `seq`"取代"`next` 指针 + 桶头替换"，多版本共存无需任何指针操作，扫描局部性更好。
+
+### 12.6 跳过"未来 producer"：以本地任务索引为时序过滤
+
+> **问题**：winner 走得快，它 insert 的条目 producer id 可能**大于**某个落后核当前的
+> `local_current_task_index`。若落后核在解析自己位于 id `N` 的任务的 fan-in 时，查到了一个
+> producer id `P > N`，那它就**引用了一个属于它自己未来的任务**——该未来任务可能尚未执行、其
+> 完成标志未置位、其输出数据尚不可读，于是消费者会错误地阻塞等待一个"未来 producer"，或更糟，
+> 读到未完成的数据。这本质上是"把 winner 的时钟强加给落后核"。
+
+**规则（时序过滤）：** 任何核在 lookup 时，**跳过 producer id ≥ 自身 `local_current_task_index`
+的条目**。设本核当前走位到任务 `N`（即 `local_current_task_index == N`），则只接受 producer id
+`< N` 的条目作为合法 fan-in。ring 版 lookup 扫描的是**连续槽下标**（无指针跳转），每槽先 acquire-read
+`seq` 确认有效（§12.7.1 防 ABA）再读字段：
+
+```text
+lookup(region, N):                       # N = 本核 local_current_task_index
+    best = NONE
+    b = bucket_of(region)                 # 定位桶（该桶的 RingBucket）
+    hi = acquire_load(b.reserve)          # 已抢到的最高下标（发布上界）
+    lo = acquire_load(b.head)             # 回收游标（最旧仍存活槽）
+    for k in range(hi-1, lo-1, -1):       # 从最新 append 往最旧扫连续槽
+        s = &b.slots[k % CAP]
+        if acquire_load(s.seq) != k       # ★per-slot seq 校验：槽已被复用/未发布 → 跳过
+            continue                       #   （非一致平台先 invalidate 该 slot cache line）
+        if s.producer_id < N              # ★时序过滤：跳过"未来 producer"
+           and overlaps(s.region, region):
+            if best == NONE or s.producer_id > best.producer_id:
+                best = snapshot(s)         # 取合法者中最新；拷出快照，不缓存槽指针
+    return best                            # 可能返回 NONE（尚无合法 producer）
+```
+
+> ring 扫描按下标从 `reserve-1` 递减到 `head`，因追加近似按 producer id 升序，故先遇到者即较新；
+> 也可一旦命中一个 `producer_id < N` 的重叠槽就提前返回（该方向上它已是最大合法者）。`seq != k`
+> 表示该槽尚未发布或已被后续 lap 复用（§12.7.1），一律跳过；**全程不跨调用缓存 `head`/槽指针**。
+>
+> **注（落地优化）**：上面每槽 `acquire_load(s.seq)` 是**通用 MPSC** 设计所需（`reserve` 只是抢槽游标、
+> 非发布水位）。实际实现采用**单一串行追加者**（§12.10(1)），`tail` 成为真正的发布水位，故 reader 只需对
+> `tail` 做**一次** acquire、其下各槽 `seq` 改 relaxed 读即可——把"每槽一次 acquire"摊薄为"每 lookup 一次
+> acquire"，详见 §12.10(4)。
+
+**为什么用 `local_current_task_index` 而不是全局前沿 `F`。** 时序合法性是**每核本地的时钟**概念：
+"我还没走到 id `P`，就不该把 `P` 当作我的 producer"。各核的 `local_current_task_index` 严格单调地
+跟着自己的走位推进，是本核"当前时刻"的权威；而 `F` 是全局完成前沿，与"我是否已到达 `P`"无关。
+用本地索引作阈值，确保每个核只引用**自己时间线上的过去**。
+
+**返回 NONE 的处置。** 若整个环内没有任何 producer id `< N` 的重叠有效槽（winner 还没 append 到此
+区域、或本核是该区域的第一个 producer），则该 fan-in 解析为"无 producer"——即本任务的该输入是
+图的外部输入（host 提供的初始 tensor），不需要等待完成标志。这与 private 模式下"查不到 = 外部
+输入"的语义一致，只是 shared 模式下"查不到"还可能是"winner 尚未发布"——但二者对消费者行为相同
+（都不等任何 producer），且当本核确实是该区域首任 producer 时为正确；当本核并非首任、只是 winner
+尚未发布时，见 §12.7 末尾的"发布保证"。
+
+### 12.7 无缓存一致性下的数据一致性分析（核心）
+
+> **本节定位**：shared 模式的**规范数据结构是 ring-per-bucket（§12.7.1）**，其一致性方案见 §12.7.1、
+> 容量与溢出见 §12.7.2。本节 §12.7 先分析"无硬件一致性平台上共享 map"的**通用难点**，并以最初设想
+> 的**"哈希桶 + 链表 + 空闲链"方案为对照基线**说明"为何不用链表"——这些难点（尤其空闲链 ABA 与
+> `next` 悬挂指针）正是 ring 设计要规避的。通用的无一致性纪律（release/acquire 发布、writeback +
+> invalidate）对 ring 同样适用；ring 的具体落地见 §12.7.1。**链表方案不作为实现，仅作动机保留。**
+
+这是 shared 模式最困难的部分。**AI 核之间没有硬件缓存一致性**（§11.5 已就此为完成标志专门处理）。
+若把共享 TensorMap 实现成一块被多核并发读写的复杂数据结构（哈希桶 + 链表 + 空闲链），其一致性不能
+想当然——下面逐条剖析，正是这些陷阱促成了 §12.7.1 的 ring 决策。
+
+**问题一：仅 invalidate 新插入条目的数据，足够吗？**
+
+不够。winner insert 一条新 entry 时，若只把自己写的这条 entry 的 cache line invalidate/flush 到
+GM，其它核仍可能基于**陈旧的桶 head 指针**导航——它们根本看不到新 entry 存在。一致性故障点至少
+有四处，而非一处：
+
+| 故障点 | 现象 | 仅 invalidate 新条目能解决吗 |
+| ------ | ---- | ---- |
+| (a) 桶 head 指针 | 其它核 cache 里仍是旧 head，永不到达新 entry | **否**——head 在另一条 cache line 上 |
+| (b) 新 entry 的字段（producer id / region / next） | 其它核读到新 entry 但字段为旧值/撕裂 | 部分——需写回 + 读侧 invalidate |
+| (c) 旧 entry 的字段 | 旧 entry 被 winner 保留不修改，但若被回收复用则字段被改写 | **否**——见问题二/三 |
+| (d) 空闲链 / entry 池复用 | 一个被回收的 entry 被重新分配、改写，而某核仍持有旧指针在读它 | **否**——经典的 use-after-recycle |
+
+**问题二：其它核是否会使用"过时的 tensormap 数据结构"？**
+
+会，且有两种"过时"：
+
+1. **结构性过时（miss 新 head）**：落后核 cache 里的桶 head 是旧值，于是它遍历的是**旧链表前缀**，
+   完全错过 winner 新挂的 head 条目。后果：lookup 漏掉最新 producer，退而取到次新的合法 producer
+   （§12.5 多版本链表使次新仍可用），**语义上仍正确**，但可能不是最新的过去版本——这在 INOUT
+   场景下意味着消费了一个较旧版本的数据（见下文"数据正确性"）。
+2. **悬挂指针过时（use-after-recycle）**：落后核正遍历链表到 entry `e`，此时 reclaim 把 `e` 回收
+   并分配给另一个 winner 改写。落后核继续读 `e.next` / `e.producer_id`，读到**新写入者的内容**，
+   指向完全无关的区域/任务 → 错误依赖，可能挂死或读错数据。
+
+**问题三：数据正确性（不只是元数据）。**
+
+TensorMap 只是元数据；真正的产出数据在 GM 堆，由 §11.5 的完成标志 + writeback/invalidate 保证可见。
+§9.3 的**确定性 bump 分配**确保**每个 producer 写到自己的独立地址**（INOUT 的新版本也是新地址，
+**非就地覆写**），因此消费者一旦选定 producer `P` 并 acquire 到 `flag(P)=true`，从 `addr(P)` 读到的
+必是 `P` 的产出，不会被未来 producer 覆写。所以 shared 模式下的**数据正确性仍由 §11.5 兜底**，
+shared 模式新增的风险只在**元数据**层：选错了 producer（或读到回收后的垃圾 entry），会引用错误的
+`addr(P)` / 错误的完成标志位。
+
+**（对照基线）链表方案的解决方案——仅说明其复杂度，非本设计实现。** 若坚持用"哈希桶 + 链表 +
+空闲链"，需把它当作"无硬件一致性下的并发发布数据结构"来设计，沿用 §11.5 的发布/观察纪律并补齐
+回收纪律，至少需以下五条。**读者可略过细节，只需记住：其中第 3、4 条（reclaim 前沿驱动回收、空闲链
+无锁栈 + 版本防 ABA）是最易出错的部分——ring 设计（§12.7.1）通过取消空闲链与 `next` 指针，直接
+消去了它们。** 五条如下：
+
+1. **桶 head 为原子、acq-rel 发布。** `bucket_head` 用一个原子字（64 位指针 + 版本 tag，见下）。
+   winner：先写回新 entry 的全部字段与 `next`（§11.5 writeback），再对 `bucket_head` 做
+   **release-store**；reader：对 `bucket_head` 做 **acquire-load**（非一致平台先 invalidate 该 cache
+   line），拿到 head 后再 invalidate 对应 entry 的 cache line 读其字段。这解决问题一 (a)(b)。
+2. **entry 一经发布即不可变（immutable after publish）。** 一条 entry 被 head 指向、对其它核可见
+   后，其 `producer_id` / `region` / `next` **永不再被改写**。可变的只有 head 指针与 entry 在空闲链
+   中的 `freelist_next`（且二者用同一原子字的不同位/不同字段，发布期与空闲期互斥）。这把"读 entry
+   字段"从并发读写降为并发只读，消除字段撕裂。
+3. **回收仅由 reclaim 前沿 `R` 驱动，且 `R` 基于各核进度最小值。** §9.5 已定义 `heap_reclaim_frontier`
+   由"完成前沿 + 各核进度最小值"推导。shared 模式的 TensorMap 复用同一前沿：仅当某 entry 的
+   `producer_id ≤ R` 时才允许回收。由"依赖跨度 `H` + 各核进度 ≥ 完成前沿"可知，任何核在 lookup 时
+   能引用的 producer id 下界 = `其 local_index − H` ≥ `R`（因为最慢核的 `local_index` 也已超过
+   `R + H`，否则 `R` 不会推进到此），故**任何活着的 lookup 都不会触及已回收 entry**——问题二(2) 的
+   use-after-recycle 在不变式下不可能发生。
+4. **空闲链为无锁 Treiber 栈 + 版本指针防 ABA。** 多 winner 并发 pop 空 entry、reclaim 并发 push，
+   用 CAS + 指针带版本号（`head{ptr, tag}`）杜绝"同地址被多次回收再分配"造成的 ABA。这是 shared
+   模式新增的唯一热点原子（除既有 cursor/F 外）；可仿 §6.6 按 `bucket_index % G` 分片以降竞争。
+5. **lookup 全程不缓存 head / entry 指针。** 每次进入 `tm_lookup` 都重新 acquire-load `bucket_head`
+   （invalidate 后读），遍历过程中对每条 entry 的字段读取都遵循 acquire/invalidate。**禁止跨调用
+   缓存 head 或 entry 指针**——结构性过时（问题二(1)）的根因正是缓存了旧 head；强制每次重读，让
+   "最新 head"在 lookup 入口处对齐到当前前沿。
+
+**关于"结构性过时取到次新版本"的最终判据。** 即便有上述全套方案，落后核在某一刻仍可能读到一个
+尚未被 winner 发布的最新 entry 之前的旧 head——但这等价于"winner 尚未发布该版本"。此时落后核
+取到的是**次新的合法 producer** `P_old < N`。由 §9.3（独立地址）+ §11.5（flag(P_old) 可见即数据
+可见），`P_old` 的输出是完整且正确的旧版本。**只要该消费者对"必须消费最新版本"没有强要求**，
+这就是可接受的弱一致（最终一致）语义——落后核消费了一个稍旧的版本。若某任务的语义要求它必须
+消费"恰好最近的前任 producer"（典型如严格 in-place 累加序列），则需在任务图层面保证该前任已完成
+且其 entry 已发布——这由 §11.5 的 flag 依赖链天然保证：消费者在 acquire `flag(P)` 后才读数据，
+而 `P` 的 entry 由 `P` 的 winner 在置 flag **之前**就已 insert 并 release-head 发布（insert 发生在
+build 阶段、flag 置位在 execute 完成 阶段，二者顺序固定）。因此"前任已发布 entry"是"前任已完成"
+的必要前置，**不会出现"前任已完成但 entry 未发布"**。综上，shared 模式在上述五条方案下达成正确的
+元数据一致性，数据正确性沿用 §9.3 + §11.5。
+
+**发布保证（回应 §12.6 末尾"winner 尚未发布"）。** 当落后核 lookup 返回 NONE 时，除"本核是该区域
+首任 producer / 外部输入"外，另一可能是"前任 winner 已认领但尚未 insert"。但 insert 发生在 winner
+build 该任务的早期、远早于其 execute 完成与 flag 置位；落后核若需消费该前任，必先 acquire
+`flag(P)`——而 `flag(P)` 置位晚于 `insert`。故"落后核看到 flag(P) 但看不到 entry"在 acq-rel 纪律下
+不可能。NONE 即真正无前任，安全。
+
+### 12.7.1 规范数据结构：ring-per-bucket（两种模式统一的实现基准）
+
+> **本节是 private 与 shared 两种模式共用的规范实现。** §12.7 的五件套方案是**针对"桶内链表 + 空闲链"
+> 这一（被否决的）数据结构**给出的。链表方案里**最容易出错**的不是桶 head 的 acq-rel，而是**空闲链**：
+> 多 winner 并发 pop、reclaim 并发 push、指针 ABA、use-after-recycle——这些才是"处理一致性容易出错"的
+> 根源。因此两种模式**统一改用同一数据结构，让这些陷阱根本不出现**：**每桶一个有界环（ring-per-bucket）**。
+>
+> **两模式共用同一 ring，仅并发纪律不同（§12.3.2）。** 下文的 `seq` / `reserve` / acq-rel / writeback /
+> invalidate 是 **shared 模式**（并发单副本）所需；**private 模式**每核私有、单线程访问自己的副本，
+> **退化为最简形态**：`head`/`tail` 是普通整数，insert = "写槽 + `tail++`"，回收阈值用确定性 `N−H`
+> 取代全局 `R`，**无需 `seq`、无需 `reserve` 原子、无需 invalidate**。即 private = "把下文所有并发纪律
+> 关掉"的 ring。
+
+**思路。** TensorMap 的访问模式恰好是"**增量追加（append）+ 按前沿回收（evict from front）**"：
+winner 不断往一个 bucket 里 insert 新条目，旧条目随 reclaim 前沿 `R` 推进被回收。这正是 **ring
+（有界环形缓冲）** 的天然工作模式——**每个 bucket 一个 ring**，只有两个游标：
+
+```text
+struct RingBucket {
+    Entry   slots[CAP];     // 定长槽数组
+    atom<u64> head;         // 回收游标：slots[head % CAP] 是最旧仍存活条目
+    atom<u64> tail;         // 发布游标：下一个 append 落在 slots[tail % CAP]
+    atom<u64> reserve;      // 预定游标：MPSC 下 winner 用 fetch_add 抢槽位
+    // 每个 slot 内含一个 seq 字（见下）
+};
+```
+
+- **append（winner insert）**：`k = fetch_add(reserve, 1)` → 写 `slots[k % CAP]` 的字段 →
+  writeback → release-store 该 slot 的 `seq`（标记"本 lap 已发布"）。tail 由"已连续填充前缀"推进
+  （或等价地，reader 直接用 per-slot `seq` 判定有效性，无需单一 tail）。
+- **evict（reclaim）**：当 `slots[head % CAP].producer_id ≤ R` 时 `head++`。回收 = **游标自增**，
+  不摘链、不归还空闲池。
+- **lookup**：从 `reserve`（或 tail）往 `head` 方向扫 `slots[k % CAP]`，对每个 slot 先 acquire-read
+  其 `seq` 确认有效，再读字段，应用 §12.6 时序过滤与重叠判定，取合法者中 producer id 最大。
+
+**为什么这能避开"最容易出错的部分"。**
+
+| §12.7 链表方案的陷阱 | ring 方案的处置 |
+| ---- | ---- |
+| **空闲链 CAS 栈（ABA / use-after-recycle / 竞争）** | **彻底消失**——没有空闲链，"回收"只是 `head++`，"分配"只是 `fetch_add(reserve)` 抢一个确定下标 |
+| **`next` 指针的跨核读（每跳一条远程 cache line，且 next 本身可能被回收）** | **彻底消失**——槽是连续数组，下标由 `k % CAP` 算出，无指针跳转；扫描局部性好，invalidate 目标地址确定 |
+| **回收时"摘链"可能摘掉某核正持有的节点** | **不可能**——回收只动 `head` 游标，不动任何槽内容；被回收的槽在被 `reserve` 再次追上之前不会被改写 |
+| **桶 head 指针的发布/观察** | 改为 **per-slot `seq` 字**（见下），把"head 可见性"问题局部化到"单个 slot 的发布可见性"，模式更标准、更易推理 |
+
+**新增的、但更标准的要求。**
+
+1. **per-slot `seq` 防 ABA（关键）。** ring 是定长的，slot `k % CAP` 会被反复复用。若读者刚读完 lap `L`
+   的 slot `k`、被挂起，此时槽被回收并写入了 lap `L+1` 的新条目，读者醒来若只凭"slot `k` 有数据"就会
+   把 lap `L+1` 的内容当成 lap `L` 的来用——经典 ABA。解法是 bounded-queue 标准技巧：每个 slot 带
+   `seq`，发布时写 `seq = k + L*CAP`（每复用一次 `+CAP`），读者记下自己期望的 `seq` 值，acquire-read
+   `seq` **等于**期望值才认为该槽有效。lap 切换后 `seq` 不等 → 读者识别为"槽已被复用，停止扫描"
+   （因为它的目标旧条目已不可达）。这把 ABA 从"指针级、需带版本号的 Treiber 栈"降为"整数比较"，简单
+   且可局部推理。
+2. **定长容量 `CAP` 须按 H 窗口定。** 每个 bucket 的存活条目数上界 = "落进该桶、producer id 在
+   `(R, 最新]` 内的不同版本数"，受依赖跨度 `H`（§11.4）封顶。取 `CAP ≈ (H × 桶均条目数) × 安全系数`
+   即可。**溢出**时 winner **不覆写**、走反压/报错路径。这比链表的"无界增长 + 空闲链"更省内存、更可
+   预测，代价是需要正确估 `CAP`。**`CAP` 的完整取值分析、溢出报错设计与是否引入命令行参数见 §12.7.2。**
+3. **MPSC 预定游标 `reserve` 是新的热点原子。** 同一桶的多个 winner 用 `fetch_add(reserve)` 抢槽，
+   是 per-bucket 的 CAS 热点（类似 §6.5 的 cursor）。缓解：`reserve` 与 `head` 落在同一 cache line 会
+   伪共享，需分开对齐；热桶可按 §6.6 思路分片（同一 bucket 拆 `G` 个 sub-ring，按 producer id 取模）。
+
+**能否连 `seq` 也省掉？** 严格条件下可以。若 (i) AI 核**无 OS 抢占**（lookup 在有界本地时间内完成，
+不会"读到一半被挂起很久"）且 (ii) reclaim 不变式严格成立——"slot 被回收复用"要求其
+`producer_id ≤ R`，而任何 lookup 能引用的 producer id `> R`（由 `R = min_progress − H − 1` 与读者
+`local_index ≥ min_progress` 推出，§12.7 不变式）——则读者**永远不会**触及一个正被复用的 slot，
+`seq` 可省。但**仿真在 host 线程上跑、会被抢占**，且 defense-in-depth 更稳，故**推荐保留 `seq`**；
+`seq` 成本仅每槽一个整数 + 一次 acquire 比较，远低于链表的空闲链 CAS。
+
+**结论。** 把 bucket 从链表换成 ring，**消掉了 shared 模式里最易错的空闲链与 next 指针**，把一致性
+问题收敛到"per-slot acq-rel 发布 + `seq` 防 ABA + `head` 由 `R` 推进"这一套**有界队列标准模式**，
+推理局部、实现成熟。回收从"摘链 + 归还空闲池"简化为"游标自增"，append 从"建节点 + CAS 挂头"简化
+为"fetch_add 抢槽 + 写 slot + 发布 seq"。这正是用**数据结构的简化**换**一致性论证的简化**——代价是
+定长 `CAP` 与新的 `reserve` 热点，二者都可调/可分片。**后续 §12.8/§12.9 的 shared 实现默认采用
+ring-per-bucket。**
+
+### 12.7.2 Ring 容量 `CAP`、溢出报错与命令行参数（两种模式）
+
+ring 是**定长**的，这把"map 无界增长"换成了"必须正确定容"。**统一到 ring 后，private 与 shared 都需
+定容**，但二者的活跃窗口不同（private 窄、shared 宽），且 private 的窗口是**确定性静态可算**的。本节
+回答三个工程问题：(1) 两模式 `CAP` 各取多大；(2) 满环（溢出）如何检测与报错，绝不静默丢条目或覆写；
+(3) 是否/如何把 `CAP` 暴露为命令行参数、**`auto` 是否安全、如何实现**（§12.7.2.3，本章重点之一）。
+
+#### 12.7.2.1 `CAP` 如何定：活跃版本窗口 + 安全系数
+
+单个 bucket 在任意时刻的**存活槽数**（`tail − head`，shared 下为 `reserve − head`）有明确上界，可据此
+定容。**两模式的窗口不同：**
+
+- **private 的存活窗口 = `H`（更窄、确定性）。** private 每核用确定性阈值 `N−H` 回收自己的副本：走位到
+  `N` 时，`producer_id ≤ N−H` 的槽已被回收，故存活槽的 producer id 落在 `(N−H, N]`，**窗口恰为 `H`**。
+  它**不含** run-ahead `Δ`——因为每核只对自己的单一进度 `N` 回收，无跨核进度差。
+- **shared 的存活窗口 = `Δ + H`（更宽）。** shared 用全局前沿 `R = min_progress − H − 1` 回收共享副本
+  （§12.7.1）。最快核可领先最慢核达 `Δ`（run-ahead 上界，§11.1），故存活槽 producer id 落在
+  `(R, 最新 append]`，跨度 = `最新 − R ≤ Δ + H`。
+- **落进单桶的比例来自哈希。** 全局活跃版本总数 ≤ `窗口 × 每任务平均输出条目数`（private 窗口=`H`、
+  shared 窗口=`Δ+H`）；按 `B` 个桶哈希，**单桶期望存活槽 ≈ 全局活跃版本 / `B`**。哈希非理想均匀，需
+  留倾斜裕度（`auto` 如何在构建期精确取代"倾斜裕度估计"见 §12.7.2.3）。
+- **取值公式（建议下界）**：
+
+```text
+# W = H (private) 或 Δ+H (shared)
+CAP = ceil_pow2( W * avg_outputs_per_task / B * skew_factor )
+```
+
+  其中 `skew_factor`（经验 2~4）覆盖哈希不均与 INOUT 多版本堆积；`ceil_pow2` 向上取到 2 的幂，使
+  `k % CAP` 退化为位与、`seq = k + lap*CAP` 的 lap 递增用移位。`Δ`、`H`、`B` 均已是 §11 的现有常量，
+  `CAP` 与 `W`（完成标志环窗口，§11.3）**同源**，可一并标定。
+- **估偏的代价（非对称）**：估**大**只浪费 GM（每桶多几个槽 × `B` 桶，线性且可控）；估**小**在 shared 下
+  会在热桶频繁触发反压 stall，甚至（若窗口真的不足）**死锁**——因为 winner 等 `head` 前进、而 `head`
+  前进又依赖更慢核推进 `R`。**private 下估小更严重**：private 回收已用最紧的确定性 `N−H`、无更慢核可
+  等，故一旦某桶在 `H` 窗口内溢出即为**真正的配置错误**，无法靠等待自解，必须直接报错（§12.7.2.2）。
+  故**宁可略微估大**——好在 `auto` 能在构建期把两模式的窗口占用**精确算出**、不必"估"（§12.7.2.3）。
+
+#### 12.7.2.2 溢出检测与报错设计（绝不静默覆写）
+
+ring 满的语义必须是**显式失败或可恢复反压**，不能像无界链表那样"总能再挂一个"。**shared** 分两类
+处置（A/B）；**private** 无跨核等待余地，溢出直接走 B 的确定性报错（见 B 末）。
+
+**A. 可恢复反压（shared 默认，热路径）。** winner 在 `k = fetch_add(reserve, 1)` 后、写槽**之前**先检查
+`k − load_acquire(head) >= CAP`。若成立即表示环满：
+
+1. **不写槽、不发布 seq**，并把 `reserve` 回退（`fetch_sub(reserve, 1)`，或采用"先探测后提交"两段式
+   抢槽以避免回退竞争）；
+2. 进入**有界自旋 + backoff**，周期性推进本核可推进的 `F`/`R`（§11.4 协作式回收），给 `head` 前进创造
+   条件；
+3. `head` 前进后重试 `insert`。这与 §11 的**堆反压语义一致**（满则等待，不丢数据）。
+
+**B. 不可恢复 → 结构化报错（诊断路径）。** 若反压自旋超过阈值 `T_stall`（如按最坏依赖链估算的上界
+的数倍）仍无法推进，判定为**容量配置错误或依赖跨度估计错误**，触发一次**确定性、可定位**的运行时
+错误，而非挂死或 UB：
+
+```text
+FATAL[tensormap-ring-overflow]
+  bucket   = <bucket_index>            # 哪个桶溢出
+  cap      = <CAP>                     # 当前容量
+  live     = reserve - head            # 溢出时的存活槽数
+  head/R   = <head> / <R>              # 回收游标与全局 reclaim 前沿
+  slowest  = core <id> @ local_index   # 拖住 R 的最慢核（定位反压根因）
+  hint     = "raise --tensormap-ring-cap or check H/Δ estimate; \
+              possible deadlock if a producer never completes"
+```
+
+  报错要点：**(i)** 指明**是哪个桶**、当前 `CAP`、溢出时 `live` 值，便于直接调参；**(ii)** 打印**最慢核**
+  及其 `local_index`，区分"真溢出（窗口不足）"与"某 producer 卡死导致 `R` 不前进"（后者是别处 bug，
+  ring 只是最先撞墙的地方）；**(iii)** 给出可操作建议（调大 `--tensormap-ring-cap` 或复核 `H`/`Δ`）。
+  该错误应是**确定性**的（同输入必在同一 bucket 触发），便于复现与回归。
+
+  **private 的溢出更简单直接**：private 无 `reserve`/`R`，也无跨核可等；`tail − head` 触到 `CAP` 即
+  刻判定为配置错误，**立即**抛同款 FATAL（`slowest`/`R` 字段留空，`head` 用本核 `N−H`）。但在 `auto`
+  下 private **可证不溢出**（§12.7.2.3），此路仅在用户手动把 `--tensormap-ring-cap` 设得过小时触发。
+
+**C. 调试增益（可选）。** debug build 下额外维护每桶 `high_watermark = max(reserve − head)`，运行
+结束打印各桶水位分布，用于**离线标定 `CAP`**：水位远低于 `CAP` 说明可调小省内存，逼近 `CAP` 说明
+需调大或该桶是热点（考虑 §12.7.1 的 sub-ring 分片）。
+
+#### 12.7.2.3 `auto` 模式是否安全、如何实现（本章重点）
+
+统一到 ring 后，定容的安全性是新引入的**唯一**风险（链表无"满"概念）。核心问题：**默认的 `auto` 定容
+安全吗？** 结论：
+
+> **`auto` 在 private 下可证 100% 安全（永不溢出）；在 shared 下在"按最坏单桶占用定容"时同样可证不
+> 溢出，退一步即便估紧也绝不静默损坏（溢出→反压/确定性 FATAL）。** 关键在于：**决定 `CAP` 的两个量
+> ——(1) 每桶落入的静态区域集合、(2) 回收窗口宽度——都在构建期已知或有硬上界**，因此 `auto` 不是
+> "猜"，而是**在构建期精确计算**。
+
+**为何安全：两个决定量都是已知/有界的。**
+
+1. **区域集合是静态的。** SPMD 下每个核 replay **同一条确定性 submit 流**（§2/§6.4），全部任务的输出
+   region 及其 `bucket_of(region)` 哈希**在构建期即完全确定**。因此"哪些 producer 落进哪个桶"不是运行
+   期随机量，而是可枚举的静态事实——哈希倾斜**不需要"估"**，可直接数出每桶的真实占用。
+2. **回收窗口有硬上界。** private 窗口 = `H`（确定性 `N−H`）；shared 窗口 = `Δ+H`，其中 `Δ` 是私有环
+   run-ahead 的**配置上界**（§11.1）、`H` 是依赖跨度**契约上界**（§11.4）。二者都不是无界运行期量。
+
+两点合起来：**每桶存活槽数的最大值 = "在任意长度为 `W` 的 producer-id 滑动窗口内、哈希到该桶的输出
+region 条数"的最大值**（`W=H` 或 `Δ+H`）。这是一个**可在构建期精确算出**的确定值，不含任何运行期
+不确定性（private 完全确定；shared 唯一的运行期量是进度差，而它被 `Δ` 硬封顶）。
+
+**`auto` 的实现（构建期精确定容，非启发式）。**
+
+```text
+compute_auto_cap(task_graph, mode):
+    W = H                      if mode == Private        # 确定性窗口
+        (Δ + H)                if mode == Shared         # Δ 为 run-ahead 硬上界
+    per_bucket_max = array[B] of 0
+    live = sliding_multiset()                            # 以 producer-id 为键的滑动窗口
+    for N in 0 .. num_tasks-1:                           # 按确定性 submit 顺序扫全图
+        for r in outputs(task[N]):
+            b = bucket_of(r)
+            live.add(b, producer_id=N)
+        live.evict(producer_id <= N - W)                 # 精确模拟 §12.7.1 的 head 回收
+        for b in 0 .. B-1:
+            per_bucket_max[b] = max(per_bucket_max[b], live.count(b))
+    cap = ceil_pow2( max_over_b(per_bucket_max[b]) * safety )   # safety ∈ {1(可证), 小裕度}
+    return cap
+```
+
+- 该过程**只依赖静态任务图**（host build-once 或各核构建期均可跑），复杂度 O(任务数 × 每任务输出数)，
+  一次性、与执行无关。它**精确复刻** §12.7.1 的 `head` 回收语义（private 按 `N−W`、shared 按窗口
+  `Δ+H`），因此算出的 `per_bucket_max` 就是运行期真实峰值的**上确界**。
+- **private**：`safety = 1` 即已**可证不溢出**（窗口确定、无进度差、无并发追加）——`auto` 给出的 `CAP`
+  就是精确峰值。这就是"private 下 `auto` 100% 安全"的证明。
+- **shared**：以 `Δ` 硬上界代入窗口后，`per_bucket_max` 是**最坏进度差下**的峰值上界；取 `safety = 1`
+  即得**可证不溢出**的 `CAP`（代价是按最坏 `Δ` 偏保守、略费内存）。若要更省内存，可取更小的有效
+  `Δ_eff < Δ`（按实测/期望进度差）作为"紧档"，此时不再可证、但 §12.7.2.2 的反压 + FATAL 兜底保证
+  **绝不静默损坏**。默认 `auto` 采用**可证档（`safety=1`、`Δ` 满值）**，安全优先。
+- **全局单值 vs 每桶**：`auto` 天然算出**每桶**峰值，可直接支持"每桶独立 `CAP`"（最省内存）；一期为
+  实现简洁可取 `CAP = max_over_b`（全局单值），后续再切每桶。
+
+**是否需要命令行参数——需要，但默认 `auto`。**
+
+- **为何仍保留 `--tensormap-ring-cap`**：`auto` 依赖 `Δ`/`H` 的取值正确；若用户想**收紧内存**（接受 shared
+  下的紧档风险）或**排障时放大**容量，需一个**免重编译**的覆盖出口。与 §11 把 `W`/`Δ` 做成可配置一脉相承。
+- **为何默认 `auto` 而非必填**：`auto` 既开箱即用又（private 可证 / shared 可证档）安全，强制用户填值
+  徒增负担且易填错。
+- **两模式均生效**（统一 ring 后 private 也是 ring）：取值**向上取 2 的幂**；设定值 **< `auto` 算出的
+  可证峰值**时，private **启动期直接拒绝并报错**（因其必然溢出、无法自解），shared 则**告警并允许**
+  （用户显式选择紧档，运行期由 §12.7.2.2 兜底）。
+
+> 一句话：`auto` **不是估，是构建期按静态图 + 硬上界窗口精确算**——**private 可证永不溢出**，**shared
+> 取可证档同样不溢出**、紧档也绝不静默损坏；命令行 `--tensormap-ring-cap`（默认 `auto`，两模式生效）
+> 仅作收紧内存/排障的覆盖出口。
+
+### 12.8 两种模式的性能分析（均为 ring-per-bucket）
+
+> 两种模式**数据结构相同（ring-per-bucket）**，下表比较的是"每核私有 ring"与"全局共享 ring"这两种
+> 用法在内存/insert/同步上的取舍（§12.3.2 的四点差异所致），**不是**链表 vs ring（后者见 §12.3.1）。
+
+| 维度 | private（每核私有 ring） | shared（全局共享 ring） |
+| ---- | ---- | ---- |
+| **map 内存占用** | `O(核数 × 单份 ring)` | `O(单份 ring)` —— **省 `核数` 倍** |
+| **每任务 insert 工作量** | **每核都 insert 全部任务**（SPMD 冗余，§6.4 的"地板"） | **仅 winner insert**（每任务恰好一核） |
+| **每任务 lookup 工作量** | 本地 ring 连续扫描，**零跨核、无 `seq` 校验**；winner-only | 共享 ring，需 invalidate/acquire per-slot `seq` + 字段；同为连续数组扫描 |
+| **跨核同步/原子** | **无**（`head`/`tail` 为普通整数） | per-bucket `reserve`/`head` 原子 + per-slot `seq` acq-rel（可分片） |
+| **缓存一致性流量** | 无 | 随核数增长（更多 reader invalidate slot；热桶 `reserve` 竞争） |
+| **ABA / 回收风险** | 无（单线程，回收 = `head++`） | ring 复用 ABA 由 per-slot `seq` 化解；回收 = `head++`，无 use-after-recycle |
+| **`CAP` 定容窗口** | `H`（更窄），`auto` **可证不溢出**（§12.7.2.3） | `Δ+H`（更宽），`auto` 可证档不溢出 |
+| **确定性 / golden 不变** | 各核 ring 内容严格一致 | map 内容由 winner 发布顺序决定，**弱确定**（最终一致） |
+| **随核数 scale 的编排地板** | §6.2/§6.3 实测：随核数近线性上升（SPMD 重放 + 每 insert 地板） | 去掉每 insert 地板 → **有望显著 flattening** §6.2 曲线 |
+
+**定性结论。**
+
+- **shared 的主胜场**：在**多核**（大 `block_dim`）场景下，把"每核为全部任务 insert"的 SPMD 地板
+  砍成"每任务仅一核 insert"，并把 map 内存从 `核数×` 降到 `1×`。这恰好对症 §6.2/§6.3 暴露的
+  "编排墙钟随核数近线性增长"与 §6.5 的 cursor CAS 竞争之外的另一条地板——理论上 shared 模式可把
+  §6.2 的 1→13 约 2× 的增长曲线明显压平（insert 工作总量从 `核数 × 任务数` 降到 `任务数`）。
+- **shared 的主代价**：lookup 引入跨核 cache line 读 + invalidate 流量，且热桶 `reserve` 成为新的
+  原子热点（类似 §6.5 的 cursor）。在**少核**或桶内存活槽多（需扫多条远程 line）时，lookup 延迟可能
+  吃掉 insert 省下的红利。
+- **private 的主胜场**：**少核**或**内存充裕**场景下，零跨核协调、零 ABA、严格确定、lookup 纯本地
+  连续扫描（无 `seq` 校验、无 invalidate）。与 §6.4 的 O(N) 回收窗口、winner-only fan-in、§6.6 cursor
+  分片等优化完全兼容（这些语义已在 ring 上继承）。
+- **建议**：`private` 作为安全默认；`shared` 作为**大核数 / 大任务图**下的可选加速档，需在目标平台
+  实测 §12.7 的 invalidate 流量与热桶 `reserve` 竞争是否可接受。二者正交于 cursor 分片（§6.6）、
+  winner-only fan-in（§6.4）等其它优化，可叠加。
+
+> 一句话：**两模式同用 ring-per-bucket**（§12.7.1），差异仅在"每核私有 / 全局共享"（§12.3.2）；
+> **少核求快用 private**（零跨核、纯整数游标、`auto` 可证不溢出），**多核求省用 shared**（内存 `1×`、
+> insert 仅 winner，正确性靠"per-slot `seq` acq-rel + 发布即不可变 + `R` 驱动 `head++` + lookup 不缓存
+> 游标"，数据正确性仍由 §9.3 独立地址 + §11.5 完成标志兜底）。
+
+#### 12.8.1 实测 overhead（TensorMap 操作计数，确定性、跨平台）
+
+墙钟对比在仿真主机上不可用（`device_wall_us` 对单次冷跑报 0；且线程数 > 物理核时所有核忙等自旋，
+makespan 被 OS 时间片放大到 ~33 ms/task，两模式**同等**放大，把编排逻辑差异完全淹没——实测 6 核
+private 67.41 s vs shared 67.43 s，差 <0.03%，无法区分）。因此改用**确定性的 TensorMap 操作计数**
+（env `PTO_DIST_OVERHEAD=1`，引擎在 DONE 打印 `[dist] TMOPS ...`；不依赖时钟、不受 SIGBUS/超额订阅
+影响）作为 overhead 度量。BGEMM `Case0`（72 核 / 500 matmul-add / D=1000 个不同输出 region）实测：
+
+| 指标 | private | shared | 说明 |
+| ---- | ---- | ---- | ---- |
+| **inserts**（map 写入次数） | **72000** | **1000** | private = `核数 × D`（每核为全部任务 insert，SPMD 地板）；shared = `D`（每 region 仅首达核 append 一次）→ **shared 少 `核数`(72)× 写入**，且内存 `1×` vs `72×` |
+| **lookups**（fan-in 解析次数） | 3000 | 3000 | 两模式相同（均 winner-only 解析同一批边，§6.4） |
+| **scans**（lookup 扫描的槽数） | 9332 | 43689 | shared **多 ~4.7×**：全局环在 `Δ+H` 窗口内堆积**所有核**的 append（比 private 每副本的 `H` 窗口更深），且**每扫一槽多付一次 `seq` 原子 acquire + 跨核读**——这是 shared 的并发税 |
+
+**交叉验证（`runtime_overhead_test`，3 核 / tasks=100 / skip-exec）** —— 换一条完全不同的编排流、
+核数从 72 降到 3，`insert` 缩减比仍**精确等于核数**，佐证该规律是结构性的、与具体模型无关：
+
+| 指标 | private | shared | 比值 | 说明 |
+| ---- | ---- | ---- | ---- | ---- |
+| **inserts** | 600 | **200** | **3× = 核数** | 与 72 核例同构：private=`核数×D`，shared=`D` |
+| **lookups** | 600 | 600 | 1× | 完全一致 |
+| **scans** | 1581 | 1906 | ~1.2× | 该流 `Δ+H` 窗口浅，并发税小于 72 核例的 4.7× |
+
+**结论（量化 §12.8 的定性判断）：**
+- **shared 的胜场 = insert**：写入次数从 `核数×D` 砍到 `D`（此例 **72→1**，即 72× 减少），且随核数**线性**扩大；map 内存同步从 `72×` 降到 `1×`。这正是压平 §6.2 "编排墙钟随核数近线性增长"的那条地板。
+- **shared 的代价 = lookup 扫得更深**：扫描槽数 ~4.7×。根因是**核间进度 skew**——private 每核一份副本、各自只装本核 `[N−H, N)` 的 `H` 深窗口；shared 是单一全局环，必须同时覆盖**最慢核的尾**到**最快核的头**，即 `Δ+H` 深（`Δ` = 快慢核回放领先量，§12.7.1）。多出的深度就是被 coalesce 进同一个环的核间 skew。
+- **但这个扩大是有界的，不会无限增长**：`Δ` 被 run-ahead 节流（§12.7.2）按 `Δ_max` 封顶，故 shared 窗口恒 ≤ `Δ_max + H`，与核数**无关**；而 insert 红利随核数**线性**增长。两者一减一增 ⇒ **核数越多，shared 越划算**：insert 节省无上限地随核数放大，scan 深度却被 `Δ_max` 钉死。极端地令 `Δ_max→0`（lockstep）时 shared 窗口退化为 `H`、scan 与 private 完全一致，代价是牺牲 run-ahead 并行度——所以深度是"用并行度换来的可调量"，而非失控项。
+- **单次 scan 的原子代价已摊薄至接近 private**：曾经每扫一槽一次 `seq` acquire，现已优化为**每次 lookup 仅一次 acquire**（快照 tail 后对其下所有槽用 relaxed 读，正确性依据见 §12.7.1）。残留的**跨核 cache line coherence 读**不可消除——那是"单份共享"换取"省 N× 写入 + N× 内存"的固有对价（private 靠复制 N 份让读永远 L1 命中）。
+- **权衡**：故 **大核数 / insert 密集 → shared 明确胜出（如 72 核）**；**少核 / lookup 密集 / 内存充裕 → private**。此结论与墙钟无关，纯由确定性操作计数得出。
+
+**为什么不用墙钟 us/task（macOS 仿真的深入排查记录）。** 曾尝试用 `[dist] OVERHEAD` 的
+`makespan_us / tasks` 得到 us/task，结果稳定在 ~33–67 ms/task（比历史 0.5–5 µs/task 大 4 个数量级），
+排查结论如下，供后来者免于重复踩坑：
+
+1. **`SPIN_WAIT_HINT` 本已让核**：仿真构建通过 `common/platform/sim/aicpu/spin_hint.h` 展开为
+   `yield + sched_yield()`（并非 no-op）。追加 macOS 专用 `nanosleep` 强制让核后重测，us/task **完全不变**
+   → 放大**不是**忙等自旋造成的超额订阅。
+2. **replay 阶段本身就 ~13 s**：新增 `[dist] OVERHEAD ... replay_us[min/avg/max]`（仅 `orch_func`
+   回放耗时，排除 drain 循环）后发现 `replay_us ≈ busy_us ≈ makespan`，且**最快核**的 replay 也有 12.8 s。
+   即跨核等待发生在**回放内部**的堆回收 / 完成前沿（frontier）背压——每次跨核交接被 OS 调度按
+   ~ms 量级计时，任务再多也是**线性**累加，故与任务数成正比（tasks=100→13.5 s，tasks=500→67 s，
+   恒为 ~67 ms/task），并非固定超时。TMOPS 全程仅 ~1.6 k 次 scan，证实这 13 s 与 TensorMap 计算无关。
+3. **口径不同**：历史 0.5–5 µs/task 来自**设备周期剖析**（`PTO2_ORCH_PROFILING` 的 `avg/task`，计编排
+   代码消耗的设备周期），与主机墙钟不是同一度量；在 3 核 macOS 仿真上无法用墙钟复现到 µs。
+
+因此 **overhead 对比以上表 TMOPS 为准**（确定、跨平台、可复现）。若确需可比的 µs：(a) 在 Linux 多核机上
+重跑墙钟（`sched_yield` 在 Linux 真让核、跨核交接是微秒级），或 (b) 用设备周期剖析构建并把周期计数埋进
+`dist_engine.cpp` 编排热路径（排除自旋段）。`replay_us` 字段保留在 `PTO_DIST_OVERHEAD=1` 输出中，供在
+低交接延迟平台上直接得到 replay/task。
+
+### 12.9 顶层入口：TensorMap 指针的双模化设计
+
+为支持两种模式共存于同一份代码、由命令行开关选定，runtime 的**顶层 TensorMap 入口**需被改造为
+一个**间接句柄**，而非硬编码的"每核 array"。
+
+**现状（private 硬编码）。** 编排循环里直接持有"每核私有 map"（原为链表 `DistTensorMap` 实例，
+§6.4；本章统一后为每核私有 ring），`tm_insert` / `tm_lookup` 直接作用于它。这把"每核私有"写死在入口处。
+
+**改造。** 引入一个抽象句柄 `TensorMapHandle`，封装**同一 ring 数据结构的两种用法**并提供统一 API：
+
+```cpp
+enum class TensorMapMode { Private, Shared };
+
+// 两模式共用同一 ring 结构（§12.7.1）；仅并发纪律 / 副本数不同（§12.3.2）
+struct RingTensorMap;   // ring-per-bucket；Shared 用 seq/reserve/acq-rel，Private 关闭并发纪律
+
+struct TensorMapHandle {
+    TensorMapMode mode;
+    RingTensorMap* map;   // private：指向本核私有 ring（每核各一份，单线程纪律）
+                          // shared ：指向全局唯一 ring（并发纪律 + per-slot seq，§12.7.1）
+};
+
+// 统一入口，由 mode 分发（Private 走无原子快路径，Shared 走并发路径）：
+void  tm_insert (TensorMapHandle& h, const TensorRegion& r, task_id_t producer);
+Entry* tm_lookup (TensorMapHandle& h, const TensorRegion& r, task_id_t local_index);
+```
+
+**初始化（按开关二选一，同一结构不同参数）。**
+
+```text
+init(runtime_args):
+    mode = parse_tensormap_mode(args.tensormap_mode)          # private | shared
+    cap  = resolve_ring_cap(args.tensormap_ring_cap, mode)    # auto → compute_auto_cap(graph, mode) (§12.7.2.3)
+    if mode == Private:
+        # 每核构造一份私有 ring（单线程纪律：head/tail 普通整数，无 seq/reserve）
+        for each core c:  c.tensormap = { mode:Private, map: new RingTensorMap(cap, concurrent=false) }
+    else:  # Shared
+        # 全局构造唯一一份共享 ring（并发纪律：seq + reserve + acq-rel）
+        shared = new RingTensorMap(cap, concurrent=true, pool=global_pool)
+        for each core c:  c.tensormap = { mode:Shared, map: shared }
+```
+
+**调用点改动（§6 伪代码中的 `update_tensormap(task)`）。** 唯一变化是 insert 改为**仅 winner 调用**
+（shared 模式下），lookup 仍由 winner 在解析 fan-in 时调用。这通过在 `update_tensormap` 内部按
+`mode` 分发实现，**上层 §6 循环伪代码不动**：
+
+```text
+update_tensormap(task, won, N, mode):
+    if mode == Private:
+        # 无条件 insert（胜者、败者、follower 都做），保持各核 ring 副本一致
+        for t in task.inputs:  tm_lookup (h, t, N)        # fan-in（winner-only 仍由调用方门控）
+        for t in task.outputs: tm_insert (h, t, N)        # 私有 ring：写槽 + tail++（无原子/seq）
+    else:  # Shared
+        # 仅 winner 做 insert；lookup 仍为 winner 专属
+        if won:
+            for t in task.inputs:  tm_lookup (h, t, N)    # 内含 §12.6 时序过滤 + §12.7.1 per-slot seq 校验
+            for t in task.outputs: tm_insert(h, t, N)     # 内含 §12.5 ring 追加 + §12.7.1 fetch_add 抢槽 + seq 发布
+```
+
+> 注意 `tm_insert`/`tm_lookup` 在 shared 用法里隐含 §12.7.1 的 writeback/invalidate、per-slot `seq`
+> acq-rel 与 `reserve`/`head` 游标纪律，对上层透明；private 用法走**同一 ring 的无原子快路径**（普通
+> 整数 `head`/`tail`、纯本地连续扫描）。两条路径共享 ring 的桶/槽/哈希/多版本逻辑，仅并发纪律有别，
+> 不互相污染热路径。
+
+**回收侧的双模（同一 ring、不同阈值）。** private 每核按确定性阈值 `N − H` 推进自己的 `head`（继承
+§6.4 的回收窗口语义，改为游标自增）；shared 用全局 reclaim 前沿 `R`（§9.5）驱动——仅当
+`slots[head % CAP].producer_id ≤ R` 时 `head++`。两者回收都是**游标自增、不归还任何空闲池**（§12.7.1）；
+`R` 由 §11.4 协作式 `F` 推进后派生，可由任一核在推进 `F` 时顺带推进各 bucket 的 `head`（按 bucket
+独立、低频，竞争小）。
+
+如此，**命令行开关只决定 `TensorMapHandle` 的初始化参数（副本数 / 是否开并发纪律 / `CAP`）与
+`update_tensormap` 的分发分支**，§6 主循环、§9 堆管理、§11 完成标志环均不改。两模式共用一套
+ring-per-bucket 实现（§12.7.1），§6.4 的回收窗口/哈希/winner-only 等语义原样继承。这把"双模"的改动面
+收敛到"同一 ring 的两种纪律配置" + insert/lookup 分发，满足"基于命令行设置支持两种方案"的设计要求。
+
+### 12.10 落地实现与验证（a2a3 `dist_engine.cpp`）
+
+§12.4–§12.9 给出的是 shared 的**通用设计**（MPSC `reserve` 抢槽 + winner-only insert + 最终一致）。
+实际落地在 `src/a2a3/runtime/fully_distributed_within_core/runtime/dist_engine.cpp` 时，为**保证 shared
+与 private 逐位一致的计算结果**（验收目标），做了两处**更强**的选择，并新增一个反压旋钮。三者都不改变
+§12.1–§12.3 的统一 ring 结论，只是把"弱一致 + MPSC"收紧为"强一致 + 串行追加"。
+
+**(1) 顺序化追加定序器（取代 MPSC winner-only insert）。** shared 用一个全局原子 `tm_insert_next`
+把**所有追加严格串行化到 task-id 顺序**：任务 `N` 只由"第一个走位到 `N` 的核"追加一次，且必须在
+`0..N−1` 全部追加之后（`CAS(insert_next, N, BUSY)` 抢占 → 写槽 → `store(N+1)`）。因每个核都按 id 顺序
+replay、且离开任务 `K` 前必已确保 `K` 已被追加（定序器阻塞它），故**任何核解析任务 `N` 的 fan-in 时，
+全局 ring 的内容恰好等于 private 副本此刻应有的内容**。这把 §12.4 的"最终一致（winner 可能尚未发布 →
+lookup 命中次新/NONE）"收紧为**强一致**，代价是追加环节全局串行（但追加本身极廉价，且 execute 仍
+乱序重叠）。因**只有单一追加者**，§12.7.1 的 MPSC `reserve` 不再需要：`tail` 由当前唯一追加者写，
+`head`/`tail` 为原子、per-slot `seq` 仍保留以防读者在 host 线程被抢占时撞上槽复用。
+
+**(2) lookup 双过滤 `producer ∈ [N−H, N)`。** 在 §12.6 时序过滤（`< N`，跳过未来 producer）之外，**再加
+`≥ N−H` 的下界**——精确对齐 private 的 `alive_floor = N−H`。这样即便共享 ring 里同时存在快核追加的
+"未来条目"（`≥N`）与尚未回收的"陈旧条目"（`<N−H`），lookup 接受的集合也恰好是 `[N−H, N)`，与 private
+副本**逐位相同**。回收阈值用 `R = min_progress − H − 1`（各核 replay 进度的最小值），保证任何存活核的
+`[N−H, N)` 窗口都不被驱逐。
+
+**(3) run-ahead 反压（把 §12.7.2 的 `Δ+H` 溢出从 FATAL 转成背压）。** shared 存活窗口 = `Δ+H`
+（§12.7.2.1），`Δ` 为最快/最慢核的 replay 进度差。在 skip-exec 或超额订阅的仿真主机上 `Δ` 可能暴涨到
+超过 `cap`，触发 §12.7.2.2 的确定性 FATAL。为此新增 `g_tm_runahead_max`：追加前沿在**未持有定序器**
+的前提下等待（并 drain），直到 `N − min_progress ≤ Δ_max`。落后核此时**照常前进**（它们对 `<N` 的
+`claim_append` 立即返回，因 `insert_next > 其 id`），`min_progress` 上升即释放前沿——**无死锁，只节流
+前沿**。默认 `Δ_max = 3·cap/4 − H − 1`（令窗口 ≤ ~¾ cap，留哈希倾斜裕度）；命令行 `--runahead N`（→
+`PTO_DIST_RUNAHEAD=N`）覆盖，`0` 关闭（溢出回退为 FATAL）。这与 §11.4 的堆反压同源（满则等待、不丢数据）。
+
+**节流时 worker 不空转，而是协作式 drain（不是 park 线程）。** 被节流的前沿核**不阻塞、不睡眠**，
+而是在等待窗口的每一圈都调用 `drain_block_won()`（把发到本 lane 的 block.won 存款拉进空闲 slot）+
+`drain_phase_b()`（扫描本核私有 ring，把 **fan-in 已就绪** 的 slot 立即 `execute` 并发布完成标志、释放
+slot）。**仅当**本核确实没有任何就绪任务可执行（`drain_phase_b` 返回 0）才 `SPIN_WAIT_HINT` 轻自旋 +
+看门狗。这正是"worker 去检查窗口里的任务是否满足执行条件并 drain"的行为——而且它 drain 出的完成标志
+会**解锁其它核**依赖这些数据的任务，让最慢核得以推进 replay、抬升 `min_progress`，从而释放本核的节流。
+因此这是一条**协作式、无死锁**的等待：前沿核用等待时间替系统清偿它自己欠下的完成事件。
+
+**为何 per-core task slot 不能替代该节流（回答"worker 的 task slot 本身是否已限制窗口"）。** 每核有
+一个 **`kPrivateSlots = 4` 的私有执行 ring**（`kWonReserve = 2` 预留给 follower，故自领任务实际在
+`occupied_count ≥ 2` 时即反压）。**但它约束的是"本核已认领、尚未执行"的任务数（执行窗口），不是
+replay 走位的 run-ahead `Δ`。** 关键区别：一个核 **replay 全部任务**（shared 下还参与全部任务的顺序
+追加），却**只对自己 win 的任务占用 slot**；对没抢到的任务，它只做 lookup/append 后**径直走过、不占
+slot、不反压**。因此在 skip-exec（执行 0 成本）下，自领 slot 瞬间 drain 空、执行反压从不触发，走位游标
+可一路冲到终点 → `Δ` 爆炸 → shared 的 `Δ+H` 窗口溢出（这正是先前观察到的 FATAL）。**在真实执行下**，
+自领 slot 的执行反压只提供**软性、间接**的减速（核必须等自己认领的任务算完才能继续），能压低但**不能
+封顶** `Δ`，且强度取决于认领比例与依赖结构。故 task slot 无法安全地界定 tensormap 窗口——必须有独立的
+run-ahead 硬上界 `Δ_max`。二者约束**正交**：task-slot ring 限"owned-in-flight"（§3.1 完成侧），
+run-ahead 限"replay 前沿领先量"（§12.7.1 tensormap 侧）。
+
+**(4) lookup 的 acquire 摊薄：每次 lookup 一次 acquire（而非每槽一次）。** §12.7.1 的通用 MPSC 伪码里
+每扫一槽都要 `acquire_load(s.seq)`（因 `reserve` 只是抢槽游标、非发布水位，无法保证其下每槽已发布）。
+但落地实现是**单一串行追加者**（上文 (1)）：`tail` 是**真正的发布水位**——追加者先 `store(seq=k, release)`
+再 `store(tail=k+1, release)`，且跨核的 `append(k)→append(k+1)` 由 `tm_insert_next` 的 release/acquire 链
+串起、`tail` 单调。故 reader **只需对 `tail` 做一次 acquire-load**，即与"所有 `< tail` 的追加"建立
+happens-before，其下每一槽的字段与 `seq` 都已可见；扫描各槽时 `seq` 改用 **relaxed 读**，仅作 ABA 护栏
+（防扫描期间 `head` 并发回收把物理槽复用出去）。这把 §12.8.1 里"每扫一槽一次原子 acquire"降到"每次
+lookup 一次 acquire"，使 shared 的单槽扫描逼近 private 的纯本地读；残留的**跨核 cache line coherence 读**
+不可消除（单份共享的固有对价，private 靠复制 N 份规避）。**验证**：改动后 6 核（`sig=358074ac…`）与 24 核
+（`sig=c01c01e9…`）的 `PTO_DIST_DEPSIG` 依旧与 private **逐位一致**，private 侧签名不变（`8a877fd1…`）。
+
+**命令行 / 环境变量。**
+
+| 变量 | 作用 |
+| ---- | ---- |
+| `PTO_DIST_TENSORMAP_MODE={private\|shared}` | 选择模式（默认 `private`）；运行期一次性读取，不中途切换 |
+| `PTO_DIST_TENSORMAP_RING_CAP={N\|auto}` | 每桶 ring 深度（2 的幂，`auto` 由 `H` 派生，两模式生效） |
+| `PTO_DIST_RUNAHEAD=N` | shared 前沿 run-ahead 上界（`0` 关闭反压 → 溢出走确定性 FATAL） |
+| `PTO_DIST_DEPSIG=1` | 打印依赖图签名（见下），供 private/shared 一致性验证 |
+| `PTO_DIST_OVERHEAD=1` | 打印 `[dist] TMOPS`（inserts/lookups/scans 计数，§12.8.1）+ `[dist] OVERHEAD`（makespan/busy/replay 墙钟；macOS 仿真上被跨核调度延迟主导、仅供参考，理由见 §12.8.1） |
+
+**正确性验证（依赖图签名，免疫浮点噪声）。** 因 BGEMM/PagedAttention 的 `C += A@B` 等**浮点累加顺序
+随调度变化**，数值 `max_diff` **逐次运行本就波动**（private 自身即 0.0091↔0.0093），无法作逐位判据。故
+引入 `PTO_DIST_DEPSIG`：对每条已解析的 fan-in 边 `(consumer, producer)` 做 **XOR 累加**——与调度顺序
+无关，只取决于边的**集合**，是免疫浮点噪声的正确性判据。实测（build/lib，a2a3sim）：
+
+| 用例 | 规模 | private 签名 | shared 签名 |
+| ---- | ---- | ---- | ---- |
+| 差分 UT `test_dist_tensormap_ring.cpp` | 268 万次查询（含"快核超前/滞后回收"越窗条件） | 参考=private | **== private** |
+| BGEMM `Case0` | 72 核 / 500 任务 | `8a877fd1e0e02bb1` (750 边) | **相同** |
+| PagedAttention `CaseSmall1` | 27 核 | `a7db56ff3de5afa6` (15 边) | **相同** |
+| runtime_overhead | 12 核 / 600 · 1200 · 4000 任务 | `c01c…`·`3969…`·`4286b6f704b38748` | **相同** |
+
+结论：**shared 与 private 解析出完全相同的依赖图**（跨 72 并发核、含 4000 任务大图），二者数值差异纯属
+浮点累加顺序噪声（private 自身也有），非正确性差异。run-ahead 反压使 4000 任务的 skip-exec 大图从
+"`Δ+H` 溢出 FATAL"转为顺利完成且签名一致。
+
+## 13. 相关文档
 
 | 文档 | 关联性 |
 | ---- | ------ |
