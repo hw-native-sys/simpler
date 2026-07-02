@@ -113,11 +113,11 @@
  *     host shadow at the top of every tick (`mirror_shm_from_device`) and
  *     pushes the few host-modified fields (`queue_heads[q]` after pop,
  *     `free_queue.tail` + `buffer_ptrs[]` after refill) back as narrow
- *     `write_range_to_device` writes. The bulk `mirror_shm_to_device` is
- *     intentionally NOT called from mgmt_loop: it raced with AICPU writes
- *     to device-only fields (current_buf_ptr, total/dropped/mismatch
+ *     `write_range_to_device` writes. A bulk host→device write-back is
+ *     intentionally avoided: it would race with AICPU writes to
+ *     device-only fields (current_buf_ptr, total/dropped/mismatch
  *     counters, queue_tails, free_queue.head, and on a5
- *     L2SwimlaneAicpuPhaseHeader::magic) and rolled them back to the
+ *     L2SwimlaneAicpuPhaseHeader::magic) and roll them back to the
  *     host-shadow values mirrored in at the top of the tick. Buffer
  *     contents are mirrored on demand inside ProfilerAlgorithms.
  *   - On these platforms `reg` always allocates a paired host shadow; the
@@ -335,8 +335,9 @@ struct ProfilerAlgorithms {
         head = (head + 1) % Module::kReadyQueueSize;
         header->queue_heads[q] = head;
         wmb();
-        // Push the new head value back to device. The bulk mirror_shm_to_device
-        // is intentionally not used here — see buffer_pool_manager.h.
+        // Push the new head value back to device with a narrow write — a
+        // bulk host→device write-back is intentionally avoided here; see
+        // buffer_pool_manager.h.
         mgr.write_range_to_device(&header->queue_heads[q], sizeof(header->queue_heads[q]));
         return true;
     }
@@ -761,10 +762,10 @@ private:
      *      queues.
      *   4) Sleep 10 us if no work was done.
      *
-     * The bulk `mirror_shm_to_device` deliberately is NOT called: it races
+     * A bulk host→device write-back deliberately is NOT done: it would race
      * with AICPU writes to device-only fields (current_buf_ptr, total/dropped/
      * mismatch counters, queue_tails, free_queue.head, core_to_thread[],
-     * and on a5 L2SwimlaneAicpuPhaseHeader::magic) and rolls them back to
+     * and on a5 L2SwimlaneAicpuPhaseHeader::magic) and roll them back to
      * whatever was mirrored in at the start of the tick. Each host-side
      * modification is written back as a narrow field write inside Alg.
      *

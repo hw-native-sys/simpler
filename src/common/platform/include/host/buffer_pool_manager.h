@@ -39,11 +39,10 @@
  *   1. Calls `mirror_shm_from_device` once per tick to refresh the host
  *      shadow, then writes back only the fields it actually modifies via
  *      narrow `write_range_to_device(field_ptr, sizeof(field))` calls.
- *      The bulk `mirror_shm_to_device` is kept for init/teardown but is
- *      NOT used by the mgmt loop — bulk write-back races with AICPU writes
- *      to device-only fields (current_buf_ptr, total/dropped/mismatch
- *      counters, queue_tails, free_queue.head, and on a5
- *      L2SwimlaneAicpuPhaseHeader::magic).
+ *      A bulk host→device write-back is deliberately avoided — it would
+ *      race with AICPU writes to device-only fields (current_buf_ptr,
+ *      total/dropped/mismatch counters, queue_tails, free_queue.head, and
+ *      on a5 L2SwimlaneAicpuPhaseHeader::magic).
  *   2. Pulls each popped buffer's contents from device via
  *      `copy_buffer_from_device` inside ProfilerAlgorithms::process_entry
  *      before delivering it to the collector.
@@ -309,29 +308,6 @@ public:
         }
         if (!ops_.copy_from_device) return 0;
         return ops_.copy_from_device(shared_mem_host_, shared_mem_dev_, shm_size_);
-    }
-
-    /**
-     * Push the host-side modifications (advanced `queue_heads`, refilled
-     * free_queues) back to the device. Called at the bottom of every mgmt
-     * tick.
-     *
-     * NOTE: deprecated for a5 — bulk write_back races with AICPU writes to
-     * device-owned fields (BufferState::current_buf_ptr, total/dropped/mismatch
-     * counters, queue_tails, free_queue.head, and on a5
-     * L2SwimlaneAicpuPhaseHeader::magic, ...).
-     * The bulk write rolls those updates back to whatever was in the host
-     * shadow at mirror_from_device time. Keep the method around so callers
-     * outside the mgmt loop (init/teardown) still have a way to push the
-     * whole region, but the mgmt loop now uses `write_field_to_device` /
-     * `write_range_to_device` for the few fields host actually modifies.
-     */
-    int mirror_shm_to_device() {
-        if (shared_mem_host_ == nullptr || shared_mem_dev_ == nullptr || shm_size_ == 0) {
-            return 0;
-        }
-        if (!ops_.copy_to_device) return 0;
-        return ops_.copy_to_device(shared_mem_dev_, shared_mem_host_, shm_size_);
     }
 
     /**
