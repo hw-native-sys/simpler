@@ -169,13 +169,18 @@ SchedulerContext::PublishHandle SchedulerContext::prepare_subtask_to_core(
     AsyncCtx async_ctx = AsyncCtx::make(slot_state.task->task_id, deferred_slab);
     build_payload(payload, slot_state, subslot, async_ctx, block_idx);
 
+    // Carry the dispatched kernel's func_id in the marker extraId so TraCR
+    // traces record task identity (which kernel ran). subslot selects this
+    // core's kernel_id (AIC vs AIV for a paired task); post-processing maps
+    // func_id -> kernel name via the run's kernel_config.py.
+    const uint32_t tracr_func_id = static_cast<uint32_t>(slot_state.task->kernel_id[static_cast<int32_t>(subslot)]);
     if (to_pending) {
-        INSTRUMENTATION_MARK_SET(sched_thread_num_ + 1 + core_id, Running_Task_Pair, 0);
+        INSTRUMENTATION_MARK_SET(sched_thread_num_ + 1 + core_id, Running_Task_Pair, tracr_func_id);
         core_exec_state.pending_subslot = subslot;
         core_exec_state.pending_slot_state = &slot_state;
         core_exec_state.pending_reg_task_id = static_cast<int32_t>(reg_task_id);
     } else {
-        INSTRUMENTATION_MARK_SET(sched_thread_num_ + 1 + core_id, Running_Task_Single, 0);
+        INSTRUMENTATION_MARK_SET(sched_thread_num_ + 1 + core_id, Running_Task_Single, tracr_func_id);
         core_exec_state.running_subslot = subslot;
         core_exec_state.running_slot_state = &slot_state;
         core_exec_state.running_reg_task_id = static_cast<int32_t>(reg_task_id);
