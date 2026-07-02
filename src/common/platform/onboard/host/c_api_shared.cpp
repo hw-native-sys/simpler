@@ -34,7 +34,6 @@
 #include <dlfcn.h>
 #include <pthread.h>
 
-#include <chrono>
 #include <cstdlib>
 #include <cstring>
 #include <utility>

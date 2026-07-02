@@ -186,7 +186,6 @@ void TensorDumpCollector::start_writer_thread_once() {
     bytes_written_.store(0);
     run_start_time_ = std::chrono::steady_clock::now();
     last_progress_time_ = run_start_time_;
-    buffers_collected_ = 0;
 
     writer_thread_ = std::thread(&TensorDumpCollector::writer_loop, this);
 }
@@ -322,7 +321,6 @@ void TensorDumpCollector::process_dump_buffer(const DumpReadyBufferInfo &info) {
 void TensorDumpCollector::on_buffer_collected(const DumpReadyBufferInfo &info) {
     start_writer_thread_once();
     process_dump_buffer(info);
-    buffers_collected_++;
 
     auto now = std::chrono::steady_clock::now();
     if (std::chrono::duration_cast<std::chrono::seconds>(now - last_progress_time_).count() >= 5) {

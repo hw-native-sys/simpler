@@ -172,7 +172,6 @@ public:
 
 private:
     bool initialized_ = false;
-    int num_threads_ = 0;
 
     // Shared memory region (ScopeStatsDataHeader + ScopeStatsBufferState).
     // shm_host_ / shm_size_ / device_id_ live on ProfilerBase (set via

@@ -218,30 +218,3 @@ def compute_golden(tensors: dict, params: dict) -> None:
     )
 
     tensors["out"][:] = out
-
-
-def run_golden_test(all_cases: dict, default_case: str, generate_inputs_fn, label: str = "Paged Attention"):
-    """Run golden test for __main__ blocks."""
-    params = {"name": default_case, **all_cases[default_case]}
-    result = generate_inputs_fn(params)
-    tensors = {name: tensor for name, tensor in result if isinstance(tensor, torch.Tensor)}
-    compute_golden(tensors, params)
-
-    print(f"=== {label} Golden Test ({params['name']}) ===")
-    print(f"batch={params['batch']}, num_heads={params['num_heads']}, head_dim={params['head_dim']}")
-    print(f"kv_head_num={params['kv_head_num']}, block_size={params['block_size']}")
-    if params.get("context_lens_list"):
-        ctx_list = params["context_lens_list"]
-        print(f"context_lens (variable): {ctx_list[:8]}{'...' if len(ctx_list) > 8 else ''}")
-    else:
-        print(f"context_len={params['context_len']}")
-
-    max_num_blocks = params["max_model_len"] // params["block_size"]
-    q_tile = min(params["num_heads"], 128)
-    print(f"max_num_blocks_per_req={max_num_blocks}, q_tile_size={q_tile}")
-
-    out = tensors["out"].reshape(params["batch"] * params["num_heads"], params["head_dim"])
-    print(f"Output shape: {out.shape}")
-    print(f"Output range: [{out.min():.4f}, {out.max():.4f}]")
-    print(f"Output mean: {out.mean():.4f}")
-    print("Golden test passed!")

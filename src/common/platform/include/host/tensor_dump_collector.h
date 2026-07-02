@@ -289,7 +289,6 @@ private:
     // on_buffer_collected and joined by export_dump_files).
     std::chrono::steady_clock::time_point run_start_time_;
     std::chrono::steady_clock::time_point last_progress_time_;
-    uint64_t buffers_collected_{0};
     bool writer_started_{false};
 
     void process_dump_buffer(const DumpReadyBufferInfo &info);
