@@ -20,7 +20,7 @@
 
 void Orchestrator::init(
     TensorMap *tensormap, Ring *allocator, Scope *scope, ReadyQueue *ready_next_level_queue,
-    ReadyQueue *ready_sub_queue, WorkerManager *manager
+    ReadyQueue *ready_sub_queue, WorkerManager *manager, std::function<void()> ready_notify_cb
 ) {
     tensormap_ = tensormap;
     allocator_ = allocator;
@@ -28,6 +28,7 @@ void Orchestrator::init(
     ready_next_level_queue_ = ready_next_level_queue;
     ready_sub_queue_ = ready_sub_queue;
     manager_ = manager;
+    ready_notify_cb_ = std::move(ready_notify_cb);
     active_tasks_.store(0, std::memory_order_relaxed);
 }
 
@@ -310,6 +311,7 @@ SubmitResult Orchestrator::submit_impl(
     if (live_fanins == 0) {
         s.state.store(TaskState::READY, std::memory_order_release);
         ready_queue_for(worker_type)->push(slot);
+        if (ready_notify_cb_) ready_notify_cb_();
     } else {
         s.state.store(TaskState::PENDING, std::memory_order_release);
     }

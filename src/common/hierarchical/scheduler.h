@@ -19,7 +19,7 @@
  * delegated to WorkerManager. The Scheduler only drives the DAG state machine.
  *
  * Flow:
- *   Orch: submit() → ready_queue.push(slot) + cv.notify()
+ *   Orch: submit() → ready_queue.push(slot) + Scheduler::notify_ready()
  *
  *   Scheduler thread:
  *     wait on cv (ready_queue OR completion_queue non-empty)
@@ -72,6 +72,10 @@ public:
     // Called by WorkerManager (from WorkerThread) after endpoint run() reaches
     // a terminal outcome.
     void worker_done(WorkerCompletion completion);
+
+    // Called by Orchestrator after it pushes a newly-ready root task. ReadyQueue
+    // has its own condition variable, but the Scheduler waits on completion_cv_.
+    void notify_ready();
 
     // Mutex held by run() across each loop iteration's slot-touching body
     // (completion processing + dispatch). Orchestrator::drain() acquires it

@@ -425,6 +425,8 @@ public:
     // Non-blocking: returns false immediately if empty.
     bool try_pop(TaskSlot &out);
 
+    bool empty() const;
+
     // Blocking: waits until a slot is available or shutdown() is called.
     // Returns false only when shutdown and queue is empty.
     bool wait_pop(TaskSlot &out);
@@ -433,7 +435,7 @@ public:
 
 private:
     std::queue<TaskSlot> q_;
-    std::mutex mu_;
+    mutable std::mutex mu_;
     std::condition_variable cv_;
     bool shutdown_{false};
 };

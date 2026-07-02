@@ -152,6 +152,11 @@ void Scheduler::worker_done(WorkerCompletion completion) {
     completion_cv_.notify_one();
 }
 
+void Scheduler::notify_ready() {
+    std::lock_guard<std::mutex> lk(completion_mu_);
+    completion_cv_.notify_one();
+}
+
 // =============================================================================
 // Scheduler loop
 // =============================================================================
@@ -161,8 +166,9 @@ void Scheduler::run() {
         // Wait until there's something to process
         {
             std::unique_lock<std::mutex> lk(completion_mu_);
-            completion_cv_.wait_for(lk, std::chrono::milliseconds(1), [this] {
-                return !completion_queue_.empty() || stop_requested_.load(std::memory_order_acquire);
+            completion_cv_.wait(lk, [this] {
+                return !completion_queue_.empty() || !cfg_.ready_next_level_queue->empty() ||
+                       !cfg_.ready_sub_queue->empty() || stop_requested_.load(std::memory_order_acquire);
             });
         }
 
