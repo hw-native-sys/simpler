@@ -446,34 +446,6 @@ void WorkerManager::stop() {
     sub_threads_.clear();
 }
 
-void WorkerManager::shutdown_children() {
-    for (auto &wt : next_level_threads_)
-        wt->shutdown_child();
-    for (auto &wt : sub_threads_)
-        wt->shutdown_child();
-}
-
-WorkerThread *WorkerManager::pick_idle(WorkerType type) const {
-    auto &threads = (type == WorkerType::NEXT_LEVEL) ? next_level_threads_ : sub_threads_;
-    for (auto &wt : threads) {
-        if (wt->idle()) return wt.get();
-    }
-    return nullptr;
-}
-
-std::vector<WorkerThread *> WorkerManager::pick_n_idle(WorkerType type, int n) const {
-    auto &threads = (type == WorkerType::NEXT_LEVEL) ? next_level_threads_ : sub_threads_;
-    std::vector<WorkerThread *> result;
-    result.reserve(n);
-    for (auto &wt : threads) {
-        if (wt->idle()) {
-            result.push_back(wt.get());
-            if (static_cast<int>(result.size()) >= n) break;
-        }
-    }
-    return result;
-}
-
 WorkerThread *WorkerManager::get_worker_by_index(WorkerType type, int worker_index) const {
     auto &threads = (type == WorkerType::NEXT_LEVEL) ? next_level_threads_ : sub_threads_;
     if (worker_index < 0 || static_cast<size_t>(worker_index) >= threads.size()) return nullptr;
@@ -486,11 +458,6 @@ WorkerThread *WorkerManager::get_worker_by_id(WorkerType type, int32_t worker_id
         if (wt->worker_id() == worker_id) return wt.get();
     }
     return nullptr;
-}
-
-WorkerThread *WorkerManager::pick_idle_excluding(WorkerType type, const std::vector<WorkerThread *> &exclude) const {
-    static const std::vector<int32_t> unconstrained;
-    return pick_idle_excluding_eligible(type, exclude, unconstrained);
 }
 
 WorkerThread *WorkerManager::pick_idle_excluding_eligible(

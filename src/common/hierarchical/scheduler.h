@@ -24,7 +24,7 @@
  *   Scheduler thread:
  *     wait on cv (ready_queue OR completion_queue non-empty)
  *     drain completion_queue → on_task_complete → fanout release → ready_queue
- *     drain ready_queue → manager.pick_n_idle → dispatch
+ *     drain ready_queue → manager.pick_idle_excluding_eligible → dispatch
  *
  *   WorkerThread (managed by WorkerManager):
  *     loop: task_queue.pop() → endpoint.run(dispatch) →
