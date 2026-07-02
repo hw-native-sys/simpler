@@ -497,6 +497,20 @@ TEST(L3L2MessageQueueTest, InputStopReleaseRejectsLaterPublishedInputAsInvalidSt
     EXPECT_EQ(storage.counters[counter_index(L3L2_QUEUE_L2_ABORT_FLAG_OFFSET)], 1);
 }
 
+TEST(L3L2MessageQueueTest, InputStopWithPayloadMetadataPoisonsAndSetsOwnAbortFlag) {
+    RegionStorage storage{};
+    L3L2QueueArgs args = make_args(2, 64, 64);
+    L3L2QueueEndpoint queue(make_desc(&storage, args), args);
+    ASSERT_EQ(queue.error().kind, L3L2QueueErrorKind::NONE) << queue.error().message;
+    publish_input_desc(&storage, queue.layout(), 1, L3L2QueueOpcode::STOP, queue.layout().input_arena_offset, 8);
+
+    L3L2QueueInputHandle handle{};
+    EXPECT_FALSE(queue.input().try_peek(&handle));
+
+    EXPECT_EQ(queue.error().kind, L3L2QueueErrorKind::INVALID_DESCRIPTOR);
+    EXPECT_EQ(storage.counters[counter_index(L3L2_QUEUE_L2_ABORT_FLAG_OFFSET)], 1);
+}
+
 TEST(L3L2MessageQueueTest, NullInputPeekOutputIsPreMutationRejectionWithoutAbort) {
     RegionStorage storage{};
     L3L2QueueArgs args = make_args(2, 64, 64);

@@ -41,6 +41,12 @@ struct L3L2QueueDescSlot {
     uint64_t payload_nbytes;
 };
 
+static_assert(sizeof(L3L2QueueDescSlot) == L3L2_QUEUE_DESC_SLOT_BYTES, "L3L2QueueDescSlot ABI size changed");
+static_assert(offsetof(L3L2QueueDescSlot, seq) == 0, "L3L2QueueDescSlot::seq offset changed");
+static_assert(offsetof(L3L2QueueDescSlot, opcode) == 8, "L3L2QueueDescSlot::opcode offset changed");
+static_assert(offsetof(L3L2QueueDescSlot, payload_offset) == 16, "L3L2QueueDescSlot::payload_offset changed");
+static_assert(offsetof(L3L2QueueDescSlot, payload_nbytes) == 24, "L3L2QueueDescSlot::payload_nbytes changed");
+
 enum class L3L2QueueOpcode : uint64_t {
     INVALID = 0,
     DATA = 1,
@@ -330,6 +336,12 @@ public:
             L3L2QueueOpcode opcode = static_cast<L3L2QueueOpcode>(slot.opcode);
             if (!l3_l2_queue_valid_opcode(opcode)) {
                 parent_->poison(L3L2QueueErrorKind::INVALID_DESCRIPTOR, "input.try_peek", "invalid input opcode");
+                return false;
+            }
+            if (opcode == L3L2QueueOpcode::STOP && (slot.payload_offset != 0 || slot.payload_nbytes != 0)) {
+                parent_->poison(
+                    L3L2QueueErrorKind::INVALID_DESCRIPTOR, "input.try_peek", "STOP descriptor must be zero-byte"
+                );
                 return false;
             }
 

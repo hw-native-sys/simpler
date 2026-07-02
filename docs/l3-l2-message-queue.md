@@ -151,7 +151,7 @@ while (true) {
 
 `queue.input().try_peek(&input)` and
 `queue.output().try_reserve(nbytes, &reservation)` are non-blocking. A `false`
-return can mean no progress, timeout, validation failure, or poison; check
+return can mean ordinary no-progress, validation failure, or poison; check
 `queue.error().kind` to distinguish ordinary no-progress from terminal error.
 
 ## 2. Layout
@@ -282,7 +282,7 @@ are non-blocking and return `False` or `None` for ordinary no-progress.
 C++ blocking queue operations take `timeout_ns`; `timeout_ns == 0` is an
 immediate timeout probe. They return `false` on no-progress, timeout,
 validation failure, or poison. C++ `try_*` APIs are non-blocking and also
-return `false` for ordinary no-progress.
+return `false` for ordinary no-progress, validation failure, or poison.
 
 Timeout under ordinary backpressure is not poison. After timeout, an endpoint
 samples the peer abort flag; if the peer flag is set, the local endpoint
