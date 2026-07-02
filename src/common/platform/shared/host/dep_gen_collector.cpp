@@ -19,10 +19,10 @@
  *        consumed directly by the host replay — no on-disk submit_trace.bin
  *        intermediary.
  *
- * a5 specifics: device↔host transfers go through profiling_copy.h. Each
+ * Non-SVM platforms transfer device↔host data through profiling_copy.h. Each
  * DepGenBuffer's contents are pulled from device on demand inside
  * ProfilerAlgorithms::process_entry, so on_buffer_collected can read
- * `count` and `records[]` directly off the host shadow.
+ * `count` and `records[]` directly off the host view/shadow.
  */
 
 #include "host/dep_gen_collector.h"
@@ -61,7 +61,7 @@ int DepGenCollector::init(
     // consistent values during init. shm_host_ stays nullptr until the shm
     // allocation succeeds — start(tf) gates on shm_host_.
     set_memory_context(
-        alloc_cb, register_cb, free_cb, profiling_copy_to_device_for_ops, profiling_copy_from_device_for_ops,
+        alloc_cb, register_cb, free_cb, profiling_copy_to_device_or_null(), profiling_copy_from_device_or_null(),
         /*shm_dev=*/nullptr, /*shm_host=*/nullptr, /*shm_size=*/0, device_id
     );
 
@@ -131,7 +131,7 @@ int DepGenCollector::init(
     shm_dev_ = shm_dev_local;
     shm_size_ = shm_size;
     set_memory_context(
-        alloc_cb, register_cb, free_cb, profiling_copy_to_device_for_ops, profiling_copy_from_device_for_ops,
+        alloc_cb, register_cb, free_cb, profiling_copy_to_device_or_null(), profiling_copy_from_device_or_null(),
         shm_dev_local, shm_host_local, shm_size, device_id
     );
     initialized_ = true;

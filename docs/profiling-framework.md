@@ -155,7 +155,7 @@ the required members are:
 
 The Module structs are defined alongside their collectors in
 [pmu_collector.h](../src/a2a3/platform/include/host/pmu_collector.h),
-[l2_swimlane_collector.h](../src/a2a3/platform/include/host/l2_swimlane_collector.h),
+[l2_swimlane_collector.h](../src/common/platform/include/host/l2_swimlane_collector.h),
 and [tensor_dump_collector.h](../src/a2a3/platform/include/host/tensor_dump_collector.h)
 — each is a few dozen lines of static methods over the subsystem's own
 `DataHeader` / ringbuffer types.
@@ -303,7 +303,7 @@ Existing collectors are the canonical examples:
   — single kind, per-core instances. See [pmu-profiling.md](dfx/pmu-profiling.md).
 - [`TensorDumpCollector`](../src/a2a3/platform/include/host/tensor_dump_collector.h)
   — single kind, per-AICPU-thread instances. See [args-dump.md](dfx/args-dump.md).
-- [`L2SwimlaneCollector`](../src/a2a3/platform/include/host/l2_swimlane_collector.h)
+- [`L2SwimlaneCollector`](../src/common/platform/include/host/l2_swimlane_collector.h)
   — two kinds (perf records + phase markers), per-core / per-thread
   instances; the canonical multi-kind example. See
   [l2-swimlane-profiling.md](dfx/l2-swimlane-profiling.md).

@@ -23,8 +23,8 @@
  * Memory operations are injected through callbacks for sim/onboard portability.
  */
 
-#ifndef SRC_A5_PLATFORM_INCLUDE_HOST_L2_SWIMLANE_COLLECTOR_H_
-#define SRC_A5_PLATFORM_INCLUDE_HOST_L2_SWIMLANE_COLLECTOR_H_
+#ifndef SRC_COMMON_PLATFORM_INCLUDE_HOST_L2_SWIMLANE_COLLECTOR_H_
+#define SRC_COMMON_PLATFORM_INCLUDE_HOST_L2_SWIMLANE_COLLECTOR_H_
 
 #include <atomic>
 #include <cstdint>
@@ -476,4 +476,4 @@ private:
     void copy_aicore_buffer(const ReadyBufferInfo &info);
 };
 
-#endif  // SRC_A5_PLATFORM_INCLUDE_HOST_L2_SWIMLANE_COLLECTOR_H_
+#endif  // SRC_COMMON_PLATFORM_INCLUDE_HOST_L2_SWIMLANE_COLLECTOR_H_
