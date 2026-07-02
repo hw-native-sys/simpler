@@ -21,6 +21,7 @@
 #include "aicpu/scope_stats_collector_aicpu.h"
 #include <cstring>
 
+#include "aicpu/device_time.h"
 #include "common/memory_barrier.h"
 #include "common/platform_config.h"
 #include "common/scope_stats.h"
@@ -43,6 +44,8 @@ static int s_orch_thread_idx = -1;  // set via scope_stats_aicpu_set_orch_thread
 // the boundary-sampled wrapping offsets into monotonic values (see
 // unroll_heap_offset). Reset in set_platform_scope_stats_base.
 static uint64_t s_heap_wraps[PTO2_SCOPE_STATS_MAX_RING_DEPTH][2] = {};
+
+static constexpr uint64_t kScopeStatsQueueBackpressureWaitCycles = PLATFORM_PROF_SYS_CNT_FREQ / 50000;  // 20 us
 
 namespace {
 
@@ -88,20 +91,61 @@ inline void copy_basename(char (&dst)[32], const char *src) {
 
 // Enqueue a full buffer onto the orchestrator thread's ready_queue. Returns 0
 // on success, -1 if the queue is full or the orch thread index is unset.
-int enqueue_ready_buffer(uint64_t buffer_ptr, uint32_t buffer_seq) {
-    if (s_orch_thread_idx < 0 || s_orch_thread_idx >= PLATFORM_MAX_AICPU_THREADS) {
-        return -1;
+bool wait_for_ready_queue_space(ScopeStatsDataHeader *header, int thread_idx, uint32_t *tail_out, uint32_t *head_out) {
+    if (header == nullptr || thread_idx < 0 || thread_idx >= PLATFORM_MAX_AICPU_THREADS) {
+        return false;
     }
+    const uint32_t capacity = PLATFORM_SCOPE_STATS_READYQUEUE_SIZE;
+    const uint64_t start = get_sys_cnt_aicpu();
+
+    do {
+        uint32_t current_tail = header->queue_tails[thread_idx];
+        uint32_t current_head = header->queue_heads[thread_idx];
+        uint32_t next_tail = (current_tail + 1) % capacity;
+        if (next_tail != current_head) {
+            *tail_out = current_tail;
+            *head_out = current_head;
+            return true;
+        }
+        if (get_sys_cnt_aicpu() - start >= kScopeStatsQueueBackpressureWaitCycles) {
+            break;
+        }
+    } while (true);
+    return false;
+}
+
+bool wait_for_free_queue_entry(ScopeStatsFreeQueue *free_queue, uint32_t *head_out, uint32_t *tail_out) {
+    if (free_queue == nullptr) {
+        return false;
+    }
+    const uint64_t start = get_sys_cnt_aicpu();
+
+    do {
+        uint32_t head = free_queue->head;
+        uint32_t tail = free_queue->tail;
+        if (head != tail) {
+            *head_out = head;
+            *tail_out = tail;
+            rmb();  // acquire: order the tail read above before the caller's buffer_ptrs read
+            return true;
+        }
+        if (get_sys_cnt_aicpu() - start >= kScopeStatsQueueBackpressureWaitCycles) {
+            break;
+        }
+    } while (true);
+    return false;
+}
+
+int enqueue_ready_buffer(uint64_t buffer_ptr, uint32_t buffer_seq) {
     int q = s_orch_thread_idx;
     uint32_t capacity = PLATFORM_SCOPE_STATS_READYQUEUE_SIZE;
-    uint32_t current_tail = s_scope_stats_header->queue_tails[q];
-    uint32_t current_head = s_scope_stats_header->queue_heads[q];
-
-    uint32_t next_tail = (current_tail + 1) % capacity;
-    if (next_tail == current_head) {
-        return -1;  // Queue full
+    uint32_t current_tail = 0;
+    uint32_t current_head = 0;
+    if (!wait_for_ready_queue_space(s_scope_stats_header, q, &current_tail, &current_head)) {
+        return -1;
     }
 
+    uint32_t next_tail = (current_tail + 1) % capacity;
     s_scope_stats_header->queues[q][current_tail].instance_index = 0;
     s_scope_stats_header->queues[q][current_tail].buffer_ptr = buffer_ptr;
     s_scope_stats_header->queues[q][current_tail].buffer_seq = buffer_seq;
@@ -115,43 +159,33 @@ int enqueue_ready_buffer(uint64_t buffer_ptr, uint32_t buffer_seq) {
 
 // Pop a free buffer into current_buf_ptr. Returns true if one was available.
 bool pop_free_buffer() {
-    rmb();
-    uint32_t head = s_scope_stats_state->free_queue.head;
-    uint32_t tail = s_scope_stats_state->free_queue.tail;
-    if (head == tail) {
+    if (s_scope_stats_state == nullptr) return false;
+    uint32_t head = 0;
+    uint32_t tail = 0;
+    if (!wait_for_free_queue_entry(&s_scope_stats_state->free_queue, &head, &tail)) {
         return false;
     }
+
     uint64_t buf_ptr = s_scope_stats_state->free_queue.buffer_ptrs[head % PLATFORM_SCOPE_STATS_SLOT_COUNT];
-    rmb();
     s_scope_stats_state->free_queue.head = head + 1;
+    if (buf_ptr == 0) {
+        return false;
+    }
     s_scope_stats_state->current_buf_ptr = buf_ptr;
     reinterpret_cast<ScopeStatsBuffer *>(buf_ptr)->count = 0;
     wmb();
     return true;
 }
 
-// Commit the full current buffer to the ready_queue and pop a replacement. On
-// no free buffer / ready_queue full, drop the buffer's records and reuse it.
+// Commit the full current buffer to the ready_queue before popping a
+// replacement. If no replacement is available, later records drop until host
+// replenishes free_queue.
 void switch_buffer() {
     if (s_scope_stats_state == nullptr) {
         return;
     }
     ScopeStatsBuffer *full_buf = reinterpret_cast<ScopeStatsBuffer *>(s_scope_stats_state->current_buf_ptr);
     if (full_buf == nullptr) {
-        return;
-    }
-
-    rmb();
-    uint32_t head = s_scope_stats_state->free_queue.head;
-    uint32_t tail = s_scope_stats_state->free_queue.tail;
-    if (head == tail) {
-        // Host can't recycle buffers fast enough: drop silently (count only, no
-        // per-drop log). Logging here would make a slow host pay device-side
-        // hot-path cost — the device must not be coupled to host throughput. The
-        // total is surfaced via dropped_record_count in the finalize summary.
-        s_scope_stats_state->dropped_record_count += full_buf->count;
-        full_buf->count = 0;
-        wmb();
         return;
     }
 
@@ -164,13 +198,10 @@ void switch_buffer() {
         return;
     }
 
-    uint64_t new_buf_ptr = s_scope_stats_state->free_queue.buffer_ptrs[head % PLATFORM_SCOPE_STATS_SLOT_COUNT];
-    rmb();
-    s_scope_stats_state->free_queue.head = head + 1;
-    s_scope_stats_state->current_buf_ptr = new_buf_ptr;
+    s_scope_stats_state->current_buf_ptr = 0;
     s_scope_stats_state->current_buf_seq = seq + 1;
-    reinterpret_cast<ScopeStatsBuffer *>(new_buf_ptr)->count = 0;
     wmb();
+    (void)pop_free_buffer();
 }
 
 // Unroll a wrapping heap byte offset into a monotonic value using the

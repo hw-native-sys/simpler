@@ -14,11 +14,11 @@
  * @brief Host-side PMU buffer allocation, streaming collection, and CSV export.
  *
  * Architecture:
- * - BufferPoolManager<PmuModule>: shared mgmt-thread infrastructure that polls
- *   per-thread DumpReadyQueues, drains the done_queue, and replenishes the
+ * - BufferPoolManager<PmuModule>: shared split-mgmt infrastructure that polls
+ *   per-thread ready queues, drains done-queue shards, and replenishes the
  *   per-core free_queues from a unified recycled pool.
- * - PmuCollector: collector thread pops full PmuBuffers from the manager
- *   and appends them to the CSV file.
+ * - PmuCollector: collector thread shards pop full PmuBuffers from the manager
+ *   and append them to the CSV file.
  *
  * Lifecycle:
  *   init()                       — Allocate header + per-core states + PmuBuffers
@@ -27,12 +27,12 @@
  *                                  on the base so start(tf) can launch threads.
  *   start(tf)                    — Inherited from ProfilerBase: assembles
  *                                  MemoryOps from the stashed callbacks and
- *                                  launches the mgmt + poll threads.
+ *                                  launches the mgmt + collector threads.
  *   [device execution]
- *   stop()                       — Stop mgmt → join mgmt → signal poll →
- *                                  drain L2 → join poll, in that order. On
- *                                  return both thread exits and queue drains
- *                                  are complete.
+ *   stop()                       — Stop mgmt → join mgmt → signal collectors →
+ *                                  drain ready shards → join collectors, in
+ *                                  that order. On return both thread exits and
+ *                                  queue drains are complete.
  *   reconcile_counters()         — Sanity-check PmuBufferState::current_buf_ptr
  *                                  (any non-zero pointer with records is a
  *                                  device-flush bug, logged as ERROR) and run
@@ -78,9 +78,8 @@
  */
 
 /**
- * Internal hand-off struct delivered from the mgmt thread to the collector.
- * thread_index is the logical AICPU thread queue the entry was popped from,
- * passed through by ProfilerBase's mgmt loop.
+ * Internal hand-off struct delivered from a drain thread to a collector shard.
+ * thread_index is the logical AICPU thread queue the entry was popped from.
  */
 struct PmuReadyBufferInfo {
     uint32_t core_index;
@@ -100,6 +99,8 @@ struct PmuModule {
     static constexpr uint32_t kReadyQueueSize = PLATFORM_PMU_READYQUEUE_SIZE;
     static constexpr uint32_t kSlotCount = PLATFORM_PMU_SLOT_COUNT;
     static constexpr const char *kSubsystemName = "PmuModule";
+    static constexpr int kMgmtDrainThreadCount = PLATFORM_MAX_AICPU_THREADS;
+    static constexpr int kCollectorThreadCount = PLATFORM_MAX_AICPU_THREADS;
 
     /**
      * Buffers grown by proactive_replenish are batch-allocated up to the
@@ -118,7 +119,18 @@ struct PmuModule {
      * resets it itself on flush/drop/pop.
      */
     static std::optional<profiling_common::EntrySite<PmuModule>>
-    resolve_entry(void *shm, DataHeader * /*header*/, int q, const ReadyEntry &entry) {
+    resolve_entry(void *shm, DataHeader *header, int q, const ReadyEntry &entry) {
+        if (shm == nullptr || header == nullptr) {
+            LOG_ERROR("PmuModule: invalid shared memory/header while resolving ready entry");
+            return std::nullopt;
+        }
+        if (entry.core_index >= header->num_cores || entry.core_index >= static_cast<uint32_t>(PLATFORM_MAX_CORES)) {
+            LOG_ERROR(
+                "PmuModule: invalid ready entry core=%u (num_cores=%u, max=%u)", entry.core_index, header->num_cores,
+                static_cast<uint32_t>(PLATFORM_MAX_CORES)
+            );
+            return std::nullopt;
+        }
         PmuBufferState *state = get_pmu_buffer_state(shm, static_cast<int>(entry.core_index));
         profiling_common::EntrySite<PmuModule> site;
         site.kind = 0;

@@ -331,7 +331,7 @@ ScopeStatsCollector                platform scope_stats_collector_aicpu.cpp
   set kernel_args fields             runtime: scope_stats_set_ring_capacity()
   launch kernel                      runtime: scope_stats_set_tensormap_capacity()
       │                                  │
-  poll thread:                       on PTO2_SCOPE begin/end:
+  collector shard(s):                on PTO2_SCOPE begin/end:
    append records to memory  ◀──┐      runtime samples task/heap/dep_pool/tensormap
       │                         │      runtime: scope_stats_begin()/end()
       │                         │         └─ emit record, append to buffer;

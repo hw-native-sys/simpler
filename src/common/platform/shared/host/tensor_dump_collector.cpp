@@ -320,6 +320,7 @@ void TensorDumpCollector::process_dump_buffer(const DumpReadyBufferInfo &info) {
 }
 
 void TensorDumpCollector::on_buffer_collected(const DumpReadyBufferInfo &info) {
+    std::scoped_lock<std::mutex> lock(collector_state_mutex_);
     start_writer_thread_once();
     process_dump_buffer(info);
     buffers_collected_++;

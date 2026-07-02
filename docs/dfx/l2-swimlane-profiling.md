@@ -636,11 +636,11 @@ sched overhead per session as price for unbounded session length).
 
 `halHostRegister` maps device memory into host virtual address
 space so the host can read device buffers directly.
-`L2SwimlaneCollector` runs two background threads on top of a
+`L2SwimlaneCollector` runs split mgmt threads and collector shards on top of a
 [`BufferPoolManager<L2SwimlaneModule>`](../src/common/platform/include/host/buffer_pool_manager.h):
-a mgmt thread that polls SPSC ready queues and recycles full
-buffers **while kernels are still executing**, plus a poll
-thread that drains the L2 hand-off queue into
+drain/refill shards poll SPSC ready queues and recycle full buffers
+**while kernels are still executing**, a replenish thread keeps free
+queues topped up, and collector shards drain the host hand-off queues into
 `on_buffer_collected`.
 
 `L2SwimlaneModule` declares four buffer kinds going through one ready
@@ -668,19 +668,19 @@ are single-kind.
 │                          │               │                          │
 │ start(tf)                │               │ AICPU on FIN:            │
 │   ┌────────────────────┐ │ SPSC ready    │   commit AicpuTask       │
-│   │ mgmt thread        │ │ queues        │   record (kind 0); fill  │
-│   │ (BufferPool driver)│ │<──4 kinds────<│   func_id / dispatch /   │
+│   │ drain/refill shard │ │ queues        │   record (kind 0); fill  │
+│   │ + replenish thread │ │<──4 kinds────<│   func_id / dispatch /   │
 │   │   poll ready queue │<┼──multiplexed──│   finish; rotate buffer  │
 │   │   recycle buffers  │─┼──free queue──>│   when full              │
 │   └────────────────────┘ │               │ AICPU scheduler thread:  │
 │   ┌────────────────────┐ │               │   per work iter: write   │
-│   │ poll thread        │ │               │   SchedPhaseRecord       │
+│   │ collector shard    │ │               │   SchedPhaseRecord       │
 │   │   reads via host   │ │ shared mem    │   (kind 1). Per submit:  │
 │   │   mapping; copies  │<┼──mapping─────<│   write OrchPhaseRecord  │
 │   │   to host vectors  │ │               │   (kind 2).              │
 │   └────────────────────┘ │               │                          │
 │ stop()                   │               │                          │
-│   join mgmt → join poll  │               │                          │
+│   join mgmt → collectors │               │                          │
 │ read_phase_header_metadata()             │                          │
 │ reconcile_counters()     │               │                          │
 │ export_swimlane_json()   │               │                          │
@@ -694,10 +694,10 @@ are single-kind.
 init_l2_swimlane()
   l2_swimlane_collector_.initialize(num_aicore, ..., output_prefix_)
   kernel_args_.args.l2_swimlane_data_base = l2_swimlane_collector_.get_l2_swimlane_shm_device_ptr()
-start(tf)                          ← spawn mgmt + poll threads
+start(tf)                          ← spawn split mgmt + collector shards
 launch AICPU / AICore
 rtStreamSynchronize
-stop()                             ← join mgmt → join poll
+stop()                             ← join mgmt/replenish → join collectors
 read_phase_header_metadata()       ← single-shot read of the
                                      core→thread mapping
 reconcile_counters()               ← three-bucket accounting for both
@@ -711,7 +711,7 @@ finalize(unregister, free)
 [`L2SwimlaneCollector`](../src/a2a3/platform/include/host/l2_swimlane_collector.h)
 on a2a3 inherits from
 [`profiling_common::ProfilerBase<L2SwimlaneCollector, L2SwimlaneModule>`](../src/common/platform/include/host/profiler_base.h):
-the base class owns the mgmt thread, the poll thread, and the
+the base class owns split mgmt threads, collector shards, and the
 `BufferPoolManager<L2SwimlaneModule>` they share. `L2SwimlaneCollector`
 supplies the L2-specific pieces — the `L2SwimlaneModule` trait
 (notably `kBufferKinds = 4` and `kind_of()`), `initialize` that
@@ -721,7 +721,7 @@ allocates and pre-fills all four kinds of free queues, an
 to copy into the right per-core or per-thread vector, plus
 `read_phase_header_metadata` /
 `reconcile_counters` / `export_swimlane_json` / `finalize`. The
-mgmt/poll threading and `Module` trait pattern are shared with
+mgmt/collector threading and `Module` trait pattern are shared with
 PMU and TensorDump — see
 [profiling-framework.md](../profiling-framework.md) for the
 framework reference.
@@ -729,9 +729,11 @@ framework reference.
 ### 5.3 a5 — same framework, host-shadow transport
 
 a5's `L2SwimlaneCollector` derives from
-`ProfilerBase<L2SwimlaneCollector, L2SwimlaneModule>` and shares the
-mgmt + poll thread structure with a2a3. The single behavioral
-deviation from §5.2 is the **transport channel**: a5 has no
+`ProfilerBase<L2SwimlaneCollector, L2SwimlaneModule>` and uses the same
+framework abstractions as a2a3, including the same split mgmt +
+collector shard shape (`kMgmtDrainThreadCount` = `kCollectorThreadCount`
+= `PLATFORM_MAX_AICPU_THREADS`, i.e. 7 on a5 vs 4 on a2a3). The
+behavioral deviation from §5.2 is the **transport channel**: a5 has no
 `halHostRegister`, so each device buffer is paired with a
 host-shadow `malloc()` and the mgmt loop synchronizes the two via
 `profiling_copy.h` (`rtMemcpy` onboard, plain `memcpy` in sim).
@@ -863,7 +865,7 @@ PHASE), same shape as a2a3.
 | AICPU commit on FIN | identical | |
 | Buffer model | rotating pool (free + ready queues) per kind | identical |
 | Ready queue | per-AICPU-thread, multiplexes 4 kinds via `ReadyQueueEntry::kind` | per-AICPU-thread, 2 kinds via `is_phase` |
-| Host threads | mgmt + poll, streams during execution | identical |
+| Host threads | split mgmt + collector shards, streams during execution | same split mgmt + collector shards (7 = `PLATFORM_MAX_AICPU_THREADS` vs a2a3's 4) |
 | Host-class shape | `ProfilerBase<L2SwimlaneCollector, L2SwimlaneModule>` (`kBufferKinds = 4`) | same base, `kBufferKinds = 2` |
 | Host transport | `halHostRegister` shared memory | host-shadow `malloc` + per-tick `rtMemcpy`/`memcpy` |
 | `MemoryOps` callbacks | 3 (`alloc`, `reg`, `free_`) | 5 (+ `copy_to_device`, `copy_from_device`) |
@@ -891,10 +893,11 @@ Phase-record overhead (only at `--enable-l2-swimlane >= 3`):
 - a5 — one 40 B `L2SwimlaneAicpuPhaseRecord` per emitted phase
   (legacy unified shape).
 
-Both architectures drain buffers concurrently with execution via the
-mgmt + poll thread pair; a5 additionally pays per-tick
-`rtMemcpy`/`memcpy` round-trips to keep the host shadow in sync,
-which overlap with device execution.
+Both architectures drain buffers concurrently with execution through the
+ProfilerBase mgmt/collector pipeline; both a2a3 and a5 use split mgmt plus
+collector shards for this profiler (a5 with 7 shards, a2a3 with 4). a5
+additionally pays per-buffer `rtMemcpy`/`memcpy` round-trips to keep the
+host shadow in sync, which overlap with device execution.
 
 `--rounds > 1` collects only on the first round so the steady-state
 benchmark is not perturbed.
