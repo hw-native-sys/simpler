@@ -360,12 +360,14 @@ class L3L2Queue:
     ) -> int:
         if payload_nbytes == 0:
             return cursor
-        expected_offset = arena_offset + (cursor % arena_bytes)
+        arena_pos = cursor % arena_bytes
+        wraps = arena_pos + payload_nbytes > arena_bytes
+        expected_offset = arena_offset if wraps else arena_offset + arena_pos
         if expected_offset != payload_offset:
-            if payload_offset != arena_offset:
-                self._poison_local()
-                raise RuntimeError("L3-L2 queue payload replay offset mismatch")
-            cursor += arena_bytes - (cursor % arena_bytes)
+            self._poison_local()
+            raise RuntimeError("L3-L2 queue payload replay offset mismatch")
+        if wraps:
+            cursor += arena_bytes - arena_pos
         return cursor + payload_nbytes
 
     def _replay_released_input_descriptors(self, old_head: int, new_head: int) -> None:

@@ -628,6 +628,30 @@ def test_output_payload_offset_mismatch_poisons_before_payload_read():
         _close(worker, shm)
 
 
+def test_output_payload_early_wrap_offset_mismatch_poisons():
+    orch, worker, shm, fake_client = _make_orchestrator()
+    try:
+        queue = orch.create_l3_l2_queue(worker_id=0, depth=4, input_arena_bytes=128, output_arena_bytes=128)
+        _publish_output(fake_client, queue, seq=1, payload=b"abcdefghijklmnop")
+        first = queue.output.peek(timeout=0.001)
+        queue.output.release(first)
+
+        _publish_output(
+            fake_client,
+            queue,
+            seq=2,
+            payload=b"qrstuvwxyzABCDEF",
+            payload_offset=queue.layout.output_arena_offset,
+        )
+
+        with pytest.raises(RuntimeError, match="payload.*mismatch"):
+            queue.output.peek(timeout=0.001)
+
+        assert fake_client.counters[L3L2_QUEUE_L3_ABORT_FLAG_OFFSET] == 1
+    finally:
+        _close(worker, shm)
+
+
 def test_enqueue_payload_write_failure_sets_l3_abort_flag():
     orch, worker, shm, fake_client = _make_orchestrator()
     try:
