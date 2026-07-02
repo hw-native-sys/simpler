@@ -180,10 +180,11 @@ public:
                     return {-1, -1, nullptr, nullptr};
                 }
                 // Reclaim watermark is stuck. Run the deadlock checks only once
-                // per 1024 spins: get_sys_cnt_aicpu() is an MMIO read and
-                // head_blocked_on_scope_end() walks the head slot, neither of
-                // which needs to fire on every hot spin (1024 spins is far below
-                // the wall-clock timeout, so detection latency is unaffected).
+                // per 1024 spins to keep the hot reclaim loop tight:
+                // get_sys_cnt_aicpu() is a cheap cntvct_el0 read, while this
+                // block polls the fatal flag and head_blocked_on_scope_end()
+                // walks the head slot (1024 spins is far below the wall-clock
+                // timeout, so detection latency is unaffected).
                 // (1) Structural, immediate: if the head task is COMPLETED with
                 // every consumer released but its scope still open, only
                 // scope_end can free it and a blocked orchestrator can never
