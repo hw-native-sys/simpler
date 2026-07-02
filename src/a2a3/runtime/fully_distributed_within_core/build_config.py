@@ -24,9 +24,19 @@
 # runtime targets AND the orchestration .so (e.g., tensor methods needed
 # by the Tensor constructor's validation logic).
 
+# The decentralized SPMD engine (dist_engine.{cpp,h}) is shared verbatim across
+# arches from src/common/runtime/fully_distributed_within_core/. It is compiled
+# into the AICPU .so only (dist_core_main runs on AICore worker threads via a
+# function pointer). Arch-specific headers (runtime.h, pto_runtime2.h, ...) still
+# resolve through each arch's own include_dirs, so the same source builds per-arch.
+DIST_COMMON = "../../../common/runtime/fully_distributed_within_core"
+
 BUILD_CONFIG = {
     "aicore": {"include_dirs": ["runtime", "common", ".."], "source_dirs": ["aicore", "orchestration"]},
-    "aicpu": {"include_dirs": ["runtime", "common", ".."], "source_dirs": ["aicpu", "runtime", "orchestration"]},
+    "aicpu": {
+        "include_dirs": ["runtime", "common", "..", DIST_COMMON],
+        "source_dirs": ["aicpu", "runtime", "orchestration", DIST_COMMON],
+    },
     "host": {"include_dirs": ["runtime", "common", ".."], "source_dirs": ["host", "runtime/shared", "orchestration"]},
     "orchestration": {"include_dirs": ["runtime", "orchestration", "common", ".."], "source_dirs": ["orchestration"]},
 }

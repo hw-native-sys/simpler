@@ -235,10 +235,16 @@ public:
     // once `go` is set, then increments `done_count` when finished. See
     // runtime/dist_engine.* and docs/fully_distributed_within_core.md.
     struct DistHandoff {
-        volatile uint64_t core_main_fn;  // DistCoreMainFn (in AICPU .so)
-        volatile uint32_t go;            // 1 once engine wired and cores may start
-        volatile int32_t num_workers;    // number of AICore workers participating
-        volatile int32_t done_count;     // workers atomically increment when done
+        volatile uint64_t core_main_fn;      // DistCoreMainFn (in AICPU .so)
+        volatile uint64_t global_data_base;  // base of the shared DistGlobal segment
+                                             // (docs §13): allocated + initialized by
+                                             // dist_engine_register on the AICPU; each
+                                             // AICore worker binds its per-core g_gd to
+                                             // this so all shared state is base+offset
+                                             // addressed with NO process-global symbol.
+        volatile uint32_t go;                // 1 once engine wired and cores may start
+        volatile int32_t num_workers;        // number of AICore workers participating
+        volatile int32_t done_count;         // workers atomically increment when done
     } dist;
 
 private:

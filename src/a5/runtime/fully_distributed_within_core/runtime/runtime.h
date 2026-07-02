@@ -235,6 +235,15 @@ public:
     // NOTE: Made public for direct access from aicore code
     uint64_t func_id_to_addr_[RUNTIME_MAX_FUNC_ID];
 
+    // Sim-only trace-driven replay (CallConfig::use_example_exec_time). Filled by
+    // the host from CallConfig at bind time; read by execute_slot in dist_engine:
+    // when use_example_exec_time_ is set, a func whose example_exec_time_ns_[fid]
+    // is > 0 is "executed" by busy-waiting that many nanoseconds instead of
+    // calling the real kernel (funcs left at 0 still run for real). Public for
+    // direct AICore-side access, mirroring func_id_to_addr_.
+    bool use_example_exec_time_;
+    int32_t example_exec_time_ns_[RUNTIME_MAX_FUNC_ID];
+
     // Orchestrator-to-scheduler transition control
     // When true, orchestrator threads convert to scheduler threads after orchestration completes.
     // When false (default), orchestrator threads exit after orchestration without dispatching tasks.
@@ -249,10 +258,16 @@ public:
     // once `go` is set, then increments `done_count` when finished. See
     // runtime/dist_engine.* and docs/fully_distributed_within_core.md.
     struct DistHandoff {
-        volatile uint64_t core_main_fn;  // DistCoreMainFn (in AICPU .so)
-        volatile uint32_t go;            // 1 once engine wired and cores may start
-        volatile int32_t num_workers;    // number of AICore workers participating
-        volatile int32_t done_count;     // workers atomically increment when done
+        volatile uint64_t core_main_fn;      // DistCoreMainFn (in AICPU .so)
+        volatile uint64_t global_data_base;  // base of the shared DistGlobal segment
+                                             // (docs §13): allocated + initialized by
+                                             // dist_engine_register on the AICPU; each
+                                             // AICore worker binds its per-core gd to
+                                             // this so all shared state is base+offset
+                                             // addressed with NO process-global symbol.
+        volatile uint32_t go;                // 1 once engine wired and cores may start
+        volatile int32_t num_workers;        // number of AICore workers participating
+        volatile int32_t done_count;         // workers atomically increment when done
     } dist;
 
 private:

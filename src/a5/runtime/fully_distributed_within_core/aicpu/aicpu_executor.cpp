@@ -53,6 +53,10 @@
 // CoreCallable for resolved dispatch address
 #include "callable.h"
 
+// fully_distributed_within_core engine — orchestration + scheduling + execution
+// run on the AICore workers; this AICPU thread only wires the engine and waits.
+#include "dist_engine.h"
+
 // Scheduler data structures (CoreExecState, CoreTracker, etc.)
 #include "scheduler/scheduler_types.h"
 
@@ -572,9 +576,39 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
             if (*p_bind != nullptr) {
                 (*p_bind)(rt);
             }
-            rt_scope_begin(rt);
-            (*p_func)(orch_args_cached_);
-            rt_scope_end(rt);
+            // ---- fully_distributed_within_core handoff ----
+            // Instead of running orchestration here, wire the distributed engine
+            // (resets cursors/flags/heap, points rt->ops at the distributed
+            // submit path) and hand the per-core entry off to the AICore worker
+            // threads, which replay orchestration in SPMD fashion and execute
+            // the tasks they win. This AICPU thread then waits for all workers.
+            // See runtime/dist_engine.* and docs/fully_distributed_within_core.md.
+            {
+                const int32_t num_workers = runtime->worker_count;
+                // dist_engine_register repoints rt->ops at the distributed submit
+                // table for the duration of the on-core orchestration replay. Save
+                // the centralized ops so the scheduler-handoff calls below
+                // (rt_orchestration_done / on_orchestration_done) work unchanged.
+                const PTO2RuntimeOps *saved_ops = rt->ops;
+                void *core_main =
+                    dist_engine_register(rt, *p_func, &orch_args_cached_, num_workers, runtime);
+                runtime->dist.core_main_fn = reinterpret_cast<uint64_t>(core_main);
+                runtime->dist.num_workers = num_workers;
+                __atomic_store_n(&runtime->dist.done_count, 0, __ATOMIC_RELEASE);
+                __atomic_store_n(&runtime->dist.go, 1u, __ATOMIC_RELEASE);
+                const bool dist_trace = (getenv("PTO_DIST_TRACE") != nullptr);
+                if (dist_trace)
+                    fprintf(stderr, "[dist] Thread %d: engine wired, %d workers launched\n", thread_idx, num_workers);
+                while (__atomic_load_n(&runtime->dist.done_count, __ATOMIC_ACQUIRE) < num_workers) {
+                    SPIN_WAIT_HINT();
+                }
+                // All workers done (single-threaded here): emit the per-core
+                // execution swimlane if PTO_DIST_SWIMLANE is set (else no-op).
+                dist_engine_dump_trace();
+                rt->ops = saved_ops;
+                if (dist_trace)
+                    fprintf(stderr, "[dist] Thread %d: all %d distributed workers finished\n", thread_idx, num_workers);
+            }
 
             // Flush the (potentially partially-filled) DepGenBuffer so the host
             // collector can pick it up before this orchestrator thread joins.

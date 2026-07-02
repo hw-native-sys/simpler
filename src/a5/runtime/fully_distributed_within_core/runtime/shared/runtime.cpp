@@ -39,8 +39,13 @@ Runtime::Runtime() {
     aicpu_launch_count = 0;
     orch_to_sched = false;
 
+    // Sim trace-driven replay (off by default; host sets from CallConfig at bind).
+    use_example_exec_time_ = false;
+    memset(example_exec_time_ns_, 0, sizeof(example_exec_time_ns_));
+
     // fully_distributed_within_core handoff fields
     dist.core_main_fn = 0;
+    dist.global_data_base = 0;
     dist.go = 0;
     dist.num_workers = 0;
     dist.done_count = 0;

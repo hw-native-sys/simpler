@@ -76,7 +76,12 @@ LoopAction SchedulerContext::handle_orchestrator_exit(
     if (!orch_done) return LoopAction::NONE;
 
     task_count = total_tasks_;
-    if (task_count > 0 && completed_tasks_.load(std::memory_order_relaxed) >= task_count) {
+    // task_count == 0 is the fully_distributed_within_core path: orchestration +
+    // scheduling + execution all ran on the AI cores, so nothing was submitted to
+    // shared memory. Once orchestration is done (checked above) an empty SM graph
+    // means there is no AICPU-side work left — complete immediately rather than
+    // spinning forever. The centralized path (task_count > 0) is unchanged.
+    if (completed_tasks_.load(std::memory_order_relaxed) >= task_count) {
         completed_.store(true, std::memory_order_release);
         LOG_INFO_V0(
             "Thread %d: PTO2 completed tasks %d/%d", thread_idx, completed_tasks_.load(std::memory_order_relaxed),

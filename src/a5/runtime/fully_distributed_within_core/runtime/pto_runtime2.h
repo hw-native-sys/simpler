@@ -131,6 +131,12 @@ struct PTO2Runtime {
     const PTO2RuntimeOps *ops;
     PTO2ScopeMode pending_scope_mode;
 
+    // fully_distributed_within_core (docs §13): base of the shared DistGlobal
+    // segment. Set by dist_engine_register on the AICPU; read by the distributed
+    // ops callbacks (which receive only this PTO2Runtime*) to recover the segment
+    // with no process-global symbol. Null / unused for the centralized runtime.
+    void *dist_global = nullptr;
+
     // Components
     PTO2SharedMemoryHandle *sm_handle;
     PTO2OrchestratorState orchestrator;
