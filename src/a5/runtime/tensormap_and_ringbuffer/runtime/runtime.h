@@ -152,10 +152,11 @@ struct Task {
  *
  * Adding a field here grows the device image; adding a field to Runtime's
  * host-only tail does not. Keep it standard-layout (static_assert below) so the
- * rtMemcpy is well-defined. alignas(64) makes sizeof a multiple of the cache
- * line so the per-run cache_invalidate_range(runtime, sizeof(dev)) never rounds
- * into a neighbouring line (the leading Handshake is already 64-aligned, but the
- * explicit alignas keeps the property if fields are ever reordered).
+ * rtMemcpy is well-defined. alignas(64) keeps sizeof a multiple of the cache
+ * line so the device-copied image starts and ends on cache-line boundaries and
+ * never shares a line with Runtime's host-only tail (the leading Handshake is
+ * already 64-aligned, but the explicit alignas keeps the property if fields are
+ * ever reordered).
  */
 struct alignas(64) DeviceRuntimeLaunchDesc {
     // Handshake buffers for AICPU-AICore communication
@@ -340,7 +341,7 @@ static_assert(
 );
 static_assert(
     sizeof(DeviceRuntimeLaunchDesc) % 64 == 0,
-    "DeviceRuntimeLaunchDesc size must be a multiple of 64 so cache_invalidate_range(sizeof(dev)) "
+    "DeviceRuntimeLaunchDesc size must be a multiple of 64 so the device-copied image "
     "stays cache-line aligned"
 );
 

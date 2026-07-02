@@ -26,7 +26,7 @@ run-wall `{start, end}` pair used, generalized to `N` pairs.
 | `ConfigValidate` | (inside `GraphBuild`, orch thread) `config_func()` + arg-count validate |
 | `ArenaWire` | (inside `GraphBuild`, orch thread) attach the prebuilt runtime arena + wire device pointers |
 | `SmReset` | (inside `GraphBuild`, orch thread) SM/ring reset + finalize + bind, up to releasing the scheduler threads |
-| `PostOrch` | last-thread teardown (`deinit`: cache-invalidate + scheduler-state reset) after the run completes — stamped only on the thread that finishes last, so it is the real teardown tail, strictly after `sched` |
+| `PostOrch` | last-thread teardown after the run completes — a2a3 deinit invalidates host-DMA/SDMA-published state before reset; a5 resets scheduler state without cache invalidation. Stamped only on the thread that finishes last, so it is the real teardown tail, strictly after `sched`. |
 | `OrchWindow` | orchestrator thread's submit window (the former device-log `orch_start/end`) |
 | `SchedWindow` | scheduler thread's dispatch window (the former device-log `sched_start/end`) |
 

@@ -1,10 +1,12 @@
 # Cache Coherency (GM ↔ AICore/AICPU)
 
 This page is the authoritative reference for **when to insert a cache
-operation** on Ascend onboard hardware. The coherency model is shared
-across the chip generations supported in this repo (a2a3, a5); cycle
-costs and a few code-path examples below are sampled on a2a3 unless
-stated otherwise. Misapplying these rules either leaks stale data
+operation** on Ascend onboard hardware. The coherency model differs
+between chip generations supported in this repo: a2a3 requires AICPU
+cache maintenance for host-DMA and SDMA-published GM, while a5 AICPU
+loads are coherent with DMA/HBM and do not need those invalidates.
+Cycle costs and a few code-path examples below are sampled on a2a3
+unless stated otherwise. Misapplying these rules either leaks stale data
 (correctness bug) or burns a `dsb sy` per record on a hot path (perf
 bug — see PR #863 lineage). Read it before touching any code that
 writes `dc civac`, `dc cvac`, `cache_invalidate_range`, or any `dcci`
@@ -13,15 +15,15 @@ on AICore.
 ## Who shares GM, and with what consistency
 
 GM (HBM) is read and written by four parties on Ascend onboard. Their
-relationship to **AICPU's data cache** is **not symmetric** — that
-asymmetry is the entire reason this page exists.
+relationship to **AICPU's data cache** is **not symmetric** on a2a3,
+and a5 has a stronger DMA/HBM coherency model:
 
-| Writer | AICPU sees write automatically? | AICPU must invalidate before read? |
-| ------ | ------------------------------- | ---------------------------------- |
-| AICPU itself | Yes (own cache) | No |
-| **AICore** (AIC / AIV / MIX) | **Yes** | **No** |
-| Host DMA (`rtMemcpy` from host RAM) | No | **Yes** |
-| SDMA engine (device-side DMA) | No (assumed) | **Yes** (until hardware confirms otherwise) |
+| Writer | a2a3: AICPU sees write automatically? | a2a3: AICPU must invalidate before read? | a5: AICPU must invalidate before read? |
+| ------ | ------------------------------------- | ---------------------------------------- | -------------------------------------- |
+| AICPU itself | Yes (own cache) | No | No |
+| **AICore** (AIC / AIV / MIX) | **Yes** | **No** | **No** |
+| Host DMA (`rtMemcpy` from host RAM) | No | **Yes** | **No** |
+| SDMA engine (device-side DMA) | No (assumed) | **Yes** | **No** |
 
 Likewise, **AICore's own cache is non-coherent with GM** in the other
 direction: AICore-side writes stay in its data cache until explicitly
@@ -37,12 +39,13 @@ and what code lives on each side.
 | Primitive | Side | Purpose | Cost (rough, a2a3 / DAV_3510) |
 | --------- | ---- | ------- | ----------------------------- |
 | `dcci` (`__attribute__((aicore))` intrinsic) | AICore | Push a cache line out to GM (clean+invalidate). Required after AICore stores that AICPU or peer AICore must read. | 1 cache line per call + a following `dsb` to commit ordering. |
-| `cache_invalidate_range(addr, size)` (`src/{a2a3,a5}/platform/onboard/aicpu/cache_ops.cpp`) | AICPU | `dc civac` + `dsb sy` + `isb` over a byte range. Required before AICPU reads GM that **a non-coherent writer** (host DMA, SDMA) most recently published. | `dsb sy` dominates (tens to hundreds of cycles, fixed regardless of range). |
+| `cache_invalidate_range(addr, size)` (`src/a2a3/platform/onboard/aicpu/cache_ops.cpp`) | AICPU | `dc civac` + `dsb sy` + `isb` over a byte range. Required on a2a3 before AICPU reads GM that **a non-coherent writer** (host DMA, SDMA) most recently published. | `dsb sy` dominates (tens to hundreds of cycles, fixed regardless of range). |
 
 `cache_invalidate_range` is the protocol-correct primitive for the
-**host-DMA → AICPU** case. It was introduced in PR #204 specifically
-for `Runtime` struct hand-off where the host writes via `rtMemcpy` and
-AICPU reads. **It is NOT the right primitive for AICore → AICPU.**
+**host-DMA → AICPU** case on a2a3. It was introduced in PR #204
+specifically for `Runtime` struct hand-off where the host writes via
+`rtMemcpy` and AICPU reads. **It is NOT the right primitive for
+AICore → AICPU, and it is not required for a5 DMA/HBM reads.**
 
 ### `dcci` is whole-cache-line: no parallel sub-line writes
 
@@ -124,9 +127,9 @@ is `rmb()` (for load-load ordering against a prior COND read) plus
 making sure the AICore side does `dcci` before signaling. The cache
 invalidate itself is not needed on this path.
 
-## The "host DMA → AICPU" path: AICPU MUST invalidate
+## The "host DMA → AICPU" path: a2a3 MUST invalidate, a5 does not
 
-When the host writes via `rtMemcpy`, the AICPU cache is not snooped.
+On a2a3, when the host writes via `rtMemcpy`, the AICPU cache is not snooped.
 A cached value from a previous round survives the DMA write, so the
 next AICPU load returns stale data. The original PR #204 fix was:
 
@@ -135,18 +138,16 @@ next AICPU load returns stale data. The original PR #204 fix was:
 cache_invalidate_range(runtime, sizeof(Runtime));  // before reading host-written Runtime
 ```
 
-This is **necessary** and must not be removed. It is the
-load-bearing usage of `cache_invalidate_range` in this repo.
+This is **necessary on a2a3** and must not be removed there. It is the
+load-bearing usage of `cache_invalidate_range` in the a2a3 runtime.
 
-Same protocol applies to anything else the host DMAs into a GM region
-that AICPU subsequently reads.
+On a5, host DMA writes to GM are coherent with AICPU reads, so the
+matching runtime hand-off code does not call `cache_invalidate_range`.
 
-## The "SDMA → AICPU" path: treat as non-coherent until proven otherwise
+## The "SDMA → AICPU" path: a2a3 is conservative, a5 is coherent
 
-SDMA is a separate device-side DMA engine. It writes GM but is not
-known to snoop AICPU's data cache. SDMA backend code currently lives
-only under the a2a3 runtime tree, but the principle applies to any
-chip generation that exposes SDMA. Current runtime code (see
+SDMA is a separate device-side DMA engine. On a2a3 it writes GM but is
+not known to snoop AICPU's data cache. Current a2a3 runtime code (see
 `src/a2a3/runtime/tensormap_and_ringbuffer/runtime/backend/sdma/sdma_completion_scheduler.h`
 and the SDMA-engine async-wait completion path in
 `runtime/pto_async_wait.h` / `runtime/scheduler/pto_scheduler.h`)
@@ -154,10 +155,8 @@ and the SDMA-engine async-wait completion path in
 on the conservative assumption that SDMA is not in AICPU's coherency
 domain.
 
-If a hardware confirmation lifts that assumption — i.e. SDMA writes
-become snooped — these invalidates can be removed using the same
-reasoning as the AICore case. Until that confirmation exists, **leave
-them in place**.
+On a5, SDMA writes are coherent with AICPU reads, so the matching a5
+SDMA completion helpers do not invalidate or flush cache lines.
 
 ## Quick decision table
 
@@ -165,12 +164,14 @@ When you are about to insert a cache operation, ask in order:
 
 1. Who actually wrote the bytes I'm reading? Look at the producer
    code, not the address.
-2. Is the producer in the AICPU coherency domain (AICPU itself or
-   AICore)? If yes → no invalidate. If no (host, SDMA) → invalidate.
-3. For AICore writes specifically, does the producer already `dcci`
+2. Is this a5? If yes → no AICPU invalidate/flush for GM reads written
+   by host DMA, SDMA, AICPU, or AICore.
+3. On a2a3, is the producer in the AICPU coherency domain (AICPU itself
+   or AICore)? If yes → no invalidate. If no (host, SDMA) → invalidate.
+4. For AICore writes specifically, does the producer already `dcci`
    before signaling? If not, fix that instead of papering over it
    with an AICPU-side invalidate.
-4. Did I just read a completion flag (COND / mailbox / counter) from
+5. Did I just read a completion flag (COND / mailbox / counter) from
    a different memory type (Device-nGnRE MMIO) before this load? If
    yes, and there is no data/address dependency between that read and
    this one, insert `rmb()` between them — coherency does not imply
@@ -184,8 +185,8 @@ forever once they ship.
 
 ## Related code
 
-- `src/{a2a3,a5}/platform/onboard/aicpu/cache_ops.cpp` — `cache_invalidate_range` implementation (`dc civac` / `dsb sy` / `isb`).
-- `src/{a2a3,a5}/platform/sim/aicpu/cache_ops.cpp` — sim no-op.
+- `src/a2a3/platform/onboard/aicpu/cache_ops.cpp` — `cache_invalidate_range` implementation (`dc civac` / `dsb sy` / `isb`).
+- `src/a2a3/platform/sim/aicpu/cache_ops.cpp` — sim no-op.
 - AICore-side `dcci` usage lives in the L2 swimlane / PMU AICore collectors and any kernel that publishes to a GM slot AICPU reads.
 
 ## Related docs
