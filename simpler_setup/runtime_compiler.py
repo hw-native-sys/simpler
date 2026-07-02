@@ -171,6 +171,11 @@ class RuntimeCompiler:
     def _init_a5(self):
         """Initialize toolchains for real a5 hardware."""
         env_manager.ensure("ASCEND_HOME_PATH")
+        # a5 onboard host_runtime hard-depends on pto-isa headers + CANN-9.0
+        # aclnn syms (cf. src/a5/platform/onboard/host/CMakeLists.txt
+        # SIMPLER_ENABLE_PTO_SDMA_WORKSPACE marker). PTO_ISA_ROOT must be
+        # populated by the caller — same contract as a2a3 onboard.
+        env_manager.ensure("PTO_ISA_ROOT")
 
         # AICore: Bisheng CCE compiler with A5 platform
         ccec = CCECToolchain(platform="a5")
