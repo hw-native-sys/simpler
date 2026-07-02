@@ -73,7 +73,7 @@
 // Matches the upstream/main PTO2_FANIN_INLINE_CAP so workloads that already
 // fit there (qwen3_14b_decode, scalar_data_test, fanin_lookup_perf) keep
 // fitting after the polling-design rewrite.
-#define PTO2_MAX_FANIN 64
+#define PTO2_MAX_FANIN 128
 
 // TensorMap cleanup interval
 #define PTO2_TENSORMAP_CLEANUP_INTERVAL 64  // Cleanup every N retired tasks
@@ -156,7 +156,7 @@ struct PTO2TaskPayload {
     // Parallel array: producer's ring_id for each fanin edge. With multi-ring
     // (PTO2_MAX_RING_DEPTH > 1), the consumer's pending poll must read the
     // producer's ring's completion_flags — same-ring lookup is no longer a
-    // safe shortcut. Sized as bytes to stay cheap (16B for PTO2_MAX_FANIN=16).
+    // safe shortcut. Sized as bytes to stay cheap (PTO2_MAX_FANIN bytes).
     uint8_t fanin_ring_ids[PTO2_MAX_FANIN];
     // === Tensors (Tensor is alignas(64); array is naturally aligned) ===
     Tensor tensors[MAX_TENSOR_ARGS];
