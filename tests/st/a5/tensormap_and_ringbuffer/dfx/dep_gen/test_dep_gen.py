@@ -33,6 +33,7 @@ import json
 import shutil
 import subprocess
 import sys
+import time
 
 import torch
 from simpler.task_interface import ArgDirection as D
@@ -111,28 +112,33 @@ class TestDepGen(SceneTestCase):
         # — the bug that prompted #742. Use the framework helper so the
         # rounds-guard stays consistent with SceneTestCase.test_run (super()
         # already warned, so warn=False here).
+        # Marker taken before the run so _post_validate binds to this
+        # invocation's output dir rather than a stale same-label leftover.
+        run_marker = int(time.time())  # floor to whole seconds: safe if outputs/ ever lands on a coarse-mtime fs
         super().test_run(st_platform, st_worker, request)
         if not self._effective_enable_dep_gen(request):
             return
         for case in self.CASES:
             if st_platform in case.get("platforms", []):
-                self._post_validate(case)
+                self._post_validate(case, run_marker)
 
-    def _post_validate(self, case):
-        """Skips if no per-case output_prefix dir exists (e.g. selector
-        skipped this case at pytest level). When the dir + deps.json are
-        present, assert that deps.json contains the 6 edges documented in
-        example_orchestration.cpp.
+    def _post_validate(self, case, run_marker):
+        """Assert deps.json for this invocation contains the 6 edges documented
+        in example_orchestration.cpp. Reached only with dep_gen effectively on
+        and the case's platform matching, so the run must have produced an
+        output dir; a missing one is a capture regression, not a skip.
         """
         case_name = case["name"]
         safe_label = _sanitize_for_filename(f"TestDepGen_{case_name}")
         outputs = _outputs_dir()
-        matches = sorted(outputs.glob(f"{safe_label}_*"), key=lambda p: p.stat().st_mtime)
-        if not matches:
-            # No output_prefix dir — dep_gen flag wasn't on for this run; nothing
-            # to validate. Don't fail the test (the case itself already passed).
-            return
-        out_dir = matches[-1]
+        # Only dirs created by this run (mtime past the pre-run marker); a stale
+        # leftover must not stand in for a missing current-run output.
+        matches = [p for p in outputs.glob(f"{safe_label}_*") if p.stat().st_mtime >= run_marker]
+        assert matches, (
+            f"--enable-dep-gen is on and case {case_name!r} ran, but no output dir "
+            f"was created this run — capture/replay pipeline regression"
+        )
+        out_dir = max(matches, key=lambda p: p.stat().st_mtime)
 
         # ---- deps.json (host replay output — sole dep_gen artifact on disk) ----
         # We only reach here with --enable-dep-gen on and rounds<=1 (the

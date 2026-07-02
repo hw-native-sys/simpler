@@ -26,6 +26,7 @@ would fire.
 """
 
 import json
+import time
 
 import torch
 from simpler.task_interface import ArgDirection as D
@@ -132,6 +133,9 @@ class TestL2SwimlaneMixed(SceneTestCase):
         args.ws_aiv[_TILE_ELEMS:_WS_ELEMS] = s2_aiv
 
     def test_run(self, st_platform, st_worker, request):
+        # Marker taken before the run so the validators below bind to this
+        # invocation's output dir rather than a stale same-label leftover.
+        run_marker = int(time.time())  # floor to whole seconds: safe if outputs/ ever lands on a coarse-mtime fs
         super().test_run(st_platform, st_worker, request)
         if request.config.getoption("--enable-l2-swimlane", default=False):
             for case in self.CASES:
@@ -140,13 +144,13 @@ class TestL2SwimlaneMixed(SceneTestCase):
                     # the chain produces 3 MIX task_ids × 2 subtask rows = 6
                     # perf rows and 2 deps.json edges, so the dedup branch in
                     # the oracle has an arithmetically observable effect.
-                    validate_perf_artifact(f"TestL2SwimlaneMixed_{case['name']}")
+                    validate_perf_artifact(f"TestL2SwimlaneMixed_{case['name']}", since=run_marker)
         # Full-dump modes give the func_id array its regression barrier on the
         # cooperative-mix path (single-kernel coverage lives in test_args_dump).
         if int(request.config.getoption("--dump-args", default=0)) >= 2:
-            self._validate_dump_func_ids()
+            self._validate_dump_func_ids(run_marker)
 
-    def _validate_dump_func_ids(self):
+    def _validate_dump_func_ids(self, since):
         """#1181: every chained_mix task is a 2-way cooperative MIX (MATMUL
         func 0 + AIV ADD func 1) sharing one 6-tensor payload, so every dumped
         slot must carry the same active-subtask membership ``func_id == [0, 1]``,
@@ -154,10 +158,11 @@ class TestL2SwimlaneMixed(SceneTestCase):
         duplicated per subtask as the pre-#1181 geometry did.
         """
         safe_label = _sanitize_for_filename("TestL2SwimlaneMixed_default")
-        matches = sorted(_outputs_dir().glob(f"{safe_label}_*"), key=lambda p: p.stat().st_mtime)
-        assert matches, "args dump output directory missing"
-        manifest = matches[-1] / "args_dump" / "args_dump.json"
-        assert manifest.exists(), f"args_dump.json missing under {matches[-1]}"
+        matches = [p for p in _outputs_dir().glob(f"{safe_label}_*") if p.stat().st_mtime >= since]
+        assert matches, "no args dump output directory created this run"
+        out_dir = max(matches, key=lambda p: p.stat().st_mtime)
+        manifest = out_dir / "args_dump" / "args_dump.json"
+        assert manifest.exists(), f"args_dump.json missing under {out_dir}"
         with manifest.open() as f:
             data = json.load(f)
         tensors = [t for t in data.get("args", []) if t.get("kind") == "tensor"]

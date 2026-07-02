@@ -20,6 +20,7 @@ use the unified schema, and no legacy args-only manifest is emitted.
 import json
 import subprocess
 import sys
+import time
 
 import torch
 from simpler.task_interface import ArgDirection as D
@@ -99,15 +100,19 @@ class TestArgsDump(SceneTestCase):
         args.f[:] = (args.a + args.b + 1) * (args.a + args.b + 2) + (args.a + args.b)
 
     def test_run(self, st_platform, st_worker, request):
+        # Marker taken before the run so we bind to this invocation's output dir
+        # rather than a stale same-label leftover from a prior run/session.
+        run_marker = int(time.time())  # floor to whole seconds: safe if outputs/ ever lands on a coarse-mtime fs
         super().test_run(st_platform, st_worker, request)
         level = int(request.config.getoption("--dump-args", default=0))
         if not level:
             return
         safe_label = _sanitize_for_filename("TestArgsDump_default")
-        matches = sorted(_outputs_dir().glob(f"{safe_label}_*"), key=lambda p: p.stat().st_mtime)
-        assert matches, "args dump output directory missing"
-        dump_dir = matches[-1] / "args_dump"
-        assert dump_dir.is_dir(), f"args_dump/ missing under {matches[-1]} — dump capture failed?"
+        matches = [p for p in _outputs_dir().glob(f"{safe_label}_*") if p.stat().st_mtime >= run_marker]
+        assert matches, "no args dump output directory created this run"
+        out_dir = max(matches, key=lambda p: p.stat().st_mtime)
+        dump_dir = out_dir / "args_dump"
+        assert dump_dir.is_dir(), f"args_dump/ missing under {out_dir} — dump capture failed?"
         manifest = dump_dir / "args_dump.json"
         assert manifest.exists(), f"args_dump.json missing under {dump_dir} — collector finalize failed?"
         with manifest.open() as f:
