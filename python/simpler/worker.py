@@ -3025,10 +3025,10 @@ class Worker:
                                 callable_kind="CHIP_CALLABLE",
                                 target_namespace="LOCAL_CHIP",
                             ),
-                            chip_log_level,
-                            chip_log_info_v,
-                            str(self._config["platform"]),
-                            str(self._config["runtime"]),
+                            log_level=chip_log_level,
+                            log_info_v=chip_log_info_v,
+                            platform=str(self._config["platform"]),
+                            runtime=str(self._config["runtime"]),
                         )
                         os._exit(0)
                     else:

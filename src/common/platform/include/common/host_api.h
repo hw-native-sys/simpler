@@ -37,6 +37,18 @@ struct HostApi {
     // null on backends that don't wire it; callers must fall back to
     // copy_to_device.
     int (*device_memset)(void *dev_ptr, int value, size_t size);
+    // Runner-scoped retained temporary buffer for TRB device-arg staging.
+    // This is NOT an allocator — it is a single {addr, size} slot that lives
+    // across runs on the DeviceRunner. trb bind reads the slot, and if the
+    // retained buffer is too small for this run's packed temporary size it
+    // device_free's the old one, device_malloc's a bigger one, and writes the
+    // new {addr, size} back. The grow/pack/slice logic lives in trb bind
+    // (runtime_maker); the platform only remembers the slot so it can be reused
+    // next run and freed at finalize. hbg leaves these null and stages tensors
+    // through per-tensor device_malloc. `get` returns {nullptr, 0} when nothing
+    // is retained yet.
+    void (*get_retained_temp_buffer)(void **addr, size_t *size);
+    void (*set_retained_temp_buffer)(void *addr, size_t size);
     // Commit the three per-Worker pooled regions (PTO2 GM heap, PTO2 shared
     // memory, trb prebuilt runtime arena) as three independent device
     // allocations. `runtime_arena_size == 0` skips the third region (hbg
@@ -47,7 +59,7 @@ struct HostApi {
     // memory / prebuilt runtime arena. setup_static_arena must have already
     // committed the relevant region; the returned pointer is owned by the
     // DeviceRunner and freed in `DeviceRunner::finalize()` — do NOT pass it
-    // to device_free or record it in `tensor_pairs_`.
+    // to device_free or record it as an owned tensor lease.
     //
     // acquire_pooled_runtime_arena is trb-only — the runtime-arena region is
     // only committed when setup_static_arena was invoked with

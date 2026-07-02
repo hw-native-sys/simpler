@@ -91,6 +91,49 @@ Two platform implementations exist under `src/platform/`, sharing a common inter
 | `PLATFORM_MAX_AIV_PER_THREAD` | 48 | Max AIV cores per scheduler thread |
 | `PLATFORM_PROF_SYS_CNT_FREQ` | 50 MHz | System counter frequency for profiling |
 
+### 2.4 Host Temporary Buffer
+
+TRB bind normally allocates one device buffer per ordinary non-child tensor
+during host-side argument staging, copies input bytes as needed, records
+copy-back metadata, and frees those temporary buffers during runtime
+validation. TRB replaces those per-run malloc/free pairs with a single
+runner-scoped retained buffer that is reused across runs. This is always on for
+TRB — an internal allocation optimization, not user-facing configuration.
+
+The platform side is deliberately thin: `DeviceRunnerBase` only remembers a
+`{addr, size}` slot across runs, exposed through two HostApi callbacks —
+`get_retained_temp_buffer` and `set_retained_temp_buffer`. It is not an
+allocator; all grow/pack/slice logic lives in `runtime_maker.cpp`
+(`RetainedTempBump`).
+
+On each trb bind, `RetainedTempBump`:
+
+- packs the run's non-child, non-empty tensors to a required size, aligning
+  each slice up to 1024 bytes (TRB kernels require 1024-aligned device
+  pointers, which `device_malloc` already guarantees, so the retained base and
+  every 1024-aligned slice stay aligned without a base fix-up);
+- reads the slot via `get_retained_temp_buffer`; if `required` exceeds the
+  retained size it `device_free`s the old buffer, `device_malloc`s a new one,
+  and writes it back via `set_retained_temp_buffer` (no data preserved across
+  this grow — the buffer is per-run scratch). Smaller later runs keep the
+  larger buffer; the slot only grows;
+- bump-slices each tensor from the retained base at the next 1024-aligned
+  offset. Slices always fit because the buffer was sized from the same
+  tensors; a miss is a caller bug (reported, bind fails). The runtime never
+  falls back to `device_malloc` mid-run.
+
+Slices are recorded as `BufferNoop` leases: per-tensor release is a no-op, and
+the retained buffer is neither freed at end of run nor per run — it lives on
+the runner and is freed once in `finalize`. If the platform leaves the slot
+callbacks null (e.g. a backend without a retained buffer), bind transparently
+falls back to per-tensor `device_malloc` (recorded as `Free` leases, freed in
+validate).
+
+Public device-memory APIs keep their original semantics. `device_malloc_ctx`,
+`device_free_ctx`, `Worker.malloc()`, and `Worker.free()` still allocate and
+free caller-owned device memory directly; the retained buffer only affects
+TRB's internal temporary tensor staging.
+
 ---
 
 ## 3. Shared Memory Layout

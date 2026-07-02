@@ -116,6 +116,21 @@ static int device_memset(void *dev_ptr, int value, size_t size) {
     }
 }
 
+static void get_retained_temp_buffer(void **addr, size_t *size) {
+    try {
+        current_runner()->get_retained_temp_buffer(addr, size);
+    } catch (...) {
+        if (addr != nullptr) *addr = nullptr;
+        if (size != nullptr) *size = 0;
+    }
+}
+
+static void set_retained_temp_buffer(void *addr, size_t size) {
+    try {
+        current_runner()->set_retained_temp_buffer(addr, size);
+    } catch (...) {}
+}
+
 static uint64_t upload_chip_callable_buffer_wrapper(const void *callable) {
     try {
         return current_runner()->upload_chip_callable_buffer(static_cast<const ChipCallable *>(callable));
@@ -183,7 +198,7 @@ static void mark_prebuilt_runtime_arena_cached_wrapper(
 // The HostApi is a set of context-free function pointers: each wrapper above
 // recovers its runner from the thread-local current_runner(), so a single
 // filled table is valid for every runner and every run. Build it once at load
-// time rather than reassembling the 12 pointers on each simpler_run. Passed by
+// time rather than reassembling the pointer table on each simpler_run. Passed by
 // address into bind_callable_to_runtime_impl / validate_runtime_impl.
 static const HostApi g_host_api = {
     .device_malloc = device_malloc,
@@ -191,6 +206,8 @@ static const HostApi g_host_api = {
     .copy_to_device = copy_to_device,
     .copy_from_device = copy_from_device,
     .device_memset = device_memset,
+    .get_retained_temp_buffer = get_retained_temp_buffer,
+    .set_retained_temp_buffer = set_retained_temp_buffer,
     .setup_static_arena = setup_static_arena_wrapper,
     .acquire_pooled_gm_heap = acquire_pooled_gm_heap_wrapper,
     .acquire_pooled_gm_sm = acquire_pooled_gm_sm_wrapper,

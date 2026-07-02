@@ -265,6 +265,24 @@ int SimDeviceRunnerBase::device_memset(void *dev_ptr, int value, size_t bytes) {
     return 0;
 }
 
+void SimDeviceRunnerBase::get_retained_temp_buffer(void **addr, size_t *size) {
+    if (addr != nullptr) *addr = retained_temp_addr_;
+    if (size != nullptr) *size = retained_temp_size_;
+}
+
+void SimDeviceRunnerBase::set_retained_temp_buffer(void *addr, size_t size) {
+    retained_temp_addr_ = addr;
+    retained_temp_size_ = size;
+}
+
+void SimDeviceRunnerBase::clear_temporary_buffer() {
+    if (retained_temp_addr_ != nullptr) {
+        mem_alloc_.free(retained_temp_addr_);
+        retained_temp_addr_ = nullptr;
+        retained_temp_size_ = 0;
+    }
+}
+
 int SimDeviceRunnerBase::l3_l2_orch_comm_init(void *control_block, size_t control_block_size) {
     return l3_l2_orch_comm_service_.start(this, control_block, control_block_size);
 }

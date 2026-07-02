@@ -97,6 +97,9 @@ public:
     int copy_to_device(void *dev_ptr, const void *host_ptr, size_t bytes);
     int copy_from_device(void *host_ptr, const void *dev_ptr, size_t bytes);
     int device_memset(void *dev_ptr, int value, size_t bytes);
+    void get_retained_temp_buffer(void **addr, size_t *size);
+    void set_retained_temp_buffer(void *addr, size_t size);
+    void clear_temporary_buffer();
 
     int l3_l2_orch_comm_init(void *control_block, size_t control_block_size);
     int l3_l2_orch_comm_shutdown();
@@ -202,6 +205,8 @@ protected:
     std::vector<uint8_t> aicore_kernel_binary_;
 
     MemoryAllocator mem_alloc_;
+    void *retained_temp_addr_ = nullptr;
+    size_t retained_temp_size_ = 0;
 
     // Three independent per-Worker arenas, each backing a single pooled
     // region (PTO2 GM heap / PTO2 shared memory / trb prebuilt runtime

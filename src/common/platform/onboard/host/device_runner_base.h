@@ -93,6 +93,9 @@ public:
     int copy_to_device(void *dev_ptr, const void *host_ptr, std::size_t bytes);
     int copy_from_device(void *host_ptr, const void *dev_ptr, std::size_t bytes);
     int device_memset(void *dev_ptr, int value, std::size_t bytes);
+    void get_retained_temp_buffer(void **addr, std::size_t *size);
+    void set_retained_temp_buffer(void *addr, std::size_t size);
+    void clear_temporary_buffer();
     int l3_l2_orch_comm_init(void *control_block, size_t control_block_size);
     int l3_l2_orch_comm_shutdown();
 
@@ -825,6 +828,11 @@ protected:
     host::LoadAicpuOp load_aicpu_op_;
 
     MemoryAllocator mem_alloc_;
+    // Retained temporary buffer slot for TRB device-arg staging (see HostApi
+    // get/set_retained_temp_buffer). Just a remembered {addr, size} reused
+    // across runs and freed in finalize; the grow/pack logic lives in trb bind.
+    void *retained_temp_addr_ = nullptr;
+    std::size_t retained_temp_size_ = 0;
     DeviceArena gm_heap_arena_;
     DeviceArena gm_sm_arena_;
     DeviceArena runtime_arena_pool_;

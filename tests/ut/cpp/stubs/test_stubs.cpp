@@ -106,9 +106,9 @@ volatile uint32_t *get_reg_ptr(uint64_t /* reg_base_addr */, RegId /* reg */) {
 // and only present in the production host_runtime.so. These runner-only unit
 // tests link device_runner_base.cpp without any runtime_maker, and their mock
 // runners never bind (TestSimRunner::run returns 0), so the impl is never
-// invoked — it only has to resolve at link time. C linkage matches by symbol
-// name, so this opaque-pointer signature satisfies the reference.
-extern "C" int bind_callable_to_runtime_impl(
+// invoked — it only has to resolve at link time. Keep it weak so tests that
+// link a real runtime_maker.cpp use the real bind implementation instead.
+extern "C" __attribute__((weak)) int bind_callable_to_runtime_impl(
     void * /* runtime */, const void * /* api */, const void * /* orch_args */, void * /* host_orch_func_ptr */,
     const void * /* signature */, int /* sig_count */, const uint64_t * /* ring_task_window */,
     const uint64_t * /* ring_heap */, const uint64_t * /* ring_dep_pool */

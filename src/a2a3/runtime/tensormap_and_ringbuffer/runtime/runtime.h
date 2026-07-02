@@ -103,11 +103,16 @@ struct Handshake {
     volatile uint32_t aicore_regs_ready;  // AICore ID reported: 0=pending, 1=done
 } __attribute__((aligned(64)));
 
+enum class TensorReleaseKind {
+    Free,
+    BufferNoop,
+    ExternalNoop,
+};
+
 /**
- * Tensor pair for tracking host-device memory mappings.
- * Used for copy-back during finalize.
+ * Tensor lease for tracking host-device memory mappings and release ownership.
  */
-struct TensorPair {
+struct TensorLease {
     void *host_ptr;
     void *dev_ptr;
     size_t size;
@@ -115,6 +120,7 @@ struct TensorPair {
     // so the end-of-run D2H copy-back is skipped. OUTPUT/INOUT/unknown
     // keep the safe default of copying back.
     bool needs_copy_back = true;
+    TensorReleaseKind release_kind = TensorReleaseKind::Free;
 };
 
 /**
@@ -301,7 +307,7 @@ public:
     // Host-side tensor ledger for D2H copy-back at finalize. Populated by
     // runtime_maker.cpp from orch_args at bind time, then iterated in
     // validate_runtime_impl. Host-only (after `dev`): never uploaded.
-    std::vector<TensorPair> tensor_pairs_;
+    std::vector<TensorLease> tensor_leases_;
 };
 
 // `dev` must be the first member so the narrowed H2D copy starts at offset 0.

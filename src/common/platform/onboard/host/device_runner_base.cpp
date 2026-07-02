@@ -142,6 +142,24 @@ int DeviceRunnerBase::device_memset(void *dev_ptr, int value, std::size_t bytes)
     return aclrtMemset(dev_ptr, bytes, value, bytes);
 }
 
+void DeviceRunnerBase::get_retained_temp_buffer(void **addr, size_t *size) {
+    if (addr != nullptr) *addr = retained_temp_addr_;
+    if (size != nullptr) *size = retained_temp_size_;
+}
+
+void DeviceRunnerBase::set_retained_temp_buffer(void *addr, size_t size) {
+    retained_temp_addr_ = addr;
+    retained_temp_size_ = size;
+}
+
+void DeviceRunnerBase::clear_temporary_buffer() {
+    if (retained_temp_addr_ != nullptr) {
+        mem_alloc_.free(retained_temp_addr_);
+        retained_temp_addr_ = nullptr;
+        retained_temp_size_ = 0;
+    }
+}
+
 int DeviceRunnerBase::l3_l2_orch_comm_init(void *control_block, size_t control_block_size) {
     if (!l3_l2_orch_comm_supported()) {
         return PTO_RUNTIME_ERR_UNSUPPORTED;
@@ -1066,6 +1084,8 @@ int DeviceRunnerBase::finalize_common() {
     prebuilt_runtime_arena_cache_sm_base_ = nullptr;
     prebuilt_runtime_arena_cache_runtime_arena_base_ = nullptr;
     prebuilt_runtime_arena_cache_image_.clear();
+
+    clear_temporary_buffer();
 
     // Free the 8-byte device_wall buffer (allocated lazily in run()) while
     // mem_alloc_ and the device context are still live. free_tensor() routes

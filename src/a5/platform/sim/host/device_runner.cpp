@@ -656,6 +656,7 @@ int DeviceRunner::finalize() {
     gm_heap_arena_.release();
     gm_sm_arena_.release();
     runtime_arena_pool_.release();
+    clear_temporary_buffer();
     cached_gm_heap_size_ = 0;
     cached_gm_sm_size_ = 0;
     cached_runtime_arena_size_ = 0;
