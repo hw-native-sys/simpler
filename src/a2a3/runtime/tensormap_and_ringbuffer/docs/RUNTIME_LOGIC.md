@@ -538,7 +538,7 @@ This is protected by a per-ring try-lock (`advance_lock`) in `RingSchedState`, e
 
 ### 8.5 SchedulerContext
 
-All scheduler-side state and methods live in `SchedulerContext` (`runtime/scheduler/scheduler_context.h`). It is held as a `sched_ctx_` member of `AicpuExecutor`; `AicpuExecutor` is a thin wrapper that owns the lifecycle atomics and the orchestration SO handle, and delegates everything else to `SchedulerContext`.
+All scheduler-side state and methods live in `SchedulerContext` (`runtime/scheduler_context.h`). It is held as a `sched_ctx_` member of `AicpuExecutor`; `AicpuExecutor` is a thin wrapper that owns the lifecycle atomics and the orchestration SO handle, and delegates everything else to `SchedulerContext`.
 
 Public surface (called from `AicpuExecutor::init/run/deinit`):
 
@@ -552,11 +552,7 @@ Public surface (called from `AicpuExecutor::init/run/deinit`):
 | `deinit()` | once per run | Reset every scheduler-owned field to its post-construction default |
 | Read-only accessors | various | `aic_count()` / `aiv_count()` / `is_completed()` / `completed_tasks_count()` |
 
-Private internals are split across three .cpp files by responsibility:
-
-- `scheduler_completion.cpp` — completion polling, drain protocol
-- `scheduler_dispatch.cpp` — task dispatch loop and helpers
-- `scheduler_cold_path.cpp` — exit checks, stall diagnostics, profiling, lifecycle (`init/deinit`), core management (`handshake_all_cores` / `assign_cores_to_threads` / `emergency_shutdown`), and `on_orchestration_done`
+Private internals all live inline in `scheduler_context.h`, covering completion polling, drain protocol, task dispatch loop and helpers, exit checks, stall diagnostics, profiling, lifecycle (`init/deinit`), core management (`handshake_all_cores` / `assign_cores_to_threads` / `reassign_cores_for_all_threads` / `emergency_shutdown`), and `on_orchestration_done`.
 
 `AicpuExecutor` calls neither `handshake_*`, `assign_*`, `reassign_*`, nor `emergency_shutdown` directly — they are private, invoked only by `init` and `on_orchestration_done`.
 

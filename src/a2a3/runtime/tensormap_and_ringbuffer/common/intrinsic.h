@@ -63,7 +63,7 @@
  *     compiled, ran without error, and produced wrong output. Use
  *     `get_sub_block_id(args)` instead, which reads from the runtime's
  *     `GlobalContext.sub_block_id` that the scheduler initializes per
- *     AIV core in `scheduler_cold_path.cpp::SchedulerContext::init`.
+ *     AIV core in `scheduler_context.h::SchedulerContext::init`.
  *
  *   - `get_block_idx()` and `get_block_num()` are not redirected to
  *     simpler's LocalContext either — use the `(args)` variants below
@@ -97,7 +97,7 @@ static constexpr int32_t PTO2_EXT_PARAMS_COUNT = 2;
 
 /**
  * Args[] suffix indices for context pointers.
- * Derived from MAX_TENSOR_ARGS(32) + MAX_SCALAR_ARGS(16).
+ * Derived from MAX_TENSOR_ARGS(16) + MAX_SCALAR_ARGS(32).
  * Users should not depend on these values; use the Get* functions below.
  */
 static constexpr int32_t SPMD_LOCAL_CONTEXT_INDEX = 48;
