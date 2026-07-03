@@ -1298,39 +1298,57 @@ AICORE inline void RunPtoPagedAttentionVecPipelineSplitKV(__gm__ uint8_t *oGm, _
         const int32_t kvLoop = (kvSeqLenAlign + ctx.kvSplitPerCore - 1) / ctx.kvSplitPerCore;
         const uint64_t lBase = LoadTilingOffset64(tilingParaGm, paraBase, 11, 12);
         const uint64_t oFdBase = LoadTilingOffset64(tilingParaGm, paraBase, 15, 16);
-        __ubuf__ float *splitScale = reinterpret_cast<__ubuf__ float *>((uintptr_t)0x3200);
-        __ubuf__ float *splitReduce = reinterpret_cast<__ubuf__ float *>((uintptr_t)0x3400);
         const uint64_t lOffset = lBase + static_cast<uint64_t>(head) * ctx.kvSplitCoreNum;
         const uint32_t lRemain = static_cast<uint32_t>(kvLoop % 8);
+        // kMaxKvLoop caps the softmax-of-splits combine at one vector register's
+        // width (matches PtoPaSetFloatVectorMask's kFloatVectorSize and the
+        // hardcoded rptTimes=1 the raw vcmax/vadds/vexp/vcadd/vmuls calls used
+        // previously) -- not a new limitation, kvLoop was already implicitly
+        // capped there.
+        constexpr int32_t kMaxKvLoop = 64;
+        using VecFloatKvDyn = Tile<TileType::Vec, float, 1, kMaxKvLoop, BLayout::RowMajor, 1, DYNAMIC>;
+        // Cols must be a multiple of 8 floats (32-byte aligned); only index
+        // [0] is used, matching the VecFloat8 scalar-result convention used
+        // elsewhere in this file (rowMaxTile/rowSumTile/scalarMathTile).
+        using VecFloatKvScalar = Tile<TileType::Vec, float, 1, 8, BLayout::RowMajor, 1, 8>;
+        VecFloatKvDyn splitScaleTile;
+        VecFloatKvDyn splitWorkTile;
+        VecFloatKvScalar splitReduceTile;
+        TASSIGN(splitScaleTile, 0x3200);
+        TASSIGN(splitWorkTile, 0x3300);
+        TASSIGN(splitReduceTile, 0x3400);
+        __ubuf__ float *splitScale = reinterpret_cast<__ubuf__ float *>((uintptr_t)0x3200);
         copy_gm_to_ubuf_align_b32(splitScale, partialL + lOffset, 0, 1, static_cast<uint32_t>(kvLoop * 4), 0,
             lRemain == 0 ? 0 : 8 - lRemain, 0, 0);
         set_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
         wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
-        PtoPaSetFloatVectorMask(static_cast<uint32_t>(kvLoop));
-        vcmax(splitReduce, splitScale, 1, 1, 1, 8, static_cast<Order_t>(ONLY_VALUE));
+        set_flag(PIPE_V, PIPE_S, EVENT_ID3);
+        wait_flag(PIPE_V, PIPE_S, EVENT_ID3);
+        splitScaleTile.SetValidCol(static_cast<unsigned>(kvLoop));
+        splitWorkTile.SetValidCol(static_cast<unsigned>(kvLoop));
+        set_flag(PIPE_S, PIPE_V, EVENT_ID2);
+        wait_flag(PIPE_S, PIPE_V, EVENT_ID2);
+        TROWMAX(splitReduceTile, splitScaleTile, splitWorkTile);
         pipe_barrier(PIPE_V);
         set_flag(PIPE_V, PIPE_S, EVENT_ID3);
         wait_flag(PIPE_V, PIPE_S, EVENT_ID3);
-        const float lMax = splitReduce[0];
+        const float lMax = splitReduceTile.data()[0];
         set_flag(PIPE_S, PIPE_V, EVENT_ID2);
         wait_flag(PIPE_S, PIPE_V, EVENT_ID2);
-        vadds(splitScale, splitScale, -lMax, 1, 1, 1, 8, 8);
+        TSUBS(splitScaleTile, splitScaleTile, lMax);
         pipe_barrier(PIPE_V);
-        vexp(splitScale, splitScale, 1, 1, 1, 8, 8);
+        TEXP(splitScaleTile, splitScaleTile);
         pipe_barrier(PIPE_V);
-        vcadd(splitReduce, splitScale, 1, 1, 1, 8, 0);
+        TROWSUM(splitReduceTile, splitScaleTile, splitWorkTile);
         pipe_barrier(PIPE_V);
-        set_vector_mask(static_cast<uint64_t>(-1), static_cast<uint64_t>(-1));
         set_flag(PIPE_V, PIPE_S, EVENT_ID3);
         wait_flag(PIPE_V, PIPE_S, EVENT_ID3);
-        const float denom = splitReduce[0];
+        const float denom = splitReduceTile.data()[0];
         set_flag(PIPE_S, PIPE_V, EVENT_ID2);
         wait_flag(PIPE_S, PIPE_V, EVENT_ID2);
-        float invDenom = denom > 0.0f ? 1.0f / denom : 0.0f;
-        PtoPaSetFloatVectorMask(static_cast<uint32_t>(kvLoop));
-        vmuls(splitScale, splitScale, static_cast<float>(invDenom), 1, 1, 1, 8, 8);
+        const float invDenom = denom > 0.0f ? 1.0f / denom : 0.0f;
+        TMULS(splitScaleTile, splitScaleTile, invDenom);
         pipe_barrier(PIPE_V);
-        set_vector_mask(static_cast<uint64_t>(-1), static_cast<uint64_t>(-1));
         TASSIGN(weightedTile, 0x0000);
         TEXPANDS(weightedTile, 0.0f);
         pipe_barrier(PIPE_V);
@@ -1346,7 +1364,7 @@ AICORE inline void RunPtoPagedAttentionVecPipelineSplitKV(__gm__ uint8_t *oGm, _
             TASSIGN(pvTile, kCombineOutUb + static_cast<uint32_t>(split) * kHeadDim * sizeof(float));
             set_flag(PIPE_V, PIPE_S, EVENT_ID3);
             wait_flag(PIPE_V, PIPE_S, EVENT_ID3);
-            const float splitWeight = splitScale[split];
+            const float splitWeight = splitScaleTile.data()[split];
             set_flag(PIPE_S, PIPE_V, EVENT_ID2);
             wait_flag(PIPE_S, PIPE_V, EVENT_ID2);
             TMULS(pvTile, pvTile, splitWeight);
