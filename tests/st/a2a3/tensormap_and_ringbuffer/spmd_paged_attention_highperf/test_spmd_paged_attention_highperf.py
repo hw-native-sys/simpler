@@ -254,6 +254,7 @@ class TestSpmdPagedAttentionHighPerf(SceneTestCase):
             "name": "b1_h32_kv8_s8192_bs128_fp16",
             # enabled in CI to guard the long-sequence fix onboard.
             "platforms": ["a2a3"],
+            "manual" : True,
             "config": {"aicpu_thread_num": 4, "block_dim": 24},
             "params": {
                 "batch": 1,

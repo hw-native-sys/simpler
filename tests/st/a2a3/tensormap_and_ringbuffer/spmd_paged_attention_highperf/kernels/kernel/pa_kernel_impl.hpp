@@ -45,30 +45,25 @@ constexpr int32_t TILING_HEADDIM_V = 29;
 constexpr int32_t kParaKvSeqLen = 1;
 constexpr int32_t kParaBatchIndex = 13;
 
-AICORE inline int32_t LoadTilingI32(__gm__ uint8_t *tiling, int32_t index)
-{
+AICORE inline int32_t LoadTilingI32(__gm__ uint8_t *tiling, int32_t index) {
     return *(reinterpret_cast<__gm__ int32_t *>(tiling) + index);
 }
 
-AICORE inline int32_t LoadBlockTable(__gm__ uint8_t *blockTablesGm, int64_t offset)
-{
+AICORE inline int32_t LoadBlockTable(__gm__ uint8_t *blockTablesGm, int64_t offset) {
     return *(reinterpret_cast<__gm__ int32_t *>(blockTablesGm) + offset);
 }
 
-AICORE inline float LoadFp16(__gm__ uint8_t *gm, int64_t offset)
-{
+AICORE inline float LoadFp16(__gm__ uint8_t *gm, int64_t offset) {
     __gm__ half *ptr = reinterpret_cast<__gm__ half *>(gm);
     return static_cast<float>(ptr[offset]);
 }
 
-AICORE inline void StoreOutputFp16(__gm__ uint8_t *oGm, int64_t offset, float value)
-{
+AICORE inline void StoreOutputFp16(__gm__ uint8_t *oGm, int64_t offset, float value) {
     __gm__ half *out = reinterpret_cast<__gm__ half *>(oGm);
     out[offset] = static_cast<half>(value);
 }
 
-AICORE inline float LoadScale(__gm__ uint8_t *tiling)
-{
+AICORE inline float LoadScale(__gm__ uint8_t *tiling) {
     union {
         int32_t i;
         float f;
@@ -103,8 +98,7 @@ struct PaTilingContext {
     float scale;
 };
 
-AICORE inline PaTilingContext LoadPaTilingContext(__gm__ uint8_t *tiling)
-{
+AICORE inline PaTilingContext LoadPaTilingContext(__gm__ uint8_t *tiling) {
     PaTilingContext ctx{};
     ctx.batch = LoadTilingI32(tiling, TILING_BATCH);
     ctx.decoderBatch = LoadTilingI32(tiling, TILING_DECODER_BS);
@@ -133,8 +127,7 @@ AICORE inline PaTilingContext LoadPaTilingContext(__gm__ uint8_t *tiling)
 }
 
 template <typename ScalarTile>
-AICORE inline float PtoExpScalar(ScalarTile &tile, float value)
-{
+AICORE inline float PtoExpScalar(ScalarTile &tile, float value) {
     tile.data()[0] = value;
     set_flag(PIPE_S, PIPE_V, EVENT_ID2);
     wait_flag(PIPE_S, PIPE_V, EVENT_ID2);
@@ -146,8 +139,7 @@ AICORE inline float PtoExpScalar(ScalarTile &tile, float value)
 }
 
 template <typename ScalarTile>
-AICORE inline float PtoLogScalar(ScalarTile &tile, float value)
-{
+AICORE inline float PtoLogScalar(ScalarTile &tile, float value) {
     if (value <= 0.0f) {
         return -3.4028234663852886e38f;
     }
@@ -162,58 +154,36 @@ AICORE inline float PtoLogScalar(ScalarTile &tile, float value)
 }
 
 AICORE inline float LoadPagedKByBlock(
-    __gm__ uint8_t *kGm,
-    int32_t blockId,
-    int32_t offsetInBlock,
-    int32_t blockSize,
-    int32_t kvHeads,
-    int32_t kvHead,
-    int32_t headDim,
-    int32_t dim)
-{
-    const int64_t offset = (((static_cast<int64_t>(blockId) * blockSize + offsetInBlock) * kvHeads + kvHead) * headDim + dim);
+    __gm__ uint8_t *kGm, int32_t blockId, int32_t offsetInBlock, int32_t blockSize, int32_t kvHeads, int32_t kvHead,
+    int32_t headDim, int32_t dim
+) {
+    const int64_t offset =
+        (((static_cast<int64_t>(blockId) * blockSize + offsetInBlock) * kvHeads + kvHead) * headDim + dim);
     return LoadFp16(kGm, offset);
 }
 
 AICORE inline float LoadPagedVByBlock(
-    __gm__ uint8_t *vGm,
-    int32_t blockId,
-    int32_t offsetInBlock,
-    int32_t blockSize,
-    int32_t kvHeads,
-    int32_t kvHead,
-    int32_t headDim,
-    int32_t dim)
-{
-    const int64_t offset = (((static_cast<int64_t>(blockId) * blockSize + offsetInBlock) * kvHeads + kvHead) * headDim + dim);
+    __gm__ uint8_t *vGm, int32_t blockId, int32_t offsetInBlock, int32_t blockSize, int32_t kvHeads, int32_t kvHead,
+    int32_t headDim, int32_t dim
+) {
+    const int64_t offset =
+        (((static_cast<int64_t>(blockId) * blockSize + offsetInBlock) * kvHeads + kvHead) * headDim + dim);
     return LoadFp16(vGm, offset);
 }
 
 AICORE inline void ResolvePagedPosition(
-    __gm__ uint8_t *blockTablesGm,
-    int32_t batchIndex,
-    int32_t maxBlocksPerQuery,
-    int32_t pos,
-    int32_t blockSize,
-    int32_t &blockId,
-    int32_t &offsetInBlock)
-{
+    __gm__ uint8_t *blockTablesGm, int32_t batchIndex, int32_t maxBlocksPerQuery, int32_t pos, int32_t blockSize,
+    int32_t &blockId, int32_t &offsetInBlock
+) {
     const int32_t tableCol = pos / blockSize;
     offsetInBlock = pos - tableCol * blockSize;
     blockId = LoadBlockTable(blockTablesGm, static_cast<int64_t>(batchIndex) * maxBlocksPerQuery + tableCol);
 }
 
 AICORE inline float ComputeScoreByBlock(
-    const float *qValues,
-    __gm__ uint8_t *kGm,
-    int32_t blockId,
-    int32_t offsetInBlock,
-    int32_t blockSize,
-    int32_t kvHead,
-    int32_t headDim,
-    int32_t kvHeads,
-    float scale)
-{
+    const float *qValues, __gm__ uint8_t *kGm, int32_t blockId, int32_t offsetInBlock, int32_t blockSize,
+    int32_t kvHead, int32_t headDim, int32_t kvHeads, float scale
+) {
     float score = 0.0f;
     for (int32_t dim = 0; dim < headDim; ++dim) {
         const float k = LoadPagedKByBlock(kGm, blockId, offsetInBlock, blockSize, kvHeads, kvHead, headDim, dim);
@@ -221,8 +191,6 @@ AICORE inline float ComputeScoreByBlock(
     }
     return score * scale;
 }
-
-
 
 constexpr int32_t PA_TILE_TOKENS = 128;
 constexpr uint8_t PA_QK_FIFO_FLAG = 0;
@@ -237,36 +205,28 @@ constexpr uint8_t PTO_PA_RAW_P_FREE = 6;
 constexpr uint8_t PTO_PA_RAW_PV_READY = 8;
 constexpr uint8_t PTO_PA_RAW_PV_FREE = 10;
 
-AICORE inline uint8_t PtoPaSlotFlag(uint8_t baseFlag, uint8_t slot)
-{
-    return static_cast<uint8_t>(baseFlag + slot);
-}
+AICORE inline uint8_t PtoPaSlotFlag(uint8_t baseFlag, uint8_t slot) { return static_cast<uint8_t>(baseFlag + slot); }
 
-AICORE inline uint16_t PtoPaGetFftsMsg(uint16_t mode, uint16_t eventId, uint16_t baseConst = 0x1)
-{
+AICORE inline uint16_t PtoPaGetFftsMsg(uint16_t mode, uint16_t eventId, uint16_t baseConst = 0x1) {
     return ((baseConst & 0xf) + ((mode & 0x3) << 4) + ((eventId & 0xf) << 8));
 }
 
-AICORE inline void PtoPaSignalFromCube(uint8_t flagId)
-{
+AICORE inline void PtoPaSignalFromCube(uint8_t flagId) {
     pipe_barrier(PIPE_ALL);
     ffts_cross_core_sync(PIPE_FIX, PtoPaGetFftsMsg(0x2, flagId));
 }
 
-AICORE inline void PtoPaSignalFromVec(uint8_t flagId)
-{
+AICORE inline void PtoPaSignalFromVec(uint8_t flagId) {
     pipe_barrier(PIPE_ALL);
     ffts_cross_core_sync(PIPE_MTE3, PtoPaGetFftsMsg(0x2, flagId));
 }
 
-AICORE inline void PtoPaSignalFreeFromVec(uint8_t flagId)
-{
+AICORE inline void PtoPaSignalFreeFromVec(uint8_t flagId) {
     pipe_barrier(PIPE_ALL);
     ffts_cross_core_sync(PIPE_MTE3, PtoPaGetFftsMsg(0x2, flagId));
 }
 
-AICORE inline void PtoPaSignalFreeFromCube(uint8_t flagId)
-{
+AICORE inline void PtoPaSignalFreeFromCube(uint8_t flagId) {
     pipe_barrier(PIPE_ALL);
     ffts_cross_core_sync(PIPE_FIX, PtoPaGetFftsMsg(0x2, flagId));
 }
@@ -276,16 +236,14 @@ AICORE inline void PtoPaSignalFreeFromCube(uint8_t flagId)
 // +13, re-derive the para base, then read the real batch at +8. See pa_kernel.cce:523-525.
 constexpr int32_t kParaRealBatchIndex = 8;
 
-AICORE inline int32_t ResolveSortedParaBase(__gm__ uint8_t *tiling, const PaTilingContext &ctx, int32_t batchSlot)
-{
+AICORE inline int32_t ResolveSortedParaBase(__gm__ uint8_t *tiling, const PaTilingContext &ctx, int32_t batchSlot) {
     const int32_t paraBase = ctx.headSize + batchSlot * ctx.paraSize;
     const int32_t sortedBatch = LoadTilingI32(tiling, paraBase + kParaBatchIndex);
     return ctx.headSize + sortedBatch * ctx.paraSize;
 }
 
 // One-time sticky SPR setup mirroring the CCE reference SetArgs (pa_kernel.cce:441-444).
-AICORE inline void PtoPaInitCoreState()
-{
+AICORE inline void PtoPaInitCoreState() {
 #if defined(__DAV_C220_CUBE__)
     set_padding(0);
     set_nd_para(1ULL);
@@ -294,8 +252,7 @@ AICORE inline void PtoPaInitCoreState()
     set_mask_norm();
 }
 
-AICORE inline bool SupportsPtoPagedAttentionHighPerf(__gm__ uint8_t *tilingParaGm)
-{
+AICORE inline bool SupportsPtoPagedAttentionHighPerf(__gm__ uint8_t *tilingParaGm) {
     const PaTilingContext ctx = LoadPaTilingContext(tilingParaGm);
     if (ctx.headDim != PA_TILE_TOKENS || ctx.headDimV != PA_TILE_TOKENS || ctx.blockSize != PA_TILE_TOKENS) {
         return false;
@@ -309,8 +266,7 @@ AICORE inline bool SupportsPtoPagedAttentionHighPerf(__gm__ uint8_t *tilingParaG
     return true;
 }
 
-AICORE inline bool SupportsPtoPagedAttentionRawSplitKV(__gm__ uint8_t *tilingParaGm)
-{
+AICORE inline bool SupportsPtoPagedAttentionRawSplitKV(__gm__ uint8_t *tilingParaGm) {
     const PaTilingContext ctx = LoadPaTilingContext(tilingParaGm);
     if (ctx.headDim != PA_TILE_TOKENS || ctx.headDimV != PA_TILE_TOKENS || ctx.blockSize != PA_TILE_TOKENS) {
         return false;
@@ -329,8 +285,7 @@ AICORE inline bool SupportsPtoPagedAttentionRawSplitKV(__gm__ uint8_t *tilingPar
     return ctx.kvSplitPerCore <= 8192;
 }
 
-AICORE inline void DdrBarrierBeforePtoFfts()
-{
+AICORE inline void DdrBarrierBeforePtoFfts() {
 #if defined(__CPU_SIM)
     dsb(0);
 #else
@@ -339,8 +294,7 @@ AICORE inline void DdrBarrierBeforePtoFfts()
     pipe_barrier(PIPE_ALL);
 }
 
-AICORE inline void DdrFenceBeforePtoAivReduce()
-{
+AICORE inline void DdrFenceBeforePtoAivReduce() {
 #if defined(__CPU_SIM)
     dsb(0);
 #else
@@ -348,8 +302,7 @@ AICORE inline void DdrFenceBeforePtoAivReduce()
 #endif
 }
 
-AICORE inline void PtoPaSetFloatVectorMask(uint32_t len)
-{
+AICORE inline void PtoPaSetFloatVectorMask(uint32_t len) {
     set_mask_norm();
     constexpr uint32_t kFloatVectorSize = 64;
     if (len >= kFloatVectorSize) {
@@ -363,33 +316,30 @@ AICORE inline void PtoPaSetFloatVectorMask(uint32_t len)
     set_vector_mask(0, mask);
 }
 
-AICORE inline void PtoPaStageSync()
-{
-    SYNCALL<SyncCoreType::Mix>();
-}
+AICORE inline void PtoPaStageSync() { SYNCALL<SyncCoreType::Mix>(); }
 
 #ifdef __DAV_C220_VEC__
 template <typename DstTileData, typename SrcTileData>
-__tf__ AICORE void PtoPaConvF32ToF16Raw(typename DstTileData::TileDType __out__ dst,
-    typename SrcTileData::TileDType __in__ src, uint8_t repeat)
-{
+__tf__ AICORE void PtoPaConvF32ToF16Raw(
+    typename DstTileData::TileDType __out__ dst, typename SrcTileData::TileDType __in__ src, uint8_t repeat
+) {
     __ubuf__ half *dstAddr = reinterpret_cast<__ubuf__ half *>(__cce_get_tile_ptr(dst));
     __ubuf__ float *srcAddr = reinterpret_cast<__ubuf__ float *>(__cce_get_tile_ptr(src));
     vconv_f322f16(dstAddr, srcAddr, repeat, 1, 1, 4, 8);
 }
 
 template <typename DstTileData, typename SrcTileData>
-AICORE inline void PtoPaConvF32ToF16(DstTileData &dst, SrcTileData &src, uint8_t repeat)
-{
+AICORE inline void PtoPaConvF32ToF16(DstTileData &dst, SrcTileData &src, uint8_t repeat) {
     PtoPaConvF32ToF16Raw<DstTileData, SrcTileData>(dst.data(), src.data(), repeat);
 }
 #endif
 
 #ifdef __DAV_C220_CUBE__
 template <typename DstTileData, typename SrcTileData>
-__tf__ AICORE void PtoPaLoadNzHeadGroupToCaRaw(typename DstTileData::TileDType __out__ dst,
-    typename SrcTileData::TileDType __in__ src, uint32_t headGroupBase, uint16_t repeatTimes)
-{
+__tf__ AICORE void PtoPaLoadNzHeadGroupToCaRaw(
+    typename DstTileData::TileDType __out__ dst, typename SrcTileData::TileDType __in__ src, uint32_t headGroupBase,
+    uint16_t repeatTimes
+) {
     using DataType = typename SrcTileData::DType;
     static constexpr uint32_t kC0 = 16;
     __ca__ DataType *dstAddr = reinterpret_cast<__ca__ DataType *>(__cce_get_tile_ptr(dst));
@@ -398,17 +348,16 @@ __tf__ AICORE void PtoPaLoadNzHeadGroupToCaRaw(typename DstTileData::TileDType _
 }
 
 template <typename DstTileData, typename SrcTileData>
-AICORE inline void PtoPaLoadNzHeadGroupToCa(DstTileData &dst, SrcTileData &src, uint32_t headGroupBase,
-    uint16_t repeatTimes)
-{
+AICORE inline void
+PtoPaLoadNzHeadGroupToCa(DstTileData &dst, SrcTileData &src, uint32_t headGroupBase, uint16_t repeatTimes) {
     PtoPaLoadNzHeadGroupToCaRaw<DstTileData, SrcTileData>(dst.data(), src.data(), headGroupBase, repeatTimes);
 }
 
 template <typename DstTileData, typename SrcTileData>
-__tf__ AICORE void PtoPaLoadCbufToCbRaw(typename DstTileData::TileDType __out__ dst,
-    typename SrcTileData::TileDType __in__ src, uint32_t srcElementOffset, uint16_t repeatTimes,
-    uint16_t srcStride)
-{
+__tf__ AICORE void PtoPaLoadCbufToCbRaw(
+    typename DstTileData::TileDType __out__ dst, typename SrcTileData::TileDType __in__ src, uint32_t srcElementOffset,
+    uint16_t repeatTimes, uint16_t srcStride
+) {
     using DataType = typename SrcTileData::DType;
     __cb__ DataType *dstAddr = reinterpret_cast<__cb__ DataType *>(__cce_get_tile_ptr(dst));
     __cbuf__ DataType *srcAddr = reinterpret_cast<__cbuf__ DataType *>(__cce_get_tile_ptr(src)) + srcElementOffset;
@@ -416,16 +365,16 @@ __tf__ AICORE void PtoPaLoadCbufToCbRaw(typename DstTileData::TileDType __out__ 
 }
 
 template <typename DstTileData, typename SrcTileData>
-AICORE inline void PtoPaLoadCbufToCbRaw(DstTileData &dst, SrcTileData &src, uint32_t srcElementOffset,
-    uint16_t repeatTimes, uint16_t srcStride)
-{
+AICORE inline void PtoPaLoadCbufToCbRaw(
+    DstTileData &dst, SrcTileData &src, uint32_t srcElementOffset, uint16_t repeatTimes, uint16_t srcStride
+) {
     PtoPaLoadCbufToCbRaw<DstTileData, SrcTileData>(dst.data(), src.data(), srcElementOffset, repeatTimes, srcStride);
 }
 
 template <typename DstTileData, typename SrcTileData>
-__tf__ AICORE void PtoPaLoadCbufToCbTranspose128Raw(typename DstTileData::TileDType __out__ dst,
-    typename SrcTileData::TileDType __in__ src)
-{
+__tf__ AICORE void PtoPaLoadCbufToCbTranspose128Raw(
+    typename DstTileData::TileDType __out__ dst, typename SrcTileData::TileDType __in__ src
+) {
     using DataType = typename SrcTileData::DType;
     __cb__ DataType *dstAddr = reinterpret_cast<__cb__ DataType *>(__cce_get_tile_ptr(dst));
     __cbuf__ DataType *srcAddr = reinterpret_cast<__cbuf__ DataType *>(__cce_get_tile_ptr(src));
@@ -433,23 +382,24 @@ __tf__ AICORE void PtoPaLoadCbufToCbTranspose128Raw(typename DstTileData::TileDT
     constexpr uint32_t kRows = 128;
     constexpr uint32_t kCols = 128;
     for (uint32_t idx = 0; idx < kCols / kBlock; ++idx) {
-        load_cbuf_to_cb_transpose(dstAddr + idx * kRows * kBlock, srcAddr + idx * kBlock * kBlock, 0,
-            kRows / kBlock, kCols / kBlock, 0, addr_cal_mode_t(0), 0);
+        load_cbuf_to_cb_transpose(
+            dstAddr + idx * kRows * kBlock, srcAddr + idx * kBlock * kBlock, 0, kRows / kBlock, kCols / kBlock, 0,
+            addr_cal_mode_t(0), 0
+        );
     }
 }
 
 template <typename DstTileData, typename SrcTileData>
-AICORE inline void PtoPaLoadCbufToCbTranspose128Raw(DstTileData &dst, SrcTileData &src)
-{
+AICORE inline void PtoPaLoadCbufToCbTranspose128Raw(DstTileData &dst, SrcTileData &src) {
     PtoPaLoadCbufToCbTranspose128Raw<DstTileData, SrcTileData>(dst.data(), src.data());
 }
 #endif
 
 #ifdef __DAV_C220_CUBE__
-AICORE inline void RunPtoPagedAttentionCubePipeline(__gm__ uint8_t *qGm, __gm__ uint8_t *kGm,
-    __gm__ uint8_t *vGm, __gm__ uint8_t *blockTablesGm, __gm__ uint8_t *sGm, __gm__ uint8_t *pGm,
-    __gm__ uint8_t *oTmpGm, __gm__ uint8_t *tilingParaGm, int64_t workerIdx, int64_t workerNum)
-{
+AICORE inline void RunPtoPagedAttentionCubePipeline(
+    __gm__ uint8_t *qGm, __gm__ uint8_t *kGm, __gm__ uint8_t *vGm, __gm__ uint8_t *blockTablesGm, __gm__ uint8_t *sGm,
+    __gm__ uint8_t *pGm, __gm__ uint8_t *oTmpGm, __gm__ uint8_t *tilingParaGm, int64_t workerIdx, int64_t workerNum
+) {
     constexpr int32_t kHeadDim = PA_TILE_TOKENS;
     constexpr int32_t kTileTokens = PA_TILE_TOKENS;
     constexpr int32_t kM = 16;
@@ -464,8 +414,8 @@ AICORE inline void RunPtoPagedAttentionCubePipeline(__gm__ uint8_t *qGm, __gm__ 
     }
 
     const int32_t effectiveBatch = ctx.decoderBatch > 0 ? ctx.decoderBatch : ctx.batch;
-    const int32_t maxBlocksPerQuery = ctx.maxBlocksPerQuery > 0 ? ctx.maxBlocksPerQuery :
-                                      (ctx.maxKvSeqLen + ctx.blockSize - 1) / ctx.blockSize;
+    const int32_t maxBlocksPerQuery =
+        ctx.maxBlocksPerQuery > 0 ? ctx.maxBlocksPerQuery : (ctx.maxKvSeqLen + ctx.blockSize - 1) / ctx.blockSize;
     const int32_t headsPerKv = ctx.numHeads / ctx.kvHeads;
     const int64_t totalRows = static_cast<int64_t>(effectiveBatch) * ctx.numHeads;
 
@@ -473,21 +423,24 @@ AICORE inline void RunPtoPagedAttentionCubePipeline(__gm__ uint8_t *qGm, __gm__ 
     using PPipe = TPipe<PA_P_FIFO_FLAG, Direction::DIR_V2C, 256 * sizeof(half), PA_FIFO_DEPTH>;
     using PVPipe = TPipe<PA_PV_FIFO_FLAG, Direction::DIR_C2V, 16 * kHeadDim * sizeof(float), PA_FIFO_DEPTH>;
     using QGlobal = GlobalTensor<half, Shape<1, 1, 1, 1, kHeadDim>, Stride<kHeadDim, kHeadDim, kHeadDim, kHeadDim, 1>>;
-    using KGlobal = GlobalTensor<half, Shape<1, 1, 1, kHeadDim, kTileTokens>,
-        Stride<1, 1, 1, 1, 8 * kHeadDim>, Layout::DN>;
-    using VGlobal = GlobalTensor<half, Shape<1, 1, 1, kTileTokens, kHeadDim>,
+    using KGlobal =
+        GlobalTensor<half, Shape<1, 1, 1, kHeadDim, kTileTokens>, Stride<1, 1, 1, 1, 8 * kHeadDim>, Layout::DN>;
+    using VGlobal = GlobalTensor<
+        half, Shape<1, 1, 1, kTileTokens, kHeadDim>,
         Stride<kTileTokens * kHeadDim, kTileTokens * kHeadDim, kTileTokens * kHeadDim, 8 * kHeadDim, 1>>;
-    using PGlobal = GlobalTensor<half, Shape<1, 1, 1, 1, kTileTokens>,
-        Stride<kTileTokens, kTileTokens, kTileTokens, kTileTokens, 1>>;
-    using ScoreGlobal = GlobalTensor<float, Shape<1, 1, 1, 1, kTileTokens>,
-        Stride<kTileTokens, kTileTokens, kTileTokens, kTileTokens, 1>>;
-    using OTmpGlobal = GlobalTensor<float, Shape<1, 1, 1, 1, kHeadDim>,
-        Stride<kHeadDim, kHeadDim, kHeadDim, kHeadDim, 1>>;
+    using PGlobal = GlobalTensor<
+        half, Shape<1, 1, 1, 1, kTileTokens>, Stride<kTileTokens, kTileTokens, kTileTokens, kTileTokens, 1>>;
+    using ScoreGlobal = GlobalTensor<
+        float, Shape<1, 1, 1, 1, kTileTokens>, Stride<kTileTokens, kTileTokens, kTileTokens, kTileTokens, 1>>;
+    using OTmpGlobal =
+        GlobalTensor<float, Shape<1, 1, 1, 1, kHeadDim>, Stride<kHeadDim, kHeadDim, kHeadDim, kHeadDim, 1>>;
 
     using QMatTile = Tile<TileType::Mat, half, 1, kK, BLayout::RowMajor, 1, kHeadDim>;
-    using KMatTile = Tile<TileType::Mat, half, kK, kN, BLayout::RowMajor, kHeadDim, kTileTokens, SLayout::ColMajor, 512>;
+    using KMatTile =
+        Tile<TileType::Mat, half, kK, kN, BLayout::RowMajor, kHeadDim, kTileTokens, SLayout::ColMajor, 512>;
     using PMatTile = Tile<TileType::Mat, half, 1, kK, BLayout::RowMajor, 1, kTileTokens>;
-    using VMatTile = Tile<TileType::Mat, half, kK, kN, BLayout::ColMajor, kTileTokens, kHeadDim, SLayout::RowMajor, 512>;
+    using VMatTile =
+        Tile<TileType::Mat, half, kK, kN, BLayout::ColMajor, kTileTokens, kHeadDim, SLayout::RowMajor, 512>;
     using LeftQTile = TileLeft<half, 1, kK, 1, kHeadDim>;
     using LeftPTile = TileLeft<half, 1, kK, 1, kTileTokens>;
     using RightTile = TileRight<half, kK, kN, kHeadDim, kTileTokens>;
@@ -533,9 +486,9 @@ AICORE inline void RunPtoPagedAttentionCubePipeline(__gm__ uint8_t *qGm, __gm__ 
         pipe_barrier(PIPE_ALL);
 
         for (int32_t tile = 0; tile < tileCount; ++tile) {
-            const int32_t blockId = LoadBlockTable(blockTablesGm, static_cast<int64_t>(batchIndex) * maxBlocksPerQuery + tile);
+            const int32_t blockId =
+                LoadBlockTable(blockTablesGm, static_cast<int64_t>(batchIndex) * maxBlocksPerQuery + tile);
             const int64_t kvBase = (static_cast<int64_t>(blockId) * ctx.blockSize * ctx.kvHeads + kvHead) * ctx.headDim;
-
 
             KGlobal kGlobal(reinterpret_cast<__gm__ half *>(kGm) + kvBase);
             TLOAD(kMatTile, kGlobal);
@@ -566,10 +519,10 @@ AICORE inline void RunPtoPagedAttentionCubePipeline(__gm__ uint8_t *qGm, __gm__ 
 #endif
 
 #ifdef __DAV_C220_VEC__
-AICORE inline void RunPtoPagedAttentionVecPipeline(__gm__ uint8_t *oGm, __gm__ uint8_t *sGm,
-    __gm__ uint8_t *pGm, __gm__ uint8_t *oTmpGm, __gm__ uint8_t *tilingParaGm, int64_t workerIdx, int64_t workerNum,
-    uint32_t subBlockId)
-{
+AICORE inline void RunPtoPagedAttentionVecPipeline(
+    __gm__ uint8_t *oGm, __gm__ uint8_t *sGm, __gm__ uint8_t *pGm, __gm__ uint8_t *oTmpGm, __gm__ uint8_t *tilingParaGm,
+    int64_t workerIdx, int64_t workerNum, uint32_t subBlockId
+) {
     constexpr int32_t kHeadDim = PA_TILE_TOKENS;
     constexpr int32_t kTileTokens = PA_TILE_TOKENS;
     if (!SupportsPtoPagedAttentionHighPerf(tilingParaGm) || workerIdx < 0 || workerNum <= 0) {
@@ -589,8 +542,10 @@ AICORE inline void RunPtoPagedAttentionVecPipeline(__gm__ uint8_t *oGm, __gm__ u
     using VecHalf128 = Tile<TileType::Vec, half, 1, kHeadDim, BLayout::RowMajor, 1, kHeadDim>;
     using VecHalf256 = Tile<TileType::Vec, half, 1, 256, BLayout::RowMajor, 1, kHeadDim>;
     using VecFloat8 = Tile<TileType::Vec, float, 1, 8, BLayout::RowMajor, 1, 8>;
-    using GlobalFloat128 = GlobalTensor<float, Shape<1, 1, 1, 1, kHeadDim>, Stride<kHeadDim, kHeadDim, kHeadDim, kHeadDim, 1>>;
-    using GlobalHalf128 = GlobalTensor<half, Shape<1, 1, 1, 1, kHeadDim>, Stride<kHeadDim, kHeadDim, kHeadDim, kHeadDim, 1>>;
+    using GlobalFloat128 =
+        GlobalTensor<float, Shape<1, 1, 1, 1, kHeadDim>, Stride<kHeadDim, kHeadDim, kHeadDim, kHeadDim, 1>>;
+    using GlobalHalf128 =
+        GlobalTensor<half, Shape<1, 1, 1, 1, kHeadDim>, Stride<kHeadDim, kHeadDim, kHeadDim, kHeadDim, 1>>;
 
     VecFloat128 weightedTile;
     VecFloat128 scoreTile;
@@ -626,7 +581,8 @@ AICORE inline void RunPtoPagedAttentionVecPipeline(__gm__ uint8_t *oGm, __gm__ u
         pipe_barrier(PIPE_ALL);
 
         for (int32_t tile = 0; tile < tileCount; ++tile) {
-            const int32_t validTokens = ((tile + 1) * kTileTokens <= kvSeqLen) ? kTileTokens : (kvSeqLen - tile * kTileTokens);
+            const int32_t validTokens =
+                ((tile + 1) * kTileTokens <= kvSeqLen) ? kTileTokens : (kvSeqLen - tile * kTileTokens);
             TPOP<QKPipe, VecFloat128, TileSplitAxis::TILE_NO_SPLIT>(qkPipe, scoreTile);
             float tileMax = -3.4028234663852886e38f;
             for (int32_t pos = 0; pos < validTokens; ++pos) {
@@ -677,19 +633,17 @@ AICORE inline void RunPtoPagedAttentionVecPipeline(__gm__ uint8_t *oGm, __gm__ u
 }
 #endif
 
-
-AICORE inline uint64_t LoadTilingOffset64(__gm__ uint8_t *tiling, int32_t base, int32_t highIdx, int32_t lowIdx)
-{
+AICORE inline uint64_t LoadTilingOffset64(__gm__ uint8_t *tiling, int32_t base, int32_t highIdx, int32_t lowIdx) {
     const uint32_t high = static_cast<uint32_t>(LoadTilingI32(tiling, base + highIdx));
     const uint32_t low = static_cast<uint32_t>(LoadTilingI32(tiling, base + lowIdx));
     return (static_cast<uint64_t>(high) << 32) | static_cast<uint64_t>(low);
 }
 
 #ifdef __DAV_C220_CUBE__
-AICORE inline void RunPtoPagedAttentionCubePipelineSplitKV(__gm__ uint8_t *qGm, __gm__ uint8_t *kGm,
-    __gm__ uint8_t *vGm, __gm__ uint8_t *blockTablesGm, __gm__ uint8_t *sGm, __gm__ uint8_t *pGm,
-    __gm__ uint8_t *oTmpGm, __gm__ uint8_t *tilingParaGm, int64_t workerIdx, int64_t workerNum)
-{
+AICORE inline void RunPtoPagedAttentionCubePipelineSplitKV(
+    __gm__ uint8_t *qGm, __gm__ uint8_t *kGm, __gm__ uint8_t *vGm, __gm__ uint8_t *blockTablesGm, __gm__ uint8_t *sGm,
+    __gm__ uint8_t *pGm, __gm__ uint8_t *oTmpGm, __gm__ uint8_t *tilingParaGm, int64_t workerIdx, int64_t workerNum
+) {
     constexpr int32_t kHeadDim = PA_TILE_TOKENS;
     constexpr int32_t kTileTokens = PA_TILE_TOKENS;
     constexpr int32_t kM = 16;
@@ -707,25 +661,29 @@ AICORE inline void RunPtoPagedAttentionCubePipelineSplitKV(__gm__ uint8_t *qGm, 
         return;
     }
 
-    const int32_t maxBlocksPerQuery = ctx.maxBlocksPerQuery > 0 ? ctx.maxBlocksPerQuery :
-        (ctx.maxKvSeqLen + ctx.blockSize - 1) / ctx.blockSize;
+    const int32_t maxBlocksPerQuery =
+        ctx.maxBlocksPerQuery > 0 ? ctx.maxBlocksPerQuery : (ctx.maxKvSeqLen + ctx.blockSize - 1) / ctx.blockSize;
     const int32_t headsPerKv = ctx.numHeads / ctx.kvHeads;
     const int32_t formerHeadSplit = ctx.formerHeadSplit > 0 ? ctx.formerHeadSplit : 1;
     const int32_t maxHeadGroups = (formerHeadSplit + kHeadGroup - 1) / kHeadGroup;
     const int32_t corePerBatch = (ctx.numHeads + formerHeadSplit - 1) / formerHeadSplit;
     const int64_t processNum = static_cast<int64_t>(ctx.formerBatch) * corePerBatch * ctx.kvSplitCoreNum;
 
-    using QGlobal = GlobalTensor<half, Shape<1, 1, 1, kM, kHeadDim>,
-        Stride<kM * kHeadDim, kM * kHeadDim, kM * kHeadDim, kHeadDim, 1>, Layout::ND>;
-    using KGlobal = GlobalTensor<half, Shape<1, 1, 1, kHeadDim, kTileTokens>,
-        Stride<1, 1, 1, 1, 8 * kHeadDim>, Layout::DN>;
-    using VGlobal = GlobalTensor<half, Shape<1, 1, 1, kTileTokens, kHeadDim>,
+    using QGlobal = GlobalTensor<
+        half, Shape<1, 1, 1, kM, kHeadDim>, Stride<kM * kHeadDim, kM * kHeadDim, kM * kHeadDim, kHeadDim, 1>,
+        Layout::ND>;
+    using KGlobal =
+        GlobalTensor<half, Shape<1, 1, 1, kHeadDim, kTileTokens>, Stride<1, 1, 1, 1, 8 * kHeadDim>, Layout::DN>;
+    using VGlobal = GlobalTensor<
+        half, Shape<1, 1, 1, kTileTokens, kHeadDim>,
         Stride<kTileTokens * kHeadDim, kTileTokens * kHeadDim, kTileTokens * kHeadDim, 8 * kHeadDim, 1>>;
 
     using QMatTile = Tile<TileType::Mat, half, kM, kHeadDim, BLayout::ColMajor, kM, kHeadDim, SLayout::RowMajor>;
-    using KMatTile = Tile<TileType::Mat, half, kK, kN, BLayout::RowMajor, kHeadDim, kTileTokens, SLayout::ColMajor, 512>;
+    using KMatTile =
+        Tile<TileType::Mat, half, kK, kN, BLayout::RowMajor, kHeadDim, kTileTokens, SLayout::ColMajor, 512>;
     using PMatTile = Tile<TileType::Mat, half, kM, kTileTokens, BLayout::ColMajor, kM, kTileTokens, SLayout::RowMajor>;
-    using VMatTile = Tile<TileType::Mat, half, kK, kN, BLayout::ColMajor, kTileTokens, kHeadDim, SLayout::RowMajor, 512>;
+    using VMatTile =
+        Tile<TileType::Mat, half, kK, kN, BLayout::ColMajor, kTileTokens, kHeadDim, SLayout::RowMajor, 512>;
     using LeftQTile = TileLeft<half, kM, kHeadDim, kMValid, kHeadDim>;
     using LeftPTile = TileLeft<half, kM, kTileTokens, kMValid, kTileTokens>;
     using RightTile = TileRight<half, kK, kN, kHeadDim, kTileTokens>;
@@ -748,12 +706,13 @@ AICORE inline void RunPtoPagedAttentionCubePipelineSplitKV(__gm__ uint8_t *qGm, 
     TASSIGN(rightTile, 0x00000);
     TASSIGN(accTile, 0x00000);
 
-    using ScoreGlobal = GlobalTensor<float, Shape<1, 1, 1, kMValid, kN>,
-        Stride<kMValid * kN, kMValid * kN, kMValid * kN, kN, 1>>;
-    using ProbGlobal = GlobalTensor<half, Shape<1, 1, 1, kM, kTileTokens>,
+    using ScoreGlobal =
+        GlobalTensor<float, Shape<1, 1, 1, kMValid, kN>, Stride<kMValid * kN, kMValid * kN, kMValid * kN, kN, 1>>;
+    using ProbGlobal = GlobalTensor<
+        half, Shape<1, 1, 1, kM, kTileTokens>,
         Stride<kM * kTileTokens, kM * kTileTokens, kM * kTileTokens, kTileTokens, 1>, Layout::ND>;
-    using OutGlobal = GlobalTensor<float, Shape<1, 1, 1, kMValid, kN>,
-        Stride<kMValid * kN, kMValid * kN, kMValid * kN, kN, 1>>;
+    using OutGlobal =
+        GlobalTensor<float, Shape<1, 1, 1, kMValid, kN>, Stride<kMValid * kN, kMValid * kN, kMValid * kN, kN, 1>>;
 
     constexpr int64_t scoreHeadBytes = kMValid * kTileTokens * sizeof(float);
     constexpr int64_t probHeadBytes = 256 * sizeof(half);
@@ -831,8 +790,9 @@ AICORE inline void RunPtoPagedAttentionCubePipelineSplitKV(__gm__ uint8_t *qGm, 
                     QGlobal qGlobal(reinterpret_cast<__gm__ half *>(qGm) + qBase);
                     TLOAD(qMatTile, qGlobal);
                     pipe_barrier(PIPE_ALL);
-                    const int32_t blockId = LoadBlockTable(blockTablesGm,
-                        static_cast<int64_t>(batchIndex) * maxBlocksPerQuery + startTile + tile);
+                    const int32_t blockId = LoadBlockTable(
+                        blockTablesGm, static_cast<int64_t>(batchIndex) * maxBlocksPerQuery + startTile + tile
+                    );
                     for (int32_t headInGroupBase = 0; headInGroupBase < kHeadGroup; headInGroupBase += headsPerKv) {
                         const int32_t baseHeadLocal = groupHeadBase + headInGroupBase;
                         if (baseHeadLocal >= curHeadNum) {
@@ -842,8 +802,10 @@ AICORE inline void RunPtoPagedAttentionCubePipelineSplitKV(__gm__ uint8_t *qGm, 
                         const int32_t kvHead = baseHead / headsPerKv;
                         const int64_t kvBase =
                             (static_cast<int64_t>(blockId) * ctx.blockSize * ctx.kvHeads + kvHead) * ctx.headDim;
-                        PtoPaLoadNzHeadGroupToCa(qLeftTile, qMatTile, static_cast<uint32_t>(headInGroupBase),
-                            static_cast<uint16_t>(kHeadDim / 16));
+                        PtoPaLoadNzHeadGroupToCa(
+                            qLeftTile, qMatTile, static_cast<uint32_t>(headInGroupBase),
+                            static_cast<uint16_t>(kHeadDim / 16)
+                        );
                         KGlobal kGlobal(reinterpret_cast<__gm__ half *>(kGm) + kvBase);
                         TLOAD(kMatTile, kGlobal);
                         auto matmulEvent = EVENT_ID1;
@@ -853,8 +815,9 @@ AICORE inline void RunPtoPagedAttentionCubePipelineSplitKV(__gm__ uint8_t *qGm, 
                         wait_flag(PIPE_MTE2, PIPE_MTE1, matmulEvent);
                         set_flag(PIPE_M, PIPE_MTE1, matmulEvent);
                         wait_flag(PIPE_M, PIPE_MTE1, matmulEvent);
-                        PtoPaLoadCbufToCbRaw(rightTile, kMatTile, 0,
-                            static_cast<uint16_t>((kHeadDim * kTileTokens) / 256), 1);
+                        PtoPaLoadCbufToCbRaw(
+                            rightTile, kMatTile, 0, static_cast<uint16_t>((kHeadDim * kTileTokens) / 256), 1
+                        );
                         set_flag(PIPE_MTE1, PIPE_M, matmulEvent);
                         wait_flag(PIPE_MTE1, PIPE_M, matmulEvent);
                         TMATMUL(accTile, qLeftTile, rightTile);
@@ -862,10 +825,11 @@ AICORE inline void RunPtoPagedAttentionCubePipelineSplitKV(__gm__ uint8_t *qGm, 
                         wait_flag(PIPE_MTE1, PIPE_MTE2, matmulEvent);
                         set_flag(PIPE_M, PIPE_FIX, matmulEvent);
                         wait_flag(PIPE_M, PIPE_FIX, matmulEvent);
-                        ScoreGlobal scoreGlobal(reinterpret_cast<__gm__ float *>(scoreBase +
-                            static_cast<int64_t>(slot) * scoreSlotBytes +
+                        ScoreGlobal scoreGlobal(reinterpret_cast<__gm__ float *>(
+                            scoreBase + static_cast<int64_t>(slot) * scoreSlotBytes +
                             static_cast<int64_t>(headGroup) * scoreGroupBytes +
-                            static_cast<int64_t>(headInGroupBase) * scoreHeadBytes));
+                            static_cast<int64_t>(headInGroupBase) * scoreHeadBytes
+                        ));
                         TSTORE(scoreGlobal, accTile);
                     }
                 }
@@ -888,11 +852,13 @@ AICORE inline void RunPtoPagedAttentionCubePipelineSplitKV(__gm__ uint8_t *qGm, 
                     if (!activeGroup) {
                         continue;
                     }
-                    const int32_t blockId = LoadBlockTable(blockTablesGm,
-                        static_cast<int64_t>(batchIndex) * maxBlocksPerQuery + startTile + tile);
-                    ProbGlobal probGlobal(reinterpret_cast<__gm__ half *>(probBase +
-                        static_cast<int64_t>(slot) * probSlotBytes +
-                        static_cast<int64_t>(headGroup) * probGroupBytes));
+                    const int32_t blockId = LoadBlockTable(
+                        blockTablesGm, static_cast<int64_t>(batchIndex) * maxBlocksPerQuery + startTile + tile
+                    );
+                    ProbGlobal probGlobal(reinterpret_cast<__gm__ half *>(
+                        probBase + static_cast<int64_t>(slot) * probSlotBytes +
+                        static_cast<int64_t>(headGroup) * probGroupBytes
+                    ));
                     TLOAD(pMatTile, probGlobal);
                     pipe_barrier(PIPE_ALL);
                     for (int32_t headInGroupBase = 0; headInGroupBase < kHeadGroup; headInGroupBase += headsPerKv) {
@@ -904,8 +870,10 @@ AICORE inline void RunPtoPagedAttentionCubePipelineSplitKV(__gm__ uint8_t *qGm, 
                         const int32_t kvHead = baseHead / headsPerKv;
                         const int64_t kvBase =
                             (static_cast<int64_t>(blockId) * ctx.blockSize * ctx.kvHeads + kvHead) * ctx.headDim;
-                        PtoPaLoadNzHeadGroupToCa(pLeftTile, pMatTile, static_cast<uint32_t>(headInGroupBase),
-                            static_cast<uint16_t>(kTileTokens / 16));
+                        PtoPaLoadNzHeadGroupToCa(
+                            pLeftTile, pMatTile, static_cast<uint32_t>(headInGroupBase),
+                            static_cast<uint16_t>(kTileTokens / 16)
+                        );
                         VGlobal vGlobal(reinterpret_cast<__gm__ half *>(vGm) + kvBase);
                         TLOAD(vMatTile, vGlobal);
                         auto matmulEvent = EVENT_ID1;
@@ -923,10 +891,11 @@ AICORE inline void RunPtoPagedAttentionCubePipelineSplitKV(__gm__ uint8_t *qGm, 
                         wait_flag(PIPE_MTE1, PIPE_MTE2, matmulEvent);
                         set_flag(PIPE_M, PIPE_FIX, matmulEvent);
                         wait_flag(PIPE_M, PIPE_FIX, matmulEvent);
-                        OutGlobal outGlobal(reinterpret_cast<__gm__ float *>(outBase +
-                            static_cast<int64_t>(slot) * outSlotBytes +
+                        OutGlobal outGlobal(reinterpret_cast<__gm__ float *>(
+                            outBase + static_cast<int64_t>(slot) * outSlotBytes +
                             static_cast<int64_t>(headGroup) * outGroupBytes +
-                            static_cast<int64_t>(headInGroupBase) * outHeadBytes));
+                            static_cast<int64_t>(headInGroupBase) * outHeadBytes
+                        ));
                         TSTORE(outGlobal, accTile);
                     }
                 }
@@ -938,17 +907,16 @@ AICORE inline void RunPtoPagedAttentionCubePipelineSplitKV(__gm__ uint8_t *qGm, 
                 wait_flag_dev(PtoPaSlotFlag(PTO_PA_RAW_PV_FREE, 1));
             }
         }
-
     }
     pipe_barrier(PIPE_ALL);
 }
 #endif
 
 #ifdef __DAV_C220_VEC__
-AICORE inline void RunPtoPagedAttentionVecPipelineSplitKV(__gm__ uint8_t *oGm, __gm__ uint8_t *sGm,
-    __gm__ uint8_t *pGm, __gm__ uint8_t *oTmpGm, __gm__ uint8_t *oCoreTmpGm, __gm__ uint8_t *lGm,
-    __gm__ uint8_t *tilingParaGm, int64_t workerIdx, int64_t workerNum, uint32_t subBlockId)
-{
+AICORE inline void RunPtoPagedAttentionVecPipelineSplitKV(
+    __gm__ uint8_t *oGm, __gm__ uint8_t *sGm, __gm__ uint8_t *pGm, __gm__ uint8_t *oTmpGm, __gm__ uint8_t *oCoreTmpGm,
+    __gm__ uint8_t *lGm, __gm__ uint8_t *tilingParaGm, int64_t workerIdx, int64_t workerNum, uint32_t subBlockId
+) {
     constexpr int32_t kHeadDim = PA_TILE_TOKENS;
     constexpr int32_t kTileTokens = PA_TILE_TOKENS;
     constexpr int32_t kHeadGroup = 16;
@@ -979,19 +947,17 @@ AICORE inline void RunPtoPagedAttentionVecPipelineSplitKV(__gm__ uint8_t *oGm, _
     using VecFloat4x128 = Tile<TileType::Vec, float, 4, kHeadDim, BLayout::RowMajor, 4, kHeadDim>;
     using VecFloat4x1 = Tile<TileType::Vec, float, 8, 1, BLayout::ColMajor, 4, 1>;
     using VecFloat1x8 = Tile<TileType::Vec, float, 1, 8, BLayout::RowMajor, 1, 8>;
-    using ScoreGlobal = GlobalTensor<float, Shape<1, 1, 1, 1, kHeadDim>,
-        Stride<kHeadDim, kHeadDim, kHeadDim, kHeadDim, 1>>;
-    using ScoreRowsGlobal = GlobalTensor<float, Shape<1, 1, 1, 4, kHeadDim>,
-        Stride<1, 1, 1, kHeadDim, 1>>;
+    using ScoreGlobal =
+        GlobalTensor<float, Shape<1, 1, 1, 1, kHeadDim>, Stride<kHeadDim, kHeadDim, kHeadDim, kHeadDim, 1>>;
+    using ScoreRowsGlobal = GlobalTensor<float, Shape<1, 1, 1, 4, kHeadDim>, Stride<1, 1, 1, kHeadDim, 1>>;
     using ProbGlobal = GlobalTensor<half, Shape<1, 1, 1, 1, 256>, Stride<256, 256, 256, 256, 1>>;
-    using ProbRowGlobal = GlobalTensor<half, Shape<1, 1, 1, 1, kHeadDim>,
-        Stride<kHeadDim, kHeadDim, kHeadDim, kHeadDim, 1>>;
-    using OutGlobal = GlobalTensor<float, Shape<1, 1, 1, 1, kHeadDim>,
-        Stride<kHeadDim, kHeadDim, kHeadDim, kHeadDim, 1>>;
-    using OutputGlobal = GlobalTensor<half, Shape<1, 1, 1, 1, kHeadDim>,
-        Stride<kHeadDim, kHeadDim, kHeadDim, kHeadDim, 1>>;
-    using OutRowsGlobal = GlobalTensor<float, Shape<1, 1, 1, 4, kHeadDim>,
-        Stride<1, 1, 1, kHeadDim, 1>>;
+    using ProbRowGlobal =
+        GlobalTensor<half, Shape<1, 1, 1, 1, kHeadDim>, Stride<kHeadDim, kHeadDim, kHeadDim, kHeadDim, 1>>;
+    using OutGlobal =
+        GlobalTensor<float, Shape<1, 1, 1, 1, kHeadDim>, Stride<kHeadDim, kHeadDim, kHeadDim, kHeadDim, 1>>;
+    using OutputGlobal =
+        GlobalTensor<half, Shape<1, 1, 1, 1, kHeadDim>, Stride<kHeadDim, kHeadDim, kHeadDim, kHeadDim, 1>>;
+    using OutRowsGlobal = GlobalTensor<float, Shape<1, 1, 1, 4, kHeadDim>, Stride<1, 1, 1, kHeadDim, 1>>;
 
     VecFloat128 weightedTile;
     VecFloat128 scoreTile;
@@ -1005,7 +971,7 @@ AICORE inline void RunPtoPagedAttentionVecPipelineSplitKV(__gm__ uint8_t *oGm, _
     VecFloat8 scalarMathTile;
     VecFloat4x128 scoreRowsTile;
     VecFloat4x128 scoreRowsWorkTile;
-    VecFloat128 probRowView;   // 1x128 view aliasing one row of scoreRowsWorkTile for TCVT
+    VecFloat128 probRowView;  // 1x128 view aliasing one row of scoreRowsWorkTile for TCVT
     VecFloat4x128 pvRowsTile;
     VecFloat4x1 rowMaxRowsTile;
     VecFloat4x1 maxStateRowsTile;
@@ -1147,10 +1113,11 @@ AICORE inline void RunPtoPagedAttentionVecPipelineSplitKV(__gm__ uint8_t *oGm, _
                         if (headsPerKv != 4 || headLocal < subHeadBegin || headLocal + 4 > subHeadEnd) {
                             continue;
                         }
-                        ScoreRowsGlobal scoreGlobal(reinterpret_cast<__gm__ float *>(scoreBase +
-                            static_cast<int64_t>(slot) * scoreSlotBytes +
+                        ScoreRowsGlobal scoreGlobal(reinterpret_cast<__gm__ float *>(
+                            scoreBase + static_cast<int64_t>(slot) * scoreSlotBytes +
                             static_cast<int64_t>(headGroup) * scoreGroupBytes +
-                            static_cast<int64_t>(headInGroupBase) * scoreHeadBytes));
+                            static_cast<int64_t>(headInGroupBase) * scoreHeadBytes
+                        ));
                         TLOAD(scoreRowsTile, scoreGlobal);
                         set_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
                         wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
@@ -1186,19 +1153,22 @@ AICORE inline void RunPtoPagedAttentionVecPipelineSplitKV(__gm__ uint8_t *oGm, _
                         pipe_barrier(PIPE_V);
                         set_flag(PIPE_V, PIPE_S, EVENT_ID3);
                         wait_flag(PIPE_V, PIPE_S, EVENT_ID3);
-                        __gm__ half *probScratch = reinterpret_cast<__gm__ half *>(probBase +
-                            static_cast<int64_t>(slot) * probSlotBytes +
-                            static_cast<int64_t>(headGroup) * probGroupBytes);
+                        __gm__ half *probScratch = reinterpret_cast<__gm__ half *>(
+                            probBase + static_cast<int64_t>(slot) * probSlotBytes +
+                            static_cast<int64_t>(headGroup) * probGroupBytes
+                        );
                         for (int32_t row = 0; row < 4; ++row) {
                             maxScore[headLocal + row] = newMaxRowsTile.data()[row];
                             sumExp[headLocal + row] = sumStateRowsTile.data()[row];
                             oldScaleByHead[headLocal + row] = oldScaleRowsTile.data()[row];
-                            TASSIGN(probRowView, kScoreRowsWorkUb +
-                                static_cast<uint32_t>(row) * kTileTokens * sizeof(float));
+                            TASSIGN(
+                                probRowView, kScoreRowsWorkUb + static_cast<uint32_t>(row) * kTileTokens * sizeof(float)
+                            );
                             PtoPaConvF32ToF16(probHalfTile, probRowView, 2);
                             pipe_barrier(PIPE_V);
-                            ProbRowGlobal probRowGlobal(probScratch +
-                                static_cast<int64_t>(headInGroupBase + row) * kTileTokens);
+                            ProbRowGlobal probRowGlobal(
+                                probScratch + static_cast<int64_t>(headInGroupBase + row) * kTileTokens
+                            );
                             TSTORE(probRowGlobal, probHalfTile);
                         }
                     }
@@ -1234,10 +1204,11 @@ AICORE inline void RunPtoPagedAttentionVecPipelineSplitKV(__gm__ uint8_t *oGm, _
                         }
                         set_flag(PIPE_S, PIPE_V, EVENT_ID2);
                         wait_flag(PIPE_S, PIPE_V, EVENT_ID2);
-                        OutRowsGlobal outGlobal(reinterpret_cast<__gm__ float *>(outTmpBase +
-                            static_cast<int64_t>(slot) * outSlotBytes +
+                        OutRowsGlobal outGlobal(reinterpret_cast<__gm__ float *>(
+                            outTmpBase + static_cast<int64_t>(slot) * outSlotBytes +
                             static_cast<int64_t>(headGroup) * outGroupBytes +
-                            static_cast<int64_t>(headInGroupBase) * outHeadBytes));
+                            static_cast<int64_t>(headInGroupBase) * outHeadBytes
+                        ));
                         TLOAD(pvRowsTile, outGlobal);
                         set_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
                         wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
@@ -1253,14 +1224,13 @@ AICORE inline void RunPtoPagedAttentionVecPipelineSplitKV(__gm__ uint8_t *oGm, _
             }
         }
 
-
         if (activeSubBlock && validProcess) {
             for (int32_t headLocal = subHeadBegin; headLocal < subHeadEnd; ++headLocal) {
                 const int32_t head = startHead + headLocal;
                 const float invSum = sumExp[headLocal] > 0.0f ? 1.0f / sumExp[headLocal] : 0.0f;
                 const uint64_t outOffset = oFdBase * ctx.kvSplitCoreNum +
-                    static_cast<uint64_t>(head) * ctx.headDim * ctx.kvSplitCoreNum +
-                    static_cast<uint64_t>(curSplit) * ctx.headDim;
+                                           static_cast<uint64_t>(head) * ctx.headDim * ctx.kvSplitCoreNum +
+                                           static_cast<uint64_t>(curSplit) * ctx.headDim;
                 const uint64_t lOffset = lBase + static_cast<uint64_t>(head) * ctx.kvSplitCoreNum + curSplit;
                 partialL[lOffset] = maxScore[headLocal] + PtoLogScalar(scalarMathTile, sumExp[headLocal]);
                 TASSIGN(weightedTile, kAccumUbBase + static_cast<uint32_t>(headLocal) * kAccumHeadBytes);
@@ -1318,8 +1288,10 @@ AICORE inline void RunPtoPagedAttentionVecPipelineSplitKV(__gm__ uint8_t *oGm, _
         TASSIGN(splitWorkTile, 0x3300);
         TASSIGN(splitReduceTile, 0x3400);
         __ubuf__ float *splitScale = reinterpret_cast<__ubuf__ float *>((uintptr_t)0x3200);
-        copy_gm_to_ubuf_align_b32(splitScale, partialL + lOffset, 0, 1, static_cast<uint32_t>(kvLoop * 4), 0,
-            lRemain == 0 ? 0 : 8 - lRemain, 0, 0);
+        copy_gm_to_ubuf_align_b32(
+            splitScale, partialL + lOffset, 0, 1, static_cast<uint32_t>(kvLoop * 4), 0, lRemain == 0 ? 0 : 8 - lRemain,
+            0, 0
+        );
         set_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
         wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
         set_flag(PIPE_V, PIPE_S, EVENT_ID3);
@@ -1354,10 +1326,11 @@ AICORE inline void RunPtoPagedAttentionVecPipelineSplitKV(__gm__ uint8_t *oGm, _
         pipe_barrier(PIPE_V);
         constexpr uint32_t kCombineOutUb = 0x4000;
         __ubuf__ float *splitOut = reinterpret_cast<__ubuf__ float *>((uintptr_t)kCombineOutUb);
-        const uint64_t firstOutOffset = oFdBase * ctx.kvSplitCoreNum +
-            static_cast<uint64_t>(head) * ctx.headDim * ctx.kvSplitCoreNum;
-        copy_gm_to_ubuf_align_b32(splitOut, partialOut + firstOutOffset, 0, 1,
-            static_cast<uint32_t>(kvLoop * ctx.headDim * 4), 0, 0, 0, 0);
+        const uint64_t firstOutOffset =
+            oFdBase * ctx.kvSplitCoreNum + static_cast<uint64_t>(head) * ctx.headDim * ctx.kvSplitCoreNum;
+        copy_gm_to_ubuf_align_b32(
+            splitOut, partialOut + firstOutOffset, 0, 1, static_cast<uint32_t>(kvLoop * ctx.headDim * 4), 0, 0, 0, 0
+        );
         set_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
         wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
         for (int32_t split = 0; split < kvLoop; ++split) {
@@ -1385,18 +1358,10 @@ AICORE inline void RunPtoPagedAttentionVecPipelineSplitKV(__gm__ uint8_t *oGm, _
 
 #ifdef __DAV_C220_VEC__
 AICORE inline void RunPtoPagedAttentionDecodeSplitKV(
-    __gm__ uint8_t *qGm,
-    __gm__ uint8_t *kGm,
-    __gm__ uint8_t *vGm,
-    __gm__ uint8_t *blockTablesGm,
-    __gm__ uint8_t *oGm,
-    __gm__ uint8_t *oCoreTmpGm,
-    __gm__ uint8_t *lGm,
-    __gm__ uint8_t *tilingParaGm,
-    int64_t workerIdx,
-    int64_t workerNum,
-    uint32_t subBlockId)
-{
+    __gm__ uint8_t *qGm, __gm__ uint8_t *kGm, __gm__ uint8_t *vGm, __gm__ uint8_t *blockTablesGm, __gm__ uint8_t *oGm,
+    __gm__ uint8_t *oCoreTmpGm, __gm__ uint8_t *lGm, __gm__ uint8_t *tilingParaGm, int64_t workerIdx, int64_t workerNum,
+    uint32_t subBlockId
+) {
     constexpr int32_t kHeadDim = 128;
     PtoPaInitCoreState();
     const PaTilingContext ctx = LoadPaTilingContext(tilingParaGm);
@@ -1407,8 +1372,8 @@ AICORE inline void RunPtoPagedAttentionDecodeSplitKV(
         return;
     }
 
-    const int32_t maxBlocksPerQuery = ctx.maxBlocksPerQuery > 0 ? ctx.maxBlocksPerQuery :
-        (ctx.maxKvSeqLen + ctx.blockSize - 1) / ctx.blockSize;
+    const int32_t maxBlocksPerQuery =
+        ctx.maxBlocksPerQuery > 0 ? ctx.maxBlocksPerQuery : (ctx.maxKvSeqLen + ctx.blockSize - 1) / ctx.blockSize;
     const int32_t headsPerKv = ctx.numHeads / ctx.kvHeads;
     const int32_t formerHeadSplit = ctx.formerHeadSplit > 0 ? ctx.formerHeadSplit : 1;
     const int32_t corePerBatch = (ctx.numHeads + formerHeadSplit - 1) / formerHeadSplit;
@@ -1419,8 +1384,7 @@ AICORE inline void RunPtoPagedAttentionDecodeSplitKV(
     using VecHalf128 = Tile<TileType::Vec, half, 1, kHeadDim, BLayout::RowMajor, 1, kHeadDim>;
     using VecFloat128 = Tile<TileType::Vec, float, 1, kHeadDim, BLayout::RowMajor, 1, kHeadDim>;
     using VecFloat8 = Tile<TileType::Vec, float, 1, 8, BLayout::RowMajor, 1, 8>;
-    using GlobalHalf128 =
-        GlobalTensor<half, Shape<1, 1, 1, 1, kHeadDim>, Stride<1, 1, 1, kHeadDim, 1>>;
+    using GlobalHalf128 = GlobalTensor<half, Shape<1, 1, 1, 1, kHeadDim>, Stride<1, 1, 1, kHeadDim, 1>>;
 
     VecHalf128 qHalfTile;
     VecFloat128 qFloatTile;
@@ -1497,10 +1461,12 @@ AICORE inline void RunPtoPagedAttentionDecodeSplitKV(
                 const int32_t pos = startKv + relPos;
                 int32_t blockId = 0;
                 int32_t offsetInBlock = 0;
-                ResolvePagedPosition(blockTablesGm, batchIndex, maxBlocksPerQuery, pos, ctx.blockSize, blockId,
-                    offsetInBlock);
-                const int64_t kvOffset = (((static_cast<int64_t>(blockId) * ctx.blockSize + offsetInBlock) *
-                    ctx.kvHeads + kvHead) * ctx.headDim);
+                ResolvePagedPosition(
+                    blockTablesGm, batchIndex, maxBlocksPerQuery, pos, ctx.blockSize, blockId, offsetInBlock
+                );
+                const int64_t kvOffset =
+                    (((static_cast<int64_t>(blockId) * ctx.blockSize + offsetInBlock) * ctx.kvHeads + kvHead) *
+                     ctx.headDim);
 
                 GlobalHalf128 kGlobal(reinterpret_cast<__gm__ half *>(kGm) + kvOffset);
                 TLOAD(kHalfTile, kGlobal);
@@ -1540,8 +1506,8 @@ AICORE inline void RunPtoPagedAttentionDecodeSplitKV(
 
             const float invSum = sumExp > 0.0f ? 1.0f / sumExp : 0.0f;
             const uint64_t outOffset = oFdBase * ctx.kvSplitCoreNum +
-                static_cast<uint64_t>(head) * ctx.headDim * ctx.kvSplitCoreNum +
-                static_cast<uint64_t>(curSplit) * ctx.headDim;
+                                       static_cast<uint64_t>(head) * ctx.headDim * ctx.kvSplitCoreNum +
+                                       static_cast<uint64_t>(curSplit) * ctx.headDim;
             const uint64_t lOffset = lBase + static_cast<uint64_t>(head) * ctx.kvSplitCoreNum + curSplit;
             float logSumExp = -3.4028234663852886e38f;
             if (sumExp > 0.0f) {
@@ -1606,8 +1572,8 @@ AICORE inline void RunPtoPagedAttentionDecodeSplitKV(
             float value = 0.0f;
             for (int32_t split = 0; split < kvLoop; ++split) {
                 const uint64_t outOffset = oFdBase * ctx.kvSplitCoreNum +
-                    static_cast<uint64_t>(head) * ctx.headDim * ctx.kvSplitCoreNum +
-                    static_cast<uint64_t>(split) * ctx.headDim;
+                                           static_cast<uint64_t>(head) * ctx.headDim * ctx.kvSplitCoreNum +
+                                           static_cast<uint64_t>(split) * ctx.headDim;
                 value += partialOut[outOffset + dim] * splitScale[split];
             }
             StoreOutputFp16(oGm, outBase + dim, value);
@@ -1618,21 +1584,15 @@ AICORE inline void RunPtoPagedAttentionDecodeSplitKV(
 #endif
 
 AICORE inline void RunPtoPagedAttentionDecode(
-    __gm__ uint8_t *qGm,
-    __gm__ uint8_t *kGm,
-    __gm__ uint8_t *vGm,
-    __gm__ uint8_t *blockTablesGm,
-    __gm__ uint8_t *oGm,
-    __gm__ uint8_t *tilingParaGm,
-    int64_t workerIdx,
-    int64_t workerNum)
-{
+    __gm__ uint8_t *qGm, __gm__ uint8_t *kGm, __gm__ uint8_t *vGm, __gm__ uint8_t *blockTablesGm, __gm__ uint8_t *oGm,
+    __gm__ uint8_t *tilingParaGm, int64_t workerIdx, int64_t workerNum
+) {
     constexpr int32_t kMaxHeadDim = 128;
     PtoPaInitCoreState();
     const PaTilingContext ctx = LoadPaTilingContext(tilingParaGm);
     const int32_t effectiveBatch = ctx.decoderBatch > 0 ? ctx.decoderBatch : ctx.batch;
-    const int32_t maxBlocksPerQuery = ctx.maxBlocksPerQuery > 0 ? ctx.maxBlocksPerQuery :
-        (ctx.maxKvSeqLen + ctx.blockSize - 1) / ctx.blockSize;
+    const int32_t maxBlocksPerQuery =
+        ctx.maxBlocksPerQuery > 0 ? ctx.maxBlocksPerQuery : (ctx.maxKvSeqLen + ctx.blockSize - 1) / ctx.blockSize;
     const int32_t headsPerKv = ctx.numHeads / ctx.kvHeads;
     const int64_t totalRows = static_cast<int64_t>(effectiveBatch) * ctx.numHeads;
     if (workerIdx < 0 || workerNum <= 0) {
@@ -1665,8 +1625,7 @@ AICORE inline void RunPtoPagedAttentionDecode(
         using VecHalf128 = Tile<TileType::Vec, half, 1, kMaxHeadDim, BLayout::RowMajor, 1, kMaxHeadDim>;
         using VecFloat128 = Tile<TileType::Vec, float, 1, kMaxHeadDim, BLayout::RowMajor, 1, kMaxHeadDim>;
         using VecFloat8 = Tile<TileType::Vec, float, 1, 8, BLayout::RowMajor, 1, 8>;
-        using GlobalHalf128 =
-            GlobalTensor<half, Shape<1, 1, 1, 1, kMaxHeadDim>, Stride<1, 1, 1, kMaxHeadDim, 1>>;
+        using GlobalHalf128 = GlobalTensor<half, Shape<1, 1, 1, 1, kMaxHeadDim>, Stride<1, 1, 1, kMaxHeadDim, 1>>;
 
         VecFloat128 weightedTile;
         VecHalf128 qHalfTile;
@@ -1714,10 +1673,12 @@ AICORE inline void RunPtoPagedAttentionDecode(
             for (int32_t pos = 0; pos < kvSeqLen; ++pos) {
                 int32_t blockId = 0;
                 int32_t offsetInBlock = 0;
-                ResolvePagedPosition(blockTablesGm, batchIndex, maxBlocksPerQuery, pos, ctx.blockSize, blockId,
-                    offsetInBlock);
-                const int64_t kvOffset = (((static_cast<int64_t>(blockId) * ctx.blockSize + offsetInBlock) *
-                    ctx.kvHeads + kvHead) * ctx.headDim);
+                ResolvePagedPosition(
+                    blockTablesGm, batchIndex, maxBlocksPerQuery, pos, ctx.blockSize, blockId, offsetInBlock
+                );
+                const int64_t kvOffset =
+                    (((static_cast<int64_t>(blockId) * ctx.blockSize + offsetInBlock) * ctx.kvHeads + kvHead) *
+                     ctx.headDim);
 
                 GlobalHalf128 kGlobal(reinterpret_cast<__gm__ half *>(kGm) + kvOffset);
                 TLOAD(kHalfTile, kGlobal);
@@ -1787,16 +1748,21 @@ AICORE inline void RunPtoPagedAttentionDecode(
         for (int32_t pos = 0; pos < kvSeqLen; ++pos) {
             int32_t blockId = 0;
             int32_t offsetInBlock = 0;
-            ResolvePagedPosition(blockTablesGm, batchIndex, maxBlocksPerQuery, pos, ctx.blockSize, blockId, offsetInBlock);
-            const float score = ComputeScoreByBlock(qValues, kGm, blockId, offsetInBlock, ctx.blockSize, kvHead,
-                ctx.headDim, ctx.kvHeads, ctx.scale);
+            ResolvePagedPosition(
+                blockTablesGm, batchIndex, maxBlocksPerQuery, pos, ctx.blockSize, blockId, offsetInBlock
+            );
+            const float score = ComputeScoreByBlock(
+                qValues, kGm, blockId, offsetInBlock, ctx.blockSize, kvHead, ctx.headDim, ctx.kvHeads, ctx.scale
+            );
             const bool updateMax = score > maxScore;
             const float newMax = updateMax ? score : maxScore;
             const float oldScale = (pos == 0) ? 0.0f : PtoExpScalar(decodeScalarMathTile, maxScore - newMax);
             const float probUnnorm = PtoExpScalar(decodeScalarMathTile, score - newMax);
             sumExp = sumExp * oldScale + probUnnorm;
             for (int32_t dim = 0; dim < ctx.headDim; ++dim) {
-                const float value = LoadPagedVByBlock(vGm, blockId, offsetInBlock, ctx.blockSize, ctx.kvHeads, kvHead, ctx.headDim, dim);
+                const float value = LoadPagedVByBlock(
+                    vGm, blockId, offsetInBlock, ctx.blockSize, ctx.kvHeads, kvHead, ctx.headDim, dim
+                );
                 weighted[dim] = weighted[dim] * oldScale + probUnnorm * value;
             }
             maxScore = newMax;
