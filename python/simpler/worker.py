@@ -59,6 +59,7 @@ Usage::
 
 from __future__ import annotations
 
+import bisect
 import ctypes
 import importlib
 import json
@@ -208,6 +209,30 @@ _CTRL_PY_REGISTER = 10
 _CTRL_PY_UNREGISTER = 11
 _CTRL_PY_IMPORT_REGISTER = 12
 _CTRL_L3_L2_ORCH_COMM_INIT = 13
+# Host-buffer registration. MAP_HOST maps a named host-buffer shm
+# into every chip child *post-fork* and keeps it mapped so later runs can copy
+# through it; UNMAP_HOST drops one. The child also records the parent VA range
+# the shm stands in for, so the per-task blob's host pointers (raw parent VAs)
+# can be rewritten to the child's own mapping before the runtime dereferences
+# them. Unlike _CTRL_REGISTER (one-shot H2D then close), these mappings persist
+# for the buffer's registered lifetime — see docs/comm-domain.md.
+_CTRL_MAP_HOST = 14
+_CTRL_UNMAP_HOST = 15
+
+# MAP_HOST payload: token (u64), parent_va (u64), nbytes (u64), then the
+# NUL-free host-buffer shm name as the trailing bytes. UNMAP_HOST payload is the
+# token alone.
+_HOST_BUF_MAP_HEADER = struct.Struct("<QQQ")
+_HOST_BUF_UNMAP = struct.Struct("<Q")
+
+# Wire layout of a Tensor inside a task-args blob, pinned by static_assert in
+# src/common/task_interface/tensor.h: each Tensor is 128 B and buffer.addr is its
+# first field (offset 0). The blob is [int32 T][int32 S][Tensor[T]][scalars], so
+# tensor i's host pointer lives at _OFF_TASK_ARGS_BLOB + 8 + i*128. The child
+# rewrites that u64 in place to redirect a registered host pointer at its own
+# mapping (the pure-Python blob-rewrite scheme, no runtime C++ change).
+_BLOB_TENSOR_STRIDE = 128
+_BLOB_HEADER_BYTES = 8
 
 # Layout of the CTRL_COMM_INIT request shm.
 _COMM_INIT_HEADER = struct.Struct("<II")  # rank (u32), nranks (u32)
@@ -332,6 +357,149 @@ class _RemoteSession:
 
 
 _IdentitySnapshotEntry = tuple[bytes, Any, int, str, str]
+
+
+@dataclass
+class _HostBufEntry:
+    """Parent-side record for a born-shared post-fork host buffer.
+
+    The worker owns ``shm`` — a named buffer the chip children attach and
+    read/write through. The user builds a tensor over it (via the buffer
+    protocol on :class:`HostBuffer`), so the buffer *is* the shm: ``data_ptr ==
+    shm_base`` and no per-run copy is needed (the child reads and writes the same
+    physical pages the parent sees). ``shm_base`` caches the mapped address.
+    """
+
+    token: int
+    data_ptr: int
+    nbytes: int
+    shm: SharedMemory
+    shm_name: str
+    shm_base: int
+
+
+@dataclass(frozen=True, eq=False)
+class HostBuffer:
+    """Handle for a worker-allocated, born-shared host buffer (zero-copy).
+
+    Returned by ``Worker.create_host_buffer``. ``buffer`` is a ``memoryview``
+    over shared memory already attached into every chip child; wrap it with
+    ``torch.frombuffer`` / ``np.frombuffer`` to get a real tensor whose writes
+    land directly in the child-visible pages — no per-run copy. ``token`` /
+    ``data_ptr`` / ``nbytes`` identify the mapping; pass this handle back to
+    ``free_host_buffer`` to release it.
+
+    ``eq=False`` keeps object-identity equality/hash so the (unhashable)
+    ``memoryview`` field never blocks using the handle as a dict key or set
+    member.
+    """
+
+    token: int
+    data_ptr: int
+    nbytes: int
+    buffer: memoryview
+
+
+def _rewrite_blob_host_addrs(buf: memoryview, blob_off: int, ranges: list[tuple[int, int, int]]) -> None:
+    """Redirect registered host pointers in a task-args blob to child mappings.
+
+    ``ranges`` is ``(parent_lo, parent_hi, child_base)`` for each host buffer the
+    child has mapped via _CTRL_MAP_HOST. For every tensor whose ``buffer.addr``
+    (a parent VA) lands in a registered range, rewrite it in place to
+    ``child_base + (addr - parent_lo)`` so the runtime dereferences the child's
+    own mapping. Tensors outside every range (fork-inherited or child-allocated)
+    are left untouched. See _BLOB_TENSOR_STRIDE for the wire layout.
+    """
+    tensor_count = struct.unpack_from("<i", buf, blob_off)[0]
+    if tensor_count <= 0:
+        return
+    base = blob_off + _BLOB_HEADER_BYTES
+    for i in range(tensor_count):
+        addr_off = base + i * _BLOB_TENSOR_STRIDE
+        addr = struct.unpack_from("<Q", buf, addr_off)[0]
+        for parent_lo, parent_hi, child_base in ranges:
+            if parent_lo <= addr < parent_hi:
+                struct.pack_into("<Q", buf, addr_off, child_base + (addr - parent_lo))
+                break
+
+
+def _read_ctrl_staged_shm_name(buf: memoryview) -> str:
+    """Decode the staged-payload shm name a broadcast_control_all left at _OFF_ARGS."""
+    raw = bytes(buf[_OFF_ARGS : _OFF_ARGS + _CTRL_SHM_NAME_BYTES])
+    nul = raw.find(b"\x00")
+    return raw[: nul if nul >= 0 else _CTRL_SHM_NAME_BYTES].decode("utf-8", "replace")
+
+
+def _shm_base_addr(shm: SharedMemory) -> int:
+    """Mapped base address of ``shm``. The mapping outlives the temporary buffer
+    view, so the address stays valid until ``shm.close()``."""
+    view = shm.buf
+    assert view is not None
+    exporter = ctypes.c_char.from_buffer(view)
+    addr = ctypes.addressof(exporter)
+    del exporter
+    return addr
+
+
+def _rebuild_host_buf_ranges(
+    host_buf_table: dict[int, tuple[SharedMemory, int, int, int]], host_buf_ranges: list[tuple[int, int, int]]
+) -> None:
+    host_buf_ranges.clear()
+    for _shm, lo, hi, base in host_buf_table.values():
+        host_buf_ranges.append((lo, hi, base))
+
+
+def _handle_ctrl_map_host(
+    buf: memoryview,
+    host_buf_table: dict[int, tuple[SharedMemory, int, int, int]],
+    host_buf_ranges: list[tuple[int, int, int]],
+) -> None:
+    """Child handler for _CTRL_MAP_HOST: persist a host-buffer mapping.
+
+    The staged payload is ``token, parent_va, nbytes`` followed by the host
+    buffer's shm name. Map that shm and remember the parent VA range it stands
+    in for so the per-task blob rewrite can redirect host pointers to this base.
+    """
+    payload_size = struct.unpack_from("Q", buf, _CTRL_OFF_ARG0)[0]
+    staged = SharedMemory(name=_read_ctrl_staged_shm_name(buf))
+    try:
+        staged_buf = staged.buf
+        assert staged_buf is not None
+        payload = bytes(staged_buf[:payload_size])
+    finally:
+        staged.close()
+    token, parent_va, nbytes = _HOST_BUF_MAP_HEADER.unpack_from(payload, 0)
+    host_shm_name = payload[_HOST_BUF_MAP_HEADER.size :].decode("utf-8")
+    prior = host_buf_table.pop(token, None)
+    if prior is not None:
+        prior[0].close()
+    # Rebuild ranges in a finally so a raise from SharedMemory / _shm_base_addr
+    # cannot leave the just-popped prior mapping's stale range in host_buf_ranges.
+    try:
+        host_shm = SharedMemory(name=host_shm_name)
+        host_buf_table[token] = (host_shm, parent_va, parent_va + nbytes, _shm_base_addr(host_shm))
+    finally:
+        _rebuild_host_buf_ranges(host_buf_table, host_buf_ranges)
+
+
+def _handle_ctrl_unmap_host(
+    buf: memoryview,
+    host_buf_table: dict[int, tuple[SharedMemory, int, int, int]],
+    host_buf_ranges: list[tuple[int, int, int]],
+) -> None:
+    """Child handler for _CTRL_UNMAP_HOST: drop a host-buffer mapping by token."""
+    payload_size = struct.unpack_from("Q", buf, _CTRL_OFF_ARG0)[0]
+    staged = SharedMemory(name=_read_ctrl_staged_shm_name(buf))
+    try:
+        staged_buf = staged.buf
+        assert staged_buf is not None
+        token = _HOST_BUF_UNMAP.unpack_from(bytes(staged_buf[:payload_size]), 0)[0]
+    finally:
+        staged.close()
+    entry = host_buf_table.pop(token, None)
+    if entry is not None:
+        entry[0].close()
+        _rebuild_host_buf_ranges(host_buf_table, host_buf_ranges)
 
 
 def _allocate_local_slot(registry: dict[int, Any]) -> int:
@@ -974,6 +1142,12 @@ def _run_chip_main_loop(  # noqa: PLR0912, PLR0913, PLR0915 -- unified TASK_READ
     """
     prepared: set[int] = set()
     l3_l2_control_shms: list[SharedMemory] = []
+    # Post-fork host buffers mapped into this child. `host_buf_table`
+    # owns the mmap per token (for unmap + teardown); `host_buf_ranges` is the
+    # parent-VA → child-VA translation table the per-task blob rewrite consults,
+    # rebuilt from the table on every map/unmap.
+    host_buf_table: dict[int, tuple[SharedMemory, int, int, int]] = {}  # token -> (shm, lo, hi, child_base)
+    host_buf_ranges: list[tuple[int, int, int]] = []  # (parent_lo, parent_hi, child_base)
     try:
         while True:
             state = _mailbox_load_i32(state_addr)
@@ -997,6 +1171,11 @@ def _run_chip_main_loop(  # noqa: PLR0912, PLR0913, PLR0915 -- unified TASK_READ
                             f"chip_process dev={device_id}: cid {cid} not prepared before TASK_READY "
                             f"(register via _CTRL_PREPARE first)"
                         )
+                    # Redirect any registered host pointer (a parent VA) in the
+                    # blob to this child's own mapping before the runtime reads it.
+                    # No-op when nothing is registered.
+                    if host_buf_ranges:
+                        _rewrite_blob_host_addrs(buf, _OFF_TASK_ARGS_BLOB, host_buf_ranges)
                     # Hand the mailbox bytes straight to C++ (zero-copy zero-decode):
                     # the blob layout is what `write_blob` already wrote, so re-parsing
                     # it in Python is N×40B of avoidable work and a permanent
@@ -1050,9 +1229,7 @@ def _run_chip_main_loop(  # noqa: PLR0912, PLR0913, PLR0915 -- unified TASK_READ
                     elif sub_cmd == _CTRL_REGISTER:
                         digest = _read_control_digest(buf)
                         payload_size = struct.unpack_from("Q", buf, _CTRL_OFF_ARG0)[0]
-                        raw = bytes(buf[_OFF_ARGS : _OFF_ARGS + _CTRL_SHM_NAME_BYTES])
-                        nul = raw.find(b"\x00")
-                        shm_name = raw[: nul if nul >= 0 else _CTRL_SHM_NAME_BYTES].decode("utf-8", "replace")
+                        shm_name = _read_ctrl_staged_shm_name(buf)
                         shm = SharedMemory(name=shm_name)
                         shm_buf = shm.buf
                         assert shm_buf is not None
@@ -1111,6 +1288,10 @@ def _run_chip_main_loop(  # noqa: PLR0912, PLR0913, PLR0915 -- unified TASK_READ
                         _handle_ctrl_comm_init(cw, buf)
                     elif sub_cmd == _CTRL_L3_L2_ORCH_COMM_INIT:
                         l3_l2_control_shms.append(_handle_ctrl_l3_l2_orch_comm_init(cw, buf))
+                    elif sub_cmd == _CTRL_MAP_HOST:
+                        _handle_ctrl_map_host(buf, host_buf_table, host_buf_ranges)
+                    elif sub_cmd == _CTRL_UNMAP_HOST:
+                        _handle_ctrl_unmap_host(buf, host_buf_table, host_buf_ranges)
                     else:
                         raise RuntimeError(f"unknown control sub-command {int(sub_cmd)}")
                 except Exception as e:  # noqa: BLE001
@@ -1137,6 +1318,11 @@ def _run_chip_main_loop(  # noqa: PLR0912, PLR0913, PLR0915 -- unified TASK_READ
         for control_shm in reversed(l3_l2_control_shms):
             try:
                 control_shm.close()
+            except Exception:  # noqa: BLE001
+                pass
+        for host_shm, _lo, _hi, _base in host_buf_table.values():
+            try:
+                host_shm.close()
             except Exception:  # noqa: BLE001
                 pass
 
@@ -1281,9 +1467,7 @@ def _child_worker_loop(
                 if sub_cmd == _CTRL_REGISTER:
                     digest = _read_control_digest(buf)
                     payload_size = struct.unpack_from("Q", buf, _CTRL_OFF_ARG0)[0]
-                    raw = bytes(buf[_OFF_ARGS : _OFF_ARGS + _CTRL_SHM_NAME_BYTES])
-                    nul = raw.find(b"\x00")
-                    shm_name = raw[: nul if nul >= 0 else _CTRL_SHM_NAME_BYTES].decode("utf-8", "replace")
+                    shm_name = _read_ctrl_staged_shm_name(buf)
                     callable_obj = _read_chip_callable_from_shm(shm_name, int(payload_size))
                     inner_registered = False
                     try:
@@ -1431,6 +1615,22 @@ class Worker:
         self._l3_l2_orch_comm_clients: dict[int, Any] = {}
         self._live_l3_l2_regions: list[Any] = []
         self._l3_l2_orch_comm_host_buffers: dict[int, int] = {}
+
+        # Post-fork zero-copy host buffers (``create_host_buffer``). Keyed by the
+        # born-shared shm's mapped base (== the buffer's data_ptr); each entry maps
+        # a named shm into every chip child so memory created after the children
+        # were forked is still reachable by a later run — with no per-run copy.
+        self._host_buf_registry: dict[int, _HostBufEntry] = {}
+        # Immutable read snapshot for the lock-free per-submit lookup
+        # (``_find_host_buf_entry``): a ``(sorted_ptrs_tuple, registry_copy)`` pair
+        # rebuilt under ``_registry_lock`` on every create/free and rebound
+        # atomically. The reader loads it once, so the sorted keys and the dict it
+        # bisects into never mutate mid-lookup — no lock, no torn read, no
+        # IndexError from a concurrent free shrinking the list. Host buffers are
+        # distinct, non-overlapping allocations, so the unique candidate for an
+        # address is the entry with the greatest base <= addr.
+        self._host_buf_snapshot: tuple[tuple[int, ...], dict[int, _HostBufEntry]] = ((), {})
+        self._host_buf_token_counter: int = 0
 
     def _comm_plan_rootinfo_path(self) -> str:
         """Per-Worker rootinfo path used by HCCL/sim base comm_init.
@@ -3787,6 +3987,290 @@ class Worker:
         self._orch.copy_from(worker_id, dst, src, size)
 
     # ------------------------------------------------------------------
+    # Post-fork zero-copy host buffers
+    # ------------------------------------------------------------------
+
+    def create_host_buffer(self, nbytes: int) -> HostBuffer:
+        """Allocate a born-shared host buffer, attached into every chip child,
+        that a later ``run()`` reads/writes with **no per-run copy**.
+
+        L3 chip children are forked lazily on the first ``run()``; memory created
+        afterwards is not in their address space. This hands you memory that is
+        *born* in a shm already attached into every child, so there is nothing to
+        copy: the child reads and writes the same physical pages the parent sees.
+
+        Returns a :class:`HostBuffer` whose ``buffer`` is a ``memoryview`` over
+        that shm. Build a tensor over it with the buffer protocol, framework of
+        your choice, and pass it to ``run()`` as usual::
+
+            buf = worker.create_host_buffer(n * 4)
+            t = torch.frombuffer(buf.buffer, dtype=torch.float32, count=n)
+            t.uniform_(0, 1)                       # in place → lands in the shm
+            worker.run(orch(chip, t, out), args=None, config=CallConfig())
+            worker.free_host_buffer(buf)           # drop the tensor first
+
+        simpler stays framework-free: torch/numpy appear only on the user's side
+        (``frombuffer``). Blocks until every chip child has attached the buffer;
+        not thread-safe against a concurrent ``run`` / ``create`` / ``free`` on
+        the same Worker — drive them from one thread, as the L3 worker is
+        otherwise.
+        """
+        if self.level < 3:
+            raise TypeError("create_host_buffer requires a level >= 3 Worker")
+        if not self._initialized:
+            raise RuntimeError("create_host_buffer requires Worker.init() before allocation")
+        self._start_hierarchical()
+        if not self._chip_shms:
+            raise RuntimeError("create_host_buffer requires forked chip children (none are configured)")
+        assert self._worker is not None
+
+        nbytes = int(nbytes)
+        if nbytes <= 0:
+            raise ValueError("create_host_buffer: nbytes must be positive")
+
+        # Create the shm up front, then guard everything after it — mapping the
+        # address (``_shm_base_addr``), reserving the registry slot, and the
+        # broadcast — under one ``try`` so any failure closes and unlinks the shm
+        # instead of leaking a /dev/shm segment. The registry mutation stays under
+        # ``_registry_lock`` (mirrors Worker.register's discipline); the slow
+        # broadcast runs *outside* the lock — wire-level concurrency is serialized
+        # at the C++ mailbox, not here. The born-shared shm's own mapped base is
+        # the buffer's data_ptr, so a tensor built over buffer.buffer resolves to
+        # this registered range.
+        shm = SharedMemory(create=True, size=nbytes)
+        token: int | None = None
+        data_ptr: int | None = None
+        try:
+            data_ptr = _shm_base_addr(shm)
+            with self._registry_lock:
+                token = self._host_buf_token_counter
+                self._host_buf_token_counter += 1
+                entry = _HostBufEntry(
+                    token=token,
+                    data_ptr=data_ptr,
+                    nbytes=nbytes,
+                    shm=shm,
+                    shm_name=shm.name,
+                    shm_base=data_ptr,
+                )
+                self._host_buf_registry[data_ptr] = entry
+                self._rebuild_host_buf_snapshot()
+
+            payload = _HOST_BUF_MAP_HEADER.pack(token, data_ptr, nbytes) + shm.name.encode("utf-8")
+            results = self._worker.broadcast_control_all(
+                WorkerType.NEXT_LEVEL,
+                int(_CTRL_MAP_HOST),
+                payload,
+                None,
+                timeout_s=self._py_control_timeout_s,
+            )
+            errors = self._control_errors(list(results))
+            if errors:
+                raise RuntimeError(
+                    f"create_host_buffer: MAP_HOST failed on {len(errors)} chip children; first error: {errors[0]}"
+                )
+        except BaseException:
+            # Roll back on any failure — a staging error before the map, a partial
+            # map, or an exception from the broadcast itself (any of which would
+            # otherwise leak the shm): unmap any child that took it, drop the
+            # reservation, free the shm. No user view exists yet, so close() cannot
+            # be blocked by an exported buffer.
+            try:
+                if token is not None:
+                    self._broadcast_host_unmap(token)
+            except Exception as unmap_exc:  # noqa: BLE001 -- must not mask the original failure below
+                sys.stderr.write(
+                    f"[worker pid={os.getpid()}] WARN: create_host_buffer rollback UNMAP_HOST "
+                    f"failed (continuing best-effort): {unmap_exc}\n"
+                )
+                sys.stderr.flush()
+            finally:
+                with self._registry_lock:
+                    if data_ptr is not None and self._host_buf_registry.pop(data_ptr, None) is not None:
+                        self._rebuild_host_buf_snapshot()
+                shm.close()
+                try:
+                    shm.unlink()
+                except FileNotFoundError:
+                    pass
+            raise
+
+        buf_view = shm.buf
+        assert buf_view is not None
+        return HostBuffer(token=token, data_ptr=data_ptr, nbytes=nbytes, buffer=buf_view)
+
+    def free_host_buffer(self, handle: HostBuffer) -> None:
+        """Release a born-shared buffer created by ``create_host_buffer``.
+
+        Unmaps it from every chip child and frees the parent shm. Drop every
+        tensor / ``memoryview`` you built over ``handle.buffer`` *first*: a live
+        view keeps the shm's pages exported, so ``close()`` cannot release them
+        and the buffer only warns (and is reclaimed once the last view is gone).
+
+        Best-effort and idempotent: a stale handle whose token no longer matches
+        (e.g. freed twice) is a silent no-op.
+        """
+        if not isinstance(handle, HostBuffer):
+            raise TypeError("free_host_buffer expects a HostBuffer from create_host_buffer")
+        with self._registry_lock:
+            entry = self._host_buf_registry.get(handle.data_ptr)
+            if entry is None or entry.token != handle.token:
+                return
+            self._host_buf_registry.pop(handle.data_ptr, None)
+            self._rebuild_host_buf_snapshot()
+        errors: list[str] = []
+        try:
+            if self._worker is not None and getattr(self, "_hierarchical_started", False):
+                errors = self._broadcast_host_unmap(entry.token)
+        except Exception as exc:  # noqa: BLE001
+            errors = [str(exc)]
+        finally:
+            close_warn = self._close_host_shm(entry)
+            if close_warn:
+                errors.append(close_warn)
+        if errors:
+            sys.stderr.write(
+                f"[worker pid={os.getpid()}] WARN: free_host_buffer token={entry.token} "
+                f"failed on {len(errors)} chip children; first error: {errors[0]}\n"
+            )
+            sys.stderr.flush()
+
+    @staticmethod
+    def _close_host_shm(entry: _HostBufEntry) -> str | None:
+        """Close + unlink a host-buffer's parent shm.
+
+        Returns a warning string (else ``None``) when a still-live view over a
+        zero-copy buffer blocks ``close()``: ``memoryview.release()`` raises
+        ``BufferError`` while a tensor built via ``frombuffer`` still holds the
+        pages exported. The name is unlinked regardless, so the OS reclaims the
+        segment once the user drops that last view.
+        """
+        warn: str | None = None
+        try:
+            entry.shm.close()
+        except BufferError:
+            warn = (
+                f"host buffer token={entry.token} still has a live view (a tensor/memoryview over "
+                f"buffer.buffer); drop it before free_host_buffer/close() to release the shm promptly"
+            )
+        try:
+            entry.shm.unlink()
+        except FileNotFoundError:
+            pass
+        return warn
+
+    def _release_all_host_buffers(self) -> None:
+        """Unmap + free every still-registered host buffer (called from close())."""
+        with self._registry_lock:
+            entries = list(self._host_buf_registry.values())
+            self._host_buf_registry.clear()
+            self._rebuild_host_buf_snapshot()
+        for entry in entries:
+            try:
+                if self._worker is not None and getattr(self, "_hierarchical_started", False):
+                    self._broadcast_host_unmap(entry.token)
+            except Exception as exc:  # noqa: BLE001
+                # A failed unmap broadcast must not strand the parent shm; log it
+                # (mirrors free_host_buffer) instead of swallowing silently.
+                sys.stderr.write(
+                    f"[worker pid={os.getpid()}] WARN: close() UNMAP_HOST token={entry.token} "
+                    f"failed (continuing best-effort): {exc}\n"
+                )
+                sys.stderr.flush()
+            finally:
+                # Tolerates a still-live view over a zero-copy buffer at close():
+                # unlinks the name regardless so the OS reclaims it once dropped.
+                self._close_host_shm(entry)
+
+    def _broadcast_host_unmap(self, token: int) -> list[str]:
+        """Broadcast _CTRL_UNMAP_HOST for ``token`` to every chip child."""
+        if self._worker is None:
+            return []
+        results = self._worker.broadcast_control_all(
+            WorkerType.NEXT_LEVEL,
+            int(_CTRL_UNMAP_HOST),
+            _HOST_BUF_UNMAP.pack(token),
+            None,
+            timeout_s=self._py_control_timeout_s,
+        )
+        return self._control_errors(list(results))
+
+    def _stage_host_buffers_for_chip_submit(self, args: Any) -> None:
+        """Validate the host tensors of one chip submit before dispatch.
+
+        Called from ``Orchestrator.submit_next_level`` on the LOCAL_CHIP path —
+        only there does the forked child dereference raw host pointers. Each host
+        tensor is either:
+
+        * inside a buffer from ``create_host_buffer`` → born-shared, so its bytes
+          already live in the child-visible shm and the child writes results back
+          into the same physical pages: nothing to copy. ``_find_host_buf_entry``
+          still validates the view fits inside the buffer (else the child would
+          read past its shm mapping);
+        * unregistered → forwarded unvalidated. A fork-inherited ``share_memory_``
+          tensor is the legitimate case; an unregistered post-fork tensor reads
+          stale/unmapped memory in the child — allocate it with
+          ``create_host_buffer`` instead.
+
+        The child rewrites in-range host pointers to its own mapping; see
+        _rewrite_blob_host_addrs.
+        """
+        for i in range(args.tensor_count()):
+            tensor = args.tensor(i)
+            if tensor.child_memory:
+                continue
+            addr = int(tensor.data)
+            if addr == 0:
+                continue
+            # Raises if an in-range view overruns its buffer; otherwise there is
+            # nothing to do — the born-shared bytes are already child-visible.
+            self._find_host_buf_entry(addr, int(tensor.nbytes()))
+
+    def _rebuild_host_buf_snapshot(self) -> None:
+        """Rebuild the lock-free read snapshot from the registry.
+
+        Caller must hold ``_registry_lock``. Rebinds ``_host_buf_snapshot`` to a
+        fresh ``(sorted_ptrs_tuple, registry_copy)`` pair so an in-flight
+        ``_find_host_buf_entry`` keeps reading the prior immutable snapshot until
+        the single atomic rebind swaps it — see ``_find_host_buf_entry``.
+        """
+        registry = dict(self._host_buf_registry)
+        self._host_buf_snapshot = (tuple(sorted(registry)), registry)
+
+    def _find_host_buf_entry(self, addr: int, nbytes: int) -> _HostBufEntry | None:
+        """Host buffer whose ``[data_ptr, data_ptr+nbytes)`` contains the whole
+        ``[addr, addr+nbytes)`` view, or None. Raises if a view starts inside a
+        buffer but runs past its end (would read past the shm in the child).
+
+        Host buffers are distinct, non-overlapping allocations, so the only
+        candidate for ``addr`` is the entry with the greatest base ``<= addr`` —
+        found by bisecting the snapshot's sorted keys so this stays log-time on
+        the per-submit hot path rather than scanning every buffer.
+
+        Sub-view matching assumes the blob's ``Tensor.buffer.addr`` is the
+        contiguous base of the host buffer (``make_tensor_arg`` builds tensors with
+        ``start_offset == 0``); a non-zero ``start_offset`` would shift ``addr``
+        and is not modelled here.
+        """
+        # Load the immutable snapshot once: sorted keys and the dict they index
+        # into are captured together, so a concurrent create/free (which rebinds a
+        # fresh snapshot) cannot mutate what we bisect and index here — no lock, no
+        # IndexError from a shrinking list, no torn key/dict pairing.
+        sorted_ptrs, registry = self._host_buf_snapshot
+        idx = bisect.bisect_right(sorted_ptrs, addr) - 1
+        if idx < 0:
+            return None
+        entry = registry.get(sorted_ptrs[idx])
+        if entry is None or addr >= entry.data_ptr + entry.nbytes:
+            return None
+        if addr + nbytes > entry.data_ptr + entry.nbytes:
+            raise RuntimeError(
+                f"Host tensor 0x{addr:x} (+{nbytes} B) overruns its host buffer "
+                f"0x{entry.data_ptr:x} (+{entry.nbytes} B); create a buffer at least as large."
+            )
+        return entry
+
+    # ------------------------------------------------------------------
     # run — uniform entry point
     # ------------------------------------------------------------------
 
@@ -3911,6 +4395,10 @@ class Worker:
         except BaseException as exc:  # noqa: BLE001
             sys.stderr.write(f"Worker.close(): remote buffer cleanup reported error (continuing): {exc}\n")
             sys.stderr.flush()
+
+        # Release any host buffers the user never unregistered. Must run while
+        # the chip mailboxes are still usable (before _worker.close()).
+        self._release_all_host_buffers()
 
         if self.level == 2:
             if self._chip_worker:

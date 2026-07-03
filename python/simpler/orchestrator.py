@@ -187,6 +187,11 @@ class Orchestrator:
                 raise TypeError("RemoteTensorRef is only supported for RemoteCallable NEXT_LEVEL submits")
             remote_sidecar = None
         _validate_remote_sidecar_access(c_args, remote_sidecar)
+        # Validate the post-fork host buffers of this submit (issue #1027). Only
+        # the LOCAL_CHIP path dereferences raw host pointers in the forked child;
+        # zero-copy buffers need no per-run mirror, just an in-range fit check.
+        if target_namespace == "LOCAL_CHIP" and self._worker is not None:
+            self._worker._stage_host_buffers_for_chip_submit(c_args)
         final_worker_ids = _remote_data_eligible_worker_ids(remote_sidecar, eligible_worker_ids)
         cpp_worker_id = int(worker)
         captured_refs = self._worker._capture_remote_sidecar_refs(remote_sidecar) if self._worker is not None else []
@@ -249,6 +254,11 @@ class Orchestrator:
         if remote_sidecars is not None:
             for c_args, remote_sidecar in zip(c_args_list, remote_sidecars):
                 _validate_remote_sidecar_access(c_args, remote_sidecar)
+        # Validate post-fork host buffers for chip dispatch (issue #1027), same as
+        # the single submit path.
+        if target_namespace == "LOCAL_CHIP" and self._worker is not None:
+            for c_args in c_args_list:
+                self._worker._stage_host_buffers_for_chip_submit(c_args)
         worker_id_sets = (
             [
                 _remote_data_eligible_worker_ids(remote_sidecar, eligible_worker_ids)
