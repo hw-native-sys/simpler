@@ -427,8 +427,8 @@ static bool prepare_task(
     // Reset the fanout/fanin bookkeeping for this reuse. The allocator only
     // returns a slot whose previous occupant is CONSUMED and quiescent (alloc
     // spins until last_task_alive passes it; in-order reclaim + acquire load),
-    // and the slot is not published to any scheduler thread until the
-    // wiring.queue.push at the end of submit_task_common — so this reset is
+    // and the slot is not published to any scheduler thread until
+    // submit_task_common's wire_task at the end — so this reset is
     // race-free. Doing it here (not relying on the scheduler's eager
     // reset-after-CONSUMED, which only covers the contiguously-reclaimed tail)
     // makes every reused slot self-clean, which lets the per-boot SM init skip
@@ -445,14 +445,14 @@ static bool prepare_task(
     // here lets RingSchedState::init() skip the O(window_size) bind loop.
     // Both writes hit the same 64B slot_state cache line we're about to
     // dirty below, so the extra cost is two stores on an already-hot line.
-    // Must precede the scheduler wiring.queue.push at the end of
-    // submit_task_common — that push is the first read of slot_state->task /
-    // slot_state->payload by another thread.
+    // Must precede the wire_task call at the end of submit_task_common —
+    // wire_task is the first read of slot_state->task / slot_state->payload by
+    // another thread (producer fanout_lock + ready-queue push).
     out->slot_state->bind_buffers(out->payload, out->task);
 
     // prepare_task does NO payload writes: all payload content (tensors/scalars +
     // early-dispatch spec fields) is initialized in PTO2TaskPayload::init, the
-    // single payload-init point, which runs before the scheduler wiring push.
+    // single payload-init point, which runs before wire_task.
 
     // Fields already reset by advance_ring_pointers (eager reset after CONSUMED):
     //   fanout_lock=0, fanout_count=PTO2_FANOUT_SCOPE_BIT, fanout_head=nullptr,
@@ -686,8 +686,8 @@ static bool ensure_tensormap_capacity(PTO2OrchestratorState *orch, int32_t neede
 // Shared body for submit_task / submit_dummy_task. Caller has already validated
 // args.has_error, decided active_mask (empty for dummy), and resolved the per-slot
 // kernel_ids (all INVALID_KERNEL_ID for dummy). Performs tensormap sync, fanin
-// computation (explicit_deps + auto), output registration, slot init, and pushes
-// to the scheduler wiring queue.
+// computation (explicit_deps + auto), output registration, slot init, and
+// in-line fanout wiring.
 static TaskOutputTensors submit_task_common(
     PTO2OrchestratorState *orch, const L0TaskArgs &args, ActiveMask active_mask, int32_t aic_kernel_id,
     int32_t aiv0_kernel_id, int32_t aiv1_kernel_id
@@ -865,28 +865,23 @@ static TaskOutputTensors submit_task_common(
 
     CYCLE_COUNT_LAP(g_orch_args_cycle);
 
-    // === STEP 6: push to wiring queue ===
-    // Deferred wiring: orchestrator only stores dependency metadata and increments
-    // fanout_count. The actual fanout_head wiring (lock + dep_pool + early_finished)
-    // is handled asynchronously by scheduler thread 0 via the wiring queue.
-    // Push to global wiring queue — scheduler sets fanin_count, wires fanout, checks readiness
-    if (!sched->wiring.queue.push(&cur_slot_state)) {
-        // producer_blocked is the wiring deadlock detector's "orchestrator is
-        // stuck in push" observable: set ONLY while we actually spin (queue
-        // full), cleared on exit, so the just-filled-then-scope_end case (push
-        // succeeded, no spin) never trips a false deadlock. Also poll the shared
-        // orch_error_code so a fatal latched by any party (e.g. that detector)
-        // breaks this otherwise-unbounded spin and unwinds orchestration.
-        sched->wiring.producer_blocked.store(1, std::memory_order_release);
-        while (!sched->wiring.queue.push(&cur_slot_state)) {
-            if (orch->sm_header->orch_error_code.load(std::memory_order_acquire) != PTO2_ERROR_NONE) {
-                orch->fatal = true;
-                sched->wiring.producer_blocked.store(0, std::memory_order_release);
-                return result;
-            }
-            SPIN_WAIT_HINT();
+    // === STEP 6: wire fanout edges inline (orchestrator-side) ===
+    // The orchestrator wires each task's fanout edges directly; there is no
+    // deferred wiring queue. dep_pool is touched only here, so it is
+    // orchestrator-exclusive and needs no lock (previously it was thread-0 of
+    // the scheduler for the same single-writer reason). For tasks with live
+    // producers we block in ensure_space (reclaim + spin + overflow detect) —
+    // the same pattern as fanin_pool.ensure_space in append_fanin_or_fail.
+    // wire_task links fanout_head, seeds fanin_refcount, and routes the task
+    // ready itself once its fanin is satisfied.
+    {
+        auto &rss = sched->ring_sched_states[ring_id];
+        int32_t wfanin = payload.fanin_actual_count;
+        if (wfanin > 0 && !rss.dep_pool.ensure_space(*rss.ring, wfanin)) {
+            orch_mark_fatal(orch, PTO2_ERROR_DEP_POOL_OVERFLOW);
+            return result;
         }
-        sched->wiring.producer_blocked.store(0, std::memory_order_release);
+        sched->wire_task(rss, &cur_slot_state, wfanin);
     }
 
     CYCLE_COUNT_LAP(g_orch_fanin_cycle);

@@ -297,8 +297,7 @@ private:
     // True if mix tasks remain in the global MIX ready queue. Approximate —
     // PTO2ReadyQueue::size() (see pto_scheduler.h) snapshots its enqueue/dequeue
     // positions with std::memory_order_relaxed and may interleave with concurrent
-    // push/pop. Don't confuse with PTO2SpscQueue::size(), which uses acquire
-    // loads — that one isn't on this path. A stale read here causes at most one
+    // push/pop. A stale read here causes at most one
     // extra/missed AIC/AIV skip and self-corrects on the next loop iteration.
     bool has_residual_mix() const {
         return sched_->ready_queues[static_cast<int32_t>(PTO2ResourceShape::MIX)].size() > 0;

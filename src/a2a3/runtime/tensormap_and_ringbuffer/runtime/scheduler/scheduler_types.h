@@ -419,7 +419,6 @@ struct alignas(64) SchedL2SwimlaneCounters {
     uint64_t sched_start_ts{0};
     uint64_t sched_complete_cycle{0};
     uint64_t sched_dispatch_cycle{0};
-    uint64_t sched_wiring_cycle{0};
     uint64_t sched_idle_cycle{0};
     uint64_t sched_loop_count{0};
     uint32_t phase_complete_count{0};
@@ -437,7 +436,6 @@ struct alignas(64) SchedL2SwimlaneCounters {
     uint64_t pop_hit_at_last_emit{0};
     uint64_t pop_miss_at_last_emit{0};
 #if PTO2_SCHED_PROFILING
-    uint32_t phase_wiring_count{0};
     uint64_t complete_probe_count{0};
     uint64_t complete_hit_count{0};
     uint64_t sched_complete_perf_cycle{0};

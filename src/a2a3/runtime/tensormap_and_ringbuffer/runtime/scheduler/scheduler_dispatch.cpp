@@ -931,36 +931,6 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
             continue;
         }
 
-        // Phase 3: Drain wiring queue (thread 0 only)
-        int wired = 0;
-        if (thread_idx == 0) {
-            wired = sched_->drain_wiring_queue(orchestrator_done_.load(std::memory_order_relaxed));
-            if (wired > 0) {
-                made_progress = true;
-#if PTO2_SCHED_PROFILING
-                l2_swimlane.phase_wiring_count += wired;
-#endif
-            }
-        }
-#if PTO2_PROFILING
-        CYCLE_COUNT_LAP(l2_swimlane.sched_wiring_cycle);
-        // Wire outer phase: emit one bar covering this iter's drain_wiring_queue
-        // pass when it wired any tasks. tasks_processed = wired count. Resolve
-        // does NOT nest under Wire — wiring only enqueues, the consumer release
-        // happens later in Complete/Dummy.
-        if (l2_swimlane_level_ >= L2SwimlaneLevel::SCHED_PHASES && wired > 0) {
-            int16_t phase_end_shared[L2SWIMLANE_NUM_QUEUE_SHAPES];
-            capture_phase_end_fresh(phase_end_shared);
-            l2_swimlane_aicpu_record_sched_phase(
-                thread_idx, L2SwimlaneSchedPhaseKind::Wire, _t0_phase, _t1, l2_swimlane.sched_loop_count,
-                static_cast<uint32_t>(wired), /*pop_hit=*/0, /*pop_miss=*/0, phase_start_shared, phase_end_shared
-            );
-            for (int s = 0; s < L2SWIMLANE_NUM_QUEUE_SHAPES; s++)
-                phase_start_shared[s] = phase_end_shared[s];
-            _t0_phase = _t1;
-        }
-#endif
-
         // Phase 3b: Drain dummy ready queue (thread 0 only).
         //
         // Dependency-only tasks bypass AICore dispatch: they go through the

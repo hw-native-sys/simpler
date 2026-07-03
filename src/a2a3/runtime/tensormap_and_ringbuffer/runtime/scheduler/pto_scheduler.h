@@ -386,135 +386,6 @@ bool ready_queue_init_data_from_layout(PTO2ReadyQueue *queue, DeviceArena &arena
 void ready_queue_wire_arena_pointers(PTO2ReadyQueue *queue, DeviceArena &arena, size_t slots_off);
 void ready_queue_destroy(PTO2ReadyQueue *queue);
 
-// =============================================================================
-// SPSC Queue (Single-Producer Single-Consumer, wait-free)
-// =============================================================================
-//
-// Bounded ring buffer optimized for the wiring queue use case:
-//   - Producer: orchestrator thread (push)
-//   - Consumer: scheduler thread 0 (pop_batch)
-//
-// Design based on Rigtorp's cached-index technique: each side caches
-// the other's index locally, avoiding cross-core cache line bouncing
-// on the hot path. Only when the local cache says "full" or "empty"
-// does the thread issue an acquire load on the remote index.
-//
-// Memory layout: 5 cache-line-aligned fields ensure zero false sharing.
-
-struct alignas(64) PTO2SpscQueue {
-    // --- Producer cache lines (orchestrator thread) ---
-    alignas(64) std::atomic<uint64_t> head_{0};
-    alignas(64) uint64_t tail_cached_{0};
-
-    // --- Consumer cache lines (scheduler thread 0) ---
-    alignas(64) std::atomic<uint64_t> tail_{0};
-    alignas(64) uint64_t head_cached_{0};
-
-    // --- Shared Cacheline (read only) with mask and data ptr (immutable after init) ---
-    alignas(64) PTO2TaskSlotState **buffer_{nullptr};
-    uint64_t mask_{0};
-
-    // Padding to exactly 5 cache lines
-    char padding[64 - sizeof(PTO2TaskSlotState **) - sizeof(uint64_t)];
-
-    // Reserve the backing buffer region on the supplied arena. Returns the
-    // region offset, to be passed to init_from_layout() after the arena is
-    // committed. Cache-line aligned: the buffer is shared between the
-    // orchestrator (push) and scheduler thread 0 (pop_batch), so its base
-    // must not false-share with neighboring regions.
-    static size_t reserve_layout(DeviceArena &arena, uint64_t capacity) {
-        return arena.reserve(capacity * sizeof(uintptr_t), PTO2_ALIGN_SIZE);
-    }
-
-    // Writes everything except the arena-internal `buffer_` pointer field
-    // (zeros the slot pointer array, mask/head/tail). The host pre-builds the
-    // image without storing a host address in buffer_; the AICPU wires
-    // buffer_ at boot via wire_arena_pointers().
-    bool init_data_from_layout(DeviceArena &arena, size_t buffer_off, uint64_t capacity) {
-        if (capacity == 0 || (capacity & (capacity - 1)) != 0) return false;
-        auto *buf = static_cast<PTO2TaskSlotState **>(arena.region_ptr(buffer_off));
-        // calloc'd-equivalent: zero the slot pointers so spurious early pops
-        // observe nullptr.
-        for (uint64_t i = 0; i < capacity; i++)
-            buf[i] = nullptr;
-        mask_ = capacity - 1;
-        head_.store(0, std::memory_order_relaxed);
-        tail_.store(0, std::memory_order_relaxed);
-        tail_cached_ = 0;
-        head_cached_ = 0;
-        return true;
-    }
-
-    // Wire the arena-internal pointer. Called by both host (with host arena)
-    // and AICPU (with device arena attached to the prebuilt image).
-    void wire_arena_pointers(DeviceArena &arena, size_t buffer_off) {
-        buffer_ = static_cast<PTO2TaskSlotState **>(arena.region_ptr(buffer_off));
-    }
-
-    void reset_for_reuse() {
-        uint64_t h = head_.load(std::memory_order_relaxed);
-        tail_.store(h, std::memory_order_relaxed);
-        tail_cached_ = h;
-        head_cached_ = h;
-    }
-
-    // Arena owns the buffer; here we only forget our pointer.
-    void destroy() { buffer_ = nullptr; }
-
-    // Push one item (producer only). Returns false if queue is full.
-    // Full condition: next_h - tail > mask_ (i.e. > capacity-1), so the
-    // effective usable capacity is capacity-1 (one slot is wasted as a
-    // sentinel to distinguish full from empty). uint64_t wrapping is safe
-    // since head and tail are monotonically increasing and subtraction
-    // wraps correctly.
-    bool push(PTO2TaskSlotState *item) {
-        uint64_t h = head_.load(std::memory_order_relaxed);
-        uint64_t next_h = h + 1;
-        if (next_h - tail_cached_ > mask_) {
-            tail_cached_ = tail_.load(std::memory_order_acquire);
-            if (next_h - tail_cached_ > mask_) {
-                return false;
-            }
-        }
-        buffer_[h & mask_] = item;
-        head_.store(next_h, std::memory_order_release);
-        return true;
-    }
-
-    // Pop up to max_count items (consumer only). Returns actual count.
-    int pop_batch(PTO2TaskSlotState **out, int max_count) {
-        uint64_t t = tail_.load(std::memory_order_relaxed);
-        uint64_t avail = head_cached_ - t;
-        if (avail < static_cast<uint64_t>(max_count)) {
-            head_cached_ = head_.load(std::memory_order_acquire);
-            avail = head_cached_ - t;
-            if (avail == 0) return 0;
-        }
-        int count = (avail < static_cast<uint64_t>(max_count)) ? static_cast<int>(avail) : max_count;
-        for (int i = 0; i < count; i++) {
-            out[i] = buffer_[(t + i) & mask_];
-        }
-        tail_.store(t + count, std::memory_order_release);
-        return count;
-    }
-
-    // Approximate size (used for backoff decisions, not exact).
-    uint64_t size() const {
-        uint64_t h = head_.load(std::memory_order_acquire);
-        uint64_t t = tail_.load(std::memory_order_acquire);
-        return h - t;
-    }
-
-    // Full ⟺ the producer's next push() would fail: size has reached the
-    // usable capacity (mask_ = capacity - 1, one slot reserved as sentinel).
-    // Used by the wiring-queue deadlock detector to prove the orchestrator is
-    // blocked in push().
-    bool full() const { return size() >= mask_; }
-};
-
-static_assert(sizeof(PTO2SpscQueue) == 5 * 64, "PTO2SpscQueue must be exactly 5 cache lines (320B)");
-// =============================================================================
-
 /**
  * Statistics returned by mixed-task completion processing
  */
@@ -535,9 +406,7 @@ struct PTO2SchedulerLayout {
     size_t off_dummy_ready_queue_slots;
     size_t off_early_dispatch_queue_slots;
     size_t off_dep_pool_entries[PTO2_MAX_RING_DEPTH];
-    size_t off_wiring_spsc_buffer;
     uint64_t ready_queue_capacity;
-    uint64_t spsc_capacity;
     int32_t dep_pool_capacities[PTO2_MAX_RING_DEPTH];
 };
 
@@ -559,12 +428,8 @@ struct PTO2SchedulerState {
         int32_t last_task_alive;
         std::atomic<int32_t> advance_lock;  // multi-thread CAS
 
-        // --- Cache Line 1+: Thread 0 only (wiring dep_pool) ---
+        // --- Cache Line 1+: dep_pool (orchestrator-only writer, no lock) ---
         alignas(64) PTO2DepListPool dep_pool;
-        // One-shot latch for the wiring-queue deadlock report (thread 0 only):
-        // the drain breaks on dep_pool exhaustion every call while wedged, so
-        // the tier-1 structural diagnostic is emitted once, not per call.
-        bool dep_deadlock_reported = false;
 #if PTO2_PROFILING
         // Published only for scope_stats; orchestrator must not read dep_pool's non-atomic counters directly.
         alignas(64) std::atomic<int32_t> dep_pool_snapshot_tail;
@@ -627,41 +492,6 @@ struct PTO2SchedulerState {
     // the dispatch loop and completed inline -- never goes to AICore.
     PTO2ReadyQueue dummy_ready_queue;
 
-    // Wiring subsystem — groups all wiring-related state for cache-line isolation.
-    //
-    // Three cache-line regions by writer:
-    //   1. batch_*  / backoff — thread 0 exclusive (local batch buffer)
-    //   2. queue    — SPSC: orchestrator push, thread 0 pop
-    //   3. orch_needs_drain — orchestrator write, thread 0 read
-    struct alignas(64) WiringState {
-        static constexpr uint64_t BATCH_SIZE = 30;
-        static constexpr int BACKOFF_LIMIT = 32;
-
-        // --- Thread 0 exclusive: local batch buffer + backoff ---
-        int batch_count = 0;
-        int batch_index = 0;
-        int backoff_counter = 0;
-        PTO2TaskSlotState *batch[BATCH_SIZE];
-
-        // --- SPSC queue: orchestrator (push) ↔ thread 0 (pop) ---
-        PTO2SpscQueue queue;
-
-        // --- Orchestrator write, thread 0 read ---
-        alignas(64) std::atomic<bool> orch_needs_drain{false};
-        // Set to 1 only while the orchestrator is actually spinning in
-        // queue.push() (queue full), cleared on a successful push. The wiring
-        // deadlock detector reads this as the producer-blocked observable: it
-        // proves the orchestrator is stuck BEFORE its scope_end, as opposed to
-        // having just filled the queue with its last in-scope push and being
-        // about to call scope_end (which would release the head -> no deadlock).
-        std::atomic<int32_t> producer_blocked{0};
-    } wiring;
-
-    static_assert(
-        offsetof(WiringState, queue) == 256, "WiringState: batch region must be exactly 4 cache lines before queue"
-    );
-    static_assert(sizeof(WiringState) == 640, "WiringState must be exactly 10 cache lines (640B)");
-
     alignas(64) AsyncWaitList async_wait_list;
 
     // Statistics (cold path, isolated from hot-path fields)
@@ -672,129 +502,6 @@ struct PTO2SchedulerState {
     // =========================================================================
     // Inline hot-path methods
     // =========================================================================
-
-    /**
-     * Drain wiring queue: pop submitted tasks and wire their fanout edges.
-     * Called by scheduler thread 0 each loop iteration. Sets fanin_count,
-     * acquires fanout_lock per producer, allocates dep_pool entries, and
-     * pushes ready tasks to the appropriate ready queue.
-     *
-     * @return Number of tasks wired this call.
-     */
-
-    int drain_wiring_queue(bool force_drain = false) {
-        int wired = 0;
-
-        // Refill local batch buffer when exhausted.
-        if (wiring.batch_index >= wiring.batch_count) {
-            // Backoff: defer pop when queue holds fewer than a full batch,
-            // unless force_drain, orch_needs_drain, or backoff limit reached.
-            if (!force_drain && wiring.queue.size() < WiringState::BATCH_SIZE) {
-                if (!wiring.orch_needs_drain.load(std::memory_order_acquire) &&
-                    wiring.backoff_counter < WiringState::BACKOFF_LIMIT) {
-                    wiring.backoff_counter++;
-                    return 0;
-                }
-            }
-            wiring.backoff_counter = 0;
-            wiring.batch_count = wiring.queue.pop_batch(wiring.batch, WiringState::BATCH_SIZE);
-            wiring.batch_index = 0;
-            if (wiring.batch_count == 0) return 0;
-        }
-
-        // Process tasks from local buffer in strict FIFO order.
-        while (wiring.batch_index < wiring.batch_count) {
-            PTO2TaskSlotState *ws = wiring.batch[wiring.batch_index];
-            int ring_id = ws->ring_id;
-            auto &rss = ring_sched_states[ring_id];
-            int32_t wfanin = ws->payload->fanin_actual_count;
-
-            if (wfanin > 0 && rss.dep_pool.available() < wfanin) {
-                rss.dep_pool.reclaim(*rss.ring, rss.last_task_alive);
-                if (rss.dep_pool.available() < wfanin) {
-#if PTO2_PROFILING
-                    if (is_scope_stats_enabled()) {
-                        rss.publish_dep_pool_snapshot();
-                    }
-#endif
-                    // dep_pool can't reclaim because the reclaim watermark is
-                    // wedged. This runs on the scheduler thread, so unlike
-                    // alloc()'s detector it cannot self-observe that the
-                    // orchestrator is blocked; wiring.producer_blocked is the
-                    // external certificate -- the orchestrator sets it ONLY while
-                    // it is actually spinning in queue.push() (cleared on a
-                    // successful push), so the "just filled the queue then called
-                    // scope_end" case (push succeeded -> flag stays 0) cannot trip
-                    // a false report. With the producer provably stuck in push
-                    // (program-order before its scope_end) AND the head COMPLETED,
-                    // all consumers released, scope still open (only scope_end
-                    // frees it), scope_end can never run -> provable head-of-line
-                    // deadlock. The producer-blocked gate also pins the head:
-                    // scope_end has not run, so the scope-gated head cannot be
-                    // CONSUMED/reset concurrently while we read it.
-                    if (!rss.dep_deadlock_reported && wiring.producer_blocked.load(std::memory_order_acquire) != 0) {
-                        int32_t last_alive = rss.last_task_alive;
-                        PTO2TaskSlotState &h = rss.ring->get_slot_state_by_task_id(last_alive);
-                        // Read the head under its fanout_lock: fanout_count is a
-                        // lock-protected field, and one snapshot keeps the check
-                        // and the report consistent.
-                        h.lock_fanout();
-                        int32_t state = h.task_state.load(std::memory_order_acquire);
-                        uint32_t fc = h.fanout_count;
-                        uint32_t rc = h.fanout_refcount.load(std::memory_order_acquire);
-                        h.unlock_fanout();
-                        bool head_scope_gated = (state == PTO2_TASK_COMPLETED) && (rc == (fc & ~PTO2_FANOUT_SCOPE_BIT));
-                        if (head_scope_gated) {
-                            rss.dep_deadlock_reported = true;
-                            report_wiring_deadlock(rss, wfanin, last_alive, state, fc, rc);
-                            // Latch the shared fatal so both sides exit fast off
-                            // one error code: the scheduler cold-path poll
-                            // (handle_orchestrator_exit) emergency_shutdowns, and
-                            // the orchestrator's push spin breaks out and unwinds.
-                            if (rss.dep_pool.error_code_ptr != nullptr) {
-                                int32_t expected = PTO2_ERROR_NONE;
-                                rss.dep_pool.error_code_ptr->compare_exchange_strong(
-                                    expected, PTO2_ERROR_DEP_POOL_OVERFLOW, std::memory_order_acq_rel
-                                );
-                            }
-                        }
-                    }
-                    break;  // not enough dep_pool space — keep remainder for next call
-                }
-            }
-
-            wiring.batch_index++;
-            wire_task(rss, ws, wfanin);
-            wired++;
-        }
-
-        return wired;
-    }
-
-    // Tier-1 structural diagnostic for a provable wiring-queue deadlock (head
-    // COMPLETED + all consumers released + scope still open, dep_pool exhausted,
-    // orchestrator provably blocked in push). The head snapshot (state/fc/rc) is
-    // taken under fanout_lock by the caller and passed in, so the report agrees
-    // with the check and reads no lock-protected field unlocked.
-    void report_wiring_deadlock(
-        RingSchedState &rss, int32_t wfanin, int32_t last_alive, int32_t state, uint32_t fc, uint32_t rc
-    ) {
-        LOG_ERROR("========================================");
-        LOG_ERROR("FATAL: Wiring-Queue Deadlock - Dep Pool Exhausted!");
-        LOG_ERROR("========================================");
-        LOG_ERROR("Head task %d COMPLETED, all consumers released, scope still open ->", last_alive);
-        LOG_ERROR("only scope_end can free it, but the orchestrator is blocked on a full wiring");
-        LOG_ERROR("queue (in push, before its scope_end). Provable head-of-line deadlock.");
-        LOG_ERROR(
-            "  Head task %d: state=%d, consumers=%u/%u, scope_released=%d", last_alive, state,
-            rc & ~PTO2_FANOUT_SCOPE_BIT, fc & ~PTO2_FANOUT_SCOPE_BIT, (rc & PTO2_FANOUT_SCOPE_BIT) ? 1 : 0
-        );
-        LOG_ERROR("  Dep pool:   used=%d/%d, needed=%d entries", rss.dep_pool.used(), rss.dep_pool.capacity, wfanin);
-        LOG_ERROR("Solution:");
-        LOG_ERROR("  The open scope's fanout exceeds the dep pool. Either split the scope, or");
-        LOG_ERROR("  raise PTO2_RING_DEP_POOL (compile-time PTO2_DEP_LIST_POOL_SIZE).");
-        LOG_ERROR("========================================");
-    }
 
     // Route a ready slot to the right global queue. Dummy tasks (empty
     // active_mask) live in dummy_ready_queue; everything else goes to the
@@ -1367,7 +1074,7 @@ struct PTO2SchedulerState {
 
     // Phase 3b: write the arena-internal pointer fields
     // (ready_queues[].slots, dummy_ready_queue.slots, dep_pool.base for each
-    // ring, wiring.queue.buffer_). Called on both host and device sides.
+    // ring). Called on both host and device sides.
     void wire_arena_pointers(const PTO2SchedulerLayout &layout, DeviceArena &arena);
 
     // Forget per-region pointers; arena owns the backing memory.

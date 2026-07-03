@@ -90,9 +90,6 @@
 // Cross-thread early-dispatch work queue (power of two)
 #define PTO2_EARLY_DISPATCH_QUEUE_SIZE 64
 
-// Wiring queue
-#define PTO2_WRIRING_QUEUE_SIZE 1024  // Per-shape queue size
-
 // Fanin storage
 #define PTO2_FANIN_INLINE_CAP 64
 

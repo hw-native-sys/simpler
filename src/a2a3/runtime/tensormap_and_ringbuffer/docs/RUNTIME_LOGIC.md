@@ -418,7 +418,7 @@ Key members:
 - `rings[PTO2_MAX_RING_DEPTH]`: per-ring `PTO2RingSet` (HeapRing + TaskRing + FaninPool). See [MULTI_RING.md §4.2](MULTI_RING.md).
 - `tensor_map`, `tensor_pool`: dependency tracking
 - `scope_tasks[]`, `scope_begins[]`, `scope_stack_top`: scope nesting stack (flat buffer partitioned by level)
-- `scheduler`: pointer to scheduler state (for wiring queue and ready queue access)
+- `scheduler`: pointer to scheduler state (for dep_pool + ready queue access)
 - `gm_heap_base`, `gm_heap_size`: GM heap for output buffers
 
 ### 7.2 Task Submission Flow (`PTO2OrchestratorState::submit_task`)
@@ -431,25 +431,35 @@ Key members:
 | 3 | **Lookup**: for each INPUT/INOUT param, search TensorMap for producers; collect producer pointers in `PTO2FaninBuilder` |
 | 4 | **Insert**: register OUTPUT/INOUT args in TensorMap |
 | 5 | **Record fanin metadata**: store producer pointers in `payload->fanin_inline_slot_states[]` (+ spill pool if >64); increment each producer's `fanout_count` (no lock needed — single writer). This step runs **before** `payload.init()`. |
-| 6 | **Push to wiring queue**: push to global `PTO2SpscQueue`; scheduler thread 0 asynchronously wires fanout edges (lock + dep_pool + early_finished check + ready push) |
+| 6 | **Wire fanout inline (orchestrator-side)**: the orchestrator acquires each producer's `fanout_lock`, allocates `dep_pool` entries for live producers (blocking in `dep_pool.ensure_space` if the pool is full), and routes the task ready once its fanin refcount is satisfied |
 
-> **Note**: Fanout wiring (Steps 4–7 in earlier versions) has been moved from the
-> orchestrator submit hot path to the scheduler's global `wiring_queue` (SPSC). This reduces the
-> orchestrator's shared L2 cache / memory bus pressure, as the orchestrator no longer
-> acquires `fanout_lock` or allocates from `dep_pool` during submission.
+> **Note**: Fanout wiring runs on the orchestrator at submit time. `dep_pool` is
+> touched only by the orchestrator (single writer, no lock) — the scheduler never
+> allocates from or reclaims it. This mirrors the `fanin_pool.ensure_space` already
+> used earlier on the submit path; the only cross-thread serialization is the
+> per-producer `fanout_lock`, shared with the scheduler's completion handler.
 
-### 7.3 Deferred Fanout Wiring (Scheduler Wiring Queue)
+### 7.3 Fanout Wiring (Orchestrator-Side, Inline)
 
-The orchestrator pushes each submitted task to the global `scheduler->wiring_queue` (a wait-free SPSC queue). Scheduler thread 0 drains this queue in batches, deferring if the queue holds fewer than a full batch of items to reduce contention (unless a final flush is needed at end of execution). For each task:
+The orchestrator wires each task's fanout edges directly at the end of
+`submit_task_common`; there is no deferred wiring queue. Because `dep_pool` has a
+single writer (the orchestrator), it needs no lock. For each task:
 
-1. Sets `fanin_count = N + 1` (+1 redundance to prevent premature readiness)
-2. For each producer in `payload->fanin_slot_states[]`:
-   - **Acquires** the producer's `fanout_lock`
+1. If the task has live producers, blocks in `dep_pool.ensure_space`
+   (reclaim + spin + overflow detect) until `wfanin` entries are free.
+2. Sets `fanin_count = N + 1` (+1 redundance to prevent premature readiness)
+3. For each producer in `payload->fanin_inline_slot_states[]` (+ spill pool):
+   - **Acquires** the producer's `fanout_lock` — this is the one cross-thread
+     edge, serializing against the scheduler's completion handler walking the
+     same producer's `fanout_head`
    - Checks `task_state >= COMPLETED` (early-finished optimization)
-   - If not completed: prepends consumer to producer's `fanout_head` via `dep_pool.prepend`
+   - If not completed: prepends consumer to producer's `fanout_head`
+     via `dep_pool.prepend`
    - **Releases** `fanout_lock`
-3. Atomically releases the +1 redundance + early_finished count via `fanin_refcount.fetch_add`
-4. If all deps satisfied: pushes task to ready queue
+4. Atomically releases the +1 redundance + early_finished count via
+   `fanin_refcount.fetch_add`
+5. If all deps satisfied: pushes task to the ready queue (exactly-once, via the
+   `fanin_refcount == fanin_count` transition)
 
 The scheduler's completion handler mirrors this:
 
@@ -700,11 +710,12 @@ With `PTO2_SERIAL_ORCH_SCHED=1`, scheduler threads still wait for
 `runtime_init_ready_` first, then additionally wait for `orchestrator_done_`
 before entering `resolve_and_dispatch()`. The default is off, preserving the
 current overlapped orch/sched pipeline. Serial mode is intended for measurement
-and debugging. During the serial wait, scheduler thread 0 may drain deferred
-wiring records to prevent bounded wiring-queue backpressure, but it does not
-dispatch AICore work until `orchestrator_done_` is set. Large graphs may still
-require larger task-ring, heap, or dependency-pool capacity because no task
-execution/reclaim happens during graph build.
+and debugging. Because the orchestrator wires every task itself at submit time,
+serial mode performs all fanout wiring during graph build; no AICore work runs
+until `orchestrator_done_` is set. Large graphs may still require larger
+task-ring, heap, or dependency-pool capacity because no task execution/reclaim
+happens during graph build (dep_pool entries accumulate until the orchestrator
+finishes and the scheduler begins dispatch).
 
 ---
 

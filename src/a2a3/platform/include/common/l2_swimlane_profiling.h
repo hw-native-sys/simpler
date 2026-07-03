@@ -504,8 +504,6 @@ enum class L2SwimlaneSchedPhaseKind : uint32_t {
                         // tasks_processed = subtasks published this iter.
     Release = 2,        // Deferred-release drain (on_task_release work).
                         // tasks_processed = slots released this iter.
-    Wire = 3,           // drain_wiring_queue: pop wired tasks into ready queues.
-                        // tasks_processed = wired count.
     Dummy = 4,          // dummy_drain outer bar: covers handling of all dummies
                         // popped this iter. tasks_processed = dummy_got count.
     EarlyDispatch = 5,  // try_speculative_early_dispatch: speculative pre-staging

@@ -135,12 +135,11 @@ struct RingSchedState {
     int32_t last_task_alive;
     std::atomic<int32_t> advance_lock;  // multi-thread CAS
 
-    // Cache Line 1+: Thread 0 only (wiring dep_pool, cache-isolated)
+    // Cache Line 1+: orchestrator-only (dep_pool, cache-isolated)
     alignas(64) PTO2DepListPool dep_pool;
 };
 
 RingSchedState ring_sched_states[PTO2_MAX_RING_DEPTH];
-PTO2SpscQueue wiring_queue;  // global SPSC queue: orchestrator pushes, scheduler thread 0 drains
 ```
 
 `slot_states`, `task_window_size`, and `task_window_mask` are no longer duplicated — callers access them via `ring->get_slot_state_by_*()` and other ring header accessors. The ring pointer shares cache line 0 with `last_task_alive` and `advance_lock`.
@@ -198,10 +197,10 @@ Dependency edges use `PTO2TaskSlotState*` pointers, which naturally span rings:
 
 ### 5.3 DepPool Reclamation
 
-DepPool is exclusively managed by scheduler thread 0 (allocation during wiring, reclamation during watermark advancement):
+DepPool is exclusively managed by the orchestrator (allocation during wiring, reclamation inside `ensure_space`):
 
 ```text
-// Called by scheduler thread 0 during wiring_queue drain:
+// Called by the orchestrator inside dep_pool.ensure_space when the pool is full:
 dep_pool_reclaim(ring_id):
     la = ring->fc.last_task_alive
     newest_consumed = la - 1
