@@ -282,7 +282,9 @@ struct SchedulerFixture : public ::testing::Test {
 
     void SetUp() override {
         allocator.init(/*heap_bytes=*/1ULL << 20);
-        orch.init(&tm, &allocator, &scope, &rq_next_level, &rq_sub, &manager);
+        orch.init(&tm, &allocator, &scope, &rq_next_level, &rq_sub, &manager, [this] {
+            sched.notify_ready();
+        });
 
         mock_worker.start();
         manager.add_next_level(mock_worker.mailbox_ptr());
@@ -487,7 +489,9 @@ struct GroupSchedulerFixture : public ::testing::Test {
 
     void SetUp() override {
         allocator.init(/*heap_bytes=*/1ULL << 20);
-        orch.init(&tm, &allocator, &scope, &rq_next_level, &rq_sub, &manager);
+        orch.init(&tm, &allocator, &scope, &rq_next_level, &rq_sub, &manager, [this] {
+            sched.notify_ready();
+        });
 
         worker_a.start();
         worker_b.start();
@@ -659,7 +663,9 @@ TEST(SchedulerWorkerAffinityTest, NextLevelAffinityUsesWorkerIdNotVectorIndex) {
     std::mutex consumed_mu;
 
     allocator.init(/*heap_bytes=*/1ULL << 20);
-    orch.init(&tm, &allocator, &scope, &rq_next_level, &rq_sub, &manager);
+    orch.init(&tm, &allocator, &scope, &rq_next_level, &rq_sub, &manager, [&sched] {
+        sched.notify_ready();
+    });
 
     worker_a.start();
     worker_b.start();
@@ -777,7 +783,9 @@ struct MixedTypeSchedulerFixture : public ::testing::Test {
 
     void SetUp() override {
         allocator.init(/*heap_bytes=*/1ULL << 20);
-        orch.init(&tm, &allocator, &scope, &rq_next_level, &rq_sub, &manager);
+        orch.init(&tm, &allocator, &scope, &rq_next_level, &rq_sub, &manager, [this] {
+            sched.notify_ready();
+        });
 
         next_level_worker.start();
         sub_worker.start();
