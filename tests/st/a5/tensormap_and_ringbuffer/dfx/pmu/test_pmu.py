@@ -14,8 +14,12 @@ the AICore counters land in ``<output_prefix>/pmu.csv``, one data row per
 task. The schema is fixed (see docs/dfx/pmu-profiling.md and
 src/a5/platform/shared/host/pmu_collector.cpp's "Build CSV header"
 block). Smoke asserts: file exists, header starts with the documented
-prefix, at least one data row present.
+prefix (ordered — the header literal and the positional row writer are
+separate code paths, so the header must stay in the row order or every
+column is silently mislabeled), at least one data row present.
 """
+
+import time
 
 import torch
 from simpler.task_interface import ArgDirection as D
@@ -82,25 +86,31 @@ class TestPmu(SceneTestCase):
         args.f[:] = (args.a + args.b + 1) * (args.a + args.b + 2) + (args.a + args.b)
 
     def test_run(self, st_platform, st_worker, request):
+        # Marker taken before the run so _validate_pmu_artifact can distinguish
+        # this invocation's output directory from stale same-label leftovers.
+        run_marker = int(time.time())  # floor to whole seconds: safe if outputs/ ever lands on a coarse-mtime fs
         super().test_run(st_platform, st_worker, request)
         if not request.config.getoption("--enable-pmu", default=0):
             return
         for case in self.CASES:
             if st_platform in case["platforms"]:
-                self._validate_pmu_artifact(case)
+                self._validate_pmu_artifact(case, run_marker)
 
-    def _validate_pmu_artifact(self, case):
+    def _validate_pmu_artifact(self, case, run_marker):
         safe_label = _sanitize_for_filename(f"TestPmu_{case['name']}")
-        matches = sorted(_outputs_dir().glob(f"{safe_label}_*"), key=lambda p: p.stat().st_mtime)
-        if not matches:
-            return
-        csv = matches[-1] / "pmu.csv"
-        assert csv.exists(), f"pmu.csv missing under {matches[-1]} — PMU capture failed?"
+        # Only directories created by this invocation (mtime past the pre-run
+        # marker); a stale dir from a prior run must not stand in for a missing
+        # current-run output and mask a capture regression.
+        matches = [p for p in _outputs_dir().glob(f"{safe_label}_*") if p.stat().st_mtime >= run_marker]
+        assert matches, f"no PMU output directory for '{safe_label}' created this run — PMU capture failed?"
+        run_dir = max(matches, key=lambda p: p.stat().st_mtime)
+        csv = run_dir / "pmu.csv"
+        assert csv.exists(), f"pmu.csv missing under {run_dir} — PMU capture failed?"
         lines = csv.read_text().splitlines()
         assert lines, "pmu.csv is empty"
         header_cols = lines[0].split(",")
-        for col in _REQUIRED_HEADER_PREFIX:
-            assert col in header_cols, f"header missing required column '{col}': {header_cols}"
+        prefix = list(_REQUIRED_HEADER_PREFIX)
+        assert header_cols[: len(prefix)] == prefix, f"header must start with {prefix} in order: {header_cols}"
         # At least one data row — sim runs all 5 vector_example tasks; expect ≥1
         # to keep the assertion robust if a future scheduler change collapses
         # / batches per-task PMU sampling.

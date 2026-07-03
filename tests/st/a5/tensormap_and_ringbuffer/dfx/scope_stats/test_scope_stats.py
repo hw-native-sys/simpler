@@ -23,6 +23,7 @@ line is one scope-boundary record carrying task/heap/dep_pool start-end.
 """
 
 import json
+import time
 
 import torch
 from simpler.task_interface import ArgDirection as D
@@ -99,24 +100,28 @@ class TestScopeStats(SceneTestCase):
         args.f[:] = (args.a + args.b + 1) * (args.a + args.b + 2) + (args.a + args.b)
 
     def test_run(self, st_platform, st_worker, request):
+        # Marker taken before the run so _validate_scope_stats_artifact binds to
+        # this invocation's output dir rather than a stale same-label leftover.
+        run_marker = int(time.time())  # floor to whole seconds: safe if outputs/ ever lands on a coarse-mtime fs
         super().test_run(st_platform, st_worker, request)
         if not request.config.getoption("--enable-scope-stats", default=False):
             return
         for case in self.CASES:
             if st_platform in case["platforms"]:
-                self._validate_scope_stats_artifact(case)
+                self._validate_scope_stats_artifact(case, run_marker)
 
-    def _validate_scope_stats_artifact(self, case):
+    def _validate_scope_stats_artifact(self, case, run_marker):
         safe_label = _sanitize_for_filename(f"TestScopeStats_{case['name']}")
-        matches = sorted(_outputs_dir().glob(f"{safe_label}_*"), key=lambda p: p.stat().st_mtime)
+        matches = [p for p in _outputs_dir().glob(f"{safe_label}_*") if p.stat().st_mtime >= run_marker]
         assert matches, (
-            f"no output directory under {_outputs_dir()} matching {safe_label}_* — "
+            f"no output directory matching {safe_label}_* created this run — "
             f"--enable-scope-stats was on but the run produced no per-case output dir"
         )
-        path = matches[-1] / "scope_stats" / "scope_stats.jsonl"
-        assert path.exists(), f"scope_stats.jsonl missing under {matches[-1]} — collector finalize failed?"
+        out_dir = max(matches, key=lambda p: p.stat().st_mtime)
+        path = out_dir / "scope_stats" / "scope_stats.jsonl"
+        assert path.exists(), f"scope_stats.jsonl missing under {out_dir} — collector finalize failed?"
         lines = [ln for ln in path.read_text().splitlines() if ln.strip()]
-        assert lines, f"scope_stats.jsonl empty under {matches[-1]}"
+        assert lines, f"scope_stats.jsonl empty under {out_dir}"
         meta = json.loads(lines[0])
         assert meta.get("version") == 6, f"unexpected schema version: {meta!r}"
         assert meta.get("fatal") is False, f"run latched fatal: {meta!r}"

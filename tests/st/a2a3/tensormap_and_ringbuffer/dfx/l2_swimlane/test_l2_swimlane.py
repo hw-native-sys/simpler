@@ -22,6 +22,8 @@ that variant exercises the per-task dedup branch in
 ``compute_dag_stats_from_deps`` which this AIV-only workload doesn't.
 """
 
+import time
+
 import torch
 from simpler.task_interface import ArgDirection as D
 
@@ -87,12 +89,17 @@ class TestL2Swimlane(SceneTestCase):
         args.f[:] = (args.a + args.b + 1) * (args.a + args.b + 2) + (args.a + args.b)
 
     def test_run(self, st_platform, st_worker, request):
+        # Marker taken before the run so validate_perf_artifact can bind to this
+        # invocation's output dir rather than a stale same-label leftover.
+        run_marker = int(time.time())  # floor to whole seconds: safe if outputs/ ever lands on a coarse-mtime fs
         super().test_run(st_platform, st_worker, request)
         if not request.config.getoption("--enable-l2-swimlane", default=0):
             return
         for case in self.CASES:
             if st_platform in case["platforms"]:
-                validate_perf_artifact(f"TestL2Swimlane_{case['name']}", expected_task_count=_EXPECTED_TASK_COUNT)
+                validate_perf_artifact(
+                    f"TestL2Swimlane_{case['name']}", since=run_marker, expected_task_count=_EXPECTED_TASK_COUNT
+                )
 
 
 if __name__ == "__main__":
