@@ -50,6 +50,15 @@
 #ifndef PLATFORM_STRACE_H_
 #define PLATFORM_STRACE_H_
 
+// SIMPLER_PROFILING is defined in profiling_config.h (default on). Include it
+// here so the header is self-contained: a TU that uses STRACE but does not pull
+// in any runtime pto_*.h (notably the platform c_api_shared.cpp that wraps
+// simpler_run) would otherwise see SIMPLER_PROFILING undefined, making the
+// `#if SIMPLER_PROFILING` gate below evaluate false and silently compile every
+// STRACE to a no-op — dropping the simpler_run host-trace markers that
+// consumers (pypto-serving) read from the log.
+#include "profiling_config.h"
+
 #if SIMPLER_PROFILING
 
 #include <pthread.h>
