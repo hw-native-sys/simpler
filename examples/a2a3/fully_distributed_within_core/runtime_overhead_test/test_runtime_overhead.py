@@ -384,13 +384,14 @@ def main():
         "--runahead",
         type=int,
         default=None,
-        help="shared-mode append-frontier run-ahead bound Δ_max: max tasks the fastest core may lead "
-        "the slowest before it back-pressures (drains ready work) instead of overflowing the shared "
-        "ring's Δ+H window. 0 disables the throttle (Δ+H overflow -> deterministic FATAL). Only "
-        "meaningful with --tensormap-mode shared. Sets PTO_DIST_RUNAHEAD. NOTE: for a clean overhead "
-        f"measurement this benchmark defaults to a very large window ({_RUNAHEAD_WIDE_OPEN}) so the "
-        "throttle's back-pressure never perturbs the timing; pass an explicit value to re-enable it. "
-        "See docs §12.7.2 / §12.10.",
+        help="run-ahead bound Δ_max (BOTH modes, load balance, docs §12.7.3): max tasks the fastest "
+        "core may lead the slowest before it back-pressures (drains ready work). Caps how far a fast "
+        "core races the monotonic claim cursor ahead, so laggards keep claiming their share. In shared "
+        "mode it also bounds the append frontier vs the ring's Δ+H window (0 -> overflow reverts to the "
+        "deterministic FATAL). Default (unset) = 2x num_workers per platform; 0 disables the throttle. "
+        f"Sets PTO_DIST_RUNAHEAD. NOTE: for a clean overhead measurement this benchmark forces a very "
+        f"large window ({_RUNAHEAD_WIDE_OPEN}) so back-pressure never perturbs the timing; pass an "
+        "explicit value to re-enable it. See docs §12.7.3 / §12.10.",
     )
     p.add_argument(
         "--bind",

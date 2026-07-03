@@ -941,6 +941,12 @@ struct DistGlobal {
     bool tm_shared;             // PTO_DIST_TENSORMAP_MODE=shared (docs §12.2)
     int32_t ring_cap;           // per-bucket ring depth (docs §12.7.2)
     int32_t tm_runahead_max;    // shared run-ahead bound Δ_max (docs §12.7.2)
+    int32_t runahead_max;       // BOTH modes: claim/replay frontier balance bound
+                                // (max local_index spread across cores). 0 disables.
+                                // Default = a small multiple of num_workers so the
+                                // window fits every core yet caps a runaway core from
+                                // racing the fetch_max claim cursor far ahead and
+                                // starving laggards (load-balance knob, PTO_DIST_RUNAHEAD).
     Coherent<uint64_t> dep_sig;    // XOR of resolved fan-in edge hashes (§12.10)
     Coherent<uint64_t> dep_edges;  // count of resolved edges
 
@@ -1014,6 +1020,18 @@ inline void dep_sig_add(DistGlobal *gd, int32_t consumer, int32_t producer) {
 // scheduling, independent of kernel work. Outputs are NOT computed (run with
 // golden checks disabled). See examples/.../runtime_overhead_test.
 bool g_skip_exec = false;
+
+// Uniform fake per-kernel execution cost (env PTO_DIST_FAKE_EXEC_NS=<ns>, sim
+// only). When > 0, execute_slot "runs" EVERY incore (sub)task by busy-waiting
+// this many nanoseconds instead of calling the real kernel — giving every task
+// an equal, nonzero synthetic duration. This is the balance-study companion to
+// PTO_DIST_SKIP_EXEC: skip-exec's 0-cost kernels let one fast core race ahead and
+// win nearly all tasks (a meaningless imbalance artifact) and collapse swimlane
+// bars to zero width; a uniform cost self-throttles the claim race (a core busy
+// for fake_ns cannot keep winning) so the swimlane reflects GENUINE scheduling
+// balance. Differs from use_example_exec_time (per-func recorded times): this is
+// one uniform value for all funcs. Outputs are NOT computed (golden meaningless).
+int32_t g_fake_exec_ns = 0;
 
 inline uint64_t now_ns() {
     return static_cast<uint64_t>(
@@ -1229,10 +1247,13 @@ void execute_slot([[maybe_unused]] DistCore *self, RingSlot &s) {
     // cores >> 72 workers, so the spin does not contend; funcs left at 0 fall
     // through to the real call below. See Runtime::example_exec_time_ns_.
     const Runtime *rt = gd->runtime;
-    const int32_t sim_ns =
+    int32_t sim_ns =
         (rt != nullptr && rt->use_example_exec_time_ && s.func_id >= 0 && s.func_id < RUNTIME_MAX_FUNC_ID) ?
             rt->example_exec_time_ns_[s.func_id] :
             0;
+    // Uniform fake cost fallback (PTO_DIST_FAKE_EXEC_NS): applies to every kernel
+    // that has no per-func recorded time. See g_fake_exec_ns.
+    if (sim_ns == 0 && g_fake_exec_ns > 0) sim_ns = g_fake_exec_ns;
     if (sim_ns > 0) {
         const uint64_t t0 = now_ns();
         const uint64_t target = t0 + static_cast<uint64_t>(sim_ns);
@@ -1481,6 +1502,35 @@ inline int32_t tm_shared_min_progress(DistGlobal *gd) {
 // ever evicted (docs §12.7.1 / §9.5). O(num_workers), called once per append.
 inline int32_t tm_shared_reclaim_floor(DistGlobal *gd) { return tm_shared_min_progress(gd) - gd->H - 1; }
 
+// Run-ahead balance throttle (BOTH modes). Before advancing to task N, keep this
+// core within gd->runahead_max tasks of the SLOWEST core's replay position. The
+// claim (fetch_max on a monotonic cursor, §11.1) lets whichever core reaches N
+// first win it, so a core that races its local_index far ahead grabs a long
+// contiguous prefix and starves the cores behind it — the imbalance seen when
+// cores progress at unequal rates (host oversubscription in sim; a straggler core
+// on HW). Capping the spread bounds how far any core runs ahead, so laggards keep
+// claiming their share. Pure WAITING (drains owned ready work + follower deposits
+// meanwhile); it changes only WHICH core wins, never the deterministic map replay
+// / dependency graph (DEPSIG invariant). Deadlock-free: the slowest core has
+// (N - min) == 0, is never throttled, advances, and raises min_progress — which
+// releases everyone ahead. Disabled when runahead_max <= 0 (zero overhead: one
+// compare). core_progress[] is published by the caller before this wait so the
+// min is current. NOTE: runahead_max must be >= num_workers, otherwise the window
+// is too small to hold one task per core and healthy parallelism is throttled into
+// idle cores (see register default).
+inline void dist_runahead_throttle(DistCore *self, int32_t N) {
+    DistGlobal *gd = self->gd;
+    if (gd->runahead_max <= 0) return;
+    uint64_t wd = 0;
+    while ((N - tm_shared_min_progress(gd)) > gd->runahead_max && !fatal_set(gd)) {
+        drain_block_won(self);
+        if (drain_phase_b(self) == 0) {
+            SPIN_WAIT_HINT();
+            watchdog(gd, wd);
+        }
+    }
+}
+
 // Sequenced, exactly-once append claim for task N (docs §12.4). Returns true iff
 // THIS core must perform the append (it won the sequencer at insert_next==N); the
 // caller then appends every output region via gd->shared_map.append(...) and
@@ -1606,6 +1656,13 @@ TaskOutputTensors dist_submit_impl(PTO2Runtime *rt, const MixedKernels &mixed, c
         return TaskOutputTensors{};
     }
 
+    // Publish this core's replay progress (BOTH modes) so the run-ahead balance
+    // throttle + (shared) reclaim floor see the slowest core, then throttle so no
+    // core races the claim cursor > runahead_max tasks ahead of the slowest (load
+    // balance; deterministic replay below is unaffected — see dist_runahead_throttle).
+    gd->core_progress[self->core_idx].store(N, std::memory_order_relaxed);
+    dist_runahead_throttle(self, N);
+
     // (a) Deterministic GM output-heap allocation + materialization (§9.3, §11.4).
     // The virtual bump `heap_next` is unbounded and identical on every core; the
     // PHYSICAL address is (virtual mod ring). First sum this task's aligned output
@@ -1667,11 +1724,9 @@ TaskOutputTensors dist_submit_impl(PTO2Runtime *rt, const MixedKernels &mixed, c
     // Retire producer-map entries that have left the H span (deterministic,
     // N-derived) before this task's lookups/inserts. Bounds chain length so
     // submit stays ~O(N) instead of O(N^2). See DistTensorMap. In shared mode the
-    // per-core map is unused; instead publish this core's progress so the shared
-    // ring's global reclaim floor tracks the slowest core (docs §12.7.1).
-    if (gd->tm_shared)
-        gd->core_progress[self->core_idx].store(N, std::memory_order_relaxed);
-    else
+    // per-core map is unused (progress already published above for the shared
+    // ring's global reclaim floor, docs §12.7.1).
+    if (!gd->tm_shared)
         self->map.advance_retire(N, gd->H);
 
     // (b) Anchor type + claim race FIRST — resolved from the mask alone (no map
@@ -2042,6 +2097,10 @@ TaskOutputTensors dist_alloc_tensors(PTO2Runtime *rt, const L0TaskArgs &args) {
         return TaskOutputTensors{};
     }
 
+    // Publish progress + run-ahead balance throttle (BOTH modes; see dist_submit_impl).
+    gd->core_progress[self->core_idx].store(N, std::memory_order_relaxed);
+    dist_runahead_throttle(self, N);
+
     // Deterministic GM heap allocation + straddle-padding (identical to submit (a)).
     const size_t ring = gd->heap_size;
     uint64_t total = 0;
@@ -2091,8 +2150,7 @@ TaskOutputTensors dist_alloc_tensors(PTO2Runtime *rt, const L0TaskArgs &args) {
     // writes its replica (map parity). Shared: the in-id-order sequencer appends
     // once to the single global ring (docs §12.4), same as dist_submit_impl (d).
     if (gd->tm_shared) {
-        gd->core_progress[self->core_idx].store(N, std::memory_order_relaxed);
-        tm_shared_append_task(self, N, args, result);
+        tm_shared_append_task(self, N, args, result);  // progress published above
     } else {
         self->map.advance_retire(N, gd->H);
         uint32_t out_idx = 0;
@@ -2459,6 +2517,12 @@ void *dist_engine_register(
 #if DIST_SIM_HOST_CLOCK
     // Overhead-isolation gate (skip incore kernel calls, keep all bookkeeping).
     g_skip_exec = (getenv("PTO_DIST_SKIP_EXEC") != nullptr);
+    // Uniform fake per-kernel cost (ns). See g_fake_exec_ns.
+    {
+        const char *fe = getenv("PTO_DIST_FAKE_EXEC_NS");
+        g_fake_exec_ns = (fe != nullptr) ? atoi(fe) : 0;
+        if (g_fake_exec_ns < 0) g_fake_exec_ns = 0;
+    }
     // On-core orchestration overhead summary gate (per-core makespan/busy print).
     g_overhead_on = (getenv("PTO_DIST_OVERHEAD") != nullptr);
     g_orch_recorded.store(0, std::memory_order_relaxed);
@@ -2496,21 +2560,46 @@ void *dist_engine_register(
     gd->tm_shared = false;
     if (const char *e = getenv("PTO_DIST_TENSORMAP_MODE"))
         if (strcmp(e, "shared") == 0) gd->tm_shared = true;
+
+    // Per-core replay progress. Now read by the run-ahead balance throttle in BOTH
+    // modes (not just the shared reclaim floor), so zero it before any core starts.
+    for (int32_t i = 0; i < RUNTIME_MAX_WORKER; i++)
+        gd->core_progress[i].store(0, std::memory_order_relaxed);
+
+    // Run-ahead balance bound (BOTH modes; docs §12.7.2 / load balance). Cap how
+    // far any core's replay position may lead the slowest core. Derived from the
+    // core count so it is a reasonable per-platform default automatically:
+    // num_workers is 24 AIC + 48 AIV = 72 on a2/a3 and 36 AIC + 72 AIV = 108 on a5
+    // (and their sims). The bound MUST be >= num_workers or the window cannot hold
+    // one live task per core and healthy parallelism is throttled into idle cores;
+    // 2x gives pipelining slack while still reining in a runaway core that would
+    // otherwise claim a long contiguous prefix (fetch_max cursor) and starve
+    // laggards — the imbalance observed under unequal core progress. Overridable by
+    // PTO_DIST_RUNAHEAD (0 disables the throttle entirely).
+    gd->runahead_max = 2 * num_workers;
+    if (gd->runahead_max < 1) gd->runahead_max = 1;
+
     gd->tm_runahead_max = 0;
     if (gd->tm_shared) {
         gd->shared_map.reset(gd->ring_cap);
         gd->tm_insert_next.store(0, std::memory_order_relaxed);
-        for (int32_t i = 0; i < RUNTIME_MAX_WORKER; i++)
-            gd->core_progress[i].store(0, std::memory_order_relaxed);
         // Bound run-ahead so the shared live window (Δ+H) stays well under cap,
         // leaving headroom for per-task regions + hash skew. Default keeps the
-        // window <= ~3/4 cap; PTO_DIST_RUNAHEAD=N overrides (0 disables => FATAL
-        // on overflow instead of back-pressure).
+        // window <= ~3/4 cap (0 disables => FATAL on overflow instead of
+        // back-pressure). PTO_DIST_RUNAHEAD overrides below.
         gd->tm_runahead_max = (3 * gd->ring_cap) / 4 - gd->H - 1;
         if (gd->tm_runahead_max < 1) gd->tm_runahead_max = 1;
-        if (const char *e = getenv("PTO_DIST_RUNAHEAD")) {
-            const long v = atol(e);
-            if (v >= 0) gd->tm_runahead_max = static_cast<int32_t>(v);
+    }
+
+    // One knob: PTO_DIST_RUNAHEAD=N = "max tasks a core may run ahead of the
+    // slowest". Overrides the balance bound (BOTH modes) and, in shared mode, the
+    // ring back-pressure bound too. 0 disables the balance throttle (and in shared
+    // mode reverts ring overflow to the deterministic FATAL).
+    if (const char *e = getenv("PTO_DIST_RUNAHEAD")) {
+        const long v = atol(e);
+        if (v >= 0) {
+            gd->runahead_max = static_cast<int32_t>(v);
+            if (gd->tm_shared) gd->tm_runahead_max = static_cast<int32_t>(v);
         }
     }
     gd->orch_func = orch_func;
@@ -2662,7 +2751,7 @@ void dist_engine_dump_trace() {
         case TracePhase::DrainWon:
             return "drain_won";
         case TracePhase::Replay:
-            return "replay";
+            return "orch";  // swimlane label: replayed the submit stream but LOST the claim
         case TracePhase::RingBp:
             return "ringbp";
         case TracePhase::EfDrain:
