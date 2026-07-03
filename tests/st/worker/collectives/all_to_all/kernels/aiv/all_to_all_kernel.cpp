@@ -9,13 +9,23 @@
  * -----------------------------------------------------------------------------------------------------------
  */
 /**
- * AllToAll kernel — symmetric, 3-phase, HCCL-window scratch pattern.
+ * AllToAll kernel — symmetric, 2-phase push-based pattern.
  *
- * Phase 1 (stage-in):   for dest in 0..nranks-1: input[dest*C..) → scratch[dest*C..)
- * Phase 2 (barrier):    signal matrix + TWAIT cross-rank sync
- * Phase 3 (exchange):   for src in 0..nranks-1: TLOAD(peer src scratch[my_rank*C]) → output[src*C..)
+ * Phase 1 (push):     for dest in 0..nranks-1:
+ *                       TPUT input[dest*C..) → peer dest's scratch[my_rank*C..)
+ *                     Self-rank handled naturally: CommRemotePtr to self
+ *                     returns the local pointer, so TPUT degenerates to a
+ *                     local GM write.
+ * Phase 2 (barrier):  signal matrix + TWAIT cross-rank sync.
+ *                     No post-exchange barrier needed — input is read-only
+ *                     and the scratch is write-only from peers, so there is
+ *                     no WAR hazard on the scratch.
+ * Phase 3 (copy-out): for src in 0..nranks-1:
+ *                       TLOAD(local scratch[src*C..)) → TSTORE(output[src*C..))
+ *                     Purely local copy — the scratch already holds the
+ *                     result after the barrier.
  *
- * Scratch is indexed by destination rank: scratch[dest*C] holds the chunk sent to dest.
+ * Scratch at offset src*C holds the chunk that rank src pushed here.
  *
  * args layout:
  *   tensor(0) = input    nranks*COUNT_PER_RANK floats  (INPUT)
@@ -74,35 +84,34 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
         return;
     }
 
-    // signal_base follows the nranks * COUNT_PER_RANK float staging region.
+    // signal_base follows the nranks * COUNT_PER_RANK float data region.
     __gm__ int32_t *signal_base = reinterpret_cast<__gm__ int32_t *>(scratch + nranks * COUNT_PER_RANK);
 
     ShapeDyn shape(1, 1, 1, 1, COUNT_PER_RANK);
     StrideDyn stride(COUNT_PER_RANK, COUNT_PER_RANK, COUNT_PER_RANK, COUNT_PER_RANK, 1);
 
-    TileData stageTile(1, COUNT_PER_RANK);
-    TileData recvTile(1, COUNT_PER_RANK);
-    TASSIGN(stageTile, 0x0);
-    TASSIGN(recvTile, 0x10000);
+    // Single push tile — reused for both Phase 1 push and Phase 3 copy-out.
+    TileData pushTile(1, COUNT_PER_RANK);
+    TASSIGN(pushTile, 0x0);
 
     // ------------------------------------------------------------------
-    // Phase 1: stage-in — copy each destination chunk into scratch so
-    // every peer can read the slice destined for them in Phase 3.
+    // Phase 1: push — TPUT each destination chunk directly into the
+    // corresponding peer's scratch at offset my_rank*C. When dest == my_rank
+    // CommRemotePtr returns the local pointer, so TPUT is a local GM write.
     // ------------------------------------------------------------------
+    __gm__ float *scratch_dst_local = scratch + my_rank * COUNT_PER_RANK;
     for (int dest = 0; dest < nranks; ++dest) {
+        __gm__ float *scratch_dst_remote = CommRemotePtr(commCtx, scratch_dst_local, dest);
+
         Global inputChunkG(input + dest * COUNT_PER_RANK, shape, stride);
-        Global scratchChunkG(scratch + dest * COUNT_PER_RANK, shape, stride);
-        TLOAD(stageTile, inputChunkG);
-        set_flag(PIPE_MTE2, PIPE_MTE3, EVENT_ID0);
-        wait_flag(PIPE_MTE2, PIPE_MTE3, EVENT_ID0);
-        TSTORE(scratchChunkG, stageTile);
-        set_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID0);
-        wait_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID0);
+        Global scratchChunkG(scratch_dst_remote, shape, stride);
+
+        pto::comm::TPUT(scratchChunkG, inputChunkG, pushTile);
     }
     pipe_barrier(PIPE_ALL);
 
     // ------------------------------------------------------------------
-    // Phase 2: device barrier — notify every peer that stage-in is done,
+    // Phase 2: device barrier — notify every peer that our pushes are done,
     // then wait until every peer has notified us.
     // ------------------------------------------------------------------
     for (int peer = 0; peer < nranks; ++peer) {
@@ -119,19 +128,17 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
     pipe_barrier(PIPE_ALL);
 
     // ------------------------------------------------------------------
-    // Phase 3: exchange — read chunk my_rank from every rank's scratch and
-    // write it into the corresponding slice of the output tensor.
-    // CommRemotePtr with pe==my_rank returns localPtr unchanged, so the
-    // self-read goes through the same code path as the remote reads.
+    // Phase 3: copy-out — every peer has pushed into our scratch at their
+    // rank's offset. Copy each slot into the output tensor. Purely local
+    // reads — no CommRemotePtr needed here.
     // ------------------------------------------------------------------
     for (int src = 0; src < nranks; ++src) {
-        __gm__ float *remote_chunk = CommRemotePtr(commCtx, scratch + my_rank * COUNT_PER_RANK, src);
-        Global remoteG(remote_chunk, shape, stride);
+        Global scratchSlotG(scratch + src * COUNT_PER_RANK, shape, stride);
         Global outputSlotG(output + src * COUNT_PER_RANK, shape, stride);
-        TLOAD(recvTile, remoteG);
+        TLOAD(pushTile, scratchSlotG);
         set_flag(PIPE_MTE2, PIPE_MTE3, EVENT_ID0);
         wait_flag(PIPE_MTE2, PIPE_MTE3, EVENT_ID0);
-        TSTORE(outputSlotG, recvTile);
+        TSTORE(outputSlotG, pushTile);
         set_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID0);
         wait_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID0);
     }

@@ -2,14 +2,20 @@
 
 Personalized exchange: each rank sends a different slice to each peer through the HCCL window.
 
-## Algorithm (3-Phase Mesh)
+## Algorithm (2-Phase Push)
 
-1. **Stage-in**: for d in 0..P-1: `input[d*C] → scratch[d*C]` (chunk d is for rank d)
-2. **Barrier**: mesh barrier (all-to-all notify/wait)
-3. **Exchange**: for s in 0..P-1: `TLOAD(peer s scratch[my_rank*C]) → output[s*C]`
+```text
+Phase 1: push        for d in 0..P-1: TPUT input[d * C] → peer d's scratch[my_rank * C]
+                     Self-rank handled naturally — CommRemotePtr to self returns local pointer
+Phase 2: barrier     mesh barrier (all-to-all notify/wait); no post-exchange barrier needed
+Phase 3: copy-out    for s in 0..P-1: TLOAD(local scratch[s * C]) → output[s * C]  (purely local)
+```
 
 **Input**: Each rank owns `nranks * COUNT_PER_RANK=64` floats. Chunk d is payload for rank d.
 **Output**: Each rank receives `nranks * 64` floats — the data every peer sent to it.
+
+After Phase 1, scratch at offset `src * C` holds the chunk rank `src` pushed here.
+After the barrier, the result is in scratch — Phase 3 is a purely local copy to the output tensor.
 
 ## Golden Check
 
