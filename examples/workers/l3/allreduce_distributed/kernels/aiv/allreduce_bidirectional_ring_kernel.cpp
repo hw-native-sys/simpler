@@ -9,35 +9,26 @@
  * -----------------------------------------------------------------------------------------------------------
  */
 /**
- * Bidirectional Ring AllReduce kernel — interleaved bidirectional RS+AG
- * implementing the IBing algorithm (Zong et al., ACM TACO 2025).
+ * Bidirectional Ring AllReduce — two parallel unidirectional rings on
+ * disjoint halves of the data, sharing RoundBarrier per step.
  *
- * Communication steps halved from 2(P-1) to P-1 by sending/receiving in
- * both HCCS directions simultaneously.  Reuses TLOAD/TNOTIFY/TWAIT/TADD
- * primitives unchanged — innovation at the schedule level.
+ * Ring 0 (clockwise, →right neighbour): first half of each chunk's elements.
+ *   Uses standard unidirectional RS+AG formulas.
+ * Ring 1 (counter-clockwise, →left neighbour): second half of each chunk's
+ *   elements.  Mirrored unidirectional RS+AG formulas.
  *
- * Phase 1 (stage-in):      partition input → P chunk slots in window
- * Phase 2 (bidir RS+AG):   P-1 ring steps; first floor((P-1)/2) steps
- *                          TADD both received chunks; remaining steps
- *                          TSTORE-forward (allgather).
- * Phase 3 (stage-out):     chunks → output
+ * Both rings run reduce-scatter (P−1 barrier rounds) then allgather (P−1
+ * barrier rounds).  Total: 2(P−1) barrier rounds — same count as the
+ * unidirectional ring — but each round processes two subchunks (one per
+ * ring direction), doubling data throughput per barrier.
+ *
+ * On sim (POSIX shared memory): raw float* arithmetic into shared memory.
+ * On NPU hardware: TPUT<AtomicAdd/AtomicNone> for remote DMA writes.
  *
  * Scratch layout (per rank, in HCCL window):
- *   [0 .. P*chunk)              P chunk slots owned by this rank
- *   [P*chunk .. (P+1)*chunk)    exchange_left  — left-bound  publish buffer
- *   [(P+1)*chunk .. (P+2)*chunk) exchange_right — right-bound publish buffer
- *   tail                        (P-1) * kMaxSupportedRanks int32 barrier slots
- *
- * Two exchange buffers are required because each rank publishes two
- * different chunks per step — one TSTORE would overwrite the other before
- * the barrier.  The barrier signals both are ready.
- *
- * args layout (passed as Tensor arg slots):
- *   tensor(0) = input    (host-backed, framework-supplied device addr)
- *   tensor(1) = output   (host-backed, framework-supplied device addr)
- *   tensor(2) = scratch  (HCCL window slot, cross-rank addressable)
- *   scalar(0) = nranks
- *   scalar(1) = CommContext device pointer
+ *   [0 .. P*subchunk)              ring0 chunks (clockwise ring)
+ *   [P*subchunk .. 2*P*subchunk)   ring1 chunks (counter-clockwise ring)
+ *   tail                           2*(P−1)*kMaxSupportedRanks int32 barrier rows
  */
 
 #include <cstdint>
@@ -65,7 +56,6 @@ AICORE inline __gm__ T *CommRemotePtr(__gm__ CommContext *ctx, __gm__ T *localPt
     return (__gm__ T *)(ctx->windowsIn[pe] + offset);
 }
 
-// Per-round barrier row: used exactly once (AtomicAdd 0→1, TWAIT GE 1).
 AICORE inline void RoundBarrier(__gm__ CommContext *ctx, __gm__ int32_t *signal_row, int my_rank, int nranks) {
     for (int peer = 0; peer < nranks; ++peer) {
         if (peer == my_rank) {
@@ -99,8 +89,7 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
 
     using ShapeDyn = pto::Shape<pto::DYNAMIC, pto::DYNAMIC, pto::DYNAMIC, pto::DYNAMIC, pto::DYNAMIC>;
     using StrideDyn = pto::Stride<pto::DYNAMIC, pto::DYNAMIC, pto::DYNAMIC, pto::DYNAMIC, pto::DYNAMIC>;
-    using Global = pto::GlobalTensor<float, ShapeDyn, StrideDyn, pto::Layout::ND>;
-    using TileData = pto::Tile<pto::TileType::Vec, float, 1, ALLREDUCE_COUNT, pto::BLayout::RowMajor, -1, -1>;
+    using GT = pto::GlobalTensor<float, ShapeDyn, StrideDyn, pto::Layout::ND>;
 
     int my_rank = static_cast<int>(commCtx->rankId);
 
@@ -109,191 +98,193 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
         return;
     }
 
-    const int chunk_elems = static_cast<int>(ALLREDUCE_COUNT / static_cast<size_t>(nranks));
-    __gm__ float *chunks = scratch;
-    __gm__ float *exchange_left = scratch + static_cast<size_t>(nranks * chunk_elems);
-    __gm__ float *exchange_right = exchange_left + static_cast<size_t>(chunk_elems);
-    // Signal rows after float region: (P-1) rounds, kMaxSupportedRanks stride.
-    __gm__ int32_t *signal_base = reinterpret_cast<__gm__ int32_t *>(exchange_right + static_cast<size_t>(chunk_elems));
+    const int subchunk_elems = static_cast<int>(ALLREDUCE_COUNT / (2 * static_cast<size_t>(nranks)));
+    const int chunk_elems = 2 * subchunk_elems;
+    const int ring_stride = nranks * subchunk_elems;
 
-    TileData chunkTile(1, chunk_elems);
-    TileData publishTile(1, chunk_elems);
-    TileData recvLeftTile(1, chunk_elems);
-    TileData recvRightTile(1, chunk_elems);
-    TASSIGN(chunkTile, 0x0);
-    TASSIGN(publishTile, 0x10000);
-    TASSIGN(recvLeftTile, 0x20000);
-    TASSIGN(recvRightTile, 0x30000);
+    __gm__ float *ring0 = scratch;                // clockwise ring — first half of each chunk
+    __gm__ float *ring1 = scratch + ring_stride;  // counter-clockwise ring — second half
+    __gm__ int32_t *signal_base = reinterpret_cast<__gm__ int32_t *>(scratch + static_cast<size_t>(2 * ring_stride));
 
-    ShapeDyn chunkShape(1, 1, 1, 1, chunk_elems);
-    StrideDyn chunkStride(chunk_elems, chunk_elems, chunk_elems, chunk_elems, 1);
+#ifndef __CPU_SIM
+    using TileSub = pto::Tile<pto::TileType::Vec, float, 1, ALLREDUCE_COUNT, pto::BLayout::RowMajor, -1, -1>;
+    TileSub pushTile(1, subchunk_elems);
+    TASSIGN(pushTile, 0x10000);
+#endif
 
-    // ------------------------------------------------------------------
-    // Phase 1: stage-in — partition local input into P chunk slots.
-    // ------------------------------------------------------------------
-    for (int chunk = 0; chunk < nranks; ++chunk) {
-        __gm__ float *dst = chunks + static_cast<size_t>(chunk * chunk_elems);
-        __gm__ float *src = input + static_cast<size_t>(chunk * chunk_elems);
-        Global srcG(src, chunkShape, chunkStride);
-        Global dstG(dst, chunkShape, chunkStride);
-        TLOAD(chunkTile, srcG);
-        set_flag(PIPE_MTE2, PIPE_MTE3, EVENT_ID0);
-        wait_flag(PIPE_MTE2, PIPE_MTE3, EVENT_ID0);
-        TSTORE(dstG, chunkTile);
-        set_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID0);
-        wait_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID0);
-    }
-    pipe_barrier(PIPE_ALL);
+    using TileSubStage = pto::Tile<pto::TileType::Vec, float, 1, ALLREDUCE_COUNT, pto::BLayout::RowMajor, -1, -1>;
+    TileSubStage stageTile(1, subchunk_elems);
+    TASSIGN(stageTile, 0x0);
+
+    ShapeDyn subShape(1, 1, 1, 1, subchunk_elems);
+    StrideDyn subStride(subchunk_elems, subchunk_elems, subchunk_elems, subchunk_elems, 1);
 
     // ------------------------------------------------------------------
-    // Phase 2: bidirectional RS+AG — P-1 ring steps.
-    //
-    // Per step s (1..P-1):
-    //   1. Publish two chunks to exchange buffers
-    //   2. RoundBarrier — notify all peers both chunks are ready
-    //   3. TLOAD from left neighbor's exchange_right + right neighbor's exchange_left
-    //   4. First floor((P-1)/2) steps: TADD both into chunks[]
-    //   5. Remaining steps: TSTORE both into chunks[] (allgather forward)
-    //
-    // Index formulas from IBing (Zong et al. 2025):
-    //   Right-bound publish:  idx = (r - s + P) % P  → exchange_right
-    //   Left-bound  publish:  idx = (r + s + P + 1) % P  → exchange_left
-    //   Receive from left:    accumulate at (left - s + P) % P
-    //   Receive from right:   accumulate at (right + s + P + 1) % P
+    // Phase 1: stage-in — split each logical chunk into ring0 (first half)
+    //           and ring1 (second half).
     // ------------------------------------------------------------------
-    int round = 0;
-    int reduce_steps = (nranks - 1) / 2;  // floor((P-1)/2)
-    if (nranks == 2) {
-        reduce_steps = 1;  // P=2: single step must always reduce (no forwarding needed)
-    }
-
-    for (int step = 1; step < nranks; ++step) {
-        const int left = (my_rank - 1 + nranks) % nranks;
-        const int right = (my_rank + 1) % nranks;
-
-        // Indices for the two chunks to publish this step.
-        const int right_send_idx = (my_rank - step + nranks) % nranks;
-        const int left_send_idx = (my_rank + step + nranks + 1) % nranks;
-
-        // Publish right-bound chunk → exchange_right.
+    for (int c = 0; c < nranks; ++c) {
+        // ring0 ← first half of chunk c.
         {
-            Global srcG(chunks + static_cast<size_t>(right_send_idx * chunk_elems), chunkShape, chunkStride);
-            Global dstG(exchange_right, chunkShape, chunkStride);
-            TLOAD(publishTile, srcG);
+            __gm__ float *dst = ring0 + static_cast<size_t>(c * subchunk_elems);
+            __gm__ float *src = input + static_cast<size_t>(c * chunk_elems);
+            GT srcG(src, subShape, subStride);
+            GT dstG(dst, subShape, subStride);
+            TLOAD(stageTile, srcG);
             set_flag(PIPE_MTE2, PIPE_MTE3, EVENT_ID0);
             wait_flag(PIPE_MTE2, PIPE_MTE3, EVENT_ID0);
-            TSTORE(dstG, publishTile);
+            TSTORE(dstG, stageTile);
             set_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID0);
             wait_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID0);
         }
-
-        // Publish left-bound chunk → exchange_left.
+        // ring1 ← second half of chunk c.
         {
-            Global srcG(chunks + static_cast<size_t>(left_send_idx * chunk_elems), chunkShape, chunkStride);
-            Global dstG(exchange_left, chunkShape, chunkStride);
-            TLOAD(publishTile, srcG);
+            __gm__ float *dst = ring1 + static_cast<size_t>(c * subchunk_elems);
+            __gm__ float *src = input + static_cast<size_t>(c * chunk_elems + subchunk_elems);
+            GT srcG(src, subShape, subStride);
+            GT dstG(dst, subShape, subStride);
+            TLOAD(stageTile, srcG);
             set_flag(PIPE_MTE2, PIPE_MTE3, EVENT_ID1);
             wait_flag(PIPE_MTE2, PIPE_MTE3, EVENT_ID1);
-            TSTORE(dstG, publishTile);
+            TSTORE(dstG, stageTile);
             set_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID1);
             wait_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID1);
         }
-        pipe_barrier(PIPE_ALL);
+    }
+    pipe_barrier(PIPE_ALL);
 
-        RoundBarrier(commCtx, signal_base + round * kMaxSupportedRanks, my_rank, nranks);
-        ++round;
+    const int left = (my_rank - 1 + nranks) % nranks;
+    const int right = (my_rank + 1) % nranks;
 
-        // Indices where received data accumulates locally.
-        const int acc_from_left_idx = (left - step + nranks) % nranks;
-        const int acc_from_right_idx = (right + step + nranks + 1) % nranks;
+    // ------------------------------------------------------------------
+    // Phase 2: reduce-scatter — P−1 barrier rounds.
+    //
+    // Ring0 (cw →right): send_idx = (r - s + P) % P
+    //   Pushes ring0[send_idx] to right neighbour at same index.
+    // Ring1 (ccw →left): send_idx = (r + s + P) % P
+    //   Pushes ring1[send_idx] to left neighbour at same index.
+    // ------------------------------------------------------------------
+    for (int step = 1; step < nranks; ++step) {
+        RoundBarrier(commCtx, signal_base + (step - 1) * kMaxSupportedRanks, my_rank, nranks);
 
-        // TLOAD from left neighbor's exchange_right.
+        // Ring0: push ring0[(r - step + P) % P] → right's ring0[same index].
         {
-            __gm__ float *remote_buf = CommRemotePtr(commCtx, exchange_right, left);
-            Global remoteG(remote_buf, chunkShape, chunkStride);
-            TLOAD(recvLeftTile, remoteG);
-            set_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
-            wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
+            const int idx = (my_rank - step + nranks) % nranks;
+            __gm__ float *src = ring0 + static_cast<size_t>(idx * subchunk_elems);
+            __gm__ float *dst = CommRemotePtr(commCtx, src, right);
+#if defined(__CPU_SIM)
+            for (int i = 0; i < subchunk_elems; ++i) {
+                dst[i] += src[i];
+            }
+#else
+            GT srcG(src, subShape, subStride);
+            GT dstG(dst, subShape, subStride);
+            pto::comm::TPUT<pto::AtomicType::AtomicAdd>(dstG, srcG, pushTile);
+#endif
         }
 
-        // TLOAD from right neighbor's exchange_left.
+        // Ring1: push ring1[(r + step + P) % P] → left's ring1[same index].
         {
-            __gm__ float *remote_buf = CommRemotePtr(commCtx, exchange_left, right);
-            Global remoteG(remote_buf, chunkShape, chunkStride);
-            TLOAD(recvRightTile, remoteG);
-            set_flag(PIPE_MTE2, PIPE_V, EVENT_ID1);
-            wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID1);
-        }
-
-        if (step <= reduce_steps) {
-            // --- Reduce phase: TADD both received chunks ---
-
-            // TADD from left into acc_from_left_idx.
-            {
-                Global accG(chunks + static_cast<size_t>(acc_from_left_idx * chunk_elems), chunkShape, chunkStride);
-                TLOAD(chunkTile, accG);
-                set_flag(PIPE_MTE2, PIPE_V, EVENT_ID2);
-                wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID2);
-                TADD(chunkTile, chunkTile, recvLeftTile);
-                set_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
-                wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
-                TSTORE(accG, chunkTile);
-                set_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID0);
-                wait_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID0);
+            const int idx = (my_rank + step + nranks) % nranks;
+            __gm__ float *src = ring1 + static_cast<size_t>(idx * subchunk_elems);
+            __gm__ float *dst = CommRemotePtr(commCtx, src, left);
+#if defined(__CPU_SIM)
+            for (int i = 0; i < subchunk_elems; ++i) {
+                dst[i] += src[i];
             }
-
-            // TADD from right into acc_from_right_idx.
-            {
-                Global accG(chunks + static_cast<size_t>(acc_from_right_idx * chunk_elems), chunkShape, chunkStride);
-                TLOAD(chunkTile, accG);
-                set_flag(PIPE_MTE2, PIPE_V, EVENT_ID3);
-                wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID3);
-                TADD(chunkTile, chunkTile, recvRightTile);
-                set_flag(PIPE_V, PIPE_MTE3, EVENT_ID1);
-                wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID1);
-                TSTORE(accG, chunkTile);
-                set_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID1);
-                wait_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID1);
-            }
-        } else {
-            // --- Allgather phase: TSTORE-forward both received chunks ---
-
-            {
-                Global dstG(chunks + static_cast<size_t>(acc_from_left_idx * chunk_elems), chunkShape, chunkStride);
-                set_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
-                wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
-                TSTORE(dstG, recvLeftTile);
-                set_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID0);
-                wait_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID0);
-            }
-
-            {
-                Global dstG(chunks + static_cast<size_t>(acc_from_right_idx * chunk_elems), chunkShape, chunkStride);
-                set_flag(PIPE_V, PIPE_MTE3, EVENT_ID1);
-                wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID1);
-                TSTORE(dstG, recvRightTile);
-                set_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID1);
-                wait_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID1);
-            }
+#else
+            GT srcG(src, subShape, subStride);
+            GT dstG(dst, subShape, subStride);
+            pto::comm::TPUT<pto::AtomicType::AtomicAdd>(dstG, srcG, pushTile);
+#endif
         }
 
         pipe_barrier(PIPE_ALL);
     }
 
     // ------------------------------------------------------------------
-    // Phase 3: stage-out — write concatenated chunks into local output.
+    // Phase 3: allgather — P−1 barrier rounds.
+    //
+    // Ring0 (cw →right): send_idx = (r - step + 1 + P) % P
+    // Ring1 (ccw →left): send_idx = (r + step + 1 + P) % P
     // ------------------------------------------------------------------
-    for (int chunk = 0; chunk < nranks; ++chunk) {
-        __gm__ float *dst = output + static_cast<size_t>(chunk * chunk_elems);
-        __gm__ float *src = chunks + static_cast<size_t>(chunk * chunk_elems);
-        Global srcG(src, chunkShape, chunkStride);
-        Global dstG(dst, chunkShape, chunkStride);
-        TLOAD(chunkTile, srcG);
-        set_flag(PIPE_MTE2, PIPE_MTE3, EVENT_ID0);
-        wait_flag(PIPE_MTE2, PIPE_MTE3, EVENT_ID0);
-        TSTORE(dstG, chunkTile);
-        set_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID0);
-        wait_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID0);
+    for (int step = 1; step < nranks; ++step) {
+        const int rs_rounds = nranks - 1;
+        RoundBarrier(commCtx, signal_base + (rs_rounds + step - 1) * kMaxSupportedRanks, my_rank, nranks);
+
+        // Ring0 AG.
+        {
+            const int idx = (my_rank - step + 1 + nranks) % nranks;
+            __gm__ float *src = ring0 + static_cast<size_t>(idx * subchunk_elems);
+            __gm__ float *dst = CommRemotePtr(commCtx, src, right);
+#if defined(__CPU_SIM)
+            for (int i = 0; i < subchunk_elems; ++i) {
+                dst[i] = src[i];
+            }
+#else
+            GT srcG(src, subShape, subStride);
+            GT dstG(dst, subShape, subStride);
+            pto::comm::TPUT<pto::AtomicType::AtomicNone>(dstG, srcG, pushTile);
+#endif
+        }
+
+        // Ring1 AG: send_idx = (r + step - 1 + P) % P
+        // The chunk was received from rank r+1 in the previous AG step.
+        {
+            const int idx = (my_rank + step - 1 + nranks) % nranks;
+            __gm__ float *src = ring1 + static_cast<size_t>(idx * subchunk_elems);
+            __gm__ float *dst = CommRemotePtr(commCtx, src, left);
+#if defined(__CPU_SIM)
+            for (int i = 0; i < subchunk_elems; ++i) {
+                dst[i] = src[i];
+            }
+#else
+            GT srcG(src, subShape, subStride);
+            GT dstG(dst, subShape, subStride);
+            pto::comm::TPUT<pto::AtomicType::AtomicNone>(dstG, srcG, pushTile);
+#endif
+        }
+
+        pipe_barrier(PIPE_ALL);
+    }
+
+    // Final sync barrier: ensure all AG writes are globally visible before
+    // stage-out reads from ring0/ring1.  Without this, remote writes from
+    // other ranks may not have propagated to shared memory yet.
+    if (nranks > 1) {
+        RoundBarrier(commCtx, signal_base + (2 * (nranks - 1)) * kMaxSupportedRanks, my_rank, nranks);
+    }
+
+    // ------------------------------------------------------------------
+    // Phase 4: stage-out — recombine ring0 and ring1 halves into output.
+    // ------------------------------------------------------------------
+    for (int c = 0; c < nranks; ++c) {
+        // First half of chunk c ← ring0.
+        {
+            __gm__ float *dst = output + static_cast<size_t>(c * chunk_elems);
+            __gm__ float *src = ring0 + static_cast<size_t>(c * subchunk_elems);
+            GT srcG(src, subShape, subStride);
+            GT dstG(dst, subShape, subStride);
+            TLOAD(stageTile, srcG);
+            set_flag(PIPE_MTE2, PIPE_MTE3, EVENT_ID0);
+            wait_flag(PIPE_MTE2, PIPE_MTE3, EVENT_ID0);
+            TSTORE(dstG, stageTile);
+            set_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID0);
+            wait_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID0);
+        }
+        // Second half of chunk c ← ring1.
+        {
+            __gm__ float *dst = output + static_cast<size_t>(c * chunk_elems + subchunk_elems);
+            __gm__ float *src = ring1 + static_cast<size_t>(c * subchunk_elems);
+            GT srcG(src, subShape, subStride);
+            GT dstG(dst, subShape, subStride);
+            TLOAD(stageTile, srcG);
+            set_flag(PIPE_MTE2, PIPE_MTE3, EVENT_ID1);
+            wait_flag(PIPE_MTE2, PIPE_MTE3, EVENT_ID1);
+            TSTORE(dstG, stageTile);
+            set_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID1);
+            wait_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID1);
+        }
     }
     pipe_barrier(PIPE_ALL);
 }

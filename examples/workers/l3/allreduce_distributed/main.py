@@ -124,10 +124,11 @@ def compute_scratch_params(mode: str, nranks: int) -> tuple[int, int, int]:
         signal_tail_nbytes = 2 * (nranks - 1) * K_MAX_SUPPORTED_RANKS * DTYPE_NBYTES
         scratch_nbytes = float_elems * DTYPE_NBYTES + signal_tail_nbytes
     elif mode == "bidirectional_ring":
-        # Bidirectional ring: (nranks+2) * chunk_elems floats (P chunks + 2 exchange) + (P-1) signal rows.
-        chunk_elems = ALLREDUCE_COUNT // nranks
-        float_elems = (nranks + 2) * chunk_elems
-        signal_tail_nbytes = (nranks - 1) * K_MAX_SUPPORTED_RANKS * DTYPE_NBYTES
+        # Two-ring design: ALLREDUCE_COUNT floats + (2*(P-1)+1) signal rows.
+        # The +1 accounts for the final sync barrier between AG and stage-out.
+        subchunk_elems = ALLREDUCE_COUNT // (2 * nranks)
+        float_elems = 2 * nranks * subchunk_elems  # = ALLREDUCE_COUNT
+        signal_tail_nbytes = (2 * (nranks - 1) + 1) * K_MAX_SUPPORTED_RANKS * DTYPE_NBYTES
         scratch_nbytes = float_elems * DTYPE_NBYTES + signal_tail_nbytes
     else:
         raise ValueError(f"Unsupported allreduce mode: {mode!r}. Expected one of {tuple(KERNEL_MAP.keys())}.")
@@ -205,9 +206,14 @@ def run(
     if not (2 <= nranks <= K_MAX_SUPPORTED_RANKS):
         raise ValueError(f"allreduce needs between 2 and {K_MAX_SUPPORTED_RANKS} devices, got {nranks} ({device_ids})")
 
-    # Ring and bidirectional_ring require ALLREDUCE_COUNT divisible by nranks.
-    if mode in ("twophase", "ring", "bidirectional_ring") and ALLREDUCE_COUNT % nranks != 0:
+    # Ring requires ALLREDUCE_COUNT divisible by nranks; bidirectional_ring
+    # (two-ring design) requires ALLREDUCE_COUNT divisible by 2*nranks.
+    if mode in ("twophase", "ring") and ALLREDUCE_COUNT % nranks != 0:
         raise ValueError(f"ALLREDUCE_COUNT={ALLREDUCE_COUNT} must be divisible by nranks={nranks} for {mode} mode")
+    if mode == "bidirectional_ring" and ALLREDUCE_COUNT % (2 * nranks) != 0:
+        raise ValueError(
+            f"ALLREDUCE_COUNT={ALLREDUCE_COUNT} must be divisible by 2*nranks={2 * nranks} for {mode} mode"
+        )
 
     float_elems, scratch_nbytes, window_size = compute_scratch_params(mode, nranks)
 

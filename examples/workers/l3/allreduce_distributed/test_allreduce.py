@@ -32,10 +32,7 @@ def test_allreduce_distributed(st_platform, st_device_ids, mode):
         pytest.param(4, "onephase", marks=pytest.mark.device_count(4)),
         pytest.param(4, "twophase", marks=pytest.mark.device_count(4)),
         pytest.param(4, "ring", marks=pytest.mark.device_count(4)),
-        # TODO(#37): P=4 bidirectional_ring validation pending — IBing index
-        # formulas need refinement for P≥4 to prevent orphan chunk data loss
-        # during the forward phase. P=2 passes golden.
-        # pytest.param(4, "bidirectional_ring", marks=pytest.mark.device_count(4)),
+        pytest.param(4, "bidirectional_ring", marks=pytest.mark.device_count(4)),
     ],
 )
 def test_allreduce_distributed_multi_rank(st_platform, st_device_ids, n_devices, mode):
