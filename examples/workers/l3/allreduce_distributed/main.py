@@ -9,7 +9,7 @@
 # -----------------------------------------------------------------------------------------------------------
 """End-to-end distributed allreduce with selectable algorithm variant.
 
-Three algorithm modes are available via --mode:
+Four algorithm modes are available via --mode:
 
   onephase   (default) Mesh direct: read full vector from all peers, accumulate.
              Best for small P (2-4), simplest implementation.
@@ -20,6 +20,11 @@ Three algorithm modes are available via --mode:
   ring       Ring RS+AG: chunked reduce-scatter + allgather with neighbor barriers.
              Best for large P (8+), bandwidth-optimal (2*(P-1)/P * N).
 
+  bidirectional_ring  Bidirectional interleaved ring RS+AG implementing the IBing
+             algorithm (Zong et al., ACM TACO 2025).  Communication steps halved
+             from 2(P-1) to P-1 by sending/receiving in both HCCS directions
+             simultaneously.  Best for small-N (α-dominated) workloads.
+
 Each rank owns a private input/output tensor; cross-rank communication happens
 strictly inside the kernel, via a communication window scratch slot.
 
@@ -27,6 +32,7 @@ Run examples:
     python main.py -p a2a3sim -d 0-1 --mode onephase
     python main.py -p a2a3sim -d 0-3 --mode twophase
     python main.py -p a2a3sim -d 0-3 --mode ring
+    python main.py -p a2a3sim -d 0-3 --mode bidirectional_ring
 
 """
 
@@ -68,6 +74,7 @@ KERNEL_MAP = {
     "onephase": "kernels/aiv/allreduce_onephase_kernel.cpp",
     "twophase": "kernels/aiv/allreduce_twophase_kernel.cpp",
     "ring": "kernels/aiv/allreduce_ring_kernel.cpp",
+    "bidirectional_ring": "kernels/aiv/allreduce_bidirectional_ring_kernel.cpp",
 }
 ORCH_MAP = {
     "onephase": (
@@ -84,6 +91,11 @@ ORCH_MAP = {
         "kernels/orchestration/allreduce_ring_orch.cpp",
         "allreduce_ring_orchestration",
         "allreduce_ring_orchestration_config",
+    ),
+    "bidirectional_ring": (
+        "kernels/orchestration/allreduce_bidirectional_ring_orch.cpp",
+        "allreduce_bidirectional_ring_orchestration",
+        "allreduce_bidirectional_ring_orchestration_config",
     ),
 }
 
@@ -110,6 +122,12 @@ def compute_scratch_params(mode: str, nranks: int) -> tuple[int, int, int]:
         chunk_elems = ALLREDUCE_COUNT // nranks
         float_elems = (nranks + 1) * chunk_elems
         signal_tail_nbytes = 2 * (nranks - 1) * K_MAX_SUPPORTED_RANKS * DTYPE_NBYTES
+        scratch_nbytes = float_elems * DTYPE_NBYTES + signal_tail_nbytes
+    elif mode == "bidirectional_ring":
+        # Bidirectional ring: (nranks+2) * chunk_elems floats (P chunks + 2 exchange) + (P-1) signal rows.
+        chunk_elems = ALLREDUCE_COUNT // nranks
+        float_elems = (nranks + 2) * chunk_elems
+        signal_tail_nbytes = (nranks - 1) * K_MAX_SUPPORTED_RANKS * DTYPE_NBYTES
         scratch_nbytes = float_elems * DTYPE_NBYTES + signal_tail_nbytes
     else:
         raise ValueError(f"Unsupported allreduce mode: {mode!r}. Expected one of {tuple(KERNEL_MAP.keys())}.")
@@ -187,8 +205,8 @@ def run(
     if not (2 <= nranks <= K_MAX_SUPPORTED_RANKS):
         raise ValueError(f"allreduce needs between 2 and {K_MAX_SUPPORTED_RANKS} devices, got {nranks} ({device_ids})")
 
-    # Ring and twophase require ALLREDUCE_COUNT divisible by nranks.
-    if mode in ("twophase", "ring") and ALLREDUCE_COUNT % nranks != 0:
+    # Ring and bidirectional_ring require ALLREDUCE_COUNT divisible by nranks.
+    if mode in ("twophase", "ring", "bidirectional_ring") and ALLREDUCE_COUNT % nranks != 0:
         raise ValueError(f"ALLREDUCE_COUNT={ALLREDUCE_COUNT} must be divisible by nranks={nranks} for {mode} mode")
 
     float_elems, scratch_nbytes, window_size = compute_scratch_params(mode, nranks)
@@ -280,9 +298,12 @@ def main() -> int:
     parser.add_argument(
         "-m",
         "--mode",
-        choices=["onephase", "twophase", "ring"],
+        choices=["onephase", "twophase", "ring", "bidirectional_ring"],
         default="onephase",
-        help="Allreduce algorithm variant: onephase (mesh direct), twophase (mesh RS+AG), ring (ring RS+AG).",
+        help=(
+            "Allreduce algorithm variant: onephase (mesh direct), twophase (mesh RS+AG), "
+            "ring (ring RS+AG), bidirectional_ring (interleaved bidirectional ring RS+AG)."
+        ),
     )
     parser.add_argument("--pto-isa-commit", default=None, help="Optional PTO ISA commit/tag to fetch before compiling.")
     cli = parser.parse_args()
