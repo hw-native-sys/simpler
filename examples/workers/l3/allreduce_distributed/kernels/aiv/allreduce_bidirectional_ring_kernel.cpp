@@ -28,7 +28,7 @@
  * Scratch layout (per rank, in HCCL window):
  *   [0 .. P*subchunk)              ring0 chunks (clockwise ring)
  *   [P*subchunk .. 2*P*subchunk)   ring1 chunks (counter-clockwise ring)
- *   tail                           2*(P−1)*kMaxSupportedRanks int32 barrier rows
+ *   tail                           (2*(P−1)+1)*kMaxSupportedRanks int32 barrier rows
  */
 
 #include <cstdint>
@@ -93,7 +93,7 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
 
     int my_rank = static_cast<int>(commCtx->rankId);
 
-    if (nranks <= 1 || nranks > kMaxSupportedRanks || (ALLREDUCE_COUNT % static_cast<size_t>(nranks)) != 0) {
+    if (nranks <= 1 || nranks > kMaxSupportedRanks || (ALLREDUCE_COUNT % (2ULL * static_cast<size_t>(nranks))) != 0) {
         pipe_barrier(PIPE_ALL);
         return;
     }
@@ -206,7 +206,7 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
     // Phase 3: allgather — P−1 barrier rounds.
     //
     // Ring0 (cw →right): send_idx = (r - step + 1 + P) % P
-    // Ring1 (ccw →left): send_idx = (r + step + 1 + P) % P
+    // Ring1 (ccw →left): send_idx = (r + step - 1 + P) % P
     // ------------------------------------------------------------------
     for (int step = 1; step < nranks; ++step) {
         const int rs_rounds = nranks - 1;

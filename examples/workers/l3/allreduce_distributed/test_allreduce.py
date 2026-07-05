@@ -6,7 +6,7 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""ST for examples/workers/l3/allreduce_distributed — all three algorithm modes."""
+"""ST for examples/workers/l3/allreduce_distributed — all five tested algorithm modes."""
 
 import pytest
 
@@ -16,9 +16,9 @@ from .main import run
 @pytest.mark.platforms(["a2a3sim", "a2a3", "a5sim", "a5"])
 @pytest.mark.runtime("tensormap_and_ringbuffer")
 @pytest.mark.device_count(2)
-@pytest.mark.parametrize("mode", ["onephase", "twophase", "ring", "bidirectional_ring"])
+@pytest.mark.parametrize("mode", ["onephase", "twophase", "ring", "bidirectional_ring", "ibing"])
 def test_allreduce_distributed(st_platform, st_device_ids, mode):
-    """Test all three allreduce modes with 2 devices."""
+    """Test all allreduce modes with 2 devices."""
     assert len(st_device_ids) == 2
     rc = run([int(d) for d in st_device_ids], platform=st_platform, mode=mode)
     assert rc == 0
