@@ -22,14 +22,16 @@
  * Right-bound:  r pushes chunks[(r - s + P) % P]         → rank r+1
  * Left-bound:   r pushes chunks[(r + s + 1 + P) % P]    → rank r-1
  *
- * On CPU sim (POSIX shared memory): exchange buffers snapshot source
- * chunks before pushing, avoiding intra-round read/write races.
- * On NPU hardware (HCCL window): direct TPUT<AtomicAdd/AtomicNone>.
+ * Exchange buffers snapshot source chunks before pushing on all platforms,
+ * avoiding intra-round read/write races where a remote TPUT can modify a
+ * chunk between the right-bound and left-bound TLOAD within the same step.
+ * The double-barrier scheme ensures (a) prior writes are globally visible,
+ * (b) all snapshots complete, before any push reads the exchange buffers.
  *
  * Scratch layout (per rank, in HCCL window):
  *   [0 .. P*chunk_elems)                   P working chunks
- *   [P*chunk .. (P+1)*chunk)               exchange_right (CPU sim snapshot)
- *   [(P+1)*chunk .. (P+2)*chunk)          exchange_left  (CPU sim snapshot)
+ *   [P*chunk .. (P+1)*chunk)               exchange_right (snapshot buffer)
+ *   [(P+1)*chunk .. (P+2)*chunk)          exchange_left  (snapshot buffer)
  *   tail                   (2*(P-1)+1) * kMaxSupportedRanks int32 signals
  *
  * Divisibility: requires ALLREDUCE_COUNT % nranks == 0.
@@ -143,33 +145,28 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
     //   Steps 1..⌊P/2⌋:     reduce  — AtomicAdd pushes from exchange buffers.
     //   Steps ⌊P/2⌋+1..P−1: forward — AtomicNone pushes (allgather).
     //
-    // CPU sim uses a double-barrier scheme:
+    // CPU sim and NPU both use a double-barrier scheme:
     //   1. Barrier A: ensure prior writes are globally visible.
     //   2. Snapshot:  copy src chunks → exchange buffers.
     //   3. Barrier B: ensure all snapshots complete.
     //   4. Push:      write exchange buffers → neighbour's chunks[].
     //
-    // This replicates the MPI exchange-buffer semantics of the original
-    // IBing paper in shared memory.  On NPU hardware the snapshots and
-    // second barrier are unnecessary (HCCL provides ordering guarantees).
+    // This replicates MPI exchange-buffer semantics.  Without snapshots,
+    // a remote TPUT can modify chunks[idx_l] between the right-bound and
+    // left-bound TLOAD within the same step, double-counting data.
     // ------------------------------------------------------------------
     const int left = (my_rank - 1 + nranks) % nranks;
     const int right = (my_rank + 1) % nranks;
     const int reduce_steps = nranks / 2;
 
     for (int step = 1; step < nranks; ++step) {
-#ifdef __CPU_SIM
         // Barrier A: all prior writes globally visible.
         RoundBarrier(commCtx, signal_base + (2 * (step - 1)) * kMaxSupportedRanks, my_rank, nranks);
-#else
-        RoundBarrier(commCtx, signal_base + (step - 1) * kMaxSupportedRanks, my_rank, nranks);
-#endif
 
         const int idx_r = (my_rank - step + nranks) % nranks;
         const int idx_l = (my_rank + step + nranks + 1) % nranks;
         const bool fwd = (step > reduce_steps);
 
-#ifdef __CPU_SIM
         // Snapshot source chunks into exchange buffers.
         for (int i = 0; i < chunk_elems; ++i)
             exchange_right[i] = chunks[static_cast<size_t>(idx_r * chunk_elems) + i];
@@ -178,7 +175,6 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
 
         // Barrier B: all snapshots complete — safe to push.
         RoundBarrier(commCtx, signal_base + (2 * (step - 1) + 1) * kMaxSupportedRanks, my_rank, nranks);
-#endif
 
         // Right-bound push.
         {
@@ -193,8 +189,8 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
                     dst[i] += src[i];
             }
 #else
-            __gm__ float *src = chunks + static_cast<size_t>(idx_r * chunk_elems);
-            __gm__ float *dst = CommRemotePtr(commCtx, src, right);
+            __gm__ float *src = exchange_right;
+            __gm__ float *dst = CommRemotePtr(commCtx, chunks + static_cast<size_t>(idx_r * chunk_elems), right);
             GT srcG(src, chunkShape, chunkStride);
             GT dstG(dst, chunkShape, chunkStride);
             if (fwd) pto::comm::TPUT<pto::AtomicType::AtomicNone>(dstG, srcG, pushTile);
@@ -215,8 +211,8 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
                     dst[i] += src[i];
             }
 #else
-            __gm__ float *src = chunks + static_cast<size_t>(idx_l * chunk_elems);
-            __gm__ float *dst = CommRemotePtr(commCtx, src, left);
+            __gm__ float *src = exchange_left;
+            __gm__ float *dst = CommRemotePtr(commCtx, chunks + static_cast<size_t>(idx_l * chunk_elems), left);
             GT srcG(src, chunkShape, chunkStride);
             GT dstG(dst, chunkShape, chunkStride);
             if (fwd) pto::comm::TPUT<pto::AtomicType::AtomicNone>(dstG, srcG, pushTile);
@@ -231,11 +227,7 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
     // Final sync: ensure all pushes are globally visible before stage-out.
     // ------------------------------------------------------------------
     if (nranks > 1) {
-#ifdef __CPU_SIM
         RoundBarrier(commCtx, signal_base + (2 * (nranks - 1)) * kMaxSupportedRanks, my_rank, nranks);
-#else
-        RoundBarrier(commCtx, signal_base + (nranks - 1) * kMaxSupportedRanks, my_rank, nranks);
-#endif
     }
 
     // ------------------------------------------------------------------

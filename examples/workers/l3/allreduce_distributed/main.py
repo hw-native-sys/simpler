@@ -140,9 +140,8 @@ def compute_scratch_params(mode: str, nranks: int) -> tuple[int, int, int]:
         scratch_nbytes = float_elems * DTYPE_NBYTES + signal_tail_nbytes
     elif mode == "ibing":
         # IBing interleaved: (P+2)*chunk_elems floats + 2*(P-1)+1 signal rows.
-        # CPU sim uses two RoundBarriers per step (snapshot barrier + push barrier),
-        # needing 2*(P-1)+1 rows.  NPU uses only P rows but we allocate for the
-        # CPU sim worst case.
+        # Double-barrier scheme (Barrier A + Barrier B per step) needs 2*(P-1)+1
+        # signal rows on all platforms (unified sim and NPU path).
         chunk_elems = ALLREDUCE_COUNT // nranks
         float_elems = (nranks + 2) * chunk_elems
         signal_tail_nbytes = (2 * (nranks - 1) + 1) * K_MAX_SUPPORTED_RANKS * DTYPE_NBYTES
