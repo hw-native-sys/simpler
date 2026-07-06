@@ -48,9 +48,12 @@ def test_allreduce_distributed_multi_rank(st_platform, st_device_ids, n_devices,
 
 @pytest.mark.platforms(["a2a3sim", "a2a3", "a5sim", "a5"])
 @pytest.mark.runtime("tensormap_and_ringbuffer")
-@pytest.mark.device_count(4)
-def test_allreduce_distributed_ibing_unsupported_ranks(st_platform, st_device_ids):
-    """ibing mode should raise ValueError for nranks != 2."""
-    assert len(st_device_ids) == 4
+@pytest.mark.device_count(2)
+def test_allreduce_distributed_ibing_unsupported_ranks(st_platform):
+    """ibing mode should raise ValueError for nranks != 2.
+
+    Uses synthetic 4-rank device IDs: run() validates nranks before worker init,
+    so no 4-device pool is required (2-device CI can run this case).
+    """
     with pytest.raises(ValueError, match="ibing mode is only supported for nranks=2"):
-        run([int(d) for d in st_device_ids], platform=st_platform, mode="ibing")
+        run([0, 1, 2, 3], platform=st_platform, mode="ibing")
