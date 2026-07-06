@@ -158,7 +158,7 @@ def run_l3_l2_message_queue_example(platform: str, device_id: int) -> None:
         worker.close()
 
 
-@pytest.mark.platforms(["a2a3sim", "a5sim", "a2a3"])
+@pytest.mark.platforms(["a2a3sim", "a2a3", "a5sim", "a5"])
 @pytest.mark.device_count(1)
 @pytest.mark.runtime("tensormap_and_ringbuffer")
 def test_l3_l2_message_queue(st_platform, st_device_ids):

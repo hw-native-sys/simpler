@@ -351,8 +351,7 @@ Host poisons only the region parsed from that text.
 - `a2a3sim`: full API and protocol support.
 - `a5sim`: full API and protocol support.
 - `a2a3` onboard: full API and protocol support.
-- `a5` onboard: symbols are present; region operations fail with a clear
-  not-supported error.
+- `a5` onboard: full API and protocol support.
 
 Simulation backends preserve the same API, ordering, timeout, and error
 semantics as onboard backends.
@@ -371,8 +370,9 @@ followed by input and output tensor slices. It can use counter offset `0` for
 `{seq + 1, STOP}` and publish it through `data_ready`.
 
 The related example lives in
-`examples/a2a3/tensormap_and_ringbuffer/l3_l2_orch_comm_stream`. It creates one
-region, submits one persistent L2 orchestration task, and drives three DATA
+`examples/workers/l3/l3_l2_orch_comm_stream` and is marked for `a2a3sim`,
+`a2a3`, `a5sim`, and `a5`. It creates one region, submits one persistent L2
+orchestration task, and drives three DATA
 rounds from L3 while the L2 task stays in flight. Each round copies a
 `float32[128 * 128]` input slice and a small channel header into the region;
 L2 builds input/output GM tensor views from the descriptor, launches an AIV

@@ -118,8 +118,6 @@ public:
      */
     void set_dep_gen_enabled(bool enable) override { enable_dep_gen_ = enable; }
 
-    bool l3_l2_orch_comm_supported() const override { return false; }
-
     /**
      * Cleanup all resources
      *

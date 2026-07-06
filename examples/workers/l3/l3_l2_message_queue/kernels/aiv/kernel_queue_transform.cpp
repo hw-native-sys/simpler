@@ -10,6 +10,7 @@
  */
 
 #include <cstdint>
+
 #include <pto/pto-inst.hpp>
 
 #include "pipe_sync.h"
@@ -35,8 +36,8 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
 
     constexpr int kRows = 128;
     constexpr int kCols = 128;
-    using DynShapeDim5 = Shape<1, 1, 1, kRows, kCols>;
-    using DynStrideDim5 = Stride<1, 1, 1, kCols, 1>;
+    using DynShapeDim5 = pto::Shape<1, 1, 1, kRows, kCols>;
+    using DynStrideDim5 = pto::Stride<1, 1, 1, kCols, 1>;
     using GlobalData = GlobalTensor<float, DynShapeDim5, DynStrideDim5>;
     using TileData = Tile<TileType::Vec, float, kRows, kCols, BLayout::RowMajor, -1, -1>;
 

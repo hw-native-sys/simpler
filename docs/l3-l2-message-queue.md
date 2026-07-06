@@ -366,7 +366,12 @@ payload, and counter primitives.
 - `a5sim`: supported.
 - `a2a3` onboard: supported where the underlying L3-L2 communication
   primitives are supported.
-- `a5` onboard: follows the underlying L3-L2 communication support status.
+- `a5` onboard: supported where the underlying L3-L2 communication
+  primitive is available.
 
 Simulation backends preserve the same API, ordering, timeout, and error
 semantics as onboard backends.
+
+The runnable example lives in
+`examples/workers/l3/l3_l2_message_queue` and is marked for `a2a3sim`,
+`a2a3`, `a5sim`, and `a5`.
