@@ -14,6 +14,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <new>
 #include <string.h>
 
 #include "aicpu/l3_l2_orch_endpoint.h"
@@ -102,6 +103,10 @@ struct L3L2QueueArgs {
     uint64_t output_arena_bytes;
     uint64_t payload_bytes;
     uint64_t counter_bytes;
+};
+
+struct L3L2QueueEndpointConfig {
+    uint64_t max_l2_input_inflight;
 };
 
 struct L3L2QueueInputHandle {
@@ -255,10 +260,53 @@ static inline bool l3_l2_queue_reconstruct_counter(int32_t observed_low32, uint6
 class L3L2QueueEndpoint {
 public:
     class InputQueue {
+        struct ActiveInputEntry {
+            uint64_t seq;
+            L3L2QueueOpcode opcode;
+            uint64_t payload_offset;
+            uint64_t payload_nbytes;
+            L3L2OrchPayloadView payload;
+            bool completed;
+        };
+
     public:
         explicit InputQueue(L3L2QueueEndpoint *parent) :
             parent_(parent) {}
 
+        InputQueue(const InputQueue &) = delete;
+        InputQueue &operator=(const InputQueue &) = delete;
+        InputQueue(InputQueue &&) = delete;
+        InputQueue &operator=(InputQueue &&) = delete;
+
+        ~InputQueue() { delete[] active_entries_; }
+
+        friend class L3L2QueueEndpoint;
+
+    private:
+        bool initialize(uint64_t max_l2_input_inflight) {
+            delete[] active_entries_;
+            active_entries_ = nullptr;
+            entry_capacity_ = 0;
+            active_count_ = 0;
+            active_non_stop_count_ = 0;
+            input_acquire_ = parent_->input_head_;
+            stop_observed_ = false;
+            drained_ = false;
+
+            ActiveInputEntry *entries = new (std::nothrow) ActiveInputEntry[max_l2_input_inflight + 1];
+            if (entries == nullptr) {
+                parent_->set_error(
+                    L3L2QueueErrorKind::ENDPOINT_ERROR, "init", parent_->endpoint_.descriptor().region_id,
+                    "input window allocation failed"
+                );
+                return false;
+            }
+            active_entries_ = entries;
+            entry_capacity_ = max_l2_input_inflight + 1;
+            return true;
+        }
+
+    public:
         bool peek(uint64_t timeout_ns, L3L2QueueInputHandle *out) {
             if (out == nullptr) {
                 return false;
@@ -291,7 +339,7 @@ public:
             if (!parent_->ensure_live("input.try_peek") || out == nullptr) {
                 return false;
             }
-            if (active_) {
+            if (parent_->config_.max_l2_input_inflight == 1 && active_count_ != 0) {
                 parent_->poison(L3L2QueueErrorKind::OWNERSHIP, "input.try_peek", "input handle already active");
                 return false;
             }
@@ -301,8 +349,8 @@ public:
                 )) {
                 return false;
             }
-            if (stopped_) {
-                if (parent_->input_tail_ != parent_->input_head_) {
+            if (stop_observed_) {
+                if (parent_->input_tail_ != input_acquire_) {
                     parent_->poison(
                         L3L2QueueErrorKind::INVALID_DESCRIPTOR, "input.try_peek",
                         "input descriptor published after STOP"
@@ -310,10 +358,11 @@ public:
                 }
                 return false;
             }
-            if (parent_->input_tail_ == parent_->input_head_) {
+            if (parent_->input_tail_ == input_acquire_) {
                 return false;
             }
-            if (parent_->input_tail_ - parent_->input_head_ > parent_->layout_.depth) {
+            if (parent_->input_tail_ - parent_->input_head_ > parent_->layout_.depth ||
+                input_acquire_ < parent_->input_head_ || input_acquire_ > parent_->input_tail_) {
                 parent_->poison(
                     L3L2QueueErrorKind::INVALID_DESCRIPTOR, "input.try_peek", "input descriptor state invalid"
                 );
@@ -321,12 +370,12 @@ public:
             }
 
             L3L2QueueDescSlot slot{};
-            uint64_t slot_index = parent_->input_head_ & (parent_->layout_.depth - 1);
+            uint64_t slot_index = input_acquire_ & (parent_->layout_.depth - 1);
             uint64_t slot_offset = parent_->layout_.input_desc_offset + slot_index * sizeof(L3L2QueueDescSlot);
             if (!parent_->read_desc_slot(slot_offset, &slot, "input.try_peek")) {
                 return false;
             }
-            uint64_t expected_seq = parent_->input_head_ + 1;
+            uint64_t expected_seq = input_acquire_ + 1;
             if (slot.seq != expected_seq) {
                 parent_->poison(
                     L3L2QueueErrorKind::INVALID_DESCRIPTOR, "input.try_peek", "input descriptor seq mismatch"
@@ -342,6 +391,14 @@ public:
                 parent_->poison(
                     L3L2QueueErrorKind::INVALID_DESCRIPTOR, "input.try_peek", "STOP descriptor must be zero-byte"
                 );
+                return false;
+            }
+            bool counts_against_window = opcode == L3L2QueueOpcode::DATA || opcode == L3L2QueueOpcode::ERROR;
+            if (counts_against_window && active_non_stop_count_ >= parent_->config_.max_l2_input_inflight) {
+                return false;
+            }
+            if (active_count_ >= entry_capacity_) {
+                parent_->poison(L3L2QueueErrorKind::OWNERSHIP, "input.try_peek", "input window state full");
                 return false;
             }
 
@@ -361,7 +418,7 @@ public:
                 parent_->poison(L3L2QueueErrorKind::INVALID_DESCRIPTOR, "input.try_peek", "input payload out of arena");
                 return false;
             } else if (!parent_->payload_matches_head(
-                           parent_->input_payload_head_, slot.payload_offset, slot.payload_nbytes,
+                           parent_->input_payload_acquire_head_, slot.payload_offset, slot.payload_nbytes,
                            parent_->layout_.input_arena_offset, parent_->layout_.input_arena_bytes, "input.try_peek"
                        )) {
                 return false;
@@ -370,14 +427,34 @@ public:
                     L3L2QueueErrorKind::ENDPOINT_ERROR, "input.try_peek", parent_->endpoint_.error().message
                 );
                 return false;
+            } else {
+                parent_->advance_payload_head(
+                    parent_->input_payload_acquire_head_, slot.payload_offset, slot.payload_nbytes,
+                    parent_->layout_.input_arena_offset, parent_->layout_.input_arena_bytes, "input.try_peek"
+                );
+                if (parent_->error_.kind != L3L2QueueErrorKind::NONE) {
+                    return false;
+                }
             }
 
             *out = L3L2QueueInputHandle{slot.seq, opcode, slot.payload_offset, slot.payload_nbytes, view};
-            active_ = true;
-            active_seq_ = slot.seq;
-            active_opcode_ = opcode;
-            active_payload_offset_ = slot.payload_offset;
-            active_payload_nbytes_ = slot.payload_nbytes;
+            active_entries_[active_count_] =
+                ActiveInputEntry{slot.seq, opcode, slot.payload_offset, slot.payload_nbytes, view, false};
+            active_count_ += 1;
+            if (counts_against_window) {
+                active_non_stop_count_ += 1;
+            }
+            input_acquire_ += 1;
+            if (opcode == L3L2QueueOpcode::STOP) {
+                stop_observed_ = true;
+                if (parent_->input_tail_ != input_acquire_) {
+                    parent_->poison(
+                        L3L2QueueErrorKind::INVALID_DESCRIPTOR, "input.try_peek",
+                        "input descriptor published after STOP"
+                    );
+                    return false;
+                }
+            }
             return true;
         }
 
@@ -385,43 +462,83 @@ public:
             if (!parent_->ensure_live("input.release")) {
                 return false;
             }
-            if (!active_ || handle.seq != active_seq_ || handle.seq != parent_->input_head_ + 1 ||
-                handle.opcode != active_opcode_ || handle.payload_offset != active_payload_offset_ ||
-                handle.payload_nbytes != active_payload_nbytes_) {
+            uint64_t entry_index = 0;
+            ActiveInputEntry *entry = find_active_entry(handle.seq, &entry_index);
+            if (entry == nullptr || handle.opcode != entry->opcode || handle.payload_offset != entry->payload_offset ||
+                handle.payload_nbytes != entry->payload_nbytes || handle.payload.gm_addr != entry->payload.gm_addr ||
+                handle.payload.nbytes != entry->payload.nbytes) {
                 parent_->poison(L3L2QueueErrorKind::OWNERSHIP, "input.release", "input handle is not active");
                 return false;
             }
-            if (active_payload_nbytes_ != 0) {
-                parent_->advance_payload_head(
-                    parent_->input_payload_head_, active_payload_offset_, active_payload_nbytes_,
-                    parent_->layout_.input_arena_offset, parent_->layout_.input_arena_bytes, "input.release"
-                );
-                if (parent_->error_.kind != L3L2QueueErrorKind::NONE) {
+            if (entry->completed) {
+                parent_->poison(L3L2QueueErrorKind::OWNERSHIP, "input.release", "input handle already released");
+                return false;
+            }
+            (void)entry_index;
+            entry->completed = true;
+            return release_completed_prefix();
+        }
+
+        bool drained() const { return drained_; }
+
+    private:
+        ActiveInputEntry *find_active_entry(uint64_t seq, uint64_t *entry_index) {
+            for (uint64_t i = 0; i < active_count_; ++i) {
+                if (active_entries_[i].seq == seq) {
+                    if (entry_index != nullptr) {
+                        *entry_index = i;
+                    }
+                    return &active_entries_[i];
+                }
+            }
+            return nullptr;
+        }
+
+        void remove_first_entry() {
+            for (uint64_t i = 1; i < active_count_; ++i) {
+                active_entries_[i - 1] = active_entries_[i];
+            }
+            active_count_ -= 1;
+        }
+
+        bool release_completed_prefix() {
+            while (active_count_ != 0 && active_entries_[0].completed) {
+                ActiveInputEntry entry = active_entries_[0];
+                if (entry.payload_nbytes != 0) {
+                    parent_->advance_payload_head(
+                        parent_->input_payload_head_, entry.payload_offset, entry.payload_nbytes,
+                        parent_->layout_.input_arena_offset, parent_->layout_.input_arena_bytes, "input.release"
+                    );
+                    if (parent_->error_.kind != L3L2QueueErrorKind::NONE) {
+                        return false;
+                    }
+                }
+                parent_->input_head_ += 1;
+                if (entry.opcode == L3L2QueueOpcode::DATA || entry.opcode == L3L2QueueOpcode::ERROR) {
+                    active_non_stop_count_ -= 1;
+                }
+                if (entry.opcode == L3L2QueueOpcode::STOP) {
+                    drained_ = true;
+                }
+                remove_first_entry();
+                if (!parent_->notify_counter(
+                        parent_->layout_.input_desc_head_offset, static_cast<int32_t>(parent_->input_head_),
+                        "input.release"
+                    )) {
                     return false;
                 }
             }
-            parent_->input_head_ += 1;
-            if (active_opcode_ == L3L2QueueOpcode::STOP) {
-                stopped_ = true;
-            }
-            active_ = false;
-            active_seq_ = 0;
-            active_opcode_ = L3L2QueueOpcode::INVALID;
-            active_payload_offset_ = 0;
-            active_payload_nbytes_ = 0;
-            return parent_->notify_counter(
-                parent_->layout_.input_desc_head_offset, static_cast<int32_t>(parent_->input_head_), "input.release"
-            );
+            return true;
         }
 
-    private:
         L3L2QueueEndpoint *parent_;
-        bool active_{false};
-        uint64_t active_seq_{0};
-        L3L2QueueOpcode active_opcode_{L3L2QueueOpcode::INVALID};
-        uint64_t active_payload_offset_{0};
-        uint64_t active_payload_nbytes_{0};
-        bool stopped_{false};
+        ActiveInputEntry *active_entries_{nullptr};
+        uint64_t entry_capacity_{0};
+        uint64_t active_count_{0};
+        uint64_t active_non_stop_count_{0};
+        uint64_t input_acquire_{0};
+        bool stop_observed_{false};
+        bool drained_{false};
     };
 
     class OutputQueue {
@@ -553,14 +670,31 @@ public:
     };
 
     L3L2QueueEndpoint(const L3L2OrchRegionDesc &desc, const L3L2QueueArgs &args) :
+        L3L2QueueEndpoint(desc, args, L3L2QueueEndpointConfig{1}) {}
+
+    L3L2QueueEndpoint(
+        const L3L2OrchRegionDesc &desc, const L3L2QueueArgs &args, const L3L2QueueEndpointConfig &config
+    ) :
         endpoint_(desc),
+        config_(config),
         input_queue_(this),
         output_queue_(this) {
         if (endpoint_.error().kind != L3L2EndpointErrorKind::NONE ||
             !l3_l2_queue_validate_region(desc, args, &layout_)) {
             set_error(L3L2QueueErrorKind::BAD_DESCRIPTOR, "init", desc.region_id, "invalid queue descriptor");
+            return;
         }
+        if (config_.max_l2_input_inflight == 0 || config_.max_l2_input_inflight > layout_.depth) {
+            set_error(L3L2QueueErrorKind::BAD_ARGUMENT, "init", desc.region_id, "invalid endpoint config");
+            return;
+        }
+        input_queue_.initialize(config_.max_l2_input_inflight);
     }
+
+    L3L2QueueEndpoint(const L3L2QueueEndpoint &) = delete;
+    L3L2QueueEndpoint &operator=(const L3L2QueueEndpoint &) = delete;
+    L3L2QueueEndpoint(L3L2QueueEndpoint &&) = delete;
+    L3L2QueueEndpoint &operator=(L3L2QueueEndpoint &&) = delete;
 
     const L3L2QueueError &error() const { return error_; }
     const L3L2QueueLayout &layout() const { return layout_; }
@@ -730,6 +864,7 @@ private:
     }
 
     L3L2OrchEndpoint endpoint_;
+    L3L2QueueEndpointConfig config_{1};
     L3L2QueueLayout layout_{};
     L3L2QueueError error_{L3L2QueueErrorKind::NONE, "", 0, ""};
     uint64_t input_head_{0};
@@ -737,6 +872,7 @@ private:
     uint64_t output_head_{0};
     uint64_t output_tail_{0};
     uint64_t input_payload_head_{0};
+    uint64_t input_payload_acquire_head_{0};
     uint64_t output_payload_head_{0};
     uint64_t output_payload_tail_{0};
     InputQueue input_queue_;

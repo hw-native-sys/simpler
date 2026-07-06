@@ -539,4 +539,234 @@ TEST(L3L2MessageQueueTest, InputSecondPeekBeforeReleasePoisonsOwnershipAndSetsOw
     EXPECT_EQ(storage.counters[counter_index(L3L2_QUEUE_L2_ABORT_FLAG_OFFSET)], 1);
 }
 
+TEST(L3L2MessageQueueTest, InvalidEndpointConfigSetsBadArgumentWithoutAbortFlag) {
+    RegionStorage zero_storage{};
+    RegionStorage too_large_storage{};
+    L3L2QueueArgs args = make_args(2, 64, 64);
+
+    L3L2QueueEndpoint zero(make_desc(&zero_storage, args), args, L3L2QueueEndpointConfig{0});
+    EXPECT_EQ(zero.error().kind, L3L2QueueErrorKind::BAD_ARGUMENT);
+    EXPECT_EQ(zero_storage.counters[counter_index(L3L2_QUEUE_L2_ABORT_FLAG_OFFSET)], 0);
+
+    L3L2QueueEndpoint too_large(make_desc(&too_large_storage, args), args, L3L2QueueEndpointConfig{3});
+    EXPECT_EQ(too_large.error().kind, L3L2QueueErrorKind::BAD_ARGUMENT);
+    EXPECT_EQ(too_large_storage.counters[counter_index(L3L2_QUEUE_L2_ABORT_FLAG_OFFSET)], 0);
+}
+
+TEST(L3L2MessageQueueTest, MultiInflightAcquireAllowsSeveralDataInputs) {
+    RegionStorage storage{};
+    L3L2QueueArgs args = make_args(4, 128, 128);
+    L3L2QueueEndpoint queue(make_desc(&storage, args), args, L3L2QueueEndpointConfig{3});
+    ASSERT_EQ(queue.error().kind, L3L2QueueErrorKind::NONE) << queue.error().message;
+    publish_input_desc(&storage, queue.layout(), 1, L3L2QueueOpcode::DATA);
+    publish_input_desc(&storage, queue.layout(), 2, L3L2QueueOpcode::DATA);
+    publish_input_desc(&storage, queue.layout(), 3, L3L2QueueOpcode::DATA);
+
+    L3L2QueueInputHandle first{};
+    L3L2QueueInputHandle second{};
+    L3L2QueueInputHandle third{};
+    EXPECT_TRUE(queue.input().try_peek(&first)) << queue.error().message;
+    EXPECT_TRUE(queue.input().try_peek(&second)) << queue.error().message;
+    EXPECT_TRUE(queue.input().try_peek(&third)) << queue.error().message;
+
+    EXPECT_EQ(first.seq, 1u);
+    EXPECT_EQ(second.seq, 2u);
+    EXPECT_EQ(third.seq, 3u);
+    EXPECT_EQ(queue.error().kind, L3L2QueueErrorKind::NONE);
+    EXPECT_EQ(storage.counters[counter_index(L3L2_QUEUE_INPUT_DESC_HEAD_OFFSET)], 0);
+}
+
+TEST(L3L2MessageQueueTest, MultiInflightAcquireAllowsNonZeroPayloadOffsetsBeforeRelease) {
+    RegionStorage storage{};
+    L3L2QueueArgs args = make_args(4, 128, 128);
+    L3L2QueueEndpoint queue(make_desc(&storage, args), args, L3L2QueueEndpointConfig{3});
+    ASSERT_EQ(queue.error().kind, L3L2QueueErrorKind::NONE) << queue.error().message;
+    const uint64_t first_offset = queue.layout().input_arena_offset;
+    const uint64_t second_offset = first_offset + 16;
+    publish_input_desc(&storage, queue.layout(), 1, L3L2QueueOpcode::DATA, first_offset, 16);
+    publish_input_desc(&storage, queue.layout(), 2, L3L2QueueOpcode::DATA, second_offset, 16);
+
+    L3L2QueueInputHandle first{};
+    L3L2QueueInputHandle second{};
+    ASSERT_TRUE(queue.input().try_peek(&first)) << queue.error().message;
+    ASSERT_TRUE(queue.input().try_peek(&second)) << queue.error().message;
+
+    EXPECT_EQ(first.payload_offset, first_offset);
+    EXPECT_EQ(first.payload_nbytes, 16u);
+    EXPECT_EQ(second.payload_offset, second_offset);
+    EXPECT_EQ(second.payload_nbytes, 16u);
+    EXPECT_EQ(queue.error().kind, L3L2QueueErrorKind::NONE);
+    EXPECT_EQ(storage.counters[counter_index(L3L2_QUEUE_INPUT_DESC_HEAD_OFFSET)], 0);
+}
+
+TEST(L3L2MessageQueueTest, ErrorCountsAgainstInputWindowAndFullDoesNotPoison) {
+    RegionStorage storage{};
+    L3L2QueueArgs args = make_args(4, 128, 128);
+    L3L2QueueEndpoint queue(make_desc(&storage, args), args, L3L2QueueEndpointConfig{2});
+    ASSERT_EQ(queue.error().kind, L3L2QueueErrorKind::NONE) << queue.error().message;
+    publish_input_desc(&storage, queue.layout(), 1, L3L2QueueOpcode::DATA);
+    publish_input_desc(&storage, queue.layout(), 2, L3L2QueueOpcode::ERROR);
+    publish_input_desc(&storage, queue.layout(), 3, L3L2QueueOpcode::DATA);
+
+    L3L2QueueInputHandle first{};
+    L3L2QueueInputHandle second{};
+    L3L2QueueInputHandle third{};
+    ASSERT_TRUE(queue.input().try_peek(&first)) << queue.error().message;
+    ASSERT_TRUE(queue.input().try_peek(&second)) << queue.error().message;
+    EXPECT_FALSE(queue.input().try_peek(&third));
+
+    EXPECT_EQ(queue.error().kind, L3L2QueueErrorKind::NONE);
+    EXPECT_EQ(storage.counters[counter_index(L3L2_QUEUE_INPUT_DESC_HEAD_OFFSET)], 0);
+    EXPECT_EQ(storage.counters[counter_index(L3L2_QUEUE_L2_ABORT_FLAG_OFFSET)], 0);
+}
+
+TEST(L3L2MessageQueueTest, OutOfOrderInputReleaseOnlyAdvancesCompletedFifoPrefix) {
+    RegionStorage storage{};
+    L3L2QueueArgs args = make_args(4, 128, 128);
+    L3L2QueueEndpoint queue(make_desc(&storage, args), args, L3L2QueueEndpointConfig{3});
+    ASSERT_EQ(queue.error().kind, L3L2QueueErrorKind::NONE) << queue.error().message;
+    publish_input_desc(&storage, queue.layout(), 1, L3L2QueueOpcode::DATA);
+    publish_input_desc(&storage, queue.layout(), 2, L3L2QueueOpcode::DATA);
+    publish_input_desc(&storage, queue.layout(), 3, L3L2QueueOpcode::DATA);
+
+    L3L2QueueInputHandle first{};
+    L3L2QueueInputHandle second{};
+    L3L2QueueInputHandle third{};
+    ASSERT_TRUE(queue.input().try_peek(&first)) << queue.error().message;
+    ASSERT_TRUE(queue.input().try_peek(&second)) << queue.error().message;
+    ASSERT_TRUE(queue.input().try_peek(&third)) << queue.error().message;
+
+    ASSERT_TRUE(queue.input().release(second)) << queue.error().message;
+    EXPECT_EQ(storage.counters[counter_index(L3L2_QUEUE_INPUT_DESC_HEAD_OFFSET)], 0);
+
+    ASSERT_TRUE(queue.input().release(first)) << queue.error().message;
+    EXPECT_EQ(storage.counters[counter_index(L3L2_QUEUE_INPUT_DESC_HEAD_OFFSET)], 2);
+
+    ASSERT_TRUE(queue.input().release(third)) << queue.error().message;
+    EXPECT_EQ(storage.counters[counter_index(L3L2_QUEUE_INPUT_DESC_HEAD_OFFSET)], 3);
+}
+
+TEST(L3L2MessageQueueTest, StopDoesNotCountAgainstWindowAndDrainsAfterEarlierInputs) {
+    RegionStorage storage{};
+    L3L2QueueArgs args = make_args(4, 128, 128);
+    L3L2QueueEndpoint queue(make_desc(&storage, args), args, L3L2QueueEndpointConfig{2});
+    ASSERT_EQ(queue.error().kind, L3L2QueueErrorKind::NONE) << queue.error().message;
+    publish_input_desc(&storage, queue.layout(), 1, L3L2QueueOpcode::DATA);
+    publish_input_desc(&storage, queue.layout(), 2, L3L2QueueOpcode::DATA);
+    publish_input_desc(&storage, queue.layout(), 3, L3L2QueueOpcode::STOP);
+
+    L3L2QueueInputHandle first{};
+    L3L2QueueInputHandle second{};
+    L3L2QueueInputHandle stop{};
+    ASSERT_TRUE(queue.input().try_peek(&first)) << queue.error().message;
+    ASSERT_TRUE(queue.input().try_peek(&second)) << queue.error().message;
+    ASSERT_TRUE(queue.input().try_peek(&stop)) << queue.error().message;
+    EXPECT_EQ(stop.opcode, L3L2QueueOpcode::STOP);
+
+    ASSERT_TRUE(queue.input().release(stop)) << queue.error().message;
+    EXPECT_FALSE(queue.input().drained());
+    EXPECT_EQ(storage.counters[counter_index(L3L2_QUEUE_INPUT_DESC_HEAD_OFFSET)], 0);
+
+    ASSERT_TRUE(queue.input().release(first)) << queue.error().message;
+    EXPECT_FALSE(queue.input().drained());
+    EXPECT_EQ(storage.counters[counter_index(L3L2_QUEUE_INPUT_DESC_HEAD_OFFSET)], 1);
+
+    ASSERT_TRUE(queue.input().release(second)) << queue.error().message;
+    EXPECT_TRUE(queue.input().drained());
+    EXPECT_EQ(storage.counters[counter_index(L3L2_QUEUE_INPUT_DESC_HEAD_OFFSET)], 3);
+}
+
+TEST(L3L2MessageQueueTest, TryPeekAfterStopAcquireIsNoProgressWithoutPoison) {
+    RegionStorage storage{};
+    L3L2QueueArgs args = make_args(4, 128, 128);
+    L3L2QueueEndpoint queue(make_desc(&storage, args), args, L3L2QueueEndpointConfig{2});
+    ASSERT_EQ(queue.error().kind, L3L2QueueErrorKind::NONE) << queue.error().message;
+    publish_input_desc(&storage, queue.layout(), 1, L3L2QueueOpcode::DATA);
+    publish_input_desc(&storage, queue.layout(), 2, L3L2QueueOpcode::STOP);
+
+    L3L2QueueInputHandle first{};
+    L3L2QueueInputHandle stop{};
+    L3L2QueueInputHandle later{};
+    ASSERT_TRUE(queue.input().try_peek(&first)) << queue.error().message;
+    ASSERT_TRUE(queue.input().try_peek(&stop)) << queue.error().message;
+    EXPECT_FALSE(queue.input().try_peek(&later));
+
+    EXPECT_EQ(queue.error().kind, L3L2QueueErrorKind::NONE);
+    EXPECT_EQ(storage.counters[counter_index(L3L2_QUEUE_L2_ABORT_FLAG_OFFSET)], 0);
+}
+
+TEST(L3L2MessageQueueTest, StopAcquirePoisonsIfLaterInputAlreadyObserved) {
+    RegionStorage storage{};
+    L3L2QueueArgs args = make_args(4, 128, 128);
+    L3L2QueueEndpoint queue(make_desc(&storage, args), args, L3L2QueueEndpointConfig{2});
+    ASSERT_EQ(queue.error().kind, L3L2QueueErrorKind::NONE) << queue.error().message;
+    publish_input_desc(&storage, queue.layout(), 1, L3L2QueueOpcode::DATA);
+    publish_input_desc(&storage, queue.layout(), 2, L3L2QueueOpcode::STOP);
+    publish_input_desc(&storage, queue.layout(), 3, L3L2QueueOpcode::DATA);
+
+    L3L2QueueInputHandle input{};
+    L3L2QueueInputHandle stop{};
+    ASSERT_TRUE(queue.input().try_peek(&input)) << queue.error().message;
+    EXPECT_FALSE(queue.input().try_peek(&stop));
+
+    EXPECT_EQ(queue.error().kind, L3L2QueueErrorKind::INVALID_DESCRIPTOR);
+    EXPECT_EQ(storage.counters[counter_index(L3L2_QUEUE_L2_ABORT_FLAG_OFFSET)], 1);
+}
+
+TEST(L3L2MessageQueueTest, InputReleaseRejectsStaleAndDoubleRelease) {
+    RegionStorage stale_storage{};
+    RegionStorage double_storage{};
+    L3L2QueueArgs args = make_args(4, 128, 128);
+
+    L3L2QueueEndpoint stale_queue(make_desc(&stale_storage, args), args, L3L2QueueEndpointConfig{2});
+    ASSERT_EQ(stale_queue.error().kind, L3L2QueueErrorKind::NONE) << stale_queue.error().message;
+    publish_input_desc(&stale_storage, stale_queue.layout(), 1, L3L2QueueOpcode::DATA);
+    publish_input_desc(&stale_storage, stale_queue.layout(), 2, L3L2QueueOpcode::DATA);
+    L3L2QueueInputHandle stale_first{};
+    L3L2QueueInputHandle stale_second{};
+    ASSERT_TRUE(stale_queue.input().try_peek(&stale_first)) << stale_queue.error().message;
+    ASSERT_TRUE(stale_queue.input().try_peek(&stale_second)) << stale_queue.error().message;
+    ASSERT_TRUE(stale_queue.input().release(stale_first)) << stale_queue.error().message;
+    ASSERT_TRUE(stale_queue.input().release(stale_second)) << stale_queue.error().message;
+    EXPECT_FALSE(stale_queue.input().release(stale_first));
+    EXPECT_EQ(stale_queue.error().kind, L3L2QueueErrorKind::OWNERSHIP);
+    EXPECT_EQ(stale_storage.counters[counter_index(L3L2_QUEUE_L2_ABORT_FLAG_OFFSET)], 1);
+
+    L3L2QueueEndpoint double_queue(make_desc(&double_storage, args), args, L3L2QueueEndpointConfig{2});
+    ASSERT_EQ(double_queue.error().kind, L3L2QueueErrorKind::NONE) << double_queue.error().message;
+    publish_input_desc(&double_storage, double_queue.layout(), 1, L3L2QueueOpcode::DATA);
+    publish_input_desc(&double_storage, double_queue.layout(), 2, L3L2QueueOpcode::DATA);
+    L3L2QueueInputHandle first{};
+    L3L2QueueInputHandle second{};
+    ASSERT_TRUE(double_queue.input().try_peek(&first)) << double_queue.error().message;
+    ASSERT_TRUE(double_queue.input().try_peek(&second)) << double_queue.error().message;
+    ASSERT_TRUE(double_queue.input().release(second)) << double_queue.error().message;
+    EXPECT_FALSE(double_queue.input().release(second));
+    EXPECT_EQ(double_queue.error().kind, L3L2QueueErrorKind::OWNERSHIP);
+    EXPECT_EQ(double_storage.counters[counter_index(L3L2_QUEUE_L2_ABORT_FLAG_OFFSET)], 1);
+}
+
+TEST(L3L2MessageQueueTest, OutputReservePublishWorksDuringStopDrain) {
+    RegionStorage storage{};
+    L3L2QueueArgs args = make_args(4, 128, 128);
+    L3L2QueueEndpoint queue(make_desc(&storage, args), args, L3L2QueueEndpointConfig{2});
+    ASSERT_EQ(queue.error().kind, L3L2QueueErrorKind::NONE) << queue.error().message;
+    publish_input_desc(&storage, queue.layout(), 1, L3L2QueueOpcode::DATA);
+    publish_input_desc(&storage, queue.layout(), 2, L3L2QueueOpcode::STOP);
+
+    L3L2QueueInputHandle input{};
+    L3L2QueueInputHandle stop{};
+    ASSERT_TRUE(queue.input().try_peek(&input)) << queue.error().message;
+    ASSERT_TRUE(queue.input().try_peek(&stop)) << queue.error().message;
+    ASSERT_TRUE(queue.input().release(stop)) << queue.error().message;
+
+    L3L2QueueOutputReservation reservation{};
+    ASSERT_TRUE(queue.output().try_reserve(16, &reservation)) << queue.error().message;
+    ASSERT_TRUE(queue.output().publish(reservation, L3L2QueueOpcode::DATA)) << queue.error().message;
+
+    EXPECT_FALSE(queue.input().drained());
+    EXPECT_EQ(storage.counters[counter_index(L3L2_QUEUE_OUTPUT_DESC_TAIL_OFFSET)], 1);
+    EXPECT_EQ(queue.error().kind, L3L2QueueErrorKind::NONE);
+}
+
 }  // namespace

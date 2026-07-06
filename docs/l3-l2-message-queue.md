@@ -82,9 +82,11 @@ message = queue.output.dequeue_into(host_output, timeout=timeout_s)
 `try_peek()` and `try_dequeue_into(buffer)` are the non-blocking forms. They
 return `None` when no output message is available.
 
-The L3 buffer arguments currently must be runtime-managed tensors returned by
-`orch.alloc(...)`. Ordinary Python `bytes`, `bytearray`, and private tensors
-are rejected before shared queue state is modified. Zero-byte messages use
+The L3 buffer arguments may be runtime-managed tensors returned by
+`orch.alloc(...)` or ordinary contiguous Python byte buffers such as `bytes`
+and `bytearray`. Runtime-managed tensors use the direct registered-buffer path.
+Ordinary host buffers are staged through an internal registered scratch buffer
+before shared queue state is modified. Zero-byte messages use
 `buffer_or_none=None` and `nbytes=0`.
 
 L3 requests graceful shutdown by publishing an input-side `STOP` descriptor:
@@ -121,6 +123,21 @@ if (queue.error().kind != L3L2QueueErrorKind::NONE) {
 }
 ```
 
+The default endpoint constructor allows one active L2 input handle at a time.
+L2 can opt into an input window with local endpoint configuration:
+
+```cpp
+L3L2QueueEndpoint queue(
+    desc,
+    queue_args,
+    L3L2QueueEndpointConfig{.max_l2_input_inflight = 4}
+);
+```
+
+`max_l2_input_inflight` is not part of L3 queue creation and does not change
+the queue layout or the shared ABI. The valid range is `1 <= N <= depth`.
+Invalid config reports `BAD_ARGUMENT` without setting the L2 abort flag.
+
 L2 consumes input messages from `queue.input()` and publishes outputs through
 `queue.output()`:
 
@@ -153,6 +170,12 @@ while (true) {
 `queue.output().try_reserve(nbytes, &reservation)` are non-blocking. A `false`
 return can mean ordinary no-progress, validation failure, or poison; check
 `queue.error().kind` to distinguish ordinary no-progress from terminal error.
+
+With `max_l2_input_inflight > 1`, L2 may acquire several DATA or ERROR inputs
+before releasing earlier ones. `release(handle)` then marks the input logically
+complete; the queue physically advances the shared input head only for the
+completed FIFO prefix. This lets L2 publish outputs in an application-defined
+order while keeping the input descriptor and payload release protocol FIFO.
 
 ## 2. Layout
 
@@ -298,23 +321,51 @@ same handle. The caller may read the payload with `read_into(handle, buffer)`
 before releasing it. Releasing the wrong handle is an ownership error and
 poisons the queue.
 
-On L2 input, `peek()` returns one active input handle. L2 must not call
-`peek()` again before releasing that handle. L2 must not release an input until
-all AICore work that reads the input payload has completed.
+On L2 input, the default endpoint constructor keeps one active input handle.
+L2 must not call `peek()` again before releasing that handle. This is
+equivalent to `max_l2_input_inflight = 1` and preserves the base queue
+behavior.
+
+When L2 constructs the endpoint with
+`L3L2QueueEndpointConfig{.max_l2_input_inflight = N}`, it may hold up to `N`
+active DATA or ERROR input handles. DATA and ERROR both count against the
+window because either may carry payload bytes that remain owned by L2
+application code. STOP does not count against the window.
+
+In window mode, `release(handle)` is logical completion: the application is
+declaring that no future L2 code or in-flight AICore task will read that input
+payload. The queue then physically releases only the completed FIFO prefix. If
+input 2 is released before input 1, input 2 remains physically owned until
+input 1 is also released.
 
 On L2 output, `reserve()` returns one active output reservation. L2 fills the
 reserved payload span, then calls `publish(reservation, opcode)`. Publishing an
 unknown, stale, already-published, or cross-queue reservation is an ownership
 error and poisons the queue.
 
-The base queue supports at most one active L2 input handle and one active L2
-output reservation. It does not provide a multi-input L2 window.
+The queue supports at most one active L2 output reservation. The input window
+does not introduce multiple concurrent output reservations; output ordering and
+output cardinality remain application-defined.
 
 ## 6. STOP Semantics
 
-`STOP` is an input descriptor with no payload. It follows normal FIFO ordering:
-L2 observes and releases messages before `STOP`, then releases `STOP` and
-returns from the persistent run.
+`STOP` is an input descriptor with no payload. It is acquired through
+`queue.input().peek()` / `try_peek()` like DATA and ERROR, and the user must
+release the STOP handle.
+
+With the default single-input endpoint, L2 observes and releases messages
+before STOP, then releases STOP and returns from the persistent run.
+
+With an input window, STOP may be acquired while earlier DATA or ERROR inputs
+are still active. After STOP is acquired, the input queue enters draining mode
+and does not acquire later DATA or ERROR descriptors. Earlier active inputs may
+still produce outputs, and L2 may still use `queue.output().reserve()` and
+`queue.output().publish()` while draining. STOP is physically released only
+after all earlier active inputs are physically released.
+
+`queue.input().drained()` returns true only after STOP has been physically
+released. Persistent L2 code should return only after `drained()` is true and
+after it has published all outputs required by its own payload protocol.
 
 After L3 successfully publishes `STOP`, the input queue rejects further input
 messages locally without poisoning. L3 may still dequeue output messages that
@@ -324,6 +375,9 @@ L2 publishes before returning.
 It does not wait for L2 exit and does not drain outputs. Applications that need
 all outputs must keep dequeuing until their own protocol-level final condition
 is satisfied before returning from the L3 orchestration function.
+
+If L2 observes a published input descriptor after STOP, that descriptor is
+invalid shared state and poisons the queue with `INVALID_DESCRIPTOR`.
 
 ## 7. Error Handling
 
@@ -357,7 +411,25 @@ set the local abort flag.
 
 After poison, normal queue operations reject. Cleanup remains valid.
 
-## 8. Platform Support
+## 8. Example
+
+The example lives at:
+
+```text
+examples/workers/l3/l3_l2_message_queue/
+```
+
+It uses `L3L2QueueEndpointConfig{.max_l2_input_inflight = 4}` and a PTO-ISA
+AIV kernel. L3 sends an initial pair of DATA inputs, drains the outputs that
+the persistent L2 run publishes for them, then sends another pair of DATA
+inputs followed by STOP. L2 acquires multiple inputs before releasing the
+earlier ones, publishes outputs in a different order from input acquisition,
+emits multiple outputs for one input, combines two inputs into one output
+during STOP drain, and returns only after `queue.input().drained()`.
+Application request IDs and output kinds are carried in the payload headers;
+the transport sequence number is not used as a request ID.
+
+## 9. Platform Support
 
 The message queue uses the existing L3-L2 orchestration communication region,
 payload, and counter primitives.
