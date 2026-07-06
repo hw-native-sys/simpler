@@ -3,6 +3,8 @@ name: CI
 permissions:
   contents: read
   pull-requests: read
+  # Lets the ubuntu-fallback job poll sibling job status.
+  actions: read
 
 on:
   pull_request:
@@ -720,3 +722,133 @@ jobs:
           DEVICE_LIST=$(python -c "p='${DEVICE_RANGE}'.split('-'); s,e=p[0],p[-1]; print(','.join(str(i) for i in range(int(s),int(e)+1)))")
           PYTEST="python -m pytest examples tests/st --platform a5 --device ${DEVICE_RANGE} -v --require-pto-isa"
           task-submit --timeout 1800 --max-time 1800 --device "$DEVICE_LIST" --run "$PYTEST --pto-session-timeout 1200"
+
+  # ---------- Self-hosted fail-over for the ubuntu-latest legs ----------
+  # The GitHub primaries (ut / st-sim-a2a3 / st-sim-a5) are the REQUIRED checks
+  # and gate on their own results. This job is a non-required convenience for the
+  # rare case where GitHub's hosted pool is congested and never schedules a leg:
+  # it polls the three primaries in parallel and, per leg, DEFERS the moment
+  # GitHub starts running it (exits, freeing the runner in seconds) and only
+  # self-runs a leg that GitHub never scheduled. On such a stall the required
+  # primary stays pending -- admin-merge using this job's green self-run result.
+  # Do NOT make this the required check. GCC 15 / gtest are expected on the
+  # runner. Detects arch changes itself so a detect-changes stall cannot block it.
+  ubuntu-fallback:
+    # Runs for every PR, including forks: this repo's contributors push from
+    # their own forks and are trusted to execute on the self-hosted runner.
+    runs-on: [self-hosted, fallback]
+    timeout-minutes: 90
+    env:
+      PTO2_SCHEDULER_TIMEOUT_MS: "5000"
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      # Same rule as the detect-changes job; inlined so a detect-changes stall
+      # cannot block this fallback.
+      - name: Detect arch changes
+        id: arch
+        run: |
+          FILES=$(git diff --name-only ${{ github.event.pull_request.base.sha }}...${{ github.event.pull_request.head.sha }})
+          NON_CODE='^(docs/|\.docs/|\.claude/|KNOWN_ISSUES\.md$|\.gitignore$|README\.md$|\.pre-commit-config\.yaml$)'
+          A5_ONLY='^(src/a5/|examples/a5/|tests/(st|device_tests)/a5/)'
+          A2A3_ONLY='^(src/a2a3/|examples/a2a3/|tests/(st|device_tests)/a2a3/)'
+          A2A3_REMAINING=$(echo "$FILES" | grep -vE "$A5_ONLY" | grep -vE "$NON_CODE" || true)
+          A5_REMAINING=$(echo "$FILES" | grep -vE "$A2A3_ONLY" | grep -vE "$NON_CODE" || true)
+          [ -n "$A2A3_REMAINING" ] && echo "a2a3=true" >> "$GITHUB_OUTPUT" || echo "a2a3=false" >> "$GITHUB_OUTPUT"
+          [ -n "$A5_REMAINING" ] && echo "a5=true" >> "$GITHUB_OUTPUT" || echo "a5=false" >> "$GITHUB_OUTPUT"
+
+      # Poll each ubuntu primary in parallel; ci-wait-or-fallback.sh prints one of
+      # DEFER / SELFRUN / RENAME_ERROR / FETCH_ERROR per leg (step outputs are
+      # passed via env: rather than spliced into the script to avoid the
+      # template-injection pattern).
+      - name: Decide defer vs self-run
+        id: decide
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          A2A3_CHANGED: ${{ steps.arch.outputs.a2a3 }}
+          A5_CHANGED: ${{ steps.arch.outputs.a5 }}
+        run: |
+          poll() { .github/scripts/ci-wait-or-fallback.sh "$1" 600 "$2" > "$3" 2> "$3.log" & }
+          poll "ut (ubuntu-latest, 3.10)" 1 ut.dec
+          [ "$A2A3_CHANGED" = "true" ] && poll "st-sim-a2a3 (ubuntu-latest, 3.10)" 0 a2a3.dec
+          [ "$A5_CHANGED" = "true" ] && poll "st-sim-a5 (ubuntu-latest, 3.10)" 0 a5.dec
+          wait
+          # Missing file -> SKIP (leg not polled); present-but-empty -> ERROR
+          # (script died before writing a token).
+          get() { local d; if [ -f "$1" ]; then d=$(tail -n1 "$1"); echo "${d:-ERROR}"; else echo SKIP; fi; }
+          UT=$(get ut.dec); A2A3=$(get a2a3.dec); A5=$(get a5.dec)
+          for f in ut a2a3 a5; do [ -f "$f.dec.log" ] && { echo "--- $f ---"; cat "$f.dec.log"; }; done
+          echo "ut=$UT"     >> "$GITHUB_OUTPUT"
+          echo "a2a3=$A2A3" >> "$GITHUB_OUTPUT"
+          echo "a5=$A5"     >> "$GITHUB_OUTPUT"
+          echo "Decisions -> ut=$UT a2a3=$A2A3 a5=$A5"
+
+      - name: Announce stalled legs
+        if: steps.decide.outputs.ut == 'SELFRUN' || steps.decide.outputs.a2a3 == 'SELFRUN' || steps.decide.outputs.a5 == 'SELFRUN'
+        env:
+          UT: ${{ steps.decide.outputs.ut }}
+          A2A3: ${{ steps.decide.outputs.a2a3 }}
+          A5: ${{ steps.decide.outputs.a5 }}
+        run: |
+          {
+            echo "### ⚠ GitHub stalled some ubuntu legs — self-running here"
+            echo "Their required primaries stay pending; admin-merge once this job is green:"
+            if [ "$UT" = "SELFRUN" ]; then echo "- ut"; fi
+            if [ "$A2A3" = "SELFRUN" ]; then echo "- st-sim-a2a3"; fi
+            if [ "$A5" = "SELFRUN" ]; then echo "- st-sim-a5"; fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Install dependencies (any self-run)
+        if: steps.decide.outputs.ut == 'SELFRUN' || steps.decide.outputs.a2a3 == 'SELFRUN' || steps.decide.outputs.a5 == 'SELFRUN'
+        run: |
+          python3 -m venv --system-site-packages .venv
+          source .venv/bin/activate
+          pip install --upgrade pip
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+          pip install '.[test]'
+
+      - name: ut self-run
+        if: steps.decide.outputs.ut == 'SELFRUN'
+        run: |
+          source .venv/bin/activate
+          python -m pytest tests/ut -m "not requires_hardware" -v
+          cmake -B tests/ut/cpp/build -S tests/ut/cpp
+          cmake --build tests/ut/cpp/build
+          ctest --test-dir tests/ut/cpp/build -LE requires_hardware --output-on-failure
+
+      - name: st-sim-a2a3 self-run
+        if: steps.decide.outputs.a2a3 == 'SELFRUN'
+        run: |
+          source .venv/bin/activate
+          C="--platform a2a3sim --device 0-15 --pto-session-timeout 600 --require-pto-isa"
+          D="tests/st/a2a3/tensormap_and_ringbuffer/dfx"
+          python -m pytest examples tests/st $C -v
+          python -m pytest $D/dep_gen/test_dep_gen.py $C -p no:xdist --enable-dep-gen
+          python -m pytest $D/l2_swimlane/ $C -p no:xdist --enable-l2-swimlane --enable-dep-gen
+          python -m pytest $D/pmu/test_pmu.py $C -p no:xdist --enable-pmu 2
+          python -m pytest $D/args_dump/test_args_dump.py $C -p no:xdist --dump-args
+
+      - name: st-sim-a5 self-run
+        if: steps.decide.outputs.a5 == 'SELFRUN'
+        run: |
+          source .venv/bin/activate
+          python -m pytest examples tests/st --platform a5sim --device 0-15 -v \
+            --pto-session-timeout 600 --require-pto-isa
+
+      # A leg that self-ran fails this job via its own step above. RENAME_ERROR /
+      # ERROR / FETCH_ERROR only warn: this job is non-required, and a mismatched
+      # primary name or an unreachable API should be noticed, not silently self-run.
+      - name: Warn on unresolved legs
+        env:
+          UT: ${{ steps.decide.outputs.ut }}
+          A2A3: ${{ steps.decide.outputs.a2a3 }}
+          A5: ${{ steps.decide.outputs.a5 }}
+        run: |
+          for p in "ut=$UT" "a2a3=$A2A3" "a5=$A5"; do
+            case "${p#*=}" in
+              RENAME_ERROR|ERROR|FETCH_ERROR) echo "::warning::ubuntu leg ${p%%=*} -> ${p#*=} (check the primary job name / API reachability)" ;;
+            esac
+          done
