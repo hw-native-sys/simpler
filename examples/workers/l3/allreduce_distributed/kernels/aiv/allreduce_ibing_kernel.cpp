@@ -168,10 +168,48 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
         const bool fwd = (step > reduce_steps);
 
         // Snapshot source chunks into exchange buffers.
+        //
+        // On NPU the snapshot stays on the MTE pipeline (TLOAD → TSTORE)
+        // so that pipe_barrier(PIPE_ALL) in the following RoundBarrier
+        // guarantees the exchange buffers are visible to subsequent MTE
+        // TLOADs inside TPUT.  Scalar-write snapshots are not flushed by
+        // PIPE_ALL and produce stale reads (zero accumulation).
+        //
+        // On CPU sim, scalar pointer writes into POSIX shm are sufficient
+        // because all ranks map the same physical pages and RoundBarrier's
+        // seq_cst atomics provide cross-process ordering.
+#ifdef __CPU_SIM
         for (int i = 0; i < chunk_elems; ++i)
             exchange_right[i] = chunks[static_cast<size_t>(idx_r * chunk_elems) + i];
         for (int i = 0; i < chunk_elems; ++i)
             exchange_left[i] = chunks[static_cast<size_t>(idx_l * chunk_elems) + i];
+#else
+        // exchange_right ← chunks[idx_r]
+        {
+            __gm__ float *src_r = chunks + static_cast<size_t>(idx_r * chunk_elems);
+            GT srcG_r(src_r, chunkShape, chunkStride);
+            GT dstG_r(exchange_right, chunkShape, chunkStride);
+            TLOAD(stageTile, srcG_r);
+            set_flag(PIPE_MTE2, PIPE_MTE3, EVENT_ID0);
+            wait_flag(PIPE_MTE2, PIPE_MTE3, EVENT_ID0);
+            TSTORE(dstG_r, stageTile);
+            set_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID0);
+            wait_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID0);
+        }
+        // exchange_left ← chunks[idx_l]
+        {
+            __gm__ float *src_l = chunks + static_cast<size_t>(idx_l * chunk_elems);
+            GT srcG_l(src_l, chunkShape, chunkStride);
+            GT dstG_l(exchange_left, chunkShape, chunkStride);
+            TLOAD(stageTile, srcG_l);
+            set_flag(PIPE_MTE2, PIPE_MTE3, EVENT_ID1);
+            wait_flag(PIPE_MTE2, PIPE_MTE3, EVENT_ID1);
+            TSTORE(dstG_l, stageTile);
+            set_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID1);
+            wait_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID1);
+        }
+        pipe_barrier(PIPE_ALL);
+#endif
 
         // Barrier B: all snapshots complete — safe to push.
         RoundBarrier(commCtx, signal_base + (2 * (step - 1) + 1) * kMaxSupportedRanks, my_rank, nranks);
