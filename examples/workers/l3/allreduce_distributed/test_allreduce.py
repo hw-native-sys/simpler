@@ -44,3 +44,13 @@ def test_allreduce_distributed_multi_rank(st_platform, st_device_ids, n_devices,
     assert len(st_device_ids) == n_devices
     rc = run([int(d) for d in st_device_ids], platform=st_platform, mode=mode)
     assert rc == 0
+
+
+@pytest.mark.platforms(["a2a3sim", "a2a3", "a5sim", "a5"])
+@pytest.mark.runtime("tensormap_and_ringbuffer")
+@pytest.mark.device_count(4)
+def test_allreduce_distributed_ibing_unsupported_ranks(st_platform, st_device_ids):
+    """ibing mode should raise ValueError for nranks != 2."""
+    assert len(st_device_ids) == 4
+    with pytest.raises(ValueError, match="ibing mode is only supported for nranks=2"):
+        run([int(d) for d in st_device_ids], platform=st_platform, mode="ibing")

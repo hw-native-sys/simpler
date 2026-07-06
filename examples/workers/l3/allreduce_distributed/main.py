@@ -225,6 +225,10 @@ def run(
     # Ring requires ALLREDUCE_COUNT divisible by nranks; bidirectional_ring
     # (two-ring design) requires ALLREDUCE_COUNT divisible by 2*nranks.
     # ibing requires ALLREDUCE_COUNT divisible by nranks (contiguous chunks).
+    # ibing is limited to P=2: for P>=4 the AtomicNone forward phase overwrites
+    # peer chunks that are not yet fully reduced (shared-memory push-model race).
+    if mode == "ibing" and nranks != 2:
+        raise ValueError(f"ibing mode is only supported for nranks=2, got nranks={nranks}")
     if mode in ("twophase", "ring", "ibing") and ALLREDUCE_COUNT % nranks != 0:
         raise ValueError(f"ALLREDUCE_COUNT={ALLREDUCE_COUNT} must be divisible by nranks={nranks} for {mode} mode")
     if mode in ("bidirectional_ring",) and ALLREDUCE_COUNT % (2 * nranks) != 0:
