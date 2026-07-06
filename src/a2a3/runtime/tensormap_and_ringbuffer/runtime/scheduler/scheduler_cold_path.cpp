@@ -669,27 +669,23 @@ int32_t SchedulerContext::shutdown(int32_t thread_idx) {
 }
 
 // =============================================================================
-// Handshake with all AICore workers; discover core type and reg address.
+// Handshake a contiguous slice of AICore workers. Runs on every AICPU thread in
+// parallel (partitioned by tidx/nthreads); the leader's pre_handshake_init has
+// already zeroed state, set cores_total_num_, and reset the counts/flag. The
+// serial per-core MMIO here is what dominates preamble, so splitting the slice
+// across threads is the whole point. Worker-id lists are built serially in
+// post_handshake_init (core-index order) once every slice has landed.
 // =============================================================================
-int32_t SchedulerContext::handshake_all_cores(Runtime *runtime) {
+void SchedulerContext::handshake_partition(Runtime *runtime, int32_t tidx, int32_t nthreads) {
     Handshake *all_handshakes = reinterpret_cast<Handshake *>(runtime->dev.workers);
-    cores_total_num_ = runtime->dev.worker_count;
-
-    // Validate cores_total_num_ before using as array index
-    if (cores_total_num_ == 0 || cores_total_num_ > RUNTIME_MAX_WORKER) {
-        LOG_ERROR("Invalid cores_total_num %d (expected 1-%d)", cores_total_num_, RUNTIME_MAX_WORKER);
-        return -1;
-    }
-
-    aic_count_ = 0;
-    aiv_count_ = 0;
-
-    LOG_INFO_V0("Handshaking with %d cores", cores_total_num_);
+    const int32_t total = cores_total_num_;
+    const int32_t lo = static_cast<int32_t>((static_cast<int64_t>(tidx) * total) / nthreads);
+    const int32_t hi = static_cast<int32_t>((static_cast<int64_t>(tidx + 1) * total) / nthreads);
 
     // Step 1: Write per-core payload addresses and send handshake signal.
     // OUT_OF_ORDER_STORE_BARRIER() ensures task is globally visible before
     // aicpu_ready=1, so AICore reads the correct payload pointer after waking up.
-    for (int32_t i = 0; i < cores_total_num_; i++) {
+    for (int32_t i = lo; i < hi; i++) {
         all_handshakes[i].task = reinterpret_cast<uint64_t>(&payload_per_core_[i][0]);
         OUT_OF_ORDER_STORE_BARRIER();
         all_handshakes[i].aicpu_ready = 1;
@@ -699,9 +695,8 @@ int32_t SchedulerContext::handshake_all_cores(Runtime *runtime) {
     // Get platform physical cores count for validation
     uint32_t max_physical_cores_count = platform_get_physical_cores_count();
 
-    // Step 2: Wait for all cores to respond, collect core type and register addresses
-    bool handshake_failed = false;
-    for (int32_t i = 0; i < cores_total_num_; i++) {
+    // Step 2: Wait for this slice's cores, init registers, collect state.
+    for (int32_t i = lo; i < hi; i++) {
         Handshake *hank = &all_handshakes[i];
 
         while (hank->aicore_regs_ready == 0) {
@@ -715,7 +710,7 @@ int32_t SchedulerContext::handshake_all_cores(Runtime *runtime) {
                 "Core %d reported invalid physical_core_id=%u (platform max=%u)", i, physical_core_id,
                 max_physical_cores_count
             );
-            handshake_failed = true;
+            handshake_failed_.store(true, std::memory_order_release);
             continue;
         }
 
@@ -733,8 +728,6 @@ int32_t SchedulerContext::handshake_all_cores(Runtime *runtime) {
             SPIN_WAIT_HINT();
         }
 
-        CoreType type = hank->core_type;
-
         core_exec_states_[i].reg_addr = reg_addr;
         core_exec_states_[i].cond_ptr = get_reg_ptr(reg_addr, RegId::COND);
 
@@ -746,25 +739,9 @@ int32_t SchedulerContext::handshake_all_cores(Runtime *runtime) {
 #if !PTO2_PROFILING
         core_exec_states_[i].worker_id = i;
         core_exec_states_[i].physical_core_id = physical_core_id;
-        core_exec_states_[i].core_type = type;
+        core_exec_states_[i].core_type = hank->core_type;
 #endif
-
-        if (type == CoreType::AIC) {
-            aic_worker_ids_[aic_count_++] = i;
-            LOG_INFO_V0("Core %d: AIC, physical_id=%u, reg_addr=0x%lx", i, physical_core_id, reg_addr);
-        } else {
-            aiv_worker_ids_[aiv_count_++] = i;
-            LOG_INFO_V0("Core %d: AIV, physical_id=%u, reg_addr=0x%lx", i, physical_core_id, reg_addr);
-        }
     }
-
-    if (handshake_failed) {
-        emergency_shutdown(runtime);
-        return -1;
-    }
-
-    LOG_INFO_V0("Core discovery complete: %d AIC, %d AIV", aic_count_, aiv_count_);
-    return 0;
 }
 
 // =============================================================================
@@ -858,8 +835,9 @@ void SchedulerContext::emergency_shutdown(Runtime *runtime) {
 // =============================================================================
 // Lifecycle: init / deinit
 // =============================================================================
-int32_t
-SchedulerContext::init(Runtime *runtime, int32_t aicpu_thread_num, int32_t sched_thread_num, uint64_t regs_base) {
+int32_t SchedulerContext::pre_handshake_init(
+    Runtime *runtime, int32_t aicpu_thread_num, int32_t sched_thread_num, uint64_t regs_base
+) {
     always_assert(runtime != nullptr);
 
     // Zero all per-core execution state before handshake
@@ -876,7 +854,9 @@ SchedulerContext::init(Runtime *runtime, int32_t aicpu_thread_num, int32_t sched
     // value would still be 0 (only the binary enable bit has been seeded by
     // kernel.cpp at this point). Reset the cached level on disabled runs so a
     // prior enabled launch's level can't leak into the phase-record gates in
-    // scheduler_dispatch.
+    // scheduler_dispatch. This runs on the leader before it publishes
+    // hs_setup_done_, so it happens-before every thread's handshake_partition
+    // (and therefore before any aicpu_ready=1 write).
     if (is_l2_swimlane_enabled()) {
         l2_swimlane_aicpu_init(runtime->dev.worker_count);
         l2_swimlane_level_ = get_l2_swimlane_level();
@@ -899,19 +879,55 @@ SchedulerContext::init(Runtime *runtime, int32_t aicpu_thread_num, int32_t sched
     }
 #endif
 
-    // Discover cores and assign to scheduler threads.
-    int32_t rc = handshake_all_cores(runtime);
-    if (rc != 0) {
-        LOG_ERROR("handshake_all_cores failed");
-        return rc;
+    // Core count is needed by every thread to compute its handshake slice.
+    cores_total_num_ = runtime->dev.worker_count;
+    if (cores_total_num_ == 0 || cores_total_num_ > RUNTIME_MAX_WORKER) {
+        LOG_ERROR("Invalid cores_total_num %d (expected 1-%d)", cores_total_num_, RUNTIME_MAX_WORKER);
+        return -1;
     }
+    aic_count_ = 0;
+    aiv_count_ = 0;
+    handshake_failed_.store(false, std::memory_order_release);
+
+    LOG_INFO_V0("Handshaking with %d cores", cores_total_num_);
+    return 0;
+}
+
+int32_t SchedulerContext::post_handshake_init(Runtime *runtime) {
+    if (handshake_failed_.load(std::memory_order_acquire)) {
+        emergency_shutdown(runtime);
+        return -1;
+    }
+
+    // Build cluster-ordered AIC/AIV worker-id lists from the discovered cores.
+    // Serial and MMIO-free — the expensive per-core handshake already ran in
+    // parallel across threads. Core-index order matches the original
+    // single-thread handshake so assign_cores_to_threads forms identical
+    // clusters. core_type / physical_core_id are read from the Handshake struct
+    // (stable after the handshake) so this stays correct under PTO2_PROFILING,
+    // where they are not mirrored into CoreExecState.
+    Handshake *all_handshakes = reinterpret_cast<Handshake *>(runtime->dev.workers);
+    for (int32_t i = 0; i < cores_total_num_; i++) {
+        CoreType type = all_handshakes[i].core_type;
+        uint32_t physical_core_id = all_handshakes[i].physical_core_id;
+        uint64_t reg_addr = core_exec_states_[i].reg_addr;
+        if (type == CoreType::AIC) {
+            aic_worker_ids_[aic_count_++] = i;
+            LOG_INFO_V0("Core %d: AIC, physical_id=%u, reg_addr=0x%lx", i, physical_core_id, reg_addr);
+        } else {
+            aiv_worker_ids_[aiv_count_++] = i;
+            LOG_INFO_V0("Core %d: AIV, physical_id=%u, reg_addr=0x%lx", i, physical_core_id, reg_addr);
+        }
+    }
+    LOG_INFO_V0("Core discovery complete: %d AIC, %d AIV", aic_count_, aiv_count_);
+
     if (!assign_cores_to_threads()) {
         return -1;
     }
 
-    // Profiling-subsystem buffer/state init: single-threaded cold path, so the
-    // "do it once" guarantee is structural (no CAS needed). Runs after
-    // handshake_all_cores / assign_cores_to_threads because pmu_aicpu_init needs
+    // Profiling-subsystem buffer/state init: single-threaded cold path (leader
+    // only), so the "do it once" guarantee is structural (no CAS needed). Runs
+    // after the handshake / assign_cores_to_threads because pmu_aicpu_init needs
     // physical_core_ids_ / cores_total_num_. Mirrors the l2_swimlane_aicpu_init
     // convention above; the per-thread *_set_orch_thread_idx setters stay on the
     // orchestrator thread (see aicpu_executor.cpp).

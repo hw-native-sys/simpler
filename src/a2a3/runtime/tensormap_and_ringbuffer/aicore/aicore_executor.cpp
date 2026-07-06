@@ -103,8 +103,8 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, in
     bool pmu_enabled = GET_PROFILING_FLAG(enable_profiling_flag, PROFILING_FLAG_PMU);
 
     // Per-core L2SwimlaneActiveHead channel. AICPU completes
-    // `l2_swimlane_aicpu_init` before writing `aicpu_ready = 1` in
-    // `handshake_all_cores`, and Phase 1 above has already observed
+    // `l2_swimlane_aicpu_init` (in pre_handshake_init) before any thread writes
+    // `aicpu_ready = 1` in `handshake_partition`, and Phase 1 above has already observed
     // `aicpu_ready == 1`, so the rotation-table slot is populated and the
     // first deref is safe here — off the dispatch→start critical path.
     __gm__ L2SwimlaneActiveHead *l2_swimlane_head = l2_swimlane_enabled ? get_l2_swimlane_aicore_head() : nullptr;
