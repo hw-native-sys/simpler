@@ -295,6 +295,34 @@ jobs:
           pytest examples tests/st --platform a5sim --device 0-15 -v \
             --pto-session-timeout 600 --require-pto-isa
 
+      # DFX per-feature smokes — the default pytest above passes no --enable-*
+      # flag, so each capture pipeline gets its own invocation here. Kept as
+      # separate steps so a failing capture pipeline is attributed to its own
+      # CI step rather than buried in a combined run. Mirrors st-sim-a2a3.
+      - name: dep_gen smoke
+        run: |
+          pytest tests/st/a5/tensormap_and_ringbuffer/dfx/dep_gen/test_dep_gen.py \
+            --platform a5sim --device 0-15 -p no:xdist --pto-session-timeout 600 \
+            --require-pto-isa --enable-dep-gen
+
+      - name: l2_swimlane smoke
+        run: |
+          pytest tests/st/a5/tensormap_and_ringbuffer/dfx/l2_swimlane/ \
+            --platform a5sim --device 0-15 -p no:xdist --pto-session-timeout 600 \
+            --require-pto-isa --enable-l2-swimlane --enable-dep-gen
+
+      - name: PMU smoke
+        run: |
+          pytest tests/st/a5/tensormap_and_ringbuffer/dfx/pmu/test_pmu.py \
+            --platform a5sim --device 0-15 -p no:xdist --pto-session-timeout 600 \
+            --require-pto-isa --enable-pmu 2
+
+      - name: args_dump smoke
+        run: |
+          pytest tests/st/a5/tensormap_and_ringbuffer/dfx/args_dump/test_args_dump.py \
+            --platform a5sim --device 0-15 -p no:xdist --pto-session-timeout 600 \
+            --require-pto-isa --dump-args
+
   # ---------- Profiling sub-flags smoke (compile + run) ----------
   # PTO2_PROFILING / PTO2_ORCH_PROFILING / PTO2_SCHED_PROFILING /
   # PTO2_TENSORMAP_PROFILING are compile-time gates whose defaults and
@@ -720,3 +748,43 @@ jobs:
           DEVICE_LIST=$(python -c "p='${DEVICE_RANGE}'.split('-'); s,e=p[0],p[-1]; print(','.join(str(i) for i in range(int(s),int(e)+1)))")
           PYTEST="python -m pytest examples tests/st --platform a5 --device ${DEVICE_RANGE} -v --require-pto-isa"
           task-submit --timeout 1800 --max-time 1800 --device "$DEVICE_LIST" --run "$PYTEST --pto-session-timeout 1200"
+
+      # DFX per-feature smokes — hardware mirror of the st-sim-a5 set. The
+      # race window in dep_gen only fires on real timing, so this row is
+      # what would catch onboard-only regressions like the missing kernel.cpp
+      # propagation #742 fixed.
+      - name: dep_gen smoke
+        run: |
+          source .venv/bin/activate
+          DEVICE_LIST=$(python -c "p='${DEVICE_RANGE}'.split('-'); s,e=p[0],p[-1]; print(','.join(str(i) for i in range(int(s),int(e)+1)))")
+          PYTEST="python -m pytest tests/st/a5/tensormap_and_ringbuffer/dfx/dep_gen/test_dep_gen.py \
+            --platform a5 --device ${DEVICE_RANGE} -p no:xdist --pto-session-timeout 600 \
+            --require-pto-isa --enable-dep-gen"
+          task-submit --timeout 1800 --max-time 1800 --device "$DEVICE_LIST" --run "$PYTEST"
+
+      - name: l2_swimlane smoke
+        run: |
+          source .venv/bin/activate
+          DEVICE_LIST=$(python -c "p='${DEVICE_RANGE}'.split('-'); s,e=p[0],p[-1]; print(','.join(str(i) for i in range(int(s),int(e)+1)))")
+          PYTEST="python -m pytest tests/st/a5/tensormap_and_ringbuffer/dfx/l2_swimlane/ \
+            --platform a5 --device ${DEVICE_RANGE} -p no:xdist --pto-session-timeout 600 \
+            --require-pto-isa --enable-l2-swimlane --enable-dep-gen"
+          task-submit --timeout 1800 --max-time 1800 --device "$DEVICE_LIST" --run "$PYTEST"
+
+      - name: PMU smoke
+        run: |
+          source .venv/bin/activate
+          DEVICE_LIST=$(python -c "p='${DEVICE_RANGE}'.split('-'); s,e=p[0],p[-1]; print(','.join(str(i) for i in range(int(s),int(e)+1)))")
+          PYTEST="python -m pytest tests/st/a5/tensormap_and_ringbuffer/dfx/pmu/test_pmu.py \
+            --platform a5 --device ${DEVICE_RANGE} -p no:xdist --pto-session-timeout 600 \
+            --require-pto-isa --enable-pmu 2"
+          task-submit --timeout 1800 --max-time 1800 --device "$DEVICE_LIST" --run "$PYTEST"
+
+      - name: args_dump smoke
+        run: |
+          source .venv/bin/activate
+          DEVICE_LIST=$(python -c "p='${DEVICE_RANGE}'.split('-'); s,e=p[0],p[-1]; print(','.join(str(i) for i in range(int(s),int(e)+1)))")
+          PYTEST="python -m pytest tests/st/a5/tensormap_and_ringbuffer/dfx/args_dump/test_args_dump.py \
+            --platform a5 --device ${DEVICE_RANGE} -p no:xdist --pto-session-timeout 600 \
+            --require-pto-isa --dump-args"
+          task-submit --timeout 1800 --max-time 1800 --device "$DEVICE_LIST" --run "$PYTEST"

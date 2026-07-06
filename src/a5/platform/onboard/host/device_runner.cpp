@@ -748,17 +748,26 @@ int DeviceRunner::finalize() {
 // `launch_aicpu_kernel` and `launch_aicore_kernel` live on `DeviceRunnerBase`.
 
 void DeviceRunner::finalize_collectors() {
+    // On any exit from run() — success or early error — release the diagnostics
+    // collectors' shared memory. They are only re-initialized per run(), so a
+    // Worker reused across runs (e.g. a pytest session-scoped worker pool) would
+    // otherwise re-enter init_l2_swimlane() with stale state still allocated.
+    // Matches a2a3's finalize_collectors().
     if (l2_swimlane_collector_.is_initialized()) {
-        l2_swimlane_collector_.stop();
+        l2_swimlane_collector_.finalize(/*unregister_cb=*/nullptr, prof_free_cb);
     }
     if (dump_collector_.is_initialized()) {
-        dump_collector_.stop();
+        dump_collector_.finalize(/*unregister_cb=*/nullptr, prof_free_cb);
     }
     if (pmu_collector_.is_initialized()) {
-        pmu_collector_.stop();
+        pmu_collector_.finalize(/*unregister_cb=*/nullptr, prof_free_cb);
     }
     if (dep_gen_collector_.is_initialized()) {
-        dep_gen_collector_.stop();
+        dep_gen_collector_.finalize(/*unregister_cb=*/nullptr, prof_free_cb);
+    }
+    if (scope_stats_collector_.is_initialized()) {
+        scope_stats_collector_.finalize(/*unregister_cb=*/nullptr, prof_free_cb);
+        kernel_args_.args.scope_stats_data_base = 0;
     }
 }
 

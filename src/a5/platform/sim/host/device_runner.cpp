@@ -128,6 +128,11 @@ int DeviceRunner::ensure_binaries_loaded() {
         if (!load_sym("set_dump_args_enabled", reinterpret_cast<void **>(&set_dump_args_enabled_func_))) return -1;
         if (!load_sym("set_platform_l2_swimlane_base", reinterpret_cast<void **>(&set_platform_l2_swimlane_base_func_)))
             return -1;
+        if (!load_sym(
+                "set_platform_l2_swimlane_aicore_rotation_table",
+                reinterpret_cast<void **>(&set_platform_l2_swimlane_aicore_rotation_table_func_)
+            ))
+            return -1;
         if (!load_sym("set_l2_swimlane_enabled", reinterpret_cast<void **>(&set_l2_swimlane_enabled_func_))) return -1;
         if (!load_sym("set_platform_pmu_base", reinterpret_cast<void **>(&set_platform_pmu_base_func_))) return -1;
         if (!load_sym("set_pmu_enabled", reinterpret_cast<void **>(&set_pmu_enabled_func_))) return -1;
@@ -350,7 +355,7 @@ int DeviceRunner::run(Runtime &runtime, const CallConfig &config) {
     // mgmt + poll threads exit cleanly. stop() is idempotent and a no-op on
     // collectors that never started.
     auto perf_cleanup = RAIIScopeGuard([this]() {
-        stop_collectors();
+        finalize_collectors();
     });
 
     // Allocate simulated register blocks for all AICore cores. Uses sparse
@@ -396,7 +401,7 @@ int DeviceRunner::run(Runtime &runtime, const CallConfig &config) {
         set_pmu_enabled_func_ == nullptr || set_platform_dep_gen_base_func_ == nullptr ||
         set_dep_gen_enabled_func_ == nullptr || set_scope_stats_enabled_func_ == nullptr ||
         set_platform_scope_stats_base_func_ == nullptr || set_platform_l2_swimlane_base_func_ == nullptr ||
-        set_l2_swimlane_enabled_func_ == nullptr) {
+        set_platform_l2_swimlane_aicore_rotation_table_func_ == nullptr || set_l2_swimlane_enabled_func_ == nullptr) {
         LOG_ERROR("Executor functions not loaded. Call ensure_binaries_loaded first.");
         return -1;
     }
@@ -408,6 +413,7 @@ int DeviceRunner::run(Runtime &runtime, const CallConfig &config) {
     set_platform_dump_base_func_(kernel_args_.dump_data_base);
     set_dump_args_enabled_func_(enable_dump_tensor_);
     set_platform_l2_swimlane_base_func_(kernel_args_.l2_swimlane_data_base);
+    set_platform_l2_swimlane_aicore_rotation_table_func_(kernel_args_.l2_swimlane_aicore_rotation_table);
     set_l2_swimlane_enabled_func_(enable_l2_swimlane_);
     set_platform_pmu_base_func_(kernel_args_.pmu_data_base);
     set_pmu_enabled_func_(enable_pmu_);
@@ -601,6 +607,7 @@ void DeviceRunner::unload_executor_binaries() {
         set_platform_dump_base_func_ = nullptr;
         set_dump_args_enabled_func_ = nullptr;
         set_platform_l2_swimlane_base_func_ = nullptr;
+        set_platform_l2_swimlane_aicore_rotation_table_func_ = nullptr;
         set_l2_swimlane_enabled_func_ = nullptr;
         set_platform_pmu_base_func_ = nullptr;
         set_pmu_enabled_func_ = nullptr;
@@ -631,23 +638,9 @@ int DeviceRunner::finalize() {
         return 0;
     }
 
-    // a5 sim full collector finalize: release shm back to prof_free_cb.
-    if (l2_swimlane_collector_.is_initialized()) {
-        l2_swimlane_collector_.finalize(/*unregister_cb=*/nullptr, prof_free_cb);
-    }
-    if (dump_collector_.is_initialized()) {
-        dump_collector_.finalize(/*unregister_cb=*/nullptr, prof_free_cb);
-    }
-    if (pmu_collector_.is_initialized()) {
-        pmu_collector_.finalize(/*unregister_cb=*/nullptr, prof_free_cb);
-    }
-    if (dep_gen_collector_.is_initialized()) {
-        dep_gen_collector_.finalize(/*unregister_cb=*/nullptr, prof_free_cb);
-    }
-    if (scope_stats_collector_.is_initialized()) {
-        scope_stats_collector_.finalize(/*unregister_cb=*/nullptr, prof_free_cb);
-        kernel_args_.scope_stats_data_base = 0;
-    }
+    // Cleanup performance profiling. Normally already done by run()'s
+    // perf_cleanup guard; this is the backstop for the no-run-since-init case.
+    finalize_collectors();
 
     release_callable_state();
 
@@ -686,18 +679,22 @@ int DeviceRunner::finalize() {
 // Performance Profiling Implementation
 // =============================================================================
 
-void DeviceRunner::stop_collectors() {
+void DeviceRunner::finalize_collectors() {
     if (l2_swimlane_collector_.is_initialized()) {
-        l2_swimlane_collector_.stop();
+        l2_swimlane_collector_.finalize(/*unregister_cb=*/nullptr, prof_free_cb);
     }
     if (dump_collector_.is_initialized()) {
-        dump_collector_.stop();
+        dump_collector_.finalize(/*unregister_cb=*/nullptr, prof_free_cb);
     }
     if (pmu_collector_.is_initialized()) {
-        pmu_collector_.stop();
+        pmu_collector_.finalize(/*unregister_cb=*/nullptr, prof_free_cb);
     }
     if (dep_gen_collector_.is_initialized()) {
-        dep_gen_collector_.stop();
+        dep_gen_collector_.finalize(/*unregister_cb=*/nullptr, prof_free_cb);
+    }
+    if (scope_stats_collector_.is_initialized()) {
+        scope_stats_collector_.finalize(/*unregister_cb=*/nullptr, prof_free_cb);
+        kernel_args_.scope_stats_data_base = 0;
     }
 }
 
