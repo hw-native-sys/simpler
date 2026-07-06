@@ -30,7 +30,7 @@
 
 #include <cstring>
 
-#include "aicpu/device_time.h"
+#include "aicpu/profiler_device_engine.h"
 #include "common/memory_barrier.h"
 #include "common/platform_config.h"
 #include "common/unified_log.h"
@@ -59,124 +59,69 @@ void dep_gen_aicpu_set_orch_thread_idx(int thread_idx) { s_orch_thread_idx = thr
 // Internal: enqueue full buffer to per-thread ready_queue
 // ---------------------------------------------------------------------------
 
-static bool
-wait_for_ready_queue_space(DepGenDataHeader *header, int thread_idx, uint32_t *tail_out, uint32_t *head_out) {
-    if (header == nullptr || thread_idx < 0 || thread_idx >= PLATFORM_MAX_AICPU_THREADS) {
-        return false;
+struct DepGenDeviceModule {
+    struct Context {
+        DepGenDataHeader *header;
+        int thread_idx;
+    };
+
+    using DataHeader = DepGenDataHeader;
+    using State = DepGenBufferState;
+    using FreeQueue = DepGenFreeQueue;
+    using Buffer = DepGenBuffer;
+
+    static constexpr uint32_t kReadyQueueSize = PLATFORM_DEP_GEN_READYQUEUE_SIZE;
+    static constexpr uint32_t kSlotCount = PLATFORM_DEP_GEN_SLOT_COUNT;
+    static constexpr uint64_t kBackpressureWaitCycles = kDepGenQueueBackpressureWaitCycles;
+
+    static DataHeader *header(Context ctx) { return ctx.header; }
+    static int ready_thread(Context ctx) { return ctx.thread_idx; }
+    static FreeQueue *free_queue(State *state) { return &state->free_queue; }
+
+    static uint64_t current_ptr(State *state) { return state->current_buf_ptr; }
+    static void set_current_ptr(State *state, uint64_t ptr) { state->current_buf_ptr = ptr; }
+    static uint32_t current_seq(State *state) { return state->current_buf_seq; }
+    static void set_current_seq(State *state, uint32_t seq) { state->current_buf_seq = seq; }
+
+    static uint32_t count(Buffer *buffer) { return buffer->count; }
+    static void set_count(Buffer *buffer, uint32_t count) { buffer->count = count; }
+
+    static void write_ready_entry(Context ctx, uint32_t tail, uint64_t buffer_ptr, uint32_t buffer_seq) {
+        ctx.header->queues[ctx.thread_idx][tail].instance_index = 0;
+        ctx.header->queues[ctx.thread_idx][tail].buffer_ptr = buffer_ptr;
+        ctx.header->queues[ctx.thread_idx][tail].buffer_seq = buffer_seq;
     }
-    const uint32_t capacity = PLATFORM_DEP_GEN_READYQUEUE_SIZE;
-    const uint64_t start = get_sys_cnt_aicpu();
 
-    do {
-        uint32_t current_tail = header->queue_tails[thread_idx];
-        uint32_t current_head = header->queue_heads[thread_idx];
-        uint32_t next_tail = (current_tail + 1) % capacity;
-        if (next_tail != current_head) {
-            *tail_out = current_tail;
-            *head_out = current_head;
-            return true;
-        }
-        if (get_sys_cnt_aicpu() - start >= kDepGenQueueBackpressureWaitCycles) {
-            break;
-        }
-    } while (true);
-    return false;
-}
-
-static bool wait_for_free_queue_entry(DepGenFreeQueue *free_queue, uint32_t *head_out, uint32_t *tail_out) {
-    if (free_queue == nullptr) {
-        return false;
+    static void account_dropped(Context, State *state, uint32_t count) { state->dropped_record_count += count; }
+    static void on_pop_success(Context, State *, Buffer *) {}
+    static void on_current_cleared(Context, State *) {}
+    static void on_no_replacement(Context, State *) {}
+    static void on_null_free_slot(Context, State *) {}
+    static void on_enqueue_failed(Context, State *, Buffer *buffer) {
+        LOG_ERROR("dep_gen: failed to enqueue full buffer (ready_queue full), %u records dropped", buffer->count);
     }
-    const uint64_t start = get_sys_cnt_aicpu();
+    static void on_switch_complete(Context, State *, Buffer *) {}
+};
 
-    do {
-        uint32_t head = free_queue->head;
-        uint32_t tail = free_queue->tail;
-        if (head != tail) {
-            *head_out = head;
-            *tail_out = tail;
-            rmb();  // acquire: order the tail read above before the caller's buffer_ptrs read
-            return true;
-        }
-        if (get_sys_cnt_aicpu() - start >= kDepGenQueueBackpressureWaitCycles) {
-            break;
-        }
-    } while (true);
-    return false;
+using DepGenEngine = profiling_device::DeviceProfilerEngine<DepGenDeviceModule>;
+
+static DepGenDeviceModule::Context dep_gen_context() {
+    return DepGenDeviceModule::Context{s_dep_gen_header, s_orch_thread_idx};
 }
 
 static int enqueue_dep_gen_ready_buffer(uint64_t buffer_ptr, uint32_t buffer_seq) {
-    int q = s_orch_thread_idx;
-    uint32_t capacity = PLATFORM_DEP_GEN_READYQUEUE_SIZE;
-    uint32_t current_tail = 0;
-    uint32_t current_head = 0;
-    if (!wait_for_ready_queue_space(s_dep_gen_header, q, &current_tail, &current_head)) {
-        return -1;
-    }
-
-    uint32_t next_tail = (current_tail + 1) % capacity;
-    s_dep_gen_header->queues[q][current_tail].instance_index = 0;
-    s_dep_gen_header->queues[q][current_tail].buffer_ptr = buffer_ptr;
-    s_dep_gen_header->queues[q][current_tail].buffer_seq = buffer_seq;
-    wmb();  // publish: entry fields visible before the tail advance
-    s_dep_gen_header->queue_tails[q] = next_tail;
-    return 0;
+    return DepGenEngine::enqueue_ready(dep_gen_context(), buffer_ptr, buffer_seq);
 }
 
 static DepGenBuffer *try_pop_dep_gen_buffer(uint32_t next_seq) {
-    if (s_dep_gen_state == nullptr) {
-        return nullptr;
-    }
-    uint32_t head = 0;
-    uint32_t tail = 0;
-    if (!wait_for_free_queue_entry(&s_dep_gen_state->free_queue, &head, &tail)) {
-        return nullptr;
-    }
-
-    uint64_t new_buf_ptr = s_dep_gen_state->free_queue.buffer_ptrs[head % PLATFORM_DEP_GEN_SLOT_COUNT];
-    s_dep_gen_state->free_queue.head = head + 1;
-    if (new_buf_ptr == 0) {
-        return nullptr;
-    }
-
-    DepGenBuffer *new_buf = reinterpret_cast<DepGenBuffer *>(new_buf_ptr);
-    new_buf->count = 0;
-    s_dep_gen_state->current_buf_ptr = new_buf_ptr;
-    s_dep_gen_state->current_buf_seq = next_seq;
-    wmb();
-    return new_buf;
+    return DepGenEngine::pop_free(dep_gen_context(), s_dep_gen_state, next_seq);
 }
 
 // ---------------------------------------------------------------------------
 // Internal: switch the current buffer
 // ---------------------------------------------------------------------------
 
-static void dep_gen_switch_buffer() {
-    if (s_dep_gen_state == nullptr) {
-        return;
-    }
-    DepGenBuffer *full_buf = reinterpret_cast<DepGenBuffer *>(s_dep_gen_state->current_buf_ptr);
-    if (full_buf == nullptr) {
-        return;
-    }
-
-    uint32_t seq = s_dep_gen_state->current_buf_seq;
-    int rc = enqueue_dep_gen_ready_buffer(s_dep_gen_state->current_buf_ptr, seq);
-    if (rc != 0) {
-        LOG_ERROR("dep_gen: failed to enqueue full buffer (ready_queue full), %u records dropped", full_buf->count);
-        s_dep_gen_state->dropped_record_count += full_buf->count;
-        full_buf->count = 0;
-        wmb();
-        return;
-    }
-
-    uint32_t next_seq = seq + 1;
-    s_dep_gen_state->current_buf_ptr = 0;
-    s_dep_gen_state->current_buf_seq = next_seq;
-    wmb();
-
-    (void)try_pop_dep_gen_buffer(next_seq);
-}
+static void dep_gen_switch_buffer() { DepGenEngine::switch_buffer(dep_gen_context(), s_dep_gen_state); }
 
 // ---------------------------------------------------------------------------
 // Public interface

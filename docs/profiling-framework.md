@@ -1,13 +1,16 @@
 # Profiling Framework
 
-Shared host-side infrastructure that the PMU, L2Swimlane, DepGen,
-TensorDump, and ScopeStats collectors are built on. The framework headers
-live in
+Shared profiling infrastructure that the PMU, L2Swimlane, DepGen,
+TensorDump, and ScopeStats collectors are built on. The host-side framework
+headers live in
 [`src/common/platform/include/host/`](../src/common/platform/include/host/)
 and are consumed verbatim by both a2a3 and a5 collectors (PR #944
-unified the previously-divergent per-arch copies into one set). This page
-describes the shape; §8 covers the a5-specific transport deviations that
-the collectors themselves still carry.
+unified the previously-divergent per-arch copies into one set). The AICPU
+device-side producer algorithms live in
+[`src/common/platform/include/aicpu/profiler_device_engine.h`](../src/common/platform/include/aicpu/profiler_device_engine.h)
+and are shared by the device writers that publish buffers into those host
+collectors. This page describes both halves; §8 covers the a5-specific
+transport deviations that the collectors themselves still carry.
 
 The per-collector pages
 ([pmu-profiling.md](dfx/pmu-profiling.md),
@@ -42,9 +45,14 @@ Each profiling subsystem needs the same plumbing on the host:
 - A teardown sequence that flushes the device queues and host shards without
   losing late entries.
 
+The AICPU producer side has a matching repeated shape: wait for ready-queue
+space, publish a full buffer, wait for a free replacement, install it as the
+current buffer, and account dropped records if bounded backpressure expires.
+
 Before unification this was near-identical control flow repeated across
-collectors. The framework collapses it to one implementation parameterized
-on a small per-subsystem trait.
+collectors. The framework collapses the host side to one implementation
+parameterized on a small per-subsystem trait, and the device side to
+`DeviceProfilerEngine<Module>` plus small local AICPU module traits.
 
 ## 2. Layered view
 
@@ -72,6 +80,22 @@ on a small per-subsystem trait.
               │  Dump / Scope modules             │  ─ DataHeader / ReadyEntry / FreeQueue
               └────────────────────────────────┘  ─ kBufferKinds / kReadyQueueSize
                                                   ─ resolve_entry / for_each_instance
+
+  AICPU device side:
+
+                ┌──────────────────────────────────────────┐
+                │  AICPU writer files                      │  record fill / flush / local state
+                │  pmu / l2 / dep_gen / dump / scope       │  subsystem hooks
+                └─────────────┬────────────────────────────┘
+                              │ uses
+                ┌─────────────▼────────────────────────────┐
+                │  DeviceProfilerEngine<DeviceModule>      │  ready/free/switch algorithms
+                └─────────────┬────────────────────────────┘
+                              │ DeviceModule trait wires layout into algorithms
+                ┌─────────────▼────────────────────────────┐
+                │  XxxDeviceModule                         │  DataHeader / State / FreeQueue
+                │                                          │  write_ready_entry / drop hooks
+                └──────────────────────────────────────────┘
 ```
 
 `ProfilerBase` is the owner: it holds `BufferPoolManager manager_` as a
@@ -206,6 +230,53 @@ and only has to provide:
   buffers (`release_owned_buffers`) and drop the mapping table
   (`clear_mappings`).
 
+### 3.5 `DeviceProfilerEngine<Module>` — AICPU producer algorithm layer
+
+Defined in
+[`profiler_device_engine.h`](../src/common/platform/include/aicpu/profiler_device_engine.h).
+This is the device-side counterpart to `ProfilerAlgorithms<Module>`: it
+owns the AICPU producer control flow, while each subsystem keeps its record
+schema, flush/finalize behavior, and small layout hooks locally.
+
+The engine currently provides:
+
+- `wait_for_ready_queue_space` — bounded wait for a per-thread ready queue
+  slot.
+- `wait_for_free_queue_entry` — bounded wait for a replacement buffer in a
+  free queue, with acquire ordering before reading `buffer_ptrs[]`.
+- `enqueue_ready` — write the ready entry, `wmb()`, then advance
+  `queue_tails[q]`.
+- `pop_free` — pop a free buffer, clear its count, install
+  `current_buf_ptr/current_buf_seq`, update any local cache hook, then
+  publish with `wmb()`.
+- `switch_buffer` — enqueue the full current buffer, clear current state,
+  advance seq, then try to install a replacement; on enqueue failure it
+  accounts dropped records, clears count, and keeps the workload moving.
+
+Each AICPU writer defines a local `XxxDeviceModule` trait with:
+
+| Member | Purpose |
+| ------ | ------- |
+| `Context` | Per-call context such as header pointer, ready-queue thread, core/pool id, or local cache pointer |
+| `using DataHeader / State / FreeQueue / Buffer` | Device shared-memory layout types |
+| `kReadyQueueSize`, `kSlotCount`, `kBackpressureWaitCycles` | Queue geometry and bounded wait budget |
+| `header(ctx)`, `ready_thread(ctx)`, `free_queue(state)` | Locate the shared header and queues |
+| `current_ptr/set_current_ptr`, `current_seq/set_current_seq` | Access the active device buffer state |
+| `count/set_count` | Access the active buffer's record count |
+| `write_ready_entry(ctx, tail, ptr, seq)` | Fill subsystem-specific ready-entry fields (`core_index`, `kind`, `thread_index`, `instance_index`, …) |
+| `account_dropped`, `on_enqueue_failed`, `on_no_replacement` | Preserve subsystem-specific drop accounting and logs |
+| `on_pop_success`, `on_current_cleared`, `on_null_free_slot`, `on_switch_complete` | Preserve local caches and optional switch logs |
+
+Current users:
+
+- ScopeStats, DepGen, TensorDump, and PMU use the engine for
+  ready/free/switch.
+- L2Swimlane uses the engine for ready enqueue / free wait primitives and
+  AICPU task-buffer pop/switch.
+- L2Swimlane scheduler/orchestrator phase pools and AICore rotation remain
+  local special cases. Their seq recovery, retry, and AICore-visible head
+  publishing rules differ from standard `switch_buffer`.
+
 ## 4. End-to-end data flow
 
 ```text
@@ -320,7 +391,13 @@ Two things follow:
    and AICPU can include.
 2. Write a `XxxModule` struct satisfying the contract in §3.3. Multi-kind
    modules also implement `kind_of`.
-3. Write a `XxxCollector : public profiling_common::ProfilerBase<XxxCollector, XxxModule>`:
+3. If the subsystem has an AICPU device writer, define a local
+   `XxxDeviceModule` satisfying §3.5 and use
+   `profiling_device::DeviceProfilerEngine<XxxDeviceModule>` for
+   ready/free/switch control flow. Keep record fill, flush/finalize, and
+   unusual cross-core protocols local unless their semantics match the
+   standard engine contract.
+4. Write a `XxxCollector : public profiling_common::ProfilerBase<XxxCollector, XxxModule>`:
    - `init(...)`: `rtMalloc` + register pre-allocated buffers, populate
      the shared header, call `register_mapping` per buffer, then call
      `set_memory_context(...)`.
@@ -329,7 +406,7 @@ Two things follow:
    - `kIdleTimeoutSec`, `kSubsystemName`.
    - `finalize(unregister, free)`: `release_owned_buffers` + free
      collector-owned buffers + `clear_mappings` + `clear_memory_context`.
-4. Wire it into `device_runner` so `start(tf)` is called before the
+5. Wire it into `device_runner` so `start(tf)` is called before the
    kernel launch and `stop()` before `finalize`.
 
 Existing collectors are the canonical examples:

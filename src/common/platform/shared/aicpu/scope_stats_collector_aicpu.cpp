@@ -21,7 +21,7 @@
 #include "aicpu/scope_stats_collector_aicpu.h"
 #include <cstring>
 
-#include "aicpu/device_time.h"
+#include "aicpu/profiler_device_engine.h"
 #include "common/memory_barrier.h"
 #include "common/platform_config.h"
 #include "common/scope_stats.h"
@@ -89,120 +89,70 @@ inline void copy_basename(char (&dst)[32], const char *src) {
     }
 }
 
-// Enqueue a full buffer onto the orchestrator thread's ready_queue. Returns 0
-// on success, -1 if the queue is full or the orch thread index is unset.
-bool wait_for_ready_queue_space(ScopeStatsDataHeader *header, int thread_idx, uint32_t *tail_out, uint32_t *head_out) {
-    if (header == nullptr || thread_idx < 0 || thread_idx >= PLATFORM_MAX_AICPU_THREADS) {
-        return false;
+struct ScopeStatsDeviceModule {
+    struct Context {
+        ScopeStatsDataHeader *header;
+        int thread_idx;
+    };
+
+    using DataHeader = ScopeStatsDataHeader;
+    using State = ScopeStatsBufferState;
+    using FreeQueue = ScopeStatsFreeQueue;
+    using Buffer = ScopeStatsBuffer;
+
+    static constexpr uint32_t kReadyQueueSize = PLATFORM_SCOPE_STATS_READYQUEUE_SIZE;
+    static constexpr uint32_t kSlotCount = PLATFORM_SCOPE_STATS_SLOT_COUNT;
+    static constexpr uint64_t kBackpressureWaitCycles = kScopeStatsQueueBackpressureWaitCycles;
+
+    static DataHeader *header(Context ctx) { return ctx.header; }
+    static int ready_thread(Context ctx) { return ctx.thread_idx; }
+    static FreeQueue *free_queue(State *state) { return &state->free_queue; }
+
+    static uint64_t current_ptr(State *state) { return state->current_buf_ptr; }
+    static void set_current_ptr(State *state, uint64_t ptr) { state->current_buf_ptr = ptr; }
+    static uint32_t current_seq(State *state) { return state->current_buf_seq; }
+    static void set_current_seq(State *state, uint32_t seq) { state->current_buf_seq = seq; }
+
+    static uint32_t count(Buffer *buffer) { return buffer->count; }
+    static void set_count(Buffer *buffer, uint32_t count) { buffer->count = count; }
+
+    static void write_ready_entry(Context ctx, uint32_t tail, uint64_t buffer_ptr, uint32_t buffer_seq) {
+        ctx.header->queues[ctx.thread_idx][tail].instance_index = 0;
+        ctx.header->queues[ctx.thread_idx][tail].buffer_ptr = buffer_ptr;
+        ctx.header->queues[ctx.thread_idx][tail].buffer_seq = buffer_seq;
     }
-    const uint32_t capacity = PLATFORM_SCOPE_STATS_READYQUEUE_SIZE;
-    const uint64_t start = get_sys_cnt_aicpu();
 
-    do {
-        uint32_t current_tail = header->queue_tails[thread_idx];
-        uint32_t current_head = header->queue_heads[thread_idx];
-        uint32_t next_tail = (current_tail + 1) % capacity;
-        if (next_tail != current_head) {
-            *tail_out = current_tail;
-            *head_out = current_head;
-            return true;
-        }
-        if (get_sys_cnt_aicpu() - start >= kScopeStatsQueueBackpressureWaitCycles) {
-            break;
-        }
-    } while (true);
-    return false;
-}
+    static void account_dropped(Context, State *state, uint32_t count) { state->dropped_record_count += count; }
+    static void on_pop_success(Context, State *, Buffer *) {}
+    static void on_current_cleared(Context, State *) {}
+    static void on_no_replacement(Context, State *) {}
+    static void on_enqueue_failed(Context, State *, Buffer *) {}
+    static void on_null_free_slot(Context, State *) {}
+    static void on_switch_complete(Context, State *, Buffer *) {}
+};
 
-bool wait_for_free_queue_entry(ScopeStatsFreeQueue *free_queue, uint32_t *head_out, uint32_t *tail_out) {
-    if (free_queue == nullptr) {
-        return false;
-    }
-    const uint64_t start = get_sys_cnt_aicpu();
+using ScopeStatsEngine = profiling_device::DeviceProfilerEngine<ScopeStatsDeviceModule>;
 
-    do {
-        uint32_t head = free_queue->head;
-        uint32_t tail = free_queue->tail;
-        if (head != tail) {
-            *head_out = head;
-            *tail_out = tail;
-            rmb();  // acquire: order the tail read above before the caller's buffer_ptrs read
-            return true;
-        }
-        if (get_sys_cnt_aicpu() - start >= kScopeStatsQueueBackpressureWaitCycles) {
-            break;
-        }
-    } while (true);
-    return false;
+ScopeStatsDeviceModule::Context scope_stats_context() {
+    return ScopeStatsDeviceModule::Context{s_scope_stats_header, s_orch_thread_idx};
 }
 
 int enqueue_ready_buffer(uint64_t buffer_ptr, uint32_t buffer_seq) {
-    int q = s_orch_thread_idx;
-    uint32_t capacity = PLATFORM_SCOPE_STATS_READYQUEUE_SIZE;
-    uint32_t current_tail = 0;
-    uint32_t current_head = 0;
-    if (!wait_for_ready_queue_space(s_scope_stats_header, q, &current_tail, &current_head)) {
-        return -1;
-    }
-
-    uint32_t next_tail = (current_tail + 1) % capacity;
-    s_scope_stats_header->queues[q][current_tail].instance_index = 0;
-    s_scope_stats_header->queues[q][current_tail].buffer_ptr = buffer_ptr;
-    s_scope_stats_header->queues[q][current_tail].buffer_seq = buffer_seq;
-    // Single hand-off barrier: drain every record written into the buffer plus
-    // the ready-entry fields above before the host can observe the advanced
-    // tail. Replaces the former per-record wmb() in scope_stats_end().
-    wmb();
-    s_scope_stats_header->queue_tails[q] = next_tail;
-    return 0;
+    return ScopeStatsEngine::enqueue_ready(scope_stats_context(), buffer_ptr, buffer_seq);
 }
 
 // Pop a free buffer into current_buf_ptr. Returns true if one was available.
 bool pop_free_buffer() {
     if (s_scope_stats_state == nullptr) return false;
-    uint32_t head = 0;
-    uint32_t tail = 0;
-    if (!wait_for_free_queue_entry(&s_scope_stats_state->free_queue, &head, &tail)) {
-        return false;
-    }
-
-    uint64_t buf_ptr = s_scope_stats_state->free_queue.buffer_ptrs[head % PLATFORM_SCOPE_STATS_SLOT_COUNT];
-    s_scope_stats_state->free_queue.head = head + 1;
-    if (buf_ptr == 0) {
-        return false;
-    }
-    s_scope_stats_state->current_buf_ptr = buf_ptr;
-    reinterpret_cast<ScopeStatsBuffer *>(buf_ptr)->count = 0;
-    wmb();
-    return true;
+    return ScopeStatsEngine::pop_free(
+               scope_stats_context(), s_scope_stats_state, s_scope_stats_state->current_buf_seq
+           ) != nullptr;
 }
 
 // Commit the full current buffer to the ready_queue before popping a
 // replacement. If no replacement is available, later records drop until host
 // replenishes free_queue.
-void switch_buffer() {
-    if (s_scope_stats_state == nullptr) {
-        return;
-    }
-    ScopeStatsBuffer *full_buf = reinterpret_cast<ScopeStatsBuffer *>(s_scope_stats_state->current_buf_ptr);
-    if (full_buf == nullptr) {
-        return;
-    }
-
-    uint32_t seq = s_scope_stats_state->current_buf_seq;
-    int rc = enqueue_ready_buffer(s_scope_stats_state->current_buf_ptr, seq);
-    if (rc != 0) {
-        s_scope_stats_state->dropped_record_count += full_buf->count;
-        full_buf->count = 0;
-        wmb();
-        return;
-    }
-
-    s_scope_stats_state->current_buf_ptr = 0;
-    s_scope_stats_state->current_buf_seq = seq + 1;
-    wmb();
-    (void)pop_free_buffer();
-}
+void switch_buffer() { ScopeStatsEngine::switch_buffer(scope_stats_context(), s_scope_stats_state); }
 
 // Unroll a wrapping heap byte offset into a monotonic value using the
 // accumulated wrap count for this ring/side and the registered heap capacity.

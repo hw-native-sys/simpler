@@ -23,7 +23,7 @@
 #include <cstdlib>
 #include <cstring>
 
-#include "aicpu/device_time.h"
+#include "aicpu/profiler_device_engine.h"
 #include "common/memory_barrier.h"
 #include "common/platform_config.h"
 #include "common/unified_log.h"
@@ -345,92 +345,84 @@ bool try_log_dump_args_layout_mismatch() {
 /**
  * Enqueue a full dump metadata buffer to the thread's ready queue.
  */
-static bool wait_for_ready_queue_space(DumpDataHeader *header, int thread_idx, uint32_t *tail_out, uint32_t *head_out) {
-    if (header == nullptr || thread_idx < 0 || thread_idx >= PLATFORM_MAX_AICPU_THREADS) {
-        return false;
+struct DumpDeviceModule {
+    struct Context {
+        DumpDataHeader *header;
+        int thread_idx;
+    };
+
+    using DataHeader = DumpDataHeader;
+    using State = DumpBufferState;
+    using FreeQueue = DumpFreeQueue;
+    using Buffer = DumpMetaBuffer;
+
+    static constexpr uint32_t kReadyQueueSize = PLATFORM_DUMP_READYQUEUE_SIZE;
+    static constexpr uint32_t kSlotCount = PLATFORM_DUMP_SLOT_COUNT;
+    static constexpr uint64_t kBackpressureWaitCycles = kDumpQueueBackpressureWaitCycles;
+
+    static DataHeader *header(Context ctx) { return ctx.header; }
+    static int ready_thread(Context ctx) { return ctx.thread_idx; }
+    static FreeQueue *free_queue(State *state) { return &state->free_queue; }
+
+    static uint64_t current_ptr(State *state) { return state->current_buf_ptr; }
+    static void set_current_ptr(State *state, uint64_t ptr) { state->current_buf_ptr = ptr; }
+    static uint32_t current_seq(State *state) { return state->current_buf_seq; }
+    static void set_current_seq(State *state, uint32_t seq) { state->current_buf_seq = seq; }
+
+    static uint32_t count(Buffer *buffer) { return buffer->count; }
+    static void set_count(Buffer *buffer, uint32_t count) { buffer->count = count; }
+
+    static void write_ready_entry(Context ctx, uint32_t tail, uint64_t buffer_ptr, uint32_t buffer_seq) {
+        ctx.header->queues[ctx.thread_idx][tail].thread_index = static_cast<uint32_t>(ctx.thread_idx);
+        ctx.header->queues[ctx.thread_idx][tail].buffer_ptr = buffer_ptr;
+        ctx.header->queues[ctx.thread_idx][tail].buffer_seq = buffer_seq;
     }
-    const uint32_t capacity = PLATFORM_DUMP_READYQUEUE_SIZE;
-    const uint64_t start = get_sys_cnt_aicpu();
 
-    do {
-        uint32_t current_tail = header->queue_tails[thread_idx];
-        uint32_t current_head = header->queue_heads[thread_idx];
-        uint32_t next_tail = (current_tail + 1) % capacity;
-        if (next_tail != current_head) {
-            *tail_out = current_tail;
-            *head_out = current_head;
-            return true;
-        }
-        if (get_sys_cnt_aicpu() - start >= kDumpQueueBackpressureWaitCycles) {
-            break;
-        }
-    } while (true);
-    return false;
-}
+    static void account_dropped(Context, State *state, uint32_t count) { account_dropped_records(state, count); }
+    static void on_pop_success(Context ctx, State *, Buffer *buffer) { s_current_dump_buf[ctx.thread_idx] = buffer; }
+    static void on_current_cleared(Context ctx, State *) { s_current_dump_buf[ctx.thread_idx] = nullptr; }
+    static void on_null_free_slot(Context, State *) {}
 
-static bool wait_for_free_queue_entry(DumpFreeQueue *free_queue, uint32_t *head_out, uint32_t *tail_out) {
-    if (free_queue == nullptr) {
-        return false;
+    static void on_enqueue_failed(Context ctx, State *, Buffer *) {
+        if (!s_logged_ready_queue_full[ctx.thread_idx]) {
+            s_logged_ready_queue_full[ctx.thread_idx] = true;
+            LOG_WARN(
+                "Args dump ready queue full on thread %d after bounded wait, "
+                "dropping current metadata buffer. Increase PLATFORM_DUMP_READYQUEUE_SIZE.",
+                ctx.thread_idx
+            );
+        }
     }
-    const uint64_t start = get_sys_cnt_aicpu();
 
-    do {
-        uint32_t head = free_queue->head;
-        uint32_t tail = free_queue->tail;
-        if (head != tail) {
-            *head_out = head;
-            *tail_out = tail;
-            rmb();  // acquire: order the tail read above before the caller's buffer_ptrs read
-            return true;
+    static void on_no_replacement(Context ctx, State *) {
+        if (!s_logged_no_free_meta_buffer[ctx.thread_idx]) {
+            s_logged_no_free_meta_buffer[ctx.thread_idx] = true;
+            LOG_WARN(
+                "Args dump published a full metadata buffer on thread %d but no replacement was available; "
+                "records will drop until recovery. Increase PLATFORM_DUMP_BUFFERS_PER_THREAD.",
+                ctx.thread_idx
+            );
         }
-        if (get_sys_cnt_aicpu() - start >= kDumpQueueBackpressureWaitCycles) {
-            break;
-        }
-    } while (true);
-    return false;
+    }
+
+    static void on_switch_complete(Context ctx, State *, Buffer *) { s_buffers_switched[ctx.thread_idx]++; }
+};
+
+using DumpEngine = profiling_device::DeviceProfilerEngine<DumpDeviceModule>;
+
+static DumpDeviceModule::Context dump_context(int thread_idx) {
+    return DumpDeviceModule::Context{s_dump_header, thread_idx};
 }
 
 static int enqueue_dump_ready_buffer(int thread_idx, uint64_t buffer_ptr, uint32_t buffer_seq) {
-    uint32_t capacity = PLATFORM_DUMP_READYQUEUE_SIZE;
-    uint32_t current_tail = 0;
-    uint32_t current_head = 0;
-    if (!wait_for_ready_queue_space(s_dump_header, thread_idx, &current_tail, &current_head)) {
-        return -1;
-    }
-
-    uint32_t next_tail = (current_tail + 1) % capacity;
-    s_dump_header->queues[thread_idx][current_tail].thread_index = static_cast<uint32_t>(thread_idx);
-    s_dump_header->queues[thread_idx][current_tail].buffer_ptr = buffer_ptr;
-    s_dump_header->queues[thread_idx][current_tail].buffer_seq = buffer_seq;
-    wmb();  // publish: entry fields visible before the tail advance
-    s_dump_header->queue_tails[thread_idx] = next_tail;
-
-    return 0;
+    return DumpEngine::enqueue_ready(dump_context(thread_idx), buffer_ptr, buffer_seq);
 }
 
 static DumpMetaBuffer *try_pop_dump_meta_buffer(int thread_idx, DumpBufferState *state, uint32_t next_seq) {
     if (thread_idx < 0 || thread_idx >= PLATFORM_MAX_AICPU_THREADS || state == nullptr) {
         return nullptr;
     }
-    uint32_t head = 0;
-    uint32_t tail = 0;
-    if (!wait_for_free_queue_entry(&state->free_queue, &head, &tail)) {
-        return nullptr;
-    }
-
-    uint64_t new_ptr = state->free_queue.buffer_ptrs[head % PLATFORM_DUMP_SLOT_COUNT];
-    state->free_queue.head = head + 1;
-    if (new_ptr == 0) {
-        return nullptr;
-    }
-
-    DumpMetaBuffer *new_buf = reinterpret_cast<DumpMetaBuffer *>(new_ptr);
-    new_buf->count = 0;
-    s_current_dump_buf[thread_idx] = new_buf;
-    state->current_buf_ptr = new_ptr;
-    state->current_buf_seq = next_seq;
-    wmb();
-    return new_buf;
+    return DumpEngine::pop_free(dump_context(thread_idx), state, next_seq);
 }
 
 /**
@@ -447,42 +439,7 @@ static int switch_dump_meta_buffer(int thread_idx) {
     if (state == nullptr || cur == nullptr) {
         return -1;
     }
-
-    uint64_t buf_addr = reinterpret_cast<uint64_t>(cur);
-    uint32_t seq = state->current_buf_seq;
-    int rc = enqueue_dump_ready_buffer(thread_idx, buf_addr, seq);
-    if (rc != 0) {
-        account_dropped_records(state, cur->count);
-        cur->count = 0;
-        wmb();
-        if (!s_logged_ready_queue_full[thread_idx]) {
-            s_logged_ready_queue_full[thread_idx] = true;
-            LOG_WARN(
-                "Args dump ready queue full on thread %d after bounded wait, "
-                "dropping current metadata buffer. Increase PLATFORM_DUMP_READYQUEUE_SIZE.",
-                thread_idx
-            );
-        }
-        return 0;
-    }
-
-    uint32_t next_seq = seq + 1;
-    s_current_dump_buf[thread_idx] = nullptr;
-    state->current_buf_ptr = 0;
-    state->current_buf_seq = next_seq;
-    wmb();
-
-    if (try_pop_dump_meta_buffer(thread_idx, state, next_seq) == nullptr && !s_logged_no_free_meta_buffer[thread_idx]) {
-        s_logged_no_free_meta_buffer[thread_idx] = true;
-        LOG_WARN(
-            "Args dump published a full metadata buffer on thread %d but no replacement was available; "
-            "records will drop until recovery. Increase PLATFORM_DUMP_BUFFERS_PER_THREAD.",
-            thread_idx
-        );
-    }
-
-    s_buffers_switched[thread_idx]++;
-
+    DumpEngine::switch_buffer(dump_context(thread_idx), state);
     return 0;
 }
 
