@@ -140,6 +140,8 @@
  * -------------------------
  *
  *   void on_buffer_collected(const ReadyBufferInfo& info);
+ *   // Optional shard-aware overload:
+ *   void on_buffer_collected(const ReadyBufferInfo& info, int collector_shard);
  *       Copy records out of `info.host_buffer_ptr` and update any
  *       per-collector state. The base class then calls
  *       `manager_.notify_copy_done(...)` so the buffer is recycled —
@@ -184,6 +186,19 @@ struct ProfilerModuleDrainThreadCount {
 template <typename Module>
 struct ProfilerModuleDrainThreadCount<Module, std::void_t<decltype(Module::kMgmtDrainThreadCount)>> {
     static constexpr int value = Module::kMgmtDrainThreadCount;
+};
+
+template <typename Derived, typename ReadyBufferInfo, typename = void>
+struct ProfilerDerivedShardAwareCollector {
+    static constexpr bool value = false;
+};
+
+template <typename Derived, typename ReadyBufferInfo>
+struct ProfilerDerivedShardAwareCollector<
+    Derived, ReadyBufferInfo,
+    std::void_t<decltype(std::declval<Derived *>()
+                             ->on_buffer_collected(std::declval<const ReadyBufferInfo &>(), std::declval<int>()))>> {
+    static constexpr bool value = true;
 };
 
 // Common subsystem callback signatures. All four collectors (PMU / TensorDump
@@ -977,7 +992,11 @@ private:
     }
 
     void consume(const ReadyBufferInfo &info, int shard_index) {
-        static_cast<Derived *>(this)->on_buffer_collected(info);
+        if constexpr (ProfilerDerivedShardAwareCollector<Derived, ReadyBufferInfo>::value) {
+            static_cast<Derived *>(this)->on_buffer_collected(info, shard_index);
+        } else {
+            static_cast<Derived *>(this)->on_buffer_collected(info);
+        }
         if constexpr (Module::kBufferKinds > 1) {
             manager_.notify_copy_done(info.dev_buffer_ptr, Module::kind_of(info), shard_index);
         } else {
