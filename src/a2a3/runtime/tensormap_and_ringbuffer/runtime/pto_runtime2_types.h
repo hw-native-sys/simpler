@@ -270,6 +270,11 @@ struct PTO2TaskPayload {
     std::atomic<uint8_t> dispatch_propagated{0};  // PRODUCER side: once-guard for fanout propagation
     std::atomic<uint8_t> spec_chain_active{0};    // inherited early-dispatch flag (auto-chain past codegen flag)
     uint8_t spec_chain_depth{0};                  // auto-chain depth; inherited = parent+1, capped
+    // Split-placement doorbell gate: counts subtasks that reached a running slot
+    // and are gated-spinning (running-direct placements count at stage; pending at
+    // promote). Doorbell rings only when this reaches total_required_subtasks AND
+    // the task is fully staged, so all subtasks activate simultaneously.
+    std::atomic<int16_t> promoted_subtasks{0};
     // === Cache lines 9-72 (4096B) — tensors (alignas(64) forces alignment) ===
     Tensor tensors[MAX_TENSOR_ARGS];
     // === Cache lines 73-74 (128B) — scalars ===
@@ -354,6 +359,7 @@ struct PTO2TaskPayload {
         dispatch_propagated.store(0, std::memory_order_relaxed);
         spec_chain_active.store(0, std::memory_order_relaxed);
         spec_chain_depth = 0;
+        promoted_subtasks.store(0, std::memory_order_relaxed);
     }
 };
 

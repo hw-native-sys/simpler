@@ -211,8 +211,8 @@ SchedulerContext::PublishHandle SchedulerContext::prepare_subtask_to_core(
 }
 
 int SchedulerContext::prepare_block_for_dispatch(
-    int32_t thread_idx, int32_t core_offset, PTO2TaskSlotState &slot_state, PTO2ResourceShape shape, bool to_pending,
-    int32_t block_idx, PublishHandle *out_handles
+    int32_t thread_idx, int32_t core_offset, PTO2TaskSlotState &slot_state, PTO2ResourceShape shape,
+    uint8_t pending_mask, int32_t block_idx, PublishHandle *out_handles
 ) {
 #if PTO2_PROFILING
     if (is_dump_args_enabled()) {
@@ -229,24 +229,25 @@ int SchedulerContext::prepare_block_for_dispatch(
 #endif
     CoreTracker &tracker = core_trackers_[thread_idx];
     if (shape == PTO2ResourceShape::MIX) {
+        // pending_mask: per-subtask PENDING decision (set = pending slot, clear = running).
         uint8_t cmask = slot_state.active_mask.core_mask();
         int n = 0;
         if (cmask & PTO2_SUBTASK_MASK_AIC) {
             out_handles[n++] = prepare_subtask_to_core(
-                thread_idx, tracker.get_aic_core_offset(core_offset), slot_state, PTO2SubtaskSlot::AIC, to_pending,
-                block_idx
+                thread_idx, tracker.get_aic_core_offset(core_offset), slot_state, PTO2SubtaskSlot::AIC,
+                (pending_mask & PTO2_SUBTASK_MASK_AIC) != 0, block_idx
             );
         }
         if (cmask & PTO2_SUBTASK_MASK_AIV0) {
             out_handles[n++] = prepare_subtask_to_core(
-                thread_idx, tracker.get_aiv0_core_offset(core_offset), slot_state, PTO2SubtaskSlot::AIV0, to_pending,
-                block_idx
+                thread_idx, tracker.get_aiv0_core_offset(core_offset), slot_state, PTO2SubtaskSlot::AIV0,
+                (pending_mask & PTO2_SUBTASK_MASK_AIV0) != 0, block_idx
             );
         }
         if (cmask & PTO2_SUBTASK_MASK_AIV1) {
             out_handles[n++] = prepare_subtask_to_core(
-                thread_idx, tracker.get_aiv1_core_offset(core_offset), slot_state, PTO2SubtaskSlot::AIV1, to_pending,
-                block_idx
+                thread_idx, tracker.get_aiv1_core_offset(core_offset), slot_state, PTO2SubtaskSlot::AIV1,
+                (pending_mask & PTO2_SUBTASK_MASK_AIV1) != 0, block_idx
             );
         }
 #if PTO2_PROFILING
@@ -254,15 +255,19 @@ int SchedulerContext::prepare_block_for_dispatch(
 #endif
         return n;
     } else if (shape == PTO2ResourceShape::AIC) {
-        out_handles[0] =
-            prepare_subtask_to_core(thread_idx, core_offset, slot_state, PTO2SubtaskSlot::AIC, to_pending, block_idx);
+        out_handles[0] = prepare_subtask_to_core(
+            thread_idx, core_offset, slot_state, PTO2SubtaskSlot::AIC, (pending_mask & PTO2_SUBTASK_MASK_AIC) != 0,
+            block_idx
+        );
 #if PTO2_PROFILING
         sched_l2_swimlane_[thread_idx].phase_dispatch_count += 1;
 #endif
         return 1;
     } else {
-        out_handles[0] =
-            prepare_subtask_to_core(thread_idx, core_offset, slot_state, PTO2SubtaskSlot::AIV0, to_pending, block_idx);
+        out_handles[0] = prepare_subtask_to_core(
+            thread_idx, core_offset, slot_state, PTO2SubtaskSlot::AIV0, (pending_mask & PTO2_SUBTASK_MASK_AIV0) != 0,
+            block_idx
+        );
 #if PTO2_PROFILING
         sched_l2_swimlane_[thread_idx].phase_dispatch_count += 1;
 #endif
@@ -366,7 +371,7 @@ void SchedulerContext::dispatch_shape(
                 auto wanted = is_pending ? CoreTracker::MixPlacement::PENDING : CoreTracker::MixPlacement::RUNNING;
                 while (candidates.has_value()) {
                     int32_t cluster_offset = candidates.pop_first();
-                    if (tracker.classify_mix_cluster(cluster_offset, cmask) == wanted) {
+                    if (tracker.classify_mix_cluster(cluster_offset, cmask).mode == wanted) {
                         selected_mix_clusters |= CoreTracker::BitStates(1ULL << cluster_offset);
                     }
                 }
@@ -436,7 +441,8 @@ void SchedulerContext::dispatch_shape(
                     cores.clear_bit(core_offset);
                 }
                 handle_count += prepare_block_for_dispatch(
-                    thread_idx, core_offset, *slot_state, shape, is_pending, start + b, &handles[handle_count]
+                    thread_idx, core_offset, *slot_state, shape, is_pending ? 0xFF : 0, start + b,
+                    &handles[handle_count]
                 );
             }
 
@@ -558,50 +564,61 @@ void SchedulerContext::dispatch_ready_tasks(
 // then read mask" (release) guarantees every gated core's doorbell fires.
 int32_t SchedulerContext::stage_consumer_blocks(
     int32_t thread_idx, PTO2TaskSlotState *c, PTO2ResourceShape shape, int32_t start, int32_t count,
-    CoreTracker::BitStates &idle, CoreTracker::BitStates &pend
+    CoreTracker::BitStates &idle, CoreTracker::BitStates &pend, CoreTracker::BitStates &split,
+    CoreTracker::BitStates blocked_pending
 ) {
     CoreTracker &tracker = core_trackers_[thread_idx];
-    // Stamp the real pre-stage time (NOT 0) so the swimlane shows these blocks
-    // dispatched during the producer's run, not at trace start.
     uint64_t early_dispatch_ts = get_sys_cnt_aicpu();
-    uint64_t my_cores[PTO2_SPEC_CORE_MASK_WORDS] = {0};  // cores this thread gated (for self-ring)
+    uint64_t my_cores[PTO2_SPEC_CORE_MASK_WORDS] = {0};
     int32_t staged = 0;
     int32_t block = start;
-    auto stage_from = [&](CoreTracker::BitStates &avail, bool to_pending) {
-        // Mirror the normal flush_publish (scheduler_dispatch.cpp wmb()+publish loop):
-        // prepare all claimed blocks' payloads, one wmb(), then publish. The wmb
-        // guarantees the not_ready gate + args are globally visible before any
-        // DATA_MAIN_BASE token — without it a gated core can pick up the token and
-        // dcci a stale payload (the doorbell/release path mirrors normal dispatch).
-        PublishHandle handles[CoreTracker::MAX_CLUSTERS * 3];
-        int n = 0;
-        while (count > 0 && avail.has_value()) {
-            int32_t core_offset = avail.pop_first();
-            n += prepare_block_for_dispatch(thread_idx, core_offset, *c, shape, to_pending, block, &handles[n]);
-            block++;
-            count--;
-            staged++;
-        }
-        if (n == 0) return;
-        wmb();
-        for (int i = 0; i < n; i++) {
-            publish_subtask_to_core(handles[i], early_dispatch_ts);
-            int32_t cid = tracker.get_core_id_by_offset(handles[i].core_offset);
-            sched_->spec_doorbell_table[cid].addr = handles[i].reg_addr;
-            sched_->spec_doorbell_table[cid].token = handles[i].reg_task_id;
-            my_cores[cid >> 6] |= (1ULL << (cid & 63));
-        }
-    };
-    if (idle.has_value()) stage_from(idle, /*to_pending=*/false);
-    if (pend.has_value()) stage_from(pend, /*to_pending=*/true);
-    // Publish all this thread's gated cores into the shared mask in one OR per word
-    // (vs one per subtask) so release sees them; seq_cst keeps the self-ring order.
+    uint8_t cmask = c->active_mask.core_mask();
+    int32_t subtasks_per_block = __builtin_popcount(cmask);
+    int32_t running_direct = 0;  // running-slot subtasks staged (count toward the gate now)
+    PublishHandle handles[CoreTracker::MAX_CLUSTERS * 3];
+    int n = 0;
+    // Idle clusters (whole-cluster running placement).
+    while (count > 0 && idle.has_value()) {
+        int32_t core_offset = idle.pop_first();
+        n += prepare_block_for_dispatch(thread_idx, core_offset, *c, shape, /*pending_mask=*/0, block, &handles[n]);
+        block++; count--; staged++;
+        running_direct += subtasks_per_block;
+    }
+    // Pending clusters (whole-cluster pending placement).
+    while (count > 0 && pend.has_value()) {
+        int32_t core_offset = pend.pop_first();
+        n += prepare_block_for_dispatch(thread_idx, core_offset, *c, shape, /*pending_mask=*/0xFF, block, &handles[n]);
+        block++; count--; staged++;
+    }
+    // Split clusters (per-subtask placement: idle cores → running, busy → pending).
+    // Re-classify under the deadlock guard; skip if no longer SPLIT (state raced).
+    while (count > 0 && split.has_value()) {
+        int32_t cluster_offset = split.pop_first();
+        CoreTracker::MixPlacementPlan plan = tracker.classify_mix_cluster(cluster_offset, cmask, blocked_pending);
+        if (plan.mode != CoreTracker::MixPlacement::SPLIT) continue;
+        n += prepare_block_for_dispatch(thread_idx, cluster_offset, *c, shape, plan.pending_mask, block, &handles[n]);
+        running_direct += __builtin_popcount(cmask & static_cast<uint8_t>(~plan.pending_mask));
+        block++; count--; staged++;
+    }
+    if (n == 0) return 0;
+    wmb();
+    for (int i = 0; i < n; i++) {
+        publish_subtask_to_core(handles[i], early_dispatch_ts);
+        int32_t cid = tracker.get_core_id_by_offset(handles[i].core_offset);
+        sched_->spec_doorbell_table[cid].addr = handles[i].reg_addr;
+        sched_->spec_doorbell_table[cid].token = handles[i].reg_task_id;
+        my_cores[cid >> 6] |= (1ULL << (cid & 63));
+    }
     for (int w = 0; w < PTO2_SPEC_CORE_MASK_WORDS; w++)
-        if (my_cores[w] != 0) c->payload->staged_core_mask[w].fetch_or(my_cores[w], std::memory_order_seq_cst);
-
-    // If release already flipped DISPATCHED, it may have read the mask before our
-    // bits landed — ring our own cores so none is left gated forever.
-    if (staged > 0 && c->payload->spec_state.load(std::memory_order_seq_cst) == PTO2_SPEC_DISPATCHED) {
+        if (my_cores[w] != 0) c->payload->staged_core_mask[w].fetch_or(my_cores[w], std::memory_order_release);
+    // Running-direct subtasks are now in their running slots, gated-spinning — count
+    // them toward the doorbell gate; pending subtasks count at their promote (Case 3.3).
+    if (running_direct > 0)
+        c->payload->promoted_subtasks.fetch_add(running_direct, std::memory_order_acq_rel);
+    // Try the gate (rings if fully staged + fanin done + all promoted). If a peer
+    // already flipped DISPATCHED before our mask OR landed, self-ring our cores.
+    if (!sched_->maybe_ring_split_doorbell(*c) &&
+        c->payload->spec_state.load(std::memory_order_acquire) == PTO2_SPEC_DISPATCHED) {
         for (int w = 0; w < PTO2_SPEC_CORE_MASK_WORDS; w++) {
             uint64_t bits = my_cores[w];
             while (bits != 0) {
@@ -641,7 +658,25 @@ int32_t SchedulerContext::try_speculative_early_dispatch(int32_t thread_idx) {
         PTO2ResourceShape shape = c->active_mask.to_shape();
         auto idle = tracker.get_idle_core_offset_states(shape);
         auto pend = tracker.get_pending_core_offset_states(shape);
-        int32_t freecores = (idle.has_value() ? idle.count() : 0) + (pend.has_value() ? pend.count() : 0);
+        // Split clusters (mixed running+pending within one MIX block) — the fix for
+        // stranded AIV cores. Source with the deadlock guard: a core whose running
+        // task is gated (STAGING) is not pending-eligible.
+        CoreTracker::BitStates split(0ULL);
+        CoreTracker::BitStates blocked_pending(0ULL);
+        if (shape == PTO2ResourceShape::MIX) {
+            const int32_t *cids = tracker.core_ids();
+            int32_t nc = tracker.core_num();
+            for (int k = 0; k < nc; k++) {
+                CoreExecState &ce = core_exec_states_[cids[k]];
+                if (ce.running_slot_state != nullptr && ce.running_slot_state->payload != nullptr &&
+                    ce.running_slot_state->payload->spec_state.load(std::memory_order_acquire) == PTO2_SPEC_STAGING) {
+                    blocked_pending |= CoreTracker::BitStates(1ULL << k);
+                }
+            }
+            split = tracker.get_mix_split_cluster_offset_states(c->active_mask.core_mask(), blocked_pending);
+        }
+        int32_t freecores = (idle.has_value() ? idle.count() : 0) + (pend.has_value() ? pend.count() : 0) +
+                            (split.has_value() ? split.count() : 0);
         if (freecores == 0) {  // no free cores of this shape — give it back for peers and stop
             sched_->early_dispatch_queue.push(c);
             break;
@@ -670,7 +705,7 @@ int32_t SchedulerContext::try_speculative_early_dispatch(int32_t thread_idx) {
                     "[SPEC] queue full on re-push, consumer=%" PRId64, static_cast<int64_t>(c->task->task_id.raw)
                 );
         }
-        total_staged += stage_consumer_blocks(thread_idx, c, shape, start, claim, idle, pend);
+        total_staged += stage_consumer_blocks(thread_idx, c, shape, start, claim, idle, pend, split, blocked_pending);
     }
     return total_staged;
 }

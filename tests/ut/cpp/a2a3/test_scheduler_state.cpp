@@ -294,7 +294,7 @@ TEST(CoreTrackerTest, MixClassifyIgnoresUnusedBusyCoreForRunningPlacement) {
     tracker.change_core_state(cluster_offset + 2);  // AIV1 running, unused by this 1c1v task
 
     auto placement = tracker.classify_mix_cluster(cluster_offset, PTO2_SUBTASK_MASK_AIC | PTO2_SUBTASK_MASK_AIV0);
-    EXPECT_EQ(placement, CoreTracker::MixPlacement::RUNNING);
+    EXPECT_EQ(placement.mode, CoreTracker::MixPlacement::RUNNING);
 }
 
 TEST(CoreTrackerTest, MixClassifyAllowsPendingForUsedRunningCoresOnly) {
@@ -308,10 +308,10 @@ TEST(CoreTrackerTest, MixClassifyAllowsPendingForUsedRunningCoresOnly) {
     tracker.set_pending_occupied(cluster_offset + 2);  // Unused AIV1 must not block this 1c1v task
 
     auto placement = tracker.classify_mix_cluster(cluster_offset, PTO2_SUBTASK_MASK_AIC | PTO2_SUBTASK_MASK_AIV0);
-    EXPECT_EQ(placement, CoreTracker::MixPlacement::PENDING);
+    EXPECT_EQ(placement.mode, CoreTracker::MixPlacement::PENDING);
 }
 
-TEST(CoreTrackerTest, MixClassifyRejectsMixedUsedCores) {
+TEST(CoreTrackerTest, MixClassifyReturnsSplitForMixedUsedCores) {
     CoreTracker tracker;
     tracker.init(1);
     tracker.set_cluster(0, 0, 1, 2);
@@ -320,7 +320,8 @@ TEST(CoreTrackerTest, MixClassifyRejectsMixedUsedCores) {
     tracker.change_core_state(cluster_offset + 1);  // AIV0 running while AIC is idle
 
     auto placement = tracker.classify_mix_cluster(cluster_offset, PTO2_SUBTASK_MASK_AIC | PTO2_SUBTASK_MASK_AIV0);
-    EXPECT_EQ(placement, CoreTracker::MixPlacement::REJECT);
+    EXPECT_EQ(placement.mode, CoreTracker::MixPlacement::SPLIT);
+    EXPECT_EQ(placement.pending_mask, PTO2_SUBTASK_MASK_AIV0);  // AIV0 → pending, AIC → running
 }
 
 TEST(CoreTrackerTest, MixClassifyRejectsOccupiedPendingSlotInUsedMask) {
@@ -334,7 +335,7 @@ TEST(CoreTrackerTest, MixClassifyRejectsOccupiedPendingSlotInUsedMask) {
     tracker.set_pending_occupied(cluster_offset + 1);
 
     auto placement = tracker.classify_mix_cluster(cluster_offset, PTO2_SUBTASK_MASK_AIC | PTO2_SUBTASK_MASK_AIV0);
-    EXPECT_EQ(placement, CoreTracker::MixPlacement::REJECT);
+    EXPECT_EQ(placement.mode, CoreTracker::MixPlacement::REJECT);
 }
 
 TEST(CoreTrackerTest, MixRunningClusterHelpersUseActiveMask) {
@@ -359,6 +360,8 @@ TEST(CoreTrackerTest, MixRunningClusterHelpersRejectOccupiedUsedPendingSlot) {
     tracker.set_cluster(0, 0, 1, 2);
 
     constexpr uint8_t used_mask = PTO2_SUBTASK_MASK_AIC | PTO2_SUBTASK_MASK_AIV0;
+    // AIV0 busy AND its pending slot occupied → AIV0 has no free slot → cluster rejected.
+    tracker.change_core_state(1);
     tracker.set_pending_occupied(1);
 
     EXPECT_EQ(tracker.count_mix_running_clusters(used_mask), 0);

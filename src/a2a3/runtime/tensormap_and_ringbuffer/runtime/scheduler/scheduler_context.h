@@ -247,7 +247,7 @@ private:
     // caller-supplied handles buffer. Returns the number of handles written.
     int prepare_block_for_dispatch(
         int32_t thread_idx, int32_t core_offset, PTO2TaskSlotState &slot_state, PTO2ResourceShape shape,
-        bool to_pending, int32_t block_idx, PublishHandle *out_handles
+        uint8_t pending_mask, int32_t block_idx, PublishHandle *out_handles
     );
 
     void dispatch_shape(
@@ -269,7 +269,8 @@ private:
     // number of blocks staged.
     int32_t stage_consumer_blocks(
         int32_t thread_idx, PTO2TaskSlotState *c, PTO2ResourceShape shape, int32_t start, int32_t count,
-        CoreTracker::BitStates &idle, CoreTracker::BitStates &pend
+        CoreTracker::BitStates &idle, CoreTracker::BitStates &pend, CoreTracker::BitStates &split,
+        CoreTracker::BitStates blocked_pending
     );
 
     // One pass of "Phase 4" in the resolve_and_dispatch loop: IDLE-stage dispatch

@@ -400,6 +400,15 @@ void SchedulerContext::check_running_cores_for_completion(
         if (t.running_freed) {
             if (core.pending_slot_state != nullptr && !t.pending_done) {
                 promote_pending_to_running(core);  // Case 2 or Case 3 (with pending)
+                // Split-doorbell gate: a gated subtask reached its running slot.
+                // Count it and try the gate (rings when fully staged + fanin done +
+                // all promoted → simultaneous start).
+                PTO2TaskSlotState *promoted = core.running_slot_state;
+                if (promoted != nullptr && promoted->payload != nullptr &&
+                    promoted->payload->spec_state.load(std::memory_order_acquire) == PTO2_SPEC_STAGING) {
+                    promoted->payload->promoted_subtasks.fetch_add(1, std::memory_order_acq_rel);
+                    sched_->maybe_ring_split_doorbell(*promoted);
+                }
             } else {
                 clear_running_slot(core);  // Case 1 or Case 3 (no pending)
                 if (t.pending_done) {
@@ -498,7 +507,7 @@ void SchedulerContext::drain_worker_dispatch(int32_t block_num) {
         for (int32_t b = 0; b < claim; b++) {
             auto core_offset = valid.pop_first();
             handle_count += prepare_block_for_dispatch(
-                t, core_offset, *slot_state, shape, false, start + b, &handles[handle_count]
+                t, core_offset, *slot_state, shape, /*pending_mask=*/0, start + b, &handles[handle_count]
             );
         }
         wmb();

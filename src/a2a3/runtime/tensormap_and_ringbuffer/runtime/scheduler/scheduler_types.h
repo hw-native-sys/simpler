@@ -303,34 +303,63 @@ public:
     // Pending dispatch: returns bit offsets of cores eligible for pending-slot dispatch.
     // AIC: 1 bit per cluster (aic_mask_ positions). AIV: 1 bit per AIV core (aiv_mask_ positions).
     // Runtime MIX dispatch uses classify_mix_cluster() so the decision follows the task's active_mask.
-    enum class MixPlacement : uint8_t { RUNNING, PENDING, REJECT };
+    enum class MixPlacement : uint8_t { RUNNING, PENDING, SPLIT, REJECT };
 
-    // A MIX block must place all cores named by active_mask the same way:
-    // all idle means running placement, all running means pending placement,
-    // and any mixed state is retried later.
-    MixPlacement classify_mix_cluster(int32_t cluster_offset, uint8_t core_mask) const {
-        BitStates used(0ULL);
-        if (core_mask & PTO2_SUBTASK_MASK_AIC) {
-            used |= BitStates(1ULL << cluster_offset);
-        }
-        if (core_mask & PTO2_SUBTASK_MASK_AIV0) {
-            used |= BitStates(1ULL << (cluster_offset + 1));
-        }
-        if (core_mask & PTO2_SUBTASK_MASK_AIV1) {
-            used |= BitStates(1ULL << (cluster_offset + 2));
-        }
-        if (!used.has_value() || (pending_occupied_ & used).has_value()) {
-            return MixPlacement::REJECT;
-        }
+    // Per-subtask placement plan for one cluster. pending_mask carries the
+    // PTO2_SUBTASK_MASK_* bits of subtasks that go to a PENDING slot (core busy +
+    // pending-free); clear bits go RUNNING (core idle). 0 for RUNNING, = core_mask
+    // for PENDING.
+    struct MixPlacementPlan {
+        MixPlacement mode{MixPlacement::REJECT};
+        uint8_t pending_mask{0};
+    };
 
-        BitStates idle = core_states_ & used;
-        if (idle.count() == used.count()) {
-            return MixPlacement::RUNNING;
+    // A MIX block may place each active subtask on whatever slot is free: a RUNNING
+    // slot if the core is idle, or a PENDING slot if the core is busy with a free
+    // pending slot. SPLIT (mixed running+pending within one block) is accepted — the
+    // in-kernel simultaneity contract (FFTS syncall + cross-core pipe) is upheld by
+    // gating the whole task behind the speculative doorbell until every subtask has
+    // promoted to a running slot, so all subtasks activate at the same instant at
+    // doorbell-ring. REJECT only when some active subtask has neither slot.
+    // blocked_pending: cores whose running task is gated (STAGING) — NOT pending-
+    // eligible (staging a pending subtask behind a gated running task deadlocks).
+    MixPlacementPlan classify_mix_cluster(
+        int32_t cluster_offset, uint8_t core_mask, BitStates blocked_pending = BitStates(0ULL)
+    ) const {
+        MixPlacementPlan plan;
+        int active = 0, running_cnt = 0, pending_cnt = 0;
+        uint8_t pend_mask = 0;
+        auto check = [&](int sub_idx, uint8_t smask) {
+            if (!(core_mask & smask)) return;
+            active++;
+            BitStates core_bit(1ULL << (cluster_offset + sub_idx));
+            bool idle = (core_states_ & core_bit).has_value();
+            bool pend_free = !(pending_occupied_ & core_bit).has_value() &&
+                             !(blocked_pending & core_bit).has_value();
+            if (idle) {
+                running_cnt++;
+            } else if (pend_free) {
+                pending_cnt++;
+                pend_mask |= smask;
+            }
+        };
+        check(0, PTO2_SUBTASK_MASK_AIC);
+        check(1, PTO2_SUBTASK_MASK_AIV0);
+        check(2, PTO2_SUBTASK_MASK_AIV1);
+
+        if (active == 0 || running_cnt + pending_cnt < active) {
+            plan.mode = MixPlacement::REJECT;
+            return plan;
         }
-        if (!idle.has_value()) {
-            return MixPlacement::PENDING;
+        plan.pending_mask = pend_mask;
+        if (pending_cnt == 0) {
+            plan.mode = MixPlacement::RUNNING;
+        } else if (running_cnt == 0) {
+            plan.mode = MixPlacement::PENDING;
+        } else {
+            plan.mode = MixPlacement::SPLIT;
         }
-        return MixPlacement::REJECT;
+        return plan;
     }
 
     BitStates get_mix_running_cluster_offset_states(uint8_t core_mask) const {
@@ -338,7 +367,25 @@ public:
         BitStates candidates = get_cluster_offset_states();
         while (candidates.has_value()) {
             int32_t cluster_offset = candidates.pop_first();
-            if (classify_mix_cluster(cluster_offset, core_mask) == MixPlacement::RUNNING) {
+            if (classify_mix_cluster(cluster_offset, core_mask).mode == MixPlacement::RUNNING) {
+                result |= BitStates(1ULL << cluster_offset);
+            }
+        }
+        return result;
+    }
+
+    // Clusters classified as SPLIT (mixed running+pending) — usable by split
+    // placement but excluded from the all-RUNNING drain / sync_start path.
+    // blocked_pending: gated-running cores are not pending-eligible (deadlock guard).
+    BitStates get_mix_split_cluster_offset_states(
+        uint8_t core_mask, BitStates blocked_pending = BitStates(0ULL)
+    ) const {
+        BitStates result(0ULL);
+        BitStates candidates = get_cluster_offset_states();
+        while (candidates.has_value()) {
+            int32_t cluster_offset = candidates.pop_first();
+            if (classify_mix_cluster(cluster_offset, core_mask, blocked_pending).mode ==
+                MixPlacement::SPLIT) {
                 result |= BitStates(1ULL << cluster_offset);
             }
         }
