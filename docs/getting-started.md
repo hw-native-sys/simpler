@@ -19,8 +19,12 @@ file.
 The test framework automatically handles PTO-ISA setup:
 
 1. Reads the required commit from `pto_isa.pin`.
-2. Clones pto-isa over HTTPS to `build/pto-isa` on first use if needed.
-3. Checks out and resets `build/pto-isa` to the pinned commit.
+2. Reuses `build/pto-isa` as-is when it already sits at exactly the pinned
+   commit.
+3. Otherwise (missing, wrong revision, or a dirty working tree) re-clones
+   `build/pto-isa` fresh over HTTPS directly at the pinned commit, rather than
+   `git checkout`-ing over the existing checkout — a checkout aborts on local
+   modifications and would strand the clone at the wrong revision.
 4. Passes that managed checkout to the kernel/runtime compilers.
 
 **Automatic Setup (Recommended):**
@@ -39,9 +43,10 @@ mkdir -p build
 git clone --branch main https://github.com/hw-native-sys/pto-isa.git build/pto-isa
 ```
 
-Manual setup still uses the standard managed location. `simpler` will fetch,
-checkout, and reset that repository to the commit in `pto_isa.pin` before it
-builds runtimes or compiles kernels.
+Manual setup still uses the standard managed location. Before it builds
+runtimes or compiles kernels, `simpler` verifies that checkout is at the commit
+in `pto_isa.pin`; if it isn't (or the working tree is dirty), it re-clones the
+repository fresh at the pinned commit.
 
 **Revision selection and compatibility checks:**
 
