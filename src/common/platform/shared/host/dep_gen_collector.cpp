@@ -19,16 +19,17 @@
  *        consumed directly by the host replay — no on-disk submit_trace.bin
  *        intermediary.
  *
- * a5 specifics: device↔host transfers go through profiling_copy.h. Each
- * DepGenBuffer's contents are pulled from device on demand inside
- * ProfilerAlgorithms::process_entry, so on_buffer_collected can read
- * `count` and `records[]` directly off the host shadow.
+ * Non-SVM platforms route device↔host transfers through profiling_copy.h.
+ * Each DepGenBuffer's contents are pulled from device on demand inside
+ * ProfilerAlgorithms::process_entry, so on_buffer_collected can read `count`
+ * and `records[]` directly off the host shadow.
  */
 
 #include "host/dep_gen_collector.h"
 
 #include <cassert>
 #include <cstring>
+#include <unordered_set>
 
 #include "common/memory_barrier.h"
 #include "common/unified_log.h"
@@ -61,7 +62,7 @@ int DepGenCollector::init(
     // consistent values during init. shm_host_ stays nullptr until the shm
     // allocation succeeds — start(tf) gates on shm_host_.
     set_memory_context(
-        alloc_cb, register_cb, free_cb, profiling_copy_to_device_for_ops, profiling_copy_from_device_for_ops,
+        alloc_cb, register_cb, free_cb, profiling_copy_to_device_or_null(), profiling_copy_from_device_or_null(),
         /*shm_dev=*/nullptr, /*shm_host=*/nullptr, /*shm_size=*/0, device_id
     );
 
@@ -100,12 +101,12 @@ int DepGenCollector::init(
 
         if (b < PLATFORM_DEP_GEN_SLOT_COUNT) {
             // First N buffers go directly into the (single) instance's free_queue.
-            // All writes hit the host shadow here; the whole shm region gets
-            // pushed to device once below — no wmb needed.
             uint32_t tail = state->free_queue.tail;
             assert(tail - state->free_queue.head < PLATFORM_DEP_GEN_SLOT_COUNT && "free_queue overflow on init");
             state->free_queue.buffer_ptrs[tail % PLATFORM_DEP_GEN_SLOT_COUNT] = reinterpret_cast<uint64_t>(dev_ptr);
+            wmb();
             state->free_queue.tail = tail + 1;
+            wmb();
         } else {
             manager_.push_recycled(0, dev_ptr);
         }
@@ -131,7 +132,7 @@ int DepGenCollector::init(
     shm_dev_ = shm_dev_local;
     shm_size_ = shm_size;
     set_memory_context(
-        alloc_cb, register_cb, free_cb, profiling_copy_to_device_for_ops, profiling_copy_from_device_for_ops,
+        alloc_cb, register_cb, free_cb, profiling_copy_to_device_or_null(), profiling_copy_from_device_or_null(),
         shm_dev_local, shm_host_local, shm_size, device_id
     );
     initialized_ = true;
@@ -176,6 +177,7 @@ bool DepGenCollector::reconcile_counters() {
     if (manager_.shared_mem_dev() != nullptr && shm_size_ > 0) {
         profiling_copy_from_device(shm_host_, manager_.shared_mem_dev(), shm_size_);
     }
+    rmb();
 
     bool clean = true;
 
@@ -185,6 +187,7 @@ bool DepGenCollector::reconcile_counters() {
         void *host_ptr = manager_.resolve_host_ptr(reinterpret_cast<void *>(buf_dev));
         if (host_ptr != nullptr) {
             profiling_copy_from_device(host_ptr, reinterpret_cast<void *>(buf_dev), sizeof(DepGenBuffer));
+            rmb();
             uint32_t count = reinterpret_cast<const DepGenBuffer *>(host_ptr)->count;
             if (count != 0) {
                 LOG_ERROR(
@@ -250,14 +253,23 @@ void DepGenCollector::finalize(DepGenUnregisterCallback unregister_cb, const Dep
     auto release_dev = [&](void *p) {
         release_one_buffer(p, unregister_cb, free_cb);
     };
+    std::unordered_set<void *> released_dev_ptrs;
+    auto release_dev_once = [&](void *p) {
+        if (p == nullptr || !released_dev_ptrs.insert(p).second) return;
+        release_dev(p);
+    };
 
     // Free buffers still parked in the free_queue / current_buf_ptr.
     // Release the device pointer only — the paired host shadow stays in
     // dev_to_host_ and is freed by clear_mappings() below.
     if (shm_host_ != nullptr) {
+        if (manager_.shared_mem_dev() != nullptr && shm_size_ > 0) {
+            profiling_copy_from_device(shm_host_, manager_.shared_mem_dev(), shm_size_);
+        }
+        rmb();
         DepGenBufferState *state = dep_gen_state(0);
 
-        release_dev(reinterpret_cast<void *>(state->current_buf_ptr));
+        release_dev_once(reinterpret_cast<void *>(state->current_buf_ptr));
         state->current_buf_ptr = 0;
 
         uint32_t head = state->free_queue.head;
@@ -266,7 +278,7 @@ void DepGenCollector::finalize(DepGenUnregisterCallback unregister_cb, const Dep
         if (queued > PLATFORM_DEP_GEN_SLOT_COUNT) queued = PLATFORM_DEP_GEN_SLOT_COUNT;
         for (uint32_t i = 0; i < queued; i++) {
             uint32_t slot = (head + i) % PLATFORM_DEP_GEN_SLOT_COUNT;
-            release_dev(reinterpret_cast<void *>(state->free_queue.buffer_ptrs[slot]));
+            release_dev_once(reinterpret_cast<void *>(state->free_queue.buffer_ptrs[slot]));
             state->free_queue.buffer_ptrs[slot] = 0;
         }
         state->free_queue.head = tail;
@@ -275,7 +287,7 @@ void DepGenCollector::finalize(DepGenUnregisterCallback unregister_cb, const Dep
     // Release framework-owned buffers (recycled pool, ready_queue,
     // done_queue). release_owned_buffers also frees their host shadows.
     manager_.release_owned_buffers([&](void *p) {
-        release_dev(p);
+        release_dev_once(p);
     });
 
     // Free shared header region (device only — shadow stays in

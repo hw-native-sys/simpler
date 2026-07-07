@@ -177,8 +177,8 @@ the required members are:
 
 The Module structs are defined alongside their collectors in
 [pmu_collector.h](../src/a2a3/platform/include/host/pmu_collector.h),
-[l2_swimlane_collector.h](../src/a2a3/platform/include/host/l2_swimlane_collector.h),
-[dep_gen_collector.h](../src/a2a3/platform/include/host/dep_gen_collector.h),
+[l2_swimlane_collector.h](../src/common/platform/include/host/l2_swimlane_collector.h),
+[dep_gen_collector.h](../src/common/platform/include/host/dep_gen_collector.h),
 [tensor_dump_collector.h](../src/common/platform/include/host/tensor_dump_collector.h),
 and
 [scope_stats_collector.h](../src/common/platform/include/host/scope_stats_collector.h)
@@ -336,13 +336,13 @@ Existing collectors are the canonical examples:
 
 - [`PmuCollector`](../src/a2a3/platform/include/host/pmu_collector.h)
   — single kind, per-core instances. See [pmu-profiling.md](dfx/pmu-profiling.md).
-- [`DepGenCollector`](../src/a2a3/platform/include/host/dep_gen_collector.h)
+- [`DepGenCollector`](../src/common/platform/include/host/dep_gen_collector.h)
   — single kind, one instance. See [dep_gen.md](dfx/dep_gen.md).
 - [`TensorDumpCollector`](../src/common/platform/include/host/tensor_dump_collector.h)
   — single kind, per-AICPU-thread instances. See [args-dump.md](dfx/args-dump.md).
 - [`ScopeStatsCollector`](../src/common/platform/include/host/scope_stats_collector.h)
   — single kind, one instance. See [scope-stats.md](dfx/scope-stats.md).
-- [`L2SwimlaneCollector`](../src/a2a3/platform/include/host/l2_swimlane_collector.h)
+- [`L2SwimlaneCollector`](../src/common/platform/include/host/l2_swimlane_collector.h)
   — four kinds (AICPU task, scheduler phase, orchestrator phase, AICore
   task), per-core / per-thread instances; the canonical multi-kind example. See
   [l2-swimlane-profiling.md](dfx/l2-swimlane-profiling.md).
