@@ -51,6 +51,8 @@
 #include "common/strace.h"
 #include "common/unified_log.h"
 #include "host/platform_compile_info.h"
+#include "host/raii_scope_guard.h"
+#include "common/host_api.h"
 #include "utils/device_arena.h"
 #include "prepare_callable_common.h"
 
@@ -267,6 +269,103 @@ static int32_t pto2_read_runtime_status(Runtime *runtime, const HostApi *api, PT
     return runtime_status_from_error_codes(orch_error_code, sched_error_code);
 }
 
+static void release_tensor_leases(Runtime *runtime, const HostApi *api) {
+    int freed = 0;
+    int buffer_noop = 0;
+    int external_noop = 0;
+    for (TensorLease &lease : runtime->tensor_leases_) {
+        if (lease.dev_ptr == nullptr) {
+            continue;
+        }
+        switch (lease.release_kind) {
+        case TensorReleaseKind::Free:
+            api->device_free(lease.dev_ptr);
+            ++freed;
+            break;
+        case TensorReleaseKind::BufferNoop:
+            ++buffer_noop;
+            break;
+        case TensorReleaseKind::ExternalNoop:
+            ++external_noop;
+            break;
+        }
+    }
+    LOG_DEBUG("Released tensor leases: freed=%d buffer_noop=%d external_noop=%d", freed, buffer_noop, external_noop);
+    runtime->tensor_leases_.clear();
+}
+
+// per-run bump allocator over the runner's retained temporary buffer. This is
+// the whole temporary-buffer mechanism: the platform only remembers a
+// {addr, size} slot across runs (HostApi get/set_retained_temp_buffer); the
+// grow/pack/slice logic lives here. TRB kernels require 1024-byte-aligned
+// device pointers, which device_malloc already guarantees for the OFF path, so
+// the retained base is 1024-aligned and slices taken at 1024-aligned offsets
+// stay aligned without any base fix-up.
+class RetainedTempBump {
+public:
+    static constexpr size_t kAlignment = 1024;
+
+    static size_t align_up(size_t v) { return (v + (kAlignment - 1)) & ~(kAlignment - 1); }
+
+    // Pack the run's non-child, non-empty tensors to compute the required
+    // aligned size, then grow the retained slot if it is too small (free old +
+    // malloc new + write back). Returns false only if the (grow) device_malloc
+    // fails. A run needing 0 bytes leaves the slot untouched.
+    bool begin(const HostApi *api, const ChipStorageTaskArgs *orch_args) {
+        api_ = api;
+        offset_ = 0;
+        size_t required = 0;
+        for (int i = 0; i < orch_args->tensor_count(); i++) {
+            Tensor t = orch_args->tensor(i);
+            if (t.is_child_memory() || t.nbytes() == 0) {
+                continue;
+            }
+            required += align_up(static_cast<size_t>(t.nbytes()));
+        }
+        void *addr = nullptr;
+        size_t size = 0;
+        api->get_retained_temp_buffer(&addr, &size);
+        if (required > size) {
+            if (addr != nullptr) {
+                api->device_free(addr);
+            }
+            addr = required != 0 ? api->device_malloc(required) : nullptr;
+            if (required != 0 && addr == nullptr) {
+                api->set_retained_temp_buffer(nullptr, 0);
+                base_ = nullptr;
+                capacity_ = 0;
+                LOG_ERROR("Retained temp buffer grow failed: required bytes %zu", required);
+                return false;
+            }
+            api->set_retained_temp_buffer(addr, required);
+            size = required;
+        }
+        base_ = addr;
+        capacity_ = size;
+        return true;
+    }
+
+    // Slice `bytes` from the retained buffer at the next 1024-aligned offset.
+    // Must fit because begin() sized the buffer from the same tensors; a miss
+    // is a caller bug (plan/slice mismatch), reported as nullptr.
+    void *acquire(size_t bytes) {
+        size_t aligned = align_up(offset_);
+        if (base_ == nullptr || aligned + bytes > capacity_) {
+            LOG_ERROR("Retained temp buffer slice miss: bytes=%zu offset=%zu capacity=%zu", bytes, aligned, capacity_);
+            return nullptr;
+        }
+        void *ptr = static_cast<char *>(base_) + aligned;
+        offset_ = aligned + bytes;
+        return ptr;
+    }
+
+private:
+    const HostApi *api_ = nullptr;
+    void *base_ = nullptr;
+    size_t capacity_ = 0;
+    size_t offset_ = 0;
+};
+
 /**
  * Stage the per-callable resources (kernel binaries + orchestration SO) into
  * the supplied runtime so a subsequent bind_callable_to_runtime_impl can use
@@ -334,7 +433,7 @@ struct ArenaStaticSizes {
 };
 
 // Device pointers to the per-Worker static pools that DeviceRunner keeps alive
-// across runs (freed in DeviceRunner::finalize(), never in tensor_pairs_).
+// across runs (freed in DeviceRunner::finalize(), never in tensor_leases_).
 struct StaticArenaPtrs {
     void *gm_heap;
     void *gm_sm;
@@ -415,12 +514,14 @@ static bool derive_arena_static_sizes(const ArenaSizingConfig &sizing, ArenaStat
 // per-run: the only signature-aware step. Copy the orch args, replacing each
 // host tensor pointer with a freshly staged device pointer (H2D copy-in, or an
 // on-device zero for pure-OUTPUT buffers), and record the host/device pair for
-// copy-back. Read-only INPUT tensors skip copy-back. On failure the partially
-// staged device_args / tensor_pairs_ stay owned by the caller's Runtime, which
-// frees them in validate_runtime_impl.
+// copy-back. Read-only INPUT tensors skip copy-back. When `bump` is non-null,
+// ordinary non-child tensors are sliced from the runner's retained temporary
+// buffer (released as a no-op — the buffer is reused across runs); otherwise
+// each is device_malloc'd and freed in validate. On failure the partially
+// staged device_args / tensor_leases_ stay owned by the caller's Runtime.
 static bool stage_device_args(
     Runtime *runtime, const HostApi *api, const ChipStorageTaskArgs *orch_args, const ArgDirection *signature,
-    int sig_count, ChipStorageTaskArgs *out
+    int sig_count, RetainedTempBump *bump, ChipStorageTaskArgs *out
 ) {
     int tensor_count = orch_args->tensor_count();
     int scalar_count = orch_args->scalar_count();
@@ -438,8 +539,24 @@ static bool stage_device_args(
 
         void *host_ptr = reinterpret_cast<void *>(static_cast<uintptr_t>(t.buffer.addr));
         size_t size = static_cast<size_t>(t.nbytes());
+        if (size == 0) {
+            t.buffer.addr = 0;
+            out->add_tensor(t);
+            continue;
+        }
 
-        void *dev_ptr = api->device_malloc(size);
+        void *dev_ptr = nullptr;
+        TensorReleaseKind release_kind = TensorReleaseKind::Free;
+        if (bump != nullptr) {
+            dev_ptr = bump->acquire(size);
+            release_kind = TensorReleaseKind::BufferNoop;
+            if (dev_ptr == nullptr) {
+                LOG_ERROR("Retained temp buffer slice failed for tensor %d: tensor bytes=%zu", i, size);
+                return false;
+            }
+        } else {
+            dev_ptr = api->device_malloc(size);
+        }
         if (dev_ptr == nullptr) {
             LOG_ERROR("Failed to allocate device memory for tensor %d", i);
             return false;
@@ -460,7 +577,9 @@ static bool stage_device_args(
         }
         if (rc != 0) {
             LOG_ERROR("Failed to stage tensor %d to device", i);
-            api->device_free(dev_ptr);
+            if (release_kind == TensorReleaseKind::Free) {
+                api->device_free(dev_ptr);
+            }
             return false;
         }
         // Read-only INPUT tensors are never written by the kernel, so there is
@@ -470,7 +589,7 @@ static bool stage_device_args(
         // tensor entries). Anything not provably IN keeps the safe default of
         // copying back.
         bool needs_copy_back = !(signature != nullptr && i < sig_count && signature[i] == ArgDirection::IN);
-        runtime->tensor_pairs_.push_back({host_ptr, dev_ptr, size, needs_copy_back});
+        runtime->tensor_leases_.push_back({host_ptr, dev_ptr, size, needs_copy_back, release_kind});
         LOG_INFO_V0("  Tensor %d: %zu bytes at %p", i, size, dev_ptr);
 
         t.buffer.addr = reinterpret_cast<uint64_t>(dev_ptr);
@@ -694,6 +813,7 @@ extern "C" int bind_callable_to_runtime_impl(
     int tensor_count = orch_args->tensor_count();
     int scalar_count = orch_args->scalar_count();
     LOG_INFO_V0("RT2 bind: %d tensors + %d scalars, device orchestration mode", tensor_count, scalar_count);
+    runtime->tensor_leases_.clear();
 
     int64_t t_total_start = _now_ms();
 
@@ -702,8 +822,25 @@ extern "C" int bind_callable_to_runtime_impl(
         return -1;
     }
 
+    // The retained temporary buffer is always used on the trb path — it is an
+    // internal allocation optimization, not user-facing config. Gate only on
+    // whether the platform wired the slot accessors (trb always does; a backend
+    // that leaves them null transparently falls back to per-tensor
+    // device_malloc). The buffer itself lives on the runner across runs; here we
+    // just grow it to this run's packed size and bump-slice from it.
+    RetainedTempBump bump;
+    bool use_temporary_buffer =
+        api->get_retained_temp_buffer != nullptr && api->set_retained_temp_buffer != nullptr;
+    if (use_temporary_buffer && !bump.begin(api, orch_args)) {
+        return -1;
+    }
+
+    auto bind_cleanup = RAIIScopeGuard([&]() { release_tensor_leases(runtime, api); });
+
     ChipStorageTaskArgs device_args;
-    if (!stage_device_args(runtime, api, orch_args, signature, sig_count, &device_args)) {
+    if (!stage_device_args(
+            runtime, api, orch_args, signature, sig_count, use_temporary_buffer ? &bump : nullptr, &device_args
+        )) {
         return -1;
     }
 
@@ -748,6 +885,7 @@ extern "C" int bind_callable_to_runtime_impl(
     LOG_INFO_V0("TIMING: prebuilt_runtime_arena = %" PRId64 "ms", t_prebuilt_end - t_prebuilt_start);
     LOG_INFO_V0("TIMING: total_init_runtime_impl = %" PRId64 "ms", t_total_end - t_total_start);
 
+    bind_cleanup.dismiss();
     return 0;
 }
 
@@ -756,8 +894,8 @@ extern "C" int bind_callable_to_runtime_impl(
  *
  * This function:
  * 1. Copies recorded tensors from device back to host
- * 2. Frees device memory for recorded tensors
- * 3. Clears tensor pair state
+ * 2. Releases recorded tensor leases
+ * 3. Clears tensor lease state
  *
  * @param runtime  Pointer to Runtime
  * @return 0 on success, -1 on failure
@@ -777,10 +915,10 @@ extern "C" int validate_runtime_impl(Runtime *runtime, const HostApi *api) {
     LOG_INFO_V0("=== Copying Results Back to Host ===");
 
     // Copy all recorded tensors from device back to host
-    TensorPair *tensor_pairs = runtime->tensor_pairs_.data();
-    int tensor_pair_count = static_cast<int>(runtime->tensor_pairs_.size());
+    TensorLease *tensor_leases = runtime->tensor_leases_.data();
+    int tensor_lease_count = static_cast<int>(runtime->tensor_leases_.size());
 
-    LOG_INFO_V0("Tensor pairs to process: %d", tensor_pair_count);
+    LOG_INFO_V0("Tensor leases to process: %d", tensor_lease_count);
 
     // PTO2 (device orchestration): graph output may be in packed buffer
     uint64_t graph_out_ptr = 0;
@@ -829,31 +967,31 @@ extern "C" int validate_runtime_impl(Runtime *runtime, const HostApi *api) {
         LOG_WARN("Skipping tensor copy-back because PTO2 runtime reported fatal status");
     } else {
         bool first_output_tensor = true;
-        for (int i = 0; i < tensor_pair_count; i++) {
-            const TensorPair &pair = tensor_pairs[i];
+        for (int i = 0; i < tensor_lease_count; i++) {
+            const TensorLease &lease = tensor_leases[i];
 
             // Skip if device pointer is null
-            if (pair.dev_ptr == nullptr) {
+            if (lease.dev_ptr == nullptr) {
                 LOG_WARN("Tensor %d has null device pointer, skipping", i);
                 continue;
             }
 
             // If host pointer is null, this is a device-only allocation (no copy-back)
-            if (pair.host_ptr == nullptr) {
+            if (lease.host_ptr == nullptr) {
                 LOG_INFO_V0("Tensor %d: device-only allocation (no copy-back)", i);
                 continue;
             }
 
             // Read-only INPUT tensors were uploaded H2D but the kernel never
             // wrote them — copying them back (potentially ~GB) is pure waste.
-            // They are still device_free'd in the cleanup loop below.
-            if (!pair.needs_copy_back) {
+            // They are still released through release_kind below.
+            if (!lease.needs_copy_back) {
                 LOG_INFO_V0("Tensor %d: read-only input, skipping copy-back", i);
                 continue;
             }
 
-            void *src_ptr = pair.dev_ptr;
-            size_t copy_size = pair.size;
+            void *src_ptr = lease.dev_ptr;
+            size_t copy_size = lease.size;
 
             // Use graph_output_ptr for the first output tensor if available
             if (first_output_tensor && graph_out_ptr != 0 && graph_out_size > 0) {
@@ -863,42 +1001,19 @@ extern "C" int validate_runtime_impl(Runtime *runtime, const HostApi *api) {
                 first_output_tensor = false;
             }
 
-            int copy_rc = api->copy_from_device(pair.host_ptr, src_ptr, copy_size);
+            int copy_rc = api->copy_from_device(lease.host_ptr, src_ptr, copy_size);
             if (copy_rc != 0) {
                 LOG_ERROR("Failed to copy tensor %d from device: %d", i, copy_rc);
                 rc = copy_rc;
             } else {
-                LOG_INFO_V0("Tensor %d: %zu bytes copied to host", i, pair.size);
+                LOG_INFO_V0("Tensor %d: %zu bytes copied to host", i, lease.size);
             }
         }
     }
 
     // Cleanup device tensors
     LOG_INFO_V0("=== Cleaning Up ===");
-    for (int i = 0; i < tensor_pair_count; i++) {
-        if (tensor_pairs[i].dev_ptr != nullptr) {
-            api->device_free(tensor_pairs[i].dev_ptr);
-        }
-    }
-    LOG_INFO_V0("Freed %d device allocations", tensor_pair_count);
-
-    // Clear the per-run dispatch-table entries staged by register_callable_impl.
-    // The underlying chip-callable device buffer is pool-managed by
-    // DeviceRunner (keyed by content hash) and bulk-freed in
-    // DeviceRunner::finalize(); re-running the same callable repeatedly
-    // should not re-upload.
-    int kernel_count = runtime->get_registered_kernel_count();
-    for (int i = 0; i < kernel_count; i++) {
-        int func_id = runtime->get_registered_kernel_func_id(i);
-        runtime->set_function_bin_addr(func_id, 0);
-    }
-    if (kernel_count > 0) {
-        LOG_INFO_V0("Cleared %d kernel dispatch-table entries", kernel_count);
-    }
-    runtime->clear_registered_kernels();
-
-    // Clear tensor pairs
-    runtime->tensor_pairs_.clear();
+    release_tensor_leases(runtime, api);
 
     LOG_INFO_V0("=== Finalize Complete ===");
 

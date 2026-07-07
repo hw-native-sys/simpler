@@ -129,8 +129,7 @@ jobs:
           # job log inline, not just the uploaded per-pid file.
           LD_PRELOAD="$LIB $LIBSTDCXX" pytest $TARGETS --platform ${{ matrix.platform }} \
             --device 0-7 --max-parallel "$MAXPAR" -k "$KFILTER" \
-            --sanitizer ${{ matrix.sanitizer }} -v -s --pto-session-timeout 600 \
-            --pto-isa-commit ${{ env.PTO_ISA_COMMIT }} --clone-protocol https --require-pto-isa
+            --sanitizer ${{ matrix.sanitizer }} -v -s --pto-session-timeout 600 --require-pto-isa
 
       - name: Upload sanitizer logs (${{ matrix.sanitizer }}, ${{ matrix.platform }})
         if: always()

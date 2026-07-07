@@ -33,6 +33,7 @@
 #include <atomic>
 #include <condition_variable>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <vector>
@@ -73,7 +74,7 @@ public:
     // the Scheduler's dispatch_ready walks each queue independently.
     void init(
         TensorMap *tensormap, Ring *allocator, Scope *scope, ReadyQueue *ready_next_level_queue,
-        ReadyQueue *ready_sub_queue, WorkerManager *manager = nullptr
+        ReadyQueue *ready_sub_queue, WorkerManager *manager = nullptr, std::function<void()> ready_notify_cb = {}
     );
 
     // Allocate an intermediate buffer from the Worker's HeapRing (MAP_SHARED,
@@ -162,6 +163,7 @@ private:
     Ring *allocator_ = nullptr;
     Scope *scope_ = nullptr;
     WorkerManager *manager_ = nullptr;
+    std::function<void()> ready_notify_cb_;
     // Strict-4 per-worker-type ready queues. Each queue handles tasks of
     // exactly one WorkerType so the Scheduler can dispatch from an idle pool
     // without being blocked by another pool's saturation.

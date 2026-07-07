@@ -32,7 +32,7 @@ public:
     DeviceRunner() = default;
     ~DeviceRunner() override;
 
-    int run(Runtime &runtime, int block_dim, int launch_aicpu_num = 1) override;
+    int run(Runtime &runtime, const CallConfig &config) override;
     int finalize() override;
     // a5 dep_gen enablement setter, overriding the base no-op (the c_api
     // unconditionally calls it).

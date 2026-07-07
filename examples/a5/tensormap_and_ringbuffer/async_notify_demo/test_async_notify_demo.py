@@ -46,10 +46,10 @@ def parse_device_range(spec: str) -> list[int]:
     return [int(spec)]
 
 
-def build_chip_callable(platform: str, pto_isa_commit: str | None, clone_protocol: str) -> ChipCallable:
+def build_chip_callable(platform: str) -> ChipCallable:
     kc = KernelCompiler(platform=platform)
     runtime = "tensormap_and_ringbuffer"
-    pto_isa_root = ensure_pto_isa_root(commit=pto_isa_commit, clone_protocol=clone_protocol)
+    pto_isa_root = ensure_pto_isa_root()
     include_dirs = kc.get_orchestration_include_dirs(runtime)
     extra_includes = list(include_dirs) + [str(kc.project_root / "src" / "common")]
 
@@ -90,7 +90,7 @@ def build_chip_callable(platform: str, pto_isa_commit: str | None, clone_protoco
     )
 
 
-def run(platform: str = "a5", device_ids: list[int] | None = None, pto_isa_commit: str | None = None) -> int:
+def run(platform: str = "a5", device_ids: list[int] | None = None) -> int:
     if device_ids is None:
         device_ids = [0, 1]
     nranks = len(device_ids)
@@ -104,7 +104,7 @@ def run(platform: str = "a5", device_ids: list[int] | None = None, pto_isa_commi
     out = [torch.zeros(N, dtype=torch.float32).share_memory_() for _ in range(nranks)]
     result = [torch.zeros(N, dtype=torch.float32).share_memory_() for _ in range(nranks)]
 
-    chip_callable = build_chip_callable(platform, pto_isa_commit, "https")
+    chip_callable = build_chip_callable(platform)
     worker = Worker(
         level=3,
         platform=platform,
@@ -164,9 +164,8 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("-p", "--platform", default="a5")
     parser.add_argument("-d", "--device", default="0-1")
-    parser.add_argument("--pto-isa-commit", default=None)
     args = parser.parse_args()
-    return run(args.platform, parse_device_range(args.device), args.pto_isa_commit)
+    return run(args.platform, parse_device_range(args.device))
 
 
 if __name__ == "__main__":

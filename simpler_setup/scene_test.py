@@ -1372,21 +1372,6 @@ class SceneTestCase:
             ),
         )
         parser.add_argument(
-            "-c",
-            "--pto-isa-commit",
-            default=None,
-            help=(
-                "Override the PTO-ISA revision before running. Default: use pto_isa.pin. "
-                "Use latest/head/none to track origin/HEAD."
-            ),
-        )
-        parser.add_argument(
-            "--clone-protocol",
-            choices=["ssh", "https"],
-            default="ssh",
-            help="Git protocol for auto-cloning PTO-ISA when PTO_ISA_ROOT is not set. Default: ssh.",
-        )
-        parser.add_argument(
             "--log-level",
             choices=LOG_LEVEL_CHOICES,
             default=DEFAULT_LOG_LEVEL,
@@ -1416,12 +1401,7 @@ class SceneTestCase:
                     f"  {_san.preload_command(_san_tokens, args.platform)} python {module_name} ..."
                 )
 
-        os.environ["PTO_ISA_ROOT"] = ensure_pto_isa_root(
-            commit=args.pto_isa_commit,
-            clone_protocol=args.clone_protocol,
-            update_if_exists=True,
-            verbose=True,
-        )
+        os.environ["PTO_ISA_ROOT"] = ensure_pto_isa_root(verbose=True)
 
         if args.rounds > 1 and args.enable_l2_swimlane:
             logger.warning("Profiling disabled: --rounds > 1")

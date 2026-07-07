@@ -129,13 +129,13 @@ constexpr int PLATFORM_PROF_SLOT_COUNT = 4;
 
 /**
  * L2SwimlaneAicpuTaskBuffer pre-allocation count per AICore.
- * 1 goes into the free_queue at init, the rest into the recycled pool.
+ * Up to PLATFORM_PROF_SLOT_COUNT go into the free_queue at init, the rest into the recycled pool.
  */
 constexpr int PLATFORM_PROF_BUFFERS_PER_CORE = 8;
 
 /**
  * L2SwimlaneAicoreTaskBuffer pre-allocation count per AICore (AICore-as-producer pool).
- * 1 goes into the free_queue at init, the rest into the recycled pool.
+ * Up to PLATFORM_PROF_SLOT_COUNT go into the free_queue at init, the rest into the recycled pool.
  * Mirrors PLATFORM_PROF_BUFFERS_PER_CORE in role; smaller because AICore records
  * are slim (32 B each) and the buffer is also smaller per the rotation design.
  */
@@ -144,8 +144,8 @@ constexpr int PLATFORM_AICORE_BUFFERS_PER_CORE = 4;
 /**
  * Host preallocation count per AICPU thread for the two phase pools, split per
  * kind (sched vs orch) because their throughput is asymmetric — a single shared
- * value over-provisions the lighter one. 1 buffer seeds the free_queue at init,
- * the rest the recycled pool.
+ * value over-provisions the lighter one. Up to PLATFORM_PROF_SLOT_COUNT buffers
+ * seed the free_queue at init, and the rest seed the recycled pool.
  *
  * Floor for both: SLOT_COUNT(4) + 1 = 5 (free_queue fillable + 1 active buffer).
  * Pure host preallocation — zero ABI (the device-visible ready_queue is decoupled

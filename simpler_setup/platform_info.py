@@ -62,14 +62,6 @@ def discover_runtimes(arch: str) -> list[str]:
     return sorted(d.name for d in runtime_base.iterdir() if d.is_dir() and (d / "build_config.py").exists())
 
 
-def discover_variants(arch: str) -> list[str]:
-    """Return sorted list of platform variants (excluding include/src dirs)."""
-    platform_base = PROJECT_ROOT / "src" / arch / "platform"
-    if not platform_base.is_dir():
-        return []
-    return sorted(d.name for d in platform_base.iterdir() if d.is_dir() and d.name not in ("include", "src"))
-
-
 def load_build_config(config_path: Path) -> dict:
     """Load BUILD_CONFIG dict from a build_config.py file."""
     spec = importlib.util.spec_from_file_location("build_config", config_path)

@@ -303,6 +303,12 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
         }
         recv_count_out[e] = sum;
     }
+    // recv_count_out is written by the scalar unit (raw GM store), not TSTORE,
+    // so it stays in cache; the downstream local_expert task reads it to bound
+    // its row loop. Flush the one cache line ([L=16,1] INT32 = 64 B) so its HBM
+    // value is visible regardless of dispatch/consumer timing. (recv_x/recv_w/
+    // recv_idx go out via TSTORE and need no dcci.)
+    dcci((__gm__ void *)recv_count_out, SINGLE_CACHE_LINE, CACHELINE_OUT);
 
     // ------------------------------------------------------------------
     // payload_push: push x / weight / idx payloads via TPUT.

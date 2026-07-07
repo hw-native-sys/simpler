@@ -11,14 +11,12 @@ Detection procedures referenced below live in
 1. Locate the test file under `$ARGUMENTS/`: pick the single `test_*.py` that
    lives directly in that directory (not in a subdirectory). If none exists,
    tell the user the directory is not a scene test and stop.
-2. **Extract CI pins** (§D, sim jobs): `--pto-isa-commit`.
-3. **Detect platform** (sim, §B — prefer the "from a path" rule using
+2. **Detect platform** (sim, §B — prefer the "from a path" rule using
    `$ARGUMENTS`).
-4. Run standalone:
+3. Run standalone:
 
    ```bash
-   python $ARGUMENTS/test_<name>.py -p <platform> \
-     --clone-protocol https --pto-isa-commit <commit>
+   python $ARGUMENTS/test_<name>.py -p <platform>
    ```
 
-5. Report pass/fail status with any error output.
+4. Report pass/fail status with any error output.

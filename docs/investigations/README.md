@@ -84,6 +84,7 @@ that ...".
 
 Newest first.
 
+- [2026-07 — Removing PTO2LocalReadyBuffer exposed a missing dcci in EP dispatch](2026-07-local-buffer-removal-ep-combine-regression.md) — RESOLVED in #1245: local-buffer removal changed dispatch timing and unmasked a latent kernel bug (dispatch never dcci'd `recv_count_out` to HBM → local_expert read count=0 → all-zero output); fixed with a one-line dcci in the example kernel
 - [2026-06 — Gating the two residual profiling enable() calls on the orch/scheduler hot path](2026-06-orch-profiling-enable-gates-hot-path.md) — gated under existing `PTO2_PROFILING`; magnitude unmeasured, no new macro
 - [2026-06 — Replacing COND with GM+dcci for AICore→AICPU notification](2026-06-cond-vs-gm-notification.md)
 - [2026-06 — Letting AICore directly read or write the SPR MMIO window](2026-06-aicore-mmio-to-spr.md)

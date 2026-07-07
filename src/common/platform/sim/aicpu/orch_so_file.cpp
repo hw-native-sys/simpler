@@ -17,7 +17,6 @@
 
 #include "aicpu/orch_so_file.h"
 
-#include <fcntl.h>
 #include <stdlib.h>
 #include <sys/stat.h>
 #include <unistd.h>

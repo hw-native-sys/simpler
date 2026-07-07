@@ -40,7 +40,13 @@ class BuildTarget:
     def get_binary_name(self) -> str:
         return self._binary_name
 
-    def gen_cmake_args(self, include_dirs: list[str], source_dirs: list[str], sanitizers: str = "") -> list[str]:
+    def gen_cmake_args(
+        self,
+        include_dirs: list[str],
+        source_dirs: list[str],
+        sanitizers: str = "",
+        cmake_defines: Optional[dict[str, str]] = None,
+    ) -> list[str]:
         """Generate CMake arguments list from toolchain args + custom directories."""
         inc = ";".join(os.path.abspath(d) for d in include_dirs)
         src = ";".join(os.path.abspath(d) for d in source_dirs)
@@ -48,6 +54,9 @@ class BuildTarget:
             f"-DCUSTOM_INCLUDE_DIRS={inc}",
             f"-DCUSTOM_SOURCE_DIRS={src}",
         ]
+        if cmake_defines:
+            for key, value in sorted(cmake_defines.items()):
+                args.append(f"-D{key}={value}")
         # Sanitizers only apply to host-compiled targets — device toolchains
         # (ccec, aarch64 cross) run on the NPU and can't carry a host sanitizer
         # runtime. cmake/sanitizers.cmake reads both defines.
@@ -124,17 +133,12 @@ class RuntimeCompiler:
         env_manager.ensure("ASCEND_HOME_PATH")
         # a2a3 onboard host_runtime hard-depends on pto-isa headers + CANN-9.0
         # aclnn syms (cf. src/a2a3/platform/onboard/host/CMakeLists.txt
-        # SIMPLER_ENABLE_PTO_SDMA_WORKSPACE marker). PTO_ISA_ROOT must be
-        # populated by the caller — no auto-clone fallback here. Resolved by:
-        #   - pip install: top-level CMakeLists invokes
-        #     simpler_setup/build_runtimes.py --clone-protocol <proto> which
-        #     calls ensure_pto_isa_root() and sets os.environ.
-        #   - pytest:      conftest.py::pytest_configure does the same, with
-        #     the --clone-protocol pytest flag.
-        #   - Direct callers (e.g. CI `python -c "RuntimeBuilder('a2a3')..."`
-        #     or `python examples/.../test_*.py` standalone) must export
-        #     PTO_ISA_ROOT in env before constructing this RuntimeCompiler;
-        #     CI workflows propagate it via $GITHUB_ENV after the install step.
+        # SIMPLER_ENABLE_PTO_SDMA_WORKSPACE marker). Use the same pinned
+        # managed checkout as kernel compilation and expose it through
+        # PTO_ISA_ROOT for the existing CMake/build_config surface.
+        from simpler_setup.pto_isa import ensure_pto_isa_root  # noqa: PLC0415
+
+        os.environ["PTO_ISA_ROOT"] = ensure_pto_isa_root(verbose=True)
         env_manager.ensure("PTO_ISA_ROOT")
 
         # AICore: Bisheng CCE compiler
@@ -221,6 +225,7 @@ class RuntimeCompiler:
         build_dir: Optional[str] = None,
         output_dir: Optional[Union[str, Path]] = None,
         dispatcher_dest: Optional[Union[str, Path]] = None,
+        cmake_defines: Optional[dict[str, str]] = None,
     ) -> Union[bytes, Path]:
         """
         Compile binary for the specified target platform.
@@ -238,6 +243,7 @@ class RuntimeCompiler:
                         When None, the dispatcher SO is not exported. Used by
                         runtime_builder to share one dispatcher SO across all
                         runtimes for a given arch.
+            cmake_defines: Additional CMake cache definitions for this target.
 
         Returns:
             If output_dir is set: Path to the compiled binary in output_dir.
@@ -257,7 +263,12 @@ class RuntimeCompiler:
         else:
             raise ValueError(f"Invalid target platform: {target_platform}. Must be 'aicore', 'aicpu', or 'host'.")
 
-        cmake_args = target.gen_cmake_args(include_dirs, source_dirs, sanitizers=self._sanitizers)
+        cmake_args = target.gen_cmake_args(
+            include_dirs,
+            source_dirs,
+            sanitizers=self._sanitizers,
+            cmake_defines=cmake_defines,
+        )
         cmake_source_dir = target.get_root_dir()
         binary_name = target.get_binary_name()
         platform = target_platform.upper()

@@ -332,13 +332,9 @@ void ChipWorker::run(int32_t callable_id, const ChipStorageTaskArgs *args, const
 
     void *rt = runtime_buf_.data();
     // Per-stage timing is emitted by the platform as `[STRACE]` log markers, not
-    // returned (see chip_worker.h::run).
-    int rc = run_fn_(
-        device_ctx_, rt, callable_id, args, config.block_dim, config.aicpu_thread_num, config.enable_l2_swimlane,
-        config.enable_dump_tensor, config.enable_pmu, config.enable_dep_gen, config.enable_scope_stats,
-        config.runtime_env.ring_task_window, config.runtime_env.ring_heap, config.runtime_env.ring_dep_pool,
-        config.output_prefix
-    );
+    // returned (see chip_worker.h::run). CallConfig is threaded through to the C
+    // ABI as a single pointer rather than unpacked into per-field args.
+    int rc = run_fn_(device_ctx_, rt, callable_id, args, &config);
     if (rc != 0) {
         throw std::runtime_error("run failed with code " + std::to_string(rc));
     }

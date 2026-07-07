@@ -34,6 +34,7 @@
 #include "aicpu_topology_probe.h"
 #include "callable.h"
 #include "callable_protocol.h"
+#include "call_config.h"
 #include "utils/elf_build_id.h"
 #include "utils/fnv1a_64.h"
 #include "host/host_regs.h"  // Register address retrieval
@@ -142,7 +143,12 @@ int DeviceRunner::destroy_comm_stream(void *stream) {
     return 0;
 }
 
-int DeviceRunner::run(Runtime &runtime, int block_dim, int launch_aicpu_num) {
+int DeviceRunner::run(Runtime &runtime, const CallConfig &config) {
+    // Latch this run's diagnostic enables onto the runner before the collector
+    // paths below read them; block_dim/aicpu_thread_num are consumed locally.
+    apply_call_config(config);
+    int block_dim = config.block_dim;
+    const int launch_aicpu_num = config.aicpu_thread_num;
     // A prior AICore launch/sync error poisoned the device context and the
     // in-place drain could not clear it. Refuse to run rather than cascade
     // into halResMap rc=62 (init_aicore_register_addresses) or rtMalloc

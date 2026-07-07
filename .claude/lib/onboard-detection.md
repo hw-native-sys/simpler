@@ -62,25 +62,15 @@ An *idle* device is one whose **HBM-Usage is 0** in `npu-smi info` output.
 When wrapping in `task-submit` (§E), prefer `--device auto --device-num <N>`
 and let it pick free dies instead of selecting here.
 
-## D. Extract CI pins from `.github/workflows/ci.yml`
+## D. Extract CI timeout from `.github/workflows/ci.yml`
 
-Copy the pinned values so local runs match CI:
-
-```bash
-PTO_ISA_COMMIT=$(grep -oP '(?<=--pto-isa-commit )\w+' .github/workflows/ci.yml | head -1)
-```
-
-- **Onboard runs** read the `st-onboard-<platform>` job; **sim runs** read the
-  `st-sim-*` jobs. (Both pin the same `--pto-isa-commit`; the value is shared.)
-- `--pto-session-timeout` is also pinned per job (onboard a5 = 1200, others =
-  600). Extract it the same way for full-pipeline / per-runtime runs:
+PTO-ISA reproducibility comes from `pto_isa.pin`; local test commands should
+not pass a separate PTO-ISA commit. For full-pipeline / per-runtime runs,
+copy the CI session timeout for the relevant job:
 
   ```bash
   PTO_SESSION_TIMEOUT=$(grep -oP '(?<=--pto-session-timeout )\d+' .github/workflows/ci.yml | head -1)
   ```
-
-**Local clone protocol:** CI onboard jobs use `--clone-protocol ssh`, but on a
-shared dev box ssh can stall — use `--clone-protocol https` locally.
 
 ## E. Isolate onboard runs through `task-submit`
 

@@ -1145,7 +1145,21 @@ void AicpuExecutor::deinit(Runtime *runtime) {
     // 1. Invalidate AICPU cache for Runtime address range.
     //    Next round's Host DMA (rtMemcpy) writes fresh Runtime to HBM but
     //    bypasses this cache. Invalidating now ensures next round reads from HBM.
-    cache_invalidate_range(runtime, sizeof(Runtime));
+    //    Invalidate exactly the uploaded prefix (offsetof(tasks) + populated
+    //    tasks): the device buffer is allocated at that size (see
+    //    runtime_device_copy_size / init_runtime_args), so invalidating
+    //    sizeof(Runtime) would iterate cache lines past the allocation into
+    //    unrelated memory. A short invalidate is also sufficient — every run
+    //    reads only tasks[0..next_task_id) for its OWN next_task_id (get_task()
+    //    bounds-checks), and the H2D DMA wrote exactly that, so no run ever
+    //    observes a task line beyond its own prefix. cache_invalidate_range
+    //    rounds the end up to a 64-byte line, covering a partial trailing line.
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Winvalid-offsetof"
+    const size_t runtime_prefix_bytes =
+        offsetof(Runtime, tasks) + static_cast<size_t>(runtime->get_task_count()) * sizeof(Task);
+#pragma GCC diagnostic pop
+    cache_invalidate_range(runtime, runtime_prefix_bytes);
     if (runtime->get_tensor_info_storage() != nullptr && runtime->get_tensor_info_storage_bytes() > 0) {
         cache_invalidate_range(
             runtime->get_tensor_info_storage(), static_cast<size_t>(runtime->get_tensor_info_storage_bytes())

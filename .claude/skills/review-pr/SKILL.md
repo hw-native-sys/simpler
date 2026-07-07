@@ -107,6 +107,90 @@ git diff "$MERGE_BASE"...HEAD
 For large PRs, read diffs per-category (by directory or file type) to
 avoid overwhelming context.
 
+## Step 3.5: Categorize and Size the Changes
+
+Break the diff into buckets and count changed lines (added + deleted,
+i.e. churn) per bucket. This feeds the Step 8 "Change Breakdown"
+section and drives the oversized-PR warnings.
+
+**Precedence:** classify by file type / purpose first (Test/Examples,
+Build, Docs), then by source-tree location (Core), then everything
+left over is Uncategorized. First match wins — so a `CMakeLists.txt`
+under `src/` is still Build, a `README.md` under `python/` is still
+Docs, and a `.py` outside the Core dirs is Uncategorized, not Core.
+
+**Buckets:**
+
+- **Test/Examples** — anything under `test/`, `tests/`, `__tests__/`,
+  `fixtures/`, `testdata/`, `snapshots/`, **`examples/`**; files named
+  `test_*.*`, `*_test.*`, `*Test.*`, `*_spec.*`, `conftest.py`.
+- **Build** — `CMakeLists.txt`, `*.cmake`, `Makefile`/`*.mk`,
+  `*.am`/`*.ac`/`*.in`, `configure`, `config.sub`/`config.guess`,
+  `aclocal.m4`, `meson.build`, `setup.py`, `setup.cfg`,
+  `pyproject.toml`, `requirements*.txt`, `Pipfile*`, `MANIFEST.in`,
+  `package.json`, `*-lock.json`, `yarn.lock`, `pnpm-lock.yaml`,
+  `tsconfig.json`, `BUILD`, `BUILD.bazel`, `*.bzl`, `WORKSPACE`.
+- **Docs** — `*.md`, `*.rst`, `*.txt`, `*.adoc`, `*.tex`, images
+  (`png`/`jpg`/`jpeg`/`svg`/`gif`/`webp`); files under `docs/`/`doc/`;
+  `CHANGELOG`, `README`, `CONTRIBUTING`, `LICENSE`, `NOTICE`.
+- **Core** — real source / logic, **only if** the path is under `src/`,
+  `python/`, or `simpler_setup/` (root-anchored). Anything outside
+  those three dirs is not Core even if it looks like source.
+- **Uncategorized** — everything else not matched above (e.g. agent
+  config under `.claude/`, scripts, CI workflows, repo-root config).
+  This bucket exists so odd / out-of-scope files stay visible instead
+  of being silently absorbed into Core or Docs.
+
+```bash
+git diff "$MERGE_BASE"...HEAD --numstat | awk -F'\t' '
+  $1=="-" { next }                               # skip binary
+  {
+    a=$1; d=$2; path=$3; tot=a+d;
+    if (path ~ /(^|\/)(test|tests|__tests__|fixtures|testdata|snapshots|examples)\// ||
+        path ~ /(^|[_\/])(test_|conftest\.py)/ ||
+        path ~ /(_test|Test|_spec)\.[A-Za-z0-9]+$/)
+      c="test";
+    else if (path ~ /(^|\/)CMakeLists\.txt$/ || path ~ /\.cmake$/ ||
+             path ~ /(^|\/)Makefile/ || path ~ /\.(mk|am|ac|in)$/ ||
+             path ~ /(^|\/)(aclocal\.m4|configure|config\.(sub|guess))$/ ||
+             path ~ /(^|\/)meson\.build$/ ||
+             path ~ /(^|\/)(setup\.py|setup\.cfg|pyproject\.toml|requirements.*\.txt|Pipfile.*|MANIFEST\.in)$/ ||
+             path ~ /(^|\/)(package\.json|package-lock\.json|yarn\.lock|pnpm-lock\.yaml|tsconfig\.json)$/ ||
+             path ~ /(^|\/)(BUILD|BUILD\.bazel|WORKSPACE)$/ || path ~ /\.bzl$/)
+      c="build";
+    else if (path ~ /\.(md|rst|txt|adoc|tex)$/ ||
+             path ~ /(^|\/)(CHANGELOG|README|CONTRIBUTING|LICENSE|NOTICE)/ ||
+             path ~ /(^|\/)docs?\// ||
+             path ~ /\.(png|jpg|jpeg|svg|gif|webp)$/)
+      c="docs";
+    else if (path ~ /^(src|python|simpler_setup)\//)
+      c="core";
+    else
+      c="uncat";
+    F[c]++; A[c]+=a; D[c]+=d; T[c]+=tot;
+  }
+  END {
+    split("core build test docs uncat", o, " ");
+    label["core"]="Core"; label["build"]="Build"; label["test"]="Test/Ex";
+    label["docs"]="Docs"; label["uncat"]="Uncategorized";
+    tf=ta=td=tt=0;
+    for (i=1;i<=5;i++){k=o[i];
+      printf "  %-13s %3d files  +%5d  -%5d  =%d\n", label[k], F[k]+0, A[k]+0, D[k]+0, T[k]+0;
+      tf+=F[k]; ta+=A[k]; td+=D[k]; tt+=T[k];}
+    printf "  %-13s %3d files  +%5d  -%5d  =%d\n", "TOTAL", tf, ta, td, tt;
+  }
+'
+```
+
+**Thresholds (carry into Step 8):**
+
+- **Total churn > 1000 lines** → ⚠️ oversized-PR warning (review burden + merge-conflict risk; suggest splitting by concern).
+- **Core churn > 1000 lines** → ❌ stronger oversized-PR warning. Core
+  is the real logic under `src/` / `python/` / `simpler_setup/`; when
+  it alone exceeds 1000 lines the PR cannot be held in head in one
+  pass. Recommend split and require the Step 5.5 Mechanism Brief plus a
+  reviewer-friendly commit review order.
+
 ## Step 4: Extract the Stated Goal(s)
 
 The stated goal can come from **multiple sources**. Gather all of them
@@ -324,6 +408,78 @@ CI was green before this PR, which means the existing test suite does
 3. **Codestyle** (any type): apply `.claude/rules/codestyle.md` and any
    arch-specific rules (`.claude/rules/ascend.md`, etc.).
 
+## Step 6.5: pto-isa Pin Check (repo-specific)
+
+This repo vendors the `pto-isa` headers from a **pinned** git commit. When the pin is active (a concrete SHA, not the "latest main/master" default), the review always carries a pto-isa pin note: a baseline **advisory** that the pinned commit exists and may need bumping, escalating to a **recommendation** when the PR adds or relocates a pto-isa header reference — the case where the pinned revision likely no longer matches what the PR references and a bump is probably required. The risk being mitigated: a PR can silently rely on pto-isa surface the pinned revision does not provide, whose only signal is a broken build or runtime on device.
+
+**Pin source of truth:** repo-root `pto_isa.pin` (a 40-hex SHA). CI
+reads it via `.github/actions/read-pto-isa` and feeds it both to
+test-time (`--pto-isa-commit`) and to the onboard `host_runtime.so`
+build (`SIMPLER_PTO_ISA_COMMIT` cmake define). Unpinned sentinel
+values (use latest HEAD): `""`, `head`, `latest`, `none` — see
+`simpler_setup/pto_isa.py` `_UNPINNED_COMMIT_VALUES`.
+
+```bash
+# 1. Is the pin active? (read the PR's resulting HEAD)
+PIN_VALUE=$(git show "HEAD:pto_isa.pin" 2>/dev/null | tr -d '[:space:]')
+PIN_ACTIVE=0
+case "$(printf '%s' "$PIN_VALUE" | tr 'A-F' 'a-f')" in
+  ""|head|latest|none) PIN_ACTIVE=0 ;;
+  *) printf '%s' "$PIN_VALUE" | grep -qE '^[0-9a-f]{40}$' && PIN_ACTIVE=1 ;;
+esac
+echo "pto_isa.pin=$PIN_VALUE  active=$PIN_ACTIVE"
+
+# 2. Detect pto-isa include-path changes in the diff.
+#    Classify every +/- pto-isa #include by header basename:
+#      CHANGED  = same basename, different path   (pto-isa header reorg)
+#      ADDED    = a pto-isa header newly referenced
+#      REMOVED  = a pto-isa header no longer referenced
+INC_REPORT=$(git diff "$MERGE_BASE"...HEAD -- '*.h' '*.hpp' '*.c' '*.cpp' '*.cc' '*.cxx' '*.cu' '*.cuh' | awk '
+  /^---/ { next }  /^\+\+\+/ { next }
+  /^[+-][[:space:]]*#[[:space:]]*include[[:space:]]*[<"][^>"]*pto/ {
+    sign = substr($0,1,1); line = substr($0,2)
+    if (!match(line, /[<"][^>"]*pto[^>"]*[>"]/)) next
+    hdr = substr(line, RSTART+1, RLENGTH-2)   # strip < > or " "
+    bn = hdr; sub(/^.*\//, "", bn)
+    if (sign == "-") { rem[bn] = hdr } else { add[bn] = hdr }
+    seen[bn] = 1
+  }
+  END {
+    for (b in seen) {
+      if (b in rem && b in add) { if (rem[b] != add[b]) printf "  CHANGED  %s -> %s\n", rem[b], add[b] }
+      else if (b in add)        printf "  ADDED    %s\n", add[b]
+      else                      printf "  REMOVED  %s\n", rem[b]
+    }
+  }')
+
+# (a) the pin file itself touched?
+git diff "$MERGE_BASE"...HEAD --name-only | grep -qx 'pto_isa.pin' \
+  && PIN_TOUCHED=1 || PIN_TOUCHED=0
+
+# (b) referenced pto-isa header PATH changed (the rename/reorg case)
+PTO_REFS=$(printf '%s\n' "$INC_REPORT" | grep '^  CHANGED' || true)
+# (c) a pto-isa header newly referenced (no matching removal)
+NEW_PTO_INC=$(printf '%s\n' "$INC_REPORT" | grep '^  ADDED' || true)
+
+echo "pin_touched=$PIN_TOUCHED"
+echo "pto_refs (path changes):"; printf '%s\n' "$PTO_REFS"
+echo "new pto includes:";        printf '%s\n' "$NEW_PTO_INC"
+```
+
+**Decision — two severity levels:**
+
+- `PIN_ACTIVE=0` → pin check is **skipped** (repo runs on latest main/master). Record one line ("pto-isa unpinned — using latest; pin check skipped") and stop this step.
+- `PIN_ACTIVE=1` **and no** pto-isa header-reference change (`PTO_REFS` and `NEW_PTO_INC` both empty) → render the Step 8 "pto-isa Pin Check" paragraph at the default level, an **advisory**: a light, always-on reminder that the pin exists and may need bumping. This level surfaces whenever the pin is active — even when the diff does not touch the pto-isa cone — so the human is nudged to confirm the pinned commit is still adequate. It does not by itself block the merge.
+- `PIN_ACTIVE=1` **and** a pto-isa header reference changed (`PTO_REFS` or `NEW_PTO_INC` non-empty) → escalate one level to a **recommendation**: the pinned commit likely no longer matches the headers the PR references, so a bump is probably required, not merely worth checking. Escalating signals:
+  1. `PTO_REFS` — a referenced pto-isa header **path** changed (e.g. `pto/npu/comm/async/sdma/sdma_workspace_manager.hpp` → `pto/comm/async/sdma/sdma_workspace_manager.hpp`). The PR is adapting to a pto-isa header-tree reorg → the pinned commit almost certainly must bump to the revision with the new layout. This is the strongest pin-bump signal.
+  2. `NEW_PTO_INC` — the PR newly references a pto-isa header not used before → may need a newer pin that provides it.
+
+`PIN_TOUCHED` (the PR itself edited `pto_isa.pin`) is independent of the two levels: the author already bumped explicitly, so the paragraph is rendered at whichever level the header-reference signals dictate (default advisory if no header-ref change), and you additionally verify the new SHA is intentional and that onboard `host_runtime.so` gets rebuilt against it.
+
+Note: this detects *include-path* changes, **not** edits to files that merely happen to `#include` pto-isa. A logic-only change inside an existing pto-isa consumer keeps the paragraph at the default advisory level — it does not by itself escalate.
+
+**What to convey (both levels):** the current pinned SHA from `pto_isa.pin`; and that a pin bump requires rebuilding onboard `a2a3` `host_runtime.so` against the new commit via `--config-settings=cmake.define.SIMPLER_PTO_ISA_COMMIT=<sha>` (the SDMA headers are compiled into `host_runtime.so`; see `docs/developer-guide.md`, issue #1067). The exact wording per level is given by the Step 8 blockquotes.
+
 ## Step 7: Optional Cross-Check with External CLI Reviewers
 
 **Opt-in only.** Skip this entire step unless the user's `/review-pr`
@@ -513,6 +669,32 @@ From Step 4.
 From Step 5. If it matches the stated goal, say so in one line and move
 on. If it mismatches, this section is the headline finding.
 
+### Change Breakdown
+
+From Step 3.5. Render the bucket table (Core / Build / Test-Ex / Docs /
+Uncategorized, each with file count and +/−/= churn, plus TOTAL) so the
+reviewer can see at a glance how big the PR is and how much churn is
+mechanical vs. real logic.
+
+Apply the oversized-PR warnings from Step 3.5 at the top of this
+section:
+
+- **TOTAL > 1000 lines** → `⚠️ Oversized PR`: review burden and
+  merge-conflict risk are high; recommend splitting by concern. May
+  still be approvable.
+- **Core > 1000 lines** → `❌ Oversized PR (core logic)`: stronger
+  signal — the PR cannot be reviewed in one pass. Recommend split
+  *and* require the Mechanism Brief (Step 5.5) plus a commit review
+  order; bias the Verdict toward "request changes / needs discussion"
+  unless the author justifies the size.
+
+Both warnings quote the actual numbers (e.g. "Core 1180 lines").
+
+If **Uncategorized** is non-trivial, list what landed there and
+sanity-check it — it may be mis-bucketed real logic (living outside
+`src/`/`python/`/`simpler_setup/`) or out-of-scope files the reviewer
+should question before approval.
+
 ### Mechanism Brief
 
 **Required for PRs over ~500 lines; recommended for medium PRs; may be
@@ -532,6 +714,22 @@ for themselves. May be folded into Issues Found if the table is short
 
 The checklist output from Step 6, organized by type if the PR mixes
 several.
+
+### pto-isa Pin Check
+
+From Step 6.5. **Always rendered when the pin is active** (`PIN_ACTIVE=1`), at one of two severity levels chosen by whether a pto-isa header reference changed — the level is the whole point of this section, so state it explicitly in the heading:
+
+- **No header-reference change** (`PTO_REFS` and `NEW_PTO_INC` empty) → **advisory**. A light, always-on nudge that the pin exists; does not by itself block the merge. Render as a single info line, e.g.:
+
+  > ℹ️ **pto-isa pin:** `pto_isa.pin` is pinned to `<sha>`. No pto-isa header references changed in this PR — confirm the pinned commit is still adequate; bump + rebuild onboard `a2a3` `host_runtime.so` (`SIMPLER_PTO_ISA_COMMIT`) only if needed.
+
+- **Header-reference changed** (`PTO_REFS` or `NEW_PTO_INC` non-empty) → escalate to **recommendation**. Surface a visible reminder and mirror it as a **Should-fix / check** row in Issues Found below so it cannot be missed at Verdict time:
+
+  > ⚠️ **pto-isa pin check:** this PR changes how it references pto-isa while `pto_isa.pin` is pinned to `<sha>`. Verify the pinned commit still provides every pto-isa header the PR references — a **changed pto-isa include path** (e.g. `pto/npu/...` → `pto/...`) is the strongest hint a bump is needed; a newly added pto-isa include is a weaker hint. If the pin is bumped, rebuild onboard `a2a3` `host_runtime.so` against the new commit (`SIMPLER_PTO_ISA_COMMIT`).
+
+  List the triggering signals verbatim (changed pto-isa include paths / newly added pto-isa includes). `PIN_TOUCHED` (the PR edited `pto_isa.pin`) is reported alongside, at whichever level applies, with a note to verify the new SHA and the `host_runtime.so` rebuild.
+
+When the pin is not active, emit the one-line skip note and move on.
 
 ### Issues Found
 

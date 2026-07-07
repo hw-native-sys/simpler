@@ -102,7 +102,7 @@ reliably, far below CI's ~4 vCPU):
 
 ```bash
 # N concurrent instances of one case, on 2 CPUs
-docker run --cpus=2 -e PTO_ISA_ROOT=/pto-isa <image> bash -c '
+docker run --cpus=2 <image> bash -c '
   source .venv/bin/activate
   for c in $(seq 1 8); do
     python -c "from examples.workers.l3.domain_rank_map.main import run; run(\"a5sim\",[0,1,2])" &

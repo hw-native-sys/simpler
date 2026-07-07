@@ -75,9 +75,7 @@ def build_all(
     lib_dir: Path,
     cache_dir: Path,
     platforms: Optional[list] = None,
-    clone_protocol: str = "ssh",
     sanitizer: str = "none",
-    pto_isa_commit: Optional[str] = None,
 ) -> None:
     """Build all runtime variants for the given platforms.
 
@@ -85,15 +83,9 @@ def build_all(
         lib_dir: Final binary output directory (lib/).
         cache_dir: Persistent cmake build directory (build/cache/).
         platforms: List of platform strings. None = auto-detect.
-        clone_protocol: Protocol used by ensure_pto_isa_root() when an
-            onboard platform needs the pto-isa headers and PTO_ISA_ROOT is
-            not pre-set. Mirrors conftest's --clone-protocol flag.
         sanitizer: Sanitizer preset (asan/ubsan/tsan/none) or raw `-fsanitize`
             token list. Only host-compiled targets honor it; see
             BuildTarget.gen_cmake_args.
-        pto_isa_commit: optional pto-isa commit override for the onboard a2a3
-            host build. None uses pto_isa.pin; latest/head/none explicitly
-            tracks origin/HEAD.
     """
     # Override default paths to respect CLI args
     RuntimeBuilder._LIB_DIR = lib_dir
@@ -118,22 +110,17 @@ def build_all(
 
     logger.info(f"Building for platforms: {', '.join(platforms)}")
     pto_isa_root_for_metadata: Optional[str] = None
+    pto_isa_runtime_keys: list[str] = []
 
     # a2a3 onboard host_runtime hard-depends on pto-isa headers + CANN-9.0
     # aclnn syms (cf. src/a2a3/platform/onboard/host/CMakeLists.txt
     # SIMPLER_ENABLE_PTO_SDMA_WORKSPACE marker). Resolve PTO_ISA_ROOT now so
-    # the protocol declared on the CLI (and surfaced in the top-level
-    # CMakeLists invocation) is the one actually used, instead of relying on
-    # the fallback in RuntimeCompiler._init_a2a3. No-ops when PTO_ISA_ROOT
-    # is already set. Skipped when only sim platforms are being built.
-    #
-    # pto_isa_commit can override the repository pin used by the managed clone.
-    # The actual git HEAD used for this build is recorded after the runtime
-    # build completes and later compared with the run-time checkout.
+    # the runtime compiler consumes the same pinned managed checkout as kernel
+    # compilation. Skipped when only sim platforms are being built.
     if "a2a3" in platforms:
         from simpler_setup.pto_isa import ensure_pto_isa_root  # noqa: PLC0415
 
-        pto_isa_root = ensure_pto_isa_root(commit=pto_isa_commit, clone_protocol=clone_protocol, verbose=True)
+        pto_isa_root = ensure_pto_isa_root(verbose=True)
         os.environ["PTO_ISA_ROOT"] = pto_isa_root
         pto_isa_root_for_metadata = pto_isa_root
 
@@ -160,7 +147,7 @@ def build_all(
     # Collect all (platform, runtime_name) tasks to run in parallel
     tasks: list[tuple[str, str]] = []
     for platform in platforms:
-        arch, _ = parse_platform(platform)
+        arch, variant = parse_platform(platform)
         runtimes = discover_runtimes(arch)
 
         if not runtimes:
@@ -169,6 +156,10 @@ def build_all(
 
         for runtime_name in runtimes:
             tasks.append((platform, runtime_name))
+            if arch == "a2a3" and variant == "onboard":
+                from simpler_setup.pto_isa import pto_isa_runtime_artifact_key  # noqa: PLC0415
+
+                pto_isa_runtime_keys.append(pto_isa_runtime_artifact_key(arch, variant, runtime_name))
 
     def _build_runtime(platform: str, runtime_name: str) -> None:
         try:
@@ -200,7 +191,7 @@ def build_all(
     if pto_isa_root_for_metadata is not None:
         from simpler_setup.pto_isa import write_pto_isa_build_metadata  # noqa: PLC0415
 
-        write_pto_isa_build_metadata(lib_dir, pto_isa_root_for_metadata, requested_commit=pto_isa_commit)
+        write_pto_isa_build_metadata(lib_dir, pto_isa_root_for_metadata, pto_isa_runtime_keys)
 
 
 def main():
@@ -228,30 +219,12 @@ def main():
         help="List buildable platforms and exit",
     )
     parser.add_argument(
-        "--clone-protocol",
-        choices=["ssh", "https"],
-        default="ssh",
-        help=(
-            "Protocol for cloning pto-isa when an onboard a2a3 build needs it "
-            "and PTO_ISA_ROOT is not pre-set (default: ssh, matching conftest)"
-        ),
-    )
-    parser.add_argument(
         "--sanitizer",
         default="none",
         help=(
             f"Compiler sanitizer for host-compiled targets. Preset "
             f"({'/'.join(SANITIZER_PRESETS)}) or a raw -fsanitize token list. "
             "Default: none. asan/tsan are mutually exclusive (separate builds)."
-        ),
-    )
-    parser.add_argument(
-        "--pto-isa-commit",
-        default=None,
-        help=(
-            "Override the pto-isa revision before building onboard "
-            "a2a3 host_runtime. Default: use pto_isa.pin. "
-            "Use latest/head/none to track origin/HEAD."
         ),
     )
     args = parser.parse_args()
@@ -277,9 +250,7 @@ def main():
         lib_dir=args.lib_dir,
         cache_dir=args.cache_dir,
         platforms=args.platforms,
-        clone_protocol=args.clone_protocol,
         sanitizer=args.sanitizer,
-        pto_isa_commit=args.pto_isa_commit,
     )
 
 

@@ -14,10 +14,10 @@
  * @brief Host-side scope_stats streaming collector + NDJSON export.
  *
  * Architecture mirrors PmuCollector: BufferPoolManager<ScopeStatsModule> runs
- * the mgmt thread (polls the per-thread ready queue, recycles buffers, refills
- * the single instance's free_queue); ScopeStatsCollector's poll thread appends
- * each full buffer's ScopeStatsRecords to an in-memory vector. After stop(),
- * write_jsonl() renders them to
+ * split mgmt threads (poll per-thread ready queues, recycle buffers, refill the
+ * single instance's free_queue); ScopeStatsCollector's collector thread shards
+ * append each full buffer's ScopeStatsRecords to an in-memory vector. After
+ * stop(), write_jsonl() renders them to
  * <output_dir>/scope_stats/scope_stats.jsonl.
  *
  * Memory mirroring is handled by the framework via the MemoryOps installed
@@ -31,7 +31,7 @@
  * Lifecycle:
  *   init()               — Allocate header + 1 BufferState + N ScopeStatsBuffers
  *                          (pre-fills free_queue; surplus → recycled pool).
- *   start(tf)            — Inherited: launches mgmt + poll threads.
+ *   start(tf)            — Inherited: launches mgmt + collector threads.
  *   [device execution]
  *   stop()               — Inherited: drain queues, join threads.
  *   reconcile_counters() — Recover any un-flushed current buffer left by an
@@ -89,6 +89,8 @@ struct ScopeStatsModule {
     static constexpr uint32_t kReadyQueueSize = PLATFORM_SCOPE_STATS_READYQUEUE_SIZE;
     static constexpr uint32_t kSlotCount = PLATFORM_SCOPE_STATS_SLOT_COUNT;
     static constexpr const char *kSubsystemName = "ScopeStatsModule";
+    static constexpr int kMgmtDrainThreadCount = PLATFORM_MAX_AICPU_THREADS;
+    static constexpr int kCollectorThreadCount = PLATFORM_MAX_AICPU_THREADS;
 
     static constexpr int batch_size(int /*kind*/) {
         constexpr int kBatch = PLATFORM_SCOPE_STATS_BUFFERS_PER_INSTANCE - PLATFORM_SCOPE_STATS_SLOT_COUNT;
@@ -98,7 +100,18 @@ struct ScopeStatsModule {
     static DataHeader *header_from_shm(void *shm) { return get_scope_stats_header(shm); }
 
     static std::optional<profiling_common::EntrySite<ScopeStatsModule>>
-    resolve_entry(void *shm, DataHeader * /*header*/, int q, const ReadyEntry &entry) {
+    resolve_entry(void *shm, DataHeader *header, int q, const ReadyEntry &entry) {
+        if (shm == nullptr || header == nullptr) {
+            LOG_ERROR("ScopeStatsModule: invalid shared memory/header while resolving ready entry");
+            return std::nullopt;
+        }
+        if (header->num_instances != 1 || entry.instance_index >= header->num_instances) {
+            LOG_ERROR(
+                "ScopeStatsModule: invalid ready entry instance=%u (num_instances=%u)", entry.instance_index,
+                header->num_instances
+            );
+            return std::nullopt;
+        }
         ScopeStatsBufferState *state = get_scope_stats_buffer_state(shm, static_cast<int>(entry.instance_index));
         profiling_common::EntrySite<ScopeStatsModule> site;
         site.kind = 0;
@@ -172,7 +185,6 @@ public:
 
 private:
     bool initialized_ = false;
-    int num_threads_ = 0;
 
     // Shared memory region (ScopeStatsDataHeader + ScopeStatsBufferState).
     // shm_host_ / shm_size_ / device_id_ live on ProfilerBase (set via

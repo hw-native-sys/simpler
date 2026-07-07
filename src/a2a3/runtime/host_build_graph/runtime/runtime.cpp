@@ -54,9 +54,6 @@ Runtime::Runtime() {
     tensor_allocation_storage_bytes_ = 0;
     tensor_allocation_count_ = 0;
 
-    // Initialize kernel binary tracking
-    registered_kernel_count_ = 0;
-
     // Initialize function address mapping
     for (int i = 0; i < RUNTIME_MAX_FUNC_ID; i++) {
         func_id_to_addr_[i] = 0;
@@ -211,28 +208,14 @@ void Runtime::print_runtime() const {
     LOG_DEBUG("========================================================================");
 }
 
-// =============================================================================
-// Kernel Binary Address Management
-// =============================================================================
-
-void Runtime::set_function_bin_addr(int func_id, uint64_t addr) {
-    if (func_id < 0 || func_id >= RUNTIME_MAX_FUNC_ID) {
-        LOG_ERROR("[Runtime] func_id=%d is out of range [0, %d)", func_id, RUNTIME_MAX_FUNC_ID);
-        return;
-    }
-    if (addr != 0 && func_id_to_addr_[func_id] == 0) {
-        if (registered_kernel_count_ < RUNTIME_MAX_FUNC_ID) {
-            registered_kernel_func_ids_[registered_kernel_count_++] = func_id;
-        } else {
-            LOG_ERROR(
-                "[Runtime] Registration limit reached (%d). Cannot track func_id=%d for cleanup.", RUNTIME_MAX_FUNC_ID,
-                func_id
-            );
-        }
-    }
-    func_id_to_addr_[func_id] = addr;
+// host_build_graph uploads a variable-length prefix of the Runtime object:
+// everything up to and including the populated task slots. tasks[] is the last
+// device-read member, so this ships every device-read field while truncating the
+// unpopulated task tail and the host-only members declared after tasks[]. See
+// the static_asserts in runtime.h.
+size_t runtime_device_copy_size(const Runtime &rt) {
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Winvalid-offsetof"
+    return offsetof(Runtime, tasks) + static_cast<size_t>(rt.get_task_count()) * sizeof(Task);
+#pragma GCC diagnostic pop
 }
-
-// host_build_graph uploads the whole Runtime object (AICore reads tasks[] etc.
-// by offset), so the device copy size is the full struct.
-size_t runtime_device_copy_size(const Runtime &) { return sizeof(Runtime); }

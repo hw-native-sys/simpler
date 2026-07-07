@@ -145,10 +145,7 @@ private:
     using SimplerInitFn =
         int (*)(void *, int, const uint8_t *, size_t, const uint8_t *, size_t, const uint8_t *, size_t);
     using SimplerRegisterCallableFn = int (*)(void *, int32_t, const void *);
-    using SimplerRunFn = int (*)(
-        void *, void *, int32_t, const void *, int, int, int, int, int, int, int, const uint64_t *, const uint64_t *,
-        const uint64_t *, const char *
-    );
+    using SimplerRunFn = int (*)(void *, void *, int32_t, const void *, const CallConfig *);
     using SimplerUnregisterCallableFn = int (*)(void *, int32_t);
     using GetAicpuDlopenCountFn = size_t (*)(void *);
     using FinalizeDeviceFn = int (*)(void *);

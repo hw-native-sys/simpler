@@ -84,10 +84,9 @@ def build_chip_callable(platform: str) -> ChipCallable:
     runtime = "tensormap_and_ringbuffer"
 
     # 1. Compile the AIV kernel source to a .o. ``pto_isa_root`` is the
-    # sibling header repo; ``ensure_pto_isa_root()`` clones it on first run
-    # (see docs/getting-started.md). Uses HTTPS clone by default; set
-    # PTO_ISA_ROOT to skip the clone and point at an existing checkout.
-    pto_isa_root = ensure_pto_isa_root(clone_protocol="https")
+    # sibling header repo; ``ensure_pto_isa_root()`` clones/updates the
+    # managed checkout on first run (see docs/getting-started.md).
+    pto_isa_root = ensure_pto_isa_root()
     include_dirs = kc.get_orchestration_include_dirs(runtime)
     kernel_bytes = kc.compile_incore(
         source_path=os.path.join(HERE, "kernels/aiv/vector_add_kernel.cpp"),

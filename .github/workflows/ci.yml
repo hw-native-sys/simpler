@@ -153,10 +153,7 @@ jobs:
           pip install '.[test]'
 
       - name: Run Python unit tests
-        # --clone-protocol https mirrors the ST jobs: GH-hosted runners have
-        # no SSH keys, so the default (ssh) would emit a 'Permission denied
-        # (publickey)' git stderr line before the lazy fallback kicks in.
-        run: pytest tests/ut -m "not requires_hardware" -v --clone-protocol https
+        run: pytest tests/ut -m "not requires_hardware" -v
 
       - name: Build and run C++ unit tests
         run: |
@@ -195,9 +192,7 @@ jobs:
             sudo apt-get install -y g++-15 || sudo apt-get install -y g++
             if ! command -v g++-15; then sudo ln -s $(which g++) /usr/local/bin/g++-15; fi
             # graphviz: required by the dep_gen smoke (deps_viewer -> dot).
-            # Installed unconditionally so both a2a3 and a5 sim jobs stay
-            # uniform — the dep_gen test is a2a3-only today but the cost is
-            # negligible and the alternative branch sprawls the install logic.
+            # Both a2a3 and a5 sim jobs run dep_gen, so install it in both.
             sudo apt-get install -y graphviz
           else
             brew install ninja
@@ -226,7 +221,7 @@ jobs:
       - name: Run pytest scene tests (a2a3sim)
         run: |
           pytest examples tests/st --platform a2a3sim --device 0-15 -v \
-            --pto-session-timeout 600 --pto-isa-commit ${{ env.PTO_ISA_COMMIT }} --clone-protocol https --require-pto-isa
+            --pto-session-timeout 600 --require-pto-isa
 
       # DFX per-feature smokes — the default pytest above passes no --enable-*
       # flag, so each capture pipeline gets its own invocation here. Kept as
@@ -236,25 +231,25 @@ jobs:
         run: |
           pytest tests/st/a2a3/tensormap_and_ringbuffer/dfx/dep_gen/test_dep_gen.py \
             --platform a2a3sim --device 0-15 -p no:xdist --pto-session-timeout 600 \
-            --enable-dep-gen --clone-protocol https --pto-isa-commit ${{ env.PTO_ISA_COMMIT }}
+            --require-pto-isa --enable-dep-gen
 
       - name: l2_swimlane smoke
         run: |
           pytest tests/st/a2a3/tensormap_and_ringbuffer/dfx/l2_swimlane/ \
             --platform a2a3sim --device 0-15 -p no:xdist --pto-session-timeout 600 \
-            --enable-l2-swimlane --enable-dep-gen --clone-protocol https --pto-isa-commit ${{ env.PTO_ISA_COMMIT }}
+            --require-pto-isa --enable-l2-swimlane --enable-dep-gen
 
       - name: PMU smoke
         run: |
           pytest tests/st/a2a3/tensormap_and_ringbuffer/dfx/pmu/test_pmu.py \
             --platform a2a3sim --device 0-15 -p no:xdist --pto-session-timeout 600 \
-            --enable-pmu 2 --clone-protocol https --pto-isa-commit ${{ env.PTO_ISA_COMMIT }}
+            --require-pto-isa --enable-pmu 2
 
       - name: args_dump smoke
         run: |
           pytest tests/st/a2a3/tensormap_and_ringbuffer/dfx/args_dump/test_args_dump.py \
             --platform a2a3sim --device 0-15 -p no:xdist --pto-session-timeout 600 \
-            --dump-args --clone-protocol https --pto-isa-commit ${{ env.PTO_ISA_COMMIT }}
+            --require-pto-isa --dump-args
 
   st-sim-a5:
     needs: detect-changes
@@ -286,9 +281,7 @@ jobs:
             sudo apt-get install -y g++-15 || sudo apt-get install -y g++
             if ! command -v g++-15; then sudo ln -s $(which g++) /usr/local/bin/g++-15; fi
             # graphviz: required by the dep_gen smoke (deps_viewer -> dot).
-            # Installed unconditionally so both a2a3 and a5 sim jobs stay
-            # uniform — the dep_gen test is a2a3-only today but the cost is
-            # negligible and the alternative branch sprawls the install logic.
+            # Both a2a3 and a5 sim jobs run dep_gen, so install it in both.
             sudo apt-get install -y graphviz
           else
             brew install ninja
@@ -317,7 +310,7 @@ jobs:
       - name: Run pytest scene tests (a5sim)
         run: |
           pytest examples tests/st --platform a5sim --device 0-15 -v \
-            --pto-session-timeout 600 --pto-isa-commit ${{ env.PTO_ISA_COMMIT }} --clone-protocol https --require-pto-isa
+            --pto-session-timeout 600 --require-pto-isa
 
   # ---------- Profiling sub-flags smoke (compile + run) ----------
   # PTO2_PROFILING / PTO2_ORCH_PROFILING / PTO2_SCHED_PROFILING /
@@ -437,7 +430,7 @@ jobs:
               if ! python -m pytest \
                    "examples/${ARCH_DIR}/tensormap_and_ringbuffer/vector_example/test_vector_example.py" \
                    --platform "$ARCH" --device 0-1 -p no:xdist \
-                   --pto-session-timeout 600 --clone-protocol https; then
+                   --pto-session-timeout 600; then
                 echo "::error::Smoke failed: $ARCH / $NAME"
                 FAIL+=("$ARCH/$NAME (pytest)")
               fi
@@ -477,29 +470,20 @@ jobs:
           python3 -m venv --system-site-packages .venv
           source .venv/bin/activate
           pip install --upgrade pip
-          # The host_runtime build resolves pto-isa from pto_isa.pin by default
-          # (which CI exports as PTO_ISA_COMMIT), so host_runtime.so and the
-          # test-time kernels share one pto-isa revision (see issue #1067).
+          # The host_runtime build and test-time kernels both resolve PTO-ISA
+          # from pto_isa.pin, so they share one ISA revision.
           pip install '.[test]'
 
       - name: Run Python hardware unit tests
         run: |
           source /usr/local/Ascend/cann/set_env.sh
           source .venv/bin/activate
-          # Pin to the same commit pip install built host_runtime against, so
-          # conftest does not reset build/pto-isa to HEAD (which would diverge
-          # from the pre-built host_runtime and break the C++ UT rebuild below).
-          python -m pytest tests -m requires_hardware --platform a2a3 --device ${DEVICE_RANGE} -v \
-            --pto-isa-commit ${{ env.PTO_ISA_COMMIT }}
+          python -m pytest tests -m requires_hardware --platform a2a3 --device ${DEVICE_RANGE} -v
 
       - name: Build and run C++ hardware unit tests
         run: |
           source /usr/local/Ascend/cann/set_env.sh
           source .venv/bin/activate
-          # pip install's build_runtimes.py already cloned pto-isa into
-          # build/pto-isa at PTO_ISA_COMMIT; point this step's RuntimeBuilder at
-          # it so _init_a2a3's PTO_ISA_ROOT check passes without re-cloning.
-          export PTO_ISA_ROOT="$(pwd)/build/pto-isa"
           python -c "from simpler_setup.runtime_builder import RuntimeBuilder; RuntimeBuilder('a2a3').get_binaries('tensormap_and_ringbuffer', build=True)"
           cmake -B tests/ut/cpp/build -S tests/ut/cpp -DSIMPLER_ENABLE_HARDWARE_TESTS=ON
           cmake --build tests/ut/cpp/build
@@ -571,9 +555,8 @@ jobs:
           python3 -m venv --system-site-packages .venv
           source .venv/bin/activate
           pip install --upgrade pip
-          # The host_runtime build resolves pto-isa from pto_isa.pin by default
-          # (which CI exports as PTO_ISA_COMMIT), so host_runtime.so and the
-          # test-time kernels share one pto-isa revision (see issue #1067).
+          # The host_runtime build and test-time kernels both resolve PTO-ISA
+          # from pto_isa.pin, so they share one ISA revision.
           pip install '.[test]'
           # Warn if graphviz isn't installed on the runner — the dep_gen
           # smoke step needs `dot` to render deps_viewer. The Python
@@ -588,7 +571,7 @@ jobs:
           source /usr/local/Ascend/cann/set_env.sh
           source .venv/bin/activate
           python -m pytest examples tests/st --platform a2a3 --device ${DEVICE_RANGE} -v \
-            --pto-session-timeout 600 --pto-isa-commit ${{ env.PTO_ISA_COMMIT }} --clone-protocol ssh --require-pto-isa
+            --pto-session-timeout 600 --require-pto-isa
 
       # DFX per-feature smokes — hardware mirror of the st-sim-a2a3 set. The
       # race window in dep_gen only fires on real timing, so this row is
@@ -600,7 +583,7 @@ jobs:
           source .venv/bin/activate
           python -m pytest tests/st/a2a3/tensormap_and_ringbuffer/dfx/dep_gen/test_dep_gen.py \
             --platform a2a3 --device ${DEVICE_RANGE} -p no:xdist --pto-session-timeout 600 \
-            --enable-dep-gen --clone-protocol ssh --pto-isa-commit ${{ env.PTO_ISA_COMMIT }}
+            --require-pto-isa --enable-dep-gen
 
       - name: l2_swimlane smoke
         run: |
@@ -608,7 +591,7 @@ jobs:
           source .venv/bin/activate
           python -m pytest tests/st/a2a3/tensormap_and_ringbuffer/dfx/l2_swimlane/ \
             --platform a2a3 --device ${DEVICE_RANGE} -p no:xdist --pto-session-timeout 600 \
-            --enable-l2-swimlane --enable-dep-gen --clone-protocol ssh --pto-isa-commit ${{ env.PTO_ISA_COMMIT }}
+            --require-pto-isa --enable-l2-swimlane --enable-dep-gen
 
       - name: PMU smoke
         run: |
@@ -616,7 +599,7 @@ jobs:
           source .venv/bin/activate
           python -m pytest tests/st/a2a3/tensormap_and_ringbuffer/dfx/pmu/test_pmu.py \
             --platform a2a3 --device ${DEVICE_RANGE} -p no:xdist --pto-session-timeout 600 \
-            --enable-pmu 2 --clone-protocol ssh --pto-isa-commit ${{ env.PTO_ISA_COMMIT }}
+            --require-pto-isa --enable-pmu 2
 
       - name: args_dump smoke
         run: |
@@ -624,7 +607,7 @@ jobs:
           source .venv/bin/activate
           python -m pytest tests/st/a2a3/tensormap_and_ringbuffer/dfx/args_dump/test_args_dump.py \
             --platform a2a3 --device ${DEVICE_RANGE} -p no:xdist --pto-session-timeout 600 \
-            --dump-args --clone-protocol ssh --pto-isa-commit ${{ env.PTO_ISA_COMMIT }}
+            --require-pto-isa --dump-args
 
 
   # ---------- Detect platform-specific changes (runs on GitHub server) ----------
@@ -695,16 +678,15 @@ jobs:
           python3 -m venv --system-site-packages .venv
           source .venv/bin/activate
           pip install --upgrade pip
-          # The host_runtime build resolves pto-isa from pto_isa.pin by default
-          # (which CI exports as PTO_ISA_COMMIT), so host_runtime.so and the
-          # test-time kernels share one pto-isa revision (see issue #1067).
+          # The host_runtime build and test-time kernels both resolve PTO-ISA
+          # from pto_isa.pin, so they share one ISA revision.
           pip install '.[test]'
 
       - name: Run Python hardware unit tests (a5)
         run: |
           source .venv/bin/activate
           DEVICE_LIST=$(python -c "p='${DEVICE_RANGE}'.split('-'); s,e=p[0],p[-1]; print(','.join(str(i) for i in range(int(s),int(e)+1)))")
-          task-submit --timeout 1800 --max-time 1800 --device "$DEVICE_LIST" --run "python -m pytest tests -m requires_hardware --platform a5 --device ${DEVICE_RANGE} -v --pto-isa-commit ${{ env.PTO_ISA_COMMIT }}"
+          task-submit --timeout 1800 --max-time 1800 --device "$DEVICE_LIST" --run "python -m pytest tests -m requires_hardware --platform a5 --device ${DEVICE_RANGE} -v"
 
       - name: Build and run C++ hardware unit tests (a5)
         run: |
@@ -772,14 +754,13 @@ jobs:
           python3 -m venv --system-site-packages .venv
           source .venv/bin/activate
           pip install --upgrade pip
-          # The host_runtime build resolves pto-isa from pto_isa.pin by default
-          # (which CI exports as PTO_ISA_COMMIT), so host_runtime.so and the
-          # test-time kernels share one pto-isa revision (see issue #1067).
+          # The host_runtime build and test-time kernels both resolve PTO-ISA
+          # from pto_isa.pin, so they share one ISA revision.
           pip install '.[test]'
 
       - name: Run pytest scene tests (a5)
         run: |
           source .venv/bin/activate
           DEVICE_LIST=$(python -c "p='${DEVICE_RANGE}'.split('-'); s,e=p[0],p[-1]; print(','.join(str(i) for i in range(int(s),int(e)+1)))")
-          PYTEST="python -m pytest examples tests/st --platform a5 --device ${DEVICE_RANGE} -v --clone-protocol ssh --require-pto-isa"
-          task-submit --timeout 1800 --max-time 1800 --device "$DEVICE_LIST" --run "$PYTEST --pto-session-timeout 1200 --pto-isa-commit ${{ env.PTO_ISA_COMMIT }}"
+          PYTEST="python -m pytest examples tests/st --platform a5 --device ${DEVICE_RANGE} -v --require-pto-isa"
+          task-submit --timeout 1800 --max-time 1800 --device "$DEVICE_LIST" --run "$PYTEST --pto-session-timeout 1200"

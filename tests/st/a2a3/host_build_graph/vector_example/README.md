@@ -61,8 +61,8 @@ The `a2a3sim` backend emulates the AICPU/AICore execution model in-process:
 ## Troubleshooting
 
 - **Kernel compile fails on `a2a3`:** PTO-ISA is auto-cloned on first run. If
-  that fails, clone it manually to `build/pto-isa` or set
-  `PTO_ISA_ROOT=/path/to/pto-isa` (see [docs/getting-started.md](../../../../docs/getting-started.md)).
+  that fails, clone it manually to `build/pto-isa` (see
+  [docs/getting-started.md](../../../../docs/getting-started.md)).
 - **Device init fails on `a2a3`:** check CANN env (`source
   $ASCEND_HOME_PATH/bin/setenv.bash`) and that the chosen `-d <id>` is free.
 - **`"binary_data cannot be empty"`:** wrong `--platform`, missing kernel

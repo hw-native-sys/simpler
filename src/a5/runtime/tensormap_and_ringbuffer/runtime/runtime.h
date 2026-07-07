@@ -111,11 +111,16 @@ struct Handshake {
     volatile uint32_t aicore_regs_ready;  // AICore ID reported: 0=pending, 1=done
 } __attribute__((aligned(64)));
 
+enum class TensorReleaseKind {
+    Free,
+    BufferNoop,
+    ExternalNoop,
+};
+
 /**
- * Tensor pair for tracking host-device memory mappings.
- * Used for copy-back during finalize.
+ * Tensor lease for tracking host-device memory mappings and release ownership.
  */
-struct TensorPair {
+struct TensorLease {
     void *host_ptr;
     void *dev_ptr;
     size_t size;
@@ -123,6 +128,7 @@ struct TensorPair {
     // so the end-of-run D2H copy-back is skipped. OUTPUT/INOUT/unknown
     // keep the safe default of copying back.
     bool needs_copy_back = true;
+    TensorReleaseKind release_kind = TensorReleaseKind::Free;
 };
 
 /**
@@ -152,10 +158,11 @@ struct Task {
  *
  * Adding a field here grows the device image; adding a field to Runtime's
  * host-only tail does not. Keep it standard-layout (static_assert below) so the
- * rtMemcpy is well-defined. alignas(64) makes sizeof a multiple of the cache
- * line so the per-run cache_invalidate_range(runtime, sizeof(dev)) never rounds
- * into a neighbouring line (the leading Handshake is already 64-aligned, but the
- * explicit alignas keeps the property if fields are ever reordered).
+ * rtMemcpy is well-defined. alignas(64) keeps sizeof a multiple of the cache
+ * line so the device-copied image starts and ends on cache-line boundaries and
+ * never shares a line with Runtime's host-only tail (the leading Handshake is
+ * already 64-aligned, but the explicit alignas keeps the property if fields are
+ * ever reordered).
  */
 struct alignas(64) DeviceRuntimeLaunchDesc {
     // Handshake buffers for AICPU-AICore communication
@@ -232,14 +239,6 @@ public:
     // copies sizeof(DeviceRuntimeLaunchDesc) bytes from offset 0.
     DeviceRuntimeLaunchDesc dev;
 
-private:
-    // ---- host-only tail (never uploaded to device) ----
-
-    // Kernel binary tracking for cleanup
-    int registered_kernel_func_ids_[RUNTIME_MAX_FUNC_ID];
-    int registered_kernel_count_;
-
-public:
     /**
      * Constructor - zero-initialize all arrays
      */
@@ -298,18 +297,12 @@ public:
     int32_t get_active_callable_id() const;
 
     uint64_t get_function_bin_addr(int func_id) const;
-    void set_function_bin_addr(int func_id, uint64_t addr);
     /**
-     * Replay a previously-uploaded kernel address onto a fresh Runtime
-     * without recording it in registered_kernel_func_ids_. Used by
-     * DeviceRunner::bind_callable_to_runtime so prepared kernel
-     * binaries are not freed by validate_runtime_impl across runs.
+     * Replay a previously-uploaded kernel address onto a fresh Runtime.
+     * Used by DeviceRunner::bind_callable_to_runtime to rebind prepared
+     * kernel binaries onto the runtime before each run.
      */
     void replay_function_bin_addr(int func_id, uint64_t addr);
-
-    int get_registered_kernel_count() const;
-    int get_registered_kernel_func_id(int index) const;
-    void clear_registered_kernels();
 
     // =========================================================================
     // Deprecated API (for platform compatibility, always returns 0/nullptr)
@@ -329,7 +322,7 @@ public:
     // Host-side tensor ledger for D2H copy-back at finalize. Populated by
     // runtime_maker.cpp from orch_args at bind time, then iterated in
     // validate_runtime_impl. Host-only (after `dev`): never uploaded.
-    std::vector<TensorPair> tensor_pairs_;
+    std::vector<TensorLease> tensor_leases_;
 };
 
 // `dev` must be the first member so the narrowed H2D copy starts at offset 0.
@@ -354,7 +347,7 @@ static_assert(
 );
 static_assert(
     sizeof(DeviceRuntimeLaunchDesc) % 64 == 0,
-    "DeviceRuntimeLaunchDesc size must be a multiple of 64 so cache_invalidate_range(sizeof(dev)) "
+    "DeviceRuntimeLaunchDesc size must be a multiple of 64 so the device-copied image "
     "stays cache-line aligned"
 );
 

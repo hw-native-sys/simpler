@@ -22,7 +22,7 @@ namespace {
 
 class TestSimRunner : public SimDeviceRunnerBase {
 public:
-    int run(Runtime &, int, int) override { return 0; }
+    int run(Runtime &, const CallConfig &) override { return 0; }
     int finalize() override {
         l3_l2_orch_comm_shutdown();
         mem_alloc_.finalize();

@@ -63,42 +63,6 @@ struct PTO2ReadyQueueSlot {
 };
 
 /**
- * Thread-local ready buffer for local-first dispatch optimization.
- *
- * Two buffers per scheduling thread, one per CoreType (AIC=0, AIV=1).
- * Initialized once before the scheduling loop; must be empty at
- * the start of each iteration (verified by always_assert).
- *
- * Phase 1 fills per-CoreType buffers via on_task_complete().
- * The dispatch stage drains them local-first via get_ready_tasks_batch,
- * with any remaining tasks pushed to the global ready queue.
- */
-// Number of CoreType values eligible for local dispatch (AIC=0, AIV=1)
-static constexpr int PTO2_LOCAL_DISPATCH_TYPE_NUM = 2;
-
-struct PTO2LocalReadyBuffer {
-    PTO2TaskSlotState **slot_states = nullptr;
-    int count = 0;
-    int capacity = 0;
-
-    void reset(PTO2TaskSlotState **buf, int cap) {
-        slot_states = buf;
-        count = 0;
-        capacity = cap;
-    }
-
-    bool try_push(PTO2TaskSlotState *s) {
-        if (slot_states && count < capacity) {
-            slot_states[count++] = s;
-            return true;
-        }
-        return false;
-    }
-
-    PTO2TaskSlotState *pop() { return (count > 0) ? slot_states[--count] : nullptr; }
-};
-
-/**
  * Lock-free bounded MPMC queue (Dmitry Vyukov design)
  *
  * Key properties:
@@ -834,9 +798,7 @@ struct PTO2SchedulerState {
 
     // Route a ready slot to the right global queue. Dummy tasks (empty
     // active_mask) live in dummy_ready_queue; everything else goes to the
-    // per-shape ready_queues[]. Used by paths that do not have a thread-local
-    // ready buffer (e.g. wiring). See push_ready_routed_local for the
-    // dispatch-time fast path.
+    // per-shape ready_queues[].
     void push_ready_routed(PTO2TaskSlotState *slot_state) {
         PTO2ResourceShape shape = slot_state->active_mask.to_shape();
         if (shape == PTO2ResourceShape::DUMMY) {
@@ -1157,9 +1119,7 @@ struct PTO2SchedulerState {
         return slot_state.next_block_idx.load(std::memory_order_seq_cst) >= slot_state.logical_block_num;
     }
 
-    bool release_fanin_and_check_ready(
-        PTO2TaskSlotState &slot_state, PTO2LocalReadyBuffer *local_bufs = nullptr, SpecReleaseSink *sink = nullptr
-    ) {
+    bool release_fanin_and_check_ready(PTO2TaskSlotState &slot_state, SpecReleaseSink *sink = nullptr) {
         // Atomically increment fanin_refcount and check if all producers are done
         // ACQ_REL on fanin_refcount already synchronizes with the orchestrator's
         // init release, making fanin_count visible — plain load suffices.
@@ -1169,16 +1129,7 @@ struct PTO2SchedulerState {
             // Speculative early-dispatch: pre-staged tasks are released by doorbell
             // here, skipping the ready-queue round-trip entirely.
             if (try_speculative_release(slot_state, sink)) return true;
-            // Local-first: try per-CoreType thread-local buffer before global queue
-            // Route by active_mask: AIC-containing tasks → buf[0], AIV-only → buf[1]
-            // DUMMY shape is out of range for local_bufs (sized PTO2_NUM_RESOURCE_SHAPES);
-            // dummy slots bypass the local fast path and go straight to dummy_ready_queue.
-            PTO2ResourceShape shape = slot_state.active_mask.to_shape();
-            if (shape == PTO2ResourceShape::DUMMY) {
-                dummy_ready_queue.push(&slot_state);
-            } else if (!local_bufs || !local_bufs[static_cast<int32_t>(shape)].try_push(&slot_state)) {
-                ready_queues[static_cast<int32_t>(shape)].push(&slot_state);
-            }
+            push_ready_routed(&slot_state);
             return true;
         }
         return false;
@@ -1186,8 +1137,7 @@ struct PTO2SchedulerState {
 
 #if PTO2_ORCH_PROFILING || PTO2_SCHED_PROFILING
     bool release_fanin_and_check_ready(
-        PTO2TaskSlotState &slot_state, uint64_t &atomic_count, uint64_t &push_wait,
-        PTO2LocalReadyBuffer *local_bufs = nullptr, SpecReleaseSink *sink = nullptr
+        PTO2TaskSlotState &slot_state, uint64_t &atomic_count, uint64_t &push_wait, SpecReleaseSink *sink = nullptr
     ) {
         int32_t new_refcount = slot_state.fanin_refcount.fetch_add(1, std::memory_order_acq_rel) + 1;
         atomic_count += 1;  // fanin_refcount.fetch_add
@@ -1196,14 +1146,13 @@ struct PTO2SchedulerState {
             // Speculative early-dispatch: pre-staged tasks are released by doorbell
             // here, skipping the ready-queue round-trip entirely.
             if (try_speculative_release(slot_state, sink)) return true;
-            // Local-first: try per-CoreType thread-local buffer before global queue.
-            // Dummy slots bypass local_bufs (out-of-range for PTO2_NUM_RESOURCE_SHAPES)
-            // and go straight to dummy_ready_queue; use the profiling-aware push so
-            // atomic_count / push_wait stay consistent with the non-dummy path.
+            // Dummy slots go to dummy_ready_queue; everything else to the per-shape
+            // ready_queues[]. Use the profiling-aware push so atomic_count / push_wait
+            // stay consistent with the non-dummy path.
             PTO2ResourceShape shape = slot_state.active_mask.to_shape();
             if (shape == PTO2ResourceShape::DUMMY) {
                 dummy_ready_queue.push(&slot_state, atomic_count, push_wait);
-            } else if (!local_bufs || !local_bufs[static_cast<int32_t>(shape)].try_push(&slot_state)) {
+            } else {
                 ready_queues[static_cast<int32_t>(shape)].push(&slot_state, atomic_count, push_wait);
             }
             return true;
@@ -1212,35 +1161,15 @@ struct PTO2SchedulerState {
     }
 #endif
 
-    int get_ready_tasks_batch(
-        PTO2ResourceShape shape, PTO2LocalReadyBuffer &local_buf, PTO2TaskSlotState **out, int max_count
-    ) {
-        int count = 0;
-        while (count < max_count && local_buf.count > 0) {
-            out[count++] = local_buf.slot_states[--local_buf.count];
-        }
-        int remaining = max_count - count;
-        if (remaining > 0) {
-            count += ready_queues[static_cast<int32_t>(shape)].pop_batch(out + count, remaining);
-        }
-        return count;
+    int get_ready_tasks_batch(PTO2ResourceShape shape, PTO2TaskSlotState **out, int max_count) {
+        return ready_queues[static_cast<int32_t>(shape)].pop_batch(out, max_count);
     }
 
 #if PTO2_SCHED_PROFILING
     int get_ready_tasks_batch(
-        PTO2ResourceShape shape, PTO2LocalReadyBuffer &local_buf, PTO2TaskSlotState **out, int max_count,
-        uint64_t &atomic_count, uint64_t &wait_cycle
+        PTO2ResourceShape shape, PTO2TaskSlotState **out, int max_count, uint64_t &atomic_count, uint64_t &wait_cycle
     ) {
-        int count = 0;
-        while (count < max_count && local_buf.count > 0) {
-            out[count++] = local_buf.slot_states[--local_buf.count];
-        }
-        int remaining = max_count - count;
-        if (remaining > 0) {
-            count +=
-                ready_queues[static_cast<int32_t>(shape)].pop_batch(out + count, remaining, atomic_count, wait_cycle);
-        }
-        return count;
+        return ready_queues[static_cast<int32_t>(shape)].pop_batch(out, max_count, atomic_count, wait_cycle);
     }
 #endif
 
@@ -1292,12 +1221,11 @@ struct PTO2SchedulerState {
     uint32_t
 #endif
     on_task_complete(
-        PTO2TaskSlotState &slot_state,
+        PTO2TaskSlotState &slot_state
 #if PTO2_SCHED_PROFILING
-        int thread_idx,
+        ,
+        int thread_idx
 #endif
-
-        PTO2LocalReadyBuffer *local_bufs = nullptr
     ) {
 #if PTO2_SCHED_PROFILING
         CompletionStats stats = {0, 0, 0, true};
@@ -1352,12 +1280,12 @@ struct PTO2SchedulerState {
             PTO2TaskSlotState &consumer_slot = *current->slot_state;
 #if PTO2_SCHED_PROFILING
             stats.fanout_edges++;
-            if (release_fanin_and_check_ready(consumer_slot, fanout_atomics, push_wait, local_bufs, &rel_sink)) {
+            if (release_fanin_and_check_ready(consumer_slot, fanout_atomics, push_wait, &rel_sink)) {
                 stats.tasks_enqueued++;
             }
 #else
             consumer_walk_count++;
-            release_fanin_and_check_ready(consumer_slot, local_bufs, &rel_sink);
+            release_fanin_and_check_ready(consumer_slot, &rel_sink);
 #endif
             current = current->next;
         }
@@ -1465,9 +1393,9 @@ AsyncWaitList::try_inline_complete_locked(AsyncWaitList::DrainCompletionSink &si
     // Return value (CompletionStats / consumer-walk count) discarded:
     // async-wait drain path has no Resolve swimlane bar attached.
 #if PTO2_SCHED_PROFILING
-    (void)sink.sched->on_task_complete(slot_state, sink.thread_idx, sink.local_bufs);
+    (void)sink.sched->on_task_complete(slot_state, sink.thread_idx);
 #else
-    (void)sink.sched->on_task_complete(slot_state, sink.local_bufs);
+    (void)sink.sched->on_task_complete(slot_state);
 #endif
     if (*sink.deferred_release_count >= sink.deferred_release_capacity) {
         while (*sink.deferred_release_count > 0) {
@@ -1487,7 +1415,7 @@ AsyncWaitList::try_inline_complete_locked(AsyncWaitList::DrainCompletionSink &si
 
 template <bool Profiling>
 inline AsyncPollResult AsyncWaitList::poll_and_complete(
-    AICoreCompletionMailbox *aicore_mailbox, PTO2SchedulerState *sched, PTO2LocalReadyBuffer *local_bufs,
+    AICoreCompletionMailbox *aicore_mailbox, PTO2SchedulerState *sched,
     PTO2TaskSlotState **deferred_release_slot_states, int32_t &deferred_release_count, int32_t deferred_release_capacity
 #if PTO2_SCHED_PROFILING
     ,
@@ -1499,7 +1427,6 @@ inline AsyncPollResult AsyncWaitList::poll_and_complete(
 
     AsyncWaitList::DrainCompletionSink sink{};
     sink.sched = sched;
-    sink.local_bufs = local_bufs;
     sink.deferred_release_slot_states = deferred_release_slot_states;
     sink.deferred_release_count = &deferred_release_count;
     sink.deferred_release_capacity = deferred_release_capacity;
@@ -1547,9 +1474,9 @@ inline AsyncPollResult AsyncWaitList::poll_and_complete(
             // Return value (CompletionStats / consumer-walk count) discarded:
             // deferred-completion drain has no Resolve swimlane bar attached.
 #if PTO2_SCHED_PROFILING
-            (void)sched->on_task_complete(*entry.slot_state, thread_idx, local_bufs);
+            (void)sched->on_task_complete(*entry.slot_state, thread_idx);
 #else
-            (void)sched->on_task_complete(*entry.slot_state, local_bufs);
+            (void)sched->on_task_complete(*entry.slot_state);
 #endif
             // Drain deferred_release in place when the buffer fills — same
             // overflow-drain idiom used by complete_slot_task's inline path

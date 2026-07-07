@@ -33,6 +33,7 @@
 
 #include "aicpu/device_phase_aicpu.h"
 #include "aicpu/platform_aicpu_affinity.h"
+#include "call_config.h"
 #include "callable_protocol.h"
 #include "common/memory_barrier.h"
 #include "common/platform_config.h"
@@ -207,7 +208,10 @@ int DeviceRunner::invoke_device_register(const RegisterCallableArgs &reg_args) {
     return aicpu_register_callable_func_(const_cast<RegisterCallableArgs *>(&reg_args));
 }
 
-int DeviceRunner::run(Runtime &runtime, int block_dim, int launch_aicpu_num) {
+int DeviceRunner::run(Runtime &runtime, const CallConfig &config) {
+    apply_call_config(config);
+    int block_dim = config.block_dim;
+    const int launch_aicpu_num = config.aicpu_thread_num;
     clear_cpu_sim_shared_storage();
     if (launch_aicpu_num < 1 || launch_aicpu_num > PLATFORM_MAX_AICPU_THREADS) {
         LOG_ERROR("launch_aicpu_num (%d) must be in range [1, %d]", launch_aicpu_num, PLATFORM_MAX_AICPU_THREADS);
@@ -703,6 +707,7 @@ int DeviceRunner::finalize() {
     gm_heap_arena_.release();
     gm_sm_arena_.release();
     runtime_arena_pool_.release();
+    clear_temporary_buffer();
     cached_gm_heap_size_ = 0;
     cached_gm_sm_size_ = 0;
     cached_runtime_arena_size_ = 0;

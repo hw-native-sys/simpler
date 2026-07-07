@@ -91,7 +91,6 @@ Then, from the worktree, the qwen runs assume this env:
 ```bash
 source .venv/bin/activate
 eval "$(pypto-setup --export)"            # PTOAS_ROOT, ASCEND_HOME_PATH, gcc-15, PATH
-export PTO_ISA_ROOT="$PWD/build/pto-isa"  # needed to build the simpler runtime
 PY="$PWD/.venv/bin/python"
 ```
 

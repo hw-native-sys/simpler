@@ -73,7 +73,7 @@ bool SchedulerContext::has_idle_in_other_threads(int32_t self_thread_idx, PTO2Re
 }
 
 int SchedulerContext::pop_ready_tasks_batch(
-    PTO2ResourceShape shape, int32_t thread_idx, PTO2LocalReadyBuffer &local_buf, PTO2TaskSlotState **out, int max_count
+    PTO2ResourceShape shape, int32_t thread_idx, PTO2TaskSlotState **out, int max_count
 ) {
 #if PTO2_PROFILING
     auto &l2_swimlane = sched_l2_swimlane_[thread_idx];
@@ -81,11 +81,11 @@ int SchedulerContext::pop_ready_tasks_batch(
     extern uint64_t g_sched_pop_atomic_count[], g_sched_pop_wait_cycle[];
     uint64_t t_pop_start = get_sys_cnt_aicpu();
     int count = sched_->get_ready_tasks_batch(
-        shape, local_buf, out, max_count, g_sched_pop_atomic_count[thread_idx], g_sched_pop_wait_cycle[thread_idx]
+        shape, out, max_count, g_sched_pop_atomic_count[thread_idx], g_sched_pop_wait_cycle[thread_idx]
     );
     l2_swimlane.sched_dispatch_pop_cycle += (get_sys_cnt_aicpu() - t_pop_start);
 #else
-    int count = sched_->get_ready_tasks_batch(shape, local_buf, out, max_count);
+    int count = sched_->get_ready_tasks_batch(shape, out, max_count);
 #endif
     if (l2_swimlane_level_ >= L2SwimlaneLevel::SCHED_PHASES) {
         if (count > 0) {
@@ -96,7 +96,7 @@ int SchedulerContext::pop_ready_tasks_batch(
     }
 #else
     (void)thread_idx;
-    int count = sched_->get_ready_tasks_batch(shape, local_buf, out, max_count);
+    int count = sched_->get_ready_tasks_batch(shape, out, max_count);
 #endif
     return count;
 }
@@ -263,7 +263,7 @@ void SchedulerContext::dispatch_block(
 
 void SchedulerContext::dispatch_shape(
     Runtime *runtime, int32_t thread_idx, PTO2ResourceShape shape, CoreTracker::DispatchPhase phase,
-    PTO2LocalReadyBuffer &local_buf, CoreTracker &tracker, bool &entered_drain, bool &made_progress, bool &try_pushed
+    CoreTracker &tracker, bool &entered_drain, bool &made_progress, bool &try_pushed
 ) {
 #if PTO2_SCHED_PROFILING
     auto &l2_swimlane = sched_l2_swimlane_[thread_idx];
@@ -278,7 +278,7 @@ void SchedulerContext::dispatch_shape(
     while (cores.has_value() && !entered_drain) {
         int want = cores.count();
         PTO2TaskSlotState *batch[CoreTracker::MAX_CLUSTERS * 3];
-        int got = pop_ready_tasks_batch(shape, thread_idx, local_buf, batch, want);
+        int got = pop_ready_tasks_batch(shape, thread_idx, batch, want);
         if (got == 0) break;
 
         bool dispatched_any = false;
@@ -369,11 +369,9 @@ void SchedulerContext::dispatch_shape(
 }
 
 void SchedulerContext::dispatch_ready_tasks(
-    Runtime *runtime, int32_t thread_idx, CoreTracker &tracker,
-    PTO2LocalReadyBuffer (&local_bufs)[PTO2_NUM_RESOURCE_SHAPES], bool pmu_active, bool &made_progress, bool &try_pushed
+    Runtime *runtime, int32_t thread_idx, CoreTracker &tracker, bool pmu_active, bool &made_progress, bool &try_pushed
 ) {
     using Phase = CoreTracker::DispatchPhase;
-    constexpr int32_t MIX_I = static_cast<int32_t>(PTO2ResourceShape::MIX);
 
     // MIX is handled explicitly at the top of each stage; only AIC/AIV cycle
     // through this 2-elem array, with order toggled by thread parity for
@@ -384,80 +382,52 @@ void SchedulerContext::dispatch_ready_tasks(
     };
     const PTO2ResourceShape *aic_aiv = kAicAivOrder[thread_idx & 1];
 
-    auto flush_local_bufs = [&]() {
-        for (int32_t s = 0; s < PTO2_NUM_RESOURCE_SHAPES; s++) {
-            auto &lb = local_bufs[s];
-            if (lb.count > 0) {
-                sched_->ready_queues[s].push_batch(lb.slot_states, lb.count);
-                lb.count = 0;
-            }
-        }
-    };
-    // Every return path below must flush; wrap in RAII so we cannot forget.
-    // The mid-function flush between IDLE and PENDING is still called
-    // explicitly — guard only covers exit.
-    struct FlushGuard {
-        decltype(flush_local_bufs) &flush_fn;
-        ~FlushGuard() { flush_fn(); }
-    } flush_guard{flush_local_bufs};
-
     bool entered_drain = false;
 
     // ===== IDLE stage =====
     dispatch_shape(
-        runtime, thread_idx, PTO2ResourceShape::MIX, Phase::IDLE, local_bufs[MIX_I], tracker, entered_drain,
-        made_progress, try_pushed
+        runtime, thread_idx, PTO2ResourceShape::MIX, Phase::IDLE, tracker, entered_drain, made_progress, try_pushed
     );
     if (entered_drain) return;
 
     // MIX-IDLE residual: AIC/AIV (both IDLE and PENDING) yield for this pass.
     // MIX-PENDING below still runs — that is the core of "mix strict priority":
     // pending slots are spent on mix before AIC/AIV get any chance.
-    bool skip_aic_aiv = has_residual_mix(local_bufs[MIX_I]);
+    bool skip_aic_aiv = has_residual_mix();
 
     if (!skip_aic_aiv) {
         for (int i = 0; i < 2; i++) {
             PTO2ResourceShape s = aic_aiv[i];
-            dispatch_shape(
-                runtime, thread_idx, s, Phase::IDLE, local_bufs[static_cast<int32_t>(s)], tracker, entered_drain,
-                made_progress, try_pushed
-            );
+            dispatch_shape(runtime, thread_idx, s, Phase::IDLE, tracker, entered_drain, made_progress, try_pushed);
             if (entered_drain) return;
         }
     }
-
-    // Flush between IDLE and PENDING so PENDING-stage queue-size checks and any
-    // peer-thread reads see the IDLE-stage release_fanin output.
-    flush_local_bufs();
 
     if (pmu_active) return;
 
     // ===== PENDING stage =====
     // MIX-PENDING gate: skip when a peer has an idle MIX-capable cluster — that
     // peer's next IDLE-MIX iteration will pull the mix task from the global
-    // queue (already flushed above) at lower latency than us pre-loading a
-    // pending slot here. Forward progress for MIX is preserved: at least one
-    // thread will run MIX-IDLE next pass and consume the residual.
+    // queue at lower latency than us pre-loading a pending slot here. Forward
+    // progress for MIX is preserved: at least one thread will run MIX-IDLE next
+    // pass and consume the residual.
     //
     // The gate is NOT subject to skip_aic_aiv — residual mix continues to drain
     // via pending slots on this thread when no peer is idle.
     if (!has_idle_in_other_threads(thread_idx, PTO2ResourceShape::MIX)) {
         dispatch_shape(
-            runtime, thread_idx, PTO2ResourceShape::MIX, Phase::PENDING, local_bufs[MIX_I], tracker, entered_drain,
-            made_progress, try_pushed
+            runtime, thread_idx, PTO2ResourceShape::MIX, Phase::PENDING, tracker, entered_drain, made_progress,
+            try_pushed
         );
         if (entered_drain) return;
     }
 
     // Re-check after MIX-PENDING. If MIX-IDLE already set skip_aic_aiv, leave
     // it set; otherwise, escalate iff PENDING-MIX left residual.
-    if (!skip_aic_aiv && has_residual_mix(local_bufs[MIX_I])) {
+    if (!skip_aic_aiv && has_residual_mix()) {
         skip_aic_aiv = true;
     }
 
-    // PENDING-MIX may have re-populated AIC/AIV local_bufs via release_fanin
-    // during in-flight completions; flush_guard ensures these don't carry
-    // across to the next iteration's IDLE stage.
     if (skip_aic_aiv) return;
 
     // AIC/AIV-PENDING gate: a peer-idle skip is a delay, not a loss — the peer
@@ -465,10 +435,7 @@ void SchedulerContext::dispatch_ready_tasks(
     for (int i = 0; i < 2; i++) {
         PTO2ResourceShape s = aic_aiv[i];
         if (has_idle_in_other_threads(thread_idx, s)) continue;
-        dispatch_shape(
-            runtime, thread_idx, s, Phase::PENDING, local_bufs[static_cast<int32_t>(s)], tracker, entered_drain,
-            made_progress, try_pushed
-        );
+        dispatch_shape(runtime, thread_idx, s, Phase::PENDING, tracker, entered_drain, made_progress, try_pushed);
         if (entered_drain) return;
     }
 }
@@ -512,12 +479,6 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
     l2_swimlane.l2_swimlane_enabled = (l2_swimlane_level_ != L2SwimlaneLevel::DISABLED);
 #endif
 
-    constexpr int LOCAL_READY_CAP_PER_TYPE = 64;
-    PTO2TaskSlotState *local_ptrs[PTO2_NUM_RESOURCE_SHAPES][LOCAL_READY_CAP_PER_TYPE];
-    PTO2LocalReadyBuffer local_bufs[PTO2_NUM_RESOURCE_SHAPES];
-    for (int32_t i = 0; i < PTO2_NUM_RESOURCE_SHAPES; i++) {
-        local_bufs[i].reset(local_ptrs[i], LOCAL_READY_CAP_PER_TYPE);
-    }
     PTO2TaskSlotState *deferred_release_slot_states[PTO2_DEFERRED_RELEASE_CAP];
     int32_t deferred_release_count = 0;
 
@@ -540,34 +501,27 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
 
 #if PTO2_PROFILING
     // Queue-depth snapshot carried across the iteration boundary: each phase
-    // emit consumes (phase_start_*) and refreshes them with its own end snapshot
-    // so the next phase's "at_start" equals the previous phase's "at_end".
+    // emit consumes (phase_start_shared) and refreshes it with its own end
+    // snapshot so the next phase's "at_start" equals the previous phase's
+    // "at_end".
     //
     // L2SWIMLANE_NUM_QUEUE_SHAPES (3) matches PTO2_NUM_RESOURCE_SHAPES: AIC/AIV/MIX.
     //
-    // **Hot-path cost discipline.** Local depth (this thread's PTO2LocalReadyBuffer)
-    // is a single int read on a register-cached stack — free. Shared depth
-    // (PTO2ReadyQueue::size) is two atomic relaxed loads against cache lines
-    // that all peer sched threads also write to (enqueue_pos and dequeue_pos
-    // bounce on every flush_local_bufs + every pop). With both phases emitting
-    // per iter that's 12 cross-core loads × thousands of iters per run, a
-    // measurable AICPU slowdown. Mitigation: lazy + per-iter cached shared
-    // snapshot, refreshed at most once per iteration. The complete-emit and
-    // dispatch-emit in the same iter both reuse the same shared sample; the
-    // big transitions (local→shared flush) still show up across iter boundaries.
+    // **Hot-path cost discipline.** Shared depth (PTO2ReadyQueue::size) is two
+    // atomic relaxed loads against cache lines that all peer sched threads also
+    // write to (enqueue_pos and dequeue_pos bounce on every push + every pop).
+    // With both phases emitting per iter that's cross-core loads × thousands of
+    // iters per run, a measurable AICPU slowdown. Mitigation: lazy + per-iter
+    // cached shared snapshot, refreshed at most once per iteration. The
+    // complete-emit and dispatch-emit in the same iter both reuse the same
+    // shared sample.
     static_assert(
         L2SWIMLANE_NUM_QUEUE_SHAPES == PTO2_NUM_RESOURCE_SHAPES,
         "queue snapshot width must match runtime resource shape count"
     );
-    int16_t phase_start_local[L2SWIMLANE_NUM_QUEUE_SHAPES] = {0};
     int16_t phase_start_shared[L2SWIMLANE_NUM_QUEUE_SHAPES] = {0};
     int16_t iter_shared_snapshot[L2SWIMLANE_NUM_QUEUE_SHAPES] = {0};
     bool iter_shared_sampled = false;
-    auto capture_local_snapshot = [&](int16_t local_out[L2SWIMLANE_NUM_QUEUE_SHAPES]) {
-        for (int s = 0; s < L2SWIMLANE_NUM_QUEUE_SHAPES; s++) {
-            local_out[s] = static_cast<int16_t>(local_bufs[s].count);
-        }
-    };
     auto get_or_sample_shared = [&]() -> const int16_t * {
         if (!iter_shared_sampled) {
             // Clamp to int16_t max before narrowing. PTO2_PROF_READYQUEUE_SIZE
@@ -583,15 +537,22 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
         }
         return iter_shared_snapshot;
     };
-    auto capture_phase_end = [&](int16_t local_out[L2SWIMLANE_NUM_QUEUE_SHAPES],
-                                 int16_t shared_out[L2SWIMLANE_NUM_QUEUE_SHAPES]) {
-        capture_local_snapshot(local_out);
+    auto capture_phase_end = [&](int16_t shared_out[L2SWIMLANE_NUM_QUEUE_SHAPES]) {
         const int16_t *shared_cached = get_or_sample_shared();
         for (int s = 0; s < L2SWIMLANE_NUM_QUEUE_SHAPES; s++)
             shared_out[s] = shared_cached[s];
     };
+    // Queue-mutating phases (Complete / Wire / Dummy) push newly-ready consumers
+    // straight into the shared ready_queues[] (the local-first buffer is gone),
+    // so their end-of-phase shared depth differs from their start. Force a fresh
+    // re-sample for those emits — this also refreshes the per-iter cache so the
+    // next phase's start snapshot is not stale.
+    auto capture_phase_end_fresh = [&](int16_t shared_out[L2SWIMLANE_NUM_QUEUE_SHAPES]) {
+        iter_shared_sampled = false;
+        capture_phase_end(shared_out);
+    };
     if (l2_swimlane_level_ >= L2SwimlaneLevel::SCHED_PHASES) {
-        capture_phase_end(phase_start_local, phase_start_shared);
+        capture_phase_end(phase_start_shared);
     }
 #endif
 
@@ -643,7 +604,7 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
         if (try_completed) {
             check_running_cores_for_completion(
                 thread_idx, hank, completed_this_turn, cur_thread_completed, made_progress,
-                deferred_release_slot_states, deferred_release_count, local_bufs
+                deferred_release_slot_states, deferred_release_count
             );
         }
         if (completed_this_turn > 0) {
@@ -667,7 +628,7 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
         if (rt_ != nullptr && rt_->aicore_mailbox != nullptr &&
             (sched_->async_wait_list.count > 0 || rt_->aicore_mailbox->has_pending())) {
             AsyncPollResult poll_result = sched_->async_wait_list.poll_and_complete<false>(
-                rt_->aicore_mailbox, sched_, local_bufs, deferred_release_slot_states, deferred_release_count,
+                rt_->aicore_mailbox, sched_, deferred_release_slot_states, deferred_release_count,
                 PTO2_DEFERRED_RELEASE_CAP
 #if PTO2_SCHED_PROFILING
                 ,
@@ -699,24 +660,17 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
         } else {
             CYCLE_COUNT_LAP(l2_swimlane.sched_complete_cycle);
             if (l2_swimlane_level_ >= L2SwimlaneLevel::SCHED_PHASES && l2_swimlane.phase_complete_count > 0) {
-                // Local depth is cheap (this thread's own buffer counter).
-                // Shared depth is NOT sampled here: complete's release_fanin
-                // pushes to local_bufs in the fast path (try_push succeeds
-                // until cap=64). Shared only changes on dispatch's flush
-                // path. Carrying phase_start_shared forward as end_shared
-                // is the right answer 99% of the time AND skips three
-                // contended atomic loads per emit.
-                int16_t phase_end_local[L2SWIMLANE_NUM_QUEUE_SHAPES];
-                capture_local_snapshot(phase_end_local);
+                // Complete's release_fanin pushes newly-ready consumers into the
+                // shared ready_queues[], so the end depth differs from the start.
+                int16_t phase_end_shared[L2SWIMLANE_NUM_QUEUE_SHAPES];
+                capture_phase_end_fresh(phase_end_shared);
                 l2_swimlane_aicpu_record_sched_phase(
                     thread_idx, L2SwimlaneSchedPhaseKind::Complete, _t0_phase, _t1, l2_swimlane.sched_loop_count,
-                    l2_swimlane.phase_complete_count, /*pop_hit=*/0, /*pop_miss=*/0, phase_start_local,
-                    phase_start_shared, phase_end_local, phase_start_shared
+                    l2_swimlane.phase_complete_count, /*pop_hit=*/0, /*pop_miss=*/0, phase_start_shared,
+                    phase_end_shared
                 );
-                for (int s = 0; s < L2SWIMLANE_NUM_QUEUE_SHAPES; s++) {
-                    phase_start_local[s] = phase_end_local[s];
-                    // phase_start_shared unchanged — carried forward
-                }
+                for (int s = 0; s < L2SWIMLANE_NUM_QUEUE_SHAPES; s++)
+                    phase_start_shared[s] = phase_end_shared[s];
                 _t0_phase = _t1;
                 l2_swimlane.phase_complete_count = 0;
             }
@@ -747,16 +701,14 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
         // Wire outer phase: emit one bar covering this iter's drain_wiring_queue
         // pass when it wired any tasks. tasks_processed = wired count.
         if (l2_swimlane_level_ >= L2SwimlaneLevel::SCHED_PHASES && wired > 0) {
-            int16_t phase_end_local[L2SWIMLANE_NUM_QUEUE_SHAPES];
-            capture_local_snapshot(phase_end_local);
+            int16_t phase_end_shared[L2SWIMLANE_NUM_QUEUE_SHAPES];
+            capture_phase_end_fresh(phase_end_shared);
             l2_swimlane_aicpu_record_sched_phase(
                 thread_idx, L2SwimlaneSchedPhaseKind::Wire, _t0_phase, _t1, l2_swimlane.sched_loop_count,
-                static_cast<uint32_t>(wired), /*pop_hit=*/0, /*pop_miss=*/0, phase_start_local, phase_start_shared,
-                phase_end_local, phase_start_shared
+                static_cast<uint32_t>(wired), /*pop_hit=*/0, /*pop_miss=*/0, phase_start_shared, phase_end_shared
             );
-            for (int s = 0; s < L2SWIMLANE_NUM_QUEUE_SHAPES; s++) {
-                phase_start_local[s] = phase_end_local[s];
-            }
+            for (int s = 0; s < L2SWIMLANE_NUM_QUEUE_SHAPES; s++)
+                phase_start_shared[s] = phase_end_shared[s];
             _t0_phase = _t1;
         }
 #endif
@@ -780,9 +732,9 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
             for (int di = 0; di < dummy_got; di++) {
                 PTO2TaskSlotState &dummy_slot = *dummy_batch[di];
 #if PTO2_SCHED_PROFILING
-                sched_->on_task_complete(dummy_slot, thread_idx, local_bufs);
+                sched_->on_task_complete(dummy_slot, thread_idx);
 #else
-                sched_->on_task_complete(dummy_slot, local_bufs);
+                sched_->on_task_complete(dummy_slot);
 #endif
                 // Dummy tasks have no subtasks to retire and no fanout pre-conditions
                 // beyond their own producers; release self-reference so the slot can
@@ -808,17 +760,16 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
             }
 #if PTO2_PROFILING
             if (dummy_outer_t0 != 0) {
-                int16_t phase_end_local[L2SWIMLANE_NUM_QUEUE_SHAPES];
-                capture_local_snapshot(phase_end_local);
                 uint64_t dummy_outer_t1 = get_sys_cnt_aicpu();
+                int16_t phase_end_shared[L2SWIMLANE_NUM_QUEUE_SHAPES];
+                capture_phase_end_fresh(phase_end_shared);
                 l2_swimlane_aicpu_record_sched_phase(
                     thread_idx, L2SwimlaneSchedPhaseKind::Dummy, dummy_outer_t0, dummy_outer_t1,
                     l2_swimlane.sched_loop_count, static_cast<uint32_t>(dummy_got), /*pop_hit=*/0,
-                    /*pop_miss=*/0, phase_start_local, phase_start_shared, phase_end_local, phase_start_shared
+                    /*pop_miss=*/0, phase_start_shared, phase_end_shared
                 );
-                for (int s = 0; s < L2SWIMLANE_NUM_QUEUE_SHAPES; s++) {
-                    phase_start_local[s] = phase_end_local[s];
-                }
+                for (int s = 0; s < L2SWIMLANE_NUM_QUEUE_SHAPES; s++)
+                    phase_start_shared[s] = phase_end_shared[s];
                 _t0_phase = dummy_outer_t1;
             }
 #endif
@@ -827,7 +778,7 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
         // Phase 4: MIX-strict-priority dispatch with phase-split and
         // cross-thread idle gating. See dispatch_ready_tasks for the policy.
         // pmu_active is cached at function scope above (loop-invariant).
-        dispatch_ready_tasks(runtime, thread_idx, tracker, local_bufs, pmu_active, made_progress, try_pushed);
+        dispatch_ready_tasks(runtime, thread_idx, tracker, pmu_active, made_progress, try_pushed);
 
 #if PTO2_PROFILING
         if (!try_pushed) {
@@ -844,17 +795,14 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
                 // realistic dispatch cadence and silently truncates without this guard.
                 debug_assert(pop_hit_delta < (1ULL << 32));
                 debug_assert(pop_miss_delta < (1ULL << 32));
-                int16_t phase_end_local[L2SWIMLANE_NUM_QUEUE_SHAPES];
                 int16_t phase_end_shared[L2SWIMLANE_NUM_QUEUE_SHAPES];
-                capture_phase_end(phase_end_local, phase_end_shared);
+                capture_phase_end(phase_end_shared);
                 l2_swimlane_aicpu_record_sched_phase(
                     thread_idx, L2SwimlaneSchedPhaseKind::Dispatch, _t0_phase, _t1, l2_swimlane.sched_loop_count,
                     l2_swimlane.phase_dispatch_count, static_cast<uint32_t>(pop_hit_delta),
-                    static_cast<uint32_t>(pop_miss_delta), phase_start_local, phase_start_shared, phase_end_local,
-                    phase_end_shared
+                    static_cast<uint32_t>(pop_miss_delta), phase_start_shared, phase_end_shared
                 );
                 for (int s = 0; s < L2SWIMLANE_NUM_QUEUE_SHAPES; s++) {
-                    phase_start_local[s] = phase_end_local[s];
                     phase_start_shared[s] = phase_end_shared[s];
                 }
                 _t0_phase = _t1;
@@ -967,13 +915,12 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
         debug_assert(final_pop_miss_delta < (1ULL << 32));
         if (final_pop_hit_delta != 0 || final_pop_miss_delta != 0) {
             uint64_t t_now = get_sys_cnt_aicpu();
-            int16_t phase_end_local[L2SWIMLANE_NUM_QUEUE_SHAPES];
             int16_t phase_end_shared[L2SWIMLANE_NUM_QUEUE_SHAPES];
-            capture_phase_end(phase_end_local, phase_end_shared);
+            capture_phase_end(phase_end_shared);
             l2_swimlane_aicpu_record_sched_phase(
                 thread_idx, L2SwimlaneSchedPhaseKind::Dispatch, t_now, t_now, l2_swimlane.sched_loop_count, 0,
                 static_cast<uint32_t>(final_pop_hit_delta), static_cast<uint32_t>(final_pop_miss_delta),
-                phase_end_local, phase_end_shared, phase_end_local, phase_end_shared
+                phase_end_shared, phase_end_shared
             );
             l2_swimlane.pop_hit_at_last_emit = l2_swimlane.pop_hit;
             l2_swimlane.pop_miss_at_last_emit = l2_swimlane.pop_miss;

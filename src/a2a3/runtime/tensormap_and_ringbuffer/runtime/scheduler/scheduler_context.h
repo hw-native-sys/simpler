@@ -208,10 +208,7 @@ private:
         return "?";
     }
 
-    int pop_ready_tasks_batch(
-        PTO2ResourceShape shape, int32_t thread_idx, PTO2LocalReadyBuffer &local_buf, PTO2TaskSlotState **out,
-        int max_count
-    );
+    int pop_ready_tasks_batch(PTO2ResourceShape shape, int32_t thread_idx, PTO2TaskSlotState **out, int max_count);
 
     void build_payload(
         PTO2DispatchPayload &dispatch_payload, PTO2TaskSlotState &slot_state, PTO2SubtaskSlot subslot,
@@ -254,8 +251,8 @@ private:
     );
 
     void dispatch_shape(
-        int32_t thread_idx, PTO2ResourceShape shape, CoreTracker::DispatchPhase phase, PTO2LocalReadyBuffer &local_buf,
-        CoreTracker &tracker, bool &entered_drain, bool &made_progress, bool &try_pushed
+        int32_t thread_idx, PTO2ResourceShape shape, CoreTracker::DispatchPhase phase, CoreTracker &tracker,
+        bool &entered_drain, bool &made_progress, bool &try_pushed
     );
 
     // Speculative early-dispatch (Hook 1). After normal dispatch leaves idle
@@ -276,10 +273,10 @@ private:
     );
 
     // One pass of "Phase 4" in the resolve_and_dispatch loop: IDLE-stage dispatch
-    // for MIX then (if no mix residual) AIC/AIV; mid-flush of local buffers; then
-    // PENDING-stage dispatch with cross-thread idle gating. MIX is strictly
-    // prioritized — when mix residual is detected after MIX-IDLE, AIC/AIV are
-    // skipped for the whole pass but MIX-PENDING still runs.
+    // for MIX then (if no mix residual) AIC/AIV; then PENDING-stage dispatch with
+    // cross-thread idle gating. MIX is strictly prioritized — when mix residual is
+    // detected after MIX-IDLE, AIC/AIV are skipped for the whole pass but
+    // MIX-PENDING still runs.
     //
     // Forward-progress argument for AIC/AIV: skip_aic_aiv is sticky for the
     // current pass only. The next loop iteration re-evaluates after Phase 1
@@ -288,8 +285,7 @@ private:
     // not unbounded — once mix completes on at least one cluster, the next
     // pass either drains the residual or admits AIC/AIV.
     void dispatch_ready_tasks(
-        int32_t thread_idx, CoreTracker &tracker, PTO2LocalReadyBuffer (&local_bufs)[PTO2_NUM_RESOURCE_SHAPES],
-        bool pmu_active, bool &made_progress, bool &try_pushed
+        int32_t thread_idx, CoreTracker &tracker, bool pmu_active, bool &made_progress, bool &try_pushed
     );
 
     // Returns true if any *other* scheduler thread currently has an idle core
@@ -298,15 +294,14 @@ private:
     // rationale and the safety argument against the drain worker.
     bool has_idle_in_other_threads(int32_t self_thread_idx, PTO2ResourceShape shape) const;
 
-    // True if mix tasks remain anywhere this thread could see them: the caller's
-    // MIX local LIFO stack or the global MIX ready queue. Approximate —
+    // True if mix tasks remain in the global MIX ready queue. Approximate —
     // PTO2ReadyQueue::size() (see pto_scheduler.h) snapshots its enqueue/dequeue
     // positions with std::memory_order_relaxed and may interleave with concurrent
     // push/pop. Don't confuse with PTO2SpscQueue::size(), which uses acquire
     // loads — that one isn't on this path. A stale read here causes at most one
     // extra/missed AIC/AIV skip and self-corrects on the next loop iteration.
-    bool has_residual_mix(const PTO2LocalReadyBuffer &mix_local_buf) const {
-        return mix_local_buf.count > 0 || sched_->ready_queues[static_cast<int32_t>(PTO2ResourceShape::MIX)].size() > 0;
+    bool has_residual_mix() const {
+        return sched_->ready_queues[static_cast<int32_t>(PTO2ResourceShape::MIX)].size() > 0;
     }
 
     // =========================================================================
@@ -320,8 +315,7 @@ private:
     void complete_slot_task(
         PTO2TaskSlotState &slot_state, int32_t expected_reg_task_id, PTO2SubtaskSlot subslot, int32_t thread_idx,
         int32_t core_id, Handshake *hank, int32_t &completed_this_turn,
-        PTO2TaskSlotState *deferred_release_slot_states[], int32_t &deferred_release_count,
-        PTO2LocalReadyBuffer *local_bufs
+        PTO2TaskSlotState *deferred_release_slot_states[], int32_t &deferred_release_count
 #if PTO2_PROFILING
         ,
         uint64_t dispatch_ts, uint64_t finish_ts
@@ -333,8 +327,7 @@ private:
 
     void check_running_cores_for_completion(
         int32_t thread_idx, Handshake *hank, int32_t &completed_this_turn, int32_t &cur_thread_completed,
-        bool &made_progress, PTO2TaskSlotState *deferred_release_slot_states[], int32_t &deferred_release_count,
-        PTO2LocalReadyBuffer *local_bufs
+        bool &made_progress, PTO2TaskSlotState *deferred_release_slot_states[], int32_t &deferred_release_count
     );
 
     bool enter_drain_mode(PTO2TaskSlotState *slot_state, int32_t block_num);

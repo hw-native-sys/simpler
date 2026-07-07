@@ -30,6 +30,7 @@
 #define SRC_A2A3_RUNTIME_HOST_BUILD_GRAPH_RUNTIME_RUNTIME_H_
 
 #include <stdbool.h>
+#include <stddef.h>  // for offsetof (layout static_asserts)
 #include <stdint.h>
 #include <stdio.h>   // for fprintf, printf
 #include <string.h>  // for memset
@@ -174,7 +175,17 @@ typedef struct {
  */
 class Runtime {
 public:
-    // Handshake buffers for AICPU-AICore communication
+    // ===================== Device-read prefix =====================
+    // Everything from here through `tasks[]` is uploaded to the device. The
+    // ordering is load-bearing: AICore reads `workers[]` at offset 0 and
+    // `tasks[i]` by offset, and `tasks[]` is the LAST device-read member so a
+    // variable-length H2D copy of `offsetof(tasks) + get_task_count()*sizeof(Task)`
+    // (see runtime_device_copy_size) keeps every preceding field at its fixed
+    // offset while shipping only the populated task slots. All fields device
+    // code may read must therefore precede `tasks[]`; the offsetof static_asserts
+    // after the class enforce this. These are public (not hidden behind the
+    // accessors) because they form the host/device ABI, mirroring trb's
+    // DeviceRuntimeLaunchDesc.
     Handshake workers[RUNTIME_MAX_WORKER];  // Worker (AICore) handshake buffers
     int worker_count;                       // Number of active workers
 
@@ -183,47 +194,55 @@ public:
     // round-robin across the assigned cores. See AicpuExecutor::init.
     int aicpu_thread_num;
 
-    // Task storage
-    Task tasks[RUNTIME_MAX_TASKS];  // Fixed-size task array
-
     // TraCR data placeholder
     // Those are the pointers with the allocated memory on the device
     void *tracrData_;
     void *tracrDataSizes_;
 
-    // Filter-style affinity gate input (a2a3 onboard). Placed AFTER `tasks`
-    // because AICore reads runtime->tasks[] by offset. Host fills these before
+    // Filter-style affinity gate input (a2a3 onboard). Host fills these before
     // launch from AICPU OCCUPY; the device gate keeps threads whose
-    // sched_getcpu() lands on one of the cpu_ids. The array position is the
-    // deterministic exec_idx used by AicpuExecutor for stable core assignment.
+    // sched_getcpu() lands on one of the cpu_ids. Read device-side in kernel.cpp,
+    // so it must precede `tasks[]`.
     int32_t aicpu_allowed_cpus[MAX_GATE_THREADS];
     int32_t aicpu_allowed_cpu_count;
     int32_t aicpu_launch_count;
 
-private:
-    int next_task_id;  // Next available task ID
+    // Next available task ID. Device-read via get_task_count() (AICPU task loop
+    // bound), so it lives in the prefix.
+    int next_task_id;
 
-    // Initial ready tasks (computed once, read-only after)
-    int initial_ready_tasks[RUNTIME_MAX_TASKS];
-    int initial_ready_count;
-
-    // Function address mapping (for API compatibility with rt2)
+    // Function address mapping (for API compatibility with rt2). Device-read
+    // under PTO2_PROFILING (dump-args path), so it lives in the prefix.
     uint64_t func_id_to_addr_[RUNTIME_MAX_FUNC_ID];
 
-    // Kernel binary tracking for cleanup
-    int registered_kernel_func_ids_[RUNTIME_MAX_FUNC_ID];
-    int registered_kernel_count_;
-
-    // Tensor info metadata for tensor dump
+    // Tensor info metadata for tensor dump. Device-read via get_tensor_info()
+    // under PTO2_PROFILING, so it lives in the prefix.
     void *tensor_info_storage_;
     uint64_t tensor_info_storage_bytes_;
     uint32_t tensor_info_offsets_[RUNTIME_MAX_TASKS];
     uint16_t tensor_info_counts_[RUNTIME_MAX_TASKS];
 
-    // Device allocation ranges used to recover tensor buffer addresses from task.args[]
+    // Device allocation ranges used to recover tensor buffer addresses from
+    // task.args[]. Device-read via is_tensor_buffer_addr() under PTO2_PROFILING,
+    // so it lives in the prefix.
     void *tensor_allocation_storage_;
     uint64_t tensor_allocation_storage_bytes_;
     uint32_t tensor_allocation_count_;
+
+    // Task storage — LAST device-read member. The variable-length H2D copy stops
+    // at offsetof(tasks) + get_task_count()*sizeof(Task); the unpopulated tail is
+    // never read device-side (get_task() bounds-checks task_id < next_task_id,
+    // and AICore only touches AICPU-dispatched ids).
+    Task tasks[RUNTIME_MAX_TASKS];  // Fixed-size task array
+
+private:
+    // ===================== Host-only tail =====================
+    // Never crosses to the device (physically after `tasks[]`, excluded from the
+    // H2D copy). See also active_callable_id_ / tensor_pairs_ declared below.
+
+    // Initial ready tasks (computed once, read-only after)
+    int initial_ready_tasks[RUNTIME_MAX_TASKS];
+    int initial_ready_count;
 
 public:
     /**
@@ -417,32 +436,14 @@ public:
     }
 
     /**
-     * Set function binary address for a func_id.
-     * Called by platform layer after kernel registration.
-     */
-    void set_function_bin_addr(int func_id, uint64_t addr);
-
-    /**
-     * Replay a previously-uploaded kernel address onto a fresh Runtime
-     * without recording it in registered_kernel_func_ids_. Used by
-     * DeviceRunner::bind_callable_to_runtime when restoring kernels
-     * across simpler_run invocations: the prepared callable owns the
-     * kernel binaries' device memory until unregister, so
-     * validate_runtime_impl must NOT free them.
+     * Replay a previously-uploaded kernel address onto a fresh Runtime.
+     * Used by DeviceRunner::bind_callable_to_runtime to rebind prepared
+     * kernel binaries onto the runtime before each simpler_run invocation.
      */
     void replay_function_bin_addr(int func_id, uint64_t addr) {
         if (func_id < 0 || func_id >= RUNTIME_MAX_FUNC_ID) return;
         func_id_to_addr_[func_id] = addr;
     }
-
-    int get_registered_kernel_count() const { return registered_kernel_count_; }
-
-    int get_registered_kernel_func_id(int index) const {
-        if (index < 0 || index >= registered_kernel_count_) return -1;
-        return registered_kernel_func_ids_[index];
-    }
-
-    void clear_registered_kernels() { registered_kernel_count_ = 0; }
 
     // =========================================================================
     // Host-only state (not copied to device)
@@ -459,15 +460,44 @@ public:
 
     // Host-side tensor ledger for D2H copy-back at finalize. Populated by
     // runtime_maker.cpp from orch_args at bind time; iterated in
-    // validate_runtime_impl. Not read by AICPU/AICore — the device-side
-    // Runtime image carries the std::vector control block as harmless
-    // garbage. No fixed cap.
+    // validate_runtime_impl. Not read by AICPU/AICore and — being after
+    // `tasks[]` in the host-only tail — is not uploaded to the device at all.
+    // No fixed cap.
     std::vector<TensorPair> tensor_pairs_;
 };
 
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Winvalid-offsetof"
+// Layout invariants for the variable-length H2D copy (runtime_device_copy_size).
+// workers[] must be first (AICore reads runtime->workers[block_idx] at offset 0),
+// and tasks[] must be the highest-offset device-read member so copying
+// offsetof(tasks) + n*sizeof(Task) covers every field the device reads while
+// truncating only the unpopulated task tail. The host-only tail
+// (initial_ready_*, registered_*, active_callable_id_, tensor_pairs_) sits after
+// tasks[] and is excluded from the copy. (offsetof over Runtime is technically
+// non-standard-layout due to the std::vector tail; the pragma silences that —
+// the device-read prefix is all standard-layout scalars/arrays.)
+static_assert(offsetof(Runtime, workers) == 0, "workers[] must be first: AICore reads offset 0");
+static_assert(
+    offsetof(Runtime, tasks) > offsetof(Runtime, aicpu_allowed_cpus),
+    "tasks[] must follow the affinity gate array (device-read at fixed offset)"
+);
+static_assert(
+    offsetof(Runtime, tasks) > offsetof(Runtime, func_id_to_addr_),
+    "tasks[] must follow func_id_to_addr_ (device-read under profiling)"
+);
+static_assert(
+    offsetof(Runtime, tasks) > offsetof(Runtime, tensor_allocation_count_),
+    "tasks[] must be the last device-read member (all profiling metadata precedes it)"
+);
+#pragma GCC diagnostic pop
+
 // Number of bytes of the Runtime image copied to the device. host_build_graph
-// uploads the whole object (AICore reads tasks[] etc. by offset), so this is
-// sizeof(Runtime). Mirrors the trb declaration so the shared
+// uploads a variable-length prefix: everything from offset 0 up to and including
+// the populated task slots, i.e. offsetof(Runtime, tasks) + n*sizeof(Task).
+// tasks[] is the last device-read member (static_asserts above), so this ships
+// every device-read field while truncating the unpopulated task tail and the
+// host-only members after tasks[]. Mirrors the trb declaration so the shared
 // device_runner_helpers.cpp copy path is runtime-agnostic.
 size_t runtime_device_copy_size(const Runtime &rt);
 

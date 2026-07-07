@@ -20,7 +20,7 @@ namespace {
 
 class UnsupportedL3L2Runner : public DeviceRunnerBase {
 public:
-    int run(Runtime &, int, int) override { return 0; }
+    int run(Runtime &, const CallConfig &) override { return 0; }
     int finalize() override { return 0; }
     bool l3_l2_orch_comm_supported() const override { return false; }
 };

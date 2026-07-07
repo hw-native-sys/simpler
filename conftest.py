@@ -190,22 +190,6 @@ def pytest_addoption(parser):
         "Requires --enable-l2-swimlane + deps.json (re-run with --enable-dep-gen if absent).",
     )
     parser.addoption(
-        "--pto-isa-commit",
-        action="store",
-        default=None,
-        help=(
-            "Override the pto-isa revision before running tests. "
-            "Default: use pto_isa.pin. Use latest/head/none to track origin/HEAD."
-        ),
-    )
-    parser.addoption(
-        "--clone-protocol",
-        action="store",
-        default="ssh",
-        choices=["ssh", "https"],
-        help="Protocol for cloning pto-isa when PTO_ISA_ROOT is not already set",
-    )
-    parser.addoption(
         "--sanitizer",
         action="store",
         default="none",
@@ -441,14 +425,8 @@ def pytest_configure(config):
     log_level = config.getoption("--log-level", default=None)
     configure_logging(log_level or DEFAULT_LOG_LEVEL)
 
-    commit = config.getoption("--pto-isa-commit")
-    clone_protocol = config.getoption("--clone-protocol")
-    # Pre-clone / refresh PTO-ISA up front so that (a) the requested
-    # --clone-protocol is honored before SceneTestCase's lazy default-ssh
-    # resolve, and (b) the local clone is fetched to origin/HEAD so a
-    # requested/default pto-isa commit doesn't miss a recently-published object.
-    # Short-circuits when $PTO_ISA_ROOT already points to a user-managed clone.
-    #
+    # Pre-clone / refresh PTO-ISA up front so scene-test children inherit the
+    # pinned managed checkout resolved from pto_isa.pin.
     # Pre-clone is an optimization, not a requirement: jobs that don't actually
     # need PTO-ISA (e.g. pytest tests/ut on a runner without SSH keys) must not
     # be aborted when the eager clone fails. If an actual scene test later needs
@@ -458,12 +436,7 @@ def pytest_configure(config):
     # (CI scene-test jobs) want the session to die here rather than fan out
     # into device subprocesses that each re-attempt the clone.
     try:
-        root = ensure_pto_isa_root(
-            verbose=True,
-            commit=commit,
-            clone_protocol=clone_protocol,
-            update_if_exists=True,
-        )
+        root = ensure_pto_isa_root(verbose=True)
     except OSError as e:
         if config.getoption("--require-pto-isa"):
             pytest.exit(f"PTO-ISA required but unavailable: {e}", returncode=pytest.ExitCode.USAGE_ERROR)
@@ -768,6 +741,39 @@ def _emit_group(header: str, body: str) -> None:
     print("::endgroup::", flush=True)
 
 
+def _github_actions_escape(value: object) -> str:
+    """Escape a value for the GitHub Actions workflow-command payload."""
+    return str(value).replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+
+
+def _emit_resource_failure_summary(
+    results: list[_ps.JobResult],
+    *,
+    emit_annotations: bool = True,
+    heading: str = "Resource phase failed",
+) -> None:
+    """Print failed Resource child jobs outside collapsible groups."""
+    failed = [r for r in results if r.returncode != 0]
+    if not failed:
+        return
+
+    print(f"\n*** {heading}: {len(failed)} child job(s) ***", flush=True)
+    for res in failed:
+        devices = ",".join(str(d) for d in res.device_ids)
+        nodeid = res.nodeid or "<unknown>"
+        if emit_annotations:
+            message = _github_actions_escape(f"{nodeid} ({res.label}) rc={res.returncode} devices=[{devices}]")
+            print(f"::error title=Resource phase failed::{message}", flush=True)
+
+        print(
+            f"- nodeid={nodeid}",
+            flush=True,
+        )
+        print(f"  label={res.label}", flush=True)
+        print(f"  rc={res.returncode} devices={res.device_ids} duration={res.duration_s:.1f}s", flush=True)
+        print("  full output is in the Resource child group above", flush=True)
+
+
 def _dispatch_test_phases(session, resource_specs):  # noqa: PLR0912
     """Run Resource → L2 phases.
 
@@ -794,6 +800,7 @@ def _dispatch_test_phases(session, resource_specs):  # noqa: PLR0912
 
     # ----- Phase 1: Resource (L3 classes + standalone resource functions) -----
     resource_failed = False
+    resource_results: list[_ps.JobResult] = []
     if resource_specs:
         jobs = []
         for spec in resource_specs:
@@ -831,18 +838,20 @@ def _dispatch_test_phases(session, resource_specs):  # noqa: PLR0912
                     device_count=spec.device_count,
                     build_cmd=_build,
                     cwd=str(cwd),
+                    nodeid=spec.nodeid,
                 )
             )
 
         def _on_done(res):
             tag = "PASS" if res.returncode == 0 else f"FAIL rc={res.returncode}"
-            header = f"{res.label} [{tag} {res.duration_s:.1f}s, devices={res.device_ids}]"
+            nodeid = res.nodeid or "<unknown>"
+            header = f"{res.label} nodeid={nodeid} [{tag} {res.duration_s:.1f}s, devices={res.device_ids}]"
             _emit_group(header, res.output)
             if res.returncode != 0:
                 # Out-of-group summary so a reviewer scanning the collapsed
                 # log still sees the failure without having to expand.
                 print(
-                    f"*** FAIL: {res.label} (devices={res.device_ids}) — expand group above ***",
+                    f"*** FAIL: {nodeid} ({res.label}, devices={res.device_ids}) — expand group above ***",
                     flush=True,
                 )
 
@@ -862,7 +871,10 @@ def _dispatch_test_phases(session, resource_specs):  # noqa: PLR0912
             print(f"\n*** Resource phase ABORTED: {e} ***\n", flush=True)
             session.testsfailed = 1
             return True
+        resource_results = results
         resource_failed = any(r.returncode != 0 for r in results)
+        if resource_failed:
+            _emit_resource_failure_summary(results)
         if any(r.returncode == TIMEOUT_EXIT_CODE for r in results):
             print("\n*** Resource phase: TIMED OUT ***\n", flush=True)
             os._exit(TIMEOUT_EXIT_CODE)
@@ -942,6 +954,13 @@ def _dispatch_test_phases(session, resource_specs):  # noqa: PLR0912
             print(f"*** FAIL: L2 {rt} — expand group above ***", flush=True)
             if fail_fast:
                 break
+
+    if resource_failed:
+        _emit_resource_failure_summary(
+            resource_results,
+            emit_annotations=False,
+            heading="Resource phase failed recap",
+        )
 
     session.testsfailed = 1 if (resource_failed or l2_failed) else 0
     if not (resource_failed or l2_failed):

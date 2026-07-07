@@ -216,7 +216,8 @@ A complete `Worker::run()` call traverses all three tiers:
    - writes the AICPU start register to signal "go"
 
 2. AICPU (.so running on the chip)
-   - cache_invalidate_range on the Runtime header   (host DMA wrote it)
+   - a2a3: cache_invalidate_range on the Runtime header (host DMA wrote it)
+   - a5: read the coherent Runtime header directly
    - reads task graph + buffer pointers
    - for each ready task, picks an idle AICore unit (AIC or AIV)
    - writes task descriptor to that unit over the on-chip bus

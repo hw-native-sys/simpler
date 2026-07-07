@@ -1549,17 +1549,11 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
 
                 # Queue-depth snapshot fields. Layout per
                 # L2SwimlaneAicpuSchedPhaseRecord docstring: [AIC, AIV, MIX].
-                local_at_start = record.get("local_at_start")
-                local_at_end = record.get("local_at_end")
                 shared_at_start = record.get("shared_at_start")
                 shared_at_end = record.get("shared_at_end")
                 depths_valid = (
-                    isinstance(local_at_start, list)
-                    and isinstance(local_at_end, list)
-                    and isinstance(shared_at_start, list)
+                    isinstance(shared_at_start, list)
                     and isinstance(shared_at_end, list)
-                    and len(local_at_start) == 3
-                    and len(local_at_end) == 3
                     and len(shared_at_start) == 3
                     and len(shared_at_end) == 3
                 )
@@ -1579,8 +1573,6 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
                     # parser-safe while still self-documenting.
                     phase_args.update(
                         {
-                            f"T{thread_idx}_local_at_start (aic,aiv,mix)": list(local_at_start),
-                            f"T{thread_idx}_local_at_end (aic,aiv,mix)": list(local_at_end),
                             "shared_at_start (aic,aiv,mix)": list(shared_at_start),
                             "shared_at_end (aic,aiv,mix)": list(shared_at_end),
                         }
@@ -1611,27 +1603,13 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
                 # start, so emitting both is redundant. Two samples at the
                 # SAME ts (e.g. final-drain emit where start_time==end_time)
                 # also breaks Perfetto's rate calc (divide-by-zero → NULL).
-                # Track name carries thread index so it reads standalone
-                # even with the thread tree collapsed. Only complete/dispatch
-                # carry real queue depths; release/resolve/early_dispatch zero-
-                # fill them, so skip their counter samples to avoid spurious 0
-                # dips.
+                # Only complete/dispatch carry real queue depths; release/
+                # resolve/early_dispatch zero-fill them, so skip their counter
+                # samples to avoid spurious 0 dips.
                 if phase not in ("complete", "dispatch"):
                     continue
                 if not depths_valid:
                     continue
-                local_track_name = f"local_ready_buf_T{thread_idx}"
-                events.append(
-                    {
-                        "args": {"AIC": local_at_end[0], "AIV": local_at_end[1], "MIX": local_at_end[2]},
-                        "cat": "queue",
-                        "name": local_track_name,
-                        "ph": "C",
-                        "pid": 2,
-                        "tid": tid,
-                        "ts": end_us,
-                    }
-                )
                 # Shared queue: dedicated tid 3999 so all 3 schedulers'
                 # snapshots compose onto one timeline (it's the same global
                 # queue regardless of who sampled it). Samples from different

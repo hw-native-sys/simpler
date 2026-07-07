@@ -43,6 +43,14 @@
 #include <stddef.h>
 #include <stdint.h>
 
+// simpler_run takes a pointer to the C++ CallConfig POD (task_interface/
+// call_config.h). Forward-declared so this C-linkage header needn't pull the
+// full C++ definition; both the ChipWorker consumer and the platform producers
+// include call_config.h in their .cpp before calling / defining simpler_run.
+#ifdef __cplusplus
+struct CallConfig;
+#endif
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -185,21 +193,19 @@ int simpler_register_callable(DeviceContextHandle ctx, int32_t callable_id, cons
  * Per-stage run timing is not returned — the platform emits it as `[STRACE]`
  * log markers (see docs/dfx/host-trace.md).
  *
- * `ring_task_window` / `ring_heap` / `ring_dep_pool` are per-task ring sizing
- * overrides, each a per-scope-depth-ring array of RUNTIME_ENV_RING_COUNT
- * entries (0 = unset). A nonzero entry overrides that ring; a 0 entry falls
- * through. Precedence per ring: per-ring entry > PTO2_RING_* env var >
- * compile-time default. A "size every ring the same" request is broadcast to
- * all entries by the caller. Consumed by tensormap_and_ringbuffer only; other
- * runtime variants accept and ignore them.
+ * `config` carries block_dim (0 = auto), aicpu_thread_num, the five diagnostic
+ * enables + output_prefix, and the per-task ring sizing overrides
+ * (`runtime_env.ring_task_window` / `.ring_heap` / `.ring_dep_pool`, each a
+ * per-scope-depth-ring array of RUNTIME_ENV_RING_COUNT entries; 0 = unset,
+ * precedence per ring: per-ring entry > PTO2_RING_* env var > compile-time
+ * default). Ring overrides are consumed by tensormap_and_ringbuffer only; other
+ * runtime variants accept and ignore them. Wire-compatible POD; the platform
+ * reads it by pointer without copying.
  *
- * @return 0 on success, negative on error (no prep state, NULL ctx, etc.).
+ * @return 0 on success, negative on error (no prep state, NULL ctx/config, etc.).
  */
 int simpler_run(
-    DeviceContextHandle ctx, RuntimeHandle runtime, int32_t callable_id, const void *args, int block_dim,
-    int aicpu_thread_num, int enable_l2_swimlane, int enable_dump_tensor, int enable_pmu, int enable_dep_gen,
-    int enable_scope_stats, const uint64_t *ring_task_window, const uint64_t *ring_heap, const uint64_t *ring_dep_pool,
-    const char *output_prefix
+    DeviceContextHandle ctx, RuntimeHandle runtime, int32_t callable_id, const void *args, const CallConfig *config
 );
 
 /**

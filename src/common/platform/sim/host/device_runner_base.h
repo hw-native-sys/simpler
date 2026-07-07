@@ -53,6 +53,9 @@
 #include "host/scope_stats_collector.h"
 #include "runtime.h"
 
+struct HostApi;     // common/host_api.h — fwd-declared to keep task_interface headers out
+struct CallConfig;  // task_interface/call_config.h — per-run config threaded into run()
+
 class SimDeviceRunnerBase : public L3L2OrchCommBackend {
 public:
     SimDeviceRunnerBase() :
@@ -65,7 +68,7 @@ public:
     ~SimDeviceRunnerBase() override = default;
 
     // --- Pure / no-op virtuals dispatched from the shared c_api glue ----
-    virtual int run(Runtime &runtime, int block_dim, int launch_aicpu_num = 1) = 0;
+    virtual int run(Runtime &runtime, const CallConfig &config) = 0;
     virtual int finalize() = 0;
     // a2a3 and a5 both override; an arch without dep_gen leaves the no-op.
     virtual void set_dep_gen_enabled(bool /*enable*/) {}
@@ -94,6 +97,9 @@ public:
     int copy_to_device(void *dev_ptr, const void *host_ptr, size_t bytes);
     int copy_from_device(void *host_ptr, const void *dev_ptr, size_t bytes);
     int device_memset(void *dev_ptr, int value, size_t bytes);
+    void get_retained_temp_buffer(void **addr, size_t *size);
+    void set_retained_temp_buffer(void *addr, size_t size);
+    void clear_temporary_buffer();
 
     int l3_l2_orch_comm_init(void *control_block, size_t control_block_size);
     int l3_l2_orch_comm_shutdown();
@@ -108,7 +114,15 @@ public:
     );
     int unregister_callable(int32_t callable_id);
     bool has_callable(int32_t callable_id) const;
-    BindCallableResult bind_callable_to_runtime(Runtime &runtime, int32_t callable_id);
+    // One-step bind: replay CallableState (kernel addrs + active_callable_id)
+    // then run the per-run bind_callable_to_runtime_impl with the state's
+    // host_orch_func_ptr + signature. `api` is g_host_api; `orch_args` is a
+    // const ChipStorageTaskArgs* (void* keeps task_interface headers out of this
+    // header). Returns 0 on success, non-zero on failure.
+    int bind_callable_to_runtime(
+        Runtime &runtime, int32_t callable_id, const HostApi *api, const void *orch_args,
+        const uint64_t *ring_task_window, const uint64_t *ring_heap, const uint64_t *ring_dep_pool
+    );
     uint64_t upload_chip_callable_buffer(const ChipCallable *callable);
     int launch_device_register(int32_t callable_id);
     int commit_device_register(int32_t callable_id);
@@ -150,6 +164,12 @@ public:
     void set_output_prefix(const char *prefix) { output_prefix_ = (prefix != nullptr) ? prefix : ""; }
     const std::string &output_prefix() const { return output_prefix_; }
 
+    // Latch this run's per-run diagnostic config onto the runner's enable_*_
+    // members before run() uses them. Each arch's run() calls this at entry; the
+    // c_api threads the CallConfig through instead of calling set_*_enabled.
+    // Defined in the .cpp so this header does not need the full CallConfig.
+    void apply_call_config(const CallConfig &config);
+
     size_t aicpu_dlopen_count() const { return aicpu_dlopen_total_; }
     size_t host_dlopen_count() const { return host_dlopen_total_; }
 
@@ -185,6 +205,8 @@ protected:
     std::vector<uint8_t> aicore_kernel_binary_;
 
     MemoryAllocator mem_alloc_;
+    void *retained_temp_addr_ = nullptr;
+    size_t retained_temp_size_ = 0;
 
     // Three independent per-Worker arenas, each backing a single pooled
     // region (PTO2 GM heap / PTO2 shared memory / trb prebuilt runtime

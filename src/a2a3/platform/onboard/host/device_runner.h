@@ -112,7 +112,7 @@ public:
      * are captured once by simpler_init (binaries) / libsimpler_log.so (log)
      * and read off DeviceRunner state / HostLogger here — no per-run args.
      */
-    int run(Runtime &runtime, int block_dim, int launch_aicpu_num = 1) override;
+    int run(Runtime &runtime, const CallConfig &config) override;
 
     /**
      * a2a3-only `dep_gen` enablement setter. The shared

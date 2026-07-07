@@ -75,6 +75,11 @@ bool ReadyQueue::try_pop(TaskSlot &out) {
     return true;
 }
 
+bool ReadyQueue::empty() const {
+    std::lock_guard<std::mutex> lk(mu_);
+    return q_.empty();
+}
+
 bool ReadyQueue::wait_pop(TaskSlot &out) {
     std::unique_lock<std::mutex> lk(mu_);
     cv_.wait(lk, [this] {

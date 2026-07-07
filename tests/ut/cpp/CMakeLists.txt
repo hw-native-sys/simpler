@@ -378,7 +378,57 @@ target_include_directories(test_runtime_orch_so PRIVATE
     ${CMAKE_SOURCE_DIR}/../../../src/a2a3/platform/include
 )
 add_common_utils_test(test_device_arena common/test_device_arena.cpp)
+add_common_utils_test(test_buffer_pool_manager common/test_buffer_pool_manager.cpp)
+target_include_directories(test_buffer_pool_manager PRIVATE
+    ${CMAKE_SOURCE_DIR}/../../../src/common/log/include
+)
 add_common_utils_test(test_l3_l2_orch_comm common/test_l3_l2_orch_comm.cpp)
+
+add_executable(test_trb_runtime_temp_buffer
+    common/test_trb_runtime_temp_buffer.cpp
+    ${CMAKE_SOURCE_DIR}/../../../src/a2a3/runtime/tensormap_and_ringbuffer/host/runtime_maker.cpp
+    ${CMAKE_SOURCE_DIR}/../../../src/a2a3/runtime/tensormap_and_ringbuffer/runtime/shared/runtime.cpp
+    ${CMAKE_SOURCE_DIR}/../../../src/common/platform/shared/host/platform_compile_info.cpp
+)
+target_compile_definitions(test_trb_runtime_temp_buffer PRIVATE SIMPLER_PLATFORM_NAME="a2a3sim")
+target_include_directories(test_trb_runtime_temp_buffer PRIVATE
+    ${GTEST_INCLUDE_DIRS}
+    ${CMAKE_SOURCE_DIR}/../../../src/a2a3/runtime/tensormap_and_ringbuffer/host
+    ${CMAKE_SOURCE_DIR}/../../../src/a2a3/runtime/tensormap_and_ringbuffer/orchestration
+    ${CMAKE_SOURCE_DIR}/../../../src/a2a3/runtime/tensormap_and_ringbuffer/runtime
+    ${CMAKE_SOURCE_DIR}/../../../src/a2a3/runtime/tensormap_and_ringbuffer/common
+    ${CMAKE_SOURCE_DIR}/../../../src/a2a3/platform/include
+    ${CMAKE_SOURCE_DIR}/../../../src/common/platform/include
+    ${CMAKE_SOURCE_DIR}/../../../src/common/task_interface
+    ${CMAKE_SOURCE_DIR}/../../../src/common/log/include
+    ${CMAKE_SOURCE_DIR}/../../../src/common
+)
+target_link_libraries(test_trb_runtime_temp_buffer PRIVATE
+    a2a3_rt_objs
+    ${GTEST_MAIN_LIB}
+    ${GTEST_LIB}
+    pthread
+)
+add_test(NAME test_trb_runtime_temp_buffer COMMAND test_trb_runtime_temp_buffer)
+set_tests_properties(test_trb_runtime_temp_buffer PROPERTIES LABELS "no_hardware")
+
+add_executable(test_l3_l2_message_queue
+    common/test_l3_l2_message_queue.cpp
+    stubs/test_stubs.cpp
+)
+target_include_directories(test_l3_l2_message_queue PRIVATE
+    ${GTEST_INCLUDE_DIRS}
+    ${CMAKE_SOURCE_DIR}/../../../src/a2a3/platform/include
+    ${CMAKE_SOURCE_DIR}/../../../src/common/platform/include
+)
+target_link_libraries(test_l3_l2_message_queue PRIVATE
+    ${GTEST_MAIN_LIB}
+    ${GTEST_LIB}
+    pthread
+)
+add_test(NAME test_l3_l2_message_queue COMMAND test_l3_l2_message_queue)
+set_tests_properties(test_l3_l2_message_queue PROPERTIES LABELS "no_hardware")
+
 add_executable(test_l3_l2_orch_endpoint
     common/test_l3_l2_orch_endpoint.cpp
     stubs/test_stubs.cpp

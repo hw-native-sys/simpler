@@ -21,7 +21,6 @@
 #include "common/unified_log.h"
 
 #include <dlfcn.h>
-#include <cstdlib>
 
 using HalMemAllocFn = int (*)(void **pp, unsigned long long size, unsigned long long flag);
 using HalMemFreeFn = int (*)(void *pp);

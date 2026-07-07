@@ -88,7 +88,7 @@ SlotTransition SchedulerContext::decide_slot_transition(
 void SchedulerContext::complete_slot_task(
     PTO2TaskSlotState &slot_state, int32_t expected_reg_task_id, [[maybe_unused]] PTO2SubtaskSlot subslot,
     int32_t thread_idx, int32_t core_id, Handshake *hank, int32_t &completed_this_turn,
-    PTO2TaskSlotState *deferred_release_slot_states[], int32_t &deferred_release_count, PTO2LocalReadyBuffer *local_bufs
+    PTO2TaskSlotState *deferred_release_slot_states[], int32_t &deferred_release_count
 #if PTO2_PROFILING
     ,
     uint64_t dispatch_ts, uint64_t finish_ts
@@ -203,9 +203,9 @@ void SchedulerContext::complete_slot_task(
         // counter side-effects (g_sched_*_atomic_count[thread_idx], consumed
         // by the otc_* log lines). It returns CompletionStats whose
         // `fanout_edges` is the consumer-walk count.
-        consumers_resolved = sched_->on_task_complete(slot_state, thread_idx, local_bufs).fanout_edges;
+        consumers_resolved = sched_->on_task_complete(slot_state, thread_idx).fanout_edges;
 #else
-        consumers_resolved = sched_->on_task_complete(slot_state, local_bufs);
+        consumers_resolved = sched_->on_task_complete(slot_state);
 #endif
 #if PTO2_PROFILING
         if (resolve_t0 != 0) {
@@ -297,8 +297,7 @@ void SchedulerContext::clear_running_slot(CoreExecState &core) {
 
 void SchedulerContext::check_running_cores_for_completion(
     int32_t thread_idx, Handshake *hank, int32_t &completed_this_turn, int32_t &cur_thread_completed,
-    bool &made_progress, PTO2TaskSlotState *deferred_release_slot_states[], int32_t &deferred_release_count,
-    PTO2LocalReadyBuffer *local_bufs
+    bool &made_progress, PTO2TaskSlotState *deferred_release_slot_states[], int32_t &deferred_release_count
 ) {
 #if PTO2_SCHED_PROFILING
     auto &l2_swimlane = sched_l2_swimlane_[thread_idx];
@@ -380,7 +379,7 @@ void SchedulerContext::check_running_cores_for_completion(
         if (t.pending_done) {
             complete_slot_task(
                 *core.pending_slot_state, core.pending_reg_task_id, core.pending_subslot, thread_idx, core_id, hank,
-                completed_this_turn, deferred_release_slot_states, deferred_release_count, local_bufs
+                completed_this_turn, deferred_release_slot_states, deferred_release_count
 #if PTO2_PROFILING
                 ,
                 core.pending_dispatch_timestamp, finish_ts
@@ -392,7 +391,7 @@ void SchedulerContext::check_running_cores_for_completion(
         if (t.running_done) {
             complete_slot_task(
                 *core.running_slot_state, core.running_reg_task_id, core.running_subslot, thread_idx, core_id, hank,
-                completed_this_turn, deferred_release_slot_states, deferred_release_count, local_bufs
+                completed_this_turn, deferred_release_slot_states, deferred_release_count
 #if PTO2_PROFILING
                 ,
                 core.running_dispatch_timestamp, finish_ts

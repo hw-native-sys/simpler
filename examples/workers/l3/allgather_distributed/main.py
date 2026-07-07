@@ -70,11 +70,11 @@ def parse_device_range(spec: str) -> list[int]:
     return ids
 
 
-def build_chip_callable(platform: str, pto_isa_commit: str | None) -> ChipCallable:
+def build_chip_callable(platform: str) -> ChipCallable:
     """Compile the AIV allgather kernel + its C++ orchestration shim."""
     kc = KernelCompiler(platform=platform)
     runtime = "tensormap_and_ringbuffer"
-    pto_isa_root = ensure_pto_isa_root(commit=pto_isa_commit, clone_protocol="https")
+    pto_isa_root = ensure_pto_isa_root()
     include_dirs = kc.get_orchestration_include_dirs(runtime)
 
     # src/common  — for platform_comm/comm_context.h
@@ -115,7 +115,6 @@ def expected_output(nranks: int) -> list[float]:
 def run(
     device_ids: list[int],
     platform: str = "a2a3",
-    pto_isa_commit: str | None = None,
 ) -> int:
     """Core logic — callable from both CLI and pytest."""
     nranks = len(device_ids)
@@ -130,7 +129,7 @@ def run(
     host_outputs = [torch.zeros(nranks * COUNT_PER_RANK, dtype=torch.float32).share_memory_() for _ in range(nranks)]
 
     print("[allgather] compiling kernels...")
-    chip_callable = build_chip_callable(platform, pto_isa_commit)
+    chip_callable = build_chip_callable(platform)
 
     worker = Worker(
         level=3,
@@ -203,10 +202,9 @@ def main() -> int:
     parser.add_argument(
         "-d", "--device", default="0-1", help="Device range, e.g. '0-1' or '0-3'. 2 to 16 chips required."
     )
-    parser.add_argument("--pto-isa-commit", default=None, help="Optional PTO ISA commit/tag to fetch before compiling.")
     cli = parser.parse_args()
 
-    return run(parse_device_range(cli.device), platform=cli.platform, pto_isa_commit=cli.pto_isa_commit)
+    return run(parse_device_range(cli.device), platform=cli.platform)
 
 
 if __name__ == "__main__":

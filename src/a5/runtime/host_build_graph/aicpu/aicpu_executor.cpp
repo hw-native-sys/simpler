@@ -1134,24 +1134,8 @@ int AicpuExecutor::run(Runtime *runtime) {
     return 0;
 }
 
-void AicpuExecutor::deinit(Runtime *runtime) {
+void AicpuExecutor::deinit(Runtime * /*runtime*/) {
     // === Exit cleanup: reset all inter-round state ===
-
-    // 1. Invalidate AICPU cache for Runtime address range.
-    //    Next round's Host DMA (rtMemcpy) writes fresh Runtime to HBM but
-    //    bypasses this cache. Invalidating now ensures next round reads from HBM.
-    cache_invalidate_range(runtime, sizeof(Runtime));
-    if (runtime->get_tensor_info_storage() != nullptr && runtime->get_tensor_info_storage_bytes() > 0) {
-        cache_invalidate_range(
-            runtime->get_tensor_info_storage(), static_cast<size_t>(runtime->get_tensor_info_storage_bytes())
-        );
-    }
-    if (runtime->get_tensor_allocation_storage() != nullptr && runtime->get_tensor_allocation_storage_bytes() > 0) {
-        cache_invalidate_range(
-            runtime->get_tensor_allocation_storage(),
-            static_cast<size_t>(runtime->get_tensor_allocation_storage_bytes())
-        );
-    }
 
     // === Existing reset logic ===
     ready_count_aic_.store(0, std::memory_order_release);

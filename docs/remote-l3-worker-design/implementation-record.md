@@ -145,8 +145,8 @@ It is updated as each documented feature is completed and verified.
   `ctest --test-dir tests/ut/cpp/build-fetch -LE requires_hardware
   --output-on-failure` passed with `39/39` tests.
 - Python unit tests:
-  `tests/ut/py -m "not requires_hardware" --clone-protocol https` passed with
-  `350 passed, 11 skipped, 10 deselected`.
+  `tests/ut/py -m "not requires_hardware"` passed with `350 passed,
+  11 skipped, 10 deselected`.
 - Editable build with `CCACHE_DISABLE=1`: passed.
 - C++ focused UTs built and passed from `tests/ut/cpp/build-fetch`:
   `test_orchestrator`, `test_remote_wire`, `test_remote_endpoint`.

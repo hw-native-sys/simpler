@@ -14,9 +14,9 @@
  * @brief Host-side tensor dump collector with independent shared memory.
  *
  * Architecture:
- * - BufferPoolManager<DumpModule>: shared mgmt-thread infrastructure that
- *   polls per-thread DumpReadyQueues, replenishes free_queues, and hands
- *   full DumpMetaBuffers off to the collector thread.
+ * - BufferPoolManager<DumpModule>: shared split-mgmt infrastructure that
+ *   polls per-thread ready queues, replenishes free_queues, and hands
+ *   full DumpMetaBuffers off to collector thread shards.
  * - TensorDumpCollector: copies tensor metadata + arena bytes into host
  *   vectors and writes the result to disk (.bin + JSON).
  *
@@ -86,6 +86,8 @@ struct DumpModule {
     static constexpr uint32_t kReadyQueueSize = PLATFORM_DUMP_READYQUEUE_SIZE;
     static constexpr uint32_t kSlotCount = PLATFORM_DUMP_SLOT_COUNT;
     static constexpr const char *kSubsystemName = "DumpModule";
+    static constexpr int kMgmtDrainThreadCount = PLATFORM_MAX_AICPU_THREADS;
+    static constexpr int kCollectorThreadCount = PLATFORM_MAX_AICPU_THREADS;
 
     /**
      * Tensor-dump bursts can be very large; the batch is sized so a fully
@@ -100,7 +102,19 @@ struct DumpModule {
     static DataHeader *header_from_shm(void *shm) { return get_dump_header(shm); }
 
     static std::optional<profiling_common::EntrySite<DumpModule>>
-    resolve_entry(void *shm, DataHeader * /*header*/, int /*q*/, const ReadyEntry &entry) {
+    resolve_entry(void *shm, DataHeader *header, int /*q*/, const ReadyEntry &entry) {
+        if (shm == nullptr || header == nullptr) {
+            LOG_ERROR("DumpModule: invalid shared memory/header while resolving ready entry");
+            return std::nullopt;
+        }
+        if (entry.thread_index >= header->num_dump_threads ||
+            entry.thread_index >= static_cast<uint32_t>(PLATFORM_MAX_AICPU_THREADS)) {
+            LOG_ERROR(
+                "DumpModule: invalid ready entry thread=%u (num_dump_threads=%u, max=%u)", entry.thread_index,
+                header->num_dump_threads, static_cast<uint32_t>(PLATFORM_MAX_AICPU_THREADS)
+            );
+            return std::nullopt;
+        }
         DumpBufferState *state = get_dump_buffer_state(shm, static_cast<int>(entry.thread_index));
         profiling_common::EntrySite<DumpModule> site;
         site.kind = 0;
@@ -289,7 +303,6 @@ private:
     // on_buffer_collected and joined by export_dump_files).
     std::chrono::steady_clock::time_point run_start_time_;
     std::chrono::steady_clock::time_point last_progress_time_;
-    uint64_t buffers_collected_{0};
     bool writer_started_{false};
 
     void process_dump_buffer(const DumpReadyBufferInfo &info);
@@ -297,6 +310,7 @@ private:
 
     // Writer thread: streams arg payloads to a single args.bin
     std::thread writer_thread_;
+    std::mutex collector_state_mutex_;
     std::mutex write_mutex_;
     std::condition_variable write_cv_;
     std::queue<DumpedTensor> write_queue_;

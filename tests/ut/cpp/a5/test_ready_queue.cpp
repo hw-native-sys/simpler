@@ -9,10 +9,9 @@
  * -----------------------------------------------------------------------------------------------------------
  */
 /**
- * Unit tests for PTO2ReadyQueue and PTO2LocalReadyBuffer from pto_scheduler.h
+ * Unit tests for PTO2ReadyQueue from pto_scheduler.h
  *
- * Tests the lock-free bounded MPMC queue (Vyukov design) and the thread-local
- * ready buffer used for local-first dispatch optimization.
+ * Tests the lock-free bounded MPMC queue (Vyukov design).
  *
  * Design contracts:
  *
@@ -30,10 +29,6 @@
  * - size() relaxed ordering: size() reads both positions with
  *   memory_order_relaxed and is a hint, not a snapshot.  If a stale read
  *   produces d > e the guard returns 0.
- *
- * - LocalReadyBuffer LIFO dispatch: try_push appends at count++, pop returns
- *   slot_states[--count].  LIFO reversal is intentional for cache-locality
- *   when a producer immediately dispatches its fanout.
  */
 
 #include <gtest/gtest.h>
@@ -406,71 +401,3 @@ INSTANTIATE_TEST_SUITE_P(
         MPMCConfig{4, 4, 1250}  // HighContentionStress
     )
 );
-
-// =============================================================================
-// LocalReadyBuffer
-// =============================================================================
-
-class LocalReadyBufferTest : public ::testing::Test {
-protected:
-    static constexpr int CAPACITY = 8;
-
-    PTO2LocalReadyBuffer buffer;
-    PTO2TaskSlotState *backing[CAPACITY];
-
-    void SetUp() override { buffer.reset(backing, CAPACITY); }
-};
-
-// --- Normal path ---
-
-TEST_F(LocalReadyBufferTest, PopEmptyReturnsNullptr) { EXPECT_EQ(buffer.pop(), nullptr); }
-
-// LIFO dispatch: try_push appends at count++, pop returns slot_states[--count].
-TEST_F(LocalReadyBufferTest, LIFOOrdering) {
-    PTO2TaskSlotState a, b;
-
-    ASSERT_TRUE(buffer.try_push(&a));
-    ASSERT_TRUE(buffer.try_push(&b));
-
-    EXPECT_EQ(buffer.pop(), &b);
-    EXPECT_EQ(buffer.pop(), &a);
-    EXPECT_EQ(buffer.pop(), nullptr);
-}
-
-TEST_F(LocalReadyBufferTest, TryPushFullReturnsFalse) {
-    PTO2TaskSlotState items[CAPACITY + 1];
-
-    for (int i = 0; i < CAPACITY; i++) {
-        ASSERT_TRUE(buffer.try_push(&items[i]));
-    }
-
-    EXPECT_FALSE(buffer.try_push(&items[CAPACITY]));
-}
-
-TEST_F(LocalReadyBufferTest, ResetSetsCleanState) {
-    EXPECT_EQ(buffer.pop(), nullptr) << "Fresh buffer is empty";
-
-    PTO2TaskSlotState a, b;
-    ASSERT_TRUE(buffer.try_push(&a));
-    ASSERT_TRUE(buffer.try_push(&b));
-
-    buffer.reset(backing, CAPACITY);
-    EXPECT_EQ(buffer.pop(), nullptr) << "Buffer is empty after reset";
-
-    PTO2TaskSlotState items[CAPACITY];
-    for (int i = 0; i < CAPACITY; i++) {
-        EXPECT_TRUE(buffer.try_push(&items[i]));
-    }
-    EXPECT_FALSE(buffer.try_push(&a)) << "Full after pushing capacity items post-reset";
-}
-
-// --- Boundary conditions ---
-
-TEST_F(LocalReadyBufferTest, NullBackingBuffer) {
-    PTO2LocalReadyBuffer buf;
-    buf.reset(nullptr, 0);
-
-    PTO2TaskSlotState item{};
-    EXPECT_FALSE(buf.try_push(&item)) << "Push fails with null backing";
-    EXPECT_EQ(buf.pop(), nullptr) << "Pop returns null with null backing";
-}

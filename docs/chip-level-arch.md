@@ -106,7 +106,7 @@ DeviceRunner runner;
 void *ptr = runner.allocate_tensor(bytes);
 runner.copy_to_device(dev_ptr, host_ptr, bytes);
 runner.set_executors(aicpu_binary, aicore_binary);   // once, at init time
-runner.run(runtime, block_dim, launch_aicpu_num);
+runner.run(runtime, config);                         // config carries block_dim, aicpu_thread_num, diagnostics
 runner.finalize();
 ```
 
@@ -123,9 +123,9 @@ simpler_init(ctx, device_id,                          // attach + binary takeove
              aicore_binary, aicore_size);
 size_t size = get_runtime_size();
 register_callable(ctx, cid, callable);                 // one-time per callable
-simpler_run(ctx, runtime, cid, args, block_dim,      // per-launch — no binaries
-             aicpu_thread_num,
-             enable_l2_swimlane, enable_dump_tensor, enable_pmu, output_prefix);
+simpler_run(ctx, runtime, cid, args, config);        // per-launch — no binaries; config
+                                                       // carries block_dim, aicpu_thread_num,
+                                                       // diagnostics + ring overrides
 unregister_callable(ctx, cid);
 finalize_device(ctx);
 destroy_device_context(ctx);

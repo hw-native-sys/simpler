@@ -52,10 +52,6 @@ _PY_CALLABLE_SERIALIZER_CLOUDPICKLE = 1
 _PY_CALLABLE_HEADER = struct.Struct("<4sBBHQ")
 
 
-def _pack_u8(value: int) -> bytes:
-    return struct.pack("<B", int(value))
-
-
 def _pack_u32(value: int) -> bytes:
     return struct.pack("<I", int(value))
 

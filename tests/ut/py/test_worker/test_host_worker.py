@@ -18,6 +18,7 @@ import threading
 from multiprocessing.shared_memory import SharedMemory
 
 import pytest
+import simpler.worker as worker_mod
 from _task_interface import MAX_REGISTERED_CALLABLE_IDS  # pyright: ignore[reportMissingImports]
 from simpler.callable_identity import (
     CallableHandle,
@@ -120,6 +121,45 @@ def _chip_payload_shm(callable_obj: ChipCallable) -> SharedMemory:
     assert shm.buf is not None
     shm.buf[: len(payload)] = payload
     return shm
+
+
+def test_chip_process_loop_inits_runs_and_finalizes(monkeypatch):
+    events: list[tuple] = []
+
+    class FakeChipWorker:
+        def init(self, device_id, bins, *, log_level, log_info_v):
+            events.append(("init", device_id, bins, log_level, log_info_v))
+
+        def finalize(self) -> None:
+            events.append(("finalize",))
+
+    def fake_run_chip_main_loop(cw, *_args, chip_platform, chip_runtime):
+        events.append(("main_loop", cw, chip_platform, chip_runtime))
+
+    monkeypatch.setattr(worker_mod, "ChipWorker", FakeChipWorker)
+    monkeypatch.setattr(worker_mod, "_run_chip_main_loop", fake_run_chip_main_loop)
+
+    shm = SharedMemory(create=True, size=MAILBOX_SIZE)
+    try:
+        assert shm.buf is not None
+        worker_mod._chip_process_loop(
+            shm.buf,
+            "bins",
+            7,
+            {},
+            {},
+            {},
+            platform="a2a3",
+            runtime="tensormap_and_ringbuffer",
+        )
+    finally:
+        shm.close()
+        shm.unlink()
+
+    assert events[0] == ("init", 7, "bins", 1, 5)
+    assert events[1][0] == "main_loop"
+    assert events[1][2:] == ("a2a3", "tensormap_and_ringbuffer")
+    assert events[2] == ("finalize",)
 
 
 def _chip_digest(callable_obj: ChipCallable, *, platform: str = "", runtime: str = "") -> bytes:

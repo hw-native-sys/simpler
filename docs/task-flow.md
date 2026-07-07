@@ -258,6 +258,23 @@ void ChipWorker::run(int32_t local_slot, TaskArgsView view, const CallConfig &co
 
 One memcpy of a few KB per task; negligible.
 
+#### TRB temporary buffer
+
+`tensormap_and_ringbuffer` stages ordinary non-child tensor arguments through a
+runner-scoped retained temporary buffer instead of a per-run `device_malloc()` /
+`device_free()` pair. This is always on for TRB — an internal allocation
+optimization with no user-facing switch. It is not serialized in task mailboxes
+and does not change `TaskArgs`, `CallConfig`, child-memory tensors, or public
+`Worker.malloc()` / `Worker.free()` semantics.
+
+On each TRB bind the host runtime sizes the retained buffer from the run's
+non-child tensors, growing it (free old + malloc new) only when a run needs
+more than is currently retained, and bump-slices each tensor from it. The
+buffer lives on the `DeviceRunner` across runs (freed once at finalize); the
+platform only stores its `{addr, size}` slot. If a grow allocation fails the
+run fails before device argument staging. See the runtime's `RUNTIME_LOGIC.md`
+§2.4 for the grow/reuse mechanics.
+
 ### SUB-type child loop (Python callable leaf)
 
 SUB execution is handled entirely in Python. The forked child process

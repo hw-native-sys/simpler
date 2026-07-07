@@ -79,7 +79,8 @@ bool PTO2FaninPool::ensure_space(PTO2SharedMemoryRingHeader &ring, int32_t neede
             }
             // Absolute-time backstop, matching the task allocator: stable across
             // chips/contention, unlike a fixed spin count. get_sys_cnt_aicpu()
-            // is an MMIO read, so sample it only once per 1024 spins.
+            // is a cheap cntvct_el0 read; the 1024-spin gate keeps fatal-flag
+            // polling and timeout bookkeeping out of every reclaim spin.
             uint64_t now = get_sys_cnt_aicpu();
             if (!block_timing) {
                 block_cycle0 = now;

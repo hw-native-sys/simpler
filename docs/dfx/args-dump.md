@@ -486,12 +486,12 @@ normal execution continues.
 
 `halHostRegister` maps device memory into host virtual address
 space so the host can read device buffers directly.
-`TensorDumpCollector` runs two background threads on top of a
+`TensorDumpCollector` runs split mgmt threads and collector shards on top of a
 [`BufferPoolManager<DumpModule>`](../src/common/platform/include/host/buffer_pool_manager.h):
-a mgmt thread that polls SPSC ready queues and recycles full
-metadata buffers **while kernels are still executing**, plus a
-poll thread that drains the L2 hand-off queue into
-`on_buffer_collected`.
+drain/refill shards poll SPSC ready queues and recycle full metadata
+buffers **while kernels are still executing**, a replenish thread keeps
+free queues topped up, and collector shards drain the host hand-off queues
+into `on_buffer_collected`.
 
 ```text
         HOST                                         DEVICE
@@ -504,19 +504,19 @@ poll thread that drains the L2 hand-off queue into
 │                          │               │                          │
 │ start()                  │               │ per-task run loop:       │
 │   ┌────────────────────┐ │               │   BEFORE_DISPATCH        │
-│   │ mgmt thread        │ │               │     dump_arg_record()    │
-│   │ (BufferPool driver)│ │ SPSC ready    │     → write to arena     │
+│   │ drain/refill shard │ │               │     dump_arg_record()    │
+│   │ + replenish thread │ │ SPSC ready    │     → write to arena     │
 │   │   poll ready queue │<┼──queues──────<│     → append record      │
 │   │   recycle buffers  │─┼──free queue──>│     → push to ready_q    │
 │   └────────────────────┘ │               │   dispatch kernel        │
 │   ┌────────────────────┐ │               │   wait FIN               │
-│   │ poll thread        │ │               │   AFTER_COMPLETION       │
+│   │ collector shard    │ │               │   AFTER_COMPLETION       │
 │   │   reads arena via  │ │ shared mem    │     dump_arg_record()    │
 │   │   host mapping     │<┼──mapping─────<│                          │
 │   └────────────────────┘ │               │                          │
 │                          │               │ dump_args_flush()        │
 │ stop()                   │               │   log per-thread stats   │
-│   join mgmt → join poll  │               └──────────────────────────┘
+│   join mgmt → collectors │               └──────────────────────────┘
 │ reconcile_counters()     │
 │   recover leftovers      │
 │   + dropped accounting   │
@@ -535,29 +535,28 @@ poll thread that drains the L2 hand-off queue into
 init_tensor_dump()
   dump_collector_.initialize(..., output_prefix_)
   kernel_args_.args.dump_data_base = dump_collector_.get_dump_shm_device_ptr()
-start()                          ← spawn mgmt thread (drains L1 ringbuffer)
-                                   then spawn poll thread (consumes L2 queue)
+start()                          ← spawn split mgmt threads (drain/refill
+                                   + replenish), then collector shards
 launch AICPU / AICore
 rtStreamSynchronize              ← wait for kernel completion
-stop()                           ← join mgmt (its final-drain pass into L2
-                                   has poll as the consumer), then signal
-                                   poll and join it
+stop()                           ← join mgmt/replenish after final drain,
+                                   then signal collector shards and join them
 reconcile_counters()             ← recover leftover current buffers
                                    + dropped accounting
 export_dump_files()
 ```
 
-[`TensorDumpCollector`](../src/a2a3/platform/include/host/tensor_dump_collector.h)
+[`TensorDumpCollector`](../src/common/platform/include/host/tensor_dump_collector.h)
 on a2a3 inherits from
 [`profiling_common::ProfilerBase<TensorDumpCollector, DumpModule>`](../src/common/platform/include/host/profiler_base.h):
-the base class owns the mgmt thread, the poll thread, and the
+the base class owns split mgmt threads, collector shards, and the
 `BufferPoolManager<DumpModule>` they share. `TensorDumpCollector`
 only supplies the dump-specific pieces — the `DumpModule` trait
 that describes the shared-memory layout, `initialize` that
 allocates and pre-fills free queues, an `on_buffer_collected`
 callback that gathers payload bytes into the in-memory record
 list, plus `reconcile_counters` / `export_dump_files` /
-`finalize`. The mgmt/poll threading, buffer pooling, and `Module`
+`finalize`. The mgmt/collector threading, buffer pooling, and `Module`
 trait pattern are shared with PMU and L2Swimlane — see
 [profiling-framework.md](../profiling-framework.md) for the
 framework reference.
@@ -566,7 +565,7 @@ framework reference.
 
 a5's `TensorDumpCollector` derives from
 `ProfilerBase<TensorDumpCollector, DumpModule>` and shares the
-mgmt + poll thread structure with a2a3. The single behavioral
+split mgmt + collector shard structure with a2a3. The single behavioral
 deviation from §5.4 is the **transport channel**: a5 has no
 `halHostRegister`, so each device buffer is paired with a
 host-shadow `malloc()` and the mgmt loop synchronizes the two via
@@ -602,8 +601,8 @@ the buffer's records.
 │   register_mapping(s)    │               │   BEFORE_DISPATCH        │
 │                          │               │     dump_arg_record()    │
 │ start(thread_factory)    │               │   dispatch kernel        │
-│   mgmt_thread starts     │               │   wait FIN               │
-│   poll_thread starts     │               │   AFTER_COMPLETION       │
+│   split mgmt starts      │               │   wait FIN               │
+│   collector shards start │               │   AFTER_COMPLETION       │
 │                          │               │     dump_arg_record()    │
 │ mgmt every 10us tick:    │               │   if buffer full:        │
 │   copy_from_device(shm)  │<──memcpy─────<│     push ready entry,    │
@@ -617,7 +616,7 @@ the buffer's records.
 │     for each modified    │               │                          │
 │     field                │               │                          │
 │                          │               │                          │
-│ poll thread:             │               │                          │
+│ collector shard:         │               │                          │
 │   wait_pop_ready         │               │                          │
 │   on_buffer_collected →  │               │                          │
 │     copy arena slice     │<──memcpy─────<│                          │
@@ -627,7 +626,7 @@ the buffer's records.
 │                          │               │                          │
 │ rtStreamSynchronize      │               │                          │
 │ stop()                   │               │                          │
-│   join mgmt + poll       │               │                          │
+│   join mgmt + collectors │               │                          │
 │ reconcile_counters()     │               │                          │
 │   recover leftovers      │               │                          │
 │   + dropped accounting   │               │                          │
@@ -643,17 +642,17 @@ the buffer's records.
 init_tensor_dump()
   dump_collector_.initialize(num_dump_threads, ..., output_prefix_)
   kernel_args_.args.dump_data_base = dump_collector_.get_dump_shm_device_ptr()
-dump_collector_.start(thread_factory)   ← mgmt + poll threads
+dump_collector_.start(thread_factory)   ← split mgmt + collector shards
 launch AICPU / AICore
 rtStreamSynchronize
-dump_collector_.stop()                  ← join mgmt + poll, drain final batch
+dump_collector_.stop()                  ← join mgmt + collectors, drain final batch
 dump_collector_.reconcile_counters()    ← recover leftover current buffers
                                           + dropped accounting
 dump_collector_.export_dump_files()
 dump_collector_.finalize()
 ```
 
-[`TensorDumpCollector`](../src/a5/platform/include/host/tensor_dump_collector.h)
+[`TensorDumpCollector`](../src/common/platform/include/host/tensor_dump_collector.h)
 on a5 inherits the same CRTP base
 ([`profiling_common::ProfilerBase`](../src/common/platform/include/host/profiler_base.h))
 as a2a3 and parameterizes
@@ -675,7 +674,7 @@ before that flush runs, `reconcile_counters` recovers a non-empty
 | Device-side layout | identical (same `DumpDataHeader` / `DumpMetaBuffer` / arena shape, `static_assert`-checked) | |
 | AICPU recording logic | identical | |
 | Buffer model | rotating pool (free + ready queues per thread) | identical |
-| Host threads | mgmt + poll, streams during execution | identical |
+| Host threads | split mgmt + collector shards, streams during execution | identical |
 | Host-class shape | `ProfilerBase<TensorDumpCollector, DumpModule>` | identical |
 | Host transport | `halHostRegister` shared memory | host-shadow `malloc` + per-tick `rtMemcpy`/`memcpy` |
 | `MemoryOps` callbacks | 3 (`alloc`, `reg`, `free_`) | 5 (+ `copy_to_device`, `copy_from_device`) |
@@ -699,9 +698,10 @@ With `--dump-args`, AICPU records full `BEFORE_DISPATCH` /
   non-contiguous views).
 - The completion `pipe_barrier(PIPE_ALL)` before writing FIN, which
   serializes all device-side writes for dumped tasks.
-- The arena and metadata writes themselves; the host transport
-  cost is taken concurrently on a2a3 (mgmt + poll threads) or after
-  the stream finishes on a5.
+- The arena and metadata writes themselves; host drain/replenish and
+  collector work runs concurrently with the stream on both architectures.
+  a5 additionally pays `rtMemcpy`/`memcpy` transport cost to keep host
+  shadows in sync.
 
 For interactive debugging, total memory pressure is what to watch:
 the default per-thread arena is 128 MiB
@@ -898,7 +898,7 @@ per-thread arena (default 128 MiB). Bump
 
 **`dropped_overwrite > 0` in summary.** On a5, the run produced
 more total payload than fits in the arena; on a2a3, the host
-mgmt/poll threads couldn't keep up. Reduce the number of dumped
+mgmt/collector pipeline couldn't keep up. Reduce the number of dumped
 tasks (filter by `func_id` upstream) or increase
 `PLATFORM_DUMP_BUFFERS_PER_THREAD`.
 

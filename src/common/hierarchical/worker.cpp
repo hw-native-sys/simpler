@@ -94,7 +94,11 @@ void Worker::add_remote_l3_socket(
 void Worker::init() {
     if (initialized_) throw std::runtime_error("Worker: already initialized");
 
-    orchestrator_.init(&tensormap_, &allocator_, &scope_, &ready_next_level_queue_, &ready_sub_queue_, &manager_);
+    orchestrator_.init(
+        &tensormap_, &allocator_, &scope_, &ready_next_level_queue_, &ready_sub_queue_, &manager_, [this] {
+            scheduler_.notify_ready();
+        }
+    );
 
     // Start WorkerManager first — creates WorkerThreads.
     // The on_complete callback routes through the Scheduler's worker_done().

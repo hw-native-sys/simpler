@@ -47,7 +47,7 @@ pto-runtime/
 │   ├── elf_parser.py                  # Authoritative copy
 │   ├── platform_info.py               # Platform/runtime discovery
 │   ├── environment.py                 # PROJECT_ROOT resolver (wheel vs source tree)
-│   ├── pto_isa.py                     # PTO_ISA_ROOT discovery
+│   ├── pto_isa.py                     # pinned PTO-ISA checkout management
 │   ├── build_runtimes.py              # Pre-build all runtime variants (invoked by pip install)
 │   └── _assets/                       # (wheel only) src/ + build/lib/ shipped with wheel
 │
@@ -185,7 +185,11 @@ This builds the nanobind `_task_interface` extension **and** pre-builds all runt
 | Nanobind bindings (`python/bindings/`) | Re-run `pip install --no-build-isolation -e .` (no rebuild-on-import; `editable.rebuild = false`) |
 | Python-only code (`python/*.py`, `simpler_setup/*.py`) | No rebuild needed (editable install) |
 | Examples / kernels (`examples/{arch}/`, `tests/st/`) | No rebuild needed, just re-run |
-| Pinned pto-isa commit (CI `PTO_ISA_COMMIT`) | Re-run `pip install` — onboard a2a3 `host_runtime.so` embeds pto-isa SDMA headers, so a commit bump must rebuild it. The cmake cache stamp and the `host_runtime` ccache key both fold in the resolved pto-isa commit, so a bump invalidates the stale object automatically — no manual `ccache -C` / `rm -rf build/` needed (issue #1139). `pip install` reads `pto_isa.pin` by default; to build against a different commit without changing the pin, set `PTO_ISA_ROOT` at a pre-checked-out clone or run `python simpler_setup/build_runtimes.py --pto-isa-commit <sha>` (issue #1067). |
+| `pto_isa.pin` changed | Re-run `pip install`. The cmake cache stamp and the `host_runtime` ccache key include the pinned PTO-ISA commit for a2a3 onboard, so a pin bump invalidates stale runtime objects automatically. |
+
+A `pto_isa.pin` bump changes the SDMA headers embedded by
+`host_runtime.so`. Install-time runtime builds and run-time kernel compilation
+both read `pto_isa.pin`; use a different ISA revision by updating that file.
 
 ### Runtime binary lookup
 

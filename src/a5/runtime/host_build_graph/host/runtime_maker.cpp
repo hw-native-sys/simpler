@@ -372,9 +372,8 @@ int register_callable_impl(const ChipCallable *callable, uint64_t (*upload_fn)(c
 /**
  * Per-run binding for hbg: invoke the previously-resolved orchestration entry
  * point against the supplied args, then upload tensor info / allocation
- * storage. The c_api caller passes `host_orch_func_ptr` straight through from
- * DeviceRunner::bind_callable_to_runtime (which read it from
- * CallableState for this run's callable_id).
+ * storage. DeviceRunner::bind_callable_to_runtime passes `host_orch_func_ptr`
+ * straight through from CallableState for this run's callable_id.
  */
 int bind_callable_to_runtime_impl(
     Runtime *runtime, const HostApi *api, const ChipStorageTaskArgs *orch_args, void *host_orch_func_ptr,
@@ -502,20 +501,6 @@ int validate_runtime_impl(Runtime *runtime, const HostApi *api) {
         api->device_free(tensor_pairs[i].dev_ptr);
     }
     LOG_INFO_V0("Freed %d device tensors", tensor_pair_count);
-
-    // Clear the per-run dispatch-table entries staged by register_callable_impl.
-    // The underlying chip-callable device buffer is pool-managed by
-    // DeviceRunner (keyed by content hash) and bulk-freed in
-    // DeviceRunner::finalize().
-    int kernel_count = runtime->get_registered_kernel_count();
-    for (int i = 0; i < kernel_count; i++) {
-        int func_id = runtime->get_registered_kernel_func_id(i);
-        runtime->set_function_bin_addr(func_id, 0);
-    }
-    if (kernel_count > 0) {
-        LOG_INFO_V0("Cleared %d kernel dispatch-table entries", kernel_count);
-    }
-    runtime->clear_registered_kernels();
 
     if (runtime->get_tensor_info_storage() != nullptr) {
         api->device_free(runtime->get_tensor_info_storage());

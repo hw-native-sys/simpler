@@ -46,9 +46,6 @@ Runtime::Runtime() {
     for (int i = 0; i < RUNTIME_MAX_FUNC_ID; i++) {
         dev.func_id_to_addr_[i] = 0;
     }
-
-    // Initialize host-only tail.
-    registered_kernel_count_ = 0;
 }
 
 // =============================================================================
@@ -76,24 +73,6 @@ uint64_t Runtime::get_function_bin_addr(int func_id) const {
     return dev.func_id_to_addr_[func_id];
 }
 
-void Runtime::set_function_bin_addr(int func_id, uint64_t addr) {
-    if (func_id < 0 || func_id >= RUNTIME_MAX_FUNC_ID) {
-        LOG_ERROR("[Runtime] func_id=%d is out of range [0, %d)", func_id, RUNTIME_MAX_FUNC_ID);
-        return;
-    }
-    if (addr != 0 && dev.func_id_to_addr_[func_id] == 0) {
-        if (registered_kernel_count_ < RUNTIME_MAX_FUNC_ID) {
-            registered_kernel_func_ids_[registered_kernel_count_++] = func_id;
-        } else {
-            LOG_ERROR(
-                "[Runtime] Registration limit reached (%d). Cannot track func_id=%d for cleanup.", RUNTIME_MAX_FUNC_ID,
-                func_id
-            );
-        }
-    }
-    dev.func_id_to_addr_[func_id] = addr;
-}
-
 void Runtime::replay_function_bin_addr(int func_id, uint64_t addr) {
     if (func_id < 0 || func_id >= RUNTIME_MAX_FUNC_ID) {
         LOG_ERROR("[Runtime] func_id=%d is out of range [0, %d)", func_id, RUNTIME_MAX_FUNC_ID);
@@ -101,15 +80,6 @@ void Runtime::replay_function_bin_addr(int func_id, uint64_t addr) {
     }
     dev.func_id_to_addr_[func_id] = addr;
 }
-
-int Runtime::get_registered_kernel_count() const { return registered_kernel_count_; }
-
-int Runtime::get_registered_kernel_func_id(int index) const {
-    if (index < 0 || index >= registered_kernel_count_) return -1;
-    return registered_kernel_func_ids_[index];
-}
-
-void Runtime::clear_registered_kernels() { registered_kernel_count_ = 0; }
 
 // trb's device image is just the `dev` descriptor (the rest of Runtime is
 // host-only). Mirrors the host_build_graph definition (= sizeof(Runtime)).

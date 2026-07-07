@@ -14,8 +14,8 @@ Detection / isolation procedures referenced below live in
    `/test-runtime-sim` instead and stop.
 3. **Precheck + detect platform** (§A) — gate on real silicon, then read the
    detected arch into `PLATFORM`.
-4. **Extract CI pins** (§D, `st-onboard-<platform>` job): `--pto-isa-commit`
-   and `--pto-session-timeout`.
+4. **Extract CI timeout** (§D, `st-onboard-<platform>` job):
+   `--pto-session-timeout`.
 5. **Select a device range** (§C, range ≤4) — or, when wrapping in
    `task-submit`, let it pick via `--device auto --device-num <range size>`.
 6. **Run through `task-submit`** (§E). The underlying command:
@@ -23,8 +23,7 @@ Detection / isolation procedures referenced below live in
    ```bash
    pytest examples tests/st --platform <platform> --runtime $ARGUMENTS \
      --device <range-or-$TASK_DEVICE> \
-     --pto-session-timeout <timeout> --clone-protocol https \
-     --pto-isa-commit <commit> -v
+     --pto-session-timeout <timeout> -v
    ```
 
    Hardware parallelism is auto-driven by `--device` (one subprocess per
