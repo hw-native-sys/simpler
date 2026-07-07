@@ -7,6 +7,7 @@
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
 import fcntl
+import hashlib
 import json
 import logging
 import shutil
@@ -326,6 +327,56 @@ class RuntimeBuilder:
             sim_context_path=sim_context_path,
             dispatcher_path=dispatcher_path,
         )
+
+    def build_aicore_image_with_extra_sources(self, name: str, extra_source_dirs: list[str]) -> Path:
+        """Build a per-orchestration AICore kernel image.
+
+        For fully_distributed_within_core on real hardware (docs §16.1) the
+        test's orchestration source is CCEC-compiled straight into the AICore
+        kernel image — exactly like its aic/aiv compute kernels go through
+        CUSTOM_SOURCE_DIRS — so aicpu_orchestration_entry / framework_bind_runtime
+        resolve as in-image symbols the on-core engine calls directly (no GM
+        blob, no cross-binary function-pointer jump).
+
+        The image = the runtime's own aicore sources + ``extra_source_dirs``.
+        The output/cache dirs are keyed by the extra dirs so distinct
+        orchestrations produce distinct images (and rebuild incrementally).
+        Returns the path to the per-image ``aicore_kernel.o``.
+        """
+        self._validate_runtime(name)
+        arch, variant = self._arch, self._variant
+        config_path = self._runtimes[name]
+        config_dir = config_path.parent
+        build_config = load_build_config(config_path)
+        include_dirs, source_dirs = self._resolve_target_dirs(config_dir, build_config, "aicore")
+
+        extra = [str(Path(d).resolve()) for d in extra_source_dirs]
+        all_sources = source_dirs + extra
+        # The orchestration source (#include "pto_orchestration_api.h") needs the
+        # runtime's orchestration dir on the quoted-include path — its own source
+        # directory only holds the .cpp. The extra dirs go on the include path too
+        # so an orchestration that ships local headers can find them.
+        orch_inc = str((config_dir / "orchestration").resolve())
+        all_includes = list(dict.fromkeys(include_dirs + [orch_inc] + extra))
+
+        key = hashlib.sha1(";".join(all_sources).encode()).hexdigest()[:16]
+        tag = f"{name}__orch_{key}"
+        output_dir = self._LIB_DIR / arch / variant / tag
+        cache_dir = self._CACHE_DIR / arch / variant / tag
+        cache_dir.mkdir(parents=True, exist_ok=True)
+
+        current_commit = _get_git_head(PROJECT_ROOT)
+        lock_path = cache_dir / ".aicore.lock"
+        with open(lock_path, "w") as lock_fd:
+            fcntl.flock(lock_fd, fcntl.LOCK_EX)
+            _invalidate_cache_if_stale(cache_dir / "aicore", current_commit)
+            return self._runtime_compiler.compile(  # type: ignore[return-value]
+                "aicore",
+                all_includes,
+                all_sources,
+                build_dir=str(cache_dir),
+                output_dir=output_dir,
+            )
 
     def _resolve_dispatcher_path(self) -> Optional[Path]:
         """Return path to libsimpler_aicpu_dispatcher.so for onboard variants.

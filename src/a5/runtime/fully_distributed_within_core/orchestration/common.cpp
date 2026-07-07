@@ -31,21 +31,45 @@ struct PTO2Runtime;
 // reach the CANN device log.
 extern "C" void unified_log_error(const char *func, const char *fmt, ...);
 
-namespace {
 // Plain global (not thread_local) to avoid glibc TLSDESC stale-resolution
 // crash (BZ #32412) when the orchestration SO is dlclose'd/re-dlopen'd
 // between execution rounds.  All orchestrator threads bind the same rt
 // value, so per-thread storage is unnecessary.
-PTO2Runtime *g_current_runtime = nullptr;
-}  // namespace
+//
+// On the CCEC AICore build this MUST be __gm__ (a GM-resident global) — CCEC
+// forbids writable BSS/file-scope storage in __aicore__ functions. __gm__
+// globals live in global memory (a valid AICore address space) and are
+// permitted (cf. s_dump_gd in dist_engine.cpp). All 9 AICore workers share
+// the same GM and bind the same rt, so the single shared slot is correct.
+// On host/AICPU builds __gm__ is empty → plain BSS global, unchanged.
+//
+// EXTERNAL + weak (NOT an anonymous-namespace static): the a5 AICore image
+// compiles this TU TWICE (once for AIC, once for AIV) and links both object
+// sets into one binary. With internal linkage each object gets its OWN private
+// g_current_runtime slot; framework_bind_runtime / framework_current_runtime are
+// weak so the linker keeps ONE of each, and if the surviving bind and current
+// come from opposite TUs they touch DIFFERENT slots — bind writes one, current
+// reads the other (nullptr) → orchestration's current_runtime()->ops derefs
+// null and faults right at the orchestration entry (observed: every core stuck
+// at the replay crumb, nondeterministic 507000/507046). A single weak external
+// symbol collapses to ONE shared slot across both TUs, matching the single weak
+// bind/current definitions. The unique name avoids clashing with the AICPU .so's
+// own g_current_runtime (that binary is linked separately).
+__attribute__((weak)) __gm__ PTO2Runtime *pto_fdwc_g_current_runtime = nullptr;
 
-extern "C" __attribute__((visibility("default"))) void framework_bind_runtime(PTO2Runtime *rt) {
-    g_current_runtime = rt;
+// __attribute__((weak)): the a5 AICore runtime binary compiles this TU twice
+// (once for AIC, once for AIV) and links both object sets into one image with
+// `ld -m aicorelinux`. Without weak, the extern "C" definitions collide as
+// duplicate symbols at that final link (same as dist_core_main, which is weak
+// for the same reason). Weak keeps a single definition; g_current_runtime is a
+// shared __gm__ slot so bind/current stay consistent across all cores.
+extern "C" __attribute__((visibility("default"))) __attribute__((weak)) __aicore__ void framework_bind_runtime(__gm__ PTO2Runtime *rt) {
+    pto_fdwc_g_current_runtime = rt;
 }
 
 // Keep current_runtime local to this .so so orchestration helpers do not
 // accidentally bind to the AICPU binary's same-named symbol.
-extern "C" __attribute__((visibility("hidden"))) PTO2Runtime *framework_current_runtime() { return g_current_runtime; }
+extern "C" __attribute__((visibility("hidden"))) __attribute__((weak)) __aicore__ __gm__ PTO2Runtime *framework_current_runtime() { return pto_fdwc_g_current_runtime; }
 
 /**
  * Use addr2line to convert an address to file:line information.

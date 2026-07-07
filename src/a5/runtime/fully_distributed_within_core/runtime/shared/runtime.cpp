@@ -49,6 +49,11 @@ Runtime::Runtime() {
     dist.go = 0;
     dist.num_workers = 0;
     dist.done_count = 0;
+    dist.seg_base = 0;
+    dist.seg_size = 0;
+    // Clear DEBUG crumbs so stale values from a prior run can't masquerade as
+    // this run's progress (the array is strided one cache line per worker).
+    memset(const_cast<uint32_t *>(dist.aicore_progress), 0, sizeof(dist.aicore_progress));
 
     // Initialize profiling state
 

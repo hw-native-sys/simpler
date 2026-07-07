@@ -14,6 +14,7 @@
 #include "common/platform_config.h"  // Register-based communication
 #include "pto2_dispatch_payload.h"
 #include "runtime.h"
+#include "dist_engine.h"
 
 /**
  * AICore main execution loop (fully_distributed_within_core, SPMD-on-core)
@@ -77,18 +78,56 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, in
     // AICPU scheduler/shutdown path is reused unchanged.
     // See runtime/dist_engine.* and docs/fully_distributed_within_core.md.
     // ===========================================================================
-    while (runtime->dist.go == 0) {
-        dcci(&runtime->dist, SINGLE_CACHE_LINE);
+    // ===========================================================================
+    // DEBUG: do NOT write runtime->dist.aicore_progress here — it shares a cache
+    // line with dist.go (false sharing clobbers the AICPU's go=1 store).
+    // Poll the PER-CORE dist_go flag. It lives in the FIRST handshake cache line
+    // (offset 32), so we invalidate that line with dcci(my_hank,
+    // SINGLE_CACHE_LINE) — the SAME primitive the Phase 1 aicpu_ready poll uses
+    // and that is proven to deliver the AICPU's store to all 9 cores on A5.
+    while (my_hank->dist_go == 0) {
+        dcci(my_hank, SINGLE_CACHE_LINE);
         SPIN_WAIT_HINT();
     }
+    // DEBUG: mark this worker saw go=1 and is entering dist_core_main.
+    // Own cache line per worker (stride AICORE_PROGRESS_STRIDE): the dcci
+    // write-back flushes the whole line, so a dense array would clobber
+    // neighbors' crumbs (false sharing).
+    runtime->dist.aicore_progress[s_block_idx * AICORE_PROGRESS_STRIDE] = 11;
+    dcci(&runtime->dist.aicore_progress[s_block_idx * AICORE_PROGRESS_STRIDE], SINGLE_CACHE_LINE, CACHELINE_OUT);
     {
+#if defined(__CPU_SIM)
+        // Sim: AICore worker is a host thread; jump to the dist_core_main
+        // registered by the AICPU orchestrator thread (same address space).
         DistCoreMainFn core_main = reinterpret_cast<DistCoreMainFn>(runtime->dist.core_main_fn);
         if (core_main != nullptr) {
             core_main(runtime, s_block_idx, static_cast<int>(core_type));
         } else {
             __atomic_add_fetch(&runtime->dist.done_count, 1, __ATOMIC_ACQ_REL);
         }
+#else
+        // Onboard: dist_core_main is CCEC-compiled into this AICore binary.
+        // Pass the __gm__ Runtime* directly — dist_core_main's first parameter
+        // is __gm__ void* (dist_engine.h), which matches this address space.
+        // The engine recovers the GM segment base from
+        // runtime->dist.global_data_base (docs §13, 方案B).
+        dist_core_main(runtime, s_block_idx, static_cast<int>(core_type));
+#endif
     }
+    // DEBUG: mark dist_core_main returned.
+    runtime->dist.aicore_progress[s_block_idx * AICORE_PROGRESS_STRIDE] = 12;
+    dcci(&runtime->dist.aicore_progress[s_block_idx * AICORE_PROGRESS_STRIDE], SINGLE_CACHE_LINE, CACHELINE_OUT);
+
+    // Signal completion via the PER-CORE dist_done flag (SECOND cache line,
+    // offset 64) and dcci write-back of that line — the proven Phase 3 pattern,
+    // applied to the isolated dist_done line so the AICPU's first-line
+    // (dist_go) flush can never clobber it. The AICPU polls this flag instead
+    // of the shared atomicAdd done_count, whose result was not visible to the
+    // AICPU on A5 (cacheable-GM atomicAdd never reached an observable line).
+    // On sim the done_count increment inside dist_core_main already completed
+    // the wait; dist_done is best-effort there.
+    my_hank->dist_done = 1u;
+    dcci(&my_hank->dist_done, SINGLE_CACHE_LINE, CACHELINE_OUT);
 
     // Teardown: wait for the AICPU EXIT signal on DATA_MAIN_BASE and ack.
     while (true) {

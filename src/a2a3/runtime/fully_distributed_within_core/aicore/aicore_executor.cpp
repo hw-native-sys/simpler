@@ -90,7 +90,18 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, in
         if (core_main != nullptr) {
             core_main(runtime, block_idx, static_cast<int>(core_type));
         } else {
+#if DIST_SIM_HOST_CLOCK
             __atomic_add_fetch(&runtime->dist.done_count, 1, __ATOMIC_ACQ_REL);
+#else
+            // A2A3 onboard fdwc isn't wired through this executor (core_main is a
+            // host fn pointer, unreachable from AICore), so this no-engine fallback
+            // is degenerate. The GCC __atomic_add_fetch builtin can't lower on
+            // addrspace-1 (GM) and the CCEC atomicAdd builtin isn't visible in this
+            // TU (dist_engine.o is not linked into the a2a3 aicore binary), so do a
+            // volatile RMW + cache flush as a best-effort done signal.
+            runtime->dist.done_count = runtime->dist.done_count + 1;
+            dcci(&runtime->dist.done_count, SINGLE_CACHE_LINE);
+#endif
         }
     }
 

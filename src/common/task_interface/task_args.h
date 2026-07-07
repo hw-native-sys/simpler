@@ -54,9 +54,9 @@ template <typename TensorTag, size_t MaxT>
 struct TensorTagMixin {
     TensorTag tags_[MaxT]{};
 
-    const TensorTag &tag(int32_t i) const { return tags_[i]; }
-    TensorTag &tag(int32_t i) { return tags_[i]; }
-    const TensorTag *tag_data() const { return tags_; }
+    PTO_DEVICE_FUNC const TensorTag &tag(int32_t i) const { return tags_[i]; }
+    PTO_DEVICE_FUNC TensorTag &tag(int32_t i) { return tags_[i]; }
+    PTO_DEVICE_FUNC const TensorTag *tag_data() const { return tags_; }
 };
 
 // Dynamic vector of tags (MaxT == 0, TensorTag != void)
@@ -88,32 +88,43 @@ struct TaskArgsTpl : TensorTagMixin<TensorTag, MaxT> {
     int32_t tensor_count_{0};
     int32_t scalar_count_{0};
 
-    void add_tensor(const T &t) {
+    PTO_DEVICE_FUNC void add_tensor(const T &t) {
+#ifndef __CCE_AICORE__
         if (scalar_count_ > 0) throw std::logic_error("TaskArgs: cannot add tensor after scalar");
         if (static_cast<size_t>(tensor_count_) >= MaxT) throw std::out_of_range("TaskArgs: tensor capacity exceeded");
+#else
+        // AICore: no exception runtime. Capacity/order invariants are enforced
+        // by the orchestrator (host) before dispatch; a violation here is a
+        // silent no-op (TODO a5: route to set_fatal).
+        if (scalar_count_ > 0 || static_cast<size_t>(tensor_count_) >= MaxT) return;
+#endif
         tensors_[tensor_count_++] = t;
     }
 
-    void add_scalar(S s) {
+    PTO_DEVICE_FUNC void add_scalar(S s) {
+#ifndef __CCE_AICORE__
         if (static_cast<size_t>(scalar_count_) >= MaxS) throw std::out_of_range("TaskArgs: scalar capacity exceeded");
+#else
+        if (static_cast<size_t>(scalar_count_) >= MaxS) return;
+#endif
         scalars_[scalar_count_++] = s;
     }
 
-    const T &tensor(int32_t i) const { return tensors_[i]; }
-    T &tensor(int32_t i) { return tensors_[i]; }
+    PTO_DEVICE_FUNC const T &tensor(int32_t i) const { return tensors_[i]; }
+    PTO_DEVICE_FUNC T &tensor(int32_t i) { return tensors_[i]; }
 
-    S scalar(int32_t i) const { return scalars_[i]; }
-    S &scalar(int32_t i) { return scalars_[i]; }
+    PTO_DEVICE_FUNC S scalar(int32_t i) const { return scalars_[i]; }
+    PTO_DEVICE_FUNC S &scalar(int32_t i) { return scalars_[i]; }
 
-    const S *scalars() const { return scalars_; }
+    PTO_DEVICE_FUNC const S *scalars() const { return scalars_; }
 
-    const T *tensor_data() const { return tensors_; }
-    const S *scalar_data() const { return scalars_; }
+    PTO_DEVICE_FUNC const T *tensor_data() const { return tensors_; }
+    PTO_DEVICE_FUNC const S *scalar_data() const { return scalars_; }
 
-    int32_t tensor_count() const { return tensor_count_; }
-    int32_t scalar_count() const { return scalar_count_; }
+    PTO_DEVICE_FUNC int32_t tensor_count() const { return tensor_count_; }
+    PTO_DEVICE_FUNC int32_t scalar_count() const { return scalar_count_; }
 
-    void clear() {
+    PTO_DEVICE_FUNC void clear() {
         tensor_count_ = 0;
         scalar_count_ = 0;
     }

@@ -47,6 +47,11 @@
 
 #define RUNTIME_MAX_ARGS 128
 #define RUNTIME_MAX_WORKER 108  // 36 AIC + 72 AIV cores
+// DEBUG crumb slot stride: each worker's aicore_progress slot gets its OWN
+// 64-byte cache line (16 uint32). A dense array false-shares — the DIST_CRUMB
+// dcci write-back flushes the whole line, so core A's flush clobbers core B's
+// freshly-written crumb (observed as garbage progress like [27,23,27,11,...]).
+#define AICORE_PROGRESS_STRIDE 16
 #define RUNTIME_MAX_FUNC_ID 1024
 #define RUNTIME_MAX_ORCH_SO_SIZE (4 * 1024 * 1024)  // 4MB max for orchestration SO
 #define RUNTIME_MAX_ORCH_SYMBOL_NAME 64
@@ -106,6 +111,27 @@ struct Handshake {
     volatile uint32_t physical_core_id;   // Physical core ID
     volatile uint32_t aicpu_regs_ready;   // AICPU register init done: 0=pending, 1=done
     volatile uint32_t aicore_regs_ready;  // AICore ID reported: 0=pending, 1=done
+    // dist_go lives in the FIRST 64-byte cache line (offset 32). The AICPU
+    // publishes it with a plain store + cache_flush_range (write-back) of this
+    // line — the AICPU->AICore path is NOT coherent on A5, so the flush is
+    // REQUIRED to push the store to GM where the AICore's dcci-invalidate poll
+    // can see it (plain store + barrier alone only reached 2/9 cores). The
+    // AICore polls with dcci(my_hank, SINGLE_CACHE_LINE) — the same primitive
+    // the Phase 1 aicpu_ready poll uses. The AICPU sets dist_go AFTER
+    // handshake_all_cores has confirmed every worker completed Phase 3, so the
+    // Phase 3 dcci write-back (which carries stale dist_go=0) cannot race with
+    // the AICPU's dist_go=1 store.
+    volatile uint32_t dist_go;            // offset 32: 1 once the distributed engine is wired
+    char _pad0[28];                       // pad first line to 64 bytes
+    // dist_done lives in the SECOND 64-byte cache line (offset 64), ISOLATED
+    // from dist_go's line. The AICPU flushes the first line to publish dist_go;
+    // if dist_done shared that line, the AICPU's write-back would clobber the
+    // AICore's dist_done=1 with the AICPU's stale dist_done=0. The AICore sets
+    // dist_done + dcci write-back of this second line after dist_core_main
+    // returns; the AICPU reads it via cache_invalidate_range (invalidate-only,
+    // never write-back) — replacing the shared atomicAdd done_count, whose
+    // result was not visible to the AICPU on A5.
+    volatile uint32_t dist_done;          // offset 64: 1 once this worker's dist_core_main returned
 } __attribute__((aligned(64)));
 
 /**
@@ -257,6 +283,12 @@ public:
     // itself. Each AICore worker invokes core_main_fn(runtime, idx, core_type)
     // once `go` is set, then increments `done_count` when finished. See
     // runtime/dist_engine.* and docs/fully_distributed_within_core.md.
+    // Feature flag: this runtime carries the fully_distributed_within_core
+    // handoff (Runtime::dist). The shared a5 device_runner.cpp keys off it to
+    // compile the fdwc-only shared-segment reserve wiring, since the other a5
+    // runtimes (tensormap_and_ringbuffer, host_build_graph) share the same
+    // device_runner.cpp but have no Runtime::dist member.
+#define RUNTIME_HAS_FDWC_DIST 1
     struct DistHandoff {
         volatile uint64_t core_main_fn;      // DistCoreMainFn (in AICPU .so)
         volatile uint64_t global_data_base;  // base of the shared DistGlobal segment
@@ -268,6 +300,25 @@ public:
         volatile uint32_t go;                // 1 once engine wired and cores may start
         volatile int32_t num_workers;        // number of AICore workers participating
         volatile int32_t done_count;         // workers atomically increment when done
+        // DEBUG: per-worker AICore progress trace. AICore writes crumb i at
+        // aicore_progress[i * AICORE_PROGRESS_STRIDE]; AICPU orchestrator reads
+        // + logs to localize stalls. Each slot sits on its OWN 64-byte cache
+        // line (stride 16 uint32) and the array is 64-byte aligned so a core's
+        // dcci write-back never clobbers a neighbor's crumb (false sharing gave
+        // garbage values like [27,23,27,11,...]).
+        // Each worker owns a 64-byte line (stride 16 u32): slot 0 is the crumb,
+        // slots 1..15 are diagnostic scratch (DIST_DBG stashes a pointer's low
+        // 32 bits in slot 1, high 32 in slot 2) — same proven-writable line, so
+        // no separate array (a separate array write faulted on-core: the device
+        // Runtime mapping does not cover fields added past aicore_progress).
+        alignas(64) volatile uint32_t aicore_progress[RUNTIME_MAX_WORKER * AICORE_PROGRESS_STRIDE];
+        // Host-preallocated shared segment (dist_engine.h DIST_SEG_RESERVE_BYTES).
+        // Allocated via host rtMalloc(RT_MEMORY_HBM) so the base is an
+        // AICore-MPU-visible device VA (~0x1000…); dist_engine_register carves
+        // DistGlobal + heap from it instead of AICPU-side halMemAlloc (which
+        // returns an AICore-invisible ~0x3ffa… aperture). 0 => legacy allocator.
+        volatile uint64_t seg_base;
+        volatile uint64_t seg_size;
     } dist;
 
 private:

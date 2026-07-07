@@ -34,6 +34,14 @@
 #include "aicpu_topology_probe.h"
 #include "callable.h"
 #include "callable_protocol.h"
+// DIST_SEG_RESERVE_BYTES (fdwc shared-segment reserve). Only the
+// fully_distributed_within_core runtime puts dist_engine.h on the host include
+// path and defines RUNTIME_HAS_FDWC_DIST (via runtime.h, included through
+// device_runner.h); the other a5 runtimes share this .cpp but have no
+// Runtime::dist, so the include + wiring are gated on that macro.
+#ifdef RUNTIME_HAS_FDWC_DIST
+#include "dist_engine.h"
+#endif
 #include "utils/elf_build_id.h"
 #include "utils/fnv1a_64.h"
 #include "host/host_regs.h"  // Register address retrieval
@@ -190,6 +198,37 @@ int DeviceRunner::run(Runtime &runtime, int block_dim, int launch_aicpu_num) {
     kernel_args_.args.enable_profiling_flag = enable_profiling_flag;
 
     if (prepare_runtime_for_launch(runtime, block_dim, launch_aicpu_num) != 0) return -1;
+
+    // fully_distributed_within_core: publish the AICore-MPU-visible shared
+    // segment reserve. DistGlobal + the GM output heap MUST live in device
+    // memory the AICore MPU can map (~0x1000…). AICPU-side halMemAlloc returns
+    // an AICPU-process aperture (~0x3ffa…) that faults on AICore deref
+    // (errcode 271), so the host allocates the reserve here via
+    // rtMalloc(RT_MEMORY_HBM) and hands the base to dist_engine_register through
+    // Runtime::dist.seg_base. Allocated once, reused across runs, freed by
+    // mem_alloc_ at finalize. Harmless for non-fdwc runtimes (they never read
+    // seg_base).
+#ifdef RUNTIME_HAS_FDWC_DIST
+    if (dist_seg_dev_ == nullptr) {
+        dist_seg_dev_ = mem_alloc_.alloc(DIST_SEG_RESERVE_BYTES);
+        if (dist_seg_dev_ == nullptr) {
+            LOG_ERROR("Failed to allocate fdwc shared-segment reserve (%zu bytes)", DIST_SEG_RESERVE_BYTES);
+            return -1;
+        }
+        LOG_INFO_V0("fdwc shared-segment reserve = %p (%zu bytes)", dist_seg_dev_, DIST_SEG_RESERVE_BYTES);
+        // DIAG: host write+readback self-test of the reserve. If readback != pattern,
+        // the host cannot even round-trip this buffer (allocation/mapping problem).
+        {
+            uint32_t pat = 0xABCD1234u, back = 0;
+            int wrc = rtMemcpy(dist_seg_dev_, sizeof(pat), &pat, sizeof(pat), RT_MEMCPY_HOST_TO_DEVICE);
+            int rrc = rtMemcpy(&back, sizeof(back), dist_seg_dev_, sizeof(back), RT_MEMCPY_DEVICE_TO_HOST);
+            LOG_ERROR("DIAG fdwc reserve self-test: base=%p wrc=%d rrc=%d back=0x%x (want 0xabcd1234)",
+                      dist_seg_dev_, wrc, rrc, back);
+        }
+    }
+    runtime.dist.seg_base = reinterpret_cast<uint64_t>(dist_seg_dev_);
+    runtime.dist.seg_size = DIST_SEG_RESERVE_BYTES;
+#endif
 
     // a5-specific: probe the AICPU topology + compute ALLOWED_CPUS for the
     // filter-style gate (see src/common/platform/onboard/aicpu/

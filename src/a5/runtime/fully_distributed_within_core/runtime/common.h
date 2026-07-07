@@ -28,12 +28,29 @@
 // build also compiles — notably orchestration/common.cpp — see these symbols
 // without pulling in pto_types.h, whose Arg::add_scalar → to_u64 path is
 // __aicore__-only and would break the ccec build.
+//
+// framework_bind_runtime / framework_current_runtime are called from BOTH
+// __host__ code (AICPU executor, orchestration .so) and __aicore__ code
+// (dist_core_main_impl binds before replay; the replayed orchestration reads
+// current_runtime). Attribute them __aicore__ so CCEC permits the AICore call;
+// on non-CCEC builds __aicore__/__gm__ are no-ops (defined empty below).
+//
+// The rt pointer lives in GM on the AICore (gd->rt is __gm__ PTO2Runtime*), so
+// the bridge parameter/return type carries __gm__. On host/AICPU builds __gm__
+// is empty → the signature collapses to plain PTO2Runtime*, matching the
+// existing host callers (aicpu_executor.cpp line 77, orchestration .so).
+#ifndef __aicore__
+#define __aicore__
+#endif
+#ifndef __gm__
+#define __gm__
+#endif
 #ifdef __cplusplus
 extern "C" {
 #endif
 struct PTO2Runtime;
-PTO2Runtime *framework_current_runtime(void);
-void framework_bind_runtime(PTO2Runtime *rt);
+__aicore__ __gm__ PTO2Runtime *framework_current_runtime(void);
+__aicore__ void framework_bind_runtime(__gm__ PTO2Runtime *rt);
 #ifdef __cplusplus
 }
 #endif

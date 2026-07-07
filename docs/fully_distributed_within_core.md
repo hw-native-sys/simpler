@@ -1112,11 +1112,55 @@ anchor 推送最后的多核子任务。这不是 per-task 串行阻塞，只发
 ### 11.1 Claim 原子性 + 两条流的无跳过（原“Claim 原子性”“每 anchor 类型 claim 计数器”）
 
 **原语：单条 `atomic_fetch_max`。** 一个类型为 `T` 的核到达任务 `N` 时执行
-`old = atomic_fetch_max(cursor[T], N)`（`cursor[T]` 为 GM 上一个 64 位字），**`old < N` 即胜出**，
+`old = atomic_fetch_max(cursor[T], N)`（`cursor[T]` 为 GM 上一个字），**`old < N` 即胜出**，
 否则 `N` 已被认领。单原子、无循环。若硬件无 `fetch_max`，等价 CAS 回路：
 `do { c = load(cursor[T]); if (N <= c) return LOST; } while (!CAS(cursor[T], c, N)); return WON;`
 内存序取 **acq-rel**（release 发布胜利，acquire 观察既有认领）。所有权判定只依赖 cursor 本身；
 真正的产出数据另由完成标志同步（§11.5）。
+
+#### 11.1.1 A5 onboard 实现：硬件 `atomicMax` 直接维护全局 cursor
+
+**关键结论（推翻旧 §16.2/C1 假设）：A5（`dav_3510`）拥有可用的、核间一致的 GM 硬件原子。**
+CANN `dav_3510` 的 `kernel_operator_atomic_impl.h` 暴露一组作用于 `__gm__` 地址的原子内建：
+`atomicAdd` / `atomicMax` / `atomicMin`（支持 `int32_t/uint32_t/int64_t/uint64_t/float`）、
+`atomicCAS` / `atomicExch`（`uint32_t/uint64_t`）。CANN 文档 [AtomicMax](https://www.hiascend.com/document/detail/zh/CANNCommunityEdition/910beta3/API/ascendcopapi/atlasascendc_api_07_00261.html)
+明确给出**三核并发 `AtomicMax` 得到正确结果、且各核拿到本次原子操作前的旧值**的示例——即这是**内存级、核间序列化**的真原子，**不需要 uncacheable 内存别名**（本机 double page table 不可用，见 §16.2 修订）。因此 §11.1 中"若硬件无 `fetch_max`"的 CAS 回退分支在 A5 上**不再需要**。
+
+**global task cursor（全局，跨核共享）** —— 每类型一个（或分片，见 §7.2）GM 上的 `int32_t`，仅由
+硬件 `atomicMax` 维护。认领即一条原子：
+
+```cpp
+// T ∈ {cube, vector, alloc}；cursor[T] 为 GM int32_t，初值 -1
+int32_t old = atomicMax(&cursor[T], N);   // 硬件原子：内存级、跨核序列化；返回操作前旧值
+bool won = (old < N);                     // old < N ⇒ 本核把 cursor 从 old 推进到 N，独占 N
+```
+
+- **无 CAS 回路、无单独的 `load`**：`atomicMax` 一次完成"读旧值 + 取大发布"，返回值即判定依据。
+  这从根本上绕开了"先 `load` 读到 cacheable 陈旧副本再 CAS"的隐患——旧路径的 `claim()` 用
+  `coherent_load` 起头，在真机 cacheable GM 上会读到本核的陈旧缓存值（见下"coherent 读"）。
+- **恰一胜者且无跳过**：`atomicMax` 的单调性与 §11.1 正文一致——每个 `T` id 恰被一个核置位，
+  cursor 只在 `T` 子序列上单调跃进，不跳过任何 `T` id。
+
+**local task cursor（每核私有）** —— `local_current_task_index`（实现里的 `self->local_index`）是
+本核 replay submit 流时到达的任务 id，**纯每核变量、非共享、不加任何原子**，随核走位自增。它与
+global cursor 的唯一交互就是上面那条 `atomicMax(&cursor[T], local_index)`。
+
+**cursor 的"coherent 读"（非认领场景）** —— 少数地方需要**读**（而非推进）global cursor：run-ahead
+节流（§6.1，比较本核 `local_index` 与最慢核进度）、以及诊断打印。真机 cacheable GM 上普通 `load`
+读到的是本核缓存副本（可能陈旧）。用一条**幂等原子**做一致读，避免陈旧：
+
+```cpp
+int32_t cur = atomicMax(&cursor[T], INT32_MIN);  // 恒不推进（任何真值 ≥ INT32_MIN），返回内存中真值
+```
+
+即"以 `INT32_MIN` 取大"永不改变 cursor，却经原子单元读回内存里的当前真值。cursor 初值 `-1`、
+运行期只增，故 `INT32_MIN` 是安全的 no-op 下界。（等价替代：读前对该 cache line 做 `dcci` 失效再普通
+`load`；二者皆可，优先用幂等原子，省一次 cacheline 失效且与写路径同一原子单元、序更清晰。）
+
+> 适用范围：本节把**全局 cursor 的认领与读**在 A5 上定死为硬件 `atomicMax`。其余跨核共享量
+> （完成前沿 `frontier`、启动/回放 barrier `started_count`/`replay_done`、完成标志环 `flags[]`、
+> `block.won` 的 `remaining`/`state`）遵循**同一原则**——RMW 走硬件原子（`atomicMax`/`atomicAdd`/
+> `atomicCAS`）、纯读走幂等原子或 `dcci` 失效——实现细节与落地顺序见 §16.4 修订后的阶段计划。
 
 **恰一胜者且无跳过（取代“claim 计数器”）。** 每个 `T` 核按 id 递增顺序遇到 `T` 任务，`cursor[T]`
 只会取到真实的 `T` 任务 id 值。在任何核尝试第 `k` 个 `T` 任务 `t_k` 之前，它必先尝试过 `t_{k-1}`
@@ -2372,20 +2416,39 @@ onboard a5 各 target 的编译器(`runtime_compiler.py::_init_a5`):`aicore`→*
 
 **所需重构**:把引擎拆成两个编译单元 —— AICPU 侧(`register`/GM 分配/发布,aarch64)与 AICore 侧(`dist_core_main` 热路径,CCEC),平台 seam 抽到 CCEC 会编译的 header;`dist.core_main_fn` 在真机改为指向 **AICore 二进制内**的入口(而非 AICPU .so 内的函数指针)。同时需确认引擎热路径不使用 CCEC 不支持的 STL(`std::vector/string/chrono` 已被 `#if` 关闭,但需 CCEC 实编确认无残留)。
 
-### 16.2 阻塞 2（硬件能力）：a5 AICore 无跨核原子 RMW
+### 16.2 阻塞 2（硬件能力）：~~a5 AICore 无跨核原子 RMW~~ —— 已解除：A5 有硬件 GM 原子
 
-去中心化的核心是多 AICore 对全局游标 `fetch_max`/CAS 抢任务,这需要**跨核原子**。调查确认 a5 AICore 树中**无跨核 GM 原子 RMW 原语**(无 `SetAtomicAdd` 用于控制字、无 CAS intrinsic、无 LL/SC);`dist_engine.cpp` 作者注释亦承认:`// No hardware fetch_max on the target`、`// NOTE(a5): true cross-core RMW atomicity ... needs the hardware atomic unit / LL-SC`。
+> **本节结论已修订（2026-07）。** 早前基于对旧代码注释（`// No hardware fetch_max on the target`）
+> 的判断，认定"a5 AICore 无跨核原子 RMW"，并把它列为总闸 blocker。**这个判断是错的。**
+> A5（`dav_3510`）实测拥有可用、核间一致的 GM 硬件原子（见下）。claim 竞争可用一条硬件
+> `atomicMax` 直接实现，**无需** AICPU 仲裁 / 静态分派 / 软件锁，也**无需** uncacheable 内存。
 
-`dcci` 只给**可见性**不给**原子性**:`Coherent<T>` 的"invalidate→本地 `std::atomic` RMW→flush"在真机**不是跨核原子**——两核可同时 invalidate、读同值、各自本地 CAS 成功、各自 flush → **重复认领 / 丢更新**。a5 现有生产路径正是用 **AICPU 单写寄存器 + dcci** 刻意避开核间原子。
+**证据。** CANN `dav_3510` 头 `asc/impl/basic_api/dav_3510/kernel_operator_atomic_impl.h` 暴露：
+`atomicAdd`/`atomicMax`/`atomicMin`（`int32_t/uint32_t/int64_t/uint64_t/float`）、
+`atomicCAS`/`atomicExch`（`uint32_t/uint64_t`），均作用于 `__gm__` 地址。CANN 文档
+[AtomicMax](https://www.hiascend.com/document/detail/zh/CANNCommunityEdition/910beta3/API/ascendcopapi/atlasascendc_api_07_00261.html)
+给出三核并发 `AtomicMax` 结果正确、各核返回操作前旧值的示例——**内存级、核间序列化的真原子**。
+`dist_engine.cpp` 现有的 `dist_atomic_cas`/`dist_atomic_add` 已经在用 `atomicCAS`/`atomicAdd`，
+说明 RMW 写侧本就走硬件原子。
 
-**这是设计问题,不是实现问题。** 候选方向(需团队/HW 决策,建议先做 (0)):
+**真正的真机 bug（已定位）在读侧，不在原子侧。** `coherent_load` 的 onboard 分支是**普通
+`load`（无 `dcci` 失效）**，注释假设"uncacheable → 普通 load 即一致"。但本机 double page table
+不可用（§16.2 附注/探针），段实际是 **cacheable**，普通 load 读到的是本核**陈旧缓存副本**。
+后果：`atomicAdd`/`atomicMax` 的写在内存里是对的，但用 `coherent_load` 观察这些量的核看不到
+别人的更新 → drain barrier（`replay_done`）永远读不到 `num_workers` → 挂死（实测 9 核只读到 8）。
 
-0. **先查实 a5 是否有可用 AICore 原子**(推荐先行):核对 CANN 文档/intrinsic —— L2/HBM atomic、`SetAtomicAdd` 能否用于控制字、有无 CAS intrinsic。**有**则用真原子实现 claim,`Coherent<T>` 的 RMW 直接映射;**无**则退到下列之一。避免基于错误假设写代码。
-1. **AICPU 仲裁(混合)**:执行仍 SPMD-on-core,但 claim 经单写者寄存器/邮箱向 AICPU(或指定协调核)申请。避开核间原子、保留动态负载均衡,但重新引入一个仲裁者(部分回退中心化)。
-2. **静态分派**:任务按确定规则(如游标 `index % 核数`)预分给各核,零跨核原子、真正去中心化,但**丢失 execute-first 的动态负载均衡**(长任务会拖累该核的分片)。
-3. **GM 软件锁(dcci + ticket/Lamport bakery)**:不依赖 HW 原子,但延迟高、正确性难保证(软件互斥仍依赖单字顺序一致性),风险最高,不推荐。
+**修复方向（取代旧的 (0)/(1)/(2)/(3) 候选）：**
 
-> 倾向:先 (0) 查实;若无 HW 原子,(1) AICPU 仲裁在"保留负载均衡 + 可实现"间最平衡,(2) 静态分派作为最简可跑基线备选。
+1. **claim / 全局 cursor**：改用单条硬件 `atomicMax`（§11.1.1）。认领 `old = atomicMax(&cursor[T], N); won = old<N;`，一次原子完成读+写，天然绕开陈旧读。
+2. **cursor 的纯读**（节流/诊断）：用幂等原子 `atomicMax(&cursor, INT32_MIN)` 读回内存真值（§11.1.1）。
+3. **其余共享量的读**（`coherent_load` 通路：`frontier`/`started_count`/`replay_done`/`flags[]`/`block.won`）：
+   onboard 分支**加 `dcci` 失效再 load**（对齐 sim 分支的 `pto_dcci_inval`），或对可用类型改幂等原子读。RMW 保持硬件原子。
+4. **flag 环 false sharing**（C4）：`flags[]` 逐字节共享 cacheline，`dcci` 以 line 为粒度——仍需 flag 按 cacheline 对齐或 per-core 分片；这一条独立于原子能力，仍待处理。
+
+> 附注（uncacheable 探针，2026-07）：`halMemCtl(CTRL_TYPE_GET_DOUBLE_PGTABLE_OFFSET)` 在本机
+> 返回 `rc=0` 但 `offset=0`（`CTRL_TYPE_GET_DCACHE_ADDR` 亦返回 0），即驱动确认**本设备无
+> cacheable/uncacheable 双页表别名**。故不能靠"把段搬到 uncacheable 别名"来获得一致性——
+> 必须走上面的硬件原子 + `dcci` 读一致路线。
 
 ### 16.3 seam → a5 现成原语映射（重构后填入 CCEC 单元）
 
@@ -2402,11 +2465,17 @@ onboard a5 各 target 的编译器(`runtime_compiler.py::_init_a5`):`aicore`→*
 
 ### 16.4 阶段计划（每阶段带验证闸）
 
-1. **P0 决策**:先落 §16.2 的 (0),定 claim 机制。**闸**:HW 原子能力结论 + 选定方案。
-2. **P1 结构拆分(可 sim 验证)**:seam 抽到独立 header;引擎拆 AICPU/AICore 两单元;a5 `build_config` 把热路径加入 `aicore` `source_dirs`、`register` 留 `aicpu`。**闸**:a5sim + a2a3sim 仍 DEPSIG private==shared、golden 通过(结构不回归)。
-3. **P2 CCEC 编译打通**:HW seam 分支填入(§16.3);`__gm__` 化引擎内 GM 指针;确认无 CCEC 不支持的 STL。**闸**:CCEC 编译 aicore 二进制成功(CI)。
-4. **P3 claim 机制落地**:按 P0 决策实现(真原子 / AICPU 仲裁 / 静态分派);done_count 等计数配对 dcci。**闸**:单核→多核真机小用例(vector_example / mix_coown)golden + 无重复认领。
-5. **P4 一致性 & 压测**:flag cacheline 对齐、makespan/负载均衡对比 sim。**闸**:真机 paged_attention 等 DEPSIG 与 sim 一致、性能达标。
+0. **P0 决策 —— 已完成。** claim 机制定为 **A5 硬件 `atomicMax`**（§11.1.1）：A5(`dav_3510`)有
+   核间一致的 GM 硬件原子，无需 AICPU 仲裁 / 静态分派 / uncacheable 别名。**闸已过**：HW 原子能力
+   结论（`kernel_operator_atomic_impl.h` + CANN 三核 `AtomicMax` 示例）+ 选定方案。
+1. **P1 结构拆分(可 sim 验证)**:seam 抽到独立 header;引擎拆 AICPU/AICore 两单元;a5 `build_config` 把热路径加入 `aicore` `source_dirs`、`register` 留 `aicpu`。**闸**:a5sim + a2a3sim 仍 DEPSIG private==shared、golden 通过(结构不回归)。
+2. **P2 CCEC 编译打通**:HW seam 分支填入(§16.3);`__gm__` 化引擎内 GM 指针;确认无 CCEC 不支持的 STL。**闸**:CCEC 编译 aicore 二进制成功(CI)。
+3. **P3 claim + 读一致性落地**：
+   - claim 用单条 `atomicMax`（`dist_atomic_max`，已落 `dist_engine.cpp` 的 `#if !DIST_SIM_HOST_CLOCK` claim 分支）；
+   - global cursor 纯读改幂等 `atomicMax(&cursor, INT32_MIN)`（节流 §6.1 / 诊断）；
+   - `coherent_load` 的 onboard 分支补 `dcci` 失效再 load（`frontier`/`started_count`/`replay_done`/`flags[]`/`block.won`），RMW 保持 `atomicAdd`/`atomicCAS`。
+   **闸**:单核→多核真机小用例(vector_example / mix_coown) barrier 收敛、golden + 无重复认领/丢更新。
+4. **P4 一致性 & 压测**:flag cacheline 对齐(C4，独立于原子能力)、makespan/负载均衡对比 sim。**闸**:真机 paged_attention 等 DEPSIG 与 sim 一致、性能达标。
 
 ## 17. Open Challenges（A5 onboard 未决项）
 
@@ -2414,17 +2483,47 @@ onboard a5 各 target 的编译器(`runtime_compiler.py::_init_a5`):`aicore`→*
 
 | # | 挑战 | 档位 | 现状 / 根因 | 待决策 or 落地方向 | 验证依赖 |
 | - | ---- | ---- | ---- | ---- | ---- |
-| C1 | **跨核原子 RMW 缺失**(总闸) | BLOCKER | a5 AICore 无跨核 GM 原子(CAS/`fetch_*`);claim 竞争本质依赖它。`dcci` 只给可见性不给原子性,`Coherent<T>` 的 RMW 在真机非跨核原子 → 可能重复认领/丢更新。引擎作者已留 open NOTE(`// No hardware fetch_max on the target`) | **先查实 CANN 是否有可用 AICore 原子**;无则选:AICPU 仲裁(荐)/ 静态分派 / 软件锁(§16.2) | CANN 文档/HW 同事;真机多核无重复认领 |
-| C2 | **热路径处理器错位**(引擎需 CCEC 重构) | BLOCKER | `dist_engine.cpp` 现由 AICPU aarch64-g++ 编译 → onboard `DIST_SIM_HOST_CLOCK=1` → HW seam `#else` 永不编译(死代码)。`dist_core_main` 无法在 CCEC AICore 上跑(异构 ISA) | 拆引擎为 AICPU(`register`/GM)+ AICore(`dist_core_main` 热路径,CCEC)两单元;seam 抽到 CCEC header;`core_main_fn` 指向 AICore 二进制入口(§16.1 / P1–P2) | a5sim/a2a3sim 不回归;CCEC 编译 aicore 成功(CI) |
+| C1 | ~~跨核原子 RMW 缺失~~ **已解除** → 改为**读侧一致性** | ~~BLOCKER~~ CORRECTNESS | **修订**：A5(`dav_3510`)有硬件 GM 原子 `atomicAdd/Max/Min/CAS/Exch`(内存级、核间一致,CANN 文档三核 `AtomicMax` 示例佐证),claim 可用单条 `atomicMax` 实现(§11.1.1)。真机 bug 实为 `coherent_load` 的 onboard 分支是无 `dcci` 的普通 load(误设 uncacheable),读到陈旧缓存 → barrier 挂死。本机 double page table 不可用(探针 `offset=0`),不能靠 uncacheable 别名 | claim/cursor 用 `atomicMax`;cursor 纯读用幂等 `atomicMax(x,INT32_MIN)`;其余 `coherent_load` onboard 分支加 `dcci` 失效再 load(§11.1.1/§16.2) | 真机多核无重复认领 + barrier 收敛 |
+| C2 | ~~热路径处理器错位~~ **结构拆分已完成** | ~~BLOCKER~~ 已落地 | **修订**：引擎已拆 AICPU(`register`,`SIMPLER_DIST_AICPU_ONLY`)/AICore(`dist_core_main`,`SIMPLER_DIST_AICORE_ONLY`)两单元；a5 `build_config` 把 `DIST_COMMON` 加入 `aicore` `source_dirs`；`aicore_execute` onboard 分支**直接调用** `dist_core_main`(非函数指针)。CCEC 已把 `dist_engine.cpp` 编成 `dist_engine_aic.o`/`dist_engine_aiv.o` 并链入 `aicore_kernel.o`(797KB)。**剩余的真机故障是 C10(ops 表函数指针重定位)，不再是编译错位** | 已完成；后续问题见 C10 | a5sim/a2a3sim 不回归(a5sim 通过；a2a3sim 见 C11);CCEC 编译成功✅ |
 | C3 | **CCEC STL 支持不确定** | ENG(潜在 BLOCKER) | 引擎含 `std::vector/string/chrono`(HW 上已 `#if` 关闭),但需 CCEC 实编确认热路径无残留 STL / 异常 / RTTI 依赖 | 热路径去 STL 化;必要时改固定容量数组 | CCEC 编译通过 |
 | C4 | **flag 环 cacheline 粒度 / false sharing** | CORRECTNESS | `flags[]` 逐字节环;`dcci` 以 cacheline 为单位失效/刷出 → "失效邻居未刷出的写"会丢数据 | flag 按 cacheline 对齐,或改 per-core 分片(§14.3 / §16.3 注) | 真机多核压测 |
 | C5 | **计数缺配对 dcci** | CORRECTNESS | `runtime->dist.done_count` 的 `__atomic_add_fetch`(`aicore_executor.cpp`)无配对 dcci → 真机跨核语义不可靠(同属 C1 家族) | 计数改经确定的可见性协议(单写者 / dcci 配对 / 归约) | 真机 done_count 收敛 |
 | C6 | **`__gm__` 地址空间化** | ENG | sim 上 `__gm__` 为空宏;真机 CCEC 上引擎内所有 GM 指针/段访问需 `__gm__` 限定 | 随 C2 重构给 `DistGlobal`/`DistCore`/段指针加 `__gm__` | CCEC 编译通过 |
 | C7 | **GM 段分配 + 发布** | ENG | seam `pto_gm_alloc/publish` 真机分支为 TODO | AICPU 侧 `rtMalloc(RT_MEMORY_HBM)`/`halMemAlloc` + `cache_flush_range` 发布(§16.3) | 真机各核可读到初始化后的段 |
 | C8 | **core-id 映射**(低风险,记录在案) | ENG | 逻辑 worker index 已由 `dist_core_main(core_idx)` 入口参数携带(= launch `s_block_idx`),无需读寄存器;物理 id 仅诊断用 | 沿用入口参数;`pto_core_id()` HW 分支返回该入参 | — |
-| C9 | **验证缺口:无本地 CCEC/真机** | PROC | 本机 `--list` 仅 a5sim/a2a3sim,onboard 无法编译/运行 | 所有 HW 改动走 CI(CCEC 编译)+ 真机(golden/DEPSIG)验证闸(§16.4) | CI + 真机可用 |
+| C9 | **验证缺口:无本地 CCEC/真机** | PROC | ~~本机无 CCEC~~ **修订**：本机 CCEC 可用(`cann-9.1.T500/bin/ccec`)，`build_runtimes --platforms a5` 能出 CCEC aicore 二进制；真机经 `task-submit --device auto` 跑 `vector_example`。仍无本地 npu-smi(缺 `libsecurec.so`，onboard-arch-precheck 需手动确认 a5) | 继续走 `task-submit` + `_run_probe.sh`(自动重编+抓 device log crumbs) | 已可用✅ |
+| C10 | ~~ops 表函数指针 incore 重定位~~ **已解除** | ~~BLOCKER~~ 已落地 | **修订**：真机开 `dist_ops_refresh_aicore`+ops 后 `gd->rt->ops->submit_task` 经 `runtime->dist.global_data_base + offsetof(ops)` 的**整数偏移自解析**已可用；`dist_submit_impl` 被正常进入。之前"9 核全 271"的真因是 **ABI 分歧(C13)+`pto_core_id()` 桩(C14)** 联合，与 ops 重定位无关。修 C14 后 9 核 `local_index=5`(各核提交 5 任务)、`core_id` 各不相同(0-8) | 已完成 | 编排能提交任务✅ |
+| C11 | **`a2a3sim` 编译回归** | ENG | 共享 `dist_engine.cpp` 引用 `runtime->dist.seg_base/seg_size`、`TensorRef::raw_addr()` —— 这些**仅 a5 定义**(前序会话加的 a5-onboard 段交付逻辑)，a2a3 的 runtime.h 无 → a2a3sim 编译失败 | 给这些 a5-only 字段访问加 `#ifdef`/特征检测隔离，或把段交付逻辑下沉到 a5-only 编译单元 | a2a3sim `Build complete!` |
+| C13 | ~~`DistGlobal` ABI 分歧~~ **已解除** | ~~BLOCKER~~ 已落地 | `PTO2_PROFILING` 宏在 AICPU(g++)/AICore(CCEC)不一致 → `L2TaskArgs orch_args_gm` 尺寸差 160B → AICore 读 `gd->rt`=0 → MPU 271。**修复**：把 `orch_args_gm` 移到 `DistGlobal` 末尾，profiling 相关字段不再影响前段 offset | 已完成 | AICore 读到正确 `gd->rt`✅ |
+| C14 | ~~编排未在核上执行(`pto_core_id` 桩 + 编排调度错位)~~ **已解除** | ~~BLOCKER~~ 已落地 | 两处联合：(a) `pto_core_id()` HW 分支是恒返回 0 的桩 → 所有核自认 core 0 → SPMD 崩塌；(b) `dist_core_main` onboard 分支**直调弱符号** `aicpu_orchestration_entry`(仅弱声明→链接器解析到镜像基址=空操作)，而真正的编排是 CCEC 编成的**独立 PC-relative blob**(`_compile_orchestration_dist_blob`)，入口在 `gd->orch_func`。**修复**：(a) `pto_set_core_id/pto_core_id` 用 `[[block_local]] static` 存/取入参 `core_idx`；(b) onboard 分支改与 sim 一致——先 `gd->orch_bind_func(gd->rt)` 绑定 blob 自身 `g_current_runtime`，再经 `gd->orch_func(*gd->orch_args)` 调用。移除 `DIST_DIAG_SKIP_ORCH` | 已完成 | 9 核 `local_index=5`、`core_id`=0..8✅ |
+| C15 | ~~drain 死锁(flag false-sharing)~~ **已解除** | ~~BLOCKER~~ 已落地 | C14 解除后 `drain` 开始执行 kernel，但 2 核卡 `crumb 33`(非 40/41 → kernel 不挂死、无 DMA 故障)、`done_count=7/9`、507000 超时。诊断证实：卡住核 `occupied_count=1`、`ring_empty=0`，其私有环 slot 的 fanin 生产者 flag 永不置位——**`flags[2]=0` 但结构对称的 `flags[1]=1`**(t1/t2 都是 c+标量、只依赖 t0)。真因 = **C4 false-sharing**：`flags[]` 是 `Coherent<uint8_t>` 稠密环，t0..t4 五个 flag 共用一条 64B cacheline，`coherent_store`+dcci **按 cacheline 刷出会把相邻核刚写的 flag clobber 回 0** | flag 改 `int32_t` + 置位走**内存级 `atomicMax(&flags[i],1)`**(`dist_set_flag`)——直写真实 HBM 字、不回写共享行，相邻置位互不 clobber；读侧仍 `coherent_load` dcci 失效 | **9/9 完成、无 507000/异常✅**(仍差数值，见 C16) |
+| C16 | **中间 `TensorCreateInfo` 栈局部地址空间损坏(现总闸)** | BLOCKER | C15 解除后 9 核全部完成、无死锁，但 `f` golden `max_diff≈31~51`。**真因已确诊(非缓存一致性)**：上板 dump 逐张量地址显示中间张量间距仅 `0x400`(1024B=256 float)而非 `0x10000`(65536B)——`buffer_size_bytes()` 用了 `ndims=0`(ALIGN_UP(4,1024)=1024)。进一步 dump `dist_submit_impl` 读到的 create_info：`@0x107c78 ndims=0 shape0=0`。根因 = **用户编排里 `TensorCreateInfo inter_ci` 是 CCEC AICore 的栈局部变量**(栈在 local/workspace 空间，`-cce-aicore-stack-size`)，而 `TensorRef` 在 CCEC 用**整数地址 seam**存指针(`addr_=reinterpret_cast<uintptr_t>(&inter_ci)`)——整数 round-trip **丢失 local 地址空间限定**，重建为 generic 指针后指向错误位置→读出 ndims=0→中间输出被分配成 4B→严重重叠(每张量覆盖后续 63 个,只剩首 256 元素正确)。外部张量(ext_a/ext_f)正常是因为它们 GM 常驻,地址可扁平 round-trip。注释"on-core 一切 GM-resident"的假设**对用户栈 create_info 不成立** | `TensorRef` 对 OUTPUT **按值内嵌** `TensorCreateInfo`(在 `add_output` 时用仍带正确空间限定的指针拷贝,不再存整数地址),`create_info()` 返回内嵌成员(经 `args` 引用做成员访问,空间正确)。host/CCEC 一致内嵌以保 `L2TaskArgs`(orch_args_gm)布局不变 | 真机 `f` golden 通过 |
 
-> 依赖关系:**C1(总闸)** 决定 claim 机制 → 影响 **C2** 热路径写什么代码;**C2** 是 C3/C4/C6/C7 生效的前提(seam 必须在 CCEC 单元里才有意义)。落地顺序见 §16.4 的 P0→P4 阶段闸。
+> 依赖关系:**C1** claim 机制已定(硬件 `atomicMax`)；**C2** 结构拆分完成；**C10/C13/C14/C15 已解除**——编排提交任务、SPMD id 正确、**drain 无死锁、9/9 完成**。**当前总闸转为 C16**(中间张量数据跨核可见性)——最后一步数值正确性。C16 解除后收 C5(done_count)/C11(a2a3 隔离)。落地顺序见 §16.4 的 P0→P4 阶段闸。
+
+### 17.1 本轮上板定位记录（2026-07，MPU 271 收敛）
+
+真机 `vector_example`(device auto，9 workers = 3 AIC + 6 AIV)三次迭代的证据链：
+
+1. **已修两处跨核陈旧指针隐患**（`dist_core_main_impl` / `drain_block_won` / `has_pending_won`）：
+   - `self->gd`（`gd->cores[i].gd`）由 AICPU 写、AICore 用**裸指针 load**读（`Coherent<T>` 只包原子，不含此回指针），cacheable HBM 上可能读到上一轮 segment base 的陈旧值 → `gd->blocks[self->block_id]` 野地址。**修复**：在 `dist_core_main_impl` 用本核已验证的 local `gd` 就地 `self->gd = gd`（同核写读，天然一致）。
+   - `block_id` 越界防护：`drain_block_won`/`has_pending_won` 进入前判 `0 <= block_id < num_blocks`。
+2. **故障随 ops/orch 开关移动**（关键 bisection）：
+   - `DIST_DIAG_SKIP_OPS=1 && SKIP_ORCH=1`：故障在 **drain 循环**（crumb 30），**7/9 存活**。
+   - `DIST_DIAG_SKIP_OPS=0 && SKIP_ORCH=0`：故障前移到 **ops 表/编排回放**（crumb 26-27），**9/9 全 271**，pc 收敛到 `0x2600`/`0x2624`。
+   - 结论：真正的元凶在 **`dist_ops_refresh_aicore` + `rt->ops` 调用路径**（C10），与 cursor 认领、读一致性无关。
+3. **本轮正确性改动**（cursor `atomicMax`、`coherent_load/store` 补 dcci、`self->gd`、`block_id` 防护）都是必要且正确的，把故障从 drain 路径清掉；但它们不是 C10 的成因。
+4. **复现命令**：`task-submit --device auto --max-time 260 --run "bash tests/st/a5/fully_distributed_within_core/vector_example/_run_probe.sh"`；device log crumbs 在 `~/ascend/log/debug/device-*/`，`progress=[...]` 按 core_idx、`dbg=[...]` 为各核读到的诊断包。诊断开关在 `dist_engine.cpp` 顶部 `DIST_DIAG_SKIP_ORCH/BIND/OPS`（当前全 0 = 完整路径）。
+
+### 17.2 编排提交打通里程碑（2026-07，C13/C14 解除）
+
+`vector_example`（device auto，9 workers）关键突破的证据链：
+
+1. **C13（ABI 分歧）** 修复后，AICore 不再 271，能读到正确 `gd->rt`；但 `local_index` 全 0（无任务提交）。
+2. **`pto_core_id()` 是桩**：HW 分支恒返回 0（带 TODO）→ 所有核自认 core 0，`dist_submit_impl`/`dist_is_fatal` 全走 core 0 视角，SPMD 崩塌。改用 `[[block_local]] static int32_t` 存 `dist_core_main(core_idx)` 入参后修复。
+3. **编排调度错位（C14 核心）**：onboard `dist_core_main` 直调 `aicpu_orchestration_entry`——但该符号在通用运行时镜像里只有**弱声明**，链接器解析到镜像基址 `0x…be00000`（探针 `dbg99` bits0-31 实测），等于**空操作**；真正的编排是 CCEC 编成的**独立 PC-relative blob**（`kernel_compiler._compile_orchestration_dist_blob`），入口存 `gd->orch_func`（探针实测 `0x…0001d04c`，落在 DevMalloc 上传区）。`DIST_DIAG_SKIP_ORCH=1` 又把直调整个跳过（双重失效）。
+4. **修复**：onboard 分支改与 sim 一致，先 `gd->orch_bind_func(gd->rt)` 绑定 blob 自身 `g_current_runtime`，再 `gd->orch_func(*gd->orch_args)`；删除 `DIST_DIAG_SKIP_ORCH`。（§16.1 的"编排编进镜像/直调符号"方案构建侧尚未接通，故沿用 blob 指针调度——与 kernel blob 一致。）
+5. **结果**：9 核 `dbg=[0x50k0001d04c]` 解码 = `local_index=5`（每核提交 5 任务）+ `core_id`=0..8（各不相同）。**编排首次在核上真正提交任务、SPMD id 正确**。随后暴露 C15（kernel 执行/DMA MTE 异常），成为新总闸。
 
 ## 18. 相关文档
 

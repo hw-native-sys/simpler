@@ -1877,6 +1877,19 @@ class Worker:
         builder = RuntimeBuilder(platform)
         binaries = builder.get_binaries(runtime)
 
+        # fully_distributed_within_core on real hardware compiles the test's
+        # orchestration source straight into the AICore kernel image (docs
+        # §16.1), so aicpu_orchestration_entry / framework_bind_runtime are
+        # in-image symbols the on-core engine calls directly. When the caller
+        # supplies the orchestration source dir(s), build that per-orchestration
+        # image and swap it in for the shared runtime image.
+        extra_aicore_sources = self._config.get("aicore_extra_source_dirs")
+        if extra_aicore_sources:
+            import dataclasses  # noqa: PLC0415
+
+            per_test_aicore = builder.build_aicore_image_with_extra_sources(runtime, extra_aicore_sources)
+            binaries = dataclasses.replace(binaries, aicore_path=per_test_aicore)
+
         self._chip_worker = ChipWorker()
         self._chip_worker.init(device_id, binaries)
 

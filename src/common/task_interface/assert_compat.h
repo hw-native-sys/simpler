@@ -55,9 +55,24 @@ private:
  * debug_assert macro:
  * checks the condition in debug builds and throws with a stack trace on failure.
  * It is a no-op in release builds (NDEBUG).
+ *
+ * On AICore (CCEC, __CCE_AICORE__) there is no std::string / std::runtime_error
+ * / exception runtime and no stdio for assert_impl, so assertions compile to
+ * no-ops. A failed invariant on AICore is expected to surface via the engine's
+ * fatal flag (set_fatal) or a watchdog, not via a throw. (TODO a5: route to a
+ * trap/hardware abort.)
  */
-#ifdef NDEBUG
+#ifdef __CCE_AICORE__
 #define debug_assert(cond) ((void)0)
+#define always_assert(cond) ((void)0)
+#elif defined(NDEBUG)
+#define debug_assert(cond) ((void)0)
+#define always_assert(cond)                         \
+    do {                                            \
+        if (!(cond)) {                              \
+            assert_impl(#cond, __FILE__, __LINE__); \
+        }                                           \
+    } while (0)
 #else
 #define debug_assert(cond)                          \
     do {                                            \
@@ -65,18 +80,13 @@ private:
             assert_impl(#cond, __FILE__, __LINE__); \
         }                                           \
     } while (0)
-#endif
-
-/**
- * always_assert macro:
- * checks the condition in both debug and release builds.
- */
 #define always_assert(cond)                         \
     do {                                            \
         if (!(cond)) {                              \
             assert_impl(#cond, __FILE__, __LINE__); \
         }                                           \
     } while (0)
+#endif
 
 #define PTO_PRAGMA(x) _Pragma(#x)
 

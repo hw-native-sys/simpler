@@ -225,6 +225,19 @@ class Gxx15Toolchain(Toolchain):
             flags.append("-D__DAV_VEC__")
         elif core_type == "aic":
             flags.append("-D__DAV_CUBE__")
+        # pto-isa's common/type.hpp typedefs half/aclFloat16/bfloat16_t to
+        # `_Float16` under __CPU_SIM. openEuler's GCC 12.3.1 (the `g++-15` on this
+        # aarch64 dev box) does not provide the `_Float16` C extension type
+        # (it suggests `_Float64`), so the sim kernel compile fails at the first
+        # pto-inst.hpp include. aarch64 GCC does support `__fp16` (half-precision),
+        # which is semantically equivalent for best-effort CPU simulation (pto-isa
+        # itself notes "a best-effort 16-bit float type is sufficient"). Map
+        # `_Float16`→`__fp16` on aarch64 only; x86_64 CI runners use a newer GCC
+        # that provides `_Float16` natively and must not be affected.
+        import platform as _platform
+
+        if _platform.machine() == "aarch64":
+            flags.append("-D_Float16=__fp16")
         return flags
 
     def get_cmake_args(self) -> list[str]:

@@ -229,7 +229,7 @@ struct alignas(64) PTO2TensorMapEntry {
      * COVERED is returned when `input` completely contains `entry` per-dim
      * — dep_compute uses this to retire the now-redundant entry.
      */
-    OverlapStatus check_overlap(const Tensor &input) const {
+    PTO_DEVICE_FUNC OverlapStatus check_overlap(const Tensor &input) const {
         debug_assert(input.buffer.addr == buffer_addr);
         debug_assert(input.version >= version);
         if (input.version > version) {

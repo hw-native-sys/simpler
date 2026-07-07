@@ -231,7 +231,13 @@ struct PTO2TaskPayload {
      * @param args                Task arguments (tensors + scalars)
      * @param result  Materialized output tensors (from TensorCreateInfo path)
      */
-    void init(
+    // init() populates the dispatch payload from submit-time args. It runs only
+    // on the AICPU orchestrator (pto_orchestrator.cpp) where the payload is a
+    // generic stack/local object. On AICore the fdwc engine populates RingSlot
+    // directly (build_ring_slot), so this method is host-only — gating it avoids
+    // the __gm__/generic Tensor-reference mismatch with materialize_output().
+#if !defined(__CCE_AICORE__)
+    PTO_DEVICE_FUNC void init(
         const L0TaskArgs &args, TaskOutputTensors &result, PTO2TaskAllocResult &alloc_result, PTO2OutputLayout &layout
     ) {
         tensor_count = args.tensor_count();
@@ -255,6 +261,7 @@ struct PTO2TaskPayload {
         // Eliminates branches; extra bytes within the same CL have zero additional cost.
         memcpy(scalars, args.scalars(), PTO2_ALIGN_UP(args.scalar_count() * sizeof(uint64_t), 64));
     }
+#endif
 };
 
 // PTO2TaskPayload layout verification (offsetof requires complete type).

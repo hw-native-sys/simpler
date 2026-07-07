@@ -32,11 +32,27 @@
 DIST_COMMON = "../../../common/runtime/fully_distributed_within_core"
 
 BUILD_CONFIG = {
-    "aicore": {"include_dirs": ["runtime", "common", ".."], "source_dirs": ["aicore", "orchestration"]},
+    "aicore": {
+        # "../../../common" puts src/common on the CCEC include path so the
+        # engine's transitive includes (utils/device_arena.h via pto_runtime2.h)
+        # resolve — matching what the AICPU build already gets through the
+        # platform CMake's ../../../../common flag. DIST_COMMON brings in the
+        # shared dist_engine.{cpp,h}; onboard compiles dist_core_main into the
+        # AICore binary (CCEC) rather than reaching it via a host function
+        # pointer (sim). See docs/fully_distributed_within_core.md §16.
+        "include_dirs": ["runtime", "common", "..", "../../../common", DIST_COMMON],
+        "source_dirs": ["aicore", "orchestration", DIST_COMMON],
+    },
     "aicpu": {
         "include_dirs": ["runtime", "common", "..", DIST_COMMON],
         "source_dirs": ["aicpu", "runtime", "orchestration", DIST_COMMON],
     },
-    "host": {"include_dirs": ["runtime", "common", ".."], "source_dirs": ["host", "runtime/shared", "orchestration"]},
+    "host": {
+        # DIST_COMMON is on the host include path so device_runner.cpp can read
+        # DIST_SEG_RESERVE_BYTES from dist_engine.h (the fdwc shared-segment
+        # reserve the host pre-allocates for AICore-MPU-visible DistGlobal/heap).
+        "include_dirs": ["runtime", "common", "..", DIST_COMMON],
+        "source_dirs": ["host", "runtime/shared", "orchestration"],
+    },
     "orchestration": {"include_dirs": ["runtime", "orchestration", "common", ".."], "source_dirs": ["orchestration"]},
 }

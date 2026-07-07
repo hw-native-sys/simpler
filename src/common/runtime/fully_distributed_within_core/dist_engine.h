@@ -29,9 +29,37 @@
 
 #pragma once
 
+#include <cstddef>
+#include <cstdint>
+
 struct PTO2Runtime;
 struct L2TaskArgs;
 class Runtime;
+
+// Host-preallocated shared-segment reserve (docs §13/§15.2, 方案B).
+//
+// On a5 onboard, the DistGlobal segment + GM output heap MUST be reachable from
+// every AICore's MPU. AICPU-side halMemAlloc returns an AICPU-process aperture
+// (~0x3ffa…) that the AICore MPU does not map, so dereferencing it inside
+// dist_core_main faults with "MPU address access invalid" (errcode 271). The
+// host therefore pre-allocates ONE device buffer via rtMalloc(RT_MEMORY_HBM) —
+// the same allocator that produces the AICore-visible tensor/runtime VAs
+// (~0x1000…) — and publishes its base/size through Runtime::dist.seg_base /
+// seg_size. dist_engine_register bump-carves DistGlobal + heap from it. When
+// seg_base is 0 (sim, or an arch that has not wired this) the engine falls back
+// to the legacy dist_alloc_gm_segment allocator, so sim/a2a3 behavior is
+// unchanged.
+//
+// Layout inside the reserve: DistGlobal at offset 0, then the heap ring at a
+// page-aligned offset after it. sizeof(DistGlobal) is dominated by
+// cores[RUNTIME_MAX_WORKER] each holding a DistTensorMap
+// (kRingBuckets*kBucketCapMax MapEntry ≈ 2 MiB), so it runs ~150 MiB on a
+// 72-core SKU; the default heap ring is 64 MiB (kHeapRingDefault). 320 MiB
+// leaves headroom for both plus alignment. A PTO_DIST_HEAP_MB that overflows
+// the reserve triggers a deterministic FATAL (always_assert) in
+// dist_engine_register. Device HBM is tens of GiB, so the reserve is cheap and
+// allocated once (reused across runs).
+constexpr size_t DIST_SEG_RESERVE_BYTES = (320ull << 20);
 
 // Orchestration entry signature (matches DeviceOrchestrationFunc in the AICPU
 // executor): the dlopen'd user orchestration function the cores replay.
@@ -51,7 +79,8 @@ typedef void (*DistOrchFunc)(const L2TaskArgs &);
  * Runtime::dist.core_main_fn. Returned as void* to keep this header light.
  */
 void *dist_engine_register(
-    PTO2Runtime *rt, DistOrchFunc orch_func, const L2TaskArgs *orch_args, int num_workers, Runtime *runtime
+    PTO2Runtime *rt, DistOrchFunc orch_func, const L2TaskArgs *orch_args, int num_workers, Runtime *runtime,
+    uint64_t orch_bind_func = 0
 );
 
 /**
@@ -65,3 +94,27 @@ void *dist_engine_register(
  * by the AICPU stub once Runtime::dist.done_count == num_workers.
  */
 void dist_engine_dump_trace();
+
+// Per-core SPMD entry. On onboard it is CCEC-compiled into the AICore binary
+// and called directly by aicore_execute; on sim the AICPU .so exports it and
+// each AICore worker thread reaches it via the Runtime::dist.core_main_fn
+// function pointer. Marked __aicore__ so the CCEC AICore build can call it
+// from aicore_execute (a __host__ function is not callable from __aicore__).
+// The first parameter is __gm__ void* because on AICore the Runtime lives in
+// GM (a distinct CCEC address space — a generic void* would be an illegal
+// address-space cast). __aicore__/__gm__ are defined as empty for non-CCEC
+// builds (AICPU aarch64, host g++, sim), so the same declaration works in
+// every compile unit.
+#ifndef __aicore__
+#define __aicore__
+#endif
+#ifndef __gm__
+#define __gm__
+#endif
+#ifdef __cplusplus
+extern "C" {
+#endif
+__aicore__ void dist_core_main(__gm__ void *runtime_v, int core_idx, int core_type_int);
+#ifdef __cplusplus
+}
+#endif

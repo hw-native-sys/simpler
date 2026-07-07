@@ -134,7 +134,13 @@ struct PTO2Runtime {
     // segment. Set by dist_engine_register on the AICPU; read by the distributed
     // ops callbacks (which receive only this PTO2Runtime*) to recover the segment
     // with no process-global symbol. Null / unused for the centralized runtime.
-    void *dist_global = nullptr;
+    //
+    // uint64_t (not void*): the shared dist_engine.cpp recovers a __gm__
+    // DistGlobal* via static_cast<uintptr_t>. A void*→uintptr_t cast of a
+    // GM-loaded generic pointer makes CCEC's backend fail ("error pointer
+    // address space cast"); an integer field sidesteps it. Kept in sync with
+    // the a5 fdwc runtime (both include the shared engine).
+    uint64_t dist_global = 0;
 
     // Components
     PTO2SharedMemoryHandle *sm_handle;

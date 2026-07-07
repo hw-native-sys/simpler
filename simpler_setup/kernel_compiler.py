@@ -17,6 +17,7 @@ from typing import Optional, Union
 
 from simpler import env_manager
 
+from .elf_parser import build_dist_orch_blob
 from .environment import PROJECT_ROOT
 from .toolchain import (
     Aarch64GxxToolchain,
@@ -418,6 +419,19 @@ class KernelCompiler:
         if orch_includes:
             include_dirs = include_dirs + orch_includes
 
+        # fully_distributed_within_core onboard: the orchestration is replayed on
+        # the AICore itself (SPMD), so it must be CCEC-compiled + linked into a
+        # position-independent AICore blob rather than a host-dlopen'd AArch64
+        # .so. See _compile_orchestration_dist_blob and
+        # docs/fully_distributed_within_core.md §16.
+        if runtime_name == "fully_distributed_within_core" and self.platform == "a5":
+            return self._compile_orchestration_dist_blob(
+                source_path,
+                extra_include_dirs=include_dirs,
+                extra_sources=orch_sources or None,
+                build_dir=build_dir,
+            )
+
         # Resolve toolchain: HOST_GXX needs no runtime-specific extras
         toolchain_type = self._get_toolchain(
             {
@@ -518,6 +532,159 @@ class KernelCompiler:
             error_hint=f"{toolchain.cxx_path} not found. Please install it.",
             delete_output=build_dir is None,
         )
+
+    # Orchestration entry / bind symbols the AICore blob must export.
+    _DIST_ORCH_ENTRY_SYMBOL = "aicpu_orchestration_entry"
+    _DIST_ORCH_BIND_SYMBOL = "framework_bind_runtime"
+
+    def _dist_blob_include_dirs(self, extra_include_dirs: Optional[list[str]]) -> list[str]:
+        """Include roots for the CCEC orchestration blob.
+
+        Mirrors the AICore runtime image build (src/{arch}/platform/onboard/
+        aicore/CMakeLists.txt) so the blob's view of PTO2Runtime / PTO2RuntimeOps
+        / Tensor layouts is byte-identical to the runtime it links against at
+        run time.
+        """
+        arch = "a5" if self.platform in ("a5", "a5sim") else "a2a3"
+        aicore_dir = self.platform_dir / "onboard" / "aicore"
+        fdwc = self.project_root / "src" / arch / "runtime" / "fully_distributed_within_core"
+        dirs = [
+            str(aicore_dir),
+            str(self.platform_dir / "include"),
+            str(self.project_root / "src" / "common" / "platform" / "include"),
+            str(self.project_root / "src" / "common" / "task_interface"),
+            str(self.project_root / "src" / "common" / "log" / "include"),
+            str(fdwc / "runtime"),
+            str(fdwc / "common"),
+            str(fdwc / "orchestration"),
+            str(self.project_root / "src" / arch / "runtime"),
+            str(self.project_root / "src" / "common"),
+            str(self.project_root / "src" / "common" / "runtime" / "fully_distributed_within_core"),
+        ]
+        for inc_dir in extra_include_dirs or []:
+            inc_abs = os.path.abspath(inc_dir)
+            if inc_abs not in dirs:
+                dirs.append(inc_abs)
+        return dirs
+
+    def _dist_blob_ccec_flags(self) -> list[str]:
+        """CCEC flags matching the AICore runtime image build (single arch).
+
+        AIC and AIV produce byte-identical code for the pure-scalar orchestration
+        (verified), so one blob (vec) runs on every SPMD core.
+        """
+        arch = "dav-c310-vec" if self.platform in ("a5", "a5sim") else "dav-c220-vec"
+        return [
+            "-c",
+            "-O3",
+            "-g",
+            "-x",
+            "cce",
+            "-Wall",
+            "-std=c++17",
+            "-DPTO2_PROFILING=0",
+            "-DSIMPLER_DIST_AICORE_ONLY",
+            "--cce-aicore-only",
+            "-mllvm",
+            "-cce-aicore-stack-size=0x8000",
+            "-mllvm",
+            "-cce-aicore-function-stack-size=0x8000",
+            "-mllvm",
+            "-cce-aicore-record-overflow=false",
+            "-mllvm",
+            "-cce-aicore-addr-transform",
+            "-mllvm",
+            "-cce-aicore-dcci-insert-for-scalar=false",
+            f"--cce-aicore-arch={arch}",
+        ]
+
+    def _compile_orchestration_dist_blob(
+        self,
+        source_path: str,
+        extra_include_dirs: Optional[list[str]] = None,
+        extra_sources: Optional[list[str]] = None,
+        build_dir: Optional[str] = None,
+    ) -> bytes:
+        """Compile the fully_distributed_within_core orchestration into a
+        position-independent AICore blob for on-core SPMD replay.
+
+        Steps: CCEC-compile the user orchestration (entry forced ``__aicore__``)
+        and the shared orchestration/common.cpp, link them with
+        ``cce-ld -m aicorelinux -Ttext=0 -static`` into one flat PC-relative
+        AICore executable, then package the loadable image + entry/bind offsets
+        (see build_dist_orch_blob). The AICPU stub copies the blob into device
+        GM and dispatches the AICore entry directly (no host dlopen).
+        """
+        assert self.ccec is not None, "ccec toolchain is only available for hardware platforms"
+        source_path = os.path.abspath(source_path)
+        if not os.path.isfile(source_path):
+            raise FileNotFoundError(f"Source file not found: {source_path}")
+
+        include_flags = [f"-I{d}" for d in self._dist_blob_include_dirs(extra_include_dirs)]
+        base_flags = self._dist_blob_ccec_flags()
+
+        objects: list[str] = []
+        try:
+            orch_obj = self._make_temp_path(
+                prefix=f"{os.path.basename(source_path)}.dist_orch_", suffix=".o", build_dir=build_dir
+            )
+            # The orchestration source self-attributes aicpu_orchestration_entry
+            # with PTO_DEVICE_FUNC (→ __aicore__ under CCE), so no forced-include
+            # prelude is needed: CCE compiles the entry as an __aicore__ symbol
+            # here just as it does when the same source is linked into the
+            # AICore kernel image (docs §16.1).
+            cmd = [self.ccec.cxx_path] + base_flags + include_flags
+            cmd.extend(["-o", orch_obj, source_path])
+            logger.info(f"[DistOrch] Compiling orchestration: {source_path}")
+            self._run_subprocess(cmd, "DistOrch", error_hint=f"ccec not found at {self.ccec.cxx_path}")
+            objects.append(orch_obj)
+
+            for src in extra_sources or []:
+                src = os.path.abspath(src)
+                if not os.path.isfile(src):
+                    continue
+                obj = self._make_temp_path(
+                    prefix=f"{os.path.basename(src)}.dist_orch_", suffix=".o", build_dir=build_dir
+                )
+                cmd = [self.ccec.cxx_path] + base_flags + include_flags
+                cmd.extend(["-o", obj, src])
+                logger.info(f"[DistOrch] Compiling orchestration dep: {src}")
+                self._run_subprocess(cmd, "DistOrch", error_hint=f"ccec not found at {self.ccec.cxx_path}")
+                objects.append(obj)
+
+            linked_path = self._make_temp_path(
+                prefix=f"{os.path.basename(source_path)}.dist_orch_linked_", suffix=".elf", build_dir=build_dir
+            )
+            link_cmd = [
+                self.ccec.linker_path,
+                "-m",
+                "aicorelinux",
+                "-Ttext=0",
+                "-static",
+                "--no-undefined",
+                "-o",
+                linked_path,
+            ] + objects
+            logger.info("[DistOrch] Linking orchestration blob")
+            self._run_subprocess(link_cmd, "DistOrch", error_hint=f"ccec linker not found at {self.ccec.linker_path}")
+
+            with open(linked_path, "rb") as f:
+                linked_bytes = f.read()
+            blob = build_dist_orch_blob(
+                linked_bytes, self._DIST_ORCH_ENTRY_SYMBOL, self._DIST_ORCH_BIND_SYMBOL
+            )
+            logger.info(f"[DistOrch] Blob ready: {len(blob)} bytes")
+
+            if build_dir is None:
+                for p in (*objects, linked_path):
+                    if os.path.isfile(p):
+                        os.remove(p)
+            return blob
+        except Exception:
+            for p in objects:
+                if os.path.isfile(p):
+                    os.remove(p)
+            raise
 
     def _compile_incore_sim(
         self,

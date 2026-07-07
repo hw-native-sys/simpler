@@ -28,9 +28,26 @@
 #include "data_type.h"
 #include "tensor.h"
 
+// These materialization helpers run on BOTH the AICPU (aarch64) and the AICore
+// (CCEC) build of the distributed engine. __aicore__ is the CCEC function
+// attribute (defined as [aicore] by inner_kernel.h on AICore, empty elsewhere);
+// define it here as empty if a TU includes this header without pulling in the
+// platform qualifier headers, so the same definition compiles in every unit.
+#ifndef __aicore__
+#define __aicore__
+#endif
+
+// AICore (CCEC) has no libc memcpy callable from __aicore__ (the <string.h>
+// declaration is __host__), and __builtin_memcpy can't lower address-space-1
+// (GM) memory intrinsics. The materialization helpers and Tensor::init_from_*
+// below memcpy 64B cache lines (local-local) and, for initial-value fills,
+// within a GM backing buffer — all from __aicore__ context. The dist_memcpy
+// shim + memcpy redirect live in data_type.h (included before this header and
+// before tensor.h), so they cover every call site in the runtime headers.
+
 class alignas(64) TensorCreateInfo {
 public:
-    TensorCreateInfo(
+    __aicore__ TensorCreateInfo(
         const uint32_t shapes_in[], uint32_t ndims_in, DataType dtype_in = DataType::FLOAT32, bool manual_dep_in = false
     ) :
         initial_value(0),
@@ -52,7 +69,7 @@ public:
         }
     }
 
-    void copy(const TensorCreateInfo &other) { memcpy(this, &other, sizeof(other)); }
+    __aicore__ void copy(const TensorCreateInfo &other) { memcpy(this, &other, sizeof(other)); }
 
     template <typename T = uint64_t>
     void set_initial_value(T value) {
@@ -60,7 +77,7 @@ public:
         initial_value = to_u64(value);
     }
 
-    uint64_t buffer_size_bytes() const {
+    __aicore__ uint64_t buffer_size_bytes() const {
         uint64_t total = 1;
         for (uint32_t i = 0; i < ndims; i++) {
             total *= shapes[i];
@@ -88,7 +105,7 @@ public:
     uint8_t __pad_flags__;             // → Tensor::child_memory (always 0 for create-info outputs)
     uint32_t shapes[MAX_TENSOR_DIMS];  // → Tensor::shapes
 
-    TensorCreateInfo() = default;
+    __aicore__ TensorCreateInfo() = default;
 };
 
 // TensorCreateInfo layout must match Tensor cacheline 1 for memcpy optimization
@@ -109,7 +126,11 @@ static_assert(offsetof(TensorCreateInfo, shapes) == offsetof(Tensor, shapes));
 // ============================================================================
 
 /// Fill the entire backing buffer of `t` with `initial_value` (doubling memcpy).
-inline void fill_tensor_initial_value(Tensor &t, uint64_t initial_value) {
+/// Templated on the Tensor reference: callers pass either a stack-local Tensor
+/// (AICPU payload) or a __gm__ Tensor (DistCore::outpool), and CCEC forbids
+/// cross-address-space reference casts.
+template <class TRef>
+__aicore__ inline void fill_tensor_initial_value(TRef &t, uint64_t initial_value) {
     always_assert(reinterpret_cast<char *>(t.buffer.addr) != nullptr);
     uint64_t elem_size = get_element_size(t.dtype);
     char *dst = reinterpret_cast<char *>(t.buffer.addr);
@@ -130,11 +151,29 @@ inline void fill_tensor_initial_value(Tensor &t, uint64_t initial_value) {
 /// Single 64B memcpy covers cache line 1; `ci` pre-initialises start_offset (=0)
 /// and is_contiguous (=true) in its line-1 slots so they need no reset here.
 /// Cache line 2 (stride/extent) is computed from `ci.shapes` in a single reverse pass.
-inline void init_tensor_from_create_info(Tensor &t, const TensorCreateInfo &ci, void *addr, uint64_t buffer_size) {
+/// Templated on the Tensor reference (see fill_tensor_initial_value).
+template <class TRef>
+__aicore__ inline void init_tensor_from_create_info(TRef &t, const TensorCreateInfo &ci, void *addr, uint64_t buffer_size) {
     always_assert(ci.ndims > 0 && ci.ndims <= MAX_TENSOR_DIMS);
-    memcpy(&t, &ci, 64);
-    t.buffer = {reinterpret_cast<uint64_t>(addr), buffer_size};
-    t.owner_task_id = PTO2TaskId::invalid();  // caller (orchestrator) overwrites with actual task_id
+    // Field-wise copy (NOT a bulk `memcpy(&t, &ci, 64)`): on the onboard AICore
+    // `ci` may live in the orchestration frame's local/workspace space (docs §17
+    // C16). A bulk memcpy from that space into the GM-resident `t` faults (MTE),
+    // whereas scalar field reads are address-space-safe. These mirror the fields
+    // TensorCreateInfo shares with Tensor cache line 1 (see the offsetof asserts
+    // above); buffer/owner are set explicitly below.
+    t.start_offset = ci.start_offset;
+    t.version = ci.version;
+    t.ndims = ci.ndims;
+    t.dtype = ci.dtype;
+    t.manual_dep = ci.manual_dep;
+    t.is_contiguous = ci.is_contiguous;
+    t.child_memory = 0;  // TensorCreateInfo::__pad_flags__ mirror (always 0)
+    for (uint32_t i = 0; i < ci.ndims; i++) {
+        t.shapes[i] = ci.shapes[i];
+    }
+    t.buffer.size = buffer_size;
+    t.buffer.addr = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(addr));
+    t.owner_task_id.raw = UINT64_MAX;  // caller (orchestrator) overwrites with actual task_id
     uint32_t s = 1;
     for (int32_t i = static_cast<int32_t>(t.ndims) - 1; i >= 0; --i) {
         t.strides[i] = s;

@@ -84,6 +84,8 @@ target_compile_options(aicpu_kernel
         $<$<COMPILE_LANGUAGE:C>:-std=gnu11>
 )
 
+target_compile_definitions(aicpu_kernel PRIVATE SIMPLER_DIST_AICPU_ONLY)
+
 target_include_directories(aicpu_kernel
     PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}

@@ -40,6 +40,30 @@
 #include "task_args.h"           // ChipStorageTaskArgs, Tensor
 #include "tensor.h"              // Tensor, TensorCreateInfo
 
+// PTO_ORCH_ENTRY — attribute for the orchestration entry / config symbols
+// (aicpu_orchestration_entry, aicpu_orchestration_config).
+//
+// On the onboard AICore build (docs §16.1) the orchestration source is
+// CCEC-compiled straight into the AICore kernel image and, like the rest of
+// that image (kernel.cpp, orchestration/common.cpp), compiled TWICE — once for
+// AIC and once for AIV — then linked into one binary with `ld -m aicorelinux`.
+// So these entry symbols need:
+//   * __aicore__  — the on-core dist_core_main calls them as device symbols;
+//   * weak        — otherwise the AIC and AIV definitions collide as duplicate
+//                   symbols at the final link (same reason framework_bind_runtime
+//                   and dist_core_main are weak). AIC/AIV emit byte-identical
+//                   code for the pure-scalar orchestration, so dedup is safe.
+// On host / sim / AICPU builds this expands to nothing: the orchestration is a
+// plain function resolved by dlopen.
+#if defined(__DAV_VEC__) || defined(__DAV_CUBE__)
+#ifndef __aicore__
+#define __aicore__ [aicore]
+#endif
+#define PTO_ORCH_ENTRY __attribute__((weak)) __aicore__
+#else
+#define PTO_ORCH_ENTRY
+#endif
+
 // =============================================================================
 // Tensor Factory Helpers
 // =============================================================================
@@ -64,28 +88,33 @@ typedef struct PTO2Runtime PTO2Runtime;
  * Populated by the runtime; called by orchestration through inline wrappers.
  */
 typedef struct PTO2RuntimeOps {
-    TaskOutputTensors (*submit_task)(PTO2Runtime *rt, const MixedKernels &mixed_kernels, const L0TaskArgs &args);
-    void (*scope_begin)(PTO2Runtime *rt);
-    void (*scope_end)(PTO2Runtime *rt);
-    void (*orchestration_done)(PTO2Runtime *rt);
-    bool (*is_fatal)(PTO2Runtime *rt);
-    void (*report_fatal)(PTO2Runtime *rt, int32_t error_code, const char *func, const char *fmt, ...);
+    TaskOutputTensors (*submit_task)(__gm__ PTO2Runtime *rt, const MixedKernels &mixed_kernels, const L0TaskArgs &args);
+    void (*scope_begin)(__gm__ PTO2Runtime *rt);
+    void (*scope_end)(__gm__ PTO2Runtime *rt);
+    void (*orchestration_done)(__gm__ PTO2Runtime *rt);
+    bool (*is_fatal)(__gm__ PTO2Runtime *rt);
+    // Diagnostic string params are __gm__ const char*: on the onboard AICore
+    // (CCEC) build of the orchestration, string literals and __FUNCTION__ live
+    // in global memory (__gm__ const char[]), so the ops-table slots must accept
+    // GM-qualified pointers. On host/sim __gm__ is empty and these collapse to
+    // plain const char*.
+    void (*report_fatal)(__gm__ PTO2Runtime *rt, int32_t error_code, __gm__ const char *func, __gm__ const char *fmt, ...);
 
     // Logging (populated by runtime, called by orchestration)
-    void (*log_error)(const char *func, const char *fmt, ...);
-    void (*log_warn)(const char *func, const char *fmt, ...);
-    void (*log_debug)(const char *func, const char *fmt, ...);
+    void (*log_error)(__gm__ const char *func, __gm__ const char *fmt, ...);
+    void (*log_warn)(__gm__ const char *func, __gm__ const char *fmt, ...);
+    void (*log_debug)(__gm__ const char *func, __gm__ const char *fmt, ...);
     // INFO with explicit verbosity tier (v ∈ [0,9]; gating done inside).
-    void (*log_info_v)(const char *func, int v, const char *fmt, ...);
+    void (*log_info_v)(__gm__ const char *func, int v, __gm__ const char *fmt, ...);
 
     // Cross-layer data access (orchestration reads/writes tensor values via runtime)
     // Placed after logging to avoid shifting hot-path field offsets.
-    uint64_t (*get_tensor_data)(PTO2Runtime *rt, const Tensor &tensor, uint32_t ndims, const uint32_t indices[]);
+    uint64_t (*get_tensor_data)(__gm__ PTO2Runtime *rt, const Tensor &tensor, uint32_t ndims, const uint32_t indices[]);
     void (*set_tensor_data)(
-        PTO2Runtime *rt, const Tensor &tensor, uint32_t ndims, const uint32_t indices[], uint64_t value
+        __gm__ PTO2Runtime *rt, const Tensor &tensor, uint32_t ndims, const uint32_t indices[], uint64_t value
     );
-    TaskOutputTensors (*alloc_tensors)(PTO2Runtime *rt, const L0TaskArgs &args);
-    TaskOutputTensors (*submit_dummy_task)(PTO2Runtime *rt, const L0TaskArgs &args);
+    TaskOutputTensors (*alloc_tensors)(__gm__ PTO2Runtime *rt, const L0TaskArgs &args);
+    TaskOutputTensors (*submit_dummy_task)(__gm__ PTO2Runtime *rt, const L0TaskArgs &args);
 
     // Stash the call-site of the next PTO2ScopeGuard so the [ScopeStats]
     // collector can log it. Always present to keep ops-table layout stable
@@ -110,18 +139,25 @@ struct PTO2Runtime {
 // Inline Convenience Wrappers (call through ops table)
 // =============================================================================
 
-static inline PTO2Runtime *current_runtime() { return framework_current_runtime(); }
+// Inline convenience wrappers. Attributed PTO_DEVICE_FUNC so the onboard AICore
+// (CCEC) build of the per-test orchestration compiles them as __aicore__ (the
+// orchestration is replayed ON each AICore in SPMD, docs §16); on host/sim
+// builds PTO_DEVICE_FUNC is empty and they stay ordinary host functions. The
+// runtime pointer is __gm__ (framework_current_runtime returns __gm__
+// PTO2Runtime*): on AICore the Runtime lives in global memory, on host __gm__
+// is empty and this collapses to a plain pointer.
+PTO_DEVICE_FUNC static inline __gm__ PTO2Runtime *current_runtime() { return framework_current_runtime(); }
 
-static inline TaskOutputTensors alloc_tensors(const L0TaskArgs &args) {
-    PTO2Runtime *rt = current_runtime();
+PTO_DEVICE_FUNC static inline TaskOutputTensors alloc_tensors(const L0TaskArgs &args) {
+    __gm__ PTO2Runtime *rt = current_runtime();
     if (rt->ops->is_fatal(rt)) {
         return TaskOutputTensors{};
     }
     return rt->ops->alloc_tensors(rt, args);
 }
 
-static inline TaskOutputTensors alloc_tensors(const TensorCreateInfo create_infos[], uint32_t count) {
-    PTO2Runtime *rt = current_runtime();
+PTO_DEVICE_FUNC static inline TaskOutputTensors alloc_tensors(const TensorCreateInfo create_infos[], uint32_t count) {
+    __gm__ PTO2Runtime *rt = current_runtime();
     if (rt->ops->is_fatal(rt)) {
         return TaskOutputTensors{};
     }
@@ -140,13 +176,13 @@ static inline TaskOutputTensors alloc_tensors(const TensorCreateInfo create_info
 }
 
 template <typename... CIs>
-static inline TaskOutputTensors alloc_tensors(const CIs &...cis) {
+PTO_DEVICE_FUNC static inline TaskOutputTensors alloc_tensors(const CIs &...cis) {
     static_assert(sizeof...(cis) > 0, "alloc_tensors requires at least one TensorCreateInfo");
     static_assert(
         (std::is_same_v<std::decay_t<CIs>, TensorCreateInfo> && ...),
         "alloc_tensors only accepts TensorCreateInfo arguments"
     );
-    PTO2Runtime *rt = current_runtime();
+    __gm__ PTO2Runtime *rt = current_runtime();
     if (rt->ops->is_fatal(rt)) {
         return TaskOutputTensors{};
     }
@@ -162,8 +198,8 @@ static inline TaskOutputTensors alloc_tensors(const CIs &...cis) {
     return alloc_tensors(args);
 }
 
-static inline TaskOutputTensors rt_submit_task(const MixedKernels &mixed_kernels, const L0TaskArgs &args) {
-    PTO2Runtime *rt = current_runtime();
+PTO_DEVICE_FUNC static inline TaskOutputTensors rt_submit_task(const MixedKernels &mixed_kernels, const L0TaskArgs &args) {
+    __gm__ PTO2Runtime *rt = current_runtime();
     if (rt->ops->is_fatal(rt)) {
         return TaskOutputTensors{};
     }
@@ -173,7 +209,7 @@ static inline TaskOutputTensors rt_submit_task(const MixedKernels &mixed_kernels
 /**
  * Convenience wrapper: submit an AIC-only task.
  */
-static inline TaskOutputTensors rt_submit_aic_task(int32_t kernel_id, const L0TaskArgs &args) {
+PTO_DEVICE_FUNC static inline TaskOutputTensors rt_submit_aic_task(int32_t kernel_id, const L0TaskArgs &args) {
     MixedKernels mk;
     mk.aic_kernel_id = kernel_id;
     return rt_submit_task(mk, args);
@@ -182,7 +218,7 @@ static inline TaskOutputTensors rt_submit_aic_task(int32_t kernel_id, const L0Ta
 /**
  * Convenience wrapper: submit an AIV-only task (uses AIV0 slot).
  */
-static inline TaskOutputTensors rt_submit_aiv_task(int32_t kernel_id, const L0TaskArgs &args) {
+PTO_DEVICE_FUNC static inline TaskOutputTensors rt_submit_aiv_task(int32_t kernel_id, const L0TaskArgs &args) {
     MixedKernels mk;
     mk.aiv0_kernel_id = kernel_id;
     return rt_submit_task(mk, args);
@@ -195,16 +231,16 @@ static inline TaskOutputTensors rt_submit_aiv_task(int32_t kernel_id, const L0Ta
  * waits on its fanin and notifies its fanout. Useful as a synchronization
  * barrier or as a placeholder producer for tests / dep-graph wiring.
  */
-static inline TaskOutputTensors rt_submit_dummy_task(const L0TaskArgs &args) {
-    PTO2Runtime *rt = current_runtime();
+PTO_DEVICE_FUNC static inline TaskOutputTensors rt_submit_dummy_task(const L0TaskArgs &args) {
+    __gm__ PTO2Runtime *rt = current_runtime();
     if (rt->ops->is_fatal(rt)) {
         return TaskOutputTensors{};
     }
     return rt->ops->submit_dummy_task(rt, args);
 }
 
-static inline void rt_scope_begin(PTO2ScopeMode mode = PTO2ScopeMode::AUTO) {
-    PTO2Runtime *rt = current_runtime();
+PTO_DEVICE_FUNC static inline void rt_scope_begin(PTO2ScopeMode mode = PTO2ScopeMode::AUTO) {
+    __gm__ PTO2Runtime *rt = current_runtime();
     if (rt->ops->is_fatal(rt)) {
         return;
     }
@@ -212,27 +248,27 @@ static inline void rt_scope_begin(PTO2ScopeMode mode = PTO2ScopeMode::AUTO) {
     rt->ops->scope_begin(rt);
 }
 
-static inline void rt_scope_end() {
-    PTO2Runtime *rt = current_runtime();
+PTO_DEVICE_FUNC static inline void rt_scope_end() {
+    __gm__ PTO2Runtime *rt = current_runtime();
     if (rt->ops->is_fatal(rt)) {
         return;
     }
     rt->ops->scope_end(rt);
 }
 
-static inline void rt_orchestration_done() {
-    PTO2Runtime *rt = current_runtime();
+PTO_DEVICE_FUNC static inline void rt_orchestration_done() {
+    __gm__ PTO2Runtime *rt = current_runtime();
     rt->ops->orchestration_done(rt);
 }
 
-static inline bool rt_is_fatal() {
-    PTO2Runtime *rt = current_runtime();
+PTO_DEVICE_FUNC static inline bool rt_is_fatal() {
+    __gm__ PTO2Runtime *rt = current_runtime();
     return rt->ops->is_fatal(rt);
 }
 
 #define rt_report_fatal(code, fmt, ...)                                          \
     do {                                                                         \
-        PTO2Runtime *_rt = current_runtime();                                    \
+        __gm__ PTO2Runtime *_rt = current_runtime();                             \
         _rt->ops->report_fatal(_rt, (code), __FUNCTION__, (fmt), ##__VA_ARGS__); \
     } while (0)
 
@@ -274,8 +310,8 @@ static inline bool rt_is_fatal() {
  * are read immediately without waiting.
  */
 template <typename T = uint64_t>
-static inline T get_tensor_data(const Tensor &tensor, uint32_t ndims, const uint32_t indices[]) {
-    PTO2Runtime *rt = current_runtime();
+PTO_DEVICE_FUNC static inline T get_tensor_data(const Tensor &tensor, uint32_t ndims, const uint32_t indices[]) {
+    __gm__ PTO2Runtime *rt = current_runtime();
     if (rt->ops->is_fatal(rt)) {
         return from_u64<T>(0);
     }
@@ -310,8 +346,8 @@ static inline T get_tensor_data(const Tensor &tensor, uint32_t ndims, const uint
  * add_output(TensorCreateInfo) after submit returns.
  */
 template <typename T = uint64_t>
-static inline void set_tensor_data(const Tensor &tensor, uint32_t ndims, const uint32_t indices[], T value) {
-    PTO2Runtime *rt = current_runtime();
+PTO_DEVICE_FUNC static inline void set_tensor_data(const Tensor &tensor, uint32_t ndims, const uint32_t indices[], T value) {
+    __gm__ PTO2Runtime *rt = current_runtime();
     if (rt->ops->is_fatal(rt)) {
         return;
     }
@@ -327,7 +363,7 @@ static inline void set_tensor_data(const Tensor &tensor, uint32_t ndims, const u
  */
 class PTO2ScopeGuard {
 public:
-    explicit PTO2ScopeGuard(
+    PTO_DEVICE_FUNC explicit PTO2ScopeGuard(
         PTO2ScopeMode mode = PTO2ScopeMode::AUTO, const char *file = __builtin_FILE(), int line = __builtin_LINE()
     ) :
         rt_(current_runtime()) {
@@ -337,14 +373,14 @@ public:
             rt_->ops->scope_begin(rt_);
         }
     }
-    ~PTO2ScopeGuard() {
+    PTO_DEVICE_FUNC ~PTO2ScopeGuard() {
         if (!rt_->ops->is_fatal(rt_)) {
             rt_->ops->scope_end(rt_);
         }
     }
 
 private:
-    PTO2Runtime *rt_;
+    __gm__ PTO2Runtime *rt_;
 };
 
 #define _PTO2_CONCATENATE_IMPL(x, y) x##y

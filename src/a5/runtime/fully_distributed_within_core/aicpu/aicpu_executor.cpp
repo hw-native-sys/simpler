@@ -22,6 +22,7 @@
 #include <sys/mman.h>
 #endif
 
+#include "aicpu/device_malloc.h"
 #include "aicpu/device_time.h"
 #include "aicpu/orch_so_file.h"
 #include "aicpu/platform_aicpu_affinity.h"
@@ -79,6 +80,23 @@ extern "C" void framework_bind_runtime(PTO2Runtime *rt);
 constexpr const char *DEFAULT_ORCH_ENTRY_SYMBOL = "aicpu_orchestration_entry";
 constexpr const char *DEFAULT_ORCH_CONFIG_SYMBOL = "aicpu_orchestration_config";
 
+// Onboard fully_distributed_within_core orchestration blob header. The
+// orchestration is CCEC-compiled + cce-ld-linked into a position-independent
+// AICore image (not an AArch64 .so), then wrapped in this fixed header by
+// simpler_setup/elf_parser.py::build_dist_orch_blob. The host copies the whole
+// blob verbatim into device GM; this stub reads the header to locate the
+// AICore entry / bind symbols instead of doing a host dlopen. Keep this struct
+// byte-compatible with the Python packer.
+constexpr uint32_t DIST_ORCH_BLOB_MAGIC = 0x42524F44;  // "DORB"
+constexpr uint64_t DIST_ORCH_BLOB_HEADER_SIZE = 64;
+struct DistOrchBlobHeader {
+    uint32_t magic;
+    uint32_t version;
+    uint64_t entry_off;   // AICore entry offset within the image
+    uint64_t bind_off;    // framework_bind_runtime offset within the image
+    uint64_t image_size;  // image byte count (header excluded)
+};
+
 static int32_t read_runtime_status(Runtime *runtime) {
     if (runtime == nullptr) {
         return 0;
@@ -112,6 +130,12 @@ struct OrchSoEntry {
     DeviceOrchestrationFunc func{nullptr};
     DeviceOrchestrationBindRuntimeFunc bind{nullptr};
     DeviceOrchestrationConfigFunc config_func{nullptr};
+    // Onboard CCEC orchestration blob only: GM address of the blob's
+    // framework_bind_runtime (0 for the AArch64-dlopen path). Passed to
+    // dist_engine_register so each AICore worker binds the blob's
+    // g_current_runtime before replay. `func` holds the blob's AICore entry
+    // (a GM code address, not a host pointer) in that case.
+    uint64_t blob_bind_addr{0};
 };
 
 struct AicpuExecutor {
@@ -280,6 +304,30 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
                     return -1;
                 }
 
+                // Onboard CCEC path: the "SO" is actually a position-independent
+                // AICore orchestration blob (magic header), not an AArch64 .so.
+                // It was copied verbatim into GM; there is nothing to dlopen —
+                // the AICore executes it directly. Resolve the entry / bind GM
+                // addresses from the header (gm_base + fixed header + offset) and
+                // skip the file-create + dlopen dance entirely.
+                const auto *blob_hdr = reinterpret_cast<const DistOrchBlobHeader *>(so_data);
+                const bool is_dist_blob =
+                    so_size >= sizeof(DistOrchBlobHeader) && blob_hdr->magic == DIST_ORCH_BLOB_MAGIC;
+                if (is_dist_blob) {
+                    const uint64_t image_base = reinterpret_cast<uint64_t>(so_data) + DIST_ORCH_BLOB_HEADER_SIZE;
+                    *p_handle = nullptr;
+                    *p_func = reinterpret_cast<DeviceOrchestrationFunc>(image_base + blob_hdr->entry_off);
+                    *p_bind = nullptr;  // the blob's bind runs on the AICore, not here
+                    *p_config_func = nullptr;  // config is CCEC code; onboard skips arg-count validation
+                    p_path[0] = '\0';
+                    orch_so_table_[callable_id].blob_bind_addr = image_base + blob_hdr->bind_off;
+                    orch_so_table_[callable_id].in_use = true;
+                    LOG_INFO_V0(
+                        "Thread %d: dist orch blob entry=0x%lx bind=0x%lx (%zu bytes)", thread_idx,
+                        image_base + blob_hdr->entry_off, image_base + blob_hdr->bind_off, so_size
+                    );
+                } else {
+
                 // Try multiple paths that may allow execution on AICPU
                 char so_path[256];
                 bool file_created = false;
@@ -395,12 +443,17 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
                 *p_bind = bind_runtime_func;
                 *p_config_func = config_func;
                 snprintf(p_path, 256, "%s", so_path);
+                orch_so_table_[callable_id].blob_bind_addr = 0;
                 orch_so_table_[callable_id].in_use = true;
+                }  // end AArch64-.so dlopen path (else of is_dist_blob)
             } else {
                 LOG_INFO_V0(
                     "Thread %d: Reusing cached orch SO handle=%p (callable_id=%d)", thread_idx, *p_handle, callable_id
                 );
-                if (*p_handle == nullptr || *p_func == nullptr) {
+                // Blob path caches only the resolved entry (handle stays null);
+                // the dlopen path caches a live handle. Accept either.
+                const bool cached_blob = *p_func != nullptr && orch_so_table_[callable_id].blob_bind_addr != 0;
+                if (!cached_blob && (*p_handle == nullptr || *p_func == nullptr)) {
                     LOG_ERROR(
                         "Thread %d: reload=false but no cached SO handle/func for callable_id=%d", thread_idx,
                         callable_id
@@ -585,29 +638,184 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
             // See runtime/dist_engine.* and docs/fully_distributed_within_core.md.
             {
                 const int32_t num_workers = runtime->worker_count;
+                LOG_INFO_V9("[dist] Thread %d: pre-register num_workers=%d runtime=%p", thread_idx, num_workers, (void *)runtime);
                 // dist_engine_register repoints rt->ops at the distributed submit
                 // table for the duration of the on-core orchestration replay. Save
                 // the centralized ops so the scheduler-handoff calls below
                 // (rt_orchestration_done / on_orchestration_done) work unchanged.
                 const PTO2RuntimeOps *saved_ops = rt->ops;
+                // For the CCEC blob path, hand the blob's framework_bind_runtime
+                // GM address to the engine so each AICore worker binds the blob's
+                // g_current_runtime before replay (0 for the AArch64-.so path,
+                // where binding already happened above via (*p_bind)(rt)).
+                const uint64_t blob_bind_addr = orch_so_table_[callable_id].blob_bind_addr;
                 void *core_main =
-                    dist_engine_register(rt, *p_func, &orch_args_cached_, num_workers, runtime);
+                    dist_engine_register(rt, *p_func, &orch_args_cached_, num_workers, runtime, blob_bind_addr);
+                LOG_INFO_V9("[dist] Thread %d: post-register core_main=%p global_data_base=%p",
+                            thread_idx, core_main, (void *)(uintptr_t)runtime->dist.global_data_base);
+                // DIAG: does the AICPU's own DistGlobal init land in HBM at this VA?
+                // Invalidate + read seg[0..1] back. If sane (0), AICPU writes landed
+                // and the AICore's *different* view is the bug; if 0xffffffff, the
+                // AICPU writes never reached this physical page.
+                {
+                    volatile uint32_t *segp =
+                        reinterpret_cast<volatile uint32_t *>(static_cast<uintptr_t>(runtime->dist.global_data_base));
+                    cache_invalidate_range(const_cast<const void *>(reinterpret_cast<volatile void *>(segp)), 64);
+                    uint32_t s0 = segp[0], s1 = segp[1];
+                    LOG_INFO_V9("[dist] Thread %d: AICPU readback seg[0]=0x%x seg[1]=0x%x", thread_idx, s0, s1);
+                }
+                // DIAG (route-A feasibility): probe whether this A5 can hand out an
+                // AICore-uncacheable alias for the DistGlobal reserve VA. Logs the
+                // raw halMemCtl results so we can decide route A vs route B.
+                {
+                    AicpuUncacheProbe up{};
+                    aicpu_device_probe_uncacheable(
+                        reinterpret_cast<void *>(static_cast<uintptr_t>(runtime->dist.global_data_base)), &up);
+                    LOG_INFO_V9(
+                        "[dist] Thread %d: UNCACHE PROBE ctl_resolved=%d dpt_rc=%d dpt_off=0x%llx "
+                        "feat_rc=%d feat_bits=0x%llx dcache_rc=%d dcache_addr=0x%llx",
+                        thread_idx, up.hal_ctl_resolved, up.dpt_rc, (unsigned long long)up.dpt_offset,
+                        up.feature_rc, (unsigned long long)up.feature_bits, up.dcache_rc,
+                        (unsigned long long)up.dcache_addr);
+                }
                 runtime->dist.core_main_fn = reinterpret_cast<uint64_t>(core_main);
                 runtime->dist.num_workers = num_workers;
-                __atomic_store_n(&runtime->dist.done_count, 0, __ATOMIC_RELEASE);
-                __atomic_store_n(&runtime->dist.go, 1u, __ATOMIC_RELEASE);
-                const bool dist_trace = (getenv("PTO_DIST_TRACE") != nullptr);
-                if (dist_trace)
-                    fprintf(stderr, "[dist] Thread %d: engine wired, %d workers launched\n", thread_idx, num_workers);
-                while (__atomic_load_n(&runtime->dist.done_count, __ATOMIC_ACQUIRE) < num_workers) {
+                runtime->dist.done_count = 0;
+                // Publish the go signal to EACH worker's per-core dist_go flag.
+                // dist_go lives in the FIRST handshake cache line (offset 32).
+                // The AICPU->AICore path is NOT coherent on A5, so a plain store
+                // + barrier does NOT reach the AICore's dcci-invalidate poll
+                // (only 2/9 cores observed it without a flush). cache_flush_range
+                // (write-back) of the first line is REQUIRED to push dist_go=1
+                // to GM. dist_done lives in the SECOND cache line (offset 64),
+                // so flushing the first line cannot clobber it. The AICore polls
+                // with dcci(my_hank, SINGLE_CACHE_LINE) — the same primitive the
+                // Phase 1 aicpu_ready poll uses.
+                for (int32_t i = 0; i < num_workers; i++) {
+                    OUT_OF_ORDER_STORE_BARRIER();
+                    runtime->workers[i].dist_go = 1u;
+                    cache_flush_range(&runtime->workers[i], 64);
+                }
+                OUT_OF_ORDER_STORE_BARRIER();
+                // Also set the shared dist.go (best-effort; the per-core dist_go
+                // above is the authoritative signal the AICore polls).
+                runtime->dist.go = 1u;
+                OUT_OF_ORDER_STORE_BARRIER();
+                LOG_INFO_V9("[dist] Thread %d: engine wired + dist_go flushed, %d workers launched", thread_idx, num_workers);
+                uint32_t wait_iters = 0;
+                // Onboard: completion is observed via the PER-CORE dist_done flag
+                // (AICore sets it + dcci write-back of the SECOND handshake line
+                // after dist_core_main). The shared atomicAdd done_count was NOT
+                // visible to the AICPU on A5. On sim, done_count (incremented
+                // inside dist_core_main via GCC __atomic) is the authoritative
+                // counter; dist_done is also set there as best-effort. Wait until
+                // EITHER crosses num_workers.
+                uint32_t dist_done_count = 0;
+                while (dist_done_count < static_cast<uint32_t>(num_workers) && static_cast<uint32_t>(runtime->dist.done_count) < static_cast<uint32_t>(num_workers)) {
                     SPIN_WAIT_HINT();
+                    if ((++wait_iters & 0x3FFFFFF) == 0) {
+                        // Re-publish dist_go: re-write + re-flush the FIRST line.
+                        // This cannot clobber dist_done (second line). Kept until
+                        // every core has observed dist_go=1 and entered
+                        // dist_core_main.
+                        for (int32_t i = 0; i < num_workers; i++) {
+                            runtime->workers[i].dist_go = 1u;
+                            cache_flush_range(&runtime->workers[i], 64);
+                        }
+                        // INVALIDATE (never flush) the SECOND handshake line of
+                        // each worker so the dist_done read discards the AICPU's
+                        // stale copy and fetches the AICore's dcci write-back via
+                        // coherence. invalidate-only never writes back, so it
+                        // cannot clobber the AICore's dist_done=1. Then count.
+                        dist_done_count = 0;
+                        for (int32_t i = 0; i < num_workers; i++) {
+                            cache_invalidate_range(const_cast<const void *>(reinterpret_cast<volatile void *>(&runtime->workers[i].dist_done)), sizeof(uint32_t));
+                            if (runtime->workers[i].dist_done != 0u) dist_done_count++;
+                        }
+                        cache_invalidate_range(const_cast<const void *>(reinterpret_cast<volatile void *>(&runtime->dist.done_count)), sizeof(runtime->dist.done_count));
+                        // Each worker's crumb sits on its own cache line (stride
+                        // AICORE_PROGRESS_STRIDE); invalidate the whole span so the
+                        // AICore write-backs become visible before we read them.
+                        cache_invalidate_range(const_cast<const void *>(reinterpret_cast<volatile void *>(&runtime->dist.aicore_progress[0])), sizeof(runtime->dist.aicore_progress[0]) * num_workers * AICORE_PROGRESS_STRIDE);
+                        char prog[32 * 4];
+                        int off = 0;
+                        for (int i = 0; i < num_workers && i < 32; i++)
+                            off += snprintf(prog + off, sizeof(prog) - off, "%u,", runtime->dist.aicore_progress[i * AICORE_PROGRESS_STRIDE]);
+                        // DIST_DBG stashes a 64-bit value in this worker's crumb
+                        // line: slot+1 = low 32b, slot+2 = high 32b. Recombine.
+                        char dbg[32 * 20];
+                        int doff = 0;
+                        for (int i = 0; i < num_workers && i < 16; i++) {
+                            uint64_t lo = runtime->dist.aicore_progress[i * AICORE_PROGRESS_STRIDE + 1];
+                            uint64_t hi = runtime->dist.aicore_progress[i * AICORE_PROGRESS_STRIDE + 2];
+                            doff += snprintf(dbg + doff, sizeof(dbg) - doff, "0x%llx,", (unsigned long long)((hi << 32) | lo));
+                        }
+                        LOG_INFO_V9("[dist] Thread %d: waiting dist_done=%d done_count=%d/%d (go=%u) progress=[%s] dbg=[%s]",
+                                thread_idx, dist_done_count,
+                                runtime->dist.done_count,
+                                num_workers, runtime->dist.go, prog, dbg);
+                        // C16 DIAG: task-0 first-output create_info as read by dist_submit_impl
+                        // (slots 9-13, written on-core during submit — persists through a crash).
+                        LOG_INFO_V9("[dist] Thread %d: CI(t0.out0) @0x%x%08x ndims=%u shape0=%u logicalB=%u",
+                                thread_idx,
+                                runtime->dist.aicore_progress[0 * AICORE_PROGRESS_STRIDE + 10],
+                                runtime->dist.aicore_progress[0 * AICORE_PROGRESS_STRIDE + 9],
+                                runtime->dist.aicore_progress[0 * AICORE_PROGRESS_STRIDE + 11],
+                                runtime->dist.aicore_progress[0 * AICORE_PROGRESS_STRIDE + 12],
+                                runtime->dist.aicore_progress[0 * AICORE_PROGRESS_STRIDE + 13]);
+                    }
+                }
+                // C13 DIAG: on a fast/clean run the wait loop above exits before
+                // its throttled (0x3FFFFFF) progress print ever fires, so we never
+                // see the final crumbs/dbg. Dump them ONCE here unconditionally so
+                // clean-but-wrong-output runs still surface each core's last crumb
+                // and stashed dbg value (e.g. resolve_kernel_addr).
+                {
+                    cache_invalidate_range(const_cast<const void *>(reinterpret_cast<volatile void *>(&runtime->dist.aicore_progress[0])), sizeof(runtime->dist.aicore_progress[0]) * num_workers * AICORE_PROGRESS_STRIDE);
+                    char prog[32 * 4];
+                    int off = 0;
+                    for (int i = 0; i < num_workers && i < 32; i++)
+                        off += snprintf(prog + off, sizeof(prog) - off, "%u,", runtime->dist.aicore_progress[i * AICORE_PROGRESS_STRIDE]);
+                    char dbg[32 * 20];
+                    int doff = 0;
+                    for (int i = 0; i < num_workers && i < 16; i++) {
+                        uint64_t lo = runtime->dist.aicore_progress[i * AICORE_PROGRESS_STRIDE + 1];
+                        uint64_t hi = runtime->dist.aicore_progress[i * AICORE_PROGRESS_STRIDE + 2];
+                        doff += snprintf(dbg + doff, sizeof(dbg) - doff, "0x%llx,", (unsigned long long)((hi << 32) | lo));
+                    }
+                    LOG_INFO_V9("[dist] Thread %d: FINAL done_count=%d/%d progress=[%s] dbg=[%s]",
+                            thread_idx, runtime->dist.done_count, num_workers, prog, dbg);
+                    // C16 DIAG: each core stashes its LAST executed task's out[0]
+                    // (slot+3, as int) and task_id (slot+4) — see dist_engine.cpp
+                    // execute_slot. Print core->(task_id: out[0]) so the union over
+                    // cores reveals the c/d/e/g/f chain (t0=c,t1=d,t2=e,t3=g,t4=f).
+                    char oc[32 * 40];
+                    int ooff = 0;
+                    for (int i = 0; i < num_workers && i < 32; i++) {
+                        int32_t v0 = (int32_t)runtime->dist.aicore_progress[i * AICORE_PROGRESS_STRIDE + 3];
+                        uint32_t tid = runtime->dist.aicore_progress[i * AICORE_PROGRESS_STRIDE + 4];
+                        uint32_t ish = runtime->dist.aicore_progress[i * AICORE_PROGRESS_STRIDE + 5];
+                        uint32_t isz = runtime->dist.aicore_progress[i * AICORE_PROGRESS_STRIDE + 6];
+                        uint32_t osh = runtime->dist.aicore_progress[i * AICORE_PROGRESS_STRIDE + 7];
+                        uint32_t osz = runtime->dist.aicore_progress[i * AICORE_PROGRESS_STRIDE + 8];
+                        if (v0 != 0 || ish != 0 || osh != 0)
+                            ooff += snprintf(oc + ooff, sizeof(oc) - ooff, "c%d(t%u [0]=%d inSh=%u inSz=%u outSh=%u outSz=%u) ", i, tid, v0, ish, isz, osh, osz);
+                    }
+                    LOG_INFO_V9("[dist] Thread %d: DBGOUT %s", thread_idx, oc);
+                    // C16 DIAG: task-0 first-output create_info as read by dist_submit_impl.
+                    uint32_t cilo = runtime->dist.aicore_progress[0 * AICORE_PROGRESS_STRIDE + 9];
+                    uint32_t cihi = runtime->dist.aicore_progress[0 * AICORE_PROGRESS_STRIDE + 10];
+                    uint32_t cind = runtime->dist.aicore_progress[0 * AICORE_PROGRESS_STRIDE + 11];
+                    uint32_t cish = runtime->dist.aicore_progress[0 * AICORE_PROGRESS_STRIDE + 12];
+                    uint32_t cilog = runtime->dist.aicore_progress[0 * AICORE_PROGRESS_STRIDE + 13];
+                    LOG_INFO_V9("[dist] Thread %d: CI(t0.out0) @0x%x%08x ndims=%u shape0=%u logicalB=%u",
+                            thread_idx, cihi, cilo, cind, cish, cilog);
                 }
                 // All workers done (single-threaded here): emit the per-core
                 // execution swimlane if PTO_DIST_SWIMLANE is set (else no-op).
                 dist_engine_dump_trace();
                 rt->ops = saved_ops;
-                if (dist_trace)
-                    fprintf(stderr, "[dist] Thread %d: all %d distributed workers finished\n", thread_idx, num_workers);
+                LOG_INFO_V9("[dist] Thread %d: all %d distributed workers finished", thread_idx, num_workers);
             }
 
             // Flush the (potentially partially-filled) DepGenBuffer so the host

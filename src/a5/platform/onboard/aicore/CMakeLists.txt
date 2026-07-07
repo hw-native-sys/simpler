@@ -52,6 +52,7 @@ endforeach()
 # Compiler flags
 set(AICORE_FLAGS
     "-c -O3 -g -x cce -Wall -std=c++17 \
+    -DPTO2_PROFILING=0 -DSIMPLER_DIST_AICORE_ONLY \
     --cce-aicore-only \
     -mllvm -cce-aicore-stack-size=0x8000 \
     -mllvm -cce-aicore-function-stack-size=0x8000 \

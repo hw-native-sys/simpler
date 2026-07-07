@@ -46,9 +46,31 @@ _RELA_SIZE = 24
 # ELF section types
 _SHT_PROGBITS = 1
 _SHT_RELA = 4
+_SHT_SYMTAB = 2
+_SHT_NOBITS = 8
+
+# ELF section flags
+_SHF_ALLOC = 0x2
+
+# ELF symbol table entry layout (Elf64_Sym)
+_SYM_SIZE = 24
 
 # Mach-O Magic Numbers
 MH_MAGIC_64 = 0xFEEDFACF
+
+# ---------------------------------------------------------------------------
+# fully_distributed_within_core onboard orchestration blob
+# ---------------------------------------------------------------------------
+# The CCEC-compiled + cce-ld-linked orchestration is a position-independent
+# AICore executable (see build_dist_orch_blob). We wrap its loadable image in
+# a small fixed header so the AICPU stub can locate the AICore entry / bind
+# symbols after the image is copied verbatim into device GM. Keep this struct
+# byte-compatible with `DistOrchBlobHeader` in the AICPU executor.
+DIST_ORCH_BLOB_MAGIC = 0x42524F44  # "DORB" little-endian
+DIST_ORCH_BLOB_VERSION = 1
+# 64-byte header keeps the image 64-byte aligned (CALLABLE_ALIGN) once copied
+# after a device allocation whose base is already >= 64-byte aligned.
+DIST_ORCH_BLOB_HEADER_SIZE = 64
 
 # Mach-O Load Command types
 LC_SEGMENT_64 = 0x19
@@ -201,6 +223,109 @@ def _raise_unresolved_text_error(
         f"  readelf -S <file.o> | grep '\\.text'\n"
         f"  readelf -r <file.o>"
     )
+
+
+def _parse_elf64_sections(elf_data: bytes, source_name: str) -> tuple[list[dict], bytes]:
+    """Return (sections, shstrtab) for an ELF64 image.
+
+    Each section dict carries name/type/flags/addr/offset/size/link/entsize.
+    """
+    if len(elf_data) < 64:
+        raise ValueError(f"Data too small to be a valid ELF: {source_name}")
+    e_shoff = struct.unpack("<Q", elf_data[40:48])[0]
+    e_shnum = struct.unpack("<H", elf_data[60:62])[0]
+    e_shstrndx = struct.unpack("<H", elf_data[62:64])[0]
+    if e_shnum == 0 or e_shstrndx >= e_shnum:
+        raise ValueError(f"Invalid ELF section header table in {source_name}")
+
+    shstr_off = e_shoff + e_shstrndx * _SHDR_SIZE
+    shstr_data_off = struct.unpack("<Q", elf_data[shstr_off + 24 : shstr_off + 32])[0]
+    shstr_data_size = struct.unpack("<Q", elf_data[shstr_off + 32 : shstr_off + 40])[0]
+    shstrtab = elf_data[shstr_data_off : shstr_data_off + shstr_data_size]
+
+    sections = []
+    for i in range(e_shnum):
+        base = e_shoff + i * _SHDR_SIZE
+        name_off = struct.unpack("<I", elf_data[base : base + 4])[0]
+        sections.append(
+            {
+                "name": _extract_cstring(shstrtab, name_off),
+                "type": struct.unpack("<I", elf_data[base + 4 : base + 8])[0],
+                "flags": struct.unpack("<Q", elf_data[base + 8 : base + 16])[0],
+                "addr": struct.unpack("<Q", elf_data[base + 16 : base + 24])[0],
+                "offset": struct.unpack("<Q", elf_data[base + 24 : base + 32])[0],
+                "size": struct.unpack("<Q", elf_data[base + 32 : base + 40])[0],
+                "link": struct.unpack("<I", elf_data[base + 40 : base + 44])[0],
+                "entsize": struct.unpack("<Q", elf_data[base + 56 : base + 64])[0],
+            }
+        )
+    return sections, shstrtab
+
+
+def _resolve_elf64_symbols(elf_data: bytes, sections: list[dict], names: set[str]) -> dict[str, int]:
+    """Return {symbol_name: st_value} for the requested symbols in an ELF64."""
+    symtab = next((s for s in sections if s["type"] == _SHT_SYMTAB), None)
+    if symtab is None:
+        return {}
+    strtab = sections[symtab["link"]]
+    strtab_bytes = elf_data[strtab["offset"] : strtab["offset"] + strtab["size"]]
+    result: dict[str, int] = {}
+    count = symtab["size"] // _SYM_SIZE
+    for i in range(count):
+        base = symtab["offset"] + i * _SYM_SIZE
+        name_off = struct.unpack("<I", elf_data[base : base + 4])[0]
+        value = struct.unpack("<Q", elf_data[base + 8 : base + 16])[0]
+        name = _extract_cstring(strtab_bytes, name_off)
+        if name in names:
+            result[name] = value
+    return result
+
+
+def build_dist_orch_blob(linked_elf: bytes, entry_symbol: str, bind_symbol: str) -> bytes:
+    """Package a linked, position-independent AICore orchestration executable.
+
+    ``linked_elf`` is the output of linking the CCEC-compiled orchestration +
+    common object with ``cce-ld -m aicorelinux -Ttext=0`` — a flat, PC-relative
+    AICore executable whose ``.text``/``.rodata``/``.data`` sections reference
+    each other PC-relative, so the whole image runs at any GM base as long as
+    the sections keep their relative layout.
+
+    Returns a byte blob = DIST_ORCH_BLOB_HEADER_SIZE header + contiguous image.
+    The AICPU stub copies this verbatim into device GM, reads the header, and
+    computes the AICore entry/bind addresses as ``gm_base + header + off``.
+    """
+    sections, _ = _parse_elf64_sections(linked_elf, "<orch-blob>")
+    alloc = [s for s in sections if (s["flags"] & _SHF_ALLOC) and s["size"] > 0]
+    if not alloc:
+        raise ValueError("orchestration blob has no allocatable sections")
+
+    lo = min(s["addr"] for s in alloc)
+    hi = max(s["addr"] + s["size"] for s in alloc)
+    image = bytearray(hi - lo)
+    for s in alloc:
+        start = s["addr"] - lo
+        if s["type"] == _SHT_NOBITS:
+            continue  # .bss stays zero-filled
+        image[start : start + s["size"]] = linked_elf[s["offset"] : s["offset"] + s["size"]]
+
+    syms = _resolve_elf64_symbols(linked_elf, sections, {entry_symbol, bind_symbol})
+    if entry_symbol not in syms:
+        raise ValueError(f"orchestration blob missing entry symbol '{entry_symbol}'")
+    if bind_symbol not in syms:
+        raise ValueError(f"orchestration blob missing bind symbol '{bind_symbol}'")
+    entry_off = syms[entry_symbol] - lo
+    bind_off = syms[bind_symbol] - lo
+
+    header = struct.pack(
+        "<IIQQQ",
+        DIST_ORCH_BLOB_MAGIC,
+        DIST_ORCH_BLOB_VERSION,
+        entry_off,
+        bind_off,
+        len(image),
+    )
+    header = header.ljust(DIST_ORCH_BLOB_HEADER_SIZE, b"\x00")
+    return bytes(header) + bytes(image)
 
 
 def _extract_text_macho64(data: bytes, source_name: str) -> bytes:

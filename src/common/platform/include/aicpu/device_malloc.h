@@ -42,6 +42,22 @@
 void *aicpu_device_malloc(size_t size);
 
 /**
+ * Return the cached→uncached VA alias offset for device HBM (A5 double page
+ * table), or 0 if unavailable.
+ *
+ * On A5, HBM is mapped twice: a cacheable view and an uncacheable view
+ * separated by this fixed offset. The distributed engine's cross-core shared
+ * segment (DistGlobal) must be accessed through the uncacheable alias so plain
+ * loads/stores + device atomics stay coherent across AICores. A host-allocated
+ * rtMalloc(RT_MEMORY_HBM) reserve is cacheable; adding this offset yields its
+ * uncacheable alias. Returns 0 on sim or when the driver lacks the double page
+ * table (caller falls back to the cacheable address).
+ *
+ * @return Uncacheable-alias VA offset in bytes, or 0 if unavailable.
+ */
+unsigned long long aicpu_device_nocache_offset();
+
+/**
  * Free device memory previously allocated by aicpu_device_malloc().
  *
  * Safe to call with nullptr (no-op).
@@ -49,5 +65,25 @@ void *aicpu_device_malloc(size_t size);
  * @param ptr  Pointer to free (may be nullptr)
  */
 void aicpu_device_free(void *ptr);
+
+/**
+ * DIAG: probe whether this device can hand out an AICore-uncacheable alias of a
+ * given device VA. Fills every field; all halMemCtl calls are best-effort and
+ * failures are reported (not fatal). Used to decide whether the distributed
+ * engine's DistGlobal can be made uncacheable (route A) on this specific A5.
+ *
+ * @param va  A device VA (e.g. the DistGlobal reserve base) to query aliases for
+ * @param out Filled with query results (see field comments)
+ */
+struct AicpuUncacheProbe {
+    int hal_ctl_resolved;             // 1 if halMemCtl was dlsym-resolved
+    int dpt_rc;                       // rc from CTRL_TYPE_GET_DOUBLE_PGTABLE_OFFSET
+    unsigned long long dpt_offset;    // returned global nocache offset (0 == none)
+    int feature_rc;                   // rc from CTRL_TYPE_SUPPORT_FEATURE
+    unsigned long long feature_bits;  // returned feature bitmask
+    int dcache_rc;                    // rc from CTRL_TYPE_GET_DCACHE_ADDR for `va`
+    unsigned long long dcache_addr;   // returned dcache/alias addr for `va`
+};
+void aicpu_device_probe_uncacheable(void *va, struct AicpuUncacheProbe *out);
 
 #endif  // SRC_COMMON_PLATFORM_INCLUDE_AICPU_DEVICE_MALLOC_H_

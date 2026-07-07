@@ -179,7 +179,7 @@ struct Task {
 // AICore worker thread via Runtime::dist.core_main_fn. `runtime` is Runtime*,
 // `core_type` is CoreType (cast to int to keep this typedef header-light).
 // See docs/fully_distributed_within_core.md.
-typedef void (*DistCoreMainFn)(void *runtime, int core_idx, int core_type);
+typedef void (*DistCoreMainFn)(__gm__ void *runtime, int core_idx, int core_type);
 
 // =============================================================================
 // Runtime Class

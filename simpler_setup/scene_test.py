@@ -968,6 +968,19 @@ def _compare_outputs(test_args, golden_args, output_names, rtol, atol):
         expected = getattr(golden_args, name)
         if not torch.allclose(actual, expected, rtol=rtol, atol=atol):
             diff = (actual - expected).abs().max().item()
+            try:
+                af = actual.flatten().to(torch.float64)
+                ef = expected.flatten().to(torch.float64)
+                uniq_a = torch.unique(af)
+                n_wrong = int((af != ef).sum().item())
+                print(
+                    f"[DIAG _compare_outputs '{name}'] n={af.numel()} n_wrong={n_wrong} "
+                    f"actual[0:8]={af[:8].tolist()} actual[-4:]={af[-4:].tolist()} "
+                    f"expected[0]={ef[0].item()} unique_actual(<=12)={uniq_a[:12].tolist()}",
+                    flush=True,
+                )
+            except Exception as _e:  # noqa: BLE001
+                print(f"[DIAG _compare_outputs] dump failed: {_e}", flush=True)
             raise AssertionError(f"Golden mismatch on '{name}': max_diff={diff}, rtol={rtol}, atol={atol}")
 
 
@@ -1097,9 +1110,33 @@ class SceneTestCase:
         """
         from simpler.worker import Worker  # noqa: PLC0415
 
-        w = Worker(level=2, device_id=device_id, platform=platform, runtime=cls._st_runtime)
+        w = Worker(
+            level=2,
+            device_id=device_id,
+            platform=platform,
+            runtime=cls._st_runtime,
+            aicore_extra_source_dirs=cls._fdwc_aicore_orch_dirs(platform),
+        )
         w.init()
         return w
+
+    @classmethod
+    def _fdwc_aicore_orch_dirs(cls, platform):
+        """Orchestration source dir(s) to compile into the AICore image.
+
+        fully_distributed_within_core on real hardware (not sim) links the
+        test's orchestration straight into the AICore kernel image (docs
+        §16.1). Returns the directory holding the orchestration source so the
+        Worker can build a per-orchestration image, or ``None`` when this
+        mechanism does not apply (other runtimes, or sim where the
+        orchestration is dlopen'd).
+        """
+        if cls._st_runtime != "fully_distributed_within_core" or platform.endswith("sim"):
+            return None
+        orch = getattr(cls, "CALLABLE", {}).get("orchestration")
+        if not orch or "source" not in orch:
+            return None
+        return [str(Path(orch["source"]).resolve().parent)]
 
     # ------------------------------------------------------------------
     # Default build methods

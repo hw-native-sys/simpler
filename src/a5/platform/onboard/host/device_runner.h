@@ -270,6 +270,13 @@ private:
     // dep_gen enablement is a5-specific (a2a3 carries its own copy).
     bool enable_dep_gen_{false};
 
+    // fully_distributed_within_core shared-segment reserve (dist_engine.h).
+    // Allocated ONCE via rtMalloc(RT_MEMORY_HBM) so the base is an
+    // AICore-MPU-visible device VA; dist_engine_register carves DistGlobal +
+    // heap from it. Published into Runtime::dist.seg_base each run. Freed by
+    // mem_alloc_ at finalize. Zero until first use / for non-fdwc runtimes.
+    void *dist_seg_dev_{nullptr};
+
     int init_pmu(int num_cores, int num_threads, const std::string &csv_path, PmuEventType event_type, int device_id);
     int init_scope_stats(int num_threads, int device_id);
 

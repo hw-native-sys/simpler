@@ -34,6 +34,21 @@
 
 #pragma once
 
+// __gm__/__aicore__ address-space/function attributes. On the CCEC AICore build
+// these are real compiler keywords; on host/AICPU (g++) builds they are empty
+// no-ops. Defined here so PTO2RuntimeOps can carry __gm__ PTO2Runtime* in its
+// function-pointer fields — the AICore engine functions (dist_submit_impl etc.)
+// take __gm__ PTO2Runtime*, and without __gm__ on the ops-table field type CCEC
+// rejects the function-pointer assignment as an address-space cast. On host the
+// empty macro collapses the signature to plain PTO2Runtime*, matching the
+// existing pto_orchestration_api.h ops-table definition and all host callers.
+#ifndef __aicore__
+#define __aicore__
+#endif
+#ifndef __gm__
+#define __gm__
+#endif
+
 #include "utils/device_arena.h"
 #include "pto_runtime2_types.h"
 #include "pto_submit_types.h"
@@ -67,28 +82,31 @@ enum PTO2RuntimeMode {
 typedef struct PTO2Runtime PTO2Runtime;  // forward declare for ops signatures
 
 struct PTO2RuntimeOps {
-    TaskOutputTensors (*submit_task)(PTO2Runtime *rt, const MixedKernels &mixed_kernels, const L0TaskArgs &args);
-    void (*scope_begin)(PTO2Runtime *rt);
-    void (*scope_end)(PTO2Runtime *rt);
-    void (*orchestration_done)(PTO2Runtime *rt);
-    bool (*is_fatal)(PTO2Runtime *rt);
-    void (*report_fatal)(PTO2Runtime *rt, int32_t error_code, const char *func, const char *fmt, ...);
+    TaskOutputTensors (*submit_task)(__gm__ PTO2Runtime *rt, const MixedKernels &mixed_kernels, const L0TaskArgs &args);
+    void (*scope_begin)(__gm__ PTO2Runtime *rt);
+    void (*scope_end)(__gm__ PTO2Runtime *rt);
+    void (*orchestration_done)(__gm__ PTO2Runtime *rt);
+    bool (*is_fatal)(__gm__ PTO2Runtime *rt);
+    // Diagnostic string params are __gm__ const char* — see the matching note in
+    // pto_orchestration_api.h. On host/sim __gm__ is empty (unchanged); on the
+    // onboard AICore CCEC build string literals live in GM.
+    void (*report_fatal)(__gm__ PTO2Runtime *rt, int32_t error_code, __gm__ const char *func, __gm__ const char *fmt, ...);
 
     // Logging (populated by runtime, called by orchestration)
-    void (*log_error)(const char *func, const char *fmt, ...);
-    void (*log_warn)(const char *func, const char *fmt, ...);
-    void (*log_debug)(const char *func, const char *fmt, ...);
+    void (*log_error)(__gm__ const char *func, __gm__ const char *fmt, ...);
+    void (*log_warn)(__gm__ const char *func, __gm__ const char *fmt, ...);
+    void (*log_debug)(__gm__ const char *func, __gm__ const char *fmt, ...);
     // INFO with explicit verbosity tier (v ∈ [0,9]; gating done inside).
-    void (*log_info_v)(const char *func, int v, const char *fmt, ...);
+    void (*log_info_v)(__gm__ const char *func, int v, __gm__ const char *fmt, ...);
 
     // Cross-layer data access (orchestration reads/writes tensor values via runtime)
     // Placed after logging to avoid shifting hot-path field offsets.
-    uint64_t (*get_tensor_data)(PTO2Runtime *rt, const Tensor &tensor, uint32_t ndims, const uint32_t indices[]);
+    uint64_t (*get_tensor_data)(__gm__ PTO2Runtime *rt, const Tensor &tensor, uint32_t ndims, const uint32_t indices[]);
     void (*set_tensor_data)(
-        PTO2Runtime *rt, const Tensor &tensor, uint32_t ndims, const uint32_t indices[], uint64_t value
+        __gm__ PTO2Runtime *rt, const Tensor &tensor, uint32_t ndims, const uint32_t indices[], uint64_t value
     );
-    TaskOutputTensors (*alloc_tensors)(PTO2Runtime *rt, const L0TaskArgs &args);
-    TaskOutputTensors (*submit_dummy_task)(PTO2Runtime *rt, const L0TaskArgs &args);
+    TaskOutputTensors (*alloc_tensors)(__gm__ PTO2Runtime *rt, const L0TaskArgs &args);
+    TaskOutputTensors (*submit_dummy_task)(__gm__ PTO2Runtime *rt, const L0TaskArgs &args);
 
     // Stash the call-site captured by PTO2ScopeGuard into the [ScopeStats]
     // collector. Always present to keep ops-table layout stable across
@@ -135,7 +153,14 @@ struct PTO2Runtime {
     // segment. Set by dist_engine_register on the AICPU; read by the distributed
     // ops callbacks (which receive only this PTO2Runtime*) to recover the segment
     // with no process-global symbol. Null / unused for the centralized runtime.
-    void *dist_global = nullptr;
+    //
+    // Stored as a uint64_t (not void*) so the onboard AICore ops callbacks can
+    // recover a __gm__ DistGlobal* via static_cast<uintptr_t> without a
+    // void*→uintptr_t cast of a GM-loaded generic pointer — CCEC's backend
+    // fails to lower that cast ("error pointer address space cast"). An integer
+    // field sidesteps it. On host/AICPU (uint64_t == the pointer bits) this is
+    // an unchanged reinterpret at the two seam sites.
+    uint64_t dist_global = 0;
 
     // Components
     PTO2SharedMemoryHandle *sm_handle;

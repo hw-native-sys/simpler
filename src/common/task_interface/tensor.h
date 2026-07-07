@@ -140,7 +140,7 @@ struct alignas(64) Tensor {
     /// Number of logical elements covered by the view (NOT the extent).
     /// ndims > 0 is a construction-time invariant (see init_external /
     /// init_from_create_info), so the loop always runs at least once.
-    uint64_t numel() const {
+    PTO_DEVICE_FUNC uint64_t numel() const {
         uint64_t total = 1;
         for (uint32_t i = 0; i < ndims; i++)
             total *= shapes[i];
@@ -149,7 +149,7 @@ struct alignas(64) Tensor {
 
     /// Element extent — the smallest M such that every reachable element lies in [start_offset, start_offset+M).
     /// For strides[i]>0: extent_elem = 1 + Σ (shapes[i]-1) · strides[i].
-    uint64_t extent_elem() const {
+    PTO_DEVICE_FUNC uint64_t extent_elem() const {
         if (is_contiguous) return numel();  // fast path: line 2 not needed when contiguous
         return extent_elem_cache;
     }
@@ -157,12 +157,12 @@ struct alignas(64) Tensor {
     /// True when `buffer.addr` is a device pointer allocated by the child process
     /// (host skips the H2D copy in init_runtime_impl). Host-side concept carried
     /// across the wire; runtime views inherit it via the cache-line-1 copy.
-    [[nodiscard]] bool is_child_memory() const { return child_memory != 0; }
+    [[nodiscard]] PTO_DEVICE_FUNC bool is_child_memory() const { return child_memory != 0; }
 
     /// Logical byte size of the view (numel * element size). For a contiguous
     /// host-constructed tensor this equals buffer.size; provided for parity with
     /// the host-side allocators that size buffers from a tensor's logical bytes.
-    [[nodiscard]] uint64_t nbytes() const { return numel() * get_element_size(dtype); }
+    [[nodiscard]] PTO_DEVICE_FUNC uint64_t nbytes() const { return numel() * get_element_size(dtype); }
 
     /// Typed pointer to the tensor's buffer base (== buffer.addr). Convenience
     /// accessor used by orchestration sources to read raw tensor data; matches
@@ -179,7 +179,7 @@ struct alignas(64) Tensor {
     /// Initialize as a contiguous tensor that covers `shapes[]` starting at `addr`.
     /// stride is set to row_major(shapes); start_offset = 0; is_contiguous = true.
     /// Enforces the ndims > 0 invariant relied upon by every downstream op.
-    void init_external(
+    PTO_DEVICE_FUNC void init_external(
         void *addr, uint64_t buffer_size_bytes, const uint32_t in_shapes[], uint32_t in_ndims, DataType in_dtype,
         int32_t in_version, bool in_manual_dep = false, uint8_t in_child_memory = 0
     ) {
@@ -213,7 +213,8 @@ struct alignas(64) Tensor {
     /// derivable from line 1, so we **skip reading other's cache line 2** and
     /// write dst's line 2 from the local shapes instead. Non-contiguous source
     /// pays one line 2 read; contiguous source does not.
-    void init_from(const Tensor &other) {
+    template <class TRef>
+    PTO_HOST_DEVICE_FUNC void init_from(const TRef &other) {
         init_from_line1(other);
         if (other.is_contiguous && other.start_offset == 0) {
             // Derive line 2 from line 1: stride = row-major of shapes; extent = numel.
@@ -238,11 +239,13 @@ struct alignas(64) Tensor {
     /// in place and calls `refresh_derived()` to recompute line 2 once. This
     /// avoids the wasted line 2 writes that `init_from()` would do just before
     /// the op overwrites them.
-    void init_from_line1(const Tensor &other) { memcpy(this, &other, 64); }
+    template <class TRef>
+    PTO_HOST_DEVICE_FUNC void init_from_line1(const TRef &other) { memcpy(this, &other, 64); }
 
     /// Backward-compat alias used by orchestrator hot paths that need a full
     /// deep copy. Equivalent to `init_from(other)`.
-    void copy(const Tensor &other) { init_from(other); }
+    template <class TRef>
+    PTO_HOST_DEVICE_FUNC void copy(const TRef &other) { init_from(other); }
 
     // Materialization from a TensorCreateInfo (runtime-allocated outputs) lives
     // in the runtime tensor_create_info.h as the free functions
@@ -380,6 +383,7 @@ struct alignas(64) Tensor {
     // Dump for diagnostics
     // ========================================================================
 
+#if !defined(__CCE_AICORE__)
     std::string dump() const {
         std::stringstream ss;
         std::string indent = "    ";
@@ -406,12 +410,13 @@ struct alignas(64) Tensor {
         ss << "}" << '\n';
         return ss.str();
     }
+#endif
 
 private:
     // The parameterized constructor is private: a fully-initialized Tensor with
     // a real buffer comes only through make_tensor_external() / view ops. (The
     // default constructor is public — see above — for POD/array storage.)
-    Tensor(
+    PTO_DEVICE_FUNC Tensor(
         void *addr, uint64_t buffer_size_bytes, const uint32_t in_shapes[], uint32_t in_ndims, DataType in_dtype,
         int32_t in_version, bool in_manual_dep = false, uint8_t in_child_memory = 0
     ) {
@@ -428,7 +433,7 @@ private:
     /// Called after any op that mutates view metadata. Single reverse pass:
     ///   extent_elem += (shapes[i] - 1) · strides[i]
     ///   is_contiguous &&= (strides[i] == prod(shapes[i+1..]))
-    void refresh_derived() {
+    PTO_DEVICE_FUNC void refresh_derived() {
         uint64_t e = 1;
         uint64_t expected = 1;
         bool contig = true;
@@ -444,7 +449,7 @@ private:
     }
 
     /// Assert the view stays inside the underlying buffer (byte-range safety).
-    void assert_in_buffer_bounds() const {
+    PTO_DEVICE_FUNC void assert_in_buffer_bounds() const {
         const uint64_t elem_size = get_element_size(dtype);
         const uint64_t buffer_elems = buffer.size / elem_size;
         debug_assert(start_offset + extent_elem_cache <= buffer_elems);
@@ -452,11 +457,60 @@ private:
 
     // Friends that need to construct Tensors
     friend struct PTO2TaskPayload;
-    friend inline Tensor make_tensor_external(
+    friend PTO_DEVICE_FUNC inline Tensor make_tensor_external(
         void *addr, const uint32_t shapes[], uint32_t ndims, DataType dtype, bool manual_dep, int32_t version,
         uint8_t child_memory
     );
 };
+
+// Tensor accessors as FREE FUNCTIONS — Tensor is often GM-resident (e.g. inside
+// RingSlot::tensors[] in DistCore), and CCEC forbids calling a method on a __gm__
+// object (the implicit `this` is generic). These mirror Tensor::init_from_line1 /
+// init_from / copy so engine code can populate a __gm__ Tensor via pointer.
+// Templated on the source so the same function accepts both a generic (stack)
+// Tensor and a __gm__ Tensor (CCEC forbids casting across address spaces).
+template <class Src>
+PTO_DEVICE_FUNC inline void tensor_init_from_line1(__gm__ Tensor *dst, const Src &other) {
+    memcpy(dst, &other, 64);
+}
+template <class Src>
+PTO_DEVICE_FUNC inline void tensor_init_from(__gm__ Tensor *dst, const Src &other) {
+    tensor_init_from_line1(dst, other);
+    if (other.is_contiguous && other.start_offset == 0) {
+        // Derive line 2 from line 1: stride = row-major of shapes; extent = numel.
+        uint32_t s = 1;
+        for (int32_t i = static_cast<int32_t>(dst->ndims) - 1; i >= 0; --i) {
+            dst->strides[i] = s;
+            s *= dst->shapes[i];
+        }
+        dst->extent_elem_cache = s;
+    } else {
+        dst->extent_elem_cache = other.extent_elem_cache;
+        for (uint32_t i = 0; i < other.ndims; i++) {
+            dst->strides[i] = other.strides[i];
+        }
+    }
+}
+template <class Src>
+PTO_DEVICE_FUNC inline void tensor_copy(__gm__ Tensor *dst, const Src &other) {
+    tensor_init_from(dst, other);
+}
+
+// Free-function mirrors of Tensor::numel / extent_elem — templated on the Tensor
+// reference so they accept both a stack-local Tensor and a __gm__ Tensor (CCEC
+// forbids calling a method on a __gm__ object: the implicit `this` is generic).
+template <class TRef>
+PTO_DEVICE_FUNC inline uint64_t tensor_numel(const TRef &t) {
+    uint64_t total = 1;
+    for (uint32_t i = 0; i < t.ndims; i++)
+        total *= t.shapes[i];
+    return total;
+}
+template <class TRef>
+PTO_DEVICE_FUNC inline uint64_t tensor_extent_elem(const TRef &t) {
+    if (t.is_contiguous) return tensor_numel(t);
+    return t.extent_elem_cache;
+}
 
 static_assert(std::is_trivially_copyable_v<Tensor>, "Tensor must be trivially copyable for DMA / wire transport");
 static_assert(sizeof(Tensor) == 128, "Tensor must be exactly 2 cache lines (128 bytes)");
@@ -479,7 +533,7 @@ static_assert(offsetof(Tensor, strides) == 72);
 // same controlled path as the runtime. The resulting Tensor is contiguous:
 // start_offset == 0 and strides == row_major(shapes).
 // =============================================================================
-inline Tensor make_tensor_external(
+PTO_DEVICE_FUNC inline Tensor make_tensor_external(
     void *addr, const uint32_t shapes[], uint32_t ndims, DataType dtype = DataType::FLOAT32, bool manual_dep = false,
     int32_t version = 0, uint8_t child_memory = 0
 ) {
