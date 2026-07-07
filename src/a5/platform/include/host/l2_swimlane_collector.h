@@ -26,14 +26,10 @@
 #ifndef SRC_A5_PLATFORM_INCLUDE_HOST_L2_SWIMLANE_COLLECTOR_H_
 #define SRC_A5_PLATFORM_INCLUDE_HOST_L2_SWIMLANE_COLLECTOR_H_
 
-#include <atomic>
-#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
-#include <mutex>
 #include <string>
-#include <thread>
 #include <vector>
 
 #include "common/l2_swimlane_profiling.h"
@@ -346,7 +342,7 @@ public:
      * record vector, or a L2SwimlaneAicpuSchedPhaseBuffer / L2SwimlaneAicpuOrchPhaseBuffer into the per-thread
      * phase-record vector.
      */
-    void on_buffer_collected(const ReadyBufferInfo &info);
+    void on_buffer_collected(const ReadyBufferInfo &info, int collector_shard);
 
     /**
      * Publish per-core core_type (AIC/AIV/...) so the host emit path can
@@ -432,6 +428,21 @@ public:
     const std::vector<std::vector<L2SwimlaneAicpuTaskRecord>> &get_records() const { return collected_perf_records_; }
 
 private:
+    struct alignas(64) CollectorShardCounters {
+        uint64_t total_perf_collected{0};
+        uint64_t total_sched_phase_collected{0};
+        uint64_t total_orch_phase_collected{0};
+        bool has_phase_data{false};
+    };
+    static_assert(
+        sizeof(CollectorShardCounters) % 64 == 0, "CollectorShardCounters must not share cache lines across shards"
+    );
+
+    template <typename T>
+    using RecordsByInstance = std::vector<std::vector<T>>;
+    template <typename T>
+    using RecordsByCollector = std::vector<RecordsByInstance<T>>;
+
     // Shared memory pointers. shm_host_ / device_id_ live on ProfilerBase
     // (set via set_memory_context in initialize()).
     void *perf_shared_mem_dev_{nullptr};
@@ -458,39 +469,43 @@ private:
     // export_swimlane_json() to build <prefix>/l2_swimlane_records.json.
     std::string output_prefix_;
 
-    // Collected data (per-core vectors, indexed by core_index)
+    // Merged data, populated from per-collector shards after collector threads join.
     std::vector<std::vector<L2SwimlaneAicpuTaskRecord>> collected_perf_records_;
 
     // Collected AICore records (per-core vectors). Each entry is a full
-    // L2SwimlaneAicoreTaskRecord captured from a rotated L2SwimlaneAicoreTaskBuffer. The
-    // order across rotations is preserved by `copy_aicore_buffer` (we sort
-    // incoming buffers by buffer_seq before flattening).
+    // L2SwimlaneAicoreTaskRecord captured from a rotated L2SwimlaneAicoreTaskBuffer.
     std::vector<std::vector<L2SwimlaneAicoreTaskRecord>> collected_aicore_records_;
 
     // AICPU phase profiling data — separate per-thread vectors for sched and
     // orch records (kind-tagged at routing time; no parse-time discrimination).
     std::vector<std::vector<L2SwimlaneAicpuSchedPhaseRecord>> collected_sched_phase_records_;
     std::vector<std::vector<L2SwimlaneAicpuOrchPhaseRecord>> collected_orch_phase_records_;
-    std::atomic<bool> has_phase_data_{false};
 
     // Core-to-thread mapping (core_id → scheduler thread index, -1 = unassigned)
     std::vector<int8_t> core_to_thread_;
 
-    // Running totals used at reconcile time to cross-check device-side counters.
-    std::atomic<uint64_t> total_perf_collected_{0};
-    std::atomic<uint64_t> total_sched_phase_collected_{0};
-    std::atomic<uint64_t> total_orch_phase_collected_{0};
+    RecordsByCollector<L2SwimlaneAicpuTaskRecord> perf_records_by_collector_;
+    RecordsByCollector<L2SwimlaneAicoreTaskRecord> aicore_records_by_collector_;
+    RecordsByCollector<L2SwimlaneAicpuSchedPhaseRecord> sched_phase_records_by_collector_;
+    RecordsByCollector<L2SwimlaneAicpuOrchPhaseRecord> orch_phase_records_by_collector_;
+    std::vector<CollectorShardCounters> collector_counters_;
 
-    std::array<std::mutex, PLATFORM_MAX_CORES> perf_record_mutexes_;
-    std::array<std::mutex, PLATFORM_MAX_CORES> aicore_record_mutexes_;
-    std::array<std::mutex, PLATFORM_MAX_AICPU_THREADS> sched_phase_record_mutexes_;
-    std::array<std::mutex, PLATFORM_MAX_AICPU_THREADS> orch_phase_record_mutexes_;
+    // Running totals used at reconcile time to cross-check device-side counters.
+    uint64_t total_perf_collected_{0};
+    uint64_t total_sched_phase_collected_{0};
+    uint64_t total_orch_phase_collected_{0};
+    bool has_phase_data_{false};
+    bool collector_shards_merged_{false};
+
+    size_t normalize_collector_shard(int collector_shard) const;
+    void reset_collector_shards();
+    void merge_collector_shards();
 
     // Per-buffer-kind handlers used by on_buffer_collected.
-    void copy_perf_buffer(const ReadyBufferInfo &info);
-    void copy_sched_phase_buffer(const ReadyBufferInfo &info);
-    void copy_orch_phase_buffer(const ReadyBufferInfo &info);
-    void copy_aicore_buffer(const ReadyBufferInfo &info);
+    void copy_perf_buffer(const ReadyBufferInfo &info, int collector_shard);
+    void copy_sched_phase_buffer(const ReadyBufferInfo &info, int collector_shard);
+    void copy_orch_phase_buffer(const ReadyBufferInfo &info, int collector_shard);
+    void copy_aicore_buffer(const ReadyBufferInfo &info, int collector_shard);
 };
 
 #endif  // SRC_A5_PLATFORM_INCLUDE_HOST_L2_SWIMLANE_COLLECTOR_H_

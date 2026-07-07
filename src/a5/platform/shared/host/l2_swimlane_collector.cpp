@@ -20,6 +20,7 @@
 
 #include "host/l2_swimlane_collector.h"
 
+#include <cassert>
 #include <chrono>
 #include <cinttypes>
 #include <cstdlib>
@@ -27,6 +28,7 @@
 #include <filesystem>
 #include <fstream>
 #include <string>
+#include <type_traits>
 #include <vector>
 
 #include "common/memory_barrier.h"
@@ -75,9 +77,11 @@ int L2SwimlaneCollector::initialize(
     aicpu_thread_num_ = aicpu_thread_num;
     l2_swimlane_level_ = l2_swimlane_level;
     output_prefix_ = output_prefix;
-    total_perf_collected_.store(0, std::memory_order_relaxed);
-    total_sched_phase_collected_.store(0, std::memory_order_relaxed);
-    total_orch_phase_collected_.store(0, std::memory_order_relaxed);
+    total_perf_collected_ = 0;
+    total_sched_phase_collected_ = 0;
+    total_orch_phase_collected_ = 0;
+    has_phase_data_ = false;
+    collector_shards_merged_ = false;
 
     // Stash the memory context on the base up-front so alloc_paired_buffer
     // sees consistent values during init. shm_host_ stays nullptr until the
@@ -270,10 +274,10 @@ int L2SwimlaneCollector::initialize(
     // allocated only for the first buffer_count pools. For sched the two are
     // equal; orch is a single instance (pool 0), so it zeroes all slots but
     // allocates buffers for just pool 0 — no buffers wasted on unused slots.
-    auto init_phase_pools = [&](auto buffer_tag, L2SwimlaneAicpuTaskPool *(*get_state)(void *, int, int),
+    auto init_phase_pools = [&](auto *buffer_tag, L2SwimlaneAicpuTaskPool *(*get_state)(void *, int, int),
                                 int state_count, int buffer_count, int buffers_per_thread, ProfBufferType recycle_kind,
                                 const char *kind_label) -> int {
-        using Buffer = typename decltype(buffer_tag)::type;
+        using Buffer = std::remove_pointer_t<decltype(buffer_tag)>;
         constexpr size_t buffer_bytes = sizeof(Buffer);
         for (int t = 0; t < state_count; t++) {
             auto *state = get_state(perf_host_ptr, num_aicore, t);
@@ -303,23 +307,13 @@ int L2SwimlaneCollector::initialize(
         return 0;
     };
 
-    // Type tags so the templated lambda can deduce the buffer type without
-    // having to spell out an explicit template argument (not portable on a
-    // generic lambda before C++20 explicit template-parameter syntax).
-    struct SchedTag {
-        using type = L2SwimlaneAicpuSchedPhaseBuffer;
-    };
-    struct OrchTag {
-        using type = L2SwimlaneAicpuOrchPhaseBuffer;
-    };
-
     // Sched: actual scheduler-thread count is unknown at host-alloc time, so
     // size buffers to the platform max. Orch: a single instance (pool 0), so
     // allocate buffers for just one pool while still zeroing all MAX states.
     if (init_phase_pools(
-            SchedTag{}, get_sched_phase_buffer_state, /*state_count=*/num_phase_threads,
-            /*buffer_count=*/num_phase_threads, /*buffers_per_thread=*/PLATFORM_PROF_SCHED_BUFFERS_PER_THREAD,
-            ProfBufferType::AICPU_SCHED_PHASE, "sched"
+            static_cast<L2SwimlaneAicpuSchedPhaseBuffer *>(nullptr), get_sched_phase_buffer_state,
+            /*state_count=*/num_phase_threads, /*buffer_count=*/num_phase_threads,
+            /*buffers_per_thread=*/PLATFORM_PROF_SCHED_BUFFERS_PER_THREAD, ProfBufferType::AICPU_SCHED_PHASE, "sched"
         ) != 0) {
         return -1;
     }
@@ -327,7 +321,8 @@ int L2SwimlaneCollector::initialize(
         return get_orch_phase_buffer_state(base, n_cores, t);
     };
     if (init_phase_pools(
-            OrchTag{}, orch_get_state, /*state_count=*/num_phase_threads, /*buffer_count=*/1,
+            static_cast<L2SwimlaneAicpuOrchPhaseBuffer *>(nullptr), orch_get_state,
+            /*state_count=*/num_phase_threads, /*buffer_count=*/1,
             /*buffers_per_thread=*/PLATFORM_PROF_ORCH_BUFFERS_PER_THREAD, ProfBufferType::AICPU_ORCH_PHASE, "orch"
         ) != 0) {
         return -1;
@@ -357,10 +352,7 @@ int L2SwimlaneCollector::initialize(
     // context is deferred to after commit (below): otherwise a throw here would
     // leave perf_shared_mem_dev_ dangling and shm_host_ non-null, which would
     // make is_initialized() report true and finalize() double-free.
-    collected_perf_records_.assign(num_aicore_, {});
-    collected_aicore_records_.assign(num_aicore_, {});
-    collected_sched_phase_records_.assign(PLATFORM_MAX_AICPU_THREADS, {});
-    collected_orch_phase_records_.assign(PLATFORM_MAX_AICPU_THREADS, {});
+    reset_collector_shards();
 
     LOG_INFO_V0("Performance profiling initialized (dynamic buffer mode)");
     guard.commit();
@@ -382,7 +374,94 @@ int L2SwimlaneCollector::initialize(
 // ProfilerBase callbacks
 // ---------------------------------------------------------------------------
 
-void L2SwimlaneCollector::copy_perf_buffer(const ReadyBufferInfo &info) {
+size_t L2SwimlaneCollector::normalize_collector_shard(int collector_shard) const {
+    const size_t shard_count = collector_counters_.size();
+    const bool valid_shard = collector_shard >= 0 && static_cast<size_t>(collector_shard) < shard_count;
+    if (!valid_shard) {
+        assert(false && "collector_shard out of range");
+        return shard_count;
+    }
+    return static_cast<size_t>(collector_shard);
+}
+
+void L2SwimlaneCollector::reset_collector_shards() {
+    const size_t shard_count = static_cast<size_t>(L2SwimlaneModule::kCollectorThreadCount);
+
+    collected_perf_records_.assign(num_aicore_, {});
+    collected_aicore_records_.assign(num_aicore_, {});
+    collected_sched_phase_records_.assign(PLATFORM_MAX_AICPU_THREADS, {});
+    collected_orch_phase_records_.assign(PLATFORM_MAX_AICPU_THREADS, {});
+
+    perf_records_by_collector_.assign(shard_count, {});
+    aicore_records_by_collector_.assign(shard_count, {});
+    sched_phase_records_by_collector_.assign(shard_count, {});
+    orch_phase_records_by_collector_.assign(shard_count, {});
+    for (size_t shard = 0; shard < shard_count; shard++) {
+        perf_records_by_collector_[shard].assign(num_aicore_, {});
+        aicore_records_by_collector_[shard].assign(num_aicore_, {});
+        sched_phase_records_by_collector_[shard].assign(PLATFORM_MAX_AICPU_THREADS, {});
+        orch_phase_records_by_collector_[shard].assign(PLATFORM_MAX_AICPU_THREADS, {});
+    }
+    collector_counters_.assign(shard_count, {});
+    total_perf_collected_ = 0;
+    total_sched_phase_collected_ = 0;
+    total_orch_phase_collected_ = 0;
+    has_phase_data_ = false;
+    collector_shards_merged_ = false;
+}
+
+template <typename T>
+static void merge_record_shards(
+    const std::vector<std::vector<std::vector<T>>> &by_collector, std::vector<std::vector<T>> &merged,
+    size_t instance_count
+) {
+    merged.assign(instance_count, {});
+    for (size_t instance = 0; instance < instance_count; instance++) {
+        size_t total = 0;
+        for (const auto &collector_records : by_collector) {
+            if (instance < collector_records.size()) {
+                total += collector_records[instance].size();
+            }
+        }
+        merged[instance].reserve(total);
+        for (const auto &collector_records : by_collector) {
+            if (instance < collector_records.size()) {
+                const auto &records = collector_records[instance];
+                merged[instance].insert(merged[instance].end(), records.begin(), records.end());
+            }
+        }
+    }
+}
+
+void L2SwimlaneCollector::merge_collector_shards() {
+    if (collector_shards_merged_) {
+        return;
+    }
+
+    merge_record_shards(perf_records_by_collector_, collected_perf_records_, static_cast<size_t>(num_aicore_));
+    merge_record_shards(aicore_records_by_collector_, collected_aicore_records_, static_cast<size_t>(num_aicore_));
+    merge_record_shards(
+        sched_phase_records_by_collector_, collected_sched_phase_records_,
+        static_cast<size_t>(PLATFORM_MAX_AICPU_THREADS)
+    );
+    merge_record_shards(
+        orch_phase_records_by_collector_, collected_orch_phase_records_, static_cast<size_t>(PLATFORM_MAX_AICPU_THREADS)
+    );
+
+    total_perf_collected_ = 0;
+    total_sched_phase_collected_ = 0;
+    total_orch_phase_collected_ = 0;
+    has_phase_data_ = false;
+    for (const auto &counter : collector_counters_) {
+        total_perf_collected_ += counter.total_perf_collected;
+        total_sched_phase_collected_ += counter.total_sched_phase_collected;
+        total_orch_phase_collected_ += counter.total_orch_phase_collected;
+        has_phase_data_ = has_phase_data_ || counter.has_phase_data;
+    }
+    collector_shards_merged_ = true;
+}
+
+void L2SwimlaneCollector::copy_perf_buffer(const ReadyBufferInfo &info, int collector_shard) {
     L2SwimlaneAicpuTaskBuffer *buf = reinterpret_cast<L2SwimlaneAicpuTaskBuffer *>(info.host_buffer_ptr);
     rmb();
     uint32_t count = buf->count;
@@ -390,16 +469,18 @@ void L2SwimlaneCollector::copy_perf_buffer(const ReadyBufferInfo &info) {
         count = PLATFORM_PROF_BUFFER_SIZE;
     }
     uint32_t core_index = info.index;
-    if (core_index < static_cast<uint32_t>(num_aicore_)) {
-        std::scoped_lock<std::mutex> lock(perf_record_mutexes_[core_index]);
+    size_t shard = normalize_collector_shard(collector_shard);
+    if (core_index < static_cast<uint32_t>(num_aicore_) && shard < perf_records_by_collector_.size()) {
+        auto &dst = perf_records_by_collector_[shard][core_index];
+        dst.reserve(dst.size() + count);
         for (uint32_t i = 0; i < count; i++) {
-            collected_perf_records_[core_index].push_back(buf->records[i]);
+            dst.push_back(buf->records[i]);
         }
-        total_perf_collected_.fetch_add(count, std::memory_order_relaxed);
+        collector_counters_[shard].total_perf_collected += count;
     }
 }
 
-void L2SwimlaneCollector::copy_sched_phase_buffer(const ReadyBufferInfo &info) {
+void L2SwimlaneCollector::copy_sched_phase_buffer(const ReadyBufferInfo &info, int collector_shard) {
     auto *buf = reinterpret_cast<L2SwimlaneAicpuSchedPhaseBuffer *>(info.host_buffer_ptr);
     rmb();
     uint32_t count = buf->count;
@@ -407,19 +488,21 @@ void L2SwimlaneCollector::copy_sched_phase_buffer(const ReadyBufferInfo &info) {
         count = PLATFORM_PHASE_RECORDS_PER_THREAD;
     }
     uint32_t tidx = info.index;
-    if (tidx < collected_sched_phase_records_.size()) {
-        std::scoped_lock<std::mutex> lock(sched_phase_record_mutexes_[tidx]);
+    size_t shard = normalize_collector_shard(collector_shard);
+    if (shard < sched_phase_records_by_collector_.size() && tidx < sched_phase_records_by_collector_[shard].size()) {
+        auto &dst = sched_phase_records_by_collector_[shard][tidx];
+        dst.reserve(dst.size() + count);
         for (uint32_t i = 0; i < count; i++) {
-            collected_sched_phase_records_[tidx].push_back(buf->records[i]);
+            dst.push_back(buf->records[i]);
         }
-        total_sched_phase_collected_.fetch_add(count, std::memory_order_relaxed);
+        collector_counters_[shard].total_sched_phase_collected += count;
         if (count > 0) {
-            has_phase_data_.store(true, std::memory_order_relaxed);
+            collector_counters_[shard].has_phase_data = true;
         }
     }
 }
 
-void L2SwimlaneCollector::copy_orch_phase_buffer(const ReadyBufferInfo &info) {
+void L2SwimlaneCollector::copy_orch_phase_buffer(const ReadyBufferInfo &info, int collector_shard) {
     auto *buf = reinterpret_cast<L2SwimlaneAicpuOrchPhaseBuffer *>(info.host_buffer_ptr);
     rmb();
     uint32_t count = buf->count;
@@ -427,14 +510,16 @@ void L2SwimlaneCollector::copy_orch_phase_buffer(const ReadyBufferInfo &info) {
         count = PLATFORM_PHASE_RECORDS_PER_THREAD;
     }
     uint32_t tidx = info.index;
-    if (tidx < collected_orch_phase_records_.size()) {
-        std::scoped_lock<std::mutex> lock(orch_phase_record_mutexes_[tidx]);
+    size_t shard = normalize_collector_shard(collector_shard);
+    if (shard < orch_phase_records_by_collector_.size() && tidx < orch_phase_records_by_collector_[shard].size()) {
+        auto &dst = orch_phase_records_by_collector_[shard][tidx];
+        dst.reserve(dst.size() + count);
         for (uint32_t i = 0; i < count; i++) {
-            collected_orch_phase_records_[tidx].push_back(buf->records[i]);
+            dst.push_back(buf->records[i]);
         }
-        total_orch_phase_collected_.fetch_add(count, std::memory_order_relaxed);
+        collector_counters_[shard].total_orch_phase_collected += count;
         if (count > 0) {
-            has_phase_data_.store(true, std::memory_order_relaxed);
+            collector_counters_[shard].has_phase_data = true;
         }
     }
 }
@@ -443,9 +528,9 @@ void L2SwimlaneCollector::copy_orch_phase_buffer(const ReadyBufferInfo &info) {
 // (AICPU enqueues them at PLATFORM_AICORE_BUFFER_SIZE dispatch boundaries +
 // once at flush). Within a single buffer, AICore wrote records[0..buf->count)
 // in the order tasks ran on that core (completion-before-dispatch invariant
-// + AICPU stamps buf->count just before enqueue). Flattening in arrival
-// order gives us the per-core task stream that join_aicore_records()
-// indexes by reg_task_id.
+// + AICPU stamps buf->count just before enqueue). Records are stored in the
+// current collector shard and later merged; downstream consumers join by
+// reg_task_id / timestamp and do not require cross-shard arrival order.
 //
 // Defensive filter: skip records whose `start_time == 0`. AICore writes
 // `get_sys_cnt_aicore()` (a free-running cycle counter, always non-zero in
@@ -458,7 +543,7 @@ void L2SwimlaneCollector::copy_orch_phase_buffer(const ReadyBufferInfo &info) {
 //     propagated). The "missing" slot's previous contents are zero because
 //     allocate_single_buffer memsets at allocation.
 //   - Flush-path partial buffer whose tail wasn't reached.
-void L2SwimlaneCollector::copy_aicore_buffer(const ReadyBufferInfo &info) {
+void L2SwimlaneCollector::copy_aicore_buffer(const ReadyBufferInfo &info, int collector_shard) {
     L2SwimlaneAicoreTaskBuffer *buf = reinterpret_cast<L2SwimlaneAicoreTaskBuffer *>(info.host_buffer_ptr);
     rmb();
     uint32_t core_index = info.index;
@@ -470,9 +555,9 @@ void L2SwimlaneCollector::copy_aicore_buffer(const ReadyBufferInfo &info) {
         count = PLATFORM_AICORE_BUFFER_SIZE;
     }
     uint32_t skipped = 0;
-    {
-        std::scoped_lock<std::mutex> lock(aicore_record_mutexes_[core_index]);
-        auto &dst = collected_aicore_records_[core_index];
+    size_t shard = normalize_collector_shard(collector_shard);
+    if (shard < aicore_records_by_collector_.size()) {
+        auto &dst = aicore_records_by_collector_[shard][core_index];
         dst.reserve(dst.size() + count);
         for (uint32_t i = 0; i < count; i++) {
             const L2SwimlaneAicoreTaskRecord &r = buf->records[i];
@@ -492,19 +577,19 @@ void L2SwimlaneCollector::copy_aicore_buffer(const ReadyBufferInfo &info) {
     }
 }
 
-void L2SwimlaneCollector::on_buffer_collected(const ReadyBufferInfo &info) {
+void L2SwimlaneCollector::on_buffer_collected(const ReadyBufferInfo &info, int collector_shard) {
     switch (info.type) {
     case ProfBufferType::AICPU_TASK:
-        copy_perf_buffer(info);
+        copy_perf_buffer(info, collector_shard);
         break;
     case ProfBufferType::AICPU_SCHED_PHASE:
-        copy_sched_phase_buffer(info);
+        copy_sched_phase_buffer(info, collector_shard);
         break;
     case ProfBufferType::AICPU_ORCH_PHASE:
-        copy_orch_phase_buffer(info);
+        copy_orch_phase_buffer(info, collector_shard);
         break;
     case ProfBufferType::AICORE_TASK:
-        copy_aicore_buffer(info);
+        copy_aicore_buffer(info, collector_shard);
         break;
     }
 }
@@ -522,6 +607,7 @@ void L2SwimlaneCollector::reconcile_counters() {
     if (shm_host_ == nullptr) {
         return;
     }
+    merge_collector_shards();
 
     // Refresh the pool states (current_buf_ptr + total/dropped counters) from
     // device before the sanity loop so leftovers reflect post-stop() device
@@ -621,7 +707,7 @@ void L2SwimlaneCollector::reconcile_counters() {
         [](void *host_ptr) {
             return reinterpret_cast<L2SwimlaneAicpuTaskBuffer *>(host_ptr)->count;
         },
-        sizeof(L2SwimlaneAicpuTaskBuffer), total_perf_collected_.load(std::memory_order_relaxed), /*optional=*/false
+        sizeof(L2SwimlaneAicpuTaskBuffer), total_perf_collected_, /*optional=*/false
     );
 
     reconcile_one(
@@ -632,8 +718,7 @@ void L2SwimlaneCollector::reconcile_counters() {
         [](void *host_ptr) {
             return reinterpret_cast<L2SwimlaneAicpuSchedPhaseBuffer *>(host_ptr)->count;
         },
-        sizeof(L2SwimlaneAicpuSchedPhaseBuffer), total_sched_phase_collected_.load(std::memory_order_relaxed),
-        /*optional=*/true
+        sizeof(L2SwimlaneAicpuSchedPhaseBuffer), total_sched_phase_collected_, /*optional=*/true
     );
 
     reconcile_one(
@@ -644,8 +729,7 @@ void L2SwimlaneCollector::reconcile_counters() {
         [](void *host_ptr) {
             return reinterpret_cast<L2SwimlaneAicpuOrchPhaseBuffer *>(host_ptr)->count;
         },
-        sizeof(L2SwimlaneAicpuOrchPhaseBuffer), total_orch_phase_collected_.load(std::memory_order_relaxed),
-        /*optional=*/true
+        sizeof(L2SwimlaneAicpuOrchPhaseBuffer), total_orch_phase_collected_, /*optional=*/true
     );
 }
 
@@ -653,6 +737,7 @@ void L2SwimlaneCollector::read_phase_header_metadata() {
     if (shm_host_ == nullptr) {
         return;
     }
+    merge_collector_shards();
 
     // First post-stop() reader of the device-written header (phase thread
     // counts + core_to_thread). Pull the shm region into the shadow so these
@@ -711,10 +796,7 @@ void L2SwimlaneCollector::read_phase_header_metadata() {
         LOG_INFO_V0("  Core-to-thread mapping: %d cores", num_phase_cores);
     }
 
-    LOG_INFO_V0(
-        "Phase metadata collection complete: has_phase_data=%s",
-        has_phase_data_.load(std::memory_order_relaxed) ? "yes" : "no"
-    );
+    LOG_INFO_V0("Phase metadata collection complete: has_phase_data=%s", has_phase_data_ ? "yes" : "no");
 }
 
 void L2SwimlaneCollector::set_core_types(const CoreType *types, int n) {
@@ -735,6 +817,7 @@ int L2SwimlaneCollector::export_swimlane_json() {
     if (shm_host_ == nullptr) {
         return -1;
     }
+    merge_collector_shards();
 
     // Empty-export guard: nothing useful on disk if every per-stream source is
     // empty. AICPU_TIMING+ relies on `collected_perf_records_`; AICORE_TIMING
@@ -1054,13 +1137,20 @@ int L2SwimlaneCollector::finalize(L2SwimlaneUnregisterCallback unregister_cb, co
     // walking freed buffer state. Mirrors PMU/DepGen/TensorDump collectors.
     shm_host_ = nullptr;
     collected_perf_records_.clear();
+    collected_aicore_records_.clear();
     collected_sched_phase_records_.clear();
     collected_orch_phase_records_.clear();
+    perf_records_by_collector_.clear();
+    aicore_records_by_collector_.clear();
+    sched_phase_records_by_collector_.clear();
+    orch_phase_records_by_collector_.clear();
+    collector_counters_.clear();
     core_to_thread_.clear();
-    has_phase_data_.store(false, std::memory_order_relaxed);
-    total_perf_collected_.store(0, std::memory_order_relaxed);
-    total_sched_phase_collected_.store(0, std::memory_order_relaxed);
-    total_orch_phase_collected_.store(0, std::memory_order_relaxed);
+    has_phase_data_ = false;
+    total_perf_collected_ = 0;
+    total_sched_phase_collected_ = 0;
+    total_orch_phase_collected_ = 0;
+    collector_shards_merged_ = false;
     clear_memory_context();
 
     LOG_DEBUG("Performance profiling cleanup complete");
