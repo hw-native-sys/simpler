@@ -313,13 +313,15 @@ def checkout_pto_isa_commit(clone_path: Path, commit: str, verbose: bool = False
     try:
         _run_git_resilient(["reset", "--hard"], cwd=clone_path, timeout=30, check=True, verbose=verbose)
         _run_git_resilient(["clean", "-fdx"], cwd=clone_path, timeout=30, check=True, verbose=verbose)
-        result = _run_git_resilient(["checkout", "--detach", commit], cwd=clone_path, timeout=30, verbose=verbose)
+        result = _run_git_resilient(
+            ["checkout", "--force", "--detach", commit], cwd=clone_path, timeout=30, verbose=verbose
+        )
         if result.returncode != 0:
             if verbose:
                 logger.info(f"pto-isa commit {commit} missing locally, fetching origin...")
             _run_git_resilient(["fetch", "origin"], cwd=clone_path, timeout=120, check=True, verbose=verbose)
             _run_git_resilient(
-                ["checkout", "--detach", commit], cwd=clone_path, timeout=30, check=True, verbose=verbose
+                ["checkout", "--force", "--detach", commit], cwd=clone_path, timeout=30, check=True, verbose=verbose
             )
         _run_git_resilient(["reset", "--hard", commit], cwd=clone_path, timeout=30, check=True, verbose=verbose)
         _run_git_resilient(["clean", "-fdx"], cwd=clone_path, timeout=30, check=True, verbose=verbose)

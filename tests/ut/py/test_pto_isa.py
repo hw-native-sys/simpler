@@ -125,7 +125,7 @@ def test_checkout_pto_isa_commit_fetches_when_commit_is_missing(tmp_path, monkey
 
     def fake_run_git(args, cwd=None, timeout=30, check=False):
         calls.append((args, cwd, check))
-        if args == ["checkout", "--detach", PIN_A] and len([c for c in calls if c[0] == args]) == 1:
+        if args == ["checkout", "--force", "--detach", PIN_A] and len([c for c in calls if c[0] == args]) == 1:
             return subprocess.CompletedProcess(["git", *args], returncode=1, stdout="", stderr="missing")
         if args == ["rev-parse", "HEAD"]:
             return subprocess.CompletedProcess(["git", *args], returncode=0, stdout=f"{PIN_A}\n", stderr="")
@@ -137,9 +137,9 @@ def test_checkout_pto_isa_commit_fetches_when_commit_is_missing(tmp_path, monkey
     assert calls == [
         (["reset", "--hard"], tmp_path, False),
         (["clean", "-fdx"], tmp_path, False),
-        (["checkout", "--detach", PIN_A], tmp_path, False),
+        (["checkout", "--force", "--detach", PIN_A], tmp_path, False),
         (["fetch", "origin"], tmp_path, False),
-        (["checkout", "--detach", PIN_A], tmp_path, False),
+        (["checkout", "--force", "--detach", PIN_A], tmp_path, False),
         (["reset", "--hard", PIN_A], tmp_path, False),
         (["clean", "-fdx"], tmp_path, False),
         (["rev-parse", "HEAD"], tmp_path, False),
@@ -153,7 +153,7 @@ def test_checkout_pto_isa_commit_retries_dubious_ownership_with_safe_directory(t
 
     def fake_run_git(args, cwd=None, timeout=30, check=False):
         calls.append((args, cwd, check))
-        if args == ["checkout", "--detach", PIN_A]:
+        if args == ["checkout", "--force", "--detach", PIN_A]:
             return subprocess.CompletedProcess(["git", *args], returncode=128, stdout="", stderr=dubious)
         if args == ["rev-parse", "HEAD"]:
             return subprocess.CompletedProcess(["git", *args], returncode=0, stdout=f"{PIN_A}\n", stderr="")
@@ -165,8 +165,8 @@ def test_checkout_pto_isa_commit_retries_dubious_ownership_with_safe_directory(t
     assert calls == [
         (["reset", "--hard"], tmp_path, False),
         (["clean", "-fdx"], tmp_path, False),
-        (["checkout", "--detach", PIN_A], tmp_path, False),
-        (["-c", safe_arg, "checkout", "--detach", PIN_A], tmp_path, False),
+        (["checkout", "--force", "--detach", PIN_A], tmp_path, False),
+        (["-c", safe_arg, "checkout", "--force", "--detach", PIN_A], tmp_path, False),
         (["reset", "--hard", PIN_A], tmp_path, False),
         (["clean", "-fdx"], tmp_path, False),
         (["rev-parse", "HEAD"], tmp_path, False),
