@@ -6,7 +6,7 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""ST for examples/workers/l3/allreduce_distributed — all three algorithm modes."""
+"""ST for examples/workers/l3/allreduce_distributed — all five tested algorithm modes."""
 
 import pytest
 
@@ -16,9 +16,9 @@ from .main import run
 @pytest.mark.platforms(["a2a3sim", "a2a3", "a5sim", "a5"])
 @pytest.mark.runtime("tensormap_and_ringbuffer")
 @pytest.mark.device_count(2)
-@pytest.mark.parametrize("mode", ["onephase", "twophase", "ring"])
+@pytest.mark.parametrize("mode", ["onephase", "twophase", "ring", "bidirectional_ring", "ibing"])
 def test_allreduce_distributed(st_platform, st_device_ids, mode):
-    """Test all three allreduce modes with 2 devices."""
+    """Test all allreduce modes with 2 devices."""
     assert len(st_device_ids) == 2
     rc = run([int(d) for d in st_device_ids], platform=st_platform, mode=mode)
     assert rc == 0
@@ -32,10 +32,11 @@ def test_allreduce_distributed(st_platform, st_device_ids, mode):
         pytest.param(4, "onephase", marks=pytest.mark.device_count(4)),
         pytest.param(4, "twophase", marks=pytest.mark.device_count(4)),
         pytest.param(4, "ring", marks=pytest.mark.device_count(4)),
+        pytest.param(4, "bidirectional_ring", marks=pytest.mark.device_count(4)),
     ],
 )
 def test_allreduce_distributed_multi_rank(st_platform, st_device_ids, n_devices, mode):
-    """Test all three allreduce modes with 4 devices.
+    """Test all allreduce modes with 4 devices.
 
     a5 onboard CI exposes only 2 NPUs, so >2-rank tests run on a2a3 hardware
     and both sims only.
@@ -43,3 +44,16 @@ def test_allreduce_distributed_multi_rank(st_platform, st_device_ids, n_devices,
     assert len(st_device_ids) == n_devices
     rc = run([int(d) for d in st_device_ids], platform=st_platform, mode=mode)
     assert rc == 0
+
+
+@pytest.mark.platforms(["a2a3sim", "a2a3", "a5sim", "a5"])
+@pytest.mark.runtime("tensormap_and_ringbuffer")
+@pytest.mark.device_count(2)
+def test_allreduce_distributed_ibing_unsupported_ranks(st_platform):
+    """ibing mode should raise ValueError for nranks != 2.
+
+    Uses synthetic 4-rank device IDs: run() validates nranks before worker init,
+    so no 4-device pool is required (2-device CI can run this case).
+    """
+    with pytest.raises(ValueError, match="ibing mode is only supported for nranks=2"):
+        run([0, 1, 2, 3], platform=st_platform, mode="ibing")

@@ -198,12 +198,9 @@ static __aicore__ void aic_qk_step(
     set_flag(PIPE_M, PIPE_FIX, EVENT_ID0);
     wait_flag(PIPE_M, PIPE_FIX, EVENT_ID0);
 
-    // TPUSH sij (C2V): AccTile L0C -> GM. Ensure prior MTE3 is done,
-    // then push, then wait for MTE3 DMA to complete before signaling consumer.
     TPUSH<SijPipeT, AccTile_QK, TileSplitAxis::TILE_UP_DOWN>(sij_pipe, cTile_QK);
     set_flag(PIPE_FIX, PIPE_S, EVENT_ID7);
     wait_flag(PIPE_FIX, PIPE_S, EVENT_ID7);
-    sij_pipe.prod.record();
 }
 
 // Helper: PV matmul for block i — TPOP pij, load value, move to L0, matmul, TPUSH oi
@@ -255,11 +252,9 @@ static __aicore__ void aic_pv_step(
     set_flag(PIPE_M, PIPE_FIX, EVENT_ID1);
     wait_flag(PIPE_M, PIPE_FIX, EVENT_ID1);
 
-    // TPUSH oi (C2V): AccTile L0C -> GM. Same manual record pattern as sij.
     TPUSH<OiPipeT, AccTile_PV, TileSplitAxis::TILE_UP_DOWN>(oi_pipe, cTile_PV);
     set_flag(PIPE_FIX, PIPE_S, EVENT_ID7);
     wait_flag(PIPE_FIX, PIPE_S, EVENT_ID7);
-    oi_pipe.prod.record();
 }
 
 template <typename Cfg, int K, int N>
@@ -642,30 +637,6 @@ static __aicore__ void run_aic(
     typename Cfg::PijPipeT pij_pipe(pij_fifo_base, 0U, Cfg::PIJ_L1_BASE);
     typename Cfg::OiPipeT oi_pipe(oi_fifo_base, Cfg::OI_UB_BASE, 0U);
 
-    // Disable auto-record on C2V pipes: AccTile TSTORE goes through FIX → MTE3,
-    // but auto-record fires on PIPE_FIX which may complete before MTE3 DMA writes
-    // to GM. Manual pipe_barrier(PIPE_MTE3) + record() in each step ensures the
-    // cross-core signal fires only after the GM write is visible.
-    sij_pipe.prod.setRecordStatus(false);
-    oi_pipe.prod.setRecordStatus(false);
-
-    // Disable reverse-dependency sync (back-pressure). Forward dependency chain
-    // (AIC: QK-first; AIV: SF-first; FIFO_DEPTH=2) guarantees producer is at
-    // most SLOT_NUM=2 tiles ahead of consumer:
-    //   sij: AIC pushes sij[i+1] only after TPOP(pij[i-1]), which requires
-    //        AIV TPOP(sij[i-1]) — slot reuse safe.
-    //   oi : AIC pushes oi[i+1]  only after TPOP(pij[i+1]), which requires
-    //        AIV's iter i+1 SF, by which time AIV iter i finished UP[i-1]
-    //        i.e. TPOP(oi[i-1]) — slot reuse safe.
-    //   pij: AIV pushes pij[i+1] only after TPOP(sij[i+1]), which fires after
-    //        AIC iter i+1 starts and AIC iter i has finished TPOP(pij[i-1])
-    //        — slot reuse safe.
-    // If the QK-first/SF-first interleaving or FIFO_DEPTH changes, restore
-    // these flags.
-    sij_pipe.prod.setAllocateStatus(false);
-    oi_pipe.prod.setAllocateStatus(false);
-    pij_pipe.cons.setFreeStatus(false);
-
     __gm__ Tensor *query_t = reinterpret_cast<__gm__ Tensor *>(args[0]);
     __gm__ Tensor *key_cache_t = reinterpret_cast<__gm__ Tensor *>(args[1]);
     __gm__ Tensor *value_cache_t = reinterpret_cast<__gm__ Tensor *>(args[2]);
@@ -718,22 +689,16 @@ static __aicore__ void run_aiv(
     int32_t sub_block_id = get_sub_block_id(args);
     int64_t row_offset = sub_block_id * Cfg::SUB_QT;
 
-    // Entry offsets depend on the actual tile width (block_size for sij/pij, HEAD_DIM for oi).
-    // TILE_UP_DOWN splits Q_TILE rows into two SUB_QT halves; AIV1's data starts at
-    // SUB_QT * tile_width * sizeof(element) within the contiguous TPUSH'd tile.
-    int sij_sub_offset = sub_block_id * Cfg::SUB_QT * static_cast<int>(block_size) * static_cast<int>(sizeof(float));
-    int pij_sub_offset =
-        sub_block_id * Cfg::SUB_QT * static_cast<int>(block_size) * static_cast<int>(sizeof(bfloat16_t));
-    int oi_sub_offset = sub_block_id * Cfg::SUB_QT * HEAD_DIM * static_cast<int>(sizeof(float));
-    sij_pipe.cons.setEntryOffset(sij_sub_offset);
-    pij_pipe.prod.setEntryOffset(pij_sub_offset);
-    oi_pipe.cons.setEntryOffset(oi_sub_offset);
-
-    // Mirror reverse-dependency disable on the AIV side (see run_aic for
-    // the full forward-chain argument).
-    pij_pipe.prod.setAllocateStatus(false);
-    sij_pipe.cons.setFreeStatus(false);
-    oi_pipe.cons.setFreeStatus(false);
+    // pto-isa TPUSH/TPOP add `get_subblockid() * sub_rows * cols * elem_bytes` internally, but the CCE
+    // `get_subblockid()` register is 0 for both lanes under simpler onboard MIX dispatch; add the lane split
+    // explicitly from GlobalContext.sub_block_id (block_size wide for sij/pij, HEAD_DIM for oi).
+    sij_pipe.cons.setEntryOffset(
+        sub_block_id * Cfg::SUB_QT * static_cast<int>(block_size) * static_cast<int>(sizeof(float))
+    );
+    pij_pipe.prod.setEntryOffset(
+        sub_block_id * Cfg::SUB_QT * static_cast<int>(block_size) * static_cast<int>(sizeof(bfloat16_t))
+    );
+    oi_pipe.cons.setEntryOffset(sub_block_id * Cfg::SUB_QT * HEAD_DIM * static_cast<int>(sizeof(float)));
 
     __gm__ float *out_base = reinterpret_cast<__gm__ float *>(out_t->buffer.addr) + out_t->start_offset;
 

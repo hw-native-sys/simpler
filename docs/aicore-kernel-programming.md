@@ -184,18 +184,25 @@ down from `kernel_entry` into `UnpadAttentionDecoderAic::SetArgs` and
 The porting checklist above assumes you own every `get_subblockid()` call
 site. You do **not** when the kernel drives the pto-isa tile-pipe library
 (`TPUSH` / `TPOP` / `TFREE` with `TileSplitAxis::TILE_UP_DOWN` or
-`TILE_LEFT_RIGHT`): those templates compute their per-AIV FIFO offset from the
+`TILE_LEFT_RIGHT`): those templates compute per-AIV FIFO offset from the
 **no-arg** `get_subblockid()` internally
-(`TPush.hpp::pushVec2GMFiFo` / `popVecTileFromGMFiFo` —
-`subAIVOffset = get_subblockid() * rows * cols * sizeof(T)`), and you cannot
+(`TPush.hpp::pushVec2GMFiFo` / `popVecTileFromGMFiFo`), and you cannot
 thread `args` into a third-party library template.
 
-Under simpler's MIX dispatch that library call returns 0 for both lanes, so its
-auto-split contributes nothing and **both AIV lanes read/write the same FIFO
-half**. The other half is never produced; attention then reads uninitialised GM
-and the output is wrong/partial (observed as `NaN` in the qwen3 case here).
+**Recommended usage** (see [`docs/tpush-tpop.md`](tpush-tpop.md)):
 
-**Do not** bridge it with a file-scope cache:
+- Call `TPUSH` / `TPOP` / `TFREE` directly — record, back-pressure, and
+  `TILE_UP_DOWN` lane offset are already implemented inside those templates.
+- Do **not** add manual `pipe.prod.record()` or batch `setRecordStatus(false)` /
+  `setAllocateStatus(false)` / `setFreeStatus(false)` unless a reviewed pipeline
+  analysis requires it.
+- Do **not** `setEntryOffset(get_sub_block_id(args) * …)` for lane split when
+  `get_subblockid()` is correct — the library already adds
+  `get_subblockid() * tile_bytes_per_lane`.
+- For **non-tile-pipe** GM addressing (output rows, head partitioning), keep
+  using `get_sub_block_id(args)` from this header.
+
+**Do not** bridge `get_subblockid()` with a file-scope cache:
 
 ```cpp
 // WRONG — the .o will not load. See §4.
@@ -205,25 +212,11 @@ and the output is wrong/partial (observed as `NaN` in the qwen3 case here).
 ```
 
 A `[[block_local]]` (or any non-const) static is read via a `.text` relocation
-that the AICore loader rejects (§4), and AICore forbids ordinary global/static
-data, so there is no relocation-free global to redirect into either.
-
-The working pattern (as in `spmd_paged_attention`) leaves the library's
-`get_subblockid()` at its native 0 and adds the per-lane offset **explicitly**
-on the tile-pipe, computed from `get_sub_block_id(args)`:
-
-```cpp
-int32_t lane = get_sub_block_id(args);                        // 0 or 1, real lane
-// TILE_UP_DOWN splits an M×N tile by rows; AIV1 starts one sub-tile in.
-pipe.cons.setEntryOffset(lane * Rows * Cols * sizeof(ConsT)); // C2V pop side
-pipe.prod.setEntryOffset(lane * Rows * Cols * sizeof(ProdT)); // V2C push side
-```
-
-The library adds `get_subblockid() * bytes` (= 0) **plus** your `entryOffset`,
-so the explicit offset now carries the entire lane split. Set it once after the
-pipe is constructed; `entryOffset` persists across `TPUSH` / `TPOP`. See
-`examples/a2a3/tensormap_and_ringbuffer/qwen3_14b_decode/kernels/aiv/fa_fused_aiv.cpp`
-for a worked example.
+that the AICore loader rejects (§4). If onboard `get_subblockid()` does not
+match `get_sub_block_id(args)`, prefer fixing platform/launch identity; until
+then add the lane split explicitly with `setEntryOffset` computed inline from
+`get_sub_block_id(args)` (see the `run_aiv` `setEntryOffset` call sites in
+[`spmd_paged_attention/kernels/mix/paged_attention_parallel.cpp`](../tests/st/a2a3/tensormap_and_ringbuffer/spmd_paged_attention/kernels/mix/paged_attention_parallel.cpp)).
 
 ---
 
@@ -258,9 +251,9 @@ readelf -SW kernel.o | grep -E '\.text'  # want only ".text"; ".text._Z*" or ".r
 readelf -r  kernel.o                      # want: no relocation entries
 ```
 
-This is exactly why §3's sub-block-id fix uses an explicit `setEntryOffset`
-argument rather than a cached `[[block_local]]` static: the static would
-reintroduce a `.rela.text` the loader rejects.
+This is exactly why §3 rejects a cached `[[block_local]]` static to redirect
+`get_subblockid()`: the static would reintroduce a `.rela.text` the loader
+rejects.
 
 ---
 

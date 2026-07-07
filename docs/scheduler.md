@@ -214,7 +214,7 @@ void Scheduler::dispatch_ready() {
                     if (wt && (!wt->idle() || !s.worker_allowed(i, wt->worker_id())))
                         wt = nullptr;
                 } else {
-                    wt = manager_->pick_idle_excluding_eligible(
+                    wt = manager_->pick_idle(
                         s.worker_type, workers, s.eligible_workers_for(i));
                 }
                 if (!wt) break;

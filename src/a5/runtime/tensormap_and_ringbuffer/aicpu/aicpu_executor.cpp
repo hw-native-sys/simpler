@@ -779,13 +779,7 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
     return run_rc;
 }
 
-void AicpuExecutor::deinit(Runtime *runtime) {
-    // 1. Invalidate AICPU cache for the device-copied Runtime range (`dev`).
-    //    Next round's Host DMA (rtMemcpy) writes fresh bytes to HBM but
-    //    bypasses this cache. Invalidating now ensures next round reads from
-    //    HBM. Only `dev` is uploaded, so only `dev` needs invalidation.
-    cache_invalidate_range(runtime, sizeof(runtime->dev));
-
+void AicpuExecutor::deinit(Runtime * /*runtime*/) {
     // Reset all SchedulerContext-owned state in one place.
     sched_ctx_.deinit();
 

@@ -16,16 +16,17 @@
  *
  * Architecture:
  * - BufferPoolManager<DepGenModule>: shared mgmt-thread infrastructure that
- *   polls the per-thread ready queue, drains the done_queue, and replenishes
- *   the (single instance's) free_queue from a unified recycled pool.
- * - DepGenCollector: collector thread pops full DepGenBuffers from the manager
- *   and appends their DepGenRecords to a binary file (submit_trace.bin).
+ *   polls per-thread ready queues, drains done-queue shards, and replenishes
+ *   the single instance's free_queue from a unified recycled pool.
+ * - DepGenCollector: collector thread shards pop full DepGenBuffers from the
+ *   manager and append their DepGenRecords to a binary file
+ *   (submit_trace.bin).
  *
  * Lifecycle:
  *   init()                       — Allocate header + 1 BufferState + N DepGenBuffers
  *                                  (pre-fills free_queue; surplus → recycled pool).
  *                                  Calls set_memory_context() on the base.
- *   start(tf)                    — Inherited: launches mgmt + poll threads.
+ *   start(tf)                    — Inherited: launches mgmt + collector threads.
  *   [device execution]
  *   stop()                       — Inherited: drain queues, join threads.
  *   reconcile_counters()         — Sanity-check current_buf_ptr is cleared by
@@ -64,7 +65,7 @@
 // ---------------------------------------------------------------------------
 
 /**
- * Internal hand-off struct delivered from the mgmt thread to the collector.
+ * Internal hand-off struct delivered from a drain thread to a collector shard.
  * thread_index identifies the AICPU thread queue the entry was popped from
  * (always equal to the orchestrator thread index, since dep_gen is single-
  * instance — exposed for symmetry with PmuReadyBufferInfo).
@@ -87,6 +88,8 @@ struct DepGenModule {
     static constexpr uint32_t kReadyQueueSize = PLATFORM_DEP_GEN_READYQUEUE_SIZE;
     static constexpr uint32_t kSlotCount = PLATFORM_DEP_GEN_SLOT_COUNT;
     static constexpr const char *kSubsystemName = "DepGenModule";
+    static constexpr int kMgmtDrainThreadCount = PLATFORM_MAX_AICPU_THREADS;
+    static constexpr int kCollectorThreadCount = PLATFORM_MAX_AICPU_THREADS;
 
     /**
      * Buffers grown by proactive_replenish are batch-allocated up to the
@@ -104,7 +107,18 @@ struct DepGenModule {
      * resets it itself on flush/drop/pop.
      */
     static std::optional<profiling_common::EntrySite<DepGenModule>>
-    resolve_entry(void *shm, DataHeader * /*header*/, int q, const ReadyEntry &entry) {
+    resolve_entry(void *shm, DataHeader *header, int q, const ReadyEntry &entry) {
+        if (shm == nullptr || header == nullptr) {
+            LOG_ERROR("DepGenModule: invalid shared memory/header while resolving ready entry");
+            return std::nullopt;
+        }
+        if (header->num_instances != 1 || entry.instance_index >= header->num_instances) {
+            LOG_ERROR(
+                "DepGenModule: invalid ready entry instance=%u (num_instances=%u)", entry.instance_index,
+                header->num_instances
+            );
+            return std::nullopt;
+        }
         DepGenBufferState *state = get_dep_gen_buffer_state(shm, static_cast<int>(entry.instance_index));
         profiling_common::EntrySite<DepGenModule> site;
         site.kind = 0;

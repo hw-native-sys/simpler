@@ -1,7 +1,8 @@
 # Profiling Framework
 
-Shared host-side infrastructure that the PMU, L2Swimlane, TensorDump, and
-ScopeStats collectors are built on. The framework headers live in
+Shared host-side infrastructure that the PMU, L2Swimlane, DepGen,
+TensorDump, and ScopeStats collectors are built on. The framework headers
+live in
 [`src/common/platform/include/host/`](../src/common/platform/include/host/)
 and are consumed verbatim by both a2a3 and a5 collectors (PR #944
 unified the previously-divergent per-arch copies into one set). This page
@@ -11,6 +12,7 @@ the collectors themselves still carry.
 The per-collector pages
 ([pmu-profiling.md](dfx/pmu-profiling.md),
 [l2-swimlane-profiling.md](dfx/l2-swimlane-profiling.md),
+[dep_gen.md](dfx/dep_gen.md),
 [args-dump.md](dfx/args-dump.md),
 [scope-stats.md](dfx/scope-stats.md))
 describe the data each subsystem collects and how it enables it on-device.
@@ -23,56 +25,58 @@ breakdown of `simpler_run` (host stages + AICPU phase subdivision).
 
 ## 1. Why a shared framework
 
-Each profiling subsystem on a2a3 needs the same plumbing on the host:
+Each profiling subsystem needs the same plumbing on the host:
 
-- A management thread that polls the AICPU's per-thread SPSC ready queues
+- A management path that polls the AICPU's per-thread SPSC ready queues
   and recycles full buffers back to the device while kernels are still
-  running.
-- A collector thread that drains the host-side hand-off queue and copies
+  running. A module may opt into split drain/refill threads plus a
+  replenish thread.
+- Collector thread shards that drain host-side hand-off queues and copy
   records out of each ready buffer.
 - A pool of pre-registered device buffers (allocated up-front, refilled on
-  demand) keyed by "kind" — PMU has 1 kind, TensorDump has 1, L2Swimlane has 2
-  (perf records + phase markers).
+  demand) keyed by "kind". PMU, DepGen, TensorDump, and ScopeStats have one
+  kind; L2Swimlane has four.
 - A dev↔host pointer map so the management thread can resolve a device
   pointer popped off a ready queue to the host-mapped pointer the collector
   thread will read.
-- A teardown sequence that flushes both queues without losing late entries.
+- A teardown sequence that flushes the device queues and host shards without
+  losing late entries.
 
-Before unification this was three near-identical implementations. The
-framework collapses it to one control-flow implementation parameterized on
-a small per-subsystem trait.
+Before unification this was near-identical control flow repeated across
+collectors. The framework collapses it to one implementation parameterized
+on a small per-subsystem trait.
 
 ## 2. Layered view
 
 ```text
                 ┌──────────────────────────────────────────┐
-                │  PmuCollector / L2SwimlaneCollector /        │  Derived (CRTP)
-                │  TensorDumpCollector                     │  ─ on_buffer_collected
+                │  Pmu / L2Swimlane / DepGen / Dump / Scope │  Derived (CRTP)
+                │  collectors                               │  ─ on_buffer_collected
                 └─────────────┬────────────────────────────┘  ─ kIdleTimeoutSec / kSubsystemName
                               │ public ProfilerBase<Derived, Module>
                 ┌─────────────▼────────────────────────────┐
                 │  ProfilerBase<Derived, Module>           │  Thread orchestration
-                │  ─ owns mgmt thread + collector thread   │  ─ start/stop lifecycle
+                │  ─ owns mgmt + collector thread(s)       │  ─ start/stop lifecycle
                 │  ─ runs ProfilerAlgorithms<Module>       │  ─ consume → notify_copy_done
                 └─────────────┬────────────────────────────┘
                               │ has-a
                 ┌─────────────▼────────────────────────────┐
                 │  BufferPoolManager<Module>               │  Data structures (no threads)
-                │  ─ ready_queue / done_queue              │  ─ recycled pools (per kind)
+                │  ─ ready/done queue shards               │  ─ recycled pools (per kind)
                 │  ─ alloc_and_register / resolve_host_ptr │  ─ MemoryOps (type-erased)
                 └──────────────────────────────────────────┘
                               ▲
                               │ Module trait wires layout into algorithms
               ┌───────────────┴────────────────┐
-              │  PmuModule / L2SwimlaneModule /    │  Pure static trait (no state)
-              │  DumpModule                    │  ─ DataHeader / ReadyEntry / FreeQueue
+              │  Pmu / L2Swimlane / DepGen /      │  Pure static trait (no state)
+              │  Dump / Scope modules             │  ─ DataHeader / ReadyEntry / FreeQueue
               └────────────────────────────────┘  ─ kBufferKinds / kReadyQueueSize
                                                   ─ resolve_entry / for_each_instance
 ```
 
 `ProfilerBase` is the owner: it holds `BufferPoolManager manager_` as a
-member ([profiler_base.h:414](../src/common/platform/include/host/profiler_base.h#L414)),
-spawns and joins both threads, and dispatches collected buffers to
+member, spawns and joins the mgmt / collector threads, and dispatches
+collected buffers to
 `Derived::on_buffer_collected` via CRTP. `BufferPoolManager` owns no
 threads — it is just the shared data structure both threads access.
 `Module` is a stateless trait that tells the generic algorithms how the
@@ -85,17 +89,20 @@ subsystem's shared-memory layout is shaped.
 Defined in [`buffer_pool_manager.h`](../src/common/platform/include/host/buffer_pool_manager.h).
 Owns:
 
-- `ready_queue_` — mgmt → collector hand-off, guarded by mutex+cv.
-- `done_queue_` — collector → mgmt recycle channel, guarded by mutex.
-- `recycled_[kind]` — per-kind pool of free device buffers (mgmt-only).
+- `ready_shards_` — mgmt → collector hand-off shards, each guarded by
+  mutex+cv.
+- `done_shards_` — collector → mgmt recycle shards, each guarded by mutex.
+- `recycled_[shard][kind]` — shard-local pool of free device buffers,
+  guarded by one mutex per shard/kind.
 - `dev_to_host_` — single source of truth for `resolve_host_ptr`.
 - `MemoryOps` — type-erased `alloc / reg / free_` callbacks, plus the
   `shared_mem_host` and `device_id` stashed once at start.
 
 Owns no threads. Every entry point is documented as one of:
 
-- mgmt-only (recycled pool ops, `drain_done_into_recycled`),
-- collector-only (`notify_copy_done`),
+- mgmt-only or internally locked (`drain_done_into_recycled`, recycled
+  pool ops),
+- collector-only (`notify_copy_done`, one shard per collector),
 - shared with internal locking (`push_to_ready` / `wait_pop_ready` /
   `try_pop_ready`),
 - start/stop-only (`set_memory_context`, `release_owned_buffers`,
@@ -106,28 +113,39 @@ Owns no threads. Every entry point is documented as one of:
 Defined in [`profiler_base.h`](../src/common/platform/include/host/profiler_base.h).
 Provides:
 
-- The two threads and their lifecycle (`start` / `stop`).
-- `mgmt_loop` — drains `done_queue` → recycled, polls every AICPU
-  per-thread ready queue (bounded by `PLATFORM_MAX_AICPU_THREADS`),
-  invokes `ProfilerAlgorithms<Module>::process_entry` per popped entry,
-  and tops up free queues with `proactive_replenish`.
-- `poll_and_collect_loop` — `wait_pop_ready` with a 100 ms cv tick,
-  dispatches to `Derived::on_buffer_collected`, then calls
+- The mgmt thread(s), collector thread(s), and their lifecycle (`start` /
+  `stop`).
+- Split mgmt threads — `mgmt_drain_loop` drains ready queues and refills the
+  originating free queue from the current drain shard's local recycled pool
+  (`ProfilerAlgorithms<Module>::process_entry` per popped entry), while
+  `mgmt_replenish_loop` only drains done buffers into shard-local recycled
+  pools. A one-shot `proactive_replenish` seeds every free queue before the
+  threads start. Split drain threads do not bulk-mirror the whole
+  shared-memory region; they refresh only their queue indices / entries
+  before advancing `queue_heads`. On an empty scan, split drain does a short
+  busy-poll window before falling back to the 10 us sleep, so micro-bursts
+  are less likely to miss AICPU's bounded wait window.
+- Optional collector sharding (`Module::kCollectorThreadCount`) — each
+  collector drains one host ready shard and returns finished buffers through
+  the matching done shard.
+- `poll_and_collect_loop` — per-shard `wait_pop_ready` with a 100 ms cv
+  tick, dispatches to `Derived::on_buffer_collected`, then calls
   `manager_.notify_copy_done(...)` itself; idle-timeout hang detector.
 - `set_memory_context` / `clear_memory_context` so `Derived::init` can
   stash the alloc/reg/free callbacks before threads start; if init aborts
   before stashing, `start(tf)` becomes a no-op.
 
-`ProfilerAlgorithms<Module>` (in the same header, [profiler_base.h:170](../src/common/platform/include/host/profiler_base.h#L170))
+`ProfilerAlgorithms<Module>` (in the same
+[profiler_base.h](../src/common/platform/include/host/profiler_base.h))
 is where the unified algorithms live:
 
 - `try_pop_aicpu_entry` — barrier-correct head/tail advance over the
   per-thread ready queue, with a range-check guard against device-side
   corruption.
-- `process_entry` — three-level fallback (recycled → drain done → alloc)
-  to refill the originating free_queue with **exactly one** buffer per
-  popped entry, then resolve host_ptr and push to ready. The 1-in/1-out
-  ratio bounds per-tick latency.
+- `process_entry` — shard-local fallback (local recycled → local done →
+  other recycled shard → alloc) to refill the originating free_queue until
+  it is full or no buffer is available, then resolve host_ptr and push to
+  ready.
 - `proactive_replenish` — drain done, then top every (kind, instance)
   free queue up to `kSlotCount`, batch-allocating `batch_size(kind)`
   buffers when the recycled pool of a kind drains mid-fill so recovery
@@ -136,17 +154,21 @@ is where the unified algorithms live:
 ### 3.3 `Module` — trait layer
 
 A stateless `struct` per subsystem (`PmuModule`, `L2SwimlaneModule`,
-`DumpModule`) that tells the generic algorithms what the shared-memory
-layout looks like. The contract lives in the docblock at the top of
+`DepGenModule`, `DumpModule`, `ScopeStatsModule`) that tells the generic
+algorithms what the shared-memory layout looks like. The contract lives in the
+docblock at the top of
 [`profiler_base.h`](../src/common/platform/include/host/profiler_base.h);
 the required members are:
 
 | Member | Purpose |
 | ------ | ------- |
 | `using DataHeader / ReadyEntry / ReadyBufferInfo / FreeQueue` | Layout types |
-| `kBufferKinds` (PMU=1, Dump=1, L2Swimlane=2) | Number of per-kind recycled pools |
+| `kBufferKinds` | Number of buffer kinds inside each recycled shard |
 | `kReadyQueueSize`, `kSlotCount` | AICPU ready queue / free queue depth |
 | `kSubsystemName` | Tag used in framework log lines |
+| `kMgmtDrainThreadCount` | Optional; number of mgmt drain shards (defaults to 1) |
+| `kCollectorThreadCount` | Optional number of collector / host ready-queue shards |
+| `refresh_replenish_metadata(mgr, header)` | Optional hook to refresh cached queue metadata before a replenish pass |
 | `header_from_shm(void*) → DataHeader*` | Cast shared-memory base to header |
 | `batch_size(int kind) → int` | Per-kind batch-alloc count |
 | `resolve_entry(shm, header, q, entry) → optional<EntrySite>` | Map a popped ready entry to (kind, free_queue, buffer_size, partial info); return `nullopt` to drop |
@@ -156,7 +178,10 @@ the required members are:
 The Module structs are defined alongside their collectors in
 [pmu_collector.h](../src/a2a3/platform/include/host/pmu_collector.h),
 [l2_swimlane_collector.h](../src/a2a3/platform/include/host/l2_swimlane_collector.h),
-and [tensor_dump_collector.h](../src/a2a3/platform/include/host/tensor_dump_collector.h)
+[dep_gen_collector.h](../src/a2a3/platform/include/host/dep_gen_collector.h),
+[tensor_dump_collector.h](../src/common/platform/include/host/tensor_dump_collector.h),
+and
+[scope_stats_collector.h](../src/common/platform/include/host/scope_stats_collector.h)
 — each is a few dozen lines of static methods over the subsystem's own
 `DataHeader` / ringbuffer types.
 
@@ -184,34 +209,35 @@ and only has to provide:
 ## 4. End-to-end data flow
 
 ```text
-  AICPU                       mgmt thread                       collector thread
-  ─────                       ───────────                       ────────────────
+  AICPU                       mgmt thread(s)                    collector shard(s)
+  ─────                       ──────────────                    ──────────────────
   write record into         drain_done_into_recycled
   current free buffer       ──────────────────────────►
                             try_pop_aicpu_entry(q)
                             process_entry:
-                              pop_recycled / alloc_and_register
-                                (refill originating free_queue, 1-in/1-out)
+                              pop local recycled / local done / alloc
+                                (top up originating free_queue)
                               resolve_host_ptr
-                              push_to_ready ──────────────────► wait_pop_ready
+                              push_to_ready(shard q) ─────────► wait_pop_ready(q)
                                                                 Derived::on_buffer_collected
                                                                   (copy records out)
-                                                                notify_copy_done
-                            ◄────────────────────────────────── (done_queue)
+                                                                notify_copy_done(q)
+                            ◄────────────────────────────────── done shard q
                             (next tick) drain into recycled
 
                                           ▲
                                           │
-                            proactive_replenish: top every
-                            free_queue up to kSlotCount;
-                            batch-alloc when a kind drains.
+                            split runtime replenish:
+                            drain done into shard-local
+                            recycled pools only.
 ```
 
-Both queues plus the per-kind recycled pools and the dev↔host map all
+The queue shards plus the shard-local recycled pools and the dev↔host map all
 live in the single `BufferPoolManager` instance owned by `ProfilerBase`.
-The mgmt thread is the only writer to the ready queue; the collector
-thread is the only writer to the done queue. Recycled pools are
-mgmt-only.
+Each ready shard has one collector consumer; each done shard is written by
+its matching collector and drained into the same recycled shard. Split drain
+refills the originating free queue on the hot path; split replenish no longer
+writes free queues at runtime.
 
 ## 5. Lifecycle
 
@@ -225,17 +251,17 @@ mgmt-only.
     assemble MemoryOps from stashed callbacks (sim mode installs an
       identity reg wrapper so register == nullptr is supported uniformly)
     manager_.set_memory_context(ops, shm_host, device_id)
-    spawn mgmt thread       ← started first; mgmt is the only writer to L2
-    spawn collector thread
+    spawn mgmt thread(s)    ← started first; mgmt writes host ready shards
+    spawn collector thread(s)
 
     ... AICPU / AICore execute ...
 
   ProfilerBase::stop()
     mgmt_running_ = false
-    join mgmt thread        ← mgmt's final-drain pass flushes the last
-                              entries into ready_queue before exiting
+    join mgmt thread(s)     ← mgmt final-drain flushes the last entries into
+                              ready shards before exiting
     execution_complete_ = true
-    join collector thread   ← drains ready_queue once more, then exits
+    join collector thread(s)← each shard drains once more, then exits
 
   Derived::finalize(unregister, free)
     manager_.release_owned_buffers([&](void* p) { unregister + free })
@@ -246,9 +272,9 @@ mgmt-only.
 
 The order in `stop()` is load-bearing: mgmt is joined **before**
 `execution_complete_` is signalled so its final-drain output has a
-consumer; the collector then drains and exits. On return both queues are
-empty and `on_buffer_collected` has been called for every entry that was
-in either queue.
+consumer; collectors then drain and exit. On return all host shards are
+empty and `on_buffer_collected` has been called for every entry that was in
+any shard.
 
 `Derived::finalize` is responsible for the buffers the collector still
 owns at stop time (`free_queue` slots and `current_buf_ptr`); the
@@ -261,19 +287,28 @@ mid-run by the framework.
 
 | State | Reader(s) | Writer(s) | Synchronization |
 | ----- | --------- | --------- | --------------- |
-| `ready_queue_` | collector | mgmt | `ready_mutex_` + `ready_cv_` |
-| `done_queue_` | mgmt | collector | `done_mutex_` |
-| `recycled_[kind]` | mgmt | mgmt | none (single-threaded access) |
-| `dev_to_host_` | mgmt (`alloc_and_register`, `resolve_host_ptr`) | mgmt | none during run; collector touches it only in `release_owned_buffers` / `clear_mappings`, after `stop()` has joined mgmt |
+| `ready_shards_[q]` | collector q | mgmt drain q | shard mutex + cv |
+| `done_shards_[q]` | mgmt / replenish | collector q | shard mutex |
+| `recycled_[shard][kind]` | drain shard / replenish | drain shard / replenish | shard/kind mutex |
+| `dev_to_host_` | mgmt (`alloc_and_register`, `resolve_host_ptr`) | mgmt | `mapping_mutex_`; collector touches it only in `release_owned_buffers` / `clear_mappings`, after `stop()` has joined mgmt |
 | `MemoryOps` / `shared_mem_host_` / `device_id_` | both threads | start-only | `set_memory_context` is called once before threads spawn; read-only afterwards |
-| AICPU per-thread ready queues (`header->queues[q]`) | mgmt (head advance) | AICPU (tail advance) | `rmb` / `wmb` paired with AICPU writers |
-| Per-instance `FreeQueue` | AICPU (head advance) | mgmt (tail advance) | `rmb` / `wmb` paired with AICPU readers |
+| AICPU per-thread ready queues (`header->queues[q]`) | mgmt (head advance) | AICPU (tail advance) | `read_range_from_device` in split drain, then `write_range_to_device` for `queue_heads[q]` |
+| Per-instance `FreeQueue` | AICPU (head advance) | mgmt (tail advance) | per-free-queue writer lock; host refreshes `head` before writing `buffer_ptrs[]` / `tail` |
 
 Two things follow:
 
-- `dev_to_host_` is unlocked because mgmt owns it during the run and the
-  collector only touches it when mgmt is joined. Adding a collector path
-  that mutates the map mid-run would require revisiting this.
+- `dev_to_host_` has a narrow mapping lock; recycled pools are split by
+  collector shard and kind so the hot drain/refill path mostly stays local.
+- Device-side queue backpressure is bounded for the profiling writers that
+  use this protocol. If the host does not make ready-queue space or
+  free-queue entries visible within the short wait budget, AICPU records a
+  drop and keeps the workload moving instead of spinning indefinitely.
+- The AICPU writer publishes a full buffer to the ready queue before
+  acquiring its replacement buffer. If no replacement is visible yet, the
+  current pointer is cleared and later records first try to recover from
+  the free queue before counting a per-record drop. This matters under a
+  one-buffer stress shape: the host cannot return a replacement until it
+  first observes the full ready buffer.
 - The mgmt thread must never zero AICPU-owned fields (`count`, `head`,
   `tail` on the AICPU side). The AICPU is the sole writer to those and
   resets them itself on flush/drop/pop.
@@ -301,11 +336,15 @@ Existing collectors are the canonical examples:
 
 - [`PmuCollector`](../src/a2a3/platform/include/host/pmu_collector.h)
   — single kind, per-core instances. See [pmu-profiling.md](dfx/pmu-profiling.md).
-- [`TensorDumpCollector`](../src/a2a3/platform/include/host/tensor_dump_collector.h)
+- [`DepGenCollector`](../src/a2a3/platform/include/host/dep_gen_collector.h)
+  — single kind, one instance. See [dep_gen.md](dfx/dep_gen.md).
+- [`TensorDumpCollector`](../src/common/platform/include/host/tensor_dump_collector.h)
   — single kind, per-AICPU-thread instances. See [args-dump.md](dfx/args-dump.md).
+- [`ScopeStatsCollector`](../src/common/platform/include/host/scope_stats_collector.h)
+  — single kind, one instance. See [scope-stats.md](dfx/scope-stats.md).
 - [`L2SwimlaneCollector`](../src/a2a3/platform/include/host/l2_swimlane_collector.h)
-  — two kinds (perf records + phase markers), per-core / per-thread
-  instances; the canonical multi-kind example. See
+  — four kinds (AICPU task, scheduler phase, orchestrator phase, AICore
+  task), per-core / per-thread instances; the canonical multi-kind example. See
   [l2-swimlane-profiling.md](dfx/l2-swimlane-profiling.md).
 
 ## 8. a5 specifics — host-shadow transport
@@ -338,8 +377,9 @@ changes capture that:
    **not** called from the mgmt loop — it would race with AICPU writes
    to device-only fields (`current_buf_ptr`, `total/dropped/mismatch`
    counters, `queue_tails`, `free_queue.head`,
-   `L2SwimlaneAicpuPhaseHeader::magic`, `core_to_thread[]`), rolling them back
-   to whatever the host shadow had at the start of the tick. Per-buffer payloads (`L2SwimlaneAicpuTaskBuffer` / `PmuBuffer` /
+   `L2SwimlaneAicpuPhaseHeader::magic`, `core_to_thread[]`), rolling them
+   back to whatever the host shadow had at the start of the tick. Per-buffer
+   payloads (`L2SwimlaneAicpuTaskBuffer` / `PmuBuffer` /
    `DumpMetaBuffer`) are still pulled on demand inside
    `ProfilerAlgorithms::process_entry` after resolving the host pointer
    for a popped ready entry. The bulk `mirror_shm_to_device` is kept
@@ -395,7 +435,7 @@ rotating `L2SwimlaneAicpuTaskBuffer` / `PmuBuffer` flips — flipping is now
 fully internal to `*_complete_record` and never crosses into Handshake.
 
 Everything else — Module concept contract, alloc policy
-(1-in/1-out + proactive replenish), `kIdleTimeoutSec` / `kSubsystemName`
+(drain-shard top-up + proactive replenish), `kIdleTimeoutSec` / `kSubsystemName`
 contract, mgmt-then-poll start/stop ordering, buffer-pool sizing
 constants — matches a2a3 exactly. New collectors should be reviewed
 against both arches when added.

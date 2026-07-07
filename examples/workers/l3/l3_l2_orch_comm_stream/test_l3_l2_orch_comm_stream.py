@@ -7,7 +7,10 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""Closed-loop L3-L2 in-flight orchestration communication stream example."""
+"""Closed-loop L3-L2 in-flight orchestration communication stream demo.
+
+This file is both a runnable example and a pytest scene-test entry.
+"""
 
 from __future__ import annotations
 
@@ -15,6 +18,7 @@ import ctypes
 import os
 import struct
 
+import pytest
 from simpler.l3_l2_orch_comm import NotifyOp, WaitCmp
 from simpler.task_interface import ArgDirection as D
 from simpler.task_interface import CallConfig, ChipCallable, CoreCallable, DataType, TaskArgs, scalar_to_uint64
@@ -162,3 +166,10 @@ def run_closed_loop_stream(platform: str, device_id: int) -> None:
         worker.run(orch, args=None, config=config)
     finally:
         worker.close()
+
+
+@pytest.mark.platforms(["a2a3sim", "a2a3", "a5sim", "a5"])
+@pytest.mark.device_count(1)
+@pytest.mark.runtime("tensormap_and_ringbuffer")
+def test_l3_l2_orch_comm_stream(st_platform, st_device_ids):
+    run_closed_loop_stream(st_platform, int(st_device_ids[0]))

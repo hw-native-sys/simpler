@@ -9,7 +9,7 @@
 # -----------------------------------------------------------------------------------------------------------
 """End-to-end distributed allreduce with selectable algorithm variant.
 
-Three algorithm modes are available via --mode:
+Five algorithm modes are available via --mode:
 
   onephase   (default) Mesh direct: read full vector from all peers, accumulate.
              Best for small P (2-4), simplest implementation.
@@ -20,6 +20,14 @@ Three algorithm modes are available via --mode:
   ring       Ring RS+AG: chunked reduce-scatter + allgather with neighbor barriers.
              Best for large P (8+), bandwidth-optimal (2*(P-1)/P * N).
 
+  bidirectional_ring  Two-ring bidirectional RS+AG on disjoint data halves.
+             Same 2(P-1) barrier count as unidirectional ring but doubles data
+             throughput per barrier by exploiting both HCCS directions.
+
+  ibing      IBing paper-faithful interleaved RS+AG (Zong et al., ACM TACO 2025).
+             P-1 rounds, exchange buffers, mixed AtomicAdd/AtomicNone phases.
+             Verified for P=2 (no forward phase).
+
 Each rank owns a private input/output tensor; cross-rank communication happens
 strictly inside the kernel, via a communication window scratch slot.
 
@@ -27,6 +35,7 @@ Run examples:
     python main.py -p a2a3sim -d 0-1 --mode onephase
     python main.py -p a2a3sim -d 0-3 --mode twophase
     python main.py -p a2a3sim -d 0-3 --mode ring
+    python main.py -p a2a3sim -d 0-3 --mode bidirectional_ring
 
 """
 
@@ -68,6 +77,8 @@ KERNEL_MAP = {
     "onephase": "kernels/aiv/allreduce_onephase_kernel.cpp",
     "twophase": "kernels/aiv/allreduce_twophase_kernel.cpp",
     "ring": "kernels/aiv/allreduce_ring_kernel.cpp",
+    "bidirectional_ring": "kernels/aiv/allreduce_bidirectional_ring_kernel.cpp",
+    "ibing": "kernels/aiv/allreduce_ibing_kernel.cpp",
 }
 ORCH_MAP = {
     "onephase": (
@@ -84,6 +95,16 @@ ORCH_MAP = {
         "kernels/orchestration/allreduce_ring_orch.cpp",
         "allreduce_ring_orchestration",
         "allreduce_ring_orchestration_config",
+    ),
+    "bidirectional_ring": (
+        "kernels/orchestration/allreduce_bidirectional_ring_orch.cpp",
+        "allreduce_bidirectional_ring_orchestration",
+        "allreduce_bidirectional_ring_orchestration_config",
+    ),
+    "ibing": (
+        "kernels/orchestration/allreduce_ibing_orch.cpp",
+        "allreduce_ibing_orchestration",
+        "allreduce_ibing_orchestration_config",
     ),
 }
 
@@ -110,6 +131,20 @@ def compute_scratch_params(mode: str, nranks: int) -> tuple[int, int, int]:
         chunk_elems = ALLREDUCE_COUNT // nranks
         float_elems = (nranks + 1) * chunk_elems
         signal_tail_nbytes = 2 * (nranks - 1) * K_MAX_SUPPORTED_RANKS * DTYPE_NBYTES
+        scratch_nbytes = float_elems * DTYPE_NBYTES + signal_tail_nbytes
+    elif mode == "bidirectional_ring":
+        # Two-ring push design: ALLREDUCE_COUNT floats + (2*(P-1)+1) signal rows.
+        subchunk_elems = ALLREDUCE_COUNT // (2 * nranks)
+        float_elems = 2 * nranks * subchunk_elems  # = ALLREDUCE_COUNT
+        signal_tail_nbytes = (2 * (nranks - 1) + 1) * K_MAX_SUPPORTED_RANKS * DTYPE_NBYTES
+        scratch_nbytes = float_elems * DTYPE_NBYTES + signal_tail_nbytes
+    elif mode == "ibing":
+        # IBing interleaved: (P+2)*chunk_elems floats + 2*(P-1)+1 signal rows.
+        # Double-barrier scheme (Barrier A + Barrier B per step) needs 2*(P-1)+1
+        # signal rows on all platforms (unified sim and NPU path).
+        chunk_elems = ALLREDUCE_COUNT // nranks
+        float_elems = (nranks + 2) * chunk_elems
+        signal_tail_nbytes = (2 * (nranks - 1) + 1) * K_MAX_SUPPORTED_RANKS * DTYPE_NBYTES
         scratch_nbytes = float_elems * DTYPE_NBYTES + signal_tail_nbytes
     else:
         raise ValueError(f"Unsupported allreduce mode: {mode!r}. Expected one of {tuple(KERNEL_MAP.keys())}.")
@@ -185,9 +220,19 @@ def run(
     if not (2 <= nranks <= K_MAX_SUPPORTED_RANKS):
         raise ValueError(f"allreduce needs between 2 and {K_MAX_SUPPORTED_RANKS} devices, got {nranks} ({device_ids})")
 
-    # Ring and twophase require ALLREDUCE_COUNT divisible by nranks.
-    if mode in ("twophase", "ring") and ALLREDUCE_COUNT % nranks != 0:
+    # Ring requires ALLREDUCE_COUNT divisible by nranks; bidirectional_ring
+    # (two-ring design) requires ALLREDUCE_COUNT divisible by 2*nranks.
+    # ibing requires ALLREDUCE_COUNT divisible by nranks (contiguous chunks).
+    # ibing is limited to P=2: for P>=4 the AtomicNone forward phase overwrites
+    # peer chunks that are not yet fully reduced (shared-memory push-model race).
+    if mode == "ibing" and nranks != 2:
+        raise ValueError(f"ibing mode is only supported for nranks=2, got nranks={nranks}")
+    if mode in ("twophase", "ring", "ibing") and ALLREDUCE_COUNT % nranks != 0:
         raise ValueError(f"ALLREDUCE_COUNT={ALLREDUCE_COUNT} must be divisible by nranks={nranks} for {mode} mode")
+    if mode in ("bidirectional_ring",) and ALLREDUCE_COUNT % (2 * nranks) != 0:
+        raise ValueError(
+            f"ALLREDUCE_COUNT={ALLREDUCE_COUNT} must be divisible by 2*nranks={2 * nranks} for {mode} mode"
+        )
 
     float_elems, scratch_nbytes, window_size = compute_scratch_params(mode, nranks)
 
@@ -278,9 +323,13 @@ def main() -> int:
     parser.add_argument(
         "-m",
         "--mode",
-        choices=["onephase", "twophase", "ring"],
+        choices=["onephase", "twophase", "ring", "bidirectional_ring", "ibing"],
         default="onephase",
-        help="Allreduce algorithm variant: onephase (mesh direct), twophase (mesh RS+AG), ring (ring RS+AG).",
+        help=(
+            "Allreduce algorithm variant: onephase (mesh direct), twophase (mesh RS+AG), "
+            "ring (ring RS+AG), bidirectional_ring (two-ring push RS+AG), "
+            "ibing (IBing interleaved bidirectional, Zong et al. 2025)."
+        ),
     )
     cli = parser.parse_args()
 

@@ -359,6 +359,20 @@ class Orchestrator:
             raise RuntimeError("create_l3_l2_region requires an Orchestrator bound to a Worker")
         return self._worker._create_l3_l2_region(int(worker_id), int(payload_bytes), int(counter_bytes))
 
+    def create_l3_l2_queue(self, *, worker_id: int, depth: int, input_arena_bytes: int, output_arena_bytes: int):
+        """Create an L3-L2 message queue backed by one L3-L2 communication region."""
+        if self._worker is None:
+            raise RuntimeError("create_l3_l2_queue requires an Orchestrator bound to a Worker")
+        from .l3_l2_message_queue import create_l3_l2_queue  # noqa: PLC0415
+
+        return create_l3_l2_queue(
+            self,
+            worker_id=int(worker_id),
+            depth=int(depth),
+            input_arena_bytes=int(input_arena_bytes),
+            output_arena_bytes=int(output_arena_bytes),
+        )
+
     # ------------------------------------------------------------------
     # Nested scope (Strict-1 per-scope rings)
     # ------------------------------------------------------------------

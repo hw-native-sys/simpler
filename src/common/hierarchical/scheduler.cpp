@@ -377,8 +377,7 @@ void Scheduler::dispatch_ready() {
             if (ok) {
                 for (int i = 0; i < N; i++) {
                     if (workers[static_cast<size_t>(i)] != nullptr) continue;
-                    auto *wt =
-                        cfg_.manager->pick_idle_excluding_eligible(s.worker_type, workers, s.eligible_workers_for(i));
+                    auto *wt = cfg_.manager->pick_idle(s.worker_type, workers, s.eligible_workers_for(i));
                     if (!wt) {
                         ok = false;
                         break;

@@ -46,23 +46,28 @@ _REQUIRED_TASK_FIELDS = (
 )
 
 
-def validate_perf_artifact(case_label: str, *, expected_task_count: int | None = None) -> None:
-    """Locate the latest output dir for ``case_label`` and run the full
+def validate_perf_artifact(case_label: str, *, since: float, expected_task_count: int | None = None) -> None:
+    """Locate this invocation's output dir for ``case_label`` and run the full
     capture-→-tools-→-differential sequence.
 
     Args:
         case_label: full SceneTest case label (``f"{cls_name}_{case_name}"``)
             used to glob the per-case ``outputs/<label>_<ts>/`` directory.
+        since: ``time.time()`` marker captured before the run. Only directories
+            created past it belong to this invocation; globbing by label alone
+            would also match stale dirs from prior runs/sessions with the same
+            label, letting their artifacts stand in for a missing current-run
+            output and mask a capture regression.
         expected_task_count: when provided, assert ``len(tasks) == N``.
             Workloads whose task count varies with sim/onboard timing should
             leave this ``None`` and rely on the differential gate.
     """
     safe_label = _sanitize_for_filename(case_label)
-    matches = sorted(_outputs_dir().glob(f"{safe_label}_*"), key=lambda p: p.stat().st_mtime)
-    if not matches:
-        return
-    perf = matches[-1] / "l2_swimlane_records.json"
-    assert perf.exists(), f"l2_swimlane_records.json missing under {matches[-1]} — swimlane capture failed?"
+    matches = [p for p in _outputs_dir().glob(f"{safe_label}_*") if p.stat().st_mtime >= since]
+    assert matches, f"no output dir for {safe_label!r} created this run — swimlane capture failed?"
+    out_dir = max(matches, key=lambda p: p.stat().st_mtime)
+    perf = out_dir / "l2_swimlane_records.json"
+    assert perf.exists(), f"l2_swimlane_records.json missing under {out_dir} — swimlane capture failed?"
 
     # Read via the swimlane_converter loader so v2 host JSON gets joined into
     # the v1-shaped dict the rest of this validator (and the differential
@@ -96,7 +101,7 @@ def validate_perf_artifact(case_label: str, *, expected_task_count: int | None =
             "simpler_setup.tools.swimlane_converter",
             str(perf),
             "-o",
-            str(matches[-1] / "_smoke_swimlane.json"),
+            str(out_dir / "_smoke_swimlane.json"),
         ],
         check=True,
         timeout=60,
@@ -137,7 +142,7 @@ def validate_perf_artifact(case_label: str, *, expected_task_count: int | None =
         f"AICPU likely didn't capture dispatch_time/finish_time cycle counters — "
         f"the L2 perf collector path may have regressed.\nstdout:\n{result.stdout}"
     )
-    verify_sched_overhead_differential(result.stdout, data, matches[-1])
+    verify_sched_overhead_differential(result.stdout, data, out_dir)
 
 
 def verify_sched_overhead_differential(stdout: str, perf: dict, artifact_dir: Path) -> None:

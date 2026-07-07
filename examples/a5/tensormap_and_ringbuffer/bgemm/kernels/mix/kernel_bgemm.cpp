@@ -50,8 +50,10 @@ using pto::TPipe;
 #endif
 
 #ifndef __aicore__
-#define __aicore__
+#define __aicore__ [aicore]
 #endif
+
+#include "intrinsic.h"
 
 #ifdef __DAV_CUBE__
 constexpr bool DAV_CUBE = true;
@@ -159,7 +161,8 @@ extern "C" __aicore__ void kernel_entry(__gm__ int64_t *args) {
     // Vector side: TPOP result from cube → TLOAD C from GM → TADD → TSTORE
     // =========================================================================
     if constexpr (DAV_VEC) {
-        uint32_t subBlockIdx = get_subblockid();
+        int32_t sub_id = get_sub_block_id(args);
+        uint32_t subBlockIdx = (sub_id >= 0) ? static_cast<uint32_t>(sub_id) : 0U;
 
         __gm__ float *c_ptr = reinterpret_cast<__gm__ float *>(c_tensor->buffer.addr) + c_tensor->start_offset;
         // Each vector sub-core handles its half: sub-core 0 → rows [0, VEC_M),

@@ -44,9 +44,11 @@ per-layer KV pools.
 The kernels are used essentially as generated, with **one hand-edit** to
 `fa_fused_aiv`: the codegen emitted the AIV sub-block id as a `[[block_local]]
 static` (`pypto_runtime_subblock_id`) whose **non-branch** `.text` relocation
-simpler's strict `.text`-only loader rejects. The fix swaps it for the pto-isa
-explicit-offset pattern (`setEntryOffset(get_sub_block_id(args) * …)`) — no
-per-core static, no relocation. See Status below.
+simpler's strict `.text`-only loader rejects. The fix swaps it for
+`setEntryOffset(get_sub_block_id(args) * …)` (legacy workaround). New MIX
+kernels should prefer direct `TPUSH`/`TPOP` per
+[docs/tpush-tpop.md](../../../docs/tpush-tpop.md). See
+Status below.
 
 To regenerate: in pypto-lib, set `_CHUNK_NLAYERS=2`, `PTO2_MANUAL_MAX_SEQ=5500`,
 build the ×2-stacked inputs, and `decode_fwd_layers.compile_for_test(...)`; then
@@ -99,6 +101,6 @@ static and macro, and apply the per-lane split explicitly on the tile-pipe in
 nothing) and the explicit offset carries the lane separation. No per-core static,
 no relocation — loads under the strict loader and computes correctly.
 
-The cleaner long-term fix is upstream codegen: have pto-isa emit the explicit
-`sub_block_id` offset directly, or have the runtime program the FFTS sub-block
-register so native `get_subblockid()` returns 0/1.
+The cleaner long-term fix is direct `TPUSH`/`TPOP` with platform-correct
+`get_subblockid()` (see [docs/tpush-tpop.md](../../../docs/tpush-tpop.md)
+and [`spmd_paged_attention`](../../../../tests/st/a2a3/tensormap_and_ringbuffer/spmd_paged_attention/kernels/mix/paged_attention_parallel.cpp)).
