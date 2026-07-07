@@ -252,7 +252,7 @@ private:
 
     void dispatch_shape(
         int32_t thread_idx, PTO2ResourceShape shape, CoreTracker::DispatchPhase phase, CoreTracker &tracker,
-        bool &entered_drain, bool &made_progress, bool &try_pushed
+        bool &entered_drain, bool &made_progress
     );
 
     // Speculative early-dispatch (Hook 1). After normal dispatch leaves idle
@@ -285,7 +285,7 @@ private:
     // not unbounded — once mix completes on at least one cluster, the next
     // pass either drains the residual or admits AIC/AIV.
     void dispatch_ready_tasks(
-        int32_t thread_idx, CoreTracker &tracker, bool pmu_active, bool &made_progress, bool &try_pushed
+        int32_t thread_idx, CoreTracker &tracker, bool pmu_active, bool &made_progress
     );
 
     // Returns true if any *other* scheduler thread currently has an idle core

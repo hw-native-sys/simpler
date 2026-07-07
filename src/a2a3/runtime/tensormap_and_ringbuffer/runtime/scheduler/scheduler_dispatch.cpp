@@ -272,7 +272,7 @@ int SchedulerContext::prepare_block_for_dispatch(
 
 void SchedulerContext::dispatch_shape(
     int32_t thread_idx, PTO2ResourceShape shape, CoreTracker::DispatchPhase phase, CoreTracker &tracker,
-    bool &entered_drain, bool &made_progress, bool &try_pushed
+    bool &entered_drain, bool &made_progress
 ) {
 #if PTO2_SCHED_PROFILING
     auto &l2_swimlane = sched_l2_swimlane_[thread_idx];
@@ -406,7 +406,6 @@ void SchedulerContext::dispatch_shape(
             }
 
             dispatched_any = true;
-            try_pushed = true;
             // Record for deferred dispatch_fanin propagation after this pop's
             // blocks are published (see after the loop). propagate's own guard
             // filters non-flagged slots, so recording unconditionally is cheap.
@@ -469,7 +468,7 @@ void SchedulerContext::dispatch_shape(
 }
 
 void SchedulerContext::dispatch_ready_tasks(
-    int32_t thread_idx, CoreTracker &tracker, bool pmu_active, bool &made_progress, bool &try_pushed
+    int32_t thread_idx, CoreTracker &tracker, bool pmu_active, bool &made_progress
 ) {
     using Phase = CoreTracker::DispatchPhase;
 
@@ -485,7 +484,7 @@ void SchedulerContext::dispatch_ready_tasks(
     bool entered_drain = false;
 
     // ===== IDLE stage =====
-    dispatch_shape(thread_idx, PTO2ResourceShape::MIX, Phase::IDLE, tracker, entered_drain, made_progress, try_pushed);
+    dispatch_shape(thread_idx, PTO2ResourceShape::MIX, Phase::IDLE, tracker, entered_drain, made_progress);
     if (entered_drain) return;
 
     // MIX-IDLE residual: AIC/AIV (both IDLE and PENDING) yield for this pass.
@@ -496,7 +495,7 @@ void SchedulerContext::dispatch_ready_tasks(
     if (!skip_aic_aiv) {
         for (int i = 0; i < 2; i++) {
             PTO2ResourceShape s = aic_aiv[i];
-            dispatch_shape(thread_idx, s, Phase::IDLE, tracker, entered_drain, made_progress, try_pushed);
+            dispatch_shape(thread_idx, s, Phase::IDLE, tracker, entered_drain, made_progress);
             if (entered_drain) return;
         }
     }
@@ -514,7 +513,7 @@ void SchedulerContext::dispatch_ready_tasks(
     // via pending slots on this thread when no peer is idle.
     if (!has_idle_in_other_threads(thread_idx, PTO2ResourceShape::MIX)) {
         dispatch_shape(
-            thread_idx, PTO2ResourceShape::MIX, Phase::PENDING, tracker, entered_drain, made_progress, try_pushed
+            thread_idx, PTO2ResourceShape::MIX, Phase::PENDING, tracker, entered_drain, made_progress
         );
         if (entered_drain) return;
     }
@@ -532,7 +531,7 @@ void SchedulerContext::dispatch_ready_tasks(
     for (int i = 0; i < 2; i++) {
         PTO2ResourceShape s = aic_aiv[i];
         if (has_idle_in_other_threads(thread_idx, s)) continue;
-        dispatch_shape(thread_idx, s, Phase::PENDING, tracker, entered_drain, made_progress, try_pushed);
+        dispatch_shape(thread_idx, s, Phase::PENDING, tracker, entered_drain, made_progress);
         if (entered_drain) return;
     }
 }
@@ -561,10 +560,8 @@ int32_t SchedulerContext::stage_consumer_blocks(
     CoreTracker::BitStates &idle, CoreTracker::BitStates &pend
 ) {
     CoreTracker &tracker = core_trackers_[thread_idx];
-    // Stamp the real pre-stage time (NOT 0) so the swimlane shows these blocks
-    // dispatched during the producer's run, not at trace start.
     uint64_t early_dispatch_ts = get_sys_cnt_aicpu();
-    uint64_t my_cores[PTO2_SPEC_CORE_MASK_WORDS] = {0};  // cores this thread gated (for self-ring)
+    uint64_t my_cores[PTO2_SPEC_CORE_MASK_WORDS] = {0};
     int32_t staged = 0;
     int32_t block = start;
     // Mirror the normal flush_publish (scheduler_dispatch.cpp wmb()+publish loop):
@@ -597,14 +594,15 @@ int32_t SchedulerContext::stage_consumer_blocks(
             my_cores[cid >> 6] |= (1ULL << (cid & 63));
         }
     }
-    // Publish all this thread's gated cores into the shared mask in one OR per word
-    // (vs one per subtask) so release sees them; seq_cst keeps the self-ring order.
+    // Single OR per word with release (was seq_cst). release suffices: the stager
+    // writes its bits before the OR, and the releaser acquires the mask after its
+    // CAS; the OR-release + CAS-acquire pair gives the needed happens-before.
     for (int w = 0; w < PTO2_SPEC_CORE_MASK_WORDS; w++)
-        if (my_cores[w] != 0) c->payload->staged_core_mask[w].fetch_or(my_cores[w], std::memory_order_seq_cst);
+        if (my_cores[w] != 0) c->payload->staged_core_mask[w].fetch_or(my_cores[w], std::memory_order_release);
 
     // If release already flipped DISPATCHED, it may have read the mask before our
     // bits landed — ring our own cores so none is left gated forever.
-    if (staged > 0 && c->payload->spec_state.load(std::memory_order_seq_cst) == PTO2_SPEC_DISPATCHED) {
+    if (staged > 0 && c->payload->spec_state.load(std::memory_order_acquire) == PTO2_SPEC_DISPATCHED) {
         for (int w = 0; w < PTO2_SPEC_CORE_MASK_WORDS; w++) {
             uint64_t bits = my_cores[w];
             while (bits != 0) {
@@ -956,8 +954,6 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
         }
 #endif
 
-        bool try_pushed = false;
-
         // Phase 2 drain check
         if (drain_state_.sync_start_pending.load(std::memory_order_acquire) != 0) {
             handle_drain_mode(thread_idx);
@@ -1115,7 +1111,7 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
 #if PTO2_PROFILING
         uint64_t dispatch_t0 = (l2_swimlane_level_ >= L2SwimlaneLevel::SCHED_PHASES) ? get_sys_cnt_aicpu() : 0;
 #endif
-        dispatch_ready_tasks(thread_idx, tracker, pmu_active, made_progress, try_pushed);
+        dispatch_ready_tasks(thread_idx, tracker, pmu_active, made_progress);
 #if PTO2_PROFILING
         // Emit Dispatch IMMEDIATELY after dispatch_ready_tasks so its span
         // covers the actual publish work — not the trailing second-poll /
@@ -1123,7 +1119,7 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
         // end with span extending past the second poll, which made finish_time
         // events from the second poll fall under the Dispatch bar rather than
         // a Complete bar of their own — confusing for trace consumers.)
-        if (dispatch_t0 != 0 && try_pushed && l2_swimlane.phase_dispatch_count > 0) {
+        if (dispatch_t0 != 0 && l2_swimlane.phase_dispatch_count > 0) {
             uint64_t dispatch_t1 = get_sys_cnt_aicpu();
             uint64_t pop_hit_delta = l2_swimlane.pop_hit - l2_swimlane.pop_hit_at_last_emit;
             uint64_t pop_miss_delta = l2_swimlane.pop_miss - l2_swimlane.pop_miss_at_last_emit;
@@ -1152,7 +1148,7 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
         // pending slots, so gating on "no ready work" keeps it from delaying a real
         // ready task; skipping the producer-fanout scan when busy also removes its
         // per-iteration cost (the discovery walk only runs on genuinely idle passes).
-        bool any_ready_work = try_pushed;
+        bool any_ready_work = false;
         for (int s = 0; !any_ready_work && s < PTO2_NUM_RESOURCE_SHAPES; s++) {
             if (sched_->ready_queues[s].size() > 0) any_ready_work = true;
         }
@@ -1186,66 +1182,14 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
         }
 #endif
 
-        // Second completion poll. dispatch_ready_tasks + try_speculative_early_dispatch
-        // above can take several us in a busy window; a producer block that FINs
-        // during them would otherwise wait for the NEXT iteration's top-of-loop
-        // Phase-1 poll (the ~7us detection latency that delays a flagged
-        // producer's doorbell). Re-polling here observes those FINs immediately,
-        // so the doorbell fires this iteration. Idempotent (the poll is a poll);
-        // we drain deferred releases eagerly to keep the buffer from growing.
-#if PTO2_PROFILING
-        uint64_t complete2_t0 = (l2_swimlane_level_ >= L2SwimlaneLevel::SCHED_PHASES) ? get_sys_cnt_aicpu() : 0;
-#endif
-        if (tracker.has_any_running_cores()) {
-            int32_t completed_2nd = 0;
-            check_running_cores_for_completion(
-                thread_idx, hank, completed_2nd, cur_thread_completed, made_progress, deferred_release_slot_states,
-                deferred_release_count
-            );
-            if (completed_2nd > 0) {
-#if PTO2_SCHED_PROFILING
-                sched_->tasks_completed.fetch_add(completed_2nd, std::memory_order_relaxed);
-#endif
-                completed_tasks_.fetch_add(completed_2nd, std::memory_order_relaxed);
-                last_progress_count = completed_tasks_.load(std::memory_order_relaxed);
-            }
-            // Eager drain so the second poll can't push deferred_release toward
-            // its cap between idle iterations.
-            while (deferred_release_count >= PTO2_DEFERRED_RELEASE_CAP - 96) {
-#if PTO2_SCHED_PROFILING
-                (void)sched_->on_task_release(*deferred_release_slot_states[--deferred_release_count], thread_idx);
-#else
-                sched_->on_task_release(*deferred_release_slot_states[--deferred_release_count]);
-#endif
-            }
-        }
-#if PTO2_PROFILING
-        // Complete2 outer phase: covers second-poll FIN observation. Without
-        // this emit, FIN counts from the second poll would carry over into the
-        // next iter's first-Complete bar and be displayed with a span that
-        // doesn't actually include those FINs' timestamps (visible mismatch
-        // between Complete bar span and per-task finish_time in Worker /
-        // Scheduler View).
-        if (complete2_t0 != 0 && (l2_swimlane.phase_complete_count > 0 || l2_swimlane.phase_subretire_count > 0)) {
-            uint64_t complete2_t1 = get_sys_cnt_aicpu();
-            int16_t phase_end_shared[L2SWIMLANE_NUM_QUEUE_SHAPES];
-            capture_phase_end_fresh(phase_end_shared);
-            l2_swimlane_aicpu_record_sched_phase(
-                thread_idx, L2SwimlaneSchedPhaseKind::Complete, complete2_t0, complete2_t1,
-                l2_swimlane.sched_loop_count, l2_swimlane.phase_complete_count + l2_swimlane.phase_subretire_count,
-                /*pop_hit=*/0,
-                /*pop_miss=*/0, phase_start_shared, phase_end_shared
-            );
-            for (int s = 0; s < L2SWIMLANE_NUM_QUEUE_SHAPES; s++)
-                phase_start_shared[s] = phase_end_shared[s];
-            _t0_phase = complete2_t1;
-            l2_swimlane.phase_complete_count = 0;
-            l2_swimlane.phase_subretire_count = 0;
-        }
+        // Second completion poll removed: Phase 1's poll at loop top already
+        // catches every FIN — the second poll only saved ~7us detection latency
+        // in rare busy windows but doubled the per-iteration MMIO poll cost
+        // (the dominant scheduler overhead on this workload).
 
         // Cycle-counter LAP for the iter tail. Dispatch's emit moved earlier
         // (see Phase 4 above) so this branch only routes the time accumulator.
-        if (!try_pushed) {
+        if (!any_ready_work) {
             CYCLE_COUNT_LAP(l2_swimlane.sched_idle_cycle);
         } else {
             CYCLE_COUNT_LAP(l2_swimlane.sched_dispatch_cycle);
@@ -1254,7 +1198,6 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
 
 #if !PTO2_PROFILING
         (void)try_completed;
-        (void)try_pushed;
 #endif
 
         if (made_progress) {
