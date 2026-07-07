@@ -381,9 +381,8 @@ void SchedulerContext::dispatch_shape(
                 }
             }
 
-            // (Speculative pre-staged tasks never reach this ready-pop: they are
-            // released by their doorbell in release_fanin_and_check_ready the
-            // instant their last producer completes — see try_speculative_release.)
+            // Fully staged speculative tasks skip this path via doorbell release.
+            // Partially released tasks can return here to dispatch unclaimed blocks.
 
             if (slot_state->active_mask.requires_sync_start()) {
                 if (is_pending) {
@@ -619,16 +618,7 @@ int32_t SchedulerContext::stage_consumer_blocks(
     // already flipped DISPATCHED before our mask OR landed, self-ring our cores.
     if (!sched_->maybe_ring_split_doorbell(*c) &&
         c->payload->spec_state.load(std::memory_order_acquire) == PTO2_SPEC_DISPATCHED) {
-        for (int w = 0; w < PTO2_SPEC_CORE_MASK_WORDS; w++) {
-            uint64_t bits = my_cores[w];
-            while (bits != 0) {
-                int cid = w * 64 + __builtin_ctzll(bits);
-                bits &= bits - 1;
-                PTO2SchedulerState::ring_one_doorbell(
-                    sched_->spec_doorbell_table[cid].addr, sched_->spec_doorbell_table[cid].token
-                );
-            }
-        }
+        sched_->ring_spec_core_mask(my_cores);
     }
     return staged;
 }

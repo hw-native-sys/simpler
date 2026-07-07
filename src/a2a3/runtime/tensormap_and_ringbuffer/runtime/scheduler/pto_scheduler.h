@@ -1076,6 +1076,38 @@ struct PTO2SchedulerState {
         }
     };
 
+    inline void ring_spec_core_mask_word(int word_idx, uint64_t bits) {
+        while (bits != 0) {
+            int core_id = word_idx * 64 + __builtin_ctzll(bits);
+            bits &= bits - 1;
+            ring_one_doorbell(spec_doorbell_table[core_id].addr, spec_doorbell_table[core_id].token);
+        }
+    }
+
+    inline void ring_spec_core_mask(const uint64_t core_mask[PTO2_SPEC_CORE_MASK_WORDS]) {
+        for (int w = 0; w < PTO2_SPEC_CORE_MASK_WORDS; w++) {
+            ring_spec_core_mask_word(w, core_mask[w]);
+        }
+    }
+
+    inline void ring_staged_core_mask(PTO2TaskSlotState &slot_state) {
+        for (int w = 0; w < PTO2_SPEC_CORE_MASK_WORDS; w++) {
+            uint64_t bits = slot_state.payload->staged_core_mask[w].load(std::memory_order_seq_cst);
+            ring_spec_core_mask_word(w, bits);
+        }
+    }
+
+    inline void finish_speculative_release(PTO2TaskSlotState &slot_state, SpecReleaseSink *sink = nullptr) {
+        ring_staged_core_mask(slot_state);
+        if (sink == nullptr || !sink->push(&slot_state)) {
+            propagate_dispatch_fanin(slot_state);
+        }
+    }
+
+    inline bool all_logical_blocks_claimed(PTO2TaskSlotState &slot_state) const {
+        return slot_state.next_block_idx.load(std::memory_order_acquire) >= slot_state.logical_block_num;
+    }
+
     // Split-placement doorbell gate. Rings only when (a) real fanin is complete,
     // (b) the task is FULLY staged (next_block_idx >= logical_block_num — prevents
     // a partial ring that would spin the launched blocks of a full-occupancy
@@ -1086,7 +1118,7 @@ struct PTO2SchedulerState {
     inline bool maybe_ring_split_doorbell(PTO2TaskSlotState &slot_state, SpecReleaseSink *sink = nullptr) {
         if (slot_state.payload->spec_state.load(std::memory_order_acquire) != PTO2_SPEC_STAGING) return false;
         if (slot_state.fanin_refcount.load(std::memory_order_acquire) < slot_state.fanin_count) return false;
-        if (slot_state.next_block_idx.load(std::memory_order_acquire) < slot_state.logical_block_num) return false;
+        if (!all_logical_blocks_claimed(slot_state)) return false;
         // total_required_subtasks = logical_block_num * popcount(active_mask) — TASK-level
         // total across ALL blocks (set once by the orchestrator). promoted_subtasks is
         // incremented per-subtask reaching a running slot (running-direct at stage,
@@ -1100,17 +1132,7 @@ struct PTO2SchedulerState {
                 expect, PTO2_SPEC_DISPATCHED, std::memory_order_seq_cst, std::memory_order_seq_cst
             ))
             return false;
-        for (int w = 0; w < PTO2_SPEC_CORE_MASK_WORDS; w++) {
-            uint64_t bits = slot_state.payload->staged_core_mask[w].load(std::memory_order_seq_cst);
-            while (bits != 0) {
-                int core_id = w * 64 + __builtin_ctzll(bits);
-                bits &= bits - 1;
-                ring_one_doorbell(spec_doorbell_table[core_id].addr, spec_doorbell_table[core_id].token);
-            }
-        }
-        if (sink == nullptr || !sink->push(&slot_state)) {
-            propagate_dispatch_fanin(slot_state);
-        }
+        finish_speculative_release(slot_state, sink);
         return true;
     }
 
@@ -1122,20 +1144,26 @@ struct PTO2SchedulerState {
             )) {
             return false;
         }
-        // Staged (STAGING). A STAGING task is exclusively owned by the early-
-        // dispatch drain — it must NEVER fall back to normal dispatch (which would
-        // build_payload with not_ready=1 but skip staged_core_mask / promoted_subtasks
-        // tracking, leaving those blocks invisible to the gate → deadlocked spin).
-        //
-        // maybe_ring fires now if all conditions are met (fully staged + fanin +
-        // promoted==total). If not yet fully staged, it leaves STAGING; the drain
-        // continues staging remaining blocks and re-checks via maybe_ring after each
-        // batch + on each pending subtask promote (Case 3.3).
-        //
-        // Return true unconditionally so release_fanin_and_check_ready does NOT push
-        // the task to the ready queue — the early-dispatch drain owns its lifecycle.
-        maybe_ring_split_doorbell(slot_state, sink);
-        return true;
+        // Staged (STAGING). Prefer the original fully-staged gate: it preserves the
+        // simultaneous-start contract when the drain already claimed every block
+        // and every subtask has promoted to a running slot.
+        if (maybe_ring_split_doorbell(slot_state, sink)) return true;
+
+        // Partial release escape hatch. If the task is not fully staged/promoted,
+        // release every block already staged by the speculative drain. Returning
+        // false below lets the caller put the remaining blocks back on the normal
+        // ready queue. Keeping the task in STAGING until all logical blocks are
+        // staged can deadlock: gated running slots are intentionally skipped by
+        // completion polling, so they cannot free the resources needed to stage
+        // the tail of the same task.
+        expect = PTO2_SPEC_STAGING;
+        if (!slot_state.payload->spec_state.compare_exchange_strong(
+                expect, PTO2_SPEC_DISPATCHED, std::memory_order_seq_cst, std::memory_order_seq_cst
+            )) {
+            return true;
+        }
+        finish_speculative_release(slot_state, sink);
+        return all_logical_blocks_claimed(slot_state);
     }
 
     bool release_fanin_and_check_ready(PTO2TaskSlotState &slot_state, SpecReleaseSink *sink = nullptr) {
