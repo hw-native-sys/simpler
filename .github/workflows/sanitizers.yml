@@ -41,9 +41,6 @@ jobs:
         with:
           submodules: recursive
 
-      - name: Load pinned pto-isa commit
-        uses: ./.github/actions/read-pto-isa
-
       - name: Set up C++ compiler
         run: |
           sudo add-apt-repository -y ppa:ubuntu-toolchain-r/test

@@ -180,9 +180,6 @@ jobs:
         with:
           submodules: recursive
 
-      - name: Load pinned pto-isa commit
-        uses: ./.github/actions/read-pto-isa
-
       - name: Set up C++ compiler
         run: |
           if [[ "${{ runner.os }}" == "Linux" ]]; then
@@ -268,9 +265,6 @@ jobs:
         uses: actions/checkout@v5
         with:
           submodules: recursive
-
-      - name: Load pinned pto-isa commit
-        uses: ./.github/actions/read-pto-isa
 
       - name: Set up C++ compiler
         run: |
@@ -461,9 +455,6 @@ jobs:
         with:
           submodules: recursive
 
-      - name: Load pinned pto-isa commit
-        uses: ./.github/actions/read-pto-isa
-
       - name: Set up environment
         run: |
           source /usr/local/Ascend/cann/set_env.sh
@@ -545,9 +536,6 @@ jobs:
         uses: actions/checkout@v5
         with:
           submodules: recursive
-
-      - name: Load pinned pto-isa commit
-        uses: ./.github/actions/read-pto-isa
 
       - name: Set up environment
         run: |
@@ -670,9 +658,6 @@ jobs:
         with:
           submodules: recursive
 
-      - name: Load pinned pto-isa commit
-        uses: ./.github/actions/read-pto-isa
-
       - name: Set up environment
         run: |
           python3 -m venv --system-site-packages .venv
@@ -745,9 +730,6 @@ jobs:
         uses: actions/checkout@v5
         with:
           submodules: recursive
-
-      - name: Load pinned pto-isa commit
-        uses: ./.github/actions/read-pto-isa
 
       - name: Set up environment
         run: |
