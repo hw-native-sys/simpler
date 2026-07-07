@@ -18,7 +18,7 @@ in its own kernel sources. The contract being verified:
       duration — there's no way a real run took zero steady-clock time;
     * the device-domain wall marker
       (``name=simpler_run.runner_run.device_wall``) is present with a positive
-      duration on the default SIMPLER_PROFILING build.
+      duration on the default SIMPLER_HOST_STRACE build.
 
 Markers go to stderr via the unified host logger, captured here with ``capfd``.
 """
@@ -106,7 +106,7 @@ def test_simpler_run_emits_strace_markers(st_platform, st_device_ids, capfd):
     host_durs = _strace_durs(err, "simpler_run")
     assert host_durs, (
         "no `[STRACE] ... name=simpler_run` marker found on stderr; "
-        "simpler_run stopped emitting host-trace markers (SIMPLER_PROFILING off, "
+        "simpler_run stopped emitting host-trace markers (SIMPLER_HOST_STRACE off, "
         "or the host logger V9 tier was suppressed)."
     )
     assert max(host_durs) > 0, f"simpler_run marker dur must be > 0 ns, got {host_durs}"
@@ -115,6 +115,6 @@ def test_simpler_run_emits_strace_markers(st_platform, st_device_ids, capfd):
     dev_durs = _strace_durs(err, "simpler_run.runner_run.device_wall")
     assert dev_durs, (
         "no device_wall [STRACE] marker found; the AICPU phase buffer readback "
-        "or marker emission regressed on the default SIMPLER_PROFILING build."
+        "or marker emission regressed on the default SIMPLER_HOST_STRACE build."
     )
     assert max(dev_durs) > 0, f"device_wall marker dur must be > 0 ns, got {dev_durs}"

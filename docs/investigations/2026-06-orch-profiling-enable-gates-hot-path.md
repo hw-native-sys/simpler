@@ -1,7 +1,7 @@
 # Gating the two residual profiling `enable()` calls left on the orch/scheduler hot path
 
 **Date**: 2026-06-25
-**Verdict**: applied (gated under the **existing** `PTO2_PROFILING`); magnitude
+**Verdict**: applied (gated under the **existing** `SIMPLER_DFX`); magnitude
 deliberately **not** measured; a new `PTO_PROFILING` macro was rejected.
 
 ## Question
@@ -24,12 +24,12 @@ the compiler cannot hoist it across the dispatch loop on its own"* — the team
 already treats the call cost as real enough to hand-hoist once.
 
 The answer is to move the toggle from run time to **compile time** via the
-existing `PTO2_PROFILING` macro, giving two regimes from one switch:
+existing `SIMPLER_DFX` macro, giving two regimes from one switch:
 
-- **Default build (`PTO2_PROFILING=1`)** keeps the full runtime toggle —
+- **Default build (`SIMPLER_DFX=1`)** keeps the full runtime toggle —
   profiling stays available and can be turned on/off dynamically, behavior
   unchanged.
-- **Perf-measurement and production inference builds (`PTO2_PROFILING=0`)**
+- **Perf-measurement and production inference builds (`SIMPLER_DFX=0`)**
   compile the gates *out entirely* — no branch, no call, no residual `if` — so
   the hot path runs at its best, paying nothing for an observation feature it
   isn't using.
@@ -42,13 +42,13 @@ proposed wrapping them in a compile macro so production inference can drop them.
 Swept every `is_*_enabled()` call site across both arches
 (`is_pmu_enabled`, `is_dep_gen_enabled`, `is_dump_args_enabled`,
 `is_scope_stats_enabled`, `is_l2_swimlane_enabled`) and classified each as
-gated/ungated by `PTO2_PROFILING`. Findings:
+gated/ungated by `SIMPLER_DFX`. Findings:
 
-- The existing `PTO2_PROFILING` compile macro
+- The existing `SIMPLER_DFX` compile macro
   (`src/common/task_interface/profiling_config.h`, default `1`) already wraps
   the **vast majority** of gates — `is_dump_args_enabled`,
   `is_scope_stats_enabled`, and most `is_pmu_enabled` sites compile out at
-  `PTO2_PROFILING=0`.
+  `SIMPLER_DFX=0`.
 - Exactly **two** hot-path sites per arch were ungated:
   1. `is_pmu_enabled()` in `scheduler_dispatch.cpp` — a2a3 already cached it
      once at function scope; a5 re-called it **per scheduler main-loop
@@ -60,12 +60,12 @@ gated/ungated by `PTO2_PROFILING`. Findings:
      once per task submission.
 
 Fix applied (issue #1146): gate both, both arches, under the **existing**
-`PTO2_PROFILING`. A new `PTO_PROFILING` macro was rejected — it would only
-duplicate `PTO2_PROFILING`. For the load-bearing PMU site the call is replaced,
+`SIMPLER_DFX`. A new `PTO_PROFILING` macro was rejected — it would only
+duplicate `SIMPLER_DFX`. For the load-bearing PMU site the call is replaced,
 not deleted, so the value stays well-defined when profiling is compiled out:
 
 ```cpp
-#if PTO2_PROFILING
+#if SIMPLER_DFX
     const bool pmu_active = is_pmu_enabled();
 #else
     // PMU is definitionally off when profiling is compiled out; hard-set false
@@ -75,24 +75,24 @@ not deleted, so the value stays well-defined when profiling is compiled out:
 ```
 
 The `dep_gen` per-task capture wraps the whole `if (is_dep_gen_enabled()) { ... }`
-block in `#if PTO2_PROFILING / #endif`. To keep the subsystem internally
+block in `#if SIMPLER_DFX / #endif`. To keep the subsystem internally
 consistent, the **three remaining cold `dep_gen` sites** were folded under the
 same macro: `dep_gen_aicpu_init` (`scheduler_cold_path.cpp`, one-time boot) and
 `dep_gen_aicpu_set_orch_thread_idx` / `dep_gen_aicpu_flush` (`aicpu_executor.cpp`,
 once per orch thread). Gating only the per-task capture would leave a half-on
-state at `PTO2_PROFILING=0` — buffer init + an empty flush, but no records —
+state at `SIMPLER_DFX=0` — buffer init + an empty flush, but no records —
 which is worse than a clean compile-out. This supersedes the previous in-tree
-comment that dep_gen was "gated independently of `PTO2_PROFILING`"; that comment
+comment that dep_gen was "gated independently of `SIMPLER_DFX`"; that comment
 was updated in the same change.
 
 ## Result
 
 The two hot-path gates plus the whole dep_gen subsystem (init / set_idx / flush)
-gated under `PTO2_PROFILING`, both arches, plus the a5 PMU gate hoisted to
+gated under `SIMPLER_DFX`, both arches, plus the a5 PMU gate hoisted to
 function scope to match a2a3 — no behavioral change at the default
-`PTO2_PROFILING=1`. All touched translation units (`scheduler_dispatch.cpp`,
+`SIMPLER_DFX=1`. All touched translation units (`scheduler_dispatch.cpp`,
 `pto_orchestrator.cpp`, `scheduler_cold_path.cpp`, `aicpu_executor.cpp`)
-`-fsyntax-only` clean under `PTO2_PROFILING=1` **and** `PTO2_PROFILING=0`.
+`-fsyntax-only` clean under `SIMPLER_DFX=1` **and** `SIMPLER_DFX=0`.
 
 **Magnitude is unmeasured.** No AICPU scheduler profile was taken. "Much
 slower" is mechanism-true (one non-inlinable call per iteration / per submit)
@@ -101,12 +101,12 @@ is the in-tree hand-hoist of the PMU gate; that is an argument, not a number.
 
 ## Why not (now)
 
-- **No new macro.** Reusing `PTO2_PROFILING` avoids a duplicate config
+- **No new macro.** Reusing `SIMPLER_DFX` avoids a duplicate config
   permutation (see `.claude/rules/env-macro-gating.md`).
 - **No benchmark.** The change is a zero-risk compile-out at the default build,
   so it shipped without first quantifying the win. If anyone needs to justify
   it harder, profile before claiming a number.
-- **The `PTO2_PROFILING=0` + dep_gen-enabled combo is given up on purpose.**
+- **The `SIMPLER_DFX=0` + dep_gen-enabled combo is given up on purpose.**
   Gating the whole dep_gen subsystem means a `=0` build can no longer capture
   dep graphs. That combo is exercised by nothing today — the only `=0` CI leg
   (`profiling-flags-smoke / pto2-off`) runs `vector_example`, which never
@@ -119,9 +119,9 @@ is the in-tree hand-hoist of the PMU gate; that is an argument, not a number.
 - If an AICPU scheduler profile shows either gate as a non-trivial slice of the
   dispatch loop / submit path, that turns the "unmeasured" caveat into a real
   number — record it here.
-- If a real need appears for capturing dep graphs in a `PTO2_PROFILING=0`
+- If a real need appears for capturing dep graphs in a `SIMPLER_DFX=0`
   build, the dep_gen subsystem would have to be split back out from
-  `PTO2_PROFILING` onto its own gate (host-driven, as it was before this
+  `SIMPLER_DFX` onto its own gate (host-driven, as it was before this
   change).
 
 ## References
@@ -129,5 +129,5 @@ is the in-tree hand-hoist of the PMU gate; that is an argument, not a number.
 - Issue [#1146](https://github.com/hw-native-sys/simpler/issues/1146) — the
   code-health issue this implements. Related: #1103.
 - `docs/.../tensormap_and_ringbuffer/docs/profiling_levels.md` — the
-  `PTO2_PROFILING` macro hierarchy and defaults.
+  `SIMPLER_DFX` macro hierarchy and defaults.
 - `.claude/rules/env-macro-gating.md` — why no new macro was added.

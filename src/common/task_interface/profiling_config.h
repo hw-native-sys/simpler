@@ -12,40 +12,40 @@
 #ifndef SRC_COMMON_TASK_INTERFACE_PROFILING_CONFIG_H_
 #define SRC_COMMON_TASK_INTERFACE_PROFILING_CONFIG_H_
 
-#ifndef PTO2_PROFILING
-#define PTO2_PROFILING 1
+#ifndef SIMPLER_DFX
+#define SIMPLER_DFX 1
 #endif
 
 // Gate for the host-side `[STRACE]` run-timing trace facility
-// (src/common/log/include/common/strace.h). Separate from PTO2_PROFILING (which
+// (src/common/log/include/common/strace.h). Separate from SIMPLER_DFX (which
 // gates the device orch/sched markers) so the host trace can be toggled
-// independently; default on, mirroring PTO2_PROFILING.
-#ifndef SIMPLER_PROFILING
-#define SIMPLER_PROFILING 1
+// independently; default on, mirroring SIMPLER_DFX.
+#ifndef SIMPLER_HOST_STRACE
+#define SIMPLER_HOST_STRACE 1
 #endif
 
-#ifndef PTO2_ORCH_PROFILING
-#define PTO2_ORCH_PROFILING 0
+#ifndef SIMPLER_ORCH_PROFILING
+#define SIMPLER_ORCH_PROFILING 0
 #endif
 
-#ifndef PTO2_SCHED_PROFILING
-#define PTO2_SCHED_PROFILING 0
+#ifndef SIMPLER_SCHED_PROFILING
+#define SIMPLER_SCHED_PROFILING 0
 #endif
 
-#ifndef PTO2_TENSORMAP_PROFILING
-#define PTO2_TENSORMAP_PROFILING 0
+#ifndef SIMPLER_TENSORMAP_PROFILING
+#define SIMPLER_TENSORMAP_PROFILING 0
 #endif
 
-#if PTO2_ORCH_PROFILING && !PTO2_PROFILING
-#error "PTO2_ORCH_PROFILING requires PTO2_PROFILING=1"
+#if SIMPLER_ORCH_PROFILING && !SIMPLER_DFX
+#error "SIMPLER_ORCH_PROFILING requires SIMPLER_DFX=1"
 #endif
 
-#if PTO2_SCHED_PROFILING && !PTO2_PROFILING
-#error "PTO2_SCHED_PROFILING requires PTO2_PROFILING=1"
+#if SIMPLER_SCHED_PROFILING && !SIMPLER_DFX
+#error "SIMPLER_SCHED_PROFILING requires SIMPLER_DFX=1"
 #endif
 
-#if PTO2_TENSORMAP_PROFILING && !PTO2_ORCH_PROFILING
-#error "PTO2_TENSORMAP_PROFILING requires PTO2_ORCH_PROFILING=1"
+#if SIMPLER_TENSORMAP_PROFILING && !SIMPLER_ORCH_PROFILING
+#error "SIMPLER_TENSORMAP_PROFILING requires SIMPLER_ORCH_PROFILING=1"
 #endif
 
 #endif  // SRC_COMMON_TASK_INTERFACE_PROFILING_CONFIG_H_

@@ -75,16 +75,16 @@ extern "C" __attribute__((visibility("default"))) int simpler_aicpu_exec(void *a
     // profiling-buffer bases are pushed here.
     set_platform_regs(k_args->regs);
     set_platform_dump_base(k_args->dump_data_base);
-    set_dump_args_enabled(GET_PROFILING_FLAG(k_args->enable_profiling_flag, PROFILING_FLAG_DUMP_TENSOR));
+    set_dump_args_enabled(SIMPLER_GET_DFX_FLAG(k_args->enable_profiling_flag, SIMPLER_DFX_FLAG_DUMP_TENSOR));
     set_platform_l2_swimlane_base(k_args->l2_swimlane_data_base);
     set_platform_l2_swimlane_aicore_rotation_table(k_args->l2_swimlane_aicore_rotation_table);
-    set_l2_swimlane_enabled(GET_PROFILING_FLAG(k_args->enable_profiling_flag, PROFILING_FLAG_L2_SWIMLANE));
+    set_l2_swimlane_enabled(SIMPLER_GET_DFX_FLAG(k_args->enable_profiling_flag, SIMPLER_DFX_FLAG_L2_SWIMLANE));
     set_platform_pmu_base(k_args->pmu_data_base);
     set_platform_pmu_reg_addrs(k_args->pmu_reg_addrs);
-    set_pmu_enabled(GET_PROFILING_FLAG(k_args->enable_profiling_flag, PROFILING_FLAG_PMU));
+    set_pmu_enabled(SIMPLER_GET_DFX_FLAG(k_args->enable_profiling_flag, SIMPLER_DFX_FLAG_PMU));
     set_platform_dep_gen_base(k_args->dep_gen_data_base);
-    set_dep_gen_enabled(GET_PROFILING_FLAG(k_args->enable_profiling_flag, PROFILING_FLAG_DEP_GEN));
-    set_scope_stats_enabled(GET_PROFILING_FLAG(k_args->enable_profiling_flag, PROFILING_FLAG_SCOPE_STATS));
+    set_dep_gen_enabled(SIMPLER_GET_DFX_FLAG(k_args->enable_profiling_flag, SIMPLER_DFX_FLAG_DEP_GEN));
+    set_scope_stats_enabled(SIMPLER_GET_DFX_FLAG(k_args->enable_profiling_flag, SIMPLER_DFX_FLAG_SCOPE_STATS));
     set_platform_scope_stats_base(k_args->scope_stats_data_base);
 
     // Filter-style affinity gate. Host computed ALLOWED_CPUS from AICPU

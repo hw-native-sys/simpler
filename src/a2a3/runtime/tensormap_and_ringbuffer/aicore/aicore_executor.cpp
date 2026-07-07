@@ -102,9 +102,9 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, in
     __gm__ PTO2DispatchPayload *payload = reinterpret_cast<__gm__ PTO2DispatchPayload *>(my_hank->task);
 
     uint32_t enable_profiling_flag = get_aicore_profiling_flag();
-    bool l2_swimlane_enabled = GET_PROFILING_FLAG(enable_profiling_flag, PROFILING_FLAG_L2_SWIMLANE);
-    bool dump_tensor_enabled = GET_PROFILING_FLAG(enable_profiling_flag, PROFILING_FLAG_DUMP_TENSOR);
-    bool pmu_enabled = GET_PROFILING_FLAG(enable_profiling_flag, PROFILING_FLAG_PMU);
+    bool l2_swimlane_enabled = SIMPLER_GET_DFX_FLAG(enable_profiling_flag, SIMPLER_DFX_FLAG_L2_SWIMLANE);
+    bool dump_tensor_enabled = SIMPLER_GET_DFX_FLAG(enable_profiling_flag, SIMPLER_DFX_FLAG_DUMP_TENSOR);
+    bool pmu_enabled = SIMPLER_GET_DFX_FLAG(enable_profiling_flag, SIMPLER_DFX_FLAG_PMU);
 
     // Per-core L2SwimlaneActiveHead channel. AICPU completes
     // `l2_swimlane_aicpu_init` (in pre_handshake_init) before any thread writes

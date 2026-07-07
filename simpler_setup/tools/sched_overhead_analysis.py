@@ -59,7 +59,7 @@ def compute_dag_stats_from_deps(deps_data, perf_data, threads):
     the AICPU to track fanout edge counts is duplicate work; running this in
     Python over the existing artifacts is cheaper, more accurate (deps.json
     captures #599 race-window edges that fanout[] dropped), and lets the
-    analysis work on default builds that don't have PTO2_SCHED_PROFILING=1.
+    analysis work on default builds that don't have SIMPLER_SCHED_PROFILING=1.
 
     Edge dedup: deps.json may carry multiple records for the same (pred, succ)
     pair (different ``source``: explicit / creator / tensormap). The runtime

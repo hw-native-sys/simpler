@@ -20,9 +20,9 @@
 #include <limits>
 #include <string>
 
-constexpr const char *PTO2_OP_EXECUTE_TIMEOUT_US_ENV = "PTO2_OP_EXECUTE_TIMEOUT_US";
-constexpr const char *PTO2_STREAM_SYNC_TIMEOUT_MS_ENV = "PTO2_STREAM_SYNC_TIMEOUT_MS";
-constexpr const char *PTO2_SCHEDULER_TIMEOUT_MS_ENV = "PTO2_SCHEDULER_TIMEOUT_MS";
+constexpr const char *SIMPLER_OP_EXECUTE_TIMEOUT_US_ENV = "SIMPLER_OP_EXECUTE_TIMEOUT_US";
+constexpr const char *SIMPLER_STREAM_SYNC_TIMEOUT_MS_ENV = "SIMPLER_STREAM_SYNC_TIMEOUT_MS";
+constexpr const char *SIMPLER_SCHEDULER_TIMEOUT_MS_ENV = "SIMPLER_SCHEDULER_TIMEOUT_MS";
 
 // Covers the host stream-sync window before the AICPU scheduler no-progress
 // timer is armed: cold kernel registration, orchestration SO dlopen, runtime
@@ -144,28 +144,29 @@ resolve_runtime_timeout_config(const RuntimeTimeoutConfig &defaults, RuntimeTime
     if (status != nullptr) {
         *status = RuntimeTimeoutParseStatus{};
     }
-    const char *op_env = std::getenv(PTO2_OP_EXECUTE_TIMEOUT_US_ENV);
+    const char *op_env = std::getenv(SIMPLER_OP_EXECUTE_TIMEOUT_US_ENV);
     if (op_env != nullptr) {
         if (status != nullptr) status->op_execute_env_set = true;
         bool ok = apply_runtime_timeout_override(
-            PTO2_OP_EXECUTE_TIMEOUT_US_ENV, op_env, 1, std::numeric_limits<uint64_t>::max(), &cfg.op_execute_timeout_us
+            SIMPLER_OP_EXECUTE_TIMEOUT_US_ENV, op_env, 1, std::numeric_limits<uint64_t>::max(),
+            &cfg.op_execute_timeout_us
         );
         if (status != nullptr) status->op_execute_valid = ok;
     }
-    const char *sync_env = std::getenv(PTO2_STREAM_SYNC_TIMEOUT_MS_ENV);
+    const char *sync_env = std::getenv(SIMPLER_STREAM_SYNC_TIMEOUT_MS_ENV);
     if (sync_env != nullptr) {
         if (status != nullptr) status->stream_sync_env_set = true;
         bool ok = apply_runtime_timeout_override(
-            PTO2_STREAM_SYNC_TIMEOUT_MS_ENV, sync_env, 1, static_cast<uint64_t>(std::numeric_limits<int32_t>::max()),
+            SIMPLER_STREAM_SYNC_TIMEOUT_MS_ENV, sync_env, 1, static_cast<uint64_t>(std::numeric_limits<int32_t>::max()),
             &cfg.stream_sync_timeout_ms
         );
         if (status != nullptr) status->stream_sync_valid = ok;
     }
-    const char *sched_env = std::getenv(PTO2_SCHEDULER_TIMEOUT_MS_ENV);
+    const char *sched_env = std::getenv(SIMPLER_SCHEDULER_TIMEOUT_MS_ENV);
     if (sched_env != nullptr) {
         if (status != nullptr) status->scheduler_env_set = true;
         bool ok = apply_runtime_timeout_override(
-            PTO2_SCHEDULER_TIMEOUT_MS_ENV, sched_env, 1, static_cast<uint64_t>(std::numeric_limits<int32_t>::max()),
+            SIMPLER_SCHEDULER_TIMEOUT_MS_ENV, sched_env, 1, static_cast<uint64_t>(std::numeric_limits<int32_t>::max()),
             &cfg.scheduler_timeout_ms
         );
         if (status != nullptr) status->scheduler_valid = ok;

@@ -86,7 +86,7 @@ the signal clears the noise floor:
    `dsb st` stops being amortized by record-write store-buffer latency).
 2. A single `--rounds N` invocation rather than N separate launches, so the
    per-launch outlier tail does not dominate the variance.
-3. Extract `sched_complete_cycle` from `PTO2_SCHED_PROFILING` builds — the bucket
+3. Extract `sched_complete_cycle` from `SIMPLER_SCHED_PROFILING` builds — the bucket
    the barrier contributes to — not just `sched_cost`.
 
 ## References

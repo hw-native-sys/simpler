@@ -9,15 +9,15 @@ This means a real local hang can take much longer to surface than it does in
 CI. CI restores the old fast-fail values with environment overrides:
 
 ```bash
-export PTO2_SCHEDULER_TIMEOUT_MS=2000
-export PTO2_OP_EXECUTE_TIMEOUT_US=3000000
-export PTO2_STREAM_SYNC_TIMEOUT_MS=4000
+export SIMPLER_SCHEDULER_TIMEOUT_MS=2000
+export SIMPLER_OP_EXECUTE_TIMEOUT_US=3000000
+export SIMPLER_STREAM_SYNC_TIMEOUT_MS=4000
 ```
 
 For sim-only runs, CI sets only:
 
 ```bash
-export PTO2_SCHEDULER_TIMEOUT_MS=5000
+export SIMPLER_SCHEDULER_TIMEOUT_MS=5000
 ```
 
 Use the same variables locally when you want faster failure while debugging a

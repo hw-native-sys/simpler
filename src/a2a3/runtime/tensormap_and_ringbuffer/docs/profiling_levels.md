@@ -14,35 +14,35 @@ file before using the macros, so both a2a3 and a5 share the same default
 values and compile-time checks.
 
 ```text
-PTO2_PROFILING (base level, default=1)
-├── PTO2_ORCH_PROFILING (orchestrator, default=0, requires PTO2_PROFILING=1)
-|   └──PTO2_TENSORMAP_PROFILING (tensormap, default=0, requires PTO2_ORCH_PROFILING=1)
-├── PTO2_SCHED_PROFILING (scheduler, default=0, requires PTO2_PROFILING=1)
-└── --enable-l2-swimlane [PERF_LEVEL] (L2 swimlane data collection, 0-4, bare=4, requires PTO2_PROFILING=1)
+SIMPLER_DFX (base level, default=1)
+├── SIMPLER_ORCH_PROFILING (orchestrator, default=0, requires SIMPLER_DFX=1)
+|   └──SIMPLER_TENSORMAP_PROFILING (tensormap, default=0, requires SIMPLER_ORCH_PROFILING=1)
+├── SIMPLER_SCHED_PROFILING (scheduler, default=0, requires SIMPLER_DFX=1)
+└── --enable-l2-swimlane [PERF_LEVEL] (L2 swimlane data collection, 0-4, bare=4, requires SIMPLER_DFX=1)
 
 ```
 
 ### Compile-Time Validation
 
-Each sub-level macro requires `PTO2_PROFILING=1`:
+Each sub-level macro requires `SIMPLER_DFX=1`:
 
 ```cpp
-#if PTO2_ORCH_PROFILING && !PTO2_PROFILING
-#error "PTO2_ORCH_PROFILING requires PTO2_PROFILING=1"
+#if SIMPLER_ORCH_PROFILING && !SIMPLER_DFX
+#error "SIMPLER_ORCH_PROFILING requires SIMPLER_DFX=1"
 #endif
 
-#if PTO2_SCHED_PROFILING && !PTO2_PROFILING
-#error "PTO2_SCHED_PROFILING requires PTO2_PROFILING=1"
+#if SIMPLER_SCHED_PROFILING && !SIMPLER_DFX
+#error "SIMPLER_SCHED_PROFILING requires SIMPLER_DFX=1"
 #endif
 
-#if PTO2_TENSORMAP_PROFILING && !PTO2_ORCH_PROFILING
-#error "PTO2_TENSORMAP_PROFILING requires PTO2_ORCH_PROFILING=1"
+#if SIMPLER_TENSORMAP_PROFILING && !SIMPLER_ORCH_PROFILING
+#error "SIMPLER_TENSORMAP_PROFILING requires SIMPLER_ORCH_PROFILING=1"
 #endif
 ```
 
 ## Profiling Levels
 
-### Level 0: No Profiling (PTO2_PROFILING=0)
+### Level 0: No Profiling (SIMPLER_DFX=0)
 
 **What's compiled:**
 
@@ -54,7 +54,7 @@ Each sub-level macro requires `PTO2_PROFILING=1`:
 **What's NOT compiled:**
 
 - All `CYCLE_COUNT_*` timing counters (`sched_*_cycle`, orchestrator cost counters)
-- Scheduler/Orchestrator profiling summary logs guarded by `#if PTO2_PROFILING`
+- Scheduler/Orchestrator profiling summary logs guarded by `#if SIMPLER_DFX`
 - Performance data collection paths (`enable_l2_swimlane` runtime flag becomes ineffective because profiling code is not compiled)
 
 **Log output (normal run, no stall):**
@@ -67,7 +67,7 @@ Each sub-level macro requires `PTO2_PROFILING=1`:
 
 ---
 
-### Level 1: Basic Profiling (PTO2_PROFILING=1)
+### Level 1: Basic Profiling (SIMPLER_DFX=1)
 
 **What's compiled:**
 
@@ -86,8 +86,8 @@ Each sub-level macro requires `PTO2_PROFILING=1`:
 
 - None on the device side. The per-thread `orch_start/orch_end/orch_cost`,
   `sched_start/sched_end/sched_cost`, and `Scheduler summary` lines are NOT
-  emitted at this level — `orch_*` is gated by `PTO2_ORCH_PROFILING` (Level 3),
-  `sched_*` and `Scheduler summary` by `PTO2_SCHED_PROFILING` (Level 2).
+  emitted at this level — `orch_*` is gated by `SIMPLER_ORCH_PROFILING` (Level 3),
+  `sched_*` and `Scheduler summary` by `SIMPLER_SCHED_PROFILING` (Level 2).
   Level 1 only feeds the host-side `Orch` / `Sched` `[STRACE]` timeline.
 
 **LOG_INFO_V9 count (normal run):**
@@ -98,14 +98,14 @@ Each sub-level macro requires `PTO2_PROFILING=1`:
 **Note:**
 
 - The host-side `[STRACE]` phase windows are controlled by compile-time macro
-  `PTO2_PROFILING`, not by `enable_l2_swimlane`.
+  `SIMPLER_DFX`, not by `enable_l2_swimlane`.
 - `enable_l2_swimlane` only controls shared-memory data collection / swimlane export.
 
 ---
 
-### Level 2: Scheduler Detailed Profiling (PTO2_SCHED_PROFILING=1)
+### Level 2: Scheduler Detailed Profiling (SIMPLER_SCHED_PROFILING=1)
 
-**Requires:** `PTO2_PROFILING=1`
+**Requires:** `SIMPLER_DFX=1`
 
 **What's compiled:**
 
@@ -116,7 +116,7 @@ Each sub-level macro requires `PTO2_PROFILING=1`:
 
 **Log output (per scheduler thread, normal run):** the `sched_start/sched_end/
 sched_cost` line, the full phase breakdown, and the `Scheduler summary` line
-(all gated by `PTO2_SCHED_PROFILING`). The `Scheduler summary` line first
+(all gated by `SIMPLER_SCHED_PROFILING`). The `Scheduler summary` line first
 appears at this level — it is not emitted at Level 1.
 
 **Scheduler output:**
@@ -148,9 +148,9 @@ captured at l2_swimlane_level >= 3) and `deps.json`; consume them via
 
 ---
 
-### Level 3: Orchestrator Detailed Profiling (PTO2_ORCH_PROFILING=1)
+### Level 3: Orchestrator Detailed Profiling (SIMPLER_ORCH_PROFILING=1)
 
-**Requires:** `PTO2_PROFILING=1`
+**Requires:** `SIMPLER_DFX=1`
 
 **What's compiled:**
 
@@ -162,9 +162,9 @@ captured at l2_swimlane_level >= 3) and `deps.json`; consume them via
 
 **Log output (per orchestrator thread, normal run):** the orchestrator phase
 breakdown, followed by the `orch_start/orch_end/orch_cost` line and the
-`PTO2 total submitted tasks` line — all gated by `PTO2_ORCH_PROFILING`. This
+`PTO2 total submitted tasks` line — all gated by `SIMPLER_ORCH_PROFILING`. This
 level adds orchestrator-side logs only; the scheduler side is unchanged from
-Level 1 (add `PTO2_SCHED_PROFILING` / Level 2 for scheduler detail).
+Level 1 (add `SIMPLER_SCHED_PROFILING` / Level 2 for scheduler detail).
 
 **Orchestrator output:**
 
@@ -184,13 +184,13 @@ Thread X: orch_start=XXX orch_end=XXX orch_cost=XXXus
 PTO2 total submitted tasks = XXX, already executed XXX tasks
 ```
 
-**Note:** Orchestrator logs always print when `PTO2_ORCH_PROFILING=1`, regardless of `enable_l2_swimlane` flag.
+**Note:** Orchestrator logs always print when `SIMPLER_ORCH_PROFILING=1`, regardless of `enable_l2_swimlane` flag.
 
 ---
 
-### Level 4: TensorMap Profiling (PTO2_TENSORMAP_PROFILING=1)
+### Level 4: TensorMap Profiling (SIMPLER_TENSORMAP_PROFILING=1)
 
-**Requires:** `PTO2_PROFILING=1` AND `PTO2_ORCH_PROFILING=1`
+**Requires:** `SIMPLER_DFX=1` AND `SIMPLER_ORCH_PROFILING=1`
 
 **What's compiled:**
 
@@ -201,7 +201,7 @@ PTO2 total submitted tasks = XXX, already executed XXX tasks
 
 **Log output (per orchestrator thread, normal run):** all Level 3 orchestrator
 output plus the 4-line TensorMap lookup stats block below (gated by
-`PTO2_TENSORMAP_PROFILING`, nested inside `PTO2_ORCH_PROFILING`).
+`SIMPLER_TENSORMAP_PROFILING`, nested inside `SIMPLER_ORCH_PROFILING`).
 
 **TensorMap output:**
 
@@ -220,7 +220,7 @@ Thread X:   overlap checks : XXX, hits=XXX (XX.X%)
 mirrors the PMU pattern — two independent channels (one binary, one int):
 
 - **Binary on/off** — `KernelArgs::enable_profiling_flag` bit1
-  (`PROFILING_FLAG_L2_SWIMLANE`). Set by the host whenever level > 0; read
+  (`SIMPLER_DFX_FLAG_L2_SWIMLANE`). Set by the host whenever level > 0; read
   by AICore (which only needs on/off to decide whether to write timing) and
   by AICPU kernel entry via `set_l2_swimlane_enabled(bool)`.
 - **Granular level (0–4)** — `L2SwimlaneDataHeader::l2_swimlane_level`
@@ -321,44 +321,44 @@ shared-memory field and mirrors `PmuEventType : uint32_t`):
 
 ```bash
 # No profiling overhead
-PTO2_PROFILING=0
+SIMPLER_DFX=0
 ```
 
 ### Basic Performance Monitoring
 
 ```bash
 # Minimal overhead, summary logs only
-PTO2_PROFILING=1
-PTO2_ORCH_PROFILING=0
-PTO2_SCHED_PROFILING=0
+SIMPLER_DFX=1
+SIMPLER_ORCH_PROFILING=0
+SIMPLER_SCHED_PROFILING=0
 ```
 
 ### Scheduler Performance Analysis
 
 ```bash
 # Detailed scheduler breakdown
-PTO2_PROFILING=1
-PTO2_ORCH_PROFILING=0
-PTO2_SCHED_PROFILING=1
+SIMPLER_DFX=1
+SIMPLER_ORCH_PROFILING=0
+SIMPLER_SCHED_PROFILING=1
 ```
 
 ### Orchestrator Performance Analysis
 
 ```bash
 # Detailed orchestrator breakdown
-PTO2_PROFILING=1
-PTO2_ORCH_PROFILING=1
-PTO2_SCHED_PROFILING=0
+SIMPLER_DFX=1
+SIMPLER_ORCH_PROFILING=1
+SIMPLER_SCHED_PROFILING=0
 ```
 
 ### Full Profiling (maximum overhead)
 
 ```bash
 # All profiling features enabled
-PTO2_PROFILING=1
-PTO2_ORCH_PROFILING=1
-PTO2_SCHED_PROFILING=1
-PTO2_TENSORMAP_PROFILING=1
+SIMPLER_DFX=1
+SIMPLER_ORCH_PROFILING=1
+SIMPLER_SCHED_PROFILING=1
+SIMPLER_TENSORMAP_PROFILING=1
 ```
 
 ---
@@ -386,8 +386,8 @@ any header includes `profiling_config.h`; do not add duplicated fallback
 definitions to runtime headers.
 
 ```cpp
-#define PTO2_PROFILING 1
-#define PTO2_ORCH_PROFILING 1
+#define SIMPLER_DFX 1
+#define SIMPLER_ORCH_PROFILING 1
 #include "pto_runtime2_types.h"
 ```
 
@@ -399,11 +399,11 @@ definitions to runtime headers.
 
 | Level | Macro Settings | LOG_INFO_V9 Count | Description |
 | ----- | -------------- | ----------------- | ----------- |
-| 0 | `PTO2_PROFILING=0` | 0 | No timing output |
-| 1 | `PTO2_PROFILING=1` | 0 | Host-side `Orch`/`Sched` `[STRACE]` windows only; no device logs |
-| 2 | `+PTO2_SCHED_PROFILING=1` | per sched thread | `sched_start` + phase breakdown + `Scheduler summary` |
-| 3 | `+PTO2_ORCH_PROFILING=1` | per orch thread | Orchestrator phase breakdown + `orch_start` + `PTO2 total` |
-| 4 | `+PTO2_TENSORMAP_PROFILING=1` | per orch thread | + TensorMap lookup stats (4 lines) |
+| 0 | `SIMPLER_DFX=0` | 0 | No timing output |
+| 1 | `SIMPLER_DFX=1` | 0 | Host-side `Orch`/`Sched` `[STRACE]` windows only; no device logs |
+| 2 | `+SIMPLER_SCHED_PROFILING=1` | per sched thread | `sched_start` + phase breakdown + `Scheduler summary` |
+| 3 | `+SIMPLER_ORCH_PROFILING=1` | per orch thread | Orchestrator phase breakdown + `orch_start` + `PTO2 total` |
+| 4 | `+SIMPLER_TENSORMAP_PROFILING=1` | per orch thread | + TensorMap lookup stats (4 lines) |
 
 ---
 
@@ -412,7 +412,7 @@ definitions to runtime headers.
 ### Key Principles
 
 1. **Macros control compilation and logging**
-   - `#if PTO2_PROFILING` controls whether profiling code is compiled
+   - `#if SIMPLER_DFX` controls whether profiling code is compiled
    - Logs print when macro is enabled, regardless of runtime flag
 
 2. **Runtime flag controls data collection**

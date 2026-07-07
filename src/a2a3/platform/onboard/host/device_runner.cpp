@@ -260,12 +260,12 @@ int DeviceRunner::run(Runtime &runtime, const CallConfig &config) {
     }
 
     // Build the profiling-flag bitfield (a2a3 carries an extra dep_gen bit).
-    uint32_t enable_profiling_flag = PROFILING_FLAG_NONE;
-    if (enable_dump_tensor_) SET_PROFILING_FLAG(enable_profiling_flag, PROFILING_FLAG_DUMP_TENSOR);
-    if (enable_l2_swimlane_) SET_PROFILING_FLAG(enable_profiling_flag, PROFILING_FLAG_L2_SWIMLANE);
-    if (enable_pmu_) SET_PROFILING_FLAG(enable_profiling_flag, PROFILING_FLAG_PMU);
-    if (enable_dep_gen_) SET_PROFILING_FLAG(enable_profiling_flag, PROFILING_FLAG_DEP_GEN);
-    if (enable_scope_stats_) SET_PROFILING_FLAG(enable_profiling_flag, PROFILING_FLAG_SCOPE_STATS);
+    uint32_t enable_profiling_flag = SIMPLER_DFX_FLAG_NONE;
+    if (enable_dump_tensor_) SIMPLER_SET_DFX_FLAG(enable_profiling_flag, SIMPLER_DFX_FLAG_DUMP_TENSOR);
+    if (enable_l2_swimlane_) SIMPLER_SET_DFX_FLAG(enable_profiling_flag, SIMPLER_DFX_FLAG_L2_SWIMLANE);
+    if (enable_pmu_) SIMPLER_SET_DFX_FLAG(enable_profiling_flag, SIMPLER_DFX_FLAG_PMU);
+    if (enable_dep_gen_) SIMPLER_SET_DFX_FLAG(enable_profiling_flag, SIMPLER_DFX_FLAG_DEP_GEN);
+    if (enable_scope_stats_) SIMPLER_SET_DFX_FLAG(enable_profiling_flag, SIMPLER_DFX_FLAG_SCOPE_STATS);
     kernel_args_.args.enable_profiling_flag = enable_profiling_flag;
 
     if (prepare_runtime_for_launch(runtime, block_dim, launch_aicpu_num) != 0) return -1;

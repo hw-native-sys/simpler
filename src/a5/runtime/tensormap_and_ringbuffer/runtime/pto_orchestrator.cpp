@@ -36,7 +36,7 @@
 #include "pto_types.h"
 #include "tensor.h"
 
-#if PTO2_PROFILING
+#if SIMPLER_DFX
 #include "aicpu/tensor_dump_aicpu.h"
 #endif
 
@@ -60,7 +60,7 @@ __attribute__((weak, visibility("hidden"))) void dep_gen_aicpu_record_submit(
     uint64_t, bool, int, const void *const *, const uint8_t *, int, const uint64_t *, int, const int32_t[3]
 ) {}
 
-#if PTO2_PROFILING
+#if SIMPLER_DFX
 #include "aicpu/scope_stats_collector_aicpu.h"
 
 // Scope_stats enable gate, queried via the same predicate idiom as
@@ -78,7 +78,7 @@ extern "C" __attribute__((weak, visibility("hidden"))) void scope_stats_note_hea
 // =============================================================================
 // Orchestrator Profiling (compile-time toggle)
 // =============================================================================
-#if PTO2_ORCH_PROFILING
+#if SIMPLER_ORCH_PROFILING
 #include "aicpu/device_time.h"
 #include "aicpu/l2_swimlane_collector_aicpu.h"
 // Weak fallback for builds that don't link device_time.cpp (e.g. host).
@@ -133,7 +133,7 @@ uint64_t g_orch_scope_end_atomic_count = 0;
             l2_swimlane_aicpu_record_orch_phase(_submit_start_ts, _t1, (tid), g_orch_submit_idx); \
         }                                                                                         \
     } while (0)
-#elif PTO2_PROFILING
+#elif SIMPLER_DFX
 #include "aicpu/device_time.h"
 #include "aicpu/l2_swimlane_collector_aicpu.h"
 __attribute__((weak, visibility("hidden"))) uint64_t get_sys_cnt_aicpu() { return 0; }
@@ -179,7 +179,7 @@ static int32_t orch_mark_fatal(PTO2OrchestratorState *orch, int32_t error_code) 
 static void
 orch_report_fatal_v(PTO2OrchestratorState *orch, int32_t error_code, const char *func, const char *fmt, va_list args) {
     int32_t latched_code = orch_mark_fatal(orch, error_code);
-#if PTO2_PROFILING
+#if SIMPLER_DFX
     // Flush the active scope's peaks before the FATAL line so the diagnostic
     // context lands adjacent in the log. Latched internally — safe to call
     // from every cascaded report_fatal.
@@ -308,7 +308,7 @@ static bool append_fanin_or_fail(
         fanout_now = static_cast<int32_t>(prod_state->fanout_count & ~PTO2_FANOUT_SCOPE_BIT);
     }
     prod_state->unlock_fanout();
-#if PTO2_ORCH_PROFILING
+#if SIMPLER_ORCH_PROFILING
     // lock + unlock always; one fanout_count store when we actually claim.
     g_orch_args_atomic_count += claim ? 3 : 2;
 #endif
@@ -363,7 +363,7 @@ void PTO2OrchestratorState::mark_dep_pool_position(PTO2TaskSlotState &slot_state
     PTO2SchedulerState *sched = scheduler;
     auto &rss = sched->ring_sched_states[slot_state.ring_id];
     slot_state.dep_pool_mark = rss.dep_pool.top;
-#if PTO2_PROFILING
+#if SIMPLER_DFX
     if (is_scope_stats_enabled()) {
         rss.publish_dep_pool_snapshot();
     }
@@ -589,7 +589,7 @@ void PTO2OrchestratorState::begin_scope(PTO2ScopeMode mode) {
     if (mode == PTO2ScopeMode::MANUAL && !already_in_manual_scope) {
         orch->manual_begin_depth = orch->scope_stack_top;
     }
-#if PTO2_PROFILING
+#if SIMPLER_DFX
     // Gate via is_scope_stats_enabled() (weak-false in host builds) BEFORE the
     // collector call: when disabled we pay nothing. Sample the current ring's
     // task/heap start-end and tensormap usage at the scope boundary.
@@ -619,7 +619,7 @@ void PTO2OrchestratorState::end_scope() {
     // Snapshot the ring start/end BEFORE the orchestrator drains pending tasks
     // via scheduler->on_scope_end, so the end record reflects the scope's
     // occupancy at close, not the residual after teardown.
-#if PTO2_PROFILING
+#if SIMPLER_DFX
     // Gate via is_scope_stats_enabled() (see begin_scope). One collector call
     // emits the end-boundary record and tears down bookkeeping.
     if (is_scope_stats_enabled()) {
@@ -637,7 +637,7 @@ void PTO2OrchestratorState::end_scope() {
     }
 #endif
 
-#if PTO2_ORCH_PROFILING
+#if SIMPLER_ORCH_PROFILING
     uint64_t _se0 = get_sys_cnt_aicpu();
 #endif
 
@@ -655,7 +655,7 @@ void PTO2OrchestratorState::end_scope() {
     // Rewind the task buffer — these entries are no longer needed
     orch->scope_tasks_size = begin;
 
-#if PTO2_ORCH_PROFILING
+#if SIMPLER_ORCH_PROFILING
     uint64_t _se1 = get_sys_cnt_aicpu();
     g_orch_scope_end_cycle += (_se1 - _se0);
 #endif
@@ -792,7 +792,7 @@ static TaskOutputTensors submit_task_common(
     // these records offline to reconstruct the complete dep graph — the sole
     // source of truth for fanout now that the swimlane hot path no longer
     // records it.
-#if PTO2_PROFILING
+#if SIMPLER_DFX
     if (is_dep_gen_enabled()) {
         const void *tensor_ptrs[MAX_TENSOR_ARGS];
         // TensorArgType is `enum class : int32_t` (4 bytes); the on-disk record
@@ -827,7 +827,7 @@ static TaskOutputTensors submit_task_common(
 
     CYCLE_COUNT_LAP(g_orch_alloc_cycle);
 
-#if PTO2_PROFILING
+#if SIMPLER_DFX
     if (layout.total_output_size > 0) {
         orch->buffers_allocated++;
         orch->bytes_allocated += layout.total_output_size;
@@ -935,7 +935,7 @@ static TaskOutputTensors submit_task_common(
     }
 
     payload.init(args, result, prepared.alloc_result, layout);
-#if PTO2_PROFILING
+#if SIMPLER_DFX
     if (is_dump_args_enabled()) {
         if (args.scalar_count() > 0) {
             set_dump_args_task_scalar_dtypes(
@@ -978,9 +978,9 @@ static TaskOutputTensors submit_task_common(
     CYCLE_COUNT_LAP(g_orch_fanin_cycle);
     CYCLE_COUNT_ORCH_SUBMIT_RECORD(task_id.raw);
 
-#if PTO2_PROFILING
+#if SIMPLER_DFX
     orch->tasks_submitted++;
-#if PTO2_ORCH_PROFILING
+#if SIMPLER_ORCH_PROFILING
     g_orch_submit_count++;
 #endif
     g_orch_submit_idx++;
@@ -1127,7 +1127,7 @@ TaskOutputTensors PTO2OrchestratorState::alloc_tensors(const L0TaskArgs &args) {
 
     CYCLE_COUNT_LAP(g_orch_alloc_cycle);
 
-#if PTO2_PROFILING
+#if SIMPLER_DFX
     if (layout.total_output_size > 0) {
         orch->buffers_allocated++;
         orch->bytes_allocated += layout.total_output_size;
@@ -1165,9 +1165,9 @@ TaskOutputTensors PTO2OrchestratorState::alloc_tensors(const L0TaskArgs &args) {
     CYCLE_COUNT_LAP(g_orch_fanin_cycle);
     CYCLE_COUNT_ORCH_SUBMIT_RECORD(prepared.task_id.raw);
 
-#if PTO2_PROFILING
+#if SIMPLER_DFX
     orch->tasks_submitted++;
-#if PTO2_ORCH_PROFILING
+#if SIMPLER_ORCH_PROFILING
     g_orch_submit_count++;
 #endif
     g_orch_submit_idx++;
@@ -1199,12 +1199,12 @@ void PTO2OrchestratorState::mark_done() {
     orch->scope_tasks_size = 0;
     orch->scope_stack_top = -1;
     orch->manual_begin_depth = PTO2_MAX_SCOPE_DEPTH;
-#if !PTO2_ORCH_PROFILING && PTO2_PROFILING
+#if !SIMPLER_ORCH_PROFILING && SIMPLER_DFX
     g_orch_submit_idx = 0;
 #endif
 }
 
-#if PTO2_ORCH_PROFILING
+#if SIMPLER_ORCH_PROFILING
 PTO2OrchProfilingData orchestrator_get_profiling() {
     PTO2OrchProfilingData d;
     d.sync_cycle = g_orch_sync_cycle;

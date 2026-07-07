@@ -165,7 +165,7 @@ jobs:
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     env:
-      PTO2_SCHEDULER_TIMEOUT_MS: "5000"
+      SIMPLER_SCHEDULER_TIMEOUT_MS: "5000"
     strategy:
       matrix:
         os: [ubuntu-latest, macos-latest]
@@ -248,7 +248,7 @@ jobs:
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     env:
-      PTO2_SCHEDULER_TIMEOUT_MS: "5000"
+      SIMPLER_SCHEDULER_TIMEOUT_MS: "5000"
     strategy:
       matrix:
         os: [ubuntu-latest, macos-latest]
@@ -326,10 +326,10 @@ jobs:
             --require-pto-isa --dump-args
 
   # ---------- Profiling sub-flags smoke (compile + run) ----------
-  # PTO2_PROFILING / PTO2_ORCH_PROFILING / PTO2_SCHED_PROFILING /
-  # PTO2_TENSORMAP_PROFILING are compile-time gates whose defaults and
+  # SIMPLER_DFX / SIMPLER_ORCH_PROFILING / SIMPLER_SCHED_PROFILING /
+  # SIMPLER_TENSORMAP_PROFILING are compile-time gates whose defaults and
   # dependency checks live in src/common/task_interface/profiling_config.h.
-  # The defaults (PTO2_PROFILING=1, sub-flags=0) are exercised by every CI job,
+  # The defaults (SIMPLER_DFX=1, sub-flags=0) are exercised by every CI job,
   # but non-default branches are otherwise dead coverage: a developer flipping
   # any of them for perf debugging or to minimize logging overhead had no gate
   # protecting the gated code from drift (renamed fields, changed signatures,
@@ -344,7 +344,7 @@ jobs:
   # Combos walk the macro hierarchy explicitly (not just "all on" or "all
   # off") so log scrubbing the failing leg pinpoints the specific gate:
   #
-  #   PTO2_PROFILING (default=1, covered by every other CI job)
+  #   SIMPLER_DFX (default=1, covered by every other CI job)
   #   ├── pto2-off:         -DPTO2_PROFILING=0   (no profiling at all)
   #   ├── orch:             -DPTO2_ORCH_PROFILING=1
   #   │   └── orch-tensormap:  + -DPTO2_TENSORMAP_PROFILING=1
@@ -463,9 +463,9 @@ jobs:
     runs-on: [self-hosted, a2a3]
     timeout-minutes: 30
     env:
-      PTO2_SCHEDULER_TIMEOUT_MS: "2000"
-      PTO2_OP_EXECUTE_TIMEOUT_US: "3000000"
-      PTO2_STREAM_SYNC_TIMEOUT_MS: "4000"
+      SIMPLER_SCHEDULER_TIMEOUT_MS: "2000"
+      SIMPLER_OP_EXECUTE_TIMEOUT_US: "3000000"
+      SIMPLER_STREAM_SYNC_TIMEOUT_MS: "4000"
 
     steps:
       - name: Checkout repository
@@ -542,9 +542,9 @@ jobs:
     runs-on: [self-hosted, a2a3]
     timeout-minutes: 60
     env:
-      PTO2_SCHEDULER_TIMEOUT_MS: "2000"
-      PTO2_OP_EXECUTE_TIMEOUT_US: "3000000"
-      PTO2_STREAM_SYNC_TIMEOUT_MS: "4000"
+      SIMPLER_SCHEDULER_TIMEOUT_MS: "2000"
+      SIMPLER_OP_EXECUTE_TIMEOUT_US: "3000000"
+      SIMPLER_STREAM_SYNC_TIMEOUT_MS: "4000"
 
     steps:
       - name: Checkout repository
@@ -660,9 +660,9 @@ jobs:
     runs-on: [self-hosted, a5]
     timeout-minutes: 30
     env:
-      PTO2_SCHEDULER_TIMEOUT_MS: "2000"
-      PTO2_OP_EXECUTE_TIMEOUT_US: "3000000"
-      PTO2_STREAM_SYNC_TIMEOUT_MS: "4000"
+      SIMPLER_SCHEDULER_TIMEOUT_MS: "2000"
+      SIMPLER_OP_EXECUTE_TIMEOUT_US: "3000000"
+      SIMPLER_STREAM_SYNC_TIMEOUT_MS: "4000"
 
     steps:
       - name: Checkout repository
@@ -730,9 +730,9 @@ jobs:
     runs-on: [self-hosted, a5]
     timeout-minutes: 60
     env:
-      PTO2_SCHEDULER_TIMEOUT_MS: "2000"
-      PTO2_OP_EXECUTE_TIMEOUT_US: "3000000"
-      PTO2_STREAM_SYNC_TIMEOUT_MS: "4000"
+      SIMPLER_SCHEDULER_TIMEOUT_MS: "2000"
+      SIMPLER_OP_EXECUTE_TIMEOUT_US: "3000000"
+      SIMPLER_STREAM_SYNC_TIMEOUT_MS: "4000"
 
     steps:
       - name: Checkout repository

@@ -90,7 +90,7 @@ constexpr int PLATFORM_MAX_AICPU_THREADS_JUST_FOR_LAUNCH = 14;
  * Default AICore op execution timeout (microseconds).
  * Passed to aclrtSetOpExecuteTimeOutV2 so that STARS actively monitors
  * AICore task execution and kills ops that exceed this threshold.
- * Overridden at runtime by PTO2_OP_EXECUTE_TIMEOUT_US when that env var
+ * Overridden at runtime by SIMPLER_OP_EXECUTE_TIMEOUT_US when that env var
  * is valid.
  */
 constexpr uint64_t PLATFORM_OP_EXECUTE_TIMEOUT_US = 45000000;  // 45s
@@ -106,7 +106,7 @@ constexpr int32_t PLATFORM_ONBOARD_SCHEDULER_TIMEOUT_MS = 10000;
  * Passed to aclrtSynchronizeStreamWithTimeout to detect stream sync hangs.
  * Must be longer than PLATFORM_OP_EXECUTE_TIMEOUT_US so the host waits for
  * STARS to reap the timed-out op and surface the error, rather than giving
- * up first. Overridden at runtime by PTO2_STREAM_SYNC_TIMEOUT_MS when that
+ * up first. Overridden at runtime by SIMPLER_STREAM_SYNC_TIMEOUT_MS when that
  * env var is valid.
  */
 constexpr int PLATFORM_STREAM_SYNC_TIMEOUT_MS = 50000;  // 50s (> op-exec 45s)
@@ -224,15 +224,15 @@ inline double cycles_to_us(uint64_t cycles) {
 
 // Profiling-related runtime flags shared through AICPU-AICore handshake.
 // "Profiling" is the umbrella; each bit is a parallel diagnostics sub-feature.
-#define PROFILING_FLAG_NONE 0u
-#define PROFILING_FLAG_DUMP_TENSOR (1u << 0)
-#define PROFILING_FLAG_L2_SWIMLANE (1u << 1)
-#define PROFILING_FLAG_PMU (1u << 2)
-#define PROFILING_FLAG_DEP_GEN (1u << 3)
-#define PROFILING_FLAG_SCOPE_STATS (1u << 4)
-#define GET_PROFILING_FLAG(flags, bit) ((((uint32_t)(flags)) & ((uint32_t)(bit))) != 0u)
-#define SET_PROFILING_FLAG(flags, bit) ((flags) |= (uint32_t)(bit))
-#define CLEAR_PROFILING_FLAG(flags, bit) ((flags) &= ~((uint32_t)(bit)))
+#define SIMPLER_DFX_FLAG_NONE 0u
+#define SIMPLER_DFX_FLAG_DUMP_TENSOR (1u << 0)
+#define SIMPLER_DFX_FLAG_L2_SWIMLANE (1u << 1)
+#define SIMPLER_DFX_FLAG_PMU (1u << 2)
+#define SIMPLER_DFX_FLAG_DEP_GEN (1u << 3)
+#define SIMPLER_DFX_FLAG_SCOPE_STATS (1u << 4)
+#define SIMPLER_GET_DFX_FLAG(flags, bit) ((((uint32_t)(flags)) & ((uint32_t)(bit))) != 0u)
+#define SIMPLER_SET_DFX_FLAG(flags, bit) ((flags) |= (uint32_t)(bit))
+#define SIMPLER_CLEAR_DFX_FLAG(flags, bit) ((flags) &= ~((uint32_t)(bit)))
 
 // =============================================================================
 // Tensor Dump Configuration

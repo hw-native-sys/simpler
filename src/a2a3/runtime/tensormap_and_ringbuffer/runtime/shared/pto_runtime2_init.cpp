@@ -91,7 +91,7 @@ bool PTO2SchedulerState::RingSchedState::init_data_from_layout(void *sm_dev_base
     ring = pto2_sm_layout::ring_header_addr(sm_dev_base, ring_id);
     last_task_alive = 0;
     advance_lock.store(0, std::memory_order_relaxed);
-#if PTO2_PROFILING
+#if SIMPLER_DFX
     dep_pool_snapshot_tail.store(1, std::memory_order_relaxed);
     dep_pool_snapshot_top.store(1, std::memory_order_relaxed);
 #endif
@@ -111,7 +111,7 @@ void PTO2SchedulerState::RingSchedState::reset_for_reuse(
     last_task_alive = 0;
     advance_lock.store(0, std::memory_order_relaxed);
     dep_pool.reset_for_reuse(orch_err);
-#if PTO2_PROFILING
+#if SIMPLER_DFX
     dep_pool_snapshot_tail.store(1, std::memory_order_relaxed);
     dep_pool_snapshot_top.store(1, std::memory_order_relaxed);
 #endif
@@ -170,7 +170,7 @@ bool PTO2SchedulerState::init_data_from_layout(
 ) {
     PTO2SchedulerState *sched = this;
     sched->sm_header = reinterpret_cast<PTO2SharedMemoryHeader *>(sm_dev_base);
-#if PTO2_SCHED_PROFILING
+#if SIMPLER_SCHED_PROFILING
     sched->tasks_completed.store(0, std::memory_order_relaxed);
     sched->tasks_consumed.store(0, std::memory_order_relaxed);
 #endif
@@ -215,7 +215,7 @@ bool PTO2SchedulerState::init_data_from_layout(
 void PTO2SchedulerState::reset_for_reuse(const PTO2SchedulerLayout &layout, void *sm_dev_base) {
     PTO2SchedulerState *sched = this;
     sched->sm_header = reinterpret_cast<PTO2SharedMemoryHeader *>(sm_dev_base);
-#if PTO2_SCHED_PROFILING
+#if SIMPLER_SCHED_PROFILING
     sched->tasks_completed.store(0, std::memory_order_relaxed);
     sched->tasks_consumed.store(0, std::memory_order_relaxed);
 #endif
@@ -451,7 +451,7 @@ bool PTO2OrchestratorState::reset_for_reuse(
     orch->manual_begin_depth = PTO2_MAX_SCOPE_DEPTH;
     orch->total_cluster_count = 0;
     orch->total_aiv_count = 0;
-#if PTO2_PROFILING
+#if SIMPLER_DFX
     orch->tasks_submitted = 0;
     orch->buffers_allocated = 0;
     orch->bytes_allocated = 0;

@@ -13,11 +13,11 @@ side and no API contract: `run()` returns `None`, so markers (not a return
 value) are the channel, and the log is the one sink the L3 parent and its L2
 children share.
 
-`[STRACE]` rides on the compile-time `SIMPLER_PROFILING` macro (default on, in
+`[STRACE]` rides on the compile-time `SIMPLER_HOST_STRACE` macro (default on, in
 `src/common/task_interface/profiling_config.h` — separate from the
-`PTO2_PROFILING` gate on the device Orch/Sched markers) and is emitted at
+`SIMPLER_DFX` gate on the device Orch/Sched markers) and is emitted at
 `LOG_INFO_V9` (the must-see INFO tier) — **no new env var or flag**. In a
-`SIMPLER_PROFILING`-off build the RAII macros compile to nothing.
+`SIMPLER_HOST_STRACE`-off build the RAII macros compile to nothing.
 
 ## Marker grammar
 

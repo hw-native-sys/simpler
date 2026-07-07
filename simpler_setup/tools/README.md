@@ -205,7 +205,7 @@ The perf JSON must be captured at l2_swimlane_level >= 3 so that `aicpu_schedule
 
 Per-stage breakdown of every `simpler_run()` from `[STRACE]` host-trace
 markers in a log (host stderr or CANN device log). The runtime emits one
-`[STRACE]` line per span on scope exit (RAII, gated on `SIMPLER_PROFILING`,
+`[STRACE]` line per span on scope exit (RAII, gated on `SIMPLER_HOST_STRACE`,
 `LOG_INFO_V9`), including the AICPU device-phase subdivision (`clk=dev`). See
 [docs/dfx/host-trace.md](../../docs/dfx/host-trace.md) for the marker grammar.
 

@@ -104,9 +104,9 @@ CASES = {
         # Scheduler watchdog (2 s) classifies the running stall before STARS (3 s)
         # and host stream sync (4 s) reap the device. Mirrors aicore_op_timeout.
         env={
-            "PTO2_SCHEDULER_TIMEOUT_MS": 2000,
-            "PTO2_OP_EXECUTE_TIMEOUT_US": 3000000,
-            "PTO2_STREAM_SYNC_TIMEOUT_MS": 4000,
+            "SIMPLER_SCHEDULER_TIMEOUT_MS": 2000,
+            "SIMPLER_OP_EXECUTE_TIMEOUT_US": 3000000,
+            "SIMPLER_STREAM_SYNC_TIMEOUT_MS": 4000,
         },
         marker="sub_class=S1",
     ),
@@ -123,9 +123,9 @@ CASES = {
         # watchdog above 15 s so the tensor-data wait wins the race and latches
         # code 8 before they reap the hung core.
         env={
-            "PTO2_SCHEDULER_TIMEOUT_MS": 30000,
-            "PTO2_OP_EXECUTE_TIMEOUT_US": 30000000,
-            "PTO2_STREAM_SYNC_TIMEOUT_MS": 40000,
+            "SIMPLER_SCHEDULER_TIMEOUT_MS": 30000,
+            "SIMPLER_OP_EXECUTE_TIMEOUT_US": 30000000,
+            "SIMPLER_STREAM_SYNC_TIMEOUT_MS": 40000,
         },
         marker="orch_error_code=8",
     ),

@@ -86,12 +86,12 @@ public:
     int32_t resolve_and_dispatch(Runtime *runtime, int32_t thread_idx);
 
     // Shutdown AICore registers for this thread's assigned cores.
-    // Also runs PMU finalize (PTO2_PROFILING) before deinit when enabled.
+    // Also runs PMU finalize (SIMPLER_DFX) before deinit when enabled.
     // Orchestrator threads (core_trackers_[thread_idx].core_num() == 0) are a no-op.
     int32_t shutdown(int32_t thread_idx);
 
     // Run all post-orchestration scheduler bookkeeping:
-    //  - publishes core assignments to the perf collector (PTO2_PROFILING)
+    //  - publishes core assignments to the perf collector (SIMPLER_DFX)
     //  - latches submitted task count from PTO2 shared memory
     //  - folds inline_completed_tasks into completed_tasks_
     //  - flips orchestrator_done_ and triggers core transition
@@ -146,7 +146,7 @@ private:
     // sync_start drain coordination
     SyncStartDrainState drain_state_;
 
-#if PTO2_PROFILING
+#if SIMPLER_DFX
     SchedL2SwimlaneCounters sched_l2_swimlane_[MAX_AICPU_THREADS];
     // Cached once at init() from get_l2_swimlane_level(), AFTER
     // l2_swimlane_aicpu_init has promoted the level from the shared-memory header.
@@ -180,10 +180,10 @@ private:
     // Platform AICore-register base array (set by AicpuExecutor before init()).
     uint64_t regs_{0};
 
-#if PTO2_PROFILING
+#if SIMPLER_DFX
     // PMU profiling: physical core IDs for PMU MMIO base resolution.
     // Separate storage because CoreExecState's 64-byte budget has no room for
-    // physical_core_id when PTO2_PROFILING=1.
+    // physical_core_id when SIMPLER_DFX=1.
     uint32_t physical_core_ids_[RUNTIME_MAX_WORKER]{};
 #endif
 
@@ -347,7 +347,7 @@ private:
         PTO2TaskSlotState &slot_state, int32_t expected_reg_task_id, PTO2SubtaskSlot subslot, int32_t thread_idx,
         int32_t core_id, Handshake *hank, int32_t &completed_this_turn,
         PTO2TaskSlotState *deferred_release_slot_states[], int32_t &deferred_release_count
-#if PTO2_PROFILING
+#if SIMPLER_DFX
         ,
         uint64_t dispatch_ts, uint64_t finish_ts
 #endif
@@ -427,13 +427,13 @@ private:
     __attribute__((noinline, cold)) int32_t handle_timeout_exit(
         int32_t thread_idx, PTO2SharedMemoryHeader *header, Runtime *runtime, int32_t idle_iterations,
         int32_t last_progress_count
-#if PTO2_PROFILING
+#if SIMPLER_DFX
         ,
         uint64_t sched_start_ts
 #endif
     );
 
-#if PTO2_PROFILING
+#if SIMPLER_DFX
     __attribute__((noinline, cold)) void log_l2_swimlane_summary(int32_t thread_idx, int32_t cur_thread_completed);
 #endif
 

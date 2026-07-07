@@ -44,18 +44,18 @@ void unset_env_var(const char *name) {
 class ScopedUnsetTimeoutEnv {
 public:
     ScopedUnsetTimeoutEnv() {
-        save(PTO2_OP_EXECUTE_TIMEOUT_US_ENV, op_);
-        save(PTO2_STREAM_SYNC_TIMEOUT_MS_ENV, stream_);
-        save(PTO2_SCHEDULER_TIMEOUT_MS_ENV, scheduler_);
-        unset_env_var(PTO2_OP_EXECUTE_TIMEOUT_US_ENV);
-        unset_env_var(PTO2_STREAM_SYNC_TIMEOUT_MS_ENV);
-        unset_env_var(PTO2_SCHEDULER_TIMEOUT_MS_ENV);
+        save(SIMPLER_OP_EXECUTE_TIMEOUT_US_ENV, op_);
+        save(SIMPLER_STREAM_SYNC_TIMEOUT_MS_ENV, stream_);
+        save(SIMPLER_SCHEDULER_TIMEOUT_MS_ENV, scheduler_);
+        unset_env_var(SIMPLER_OP_EXECUTE_TIMEOUT_US_ENV);
+        unset_env_var(SIMPLER_STREAM_SYNC_TIMEOUT_MS_ENV);
+        unset_env_var(SIMPLER_SCHEDULER_TIMEOUT_MS_ENV);
     }
 
     ~ScopedUnsetTimeoutEnv() {
-        restore(PTO2_OP_EXECUTE_TIMEOUT_US_ENV, op_);
-        restore(PTO2_STREAM_SYNC_TIMEOUT_MS_ENV, stream_);
-        restore(PTO2_SCHEDULER_TIMEOUT_MS_ENV, scheduler_);
+        restore(SIMPLER_OP_EXECUTE_TIMEOUT_US_ENV, op_);
+        restore(SIMPLER_STREAM_SYNC_TIMEOUT_MS_ENV, stream_);
+        restore(SIMPLER_SCHEDULER_TIMEOUT_MS_ENV, scheduler_);
     }
 
 private:
@@ -99,9 +99,9 @@ TEST(RuntimeTimeoutConfig, UnsetEnvKeepsDefaults) {
 
 TEST(RuntimeTimeoutConfig, ValidEnvOverridesDefaults) {
     ScopedUnsetTimeoutEnv env;
-    set_env_var(PTO2_OP_EXECUTE_TIMEOUT_US_ENV, "5000000");
-    set_env_var(PTO2_STREAM_SYNC_TIMEOUT_MS_ENV, "7000");
-    set_env_var(PTO2_SCHEDULER_TIMEOUT_MS_ENV, "3000");
+    set_env_var(SIMPLER_OP_EXECUTE_TIMEOUT_US_ENV, "5000000");
+    set_env_var(SIMPLER_STREAM_SYNC_TIMEOUT_MS_ENV, "7000");
+    set_env_var(SIMPLER_SCHEDULER_TIMEOUT_MS_ENV, "3000");
 
     RuntimeTimeoutParseStatus status;
     RuntimeTimeoutConfig cfg = resolve_runtime_timeout_config(kDefaults, &status);
@@ -120,7 +120,7 @@ TEST(RuntimeTimeoutConfig, ValidEnvOverridesDefaults) {
 
 TEST(RuntimeTimeoutConfig, InvalidEnvKeepsDefaultAndReportsStatus) {
     ScopedUnsetTimeoutEnv env;
-    set_env_var(PTO2_OP_EXECUTE_TIMEOUT_US_ENV, "12ms");
+    set_env_var(SIMPLER_OP_EXECUTE_TIMEOUT_US_ENV, "12ms");
 
     RuntimeTimeoutParseStatus status;
     RuntimeTimeoutConfig cfg = resolve_runtime_timeout_config(kDefaults, &status);
@@ -134,12 +134,12 @@ TEST(RuntimeTimeoutConfig, ReusedParseStatusStartsClean) {
     ScopedUnsetTimeoutEnv env;
     RuntimeTimeoutParseStatus status;
 
-    set_env_var(PTO2_OP_EXECUTE_TIMEOUT_US_ENV, "5000000");
+    set_env_var(SIMPLER_OP_EXECUTE_TIMEOUT_US_ENV, "5000000");
     resolve_runtime_timeout_config(kDefaults, &status);
     EXPECT_TRUE(status.op_execute_env_set);
     EXPECT_TRUE(status.op_execute_valid);
 
-    unset_env_var(PTO2_OP_EXECUTE_TIMEOUT_US_ENV);
+    unset_env_var(SIMPLER_OP_EXECUTE_TIMEOUT_US_ENV);
     resolve_runtime_timeout_config(kDefaults, &status);
     EXPECT_FALSE(status.op_execute_env_set);
     EXPECT_TRUE(status.op_execute_valid);
@@ -152,7 +152,7 @@ TEST(RuntimeTimeoutConfig, CiTightTimeoutsStillValidate) {
 TEST(RuntimeTimeoutConfig, InvalidTokenKeepsPriorValue) {
     uint64_t value = 42;
 
-    EXPECT_FALSE(apply_runtime_timeout_override("PTO2_OP_EXECUTE_TIMEOUT_US", "12ms", 1, UINT64_MAX, &value));
+    EXPECT_FALSE(apply_runtime_timeout_override("SIMPLER_OP_EXECUTE_TIMEOUT_US", "12ms", 1, UINT64_MAX, &value));
     EXPECT_EQ(value, 42u);
 }
 

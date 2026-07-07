@@ -113,7 +113,7 @@ int DeviceRunner::ensure_binaries_loaded() {
         load_optional_sym("set_scheduler_timeout_ms", reinterpret_cast<void **>(&set_scheduler_timeout_ms_func_));
         if (set_scheduler_timeout_ms_func_ != nullptr) {
             // Per-device one-shot latch (mirrors the onboard InitArgs path):
-            // honor PTO2_SCHEDULER_TIMEOUT_MS once at SO load, not per run. 0 ->
+            // honor SIMPLER_SCHEDULER_TIMEOUT_MS once at SO load, not per run. 0 ->
             // the scheduler keeps its compile-time default. Sim skips the
             // op/stream ordering check (validate_runtime_timeout_order is onboard).
             RuntimeTimeoutParseStatus sched_status;
@@ -258,21 +258,21 @@ int DeviceRunner::run(Runtime &runtime, const CallConfig &config) {
     runtime.set_aicpu_thread_num(launch_aicpu_num);
 
     int num_aic = block_dim;
-    uint32_t enable_profiling_flag = PROFILING_FLAG_NONE;
+    uint32_t enable_profiling_flag = SIMPLER_DFX_FLAG_NONE;
     if (enable_dump_tensor_) {
-        SET_PROFILING_FLAG(enable_profiling_flag, PROFILING_FLAG_DUMP_TENSOR);
+        SIMPLER_SET_DFX_FLAG(enable_profiling_flag, SIMPLER_DFX_FLAG_DUMP_TENSOR);
     }
     if (enable_l2_swimlane_) {
-        SET_PROFILING_FLAG(enable_profiling_flag, PROFILING_FLAG_L2_SWIMLANE);
+        SIMPLER_SET_DFX_FLAG(enable_profiling_flag, SIMPLER_DFX_FLAG_L2_SWIMLANE);
     }
     if (enable_pmu_) {
-        SET_PROFILING_FLAG(enable_profiling_flag, PROFILING_FLAG_PMU);
+        SIMPLER_SET_DFX_FLAG(enable_profiling_flag, SIMPLER_DFX_FLAG_PMU);
     }
     if (enable_dep_gen_) {
-        SET_PROFILING_FLAG(enable_profiling_flag, PROFILING_FLAG_DEP_GEN);
+        SIMPLER_SET_DFX_FLAG(enable_profiling_flag, SIMPLER_DFX_FLAG_DEP_GEN);
     }
     if (enable_scope_stats_) {
-        SET_PROFILING_FLAG(enable_profiling_flag, PROFILING_FLAG_SCOPE_STATS);
+        SIMPLER_SET_DFX_FLAG(enable_profiling_flag, SIMPLER_DFX_FLAG_SCOPE_STATS);
     }
 
     Handshake *workers = runtime.get_workers();

@@ -422,7 +422,7 @@ SchedulerContext::StallClassification SchedulerContext::classify_stall_reason() 
 int32_t SchedulerContext::handle_timeout_exit(
     int32_t thread_idx, PTO2SharedMemoryHeader *header, Runtime *runtime, int32_t idle_iterations,
     int32_t last_progress_count
-#if PTO2_PROFILING
+#if SIMPLER_DFX
     ,
     uint64_t sched_start_ts
 #endif
@@ -451,7 +451,7 @@ int32_t SchedulerContext::handle_timeout_exit(
     }
     if (!completed_.exchange(true, std::memory_order_acq_rel)) {
         log_shutdown_stall_snapshot(thread_idx, idle_iterations, last_progress_count);
-#if PTO2_PROFILING
+#if SIMPLER_DFX
         // Capture the in-flight kernels' partial output before signalling the
         // cores to exit, so the dump reflects the live stuck state.
         if (is_dump_args_enabled()) {
@@ -471,12 +471,12 @@ int32_t SchedulerContext::handle_timeout_exit(
 #endif
         emergency_shutdown(runtime);
     }
-#if PTO2_PROFILING
+#if SIMPLER_DFX
     uint64_t sched_timeout_ts = get_sys_cnt_aicpu();
     aicpu_phase_set_window(
         AicpuPhase::SchedWindow, static_cast<uint64_t>(sched_start_ts), static_cast<uint64_t>(sched_timeout_ts)
     );
-#if PTO2_SCHED_PROFILING
+#if SIMPLER_SCHED_PROFILING
     LOG_INFO_V9(
         "Thread %d: sched_start=%" PRIu64 " sched_end(timeout)=%" PRIu64 " sched_cost=%.3fus", thread_idx,
         static_cast<uint64_t>(sched_start_ts), static_cast<uint64_t>(sched_timeout_ts),
@@ -487,7 +487,7 @@ int32_t SchedulerContext::handle_timeout_exit(
     return -PTO2_ERROR_SCHEDULER_TIMEOUT;
 }
 
-#if PTO2_PROFILING
+#if SIMPLER_DFX
 void SchedulerContext::log_l2_swimlane_summary(int32_t thread_idx, [[maybe_unused]] int32_t cur_thread_completed) {
     auto &l2_swimlane = sched_l2_swimlane_[thread_idx];
     uint64_t sched_end_ts = get_sys_cnt_aicpu();
@@ -497,7 +497,7 @@ void SchedulerContext::log_l2_swimlane_summary(int32_t thread_idx, [[maybe_unuse
     aicpu_phase_set_window(
         AicpuPhase::SchedWindow, static_cast<uint64_t>(l2_swimlane.sched_start_ts), static_cast<uint64_t>(sched_end_ts)
     );
-#if PTO2_SCHED_PROFILING
+#if SIMPLER_SCHED_PROFILING
     LOG_INFO_V9(
         "Thread %d: sched_start=%" PRIu64 " sched_end=%" PRIu64 " sched_cost=%.3fus", thread_idx,
         static_cast<uint64_t>(l2_swimlane.sched_start_ts), static_cast<uint64_t>(sched_end_ts),
@@ -632,7 +632,7 @@ int32_t SchedulerContext::shutdown(int32_t thread_idx) {
     int32_t core_num = core_trackers_[thread_idx].core_num();
     if (core_num == 0) return 0;
 
-#if PTO2_PROFILING
+#if SIMPLER_DFX
     // Restore PMU CTRL registers for this thread's cores before AICore shutdown
     if (is_pmu_enabled()) {
         pmu_aicpu_finalize(cores, core_num);
@@ -740,10 +740,10 @@ void SchedulerContext::handshake_partition(Runtime *runtime, int32_t tidx, int32
 
             core_exec_states_[i].reg_addr = reg_addr;
             core_exec_states_[i].cond_ptr = get_reg_ptr(reg_addr, RegId::COND);
-#if PTO2_PROFILING
+#if SIMPLER_DFX
             physical_core_ids_[i] = physical_core_id;
 #endif
-#if !PTO2_PROFILING
+#if !SIMPLER_DFX
             core_exec_states_[i].worker_id = i;
             core_exec_states_[i].physical_core_id = physical_core_id;
             core_exec_states_[i].core_type = hank->core_type;
@@ -860,7 +860,7 @@ int32_t SchedulerContext::pre_handshake_init(
     sched_thread_num_ = sched_thread_num;
     regs_ = regs_base;
 
-#if PTO2_PROFILING
+#if SIMPLER_DFX
     // l2_swimlane_aicpu_init promotes g_l2_swimlane_level from the shared-memory
     // header — must be called BEFORE the orchestrator thread caches the level
     // via rt->orchestrator.l2_swimlane_level = get_l2_swimlane_level() in
@@ -920,7 +920,7 @@ int32_t SchedulerContext::post_handshake_init(Runtime *runtime) {
     // parallel across threads. Core-index order matches the original
     // single-thread handshake so assign_cores_to_threads forms identical
     // clusters. core_type / physical_core_id are read from the Handshake struct
-    // (stable after the handshake) so this stays correct under PTO2_PROFILING,
+    // (stable after the handshake) so this stays correct under SIMPLER_DFX,
     // where they are not mirrored into CoreExecState.
     Handshake *all_handshakes = reinterpret_cast<Handshake *>(runtime->dev.workers);
     for (int32_t i = 0; i < cores_total_num_; i++) {
@@ -947,7 +947,7 @@ int32_t SchedulerContext::post_handshake_init(Runtime *runtime) {
     // physical_core_ids_ / cores_total_num_. Mirrors the l2_swimlane_aicpu_init
     // convention above; the per-thread *_set_orch_thread_idx setters stay on the
     // orchestrator thread (see aicpu_executor.cpp).
-#if PTO2_PROFILING
+#if SIMPLER_DFX
     if (is_dump_args_enabled()) {
         dump_args_init(active_sched_threads_);
     }
@@ -956,7 +956,7 @@ int32_t SchedulerContext::post_handshake_init(Runtime *runtime) {
         LOG_INFO_V0("PMU profiling started on %d cores", cores_total_num_);
     }
     // dep_gen is host-driven (SubmitTrace) — runtime-gated by the host flag —
-    // and compiles out with the other profiling subsystems at PTO2_PROFILING=0.
+    // and compiles out with the other profiling subsystems at SIMPLER_DFX=0.
     // init() only pops the initial buffer from instance 0's free_queue; the
     // orchestrator thread still records its idx via
     // dep_gen_aicpu_set_orch_thread_idx() before the first record_submit.
@@ -1085,7 +1085,7 @@ void SchedulerContext::wait_for_orchestration_done_before_dispatch(Runtime *runt
 void SchedulerContext::on_orchestration_done(
     Runtime *runtime, PTO2Runtime *rt, [[maybe_unused]] int32_t thread_idx, int32_t total_tasks
 ) {
-#if PTO2_PROFILING
+#if SIMPLER_DFX
     if (l2_swimlane_level_ >= L2SwimlaneLevel::ORCH_PHASES) {
         // Flush orchestrator's phase record buffer (orch pool, ordinal 0)
         l2_swimlane_aicpu_flush_orch_phase_buffer(thread_idx);
@@ -1098,7 +1098,7 @@ void SchedulerContext::on_orchestration_done(
     int32_t inline_completed = static_cast<int32_t>(rt->orchestrator.inline_completed_tasks);
     if (inline_completed > 0) {
         completed_tasks_.fetch_add(inline_completed, std::memory_order_relaxed);
-#if PTO2_SCHED_PROFILING
+#if SIMPLER_SCHED_PROFILING
         rt->scheduler.tasks_completed.fetch_add(inline_completed, std::memory_order_relaxed);
 #endif
     }
@@ -1115,7 +1115,7 @@ void SchedulerContext::on_orchestration_done(
         }
     }
 
-#if PTO2_PROFILING
+#if SIMPLER_DFX
     // Write the core-to-thread mapping so the profiling data reflects the
     // scheduler threads' final core distribution.
     if (l2_swimlane_level_ >= L2SwimlaneLevel::SCHED_PHASES) {

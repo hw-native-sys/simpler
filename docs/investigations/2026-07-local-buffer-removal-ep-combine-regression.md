@@ -59,7 +59,7 @@ downstream of that read, inside combine.cpp:
 A second probe (sum `routed_y_buf` after the barrier, before reduce) would
 disambiguate push-landed vs reduce-read, but the ad-hoc GM-scalar-loop probe
 **failed to compile** on AICore (bisheng frontend error 70). Next approach:
-runtime-side timing comparison (baseline vs current [STRACE] / PTO2_SCHED_PROFILING
+runtime-side timing comparison (baseline vs current [STRACE] / SIMPLER_SCHED_PROFILING
 of the combine task) rather than more in-kernel probes.
 
 ### NARROWED: the empty result originates at local_expert, not combine

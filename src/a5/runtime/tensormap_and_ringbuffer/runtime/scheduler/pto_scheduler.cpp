@@ -21,7 +21,7 @@
 #include <stdlib.h>
 #include "common/unified_log.h"
 
-#if PTO2_PROFILING
+#if SIMPLER_DFX
 // Weak fallbacks for host/UT builds that don't link the scope_stats collector.
 extern "C" __attribute__((weak, visibility("hidden"))) bool is_scope_stats_enabled() { return false; }
 extern "C" __attribute__((weak, visibility("hidden"))) void scope_stats_note_heap_wrap(int) {}
@@ -31,7 +31,7 @@ extern "C" __attribute__((weak, visibility("hidden"))) void scope_stats_note_hea
 // Scheduler Profiling Counters
 // =============================================================================
 
-#if PTO2_SCHED_PROFILING
+#if SIMPLER_SCHED_PROFILING
 #include "common/platform_config.h"
 
 uint64_t g_sched_lock_cycle[PLATFORM_MAX_AICPU_THREADS] = {};
@@ -87,7 +87,7 @@ void PTO2SchedulerState::print_stats() {
             }
         }
     }
-#if PTO2_SCHED_PROFILING
+#if SIMPLER_SCHED_PROFILING
     LOG_INFO_V0("tasks_completed:   %lld", (long long)sched->tasks_completed.load(std::memory_order_relaxed));
     LOG_INFO_V0("tasks_consumed:    %lld", (long long)sched->tasks_consumed.load(std::memory_order_relaxed));
 #endif

@@ -437,10 +437,10 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
 
     // Orchestrator check
     if (thread_idx >= sched_thread_num_) {
-#if PTO2_PROFILING
+#if SIMPLER_DFX
         uint64_t orch_cycle_start = 0;
 #endif
-#if PTO2_ORCH_PROFILING
+#if SIMPLER_ORCH_PROFILING
         int32_t pto2_submitted_tasks = -1;
 #endif
         // Orchestrator thread: load + run the device orchestration SO. The braces
@@ -600,7 +600,7 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
                 // Fill ops / core counts (host can't resolve s_runtime_ops's
                 // device address nor know the SchedulerContext's core fan-out).
                 runtime_finalize_after_wire(rt, sched_ctx_.aic_count(), sched_ctx_.aiv_count());
-#if PTO2_PROFILING
+#if SIMPLER_DFX
                 rt->orchestrator.l2_swimlane_level = get_l2_swimlane_level();
                 {
                     auto &orch = rt->orchestrator;
@@ -622,13 +622,13 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
 
             runtime_init_ready_.store(true, std::memory_order_release);
 
-#if PTO2_PROFILING
+#if SIMPLER_DFX
             if (get_l2_swimlane_level() >= L2SwimlaneLevel::ORCH_PHASES) {
                 l2_swimlane_aicpu_set_orch_thread_idx(thread_idx);
             }
 #endif
 
-#if PTO2_PROFILING
+#if SIMPLER_DFX
             // dep_gen plugs into the orchestrator thread (single-instance subsystem):
             // record the per-thread ready_queue index before any submit_task fires
             // inside orch_func_.
@@ -643,7 +643,7 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
             scope_stats_aicpu_set_orch_thread_idx(thread_idx);
 #endif
 
-#if PTO2_PROFILING
+#if SIMPLER_DFX
             orch_cycle_start = get_sys_cnt_aicpu();
 #endif
             framework_bind_runtime(rt);
@@ -654,7 +654,7 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
             (*p_func)(orch_args_cached_);
             rt_scope_end(rt);
 
-#if PTO2_PROFILING
+#if SIMPLER_DFX
             // Flush the (potentially partially-filled) DepGenBuffer so the host
             // collector can pick it up before this orchestrator thread joins.
             if (is_dep_gen_enabled()) {
@@ -664,13 +664,13 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
             // final scope_end records. Idempotent / no-op when disabled.
             scope_stats_aicpu_flush_buffers();
 #endif
-#if PTO2_PROFILING
+#if SIMPLER_DFX
             uint64_t orch_cycle_end = get_sys_cnt_aicpu();
             (void)orch_cycle_end;
 #endif
 
             // Print orchestrator profiling data
-#if PTO2_ORCH_PROFILING
+#if SIMPLER_ORCH_PROFILING
             PTO2OrchProfilingData p = orchestrator_get_profiling();
             uint64_t total =
                 p.sync_cycle + p.alloc_cycle + p.args_cycle + p.lookup_cycle + p.insert_cycle + p.fanin_cycle;
@@ -711,7 +711,7 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
                 p.submit_count > 0 ? cycles_to_us(total) / p.submit_count : 0.0
             );
 
-#if PTO2_TENSORMAP_PROFILING
+#if SIMPLER_TENSORMAP_PROFILING
             PTO2TensorMapProfilingData tp = pto2_tensormap_get_profiling();
             LOG_INFO_V9("Thread %d: === TensorMap Lookup Stats ===", thread_idx);
             LOG_INFO_V9(
@@ -730,7 +730,7 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
                 tp.overlap_checks > 0 ? tp.overlap_hits * 100.0 / tp.overlap_checks : 0.0
             );
 #endif
-#endif  // PTO2_ORCH_PROFILING
+#endif  // SIMPLER_ORCH_PROFILING
 
             // Latch task count from PTO2 shared memory to hand off to the
             // scheduler. The orchestrator's run window (start_time / end_time /
@@ -748,7 +748,7 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
                 }
             }
 
-#if PTO2_ORCH_PROFILING
+#if SIMPLER_ORCH_PROFILING
             pto2_submitted_tasks = total_tasks;
 #endif
 
@@ -757,13 +757,13 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
 
             sched_ctx_.on_orchestration_done(runtime, rt, thread_idx, total_tasks);
         }
-#if PTO2_PROFILING
+#if SIMPLER_DFX
         uint64_t orch_end_ts = get_sys_cnt_aicpu();
         // Ride the orch window home to the host phase buffer so the host emits
         // it as an `Orch` [STRACE] marker (the everyday path). The verbose
         // per-thread device-log line below is now opt-in deep-dive.
         aicpu_phase_set_window(AicpuPhase::OrchWindow, static_cast<uint64_t>(orch_cycle_start), orch_end_ts);
-#if PTO2_ORCH_PROFILING
+#if SIMPLER_ORCH_PROFILING
         LOG_INFO_V9(
             "Thread %d: orch_start=%" PRIu64 " orch_end=%" PRIu64 " orch_cost=%.3fus", thread_idx,
             static_cast<uint64_t>(orch_cycle_start), static_cast<uint64_t>(orch_end_ts),
@@ -775,8 +775,8 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
                 sched_ctx_.completed_tasks_count()
             );
         }
-#endif  // PTO2_ORCH_PROFILING
-#endif  // PTO2_PROFILING
+#endif  // SIMPLER_ORCH_PROFILING
+#endif  // SIMPLER_DFX
         LOG_INFO_V0("Thread %d: Orchestrator completed", thread_idx);
     }
 

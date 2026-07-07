@@ -34,7 +34,7 @@
 // default 10 s scheduler budget covers the distributed-init / HCCL skew #897
 // sized at 5 s while still firing well before STARS. The runtime consumes it
 // as SCHEDULER_TIMEOUT_MS (see scheduler_types.h). Host may override this per
-// run via PTO2_SCHEDULER_TIMEOUT_MS after validating the timeout ordering.
+// run via SIMPLER_SCHEDULER_TIMEOUT_MS after validating the timeout ordering.
 constexpr int32_t PLATFORM_SCHEDULER_TIMEOUT_MS = PLATFORM_ONBOARD_SCHEDULER_TIMEOUT_MS;
 
 #endif  // PLATFORM_A2A3_AICPU_SPIN_HINT_H_

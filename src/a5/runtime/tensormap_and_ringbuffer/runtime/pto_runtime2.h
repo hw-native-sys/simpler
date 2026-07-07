@@ -92,7 +92,7 @@ struct PTO2RuntimeOps {
 
     // Stash the call-site captured by PTO2ScopeGuard into the [ScopeStats]
     // collector. Always present to keep ops-table layout stable across
-    // PTO2_PROFILING settings; set to nullptr at PTO2_PROFILING=0.
+    // SIMPLER_DFX settings; set to nullptr at SIMPLER_DFX=0.
     void (*scope_set_site)(const char *file, int line);
 };
 

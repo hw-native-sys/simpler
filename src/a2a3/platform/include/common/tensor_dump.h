@@ -17,7 +17,7 @@
  * Fully decoupled from profiling — uses its own ready queues, buffer states,
  * and memory manager thread.
  *
- * Memory layout (Dump SHM, allocated only when PTO2_PROFILING=1):
+ * Memory layout (Dump SHM, allocated only when SIMPLER_DFX=1):
  * ┌─────────────────────────────────────────────────────────────┐
  * │ DumpDataHeader (fixed header)                               │
  * │  - Per-thread ready queues (circular FIFOs)                 │

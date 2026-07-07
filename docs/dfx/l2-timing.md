@@ -1,7 +1,7 @@
 # L2 Timing — host_wall / device_wall / Effective / Orch / Sched (`[STRACE]`)
 
 For an L2 run you usually look at a handful of timing numbers. They **all** come
-from **`[STRACE]` markers** (gated on `SIMPLER_PROFILING`, default on in
+from **`[STRACE]` markers** (gated on `SIMPLER_HOST_STRACE`, default on in
 `src/common/task_interface/profiling_config.h`): the platform emits one marker
 line per stage to stderr, and `simpler_setup.tools.strace_timing` parses them
 offline. Normal execution only *emits*; parsing is a separate, opt-in step.
@@ -24,9 +24,9 @@ opt-in (`--enable-l2-swimlane`) and documented separately in
 | **`simpler_run`** (host_wall) | Host `steady_clock` delta wrapping the dispatch call — includes Python/host overhead. | host side, around the C-ABI run call |
 | **`simpler_run.runner_run.device_wall`** | **Full on-NPU kernel wall**: earliest `simpler_aicpu_exec` start to latest end across launched threads — i.e. **the whole run + teardown**. | Each `simpler_aicpu_exec` thread stamps its own `AicpuPhase::RunWall` slot in the per-thread `AicpuPhaseRecord` buffer (`KernelArgs.device_wall_data_base`, see `src/{arch}/platform/onboard/aicpu/kernel.cpp`); host reduces `max(end) - min(start)` each run |
 
-Both are emitted whenever the runtime was built with `SIMPLER_PROFILING` (the
+Both are emitted whenever the runtime was built with `SIMPLER_HOST_STRACE` (the
 default) — **independent of `--enable-l2-swimlane`**. The `device_wall` marker is
-absent only on a `SIMPLER_PROFILING`-off build.
+absent only on a `SIMPLER_HOST_STRACE`-off build.
 
 Nested under `device_wall` are the AICPU orchestrator / scheduler sub-spans
 (`clk=dev`; captured on both onboard and sim):
@@ -43,7 +43,7 @@ init and exec teardown around the orchestrate+schedule work.
 For a finer per-stage breakdown of `device_wall` (preamble / SO-load /
 graph-build / post-orch) and of the host side (`bind` / `runner_run` /
 `validate`), see [host-trace.md](host-trace.md) and the device-phase mechanism in
-[device-phases.md](device-phases.md) — both ride on the same `SIMPLER_PROFILING`
+[device-phases.md](device-phases.md) — both ride on the same `SIMPLER_HOST_STRACE`
 macro, no extra flag.
 
 ## 2. Per-round table — `strace_timing --rounds-table`
@@ -99,7 +99,7 @@ tees each run and renders the table, then builds a cross-example summary).
 
 The `[STRACE]` markers carry *durations*, not the per-thread `loops` /
 `tasks_scheduled` counters. Those live only in the CANN device log, behind the
-opt-in `PTO2_ORCH_PROFILING` / `PTO2_SCHED_PROFILING` macros (default **off**).
+opt-in `SIMPLER_ORCH_PROFILING` / `SIMPLER_SCHED_PROFILING` macros (default **off**).
 When you need them, rebuild with the macro on and **read the device log
 directly** — there is no longer a Python parser for it:
 
@@ -123,7 +123,7 @@ instead (see Related docs).
 ## 4. Limitations
 
 - **Per-thread `loops` / `tasks_scheduled` counters** are not in the markers —
-  for those, rebuild with `PTO2_SCHED_PROFILING=1` and read the device log (§3).
+  for those, rebuild with `SIMPLER_SCHED_PROFILING=1` and read the device log (§3).
 - **`Worker.run` returns `None`** — timing is never a return value; it is only
   ever read from the markers.
 

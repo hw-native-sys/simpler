@@ -66,7 +66,7 @@ struct AicpuExecutor {
     int aic_count_{0};
     int aiv_count_{0};
 
-#if PTO2_PROFILING
+#if SIMPLER_DFX
     // Logical core_id -> hardware physical core id, collected during handshake.
     // Handed to pmu_aicpu_init() so the platform can resolve per-core PMU MMIO bases.
     uint32_t physical_core_ids_[RUNTIME_MAX_WORKER];
@@ -130,7 +130,7 @@ struct AicpuExecutor {
     //
     // resolve_task_dependencies also handles post-completion profiling hooks
     // (AFTER_COMPLETION tensor dump + per-task PMU record) so that callers
-    // walk one boundary instead of sprinkling three #if PTO2_PROFILING blocks
+    // walk one boundary instead of sprinkling three #if SIMPLER_DFX blocks
     // after every resolve site. core_id / core_type are only read when the
     // relevant profiling flag is enabled.
     inline void resolve_task_dependencies(
@@ -147,7 +147,7 @@ struct AicpuExecutor {
 
 static AicpuExecutor g_aicpu_executor;
 
-#if PTO2_PROFILING
+#if SIMPLER_DFX
 static int
 collect_task_tensor_buffer_addrs(const Runtime &runtime, const Task &task, uint64_t *buffer_addrs, int max_count) {
     int found = 0;
@@ -178,7 +178,7 @@ inline void AicpuExecutor::resolve_task_dependencies(
         return;
     }
 
-#if PTO2_PROFILING
+#if SIMPLER_DFX
     if (is_dump_args_enabled()) {
         uint64_t callable_addr = runtime.get_function_bin_addr(task->func_id);
         if (callable_addr != 0) {
@@ -256,7 +256,7 @@ inline bool AicpuExecutor::try_dispatch_task(
         running_task_ids_[core_id]
     );
 
-#if PTO2_PROFILING
+#if SIMPLER_DFX
     if (is_dump_args_enabled()) {
         Task *task = runtime.get_task(task_id);
         if (task != nullptr) {
@@ -371,7 +371,7 @@ int AicpuExecutor::init(Runtime *runtime) {
     for (int i = 0; i < RUNTIME_MAX_WORKER; i++) {
         dispatch_timestamps_[i] = 0;
     }
-#if PTO2_PROFILING
+#if SIMPLER_DFX
     if (is_dump_args_enabled()) {
         dump_args_init(aicpu_thread_num_);
     }
@@ -482,7 +482,7 @@ int AicpuExecutor::handshake_all_cores(Runtime *runtime) {
 
         core_id_to_reg_addr_[i] = reg_addr;
 
-#if PTO2_PROFILING
+#if SIMPLER_DFX
         physical_core_ids_[i] = physical_core_id;
 #endif
 
@@ -1110,7 +1110,7 @@ int AicpuExecutor::run(Runtime *runtime) {
     if (is_l2_swimlane_enabled()) {
         l2_swimlane_aicpu_flush(thread_idx, cur_thread_cores, thread_cores_num_[thread_idx]);
     }
-#if PTO2_PROFILING
+#if SIMPLER_DFX
     if (is_pmu_enabled()) {
         pmu_aicpu_flush_buffers(thread_idx, cur_thread_cores, thread_cores_num_[thread_idx]);
     }
@@ -1119,7 +1119,7 @@ int AicpuExecutor::run(Runtime *runtime) {
     }
 #endif
 
-#if PTO2_PROFILING
+#if SIMPLER_DFX
     // Restore PMU CTRL registers for this thread's cores before AICore shutdown
     if (is_pmu_enabled()) {
         pmu_aicpu_finalize(cur_thread_cores, thread_cores_num_[thread_idx]);

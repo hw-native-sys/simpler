@@ -64,7 +64,7 @@ enum {
 
 /* Per-stage run timing is no longer returned. The platform emits it as
  * `[STRACE]` log markers (host stages + the AICPU device-phase breakdown,
- * gated on SIMPLER_PROFILING) — parse with simpler_setup.tools.strace_timing.
+ * gated on SIMPLER_HOST_STRACE) — parse with simpler_setup.tools.strace_timing.
  * See docs/dfx/host-trace.md. */
 
 /* ===========================================================================

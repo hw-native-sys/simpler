@@ -87,9 +87,9 @@ bool SchedulerContext::has_idle_in_other_threads(int32_t self_thread_idx, PTO2Re
 int SchedulerContext::pop_ready_tasks_batch(
     PTO2ResourceShape shape, int32_t thread_idx, PTO2TaskSlotState **out, int max_count
 ) {
-#if PTO2_PROFILING
+#if SIMPLER_DFX
     auto &l2_swimlane = sched_l2_swimlane_[thread_idx];
-#if PTO2_SCHED_PROFILING
+#if SIMPLER_SCHED_PROFILING
     extern uint64_t g_sched_pop_atomic_count[], g_sched_pop_wait_cycle[];
     uint64_t t_pop_start = get_sys_cnt_aicpu();
     int count = sched_->get_ready_tasks_batch(
@@ -196,14 +196,14 @@ SchedulerContext::PublishHandle SchedulerContext::prepare_subtask_to_core(
     // check_running_cores_for_completion), because FIN precedes the swimlane
     // record on this runtime. `reg_task_id` is passed as that ACK gate. Gated on
     // the same enable bit as flush so level=1 (AICORE_TIMING-only) participates.
-#if PTO2_PROFILING
+#if SIMPLER_DFX
     if (l2_swimlane_level_ != L2SwimlaneLevel::DISABLED) {
         l2_swimlane_aicpu_on_aicore_dispatch(core_id, thread_idx, reg_task_id);
     }
 #endif
 
     uint64_t *dispatch_timestamp_slot = nullptr;
-#if PTO2_PROFILING
+#if SIMPLER_DFX
     if (l2_swimlane_level_ >= L2SwimlaneLevel::AICPU_TIMING) {
         dispatch_timestamp_slot =
             to_pending ? &core_exec_state.pending_dispatch_timestamp : &core_exec_state.running_dispatch_timestamp;
@@ -217,7 +217,7 @@ int SchedulerContext::prepare_block_for_dispatch(
     int32_t thread_idx, int32_t core_offset, PTO2TaskSlotState &slot_state, PTO2ResourceShape shape, bool to_pending,
     int32_t block_idx, PublishHandle *out_handles
 ) {
-#if PTO2_PROFILING
+#if SIMPLER_DFX
     if (is_dump_args_enabled()) {
         dump_args_for_task<PTO2_SUBTASK_SLOT_COUNT>(
             thread_idx, slot_state, TensorDumpStage::BEFORE_DISPATCH,
@@ -252,21 +252,21 @@ int SchedulerContext::prepare_block_for_dispatch(
                 thread_idx, tracker.get_aiv1_core_offset(core_offset), slot_state, PTO2SubtaskSlot::AIV1, p, block_idx
             );
         }
-#if PTO2_PROFILING
+#if SIMPLER_DFX
         sched_l2_swimlane_[thread_idx].phase_dispatch_count += __builtin_popcount(cmask);
 #endif
         return n;
     } else if (shape == PTO2ResourceShape::AIC) {
         out_handles[0] =
             prepare_subtask_to_core(thread_idx, core_offset, slot_state, PTO2SubtaskSlot::AIC, to_pending, block_idx);
-#if PTO2_PROFILING
+#if SIMPLER_DFX
         sched_l2_swimlane_[thread_idx].phase_dispatch_count += 1;
 #endif
         return 1;
     } else {
         out_handles[0] =
             prepare_subtask_to_core(thread_idx, core_offset, slot_state, PTO2SubtaskSlot::AIV0, to_pending, block_idx);
-#if PTO2_PROFILING
+#if SIMPLER_DFX
         sched_l2_swimlane_[thread_idx].phase_dispatch_count += 1;
 #endif
         return 1;
@@ -277,7 +277,7 @@ void SchedulerContext::dispatch_shape(
     int32_t thread_idx, PTO2ResourceShape shape, CoreTracker::DispatchPhase phase, CoreTracker &tracker,
     bool &entered_drain, bool &made_progress, bool &try_pushed
 ) {
-#if PTO2_SCHED_PROFILING
+#if SIMPLER_SCHED_PROFILING
     auto &l2_swimlane = sched_l2_swimlane_[thread_idx];
 #endif
     if (entered_drain) return;
@@ -336,7 +336,7 @@ void SchedulerContext::dispatch_shape(
         // task's block starts. Bounded by cores.count() ≤ MAX_CLUSTERS dispatches.
         PTO2TaskSlotState *prop_list[CoreTracker::MAX_CLUSTERS];
         int prop_n = 0;
-#if PTO2_SCHED_PROFILING
+#if SIMPLER_SCHED_PROFILING
         uint64_t t_setup_start = get_sys_cnt_aicpu();
 #endif
 
@@ -347,7 +347,7 @@ void SchedulerContext::dispatch_shape(
             if (handle_count == 0) return;
             wmb();
             uint64_t dispatch_ts = 0;
-#if PTO2_PROFILING
+#if SIMPLER_DFX
             if (l2_swimlane_level_ >= L2SwimlaneLevel::AICPU_TIMING) {
                 dispatch_ts = get_sys_cnt_aicpu();
             }
@@ -459,7 +459,7 @@ void SchedulerContext::dispatch_shape(
         for (int i = 0; i < prop_n; i++) {
             sched_->propagate_dispatch_fanin(*prop_list[i]);
         }
-#if PTO2_SCHED_PROFILING
+#if SIMPLER_SCHED_PROFILING
         l2_swimlane.sched_dispatch_setup_cycle += (get_sys_cnt_aicpu() - t_setup_start);
 #endif
 
@@ -834,7 +834,7 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
     int32_t timeout_rc = 0;
     int32_t idle_iterations = 0;
     int32_t last_progress_count = 0;
-#if PTO2_PROFILING
+#if SIMPLER_DFX
     auto &l2_swimlane = sched_l2_swimlane_[thread_idx];
     l2_swimlane.reset();
     l2_swimlane.l2_swimlane_enabled = (l2_swimlane_level_ != L2SwimlaneLevel::DISABLED);
@@ -847,7 +847,7 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
     // pollute per-task PMU counters, so skip the PENDING pre-load phase.
     // Cached at function scope: is_pmu_enabled() is extern "C" and the
     // compiler cannot hoist it across the dispatch loop on its own.
-#if PTO2_PROFILING
+#if SIMPLER_DFX
     const bool pmu_active = is_pmu_enabled();
 #else
     // PMU is definitionally off when profiling is compiled out; hard-set false
@@ -855,11 +855,11 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
     constexpr bool pmu_active = false;
 #endif
 
-#if PTO2_PROFILING
+#if SIMPLER_DFX
     l2_swimlane.sched_start_ts = get_sys_cnt_aicpu();
 #endif
 
-#if PTO2_PROFILING
+#if SIMPLER_DFX
     // Queue-depth snapshot carried across the iteration boundary: each phase
     // emit consumes (phase_start_shared) and refreshes it with its own end
     // snapshot so the next phase's "at_start" equals the previous phase's
@@ -937,7 +937,7 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
             break;
         }
         bool made_progress = false;
-#if PTO2_PROFILING
+#if SIMPLER_DFX
         CYCLE_COUNT_START();
         l2_swimlane.sched_loop_count++;
         uint64_t _t0_phase = _t0;
@@ -958,7 +958,7 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
             if (action == LoopAction::BREAK_LOOP) break;
         }
 
-#if PTO2_PROFILING
+#if SIMPLER_DFX
         CYCLE_COUNT_LAP(l2_swimlane.sched_idle_cycle);
 #endif
 
@@ -973,7 +973,7 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
             );
         }
         if (completed_this_turn > 0) {
-#if PTO2_SCHED_PROFILING
+#if SIMPLER_SCHED_PROFILING
             sched_->tasks_completed.fetch_add(completed_this_turn, std::memory_order_relaxed);
 #endif
             int32_t prev = completed_tasks_.fetch_add(completed_this_turn, std::memory_order_relaxed);
@@ -995,7 +995,7 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
             AsyncPollResult poll_result = sched_->async_wait_list.poll_and_complete<false>(
                 rt_->aicore_mailbox, sched_, deferred_release_slot_states, deferred_release_count,
                 PTO2_DEFERRED_RELEASE_CAP
-#if PTO2_SCHED_PROFILING
+#if SIMPLER_SCHED_PROFILING
                 ,
                 thread_idx
 #endif
@@ -1009,7 +1009,7 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
                 break;
             }
             if (poll_result.completed > 0) {
-#if PTO2_SCHED_PROFILING
+#if SIMPLER_SCHED_PROFILING
                 sched_->tasks_completed.fetch_add(poll_result.completed, std::memory_order_relaxed);
 #endif
                 int32_t prev = completed_tasks_.fetch_add(poll_result.completed, std::memory_order_relaxed);
@@ -1019,7 +1019,7 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
             }
         }
 
-#if PTO2_PROFILING
+#if SIMPLER_DFX
         if (!try_completed) {
             CYCLE_COUNT_LAP(l2_swimlane.sched_idle_cycle);
         } else {
@@ -1067,7 +1067,7 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
             constexpr int DUMMY_DRAIN_BATCH = 8;
             PTO2TaskSlotState *dummy_batch[DUMMY_DRAIN_BATCH];
             int dummy_got = sched_->dummy_ready_queue.pop_batch(dummy_batch, DUMMY_DRAIN_BATCH);
-#if PTO2_PROFILING
+#if SIMPLER_DFX
             // Dummy outer phase: covers handling of all dummies popped this
             // iter. Per-dummy DummyTask markers are emitted to a SEPARATE lane
             // (Worker View AICPU_N) by the converter, so they do not nest
@@ -1086,7 +1086,7 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
                 // visually present. tasks_processed = task_token low 32 bits
                 // (= local_id within ring) so deps.json flow arrows can land.
                 // The Resolve work that follows is emitted separately below.
-#if PTO2_PROFILING
+#if SIMPLER_DFX
                 if (l2_swimlane_level_ >= L2SwimlaneLevel::SCHED_PHASES) {
                     uint64_t dummy_marker_t = get_sys_cnt_aicpu();
                     uint32_t dummy_id_low32 = static_cast<uint32_t>(dummy_slot.task->task_id.raw & 0xFFFFFFFFu);
@@ -1100,20 +1100,20 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
                 // ----- Resolve work: walk this dummy's consumer list. ------
                 // Same 1 µs filter as the main-path Resolve emit suppresses
                 // dummies whose consumer release runs sub-microsecond.
-#if PTO2_PROFILING
+#if SIMPLER_DFX
                 uint64_t dummy_resolve_t0 =
                     (l2_swimlane_level_ >= L2SwimlaneLevel::SCHED_PHASES) ? get_sys_cnt_aicpu() : 0;
 #endif
                 // [[maybe_unused]] silences -Werror=unused-but-set-variable on
-                // the profiling-flags-smoke build path where PTO2_PROFILING is
+                // the profiling-flags-smoke build path where SIMPLER_DFX is
                 // OFF and the Resolve emit below is excluded.
                 [[maybe_unused]] uint32_t dummy_consumers = 0;
-#if PTO2_SCHED_PROFILING
+#if SIMPLER_SCHED_PROFILING
                 dummy_consumers = sched_->on_task_complete(dummy_slot, thread_idx).fanout_edges;
 #else
                 dummy_consumers = sched_->on_task_complete(dummy_slot);
 #endif
-#if PTO2_PROFILING
+#if SIMPLER_DFX
                 if (dummy_resolve_t0 != 0) {
                     uint64_t dummy_resolve_t1 = get_sys_cnt_aicpu();
                     constexpr uint64_t RESOLVE_EMIT_MIN_CYCLES = PLATFORM_PROF_SYS_CNT_FREQ / 1'000'000;  // 1 µs
@@ -1131,7 +1131,7 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
                 deferred_release_slot_states[deferred_release_count++] = &dummy_slot;
                 if (deferred_release_count >= PTO2_DEFERRED_RELEASE_CAP) {
                     while (deferred_release_count > 0) {
-#if PTO2_SCHED_PROFILING
+#if SIMPLER_SCHED_PROFILING
                         (void)sched_->on_task_release(
                             *deferred_release_slot_states[--deferred_release_count], thread_idx
                         );
@@ -1147,7 +1147,7 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
             if (dummy_got > 0) {
                 made_progress = true;
             }
-#if PTO2_PROFILING
+#if SIMPLER_DFX
             // Emit Dummy outer over the whole dummy_drain pass. Span starts at
             // dummy_outer_t0 (captured before the pop_batch) and ends at "now".
             // tasks_processed = dummy_got. Advancing _t0_phase here makes the
@@ -1175,11 +1175,11 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
 
         // Phase 4: MIX-strict-priority dispatch with phase-split and
         // cross-thread idle gating. See dispatch_ready_tasks for the policy.
-#if PTO2_PROFILING
+#if SIMPLER_DFX
         uint64_t dispatch_t0 = (l2_swimlane_level_ >= L2SwimlaneLevel::SCHED_PHASES) ? get_sys_cnt_aicpu() : 0;
 #endif
         dispatch_ready_tasks(thread_idx, tracker, pmu_active, made_progress, try_pushed);
-#if PTO2_PROFILING
+#if SIMPLER_DFX
         // Emit Dispatch IMMEDIATELY after dispatch_ready_tasks so its span
         // covers the actual publish work — not the trailing second-poll /
         // early-dispatch time. (Pre-redesign the Dispatch emit lived at iter
@@ -1214,13 +1214,13 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
         // thread has a spare slot, no normal ready work queued) and updates
         // made_progress / try_pushed, so this is a single unconditional call — it
         // returns 0 without staging when gated out.
-#if PTO2_PROFILING
+#if SIMPLER_DFX
         bool early_dispatch_record = l2_swimlane_level_ >= L2SwimlaneLevel::SCHED_PHASES;
         uint64_t early_dispatch_t0 = early_dispatch_record ? get_sys_cnt_aicpu() : 0;
 #endif
         [[maybe_unused]] int32_t staged_count =
             try_early_dispatch(thread_idx, tracker, pmu_active, made_progress, try_pushed);
-#if PTO2_PROFILING
+#if SIMPLER_DFX
         // Emit an EarlyDispatch bar so a staging-dominated iteration is attributed
         // to early-dispatch rather than disappearing into a blank gap.
         if (early_dispatch_record && staged_count > 0) {
@@ -1240,7 +1240,7 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
         }
 #endif
 
-#if PTO2_PROFILING
+#if SIMPLER_DFX
         // Cycle-counter LAP for the iter tail. Dispatch's emit moved earlier
         // (see Phase 4 above) so this branch only routes the time accumulator.
         if (!try_pushed) {
@@ -1250,7 +1250,7 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
         }
 #endif
 
-#if !PTO2_PROFILING
+#if !SIMPLER_DFX
         (void)try_completed;
         (void)try_pushed;
 #endif
@@ -1259,19 +1259,19 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
             idle_iterations = 0;
             last_progress_ts = get_sys_cnt_aicpu();
         } else {
-#if PTO2_PROFILING
+#if SIMPLER_DFX
             uint64_t rel_t0 = (l2_swimlane_level_ >= L2SwimlaneLevel::SCHED_PHASES && deferred_release_count > 0) ?
                                   get_sys_cnt_aicpu() :
                                   0;
 #endif
             while (deferred_release_count > 0) {
-#if PTO2_SCHED_PROFILING
+#if SIMPLER_SCHED_PROFILING
                 (void)sched_->on_task_release(*deferred_release_slot_states[--deferred_release_count], thread_idx);
 #else
                 sched_->on_task_release(*deferred_release_slot_states[--deferred_release_count]);
 #endif
             }
-#if PTO2_PROFILING
+#if SIMPLER_DFX
             // Release is a distinct operation from the poll scan — emit it with
             // its own span (Perfetto nests it inside the surrounding poll/idle
             // run by time-containment) rather than competing with poll for one
@@ -1323,7 +1323,7 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
                     // buffer — exactly the state we need to triage the hang.
                     timeout_rc = handle_timeout_exit(
                         thread_idx, header, runtime, idle_iterations, last_progress_count
-#if PTO2_PROFILING
+#if SIMPLER_DFX
                         ,
                         l2_swimlane.sched_start_ts
 #endif
@@ -1333,7 +1333,7 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
                 last_progress_ts = get_sys_cnt_aicpu();
             }
             SPIN_WAIT_HINT();
-#if PTO2_PROFILING
+#if SIMPLER_DFX
             CYCLE_COUNT_LAP(l2_swimlane.sched_idle_cycle);
             // _t0_phase advances through idle laps so the next emitted
             // COMPLETE/DISPATCH bar starts at the iter it actually ran in, not
@@ -1352,14 +1352,14 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
     // here so every consumed producer slot completes its on_task_release
     // regardless of which loop-exit path fired.
     while (deferred_release_count > 0) {
-#if PTO2_SCHED_PROFILING
+#if SIMPLER_SCHED_PROFILING
         (void)sched_->on_task_release(*deferred_release_slot_states[--deferred_release_count], thread_idx);
 #else
         sched_->on_task_release(*deferred_release_slot_states[--deferred_release_count]);
 #endif
     }
 
-#if PTO2_PROFILING
+#if SIMPLER_DFX
     // Final-drain: emit any pop_hit / pop_miss accrued since the last
     // dispatch emit (typically the trailing idle loops while waiting for
     // orchestrator_done_) as a zero-duration synthetic dispatch record so
@@ -1387,7 +1387,7 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
     log_l2_swimlane_summary(thread_idx, cur_thread_completed);
 #endif
 
-#if PTO2_PROFILING
+#if SIMPLER_DFX
     if (l2_swimlane.l2_swimlane_enabled) {
         l2_swimlane_aicpu_flush(
             thread_idx, core_trackers_[thread_idx].core_ids(), core_trackers_[thread_idx].core_num()
@@ -1397,12 +1397,12 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
         }
     }
 #endif
-#if PTO2_PROFILING
+#if SIMPLER_DFX
     if (is_dump_args_enabled()) {
         dump_args_flush(thread_idx);
     }
 #endif
-#if PTO2_PROFILING
+#if SIMPLER_DFX
     if (is_pmu_enabled()) {
         pmu_aicpu_flush_buffers(
             thread_idx, core_trackers_[thread_idx].core_ids(), core_trackers_[thread_idx].core_num()

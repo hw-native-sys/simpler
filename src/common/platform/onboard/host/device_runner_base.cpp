@@ -68,25 +68,25 @@ HostRuntimeTimeoutConfig resolve_onboard_timeout_config() {
     RuntimeTimeoutConfig cfg = resolve_runtime_timeout_config(order_defaults, &parse_status);
 
     if (parse_status.op_execute_env_set && !parse_status.op_execute_valid) {
-        const char *op_env = std::getenv(PTO2_OP_EXECUTE_TIMEOUT_US_ENV);
+        const char *op_env = std::getenv(SIMPLER_OP_EXECUTE_TIMEOUT_US_ENV);
         LOG_WARN(
-            "%s=%s invalid, using default %llu", PTO2_OP_EXECUTE_TIMEOUT_US_ENV, op_env,
+            "%s=%s invalid, using default %llu", SIMPLER_OP_EXECUTE_TIMEOUT_US_ENV, op_env,
             (unsigned long long)order_defaults.op_execute_timeout_us
         );
     }
 
     if (parse_status.stream_sync_env_set && !parse_status.stream_sync_valid) {
-        const char *sync_env = std::getenv(PTO2_STREAM_SYNC_TIMEOUT_MS_ENV);
+        const char *sync_env = std::getenv(SIMPLER_STREAM_SYNC_TIMEOUT_MS_ENV);
         LOG_WARN(
-            "%s=%s invalid, using default %d", PTO2_STREAM_SYNC_TIMEOUT_MS_ENV, sync_env,
+            "%s=%s invalid, using default %d", SIMPLER_STREAM_SYNC_TIMEOUT_MS_ENV, sync_env,
             order_defaults.stream_sync_timeout_ms
         );
     }
 
     if (parse_status.scheduler_env_set && !parse_status.scheduler_valid) {
-        const char *sched_env = std::getenv(PTO2_SCHEDULER_TIMEOUT_MS_ENV);
+        const char *sched_env = std::getenv(SIMPLER_SCHEDULER_TIMEOUT_MS_ENV);
         LOG_WARN(
-            "%s=%s invalid, using default %d", PTO2_SCHEDULER_TIMEOUT_MS_ENV, sched_env,
+            "%s=%s invalid, using default %d", SIMPLER_SCHEDULER_TIMEOUT_MS_ENV, sched_env,
             order_defaults.scheduler_timeout_ms
         );
     }

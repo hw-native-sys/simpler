@@ -683,7 +683,7 @@ Built by the scheduler from `PTO2TaskDescriptor`:
 | Flag | Set by | Waited by | Purpose |
 | ---- | ------ | --------- | ------- |
 | `runtime_init_ready_` | Orchestrator thread | Scheduler threads | Runtime and SM handle initialized |
-| `orchestrator_done_` | Orchestrator thread | Scheduler threads when `PTO2_SERIAL_ORCH_SCHED=1` | Full task graph built |
+| `orchestrator_done_` | Orchestrator thread | Scheduler threads when `SIMPLER_TMR_SERIAL_ORCH_SCHED_ENABLE=1` | Full task graph built |
 
 Profiling-subsystem init (`dump_args` / `pmu` / `dep_gen` / `l2_swimlane`) runs
 once in `SchedulerContext::init()` on the single-threaded cold path, before any
@@ -696,7 +696,7 @@ Startup sequence:
 2. Scheduler threads: wait for `runtime_init_ready_` → enter main loop
 3. Orchestrator thread: configure orchestrator-scheduler pointers → call orchestration function → set `orchestrator_done_`
 
-With `PTO2_SERIAL_ORCH_SCHED=1`, scheduler threads still wait for
+With `SIMPLER_TMR_SERIAL_ORCH_SCHED_ENABLE=1`, scheduler threads still wait for
 `runtime_init_ready_` first, then additionally wait for `orchestrator_done_`
 before entering `resolve_and_dispatch()`. The default is off, preserving the
 current overlapped orch/sched pipeline. Serial mode is intended for measurement

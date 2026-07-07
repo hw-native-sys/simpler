@@ -222,7 +222,7 @@ struct Arg : TaskArgsTpl<TensorRef, uint64_t, MaxT, MaxS, TensorArgType> {
 
     void clear() {
         Base::clear();
-#if PTO2_PROFILING
+#if SIMPLER_DFX
         dump_arg_selection_.clear();
 #endif
         explicit_deps_ = nullptr;
@@ -244,7 +244,7 @@ struct Arg : TaskArgsTpl<TensorRef, uint64_t, MaxT, MaxS, TensorArgType> {
 
     template <typename... Args>
     void dump(Args &&...args) {
-#if PTO2_PROFILING
+#if SIMPLER_DFX
         static_assert(
             (std::is_lvalue_reference_v<Args> && ...),
             "dump: temporaries are not allowed — pass tensors/scalars already added to this Arg"
@@ -263,7 +263,7 @@ struct Arg : TaskArgsTpl<TensorRef, uint64_t, MaxT, MaxS, TensorArgType> {
 #endif
     }
 
-#if PTO2_PROFILING
+#if SIMPLER_DFX
     uint64_t dump_arg_mask() const { return dump_arg_selection_.dump_arg_mask(); }
     uint64_t dump_arg_index_ambiguous_mask() const { return dump_arg_selection_.dump_arg_index_ambiguous_mask(); }
 #else
@@ -381,7 +381,7 @@ struct Arg : TaskArgsTpl<TensorRef, uint64_t, MaxT, MaxS, TensorArgType> {
             return;
         }
         memcpy(&scalars_[scalar_count_], values, count * sizeof(uint64_t));
-#if PTO2_PROFILING
+#if SIMPLER_DFX
         dump_arg_selection_.clear_scalar_metadata(scalar_count_, count);
 #endif
         scalar_count_ += count;
@@ -416,7 +416,7 @@ struct Arg : TaskArgsTpl<TensorRef, uint64_t, MaxT, MaxS, TensorArgType> {
             dst[i] = static_cast<uint64_t>(static_cast<uint32_t>(values[i]));
         }
 #endif
-#if PTO2_PROFILING
+#if SIMPLER_DFX
         dump_arg_selection_.clear_scalar_metadata(scalar_count_, count);
 #endif
         scalar_count_ += count;
@@ -436,13 +436,13 @@ struct Arg : TaskArgsTpl<TensorRef, uint64_t, MaxT, MaxS, TensorArgType> {
             return;
         }
         memcpy(&scalars_[scalar_count_], &src.scalars_[src_offset], count * sizeof(uint64_t));
-#if PTO2_PROFILING
+#if SIMPLER_DFX
         dump_arg_selection_.copy_scalar_dtypes_from(src.dump_arg_selection_, scalar_count_, src_offset, count);
 #endif
         scalar_count_ += count;
     }
 
-#if PTO2_PROFILING
+#if SIMPLER_DFX
     const uint8_t *scalar_dtypes() const { return dump_arg_selection_.scalar_dtypes(); }
 #else
     const uint8_t *scalar_dtypes() const { return nullptr; }
@@ -450,12 +450,12 @@ struct Arg : TaskArgsTpl<TensorRef, uint64_t, MaxT, MaxS, TensorArgType> {
 
 private:
     // Caller-owned dependency array; lifetime must extend through submit.
-#if PTO2_PROFILING
+#if SIMPLER_DFX
     DumpArgSelection dump_arg_selection_;
 #endif
     const PTO2TaskId *explicit_deps_{nullptr};
     uint32_t explicit_dep_count_{0};
-#if PTO2_PROFILING
+#if SIMPLER_DFX
     template <typename T>
     static constexpr bool is_supported_dump_arg_v =
         std::is_same_v<std::decay_t<T>, Tensor> || std::is_same_v<std::decay_t<T>, TensorCreateInfo> ||
@@ -477,7 +477,7 @@ private:
     template <typename T>
     void add_scalar_one(T &&value) {
         scalars_[scalar_count_] = to_u64(value);
-#if PTO2_PROFILING
+#if SIMPLER_DFX
         uintptr_t scalar_source_ptr = 0;
         if constexpr (std::is_lvalue_reference_v<T>) {
             scalar_source_ptr = reinterpret_cast<uintptr_t>(&value);
@@ -489,7 +489,7 @@ private:
         scalar_count_++;
     }
 
-#if PTO2_PROFILING
+#if SIMPLER_DFX
     // No-arg dump(): mark every arg already added to this Arg.
     void mark_all_dump_args() {
         if (tensor_count_ == 0 && scalar_count_ == 0) {

@@ -29,7 +29,7 @@
 #include "aicpu/device_time.h"
 #include "common/platform_config.h"  // PLATFORM_PROF_SYS_CNT_FREQ (data-wait deadline)
 #include "common/unified_log.h"
-#if PTO2_PROFILING
+#if SIMPLER_DFX
 #include "aicpu/scope_stats_collector_aicpu.h"
 #endif
 
@@ -252,9 +252,9 @@ void set_tensor_data(PTO2Runtime *rt, const Tensor &tensor, uint32_t ndims, cons
 
 // Ops-table entry that hands the call-site captured by PTO2ScopeGuard to the
 // [ScopeStats] collector. The slot is always present in the struct to keep
-// the layout stable; at PTO2_PROFILING=0 we fill nullptr so the orchestration
+// the layout stable; at SIMPLER_DFX=0 we fill nullptr so the orchestration
 // .so's null-check skips it.
-#if PTO2_PROFILING
+#if SIMPLER_DFX
 static void scope_set_site_impl(const char *file, int line) { scope_stats_set_pending_site(file, line); }
 #endif
 
@@ -273,7 +273,7 @@ static const PTO2RuntimeOps s_runtime_ops = {
     .set_tensor_data = set_tensor_data,
     .alloc_tensors = alloc_tensors_impl,
     .submit_dummy_task = submit_dummy_task_impl,
-#if PTO2_PROFILING
+#if SIMPLER_DFX
     .scope_set_site = scope_set_site_impl,
 #else
     .scope_set_site = nullptr,

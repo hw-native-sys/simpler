@@ -395,14 +395,14 @@ int simpler_register_callable(DeviceContextHandle ctx, int32_t callable_id, cons
     }
 }
 
-// Runtime gate for device-domain phase emission. SIMPLER_DEVICE_PROFILING=0
+// Runtime gate for device-domain phase emission. SIMPLER_DEVICE_STRACE_ENABLE=0
 // suppresses the device (clk=dev) markers so a deployment can profile host and
 // device independently; any other value (or unset) keeps them on. Host-side
-// [STRACE] spans are unaffected — they ride SIMPLER_PROFILING + the log level.
+// [STRACE] spans are unaffected — they ride SIMPLER_HOST_STRACE + the log level.
 // Read once and cached (process-lifetime config knob).
 static bool device_profiling_enabled() {
     static const bool enabled = [] {
-        const char *v = std::getenv("SIMPLER_DEVICE_PROFILING");
+        const char *v = std::getenv("SIMPLER_DEVICE_STRACE_ENABLE");
         return v == nullptr || std::strcmp(v, "0") != 0;
     }();
     return enabled;

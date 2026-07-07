@@ -89,7 +89,7 @@ typedef struct PTO2RuntimeOps {
 
     // Stash the call-site of the next PTO2ScopeGuard so the [ScopeStats]
     // collector can log it. Always present to keep ops-table layout stable
-    // across PTO2_PROFILING settings; set to nullptr at PTO2_PROFILING=0.
+    // across SIMPLER_DFX settings; set to nullptr at SIMPLER_DFX=0.
     void (*scope_set_site)(const char *file, int line);
 } PTO2RuntimeOps;
 

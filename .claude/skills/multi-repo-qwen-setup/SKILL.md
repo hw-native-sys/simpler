@@ -159,8 +159,8 @@ log to tell them apart**:
 
    ```bash
    # add to the task-submit --run, before the python call:
-   export PTO2_OP_EXECUTE_TIMEOUT_US=120000000  # 120 s
-   export PTO2_STREAM_SYNC_TIMEOUT_MS=130000    # 130 s (must exceed op-execute)
+   export SIMPLER_OP_EXECUTE_TIMEOUT_US=120000000  # 120 s
+   export SIMPLER_STREAM_SYNC_TIMEOUT_MS=130000    # 130 s (must exceed op-execute)
    ```
 
    The runtime reads these and overrides the compiled defaults
@@ -191,14 +191,14 @@ $PY -m simpler_setup.tools.device_log_timing \
 ```
 
 `device_log_timing` reports per-round **Total / Orch / Sched** from the
-`PTO2_PROFILING` markers (on by default, no swimlane needed). Round 0 is the
+`SIMPLER_DFX` markers (on by default, no swimlane needed). Round 0 is the
 prefill; the rest are decode steps. **Total ≈ on-device kernel makespan** =
 the "kernel run time" layer.
 
 For layers ②③④ — the host↔device and bind/validate spans — parse the
 `[STRACE]` host-trace markers with `strace_timing.py` (landed in
 [simpler #1177](https://github.com/hw-native-sys/simpler/pull/1177)). The
-markers are emitted at `LOG_INFO_V9` under `PTO2_PROFILING` (no new flag),
+markers are emitted at `LOG_INFO_V9` under `SIMPLER_DFX` (no new flag),
 so the same log captured above carries them:
 
 ```bash
@@ -306,8 +306,8 @@ instrumentation lives in the **host** lib; only that target needs rebuilding.
   prefill (50 s+ vs 16.7 s) and decode spikes. Hold the die exclusively.
 - ❌ Reading `507018` as "simpler bug" without the device log — it masks a
   heap deadlock, an op-timeout, and a forward-progress stall.
-- ❌ Editing `platform_config.h` to raise timeouts — use the `PTO2_OP_EXECUTE_TIMEOUT_US`
-  / `PTO2_STREAM_SYNC_TIMEOUT_MS` env overrides (§4) instead; no rebuild, and it
+- ❌ Editing `platform_config.h` to raise timeouts — use the `SIMPLER_OP_EXECUTE_TIMEOUT_US`
+  / `SIMPLER_STREAM_SYNC_TIMEOUT_MS` env overrides (§4) instead; no rebuild, and it
   doesn't change the default for everyone else.
 - ❌ Setting the timeout env but breaking the ordering (`stream_sync` ≤ `op_execute`,
   or `op_execute` ≤ scheduler 10 s, or `stream_sync` not clearing scheduler + 1.5 s

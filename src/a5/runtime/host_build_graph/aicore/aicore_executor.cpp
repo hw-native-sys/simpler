@@ -60,9 +60,9 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, in
     // AICore kernel entry from KernelArgs::regs[physical_core_id]), so
     // they are safe to cache here.
     uint32_t profiling_flag = get_aicore_profiling_flag();
-    bool l2_swimlane_enabled = GET_PROFILING_FLAG(profiling_flag, PROFILING_FLAG_L2_SWIMLANE);
-    bool dump_tensor_enabled = GET_PROFILING_FLAG(profiling_flag, PROFILING_FLAG_DUMP_TENSOR);
-    bool pmu_enabled = GET_PROFILING_FLAG(profiling_flag, PROFILING_FLAG_PMU);
+    bool l2_swimlane_enabled = SIMPLER_GET_DFX_FLAG(profiling_flag, SIMPLER_DFX_FLAG_L2_SWIMLANE);
+    bool dump_tensor_enabled = SIMPLER_GET_DFX_FLAG(profiling_flag, SIMPLER_DFX_FLAG_DUMP_TENSOR);
+    bool pmu_enabled = SIMPLER_GET_DFX_FLAG(profiling_flag, SIMPLER_DFX_FLAG_PMU);
     // Lazy resolve at first dispatch — AICPU init populates the rotation
     // table concurrently with kernel entry; first dispatch is proof init done.
     __gm__ L2SwimlaneActiveHead *l2_swimlane_head = nullptr;

@@ -117,7 +117,7 @@ WORKTREE_ABS="/home/user/simpler/tmp/worktree_baseline_20260331_102302"
 ```
 
 Use `--serial-orch-sched` to run each case once in the default overlapped mode
-and once with `PTO2_SERIAL_ORCH_SCHED=1`, then emit serial-vs-parallel
+and once with `SIMPLER_TMR_SERIAL_ORCH_SCHED_ENABLE=1`, then emit serial-vs-parallel
 Delta/Change tables.
 
 ### Compare Mode
@@ -246,8 +246,8 @@ plus the AICPU `preamble`/`so_load`/`graph_build`
 (`config_validate`/`arena_wire`/`sm_reset` prep sub-phases)/`post_orch`
 subdivision), parse the `[STRACE]` markers with
 `simpler_setup/tools/strace_timing.py` (add `--tree` for the nested view) — see
-[docs/dfx/host-trace.md](../../../docs/dfx/host-trace.md). Same `SIMPLER_PROFILING`
-gate, no extra flag (set `SIMPLER_DEVICE_PROFILING=0` to drop only the device
+[docs/dfx/host-trace.md](../../../docs/dfx/host-trace.md). Same `SIMPLER_HOST_STRACE`
+gate, no extra flag (set `SIMPLER_DEVICE_STRACE_ENABLE=0` to drop only the device
 `clk=dev` markers).
 
 ### Single Mode
@@ -311,7 +311,7 @@ If any example shows > 5% regression, highlight it explicitly.
 | ----- | ------ |
 | No idle device and no `-d` specified | Prompt user to specify device ID |
 | Benchmark script fails | Report which examples failed; continue with remaining |
-| No timing data | Warn: "No timing markers — ensure `SIMPLER_PROFILING` is enabled" |
+| No timing data | Warn: "No timing markers — ensure `SIMPLER_HOST_STRACE` is enabled" |
 | All examples fail | Check: did you run `pip install -e .` in the worktree venv? |
 | Worktree creation fails | Fall back to stash/checkout approach or report error |
 | `Pre-built runtime binaries not found` | The venv `pip install -e .` should have built these; re-run it |

@@ -40,7 +40,7 @@
 #include "pto_shared_memory.h"
 
 #include "aicpu/device_time.h"  // get_sys_cnt_aicpu (weak; used by early-dispatch doorbell timing too)
-#if PTO2_SCHED_PROFILING
+#if SIMPLER_SCHED_PROFILING
 #define PTO2_SCHED_CYCLE_START() uint64_t _st0 = get_sys_cnt_aicpu(), _st1
 #define PTO2_SCHED_CYCLE_LAP(acc)   \
     do {                            \
@@ -151,7 +151,7 @@ struct alignas(64) PTO2ReadyQueue {
         }
     }
 
-#if PTO2_ORCH_PROFILING || PTO2_SCHED_PROFILING
+#if SIMPLER_ORCH_PROFILING || SIMPLER_SCHED_PROFILING
     bool push(PTO2TaskSlotState *slot_state, uint64_t &atomic_count, uint64_t &wait_cycle) {
         uint64_t pos;
         PTO2ReadyQueueSlot *slot;
@@ -221,7 +221,7 @@ struct alignas(64) PTO2ReadyQueue {
         return result;
     }
 
-#if PTO2_SCHED_PROFILING
+#if SIMPLER_SCHED_PROFILING
     PTO2TaskSlotState *pop(uint64_t &atomic_count, uint64_t &wait_cycle) {
         // Fast-path: skip slot load when queue is clearly empty
         uint64_t d = dequeue_pos.load(std::memory_order_relaxed);
@@ -309,7 +309,7 @@ struct alignas(64) PTO2ReadyQueue {
         return count;
     }
 
-#if PTO2_SCHED_PROFILING
+#if SIMPLER_SCHED_PROFILING
     int pop_batch(PTO2TaskSlotState **out, int max_count, uint64_t &atomic_count, uint64_t &wait_cycle) {
         uint64_t pos;
         int count;
@@ -430,7 +430,7 @@ struct PTO2SchedulerState {
 
         // --- Cache Line 1+: Orch-side wiring dep_pool ---
         alignas(64) PTO2DepListPool dep_pool;
-#if PTO2_PROFILING
+#if SIMPLER_DFX
         // Published only for scope_stats; orchestrator must not read dep_pool's non-atomic counters directly.
         alignas(64) std::atomic<int32_t> dep_pool_snapshot_tail;
         std::atomic<int32_t> dep_pool_snapshot_top;
@@ -447,7 +447,7 @@ struct PTO2SchedulerState {
 
         void sync_to_sm() { ring->fc.last_task_alive.store(last_task_alive, std::memory_order_release); }
 
-#if PTO2_PROFILING
+#if SIMPLER_DFX
         void publish_dep_pool_snapshot() {
             dep_pool_snapshot_tail.store(dep_pool.tail, std::memory_order_release);
             dep_pool_snapshot_top.store(dep_pool.top, std::memory_order_release);
@@ -495,7 +495,7 @@ struct PTO2SchedulerState {
     alignas(64) AsyncWaitList async_wait_list;
 
     // Statistics (cold path, isolated from hot-path fields)
-#if PTO2_SCHED_PROFILING
+#if SIMPLER_SCHED_PROFILING
     alignas(64) std::atomic<int64_t> tasks_completed;
     std::atomic<int64_t> tasks_consumed;
 #endif
@@ -548,7 +548,7 @@ struct PTO2SchedulerState {
         slot_state.unlock_fanout();
         if (!became_consumed) return;
 
-#if PTO2_SCHED_PROFILING
+#if SIMPLER_SCHED_PROFILING
         tasks_consumed.fetch_add(1, std::memory_order_relaxed);
 #endif
 
@@ -566,7 +566,7 @@ struct PTO2SchedulerState {
         }
     }
 
-#if PTO2_ORCH_PROFILING || PTO2_SCHED_PROFILING
+#if SIMPLER_ORCH_PROFILING || SIMPLER_SCHED_PROFILING
     void check_and_handle_consumed(PTO2TaskSlotState &slot_state, uint64_t &atomic_count) {
         // See the non-profiling overload for why the read + COMPLETED->CONSUMED
         // flip is serialized against the orchestrator's claim under fanout_lock.
@@ -587,7 +587,7 @@ struct PTO2SchedulerState {
         atomic_count += 1;  // unlock store
         if (!became_consumed) return;
 
-#if PTO2_SCHED_PROFILING
+#if SIMPLER_SCHED_PROFILING
         tasks_consumed.fetch_add(1, std::memory_order_relaxed);
 #endif
 
@@ -623,7 +623,7 @@ struct PTO2SchedulerState {
         check_and_handle_consumed(slot_state);
     }
 
-#if PTO2_ORCH_PROFILING || PTO2_SCHED_PROFILING
+#if SIMPLER_ORCH_PROFILING || SIMPLER_SCHED_PROFILING
     void release_producer(PTO2TaskSlotState &slot_state, uint64_t &atomic_count) {
         slot_state.fanout_refcount.fetch_add(1, std::memory_order_acq_rel);
         atomic_count += 1;  // fanout_refcount.fetch_add
@@ -804,7 +804,7 @@ struct PTO2SchedulerState {
         return true;
     }
 
-#if PTO2_ORCH_PROFILING || PTO2_SCHED_PROFILING
+#if SIMPLER_ORCH_PROFILING || SIMPLER_SCHED_PROFILING
     bool route_ready_once(
         PTO2TaskSlotState &slot_state, uint64_t &atomic_count, uint64_t &push_wait,
         EarlyDispatchReleaseSink *sink = nullptr
@@ -849,7 +849,7 @@ struct PTO2SchedulerState {
         return false;
     }
 
-#if PTO2_ORCH_PROFILING || PTO2_SCHED_PROFILING
+#if SIMPLER_ORCH_PROFILING || SIMPLER_SCHED_PROFILING
     bool release_fanin_and_check_ready(
         PTO2TaskSlotState &slot_state, uint64_t &atomic_count, uint64_t &push_wait,
         EarlyDispatchReleaseSink *sink = nullptr
@@ -868,7 +868,7 @@ struct PTO2SchedulerState {
         return ready_queues[static_cast<int32_t>(shape)].pop_batch(out, max_count);
     }
 
-#if PTO2_SCHED_PROFILING
+#if SIMPLER_SCHED_PROFILING
     int get_ready_tasks_batch(
         PTO2ResourceShape shape, PTO2TaskSlotState **out, int max_count, uint64_t &atomic_count, uint64_t &wait_cycle
     ) {
@@ -877,7 +877,7 @@ struct PTO2SchedulerState {
 #endif
 
     void on_scope_end(PTO2TaskSlotState **task_slot_states, int32_t count) {
-#if PTO2_ORCH_PROFILING
+#if SIMPLER_ORCH_PROFILING
         extern uint64_t g_orch_scope_end_atomic_count;
         if (count > 0) __builtin_prefetch(task_slot_states[0], 1, 0);
         for (int32_t i = 0; i < count; i++) {
@@ -918,24 +918,24 @@ struct PTO2SchedulerState {
      * actually got resolved. PROFILING returns the richer CompletionStats
      * whose `fanout_edges` carries the same number.
      */
-#if PTO2_SCHED_PROFILING
+#if SIMPLER_SCHED_PROFILING
     CompletionStats
 #else
     uint32_t
 #endif
     on_task_complete(
         PTO2TaskSlotState &slot_state
-#if PTO2_SCHED_PROFILING
+#if SIMPLER_SCHED_PROFILING
         ,
         int thread_idx
 #endif
     ) {
-#if PTO2_SCHED_PROFILING
+#if SIMPLER_SCHED_PROFILING
         CompletionStats stats = {0, 0, 0, true};
 #else
         uint32_t consumer_walk_count = 0;
 #endif
-#if PTO2_SCHED_PROFILING
+#if SIMPLER_SCHED_PROFILING
         extern uint64_t g_sched_lock_cycle[], g_sched_fanout_cycle[];
         extern uint64_t g_sched_lock_atomic_count[], g_sched_lock_wait_cycle[];
         extern uint64_t g_sched_fanout_atomic_count[], g_sched_push_wait_cycle[];
@@ -943,7 +943,7 @@ struct PTO2SchedulerState {
         PTO2_SCHED_CYCLE_START();
 #endif
 
-#if PTO2_SCHED_PROFILING
+#if SIMPLER_SCHED_PROFILING
         slot_state.lock_fanout(lock_atomics, lock_wait);
 #else
         slot_state.lock_fanout();
@@ -952,7 +952,7 @@ struct PTO2SchedulerState {
         PTO2DepListEntry *current = slot_state.fanout_head;  // Protected by fanout_lock
         slot_state.unlock_fanout();
 
-#if PTO2_SCHED_PROFILING
+#if SIMPLER_SCHED_PROFILING
         lock_atomics += 3;  // task_state.store + ready_state.fetch_or + unlock.store
         g_sched_lock_atomic_count[thread_idx] += lock_atomics;
         g_sched_lock_wait_cycle[thread_idx] += lock_wait;
@@ -972,7 +972,7 @@ struct PTO2SchedulerState {
         // producer output. (Batching used to align the released wave, but pushed
         // every doorbell to the end of the walk, defeating the whole point of
         // early-dispatch: minimal producer-end -> consumer-start.)
-#if PTO2_SCHED_PROFILING
+#if SIMPLER_SCHED_PROFILING
         uint64_t fanout_atomics = 0, push_wait = 0;
 #endif
         // Doorbells for released pre-staged consumers fire INLINE in the walk
@@ -981,7 +981,7 @@ struct PTO2SchedulerState {
         EarlyDispatchReleaseSink rel_sink;
         while (current != nullptr) {
             PTO2TaskSlotState &consumer_slot = *current->slot_state;
-#if PTO2_SCHED_PROFILING
+#if SIMPLER_SCHED_PROFILING
             stats.fanout_edges++;
             if (release_fanin_and_check_ready(consumer_slot, fanout_atomics, push_wait, &rel_sink)) {
                 stats.tasks_enqueued++;
@@ -996,7 +996,7 @@ struct PTO2SchedulerState {
             propagate_dispatch_fanin(*rel_sink.items[i]);
         }
 
-#if PTO2_SCHED_PROFILING
+#if SIMPLER_SCHED_PROFILING
         g_sched_fanout_atomic_count[thread_idx] += fanout_atomics;
         g_sched_push_wait_cycle[thread_idx] += push_wait;
         PTO2_SCHED_CYCLE_LAP(g_sched_fanout_cycle[thread_idx]);
@@ -1011,7 +1011,7 @@ struct PTO2SchedulerState {
      * Returns fanin edge count for profiling.
      */
 
-#if PTO2_SCHED_PROFILING
+#if SIMPLER_SCHED_PROFILING
     int32_t on_task_release(PTO2TaskSlotState &slot_state, int32_t thread_idx) {
         PTO2_SCHED_CYCLE_START();
         extern uint64_t g_sched_fanin_cycle[], g_sched_fanin_atomic_count[];
@@ -1024,19 +1024,19 @@ struct PTO2SchedulerState {
 #endif
         PTO2TaskPayload *payload = slot_state.payload;
         for_each_fanin_slot_state(*payload, [&](PTO2TaskSlotState *producer_slot_state) {
-#if PTO2_SCHED_PROFILING
+#if SIMPLER_SCHED_PROFILING
             release_producer(*producer_slot_state, fanin_atomics);
 #else
             release_producer(*producer_slot_state);
 #endif
         });
-#if PTO2_SCHED_PROFILING
+#if SIMPLER_SCHED_PROFILING
         g_sched_fanin_atomic_count[thread_idx] += fanin_atomics;
         PTO2_SCHED_CYCLE_LAP(g_sched_fanin_cycle[thread_idx]);
 #endif
 
         // Self consumed check
-#if PTO2_SCHED_PROFILING
+#if SIMPLER_SCHED_PROFILING
         uint64_t self_atomics = 0;
         check_and_handle_consumed(slot_state, self_atomics);
         g_sched_self_atomic_count[thread_idx] += self_atomics;
@@ -1099,14 +1099,14 @@ inline bool
 AsyncWaitList::try_inline_complete_locked(AsyncWaitList::DrainCompletionSink &sink, PTO2TaskSlotState &slot_state) {
     // Return value (CompletionStats / consumer-walk count) discarded:
     // async-wait drain path has no Resolve swimlane bar attached.
-#if PTO2_SCHED_PROFILING
+#if SIMPLER_SCHED_PROFILING
     (void)sink.sched->on_task_complete(slot_state, sink.thread_idx);
 #else
     (void)sink.sched->on_task_complete(slot_state);
 #endif
     if (*sink.deferred_release_count >= sink.deferred_release_capacity) {
         while (*sink.deferred_release_count > 0) {
-#if PTO2_SCHED_PROFILING
+#if SIMPLER_SCHED_PROFILING
             (void)sink.sched->on_task_release(
                 *sink.deferred_release_slot_states[--(*sink.deferred_release_count)], sink.thread_idx
             );
@@ -1124,7 +1124,7 @@ template <bool Profiling>
 inline AsyncPollResult AsyncWaitList::poll_and_complete(
     AICoreCompletionMailbox *aicore_mailbox, PTO2SchedulerState *sched,
     PTO2TaskSlotState **deferred_release_slot_states, int32_t &deferred_release_count, int32_t deferred_release_capacity
-#if PTO2_SCHED_PROFILING
+#if SIMPLER_SCHED_PROFILING
     ,
     int thread_idx
 #endif
@@ -1137,7 +1137,7 @@ inline AsyncPollResult AsyncWaitList::poll_and_complete(
     sink.deferred_release_slot_states = deferred_release_slot_states;
     sink.deferred_release_count = &deferred_release_count;
     sink.deferred_release_capacity = deferred_release_capacity;
-#if PTO2_SCHED_PROFILING
+#if SIMPLER_SCHED_PROFILING
     sink.thread_idx = thread_idx;
 #endif
 
@@ -1180,7 +1180,7 @@ inline AsyncPollResult AsyncWaitList::poll_and_complete(
         if (entry.normal_done && entry.waiting_completion_count <= 0) {
             // Return value (CompletionStats / consumer-walk count) discarded:
             // deferred-completion drain has no Resolve swimlane bar attached.
-#if PTO2_SCHED_PROFILING
+#if SIMPLER_SCHED_PROFILING
             (void)sched->on_task_complete(*entry.slot_state, thread_idx);
 #else
             (void)sched->on_task_complete(*entry.slot_state);
@@ -1192,7 +1192,7 @@ inline AsyncPollResult AsyncWaitList::poll_and_complete(
             // ASYNC_WAIT_OVERFLOW under the MPSC model.
             if (deferred_release_count >= deferred_release_capacity) {
                 while (deferred_release_count > 0) {
-#if PTO2_SCHED_PROFILING
+#if SIMPLER_SCHED_PROFILING
                     (void)sched->on_task_release(*deferred_release_slot_states[--deferred_release_count], thread_idx);
 #else
                     sched->on_task_release(*deferred_release_slot_states[--deferred_release_count]);
@@ -1216,7 +1216,7 @@ inline AsyncPollResult AsyncWaitList::poll_and_complete(
 // Scheduler Profiling Data
 // =============================================================================
 
-#if PTO2_SCHED_PROFILING
+#if SIMPLER_SCHED_PROFILING
 struct PTO2SchedProfilingData {
     // Sub-phase cycle breakdown within on_task_complete
     uint64_t lock_cycle;           // lock_fanout + state store + unlock

@@ -72,19 +72,19 @@ pytest examples/a5/host_build_graph/vector_example --platform a5sim --dump-args 
 
 The level sets `CallConfig::enable_dump_tensor` (0/1/2/3). The host then
 allocates dump storage, publishes its base address through
-`kernel_args.dump_data_base`, and sets `PROFILING_FLAG_DUMP_TENSOR`
+`kernel_args.dump_data_base`, and sets `SIMPLER_DFX_FLAG_DUMP_TENSOR`
 (levels 1, 2, and 3) in each worker handshake's `enable_profiling_flag` for
 the enable/disable decision. The **partial / full / full-json-only**
 distinction is carried as a `DumpTensorLevel` in the dump shared-memory header
 (`DumpDataHeader::dump_tensor_level`, host-written before launch) rather
 than in the profiling-flag bitmask. The on-device AICPU reads the storage base
 via `set_platform_dump_base()`, the enable bit via
-`set_dump_args_enabled(GET_PROFILING_FLAG(...))`, and latches the mode
+`set_dump_args_enabled(SIMPLER_GET_DFX_FLAG(...))`, and latches the mode
 in `dump_args_init()` from the header level (`PARTIAL` → selective,
 `FULL_JSON_ONLY` → metadata-only, payload copy suppressed). Because the
 level is decided host-side **before any task is
 dispatched**, it is latched up front — there is no dependence on task
-submission order. AICore executors read the same `PROFILING_FLAG_DUMP_TENSOR`
+submission order. AICore executors read the same `SIMPLER_DFX_FLAG_DUMP_TENSOR`
 bit to insert a `pipe_barrier(PIPE_ALL)` before FIN when dump is on, so
 `AFTER_COMPLETION` snapshots see the kernel's final writes.
 
@@ -356,7 +356,7 @@ What you can read out of `args_dump.json` + `args.bin`:
 ## 5. Design Highlights
 
 `L0TaskArgs::dump(...)` selection state is compiled only when
-`PTO2_PROFILING=1`. With `PTO2_PROFILING=0`, the public API remains
+`SIMPLER_DFX=1`. With `SIMPLER_DFX=0`, the public API remains
 available but acts as a no-op: no dump-only `L0TaskArgs` state is stored and
 submit does not propagate dump metadata.
 
@@ -396,7 +396,7 @@ These structs are binary-identical between a2a3 and a5
 `k_args->dump_data_base` in `kernel.cpp` and passes it to
 `set_platform_dump_base()`. Dump enablement is propagated
 separately via the umbrella bitmask `KernelArgs::enable_profiling_flag`
-(`bit0 = PROFILING_FLAG_DUMP_TENSOR`); the AICPU kernel entry calls
+(`bit0 = SIMPLER_DFX_FLAG_DUMP_TENSOR`); the AICPU kernel entry calls
 `set_dump_args_enabled()` with the decoded bit, so device-side
 code does not infer "dump enabled" from `dump_data_base != 0`.
 
@@ -454,7 +454,7 @@ the FIN handshake. This closes the ordering gap where
 all device-side writes were globally visible. Older
 implementations could capture stale output data; the current
 implementation fixes this in the runtime, not in each individual
-kernel. The barrier is gated on `PROFILING_FLAG_DUMP_TENSOR`, so
+kernel. The barrier is gated on `SIMPLER_DFX_FLAG_DUMP_TENSOR`, so
 non-dump runs keep the original cheaper completion path.
 
 ### 5.3 Tensor metadata registration
@@ -888,7 +888,7 @@ log flooding. For `host_build_graph`, ensure
 **`AFTER_COMPLETION` data looks stale or partially written.** This
 should not happen with the runtime barrier in place — AICore
 issues `pipe_barrier(PIPE_ALL)` before FIN when dump is enabled.
-If you see it, verify the executor saw `PROFILING_FLAG_DUMP_TENSOR`
+If you see it, verify the executor saw `SIMPLER_DFX_FLAG_DUMP_TENSOR`
 set in the handshake (a missing handshake bit silently disables
 the barrier).
 
@@ -929,8 +929,8 @@ SCHEDULER_TIMEOUT_MS (10 s, onboard)  <  PLATFORM_OP_EXECUTE_TIMEOUT_US (45 s)  
 ```
 
 These defaults can be overridden without rebuilding by setting
-`PTO2_SCHEDULER_TIMEOUT_MS`, `PTO2_OP_EXECUTE_TIMEOUT_US`, and
-`PTO2_STREAM_SYNC_TIMEOUT_MS`. Invalid values, or onboard combinations that
+`SIMPLER_SCHEDULER_TIMEOUT_MS`, `SIMPLER_OP_EXECUTE_TIMEOUT_US`, and
+`SIMPLER_STREAM_SYNC_TIMEOUT_MS`. Invalid values, or onboard combinations that
 break the ordering above, are ignored with a warning and fall back to the
 defaults. The onboard host also requires stream-sync to cover the scheduler
 budget plus a 1.5 s scheduler-arming guard for cold init work before the
@@ -938,7 +938,7 @@ no-progress timer starts. This guard covers fixed/cold costs such as kernel
 registration, orchestration SO dlopen, runtime init, and AICore handshake.
 It cannot know the graph-specific maximum orchestration producer wall time, so
 callers that raise scheduler/op timeouts must also size
-`PTO2_STREAM_SYNC_TIMEOUT_MS` for their worst-case orchestration window. Sim
+`SIMPLER_STREAM_SYNC_TIMEOUT_MS` for their worst-case orchestration window. Sim
 builds do not have STARS or ACL stream-sync timeouts, but scheduler overrides
 are still parsed and applied independently so slow CPU-sim kernels can raise
 the no-progress budget without onboard-only ordering limits. CI restores the

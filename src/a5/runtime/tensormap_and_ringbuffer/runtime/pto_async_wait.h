@@ -176,7 +176,7 @@ struct AsyncWaitList {
         int32_t *deferred_release_count{nullptr};
         int32_t deferred_release_capacity{0};
         int32_t inline_completed{0};
-#if PTO2_SCHED_PROFILING
+#if SIMPLER_SCHED_PROFILING
         int32_t thread_idx{0};
 #endif
 
@@ -293,7 +293,7 @@ struct AsyncWaitList {
         AICoreCompletionMailbox *aicore_mailbox, PTO2SchedulerState *sched,
         PTO2TaskSlotState **deferred_release_slot_states, int32_t &deferred_release_count,
         int32_t deferred_release_capacity
-#if PTO2_SCHED_PROFILING
+#if SIMPLER_SCHED_PROFILING
         ,
         int thread_idx
 #endif

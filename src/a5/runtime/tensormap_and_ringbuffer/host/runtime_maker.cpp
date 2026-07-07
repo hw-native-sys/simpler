@@ -607,7 +607,7 @@ static bool stage_device_args(
 // runtime. Behavior-only env reads (no new gates); kept here so the args and
 // image steps stay free of unrelated state.
 static void apply_orch_sched_env_flags(Runtime *runtime) {
-    const char *serial_env = std::getenv("PTO2_SERIAL_ORCH_SCHED");
+    const char *serial_env = std::getenv("SIMPLER_TMR_SERIAL_ORCH_SCHED_ENABLE");
     runtime->dev.serial_orch_sched =
         serial_env && (serial_env[0] == '1' || serial_env[0] == 't' || serial_env[0] == 'T');
     LOG_INFO_V0(
@@ -829,13 +829,14 @@ extern "C" int bind_callable_to_runtime_impl(
     // device_malloc). The buffer itself lives on the runner across runs; here we
     // just grow it to this run's packed size and bump-slice from it.
     RetainedTempBump bump;
-    bool use_temporary_buffer =
-        api->get_retained_temp_buffer != nullptr && api->set_retained_temp_buffer != nullptr;
+    bool use_temporary_buffer = api->get_retained_temp_buffer != nullptr && api->set_retained_temp_buffer != nullptr;
     if (use_temporary_buffer && !bump.begin(api, orch_args)) {
         return -1;
     }
 
-    auto bind_cleanup = RAIIScopeGuard([&]() { release_tensor_leases(runtime, api); });
+    auto bind_cleanup = RAIIScopeGuard([&]() {
+        release_tensor_leases(runtime, api);
+    });
 
     ChipStorageTaskArgs device_args;
     if (!stage_device_args(

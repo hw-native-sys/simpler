@@ -1037,7 +1037,7 @@ rules.
 
 - [l2-timing.md](l2-timing.md) — the everyday L2 numbers: `[STRACE]`
   host_wall / device_wall, plus Total / Orch / Sched straight from the
-  `PTO2_PROFILING` device-log markers (no swimlane capture, works with
+  `SIMPLER_DFX` device-log markers (no swimlane capture, works with
   `--rounds > 1`); the lighter alternative when you don't need the
   per-task / phase deep dive.
 - [profiling-framework.md](../profiling-framework.md) — shared

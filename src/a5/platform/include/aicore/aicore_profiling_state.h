@@ -60,7 +60,7 @@
 /**
  * Profiling enable bitmask (umbrella over dump_tensor / l2_swimlane / pmu).
  * Same layout as `KernelArgs::enable_profiling_flag`. AICore reads via
- * `GET_PROFILING_FLAG(get_aicore_profiling_flag(), PROFILING_FLAG_*)`.
+ * `SIMPLER_GET_DFX_FLAG(get_aicore_profiling_flag(), SIMPLER_DFX_FLAG_*)`.
  */
 __aicore__ void set_aicore_profiling_flag(uint32_t flag);
 __aicore__ uint32_t get_aicore_profiling_flag();

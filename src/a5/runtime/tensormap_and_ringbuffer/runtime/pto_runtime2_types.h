@@ -51,7 +51,7 @@
 #define SPIN_WAIT_HINT() ((void)0)
 #endif
 
-#if PTO2_ORCH_PROFILING || PTO2_SCHED_PROFILING
+#if SIMPLER_ORCH_PROFILING || SIMPLER_SCHED_PROFILING
 #include "aicpu/device_time.h"
 #endif
 
@@ -398,7 +398,7 @@ struct alignas(64) PTO2TaskSlotState {
     // the orchestrator adds consumers concurrently with the scheduler
     // traversing the list after task completion.
 
-#if PTO2_ORCH_PROFILING || PTO2_SCHED_PROFILING
+#if SIMPLER_ORCH_PROFILING || SIMPLER_SCHED_PROFILING
     void lock_fanout(uint64_t &atomic_count, uint64_t &wait_cycle) {
         uint64_t t0 = get_sys_cnt_aicpu();
         bool contended = false;

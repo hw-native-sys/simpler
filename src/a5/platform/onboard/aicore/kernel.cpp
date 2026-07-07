@@ -124,7 +124,7 @@ extern "C" __global__ __aicore__ void KERNEL_ENTRY(aicore_kernel)(__gm__ KernelA
     // publication a sequence like enabled(valid)→enabled(NULL table) or
     // enabled→disabled would leave `get_l2_swimlane_aicore_head()` returning
     // the prior launch's freed pointer.
-    if (GET_PROFILING_FLAG(k_args->enable_profiling_flag, PROFILING_FLAG_L2_SWIMLANE) &&
+    if (SIMPLER_GET_DFX_FLAG(k_args->enable_profiling_flag, SIMPLER_DFX_FLAG_L2_SWIMLANE) &&
         k_args->l2_swimlane_aicore_rotation_table != 0) {
         // Stash only the slot pointer. The slot CONTENTS are written by
         // AICPU's `l2_swimlane_aicpu_init` which runs concurrently with this
@@ -137,7 +137,7 @@ extern "C" __global__ __aicore__ void KERNEL_ENTRY(aicore_kernel)(__gm__ KernelA
     } else {
         set_l2_swimlane_aicore_head_slot(nullptr);
     }
-    if (GET_PROFILING_FLAG(k_args->enable_profiling_flag, PROFILING_FLAG_PMU)) {
+    if (SIMPLER_GET_DFX_FLAG(k_args->enable_profiling_flag, SIMPLER_DFX_FLAG_PMU)) {
         __gm__ uint64_t *pmu_ring_table = reinterpret_cast<__gm__ uint64_t *>(k_args->aicore_pmu_ring_addrs);
         if (pmu_ring_table != nullptr) {
             set_aicore_pmu_ring(reinterpret_cast<__gm__ PmuAicoreRing *>(pmu_ring_table[block_idx]));

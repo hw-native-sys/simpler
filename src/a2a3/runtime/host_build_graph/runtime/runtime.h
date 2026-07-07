@@ -207,18 +207,18 @@ public:
     int next_task_id;
 
     // Function address mapping (for API compatibility with rt2). Device-read
-    // under PTO2_PROFILING (dump-args path), so it lives in the prefix.
+    // under SIMPLER_DFX (dump-args path), so it lives in the prefix.
     uint64_t func_id_to_addr_[RUNTIME_MAX_FUNC_ID];
 
     // Tensor info metadata for tensor dump. Device-read via get_tensor_info()
-    // under PTO2_PROFILING, so it lives in the prefix.
+    // under SIMPLER_DFX, so it lives in the prefix.
     void *tensor_info_storage_;
     uint64_t tensor_info_storage_bytes_;
     uint32_t tensor_info_offsets_[RUNTIME_MAX_TASKS];
     uint16_t tensor_info_counts_[RUNTIME_MAX_TASKS];
 
     // Device allocation ranges used to recover tensor buffer addresses from
-    // task.args[]. Device-read via is_tensor_buffer_addr() under PTO2_PROFILING,
+    // task.args[]. Device-read via is_tensor_buffer_addr() under SIMPLER_DFX,
     // so it lives in the prefix.
     void *tensor_allocation_storage_;
     uint64_t tensor_allocation_storage_bytes_;

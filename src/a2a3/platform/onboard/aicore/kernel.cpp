@@ -114,9 +114,9 @@ extern "C" __global__ __aicore__ void KERNEL_ENTRY(aicore_kernel)(__gm__ KernelA
     // unconditional reset is defensive against future call sites that don't
     // carry that gate. Mirrors the publish-nullptr branch in
     // sim/aicore/kernel.cpp (sim keys only on the table pointer; onboard
-    // additionally AND-gates on PROFILING_FLAG_L2_SWIMLANE — intentional,
+    // additionally AND-gates on SIMPLER_DFX_FLAG_L2_SWIMLANE — intentional,
     // since the onboard table is shared across collectors).
-    if (GET_PROFILING_FLAG(k_args->enable_profiling_flag, PROFILING_FLAG_L2_SWIMLANE) &&
+    if (SIMPLER_GET_DFX_FLAG(k_args->enable_profiling_flag, SIMPLER_DFX_FLAG_L2_SWIMLANE) &&
         k_args->l2_swimlane_aicore_rotation_table != 0) {
         // Stash only the slot pointer. The slot CONTENTS are written by
         // AICPU's `l2_swimlane_aicpu_init`, which races with this entry but

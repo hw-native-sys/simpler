@@ -23,7 +23,7 @@
 // Profiling macros (compile-time gated)
 // =============================================================================
 
-#if PTO2_PROFILING
+#if SIMPLER_DFX
 #include "aicpu/device_time.h"
 // Accumulated nanoseconds per sub-step
 #define CYCLE_COUNT_START() uint64_t _t0 = get_sys_cnt_aicpu(), _t1
@@ -107,7 +107,7 @@ struct alignas(64) CoreExecState {
     // hot completion poll does a single volatile load instead of recomputing
     // reg_base + reg_offset(COND) on every iteration.
     volatile uint32_t *cond_ptr;  // offset 40: precomputed pointer to COND register
-#if PTO2_PROFILING
+#if SIMPLER_DFX
     // --- Profiling fields (dispatch path, compile-time gated) ---
     uint64_t running_dispatch_timestamp;  // offset 48: AICPU dispatch timestamp for running task
     uint64_t pending_dispatch_timestamp;  // offset 56: AICPU dispatch timestamp for pending task
@@ -434,7 +434,7 @@ struct SlotTransition {
 // Profiling counters (compile-time gated)
 // =============================================================================
 
-#if PTO2_PROFILING
+#if SIMPLER_DFX
 struct alignas(64) SchedL2SwimlaneCounters {
     bool l2_swimlane_enabled{false};
     uint64_t sched_start_ts{0};
@@ -456,7 +456,7 @@ struct alignas(64) SchedL2SwimlaneCounters {
     uint64_t pop_miss{0};
     uint64_t pop_hit_at_last_emit{0};
     uint64_t pop_miss_at_last_emit{0};
-#if PTO2_SCHED_PROFILING
+#if SIMPLER_SCHED_PROFILING
     uint64_t complete_probe_count{0};
     uint64_t complete_hit_count{0};
     uint64_t sched_complete_perf_cycle{0};

@@ -95,7 +95,7 @@ struct PTO2OrchestratorState {
     // Total core counts set once at executor init; used for submit-time deadlock detection.
     int32_t total_cluster_count{0};  // AIC cores = MIX clusters
     int32_t total_aiv_count{0};      // AIV cores (= 2 × clusters on standard hardware)
-#if PTO2_PROFILING
+#if SIMPLER_DFX
     // L2 swimlane_level copied from get_l2_swimlane_level().
     L2SwimlaneLevel l2_swimlane_level{L2SwimlaneLevel::DISABLED};
 #endif
@@ -116,7 +116,7 @@ struct PTO2OrchestratorState {
     int64_t inline_completed_tasks{0};
 
     // === STATISTICS ===
-#if PTO2_PROFILING
+#if SIMPLER_DFX
     int64_t tasks_submitted;
     int64_t buffers_allocated;
     int64_t bytes_allocated;
@@ -190,7 +190,7 @@ struct PTO2OrchestratorState {
 // Orchestrator Profiling Data
 // =============================================================================
 
-#if PTO2_ORCH_PROFILING
+#if SIMPLER_ORCH_PROFILING
 struct PTO2OrchProfilingData {
     uint64_t sync_cycle;
     uint64_t alloc_cycle;  // Combined task slot + heap allocation

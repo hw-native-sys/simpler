@@ -197,7 +197,7 @@ struct alignas(64) DeviceRuntimeLaunchDesc {
     // Serial orchestrator -> scheduler start control.
     // When true, scheduler threads wait until orchestration has fully built the
     // task graph before entering resolve_and_dispatch().
-    // Controlled via PTO2_SERIAL_ORCH_SCHED environment variable.
+    // Controlled via SIMPLER_TMR_SERIAL_ORCH_SCHED_ENABLE environment variable.
     bool serial_orch_sched;
 
     void *gm_sm_ptr_;                        // GM pointer to PTO2 shared memory (device)

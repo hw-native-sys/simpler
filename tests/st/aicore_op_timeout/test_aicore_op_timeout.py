@@ -62,9 +62,9 @@ def _build_chip_callable(platform: str) -> ChipCallable:
 @pytest.mark.timeout(60)
 def test_aicore_op_timeout_surfaces_as_runtime_error(st_platform, st_device_ids, monkeypatch):
     configure_logging("error")
-    monkeypatch.setenv("PTO2_SCHEDULER_TIMEOUT_MS", "2000")
-    monkeypatch.setenv("PTO2_OP_EXECUTE_TIMEOUT_US", "3000000")
-    monkeypatch.setenv("PTO2_STREAM_SYNC_TIMEOUT_MS", "4000")
+    monkeypatch.setenv("SIMPLER_SCHEDULER_TIMEOUT_MS", "2000")
+    monkeypatch.setenv("SIMPLER_OP_EXECUTE_TIMEOUT_US", "3000000")
+    monkeypatch.setenv("SIMPLER_STREAM_SYNC_TIMEOUT_MS", "4000")
 
     chip_callable = _build_chip_callable(st_platform)
     worker = Worker(level=2, platform=st_platform, runtime=RUNTIME, device_id=int(st_device_ids[0]))

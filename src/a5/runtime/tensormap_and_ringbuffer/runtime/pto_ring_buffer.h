@@ -44,7 +44,7 @@
 #include "common/platform_config.h"  // PLATFORM_PROF_SYS_CNT_FREQ (deadlock wall-clock)
 #include "common/unified_log.h"
 
-#if PTO2_PROFILING
+#if SIMPLER_DFX
 // Heap-ring wrap reporting — the allocator is the only place each individual
 // wrap is observable, so it notifies the scope_stats collector here. Gated:
 // pays nothing (no include, no call) when profiling is compiled out.
@@ -132,7 +132,7 @@ public:
         bool blocked_on_heap = false;
         uint64_t block_cycle0 = 0;  // wall-clock anchor for the deadlock backstop
         bool block_timing = false;  // false until the first no-reclaim-progress spin
-#if PTO2_ORCH_PROFILING
+#if SIMPLER_ORCH_PROFILING
         uint64_t wait_start = 0;
         bool waiting = false;
 #endif
@@ -143,7 +143,7 @@ public:
                 void *heap_ptr = try_bump_heap(aligned_size);
                 if (heap_ptr) {
                     int32_t task_id = commit_task();
-#if PTO2_ORCH_PROFILING
+#if SIMPLER_ORCH_PROFILING
                     record_wait(spin_count, wait_start, waiting);
 #endif
                     return {task_id, task_id & window_mask_, heap_ptr, static_cast<char *>(heap_ptr) + aligned_size};
@@ -155,7 +155,7 @@ public:
 
             // Spin: wait for scheduler to advance last_task_alive
             spin_count++;
-#if PTO2_ORCH_PROFILING
+#if SIMPLER_ORCH_PROFILING
             if (!waiting) {
                 wait_start = get_sys_cnt_aicpu();
                 waiting = true;
@@ -303,7 +303,7 @@ private:
         uint64_t old_tail = heap_tail_;
         heap_tail_ =
             static_cast<uint64_t>(static_cast<char *>(desc.packed_buffer_end) - static_cast<char *>(heap_base_));
-#if PTO2_PROFILING
+#if SIMPLER_DFX
         // Reclaim pointer moves forward monotonically in ring order; a decrease
         // means it wrapped past heap_size_ (occupancy < heap_size_ guarantees at
         // most one wrap per call). Report it so scope_stats can unroll.
@@ -340,7 +340,7 @@ private:
                 );
                 result = heap_base_;
                 heap_top_ = alloc_size;
-#if PTO2_PROFILING
+#if SIMPLER_DFX
                 // Allocation pointer just wrapped past heap_size_; report it so
                 // scope_stats can unroll the wrapping offset into a monotonic value.
                 // The collector attributes the wrap to the current scope's ring.
@@ -371,7 +371,7 @@ private:
         return result;
     }
 
-#if PTO2_ORCH_PROFILING
+#if SIMPLER_ORCH_PROFILING
     void record_wait(int spin_count, uint64_t wait_start, bool waiting) {
         if (waiting) {
             extern uint64_t g_orch_alloc_wait_cycle;

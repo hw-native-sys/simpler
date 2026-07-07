@@ -44,7 +44,7 @@ already-measured window into the host buffer, the host reduces across threads
 (`Sched` = `min(start)..max(end)` over the scheduler threads) and emits them as
 markers. The verbose per-thread `orch_start=…` / `sched_start=…` / `Scheduler
 summary` (loops, tasks_scheduled) device-log lines are gated behind
-`PTO2_ORCH_PROFILING` / `PTO2_SCHED_PROFILING` (default off) as an opt-in
+`SIMPLER_ORCH_PROFILING` / `SIMPLER_SCHED_PROFILING` (default off) as an opt-in
 deep-dive — see [l2-timing.md](l2-timing.md).
 
 ### Buffer layout & flow
@@ -68,18 +68,18 @@ deep-dive — see [l2-timing.md](l2-timing.md).
   `[STRACE]` marker nested under `simpler_run.runner_run.device_wall`
   (see [host-trace.md](host-trace.md)).
 
-### Gating: `SIMPLER_DEVICE_PROFILING` (host/device split)
+### Gating: `SIMPLER_DEVICE_STRACE_ENABLE` (host/device split)
 
 The device markers can be turned off independently of the host spans so a
 deployment can profile the two domains separately:
 
-* **Device** (`clk=dev` markers): the runtime env `SIMPLER_DEVICE_PROFILING`,
+* **Device** (`clk=dev` markers): the runtime env `SIMPLER_DEVICE_STRACE_ENABLE`,
   read once by `emit_device_phase_markers` in the host `c_api_shared`. `=0`
   suppresses the whole device-phase emit; any other value (or unset) keeps it on
   (**default on**). It does not affect the on-device stamping cost (cheap plain
   stores) — only whether the host re-emits the readback as markers.
 * **Host** (`simpler_run` / `bind` / `runner_run` / `validate` spans): no new
-  knob — they ride the compile-time `SIMPLER_PROFILING` macro and the log level
+  knob — they ride the compile-time `SIMPLER_HOST_STRACE` macro and the log level
   (`LOG_INFO_V9`), so raising the log threshold drops them.
 
 `RunWall` is the whole on-NPU wall (the former `RunTiming.device_wall`); it is

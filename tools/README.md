@@ -21,7 +21,7 @@ elapsed time.
 ./tools/benchmark_rounds.sh -p a2a3 -d 4 -n 20 -r tensormap_and_ringbuffer
 ```
 
-Requires `PTO2_PROFILING=1` in the runtime; device log must include the
+Requires `SIMPLER_DFX=1` in the runtime; device log must include the
 `orch_*` / `sched_*` lines. The `TMR_EXAMPLE_CASES` map at the top of the
 script controls which examples/cases are run.
 
