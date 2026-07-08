@@ -189,13 +189,14 @@ SchedulerContext::PublishHandle SchedulerContext::prepare_subtask_to_core(
 
     // AICore buffer rotation lives on the dispatch path: count this dispatch
     // and rotate before write_reg when we're about to cross a BUFFER_SIZE
-    // boundary. The completion-before-dispatch invariant makes this race-free
-    // (all prior tasks on this core have FIN'd, so AICore has dcci'd their
-    // records out of the old buffer). Gated on the same enable bit as flush
-    // so level=1 (AICORE_TIMING-only) participates without needing complete_task.
+    // boundary. The just-filled buffer is not handed to the host here — it is
+    // released once AICore ACKs this boundary dispatch (see the ACK hook in
+    // check_running_cores_for_completion), because FIN precedes the swimlane
+    // record on this runtime. `reg_task_id` is passed as that ACK gate. Gated on
+    // the same enable bit as flush so level=1 (AICORE_TIMING-only) participates.
 #if PTO2_PROFILING
     if (l2_swimlane_level_ != L2SwimlaneLevel::DISABLED) {
-        l2_swimlane_aicpu_on_aicore_dispatch(core_id, thread_idx);
+        l2_swimlane_aicpu_on_aicore_dispatch(core_id, thread_idx, reg_task_id);
     }
 #endif
 

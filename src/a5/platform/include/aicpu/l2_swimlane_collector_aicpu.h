@@ -85,24 +85,47 @@ void l2_swimlane_aicpu_init(int worker_count);
  *
  *   1. Maintain the per-core AICPU-side dispatch count.
  *   2. Rotate the AICore buffer when the count is about to cross a
- *      PLATFORM_AICORE_BUFFER_SIZE boundary — enqueue the just-filled buffer
- *      to the ready queue and pop the next one from free_queue.
+ *      PLATFORM_AICORE_BUFFER_SIZE boundary — publish the next buffer from
+ *      free_queue to AICore and STASH the just-filled buffer for deferred,
+ *      ACK-gated release (see l2_swimlane_aicpu_on_aicore_ack).
  *   3. Bump the AICore pool's `total_record_count` so host reconcile
  *      (total == collected + dropped) stays accurate at all levels —
  *      including AICORE_TIMING (level=1), where `complete_task` is bypassed.
  *
- * Race safety: rotation runs BEFORE the dispatch register write. The runtime's
- * completion-before-dispatch invariant (AICore per core is single-threaded
- * and AICPU does not dispatch task K+1 until K FIN'd) guarantees AICore has
- * FIN'd — and dcci'd out — every record in the old buffer by then. No
- * AICore-side signal is needed; AICPU has full dispatch visibility itself.
+ * Race safety: rotation runs BEFORE the dispatch register write. The
+ * completion-before-dispatch invariant proves prior tasks FIN'd, but
+ * tensormap_and_ringbuffer may write FIN before the swimlane record, so the old
+ * buffer's tail record may not have drained at rotation time. The old buffer is
+ * therefore not enqueued here; it is released once AICore ACKs the boundary
+ * dispatch (whose token is `reg_task_id`) or, when a runtime does not wire the
+ * ACK hook, by the next-rotation / run-end backstop.
  *
  * No-op if l2_swimlane is disabled or `core_id` is out of range.
  *
- * @param core_id     Core index this dispatch targets
- * @param thread_idx  Owning AICPU thread (target ready-queue for rotation)
+ * @param core_id      Core index this dispatch targets
+ * @param thread_idx   Owning AICPU thread (target ready-queue for rotation)
+ * @param reg_task_id  Per-core dispatch token of this dispatch; when it is the
+ *                     boundary dispatch it becomes the ACK gate for releasing
+ *                     the just-filled buffer
  */
-void l2_swimlane_aicpu_on_aicore_dispatch(int core_id, int thread_idx);
+void l2_swimlane_aicpu_on_aicore_dispatch(int core_id, int thread_idx, uint32_t reg_task_id);
+
+/**
+ * Post-completion hook: release an ACK-gated AICore buffer.
+ *
+ * Called from the completion path on every matched AICore COND event (ACK or
+ * FIN). When a rotation has stashed the previous buffer with a gate equal to
+ * `reg_task_id`, that event proves AICore reached at least the new buffer's
+ * first-task ACK — hence passed the old buffer's last record dcci+dsb — so the
+ * stashed buffer is enqueued to the ready queue. No-op when nothing is stashed
+ * or the token does not match the gate. Runtimes that write the record before
+ * FIN need not wire this; the next-rotation / run-end backstop covers them.
+ *
+ * @param core_id      Core index the COND event was observed on
+ * @param thread_idx   Owning AICPU thread (target ready-queue)
+ * @param reg_task_id  Task token extracted from the observed COND value
+ */
+void l2_swimlane_aicpu_on_aicore_ack(int core_id, int thread_idx, uint32_t reg_task_id);
 
 /**
  * Commit an AICPU-side timing record for one completed task.

@@ -281,11 +281,14 @@ inline bool AicpuExecutor::try_dispatch_task(
     pending_task_ids_[core_id] = task_id;
 
     // AICore buffer rotation: count this dispatch and rotate before write_reg
-    // when crossing a BUFFER_SIZE boundary. The completion-before-dispatch
-    // invariant makes this race-free (all prior tasks on this core have FIN'd,
-    // so AICore has dcci'd their records out of the old buffer).
+    // when crossing a BUFFER_SIZE boundary. This runtime writes the swimlane
+    // record before FIN, so the completion-before-dispatch invariant already
+    // guarantees the old buffer's records are drained at rotation; the shared
+    // rotate still stashes the buffer for ACK-gated release, drained here by the
+    // next-rotation / run-end backstop (no ACK hook wired). `task_id` is passed
+    // as the (unused-for-hbg) gate token.
     if (l2_swimlane_enabled) {
-        l2_swimlane_aicpu_on_aicore_dispatch(core_id, thread_idx);
+        l2_swimlane_aicpu_on_aicore_dispatch(core_id, thread_idx, static_cast<uint32_t>(task_id));
     }
 
     // Publish task data before AICore can observe the dispatched task_id.

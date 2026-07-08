@@ -172,10 +172,12 @@ void SchedulerContext::dispatch_subtask_to_core(
 
     // AICore buffer rotation lives on the dispatch path: count this dispatch
     // and rotate before write_reg when we're about to cross a BUFFER_SIZE
-    // boundary. The completion-before-dispatch invariant makes this race-free.
+    // boundary. The just-filled buffer is stashed for ACK-gated release; a5 does
+    // not wire the ACK hook, so it drains via the next-rotation / run-end
+    // backstop. `reg_task_id` is passed as the gate token.
 #if PTO2_PROFILING
     if (l2_swimlane_level_ != L2SwimlaneLevel::DISABLED) {
-        l2_swimlane_aicpu_on_aicore_dispatch(core_id, thread_idx);
+        l2_swimlane_aicpu_on_aicore_dispatch(core_id, thread_idx, reg_task_id);
     }
 #endif
 

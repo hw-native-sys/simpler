@@ -66,12 +66,15 @@ struct L2SwimlaneAicoreLocalState {
  *
  * Race avoidance: AICPU rotates strictly before `write_reg(DATA_MAIN_BASE)`
  * for the first task of a new BUFFER_SIZE batch — driven by AICPU's own
- * per-core dispatch count (no AICore-side signal). The runtime's
- * completion-before-dispatch invariant (AICore per core is single-threaded
- * and AICPU does not dispatch task K+1 until K FIN'd) guarantees all prior
- * tasks have FIN'd at rotation time, so AICore has already finished writing
- * their records and dcci'd them out before AICPU enqueues the old buffer to
- * the ready queue.
+ * per-core dispatch count (no AICore-side signal). At rotation AICPU only
+ * publishes the new buffer; it does NOT hand the old buffer to the host there.
+ * The completion-before-dispatch invariant proves all prior tasks FIN'd, but
+ * this runtime writes FIN before the record below, so a FIN-gated release could
+ * publish a buffer whose tail record's `dcci(record, CACHELINE_OUT) + dsb` has
+ * not landed. AICPU instead releases the old buffer once it observes AICore ACK
+ * the new buffer's first task (l2_swimlane_aicpu_on_aicore_ack): by this core's
+ * single-threaded program order that ACK is emitted only after the previous
+ * task's record dcci+dsb, so the old buffer's last record is guaranteed drained.
  *
  * @param head            Per-core L2SwimlaneActiveHead channel. The executor
  *                        resolves it right after Phase 1 handshake exit

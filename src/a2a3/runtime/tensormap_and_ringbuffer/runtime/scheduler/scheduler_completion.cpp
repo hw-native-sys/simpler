@@ -351,6 +351,16 @@ void SchedulerContext::check_running_cores_for_completion(
         );
         if (!t.matched) continue;
 
+#if PTO2_PROFILING
+        // Release an ACK-gated AICore swimlane buffer if this matched ACK/FIN is
+        // the one a rotation is waiting on: it proves the core advanced past the
+        // just-rotated buffer's tail record (FIN precedes the record write on
+        // this runtime, so rotation could not release the buffer itself).
+        if (l2_swimlane_level_ != L2SwimlaneLevel::DISABLED) {
+            l2_swimlane_aicpu_on_aicore_ack(core_id, thread_idx, static_cast<uint32_t>(reg_task_id));
+        }
+#endif
+
 #if PTO2_SCHED_PROFILING
         if (l2_swimlane.l2_swimlane_enabled && (t.running_done || t.pending_done)) {
             l2_swimlane.complete_hit_count++;

@@ -285,9 +285,11 @@ inline bool AicpuExecutor::try_dispatch_task(
     pending_task_ids_[core_id] = task_id;
 
     // AICore buffer rotation: count this dispatch and rotate before write_reg
-    // when crossing a BUFFER_SIZE boundary.
+    // when crossing a BUFFER_SIZE boundary. The just-filled buffer is stashed
+    // for ACK-gated release and drained via the next-rotation / run-end backstop
+    // (no ACK hook wired). `task_id` is passed as the gate token.
     if (l2_swimlane_enabled) {
-        l2_swimlane_aicpu_on_aicore_dispatch(core_id, thread_idx);
+        l2_swimlane_aicpu_on_aicore_dispatch(core_id, thread_idx, static_cast<uint32_t>(task_id));
     }
 
     // Publish task data before AICore can observe the dispatched task_id.

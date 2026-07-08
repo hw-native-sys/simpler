@@ -60,6 +60,24 @@ static L2SwimlaneAicoreTaskPool *s_aicore_task_pools[PLATFORM_MAX_CORES] = {};
 // Single-writer per cell (the scheduler thread that owns the core).
 static uint32_t s_aicore_dispatched_count[PLATFORM_MAX_CORES] = {};
 
+// Per-core deferred AICore old-buffer enqueue (ACK-gate for the FIN-before-record
+// window). The tensormap_and_ringbuffer AICore executor writes FIN before the
+// swimlane record, so releasing a just-filled buffer on the FIN that gated the
+// boundary dispatch could publish a buffer whose tail record has not drained
+// yet. Instead the rotation stashes the old buffer here and it is released only
+// once AICore ACKs the first task of the NEW buffer (reg_task_id == gate): by
+// AICore's single-threaded program order that ACK proves the old buffer's last
+// record dcci+dsb has landed. host_build_graph writes the record before FIN, so
+// it has no such window — it never wires the ACK hook and its stashed buffer is
+// released by the next-rotation / run-end backstop instead. Single-writer per
+// cell (the scheduler thread that owns the core).
+struct AicorePendingEnqueue {
+    uint64_t buf_ptr = 0;  // 0 == nothing pending
+    uint32_t buf_seq = 0;
+    uint32_t gate_reg_task_id = 0;
+};
+static AicorePendingEnqueue s_aicore_pending_enqueue[PLATFORM_MAX_CORES] = {};
+
 // Per-core cached current-records-buffer pointer. Written by AICPU when
 // rotating buffers from inside `complete_record`. AICore writes to its own
 // per-core L2SwimlaneAicoreTaskBuffer (host-allocated, AICPU rotates) and AICPU
@@ -232,9 +250,14 @@ void l2_swimlane_aicpu_init(int worker_count) {
     // launch must start counting from 0 so the rotation boundary check
     // (count % BUFFER_SIZE == 0) lands on the right dispatches. Stale values
     // from a prior launch would skip the first rotation (count already past a
-    // boundary) or trigger one prematurely.
+    // boundary) or trigger one prematurely. The deferred-enqueue stash must be
+    // cleared too: a prior launch that ended with a buffer still stashed (gate
+    // ACK never observed, or run-end flush hit a full queue) would otherwise
+    // leave a dangling buf_ptr that a matching reg_task_id in this launch could
+    // flush — freeing a buffer that no longer belongs to us.
     for (int i = 0; i < PLATFORM_MAX_CORES; i++) {
         s_aicore_dispatched_count[i] = 0;
+        s_aicore_pending_enqueue[i] = AicorePendingEnqueue{};
     }
 
     void *l2_swimlane_base = reinterpret_cast<void *>(g_platform_l2_swimlane_base);
@@ -362,13 +385,42 @@ static void switch_records_buffer(int core_id, int thread_idx) {
     );
 }
 
-// Try to rotate the AICore buffer for `core_id`. Called from the completion
-// path after a successful L2SwimlaneAicpuTaskRecord commit so the just-FIN'd task's
-// AICore record is guaranteed to be in the old buffer before we enqueue it.
-// On success bumps `ac_state->head.current_buf_seq`; on failure (empty free queue
-// or full ready queue) the old buffer is abandoned in place, AICore overflows
-// it from now on, and the drop count grows.
-static void aicore_rotate(int core_id, int thread_idx) {
+// Release a deferred AICore buffer (stashed by aicore_rotate) to the ready
+// queue. Shared by the ACK hook (prompt release), the next-rotation backstop,
+// and run-end flush. No-op when nothing is pending. On ready-queue-full the
+// buffer stays stashed for a later retry; the same no-double-count rationale as
+// the rotation queue-full branch applies (reconcile reports silent_loss).
+static void flush_aicore_pending_enqueue(int core_id, int thread_idx) {
+    AicorePendingEnqueue &pe = s_aicore_pending_enqueue[core_id];
+    if (pe.buf_ptr == 0) {
+        return;
+    }
+    L2SwimlaneAicoreTaskBuffer *old_buf = reinterpret_cast<L2SwimlaneAicoreTaskBuffer *>(pe.buf_ptr);
+    old_buf->count = static_cast<uint32_t>(PLATFORM_AICORE_BUFFER_SIZE);
+    wmb();
+    int rc = enqueue_ready_buffer(
+        s_l2_swimlane_header, thread_idx, core_id, pe.buf_ptr, pe.buf_seq, L2SwimlaneBufferKind::AicoreTask
+    );
+    if (rc != 0) {
+        LOG_ERROR(
+            "Thread %d: Core %d failed to enqueue deferred AICore buffer (queue full); will retry at flush", thread_idx,
+            core_id
+        );
+        return;
+    }
+    pe.buf_ptr = 0;
+}
+
+// Rotate the AICore buffer for `core_id` at a PLATFORM_AICORE_BUFFER_SIZE
+// dispatch boundary: pop a fresh buffer from free_queue, publish it via the head
+// channel, and DEFER the just-filled buffer's enqueue via
+// s_aicore_pending_enqueue (see that declaration for the FIN-before-record
+// rationale). `new_buf_first_reg_task_id` is the reg_task_id of the boundary
+// dispatch — the first task written into the new buffer — used as the ACK gate
+// that later releases the stashed buffer. On success bumps
+// `ac_state->head.current_buf_seq`; on empty free queue the old buffer is kept
+// active in place (AICore overflows it, drop count grows).
+static void aicore_rotate(int core_id, int thread_idx, uint32_t new_buf_first_reg_task_id) {
     L2SwimlaneAicoreTaskPool *ac_state = s_aicore_task_pools[core_id];
     if (ac_state == nullptr) {
         return;
@@ -410,30 +462,19 @@ static void aicore_rotate(int core_id, int thread_idx) {
         return;
     }
 
-    // Enqueue the just-filled AICore buffer with count = BUFFER_SIZE.
+    // Defer the just-filled buffer's enqueue behind the ACK gate instead of
+    // handing it to the host now (see s_aicore_pending_enqueue). First drain any
+    // buffer still stashed from a prior rotation whose gate ACK was never
+    // observed: its gate task completed a full BUFFER_SIZE batch ago, so it is
+    // long safe to release. If that drain fails (ready queue full) the older
+    // buffer is overwritten below and shows up as silent_loss at reconcile —
+    // the same lossy regime the pre-defer code hit on a queue-full enqueue.
     if (old_buf_ptr != 0) {
-        L2SwimlaneAicoreTaskBuffer *old_buf = reinterpret_cast<L2SwimlaneAicoreTaskBuffer *>(old_buf_ptr);
-        old_buf->count = static_cast<uint32_t>(PLATFORM_AICORE_BUFFER_SIZE);
-        wmb();
-        int rc = enqueue_ready_buffer(
-            s_l2_swimlane_header, thread_idx, core_id, old_buf_ptr, seq, L2SwimlaneBufferKind::AicoreTask
-        );
-        if (rc != 0) {
-            // Ready queue full — we leave current_buf_ptr pointing at the
-            // old buffer so the run-end flush path retries the enqueue (the
-            // host is draining concurrently; the queue may have space by
-            // then). We deliberately do NOT bump dropped here for the same
-            // reason as the empty-free-queue branch: counting a drop now
-            // would double-count if the flush succeeds in delivering the
-            // buffer to the host. Reconcile reports the actual loss as
-            // silent_loss when neither this rotation nor the flush
-            // delivers the records.
-            LOG_ERROR(
-                "Thread %d: Core %d failed to enqueue AICore buffer at rotation (queue full); will retry at flush",
-                thread_idx, core_id
-            );
-            return;
-        }
+        flush_aicore_pending_enqueue(core_id, thread_idx);
+        AicorePendingEnqueue &pe = s_aicore_pending_enqueue[core_id];
+        pe.buf_ptr = old_buf_ptr;
+        pe.buf_seq = seq;
+        pe.gate_reg_task_id = new_buf_first_reg_task_id;
     }
 
     // Pop next buffer from free_queue and publish via the head channel.
@@ -458,17 +499,20 @@ static void aicore_rotate(int core_id, int thread_idx) {
 // per-core dispatch count and rotates the AICore buffer when the count is
 // about to cross a PLATFORM_AICORE_BUFFER_SIZE boundary.
 //
-// Race safety: rotation runs before the dispatch register write. The
-// completion-before-dispatch invariant (AICore per core is single-threaded
-// and AICPU does not dispatch task K+1 until K FIN'd) guarantees AICore has
-// already finished writing — and dcci'd out — every record in the old buffer
-// by then. AICPU can safely enqueue the old buffer to the ready queue.
+// Race safety: rotation runs before the dispatch register write and publishes
+// the new buffer to AICore, but does NOT hand the old buffer to the host here.
+// The old buffer is stashed and released only once AICore ACKs the first task
+// of the new buffer (l2_swimlane_aicpu_on_aicore_ack) — the completion-before-
+// dispatch invariant proves prior tasks FIN'd, but tensormap_and_ringbuffer
+// writes FIN before the swimlane record, so FIN alone does not prove the tail
+// record has drained. `reg_task_id` is that boundary dispatch's token, stored
+// as the ACK gate.
 //
 // total_record_count accounting also lives here: one AICore record == one
 // dispatch, so the dispatch count IS the AICore-side total. Bumping here
 // (instead of inside complete_task) means level=1 (AICORE_TIMING-only) gets
 // accurate reconcile counts even when complete_task is bypassed.
-void l2_swimlane_aicpu_on_aicore_dispatch(int core_id, int thread_idx) {
+void l2_swimlane_aicpu_on_aicore_dispatch(int core_id, int thread_idx, uint32_t reg_task_id) {
     if (!g_enable_l2_swimlane) {
         return;
     }
@@ -484,10 +528,26 @@ void l2_swimlane_aicpu_on_aicore_dispatch(int core_id, int thread_idx) {
     // batch (prev = BUFFER_SIZE, 2*BUFFER_SIZE, ...). PLATFORM_AICORE_BUFFER_SIZE
     // is asserted power-of-two so the mod lowers to a bitwise AND.
     if (prev > 0 && (prev & (PLATFORM_AICORE_BUFFER_SIZE - 1)) == 0) {
-        aicore_rotate(core_id, thread_idx);
+        aicore_rotate(core_id, thread_idx, reg_task_id);
     }
     s_aicore_dispatched_count[core_id] = prev + 1;
     ac_state->head.total_record_count += 1;
+}
+
+void l2_swimlane_aicpu_on_aicore_ack(int core_id, int thread_idx, uint32_t reg_task_id) {
+    if (core_id < 0 || core_id >= PLATFORM_MAX_CORES) {
+        return;
+    }
+    AicorePendingEnqueue &pe = s_aicore_pending_enqueue[core_id];
+    // Fast path: nothing stashed, or this is not the gating ACK/FIN. gate_reg_task_id
+    // is the boundary dispatch's token; the first COND event carrying it means
+    // AICore reached at least ACK of the new buffer's first task, hence passed
+    // record_task + dsb of the old buffer's last record. reg_task_id is unique
+    // per BUFFER_SIZE window, so this cannot fire early.
+    if (pe.buf_ptr == 0 || pe.gate_reg_task_id != reg_task_id) {
+        return;
+    }
+    flush_aicore_pending_enqueue(core_id, thread_idx);
 }
 
 int l2_swimlane_aicpu_complete_task(
@@ -615,6 +675,12 @@ void l2_swimlane_aicpu_flush(int thread_idx, const int *cur_thread_cores, int co
         // the buffer is actually full.
         L2SwimlaneAicoreTaskPool *ac_state = s_aicore_task_pools[core_id];
         if (ac_state == nullptr) continue;
+
+        // Drain any ACK-gated buffer still stashed from a rotation whose gate
+        // ACK was never observed before teardown. By run end every AICore task
+        // has completed, so the buffer's records are fully drained. Enqueue it
+        // before the current buffer so ready-queue order follows buffer_seq.
+        flush_aicore_pending_enqueue(core_id, thread_idx);
 
         rmb();
         uint64_t ac_buf_ptr = ac_state->head.current_buf_ptr;
