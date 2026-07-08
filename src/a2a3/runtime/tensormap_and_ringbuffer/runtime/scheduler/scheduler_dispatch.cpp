@@ -1123,7 +1123,7 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
         // end with span extending past the second poll, which made finish_time
         // events from the second poll fall under the Dispatch bar rather than
         // a Complete bar of their own — confusing for trace consumers.)
-        if (dispatch_t0 != 0 && try_pushed && l2_swimlane.phase_dispatch_count > 0) {
+        if (dispatch_t0 != 0 && l2_swimlane.phase_dispatch_count > 0) {
             uint64_t dispatch_t1 = get_sys_cnt_aicpu();
             uint64_t pop_hit_delta = l2_swimlane.pop_hit - l2_swimlane.pop_hit_at_last_emit;
             uint64_t pop_miss_delta = l2_swimlane.pop_miss - l2_swimlane.pop_miss_at_last_emit;
@@ -1146,26 +1146,29 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
         }
 #endif
 
-        // Phase 4b: early-dispatch onto spare cores, but ONLY when this thread is
-        // otherwise idle — nothing was dispatched this iteration AND no ready work is
-        // queued for any shape. Early-dispatch competes with normal dispatch for
-        // pending slots, so gating on "no ready work" keeps it from delaying a real
-        // ready task; skipping the producer-fanout scan when busy also removes its
-        // per-iteration cost (the discovery walk only runs on genuinely idle passes).
-        bool any_ready_work = try_pushed;
-        for (int s = 0; !any_ready_work && s < PTO2_NUM_RESOURCE_SHAPES; s++) {
-            if (sched_->ready_queues[s].size() > 0) any_ready_work = true;
+        // Phase 4b: early-dispatch onto spare cores. Runs only when this thread
+        // has spare capacity AND no real ready work is queued. Two gates, cheapest
+        // and most-local first:
+        //   1. has_any_free_slot() — reads only this thread's core tracker (no
+        //      shared/atomic access). A fully-occupied thread skips here, never
+        //      touching the shared ready_queues or the shared early_dispatch_queue.
+        //   2. ready_queues empty — keeps early-dispatch from delaying a real ready
+        //      task (there is none to delay when empty).
+        // pmu_active also disables it: dispatch_ready_tasks already withholds
+        // PENDING dispatch under PMU to preserve single-issue windows, and staging
+        // gated work would perturb the same windows. The old try_pushed gate is
+        // gone on purpose — discovery is event-driven (propagate_dispatch_fanin),
+        // so this pass only drains the queue, and spare cores left after a partial
+        // dispatch get pre-staged the same iteration instead of waiting a round.
+        bool run_early_dispatch = !pmu_active && tracker.has_any_free_slot();
+        for (int s = 0; run_early_dispatch && s < PTO2_NUM_RESOURCE_SHAPES; s++) {
+            if (sched_->ready_queues[s].size() > 0) run_early_dispatch = false;
         }
 #if PTO2_PROFILING
         bool early_dispatch_record = l2_swimlane_level_ >= L2SwimlaneLevel::SCHED_PHASES;
         uint64_t early_dispatch_t0 = early_dispatch_record ? get_sys_cnt_aicpu() : 0;
 #endif
-        // Skip speculative early-dispatch under PMU: dispatch_ready_tasks already
-        // withholds PENDING dispatch when pmu_active to preserve single-issue PMU
-        // windows, and staging gated work into idle/pending slots would perturb the
-        // same windows.
-        [[maybe_unused]] int32_t staged_count =
-            (pmu_active || any_ready_work) ? 0 : try_speculative_early_dispatch(thread_idx);
+        [[maybe_unused]] int32_t staged_count = run_early_dispatch ? try_speculative_early_dispatch(thread_idx) : 0;
 #if PTO2_PROFILING
         // Emit an EarlyDispatch bar so a staging-dominated iteration is attributed
         // to early-dispatch rather than disappearing into a blank gap.
@@ -1179,70 +1182,14 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
             // those blocks belong to this EarlyDispatch bar, so clear the counter
             // before it leaks into the next Dispatch bar.
             sched_l2_swimlane_[thread_idx].phase_dispatch_count = 0;
-            // Advance _t0_phase so the following second-poll's Complete bar
-            // starts at the EarlyDispatch end, not before it (otherwise their
-            // spans overlap and the outer-phase mutual-exclusion breaks).
+            // Advance _t0_phase so the next phase bar starts at the EarlyDispatch
+            // end, not before it (otherwise their spans overlap and the
+            // outer-phase mutual-exclusion breaks).
             _t0_phase = early_dispatch_t1;
         }
 #endif
 
-        // Second completion poll. dispatch_ready_tasks + try_speculative_early_dispatch
-        // above can take several us in a busy window; a producer block that FINs
-        // during them would otherwise wait for the NEXT iteration's top-of-loop
-        // Phase-1 poll (the ~7us detection latency that delays a flagged
-        // producer's doorbell). Re-polling here observes those FINs immediately,
-        // so the doorbell fires this iteration. Idempotent (the poll is a poll);
-        // we drain deferred releases eagerly to keep the buffer from growing.
 #if PTO2_PROFILING
-        uint64_t complete2_t0 = (l2_swimlane_level_ >= L2SwimlaneLevel::SCHED_PHASES) ? get_sys_cnt_aicpu() : 0;
-#endif
-        if (tracker.has_any_running_cores()) {
-            int32_t completed_2nd = 0;
-            check_running_cores_for_completion(
-                thread_idx, hank, completed_2nd, cur_thread_completed, made_progress, deferred_release_slot_states,
-                deferred_release_count
-            );
-            if (completed_2nd > 0) {
-#if PTO2_SCHED_PROFILING
-                sched_->tasks_completed.fetch_add(completed_2nd, std::memory_order_relaxed);
-#endif
-                completed_tasks_.fetch_add(completed_2nd, std::memory_order_relaxed);
-                last_progress_count = completed_tasks_.load(std::memory_order_relaxed);
-            }
-            // Eager drain so the second poll can't push deferred_release toward
-            // its cap between idle iterations.
-            while (deferred_release_count >= PTO2_DEFERRED_RELEASE_CAP - 96) {
-#if PTO2_SCHED_PROFILING
-                (void)sched_->on_task_release(*deferred_release_slot_states[--deferred_release_count], thread_idx);
-#else
-                sched_->on_task_release(*deferred_release_slot_states[--deferred_release_count]);
-#endif
-            }
-        }
-#if PTO2_PROFILING
-        // Complete2 outer phase: covers second-poll FIN observation. Without
-        // this emit, FIN counts from the second poll would carry over into the
-        // next iter's first-Complete bar and be displayed with a span that
-        // doesn't actually include those FINs' timestamps (visible mismatch
-        // between Complete bar span and per-task finish_time in Worker /
-        // Scheduler View).
-        if (complete2_t0 != 0 && (l2_swimlane.phase_complete_count > 0 || l2_swimlane.phase_subretire_count > 0)) {
-            uint64_t complete2_t1 = get_sys_cnt_aicpu();
-            int16_t phase_end_shared[L2SWIMLANE_NUM_QUEUE_SHAPES];
-            capture_phase_end_fresh(phase_end_shared);
-            l2_swimlane_aicpu_record_sched_phase(
-                thread_idx, L2SwimlaneSchedPhaseKind::Complete, complete2_t0, complete2_t1,
-                l2_swimlane.sched_loop_count, l2_swimlane.phase_complete_count + l2_swimlane.phase_subretire_count,
-                /*pop_hit=*/0,
-                /*pop_miss=*/0, phase_start_shared, phase_end_shared
-            );
-            for (int s = 0; s < L2SWIMLANE_NUM_QUEUE_SHAPES; s++)
-                phase_start_shared[s] = phase_end_shared[s];
-            _t0_phase = complete2_t1;
-            l2_swimlane.phase_complete_count = 0;
-            l2_swimlane.phase_subretire_count = 0;
-        }
-
         // Cycle-counter LAP for the iter tail. Dispatch's emit moved earlier
         // (see Phase 4 above) so this branch only routes the time accumulator.
         if (!try_pushed) {

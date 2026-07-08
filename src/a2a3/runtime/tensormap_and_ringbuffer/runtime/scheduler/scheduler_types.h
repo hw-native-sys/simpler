@@ -208,6 +208,15 @@ public:
 
     bool has_any_running_cores() const { return ((~core_states_) & (aic_mask_ | aiv_mask_)).has_value(); }
 
+    // True if any core on this thread still has a free slot to stage onto — an
+    // idle core (running slot) or a running core with a free pending slot. A
+    // core is unavailable only when running AND its pending slot is occupied;
+    // idle cores keep pending_occupied_ clear by invariant, so
+    // ~pending_occupied_ over all cores is exactly "has a free slot". Purely
+    // local (no shared/atomic access) — used to skip early dispatch, and its
+    // shared-queue pop, when this thread has no capacity at all.
+    bool has_any_free_slot() const { return ((~pending_occupied_) & (aic_mask_ | aiv_mask_)).has_value(); }
+
     template <CoreType CT>
     int32_t get_running_count() const {
         if constexpr (CT == CoreType::AIC) {
