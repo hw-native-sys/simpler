@@ -7,19 +7,17 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""End-to-end distributed reduce-scatter — symmetric 4-phase pattern.
+"""Minimal distributed allreduce example — onephase mesh-direct algorithm.
 
-Each rank owns a private input of nranks*COUNT_PER_RANK floats (N equal-sized
-chunks).  After reduce-scatter, rank r holds the element-wise sum of chunk r
-from every rank:
+This is the simplest "how to do a collective" feature demo.  Each rank
+stages its private vector into the HCCL window, waits for peers via a
+signal barrier, then reads every peer's slot and accumulates locally.
 
-  Phase 1 stage-in      all N input chunks → scratch slots in HCCL window
-  Phase 2 device barrier signal matrix cross-rank sync via TNOTIFY/TWAIT
-  Phase 3 reduce        acc = my scratch[my_rank*C]; acc += peer's scratch[my_rank*C] for each peer
-  Phase 4 stage-out     TSTORE acc → output
+For the full algorithm corpus (twophase, ring, bidirectional_ring, ibing)
+see the scene tests at ``tests/st/a2a3/tensormap_and_ringbuffer/collectives/allreduce/``.
 
 Run:
-    python examples/workers/l3/reduce_scatter_distributed/main.py -p a2a3sim -d 0-1
+    python examples/workers/l3/allreduce/main.py -p a2a3sim -d 0-1
 
 """
 
@@ -52,39 +50,50 @@ from simpler_setup.torch_interop import make_tensor_arg  # noqa: E402
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 
-# Must match COUNT_PER_RANK in kernels/aiv/reduce_scatter_kernel.cpp.
-COUNT_PER_RANK = 64
+# Paths to kernel sources — these live under tests/st/.../collectives/allreduce/
+_COLLECTIVES_DIR = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)),
+    "..",
+    "..",
+    "..",
+    "..",
+    "tests",
+    "st",
+    "a2a3",
+    "tensormap_and_ringbuffer",
+    "collectives",
+    "allreduce",
+)
+_KERNEL_AIV = os.path.join(_COLLECTIVES_DIR, "kernels", "aiv", "allreduce_onephase_kernel.cpp")
+_KERNEL_ORCH = os.path.join(_COLLECTIVES_DIR, "kernels", "orchestration", "allreduce_onephase_orch.cpp")
+
+ALLREDUCE_COUNT = 256
 DTYPE_NBYTES = 4  # float32
-# Signal tail: one int32 slot per rank, bounded by kMaxSupportedRanks.
-SIGNAL_TAIL_NBYTES = 16 * 4  # 64 B
-# NOTE: the full scratch size depends on nranks (staging area = nranks * COUNT_PER_RANK floats).
-# It is computed inside run() once nranks is known.
+K_MAX_SUPPORTED_RANKS = 16
 
 
 def parse_device_range(spec: str) -> list[int]:
+    """Parse a device range string like ``0-1`` or a single device id."""
     if "-" in spec:
         lo, hi = (int(x) for x in spec.split("-"))
         ids = list(range(lo, hi + 1))
     else:
         ids = [int(spec)]
-    if not (2 <= len(ids) <= 16):
-        raise ValueError(f"reduce_scatter_distributed needs between 2 and 16 devices, got {len(ids)} ({ids})")
+    if not (2 <= len(ids) <= K_MAX_SUPPORTED_RANKS):
+        raise ValueError(f"allreduce needs between 2 and {K_MAX_SUPPORTED_RANKS} devices, got {len(ids)} ({ids})")
     return ids
 
 
 def build_chip_callable(platform: str) -> ChipCallable:
-    """Compile the AIV reduce-scatter kernel + its C++ orchestration shim."""
+    """Compile the onephase allreduce kernel + orchestration shim."""
     kc = KernelCompiler(platform=platform)
     runtime = "tensormap_and_ringbuffer"
     pto_isa_root = ensure_pto_isa_root()
     include_dirs = kc.get_orchestration_include_dirs(runtime)
 
-    # src/common  — for platform_comm/comm_context.h
-    kernel_include_dirs = list(include_dirs) + [
-        str(kc.project_root / "src" / "common"),
-    ]
+    kernel_include_dirs = list(include_dirs) + [str(kc.project_root / "src" / "common")]
     kernel_bytes = kc.compile_incore(
-        source_path=os.path.join(HERE, "kernels/aiv/reduce_scatter_kernel.cpp"),
+        source_path=_KERNEL_AIV,
         core_type="aiv",
         pto_isa_root=pto_isa_root,
         extra_include_dirs=kernel_include_dirs,
@@ -94,7 +103,7 @@ def build_chip_callable(platform: str) -> ChipCallable:
 
     orch_bytes = kc.compile_orchestration(
         runtime_name=runtime,
-        source_path=os.path.join(HERE, "kernels/orchestration/reduce_scatter_orch.cpp"),
+        source_path=_KERNEL_ORCH,
     )
     core_callable = CoreCallable.build(
         signature=[ArgDirection.IN, ArgDirection.OUT, ArgDirection.INOUT],
@@ -102,39 +111,38 @@ def build_chip_callable(platform: str) -> ChipCallable:
     )
     return ChipCallable.build(
         signature=[ArgDirection.IN, ArgDirection.OUT, ArgDirection.INOUT],
-        func_name="reduce_scatter_orchestration",
-        config_name="reduce_scatter_orchestration_config",
+        func_name="allreduce_orchestration",
+        config_name="allreduce_orchestration_config",
         binary=orch_bytes,
         children=[(0, core_callable)],
     )
 
 
-def expected_output(nranks: int, dest: int) -> list[float]:
-    """output[j] = sum_r input_r[dest*C + j] = nranks*(dest*C+j) + 100*nranks*(nranks-1)/2."""
-    return [
-        float(nranks * (dest * COUNT_PER_RANK + j) + 100 * nranks * (nranks - 1) // 2) for j in range(COUNT_PER_RANK)
-    ]
+def expected_output(nranks: int) -> list[float]:
+    """output[i] = sum_r (i + r*100) = nranks*i + 100 * nranks*(nranks-1)/2."""
+    return [float(nranks * i + 100 * nranks * (nranks - 1) // 2) for i in range(ALLREDUCE_COUNT)]
 
 
-def run(
-    device_ids: list[int],
-    platform: str = "a2a3",
-) -> int:
+def run(device_ids: list[int], platform: str = "a2a3") -> int:
     """Core logic — callable from both CLI and pytest."""
     nranks = len(device_ids)
-    # Scratch = nranks * COUNT_PER_RANK floats (staging) + signal tail.
-    scratch_nbytes = nranks * COUNT_PER_RANK * DTYPE_NBYTES + SIGNAL_TAIL_NBYTES
+    if not (2 <= nranks <= K_MAX_SUPPORTED_RANKS):
+        raise ValueError(f"allreduce needs between 2 and {K_MAX_SUPPORTED_RANKS} devices, got {nranks}")
+
+    float_elems = ALLREDUCE_COUNT
+    signal_tail_nbytes = K_MAX_SUPPORTED_RANKS * DTYPE_NBYTES
+    scratch_nbytes = float_elems * DTYPE_NBYTES + signal_tail_nbytes
     window_size = max(scratch_nbytes, 4 * 1024)
 
-    print(f"[reduce_scatter] platform={platform} devices={device_ids} nranks={nranks}")
+    print(f"[allreduce] platform={platform} devices={device_ids} nranks={nranks}")
 
     host_inputs = [
-        torch.tensor([i + rank * 100 for i in range(nranks * COUNT_PER_RANK)], dtype=torch.float32).share_memory_()
+        torch.tensor([i + rank * 100 for i in range(ALLREDUCE_COUNT)], dtype=torch.float32).share_memory_()
         for rank in range(nranks)
     ]
-    host_outputs = [torch.zeros(COUNT_PER_RANK, dtype=torch.float32).share_memory_() for _ in range(nranks)]
+    host_outputs = [torch.zeros(ALLREDUCE_COUNT, dtype=torch.float32).share_memory_() for _ in range(nranks)]
 
-    print("[reduce_scatter] compiling kernels...")
+    print("[allreduce] compiling onephase kernel...")
     chip_callable = build_chip_callable(platform)
 
     worker = Worker(
@@ -147,7 +155,7 @@ def run(
     chip_handle = worker.register(chip_callable)
 
     try:
-        print("[reduce_scatter] init worker (forks chip children; base comm is lazy)...")
+        print("[allreduce] init worker...")
         worker.init()
 
         def orch_fn(orch, _args, cfg):
@@ -155,29 +163,17 @@ def run(
                 name="default",
                 workers=list(range(nranks)),
                 window_size=window_size,
-                buffers=[
-                    CommBufferSpec(
-                        name="scratch",
-                        dtype="float32",
-                        count=nranks * COUNT_PER_RANK,
-                        nbytes=scratch_nbytes,
-                    )
-                ],
+                buffers=[CommBufferSpec(name="scratch", dtype="float32", count=float_elems, nbytes=scratch_nbytes)],
             ) as handle:
                 for i in range(nranks):
                     domain = handle[i]
-                    print(
-                        f"[reduce_scatter] chip {i}: rank={domain.domain_rank}/{domain.domain_size} "
-                        f"window=[0x{domain.local_window_base:x} +{domain.actual_window_size}B] "
-                        f"scratch=0x{domain.buffer_ptrs['scratch']:x}"
-                    )
                     chip_args = TaskArgs()
                     chip_args.add_tensor(make_tensor_arg(host_inputs[i]), TensorArgType.INPUT)
                     chip_args.add_tensor(make_tensor_arg(host_outputs[i]), TensorArgType.OUTPUT_EXISTING)
                     chip_args.add_tensor(
                         Tensor.make(
                             data=domain.buffer_ptrs["scratch"],
-                            shapes=(nranks * COUNT_PER_RANK,),
+                            shapes=(float_elems,),
                             dtype=DataType.FLOAT32,
                             child_memory=True,
                         ),
@@ -187,23 +183,21 @@ def run(
                     chip_args.add_scalar(domain.device_ctx)
                     orch.submit_next_level(chip_handle, chip_args, cfg, worker=i)
 
-        print(f"[reduce_scatter] running {nranks}-chip reduce-scatter DAG...")
+        print(f"[allreduce] running {nranks}-chip allreduce DAG...")
         worker.run(orch_fn, args=None, config=CallConfig())
 
+        expected = torch.tensor(expected_output(nranks), dtype=torch.float32)
         ok = True
         for i in range(nranks):
-            expected = torch.tensor(expected_output(nranks, i), dtype=torch.float32)
             max_diff = float(torch.max(torch.abs(host_outputs[i] - expected)))
-            print(f"[reduce_scatter] chip {i}: max |out - expected| = {max_diff:.3e}")
+            print(f"[allreduce] chip {i}: max |out - expected| = {max_diff:.3e}")
             if max_diff > 1e-3:
                 ok = False
-                for j in range(min(4, COUNT_PER_RANK)):
-                    print(f"  output[{j}]={float(host_outputs[i][j])!r} expected={float(expected[j])!r}")
 
         if not ok:
-            print("[reduce_scatter] golden check FAILED")
+            print("[allreduce] golden check FAILED")
             return 1
-        print("[reduce_scatter] all ranks matched golden ✅")
+        print("[allreduce] all ranks matched golden ✅")
         return 0
     finally:
         worker.close()
@@ -216,7 +210,6 @@ def main() -> int:
         "-d", "--device", default="0-1", help="Device range, e.g. '0-1' or '0-3'. 2 to 16 chips required."
     )
     cli = parser.parse_args()
-
     return run(parse_device_range(cli.device), platform=cli.platform)
 
 

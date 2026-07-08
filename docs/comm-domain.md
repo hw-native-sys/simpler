@@ -228,8 +228,8 @@ the child — allocate it with `create_host_buffer` instead.
 
 ## 7. Examples
 
-- `examples/workers/l3/allreduce_distributed/` — single domain, PTO-ISA remote
-  reads over the window.
+- [`tests/st/a2a3/tensormap_and_ringbuffer/collectives/allreduce/`](../tests/st/a2a3/tensormap_and_ringbuffer/collectives/allreduce/) — single domain, PTO-ISA remote
+  reads over the window (allreduce scene tests with multiple algorithm modes).
 - `examples/workers/l3/domain_rank_map/` — two domains, domain-local ranks,
   missing-domain `KeyError`, per-domain allreduce.
 - `examples/workers/l3/dual_domain_overlap/` — overlapping domains where one

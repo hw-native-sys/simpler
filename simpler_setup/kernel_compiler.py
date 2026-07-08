@@ -143,7 +143,8 @@ class KernelCompiler:
         runtime_dir = str(self.project_root / "src" / arch / "runtime" / runtime_name / "runtime")
         runtime_common_dir = str(self.project_root / "src" / arch / "runtime" / runtime_name / "common")
         common_dir = str(self.project_root / "src" / "common" / "task_interface")
-        return [runtime_dir, runtime_common_dir, common_dir] + self.get_platform_include_dirs()
+        src_common_dir = str(self.project_root / "src" / "common")
+        return [runtime_dir, runtime_common_dir, common_dir, src_common_dir] + self.get_platform_include_dirs()
 
     def get_incore_include_dirs(self) -> list[str]:
         """
