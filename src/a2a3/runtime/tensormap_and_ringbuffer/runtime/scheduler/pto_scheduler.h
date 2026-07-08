@@ -819,9 +819,14 @@ struct PTO2SchedulerState {
 
         if (wfanin != 0) {
             int32_t early_finished = 0;
+            bool early_disqualified = false;  // an unflagged producer => C can never early-dispatch
             for_each_fanin_slot_state(*wp, [&](PTO2TaskSlotState *producer) {
                 producer->lock_fanout();
                 int32_t pstate = producer->task_state.load(std::memory_order_acquire);
+                // A single unflagged producer makes dispatch_fanin unreachable to
+                // fanin_actual_count (it never bumps), so once we've seen one, stop
+                // paying for the flag read on the remaining producers.
+                if (!early_disqualified && !producer->allow_early_resolve) early_disqualified = true;
                 if (pstate >= PTO2_TASK_COMPLETED) {
                     early_finished++;
                 } else {
@@ -830,15 +835,16 @@ struct PTO2SchedulerState {
                 producer->unlock_fanout();
             });
 
-            // Seed dispatch_fanin with producers already complete at wiring
-            // time (e.g. buffer-creator tasks that finished before this
-            // consumer entered the graph). Such producers never dispatch at
-            // runtime, so they can never bump dispatch_fanin via the fanout
-            // walk; without this seed the candidate compare
-            // (dispatch_fanin == fanin_actual_count) would be unreachable
-            // whenever any producer is pre-completed. Mirrors the
-            // early_finished seed that ready_fanin gets via init_rc.
-            if (early_finished != 0) {
+            // Seed dispatch_fanin only when EVERY producer is codegen-flagged: then
+            // every pre-completed producer is flagged too, so early_finished is
+            // exactly the flagged-pre-completed count the candidate compare
+            // (dispatch_fanin == fanin_actual_count) expects. Such producers never
+            // dispatch at runtime, so they can never bump dispatch_fanin via the
+            // fanout walk; the seed accounts for them up front. If any producer is
+            // unflagged, leave dispatch_fanin at 0 — that producer never bumps it, so
+            // the consumer can never become an early-dispatch candidate. (The ready
+            // seed below still counts ALL pre-completed producers, flag-independent.)
+            if (!early_disqualified && early_finished != 0) {
                 wp->dispatch_fanin.fetch_add(early_finished, std::memory_order_acq_rel);
             }
 
@@ -1015,9 +1021,6 @@ struct PTO2SchedulerState {
         *dmb = (tk << 32) | tk;  // 64-bit STR: high=low=token releases the gated AICore
     }
 
-    // auto-chain depth cap: a candidate inherits the flag only while depth < this.
-    static constexpr uint8_t PTO2_SPEC_CHAIN_MAX = 4;
-
     // Event-driven candidate detection (the dual of fanin_refcount/ready). Call when a
     // FLAGGED producer `p` DISPATCHES (starts running): walk its fanout and bump each
     // consumer's dispatch_fanin. A consumer whose dispatch_fanin reaches
@@ -1025,13 +1028,12 @@ struct PTO2SchedulerState {
     // already complete when the consumer was wired) is an early-dispatch candidate:
     // CAS NONE->STAGING (exactly-once) and push to early_dispatch_queue for the idle drain to
     // pre-stage. Once-guarded per producer so an SPMD producer's block-by-block
-    // dispatch propagates once. Replaces the old per-iteration pass-1 PULL scan.
+    // dispatch propagates once. Only codegen-flagged producers propagate: a task's
+    // successors early-dispatch off its DIRECT producers' marks, never an inherited chain.
     void propagate_dispatch_fanin(PTO2TaskSlotState &p) {
-        if (!(p.payload->allow_early_resolve || p.payload->spec_chain_active.load(std::memory_order_acquire)))
-            return;  // only flagged (codegen or inherited) producers propagate
+        if (!p.allow_early_resolve) return;  // only codegen-flagged (direct) producers propagate
         if (p.payload->dispatch_propagated.exchange(1, std::memory_order_acq_rel) != 0)
             return;  // already propagated once
-        uint8_t child_depth = static_cast<uint8_t>(p.payload->spec_chain_depth + 1);
         p.lock_fanout();
         PTO2DepListEntry *edge = p.fanout_head;  // snapshot head, walk lock-free (fanout stable by dispatch)
         p.unlock_fanout();
@@ -1040,9 +1042,10 @@ struct PTO2SchedulerState {
             // Compare to fanin_actual_count (the real producer-edge count), NOT
             // fanin_count: fanin_count = fanin_actual_count + 1 (a self/wiring +1 that
             // ready_fanin gets but dispatch_fanin does not). dispatch_fanin starts at
-            // the wiring-time early_finished seed (producers already complete) and is
-            // bumped here by flagged producers; reaching fanin_actual_count means every
-            // producer is flagged-dispatched or was pre-completed.
+            // the wiring-time flagged-pre-completed seed and is bumped here by flagged
+            // producers; reaching fanin_actual_count means every producer is
+            // flagged-dispatched or was pre-completed. An unflagged producer leaves the
+            // seed short and never bumps, so this stays unreachable for that consumer.
             int32_t nf = c->payload->dispatch_fanin.fetch_add(1, std::memory_order_acq_rel) + 1;
             if (nf != c->payload->fanin_actual_count) continue;
             if (c->active_mask.requires_sync_start()) continue;  // sync_start can't be block-by-block pre-staged
@@ -1054,10 +1057,6 @@ struct PTO2SchedulerState {
                     expect, PTO2_SPEC_STAGING, std::memory_order_seq_cst, std::memory_order_seq_cst
                 ))
                 continue;
-            if (child_depth < PTO2_SPEC_CHAIN_MAX) {  // auto-chain: C propagates to ITS consumers
-                c->payload->spec_chain_depth = child_depth;
-                c->payload->spec_chain_active.store(1, std::memory_order_release);
-            }
             early_dispatch_queue.push(c);
         }
     }
@@ -1105,10 +1104,11 @@ struct PTO2SchedulerState {
             }
         }
         // This pre-staged consumer was just released by its doorbell — it starts
-        // running NOW, so propagate dispatch_fanin to ITS consumers (auto-chain,
-        // knob A). Defer it via the sink so it runs after the whole fanout walk:
-        // doing it inline here would delay the doorbells of later consumers in the
-        // same producer's fanout. Fallback to inline if no sink / sink full.
+        // running NOW, so propagate dispatch_fanin to ITS consumers (only if it is
+        // itself codegen-flagged; the gate inside no-ops otherwise). Defer it via the
+        // sink so it runs after the whole fanout walk: doing it inline here would
+        // delay the doorbells of later consumers in the same producer's fanout.
+        // Fallback to inline if no sink / sink full.
         if (sink == nullptr || !sink->push(&slot_state)) {
             propagate_dispatch_fanin(slot_state);
         }

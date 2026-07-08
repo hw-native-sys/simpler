@@ -257,7 +257,6 @@ struct PTO2TaskPayload {
     // fanin_actual_count  <=>  every producer is flagged-and-dispatched or was
     // pre-completed  =>  this task is an early-dispatch candidate (push early_dispatch_queue).
     std::atomic<int32_t> dispatch_fanin{0};  // CONSUMER side: flagged-dispatched + pre-completed producers
-    bool allow_early_resolve{false};         // codegen hint copied from Arg in PTO2TaskPayload::init
     // Lock-free claim state shared by the stagers (Hook 1, possibly several AICPU
     // threads concurrently) and the completion-path release: 0=NONE, 1=STAGING,
     // 3=DISPATCHED (2=STAGED is unused now). STAGING is the STABLE gated state —
@@ -268,8 +267,6 @@ struct PTO2TaskPayload {
     // (self-ring), so no doorbell is ever missed.
     std::atomic<uint8_t> spec_state{0};
     std::atomic<uint8_t> dispatch_propagated{0};  // PRODUCER side: once-guard for fanout propagation
-    std::atomic<uint8_t> spec_chain_active{0};    // inherited early-dispatch flag (auto-chain past codegen flag)
-    uint8_t spec_chain_depth{0};                  // auto-chain depth; inherited = parent+1, capped
     // === Cache lines 9-72 (4096B) — tensors (alignas(64) forces alignment) ===
     Tensor tensors[MAX_TENSOR_ARGS];
     // === Cache lines 73-74 (128B) — scalars ===
@@ -340,20 +337,16 @@ struct PTO2TaskPayload {
         // structures); prepare_task only allocates/binds. prefetch() warms this
         // line (offset 512) so these writes land in warm cache.
         //
-        // spec_state / staged_core_mask / dispatch_fanin / spec_chain_* are all
-        // CONSUMER-side: a task with allow_early_resolve == false still has them
-        // touched when one of ITS producers is flagged (propagate_dispatch_fanin
-        // bumps dispatch_fanin and may CAS spec_state / set the auto-chain flag on
-        // any consumer, independent of the consumer's own hint). So they MUST be
-        // zeroed here unconditionally — no per-task allow_early_resolve gating.
-        allow_early_resolve = args.allow_early_resolve();
+        // spec_state / staged_core_mask / dispatch_fanin are all CONSUMER-side: a
+        // task whose own allow_early_resolve is false still has them touched when
+        // one of ITS producers is flagged (propagate_dispatch_fanin bumps
+        // dispatch_fanin and may CAS spec_state on any consumer, independent of the
+        // consumer's own hint). So they MUST be zeroed here unconditionally.
         spec_state.store(PTO2_SPEC_NONE, std::memory_order_relaxed);
         for (int w = 0; w < PTO2_SPEC_CORE_MASK_WORDS; w++)
             staged_core_mask[w].store(0, std::memory_order_relaxed);
         dispatch_fanin.store(0, std::memory_order_relaxed);
         dispatch_propagated.store(0, std::memory_order_relaxed);
-        spec_chain_active.store(0, std::memory_order_relaxed);
-        spec_chain_depth = 0;
     }
 };
 
@@ -437,7 +430,12 @@ struct alignas(64) PTO2TaskSlotState {
     // sequenced before on_subtask_complete's acq_rel fetch_add and the read
     // after, so all earlier subtasks' writes are visible to the last subtask.
     std::atomic<bool> any_subtask_deferred{false};
-    uint8_t _async_pad{0};
+    // Codegen early-dispatch hint, copied from Arg at submit. Lives on slot_state
+    // (not payload) so the wiring fanin walk and the propagate_dispatch_fanin gate
+    // read it from the already-hot slot_state cache line instead of chasing the
+    // producer's cold payload. Repurposes the former padding byte, so the struct
+    // stays 64 bytes.
+    bool allow_early_resolve{false};
     int32_t dep_pool_mark{0};  // Dep pool top after wiring (thread-0-only)
 
     std::atomic<int16_t> completed_subtasks{0};  // Each core completion increments by 1
@@ -487,10 +485,11 @@ struct alignas(64) PTO2TaskSlotState {
         completed_subtasks.store(0, std::memory_order_relaxed);
         next_block_idx.store(0, std::memory_order_relaxed);
         any_subtask_deferred.store(false, std::memory_order_relaxed);
-        // Note: payload spec fields (spec_state / staged_core_mask / dispatch_fanin /
-        // spec_chain_*) are NOT reset here — this method skips the payload by
-        // contract. They are (re)initialized in PTO2TaskPayload::init on every
-        // submit, before the slot becomes visible to the scheduler.
+        allow_early_resolve = false;  // safe default; the normal submit path overwrites from Arg
+        // Note: payload spec fields (spec_state / staged_core_mask / dispatch_fanin)
+        // are NOT reset here — this method skips the payload by contract. They are
+        // (re)initialized in PTO2TaskPayload::init on every submit, before the slot
+        // becomes visible to the scheduler.
     }
 
     // === Per-task fanout spinlock ===

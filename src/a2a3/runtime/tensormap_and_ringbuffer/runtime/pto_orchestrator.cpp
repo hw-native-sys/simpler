@@ -846,6 +846,7 @@ static TaskOutputTensors submit_task_common(
     }
 
     payload.init(args, result, prepared.alloc_result, layout);
+    cur_slot_state.allow_early_resolve = args.allow_early_resolve();
 #if PTO2_PROFILING
     if (is_dump_args_enabled()) {
         if (args.scalar_count() > 0) {

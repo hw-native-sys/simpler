@@ -241,6 +241,177 @@ TEST_F(WiringTest, WireTaskMixedProducerStates) {
 }
 
 // =============================================================================
+// Early-dispatch seed (direct-only): a consumer becomes an early-dispatch
+// candidate ONLY when every producer is codegen-flagged (allow_early_resolve,
+// now a slot_state field). A single unflagged producer leaves dispatch_fanin
+// short forever. Auto-chain inheritance was removed, so flagged-ness is the
+// producer's own static hint — never propagated down a chain.
+// =============================================================================
+
+TEST_F(WiringTest, WireTaskAllFlaggedPrecompletedSeedsDispatchFanin) {
+    alignas(64) PTO2TaskSlotState task_slot;
+    alignas(64) PTO2TaskSlotState producer_slots[2];
+    alignas(64) PTO2TaskPayload payload;
+    memset(&payload, 0, sizeof(payload));
+    PTO2TaskDescriptor desc{};
+
+    for (int i = 0; i < 2; i++) {
+        init_slot(producer_slots[i], PTO2_TASK_COMPLETED, 1, 2);
+        producer_slots[i].allow_early_resolve = true;  // codegen-flagged
+    }
+
+    init_slot(task_slot, PTO2_TASK_PENDING, 0, 1);
+    payload.fanin_actual_count = 2;
+    payload.fanin_inline_slot_states[0] = &producer_slots[0];
+    payload.fanin_inline_slot_states[1] = &producer_slots[1];
+    task_slot.payload = &payload;
+    task_slot.task = &desc;
+
+    auto &rss = sched.ring_sched_states[0];
+    sched.wire_task(rss, &task_slot, 2);
+
+    // Every producer flagged + pre-completed -> seeded to fanin_actual_count, so
+    // the consumer is already an early-dispatch candidate at wiring time.
+    EXPECT_EQ(payload.dispatch_fanin.load(), payload.fanin_actual_count);
+}
+
+TEST_F(WiringTest, WireTaskUnflaggedPrecompletedProducerDoesNotSeed) {
+    // Regression: an unflagged producer already complete at wiring must NOT seed
+    // dispatch_fanin. It never dispatches, so it can never be the flagged-and-
+    // dispatched contributor the candidate compare expects; seeding it would let
+    // the consumer become an early-dispatch candidate it should stay off.
+    alignas(64) PTO2TaskSlotState task_slot;
+    alignas(64) PTO2TaskSlotState producer;
+    alignas(64) PTO2TaskPayload payload;
+    memset(&payload, 0, sizeof(payload));
+    PTO2TaskDescriptor desc{};
+
+    init_slot(producer, PTO2_TASK_COMPLETED, 1, 1);
+    producer.allow_early_resolve = false;  // unflagged
+
+    init_slot(task_slot, PTO2_TASK_PENDING, 0, 1);
+    payload.fanin_actual_count = 1;
+    payload.fanin_inline_slot_states[0] = &producer;
+    task_slot.payload = &payload;
+    task_slot.task = &desc;
+
+    auto &rss = sched.ring_sched_states[0];
+    sched.wire_task(rss, &task_slot, 1);
+
+    EXPECT_EQ(payload.dispatch_fanin.load(), 0);  // NOT seeded (direct-only)
+    // Readiness is unaffected: early_finished(1) + 1 == fanin_count(2) -> ready.
+    EXPECT_GE(task_slot.fanin_refcount.load(), task_slot.fanin_count);
+}
+
+TEST_F(WiringTest, WireTaskOneUnflaggedProducerDisqualifiesSeed) {
+    alignas(64) PTO2TaskSlotState task_slot;
+    alignas(64) PTO2TaskSlotState producers[2];
+    alignas(64) PTO2TaskPayload payload;
+    memset(&payload, 0, sizeof(payload));
+    PTO2TaskDescriptor desc{};
+
+    init_slot(producers[0], PTO2_TASK_COMPLETED, 1, 2);
+    producers[0].allow_early_resolve = true;  // flagged
+    init_slot(producers[1], PTO2_TASK_COMPLETED, 1, 2);
+    producers[1].allow_early_resolve = false;  // one unflagged -> disqualifies
+
+    init_slot(task_slot, PTO2_TASK_PENDING, 0, 1);
+    payload.fanin_actual_count = 2;
+    payload.fanin_inline_slot_states[0] = &producers[0];
+    payload.fanin_inline_slot_states[1] = &producers[1];
+    task_slot.payload = &payload;
+    task_slot.task = &desc;
+
+    auto &rss = sched.ring_sched_states[0];
+    sched.wire_task(rss, &task_slot, 2);
+
+    EXPECT_EQ(payload.dispatch_fanin.load(), 0);  // disqualified: seed stays 0
+}
+
+TEST_F(WiringTest, EarlyDispatchReachesCandidateWhenAllFlagged) {
+    // A flagged, still-pending producer seeds nothing at wiring (not
+    // pre-completed); its DISPATCH propagates and bumps the consumer to
+    // fanin_actual_count, making it an early-dispatch candidate.
+    alignas(64) PTO2TaskSlotState task_slot;
+    alignas(64) PTO2TaskSlotState producer;
+    alignas(64) PTO2TaskPayload payload;
+    memset(&payload, 0, sizeof(payload));
+    PTO2TaskDescriptor desc{};
+
+    init_slot(producer, PTO2_TASK_PENDING, 1, 1);
+    producer.allow_early_resolve = true;
+
+    init_slot(task_slot, PTO2_TASK_PENDING, 0, 1);
+    payload.fanin_actual_count = 1;
+    payload.fanin_inline_slot_states[0] = &producer;
+    task_slot.payload = &payload;
+    task_slot.task = &desc;
+
+    auto &rss = sched.ring_sched_states[0];
+    sched.wire_task(rss, &task_slot, 1);
+    EXPECT_EQ(payload.dispatch_fanin.load(), 0);  // pending -> nothing seeded yet
+
+    sched.propagate_dispatch_fanin(producer);
+    EXPECT_EQ(payload.dispatch_fanin.load(), payload.fanin_actual_count);
+}
+
+TEST_F(WiringTest, EarlyDispatchBlockedByUnflaggedProducer) {
+    alignas(64) PTO2TaskSlotState task_slot;
+    alignas(64) PTO2TaskSlotState p_flagged, q_unflagged;
+    alignas(64) PTO2TaskPayload payload;
+    memset(&payload, 0, sizeof(payload));
+    PTO2TaskDescriptor desc{};
+
+    init_slot(p_flagged, PTO2_TASK_PENDING, 1, 1);
+    p_flagged.allow_early_resolve = true;
+    init_slot(q_unflagged, PTO2_TASK_PENDING, 1, 1);
+    q_unflagged.allow_early_resolve = false;
+
+    init_slot(task_slot, PTO2_TASK_PENDING, 0, 1);
+    payload.fanin_actual_count = 2;
+    payload.fanin_inline_slot_states[0] = &p_flagged;
+    payload.fanin_inline_slot_states[1] = &q_unflagged;
+    task_slot.payload = &payload;
+    task_slot.task = &desc;
+
+    auto &rss = sched.ring_sched_states[0];
+    sched.wire_task(rss, &task_slot, 2);
+    EXPECT_EQ(payload.dispatch_fanin.load(), 0);  // q unflagged -> disqualified seed
+
+    sched.propagate_dispatch_fanin(p_flagged);    // bumps to 1
+    sched.propagate_dispatch_fanin(q_unflagged);  // gate returns, no bump
+    EXPECT_EQ(payload.dispatch_fanin.load(), 1);  // never reaches 2 -> not a candidate
+}
+
+TEST_F(WiringTest, UnflaggedProducerDoesNotPropagate) {
+    // Auto-chain removed: an unflagged producer never propagates, so its
+    // consumers' dispatch_fanin stays untouched even after it dispatches, and the
+    // once-guard is not even consumed (the gate returns first).
+    alignas(64) PTO2TaskSlotState producer, consumer;
+    alignas(64) PTO2TaskPayload prod_payload, cons_payload;
+    memset(&prod_payload, 0, sizeof(prod_payload));
+    memset(&cons_payload, 0, sizeof(cons_payload));
+
+    init_slot(producer, PTO2_TASK_PENDING, 1, 1);
+    producer.allow_early_resolve = false;  // unflagged
+    producer.payload = &prod_payload;
+
+    init_slot(consumer, PTO2_TASK_PENDING, 1, 1);
+    consumer.payload = &cons_payload;
+    cons_payload.fanin_actual_count = 1;
+
+    PTO2DepListEntry dep{};
+    dep.slot_state = &consumer;
+    dep.next = nullptr;
+    producer.fanout_head = &dep;
+
+    sched.propagate_dispatch_fanin(producer);
+
+    EXPECT_EQ(cons_payload.dispatch_fanin.load(), 0);       // no bump
+    EXPECT_EQ(prod_payload.dispatch_propagated.load(), 0);  // gate returned before once-guard
+}
+
+// =============================================================================
 // on_task_complete: notifies consumers via fanout chain
 // =============================================================================
 
