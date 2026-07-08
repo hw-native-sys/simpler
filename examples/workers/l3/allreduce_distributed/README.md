@@ -90,7 +90,7 @@ allreduce_distributed/
 1. **Host tensors**: Each rank owns a private input/output tensor via `torch.share_memory_()`.
 2. **Communication domain**: `orch.allocate_domain()` creates an HCCL window for cross-rank communication.
 3. **Kernel dispatch**: `main.py` compiles the selected kernel based on `--mode` and submits it to each chip.
-4. **Barrier + remote read**: Kernels use PTO-ISA `TNOTIFY`/`TWAIT` for synchronization and `TLOAD` via `CommRemotePtr` for cross-rank reads.
+4. **Barrier + cross-rank data movement**: Kernels use PTO-ISA `TNOTIFY`/`TWAIT` for synchronization. Pull-style modes use `TLOAD` via `CommRemotePtr`; push-style modes use `TPUT` via `CommRemotePtr`.
 5. **Golden check**: Output verified against `sum_r(i + r*100)` for all ranks.
 
 ## When to Use Which Mode

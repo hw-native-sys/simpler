@@ -107,14 +107,8 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
         }
         __gm__ float *remote_mailbox_base = CommRemotePtr(comm_ctx, mailbox_ptr, peer);
         __gm__ float *remote_slot_ptr = remote_mailbox_base + my_rank * kElemsPerPartial;
-#if defined(__CPU_SIM)
-        for (int i = 0; i < kElemsPerPartial; ++i) {
-            remote_slot_ptr[i] = partial_local_ptr[i];
-        }
-#else
         MatrixGlobal remote_slot(remote_slot_ptr);
         pto::comm::TPUT(remote_slot, partial_local_global, staging_tile);
-#endif
     }
     pipe_barrier(PIPE_ALL);
 

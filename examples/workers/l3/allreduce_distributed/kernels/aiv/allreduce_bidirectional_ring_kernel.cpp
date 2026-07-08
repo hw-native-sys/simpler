@@ -22,8 +22,7 @@
  * unidirectional ring — but each round processes two subchunks (one per
  * ring direction), doubling data throughput per barrier.
  *
- * On sim (POSIX shared memory): raw float* arithmetic into shared memory.
- * On NPU hardware: TPUT<AtomicAdd/AtomicNone> for remote DMA writes.
+ * Remote writes use TPUT<AtomicAdd/AtomicNone> on both sim and NPU hardware.
  *
  * Scratch layout (per rank, in HCCL window):
  *   [0 .. P*subchunk)              ring0 chunks (clockwise ring)
@@ -106,11 +105,9 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
     __gm__ float *ring1 = scratch + ring_stride;  // counter-clockwise ring — second half
     __gm__ int32_t *signal_base = reinterpret_cast<__gm__ int32_t *>(scratch + static_cast<size_t>(2 * ring_stride));
 
-#ifndef __CPU_SIM
     using TileSub = pto::Tile<pto::TileType::Vec, float, 1, ALLREDUCE_COUNT, pto::BLayout::RowMajor, -1, -1>;
     TileSub pushTile(1, subchunk_elems);
     TASSIGN(pushTile, 0x10000);
-#endif
 
     using TileSubStage = pto::Tile<pto::TileType::Vec, float, 1, ALLREDUCE_COUNT, pto::BLayout::RowMajor, -1, -1>;
     TileSubStage stageTile(1, subchunk_elems);
@@ -172,15 +169,9 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
             const int idx = (my_rank - step + nranks) % nranks;
             __gm__ float *src = ring0 + static_cast<size_t>(idx * subchunk_elems);
             __gm__ float *dst = CommRemotePtr(commCtx, src, right);
-#if defined(__CPU_SIM)
-            for (int i = 0; i < subchunk_elems; ++i) {
-                dst[i] += src[i];
-            }
-#else
             GT srcG(src, subShape, subStride);
             GT dstG(dst, subShape, subStride);
             pto::comm::TPUT<pto::AtomicType::AtomicAdd>(dstG, srcG, pushTile);
-#endif
         }
 
         // Ring1: push ring1[(r + step + P) % P] → left's ring1[same index].
@@ -188,15 +179,9 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
             const int idx = (my_rank + step + nranks) % nranks;
             __gm__ float *src = ring1 + static_cast<size_t>(idx * subchunk_elems);
             __gm__ float *dst = CommRemotePtr(commCtx, src, left);
-#if defined(__CPU_SIM)
-            for (int i = 0; i < subchunk_elems; ++i) {
-                dst[i] += src[i];
-            }
-#else
             GT srcG(src, subShape, subStride);
             GT dstG(dst, subShape, subStride);
             pto::comm::TPUT<pto::AtomicType::AtomicAdd>(dstG, srcG, pushTile);
-#endif
         }
 
         pipe_barrier(PIPE_ALL);
@@ -217,15 +202,9 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
             const int idx = (my_rank - step + 1 + nranks) % nranks;
             __gm__ float *src = ring0 + static_cast<size_t>(idx * subchunk_elems);
             __gm__ float *dst = CommRemotePtr(commCtx, src, right);
-#if defined(__CPU_SIM)
-            for (int i = 0; i < subchunk_elems; ++i) {
-                dst[i] = src[i];
-            }
-#else
             GT srcG(src, subShape, subStride);
             GT dstG(dst, subShape, subStride);
             pto::comm::TPUT<pto::AtomicType::AtomicNone>(dstG, srcG, pushTile);
-#endif
         }
 
         // Ring1 AG: send_idx = (r + step - 1 + P) % P
@@ -234,15 +213,9 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
             const int idx = (my_rank + step - 1 + nranks) % nranks;
             __gm__ float *src = ring1 + static_cast<size_t>(idx * subchunk_elems);
             __gm__ float *dst = CommRemotePtr(commCtx, src, left);
-#if defined(__CPU_SIM)
-            for (int i = 0; i < subchunk_elems; ++i) {
-                dst[i] = src[i];
-            }
-#else
             GT srcG(src, subShape, subStride);
             GT dstG(dst, subShape, subStride);
             pto::comm::TPUT<pto::AtomicType::AtomicNone>(dstG, srcG, pushTile);
-#endif
         }
 
         pipe_barrier(PIPE_ALL);

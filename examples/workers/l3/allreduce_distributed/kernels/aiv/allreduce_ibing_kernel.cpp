@@ -108,11 +108,9 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
     ShapeDyn chunkShape(1, 1, 1, 1, chunk_elems);
     StrideDyn chunkStride(chunk_elems, chunk_elems, chunk_elems, chunk_elems, 1);
 
-#ifndef __CPU_SIM
     using TilePush = pto::Tile<pto::TileType::Vec, float, 1, ALLREDUCE_COUNT, pto::BLayout::RowMajor, -1, -1>;
     TilePush pushTile(1, chunk_elems);
     TASSIGN(pushTile, 0x10000);
-#endif
 
     using TileStage = pto::Tile<pto::TileType::Vec, float, 1, ALLREDUCE_COUNT, pto::BLayout::RowMajor, -1, -1>;
     TileStage stageTile(1, chunk_elems);
@@ -216,46 +214,22 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
 
         // Right-bound push.
         {
-#ifdef __CPU_SIM
-            __gm__ float *src = exchange_right;
-            __gm__ float *dst = CommRemotePtr(commCtx, chunks + static_cast<size_t>(idx_r * chunk_elems), right);
-            if (fwd) {
-                for (int i = 0; i < chunk_elems; ++i)
-                    dst[i] = src[i];
-            } else {
-                for (int i = 0; i < chunk_elems; ++i)
-                    dst[i] += src[i];
-            }
-#else
             __gm__ float *src = exchange_right;
             __gm__ float *dst = CommRemotePtr(commCtx, chunks + static_cast<size_t>(idx_r * chunk_elems), right);
             GT srcG(src, chunkShape, chunkStride);
             GT dstG(dst, chunkShape, chunkStride);
             if (fwd) pto::comm::TPUT<pto::AtomicType::AtomicNone>(dstG, srcG, pushTile);
             else pto::comm::TPUT<pto::AtomicType::AtomicAdd>(dstG, srcG, pushTile);
-#endif
         }
 
         // Left-bound push.
         {
-#ifdef __CPU_SIM
-            __gm__ float *src = exchange_left;
-            __gm__ float *dst = CommRemotePtr(commCtx, chunks + static_cast<size_t>(idx_l * chunk_elems), left);
-            if (fwd) {
-                for (int i = 0; i < chunk_elems; ++i)
-                    dst[i] = src[i];
-            } else {
-                for (int i = 0; i < chunk_elems; ++i)
-                    dst[i] += src[i];
-            }
-#else
             __gm__ float *src = exchange_left;
             __gm__ float *dst = CommRemotePtr(commCtx, chunks + static_cast<size_t>(idx_l * chunk_elems), left);
             GT srcG(src, chunkShape, chunkStride);
             GT dstG(dst, chunkShape, chunkStride);
             if (fwd) pto::comm::TPUT<pto::AtomicType::AtomicNone>(dstG, srcG, pushTile);
             else pto::comm::TPUT<pto::AtomicType::AtomicAdd>(dstG, srcG, pushTile);
-#endif
         }
 
         pipe_barrier(PIPE_ALL);

@@ -162,15 +162,9 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
                 __gm__ bfloat16_t *dst_row_local = routed_y_buf_local + r * D;
                 __gm__ bfloat16_t *dst_row_remote = CommRemotePtr(comm_ctx, dst_row_local, dst);
 
-#if defined(__CPU_SIM)
-                for (int i = 0; i < D; ++i) {
-                    dst_row_remote[i] = src_row[i];
-                }
-#else
                 RowBfG src_g(src_row);
                 RowBfG dst_g(dst_row_remote);
                 pto::comm::TPUT(dst_g, src_g, push_tile);
-#endif
             }
         }
     }
