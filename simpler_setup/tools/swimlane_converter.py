@@ -24,6 +24,8 @@ SPMD (block_num>1): dependency flows use min core_id anchors per core_type
 on physical lanes; see docs/dfx/l2-swimlane-profiling.md §3.5.
 """
 
+_SETUP_MIN_US = 0.02  # sub-period local_setup is not rendered as its own bar
+
 import argparse
 import bisect
 import importlib.util
@@ -411,11 +413,9 @@ def load_deps_json(deps_path):
         print(f"Warning: {deps_path} has no 'edges' array", file=sys.stderr)
         return None
     # The converter only needs flow-event endpoints (not the per-edge tensor
-    # annotations). Project annotated edges down to a (pred, succ) set and
-    # dedup so multiple annotated edges sharing the same pair (distinct arg
-    # / source / overlap) collapse to a single flow event.
+    # annotations). Keep every annotated edge; (pred, succ) dedup happens
+    # separately when emitting Worker View (pid=4) and Scheduler View (pid=3).
     by_pred: dict[int, list[int]] = defaultdict(list)
-    seen: set[tuple[int, int]] = set()
     for edge in edges:
         if not isinstance(edge, dict):
             continue
@@ -423,10 +423,6 @@ def load_deps_json(deps_path):
         succ = normalize_pto2_task_id_int(edge.get("succ"))
         if pred is None or succ is None:
             continue
-        key = (pred, succ)
-        if key in seen:
-            continue
-        seen.add(key)
         by_pred[pred].append(succ)
     return dict(by_pred)
 
@@ -591,6 +587,33 @@ def _dependency_task_fan_count(task_id, spmd_task_ids, task_map, deps_block_map=
             return deps_block_map[task_id]
         return len(task_map[task_id])
     return 1
+
+
+def _worker_has_rendered_setup(row):
+    """True when the Worker View emits a visible setup bar for this subtask."""
+    receive = row.get("receive_time_us")
+    local_setup = row.get("local_setup_us") or 0.0
+    return receive is not None and local_setup >= _SETUP_MIN_US
+
+
+def _worker_dependency_inbound_ts(succ_row, succ_id, spmd_task_ids):
+    """Worker View dependency inbound timestamp for one successor subtask row.
+
+    SPMD successors land on the setup bar (receive_time) only when a setup
+    slice is actually rendered. With no setup data, zero-duration setup, or
+    sub-period setup below the render threshold, the arrow anchors on the exec
+    bar left edge (start_time) instead.
+    """
+    if succ_id in spmd_task_ids and not _worker_has_rendered_setup(succ_row):
+        return succ_row["start_time_us"]
+    receive = succ_row.get("receive_time_us")
+    return receive if receive is not None else succ_row["start_time_us"]
+
+
+def _subtask_exec_event_id(subtask_event_ids, row, fallback):
+    """Event id of the exec slice for a specific subtask row."""
+    key = (row["task_id"], row["core_id"], row["start_time_us"])
+    return subtask_event_ids.get(key, fallback.get((row["task_id"], row["core_id"])))
 
 
 def _append_dependency_flow_pair(  # noqa: PLR0913
@@ -1151,6 +1174,7 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
     # Duration events (Complete events "X")
     # Build task_id -> event_id mapping for flow events
     task_to_event_id: dict[tuple[int, int], int] = {}
+    subtask_exec_event_ids: dict[tuple[int, int, float], int] = {}
     task_to_aicpu_event_id: dict[tuple[int, int], int] = {}
     task_to_aicpu_tid: dict[tuple[int, int], int] = {}
     event_id = 0
@@ -1163,10 +1187,8 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
             for succ in succs:
                 fanin_map[succ].append(pred)
 
-    # One clock period at the AICore counter resolution. The device counter
-    # ticks at 50 MHz on a2a3 (20 ns) — sub-period local_setup intervals are
-    # noise (warm dcci is cycle-zero), so don't emit invisible zero-width bars.
-    _SETUP_MIN_US = 0.02
+    # Sub-period local_setup intervals are noise (warm dcci is cycle-zero), so
+    # don't emit invisible zero-width setup bars — see module _SETUP_MIN_US.
 
     for task in tasks:
         tid = core_to_tid[task["core_id"]]
@@ -1239,6 +1261,7 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
 
         # Record mapping for flow events
         task_to_event_id[(task["task_id"], task["core_id"])] = event_id
+        subtask_exec_event_ids[(task["task_id"], task["core_id"], task["start_time_us"])] = event_id
         event_id += 1
 
     # Scheduler View duration events (dispatch_time to finish_time)
@@ -1356,12 +1379,17 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
     deps_flow_count = 0
     edges_by_pred = deps_edges or {}
     flow_epsilon = 0.01
+    worker_dep_seen: set[tuple[int, int]] = set()
 
     for pred_id, succ_ids in edges_by_pred.items():
         if pred_id not in task_map:
             continue
 
         for succ_id in succ_ids:
+            dep_key = (pred_id, succ_id)
+            if dep_key in worker_dep_seen:
+                continue
+            worker_dep_seen.add(dep_key)
             if succ_id not in task_map:
                 if verbose:
                     print(
@@ -1378,7 +1406,7 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
             input_task_count = _dependency_task_fan_count(succ_id, spmd_task_ids, task_map, deps_block_map)
             for pred_row, succ_row in row_pairs:
                 src_ts_end = pred_row["end_time_us"] - flow_epsilon
-                dst_ts_start = succ_row.get("receive_time_us") or succ_row["start_time_us"]
+                dst_ts_start = _worker_dependency_inbound_ts(succ_row, succ_id, spmd_task_ids)
                 hb_violated = (src_ts_end + flow_epsilon) > dst_ts_start
                 flow_name = "hb_violation" if hb_violated else "dependency"
                 if hb_violated:
@@ -1390,11 +1418,11 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
                     4,
                     core_to_tid[pred_row["core_id"]],
                     src_ts_end,
-                    task_to_event_id.get((pred_id, pred_row["core_id"])),
+                    _subtask_exec_event_id(subtask_exec_event_ids, pred_row, task_to_event_id),
                     4,
                     core_to_tid[succ_row["core_id"]],
                     dst_ts_start,
-                    task_to_event_id.get((succ_id, succ_row["core_id"])),
+                    _subtask_exec_event_id(subtask_exec_event_ids, succ_row, task_to_event_id),
                     input_task_count=input_task_count,
                     output_task_count=output_task_count,
                 )
@@ -1821,11 +1849,16 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
 
     # Scheduler View dependency mirror (AICPU timestamps).
     if has_aicpu_data:
+        scheduler_dep_seen: set[tuple[int, int]] = set()
         for pred_id, succ_ids in edges_by_pred.items():
             if pred_id not in task_map:
                 continue
 
             for succ_id in succ_ids:
+                dep_key = (pred_id, succ_id)
+                if dep_key in scheduler_dep_seen:
+                    continue
+                scheduler_dep_seen.add(dep_key)
                 if succ_id not in task_map:
                     continue
 
@@ -1874,6 +1907,11 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
     # logical task it walks the fanout list and releases each consumer's
     # fanin refcount. The arrows are built in two stages.
     #
+    # SPMD logical tasks (block_num>1) are excluded: their block-level
+    # dependencies are drawn only via deps.json ``dependency`` flows on
+    # Worker View (pid=4) and Scheduler View (pid=3), not through complete
+    # inbound / complete→ready chains.
+    #
     # Inbound: per-task, NOT per-subtask. A task is logically "completed"
     # only when its LAST subtask is observed (the one that triggers
     # phase_complete_count++ in firmware). For SPMD with N subtasks across
@@ -1918,6 +1956,8 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
         task_to_complete: dict[int, dict] = {}
         task_last_subtask: dict[int, tuple[float, float, int]] = {}  # tid -> (last_end_us, last_finish_us, core_id)
         for tid, recs in tasks_by_id.items():
+            if tid in spmd_task_ids:
+                continue
             valid_finishes = [
                 (r.get("finish_time_us"), r.get("end_time_us"), r["core_id"])
                 for r in recs

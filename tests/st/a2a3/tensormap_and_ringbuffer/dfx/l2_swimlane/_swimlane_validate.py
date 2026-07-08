@@ -22,7 +22,6 @@ AIC+AIV tasks produce multiple perf rows per ``task_id``.
 
 from __future__ import annotations
 
-import importlib.util
 import json
 import re
 import subprocess
@@ -31,16 +30,6 @@ from pathlib import Path
 
 from simpler_setup.scene_test import _outputs_dir, _sanitize_for_filename
 from simpler_setup.tools.swimlane_converter import read_perf_data
-
-# verify_dependency_view_parity encodes a contract a2a3 and a5 must keep
-# byte-identical, so it lives in tests/st/_l2_swimlane_shared.py. The two
-# leaf packages have no shared package parent under --import-mode=importlib,
-# so load that single source of truth by __file__-relative path.
-_shared_path = Path(__file__).resolve().parents[4] / "_l2_swimlane_shared.py"
-_shared_spec = importlib.util.spec_from_file_location("_l2_swimlane_shared", _shared_path)
-_l2_swimlane_shared = importlib.util.module_from_spec(_shared_spec)
-_shared_spec.loader.exec_module(_l2_swimlane_shared)
-verify_dependency_view_parity = _l2_swimlane_shared.verify_dependency_view_parity
 
 _REQUIRED_TASK_FIELDS = (
     "task_id",
@@ -117,18 +106,6 @@ def validate_perf_artifact(case_label: str, *, since: float, expected_task_count
         check=True,
         timeout=60,
     )
-
-    # ---- Dependency-view parity: Worker View vs Scheduler View ----
-    # The converter draws each deps.json edge twice — on the Worker View
-    # (pid=4, AICore timestamps) and mirrored on the Scheduler View (pid=3,
-    # AICPU timestamps). At level>=2 (AICPU timing present) every Worker-View
-    # dependency arrow must have a Scheduler-View counterpart; a regression in
-    # the mirror's endpoint resolution (e.g. dropping arrows to tasks whose
-    # completion wasn't captured) shows up here as a count mismatch. Requires a
-    # sibling deps.json (co-captured with --enable-dep-gen).
-    deps_sibling = Path(perf).parent / "deps.json"
-    if deps_sibling.exists():
-        verify_dependency_view_parity(data, deps_sibling, out_dir)
 
     # ---- Tool smoke: sched_overhead_analysis ----
     # pop_hit / pop_miss come from the dispatch-phase extras the runtime writes

@@ -133,6 +133,39 @@ def test_spmd_pred_routes_dependency_to_min_core_subtask(tmp_path):
     assert sched_flow[0]["ts"] == tasks[0]["finish_time_us"] - 0.01
     assert sched_flow[1]["ts"] == tasks[4]["dispatch_time_us"]
 
+    deps_dup = {pred_id: [succ_id, succ_id, succ_id]}
+    out_dup = _generate_trace(tasks, deps_dup, deps_block_map, tmp_path)
+    assert _count_dependency_flow_starts(out_dup, pid=4) == 1
+    assert _count_dependency_flow_starts(out_dup, pid=3) == 1
+
+    # SPMD(4) -> SPMD(4): one logical edge, symmetric fan metadata.
+    to_spmd_tasks = [_task_row(pred_id, core_id, dispatch=10.0 + core_id) for core_id in range(4)]
+    to_spmd_tasks.extend(_task_row(succ_id, core_id, dispatch=30.0 + core_id) for core_id in range(4))
+    out_to_spmd = _generate_trace(to_spmd_tasks, deps_edges, {pred_id: 4, succ_id: 4}, tmp_path)
+    assert _count_dependency_flow_starts(out_to_spmd, pid=4) == 1
+    assert _count_dependency_flow_starts(out_to_spmd, pid=3) == 1
+    assert not _has_spmd_block_level_track(out_to_spmd)
+    to_spmd_flow = _first_worker_dependency_flow(out_to_spmd)
+    assert to_spmd_flow[0]["output_task_count"] == 4
+    assert to_spmd_flow[0]["input_task_count"] == 4
+    to_spmd_sched = _first_scheduler_dependency_flow(out_to_spmd)
+    assert to_spmd_sched[0]["output_task_count"] == 4
+    assert to_spmd_sched[0]["input_task_count"] == 4
+    assert to_spmd_sched[0]["ts"] == to_spmd_tasks[0]["finish_time_us"] - 0.01
+    assert to_spmd_sched[1]["ts"] == to_spmd_tasks[4]["dispatch_time_us"]
+
+    # Scheduler mirror falls back to the first sibling with a captured finish.
+    pred_rows = [_task_row(pred_id, core_id, dispatch=10.0 + core_id) for core_id in range(4)]
+    pred_rows[0]["finish_time_us"] = 0.0
+    tasks_no_min_finish = list(pred_rows)
+    tasks_no_min_finish.append(_task_row(succ_id, 10))
+    out_fallback = _generate_trace(tasks_no_min_finish, deps_edges, deps_block_map, tmp_path)
+    assert _count_dependency_flow_starts(out_fallback, pid=4) == 1
+    assert _count_dependency_flow_starts(out_fallback, pid=3) == 1
+    sched_fallback = _first_scheduler_dependency_flow(out_fallback)
+    assert sched_fallback[0]["tid"] == _core_tid(1)
+    assert sched_fallback[0]["ts"] == tasks_no_min_finish[1]["finish_time_us"] - 0.01
+
 
 def test_spmd_succ_routes_dependency_to_min_core_subtask(tmp_path):
     pred_id = 100
@@ -149,74 +182,73 @@ def test_spmd_succ_routes_dependency_to_min_core_subtask(tmp_path):
 
     out = _generate_trace(tasks, deps_edges, deps_block_map, tmp_path)
     assert _count_dependency_flow_starts(out, pid=4) == 1
+    assert _count_dependency_flow_starts(out, pid=3) == 1
     flow = _first_worker_dependency_flow(out)
     assert flow[0]["output_task_count"] == 1
     assert flow[0]["input_task_count"] == 4
     assert flow[1]["tid"] == _core_tid(0)
     assert flow[1]["ts"] == tasks[1]["receive_time_us"]
-
-
-def test_spmd_to_spmd_one_edge_on_min_core_subtask(tmp_path):
-    pred_id = 100
-    succ_id = 200
-    tasks = [_task_row(pred_id, core_id, dispatch=10.0 + core_id) for core_id in range(4)]
-    tasks.extend(_task_row(succ_id, core_id, dispatch=30.0 + core_id) for core_id in range(4))
-    deps_edges = {pred_id: [succ_id]}
-    deps_block_map = {pred_id: 4, succ_id: 4}
-
-    out = _generate_trace(tasks, deps_edges, deps_block_map, tmp_path)
-    assert _count_dependency_flow_starts(out, pid=4) == 1
-    assert not _has_spmd_block_level_track(out)
-    flow = _first_worker_dependency_flow(out)
-    assert flow[0]["output_task_count"] == 4
-    assert flow[0]["input_task_count"] == 4
-
-
-def test_spmd_succ_missing_finish_still_gets_scheduler_arrow(tmp_path):
-    # A tail/terminal successor dispatched but its completion was never
-    # captured (finish_time_us <= 0). The inbound dependency arrow lands at
-    # the successor's dispatch, so the Scheduler View must still draw it —
-    # matching the Worker View, which keeps the arrow (AICore end_time is
-    # always present). Regression for the dropped SPMD Scheduler-View arrow.
-    pred_id = 100
-    succ_id = 200
-    tasks = [_task_row(pred_id, 0)]
-    succ_rows = [
-        _task_row(succ_id, core_id, dispatch=20.0 + core_id, start=21.0 + core_id, end=30.0 + core_id)
-        for core_id in range(4)
-    ]
-    for r in succ_rows:
-        r["finish_time_us"] = 0.0  # completion not captured
-    tasks.extend(succ_rows)
-    deps_edges = {pred_id: [succ_id]}
-    deps_block_map = {pred_id: 1, succ_id: 4}
-
-    out = _generate_trace(tasks, deps_edges, deps_block_map, tmp_path)
-    assert _count_dependency_flow_starts(out, pid=4) == 1
-    assert _count_dependency_flow_starts(out, pid=3) == 1
-
-
-def test_spmd_pred_missing_finish_on_min_core_falls_back_to_sibling(tmp_path):
-    # The literal min-core anchor subtask has no captured finish, but a
-    # sibling subtask of the same logical SPMD task does. The Scheduler View
-    # anchors the outbound arrow on the first *visible* subtask instead of
-    # dropping the edge.
-    pred_id = 100
-    succ_id = 200
-    pred_rows = [_task_row(pred_id, core_id, dispatch=10.0 + core_id) for core_id in range(4)]
-    pred_rows[0]["finish_time_us"] = 0.0  # min-core subtask's completion not captured
-    tasks = list(pred_rows)
-    tasks.append(_task_row(succ_id, 10))
-    deps_edges = {pred_id: [succ_id]}
-    deps_block_map = {pred_id: 4, succ_id: 1}
-
-    out = _generate_trace(tasks, deps_edges, deps_block_map, tmp_path)
-    assert _count_dependency_flow_starts(out, pid=4) == 1
-    assert _count_dependency_flow_starts(out, pid=3) == 1
     sched_flow = _first_scheduler_dependency_flow(out)
-    # Anchored on the first sibling that has a captured finish (core 1).
-    assert sched_flow[0]["tid"] == _core_tid(1)
-    assert sched_flow[0]["ts"] == tasks[1]["finish_time_us"] - 0.01
+    assert sched_flow[0]["output_task_count"] == 1
+    assert sched_flow[0]["input_task_count"] == 4
+    assert sched_flow[1]["ts"] == tasks[1]["dispatch_time_us"]
+
+    # Scheduler mirror lands on dispatch even when succ finish was not captured.
+    for row in tasks[1:]:
+        row["finish_time_us"] = 0.0
+    out_no_finish = _generate_trace(tasks, deps_edges, deps_block_map, tmp_path)
+    assert _count_dependency_flow_starts(out_no_finish, pid=4) == 1
+    assert _count_dependency_flow_starts(out_no_finish, pid=3) == 1
+
+    # SPMD succ: no visible setup -> inbound anchors on exec start; bind_id matches anchor slice.
+    succ_no_setup = _task_row(succ_id, 0, dispatch=20.0, start=21.0, end=30.0, receive=20.99)
+    succ_no_setup["local_setup_us"] = 0.01
+    tasks_no_setup = [_task_row(pred_id, 0), succ_no_setup]
+    out_no_setup = _generate_trace(tasks_no_setup, deps_edges, deps_block_map, tmp_path)
+    with open(out_no_setup) as f:
+        events = json.load(f)["traceEvents"]
+    flow_f = next(
+        e
+        for e in events
+        if e.get("cat") == "flow" and e.get("ph") == "f" and e.get("pid") == 4 and e.get("name") == "dependency"
+    )
+    assert flow_f["ts"] == 21.0
+    dst_slice = next(e for e in events if e.get("ph") == "X" and e.get("id") == flow_f["bind_id"])
+    assert dst_slice["ts"] == 21.0
+
+    # SPMD tasks do not participate in complete-phase flow arrows.
+    scalar_task_id = 300
+    spmd_tasks = [_task_row(succ_id, core_id) for core_id in range(4)]
+    spmd_tasks.append(_task_row(scalar_task_id, 10))
+    scheduler_phases = [
+        [
+            {
+                "phase": "complete",
+                "start_time_us": 5.0,
+                "end_time_us": 25.0,
+                "tasks_processed": 1,
+                "loop_iter": 0,
+            }
+        ]
+    ]
+    core_to_thread = [0] * 11
+    out_complete = tmp_path / "trace_complete.json"
+    sc.generate_chrome_trace_json(
+        spmd_tasks,
+        str(out_complete),
+        deps_edges={succ_id: [scalar_task_id]},
+        deps_block_map={succ_id: 4, scalar_task_id: 1},
+        scheduler_phases=scheduler_phases,
+        core_to_thread=core_to_thread,
+    )
+    with open(out_complete) as f:
+        complete_events = json.load(f)["traceEvents"]
+    complete_starts = [
+        e for e in complete_events if e.get("cat") == "flow" and e.get("name") == "complete" and e.get("ph") == "s"
+    ]
+    spmd_tids = {_core_tid(c) for c in range(4)}
+    assert not any(e.get("tid") in spmd_tids for e in complete_starts)
+    assert any(e.get("tid") == _core_tid(10) for e in complete_starts)
 
 
 def test_spmd_mix_to_mix_uses_anchor_cartesian_product(tmp_path):
@@ -299,21 +331,6 @@ def test_spmd_fallback_without_block_map(tmp_path):
     assert flow[0]["tid"] == _core_tid(0)
 
 
-def test_dependency_flow_anchor_rows_picks_min_core_per_type():
-    task_map = {
-        1: [
-            _task_row(1, 5, "aiv"),
-            _task_row(1, 0, "aiv"),
-            _task_row(1, 2, "aic"),
-            _task_row(1, 7, "aic"),
-        ]
-    }
-    rows = sc._dependency_flow_anchor_rows(1, task_map, {1})
-    assert len(rows) == 2
-    by_type = {r["core_type"]: r["core_id"] for r in rows}
-    assert by_type == {"aic": 2, "aiv": 0}
-
-
 def test_identify_spmd_task_ids_respects_authoritative_block_num_one():
     task_map = {
         1: [_task_row(1, 0), _task_row(1, 1), _task_row(1, 2)],
@@ -330,15 +347,3 @@ def test_spmd_task_display_name_suffix():
     assert sc._task_display_name(-1, {}, "r2t18", spmd=True) == "task_spmd(r2t18)"
     assert sc._task_display_name(0, {"0": "spmd_write_aiv"}, "t0", spmd=True) == "spmd_write_aiv(t0)"
     assert sc._task_display_name(0, {"0": "SPMDKernel"}, "t0", spmd=True) == "SPMDKernel(t0)"
-
-
-def test_spmd_cross_type_single_anchor_pair(tmp_path):
-    pred_id = 100
-    succ_id = 200
-    tasks = [_task_row(pred_id, core_id, "aic", dispatch=10.0 + core_id) for core_id in range(1, 9, 3)]
-    tasks.extend(_task_row(succ_id, core_id, "aiv", dispatch=30.0 + core_id) for core_id in range(24, 40, 2))
-    deps_edges = {pred_id: [succ_id]}
-    deps_block_map = {pred_id: 8, succ_id: 16}
-
-    out = _generate_trace(tasks, deps_edges, deps_block_map, tmp_path)
-    assert _count_dependency_flow_starts(out, pid=4) == 1
