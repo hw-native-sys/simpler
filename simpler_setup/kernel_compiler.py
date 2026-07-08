@@ -210,6 +210,15 @@ class KernelCompiler:
 
         return include_dirs, source_files
 
+    def _get_orchestration_platform_sources(self) -> list[str]:
+        """Sources needed when public AICPU helper headers are used by orchestration SOs."""
+        variant = "sim" if self.platform.endswith("sim") else "onboard"
+        source_dir = self.project_root / "src" / "common" / "platform" / variant / "aicpu"
+        return [
+            str(source_dir / "cache_ops.cpp"),
+            str(source_dir / "device_time.cpp"),
+        ]
+
     def _run_subprocess(
         self, cmd: list[str], label: str, error_hint: str = "Compiler not found"
     ) -> subprocess.CompletedProcess:
@@ -418,6 +427,7 @@ class KernelCompiler:
         orch_includes, orch_sources = self._get_orchestration_config(runtime_name)
         if orch_includes:
             include_dirs = include_dirs + orch_includes
+        orch_sources = list(orch_sources) + self._get_orchestration_platform_sources()
 
         # host_build_graph dlopens the orchestration .so on the host, so it
         # compiles with the host g++ (x86_64) regardless of platform.
@@ -443,7 +453,10 @@ class KernelCompiler:
         else:
             toolchain = self.host_gxx
 
-        # Orchestration uses the ops table via pto_orchestration_api.h (no extra runtime sources needed).
+        # HOST_GXX: simulation build (host execution)
+        # AARCH64_GXX: cross-compilation for supported runtimes
+        # Runtime calls still go through pto_orchestration_api.h; platform helper sources
+        # are linked only for public AICPU utility headers used directly by orchestration code.
         return self._compile_orchestration_shared_lib(
             source_path,
             toolchain,

@@ -307,7 +307,6 @@ class Aarch64GxxToolchain(Toolchain):
             "-O3",
             "-g",
             "-std=c++17",
-            "-DL3_L2_ORCH_ENDPOINT_ENABLE_CACHE_MAINTENANCE",
         ]
         # -fno-gnu-unique: prevent STB_GNU_UNIQUE binding so dlclose actually unloads the SO.
         if self._gcc:

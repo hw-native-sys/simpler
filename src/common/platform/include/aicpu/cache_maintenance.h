@@ -8,14 +8,23 @@
  * See LICENSE in the root of the software repository for the full text of the License.
  * -----------------------------------------------------------------------------------------------------------
  */
-#include <cstddef>
 
-#include "aicpu/cache_maintenance.h"
+#ifndef SRC_COMMON_PLATFORM_INCLUDE_AICPU_CACHE_MAINTENANCE_H_
+#define SRC_COMMON_PLATFORM_INCLUDE_AICPU_CACHE_MAINTENANCE_H_
+
+#include <stddef.h>
 
 namespace aicpu_cache_maintenance {
 
-void invalidate_range_impl(const void * /* addr */, size_t /* size */) {}
-
-void flush_range_impl(const void * /* addr */, size_t /* size */) {}
+void invalidate_range_impl(const void *addr, size_t size);
+void flush_range_impl(const void *addr, size_t size);
 
 }  // namespace aicpu_cache_maintenance
+
+inline void cache_invalidate_range(const void *addr, size_t size) {
+    aicpu_cache_maintenance::invalidate_range_impl(addr, size);
+}
+
+inline void cache_flush_range(const void *addr, size_t size) { aicpu_cache_maintenance::flush_range_impl(addr, size); }
+
+#endif  // SRC_COMMON_PLATFORM_INCLUDE_AICPU_CACHE_MAINTENANCE_H_

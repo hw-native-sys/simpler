@@ -267,11 +267,9 @@ monotonic sequence or `Add` counters, because `EQ` can miss a target if the
 counter steps past it before the waiter observes the value. The primitive layer
 only applies the requested comparison.
 
-On onboard builds, correct payload/counter visibility depends on the endpoint
-cache maintenance helpers guarded by
-`L3_L2_ORCH_ENDPOINT_ENABLE_CACHE_MAINTENANCE`. Normal onboard orchestration
-builds define that macro through the toolchain; sim and non-aarch64 helper
-paths are no-ops. See
+On onboard builds, correct payload/counter visibility depends on the common
+`aicpu/cache_maintenance.h` helpers. The aarch64 path emits data-cache
+maintenance instructions; sim and non-aarch64 paths are no-ops. See
 [hardware/cache-coherency.md](hardware/cache-coherency.md).
 
 All waits must use finite timeouts. Unbounded waits hide protocol deadlocks.

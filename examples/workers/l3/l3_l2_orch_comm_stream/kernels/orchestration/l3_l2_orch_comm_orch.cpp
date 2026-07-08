@@ -33,8 +33,9 @@ void report_endpoint_error(const L3L2OrchEndpoint &endpoint) {
         PTO2_ERROR_EXPLICIT_ORCH_FATAL,
         "L3-L2 endpoint error op=%s kind=%u region=%llu counter_addr=%llu counter_operand=%d observed_counter=%d "
         "msg=%s",
-        err.op, static_cast<unsigned>(err.kind), static_cast<unsigned long long>(err.region_id),
-        static_cast<unsigned long long>(err.counter_addr), err.counter_operand, err.observed_counter, err.message
+        l3_l2_endpoint_op_to_string(err.op), static_cast<unsigned>(err.kind),
+        static_cast<unsigned long long>(err.region_id), static_cast<unsigned long long>(err.counter_addr),
+        err.counter_operand, err.observed_counter, err.message
     );
 }
 

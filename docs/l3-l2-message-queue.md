@@ -117,26 +117,26 @@ L3L2QueueArgs queue_args{
     counter_bytes,
 };
 
-L3L2QueueEndpoint queue(desc, queue_args);
+L3L2QueueEndpoint<> queue(desc, queue_args);
 if (queue.error().kind != L3L2QueueErrorKind::NONE) {
     return;
 }
 ```
 
-The default endpoint constructor allows one active L2 input handle at a time.
-L2 can opt into an input window with local endpoint configuration:
+The default endpoint allows one active L2 DATA/ERROR input handle at a time.
+L2 can opt into a larger input window with a compile-time endpoint structure
+parameter:
 
 ```cpp
-L3L2QueueEndpoint queue(
-    desc,
-    queue_args,
-    L3L2QueueEndpointConfig{.max_l2_input_inflight = 4}
-);
+L3L2QueueEndpoint<4> queue(desc, queue_args);
 ```
 
-`max_l2_input_inflight` is not part of L3 queue creation and does not change
-the queue layout or the shared ABI. The valid range is `1 <= N <= depth`.
-Invalid config reports `BAD_ARGUMENT` without setting the L2 abort flag.
+The template argument is not part of L3 queue creation and does not change the
+queue layout or the shared ABI. The valid range is `1 <= MaxInflight <= depth`.
+Invalid template/layout combinations report `BAD_ARGUMENT` without setting the
+L2 abort flag. STOP does not count against `MaxInflight`; the endpoint keeps
+one extra active-entry slot so a STOP handle can remain pending behind earlier
+DATA/ERROR handles.
 
 L2 consumes input messages from `queue.input()` and publishes outputs through
 `queue.output()`:
@@ -171,11 +171,12 @@ while (true) {
 return can mean ordinary no-progress, validation failure, or poison; check
 `queue.error().kind` to distinguish ordinary no-progress from terminal error.
 
-With `max_l2_input_inflight > 1`, L2 may acquire several DATA or ERROR inputs
-before releasing earlier ones. `release(handle)` then marks the input logically
-complete; the queue physically advances the shared input head only for the
-completed FIFO prefix. This lets L2 publish outputs in an application-defined
-order while keeping the input descriptor and payload release protocol FIFO.
+With `L3L2QueueEndpoint<N>` where `N > 1`, L2 may acquire several DATA or
+ERROR inputs before releasing earlier ones. `release(handle)` then marks the
+input logically complete; the queue physically advances the shared input head
+only for the completed FIFO prefix. This lets L2 publish outputs in an
+application-defined order while keeping the input descriptor and payload
+release protocol FIFO.
 
 ## 2. Layout
 
@@ -321,16 +322,15 @@ same handle. The caller may read the payload with `read_into(handle, buffer)`
 before releasing it. Releasing the wrong handle is an ownership error and
 poisons the queue.
 
-On L2 input, the default endpoint constructor keeps one active input handle.
-L2 must not call `peek()` again before releasing that handle. This is
-equivalent to `max_l2_input_inflight = 1` and preserves the base queue
-behavior.
+On L2 input, `L3L2QueueEndpoint<>` keeps one active DATA/ERROR input handle.
+L2 must not call `peek()` again before releasing that handle, except that STOP
+may also be acquired into the endpoint's extra STOP slot.
 
-When L2 constructs the endpoint with
-`L3L2QueueEndpointConfig{.max_l2_input_inflight = N}`, it may hold up to `N`
-active DATA or ERROR input handles. DATA and ERROR both count against the
-window because either may carry payload bytes that remain owned by L2
-application code. STOP does not count against the window.
+When L2 constructs `L3L2QueueEndpoint<N>`, it may hold up to `N` active DATA
+or ERROR input handles. DATA and ERROR both count against the window because
+either may carry payload bytes that remain owned by L2 application code. STOP
+does not count against the DATA/ERROR window, but it is still normal FIFO
+content and is released only by the completed prefix.
 
 In window mode, `release(handle)` is logical completion: the application is
 declaring that no future L2 code or in-flight AICore task will read that input
@@ -419,15 +419,19 @@ The example lives at:
 examples/workers/l3/l3_l2_message_queue/
 ```
 
-It uses `L3L2QueueEndpointConfig{.max_l2_input_inflight = 4}` and a PTO-ISA
-AIV kernel. L3 sends an initial pair of DATA inputs, drains the outputs that
-the persistent L2 run publishes for them, then sends another pair of DATA
-inputs followed by STOP. L2 acquires multiple inputs before releasing the
-earlier ones, publishes outputs in a different order from input acquisition,
-emits multiple outputs for one input, combines two inputs into one output
-during STOP drain, and returns only after `queue.input().drained()`.
+It uses `L3L2QueueEndpoint<4>` and a PTO-ISA AIV kernel. L3 sends an initial
+pair of DATA inputs, drains the outputs that the persistent L2 run publishes
+for them, then sends another pair of DATA inputs followed by STOP. L2 acquires
+multiple inputs before releasing the earlier ones, publishes outputs in a
+different order from input acquisition, emits multiple outputs for one input,
+combines two inputs into one output during STOP drain, and returns only after
+`queue.input().drained()`.
 Application request IDs and output kinds are carried in the payload headers;
 the transport sequence number is not used as a request ID.
+
+Data-plane routing between L3 Python and an L2 host service is intentionally
+deferred. That needs a separate design for L2 host-service routing, registered
+host tensors, and possible IPC virtual-address mapping.
 
 ## 9. Platform Support
 

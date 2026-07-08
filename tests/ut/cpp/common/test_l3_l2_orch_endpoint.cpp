@@ -12,9 +12,11 @@
 #include <array>
 #include <cstdint>
 #include <cstring>
+#include <type_traits>
 
 #include <gtest/gtest.h>
 
+#include "aicpu/device_time.h"
 #include "aicpu/l3_l2_orch_endpoint.h"
 #include "common/l3_l2_orch_comm.h"
 
@@ -54,7 +56,23 @@ TEST(L3L2OrchEndpointTest, DecodesDescriptorScalarsAndCounterRange) {
 }
 
 TEST(L3L2OrchEndpointTest, ConvertsCounterTicksToNanoseconds) {
-    EXPECT_EQ(l3_l2_orch_endpoint_ticks_to_ns(50'000'000, 50'000'000), 1'000'000'000);
+    EXPECT_EQ(sys_cnt_ticks_to_ns(50'000'000, 50'000'000), 1'000'000'000);
+    EXPECT_EQ(sys_cnt_elapsed_ns(10, 25, 1'000'000'000), 15u);
+}
+
+TEST(L3L2OrchEndpointTest, ErrorOperationStringsAndMessageCopyAreStable) {
+    static_assert(std::is_standard_layout<L3L2EndpointError>::value, "error must be POD-like");
+    static_assert(std::is_trivially_copyable<L3L2EndpointError>::value, "error must be fixed-size");
+    EXPECT_EQ(sizeof(L3L2EndpointError::message), 256u);
+
+    EXPECT_STREQ(l3_l2_endpoint_op_to_string(L3L2EndpointOp::INIT), "init");
+    EXPECT_STREQ(l3_l2_endpoint_op_to_string(L3L2EndpointOp::COUNTER_ADDR), "counter_addr");
+    EXPECT_STREQ(l3_l2_endpoint_op_to_string(L3L2EndpointOp::PAYLOAD_READ), "payload_read");
+    EXPECT_STREQ(l3_l2_endpoint_op_to_string(L3L2EndpointOp::PAYLOAD_WRITE), "payload_write");
+    EXPECT_STREQ(l3_l2_endpoint_op_to_string(L3L2EndpointOp::SIGNAL_NOTIFY), "signal_notify");
+    EXPECT_STREQ(l3_l2_endpoint_op_to_string(L3L2EndpointOp::SIGNAL_TEST), "signal_test");
+    EXPECT_STREQ(l3_l2_endpoint_op_to_string(L3L2EndpointOp::SIGNAL_WAIT), "signal_wait");
+    EXPECT_STREQ(l3_l2_endpoint_op_to_string(static_cast<L3L2EndpointOp>(99)), "unknown");
 }
 
 TEST(L3L2OrchEndpointTest, PayloadWriteCopiesSmallMetadataIntoPayloadRange) {
@@ -94,10 +112,10 @@ TEST(L3L2OrchEndpointTest, PayloadBoundsErrorCarriesStructuredMetadata) {
     EXPECT_EQ(view.gm_addr, 0u);
     EXPECT_EQ(view.nbytes, 0u);
     EXPECT_EQ(endpoint.error().kind, L3L2EndpointErrorKind::OUT_OF_BOUNDS);
-    EXPECT_STREQ(endpoint.error().op, "payload_read");
+    EXPECT_EQ(endpoint.error().op, L3L2EndpointOp::PAYLOAD_READ);
     EXPECT_EQ(endpoint.error().region_id, 17u);
     EXPECT_EQ(endpoint.error().counter_addr, 0u);
-    EXPECT_NE(endpoint.error().message, nullptr);
+    EXPECT_STRNE(endpoint.error().message, "");
 }
 
 TEST(L3L2OrchEndpointTest, CounterAddrRejectsBadOffsets) {
@@ -109,7 +127,7 @@ TEST(L3L2OrchEndpointTest, CounterAddrRejectsBadOffsets) {
 
     EXPECT_EQ(counter_addr, 0u);
     EXPECT_EQ(endpoint.error().kind, L3L2EndpointErrorKind::OUT_OF_BOUNDS);
-    EXPECT_STREQ(endpoint.error().op, "counter_addr");
+    EXPECT_EQ(endpoint.error().op, L3L2EndpointOp::COUNTER_ADDR);
     EXPECT_EQ(endpoint.error().region_id, 17u);
     EXPECT_EQ(endpoint.error().counter_addr, make_desc(&storage).counter_base + 2);
 }
@@ -166,7 +184,7 @@ TEST(L3L2OrchEndpointTest, SignalWaitTimeoutCarriesStructuredMetadata) {
     EXPECT_FALSE(endpoint.signal_wait(counter_addr, 1, L3L2OrchWaitCmp::EQ, 1, &observed));
 
     EXPECT_EQ(endpoint.error().kind, L3L2EndpointErrorKind::SIGNAL_TIMEOUT);
-    EXPECT_STREQ(endpoint.error().op, "signal_wait");
+    EXPECT_EQ(endpoint.error().op, L3L2EndpointOp::SIGNAL_WAIT);
     EXPECT_EQ(endpoint.error().region_id, 17u);
     EXPECT_EQ(endpoint.error().counter_addr, counter_addr);
     EXPECT_EQ(endpoint.error().counter_operand, 1);
@@ -195,8 +213,8 @@ TEST(L3L2OrchEndpointTest, RejectsBadDescriptorScalars) {
     L3L2OrchEndpoint endpoint(scalars.data(), scalars.size());
 
     EXPECT_EQ(endpoint.error().kind, L3L2EndpointErrorKind::BAD_DESCRIPTOR);
-    EXPECT_STREQ(endpoint.error().op, "init");
-    EXPECT_NE(endpoint.error().message, nullptr);
+    EXPECT_EQ(endpoint.error().op, L3L2EndpointOp::INIT);
+    EXPECT_STRNE(endpoint.error().message, "");
 }
 
 }  // namespace

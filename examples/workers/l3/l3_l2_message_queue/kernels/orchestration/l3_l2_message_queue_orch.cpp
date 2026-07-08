@@ -51,16 +51,18 @@ struct ActiveRequest {
     InputHeader header;
 };
 
-void report_queue_error(const L3L2QueueEndpoint &queue) {
+using QueueEndpoint = L3L2QueueEndpoint<kInputWindow>;
+
+void report_queue_error(const QueueEndpoint &queue) {
     const L3L2QueueError &err = queue.error();
     rt_report_fatal(
         PTO2_ERROR_EXPLICIT_ORCH_FATAL, "L3-L2 queue error op=%s kind=%u region=%llu msg=%s",
-        err.op ? err.op : "unknown", static_cast<unsigned>(err.kind), static_cast<unsigned long long>(err.region_id),
-        err.message ? err.message : "unknown"
+        l3_l2_queue_op_to_string(err.op), static_cast<unsigned>(err.kind),
+        static_cast<unsigned long long>(err.region_id), err.message
     );
 }
 
-bool has_queue_error(const L3L2QueueEndpoint &queue) { return queue.error().kind != L3L2QueueErrorKind::NONE; }
+bool has_queue_error(const QueueEndpoint &queue) { return queue.error().kind != L3L2QueueErrorKind::NONE; }
 
 bool parse_input_header(const L3L2QueueInputHandle &input, InputHeader *header) {
     if (header == nullptr || input.payload_nbytes != kInputHeaderBytes + kTileBytes) {
@@ -77,8 +79,8 @@ Tensor make_input_values_tensor(const L3L2QueueInputHandle &input) {
 }
 
 bool publish_aiv_output(
-    L3L2QueueEndpoint &queue, const L3L2QueueInputHandle &first, const L3L2QueueInputHandle &second,
-    uint64_t request_id, uint64_t kind, uint64_t aux, InputWindowOp op, float scalar
+    QueueEndpoint &queue, const L3L2QueueInputHandle &first, const L3L2QueueInputHandle &second, uint64_t request_id,
+    uint64_t kind, uint64_t aux, InputWindowOp op, float scalar
 ) {
     uint64_t nbytes = kOutputHeaderBytes + kTileBytes;
     L3L2QueueOutputReservation output{};
@@ -91,7 +93,7 @@ bool publish_aiv_output(
     uint8_t *dst = reinterpret_cast<uint8_t *>(static_cast<uintptr_t>(output.payload.gm_addr));
     memset(dst, 0, kOutputHeaderBytes);
     memcpy(dst, &header, sizeof(header));
-    l3_l2_orch_endpoint_cache_flush_range(dst, kOutputHeaderBytes);
+    cache_flush_range(dst, kOutputHeaderBytes);
 
     Tensor first_tensor = make_input_values_tensor(first);
     Tensor second_tensor = make_input_values_tensor(second);
@@ -116,7 +118,7 @@ bool publish_aiv_output(
     return true;
 }
 
-bool release_input(L3L2QueueEndpoint &queue, const L3L2QueueInputHandle &input) {
+bool release_input(QueueEndpoint &queue, const L3L2QueueInputHandle &input) {
     if (!queue.input().release(input)) {
         report_queue_error(queue);
         return false;
@@ -124,7 +126,7 @@ bool release_input(L3L2QueueEndpoint &queue, const L3L2QueueInputHandle &input) 
     return true;
 }
 
-bool process_first_pair(L3L2QueueEndpoint &queue, ActiveRequest *active, const L3L2QueueInputHandle &input) {
+bool process_first_pair(QueueEndpoint &queue, ActiveRequest *active, const L3L2QueueInputHandle &input) {
     active[1].handle = input;
     if (!parse_input_header(input, &active[1].header) || active[0].header.request_id == 0) {
         rt_report_fatal(PTO2_ERROR_EXPLICIT_ORCH_FATAL, "invalid L3-L2 queue example request");
@@ -169,7 +171,7 @@ bool remember_input_for_pair(ActiveRequest *active, const L3L2QueueInputHandle &
     return false;
 }
 
-bool process_data_message(L3L2QueueEndpoint &queue, const L3L2QueueInputHandle &input, ActiveRequest *active) {
+bool process_data_message(QueueEndpoint &queue, const L3L2QueueInputHandle &input, ActiveRequest *active) {
     InputHeader header{};
     if (!parse_input_header(input, &header)) {
         rt_report_fatal(PTO2_ERROR_EXPLICIT_ORCH_FATAL, "invalid L3-L2 queue example request");
@@ -199,7 +201,7 @@ bool process_data_message(L3L2QueueEndpoint &queue, const L3L2QueueInputHandle &
     return false;
 }
 
-bool finish_pending_inputs(L3L2QueueEndpoint &queue, ActiveRequest *active) {
+bool finish_pending_inputs(QueueEndpoint &queue, ActiveRequest *active) {
     if (active[2].header.request_id == 0 && active[3].header.request_id == 0) {
         return true;
     }
@@ -242,7 +244,7 @@ __attribute__((visibility("default"))) void l3_l2_message_queue_orchestration(co
         orch_args.scalar(6), orch_args.scalar(7),  orch_args.scalar(8),
         orch_args.scalar(9), orch_args.scalar(10), orch_args.scalar(11),
     };
-    L3L2QueueEndpoint queue(desc, queue_args, L3L2QueueEndpointConfig{.max_l2_input_inflight = kInputWindow});
+    QueueEndpoint queue(desc, queue_args);
     if (has_queue_error(queue)) {
         report_queue_error(queue);
         return;

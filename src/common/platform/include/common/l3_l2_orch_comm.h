@@ -14,6 +14,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <string.h>
 
 static constexpr uint32_t L3L2_ORCH_COMM_MAGIC = 0x4C334C32u;  // "L3L2"
 static constexpr uint16_t L3L2_ORCH_COMM_ABI_MAJOR = 2;
@@ -94,6 +95,20 @@ struct L3L2OrchCommResponse {
     L3L2OrchRegionDesc desc;
     char message[256];
 };
+
+namespace l3_l2_orch_comm {
+
+static inline void copy_error_message(char *dst, size_t dst_size, const char *message) {
+    if (dst == nullptr || dst_size == 0) {
+        return;
+    }
+    const char *src = message == nullptr ? "" : message;
+    size_t n = strnlen(src, dst_size - 1);
+    memcpy(dst, src, n);
+    dst[n] = '\0';
+}
+
+}  // namespace l3_l2_orch_comm
 
 static inline uint64_t l3_l2_orch_comm_pack_magic_version(uint32_t magic, uint16_t major, uint16_t minor) {
     return (static_cast<uint64_t>(magic) << 32) | (static_cast<uint64_t>(major) << 16) | static_cast<uint64_t>(minor);
@@ -267,5 +282,73 @@ l3_l2_orch_comm_validate_counter_addr(const L3L2OrchRegionDesc &desc, uint64_t c
     }
     return L3L2OrchCommValidationError::OK;
 }
+
+namespace l3_l2_orch_comm {
+
+static inline uint64_t pack_magic_version(uint32_t magic, uint16_t major, uint16_t minor) {
+    return ::l3_l2_orch_comm_pack_magic_version(magic, major, minor);
+}
+
+static inline uint64_t magic_version() { return ::l3_l2_orch_comm_magic_version(); }
+
+static inline uint32_t magic(uint64_t magic_version_value) { return ::l3_l2_orch_comm_magic(magic_version_value); }
+
+static inline uint16_t abi_major(uint64_t magic_version_value) {
+    return ::l3_l2_orch_comm_abi_major(magic_version_value);
+}
+
+static inline uint16_t abi_minor(uint64_t magic_version_value) {
+    return ::l3_l2_orch_comm_abi_minor(magic_version_value);
+}
+
+static inline bool add_overflows(uint64_t a, uint64_t b) { return ::l3_l2_orch_comm_add_overflows(a, b); }
+
+static inline bool is_aligned(uint64_t value, uint64_t align) { return ::l3_l2_orch_comm_is_aligned(value, align); }
+
+static inline bool range_contains(uint64_t base, uint64_t size, uint64_t value) {
+    return ::l3_l2_orch_comm_range_contains(base, size, value);
+}
+
+static inline bool
+ranges_overlap(uint64_t first_base, uint64_t first_size, uint64_t second_base, uint64_t second_size) {
+    return ::l3_l2_orch_comm_ranges_overlap(first_base, first_size, second_base, second_size);
+}
+
+static inline L3L2OrchCommValidationError
+validate_payload_bounds(uint64_t offset, uint64_t nbytes, uint64_t payload_bytes) {
+    return ::l3_l2_orch_comm_validate_payload_bounds(offset, nbytes, payload_bytes);
+}
+
+static inline L3L2OrchCommValidationError validate_counter_range(const L3L2OrchRegionDesc &desc) {
+    return ::l3_l2_orch_comm_validate_counter_range(desc);
+}
+
+static inline L3L2OrchCommValidationError validate_desc(const L3L2OrchRegionDesc &desc) {
+    return ::l3_l2_orch_comm_validate_desc(desc);
+}
+
+static inline bool encode_desc(const L3L2OrchRegionDesc &desc, uint64_t *scalars, size_t scalar_count) {
+    return ::l3_l2_orch_comm_encode_desc(desc, scalars, scalar_count);
+}
+
+static inline bool decode_desc(
+    const uint64_t *scalars, size_t scalar_count, L3L2OrchRegionDesc *out_desc, L3L2OrchCommValidationError *out_error
+) {
+    return ::l3_l2_orch_comm_decode_desc(scalars, scalar_count, out_desc, out_error);
+}
+
+static inline bool valid_notify_op(L3L2OrchNotifyOp op) { return ::l3_l2_orch_comm_valid_notify_op(op); }
+
+static inline bool valid_wait_cmp(L3L2OrchWaitCmp cmp) { return ::l3_l2_orch_comm_valid_wait_cmp(cmp); }
+
+static inline bool compare_counter(int32_t observed, int32_t cmp_value, L3L2OrchWaitCmp cmp) {
+    return ::l3_l2_orch_comm_compare_counter(observed, cmp_value, cmp);
+}
+
+static inline L3L2OrchCommValidationError validate_counter_addr(const L3L2OrchRegionDesc &desc, uint64_t counter_addr) {
+    return ::l3_l2_orch_comm_validate_counter_addr(desc, counter_addr);
+}
+
+}  // namespace l3_l2_orch_comm
 
 #endif  // SRC_COMMON_PLATFORM_INCLUDE_COMMON_L3_L2_ORCH_COMM_H_

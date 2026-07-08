@@ -25,6 +25,7 @@
 #include <stdexcept>
 #include <string>
 
+#include "aicpu/cache_maintenance.h"
 #include "aicpu/platform_regs.h"  // get_reg_ptr / RegId (arch header picked up via rt_objs include path)
 
 // =============================================================================
@@ -76,12 +77,25 @@ void unified_log_info_v(const char *func, int v, const char *fmt, ...) {
 
 uint64_t get_sys_cnt_aicpu() {
     auto now = std::chrono::steady_clock::now();
-    return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(now.time_since_epoch()).count());
+    uint64_t elapsed_ns =
+        static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(now.time_since_epoch()).count());
+    constexpr uint64_t kNsPerSec = std::nano::den;
+    uint64_t seconds = elapsed_ns / kNsPerSec;
+    uint64_t remaining_ns = elapsed_ns % kNsPerSec;
+    return seconds * PLATFORM_PROF_SYS_CNT_FREQ + (remaining_ns * PLATFORM_PROF_SYS_CNT_FREQ) / kNsPerSec;
 }
 
-void cache_invalidate_range(const void * /* addr */, size_t /* size */) {}
+// =============================================================================
+// cache_maintenance.h stub
+// =============================================================================
 
-void cache_flush_range(const void * /* addr */, size_t /* size */) {}
+namespace aicpu_cache_maintenance {
+
+void invalidate_range_impl(const void * /* addr */, size_t /* size */) {}
+
+void flush_range_impl(const void * /* addr */, size_t /* size */) {}
+
+}  // namespace aicpu_cache_maintenance
 
 // =============================================================================
 // platform_regs.h stub (get_reg_ptr)
