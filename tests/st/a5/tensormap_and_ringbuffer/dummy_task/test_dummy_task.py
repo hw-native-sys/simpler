@@ -86,6 +86,16 @@ class TestDummyTask(SceneTestCase):
             "config": {"aicpu_thread_num": 2, "block_dim": 1},
             "params": {"case": 3},
         },
+        {
+            # One producer fanned out to 18 dummy barriers, then one consumer
+            # depending on all 18 — both degrees exceed the dense-dependency
+            # warn threshold (16), exercising the orchestrator's fanout and
+            # fanin diagnostics. Correctness is still just the copy.
+            "name": "DenseFanoutFanin",
+            "platforms": ["a5sim", "a5"],
+            "config": {"aicpu_thread_num": 2, "block_dim": 1},
+            "params": {"case": 4},
+        },
     ]
 
     def generate_args(self, params):

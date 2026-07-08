@@ -93,6 +93,11 @@
 // Fanin storage
 #define PTO2_FANIN_INLINE_CAP 64
 
+// Dependency-degree diagnostic: warn once when a task's fanin or a producer's
+// fanout first exceeds this degree, so dense dependency graphs surface without
+// flooding the AICPU hot-path device log.
+#define PTO2_DEP_DEGREE_WARN_THRESHOLD 16
+
 // TensorMap cleanup interval
 #define PTO2_TENSORMAP_CLEANUP_INTERVAL 64  // Cleanup every N retired tasks
 #define PTO2_DEP_POOL_CLEANUP_INTERVAL 64   // Cleanup every N retired tasks

@@ -301,6 +301,7 @@ static bool append_fanin_or_fail(
     bool gone = prod_state->task == nullptr || prod_state->task->task_id.local() != producer_task_id.local() ||
                 pstate == PTO2_TASK_CONSUMED;
     bool claim = !gone && !fanin_builder->mark_seen(prod_ring, prod_slot);
+    int32_t fanout_now = -1;
     if (claim) {
         // Low bits hold the consumer count; bit31 is the scope ref. The consumer
         // count must never carry into bit31 (would corrupt the scope-release
@@ -310,12 +311,23 @@ static bool append_fanin_or_fail(
             "fanout consumer count overflow into scope bit"
         );
         prod_state->fanout_count++;
+        fanout_now = static_cast<int32_t>(prod_state->fanout_count & ~PTO2_FANOUT_SCOPE_BIT);
     }
     prod_state->unlock_fanout();
 #if PTO2_ORCH_PROFILING
     // lock + unlock always; one fanout_count store when we actually claim.
     g_orch_args_atomic_count += claim ? 3 : 2;
 #endif
+    // Dense-fanout diagnostic, emitted outside fanout_lock (no logging under the
+    // spinlock). The monotonic fanout_count++ crosses THRESHOLD+1 exactly once,
+    // so each dense producer warns exactly once and the AICPU hot path keeps a
+    // single predicted-not-taken branch on the common case.
+    if (fanout_now == PTO2_DEP_DEGREE_WARN_THRESHOLD + 1) {
+        LOG_WARN(
+            "dense dependency: task ring=%u id=%u fanout>%d [orch submit]",
+            static_cast<unsigned>(producer_task_id.ring()), producer_task_id.local(), PTO2_DEP_DEGREE_WARN_THRESHOLD
+        );
+    }
     // gone (stale/consumed) or an already-seen duplicate live producer: no new
     // fanin edge either way.
     if (!claim) {
@@ -922,6 +934,16 @@ static TaskOutputTensors submit_task_common(
     int32_t inline_count = std::min(fanin_builder.count, PTO2_FANIN_INLINE_CAP);
     // Store fanin metadata in payload for scheduler to iterate
     payload.fanin_actual_count = fanin_builder.count;
+    // Dense-fanin diagnostic: fanin_builder.count is finalized here and submit
+    // runs once per task, so each dense consumer warns exactly once. The check
+    // is > THRESHOLD (not == THRESHOLD+1): the count lands at its total here, so
+    // an == crossing test would miss a task that jumps straight past THRESHOLD+1.
+    if (fanin_builder.count > PTO2_DEP_DEGREE_WARN_THRESHOLD) {
+        LOG_WARN(
+            "dense dependency: task ring=%u id=%u fanin>%d [orch submit]", static_cast<unsigned>(task_id.ring()),
+            task_id.local(), PTO2_DEP_DEGREE_WARN_THRESHOLD
+        );
+    }
     payload.fanin_spill_start = fanin_builder.spill_start;
     payload.fanin_spill_pool = &fanin_builder.spill_pool;
     for (int i = 0; i < inline_count; i++) {
