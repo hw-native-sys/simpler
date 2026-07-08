@@ -513,6 +513,14 @@ void SchedulerContext::drain_worker_dispatch(int32_t block_num) {
         }
     }
 
+    // The drain path IS this sync_start producer's dispatch, so it must bump its
+    // consumers' dispatch_fanin like the normal dispatch path
+    // (scheduler_dispatch.cpp, post-publish) -- otherwise a consumer whose only
+    // flagged producer is a sync_start (drain-dispatched) task never becomes an
+    // early-dispatch candidate. Idempotent via propagate's dispatch_propagated
+    // once-guard; the internal gate no-ops for an unflagged producer.
+    sched_->propagate_dispatch_fanin(*slot_state);
+
     // All blocks dispatched -- clear drain state.
     // Release fence ensures tracker mutations are visible to threads that
     // acquire-load sync_start_pending == 0 and resume normal operation.
