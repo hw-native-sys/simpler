@@ -1073,6 +1073,15 @@ TaskOutputTensors PTO2OrchestratorState::alloc_tensors(const L0TaskArgs &args) {
         // required so scope_end can release the producer-side reference and
         // drive the slot to CONSUMED, but worker dispatch fields are never
         // observed for hidden alloc tasks.
+        //
+        // Flag the creator so it does NOT suppress its consumers' early-dispatch.
+        // Under the direct-only model an unflagged producer disqualifies its
+        // consumer, and a pre-completed producer only seeds dispatch_fanin when
+        // flagged. A buffer allocation is pure memory whose output is ready at
+        // creation — it should always be transparent, never a barrier. Unlike a
+        // codegen task there is no Arg-driven hint to honor here, so mark it
+        // unconditionally.
+        prepared.slot_state->allow_early_resolve = true;
         prepared.slot_state->task_state.store(PTO2_TASK_COMPLETED, std::memory_order_release);
     }
     orch->inline_completed_tasks++;

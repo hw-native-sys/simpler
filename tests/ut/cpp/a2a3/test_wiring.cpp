@@ -411,6 +411,38 @@ TEST_F(WiringTest, UnflaggedProducerDoesNotPropagate) {
     EXPECT_EQ(prod_payload.dispatch_propagated.load(), 0);  // gate returned before once-guard
 }
 
+TEST_F(WiringTest, FlaggedPrecompletedCreatorTransparentToEarlyDispatch) {
+    // Models the alloc-creator case: a consumer depends on a pre-completed,
+    // FLAGGED buffer creator (alloc_tensors flags its inline-completed task) plus
+    // a flagged, still-pending compute producer. The creator must be transparent
+    // (seeded), not a disqualifier: once the compute producer dispatches, the
+    // consumer reaches fanin_actual_count and becomes an early-dispatch candidate.
+    alignas(64) PTO2TaskSlotState task_slot;
+    alignas(64) PTO2TaskSlotState creator, compute;
+    alignas(64) PTO2TaskPayload payload;
+    memset(&payload, 0, sizeof(payload));
+    PTO2TaskDescriptor desc{};
+
+    init_slot(creator, PTO2_TASK_COMPLETED, 1, 1);
+    creator.allow_early_resolve = true;  // alloc creator: flagged -> transparent
+    init_slot(compute, PTO2_TASK_PENDING, 1, 1);
+    compute.allow_early_resolve = true;  // flagged compute producer
+
+    init_slot(task_slot, PTO2_TASK_PENDING, 0, 1);
+    payload.fanin_actual_count = 2;
+    payload.fanin_inline_slot_states[0] = &creator;
+    payload.fanin_inline_slot_states[1] = &compute;
+    task_slot.payload = &payload;
+    task_slot.task = &desc;
+
+    auto &rss = sched.ring_sched_states[0];
+    sched.wire_task(rss, &task_slot, 2);
+    EXPECT_EQ(payload.dispatch_fanin.load(), 1);  // creator seeded (transparent), not disqualified
+
+    sched.propagate_dispatch_fanin(compute);                               // compute dispatches -> bumps to 2
+    EXPECT_EQ(payload.dispatch_fanin.load(), payload.fanin_actual_count);  // candidate
+}
+
 // =============================================================================
 // on_task_complete: notifies consumers via fanout chain
 // =============================================================================
