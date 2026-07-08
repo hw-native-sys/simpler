@@ -35,10 +35,11 @@ available.
   [§3.5](#35-dependency-arrows-from-dep_gen).
 - **AICPU scheduler phases** — per-iteration breakdown into six
   mutually time-exclusive **outer** phases (`complete` / `dispatch`
-  / `release` / `wire` / `dummy` / `early_dispatch`), one **inner**
-  phase that nests inside its parent outer (`resolve`, parent =
-  Complete or Dummy), and one **separate-lane** phase
-  (`dummy_task`, rendered on Worker View AICPU_N rather than on the
+  / `release` / `wire` / `dummy` / `early_dispatch`), one logical
+  **inner** phase (`resolve`, parent = Complete or Dummy) rendered on a
+  sibling scheduler sub-lane with the same `Sched_N` label and adjacent tid,
+  and one **separate-lane**
+  phase (`dummy_task`, rendered on Worker View AICPU_N rather than on the
   sched lane). Idle iterations no longer emit a record on a2a3; the
   host tooling reconstructs idle spans from the gap between
   consecutive work records on the same thread. See §3.2 for the
@@ -231,16 +232,17 @@ field but render differently in Perfetto:
 | `wire` | outer | sched | tasks wired by `drain_wiring_queue` this iter |
 | `dummy` | outer | sched | dummies handled by `dummy_drain` this iter |
 | `early_dispatch` | outer | sched | blocks staged by speculative early-dispatch this pass |
-| `resolve` | inner | sched (nests in `complete` or `dummy`) | consumers visited in `on_task_complete` |
+| `resolve` | inner | sched sub-lane, same `Sched_N` label as its outer lane | consumers visited in `on_task_complete` |
 | `dummy_task` | separate-lane | Worker View AICPU_N (pid=4) | dummy `task_id` low 32 bits (deps.json flow target) |
 
 Outer phases are mutually time-exclusive within an iter — each
 emit advances the per-thread phase anchor (`_t0_phase`). Inner
-phases (`resolve`) don't advance the anchor; Perfetto nests them
-under the parent outer bar via time containment. Separate-lane
-phases are routed to a different lane by the converter (Worker
-View AICPU_N), so they never overlap visually with the sched
-lane bars even when their timestamps fall inside an outer span.
+phases (`resolve`) don't advance the anchor; the converter renders
+them on a sibling `Sched_N` tid so flow arrows attach to the outer
+`complete`/`dummy` lane instead of being visually captured by the inner
+slice. Separate-lane phases are routed to a different lane by the converter
+(Worker View AICPU_N), so they never overlap visually with the sched lane
+bars even when their timestamps fall inside an outer span.
 
 Legacy phases (`scan` / `poll` / `idle` / `fanout` / `prestage`)
 are still parsed for old captures but current a2a3/a5 builds no
@@ -285,20 +287,29 @@ in. The trace contains:
   blocks coloured by `phase` (level >= 3). The six outer phases
   (`complete` / `dispatch` / `release` / `wire` / `dummy` /
   `early_dispatch`) appear as sibling bars on each scheduler
-  thread's lane; the `resolve` inner phase nests inside its
-  parent (`complete` or `dummy`).
+  thread's first `Sched_N` lane; the `resolve` inner phase appears on an
+  adjacent `Sched_N` sub-lane.
 - **Scheduler View** (pid=3) — task-execution overlay using AICPU
   dispatch/finish timestamps (level >= 2), with the same labels
   as Worker View.
 - **Worker View** (pid=4) — one swim-lane per physical worker:
-  - `AIC_N` — matrix cores (kernel exec from level >= 1)
-  - `AIV_N` — vector cores (kernel exec from level >= 1)
+  - `AIC_N` — matrix cores (receive → kernel end from level >= 1)
+  - `AIV_N` — vector cores (receive → kernel end from level >= 1)
   - `AICPU_N` — AICPU acting as worker; carries `dummy_task`
     zero-width markers (one per dummy drained by the sched
     thread on AICPU N) and `alloc` bars (from `alloc_tensors()`
     calls that the orchestrator on AICPU 0 inline-completed).
     Both are activities the AICPU performs as a worker, so they
     share the same lane tier as AIC/AIV.
+  AIC/AIV hover args keep both `kernel-duration-us` and
+  `local_setup_us`; the old standalone setup preview bar is folded
+  into the task bar.
+
+`merged_swimlane.json` no longer emits separate `setup` X events.
+For AIC/AIV tasks, the Worker View task bar starts at `receive_time_us`
+and ends at `end_time_us`; the kernel-only duration remains available as
+`kernel-duration-us`, and the receive→start setup interval remains
+available as `local_setup_us` in the task's hover args.
 
 **Task labeling (AICore View and AICPU View) depends entirely on
 whether a `deps.json` is present** (see
@@ -458,11 +469,27 @@ that something dropped on the way from dep_gen to converter.
 
 **SPMD dependency arrows.** For logical tasks with `block_num > 1`,
 dependency / `hb_violation` flows connect via **anchor pairing** on
-physical core lanes — there is no dedicated `SPMD (block-level)` track.
+the Worker View and Scheduler View task lanes — there is no dedicated
+`SPMD (block-level)` track.
 
-SPMD tasks use the minimum-`core_id` subtask row per `core_type` as the
-dependency anchor; MIX-type SPMD tasks pick the minimum separately for
-AIC and AIV.
+SPMD tasks use the earliest-start subtask row for each
+`(func_id, task_id)` group as the dependency anchor. This keeps one
+representative endpoint per logical function within a task in each view
+and makes the task-dependency arrows share the same anchor records
+as the `complete` flow. The anchor decision includes both the function
+identity and the logical `task_id` (ring/local id), so MIX tasks that
+share a `task_id` across AIC/AIV functions keep separate anchors. The
+converter does not draw one arrow per subtask instance.
+
+**`complete` arrows.** Like the dependency mirror, the per-task
+`complete` flow (task → the pid=2 `complete` phase that observed its
+last subtask FIN) is drawn from **both** task views on the same anchor
+rows: the Worker View source anchors on the kernel slice (`end_time_us`),
+the Scheduler View source anchors on the AICPU `finish_time_us`. Both
+mirrors land on the identical pid=2 endpoint (thread + timestamp), so
+clicking the task in either view surfaces the arrow without changing
+completion attribution. The Scheduler View mirror is skipped for an
+anchor with no AICPU finish (its pid=3 bar does not exist).
 
 Non-SPMD tasks (including MIX multi-slot kernels with `block_num == 1`)
 keep every subtask row as an endpoint (N×N pairing unchanged).
@@ -506,9 +533,8 @@ What the swimlane shows:
   so Perfetto draws arrows between predecessor and successor tasks
   — see [§3.5](#35-dependency-arrows-from-dep_gen). Without
   `deps.json` the trace is correct but unarrowed. For SPMD tasks,
-  dependency arrows use the minimum-`core_id` subtask row per
-  `core_type` as the anchor; MIX-type SPMD tasks pick the
-  minimum-`core_id` subtask separately for AIC and AIV.
+  dependency arrows use the earliest-start subtask row per
+  `(func_id, task_id)` group as the anchor.
 - **Scheduler-loop time decomposition.** Per-iteration AICPU
   phase records show how long the scheduler spent in each of
   its two work phases (complete / dispatch); idle is recovered
