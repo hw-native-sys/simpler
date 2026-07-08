@@ -12,9 +12,27 @@
 ``ensure_pto_isa_root()`` always manages ``PROJECT_ROOT/build/pto-isa``:
 
 1. Read the required commit from ``pto_isa.pin``.
-2. Clone the managed checkout over HTTPS if it is missing.
-3. Checkout/reset the managed checkout to the pinned commit.
+2. If a managed checkout already exists **clean and at exactly the pin**, use it
+   as-is — it already *is* the pinned ISA, so no checkout and no network.
+3. Otherwise (missing, wrong revision, or dirty) obtain the pin fresh: clone
+   over HTTPS (``--no-checkout`` so the default branch is never materialized)
+   and force-check-out the pin.
 4. Verify HEAD exactly matches the pin before returning.
+
+Two deliberate choices:
+
+- **Obtain the pin fresh instead of patching a dirty cache.** A checkout is
+  reused only when it is provably already the pin (clean working tree with
+  HEAD == pin); anything else is re-cloned rather than reset/force-checked-out
+  in place, so the build never uses an ISA tree that was checked out over local
+  modifications. Reusing a pristine cache keeps the common path network-free;
+  the one network hop of a fresh clone is retried on transient failure.
+- **Force the checkout when landing a fresh clone.** pto-isa's default branch
+  carries case-duplicate doc paths (``docs/isa/TADDDEQRELU.md`` vs
+  ``TAddDeqRelu.md``) that collide on a case-insensitive filesystem (macOS CI),
+  leaving even a fresh working tree "modified"; a plain checkout then aborts.
+  ``--no-checkout`` (never materialize the default branch) plus a forced
+  checkout of the pin sidesteps that entirely.
 
 Lock file under build/ serializes concurrent clones from parallel processes.
 """
@@ -25,11 +43,18 @@ import logging
 import re
 import shutil
 import subprocess
+import time
 from collections.abc import Iterable
 from pathlib import Path
 from typing import Optional
 
 from .environment import PROJECT_ROOT
+
+# A fresh clone is only needed when no usable local checkout exists; when it is,
+# guard the single network hop against transient failures (e.g. GitHub
+# SSL_ERROR_SYSCALL) with a few backed-off retries before giving up.
+_CLONE_ATTEMPTS = 3
+_CLONE_RETRY_BACKOFF_S = 2
 
 logger = logging.getLogger(__name__)
 
@@ -269,8 +294,90 @@ def _discard_incomplete_clone(target: Path, verbose: bool) -> None:
         target.unlink(missing_ok=True)
 
 
-def _clone(target: Path, verbose: bool) -> bool:
-    """Clone PTO-ISA to `target` over HTTPS. Returns True on success."""
+def _remove_clone(target: Path, verbose: bool) -> None:
+    """Unconditionally remove `target` so a fresh clone can replace it.
+
+    Unlike ``_discard_incomplete_clone``, this removes even a *valid* clone —
+    used when the managed checkout is at the wrong (or a dirty) revision and we
+    re-clone at the pinned commit instead of checking out over local changes.
+    Handles a directory, a plain file, or a (possibly broken) symlink.
+    """
+    if not (target.exists() or target.is_symlink()):
+        return
+    if verbose:
+        logger.info(f"Removing pto-isa checkout at {target} to re-clone at the pinned commit")
+    if target.is_dir() and not target.is_symlink():
+        shutil.rmtree(target, ignore_errors=True)
+    else:
+        target.unlink(missing_ok=True)
+
+
+def _land_on_commit(clone_path: Path, commit: str, verbose: bool) -> bool:
+    """Force-detach-checkout a freshly cloned tree onto `commit`. False on failure.
+
+    `--force` is load-bearing, not defensive: pto-isa's default branch carries
+    paths that differ only in case (e.g. ``docs/isa/TADDDEQRELU.md`` vs
+    ``docs/isa/TAddDeqRelu.md``). On a case-insensitive filesystem (macOS CI)
+    they collide onto one inode, so even a *fresh* clone's working tree reports
+    them as modified, and a plain checkout to the pin aborts with "local changes
+    would be overwritten." Forcing discards that pseudo-dirt and lands exactly on
+    the pin. A full clone already carries every branch's history, but keep a
+    fetch fallback in case the pin is not reachable from the default fetch.
+    """
+    try:
+        result = _run_git_resilient(
+            ["checkout", "--detach", "--force", commit], cwd=clone_path, timeout=30, verbose=verbose
+        )
+        if result.returncode != 0:
+            if verbose:
+                logger.info(f"pto-isa commit {commit} missing locally, fetching origin...")
+            _run_git_resilient(["fetch", "origin"], cwd=clone_path, timeout=120, check=True, verbose=verbose)
+            _run_git_resilient(
+                ["checkout", "--detach", "--force", commit], cwd=clone_path, timeout=30, check=True, verbose=verbose
+            )
+        actual = get_pto_isa_head(str(clone_path))
+        if actual != commit:
+            logger.warning(f"pto-isa checkout verification failed: expected {commit}, got {actual or '<unknown>'}")
+            return False
+        return True
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
+        logger.warning(f"Failed to check out pto-isa commit {commit}: {e.stderr if hasattr(e, 'stderr') else e}")
+        return False
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"Unexpected error checking out pto-isa commit {commit}: {e}")
+        return False
+
+
+def _is_pristine_at_commit(clone_path: Path, commit: str, verbose: bool) -> bool:
+    """True iff the checkout is clean AND already at exactly `commit`.
+
+    When both hold, the working tree already *is* the pinned ISA — git content
+    is addressed by SHA, so a clean tree at HEAD == pin is byte-for-byte the pin
+    — and can be used as-is with no checkout and no network. A dirty or
+    wrong-revision tree returns False; the caller then obtains the pin with a
+    fresh clone rather than checking out over the existing tree, so the build is
+    never fed a checkout that was patched over local modifications.
+    """
+    if get_pto_isa_head(str(clone_path)) != commit:
+        return False
+    try:
+        result = _run_git_resilient(["status", "--porcelain"], cwd=clone_path, timeout=30, verbose=verbose)
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
+        logger.warning(f"Failed to check pto-isa checkout cleanliness: {e.stderr if hasattr(e, 'stderr') else e}")
+        return False
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"Unexpected error checking pto-isa checkout cleanliness: {e}")
+        return False
+    return result.returncode == 0 and not result.stdout.strip()
+
+
+def _clone(target: Path, commit: str, verbose: bool) -> bool:
+    """Fresh-clone PTO-ISA to `target` over HTTPS and land it on `commit`.
+
+    Any existing checkout at `target` is removed first, so this always yields a
+    clean tree at exactly `commit` — the sync can never be blocked by local
+    modifications in a preexisting (cached/preset) managed checkout.
+    """
     if not _is_git_available():
         if verbose:
             logger.warning("git command not available, cannot clone pto-isa")
@@ -283,18 +390,36 @@ def _clone(target: Path, verbose: bool) -> bool:
             logger.warning(f"Failed to create clone parent dir: {e}")
         return False
 
-    _discard_incomplete_clone(target, verbose)
-    logger.info(f"Cloning pto-isa to {target} over HTTPS (first run, may take up to a minute)...")
+    _remove_clone(target, verbose)
+    logger.info(f"Cloning pto-isa to {target} over HTTPS at {commit} (may take up to a minute)...")
 
     try:
-        result = _run_git(["clone", _PTO_ISA_HTTPS, str(target)], timeout=300)
+        # --no-checkout: never materialize the default branch. Its working tree
+        # is what carries the case-colliding docs/isa/TADDDEQRELU* paths; we only
+        # ever want the pinned commit's tree, laid down by _land_on_commit.
+        result = _run_git(["clone", "--no-checkout", _PTO_ISA_HTTPS, str(target)], timeout=300)
+        for attempt in range(2, _CLONE_ATTEMPTS + 1):
+            if result.returncode == 0:
+                break
+            if verbose:
+                logger.warning(f"pto-isa clone attempt {attempt - 1}/{_CLONE_ATTEMPTS} failed:\n{result.stderr}")
+            _remove_clone(target, verbose)  # clear the partial clone before retrying
+            time.sleep(_CLONE_RETRY_BACKOFF_S * (attempt - 1))
+            result = _run_git(["clone", "--no-checkout", _PTO_ISA_HTTPS, str(target)], timeout=300)
         if result.returncode != 0:
             if verbose:
-                logger.warning(f"Failed to clone pto-isa:\n{result.stderr}")
+                logger.warning(f"Failed to clone pto-isa after {_CLONE_ATTEMPTS} attempts:\n{result.stderr}")
             _discard_incomplete_clone(target, verbose)
             return False
+        if not _land_on_commit(target, commit, verbose=verbose):
+            # The clone succeeded but sits at the wrong commit (default HEAD),
+            # so it looks like a valid clone and `_discard_incomplete_clone`
+            # would leave it. Remove it outright so no wrong-revision checkout
+            # is stranded on disk for a later run to mistake for the pin.
+            _remove_clone(target, verbose)
+            return False
         if verbose:
-            logger.info(f"pto-isa cloned successfully: {target}")
+            logger.info(f"pto-isa cloned at {commit}: {target}")
         return True
     except subprocess.TimeoutExpired:
         if verbose:
@@ -305,36 +430,6 @@ def _clone(target: Path, verbose: bool) -> bool:
         if verbose:
             logger.warning(f"Failed to clone pto-isa: {e}")
         _discard_incomplete_clone(target, verbose)
-        return False
-
-
-def checkout_pto_isa_commit(clone_path: Path, commit: str, verbose: bool = False) -> bool:
-    """Checkout/reset the managed clone to `commit`. Return False on failure."""
-    try:
-        _run_git_resilient(["reset", "--hard"], cwd=clone_path, timeout=30, check=True, verbose=verbose)
-        _run_git_resilient(["clean", "-fdx"], cwd=clone_path, timeout=30, check=True, verbose=verbose)
-        result = _run_git_resilient(
-            ["checkout", "--force", "--detach", commit], cwd=clone_path, timeout=30, verbose=verbose
-        )
-        if result.returncode != 0:
-            if verbose:
-                logger.info(f"pto-isa commit {commit} missing locally, fetching origin...")
-            _run_git_resilient(["fetch", "origin"], cwd=clone_path, timeout=120, check=True, verbose=verbose)
-            _run_git_resilient(
-                ["checkout", "--force", "--detach", commit], cwd=clone_path, timeout=30, check=True, verbose=verbose
-            )
-        _run_git_resilient(["reset", "--hard", commit], cwd=clone_path, timeout=30, check=True, verbose=verbose)
-        _run_git_resilient(["clean", "-fdx"], cwd=clone_path, timeout=30, check=True, verbose=verbose)
-        actual = get_pto_isa_head(str(clone_path))
-        if actual != commit:
-            logger.warning(f"pto-isa checkout verification failed: expected {commit}, got {actual or '<unknown>'}")
-            return False
-        return True
-    except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
-        logger.warning(f"Failed to checkout pto-isa commit {commit}: {e.stderr if hasattr(e, 'stderr') else e}")
-        return False
-    except Exception as e:  # noqa: BLE001
-        logger.warning(f"Unexpected error checking out pto-isa commit {commit}: {e}")
         return False
 
 
@@ -361,15 +456,24 @@ def ensure_pto_isa_root(verbose: bool = False) -> str:
 
 def _ensure_locked(clone_path: Path, required_commit: str, verbose: bool) -> Optional[str]:
     """Inner logic executed while holding the file lock."""
-    if not _is_cloned(clone_path):
-        if not _clone(clone_path, verbose=verbose):
-            if not _is_cloned(clone_path):
-                return None
-            if verbose:
-                logger.info("pto-isa already cloned by another process")
+    # Reuse an existing checkout ONLY when it is already exactly the pin: a clean
+    # working tree at HEAD == pin already *is* the pinned ISA (git objects are
+    # content-addressed), so use it as-is — no checkout, no network. This is the
+    # warm-cache path on persistent runners.
+    if _is_cloned(clone_path) and _is_pristine_at_commit(clone_path, required_commit, verbose=verbose):
+        return str(clone_path.resolve())
 
-    if not checkout_pto_isa_commit(clone_path, required_commit, verbose=verbose):
-        return None
+    # Otherwise (missing, wrong revision, or dirty) obtain the pin *fresh* rather
+    # than checking out over the existing tree: re-clone directly at the pin. We
+    # never reset/force-checkout a dirty cache in place, so the build never uses
+    # a checkout that was patched over local modifications.
+    if not _clone(clone_path, required_commit, verbose=verbose):
+        # A parallel process holding a separate lock may have prepared the
+        # checkout concurrently; accept its result only if it landed on the pin.
+        if not (_is_cloned(clone_path) and get_pto_isa_head(str(clone_path)) == required_commit):
+            return None
+        if verbose:
+            logger.info("pto-isa prepared at the pin by another process")
 
     if not _is_cloned(clone_path):
         if verbose:
