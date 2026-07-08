@@ -61,6 +61,7 @@ jobs:
   # build artifacts cannot mask a regression in the next mode. Slow but reliable.
   # See docs/python-packaging.md and tools/verify_packaging.sh.
   packaging-matrix:
+    needs: pre-commit
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
     strategy:
@@ -104,6 +105,7 @@ jobs:
 
   # ---------- Unit tests (no hardware, Python + C++) ----------
   ut:
+    needs: pre-commit
     runs-on: ${{ matrix.os }}
     timeout-minutes: 15
     strategy:
@@ -158,7 +160,7 @@ jobs:
 
   # ---------- Simulation scene tests ----------
   st-sim-a2a3:
-    needs: detect-changes
+    needs: [detect-changes, pre-commit]
     if: needs.detect-changes.outputs.a2a3_changed == 'true'
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
@@ -241,7 +243,7 @@ jobs:
             --require-pto-isa --dump-args
 
   st-sim-a5:
-    needs: detect-changes
+    needs: [detect-changes, pre-commit]
     if: needs.detect-changes.outputs.a5_changed == 'true'
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
@@ -331,7 +333,7 @@ jobs:
   # the matching profiling log strings, and pytest output emits *only* the
   # corresponding profiling block — no cross-contamination from cmake cache.
   profiling-flags-smoke:
-    needs: detect-changes
+    needs: [detect-changes, pre-commit]
     if: needs.detect-changes.outputs.a2a3_changed == 'true' || needs.detect-changes.outputs.a5_changed == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -429,6 +431,7 @@ jobs:
 
   # ---------- Unit tests (a2a3 hardware, Python + C++) ----------
   ut-a2a3:
+    needs: pre-commit
     runs-on: [self-hosted, a2a3]
     timeout-minutes: 30
     env:
@@ -506,7 +509,7 @@ jobs:
 
   # ---------- Scene tests (a2a3 hardware) ----------
   st-onboard-a2a3:
-    needs: detect-changes
+    needs: [detect-changes, pre-commit]
     if: needs.detect-changes.outputs.a2a3_changed == 'true'
     runs-on: [self-hosted, a2a3]
     timeout-minutes: 60
@@ -595,10 +598,10 @@ jobs:
         run: |
           FILES=$(git diff --name-only ${{ github.event.pull_request.base.sha }}...${{ github.event.pull_request.head.sha }})
 
-          NON_CODE='^(docs/|\.docs/|\.claude/|KNOWN_ISSUES\.md$|\.gitignore$|README\.md$|\.pre-commit-config\.yaml$)'
+          NON_CODE='^(docs/|\.docs/|\.claude/|\.gitignore$|\.pre-commit-config\.yaml$)|\.md$'
 
           # a2a3: skip only when ALL changed files are a5-only or non-code
-          A5_ONLY='^(src/a5/|examples/a5/|tests/(st|device_tests)/a5/)'
+          A5_ONLY='^(src/a5/|examples/a5/|tests/(st|ut/cpp)/a5/)'
           A2A3_REMAINING=$(echo "$FILES" | grep -vE "$A5_ONLY" | grep -vE "$NON_CODE" || true)
 
           if [ -n "$A2A3_REMAINING" ]; then
@@ -611,7 +614,7 @@ jobs:
           fi
 
           # a5: skip only when ALL changed files are a2a3-only or non-code
-          A2A3_ONLY='^(src/a2a3/|examples/a2a3/|tests/(st|device_tests)/a2a3/)'
+          A2A3_ONLY='^(src/a2a3/|examples/a2a3/|tests/(st|ut/cpp)/a2a3/)'
           A5_REMAINING=$(echo "$FILES" | grep -vE "$A2A3_ONLY" | grep -vE "$NON_CODE" || true)
 
           if [ -n "$A5_REMAINING" ]; then
@@ -625,6 +628,7 @@ jobs:
 
   # ---------- Unit tests (a5 hardware, Python + C++) ----------
   ut-a5:
+    needs: pre-commit
     runs-on: [self-hosted, a5]
     timeout-minutes: 30
     env:
@@ -693,7 +697,7 @@ jobs:
           cmake --build build
 
   st-onboard-a5:
-    needs: detect-changes
+    needs: [detect-changes, pre-commit]
     if: needs.detect-changes.outputs.a5_changed == 'true'
     runs-on: [self-hosted, a5]
     timeout-minutes: 60
