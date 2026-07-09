@@ -593,7 +593,6 @@ int l2_swimlane_aicpu_complete_task(
 
     uint32_t new_count = count + 1;
     l2_swimlane_buf->count = new_count;
-    wmb();
 
     // Rotate AICpu's L2SwimlaneAicpuTaskBuffer after the write so the just-committed
     // record is preserved.
