@@ -8,6 +8,8 @@
 # -----------------------------------------------------------------------------------------------------------
 """Contract tests for simpler_setup.tools.deps_viewer text output."""
 
+import json
+
 from simpler_setup.tools import deps_viewer
 from simpler_setup.tools.deps_viewer import _merge_task_meta_with_kernel_ids, emit_text
 
@@ -349,3 +351,115 @@ def test_main_keeps_task_metadata_when_show_tensor_info_disabled(tmp_path, monke
     assert rc == 0
     assert captured["task_table"] == {1: {"task_id": 1, "args": []}}
     assert captured["show_tensor_info"] is False
+
+
+def test_transitive_reduction_removes_implied_edge():
+    # A->B->C plus the implied shortcut A->C.
+    kept, removed, is_dag = deps_viewer._transitive_reduction([(1, 2), (1, 3), (2, 3)], [1, 2, 3])
+    assert is_dag
+    assert removed == [(1, 3)]
+    assert kept == [(1, 2), (2, 3)]
+
+
+def test_transitive_reduction_keeps_non_redundant_diamond():
+    # Diamond A->B, A->C, B->D, C->D — no edge is implied by another path.
+    edges = [(1, 2), (1, 3), (2, 4), (3, 4)]
+    kept, removed, is_dag = deps_viewer._transitive_reduction(edges, [1, 2, 3, 4])
+    assert is_dag
+    assert removed == []
+    assert kept == sorted(edges)
+
+
+def test_transitive_reduction_drops_multi_hop_shortcut():
+    # Chain A->B->C->D with a long shortcut A->D implied by three hops.
+    kept, removed, is_dag = deps_viewer._transitive_reduction([(1, 2), (2, 3), (3, 4), (1, 4)], [1, 2, 3, 4])
+    assert is_dag
+    assert removed == [(1, 4)]
+    assert kept == [(1, 2), (2, 3), (3, 4)]
+
+
+def test_transitive_reduction_detects_cycle_and_falls_back():
+    edges = [(1, 2), (2, 1)]
+    kept, removed, is_dag = deps_viewer._transitive_reduction(edges, [1, 2])
+    assert not is_dag
+    assert kept == edges
+    assert removed == []
+
+
+def _write_deps_edges(tmp_path, edges):
+    deps = {
+        "tasks": [],
+        "tensors": [],
+        "edges": [{"pred": str(p), "succ": str(s), "arg": 0, "source": "creator"} for p, s in edges],
+    }
+    path = tmp_path / "deps.json"
+    path.write_text(json.dumps(deps))
+    return path
+
+
+def test_main_reduced_mode_drops_edge_and_prints_removed(tmp_path, capsys):
+    # A(r1t1) -> B(r1t2) -> C(r1t3) plus the implied A->C shortcut.
+    ring = 1 << 32
+    a, b, c = ring + 1, ring + 2, ring + 3
+    deps_path = _write_deps_edges(tmp_path, [(a, b), (b, c), (a, c)])
+    out = tmp_path / "graph.txt"
+
+    rc = deps_viewer.main([str(deps_path), "--edge-mode", "reduced", "-o", str(out)])
+    assert rc == 0
+
+    text = out.read_text()
+    assert "unique_task_edges: 2" in text
+    # Annotations of the pruned edge are dropped too, so the count matches the
+    # reduced edge set instead of over-counting (was 3 before reduction).
+    assert "annotated_edges: 2" in text
+    stdout = capsys.readouterr().out
+    assert "removed 1 redundant edge(s)" in stdout
+    # ring>=1 nodes render as the explicit (ring, local) tuple.
+    assert "(1, 1) -> (1, 3)" in stdout
+
+
+def test_main_full_mode_keeps_all_edges(tmp_path, capsys):
+    ring = 1 << 32
+    a, b, c = ring + 1, ring + 2, ring + 3
+    deps_path = _write_deps_edges(tmp_path, [(a, b), (b, c), (a, c)])
+    out = tmp_path / "graph.txt"
+
+    rc = deps_viewer.main([str(deps_path), "-o", str(out)])
+    assert rc == 0
+    assert "unique_task_edges: 3" in out.read_text()
+    assert "Transitive reduction" not in capsys.readouterr().out
+
+
+def test_main_omitted_mode_draws_only_redundant_edges(tmp_path, capsys):
+    # A(r1t1) -> B(r1t2) -> C(r1t3) plus the implied A->C shortcut. omitted
+    # keeps ONLY the redundant A->C edge (complement of reduced).
+    ring = 1 << 32
+    a, b, c = ring + 1, ring + 2, ring + 3
+    deps_path = _write_deps_edges(tmp_path, [(a, b), (b, c), (a, c)])
+    out = tmp_path / "graph.txt"
+
+    rc = deps_viewer.main([str(deps_path), "--edge-mode", "omitted", "-o", str(out)])
+    assert rc == 0
+
+    text = out.read_text()
+    # Only the single redundant edge is drawn; annotations match it.
+    assert "unique_task_edges: 1" in text
+    assert "annotated_edges: 1" in text
+    # The drawn edge is the redundant A->C, not the chain edges.
+    assert "=== TASK (1, 1)" in text
+    assert "  -> (1, 3)" in text
+    assert "  -> (1, 2)" not in text
+    stdout = capsys.readouterr().out
+    assert "showing 1 redundant edge(s)" in stdout
+    assert "(1, 1) -> (1, 3)" in stdout
+
+
+def test_main_omitted_default_output_stem(tmp_path):
+    ring = 1 << 32
+    a, b, c = ring + 1, ring + 2, ring + 3
+    deps_path = _write_deps_edges(tmp_path, [(a, b), (b, c), (a, c)])
+
+    rc = deps_viewer.main([str(deps_path), "--edge-mode", "omitted"])
+    assert rc == 0
+    assert (tmp_path / "deps_viewer_omitted.txt").exists()
+    assert not (tmp_path / "deps_viewer.txt").exists()
