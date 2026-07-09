@@ -14,6 +14,7 @@ from multiprocessing.shared_memory import SharedMemory
 from typing import Optional
 
 import pytest
+from simpler import l3_l2_orch_comm
 from simpler.l3_l2_message_queue import (
     L3L2_QUEUE_COUNTER_BYTES,
     L3L2_QUEUE_DESC_SLOT_BYTES,
@@ -25,17 +26,16 @@ from simpler.l3_l2_message_queue import (
     make_l3_l2_queue_layout,
 )
 from simpler.l3_l2_orch_comm import (
+    L3HostRegionMapping,
     L3L2OrchCommCmd,
     L3L2OrchCommRequest,
     L3L2OrchCommResponse,
     L3L2OrchRegion,
     L3L2OrchRegionDesc,
-    L3HostRegionMapping,
     L3L2RegionAccessProfile,
     NotifyOp,
     WaitCmp,
 )
-from simpler import l3_l2_orch_comm
 from simpler.orchestrator import Orchestrator
 from simpler.task_interface import DataType, Tensor, get_element_size
 from simpler.worker import _IDLE, _OFF_STATE, Worker, _buffer_field_addr, _mailbox_store_i32
@@ -459,14 +459,20 @@ def test_l3_host_mapped_queue_ordinary_input_delegates_staging_to_primitive(monk
         counters[int(offset)] = int(value)
 
     monkeypatch.setattr(l3_l2_orch_comm, "_l3_host_mapped_payload_write", payload_write)
-    monkeypatch.setattr(l3_l2_orch_comm, "_l3_host_mapped_counter_test", lambda _h, off, _v, _cmp: (False, counters.get(off, 0)))
+    monkeypatch.setattr(
+        l3_l2_orch_comm,
+        "_l3_host_mapped_counter_test",
+        lambda _h, off, _v, _cmp: (False, counters.get(off, 0)),
+    )
     monkeypatch.setattr(l3_l2_orch_comm, "_l3_host_mapped_counter_notify", counter_notify)
 
     queue.input.enqueue(b"ordinary", nbytes=8, timeout=0.001)
 
     assert (layout.input_arena_offset, b"ordinary") in payload_writes
     assert len(orch._buffers) == alloc_count
-    assert counters[region._l3_host_mapping.counter_offset + layout.input_desc_tail_offset] == 1
+    l3_host_mapping = region._l3_host_mapping
+    assert l3_host_mapping is not None
+    assert counters[l3_host_mapping.counter_offset + layout.input_desc_tail_offset] == 1
 
 
 def test_staging_allocation_failure_does_not_poison():

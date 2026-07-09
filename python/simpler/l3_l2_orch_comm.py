@@ -33,7 +33,7 @@ try:
     )
 except ImportError:
 
-    def _missing_l3_host_helper(*_: Any) -> None:
+    def _missing_l3_host_helper(*_: Any) -> Any:
         raise RuntimeError("L3-L2 L3 Host mapped-region helpers are unavailable; rebuild _task_interface")
 
     _l3_host_mapped_counter_notify = _missing_l3_host_helper
@@ -502,13 +502,13 @@ class L3L2OrchRegion:
 
     def payload_write(self, offset: int, host_buffer: Any, nbytes: int | None = None) -> None:
         self._ensure_live()
-        has_l3_host_mapping = self._l3_host_mapping is not None
-        with _PinnedBuffer(host_buffer, self._owner, has_l3_host_mapping=has_l3_host_mapping) as pinned:
+        l3_host_mapping = self._l3_host_mapping
+        with _PinnedBuffer(host_buffer, self._owner, has_l3_host_mapping=l3_host_mapping is not None) as pinned:
             size = pinned.nbytes if nbytes is None else int(nbytes)
             self._validate_payload_range(offset, size, pinned.nbytes)
-            if has_l3_host_mapping:
+            if l3_host_mapping is not None:
                 try:
-                    _l3_host_mapped_payload_write(self._l3_host_mapping.handle, int(offset), pinned.addr, size)
+                    _l3_host_mapped_payload_write(l3_host_mapping.handle, int(offset), pinned.addr, size)
                 except Exception:
                     self._poison()
                     raise
@@ -525,13 +525,15 @@ class L3L2OrchRegion:
 
     def payload_read(self, offset: int, host_buffer: Any, nbytes: int | None = None) -> None:
         self._ensure_live()
-        has_l3_host_mapping = self._l3_host_mapping is not None
-        with _PinnedBuffer(host_buffer, self._owner, writable=True, has_l3_host_mapping=has_l3_host_mapping) as pinned:
+        l3_host_mapping = self._l3_host_mapping
+        with _PinnedBuffer(
+            host_buffer, self._owner, writable=True, has_l3_host_mapping=l3_host_mapping is not None
+        ) as pinned:
             size = pinned.nbytes if nbytes is None else int(nbytes)
             self._validate_payload_range(offset, size, pinned.nbytes)
-            if has_l3_host_mapping:
+            if l3_host_mapping is not None:
                 try:
-                    _l3_host_mapped_payload_read(self._l3_host_mapping.handle, int(offset), pinned.addr, size)
+                    _l3_host_mapped_payload_read(l3_host_mapping.handle, int(offset), pinned.addr, size)
                 except Exception:
                     self._poison()
                     raise
@@ -594,20 +596,22 @@ class L3L2OrchRegion:
             raise
 
     def _direct_counter_notify(self, offset: int, value: int, op: NotifyOp) -> None:
-        assert self._l3_host_mapping is not None
-        mapping_offset = int(self._l3_host_mapping.counter_offset) + int(offset)
+        l3_host_mapping = self._l3_host_mapping
+        assert l3_host_mapping is not None
+        mapping_offset = int(l3_host_mapping.counter_offset) + int(offset)
         try:
-            _l3_host_mapped_counter_notify(self._l3_host_mapping.handle, mapping_offset, int(value), int(op))
+            _l3_host_mapped_counter_notify(l3_host_mapping.handle, mapping_offset, int(value), int(op))
         except Exception:
             self._poison()
             raise
 
     def _direct_counter_test(self, offset: int, cmp_value: int, cmp: WaitCmp) -> SignalTestResult:
-        assert self._l3_host_mapping is not None
-        mapping_offset = int(self._l3_host_mapping.counter_offset) + int(offset)
+        l3_host_mapping = self._l3_host_mapping
+        assert l3_host_mapping is not None
+        mapping_offset = int(l3_host_mapping.counter_offset) + int(offset)
         try:
             matched, observed = _l3_host_mapped_counter_test(
-                self._l3_host_mapping.handle, mapping_offset, int(cmp_value), int(cmp)
+                l3_host_mapping.handle, mapping_offset, int(cmp_value), int(cmp)
             )
         except Exception:
             self._poison()
@@ -615,11 +619,12 @@ class L3L2OrchRegion:
         return SignalTestResult(matched=bool(matched), observed=int(observed))
 
     def _direct_counter_wait(self, offset: int, cmp_value: int, cmp: WaitCmp, timeout_ns: int) -> int:
-        assert self._l3_host_mapping is not None
-        mapping_offset = int(self._l3_host_mapping.counter_offset) + int(offset)
+        l3_host_mapping = self._l3_host_mapping
+        assert l3_host_mapping is not None
+        mapping_offset = int(l3_host_mapping.counter_offset) + int(offset)
         try:
             status, error_kind, observed, _matched, message = _l3_host_mapped_counter_wait(
-                self._l3_host_mapping.handle, mapping_offset, int(cmp_value), int(cmp), int(timeout_ns)
+                l3_host_mapping.handle, mapping_offset, int(cmp_value), int(cmp), int(timeout_ns)
             )
         except Exception:
             self._poison()

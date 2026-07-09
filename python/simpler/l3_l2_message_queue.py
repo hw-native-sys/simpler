@@ -517,15 +517,7 @@ class _L3InputQueue:
         nbytes = int(nbytes)
         if nbytes < 0:
             raise ValueError("L3-L2 queue nbytes must be non-negative")
-        payload_tensor = None
-        staged_span = None
-        if nbytes == 0:
-            if buffer_or_none is not None:
-                raise ValueError("L3-L2 queue zero-byte enqueue requires buffer_or_none == None")
-        else:
-            payload_tensor = queue._registered_buffer_or_none(buffer_or_none, nbytes)
-            if payload_tensor is None:
-                staged_span = _host_byte_span(buffer_or_none, nbytes, writable=False)
+        payload_tensor, staged_span = self._resolve_payload_source(buffer_or_none, nbytes)
 
         queue._ensure_live()
         if queue._stop_published:
@@ -546,19 +538,11 @@ class _L3InputQueue:
         payload_offset = 0
         next_payload_tail = queue._input_payload_tail
         if nbytes != 0:
-            arena_pos = next_payload_tail % queue._layout.input_arena_bytes
-            if arena_pos + nbytes > queue._layout.input_arena_bytes:
-                next_payload_tail += queue._layout.input_arena_bytes - arena_pos
-                arena_pos = 0
-            if next_payload_tail + nbytes - queue._input_payload_head > queue._layout.input_arena_bytes:
+            payload_offset, next_payload_tail = self._reserve_payload_range(nbytes, next_payload_tail)
+            if payload_offset < 0:
                 return False
             if staged_span is not None:
-                if getattr(queue._region, "_l3_host_mapping", None) is None:
-                    payload_tensor = queue._ensure_staging_capacity(nbytes)
-                    queue._copy_host_span_to_tensor(staged_span, payload_tensor)
-                else:
-                    payload_tensor = buffer_or_none
-            payload_offset = queue._layout.input_arena_offset + arena_pos
+                payload_tensor = self._materialize_staged_payload(buffer_or_none, staged_span, nbytes)
             queue._run_primitive(queue._region.payload_write, payload_offset, payload_tensor, nbytes=nbytes)
             queue._input_payload_tail = next_payload_tail + nbytes
 
@@ -571,6 +555,34 @@ class _L3InputQueue:
         if opcode == L3L2QueueOpcode.STOP:
             queue._stop_published = True
         return True
+
+    def _resolve_payload_source(self, buffer_or_none: Any, nbytes: int) -> tuple[Any | None, _HostByteSpan | None]:
+        if nbytes == 0:
+            if buffer_or_none is not None:
+                raise ValueError("L3-L2 queue zero-byte enqueue requires buffer_or_none == None")
+            return None, None
+        payload_tensor = self._queue._registered_buffer_or_none(buffer_or_none, nbytes)
+        if payload_tensor is not None:
+            return payload_tensor, None
+        return None, _host_byte_span(buffer_or_none, nbytes, writable=False)
+
+    def _reserve_payload_range(self, nbytes: int, next_payload_tail: int) -> tuple[int, int]:
+        queue = self._queue
+        arena_pos = next_payload_tail % queue._layout.input_arena_bytes
+        if arena_pos + nbytes > queue._layout.input_arena_bytes:
+            next_payload_tail += queue._layout.input_arena_bytes - arena_pos
+            arena_pos = 0
+        if next_payload_tail + nbytes - queue._input_payload_head > queue._layout.input_arena_bytes:
+            return -1, next_payload_tail
+        return queue._layout.input_arena_offset + arena_pos, next_payload_tail
+
+    def _materialize_staged_payload(self, buffer_or_none: Any, staged_span: _HostByteSpan, nbytes: int) -> Any:
+        queue = self._queue
+        if getattr(queue._region, "_l3_host_mapping", None) is not None:
+            return buffer_or_none
+        payload_tensor = queue._ensure_staging_capacity(nbytes)
+        queue._copy_host_span_to_tensor(staged_span, payload_tensor)
+        return payload_tensor
 
 
 class _L3OutputQueue:

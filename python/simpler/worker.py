@@ -73,7 +73,7 @@ import threading
 import uuid
 from dataclasses import dataclass
 from multiprocessing.shared_memory import SharedMemory
-from typing import Any
+from typing import Any, cast
 
 import cloudpickle
 from _task_interface import (  # pyright: ignore[reportMissingImports]
@@ -1100,11 +1100,11 @@ def _next_l2_host_l3_l2_region_id(cw: ChipWorker) -> int:
 
 def _handle_ctrl_l3_l2_region_create(cw: ChipWorker, buf: memoryview) -> None:
     from .l3_l2_orch_comm import (  # noqa: PLC0415
+        _REGION_CREATE_REPLY,
+        _REGION_CREATE_REQUEST,
         CTRL_SHM_TOKEN_BYTES,
         L3L2RegionAccessProfile,
         L3L2RegionCreateRequest,
-        _REGION_CREATE_REPLY,
-        _REGION_CREATE_REQUEST,
         _align_up,
         _checked_add_u64,
     )
@@ -1113,9 +1113,11 @@ def _handle_ctrl_l3_l2_region_create(cw: ChipWorker, buf: memoryview) -> None:
     reply_shm_name = _read_shm_name(buf, _OFF_ARGS + _CTRL_SHM_NAME_BYTES)
     req_shm = SharedMemory(name=request_shm_name)
     reply_shm = SharedMemory(name=reply_shm_name)
+    req_buf = cast(memoryview, req_shm.buf)
+    reply_buf = cast(memoryview, reply_shm.buf)
     region: _L2HostL3L2Region | None = None
     try:
-        fields = _REGION_CREATE_REQUEST.unpack_from(req_shm.buf, 0)
+        fields = _REGION_CREATE_REQUEST.unpack_from(req_buf, 0)
         request = L3L2RegionCreateRequest(
             magic_version=int(fields[0]),
             request_bytes=int(fields[1]),
@@ -1140,18 +1142,20 @@ def _handle_ctrl_l3_l2_region_create(cw: ChipWorker, buf: memoryview) -> None:
             counter_bytes=request.counter_bytes,
             total_bytes=total_bytes,
         )
-        shm.buf[counter_offset : counter_offset + request.counter_bytes] = b"\x00" * request.counter_bytes
-        exported = ctypes.c_char.from_buffer(shm.buf)
+        region_buf = cast(memoryview, shm.buf)
+        region_buf[counter_offset : counter_offset + request.counter_bytes] = b"\x00" * request.counter_bytes
+        exported = ctypes.c_char.from_buffer(region_buf)
         try:
             payload_base = ctypes.addressof(exported)
         finally:
             del exported
+            del region_buf
         counter_base = payload_base + counter_offset
         backing_name = shm.name.encode("utf-8")
         if len(backing_name) >= CTRL_SHM_TOKEN_BYTES:
             raise RuntimeError("CTRL_L3_L2_REGION_CREATE backing shm token is too long")
         _REGION_CREATE_REPLY.pack_into(
-            reply_shm.buf,
+            reply_buf,
             0,
             request.magic_version,
             region_id,
@@ -1175,6 +1179,8 @@ def _handle_ctrl_l3_l2_region_create(cw: ChipWorker, buf: memoryview) -> None:
                 region.shm.unlink()
             except Exception:  # noqa: BLE001
                 pass
+        del req_buf
+        del reply_buf
         req_shm.close()
         reply_shm.close()
 
@@ -3604,7 +3610,9 @@ class Worker:
         control_shm = SharedMemory(create=True, size=CONTROL_SHM_SIZE)
         try:
             client = self._make_l3_l2_orch_comm_client(control_shm)
-            self._worker.control_l3_l2_orch_comm_init(worker_id, control_shm.name)
+            worker = self._worker
+            assert worker is not None
+            worker.control_l3_l2_orch_comm_init(worker_id, control_shm.name)
         except Exception:
             try:
                 control_shm.close()
@@ -3689,17 +3697,17 @@ class Worker:
 
     def _create_l3_l2_region(self, worker_id: int, payload_bytes: int, counter_bytes: int):
         from .l3_l2_orch_comm import (  # noqa: PLC0415
+            REGION_CREATE_REPLY_BYTES,
+            REGION_CREATE_REQUEST_BYTES,
+            L3HostRegionMapping,
             L3L2OrchCommCmd,
             L3L2OrchCommRequest,
             L3L2OrchRegion,
-            L3HostRegionMapping,
             L3L2RegionAccessProfile,
             L3L2RegionCreateRequest,
-            REGION_CREATE_REPLY_BYTES,
-            REGION_CREATE_REQUEST_BYTES,
+            _l3_host_mapped_region_import_sim,
             decode_region_create_reply,
             validate_region_create_reply,
-            _l3_host_mapped_region_import_sim,
         )
 
         if payload_bytes <= 0:
@@ -3710,6 +3718,8 @@ class Worker:
         if self._l3_l2_use_l3_host_mapped_path():
             req_shm = SharedMemory(create=True, size=REGION_CREATE_REQUEST_BYTES)
             reply_shm = SharedMemory(create=True, size=REGION_CREATE_REPLY_BYTES)
+            req_buf = cast(memoryview, req_shm.buf)
+            reply_buf = cast(memoryview, reply_shm.buf)
             region_id = 0
             l3_host_mapping = None
             try:
@@ -3719,10 +3729,11 @@ class Worker:
                     payload_bytes=int(payload_bytes),
                     counter_bytes=int(counter_bytes),
                     l3_host_pid=os.getpid(),
-                ).encode_into(req_shm.buf)
-                assert self._worker is not None
-                self._worker.control_l3_l2_region_create(int(worker_id), req_shm.name, reply_shm.name)
-                reply = decode_region_create_reply(reply_shm.buf)
+                ).encode_into(req_buf)
+                worker = self._worker
+                assert worker is not None
+                worker.control_l3_l2_region_create(int(worker_id), req_shm.name, reply_shm.name)
+                reply = decode_region_create_reply(reply_buf)
                 region_id = int(reply.desc.region_id)
                 counter_offset, total_bytes = validate_region_create_reply(reply)
                 if reply.access_profile != L3L2RegionAccessProfile.SIM_POSIX_SHM:
@@ -3756,6 +3767,8 @@ class Worker:
                         pass
                 raise
             finally:
+                del req_buf
+                del reply_buf
                 for shm in (req_shm, reply_shm):
                     try:
                         shm.close()

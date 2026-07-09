@@ -68,16 +68,20 @@ class _FakeDirectCWorker:
         self.create_calls.append((int(worker_id), str(request_shm_name), str(reply_shm_name)))
         req_shm = SharedMemory(name=request_shm_name)
         reply_shm = SharedMemory(name=reply_shm_name)
+        req_buf = req_shm.buf
+        reply_buf = reply_shm.buf
+        assert req_buf is not None
+        assert reply_buf is not None
         try:
-            req = l3_l2_orch_comm._REGION_CREATE_REQUEST.unpack_from(req_shm.buf, 0)
+            req = l3_l2_orch_comm._REGION_CREATE_REQUEST.unpack_from(req_buf, 0)
             payload_bytes = int(req[2])
             counter_bytes = int(req[3])
             counter_offset = ((payload_bytes + 63) // 64) * 64
             region_id = self.next_region_id
             self.next_region_id += 1
-            backing_name = f"sim-direct-{region_id}".encode("utf-8")
+            backing_name = f"sim-direct-{region_id}".encode()
             l3_l2_orch_comm._REGION_CREATE_REPLY.pack_into(
-                reply_shm.buf,
+                reply_buf,
                 0,
                 0x4C334C3200020000,
                 region_id,
@@ -93,6 +97,8 @@ class _FakeDirectCWorker:
                 counter_offset + counter_bytes,
             )
         finally:
+            del req_buf
+            del reply_buf
             req_shm.close()
             reply_shm.close()
 
@@ -260,8 +266,10 @@ def test_sim_direct_region_uses_lifecycle_control_and_l3_host_metadata(monkeypat
         assert len(fake_c_worker.create_calls) == 1
         assert region.descriptor_scalars() == [0x4C334C3200020000, 1, 0xDEAD_0000, 64, 0xDEAD_0040, 128]
         assert 99 not in region.descriptor_scalars()
-        assert region._l3_host_mapping.handle != region.descriptor.payload_base
-        assert region._l3_host_mapping.counter_offset == 64
+        l3_host_mapping = region._l3_host_mapping
+        assert l3_host_mapping is not None
+        assert l3_host_mapping.handle != region.descriptor.payload_base
+        assert l3_host_mapping.counter_offset == 64
         assert calls[0] == ("import", "sim-direct-1", 192)
         assert calls[1][0:3] == ("write", 99, 0)
         assert calls[2][0:3] == ("read", 99, 8)
