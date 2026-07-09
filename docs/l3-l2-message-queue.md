@@ -100,8 +100,9 @@ queue.free()
 queue handle and marks the underlying `L3L2OrchRegion` handle released. It does
 not synchronously free device memory; physical cleanup follows the underlying
 region lifetime model after submitted L2 work has drained. Small Python wrapper
-scratch tensors used for descriptor staging are owned by the queue object and
-follow normal Python object lifetime.
+scratch tensors used for descriptor packing are owned by the queue object and
+follow normal Python object lifetime. Payload-transfer staging is delegated to
+the underlying primitive region backend.
 
 On L2, orchestration code receives the primitive descriptor and queue args,
 then constructs an endpoint:
