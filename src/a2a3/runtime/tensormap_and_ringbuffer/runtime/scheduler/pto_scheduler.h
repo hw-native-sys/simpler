@@ -407,6 +407,7 @@ struct PTO2SchedulerLayout {
     size_t off_ready_sync_queue_slots[PTO2_NUM_RESOURCE_SHAPES];
     size_t off_dummy_ready_queue_slots;
     size_t off_early_dispatch_queue_slots[PTO2_NUM_RESOURCE_SHAPES];
+    size_t off_early_sync_start_queue_slots;
     size_t off_dep_pool_entries[PTO2_MAX_RING_DEPTH];
     uint64_t ready_queue_capacity;
     int32_t dep_pool_capacities[PTO2_MAX_RING_DEPTH];
@@ -693,6 +694,19 @@ struct PTO2SchedulerState {
     // logged and the consumer's blocks fall back to normal dispatch.
     PTO2ReadyQueue early_dispatch_queues[PTO2_NUM_RESOURCE_SHAPES];
 
+    // sync_start early-dispatch candidates park here instead of early_dispatch_queues[]:
+    // they need an atomic all-or-nothing stage via the drain barrier, not
+    // early_dispatch_shape's per-thread partial range-claim. Shape-agnostic (the
+    // rendezvous counts cores, not blocks), so a single queue serves all shapes; drained
+    // as the highest occupancy tier at the top of try_early_dispatch.
+    //
+    // Deliberately single, vs the normal source's per-shape ready_sync_queues[]: a READY
+    // sync cohort (producer done) can dispatch inline when it fits, so it reuses the
+    // per-shape dispatch_shape; an EARLY sync cohort is ALWAYS gated (not_ready=1) => always
+    // drains => the shape-agnostic rendezvous makes one queue sufficient. Same drain, two
+    // sources.
+    PTO2ReadyQueue early_sync_start_queue;
+
     static inline void ring_one_doorbell(uint64_t reg_addr, uint32_t token) {
         volatile uint64_t *dmb = reinterpret_cast<volatile uint64_t *>(get_reg_ptr(reg_addr, RegId::DATA_MAIN_BASE));
         uint64_t tk = static_cast<uint64_t>(token);
@@ -740,16 +754,57 @@ struct PTO2SchedulerState {
         slot_state.payload->published_block_count.fetch_add(static_cast<int16_t>(count), std::memory_order_seq_cst);
     }
 
-    // Event-driven candidate detection (the dual of fanin_refcount/ready). Call after
-    // publishing a FLAGGED producer's blocks: once every logical block is launch-visible,
-    // walk its fanout and bump each
-    // consumer's dispatch_fanin. A consumer whose dispatch_fanin reaches
-    // fanin_actual_count (= every producer is either flagged-and-fully-published, or was
-    // already complete when the consumer was wired) is an early-dispatch candidate:
-    // CAS NONE->STAGING (exactly-once) and push to early_dispatch_queues[shape] for the idle drain to
-    // pre-stage. Once-guarded per producer so an SPMD producer's block-by-block
-    // dispatch propagates once. Only codegen-flagged producers propagate: a task's
-    // successors early-dispatch off its DIRECT producers' marks, never an inherited chain.
+    // Ring every doorbell recorded in a staged consumer's staged_core_mask, from the
+    // per-core early_dispatch_doorbell_table. Idempotent — a re-rung doorbell is harmless (the
+    // AICore already matched). seq_cst load pairs with the stagers' seq_cst fetch_or.
+    inline void ring_all_staged_doorbells(PTO2TaskSlotState &slot_state) {
+        for (int w = 0; w < PTO2_EARLY_DISPATCH_CORE_MASK_WORDS; w++) {
+            uint64_t bits = slot_state.payload->staged_core_mask[w].load(std::memory_order_seq_cst);
+            while (bits != 0) {
+                int core_id = w * 64 + __builtin_ctzll(bits);
+                bits &= bits - 1;
+                ring_one_doorbell(
+                    early_dispatch_doorbell_table[core_id].addr, early_dispatch_doorbell_table[core_id].token
+                );
+            }
+        }
+    }
+
+    // sync_start rendezvous: a sync_start consumer's gated cores launch as an atomic
+    // cohort, so their doorbells are held until BOTH halves hold — every gated core
+    // occupies a running slot (running_slot_count == popcount(staged_core_mask)) AND the
+    // producer released (early_dispatch_state == DISPATCHED). Counting CORES (not blocks) makes
+    // this shape-agnostic: an AIC/AIV block is one core, a MIX block is a cluster whose
+    // cores promote pending->running independently. Called from both halves (the producer
+    // release and each pending->running promotion); whichever observes the second half
+    // rings. seq_cst on running_slot_count and early_dispatch_state makes "second observer rings" a
+    // total order; a double ring (both observe) is harmless. No-op until both hold.
+    inline void maybe_rendezvous_ring(PTO2TaskSlotState &slot_state) {
+        int32_t staged_cores = 0;
+        for (int w = 0; w < PTO2_EARLY_DISPATCH_CORE_MASK_WORDS; w++)
+            staged_cores +=
+                __builtin_popcountll(slot_state.payload->staged_core_mask[w].load(std::memory_order_seq_cst));
+        if (slot_state.payload->running_slot_count.load(std::memory_order_seq_cst) != staged_cores) return;
+        if (slot_state.payload->early_dispatch_state.load(std::memory_order_seq_cst) != PTO2_EARLY_DISPATCH_DISPATCHED)
+            return;
+        ring_all_staged_doorbells(slot_state);
+    }
+
+    // Event-driven candidate detection (the dual of fanin_refcount/ready). Called after a
+    // FLAGGED producer `p` publishes blocks (normal dispatch, early-dispatch release, or the
+    // sync_start drain), but no-ops until every logical block is launch-visible. Only then
+    // does it walk p's fanout and bump each consumer's
+    // dispatch_fanin. A consumer whose dispatch_fanin reaches fanin_actual_count (= every
+    // producer is flagged-and-fully-dispatched, or was already complete when the consumer was
+    // wired) is an early-dispatch candidate: CAS NONE->STAGING (exactly-once) and push to
+    // early_dispatch_queues[shape] (or early_sync_start_queue for a require_sync_start cohort)
+    // for the drain to pre-stage. The full-publication gate is load-bearing: a consumer that
+    // pre-occupies cores off a producer whose later blocks are not yet launch-visible would gate the
+    // very cores those blocks need, starving the producer so it never completes and the
+    // rendezvous never rings — a resource deadlock. published_block_count advances after
+    // every placement path publishes its claimed range. Once-guarded per producer.
+    // Only codegen-flagged producers propagate: a task's successors early-dispatch off its
+    // DIRECT producers' marks, never an inherited chain.
     void propagate_dispatch_fanin(PTO2TaskSlotState &p) {
         if (!p.allow_early_resolve) return;  // only codegen-flagged (direct) producers propagate
         if (p.payload->published_block_count.load(std::memory_order_seq_cst) < p.logical_block_num) return;
@@ -773,16 +828,26 @@ struct PTO2SchedulerState {
             // seed short and never bumps, so this stays unreachable for that consumer.
             int32_t nf = c->payload->dispatch_fanin.fetch_add(1, std::memory_order_acq_rel) + 1;
             if (nf != c->payload->fanin_actual_count) continue;
-            if (c->active_mask.requires_sync_start()) continue;  // sync_start can't be block-by-block pre-staged
             PTO2ResourceShape shape = c->active_mask.to_shape();
             if (shape != PTO2ResourceShape::AIC && shape != PTO2ResourceShape::AIV && shape != PTO2ResourceShape::MIX)
                 continue;
+            // sync_start blocks launch as an atomic cohort. They ride the early-dispatch path
+            // too, but through a dedicated shape-agnostic queue (early_sync_start_queue),
+            // drained as the highest tier in try_early_dispatch via the gated drain +
+            // running-slot rendezvous (enter_drain_mode pre-stages every block gated — MIX
+            // with per-core split placement — and the rendezvous rings them together once
+            // every gated core occupies a running slot and the producer released). They must
+            // NOT enter early_dispatch_queues[shape]: that path's partial range-claim would
+            // strand gated cohort blocks nobody rings, so the rendezvous never reaches
+            // block_num. The rendezvous counts CORES (a MIX block spans a cluster), so one
+            // shape-agnostic queue suffices.
             uint8_t expect = PTO2_EARLY_DISPATCH_NONE;  // exactly-once: only the CAS winner enqueues
             if (!c->payload->early_dispatch_state.compare_exchange_strong(
                     expect, PTO2_EARLY_DISPATCH_STAGING, std::memory_order_seq_cst, std::memory_order_seq_cst
                 ))
                 continue;
-            early_dispatch_queues[static_cast<int32_t>(shape)].push(c);
+            if (c->active_mask.requires_sync_start()) early_sync_start_queue.push(c);
+            else early_dispatch_queues[static_cast<int32_t>(shape)].push(c);
         }
     }
 
@@ -811,22 +876,34 @@ struct PTO2SchedulerState {
         // route_ready_once admits one caller, but keep the helper defensive: a
         // duplicate that observes or loses an in-progress launch must never
         // route the same partial task a second time.
-        if (expect != PTO2_EARLY_DISPATCH_STAGING || !try_claim_early_dispatch_launch(*slot_state.payload)) return true;
+        if (expect != PTO2_EARLY_DISPATCH_STAGING) return true;
+        bool sync_start = slot_state.active_mask.requires_sync_start();
+        if (!sync_start && !try_claim_early_dispatch_launch(*slot_state.payload)) return true;
         expect = PTO2_EARLY_DISPATCH_STAGING;
         slot_state.payload->early_dispatch_state.compare_exchange_strong(
             expect, PTO2_EARLY_DISPATCH_DISPATCHED, std::memory_order_seq_cst, std::memory_order_seq_cst
         );
-        // Destructively claim every published bit. A stager racing this pass
-        // can claim only bits that land after the exchange, so each gated core
-        // has exactly one doorbell writer.
-        for (int w = 0; w < PTO2_EARLY_DISPATCH_CORE_MASK_WORDS; w++) {
-            uint64_t owned = claim_all_staged_doorbell_bits(slot_state.payload->staged_core_mask[w]);
-            ring_staged_doorbell_bits(w, owned);
+        // Producer released: ring the gated cores. A non-sync_start consumer launches
+        // each block the instant its doorbell fires. A sync_start consumer instead holds
+        // for the rendezvous — every gated core must occupy a running slot first — so the
+        // flip to DISPATCHED above is only the producer-released half; maybe_rendezvous_ring
+        // rings now iff running_slot_count already reached popcount(staged_core_mask) (all
+        // gated cores took idle running slots), else the last pending->running promotion rings.
+        if (sync_start) {
+            maybe_rendezvous_ring(slot_state);
+        } else {
+            // Destructively claim every published bit. A stager racing this pass
+            // can claim only bits that land after the exchange, so each gated core
+            // has exactly one doorbell writer.
+            for (int w = 0; w < PTO2_EARLY_DISPATCH_CORE_MASK_WORDS; w++) {
+                uint64_t owned = claim_all_staged_doorbell_bits(slot_state.payload->staged_core_mask[w]);
+                ring_staged_doorbell_bits(w, owned);
+            }
+            wmb();
+            slot_state.payload->early_dispatch_launch_state.store(
+                PTO2_EARLY_DISPATCH_LAUNCH_COMPLETE, std::memory_order_seq_cst
+            );
         }
-        wmb();
-        slot_state.payload->early_dispatch_launch_state.store(
-            PTO2_EARLY_DISPATCH_LAUNCH_COMPLETE, std::memory_order_seq_cst
-        );
         // This pre-staged consumer was just released by its doorbell — it starts
         // running NOW, so propagate dispatch_fanin to ITS consumers (only if it is
         // itself codegen-flagged; the gate inside no-ops otherwise). Defer it via the

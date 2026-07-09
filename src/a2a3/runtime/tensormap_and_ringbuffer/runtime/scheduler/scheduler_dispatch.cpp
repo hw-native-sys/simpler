@@ -256,6 +256,11 @@ int SchedulerContext::prepare_block_for_dispatch(
     if (shape == PTO2ResourceShape::MIX) {
         uint8_t cmask = slot_state.active_mask.core_mask();
         int n = 0;
+        // Per-core slot placement (#1308): an idle used core takes its running slot
+        // (tracked by the completion poller), a busy used core takes its gated pending slot
+        // (promoted on completion). The sync_start drain relies on this — it passes
+        // to_pending=true so every busy core opts into a pending slot; combined with
+        // not_ready=1 (gated) the whole cohort still launches together at the rendezvous.
         if (cmask & PTO2_SUBTASK_MASK_AIC) {
             bool p = to_pending && !tracker.is_aic_core_idle(core_offset);
             out_handles[n++] = prepare_subtask_to_core(
@@ -790,11 +795,11 @@ SchedulerContext::early_dispatch_shape(int32_t thread_idx, PTO2ResourceShape sha
     return total_staged;
 }
 
-// Early-dispatch drain (idle pass), mirroring dispatch_ready_tasks: owns its own
-// gating and progress-flag updates, and orders staging the same way — MIX strict
-// priority, IDLE stage before PENDING stage, cross-thread idle gating
-// (MIX-IDLE ▶ c/v-IDLE ▶ MIX-PEND ▶ c/v-PEND). sync_start doesn't apply here (those
-// tasks are excluded from early dispatch at push time, propagate_dispatch_fanin).
+// Early-dispatch drain (idle pass) — the EARLY source's analog of dispatch_ready_tasks.
+// Both sources share run_staging_order for the shape order (MIX strict priority, IDLE
+// before PENDING, cross-thread idle gating: MIX-IDLE ▶ c/v-IDLE ▶ MIX-PEND ▶ c/v-PEND) and
+// both drain their sync_start cohort FIRST as the highest occupancy tier (Tier 0), via the
+// same all-or-nothing drain barrier. This one owns its own gating and progress flags.
 // Returns the number of blocks staged this pass (for the EarlyDispatch swimlane bar).
 int32_t SchedulerContext::try_early_dispatch(
     int32_t thread_idx, CoreTracker &tracker, bool pmu_active, bool &made_progress, bool &try_pushed
@@ -814,9 +819,26 @@ int32_t SchedulerContext::try_early_dispatch(
         if (sched_->ready_sync_queues[s].size() > 0 || sched_->ready_queues[s].size() > 0) return 0;
     }
 
-    // Early staging (NOT is_ready): same MIX/idle/pending order as normal dispatch, via the
-    // shared skeleton. early_dispatch_shape stages a gated block range and never enters drain,
-    // so the stage callback always reports "no stop".
+    // ===== Tier 0: sync_start cohorts (highest occupancy tier, all-or-nothing) =====
+    // sync_start candidates park in their own shape-agnostic queue. They cannot ride
+    // early_dispatch_shape's per-thread partial range-claim (a partial claim strands gated
+    // cohort blocks nobody rings, so the rendezvous never reaches block_num). Instead arm the
+    // drain barrier: it takes exclusive tracker access and only stages when global
+    // idle+pending >= block_num, guaranteeing all-or-nothing. Win => the dispatch loop runs
+    // the gated drain next iteration; lose (a drain is already armed, or capacity <
+    // block_num) => re-push and fall through to the normal tiers. A non-STAGING pop was
+    // already released and is dropped. Staging happens inside the drain, so this arms at most
+    // one drain and adds no blocks to total_staged here.
+    if (PTO2TaskSlotState *c = sched_->early_sync_start_queue.pop()) {
+        if (c->payload->early_dispatch_state.load(std::memory_order_acquire) == PTO2_EARLY_DISPATCH_STAGING &&
+            !enter_drain_mode(c, c->logical_block_num)) {
+            sched_->early_sync_start_queue.push(c);
+        }
+    }
+
+    // Regular early staging (NOT is_ready): same MIX/idle/pending order as normal dispatch,
+    // via the shared skeleton. early_dispatch_shape stages a gated block range and never
+    // enters drain, so the stage callback always reports "no stop".
     int32_t total_staged = 0;
     run_staging_order(
         thread_idx, pmu_active,
@@ -928,7 +950,9 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
             // and silently corrupt the snapshot.
             constexpr size_t kMax = static_cast<size_t>(std::numeric_limits<int16_t>::max());
             for (int s = 0; s < L2SWIMLANE_NUM_QUEUE_SHAPES; s++) {
-                const size_t qsize = sched_->ready_queues[s].size();
+                // Total normal-source ready depth of shape `s` = regular ready lane + the
+                // sync_start Tier-0 lane; both feed dispatch_ready_tasks for this shape.
+                const size_t qsize = sched_->ready_queues[s].size() + sched_->ready_sync_queues[s].size();
                 iter_shared_snapshot[s] = static_cast<int16_t>(std::min(qsize, kMax));
             }
             iter_shared_sampled = true;
@@ -1090,7 +1114,27 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
 
         // Phase 2 drain check
         if (drain_state_.sync_start_pending.load(std::memory_order_acquire) != 0) {
+#if SIMPLER_DFX
+            // The drain is otherwise a swimlane blind spot: the `continue` below skips
+            // every phase record, and handle_drain_mode is uninstrumented. Time it here so
+            // the sync_start stop-the-world window shows on the scheduler lane (one bar per
+            // iteration that enters the drain; retries appear as multiple bars).
+            uint64_t drain_t0 = (l2_swimlane_level_ >= L2SwimlaneLevel::SCHED_PHASES) ? get_sys_cnt_aicpu() : 0;
+            uint64_t drain_stage_wall = 0;  // set by handle_drain_mode ONLY if this thread staged
+            handle_drain_mode(thread_idx, &drain_stage_wall);
+            // Record a Drain bar only when this thread actually did drain work (reached
+            // drain_stage_cores). The many no-op entries — ack + availability-insufficient
+            // reset, stale-elected, non-elected bail before stage_go — never stage, so they
+            // would otherwise clutter the lane with zero-work drain(0) bars.
+            if (l2_swimlane_level_ >= L2SwimlaneLevel::SCHED_PHASES && drain_stage_wall != 0) {
+                l2_swimlane_aicpu_record_sched_phase(
+                    thread_idx, L2SwimlaneSchedPhaseKind::Drain, drain_t0, get_sys_cnt_aicpu(),
+                    l2_swimlane.sched_loop_count, static_cast<uint32_t>(drain_stage_wall)
+                );
+            }
+#else
             handle_drain_mode(thread_idx);
+#endif
             continue;
         }
 

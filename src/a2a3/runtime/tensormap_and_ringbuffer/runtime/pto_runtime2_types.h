@@ -284,6 +284,13 @@ struct PTO2TaskPayload {
     // are visible. Combined with published_block_count, this keeps fanout
     // private until release-owned and late-owned blocks have both launched.
     std::atomic<uint8_t> early_dispatch_launch_state{PTO2_EARLY_DISPATCH_LAUNCH_NONE};
+    // sync_start early-dispatch rendezvous: count of this task's gated CORES currently
+    // occupying a RUNNING slot (staged directly to an idle core, or promoted from a
+    // gated pending slot). Counted per-core (not per-block) so it is shape-agnostic: a
+    // MIX block spans a cluster whose cores promote independently. A sync_start task's
+    // doorbells are rung only once this reaches popcount(staged_core_mask) AND the
+    // producer released, so all cores launch atomically. Unused (0) for non-sync_start.
+    std::atomic<int16_t> running_slot_count{0};
     // === Cache lines 9-72 (4096B) — tensors (alignas(64) forces alignment) ===
     Tensor tensors[MAX_TENSOR_ARGS];
     // === Cache lines 73-74 (128B) — scalars ===
@@ -368,6 +375,7 @@ struct PTO2TaskPayload {
         dispatch_propagated.store(0, std::memory_order_relaxed);
         published_block_count.store(0, std::memory_order_relaxed);
         early_dispatch_launch_state.store(PTO2_EARLY_DISPATCH_LAUNCH_NONE, std::memory_order_relaxed);
+        running_slot_count.store(0, std::memory_order_relaxed);
     }
 };
 

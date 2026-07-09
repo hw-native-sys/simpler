@@ -546,9 +546,11 @@ Each scheduler thread runs a tight loop with two main phases:
 - Poll register `COND` on each managed core
 - When `TASK_FIN_STATE` detected: record completion timestamps, call `on_subtask_complete(task_id, subslot)` to increment the completion counter; when `completed_subtasks == total_required_subtasks`, trigger `on_task_complete(task_id)` which marks `task_state[slot] = COMPLETED`, acquires fanout lock, traverses fanout list (incrementing consumers' `fanin_refcount`), marks `task_state[slot] = CONSUMED`, and advances `last_task_alive` watermark
 
-**Phase 2 — Dispatch**:
+**Phase 2 — Dispatch** (full model in §8.6):
 
-- For each idle core: pop a task from the matching shape-based ready queue (lock-free MPMC Vyukov queue, one per resource shape)
+- Drain each source (normal ready ▸ speculative early) in occupancy order — `sync_start`
+  Tier-0 ▸ MIX ▸ AIC/AIV, idle ▸ pending — popping from the matching shape-based ready queue
+  (lock-free MPMC Vyukov queue, one per resource shape)
 - Build `PTO2DispatchPayload` from `TaskDescriptor` with `task_id`, `subslot`, `kernel_id`, and `core_type`
 - Write task pointer to `Handshake.task`, signal AICore via register `DATA_MAIN_BASE`
 
@@ -558,8 +560,11 @@ After these phases, the scheduler updates profiling headers and checks for termi
 
 Ready queues use a lock-free bounded MPMC (Vyukov) design:
 
-- One `PTO2ReadyQueue` per resource shape (5 shapes: `AIC_ONLY`, `AIV_X1`, `AIV_X2`, `AIC_AIV_X1`, `AIC_AIV_X2`)
-- **Push**: any thread (orchestrator via `init_task`, or scheduler on completion) pushes newly-ready tasks to the queue matching `task->active_mask.to_shape()`
+- One `PTO2ReadyQueue` per resource shape — 3 shapes (`PTO2_NUM_RESOURCE_SHAPES`): `MIX`
+  (AIC+AIV cluster), `AIC`, `AIV`. Alongside `ready_queues[]` there is a per-shape
+  `ready_sync_queues[]` (sync_start Tier-0) and the speculative `early_dispatch_queues[]` /
+  `early_sync_start_queue` — see §8.6 for the full source × tier model.
+- **Push**: any thread (orchestrator via `init_task`, or scheduler on completion) pushes newly-ready tasks to the queue matching `task->active_mask.to_shape()` (sync_start cohorts to the sync lane)
 - **Pop**: scheduler threads pop from the queue matching the idle core's resource shape
 - Per-slot sequence counters prevent ABA problems
 - `enqueue_pos` and `dequeue_pos` are on separate cache lines to avoid false sharing
@@ -602,6 +607,83 @@ Private internals are split across three .cpp files by responsibility:
 - `scheduler_cold_path.cpp` — exit checks, stall diagnostics, profiling, lifecycle (`pre_handshake_init` / `handshake_partition` / `post_handshake_init` / `deinit`), core management (`assign_cores_to_threads` / `emergency_shutdown`), and `on_orchestration_done`
 
 `AicpuExecutor` calls neither `handshake_*`, `assign_*`, `reassign_*`, nor `emergency_shutdown` directly — they are private, invoked only by `init` and `on_orchestration_done`.
+
+### 8.6 Dispatch model — two sources, sync tiers, occupancy order
+
+`resolve_and_dispatch` places ready and speculative work onto AICore cores under one
+occupancy model. Two orthogonal axes decide *what* runs and *where*:
+
+- **Source** — `NORMAL` (all producers done; the task sits in a ready queue and launches on
+  pickup) vs `EARLY` (a *speculative* pre-stage of a not-yet-released task; gated with
+  `not_ready=1`, launched later by a doorbell). Normal strictly precedes early.
+- **Cohort** — `SYNC_START` (an SPMD cohort that must launch atomically) vs `REGULAR` (each
+  block launches independently). "is it ready" (source) and "does it need a rendezvous"
+  (cohort) are orthogonal.
+
+Within each source the occupancy order is **`sync_start` ▸ MIX ▸ AIC/AIV** (shape), and per
+shape **idle ▸ pending** (an idle core takes its running slot; a busy core takes its gated
+pending slot, promoted on completion). This order lives in one shared skeleton,
+`run_staging_order`; the normal and early sources differ only in the per-shape stage callback
+(pickup vs gated).
+
+#### Queues
+
+| Source | Regular lanes | sync_start lane |
+| ------ | ------------- | --------------- |
+| NORMAL (ready) | `ready_queues[MIX\|AIC\|AIV]` | `ready_sync_queues[MIX\|AIC\|AIV]` (per-shape) |
+| EARLY (speculative) | `early_dispatch_queues[MIX\|AIC\|AIV]` | `early_sync_start_queue` (single) |
+
+A task routes to the sync lane iff `active_mask.requires_sync_start()`. In each source the
+sync lane is drained as a strict **Tier-0** before the regular lane (`sync_start > MIX > C/V`),
+and early dispatch runs only once *both* normal lanes are empty (normal ▸ early).
+
+**Asymmetry (deliberate):** the normal sync lane is per-shape (3 queues) because a ready sync
+cohort can dispatch *inline* when it fits, reusing the per-shape `dispatch_shape`; the early
+sync lane is a single, shape-agnostic queue because an early cohort is *always* gated → always
+takes the drain path, whose rendezvous counts cores (not blocks) and is shape-agnostic. Both
+feed the same drain.
+
+#### sync_start drain + rendezvous
+
+A sync_start cohort of `block_num` cores must occupy all its cores before any of them run.
+When it cannot fit inline, `enter_drain_mode` arms a stop-the-world drain:
+
+1. **Single election** — a CAS on `sync_start_pending` (0 → −1) makes drains mutually
+   exclusive; only one cohort drains at a time, regardless of source.
+2. **All-or-nothing** — the elected thread checks `count_global_available >= block_num`
+   *before* staging; if short it aborts (stages nothing) and retries after completions free
+   cores. A cohort is fully staged or not at all — never partial.
+3. **Parallel stage** — all threads barrier, then each CAS-claims a block range and stages
+   its own cores gated (`not_ready=1`): idle cores → running slots, busy cores → pending slots.
+4. **Rendezvous launch** — `running_slot_count` counts staged running-slot cores; when it
+   reaches `popcount(staged_core_mask)` **and** the producer has released,
+   `maybe_rendezvous_ring` rings every gated core's doorbell together — the cohort starts as one.
+
+Single-election + all-or-nothing make the drain deadlock-free across multiple cohorts: at most
+one drains, and it fully stages or waits, so two cohorts can never each half-occupy the cluster
+set (see the completion path's `pending_gated` classification for why a promoted-but-still-gated
+block is not mistaken for a normal task).
+
+#### Early-candidate gate: producer must be fully dispatched (deadlock avoidance)
+
+`propagate_dispatch_fanin` (the EARLY-source candidate trigger) no-ops until the producer is
+**fully dispatched** — `next_block_idx == logical_block_num`, all its blocks on a core. Only then
+does it bump consumers' `dispatch_fanin` and let a `require_sync_start` consumer pre-stage. This
+is load-bearing: a flagged SPMD producer with more blocks than cores (e.g. a 50-block AIC proj on
+24 AIC cores) dispatches in waves, and if its *first* wave triggered a downstream MIX cohort to
+gate every running/pending slot, the producer's remaining blocks would find no core, never
+complete, and the cohort's rendezvous — which waits for that producer to release — would never
+ring. Gating on full dispatch keeps the producer's cores committed before any consumer can
+pre-occupy. `next_block_idx` (not a per-path counter) is the gate because it advances on *every*
+placement path (normal dispatch, early-dispatch release, drain), so a producer that is itself
+early-dispatched or drained still gates correctly across all `propagate_dispatch_fanin` call sites.
+
+#### MIX per-core placement
+
+A MIX task spans a cluster (1 AIC + 2 AIV). `classify_mix_cluster` admits a cluster whenever
+every used core has a free slot; `prepare_block_for_dispatch` then places **per core**
+(`to_pending && !is_core_idle`): idle cores → running, busy cores → pending. Cross-core start
+skew within a block is tolerated by AICore incore synchronization.
 
 ---
 

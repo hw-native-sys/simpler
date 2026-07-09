@@ -1028,6 +1028,12 @@ int L2SwimlaneCollector::export_swimlane_json() {
                 return "resolve";
             case L2SwimlaneSchedPhaseKind::DummyTask:
                 return "dummy_task";
+            case L2SwimlaneSchedPhaseKind::Drain:
+                return "drain";
+            case L2SwimlaneSchedPhaseKind::DrainPrepare:
+                return "drain_prepare";
+            case L2SwimlaneSchedPhaseKind::DrainPublish:
+                return "drain_publish";
             }
             return "unknown";
         };

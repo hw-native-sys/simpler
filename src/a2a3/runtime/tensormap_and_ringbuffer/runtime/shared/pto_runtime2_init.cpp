@@ -159,6 +159,7 @@ PTO2SchedulerLayout PTO2SchedulerState::reserve_layout(
     for (int i = 0; i < PTO2_NUM_RESOURCE_SHAPES; i++) {
         layout.off_early_dispatch_queue_slots[i] = ready_queue_reserve_layout(arena, PTO2_EARLY_DISPATCH_QUEUE_SIZE);
     }
+    layout.off_early_sync_start_queue_slots = ready_queue_reserve_layout(arena, PTO2_EARLY_DISPATCH_QUEUE_SIZE);
     for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
         // Force a cache-line base so Orch-side dep_pool writes do not invalidate
         // adjacent multi-threaded regions like ready_queue.slots.
@@ -211,6 +212,12 @@ bool PTO2SchedulerState::init_data_from_layout(
             return false;
         }
     }
+    if (!ready_queue_init_data_from_layout(
+            &sched->early_sync_start_queue, arena, layout.off_early_sync_start_queue_slots,
+            PTO2_EARLY_DISPATCH_QUEUE_SIZE
+        )) {
+        return false;
+    }
 
     auto *orch_err = pto2_sm_layout::orch_error_code_addr(sm_dev_base);
     for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
@@ -245,6 +252,7 @@ void PTO2SchedulerState::reset_for_reuse(const PTO2SchedulerLayout &layout, void
     for (int i = 0; i < PTO2_NUM_RESOURCE_SHAPES; i++) {
         sched->early_dispatch_queues[i].reset_for_reuse();
     }
+    sched->early_sync_start_queue.reset_for_reuse();
 
     sched->async_wait_list.reset_for_reuse();
     (void)layout;
@@ -264,6 +272,7 @@ void PTO2SchedulerState::wire_arena_pointers(const PTO2SchedulerLayout &layout, 
             &sched->early_dispatch_queues[i], arena, layout.off_early_dispatch_queue_slots[i]
         );
     }
+    ready_queue_wire_arena_pointers(&sched->early_sync_start_queue, arena, layout.off_early_sync_start_queue_slots);
     for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
         sched->ring_sched_states[r].dep_pool.base =
             static_cast<PTO2DepListEntry *>(arena.region_ptr(layout.off_dep_pool_entries[r]));
@@ -286,6 +295,7 @@ void PTO2SchedulerState::destroy() {
     for (int i = 0; i < PTO2_NUM_RESOURCE_SHAPES; i++) {
         ready_queue_destroy(&sched->early_dispatch_queues[i]);
     }
+    ready_queue_destroy(&sched->early_sync_start_queue);
 }
 
 // =============================================================================

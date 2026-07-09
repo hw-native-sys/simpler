@@ -343,14 +343,29 @@ void SchedulerContext::check_running_cores_for_completion(
         }
 #endif
 
-        // A pending task is "gated" when it is a early-dispatch pre-stage still
-        // waiting on its doorbell (STAGED): it will not ack on the producer's FIN,
-        // so the Case 3.1 wait-for-pending-ack shortcut would deadlock. Detect it
-        // so decide_slot_transition completes the running FIN and promotes it.
+        // A pending task is "gated" when it is an early-dispatch pre-stage still parked on
+        // its doorbell: it will not ack on the producer's FIN, so the Case 3.1 wait-for-
+        // pending-ack shortcut would deadlock. Detect it so decide_slot_transition completes
+        // the running FIN and PROMOTES it (Case 3.3) instead.
+        //
+        // "Gated" is "not yet launched (rung)", which is NOT the same as
+        // early_dispatch_state. STAGING covers the pre-release window. But a sync_start block
+        // stays gated even AFTER its producer releases (early_dispatch_state STAGING ->
+        // DISPATCHED): the cohort is not rung until the rendezvous has assembled EVERY core
+        // into a running slot, and this pending block (being promoted now) is by definition
+        // not yet counted, so the ring has not fired and it is still gated. Classifying it by
+        // STAGING alone would, once the producer's release beats the last promotion, treat it
+        // as a normal task and wait for an ack that never comes -> deadlock (the
+        // nondeterministic sync_start stall).
+        uint8_t pending_ss =
+            (core.pending_slot_state != nullptr && core.pending_slot_state->payload != nullptr) ?
+                core.pending_slot_state->payload->early_dispatch_state.load(std::memory_order_relaxed) :
+                static_cast<uint8_t>(PTO2_EARLY_DISPATCH_NONE);
         bool pending_gated =
             (core.pending_slot_state != nullptr && core.pending_slot_state->payload != nullptr &&
-             core.pending_slot_state->payload->early_dispatch_state.load(std::memory_order_relaxed) ==
-                 PTO2_EARLY_DISPATCH_STAGING);
+             (pending_ss == PTO2_EARLY_DISPATCH_STAGING ||
+              (pending_ss == PTO2_EARLY_DISPATCH_DISPATCHED &&
+               core.pending_slot_state->active_mask.requires_sync_start())));
         SlotTransition t = decide_slot_transition(
             reg_task_id, reg_state, core.running_reg_task_id, core.pending_reg_task_id, pending_gated
         );
@@ -414,7 +429,17 @@ void SchedulerContext::check_running_cores_for_completion(
         // 2. Update slot data
         if (t.running_freed) {
             if (core.pending_slot_state != nullptr && !t.pending_done) {
+                // A gated sync_start block promoting into the running slot advances the
+                // rendezvous. Capture that BEFORE promote nulls the pending fields; after
+                // it lands, bump running_slot_count and ring iff this was the block that
+                // completed the cohort (and the producer already released).
+                PTO2TaskSlotState *promoted = core.pending_slot_state;
+                bool sync_start_promote = pending_gated && promoted->active_mask.requires_sync_start();
                 promote_pending_to_running(core);  // Case 2 or Case 3 (with pending)
+                if (sync_start_promote) {
+                    promoted->payload->running_slot_count.fetch_add(1, std::memory_order_seq_cst);
+                    sched_->maybe_rendezvous_ring(*promoted);
+                }
             } else {
                 clear_running_slot(core);  // Case 1 or Case 3 (no pending)
                 if (t.pending_done) {
@@ -464,10 +489,14 @@ bool SchedulerContext::enter_drain_mode(PTO2TaskSlotState *slot_state, int32_t b
         )) {
         return false;  // Another thread already holds the drain slot.
     }
-    // We own the drain slot.  Store the task and reset election flag before making it visible.
+    // We own the drain slot.  Store the task and reset the coordination flags before making
+    // it visible.
     drain_state_.pending_task.store(slot_state, std::memory_order_release);
     drain_state_.drain_ack_mask.store(0, std::memory_order_relaxed);
     drain_state_.drain_worker_elected.store(0, std::memory_order_relaxed);
+    drain_state_.drain_stage_go.store(0, std::memory_order_relaxed);
+    drain_state_.drain_stage_done_mask.store(0, std::memory_order_relaxed);
+    drain_state_.drain_running_staged.store(0, std::memory_order_relaxed);
     // Release store: all stores above are now visible to any thread that
     // acquire-loads sync_start_pending and sees block_num > 0.
     drain_state_.sync_start_pending.store(block_num, std::memory_order_release);
@@ -475,98 +504,182 @@ bool SchedulerContext::enter_drain_mode(PTO2TaskSlotState *slot_state, int32_t b
 }
 
 // Count total available resources across all scheduler threads for a given shape.
-int32_t SchedulerContext::count_global_available(PTO2ResourceShape shape, uint8_t core_mask) {
+// include_pending adds each thread's pending-capable cores/clusters — used by the
+// gated (early) sync_start drain, which pre-stages onto idle running slots AND onto
+// busy cores' pending slots. The ready drain (include_pending=false) counts idle only.
+int32_t SchedulerContext::count_global_available(PTO2ResourceShape shape, uint8_t core_mask, bool include_pending) {
     int32_t total = 0;
     for (int32_t t = 0; t < active_sched_threads_; t++) {
         if (shape == PTO2ResourceShape::MIX) {
-            total += core_trackers_[t].count_mix_running_clusters(core_mask);
+            // Gated MIX uses split placement (each core to running-if-idle / pending-if-busy),
+            // so a cluster is available iff every used core has some free slot. The ready
+            // path (include_pending=false) still needs whole-cluster idle placement.
+            total += include_pending ? core_trackers_[t].count_mix_split_clusters(core_mask) :
+                                       core_trackers_[t].count_mix_running_clusters(core_mask);
         } else {
             total += core_trackers_[t].get_idle_core_offset_states(shape).count();
+            if (include_pending) {
+                total += core_trackers_[t].get_pending_core_offset_states(shape).count();
+            }
         }
     }
     return total;
 }
 
-// Drain worker: dispatch all blocks in one pass across all threads' trackers.
-// Called only when global resources >= block_num, so one pass always suffices.
-// All other threads are spinning -- the drain worker has exclusive tracker access.
-void SchedulerContext::drain_worker_dispatch(int32_t block_num) {
-    PTO2TaskSlotState *slot_state = drain_state_.pending_task.load(std::memory_order_acquire);
-    if (!slot_state) {
-        drain_state_.sync_start_pending.store(0, std::memory_order_release);
-        return;
-    }
+// One thread's share of the drain staging: CAS-claim block indices and publish them onto
+// THIS thread's own cores, concurrently with peers. Returns the number of cores placed on a
+// RUNNING slot (the rendezvous seed contribution). Each thread touches only its own tracker
+// and its own cores' doorbell-table entries; the CAS on next_block_idx and the fetch_or into
+// staged_core_mask are the only cross-thread points.
+//
+// A gated (early) sync_start drain pre-stages every block behind its doorbell
+// (prepare_block_for_dispatch reads early_dispatch_state==STAGING => not_ready=1) and defers the launch
+// to the rendezvous: idle cores take a gated RUNNING slot; busy cores take a gated PENDING
+// slot (promoted by Case 3.3 as those cores' running tasks FIN). A non-gated (ready) drain
+// leaves early_dispatch_state==NONE, so every block launches immediately on an idle running slot and
+// the pending pass is skipped. For MIX, a gated block uses SPLIT placement (each core
+// independently: idle->running, busy->pending) — safe only because gated.
+int32_t
+SchedulerContext::drain_stage_cores(PTO2TaskSlotState *slot_state, int32_t block_num, int32_t thread_idx, bool gated) {
+    CoreTracker &tracker = core_trackers_[thread_idx];
     PTO2ResourceShape shape = slot_state->active_mask.to_shape();
     uint8_t core_mask = slot_state->active_mask.core_mask();
+    bool mix_split = gated && shape == PTO2ResourceShape::MIX;
+    int32_t running_staged = 0;
 
-    for (int32_t t = 0;
-         t < active_sched_threads_ && slot_state->next_block_idx.load(std::memory_order_relaxed) < block_num; t++) {
-        auto valid = (shape == PTO2ResourceShape::MIX) ?
-                         core_trackers_[t].get_mix_running_cluster_offset_states(core_mask) :
-                         core_trackers_[t].get_idle_core_offset_states(shape);
-        int32_t start = slot_state->next_block_idx.load(std::memory_order_relaxed);
-        int32_t remaining = slot_state->logical_block_num - start;
-        int32_t claim = std::min(valid.count(), remaining);
-        slot_state->next_block_idx.store(static_cast<int16_t>(start + claim), std::memory_order_relaxed);
-        PublishHandle handles[CoreTracker::MAX_CLUSTERS * 3];
-        int handle_count = 0;
-        // Gather the claimed offsets so the per-core destination structures of block
-        // b+1 can be prefetched while block b's prepare runs (software pipeline —
-        // this drain launches every block on a single elected thread).
-        int32_t claimed[CoreTracker::MAX_CLUSTERS * 3];
-        for (int32_t b = 0; b < claim; b++)
-            claimed[b] = valid.pop_first();
-        bool is_mix = (shape == PTO2ResourceShape::MIX);
-        if (claim > 0) prefetch_block_dst(t, claimed[0], is_mix);
-        for (int32_t b = 0; b < claim; b++) {
-            if (b + 1 < claim) prefetch_block_dst(t, claimed[b + 1], is_mix);
-            handle_count +=
-                prepare_block_for_dispatch(t, claimed[b], *slot_state, shape, false, start + b, &handles[handle_count]);
-        }
-        wmb();
-        uint64_t dispatch_ts = 0;
+    // Stage from this thread's `valid` cores/clusters: CAS-claim a block-index range sized to
+    // what this thread can place (against peers claiming concurrently), then publish those
+    // blocks onto valid cores. prepare_block_for_dispatch decides each MIX core's slot per-core
+    // (idle -> running, busy -> pending when to_pending); a MIX cluster's idle cores are the
+    // running-slot cores, counted BEFORE staging mutates the tracker (rendezvous seed).
+    auto stage = [&](CoreTracker::BitStates valid, bool to_pending) {
+        while (valid.has_value()) {
+            int32_t avail = valid.count();
+            int32_t start = 0, claim = 0;
+            while (true) {
+                int16_t cur = slot_state->next_block_idx.load(std::memory_order_relaxed);
+                if (cur >= block_num) return;  // all blocks claimed
+                int32_t cnt = block_num - cur;
+                if (cnt > avail) cnt = avail;
+                if (slot_state->next_block_idx.compare_exchange_weak(
+                        cur, static_cast<int16_t>(cur + cnt), std::memory_order_seq_cst, std::memory_order_relaxed
+                    )) {
+                    start = cur;
+                    claim = cnt;
+                    break;
+                }
+            }
+            if (claim == 0) return;
 #if SIMPLER_DFX
-        if (l2_swimlane_level_ >= L2SwimlaneLevel::AICPU_TIMING) {
-            dispatch_ts = get_sys_cnt_aicpu();
-        }
+            bool sub_prof = l2_swimlane_level_ >= L2SwimlaneLevel::SCHED_PHASES;
+            uint64_t prep_t0 = sub_prof ? get_sys_cnt_aicpu() : 0;
 #endif
-        for (int i = 0; i < handle_count; i++) {
-            publish_subtask_to_core(handles[i], dispatch_ts);
+            PublishHandle handles[CoreTracker::MAX_CLUSTERS * 3];
+            int handle_count = 0;
+            int32_t claimed[CoreTracker::MAX_CLUSTERS * 3];
+            for (int32_t b = 0; b < claim; b++)
+                claimed[b] = valid.pop_first();
+            bool is_mix = (shape == PTO2ResourceShape::MIX);
+            if (claim > 0) prefetch_block_dst(thread_idx, claimed[0], is_mix);
+            for (int32_t b = 0; b < claim; b++) {
+                if (b + 1 < claim) prefetch_block_dst(thread_idx, claimed[b + 1], is_mix);
+                auto core_offset = claimed[b];
+                if (shape == PTO2ResourceShape::MIX) {
+                    running_staged += tracker.mix_cluster_idle_core_count(core_offset, core_mask);
+                }
+                handle_count += prepare_block_for_dispatch(
+                    thread_idx, core_offset, *slot_state, shape, to_pending, start + b, &handles[handle_count]
+                );
+            }
+            wmb();
+            uint64_t dispatch_ts = 0;
+#if SIMPLER_DFX
+            uint64_t pub_t0 = 0;
+            if (sub_prof) {
+                pub_t0 = get_sys_cnt_aicpu();
+                // DrainPrepare bar: cluster scan happened before this lambda, so this covers the
+                // build_payload work for `claim` blocks (handle_count subtasks).
+                l2_swimlane_aicpu_record_sched_phase(
+                    thread_idx, L2SwimlaneSchedPhaseKind::DrainPrepare, prep_t0, pub_t0,
+                    sched_l2_swimlane_[thread_idx].sched_loop_count, static_cast<uint32_t>(handle_count)
+                );
+            }
+            if (l2_swimlane_level_ >= L2SwimlaneLevel::AICPU_TIMING) {
+                dispatch_ts = pub_t0 != 0 ? pub_t0 : get_sys_cnt_aicpu();
+            }
+#endif
+            // Accumulate this batch's gated cores into a LOCAL mask and OR it into the shared
+            // staged_core_mask ONCE below, instead of a seq_cst fetch_or per subtask — that
+            // per-write atomic contends across all drain threads on the same 2 words and was
+            // ~half the publish cost. The doorbell-table writes stay per-core (unique cid, no
+            // contention).
+            uint64_t my_mask[PTO2_EARLY_DISPATCH_CORE_MASK_WORDS] = {0};
+            for (int i = 0; i < handle_count; i++) {
+                publish_subtask_to_core(handles[i], dispatch_ts);
+                if (gated) {
+                    int32_t cid = tracker.get_core_id_by_offset(handles[i].core_offset);
+                    sched_->early_dispatch_doorbell_table[cid].addr = handles[i].reg_addr;
+                    sched_->early_dispatch_doorbell_table[cid].token = handles[i].reg_task_id;
+                    my_mask[cid >> 6] |= 1ULL << (cid & 63);
+                }
+            }
+            if (gated) {
+                for (int w = 0; w < PTO2_EARLY_DISPATCH_CORE_MASK_WORDS; w++) {
+                    if (my_mask[w] != 0) {
+                        slot_state->payload->staged_core_mask[w].fetch_or(my_mask[w], std::memory_order_seq_cst);
+                    }
+                }
+            }
+#if SIMPLER_DFX
+            if (sub_prof) {
+                // DrainPublish bar: the MMIO write_reg per subtask (+ gated doorbell/mask record).
+                l2_swimlane_aicpu_record_sched_phase(
+                    thread_idx, L2SwimlaneSchedPhaseKind::DrainPublish, pub_t0, get_sys_cnt_aicpu(),
+                    sched_l2_swimlane_[thread_idx].sched_loop_count, static_cast<uint32_t>(handle_count)
+                );
+            }
+#endif
+            sched_->record_published_blocks(*slot_state, claim);
+            // AIC/AIV running placement (whole block on idle cores); MIX running cores are
+            // counted per-cluster above (mix_cluster_idle_core_count).
+            if (gated && shape != PTO2ResourceShape::MIX && !to_pending) running_staged += handle_count;
         }
-        sched_->record_published_blocks(*slot_state, claim);
+    };
+
+    if (mix_split) {
+        // Gated MIX: to_pending=true opts every BUSY used core into its pending slot while idle
+        // used cores take running slots (prepare_block_for_dispatch: to_pending && !is_core_idle).
+        stage(tracker.get_mix_split_cluster_offset_states(core_mask), /*to_pending=*/true);
+    } else {
+        auto idle = (shape == PTO2ResourceShape::MIX) ? tracker.get_mix_running_cluster_offset_states(core_mask) :
+                                                        tracker.get_idle_core_offset_states(shape);
+        stage(idle, /*to_pending=*/false);  // idle -> running (ready launch + gated pre-stage)
+        if (gated) {
+            stage(tracker.get_pending_core_offset_states(shape), /*to_pending=*/true);
+        }
     }
-
-    // The drain path IS this sync_start producer's dispatch, so it must bump its
-    // consumers' dispatch_fanin like the normal dispatch path
-    // (scheduler_dispatch.cpp, post-publish) -- otherwise a consumer whose only
-    // flagged producer is a sync_start (drain-dispatched) task never becomes an
-    // early-dispatch candidate. Idempotent via propagate's dispatch_propagated
-    // once-guard; the internal gate no-ops for an unflagged producer.
-    sched_->propagate_dispatch_fanin(*slot_state);
-
-    // All blocks dispatched -- clear drain state.
-    // Release fence ensures tracker mutations are visible to threads that
-    // acquire-load sync_start_pending == 0 and resume normal operation.
-    std::atomic_thread_fence(std::memory_order_release);
-    drain_state_.pending_task.store(nullptr, std::memory_order_release);
-    drain_state_.drain_ack_mask.store(0, std::memory_order_relaxed);
-    drain_state_.drain_worker_elected.store(0, std::memory_order_relaxed);
-    drain_state_.sync_start_pending.store(0, std::memory_order_release);
+    return running_staged;
 }
 
 // Called by each scheduler thread when drain_state_.sync_start_pending != 0.
 //
-// Protocol (single-stage ack barrier):
-//   1. Ack barrier: all threads signal they've stopped dispatch, then spin
-//      until all ack bits are set.
-//      If this thread's bit gets cleared while waiting, a reset occurred -- return.
-//   2. Election: one thread wins the CAS and becomes the drain worker.
-//      If resources are insufficient, reset ack/election fields and return --
-//      all threads resume completion polling to free running cores, then retry.
-//   3. Dispatch: elected thread dispatches all blocks (one pass, resources guaranteed).
-//      Non-elected threads spin-wait until sync_start_pending == 0.
-//      During dispatch the elected thread has exclusive tracker access.
-void SchedulerContext::handle_drain_mode(int32_t thread_idx) {
+// Protocol:
+//   1. Ack barrier: all threads signal they've stopped dispatch, spin until all acked.
+//      If this thread's ack bit gets cleared while waiting, a reset occurred -- return.
+//   2. Election + availability: one thread wins the CAS. It checks global resources; if
+//      insufficient it resets ack/election so all threads resume completion polling to free
+//      cores, then retry. If sufficient it releases parallel staging (stage_go).
+//   3. Parallel stage: EVERY thread stages its OWN cores concurrently (CAS-claimed block
+//      indices), accumulates its running-slot cores, and marks its stage_done bit.
+//   4. Finalize: the elected thread waits for all stage_done bits, seeds the rendezvous
+//      (running_slot_count) for a gated drain, propagates dispatch_fanin, and reopens the gate
+//      (a release-store the non-elected threads acquire, so the seed is visible before any
+//      completion promotes a pending block). Non-elected threads spin until the gate reopens.
+void SchedulerContext::handle_drain_mode(int32_t thread_idx, [[maybe_unused]] uint64_t *out_stage_wall_cycles) {
+#if SIMPLER_DFX
+    bool drain_prof = (l2_swimlane_level_ >= L2SwimlaneLevel::SCHED_PHASES && out_stage_wall_cycles != nullptr);
+    uint64_t drain_acked_ts = 0;  // set at ack-barrier end; used to measure the stage wall
+#endif
     // Every spin in this function honors is_completed(): once the run latches
     // completed_ (all tasks done, or a fatal error raised elsewhere), peers leave
     // the dispatch loop and stop participating in the drain. A thread parked in a
@@ -599,15 +712,76 @@ void SchedulerContext::handle_drain_mode(int32_t thread_idx) {
         if ((ack & (1u << thread_idx)) == 0) return;
         SPIN_WAIT_HINT();
     }
-
     // Election -- exactly one thread wins the CAS.
     int32_t expected = 0;
     drain_state_.drain_worker_elected.compare_exchange_strong(
         expected, thread_idx + 1, std::memory_order_acquire, std::memory_order_relaxed
     );
+    bool elected = drain_state_.drain_worker_elected.load(std::memory_order_relaxed) == thread_idx + 1;
 
-    if (drain_state_.drain_worker_elected.load(std::memory_order_relaxed) != thread_idx + 1) {
-        // Non-elected: spin-wait for drain completion or resource-insufficient reset.
+    PTO2TaskSlotState *slot_state = drain_state_.pending_task.load(std::memory_order_acquire);
+    // gated read is stable during the drain: completions don't run while every thread is parked
+    // in handle_drain_mode, so the producer cannot flip early_dispatch_state here.
+    bool gated =
+        slot_state != nullptr && slot_state->payload != nullptr &&
+        slot_state->payload->early_dispatch_state.load(std::memory_order_seq_cst) == PTO2_EARLY_DISPATCH_STAGING;
+
+    if (elected) {
+        if (slot_state == nullptr) {
+            // pending_task observed null only when a concurrent drain completion already cleared
+            // it. Stale-elected: release the election lock and return. Do NOT clear drain_ack_mask
+            // / sync_start_pending -- a *new* drain run may already be accumulating acks.
+            drain_state_.drain_worker_elected.store(0, std::memory_order_release);
+            return;
+        }
+        PTO2ResourceShape shape = slot_state->active_mask.to_shape();
+        // A gated drain may pre-stage onto pending slots too (idle+pending); the ready drain
+        // needs block_num idle cores/clusters.
+        int32_t available =
+            count_global_available(shape, slot_state->active_mask.core_mask(), /*include_pending=*/gated);
+        if (available < block_num) {
+            // Insufficient -- reset so all threads resume completion polling to free cores, then retry.
+            drain_state_.drain_ack_mask.store(0, std::memory_order_release);
+            drain_state_.drain_worker_elected.store(0, std::memory_order_release);
+            return;
+        }
+        // Release parallel staging: every thread (this one included) now stages its own cores.
+        drain_state_.drain_running_staged.store(0, std::memory_order_relaxed);
+        drain_state_.drain_stage_done_mask.store(0, std::memory_order_relaxed);
+        drain_state_.drain_stage_go.store(1, std::memory_order_release);
+    } else {
+        // Non-elected: wait for the go signal, or bail if the elected thread reset (stale /
+        // insufficient resources).
+        while (drain_state_.drain_stage_go.load(std::memory_order_acquire) == 0) {
+            if (is_completed()) return;
+            if (drain_state_.drain_worker_elected.load(std::memory_order_acquire) == 0) return;
+            SPIN_WAIT_HINT();
+        }
+        slot_state = drain_state_.pending_task.load(std::memory_order_acquire);
+        if (slot_state == nullptr) return;
+        gated =
+            slot_state->payload != nullptr &&
+            slot_state->payload->early_dispatch_state.load(std::memory_order_seq_cst) == PTO2_EARLY_DISPATCH_STAGING;
+    }
+
+    // Parallel stage this thread's own cores (CAS-claimed block indices), then mark done.
+#if SIMPLER_DFX
+    if (drain_prof) drain_acked_ts = get_sys_cnt_aicpu();  // pre-stage
+#endif
+    int32_t my_running = drain_stage_cores(slot_state, block_num, thread_idx, gated);
+#if SIMPLER_DFX
+    // out param carries the PURE drain_stage_cores wall (build_payload + MMIO publish of
+    // this thread's cores), isolating it from availability + stage_go handshake.
+    if (drain_prof && drain_acked_ts != 0) *out_stage_wall_cycles = get_sys_cnt_aicpu() - drain_acked_ts;
+#endif
+    drain_state_.drain_running_staged.fetch_add(my_running, std::memory_order_acq_rel);
+    drain_state_.drain_stage_done_mask.fetch_or(1u << thread_idx, std::memory_order_release);
+
+    if (!elected) {
+        // Non-elected: staging done; wait for the elected thread to reopen the gate. Exiting via
+        // sync_start_pending==0 (release/acquire) or drain_worker_elected==0 both synchronize
+        // with the elected's finalize (its release fence sequences the seed before both stores),
+        // so the running_slot_count seed is visible before this thread resumes completions.
         while (drain_state_.sync_start_pending.load(std::memory_order_acquire) != 0) {
             if (is_completed()) return;
             if (drain_state_.drain_worker_elected.load(std::memory_order_acquire) == 0) return;
@@ -616,29 +790,36 @@ void SchedulerContext::handle_drain_mode(int32_t thread_idx) {
         return;
     }
 
-    // Elected: check if global resources are sufficient.
-    PTO2TaskSlotState *slot_state = drain_state_.pending_task.load(std::memory_order_acquire);
-    if (slot_state == nullptr) {
-        // pending_task is observed null only when a concurrent drain completion
-        // already cleared it (drain_worker_dispatch nulls it before reopening the
-        // gate). That drain is done and this is a stale-elected thread, so just
-        // release the election lock and return. Do NOT clear drain_ack_mask or
-        // sync_start_pending: a *new* drain run may already be active and
-        // accumulating acks, and zeroing them would corrupt it into a hang.
-        drain_state_.drain_worker_elected.store(0, std::memory_order_release);
-        return;
+    // Elected: wait for all threads to finish staging, then seed the rendezvous and reopen.
+    while ((drain_state_.drain_stage_done_mask.load(std::memory_order_acquire) & all_acked) != all_acked) {
+        if (is_completed()) return;
+        SPIN_WAIT_HINT();
     }
-    PTO2ResourceShape shape = slot_state->active_mask.to_shape();
-    int32_t available = count_global_available(shape, slot_state->active_mask.core_mask());
-
-    if (available < block_num) {
-        // Insufficient resources -- reset drain fields so threads can resume
-        // completion polling to free running cores, then retry.
-        drain_state_.drain_ack_mask.store(0, std::memory_order_release);
-        drain_state_.drain_worker_elected.store(0, std::memory_order_release);
-        return;
+    if (gated) {
+        // Seed the rendezvous with the running-slot cores staged across all threads; pending
+        // cores advance it as they promote. maybe_rendezvous_ring (producer release) rings iff
+        // this already equals popcount(staged_core_mask) — i.e. no pending spill.
+        slot_state->payload->running_slot_count.store(
+            static_cast<int16_t>(drain_state_.drain_running_staged.load(std::memory_order_acquire)),
+            std::memory_order_seq_cst
+        );
     }
+    // Clear drain state and reopen the gate FIRST, so the other threads resume immediately.
+    // Release fence sequences the seed + tracker mutations before every clear, so any thread
+    // that acquire-observes one of them (sync_start_pending==0 / drain_worker_elected==0) sees
+    // the seed. `slot_state` is a local holding the fa_fused slot (not drain_state_), so it stays
+    // valid for the propagate below even if a new drain reuses pending_task after reopen.
+    std::atomic_thread_fence(std::memory_order_release);
+    drain_state_.pending_task.store(nullptr, std::memory_order_release);
+    drain_state_.drain_stage_go.store(0, std::memory_order_relaxed);
+    drain_state_.drain_stage_done_mask.store(0, std::memory_order_relaxed);
+    drain_state_.drain_ack_mask.store(0, std::memory_order_relaxed);
+    drain_state_.drain_worker_elected.store(0, std::memory_order_relaxed);
+    drain_state_.sync_start_pending.store(0, std::memory_order_release);
 
-    // Dispatch -- all other threads are spinning, elected thread has exclusive tracker access.
-    drain_worker_dispatch(block_num);
+    // The drain path IS this sync_start producer's dispatch, so it bumps its consumers'
+    // dispatch_fanin like the normal post-publish path (idempotent via the once-guard). Done
+    // AFTER reopen — it walks fa_fused's (large) fanout and is off the other threads' critical
+    // path; the once-guard + the local slot_state keep it correct post-reopen.
+    sched_->propagate_dispatch_fanin(*slot_state);
 }

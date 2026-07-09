@@ -514,9 +514,18 @@ enum class L2SwimlaneSchedPhaseKind : uint32_t {
                   // push newly-ready successors, ring doorbells for
                   // early-dispatch hits. tasks_processed = # consumers visited.
     // Separate-lane (Worker View pid=4 AICPU_N)
-    DummyTask = 7,  // Per-dummy identity marker (zero-width). tasks_processed
-                    // = task_token_raw low 32 bits so deps.json flow arrows
-                    // can land on it.
+    DummyTask = 7,      // Per-dummy identity marker (zero-width). tasks_processed
+                        // = task_token_raw low 32 bits so deps.json flow arrows
+                        // can land on it.
+    Drain = 8,          // handle_drain_mode outer: the sync_start stop-the-world drain
+                        // (ack barrier + availability + parallel stage + finalize).
+                        // One bar per dispatch-loop iteration that enters the drain,
+                        // so retries show as multiple bars. Otherwise this time is a
+                        // swimlane blind spot (the loop `continue`s past all records).
+    DrainPrepare = 9,   // inner: this thread's drain_stage_cores prepare pass
+                        // (cluster scan + build_payload). tasks_processed = subtasks.
+    DrainPublish = 10,  // inner: this thread's drain_stage_cores publish pass
+                        // (MMIO write_reg per subtask). tasks_processed = subtasks.
 };
 
 /** Index layout of the queue-depth snapshot arrays below: AIC=0, AIV=1, MIX=2.
@@ -546,7 +555,7 @@ struct L2SwimlaneAicpuSchedPhaseRecord {
     uint32_t tasks_processed;       // Tasks processed in this phase batch
     uint32_t pop_hit;               // SCHED_DISPATCH delta since last emit (0 for Complete)
     uint32_t pop_miss;              // SCHED_DISPATCH delta since last emit (0 for Complete)
-    int16_t shared_depth_at_start[L2SWIMLANE_NUM_QUEUE_SHAPES];  // sched->ready_queues[shape].size()
+    int16_t shared_depth_at_start[L2SWIMLANE_NUM_QUEUE_SHAPES];  // ready_queues[shape] + ready_sync_queues[shape]
     int16_t shared_depth_at_end[L2SWIMLANE_NUM_QUEUE_SHAPES];
     uint32_t _pad[4];  // 64B alignment padding
 };
