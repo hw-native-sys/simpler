@@ -48,7 +48,7 @@ class TestSpmdSyncStartAiv(SceneTestCase):
         {
             "name": "Case1",
             "platforms": ["a2a3sim", "a2a3"],
-            "config": {"aicpu_thread_num": 4, "block_dim": 24},
+            "config": {"aicpu_thread_num": 4, "block_dim": 0},
             "params": {},
         }
     ]

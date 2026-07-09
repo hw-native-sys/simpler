@@ -70,7 +70,7 @@ class TestPagedAttentionUnrollManualScope(SceneTestCase):
         {
             "name": "Case1",
             "platforms": ["a5"],
-            "config": {"aicpu_thread_num": 4, "block_dim": 36},
+            "config": {"aicpu_thread_num": 4, "block_dim": 0},
             "params": {
                 "batch": 256,
                 "num_heads": 16,
@@ -85,7 +85,7 @@ class TestPagedAttentionUnrollManualScope(SceneTestCase):
         {
             "name": "Case2",
             "platforms": ["a5"],
-            "config": {"aicpu_thread_num": 4, "block_dim": 36},
+            "config": {"aicpu_thread_num": 4, "block_dim": 0},
             "manual": True,
             "params": {
                 "batch": 64,
@@ -101,7 +101,7 @@ class TestPagedAttentionUnrollManualScope(SceneTestCase):
         {
             "name": "Case3",
             "platforms": ["a5"],
-            "config": {"aicpu_thread_num": 4, "block_dim": 36},
+            "config": {"aicpu_thread_num": 4, "block_dim": 0},
             "manual": True,
             "params": {
                 "batch": 64,
@@ -117,7 +117,7 @@ class TestPagedAttentionUnrollManualScope(SceneTestCase):
         {
             "name": "SmallCase1",
             "platforms": ["a5sim", "a5"],
-            "config": {"aicpu_thread_num": 4, "block_dim": 36},
+            "config": {"aicpu_thread_num": 4, "block_dim": 0},
             "params": {
                 "batch": 1,
                 "num_heads": 16,
@@ -132,7 +132,7 @@ class TestPagedAttentionUnrollManualScope(SceneTestCase):
         {
             "name": "SmallCase2",
             "platforms": ["a5sim", "a5"],
-            "config": {"aicpu_thread_num": 4, "block_dim": 36},
+            "config": {"aicpu_thread_num": 4, "block_dim": 0},
             "manual": True,
             "params": {
                 "batch": 1,

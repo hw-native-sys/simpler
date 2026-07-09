@@ -72,7 +72,7 @@ class TestPagedAttentionManualScope(SceneTestCase):
             # MANUAL scope; the default per-ring task window (16384) can fill
             # before the oldest task retires and wedge the orchestrator
             # (FLOW_CONTROL_DEADLOCK / code 3). Double the window for headroom.
-            "config": {"aicpu_thread_num": 4, "block_dim": 24, "runtime_env": {"ring_task_window": 32768}},
+            "config": {"aicpu_thread_num": 4, "block_dim": 0, "runtime_env": {"ring_task_window": 32768}},
             "params": {
                 "batch": 256,
                 "num_heads": 16,
@@ -87,7 +87,7 @@ class TestPagedAttentionManualScope(SceneTestCase):
         {
             "name": "Case2",
             "platforms": ["a2a3"],
-            "config": {"aicpu_thread_num": 4, "block_dim": 24},
+            "config": {"aicpu_thread_num": 4, "block_dim": 0},
             "manual": True,
             "params": {
                 "batch": 64,
@@ -103,7 +103,7 @@ class TestPagedAttentionManualScope(SceneTestCase):
         {
             "name": "Case3",
             "platforms": ["a2a3"],
-            "config": {"aicpu_thread_num": 4, "block_dim": 24},
+            "config": {"aicpu_thread_num": 4, "block_dim": 0},
             "manual": True,
             "params": {
                 "batch": 64,
@@ -134,7 +134,7 @@ class TestPagedAttentionManualScope(SceneTestCase):
         {
             "name": "CaseSmall2",
             "platforms": ["a2a3sim", "a2a3"],
-            "config": {"aicpu_thread_num": 4, "block_dim": 24},
+            "config": {"aicpu_thread_num": 4, "block_dim": 0},
             "manual": True,
             "params": {
                 "batch": 1,
@@ -150,7 +150,7 @@ class TestPagedAttentionManualScope(SceneTestCase):
         {
             "name": "CaseVarSeq2",
             "platforms": ["a2a3sim", "a2a3"],
-            "config": {"aicpu_thread_num": 4, "block_dim": 24},
+            "config": {"aicpu_thread_num": 4, "block_dim": 0},
             "manual": True,
             "params": {
                 "batch": 2,
@@ -167,7 +167,7 @@ class TestPagedAttentionManualScope(SceneTestCase):
         {
             "name": "CaseVarSeq4",
             "platforms": ["a2a3sim", "a2a3"],
-            "config": {"aicpu_thread_num": 4, "block_dim": 24},
+            "config": {"aicpu_thread_num": 4, "block_dim": 0},
             "manual": True,
             "params": {
                 "batch": 4,

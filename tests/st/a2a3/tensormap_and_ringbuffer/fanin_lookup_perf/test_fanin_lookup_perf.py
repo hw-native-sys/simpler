@@ -51,13 +51,13 @@ class TestFaninLookupPerf(SceneTestCase):
         {
             "name": "LookupOnlyProducers64Consumers64",
             "platforms": ["a2a3sim", "a2a3"],
-            "config": {"aicpu_thread_num": 4, "block_dim": 24},
+            "config": {"aicpu_thread_num": 4, "block_dim": 0},
             "params": {"producer_count": 64, "consumer_count": 64, "use_real_kernels": 0},
         },
         {
             "name": "SwimlaneProducers64Consumers64",
             "platforms": ["a2a3sim", "a2a3"],
-            "config": {"aicpu_thread_num": 4, "block_dim": 24},
+            "config": {"aicpu_thread_num": 4, "block_dim": 0},
             "params": {"producer_count": 64, "consumer_count": 64, "use_real_kernels": 1},
         },
     ]

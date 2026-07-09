@@ -77,7 +77,7 @@ class TestPagedAttentionRingbuffer(SceneTestCase):
             # but 4 MiB keeps the small-ring stress intent compact.
             "config": {
                 "aicpu_thread_num": 4,
-                "block_dim": 24,
+                "block_dim": 0,
                 "runtime_env": {
                     "ring_task_window": 64,
                     "ring_heap": 4 * 1024 * 1024,
