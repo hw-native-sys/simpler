@@ -240,10 +240,14 @@ and
 Each collector inherits as `class XxxCollector : public ProfilerBase<XxxCollector, XxxModule>`
 and only has to provide:
 
-- `void on_buffer_collected(const ReadyBufferInfo& info)` — copy the
-  records out of `info.host_buffer_ptr` and update collector-specific
-  state (CSV row, in-memory aggregator, file writer thread, …). The
-  framework calls `manager_.notify_copy_done(...)` afterwards; **Derived
+- `void on_buffer_collected(const ReadyBufferInfo& info)` or the optional
+  shard-aware overload `void on_buffer_collected(const ReadyBufferInfo& info,
+  int collector_shard)` — copy records out of `info.host_buffer_ptr` and
+  update collector-specific state (CSV row, in-memory aggregator, file writer
+  thread, …). PMU and ArgsDump use the shard id for lock-free local
+  accumulation. DepGen and ScopeStats have one orchestrator producer, so they
+  retain their single-accumulator path. The framework calls
+  `manager_.notify_copy_done(...)` afterwards; **Derived
   must not call it directly.**
 - `static constexpr int kIdleTimeoutSec` — bound on no-progress idle in
   the collector loop. Use the subsystem's `PLATFORM_*_TIMEOUT_SECONDS`

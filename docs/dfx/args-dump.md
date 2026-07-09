@@ -495,6 +495,13 @@ replenish thread folds done buffers back into recycled lanes and, for
 modules that declare a recycled watermark, tops those lanes up by batched
 allocation without writing device free queues.
 
+Each collector appends metadata to its own vector, so collectors do not
+serialize on the manifest accumulator. Payloads still share one `args.bin`:
+the narrow writer lock assigns the next binary offset and enqueues the payload
+in the same order, while metadata insertion stays outside that lock. Export
+joins the writer, folds the shard-local vectors together, and sorts the merged
+metadata by `(task_id, stage, arg_index, role)` before writing JSON.
+
 ```text
         HOST                                         DEVICE
 ┌──────────────────────────┐               ┌──────────────────────────┐
@@ -556,8 +563,8 @@ the base class owns split mgmt threads, collector shards, and the
 only supplies the dump-specific pieces — the `DumpModule` trait
 that describes the shared-memory layout, `initialize` that
 allocates and pre-fills free queues, an `on_buffer_collected`
-callback that gathers payload bytes into the in-memory record
-list, plus `reconcile_counters` / `export_dump_files` /
+callback that gathers payload bytes and appends metadata to a shard-local
+record list, plus `reconcile_counters` / `export_dump_files` /
 `finalize`. The mgmt/collector threading, buffer pooling, and `Module`
 trait pattern are shared with PMU and L2Swimlane — see
 [profiling-framework.md](../profiling-framework.md) for the
@@ -622,7 +629,7 @@ the buffer's records.
 │   wait_pop_ready         │               │                          │
 │   on_buffer_collected →  │               │                          │
 │     copy arena slice     │<──memcpy─────<│                          │
-│     extract DumpedTensors│               │                          │
+│     extract DumpedArgs   │               │                          │
 │     queue to writer thrd │               │                          │
 │   notify_copy_done       │               │                          │
 │                          │               │                          │

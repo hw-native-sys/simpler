@@ -18,7 +18,7 @@
  *   per-thread ready queues, drains done-queue shards, and replenishes the
  *   per-core free_queues from shard-local recycled lanes.
  * - PmuCollector: collector thread shards pop full PmuBuffers from the manager
- *   and append them to the CSV file.
+ *   and append them to shard-local temporary CSV files.
  *
  * a5 specifics: device↔host transfers go through profiling_copy.h. The
  * framework's mgmt loop mirrors the shm region per tick; per-buffer
@@ -30,17 +30,18 @@
  *                                  go into the recycled pool). Calls
  *                                  set_memory_context() on the base so
  *                                  start(tf) can launch threads.
- *   start(tf)                    — Inherited from ProfilerBase: assembles
- *                                  MemoryOps from the stashed callbacks
- *                                  and launches the mgmt + collector threads.
+ *   start(tf)                    — Reset run-scoped CSV shards, then launch the
+ *                                  mgmt + collector threads through
+ *                                  ProfilerBase.
  *   [device execution]
  *   stop()                       — Stop mgmt → join mgmt → signal collectors →
  *                                  drain ready shards → join collectors, in
  *                                  that order. On return both thread exits and
  *                                  queue drains are complete.
- *   reconcile_counters()         — Sanity-check PmuBufferState::current_buf_ptr
- *                                  (any non-zero pointer with records is a
- *                                  device-flush bug, logged as ERROR) and
+ *   reconcile_counters()         — Merge CSV shards, sanity-check
+ *                                  PmuBufferState::current_buf_ptr (any
+ *                                  non-zero pointer with records is a
+ *                                  device-flush bug, logged as ERROR), and
  *                                  run the device-side cross-check
  *                                  collected + dropped == total.
  *   finalize()                   — Free all device memory and unregister.
@@ -58,10 +59,8 @@
 #include <filesystem>
 #include <fstream>
 #include <functional>
-#include <mutex>
 #include <optional>
 #include <string>
-#include <thread>
 #include <vector>
 
 #include "common/memory_barrier.h"
@@ -232,6 +231,8 @@ public:
         const PmuAllocCallback &alloc_cb, PmuRegisterCallback register_cb, const PmuFreeCallback &free_cb, int device_id
     );
 
+    void start(const profiling_common::ThreadFactory &thread_factory);
+
     /**
      * Device pointer to the PmuDataHeader. Set kernel_args.pmu_data_base
      * to this after init() succeeds so the AICPU side can find the shared
@@ -250,7 +251,7 @@ public:
      * Per-buffer callback invoked by ProfilerBase's poll loop. Flushes
      * records to CSV.
      */
-    void on_buffer_collected(const PmuReadyBufferInfo &info);
+    void on_buffer_collected(const PmuReadyBufferInfo &info, int collector_shard);
 
     /**
      * After stop(), perform purely-passive accounting:
@@ -275,6 +276,13 @@ public:
     bool is_initialized() const { return initialized_; }
 
 private:
+    struct alignas(64) CollectorShardCounters {
+        uint64_t total_collected{0};
+    };
+    static_assert(
+        sizeof(CollectorShardCounters) % 64 == 0, "CollectorShardCounters must not share cache lines across shards"
+    );
+
     bool initialized_ = false;
     int num_cores_ = 0;
     int num_threads_ = 0;
@@ -290,13 +298,18 @@ private:
     void *aicore_ring_addrs_dev_ = nullptr;
     void *aicore_ring_addrs_host_ = nullptr;
 
-    // CSV output. File is opened lazily on the first record write so that
-    // a hung device run that produces no records does not leave a
-    // header-only CSV on disk.
+    // CSV output. Collector shards stream rows into shard-local temp files on
+    // the hot path; stop-time reconciliation merges them into the final CSV so
+    // collector threads do not contend on one ofstream mutex or retain all rows
+    // in heap memory.
     std::string csv_path_;
     std::string csv_header_;
     std::ofstream csv_file_;
-    std::mutex csv_mutex_;
+    std::vector<std::string> csv_shard_paths_;
+    std::vector<std::ofstream> csv_shard_files_;
+    std::vector<CollectorShardCounters> collector_counters_;
+    std::atomic<bool> csv_shard_io_failed_{false};
+    bool csv_shards_finalized_{false};
 
     // Running total of records written to CSV. Used at reconcile time to
     // verify collected + dropped == device_total.
@@ -305,8 +318,14 @@ private:
     PmuDataHeader *pmu_header() const { return get_pmu_header(shm_host_); }
     PmuBufferState *pmu_state(int core_id) const { return get_pmu_buffer_state(shm_host_, core_id); }
 
-    void write_buffer_to_csv(int core_id, int thread_idx, const void *buf_host_ptr);
-    void ensure_csv_open_unlocked();
+    size_t normalize_collector_shard(int collector_shard) const;
+    void reset_collector_shards();
+    void append_buffer_to_csv_shard(int core_id, int thread_idx, const void *buf_host_ptr, int collector_shard);
+    bool flush_collector_shards_to_csv();
+    bool ensure_csv_shard_open(size_t shard);
+    bool ensure_csv_open();
+    bool close_csv_shards();
+    void cleanup_csv_shards();
 };
 
 // ---------------------------------------------------------------------------

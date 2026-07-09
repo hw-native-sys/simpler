@@ -30,6 +30,7 @@
 #include <cassert>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <iomanip>
 #include <ios>
 
@@ -97,7 +98,7 @@ int PmuCollector::init(
     event_type_ = event_type;
     csv_path_ = csv_path;
 
-    total_collected_ = 0;
+    reset_collector_shards();
     if (csv_file_.is_open()) {
         csv_file_.close();
     }
@@ -248,21 +249,111 @@ int PmuCollector::init(
     return 0;
 }
 
+void PmuCollector::start(const profiling_common::ThreadFactory &thread_factory) {
+    if (shm_host_ == nullptr) return;
+    reset_collector_shards();
+    profiling_common::ProfilerBase<PmuCollector, PmuModule>::start(thread_factory);
+}
+
 // ---------------------------------------------------------------------------
 // CSV writing
 // ---------------------------------------------------------------------------
 
-void PmuCollector::ensure_csv_open_unlocked() {
-    if (csv_file_.is_open()) return;
+size_t PmuCollector::normalize_collector_shard(int collector_shard) const {
+    const size_t shard_count = csv_shard_files_.size();
+    const bool valid_shard = collector_shard >= 0 && static_cast<size_t>(collector_shard) < shard_count;
+    if (!valid_shard) {
+        assert(false && "collector_shard out of range");
+        return shard_count;
+    }
+    return static_cast<size_t>(collector_shard);
+}
+
+bool PmuCollector::close_csv_shards() {
+    bool success = true;
+    for (size_t shard = 0; shard < csv_shard_files_.size(); shard++) {
+        auto &file = csv_shard_files_[shard];
+        if (file.is_open()) {
+            file.flush();
+            if (!file.good()) {
+                LOG_ERROR("PmuCollector: failed to flush CSV shard file: %s", csv_shard_paths_[shard].c_str());
+                success = false;
+            }
+            file.close();
+            if (file.fail()) {
+                LOG_ERROR("PmuCollector: failed to close CSV shard file: %s", csv_shard_paths_[shard].c_str());
+                success = false;
+            }
+        }
+    }
+    if (!success) {
+        csv_shard_io_failed_.store(true, std::memory_order_relaxed);
+    }
+    return success;
+}
+
+void PmuCollector::cleanup_csv_shards() {
+    for (const auto &path : csv_shard_paths_) {
+        if (path.empty()) continue;
+        std::error_code ec;
+        std::filesystem::remove(path, ec);
+    }
+}
+
+void PmuCollector::reset_collector_shards() {
+    (void)close_csv_shards();
+    cleanup_csv_shards();
+
+    const size_t shard_count = static_cast<size_t>(PmuModule::kCollectorThreadCount);
+    csv_shard_paths_.clear();
+    csv_shard_paths_.reserve(shard_count);
+    for (size_t shard = 0; shard < shard_count; shard++) {
+        csv_shard_paths_.push_back(csv_path_ + ".shard" + std::to_string(shard) + ".tmp");
+    }
+    csv_shard_files_.clear();
+    csv_shard_files_.resize(shard_count);
+    collector_counters_.assign(shard_count, {});
+    total_collected_ = 0;
+    csv_shard_io_failed_.store(false, std::memory_order_relaxed);
+    csv_shards_finalized_ = false;
+}
+
+bool PmuCollector::ensure_csv_open() {
+    if (csv_file_.is_open()) return csv_file_.good();
+    csv_file_.clear();
     csv_file_.open(csv_path_, std::ios::out | std::ios::trunc);
     if (!csv_file_.is_open()) {
         LOG_ERROR("PmuCollector: failed to open CSV file: %s", csv_path_.c_str());
-        return;
+        return false;
     }
     csv_file_ << csv_header_;
+    if (!csv_file_.good()) {
+        LOG_ERROR("PmuCollector: failed to write CSV header: %s", csv_path_.c_str());
+        return false;
+    }
+    return true;
 }
 
-void PmuCollector::write_buffer_to_csv(int core_id, int thread_idx, const void *buf_host_ptr) {
+bool PmuCollector::ensure_csv_shard_open(size_t shard) {
+    if (shard >= csv_shard_files_.size() || shard >= csv_shard_paths_.size()) {
+        LOG_ERROR("PmuCollector: invalid CSV shard index %zu", shard);
+        csv_shard_io_failed_.store(true, std::memory_order_relaxed);
+        return false;
+    }
+    auto &file = csv_shard_files_[shard];
+    if (file.is_open()) return true;
+    file.open(csv_shard_paths_[shard], std::ios::out | std::ios::trunc);
+    if (!file.is_open()) {
+        LOG_ERROR("PmuCollector: failed to open CSV shard file: %s", csv_shard_paths_[shard].c_str());
+        csv_shard_io_failed_.store(true, std::memory_order_relaxed);
+        return false;
+    }
+    return true;
+}
+
+void PmuCollector::append_buffer_to_csv_shard(
+    int core_id, int thread_idx, const void *buf_host_ptr, int collector_shard
+) {
     const PmuBuffer *buf = reinterpret_cast<const PmuBuffer *>(buf_host_ptr);
     uint32_t n = buf->count;
     if (n > static_cast<uint32_t>(PLATFORM_PMU_RECORDS_PER_BUFFER)) {
@@ -270,39 +361,109 @@ void PmuCollector::write_buffer_to_csv(int core_id, int thread_idx, const void *
     }
     if (n == 0) return;
 
-    std::scoped_lock<std::mutex> lock(csv_mutex_);
-    ensure_csv_open_unlocked();
-    if (!csv_file_.is_open()) return;
-    total_collected_ += n;
+    const size_t shard = normalize_collector_shard(collector_shard);
+    if (!ensure_csv_shard_open(shard)) return;
 
     const PmuEventConfig *evt = pmu_resolve_event_config_a5(event_type_);
     if (evt == nullptr) {
         evt = &PMU_EVENTS_A5_PIPE_UTIL;
     }
+
+    auto &rows = csv_shard_files_[shard];
     for (uint32_t i = 0; i < n; i++) {
         const PmuRecord &r = buf->records[i];
-        csv_file_ << thread_idx << ',' << core_id << ',';
-        csv_file_ << "0x" << std::hex << std::setw(16) << std::setfill('0') << r.task_id << std::dec
-                  << std::setfill(' ');
-        csv_file_ << ',' << r.func_id << ',' << static_cast<int>(r.core_type) << ',' << r.pmu_total_cycles;
+        rows << thread_idx << ',' << core_id << ',';
+        rows << "0x" << std::hex << std::setw(16) << std::setfill('0') << r.task_id << std::dec << std::setfill(' ');
+        rows << ',' << r.func_id << ',' << static_cast<int>(r.core_type) << ',' << r.pmu_total_cycles;
         for (int k = 0; k < PMU_COUNTER_COUNT_A5; k++) {
             const char *name = evt->counter_names[k];
             if (name == nullptr || name[0] == '\0') {
                 continue;
             }
-            csv_file_ << ',' << r.pmu_counters[k];
+            rows << ',' << r.pmu_counters[k];
         }
-        csv_file_ << ',' << static_cast<uint32_t>(event_type_) << '\n';
+        rows << ',' << static_cast<uint32_t>(event_type_) << '\n';
     }
-    csv_file_.flush();
+    if (!rows.good()) {
+        LOG_ERROR("PmuCollector: failed to write CSV shard file: %s", csv_shard_paths_[shard].c_str());
+        csv_shard_io_failed_.store(true, std::memory_order_relaxed);
+        return;
+    }
+    collector_counters_[shard].total_collected += n;
+}
+
+bool PmuCollector::flush_collector_shards_to_csv() {
+    if (csv_shards_finalized_) {
+        return true;
+    }
+
+    const bool shards_closed = close_csv_shards();
+    if (!shards_closed || csv_shard_io_failed_.load(std::memory_order_relaxed)) {
+        LOG_ERROR("PmuCollector: CSV shard output failed; preserving shard files for diagnosis");
+        return false;
+    }
+
+    uint64_t collected_candidate = 0;
+    bool has_rows = false;
+    for (size_t shard = 0; shard < collector_counters_.size(); shard++) {
+        collected_candidate += collector_counters_[shard].total_collected;
+        has_rows = has_rows || collector_counters_[shard].total_collected != 0;
+    }
+
+    if (has_rows) {
+        if (csv_file_.is_open()) {
+            csv_file_.close();
+        }
+        if (!ensure_csv_open()) {
+            if (csv_file_.is_open()) {
+                csv_file_.close();
+                std::error_code ec;
+                std::filesystem::remove(csv_path_, ec);
+            }
+            return false;
+        }
+        for (size_t shard = 0; shard < csv_shard_paths_.size(); shard++) {
+            if (collector_counters_[shard].total_collected == 0) continue;
+            std::ifstream shard_file(csv_shard_paths_[shard], std::ios::binary);
+            if (!shard_file.is_open()) {
+                LOG_ERROR("PmuCollector: failed to read CSV shard file: %s", csv_shard_paths_[shard].c_str());
+                csv_file_.close();
+                std::error_code ec;
+                std::filesystem::remove(csv_path_, ec);
+                return false;
+            }
+            csv_file_ << shard_file.rdbuf();
+            if (shard_file.bad() || !csv_file_.good()) {
+                LOG_ERROR("PmuCollector: failed to merge CSV shard file: %s", csv_shard_paths_[shard].c_str());
+                csv_file_.close();
+                std::error_code ec;
+                std::filesystem::remove(csv_path_, ec);
+                return false;
+            }
+        }
+        csv_file_.flush();
+        if (!csv_file_.good()) {
+            LOG_ERROR("PmuCollector: failed to flush merged CSV file: %s", csv_path_.c_str());
+            csv_file_.close();
+            std::error_code ec;
+            std::filesystem::remove(csv_path_, ec);
+            return false;
+        }
+    }
+    total_collected_ = collected_candidate;
+    cleanup_csv_shards();
+    csv_shards_finalized_ = true;
+    return true;
 }
 
 // ---------------------------------------------------------------------------
 // ProfilerBase callback
 // ---------------------------------------------------------------------------
 
-void PmuCollector::on_buffer_collected(const PmuReadyBufferInfo &info) {
-    write_buffer_to_csv(static_cast<int>(info.core_index), static_cast<int>(info.thread_index), info.host_buffer_ptr);
+void PmuCollector::on_buffer_collected(const PmuReadyBufferInfo &info, int collector_shard) {
+    append_buffer_to_csv_shard(
+        static_cast<int>(info.core_index), static_cast<int>(info.thread_index), info.host_buffer_ptr, collector_shard
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -325,6 +486,7 @@ void PmuCollector::reconcile_counters() {
         profiling_copy_from_device(shm_host_, manager_.shared_mem_dev(), shm_size_);
     }
     rmb();
+    flush_collector_shards_to_csv();
 
     // After stop(), pmu_aicpu_flush_buffers should have either enqueued the
     // active buffer (success → current_buf_ptr=0) or counted it as dropped
@@ -424,6 +586,7 @@ void PmuCollector::finalize(PmuUnregisterCallback unregister_cb, const PmuFreeCa
 
     // Stop mgmt + collector threads if the caller didn't already (idempotent).
     stop();
+    flush_collector_shards_to_csv();
 
     if (csv_file_.is_open()) {
         csv_file_.close();
@@ -493,6 +656,17 @@ void PmuCollector::finalize(PmuUnregisterCallback unregister_cb, const PmuFreeCa
     manager_.clear_mappings();
 
     initialized_ = false;
+    (void)close_csv_shards();
+    if (csv_shards_finalized_) {
+        cleanup_csv_shards();
+    }
+    csv_shard_paths_.clear();
+    csv_shard_paths_.shrink_to_fit();
+    csv_shard_files_.clear();
+    csv_shard_files_.shrink_to_fit();
+    collector_counters_.clear();
+    collector_counters_.shrink_to_fit();
+    csv_shards_finalized_ = false;
     clear_memory_context();
     LOG_INFO_V0("PMU collector finalized");
 }

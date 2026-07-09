@@ -247,7 +247,8 @@ extra allocation target.
 │   │ collector shard    │ │ mapping       │   push remaining full    │
 │   │   read records via │<┼──────────────<│   buffers to ready_q     │
 │   │   host mapping     │ │               │                          │
-│   │   append to CSV    │ │               │                          │
+│   │   append to shard  │ │               │                          │
+│   │   temp CSV         │ │               │                          │
 │   └────────────────────┘ │               └──────────────────────────┘
 │                          │
 │ stop()                   │
@@ -288,11 +289,12 @@ start(tf)                       ← spawn split mgmt threads (drain AICPU ready
                                   recycled lanes; replenish drains done
                                   buffers into recycled lanes)
                                   + collector shards (drain host hand-off,
-                                  append to CSV)
+                                  append to shard-local temp CSV files)
 launch AICPU / AICore
 rtStreamSynchronize             ← wait for kernel completion
 stop()                          ← join mgmt/replenish → join collectors
-reconcile_counters()            ← assert collected + dropped == total;
+reconcile_counters()            ← merge shard files into pmu.csv, then assert
+                                  collected + dropped == total;
                                   any non-empty current_buf_ptr is a
                                   flush bug, logged as ERROR
 finalize(unregister, free)
@@ -305,11 +307,16 @@ the base class owns split mgmt threads, collector shards, and the
 `BufferPoolManager<PmuModule>` they share. `PmuCollector` only supplies
 the PMU-specific pieces — the `PmuModule` trait that describes the
 shared-memory layout, an `init()` that allocates and pre-fills the free
-queues, an `on_buffer_collected()` callback that appends records to the
-CSV, and `reconcile_counters()` / `finalize()`. The mgmt/collector threading,
-buffer pooling, and `Module` trait pattern are shared with ArgsDump
-and L2Swimlane — see [profiling-framework.md](../profiling-framework.md) for
-the framework reference.
+queues, an `on_buffer_collected()` callback that appends records to a
+shard-local temporary CSV, and `reconcile_counters()` / `finalize()` that
+merge those files into `pmu.csv`. A failed merge preserves the temporary
+files and does not count their rows as successfully exported. Successful
+reconciliation removes the temporary files. An abrupt process exit can leave
+them in the CSV directory; the next `start()` for the same output path removes
+those stale run-scoped files before collector threads launch. The
+mgmt/collector threading, buffer pooling, and `Module` trait pattern are shared
+with ArgsDump and L2Swimlane — see
+[profiling-framework.md](../profiling-framework.md) for the framework reference.
 
 ### 5.3 a5 — same framework, host-shadow transport (DAV_3510, 10 counters)
 
@@ -377,7 +384,7 @@ still pulled on demand inside
 │ poll thread:             │               │                          │
 │   wait_pop_ready         │               │                          │
 │   on_buffer_collected →  │               │                          │
-│     write_buffer_to_csv  │               │                          │
+│     write shard temp CSV │               │                          │
 │   notify_copy_done       │               │                          │
 │                          │               │                          │
 │ rtStreamSynchronize      │               │                          │
@@ -452,7 +459,8 @@ pmu_collector_.start(thread_factory)   ← mgmt + poll threads
 launch AICPU / AICore
 rtStreamSynchronize
 pmu_collector_.stop()                  ← join mgmt + poll, drain final batch
-pmu_collector_.reconcile_counters()    ← collected + dropped + mismatch == device_total
+pmu_collector_.reconcile_counters()    ← merge shard files, then verify
+                                          collected + dropped + mismatch == device_total
 pmu_collector_.finalize(free)
 ```
 
@@ -493,7 +501,7 @@ device-side counters.
 | Counter readout | AICPU MMIO `read_reg` | AICore MMIO `ld_dev` |
 | Per-core staging | direct write into `records[count]` | dual-issue slots, AICPU commits on FIN |
 | Buffer model | rotating pool (free + ready queues, SPSC protocol) | identical |
-| Host threads | split mgmt + collector shards, streams during execution | same split mgmt + collector shards (7 = `PLATFORM_MAX_AICPU_THREADS` vs a2a3's 4) |
+| Host threads | split mgmt + collector shards, writes shard-local temp files during execution and merges at reconcile | same split mgmt + collector shards (7 = `PLATFORM_MAX_AICPU_THREADS` vs a2a3's 4) |
 | Host-class shape | `ProfilerBase<PmuCollector, PmuModule>` | identical |
 | Host transport | `halHostRegister` shared memory | host-shadow `malloc` + per-tick `rtMemcpy`/`memcpy` |
 | `MemoryOps` callbacks | 3 (`alloc`, `reg`, `free_`) | 5 (+ `copy_to_device`, `copy_from_device`) |
@@ -508,8 +516,9 @@ counter-read code paths are skipped.
 
 When enabled, the dominant per-task overhead is the MMIO counter read
 (8 reads on a2a3, 10 on a5) plus a single record copy. On both
-architectures, streaming keeps host-side work off the critical path —
-the collector shards drain buffers concurrently with kernel execution.
+architectures, shard-local streaming keeps host-side work off the critical
+path without serializing collectors on one output stream. Reconciliation
+merges the bounded temporary files into the final CSV after collection stops.
 Both a2a3 and a5 use split mgmt plus collector shards (a5 with 7 shards,
 a2a3 with 4). a5's copy hooks add `rtMemcpy` round-trips that a2a3's
 shared memory avoids, but these overlap with device execution.

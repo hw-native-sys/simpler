@@ -229,6 +229,8 @@ public:
         const DumpFreeCallback &free_cb, const std::string &output_prefix, DumpArgsLevel dump_args_level
     );
 
+    void start(const profiling_common::ThreadFactory &thread_factory);
+
     /**
      * Per-buffer callback invoked by ProfilerBase's poll loop. Pulls the
      * relevant portion of the originating thread's arena from device, copies
@@ -236,7 +238,7 @@ public:
      * queues payloads to the writer thread. The writer thread is started
      * lazily on the first invocation per run.
      */
-    void on_buffer_collected(const DumpReadyBufferInfo &info);
+    void on_buffer_collected(const DumpReadyBufferInfo &info, int collector_shard);
 
     /**
      * Write collected dumps to <output_prefix>/args_dump/{*.bin, *.json}.
@@ -274,6 +276,13 @@ public:
     void *get_dump_shm_device_ptr() const { return dump_shared_mem_dev_; }
 
 private:
+    struct alignas(64) CollectorShardCounters {
+        uint64_t total_collected{0};
+    };
+    static_assert(
+        sizeof(CollectorShardCounters) % 64 == 0, "CollectorShardCounters must not share cache lines across shards"
+    );
+
     void *dump_shared_mem_dev_{nullptr};
     int num_dump_threads_{0};
 
@@ -291,27 +300,35 @@ private:
     };
     std::vector<ArenaInfo> arenas_;
 
-    // Collected dump args (metadata only; payloads live in args.bin)
+    // Merged dump args (metadata only; payloads live in args.bin).
+    // Collector shards append to collected_by_collector_ on the hot path, then
+    // export folds those shards into collected_ before sorting/writing JSON.
     std::vector<DumpedArg> collected_;
-    std::mutex collected_mutex_;
+    std::vector<std::vector<DumpedArg>> collected_by_collector_;
+    std::vector<CollectorShardCounters> collector_counters_;
+    bool collector_shards_merged_{false};
+    std::atomic<uint64_t> total_metadata_collected_{0};
 
     // Stats
-    uint32_t total_dropped_record_count_{0};
-    uint32_t total_truncated_count_{0};
-    uint32_t total_overwrite_count_{0};
+    std::atomic<uint32_t> total_dropped_record_count_{0};
+    std::atomic<uint32_t> total_truncated_count_{0};
+    std::atomic<uint32_t> total_overwrite_count_{0};
 
     // Run-scoped state for the writer thread (lazily started on first
     // on_buffer_collected and joined by export_dump_files).
     std::chrono::steady_clock::time_point run_start_time_;
-    std::chrono::steady_clock::time_point last_progress_time_;
+    std::atomic<int64_t> last_progress_ms_{0};
     bool writer_started_{false};
 
-    void process_dump_buffer(const DumpReadyBufferInfo &info);
+    size_t normalize_collector_shard(int collector_shard) const;
+    void reset_collector_shards();
+    void merge_collector_shards();
+    void process_dump_buffer(const DumpReadyBufferInfo &info, int collector_shard);
     void start_writer_thread_once();
 
     // Writer thread: streams arg payloads to a single args.bin
     std::thread writer_thread_;
-    std::mutex collector_state_mutex_;
+    std::mutex writer_start_mutex_;
     std::mutex write_mutex_;
     std::condition_variable write_cv_;
     std::queue<DumpedArg> write_queue_;

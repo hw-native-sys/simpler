@@ -30,6 +30,7 @@
 #include "data_type.h"
 
 #include <algorithm>
+#include <cassert>
 #include <chrono>
 #include <cmath>
 #include <cstring>
@@ -47,6 +48,47 @@
 
 ArgsDumpCollector::~ArgsDumpCollector() { stop(); }
 
+static int64_t steady_clock_ms(std::chrono::steady_clock::time_point tp) {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(tp.time_since_epoch()).count();
+}
+
+size_t ArgsDumpCollector::normalize_collector_shard(int collector_shard) const {
+    const size_t shard_count = collected_by_collector_.size();
+    const bool valid_shard = collector_shard >= 0 && static_cast<size_t>(collector_shard) < shard_count;
+    if (!valid_shard) {
+        assert(false && "collector_shard out of range");
+        return shard_count;
+    }
+    return static_cast<size_t>(collector_shard);
+}
+
+void ArgsDumpCollector::reset_collector_shards() {
+    const size_t shard_count = static_cast<size_t>(DumpModule::kCollectorThreadCount);
+    collected_.clear();
+    collected_by_collector_.assign(shard_count, {});
+    collector_counters_.assign(shard_count, {});
+    collector_shards_merged_ = false;
+    total_metadata_collected_.store(0, std::memory_order_relaxed);
+}
+
+void ArgsDumpCollector::merge_collector_shards() {
+    if (collector_shards_merged_) {
+        return;
+    }
+
+    size_t total_records = 0;
+    for (const auto &shard_records : collected_by_collector_) {
+        total_records += shard_records.size();
+    }
+
+    collected_.clear();
+    collected_.reserve(total_records);
+    for (const auto &shard_records : collected_by_collector_) {
+        collected_.insert(collected_.end(), shard_records.begin(), shard_records.end());
+    }
+    collector_shards_merged_ = true;
+}
+
 int ArgsDumpCollector::initialize(
     int num_dump_threads, int device_id, const DumpAllocCallback &alloc_cb, DumpRegisterCallback register_cb,
     const DumpFreeCallback &free_cb, const std::string &output_prefix, DumpArgsLevel dump_args_level
@@ -59,6 +101,11 @@ int ArgsDumpCollector::initialize(
     num_dump_threads_ = num_dump_threads;
     output_prefix_ = output_prefix;
     dump_args_level_ = dump_args_level;
+    reset_collector_shards();
+    total_dropped_record_count_.store(0, std::memory_order_relaxed);
+    total_truncated_count_.store(0, std::memory_order_relaxed);
+    total_overwrite_count_.store(0, std::memory_order_relaxed);
+    last_progress_ms_.store(0, std::memory_order_relaxed);
 
     // Stash the memory context on the base up-front so alloc_paired_buffer
     // (which reads alloc_cb_/register_cb_/free_cb_/device_id_)
@@ -167,7 +214,14 @@ int ArgsDumpCollector::initialize(
     return 0;
 }
 
+void ArgsDumpCollector::start(const profiling_common::ThreadFactory &thread_factory) {
+    if (shm_host_ == nullptr) return;
+    reset_collector_shards();
+    profiling_common::ProfilerBase<ArgsDumpCollector, DumpModule>::start(thread_factory);
+}
+
 void ArgsDumpCollector::start_writer_thread_once() {
+    std::scoped_lock<std::mutex> lock(writer_start_mutex_);
     if (writer_started_) return;
     writer_started_ = true;
 
@@ -187,12 +241,12 @@ void ArgsDumpCollector::start_writer_thread_once() {
     writer_done_.store(false);
     bytes_written_.store(0);
     run_start_time_ = std::chrono::steady_clock::now();
-    last_progress_time_ = run_start_time_;
+    last_progress_ms_.store(steady_clock_ms(run_start_time_), std::memory_order_relaxed);
 
     writer_thread_ = std::thread(&ArgsDumpCollector::writer_loop, this);
 }
 
-void ArgsDumpCollector::process_dump_buffer(const DumpReadyBufferInfo &info) {
+void ArgsDumpCollector::process_dump_buffer(const DumpReadyBufferInfo &info, int collector_shard) {
     DumpMetaBuffer *buf = reinterpret_cast<DumpMetaBuffer *>(info.host_buffer_ptr);
     uint32_t count = buf->count;
 
@@ -205,6 +259,9 @@ void ArgsDumpCollector::process_dump_buffer(const DumpReadyBufferInfo &info) {
         );
         return;
     }
+
+    const size_t shard = normalize_collector_shard(collector_shard);
+    uint64_t records_appended = 0;
 
     // a5: pull the relevant portion of the originating thread's arena from
     // device. arena_write_offset was mirrored into shm_host_ at the top of
@@ -223,7 +280,7 @@ void ArgsDumpCollector::process_dump_buffer(const DumpReadyBufferInfo &info) {
     for (uint32_t i = 0; i < count; i++) {
         const ArgsDumpRecord &rec = buf->records[i];
 
-        DumpedArg dt;
+        DumpedArg dt{};
         dt.task_id = rec.task_id;
         // rec is read from device shared memory (untrusted): clamp func_count so a
         // corrupt oversized value can't drive an out-of-bounds read of the
@@ -263,7 +320,7 @@ void ArgsDumpCollector::process_dump_buffer(const DumpReadyBufferInfo &info) {
         std::memcpy(dt.shapes, rec.shapes, sizeof(dt.shapes));
         std::memcpy(dt.strides, rec.strides, sizeof(dt.strides));
 
-        if (dt.truncated && ++total_truncated_count_ == 1) {
+        if (dt.truncated && total_truncated_count_.fetch_add(1, std::memory_order_relaxed) == 0) {
             LOG_WARN("Args dump truncation detected. Increase PLATFORM_DUMP_AVG_TENSOR_BYTES.");
         }
 
@@ -275,7 +332,7 @@ void ArgsDumpCollector::process_dump_buffer(const DumpReadyBufferInfo &info) {
             uint64_t high_water = ai.high_water;
             if (high_water > arena_sz && rec.payload_offset < high_water - arena_sz) {
                 dt.overwritten = true;
-                if (++total_overwrite_count_ == 1) {
+                if (total_overwrite_count_.fetch_add(1, std::memory_order_relaxed) == 0) {
                     LOG_WARN(
                         "Args dump overwrite detected: host drain was slower than arena reuse. "
                         "Increase PLATFORM_DUMP_BUFFERS_PER_THREAD."
@@ -304,42 +361,48 @@ void ArgsDumpCollector::process_dump_buffer(const DumpReadyBufferInfo &info) {
         dt.payload_size = dt.bytes.size();
 
         bool has_payload = dt.kind == ArgsDumpKind::TENSOR && !dt.overwritten && !dt.bytes.empty();
-        dt.bin_offset = has_payload ? next_bin_offset_ : 0;
         if (has_payload) {
-            next_bin_offset_ += dt.payload_size;
-        }
-
-        // Store metadata-only copy in collected_ (no payload bytes)
-        DumpedArg meta = dt;
-        meta.bytes.clear();
-        {
-            std::scoped_lock<std::mutex> lock(collected_mutex_);
-            collected_.push_back(std::move(meta));
-        }
-
-        // Enqueue full tensor (with payload) to writer thread
-        if (has_payload) {
+            std::vector<uint8_t> payload = std::move(dt.bytes);
+            DumpedArg writer_item = dt;
+            writer_item.bytes = std::move(payload);
             {
                 std::scoped_lock<std::mutex> lock(write_mutex_);
-                write_queue_.push(std::move(dt));
+                dt.bin_offset = next_bin_offset_;
+                writer_item.bin_offset = next_bin_offset_;
+                next_bin_offset_ += dt.payload_size;
+                write_queue_.push(std::move(writer_item));
             }
+            collected_by_collector_[shard].push_back(std::move(dt));
             write_cv_.notify_one();
+        } else {
+            dt.bin_offset = 0;
+            dt.bytes.clear();
+            collected_by_collector_[shard].push_back(std::move(dt));
         }
+        records_appended++;
+    }
+
+    if (records_appended > 0) {
+        collector_counters_[shard].total_collected += records_appended;
+        total_metadata_collected_.fetch_add(records_appended, std::memory_order_relaxed);
     }
 }
 
-void ArgsDumpCollector::on_buffer_collected(const DumpReadyBufferInfo &info) {
-    std::scoped_lock<std::mutex> lock(collector_state_mutex_);
+void ArgsDumpCollector::on_buffer_collected(const DumpReadyBufferInfo &info, int collector_shard) {
     start_writer_thread_once();
-    process_dump_buffer(info);
+    process_dump_buffer(info, collector_shard);
 
     auto now = std::chrono::steady_clock::now();
-    if (std::chrono::duration_cast<std::chrono::seconds>(now - last_progress_time_).count() >= 5) {
+    int64_t now_ms = steady_clock_ms(now);
+    int64_t last_ms = last_progress_ms_.load(std::memory_order_relaxed);
+    if (now_ms - last_ms >= 5000 &&
+        last_progress_ms_.compare_exchange_strong(last_ms, now_ms, std::memory_order_relaxed)) {
         auto elapsed_s = std::chrono::duration_cast<std::chrono::seconds>(now - run_start_time_).count();
         LOG_INFO_V0(
-            "Collecting: %zu args, %.1f GB written (%lds)", collected_.size(), bytes_written_.load() / 1e9, elapsed_s
+            "Collecting: %lu args, %.1f GB written (%lds)",
+            static_cast<unsigned long>(total_metadata_collected_.load(std::memory_order_relaxed)),
+            bytes_written_.load() / 1e9, elapsed_s
         );
-        last_progress_time_ = now;
     }
 }
 
@@ -371,7 +434,7 @@ void ArgsDumpCollector::reconcile_counters() {
     for (int t = 0; t < num_dump_threads_; t++) {
         DumpBufferState *state = get_dump_buffer_state(shm_host_, t);
 
-        total_dropped_record_count_ += state->dropped_record_count;
+        total_dropped_record_count_.fetch_add(state->dropped_record_count, std::memory_order_relaxed);
         dropped_total += state->dropped_record_count;
 
         uint64_t cur_ptr = state->current_buf_ptr;
@@ -389,7 +452,7 @@ void ArgsDumpCollector::reconcile_counters() {
         info.dev_buffer_ptr = reinterpret_cast<void *>(cur_ptr);
         info.host_buffer_ptr = host_ptr;
         info.buffer_seq = state->current_buf_seq;
-        on_buffer_collected(info);
+        on_buffer_collected(info, static_cast<int>(t));
         recovered_threads++;
         LOG_WARN(
             "Dump reconcile: thread %d had an un-flushed buffer (count=%u) — device flush did not run "
@@ -563,13 +626,19 @@ int ArgsDumpCollector::export_dump_files() {
             std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - run_start_time_)
                 .count();
         LOG_INFO_V0(
-            "Collected %zu args, wrote %.1f GB to disk (%.1fs)", collected_.size(), bytes_written_.load() / 1e9,
-            elapsed_ms / 1000.0
+            "Collected %lu args, wrote %.1f GB to disk (%.1fs)",
+            static_cast<unsigned long>(total_metadata_collected_.load(std::memory_order_relaxed)),
+            bytes_written_.load() / 1e9, elapsed_ms / 1000.0
         );
     }
 
+    merge_collector_shards();
     if (collected_.empty()) {
         LOG_WARN("No args dump data to export");
+        reset_collector_shards();
+        total_dropped_record_count_.store(0, std::memory_order_relaxed);
+        total_truncated_count_.store(0, std::memory_order_relaxed);
+        total_overwrite_count_.store(0, std::memory_order_relaxed);
         writer_started_ = false;
         return 0;
     }
@@ -622,9 +691,9 @@ int ArgsDumpCollector::export_dump_files() {
     json << "  \"input_args\": " << num_input_args << ",\n";
     json << "  \"output_args\": " << num_output_args << ",\n";
     json << "  \"inout_args\": " << num_inout_args << ",\n";
-    json << "  \"truncated_args\": " << total_truncated_count_ << ",\n";
-    json << "  \"dropped_records\": " << total_dropped_record_count_ << ",\n";
-    json << "  \"dropped_overwrite\": " << total_overwrite_count_ << ",\n";
+    json << "  \"truncated_args\": " << total_truncated_count_.load(std::memory_order_relaxed) << ",\n";
+    json << "  \"dropped_records\": " << total_dropped_record_count_.load(std::memory_order_relaxed) << ",\n";
+    json << "  \"dropped_overwrite\": " << total_overwrite_count_.load(std::memory_order_relaxed) << ",\n";
     if (dump_args_level_ == DumpArgsLevel::FULL_JSON_ONLY) {
         json << "  \"bin_file\": null,\n";
     } else {
@@ -677,18 +746,24 @@ int ArgsDumpCollector::export_dump_files() {
     auto total_ms = std::chrono::duration_cast<std::chrono::milliseconds>(export_end - export_start).count();
     LOG_INFO_V0("Wrote JSON manifest (%zu args) to %s (%ldms)", collected_.size(), run_dir_.c_str(), total_ms);
 
-    if (total_truncated_count_ > 0 || total_dropped_record_count_ > 0 || total_overwrite_count_ > 0) {
+    uint32_t truncated = total_truncated_count_.load(std::memory_order_relaxed);
+    uint32_t dropped = total_dropped_record_count_.load(std::memory_order_relaxed);
+    uint32_t overwritten = total_overwrite_count_.load(std::memory_order_relaxed);
+    if (truncated > 0 || dropped > 0 || overwritten > 0) {
         LOG_WARN(
-            "Args dump anomalies: truncated=%u, dropped_records=%u, overwritten=%u", total_truncated_count_,
-            total_dropped_record_count_, total_overwrite_count_
+            "Args dump anomalies: truncated=%u, dropped_records=%u, overwritten=%u", truncated, dropped, overwritten
         );
     }
 
     // Clear state so subsequent runs don't accumulate data from previous runs
     collected_.clear();
-    total_dropped_record_count_ = 0;
-    total_truncated_count_ = 0;
-    total_overwrite_count_ = 0;
+    collected_by_collector_.clear();
+    collector_counters_.clear();
+    collector_shards_merged_ = false;
+    total_metadata_collected_.store(0, std::memory_order_relaxed);
+    total_dropped_record_count_.store(0, std::memory_order_relaxed);
+    total_truncated_count_.store(0, std::memory_order_relaxed);
+    total_overwrite_count_.store(0, std::memory_order_relaxed);
     writer_started_ = false;
     for (auto &ai : arenas_) {
         ai.high_water = 0;
@@ -786,9 +861,13 @@ int ArgsDumpCollector::finalize(DumpUnregisterCallback unregister_cb, const Dump
     // Reset state
     num_dump_threads_ = 0;
     collected_.clear();
-    total_dropped_record_count_ = 0;
-    total_truncated_count_ = 0;
-    total_overwrite_count_ = 0;
+    collected_by_collector_.clear();
+    collector_counters_.clear();
+    collector_shards_merged_ = false;
+    total_metadata_collected_.store(0, std::memory_order_relaxed);
+    total_dropped_record_count_.store(0, std::memory_order_relaxed);
+    total_truncated_count_.store(0, std::memory_order_relaxed);
+    total_overwrite_count_.store(0, std::memory_order_relaxed);
     writer_started_ = false;
     clear_memory_context();
 
