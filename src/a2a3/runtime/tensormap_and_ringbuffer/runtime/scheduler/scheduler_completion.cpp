@@ -57,7 +57,7 @@ SlotTransition SchedulerContext::decide_slot_transition(
                 t.running_done = true;
                 t.running_freed = true;
             } else if (pending_gated) {
-                // Case 3.3: running FIN, pending is a SPECULATIVE GATED task. The
+                // Case 3.3: running FIN, pending is a EARLY-DISPATCH GATED task. The
                 // Case 3.1 "wait for the pending's ack" shortcut assumes the AICore
                 // immediately runs the pending task; a gated task instead spins on
                 // its doorbell and never acks until its producer completes — and
@@ -184,7 +184,7 @@ void SchedulerContext::complete_slot_task(
 #endif
 #if PTO2_PROFILING
         // Time Resolve (walk the consumer list, decrement each consumer's
-        // fanin, push the newly-ready ones, ring doorbells for speculative
+        // fanin, push the newly-ready ones, ring doorbells for early-dispatch
         // hits) so it renders as a child bar nested inside this iteration's
         // Complete bar. The 1 µs floor below filters out the ~88% of tasks
         // with 1-2 consumers (~500 ns Resolve) so only the long broadcast /
@@ -306,17 +306,17 @@ void SchedulerContext::check_running_cores_for_completion(
         int32_t core_id = tracker.get_core_id_by_offset(bit_pos);
         CoreExecState &core = core_exec_states_[core_id];
 
-        // Skip gated speculative cores. A STAGED task is parked on this core
+        // Skip gated early-dispatch cores. A STAGED task is parked on this core
         // waiting for its doorbell — it physically cannot ACK/FIN yet, so
         // reading its COND (MMIO, and the core is hot-spinning on its own SPR)
         // every poll is pure waste that drags out the completion phase. The
-        // doorbell (try_speculative_release) flips spec_state to DISPATCHED, at
+        // doorbell (try_early_dispatch_release) flips early_dispatch_state to DISPATCHED, at
         // which point the core becomes pollable again and its FIN is caught.
         // Cheap cacheable load; no MMIO. Pending slot is empty while gated.
         {
             PTO2TaskSlotState *rs = core.running_slot_state;
             if (rs != nullptr && rs->payload != nullptr &&
-                rs->payload->spec_state.load(std::memory_order_relaxed) == PTO2_SPEC_STAGING) {
+                rs->payload->early_dispatch_state.load(std::memory_order_relaxed) == PTO2_EARLY_DISPATCH_STAGING) {
                 continue;
             }
         }
@@ -339,13 +339,14 @@ void SchedulerContext::check_running_cores_for_completion(
         }
 #endif
 
-        // A pending task is "gated" when it is a speculative pre-stage still
+        // A pending task is "gated" when it is a early-dispatch pre-stage still
         // waiting on its doorbell (STAGED): it will not ack on the producer's FIN,
         // so the Case 3.1 wait-for-pending-ack shortcut would deadlock. Detect it
         // so decide_slot_transition completes the running FIN and promotes it.
         bool pending_gated =
             (core.pending_slot_state != nullptr && core.pending_slot_state->payload != nullptr &&
-             core.pending_slot_state->payload->spec_state.load(std::memory_order_relaxed) == PTO2_SPEC_STAGING);
+             core.pending_slot_state->payload->early_dispatch_state.load(std::memory_order_relaxed) ==
+                 PTO2_EARLY_DISPATCH_STAGING);
         SlotTransition t = decide_slot_transition(
             reg_task_id, reg_state, core.running_reg_task_id, core.pending_reg_task_id, pending_gated
         );

@@ -255,11 +255,16 @@ private:
         bool &entered_drain, bool &made_progress, bool &try_pushed
     );
 
-    // Speculative early-dispatch (Hook 1). After normal dispatch leaves idle
-    // cores spare, pre-stage the consumers of any RUNNING flagged producer onto
-    // those cores with not_ready=1 (gated). Touches no dependency state — the
-    // task is released by the doorbell at its normal ready-pop (Hook 2).
-    int32_t try_speculative_early_dispatch(int32_t thread_idx);
+    // Early-dispatch (Hook 1). Mirrors dispatch_ready_tasks: owns its
+    // own gating (off-PMU, this thread has a spare slot, and no normal ready work
+    // is queued) and sets made_progress / try_pushed when it stages, so the caller
+    // is a single unconditional call like normal dispatch. After normal dispatch
+    // leaves idle cores spare, pre-stage the consumers of any RUNNING flagged
+    // producer onto those cores with not_ready=1 (gated). Touches no dependency
+    // state — the task is released by the doorbell at its normal ready-pop (Hook 2).
+    int32_t try_early_dispatch(
+        int32_t thread_idx, CoreTracker &tracker, bool pmu_active, bool &made_progress, bool &try_pushed
+    );
 
     // Stage the already-claimed range [start, start+count) of consumer `c` onto
     // thread_idx's idle (RUNNING slot) then pending (gated-pending, promote-on-FIN)
@@ -271,6 +276,13 @@ private:
         int32_t thread_idx, PTO2TaskSlotState *c, PTO2ResourceShape shape, int32_t start, int32_t count,
         CoreTracker::BitStates &idle, CoreTracker::BitStates &pend
     );
+
+    // Early-dispatch analog of dispatch_shape: drain early_dispatch_queues[shape] and
+    // pre-stage claimed block ranges onto this thread's free cores of `shape` for the
+    // given phase (IDLE -> onto idle cores in the RUNNING slot; PENDING -> onto a
+    // running core's gated pending slot). Pop is sized to the shape's capacity exactly
+    // as dispatch_shape sizes normal dispatch. Returns the number of blocks staged.
+    int32_t early_dispatch_shape(int32_t thread_idx, PTO2ResourceShape shape, CoreTracker::DispatchPhase phase);
 
     // One pass of "Phase 4" in the resolve_and_dispatch loop: IDLE-stage dispatch
     // for MIX then (if no mix residual) AIC/AIV; then PENDING-stage dispatch with
@@ -302,6 +314,15 @@ private:
     // extra/missed AIC/AIV skip and self-corrects on the next loop iteration.
     bool has_residual_mix() const {
         return sched_->ready_queues[static_cast<int32_t>(PTO2ResourceShape::MIX)].size() > 0;
+    }
+
+    // Early-dispatch analog of has_residual_mix: true if MIX early-dispatch candidates
+    // remain queued. has_residual_mix reads the normal MIX ready queue, which is empty
+    // whenever the Phase-4b early pass runs (it is gated on all ready_queues being
+    // empty), so early-dispatch MIX priority needs its own residual check against
+    // early_dispatch_queues[MIX]. Same relaxed-size snapshot caveat as has_residual_mix.
+    bool has_residual_early_mix() const {
+        return sched_->early_dispatch_queues[static_cast<int32_t>(PTO2ResourceShape::MIX)].size() > 0;
     }
 
     // =========================================================================

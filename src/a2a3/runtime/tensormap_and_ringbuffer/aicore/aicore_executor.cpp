@@ -141,7 +141,7 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, in
             // `start_time - receive_time`.
             //
             // Common path (not_ready == 0): the new task_id is itself the ready
-            // signal, so receive_time is the true ready moment. Speculative path
+            // signal, so receive_time is the true ready moment. Early-dispatch path
             // (not_ready == 1): receive_time stays at pickup — before the
             // doorbell wait — so it precedes the producer's end_time; the host
             // folds it to start_time for those tasks (detected when receive
@@ -156,7 +156,7 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, in
             // Invalidate payload buffer (AICPU updates its content each dispatch)
             dcci(exec_payload, ENTIRE_DATA_CACHE);
 
-            // Speculative early-dispatch gate. A not-ready task was staged on
+            // Early-dispatch gate. A not-ready task was staged on
             // this core before its dependencies resolved; wait until AICPU rings
             // the doorbell (DATA_MAIN_BASE high 32 == task_id) before executing.
             // The ACK is deferred until AFTER the gate so the scheduler keeps the

@@ -215,7 +215,17 @@ public:
     // ~pending_occupied_ over all cores is exactly "has a free slot". Purely
     // local (no shared/atomic access) — used to skip early dispatch, and its
     // shared-queue pop, when this thread has no capacity at all.
-    bool has_any_free_slot() const { return ((~pending_occupied_) & (aic_mask_ | aiv_mask_)).has_value(); }
+    // BitStates of every core on this thread with a free slot to stage onto: a
+    // core is unavailable only when running AND its pending slot is occupied.
+    // Idle cores keep pending_occupied_ clear by invariant, so ~pending_occupied_
+    // over aic|aiv is exactly "has a free slot". Spans AIC+AIV, so its .count() is
+    // an upper bound on the early-dispatch drain's per-shape pop (never exceeds the
+    // thread's total free cores), and .has_value() is the has_any_free_slot()
+    // predicate that gates the Phase-4b early-dispatch pass. Purely local (no
+    // shared/atomic access).
+    BitStates get_free_slot_states() const { return (~pending_occupied_) & (aic_mask_ | aiv_mask_); }
+
+    bool has_any_free_slot() const { return get_free_slot_states().has_value(); }
 
     template <CoreType CT>
     int32_t get_running_count() const {

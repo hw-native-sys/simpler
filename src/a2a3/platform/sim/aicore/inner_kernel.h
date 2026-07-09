@@ -163,7 +163,7 @@ inline uint64_t read_reg(RegId reg) {
 }
 
 /**
- * Read the high 32 bits of DATA_MAIN_BASE (speculative-dispatch doorbell).
+ * Read the high 32 bits of DATA_MAIN_BASE (early-dispatch doorbell).
  * The high word lives one 32-bit slot above the dispatch token.
  */
 inline uint32_t read_dmb_high32() {

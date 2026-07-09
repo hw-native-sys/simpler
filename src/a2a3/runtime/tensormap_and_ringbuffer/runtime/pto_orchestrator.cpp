@@ -451,7 +451,7 @@ static bool prepare_task(
     out->slot_state->bind_buffers(out->payload, out->task);
 
     // prepare_task does NO payload writes: all payload content (tensors/scalars +
-    // early-dispatch spec fields) is initialized in PTO2TaskPayload::init, the
+    // early-dispatch fields) is initialized in PTO2TaskPayload::init, the
     // single payload-init point, which runs before the scheduler wiring push.
 
     // Fields already reset by advance_ring_pointers (eager reset after CONSUMED):
