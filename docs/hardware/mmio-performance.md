@@ -156,7 +156,7 @@ and the matching producer code in
 LOG_WARN lines like `[P12-A] ... per=5.29 ticks (~105 ns/LDR)` land in
 the AICPU device log at `~/ascend/log/debug/device-<id>/`. Each phase
 is gated by a `hammer_go` value so that the AICore-side handshake is
-explicit; the AICPU-side `scheduler_cold_path::handshake_all_cores` is
+explicit; the AICPU-side `scheduler_cold_path::handshake_partition` is
 the host of the test. Phase 10 and Phase 11 are kept under `#if 0`
 because they hang the chip on entry — see
 `docs/investigations/2026-06-aicore-mmio-to-spr.md` for the verdict.

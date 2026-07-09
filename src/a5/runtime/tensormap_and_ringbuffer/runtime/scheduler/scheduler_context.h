@@ -52,14 +52,25 @@ public:
     // Lifecycle
     // =========================================================================
 
-    // Initialize scheduler state from the given runtime and thread layout.
-    // - Discovers cores via handshake_all_cores()
-    // - Assigns cores to scheduler threads
-    // - Resets task counters, payloads, per-core GlobalContext
-    // - Binds func_id_to_addr_ / initial sched_ (if rt is already known)
-    // - Captures AICore-register base (consumed by handshake_all_cores())
-    // Returns 0 on success, negative on failure (handshake / assignment error).
-    int32_t init(Runtime *runtime, int32_t aicpu_thread_num, int32_t sched_thread_num, uint64_t regs_base);
+    // Initialize scheduler state from the given runtime and thread layout. Split
+    // into three parts so the per-core AICore handshake — a serial, MMIO-bound
+    // loop that dominates preamble (~217 µs of ~283 µs for 72 cores) — can run in
+    // parallel across all AICPU threads. Orchestrated by AicpuExecutor::init:
+    // the leader runs pre_handshake_init, every thread handshakes a disjoint
+    // slice of cores via handshake_partition, then the leader runs
+    // post_handshake_init after a barrier.
+    //
+    // Leader-only: per-core state + config + swimlane buffers + core count. Must
+    // be published before any thread enters handshake_partition. Returns 0 on
+    // success, negative on failure.
+    int32_t
+    pre_handshake_init(Runtime *runtime, int32_t aicpu_thread_num, int32_t sched_thread_num, uint64_t regs_base);
+    // All threads: handshake this thread's contiguous slice [lo, hi) of cores
+    // (partitioned by tidx/nthreads). Each core is touched by exactly one thread.
+    void handshake_partition(Runtime *runtime, int32_t tidx, int32_t nthreads);
+    // Leader-only, after the handshake barrier: build worker-id lists, assign
+    // cores, init profiling subsystems, read task counts, init payloads.
+    int32_t post_handshake_init(Runtime *runtime);
 
     // Reset all SchedulerContext-owned state to its post-construction defaults.
     // Called by AicpuExecutor::deinit() during per-run teardown.
@@ -155,11 +166,15 @@ private:
     int32_t aicpu_thread_num_{0};
     int32_t cores_total_num_{0};
 
-    // Cluster-ordered worker_id lists, populated by handshake_all_cores().
+    // Cluster-ordered worker_id lists, populated by post_handshake_init().
     int32_t aic_worker_ids_[RUNTIME_MAX_WORKER]{};
     int32_t aiv_worker_ids_[RUNTIME_MAX_WORKER]{};
     int32_t aic_count_{0};
     int32_t aiv_count_{0};
+
+    // Set by any thread whose slice hits an invalid physical_core_id in
+    // handshake_partition; checked by the leader in post_handshake_init.
+    std::atomic<bool> handshake_failed_{false};
 
 #if PTO2_PROFILING
     // Physical core ids keyed by logical worker id. Populated by
@@ -176,9 +191,6 @@ private:
     // =========================================================================
     // Core management (scheduler_cold_path.cpp)
     // =========================================================================
-
-    // Handshake with all AICore workers; populates core_exec_states_, worker id lists.
-    int32_t handshake_all_cores(Runtime *runtime);
 
     // Assign discovered cores (cluster = 1 AIC + 2 AIV) round-robin across scheduler threads.
     bool assign_cores_to_threads();

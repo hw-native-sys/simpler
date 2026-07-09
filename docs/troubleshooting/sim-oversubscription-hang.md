@@ -51,7 +51,7 @@ Under that pressure two HW-correct patterns misbehave:
 
 - **Init handshake (livelock).** `SchedulerContext::handshake_all_cores` and
   `aicore_execute` synchronize startup with **bare busy-spins**
-  (`while (hank->aicore_done == 0) {}`, `while (my_hank->aicpu_regs_ready == 0) {}`).
+  (`while (hank->aicore_done == 0) {}`, `while (read_reg(RegId::DATA_MAIN_BASE) == 0) {}`).
   With no yield, the spinning threads monopolize the CPUs and starve the very
   threads they wait on, so the handshake never completes. A `gdb` snapshot of a
   wedged chip subprocess (8× `domain_rank_map` on 2 CPUs) showed the AICPU stuck

@@ -71,24 +71,29 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, in
         SPIN_WAIT_HINT();
     }
 
-    // Phase 2: Report physical core ID, signal ready
+    // Phase 2: Report physical core ID + core type and signal done in one write.
+    // The AICPU opens this core's register window (platform_init_aicore_regs:
+    // FAST_PATH + DATA_MAIN_BASE=IDLE) only after it observes aicore_done, so a
+    // single report suffices — there is no separate aicpu_regs_ready round-trip.
     my_hank->physical_core_id = get_physical_core_id();
-    OUT_OF_ORDER_STORE_BARRIER();
-    my_hank->aicore_regs_ready = 1;
-    dcci(&my_hank->aicore_regs_ready, SINGLE_CACHE_LINE, CACHELINE_OUT);
-    while (my_hank->aicpu_regs_ready == 0) {
-        dcci(&my_hank->aicpu_regs_ready, SINGLE_CACHE_LINE);
-        SPIN_WAIT_HINT();
-    }
-    // Report initial idle status via register
-    write_reg(RegId::COND, AICORE_IDLE_VALUE);
-
-    // Phase 3: Report core type, signal ready
     my_hank->core_type = core_type;
     OUT_OF_ORDER_STORE_BARRIER();
     my_hank->aicore_done = s_block_idx + 1;  // Signal ready (use s_block_idx + 1 to avoid 0)
-
     dcci(my_hank, SINGLE_CACHE_LINE, CACHELINE_OUT);
+
+    // Phase 3: Wait for the AICPU to open our register window. A kernel launch
+    // resets DATA_MAIN_BASE to 0 (verified on a2a3 silicon; a5 shares this
+    // register protocol and relies on CI); the AICPU writes DATA_MAIN_BASE =
+    // AICPU_IDLE_TASK_ID (non-zero) as it opens FAST_PATH, so a non-zero read
+    // means the window is open and reads/writes are valid. The AICPU runs
+    // assign_cores_to_threads (µs) between opening the window and the first
+    // dispatch, so this IDLE is observed long before any task_id lands — the
+    // poll cannot miss it and mistake a later task for the reset value.
+    while (read_reg(RegId::DATA_MAIN_BASE) == 0) {
+        SPIN_WAIT_HINT();
+    }
+    // Report initial idle status via register (FAST_PATH is now open).
+    write_reg(RegId::COND, AICORE_IDLE_VALUE);
 
     // Cache per-core dispatch payload pointer (set by AICPU before aicpu_ready)
     __gm__ PTO2DispatchPayload *payload = reinterpret_cast<__gm__ PTO2DispatchPayload *>(my_hank->task);

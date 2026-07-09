@@ -189,20 +189,20 @@ PR #537 reached the point where all the routing was correct: CANN
 dispatched the `Dyn*` exports to the cust subprocess, the inner
 `libsimpler_aicpu_<runtime>.so` was dlopen'd, all three phases
 (Null / Init / Run) entered our code, and
-`SchedulerContext::handshake_all_cores` step 1 successfully wrote
+`SchedulerContext::handshake_partition` step 1 successfully wrote
 `complete=1` to all 9 cores' `Handshake` slots in HBM. **The host's D2H
 readback confirmed the AICPU's writes landed in HBM**, AICore picked
-them up, ran past its phase 1, and wrote `aicore_regs_ready=1` back
-into the same `Handshake` slots.
+them up, ran past its phase 1, and wrote its report (`aicore_done` +
+`physical_core_id` + `core_type`) back into the same `Handshake` slots.
 
-Step 2 of `handshake_all_cores` is then a spin-wait:
+Step 2 of `handshake_partition` is then a spin-wait:
 
 ```cpp
 // src/{arch}/runtime/tensormap_and_ringbuffer/runtime/scheduler/scheduler_cold_path.cpp
-while (hank->aicore_regs_ready == 0) {}   // ← cust AICPU stuck here forever
+while (hank->aicore_done == 0) {}   // ← cust AICPU stuck here forever
 ```
 
-The cust AICPU's L1 cache holds a stale `0` for `aicore_regs_ready`.
+The cust AICPU's L1 cache holds a stale `0` for `aicore_done`.
 HBM has `1`, the host's D2H readback sees `1`, but the cust AICPU never
 observes the change. After 2 s,
 `aclrtSynchronizeStreamWithTimeout(stream_aicpu_)` reports
@@ -228,7 +228,7 @@ saves a future session from running the same experiment.
 | ------- | ------ | ------------------- |
 | `volatile uint32_t` field qualifier | No effect | Prevents the compiler from caching the value in a register / reusing it across statements. The CPU still reads from L1 (or whatever level holds the stale line). Cache coherency is an architectural issue below the C abstract machine. |
 | `__atomic_load_n(..., __ATOMIC_ACQUIRE)` (compiles to `ldar`) | No effect | `ldar` is an ordering instruction — it orders this load with respect to later loads/stores. It does **not** force a coherent reload from memory or invalidate the L1 line. |
-| `dc civac` (clean + invalidate by VA to Point of Coherency) in spin loop | Worse — corrupts AICore data | The same cache line holds AICPU-written fields (`aicpu_ready`, `task`) and the AICore-written field (`aicore_regs_ready`). `civac` writes back the AICPU's dirty stale view of the line, **clobbering AICore's HBM writes** for the AICPU-owned fields. |
+| `dc civac` (clean + invalidate by VA to Point of Coherency) in spin loop | Worse — corrupts AICore data | The same cache line holds AICPU-written fields (`aicpu_ready`, `task`) and the AICore-written field (`aicore_done`). `civac` writes back the AICPU's dirty stale view of the line, **clobbering AICore's HBM writes** for the AICPU-owned fields. |
 | `dc ivac` (invalidate-only by VA to Point of Coherency) in spin loop | Silently NOP'd | EL0 access to `dc ivac` is gated by `SCTLR_EL1.UCI`. The Linux kernel inside the cust subprocess has `UCI=0`, so the instruction traps and the kernel handler silently turns it into a NOP rather than emulating it. From userspace it looks like the instruction ran with no effect. |
 
 The fix has to live somewhere with the privilege to either change the
