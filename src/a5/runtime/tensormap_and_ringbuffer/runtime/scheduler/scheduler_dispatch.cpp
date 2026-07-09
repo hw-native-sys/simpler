@@ -211,21 +211,24 @@ void SchedulerContext::dispatch_mix_block_to_cluster(
     CoreTracker &tracker = core_trackers_[thread_idx];
     uint8_t cmask = slot_state.active_mask.core_mask();
     if (cmask & PTO2_SUBTASK_MASK_AIC) {
+        bool aic_to_pending = to_pending && !tracker.is_aic_core_idle(cluster_offset);
         dispatch_subtask_to_core(
             runtime, thread_idx, tracker.get_aic_core_offset(cluster_offset), slot_state, PTO2SubtaskSlot::AIC,
-            to_pending, block_idx
+            aic_to_pending, block_idx
         );
     }
     if (cmask & PTO2_SUBTASK_MASK_AIV0) {
+        bool aiv0_to_pending = to_pending && !tracker.is_aiv0_core_idle(cluster_offset);
         dispatch_subtask_to_core(
             runtime, thread_idx, tracker.get_aiv0_core_offset(cluster_offset), slot_state, PTO2SubtaskSlot::AIV0,
-            to_pending, block_idx
+            aiv0_to_pending, block_idx
         );
     }
     if (cmask & PTO2_SUBTASK_MASK_AIV1) {
+        bool aiv1_to_pending = to_pending && !tracker.is_aiv1_core_idle(cluster_offset);
         dispatch_subtask_to_core(
             runtime, thread_idx, tracker.get_aiv1_core_offset(cluster_offset), slot_state, PTO2SubtaskSlot::AIV1,
-            to_pending, block_idx
+            aiv1_to_pending, block_idx
         );
     }
 }

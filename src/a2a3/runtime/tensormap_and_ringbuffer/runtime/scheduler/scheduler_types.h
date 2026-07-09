@@ -324,9 +324,14 @@ public:
     // Runtime MIX dispatch uses classify_mix_cluster() so the decision follows the task's active_mask.
     enum class MixPlacement : uint8_t { RUNNING, PENDING, REJECT };
 
-    // A MIX block must place all cores named by active_mask the same way:
-    // all idle means running placement, all running means pending placement,
-    // and any mixed state is retried later.
+    // Placement for the cores named by active_mask, ignoring cores this task does
+    // not use. All used cores idle -> RUNNING placement (each to its running slot).
+    // Otherwise -> PENDING placement: at dispatch each used core is filled per its
+    // own state -- an idle core takes its running slot (and is marked running, so
+    // the completion poller, which scans only running cores, tracks its FIN), an
+    // already-running core takes its pending slot and executes after its in-flight
+    // task. REJECT only when a used core's pending slot is already occupied (no free
+    // slot) or the mask is empty.
     MixPlacement classify_mix_cluster(int32_t cluster_offset, uint8_t core_mask) const {
         BitStates used(0ULL);
         if (core_mask & PTO2_SUBTASK_MASK_AIC) {
@@ -346,10 +351,7 @@ public:
         if (idle.count() == used.count()) {
             return MixPlacement::RUNNING;
         }
-        if (!idle.has_value()) {
-            return MixPlacement::PENDING;
-        }
-        return MixPlacement::REJECT;
+        return MixPlacement::PENDING;
     }
 
     BitStates get_mix_running_cluster_offset_states(uint8_t core_mask) const {

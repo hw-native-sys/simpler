@@ -235,21 +235,21 @@ int SchedulerContext::prepare_block_for_dispatch(
         uint8_t cmask = slot_state.active_mask.core_mask();
         int n = 0;
         if (cmask & PTO2_SUBTASK_MASK_AIC) {
+            bool p = to_pending && !tracker.is_aic_core_idle(core_offset);
             out_handles[n++] = prepare_subtask_to_core(
-                thread_idx, tracker.get_aic_core_offset(core_offset), slot_state, PTO2SubtaskSlot::AIC, to_pending,
-                block_idx
+                thread_idx, tracker.get_aic_core_offset(core_offset), slot_state, PTO2SubtaskSlot::AIC, p, block_idx
             );
         }
         if (cmask & PTO2_SUBTASK_MASK_AIV0) {
+            bool p = to_pending && !tracker.is_aiv0_core_idle(core_offset);
             out_handles[n++] = prepare_subtask_to_core(
-                thread_idx, tracker.get_aiv0_core_offset(core_offset), slot_state, PTO2SubtaskSlot::AIV0, to_pending,
-                block_idx
+                thread_idx, tracker.get_aiv0_core_offset(core_offset), slot_state, PTO2SubtaskSlot::AIV0, p, block_idx
             );
         }
         if (cmask & PTO2_SUBTASK_MASK_AIV1) {
+            bool p = to_pending && !tracker.is_aiv1_core_idle(core_offset);
             out_handles[n++] = prepare_subtask_to_core(
-                thread_idx, tracker.get_aiv1_core_offset(core_offset), slot_state, PTO2SubtaskSlot::AIV1, to_pending,
-                block_idx
+                thread_idx, tracker.get_aiv1_core_offset(core_offset), slot_state, PTO2SubtaskSlot::AIV1, p, block_idx
             );
         }
 #if PTO2_PROFILING
