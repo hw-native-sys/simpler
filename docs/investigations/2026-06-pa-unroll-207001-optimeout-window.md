@@ -57,7 +57,7 @@ sizing/leak/OOM bug.
   device-side binary load inside `rtKernelLaunchWithHandleV2`
   (`Module::Load` = HBM `DevMemAlloc` + H2D `MemCopySync`).
 - **Spin poll-frequency is NOT the cause** (throttle experiment, inconclusive):
-  the handshake spin on `aicore_regs_ready` is a no-op `SPIN_WAIT_HINT()` =
+  the handshake spin on `aicore_done` is a no-op `SPIN_WAIT_HINT()` =
   a tight GM-hammer loop. Inserting a busy delay between polls gave a
   non-monotonic, within-noise result — median first-launch submit 1.46 s (no
   throttle) → 1.10 s (200k-iter delay) → 1.40 s (4M-iter delay), n=8 each with

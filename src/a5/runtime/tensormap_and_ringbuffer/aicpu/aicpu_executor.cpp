@@ -119,10 +119,19 @@ struct AicpuExecutor {
 
     // ===== Thread management state =====
     std::atomic<int32_t> thread_idx_{0};
-    std::atomic<bool> initialized_{false};
     std::atomic<bool> init_done_{false};
     std::atomic<bool> init_failed_{false};
     std::atomic<bool> finished_{false};
+
+    // Parallel-handshake coordination (see AicpuExecutor::init). hs_setup_done_
+    // is published by the leader once the shared pre-handshake setup is visible;
+    // hs_arrived_ is the barrier counting threads that finished their core slice.
+    // hs_thread_seq_ hands out a distinct [0, nthreads) index when the platform
+    // exposes no affinity idx (sim, where platform_aicpu_affinity_thread_idx()
+    // is -1 during init) so the threads don't all collapse to leader 0.
+    std::atomic<bool> hs_setup_done_{false};
+    std::atomic<int32_t> hs_arrived_{0};
+    std::atomic<int32_t> hs_thread_seq_{0};
 
     int32_t aicpu_thread_num_{0};
 
@@ -189,42 +198,88 @@ static_assert(
 // ===== AicpuExecutor Method Implementations =====
 
 int32_t AicpuExecutor::init(Runtime *runtime) {
-    bool expected = false;
-    if (!initialized_.compare_exchange_strong(expected, true, std::memory_order_acq_rel, std::memory_order_acquire)) {
-        return 0;
-    }
-
-    LOG_INFO_V0("AicpuExecutor: Initializing");
-
     if (runtime == nullptr) {
         LOG_ERROR("runtime is nullptr");
         init_failed_.store(true, std::memory_order_release);
         return -1;
     }
 
-    // Read execution parameters from runtime. The 0 → 1 fixup runs before the
-    // sched_thread_num_ derivation so a zero input doesn't leave the scheduler
-    // count at -1.
-    aicpu_thread_num_ = runtime->dev.aicpu_thread_num;
-    if (aicpu_thread_num_ == 0) aicpu_thread_num_ = 1;
-    sched_thread_num_ = aicpu_thread_num_ - 1;
-    serial_orch_sched_ = runtime->dev.serial_orch_sched;
-
-    if (aicpu_thread_num_ < 1 || aicpu_thread_num_ > MAX_AICPU_THREADS) {
-        LOG_ERROR("Invalid aicpu_thread_num: %d", aicpu_thread_num_);
+    // All AICPU threads enter init. The per-core AICore handshake is the
+    // dominant preamble cost (serial MMIO, ~217 µs of ~283 µs for 72 cores), so
+    // it is parallelized: the leader (tidx 0) does the shared setup, every
+    // thread handshakes a disjoint slice of cores, then the leader finishes init
+    // after a barrier. Non-leaders spin on init_done_.
+    int32_t nthreads = runtime->dev.aicpu_thread_num;
+    if (nthreads == 0) nthreads = 1;
+    if (nthreads < 1 || nthreads > MAX_AICPU_THREADS) {
+        LOG_ERROR("Invalid aicpu_thread_num: %d", nthreads);
         init_failed_.store(true, std::memory_order_release);
         return -1;
     }
-
-    if (sched_ctx_.init(runtime, aicpu_thread_num_, sched_thread_num_, get_platform_regs()) != 0) {
-        init_failed_.store(true, std::memory_order_release);
+    // Each thread needs a distinct index in [0, nthreads) to pick the leader and
+    // partition the cores. Onboard the gate filter assigns it (exec_idx); sim's
+    // gate does not, so platform_aicpu_affinity_thread_idx() is -1 here for every
+    // thread — hand those a distinct index from a counter (mirrors run()'s
+    // thread_idx_++ fallback) instead of collapsing them all to leader 0, which
+    // would run pre_/post_handshake_init on every thread and race the shared
+    // scheduler state. Exactly nthreads threads reach init (the gate drops the
+    // rest), so the counter yields a gap-free [0, nthreads).
+    int32_t tidx = platform_aicpu_affinity_thread_idx();
+    if (tidx < 0) tidx = hs_thread_seq_.fetch_add(1, std::memory_order_acq_rel);
+    // A thread whose index still falls outside [0, nthreads) owns no core slice:
+    // handshake_partition would compute lo/hi past cores_total_num_ and index
+    // all_handshakes[]/core_exec_states_ out of bounds. Reject it here (mirrors
+    // the bounds guard already in run()). Fail only this thread and do NOT set
+    // init_failed_ — that would make the valid peers abort before their
+    // hs_arrived_ increment and hang the leader at the barrier below.
+    if (tidx >= nthreads) {
+        LOG_ERROR("AICPU affinity thread idx %d out of range [0,%d) in init", tidx, nthreads);
         return -1;
     }
+    const bool is_leader = (tidx == 0);
 
-    finished_count_.store(0, std::memory_order_release);
+    if (is_leader) {
+        LOG_INFO_V0("AicpuExecutor: Initializing");
+        // The 0 → 1 fixup already applied above; derive scheduler count from it.
+        aicpu_thread_num_ = nthreads;
+        sched_thread_num_ = nthreads - 1;
+        serial_orch_sched_ = runtime->dev.serial_orch_sched;
 
-    init_done_.store(true, std::memory_order_release);
-    LOG_INFO_V0("AicpuExecutor: Init complete");
+        hs_arrived_.store(0, std::memory_order_relaxed);
+        if (sched_ctx_.pre_handshake_init(runtime, aicpu_thread_num_, sched_thread_num_, get_platform_regs()) != 0) {
+            init_failed_.store(true, std::memory_order_release);
+            hs_setup_done_.store(true, std::memory_order_release);
+            return -1;
+        }
+        hs_setup_done_.store(true, std::memory_order_release);
+    } else {
+        while (!hs_setup_done_.load(std::memory_order_acquire)) {
+            if (init_failed_.load(std::memory_order_acquire)) return -1;
+        }
+        if (init_failed_.load(std::memory_order_acquire)) return -1;
+    }
+
+    // All threads: handshake this thread's slice of cores in parallel.
+    sched_ctx_.handshake_partition(runtime, tidx, nthreads);
+
+    // Barrier: leader waits for every slice to finish, then completes init.
+    hs_arrived_.fetch_add(1, std::memory_order_acq_rel);
+    if (is_leader) {
+        while (hs_arrived_.load(std::memory_order_acquire) < nthreads) {}
+        finished_count_.store(0, std::memory_order_release);
+        if (sched_ctx_.post_handshake_init(runtime) != 0) {
+            init_failed_.store(true, std::memory_order_release);
+            init_done_.store(true, std::memory_order_release);
+            return -1;
+        }
+        init_done_.store(true, std::memory_order_release);
+        LOG_INFO_V0("AicpuExecutor: Init complete");
+    } else {
+        while (!init_done_.load(std::memory_order_acquire)) {
+            if (init_failed_.load(std::memory_order_acquire)) return -1;
+        }
+        if (init_failed_.load(std::memory_order_acquire)) return -1;
+    }
     return 0;
 }
 
@@ -803,9 +858,11 @@ void AicpuExecutor::deinit(Runtime * /*runtime*/) {
 
     LOG_INFO_V0("DeInit: Runtime execution state reset");
 
-    initialized_.store(false, std::memory_order_release);
     init_done_.store(false, std::memory_order_release);
     init_failed_.store(false, std::memory_order_release);
+    hs_setup_done_.store(false, std::memory_order_release);
+    hs_arrived_.store(0, std::memory_order_release);
+    hs_thread_seq_.store(0, std::memory_order_release);
     thread_idx_.store(0, std::memory_order_release);
     finished_.store(false, std::memory_order_release);
 
@@ -844,10 +901,11 @@ extern "C" __attribute__((visibility("default"))) int simpler_aicpu_register_cal
  *
  * This is called by DynTileFwkBackendKernelServer in kernel.cpp.
  * Orchestrates the complete task runtime execution:
- * 1. Initialize executor (thread-safe, first thread only)
- * 2. Wait for initialization to complete
- * 3. Execute tasks on managed cores
- * 4. Cleanup when last thread finishes
+ * 1. Initialize executor: all threads enter init(), which handshakes the cores
+ *    in parallel and barriers internally until init is complete (or a thread
+ *    failed); its return value is authoritative on every thread.
+ * 2. Execute tasks on managed cores
+ * 3. Cleanup when last thread finishes
  *
  * @param runtime Pointer to Runtime structure
  * @return 0 on success, non-zero on error
@@ -865,12 +923,12 @@ extern "C" int32_t aicpu_execute(Runtime *runtime) {
     // rc / runtime_rc are declared out here because they outlive their phase.
     {
         AicpuPhaseScope preamble(AicpuPhase::Preamble);
-        g_aicpu_executor.init(runtime);
-        while (!g_aicpu_executor.init_done_.load(std::memory_order_acquire)) {
-            if (g_aicpu_executor.init_failed_.load(std::memory_order_acquire)) {
-                LOG_ERROR("%s", "aicpu_execute: Initialization failed, aborting execution");
-                return -1;
-            }
+        // init() barriers every thread internally until init is complete on the
+        // leader (or a thread failed), then returns the status — so a non-zero
+        // return is authoritative on all threads and no extra spin is needed.
+        if (g_aicpu_executor.init(runtime) != 0) {
+            LOG_ERROR("%s", "aicpu_execute: Initialization failed, aborting execution");
+            return -1;
         }
     }
 

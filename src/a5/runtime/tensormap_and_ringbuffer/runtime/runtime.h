@@ -95,20 +95,18 @@ constexpr int RUNTIME_DEFAULT_READY_QUEUE_SHARDS = PLATFORM_MAX_AICPU_THREADS - 
  *
  * Field Access Patterns:
  * - aicpu_ready: Written by AICPU, read by AICore
- * - aicore_done: Written by AICore, read by AICPU
+ * - aicore_done: Written by AICore, read by AICPU (final report; physical_core_id
+ *   and core_type are published alongside it in the same write)
  * - task: Written by AICPU, read by AICore (Init: PTO2DispatchPayload*; runtime: unused)
- * - core_type: Written by AICPU, read by AICore (CoreType::AIC or CoreType::AIV)
- * - physical_core_id: Written by AICore (Phase 2), read by AICPU
- * - aicpu_regs_ready / aicore_regs_ready: handshake sequence flags
+ * - core_type: Written by AICore (with aicore_done), read by AICPU
+ * - physical_core_id: Written by AICore (with aicore_done), read by AICPU
  */
 struct Handshake {
-    volatile uint32_t aicpu_ready;        // AICPU ready signal: 0=not ready, 1=ready
-    volatile uint32_t aicore_done;        // AICore ready signal: 0=not ready, core_id+1=ready
-    volatile uint64_t task;               // Init: PTO2DispatchPayload* (set before aicpu_ready); runtime: unused
-    volatile CoreType core_type;          // Core type: CoreType::AIC or CoreType::AIV
-    volatile uint32_t physical_core_id;   // Physical core ID
-    volatile uint32_t aicpu_regs_ready;   // AICPU register init done: 0=pending, 1=done
-    volatile uint32_t aicore_regs_ready;  // AICore ID reported: 0=pending, 1=done
+    volatile uint32_t aicpu_ready;  // AICPU ready signal: 0=not ready, 1=ready
+    volatile uint32_t aicore_done;  // AICore ready signal: 0=not ready, core_id+1=ready
+    volatile uint64_t task;         // Init: PTO2DispatchPayload* (set before aicpu_ready); runtime: unused
+    volatile CoreType core_type;    // Core type: CoreType::AIC or CoreType::AIV (reported by AICore with aicore_done)
+    volatile uint32_t physical_core_id;  // Physical core ID (reported by AICore with aicore_done)
 } __attribute__((aligned(64)));
 
 enum class TensorReleaseKind {

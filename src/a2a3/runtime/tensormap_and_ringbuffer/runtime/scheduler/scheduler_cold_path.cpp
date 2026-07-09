@@ -672,9 +672,13 @@ int32_t SchedulerContext::shutdown(int32_t thread_idx) {
 // Handshake a contiguous slice of AICore workers. Runs on every AICPU thread in
 // parallel (partitioned by tidx/nthreads); the leader's pre_handshake_init has
 // already zeroed state, set cores_total_num_, and reset the counts/flag. The
-// serial per-core MMIO here is what dominates preamble, so splitting the slice
-// across threads is the whole point. Worker-id lists are built serially in
-// post_handshake_init (core-index order) once every slice has landed.
+// per-core work here — releasing the core, then opening its register window over
+// serial MMIO — is what dominates preamble, so splitting the slice across
+// threads is the whole point. Within a slice we still sweep (poll every
+// outstanding core per pass, service whichever reported) so one slow core's
+// wakeup overlaps its neighbours' instead of blocking them. Worker-id lists are
+// built serially in post_handshake_init (core-index order) once every slice has
+// landed, so the shared aic_count_/aiv_count_ are written by one thread only.
 // =============================================================================
 void SchedulerContext::handshake_partition(Runtime *runtime, int32_t tidx, int32_t nthreads) {
     Handshake *all_handshakes = reinterpret_cast<Handshake *>(runtime->dev.workers);
@@ -682,12 +686,16 @@ void SchedulerContext::handshake_partition(Runtime *runtime, int32_t tidx, int32
     const int32_t lo = static_cast<int32_t>((static_cast<int64_t>(tidx) * total) / nthreads);
     const int32_t hi = static_cast<int32_t>((static_cast<int64_t>(tidx + 1) * total) / nthreads);
 
-    // Step 1: Write per-core payload addresses and send handshake signal.
-    // OUT_OF_ORDER_STORE_BARRIER() ensures task is globally visible before
-    // aicpu_ready=1, so AICore reads the correct payload pointer after waking up.
+    // Step 1: publish this slice's payload pointers, then release its cores. One
+    // barrier (not one per core) suffices: it guarantees every task store is
+    // globally visible before any aicpu_ready store, which is the only ordering
+    // AICore relies on (it reads task only after observing aicpu_ready==1). Each
+    // core is written by exactly one thread, so the slices never overlap.
     for (int32_t i = lo; i < hi; i++) {
         all_handshakes[i].task = reinterpret_cast<uint64_t>(&payload_per_core_[i][0]);
-        OUT_OF_ORDER_STORE_BARRIER();
+    }
+    OUT_OF_ORDER_STORE_BARRIER();
+    for (int32_t i = lo; i < hi; i++) {
         all_handshakes[i].aicpu_ready = 1;
     }
     OUT_OF_ORDER_STORE_BARRIER();
@@ -695,53 +703,66 @@ void SchedulerContext::handshake_partition(Runtime *runtime, int32_t tidx, int32
     // Get platform physical cores count for validation
     uint32_t max_physical_cores_count = platform_get_physical_cores_count();
 
-    // Step 2: Wait for this slice's cores, init registers, collect state.
-    for (int32_t i = lo; i < hi; i++) {
-        Handshake *hank = &all_handshakes[i];
+    // Step 2: collect responses from this slice. Each core reports
+    // {physical_core_id, core_type, aicore_done} in one write, then waits — by
+    // polling its own DATA_MAIN_BASE SPR — for us to open its register window.
+    // We sweep the slice: poll every outstanding core per pass and service
+    // whichever have reported, rather than blocking on core i before looking at
+    // core i+1, so per-core wakeups overlap (≈ max, not Σ). aicore_done is a GM
+    // read (not the nGnRE MMIO reg window), so sweeping is not forced serial the
+    // way RegId::COND polling is.
+    //
+    // Servicing a core = validate its physical_core_id, then open its register
+    // window (platform_init_aicore_regs: FAST_PATH + DATA_MAIN_BASE=IDLE). That
+    // IDLE write is *also* the signal the core polls for to leave its
+    // post-report wait — so opening the window IS the acknowledgement. There is
+    // no separate aicpu_regs_ready ack and no second round-trip. AIC/AIV
+    // classification is deferred to post_handshake_init (serial) so aic_count_/
+    // aiv_count_ are never incremented from more than one thread.
+    uint64_t *regs = reinterpret_cast<uint64_t *>(regs_);
+    bool core_serviced[RUNTIME_MAX_WORKER] = {false};
 
-        while (hank->aicore_regs_ready == 0) {
-            SPIN_WAIT_HINT();
-        }
+    for (int32_t remaining = hi - lo; remaining > 0;) {
+        for (int32_t i = lo; i < hi; i++) {
+            if (core_serviced[i]) continue;
+            Handshake *hank = &all_handshakes[i];
+            if (hank->aicore_done == 0) {
+                SPIN_WAIT_HINT();
+                continue;
+            }
 
-        uint32_t physical_core_id = hank->physical_core_id;
+            uint32_t physical_core_id = hank->physical_core_id;
+            if (physical_core_id >= max_physical_cores_count) {
+                LOG_ERROR(
+                    "Core %d reported invalid physical_core_id=%u (platform max=%u)", i, physical_core_id,
+                    max_physical_cores_count
+                );
+                handshake_failed_.store(true, std::memory_order_release);
+                core_serviced[i] = true;
+                remaining--;
+                continue;
+            }
 
-        if (physical_core_id >= max_physical_cores_count) {
-            LOG_ERROR(
-                "Core %d reported invalid physical_core_id=%u (platform max=%u)", i, physical_core_id,
-                max_physical_cores_count
-            );
-            handshake_failed_.store(true, std::memory_order_release);
-            continue;
-        }
+            // Open the window; the IDLE write releases the core's DATA_MAIN_BASE poll.
+            uint64_t reg_addr = regs[physical_core_id];
+            platform_init_aicore_regs(reg_addr);
+            OUT_OF_ORDER_STORE_BARRIER();
 
-        uint64_t *regs = reinterpret_cast<uint64_t *>(regs_);
-        uint64_t reg_addr = regs[physical_core_id];
-
-        // Initialize AICore registers after discovery (first round)
-        platform_init_aicore_regs(reg_addr);
-        OUT_OF_ORDER_STORE_BARRIER();
-        hank->aicpu_regs_ready = 1;
-
-        OUT_OF_ORDER_STORE_BARRIER();
-
-        while (hank->aicore_done == 0) {
-            SPIN_WAIT_HINT();
-        }
-
-        core_exec_states_[i].reg_addr = reg_addr;
-        core_exec_states_[i].cond_ptr = get_reg_ptr(reg_addr, RegId::COND);
-
+            core_exec_states_[i].reg_addr = reg_addr;
+            core_exec_states_[i].cond_ptr = get_reg_ptr(reg_addr, RegId::COND);
 #if PTO2_PROFILING
-        // Record physical_core_id for PMU init later (CoreExecState has no room
-        // for this field under PTO2_PROFILING).
-        physical_core_ids_[i] = physical_core_id;
+            physical_core_ids_[i] = physical_core_id;
 #endif
 #if !PTO2_PROFILING
-        core_exec_states_[i].worker_id = i;
-        core_exec_states_[i].physical_core_id = physical_core_id;
-        core_exec_states_[i].core_type = hank->core_type;
+            core_exec_states_[i].worker_id = i;
+            core_exec_states_[i].physical_core_id = physical_core_id;
+            core_exec_states_[i].core_type = hank->core_type;
 #endif
+            core_serviced[i] = true;
+            remaining--;
+        }
     }
+    OUT_OF_ORDER_STORE_BARRIER();
 }
 
 // =============================================================================
@@ -813,13 +834,14 @@ bool SchedulerContext::assign_cores_to_threads() {
 // deinit their AICore register blocks. Idempotent.
 // =============================================================================
 void SchedulerContext::emergency_shutdown(Runtime *runtime) {
+    (void)runtime;  // exit is now delivered via each core's register block, not GM
     LOG_WARN("Emergency shutdown: sending exit signal to all initialized cores");
-    Handshake *all_handshakes = reinterpret_cast<Handshake *>(runtime->dev.workers);
     int32_t timeout_count = 0;
     for (int32_t i = 0; i < cores_total_num_; i++) {
-        Handshake *hank = &all_handshakes[i];
-        OUT_OF_ORDER_STORE_BARRIER();
-        hank->aicpu_regs_ready = 1;
+        // platform_deinit_aicore_regs writes DATA_MAIN_BASE=EXIT, which both
+        // releases a core still polling for its window to open and signals it to
+        // exit. Cores never opened (reg_addr==0) are reaped by the host device
+        // reset that follows a handshake failure.
         if (core_exec_states_[i].reg_addr != 0) {
             if (platform_deinit_aicore_regs(core_exec_states_[i].reg_addr) != 0) {
                 timeout_count++;
