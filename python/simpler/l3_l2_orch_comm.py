@@ -21,6 +21,29 @@ from typing import Any
 
 from _task_interface import _mailbox_load_i32, _mailbox_store_i32  # pyright: ignore[reportMissingImports]
 
+try:
+    from _task_interface import (  # pyright: ignore[reportMissingImports]
+        _l3_host_mapped_counter_notify,
+        _l3_host_mapped_counter_test,
+        _l3_host_mapped_counter_wait,
+        _l3_host_mapped_payload_read,
+        _l3_host_mapped_payload_write,
+        _l3_host_mapped_region_close,
+        _l3_host_mapped_region_import_sim,
+    )
+except ImportError:
+
+    def _missing_l3_host_helper(*_: Any) -> None:
+        raise RuntimeError("L3-L2 L3 Host mapped-region helpers are unavailable; rebuild _task_interface")
+
+    _l3_host_mapped_counter_notify = _missing_l3_host_helper
+    _l3_host_mapped_counter_test = _missing_l3_host_helper
+    _l3_host_mapped_counter_wait = _missing_l3_host_helper
+    _l3_host_mapped_payload_read = _missing_l3_host_helper
+    _l3_host_mapped_payload_write = _missing_l3_host_helper
+    _l3_host_mapped_region_close = _missing_l3_host_helper
+    _l3_host_mapped_region_import_sim = _missing_l3_host_helper
+
 
 class L3L2OrchCommCmd(IntEnum):
     ALLOC_REGION = 1
@@ -51,6 +74,12 @@ class _ServiceError(IntEnum):
     SIGNAL_TIMEOUT = 7
 
 
+class L3L2RegionAccessProfile(IntEnum):
+    INVALID = 0
+    ONBOARD_ACL_IPC = 1
+    SIM_POSIX_SHM = 2
+
+
 _STATE_IDLE = 0
 _STATE_READY = 1
 _STATE_DONE = 3
@@ -68,6 +97,49 @@ _CONTROL_OFF_RESPONSE = _CONTROL_OFF_REQUEST + _REQUEST.size
 CONTROL_BLOCK_SIZE = _CONTROL_OFF_RESPONSE + _RESPONSE.size
 CONTROL_SHM_SIZE = max(4096, CONTROL_BLOCK_SIZE)
 L3L2_ORCH_REGION_DESC_SCALAR_COUNT = 6
+ACL_IPC_EXPORT_KEY_BYTES = 65
+CTRL_SHM_TOKEN_BYTES = 32
+_REGION_CREATE_REQUEST = struct.Struct("<QQQQi4x")
+_REGION_CREATE_REPLY = struct.Struct(f"<6QIIi{ACL_IPC_EXPORT_KEY_BYTES}s{CTRL_SHM_TOKEN_BYTES}s3xQ")
+REGION_CREATE_REQUEST_BYTES = _REGION_CREATE_REQUEST.size
+REGION_CREATE_REPLY_BYTES = _REGION_CREATE_REPLY.size
+_REGION_LAYOUT_ALIGNMENT = 64
+_UINT64_MAX = (1 << 64) - 1
+
+
+def _align_up(value: int, align: int) -> int:
+    value = int(value)
+    if value < 0 or value > _UINT64_MAX:
+        raise ValueError("L3-L2 region layout overflowed uint64")
+    remainder = value % align
+    bump = 0 if remainder == 0 else align - remainder
+    result = value + bump
+    if result > _UINT64_MAX:
+        raise ValueError("L3-L2 region layout overflowed uint64")
+    return result
+
+
+def _checked_add_u64(lhs: int, rhs: int) -> int:
+    result = int(lhs) + int(rhs)
+    if int(lhs) < 0 or int(rhs) < 0 or result > _UINT64_MAX:
+        raise ValueError("L3-L2 region layout overflowed uint64")
+    return result
+
+
+def _compare_counter(observed: int, operand: int, cmp: WaitCmp) -> bool:
+    if cmp == WaitCmp.EQ:
+        return observed == operand
+    if cmp == WaitCmp.NE:
+        return observed != operand
+    if cmp == WaitCmp.GT:
+        return observed > operand
+    if cmp == WaitCmp.GE:
+        return observed >= operand
+    if cmp == WaitCmp.LT:
+        return observed < operand
+    if cmp == WaitCmp.LE:
+        return observed <= operand
+    return False
 
 
 @dataclass(frozen=True)
@@ -119,6 +191,91 @@ class L3L2OrchCommResponse:
     matched: bool
     desc: L3L2OrchRegionDesc | None
     message: str
+
+
+@dataclass(frozen=True)
+class L3L2RegionCreateRequest:
+    magic_version: int
+    request_bytes: int
+    payload_bytes: int
+    counter_bytes: int
+    l3_host_pid: int
+
+    def encode_into(self, buf: memoryview, offset: int = 0) -> None:
+        _REGION_CREATE_REQUEST.pack_into(
+            buf,
+            offset,
+            int(self.magic_version),
+            int(self.request_bytes),
+            int(self.payload_bytes),
+            int(self.counter_bytes),
+            int(self.l3_host_pid),
+        )
+
+
+@dataclass(frozen=True)
+class L3L2RegionCreateReply:
+    desc: L3L2OrchRegionDesc
+    access_profile: L3L2RegionAccessProfile
+    device_id: int
+    export_key: bytes
+    backing_shm: str
+    mapping_bytes: int
+
+
+@dataclass
+class L3HostRegionMapping:
+    worker_id: int
+    region_id: int
+    access_profile: L3L2RegionAccessProfile
+    total_bytes: int
+    payload_offset: int
+    payload_bytes: int
+    counter_offset: int
+    counter_bytes: int
+    handle: int
+    closed: bool = False
+
+    def close(self) -> None:
+        if self.closed:
+            return
+        _l3_host_mapped_region_close(int(self.handle))
+        self.closed = True
+
+
+def decode_region_create_reply(buf: memoryview) -> L3L2RegionCreateReply:
+    fields = _REGION_CREATE_REPLY.unpack_from(buf, 0)
+    desc = L3L2OrchRegionDesc(*[int(v) for v in fields[:6]])
+    access_profile = L3L2RegionAccessProfile(int(fields[6]))
+    device_id = int(fields[8])
+    export_key = bytes(fields[9]).split(b"\x00", 1)[0]
+    backing_shm = bytes(fields[10]).split(b"\x00", 1)[0].decode("utf-8", "strict")
+    return L3L2RegionCreateReply(
+        desc=desc,
+        access_profile=access_profile,
+        device_id=device_id,
+        export_key=export_key,
+        backing_shm=backing_shm,
+        mapping_bytes=int(fields[11]),
+    )
+
+
+def validate_region_create_reply(reply: L3L2RegionCreateReply) -> tuple[int, int]:
+    desc = reply.desc
+    if desc.payload_bytes <= 0:
+        raise RuntimeError("create_l3_l2_region: reply payload_bytes must be positive")
+    if desc.counter_bytes <= 0 or desc.counter_bytes % 4 != 0:
+        raise RuntimeError("create_l3_l2_region: reply counter_bytes must be positive and a multiple of 4")
+    counter_offset = _align_up(desc.payload_bytes, _REGION_LAYOUT_ALIGNMENT)
+    total_bytes = _checked_add_u64(counter_offset, desc.counter_bytes)
+    expected_counter_base = _checked_add_u64(desc.payload_base, counter_offset)
+    if desc.counter_base != expected_counter_base:
+        raise RuntimeError("create_l3_l2_region: reply counter_base does not match fixed region layout")
+    if desc.counter_base % _REGION_LAYOUT_ALIGNMENT != 0:
+        raise RuntimeError("create_l3_l2_region: reply counter_base must be 64-byte aligned")
+    if reply.access_profile == L3L2RegionAccessProfile.SIM_POSIX_SHM and reply.mapping_bytes != total_bytes:
+        raise RuntimeError("create_l3_l2_region: sim reply mapping_bytes does not match descriptor layout")
+    return counter_offset, total_bytes
 
 
 class L3L2OrchCommClient:
@@ -189,14 +346,46 @@ class L3L2OrchCommClient:
 
 
 class _PinnedBuffer:
-    def __init__(self, obj: Any, owner: Any) -> None:
+    def __init__(self, obj: Any, owner: Any, *, writable: bool = False, has_l3_host_mapping: bool = False) -> None:
         from .task_interface import Tensor  # noqa: PLC0415
 
-        if not isinstance(obj, Tensor):
+        self._keepalive: Any = obj
+        if isinstance(obj, Tensor):
+            if has_l3_host_mapping:
+                if obj.child_memory:
+                    raise ValueError("L3-L2 payload buffer must be host storage, not child_memory device storage")
+                if not obj.is_contiguous:
+                    raise ValueError("L3-L2 payload buffer must be contiguous")
+            else:
+                owner._validate_l3_l2_orch_comm_host_buffer(obj)
+            self.addr = int(obj.data)
+            self.nbytes = int(obj.nbytes())
+            return
+
+        if not has_l3_host_mapping:
             raise ValueError("L3-L2 payload buffer must be a Tensor returned by orch.alloc(...)")
-        owner._validate_l3_l2_orch_comm_host_buffer(obj)
-        self.addr = int(obj.data)
-        self.nbytes = int(obj.nbytes())
+
+        try:
+            view = memoryview(obj)
+        except TypeError as exc:
+            raise ValueError("L3-L2 payload buffer must be a contiguous L3 Host-accessible byte span") from exc
+        if not view.c_contiguous:
+            raise ValueError("L3-L2 payload buffer must be contiguous")
+        try:
+            byte_view = view if view.itemsize == 1 and view.format in {"B", "b", "c"} else view.cast("B")
+        except (TypeError, ValueError) as exc:
+            raise ValueError("L3-L2 payload buffer must be viewable as bytes") from exc
+        if writable and byte_view.readonly:
+            raise ValueError("L3-L2 payload read destination must be writable")
+        self.nbytes = int(byte_view.nbytes)
+        if byte_view.readonly:
+            staging = ctypes.create_string_buffer(byte_view.tobytes())
+            self._keepalive = staging
+            self.addr = ctypes.addressof(staging)
+            return
+        exported = ctypes.c_char.from_buffer(byte_view)
+        self._keepalive = (byte_view, exported)
+        self.addr = ctypes.addressof(exported)
 
     def close(self) -> None:
         return None
@@ -224,6 +413,9 @@ class L3L2OrchCounter:
     def notify(self, value: int, op: NotifyOp = NotifyOp.Set) -> None:
         self._region._ensure_live()
         op = NotifyOp(op)
+        if self._region._l3_host_mapping is not None:
+            self._region._direct_counter_notify(self._offset, int(value), op)
+            return
         self._region._submit(
             L3L2OrchCommRequest(
                 cmd=L3L2OrchCommCmd.SIGNAL_NOTIFY,
@@ -237,6 +429,8 @@ class L3L2OrchCounter:
     def test(self, cmp_value: int, cmp: WaitCmp) -> SignalTestResult:
         self._region._ensure_live()
         cmp = WaitCmp(cmp)
+        if self._region._l3_host_mapping is not None:
+            return self._region._direct_counter_test(self._offset, int(cmp_value), cmp)
         response = self._region._submit(
             L3L2OrchCommRequest(
                 cmd=L3L2OrchCommCmd.SIGNAL_TEST,
@@ -255,6 +449,8 @@ class L3L2OrchCounter:
             raise ValueError("L3-L2 counter wait requires a positive timeout")
         timeout_s = float(timeout)
         timeout_ns = min(int(timeout_s * 1_000_000_000), _MAX_SIGNED_CHRONO_TIMEOUT_NS)
+        if self._region._l3_host_mapping is not None:
+            return self._region._direct_counter_wait(self._offset, int(cmp_value), cmp, timeout_ns)
         response = self._region._submit(
             L3L2OrchCommRequest(
                 cmd=L3L2OrchCommCmd.SIGNAL_WAIT,
@@ -277,10 +473,17 @@ class L3L2OrchCounter:
 
 
 class L3L2OrchRegion:
-    def __init__(self, owner: Any, worker_id: int, desc: L3L2OrchRegionDesc) -> None:
+    def __init__(
+        self,
+        owner: Any,
+        worker_id: int,
+        desc: L3L2OrchRegionDesc,
+        l3_host_mapping: L3HostRegionMapping | None = None,
+    ) -> None:
         self._owner = owner
         self._worker_id = int(worker_id)
         self._descriptor = desc
+        self._l3_host_mapping = l3_host_mapping
         self._released = False
         self._poisoned = False
         self._expired = False
@@ -299,9 +502,17 @@ class L3L2OrchRegion:
 
     def payload_write(self, offset: int, host_buffer: Any, nbytes: int | None = None) -> None:
         self._ensure_live()
-        with _PinnedBuffer(host_buffer, self._owner) as pinned:
+        has_l3_host_mapping = self._l3_host_mapping is not None
+        with _PinnedBuffer(host_buffer, self._owner, has_l3_host_mapping=has_l3_host_mapping) as pinned:
             size = pinned.nbytes if nbytes is None else int(nbytes)
             self._validate_payload_range(offset, size, pinned.nbytes)
+            if has_l3_host_mapping:
+                try:
+                    _l3_host_mapped_payload_write(self._l3_host_mapping.handle, int(offset), pinned.addr, size)
+                except Exception:
+                    self._poison()
+                    raise
+                return
             self._submit(
                 L3L2OrchCommRequest(
                     cmd=L3L2OrchCommCmd.PAYLOAD_WRITE,
@@ -314,9 +525,17 @@ class L3L2OrchRegion:
 
     def payload_read(self, offset: int, host_buffer: Any, nbytes: int | None = None) -> None:
         self._ensure_live()
-        with _PinnedBuffer(host_buffer, self._owner) as pinned:
+        has_l3_host_mapping = self._l3_host_mapping is not None
+        with _PinnedBuffer(host_buffer, self._owner, writable=True, has_l3_host_mapping=has_l3_host_mapping) as pinned:
             size = pinned.nbytes if nbytes is None else int(nbytes)
             self._validate_payload_range(offset, size, pinned.nbytes)
+            if has_l3_host_mapping:
+                try:
+                    _l3_host_mapped_payload_read(self._l3_host_mapping.handle, int(offset), pinned.addr, size)
+                except Exception:
+                    self._poison()
+                    raise
+                return
             self._submit(
                 L3L2OrchCommRequest(
                     cmd=L3L2OrchCommCmd.PAYLOAD_READ,
@@ -364,6 +583,54 @@ class L3L2OrchRegion:
         payload_bytes = int(self._descriptor.payload_bytes)
         if offset + nbytes > payload_bytes:
             raise ValueError(f"L3-L2 payload range [{offset}, {offset + nbytes}) exceeds region size {payload_bytes}")
+
+    def _close_l3_host_mapping(self) -> None:
+        if self._l3_host_mapping is None:
+            return
+        try:
+            self._l3_host_mapping.close()
+        except Exception:
+            self._poison()
+            raise
+
+    def _direct_counter_notify(self, offset: int, value: int, op: NotifyOp) -> None:
+        assert self._l3_host_mapping is not None
+        mapping_offset = int(self._l3_host_mapping.counter_offset) + int(offset)
+        try:
+            _l3_host_mapped_counter_notify(self._l3_host_mapping.handle, mapping_offset, int(value), int(op))
+        except Exception:
+            self._poison()
+            raise
+
+    def _direct_counter_test(self, offset: int, cmp_value: int, cmp: WaitCmp) -> SignalTestResult:
+        assert self._l3_host_mapping is not None
+        mapping_offset = int(self._l3_host_mapping.counter_offset) + int(offset)
+        try:
+            matched, observed = _l3_host_mapped_counter_test(
+                self._l3_host_mapping.handle, mapping_offset, int(cmp_value), int(cmp)
+            )
+        except Exception:
+            self._poison()
+            raise
+        return SignalTestResult(matched=bool(matched), observed=int(observed))
+
+    def _direct_counter_wait(self, offset: int, cmp_value: int, cmp: WaitCmp, timeout_ns: int) -> int:
+        assert self._l3_host_mapping is not None
+        mapping_offset = int(self._l3_host_mapping.counter_offset) + int(offset)
+        try:
+            status, error_kind, observed, _matched, message = _l3_host_mapped_counter_wait(
+                self._l3_host_mapping.handle, mapping_offset, int(cmp_value), int(cmp), int(timeout_ns)
+            )
+        except Exception:
+            self._poison()
+            raise
+        if int(status) == 0:
+            return int(observed)
+        msg = str(message) if message else "L3-L2 counter wait timed out"
+        if int(error_kind) == int(_ServiceError.SIGNAL_TIMEOUT):
+            raise TimeoutError(f"{msg}; observed={int(observed)}")
+        self._poison()
+        raise RuntimeError(f"{msg}; observed={int(observed)}")
 
     def _submit(
         self,

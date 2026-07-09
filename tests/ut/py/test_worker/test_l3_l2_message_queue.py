@@ -19,6 +19,7 @@ from simpler.l3_l2_message_queue import (
     L3L2_QUEUE_DESC_SLOT_BYTES,
     L3L2_QUEUE_L2_ABORT_FLAG_OFFSET,
     L3L2_QUEUE_L3_ABORT_FLAG_OFFSET,
+    L3L2Queue,
     L3L2QueueMessage,
     L3L2QueueOpcode,
     make_l3_l2_queue_layout,
@@ -27,10 +28,14 @@ from simpler.l3_l2_orch_comm import (
     L3L2OrchCommCmd,
     L3L2OrchCommRequest,
     L3L2OrchCommResponse,
+    L3L2OrchRegion,
     L3L2OrchRegionDesc,
+    L3HostRegionMapping,
+    L3L2RegionAccessProfile,
     NotifyOp,
     WaitCmp,
 )
+from simpler import l3_l2_orch_comm
 from simpler.orchestrator import Orchestrator
 from simpler.task_interface import DataType, Tensor, get_element_size
 from simpler.worker import _IDLE, _OFF_STATE, Worker, _buffer_field_addr, _mailbox_store_i32
@@ -406,6 +411,62 @@ def test_enqueue_accepts_ordinary_host_bytes_with_lazy_staging():
         assert queue.region.descriptor_scalars()[1] == 1
     finally:
         _close(worker, shm)
+
+
+def test_l3_host_mapped_queue_ordinary_input_delegates_staging_to_primitive(monkeypatch):
+    orch = _FakeCOrch()
+    layout = make_l3_l2_queue_layout(4, 128, 128)
+    desc = L3L2OrchRegionDesc(
+        magic_version=0x4C334C3200020000,
+        region_id=1,
+        payload_base=0x1000_0000,
+        payload_bytes=layout.payload_bytes,
+        counter_base=0x1000_0000 + ((layout.payload_bytes + 63) // 64) * 64,
+        counter_bytes=layout.counter_bytes,
+    )
+    region = L3L2OrchRegion(
+        object(),
+        0,
+        desc,
+        L3HostRegionMapping(
+            worker_id=0,
+            region_id=1,
+            access_profile=L3L2RegionAccessProfile.SIM_POSIX_SHM,
+            total_bytes=desc.counter_base - desc.payload_base + desc.counter_bytes,
+            payload_offset=0,
+            payload_bytes=desc.payload_bytes,
+            counter_offset=desc.counter_base - desc.payload_base,
+            counter_bytes=desc.counter_bytes,
+            handle=44,
+        ),
+    )
+    queue = L3L2Queue(
+        orch,
+        region,
+        layout,
+        orch.alloc([24], DataType.UINT8),
+        orch.alloc([8], DataType.UINT8),
+        orch.alloc([L3L2_QUEUE_DESC_SLOT_BYTES], DataType.UINT8),
+    )
+    alloc_count = len(orch._buffers)
+    payload_writes: list[tuple[int, bytes]] = []
+    counters: dict[int, int] = {}
+
+    def payload_write(_handle: int, offset: int, src: int, nbytes: int) -> None:
+        payload_writes.append((int(offset), ctypes.string_at(int(src), int(nbytes))))
+
+    def counter_notify(_handle: int, offset: int, value: int, _op: int) -> None:
+        counters[int(offset)] = int(value)
+
+    monkeypatch.setattr(l3_l2_orch_comm, "_l3_host_mapped_payload_write", payload_write)
+    monkeypatch.setattr(l3_l2_orch_comm, "_l3_host_mapped_counter_test", lambda _h, off, _v, _cmp: (False, counters.get(off, 0)))
+    monkeypatch.setattr(l3_l2_orch_comm, "_l3_host_mapped_counter_notify", counter_notify)
+
+    queue.input.enqueue(b"ordinary", nbytes=8, timeout=0.001)
+
+    assert (layout.input_arena_offset, b"ordinary") in payload_writes
+    assert len(orch._buffers) == alloc_count
+    assert counters[region._l3_host_mapping.counter_offset + layout.input_desc_tail_offset] == 1
 
 
 def test_staging_allocation_failure_does_not_poison():

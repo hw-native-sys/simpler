@@ -553,8 +553,11 @@ class _L3InputQueue:
             if next_payload_tail + nbytes - queue._input_payload_head > queue._layout.input_arena_bytes:
                 return False
             if staged_span is not None:
-                payload_tensor = queue._ensure_staging_capacity(nbytes)
-                queue._copy_host_span_to_tensor(staged_span, payload_tensor)
+                if getattr(queue._region, "_l3_host_mapping", None) is None:
+                    payload_tensor = queue._ensure_staging_capacity(nbytes)
+                    queue._copy_host_span_to_tensor(staged_span, payload_tensor)
+                else:
+                    payload_tensor = buffer_or_none
             payload_offset = queue._layout.input_arena_offset + arena_pos
             queue._run_primitive(queue._region.payload_write, payload_offset, payload_tensor, nbytes=nbytes)
             queue._input_payload_tail = next_payload_tail + nbytes
@@ -638,9 +641,12 @@ class _L3OutputQueue:
         target_span = None
         if target is None:
             target_span = _host_byte_span(buffer, handle.payload_nbytes, writable=True)
-            target = queue._ensure_staging_capacity(handle.payload_nbytes)
+            if getattr(queue._region, "_l3_host_mapping", None) is None:
+                target = queue._ensure_staging_capacity(handle.payload_nbytes)
+            else:
+                target = buffer
         queue._run_primitive(queue._region.payload_read, handle.payload_offset, target, nbytes=handle.payload_nbytes)
-        if target_span is not None:
+        if target_span is not None and getattr(queue._region, "_l3_host_mapping", None) is None:
             queue._copy_tensor_to_host_span(target, target_span)
 
     def release(self, handle: L3L2QueueMessage) -> None:

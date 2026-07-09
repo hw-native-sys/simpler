@@ -727,6 +727,16 @@ inline void bind_worker(nb::module_ &m) {
             "control_l3_l2_orch_comm_init", &Worker::control_l3_l2_orch_comm_init, nb::arg("worker_id"),
             nb::arg("control_shm_name"), nb::call_guard<nb::gil_scoped_release>(),
             "Drive one NEXT_LEVEL chip child through CTRL_L3_L2_ORCH_COMM_INIT."
+        )
+        .def(
+            "control_l3_l2_region_create", &Worker::control_l3_l2_region_create, nb::arg("worker_id"),
+            nb::arg("request_shm_name"), nb::arg("reply_shm_name"), nb::call_guard<nb::gil_scoped_release>(),
+            "Drive one NEXT_LEVEL chip child through CTRL_L3_L2_REGION_CREATE."
+        )
+        .def(
+            "control_l3_l2_region_release", &Worker::control_l3_l2_region_release, nb::arg("worker_id"),
+            nb::arg("region_id"), nb::call_guard<nb::gil_scoped_release>(),
+            "Drive one NEXT_LEVEL chip child through CTRL_L3_L2_REGION_RELEASE."
         );
 
     m.attr("DEFAULT_HEAP_RING_SIZE") = static_cast<uint64_t>(DEFAULT_HEAP_RING_SIZE);

@@ -14,7 +14,7 @@ Callable identity is exposed as an opaque ``CallableHandle`` returned by
 ``ChipCallable`` objects. L3+ ``Worker.run`` keeps the existing raw Python
 orchestration-function entry point; that function captures handles and submits
 them through the Orchestrator. L≥3 targets resolve the handle's stable SHA-256
-digest to a private child-local slot; later Python registrations are serialized
+digest to a private L2-side slot; later Python registrations are serialized
 and sent through the mailbox control plane.
 
 Usage::
@@ -233,6 +233,8 @@ _HOST_BUF_UNMAP = struct.Struct("<Q")
 # mapping (the pure-Python blob-rewrite scheme, no runtime C++ change).
 _BLOB_TENSOR_STRIDE = 128
 _BLOB_HEADER_BYTES = 8
+_CTRL_L3_L2_REGION_CREATE = 16
+_CTRL_L3_L2_REGION_RELEASE = 17
 
 # Layout of the CTRL_COMM_INIT request shm.
 _COMM_INIT_HEADER = struct.Struct("<II")  # rank (u32), nranks (u32)
@@ -1072,6 +1074,131 @@ def _handle_ctrl_l3_l2_orch_comm_init(cw: ChipWorker, buf: memoryview) -> Shared
     return control_shm
 
 
+@dataclass
+class _L2HostL3L2Region:
+    region_id: int
+    shm: SharedMemory
+    payload_bytes: int
+    counter_offset: int
+    counter_bytes: int
+    total_bytes: int
+
+
+def _l2_host_l3_l2_regions(cw: ChipWorker) -> dict[int, _L2HostL3L2Region]:
+    regions = getattr(cw, "_l3_l2_direct_regions", None)
+    if regions is None:
+        regions = {}
+        setattr(cw, "_l3_l2_direct_regions", regions)
+    return regions
+
+
+def _next_l2_host_l3_l2_region_id(cw: ChipWorker) -> int:
+    region_id = int(getattr(cw, "_l3_l2_direct_next_region_id", 1))
+    setattr(cw, "_l3_l2_direct_next_region_id", region_id + 1)
+    return region_id
+
+
+def _handle_ctrl_l3_l2_region_create(cw: ChipWorker, buf: memoryview) -> None:
+    from .l3_l2_orch_comm import (  # noqa: PLC0415
+        CTRL_SHM_TOKEN_BYTES,
+        L3L2RegionAccessProfile,
+        L3L2RegionCreateRequest,
+        _REGION_CREATE_REPLY,
+        _REGION_CREATE_REQUEST,
+        _align_up,
+        _checked_add_u64,
+    )
+
+    request_shm_name = _read_shm_name(buf, _OFF_ARGS)
+    reply_shm_name = _read_shm_name(buf, _OFF_ARGS + _CTRL_SHM_NAME_BYTES)
+    req_shm = SharedMemory(name=request_shm_name)
+    reply_shm = SharedMemory(name=reply_shm_name)
+    region: _L2HostL3L2Region | None = None
+    try:
+        fields = _REGION_CREATE_REQUEST.unpack_from(req_shm.buf, 0)
+        request = L3L2RegionCreateRequest(
+            magic_version=int(fields[0]),
+            request_bytes=int(fields[1]),
+            payload_bytes=int(fields[2]),
+            counter_bytes=int(fields[3]),
+            l3_host_pid=int(fields[4]),
+        )
+        if request.payload_bytes <= 0:
+            raise RuntimeError("CTRL_L3_L2_REGION_CREATE payload_bytes must be positive")
+        if request.counter_bytes <= 0 or request.counter_bytes % 4 != 0:
+            raise RuntimeError("CTRL_L3_L2_REGION_CREATE counter_bytes must be positive and a multiple of 4")
+        counter_offset = _align_up(request.payload_bytes, 64)
+        total_bytes = _checked_add_u64(counter_offset, request.counter_bytes)
+
+        region_id = _next_l2_host_l3_l2_region_id(cw)
+        shm = SharedMemory(create=True, size=total_bytes)
+        region = _L2HostL3L2Region(
+            region_id=region_id,
+            shm=shm,
+            payload_bytes=request.payload_bytes,
+            counter_offset=counter_offset,
+            counter_bytes=request.counter_bytes,
+            total_bytes=total_bytes,
+        )
+        shm.buf[counter_offset : counter_offset + request.counter_bytes] = b"\x00" * request.counter_bytes
+        exported = ctypes.c_char.from_buffer(shm.buf)
+        try:
+            payload_base = ctypes.addressof(exported)
+        finally:
+            del exported
+        counter_base = payload_base + counter_offset
+        backing_name = shm.name.encode("utf-8")
+        if len(backing_name) >= CTRL_SHM_TOKEN_BYTES:
+            raise RuntimeError("CTRL_L3_L2_REGION_CREATE backing shm token is too long")
+        _REGION_CREATE_REPLY.pack_into(
+            reply_shm.buf,
+            0,
+            request.magic_version,
+            region_id,
+            payload_base,
+            request.payload_bytes,
+            counter_base,
+            request.counter_bytes,
+            int(L3L2RegionAccessProfile.SIM_POSIX_SHM),
+            0,
+            int(getattr(cw, "device_id", -1)),
+            b"\x00" * 65,
+            backing_name + b"\x00" * (CTRL_SHM_TOKEN_BYTES - len(backing_name)),
+            total_bytes,
+        )
+        _l2_host_l3_l2_regions(cw)[region_id] = region
+        region = None
+    finally:
+        if region is not None:
+            try:
+                region.shm.close()
+                region.shm.unlink()
+            except Exception:  # noqa: BLE001
+                pass
+        req_shm.close()
+        reply_shm.close()
+
+
+def _handle_ctrl_l3_l2_region_release(cw: ChipWorker, buf: memoryview) -> None:
+    region_id = struct.unpack_from("Q", buf, _CTRL_OFF_ARG0)[0]
+    region = _l2_host_l3_l2_regions(cw).pop(int(region_id), None)
+    if region is None:
+        return
+    region.shm.close()
+    region.shm.unlink()
+
+
+def _sweep_l2_host_l3_l2_regions(cw: ChipWorker) -> None:
+    regions = _l2_host_l3_l2_regions(cw)
+    for region_id in list(regions):
+        region = regions.pop(region_id)
+        try:
+            region.shm.close()
+            region.shm.unlink()
+        except Exception:  # noqa: BLE001
+            pass
+
+
 def _handle_ctrl_release_domain(cw: ChipWorker, buf: memoryview) -> None:
     """CTRL_RELEASE_DOMAIN handler — collective free for one allocation."""
     request_shm_name = _read_shm_name(buf, _OFF_ARGS)
@@ -1292,6 +1419,10 @@ def _run_chip_main_loop(  # noqa: PLR0912, PLR0913, PLR0915 -- unified TASK_READ
                         _handle_ctrl_map_host(buf, host_buf_table, host_buf_ranges)
                     elif sub_cmd == _CTRL_UNMAP_HOST:
                         _handle_ctrl_unmap_host(buf, host_buf_table, host_buf_ranges)
+                    elif sub_cmd == _CTRL_L3_L2_REGION_CREATE:
+                        _handle_ctrl_l3_l2_region_create(cw, buf)
+                    elif sub_cmd == _CTRL_L3_L2_REGION_RELEASE:
+                        _handle_ctrl_l3_l2_region_release(cw, buf)
                     else:
                         raise RuntimeError(f"unknown control sub-command {int(sub_cmd)}")
                 except Exception as e:  # noqa: BLE001
@@ -1306,6 +1437,7 @@ def _run_chip_main_loop(  # noqa: PLR0912, PLR0913, PLR0915 -- unified TASK_READ
             elif state == _SHUTDOWN:
                 break
     finally:
+        _sweep_l2_host_l3_l2_regions(cw)
         if l3_l2_control_shms:
             try:
                 cw.l3_l2_orch_comm_shutdown()
@@ -1432,7 +1564,7 @@ def _child_worker_loop(
     """Runs in forked child process. Any-level Worker as child of its parent.
 
     Polls the unified mailbox for (callable digest, config, args_blob). Looks
-    up the orchestration function in the child-local registry, then delegates to
+    up the orchestration function in the L2-side registry, then delegates to
     ``inner_worker.run(orch_fn, args, cfg)`` which opens its own scope,
     runs the orch function, and drains. Also services CONTROL_REQUEST
     so the L4 parent's dynamic register/unregister broadcasts cascade
@@ -2311,7 +2443,7 @@ class Worker:
             handle, is_new = self._install_registration_locked(reg)
 
         # L3+ post-init ChipCallable: broadcast to chip / next-level children
-        # via C++ after parent-side slot allocation is complete. The slot is
+        # via C++ after L3 Host-side slot allocation is complete. The slot is
         # target-private; task dispatches carry only handle.digest.
         if self.level >= 3 and self._initialized and isinstance(target, ChipCallable):
             try:
@@ -3456,13 +3588,7 @@ class Worker:
     def _ensure_l3_l2_orch_comm(self, worker_id: int):
         from .l3_l2_orch_comm import CONTROL_SHM_SIZE  # noqa: PLC0415
 
-        if self.level < 3:
-            raise RuntimeError("create_l3_l2_region requires a hierarchical Worker")
-        if self._worker is None:
-            raise RuntimeError("create_l3_l2_region requires Worker.init()")
-        device_ids = self._config.get("device_ids", [])
-        if worker_id < 0 or worker_id >= len(device_ids):
-            raise ValueError(f"create_l3_l2_region: worker_id {worker_id} outside [0, {len(device_ids)})")
+        self._validate_l3_l2_worker_id(worker_id)
         if worker_id in self._l3_l2_orch_comm_ready:
             return self._l3_l2_orch_comm_clients[worker_id]
 
@@ -3495,6 +3621,18 @@ class Worker:
     def _l3_l2_orch_comm_submit(self, worker_id: int, request, timeout_s: float):
         client = self._ensure_l3_l2_orch_comm(int(worker_id))
         return client.submit(request, timeout_s)
+
+    def _l3_l2_use_l3_host_mapped_path(self) -> bool:
+        return str(self._config.get("platform", "")).endswith("sim")
+
+    def _validate_l3_l2_worker_id(self, worker_id: int) -> None:
+        if self.level < 3:
+            raise RuntimeError("create_l3_l2_region requires a hierarchical Worker")
+        if self._worker is None:
+            raise RuntimeError("create_l3_l2_region requires Worker.init()")
+        device_ids = self._config.get("device_ids", [])
+        if worker_id < 0 or worker_id >= len(device_ids):
+            raise ValueError(f"create_l3_l2_region: worker_id {worker_id} outside [0, {len(device_ids)})")
 
     def _poison_l3_l2_region_from_endpoint_error(self, exc: BaseException) -> bool:
         match = _L3_L2_ENDPOINT_ERROR_REGION_RE.search(str(exc))
@@ -3550,12 +3688,80 @@ class Worker:
             )
 
     def _create_l3_l2_region(self, worker_id: int, payload_bytes: int, counter_bytes: int):
-        from .l3_l2_orch_comm import L3L2OrchCommCmd, L3L2OrchCommRequest, L3L2OrchRegion  # noqa: PLC0415
+        from .l3_l2_orch_comm import (  # noqa: PLC0415
+            L3L2OrchCommCmd,
+            L3L2OrchCommRequest,
+            L3L2OrchRegion,
+            L3HostRegionMapping,
+            L3L2RegionAccessProfile,
+            L3L2RegionCreateRequest,
+            REGION_CREATE_REPLY_BYTES,
+            REGION_CREATE_REQUEST_BYTES,
+            decode_region_create_reply,
+            validate_region_create_reply,
+            _l3_host_mapped_region_import_sim,
+        )
 
         if payload_bytes <= 0:
             raise ValueError("create_l3_l2_region: payload_bytes must be positive")
         if counter_bytes <= 0 or counter_bytes % 4 != 0:
             raise ValueError("create_l3_l2_region: counter_bytes must be positive and a multiple of 4")
+        self._validate_l3_l2_worker_id(int(worker_id))
+        if self._l3_l2_use_l3_host_mapped_path():
+            req_shm = SharedMemory(create=True, size=REGION_CREATE_REQUEST_BYTES)
+            reply_shm = SharedMemory(create=True, size=REGION_CREATE_REPLY_BYTES)
+            region_id = 0
+            l3_host_mapping = None
+            try:
+                L3L2RegionCreateRequest(
+                    magic_version=0x4C334C3200020000,
+                    request_bytes=REGION_CREATE_REQUEST_BYTES,
+                    payload_bytes=int(payload_bytes),
+                    counter_bytes=int(counter_bytes),
+                    l3_host_pid=os.getpid(),
+                ).encode_into(req_shm.buf)
+                assert self._worker is not None
+                self._worker.control_l3_l2_region_create(int(worker_id), req_shm.name, reply_shm.name)
+                reply = decode_region_create_reply(reply_shm.buf)
+                region_id = int(reply.desc.region_id)
+                counter_offset, total_bytes = validate_region_create_reply(reply)
+                if reply.access_profile != L3L2RegionAccessProfile.SIM_POSIX_SHM:
+                    raise RuntimeError("create_l3_l2_region: sim direct path requires sim_posix_shm reply")
+                handle = _l3_host_mapped_region_import_sim(reply.backing_shm, int(reply.mapping_bytes))
+                l3_host_mapping = L3HostRegionMapping(
+                    worker_id=int(worker_id),
+                    region_id=region_id,
+                    access_profile=reply.access_profile,
+                    total_bytes=total_bytes,
+                    payload_offset=0,
+                    payload_bytes=int(reply.desc.payload_bytes),
+                    counter_offset=counter_offset,
+                    counter_bytes=int(reply.desc.counter_bytes),
+                    handle=int(handle),
+                )
+                region = L3L2OrchRegion(self, int(worker_id), reply.desc, l3_host_mapping)
+                self._live_l3_l2_regions.append(region)
+                return region
+            except Exception:
+                if l3_host_mapping is not None:
+                    try:
+                        l3_host_mapping.close()
+                    except Exception:  # noqa: BLE001
+                        pass
+                if region_id:
+                    try:
+                        assert self._worker is not None
+                        self._worker.control_l3_l2_region_release(int(worker_id), int(region_id))
+                    except Exception:  # noqa: BLE001
+                        pass
+                raise
+            finally:
+                for shm in (req_shm, reply_shm):
+                    try:
+                        shm.close()
+                        shm.unlink()
+                    except Exception:  # noqa: BLE001
+                        pass
         response = self._l3_l2_orch_comm_submit(
             int(worker_id),
             L3L2OrchCommRequest(
@@ -3579,7 +3785,11 @@ class Worker:
         regions, self._live_l3_l2_regions = self._live_l3_l2_regions, []
         for region in regions:
             try:
-                if region._worker_id in self._l3_l2_orch_comm_ready:
+                if getattr(region, "_l3_host_mapping", None) is not None:
+                    region._close_l3_host_mapping()
+                    if self._worker is not None:
+                        self._worker.control_l3_l2_region_release(region._worker_id, region.region_id)
+                elif region._worker_id in self._l3_l2_orch_comm_ready:
                     self._l3_l2_orch_comm_submit(
                         region._worker_id,
                         L3L2OrchCommRequest(cmd=L3L2OrchCommCmd.FREE_REGION, region_id=region.region_id),
@@ -3589,6 +3799,11 @@ class Worker:
                 region._expire()
 
     def _close_l3_l2_orch_comm(self) -> None:
+        for region in self._live_l3_l2_regions:
+            try:
+                region._close_l3_host_mapping()
+            except Exception:  # noqa: BLE001
+                pass
         self._live_l3_l2_regions.clear()
         self._l3_l2_orch_comm_clients.clear()
         self._l3_l2_orch_comm_ready.clear()
@@ -3905,7 +4120,7 @@ class Worker:
         """Fan out CTRL_ALLOC_DOMAIN / CTRL_RELEASE_DOMAIN to all participating chips.
 
         Each chip's `_Worker.control_*` is a blocking per-mailbox call; we issue
-        them on separate threads so the child-side file barrier can converge.
+        them on separate threads so the L2-side file barrier can converge.
         Joins all threads; raises on first error after all join.
         """
         dw = self._worker

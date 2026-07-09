@@ -152,6 +152,9 @@ static constexpr uint64_t CTRL_COMM_INIT = 9;
 static constexpr uint64_t CTRL_PY_REGISTER = 10;
 static constexpr uint64_t CTRL_PY_UNREGISTER = 11;
 static constexpr uint64_t CTRL_L3_L2_ORCH_COMM_INIT = 13;
+static constexpr uint64_t CTRL_L3_L2_REGION_CREATE = 16;
+static constexpr uint64_t CTRL_L3_L2_REGION_RELEASE = 17;
+
 // Control args reuse the task mailbox region (mutually exclusive with task dispatch):
 //   offset 16: uint64 arg0 (size for malloc/register; ptr for free; dst for copy)
 //   offset 24: uint64 arg1 (src for copy)
@@ -239,6 +242,8 @@ public:
     virtual void control_release_domain(const char *request_shm_name);
     virtual void control_comm_init(const char *request_shm_name);
     virtual void control_l3_l2_orch_comm_init(const char *control_shm_name);
+    virtual void control_l3_l2_region_create(const char *request_shm_name, const char *reply_shm_name);
+    virtual void control_l3_l2_region_release(uint64_t region_id);
 };
 
 class LocalMailboxEndpoint : public WorkerEndpoint {
@@ -289,6 +294,8 @@ public:
     void control_release_domain(const char *request_shm_name) override;
     void control_comm_init(const char *request_shm_name) override;
     void control_l3_l2_orch_comm_init(const char *control_shm_name) override;
+    void control_l3_l2_region_create(const char *request_shm_name, const char *reply_shm_name) override;
+    void control_l3_l2_region_release(uint64_t region_id) override;
 
 private:
     WorkerEndpointCaps caps_;
@@ -426,6 +433,8 @@ public:
     // Caller dispatches in parallel to every chip; child runs cw.comm_init.
     void control_comm_init(const char *request_shm_name);
     void control_l3_l2_orch_comm_init(const char *control_shm_name);
+    void control_l3_l2_region_create(const char *request_shm_name, const char *reply_shm_name);
+    void control_l3_l2_region_release(uint64_t region_id);
 
 private:
     Ring *ring_{nullptr};
@@ -488,6 +497,8 @@ public:
     void control_release_domain(int worker_id, const char *request_shm_name);
     void control_comm_init(int worker_id, const char *request_shm_name);
     void control_l3_l2_orch_comm_init(int worker_id, const char *control_shm_name);
+    void control_l3_l2_region_create(int worker_id, const char *request_shm_name, const char *reply_shm_name);
+    void control_l3_l2_region_release(int worker_id, uint64_t region_id);
     ControlResult
     control_digest_only(WorkerType type, int worker_id, uint64_t sub_cmd, const uint8_t *digest, double timeout_s);
     ControlResult control_remote_prepare_register(

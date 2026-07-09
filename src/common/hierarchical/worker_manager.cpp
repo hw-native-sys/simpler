@@ -118,6 +118,12 @@ void WorkerEndpoint::control_comm_init(const char *) { throw_unsupported_control
 void WorkerEndpoint::control_l3_l2_orch_comm_init(const char *) {
     throw_unsupported_control("control_l3_l2_orch_comm_init");
 }
+void WorkerEndpoint::control_l3_l2_region_create(const char *, const char *) {
+    throw_unsupported_control("control_l3_l2_region_create");
+}
+void WorkerEndpoint::control_l3_l2_region_release(uint64_t) {
+    throw_unsupported_control("control_l3_l2_region_release");
+}
 
 // =============================================================================
 // LocalMailboxEndpoint — mailbox helpers
@@ -739,6 +745,23 @@ void LocalMailboxEndpoint::control_l3_l2_orch_comm_init(const char *control_shm_
     run_control_command("control_l3_l2_orch_comm_init");
 }
 
+void LocalMailboxEndpoint::control_l3_l2_region_create(const char *request_shm_name, const char *reply_shm_name) {
+    if (!request_shm_name || !*request_shm_name || !reply_shm_name || !*reply_shm_name) {
+        throw std::runtime_error("control_l3_l2_region_create: request and reply shm names must be non-empty");
+    }
+    std::lock_guard<std::mutex> lk(mailbox_mu_);
+    uint64_t sub_cmd = CTRL_L3_L2_REGION_CREATE;
+    std::memcpy(mbox() + MAILBOX_OFF_CALLABLE, &sub_cmd, sizeof(uint64_t));
+    write_shm_name_pair(mbox(), request_shm_name, reply_shm_name);
+    run_control_command("control_l3_l2_region_create");
+}
+
+void LocalMailboxEndpoint::control_l3_l2_region_release(uint64_t region_id) {
+    std::lock_guard<std::mutex> lk(mailbox_mu_);
+    write_control_args(mbox(), CTRL_L3_L2_REGION_RELEASE, region_id);
+    run_control_command("control_l3_l2_region_release");
+}
+
 uint64_t WorkerThread::control_malloc(size_t size) {
     if (!endpoint_) throw std::runtime_error("control_malloc: null endpoint");
     return endpoint_->control_malloc(size);
@@ -870,6 +893,16 @@ void WorkerThread::control_comm_init(const char *request_shm_name) {
 void WorkerThread::control_l3_l2_orch_comm_init(const char *control_shm_name) {
     if (!endpoint_) throw std::runtime_error("control_l3_l2_orch_comm_init: null endpoint");
     endpoint_->control_l3_l2_orch_comm_init(control_shm_name);
+}
+
+void WorkerThread::control_l3_l2_region_create(const char *request_shm_name, const char *reply_shm_name) {
+    if (!endpoint_) throw std::runtime_error("control_l3_l2_region_create: null endpoint");
+    endpoint_->control_l3_l2_region_create(request_shm_name, reply_shm_name);
+}
+
+void WorkerThread::control_l3_l2_region_release(uint64_t region_id) {
+    if (!endpoint_) throw std::runtime_error("control_l3_l2_region_release: null endpoint");
+    endpoint_->control_l3_l2_region_release(region_id);
 }
 
 bool WorkerManager::any_busy() const {
@@ -1007,6 +1040,24 @@ void WorkerManager::control_l3_l2_orch_comm_init(int worker_id, const char *cont
         throw std::runtime_error("control_l3_l2_orch_comm_init: invalid worker_id " + std::to_string(worker_id));
     }
     wt->control_l3_l2_orch_comm_init(control_shm_name);
+}
+
+void WorkerManager::control_l3_l2_region_create(
+    int worker_id, const char *request_shm_name, const char *reply_shm_name
+) {
+    auto *wt = get_worker_by_id(WorkerType::NEXT_LEVEL, worker_id);
+    if (wt == nullptr) {
+        throw std::runtime_error("control_l3_l2_region_create: invalid worker_id " + std::to_string(worker_id));
+    }
+    wt->control_l3_l2_region_create(request_shm_name, reply_shm_name);
+}
+
+void WorkerManager::control_l3_l2_region_release(int worker_id, uint64_t region_id) {
+    auto *wt = get_worker_by_id(WorkerType::NEXT_LEVEL, worker_id);
+    if (wt == nullptr) {
+        throw std::runtime_error("control_l3_l2_region_release: invalid worker_id " + std::to_string(worker_id));
+    }
+    wt->control_l3_l2_region_release(region_id);
 }
 
 ControlResult WorkerManager::control_digest_only(

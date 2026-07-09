@@ -23,7 +23,18 @@
 #include <nanobind/stl/tuple.h>
 #include <nanobind/stl/vector.h>
 
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
+#include <chrono>
+#include <cerrno>
 #include <cstring>
+#include <limits>
+#include <mutex>
+#include <thread>
+#include <unordered_map>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -40,6 +51,76 @@
 #include "tensor.h"
 
 namespace nb = nanobind;
+
+namespace {
+
+struct L3HostMappedSimRegion {
+    int fd{-1};
+    void *base{nullptr};
+    size_t size{0};
+};
+
+std::mutex g_l3_host_mapped_region_mu;
+std::unordered_map<uint64_t, L3HostMappedSimRegion> g_l3_host_mapped_regions;
+uint64_t g_next_l3_host_mapped_region_handle = 1;
+
+L3HostMappedSimRegion &l3_host_mapped_region(uint64_t handle) {
+    std::lock_guard<std::mutex> lk(g_l3_host_mapped_region_mu);
+    auto it = g_l3_host_mapped_regions.find(handle);
+    if (it == g_l3_host_mapped_regions.end()) {
+        throw std::runtime_error("L3-L2 L3 Host mapped-region handle is closed or unknown");
+    }
+    return it->second;
+}
+
+void validate_mapping_range(const L3HostMappedSimRegion &mapping, uint64_t offset, uint64_t nbytes) {
+    if (nbytes == 0 || offset > mapping.size || nbytes > mapping.size - static_cast<size_t>(offset)) {
+        throw std::out_of_range("L3-L2 L3 Host mapped-region access is out of range");
+    }
+}
+
+int32_t load_counter(const L3HostMappedSimRegion &mapping, uint64_t offset) {
+    validate_mapping_range(mapping, offset, sizeof(int32_t));
+    int32_t value = 0;
+    std::memcpy(&value, static_cast<const uint8_t *>(mapping.base) + offset, sizeof(value));
+    return value;
+}
+
+void store_counter(const L3HostMappedSimRegion &mapping, uint64_t offset, int32_t value) {
+    validate_mapping_range(mapping, offset, sizeof(int32_t));
+    std::memcpy(static_cast<uint8_t *>(mapping.base) + offset, &value, sizeof(value));
+}
+
+bool compare_counter(int32_t observed, int32_t operand, int cmp) {
+    switch (cmp) {
+    case 0:
+        return observed == operand;
+    case 1:
+        return observed != operand;
+    case 2:
+        return observed > operand;
+    case 3:
+        return observed >= operand;
+    case 4:
+        return observed < operand;
+    case 5:
+        return observed <= operand;
+    default:
+        return false;
+    }
+}
+
+std::string shm_name_for_open(const std::string &token) {
+    if (token.empty()) {
+        throw std::invalid_argument("L3-L2 sim backing shm token must be non-empty");
+    }
+    if (token[0] == '/') {
+        return token;
+    }
+    return "/" + token;
+}
+
+}  // namespace
 
 // ============================================================================
 // Module definition
@@ -1007,6 +1088,148 @@ NB_MODULE(_task_interface, m) {
         nb::arg("blob_ptr"),
         "Reconstruct a TaskArgs from a length-prefixed blob at blob_ptr. "
         "Tags are not preserved (blob wire format strips them)."
+    );
+
+    m.def(
+        "_l3_host_mapped_region_import_sim",
+        [](const std::string &token, uint64_t mapping_bytes) -> uint64_t {
+            if (mapping_bytes == 0 || mapping_bytes > static_cast<uint64_t>(std::numeric_limits<size_t>::max())) {
+                throw std::invalid_argument("L3-L2 sim L3 Host mapped-region import requires a positive mapping size");
+            }
+            std::string name = shm_name_for_open(token);
+            int fd = shm_open(name.c_str(), O_RDWR, 0);
+            if (fd < 0) {
+                throw std::runtime_error("L3-L2 sim L3 Host mapped-region import shm_open failed");
+            }
+            void *base = mmap(nullptr, static_cast<size_t>(mapping_bytes), PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+            if (base == MAP_FAILED) {
+                int err = errno;
+                ::close(fd);
+                throw std::runtime_error(
+                    std::string("L3-L2 sim L3 Host mapped-region import mmap failed: ") + std::strerror(err)
+                );
+            }
+            std::lock_guard<std::mutex> lk(g_l3_host_mapped_region_mu);
+            uint64_t handle = g_next_l3_host_mapped_region_handle++;
+            g_l3_host_mapped_regions.emplace(
+                handle, L3HostMappedSimRegion{
+                            fd,
+                            base,
+                            static_cast<size_t>(mapping_bytes),
+                        }
+            );
+            return handle;
+        },
+        nb::arg("token"), nb::arg("mapping_bytes"),
+        "Import a sim L3-L2 POSIX shm region for L3 Host mapped-region access."
+    );
+    m.def(
+        "_l3_host_mapped_region_close",
+        [](uint64_t handle) {
+            L3HostMappedSimRegion mapping{};
+            {
+                std::lock_guard<std::mutex> lk(g_l3_host_mapped_region_mu);
+                auto it = g_l3_host_mapped_regions.find(handle);
+                if (it == g_l3_host_mapped_regions.end()) {
+                    return;
+                }
+                mapping = it->second;
+                g_l3_host_mapped_regions.erase(it);
+            }
+            if (mapping.base != nullptr) {
+                munmap(mapping.base, mapping.size);
+            }
+            if (mapping.fd >= 0) {
+                ::close(mapping.fd);
+            }
+        },
+        nb::arg("handle"), "Close an L3 Host mapped-region handle."
+    );
+    m.def(
+        "_l3_host_mapped_payload_write",
+        [](uint64_t handle, uint64_t payload_offset, uint64_t host_ptr, uint64_t nbytes) {
+            if (host_ptr == 0) {
+                throw std::invalid_argument("L3-L2 payload_write host_ptr must be nonzero");
+            }
+            L3HostMappedSimRegion &mapping = l3_host_mapped_region(handle);
+            validate_mapping_range(mapping, payload_offset, nbytes);
+            std::memcpy(
+                static_cast<uint8_t *>(mapping.base) + payload_offset,
+                reinterpret_cast<const void *>(static_cast<uintptr_t>(host_ptr)), static_cast<size_t>(nbytes)
+            );
+        },
+        nb::arg("handle"), nb::arg("payload_offset"), nb::arg("host_ptr"), nb::arg("nbytes"),
+        "Copy L3 Host bytes into an imported L3-L2 payload range."
+    );
+    m.def(
+        "_l3_host_mapped_payload_read",
+        [](uint64_t handle, uint64_t payload_offset, uint64_t host_ptr, uint64_t nbytes) {
+            if (host_ptr == 0) {
+                throw std::invalid_argument("L3-L2 payload_read host_ptr must be nonzero");
+            }
+            L3HostMappedSimRegion &mapping = l3_host_mapped_region(handle);
+            validate_mapping_range(mapping, payload_offset, nbytes);
+            std::memcpy(
+                reinterpret_cast<void *>(static_cast<uintptr_t>(host_ptr)),
+                static_cast<const uint8_t *>(mapping.base) + payload_offset, static_cast<size_t>(nbytes)
+            );
+        },
+        nb::arg("handle"), nb::arg("payload_offset"), nb::arg("host_ptr"), nb::arg("nbytes"),
+        "Copy imported L3-L2 payload bytes into L3 Host memory."
+    );
+    m.def(
+        "_l3_host_mapped_counter_notify",
+        [](uint64_t handle, uint64_t counter_offset, int32_t value, int op) {
+            L3HostMappedSimRegion &mapping = l3_host_mapped_region(handle);
+            if (counter_offset % sizeof(int32_t) != 0) {
+                throw std::invalid_argument("L3-L2 counter offset must be 4-byte aligned");
+            }
+            if (op == 1) {
+                value = load_counter(mapping, counter_offset) + value;
+            } else if (op != 0) {
+                throw std::invalid_argument("L3-L2 counter notify op is invalid");
+            }
+            store_counter(mapping, counter_offset, value);
+        },
+        nb::arg("handle"), nb::arg("counter_offset"), nb::arg("value"), nb::arg("op"),
+        "Store or add one L3 Host-side L3-L2 signal counter."
+    );
+    m.def(
+        "_l3_host_mapped_counter_test",
+        [](uint64_t handle, uint64_t counter_offset, int32_t operand, int cmp) {
+            L3HostMappedSimRegion &mapping = l3_host_mapped_region(handle);
+            if (counter_offset % sizeof(int32_t) != 0) {
+                throw std::invalid_argument("L3-L2 counter offset must be 4-byte aligned");
+            }
+            int32_t observed = load_counter(mapping, counter_offset);
+            return nb::make_tuple(compare_counter(observed, operand, cmp), observed);
+        },
+        nb::arg("handle"), nb::arg("counter_offset"), nb::arg("operand"), nb::arg("cmp"),
+        "Load and compare one L3 Host-side L3-L2 signal counter."
+    );
+    m.def(
+        "_l3_host_mapped_counter_wait",
+        [](uint64_t handle, uint64_t counter_offset, int32_t operand, int cmp, uint64_t timeout_ns) {
+            L3HostMappedSimRegion &mapping = l3_host_mapped_region(handle);
+            if (counter_offset % sizeof(int32_t) != 0) {
+                throw std::invalid_argument("L3-L2 counter offset must be 4-byte aligned");
+            }
+            auto deadline = std::chrono::steady_clock::now() + std::chrono::nanoseconds(timeout_ns);
+            int32_t observed = 0;
+            while (true) {
+                observed = load_counter(mapping, counter_offset);
+                bool matched = compare_counter(observed, operand, cmp);
+                if (matched) {
+                    return nb::make_tuple(0, 0, observed, true, std::string{});
+                }
+                if (std::chrono::steady_clock::now() >= deadline) {
+                    return nb::make_tuple(-1, 7, observed, false, std::string{"SIGNAL_WAIT timed out"});
+                }
+                std::this_thread::sleep_for(std::chrono::nanoseconds(50000));
+            }
+        },
+        nb::arg("handle"), nb::arg("counter_offset"), nb::arg("operand"), nb::arg("cmp"), nb::arg("timeout_ns"),
+        "Poll one L3 Host-side L3-L2 signal counter until match or timeout."
     );
 
     bind_worker(m);
