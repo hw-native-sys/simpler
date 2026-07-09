@@ -31,6 +31,13 @@ Usage:
     python -m simpler_setup.tools.deps_viewer DEPS_JSON
     python -m simpler_setup.tools.deps_viewer DEPS_JSON --format text
     python -m simpler_setup.tools.deps_viewer DEPS_JSON --format html --engine sfdp
+    python -m simpler_setup.tools.deps_viewer DEPS_JSON --edge-mode reduced
+
+``--edge-mode reduced`` applies transitive reduction: it drops every edge whose
+ordering is already implied by a longer dependency path (e.g. ``A->C`` when
+``A->B->C`` exists), prints the removed edges to stdout, and emits the reduced
+graph in whichever format is selected. It is purely structural (ignores per-edge
+tensor identity) and is skipped with a warning if the graph contains a cycle.
 
 HTML output requires Graphviz installed (``brew install graphviz`` /
 ``apt install graphviz``). Text output does not.
@@ -41,6 +48,7 @@ import json
 import shutil
 import subprocess
 import sys
+from collections import deque
 from pathlib import Path
 
 
@@ -194,6 +202,69 @@ def _load_deps_edges(deps_path):
             task_table[tid] = entry
     _backfill_output_tensor_ids(task_table, annotations)
     return sorted(edges), sorted(nodes), annotations, tensor_table, task_table
+
+
+def _transitive_reduction(edges, nodes):
+    """DAG transitive reduction on structural ``(pred, succ)`` edges.
+
+    An edge ``(u, v)`` is redundant when ``v`` is still reachable from ``u``
+    through some other path that does not use the direct ``(u, v)`` edge — i.e.
+    the dependency it expresses is already implied by a longer chain. Reduction
+    is purely structural: it ignores the per-edge tensor / arg annotations, so a
+    ``(u, v)`` carrying its own tensor is dropped whenever the ordering it
+    encodes is transitively covered.
+
+    Returns ``(kept_edges, removed_edges, is_dag)``. On a cyclic graph the input
+    edges are returned unchanged with ``is_dag=False`` (transitive reduction is
+    only well-defined on a DAG); the caller warns and emits the full graph.
+    """
+    succ: dict[int, set[int]] = {n: set() for n in nodes}
+    indeg: dict[int, int] = {n: 0 for n in nodes}
+    for u, v in edges:
+        succ.setdefault(u, set())
+        succ.setdefault(v, set())
+        indeg.setdefault(u, 0)
+        if v not in succ[u]:
+            succ[u].add(v)
+            indeg[v] = indeg.get(v, 0) + 1
+
+    # Kahn topological sort doubles as the cycle check: if we can't drain every
+    # node, a cycle remains and reduction would be ill-defined.
+    remaining = dict(indeg)
+    queue = deque(n for n, d in remaining.items() if d == 0)
+    visited = 0
+    while queue:
+        n = queue.popleft()
+        visited += 1
+        for m in succ[n]:
+            remaining[m] -= 1
+            if remaining[m] == 0:
+                queue.append(m)
+    if visited != len(succ):
+        return list(edges), [], False
+
+    def _reachable_avoiding_direct(src, dst):
+        # Can we get from src to dst WITHOUT taking the direct (src, dst) edge?
+        stack = [c for c in succ[src] if c != dst]
+        seen = set(stack)
+        while stack:
+            node = stack.pop()
+            if node == dst:
+                return True
+            for c in succ[node]:
+                if c not in seen:
+                    seen.add(c)
+                    stack.append(c)
+        return False
+
+    kept: list[tuple[int, int]] = []
+    removed: list[tuple[int, int]] = []
+    for u, v in edges:
+        if _reachable_avoiding_direct(u, v):
+            removed.append((u, v))
+        else:
+            kept.append((u, v))
+    return sorted(kept), sorted(removed), True
 
 
 def _backfill_output_tensor_ids(task_table, annotations):
@@ -1009,6 +1080,7 @@ Examples:
   %(prog)s deps.json --format text -o graph.txt
   %(prog)s deps.json --format html --engine sfdp
   %(prog)s deps.json --format html --show-tensor-info
+  %(prog)s deps.json --edge-mode reduced      # drop transitively-implied edges, print what was removed
 """,
     )
     p.add_argument("input", nargs="?", help="Path to deps.json (default: newest under ./outputs/).")
@@ -1018,6 +1090,16 @@ Examples:
         choices=["text", "html"],
         default="text",
         help="Output format: text (default) or html.",
+    )
+    p.add_argument(
+        "--edge-mode",
+        choices=["full", "reduced"],
+        default="full",
+        help=(
+            "full (default) draws every dependency edge; reduced applies transitive reduction, dropping edges "
+            "already implied by a longer path and printing the removed edges to stdout. Structural (pred,succ) "
+            "level; applies to both text and html. Skipped with a warning on a cyclic graph."
+        ),
     )
     p.add_argument(
         "--engine",
@@ -1085,10 +1167,27 @@ def main(argv=None):
     if meta:
         nodes = sorted(set(nodes) | set(meta.keys()), key=_sort_task_id_key)
 
+    reduced = False
+    if args.edge_mode == "reduced":
+        kept, removed, is_dag = _transitive_reduction(edges, nodes)
+        if not is_dag:
+            print(
+                "warning: dependency graph has a cycle; transitive reduction skipped, emitting full graph",
+                file=sys.stderr,
+            )
+        else:
+            fmt_task = _make_task_formatter(sorted(nodes, key=_sort_task_id_key))
+            print(f"Transitive reduction: removed {len(removed)} redundant edge(s) of {len(edges)} ({len(kept)} kept)")
+            for u, v in removed:
+                print(f"  - {fmt_task(u)} -> {fmt_task(v)}")
+            edges = kept
+            reduced = True
+
+    default_stem = "deps_viewer_reduced" if reduced else "deps_viewer"
     out = (
         Path(args.output)
         if args.output
-        else input_path.parent / ("deps_viewer.txt" if args.format == "text" else "deps_viewer.html")
+        else input_path.parent / f"{default_stem}.{'txt' if args.format == 'text' else 'html'}"
     )
     if args.format == "text":
         text = emit_text(

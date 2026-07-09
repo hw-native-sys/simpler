@@ -302,15 +302,30 @@ python -m simpler_setup.tools.deps_viewer outputs/<case>_<ts>/deps.json \
 # Override task labels with a func_id -> name mapping
 python -m simpler_setup.tools.deps_viewer outputs/<case>_<ts>/deps.json \
     --func-names outputs/<case>_<ts>/name_map_TestPA_basic.json
+
+# Transitive reduction: drop edges implied by a longer path, print what was removed
+python -m simpler_setup.tools.deps_viewer outputs/<case>_<ts>/deps.json \
+    --edge-mode reduced
 ```
+
+`--edge-mode reduced` removes every dependency edge that is already implied by a
+longer path — e.g. `A->C` is dropped when `A->B->C` exists — so the graph shows
+only the minimal (transitively-reduced) edge set. The removed edges are printed
+to stdout as an `r<ring>t<local> -> r<ring>t<local>` list, and both `text` and
+`html` output honor the mode. When `-o` is omitted the reduced graph is written
+to the `deps_viewer_reduced.*` stem (rather than `deps_viewer.*`) so it never
+clobbers a full-graph render in the same directory. Reduction is purely
+structural (it ignores the per-edge tensor/arg identity) and is skipped with a
+warning if the graph contains a cycle.
 
 ### Command-Line Options
 
 | Option | Short | Description |
 | ------ | ----- | ----------- |
 | `input` | | Path to `deps.json` (default: newest under `./outputs/`) |
-| `--output` | `-o` | Output path (default: `deps_viewer.txt` for text, `deps_viewer.html` for HTML) |
+| `--output` | `-o` | Output path (default: `deps_viewer.txt` for text, `deps_viewer.html` for HTML; `--edge-mode reduced` uses the `deps_viewer_reduced.*` stem) |
 | `--format` | | Output format: `text` (default) or `html` |
+| `--edge-mode` | | `full` (default) draws every edge; `reduced` applies transitive reduction, dropping edges implied by a longer path and printing the removed edges. Applies to both formats. |
 | `--engine` | | HTML-only Graphviz layout engine: `dot` (default), `sfdp`, `neato`, `fdp`, `circo`, `twopi` |
 | `--direction` | | HTML-only flow direction for hierarchical layouts: `LR` (default) / `TB` / `BT` / `RL` |
 | `--show-tensor-info` | | HTML-only: render per-task tensor rows and route edges to specific arg ports |
