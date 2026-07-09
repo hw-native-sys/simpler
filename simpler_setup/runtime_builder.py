@@ -9,6 +9,7 @@
 import fcntl
 import json
 import logging
+import os
 import shutil
 import subprocess
 from concurrent.futures import ThreadPoolExecutor
@@ -341,8 +342,21 @@ class RuntimeBuilder:
         def _compile_target(target: str) -> Path:
             include_dirs, source_dirs = self._resolve_target_dirs(config_dir, build_config, target)
             cmake_defines = None
-            if target == "host" and build_pto_isa_commit:
-                cmake_defines = {"SIMPLER_PTO_ISA_BUILD_COMMIT": build_pto_isa_commit}
+            if target == "host":
+                defines: dict[str, str] = {}
+                if build_pto_isa_commit:
+                    defines["SIMPLER_PTO_ISA_BUILD_COMMIT"] = build_pto_isa_commit
+                # Mirror the SIMPLER_ENABLE_PTO_SDMA_WORKSPACE env var into the
+                # CMake option (src/{arch}/platform/onboard/host/CMakeLists.txt)
+                # so the a5 SDMA workspace overlay is built only when opted in.
+                if os.environ.get("SIMPLER_ENABLE_PTO_SDMA_WORKSPACE", "").upper() in {
+                    "1",
+                    "ON",
+                    "TRUE",
+                    "YES",
+                }:
+                    defines["SIMPLER_ENABLE_PTO_SDMA_WORKSPACE"] = "ON"
+                cmake_defines = defines or None
             # compile() adds a {target}/ subdirectory inside build_dir
             cache_dir = self._CACHE_DIR / arch / variant / name
             cache_dir.mkdir(parents=True, exist_ok=True)

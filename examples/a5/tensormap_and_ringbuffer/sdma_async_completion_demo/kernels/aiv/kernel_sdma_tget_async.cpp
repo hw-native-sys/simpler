@@ -44,6 +44,9 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
 
     int rank = static_cast<int>(comm_ctx->rankId);
     int nranks = static_cast<int>(comm_ctx->rankNum);
+    // workSpace == 0 means the SDMA overlay is not built in
+    // (SIMPLER_ENABLE_PTO_SDMA_WORKSPACE=OFF, see docs/a5-sdma-overlay.md
+    // #1315): self-skip rather than dereferencing a null workspace.
     if (nranks != 2 || comm_ctx->workSpace == 0) {
         pipe_barrier(PIPE_ALL);
         return;

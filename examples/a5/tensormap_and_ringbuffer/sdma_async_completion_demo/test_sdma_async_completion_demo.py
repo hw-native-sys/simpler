@@ -191,6 +191,11 @@ def run(
 @pytest.mark.platforms(["a5"])
 @pytest.mark.runtime("tensormap_and_ringbuffer")
 @pytest.mark.device_count(2)
+@pytest.mark.skipif(
+    os.environ.get("SIMPLER_ENABLE_PTO_SDMA_WORKSPACE", "").upper() not in {"1", "ON", "TRUE", "YES"},
+    reason="SDMA workspace overlay not enabled (set SIMPLER_ENABLE_PTO_SDMA_WORKSPACE=ON to run). "
+    "See docs/a5-sdma-overlay.md (#1315).",
+)
 def test_sdma_async_completion_demo(st_device_ids, st_platform) -> None:
     assert run(st_platform, [int(d) for d in st_device_ids]) == 0
 

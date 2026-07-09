@@ -23,6 +23,19 @@ from .toolchain import Aarch64GxxToolchain, CCECToolchain, GxxToolchain, Toolcha
 logger = logging.getLogger(__name__)
 
 
+_SDMA_WORKSPACE_TRUTHY = {"1", "ON", "TRUE", "YES"}
+
+
+def _sdma_workspace_enabled() -> bool:
+    """Whether the a5 PTO SDMA workspace overlay is opted in.
+
+    Mirrors the CMake ``option(SIMPLER_ENABLE_PTO_SDMA_WORKSPACE ... OFF)`` in
+    src/a5/platform/onboard/host/CMakeLists.txt. Set the env var of the same
+    name to a truthy value (1/ON/TRUE/YES) to enable the overlay at build time.
+    """
+    return os.environ.get("SIMPLER_ENABLE_PTO_SDMA_WORKSPACE", "").upper() in _SDMA_WORKSPACE_TRUTHY
+
+
 class BuildTarget:
     """CMake build target: composes a Toolchain with a source directory and output name.
 
@@ -171,11 +184,15 @@ class RuntimeCompiler:
     def _init_a5(self):
         """Initialize toolchains for real a5 hardware."""
         env_manager.ensure("ASCEND_HOME_PATH")
-        # a5 onboard host_runtime hard-depends on pto-isa headers + CANN-9.0
-        # aclnn syms (cf. src/a5/platform/onboard/host/CMakeLists.txt
-        # SIMPLER_ENABLE_PTO_SDMA_WORKSPACE marker). PTO_ISA_ROOT must be
-        # populated by the caller — same contract as a2a3 onboard.
-        env_manager.ensure("PTO_ISA_ROOT")
+        # The PTO SDMA workspace overlay (comm_hccl.cpp ensure_sdma_workspace +
+        # libnnopbase link) is opt-in via the SIMPLER_ENABLE_PTO_SDMA_WORKSPACE
+        # env var, mirrored to the CMake option of the same name in
+        # src/a5/platform/onboard/host/CMakeLists.txt. Default OFF because the
+        # available a5 CANN drops lack working aclnnShmemSdmaStarsQuery
+        # primitives — see docs/a5-sdma-overlay.md (#1315). When opted in, the
+        # host build needs pto-isa headers via PTO_ISA_ROOT (same contract as a2a3).
+        if _sdma_workspace_enabled():
+            env_manager.ensure("PTO_ISA_ROOT")
 
         # AICore: Bisheng CCE compiler with A5 platform
         ccec = CCECToolchain(platform="a5")

@@ -33,20 +33,25 @@ else()
     message(FATAL_ERROR "MUST set CUSTOM_INCLUDE_DIRS to build Host runtime")
 endif()
 
-# SIMPLER_ENABLE_PTO_SDMA_WORKSPACE: marker for an outstanding architectural
-# issue. The SDMA workspace init in comm_hccl.cpp pulls in pto-isa
-# headers and CANN-9.0-only aclnn symbols (aclnnShmemSdmaStarsQuery*),
-# even though it is logically orthogonal to HCCL comm bootstrap and only
-# needed by the sdma_async_completion_demo. Until that coupling is
-# refactored away, the macro is forced ON: PTO_ISA_ROOT and CANN 9.0+ are
-# hard build/runtime preconditions for a5 onboard.
-set(SIMPLER_ENABLE_PTO_SDMA_WORKSPACE ON)
-if(NOT DEFINED ENV{PTO_ISA_ROOT})
-    message(FATAL_ERROR
-        "a5 onboard host_runtime requires PTO_ISA_ROOT "
-        "(SIMPLER_ENABLE_PTO_SDMA_WORKSPACE is forced ON; needs pto-isa headers + CANN 9.0+)")
+# SIMPLER_ENABLE_PTO_SDMA_WORKSPACE: opt-in overlay that wires the PTO-ISA
+# async-SDMA workspace into comm_alloc_windows. When ON it pulls in pto-isa
+# headers and CANN-9.0+ aclnn symbols (aclnnShmemSdmaStarsQuery*) and links
+# libnnopbase, so it requires a CANN drop that actually exposes working a5
+# SDMA primitives. Default OFF because the available a5 CANN drops break
+# (AICPU exception -> 507018, or HCCL_E_INTERNAL). See
+# docs/a5-sdma-overlay.md for the full isolation status and re-enable steps
+# (#1315).
+# Flip ON via -DSIMPLER_ENABLE_PTO_SDMA_WORKSPACE=ON (or the env var of the
+# same name, forwarded by simpler_setup/runtime_builder.py).
+option(SIMPLER_ENABLE_PTO_SDMA_WORKSPACE "Enable a5 PTO SDMA workspace overlay" OFF)
+if(SIMPLER_ENABLE_PTO_SDMA_WORKSPACE)
+    if(NOT DEFINED ENV{PTO_ISA_ROOT})
+        message(FATAL_ERROR
+            "a5 onboard host_runtime with SIMPLER_ENABLE_PTO_SDMA_WORKSPACE=ON requires PTO_ISA_ROOT "
+            "(needs pto-isa headers + CANN 9.0+ with a5 SDMA primitives)")
+    endif()
+    list(APPEND CMAKE_CUSTOM_INCLUDE_DIRS "$ENV{PTO_ISA_ROOT}/include")
 endif()
-list(APPEND CMAKE_CUSTOM_INCLUDE_DIRS "$ENV{PTO_ISA_ROOT}/include")
 
 # Build complete source list: core host sources + sources from CUSTOM_SOURCE_DIRS
 set(HOST_RUNTIME_SOURCES "")
