@@ -23,6 +23,7 @@
 #include <nanobind/stl/tuple.h>
 #include <nanobind/stl/vector.h>
 
+#include <dlfcn.h>
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
@@ -30,14 +31,16 @@
 
 #include <chrono>
 #include <cerrno>
+#include <array>
 #include <cstring>
 #include <limits>
 #include <mutex>
-#include <thread>
+#include <optional>
 #include <unordered_map>
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -54,17 +57,25 @@ namespace nb = nanobind;
 
 namespace {
 
-struct L3HostMappedSimRegion {
+enum class L3HostMappedRegionProfile : uint32_t {
+    ONBOARD_ACL_IPC = 1,
+    SIM_POSIX_SHM = 2,
+};
+
+struct L3HostMappedRegion {
+    L3HostMappedRegionProfile profile{L3HostMappedRegionProfile::SIM_POSIX_SHM};
     int fd{-1};
     void *base{nullptr};
+    int device_id{-1};
+    std::array<char, 65> export_key{};
     size_t size{0};
 };
 
 std::mutex g_l3_host_mapped_region_mu;
-std::unordered_map<uint64_t, L3HostMappedSimRegion> g_l3_host_mapped_regions;
+std::unordered_map<uint64_t, L3HostMappedRegion> g_l3_host_mapped_regions;
 uint64_t g_next_l3_host_mapped_region_handle = 1;
 
-L3HostMappedSimRegion &l3_host_mapped_region(uint64_t handle) {
+L3HostMappedRegion &l3_host_mapped_region(uint64_t handle) {
     std::lock_guard<std::mutex> lk(g_l3_host_mapped_region_mu);
     auto it = g_l3_host_mapped_regions.find(handle);
     if (it == g_l3_host_mapped_regions.end()) {
@@ -73,22 +84,10 @@ L3HostMappedSimRegion &l3_host_mapped_region(uint64_t handle) {
     return it->second;
 }
 
-void validate_mapping_range(const L3HostMappedSimRegion &mapping, uint64_t offset, uint64_t nbytes) {
+void validate_mapping_range(const L3HostMappedRegion &mapping, uint64_t offset, uint64_t nbytes) {
     if (nbytes == 0 || offset > mapping.size || nbytes > mapping.size - static_cast<size_t>(offset)) {
         throw std::out_of_range("L3-L2 L3 Host mapped-region access is out of range");
     }
-}
-
-int32_t load_counter(const L3HostMappedSimRegion &mapping, uint64_t offset) {
-    validate_mapping_range(mapping, offset, sizeof(int32_t));
-    int32_t value = 0;
-    std::memcpy(&value, static_cast<const uint8_t *>(mapping.base) + offset, sizeof(value));
-    return value;
-}
-
-void store_counter(const L3HostMappedSimRegion &mapping, uint64_t offset, int32_t value) {
-    validate_mapping_range(mapping, offset, sizeof(int32_t));
-    std::memcpy(static_cast<uint8_t *>(mapping.base) + offset, &value, sizeof(value));
 }
 
 bool compare_counter(int32_t observed, int32_t operand, int cmp) {
@@ -118,6 +117,140 @@ std::string shm_name_for_open(const std::string &token) {
         return token;
     }
     return "/" + token;
+}
+
+constexpr int kAclSuccess = 0;
+constexpr int kAclMemcpyHostToDevice = 1;
+constexpr int kAclMemcpyDeviceToHost = 2;
+constexpr uint64_t kAclIpcImportEnablePeerAccess = 0x1ULL;
+
+struct AclRuntimeApi {
+    void *lib{nullptr};
+    int (*aclInit)(const char *){nullptr};
+    int (*aclrtSetDevice)(int){nullptr};
+    int (*aclrtMemcpy)(void *, size_t, const void *, size_t, int){nullptr};
+    int (*aclrtIpcMemGetExportKey)(void *, size_t, char *, size_t, uint64_t){nullptr};
+    int (*aclrtIpcMemClose)(const char *){nullptr};
+    int (*aclrtIpcMemImportByKey)(void **, const char *, uint64_t){nullptr};
+    int (*aclrtIpcMemSetImportPid)(const char *, int32_t *, size_t){nullptr};
+    bool initialized{false};
+};
+
+std::mutex g_acl_api_mu;
+std::optional<AclRuntimeApi> g_acl_api;
+
+void *resolve_symbol(void *lib, const char *name) {
+    void *sym = dlsym(RTLD_DEFAULT, name);
+    if (sym == nullptr && lib != nullptr) {
+        sym = dlsym(lib, name);
+    }
+    if (sym == nullptr) {
+        throw std::runtime_error(std::string("CANN ACL symbol not found: ") + name);
+    }
+    return sym;
+}
+
+AclRuntimeApi &acl_api() {
+    std::lock_guard<std::mutex> lk(g_acl_api_mu);
+    if (!g_acl_api.has_value()) {
+        AclRuntimeApi api{};
+        api.lib = dlopen("libascendcl.so", RTLD_NOW | RTLD_LOCAL);
+        if (api.lib == nullptr) {
+            api.lib = dlopen("libascendcl.so.1", RTLD_NOW | RTLD_LOCAL);
+        }
+        if (api.lib == nullptr && dlsym(RTLD_DEFAULT, "aclrtMemcpy") == nullptr) {
+            throw std::runtime_error(std::string("failed to load libascendcl.so: ") + dlerror());
+        }
+        api.aclInit = reinterpret_cast<int (*)(const char *)>(dlsym(RTLD_DEFAULT, "aclInit"));
+        if (api.aclInit == nullptr && api.lib != nullptr) {
+            api.aclInit = reinterpret_cast<int (*)(const char *)>(dlsym(api.lib, "aclInit"));
+        }
+        api.aclrtSetDevice = reinterpret_cast<int (*)(int)>(resolve_symbol(api.lib, "aclrtSetDevice"));
+        api.aclrtMemcpy = reinterpret_cast<int (*)(void *, size_t, const void *, size_t, int)>(
+            resolve_symbol(api.lib, "aclrtMemcpy")
+        );
+        api.aclrtIpcMemGetExportKey = reinterpret_cast<int (*)(void *, size_t, char *, size_t, uint64_t)>(
+            resolve_symbol(api.lib, "aclrtIpcMemGetExportKey")
+        );
+        api.aclrtIpcMemClose = reinterpret_cast<int (*)(const char *)>(resolve_symbol(api.lib, "aclrtIpcMemClose"));
+        api.aclrtIpcMemImportByKey = reinterpret_cast<int (*)(void **, const char *, uint64_t)>(
+            resolve_symbol(api.lib, "aclrtIpcMemImportByKey")
+        );
+        api.aclrtIpcMemSetImportPid = reinterpret_cast<int (*)(const char *, int32_t *, size_t)>(
+            resolve_symbol(api.lib, "aclrtIpcMemSetImportPid")
+        );
+        g_acl_api = api;
+    }
+    AclRuntimeApi &api = *g_acl_api;
+    if (!api.initialized && api.aclInit != nullptr) {
+        int rc = api.aclInit(nullptr);
+        if (rc != kAclSuccess) {
+            throw std::runtime_error("aclInit failed with code " + std::to_string(rc));
+        }
+        api.initialized = true;
+    }
+    return api;
+}
+
+void acl_check(int rc, const char *op) {
+    if (rc != kAclSuccess) {
+        throw std::runtime_error(std::string(op) + " failed with code " + std::to_string(rc));
+    }
+}
+
+void bind_acl_device(const L3HostMappedRegion &mapping) {
+    if (mapping.device_id < 0) {
+        throw std::runtime_error("L3-L2 onboard mapped-region handle has no device id");
+    }
+    AclRuntimeApi &api = acl_api();
+    acl_check(api.aclrtSetDevice(mapping.device_id), "aclrtSetDevice");
+}
+
+void l3_host_copy_to_mapping(
+    const L3HostMappedRegion &mapping, uint64_t offset, const void *host_ptr, uint64_t nbytes
+) {
+    validate_mapping_range(mapping, offset, nbytes);
+    if (mapping.profile == L3HostMappedRegionProfile::SIM_POSIX_SHM) {
+        std::memcpy(static_cast<uint8_t *>(mapping.base) + offset, host_ptr, static_cast<size_t>(nbytes));
+        return;
+    }
+    bind_acl_device(mapping);
+    AclRuntimeApi &api = acl_api();
+    void *dst = static_cast<uint8_t *>(mapping.base) + offset;
+    acl_check(
+        api.aclrtMemcpy(
+            dst, static_cast<size_t>(nbytes), host_ptr, static_cast<size_t>(nbytes), kAclMemcpyHostToDevice
+        ),
+        "aclrtMemcpy H2D"
+    );
+}
+
+void l3_host_copy_from_mapping(const L3HostMappedRegion &mapping, void *host_ptr, uint64_t offset, uint64_t nbytes) {
+    validate_mapping_range(mapping, offset, nbytes);
+    if (mapping.profile == L3HostMappedRegionProfile::SIM_POSIX_SHM) {
+        std::memcpy(host_ptr, static_cast<const uint8_t *>(mapping.base) + offset, static_cast<size_t>(nbytes));
+        return;
+    }
+    bind_acl_device(mapping);
+    AclRuntimeApi &api = acl_api();
+    const void *src = static_cast<const uint8_t *>(mapping.base) + offset;
+    acl_check(
+        api.aclrtMemcpy(
+            host_ptr, static_cast<size_t>(nbytes), src, static_cast<size_t>(nbytes), kAclMemcpyDeviceToHost
+        ),
+        "aclrtMemcpy D2H"
+    );
+}
+
+int32_t load_counter(const L3HostMappedRegion &mapping, uint64_t offset) {
+    // Onboard imported GM counters are observed with 4-byte ACL copies, not CPU loads.
+    int32_t value = 0;
+    l3_host_copy_from_mapping(mapping, &value, offset, sizeof(value));
+    return value;
+}
+
+void store_counter(const L3HostMappedRegion &mapping, uint64_t offset, int32_t value) {
+    l3_host_copy_to_mapping(mapping, offset, &value, sizeof(value));
 }
 
 }  // namespace
@@ -1112,9 +1245,12 @@ NB_MODULE(_task_interface, m) {
             std::lock_guard<std::mutex> lk(g_l3_host_mapped_region_mu);
             uint64_t handle = g_next_l3_host_mapped_region_handle++;
             g_l3_host_mapped_regions.emplace(
-                handle, L3HostMappedSimRegion{
+                handle, L3HostMappedRegion{
+                            L3HostMappedRegionProfile::SIM_POSIX_SHM,
                             fd,
                             base,
+                            -1,
+                            {},
                             static_cast<size_t>(mapping_bytes),
                         }
             );
@@ -1124,9 +1260,40 @@ NB_MODULE(_task_interface, m) {
         "Import a sim L3-L2 POSIX shm region for L3 Host mapped-region access."
     );
     m.def(
+        "_l3_host_mapped_region_import_onboard",
+        [](int device_id, const std::string &export_key, uint64_t mapping_bytes, bool enable_peer_access) -> uint64_t {
+            if (device_id < 0) {
+                throw std::invalid_argument("L3-L2 onboard mapped-region import requires a non-negative device id");
+            }
+            if (export_key.empty() || export_key.size() >= 65) {
+                throw std::invalid_argument("L3-L2 onboard mapped-region import requires a valid ACL IPC export key");
+            }
+            if (mapping_bytes == 0 || mapping_bytes > static_cast<uint64_t>(std::numeric_limits<size_t>::max())) {
+                throw std::invalid_argument("L3-L2 onboard mapped-region import requires a positive mapping size");
+            }
+            L3HostMappedRegion mapping{};
+            mapping.profile = L3HostMappedRegionProfile::ONBOARD_ACL_IPC;
+            mapping.device_id = device_id;
+            mapping.size = static_cast<size_t>(mapping_bytes);
+            std::memcpy(mapping.export_key.data(), export_key.data(), export_key.size());
+            bind_acl_device(mapping);
+            AclRuntimeApi &api = acl_api();
+            uint64_t flags = enable_peer_access ? kAclIpcImportEnablePeerAccess : 0;
+            acl_check(
+                api.aclrtIpcMemImportByKey(&mapping.base, mapping.export_key.data(), flags), "aclrtIpcMemImportByKey"
+            );
+            std::lock_guard<std::mutex> lk(g_l3_host_mapped_region_mu);
+            uint64_t handle = g_next_l3_host_mapped_region_handle++;
+            g_l3_host_mapped_regions.emplace(handle, mapping);
+            return handle;
+        },
+        nb::arg("device_id"), nb::arg("export_key"), nb::arg("mapping_bytes"), nb::arg("enable_peer_access") = true,
+        "Import an onboard ACL IPC L3-L2 region for L3 Host mapped-region access."
+    );
+    m.def(
         "_l3_host_mapped_region_close",
         [](uint64_t handle) {
-            L3HostMappedSimRegion mapping{};
+            L3HostMappedRegion mapping{};
             {
                 std::lock_guard<std::mutex> lk(g_l3_host_mapped_region_mu);
                 auto it = g_l3_host_mapped_regions.find(handle);
@@ -1135,6 +1302,12 @@ NB_MODULE(_task_interface, m) {
                 }
                 mapping = it->second;
                 g_l3_host_mapped_regions.erase(it);
+            }
+            if (mapping.profile == L3HostMappedRegionProfile::ONBOARD_ACL_IPC) {
+                bind_acl_device(mapping);
+                AclRuntimeApi &api = acl_api();
+                acl_check(api.aclrtIpcMemClose(mapping.export_key.data()), "aclrtIpcMemClose");
+                return;
             }
             if (mapping.base != nullptr) {
                 munmap(mapping.base, mapping.size);
@@ -1151,11 +1324,9 @@ NB_MODULE(_task_interface, m) {
             if (host_ptr == 0) {
                 throw std::invalid_argument("L3-L2 payload_write host_ptr must be nonzero");
             }
-            L3HostMappedSimRegion &mapping = l3_host_mapped_region(handle);
-            validate_mapping_range(mapping, payload_offset, nbytes);
-            std::memcpy(
-                static_cast<uint8_t *>(mapping.base) + payload_offset,
-                reinterpret_cast<const void *>(static_cast<uintptr_t>(host_ptr)), static_cast<size_t>(nbytes)
+            L3HostMappedRegion &mapping = l3_host_mapped_region(handle);
+            l3_host_copy_to_mapping(
+                mapping, payload_offset, reinterpret_cast<const void *>(static_cast<uintptr_t>(host_ptr)), nbytes
             );
         },
         nb::arg("handle"), nb::arg("payload_offset"), nb::arg("host_ptr"), nb::arg("nbytes"),
@@ -1167,11 +1338,9 @@ NB_MODULE(_task_interface, m) {
             if (host_ptr == 0) {
                 throw std::invalid_argument("L3-L2 payload_read host_ptr must be nonzero");
             }
-            L3HostMappedSimRegion &mapping = l3_host_mapped_region(handle);
-            validate_mapping_range(mapping, payload_offset, nbytes);
-            std::memcpy(
-                reinterpret_cast<void *>(static_cast<uintptr_t>(host_ptr)),
-                static_cast<const uint8_t *>(mapping.base) + payload_offset, static_cast<size_t>(nbytes)
+            L3HostMappedRegion &mapping = l3_host_mapped_region(handle);
+            l3_host_copy_from_mapping(
+                mapping, reinterpret_cast<void *>(static_cast<uintptr_t>(host_ptr)), payload_offset, nbytes
             );
         },
         nb::arg("handle"), nb::arg("payload_offset"), nb::arg("host_ptr"), nb::arg("nbytes"),
@@ -1180,7 +1349,7 @@ NB_MODULE(_task_interface, m) {
     m.def(
         "_l3_host_mapped_counter_notify",
         [](uint64_t handle, uint64_t counter_offset, int32_t value, int op) {
-            L3HostMappedSimRegion &mapping = l3_host_mapped_region(handle);
+            L3HostMappedRegion &mapping = l3_host_mapped_region(handle);
             if (counter_offset % sizeof(int32_t) != 0) {
                 throw std::invalid_argument("L3-L2 counter offset must be 4-byte aligned");
             }
@@ -1197,7 +1366,7 @@ NB_MODULE(_task_interface, m) {
     m.def(
         "_l3_host_mapped_counter_test",
         [](uint64_t handle, uint64_t counter_offset, int32_t operand, int cmp) {
-            L3HostMappedSimRegion &mapping = l3_host_mapped_region(handle);
+            L3HostMappedRegion &mapping = l3_host_mapped_region(handle);
             if (counter_offset % sizeof(int32_t) != 0) {
                 throw std::invalid_argument("L3-L2 counter offset must be 4-byte aligned");
             }
@@ -1210,7 +1379,7 @@ NB_MODULE(_task_interface, m) {
     m.def(
         "_l3_host_mapped_counter_wait",
         [](uint64_t handle, uint64_t counter_offset, int32_t operand, int cmp, uint64_t timeout_ns) {
-            L3HostMappedSimRegion &mapping = l3_host_mapped_region(handle);
+            L3HostMappedRegion &mapping = l3_host_mapped_region(handle);
             if (counter_offset % sizeof(int32_t) != 0) {
                 throw std::invalid_argument("L3-L2 counter offset must be 4-byte aligned");
             }
@@ -1230,6 +1399,42 @@ NB_MODULE(_task_interface, m) {
         },
         nb::arg("handle"), nb::arg("counter_offset"), nb::arg("operand"), nb::arg("cmp"), nb::arg("timeout_ns"),
         "Poll one L3 Host-side L3-L2 signal counter until match or timeout."
+    );
+    m.def(
+        "_l3_child_onboard_region_export",
+        [](uint64_t dev_ptr, uint64_t nbytes, int32_t parent_pid) -> std::string {
+            if (dev_ptr == 0 || nbytes == 0 || nbytes > static_cast<uint64_t>(std::numeric_limits<size_t>::max())) {
+                throw std::invalid_argument("L3-L2 onboard child export requires a valid device allocation");
+            }
+            if (parent_pid <= 0) {
+                throw std::invalid_argument("L3-L2 onboard child export requires a positive parent pid");
+            }
+            AclRuntimeApi &api = acl_api();
+            char key[65]{};
+            acl_check(
+                api.aclrtIpcMemGetExportKey(
+                    reinterpret_cast<void *>(static_cast<uintptr_t>(dev_ptr)), static_cast<size_t>(nbytes), key,
+                    sizeof(key), 0
+                ),
+                "aclrtIpcMemGetExportKey"
+            );
+            int32_t pid = parent_pid;
+            acl_check(api.aclrtIpcMemSetImportPid(key, &pid, 1), "aclrtIpcMemSetImportPid");
+            return std::string(key);
+        },
+        nb::arg("dev_ptr"), nb::arg("nbytes"), nb::arg("parent_pid"),
+        "Export a child-owned onboard GM region through ACL IPC and authorize the L3 Host PID."
+    );
+    m.def(
+        "_l3_child_onboard_region_close",
+        [](const std::string &export_key) {
+            if (export_key.empty() || export_key.size() >= 65) {
+                return;
+            }
+            AclRuntimeApi &api = acl_api();
+            acl_check(api.aclrtIpcMemClose(export_key.c_str()), "aclrtIpcMemClose");
+        },
+        nb::arg("export_key"), "Close a child-owned onboard ACL IPC export key."
     );
 
     bind_worker(m);

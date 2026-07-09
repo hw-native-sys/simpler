@@ -47,11 +47,12 @@ region.free()
 
 The L3 handle exposes `descriptor_scalars`, `payload_write`, `payload_read`,
 `counter(offset)`, and `free`. Payload operations copy contiguous bytes between
-the caller's Host buffer and the region payload range. On simulation platforms,
-that buffer only needs to be accessible from the L3 Host orchestration code. On
-onboard platforms, payload buffers must be Host tensors returned by
-`orch.alloc(...)`, so the L2 Host runtime can access them. Counter handles
-expose `notify`, `test`, and `wait` over address-based `int32_t` counters.
+the caller's Host buffer and the region payload range. The steady-state data
+path runs in the L3 Host process on both simulation and onboard platforms.
+Simulation maps a shared POSIX backing object. Onboard imports the child-owned
+GM region with ACL IPC and moves bytes with ACL copy operations. Counter
+handles expose `notify`, `test`, and `wait` over address-based `int32_t`
+counters.
 
 On L2, orchestration code consumes the descriptor and builds an endpoint:
 
@@ -138,15 +139,16 @@ existing worker mailbox. Create returns the unchanged six-scalar L2 descriptor
 plus L3 Host-private transport metadata. Release is deferred until submitted L2
 work has drained.
 
-On simulation platforms, steady-state `payload_write`, `payload_read`,
-`SIGNAL_NOTIFY`, `SIGNAL_TEST`, and `SIGNAL_WAIT` run in the L3 Host against an
-L3 Host mapping of the communication region. The descriptor still contains
-L2-side payload and counter addresses for the L2 AICPU endpoint; L3 Host
-operations use private metadata and do not dereference descriptor addresses.
+Steady-state `payload_write`, `payload_read`, `SIGNAL_NOTIFY`, `SIGNAL_TEST`,
+and `SIGNAL_WAIT` run in the L3 Host against parent-private direct-access
+metadata. The descriptor still contains L2-side payload and counter addresses
+for the L2 AICPU endpoint; L3 Host operations do not dereference descriptor
+addresses.
 
-On onboard platforms, the same public API is supported. L3 Host payload and
-counter operations are mediated by the L2 Host runtime, while the descriptor
-addresses remain owned by the L2 side and consumed by the L2 AICPU endpoint.
+On onboard platforms, region create allocates one child-owned GM range, exports
+it with ACL IPC, authorizes the L3 Host PID, and returns the export metadata to
+the parent. The parent imports that region and closes the ACL IPC import before
+the child frees the physical allocation.
 
 ## 4. Signal Counters
 
@@ -179,10 +181,13 @@ ep.signal_wait(
 - `Add`: add the operand to the current counter value.
 
 `Add` is a convenience read-modify-write operation, not an atomic operation.
-The primitive layer requires only 4-byte counter-address alignment and does not
-force 64-byte counter offsets. This leaves room for one writer to pack a batch
-of related counters into the same cache line when that is the right protocol
-shape.
+On simulation, L3 counter reads and writes access the parent-side mapping
+directly. On onboard, L3 counter reads and writes use 4-byte ACL copy
+operations through the imported GM pointer; the parent does not CPU-dereference
+imported GM counters. The primitive layer requires only 4-byte counter-address
+alignment and does not force 64-byte counter offsets. This leaves room for one
+writer to pack a batch of related counters into the same cache line when that
+is the right protocol shape.
 
 The ownership invariant is still single-writer per 64-byte cache line: all
 counters in one cache line must have the same writer. Counters written by
@@ -208,8 +213,8 @@ observe point before reading protected data. A failed `signal_test` does not
 establish observe semantics.
 
 That contract is not provided by Host-side `atomic_thread_fence` calls alone.
-Cross-agent payload and counter visibility comes from successful payload
-command completion, backend DMA ordering, endpoint cache maintenance on onboard
+Cross-agent payload and counter visibility comes from successful parent-side
+direct transfers, backend DMA ordering, endpoint cache maintenance on onboard
 builds, and wrapper-level sequencing that publishes only after prior writes are
 complete.
 

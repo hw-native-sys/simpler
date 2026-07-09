@@ -29,6 +29,7 @@ try:
         _l3_host_mapped_payload_read,
         _l3_host_mapped_payload_write,
         _l3_host_mapped_region_close,
+        _l3_host_mapped_region_import_onboard,
         _l3_host_mapped_region_import_sim,
     )
 except ImportError:
@@ -42,6 +43,7 @@ except ImportError:
     _l3_host_mapped_payload_read = _missing_l3_host_helper
     _l3_host_mapped_payload_write = _missing_l3_host_helper
     _l3_host_mapped_region_close = _missing_l3_host_helper
+    _l3_host_mapped_region_import_onboard = _missing_l3_host_helper
     _l3_host_mapped_region_import_sim = _missing_l3_host_helper
 
 

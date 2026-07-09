@@ -84,10 +84,10 @@ return `None` when no output message is available.
 
 The L3 buffer arguments may be runtime-managed tensors returned by
 `orch.alloc(...)` or ordinary contiguous Python byte buffers such as `bytes`
-and `bytearray`. Runtime-managed tensors use the direct registered-buffer path.
-Ordinary host buffers are staged through an internal registered scratch buffer
-before shared queue state is modified. Zero-byte messages use
-`buffer_or_none=None` and `nbytes=0`.
+and `bytearray`. The queue delegates payload movement to the underlying
+primitive region backend: simulation uses the parent mapping, and onboard uses
+ACL IPC imports plus ACL copy operations from the L3 Host process. Zero-byte
+messages use `buffer_or_none=None` and `nbytes=0`.
 
 L3 requests graceful shutdown by publishing an input-side `STOP` descriptor:
 
