@@ -57,11 +57,11 @@ Each rank's input: `[i + rank*100 for i in range(256)]`. Allreduce produces the 
 
 ```bash
 # P2 tests (2 devices)
-pytest tests/st/a2a3/tensormap_and_ringbuffer/collectives/allreduce/ \
+pytest tests/st/worker/collectives/allreduce/ \
   --platform a2a3sim --device 0-1 -k "P2"
 
 # P4 tests (4 devices)
-pytest tests/st/a2a3/tensormap_and_ringbuffer/collectives/allreduce/ \
+pytest tests/st/worker/collectives/allreduce/ \
   --platform a2a3sim --device 0-3 -k "P4 or Ibing"
 ```
 

@@ -28,7 +28,7 @@ Each rank's input: `[i + rank*100 for i in range(nranks*64)]`. Rank r verifies t
 ## Run
 
 ```bash
-pytest tests/st/a2a3/tensormap_and_ringbuffer/collectives/reduce_scatter/ \
+pytest tests/st/worker/collectives/reduce_scatter/ \
   --platform a2a3sim --device 0-3 -v
 ```
 

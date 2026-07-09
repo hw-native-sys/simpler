@@ -27,7 +27,7 @@ Rank r receives in slot s the data that rank s originally prepared for rank r.
 ## Run
 
 ```bash
-pytest tests/st/a2a3/tensormap_and_ringbuffer/collectives/all_to_all/ \
+pytest tests/st/worker/collectives/all_to_all/ \
   --platform a2a3sim --device 0-3 -v
 ```
 

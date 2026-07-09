@@ -7,7 +7,7 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""Scene test for distributed all-to-all.
+"""Scene test for distributed allgather.
 
 NOTE: Each nranks gets its own SceneTestCase subclass (not multiple CASES per
 class) because multiple cases within a single class exhibit a Worker state-leak
@@ -27,42 +27,42 @@ from .._helpers import (
     COUNT_PER_RANK,
     DTYPE_NBYTES,
     SIGNAL_TAIL_NBYTES,
-    all_to_all_expected_output,
+    allgather_expected_output,
     generic_collective_orch_fn,
 )
 
 
-def all_to_all_orch_fn(orch, callables, task_args, config):
-    nranks = int(task_args.nranks.value)
-    scratch_nbytes = nranks * COUNT_PER_RANK * DTYPE_NBYTES + SIGNAL_TAIL_NBYTES
+def allgather_orch_fn(orch, callables, task_args, config):
+    _nranks = int(task_args.nranks.value)
+    scratch_nbytes = COUNT_PER_RANK * DTYPE_NBYTES + SIGNAL_TAIL_NBYTES
     window_size = max(scratch_nbytes, 4 * 1024)
     generic_collective_orch_fn(
         orch,
         callables,
         task_args,
         config,
-        chip_name="all_to_all",
-        float_elems=nranks * COUNT_PER_RANK,
+        chip_name="allgather",
+        float_elems=COUNT_PER_RANK,
         scratch_nbytes=scratch_nbytes,
         window_size=window_size,
     )
 
 
 _CALLABLE = {
-    "orchestration": all_to_all_orch_fn,
+    "orchestration": allgather_orch_fn,
     "callables": [
         {
-            "name": "all_to_all",
+            "name": "allgather",
             "orchestration": {
-                "source": "kernels/orchestration/all_to_all_orch.cpp",
-                "function_name": "all_to_all_orchestration",
-                "config_name": "all_to_all_orchestration_config",
+                "source": "kernels/orchestration/allgather_orch.cpp",
+                "function_name": "allgather_orchestration",
+                "config_name": "allgather_orchestration_config",
                 "signature": [D.IN, D.OUT, D.INOUT],
             },
             "incores": [
                 {
                     "func_id": 0,
-                    "source": "kernels/aiv/all_to_all_kernel.cpp",
+                    "source": "kernels/aiv/allgather_kernel.cpp",
                     "core_type": "aiv",
                     "signature": [D.IN, D.OUT, D.INOUT],
                 }
@@ -75,9 +75,7 @@ _CALLABLE = {
 def _make_args(nranks):
     specs = []
     for r in range(nranks):
-        inp = torch.tensor(
-            [r * 1000 + dest * 100 + j for dest in range(nranks) for j in range(COUNT_PER_RANK)], dtype=torch.float32
-        ).share_memory_()
+        inp = torch.tensor([i + r * 100 for i in range(COUNT_PER_RANK)], dtype=torch.float32).share_memory_()
         out = torch.zeros(nranks * COUNT_PER_RANK, dtype=torch.float32).share_memory_()
         specs.append(STensor(f"in_{r}", inp))
         specs.append(STensor(f"out_{r}", out))
@@ -86,30 +84,44 @@ def _make_args(nranks):
 
 
 @scene_test(level=3, runtime="tensormap_and_ringbuffer")
-class TestAllToAllP2(SceneTestCase):
+class TestAllgatherP2(SceneTestCase):
     CALLABLE = _CALLABLE
-    CASES = [{"name": "p2", "platforms": ["a2a3sim", "a2a3"], "config": {"device_count": 2}, "params": {"nranks": 2}}]
+    CASES = [
+        {
+            "name": "p2",
+            "platforms": ["a2a3sim", "a2a3", "a5sim"],
+            "config": {"device_count": 2},
+            "params": {"nranks": 2},
+        }
+    ]
 
     def generate_args(self, params):
         return _make_args(params["nranks"])
 
     def compute_golden(self, args, params):
+        expected = torch.tensor(allgather_expected_output(params["nranks"]), dtype=torch.float32)
         for r in range(params["nranks"]):
-            expected = torch.tensor(all_to_all_expected_output(params["nranks"], r), dtype=torch.float32)
             getattr(args, f"out_{r}").copy_(expected)
 
 
 @scene_test(level=3, runtime="tensormap_and_ringbuffer")
-class TestAllToAllP4(SceneTestCase):
+class TestAllgatherP4(SceneTestCase):
     CALLABLE = _CALLABLE
-    CASES = [{"name": "p4", "platforms": ["a2a3sim", "a2a3"], "config": {"device_count": 4}, "params": {"nranks": 4}}]
+    CASES = [
+        {
+            "name": "p4",
+            "platforms": ["a2a3sim", "a2a3", "a5sim"],
+            "config": {"device_count": 4},
+            "params": {"nranks": 4},
+        }
+    ]
 
     def generate_args(self, params):
         return _make_args(params["nranks"])
 
     def compute_golden(self, args, params):
+        expected = torch.tensor(allgather_expected_output(params["nranks"]), dtype=torch.float32)
         for r in range(params["nranks"]):
-            expected = torch.tensor(all_to_all_expected_output(params["nranks"], r), dtype=torch.float32)
             getattr(args, f"out_{r}").copy_(expected)
 
 

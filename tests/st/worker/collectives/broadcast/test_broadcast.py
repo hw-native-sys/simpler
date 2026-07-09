@@ -92,7 +92,14 @@ def _make_args(nranks):
 @scene_test(level=3, runtime="tensormap_and_ringbuffer")
 class TestBroadcastP2(SceneTestCase):
     CALLABLE = _CALLABLE
-    CASES = [{"name": "p2", "platforms": ["a2a3sim", "a2a3"], "config": {"device_count": 2}, "params": {"nranks": 2}}]
+    CASES = [
+        {
+            "name": "p2",
+            "platforms": ["a2a3sim", "a2a3", "a5sim"],
+            "config": {"device_count": 2},
+            "params": {"nranks": 2},
+        }
+    ]
 
     def generate_args(self, params):
         return _make_args(params["nranks"])
@@ -106,7 +113,14 @@ class TestBroadcastP2(SceneTestCase):
 @scene_test(level=3, runtime="tensormap_and_ringbuffer")
 class TestBroadcastP4(SceneTestCase):
     CALLABLE = _CALLABLE
-    CASES = [{"name": "p4", "platforms": ["a2a3sim", "a2a3"], "config": {"device_count": 4}, "params": {"nranks": 4}}]
+    CASES = [
+        {
+            "name": "p4",
+            "platforms": ["a2a3sim", "a2a3", "a5sim"],
+            "config": {"device_count": 4},
+            "params": {"nranks": 4},
+        }
+    ]
 
     def generate_args(self, params):
         return _make_args(params["nranks"])

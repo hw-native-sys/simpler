@@ -67,7 +67,7 @@ Two things to know before reading the example:
 | [`domain_rank_map/`](domain_rank_map/) | Small two-domain example showing domain-local ranks, missing-domain `KeyError`, separate window slices, and real per-domain allreduce. |
 | [`dual_domain_overlap/`](dual_domain_overlap/) | Two overlapping communication domains where worker 1 participates in both, each allocated inside the orchestration via `orch.allocate_domain` and indexed by domain-local rank. |
 
-**Collective algorithm tests** (allreduce, allgather, reduce_scatter, broadcast, all_to_all) have moved to `tests/st/a2a3/tensormap_and_ringbuffer/collectives/`. See the scene tests there for the full algorithm corpus including multi-mode allreduce (onephase, twophase, ring, bidirectional_ring, ibing).
+**Collective algorithm tests** (allreduce, allgather, reduce_scatter, broadcast, all_to_all) have moved to `tests/st/worker/collectives/`. See the scene tests there for the full algorithm corpus including multi-mode allreduce (onephase, twophase, ring, bidirectional_ring, ibing).
 
 ## Prerequisites
 

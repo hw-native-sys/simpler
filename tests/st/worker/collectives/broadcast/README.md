@@ -27,7 +27,7 @@ Root's input: `[i for i in range(64)]`. Every rank verifies it received this exa
 ## Run
 
 ```bash
-pytest tests/st/a2a3/tensormap_and_ringbuffer/collectives/broadcast/ \
+pytest tests/st/worker/collectives/broadcast/ \
   --platform a2a3sim --device 0-3 -v
 ```
 

@@ -16,7 +16,7 @@ Walks through the full flow:
 
 For the full algorithm corpus (twophase, ring, bidirectional_ring, ibing),
 see the scene tests at
-[`tests/st/a2a3/tensormap_and_ringbuffer/collectives/allreduce/`](../../../../tests/st/a2a3/tensormap_and_ringbuffer/collectives/allreduce/).
+[`tests/st/worker/collectives/allreduce/`](../../../../tests/st/worker/collectives/allreduce/).
 
 ## Run
 

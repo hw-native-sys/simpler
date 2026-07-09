@@ -27,7 +27,7 @@ Each rank's input: `[i + rank*100 for i in range(64)]`. After allgather every ra
 ## Run
 
 ```bash
-pytest tests/st/a2a3/tensormap_and_ringbuffer/collectives/allgather/ \
+pytest tests/st/worker/collectives/allgather/ \
   --platform a2a3sim --device 0-3 -v
 ```
 
