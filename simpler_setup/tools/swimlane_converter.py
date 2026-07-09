@@ -1384,7 +1384,6 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
             "complete": "good",  # green
             "dispatch": "terrible",  # red
             "release": "olive",  # deferred-release drain (on_task_release work)
-            "wire": "thread_state_running",  # drain_wiring_queue pass
             "dummy": "grey",  # dummy_drain pass (Resolve nests inside)
             "early_dispatch": "rail_animation",  # speculative early-dispatch staging
             # Inner phase — nests inside Complete or Dummy via time containment
@@ -1535,7 +1534,7 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
                         }
                     )
                     continue
-                if phase not in ("complete", "dispatch", "release", "resolve", "early_dispatch", "wire", "dummy"):
+                if phase not in ("complete", "dispatch", "release", "resolve", "early_dispatch", "dummy"):
                     continue
                 start_us = record["start_time_us"]
                 end_us = record["end_time_us"]

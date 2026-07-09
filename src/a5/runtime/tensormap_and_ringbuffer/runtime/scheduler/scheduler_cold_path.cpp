@@ -504,9 +504,8 @@ void SchedulerContext::log_l2_swimlane_summary(int32_t thread_idx, [[maybe_unuse
         cycles_to_us(sched_end_ts - l2_swimlane.sched_start_ts)
     );
 
-    uint64_t sched_total = l2_swimlane.sched_wiring_cycle + l2_swimlane.sched_complete_cycle +
-                           l2_swimlane.sched_scan_cycle + l2_swimlane.sched_dispatch_cycle +
-                           l2_swimlane.sched_idle_cycle;
+    uint64_t sched_total = l2_swimlane.sched_complete_cycle + l2_swimlane.sched_scan_cycle +
+                           l2_swimlane.sched_dispatch_cycle + l2_swimlane.sched_idle_cycle;
     if (sched_total == 0) sched_total = 1;
 
     {
@@ -602,19 +601,6 @@ void SchedulerContext::log_l2_swimlane_summary(int32_t thread_idx, [[maybe_unuse
             "Thread %d:   scan           : %.3fus (%.1f%%)", thread_idx, cycles_to_us(l2_swimlane.sched_scan_cycle),
             l2_swimlane.sched_scan_cycle * 100.0 / sched_total
         );
-
-#if PTO2_SCHED_PROFILING
-        LOG_INFO_V9(
-            "Thread %d:   wiring         : %.3fus (%.1f%%)  tasks=%d", thread_idx,
-            cycles_to_us(l2_swimlane.sched_wiring_cycle), l2_swimlane.sched_wiring_cycle * 100.0 / sched_total,
-            l2_swimlane.phase_wiring_count
-        );
-#else
-        LOG_INFO_V9(
-            "Thread %d:   wiring         : %.3fus (%.1f%%)", thread_idx, cycles_to_us(l2_swimlane.sched_wiring_cycle),
-            l2_swimlane.sched_wiring_cycle * 100.0 / sched_total
-        );
-#endif
 
         LOG_INFO_V9(
             "Thread %d:   idle           : %.3fus (%.1f%%)", thread_idx, cycles_to_us(l2_swimlane.sched_idle_cycle),
@@ -1044,15 +1030,6 @@ void SchedulerContext::bind_runtime(PTO2Runtime *rt) {
 
 void SchedulerContext::wait_for_orchestration_done_before_dispatch(Runtime *runtime, int32_t thread_idx) {
     while (!orchestration_done() && !completed_.load(std::memory_order_acquire)) {
-        if (thread_idx == 0 && sched_ != nullptr) {
-            // Use the wiring subsystem's normal batch/backoff policy while
-            // waiting. This still honors orch_needs_drain/producer_blocked
-            // signals without force-draining an empty queue every spin.
-            int wired = sched_->drain_wiring_queue(/*force_drain=*/false);
-            if (wired > 0) {
-                continue;
-            }
-        }
         if (sched_ != nullptr && sched_->sm_header != nullptr &&
             check_idle_fatal_error(thread_idx, sched_->sm_header, runtime) == LoopAction::BREAK_LOOP) {
             break;

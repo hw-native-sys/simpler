@@ -287,8 +287,8 @@ after one bool load.
 
 A scope costs exactly two collector calls — `begin` and `end` — each
 carrying that boundary's sample for the scope's own ring. The dep-pool values
-come from scheduler-published snapshots; wiring is asynchronous, so this
-diagnostic can lag the submit path slightly. The runtime gates both on the local
+come from orchestrator-published snapshots taken during Orch-side wiring, so
+they track the submit path directly. The runtime gates both on the local
 weak `is_scope_stats_enabled()` stub first, so a disabled run pays neither the
 cross-`.so` calls nor the cross-agent `active_count()` read (same idiom as
 `is_dep_gen_enabled`).

@@ -20,10 +20,11 @@
  * spill allocator exhausts and the orchestrator latches DEP_POOL_OVERFLOW.
  *
  * PRODUCER_COUNT must exceed PTO2_FANIN_INLINE_CAP, otherwise every edge fits
- * inline, the spill pool is never touched, and the run stalls into
- * SCHEDULER_TIMEOUT (code 100) instead — see scheduler_timeout_orch.cpp, which
- * pins exactly that boundary. The scope keeps all producer ids live so the
- * consumer really takes PRODUCER_COUNT distinct fanin edges.
+ * inline and the spill pool is never touched. With Orch-side dependency wiring,
+ * already-completed producer fanins bypass the dep pool entirely, so the old
+ * inline-boundary scheduler-timeout fixture is no longer a stable public-API
+ * repro. The scope keeps all producer ids live so the consumer really takes
+ * PRODUCER_COUNT distinct fanin edges.
  */
 
 #include <cstdint>

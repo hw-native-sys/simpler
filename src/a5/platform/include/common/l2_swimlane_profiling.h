@@ -482,7 +482,7 @@ static_assert(sizeof(L2SwimlaneDataHeader) % 64 == 0, "L2SwimlaneDataHeader must
  * a single discriminator byte:
  *
  *   OUTER (mutually time-exclusive within an iter; emit advances _t0_phase):
- *     Complete, Dispatch, Release, Wire, Dummy, EarlyDispatch.
+ *     Complete, Dispatch, Release, Dummy, EarlyDispatch.
  *     Every iter is a sequence of zero-or-more outer bars + optional gap.
  *
  *   INNER (no anchor advance; Perfetto auto-nests by time containment):
@@ -504,8 +504,6 @@ enum class L2SwimlaneSchedPhaseKind : uint32_t {
                         // tasks_processed = subtasks published this iter.
     Release = 2,        // Deferred-release drain (on_task_release work).
                         // tasks_processed = slots released this iter.
-    Wire = 3,           // drain_wiring_queue: pop wired tasks into ready queues.
-                        // tasks_processed = wired count.
     Dummy = 4,          // dummy_drain outer bar: covers handling of all dummies
                         // popped this iter. tasks_processed = dummy_got count.
     EarlyDispatch = 5,  // try_early_dispatch: early-dispatch pre-staging

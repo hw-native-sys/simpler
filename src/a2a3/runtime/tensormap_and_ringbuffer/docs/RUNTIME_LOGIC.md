@@ -370,8 +370,8 @@ When `PTO2OrchestratorState::submit_task` processes parameters:
 | `kernel_id[3]` | Per-slot kernel IDs: `[AIC, AIV0, AIV1]`; `INVALID_KERNEL_ID` = inactive |
 | `active_mask` | Bitmask of active subtask slots: `bit0=AIC`, `bit1=AIV0`, `bit2=AIV1` |
 | `completed_subtasks` | Atomic counter; each subtask increments on completion. Trigger condition: `completed_subtasks == total_required_subtasks` |
-| `fanin_count` | Number of producer dependencies (set by scheduler during wiring) |
-| `fanout_lock` | Per-task spinlock for concurrent fanout modification (used by scheduler wiring + completion) |
+| `fanin_count` | Number of producer dependencies (set by Orch-side wiring) |
+| `fanout_lock` | Per-task spinlock for concurrent fanout modification (used by Orch-side wiring + scheduler completion) |
 | `fanout_head` | Head of fanout consumer list (pointer, protected by `fanout_lock`) |
 | `fanout_count` | 1 (scope ref) + number of consumers |
 | `packed_buffer_base` | Start of packed buffer in GM Heap |
@@ -418,7 +418,7 @@ Key members:
 - `rings[PTO2_MAX_RING_DEPTH]`: per-ring `PTO2RingSet` (HeapRing + TaskRing + FaninPool). See [MULTI_RING.md §4.2](MULTI_RING.md).
 - `tensor_map`, `tensor_pool`: dependency tracking
 - `scope_tasks[]`, `scope_begins[]`, `scope_stack_top`: scope nesting stack (flat buffer partitioned by level)
-- `scheduler`: pointer to scheduler state (for wiring queue and ready queue access)
+- `scheduler`: pointer to scheduler state (for Orch-side wiring helpers and ready queue access)
 - `gm_heap_base`, `gm_heap_size`: GM heap for output buffers
 
 ### 7.2 Task Submission Flow (`PTO2OrchestratorState::submit_task`)
@@ -430,17 +430,15 @@ Key members:
 | 2 | Initialize task descriptor + slot state, copy parameters |
 | 3 | **Lookup**: for each INPUT/INOUT param, search TensorMap for producers; collect producer pointers in `PTO2FaninBuilder` |
 | 4 | **Insert**: register OUTPUT/INOUT args in TensorMap |
-| 5 | **Record fanin metadata**: store producer pointers in `payload->fanin_inline_slot_states[]` (+ spill pool if >64); increment each producer's `fanout_count` (no lock needed — single writer). This step runs **before** `payload.init()`. |
-| 6 | **Push to wiring queue**: push to global `PTO2SpscQueue`; scheduler thread 0 asynchronously wires fanout edges (lock + dep_pool + early_finished check + ready push) |
+| 5 | **Record fanin metadata**: store producer pointers in `payload->fanin_inline_slot_states[]` (+ spill pool if >64); claim each live producer by incrementing `fanout_count` under that producer's `fanout_lock`. This step runs **before** `payload.init()`. |
+| 6 | **Orch-side wiring / ready publish**: the orchestrator wires live fanout edges into the per-ring dep_pool; zero-fanin and already-completed fanin tasks publish directly to ready queues |
 
-> **Note**: Fanout wiring (Steps 4–7 in earlier versions) has been moved from the
-> orchestrator submit hot path to the scheduler's global `wiring_queue` (SPSC). This reduces the
-> orchestrator's shared L2 cache / memory bus pressure, as the orchestrator no longer
-> acquires `fanout_lock` or allocates from `dep_pool` during submission.
+> **Note**: Fanout wiring is now completed before publish in the orchestrator submit path.
+> Scheduler threads consume ready queues directly.
 
-### 7.3 Deferred Fanout Wiring (Scheduler Wiring Queue)
+### 7.3 Orch-Side Fanout Wiring
 
-The orchestrator pushes each submitted task to the global `scheduler->wiring_queue` (a wait-free SPSC queue). Scheduler thread 0 drains this queue in batches, deferring if the queue holds fewer than a full batch of items to reduce contention (unless a final flush is needed at end of execution). For each task:
+The orchestrator completes fanout wiring before publishing a task to the ready queues. For each task with live producers:
 
 1. Sets `fanin_count = N + 1` (+1 redundance to prevent premature readiness)
 2. For each producer in `payload->fanin_slot_states[]`:
@@ -449,7 +447,9 @@ The orchestrator pushes each submitted task to the global `scheduler->wiring_que
    - If not completed: prepends consumer to producer's `fanout_head` via `dep_pool.prepend`
    - **Releases** `fanout_lock`
 3. Atomically releases the +1 redundance + early_finished count via `fanin_refcount.fetch_add`
-4. If all deps satisfied: pushes task to ready queue
+4. If all deps satisfied: pushes task to the routed ready queue
+
+Zero-fanin tasks and tasks whose claimed producers are already completed skip dep_pool entry allocation and publish directly to the routed ready queue.
 
 The scheduler's completion handler mirrors this:
 
@@ -700,11 +700,9 @@ With `PTO2_SERIAL_ORCH_SCHED=1`, scheduler threads still wait for
 `runtime_init_ready_` first, then additionally wait for `orchestrator_done_`
 before entering `resolve_and_dispatch()`. The default is off, preserving the
 current overlapped orch/sched pipeline. Serial mode is intended for measurement
-and debugging. During the serial wait, scheduler thread 0 may drain deferred
-wiring records to prevent bounded wiring-queue backpressure, but it does not
-dispatch AICore work until `orchestrator_done_` is set. Large graphs may still
-require larger task-ring, heap, or dependency-pool capacity because no task
-execution/reclaim happens during graph build.
+and debugging. It does not dispatch AICore work until `orchestrator_done_` is
+set. Large graphs may still require larger task-ring, heap, or dependency-pool
+capacity because no task execution/reclaim happens during graph build.
 
 ---
 

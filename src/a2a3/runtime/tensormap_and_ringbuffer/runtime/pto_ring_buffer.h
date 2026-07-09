@@ -60,9 +60,6 @@
 // an ABSOLUTE TIME (not a spin count), so it is stable across chips/contention.
 #define PTO2_ALLOC_DEADLOCK_TIMEOUT_CYCLES (PLATFORM_PROF_SYS_CNT_FREQ / 2)  // 500 ms
 
-// Dep pool spin limit - if exceeded, dep pool capacity too small for workload
-#define PTO2_DEP_POOL_SPIN_LIMIT 100000
-
 // =============================================================================
 // Task Allocator (unified task slot + heap buffer allocation)
 // =============================================================================
@@ -172,8 +169,7 @@ public:
                 prev_last_alive = last_alive;
                 block_timing = false;
             } else if ((spin_count & 1023) == 0) {
-                // A fatal latched elsewhere (e.g. the scheduler-side wiring
-                // deadlock detector) breaks this otherwise-unbounded spin; the
+                // A fatal latched elsewhere breaks this otherwise-unbounded spin; the
                 // caller maps the failed alloc to orch_mark_fatal. Polled on the
                 // cold path only -- error_code_ptr_ is orch_error_code.
                 if (error_code_ptr_ != nullptr && error_code_ptr_->load(std::memory_order_acquire) != PTO2_ERROR_NONE) {
@@ -709,7 +705,7 @@ struct PTO2DepListPool {
     }
 
     /**
-     * Reclaim dead entries based on scheduler's slot state dep_pool_mark.
+     * Reclaim dead entries based on the slot state dep_pool_mark.
      * Safe to call multiple times — only advances tail forward.
      *
      * @param ring             Ring header (for reading slot dep_pool_mark)
@@ -719,9 +715,19 @@ struct PTO2DepListPool {
 
     /**
      * Ensure dep pool for a specific ring has at least `needed` entries available.
-     * Spin-waits for reclamation if under pressure. Detects deadlock if no progress.
+     * Spin-waits for reclamation under pressure. The dep pool shares
+     * last_task_alive with the heap and task rings, so it detects a wedged
+     * reclaim watermark the same way PTO2TaskAllocator::alloc does: a structural
+     * head-of-line check plus a wall-clock backstop, each emitting report_deadlock.
      */
     bool ensure_space(PTO2SharedMemoryRingHeader &ring, int32_t needed);
+
+    /**
+     * Structured dep-pool deadlock report, mirroring PTO2TaskAllocator::report_deadlock.
+     * scope_gated marks the provable head-of-line case (head COMPLETED, all
+     * consumers released, scope still open) as opposed to the wall-clock backstop.
+     */
+    void report_deadlock(PTO2SharedMemoryRingHeader &ring, int32_t needed, int32_t last_alive, bool scope_gated);
 
     /**
      * Allocate a single entry from the pool (single-thread per pool instance)

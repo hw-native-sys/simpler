@@ -90,9 +90,6 @@
 // Cross-thread early-dispatch work queue (power of two)
 #define PTO2_EARLY_DISPATCH_QUEUE_SIZE 64
 
-// Wiring queue
-#define PTO2_WRIRING_QUEUE_SIZE 1024  // Per-shape queue size
-
 // Fanin storage
 #define PTO2_FANIN_INLINE_CAP 64
 
@@ -394,6 +391,19 @@ static_assert(
 // never reach -> provable deadlock.
 static constexpr uint32_t PTO2_FANOUT_SCOPE_BIT = 0x80000000u;
 
+enum PTO2ReadyState : uint8_t {
+    PTO2_READY_UNCLAIMED = 0,
+    PTO2_READY_CLAIMED = 1,
+};
+
+enum PTO2CompletionFlag : uint8_t {
+    PTO2_COMPLETION_DONE = 2,
+};
+
+enum PTO2DeferredCompletionFlag : uint8_t {
+    PTO2_SUBTASK_DEFERRED = 4,
+};
+
 struct alignas(64) PTO2TaskSlotState {
     // Fanout lock + list (accessed together under lock in on_task_complete)
     std::atomic<int32_t> fanout_lock;  // Per-task spinlock (0=unlocked, 1=locked)
@@ -422,21 +432,14 @@ struct alignas(64) PTO2TaskSlotState {
     // --- Set per-submit (depend on task inputs) ---
     ActiveMask active_mask;  // Bitmask of active subtask slots (set once)
     uint8_t ring_id;         // Ring layer (immutable after init)
-    // Set by any subtask FIN that pushed deferred-completion CONDITIONs to
-    // the runtime mailbox; read by the last subtask FIN to decide whether
-    // the task needs MPSC-deferred completion or can complete inline on this
-    // thread. Carved out of the otherwise-padding byte between ring_id and
-    // dep_pool_mark to keep PTO2TaskSlotState at 64 bytes. The write is
-    // sequenced before on_subtask_complete's acq_rel fetch_add and the read
-    // after, so all earlier subtasks' writes are visible to the last subtask.
-    std::atomic<bool> any_subtask_deferred{false};
-    // Codegen early-dispatch hint, copied from Arg at submit. Lives on slot_state
-    // (not payload) so the wiring fanin walk and the propagate_dispatch_fanin gate
-    // read it from the already-hot slot_state cache line instead of chasing the
-    // producer's cold payload. Repurposes the former padding byte, so the struct
-    // stays 64 bytes.
+    // These one-byte flags live in the padding before dep_pool_mark to keep
+    // PTO2TaskSlotState at 64 bytes.
+    // Codegen early-dispatch hint, copied from Arg at submit. Lives on
+    // slot_state (not payload) so fanin walks read the already-hot producer
+    // slot_state cache line.
     bool allow_early_resolve{false};
-    int32_t dep_pool_mark{0};  // Dep pool top after wiring (thread-0-only)
+    std::atomic<uint8_t> ready_state{PTO2_READY_UNCLAIMED};
+    int32_t dep_pool_mark{0};  // Dep pool top after Orch-side wiring
 
     std::atomic<int16_t> completed_subtasks{0};  // Each core completion increments by 1
     int16_t total_required_subtasks{0};          // = logical_block_num * popcount(active_mask)
@@ -465,6 +468,29 @@ struct alignas(64) PTO2TaskSlotState {
         task = t;
     }
 
+    void mark_completed() {
+        task_state.store(PTO2_TASK_COMPLETED, std::memory_order_release);
+        ready_state.fetch_or(PTO2_COMPLETION_DONE, std::memory_order_release);
+    }
+
+    bool is_completion_flag_set() const {
+        return (ready_state.load(std::memory_order_acquire) & PTO2_COMPLETION_DONE) != 0;
+    }
+
+    // Set by any subtask FIN that pushed deferred-completion CONDITIONs to the
+    // runtime mailbox; read by the last subtask FIN to decide whether the task
+    // needs MPSC-deferred completion or can complete inline on this thread. The
+    // release write is sequenced before on_subtask_complete's acq_rel fetch_add
+    // and the acquire read after, so all earlier subtasks' writes are visible to
+    // the last subtask.
+    void mark_any_subtask_deferred() { ready_state.fetch_or(PTO2_SUBTASK_DEFERRED, std::memory_order_release); }
+
+    bool has_any_subtask_deferred() const {
+        return (ready_state.load(std::memory_order_acquire) & PTO2_SUBTASK_DEFERRED) != 0;
+    }
+
+    void set_allow_early_resolve(bool v) { allow_early_resolve = v; }
+
     /**
      * Reset dynamic scheduling fields for slot reuse.
      * Called by advance_ring_pointers() after a slot transitions to CONSUMED
@@ -484,8 +510,8 @@ struct alignas(64) PTO2TaskSlotState {
         fanout_refcount.store(0, std::memory_order_relaxed);
         completed_subtasks.store(0, std::memory_order_relaxed);
         next_block_idx.store(0, std::memory_order_relaxed);
-        any_subtask_deferred.store(false, std::memory_order_relaxed);
-        allow_early_resolve = false;  // safe default; the normal submit path overwrites from Arg
+        ready_state.store(PTO2_READY_UNCLAIMED, std::memory_order_relaxed);
+        allow_early_resolve = false;
         // Note: payload early-dispatch fields (early_dispatch_state / staged_core_mask / dispatch_fanin)
         // are NOT reset here — this method skips the payload by contract. They are
         // (re)initialized in PTO2TaskPayload::init on every submit, before the slot

@@ -9,9 +9,9 @@
  * -----------------------------------------------------------------------------------------------------------
  */
 /**
- * Unit tests for scheduler wiring and completion paths:
+ * Unit tests for Orch-side wiring and scheduler completion paths:
  *
- * 1. wire_task()         — fanout wiring, early-finished detection,
+ * 1. Orch-side wiring    — fanout wiring, early-finished detection,
  *                          fanin_count initialization, ready push
  * 2. on_task_complete() — COMPLETED transition, fanout traversal,
  *                               consumer fanin release
@@ -29,15 +29,17 @@
 #include <thread>
 #include <vector>
 
+#include "pto_orchestrator.h"
 #include "utils/device_arena.h"
 #include "scheduler/pto_scheduler.h"
 
 // =============================================================================
-// Fixture: sets up a scheduler with shared memory and provides helpers
+// Fixture: sets up runtime state with shared memory and provides helpers
 // =============================================================================
 
 class WiringTest : public ::testing::Test {
 protected:
+    PTO2OrchestratorState orch{};
     PTO2SchedulerState sched{};
     PTO2SharedMemoryHandle *sm_handle = nullptr;
     DeviceArena sm_arena;
@@ -57,6 +59,7 @@ protected:
         ASSERT_NE(sched_arena.commit(), nullptr);
         ASSERT_TRUE(sched.init_data_from_layout(layout, sched_arena, sm_handle->header));
         sched.wire_arena_pointers(layout, sched_arena);
+        orch.set_scheduler(&sched);
     }
 
     void TearDown() override {
@@ -87,13 +90,29 @@ protected:
         memset(&slot_pl, 0, sizeof(slot_pl));
         slot.payload = &slot_pl;
     }
+
+    void publish_no_fanin(PTO2TaskSlotState &slot) {
+        slot.fanin_count = 1;
+        slot.fanin_refcount.store(1, std::memory_order_release);
+        orch.mark_dep_pool_position(slot);
+        sched.push_ready_routed(&slot);
+    }
+
+    void wire_fanin(PTO2TaskSlotState &slot, int32_t wfanin) {
+        auto &rss = sched.ring_sched_states[slot.ring_id];
+        bool ok = rss.dep_pool.ensure_space(*rss.ring, wfanin);
+        if (ok) {
+            orch.wire_fanin_task(slot, wfanin);
+        }
+        ASSERT_TRUE(ok);
+    }
 };
 
 // =============================================================================
-// wire_task: no fanin (independent task)
+// Orch-side publish: no fanin (independent task)
 // =============================================================================
 
-TEST_F(WiringTest, WireTaskNoFaninBecomesReady) {
+TEST_F(WiringTest, NoFaninTaskBecomesReady) {
     // A task with 0 actual fanins should immediately be pushed to ready queue
     alignas(64) PTO2TaskSlotState task_slot;
     alignas(64) PTO2TaskPayload payload;
@@ -105,8 +124,7 @@ TEST_F(WiringTest, WireTaskNoFaninBecomesReady) {
     task_slot.payload = &payload;
     task_slot.task = &desc;
 
-    auto &rss = sched.ring_sched_states[0];
-    sched.wire_task(rss, &task_slot, 0);
+    publish_no_fanin(task_slot);
 
     // fanin_count set to 0 + 1 = 1 (the wiring "+1" sentinel)
     EXPECT_EQ(task_slot.fanin_count, 1);
@@ -120,7 +138,7 @@ TEST_F(WiringTest, WireTaskNoFaninBecomesReady) {
 }
 
 // =============================================================================
-// wire_task: with fanin, all producers already completed (early-finished)
+// Orch-side wiring: with fanin, all producers already completed (early-finished)
 // =============================================================================
 
 TEST_F(WiringTest, WireTaskAllProducersEarlyFinished) {
@@ -144,8 +162,7 @@ TEST_F(WiringTest, WireTaskAllProducersEarlyFinished) {
     task_slot.payload = &payload;
     task_slot.task = &desc;
 
-    auto &rss = sched.ring_sched_states[0];
-    sched.wire_task(rss, &task_slot, 2);
+    wire_fanin(task_slot, 2);
 
     // fanin_count = 2 + 1 = 3
     EXPECT_EQ(task_slot.fanin_count, 3);
@@ -159,7 +176,7 @@ TEST_F(WiringTest, WireTaskAllProducersEarlyFinished) {
 }
 
 // =============================================================================
-// wire_task: with fanin, producers still pending (task NOT ready)
+// Orch-side wiring: with fanin, producers still pending (task NOT ready)
 // =============================================================================
 
 TEST_F(WiringTest, WireTaskProducersPendingTaskNotReady) {
@@ -181,8 +198,7 @@ TEST_F(WiringTest, WireTaskProducersPendingTaskNotReady) {
     task_slot.payload = &payload;
     task_slot.task = &desc;
 
-    auto &rss = sched.ring_sched_states[0];
-    sched.wire_task(rss, &task_slot, 2);
+    wire_fanin(task_slot, 2);
 
     // fanin_count = 3 (2 + 1)
     EXPECT_EQ(task_slot.fanin_count, 3);
@@ -203,7 +219,7 @@ TEST_F(WiringTest, WireTaskProducersPendingTaskNotReady) {
 }
 
 // =============================================================================
-// wire_task: mixed early-finished and pending producers
+// Orch-side wiring: mixed early-finished and pending producers
 // =============================================================================
 
 TEST_F(WiringTest, WireTaskMixedProducerStates) {
@@ -225,8 +241,7 @@ TEST_F(WiringTest, WireTaskMixedProducerStates) {
     task_slot.payload = &payload;
     task_slot.task = &desc;
 
-    auto &rss = sched.ring_sched_states[0];
-    sched.wire_task(rss, &task_slot, 3);
+    wire_fanin(task_slot, 3);
 
     // fanin_count = 4 (3 + 1)
     EXPECT_EQ(task_slot.fanin_count, 4);
@@ -267,8 +282,7 @@ TEST_F(WiringTest, WireTaskAllFlaggedPrecompletedSeedsDispatchFanin) {
     task_slot.payload = &payload;
     task_slot.task = &desc;
 
-    auto &rss = sched.ring_sched_states[0];
-    sched.wire_task(rss, &task_slot, 2);
+    wire_fanin(task_slot, 2);
 
     // Every producer flagged + pre-completed -> seeded to fanin_actual_count, so
     // the consumer is already an early-dispatch candidate at wiring time.
@@ -295,8 +309,7 @@ TEST_F(WiringTest, WireTaskUnflaggedPrecompletedProducerDoesNotSeed) {
     task_slot.payload = &payload;
     task_slot.task = &desc;
 
-    auto &rss = sched.ring_sched_states[0];
-    sched.wire_task(rss, &task_slot, 1);
+    wire_fanin(task_slot, 1);
 
     EXPECT_EQ(payload.dispatch_fanin.load(), 0);  // NOT seeded (direct-only)
     // Readiness is unaffected: early_finished(1) + 1 == fanin_count(2) -> ready.
@@ -322,8 +335,7 @@ TEST_F(WiringTest, WireTaskOneUnflaggedProducerDisqualifiesSeed) {
     task_slot.payload = &payload;
     task_slot.task = &desc;
 
-    auto &rss = sched.ring_sched_states[0];
-    sched.wire_task(rss, &task_slot, 2);
+    wire_fanin(task_slot, 2);
 
     EXPECT_EQ(payload.dispatch_fanin.load(), 0);  // disqualified: seed stays 0
 }
@@ -347,8 +359,7 @@ TEST_F(WiringTest, EarlyDispatchReachesCandidateWhenAllFlagged) {
     task_slot.payload = &payload;
     task_slot.task = &desc;
 
-    auto &rss = sched.ring_sched_states[0];
-    sched.wire_task(rss, &task_slot, 1);
+    wire_fanin(task_slot, 1);
     EXPECT_EQ(payload.dispatch_fanin.load(), 0);  // pending -> nothing seeded yet
 
     sched.propagate_dispatch_fanin(producer);
@@ -374,8 +385,7 @@ TEST_F(WiringTest, EarlyDispatchBlockedByUnflaggedProducer) {
     task_slot.payload = &payload;
     task_slot.task = &desc;
 
-    auto &rss = sched.ring_sched_states[0];
-    sched.wire_task(rss, &task_slot, 2);
+    wire_fanin(task_slot, 2);
     EXPECT_EQ(payload.dispatch_fanin.load(), 0);  // q unflagged -> disqualified seed
 
     sched.propagate_dispatch_fanin(p_flagged);    // bumps to 1
@@ -435,8 +445,7 @@ TEST_F(WiringTest, FlaggedPrecompletedCreatorTransparentToEarlyDispatch) {
     task_slot.payload = &payload;
     task_slot.task = &desc;
 
-    auto &rss = sched.ring_sched_states[0];
-    sched.wire_task(rss, &task_slot, 2);
+    wire_fanin(task_slot, 2);
     EXPECT_EQ(payload.dispatch_fanin.load(), 1);  // creator seeded (transparent), not disqualified
 
     sched.propagate_dispatch_fanin(compute);                               // compute dispatches -> bumps to 2
@@ -598,11 +607,7 @@ TEST_F(WiringTest, AdvanceRingPointersResetsSlots) {
     EXPECT_EQ(slot.fanout_head, nullptr);
 }
 
-// =============================================================================
-// drain_wiring_queue: pushes tasks through SPSC queue
-// =============================================================================
-
-TEST_F(WiringTest, DrainWiringQueueProcessesTasks) {
+TEST_F(WiringTest, NoEdgePublishRecordsDepPoolMark) {
     alignas(64) PTO2TaskSlotState task_slot;
     alignas(64) PTO2TaskPayload payload;
     memset(&payload, 0, sizeof(payload));
@@ -613,54 +618,8 @@ TEST_F(WiringTest, DrainWiringQueueProcessesTasks) {
     task_slot.payload = &payload;
     task_slot.task = &desc;
 
-    // Push into wiring SPSC queue (orchestrator side)
-    ASSERT_TRUE(sched.wiring.queue.push(&task_slot));
-
-    // Drain (scheduler thread 0 side)
-    int wired = sched.drain_wiring_queue(true /* force_drain */);
-    EXPECT_EQ(wired, 1);
-
-    // Task should be ready
-    PTO2ResourceShape shape = task_slot.active_mask.to_shape();
-    auto *popped = sched.ready_queues[static_cast<int32_t>(shape)].pop();
-    EXPECT_EQ(popped, &task_slot);
-}
-
-TEST_F(WiringTest, DrainWiringQueueBackoffDefers) {
-    alignas(64) PTO2TaskSlotState task_slot;
-    alignas(64) PTO2TaskPayload payload;
-    memset(&payload, 0, sizeof(payload));
-    PTO2TaskDescriptor desc{};
-
-    init_slot(task_slot, PTO2_TASK_PENDING, 0, 1);
-    payload.fanin_actual_count = 0;
-    task_slot.payload = &payload;
-    task_slot.task = &desc;
-
-    sched.wiring.queue.push(&task_slot);
-
-    // Without force_drain, single item < BATCH_SIZE → backoff
-    sched.wiring.backoff_counter = 0;
-    int wired = sched.drain_wiring_queue(false);
-    EXPECT_EQ(wired, 0) << "Backoff should defer when queue < BATCH_SIZE";
-    EXPECT_EQ(sched.wiring.backoff_counter, 1);
-}
-
-TEST_F(WiringTest, DrainWiringQueueBackoffLimitForcesProcess) {
-    alignas(64) PTO2TaskSlotState task_slot;
-    alignas(64) PTO2TaskPayload payload;
-    memset(&payload, 0, sizeof(payload));
-    PTO2TaskDescriptor desc{};
-
-    init_slot(task_slot, PTO2_TASK_PENDING, 0, 1);
-    payload.fanin_actual_count = 0;
-    task_slot.payload = &payload;
-    task_slot.task = &desc;
-
-    sched.wiring.queue.push(&task_slot);
-
-    // Set backoff at limit → should process
-    sched.wiring.backoff_counter = PTO2SchedulerState::WiringState::BACKOFF_LIMIT;
-    int wired = sched.drain_wiring_queue(false);
-    EXPECT_EQ(wired, 1) << "Backoff limit reached should force processing";
+    auto &rss = sched.ring_sched_states[0];
+    int32_t before_top = rss.dep_pool.top;
+    publish_no_fanin(task_slot);
+    EXPECT_EQ(task_slot.dep_pool_mark, before_top);
 }

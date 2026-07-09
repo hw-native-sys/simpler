@@ -104,9 +104,8 @@ public:
     // mode where rt is created by the orchestrator thread after init().
     void bind_runtime(PTO2Runtime *rt);
 
-    // Serial orch->sched mode pre-dispatch wait. Thread 0 may drain deferred
-    // wiring to keep the bounded wiring queue from back-pressuring orchestration,
-    // but no AICore dispatch happens before orchestrator_done_.
+    // Serial orch->sched mode pre-dispatch wait. No AICore dispatch happens
+    // before orchestrator_done_.
     void wait_for_orchestration_done_before_dispatch(Runtime *runtime, int32_t thread_idx);
 
     // =========================================================================
@@ -321,8 +320,7 @@ private:
     // True if mix tasks remain in the global MIX ready queue. Approximate —
     // PTO2ReadyQueue::size() (see pto_scheduler.h) snapshots its enqueue/dequeue
     // positions with std::memory_order_relaxed and may interleave with concurrent
-    // push/pop. Don't confuse with PTO2SpscQueue::size(), which uses acquire
-    // loads — that one isn't on this path. A stale read here causes at most one
+    // push/pop. A stale read here causes at most one
     // extra/missed AIC/AIV skip and self-corrects on the next loop iteration.
     bool has_residual_mix() const {
         return sched_->ready_queues[static_cast<int32_t>(PTO2ResourceShape::MIX)].size() > 0;

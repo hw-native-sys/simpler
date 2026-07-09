@@ -951,8 +951,6 @@ int L2SwimlaneCollector::export_swimlane_json() {
                 return "dispatch";
             case L2SwimlaneSchedPhaseKind::Release:
                 return "release";
-            case L2SwimlaneSchedPhaseKind::Wire:
-                return "wire";
             case L2SwimlaneSchedPhaseKind::Dummy:
                 return "dummy";
             case L2SwimlaneSchedPhaseKind::EarlyDispatch:

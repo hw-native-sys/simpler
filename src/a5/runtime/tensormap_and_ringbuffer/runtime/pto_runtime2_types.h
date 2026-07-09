@@ -87,9 +87,6 @@
 // Ready queue
 #define PTO2_READY_QUEUE_SIZE 65536  // Per-shape queue size
 
-// Wiring queue
-#define PTO2_WRIRING_QUEUE_SIZE 1024  // Per-shape queue size
-
 // Fanin storage
 #define PTO2_FANIN_INLINE_CAP 64
 
@@ -342,7 +339,7 @@ struct alignas(64) PTO2TaskSlotState {
     // and dep_pool_mark to keep PTO2TaskSlotState at 64 bytes.
     std::atomic<bool> any_subtask_deferred{false};
     uint8_t _async_pad{0};
-    int32_t dep_pool_mark{0};  // Dep pool top after wiring (thread-0-only)
+    int32_t dep_pool_mark{0};  // Dep pool top after Orch-side wiring
 
     std::atomic<int16_t> completed_subtasks{0};  // Each core completion increments by 1
     int16_t total_required_subtasks{0};          // = logical_block_num * popcount(active_mask)

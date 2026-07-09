@@ -101,7 +101,7 @@ void SchedulerContext::complete_slot_task(
     // non-deferred tasks complete inline on this thread (matching pre-MPSC
     // behavior — keeps the common case parallelized across scheduler threads
     // instead of serializing through the single consumer). The
-    // any_subtask_deferred flag on slot_state is the discriminator; it's set
+    // deferred-completion flag on slot_state is the discriminator; it's set
     // (release) before on_subtask_complete and read (acquire) after, so the
     // last subtask sees flag writes from any earlier subtask of the same task.
     AICoreCompletionMailbox *mailbox = rt_ != nullptr ? rt_->aicore_mailbox : nullptr;
@@ -134,7 +134,7 @@ void SchedulerContext::complete_slot_task(
             // acq_rel fetch_add inside on_subtask_complete makes the flag
             // visible to whichever subtask sees task_complete=true (which may
             // be this thread or a later one).
-            slot_state.any_subtask_deferred.store(true, std::memory_order_release);
+            slot_state.mark_any_subtask_deferred();
 
             const PTO2TaskId token = slot_state.task->task_id;
             for (uint32_t i = 0; i < cond_count; ++i) {
@@ -157,8 +157,7 @@ void SchedulerContext::complete_slot_task(
     }
 #endif
 
-    if (task_complete && slot_state.payload != nullptr &&
-        slot_state.any_subtask_deferred.load(std::memory_order_acquire)) {
+    if (task_complete && slot_state.payload != nullptr && slot_state.has_any_subtask_deferred()) {
         // Some subtask of this task registered conditions; finish the
         // registration by handing the slot_state off to the consumer.
         while (!mailbox->try_push_normal_done(slot_state.task->task_id, reinterpret_cast<uint64_t>(&slot_state))) {

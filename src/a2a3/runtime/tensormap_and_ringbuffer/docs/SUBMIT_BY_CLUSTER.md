@@ -163,7 +163,7 @@ This project-defined flattened numbering is kept unchanged.
 1. Validate submit arguments.
 2. Allocate mixed-task ID and initialize descriptor/payload/slot_state once.
 3. Lookup producers via TensorMap; collect fanin metadata and increment producers' `fanout_count`.
-4. Push task to scheduler's wiring queue (scheduler thread 0 asynchronously wires fanout edges and determines readiness).
+4. Wire fanout edges on the orchestrator side and publish ready tasks to the scheduler queues.
 5. Dispatch all active lanes atomically when resources allow.
 6. Aggregate completion and release downstream once.
 

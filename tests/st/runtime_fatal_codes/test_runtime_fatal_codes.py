@@ -94,15 +94,6 @@ CASES = {
         kernel="aiv/kernel_noop.cpp",
         marker="orch_error_code=7",
     ),
-    "scheduler_timeout": dict(
-        orch="scheduler_timeout_orch.cpp",
-        code=100,
-        runtime_env={"ring_dep_pool": 4},
-        kernel=None,
-        # Fire the no-progress watchdog in well under a second (default 10 s).
-        env={"PTO2_SCHEDULER_TIMEOUT_MS": 500},
-        marker="sub_class=S3",
-    ),
     "aicore_hang": dict(
         orch="aicore_hang_orch.cpp",
         code=100,
@@ -181,20 +172,25 @@ CASES = {
     #   the ring capacity together, so the constant gap holds.
     #
     # -- Design-unreachable from the public API (defensive classifier branches) --
-    # * SCHEDULER_TIMEOUT sub-classes S4/S5/UNKNOWN: the pure classifier is unit-
+    # * SCHEDULER_TIMEOUT sub-classes S3/S4/S5/UNKNOWN: the pure classifier is unit-
     #   tested for all of them (classify_stall_detail priority table in
     #   tests/ut/cpp/.../test_shared_memory.cpp), but the live states cannot be
-    #   produced through the public API. S4 (dep-deadlock, pure WAIT) needs a
-    #   dependency that never resolves with nothing running/ready; set_dependencies
-    #   only references already-submitted tasks, so cycles are inexpressible, and a
-    #   stuck producer is RUNNING (-> S1), never pure WAIT. S5 (orch-starvation)
-    #   needs completed < total with empty rings, but total_tasks_ is the count of
-    #   *submitted* tasks (sum of current_task_index), so once they retire
-    #   completed == total and the watchdog never fires — a while-loop in the orch
-    #   does not help. UNKNOWN is a bookkeeping-invariant violation (corruption).
-    #   These are kept as defensive labels: if a future bug ever produces the state,
-    #   the classifier names it correctly instead of mislabeling. S1/S3 are the
-    #   reproducible ones (aicore_hang_orch.cpp / scheduler_timeout_orch.cpp).
+    #   produced stably through the public API after Orch-side wiring. S3 used to
+    #   be reachable by under-sizing the fanout dep_pool for a ready dummy consumer,
+    #   but completed-producer fanins now bypass dep_pool entirely, while live
+    #   producers block in Orch-side prewire and either recover or latch the
+    #   orchestrator dep_pool error before the scheduler has an orch-done total to
+    #   classify as ready-but-idle. S4 (dep-deadlock, pure WAIT) needs a dependency
+    #   that never resolves with nothing running/ready; set_dependencies only
+    #   references already-submitted tasks, so cycles are inexpressible, and a stuck
+    #   producer is RUNNING (-> S1), never pure WAIT. S5 (orch-starvation) needs
+    #   completed < total with empty rings, but total_tasks_ is the count of
+    #   *submitted* tasks (sum of current_task_index), so once they retire completed
+    #   == total and the watchdog never fires — a while-loop in the orch does not
+    #   help. UNKNOWN is a bookkeeping-invariant violation (corruption). These are
+    #   kept as defensive labels: if a future bug ever produces the state, the
+    #   classifier names it correctly instead of mislabeling. S1 remains the
+    #   reproducible scheduler-timeout e2e case (aicore_hang_orch.cpp).
     #
     # -- Reachable only by exhausting a fixed compile-time cap --
     # * TENSORMAP_OVERFLOW (11): the tensormap entry pool (PTO2_TENSORMAP_POOL_SIZE

@@ -224,8 +224,8 @@ PTO2Runtime *runtime_init_data_from_layout(
 /**
  * Phase 3 — wire every arena-internal pointer field (rt->sm_handle,
  * rt->aicore_mailbox, orchestrator.{scope_tasks, scope_begins, scheduler,
- * tensor_map.*, rings[].fanin_pool.base}, scheduler.{ready_queues, dep_pool,
- * wiring.queue}) so each holds arena.base() + offset. Idempotent — runs on
+ * tensor_map.*, rings[].fanin_pool.base}, scheduler.{ready_queues, dep_pool})
+ * so each holds arena.base() + offset. Idempotent — runs on
  * both host (writing host-mirror addresses) and AICPU (writing device
  * addresses) sides.
  */

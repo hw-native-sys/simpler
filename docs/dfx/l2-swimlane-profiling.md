@@ -33,9 +33,9 @@ available.
   `l2_swimlane_records.json` with `deps.json` from
   [`dep_gen`](dep_gen.md) at post-process time; see
   [§3.5](#35-dependency-arrows-from-dep_gen).
-- **AICPU scheduler phases** — per-iteration breakdown into six
+- **AICPU scheduler phases** — per-iteration breakdown into five
   mutually time-exclusive **outer** phases (`complete` / `dispatch`
-  / `release` / `wire` / `dummy` / `early_dispatch`), one logical
+  / `release` / `dummy` / `early_dispatch`), one logical
   **inner** phase (`resolve`, parent = Complete or Dummy) rendered on a
   sibling scheduler sub-lane with the same `Sched_N` label and adjacent tid,
   and one **separate-lane**
@@ -229,11 +229,15 @@ field but render differently in Perfetto:
 | `complete` | outer | sched (pid=2) | FIN'd subtasks + sub-block retires this iter |
 | `dispatch` | outer | sched | subtasks published this iter |
 | `release` | outer | sched | deferred-release slots drained this iter |
-| `wire` | outer | sched | tasks wired by `drain_wiring_queue` this iter |
 | `dummy` | outer | sched | dummies handled by `dummy_drain` this iter |
 | `early_dispatch` | outer | sched | blocks staged by speculative early-dispatch this pass |
 | `resolve` | inner | sched sub-lane, same `Sched_N` label as its outer lane | consumers visited in `on_task_complete` |
 | `dummy_task` | separate-lane | Worker View AICPU_N (pid=4) | dummy `task_id` low 32 bits (deps.json flow target) |
+
+Fanin/fanout wiring is not a scheduler phase: it runs on the
+orchestrator submit path, so it has no swimlane lane. Read its cost
+from `g_orch_fanin_cycle` in the device-log orch breakdown (the
+`fanin` line) instead.
 
 Outer phases are mutually time-exclusive within an iter — each
 emit advances the per-thread phase anchor (`_t0_phase`). Inner
@@ -284,8 +288,8 @@ in. The trace contains:
 - **Orchestrator** (pid=1) — per-submit `orch_submit` envelope
   blocks (level >= 4).
 - **AICPU Scheduler** (pid=2) — per-iteration scheduler phase
-  blocks coloured by `phase` (level >= 3). The six outer phases
-  (`complete` / `dispatch` / `release` / `wire` / `dummy` /
+  blocks coloured by `phase` (level >= 3). The five outer phases
+  (`complete` / `dispatch` / `release` / `dummy` /
   `early_dispatch`) appear as sibling bars on each scheduler
   thread's first `Sched_N` lane; the `resolve` inner phase appears on an
   adjacent `Sched_N` sub-lane.

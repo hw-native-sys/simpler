@@ -87,10 +87,10 @@ struct PTO2OrchestratorState {
     uint64_t scope_stack_capacity;    // Max nesting depth (PTO2_MAX_SCOPE_DEPTH)
     int32_t manual_begin_depth{PTO2_MAX_SCOPE_DEPTH};
 
-    // === SCHEDULER REFERENCE ===
-    // Note: In simulated mode, orchestrator and scheduler share address space
-    // In real mode, they communicate via shared memory only
-    PTO2SchedulerState *scheduler;  // For simulated mode only
+    // === SCHEDULER STATE ACCESS ===
+    // Same runtime-arena scheduler object; Orch-side wiring mutates dep_pool
+    // and publishes ready tasks through it before scheduler workers dispatch.
+    PTO2SchedulerState *scheduler;
 
     // Total core counts set once at executor init; used for submit-time deadlock detection.
     int32_t total_cluster_count{0};  // AIC cores = MIX clusters
@@ -175,6 +175,8 @@ struct PTO2OrchestratorState {
     // Forget pointers; arena owns the backing buffers.
     void destroy();
     void set_scheduler(PTO2SchedulerState *scheduler);
+    void mark_dep_pool_position(PTO2TaskSlotState &slot_state);
+    void wire_fanin_task(PTO2TaskSlotState &slot_state, int32_t wfanin);
     void report_fatal(int32_t error_code, const char *func, const char *fmt, ...);
     void begin_scope(PTO2ScopeMode mode = PTO2ScopeMode::AUTO);
     void end_scope();
