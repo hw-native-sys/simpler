@@ -508,13 +508,13 @@ enum class L2SwimlaneSchedPhaseKind : uint32_t {
                         // tasks_processed = wired count.
     Dummy = 4,          // dummy_drain outer bar: covers handling of all dummies
                         // popped this iter. tasks_processed = dummy_got count.
-    EarlyDispatch = 5,  // try_speculative_early_dispatch: speculative pre-staging
+    EarlyDispatch = 5,  // try_early_dispatch: early-dispatch pre-staging
                         // of a flagged producer's consumer's gated blocks.
                         // tasks_processed = blocks staged this pass.
     // Inner (parent: Complete | Dummy)
     Resolve = 6,  // on_task_complete: walk consumer list, decrement fanin,
                   // push newly-ready successors, ring doorbells for
-                  // speculative hits. tasks_processed = # consumers visited.
+                  // early-dispatch hits. tasks_processed = # consumers visited.
     // Separate-lane (Worker View pid=4 AICPU_N)
     DummyTask = 7,  // Per-dummy identity marker (zero-width). tasks_processed
                     // = task_token_raw low 32 bits so deps.json flow arrows

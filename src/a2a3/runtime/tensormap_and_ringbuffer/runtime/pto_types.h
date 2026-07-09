@@ -222,7 +222,7 @@ struct Arg : TaskArgsTpl<TensorRef, uint64_t, MaxT, MaxS, TensorArgType> {
     const char *error_msg{nullptr};
     PTO2LaunchSpec launch_spec;  // SPMD launch parameters (block_num, etc.)
 
-    // Speculative early-dispatch hint (codegen-author set, off by default). When
+    // Early-dispatch hint (codegen-author set, off by default). When
     // true, the scheduler may stage this task on an idle core before its producer
     // finishes, gating execution on the DATA_MAIN_BASE doorbell — only safe when
     // the author knows the task's data dependencies allow it. Read in-process by

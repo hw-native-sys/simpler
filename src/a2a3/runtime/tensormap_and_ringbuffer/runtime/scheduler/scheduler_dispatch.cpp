@@ -45,10 +45,11 @@ namespace {
 inline constexpr int32_t PTO2_DEFERRED_RELEASE_CAP = 256;
 }
 
-// The speculative core bitmask (PTO2_SPEC_CORE_MASK_WORDS * 64 bits) must cover
+// The early-dispatch core bitmask (PTO2_EARLY_DISPATCH_CORE_MASK_WORDS * 64 bits) must cover
 // every global core_id, and the per-core doorbell table is sized to match.
 static_assert(
-    RUNTIME_MAX_WORKER <= PTO2_SPEC_CORE_MASK_WORDS * 64, "staged_core_mask too small for RUNTIME_MAX_WORKER cores"
+    RUNTIME_MAX_WORKER <= PTO2_EARLY_DISPATCH_CORE_MASK_WORDS * 64,
+    "staged_core_mask too small for RUNTIME_MAX_WORKER cores"
 );
 
 const char *SchedulerContext::shape_name(PTO2ResourceShape shape) {
@@ -133,11 +134,12 @@ void SchedulerContext::build_payload(
     dispatch_payload.local_context.async_ctx = async_ctx;
     dispatch_payload.args[PAYLOAD_LOCAL_CONTEXT_INDEX] = reinterpret_cast<uint64_t>(&dispatch_payload.local_context);
     dispatch_payload.args[PAYLOAD_GLOBAL_CONTEXT_INDEX] = reinterpret_cast<uint64_t>(&dispatch_payload.global_context);
-    // Speculative early-dispatch: a task being staged (Hook 1 set spec_state to
+    // Early-dispatch: a task being staged (Hook 1 set early_dispatch_state to
     // STAGING before this call) is gated — the AICore must wait for the
     // DATA_MAIN_BASE high-32 doorbell. All other dispatches run on pickup.
     dispatch_payload.not_ready =
-        (slot_state.payload->spec_state.load(std::memory_order_relaxed) == PTO2_SPEC_STAGING) ? 1 : 0;
+        (slot_state.payload->early_dispatch_state.load(std::memory_order_relaxed) == PTO2_EARLY_DISPATCH_STAGING) ? 1 :
+                                                                                                                    0;
 }
 
 SchedulerContext::PublishHandle SchedulerContext::prepare_subtask_to_core(
@@ -377,9 +379,9 @@ void SchedulerContext::dispatch_shape(
                 }
             }
 
-            // (Speculative pre-staged tasks never reach this ready-pop: they are
+            // (Early-dispatch pre-staged tasks never reach this ready-pop: they are
             // released by their doorbell in release_fanin_and_check_ready the
-            // instant their last producer completes — see try_speculative_release.)
+            // instant their last producer completes — see try_early_dispatch_release.)
 
             if (slot_state->active_mask.requires_sync_start()) {
                 if (is_pending) {
@@ -555,7 +557,7 @@ void SchedulerContext::dispatch_ready_tasks(
 //
 // Self-ring: release flips STAGING->DISPATCHED then rings the mask. A block staged
 // after that flip isn't in the mask release read, so this thread rings it here. The
-// seq_cst order between "OR mask then load spec_state" (here) and "store DISPATCHED
+// seq_cst order between "OR mask then load early_dispatch_state" (here) and "store DISPATCHED
 // then read mask" (release) guarantees every gated core's doorbell fires.
 int32_t SchedulerContext::stage_consumer_blocks(
     int32_t thread_idx, PTO2TaskSlotState *c, PTO2ResourceShape shape, int32_t start, int32_t count,
@@ -565,7 +567,7 @@ int32_t SchedulerContext::stage_consumer_blocks(
     // Stamp the real pre-stage time (NOT 0) so the swimlane shows these blocks
     // dispatched during the producer's run, not at trace start.
     uint64_t early_dispatch_ts = get_sys_cnt_aicpu();
-    uint64_t my_cores[PTO2_SPEC_CORE_MASK_WORDS] = {0};  // cores this thread gated (for self-ring)
+    uint64_t my_cores[PTO2_EARLY_DISPATCH_CORE_MASK_WORDS] = {0};  // cores this thread gated (for self-ring)
     int32_t staged = 0;
     int32_t block = start;
     // Mirror the normal flush_publish (scheduler_dispatch.cpp wmb()+publish loop):
@@ -593,26 +595,27 @@ int32_t SchedulerContext::stage_consumer_blocks(
         for (int i = 0; i < n; i++) {
             publish_subtask_to_core(handles[i], early_dispatch_ts);
             int32_t cid = tracker.get_core_id_by_offset(handles[i].core_offset);
-            sched_->spec_doorbell_table[cid].addr = handles[i].reg_addr;
-            sched_->spec_doorbell_table[cid].token = handles[i].reg_task_id;
+            sched_->early_dispatch_doorbell_table[cid].addr = handles[i].reg_addr;
+            sched_->early_dispatch_doorbell_table[cid].token = handles[i].reg_task_id;
             my_cores[cid >> 6] |= (1ULL << (cid & 63));
         }
     }
     // Publish all this thread's gated cores into the shared mask in one OR per word
     // (vs one per subtask) so release sees them; seq_cst keeps the self-ring order.
-    for (int w = 0; w < PTO2_SPEC_CORE_MASK_WORDS; w++)
+    for (int w = 0; w < PTO2_EARLY_DISPATCH_CORE_MASK_WORDS; w++)
         if (my_cores[w] != 0) c->payload->staged_core_mask[w].fetch_or(my_cores[w], std::memory_order_seq_cst);
 
     // If release already flipped DISPATCHED, it may have read the mask before our
     // bits landed — ring our own cores so none is left gated forever.
-    if (staged > 0 && c->payload->spec_state.load(std::memory_order_seq_cst) == PTO2_SPEC_DISPATCHED) {
-        for (int w = 0; w < PTO2_SPEC_CORE_MASK_WORDS; w++) {
+    if (staged > 0 &&
+        c->payload->early_dispatch_state.load(std::memory_order_seq_cst) == PTO2_EARLY_DISPATCH_DISPATCHED) {
+        for (int w = 0; w < PTO2_EARLY_DISPATCH_CORE_MASK_WORDS; w++) {
             uint64_t bits = my_cores[w];
             while (bits != 0) {
                 int cid = w * 64 + __builtin_ctzll(bits);
                 bits &= bits - 1;
                 PTO2SchedulerState::ring_one_doorbell(
-                    sched_->spec_doorbell_table[cid].addr, sched_->spec_doorbell_table[cid].token
+                    sched_->early_dispatch_doorbell_table[cid].addr, sched_->early_dispatch_doorbell_table[cid].token
                 );
             }
         }
@@ -620,64 +623,68 @@ int32_t SchedulerContext::stage_consumer_blocks(
     return staged;
 }
 
-// Early-dispatch drain (idle pass). Candidates are pushed to early_dispatch_queue
-// EVENT-DRIVEN by propagate_dispatch_fanin (a flagged producer's dispatch bumps its
-// consumers' dispatch_fanin; reaching fanin_count enqueues the consumer) — there is
-// no per-iteration PULL scan here anymore. This pass only DRAINS the queue.
-// Returns the number of blocks staged this pass (for the EarlyDispatch swimlane bar).
-int32_t SchedulerContext::try_speculative_early_dispatch(int32_t thread_idx) {
-    constexpr int PTO2_EARLY_DISPATCH_DRAIN_MAX = 8;  // bounded pops per pass
+// Early-dispatch analog of dispatch_shape: drain early_dispatch_queues[shape] and
+// pre-stage claimed block ranges onto this thread's `shape` cores for `phase`. IDLE
+// stages onto idle cores (RUNNING slot, gated); PENDING stages onto a running core's
+// gated pending slot. Candidates are pushed to the shape's queue EVENT-DRIVEN by
+// propagate_dispatch_fanin, so the shape is the queue index (no per-consumer
+// to_shape()). Returns the number of blocks staged.
+int32_t
+SchedulerContext::early_dispatch_shape(int32_t thread_idx, PTO2ResourceShape shape, CoreTracker::DispatchPhase phase) {
     CoreTracker &tracker = core_trackers_[thread_idx];
-    int32_t total_staged = 0;
+    int32_t s = static_cast<int32_t>(shape);
+    bool is_mix = (shape == PTO2ResourceShape::MIX);
+    bool is_idle = (phase == CoreTracker::DispatchPhase::IDLE);
 
-    // Drain the queue — mirrors the normal SPMD dispatch path. Batch-pop up to
-    // DRAIN_MAX consumers in one queue op (fewer CAS than one pop per consumer, like
-    // normal dispatch's pop_ready_tasks_batch), then for each: CLAIM a range sized to
-    // THIS thread's free cores by advancing next_block_idx with a CAS (atomic —
-    // next_block_idx is shared with normal dispatch, which also claims it if release
-    // routes the consumer to the ready queue, so a plain store could double-dispatch),
-    // RE-PUSH it for peers, THEN do the expensive prepare+publish. Re-pushing before
-    // staging lets peers claim the next range and stage CONCURRENTLY — a wide consumer
-    // (online_softmax, 48 blocks) is filled by all idle threads in parallel. When this
-    // thread's cores run out mid-batch, the unprocessed remainder is pushed back for
-    // peers (mirrors normal's push_batch of the unconsumed tail).
-    PTO2TaskSlotState *batch[PTO2_EARLY_DISPATCH_DRAIN_MAX];
-    int got = sched_->early_dispatch_queue.pop_batch(batch, PTO2_EARLY_DISPATCH_DRAIN_MAX);
+    // Size the pop exactly as dispatch_shape does: MIX to the cluster count, else the
+    // phase's dispatchable-core count. Skip the queue entirely when no core is free
+    // for this shape+phase (avoids a pointless pop + immediate push-back).
+    CoreTracker::BitStates cores =
+        is_mix ? tracker.get_cluster_offset_states() : tracker.get_dispatchable_cores(shape, phase);
+    if (!cores.has_value()) return 0;
+
+    int32_t total_staged = 0;
+    PTO2TaskSlotState *batch[CoreTracker::MAX_CLUSTERS * 3];
+    // Batch-pop in one queue op (fewer CAS than one pop per consumer); the pop is
+    // bounded by the shape's capacity so the stack buffer always holds it. Then for
+    // each consumer: CLAIM a range sized to THIS thread's free cores by advancing
+    // next_block_idx with a CAS (atomic — next_block_idx is shared with normal
+    // dispatch, which also claims it if release routes the consumer to the ready
+    // queue, so a plain store could double-dispatch), RE-PUSH it for peers, THEN do
+    // the expensive prepare+publish. Re-pushing before staging lets peers claim the
+    // next range and stage CONCURRENTLY — a wide consumer (online_softmax, 48 blocks)
+    // is filled by all idle threads in parallel. When cores run out mid-batch the
+    // unprocessed remainder is pushed back for peers (mirrors normal's push_batch of
+    // the unconsumed tail).
+    int got = sched_->early_dispatch_queues[s].pop_batch(batch, cores.count());
     for (int bi = 0; bi < got; bi++) {
         PTO2TaskSlotState *c = batch[bi];
-        if (c->payload->spec_state.load(std::memory_order_acquire) != PTO2_SPEC_STAGING) continue;  // released
-        PTO2ResourceShape shape = c->active_mask.to_shape();
-        CoreTracker::BitStates idle, pend;
-        if (shape == PTO2ResourceShape::MIX) {
-            // Active-mask-aware whole-cluster selection, matching normal dispatch's
-            // classify_mix_cluster: only the task's used cores must be idle (running
-            // placement) or running + pending-free (pending placement). Unused cores
-            // in the cluster are ignored, so early dispatch no longer strands a MIX
-            // whose unused AIV is busy. One inline scan fills BOTH buckets because
-            // early dispatch needs them at once (freecores + two-bucket staging),
-            // unlike normal dispatch which is phase-split and handles one per call.
+        if (c->payload->early_dispatch_state.load(std::memory_order_acquire) != PTO2_EARLY_DISPATCH_STAGING)
+            continue;  // released
+
+        // The single free-core bucket for this phase. For MIX, an active-mask-aware
+        // whole-cluster scan keeps only the clusters whose placement matches the phase
+        // (RUNNING placement for IDLE, PENDING placement for PENDING), matching normal
+        // dispatch's classify_mix_cluster — unused cores in the cluster are ignored, so
+        // a MIX whose unused AIV is busy is not stranded. For AIC/AIV it is just the
+        // phase's dispatchable cores.
+        CoreTracker::BitStates bucket;
+        if (is_mix) {
+            auto wanted = is_idle ? CoreTracker::MixPlacement::RUNNING : CoreTracker::MixPlacement::PENDING;
             uint8_t cmask = c->active_mask.core_mask();
             CoreTracker::BitStates candidates = tracker.get_cluster_offset_states();
             while (candidates.has_value()) {
                 int32_t cluster_offset = candidates.pop_first();
-                switch (tracker.classify_mix_cluster(cluster_offset, cmask)) {
-                case CoreTracker::MixPlacement::RUNNING:
-                    idle |= CoreTracker::BitStates(1ULL << cluster_offset);
-                    break;
-                case CoreTracker::MixPlacement::PENDING:
-                    pend |= CoreTracker::BitStates(1ULL << cluster_offset);
-                    break;
-                default:
-                    break;
+                if (tracker.classify_mix_cluster(cluster_offset, cmask) == wanted) {
+                    bucket |= CoreTracker::BitStates(1ULL << cluster_offset);
                 }
             }
         } else {
-            idle = tracker.get_idle_core_offset_states(shape);
-            pend = tracker.get_pending_core_offset_states(shape);
+            bucket = tracker.get_dispatchable_cores(shape, phase);
         }
-        int32_t freecores = (idle.has_value() ? idle.count() : 0) + (pend.has_value() ? pend.count() : 0);
-        if (freecores == 0) {  // no free cores of this shape — give this + the unprocessed rest back and stop
-            sched_->early_dispatch_queue.push_batch(&batch[bi], got - bi);
+        int32_t freecores = bucket.has_value() ? bucket.count() : 0;
+        if (freecores == 0) {  // no cores for this shape+phase — give this + the unprocessed rest back
+            sched_->early_dispatch_queues[s].push_batch(&batch[bi], got - bi);
             break;
         }
         // CAS-claim a contiguous range [start, start+claim) sized to this thread's
@@ -699,12 +706,96 @@ int32_t SchedulerContext::try_speculative_early_dispatch(int32_t thread_idx) {
         if (claim == 0) continue;  // nothing left to claim -> drop (no re-push)
         // Re-push for concurrent peers BEFORE the expensive staging.
         if (start + claim < c->logical_block_num) {
-            if (!sched_->early_dispatch_queue.push(c))
+            if (!sched_->early_dispatch_queues[s].push(c))
                 LOG_INFO_V9(
-                    "[SPEC] queue full on re-push, consumer=%" PRId64, static_cast<int64_t>(c->task->task_id.raw)
+                    "[EARLY_DISPATCH] queue full on re-push, consumer=%" PRId64,
+                    static_cast<int64_t>(c->task->task_id.raw)
                 );
         }
-        total_staged += stage_consumer_blocks(thread_idx, c, shape, start, claim, idle, pend);
+        // stage_consumer_blocks fills the idle bucket (RUNNING slot) then the pend
+        // bucket (gated pending); pass this phase's bucket in the matching slot and an
+        // empty other so only the phase's cores are staged.
+        CoreTracker::BitStates empty(0ULL);
+        total_staged += is_idle ? stage_consumer_blocks(thread_idx, c, shape, start, claim, bucket, empty) :
+                                  stage_consumer_blocks(thread_idx, c, shape, start, claim, empty, bucket);
+    }
+    return total_staged;
+}
+
+// Early-dispatch drain (idle pass), mirroring dispatch_ready_tasks: owns its own
+// gating and progress-flag updates, and orders staging the same way — MIX strict
+// priority, IDLE stage before PENDING stage, cross-thread idle gating
+// (MIX-IDLE ▶ c/v-IDLE ▶ MIX-PEND ▶ c/v-PEND). sync_start doesn't apply here (those
+// tasks are excluded from early dispatch at push time, propagate_dispatch_fanin).
+// Returns the number of blocks staged this pass (for the EarlyDispatch swimlane bar).
+int32_t SchedulerContext::try_early_dispatch(
+    int32_t thread_idx, CoreTracker &tracker, bool pmu_active, bool &made_progress, bool &try_pushed
+) {
+    using Phase = CoreTracker::DispatchPhase;
+
+    // Gate, owned here rather than by the caller (mirrors dispatch_ready_tasks
+    // withholding PENDING under PMU internally):
+    //   - pmu_active: staging gated work perturbs the single-issue PMU windows the
+    //     same way dual-issue PENDING dispatch does, so early dispatch is off.
+    //   - has_any_free_slot: this thread has no spare capacity to stage onto (a
+    //     purely local read; a fully-occupied thread bails before touching shared
+    //     queues).
+    //   - ready_queues empty: normal dispatch strictly precedes early — there is no
+    //     real ready task to delay only when every ready queue is drained.
+    if (pmu_active || !tracker.has_any_free_slot()) return 0;
+    for (int s = 0; s < PTO2_NUM_RESOURCE_SHAPES; s++) {
+        if (sched_->ready_queues[s].size() > 0) return 0;
+    }
+
+    // AIC/AIV order toggled by thread parity for shape-level load balancing, matching
+    // dispatch_ready_tasks. MIX is handled explicitly at the top of each stage.
+    static constexpr PTO2ResourceShape kAicAivOrder[2][2] = {
+        {PTO2ResourceShape::AIC, PTO2ResourceShape::AIV},
+        {PTO2ResourceShape::AIV, PTO2ResourceShape::AIC},
+    };
+    const PTO2ResourceShape *aic_aiv = kAicAivOrder[thread_idx & 1];
+
+    int32_t total_staged = 0;
+
+    // ===== IDLE stage =====
+    total_staged += early_dispatch_shape(thread_idx, PTO2ResourceShape::MIX, Phase::IDLE);
+
+    // MIX strict priority: with MIX candidates still queued, AIC/AIV yield this pass so
+    // the residual mix keeps its clusters. Uses the early-queue residual (the normal
+    // MIX ready queue is empty whenever this pass runs).
+    bool skip_aic_aiv = has_residual_early_mix();
+    if (!skip_aic_aiv) {
+        for (int i = 0; i < 2; i++) {
+            total_staged += early_dispatch_shape(thread_idx, aic_aiv[i], Phase::IDLE);
+        }
+    }
+
+    // ===== PENDING stage =====
+    // MIX-PENDING gate: skip when a peer has an idle MIX-capable cluster — that peer's
+    // next IDLE-MIX pass pulls the mix candidate from the shared queue at lower latency.
+    if (!has_idle_in_other_threads(thread_idx, PTO2ResourceShape::MIX)) {
+        total_staged += early_dispatch_shape(thread_idx, PTO2ResourceShape::MIX, Phase::PENDING);
+    }
+
+    // Re-check residual mix after MIX-PENDING; escalate the skip if it left residual.
+    if (!skip_aic_aiv && has_residual_early_mix()) {
+        skip_aic_aiv = true;
+    }
+    // AIC/AIV-PENDING, each gated on no peer being idle for that shape (a skip is a
+    // delay, not a loss — the peer pulls from the shared queue on its next IDLE pass).
+    if (!skip_aic_aiv) {
+        for (int i = 0; i < 2; i++) {
+            PTO2ResourceShape s = aic_aiv[i];
+            if (has_idle_in_other_threads(thread_idx, s)) continue;
+            total_staged += early_dispatch_shape(thread_idx, s, Phase::PENDING);
+        }
+    }
+
+    // Staging is dispatch work: reset the idle/stall clock and route this iter's tail
+    // cycles to the dispatch accumulator, exactly as normal dispatch does.
+    if (total_staged > 0) {
+        made_progress = true;
+        try_pushed = true;
     }
     return total_staged;
 }
@@ -1147,29 +1238,17 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
         }
 #endif
 
-        // Phase 4b: early-dispatch onto spare cores. Runs only when this thread
-        // has spare capacity AND no real ready work is queued. Two gates, cheapest
-        // and most-local first:
-        //   1. has_any_free_slot() — reads only this thread's core tracker (no
-        //      shared/atomic access). A fully-occupied thread skips here, never
-        //      touching the shared ready_queues or the shared early_dispatch_queue.
-        //   2. ready_queues empty — keeps early-dispatch from delaying a real ready
-        //      task (there is none to delay when empty).
-        // pmu_active also disables it: dispatch_ready_tasks already withholds
-        // PENDING dispatch under PMU to preserve single-issue windows, and staging
-        // gated work would perturb the same windows. The old try_pushed gate is
-        // gone on purpose — discovery is event-driven (propagate_dispatch_fanin),
-        // so this pass only drains the queue, and spare cores left after a partial
-        // dispatch get pre-staged the same iteration instead of waiting a round.
-        bool run_early_dispatch = !pmu_active && tracker.has_any_free_slot();
-        for (int s = 0; run_early_dispatch && s < PTO2_NUM_RESOURCE_SHAPES; s++) {
-            if (sched_->ready_queues[s].size() > 0) run_early_dispatch = false;
-        }
+        // Phase 4b: early-dispatch onto spare cores, mirroring the Phase 4 call
+        // shape. try_early_dispatch owns its own gating (off-PMU, this
+        // thread has a spare slot, no normal ready work queued) and updates
+        // made_progress / try_pushed, so this is a single unconditional call — it
+        // returns 0 without staging when gated out.
 #if PTO2_PROFILING
         bool early_dispatch_record = l2_swimlane_level_ >= L2SwimlaneLevel::SCHED_PHASES;
         uint64_t early_dispatch_t0 = early_dispatch_record ? get_sys_cnt_aicpu() : 0;
 #endif
-        [[maybe_unused]] int32_t staged_count = run_early_dispatch ? try_speculative_early_dispatch(thread_idx) : 0;
+        [[maybe_unused]] int32_t staged_count =
+            try_early_dispatch(thread_idx, tracker, pmu_active, made_progress, try_pushed);
 #if PTO2_PROFILING
         // Emit an EarlyDispatch bar so a staging-dominated iteration is attributed
         // to early-dispatch rather than disappearing into a blank gap.

@@ -54,9 +54,9 @@ public:
     using L0TaskArgs::add_scalar;
     using L0TaskArgs::add_scalars;
     using L0TaskArgs::add_scalars_i32;
-    using L0TaskArgs::allow_early_resolve;  // speculative early-dispatch hint (getter)
+    using L0TaskArgs::allow_early_resolve;  // early-dispatch hint (getter)
     using L0TaskArgs::copy_scalars_from;
-    using L0TaskArgs::set_allow_early_resolve;  // speculative early-dispatch hint (setter)
+    using L0TaskArgs::set_allow_early_resolve;  // early-dispatch hint (setter)
 
     // Error / status — forward to Arg
     using L0TaskArgs::error_msg;

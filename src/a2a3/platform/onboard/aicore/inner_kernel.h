@@ -93,7 +93,7 @@ __aicore__ inline uint64_t read_reg(RegId reg) {
  * Read the high 32 bits of DATA_MAIN_BASE.
  *
  * AICore reads the full 64-bit SPR via MOV; the high half is the
- * speculative-dispatch doorbell written by AICPU (low half stays the dispatch
+ * early-dispatch doorbell written by AICPU (low half stays the dispatch
  * token). Read-only on the AICore side, so this is always valid (unlike writes
  * to DATA_MAIN_BASE, which the SPR-write port rejects).
  */
