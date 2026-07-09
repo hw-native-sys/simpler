@@ -50,22 +50,8 @@ from simpler_setup.torch_interop import make_tensor_arg  # noqa: E402
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 
-# Paths to kernel sources — these live under tests/st/.../collectives/allreduce/
-_COLLECTIVES_DIR = os.path.join(
-    os.path.dirname(os.path.abspath(__file__)),
-    "..",
-    "..",
-    "..",
-    "..",
-    "tests",
-    "st",
-    "a2a3",
-    "tensormap_and_ringbuffer",
-    "collectives",
-    "allreduce",
-)
-_KERNEL_AIV = os.path.join(_COLLECTIVES_DIR, "kernels", "aiv", "allreduce_onephase_kernel.cpp")
-_KERNEL_ORCH = os.path.join(_COLLECTIVES_DIR, "kernels", "orchestration", "allreduce_onephase_orch.cpp")
+_KERNEL_AIV = os.path.join(HERE, "kernels", "aiv", "allreduce_onephase_kernel.cpp")
+_KERNEL_ORCH = os.path.join(HERE, "kernels", "orchestration", "allreduce_onephase_orch.cpp")
 
 ALLREDUCE_COUNT = 256
 DTYPE_NBYTES = 4  # float32
