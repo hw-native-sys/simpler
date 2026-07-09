@@ -65,6 +65,13 @@ def _matches_pinned_name(actual: str, pinned: str) -> bool:
     return base == pinned or base.endswith(f"-{pinned}")
 
 
+def _first_existing_file(candidates: list[str], description: str) -> str:
+    for path in candidates:
+        if os.path.isfile(path):
+            return path
+    raise FileNotFoundError(f"{description} not found; checked: {', '.join(candidates)}")
+
+
 def _host_compiler_cmake_args(default_cc: str, default_cxx: str, pin_compiler: bool = False) -> list[str]:
     """CMake ``-D`` args for a host GCC/G++ toolchain.
 
@@ -150,13 +157,20 @@ class CCECToolchain(Toolchain):
         if self.ascend_home_path is None:
             raise RuntimeError("ASCEND_HOME_PATH is required for CCEC toolchain")
 
-        self.cxx_path = os.path.join(self.ascend_home_path, "bin", "ccec")
-        self.linker_path = os.path.join(self.ascend_home_path, "bin", "ld.lld")
-
-        if not os.path.isfile(self.cxx_path):
-            raise FileNotFoundError(f"ccec compiler not found: {self.cxx_path}")
-        if not os.path.isfile(self.linker_path):
-            raise FileNotFoundError(f"ccec linker not found: {self.linker_path}")
+        self.cxx_path = _first_existing_file(
+            [
+                os.path.join(self.ascend_home_path, "bin", "ccec"),
+                os.path.join(self.ascend_home_path, "aarch64-linux", "bin", "ccec"),
+            ],
+            "ccec compiler",
+        )
+        self.linker_path = _first_existing_file(
+            [
+                os.path.join(self.ascend_home_path, "bin", "ld.lld"),
+                os.path.join(self.ascend_home_path, "aarch64-linux", "bin", "ld.lld"),
+            ],
+            "ccec linker",
+        )
 
     def get_compile_flags(self, core_type: str = "aiv", **kwargs) -> list[str]:
         # A5 uses dav-c310 architecture, A2A3 uses dav-c220
@@ -280,24 +294,18 @@ class Aarch64GxxToolchain(Toolchain):
         if self.ascend_home_path is None:
             raise RuntimeError("ASCEND_HOME_PATH is required for aarch64 toolchain")
 
-        self.cxx_path = os.path.join(
-            self.ascend_home_path,
-            "tools",
-            "hcc",
-            "bin",
-            "aarch64-target-linux-gnu-g++",
+        hcc_roots = [
+            os.path.join(self.ascend_home_path, "tools", "hcc", "bin"),
+            os.path.join(os.path.dirname(self.ascend_home_path), "tools", "hcc", "bin"),
+        ]
+        self.cxx_path = _first_existing_file(
+            [os.path.join(root, "aarch64-target-linux-gnu-g++") for root in hcc_roots],
+            "aarch64 C++ compiler",
         )
-        self.cc_path = os.path.join(
-            self.ascend_home_path,
-            "tools",
-            "hcc",
-            "bin",
-            "aarch64-target-linux-gnu-gcc",
+        self.cc_path = _first_existing_file(
+            [os.path.join(root, "aarch64-target-linux-gnu-gcc") for root in hcc_roots],
+            "aarch64 C compiler",
         )
-        if not os.path.isfile(self.cc_path):
-            raise FileNotFoundError(f"aarch64 C compiler not found: {self.cc_path}")
-        if not os.path.isfile(self.cxx_path):
-            raise FileNotFoundError(f"aarch64 C++ compiler not found: {self.cxx_path}")
         self._gcc = _is_gcc(self.cxx_path)
 
     def get_compile_flags(self, **kwargs) -> list[str]:

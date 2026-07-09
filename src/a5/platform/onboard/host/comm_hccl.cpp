@@ -45,6 +45,7 @@
 #include "acl/acl.h"
 #include "hccl/hccl_comm.h"
 #include "hccl/hccl_types.h"
+#include "pto/comm/async/urma/urma_workspace_manager.hpp"
 
 // Thin wrappers around the HCCL public APIs we use. Kept as a translation
 // layer in case we need to swap (e.g., InitConfig variant) later.
@@ -70,6 +71,7 @@ struct DomainAllocation {
     int nranks = 0;  // subset size
     void *local_buf = nullptr;
     CommContext *device_ctx = nullptr;  // aclrtMalloc'd CommContext mirror
+    std::unique_ptr<pto::comm::urma::UrmaWorkspaceManager> urma_workspace;
 };
 
 struct CommHandle_ {
@@ -87,6 +89,7 @@ struct CommHandle_ {
     bool owns_device_ctx = false;
     std::vector<CommContext *> derived_contexts;
     std::unordered_map<uint64_t, std::unique_ptr<DomainAllocation>> domain_allocations;
+    std::unique_ptr<pto::comm::urma::UrmaWorkspaceManager> urma_workspace;
 };
 
 // ============================================================================
@@ -623,25 +626,56 @@ static std::string domain_barrier_tag(uint64_t allocation_id, const char *phase)
     return std::string("alloc_") + std::to_string(allocation_id) + "_" + phase;
 }
 
-// Idempotently provision the process-global PTO-ISA async-SDMA scratch
-// workspace on the comm handle and mirror its address into host_ctx.  Both
-// the base-window path and the dynamic per-domain path call this; only the
-// first call allocates.  CANN 9.0+ feature: on 8.5 the aclnn dlsym fails by
-// design, so we leave workSpace == 0 and SDMA demos self-skip.  No-op when
-// the build-time PTO-ISA dependency is absent.
-static void ensure_sdma_workspace(CommHandle h) {
-#ifdef SIMPLER_ENABLE_PTO_SDMA_WORKSPACE
-    if (h->sdma_workspace) return;
-    h->sdma_workspace = std::make_unique<pto::comm::sdma::SdmaWorkspaceManager>();
-    if (h->sdma_workspace->Init()) {
-        h->host_ctx.workSpace = reinterpret_cast<uint64_t>(h->sdma_workspace->GetWorkspaceAddr());
-        h->host_ctx.workSpaceSize = 16 * 1024;
-    } else {
-        h->sdma_workspace.reset();
+static uint64_t urma_workspace_bytes(uint32_t rank_count) {
+    using namespace pto::comm::urma;
+    constexpr uint32_t qp_num = 1;
+    return sizeof(UrmaInfo) +
+           static_cast<uint64_t>(rank_count) *
+               (2ULL * sizeof(UrmaWQCtx) * qp_num + 2ULL * sizeof(UrmaCqCtx) * qp_num + sizeof(UrmaMemInfo) * qp_num);
+}
+
+static bool rank_ids_are_dense_prefix(const uint32_t *rank_ids, size_t rank_count) {
+    if (rank_ids == nullptr) return false;
+    for (size_t i = 0; i < rank_count; ++i) {
+        if (rank_ids[i] != static_cast<uint32_t>(i)) return false;
     }
-#else
-    (void)h;
-#endif
+    return true;
+}
+
+static bool init_urma_workspace(
+    CommHandle h, uint32_t rank_id, uint32_t rank_count, void *symmetric_addr, uint64_t symmetric_size,
+    std::unique_ptr<pto::comm::urma::UrmaWorkspaceManager> &workspace
+) {
+    if (workspace) return workspace->GetWorkspaceAddr() != nullptr;
+    if (h == nullptr || h->hccl_comm == nullptr || symmetric_addr == nullptr || symmetric_size == 0 ||
+        rank_id >= rank_count) {
+        return false;
+    }
+
+    auto manager = std::make_unique<pto::comm::urma::UrmaWorkspaceManager>();
+    if (!manager->Init(h->hccl_comm, rank_id, rank_count, symmetric_addr, symmetric_size)) {
+        LOG_WARN(
+            "[comm rank %d] URMA workspace init failed (rank_id=%u rank_count=%u size=%llu); "
+            "CommContext::workSpace remains 0",
+            h->rank, rank_id, rank_count, static_cast<unsigned long long>(symmetric_size)
+        );
+        return false;
+    }
+    workspace = std::move(manager);
+    return true;
+}
+
+static void ensure_base_urma_workspace(CommHandle h) {
+    if (h == nullptr || h->urma_workspace) return;
+    void *local_buf = reinterpret_cast<void *>(static_cast<uintptr_t>(h->host_ctx.windowsIn[h->rank]));
+    if (!init_urma_workspace(
+            h, static_cast<uint32_t>(h->rank), static_cast<uint32_t>(h->nranks), local_buf, h->host_ctx.winSize,
+            h->urma_workspace
+        )) {
+        return;
+    }
+    h->host_ctx.workSpace = reinterpret_cast<uint64_t>(h->urma_workspace->GetWorkspaceAddr());
+    h->host_ctx.workSpaceSize = urma_workspace_bytes(static_cast<uint32_t>(h->nranks));
 }
 
 // Performs the per-allocation Path-D dance for one subset rank.  rank_ids
@@ -773,20 +807,26 @@ static int domain_alloc_via_ipc(
     out->rank = my_dr;
     out->nranks = subset_n;
     out->local_buf = localBuf;
-    // Build a host-side CommContext for the subset and upload it as device_ctx.
-    // PTO-ISA async SDMA ops (SdmaTget) read the scratch workspace off
-    // CommContext::workSpace.  The dynamic-domain path does not go through
-    // comm_alloc_windows, so provision the workspace here; without it a
-    // freshly zero-initialized per-domain ctx would leave workSpace == 0 and
-    // those kernels early-return on the workSpace guard.
-    ensure_sdma_workspace(h);
+    if (rank_ids_are_dense_prefix(rank_ids, rank_count)) {
+        (void)init_urma_workspace(
+            h, domain_rank, static_cast<uint32_t>(rank_count), localBuf, win_size, out->urma_workspace
+        );
+    } else {
+        LOG_WARN(
+            "[comm rank %d] alloc_domain: URMA workspace disabled for non-dense rank mapping "
+            "(first supported version requires rank_ids[i] == i)",
+            h->rank
+        );
+    }
 
     CommContext ctx{};
     ctx.rankId = domain_rank;
     ctx.rankNum = static_cast<uint32_t>(subset_n);
     ctx.winSize = win_size;
-    ctx.workSpace = h->host_ctx.workSpace;
-    ctx.workSpaceSize = h->host_ctx.workSpaceSize;
+    if (out->urma_workspace) {
+        ctx.workSpace = reinterpret_cast<uint64_t>(out->urma_workspace->GetWorkspaceAddr());
+        ctx.workSpaceSize = urma_workspace_bytes(static_cast<uint32_t>(rank_count));
+    }
     ctx.windowsIn[my_dr] = reinterpret_cast<uint64_t>(localBuf);
     for (int p = 0; p < subset_n; ++p) {
         if (p == my_dr) continue;
@@ -842,11 +882,7 @@ extern "C" int comm_alloc_windows(CommHandle h, size_t win_size, uint64_t *devic
     const uint64_t effective_win_size = win_size != 0 ? static_cast<uint64_t>(win_size) : kDefaultIpcWinSize;
     if (alloc_windows_via_ipc(h, effective_win_size) != 0) return -1;
 
-    // Optional PTO-ISA async SDMA workspace pre-allocation (overlays the comm
-    // backend's output; comm-side flow does not care about workSpace).  No-op
-    // when SIMPLER_ENABLE_PTO_SDMA_WORKSPACE is undefined (this PR ships A
-    // without the macro; the overlay PR turns it on).
-    ensure_sdma_workspace(h);
+    ensure_base_urma_workspace(h);
 
     void *newDevMem = nullptr;
     aclError aRet = aclrtMalloc(&newDevMem, sizeof(CommContext), ACL_MEM_MALLOC_HUGE_FIRST);
@@ -905,8 +941,16 @@ extern "C" int comm_derive_context(
     }
 
     CommContext ctx{};
-    ctx.workSpace = h->host_ctx.workSpace;
-    ctx.workSpaceSize = h->host_ctx.workSpaceSize;
+    if (rank_ids_are_dense_prefix(rank_ids, rank_count)) {
+        ctx.workSpace = h->host_ctx.workSpace;
+        ctx.workSpaceSize = h->host_ctx.workSpaceSize;
+    } else {
+        LOG_WARN(
+            "[comm rank %d] comm_derive_context: URMA workspace disabled for non-dense rank mapping "
+            "(first supported version requires rank_ids[i] == i)",
+            h->rank
+        );
+    }
     ctx.rankId = domain_rank;
     ctx.rankNum = static_cast<uint32_t>(rank_count);
     ctx.winSize = window_size;
@@ -1059,6 +1103,7 @@ comm_release_domain_windows(CommHandle h, uint64_t allocation_id, size_t rank_co
         aclError aret = aclrtFree(alloc->device_ctx);
         if (aret != ACL_SUCCESS && rc == 0) rc = -1;
     }
+    alloc->urma_workspace.reset();
     if (alloc->local_buf) {
         aclError aret = aclrtFree(alloc->local_buf);
         if (aret != ACL_SUCCESS && rc == 0) rc = -1;
@@ -1099,9 +1144,11 @@ extern "C" int comm_destroy(CommHandle h) try {
     for (auto &kv : h->domain_allocations) {
         auto &alloc = kv.second;
         if (alloc->device_ctx) aclrtFree(alloc->device_ctx);
+        alloc->urma_workspace.reset();
         if (alloc->local_buf) aclrtFree(alloc->local_buf);
     }
     h->domain_allocations.clear();
+    h->urma_workspace.reset();
     if (h->hccl_comm) {
         HcclResult hret = hccl_comm_destroy(h->hccl_comm);
         if (hret != HCCL_SUCCESS) {

@@ -130,6 +130,7 @@ inline __aicore__ bool register_completion_condition(AsyncCtx &ctx, const Comple
 
     volatile __gm__ DeferredCompletionEntry *slot = &ctx.completion_entries[idx];
     slot->addr = token.addr;
+    slot->backend_cookie = token.backend_cookie;
     slot->expected_value = token.expected_value;
     slot->engine = token.engine;
     slot->completion_type = token.completion_type;

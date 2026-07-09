@@ -32,6 +32,14 @@ if(DEFINED CUSTOM_INCLUDE_DIRS)
 else()
     message(FATAL_ERROR "MUST set CUSTOM_INCLUDE_DIRS to build Host runtime")
 endif()
+if(NOT DEFINED ENV{PTO_ISA_ROOT})
+    message(FATAL_ERROR
+        "a5 onboard host_runtime requires PTO_ISA_ROOT "
+        "(URMA workspace setup uses pto-isa host headers)")
+endif()
+list(APPEND CMAKE_CUSTOM_INCLUDE_DIRS "$ENV{PTO_ISA_ROOT}/include")
+
+set(ASCEND_ARCH_HOME "${ASCEND_HOME_PATH}/${CMAKE_SYSTEM_PROCESSOR}-linux")
 
 # Build complete source list: core host sources + sources from CUSTOM_SOURCE_DIRS
 set(HOST_RUNTIME_SOURCES "")
@@ -97,6 +105,13 @@ target_compile_options(host_runtime
 # src/common/platform/shared/host/platform_compile_info.cpp.
 target_compile_definitions(host_runtime PRIVATE SIMPLER_PLATFORM_NAME="a5")
 
+set(SIMPLER_PTO_ISA_BUILD_COMMIT "" CACHE STRING
+    "PTO-ISA commit used for host_runtime cache key")
+if(NOT "${SIMPLER_PTO_ISA_BUILD_COMMIT}" STREQUAL "")
+    target_compile_definitions(host_runtime PRIVATE
+        SIMPLER_PTO_ISA_BUILD_COMMIT="${SIMPLER_PTO_ISA_BUILD_COMMIT}")
+endif()
+
 # Include directories - always include local headers
 target_include_directories(host_runtime
     PRIVATE
@@ -115,18 +130,33 @@ target_include_directories(host_runtime
         # rtsLaunchCpuKernel API used by LoadAicpuOp).
         ${ASCEND_HOME_PATH}/pkg_inc/runtime/runtime
         ${ASCEND_HOME_PATH}/pkg_inc/profiling
+        ${ASCEND_ARCH_HOME}/include
+        ${ASCEND_ARCH_HOME}/pkg_inc
+        ${ASCEND_ARCH_HOME}/pkg_inc/runtime
+        ${ASCEND_ARCH_HOME}/pkg_inc/runtime/runtime
+        ${ASCEND_ARCH_HOME}/pkg_inc/profiling
+        ${ASCEND_HOME_PATH}/${CMAKE_SYSTEM_PROCESSOR}-linux/asc/include
+        ${ASCEND_ARCH_HOME}/asc/include
+        ${ASCEND_ARCH_HOME}/include/driver
         ${ASCEND_HOME_PATH}/${CMAKE_SYSTEM_PROCESSOR}-linux/include/driver
 )
 
 # CANN 9.x exposes the working non-V2 HCCL entry points through libhcomm.
 # Link it explicitly so comm_hccl.cpp can follow the same initialization path
 # as the pto-isa communication tests.
-find_library(HCOMM_LIB NAMES hcomm PATHS ${ASCEND_HOME_PATH}/lib64 NO_DEFAULT_PATH)
+find_library(HCOMM_LIB
+    NAMES hcomm
+    PATHS
+        ${ASCEND_HOME_PATH}/lib64
+        ${ASCEND_ARCH_HOME}/lib64
+    NO_DEFAULT_PATH
+)
 if(HCOMM_LIB)
     set(HCCL_LINK_TARGETS ${HCOMM_LIB})
     message(STATUS "Using HCCL library: ${HCOMM_LIB}")
 else()
-    message(FATAL_ERROR "libhcomm not found under ${ASCEND_HOME_PATH}/lib64")
+    message(FATAL_ERROR
+        "libhcomm not found under ${ASCEND_HOME_PATH}/lib64 or ${ASCEND_ARCH_HOME}/lib64")
 endif()
 
 # Link against CANN runtime libraries
@@ -142,6 +172,8 @@ target_link_libraries(host_runtime
         runtime
         ascendcl
         -Wl,--no-as-needed ${HCCL_LINK_TARGETS} -Wl,--as-needed
+        c_sec
+        nnopbase
         dl
 )
 
@@ -149,6 +181,9 @@ target_link_directories(host_runtime
     PRIVATE
         ${ASCEND_HOME_PATH}/lib64
         ${ASCEND_HOME_PATH}/runtime/lib64
+        ${ASCEND_HOME_PATH}/${CMAKE_SYSTEM_PROCESSOR}-linux/lib64
+        ${ASCEND_ARCH_HOME}/lib64
+        ${ASCEND_ARCH_HOME}/runtime/lib64
 )
 
 set_target_properties(host_runtime PROPERTIES OUTPUT_NAME "host_runtime")

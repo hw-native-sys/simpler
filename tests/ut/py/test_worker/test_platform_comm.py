@@ -75,6 +75,7 @@ def _rank_entry(
     nranks: int,
     device_id: int,
     bins,
+    platform: str,
     rootinfo_path: str,
     result_queue: mp.Queue,  # type: ignore[type-arg]
 ) -> None:
@@ -136,6 +137,42 @@ def _rank_entry(
         result["local_base"] = int(local_base)
         result["rank_id"] = int(host_ctx.rankId)
         result["rank_num"] = int(host_ctx.rankNum)
+        result["workspace"] = int(host_ctx.workSpace)
+        result["workspace_size"] = int(host_ctx.workSpaceSize)
+
+        if platform == "a5":
+            if host_ctx.workSpace == 0:
+                raise AssertionError("a5 base CommContext.workSpace is 0")
+            if host_ctx.workSpaceSize == 0:
+                raise AssertionError("a5 base CommContext.workSpaceSize is 0")
+
+            dense_ctx_ptr = worker.comm_derive_context(comm, list(range(nranks)), rank, 0, 4096)
+            dense_ctx = _CommContext()
+            worker.copy_from(ctypes.addressof(dense_ctx), dense_ctx_ptr, ctypes.sizeof(dense_ctx))
+            if dense_ctx.workSpace != host_ctx.workSpace:
+                raise AssertionError(
+                    f"dense derived workSpace=0x{dense_ctx.workSpace:x}, "
+                    f"expected base=0x{host_ctx.workSpace:x}"
+                )
+            if dense_ctx.workSpaceSize != host_ctx.workSpaceSize:
+                raise AssertionError(
+                    f"dense derived workSpaceSize={dense_ctx.workSpaceSize}, "
+                    f"expected base={host_ctx.workSpaceSize}"
+                )
+
+            non_dense_rank_ids = list(reversed(range(nranks)))
+            non_dense_domain_rank = non_dense_rank_ids.index(rank)
+            non_dense_ctx_ptr = worker.comm_derive_context(comm, non_dense_rank_ids, non_dense_domain_rank, 0, 4096)
+            non_dense_ctx = _CommContext()
+            worker.copy_from(ctypes.addressof(non_dense_ctx), non_dense_ctx_ptr, ctypes.sizeof(non_dense_ctx))
+            if non_dense_ctx.workSpace != 0 or non_dense_ctx.workSpaceSize != 0:
+                raise AssertionError(
+                    "non-dense derived context must disable URMA workspace, got "
+                    f"workSpace=0x{non_dense_ctx.workSpace:x} workSpaceSize={non_dense_ctx.workSpaceSize}"
+                )
+            result["dense_workspace"] = int(dense_ctx.workSpace)
+            result["non_dense_workspace"] = int(non_dense_ctx.workSpace)
+            result["stage"] = "a5_workspace_ok"
 
         # Barrier.  The C++ HCCL UT observed CANN error 507018 here on some
         # builds; that bug is tracked independently.  Surface the failure to
@@ -189,6 +226,7 @@ def test_two_rank_comm_lifecycle(st_platform, st_device_ids):
                 nranks,
                 int(st_device_ids[rank]),
                 bins,
+                st_platform,
                 rootinfo_path,
                 result_queue,
             ),

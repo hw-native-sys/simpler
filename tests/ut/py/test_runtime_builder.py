@@ -156,15 +156,17 @@ class TestRuntimeBuilderPtoIsaValidation:
     """Test PTO-ISA metadata validation is scoped to affected runtimes."""
 
     @pytest.mark.parametrize(
-        ("platform", "should_validate"),
+            ("platform", "should_validate"),
         [
             ("a2a3", True),
             ("a2a3sim", False),
-            ("a5", False),
+            ("a5", True),
             ("a5sim", False),
         ],
     )
-    def test_pto_isa_validation_only_runs_for_a2a3_onboard(self, tmp_path, monkeypatch, platform, should_validate):
+    def test_pto_isa_validation_only_runs_for_onboard_pto_users(
+        self, tmp_path, monkeypatch, platform, should_validate
+    ):
         from simpler_setup import pto_isa  # noqa: PLC0415
         from simpler_setup.platform_info import TARGETS, parse_platform  # noqa: PLC0415
         from simpler_setup.runtime_builder import RuntimeBuilder  # noqa: PLC0415
@@ -197,7 +199,7 @@ class TestRuntimeBuilderPtoIsaValidation:
         if should_validate:
             with pytest.raises(RuntimeError, match="pto-isa validation called"):
                 builder._lookup_binaries("test_rt", tmp_path / "out")
-            assert calls == [(builder._LIB_DIR, "a2a3/onboard/test_rt")]
+            assert calls == [(builder._LIB_DIR, f"{builder._arch}/onboard/test_rt")]
         else:
             with pytest.raises(FileNotFoundError, match="Pre-built runtime binaries not found"):
                 builder._lookup_binaries("test_rt", tmp_path / "out")
@@ -362,7 +364,7 @@ class TestRuntimeBuilderGetBinaries:
 
     @patch("simpler_setup.runtime_builder.RuntimeCompiler")
     def test_sim_direct_build_does_not_write_pto_isa_metadata(self, MockCompiler, tmp_path, monkeypatch):
-        """get_binaries(build=True) only writes PTO-ISA metadata for onboard a2a3."""
+        """get_binaries(build=True) only writes PTO-ISA metadata for onboard pto-isa users."""
         from simpler_setup import pto_isa  # noqa: PLC0415
         from simpler_setup.runtime_builder import RuntimeBuilder  # noqa: PLC0415
 
@@ -458,18 +460,19 @@ class TestBuildCacheStamp:
         builder._arch, builder._variant = parse_platform(platform)
         return builder
 
-    def test_a2a3_onboard_folds_in_pto_isa_commit(self, monkeypatch):
-        """a2a3 onboard with a resolved pto-isa commit → composite stamp."""
+    @pytest.mark.parametrize("platform", ["a2a3", "a5"])
+    def test_onboard_pto_user_folds_in_pto_isa_commit(self, monkeypatch, platform):
+        """Onboard runtime with a resolved pto-isa commit → composite stamp."""
         import simpler_setup.runtime_builder as rb_module  # noqa: PLC0415
         from simpler_setup import pto_isa  # noqa: PLC0415
 
         monkeypatch.setattr(rb_module, "_get_git_head", lambda _root: "runtime_sha")
         monkeypatch.setattr(pto_isa, "read_pto_isa_pin", lambda: "isa_sha")
 
-        builder = self._make_builder("a2a3")
+        builder = self._make_builder(platform)
         assert builder._build_cache_stamp() == "runtime_sha:pto-isa=isa_sha"
 
-    def test_non_a2a3_onboard_uses_pure_runtime_sha(self, monkeypatch):
+    def test_non_pto_user_uses_pure_runtime_sha(self, monkeypatch):
         """Other arch/variant ignores pto-isa → stamp keyed on runtime HEAD only."""
         import simpler_setup.runtime_builder as rb_module  # noqa: PLC0415
         from simpler_setup import pto_isa  # noqa: PLC0415
@@ -504,7 +507,7 @@ class TestResolveBuildPtoIsaCommit:
         builder._arch, builder._variant = parse_platform(platform)
         return builder
 
-    def test_non_a2a3_onboard_returns_empty(self, monkeypatch):
+    def test_non_pto_user_returns_empty(self, monkeypatch):
         from simpler_setup import pto_isa  # noqa: PLC0415
 
         monkeypatch.setattr(pto_isa, "read_pto_isa_pin", lambda: pytest.fail("unexpected pin read"))
@@ -512,11 +515,12 @@ class TestResolveBuildPtoIsaCommit:
         builder = self._make_builder("a2a3sim")
         assert builder._resolve_build_pto_isa_commit() == ""
 
-    def test_a2a3_onboard_reads_pin(self, monkeypatch):
+    @pytest.mark.parametrize("platform", ["a2a3", "a5"])
+    def test_onboard_pto_user_reads_pin(self, monkeypatch, platform):
         from simpler_setup import pto_isa  # noqa: PLC0415
 
         monkeypatch.setattr(pto_isa, "read_pto_isa_pin", lambda: "isa_sha")
-        builder = self._make_builder("a2a3")
+        builder = self._make_builder(platform)
         assert builder._resolve_build_pto_isa_commit() == "isa_sha"
 
     def test_pin_error_propagates(self, monkeypatch):

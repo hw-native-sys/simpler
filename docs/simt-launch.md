@@ -86,8 +86,8 @@ These properties make it work and keep it cheap:
   `cce::dim3`, `__simt_vf__`, `LAUNCH_BOUND`, `threadIdx` come from bisheng's
   bundled `__clang_cce_*.h` headers (auto-included for `dav-c310-vec`).
   `mscatter` itself lowers to exactly these builtins — pto-isa is only a
-  wrapper. So the a5 **platform runtime stays pto-isa-free**; only per-example
-  incore kernels pull pto-isa (via `kernel_compiler.py`).
+  wrapper. So the a5 **AICore SIMT anchor stays pto-isa-free**. The onboard
+  host runtime may still embed pto-isa for communication workspace setup.
 - **Survives dead-code elimination.** `force_simt_anchor` is a trailing field
   in the a5 `KernelArgs` ([kernel_args.h](../src/a5/platform/include/common/kernel_args.h))
   that the host always leaves 0. Because it is loaded from `__gm__` memory the

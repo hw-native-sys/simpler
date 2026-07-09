@@ -31,6 +31,8 @@ else()
     message(FATAL_ERROR "MUST set CUSTOM_INCLUDE_DIRS to build AICPU kernel")
 endif()
 
+set(ASCEND_ARCH_HOME "${ASCEND_HOME_PATH}/${CMAKE_SYSTEM_PROCESSOR}-linux")
+
 # Build complete source list from CUSTOM_SOURCE_DIRS and core sources.
 # Sources come from three buckets:
 #   1. `${CMAKE_CURRENT_SOURCE_DIR}/*.cpp` — onboard-aicpu sources that are
@@ -92,13 +94,19 @@ target_include_directories(aicpu_kernel
         ${ASCEND_HOME_PATH}/include
         ${ASCEND_HOME_PATH}/include/toolchain
         ${ASCEND_HOME_PATH}/pkg_inc/base
+        ${ASCEND_ARCH_HOME}/include
+        ${ASCEND_ARCH_HOME}/include/toolchain
+        ${ASCEND_ARCH_HOME}/pkg_inc/base
 )
 
 target_link_directories(aicpu_kernel
     PRIVATE
         ${ASCEND_HOME_PATH}/${CMAKE_SYSTEM_PROCESSOR}-linux/devlib/linux/aarch64/
         ${ASCEND_HOME_PATH}/${CMAKE_SYSTEM_PROCESSOR}-linux/devlib/device/
+        ${ASCEND_ARCH_HOME}/devlib/linux/aarch64/
+        ${ASCEND_ARCH_HOME}/devlib/device/
         ${ASCEND_HOME_PATH}/lib64
+        ${ASCEND_ARCH_HOME}/lib64
 )
 
 # Output name
@@ -130,6 +138,7 @@ target_include_directories(aicpu_dispatcher
         # (matches a2a3 sibling; same Build-ID fingerprint protocol).
         ${CMAKE_CURRENT_SOURCE_DIR}/../../../../common
         ${ASCEND_HOME_PATH}/include
+        ${ASCEND_ARCH_HOME}/include
 )
 
 target_link_libraries(aicpu_dispatcher PRIVATE dl)

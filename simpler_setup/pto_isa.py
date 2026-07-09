@@ -129,7 +129,8 @@ def write_pto_isa_build_metadata(lib_dir: Path, pto_isa_root: str, runtime_keys:
         raise RuntimeError(
             "Cannot record PTO-ISA build revision: "
             f"{pto_isa_root} is not a git checkout or git HEAD is unavailable. "
-            "Building a2a3 onboard runtimes requires the managed build/pto-isa checkout."
+            "Building onboard runtimes that embed PTO-ISA host headers requires "
+            "the managed build/pto-isa checkout."
         )
     if actual_commit != required_commit:
         raise RuntimeError(

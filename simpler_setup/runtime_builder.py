@@ -180,29 +180,24 @@ class RuntimeBuilder:
     def _requires_pto_isa_metadata_validation(self) -> bool:
         """Return True when this runtime embeds PTO-ISA headers into host code.
 
-        Scoped on arch/variant, not on ``SIMPLER_ENABLE_PTO_SDMA_WORKSPACE``
-        (the actual flag that pulls pto-isa headers into the host .so). This is
-        deliberately coarser: should a2a3 onboard ever turn that workspace off,
-        a pto-isa bump would still invalidate this target's cache even though it
-        no longer embeds pto-isa. That over-invalidation only costs an extra
-        recompile — it can never serve a stale object — so erring wide is the
-        safe direction, and keeping the scope arch/variant-based matches the
-        cmake-side define gating in src/a2a3/platform/onboard/host/CMakeLists.txt.
+        Scoped on arch/variant, not on individual source includes. a2a3
+        onboard embeds pto-isa for SDMA workspace setup and a5 onboard embeds
+        it for URMA workspace setup, so a pto-isa bump must invalidate those
+        runtime binaries.
         """
-        return self._arch == "a2a3" and self._variant == "onboard"
+        return self._arch in ("a2a3", "a5") and self._variant == "onboard"
 
     def _resolve_build_pto_isa_commit(self) -> str:
         """Return the pinned pto-isa commit baked into this build.
 
-        Only a2a3 onboard host code embeds pto-isa headers, so a pto-isa bump
-        must invalidate that build's cmake cache even when the runtime repo
-        HEAD is unchanged (issue #1139: a stale host_runtime.so compiled
-        against the old headers otherwise survives a reinstall). For every
-        other arch/variant the pto-isa revision does not affect the compiled
-        objects, so return "" and leave the stamp keyed on the runtime HEAD.
+        Onboard host code that embeds pto-isa headers must be invalidated when
+        the pin changes, even when the runtime repo HEAD is unchanged (issue
+        #1139: a stale host_runtime.so compiled against the old headers
+        otherwise survives a reinstall). For variants that do not embed
+        pto-isa, return "" and leave the stamp keyed on the runtime HEAD.
 
         ``pto_isa.pin`` is the single source of truth. If the pin is missing or
-        invalid, let ``read_pto_isa_pin`` raise so an a2a3 onboard build cannot
+        invalid, let ``read_pto_isa_pin`` raise so an onboard build cannot
         silently proceed with unknown PTO-ISA headers.
         """
         if not self._requires_pto_isa_metadata_validation():
@@ -214,8 +209,9 @@ class RuntimeBuilder:
     def _build_cache_stamp(self, pto_isa_commit: Optional[str] = None) -> str:
         """Stamp identifying the sources this build was compiled from.
 
-        Combines the runtime repo HEAD with the pto-isa commit (a2a3 onboard
-        only) so the cmake cache is invalidated whenever either changes. An
+        Combines the runtime repo HEAD with the pto-isa commit for onboard
+        runtimes that embed PTO-ISA host headers, so the cmake cache is
+        invalidated whenever either changes. An
         empty runtime HEAD is preserved verbatim so the
         ``_invalidate_cache_if_stale`` 'unavailable → clean rebuild' path still
         fires rather than being masked by a present pto-isa commit.

@@ -11,8 +11,8 @@
 /**
  * Unit tests for the a5 AICoreCompletionMailbox MPSC push protocol.
  *
- * Mirrors tests/ut/cpp/a2a3/test_aicore_completion_mailbox.cpp but adapted
- * to a5's simpler CompletionCondition (no completion_type field; counter-only).
+ * Mirrors tests/ut/cpp/a2a3/test_aicore_completion_mailbox.cpp for the a5
+ * completion mailbox and async wait-list path.
  */
 
 #include <gtest/gtest.h>
@@ -51,9 +51,10 @@ TEST(A5AICoreCompletionMailbox, PushConditionThenDrainCreatesEntry) {
 
     PTO2TaskId token = make_token(42);
     constexpr uint64_t kAddr = 0xCAFEBABEDEADBEEFull;
-    ASSERT_TRUE(
-        mb->try_push_condition(token, kAddr, /*expected=*/7, /*engine=*/COMPLETION_ENGINE_ROCE, COMPLETION_TYPE_COUNTER)
-    );
+    constexpr uint64_t kCookie = 0x123456789ABCDEF0ull;
+    ASSERT_TRUE(mb->try_push_condition(
+        token, kAddr, kCookie, /*expected=*/7, /*engine=*/COMPLETION_ENGINE_ROCE, COMPLETION_TYPE_COUNTER
+    ));
 
     int32_t err = PTO2_ERROR_NONE;
     AsyncWaitList::DrainCompletionSink sink{};
@@ -66,6 +67,7 @@ TEST(A5AICoreCompletionMailbox, PushConditionThenDrainCreatesEntry) {
     EXPECT_EQ(wait_list.entries[0].slot_state, nullptr);
     ASSERT_EQ(wait_list.entries[0].condition_count, 1);
     EXPECT_EQ(wait_list.entries[0].conditions[0].expected_value, 7u);
+    EXPECT_EQ(wait_list.entries[0].conditions[0].backend_cookie, kCookie);
     EXPECT_EQ(reinterpret_cast<uint64_t>(wait_list.entries[0].conditions[0].counter_addr), kAddr);
     EXPECT_EQ(wait_list.entries[0].waiting_completion_count, 1);
     EXPECT_FALSE(wait_list.entries[0].normal_done);
@@ -136,12 +138,14 @@ TEST(A5AICoreCompletionMailbox, ConditionAttachesToExistingEntry) {
     wait_list.entries[0].normal_done = false;
     wait_list.count = 1;
 
-    // a5 is counter-only (no SDMA event-record backend), so both conditions
-    // are COUNTER and bind counter_addr / expected_value.
     constexpr uint64_t kAddr1 = 0x1000;
     constexpr uint64_t kAddr2 = 0x2000;
-    ASSERT_TRUE(mb->try_push_condition(token, kAddr1, /*expected=*/3, COMPLETION_ENGINE_SDMA, COMPLETION_TYPE_COUNTER));
-    ASSERT_TRUE(mb->try_push_condition(token, kAddr2, /*expected=*/9, COMPLETION_ENGINE_ROCE, COMPLETION_TYPE_COUNTER));
+    ASSERT_TRUE(
+        mb->try_push_condition(token, kAddr1, 0, /*expected=*/3, COMPLETION_ENGINE_SDMA, COMPLETION_TYPE_COUNTER)
+    );
+    ASSERT_TRUE(
+        mb->try_push_condition(token, kAddr2, 0, /*expected=*/9, COMPLETION_ENGINE_ROCE, COMPLETION_TYPE_COUNTER)
+    );
 
     int32_t err = PTO2_ERROR_NONE;
     AsyncWaitList::DrainCompletionSink sink{};
@@ -165,12 +169,13 @@ TEST(A5AICoreCompletionMailbox, PushReturnsFalseWhenFull) {
     PTO2TaskId token = make_token(1);
     for (uint32_t i = 0; i < kCap; i++) {
         ASSERT_TRUE(mb->try_push_condition(
-            token, /*addr=*/0x10000 + i, /*expected=*/0, COMPLETION_ENGINE_SDMA, COMPLETION_TYPE_COUNTER
+            token, /*addr=*/0x10000 + i, /*backend_cookie=*/0, /*expected=*/0, COMPLETION_ENGINE_SDMA,
+            COMPLETION_TYPE_COUNTER
         ));
     }
-    EXPECT_FALSE(
-        mb->try_push_condition(token, /*addr=*/0x20000, /*expected=*/0, COMPLETION_ENGINE_SDMA, COMPLETION_TYPE_COUNTER)
-    );
+    EXPECT_FALSE(mb->try_push_condition(
+        token, /*addr=*/0x20000, /*backend_cookie=*/0, /*expected=*/0, COMPLETION_ENGINE_SDMA, COMPLETION_TYPE_COUNTER
+    ));
     EXPECT_FALSE(mb->try_push_normal_done(token, /*slot_state_addr=*/0));
 
     destroy_mailbox(mb);
@@ -191,7 +196,7 @@ TEST(A5AICoreCompletionMailbox, MultiProducerNoLossAndPerProducerOrder) {
             for (int i = 0; i < kPerProducer; i++) {
                 uint64_t addr = (static_cast<uint64_t>(p) << 32) | static_cast<uint64_t>(i);
                 while (!mb->try_push_condition(
-                    token, addr, /*expected=*/0, COMPLETION_ENGINE_SDMA, COMPLETION_TYPE_COUNTER
+                    token, addr, /*backend_cookie=*/0, /*expected=*/0, COMPLETION_ENGINE_SDMA, COMPLETION_TYPE_COUNTER
                 )) {
                     std::this_thread::yield();
                 }
@@ -262,7 +267,7 @@ TEST(A5AICoreCompletionMailbox, ProducerInterleavedWithDrain) {
     std::thread producer([&]() {
         for (int i = 0; i < kTotal; i++) {
             while (!mb->try_push_condition(
-                token, /*addr=*/i, /*expected=*/0, COMPLETION_ENGINE_SDMA, COMPLETION_TYPE_COUNTER
+                token, /*addr=*/i, /*backend_cookie=*/0, /*expected=*/0, COMPLETION_ENGINE_SDMA, COMPLETION_TYPE_COUNTER
             )) {
                 std::this_thread::yield();
             }
@@ -319,9 +324,9 @@ TEST(A5AICoreCompletionMailbox, MonotonicSeqSurvivesCapacityWrapWithoutZeroing) 
     PTO2TaskId token = make_token(7);
     AICoreCompletionMsgView msg;
     for (uint64_t i = 0; i < AICORE_COMPLETION_MAILBOX_CAPACITY + 17; i++) {
-        ASSERT_TRUE(
-            mb->try_push_condition(token, /*addr=*/i, /*expected=*/0, COMPLETION_ENGINE_SDMA, COMPLETION_TYPE_COUNTER)
-        );
+        ASSERT_TRUE(mb->try_push_condition(
+            token, /*addr=*/i, /*backend_cookie=*/0, /*expected=*/0, COMPLETION_ENGINE_SDMA, COMPLETION_TYPE_COUNTER
+        ));
         ASSERT_TRUE(mb->try_pop(msg));
         EXPECT_EQ(msg.addr, i);
     }
@@ -331,9 +336,9 @@ TEST(A5AICoreCompletionMailbox, MonotonicSeqSurvivesCapacityWrapWithoutZeroing) 
     // push reuses it but publishes seq = head+1 (well past CAPACITY). try_pop
     // must accept only that fresh value — proving stale seq cannot be replayed.
     const uint64_t addr_after_wrap = 0xABCD1234ull;
-    ASSERT_TRUE(
-        mb->try_push_condition(token, addr_after_wrap, /*expected=*/3, COMPLETION_ENGINE_SDMA, COMPLETION_TYPE_COUNTER)
-    );
+    ASSERT_TRUE(mb->try_push_condition(
+        token, addr_after_wrap, /*backend_cookie=*/0, /*expected=*/3, COMPLETION_ENGINE_SDMA, COMPLETION_TYPE_COUNTER
+    ));
     ASSERT_TRUE(mb->try_pop(msg));
     EXPECT_EQ(msg.addr, addr_after_wrap);
     EXPECT_EQ(msg.expected_value, 3u);
@@ -350,7 +355,8 @@ TEST(A5AICoreCompletionMailbox, TailEqualsHeadDiscardsUndrainedLeftovers) {
     PTO2TaskId token = make_token(11);
     for (int i = 0; i < 5; i++) {
         ASSERT_TRUE(mb->try_push_condition(
-            token, /*addr=*/static_cast<uint64_t>(i), /*expected=*/0, COMPLETION_ENGINE_SDMA, COMPLETION_TYPE_COUNTER
+            token, /*addr=*/static_cast<uint64_t>(i), /*backend_cookie=*/0, /*expected=*/0, COMPLETION_ENGINE_SDMA,
+            COMPLETION_TYPE_COUNTER
         ));
     }
     ASSERT_TRUE(mb->has_pending());

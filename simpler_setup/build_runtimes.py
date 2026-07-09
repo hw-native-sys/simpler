@@ -112,12 +112,10 @@ def build_all(
     pto_isa_root_for_metadata: Optional[str] = None
     pto_isa_runtime_keys: list[str] = []
 
-    # a2a3 onboard host_runtime hard-depends on pto-isa headers + CANN-9.0
-    # aclnn syms (cf. src/a2a3/platform/onboard/host/CMakeLists.txt
-    # SIMPLER_ENABLE_PTO_SDMA_WORKSPACE marker). Resolve PTO_ISA_ROOT now so
-    # the runtime compiler consumes the same pinned managed checkout as kernel
-    # compilation. Skipped when only sim platforms are being built.
-    if "a2a3" in platforms:
+    # Onboard host runtimes that embed pto-isa headers need the same pinned
+    # managed checkout as kernel compilation. Skipped when only sim platforms
+    # are being built.
+    if any(p in platforms for p in ("a2a3", "a5")):
         from simpler_setup.pto_isa import ensure_pto_isa_root  # noqa: PLC0415
 
         pto_isa_root = ensure_pto_isa_root(verbose=True)
@@ -156,7 +154,7 @@ def build_all(
 
         for runtime_name in runtimes:
             tasks.append((platform, runtime_name))
-            if arch == "a2a3" and variant == "onboard":
+            if arch in ("a2a3", "a5") and variant == "onboard":
                 from simpler_setup.pto_isa import pto_isa_runtime_artifact_key  # noqa: PLC0415
 
                 pto_isa_runtime_keys.append(pto_isa_runtime_artifact_key(arch, variant, runtime_name))

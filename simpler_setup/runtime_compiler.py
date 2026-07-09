@@ -171,6 +171,13 @@ class RuntimeCompiler:
     def _init_a5(self):
         """Initialize toolchains for real a5 hardware."""
         env_manager.ensure("ASCEND_HOME_PATH")
+        # a5 onboard host_runtime builds URMA workspace setup against pto-isa
+        # host headers. Use the same pinned managed checkout as kernel
+        # compilation and expose it through PTO_ISA_ROOT for CMake.
+        from simpler_setup.pto_isa import ensure_pto_isa_root  # noqa: PLC0415
+
+        os.environ["PTO_ISA_ROOT"] = ensure_pto_isa_root(verbose=True)
+        env_manager.ensure("PTO_ISA_ROOT")
 
         # AICore: Bisheng CCE compiler with A5 platform
         ccec = CCECToolchain(platform="a5")

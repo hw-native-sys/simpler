@@ -37,9 +37,8 @@
  * Built purely from bisheng/cce compiler builtins — cce::async_invoke /
  * cce::dim3 (`__clang_cce_simt.h`), __simt_vf__ / __simd_vf__ / LAUNCH_BOUND
  * (`__clang_cce_defines.h`), threadIdx (`__clang_cce_simt_builtin_vars.h`), all
- * auto-included by ccec for the dav-c310-vec arch. No pto-isa dependency, so
- * the a5 platform runtime build stays pto-isa-free (only per-example incore
- * kernels pull pto-isa, via kernel_compiler.py).
+ * auto-included by ccec for the dav-c310-vec arch. This AICore anchor adds no
+ * pto-isa dependency; onboard host communication setup may still embed pto-isa.
  */
 
 #ifndef PLATFORM_A5_AICORE_SIMT_ANCHOR_H_
