@@ -151,7 +151,6 @@ static constexpr uint64_t CTRL_RELEASE_DOMAIN = 8;
 static constexpr uint64_t CTRL_COMM_INIT = 9;
 static constexpr uint64_t CTRL_PY_REGISTER = 10;
 static constexpr uint64_t CTRL_PY_UNREGISTER = 11;
-static constexpr uint64_t CTRL_L3_L2_ORCH_COMM_INIT = 13;
 static constexpr uint64_t CTRL_L3_L2_REGION_CREATE = 16;
 static constexpr uint64_t CTRL_L3_L2_REGION_RELEASE = 17;
 
@@ -241,7 +240,6 @@ public:
     virtual void control_alloc_domain(const char *request_shm_name, const char *reply_shm_name);
     virtual void control_release_domain(const char *request_shm_name);
     virtual void control_comm_init(const char *request_shm_name);
-    virtual void control_l3_l2_orch_comm_init(const char *control_shm_name);
     virtual void control_l3_l2_region_create(const char *request_shm_name, const char *reply_shm_name);
     virtual void control_l3_l2_region_release(uint64_t region_id);
 };
@@ -293,7 +291,6 @@ public:
     void control_alloc_domain(const char *request_shm_name, const char *reply_shm_name) override;
     void control_release_domain(const char *request_shm_name) override;
     void control_comm_init(const char *request_shm_name) override;
-    void control_l3_l2_orch_comm_init(const char *control_shm_name) override;
     void control_l3_l2_region_create(const char *request_shm_name, const char *reply_shm_name) override;
     void control_l3_l2_region_release(uint64_t region_id) override;
 
@@ -432,7 +429,6 @@ public:
     // Lazy comm_init driver — payload shm carries (rank, nranks, rootinfo_path).
     // Caller dispatches in parallel to every chip; child runs cw.comm_init.
     void control_comm_init(const char *request_shm_name);
-    void control_l3_l2_orch_comm_init(const char *control_shm_name);
     void control_l3_l2_region_create(const char *request_shm_name, const char *reply_shm_name);
     void control_l3_l2_region_release(uint64_t region_id);
 
@@ -496,7 +492,6 @@ public:
     void control_alloc_domain(int worker_id, const char *request_shm_name, const char *reply_shm_name);
     void control_release_domain(int worker_id, const char *request_shm_name);
     void control_comm_init(int worker_id, const char *request_shm_name);
-    void control_l3_l2_orch_comm_init(int worker_id, const char *control_shm_name);
     void control_l3_l2_region_create(int worker_id, const char *request_shm_name, const char *reply_shm_name);
     void control_l3_l2_region_release(int worker_id, uint64_t region_id);
     ControlResult

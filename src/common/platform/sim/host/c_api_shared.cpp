@@ -283,34 +283,12 @@ int finalize_device(DeviceContextHandle ctx) {
     if (ctx == NULL) return -1;
     try {
         SimDeviceRunnerBase *runner = static_cast<SimDeviceRunnerBase *>(ctx);
-        int rc = runner->l3_l2_orch_comm_shutdown();
-        int finalize_rc = runner->finalize();
-        if (rc == 0) {
-            rc = finalize_rc;
-        }
+        int rc = runner->finalize();
         int dev = pto_cpu_sim_get_bound_device();
         if (dev >= 0) {
             pto_cpu_sim_release_device(dev);
         }
         return rc;
-    } catch (...) {
-        return -1;
-    }
-}
-
-int l3_l2_orch_comm_init_ctx(DeviceContextHandle ctx, void *control_block, size_t control_block_size) {
-    if (ctx == NULL || control_block == NULL) return -1;
-    try {
-        return static_cast<SimDeviceRunnerBase *>(ctx)->l3_l2_orch_comm_init(control_block, control_block_size);
-    } catch (...) {
-        return -1;
-    }
-}
-
-int l3_l2_orch_comm_shutdown_ctx(DeviceContextHandle ctx) {
-    if (ctx == NULL) return -1;
-    try {
-        return static_cast<SimDeviceRunnerBase *>(ctx)->l3_l2_orch_comm_shutdown();
     } catch (...) {
         return -1;
     }

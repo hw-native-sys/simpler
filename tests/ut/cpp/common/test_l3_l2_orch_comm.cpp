@@ -206,28 +206,11 @@ TEST(L3L2OrchCommTest, WaitCmpComparisonCoversAllPredicates) {
     EXPECT_FALSE(l3_l2_orch_comm_compare_counter(5, 5, static_cast<L3L2OrchWaitCmp>(6)));
 }
 
-TEST(L3L2OrchCommTest, RequestAndResponseAreFixedSizePodDescriptorsOnly) {
+TEST(L3L2OrchCommTest, DescriptorAndSignalResultAreFixedSizePodTypes) {
     static_assert(std::is_standard_layout<L3L2OrchRegionDesc>::value, "descriptor must be POD-like");
     static_assert(std::is_trivially_copyable<L3L2OrchRegionDesc>::value, "descriptor must be fixed-size");
     static_assert(std::is_standard_layout<L3L2OrchSignalTestResult>::value, "test result must be POD-like");
     static_assert(std::is_trivially_copyable<L3L2OrchSignalTestResult>::value, "test result must be fixed-size");
-    static_assert(std::is_standard_layout<L3L2OrchCommRequest>::value, "request must be POD-like");
-    static_assert(std::is_trivially_copyable<L3L2OrchCommRequest>::value, "request must be fixed-size");
-    static_assert(std::is_standard_layout<L3L2OrchCommResponse>::value, "response must be POD-like");
-    static_assert(std::is_trivially_copyable<L3L2OrchCommResponse>::value, "response must be fixed-size");
-
-    EXPECT_EQ(offsetof(L3L2OrchCommRequest, cmd), 0u);
-    EXPECT_EQ(offsetof(L3L2OrchCommRequest, op), sizeof(uint32_t));
-    EXPECT_EQ(offsetof(L3L2OrchCommRequest, payload_offset), sizeof(uint32_t) * 2 + sizeof(uint64_t));
-    EXPECT_EQ(offsetof(L3L2OrchCommRequest, counter_addr), sizeof(uint32_t) * 2 + sizeof(uint64_t) * 4);
-    EXPECT_EQ(offsetof(L3L2OrchCommRequest, counter_operand), sizeof(uint32_t) * 2 + sizeof(uint64_t) * 6);
-    EXPECT_EQ(offsetof(L3L2OrchCommResponse, observed_counter), sizeof(int32_t) + sizeof(uint32_t) + sizeof(uint64_t));
-    EXPECT_EQ(
-        offsetof(L3L2OrchCommResponse, matched), sizeof(int32_t) + sizeof(uint32_t) + sizeof(uint64_t) + sizeof(int32_t)
-    );
-    EXPECT_EQ(sizeof(L3L2OrchCommResponse::message), 256u);
-    EXPECT_EQ(sizeof(L3L2OrchCommRequest), sizeof(uint32_t) * 4 + sizeof(uint64_t) * 7)
-        << "request carries descriptors only; payload bytes must not be embedded";
 }
 
 TEST(L3L2OrchCommTest, LifecycleCreateWireStructsHaveFixedLayout) {

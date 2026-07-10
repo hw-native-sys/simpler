@@ -18,8 +18,6 @@ from enum import IntEnum
 from typing import Any
 
 from .l3_l2_orch_comm import (
-    L3L2OrchCommCmd,
-    L3L2OrchCommRequest,
     L3L2OrchRegion,
     NotifyOp,
     WaitCmp,
@@ -399,17 +397,11 @@ class L3L2Queue:
             return
         self._state = _QueueState.POISONED_LOCAL
         try:
-            self._region._owner._l3_l2_orch_comm_submit(
-                self._region._worker_id,
-                L3L2OrchCommRequest(
-                    cmd=L3L2OrchCommCmd.SIGNAL_NOTIFY,
-                    op=int(NotifyOp.Set),
-                    region_id=self._region.region_id,
-                    counter_addr=int(self._region.descriptor.counter_base) + self._layout.l3_abort_flag_offset,
-                    counter_operand=1,
-                ),
-                5.0,
-            )
+            l3_host_mapping = getattr(self._region, "_l3_host_mapping", None)
+            if l3_host_mapping is not None:
+                self._region._direct_counter_notify(self._layout.l3_abort_flag_offset, 1, NotifyOp.Set)
+            else:
+                self._region.counter(self._layout.l3_abort_flag_offset).notify(1, NotifyOp.Set)
         except Exception:
             pass
 

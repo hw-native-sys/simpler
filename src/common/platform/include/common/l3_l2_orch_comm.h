@@ -32,16 +32,6 @@ struct L3L2OrchRegionDesc {
     uint64_t counter_bytes;
 };
 
-enum class L3L2OrchCommCmd : uint32_t {
-    ALLOC_REGION = 1,
-    FREE_REGION = 2,
-    PAYLOAD_WRITE = 3,
-    PAYLOAD_READ = 4,
-    SIGNAL_NOTIFY = 5,
-    SIGNAL_WAIT = 6,
-    SIGNAL_TEST = 7,
-};
-
 enum class L3L2OrchNotifyOp : uint32_t {
     Set = 0,
     Add = 1,
@@ -70,30 +60,6 @@ enum class L3L2OrchCommValidationError : uint32_t {
     OUT_OF_BOUNDS = 5,
     BAD_SCALAR_COUNT = 6,
     NULL_POINTER = 7,
-};
-
-struct L3L2OrchCommRequest {
-    uint32_t cmd;
-    uint32_t op;
-    uint64_t region_id;
-    uint64_t payload_offset;
-    uint64_t host_ptr;
-    uint64_t payload_bytes;
-    uint64_t counter_addr;
-    uint64_t counter_bytes;
-    int32_t counter_operand;
-    uint32_t reserved0;
-    uint64_t timeout_ns;
-};
-
-struct L3L2OrchCommResponse {
-    int32_t status;
-    uint32_t error_kind;
-    uint64_t region_id;
-    int32_t observed_counter;
-    uint32_t matched;
-    L3L2OrchRegionDesc desc;
-    char message[256];
 };
 
 namespace l3_l2_orch_comm {

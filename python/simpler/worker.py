@@ -208,7 +208,6 @@ _CTRL_COMM_INIT = 9
 _CTRL_PY_REGISTER = 10
 _CTRL_PY_UNREGISTER = 11
 _CTRL_PY_IMPORT_REGISTER = 12
-_CTRL_L3_L2_ORCH_COMM_INIT = 13
 # Host-buffer registration. MAP_HOST maps a named host-buffer shm
 # into every chip child *post-fork* and keeps it mapped so later runs can copy
 # through it; UNMAP_HOST drops one. The child also records the parent VA range
@@ -1055,25 +1054,6 @@ def _handle_ctrl_comm_init(cw: ChipWorker, buf: memoryview) -> None:
     cw._comm_base_handle_cached = int(handle)
 
 
-def _handle_ctrl_l3_l2_orch_comm_init(cw: ChipWorker, buf: memoryview) -> SharedMemory:
-    control_shm_name = _read_shm_name(buf, _OFF_ARGS)
-    control_shm = SharedMemory(name=control_shm_name)
-    control_buf = control_shm.buf
-    assert control_buf is not None
-    exported = ctypes.c_char.from_buffer(control_buf)
-    success = False
-    try:
-        control_block_addr = ctypes.addressof(exported)
-        cw.l3_l2_orch_comm_init_from_addr(control_block_addr, control_shm.size)
-        success = True
-    finally:
-        del exported
-        del control_buf
-        if not success:
-            control_shm.close()
-    return control_shm
-
-
 @dataclass
 class _L2HostL3L2Region:
     region_id: int
@@ -1346,7 +1326,6 @@ def _run_chip_main_loop(  # noqa: PLR0912, PLR0913, PLR0915 -- unified TASK_READ
     lazily preparing it.
     """
     prepared: set[int] = set()
-    l3_l2_control_shms: list[SharedMemory] = []
     # Post-fork host buffers mapped into this child. `host_buf_table`
     # owns the mmap per token (for unmap + teardown); `host_buf_ranges` is the
     # parent-VA → child-VA translation table the per-task blob rewrite consults,
@@ -1491,8 +1470,6 @@ def _run_chip_main_loop(  # noqa: PLR0912, PLR0913, PLR0915 -- unified TASK_READ
                         _handle_ctrl_release_domain(cw, buf)
                     elif sub_cmd == _CTRL_COMM_INIT:
                         _handle_ctrl_comm_init(cw, buf)
-                    elif sub_cmd == _CTRL_L3_L2_ORCH_COMM_INIT:
-                        l3_l2_control_shms.append(_handle_ctrl_l3_l2_orch_comm_init(cw, buf))
                     elif sub_cmd == _CTRL_MAP_HOST:
                         _handle_ctrl_map_host(buf, host_buf_table, host_buf_ranges)
                     elif sub_cmd == _CTRL_UNMAP_HOST:
@@ -1516,20 +1493,6 @@ def _run_chip_main_loop(  # noqa: PLR0912, PLR0913, PLR0915 -- unified TASK_READ
                 break
     finally:
         _sweep_l2_host_l3_l2_regions(cw)
-        if l3_l2_control_shms:
-            try:
-                cw.l3_l2_orch_comm_shutdown()
-            except Exception as e:  # noqa: BLE001
-                sys.stderr.write(
-                    f"[chip_process pid={os.getpid()} dev={device_id}] "
-                    f"WARN: l3_l2_orch_comm_shutdown failed: {type(e).__name__}: {e}\n"
-                )
-                sys.stderr.flush()
-        for control_shm in reversed(l3_l2_control_shms):
-            try:
-                control_shm.close()
-            except Exception:  # noqa: BLE001
-                pass
         for host_shm, _lo, _hi, _base in host_buf_table.values():
             try:
                 host_shm.close()
@@ -1826,9 +1789,6 @@ class Worker:
         # starts the C++ scheduler; no comm work happens there.
         self._comm_base_ready: bool = False
 
-        self._l3_l2_orch_comm_ready: set[int] = set()
-        self._l3_l2_orch_comm_shms: dict[int, SharedMemory] = {}
-        self._l3_l2_orch_comm_clients: dict[int, Any] = {}
         self._live_l3_l2_regions: list[Any] = []
         self._l3_l2_orch_comm_host_buffers: dict[int, int] = {}
 
@@ -3658,50 +3618,6 @@ class Worker:
         """
         return dict(self._live_domains)
 
-    def _make_l3_l2_orch_comm_client(self, shm: SharedMemory):
-        from .l3_l2_orch_comm import L3L2OrchCommClient  # noqa: PLC0415
-
-        return L3L2OrchCommClient(shm)
-
-    def _ensure_l3_l2_orch_comm(self, worker_id: int):
-        from .l3_l2_orch_comm import CONTROL_SHM_SIZE  # noqa: PLC0415
-
-        self._validate_l3_l2_worker_id(worker_id)
-        if worker_id in self._l3_l2_orch_comm_ready:
-            return self._l3_l2_orch_comm_clients[worker_id]
-
-        chip_shm = self._chip_shms[worker_id]
-        assert chip_shm.buf is not None
-        state = _mailbox_load_i32(_buffer_field_addr(chip_shm.buf, _OFF_STATE))
-        if state != _IDLE:
-            raise RuntimeError(
-                f"create_l3_l2_region bootstrap failed: target worker {worker_id} is busy and "
-                "the L3-L2 service is not ready"
-            )
-
-        control_shm = SharedMemory(create=True, size=CONTROL_SHM_SIZE)
-        try:
-            client = self._make_l3_l2_orch_comm_client(control_shm)
-            worker = self._worker
-            assert worker is not None
-            worker.control_l3_l2_orch_comm_init(worker_id, control_shm.name)
-        except Exception:
-            try:
-                control_shm.close()
-                control_shm.unlink()
-            except Exception:  # noqa: BLE001
-                pass
-            raise
-
-        self._l3_l2_orch_comm_shms[worker_id] = control_shm
-        self._l3_l2_orch_comm_clients[worker_id] = client
-        self._l3_l2_orch_comm_ready.add(worker_id)
-        return client
-
-    def _l3_l2_orch_comm_submit(self, worker_id: int, request, timeout_s: float):
-        client = self._ensure_l3_l2_orch_comm(int(worker_id))
-        return client.submit(request, timeout_s)
-
     def _l3_l2_use_l3_host_mapped_path(self) -> bool:
         return str(self._config.get("platform", "")) in {"a2a3", "a2a3sim", "a5", "a5sim"}
 
@@ -3776,8 +3692,6 @@ class Worker:
             REGION_CREATE_REPLY_BYTES,
             REGION_CREATE_REQUEST_BYTES,
             L3HostRegionMapping,
-            L3L2OrchCommCmd,
-            L3L2OrchCommRequest,
             L3L2OrchRegion,
             L3L2RegionAccessProfile,
             L3L2RegionCreateRequest,
@@ -3792,6 +3706,8 @@ class Worker:
         if counter_bytes <= 0 or counter_bytes % 4 != 0:
             raise ValueError("create_l3_l2_region: counter_bytes must be positive and a multiple of 4")
         self._validate_l3_l2_worker_id(int(worker_id))
+        if not self._l3_l2_use_l3_host_mapped_path():
+            raise RuntimeError("create_l3_l2_region requires a direct L3 Host mapped backend")
         if self._l3_l2_use_l3_host_mapped_path():
             req_shm = SharedMemory(create=True, size=REGION_CREATE_REQUEST_BYTES)
             reply_shm = SharedMemory(create=True, size=REGION_CREATE_REPLY_BYTES)
@@ -3863,26 +3779,11 @@ class Worker:
                         shm.unlink()
                     except Exception:  # noqa: BLE001
                         pass
-        response = self._l3_l2_orch_comm_submit(
-            int(worker_id),
-            L3L2OrchCommRequest(
-                cmd=L3L2OrchCommCmd.ALLOC_REGION,
-                payload_bytes=int(payload_bytes),
-                counter_bytes=int(counter_bytes),
-            ),
-            timeout_s=5.0,
-        )
-        if response.status != 0 or response.desc is None:
-            raise RuntimeError(response.message or "create_l3_l2_region: ALLOC_REGION failed")
-        region = L3L2OrchRegion(self, int(worker_id), response.desc)
-        self._live_l3_l2_regions.append(region)
-        return region
+        raise AssertionError("unreachable")
 
     def _cleanup_l3_l2_regions(self) -> None:
         if not self._live_l3_l2_regions:
             return
-        from .l3_l2_orch_comm import L3L2OrchCommCmd, L3L2OrchCommRequest  # noqa: PLC0415
-
         regions, self._live_l3_l2_regions = self._live_l3_l2_regions, []
         for region in regions:
             try:
@@ -3890,12 +3791,6 @@ class Worker:
                     region._close_l3_host_mapping()
                     if self._worker is not None:
                         self._worker.control_l3_l2_region_release(region._worker_id, region.region_id)
-                elif region._worker_id in self._l3_l2_orch_comm_ready:
-                    self._l3_l2_orch_comm_submit(
-                        region._worker_id,
-                        L3L2OrchCommRequest(cmd=L3L2OrchCommCmd.FREE_REGION, region_id=region.region_id),
-                        timeout_s=5.0,
-                    )
             finally:
                 region._expire()
 
@@ -3906,16 +3801,7 @@ class Worker:
             except Exception:  # noqa: BLE001
                 pass
         self._live_l3_l2_regions.clear()
-        self._l3_l2_orch_comm_clients.clear()
-        self._l3_l2_orch_comm_ready.clear()
         self._l3_l2_orch_comm_host_buffers.clear()
-        for shm in self._l3_l2_orch_comm_shms.values():
-            try:
-                shm.close()
-                shm.unlink()
-            except Exception:  # noqa: BLE001
-                pass
-        self._l3_l2_orch_comm_shms.clear()
 
     # ------------------------------------------------------------------
     # Dynamic CommDomain allocation (driven by Orchestrator.allocate_domain;

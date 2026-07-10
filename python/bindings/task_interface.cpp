@@ -1148,15 +1148,6 @@ NB_MODULE(_task_interface, m) {
         .def("copy_to", &ChipWorker::copy_to, nb::arg("dst"), nb::arg("src"), nb::arg("size"))
         .def("copy_from", &ChipWorker::copy_from, nb::arg("dst"), nb::arg("src"), nb::arg("size"))
         .def(
-            "l3_l2_orch_comm_init_from_addr", &ChipWorker::l3_l2_orch_comm_init, nb::arg("control_block_addr"),
-            nb::arg("control_block_size"),
-            "Start the independent L3-L2 orchestrator communication service from a mapped control-block address."
-        )
-        .def(
-            "l3_l2_orch_comm_shutdown", &ChipWorker::l3_l2_orch_comm_shutdown,
-            "Stop the independent L3-L2 orchestrator communication service."
-        )
-        .def(
             "comm_init", &ChipWorker::comm_init, nb::arg("rank"), nb::arg("nranks"), nb::arg("rootinfo_path"),
             "Initialize a communicator for this rank.  ChipWorker owns ACL + stream "
             "lifetime internally (onboard drives ensure_acl_ready + aclrtCreateStream; "
