@@ -651,10 +651,15 @@ cross-direction read on the hot path.
 
 **Sizing.** `PLATFORM_AICORE_BUFFER_SIZE = 1024` (power of two, modulo
 lowers to AND) and `PLATFORM_AICORE_BUFFERS_PER_CORE = 4` (1 active +
-3 recycled). Host-side `BufferPoolManager` refills the recycled pool
-from the ready queue while the session runs, so session length is
-bounded only by how fast the host drains — not by the per-core buffer
-sum.
+3 recycled). Host-side `BufferPoolManager` drains full buffers through
+the collector, returns them via done → replenish → recycled lanes, and
+the owning drain shard refills the device free queue from that lane. The
+replenish thread also keeps recycled lanes above their host-side watermarks
+by batched allocation, but it never writes device free queues. These
+watermarks are steady-state low-water marks: AICPU-task keeps half of the
+init-seeded surplus per shard, while AICore-task has no init surplus and only
+keeps a minimal reserve batch. Session length is bounded only by how fast the
+host closes that loop — not by the per-core buffer sum.
 
 **Measured impact.** Hardware bench on a2a3 paged_attention_unroll
 Case1 with swimlane=4: rotation design delivers sched -4 µs / orch -19 µs
@@ -668,10 +673,11 @@ sched overhead per session as price for unbounded session length).
 space so the host can read device buffers directly.
 `L2SwimlaneCollector` runs split mgmt threads and collector shards on top of a
 [`BufferPoolManager<L2SwimlaneModule>`](../../src/common/platform/include/host/buffer_pool_manager.h):
-drain/refill shards poll SPSC ready queues and recycle full buffers
-**while kernels are still executing**, a replenish thread keeps free
-queues topped up, and collector shards drain the host hand-off queues into
-`on_buffer_collected`.
+drain/refill shards poll SPSC ready queues and refill free queues from
+shard-local recycled lanes **while kernels are still executing**. Collector
+shards drain the host hand-off queues into `on_buffer_collected`, then the
+replenish thread folds done buffers back into recycled lanes and tops up
+optional recycled watermarks.
 
 `L2SwimlaneModule` declares four buffer kinds going through one ready
 queue per AICPU thread:
@@ -701,7 +707,7 @@ are single-kind.
 │   │ drain/refill shard │ │ queues        │   record (kind 0); fill  │
 │   │ + replenish thread │ │<──4 kinds────<│   func_id / dispatch /   │
 │   │   poll ready queue │<┼──multiplexed──│   finish; rotate buffer  │
-│   │   recycle buffers  │─┼──free queue──>│   when full              │
+│   │   refill freeQ     │─┼──free queue──>│   when full              │
 │   └────────────────────┘ │               │ AICPU scheduler thread:  │
 │   ┌────────────────────┐ │               │   per work iter: write   │
 │   │ collector shard    │ │               │   SchedPhaseRecord       │
@@ -798,8 +804,10 @@ whatever the host shadow held at the start of the tick. Per-buffer
 payloads (`L2SwimlaneAicpuTaskBuffer` / `L2SwimlaneAicpuPhaseBuffer`)
 are pulled on demand inside `ProfilerAlgorithms::process_entry` after
 a popped ready-entry resolves to its host shadow. `BufferPoolManager`'s
-`release_owned_buffers` frees the device pointer via the
-collector's `release_fn` and the paired shadow via `std::free()`.
+`release_owned_buffers` canonicalizes carved sub-buffers back to the
+registered allocation block before calling the collector's `release_fn`;
+paired host shadows are released later by `clear_mappings()` or on init
+rollback by `release_all_owned()`.
 
 ```text
         HOST                                         DEVICE
@@ -825,7 +833,7 @@ collector's `release_fn` and the paired shadow via `std::free()`.
 │   for each ready entry:  │               │                          │
 │     copy buf from device │<──memcpy─────<│                          │
 │     resolve host ptr     │               │                          │
-│     push to L2 ready_q   │               │                          │
+│     push to host ready_q │               │                          │
 │   advance queue_heads,   │               │                          │
 │     refill free_queues   │               │                          │
 │   write_range_to_device  │──memcpy──────>│                          │

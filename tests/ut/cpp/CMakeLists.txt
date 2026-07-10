@@ -379,7 +379,13 @@ target_include_directories(test_runtime_orch_so PRIVATE
 )
 add_common_utils_test(test_device_arena common/test_device_arena.cpp)
 add_common_utils_test(test_buffer_pool_manager common/test_buffer_pool_manager.cpp)
+target_sources(test_buffer_pool_manager PRIVATE
+    ${CMAKE_SOURCE_DIR}/../../../src/common/log/host_log.cpp
+    ${CMAKE_SOURCE_DIR}/../../../src/common/log/unified_log_host.cpp
+)
 target_include_directories(test_buffer_pool_manager PRIVATE
+    ${CMAKE_SOURCE_DIR}/../../../src/a2a3/platform/include
+    ${CMAKE_SOURCE_DIR}/../../../src/common/log
     ${CMAKE_SOURCE_DIR}/../../../src/common/log/include
 )
 add_common_utils_test(test_l3_l2_orch_comm common/test_l3_l2_orch_comm.cpp)

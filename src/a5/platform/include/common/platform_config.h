@@ -150,7 +150,8 @@ constexpr int PLATFORM_PROF_BUFFER_SIZE = 1000;
  * Host dynamically allocates buffers and writes addresses into these slots.
  * Device reads slot addresses when switching buffers.
  * Using slots: provides full pipeline depth for buffer recycling.
- * No runtime rtMalloc — all buffers are pre-allocated and recycled in a closed loop.
+ * Runtime drain never allocates; the host replenish slow path may batch-allocate
+ * registered blocks to keep recycled lanes above their watermarks.
  */
 constexpr int PLATFORM_PROF_SLOT_COUNT = 4;
 

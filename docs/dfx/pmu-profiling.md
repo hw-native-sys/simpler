@@ -218,8 +218,13 @@ collected_on_host + dropped == total              (a2a3, 2 buckets)
 AICPU reads the 8 PMU counters via MMIO (`read_reg(reg_base, PMU_CNTi)`)
 directly into a `PmuRecord` on every task FIN. Buffers rotate through
 an SPSC free queue per core; full buffers flow through a per-thread
-ready queue to host drain/refill shards that recycle them, while
-collector shards stream records to CSV during execution.
+ready queue to host drain/refill shards. Drain refills free queues from
+shard-local recycled lanes; collector shards stream records to CSV during
+execution, and the replenish thread folds done buffers back into recycled
+lanes and tops up optional recycled watermarks without writing device free
+queues. PMU has no init-seeded recycled surplus by default, so the runtime
+watermark is only a minimal reserve batch rather than a core-count-scaled
+extra allocation target.
 
 ```text
         HOST                                         DEVICE
@@ -236,7 +241,7 @@ collector shards stream records to CSV during execution.
 │   │ drain/refill shard │ │               │     into records[count]  │
 │   │ + replenish thread │ │ SPSC ready    │   if buffer full:        │
 │   │   poll ready queue │<┼──queues──────<│     push ready entry,    │
-│   │   recycle buffers  │─┼──free queue──>│     pop next buffer      │
+│   │   refill freeQ     │─┼──free queue──>│     pop next buffer      │
 │   └────────────────────┘ │               │                          │
 │   ┌────────────────────┐ │ shared mem    │ pmu_aicpu_flush():       │
 │   │ collector shard    │ │ mapping       │   push remaining full    │
@@ -279,8 +284,9 @@ init_pmu()
   pmu_collector_.init(num_aicore, num_threads, csv_path, event_type, ...)
   kernel_args_.args.pmu_data_base = pmu_collector_.get_pmu_shm_device_ptr()
 start(tf)                       ← spawn split mgmt threads (drain AICPU ready
-                                  queues, refills free queues, and runs
-                                  background replenish via BufferPoolManager)
+                                  queues and refill free queues from
+                                  recycled lanes; replenish drains done
+                                  buffers into recycled lanes)
                                   + collector shards (drain host hand-off,
                                   append to CSV)
 launch AICPU / AICore
@@ -361,7 +367,7 @@ still pulled on demand inside
 │   for each ready entry:  │               │     records[count]       │
 │     copy buf from device │<──memcpy─────<│   fill func_id/core_type │
 │     resolve host ptr     │               │   ++count                │
-│     push to L2 ready_q   │               │   if buffer full:        │
+│     push to host ready_q │               │   if buffer full:        │
 │   advance queue_heads,   │               │     push ready entry,    │
 │     refill free_queues   │               │     pop next from free_q │
 │   write_range_to_device  │──memcpy──────>│                          │
@@ -602,12 +608,12 @@ covers every core that produced records.
 **Dropped records on a2a3.** `PmuBufferState::dropped_record_count`
 nonzero means the AICPU could not get a free buffer in time
 (`free_queue` empty). Increase `PLATFORM_PMU_BUFFERS_PER_CORE` so the
-mgmt thread has more headroom to recycle buffers.
+host drain/replenish path has more buffer headroom.
 
 **Dropped records on a5.** `PmuBufferState::dropped_record_count`
 nonzero means the AICPU could not get a free buffer in time
 (`free_queue` empty). Increase `PLATFORM_PMU_BUFFERS_PER_CORE` so the
-collector thread has more headroom to recycle buffers.
+host drain/replenish path has more buffer headroom.
 
 ## 9. Related docs
 

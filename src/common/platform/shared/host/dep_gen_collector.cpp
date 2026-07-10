@@ -91,6 +91,7 @@ int DepGenCollector::init(
     const size_t buf_size = sizeof(DepGenBuffer);
     DepGenBufferState *state = get_dep_gen_buffer_state(shm_host_local, 0);
 
+    const int owner_shard = (num_threads > 0) ? (num_threads - 1) : 0;
     for (int b = 0; b < PLATFORM_DEP_GEN_BUFFERS_PER_INSTANCE; b++) {
         void *host_ptr = nullptr;
         void *dev_ptr = alloc_paired_buffer(buf_size, &host_ptr);
@@ -108,7 +109,9 @@ int DepGenCollector::init(
             state->free_queue.tail = tail + 1;
             wmb();
         } else {
-            manager_.push_recycled(0, dev_ptr);
+            if (!manager_.push_recycled(0, dev_ptr, owner_shard)) {
+                (void)manager_.retire_unqueued_buffer(0, dev_ptr, owner_shard);
+            }
         }
     }
 
@@ -284,8 +287,8 @@ void DepGenCollector::finalize(DepGenUnregisterCallback unregister_cb, const Dep
         state->free_queue.head = tail;
     }
 
-    // Release framework-owned buffers (recycled pool, ready_queue,
-    // done_queue). release_owned_buffers also frees their host shadows.
+    // Release framework-owned device allocations (recycled pool,
+    // ready_queue, done_queue). Host shadows are freed by clear_mappings().
     manager_.release_owned_buffers([&](void *p) {
         release_dev_once(p);
     });

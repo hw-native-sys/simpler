@@ -138,7 +138,9 @@ int TensorDumpCollector::initialize(
                 state->free_queue.buffer_ptrs[tail % PLATFORM_DUMP_SLOT_COUNT] = reinterpret_cast<uint64_t>(dev_ptr);
                 state->free_queue.tail = tail + 1;
             } else {
-                manager_.push_recycled(0, dev_ptr);
+                if (!manager_.push_recycled(0, dev_ptr, t)) {
+                    (void)manager_.retire_unqueued_buffer(0, dev_ptr, t);
+                }
             }
         }
     }
@@ -747,9 +749,8 @@ int TensorDumpCollector::finalize(DumpUnregisterCallback unregister_cb, const Du
         }
     }
 
-    // Release framework-owned buffers (recycled pools, ready_queue,
-    // done_queue). release_owned_buffers also frees the paired host shadows
-    // for these (and erases their mappings).
+    // Release framework-owned device allocations (recycled pools,
+    // ready_queue, done_queue). Host shadows are freed by clear_mappings().
     manager_.release_owned_buffers([&](void *p) {
         release_dev(p);
     });

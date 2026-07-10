@@ -21,6 +21,7 @@
 
 #include "host/pmu_collector.h"
 
+#include <array>
 #include <cassert>
 #include <cstring>
 #include <iomanip>
@@ -29,6 +30,35 @@
 
 #include "common/memory_barrier.h"
 #include "common/unified_log.h"
+
+namespace {
+
+int owner_recycled_shard_for_core(int core_index, int thread_count) {
+    int cluster_index = core_index / PLATFORM_CORES_PER_BLOCKDIM;
+    return cluster_index % thread_count;
+}
+
+bool recycled_seed_capacity_is_sufficient(int num_cores, int thread_count, int surplus_per_core, size_t capacity) {
+    if (surplus_per_core <= 0) return true;
+    std::array<int, PLATFORM_MAX_AICPU_THREADS> per_shard{};
+    for (int core = 0; core < num_cores; core++) {
+        per_shard[static_cast<size_t>(owner_recycled_shard_for_core(core, thread_count))] += surplus_per_core;
+    }
+
+    bool ok = true;
+    for (int shard = 0; shard < thread_count; shard++) {
+        if (static_cast<size_t>(per_shard[static_cast<size_t>(shard)]) <= capacity) continue;
+        LOG_ERROR(
+            "PMU recycled seed exceeds lane capacity: shard=%d need=%d capacity=%zu "
+            "(num_cores=%d thread_count=%d)",
+            shard, per_shard[static_cast<size_t>(shard)], capacity, num_cores, thread_count
+        );
+        ok = false;
+    }
+    return ok;
+}
+
+}  // namespace
 
 PmuCollector::~PmuCollector() { stop(); }
 
@@ -44,6 +74,13 @@ int PmuCollector::init(
         LOG_ERROR("PmuCollector::init: invalid arguments");
         return -1;
     }
+    if (num_cores > PLATFORM_MAX_CORES || num_threads > PLATFORM_MAX_AICPU_THREADS) {
+        LOG_ERROR(
+            "PmuCollector::init: dimensions out of range (cores=%d/%d threads=%d/%d)", num_cores, PLATFORM_MAX_CORES,
+            num_threads, PLATFORM_MAX_AICPU_THREADS
+        );
+        return -1;
+    }
 
     num_cores_ = num_cores;
     num_threads_ = num_threads;
@@ -55,6 +92,14 @@ int PmuCollector::init(
     execution_complete_.store(false, std::memory_order_release);
     if (csv_file_.is_open()) {
         csv_file_.close();
+    }
+    constexpr int kPmuSurplusPerCore = (PLATFORM_PMU_BUFFERS_PER_CORE > PLATFORM_PMU_SLOT_COUNT) ?
+                                           (PLATFORM_PMU_BUFFERS_PER_CORE - PLATFORM_PMU_SLOT_COUNT) :
+                                           0;
+    if (!recycled_seed_capacity_is_sufficient(
+            num_cores, num_threads, kPmuSurplusPerCore, decltype(manager_)::kRecycledQueueCapacity
+        )) {
+        return -1;
     }
 
     // ---- Allocate shared header + buffer-state region ----
@@ -119,8 +164,12 @@ int PmuCollector::init(
                 state->free_queue.tail = tail + 1;
                 wmb();
             } else {
-                // Surplus buffers go into the recycled pool, available to any core.
-                manager_.push_recycled(0, dev_ptr);
+                // Surplus buffers go into the cluster owner shard so runtime
+                // drain consumes the same recycled lane it owns.
+                int shard = owner_recycled_shard_for_core(c, num_threads);
+                if (!manager_.push_recycled(0, dev_ptr, shard)) {
+                    (void)manager_.retire_unqueued_buffer(0, dev_ptr, shard);
+                }
             }
         }
     }

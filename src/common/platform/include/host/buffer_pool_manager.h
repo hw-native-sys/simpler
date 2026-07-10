@@ -11,14 +11,15 @@
 
 /**
  * @file buffer_pool_manager.h
- * @brief Generic buffer-pool data structure shared by L2Swimlane, TensorDump,
- *        and PMU collectors. Owns:
+ * @brief Generic buffer-pool data structure shared by L2Swimlane, PMU,
+ *        DepGen, TensorDump, and ScopeStats collectors. Owns:
  *
- *   - ready_queue shard(s) (mgmt → collector) with mutex/cv,
- *   - done_queue shard(s) (collector → mgmt) with mutex,
- *   - shard-local per-kind recycled-buffer pools,
- *   - dev↔host pointer mapping table,
- *   - alloc_and_register / free_buffer / resolve_host_ptr helpers.
+ *   - ready_queue shard(s) (mgmt → collector) as SPSC rings,
+ *   - done_queue shard(s) (collector → mgmt) as SPSC rings,
+ *   - shard-local per-kind recycled-buffer SPSC rings,
+ *   - mutex-protected retired-buffer pools for exceptional teardown paths,
+ *   - dev↔host pointer mapping table with block-range resolution,
+ *   - batched block allocation / free_buffer / resolve_host_ptr helpers.
  *
  * Owns no threads. ProfilerBase drives the mgmt loop and forwards memory
  * context here once via set_memory_context(). The Module concept contract
@@ -47,16 +48,17 @@
  *      `copy_buffer_from_device` inside ProfilerAlgorithms::process_entry
  *      before delivering it to the collector.
  *
- * `release_owned_buffers` frees both the device pointer (via `release_fn`)
- * and any paired host shadow that the framework itself malloc'd. Ownership
- * is tracked explicitly in `malloc_shadows_`: only shadows allocated via
- * `default_host_shadow_register` or the `copy_to_device_` branch of
+ * `release_owned_buffers` releases device allocations via the collector's
+ * `release_fn`, canonicalizing carved sub-buffers back to their registered
+ * block base first. Paired host shadows that the framework malloc'd are
+ * released later by `clear_mappings()` or immediately by `release_all_owned()`.
+ * Ownership is tracked explicitly in `malloc_shadows_`: only shadows allocated
+ * via `default_host_shadow_register` or the `copy_to_device_` branch of
  * `ProfilerBase::alloc_paired_buffer` are added to the set, so HAL-managed
  * mappings (e.g. `halHostRegister` results on a2a3 onboard) never see a
- * spurious `std::free`. The earlier `host_ptr != dev_ptr` alias check is
- * not sufficient on its own — `halHostRegister` returns a host VA that
- * may or may not coincide with the device VA, and feeding either case to
- * `std::free` is UB.
+ * spurious `std::free`. The earlier `host_ptr != dev_ptr` alias check is not
+ * sufficient on its own — `halHostRegister` returns a host VA that may or may
+ * not coincide with the device VA, and feeding either case to `std::free` is UB.
  *
  * Platforms with SVM (a2a3: halHostRegister maps device pointers into host
  * address space) leave `copy_to_device` / `copy_from_device` null and pass
@@ -70,6 +72,7 @@
 #ifndef SRC_COMMON_PLATFORM_INCLUDE_HOST_BUFFER_POOL_MANAGER_H_
 #define SRC_COMMON_PLATFORM_INCLUDE_HOST_BUFFER_POOL_MANAGER_H_
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -78,8 +81,8 @@
 #include <cstdint>
 #include <cstdlib>
 #include <functional>
+#include <limits>
 #include <mutex>
-#include <queue>
 #include <thread>
 #include <type_traits>
 #include <unordered_map>
@@ -148,6 +151,127 @@ struct ProfilerModuleCollectorThreadCount<Module, std::void_t<decltype(Module::k
     static constexpr int value = Module::kCollectorThreadCount;
 };
 
+template <typename Module, typename = void>
+struct ProfilerModuleHostQueueCapacity {
+    static constexpr size_t value = 1024;
+};
+
+template <typename Module>
+struct ProfilerModuleHostQueueCapacity<Module, std::void_t<decltype(Module::kReadyQueueSize)>> {
+    static constexpr size_t value = Module::kReadyQueueSize > 0 ? Module::kReadyQueueSize : 1;
+};
+
+template <typename Module, typename = void>
+struct ProfilerModuleHostPoolQueueCapacity {
+    static constexpr size_t value = 1024;
+};
+
+template <typename Module>
+struct ProfilerModuleHostPoolQueueCapacity<Module, std::void_t<decltype(Module::kHostPoolQueueSize)>> {
+    static constexpr size_t value = Module::kHostPoolQueueSize > 0 ? Module::kHostPoolQueueSize : 1;
+};
+
+template <typename Module, typename = void>
+struct ProfilerModuleHostRecycledQueueCapacity {
+    static constexpr size_t value = ProfilerModuleHostPoolQueueCapacity<Module>::value;
+};
+
+template <typename Module>
+struct ProfilerModuleHostRecycledQueueCapacity<Module, std::void_t<decltype(Module::kHostRecycledQueueSize)>> {
+    static constexpr size_t value = Module::kHostRecycledQueueSize > 0 ? Module::kHostRecycledQueueSize : 1;
+};
+
+template <typename T, size_t Capacity>
+class SpscRing {
+    static_assert(Capacity > 0, "SpscRing capacity must be > 0");
+
+public:
+    bool push(const T &item) {
+        uint64_t head = head_.load(std::memory_order_relaxed);
+        uint64_t tail = tail_.load(std::memory_order_acquire);
+        if (head - tail >= Capacity) {
+            return false;
+        }
+        entries_[head % Capacity] = item;
+        head_.store(head + 1, std::memory_order_release);
+        return true;
+    }
+
+    bool pop(T &out) {
+        uint64_t tail = tail_.load(std::memory_order_relaxed);
+        uint64_t head = head_.load(std::memory_order_acquire);
+        if (tail == head) {
+            return false;
+        }
+        out = entries_[tail % Capacity];
+        tail_.store(tail + 1, std::memory_order_release);
+        return true;
+    }
+
+    bool empty() const {
+        uint64_t tail = tail_.load(std::memory_order_acquire);
+        uint64_t head = head_.load(std::memory_order_acquire);
+        return tail == head;
+    }
+
+    size_t size() const {
+        uint64_t tail = tail_.load(std::memory_order_acquire);
+        uint64_t head = head_.load(std::memory_order_acquire);
+        uint64_t count = head - tail;
+        return count > Capacity ? Capacity : static_cast<size_t>(count);
+    }
+
+    void clear() {
+        T ignored{};
+        while (pop(ignored)) {}
+    }
+
+private:
+    std::array<T, Capacity> entries_{};
+    alignas(64) std::atomic<uint64_t> head_{0};
+    alignas(64) std::atomic<uint64_t> tail_{0};
+};
+
+class RetiredPool {
+public:
+    bool push(void *item) {
+        std::scoped_lock<std::mutex> lock(mutex_);
+        try {
+            entries_.push_back(item);
+        } catch (...) {
+            return false;
+        }
+        return true;
+    }
+
+    bool pop(void *&out) {
+        std::scoped_lock<std::mutex> lock(mutex_);
+        if (entries_.empty()) return false;
+        out = entries_.back();
+        entries_.pop_back();
+        return true;
+    }
+
+    void clear() {
+        std::scoped_lock<std::mutex> lock(mutex_);
+        entries_.clear();
+    }
+
+    bool empty() const {
+        std::scoped_lock<std::mutex> lock(mutex_);
+        return entries_.empty();
+    }
+
+    size_t size() const {
+        std::scoped_lock<std::mutex> lock(mutex_);
+        return entries_.size();
+    }
+
+private:
+    mutable std::mutex mutex_;
+    std::vector<void *> entries_;
+};
+
 template <typename Module>
 class BufferPoolManager {
     // Static checks for the Module concept. Required type aliases trigger
@@ -162,10 +286,12 @@ public:
     using ReadyBufferInfo = typename Module::ReadyBufferInfo;
     static constexpr int kCollectorShardCount = ProfilerModuleCollectorThreadCount<Module>::value;
     static_assert(kCollectorShardCount >= 1, "Module::kCollectorThreadCount must be >= 1");
+    static constexpr size_t kReadyQueueCapacity = ProfilerModuleHostQueueCapacity<Module>::value;
+    static constexpr size_t kPoolQueueCapacity = ProfilerModuleHostPoolQueueCapacity<Module>::value;
+    static constexpr size_t kRecycledQueueCapacity = ProfilerModuleHostRecycledQueueCapacity<Module>::value;
+    static constexpr size_t kHostQueueCapacity = kReadyQueueCapacity;
 
-    BufferPoolManager() :
-        ready_shards_(kCollectorShardCount),
-        done_shards_(kCollectorShardCount) {}
+    BufferPoolManager() = default;
     ~BufferPoolManager() = default;
 
     BufferPoolManager(const BufferPoolManager &) = delete;
@@ -173,9 +299,9 @@ public:
 
     /**
      * Configure the buffer pool's memory context. Called by ProfilerBase::start()
-     * before any allocator-touching method (alloc_and_register / free_buffer /
-     * resolve_host_ptr / drain_done_into_recycled triggered by the mgmt loop)
-     * is invoked. Must NOT be called concurrently with the mgmt thread.
+     * before any allocator-touching method (alloc_and_register_block /
+     * free_buffer / resolve_host_ptr / drain_done_into_recycled) is invoked.
+     * Must NOT be called concurrently with the mgmt thread.
      *
      * @param ops              Memory-op callbacks (alloc/reg/free/copy_*).
      * @param shared_mem_dev   Device base of the subsystem's shared memory.
@@ -200,58 +326,49 @@ public:
      * to the collector and must be released by it (the AICPU may still be
      * referencing them via shared memory until execution ends).
      *
-     * For each unique device pointer freed, the paired host shadow is
-     * `std::free`d ONLY if it lives in `malloc_shadows_` (i.e. the
-     * framework itself malloc'd it via `default_host_shadow_register` or
-     * `ProfilerBase::alloc_paired_buffer`'s copy-to-device branch). HAL
-     * mappings (e.g. `halHostRegister` results) are never freed here.
-     *
-     * `release_fn(dev_ptr)` is invoked once per unique pointer; the
-     * collector is expected to call its free_cb on the device pointer.
+     * `release_fn(dev_ptr)` is invoked once per unique allocation base.
+     * Carved sub-buffers from the same registered block are canonicalized
+     * back to that block base before invoking release_fn.
      *
      * Only safe to call after ProfilerBase::stop() has joined the mgmt thread.
      */
     template <typename ReleaseFn>
     void release_owned_buffers(const ReleaseFn &release_fn) {
-        std::unordered_map<void *, bool> seen;
+        std::unordered_set<void *> seen;
         auto release_once = [&](void *p) {
             if (p == nullptr) return;
-            if (seen.emplace(p, true).second) {
-                auto it = dev_to_host_.find(p);
-                void *host_ptr = (it != dev_to_host_.end()) ? it->second : nullptr;
-                release_fn(p);
-                if (host_ptr != nullptr && malloc_shadows_.erase(host_ptr) > 0) {
-                    std::free(host_ptr);
-                }
-                if (it != dev_to_host_.end()) {
-                    dev_to_host_.erase(it);
-                }
+            void *release_ptr = release_pointer_for(p);
+            if (release_ptr != nullptr && seen.insert(release_ptr).second) {
+                release_fn(release_ptr);
             }
         };
 
         for (auto &shard_pools : recycled_) {
             for (auto &pool : shard_pools) {
-                for (void *p : pool)
+                void *p = nullptr;
+                while (pool.pop(p)) {
                     release_once(p);
-                pool.clear();
-            }
-        }
-        {
-            for (auto &shard : done_shards_) {
-                std::scoped_lock<std::mutex> lock(shard.mutex);
-                while (!shard.queue.empty()) {
-                    release_once(shard.queue.front().dev_ptr);
-                    shard.queue.pop();
                 }
             }
         }
-        {
-            for (auto &shard : ready_shards_) {
-                std::scoped_lock<std::mutex> lock(shard.mutex);
-                while (!shard.queue.empty()) {
-                    release_once(shard.queue.front().dev_buffer_ptr);
-                    shard.queue.pop();
+        for (auto &shard_pools : retired_) {
+            for (auto &pool : shard_pools) {
+                void *p = nullptr;
+                while (pool.pop(p)) {
+                    release_once(p);
                 }
+            }
+        }
+        for (auto &shard : done_shards_) {
+            DoneInfo info{};
+            while (shard.queue.pop(info)) {
+                release_once(info.dev_ptr);
+            }
+        }
+        for (auto &shard : ready_shards_) {
+            ReadyBufferInfo info{};
+            while (shard.queue.pop(info)) {
+                release_once(info.dev_buffer_ptr);
             }
         }
     }
@@ -266,11 +383,13 @@ public:
      */
     void clear_mappings() {
         for (auto &kv : dev_to_host_) {
-            if (kv.second != nullptr && malloc_shadows_.count(kv.second) > 0) {
+            if (kv.second != nullptr && malloc_shadows_.erase(kv.second) > 0) {
                 std::free(kv.second);
             }
         }
         dev_to_host_.clear();
+        block_ranges_.clear();
+        released_allocations_.clear();
         malloc_shadows_.clear();
     }
 
@@ -284,8 +403,8 @@ public:
      * not run.
      *
      * Drains recycled/done/ready first (just discards — release goes via
-     * dev_to_host_ to avoid double-free) and then iterates the full
-     * dev→host map. Each unique dev_ptr is released exactly once.
+     * dev_to_host_ to avoid double-free) and then iterates the full mapping
+     * table. Each unique allocation base is released exactly once.
      */
     template <typename ReleaseFn>
     void release_all_owned(const ReleaseFn &release_fn) {
@@ -293,26 +412,33 @@ public:
             for (auto &pool : shard_pools)
                 pool.clear();
         }
+        for (auto &shard_pools : retired_) {
+            for (auto &pool : shard_pools)
+                pool.clear();
+        }
         for (auto &shard : done_shards_) {
-            std::scoped_lock<std::mutex> lock(shard.mutex);
-            std::queue<DoneInfo>().swap(shard.queue);
+            shard.queue.clear();
         }
         for (auto &shard : ready_shards_) {
-            std::scoped_lock<std::mutex> lock(shard.mutex);
-            std::queue<ReadyBufferInfo>().swap(shard.queue);
+            shard.queue.clear();
         }
-        for (auto &kv : dev_to_host_) {
+        std::unordered_set<void *> release_ptrs;
+        for (const auto &kv : dev_to_host_) {
             if (kv.first != nullptr) {
-                release_fn(kv.first);
+                if (void *release_ptr = allocation_base_for_locked(kv.first); release_ptr != nullptr) {
+                    release_ptrs.insert(release_ptr);
+                }
             }
-            // erase-based check (matches release_owned_buffers): atomic
-            // check-and-remove guards against a double-free if any duplicate
-            // mapping ever sneaks into dev_to_host_.
-            if (kv.second != nullptr && malloc_shadows_.erase(kv.second) > 0) {
-                std::free(kv.second);
-            }
+        }
+        for (void *p : release_ptrs) {
+            release_fn(p);
+        }
+        for (void *host_ptr : malloc_shadows_) {
+            std::free(host_ptr);
         }
         dev_to_host_.clear();
+        block_ranges_.clear();
+        released_allocations_.clear();
         malloc_shadows_.clear();
     }
 
@@ -427,35 +553,34 @@ public:
     // ready_queue shards: mgmt threads push, collector threads pop
     // -------------------------------------------------------------------------
 
-    void push_to_ready(const ReadyBufferInfo &info, int shard_index = 0) {
+    bool push_to_ready(const ReadyBufferInfo &info, int shard_index = 0) {
         auto &shard = ready_shards_[normalize_shard(shard_index)];
-        {
-            std::scoped_lock<std::mutex> lock(shard.mutex);
-            shard.queue.push(info);
+        if (!shard.queue.push(info)) {
+            LOG_ERROR("BufferPoolManager: ready queue full for shard=%d capacity=%zu", shard_index, kHostQueueCapacity);
+            return false;
         }
+        shard.notify_epoch.fetch_add(1, std::memory_order_release);
         shard.cv.notify_one();
+        return true;
     }
 
     bool try_pop_ready(ReadyBufferInfo &out, int shard_index = 0) {
         auto &shard = ready_shards_[normalize_shard(shard_index)];
-        std::scoped_lock<std::mutex> lock(shard.mutex);
-        if (shard.queue.empty()) return false;
-        out = shard.queue.front();
-        shard.queue.pop();
-        return true;
+        return shard.queue.pop(out);
     }
 
     bool wait_pop_ready(ReadyBufferInfo &out, std::chrono::milliseconds timeout, int shard_index = 0) {
         auto &shard = ready_shards_[normalize_shard(shard_index)];
-        std::unique_lock<std::mutex> lock(shard.mutex);
-        if (!shard.cv.wait_for(lock, timeout, [&shard] {
-                return !shard.queue.empty();
+        if (shard.queue.pop(out)) return true;
+
+        uint64_t seen = shard.notify_epoch.load(std::memory_order_acquire);
+        std::unique_lock<std::mutex> lock(shard.wait_mutex);
+        if (!shard.cv.wait_for(lock, timeout, [&shard, seen] {
+                return shard.notify_epoch.load(std::memory_order_acquire) != seen || !shard.queue.empty();
             })) {
             return false;
         }
-        out = shard.queue.front();
-        shard.queue.pop();
-        return true;
+        return shard.queue.pop(out);
     }
 
     // -------------------------------------------------------------------------
@@ -464,10 +589,21 @@ public:
     // right kind.
     // -------------------------------------------------------------------------
 
-    void notify_copy_done(void *dev_ptr, int kind, int shard_index = 0) {
+    bool notify_copy_done(void *dev_ptr, int kind, int shard_index = 0) {
         auto &shard = done_shards_[normalize_shard(shard_index)];
-        std::scoped_lock<std::mutex> lock(shard.mutex);
-        shard.queue.push(DoneInfo{dev_ptr, kind});
+        if (!shard.queue.push(DoneInfo{dev_ptr, kind})) {
+            LOG_ERROR(
+                "BufferPoolManager: done queue full for shard=%d kind=%d capacity=%zu", shard_index, kind,
+                kPoolQueueCapacity
+            );
+            return false;
+        }
+        return true;
+    }
+
+    bool try_pop_done(DoneInfo &out, int shard_index = 0) {
+        auto &shard = done_shards_[normalize_shard(shard_index)];
+        return shard.queue.pop(out);
     }
 
     // -------------------------------------------------------------------------
@@ -475,15 +611,55 @@ public:
     // -------------------------------------------------------------------------
 
     /**
-     * Allocate a new device buffer and pair it with a host shadow via
-     * ops_.reg. Tracks the resulting dev→host mapping so resolve_host_ptr()
-     * can find it on subsequent ready-queue pops.
+     * Allocate one device block, register it once, carve it into fixed-size
+     * buffers, then publish the carved buffer starts to one or more recycled
+     * lanes. The block mapping lets resolve_host_ptr() translate any carved
+     * device pointer by range offset, so the HAL registration cost is paid once
+     * per batch rather than once per buffer.
+     */
+    size_t allocate_recycled_batch(int kind, size_t buffer_size, int count, int shard_index = -1) {
+        if (count <= 0 || buffer_size == 0) return 0;
+
+        constexpr size_t kCarveAlignment = 64;
+        size_t stride = align_up(buffer_size, kCarveAlignment);
+        if (stride == 0 || static_cast<size_t>(count) > std::numeric_limits<size_t>::max() / stride) {
+            LOG_ERROR(
+                "BufferPoolManager: invalid block allocation request size=%zu count=%d stride=%zu", buffer_size, count,
+                stride
+            );
+            return 0;
+        }
+        size_t block_size = stride * static_cast<size_t>(count);
+        void *host_base = nullptr;
+        void *dev_base = alloc_and_register_block(block_size, &host_base);
+        if (dev_base == nullptr) return 0;
+        (void)host_base;
+
+        size_t published = 0;
+        auto dev_addr = reinterpret_cast<uintptr_t>(dev_base);
+        for (int i = 0; i < count; i++) {
+            void *dev_ptr = reinterpret_cast<void *>(dev_addr + stride * static_cast<size_t>(i));
+            int target_shard = shard_index >= 0 ? shard_index : i;
+            if (push_recycled(kind, dev_ptr, target_shard) || retire_unqueued_buffer(kind, dev_ptr, target_shard)) {
+                published++;
+            }
+        }
+        if (published == 0) {
+            LOG_ERROR("BufferPoolManager: failed to publish any carved buffers from block %p", dev_base);
+        }
+        return published;
+    }
+
+    /**
+     * Allocate a new device block and pair it with a host shadow via
+     * ops_.reg. Tracks a range mapping so resolve_host_ptr() can handle
+     * carved sub-buffers.
      *
      * @param size              Byte size to allocate.
      * @param[out] host_ptr_out Host shadow pointer.
      * @return                  Device pointer, or nullptr on failure.
      */
-    void *alloc_and_register(size_t size, void **host_ptr_out) {
+    void *alloc_and_register_block(size_t size, void **host_ptr_out) {
         void *dev_ptr = ops_.alloc(size);
         if (dev_ptr == nullptr) {
             *host_ptr_out = nullptr;
@@ -504,6 +680,11 @@ public:
         {
             std::scoped_lock<std::mutex> lock(mapping_mutex_);
             dev_to_host_[dev_ptr] = host_ptr;
+            block_ranges_.push_back(
+                BlockRange{
+                    reinterpret_cast<uintptr_t>(dev_ptr), reinterpret_cast<uintptr_t>(dev_ptr) + size, dev_ptr, host_ptr
+                }
+            );
         }
         return dev_ptr;
     }
@@ -515,19 +696,35 @@ public:
      */
     void free_buffer(void *dev_ptr) {
         if (dev_ptr == nullptr) return;
+        void *release_ptr = nullptr;
+        if (!claim_release_pointer(dev_ptr, &release_ptr)) return;
+
         void *host_ptr = nullptr;
         bool free_host_shadow = false;
         {
             std::scoped_lock<std::mutex> lock(mapping_mutex_);
-            auto it = dev_to_host_.find(dev_ptr);
+            auto it = dev_to_host_.find(release_ptr);
             host_ptr = (it != dev_to_host_.end()) ? it->second : nullptr;
             if (it != dev_to_host_.end()) {
                 dev_to_host_.erase(it);
             }
+            block_ranges_.erase(
+                std::remove_if(
+                    block_ranges_.begin(), block_ranges_.end(),
+                    [release_ptr](const BlockRange &range) {
+                        return range.dev_base == release_ptr;
+                    }
+                ),
+                block_ranges_.end()
+            );
             free_host_shadow = (host_ptr != nullptr && malloc_shadows_.erase(host_ptr) > 0);
         }
         if (ops_.free_) {
-            ops_.free_(dev_ptr);
+            ops_.free_(release_ptr);
+        }
+        {
+            std::scoped_lock<std::mutex> lock(mapping_mutex_);
+            released_allocations_.erase(release_ptr);
         }
         if (free_host_shadow) {
             std::free(host_ptr);
@@ -536,12 +733,17 @@ public:
 
     /**
      * Resolve a device pointer to the host-mapped pointer recorded at
-     * alloc_and_register / register_mapping time.
+     * alloc_and_register_block / register_mapping time. Mappings are built
+     * during init/proactive refill and are immutable while mgmt/collector
+     * threads run, so this hot path is read-only and lock-free.
      */
-    void *resolve_host_ptr(void *dev_ptr) {
-        std::scoped_lock<std::mutex> lock(mapping_mutex_);
-        auto it = dev_to_host_.find(dev_ptr);
-        if (it != dev_to_host_.end()) return it->second;
+    void *resolve_host_ptr(void *dev_ptr) const {
+        const auto &exact_mappings = dev_to_host_;
+        auto it = exact_mappings.find(dev_ptr);
+        if (it != exact_mappings.end()) return it->second;
+        if (void *host_ptr = resolve_host_ptr_from_range(dev_ptr); host_ptr != nullptr) {
+            return host_ptr;
+        }
         LOG_ERROR("BufferPoolManager: no host mapping for dev_ptr=%p", dev_ptr);
         return nullptr;
     }
@@ -559,8 +761,8 @@ public:
     /**
      * Claim ownership of a host shadow that the framework malloc'd. Only
      * shadows tracked here are `std::free`d by `clear_mappings()`,
-     * `release_owned_buffers()`, and `free_buffer()` — HAL-managed
-     * mappings (e.g. `halHostRegister` results) must NOT be added here.
+     * `release_all_owned()`, and `free_buffer()` — HAL-managed mappings
+     * (e.g. `halHostRegister` results) must NOT be added here.
      */
     void add_malloc_shadow(void *host_ptr) {
         if (host_ptr != nullptr) {
@@ -576,34 +778,50 @@ public:
      */
     void *pop_recycled(int kind, int shard_index = 0) {
         auto shard = normalize_shard(shard_index);
-        std::scoped_lock<std::mutex> lock(recycled_mutexes_[shard][kind]);
         auto &pool = recycled_[shard][kind];
-        if (pool.empty()) return nullptr;
-        void *p = pool.back();
-        pool.pop_back();
-        return p;
+        void *p = nullptr;
+        return pool.pop(p) ? p : nullptr;
     }
 
-    void *pop_recycled_any(int kind, int preferred_shard = 0) {
-        if (void *p = pop_recycled(kind, preferred_shard); p != nullptr) return p;
-        const auto preferred = normalize_shard(preferred_shard);
-        for (size_t s = 0; s < recycled_.size(); s++) {
-            if (s == preferred) continue;
-            if (void *p = pop_recycled(kind, static_cast<int>(s)); p != nullptr) return p;
+    void *pop_recycled_for_startup(int kind) {
+        for (size_t shard = 0; shard < recycled_.size(); shard++) {
+            if (void *p = pop_recycled(kind, static_cast<int>(shard)); p != nullptr) return p;
         }
         return nullptr;
     }
 
-    void push_recycled(int kind, void *dev_ptr, int shard_index = 0) {
+    bool push_recycled(int kind, void *dev_ptr, int shard_index = 0) {
         auto shard = normalize_shard(shard_index);
-        std::scoped_lock<std::mutex> lock(recycled_mutexes_[shard][kind]);
-        recycled_[shard][kind].push_back(dev_ptr);
+        if (!recycled_[shard][kind].push(dev_ptr)) {
+            LOG_ERROR(
+                "BufferPoolManager: recycled queue full for shard=%zu kind=%d capacity=%zu", shard, kind,
+                kRecycledQueueCapacity
+            );
+            return false;
+        }
+        return true;
+    }
+
+    bool retire_unqueued_buffer(int kind, void *dev_ptr, int shard_index = 0) {
+        auto shard = normalize_shard(shard_index);
+        if (!retired_[shard][kind].push(dev_ptr)) {
+            LOG_ERROR(
+                "BufferPoolManager: failed to park retired buffer for shard=%zu kind=%d dev_ptr=%p", shard, kind,
+                dev_ptr
+            );
+            return false;
+        }
+        return true;
+    }
+
+    size_t recycled_count(int kind, int shard_index) const {
+        auto shard = normalize_shard(shard_index);
+        return recycled_[shard][kind].size();
     }
 
     size_t recycled_count(int kind) const {
         size_t total = 0;
         for (size_t shard = 0; shard < recycled_.size(); shard++) {
-            std::scoped_lock<std::mutex> lock(recycled_mutexes_[shard][kind]);
             total += recycled_[shard][kind].size();
         }
         return total;
@@ -612,34 +830,26 @@ public:
     bool recycled_empty() const {
         for (size_t shard = 0; shard < recycled_.size(); shard++) {
             for (int kind = 0; kind < Module::kBufferKinds; kind++) {
-                std::scoped_lock<std::mutex> lock(recycled_mutexes_[shard][kind]);
                 if (!recycled_[shard][kind].empty()) return false;
             }
         }
         return true;
     }
 
-    template <typename Fn>
-    decltype(auto) with_free_queue_writer(const void *queue_key, Fn &&fn) {
-        std::scoped_lock<std::mutex> lock(free_queue_mutexes_[free_queue_lock_index(queue_key)]);
-        return fn();
-    }
-
     /**
-     * Drain everything currently in done queue shards back into the per-kind
-     * recycled pool. May be called from Module::process_entry when its
-     * primary recycled pool ran out, to harvest buffers the collector freed
-     * in the meantime.
+     * Drain everything currently in a done queue shard back into that shard's
+     * per-kind recycled pool. Runtime callers keep this single-consumer: the
+     * replenish thread is the only runtime consumer for done shards.
      */
     size_t drain_done_into_recycled(int shard_index) {
         auto &shard = done_shards_[normalize_shard(shard_index)];
         size_t drained = 0;
-        std::scoped_lock<std::mutex> lock(shard.mutex);
-        while (!shard.queue.empty()) {
-            const DoneInfo &info = shard.queue.front();
-            push_recycled(info.kind, info.dev_ptr, shard_index);
-            shard.queue.pop();
-            drained++;
+        DoneInfo info{};
+        while (shard.queue.pop(info)) {
+            if (push_recycled(info.kind, info.dev_ptr, shard_index) ||
+                retire_unqueued_buffer(info.kind, info.dev_ptr, shard_index)) {
+                drained++;
+            }
         }
         return drained;
     }
@@ -652,25 +862,108 @@ public:
         return drained;
     }
 
+    /**
+     * Return the device pointer that owns this allocation. For carved buffers
+     * this is the registered block base; for legacy one-buffer mappings it is
+     * the pointer itself.
+     */
+    void *release_pointer_for(void *dev_ptr) const {
+        std::scoped_lock<std::mutex> lock(mapping_mutex_);
+        return allocation_base_for_locked(dev_ptr);
+    }
+
+    /**
+     * Claim an allocation for release. Multiple carved sub-buffers can point
+     * into the same registered block; only the first claim returns true.
+     */
+    bool claim_release_pointer(void *dev_ptr, void **release_ptr_out) {
+        if (release_ptr_out == nullptr) return false;
+        std::scoped_lock<std::mutex> lock(mapping_mutex_);
+        void *release_ptr = tracked_allocation_base_for_locked(dev_ptr);
+        if (release_ptr == nullptr) {
+            *release_ptr_out = nullptr;
+            return false;
+        }
+        if (!released_allocations_.insert(release_ptr).second) {
+            *release_ptr_out = release_ptr;
+            return false;
+        }
+        *release_ptr_out = release_ptr;
+        return true;
+    }
+
     void *shared_mem_dev() const { return shared_mem_dev_; }
     void *shared_mem_host() const { return shared_mem_host_; }
     int device_id() const { return device_id_; }
 
 private:
+    using ReadyRing = SpscRing<ReadyBufferInfo, kReadyQueueCapacity>;
+    using DoneRing = SpscRing<DoneInfo, kPoolQueueCapacity>;
+    using RecycledRing = SpscRing<void *, kRecycledQueueCapacity>;
+
+    struct BlockRange {
+        uintptr_t dev_begin;
+        uintptr_t dev_end;
+        void *dev_base;
+        void *host_base;
+    };
+
     struct ReadyQueueShard {
-        std::mutex mutex;
+        ReadyRing queue;
+        std::mutex wait_mutex;
         std::condition_variable cv;
-        std::queue<ReadyBufferInfo> queue;
+        std::atomic<uint64_t> notify_epoch{0};
     };
 
     struct DoneQueueShard {
-        std::mutex mutex;
-        std::queue<DoneInfo> queue;
+        DoneRing queue;
     };
 
     static size_t normalize_shard(int shard_index) {
         if (shard_index < 0) return 0;
         return static_cast<size_t>(shard_index) % static_cast<size_t>(kCollectorShardCount);
+    }
+
+    static size_t align_up(size_t value, size_t alignment) {
+        if (alignment == 0) return value;
+        size_t rem = value % alignment;
+        if (rem == 0) return value;
+        if (value > std::numeric_limits<size_t>::max() - (alignment - rem)) return 0;
+        return value + (alignment - rem);
+    }
+
+    void *allocation_base_for_locked(void *dev_ptr) const {
+        if (dev_ptr == nullptr) return nullptr;
+        uintptr_t addr = reinterpret_cast<uintptr_t>(dev_ptr);
+        for (const auto &range : block_ranges_) {
+            if (addr >= range.dev_begin && addr < range.dev_end) {
+                return range.dev_base;
+            }
+        }
+        return dev_ptr;
+    }
+
+    void *tracked_allocation_base_for_locked(void *dev_ptr) const {
+        if (dev_ptr == nullptr) return nullptr;
+        uintptr_t addr = reinterpret_cast<uintptr_t>(dev_ptr);
+        for (const auto &range : block_ranges_) {
+            if (addr >= range.dev_begin && addr < range.dev_end) {
+                return range.dev_base;
+            }
+        }
+        return dev_to_host_.find(dev_ptr) != dev_to_host_.end() ? dev_ptr : nullptr;
+    }
+
+    void *resolve_host_ptr_from_range(void *dev_ptr) const {
+        if (dev_ptr == nullptr) return nullptr;
+        uintptr_t addr = reinterpret_cast<uintptr_t>(dev_ptr);
+        for (const auto &range : block_ranges_) {
+            if (addr >= range.dev_begin && addr < range.dev_end) {
+                uintptr_t offset = addr - range.dev_begin;
+                return reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(range.host_base) + offset);
+            }
+        }
+        return nullptr;
     }
 
     // Subsystem inputs (set by ProfilerBase::start via set_memory_context).
@@ -681,24 +974,18 @@ private:
     MemoryOps ops_;
 
     // mgmt → collector
-    std::vector<ReadyQueueShard> ready_shards_;
+    std::array<ReadyQueueShard, kCollectorShardCount> ready_shards_;
 
     // collector → mgmt
-    std::vector<DoneQueueShard> done_shards_;
+    std::array<DoneQueueShard, kCollectorShardCount> done_shards_;
 
     // Host-side pointer mappings are shared across all collector shards.
     mutable std::mutex mapping_mutex_;
-    static constexpr size_t kFreeQueueLockStripes = 64;
 
-    static size_t free_queue_lock_index(const void *queue_key) {
-        auto raw = reinterpret_cast<uintptr_t>(queue_key);
-        return (raw >> 6) % kFreeQueueLockStripes;
-    }
-
-    std::array<std::mutex, kFreeQueueLockStripes> free_queue_mutexes_;
-
-    // dev → host mapping (single source of truth for resolve_host_ptr)
+    // dev → host exact mappings plus block ranges for carved buffers.
     std::unordered_map<void *, void *> dev_to_host_;
+    std::vector<BlockRange> block_ranges_;
+    std::unordered_set<void *> released_allocations_;
 
     // Host shadows the framework itself malloc'd (via
     // `default_host_shadow_register` or `ProfilerBase::alloc_paired_buffer`'s
@@ -707,8 +994,11 @@ private:
     std::unordered_set<void *> malloc_shadows_;
 
     // Local recycled buffer pools indexed by collector shard, then Module-defined kind id.
-    std::array<std::array<std::vector<void *>, Module::kBufferKinds>, kCollectorShardCount> recycled_;
-    mutable std::array<std::array<std::mutex, Module::kBufferKinds>, kCollectorShardCount> recycled_mutexes_;
+    std::array<std::array<RecycledRing, Module::kBufferKinds>, kCollectorShardCount> recycled_;
+
+    // Error-path holding pools for buffers removed from recycled_ or popped
+    // from device ready queues but not published to a collector/free_queue.
+    std::array<std::array<RetiredPool, Module::kBufferKinds>, kCollectorShardCount> retired_;
 };
 
 }  // namespace profiling_common

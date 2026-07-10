@@ -16,7 +16,7 @@
  * Architecture:
  * - BufferPoolManager<PmuModule>: shared split-mgmt infrastructure that polls
  *   per-thread ready queues, drains done-queue shards, and replenishes the
- *   per-core free_queues from a unified recycled pool.
+ *   per-core free_queues from shard-local recycled lanes.
  * - PmuCollector: collector thread shards pop full PmuBuffers from the manager
  *   and append them to the CSV file.
  *
@@ -71,10 +71,9 @@
 /**
  * One buffer kind (PmuBuffer); per-core buffer states. The collector
  * pre-allocates PLATFORM_PMU_BUFFERS_PER_CORE buffers per core at init time
- * to absorb steady-state load. process_entry refills the originating core's
- * free_queue with exactly one buffer (recycled → drain done → alloc), and
- * proactive_replenish tops up to SLOT_COUNT with a batch alloc when the
- * recycled pool drains.
+ * to absorb steady-state load. Runtime refill uses the owning drain shard's
+ * local recycled lanes; proactive_replenish may batch-allocate before
+ * drain and collector threads start.
  */
 
 /**
@@ -97,6 +96,10 @@ struct PmuModule {
 
     static constexpr int kBufferKinds = 1;
     static constexpr uint32_t kReadyQueueSize = PLATFORM_PMU_READYQUEUE_SIZE;
+    static constexpr uint32_t kHostPoolQueueSize = PLATFORM_MAX_CORES * PLATFORM_PMU_BUFFERS_PER_CORE;
+    static constexpr uint32_t kMaxCoresPerCollectorShard =
+        (PLATFORM_MAX_CORES + PLATFORM_MAX_AICPU_THREADS - 1) / PLATFORM_MAX_AICPU_THREADS;
+    static constexpr uint32_t kHostRecycledQueueSize = PLATFORM_MAX_CORES * PLATFORM_PMU_BUFFERS_PER_CORE;
     static constexpr uint32_t kSlotCount = PLATFORM_PMU_SLOT_COUNT;
     static constexpr const char *kSubsystemName = "PmuModule";
     static constexpr int kMgmtDrainThreadCount = PLATFORM_MAX_AICPU_THREADS;
@@ -110,6 +113,17 @@ struct PmuModule {
     static constexpr int batch_size(int /*kind*/) {
         constexpr int kBatch = PLATFORM_PMU_BUFFERS_PER_CORE - PLATFORM_PMU_SLOT_COUNT;
         return kBatch < 1 ? 1 : kBatch;
+    }
+
+    static constexpr int recycled_warm_target(int /*kind*/) {
+        // Keep half of the init-seeded surplus per shard as the steady-state
+        // low-water mark. PMU normally has no init surplus, so retain one
+        // minimal reserve batch instead of scaling by core count.
+        constexpr int kSurplusPerCore = (PLATFORM_PMU_BUFFERS_PER_CORE > PLATFORM_PMU_SLOT_COUNT) ?
+                                            (PLATFORM_PMU_BUFFERS_PER_CORE - PLATFORM_PMU_SLOT_COUNT) :
+                                            0;
+        constexpr int kInitialSurplus = kSurplusPerCore * static_cast<int>(kMaxCoresPerCollectorShard);
+        return kInitialSurplus > 0 ? (kInitialSurplus + 1) / 2 : 1;
     }
 
     static DataHeader *header_from_shm(void *shm) { return get_pmu_header(shm); }
@@ -190,8 +204,7 @@ public:
      * `num_cores * PLATFORM_PMU_BUFFERS_PER_CORE` PmuBuffers. The first
      * PLATFORM_PMU_SLOT_COUNT buffers per core are pushed directly into that
      * core's free_queue; the surplus go into the BufferPoolManager's shared
-     * recycled pool (no per-core affinity — any core can borrow from the pool
-     * via the mgmt thread's proactive_replenish).
+     * recycled lanes, sharded by the owning AICPU thread/core affinity.
      *
      * @param num_cores                    Number of AICore instances in use
      * @param num_threads                  Number of AICPU scheduling threads

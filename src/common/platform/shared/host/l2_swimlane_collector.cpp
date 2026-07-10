@@ -20,6 +20,7 @@
 
 #include "host/l2_swimlane_collector.h"
 
+#include <array>
 #include <cassert>
 #include <chrono>
 #include <cinttypes>
@@ -42,6 +43,37 @@
 // Sched / orch phase records route through separate BufferKinds; no
 // parse-time discriminator function is needed (the device-side type tag is
 // the source of truth).
+
+namespace {
+
+int owner_recycled_shard_for_core(int core_index, int thread_count) {
+    int cluster_index = core_index / PLATFORM_CORES_PER_BLOCKDIM;
+    return cluster_index % thread_count;
+}
+
+bool recycled_seed_capacity_is_sufficient(
+    const char *label, int num_cores, int thread_count, int surplus_per_core, size_t capacity
+) {
+    if (surplus_per_core <= 0) return true;
+    std::array<int, PLATFORM_MAX_AICPU_THREADS> per_shard{};
+    for (int core = 0; core < num_cores; core++) {
+        per_shard[static_cast<size_t>(owner_recycled_shard_for_core(core, thread_count))] += surplus_per_core;
+    }
+
+    bool ok = true;
+    for (int shard = 0; shard < thread_count; shard++) {
+        if (static_cast<size_t>(per_shard[static_cast<size_t>(shard)]) <= capacity) continue;
+        LOG_ERROR(
+            "%s recycled seed exceeds lane capacity: shard=%d need=%d capacity=%zu "
+            "(num_cores=%d thread_count=%d)",
+            label, shard, per_shard[static_cast<size_t>(shard)], capacity, num_cores, thread_count
+        );
+        ok = false;
+    }
+    return ok;
+}
+
+}  // namespace
 
 L2SwimlaneCollector::~L2SwimlaneCollector() {
     stop();
@@ -71,6 +103,12 @@ int L2SwimlaneCollector::initialize(
 
     if (num_aicore <= 0 || num_aicore > PLATFORM_MAX_CORES) {
         LOG_ERROR("Invalid number of AICores: %d (max=%d)", num_aicore, PLATFORM_MAX_CORES);
+        return -1;
+    }
+    if (aicpu_thread_num <= 0 || aicpu_thread_num > PLATFORM_MAX_AICPU_THREADS) {
+        LOG_ERROR(
+            "Invalid number of AICPU threads: %d (valid range: 1-%d)", aicpu_thread_num, PLATFORM_MAX_AICPU_THREADS
+        );
         return -1;
     }
 
@@ -178,6 +216,16 @@ int L2SwimlaneCollector::initialize(
     // Step 5: Initialize L2SwimlaneAicpuTaskPools. Seed as many buffers as
     // the device-side free_queue can hold; any remaining buffers stay in the
     // host recycled pool.
+    constexpr int kAicpuInitialFreeCount = (PLATFORM_PROF_BUFFERS_PER_CORE < PLATFORM_PROF_SLOT_COUNT) ?
+                                               PLATFORM_PROF_BUFFERS_PER_CORE :
+                                               PLATFORM_PROF_SLOT_COUNT;
+    constexpr int kAicpuSurplusPerCore = PLATFORM_PROF_BUFFERS_PER_CORE - kAicpuInitialFreeCount;
+    if (!recycled_seed_capacity_is_sufficient(
+            "L2SwimlaneAicpuTask", num_aicore, aicpu_thread_num, kAicpuSurplusPerCore,
+            decltype(manager_)::kRecycledQueueCapacity
+        )) {
+        return -1;
+    }
     for (int i = 0; i < num_aicore; i++) {
         L2SwimlaneAicpuTaskPool *state = get_perf_buffer_state(perf_host_ptr, i);
         memset(state, 0, sizeof(L2SwimlaneAicpuTaskPool));
@@ -187,9 +235,7 @@ int L2SwimlaneCollector::initialize(
         state->head.current_buf_ptr = 0;
         state->head.current_buf_seq = 0;
 
-        const int initial_free_count = (PLATFORM_PROF_BUFFERS_PER_CORE < PLATFORM_PROF_SLOT_COUNT) ?
-                                           PLATFORM_PROF_BUFFERS_PER_CORE :
-                                           PLATFORM_PROF_SLOT_COUNT;
+        const int initial_free_count = kAicpuInitialFreeCount;
         for (int s = 0; s < PLATFORM_PROF_BUFFERS_PER_CORE; s++) {
             void *host_buf_ptr = nullptr;
             void *dev_buf_ptr = alloc_paired_buffer(sizeof(L2SwimlaneAicpuTaskBuffer), &host_buf_ptr);
@@ -204,7 +250,11 @@ int L2SwimlaneCollector::initialize(
             if (s < initial_free_count) {
                 state->free_queue.buffer_ptrs[s] = reinterpret_cast<uint64_t>(dev_buf_ptr);
             } else {
-                manager_.push_recycled(static_cast<int>(ProfBufferType::AICPU_TASK), dev_buf_ptr);
+                int shard = owner_recycled_shard_for_core(i, aicpu_thread_num);
+                int kind = static_cast<int>(ProfBufferType::AICPU_TASK);
+                if (!manager_.push_recycled(kind, dev_buf_ptr, shard)) {
+                    (void)manager_.retire_unqueued_buffer(kind, dev_buf_ptr, shard);
+                }
             }
         }
         wmb();
@@ -214,13 +264,21 @@ int L2SwimlaneCollector::initialize(
 
     // Step 5b: Initialize L2SwimlaneAicoreTaskPools — per-core AICore rotation
     // channel + buffer pool. Same SPSC pattern as the AICPU pool above.
+    constexpr int kAicoreInitialFreeCount = (PLATFORM_AICORE_BUFFERS_PER_CORE < PLATFORM_PROF_SLOT_COUNT) ?
+                                                PLATFORM_AICORE_BUFFERS_PER_CORE :
+                                                PLATFORM_PROF_SLOT_COUNT;
+    constexpr int kAicoreSurplusPerCore = PLATFORM_AICORE_BUFFERS_PER_CORE - kAicoreInitialFreeCount;
+    if (!recycled_seed_capacity_is_sufficient(
+            "L2SwimlaneAicoreTask", num_aicore, aicpu_thread_num, kAicoreSurplusPerCore,
+            decltype(manager_)::kRecycledQueueCapacity
+        )) {
+        return -1;
+    }
     for (int i = 0; i < num_aicore; i++) {
         L2SwimlaneAicoreTaskPool *ac_state = get_aicore_buffer_state(perf_host_ptr, num_aicore, i);
         memset(ac_state, 0, sizeof(L2SwimlaneAicoreTaskPool));
 
-        const int initial_free_count = (PLATFORM_AICORE_BUFFERS_PER_CORE < PLATFORM_PROF_SLOT_COUNT) ?
-                                           PLATFORM_AICORE_BUFFERS_PER_CORE :
-                                           PLATFORM_PROF_SLOT_COUNT;
+        const int initial_free_count = kAicoreInitialFreeCount;
         for (int s = 0; s < PLATFORM_AICORE_BUFFERS_PER_CORE; s++) {
             void *host_buf_ptr = nullptr;
             void *dev_buf_ptr = alloc_paired_buffer(sizeof(L2SwimlaneAicoreTaskBuffer), &host_buf_ptr);
@@ -235,7 +293,11 @@ int L2SwimlaneCollector::initialize(
             if (s < initial_free_count) {
                 ac_state->free_queue.buffer_ptrs[s] = reinterpret_cast<uint64_t>(dev_buf_ptr);
             } else {
-                manager_.push_recycled(static_cast<int>(ProfBufferType::AICORE_TASK), dev_buf_ptr);
+                int shard = owner_recycled_shard_for_core(i, aicpu_thread_num);
+                int kind = static_cast<int>(ProfBufferType::AICORE_TASK);
+                if (!manager_.push_recycled(kind, dev_buf_ptr, shard)) {
+                    (void)manager_.retire_unqueued_buffer(kind, dev_buf_ptr, shard);
+                }
             }
         }
         wmb();
@@ -308,7 +370,14 @@ int L2SwimlaneCollector::initialize(
                 if (s < initial_free_count) {
                     state->free_queue.buffer_ptrs[s] = reinterpret_cast<uint64_t>(dev_buf_ptr);
                 } else {
-                    manager_.push_recycled(static_cast<int>(recycle_kind), dev_buf_ptr);
+                    int shard = t;
+                    if (recycle_kind == ProfBufferType::AICPU_ORCH_PHASE) {
+                        shard = (aicpu_thread_num > 0) ? (aicpu_thread_num - 1) : 0;
+                    }
+                    int kind = static_cast<int>(recycle_kind);
+                    if (!manager_.push_recycled(kind, dev_buf_ptr, shard)) {
+                        (void)manager_.retire_unqueued_buffer(kind, dev_buf_ptr, shard);
+                    }
                 }
             }
             wmb();

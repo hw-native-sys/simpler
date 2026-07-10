@@ -17,7 +17,7 @@
  * Architecture:
  * - BufferPoolManager<DepGenModule>: shared mgmt-thread infrastructure that
  *   polls per-thread ready queues, drains done-queue shards, and replenishes
- *   the single instance's free_queue from a unified recycled pool.
+ *   the single instance's free_queue from shard-local recycled lanes.
  * - DepGenCollector: collector thread shards pop full DepGenBuffers from the
  *   manager and append their DepGenRecords to an in-memory vector consumed by
  *   host replay after device execution completes.
@@ -85,14 +85,15 @@ struct DepGenModule {
 
     static constexpr int kBufferKinds = 1;
     static constexpr uint32_t kReadyQueueSize = PLATFORM_DEP_GEN_READYQUEUE_SIZE;
+    static constexpr uint32_t kHostPoolQueueSize = PLATFORM_MAX_AICPU_THREADS * PLATFORM_DEP_GEN_BUFFERS_PER_INSTANCE;
     static constexpr uint32_t kSlotCount = PLATFORM_DEP_GEN_SLOT_COUNT;
     static constexpr const char *kSubsystemName = "DepGenModule";
     static constexpr int kMgmtDrainThreadCount = PLATFORM_MAX_AICPU_THREADS;
     static constexpr int kCollectorThreadCount = PLATFORM_MAX_AICPU_THREADS;
 
     /**
-     * Buffers grown by proactive_replenish are batch-allocated up to the
-     * per-instance ceiling minus the slot count.
+     * Startup-only batch allocation size for proactive_replenish when the
+     * recycled lanes need additional buffers before drain threads start.
      */
     static constexpr int batch_size(int /*kind*/) {
         constexpr int kBatch = PLATFORM_DEP_GEN_BUFFERS_PER_INSTANCE - PLATFORM_DEP_GEN_SLOT_COUNT;
@@ -174,7 +175,7 @@ public:
      * Allocates a DepGenDataHeader + 1 DepGenBufferState, plus
      * PLATFORM_DEP_GEN_BUFFERS_PER_INSTANCE DepGenBuffers. The first
      * PLATFORM_DEP_GEN_SLOT_COUNT buffers go directly into the free_queue;
-     * the surplus go into BufferPoolManager's shared recycled pool.
+     * the surplus go into BufferPoolManager's shard-local recycled lanes.
      *
      * @param num_threads     Number of AICPU scheduling threads (so the
      *                        DataHeader sizes its per-thread ready queues)

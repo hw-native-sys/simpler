@@ -29,9 +29,13 @@ over-provisioned pools frees **~66 MB, zero ABI**.
 
 The 5 subsystems share an **SPSC + ProfilerBase** contract: the device writes
 records into a buffer, rotates when full and pops an empty buffer from the
-free_queue; a host mgmt thread concurrently recycles full buffers and refills
-empties. **When a buffer is full and the free_queue is empty, the record is
-dropped** (no back-pressure on the dispatch hot path — a deliberate invariant).
+free_queue; the host drain/replenish mgmt path concurrently returns
+collector-done buffers to recycled lanes and refills free queues from those
+lanes. Modules can also ask the replenish thread to keep recycled lanes above
+host-side watermarks by batched allocation; only the drain path writes device
+free queues. **When a buffer is full and the free_queue is empty, the record
+is dropped** (no back-pressure on the dispatch hot path — a deliberate
+invariant).
 
 - **Criterion**: each pool's `configured / actually-needed` ratio should be
   roughly consistent across subsystems — over-provisioning wastes memory,

@@ -34,6 +34,7 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <cstddef>
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
@@ -61,9 +62,9 @@
 /**
  * One buffer kind (DumpMetaBuffer); one ready_queue per AICPU thread.
  * Per-thread arena buffers are owned by the collector itself, not the
- * framework. process_entry refills the originating thread's free_queue
- * with exactly one buffer; proactive_replenish tops up to SLOT_COUNT and
- * batch-allocates when the recycled pool drains.
+ * framework. Runtime refill uses the owning drain shard's local
+ * recycled/done lanes; proactive_replenish may batch-allocate before drain
+ * and collector threads start.
  */
 
 /**
@@ -84,15 +85,15 @@ struct DumpModule {
 
     static constexpr int kBufferKinds = 1;
     static constexpr uint32_t kReadyQueueSize = PLATFORM_DUMP_READYQUEUE_SIZE;
+    static constexpr uint32_t kHostPoolQueueSize = PLATFORM_MAX_AICPU_THREADS * PLATFORM_DUMP_BUFFERS_PER_THREAD;
     static constexpr uint32_t kSlotCount = PLATFORM_DUMP_SLOT_COUNT;
     static constexpr const char *kSubsystemName = "DumpModule";
     static constexpr int kMgmtDrainThreadCount = PLATFORM_MAX_AICPU_THREADS;
     static constexpr int kCollectorThreadCount = PLATFORM_MAX_AICPU_THREADS;
 
     /**
-     * Tensor-dump bursts can be very large; the batch is sized so a fully
-     * empty recycled pool refills to the configured per-thread ceiling in
-     * one tick.
+     * Tensor-dump bursts can be very large; this is the startup-only batch
+     * size used when proactive_replenish needs to grow recycled lanes.
      */
     static constexpr int batch_size(int /*kind*/) {
         constexpr int kBatch = PLATFORM_DUMP_BUFFERS_PER_THREAD - PLATFORM_DUMP_SLOT_COUNT;

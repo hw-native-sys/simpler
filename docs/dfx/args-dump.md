@@ -488,10 +488,12 @@ normal execution continues.
 space so the host can read device buffers directly.
 `TensorDumpCollector` runs split mgmt threads and collector shards on top of a
 [`BufferPoolManager<DumpModule>`](../src/common/platform/include/host/buffer_pool_manager.h):
-drain/refill shards poll SPSC ready queues and recycle full metadata
-buffers **while kernels are still executing**, a replenish thread keeps
-free queues topped up, and collector shards drain the host hand-off queues
-into `on_buffer_collected`.
+drain/refill shards poll SPSC ready queues and refill free queues from
+shard-local recycled lanes **while kernels are still executing**. Collector
+shards drain the host hand-off queues into `on_buffer_collected`, then the
+replenish thread folds done buffers back into recycled lanes and, for
+modules that declare a recycled watermark, tops those lanes up by batched
+allocation without writing device free queues.
 
 ```text
         HOST                                         DEVICE
@@ -507,7 +509,7 @@ into `on_buffer_collected`.
 │   │ drain/refill shard │ │               │     dump_arg_record()    │
 │   │ + replenish thread │ │ SPSC ready    │     → write to arena     │
 │   │   poll ready queue │<┼──queues──────<│     → append record      │
-│   │   recycle buffers  │─┼──free queue──>│     → push to ready_q    │
+│   │   refill freeQ     │─┼──free queue──>│     → push to ready_q    │
 │   └────────────────────┘ │               │   dispatch kernel        │
 │   ┌────────────────────┐ │               │   wait FIN               │
 │   │ collector shard    │ │               │   AFTER_COMPLETION       │
@@ -609,7 +611,7 @@ the buffer's records.
 │   for each ready entry:  │               │     pop next from free_q │
 │     copy buf from device │<──memcpy─────<│                          │
 │     resolve host ptr     │               │ dump_args_flush():       │
-│     push to L2 ready_q   │               │   push remaining buffers │
+│     push to host ready_q │               │   push remaining buffers │
 │   advance queue_heads,   │               │   to ready_q             │
 │     refill free_queues   │               │                          │
 │   write_range_to_device  │──memcpy──────>│                          │
