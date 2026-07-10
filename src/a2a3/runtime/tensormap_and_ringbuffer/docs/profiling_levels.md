@@ -372,10 +372,10 @@ This overrides the defaults in `profiling_config.h` without changing source.
 
 ```bash
 # Example: disable all profiling code
-CXXFLAGS="-DPTO2_PROFILING=0" pip install --no-build-isolation -e .
+CXXFLAGS="-DSIMPLER_DFX=0" pip install --no-build-isolation -e .
 
 # Example: enable orchestrator and tensormap profiling
-CXXFLAGS="-DPTO2_ORCH_PROFILING=1 -DPTO2_TENSORMAP_PROFILING=1" \
+CXXFLAGS="-DSIMPLER_ORCH_PROFILING=1 -DSIMPLER_TENSORMAP_PROFILING=1" \
     pip install --no-build-isolation -e .
 ```
 

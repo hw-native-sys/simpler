@@ -105,7 +105,7 @@ directly** — there is no longer a Python parser for it:
 
 ```bash
 # build the runtime with the deep-dive lines compiled in
-CXX="g++ -DPTO2_SCHED_PROFILING=1" python simpler_setup/build_runtimes.py --platforms a2a3
+CXX="g++ -DSIMPLER_SCHED_PROFILING=1" python simpler_setup/build_runtimes.py --platforms a2a3
 # run, then grep the device log by eye
 grep -E 'orch_start=|sched_start=|Scheduler summary' \
     ~/ascend/log/debug/device-0/device-*.log

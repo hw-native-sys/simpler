@@ -345,10 +345,10 @@ jobs:
   # off") so log scrubbing the failing leg pinpoints the specific gate:
   #
   #   SIMPLER_DFX (default=1, covered by every other CI job)
-  #   ├── pto2-off:         -DPTO2_PROFILING=0   (no profiling at all)
-  #   ├── orch:             -DPTO2_ORCH_PROFILING=1
-  #   │   └── orch-tensormap:  + -DPTO2_TENSORMAP_PROFILING=1
-  #   ├── sched:            -DPTO2_SCHED_PROFILING=1
+  #   ├── dfx-off:         -DSIMPLER_DFX=0   (no profiling at all)
+  #   ├── orch:             -DSIMPLER_ORCH_PROFILING=1
+  #   │   └── orch-tensormap:  + -DSIMPLER_TENSORMAP_PROFILING=1
+  #   ├── sched:            -DSIMPLER_SCHED_PROFILING=1
   #   ├── orch-sched:       ORCH=1 + SCHED=1   (both sub-flags on, tensormap off)
   #   └── all-on:           ORCH=1 + SCHED=1 + TENSORMAP=1
   #
@@ -414,14 +414,14 @@ jobs:
           # Combo names paired with their CXX defines. Parallel arrays (not
           # an associative array) so the loop iteration order is deterministic
           # and the log reads top-to-bottom in hierarchy order.
-          COMBO_NAMES=(pto2-off orch orch-tensormap sched orch-sched all-on)
+          COMBO_NAMES=(dfx-off orch orch-tensormap sched orch-sched all-on)
           COMBO_DEFS=(
-            "-DPTO2_PROFILING=0"
-            "-DPTO2_ORCH_PROFILING=1"
-            "-DPTO2_ORCH_PROFILING=1 -DPTO2_TENSORMAP_PROFILING=1"
-            "-DPTO2_SCHED_PROFILING=1"
-            "-DPTO2_ORCH_PROFILING=1 -DPTO2_SCHED_PROFILING=1"
-            "-DPTO2_ORCH_PROFILING=1 -DPTO2_SCHED_PROFILING=1 -DPTO2_TENSORMAP_PROFILING=1"
+            "-DSIMPLER_DFX=0"
+            "-DSIMPLER_ORCH_PROFILING=1"
+            "-DSIMPLER_ORCH_PROFILING=1 -DSIMPLER_TENSORMAP_PROFILING=1"
+            "-DSIMPLER_SCHED_PROFILING=1"
+            "-DSIMPLER_ORCH_PROFILING=1 -DSIMPLER_SCHED_PROFILING=1"
+            "-DSIMPLER_ORCH_PROFILING=1 -DSIMPLER_SCHED_PROFILING=1 -DSIMPLER_TENSORMAP_PROFILING=1"
           )
           ARCHES=(a2a3sim a5sim)
           FAIL=()
