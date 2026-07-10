@@ -57,7 +57,7 @@ class TestPagedAttentionUnrollTpushPop(SceneTestCase):
         {
             "name": "Case1",
             "platforms": ["a2a3"],
-            "config": {"aicpu_thread_num": 4, "block_dim": 24},
+            "config": {"aicpu_thread_num": 4, "block_dim": 0},
             "params": {
                 "batch": 256,
                 "num_heads": 16,
@@ -72,7 +72,7 @@ class TestPagedAttentionUnrollTpushPop(SceneTestCase):
         {
             "name": "Case2",
             "platforms": ["a2a3"],
-            "config": {"aicpu_thread_num": 4, "block_dim": 24},
+            "config": {"aicpu_thread_num": 4, "block_dim": 0},
             "manual": True,
             "params": {
                 "batch": 64,
@@ -94,7 +94,7 @@ class TestPagedAttentionUnrollTpushPop(SceneTestCase):
             "name": "SmallCase1",
             "platforms": ["a2a3"],
             "manual": True,
-            "config": {"aicpu_thread_num": 4, "block_dim": 24},
+            "config": {"aicpu_thread_num": 4, "block_dim": 0},
             "params": {
                 "batch": 24,
                 "num_heads": 16,

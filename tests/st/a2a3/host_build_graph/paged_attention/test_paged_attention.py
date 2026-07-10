@@ -70,7 +70,7 @@ class TestPagedAttentionHostBuildGraph(SceneTestCase):
         {
             "name": "Case1",
             "platforms": ["a2a3"],
-            "config": {"aicpu_thread_num": 3, "block_dim": 24},
+            "config": {"aicpu_thread_num": 3, "block_dim": 0},
             "params": {
                 "batch": 256,
                 "num_heads": 16,
@@ -85,7 +85,7 @@ class TestPagedAttentionHostBuildGraph(SceneTestCase):
         {
             "name": "Case2",
             "platforms": ["a2a3"],
-            "config": {"aicpu_thread_num": 3, "block_dim": 24},
+            "config": {"aicpu_thread_num": 3, "block_dim": 0},
             "manual": True,
             "params": {
                 "batch": 64,
