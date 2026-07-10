@@ -403,6 +403,7 @@ struct CompletionStats {
  */
 struct PTO2SchedulerLayout {
     size_t off_ready_queue_slots[PTO2_NUM_RESOURCE_SHAPES];
+    size_t off_ready_sync_queue_slots[PTO2_NUM_RESOURCE_SHAPES];
     size_t off_dummy_ready_queue_slots;
     size_t off_early_dispatch_queue_slots[PTO2_NUM_RESOURCE_SHAPES];
     size_t off_dep_pool_entries[PTO2_MAX_RING_DEPTH];
@@ -488,6 +489,13 @@ struct PTO2SchedulerState {
     // Ready queues remain global (scheduling is ring-agnostic)
     PTO2ReadyQueue ready_queues[PTO2_NUM_RESOURCE_SHAPES];
 
+    // Ready sync_start queues, one per shape. A ready sync_start cohort parks here
+    // instead of ready_queues[] so the dispatch loop can drain it as a strict Tier-0
+    // (sync_start > MIX > C/V) before any regular ready task takes a core, while
+    // reusing the same per-shape dispatch_shape machinery (fits-local inline vs
+    // stop-the-world drain, per-core MIX placement, head-start spacing).
+    PTO2ReadyQueue ready_sync_queues[PTO2_NUM_RESOURCE_SHAPES];
+
     // Dependency-only tasks (active_mask is empty, shape == DUMMY). Drained by
     // the dispatch loop and completed inline -- never goes to AICore.
     PTO2ReadyQueue dummy_ready_queue;
@@ -503,13 +511,15 @@ struct PTO2SchedulerState {
     // Inline hot-path methods
     // =========================================================================
 
-    // Route a ready slot to the right global queue. Dummy tasks (empty
-    // active_mask) live in dummy_ready_queue; everything else goes to the
-    // per-shape ready_queues[].
+    // Route a ready slot to the right global queue. Dummy tasks (empty active_mask)
+    // live in dummy_ready_queue; a ready sync_start cohort goes to the per-shape
+    // ready_sync_queues[] (drained as Tier-0); everything else to ready_queues[].
     void push_ready_routed(PTO2TaskSlotState *slot_state) {
         PTO2ResourceShape shape = slot_state->active_mask.to_shape();
         if (shape == PTO2ResourceShape::DUMMY) {
             dummy_ready_queue.push(slot_state);
+        } else if (slot_state->active_mask.requires_sync_start()) {
+            ready_sync_queues[static_cast<int32_t>(shape)].push(slot_state);
         } else {
             ready_queues[static_cast<int32_t>(shape)].push(slot_state);
         }
@@ -798,6 +808,8 @@ struct PTO2SchedulerState {
         PTO2ResourceShape shape = slot_state.active_mask.to_shape();
         if (shape == PTO2ResourceShape::DUMMY) {
             dummy_ready_queue.push(&slot_state);
+        } else if (slot_state.active_mask.requires_sync_start()) {
+            ready_sync_queues[static_cast<int32_t>(shape)].push(&slot_state);
         } else {
             ready_queues[static_cast<int32_t>(shape)].push(&slot_state);
         }
@@ -830,6 +842,8 @@ struct PTO2SchedulerState {
         PTO2ResourceShape shape = slot_state.active_mask.to_shape();
         if (shape == PTO2ResourceShape::DUMMY) {
             dummy_ready_queue.push(&slot_state, atomic_count, push_wait);
+        } else if (slot_state.active_mask.requires_sync_start()) {
+            ready_sync_queues[static_cast<int32_t>(shape)].push(&slot_state, atomic_count, push_wait);
         } else {
             ready_queues[static_cast<int32_t>(shape)].push(&slot_state, atomic_count, push_wait);
         }
@@ -864,15 +878,16 @@ struct PTO2SchedulerState {
     }
 #endif
 
-    int get_ready_tasks_batch(PTO2ResourceShape shape, PTO2TaskSlotState **out, int max_count) {
-        return ready_queues[static_cast<int32_t>(shape)].pop_batch(out, max_count);
+    int get_ready_tasks_batch(PTO2ReadyQueue *queues, PTO2ResourceShape shape, PTO2TaskSlotState **out, int max_count) {
+        return queues[static_cast<int32_t>(shape)].pop_batch(out, max_count);
     }
 
 #if SIMPLER_SCHED_PROFILING
     int get_ready_tasks_batch(
-        PTO2ResourceShape shape, PTO2TaskSlotState **out, int max_count, uint64_t &atomic_count, uint64_t &wait_cycle
+        PTO2ReadyQueue *queues, PTO2ResourceShape shape, PTO2TaskSlotState **out, int max_count, uint64_t &atomic_count,
+        uint64_t &wait_cycle
     ) {
-        return ready_queues[static_cast<int32_t>(shape)].pop_batch(out, max_count, atomic_count, wait_cycle);
+        return queues[static_cast<int32_t>(shape)].pop_batch(out, max_count, atomic_count, wait_cycle);
     }
 #endif
 

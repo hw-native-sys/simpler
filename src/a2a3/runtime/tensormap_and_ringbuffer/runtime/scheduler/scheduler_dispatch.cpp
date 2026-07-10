@@ -85,7 +85,7 @@ bool SchedulerContext::has_idle_in_other_threads(int32_t self_thread_idx, PTO2Re
 }
 
 int SchedulerContext::pop_ready_tasks_batch(
-    PTO2ResourceShape shape, int32_t thread_idx, PTO2TaskSlotState **out, int max_count
+    PTO2ReadyQueue *queues, PTO2ResourceShape shape, int32_t thread_idx, PTO2TaskSlotState **out, int max_count
 ) {
 #if SIMPLER_DFX
     auto &l2_swimlane = sched_l2_swimlane_[thread_idx];
@@ -93,11 +93,11 @@ int SchedulerContext::pop_ready_tasks_batch(
     extern uint64_t g_sched_pop_atomic_count[], g_sched_pop_wait_cycle[];
     uint64_t t_pop_start = get_sys_cnt_aicpu();
     int count = sched_->get_ready_tasks_batch(
-        shape, out, max_count, g_sched_pop_atomic_count[thread_idx], g_sched_pop_wait_cycle[thread_idx]
+        queues, shape, out, max_count, g_sched_pop_atomic_count[thread_idx], g_sched_pop_wait_cycle[thread_idx]
     );
     l2_swimlane.sched_dispatch_pop_cycle += (get_sys_cnt_aicpu() - t_pop_start);
 #else
-    int count = sched_->get_ready_tasks_batch(shape, out, max_count);
+    int count = sched_->get_ready_tasks_batch(queues, shape, out, max_count);
 #endif
     if (l2_swimlane_level_ >= L2SwimlaneLevel::SCHED_PHASES) {
         if (count > 0) {
@@ -108,7 +108,7 @@ int SchedulerContext::pop_ready_tasks_batch(
     }
 #else
     (void)thread_idx;
-    int count = sched_->get_ready_tasks_batch(shape, out, max_count);
+    int count = sched_->get_ready_tasks_batch(queues, shape, out, max_count);
 #endif
     return count;
 }
@@ -274,8 +274,8 @@ int SchedulerContext::prepare_block_for_dispatch(
 }
 
 void SchedulerContext::dispatch_shape(
-    int32_t thread_idx, PTO2ResourceShape shape, CoreTracker::DispatchPhase phase, CoreTracker &tracker,
-    bool &entered_drain, bool &made_progress, bool &try_pushed
+    int32_t thread_idx, PTO2ReadyQueue *disp_queues, PTO2ResourceShape shape, CoreTracker::DispatchPhase phase,
+    CoreTracker &tracker, bool &entered_drain, bool &made_progress, bool &try_pushed
 ) {
 #if SIMPLER_SCHED_PROFILING
     auto &l2_swimlane = sched_l2_swimlane_[thread_idx];
@@ -290,7 +290,7 @@ void SchedulerContext::dispatch_shape(
     while (cores.has_value() && !entered_drain) {
         int want = cores.count();
         PTO2TaskSlotState *batch[CoreTracker::MAX_CLUSTERS * 3];
-        int got = pop_ready_tasks_batch(shape, thread_idx, batch, want);
+        int got = pop_ready_tasks_batch(disp_queues, shape, thread_idx, batch, want);
         if (got == 0) break;
 
         // sync_start exclusion gate.
@@ -374,7 +374,7 @@ void SchedulerContext::dispatch_shape(
                     }
                 }
                 if (!selected_mix_clusters.has_value()) {
-                    sched_->ready_queues[static_cast<int32_t>(shape)].push(slot_state);
+                    disp_queues[static_cast<int32_t>(shape)].push(slot_state);
                     continue;
                 }
             }
@@ -385,17 +385,17 @@ void SchedulerContext::dispatch_shape(
 
             if (slot_state->active_mask.requires_sync_start()) {
                 if (is_pending) {
-                    sched_->ready_queues[static_cast<int32_t>(shape)].push(slot_state);
+                    disp_queues[static_cast<int32_t>(shape)].push(slot_state);
                     continue;
                 }
                 int32_t available = is_mix ? selected_mix_clusters.count() : cores.count();
                 if (available < slot_state->logical_block_num) {
                     flush_publish();
                     if (!enter_drain_mode(slot_state, slot_state->logical_block_num)) {
-                        sched_->ready_queues[static_cast<int32_t>(shape)].push(slot_state);
+                        disp_queues[static_cast<int32_t>(shape)].push(slot_state);
                     }
                     for (int rem = bi + 1; rem < got; rem++) {
-                        sched_->ready_queues[static_cast<int32_t>(shape)].push(batch[rem]);
+                        disp_queues[static_cast<int32_t>(shape)].push(batch[rem]);
                     }
                     entered_drain = true;
                     break;
@@ -404,7 +404,7 @@ void SchedulerContext::dispatch_shape(
 
             if (!cores.has_value()) {
                 flush_publish();
-                sched_->ready_queues[static_cast<int32_t>(shape)].push_batch(&batch[bi], got - bi);
+                disp_queues[static_cast<int32_t>(shape)].push_batch(&batch[bi], got - bi);
                 break;
             }
 
@@ -430,7 +430,7 @@ void SchedulerContext::dispatch_shape(
             slot_state->next_block_idx.store(static_cast<int16_t>(start + claim), std::memory_order_relaxed);
 
             if (start + claim < slot_state->logical_block_num) {
-                sched_->ready_queues[static_cast<int32_t>(shape)].push(slot_state);
+                disp_queues[static_cast<int32_t>(shape)].push(slot_state);
             }
 
             for (int32_t b = 0; b < claim; b++) {
@@ -471,8 +471,9 @@ void SchedulerContext::dispatch_shape(
     }
 }
 
-void SchedulerContext::dispatch_ready_tasks(
-    int32_t thread_idx, CoreTracker &tracker, bool pmu_active, bool &made_progress, bool &try_pushed
+template <typename StageFn, typename ResidualMixFn>
+void SchedulerContext::run_staging_order(
+    int32_t thread_idx, bool pmu_active, StageFn &&stage, ResidualMixFn &&residual_mix
 ) {
     using Phase = CoreTracker::DispatchPhase;
 
@@ -485,22 +486,17 @@ void SchedulerContext::dispatch_ready_tasks(
     };
     const PTO2ResourceShape *aic_aiv = kAicAivOrder[thread_idx & 1];
 
-    bool entered_drain = false;
-
     // ===== IDLE stage =====
-    dispatch_shape(thread_idx, PTO2ResourceShape::MIX, Phase::IDLE, tracker, entered_drain, made_progress, try_pushed);
-    if (entered_drain) return;
+    if (stage(PTO2ResourceShape::MIX, Phase::IDLE)) return;
 
     // MIX-IDLE residual: AIC/AIV (both IDLE and PENDING) yield for this pass.
     // MIX-PENDING below still runs — that is the core of "mix strict priority":
     // pending slots are spent on mix before AIC/AIV get any chance.
-    bool skip_aic_aiv = has_residual_mix();
+    bool skip_aic_aiv = residual_mix();
 
     if (!skip_aic_aiv) {
         for (int i = 0; i < 2; i++) {
-            PTO2ResourceShape s = aic_aiv[i];
-            dispatch_shape(thread_idx, s, Phase::IDLE, tracker, entered_drain, made_progress, try_pushed);
-            if (entered_drain) return;
+            if (stage(aic_aiv[i], Phase::IDLE)) return;
         }
     }
 
@@ -516,15 +512,12 @@ void SchedulerContext::dispatch_ready_tasks(
     // The gate is NOT subject to skip_aic_aiv — residual mix continues to drain
     // via pending slots on this thread when no peer is idle.
     if (!has_idle_in_other_threads(thread_idx, PTO2ResourceShape::MIX)) {
-        dispatch_shape(
-            thread_idx, PTO2ResourceShape::MIX, Phase::PENDING, tracker, entered_drain, made_progress, try_pushed
-        );
-        if (entered_drain) return;
+        if (stage(PTO2ResourceShape::MIX, Phase::PENDING)) return;
     }
 
     // Re-check after MIX-PENDING. If MIX-IDLE already set skip_aic_aiv, leave
     // it set; otherwise, escalate iff PENDING-MIX left residual.
-    if (!skip_aic_aiv && has_residual_mix()) {
+    if (!skip_aic_aiv && residual_mix()) {
         skip_aic_aiv = true;
     }
 
@@ -535,9 +528,48 @@ void SchedulerContext::dispatch_ready_tasks(
     for (int i = 0; i < 2; i++) {
         PTO2ResourceShape s = aic_aiv[i];
         if (has_idle_in_other_threads(thread_idx, s)) continue;
-        dispatch_shape(thread_idx, s, Phase::PENDING, tracker, entered_drain, made_progress, try_pushed);
-        if (entered_drain) return;
+        if (stage(s, Phase::PENDING)) return;
     }
+}
+
+void SchedulerContext::dispatch_ready_tasks(
+    int32_t thread_idx, CoreTracker &tracker, bool pmu_active, bool &made_progress, bool &try_pushed
+) {
+    // Normal ready dispatch (is_ready): dispatch_shape places each block on pickup and
+    // signals a stop by setting entered_drain when it enters a sync_start drain.
+    bool entered_drain = false;
+
+    // Tier 0: ready sync_start cohorts take cores before any regular ready task
+    // (sync_start > MIX > C/V within the normal source). Same order and machinery,
+    // fed from ready_sync_queues; an oversized cohort arms the stop-the-world drain
+    // (entered_drain), which also short-circuits the regular tier below.
+    run_staging_order(
+        thread_idx, pmu_active,
+        [&](PTO2ResourceShape shape, CoreTracker::DispatchPhase phase) {
+            dispatch_shape(
+                thread_idx, sched_->ready_sync_queues, shape, phase, tracker, entered_drain, made_progress, try_pushed
+            );
+            return entered_drain;
+        },
+        [&] {
+            return has_residual_sync_mix();
+        }
+    );
+    if (entered_drain) return;
+
+    // Tier 1: regular ready work.
+    run_staging_order(
+        thread_idx, pmu_active,
+        [&](PTO2ResourceShape shape, CoreTracker::DispatchPhase phase) {
+            dispatch_shape(
+                thread_idx, sched_->ready_queues, shape, phase, tracker, entered_drain, made_progress, try_pushed
+            );
+            return entered_drain;
+        },
+        [&] {
+            return has_residual_mix();
+        }
+    );
 }
 
 // Stage the ALREADY-CLAIMED range [start, start+count) of consumer `c` onto
@@ -731,8 +763,6 @@ SchedulerContext::early_dispatch_shape(int32_t thread_idx, PTO2ResourceShape sha
 int32_t SchedulerContext::try_early_dispatch(
     int32_t thread_idx, CoreTracker &tracker, bool pmu_active, bool &made_progress, bool &try_pushed
 ) {
-    using Phase = CoreTracker::DispatchPhase;
-
     // Gate, owned here rather than by the caller (mirrors dispatch_ready_tasks
     // withholding PENDING under PMU internally):
     //   - pmu_active: staging gated work perturbs the single-issue PMU windows the
@@ -740,56 +770,28 @@ int32_t SchedulerContext::try_early_dispatch(
     //   - has_any_free_slot: this thread has no spare capacity to stage onto (a
     //     purely local read; a fully-occupied thread bails before touching shared
     //     queues).
-    //   - ready_queues empty: normal dispatch strictly precedes early — there is no
-    //     real ready task to delay only when every ready queue is drained.
+    //   - ready queues empty: normal dispatch (both the ready sync_start lane and the
+    //     regular ready_queues) strictly precedes early — there is no real ready task
+    //     to delay only when every normal queue is drained.
     if (pmu_active || !tracker.has_any_free_slot()) return 0;
     for (int s = 0; s < PTO2_NUM_RESOURCE_SHAPES; s++) {
-        if (sched_->ready_queues[s].size() > 0) return 0;
+        if (sched_->ready_sync_queues[s].size() > 0 || sched_->ready_queues[s].size() > 0) return 0;
     }
 
-    // AIC/AIV order toggled by thread parity for shape-level load balancing, matching
-    // dispatch_ready_tasks. MIX is handled explicitly at the top of each stage.
-    static constexpr PTO2ResourceShape kAicAivOrder[2][2] = {
-        {PTO2ResourceShape::AIC, PTO2ResourceShape::AIV},
-        {PTO2ResourceShape::AIV, PTO2ResourceShape::AIC},
-    };
-    const PTO2ResourceShape *aic_aiv = kAicAivOrder[thread_idx & 1];
-
+    // Early staging (NOT is_ready): same MIX/idle/pending order as normal dispatch, via the
+    // shared skeleton. early_dispatch_shape stages a gated block range and never enters drain,
+    // so the stage callback always reports "no stop".
     int32_t total_staged = 0;
-
-    // ===== IDLE stage =====
-    total_staged += early_dispatch_shape(thread_idx, PTO2ResourceShape::MIX, Phase::IDLE);
-
-    // MIX strict priority: with MIX candidates still queued, AIC/AIV yield this pass so
-    // the residual mix keeps its clusters. Uses the early-queue residual (the normal
-    // MIX ready queue is empty whenever this pass runs).
-    bool skip_aic_aiv = has_residual_early_mix();
-    if (!skip_aic_aiv) {
-        for (int i = 0; i < 2; i++) {
-            total_staged += early_dispatch_shape(thread_idx, aic_aiv[i], Phase::IDLE);
+    run_staging_order(
+        thread_idx, pmu_active,
+        [&](PTO2ResourceShape shape, CoreTracker::DispatchPhase phase) {
+            total_staged += early_dispatch_shape(thread_idx, shape, phase);
+            return false;
+        },
+        [&] {
+            return has_residual_early_mix();
         }
-    }
-
-    // ===== PENDING stage =====
-    // MIX-PENDING gate: skip when a peer has an idle MIX-capable cluster — that peer's
-    // next IDLE-MIX pass pulls the mix candidate from the shared queue at lower latency.
-    if (!has_idle_in_other_threads(thread_idx, PTO2ResourceShape::MIX)) {
-        total_staged += early_dispatch_shape(thread_idx, PTO2ResourceShape::MIX, Phase::PENDING);
-    }
-
-    // Re-check residual mix after MIX-PENDING; escalate the skip if it left residual.
-    if (!skip_aic_aiv && has_residual_early_mix()) {
-        skip_aic_aiv = true;
-    }
-    // AIC/AIV-PENDING, each gated on no peer being idle for that shape (a skip is a
-    // delay, not a loss — the peer pulls from the shared queue on its next IDLE pass).
-    if (!skip_aic_aiv) {
-        for (int i = 0; i < 2; i++) {
-            PTO2ResourceShape s = aic_aiv[i];
-            if (has_idle_in_other_threads(thread_idx, s)) continue;
-            total_staged += early_dispatch_shape(thread_idx, s, Phase::PENDING);
-        }
-    }
+    );
 
     // Staging is dispatch work: reset the idle/stall clock and route this iter's tail
     // cycles to the dispatch accumulator, exactly as normal dispatch does.
