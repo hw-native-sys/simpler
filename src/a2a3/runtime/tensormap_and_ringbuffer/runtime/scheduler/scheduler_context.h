@@ -173,6 +173,12 @@ private:
     int32_t aic_count_{0};
     int32_t aiv_count_{0};
 
+    // Compact per-core CoreType, packed contiguously (~2 cache lines total) so
+    // post_handshake_init's ordered discovery scan reads it instead of taking a
+    // per-core volatile GM load from the 64B-aligned Handshake struct. Filled by
+    // each handshake thread for its own [lo,hi) slice during the parallel sweep.
+    uint8_t core_type_compact_[RUNTIME_MAX_WORKER]{};
+
     // Set by any thread whose slice hits an invalid physical_core_id in
     // handshake_partition; checked by the leader in post_handshake_init.
     std::atomic<bool> handshake_failed_{false};

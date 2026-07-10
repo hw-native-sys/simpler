@@ -363,6 +363,19 @@ int DeviceRunner::run(Runtime &runtime, const CallConfig &config) {
     // removes the slow launch itself, so the wedge cannot return if the timeout
     // is ever tightened or a slower device pushes the launch past it. See
     // docs/investigations/2026-06-pa-unroll-207001-optimeout-window.md.
+    // The AICore publishes aicore_done on launch (gated by nothing), and the
+    // workers region persists across runs in the pooled arena. Clearing each
+    // worker's aicore_done before the AICore kernel launches keeps the AICPU's
+    // handshake sweep from reading a prior run's report — which would open a
+    // window on that run's physical_core_id. Only aicore_done needs clearing; the
+    // AICore overwrites physical_core_id/core_type in the same report.
+    {
+        Handshake *workers = runtime.get_workers();
+        for (int i = 0; i < num_aicore; i++) {
+            workers[i].aicore_done = 0;
+        }
+    }
+
     LOG_INFO_V0("=== launch_aicore_kernel ===");
     rc = kernel_args_.init_device_kernel_args(mem_alloc_);
     if (rc != 0) {

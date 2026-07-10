@@ -432,6 +432,19 @@ int DeviceRunner::run(Runtime &runtime, const CallConfig &config) {
     // slow-launch / 207001 wedge was measured on a5; this mirror is UNVERIFIED on
     // a2a3 silicon (the dev box is a5-only), relying on CI. See
     // docs/investigations/2026-06-pa-unroll-207001-optimeout-window.md.
+    // The AICore publishes aicore_done on launch (gated by nothing), and the
+    // workers region persists across runs in the pooled arena. Clearing each
+    // worker's aicore_done before the AICore kernel launches keeps the AICPU's
+    // handshake sweep from reading a prior run's report — which would open a
+    // window on that run's physical_core_id. Only aicore_done needs clearing; the
+    // AICore overwrites physical_core_id/core_type in the same report.
+    {
+        Handshake *workers = runtime.get_workers();
+        for (int i = 0; i < num_aicore; i++) {
+            workers[i].aicore_done = 0;
+        }
+    }
+
     LOG_INFO_V0("=== launch_aicore_kernel ===");
     // Launch AICore kernel (pass device copy of KernelArgs)
     rc = launch_aicore_kernel(stream_aicore_, kernel_args_.device_k_args_);
