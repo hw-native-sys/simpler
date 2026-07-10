@@ -85,7 +85,7 @@ bool SchedulerContext::has_idle_in_other_threads(int32_t self_thread_idx, PTO2Re
 }
 
 int SchedulerContext::pop_ready_tasks_batch(
-    PTO2ResourceShape shape, int32_t thread_idx, PTO2TaskSlotState **out, int max_count
+    PTO2ReadyQueue *queues, PTO2ResourceShape shape, int32_t thread_idx, PTO2TaskSlotState **out, int max_count
 ) {
 #if SIMPLER_DFX
     auto &l2_swimlane = sched_l2_swimlane_[thread_idx];
@@ -93,11 +93,11 @@ int SchedulerContext::pop_ready_tasks_batch(
     extern uint64_t g_sched_pop_atomic_count[], g_sched_pop_wait_cycle[];
     uint64_t t_pop_start = get_sys_cnt_aicpu();
     int count = sched_->get_ready_tasks_batch(
-        shape, out, max_count, g_sched_pop_atomic_count[thread_idx], g_sched_pop_wait_cycle[thread_idx]
+        queues, shape, out, max_count, g_sched_pop_atomic_count[thread_idx], g_sched_pop_wait_cycle[thread_idx]
     );
     l2_swimlane.sched_dispatch_pop_cycle += (get_sys_cnt_aicpu() - t_pop_start);
 #else
-    int count = sched_->get_ready_tasks_batch(shape, out, max_count);
+    int count = sched_->get_ready_tasks_batch(queues, shape, out, max_count);
 #endif
     if (l2_swimlane_level_ >= L2SwimlaneLevel::SCHED_PHASES) {
         if (count > 0) {
@@ -108,7 +108,7 @@ int SchedulerContext::pop_ready_tasks_batch(
     }
 #else
     (void)thread_idx;
-    int count = sched_->get_ready_tasks_batch(shape, out, max_count);
+    int count = sched_->get_ready_tasks_batch(queues, shape, out, max_count);
 #endif
     return count;
 }
@@ -274,8 +274,8 @@ int SchedulerContext::prepare_block_for_dispatch(
 }
 
 void SchedulerContext::dispatch_shape(
-    int32_t thread_idx, PTO2ResourceShape shape, CoreTracker::DispatchPhase phase, CoreTracker &tracker,
-    bool &entered_drain, bool &made_progress, bool &try_pushed
+    int32_t thread_idx, PTO2ReadyQueue *disp_queues, PTO2ResourceShape shape, CoreTracker::DispatchPhase phase,
+    CoreTracker &tracker, bool &entered_drain, bool &made_progress, bool &try_pushed
 ) {
 #if SIMPLER_SCHED_PROFILING
     auto &l2_swimlane = sched_l2_swimlane_[thread_idx];
@@ -290,7 +290,7 @@ void SchedulerContext::dispatch_shape(
     while (cores.has_value() && !entered_drain) {
         int want = cores.count();
         PTO2TaskSlotState *batch[CoreTracker::MAX_CLUSTERS * 3];
-        int got = pop_ready_tasks_batch(shape, thread_idx, batch, want);
+        int got = pop_ready_tasks_batch(disp_queues, shape, thread_idx, batch, want);
         if (got == 0) break;
 
         // sync_start exclusion gate.
@@ -374,7 +374,7 @@ void SchedulerContext::dispatch_shape(
                     }
                 }
                 if (!selected_mix_clusters.has_value()) {
-                    sched_->ready_queues[static_cast<int32_t>(shape)].push(slot_state);
+                    disp_queues[static_cast<int32_t>(shape)].push(slot_state);
                     continue;
                 }
             }
@@ -385,17 +385,17 @@ void SchedulerContext::dispatch_shape(
 
             if (slot_state->active_mask.requires_sync_start()) {
                 if (is_pending) {
-                    sched_->ready_queues[static_cast<int32_t>(shape)].push(slot_state);
+                    disp_queues[static_cast<int32_t>(shape)].push(slot_state);
                     continue;
                 }
                 int32_t available = is_mix ? selected_mix_clusters.count() : cores.count();
                 if (available < slot_state->logical_block_num) {
                     flush_publish();
                     if (!enter_drain_mode(slot_state, slot_state->logical_block_num)) {
-                        sched_->ready_queues[static_cast<int32_t>(shape)].push(slot_state);
+                        disp_queues[static_cast<int32_t>(shape)].push(slot_state);
                     }
                     for (int rem = bi + 1; rem < got; rem++) {
-                        sched_->ready_queues[static_cast<int32_t>(shape)].push(batch[rem]);
+                        disp_queues[static_cast<int32_t>(shape)].push(batch[rem]);
                     }
                     entered_drain = true;
                     break;
@@ -404,7 +404,7 @@ void SchedulerContext::dispatch_shape(
 
             if (!cores.has_value()) {
                 flush_publish();
-                sched_->ready_queues[static_cast<int32_t>(shape)].push_batch(&batch[bi], got - bi);
+                disp_queues[static_cast<int32_t>(shape)].push_batch(&batch[bi], got - bi);
                 break;
             }
 
@@ -430,7 +430,7 @@ void SchedulerContext::dispatch_shape(
             slot_state->next_block_idx.store(static_cast<int16_t>(start + claim), std::memory_order_relaxed);
 
             if (start + claim < slot_state->logical_block_num) {
-                sched_->ready_queues[static_cast<int32_t>(shape)].push(slot_state);
+                disp_queues[static_cast<int32_t>(shape)].push(slot_state);
             }
 
             for (int32_t b = 0; b < claim; b++) {
@@ -538,13 +538,37 @@ void SchedulerContext::dispatch_ready_tasks(
     // Normal ready dispatch (is_ready): dispatch_shape places each block on pickup and
     // signals a stop by setting entered_drain when it enters a sync_start drain.
     bool entered_drain = false;
+
+    // Tier 0: ready sync_start cohorts take cores before any regular ready task
+    // (sync_start > MIX > C/V within the normal source). Same order and machinery,
+    // fed from ready_sync_queues; an oversized cohort arms the stop-the-world drain
+    // (entered_drain), which also short-circuits the regular tier below.
     run_staging_order(
         thread_idx, pmu_active,
         [&](PTO2ResourceShape shape, CoreTracker::DispatchPhase phase) {
-            dispatch_shape(thread_idx, shape, phase, tracker, entered_drain, made_progress, try_pushed);
+            dispatch_shape(
+                thread_idx, sched_->ready_sync_queues, shape, phase, tracker, entered_drain, made_progress, try_pushed
+            );
             return entered_drain;
         },
-        [&] { return has_residual_mix(); }
+        [&] {
+            return has_residual_sync_mix();
+        }
+    );
+    if (entered_drain) return;
+
+    // Tier 1: regular ready work.
+    run_staging_order(
+        thread_idx, pmu_active,
+        [&](PTO2ResourceShape shape, CoreTracker::DispatchPhase phase) {
+            dispatch_shape(
+                thread_idx, sched_->ready_queues, shape, phase, tracker, entered_drain, made_progress, try_pushed
+            );
+            return entered_drain;
+        },
+        [&] {
+            return has_residual_mix();
+        }
     );
 }
 
@@ -746,11 +770,12 @@ int32_t SchedulerContext::try_early_dispatch(
     //   - has_any_free_slot: this thread has no spare capacity to stage onto (a
     //     purely local read; a fully-occupied thread bails before touching shared
     //     queues).
-    //   - ready_queues empty: normal dispatch strictly precedes early — there is no
-    //     real ready task to delay only when every ready queue is drained.
+    //   - ready queues empty: normal dispatch (both the ready sync_start lane and the
+    //     regular ready_queues) strictly precedes early — there is no real ready task
+    //     to delay only when every normal queue is drained.
     if (pmu_active || !tracker.has_any_free_slot()) return 0;
     for (int s = 0; s < PTO2_NUM_RESOURCE_SHAPES; s++) {
-        if (sched_->ready_queues[s].size() > 0) return 0;
+        if (sched_->ready_sync_queues[s].size() > 0 || sched_->ready_queues[s].size() > 0) return 0;
     }
 
     // Early staging (NOT is_ready): same MIX/idle/pending order as normal dispatch, via the
@@ -763,7 +788,9 @@ int32_t SchedulerContext::try_early_dispatch(
             total_staged += early_dispatch_shape(thread_idx, shape, phase);
             return false;
         },
-        [&] { return has_residual_early_mix(); }
+        [&] {
+            return has_residual_early_mix();
+        }
     );
 
     // Staging is dispatch work: reset the idle/stall clock and route this iter's tail

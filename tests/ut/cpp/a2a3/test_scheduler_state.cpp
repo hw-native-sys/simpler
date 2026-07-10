@@ -203,7 +203,7 @@ TEST_F(SchedulerStateTest, GetReadyTasksBatchDrainsSharedQueue) {
     ASSERT_TRUE(sched.release_fanin_and_check_ready(slot_b));
 
     PTO2TaskSlotState *out[4];
-    int count = sched.get_ready_tasks_batch(PTO2ResourceShape::AIC, out, 4);
+    int count = sched.get_ready_tasks_batch(sched.ready_queues, PTO2ResourceShape::AIC, out, 4);
 
     EXPECT_EQ(count, 2);
     // Shared queue is FIFO, so slot_a (pushed first) comes first.

@@ -219,7 +219,9 @@ private:
         return "?";
     }
 
-    int pop_ready_tasks_batch(PTO2ResourceShape shape, int32_t thread_idx, PTO2TaskSlotState **out, int max_count);
+    int pop_ready_tasks_batch(
+        PTO2ReadyQueue *queues, PTO2ResourceShape shape, int32_t thread_idx, PTO2TaskSlotState **out, int max_count
+    );
 
     void build_payload(
         PTO2DispatchPayload &dispatch_payload, PTO2TaskSlotState &slot_state, PTO2SubtaskSlot subslot,
@@ -262,8 +264,8 @@ private:
     );
 
     void dispatch_shape(
-        int32_t thread_idx, PTO2ResourceShape shape, CoreTracker::DispatchPhase phase, CoreTracker &tracker,
-        bool &entered_drain, bool &made_progress, bool &try_pushed
+        int32_t thread_idx, PTO2ReadyQueue *disp_queues, PTO2ResourceShape shape, CoreTracker::DispatchPhase phase,
+        CoreTracker &tracker, bool &entered_drain, bool &made_progress, bool &try_pushed
     );
 
     // Early-dispatch (Hook 1). Mirrors dispatch_ready_tasks: owns its
@@ -334,6 +336,13 @@ private:
     // extra/missed AIC/AIV skip and self-corrects on the next loop iteration.
     bool has_residual_mix() const {
         return sched_->ready_queues[static_cast<int32_t>(PTO2ResourceShape::MIX)].size() > 0;
+    }
+
+    // Tier-0 analog of has_residual_mix for the ready sync_start lane: true if MIX
+    // sync_start cohorts remain queued, so the Tier-0 pass keeps MIX strict priority
+    // over its own AIC/AIV sync work. Same relaxed-size snapshot caveat.
+    bool has_residual_sync_mix() const {
+        return sched_->ready_sync_queues[static_cast<int32_t>(PTO2ResourceShape::MIX)].size() > 0;
     }
 
     // Early-dispatch analog of has_residual_mix: true if MIX early-dispatch candidates
