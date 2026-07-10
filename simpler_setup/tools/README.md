@@ -302,15 +302,42 @@ python -m simpler_setup.tools.deps_viewer outputs/<case>_<ts>/deps.json \
 # Override task labels with a func_id -> name mapping
 python -m simpler_setup.tools.deps_viewer outputs/<case>_<ts>/deps.json \
     --func-names outputs/<case>_<ts>/name_map_TestPA_basic.json
+
+# Transitive reduction: drop edges implied by a longer path, print what was removed
+python -m simpler_setup.tools.deps_viewer outputs/<case>_<ts>/deps.json \
+    --edge-mode reduced
+
+# Redundant-only: draw ONLY the transitively-implied edges reduced would drop
+python -m simpler_setup.tools.deps_viewer outputs/<case>_<ts>/deps.json \
+    --edge-mode omitted
 ```
+
+`--edge-mode` selects which structural `(pred, succ)` edges are drawn:
+
+- `full` (default) — every dependency edge.
+- `reduced` — the minimal (transitively-reduced) edge set: every edge already
+  implied by a longer path is dropped, e.g. `A->C` when `A->B->C` exists.
+- `omitted` — only the redundant edges `reduced` would drop (its complement),
+  for auditing exactly which dependencies are transitively covered.
+
+`reduced` and `omitted` print the redundant edges to stdout as a
+`<task> -> <task>` list, where each task uses the same label as the rendered
+graph — the bare `local` counter when every task is in ring 0, or the explicit
+`(ring, local)` tuple once any task lives in ring >= 1. Both `text` and `html`
+output honor the mode. When `-o` is omitted the graph is written to a
+mode-specific stem (`deps_viewer_reduced.*` / `deps_viewer_omitted.*`) rather
+than `deps_viewer.*` so it never clobbers a full-graph render in the same
+directory. Reduction is purely structural (it ignores the per-edge tensor/arg
+identity) and is skipped with a warning if the graph contains a cycle.
 
 ### Command-Line Options
 
 | Option | Short | Description |
 | ------ | ----- | ----------- |
 | `input` | | Path to `deps.json` (default: newest under `./outputs/`) |
-| `--output` | `-o` | Output path (default: `deps_viewer.txt` for text, `deps_viewer.html` for HTML) |
+| `--output` | `-o` | Output path (default: `deps_viewer.txt` for text, `deps_viewer.html` for HTML; `reduced`/`omitted` use the `deps_viewer_reduced.*` / `deps_viewer_omitted.*` stem) |
 | `--format` | | Output format: `text` (default) or `html` |
+| `--edge-mode` | | `full` (default) draws every edge; `reduced` draws the transitively-reduced (minimal) set; `omitted` draws only the redundant edges reduced would drop. `reduced`/`omitted` print the redundant edges and apply to both formats. |
 | `--engine` | | HTML-only Graphviz layout engine: `dot` (default), `sfdp`, `neato`, `fdp`, `circo`, `twopi` |
 | `--direction` | | HTML-only flow direction for hierarchical layouts: `LR` (default) / `TB` / `BT` / `RL` |
 | `--show-tensor-info` | | HTML-only: render per-task tensor rows and route edges to specific arg ports |
