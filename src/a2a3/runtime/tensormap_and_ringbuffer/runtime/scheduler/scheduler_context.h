@@ -311,6 +311,16 @@ private:
         int32_t thread_idx, CoreTracker &tracker, bool pmu_active, bool &made_progress, bool &try_pushed
     );
 
+    // Shared staging order for both dispatch sources (normal ready + speculative early):
+    // MIX strict priority, IDLE stage before PENDING stage, cross-thread idle gating
+    // (MIX-IDLE ▶ c/v-IDLE ▶ MIX-PEND ▶ c/v-PEND). `stage(shape, phase)` stages that
+    // shape+phase bucket for the source and returns true to STOP the pass (normal returns
+    // true when it enters drain mode; early always returns false). `residual_mix()` reports
+    // whether MIX work remains queued for the source (normal reads ready_queues[MIX], early
+    // reads early_dispatch_queues[MIX]). IDLE runs under PMU; PENDING is withheld under PMU.
+    template <typename StageFn, typename ResidualMixFn>
+    void run_staging_order(int32_t thread_idx, bool pmu_active, StageFn &&stage, ResidualMixFn &&residual_mix);
+
     // Returns true if any *other* scheduler thread currently has an idle core
     // matching `shape`. Used as a scheduling hint on the PENDING dispatch path
     // — see the implementation in scheduler_dispatch.cpp for the hint-semantics
