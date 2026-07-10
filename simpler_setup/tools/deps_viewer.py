@@ -34,7 +34,7 @@ Usage:
     python -m simpler_setup.tools.deps_viewer DEPS_JSON --edge-mode reduced
     python -m simpler_setup.tools.deps_viewer DEPS_JSON --edge-mode omitted
 
-``--edge-mode`` selects which edges are drawn (structural transitive reduction,
+``--edge-mode`` selects which edges are visible (structural transitive reduction,
 purely on ``(pred, succ)`` — per-edge tensor identity is ignored, and it is
 skipped with a warning if the graph contains a cycle):
 
@@ -44,8 +44,10 @@ skipped with a warning if the graph contains a cycle):
 - ``omitted`` — only the redundant edges ``reduced`` would drop (its complement),
   useful for auditing exactly which dependencies are transitively covered.
 
-``reduced`` and ``omitted`` print the redundant edges to stdout and emit in
-whichever format is selected.
+``reduced`` and ``omitted`` print the redundant edges to stdout. Text output
+emits only the selected edge set. HTML output keeps every edge in the Graphviz
+layout and colors the unselected edges like the page background, preserving the
+full-graph layout while making the selected edge set visible.
 
 HTML output requires Graphviz installed (``brew install graphviz`` /
 ``apt install graphviz``). Text output does not.
@@ -733,6 +735,7 @@ def emit_dot(
     tensor_table=None,
     task_table=None,
     show_tensor_info=None,
+    hidden_edges=None,
 ):
     """Graphviz DOT source. Used internally to feed the layout engine before
     wrapping the SVG in HTML.
@@ -752,6 +755,7 @@ def emit_dot(
     annotations = annotations or {}
     tensor_table = tensor_table or {}
     task_table = task_table or {}
+    hidden_edges = set(hidden_edges or ())
     show_tensor = bool(task_table) if show_tensor_info is None else bool(show_tensor_info and task_table)
     lines = [
         "digraph deps {",
@@ -767,13 +771,22 @@ def emit_dot(
             lines.append(f"  {_node_id(n)} [shape=none, margin=0, label=<{html}>];")
             continue
         lines.append(f"  {_node_id(n)} [{_plain_node_attrs(n, meta, task_table, fmt_task)}];")
+
+    def edge_attr_str(edge_attrs):
+        return (" [" + ", ".join(edge_attrs) + "]") if edge_attrs else ""
+
+    def hidden_edge_attrs():
+        return ['color="#eef2f7"', 'fontcolor="#eef2f7"']
+
     for pred, succ in edges:
+        hidden = (pred, succ) in hidden_edges
+        hidden_attrs = hidden_edge_attrs() if hidden else []
         if not show_tensor:
-            lines.append(f"  {_node_id(pred)} -> {_node_id(succ)};")
+            lines.append(f"  {_node_id(pred)} -> {_node_id(succ)}{edge_attr_str(hidden_attrs)};")
             continue
         rows = annotations.get((pred, succ), [])
         if not rows:
-            lines.append(f"  {_node_id(pred)} -> {_node_id(succ)};")
+            lines.append(f"  {_node_id(pred)} -> {_node_id(succ)}{edge_attr_str(hidden_attrs)};")
             continue
         for row in rows:
             arg = row.get("arg")
@@ -782,19 +795,21 @@ def emit_dot(
             tail = ""
             head = ""
             edge_attrs = []
+            if hidden:
+                edge_attrs.extend(hidden_edge_attrs())
             arg_idx = _normalize_small_int(arg)
             if arg_idx is not None and arg_idx >= 0:
                 head = f":in_{arg_idx}:w"
             out_port = _producer_output_port(task_table.get(pred), tid)
             if out_port:
                 tail = f":{out_port}:e"
-            if source == "explicit":
+            if source == "explicit" and not hidden:
                 edge_attrs.append('style="dashed"')
                 edge_attrs.append('color="#B0B0B0"')
             overlap = row.get("overlap")
-            if overlap and overlap != "covered":
+            if overlap and overlap != "covered" and not hidden:
                 edge_attrs.append(f'label="{_html_escape(overlap)}", fontsize=8, fontcolor="#C04040"')
-            attr_str = (" [" + ", ".join(edge_attrs) + "]") if edge_attrs else ""
+            attr_str = edge_attr_str(edge_attrs)
             lines.append(f"  {_node_id(pred)}{tail} -> {_node_id(succ)}{head}{attr_str};")
     lines.append("}")
     return "\n".join(lines) + "\n"
@@ -1027,8 +1042,14 @@ def emit_html(
     tensor_table=None,
     task_table=None,
     show_tensor_info=None,
+    html_edge_style=None,
 ):
     """Build the pan/zoom HTML page: DOT → Graphviz SVG → inline into template."""
+    html_edge_style = html_edge_style or {}
+    hidden_edges = html_edge_style.get("hidden_edges")
+    visible_edge_count = html_edge_style.get("visible_edge_count")
+    if visible_edge_count is None:
+        visible_edge_count = len(edges)
     dot = emit_dot(
         edges,
         nodes,
@@ -1038,6 +1059,7 @@ def emit_html(
         tensor_table=tensor_table,
         task_table=task_table,
         show_tensor_info=show_tensor_info,
+        hidden_edges=hidden_edges,
     )
     svg_bytes = render_svg(dot, engine=engine)
     svg_text = svg_bytes.decode("utf-8", errors="replace")
@@ -1045,7 +1067,7 @@ def emit_html(
         svg_text = svg_text[svg_text.index("<svg") :]
     return _HTML_TEMPLATE.format(
         n_nodes=len(nodes),
-        n_edges=len(edges),
+        n_edges=visible_edge_count,
         svg_body=svg_text,
         spmd_badges_json=_spmd_badges_json(nodes, task_table),
     )
@@ -1094,8 +1116,8 @@ Examples:
   %(prog)s deps.json --format text -o graph.txt
   %(prog)s deps.json --format html --engine sfdp
   %(prog)s deps.json --format html --show-tensor-info
-  %(prog)s deps.json --edge-mode reduced      # drop transitively-implied edges, print what was removed
-  %(prog)s deps.json --edge-mode omitted      # draw ONLY the transitively-implied (redundant) edges
+  %(prog)s deps.json --edge-mode reduced      # select non-redundant edges, print what was removed
+  %(prog)s deps.json --edge-mode omitted      # select transitively-implied (redundant) edges
 """,
     )
     p.add_argument("input", nargs="?", help="Path to deps.json (default: newest under ./outputs/).")
@@ -1111,10 +1133,11 @@ Examples:
         choices=["full", "reduced", "omitted"],
         default="full",
         help=(
-            "full (default) draws every dependency edge; reduced applies transitive reduction, keeping the "
-            "minimal edge set; omitted keeps only the redundant edges reduced would drop (the complement of "
+            "full (default) selects every dependency edge; reduced applies transitive reduction, selecting the "
+            "minimal edge set; omitted selects only the redundant edges reduced would drop (the complement of "
             "reduced). reduced/omitted print the redundant edges to stdout, are structural (pred,succ) level, "
-            "apply to both text and html, and are skipped with a warning on a cyclic graph."
+            "apply to both text and html, and are skipped with a warning on a cyclic graph. In html, all edges "
+            "still participate in layout; unselected edges are colored as background."
         ),
     )
     p.add_argument(
@@ -1184,6 +1207,8 @@ def main(argv=None):
         nodes = sorted(set(nodes) | set(meta.keys()), key=_sort_task_id_key)
 
     mode_stem = "deps_viewer"
+    hidden_html_edges = set()
+    visible_html_edge_count = len(edges)
     if args.edge_mode in ("reduced", "omitted"):
         kept, removed, is_dag = _transitive_reduction(edges, nodes)
         if not is_dag:
@@ -1205,12 +1230,20 @@ def main(argv=None):
                 print(f"Redundant edges only: showing {len(removed)} redundant edge(s) of {len(edges)}")
             for u, v in removed:
                 print(f"  - {fmt_task(u)} -> {fmt_task(v)}")
-            edges = shown
-            # Keep only the annotations of the shown edges so annotated-edge
-            # counts (emit_text summary, the final print) stay consistent with
-            # the rendered edge set instead of counting the hidden ones.
-            shown_set = set(shown)
-            annotations = {k: v for k, v in annotations.items() if k in shown_set}
+            if args.format == "html":
+                hidden_html_edges = set(removed if args.edge_mode == "reduced" else kept)
+                visible_html_edge_count = len(shown)
+                print(
+                    f"HTML layout preserves all {len(edges)} edge(s); "
+                    f"{len(hidden_html_edges)} unselected edge(s) are colored as background"
+                )
+            else:
+                edges = shown
+                # Keep only the annotations of the shown edges so annotated-edge
+                # counts (emit_text summary, the final print) stay consistent with
+                # the rendered edge set instead of counting the hidden ones.
+                shown_set = set(shown)
+                annotations = {k: v for k, v in annotations.items() if k in shown_set}
             mode_stem = f"deps_viewer_{args.edge_mode}"
 
     out = (
@@ -1247,9 +1280,19 @@ def main(argv=None):
         tensor_table=tensor_table,
         task_table=task_table,
         show_tensor_info=args.show_tensor_info,
+        html_edge_style={
+            "hidden_edges": hidden_html_edges,
+            "visible_edge_count": visible_html_edge_count,
+        },
     )
     out.write_text(html)
-    print(f"Wrote {out} ({len(nodes)} nodes, {len(edges)} edges, engine={args.engine}, format=html)")
+    if hidden_html_edges:
+        print(
+            f"Wrote {out} ({len(nodes)} nodes, {visible_html_edge_count} visible edges, "
+            f"{len(edges)} layout edges, engine={args.engine}, format=html)"
+        )
+    else:
+        print(f"Wrote {out} ({len(nodes)} nodes, {len(edges)} edges, engine={args.engine}, format=html)")
     return 0
 
 

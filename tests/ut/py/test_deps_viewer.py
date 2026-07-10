@@ -243,6 +243,19 @@ def test_emit_dot_handles_missing_task_table():
     assert 'label="1 · alloc"' in dot
 
 
+def test_emit_dot_hides_selected_edges_with_background_color():
+    dot = deps_viewer.emit_dot(
+        edges=[(1, 2), (2, 3)],
+        nodes=[1, 2, 3],
+        meta={},
+        task_table=None,
+        hidden_edges={(1, 2)},
+    )
+
+    assert 'T0_1 -> T0_2 [color="#eef2f7", fontcolor="#eef2f7"];' in dot
+    assert "T0_2 -> T0_3;" in dot
+
+
 def test_emit_html_default_preserves_task_table_rendering(monkeypatch):
     captured = {}
 
@@ -285,17 +298,9 @@ def test_main_passes_task_table_when_show_tensor_info_enabled(tmp_path, monkeypa
 
     captured = {}
 
-    def fake_emit_html(
-        edges,
-        nodes,
-        meta,
-        direction="LR",
-        engine="dot",
-        annotations=None,
-        tensor_table=None,
-        task_table=None,
-        show_tensor_info=False,
-    ):
+    def fake_emit_html(*args, **kwargs):
+        task_table = kwargs["task_table"]
+        show_tensor_info = kwargs["show_tensor_info"]
         captured["task_table"] = task_table
         captured["show_tensor_info"] = show_tensor_info
         return "<html></html>"
@@ -329,17 +334,9 @@ def test_main_keeps_task_metadata_when_show_tensor_info_disabled(tmp_path, monke
 
     captured = {}
 
-    def fake_emit_html(
-        edges,
-        nodes,
-        meta,
-        direction="LR",
-        engine="dot",
-        annotations=None,
-        tensor_table=None,
-        task_table=None,
-        show_tensor_info=False,
-    ):
+    def fake_emit_html(*args, **kwargs):
+        task_table = kwargs["task_table"]
+        show_tensor_info = kwargs["show_tensor_info"]
         captured["task_table"] = task_table
         captured["show_tensor_info"] = show_tensor_info
         return "<html></html>"
@@ -351,14 +348,6 @@ def test_main_keeps_task_metadata_when_show_tensor_info_disabled(tmp_path, monke
     assert rc == 0
     assert captured["task_table"] == {1: {"task_id": 1, "args": []}}
     assert captured["show_tensor_info"] is False
-
-
-def test_transitive_reduction_removes_implied_edge():
-    # A->B->C plus the implied shortcut A->C.
-    kept, removed, is_dag = deps_viewer._transitive_reduction([(1, 2), (1, 3), (2, 3)], [1, 2, 3])
-    assert is_dag
-    assert removed == [(1, 3)]
-    assert kept == [(1, 2), (2, 3)]
 
 
 def test_transitive_reduction_keeps_non_redundant_diamond():
@@ -428,6 +417,53 @@ def test_main_full_mode_keeps_all_edges(tmp_path, capsys):
     assert rc == 0
     assert "unique_task_edges: 3" in out.read_text()
     assert "Transitive reduction" not in capsys.readouterr().out
+
+
+def test_main_html_edge_modes_keep_full_layout_and_hide_unselected_edges(tmp_path, monkeypatch):
+    ring = 1 << 32
+    a, b, c = ring + 1, ring + 2, ring + 3
+    all_edges = [(a, b), (b, c), (a, c)]
+    deps_path = _write_deps_edges(tmp_path, all_edges)
+    captures = []
+
+    def fake_emit_html(edges, _nodes, _meta, **kwargs):
+        html_edge_style = kwargs["html_edge_style"]
+        captures.append(
+            {
+                "edges": edges,
+                "annotations": kwargs["annotations"],
+                "hidden_edges": html_edge_style["hidden_edges"],
+                "visible_edge_count": html_edge_style["visible_edge_count"],
+            }
+        )
+        return "<html></html>"
+
+    monkeypatch.setattr(deps_viewer, "emit_html", fake_emit_html)
+
+    cases = [
+        ("reduced", {(a, c)}, 2),
+        ("omitted", {(a, b), (b, c)}, 1),
+    ]
+    for mode, expected_hidden, expected_visible_count in cases:
+        rc = deps_viewer.main(
+            [
+                str(deps_path),
+                "--format",
+                "html",
+                "--edge-mode",
+                mode,
+                "-o",
+                str(tmp_path / f"{mode}.html"),
+            ]
+        )
+        assert rc == 0
+
+    assert len(captures) == len(cases)
+    for captured, (_mode, expected_hidden, expected_visible_count) in zip(captures, cases):
+        assert captured["edges"] == sorted(all_edges)
+        assert set(captured["annotations"]) == set(all_edges)
+        assert captured["hidden_edges"] == expected_hidden
+        assert captured["visible_edge_count"] == expected_visible_count
 
 
 def test_main_omitted_mode_draws_only_redundant_edges(tmp_path, capsys):
