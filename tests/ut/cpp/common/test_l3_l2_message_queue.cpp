@@ -42,9 +42,9 @@ size_t counter_index(uint64_t offset) { return static_cast<size_t>(offset / size
 
 L3L2QueueArgs make_args(uint64_t depth, uint64_t input_arena_bytes, uint64_t output_arena_bytes) {
     L3L2QueueLayout layout{};
-    EXPECT_TRUE(l3_l2_queue_make_layout(depth, input_arena_bytes, output_arena_bytes, &layout));
+    EXPECT_TRUE(l3_l2_queue_make_layout(depth, input_arena_bytes, output_arena_bytes, layout));
     return L3L2QueueArgs{
-        l3_l2_queue_magic_version(), depth, input_arena_bytes, output_arena_bytes, layout.payload_bytes,
+        L3L2_QUEUE_MAGIC_VERSION, depth, input_arena_bytes, output_arena_bytes, layout.payload_bytes,
         layout.counter_bytes,
     };
 }
@@ -64,10 +64,19 @@ void publish_input_desc(
     storage->counters[counter_index(layout.input_desc_tail_offset)] = static_cast<int32_t>(seq);
 }
 
+TEST(L3L2MessageQueueTest, MagicVersionConstantMatchesCompatibilityWrapper) {
+    EXPECT_EQ(
+        L3L2_QUEUE_MAGIC_VERSION,
+        l3_l2_orch_comm_pack_magic_version(L3L2_QUEUE_MAGIC, L3L2_QUEUE_ABI_MAJOR, L3L2_QUEUE_ABI_MINOR)
+    );
+    EXPECT_EQ(l3_l2_queue_magic_version(), L3L2_QUEUE_MAGIC_VERSION);
+    EXPECT_EQ(l3_l2_message_queue::magic_version(), L3L2_QUEUE_MAGIC_VERSION);
+}
+
 TEST(L3L2MessageQueueTest, LayoutAssignsPayloadAndAbortCounterOffsets) {
     L3L2QueueLayout layout{};
 
-    ASSERT_TRUE(l3_l2_queue_make_layout(4, 128, 192, &layout));
+    ASSERT_TRUE(l3_l2_queue_make_layout(4, 128, 192, layout));
 
     EXPECT_EQ(layout.input_desc_offset, 0u);
     EXPECT_EQ(layout.output_desc_offset, 4u * sizeof(L3L2QueueDescSlot));
@@ -103,7 +112,7 @@ TEST(L3L2MessageQueueTest, LayoutLockstepCasesMatchPythonMirrorExpectations) {
     for (const auto &test_case : cases) {
         L3L2QueueLayout layout{};
         ASSERT_TRUE(
-            l3_l2_queue_make_layout(test_case.depth, test_case.input_arena_bytes, test_case.output_arena_bytes, &layout)
+            l3_l2_queue_make_layout(test_case.depth, test_case.input_arena_bytes, test_case.output_arena_bytes, layout)
         );
 
         EXPECT_EQ(layout.input_desc_offset, 0u);
@@ -125,10 +134,10 @@ TEST(L3L2MessageQueueTest, LayoutLockstepCasesMatchPythonMirrorExpectations) {
 TEST(L3L2MessageQueueTest, LayoutRejectsInvalidDepthArenaAndCounterBytes) {
     L3L2QueueLayout layout{};
 
-    EXPECT_FALSE(l3_l2_queue_make_layout(3, 64, 64, &layout));
-    EXPECT_FALSE(l3_l2_queue_make_layout((1ull << 30) + 1, 64, 64, &layout));
-    EXPECT_FALSE(l3_l2_queue_make_layout(2, 0, 64, &layout));
-    EXPECT_FALSE(l3_l2_queue_make_layout(2, 65, 64, &layout));
+    EXPECT_FALSE(l3_l2_queue_make_layout(3, 64, 64, layout));
+    EXPECT_FALSE(l3_l2_queue_make_layout((1ull << 30) + 1, 64, 64, layout));
+    EXPECT_FALSE(l3_l2_queue_make_layout(2, 0, 64, layout));
+    EXPECT_FALSE(l3_l2_queue_make_layout(2, 65, 64, layout));
 
     RegionStorage storage{};
     L3L2QueueArgs args = make_args(2, 64, 64);
@@ -143,7 +152,7 @@ TEST(L3L2MessageQueueTest, LayoutOverflowFailsClosedWithoutModifyingOutput) {
     };
     const L3L2QueueLayout original = layout;
 
-    EXPECT_FALSE(l3_l2_queue_make_layout(2, std::numeric_limits<uint64_t>::max() - 63, 64, &layout));
+    EXPECT_FALSE(l3_l2_queue_make_layout(2, std::numeric_limits<uint64_t>::max() - 63, 64, layout));
 
     EXPECT_EQ(layout.depth, original.depth);
     EXPECT_EQ(layout.input_desc_offset, original.input_desc_offset);
@@ -202,22 +211,22 @@ TEST(L3L2MessageQueueTest, ErrorOperationStringsAndMessageCopyAreStable) {
 TEST(L3L2MessageQueueTest, Low32ReconstructionAcceptsWrapAndRejectsImpossibleDeltas) {
     uint64_t value = 0xFFFF'FFFFull;
 
-    EXPECT_TRUE(l3_l2_queue_reconstruct_counter(0, 4, &value));
+    EXPECT_TRUE(l3_l2_queue_reconstruct_counter(0, 4, value));
     EXPECT_EQ(value, 0x1'0000'0000ull);
 
     value = (1ull << 31) - 2;
-    EXPECT_TRUE(l3_l2_queue_reconstruct_counter(static_cast<int32_t>(0x8000'0001u), 4, &value));
+    EXPECT_TRUE(l3_l2_queue_reconstruct_counter(static_cast<int32_t>(0x8000'0001u), 4, value));
     EXPECT_EQ(value, (1ull << 31) + 1);
 
     value = 100;
-    EXPECT_TRUE(l3_l2_queue_reconstruct_counter(104, 4, &value));
+    EXPECT_TRUE(l3_l2_queue_reconstruct_counter(104, 4, value));
     EXPECT_EQ(value, 104u);
 
     value = 100;
-    EXPECT_FALSE(l3_l2_queue_reconstruct_counter(99, 4, &value));
+    EXPECT_FALSE(l3_l2_queue_reconstruct_counter(99, 4, value));
 
     value = 100;
-    EXPECT_FALSE(l3_l2_queue_reconstruct_counter(105, 4, &value));
+    EXPECT_FALSE(l3_l2_queue_reconstruct_counter(105, 4, value));
 }
 
 TEST(L3L2MessageQueueTest, L2InputPeekHandlesZeroByteDescriptorBeforeArenaValidation) {
@@ -232,7 +241,7 @@ TEST(L3L2MessageQueueTest, L2InputPeekHandlesZeroByteDescriptorBeforeArenaValida
     storage.counters[0] = 1;
 
     L3L2QueueInputHandle handle{};
-    ASSERT_TRUE(queue.input().try_peek(&handle)) << queue.error().message;
+    ASSERT_TRUE(queue.input().try_peek(handle)) << queue.error().message;
 
     EXPECT_EQ(handle.seq, 1u);
     EXPECT_EQ(handle.opcode, L3L2QueueOpcode::DATA);
@@ -254,7 +263,7 @@ TEST(L3L2MessageQueueTest, L2InputPeekPoisonsZeroByteDescriptorWithNonzeroOffset
     storage.counters[0] = 1;
 
     L3L2QueueInputHandle handle{};
-    EXPECT_FALSE(queue.input().try_peek(&handle));
+    EXPECT_FALSE(queue.input().try_peek(handle));
 
     EXPECT_EQ(queue.error().kind, L3L2QueueErrorKind::INVALID_DESCRIPTOR);
     EXPECT_EQ(storage.counters[80], 1);
@@ -272,7 +281,7 @@ TEST(L3L2MessageQueueTest, L2InputPeekExposesNonzeroPayloadBytes) {
     );
 
     L3L2QueueInputHandle handle{};
-    ASSERT_TRUE(queue.input().try_peek(&handle)) << queue.error().message;
+    ASSERT_TRUE(queue.input().try_peek(handle)) << queue.error().message;
 
     ASSERT_EQ(handle.payload_nbytes, payload.size());
     const auto *observed = reinterpret_cast<const uint8_t *>(static_cast<uintptr_t>(handle.payload.gm_addr));
@@ -289,12 +298,12 @@ TEST(L3L2MessageQueueTest, L2InputPeekAllowsArenaWrapAtExpectedPayloadHead) {
 
     publish_input_desc(&storage, queue.layout(), 1, L3L2QueueOpcode::DATA, queue.layout().input_arena_offset, 80);
     L3L2QueueInputHandle first{};
-    ASSERT_TRUE(queue.input().try_peek(&first)) << queue.error().message;
+    ASSERT_TRUE(queue.input().try_peek(first)) << queue.error().message;
     ASSERT_TRUE(queue.input().release(first)) << queue.error().message;
 
     publish_input_desc(&storage, queue.layout(), 2, L3L2QueueOpcode::DATA, queue.layout().input_arena_offset, 64);
     L3L2QueueInputHandle second{};
-    ASSERT_TRUE(queue.input().try_peek(&second)) << queue.error().message;
+    ASSERT_TRUE(queue.input().try_peek(second)) << queue.error().message;
 
     EXPECT_EQ(second.payload_offset, queue.layout().input_arena_offset);
     EXPECT_EQ(second.payload_nbytes, 64u);
@@ -310,7 +319,7 @@ TEST(L3L2MessageQueueTest, L2InputPeekRejectsPayloadOffsetMismatchBeforeRelease)
     publish_input_desc(&storage, queue.layout(), 1, L3L2QueueOpcode::DATA, queue.layout().input_arena_offset + 64, 16);
 
     L3L2QueueInputHandle handle{};
-    EXPECT_FALSE(queue.input().try_peek(&handle));
+    EXPECT_FALSE(queue.input().try_peek(handle));
 
     EXPECT_EQ(queue.error().kind, L3L2QueueErrorKind::INVALID_DESCRIPTOR);
     EXPECT_EQ(storage.counters[counter_index(L3L2_QUEUE_INPUT_DESC_HEAD_OFFSET)], 0);
@@ -324,7 +333,7 @@ TEST(L3L2MessageQueueTest, L2OutputReservePublishWritesDescriptorAndTail) {
     ASSERT_EQ(queue.error().kind, L3L2QueueErrorKind::NONE) << queue.error().message;
 
     L3L2QueueOutputReservation reservation{};
-    ASSERT_TRUE(queue.output().try_reserve(16, &reservation)) << queue.error().message;
+    ASSERT_TRUE(queue.output().try_reserve(16, reservation)) << queue.error().message;
     EXPECT_EQ(reservation.payload_nbytes, 16u);
     EXPECT_NE(reservation.payload.gm_addr, 0u);
 
@@ -345,13 +354,13 @@ TEST(L3L2MessageQueueTest, L2OutputReserveReplaysReleasedDescriptorsBeforeReusin
     ASSERT_EQ(queue.error().kind, L3L2QueueErrorKind::NONE) << queue.error().message;
 
     L3L2QueueOutputReservation first{};
-    ASSERT_TRUE(queue.output().try_reserve(80, &first)) << queue.error().message;
+    ASSERT_TRUE(queue.output().try_reserve(80, first)) << queue.error().message;
     ASSERT_EQ(first.payload_offset, queue.layout().output_arena_offset);
     ASSERT_TRUE(queue.output().publish(first, L3L2QueueOpcode::DATA)) << queue.error().message;
 
     storage.counters[48] = 1;
     L3L2QueueOutputReservation second{};
-    ASSERT_TRUE(queue.output().try_reserve(80, &second)) << queue.error().message;
+    ASSERT_TRUE(queue.output().try_reserve(80, second)) << queue.error().message;
 
     EXPECT_EQ(second.payload_offset, queue.layout().output_arena_offset);
 }
@@ -389,11 +398,11 @@ TEST(L3L2MessageQueueTest, OutputCapacityEqualsDepthAndFullIsNoProgressWithoutAb
 
     for (int i = 0; i < 2; ++i) {
         L3L2QueueOutputReservation reservation{};
-        ASSERT_TRUE(queue.output().try_reserve(0, &reservation)) << queue.error().message;
+        ASSERT_TRUE(queue.output().try_reserve(0, reservation)) << queue.error().message;
         ASSERT_TRUE(queue.output().publish(reservation, L3L2QueueOpcode::DATA)) << queue.error().message;
     }
     L3L2QueueOutputReservation third{};
-    EXPECT_FALSE(queue.output().try_reserve(0, &third));
+    EXPECT_FALSE(queue.output().try_reserve(0, third));
 
     EXPECT_EQ(queue.error().kind, L3L2QueueErrorKind::NONE);
     EXPECT_EQ(storage.counters[counter_index(L3L2_QUEUE_OUTPUT_DESC_TAIL_OFFSET)], 2);
@@ -408,13 +417,13 @@ TEST(L3L2MessageQueueTest, FullAndEmptyUseMonotonicCountersNotMaskedIndices) {
 
     for (int i = 0; i < 2; ++i) {
         L3L2QueueOutputReservation reservation{};
-        ASSERT_TRUE(queue.output().try_reserve(0, &reservation)) << queue.error().message;
+        ASSERT_TRUE(queue.output().try_reserve(0, reservation)) << queue.error().message;
         ASSERT_TRUE(queue.output().publish(reservation, L3L2QueueOpcode::DATA)) << queue.error().message;
     }
     storage.counters[counter_index(L3L2_QUEUE_OUTPUT_DESC_HEAD_OFFSET)] = 1;
 
     L3L2QueueOutputReservation third{};
-    ASSERT_TRUE(queue.output().try_reserve(0, &third)) << queue.error().message;
+    ASSERT_TRUE(queue.output().try_reserve(0, third)) << queue.error().message;
     ASSERT_TRUE(queue.output().publish(third, L3L2QueueOpcode::DATA)) << queue.error().message;
 
     EXPECT_EQ(third.seq, 3u);
@@ -430,7 +439,7 @@ TEST(L3L2MessageQueueTest, OutputReserveTooLargeIsPreMutationNoProgressWithoutAb
     ASSERT_EQ(queue.error().kind, L3L2QueueErrorKind::NONE) << queue.error().message;
 
     L3L2QueueOutputReservation reservation{};
-    EXPECT_FALSE(queue.output().try_reserve(65, &reservation));
+    EXPECT_FALSE(queue.output().try_reserve(65, reservation));
 
     EXPECT_EQ(queue.error().kind, L3L2QueueErrorKind::NONE);
     EXPECT_EQ(storage.counters[counter_index(L3L2_QUEUE_OUTPUT_DESC_TAIL_OFFSET)], 0);
@@ -444,7 +453,7 @@ TEST(L3L2MessageQueueTest, OutputPublishApplicationErrorDoesNotSetAbortFlag) {
     ASSERT_EQ(queue.error().kind, L3L2QueueErrorKind::NONE) << queue.error().message;
 
     L3L2QueueOutputReservation reservation{};
-    ASSERT_TRUE(queue.output().try_reserve(0, &reservation)) << queue.error().message;
+    ASSERT_TRUE(queue.output().try_reserve(0, reservation)) << queue.error().message;
     ASSERT_TRUE(queue.output().publish(reservation, L3L2QueueOpcode::ERROR)) << queue.error().message;
 
     L3L2QueueDescSlot slot{};
@@ -461,7 +470,7 @@ TEST(L3L2MessageQueueTest, OutputPublishStaleReservationPoisonsAndSetsOwnAbortFl
     ASSERT_EQ(queue.error().kind, L3L2QueueErrorKind::NONE) << queue.error().message;
 
     L3L2QueueOutputReservation reservation{};
-    ASSERT_TRUE(queue.output().try_reserve(0, &reservation)) << queue.error().message;
+    ASSERT_TRUE(queue.output().try_reserve(0, reservation)) << queue.error().message;
     ASSERT_TRUE(queue.output().publish(reservation, L3L2QueueOpcode::DATA)) << queue.error().message;
     EXPECT_FALSE(queue.output().publish(reservation, L3L2QueueOpcode::DATA));
 
@@ -477,7 +486,7 @@ TEST(L3L2MessageQueueTest, InputApplicationErrorIsNormalMessageAndDoesNotSetAbor
     publish_input_desc(&storage, queue.layout(), 1, L3L2QueueOpcode::ERROR);
 
     L3L2QueueInputHandle handle{};
-    ASSERT_TRUE(queue.input().try_peek(&handle)) << queue.error().message;
+    ASSERT_TRUE(queue.input().try_peek(handle)) << queue.error().message;
     EXPECT_EQ(handle.opcode, L3L2QueueOpcode::ERROR);
     ASSERT_TRUE(queue.input().release(handle)) << queue.error().message;
 
@@ -493,7 +502,7 @@ TEST(L3L2MessageQueueTest, InputReleaseRejectsCallerMutatedHandleMetadata) {
     publish_input_desc(&storage, queue.layout(), 1, L3L2QueueOpcode::DATA, queue.layout().input_arena_offset, 16);
 
     L3L2QueueInputHandle handle{};
-    ASSERT_TRUE(queue.input().try_peek(&handle)) << queue.error().message;
+    ASSERT_TRUE(queue.input().try_peek(handle)) << queue.error().message;
     handle.payload_nbytes = 0;
 
     EXPECT_FALSE(queue.input().release(handle));
@@ -511,12 +520,12 @@ TEST(L3L2MessageQueueTest, InputStopReleaseRejectsLaterPublishedInputAsInvalidSt
     publish_input_desc(&storage, queue.layout(), 1, L3L2QueueOpcode::STOP);
 
     L3L2QueueInputHandle stop{};
-    ASSERT_TRUE(queue.input().try_peek(&stop)) << queue.error().message;
+    ASSERT_TRUE(queue.input().try_peek(stop)) << queue.error().message;
     ASSERT_TRUE(queue.input().release(stop)) << queue.error().message;
 
     publish_input_desc(&storage, queue.layout(), 2, L3L2QueueOpcode::DATA);
     L3L2QueueInputHandle later{};
-    EXPECT_FALSE(queue.input().try_peek(&later));
+    EXPECT_FALSE(queue.input().try_peek(later));
 
     EXPECT_EQ(queue.error().kind, L3L2QueueErrorKind::INVALID_DESCRIPTOR);
     EXPECT_EQ(storage.counters[counter_index(L3L2_QUEUE_L2_ABORT_FLAG_OFFSET)], 1);
@@ -530,22 +539,10 @@ TEST(L3L2MessageQueueTest, InputStopWithPayloadMetadataPoisonsAndSetsOwnAbortFla
     publish_input_desc(&storage, queue.layout(), 1, L3L2QueueOpcode::STOP, queue.layout().input_arena_offset, 8);
 
     L3L2QueueInputHandle handle{};
-    EXPECT_FALSE(queue.input().try_peek(&handle));
+    EXPECT_FALSE(queue.input().try_peek(handle));
 
     EXPECT_EQ(queue.error().kind, L3L2QueueErrorKind::INVALID_DESCRIPTOR);
     EXPECT_EQ(storage.counters[counter_index(L3L2_QUEUE_L2_ABORT_FLAG_OFFSET)], 1);
-}
-
-TEST(L3L2MessageQueueTest, NullInputPeekOutputIsPreMutationRejectionWithoutAbort) {
-    RegionStorage storage{};
-    L3L2QueueArgs args = make_args(2, 64, 64);
-    L3L2QueueEndpoint<> queue(make_desc(&storage, args), args);
-    ASSERT_EQ(queue.error().kind, L3L2QueueErrorKind::NONE) << queue.error().message;
-
-    EXPECT_FALSE(queue.input().try_peek(nullptr));
-
-    EXPECT_EQ(queue.error().kind, L3L2QueueErrorKind::NONE);
-    EXPECT_EQ(storage.counters[counter_index(L3L2_QUEUE_L2_ABORT_FLAG_OFFSET)], 0);
 }
 
 TEST(L3L2MessageQueueTest, InputSecondPeekBeforeReleasePoisonsOwnershipAndSetsOwnAbortFlag) {
@@ -556,9 +553,9 @@ TEST(L3L2MessageQueueTest, InputSecondPeekBeforeReleasePoisonsOwnershipAndSetsOw
     publish_input_desc(&storage, queue.layout(), 1, L3L2QueueOpcode::DATA);
 
     L3L2QueueInputHandle handle{};
-    ASSERT_TRUE(queue.input().try_peek(&handle)) << queue.error().message;
+    ASSERT_TRUE(queue.input().try_peek(handle)) << queue.error().message;
     L3L2QueueInputHandle second{};
-    EXPECT_FALSE(queue.input().try_peek(&second));
+    EXPECT_FALSE(queue.input().try_peek(second));
 
     EXPECT_EQ(queue.error().kind, L3L2QueueErrorKind::OWNERSHIP);
     EXPECT_EQ(queue.error().op, L3L2QueueOp::INPUT_TRY_PEEK);
@@ -588,9 +585,9 @@ TEST(L3L2MessageQueueTest, MultiInflightAcquireAllowsSeveralDataInputs) {
     L3L2QueueInputHandle first{};
     L3L2QueueInputHandle second{};
     L3L2QueueInputHandle third{};
-    EXPECT_TRUE(queue.input().try_peek(&first)) << queue.error().message;
-    EXPECT_TRUE(queue.input().try_peek(&second)) << queue.error().message;
-    EXPECT_TRUE(queue.input().try_peek(&third)) << queue.error().message;
+    EXPECT_TRUE(queue.input().try_peek(first)) << queue.error().message;
+    EXPECT_TRUE(queue.input().try_peek(second)) << queue.error().message;
+    EXPECT_TRUE(queue.input().try_peek(third)) << queue.error().message;
 
     EXPECT_EQ(first.seq, 1u);
     EXPECT_EQ(second.seq, 2u);
@@ -611,8 +608,8 @@ TEST(L3L2MessageQueueTest, MultiInflightAcquireAllowsNonZeroPayloadOffsetsBefore
 
     L3L2QueueInputHandle first{};
     L3L2QueueInputHandle second{};
-    ASSERT_TRUE(queue.input().try_peek(&first)) << queue.error().message;
-    ASSERT_TRUE(queue.input().try_peek(&second)) << queue.error().message;
+    ASSERT_TRUE(queue.input().try_peek(first)) << queue.error().message;
+    ASSERT_TRUE(queue.input().try_peek(second)) << queue.error().message;
 
     EXPECT_EQ(first.payload_offset, first_offset);
     EXPECT_EQ(first.payload_nbytes, 16u);
@@ -634,9 +631,9 @@ TEST(L3L2MessageQueueTest, ErrorCountsAgainstInputWindowAndFullDoesNotPoison) {
     L3L2QueueInputHandle first{};
     L3L2QueueInputHandle second{};
     L3L2QueueInputHandle third{};
-    ASSERT_TRUE(queue.input().try_peek(&first)) << queue.error().message;
-    ASSERT_TRUE(queue.input().try_peek(&second)) << queue.error().message;
-    EXPECT_FALSE(queue.input().try_peek(&third));
+    ASSERT_TRUE(queue.input().try_peek(first)) << queue.error().message;
+    ASSERT_TRUE(queue.input().try_peek(second)) << queue.error().message;
+    EXPECT_FALSE(queue.input().try_peek(third));
 
     EXPECT_EQ(queue.error().kind, L3L2QueueErrorKind::NONE);
     EXPECT_EQ(storage.counters[counter_index(L3L2_QUEUE_INPUT_DESC_HEAD_OFFSET)], 0);
@@ -655,9 +652,9 @@ TEST(L3L2MessageQueueTest, OutOfOrderInputReleaseOnlyAdvancesCompletedFifoPrefix
     L3L2QueueInputHandle first{};
     L3L2QueueInputHandle second{};
     L3L2QueueInputHandle third{};
-    ASSERT_TRUE(queue.input().try_peek(&first)) << queue.error().message;
-    ASSERT_TRUE(queue.input().try_peek(&second)) << queue.error().message;
-    ASSERT_TRUE(queue.input().try_peek(&third)) << queue.error().message;
+    ASSERT_TRUE(queue.input().try_peek(first)) << queue.error().message;
+    ASSERT_TRUE(queue.input().try_peek(second)) << queue.error().message;
+    ASSERT_TRUE(queue.input().try_peek(third)) << queue.error().message;
 
     ASSERT_TRUE(queue.input().release(second)) << queue.error().message;
     EXPECT_EQ(storage.counters[counter_index(L3L2_QUEUE_INPUT_DESC_HEAD_OFFSET)], 0);
@@ -682,9 +679,9 @@ TEST(L3L2MessageQueueTest, RingWrapReleaseKeepsLogicalFifoOrder) {
     L3L2QueueInputHandle first{};
     L3L2QueueInputHandle second{};
     L3L2QueueInputHandle third{};
-    ASSERT_TRUE(queue.input().try_peek(&first)) << queue.error().message;
-    ASSERT_TRUE(queue.input().try_peek(&second)) << queue.error().message;
-    ASSERT_TRUE(queue.input().try_peek(&third)) << queue.error().message;
+    ASSERT_TRUE(queue.input().try_peek(first)) << queue.error().message;
+    ASSERT_TRUE(queue.input().try_peek(second)) << queue.error().message;
+    ASSERT_TRUE(queue.input().try_peek(third)) << queue.error().message;
     ASSERT_TRUE(queue.input().release(first)) << queue.error().message;
     ASSERT_TRUE(queue.input().release(second)) << queue.error().message;
     ASSERT_TRUE(queue.input().release(third)) << queue.error().message;
@@ -697,9 +694,9 @@ TEST(L3L2MessageQueueTest, RingWrapReleaseKeepsLogicalFifoOrder) {
     L3L2QueueInputHandle fourth{};
     L3L2QueueInputHandle fifth{};
     L3L2QueueInputHandle sixth{};
-    ASSERT_TRUE(queue.input().try_peek(&fourth)) << queue.error().message;
-    ASSERT_TRUE(queue.input().try_peek(&fifth)) << queue.error().message;
-    ASSERT_TRUE(queue.input().try_peek(&sixth)) << queue.error().message;
+    ASSERT_TRUE(queue.input().try_peek(fourth)) << queue.error().message;
+    ASSERT_TRUE(queue.input().try_peek(fifth)) << queue.error().message;
+    ASSERT_TRUE(queue.input().try_peek(sixth)) << queue.error().message;
 
     ASSERT_TRUE(queue.input().release(fifth)) << queue.error().message;
     EXPECT_EQ(storage.counters[counter_index(L3L2_QUEUE_INPUT_DESC_HEAD_OFFSET)], 3);
@@ -722,9 +719,9 @@ TEST(L3L2MessageQueueTest, StopDoesNotCountAgainstWindowAndDrainsAfterEarlierInp
     L3L2QueueInputHandle first{};
     L3L2QueueInputHandle second{};
     L3L2QueueInputHandle stop{};
-    ASSERT_TRUE(queue.input().try_peek(&first)) << queue.error().message;
-    ASSERT_TRUE(queue.input().try_peek(&second)) << queue.error().message;
-    ASSERT_TRUE(queue.input().try_peek(&stop)) << queue.error().message;
+    ASSERT_TRUE(queue.input().try_peek(first)) << queue.error().message;
+    ASSERT_TRUE(queue.input().try_peek(second)) << queue.error().message;
+    ASSERT_TRUE(queue.input().try_peek(stop)) << queue.error().message;
     EXPECT_EQ(stop.opcode, L3L2QueueOpcode::STOP);
 
     ASSERT_TRUE(queue.input().release(stop)) << queue.error().message;
@@ -751,9 +748,9 @@ TEST(L3L2MessageQueueTest, TryPeekAfterStopAcquireIsNoProgressWithoutPoison) {
     L3L2QueueInputHandle first{};
     L3L2QueueInputHandle stop{};
     L3L2QueueInputHandle later{};
-    ASSERT_TRUE(queue.input().try_peek(&first)) << queue.error().message;
-    ASSERT_TRUE(queue.input().try_peek(&stop)) << queue.error().message;
-    EXPECT_FALSE(queue.input().try_peek(&later));
+    ASSERT_TRUE(queue.input().try_peek(first)) << queue.error().message;
+    ASSERT_TRUE(queue.input().try_peek(stop)) << queue.error().message;
+    EXPECT_FALSE(queue.input().try_peek(later));
 
     EXPECT_EQ(queue.error().kind, L3L2QueueErrorKind::NONE);
     EXPECT_EQ(storage.counters[counter_index(L3L2_QUEUE_L2_ABORT_FLAG_OFFSET)], 0);
@@ -770,8 +767,8 @@ TEST(L3L2MessageQueueTest, StopAcquirePoisonsIfLaterInputAlreadyObserved) {
 
     L3L2QueueInputHandle input{};
     L3L2QueueInputHandle stop{};
-    ASSERT_TRUE(queue.input().try_peek(&input)) << queue.error().message;
-    EXPECT_FALSE(queue.input().try_peek(&stop));
+    ASSERT_TRUE(queue.input().try_peek(input)) << queue.error().message;
+    EXPECT_FALSE(queue.input().try_peek(stop));
 
     EXPECT_EQ(queue.error().kind, L3L2QueueErrorKind::INVALID_DESCRIPTOR);
     EXPECT_EQ(storage.counters[counter_index(L3L2_QUEUE_L2_ABORT_FLAG_OFFSET)], 1);
@@ -788,8 +785,8 @@ TEST(L3L2MessageQueueTest, InputReleaseRejectsStaleAndDoubleRelease) {
     publish_input_desc(&stale_storage, stale_queue.layout(), 2, L3L2QueueOpcode::DATA);
     L3L2QueueInputHandle stale_first{};
     L3L2QueueInputHandle stale_second{};
-    ASSERT_TRUE(stale_queue.input().try_peek(&stale_first)) << stale_queue.error().message;
-    ASSERT_TRUE(stale_queue.input().try_peek(&stale_second)) << stale_queue.error().message;
+    ASSERT_TRUE(stale_queue.input().try_peek(stale_first)) << stale_queue.error().message;
+    ASSERT_TRUE(stale_queue.input().try_peek(stale_second)) << stale_queue.error().message;
     ASSERT_TRUE(stale_queue.input().release(stale_first)) << stale_queue.error().message;
     ASSERT_TRUE(stale_queue.input().release(stale_second)) << stale_queue.error().message;
     EXPECT_FALSE(stale_queue.input().release(stale_first));
@@ -802,8 +799,8 @@ TEST(L3L2MessageQueueTest, InputReleaseRejectsStaleAndDoubleRelease) {
     publish_input_desc(&double_storage, double_queue.layout(), 2, L3L2QueueOpcode::DATA);
     L3L2QueueInputHandle first{};
     L3L2QueueInputHandle second{};
-    ASSERT_TRUE(double_queue.input().try_peek(&first)) << double_queue.error().message;
-    ASSERT_TRUE(double_queue.input().try_peek(&second)) << double_queue.error().message;
+    ASSERT_TRUE(double_queue.input().try_peek(first)) << double_queue.error().message;
+    ASSERT_TRUE(double_queue.input().try_peek(second)) << double_queue.error().message;
     ASSERT_TRUE(double_queue.input().release(second)) << double_queue.error().message;
     EXPECT_FALSE(double_queue.input().release(second));
     EXPECT_EQ(double_queue.error().kind, L3L2QueueErrorKind::OWNERSHIP);
@@ -820,12 +817,12 @@ TEST(L3L2MessageQueueTest, OutputReservePublishWorksDuringStopDrain) {
 
     L3L2QueueInputHandle input{};
     L3L2QueueInputHandle stop{};
-    ASSERT_TRUE(queue.input().try_peek(&input)) << queue.error().message;
-    ASSERT_TRUE(queue.input().try_peek(&stop)) << queue.error().message;
+    ASSERT_TRUE(queue.input().try_peek(input)) << queue.error().message;
+    ASSERT_TRUE(queue.input().try_peek(stop)) << queue.error().message;
     ASSERT_TRUE(queue.input().release(stop)) << queue.error().message;
 
     L3L2QueueOutputReservation reservation{};
-    ASSERT_TRUE(queue.output().try_reserve(16, &reservation)) << queue.error().message;
+    ASSERT_TRUE(queue.output().try_reserve(16, reservation)) << queue.error().message;
     ASSERT_TRUE(queue.output().publish(reservation, L3L2QueueOpcode::DATA)) << queue.error().message;
 
     EXPECT_FALSE(queue.input().drained());

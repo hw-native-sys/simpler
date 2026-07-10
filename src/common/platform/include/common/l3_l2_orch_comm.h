@@ -110,13 +110,14 @@ static inline void copy_error_message(char *dst, size_t dst_size, const char *me
 
 }  // namespace l3_l2_orch_comm
 
-static inline uint64_t l3_l2_orch_comm_pack_magic_version(uint32_t magic, uint16_t major, uint16_t minor) {
+static constexpr uint64_t l3_l2_orch_comm_pack_magic_version(uint32_t magic, uint16_t major, uint16_t minor) {
     return (static_cast<uint64_t>(magic) << 32) | (static_cast<uint64_t>(major) << 16) | static_cast<uint64_t>(minor);
 }
 
-static inline uint64_t l3_l2_orch_comm_magic_version() {
-    return l3_l2_orch_comm_pack_magic_version(L3L2_ORCH_COMM_MAGIC, L3L2_ORCH_COMM_ABI_MAJOR, L3L2_ORCH_COMM_ABI_MINOR);
-}
+static constexpr uint64_t L3L2_ORCH_COMM_MAGIC_VERSION =
+    l3_l2_orch_comm_pack_magic_version(L3L2_ORCH_COMM_MAGIC, L3L2_ORCH_COMM_ABI_MAJOR, L3L2_ORCH_COMM_ABI_MINOR);
+
+static inline uint64_t l3_l2_orch_comm_magic_version() { return L3L2_ORCH_COMM_MAGIC_VERSION; }
 
 static inline uint32_t l3_l2_orch_comm_magic(uint64_t magic_version) {
     return static_cast<uint32_t>(magic_version >> 32);
@@ -130,17 +131,39 @@ static inline uint16_t l3_l2_orch_comm_abi_minor(uint64_t magic_version) {
     return static_cast<uint16_t>(magic_version & 0xFFFFu);
 }
 
-static inline bool l3_l2_orch_comm_add_overflows(uint64_t a, uint64_t b) { return a > UINT64_MAX - b; }
+static inline bool l3_l2_orch_comm_add_overflows(uint64_t a, uint64_t b) {
+#if defined(__clang__) || defined(__GNUC__)
+    uint64_t result = 0;
+    return __builtin_add_overflow(a, b, &result);
+#else
+    return a > UINT64_MAX - b;
+#endif
+}
 
-static inline bool l3_l2_orch_comm_is_aligned(uint64_t value, uint64_t align) {
-    return align != 0 && (value % align) == 0;
+static inline uint64_t l3_l2_orch_comm_add_sat(uint64_t a, uint64_t b) {
+#if defined(__clang__) || defined(__GNUC__)
+    uint64_t result = 0;
+    return __builtin_add_overflow(a, b, &result) ? UINT64_MAX : result;
+#else
+    return l3_l2_orch_comm_add_overflows(a, b) ? UINT64_MAX : a + b;
+#endif
+}
+
+template <uint64_t Align>
+static constexpr bool l3_l2_orch_comm_is_aligned(uint64_t value) {
+    static_assert(Align > 0 && (Align & (Align - 1)) == 0, "Align must be a power of two");
+    return (value & (Align - 1)) == 0;
+}
+
+static inline bool l3_l2_orch_comm_is_aligned_runtime(uint64_t value, uint64_t align) {
+    return align != 0 && (align & (align - 1)) == 0 && (value & (align - 1)) == 0;
 }
 
 static inline bool l3_l2_orch_comm_range_contains(uint64_t base, uint64_t size, uint64_t value) {
     if (size == 0 || l3_l2_orch_comm_add_overflows(base, size)) {
         return false;
     }
-    return value >= base && value < base + size;
+    return value >= base && value - base < size;
 }
 
 static inline bool
@@ -149,23 +172,26 @@ l3_l2_orch_comm_ranges_overlap(uint64_t first_base, uint64_t first_size, uint64_
         l3_l2_orch_comm_add_overflows(second_base, second_size)) {
         return false;
     }
-    return first_base < second_base + second_size && second_base < first_base + first_size;
+    if (first_base < second_base) {
+        return second_base - first_base < first_size;
+    }
+    return first_base - second_base < second_size;
 }
 
 static inline L3L2OrchCommValidationError
 l3_l2_orch_comm_validate_payload_bounds(uint64_t offset, uint64_t nbytes, uint64_t payload_bytes) {
-    if (nbytes == 0 || payload_bytes == 0 || l3_l2_orch_comm_add_overflows(offset, nbytes)) {
+    if (nbytes == 0 || payload_bytes == 0) {
         return L3L2OrchCommValidationError::BAD_PAYLOAD_RANGE;
     }
-    if (offset > payload_bytes || offset + nbytes > payload_bytes) {
+    if (l3_l2_orch_comm_add_overflows(offset, nbytes) || l3_l2_orch_comm_add_sat(offset, nbytes) > payload_bytes) {
         return L3L2OrchCommValidationError::OUT_OF_BOUNDS;
     }
     return L3L2OrchCommValidationError::OK;
 }
 
 static inline L3L2OrchCommValidationError l3_l2_orch_comm_validate_counter_range(const L3L2OrchRegionDesc &desc) {
-    if (desc.counter_base == 0 || desc.counter_bytes == 0 ||
-        !l3_l2_orch_comm_is_aligned(desc.counter_base, L3L2_ORCH_COMM_COUNTER_BASE_ALIGNMENT) ||
+    if (desc.counter_bytes == 0 ||
+        !l3_l2_orch_comm_is_aligned<L3L2_ORCH_COMM_COUNTER_BASE_ALIGNMENT>(desc.counter_base) ||
         (desc.counter_bytes % L3L2_ORCH_COMM_COUNTER_BYTES) != 0 ||
         l3_l2_orch_comm_add_overflows(desc.counter_base, desc.counter_bytes)) {
         return L3L2OrchCommValidationError::BAD_COUNTER_RANGE;
@@ -184,8 +210,7 @@ static inline L3L2OrchCommValidationError l3_l2_orch_comm_validate_desc(const L3
     if (desc.region_id == 0) {
         return L3L2OrchCommValidationError::BAD_REGION_ID;
     }
-    if (desc.payload_base == 0 || desc.payload_bytes == 0 ||
-        l3_l2_orch_comm_add_overflows(desc.payload_base, desc.payload_bytes)) {
+    if (desc.payload_bytes == 0 || l3_l2_orch_comm_add_overflows(desc.payload_base, desc.payload_bytes)) {
         return L3L2OrchCommValidationError::BAD_PAYLOAD_RANGE;
     }
     L3L2OrchCommValidationError counter_error = l3_l2_orch_comm_validate_counter_range(desc);
@@ -268,16 +293,17 @@ static inline L3L2OrchCommValidationError
 l3_l2_orch_comm_validate_counter_addr(const L3L2OrchRegionDesc &desc, uint64_t counter_addr) {
     // Address validity is 4-byte; wrapper protocols must keep different
     // counter writers off the same cache line.
-    if (!l3_l2_orch_comm_is_aligned(counter_addr, L3L2_ORCH_COMM_COUNTER_BYTES)) {
+    if (!l3_l2_orch_comm_is_aligned<L3L2_ORCH_COMM_COUNTER_BYTES>(counter_addr)) {
         return L3L2OrchCommValidationError::BAD_COUNTER_RANGE;
     }
-    if (l3_l2_orch_comm_validate_counter_range(desc) != L3L2OrchCommValidationError::OK ||
-        l3_l2_orch_comm_add_overflows(counter_addr, L3L2_ORCH_COMM_COUNTER_BYTES) ||
-        l3_l2_orch_comm_add_overflows(desc.counter_base, desc.counter_bytes)) {
+    if (l3_l2_orch_comm_validate_counter_range(desc) != L3L2OrchCommValidationError::OK) {
         return L3L2OrchCommValidationError::BAD_COUNTER_RANGE;
     }
-    if (counter_addr < desc.counter_base ||
-        counter_addr + L3L2_ORCH_COMM_COUNTER_BYTES > desc.counter_base + desc.counter_bytes) {
+    if (desc.counter_bytes < L3L2_ORCH_COMM_COUNTER_BYTES) {
+        return L3L2OrchCommValidationError::BAD_COUNTER_RANGE;
+    }
+    uint64_t max_counter_addr = desc.counter_base + desc.counter_bytes - L3L2_ORCH_COMM_COUNTER_BYTES;
+    if (counter_addr < desc.counter_base || counter_addr > max_counter_addr) {
         return L3L2OrchCommValidationError::OUT_OF_BOUNDS;
     }
     return L3L2OrchCommValidationError::OK;
@@ -285,7 +311,7 @@ l3_l2_orch_comm_validate_counter_addr(const L3L2OrchRegionDesc &desc, uint64_t c
 
 namespace l3_l2_orch_comm {
 
-static inline uint64_t pack_magic_version(uint32_t magic, uint16_t major, uint16_t minor) {
+static constexpr uint64_t pack_magic_version(uint32_t magic, uint16_t major, uint16_t minor) {
     return ::l3_l2_orch_comm_pack_magic_version(magic, major, minor);
 }
 
@@ -303,7 +329,16 @@ static inline uint16_t abi_minor(uint64_t magic_version_value) {
 
 static inline bool add_overflows(uint64_t a, uint64_t b) { return ::l3_l2_orch_comm_add_overflows(a, b); }
 
-static inline bool is_aligned(uint64_t value, uint64_t align) { return ::l3_l2_orch_comm_is_aligned(value, align); }
+static inline uint64_t add_sat(uint64_t a, uint64_t b) { return ::l3_l2_orch_comm_add_sat(a, b); }
+
+template <uint64_t Align>
+static constexpr bool is_aligned(uint64_t value) {
+    return ::l3_l2_orch_comm_is_aligned<Align>(value);
+}
+
+static inline bool is_aligned_runtime(uint64_t value, uint64_t align) {
+    return ::l3_l2_orch_comm_is_aligned_runtime(value, align);
+}
 
 static inline bool range_contains(uint64_t base, uint64_t size, uint64_t value) {
     return ::l3_l2_orch_comm_range_contains(base, size, value);

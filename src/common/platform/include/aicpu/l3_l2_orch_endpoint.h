@@ -100,18 +100,9 @@ public:
 
     const L3L2OrchRegionDesc &descriptor() const { return desc_; }
 
-    bool counter_addr(uint64_t offset, uint64_t *out_addr) {
-        if (out_addr != nullptr) {
-            *out_addr = 0;
-        }
+    bool counter_addr(uint64_t offset, uint64_t &out_addr) {
+        out_addr = 0;
         if (has_error()) {
-            return false;
-        }
-        if (out_addr == nullptr) {
-            set_error(
-                L3L2EndpointErrorKind::OUT_OF_BOUNDS, L3L2EndpointOp::COUNTER_ADDR, desc_.region_id, 0, 0,
-                "null counter address output"
-            );
             return false;
         }
         if (l3_l2_orch_comm_add_overflows(desc_.counter_base, offset)) {
@@ -127,7 +118,7 @@ public:
             )) {
             return false;
         }
-        *out_addr = addr;
+        out_addr = addr;
         return true;
     }
 
@@ -135,18 +126,9 @@ public:
         return l3_l2_orch_comm::validate_counter_addr(desc_, counter_addr) == L3L2OrchCommValidationError::OK;
     }
 
-    bool payload_read(uint64_t offset, uint64_t nbytes, L3L2OrchPayloadView *out) {
-        if (out != nullptr) {
-            *out = L3L2OrchPayloadView{0, 0};
-        }
+    bool payload_read(uint64_t offset, uint64_t nbytes, L3L2OrchPayloadView &out) {
+        out = L3L2OrchPayloadView{0, 0};
         if (has_error()) {
-            return false;
-        }
-        if (out == nullptr) {
-            set_error(
-                L3L2EndpointErrorKind::OUT_OF_BOUNDS, L3L2EndpointOp::PAYLOAD_READ, desc_.region_id, 0, 0,
-                "null payload view output"
-            );
             return false;
         }
         if (!validate_payload_range(L3L2EndpointOp::PAYLOAD_READ, offset, nbytes)) {
@@ -156,7 +138,7 @@ public:
         cache_invalidate_range(
             reinterpret_cast<const void *>(static_cast<uintptr_t>(gm_addr)), static_cast<size_t>(nbytes)
         );
-        *out = L3L2OrchPayloadView{gm_addr, nbytes};
+        out = L3L2OrchPayloadView{gm_addr, nbytes};
         return true;
     }
 
@@ -210,18 +192,9 @@ public:
         return true;
     }
 
-    bool signal_test(uint64_t counter_addr, int32_t cmp_value, L3L2OrchWaitCmp cmp, L3L2OrchSignalTestResult *out) {
-        if (out != nullptr) {
-            *out = L3L2OrchSignalTestResult{false, 0};
-        }
+    bool signal_test(uint64_t counter_addr, int32_t cmp_value, L3L2OrchWaitCmp cmp, L3L2OrchSignalTestResult &out) {
+        out = L3L2OrchSignalTestResult{false, 0};
         if (has_error()) {
-            return false;
-        }
-        if (out == nullptr) {
-            set_error(
-                L3L2EndpointErrorKind::OUT_OF_BOUNDS, L3L2EndpointOp::SIGNAL_TEST, desc_.region_id, counter_addr,
-                cmp_value, "null signal test output"
-            );
             return false;
         }
         if (!validate_counter_addr_for_op(
@@ -237,23 +210,14 @@ public:
             return false;
         }
         int32_t observed = load_counter(counter_addr);
-        *out = L3L2OrchSignalTestResult{l3_l2_orch_comm::compare_counter(observed, cmp_value, cmp), observed};
+        out = L3L2OrchSignalTestResult{l3_l2_orch_comm::compare_counter(observed, cmp_value, cmp), observed};
         return true;
     }
 
     bool
-    signal_wait(uint64_t counter_addr, int32_t cmp_value, L3L2OrchWaitCmp cmp, uint64_t timeout, int32_t *observed) {
-        if (observed != nullptr) {
-            *observed = 0;
-        }
+    signal_wait(uint64_t counter_addr, int32_t cmp_value, L3L2OrchWaitCmp cmp, uint64_t timeout, int32_t &observed) {
+        observed = 0;
         if (has_error()) {
-            return false;
-        }
-        if (observed == nullptr) {
-            set_error(
-                L3L2EndpointErrorKind::OUT_OF_BOUNDS, L3L2EndpointOp::SIGNAL_WAIT, desc_.region_id, counter_addr,
-                cmp_value, "null signal wait output"
-            );
             return false;
         }
         if (!validate_counter_addr_for_op(
@@ -273,7 +237,7 @@ public:
         uint64_t frequency_hz = device_time_frequency_hz();
         while (true) {
             int32_t current = load_counter(counter_addr);
-            *observed = current;
+            observed = current;
             if (l3_l2_orch_comm::compare_counter(current, cmp_value, cmp)) {
                 return true;
             }

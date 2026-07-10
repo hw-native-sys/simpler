@@ -144,7 +144,7 @@ L2 consumes input messages from `queue.input()` and publishes outputs through
 ```cpp
 while (true) {
     L3L2QueueInputHandle input{};
-    if (!queue.input().peek(timeout_ns, &input)) {
+    if (!queue.input().peek(timeout_ns, input)) {
         return;
     }
 
@@ -154,7 +154,7 @@ while (true) {
     }
 
     L3L2QueueOutputReservation output{};
-    if (!queue.output().reserve(input.payload_nbytes, timeout_ns, &output)) {
+    if (!queue.output().reserve(input.payload_nbytes, timeout_ns, output)) {
         return;
     }
 
@@ -166,8 +166,8 @@ while (true) {
 }
 ```
 
-`queue.input().try_peek(&input)` and
-`queue.output().try_reserve(nbytes, &reservation)` are non-blocking. A `false`
+`queue.input().try_peek(input)` and
+`queue.output().try_reserve(nbytes, reservation)` are non-blocking. A `false`
 return can mean ordinary no-progress, validation failure, or poison; check
 `queue.error().kind` to distinguish ordinary no-progress from terminal error.
 

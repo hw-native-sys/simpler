@@ -84,7 +84,7 @@ bool publish_aiv_output(
 ) {
     uint64_t nbytes = kOutputHeaderBytes + kTileBytes;
     L3L2QueueOutputReservation output{};
-    if (!queue.output().reserve(nbytes, kQueueTimeoutNs, &output)) {
+    if (!queue.output().reserve(nbytes, kQueueTimeoutNs, output)) {
         report_queue_error(queue);
         return false;
     }
@@ -253,7 +253,7 @@ __attribute__((visibility("default"))) void l3_l2_message_queue_orchestration(co
     ActiveRequest active[kInputWindow]{};
     for (;;) {
         L3L2QueueInputHandle input{};
-        if (!queue.input().peek(kQueueTimeoutNs, &input)) {
+        if (!queue.input().peek(kQueueTimeoutNs, input)) {
             if (has_queue_error(queue)) {
                 report_queue_error(queue);
                 return;

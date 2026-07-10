@@ -57,14 +57,14 @@ L3L2OrchEndpoint ep(desc);
 
 uint64_t data_ready_addr = 0;
 uint64_t completion_addr = 0;
-ep.counter_addr(data_ready_offset, &data_ready_addr);
-ep.counter_addr(completion_offset, &completion_addr);
+ep.counter_addr(data_ready_offset, data_ready_addr);
+ep.counter_addr(completion_offset, completion_addr);
 
 int32_t observed = 0;
 bool ok = ep.signal_wait(
-              data_ready_addr, seq, L3L2OrchWaitCmp::GE, timeout, &observed) &&
-          ep.payload_read(input_offset, input_nbytes, &input) &&
-          ep.payload_read(output_offset, output_nbytes, &output);
+              data_ready_addr, seq, L3L2OrchWaitCmp::GE, timeout, observed) &&
+          ep.payload_read(input_offset, input_nbytes, input) &&
+          ep.payload_read(output_offset, output_nbytes, output);
 
 // The wrapper combines gm_addr/nbytes with task-level dtype and shape.
 launch_aicore(input, output);
@@ -99,7 +99,7 @@ scalar[i + 5] = counter_bytes
 | Field | Meaning |
 | ----- | ------- |
 | `magic_version` | Descriptor ABI marker and version. |
-| `region_id` | Region identifier for diagnostics and region-scoped errors. |
+| `region_id` | Region identifier; `0` is reserved as invalid. |
 | `payload_base` | Base GM address of the payload byte range. |
 | `payload_bytes` | Size of the payload byte range. |
 | `counter_base` | Base GM address of the signal counter range. |
@@ -124,6 +124,9 @@ counter_base .. counter_base + counter_bytes - 1
 `counter_base` is 64-byte aligned, and `counter_bytes` is a multiple of
 `sizeof(int32_t)`. Counter addresses must be 4-byte aligned and inside the
 registered counter range. The payload and counter ranges do not overlap.
+`payload_base == 0` and `counter_base == 0` are not validity sentinels; only
+the range sizes, alignment, overflow, overlap, and reserved `region_id == 0`
+checks determine descriptor validity.
 
 ## 3. Control Path
 
@@ -186,9 +189,9 @@ addresses:
 
 ```cpp
 ep.signal_notify(counter_addr, value, L3L2OrchNotifyOp::Set);
-ep.signal_test(counter_addr, cmp_value, L3L2OrchWaitCmp::GE, &result);
+ep.signal_test(counter_addr, cmp_value, L3L2OrchWaitCmp::GE, result);
 ep.signal_wait(
-    counter_addr, cmp_value, L3L2OrchWaitCmp::GE, timeout, &observed);
+    counter_addr, cmp_value, L3L2OrchWaitCmp::GE, timeout, observed);
 ```
 
 `NotifyOp` supports:
@@ -251,8 +254,8 @@ L3:
 
 L2:
   signal_wait(data_ready_addr, seq, GE)
-  payload_read(input_offset, input_nbytes, &input_view)
-  payload_read(output_offset, output_nbytes, &output_view)
+  payload_read(input_offset, input_nbytes, input_view)
+  payload_read(output_offset, output_nbytes, output_view)
   submit AICore(input_view, output_view)
   wait for AICore completion
   signal_notify(completion_addr, seq, Set)

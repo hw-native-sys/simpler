@@ -22,8 +22,17 @@ namespace {
 
 L3L2OrchRegionDesc valid_desc() {
     return L3L2OrchRegionDesc{
-        l3_l2_orch_comm_magic_version(), 7, 0x1000, 4096, 0x3000, 128,
+        L3L2_ORCH_COMM_MAGIC_VERSION, 7, 0x1000, 4096, 0x3000, 128,
     };
+}
+
+TEST(L3L2OrchCommTest, MagicVersionConstantMatchesCompatibilityWrapper) {
+    EXPECT_EQ(
+        L3L2_ORCH_COMM_MAGIC_VERSION,
+        l3_l2_orch_comm_pack_magic_version(L3L2_ORCH_COMM_MAGIC, L3L2_ORCH_COMM_ABI_MAJOR, L3L2_ORCH_COMM_ABI_MINOR)
+    );
+    EXPECT_EQ(l3_l2_orch_comm_magic_version(), L3L2_ORCH_COMM_MAGIC_VERSION);
+    EXPECT_EQ(l3_l2_orch_comm::magic_version(), L3L2_ORCH_COMM_MAGIC_VERSION);
 }
 
 TEST(L3L2OrchCommTest, DescriptorRoundTripsThroughSixTaskArgScalars) {
@@ -58,12 +67,47 @@ TEST(L3L2OrchCommTest, DescriptorRejectsBadMajorVersion) {
     EXPECT_EQ(error, L3L2OrchCommValidationError::BAD_MAGIC_VERSION);
 }
 
+TEST(L3L2OrchCommTest, DescriptorKeepsRegionIdZeroAsInvalidSentinel) {
+    L3L2OrchRegionDesc desc = valid_desc();
+    desc.region_id = 0;
+
+    L3L2OrchCommValidationError error = l3_l2_orch_comm_validate_desc(desc);
+    EXPECT_EQ(error, L3L2OrchCommValidationError::BAD_REGION_ID);
+}
+
+TEST(L3L2OrchCommTest, DescriptorAcceptsZeroBaseAddressesWhenRangesAreValid) {
+    L3L2OrchRegionDesc desc = valid_desc();
+    desc.payload_base = 0;
+    desc.payload_bytes = 128;
+    desc.counter_base = 256;
+    desc.counter_bytes = 64;
+    EXPECT_EQ(l3_l2_orch_comm_validate_desc(desc), L3L2OrchCommValidationError::OK);
+
+    desc = valid_desc();
+    desc.payload_base = 128;
+    desc.payload_bytes = 128;
+    desc.counter_base = 0;
+    desc.counter_bytes = 64;
+    EXPECT_EQ(l3_l2_orch_comm_validate_desc(desc), L3L2OrchCommValidationError::OK);
+}
+
 TEST(L3L2OrchCommTest, DescriptorRejectsZeroPayloadBytes) {
     L3L2OrchRegionDesc desc = valid_desc();
     desc.payload_bytes = 0;
 
     L3L2OrchCommValidationError error = l3_l2_orch_comm_validate_desc(desc);
     EXPECT_EQ(error, L3L2OrchCommValidationError::BAD_PAYLOAD_RANGE);
+}
+
+TEST(L3L2OrchCommTest, DescriptorRejectsPayloadCounterOverlapWithZeroBase) {
+    L3L2OrchRegionDesc desc = valid_desc();
+    desc.payload_base = 0;
+    desc.payload_bytes = 128;
+    desc.counter_base = 64;
+    desc.counter_bytes = 64;
+
+    L3L2OrchCommValidationError error = l3_l2_orch_comm_validate_desc(desc);
+    EXPECT_EQ(error, L3L2OrchCommValidationError::BAD_COUNTER_RANGE);
 }
 
 TEST(L3L2OrchCommTest, DescriptorRejectsOverflowingPayloadRange) {
@@ -119,10 +163,25 @@ TEST(L3L2OrchCommTest, PayloadBoundsRejectOverflowAndOutOfRange) {
     EXPECT_EQ(l3_l2_orch_comm_validate_payload_bounds(16, 8, 32), L3L2OrchCommValidationError::OK);
     EXPECT_EQ(
         l3_l2_orch_comm_validate_payload_bounds(UINT64_MAX - 3, 8, UINT64_MAX),
-        L3L2OrchCommValidationError::BAD_PAYLOAD_RANGE
+        L3L2OrchCommValidationError::OUT_OF_BOUNDS
     );
     EXPECT_EQ(l3_l2_orch_comm_validate_payload_bounds(24, 16, 32), L3L2OrchCommValidationError::OUT_OF_BOUNDS);
     EXPECT_EQ(l3_l2_orch_comm_validate_payload_bounds(0, 0, 32), L3L2OrchCommValidationError::BAD_PAYLOAD_RANGE);
+}
+
+TEST(L3L2OrchCommTest, AddSatAndOverflowHelpersHandleUint64Edges) {
+    EXPECT_FALSE(l3_l2_orch_comm_add_overflows(7, 9));
+    EXPECT_TRUE(l3_l2_orch_comm_add_overflows(UINT64_MAX - 1, 2));
+    EXPECT_EQ(l3_l2_orch_comm_add_sat(7, 9), 16u);
+    EXPECT_EQ(l3_l2_orch_comm_add_sat(UINT64_MAX - 1, 2), UINT64_MAX);
+}
+
+TEST(L3L2OrchCommTest, CompileTimeAlignmentRequiresPowerOfTwoAbiAlignment) {
+    static_assert(l3_l2_orch_comm_is_aligned<L3L2_ORCH_COMM_COUNTER_BYTES>(16), "counter alignment must work");
+    EXPECT_TRUE(l3_l2_orch_comm_is_aligned<L3L2_ORCH_COMM_COUNTER_BASE_ALIGNMENT>(0x3000));
+    EXPECT_FALSE(l3_l2_orch_comm_is_aligned<L3L2_ORCH_COMM_COUNTER_BASE_ALIGNMENT>(0x3041));
+    EXPECT_TRUE(l3_l2_orch_comm_is_aligned_runtime(24, 8));
+    EXPECT_FALSE(l3_l2_orch_comm_is_aligned_runtime(24, 3));
 }
 
 TEST(L3L2OrchCommTest, NotifyOpAndWaitCmpValidationRejectUnknownValues) {
