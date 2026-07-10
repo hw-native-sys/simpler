@@ -1222,7 +1222,7 @@ def _handle_ctrl_l3_l2_region_create(  # noqa: PLR0912
                 elif region.dev_ptr:
                     if region.export_key:
                         try:
-                            _l3_child_onboard_region_close(region.export_key.decode("utf-8", "strict"))
+                            _l3_child_onboard_region_close(region.export_key)
                         except Exception:  # noqa: BLE001
                             pass
                     cw.free(region.dev_ptr)
@@ -1247,7 +1247,7 @@ def _handle_ctrl_l3_l2_region_release(cw: ChipWorker, buf: memoryview) -> None:
         return
     if region.export_key:
         try:
-            _l3_child_onboard_region_close(region.export_key.decode("utf-8", "strict"))
+            _l3_child_onboard_region_close(region.export_key)
         except Exception:  # noqa: BLE001
             pass
     if region.dev_ptr:
@@ -1269,7 +1269,7 @@ def _sweep_l2_host_l3_l2_regions(cw: ChipWorker) -> None:
                     )
 
                     if region.export_key:
-                        _l3_child_onboard_region_close(region.export_key.decode("utf-8", "strict"))
+                        _l3_child_onboard_region_close(region.export_key)
                 except Exception:  # noqa: BLE001
                     pass
                 cw.free(region.dev_ptr)
@@ -3705,6 +3705,10 @@ class Worker:
     def _l3_l2_use_l3_host_mapped_path(self) -> bool:
         return str(self._config.get("platform", "")) in {"a2a3", "a2a3sim", "a5", "a5sim"}
 
+    def _l3_l2_onboard_import_enable_peer_access(self) -> bool:
+        platform = str(self._config.get("platform", ""))
+        return platform == "a2a3"
+
     def _validate_l3_l2_worker_id(self, worker_id: int) -> None:
         if self.level < 3:
             raise RuntimeError("create_l3_l2_region requires a hierarchical Worker")
@@ -3819,11 +3823,9 @@ class Worker:
                         raise RuntimeError("create_l3_l2_region: onboard direct path requires onboard_acl_ipc reply")
                     handle = _l3_host_mapped_region_import_onboard(
                         int(reply.device_id),
-                        reply.export_key.decode("utf-8", "strict"),
+                        reply.export_key,
                         int(total_bytes),
-                        # Onboard imports use peer access so one parent policy covers same-device and cross-device
-                        # L3/L2 placements on a2a3; a5 follows the same direct ACL IPC mode.
-                        True,
+                        self._l3_l2_onboard_import_enable_peer_access(),
                     )
                 l3_host_mapping = L3HostRegionMapping(
                     worker_id=int(worker_id),

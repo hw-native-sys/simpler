@@ -59,6 +59,7 @@ class _FakeDirectCWorker:
         payload_base: int = 0xDEAD_0000,
         access_profile: l3_l2_orch_comm.L3L2RegionAccessProfile = l3_l2_orch_comm.L3L2RegionAccessProfile.SIM_POSIX_SHM,
         device_id: int = 0,
+        export_key: bytes = b"",
     ):
         self.create_calls: list[tuple[int, str, str]] = []
         self.release_calls: list[tuple[int, int]] = []
@@ -67,6 +68,7 @@ class _FakeDirectCWorker:
         self.payload_base = int(payload_base)
         self.access_profile = access_profile
         self.device_id = int(device_id)
+        self.export_key = bytes(export_key)
 
     def control_l3_l2_orch_comm_init(self, worker_id: int, control_shm_name: str) -> None:
         self.bootstrap_calls.append((int(worker_id), str(control_shm_name)))
@@ -88,7 +90,7 @@ class _FakeDirectCWorker:
             region_id = self.next_region_id
             self.next_region_id += 1
             backing_name = f"sim-direct-{region_id}".encode()
-            export_key = f"acl-ipc-key-{region_id}".encode()
+            export_key = self.export_key or f"acl-ipc-key-{region_id}".encode()
             if self.access_profile == l3_l2_orch_comm.L3L2RegionAccessProfile.ONBOARD_ACL_IPC:
                 backing_name = b""
             else:
@@ -238,14 +240,17 @@ def _make_started_sim_worker() -> tuple[Worker, SharedMemory, _FakeDirectCWorker
     return worker, shm, fake_c_worker
 
 
-def _make_started_onboard_worker() -> tuple[Worker, SharedMemory, _FakeDirectCWorker]:
-    worker = Worker(level=3, device_ids=[2], platform="a2a3", runtime="tensormap_and_ringbuffer")
+def _make_started_onboard_worker(
+    platform: str = "a2a3", export_key: bytes = b""
+) -> tuple[Worker, SharedMemory, _FakeDirectCWorker]:
+    worker = Worker(level=3, device_ids=[2], platform=platform, runtime="tensormap_and_ringbuffer")
     shm = SharedMemory(create=True, size=4096)
     assert shm.buf is not None
     _mailbox_store_i32(_buffer_field_addr(shm.buf, _OFF_STATE), _IDLE)
     fake_c_worker = _FakeDirectCWorker(
         access_profile=l3_l2_orch_comm.L3L2RegionAccessProfile.ONBOARD_ACL_IPC,
         device_id=2,
+        export_key=export_key,
     )
     worker._initialized = True
     worker._hierarchical_started = True
@@ -341,8 +346,30 @@ def test_onboard_direct_region_imports_acl_ipc_and_uses_l3_host_metadata(monkeyp
         assert l3_host_mapping is not None
         assert l3_host_mapping.access_profile == l3_l2_orch_comm.L3L2RegionAccessProfile.ONBOARD_ACL_IPC
         assert l3_host_mapping.counter_offset == 64
-        assert calls[0] == ("import_onboard", 2, "acl-ipc-key-1", 192, True)
+        assert calls[0] == ("import_onboard", 2, b"acl-ipc-key-1", 192, True)
         assert calls[1] == ("notify", 123, 128, 9, int(NotifyOp.Set))
+    finally:
+        worker._close_l3_l2_orch_comm()
+        shm.close()
+        shm.unlink()
+
+
+def test_a5_onboard_direct_region_import_uses_acl_ipc_without_peer_access(monkeypatch):
+    worker, shm, _fake_c_worker = _make_started_onboard_worker(platform="a5", export_key=b"acl-\xff-key")
+    calls: list[tuple] = []
+    try:
+        monkeypatch.setattr(
+            l3_l2_orch_comm,
+            "_l3_host_mapped_region_import_onboard",
+            lambda device_id, export_key, mapping_bytes, enable_peer_access: calls.append(
+                ("import_onboard", device_id, export_key, mapping_bytes, enable_peer_access)
+            )
+            or 123,
+        )
+
+        worker._create_l3_l2_region(0, 64, 128)
+
+        assert calls[0] == ("import_onboard", 2, b"acl-\xff-key", 192, False)
     finally:
         worker._close_l3_l2_orch_comm()
         shm.close()

@@ -1261,11 +1261,11 @@ NB_MODULE(_task_interface, m) {
     );
     m.def(
         "_l3_host_mapped_region_import_onboard",
-        [](int device_id, const std::string &export_key, uint64_t mapping_bytes, bool enable_peer_access) -> uint64_t {
+        [](int device_id, nb::bytes export_key, uint64_t mapping_bytes, bool enable_peer_access) -> uint64_t {
             if (device_id < 0) {
                 throw std::invalid_argument("L3-L2 onboard mapped-region import requires a non-negative device id");
             }
-            if (export_key.empty() || export_key.size() >= 65) {
+            if (export_key.size() == 0 || export_key.size() >= 65) {
                 throw std::invalid_argument("L3-L2 onboard mapped-region import requires a valid ACL IPC export key");
             }
             if (mapping_bytes == 0 || mapping_bytes > static_cast<uint64_t>(std::numeric_limits<size_t>::max())) {
@@ -1275,7 +1275,7 @@ NB_MODULE(_task_interface, m) {
             mapping.profile = L3HostMappedRegionProfile::ONBOARD_ACL_IPC;
             mapping.device_id = device_id;
             mapping.size = static_cast<size_t>(mapping_bytes);
-            std::memcpy(mapping.export_key.data(), export_key.data(), export_key.size());
+            std::memcpy(mapping.export_key.data(), export_key.c_str(), export_key.size());
             bind_acl_device(mapping);
             AclRuntimeApi &api = acl_api();
             uint64_t flags = enable_peer_access ? kAclIpcImportEnablePeerAccess : 0;
@@ -1402,7 +1402,7 @@ NB_MODULE(_task_interface, m) {
     );
     m.def(
         "_l3_child_onboard_region_export",
-        [](uint64_t dev_ptr, uint64_t nbytes, int32_t parent_pid) -> std::string {
+        [](uint64_t dev_ptr, uint64_t nbytes, int32_t parent_pid) -> nb::bytes {
             if (dev_ptr == 0 || nbytes == 0 || nbytes > static_cast<uint64_t>(std::numeric_limits<size_t>::max())) {
                 throw std::invalid_argument("L3-L2 onboard child export requires a valid device allocation");
             }
@@ -1420,15 +1420,15 @@ NB_MODULE(_task_interface, m) {
             );
             int32_t pid = parent_pid;
             acl_check(api.aclrtIpcMemSetImportPid(key, &pid, 1), "aclrtIpcMemSetImportPid");
-            return std::string(key);
+            return nb::bytes(key, std::strlen(key));
         },
         nb::arg("dev_ptr"), nb::arg("nbytes"), nb::arg("parent_pid"),
         "Export a child-owned onboard GM region through ACL IPC and authorize the L3 Host PID."
     );
     m.def(
         "_l3_child_onboard_region_close",
-        [](const std::string &export_key) {
-            if (export_key.empty() || export_key.size() >= 65) {
+        [](nb::bytes export_key) {
+            if (export_key.size() == 0 || export_key.size() >= 65) {
                 return;
             }
             AclRuntimeApi &api = acl_api();

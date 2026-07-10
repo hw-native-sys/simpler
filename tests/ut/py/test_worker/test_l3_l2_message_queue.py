@@ -166,7 +166,7 @@ def _compare_counter(observed: int, operand: int, cmp: int) -> bool:
 
 
 def _make_orchestrator() -> tuple[Orchestrator, Worker, SharedMemory, _FakeClient]:
-    worker = Worker(level=3, device_ids=[0], platform="a2a3", runtime="tensormap_and_ringbuffer")
+    worker = Worker(level=3, device_ids=[0], platform="legacy-test", runtime="tensormap_and_ringbuffer")
     shm = SharedMemory(create=True, size=4096)
     assert shm.buf is not None
     _mailbox_store_i32(_buffer_field_addr(shm.buf, _OFF_STATE), _IDLE)
