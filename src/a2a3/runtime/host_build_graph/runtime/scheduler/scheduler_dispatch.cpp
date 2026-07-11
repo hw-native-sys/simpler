@@ -36,6 +36,15 @@
 #define unlikely(x) __builtin_expect(!!(x), 0)
 #endif
 
+// AICore materializes args[] from src_payload on the gated path using the
+// byte offsets in pto2_dispatch_payload.h (the AICore .o cannot see PTO2TaskPayload).
+// Pin those constants to the real layout here, where the struct is fully visible.
+static_assert(offsetof(PTO2TaskPayload, tensor_count) == PTO2_TASKPAYLOAD_TENSOR_COUNT_OFFSET);
+static_assert(offsetof(PTO2TaskPayload, scalar_count) == PTO2_TASKPAYLOAD_SCALAR_COUNT_OFFSET);
+static_assert(offsetof(PTO2TaskPayload, tensors) == PTO2_TASKPAYLOAD_TENSORS_OFFSET);
+static_assert(offsetof(PTO2TaskPayload, scalars) == PTO2_TASKPAYLOAD_SCALARS_OFFSET);
+static_assert(sizeof(Tensor) == PTO2_TASKPAYLOAD_TENSOR_STRIDE);
+
 // =============================================================================
 // Dispatch helpers
 // =============================================================================
@@ -113,37 +122,49 @@ int SchedulerContext::pop_ready_tasks_batch(
 }
 
 void SchedulerContext::build_payload(
-    PTO2DispatchPayload &dispatch_payload, PTO2TaskSlotState &slot_state, PTO2SubtaskSlot subslot,
-    const AsyncCtx &async_ctx, int32_t block_idx
+    PTO2DispatchPayload &dispatch_payload, PTO2TaskSlotState &slot_state, PTO2SubtaskSlot subslot, int32_t block_idx,
+    bool force_gate
 ) {
     int32_t slot_idx = static_cast<int32_t>(subslot);
     uint64_t callable_addr = get_function_bin_addr(slot_state.task->kernel_id[slot_idx]);
     const CoreCallable *callable = reinterpret_cast<const CoreCallable *>(callable_addr);
     dispatch_payload.function_bin_addr = callable->resolved_addr();
     auto &payload = *slot_state.payload;
-    int n = 0;
-    for (int32_t i = 0; i < payload.tensor_count; i++) {
-        dispatch_payload.args[n++] = reinterpret_cast<uint64_t>(&payload.tensors[i]);
-    }
-    for (int32_t i = 0; i < payload.scalar_count; i++) {
-        dispatch_payload.args[n++] = payload.scalars[i];
+    // A claimed early-stage range stays gated even if producer completion flips
+    // the shared state before this payload is built. All other dispatches run on
+    // pickup.
+    if (PTO2SchedulerState::should_gate_early_dispatch(
+            force_gate, payload.early_dispatch_state.load(std::memory_order_relaxed)
+        )) {
+        // Gated task: hand the idle AICore the source payload (non-zero = gate) and
+        // let it fill args[0..num_args) itself during its doorbell wait, instead of
+        // paying the arg-vector write on this scheduler thread.
+        dispatch_payload.src_payload = reinterpret_cast<uint64_t>(&payload);
+    } else {
+        // Ready task: fill args here; src_payload = 0 signals AICore to run on pickup.
+        dispatch_payload.src_payload = 0;
+        int n = 0;
+        for (int32_t i = 0; i < payload.tensor_count; i++) {
+            dispatch_payload.args[n++] = reinterpret_cast<uint64_t>(&payload.tensors[i]);
+        }
+        for (int32_t i = 0; i < payload.scalar_count; i++) {
+            dispatch_payload.args[n++] = payload.scalars[i];
+        }
     }
     dispatch_payload.local_context.block_idx = block_idx;
     dispatch_payload.local_context.block_num = slot_state.logical_block_num;
-    dispatch_payload.local_context.async_ctx = async_ctx;
-    dispatch_payload.args[PAYLOAD_LOCAL_CONTEXT_INDEX] = reinterpret_cast<uint64_t>(&dispatch_payload.local_context);
-    dispatch_payload.args[PAYLOAD_GLOBAL_CONTEXT_INDEX] = reinterpret_cast<uint64_t>(&dispatch_payload.global_context);
-    // Early-dispatch: a task being staged (Hook 1 set early_dispatch_state to
-    // STAGING before this call) is gated — the AICore must wait for the
-    // DATA_MAIN_BASE high-32 doorbell. All other dispatches run on pickup.
-    dispatch_payload.not_ready =
-        (slot_state.payload->early_dispatch_state.load(std::memory_order_relaxed) == PTO2_EARLY_DISPATCH_STAGING) ? 1 :
-                                                                                                                    0;
+    // AsyncCtx's slab pointers + capacity are prefilled once per (core, buf_idx)
+    // in init(); only task_token varies per dispatch. deferred_slab is never null
+    // on this path, so task_token is always the live task id (matches the old
+    // AsyncCtx::make(non-null) result). args[PAYLOAD_LOCAL_CONTEXT_INDEX] /
+    // [PAYLOAD_GLOBAL_CONTEXT_INDEX] are per-(core, buf_idx) constants, also
+    // prefilled in init().
+    dispatch_payload.local_context.async_ctx.task_token = slot_state.task->task_id;
 }
 
 SchedulerContext::PublishHandle SchedulerContext::prepare_subtask_to_core(
     int32_t thread_idx, int32_t core_offset, PTO2TaskSlotState &slot_state, PTO2SubtaskSlot subslot, bool to_pending,
-    int32_t block_idx
+    int32_t block_idx, bool force_gate
 ) {
     CoreTracker &tracker = core_trackers_[thread_idx];
     auto core_id = tracker.get_core_id_by_offset(core_offset);
@@ -161,11 +182,12 @@ SchedulerContext::PublishHandle SchedulerContext::prepare_subtask_to_core(
 
     uint32_t buf_idx = reg_task_id & 1u;
     PTO2DispatchPayload &payload = payload_per_core_[core_id][buf_idx];
-    DeferredCompletionSlab *deferred_slab = &deferred_slab_per_core_[core_id][buf_idx];
-    deferred_slab->count = 0;
-    deferred_slab->error_code = PTO2_ERROR_NONE;
-    AsyncCtx async_ctx = AsyncCtx::make(slot_state.task->task_id, deferred_slab);
-    build_payload(payload, slot_state, subslot, async_ctx, block_idx);
+    // The deferred_slab is NOT reset here: it is init-cleared once and the
+    // completion path re-clears count only after a task actually recorded a
+    // deferred completion (count > 0), which is rare. A non-deferred task never
+    // touches count/error_code, so the slab stays clean without a per-dispatch
+    // write — keeping this cold per-core line off the dispatch path.
+    build_payload(payload, slot_state, subslot, block_idx, force_gate);
 
     if (to_pending) {
         core_exec_state.pending_subslot = subslot;
@@ -213,7 +235,7 @@ SchedulerContext::PublishHandle SchedulerContext::prepare_subtask_to_core(
 
 int SchedulerContext::prepare_block_for_dispatch(
     int32_t thread_idx, int32_t core_offset, PTO2TaskSlotState &slot_state, PTO2ResourceShape shape, bool to_pending,
-    int32_t block_idx, PublishHandle *out_handles
+    int32_t block_idx, PublishHandle *out_handles, bool force_gate
 ) {
 #if SIMPLER_DFX
     if (is_dump_args_enabled()) {
@@ -232,22 +254,30 @@ int SchedulerContext::prepare_block_for_dispatch(
     if (shape == PTO2ResourceShape::MIX) {
         uint8_t cmask = slot_state.active_mask.core_mask();
         int n = 0;
+        // Per-core slot placement (#1308): an idle used core takes its running slot
+        // (tracked by the completion poller), a busy used core takes its gated pending slot
+        // (promoted on completion). The sync_start drain relies on this — it passes
+        // to_pending=true so every busy core opts into a pending slot; the non-zero
+        // src_payload gate keeps the whole cohort waiting for the rendezvous.
         if (cmask & PTO2_SUBTASK_MASK_AIC) {
             bool p = to_pending && !tracker.is_aic_core_idle(core_offset);
             out_handles[n++] = prepare_subtask_to_core(
-                thread_idx, tracker.get_aic_core_offset(core_offset), slot_state, PTO2SubtaskSlot::AIC, p, block_idx
+                thread_idx, tracker.get_aic_core_offset(core_offset), slot_state, PTO2SubtaskSlot::AIC, p, block_idx,
+                force_gate
             );
         }
         if (cmask & PTO2_SUBTASK_MASK_AIV0) {
             bool p = to_pending && !tracker.is_aiv0_core_idle(core_offset);
             out_handles[n++] = prepare_subtask_to_core(
-                thread_idx, tracker.get_aiv0_core_offset(core_offset), slot_state, PTO2SubtaskSlot::AIV0, p, block_idx
+                thread_idx, tracker.get_aiv0_core_offset(core_offset), slot_state, PTO2SubtaskSlot::AIV0, p, block_idx,
+                force_gate
             );
         }
         if (cmask & PTO2_SUBTASK_MASK_AIV1) {
             bool p = to_pending && !tracker.is_aiv1_core_idle(core_offset);
             out_handles[n++] = prepare_subtask_to_core(
-                thread_idx, tracker.get_aiv1_core_offset(core_offset), slot_state, PTO2SubtaskSlot::AIV1, p, block_idx
+                thread_idx, tracker.get_aiv1_core_offset(core_offset), slot_state, PTO2SubtaskSlot::AIV1, p, block_idx,
+                force_gate
             );
         }
 #if SIMPLER_DFX
@@ -255,15 +285,17 @@ int SchedulerContext::prepare_block_for_dispatch(
 #endif
         return n;
     } else if (shape == PTO2ResourceShape::AIC) {
-        out_handles[0] =
-            prepare_subtask_to_core(thread_idx, core_offset, slot_state, PTO2SubtaskSlot::AIC, to_pending, block_idx);
+        out_handles[0] = prepare_subtask_to_core(
+            thread_idx, core_offset, slot_state, PTO2SubtaskSlot::AIC, to_pending, block_idx, force_gate
+        );
 #if SIMPLER_DFX
         sched_l2_swimlane_[thread_idx].phase_dispatch_count += 1;
 #endif
         return 1;
     } else {
-        out_handles[0] =
-            prepare_subtask_to_core(thread_idx, core_offset, slot_state, PTO2SubtaskSlot::AIV0, to_pending, block_idx);
+        out_handles[0] = prepare_subtask_to_core(
+            thread_idx, core_offset, slot_state, PTO2SubtaskSlot::AIV0, to_pending, block_idx, force_gate
+        );
 #if SIMPLER_DFX
         sched_l2_swimlane_[thread_idx].phase_dispatch_count += 1;
 #endif
@@ -326,14 +358,11 @@ void SchedulerContext::dispatch_shape(
         PublishHandle handles[CoreTracker::MAX_CLUSTERS * 3];
         int handle_count = 0;
         bool dispatched_any = false;
-        // Slots dispatched this pop whose dispatch_fanin must be propagated to
-        // consumers. Deferred until AFTER publish (below) so a flagged producer's
-        // fanout walk never sits between claiming cores and publishing its own
-        // blocks — doing it inline delays this thread's blocks while peer threads
-        // co-dispatching the same SPMD task publish immediately, misaligning the
-        // task's block starts. Bounded by cores.count() ≤ MAX_CLUSTERS dispatches.
-        PTO2TaskSlotState *prop_list[CoreTracker::MAX_CLUSTERS];
-        int prop_n = 0;
+        // Logical block ranges published by this pop. AIV can pop two entries per
+        // cluster, so this ledger has the same worst-case bound as handles[].
+        PTO2TaskSlotState *published_list[CoreTracker::MAX_CLUSTERS * 3];
+        int16_t published_counts[CoreTracker::MAX_CLUSTERS * 3];
+        int published_n = 0;
 #if SIMPLER_SCHED_PROFILING
         uint64_t t_setup_start = get_sys_cnt_aicpu();
 #endif
@@ -406,14 +435,6 @@ void SchedulerContext::dispatch_shape(
                 break;
             }
 
-            dispatched_any = true;
-            try_pushed = true;
-            // Record for deferred dispatch_fanin propagation after this pop's
-            // blocks are published (see after the loop). propagate's own guard
-            // filters non-flagged slots, so recording unconditionally is cheap.
-            if (prop_n < static_cast<int>(sizeof(prop_list) / sizeof(prop_list[0]))) {
-                prop_list[prop_n++] = slot_state;
-            }
             // Claim a contiguous range of blocks, hand the slot back to the
             // ready queue immediately, then perform the expensive dispatches.
             // This lets other schedulers concurrently claim and dispatch the
@@ -421,11 +442,16 @@ void SchedulerContext::dispatch_shape(
             // this thread fills all its own cores. Only local `start + b` is
             // read after the push — `next_block_idx` may already be advanced
             // by another scheduler that popped the slot.
-            int32_t start = slot_state->next_block_idx.load(std::memory_order_relaxed);
-            int32_t remaining = slot_state->logical_block_num - start;
             int32_t available = is_mix ? selected_mix_clusters.count() : cores.count();
-            int32_t claim = std::min(available, remaining);
-            slot_state->next_block_idx.store(static_cast<int16_t>(start + claim), std::memory_order_relaxed);
+            int32_t start = 0;
+            int32_t claim = slot_state->claim_block_range(slot_state->logical_block_num, available, start);
+            if (claim == 0) continue;
+            dispatched_any = true;
+            try_pushed = true;
+
+            published_list[published_n] = slot_state;
+            published_counts[published_n] = static_cast<int16_t>(claim);
+            published_n++;
 
             if (start + claim < slot_state->logical_block_num) {
                 disp_queues[static_cast<int32_t>(shape)].push(slot_state);
@@ -451,11 +477,9 @@ void SchedulerContext::dispatch_shape(
         }
 
         flush_publish();
-        // Blocks are published; now propagate dispatch_fanin for any flagged
-        // producers dispatched above (knob A: producer is running). Off the
-        // pre-publish path so it cannot delay or misalign their blocks.
-        for (int i = 0; i < prop_n; i++) {
-            sched_->propagate_dispatch_fanin(*prop_list[i]);
+        for (int i = 0; i < published_n; i++) {
+            sched_->record_published_blocks(*published_list[i], published_counts[i]);
+            sched_->propagate_dispatch_fanin(*published_list[i]);
         }
 #if SIMPLER_SCHED_PROFILING
         l2_swimlane.sched_dispatch_setup_cycle += (get_sys_cnt_aicpu() - t_setup_start);
@@ -571,11 +595,11 @@ void SchedulerContext::dispatch_ready_tasks(
 }
 
 // Stage the ALREADY-CLAIMED range [start, start+count) of consumer `c` onto
-// thread_idx's idle then pending cores. The caller (the queue drain) has advanced
-// next_block_idx by `count` under pop-exclusivity AND re-pushed `c` for peers
+// thread_idx's idle then pending cores. The caller has atomically advanced
+// next_block_idx by `count` AND re-pushed `c` for peers
 // BEFORE calling this — so this, the expensive prepare+publish, runs CONCURRENTLY
 // with peers staging other ranges of the same consumer. This mirrors the normal
-// SPMD dispatch path (claim range -> store next_block_idx -> re-push -> dispatch).
+// SPMD dispatch path (claim range -> re-push -> dispatch).
 // `idle`/`pend` are this thread's free-core sets, sized so idle.count+pend.count >=
 // count (the caller clamped the claim to them), so all `count` blocks get a core.
 //
@@ -585,10 +609,10 @@ void SchedulerContext::dispatch_ready_tasks(
 // waiting for an ack the gated task never sends). Each staged core stays
 // pending_occupied while gated, so no second gated block stacks on it.
 //
-// Self-ring: release flips STAGING->DISPATCHED then rings the mask. A block staged
-// after that flip isn't in the mask release read, so this thread rings it here. The
-// seq_cst order between "OR mask then load early_dispatch_state" (here) and "store DISPATCHED
-// then read mask" (release) guarantees every gated core's doorbell fires.
+// Doorbell ownership: release flips STAGING->DISPATCHED and exchanges the shared
+// mask to claim its bits. A late stager ORs its bits, then fetch-and-clears only
+// those release did not take and rings them from its immutable local handles.
+// The seq_cst order guarantees every gated core has exactly one writer.
 int32_t SchedulerContext::stage_consumer_blocks(
     int32_t thread_idx, PTO2TaskSlotState *c, PTO2ResourceShape shape, int32_t start, int32_t count,
     CoreTracker::BitStates &idle, CoreTracker::BitStates &pend
@@ -597,13 +621,13 @@ int32_t SchedulerContext::stage_consumer_blocks(
     // Stamp the real pre-stage time (NOT 0) so the swimlane shows these blocks
     // dispatched during the producer's run, not at trace start.
     uint64_t early_dispatch_ts = get_sys_cnt_aicpu();
-    uint64_t my_cores[PTO2_EARLY_DISPATCH_CORE_MASK_WORDS] = {0};  // cores this thread gated (for self-ring)
+    uint64_t my_cores[PTO2_EARLY_DISPATCH_CORE_MASK_WORDS] = {0};  // cores gated by this staging pass
     int32_t staged = 0;
     int32_t block = start;
     // Mirror the normal flush_publish (scheduler_dispatch.cpp wmb()+publish loop):
     // prepare ALL claimed blocks' payloads (idle bucket -> running slot, pend bucket
     // -> gated pending), then ONE wmb(), then publish. The wmb guarantees the
-    // not_ready gate + args are globally visible before any DATA_MAIN_BASE token —
+    // src_payload gate + source args are globally visible before any DATA_MAIN_BASE token —
     // without it a gated core can pick up the token and dcci a stale payload. The
     // shared `count` budget bounds total blocks <= free clusters/cores, so both
     // buckets fit one handles[] buffer.
@@ -612,7 +636,9 @@ int32_t SchedulerContext::stage_consumer_blocks(
     auto prepare_from = [&](CoreTracker::BitStates &avail, bool to_pending) {
         while (count > 0 && avail.has_value()) {
             int32_t core_offset = avail.pop_first();
-            n += prepare_block_for_dispatch(thread_idx, core_offset, *c, shape, to_pending, block, &handles[n]);
+            n += prepare_block_for_dispatch(
+                thread_idx, core_offset, *c, shape, to_pending, block, &handles[n], /*force_gate=*/true
+            );
             block++;
             count--;
             staged++;
@@ -635,21 +661,35 @@ int32_t SchedulerContext::stage_consumer_blocks(
     for (int w = 0; w < PTO2_EARLY_DISPATCH_CORE_MASK_WORDS; w++)
         if (my_cores[w] != 0) c->payload->staged_core_mask[w].fetch_or(my_cores[w], std::memory_order_seq_cst);
 
-    // If release already flipped DISPATCHED, it may have read the mask before our
-    // bits landed — ring our own cores so none is left gated forever.
-    if (staged > 0 &&
-        c->payload->early_dispatch_state.load(std::memory_order_seq_cst) == PTO2_EARLY_DISPATCH_DISPATCHED) {
+    // Full publication and release are independent events. The seq_cst
+    // state/launch/count operations form a two-sided handshake. A released
+    // block must ring before contributing to the publication count.
+    bool released = staged > 0 &&
+                    c->payload->early_dispatch_state.load(std::memory_order_seq_cst) == PTO2_EARLY_DISPATCH_DISPATCHED;
+
+    // Claim only bits the release path did not take. Local handles remain valid
+    // even if the shared per-core table is reused before this thread resumes.
+    if (released) {
+        uint64_t owned[PTO2_EARLY_DISPATCH_CORE_MASK_WORDS] = {0};
         for (int w = 0; w < PTO2_EARLY_DISPATCH_CORE_MASK_WORDS; w++) {
-            uint64_t bits = my_cores[w];
-            while (bits != 0) {
-                int cid = w * 64 + __builtin_ctzll(bits);
-                bits &= bits - 1;
-                PTO2SchedulerState::ring_one_doorbell(
-                    sched_->early_dispatch_doorbell_table[cid].addr, sched_->early_dispatch_doorbell_table[cid].token
-                );
+            if (my_cores[w] != 0) {
+                owned[w] =
+                    PTO2SchedulerState::claim_late_staged_doorbell_bits(c->payload->staged_core_mask[w], my_cores[w]);
             }
         }
+        for (int i = 0; i < n; i++) {
+            int32_t cid = tracker.get_core_id_by_offset(handles[i].core_offset);
+            PTO2SchedulerState::ring_claimed_local_doorbell(
+                owned[cid >> 6], cid, handles[i].reg_addr, handles[i].reg_task_id
+            );
+        }
+        wmb();
     }
+    sched_->record_published_blocks(*c, staged);
+    // Retry unconditionally after publication. The guards are cheap, and a
+    // pre-ring state read can become stale if release completes before this
+    // count update.
+    sched_->propagate_dispatch_fanin(*c);
     return staged;
 }
 
@@ -717,22 +757,8 @@ SchedulerContext::early_dispatch_shape(int32_t thread_idx, PTO2ResourceShape sha
             sched_->early_dispatch_queues[s].push_batch(&batch[bi], got - bi);
             break;
         }
-        // CAS-claim a contiguous range [start, start+claim) sized to this thread's
-        // free cores; CAS keeps it atomic against peers AND normal dispatch.
-        int32_t start = 0, claim = 0;
-        while (true) {
-            int16_t cur = c->next_block_idx.load(std::memory_order_relaxed);
-            if (cur >= c->logical_block_num) break;  // fully claimed
-            int32_t cnt = c->logical_block_num - cur;
-            if (cnt > freecores) cnt = freecores;
-            if (c->next_block_idx.compare_exchange_weak(
-                    cur, static_cast<int16_t>(cur + cnt), std::memory_order_seq_cst, std::memory_order_relaxed
-                )) {
-                start = cur;
-                claim = cnt;
-                break;
-            }
-        }
+        int32_t start = 0;
+        int32_t claim = c->claim_block_range(c->logical_block_num, freecores, start);
         if (claim == 0) continue;  // nothing left to claim -> drop (no re-push)
         // Re-push for concurrent peers BEFORE the expensive staging.
         if (start + claim < c->logical_block_num) {
@@ -752,11 +778,11 @@ SchedulerContext::early_dispatch_shape(int32_t thread_idx, PTO2ResourceShape sha
     return total_staged;
 }
 
-// Early-dispatch drain (idle pass), mirroring dispatch_ready_tasks: owns its own
-// gating and progress-flag updates, and orders staging the same way — MIX strict
-// priority, IDLE stage before PENDING stage, cross-thread idle gating
-// (MIX-IDLE ▶ c/v-IDLE ▶ MIX-PEND ▶ c/v-PEND). sync_start doesn't apply here (those
-// tasks are excluded from early dispatch at push time, propagate_dispatch_fanin).
+// Early-dispatch drain (idle pass) — the EARLY source's analog of dispatch_ready_tasks.
+// Both sources share run_staging_order for the shape order (MIX strict priority, IDLE
+// before PENDING, cross-thread idle gating: MIX-IDLE ▶ c/v-IDLE ▶ MIX-PEND ▶ c/v-PEND) and
+// both drain their sync_start cohort FIRST as the highest occupancy tier (Tier 0), via the
+// same all-or-nothing drain barrier. This one owns its own gating and progress flags.
 // Returns the number of blocks staged this pass (for the EarlyDispatch swimlane bar).
 int32_t SchedulerContext::try_early_dispatch(
     int32_t thread_idx, CoreTracker &tracker, bool pmu_active, bool &made_progress, bool &try_pushed
@@ -776,9 +802,31 @@ int32_t SchedulerContext::try_early_dispatch(
         if (sched_->ready_sync_queues[s].size() > 0 || sched_->ready_queues[s].size() > 0) return 0;
     }
 
-    // Early staging (NOT is_ready): same MIX/idle/pending order as normal dispatch, via the
-    // shared skeleton. early_dispatch_shape stages a gated block range and never enters drain,
-    // so the stage callback always reports "no stop".
+    // ===== Tier 0: sync_start cohorts (highest occupancy tier, all-or-nothing) =====
+    // sync_start candidates park in their own shape-agnostic queue. They cannot ride
+    // early_dispatch_shape's per-thread partial range-claim (a partial claim strands gated
+    // cohort blocks nobody rings, so the rendezvous never reaches block_num). Instead arm the
+    // drain barrier: it takes exclusive tracker access and only stages when global
+    // idle+pending >= block_num, guaranteeing all-or-nothing. Win => the dispatch loop runs
+    // the gated drain next iteration; lose (a drain is already armed, or capacity <
+    // block_num) => cancel the owner and re-push or transfer its final ready route. A
+    // non-STAGING pop was already released and is dropped. Staging happens inside the drain,
+    // so this arms at most one drain and adds no blocks to total_staged here.
+    if (PTO2TaskSlotState *c = sched_->early_sync_start_queue.pop()) {
+        if (PTO2SchedulerState::try_claim_early_sync_drain(*c->payload)) {
+            if (c->payload->early_dispatch_state.load(std::memory_order_seq_cst) != PTO2_EARLY_DISPATCH_STAGING) {
+                sched_->cancel_early_sync_drain(*c);
+            } else if (enter_drain_mode(c, c->logical_block_num)) {
+                PTO2SchedulerState::mark_early_sync_drain_armed(*c->payload);
+            } else {
+                sched_->cancel_early_sync_drain(*c);
+            }
+        }
+    }
+
+    // Regular early staging (NOT is_ready): same MIX/idle/pending order as normal dispatch,
+    // via the shared skeleton. early_dispatch_shape stages a gated block range and never
+    // enters drain, so the stage callback always reports "no stop".
     int32_t total_staged = 0;
     run_staging_order(
         thread_idx, pmu_active,
@@ -890,7 +938,9 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
             // and silently corrupt the snapshot.
             constexpr size_t kMax = static_cast<size_t>(std::numeric_limits<int16_t>::max());
             for (int s = 0; s < L2SWIMLANE_NUM_QUEUE_SHAPES; s++) {
-                const size_t qsize = sched_->ready_queues[s].size();
+                // Total normal-source ready depth of shape `s` = regular ready lane + the
+                // sync_start Tier-0 lane; both feed dispatch_ready_tasks for this shape.
+                const size_t qsize = sched_->ready_queues[s].size() + sched_->ready_sync_queues[s].size();
                 iter_shared_snapshot[s] = static_cast<int16_t>(std::min(qsize, kMax));
             }
             iter_shared_sampled = true;
@@ -922,7 +972,6 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
     // "now" so the first budget cycle starts when this thread does, not at
     // an undefined value.
     uint64_t last_progress_ts = get_sys_cnt_aicpu();
-
     while (true) {
         if (completed_.load(std::memory_order_acquire)) {
             break;
@@ -1043,7 +1092,27 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
 
         // Phase 2 drain check
         if (drain_state_.sync_start_pending.load(std::memory_order_acquire) != 0) {
+#if SIMPLER_DFX
+            // The drain is otherwise a swimlane blind spot: the `continue` below skips
+            // every phase record, and handle_drain_mode is uninstrumented. Time it here so
+            // the sync_start stop-the-world window shows on the scheduler lane (one bar per
+            // iteration that enters the drain; retries appear as multiple bars).
+            uint64_t drain_t0 = (l2_swimlane_level_ >= L2SwimlaneLevel::SCHED_PHASES) ? get_sys_cnt_aicpu() : 0;
+            uint64_t drain_stage_wall = 0;  // set by handle_drain_mode ONLY if this thread staged
+            handle_drain_mode(thread_idx, &drain_stage_wall);
+            // Record a Drain bar only when this thread actually did drain work (reached
+            // drain_stage_cores). The many no-op entries — ack + availability-insufficient
+            // reset, stale-elected, non-elected bail before stage_go — never stage, so they
+            // would otherwise clutter the lane with zero-work drain(0) bars.
+            if (l2_swimlane_level_ >= L2SwimlaneLevel::SCHED_PHASES && drain_stage_wall != 0) {
+                l2_swimlane_aicpu_record_sched_phase(
+                    thread_idx, L2SwimlaneSchedPhaseKind::Drain, drain_t0, get_sys_cnt_aicpu(),
+                    l2_swimlane.sched_loop_count, static_cast<uint32_t>(drain_stage_wall)
+                );
+            }
+#else
             handle_drain_mode(thread_idx);
+#endif
             continue;
         }
 

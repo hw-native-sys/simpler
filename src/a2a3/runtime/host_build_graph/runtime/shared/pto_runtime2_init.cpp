@@ -120,6 +120,7 @@ PTO2SchedulerLayout PTO2SchedulerState::reserve_layout(DeviceArena &arena, int32
     for (int i = 0; i < PTO2_NUM_RESOURCE_SHAPES; i++) {
         layout.off_early_dispatch_queue_slots[i] = ready_queue_reserve_layout(arena, PTO2_EARLY_DISPATCH_QUEUE_SIZE);
     }
+    layout.off_early_sync_start_queue_slots = ready_queue_reserve_layout(arena, PTO2_EARLY_DISPATCH_QUEUE_SIZE);
     // Force a cache-line base so writes from scheduler thread 0 (sole writer of
     // the dep_pool) do not invalidate adjacent multi-threaded regions like
     // ready_queue.slots.
@@ -169,6 +170,12 @@ bool PTO2SchedulerState::init_data_from_layout(
             return false;
         }
     }
+    if (!ready_queue_init_data_from_layout(
+            &sched->early_sync_start_queue, arena, layout.off_early_sync_start_queue_slots,
+            PTO2_EARLY_DISPATCH_QUEUE_SIZE
+        )) {
+        return false;
+    }
 
     auto *orch_err = pto2_sm_layout::orch_error_code_addr(sm_dev_base);
     auto *dep_entries = static_cast<PTO2DepListEntry *>(arena.region_ptr(layout.off_dep_pool_entries));
@@ -192,6 +199,7 @@ void PTO2SchedulerState::wire_arena_pointers(const PTO2SchedulerLayout &layout, 
             &sched->early_dispatch_queues[i], arena, layout.off_early_dispatch_queue_slots[i]
         );
     }
+    ready_queue_wire_arena_pointers(&sched->early_sync_start_queue, arena, layout.off_early_sync_start_queue_slots);
     sched->ring_sched_state.dep_pool.base =
         static_cast<PTO2DepListEntry *>(arena.region_ptr(layout.off_dep_pool_entries));
 }
@@ -210,6 +218,7 @@ void PTO2SchedulerState::destroy() {
     for (int i = 0; i < PTO2_NUM_RESOURCE_SHAPES; i++) {
         ready_queue_destroy(&sched->early_dispatch_queues[i]);
     }
+    ready_queue_destroy(&sched->early_sync_start_queue);
 }
 
 // =============================================================================

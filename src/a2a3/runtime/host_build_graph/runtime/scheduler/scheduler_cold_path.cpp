@@ -933,6 +933,35 @@ int32_t SchedulerContext::post_handshake_init(Runtime *runtime) {
         }
     }
 
+    // Prefill the per-dispatch AsyncCtx constant fields once. Of AsyncCtx's five
+    // fields, four are constant for a given (core, buf_idx): the three pointers
+    // target the fixed deferred_slab_per_core_[core][buf] members, and capacity is
+    // MAX_COMPLETIONS_PER_TASK. Only task_token varies per dispatch, so build_payload
+    // writes just that; these constants survive across dispatches because the
+    // payload buffer is never zeroed between them.
+    // The two context-pointer args are also per-(core, buf_idx) constants — they
+    // target this buffer's own local_context / global_context — so prefill them
+    // here too and drop them from the per-dispatch build_payload writes. This keeps
+    // the per-dispatch write footprint on the CL0 control block only (args[48]/[49]
+    // live on a later line).
+    for (int32_t core_id = 0; core_id < RUNTIME_MAX_WORKER; core_id++) {
+        for (int32_t buf = 0; buf < 2; buf++) {
+            PTO2DispatchPayload &dp = payload_per_core_[core_id][buf];
+            AsyncCtx &ac = dp.local_context.async_ctx;
+            volatile DeferredCompletionSlab *slab = &deferred_slab_per_core_[core_id][buf];
+            ac.completion_count = &slab->count;
+            ac.completion_error_code = &slab->error_code;
+            ac.completion_entries = &slab->entries[0];
+            ac.completion_capacity = MAX_COMPLETIONS_PER_TASK;
+            // Clear the slab once here; thereafter only the completion path re-clears
+            // count (and only when a deferred task dirtied it), never per dispatch.
+            slab->count = 0;
+            slab->error_code = PTO2_ERROR_NONE;
+            dp.args[PAYLOAD_LOCAL_CONTEXT_INDEX] = reinterpret_cast<uint64_t>(&dp.local_context);
+            dp.args[PAYLOAD_GLOBAL_CONTEXT_INDEX] = reinterpret_cast<uint64_t>(&dp.global_context);
+        }
+    }
+
     func_id_to_addr_ = runtime->func_id_to_addr_;
 
     return 0;
@@ -947,11 +976,14 @@ void SchedulerContext::deinit() {
     }
 
     // No per-core memset of payload_per_core_ / deferred_slab_per_core_ here
-    // (~300 KB across all cores). Both are fully re-initialized at dispatch
-    // before they can be read: dispatch_task sets deferred_slab->count = 0 /
-    // error_code = NONE and build_payload() overwrites every payload field
-    // (function addr, args[], contexts, not_ready) on the exact [core][buf_idx]
-    // about to run. The consumer side cannot reach a stale slot either: the
+    // (~300 KB across all cores). They are re-initialized before they can be read:
+    // build_payload() overwrites the per-dispatch payload fields (function addr,
+    // args[0..num_args) or src_payload, block_idx/block_num, async_ctx.task_token)
+    // on the exact [core][buf_idx] about to run; the async_ctx slab pointers +
+    // capacity, the two context-pointer args, and the deferred slab (count = 0 /
+    // error_code = NONE) are all cleared once per run in init() — the slab is
+    // thereafter re-cleared only by the completion path after a deferred task.
+    // The consumer side cannot reach a stale slot either: the
     // drain only services a core's running_reg_task_id, and the loop above
     // already reset every core_exec_states_[].running/pending_reg_task_id to
     // AICPU_TASK_INVALID — so no FIN for an undispatched slot is processed, and
@@ -962,6 +994,9 @@ void SchedulerContext::deinit() {
     drain_state_.sync_start_pending.store(0, std::memory_order_release);
     drain_state_.drain_worker_elected.store(0, std::memory_order_release);
     drain_state_.drain_ack_mask.store(0, std::memory_order_release);
+    drain_state_.drain_stage_go.store(0, std::memory_order_release);
+    drain_state_.drain_stage_done_mask.store(0, std::memory_order_release);
+    drain_state_.drain_running_staged.store(0, std::memory_order_release);
     drain_state_.pending_task.store(nullptr, std::memory_order_release);
 
     // Reset task counters and orchestrator state

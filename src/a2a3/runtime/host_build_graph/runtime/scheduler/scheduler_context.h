@@ -222,7 +222,7 @@ private:
 
     void build_payload(
         PTO2DispatchPayload &dispatch_payload, PTO2TaskSlotState &slot_state, PTO2SubtaskSlot subslot,
-        const AsyncCtx &async_ctx, int32_t block_idx
+        int32_t block_idx, bool force_gate
     );
 
     // Batched-dispatch primitives. prepare_* builds the payload and per-core
@@ -243,7 +243,7 @@ private:
 
     PublishHandle prepare_subtask_to_core(
         int32_t thread_idx, int32_t core_offset, PTO2TaskSlotState &slot_state, PTO2SubtaskSlot subslot,
-        bool to_pending, int32_t block_idx
+        bool to_pending, int32_t block_idx, bool force_gate
     );
 
     inline void publish_subtask_to_core(const PublishHandle &h, uint64_t dispatch_ts) {
@@ -253,11 +253,44 @@ private:
         write_reg(h.reg_addr, RegId::DATA_MAIN_BASE, static_cast<uint64_t>(h.reg_task_id));
     }
 
+    // Prefetch the cold per-core structures the next block's prepare touches.
+    // Ordering is load-bearing: issue the STALLING LOAD first — CoreExecState,
+    // read by dispatch_seq++ whose value feeds reg_task_id -> buf_idx -> the whole
+    // dispatch — for every core of the block, BEFORE the store-target prefetches.
+    // MSHRs saturate (a MIX block warms 3 cores); issuing the read prefetches
+    // first keeps them from being the ones dropped. The dispatch-buffer writes
+    // still get prefetched (measured to help ~30% on this shallow-store-buffer
+    // control core), just after the reads. rw=1 on CoreExecState (read AND
+    // written) gives Exclusive, serving both without a Shared->Exclusive upgrade.
+    inline void prefetch_block_dst(int32_t thread_idx, int32_t core_offset, bool is_mix) {
+        CoreTracker &tracker = core_trackers_[thread_idx];
+        int32_t cids[3] = {};
+        int32_t nc = 0;
+        if (is_mix) {
+            cids[nc++] = tracker.get_core_id_by_offset(tracker.get_aic_core_offset(core_offset));
+            cids[nc++] = tracker.get_core_id_by_offset(tracker.get_aiv0_core_offset(core_offset));
+            cids[nc++] = tracker.get_core_id_by_offset(tracker.get_aiv1_core_offset(core_offset));
+        } else {
+            cids[nc++] = tracker.get_core_id_by_offset(core_offset);
+        }
+        // Stalling loads first.
+        for (int32_t i = 0; i < nc; i++)
+            __builtin_prefetch(&core_exec_states_[cids[i]], 1, 3);
+        // Store targets after (dispatch buffer CL0 control + CL1 args, both bufs).
+        for (int32_t i = 0; i < nc; i++) {
+            for (int32_t buf = 0; buf < 2; buf++) {
+                const char *dp = reinterpret_cast<const char *>(&payload_per_core_[cids[i]][buf]);
+                __builtin_prefetch(dp, 1, 3);
+                __builtin_prefetch(dp + 64, 1, 3);
+            }
+        }
+    }
+
     // Fan out one block's subtasks (1 for AIC/AIV, 1-3 for MIX) into the
     // caller-supplied handles buffer. Returns the number of handles written.
     int prepare_block_for_dispatch(
         int32_t thread_idx, int32_t core_offset, PTO2TaskSlotState &slot_state, PTO2ResourceShape shape,
-        bool to_pending, int32_t block_idx, PublishHandle *out_handles
+        bool to_pending, int32_t block_idx, PublishHandle *out_handles, bool force_gate = false
     );
 
     void dispatch_shape(
@@ -270,7 +303,7 @@ private:
     // is queued) and sets made_progress / try_pushed when it stages, so the caller
     // is a single unconditional call like normal dispatch. After normal dispatch
     // leaves idle cores spare, pre-stage the consumers of any RUNNING flagged
-    // producer onto those cores with not_ready=1 (gated). Touches no dependency
+    // producer onto those cores with a non-zero src_payload (gated). Touches no dependency
     // state — the task is released by the doorbell at its normal ready-pop (Hook 2).
     int32_t try_early_dispatch(
         int32_t thread_idx, CoreTracker &tracker, bool pmu_active, bool &made_progress, bool &try_pushed
@@ -278,7 +311,7 @@ private:
 
     // Stage the already-claimed range [start, start+count) of consumer `c` onto
     // thread_idx's idle (RUNNING slot) then pending (gated-pending, promote-on-FIN)
-    // cores from the provided free-core sets. The caller advances next_block_idx and
+    // cores from the provided free-core sets. The caller claims next_block_idx and
     // re-pushes `c` BEFORE calling, so this expensive prepare+publish runs
     // concurrently with peers (mirrors the normal SPMD dispatch path). Returns the
     // number of blocks staged.
@@ -378,9 +411,15 @@ private:
     );
 
     bool enter_drain_mode(PTO2TaskSlotState *slot_state, int32_t block_num);
-    int32_t count_global_available(PTO2ResourceShape shape, uint8_t core_mask);
-    void drain_worker_dispatch(int32_t block_num);
-    void handle_drain_mode(int32_t thread_idx);
+    int32_t count_global_available(PTO2ResourceShape shape, uint8_t core_mask, bool include_pending = false);
+    // One thread's share of the drain: CAS-claim block indices and stage them onto THIS
+    // thread's own cores (parallel with peers), returning the number of running-slot cores
+    // staged (the rendezvous seed contribution).
+    int32_t drain_stage_cores(PTO2TaskSlotState *slot_state, int32_t block_num, int32_t thread_idx, bool gated);
+    // out_stage_wall_cycles (profiling only): cycles this thread spent in drain_stage_cores
+    // (prepare + publish), set ONLY on threads that actually staged. Lets the caller isolate
+    // the pure stage wall from the ack-barrier + finalize spans in the Drain bar.
+    void handle_drain_mode(int32_t thread_idx, uint64_t *out_stage_wall_cycles = nullptr);
 
     // =========================================================================
     // Cold path: exit checks, stall diagnostics, profiling (scheduler_cold_path.cpp)
