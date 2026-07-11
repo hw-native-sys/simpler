@@ -777,17 +777,30 @@ struct PTO2SchedulerState {
     // this shape-agnostic: an AIC/AIV block is one core, a MIX block is a cluster whose
     // cores promote pending->running independently. Called from both halves (the producer
     // release and each pending->running promotion); whichever observes the second half
-    // rings. seq_cst on running_slot_count and early_dispatch_state makes "second observer rings" a
-    // total order; a double ring (both observe) is harmless. No-op until both hold.
-    inline void maybe_rendezvous_ring(PTO2TaskSlotState &slot_state) {
+    // wins the launch latch and rings exactly once. Returns true only to that winner,
+    // which may then expose the cohort to its fanout.
+    inline bool maybe_rendezvous_ring(PTO2TaskSlotState &slot_state) {
         int32_t staged_cores = 0;
         for (int w = 0; w < PTO2_EARLY_DISPATCH_CORE_MASK_WORDS; w++)
             staged_cores +=
                 __builtin_popcountll(slot_state.payload->staged_core_mask[w].load(std::memory_order_seq_cst));
-        if (slot_state.payload->running_slot_count.load(std::memory_order_seq_cst) != staged_cores) return;
+        if (staged_cores == 0) return false;
+        if (slot_state.payload->running_slot_count.load(std::memory_order_seq_cst) != staged_cores) return false;
         if (slot_state.payload->early_dispatch_state.load(std::memory_order_seq_cst) != PTO2_EARLY_DISPATCH_DISPATCHED)
-            return;
+            return false;
+        if (!try_claim_early_dispatch_launch(*slot_state.payload)) return false;
         ring_all_staged_doorbells(slot_state);
+        wmb();
+        slot_state.payload->early_dispatch_launch_state.store(
+            PTO2_EARLY_DISPATCH_LAUNCH_COMPLETE, std::memory_order_release
+        );
+        return true;
+    }
+
+    inline bool retry_sync_start_rendezvous_after_drain(PTO2TaskSlotState &slot_state) {
+        if (!maybe_rendezvous_ring(slot_state)) return false;
+        propagate_dispatch_fanin(slot_state);
+        return true;
     }
 
     // Event-driven candidate detection (the dual of fanin_refcount/ready). Called after a
@@ -808,10 +821,16 @@ struct PTO2SchedulerState {
     void propagate_dispatch_fanin(PTO2TaskSlotState &p) {
         if (!p.allow_early_resolve) return;  // only codegen-flagged (direct) producers propagate
         if (p.payload->published_block_count.load(std::memory_order_seq_cst) < p.logical_block_num) return;
-        if (p.payload->early_dispatch_state.load(std::memory_order_seq_cst) == PTO2_EARLY_DISPATCH_STAGING) return;
-        if (p.payload->early_dispatch_launch_state.load(std::memory_order_seq_cst) ==
-            PTO2_EARLY_DISPATCH_LAUNCH_RINGING)
-            return;
+        if (p.payload->early_dispatch_state.load(std::memory_order_acquire) == PTO2_EARLY_DISPATCH_STAGING) return;
+        uint8_t launch_state = p.payload->early_dispatch_launch_state.load(std::memory_order_acquire);
+        if (launch_state == PTO2_EARLY_DISPATCH_LAUNCH_RINGING) return;
+        if (p.active_mask.requires_sync_start()) {
+            bool was_pre_staged = false;
+            for (int w = 0; w < PTO2_EARLY_DISPATCH_CORE_MASK_WORDS; w++) {
+                was_pre_staged |= p.payload->staged_core_mask[w].load(std::memory_order_acquire) != 0;
+            }
+            if (was_pre_staged && launch_state != PTO2_EARLY_DISPATCH_LAUNCH_COMPLETE) return;
+        }
         if (p.payload->dispatch_propagated.exchange(1, std::memory_order_acq_rel) != 0)
             return;  // already propagated once
         p.lock_fanout();
@@ -889,8 +908,9 @@ struct PTO2SchedulerState {
         // flip to DISPATCHED above is only the producer-released half; maybe_rendezvous_ring
         // rings now iff running_slot_count already reached popcount(staged_core_mask) (all
         // gated cores took idle running slots), else the last pending->running promotion rings.
+        bool launched = true;
         if (sync_start) {
-            maybe_rendezvous_ring(slot_state);
+            launched = maybe_rendezvous_ring(slot_state);
         } else {
             // Destructively claim every published bit. A stager racing this pass
             // can claim only bits that land after the exchange, so each gated core
@@ -910,8 +930,10 @@ struct PTO2SchedulerState {
         // sink so it runs after the whole fanout walk: doing it inline here would
         // delay the doorbells of later consumers in the same producer's fanout.
         // Fallback to inline if no sink / sink full.
-        if (sink == nullptr || !sink->push(&slot_state)) {
-            propagate_dispatch_fanin(slot_state);
+        if (launched) {
+            if (sink == nullptr || !sink->push(&slot_state)) {
+                propagate_dispatch_fanin(slot_state);
+            }
         }
         // No explicit removal from the cross-thread queue: a still-queued entry for
         // this consumer is now DISPATCHED and is dropped when a peer pops it.

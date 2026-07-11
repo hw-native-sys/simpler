@@ -522,6 +522,71 @@ TEST_F(WiringTest, EarlyDispatchReleaseConsumesDoorbellMask) {
     EXPECT_EQ(get_test_reg_stub_value(), 0);
 }
 
+TEST_F(WiringTest, SyncStartDoorbellPassHasOneOwner) {
+    PTO2TaskPayload payload{};
+
+    for (int iteration = 0; iteration < 1000; iteration++) {
+        payload.early_dispatch_launch_state.store(PTO2_EARLY_DISPATCH_LAUNCH_NONE, std::memory_order_relaxed);
+        std::atomic<bool> start{false};
+        bool first_won = false;
+        bool second_won = false;
+
+        std::thread first([&] {
+            while (!start.load(std::memory_order_acquire)) {}
+            first_won = PTO2SchedulerState::try_claim_early_dispatch_launch(payload);
+        });
+        std::thread second([&] {
+            while (!start.load(std::memory_order_acquire)) {}
+            second_won = PTO2SchedulerState::try_claim_early_dispatch_launch(payload);
+        });
+
+        start.store(true, std::memory_order_release);
+        first.join();
+        second.join();
+
+        EXPECT_NE(first_won, second_won);
+        EXPECT_EQ(
+            payload.early_dispatch_launch_state.load(std::memory_order_acquire), PTO2_EARLY_DISPATCH_LAUNCH_RINGING
+        );
+    }
+}
+
+TEST_F(WiringTest, SyncStartDrainFinalizeRetriesProducerFirstRendezvous) {
+    alignas(64) PTO2TaskSlotState sync_consumer, downstream;
+    init_slot(sync_consumer, PTO2_TASK_PENDING, 1, 1);
+    init_slot(downstream, PTO2_TASK_PENDING, 1, 1);
+
+    sync_consumer.active_mask = ActiveMask(PTO2_SUBTASK_MASK_AIV0);
+    sync_consumer.active_mask.set_sync_start();
+    sync_consumer.allow_early_resolve = true;
+    sync_consumer.logical_block_num = 2;
+    sync_consumer.next_block_idx.store(2, std::memory_order_relaxed);
+    sync_consumer.payload->staged_core_mask[0].store(0b11, std::memory_order_relaxed);
+    sync_consumer.payload->running_slot_count.store(0, std::memory_order_relaxed);
+    sync_consumer.payload->early_dispatch_state.store(PTO2_EARLY_DISPATCH_STAGING, std::memory_order_relaxed);
+
+    downstream.payload->fanin_actual_count = 1;
+    PTO2DepListEntry dep{};
+    dep.slot_state = &downstream;
+    sync_consumer.fanout_head = &dep;
+
+    // Producer release wins before drain publishes its running-slot seed. With no pending
+    // promotions, drain finalize is the only remaining rendezvous retry.
+    EXPECT_TRUE(sched.try_early_dispatch_release(sync_consumer));
+    EXPECT_EQ(sync_consumer.payload->early_dispatch_state.load(), PTO2_EARLY_DISPATCH_DISPATCHED);
+    EXPECT_EQ(sync_consumer.payload->early_dispatch_launch_state.load(), PTO2_EARLY_DISPATCH_LAUNCH_NONE);
+    EXPECT_EQ(downstream.payload->dispatch_fanin.load(), 0);
+
+    sync_consumer.payload->running_slot_count.store(2, std::memory_order_seq_cst);
+    EXPECT_TRUE(sched.retry_sync_start_rendezvous_after_drain(sync_consumer));
+    EXPECT_EQ(sync_consumer.payload->early_dispatch_launch_state.load(), PTO2_EARLY_DISPATCH_LAUNCH_COMPLETE);
+    EXPECT_EQ(sync_consumer.payload->dispatch_propagated.load(), 1);
+    EXPECT_EQ(downstream.payload->dispatch_fanin.load(), 1);
+
+    EXPECT_FALSE(sched.retry_sync_start_rendezvous_after_drain(sync_consumer));
+    EXPECT_EQ(downstream.payload->dispatch_fanin.load(), 1);
+}
+
 TEST_F(WiringTest, EarlyDispatchBlockedByUnflaggedProducer) {
     alignas(64) PTO2TaskSlotState task_slot;
     alignas(64) PTO2TaskSlotState p_flagged, q_unflagged;

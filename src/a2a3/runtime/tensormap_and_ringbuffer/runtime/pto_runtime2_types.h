@@ -280,9 +280,8 @@ struct PTO2TaskPayload {
     // stages a block after that flip claims and rings only its remaining bits.
     std::atomic<uint8_t> early_dispatch_state{0};
     std::atomic<uint8_t> dispatch_propagated{0};  // PRODUCER side: once-guard for fanout propagation
-    // The release owner publishes COMPLETE only after all doorbells it claimed
-    // are visible. Combined with published_block_count, this keeps fanout
-    // private until release-owned and late-owned blocks have both launched.
+    // The launch owner publishes COMPLETE only after all owned doorbells are
+    // visible, keeping fanout private until every gated block has launched.
     std::atomic<uint8_t> early_dispatch_launch_state{PTO2_EARLY_DISPATCH_LAUNCH_NONE};
     // sync_start early-dispatch rendezvous: count of this task's gated CORES currently
     // occupying a RUNNING slot (staged directly to an idle core, or promoted from a

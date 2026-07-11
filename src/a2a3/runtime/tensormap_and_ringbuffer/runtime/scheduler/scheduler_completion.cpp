@@ -438,7 +438,9 @@ void SchedulerContext::check_running_cores_for_completion(
                 promote_pending_to_running(core);  // Case 2 or Case 3 (with pending)
                 if (sync_start_promote) {
                     promoted->payload->running_slot_count.fetch_add(1, std::memory_order_seq_cst);
-                    sched_->maybe_rendezvous_ring(*promoted);
+                    if (sched_->maybe_rendezvous_ring(*promoted)) {
+                        sched_->propagate_dispatch_fanin(*promoted);
+                    }
                 }
             } else {
                 clear_running_slot(core);  // Case 1 or Case 3 (no pending)
@@ -672,7 +674,7 @@ SchedulerContext::drain_stage_cores(PTO2TaskSlotState *slot_state, int32_t block
 //   3. Parallel stage: EVERY thread stages its OWN cores concurrently (CAS-claimed block
 //      indices), accumulates its running-slot cores, and marks its stage_done bit.
 //   4. Finalize: the elected thread waits for all stage_done bits, seeds the rendezvous
-//      (running_slot_count) for a gated drain, propagates dispatch_fanin, and reopens the gate
+//      (running_slot_count) for a gated drain, and reopens the gate
 //      (a release-store the non-elected threads acquire, so the seed is visible before any
 //      completion promotes a pending block). Non-elected threads spin until the gate reopens.
 void SchedulerContext::handle_drain_mode(int32_t thread_idx, [[maybe_unused]] uint64_t *out_stage_wall_cycles) {
@@ -817,9 +819,12 @@ void SchedulerContext::handle_drain_mode(int32_t thread_idx, [[maybe_unused]] ui
     drain_state_.drain_worker_elected.store(0, std::memory_order_relaxed);
     drain_state_.sync_start_pending.store(0, std::memory_order_release);
 
-    // The drain path IS this sync_start producer's dispatch, so it bumps its consumers'
-    // dispatch_fanin like the normal post-publish path (idempotent via the once-guard). Done
-    // AFTER reopen — it walks fa_fused's (large) fanout and is off the other threads' critical
-    // path; the once-guard + the local slot_state keep it correct post-reopen.
-    sched_->propagate_dispatch_fanin(*slot_state);
+    // Recheck after publishing the drain seed. The producer-side rendezvous check can race
+    // ahead of drain completion and fail while running_slot_count is still incomplete. When
+    // every block landed directly in a running slot, no pending promotion remains to retry it.
+    if (gated) {
+        sched_->retry_sync_start_rendezvous_after_drain(*slot_state);
+    } else {
+        sched_->propagate_dispatch_fanin(*slot_state);
+    }
 }
