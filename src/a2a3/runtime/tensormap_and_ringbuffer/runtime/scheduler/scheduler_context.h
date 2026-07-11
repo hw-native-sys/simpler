@@ -230,8 +230,7 @@ private:
     );
 
     void build_payload(
-        PTO2DispatchPayload &dispatch_payload, PTO2TaskSlotState &slot_state, PTO2SubtaskSlot subslot,
-        const AsyncCtx &async_ctx, int32_t block_idx
+        PTO2DispatchPayload &dispatch_payload, PTO2TaskSlotState &slot_state, PTO2SubtaskSlot subslot, int32_t block_idx
     );
 
     // Batched-dispatch primitives. prepare_* builds the payload and per-core
@@ -260,6 +259,39 @@ private:
             *h.dispatch_timestamp_slot = dispatch_ts;
         }
         write_reg(h.reg_addr, RegId::DATA_MAIN_BASE, static_cast<uint64_t>(h.reg_task_id));
+    }
+
+    // Prefetch the cold per-core structures the next block's prepare touches.
+    // Ordering is load-bearing: issue the STALLING LOAD first — CoreExecState,
+    // read by dispatch_seq++ whose value feeds reg_task_id -> buf_idx -> the whole
+    // dispatch — for every core of the block, BEFORE the store-target prefetches.
+    // MSHRs saturate (a MIX block warms 3 cores); issuing the read prefetches
+    // first keeps them from being the ones dropped. The dispatch-buffer writes
+    // still get prefetched (measured to help ~30% on this shallow-store-buffer
+    // control core), just after the reads. rw=1 on CoreExecState (read AND
+    // written) gives Exclusive, serving both without a Shared->Exclusive upgrade.
+    inline void prefetch_block_dst(int32_t thread_idx, int32_t core_offset, bool is_mix) {
+        CoreTracker &tracker = core_trackers_[thread_idx];
+        int32_t cids[3];
+        int32_t nc = 0;
+        if (is_mix) {
+            cids[nc++] = tracker.get_core_id_by_offset(tracker.get_aic_core_offset(core_offset));
+            cids[nc++] = tracker.get_core_id_by_offset(tracker.get_aiv0_core_offset(core_offset));
+            cids[nc++] = tracker.get_core_id_by_offset(tracker.get_aiv1_core_offset(core_offset));
+        } else {
+            cids[nc++] = tracker.get_core_id_by_offset(core_offset);
+        }
+        // Stalling loads first.
+        for (int32_t i = 0; i < nc; i++)
+            __builtin_prefetch(&core_exec_states_[cids[i]], 1, 3);
+        // Store targets after (dispatch buffer CL0 control + CL1 args, both bufs).
+        for (int32_t i = 0; i < nc; i++) {
+            for (int32_t buf = 0; buf < 2; buf++) {
+                const char *dp = reinterpret_cast<const char *>(&payload_per_core_[cids[i]][buf]);
+                __builtin_prefetch(dp, 1, 3);
+                __builtin_prefetch(dp + 64, 1, 3);
+            }
+        }
     }
 
     // Fan out one block's subtasks (1 for AIC/AIV, 1-3 for MIX) into the

@@ -34,6 +34,7 @@
 
 #pragma once
 
+#include <stddef.h>
 #include <stdint.h>
 
 #include "arg_direction.h"
@@ -57,6 +58,18 @@ static_assert(
     "GLOBAL_CONTEXT_INDEX out of sync with intrinsic.h"
 );
 
+// Byte offsets into PTO2TaskPayload used by AICore to materialize args[] on the
+// not_ready (early-dispatch) path. The AICore .o does not include
+// pto_runtime2_types.h, so it reads tensor_count / scalar_count / tensors[] /
+// scalars[] through these constants. The AICPU side (scheduler_dispatch.cpp)
+// static_asserts them against offsetof where the full struct is visible, so any
+// PTO2TaskPayload layout drift fails the build rather than corrupting args[].
+constexpr uint32_t PTO2_TASKPAYLOAD_TENSOR_COUNT_OFFSET = 0;
+constexpr uint32_t PTO2_TASKPAYLOAD_SCALAR_COUNT_OFFSET = 4;
+constexpr uint32_t PTO2_TASKPAYLOAD_TENSORS_OFFSET = 576;
+constexpr uint32_t PTO2_TASKPAYLOAD_SCALARS_OFFSET = 4672;
+constexpr uint32_t PTO2_TASKPAYLOAD_TENSOR_STRIDE = 128;  // sizeof(Tensor)
+
 /**
  * Per-core dispatch payload: function address + args[] + SPMD context.
  *
@@ -68,24 +81,40 @@ static_assert(
  * concurrently dispatched cores.
  */
 struct alignas(64) PTO2DispatchPayload {
-    uint64_t function_bin_addr;            /**< Kernel entry address in GM (set by Scheduler) */
-    uint64_t args[PTO2_DISPATCH_MAX_ARGS]; /**< Kernel arguments (GM pointers + scalars + ext params) */
+    // === Cache line 0 (64B): control block, the only line written per dispatch ===
+    // function_bin_addr, local_context.{block_idx,block_num,async_ctx.task_token}
+    // and src_payload are the per-dispatch writes; async_ctx's slab pointers +
+    // capacity are cold (prefilled once at init) but ride this hot line for free.
+    // Sized to exactly 64B so both dispatch paths write one control line: the
+    // ready path (src_payload = 0) then also fills args[0..num_args); the gated
+    // path (src_payload = &PTO2TaskPayload) leaves args[] to the idle AICore.
+    uint64_t function_bin_addr; /**< Kernel entry address in GM (set by Scheduler). */
 
-    /** Per-dispatch context: block_idx and block_num.
-     *  Written by build_payload() before each dispatch.
-     *  args[SPMD_LOCAL_CONTEXT_INDEX] points here. */
+    /** Per-dispatch context: block_idx/block_num (hot) + async_ctx (task_token hot,
+     *  slab pointers + capacity prefilled once at init). args[SPMD_LOCAL_CONTEXT_INDEX]
+     *  points here. */
     LocalContext local_context;
 
-    /** Per-core global context: sub_block_id (AIV lane identity).
-     *  Initialized once by init_global_context() at runtime startup.
-     *  args[SPMD_GLOBAL_CONTEXT_INDEX] points here. */
-    GlobalContext global_context;
+    /** Early-dispatch gate AND source pointer, folded into one field. 0 = ready:
+     *  AICore executes on pickup (args[] already filled by the AICPU). Non-zero =
+     *  gated: the value is the source PTO2TaskPayload address; the AICore fills
+     *  args[0..num_args) from it, then waits for the doorbell (DATA_MAIN_BASE
+     *  high 32 == this dispatch's reg_task_id) before executing. A payload address
+     *  is never 0, so the gate flag is lossless. */
+    volatile uint64_t src_payload;
 
-    /** Early-dispatch gate. 0 = ready: AICore executes on pickup.
-     *  1 = not-ready: AICore waits until AICPU rings the doorbell
-     *  (DATA_MAIN_BASE high 32 == this dispatch's reg_task_id) before executing. */
-    volatile uint32_t not_ready;
-    uint8_t reserved_payload_abi_pad[4];
+    // === Cache lines 1..7: kernel argument vector ===
+    /** [0..num_args) = GM tensor pointers + scalar values; [SPMD_LOCAL_CONTEXT_INDEX]
+     *  = &local_context, [SPMD_GLOBAL_CONTEXT_INDEX] = &global_context (both prefilled
+     *  once at init). On the gated path the AICPU leaves [0..num_args) unwritten and
+     *  the idle AICore fills them from src_payload during its gate wait. */
+    uint64_t args[PTO2_DISPATCH_MAX_ARGS];
+
+    /** Per-core global context: sub_block_id (AIV lane identity). Cold: written once
+     *  at init, never per dispatch, so it lives in the tail (not the CL0 control
+     *  block). args[SPMD_GLOBAL_CONTEXT_INDEX] points here. */
+    GlobalContext global_context;
+    // No explicit tail padding: alignas(64) rounds sizeof up to 512 (8 cache lines).
 
     static_assert(sizeof(args[0]) == 8);
     static_assert(
@@ -95,3 +124,5 @@ struct alignas(64) PTO2DispatchPayload {
 };
 
 static_assert(sizeof(PTO2DispatchPayload) == 512, "PTO2DispatchPayload hardware ABI size drift");
+static_assert(offsetof(PTO2DispatchPayload, args) == 64, "args[] must start at cache line 1 (control block = CL0)");
+static_assert(offsetof(PTO2DispatchPayload, src_payload) < 64, "src_payload (gate) must live on the CL0 control block");

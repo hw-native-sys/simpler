@@ -37,6 +37,15 @@
 #define unlikely(x) __builtin_expect(!!(x), 0)
 #endif
 
+// AICore materializes args[] from src_payload on the not_ready path using the
+// byte offsets in pto2_dispatch_payload.h (the AICore .o cannot see PTO2TaskPayload).
+// Pin those constants to the real layout here, where the struct is fully visible.
+static_assert(offsetof(PTO2TaskPayload, tensor_count) == PTO2_TASKPAYLOAD_TENSOR_COUNT_OFFSET);
+static_assert(offsetof(PTO2TaskPayload, scalar_count) == PTO2_TASKPAYLOAD_SCALAR_COUNT_OFFSET);
+static_assert(offsetof(PTO2TaskPayload, tensors) == PTO2_TASKPAYLOAD_TENSORS_OFFSET);
+static_assert(offsetof(PTO2TaskPayload, scalars) == PTO2_TASKPAYLOAD_SCALARS_OFFSET);
+static_assert(sizeof(Tensor) == PTO2_TASKPAYLOAD_TENSOR_STRIDE);
+
 // =============================================================================
 // Dispatch helpers
 // =============================================================================
@@ -114,32 +123,41 @@ int SchedulerContext::pop_ready_tasks_batch(
 }
 
 void SchedulerContext::build_payload(
-    PTO2DispatchPayload &dispatch_payload, PTO2TaskSlotState &slot_state, PTO2SubtaskSlot subslot,
-    const AsyncCtx &async_ctx, int32_t block_idx
+    PTO2DispatchPayload &dispatch_payload, PTO2TaskSlotState &slot_state, PTO2SubtaskSlot subslot, int32_t block_idx
 ) {
     int32_t slot_idx = static_cast<int32_t>(subslot);
     uint64_t callable_addr = get_function_bin_addr(slot_state.task->kernel_id[slot_idx]);
     const CoreCallable *callable = reinterpret_cast<const CoreCallable *>(callable_addr);
     dispatch_payload.function_bin_addr = callable->resolved_addr();
     auto &payload = *slot_state.payload;
-    int n = 0;
-    for (int32_t i = 0; i < payload.tensor_count; i++) {
-        dispatch_payload.args[n++] = reinterpret_cast<uint64_t>(&payload.tensors[i]);
-    }
-    for (int32_t i = 0; i < payload.scalar_count; i++) {
-        dispatch_payload.args[n++] = payload.scalars[i];
-    }
-    dispatch_payload.local_context.block_idx = block_idx;
-    dispatch_payload.local_context.block_num = slot_state.logical_block_num;
-    dispatch_payload.local_context.async_ctx = async_ctx;
-    dispatch_payload.args[PAYLOAD_LOCAL_CONTEXT_INDEX] = reinterpret_cast<uint64_t>(&dispatch_payload.local_context);
-    dispatch_payload.args[PAYLOAD_GLOBAL_CONTEXT_INDEX] = reinterpret_cast<uint64_t>(&dispatch_payload.global_context);
     // Early-dispatch: a task being staged (Hook 1 set early_dispatch_state to
     // STAGING before this call) is gated — the AICore must wait for the
     // DATA_MAIN_BASE high-32 doorbell. All other dispatches run on pickup.
-    dispatch_payload.not_ready =
-        (slot_state.payload->early_dispatch_state.load(std::memory_order_relaxed) == PTO2_EARLY_DISPATCH_STAGING) ? 1 :
-                                                                                                                    0;
+    if (payload.early_dispatch_state.load(std::memory_order_relaxed) == PTO2_EARLY_DISPATCH_STAGING) {
+        // Gated task: hand the idle AICore the source payload (non-zero = gate) and
+        // let it fill args[0..num_args) itself during its doorbell wait, instead of
+        // paying the arg-vector write on this scheduler thread.
+        dispatch_payload.src_payload = reinterpret_cast<uint64_t>(&payload);
+    } else {
+        // Ready task: fill args here; src_payload = 0 signals AICore to run on pickup.
+        dispatch_payload.src_payload = 0;
+        int n = 0;
+        for (int32_t i = 0; i < payload.tensor_count; i++) {
+            dispatch_payload.args[n++] = reinterpret_cast<uint64_t>(&payload.tensors[i]);
+        }
+        for (int32_t i = 0; i < payload.scalar_count; i++) {
+            dispatch_payload.args[n++] = payload.scalars[i];
+        }
+    }
+    dispatch_payload.local_context.block_idx = block_idx;
+    dispatch_payload.local_context.block_num = slot_state.logical_block_num;
+    // AsyncCtx's slab pointers + capacity are prefilled once per (core, buf_idx)
+    // in init(); only task_token varies per dispatch. deferred_slab is never null
+    // on this path, so task_token is always the live task id (matches the old
+    // AsyncCtx::make(non-null) result). args[PAYLOAD_LOCAL_CONTEXT_INDEX] /
+    // [PAYLOAD_GLOBAL_CONTEXT_INDEX] are per-(core, buf_idx) constants, also
+    // prefilled in init().
+    dispatch_payload.local_context.async_ctx.task_token = slot_state.task->task_id;
 }
 
 SchedulerContext::PublishHandle SchedulerContext::prepare_subtask_to_core(
@@ -162,11 +180,12 @@ SchedulerContext::PublishHandle SchedulerContext::prepare_subtask_to_core(
 
     uint32_t buf_idx = reg_task_id & 1u;
     PTO2DispatchPayload &payload = payload_per_core_[core_id][buf_idx];
-    DeferredCompletionSlab *deferred_slab = &deferred_slab_per_core_[core_id][buf_idx];
-    deferred_slab->count = 0;
-    deferred_slab->error_code = PTO2_ERROR_NONE;
-    AsyncCtx async_ctx = AsyncCtx::make(slot_state.task->task_id, deferred_slab);
-    build_payload(payload, slot_state, subslot, async_ctx, block_idx);
+    // The deferred_slab is NOT reset here: it is init-cleared once and the
+    // completion path re-clears count only after a task actually recorded a
+    // deferred completion (count > 0), which is rare. A non-deferred task never
+    // touches count/error_code, so the slab stays clean without a per-dispatch
+    // write — keeping this cold per-core line off the dispatch path.
+    build_payload(payload, slot_state, subslot, block_idx);
 
     if (to_pending) {
         core_exec_state.pending_subslot = subslot;

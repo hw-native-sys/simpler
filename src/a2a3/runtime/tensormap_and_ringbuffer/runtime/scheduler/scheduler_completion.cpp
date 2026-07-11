@@ -144,6 +144,11 @@ void SchedulerContext::complete_slot_task(
                     SPIN_WAIT_HINT();
                 }
             }
+            // Re-clear for the next reuse of this (core, buf) slot. Done here — on
+            // the hot cache line we just read — instead of on every dispatch, since
+            // only a deferred task (count > 0) ever dirties it. error_code needs no
+            // reset: a non-NONE code aborted the run above.
+            deferred_slab->count = 0;
         }
     }
 
@@ -505,11 +510,18 @@ void SchedulerContext::drain_worker_dispatch(int32_t block_num) {
         slot_state->next_block_idx.store(static_cast<int16_t>(start + claim), std::memory_order_relaxed);
         PublishHandle handles[CoreTracker::MAX_CLUSTERS * 3];
         int handle_count = 0;
+        // Gather the claimed offsets so the per-core destination structures of block
+        // b+1 can be prefetched while block b's prepare runs (software pipeline —
+        // this drain launches every block on a single elected thread).
+        int32_t claimed[CoreTracker::MAX_CLUSTERS * 3];
+        for (int32_t b = 0; b < claim; b++)
+            claimed[b] = valid.pop_first();
+        bool is_mix = (shape == PTO2ResourceShape::MIX);
+        if (claim > 0) prefetch_block_dst(t, claimed[0], is_mix);
         for (int32_t b = 0; b < claim; b++) {
-            auto core_offset = valid.pop_first();
-            handle_count += prepare_block_for_dispatch(
-                t, core_offset, *slot_state, shape, false, start + b, &handles[handle_count]
-            );
+            if (b + 1 < claim) prefetch_block_dst(t, claimed[b + 1], is_mix);
+            handle_count +=
+                prepare_block_for_dispatch(t, claimed[b], *slot_state, shape, false, start + b, &handles[handle_count]);
         }
         wmb();
         uint64_t dispatch_ts = 0;
