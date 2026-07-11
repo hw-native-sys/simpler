@@ -126,6 +126,10 @@ int fake_copy_from_device(void *host_ptr, const void *dev_ptr, size_t size) {
     return 0;
 }
 
+void *fake_register_device_memory_to_host(void *dev_ptr, size_t /* bytes */) { return dev_ptr; }
+
+void fake_unregister_device_memory_from_host(void * /* dev_ptr */) {}
+
 int fake_device_memset(void *dev_ptr, int value, size_t size) {
     ++g_fake->device_memset_count;
     std::memset(dev_ptr, value, size);
@@ -177,6 +181,8 @@ HostApi make_host_api(bool with_temporary_buffer = true) {
         fake_device_free,
         fake_copy_to_device,
         fake_copy_from_device,
+        fake_register_device_memory_to_host,
+        fake_unregister_device_memory_from_host,
         fake_device_memset,
         with_temporary_buffer ? fake_get_retained_temp_buffer : nullptr,
         with_temporary_buffer ? fake_set_retained_temp_buffer : nullptr,

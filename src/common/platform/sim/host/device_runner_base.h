@@ -104,6 +104,15 @@ public:
     int l3_l2_orch_comm_init(void *control_block, size_t control_block_size);
     int l3_l2_orch_comm_shutdown();
 
+    // On sim, allocate_tensor returns a plain host pointer, so the "device"
+    // address is already host-readable — register is identity, unregister a
+    // no-op. Mirrors the onboard DeviceRunnerBase API (separate class trees).
+    void *register_device_memory_to_host(void *dev_ptr, size_t bytes) {
+        (void)bytes;
+        return dev_ptr;
+    }
+    void unregister_device_memory_from_host(void *dev_ptr) { (void)dev_ptr; }
+
     int record_device_orch_callable(
         int32_t callable_id, const void *orch_so_data, size_t orch_so_size, const char *func_name,
         const char *config_name, std::vector<std::pair<int, uint64_t>> kernel_addrs, std::vector<ArgDirection> signature

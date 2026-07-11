@@ -103,6 +103,20 @@ static int copy_from_device(void *host_ptr, const void *dev_ptr, size_t size) {
     }
 }
 
+static void *register_device_memory_to_host(void *dev_ptr, size_t bytes) {
+    try {
+        return current_runner()->register_device_memory_to_host(dev_ptr, bytes);
+    } catch (...) {
+        return nullptr;
+    }
+}
+
+static void unregister_device_memory_from_host(void *dev_ptr) {
+    try {
+        current_runner()->unregister_device_memory_from_host(dev_ptr);
+    } catch (...) {}
+}
+
 static int device_memset(void *dev_ptr, int value, size_t size) {
     if (dev_ptr == NULL) return -1;
     try {
@@ -201,6 +215,8 @@ static const HostApi g_host_api = {
     .device_free = device_free,
     .copy_to_device = copy_to_device,
     .copy_from_device = copy_from_device,
+    .register_device_memory_to_host = register_device_memory_to_host,
+    .unregister_device_memory_from_host = unregister_device_memory_from_host,
     .device_memset = device_memset,
     .get_retained_temp_buffer = get_retained_temp_buffer,
     .set_retained_temp_buffer = set_retained_temp_buffer,

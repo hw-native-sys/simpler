@@ -114,6 +114,12 @@ public:
      */
     int run(Runtime &runtime, const CallConfig &config) override;
 
+    // Map/unmap a device buffer into host address space via
+    // halHostRegister(DEV_SVM_MAP_HOST) / halHostUnregister. The returned host
+    // VA may differ from dev_ptr — callers must use it for host access.
+    void *register_device_memory_to_host(void *dev_ptr, std::size_t bytes) override;
+    void unregister_device_memory_from_host(void *dev_ptr) override;
+
     /**
      * a2a3-only `dep_gen` enablement setter. The shared
      * `set_l2_swimlane_enabled`, `set_dump_tensor_enabled`,

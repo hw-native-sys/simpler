@@ -100,6 +100,23 @@ public:
     int l3_l2_orch_comm_shutdown();
 
     /**
+     * Map a device buffer into the host address space and return a
+     * host-readable VA (or nullptr on failure); the paired unregister releases
+     * it. The returned VA may differ from dev_ptr, so callers must use it, not
+     * dev_ptr, for host access. Register/unregister must be paired (unregister
+     * before free_tensor). On a2a3 onboard this wraps
+     * halHostRegister(DEV_SVM_MAP_HOST); a5 onboard has no host-map path and
+     * uses the base default. Base default: unsupported (returns nullptr /
+     * no-op); a2a3 overrides.
+     */
+    virtual void *register_device_memory_to_host(void *dev_ptr, std::size_t bytes) {
+        (void)dev_ptr;
+        (void)bytes;
+        return nullptr;
+    }
+    virtual void unregister_device_memory_from_host(void *dev_ptr) { (void)dev_ptr; }
+
+    /**
      * Commit the three per-Worker pooled regions (PTO2 GM heap, PTO2
      * shared memory, trb prebuilt runtime arena) as three independent
      * device allocations. Must be called before any `acquire_pooled_*`.

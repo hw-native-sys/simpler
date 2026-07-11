@@ -32,6 +32,16 @@ struct HostApi {
     void (*device_free)(void *dev_ptr);
     int (*copy_to_device)(void *dev_ptr, const void *host_ptr, size_t size);
     int (*copy_from_device)(void *host_ptr, const void *dev_ptr, size_t size);
+    // Map a device buffer into host address space and return a host-readable VA
+    // (nullptr on failure); the paired unregister releases it. The returned VA
+    // may differ from dev_ptr, so callers must use it, not dev_ptr, for host
+    // access, and pair every register with an unregister before free. Used by a
+    // host-side orchestrator (host_build_graph) to read control tensors whose
+    // buffer.addr is a device address. a2a3 onboard wraps
+    // halHostRegister(DEV_SVM_MAP_HOST); sim is identity; a5 onboard and any
+    // backend without a host-map path return nullptr / no-op.
+    void *(*register_device_memory_to_host)(void *dev_ptr, size_t bytes);
+    void (*unregister_device_memory_from_host)(void *dev_ptr);
     // Set a device buffer to a byte value (device-side, no PCIe). Used to
     // zero-init pure OUTPUT buffers in lieu of an H2D copy-in. May be
     // null on backends that don't wire it; callers must fall back to

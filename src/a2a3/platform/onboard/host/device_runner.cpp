@@ -58,7 +58,7 @@ extern "C" __attribute__((weak, visibility("hidden"))) int dep_gen_replay_emit_d
 }
 
 // =============================================================================
-// Lazy-loaded HAL (ascend_hal) for profiling host-register only
+// Lazy-loaded HAL (ascend_hal) for halHostRegister / halHostUnregister
 // =============================================================================
 
 namespace {
@@ -697,6 +697,57 @@ int DeviceRunner::force_reset_device() {
         "force_reset_device: aclrtResetDeviceForce(%d) cleared the poisoned card (probe confirmed clean)", device_id_
     );
     return 0;
+}
+
+void *DeviceRunner::register_device_memory_to_host(void *dev_ptr, std::size_t bytes) {
+    if (dev_ptr == nullptr || bytes == 0) {
+        return nullptr;
+    }
+    if (device_id_ < 0) {
+        LOG_ERROR("register_device_memory_to_host: invalid device_id %d", device_id_);
+        return nullptr;
+    }
+    if (load_hal_if_needed() != 0) {
+        LOG_ERROR("register_device_memory_to_host: failed to load ascend_hal: %s", dlerror());
+        return nullptr;
+    }
+    HalHostRegisterFn fn = get_halHostRegister();
+    if (fn == nullptr) {
+        LOG_ERROR("register_device_memory_to_host: halHostRegister symbol not found: %s", dlerror());
+        return nullptr;
+    }
+    void *host_va = nullptr;
+    int rc = fn(dev_ptr, bytes, DEV_SVM_MAP_HOST, device_id_, &host_va);
+    if (rc != 0) {
+        LOG_ERROR("register_device_memory_to_host: halHostRegister failed for dev_ptr %p (rc=%d)", dev_ptr, rc);
+        return nullptr;
+    }
+    return host_va;
+}
+
+void DeviceRunner::unregister_device_memory_from_host(void *dev_ptr) {
+    if (dev_ptr == nullptr) {
+        return;
+    }
+    if (device_id_ < 0) {
+        LOG_ERROR("unregister_device_memory_from_host: invalid device_id %d", device_id_);
+        return;
+    }
+    if (load_hal_if_needed() != 0) {
+        LOG_ERROR("unregister_device_memory_from_host: failed to load ascend_hal: %s", dlerror());
+        return;
+    }
+    // halHostUnregister is keyed by the device pointer; the HAL maps it back to
+    // the host VA internally.
+    HalHostUnregisterFn fn = get_halHostUnregister();
+    if (fn == nullptr) {
+        LOG_ERROR("unregister_device_memory_from_host: halHostUnregister symbol not found: %s", dlerror());
+        return;
+    }
+    int rc = fn(dev_ptr, device_id_);
+    if (rc != 0) {
+        LOG_ERROR("unregister_device_memory_from_host: halHostUnregister failed for dev_ptr %p (rc=%d)", dev_ptr, rc);
+    }
 }
 
 int DeviceRunner::finalize() {
