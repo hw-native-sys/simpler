@@ -664,19 +664,22 @@ one drains, and it fully stages or waits, so two cohorts can never each half-occ
 set (see the completion path's `pending_gated` classification for why a promoted-but-still-gated
 block is not mistaken for a normal task).
 
-#### Early-candidate gate: producer must be fully dispatched (deadlock avoidance)
+#### Early-candidate gate: producer must reserve every block (deadlock avoidance)
 
 `propagate_dispatch_fanin` (the EARLY-source candidate trigger) no-ops until the producer is
-**fully dispatched** — `next_block_idx == logical_block_num`, all its blocks on a core. Only then
-does it bump consumers' `dispatch_fanin` and let a `require_sync_start` consumer pre-stage. This
-is load-bearing: a flagged SPMD producer with more blocks than cores (e.g. a 50-block AIC proj on
-24 AIC cores) dispatches in waves, and if its *first* wave triggered a downstream MIX cohort to
-gate every running/pending slot, the producer's remaining blocks would find no core, never
-complete, and the cohort's rendezvous — which waits for that producer to release — would never
-ring. Gating on full dispatch keeps the producer's cores committed before any consumer can
-pre-occupy. `next_block_idx` (not a per-path counter) is the gate because it advances on *every*
-placement path (normal dispatch, early-dispatch release, drain), so a producer that is itself
-early-dispatched or drained still gates correctly across all `propagate_dispatch_fanin` call sites.
+**fully reserved** — `next_block_idx == logical_block_num`, so every block range has claimed a
+free core slot. Only then does it bump consumers' `dispatch_fanin` and let a
+`require_sync_start` consumer pre-stage. This is load-bearing: a flagged SPMD producer with more
+blocks than cores (e.g. a 50-block AIC proj on 24 AIC cores) dispatches in waves, and if its
+*first* wave triggered a downstream MIX cohort to gate every running/pending slot, the
+producer's remaining blocks would find no core, never complete, and the cohort's rendezvous —
+which waits for that producer to release — would never ring. Gating on full reservation commits
+the producer's slots before any consumer can pre-occupy them. `next_block_idx` is a claim
+counter, not a publication counter; this is sufficient because normal dispatch and early
+staging claim only slots owned by the current scheduler thread, which peers cannot consume,
+while the sync drain holds its global barrier through staging. All three paths advance the same
+counter, so a producer that is itself early-staged or drained gates correctly across every
+`propagate_dispatch_fanin` call site.
 
 #### MIX per-core placement
 
