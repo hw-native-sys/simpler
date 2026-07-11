@@ -614,8 +614,9 @@ Private internals are split across three .cpp files by responsibility:
 occupancy model. Two orthogonal axes decide *what* runs and *where*:
 
 - **Source** — `NORMAL` (all producers done; the task sits in a ready queue and launches on
-  pickup) vs `EARLY` (a *speculative* pre-stage of a not-yet-released task; gated with
-  `not_ready=1`, launched later by a doorbell). Normal strictly precedes early.
+  pickup) vs `EARLY` (a *speculative* pre-stage of a not-yet-released task; its dispatch
+  payload carries a non-zero `src_payload` gate and launches later by a doorbell). Normal
+  strictly precedes early.
 - **Cohort** — `SYNC_START` (an SPMD cohort that must launch atomically) vs `REGULAR` (each
   block launches independently). "is it ready" (source) and "does it need a rendezvous"
   (cohort) are orthogonal.
@@ -654,7 +655,8 @@ When it cannot fit inline, `enter_drain_mode` arms a stop-the-world drain:
    *before* staging; if short it aborts (stages nothing) and retries after completions free
    cores. A cohort is fully staged or not at all — never partial.
 3. **Parallel stage** — all threads barrier, then each CAS-claims a block range and stages
-   its own cores gated (`not_ready=1`): idle cores → running slots, busy cores → pending slots.
+   its own cores with a non-zero `src_payload` gate: idle cores → running slots, busy cores →
+   pending slots.
 4. **Rendezvous launch** — `running_slot_count` counts staged running-slot cores; when it
    reaches `popcount(staged_core_mask)` **and** the producer has released,
    `maybe_rendezvous_ring` rings every gated core's doorbell together — the cohort starts as one.
@@ -664,22 +666,22 @@ one drains, and it fully stages or waits, so two cohorts can never each half-occ
 set (see the completion path's `pending_gated` classification for why a promoted-but-still-gated
 block is not mistaken for a normal task).
 
-#### Early-candidate gate: producer must reserve every block (deadlock avoidance)
+#### Early-candidate gate: producer must publish every block (deadlock avoidance)
 
 `propagate_dispatch_fanin` (the EARLY-source candidate trigger) no-ops until the producer is
-**fully reserved** — `next_block_idx == logical_block_num`, so every block range has claimed a
-free core slot. Only then does it bump consumers' `dispatch_fanin` and let a
-`require_sync_start` consumer pre-stage. This is load-bearing: a flagged SPMD producer with more
-blocks than cores (e.g. a 50-block AIC proj on 24 AIC cores) dispatches in waves, and if its
-*first* wave triggered a downstream MIX cohort to gate every running/pending slot, the
-producer's remaining blocks would find no core, never complete, and the cohort's rendezvous —
-which waits for that producer to release — would never ring. Gating on full reservation commits
-the producer's slots before any consumer can pre-occupy them. `next_block_idx` is a claim
-counter, not a publication counter; this is sufficient because normal dispatch and early
-staging claim only slots owned by the current scheduler thread, which peers cannot consume,
-while the sync drain holds its global barrier through staging. All three paths advance the same
-counter, so a producer that is itself early-staged or drained gates correctly across every
-`propagate_dispatch_fanin` call site.
+**fully published**: `published_block_count == logical_block_num`. Normal dispatch, regular
+early staging, and the sync drain increment this counter only after the claimed range's payloads
+and MMIO dispatch tokens are visible. A staged producer also waits for release and completion of
+its owned doorbell pass before exposing fanout.
+
+This is load-bearing: a flagged SPMD producer with more blocks than cores (for example, a
+50-block AIC projection on 24 AIC cores) dispatches in waves. If its first wave triggered a
+downstream MIX cohort to gate every running and pending slot, the remaining producer blocks
+would find no core, never complete, and the cohort rendezvous waiting for producer release would
+never ring. Full publication is stronger than full reservation: every producer block has both a
+reserved core slot and a launch-visible payload before a consumer can pre-occupy resources.
+`next_block_idx` records reservation progress; `published_block_count` independently establishes
+publication and early-candidate readiness.
 
 #### MIX per-core placement
 

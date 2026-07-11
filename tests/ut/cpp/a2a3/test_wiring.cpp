@@ -561,6 +561,7 @@ TEST_F(WiringTest, SyncStartDrainFinalizeRetriesProducerFirstRendezvous) {
     sync_consumer.allow_early_resolve = true;
     sync_consumer.logical_block_num = 2;
     sync_consumer.next_block_idx.store(2, std::memory_order_relaxed);
+    sched.record_published_blocks(sync_consumer, sync_consumer.logical_block_num);
     sync_consumer.payload->staged_core_mask[0].store(0b11, std::memory_order_relaxed);
     sync_consumer.payload->running_slot_count.store(0, std::memory_order_relaxed);
     sync_consumer.payload->early_dispatch_state.store(PTO2_EARLY_DISPATCH_STAGING, std::memory_order_relaxed);
@@ -585,6 +586,136 @@ TEST_F(WiringTest, SyncStartDrainFinalizeRetriesProducerFirstRendezvous) {
 
     EXPECT_FALSE(sched.retry_sync_start_rendezvous_after_drain(sync_consumer));
     EXPECT_EQ(downstream.payload->dispatch_fanin.load(), 1);
+}
+
+TEST_F(WiringTest, ArmedEarlySyncDrainOwnsFinalReadyRoute) {
+    alignas(64) PTO2TaskSlotState sync_consumer;
+    init_slot(sync_consumer, PTO2_TASK_PENDING, 1, 1);
+    sync_consumer.active_mask = ActiveMask(PTO2_SUBTASK_MASK_AIV0);
+    sync_consumer.active_mask.set_sync_start();
+    sync_consumer.logical_block_num = 2;
+    sync_consumer.payload->early_dispatch_state.store(PTO2_EARLY_DISPATCH_STAGING, std::memory_order_relaxed);
+
+    ASSERT_TRUE(PTO2SchedulerState::try_claim_early_sync_drain(*sync_consumer.payload));
+    PTO2SchedulerState::mark_early_sync_drain_armed(*sync_consumer.payload);
+    EXPECT_TRUE(sched.release_fanin_and_check_ready(sync_consumer));
+    auto shape = static_cast<int32_t>(sync_consumer.active_mask.to_shape());
+    EXPECT_EQ(sched.ready_sync_queues[shape].pop(), nullptr);
+    EXPECT_EQ(sync_consumer.payload->early_dispatch_state.load(), PTO2_EARLY_DISPATCH_DISPATCHED);
+    EXPECT_EQ(
+        sync_consumer.payload->early_sync_drain_state.load(),
+        PTO2_EARLY_SYNC_DRAIN_OWNER | PTO2_EARLY_SYNC_DRAIN_ARMED | PTO2_EARLY_SYNC_DRAIN_READY
+    );
+}
+
+TEST_F(WiringTest, ArmedEarlySyncDrainKeepsEveryStagerGatedAfterReady) {
+    alignas(64) PTO2TaskPayload payload{};
+    payload.early_dispatch_state.store(PTO2_EARLY_DISPATCH_STAGING, std::memory_order_relaxed);
+
+    ASSERT_TRUE(PTO2SchedulerState::try_claim_early_sync_drain(payload));
+    PTO2SchedulerState::mark_early_sync_drain_armed(payload);
+
+    std::atomic<bool> start{false};
+    std::atomic<int> before_ready{0};
+    std::atomic<bool> ready_published{false};
+    bool gated[4] = {false, false, false, false};
+    std::thread stagers[4];
+    for (int i = 0; i < 4; i++) {
+        stagers[i] = std::thread([&, i] {
+            while (!start.load(std::memory_order_acquire)) {}
+            if (i >= 2) {
+                while (!ready_published.load(std::memory_order_acquire)) {}
+            }
+            bool force_gate = PTO2SchedulerState::owns_early_sync_drain(payload);
+            gated[i] = PTO2SchedulerState::should_gate_early_dispatch(
+                force_gate, payload.early_dispatch_state.load(std::memory_order_relaxed)
+            );
+            if (i < 2) before_ready.fetch_add(1, std::memory_order_release);
+        });
+    }
+    start.store(true, std::memory_order_release);
+    while (before_ready.load(std::memory_order_acquire) != 2) {}
+    payload.early_dispatch_state.store(PTO2_EARLY_DISPATCH_DISPATCHED, std::memory_order_seq_cst);
+    bool ready_has_owner = PTO2SchedulerState::publish_ready_to_early_sync_drain(payload);
+    ready_published.store(true, std::memory_order_release);
+    for (auto &stager : stagers)
+        stager.join();
+
+    EXPECT_TRUE(ready_has_owner);
+    for (bool was_gated : gated)
+        EXPECT_TRUE(was_gated);
+
+    alignas(64) PTO2TaskPayload normal_ready{};
+    normal_ready.early_dispatch_state.store(PTO2_EARLY_DISPATCH_DISPATCHED, std::memory_order_relaxed);
+    EXPECT_FALSE(PTO2SchedulerState::publish_ready_to_early_sync_drain(normal_ready));
+    EXPECT_FALSE(PTO2SchedulerState::owns_early_sync_drain(normal_ready));
+    EXPECT_FALSE(
+        PTO2SchedulerState::should_gate_early_dispatch(
+            PTO2SchedulerState::owns_early_sync_drain(normal_ready),
+            normal_ready.early_dispatch_state.load(std::memory_order_relaxed)
+        )
+    );
+}
+
+TEST_F(WiringTest, DrainFinishBetweenReleasePhasesRetainsOwner) {
+    alignas(64) PTO2TaskSlotState sync_consumer;
+    init_slot(sync_consumer, PTO2_TASK_PENDING, 1, 1);
+    sync_consumer.active_mask = ActiveMask(PTO2_SUBTASK_MASK_AIV0);
+    sync_consumer.active_mask.set_sync_start();
+    sync_consumer.logical_block_num = 2;
+    sync_consumer.payload->early_dispatch_state.store(PTO2_EARLY_DISPATCH_STAGING, std::memory_order_relaxed);
+
+    ASSERT_TRUE(PTO2SchedulerState::try_claim_early_sync_drain(*sync_consumer.payload));
+    PTO2SchedulerState::mark_early_sync_drain_armed(*sync_consumer.payload);
+
+    // READY publication may lag the STAGING-to-DISPATCHED release transition.
+    EXPECT_FALSE(sched.try_early_dispatch_release(sync_consumer));
+    sync_consumer.next_block_idx.store(sync_consumer.logical_block_num, std::memory_order_seq_cst);
+    PTO2SchedulerState::finish_early_sync_drain(*sync_consumer.payload);
+
+    EXPECT_TRUE(PTO2SchedulerState::publish_ready_to_early_sync_drain(*sync_consumer.payload));
+    EXPECT_EQ(
+        sync_consumer.payload->early_sync_drain_state.load(),
+        PTO2_EARLY_SYNC_DRAIN_OWNER | PTO2_EARLY_SYNC_DRAIN_ARMED | PTO2_EARLY_SYNC_DRAIN_READY |
+            PTO2_EARLY_SYNC_DRAIN_COMPLETE
+    );
+}
+
+TEST_F(WiringTest, CancelledEarlySyncDrainRoutesProducerRelease) {
+    alignas(64) PTO2TaskSlotState sync_consumer;
+    init_slot(sync_consumer, PTO2_TASK_PENDING, 1, 1);
+    sync_consumer.active_mask = ActiveMask(PTO2_SUBTASK_MASK_AIV0);
+    sync_consumer.active_mask.set_sync_start();
+    sync_consumer.logical_block_num = 2;
+    sync_consumer.payload->early_dispatch_state.store(PTO2_EARLY_DISPATCH_STAGING, std::memory_order_relaxed);
+
+    ASSERT_TRUE(PTO2SchedulerState::try_claim_early_sync_drain(*sync_consumer.payload));
+    sched.cancel_early_sync_drain(sync_consumer);
+    EXPECT_TRUE(sched.release_fanin_and_check_ready(sync_consumer));
+
+    auto shape = static_cast<int32_t>(sync_consumer.active_mask.to_shape());
+    EXPECT_EQ(sched.ready_sync_queues[shape].pop(), &sync_consumer);
+    EXPECT_EQ(sched.ready_sync_queues[shape].pop(), nullptr);
+    EXPECT_EQ(sched.early_sync_start_queue.pop(), &sync_consumer);
+}
+
+TEST_F(WiringTest, ProducerReleaseTransfersReadyRouteToCancellingDrain) {
+    alignas(64) PTO2TaskSlotState sync_consumer;
+    init_slot(sync_consumer, PTO2_TASK_PENDING, 1, 1);
+    sync_consumer.active_mask = ActiveMask(PTO2_SUBTASK_MASK_AIV0);
+    sync_consumer.active_mask.set_sync_start();
+    sync_consumer.logical_block_num = 2;
+    sync_consumer.payload->early_dispatch_state.store(PTO2_EARLY_DISPATCH_STAGING, std::memory_order_relaxed);
+
+    ASSERT_TRUE(PTO2SchedulerState::try_claim_early_sync_drain(*sync_consumer.payload));
+    EXPECT_TRUE(sched.release_fanin_and_check_ready(sync_consumer));
+    auto shape = static_cast<int32_t>(sync_consumer.active_mask.to_shape());
+    EXPECT_EQ(sched.ready_sync_queues[shape].pop(), nullptr);
+
+    sched.cancel_early_sync_drain(sync_consumer);
+    EXPECT_EQ(sched.ready_sync_queues[shape].pop(), &sync_consumer);
+    EXPECT_EQ(sched.ready_sync_queues[shape].pop(), nullptr);
+    EXPECT_EQ(sched.early_sync_start_queue.pop(), nullptr);
 }
 
 TEST_F(WiringTest, EarlyDispatchBlockedByUnflaggedProducer) {

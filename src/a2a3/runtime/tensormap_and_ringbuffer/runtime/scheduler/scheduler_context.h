@@ -273,7 +273,7 @@ private:
     // written) gives Exclusive, serving both without a Shared->Exclusive upgrade.
     inline void prefetch_block_dst(int32_t thread_idx, int32_t core_offset, bool is_mix) {
         CoreTracker &tracker = core_trackers_[thread_idx];
-        int32_t cids[3];
+        int32_t cids[3] = {};
         int32_t nc = 0;
         if (is_mix) {
             cids[nc++] = tracker.get_core_id_by_offset(tracker.get_aic_core_offset(core_offset));

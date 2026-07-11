@@ -535,7 +535,7 @@ int32_t SchedulerContext::count_global_available(PTO2ResourceShape shape, uint8_
 // staged_core_mask are the only cross-thread points.
 //
 // A gated (early) sync_start drain pre-stages every block behind its doorbell
-// (prepare_block_for_dispatch reads early_dispatch_state==STAGING => not_ready=1) and defers the launch
+// (prepare_block_for_dispatch is force-gated for the claimed drain range) and defers the launch
 // to the rendezvous: idle cores take a gated RUNNING slot; busy cores take a gated PENDING
 // slot (promoted by Case 3.3 as those cores' running tasks FIN). A non-gated (ready) drain
 // leaves early_dispatch_state==NONE, so every block launches immediately on an idle running slot and
@@ -590,7 +590,7 @@ SchedulerContext::drain_stage_cores(PTO2TaskSlotState *slot_state, int32_t block
                     running_staged += tracker.mix_cluster_idle_core_count(core_offset, core_mask);
                 }
                 handle_count += prepare_block_for_dispatch(
-                    thread_idx, core_offset, *slot_state, shape, to_pending, start + b, &handles[handle_count]
+                    thread_idx, core_offset, *slot_state, shape, to_pending, start + b, &handles[handle_count], gated
                 );
             }
             wmb();
@@ -722,11 +722,11 @@ void SchedulerContext::handle_drain_mode(int32_t thread_idx, [[maybe_unused]] ui
     bool elected = drain_state_.drain_worker_elected.load(std::memory_order_relaxed) == thread_idx + 1;
 
     PTO2TaskSlotState *slot_state = drain_state_.pending_task.load(std::memory_order_acquire);
-    // gated read is stable during the drain: completions don't run while every thread is parked
-    // in handle_drain_mode, so the producer cannot flip early_dispatch_state here.
-    bool gated =
-        slot_state != nullptr && slot_state->payload != nullptr &&
-        slot_state->payload->early_dispatch_state.load(std::memory_order_seq_cst) == PTO2_EARLY_DISPATCH_STAGING;
+    // OWNER is acquired before the drain is published and persists through
+    // completion, so every staging thread makes the same gate decision even if
+    // producer release changes early_dispatch_state during the barrier.
+    bool gated = slot_state != nullptr && slot_state->payload != nullptr &&
+                 PTO2SchedulerState::owns_early_sync_drain(*slot_state->payload);
 
     if (elected) {
         if (slot_state == nullptr) {
@@ -761,9 +761,7 @@ void SchedulerContext::handle_drain_mode(int32_t thread_idx, [[maybe_unused]] ui
         }
         slot_state = drain_state_.pending_task.load(std::memory_order_acquire);
         if (slot_state == nullptr) return;
-        gated =
-            slot_state->payload != nullptr &&
-            slot_state->payload->early_dispatch_state.load(std::memory_order_seq_cst) == PTO2_EARLY_DISPATCH_STAGING;
+        gated = slot_state->payload != nullptr && PTO2SchedulerState::owns_early_sync_drain(*slot_state->payload);
     }
 
     // Parallel stage this thread's own cores (CAS-claimed block indices), then mark done.
@@ -827,4 +825,5 @@ void SchedulerContext::handle_drain_mode(int32_t thread_idx, [[maybe_unused]] ui
     } else {
         sched_->propagate_dispatch_fanin(*slot_state);
     }
+    PTO2SchedulerState::finish_early_sync_drain(*slot_state->payload);
 }

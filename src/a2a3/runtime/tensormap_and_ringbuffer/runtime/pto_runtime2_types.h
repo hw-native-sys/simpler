@@ -229,6 +229,14 @@ enum PTO2EarlyDispatchLaunchState : uint8_t {
     PTO2_EARLY_DISPATCH_LAUNCH_COMPLETE = 2,
 };
 
+enum PTO2EarlySyncDrainState : uint8_t {
+    PTO2_EARLY_SYNC_DRAIN_NONE = 0,
+    PTO2_EARLY_SYNC_DRAIN_OWNER = 1 << 0,
+    PTO2_EARLY_SYNC_DRAIN_ARMED = 1 << 1,
+    PTO2_EARLY_SYNC_DRAIN_READY = 1 << 2,
+    PTO2_EARLY_SYNC_DRAIN_COMPLETE = 1 << 3,
+};
+
 // A pre-staged consumer occupies one core per gated subtask block. WHICH cores
 // it occupies is recorded as a bitmask (staged_core_mask, 1 bit per global
 // core_id); the completion-path release iterates the set bits and rings each
@@ -255,9 +263,10 @@ struct PTO2TaskPayload {
     // between the fanin array (offset 536) and the 64B-aligned tensors[] (offset
     // 576), so sizeof and tensors[] are unchanged.
     //
-    // Bitmask of global core_ids this consumer is pre-staged (gated) on. Set with
-    // atomic fetch_or by concurrent stagers, then destructively split between the
-    // release and late-stager paths. (Re)initialized in PTO2TaskPayload::init.
+    // Bitmask of global core_ids this consumer is pre-staged (gated) on. Concurrent
+    // stagers publish bits with atomic fetch_or. A regular consumer destructively
+    // splits them between release and late-stager owners; a sync_start drain keeps
+    // the completed mask stable for its single cohort launch owner.
     std::atomic<uint64_t> staged_core_mask[PTO2_EARLY_DISPATCH_CORE_MASK_WORDS]{};
     // Early-dispatch CANDIDATE detection (event-driven, dual of fanin_refcount):
     // seeded at wiring with producers already complete, then a flagged producer
@@ -276,8 +285,9 @@ struct PTO2TaskPayload {
     // 3=DISPATCHED (2=STAGED is unused now). STAGING is the STABLE gated state —
     // many threads stage blocks concurrently while it holds, each claiming a block
     // via the atomic next_block_idx and OR-ing its cores into staged_core_mask.
-    // Release does STAGING->DISPATCHED and claims the current mask; a thread that
-    // stages a block after that flip claims and rings only its remaining bits.
+    // Release does STAGING->DISPATCHED. For a regular consumer it claims the current
+    // mask and a late stager rings only its remaining bits. A sync_start consumer
+    // preserves the mask for rendezvous counting and its single launch pass.
     std::atomic<uint8_t> early_dispatch_state{0};
     std::atomic<uint8_t> dispatch_propagated{0};  // PRODUCER side: once-guard for fanout propagation
     // The launch owner publishes COMPLETE only after all owned doorbells are
@@ -290,6 +300,11 @@ struct PTO2TaskPayload {
     // doorbells are rung only once this reaches popcount(staged_core_mask) AND the
     // producer released, so all cores launch atomically. Unused (0) for non-sync_start.
     std::atomic<int16_t> running_slot_count{0};
+    // Ownership handshake between the early sync queue and final ready routing.
+    // A successful OWNER persists through ARMED and COMPLETE until payload
+    // reinitialization. READY records that producer release observed OWNER;
+    // only cancellation clears OWNER during the current task lifetime.
+    std::atomic<uint8_t> early_sync_drain_state{PTO2_EARLY_SYNC_DRAIN_NONE};
     // === Cache lines 9-72 (4096B) — tensors (alignas(64) forces alignment) ===
     Tensor tensors[MAX_TENSOR_ARGS];
     // === Cache lines 73-74 (128B) — scalars ===
@@ -375,6 +390,7 @@ struct PTO2TaskPayload {
         published_block_count.store(0, std::memory_order_relaxed);
         early_dispatch_launch_state.store(PTO2_EARLY_DISPATCH_LAUNCH_NONE, std::memory_order_relaxed);
         running_slot_count.store(0, std::memory_order_relaxed);
+        early_sync_drain_state.store(PTO2_EARLY_SYNC_DRAIN_NONE, std::memory_order_relaxed);
     }
 };
 

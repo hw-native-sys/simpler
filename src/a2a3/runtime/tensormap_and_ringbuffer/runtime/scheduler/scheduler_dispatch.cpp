@@ -259,8 +259,8 @@ int SchedulerContext::prepare_block_for_dispatch(
         // Per-core slot placement (#1308): an idle used core takes its running slot
         // (tracked by the completion poller), a busy used core takes its gated pending slot
         // (promoted on completion). The sync_start drain relies on this — it passes
-        // to_pending=true so every busy core opts into a pending slot; combined with
-        // not_ready=1 (gated) the whole cohort still launches together at the rendezvous.
+        // to_pending=true so every busy core opts into a pending slot; the non-zero
+        // src_payload gate keeps the whole cohort waiting for the rendezvous.
         if (cmask & PTO2_SUBTASK_MASK_AIC) {
             bool p = to_pending && !tracker.is_aic_core_idle(core_offset);
             out_handles[n++] = prepare_subtask_to_core(
@@ -826,13 +826,18 @@ int32_t SchedulerContext::try_early_dispatch(
     // drain barrier: it takes exclusive tracker access and only stages when global
     // idle+pending >= block_num, guaranteeing all-or-nothing. Win => the dispatch loop runs
     // the gated drain next iteration; lose (a drain is already armed, or capacity <
-    // block_num) => re-push and fall through to the normal tiers. A non-STAGING pop was
-    // already released and is dropped. Staging happens inside the drain, so this arms at most
-    // one drain and adds no blocks to total_staged here.
+    // block_num) => cancel the owner and re-push or transfer its final ready route. A
+    // non-STAGING pop was already released and is dropped. Staging happens inside the drain,
+    // so this arms at most one drain and adds no blocks to total_staged here.
     if (PTO2TaskSlotState *c = sched_->early_sync_start_queue.pop()) {
-        if (c->payload->early_dispatch_state.load(std::memory_order_acquire) == PTO2_EARLY_DISPATCH_STAGING &&
-            !enter_drain_mode(c, c->logical_block_num)) {
-            sched_->early_sync_start_queue.push(c);
+        if (PTO2SchedulerState::try_claim_early_sync_drain(*c->payload)) {
+            if (c->payload->early_dispatch_state.load(std::memory_order_seq_cst) != PTO2_EARLY_DISPATCH_STAGING) {
+                sched_->cancel_early_sync_drain(*c);
+            } else if (enter_drain_mode(c, c->logical_block_num)) {
+                PTO2SchedulerState::mark_early_sync_drain_armed(*c->payload);
+            } else {
+                sched_->cancel_early_sync_drain(*c);
+            }
         }
     }
 

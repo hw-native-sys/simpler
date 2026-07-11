@@ -702,9 +702,9 @@ struct PTO2SchedulerState {
     //
     // Deliberately single, vs the normal source's per-shape ready_sync_queues[]: a READY
     // sync cohort (producer done) can dispatch inline when it fits, so it reuses the
-    // per-shape dispatch_shape; an EARLY sync cohort is ALWAYS gated (not_ready=1) => always
-    // drains => the shape-agnostic rendezvous makes one queue sufficient. Same drain, two
-    // sources.
+    // per-shape dispatch_shape; an EARLY sync cohort always carries a non-zero
+    // src_payload gate and therefore always drains. The shape-agnostic rendezvous
+    // makes one queue sufficient. Same drain, two sources.
     PTO2ReadyQueue early_sync_start_queue;
 
     static inline void ring_one_doorbell(uint64_t reg_addr, uint32_t token) {
@@ -754,9 +754,9 @@ struct PTO2SchedulerState {
         slot_state.payload->published_block_count.fetch_add(static_cast<int16_t>(count), std::memory_order_seq_cst);
     }
 
-    // Ring every doorbell recorded in a staged consumer's staged_core_mask, from the
-    // per-core early_dispatch_doorbell_table. Idempotent — a re-rung doorbell is harmless (the
-    // AICore already matched). seq_cst load pairs with the stagers' seq_cst fetch_or.
+    // Ring one sync_start cohort from its stable staged_core_mask. The caller owns
+    // the NONE->RINGING launch latch and invokes this exactly once after drain
+    // staging completes, while the corresponding per-core table entries are live.
     inline void ring_all_staged_doorbells(PTO2TaskSlotState &slot_state) {
         for (int w = 0; w < PTO2_EARLY_DISPATCH_CORE_MASK_WORDS; w++) {
             uint64_t bits = slot_state.payload->staged_core_mask[w].load(std::memory_order_seq_cst);
@@ -770,6 +770,51 @@ struct PTO2SchedulerState {
         }
     }
 
+    static inline bool try_claim_early_sync_drain(PTO2TaskPayload &payload) {
+        uint8_t expected = PTO2_EARLY_SYNC_DRAIN_NONE;
+        return payload.early_sync_drain_state.compare_exchange_strong(
+            expected, PTO2_EARLY_SYNC_DRAIN_OWNER, std::memory_order_seq_cst, std::memory_order_seq_cst
+        );
+    }
+
+    static inline bool owns_early_sync_drain(const PTO2TaskPayload &payload) {
+        return (payload.early_sync_drain_state.load(std::memory_order_acquire) & PTO2_EARLY_SYNC_DRAIN_OWNER) != 0;
+    }
+
+    static inline void mark_early_sync_drain_armed(PTO2TaskPayload &payload) {
+        payload.early_sync_drain_state.fetch_or(PTO2_EARLY_SYNC_DRAIN_ARMED, std::memory_order_seq_cst);
+    }
+
+    static inline bool publish_ready_to_early_sync_drain(PTO2TaskPayload &payload) {
+        uint8_t previous =
+            payload.early_sync_drain_state.fetch_or(PTO2_EARLY_SYNC_DRAIN_READY, std::memory_order_seq_cst);
+        return (previous & PTO2_EARLY_SYNC_DRAIN_OWNER) != 0;
+    }
+
+    inline void cancel_early_sync_drain(PTO2TaskSlotState &slot_state) {
+        uint8_t previous =
+            slot_state.payload->early_sync_drain_state.exchange(PTO2_EARLY_SYNC_DRAIN_NONE, std::memory_order_seq_cst);
+        if ((previous & PTO2_EARLY_SYNC_DRAIN_OWNER) == 0) return;
+        if ((previous & PTO2_EARLY_SYNC_DRAIN_READY) != 0) {
+            push_ready_routed(&slot_state);
+            return;
+        }
+        if (slot_state.payload->early_dispatch_state.load(std::memory_order_seq_cst) == PTO2_EARLY_DISPATCH_STAGING) {
+            early_sync_start_queue.push(&slot_state);
+        }
+    }
+
+    static inline void finish_early_sync_drain(PTO2TaskPayload &payload) {
+        uint8_t state = payload.early_sync_drain_state.load(std::memory_order_seq_cst);
+        while ((state & PTO2_EARLY_SYNC_DRAIN_OWNER) != 0 && (state & PTO2_EARLY_SYNC_DRAIN_COMPLETE) == 0) {
+            uint8_t desired = state | PTO2_EARLY_SYNC_DRAIN_COMPLETE;
+            if (payload.early_sync_drain_state.compare_exchange_weak(
+                    state, desired, std::memory_order_seq_cst, std::memory_order_seq_cst
+                )) {
+                return;
+            }
+        }
+    }
     // sync_start rendezvous: a sync_start consumer's gated cores launch as an atomic
     // cohort, so their doorbells are held until BOTH halves hold — every gated core
     // occupies a running slot (running_slot_count == popcount(staged_core_mask)) AND the
@@ -947,7 +992,13 @@ struct PTO2SchedulerState {
 
         // Early-dispatch: pre-staged tasks are released by doorbell
         // here, skipping the ready-queue round-trip entirely.
-        if (try_early_dispatch_release(slot_state, sink)) return true;
+        bool early_handled = try_early_dispatch_release(slot_state, sink);
+        if (slot_state.active_mask.requires_sync_start()) {
+            bool drain_owned = publish_ready_to_early_sync_drain(*slot_state.payload);
+            if (early_handled || drain_owned) return true;
+        } else if (early_handled) {
+            return true;
+        }
 
         PTO2ResourceShape shape = slot_state.active_mask.to_shape();
         if (shape == PTO2ResourceShape::DUMMY) {
@@ -981,7 +1032,13 @@ struct PTO2SchedulerState {
 
         // Early-dispatch: pre-staged tasks are released by doorbell
         // here, skipping the ready-queue round-trip entirely.
-        if (try_early_dispatch_release(slot_state, sink)) return true;
+        bool early_handled = try_early_dispatch_release(slot_state, sink);
+        if (slot_state.active_mask.requires_sync_start()) {
+            bool drain_owned = publish_ready_to_early_sync_drain(*slot_state.payload);
+            if (early_handled || drain_owned) return true;
+        } else if (early_handled) {
+            return true;
+        }
 
         PTO2ResourceShape shape = slot_state.active_mask.to_shape();
         if (shape == PTO2ResourceShape::DUMMY) {
