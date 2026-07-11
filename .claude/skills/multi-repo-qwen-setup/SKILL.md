@@ -121,11 +121,21 @@ task-submit --timeout 2400 --max-time 2400 --device auto --device-num 1 --run "\
 - Decode dispatches through the **L3 `DistributedWorker`**, which forks a
   **chip-child (L2)** that runs `run_prepared`. The per-step timing lives at
   **L2**: `run_prepared` computes both host (`host_wall`) and device
-  (`device_wall` = the fused-decode orchestrator wall, ~33 ms — nonzero) plus
-  the device orch/sched markers. The L3 parent's `Worker.run` returns
-  `RunTiming(python_wall, 0)` — its `device_wall=0` is **expected** (L3 is a
-  dispatcher with no device wall of its own) and is **not** the source you
+  (`device_wall` = the fused-decode orchestrator wall, ~40 ms at 3.5k context —
+  nonzero) plus the device orch/sched markers. The L3 parent's `Worker.run`
+  returns `RunTiming(python_wall, 0)` — its `device_wall=0` is **expected** (L3
+  is a dispatcher with no device wall of its own) and is **not** the source you
   read. Read L2 instead (next section).
+
+  > **Warmup skews single-invocation reads.** The pypto-serving profile warmup
+  > dispatches a tiny-KV decode step (`[warmup] decode dispatch … seq_len≈257`,
+  > `device_wall` ~28 ms) *before* the real 3.5k-context steps (~40 ms). Any
+  > tool that reports one invocation shows the warmup value. Decode is
+  > memory-bound: ~28 ms reads the 28 GB bf16 weights every step, +~12 ms reads
+  > the 3.3k-token KV for attention — the KV read is why warmup (short KV) is
+  > ~12 ms cheaper, not cold start. Trust `kernel.decode_layer avg` from
+  > `--profile` (excludes warmup) or `strace_timing --tree` (medians all
+  > invocations); do not read a single decode step.
 
 ## 3. Run decode (batch-16)
 
@@ -222,9 +232,9 @@ The full per-token decomposition (what each layer means / how to get it):
 
 ②③④ come from the **L2 chip-child** `run_prepared`'s `host_wall` /
 `runner_run` / `device_wall`. `host_wall` and `device_wall` are already
-computed there (and `device_wall` is nonzero, ~33 ms — it is the L2 orchestrator
-wall, *not* the L3 parent's `RunTiming.device_wall=0`); the L3 parent drops
-the child's `RunTiming`, so they never reach a return value.
+computed there (and `device_wall` is nonzero, ~40 ms at 3.5k context — it is the
+L2 orchestrator wall, *not* the L3 parent's `RunTiming.device_wall=0`); the L3
+parent drops the child's `RunTiming`, so they never reach a return value.
 
 Simpler surfaces them instead as **`[STRACE]` host-trace markers** — one
 line per `run_prepared` stage

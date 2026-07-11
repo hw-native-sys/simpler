@@ -146,6 +146,15 @@ def _mean(values):
     return sum(values) / len(values) if values else 0.0
 
 
+def _median(values):
+    if not values:
+        return 0.0
+    s = sorted(values)
+    n = len(s)
+    mid = n // 2
+    return s[mid] if n % 2 else (s[mid - 1] + s[mid]) / 2.0
+
+
 def print_tpot_table(buckets, label_for_hid=None, stream=sys.stdout):
     """Print a per-callable TPOT table. The most-invoked bucket is decode."""
     if not buckets:
@@ -364,19 +373,35 @@ def to_chrome_trace(invocations, buckets=None):
     return {"traceEvents": events, "displayTimeUnit": "ms"}
 
 
-def _print_inv_tree(inv, stream=sys.stdout):
-    """Print one invocation's spans as a nested tree built from the dotted span
+def _print_agg_tree(invs, stream=sys.stdout):
+    """Print a callable's spans as a nested tree built from the dotted span
     names (so e.g. ``simpler_run.bind.args`` nests under ``simpler_run.bind``),
     NOT from depth+ts — host (steady_clock) and device (``clk=dev``) spans live
     on different clocks, so timestamp containment across domains is meaningless;
-    the dotted name is the unambiguous parent link. Siblings are ordered by
-    ``ts``. Device spans are tagged ``[dev]``; durations are µs."""
-    by_name = {s.name: s for s in inv.spans}
-    # children[parent_name] = [child span...]; a span's parent is its name minus
-    # the last dotted segment (if that prefix is itself a known span).
+    the dotted name is the unambiguous parent link. Device spans are tagged
+    ``[dev]``; durations are µs.
+
+    Each node's duration is the **median across every invocation** of this
+    callable, not one invocation's value. A single-invocation tree would mislead
+    on a callable whose invocations differ in cost — e.g. qwen3 decode, where the
+    pypto-serving profile warmup dispatches a tiny-KV decode step (seq_len≈257)
+    before the real steps: its Effective (~28 ms) is far below the steady-state
+    (~40 ms at 3.5k context). The median is robust to that warmup outlier."""
+    # Per-span-name median duration across all invocations.
+    dur_samples: dict = defaultdict(list)
+    for inv in invs:
+        for name, span in inv.by_name().items():
+            dur_samples[name].append(span.dur)
+    med = {name: _median(ds) for name, ds in dur_samples.items()}
+
+    # Structure + ts ordering from the LAST invocation — for qwen decode the
+    # warmup step is inv 0, so the last is a steady-state one; either way the
+    # dotted-name tree shape is identical across invocations.
+    ref = invs[-1]
+    by_name = {s.name: s for s in ref.spans}
     children = {}
     roots = []
-    for s in inv.spans:
+    for s in ref.spans:
         parent = s.name.rsplit(".", 1)[0] if "." in s.name else None
         if parent is not None and parent in by_name:
             children.setdefault(parent, []).append(s)
@@ -386,7 +411,7 @@ def _print_inv_tree(inv, stream=sys.stdout):
     def emit(s, indent):
         tag = " [dev]" if s.is_device else ""
         leaf = s.name.rsplit(".", 1)[-1] if "." in s.name else s.name
-        stream.write(f"{'  ' * indent}{leaf:<22}{tag:>6}  {s.dur / 1000.0:>12.1f} us\n")
+        stream.write(f"{'  ' * indent}{leaf:<22}{tag:>6}  {med[s.name] / 1000.0:>12.1f} us\n")
         kids = sorted(children.get(s.name, []), key=lambda x: x.ts)
         # orch and sched run concurrently (see docs/dfx/device-phases.md): render
         # them on ONE line, left = orch, right = sched, under their merged window
@@ -397,13 +422,25 @@ def _print_inv_tree(inv, stream=sys.stdout):
             cleaf = c.name.rsplit(".", 1)[-1]
             if cleaf == "orch" and has_sched:
                 sched = next(k for k in kids if k.name.rsplit(".", 1)[-1] == "sched")
-                eff = (max(c.ts + c.dur, sched.ts + sched.dur) - min(c.ts, sched.ts)) / 1000.0
+                # Effective is per-invocation (orch ∪ sched depends on both
+                # markers' overlap in that inv), so take the median of the
+                # per-inv Effective values rather than combining the two medians.
+                effs = []
+                for inv in invs:
+                    bn = inv.by_name()
+                    o, sc = bn.get(c.name), bn.get(sched.name)
+                    if o is not None and sc is not None:
+                        effs.append(max(o.ts + o.dur, sc.ts + sc.dur) - min(o.ts, sc.ts))
+                eff = _median(effs) / 1000.0
                 base = "  " * (indent + 1)
                 # Effective = the merged orch ∪ sched window, with the two
                 # concurrent children shown side by side on the indented line
                 # below it (see docs/dfx/device-phases.md).
                 stream.write(f"{base}{'Effective':<22} [dev]  {eff:>12.1f} us\n")
-                stream.write(f"{base}  orch {c.dur / 1000.0:.1f}  ∥  sched {sched.dur / 1000.0:.1f}   (concurrent)\n")
+                stream.write(
+                    f"{base}  orch {med[c.name] / 1000.0:.1f}  ∥  "
+                    f"sched {med[sched.name] / 1000.0:.1f}   (concurrent)\n"
+                )
             elif cleaf == "sched" and has_orch:
                 continue  # shown beside orch on the Effective line above
             else:
@@ -421,9 +458,10 @@ def print_tree(buckets, stream=sys.stdout):
     ordered = sorted(buckets.items(), key=lambda kv: len(kv[1]), reverse=True)
     for hid, invs in ordered:
         label = _bucket_label(buckets, hid)
-        print(f"callable hid={hid} ({label}) — {len(invs)} invocation(s)", file=stream)
-        # Show the first invocation's tree as representative (they share structure).
-        _print_inv_tree(invs[0], stream=stream)
+        n = len(invs)
+        suffix = f" — median of {n} invocation(s)" if n > 1 else " — 1 invocation"
+        print(f"callable hid={hid} ({label}){suffix}", file=stream)
+        _print_agg_tree(invs, stream=stream)
         print(file=stream)
 
 
