@@ -419,15 +419,23 @@ class KernelCompiler:
         if orch_includes:
             include_dirs = include_dirs + orch_includes
 
-        # Resolve toolchain: HOST_GXX needs no runtime-specific extras
-        toolchain_type = self._get_toolchain(
-            {
-                "a2a3": ToolchainType.AARCH64_GXX,
-                "a2a3sim": ToolchainType.HOST_GXX,
-                "a5": ToolchainType.AARCH64_GXX,
-                "a5sim": ToolchainType.HOST_GXX,
-            },
-        )
+        # host_build_graph dlopens the orchestration .so on the host, so it
+        # compiles with the host g++ (x86_64) regardless of platform.
+        # tensormap_and_ringbuffer dlopens it on the aarch64 AICPU onboard, so
+        # it cross-compiles there and uses the host g++ only for sim.
+        if runtime_name == "host_build_graph":
+            toolchain_type = ToolchainType.HOST_GXX
+        elif runtime_name == "tensormap_and_ringbuffer":
+            toolchain_type = self._get_toolchain(
+                {
+                    "a2a3": ToolchainType.AARCH64_GXX,
+                    "a2a3sim": ToolchainType.HOST_GXX,
+                    "a5": ToolchainType.AARCH64_GXX,
+                    "a5sim": ToolchainType.HOST_GXX,
+                },
+            )
+        else:
+            raise ValueError(f"Unknown runtime_name: {runtime_name!r}")
         toolchain: Union[GxxToolchain, Aarch64GxxToolchain]
         if toolchain_type == ToolchainType.AARCH64_GXX:
             assert self.aarch64 is not None, "aarch64 toolchain is only available for hardware platforms"
@@ -435,9 +443,7 @@ class KernelCompiler:
         else:
             toolchain = self.host_gxx
 
-        # HOST_GXX: simulation build (host execution)
-        # AARCH64_GXX: cross-compilation for supported runtimes
-        #   Note: orchestration uses ops table via pto_orchestration_api.h (no extra runtime sources needed)
+        # Orchestration uses the ops table via pto_orchestration_api.h (no extra runtime sources needed).
         return self._compile_orchestration_shared_lib(
             source_path,
             toolchain,
