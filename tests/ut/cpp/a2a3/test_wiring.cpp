@@ -382,6 +382,61 @@ TEST_F(WiringTest, EarlyDispatchWaitsForAllProducerBlocksPublished) {
     EXPECT_EQ(payload.dispatch_fanin.load(), payload.fanin_actual_count);
 }
 
+TEST_F(WiringTest, ConcurrentBlockRangeClaimsDoNotOverlap) {
+    alignas(64) PTO2TaskSlotState task_slot;
+    init_slot(task_slot, PTO2_TASK_PENDING, 1, 1);
+    task_slot.logical_block_num = 8;
+
+    struct ClaimedRange {
+        int32_t start = -1;
+        int32_t count = 0;
+    } ranges[2];
+    std::atomic<int32_t> ready{0};
+    std::atomic<bool> start{false};
+
+    auto claim = [&](int32_t index) {
+        ready.fetch_add(1, std::memory_order_release);
+        while (!start.load(std::memory_order_acquire)) {}
+        ranges[index].count = task_slot.claim_block_range(task_slot.logical_block_num, 5, ranges[index].start);
+    };
+
+    std::thread first(claim, 0);
+    std::thread second(claim, 1);
+    while (ready.load(std::memory_order_acquire) != 2) {}
+    start.store(true, std::memory_order_release);
+    first.join();
+    second.join();
+
+    ClaimedRange *lower = ranges[0].start < ranges[1].start ? &ranges[0] : &ranges[1];
+    ClaimedRange *upper = lower == &ranges[0] ? &ranges[1] : &ranges[0];
+    EXPECT_EQ(lower->start, 0);
+    EXPECT_EQ(lower->count, 5);
+    EXPECT_EQ(upper->start, 5);
+    EXPECT_EQ(upper->count, 3);
+    EXPECT_EQ(lower->start + lower->count, upper->start);
+    EXPECT_EQ(task_slot.next_block_idx.load(std::memory_order_relaxed), task_slot.logical_block_num);
+}
+
+TEST_F(WiringTest, PartialStagedReleaseRoutesRemainderToReadyQueue) {
+    alignas(64) PTO2TaskSlotState consumer;
+    init_slot(consumer, PTO2_TASK_PENDING, 1, 1);
+    consumer.logical_block_num = 5;
+    consumer.next_block_idx.store(2, std::memory_order_relaxed);
+    consumer.payload->early_dispatch_state.store(PTO2_EARLY_DISPATCH_STAGING, std::memory_order_relaxed);
+    consumer.payload->staged_core_mask[0].store(1, std::memory_order_relaxed);
+
+    EXPECT_TRUE(sched.route_ready_once(consumer));
+    EXPECT_EQ(consumer.payload->early_dispatch_state.load(), PTO2_EARLY_DISPATCH_DISPATCHED);
+    EXPECT_EQ(consumer.next_block_idx.load(), 2);
+
+    PTO2ResourceShape shape = consumer.active_mask.to_shape();
+    EXPECT_EQ(sched.ready_queues[static_cast<int32_t>(shape)].pop(), &consumer);
+
+    int32_t remaining_start = -1;
+    EXPECT_EQ(consumer.claim_block_range(consumer.logical_block_num, 5, remaining_start), 3);
+    EXPECT_EQ(remaining_start, 2);
+}
+
 TEST_F(WiringTest, EarlyDispatchDoorbellBitsHaveOneOwner) {
     constexpr uint64_t all_bits = 0b1111;
     constexpr uint64_t late_bits = 0b1010;

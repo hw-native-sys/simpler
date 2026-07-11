@@ -437,8 +437,6 @@ void SchedulerContext::dispatch_shape(
                 break;
             }
 
-            dispatched_any = true;
-            try_pushed = true;
             // Claim a contiguous range of blocks, hand the slot back to the
             // ready queue immediately, then perform the expensive dispatches.
             // This lets other schedulers concurrently claim and dispatch the
@@ -446,11 +444,12 @@ void SchedulerContext::dispatch_shape(
             // this thread fills all its own cores. Only local `start + b` is
             // read after the push — `next_block_idx` may already be advanced
             // by another scheduler that popped the slot.
-            int32_t start = slot_state->next_block_idx.load(std::memory_order_relaxed);
-            int32_t remaining = slot_state->logical_block_num - start;
             int32_t available = is_mix ? selected_mix_clusters.count() : cores.count();
-            int32_t claim = std::min(available, remaining);
-            slot_state->next_block_idx.store(static_cast<int16_t>(start + claim), std::memory_order_relaxed);
+            int32_t start = 0;
+            int32_t claim = slot_state->claim_block_range(slot_state->logical_block_num, available, start);
+            if (claim == 0) continue;
+            dispatched_any = true;
+            try_pushed = true;
 
             published_list[published_n] = slot_state;
             published_counts[published_n] = static_cast<int16_t>(claim);
@@ -598,11 +597,11 @@ void SchedulerContext::dispatch_ready_tasks(
 }
 
 // Stage the ALREADY-CLAIMED range [start, start+count) of consumer `c` onto
-// thread_idx's idle then pending cores. The caller (the queue drain) has advanced
-// next_block_idx by `count` under pop-exclusivity AND re-pushed `c` for peers
+// thread_idx's idle then pending cores. The caller has atomically advanced
+// next_block_idx by `count` AND re-pushed `c` for peers
 // BEFORE calling this — so this, the expensive prepare+publish, runs CONCURRENTLY
 // with peers staging other ranges of the same consumer. This mirrors the normal
-// SPMD dispatch path (claim range -> store next_block_idx -> re-push -> dispatch).
+// SPMD dispatch path (claim range -> re-push -> dispatch).
 // `idle`/`pend` are this thread's free-core sets, sized so idle.count+pend.count >=
 // count (the caller clamped the claim to them), so all `count` blocks get a core.
 //
@@ -760,22 +759,8 @@ SchedulerContext::early_dispatch_shape(int32_t thread_idx, PTO2ResourceShape sha
             sched_->early_dispatch_queues[s].push_batch(&batch[bi], got - bi);
             break;
         }
-        // CAS-claim a contiguous range [start, start+claim) sized to this thread's
-        // free cores; CAS keeps it atomic against peers AND normal dispatch.
-        int32_t start = 0, claim = 0;
-        while (true) {
-            int16_t cur = c->next_block_idx.load(std::memory_order_relaxed);
-            if (cur >= c->logical_block_num) break;  // fully claimed
-            int32_t cnt = c->logical_block_num - cur;
-            if (cnt > freecores) cnt = freecores;
-            if (c->next_block_idx.compare_exchange_weak(
-                    cur, static_cast<int16_t>(cur + cnt), std::memory_order_seq_cst, std::memory_order_relaxed
-                )) {
-                start = cur;
-                claim = cnt;
-                break;
-            }
-        }
+        int32_t start = 0;
+        int32_t claim = c->claim_block_range(c->logical_block_num, freecores, start);
         if (claim == 0) continue;  // nothing left to claim -> drop (no re-push)
         // Re-push for concurrent peers BEFORE the expensive staging.
         if (start + claim < c->logical_block_num) {

@@ -557,20 +557,8 @@ SchedulerContext::drain_stage_cores(PTO2TaskSlotState *slot_state, int32_t block
     auto stage = [&](CoreTracker::BitStates valid, bool to_pending) {
         while (valid.has_value()) {
             int32_t avail = valid.count();
-            int32_t start = 0, claim = 0;
-            while (true) {
-                int16_t cur = slot_state->next_block_idx.load(std::memory_order_relaxed);
-                if (cur >= block_num) return;  // all blocks claimed
-                int32_t cnt = block_num - cur;
-                if (cnt > avail) cnt = avail;
-                if (slot_state->next_block_idx.compare_exchange_weak(
-                        cur, static_cast<int16_t>(cur + cnt), std::memory_order_seq_cst, std::memory_order_relaxed
-                    )) {
-                    start = cur;
-                    claim = cnt;
-                    break;
-                }
-            }
+            int32_t start = 0;
+            int32_t claim = slot_state->claim_block_range(block_num, avail, start);
             if (claim == 0) return;
 #if SIMPLER_DFX
             bool sub_prof = l2_swimlane_level_ >= L2SwimlaneLevel::SCHED_PHASES;

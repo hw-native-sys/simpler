@@ -320,7 +320,7 @@ private:
 
     // Stage the already-claimed range [start, start+count) of consumer `c` onto
     // thread_idx's idle (RUNNING slot) then pending (gated-pending, promote-on-FIN)
-    // cores from the provided free-core sets. The caller advances next_block_idx and
+    // cores from the provided free-core sets. The caller claims next_block_idx and
     // re-pushes `c` BEFORE calling, so this expensive prepare+publish runs
     // concurrently with peers (mirrors the normal SPMD dispatch path). Returns the
     // number of blocks staged.

@@ -491,11 +491,27 @@ struct alignas(64) PTO2TaskSlotState {
     std::atomic<int16_t> completed_subtasks{0};  // Each core completion increments by 1
     int16_t total_required_subtasks{0};          // = logical_block_num * popcount(active_mask)
     int16_t logical_block_num{1};                // Total logical blocks (set by orchestrator)
-    // Next block to dispatch. Atomic so concurrent early-dispatch stagers can each
-    // claim a distinct block via CAS; normal dispatch (ready-queue serialized)
-    // uses plain relaxed load/store. The two phases never overlap in time (staging
-    // happens before release; normal dispatch of the remainder happens after).
+    // Next block to dispatch. Normal dispatch and late early-dispatch stagers
+    // can run concurrently after a partial staged release. All paths claim
+    // ranges through claim_block_range().
     std::atomic<int16_t> next_block_idx{0};
+
+    int32_t claim_block_range(int32_t block_limit, int32_t max_count, int32_t &start) {
+        int16_t current = next_block_idx.load(std::memory_order_relaxed);
+        while (current < block_limit && max_count > 0) {
+            int32_t count = block_limit - current;
+            if (count > max_count) count = max_count;
+            int16_t desired = static_cast<int16_t>(current + count);
+            if (next_block_idx.compare_exchange_weak(
+                    current, desired, std::memory_order_seq_cst, std::memory_order_relaxed
+                )) {
+                start = current;
+                return count;
+            }
+        }
+        start = current;
+        return 0;
+    }
 
     /**
      * Bind the slot-invariant ring id. Called once per slot during
