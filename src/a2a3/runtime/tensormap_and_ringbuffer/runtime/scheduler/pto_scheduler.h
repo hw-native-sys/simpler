@@ -698,10 +698,16 @@ struct PTO2SchedulerState {
         *dmb = (tk << 32) | tk;  // 64-bit STR: high=low=token releases the gated AICore
     }
 
-    // Event-driven candidate detection (the dual of fanin_refcount/ready). Call when a
-    // FLAGGED producer `p` DISPATCHES (starts running): walk its fanout and bump each
+    inline void record_published_blocks(PTO2TaskSlotState &slot_state, int32_t count) {
+        if (count <= 0 || !slot_state.allow_early_resolve) return;
+        slot_state.payload->published_block_count.fetch_add(static_cast<int16_t>(count), std::memory_order_seq_cst);
+    }
+
+    // Event-driven candidate detection (the dual of fanin_refcount/ready). Call after
+    // publishing a FLAGGED producer's blocks: once every logical block is launch-visible,
+    // walk its fanout and bump each
     // consumer's dispatch_fanin. A consumer whose dispatch_fanin reaches
-    // fanin_actual_count (= every producer is either flagged-and-dispatched, or was
+    // fanin_actual_count (= every producer is either flagged-and-fully-published, or was
     // already complete when the consumer was wired) is an early-dispatch candidate:
     // CAS NONE->STAGING (exactly-once) and push to early_dispatch_queues[shape] for the idle drain to
     // pre-stage. Once-guarded per producer so an SPMD producer's block-by-block
@@ -709,6 +715,7 @@ struct PTO2SchedulerState {
     // successors early-dispatch off its DIRECT producers' marks, never an inherited chain.
     void propagate_dispatch_fanin(PTO2TaskSlotState &p) {
         if (!p.allow_early_resolve) return;  // only codegen-flagged (direct) producers propagate
+        if (p.payload->published_block_count.load(std::memory_order_seq_cst) < p.logical_block_num) return;
         if (p.payload->dispatch_propagated.exchange(1, std::memory_order_acq_rel) != 0)
             return;  // already propagated once
         p.lock_fanout();
@@ -721,7 +728,7 @@ struct PTO2SchedulerState {
             // ready_fanin gets but dispatch_fanin does not). dispatch_fanin starts at
             // the wiring-time flagged-pre-completed seed and is bumped here by flagged
             // producers; reaching fanin_actual_count means every producer is
-            // flagged-dispatched or was pre-completed. An unflagged producer leaves the
+            // flagged-and-fully-published or was pre-completed. An unflagged producer leaves the
             // seed short and never bumps, so this stays unreachable for that consumer.
             int32_t nf = c->payload->dispatch_fanin.fetch_add(1, std::memory_order_acq_rel) + 1;
             if (nf != c->payload->fanin_actual_count) continue;

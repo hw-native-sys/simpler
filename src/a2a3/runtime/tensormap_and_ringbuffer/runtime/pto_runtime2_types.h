@@ -241,7 +241,7 @@ struct PTO2TaskPayload {
     PTO2FaninPool *fanin_spill_pool{nullptr};
     PTO2TaskSlotState *fanin_inline_slot_states[PTO2_FANIN_INLINE_CAP];
     // Early-dispatch metadata (AICPU-side only). Ordered by descending
-    // alignment (8B mask, 4B fanin, then 1B flags) so the block packs with no
+    // alignment (8B mask, 4B fanin, then 2B/1B counters and flags) so the block packs with no
     // internal padding. Kept here after the fanin array (not moved up front): on
     // cache line 8 it shares only with the rarely-touched fanin tail, whereas in
     // line 0 the early-dispatch atomics (written during staging) would false-share with
@@ -254,11 +254,17 @@ struct PTO2TaskPayload {
     // PTO2TaskPayload::init before the slot can be staged again.
     std::atomic<uint64_t> staged_core_mask[PTO2_EARLY_DISPATCH_CORE_MASK_WORDS]{};
     // Early-dispatch CANDIDATE detection (event-driven, dual of fanin_refcount):
-    // seeded at wiring with producers already complete, then a flagged producer's
-    // DISPATCH bumps each consumer's dispatch_fanin. dispatch_fanin ==
-    // fanin_actual_count  <=>  every producer is flagged-and-dispatched or was
+    // seeded at wiring with producers already complete, then a flagged producer
+    // bumps each consumer after all of its logical blocks are published.
+    // dispatch_fanin == fanin_actual_count  <=>  every producer is
+    // flagged-and-fully-published or was
     // pre-completed  =>  this task is an early-dispatch candidate (push early_dispatch_queues[shape]).
-    std::atomic<int32_t> dispatch_fanin{0};  // CONSUMER side: flagged-dispatched + pre-completed producers
+    std::atomic<int32_t> dispatch_fanin{0};  // CONSUMER side: fully-published + pre-completed producers
+    // Number of logical blocks whose payloads and MMIO tokens are published.
+    // Claimed-but-unpublished blocks do not make a producer launch-visible. Its
+    // seq_cst updates pair with early_dispatch_state to avoid losing the final
+    // publish vs. release wakeup for a pre-staged producer.
+    std::atomic<int16_t> published_block_count{0};
     // Lock-free claim state shared by the stagers (Hook 1, possibly several AICPU
     // threads concurrently) and the completion-path release: 0=NONE, 1=STAGING,
     // 3=DISPATCHED (2=STAGED is unused now). STAGING is the STABLE gated state —
@@ -344,11 +350,14 @@ struct PTO2TaskPayload {
         // one of ITS producers is flagged (propagate_dispatch_fanin bumps
         // dispatch_fanin and may CAS early_dispatch_state on any consumer, independent of the
         // consumer's own hint). So they MUST be zeroed here unconditionally.
+        // published_block_count and dispatch_propagated are producer-side, but share
+        // this same per-submit lifetime and are reset here too.
         early_dispatch_state.store(PTO2_EARLY_DISPATCH_NONE, std::memory_order_relaxed);
         for (int w = 0; w < PTO2_EARLY_DISPATCH_CORE_MASK_WORDS; w++)
             staged_core_mask[w].store(0, std::memory_order_relaxed);
         dispatch_fanin.store(0, std::memory_order_relaxed);
         dispatch_propagated.store(0, std::memory_order_relaxed);
+        published_block_count.store(0, std::memory_order_relaxed);
     }
 };
 
@@ -517,7 +526,7 @@ struct alignas(64) PTO2TaskSlotState {
         next_block_idx.store(0, std::memory_order_relaxed);
         ready_state.store(PTO2_READY_UNCLAIMED, std::memory_order_relaxed);
         allow_early_resolve = false;
-        // Note: payload early-dispatch fields (early_dispatch_state / staged_core_mask / dispatch_fanin)
+        // Note: payload early-dispatch fields (state, masks, fanin, publication count)
         // are NOT reset here — this method skips the payload by contract. They are
         // (re)initialized in PTO2TaskPayload::init on every submit, before the slot
         // becomes visible to the scheduler.

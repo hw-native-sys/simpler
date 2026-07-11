@@ -258,9 +258,10 @@ TEST_F(WiringTest, WireTaskMixedProducerStates) {
 // =============================================================================
 // Early-dispatch seed (direct-only): a consumer becomes an early-dispatch
 // candidate ONLY when every producer is codegen-flagged (allow_early_resolve,
-// now a slot_state field). A single unflagged producer leaves dispatch_fanin
-// short forever. Auto-chain inheritance was removed, so flagged-ness is the
-// producer's own static hint — never propagated down a chain.
+// now a slot_state field) and fully published or pre-completed. A single
+// unflagged producer leaves dispatch_fanin short forever. Auto-chain inheritance
+// was removed, so flagged-ness is the producer's own static hint — never
+// propagated down a chain.
 // =============================================================================
 
 TEST_F(WiringTest, WireTaskAllFlaggedPrecompletedSeedsDispatchFanin) {
@@ -340,10 +341,10 @@ TEST_F(WiringTest, WireTaskOneUnflaggedProducerDisqualifiesSeed) {
     EXPECT_EQ(payload.dispatch_fanin.load(), 0);  // disqualified: seed stays 0
 }
 
-TEST_F(WiringTest, EarlyDispatchReachesCandidateWhenAllFlagged) {
+TEST_F(WiringTest, EarlyDispatchWaitsForAllProducerBlocksPublished) {
     // A flagged, still-pending producer seeds nothing at wiring (not
-    // pre-completed); its DISPATCH propagates and bumps the consumer to
-    // fanin_actual_count, making it an early-dispatch candidate.
+    // pre-completed); only publishing every logical block bumps the consumer
+    // to fanin_actual_count and makes it an early-dispatch candidate.
     alignas(64) PTO2TaskSlotState task_slot;
     alignas(64) PTO2TaskSlotState producer;
     alignas(64) PTO2TaskPayload payload;
@@ -352,6 +353,7 @@ TEST_F(WiringTest, EarlyDispatchReachesCandidateWhenAllFlagged) {
 
     init_slot(producer, PTO2_TASK_PENDING, 1, 1);
     producer.allow_early_resolve = true;
+    producer.logical_block_num = 3;
 
     init_slot(task_slot, PTO2_TASK_PENDING, 0, 1);
     payload.fanin_actual_count = 1;
@@ -361,6 +363,16 @@ TEST_F(WiringTest, EarlyDispatchReachesCandidateWhenAllFlagged) {
 
     wire_fanin(task_slot, 1);
     EXPECT_EQ(payload.dispatch_fanin.load(), 0);  // pending -> nothing seeded yet
+
+    sched.record_published_blocks(producer, 2);
+    sched.propagate_dispatch_fanin(producer);
+    EXPECT_EQ(payload.dispatch_fanin.load(), 0);
+    EXPECT_EQ(producer.payload->dispatch_propagated.load(), 0);
+
+    sched.record_published_blocks(producer, 1);
+    sched.propagate_dispatch_fanin(producer);
+    EXPECT_EQ(payload.dispatch_fanin.load(), payload.fanin_actual_count);
+    EXPECT_EQ(producer.payload->dispatch_propagated.load(), 1);
 
     sched.propagate_dispatch_fanin(producer);
     EXPECT_EQ(payload.dispatch_fanin.load(), payload.fanin_actual_count);
@@ -388,6 +400,7 @@ TEST_F(WiringTest, EarlyDispatchBlockedByUnflaggedProducer) {
     wire_fanin(task_slot, 2);
     EXPECT_EQ(payload.dispatch_fanin.load(), 0);  // q unflagged -> disqualified seed
 
+    sched.record_published_blocks(p_flagged, p_flagged.logical_block_num);
     sched.propagate_dispatch_fanin(p_flagged);    // bumps to 1
     sched.propagate_dispatch_fanin(q_unflagged);  // gate returns, no bump
     EXPECT_EQ(payload.dispatch_fanin.load(), 1);  // never reaches 2 -> not a candidate
@@ -448,6 +461,7 @@ TEST_F(WiringTest, FlaggedPrecompletedCreatorTransparentToEarlyDispatch) {
     wire_fanin(task_slot, 2);
     EXPECT_EQ(payload.dispatch_fanin.load(), 1);  // creator seeded (transparent), not disqualified
 
+    sched.record_published_blocks(compute, compute.logical_block_num);
     sched.propagate_dispatch_fanin(compute);                               // compute dispatches -> bumps to 2
     EXPECT_EQ(payload.dispatch_fanin.load(), payload.fanin_actual_count);  // candidate
 }

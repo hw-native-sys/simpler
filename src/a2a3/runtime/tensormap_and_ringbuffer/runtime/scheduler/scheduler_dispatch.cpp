@@ -328,14 +328,11 @@ void SchedulerContext::dispatch_shape(
         PublishHandle handles[CoreTracker::MAX_CLUSTERS * 3];
         int handle_count = 0;
         bool dispatched_any = false;
-        // Slots dispatched this pop whose dispatch_fanin must be propagated to
-        // consumers. Deferred until AFTER publish (below) so a flagged producer's
-        // fanout walk never sits between claiming cores and publishing its own
-        // blocks — doing it inline delays this thread's blocks while peer threads
-        // co-dispatching the same SPMD task publish immediately, misaligning the
-        // task's block starts. Bounded by cores.count() ≤ MAX_CLUSTERS dispatches.
-        PTO2TaskSlotState *prop_list[CoreTracker::MAX_CLUSTERS];
-        int prop_n = 0;
+        // Logical block ranges published by this pop. AIV can pop two entries per
+        // cluster, so this ledger has the same worst-case bound as handles[].
+        PTO2TaskSlotState *published_list[CoreTracker::MAX_CLUSTERS * 3];
+        int16_t published_counts[CoreTracker::MAX_CLUSTERS * 3];
+        int published_n = 0;
 #if SIMPLER_SCHED_PROFILING
         uint64_t t_setup_start = get_sys_cnt_aicpu();
 #endif
@@ -410,12 +407,6 @@ void SchedulerContext::dispatch_shape(
 
             dispatched_any = true;
             try_pushed = true;
-            // Record for deferred dispatch_fanin propagation after this pop's
-            // blocks are published (see after the loop). propagate's own guard
-            // filters non-flagged slots, so recording unconditionally is cheap.
-            if (prop_n < static_cast<int>(sizeof(prop_list) / sizeof(prop_list[0]))) {
-                prop_list[prop_n++] = slot_state;
-            }
             // Claim a contiguous range of blocks, hand the slot back to the
             // ready queue immediately, then perform the expensive dispatches.
             // This lets other schedulers concurrently claim and dispatch the
@@ -428,6 +419,10 @@ void SchedulerContext::dispatch_shape(
             int32_t available = is_mix ? selected_mix_clusters.count() : cores.count();
             int32_t claim = std::min(available, remaining);
             slot_state->next_block_idx.store(static_cast<int16_t>(start + claim), std::memory_order_relaxed);
+
+            published_list[published_n] = slot_state;
+            published_counts[published_n] = static_cast<int16_t>(claim);
+            published_n++;
 
             if (start + claim < slot_state->logical_block_num) {
                 disp_queues[static_cast<int32_t>(shape)].push(slot_state);
@@ -453,11 +448,9 @@ void SchedulerContext::dispatch_shape(
         }
 
         flush_publish();
-        // Blocks are published; now propagate dispatch_fanin for any flagged
-        // producers dispatched above (knob A: producer is running). Off the
-        // pre-publish path so it cannot delay or misalign their blocks.
-        for (int i = 0; i < prop_n; i++) {
-            sched_->propagate_dispatch_fanin(*prop_list[i]);
+        for (int i = 0; i < published_n; i++) {
+            sched_->record_published_blocks(*published_list[i], published_counts[i]);
+            sched_->propagate_dispatch_fanin(*published_list[i]);
         }
 #if SIMPLER_SCHED_PROFILING
         l2_swimlane.sched_dispatch_setup_cycle += (get_sys_cnt_aicpu() - t_setup_start);
@@ -637,10 +630,16 @@ int32_t SchedulerContext::stage_consumer_blocks(
     for (int w = 0; w < PTO2_EARLY_DISPATCH_CORE_MASK_WORDS; w++)
         if (my_cores[w] != 0) c->payload->staged_core_mask[w].fetch_or(my_cores[w], std::memory_order_seq_cst);
 
+    // Full publication and release are independent events. The seq_cst
+    // count/state rechecks form a two-sided handshake: release propagates if
+    // publication won, and the final stager propagates if release won.
+    sched_->record_published_blocks(*c, staged);
+    bool released = staged > 0 &&
+                    c->payload->early_dispatch_state.load(std::memory_order_seq_cst) == PTO2_EARLY_DISPATCH_DISPATCHED;
+
     // If release already flipped DISPATCHED, it may have read the mask before our
     // bits landed — ring our own cores so none is left gated forever.
-    if (staged > 0 &&
-        c->payload->early_dispatch_state.load(std::memory_order_seq_cst) == PTO2_EARLY_DISPATCH_DISPATCHED) {
+    if (released) {
         for (int w = 0; w < PTO2_EARLY_DISPATCH_CORE_MASK_WORDS; w++) {
             uint64_t bits = my_cores[w];
             while (bits != 0) {
@@ -652,6 +651,7 @@ int32_t SchedulerContext::stage_consumer_blocks(
             }
         }
     }
+    if (released) sched_->propagate_dispatch_fanin(*c);
     return staged;
 }
 

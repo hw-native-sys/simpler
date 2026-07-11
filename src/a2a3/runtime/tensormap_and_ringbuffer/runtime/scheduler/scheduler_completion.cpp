@@ -521,6 +521,7 @@ void SchedulerContext::drain_worker_dispatch(int32_t block_num) {
         for (int i = 0; i < handle_count; i++) {
             publish_subtask_to_core(handles[i], dispatch_ts);
         }
+        sched_->record_published_blocks(*slot_state, claim);
     }
 
     // The drain path IS this sync_start producer's dispatch, so it must bump its
