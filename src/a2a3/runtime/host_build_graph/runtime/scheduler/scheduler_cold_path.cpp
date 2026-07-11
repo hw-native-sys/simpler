@@ -73,9 +73,6 @@ LoopAction SchedulerContext::handle_orchestrator_exit(
         return LoopAction::BREAK_LOOP;
     }
 
-    bool orch_done = orchestrator_done_;
-    if (!orch_done) return LoopAction::NONE;
-
     task_count = total_tasks_;
     if (task_count > 0 && completed_tasks_.load(std::memory_order_relaxed) >= task_count) {
         completed_.store(true, std::memory_order_release);
@@ -85,21 +82,6 @@ LoopAction SchedulerContext::handle_orchestrator_exit(
         );
         return LoopAction::BREAK_LOOP;
     }
-    return LoopAction::NONE;
-}
-
-LoopAction SchedulerContext::handle_core_transition(bool &cores_released) {
-    if (!transition_requested_.load(std::memory_order_acquire)) return LoopAction::NONE;
-    if (!reassigned_.load(std::memory_order_acquire)) {
-        wait_reassign_.fetch_add(1, std::memory_order_release);
-        while (!reassigned_.load(std::memory_order_acquire)) {
-            if (completed_.load(std::memory_order_acquire)) {
-                return LoopAction::BREAK_LOOP;
-            }
-            SPIN_WAIT_HINT();
-        }
-    }
-    cores_released = true;
     return LoopAction::NONE;
 }
 
@@ -320,7 +302,7 @@ void SchedulerContext::log_stall_diagnostics(
 
     // CLUSTER lines: one per cluster this thread owns.
     // cluster_id = local_cluster_idx * active_sched_threads_ + thread_idx, matching the
-    // round-robin assignment in assign_cores_to_threads / reassign_cores_for_all_threads.
+    // round-robin assignment in assign_cores_to_threads.
     int32_t ast = active_sched_threads_ > 0 ? active_sched_threads_ : aicpu_thread_num_;
     for (int32_t cli = 0; cli < tracker.get_cluster_count() && cli < STALL_DUMP_CORE_MAX; cli++) {
         int32_t offset = cli * 3;
@@ -427,8 +409,8 @@ void SchedulerContext::log_l2_swimlane_summary(int32_t thread_idx, int32_t cur_t
         cycles_to_us(sched_end_ts - l2_swimlane.sched_start_ts)
     );
 
-    uint64_t sched_total = l2_swimlane.sched_wiring_cycle + l2_swimlane.sched_complete_cycle +
-                           l2_swimlane.sched_dispatch_cycle + l2_swimlane.sched_idle_cycle;
+    uint64_t sched_total =
+        l2_swimlane.sched_complete_cycle + l2_swimlane.sched_dispatch_cycle + l2_swimlane.sched_idle_cycle;
     if (sched_total == 0) sched_total = 1;
 
 #if SIMPLER_SCHED_PROFILING
@@ -521,19 +503,6 @@ void SchedulerContext::log_l2_swimlane_summary(int32_t thread_idx, int32_t cur_t
             l2_swimlane.sched_dispatch_setup_cycle * 100.0 / d_parent
         );
 
-#if SIMPLER_SCHED_PROFILING
-        LOG_INFO_V9(
-            "Thread %d:   wiring         : %.3fus (%.1f%%)  tasks=%d", thread_idx,
-            cycles_to_us(l2_swimlane.sched_wiring_cycle), l2_swimlane.sched_wiring_cycle * 100.0 / sched_total,
-            l2_swimlane.phase_wiring_count
-        );
-#else
-        LOG_INFO_V9(
-            "Thread %d:   wiring         : %.3fus (%.1f%%)", thread_idx, cycles_to_us(l2_swimlane.sched_wiring_cycle),
-            l2_swimlane.sched_wiring_cycle * 100.0 / sched_total
-        );
-#endif
-
         LOG_INFO_V9(
             "Thread %d:   idle           : %.3fus (%.1f%%)", thread_idx, cycles_to_us(l2_swimlane.sched_idle_cycle),
             l2_swimlane.sched_idle_cycle * 100.0 / sched_total
@@ -590,102 +559,131 @@ int32_t SchedulerContext::shutdown(int32_t thread_idx) {
 }
 
 // =============================================================================
-// Handshake with all AICore workers; discover core type and reg address.
+// Handshake a contiguous slice of AICore workers. Runs on every AICPU thread in
+// parallel (partitioned by tidx/nthreads); the leader's pre_handshake_init has
+// already zeroed state, set cores_total_num_, and reset the counts/flag. The
+// per-core work here — releasing the core, then opening its register window over
+// serial MMIO — is what dominates preamble, so splitting the slice across
+// threads is the whole point. Within a slice we still sweep (poll every
+// outstanding core per pass, service whichever reported) so one slow core's
+// wakeup overlaps its neighbours' instead of blocking them. Worker-id lists are
+// built serially in post_handshake_init (core-index order) once every slice has
+// landed, so the shared aic_count_/aiv_count_ are written by one thread only.
 // =============================================================================
-int32_t SchedulerContext::handshake_all_cores(Runtime *runtime) {
+void SchedulerContext::handshake_partition(Runtime *runtime, int32_t tidx, int32_t nthreads) {
     Handshake *all_handshakes = reinterpret_cast<Handshake *>(runtime->workers);
-    cores_total_num_ = runtime->worker_count;
+    const int32_t total = cores_total_num_;
+    const int32_t lo = static_cast<int32_t>((static_cast<int64_t>(tidx) * total) / nthreads);
+    const int32_t hi = static_cast<int32_t>((static_cast<int64_t>(tidx + 1) * total) / nthreads);
 
-    // Validate cores_total_num_ before using as array index
-    if (cores_total_num_ == 0 || cores_total_num_ > RUNTIME_MAX_WORKER) {
-        LOG_ERROR("Invalid cores_total_num %d (expected 1-%d)", cores_total_num_, RUNTIME_MAX_WORKER);
-        return -1;
-    }
-
-    aic_count_ = 0;
-    aiv_count_ = 0;
-
-    LOG_INFO_V0("Handshaking with %d cores", cores_total_num_);
-
-    // Step 1: Write per-core payload addresses and send handshake signal.
-    // OUT_OF_ORDER_STORE_BARRIER() ensures task is globally visible before
-    // aicpu_ready=1, so AICore reads the correct payload pointer after waking up.
-    for (int32_t i = 0; i < cores_total_num_; i++) {
-        all_handshakes[i].task = reinterpret_cast<uint64_t>(&payload_per_core_[i][0]);
-        OUT_OF_ORDER_STORE_BARRIER();
-        all_handshakes[i].aicpu_ready = 1;
-    }
-    OUT_OF_ORDER_STORE_BARRIER();
+    // The AICore publishes {physical_core_id, core_type, aicore_done} on launch,
+    // gated by nothing. task is not published here: the AICore's aicore_done
+    // report flushes its whole handshake cache line, so a task stored before the
+    // report would be clobbered. task is written per core in the sweep below,
+    // after that core's aicore_done is observed and before its window opens (the
+    // point the AICore reads task).
 
     // Get platform physical cores count for validation
     uint32_t max_physical_cores_count = platform_get_physical_cores_count();
 
-    // Step 2: Wait for all cores to respond, collect core type and register addresses
-    bool handshake_failed = false;
-    for (int32_t i = 0; i < cores_total_num_; i++) {
-        Handshake *hank = &all_handshakes[i];
+    // Step 2: collect responses from this slice. Each core reports
+    // {physical_core_id, core_type, aicore_done} in one write, then waits — by
+    // polling its own DATA_MAIN_BASE SPR — for us to open its register window.
+    // We sweep the slice: poll every outstanding core per pass and service
+    // whichever have reported, rather than blocking on core i before looking at
+    // core i+1, so per-core wakeups overlap (≈ max, not Σ). aicore_done is a GM
+    // read (not the nGnRE MMIO reg window), so sweeping is not forced serial the
+    // way RegId::COND polling is.
+    //
+    // Servicing a core = validate its physical_core_id, then open its register
+    // window (platform_init_aicore_regs: FAST_PATH + DATA_MAIN_BASE=IDLE). That
+    // IDLE write is *also* the signal the core polls for to leave its
+    // post-report wait — so opening the window IS the acknowledgement. There is
+    // no separate aicpu_regs_ready ack and no second round-trip. AIC/AIV
+    // classification is deferred to post_handshake_init (serial) so aic_count_/
+    // aiv_count_ are never incremented from more than one thread.
+    uint64_t *regs = reinterpret_cast<uint64_t *>(regs_);
+    bool core_serviced[RUNTIME_MAX_WORKER] = {false};
 
-        while (hank->aicore_regs_ready == 0) {
-            SPIN_WAIT_HINT();
+    // Every core publishes aicore_done on launch, so the whole slice is already
+    // reported when the AICPU sweeps it. The reported cores are collected first,
+    // then serviced in batched phases (publish tasks, open windows, store
+    // CoreExecStates); each phase issues its stores without interleaving another
+    // phase's, so posted MMIO STRs and write-through GM stores do not serialize.
+    struct ReadyCore {
+        int32_t i;
+        uint32_t pcid;
+        uint64_t reg_addr;
+        CoreType core_type;
+    };
+    ReadyCore ready[RUNTIME_MAX_WORKER];
+    int32_t n_ready = 0;
+
+    // Phase 1: collect every reported core in this slice and prefetch its
+    // CoreExecState line for write, so the Phase 4 struct store hits a warm line.
+    for (int32_t remaining = hi - lo; remaining > 0;) {
+        for (int32_t i = lo; i < hi; i++) {
+            if (core_serviced[i]) continue;
+            Handshake *hank = &all_handshakes[i];
+            if (hank->aicore_done == 0) {
+                SPIN_WAIT_HINT();
+                continue;
+            }
+            uint32_t physical_core_id = hank->physical_core_id;
+            if (physical_core_id >= max_physical_cores_count) {
+                LOG_ERROR(
+                    "Core %d reported invalid physical_core_id=%u (platform max=%u)", i, physical_core_id,
+                    max_physical_cores_count
+                );
+                handshake_failed_.store(true, std::memory_order_release);
+                core_serviced[i] = true;
+                remaining--;
+                continue;
+            }
+            __builtin_prefetch(&core_exec_states_[i], 1, 3);
+            ready[n_ready++] = {i, physical_core_id, regs[physical_core_id], hank->core_type};
+            core_serviced[i] = true;
+            remaining--;
         }
+    }
 
-        uint32_t physical_core_id = hank->physical_core_id;
+    // Phase 2: publish every task pointer, then ONE barrier. The core reads task
+    // only after its window opens (Phase 3); a single barrier orders all task
+    // stores before any window STR. Writing task now (after the report) also
+    // keeps the core's CACHELINE_OUT report flush from clobbering it.
+    for (int32_t r = 0; r < n_ready; r++) {
+        all_handshakes[ready[r].i].task = reinterpret_cast<uint64_t>(&payload_per_core_[ready[r].i][0]);
+    }
+    OUT_OF_ORDER_STORE_BARRIER();
 
-        if (physical_core_id >= max_physical_cores_count) {
-            LOG_ERROR(
-                "Core %d reported invalid physical_core_id=%u (platform max=%u)", i, physical_core_id,
-                max_physical_cores_count
-            );
-            handshake_failed = true;
-            continue;
-        }
+    // Phase 3: open every window. platform_init_aicore_regs' STRs are posted
+    // Device-nGnRE writes, issued back-to-back with no interleaved GM stores.
+    for (int32_t r = 0; r < n_ready; r++) {
+        platform_init_aicore_regs(ready[r].reg_addr);
+    }
 
-        uint64_t *regs = reinterpret_cast<uint64_t *>(regs_);
-        uint64_t reg_addr = regs[physical_core_id];
-
-        // Initialize AICore registers after discovery (first round)
-        platform_init_aicore_regs(reg_addr);
-        OUT_OF_ORDER_STORE_BARRIER();
-        hank->aicpu_regs_ready = 1;
-
-        OUT_OF_ORDER_STORE_BARRIER();
-
-        while (hank->aicore_done == 0) {
-            SPIN_WAIT_HINT();
-        }
-
-        CoreType type = hank->core_type;
-
-        core_exec_states_[i].reg_addr = reg_addr;
-        core_exec_states_[i].cond_ptr = get_reg_ptr(reg_addr, RegId::COND);
-
-#if SIMPLER_DFX
-        // Record physical_core_id for PMU init later (CoreExecState has no room
-        // for this field under SIMPLER_DFX).
-        physical_core_ids_[i] = physical_core_id;
-#endif
+    // Phase 4: publish each CoreExecState with a single (prefetched) struct store.
+    // core_exec_states_ is AICPU-private (the scheduler reads it, never the core),
+    // so it may be written after the windows open.
+    for (int32_t r = 0; r < n_ready; r++) {
+        int32_t i = ready[r].i;
+        CoreExecState st{};
+        st.reg_addr = ready[r].reg_addr;
+        st.cond_ptr = get_reg_ptr(ready[r].reg_addr, RegId::COND);
+        st.running_reg_task_id = AICPU_TASK_INVALID;
+        st.pending_reg_task_id = AICPU_TASK_INVALID;
 #if !SIMPLER_DFX
-        core_exec_states_[i].worker_id = i;
-        core_exec_states_[i].physical_core_id = physical_core_id;
-        core_exec_states_[i].core_type = type;
+        st.worker_id = i;
+        st.physical_core_id = ready[r].pcid;
+        st.core_type = ready[r].core_type;
 #endif
-
-        if (type == CoreType::AIC) {
-            aic_worker_ids_[aic_count_++] = i;
-            LOG_INFO_V0("Core %d: AIC, physical_id=%u, reg_addr=0x%lx", i, physical_core_id, reg_addr);
-        } else {
-            aiv_worker_ids_[aiv_count_++] = i;
-            LOG_INFO_V0("Core %d: AIV, physical_id=%u, reg_addr=0x%lx", i, physical_core_id, reg_addr);
-        }
+        core_exec_states_[i] = st;
+        core_type_compact_[i] = static_cast<uint8_t>(ready[r].core_type);
+#if SIMPLER_DFX
+        physical_core_ids_[i] = ready[r].pcid;
+#endif
     }
-
-    if (handshake_failed) {
-        emergency_shutdown(runtime);
-        return -1;
-    }
-
-    LOG_INFO_V0("Core discovery complete: %d AIC, %d AIV", aic_count_, aiv_count_);
-    return 0;
+    OUT_OF_ORDER_STORE_BARRIER();
 }
 
 // =============================================================================
@@ -711,10 +709,8 @@ bool SchedulerContext::assign_cores_to_threads() {
         active_sched_threads_, aic_count_, aiv_count_
     );
 
-    for (int32_t i = 0; i < RUNTIME_MAX_WORKER; i++) {
-        core_exec_states_[i].running_reg_task_id = AICPU_TASK_INVALID;
-        core_exec_states_[i].pending_reg_task_id = AICPU_TASK_INVALID;
-    }
+    // running_reg_task_id / pending_reg_task_id for every serviced core are reset
+    // in handshake_partition's sweep.
 
     // Count clusters per thread first (round-robin may distribute unevenly)
     int32_t clusters_per_thread[MAX_AICPU_THREADS] = {};
@@ -753,87 +749,18 @@ bool SchedulerContext::assign_cores_to_threads() {
 }
 
 // =============================================================================
-// Reassign all cores across all threads (sched + orchestrator) after orchestration.
-// =============================================================================
-void SchedulerContext::reassign_cores_for_all_threads() {
-    LOG_INFO_V0(
-        "Reassigning cores (cluster-aligned) for %d threads: %d AIC, %d AIV", aicpu_thread_num_, aic_count_, aiv_count_
-    );
-
-    // Collect running worker_ids from all current trackers
-    bool running_cores[RUNTIME_MAX_WORKER] = {};
-    for (int32_t i = 0; i < aicpu_thread_num_; i++) {
-        auto all_running = core_trackers_[i].get_all_running_cores();
-        int32_t bp;
-        while ((bp = all_running.pop_first()) >= 0) {
-            running_cores[core_trackers_[i].get_core_id_by_offset(bp)] = true;
-        }
-    }
-
-    // Count clusters per thread (round-robin across all threads)
-    int32_t cluster_count = aic_count_;
-    int32_t clusters_per_thread[MAX_AICPU_THREADS] = {};
-    for (int32_t ci = 0; ci < cluster_count; ci++) {
-        clusters_per_thread[ci % aicpu_thread_num_]++;
-    }
-
-    // Re-init all trackers and reset core counts
-    for (int32_t i = 0; i < aicpu_thread_num_; i++) {
-        core_trackers_[i].init(clusters_per_thread[i]);
-    }
-
-    // Assign clusters round-robin and restore running state
-    int32_t cluster_idx_per_thread[MAX_AICPU_THREADS] = {};
-    for (int32_t ci = 0; ci < cluster_count; ci++) {
-        int32_t t = ci % aicpu_thread_num_;
-
-        int32_t aic_wid = aic_worker_ids_[ci];
-        int32_t aiv0_wid = aiv_worker_ids_[2 * ci];
-        int32_t aiv1_wid = aiv_worker_ids_[2 * ci + 1];
-
-        int32_t cl_idx = cluster_idx_per_thread[t]++;
-        core_trackers_[t].set_cluster(cl_idx, aic_wid, aiv0_wid, aiv1_wid);
-
-        // init() marks all idle; toggle cores that were running and restore pending_occupied
-        if (running_cores[aic_wid]) {
-            core_trackers_[t].change_core_state(cl_idx * 3);
-            core_trackers_[t].set_pending_occupied(cl_idx * 3);
-        }
-        if (running_cores[aiv0_wid]) {
-            core_trackers_[t].change_core_state(cl_idx * 3 + 1);
-            core_trackers_[t].set_pending_occupied(cl_idx * 3 + 1);
-        }
-        if (running_cores[aiv1_wid]) {
-            core_trackers_[t].change_core_state(cl_idx * 3 + 2);
-            core_trackers_[t].set_pending_occupied(cl_idx * 3 + 2);
-        }
-    }
-
-    // Log final distribution
-    LOG_INFO_V0("Core reassignment complete:");
-    for (int32_t t = 0; t < aicpu_thread_num_; t++) {
-        int32_t aic_running = core_trackers_[t].get_running_count<CoreType::AIC>();
-        int32_t aiv_running = core_trackers_[t].get_running_count<CoreType::AIV>();
-        LOG_INFO_V0(
-            "  Thread %d: %d cores, %d clusters (AIC running=%d, AIV running=%d)", t, core_trackers_[t].core_num(),
-            core_trackers_[t].get_cluster_count(), aic_running, aiv_running
-        );
-    }
-    active_sched_threads_ = aicpu_thread_num_;
-}
-
-// =============================================================================
 // Emergency shutdown: broadcast exit signal to every handshake'd core and
 // deinit their AICore register blocks. Idempotent.
 // =============================================================================
 void SchedulerContext::emergency_shutdown(Runtime *runtime) {
+    (void)runtime;  // exit is now delivered via each core's register block, not GM
     LOG_WARN("Emergency shutdown: sending exit signal to all initialized cores");
-    Handshake *all_handshakes = reinterpret_cast<Handshake *>(runtime->workers);
     int32_t timeout_count = 0;
     for (int32_t i = 0; i < cores_total_num_; i++) {
-        Handshake *hank = &all_handshakes[i];
-        OUT_OF_ORDER_STORE_BARRIER();
-        hank->aicpu_regs_ready = 1;
+        // platform_deinit_aicore_regs writes DATA_MAIN_BASE=EXIT, which both
+        // releases a core still polling for its window to open and signals it to
+        // exit. Cores never opened (reg_addr==0) are reaped by the host device
+        // reset that follows a handshake failure.
         if (core_exec_states_[i].reg_addr != 0) {
             if (platform_deinit_aicore_regs(core_exec_states_[i].reg_addr) != 0) {
                 timeout_count++;
@@ -849,8 +776,8 @@ void SchedulerContext::emergency_shutdown(Runtime *runtime) {
 // =============================================================================
 // Lifecycle: init / deinit
 // =============================================================================
-int32_t SchedulerContext::init(
-    Runtime *runtime, int32_t aicpu_thread_num, int32_t sched_thread_num, bool orch_to_sched, uint64_t regs_base
+int32_t SchedulerContext::pre_handshake_init(
+    Runtime *runtime, int32_t aicpu_thread_num, int32_t sched_thread_num, uint64_t regs_base
 ) {
     always_assert(runtime != nullptr);
 
@@ -860,7 +787,6 @@ int32_t SchedulerContext::init(
     // Wire thread/transition configuration that handshake/assign need to read.
     aicpu_thread_num_ = aicpu_thread_num;
     sched_thread_num_ = sched_thread_num;
-    orch_to_sched_ = orch_to_sched;
     regs_ = regs_base;
 
 #if SIMPLER_DFX
@@ -869,7 +795,9 @@ int32_t SchedulerContext::init(
     // value would still be 0 (only the binary enable bit has been seeded by
     // kernel.cpp at this point). Reset the cached level on disabled runs so a
     // prior enabled launch's level can't leak into the phase-record gates in
-    // scheduler_dispatch.
+    // scheduler_dispatch. This runs on the leader before it publishes
+    // hs_setup_done_, so it happens-before every thread's handshake_partition
+    // (and therefore before any aicpu_ready=1 write).
     if (is_l2_swimlane_enabled()) {
         l2_swimlane_aicpu_init(runtime->worker_count);
         l2_swimlane_level_ = get_l2_swimlane_level();
@@ -881,10 +809,9 @@ int32_t SchedulerContext::init(
             // threads as scheduler threads" (see assign_cores_to_threads'
             // active_sched_threads_). Without it, init_phase would prime zero
             // sched pools and all sched_phase emits would silently drop.
-            const int active_sched = (sched_thread_num_ > 0) ? sched_thread_num_ : aicpu_thread_num_;
-            const int sched_phase_threads = orch_to_sched_ ? aicpu_thread_num_ : active_sched;
+            const int sched_phase_threads = (sched_thread_num_ > 0) ? sched_thread_num_ : aicpu_thread_num_;
             // Orchestration is always single-threaded, so orch-phase is one pool
-            // (ordinal 0) in both modes — see record_orch_phase.
+            // (ordinal 0) — see record_orch_phase.
             const int orch_phase_threads = 1;
             l2_swimlane_aicpu_init_phase(runtime->worker_count, sched_phase_threads, orch_phase_threads);
         }
@@ -893,38 +820,75 @@ int32_t SchedulerContext::init(
     }
 #endif
 
-    // Discover cores and assign to scheduler threads.
-    int32_t rc = handshake_all_cores(runtime);
-    if (rc != 0) {
-        LOG_ERROR("handshake_all_cores failed");
-        return rc;
+    // Core count is needed by every thread to compute its handshake slice.
+    cores_total_num_ = runtime->worker_count;
+    if (cores_total_num_ == 0 || cores_total_num_ > RUNTIME_MAX_WORKER) {
+        LOG_ERROR("Invalid cores_total_num %d (expected 1-%d)", cores_total_num_, RUNTIME_MAX_WORKER);
+        return -1;
     }
+    aic_count_ = 0;
+    aiv_count_ = 0;
+    handshake_failed_.store(false, std::memory_order_release);
+
+    LOG_INFO_V0("Handshaking with %d cores", cores_total_num_);
+    return 0;
+}
+
+int32_t SchedulerContext::post_handshake_init(Runtime *runtime) {
+    if (handshake_failed_.load(std::memory_order_acquire)) {
+        emergency_shutdown(runtime);
+        return -1;
+    }
+
+    // Build the AIC/AIV worker-id lists in core-index order, which
+    // assign_cores_to_threads pairs into clusters. core_type is read from the
+    // contiguously packed core_type_compact_ the sweep filled, not the 64B-aligned
+    // per-core Handshake struct. aic_worker_ids_/aiv_worker_ids_ store through to
+    // HBM, so the lists are built in local (cached) buffers and published with two
+    // wide memcpys rather than element by element.
+    int32_t local_aic[RUNTIME_MAX_WORKER];
+    int32_t local_aiv[RUNTIME_MAX_WORKER];
+    int32_t la = 0, lv = 0;
+    for (int32_t i = 0; i < cores_total_num_; i++) {
+        if (static_cast<CoreType>(core_type_compact_[i]) == CoreType::AIC) {
+            local_aic[la++] = i;
+        } else {
+            local_aiv[lv++] = i;
+        }
+    }
+    memcpy(aic_worker_ids_, local_aic, static_cast<size_t>(la) * sizeof(int32_t));
+    memcpy(aiv_worker_ids_, local_aiv, static_cast<size_t>(lv) * sizeof(int32_t));
+    aic_count_ = la;
+    aiv_count_ = lv;
+    LOG_INFO_V0("Core discovery complete: %d AIC, %d AIV", aic_count_, aiv_count_);
+
     if (!assign_cores_to_threads()) {
         return -1;
     }
 
-    // Profiling-subsystem buffer/state init: single-threaded cold path, so the
-    // "do it once" guarantee is structural (no CAS needed). Runs after
-    // handshake_all_cores / assign_cores_to_threads because pmu_aicpu_init needs
+    // Profiling-subsystem buffer/state init: single-threaded cold path (leader
+    // only), so the "do it once" guarantee is structural (no CAS needed). Runs
+    // after the handshake / assign_cores_to_threads because pmu_aicpu_init needs
     // physical_core_ids_ / cores_total_num_. Mirrors the l2_swimlane_aicpu_init
     // convention above; the per-thread *_set_orch_thread_idx setters stay on the
     // orchestrator thread (see aicpu_executor.cpp).
 #if SIMPLER_DFX
     if (is_dump_args_enabled()) {
-        dump_args_init(orch_to_sched_ ? aicpu_thread_num_ : active_sched_threads_);
+        dump_args_init(active_sched_threads_);
     }
     if (is_pmu_enabled()) {
         pmu_aicpu_init(physical_core_ids_, cores_total_num_);
         LOG_INFO_V0("PMU profiling started on %d cores", cores_total_num_);
     }
-#endif
-    // dep_gen is host-driven (SubmitTrace) and gated independently of
-    // SIMPLER_DFX. init() only pops the initial buffer from instance 0's
-    // free_queue; the orchestrator thread still records its idx via
+    // dep_gen is host-driven (SubmitTrace) — runtime-gated by the host flag —
+    // and compiles out with the other profiling subsystems at SIMPLER_DFX=0.
+    // init() only pops the initial buffer from instance 0's free_queue; the
+    // orchestrator thread still records its idx via
     // dep_gen_aicpu_set_orch_thread_idx() before the first record_submit.
     if (is_dep_gen_enabled()) {
         dep_gen_aicpu_init();
     }
+#endif
 
     // Initialize task counters. Task count comes from PTO2 shared memory.
     if (runtime->get_gm_sm_ptr()) {
@@ -947,12 +911,12 @@ int32_t SchedulerContext::init(
     }
     completed_tasks_.store(0, std::memory_order_release);
 
-    // Device orchestration: the orchestrator thread flips this when the graph is built.
-    orchestrator_done_ = false;
-
-    // Clear per-core dispatch payloads
-    memset(payload_per_core_, 0, sizeof(payload_per_core_));
-    memset(deferred_slab_per_core_, 0, sizeof(deferred_slab_per_core_));
+    // prepare_subtask_to_core fully writes a per-core payload / deferred-slab slot
+    // before the AICore is told to read it: build_payload sets
+    // function_bin_addr/args/local_context/not_ready, and deferred_slab->count/
+    // error_code are reset inline on every dispatch. An AICore reads a slot only
+    // after a dispatch targets it (DATA_MAIN_BASE), so a prior round's bytes in an
+    // untouched slot are never observed.
 
     // Initialize per-core GlobalContext (sub_block_id) based on cluster position.
     // This is done once at startup and never modified afterwards.
@@ -982,9 +946,16 @@ void SchedulerContext::deinit() {
         core_exec_states_[i].pending_reg_task_id = AICPU_TASK_INVALID;
     }
 
-    // Clear per-core dispatch payloads
-    memset(payload_per_core_, 0, sizeof(payload_per_core_));
-    memset(deferred_slab_per_core_, 0, sizeof(deferred_slab_per_core_));
+    // No per-core memset of payload_per_core_ / deferred_slab_per_core_ here
+    // (~300 KB across all cores). Both are fully re-initialized at dispatch
+    // before they can be read: dispatch_task sets deferred_slab->count = 0 /
+    // error_code = NONE and build_payload() overwrites every payload field
+    // (function addr, args[], contexts, not_ready) on the exact [core][buf_idx]
+    // about to run. The consumer side cannot reach a stale slot either: the
+    // drain only services a core's running_reg_task_id, and the loop above
+    // already reset every core_exec_states_[].running/pending_reg_task_id to
+    // AICPU_TASK_INVALID — so no FIN for an undispatched slot is processed, and
+    // the count-gated consumer never reads entries[] past the fresh count.
 
     // Reset sync-start drain coordination — a previous run that aborted mid-drain
     // would otherwise leave dirty pending/elected/ack state for the next reuse.
@@ -996,12 +967,6 @@ void SchedulerContext::deinit() {
     // Reset task counters and orchestrator state
     completed_tasks_.store(0, std::memory_order_release);
     total_tasks_ = 0;
-    orchestrator_done_ = false;
-
-    // Reset core transition state
-    transition_requested_.store(false, std::memory_order_release);
-    wait_reassign_.store(0, std::memory_order_release);
-    reassigned_.store(false, std::memory_order_release);
     completed_.store(false, std::memory_order_release);
 
     // Reset core discovery and assignment state
@@ -1010,7 +975,6 @@ void SchedulerContext::deinit() {
     cores_total_num_ = 0;
     aicpu_thread_num_ = 0;
     sched_thread_num_ = 0;
-    orch_to_sched_ = false;
     active_sched_threads_ = 0;
     for (int32_t t = 0; t < MAX_AICPU_THREADS; t++) {
         core_trackers_[t] = CoreTracker{};
@@ -1028,12 +992,15 @@ void SchedulerContext::bind_runtime(PTO2Runtime *rt) {
 }
 
 // =============================================================================
-// Post-orchestration bookkeeping. Runs on the orchestrator thread once the
-// build phase finishes; folds inline-completed tasks, flips orchestrator_done_,
-// and drives the orchestrator → scheduler core transition (or fatal shutdown).
+// Post-orchestration bookkeeping. Runs once on the boot leader after the
+// host-built image is attached; latches total_tasks_ and folds inline-completed
+// tasks (or shuts down on a fatal orchestration error). The caller publishes
+// runtime_init_ready_ (release) after this returns — that store is what makes
+// total_tasks_ visible to the scheduler threads, which acquire it before
+// dispatching.
 // =============================================================================
 void SchedulerContext::on_orchestration_done(
-    Runtime *runtime, PTO2Runtime *rt, int32_t thread_idx, int32_t total_tasks
+    Runtime *runtime, PTO2Runtime *rt, [[maybe_unused]] int32_t thread_idx, int32_t total_tasks
 ) {
 #if SIMPLER_DFX
     if (l2_swimlane_level_ >= L2SwimlaneLevel::ORCH_PHASES) {
@@ -1054,7 +1021,6 @@ void SchedulerContext::on_orchestration_done(
         rt->scheduler.tasks_completed.fetch_add(inline_completed, std::memory_order_relaxed);
 #endif
     }
-    orchestrator_done_ = true;
 
     // Check for fatal error from orchestration; if so, shut down immediately.
     int32_t orch_err = 0;
@@ -1067,32 +1033,9 @@ void SchedulerContext::on_orchestration_done(
         }
     }
 
-    // Skip core transition on fatal error — cores already shut down above.
-    if (completed_.load(std::memory_order_acquire)) {
-        // Signal transition to unblock scheduler threads waiting at core transition
-        transition_requested_.store(true, std::memory_order_release);
-        reassigned_.store(true, std::memory_order_release);
-    } else if (orch_to_sched_) {
-        LOG_INFO_V0("Thread %d: Set orchestrator_done=true, requesting core transition", thread_idx);
-        transition_requested_.store(true, std::memory_order_release);
-
-        // Wait for scheduler threads to acknowledge transition request
-        while (wait_reassign_.load(std::memory_order_acquire) != sched_thread_num_) {
-            if (completed_.load(std::memory_order_acquire)) {
-                break;
-            }
-            SPIN_WAIT_HINT();
-        }
-        if (!completed_.load(std::memory_order_acquire)) {
-            reassign_cores_for_all_threads();
-            reassigned_.store(true, std::memory_order_release);
-        }
-    }
-
 #if SIMPLER_DFX
-    // Write core-to-thread mapping AFTER reassignment so the profiling data
-    // reflects the final distribution (all active_sched_threads_, including
-    // former orchestrator threads when orch_to_sched_ is enabled).
+    // Write the core-to-thread mapping so the profiling data reflects the
+    // scheduler threads' final core distribution.
     if (l2_swimlane_level_ >= L2SwimlaneLevel::SCHED_PHASES) {
         l2_swimlane_aicpu_init_core_assignments(cores_total_num_);
         for (int32_t t = 0; t < active_sched_threads_; t++) {

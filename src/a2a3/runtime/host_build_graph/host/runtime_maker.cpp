@@ -281,7 +281,7 @@ namespace {
 // host_build_graph is host-orchestration-first: the HOST dlopens the
 // orchestration .so and runs it to completion. The shared memory + arena carry
 // host-DDR cross-task pointers (slot_state.task/payload,
-// payload.fanin_inline_slot_states[], wiring queue); the host relocates them to
+// payload.fanin_inline_slot_states[], dep_pool/ready queues); the host relocates them to
 // their final device addresses (relocate_host_orch_image, below) BEFORE the H2D
 // copy, so the device receives a fully device-addressed image and schedules
 // only — no on-device pointer fixup.
@@ -355,13 +355,11 @@ struct HostOrchEntryPoints {
 // Relocated pointers span TWO regions with DIFFERENT deltas: the SM block
 // (slot_state.task/.payload, fanin_inline_slot_states[], dep-entry.slot_state,
 // ready-queue slot.slot_state) and the arena block (slot_state.fanout_head,
-// dep-entry.next, wiring-queue entries point into the SM but live in the arena).
+// dep-entry.next point into the SM but live in the arena).
 // Rather than track which delta each field needs, reloc() classifies every
 // pointer by the region it points INTO and applies that region's delta; foreign
-// and null pointers pass through untouched. This makes the same walk correct
-// whether wiring is still drained on the device (dep_pool/ready empty here, only
-// the wiring queue populated) or folded into the host submit (dep_pool/ready
-// populated, wiring queue empty).
+// and null pointers pass through untouched. The fanout adjacency is wired inline
+// during host submit, so dep_pool/ready are already populated here.
 //
 // The orchestrator's own task-allocator pointers are intentionally NOT relocated
 // (the device runs scheduler-only and never dereferences them, and must not call
@@ -446,10 +444,10 @@ static bool relocate_host_orch_image(
         }
     }
 
-    // Per-ring fanout adjacency (dep_pool entries) built by wire_task on the
-    // host. Each live entry [tail, top) carries a consumer slot_state pointer
-    // (into the SM) and a next pointer (into the arena). Empty when wiring is
-    // still drained on the device.
+    // Per-ring fanout adjacency (dep_pool entries) built inline during host
+    // submit (orch_wire_fanin_task). Each live entry [tail, top) carries a
+    // consumer slot_state pointer (into the SM) and a next pointer (into the
+    // arena).
     for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
         PTO2DepListPool &dp = rt->scheduler.ring_sched_state.dep_pool;
         if (dp.base == nullptr || dp.capacity == 0) {
@@ -476,18 +474,11 @@ static bool relocate_host_orch_image(
     };
     for (int i = 0; i < PTO2_NUM_RESOURCE_SHAPES; i++) {
         reloc_ready(rt->scheduler.ready_queues[i]);
+        reloc_ready(rt->scheduler.ready_sync_queues[i]);
     }
     reloc_ready(rt->scheduler.dummy_ready_queue);
-    reloc_ready(rt->scheduler.early_dispatch_queue);
-
-    // Wiring queue (in the arena) — populated only while wiring is still drained
-    // on the device; its entries are slot_state pointers into the SM. Empty once
-    // wiring is folded into the host submit.
-    PTO2SpscQueue &wq = rt->scheduler.wiring.queue;
-    uint64_t head = wq.head_.load(std::memory_order_relaxed);
-    uint64_t tail = wq.tail_.load(std::memory_order_relaxed);
-    for (uint64_t pos = tail; pos < head; pos++) {
-        reloc(wq.buffer_[pos & wq.mask_]);
+    for (int i = 0; i < PTO2_NUM_RESOURCE_SHAPES; i++) {
+        reloc_ready(rt->scheduler.early_dispatch_queues[i]);
     }
     return ok;
 }

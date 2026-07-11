@@ -57,7 +57,7 @@ SlotTransition SchedulerContext::decide_slot_transition(
                 t.running_done = true;
                 t.running_freed = true;
             } else if (pending_gated) {
-                // Case 3.3: running FIN, pending is a SPECULATIVE GATED task. The
+                // Case 3.3: running FIN, pending is a EARLY-DISPATCH GATED task. The
                 // Case 3.1 "wait for the pending's ack" shortcut assumes the AICore
                 // immediately runs the pending task; a gated task instead spins on
                 // its doorbell and never acks until its producer completes — and
@@ -85,7 +85,7 @@ SlotTransition SchedulerContext::decide_slot_transition(
 void SchedulerContext::complete_slot_task(
     PTO2TaskSlotState &slot_state, int32_t expected_reg_task_id, [[maybe_unused]] PTO2SubtaskSlot subslot,
     int32_t thread_idx, int32_t core_id, Handshake *hank, int32_t &completed_this_turn,
-    PTO2TaskSlotState *deferred_release_slot_states[], int32_t &deferred_release_count, PTO2LocalReadyBuffer *local_bufs
+    PTO2TaskSlotState *deferred_release_slot_states[], int32_t &deferred_release_count
 #if SIMPLER_DFX
     ,
     uint64_t dispatch_ts, uint64_t finish_ts
@@ -101,7 +101,7 @@ void SchedulerContext::complete_slot_task(
     // non-deferred tasks complete inline on this thread (matching pre-MPSC
     // behavior — keeps the common case parallelized across scheduler threads
     // instead of serializing through the single consumer). The
-    // any_subtask_deferred flag on slot_state is the discriminator; it's set
+    // deferred-completion flag on slot_state is the discriminator; it's set
     // (release) before on_subtask_complete and read (acquire) after, so the
     // last subtask sees flag writes from any earlier subtask of the same task.
     AICoreCompletionMailbox *mailbox = rt_ != nullptr ? rt_->aicore_mailbox : nullptr;
@@ -134,7 +134,7 @@ void SchedulerContext::complete_slot_task(
             // acq_rel fetch_add inside on_subtask_complete makes the flag
             // visible to whichever subtask sees task_complete=true (which may
             // be this thread or a later one).
-            slot_state.any_subtask_deferred.store(true, std::memory_order_release);
+            slot_state.mark_any_subtask_deferred();
 
             const PTO2TaskId token = slot_state.task->task_id;
             for (uint32_t i = 0; i < cond_count; ++i) {
@@ -157,8 +157,7 @@ void SchedulerContext::complete_slot_task(
     }
 #endif
 
-    if (task_complete && slot_state.payload != nullptr &&
-        slot_state.any_subtask_deferred.load(std::memory_order_acquire)) {
+    if (task_complete && slot_state.payload != nullptr && slot_state.has_any_subtask_deferred()) {
         // Some subtask of this task registered conditions; finish the
         // registration by handing the slot_state off to the consumer.
         while (!mailbox->try_push_normal_done(slot_state.task->task_id, reinterpret_cast<uint64_t>(&slot_state))) {
@@ -184,7 +183,7 @@ void SchedulerContext::complete_slot_task(
 #endif
 #if SIMPLER_DFX
         // Time Resolve (walk the consumer list, decrement each consumer's
-        // fanin, push the newly-ready ones, ring doorbells for speculative
+        // fanin, push the newly-ready ones, ring doorbells for early-dispatch
         // hits) so it renders as a child bar nested inside this iteration's
         // Complete bar. The 1 µs floor below filters out the ~88% of tasks
         // with 1-2 consumers (~500 ns Resolve) so only the long broadcast /
@@ -200,9 +199,9 @@ void SchedulerContext::complete_slot_task(
         // counter side-effects (g_sched_*_atomic_count[thread_idx], consumed
         // by the otc_* log lines). It returns CompletionStats whose
         // `fanout_edges` is the consumer-walk count.
-        consumers_resolved = sched_->on_task_complete(slot_state, thread_idx, local_bufs).fanout_edges;
+        consumers_resolved = sched_->on_task_complete(slot_state, thread_idx).fanout_edges;
 #else
-        consumers_resolved = sched_->on_task_complete(slot_state, local_bufs);
+        consumers_resolved = sched_->on_task_complete(slot_state);
 #endif
 #if SIMPLER_DFX
         if (resolve_t0 != 0) {
@@ -294,8 +293,7 @@ void SchedulerContext::clear_running_slot(CoreExecState &core) {
 
 void SchedulerContext::check_running_cores_for_completion(
     int32_t thread_idx, Handshake *hank, int32_t &completed_this_turn, int32_t &cur_thread_completed,
-    bool &made_progress, PTO2TaskSlotState *deferred_release_slot_states[], int32_t &deferred_release_count,
-    PTO2LocalReadyBuffer *local_bufs
+    bool &made_progress, PTO2TaskSlotState *deferred_release_slot_states[], int32_t &deferred_release_count
 ) {
 #if SIMPLER_SCHED_PROFILING
     auto &l2_swimlane = sched_l2_swimlane_[thread_idx];
@@ -307,17 +305,17 @@ void SchedulerContext::check_running_cores_for_completion(
         int32_t core_id = tracker.get_core_id_by_offset(bit_pos);
         CoreExecState &core = core_exec_states_[core_id];
 
-        // Skip gated speculative cores. A STAGED task is parked on this core
+        // Skip gated early-dispatch cores. A STAGED task is parked on this core
         // waiting for its doorbell — it physically cannot ACK/FIN yet, so
         // reading its COND (MMIO, and the core is hot-spinning on its own SPR)
         // every poll is pure waste that drags out the completion phase. The
-        // doorbell (try_speculative_release) flips spec_state to DISPATCHED, at
+        // doorbell (try_early_dispatch_release) flips early_dispatch_state to DISPATCHED, at
         // which point the core becomes pollable again and its FIN is caught.
         // Cheap cacheable load; no MMIO. Pending slot is empty while gated.
         {
             PTO2TaskSlotState *rs = core.running_slot_state;
             if (rs != nullptr && rs->payload != nullptr &&
-                rs->payload->spec_state.load(std::memory_order_relaxed) == PTO2_SPEC_STAGING) {
+                rs->payload->early_dispatch_state.load(std::memory_order_relaxed) == PTO2_EARLY_DISPATCH_STAGING) {
                 continue;
             }
         }
@@ -340,13 +338,14 @@ void SchedulerContext::check_running_cores_for_completion(
         }
 #endif
 
-        // A pending task is "gated" when it is a speculative pre-stage still
+        // A pending task is "gated" when it is a early-dispatch pre-stage still
         // waiting on its doorbell (STAGED): it will not ack on the producer's FIN,
         // so the Case 3.1 wait-for-pending-ack shortcut would deadlock. Detect it
         // so decide_slot_transition completes the running FIN and promotes it.
         bool pending_gated =
             (core.pending_slot_state != nullptr && core.pending_slot_state->payload != nullptr &&
-             core.pending_slot_state->payload->spec_state.load(std::memory_order_relaxed) == PTO2_SPEC_STAGING);
+             core.pending_slot_state->payload->early_dispatch_state.load(std::memory_order_relaxed) ==
+                 PTO2_EARLY_DISPATCH_STAGING);
         SlotTransition t = decide_slot_transition(
             reg_task_id, reg_state, core.running_reg_task_id, core.pending_reg_task_id, pending_gated
         );
@@ -377,7 +376,7 @@ void SchedulerContext::check_running_cores_for_completion(
         if (t.pending_done) {
             complete_slot_task(
                 *core.pending_slot_state, core.pending_reg_task_id, core.pending_subslot, thread_idx, core_id, hank,
-                completed_this_turn, deferred_release_slot_states, deferred_release_count, local_bufs
+                completed_this_turn, deferred_release_slot_states, deferred_release_count
 #if SIMPLER_DFX
                 ,
                 core.pending_dispatch_timestamp, finish_ts
@@ -388,7 +387,7 @@ void SchedulerContext::check_running_cores_for_completion(
         if (t.running_done) {
             complete_slot_task(
                 *core.running_slot_state, core.running_reg_task_id, core.running_subslot, thread_idx, core_id, hank,
-                completed_this_turn, deferred_release_slot_states, deferred_release_count, local_bufs
+                completed_this_turn, deferred_release_slot_states, deferred_release_count
 #if SIMPLER_DFX
                 ,
                 core.running_dispatch_timestamp, finish_ts
@@ -513,6 +512,14 @@ void SchedulerContext::drain_worker_dispatch(int32_t block_num) {
             publish_subtask_to_core(handles[i], dispatch_ts);
         }
     }
+
+    // The drain path IS this sync_start producer's dispatch, so it must bump its
+    // consumers' dispatch_fanin like the normal dispatch path
+    // (scheduler_dispatch.cpp, post-publish) -- otherwise a consumer whose only
+    // flagged producer is a sync_start (drain-dispatched) task never becomes an
+    // early-dispatch candidate. Idempotent via propagate's dispatch_propagated
+    // once-guard; the internal gate no-ops for an unflagged producer.
+    sched_->propagate_dispatch_fanin(*slot_state);
 
     // All blocks dispatched -- clear drain state.
     // Release fence ensures tracker mutations are visible to threads that

@@ -74,13 +74,11 @@ constexpr int32_t FATAL_ERROR_CHECK_INTERVAL = 1024;  // Check orchestrator erro
 // kills the slower-but-correct poller mid-poll — see the distributed
 // startup-skew scenario in issue #897.
 //
-// The budget is platform-defined (PLATFORM_SCHEDULER_TIMEOUT_MS in spin_hint.h)
-// because the safe value differs per variant: onboard trims it to 2 s so the
-// AICPU detects a hang and flushes its diagnostics (tensor dump, in-flight
-// partial output) before STARS reaps the op and poisons the context (chain:
-// this < op-exec < host stream-sync, platform_config.h); sim has no STARS to
-// race and keeps the full 5 s #897 headroom. See spin_hint.h for the per-variant
-// rationale.
+// The budget is platform-defined (PLATFORM_SCHEDULER_TIMEOUT_MS in spin_hint.h).
+// Onboard keeps it below the STARS op-execute and host stream-sync budgets so
+// the AICPU can flush diagnostics before the host-visible timeout chain fires.
+// Sim has no STARS or ACL stream-sync timeout, but uses the same no-progress
+// watchdog shape. See spin_hint.h for the per-variant rationale.
 constexpr int32_t SCHEDULER_TIMEOUT_MS = PLATFORM_SCHEDULER_TIMEOUT_MS;
 constexpr uint64_t SCHEDULER_TIMEOUT_CYCLES =
     static_cast<uint64_t>(SCHEDULER_TIMEOUT_MS) * (PLATFORM_PROF_SYS_CNT_FREQ / 1000);
@@ -221,6 +219,25 @@ public:
 
     bool has_any_running_cores() const { return ((~core_states_) & (aic_mask_ | aiv_mask_)).has_value(); }
 
+    // True if any core on this thread still has a free slot to stage onto — an
+    // idle core (running slot) or a running core with a free pending slot. A
+    // core is unavailable only when running AND its pending slot is occupied;
+    // idle cores keep pending_occupied_ clear by invariant, so
+    // ~pending_occupied_ over all cores is exactly "has a free slot". Purely
+    // local (no shared/atomic access) — used to skip early dispatch, and its
+    // shared-queue pop, when this thread has no capacity at all.
+    // BitStates of every core on this thread with a free slot to stage onto: a
+    // core is unavailable only when running AND its pending slot is occupied.
+    // Idle cores keep pending_occupied_ clear by invariant, so ~pending_occupied_
+    // over aic|aiv is exactly "has a free slot". Spans AIC+AIV, so its .count() is
+    // an upper bound on the early-dispatch drain's per-shape pop (never exceeds the
+    // thread's total free cores), and .has_value() is the has_any_free_slot()
+    // predicate that gates the Phase-4b early-dispatch pass. Purely local (no
+    // shared/atomic access).
+    BitStates get_free_slot_states() const { return (~pending_occupied_) & (aic_mask_ | aiv_mask_); }
+
+    bool has_any_free_slot() const { return get_free_slot_states().has_value(); }
+
     template <CoreType CT>
     int32_t get_running_count() const {
         if constexpr (CT == CoreType::AIC) {
@@ -318,9 +335,14 @@ public:
     // Runtime MIX dispatch uses classify_mix_cluster() so the decision follows the task's active_mask.
     enum class MixPlacement : uint8_t { RUNNING, PENDING, REJECT };
 
-    // A MIX block must place all cores named by active_mask the same way:
-    // all idle means running placement, all running means pending placement,
-    // and any mixed state is retried later.
+    // Placement for the cores named by active_mask, ignoring cores this task does
+    // not use. All used cores idle -> RUNNING placement (each to its running slot).
+    // Otherwise -> PENDING placement: at dispatch each used core is filled per its
+    // own state -- an idle core takes its running slot (and is marked running, so
+    // the completion poller, which scans only running cores, tracks its FIN), an
+    // already-running core takes its pending slot and executes after its in-flight
+    // task. REJECT only when a used core's pending slot is already occupied (no free
+    // slot) or the mask is empty.
     MixPlacement classify_mix_cluster(int32_t cluster_offset, uint8_t core_mask) const {
         BitStates used(0ULL);
         if (core_mask & PTO2_SUBTASK_MASK_AIC) {
@@ -340,10 +362,7 @@ public:
         if (idle.count() == used.count()) {
             return MixPlacement::RUNNING;
         }
-        if (!idle.has_value()) {
-            return MixPlacement::PENDING;
-        }
-        return MixPlacement::REJECT;
+        return MixPlacement::PENDING;
     }
 
     BitStates get_mix_running_cluster_offset_states(uint8_t core_mask) const {
@@ -432,7 +451,6 @@ struct alignas(64) SchedL2SwimlaneCounters {
     uint64_t sched_start_ts{0};
     uint64_t sched_complete_cycle{0};
     uint64_t sched_dispatch_cycle{0};
-    uint64_t sched_wiring_cycle{0};
     uint64_t sched_idle_cycle{0};
     uint64_t sched_loop_count{0};
     uint32_t phase_complete_count{0};
@@ -450,7 +468,6 @@ struct alignas(64) SchedL2SwimlaneCounters {
     uint64_t pop_hit_at_last_emit{0};
     uint64_t pop_miss_at_last_emit{0};
 #if SIMPLER_SCHED_PROFILING
-    uint32_t phase_wiring_count{0};
     uint64_t complete_probe_count{0};
     uint64_t complete_hit_count{0};
     uint64_t sched_complete_perf_cycle{0};

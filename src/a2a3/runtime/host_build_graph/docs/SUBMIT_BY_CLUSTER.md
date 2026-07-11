@@ -165,7 +165,7 @@ This project-defined flattened numbering is kept unchanged.
 1. Validate submit arguments.
 2. Allocate mixed-task ID and initialize descriptor/payload/slot_state once.
 3. Lookup producers via TensorMap; collect fanin metadata and increment producers' `fanout_count`.
-4. Wire fanout edges and determine readiness. Under host_build_graph (host-orch) this is done **inline in submit** via `wire_task`; the inherited tensormap (device-orch) path instead pushes the task to the scheduler's wiring queue, which scheduler thread 0 drains asynchronously.
+4. Wire fanout edges and determine readiness **inline in submit**: link each live producer's `fanout_head` via `dep_pool` entries and seed readiness directly — `push_ready_routed` for zero-fanin tasks, `route_ready_once` once a producer's fanin resolves. No device-side wiring queue is involved.
 5. Dispatch all active lanes atomically when resources allow.
 6. Aggregate completion and release downstream once.
 

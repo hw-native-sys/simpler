@@ -46,19 +46,20 @@ four layers of execution:
 >
 > - **host_build_graph (this runtime):** the **host** dlopens the orchestration
 >   `.so` and runs it to completion, populating shared memory + the prebuilt
->   arena. Because the orchestrator runs to completion before any scheduler
->   exists, it **wires the fanout adjacency inline during submit** (lock
->   producers, allocate `dep_pool` entries, seed the ready queue) instead of
->   deferring it to a device-side wiring queue. The host then relocates every
->   cross-task pointer to its final device address (`relocate_host_orch_image`)
->   **before** the H2D copy — pointers into the SM and pointers into the arena
->   shift by independent deltas — and ships the image. The device boots
->   **scheduler-only**: no on-device orchestrator thread, no on-device pointer
->   fixup, no wiring drain (the ready queue is already seeded); it attaches the
->   already-device-addressed SM/arena and dispatches.
+>   arena. It **wires the fanin/fanout adjacency inline during submit** —
+>   allocates `dep_pool` entries under each live producer's `fanout_lock`, links
+>   the consumer onto the producer's `fanout_head`, and seeds readiness directly
+>   into the ready queue (`push_ready_routed` for zero-fanin tasks,
+>   `route_ready_once` once a producer's fanin resolves). The host then
+>   relocates every cross-task pointer to its final device address
+>   (`relocate_host_orch_image`) **before** the H2D copy — pointers into the SM
+>   and pointers into the arena shift by independent deltas — and ships the
+>   image. The device boots **scheduler-only**: no on-device orchestrator thread
+>   and no on-device pointer fixup; it attaches the already-device-addressed
+>   SM/arena, whose ready queue is already seeded, and dispatches.
 > - **tensormap_and_ringbuffer:** the orchestrator runs **on-device** on AICPU
->   thread N-1, concurrently with the scheduler threads, and defers fanout
->   wiring to the scheduler's global wiring queue (drained by thread 0).
+>   thread N-1, concurrently with the scheduler threads, wiring the same
+>   fanin/fanout adjacency inline during submit.
 >
 > Where a section below says "the orchestrator runs on AICPU Thread 3" or
 > "Thread 3 dlopens the SO", read that as the **tensormap (device-orch)
@@ -372,8 +373,8 @@ When `PTO2OrchestratorState::submit_task` processes parameters:
 | `kernel_id[3]` | Per-slot kernel IDs: `[AIC, AIV0, AIV1]`; `INVALID_KERNEL_ID` = inactive |
 | `active_mask` | Bitmask of active subtask slots: `bit0=AIC`, `bit1=AIV0`, `bit2=AIV1` |
 | `completed_subtasks` | Atomic counter; each subtask increments on completion. Trigger condition: `completed_subtasks == total_required_subtasks` |
-| `fanin_count` | Number of producer dependencies (set by scheduler during wiring) |
-| `fanout_lock` | Per-task spinlock for concurrent fanout modification (used by scheduler wiring + completion) |
+| `fanin_count` | Number of producer dependencies (set inline during submit wiring) |
+| `fanout_lock` | Per-task spinlock for fanout modification (used by submit-time wiring + scheduler completion) |
 | `fanout_head` | Head of fanout consumer list (pointer, protected by `fanout_lock`) |
 | `fanout_count` | 1 (scope ref) + number of consumers |
 | `packed_buffer_base` | Start of packed buffer in GM Heap |
@@ -436,46 +437,55 @@ Key members:
 | 3 | **Lookup**: for each INPUT/INOUT param, search TensorMap for producers; collect producer pointers in `PTO2FaninBuilder` |
 | 4 | **Insert**: register OUTPUT/INOUT args in TensorMap |
 | 5 | **Record fanin metadata**: store producer pointers in `payload->fanin_inline_slot_states[]` (+ spill pool if >64); increment each producer's `fanout_count` (no lock needed — single writer). This step runs **before** `payload.init()`. |
-| 6 | **Wire fanout inline** (`PTO2SchedulerState::wire_task`): lock each producer, allocate `dep_pool` entries, prepend the consumer to each producer's `fanout_head`, and seed the ready queue when all deps are already satisfied. |
+| 6 | **Wire fanout inline**: for a task with live producers, lock each producer, allocate `dep_pool` entries, prepend the consumer to each producer's `fanout_head`, then seed readiness — `push_ready_routed` for zero-fanin tasks, `route_ready_once` once the fanin refcount is already satisfied. |
 
-> **Note**: Under host_build_graph the orchestrator runs to completion on the
-> host before any scheduler exists, so fanout wiring is done **inline in
-> submit** (Step 6) rather than deferred to a device-side wiring queue. The
-> `dep_pool` is sized for the whole graph — there is no reclaim during host
-> orchestration, exactly like the task window and GM heap — so an exhausted
-> pool latches `PTO2_ERROR_DEP_POOL_OVERFLOW` and aborts the run. The
-> `fanout_head` / dep-entry / ready-queue pointers this produces are host-DDR
-> addresses; `relocate_host_orch_image` shifts them to device addresses before
-> H2D (SM pointers and arena pointers by independent deltas).
->
-> The inherited tensormap (device-orch) variant instead defers this to the
-> scheduler's global `wiring_queue` (SPSC, drained by thread 0) to keep the
-> on-device orchestrator's submit path off `fanout_lock` / `dep_pool`. That
-> path is described below for the shared mechanics; host_build_graph performs
-> the same steps synchronously in Step 6.
+> **Note**: The orchestrator wires fanout **inline in submit** (Step 6) —
+> there is no device-side wiring queue. The `dep_pool` is sized for the whole
+> graph — there is no reclaim during host orchestration, exactly like the task
+> window and GM heap — so an exhausted pool latches
+> `PTO2_ERROR_DEP_POOL_OVERFLOW` and aborts the run. The `fanout_head` /
+> dep-entry / ready-queue pointers this produces are host-DDR addresses;
+> `relocate_host_orch_image` shifts them to device addresses before H2D (SM
+> pointers and arena pointers by independent deltas).
 
-### 7.3 Fanout Wiring (`wire_task`)
+### 7.3 Fanout Wiring
 
-Whether wired inline on the host (host_build_graph) or drained from the
-device-side wiring queue (tensormap), each task is wired by the same
-`wire_task` logic:
+The orchestrator wires each task's fanin/fanout adjacency inline during submit
+(Step 6). Three cases, by the state of the claimed producers:
 
-1. Sets `fanin_count = N + 1` (+1 redundance to prevent premature readiness)
-2. For each producer in `payload->fanin_slot_states[]`:
-   - **Acquires** the producer's `fanout_lock`
-   - Checks `task_state >= COMPLETED` (early-finished optimization)
-   - If not completed: prepends consumer to producer's `fanout_head` via `dep_pool.prepend`
-   - **Releases** `fanout_lock`
-3. Atomically releases the +1 redundance + early_finished count via `fanin_refcount.fetch_add`
-4. If all deps satisfied: pushes task to ready queue
+1. **Zero-fanin** (`fanin_builder.count == 0`): no producers to link. Sets
+   `fanin_count = 1`, releases the +1 self-reference, records the `dep_pool`
+   position (`orch_mark_dep_pool_position`), and seeds the task directly via
+   `push_ready_routed`.
+2. **All claimed producers already completed**: no live fanout links are
+   needed. Sets `fanin_count = N + 1`, primes `dispatch_fanin` when every
+   producer is codegen-flagged, releases the refcount, and pushes via
+   `push_ready_routed`.
+3. **At least one live producer** (`orch_wire_live_fanin_task` →
+   `orch_wire_fanin_task`):
+   - Reserves `dep_pool` space (`ensure_space`); an exhausted pool latches
+     `PTO2_ERROR_DEP_POOL_OVERFLOW`.
+   - Sets `fanin_count = N + 1` (+1 self-reference prevents premature
+     readiness).
+   - For each producer, under its `fanout_lock`: if `task_state >= COMPLETED`,
+     count it as early-finished; otherwise prepend the consumer to the
+     producer's `fanout_head` via `dep_pool.prepend`.
+   - Seeds `dispatch_fanin` by the early-finished count when every producer is
+     codegen-flagged.
+   - Releases the +1 self-reference plus the early-finished count via
+     `fanin_refcount.fetch_add`; if that already satisfies `fanin_count`,
+     publishes readiness via `route_ready_once`.
 
-The scheduler's completion handler mirrors this:
+`push_ready_routed` pushes a ready slot straight to its shape's queue;
+`route_ready_once` claims the slot exactly once (CAS), takes the early-dispatch
+doorbell path if the task was pre-staged, and otherwise routes it to the queue.
 
-1. **Acquire** `fanout_lock`, mark `task_state = COMPLETED`, read `fanout_head`, **release** lock
-2. Traverse fanout list, incrementing each consumer's `fanin_refcount`
-3. Mark `task_state = CONSUMED` when `fanout_refcount` reaches `fanout_count`
-
-This protocol guarantees every consumer is accounted for exactly once.
+The scheduler's completion handler (`on_task_complete`) mirrors the wiring:
+acquire `fanout_lock`, mark the task COMPLETED, read `fanout_head`, release the
+lock, then traverse the fanout list releasing each consumer's fanin
+(`release_fanin_and_check_ready`) and pushing newly-ready consumers via
+`route_ready_once`. This protocol guarantees every consumer is accounted for
+exactly once. (host-orch does not flip tasks to CONSUMED — see §8.4.)
 
 ### 7.4 Scope Mechanism (`PTO2_SCOPE`)
 

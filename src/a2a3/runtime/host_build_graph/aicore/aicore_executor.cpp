@@ -47,15 +47,17 @@ __aicore__ __attribute__((always_inline)) static void execute_task(__gm__ PTO2Di
  * AICore main execution loop
  *
  * Implements the AICPU-AICore register-based dispatch protocol:
- * 1. Wait for AICPU ready signal via handshake buffer
- * 2. Report physical core ID and core type, signal AICore ready
+ * 1. Report physical core ID and core type, signal aicore_done (no AICPU wait)
+ * 2. Wait for the AICPU to open our register window (DATA_MAIN_BASE != 0)
  * 3. Cache per-core PTO2DispatchPayload pointer from hank->task
  * 4. Poll DATA_MAIN_BASE register for task dispatch until exit signal
  *
- * AICPU writes &s_payload_per_core[i] to hank->task before setting
- * aicpu_ready=1. AICore caches this pointer and reads function_bin_addr +
- * args pointer from it on each dispatch. reg_val is a monotonically
- * increasing task ID used only for dispatch signaling and ACK/FIN protocol.
+ * AICore reports on launch; the AICPU writes &s_payload_per_core[i] to
+ * hank->task and then opens the register window (DATA_MAIN_BASE = IDLE), which
+ * is itself the acknowledgement. AICore caches this pointer and reads
+ * function_bin_addr + args pointer from it on each dispatch. reg_val is a
+ * monotonically increasing task ID used only for dispatch signaling and
+ * ACK/FIN protocol.
  *
  * Profiling state (enable flag, L2 swimlane rotation channel) is published into the platform
  * via set_aicore_profiling_flag / set_aicore_l2_swimlane_ring at kernel entry —
@@ -69,32 +71,36 @@ __aicore__ __attribute__((always_inline)) static void execute_task(__gm__ PTO2Di
 __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, int block_idx, CoreType core_type) {
     __gm__ Handshake *my_hank = (__gm__ Handshake *)(&runtime->workers[block_idx]);
 
-    // Phase 1: Wait for AICPU initialization signal
-    while (my_hank->aicpu_ready == 0) {
-        dcci(my_hank, SINGLE_CACHE_LINE);
-        SPIN_WAIT_HINT();
-    }
-
-    // Phase 2: Report physical core ID, signal ready
+    // Phase 1: report physical core ID + core type and signal done in one write,
+    // with no wait for the AICPU — both fields are self-known. The AICPU opens
+    // this core's register window only after it observes aicore_done, so a single
+    // report suffices. The host clears aicore_done before this kernel launches,
+    // so the value the AICPU reads is this run's report, never a stale prior one.
     my_hank->physical_core_id = get_physical_core_id();
-    OUT_OF_ORDER_STORE_BARRIER();
-    my_hank->aicore_regs_ready = 1;
-    dcci(&my_hank->aicore_regs_ready, SINGLE_CACHE_LINE, CACHELINE_OUT);
-    while (my_hank->aicpu_regs_ready == 0) {
-        dcci(&my_hank->aicpu_regs_ready, SINGLE_CACHE_LINE);
-        SPIN_WAIT_HINT();
-    }
-    // Report initial idle status via register
-    write_reg(RegId::COND, AICORE_IDLE_VALUE);
-
-    // Phase 3: Report core type, signal ready
     my_hank->core_type = core_type;
     OUT_OF_ORDER_STORE_BARRIER();
     my_hank->aicore_done = block_idx + 1;  // Signal ready (use block_idx + 1 to avoid 0)
-
     dcci(my_hank, SINGLE_CACHE_LINE, CACHELINE_OUT);
 
-    // Cache per-core dispatch payload pointer (set by AICPU before aicpu_ready)
+    // Phase 2: Wait for the AICPU to open our register window. A kernel launch
+    // resets DATA_MAIN_BASE to 0 (verified on a2a3 silicon); the AICPU writes
+    // DATA_MAIN_BASE = AICPU_IDLE_TASK_ID (non-zero) as it opens FAST_PATH, so a
+    // non-zero read means the window is open and reads/writes are valid. The
+    // AICPU runs assign_cores_to_threads (µs) between opening the window and the
+    // first dispatch, so this IDLE is observed long before any task_id lands —
+    // the poll cannot miss it and mistake a later task for the reset value.
+    // Window-open is the sync point for everything the AICPU publishes (task
+    // pointer, swimlane head): the AICPU writes those before opening the window.
+    while (read_reg(RegId::DATA_MAIN_BASE) == 0) {
+        SPIN_WAIT_HINT();
+    }
+    // Report initial idle status via register (FAST_PATH is now open).
+    write_reg(RegId::COND, AICORE_IDLE_VALUE);
+
+    // The AICPU writes task after observing our report (so our CACHELINE_OUT flush
+    // above cannot clobber it) and before opening the window; dcci to read its
+    // fresh value here.
+    dcci(my_hank, SINGLE_CACHE_LINE);
     __gm__ PTO2DispatchPayload *payload = reinterpret_cast<__gm__ PTO2DispatchPayload *>(my_hank->task);
 
     uint32_t enable_profiling_flag = get_aicore_profiling_flag();
@@ -103,9 +109,9 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, in
     bool pmu_enabled = SIMPLER_GET_DFX_FLAG(enable_profiling_flag, SIMPLER_DFX_FLAG_PMU);
 
     // Per-core L2SwimlaneActiveHead channel. AICPU completes
-    // `l2_swimlane_aicpu_init` before writing `aicpu_ready = 1` in
-    // `handshake_all_cores`, and Phase 1 above has already observed
-    // `aicpu_ready == 1`, so the rotation-table slot is populated and the
+    // `l2_swimlane_aicpu_init` (in pre_handshake_init) before any thread opens a
+    // register window in `handshake_partition`, and Phase 2 above has already
+    // observed our window open, so the rotation-table slot is populated and the
     // first deref is safe here — off the dispatch→start critical path.
     __gm__ L2SwimlaneActiveHead *l2_swimlane_head = l2_swimlane_enabled ? get_l2_swimlane_aicore_head() : nullptr;
     // cached_buf_seq must start != AICPU's initial head.current_buf_seq (0)

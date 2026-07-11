@@ -72,6 +72,17 @@ extern "C" __attribute__((weak, visibility("hidden"))) bool is_scope_stats_enabl
 // this weak no-op so the runtime translation unit stays self-contained.
 extern "C" __attribute__((weak, visibility("hidden"))) void scope_stats_note_heap_wrap(int) {}
 
+// AICore register accessor (aicpu/platform_regs.h). The host orchestrator's
+// route_ready_once path transitively ODR-uses the early-dispatch doorbell inline
+// (pto_scheduler.h ring_one_doorbell), but no core is gated during host
+// graph-build, so the doorbell never fires and this weak host fallback only
+// satisfies the linker. The AICPU build links the strong definition from
+// platform/.../platform_regs.cpp; hidden so the HOST .so does not shadow it.
+__attribute__((weak, visibility("hidden"))) volatile uint32_t *get_reg_ptr(uint64_t, RegId) {
+    static volatile uint32_t sink = 0;
+    return &sink;
+}
+
 // =============================================================================
 // Orchestrator Profiling (compile-time toggle)
 // =============================================================================
@@ -276,9 +287,9 @@ static bool append_fanin_or_fail(
     //       producer; ++'ing it would corrupt an unrelated task.
     //   (2) Already CONSUMED in place — finished, output ready, no real edge.
     // In either case, adding it to the fanin and bumping fanout_count would leave
-    // a stale ++/release pair (wire_task drops the fanout edge but keeps the fanin
-    // slot, so on_task_release still release_producer()'s it) that desyncs the
-    // slot's refcount (rc != fc) and wedges in-order reclaim. Claiming a live
+    // a stale ++/release pair (Orch-side wiring drops the fanout edge but keeps
+    // the fanin slot, so on_task_release still release_producer()'s it) that
+    // desyncs the slot's refcount (rc != fc) and wedges in-order reclaim. Claiming a live
     // producer under the lock pins it: fanout_count now counts us, so it cannot
     // reach CONSUMED (rc == fc) until we release it in on_task_release, keeping the
     // slot's generation stable until then. check_and_handle_consumed flips
@@ -343,6 +354,91 @@ static bool append_fanin_or_fail(
 }
 
 static void scope_tasks_push(PTO2OrchestratorState *orch, PTO2TaskSlotState *task_slot_state);
+
+static bool all_claimed_fanin_completed(const PTO2FaninBuilder &fanin_builder) {
+    if (fanin_builder.count == 0) return true;
+    return fanin_builder.for_each([](PTO2TaskSlotState *producer) -> bool {
+        return producer != nullptr && producer->task_state.load(std::memory_order_acquire) >= PTO2_TASK_COMPLETED;
+    });
+}
+
+static bool all_claimed_fanin_allow_early_resolve(const PTO2FaninBuilder &fanin_builder) {
+    if (fanin_builder.count == 0) return true;
+    return fanin_builder.for_each([](PTO2TaskSlotState *producer) -> bool {
+        return producer != nullptr && producer->allow_early_resolve;
+    });
+}
+
+// Record the dep_pool top reached after this slot's Orch-side wiring, so the
+// scheduler can bound its reclaim scan to the entries this task allocated.
+static void orch_mark_dep_pool_position(PTO2OrchestratorState *orch, PTO2TaskSlotState &slot_state) {
+    auto &rss = orch->scheduler->ring_sched_state;
+    slot_state.dep_pool_mark = rss.dep_pool.top;
+#if SIMPLER_DFX
+    if (is_scope_stats_enabled()) {
+        rss.publish_dep_pool_snapshot();
+    }
+#endif
+}
+
+// Wire a task with at least one live producer: prepend a fanout link on every
+// live producer under its fanout_lock, seed dispatch_fanin for pre-completed
+// codegen-flagged producers, then publish readiness via route_ready_once once
+// the fanin refcount is already satisfied.
+static void orch_wire_fanin_task(PTO2OrchestratorState *orch, PTO2TaskSlotState &slot_state, int32_t wfanin) {
+    PTO2SchedulerState *sched = orch->scheduler;
+    auto &rss = sched->ring_sched_state;
+    PTO2TaskPayload *payload = slot_state.payload;
+    slot_state.fanin_count = wfanin + 1;
+
+    int32_t early_finished = 0;
+    bool early_disqualified = false;
+    for_each_fanin_slot_state(*payload, [&](PTO2TaskSlotState *producer) {
+        producer->lock_fanout();
+        int32_t pstate = producer->task_state.load(std::memory_order_acquire);
+        if (!early_disqualified && !producer->allow_early_resolve) {
+            early_disqualified = true;
+        }
+        if (pstate >= PTO2_TASK_COMPLETED) {
+            early_finished++;
+        } else {
+            producer->fanout_head = rss.dep_pool.prepend(producer->fanout_head, &slot_state);
+        }
+        producer->unlock_fanout();
+    });
+
+    // Pre-completed producers will not dispatch again. Seed dispatch_fanin only
+    // when every producer is codegen-flagged; one unflagged producer makes the
+    // direct-only early-dispatch candidate count unreachable by design.
+    if (!early_disqualified && early_finished != 0) {
+        payload->dispatch_fanin.fetch_add(early_finished, std::memory_order_acq_rel);
+    }
+
+    int32_t init_rc = early_finished + 1;
+    int32_t new_rc = slot_state.fanin_refcount.fetch_add(init_rc, std::memory_order_acq_rel) + init_rc;
+    orch_mark_dep_pool_position(orch, slot_state);
+    if (new_rc >= slot_state.fanin_count) {
+        sched->route_ready_once(slot_state);
+    }
+}
+
+static bool orch_wire_live_fanin_task(PTO2OrchestratorState *orch, PTO2TaskSlotState &slot_state, int32_t wfanin) {
+    auto &rss = orch->scheduler->ring_sched_state;
+
+    // dep_pool is orchestrator-exclusive during host orchestration (no lock).
+    // The pool is sized for the whole graph (no reclaim during host
+    // orchestration, exactly like the task window and GM heap), so an exhausted
+    // pool latches PTO2_ERROR_DEP_POOL_OVERFLOW and reports the deadlock with the
+    // same structural + wall-clock logic the heap/task-window allocator uses. A
+    // false return also covers a fatal already latched elsewhere.
+    if (!rss.dep_pool.ensure_space(*rss.ring, wfanin)) {
+        orch->fatal = true;
+        return false;
+    }
+
+    orch_wire_fanin_task(orch, slot_state, wfanin);
+    return true;
+}
 
 struct PTO2PreparedTask {
     PTO2TaskId task_id = PTO2TaskId::invalid();
@@ -428,14 +524,14 @@ static bool prepare_task(
     // here lets RingSchedState::init() skip the O(window_size) bind loop.
     // Both writes hit the same 64B slot_state cache line we're about to
     // dirty below, so the extra cost is two stores on an already-hot line.
-    // Must precede the scheduler wiring.queue.push at the end of
-    // submit_task_common — that push is the first read of slot_state->task /
-    // slot_state->payload by another thread.
+    // Must precede the Orch-side wiring publish at the end of
+    // submit_task_common — that publish is the first read of slot_state->task /
+    // slot_state->payload by scheduler threads.
     out->slot_state->bind_buffers(out->payload, out->task);
 
     // prepare_task does NO payload writes: all payload content (tensors/scalars +
-    // early-dispatch spec fields) is initialized in PTO2TaskPayload::init, the
-    // single payload-init point, which runs before the scheduler wiring push.
+    // early-dispatch fields) is initialized in PTO2TaskPayload::init, the
+    // single payload-init point, which runs before Orch-side wiring publish.
 
     // Fields already zeroed by reset_for_reuse() at slot init:
     //   fanout_lock=0, fanout_count=PTO2_FANOUT_SCOPE_BIT, fanout_head=nullptr,
@@ -451,7 +547,7 @@ static bool prepare_task(
         static_cast<int16_t>(block_num * __builtin_popcount(active_mask.core_mask()));
     out->slot_state->logical_block_num = block_num;
     out->slot_state->active_mask = active_mask;
-    // fanin_count is set by scheduler during wiring
+    // fanin_count is set during Orch-side wiring
     scope_tasks_push(orch, out->slot_state);
 
     return true;
@@ -667,8 +763,8 @@ static bool ensure_tensormap_capacity(PTO2OrchestratorState *orch, int32_t neede
 // Shared body for submit_task / submit_dummy_task. Caller has already validated
 // args.has_error, decided active_mask (empty for dummy), and resolved the per-slot
 // kernel_ids (all INVALID_KERNEL_ID for dummy). Performs tensormap sync, fanin
-// computation (explicit_deps + auto), output registration, slot init, and pushes
-// to the scheduler wiring queue.
+// computation (explicit_deps + auto), output registration, slot init, and
+// Orch-side wiring/ready publication.
 static TaskOutputTensors submit_task_common(
     PTO2OrchestratorState *orch, const L0TaskArgs &args, ActiveMask active_mask, int32_t aic_kernel_id,
     int32_t aiv0_kernel_id, int32_t aiv1_kernel_id
@@ -822,6 +918,7 @@ static TaskOutputTensors submit_task_common(
     }
 
     payload.init(args, result, prepared.alloc_result, layout);
+    cur_slot_state.set_allow_early_resolve(args.allow_early_resolve());
 #if SIMPLER_DFX
     if (is_dump_args_enabled()) {
         if (args.scalar_count() > 0) {
@@ -841,21 +938,38 @@ static TaskOutputTensors submit_task_common(
 
     CYCLE_COUNT_LAP(g_orch_args_cycle);
 
-    // === STEP 6: wire fanout inline ===
+    // === STEP 6: wire on the orchestrator side and publish readiness ===
     // host_build_graph host-orch: the orchestrator runs to completion on the host
     // before the device boots scheduler-only, so wire the fanout adjacency here —
-    // lock each producer, allocate dep_pool entries, and seed the ready queue —
+    // lock each producer, allocate dep_pool entries, and publish readiness —
     // directly in submit instead of deferring it to a device-side wiring-queue
-    // drain. The dep_pool is sized for the whole graph (no reclaim during host
+    // drain. Zero-fanin tasks and tasks whose claimed producers are already
+    // completed need no fanout links or dep_pool entries and go straight to the
+    // ready queue; tasks with live producers allocate fanout links first. The
+    // dep_pool is sized for the whole graph (no reclaim during host
     // orchestration, exactly like the task window and GM heap), so an exhausted
-    // pool latches PTO2_ERROR_DEP_POOL_OVERFLOW via dep_pool.alloc() — the same
-    // failure class as a task-window/heap overflow. The resulting
+    // pool latches PTO2_ERROR_DEP_POOL_OVERFLOW via dep_pool.ensure_space() — the
+    // same failure class as a task-window/heap overflow. The resulting
     // fanout_head / dep-entry / ready-queue pointers are host-DDR addresses;
     // runtime_maker relocates them to device addresses before H2D.
-    sched->wire_task(sched->ring_sched_state, &cur_slot_state, payload.fanin_actual_count);
-    if (orch->sm_header->orch_error_code.load(std::memory_order_acquire) != PTO2_ERROR_NONE) {
-        orch->fatal = true;
-        return result;
+    if (fanin_builder.count == 0) {
+        cur_slot_state.fanin_count = 1;
+        cur_slot_state.fanin_refcount.store(1, std::memory_order_release);
+        orch_mark_dep_pool_position(orch, cur_slot_state);
+        sched->push_ready_routed(&cur_slot_state);
+    } else if (all_claimed_fanin_completed(fanin_builder)) {
+        int32_t ready_seed = fanin_builder.count + 1;
+        cur_slot_state.fanin_count = ready_seed;
+        if (all_claimed_fanin_allow_early_resolve(fanin_builder)) {
+            payload.dispatch_fanin.store(fanin_builder.count, std::memory_order_release);
+        }
+        cur_slot_state.fanin_refcount.store(ready_seed, std::memory_order_release);
+        orch_mark_dep_pool_position(orch, cur_slot_state);
+        sched->push_ready_routed(&cur_slot_state);
+    } else {
+        if (!orch_wire_live_fanin_task(orch, cur_slot_state, fanin_builder.count)) {
+            return result;
+        }
     }
 
     CYCLE_COUNT_LAP(g_orch_fanin_cycle);
@@ -1041,7 +1155,16 @@ TaskOutputTensors PTO2OrchestratorState::alloc_tensors(const L0TaskArgs &args) {
         // required so scope_end can release the producer-side reference and
         // drive the slot to CONSUMED, but worker dispatch fields are never
         // observed for hidden alloc tasks.
-        prepared.slot_state->task_state.store(PTO2_TASK_COMPLETED, std::memory_order_release);
+        //
+        // Flag the creator so it does NOT suppress its consumers' early-dispatch.
+        // Under the direct-only model an unflagged producer disqualifies its
+        // consumer, and a pre-completed producer only seeds dispatch_fanin when
+        // flagged. A buffer allocation is pure memory whose output is ready at
+        // creation — it should always be transparent, never a barrier. Unlike a
+        // codegen task there is no Arg-driven hint to honor here, so mark it
+        // unconditionally.
+        prepared.slot_state->allow_early_resolve = true;
+        prepared.slot_state->mark_completed();
     }
     orch->inline_completed_tasks++;
 

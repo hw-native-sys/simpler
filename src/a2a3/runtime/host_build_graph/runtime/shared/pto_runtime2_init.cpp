@@ -108,20 +108,23 @@ void PTO2SchedulerState::RingSchedState::destroy() { ring = nullptr; }
 PTO2SchedulerLayout PTO2SchedulerState::reserve_layout(DeviceArena &arena, int32_t dep_pool_capacity) {
     PTO2SchedulerLayout layout{};
     layout.ready_queue_capacity = PTO2_READY_QUEUE_SIZE;
-    layout.spsc_capacity = PTO2_WRIRING_QUEUE_SIZE;
     layout.dep_pool_capacity = dep_pool_capacity;
 
     for (int i = 0; i < PTO2_NUM_RESOURCE_SHAPES; i++) {
         layout.off_ready_queue_slots[i] = ready_queue_reserve_layout(arena, PTO2_READY_QUEUE_SIZE);
     }
+    for (int i = 0; i < PTO2_NUM_RESOURCE_SHAPES; i++) {
+        layout.off_ready_sync_queue_slots[i] = ready_queue_reserve_layout(arena, PTO2_READY_QUEUE_SIZE);
+    }
     layout.off_dummy_ready_queue_slots = ready_queue_reserve_layout(arena, PTO2_READY_QUEUE_SIZE);
-    layout.off_early_dispatch_queue_slots = ready_queue_reserve_layout(arena, PTO2_EARLY_DISPATCH_QUEUE_SIZE);
+    for (int i = 0; i < PTO2_NUM_RESOURCE_SHAPES; i++) {
+        layout.off_early_dispatch_queue_slots[i] = ready_queue_reserve_layout(arena, PTO2_EARLY_DISPATCH_QUEUE_SIZE);
+    }
     // Force a cache-line base so writes from scheduler thread 0 (sole writer of
     // the dep_pool) do not invalidate adjacent multi-threaded regions like
     // ready_queue.slots.
     layout.off_dep_pool_entries =
         arena.reserve(static_cast<size_t>(dep_pool_capacity) * sizeof(PTO2DepListEntry), PTO2_ALIGN_SIZE);
-    layout.off_wiring_spsc_buffer = PTO2SpscQueue::reserve_layout(arena, PTO2_WRIRING_QUEUE_SIZE);
     return layout;
 }
 
@@ -146,28 +149,31 @@ bool PTO2SchedulerState::init_data_from_layout(
             return false;
         }
     }
+    for (int i = 0; i < PTO2_NUM_RESOURCE_SHAPES; i++) {
+        if (!ready_queue_init_data_from_layout(
+                &sched->ready_sync_queues[i], arena, layout.off_ready_sync_queue_slots[i], layout.ready_queue_capacity
+            )) {
+            return false;
+        }
+    }
     if (!ready_queue_init_data_from_layout(
             &sched->dummy_ready_queue, arena, layout.off_dummy_ready_queue_slots, layout.ready_queue_capacity
         )) {
         return false;
     }
-    if (!ready_queue_init_data_from_layout(
-            &sched->early_dispatch_queue, arena, layout.off_early_dispatch_queue_slots, PTO2_EARLY_DISPATCH_QUEUE_SIZE
-        )) {
-        return false;
+    for (int i = 0; i < PTO2_NUM_RESOURCE_SHAPES; i++) {
+        if (!ready_queue_init_data_from_layout(
+                &sched->early_dispatch_queues[i], arena, layout.off_early_dispatch_queue_slots[i],
+                PTO2_EARLY_DISPATCH_QUEUE_SIZE
+            )) {
+            return false;
+        }
     }
 
     auto *orch_err = pto2_sm_layout::orch_error_code_addr(sm_dev_base);
     auto *dep_entries = static_cast<PTO2DepListEntry *>(arena.region_ptr(layout.off_dep_pool_entries));
     memset(dep_entries, 0, static_cast<size_t>(layout.dep_pool_capacity) * sizeof(PTO2DepListEntry));
     sched->ring_sched_state.dep_pool.init(dep_entries, layout.dep_pool_capacity, orch_err);
-
-    if (!sched->wiring.queue.init_data_from_layout(arena, layout.off_wiring_spsc_buffer, layout.spsc_capacity)) {
-        return false;
-    }
-    sched->wiring.batch_count = 0;
-    sched->wiring.batch_index = 0;
-    sched->wiring.backoff_counter = 0;
 
     return true;
 }
@@ -177,23 +183,33 @@ void PTO2SchedulerState::wire_arena_pointers(const PTO2SchedulerLayout &layout, 
     for (int i = 0; i < PTO2_NUM_RESOURCE_SHAPES; i++) {
         ready_queue_wire_arena_pointers(&sched->ready_queues[i], arena, layout.off_ready_queue_slots[i]);
     }
+    for (int i = 0; i < PTO2_NUM_RESOURCE_SHAPES; i++) {
+        ready_queue_wire_arena_pointers(&sched->ready_sync_queues[i], arena, layout.off_ready_sync_queue_slots[i]);
+    }
     ready_queue_wire_arena_pointers(&sched->dummy_ready_queue, arena, layout.off_dummy_ready_queue_slots);
-    ready_queue_wire_arena_pointers(&sched->early_dispatch_queue, arena, layout.off_early_dispatch_queue_slots);
+    for (int i = 0; i < PTO2_NUM_RESOURCE_SHAPES; i++) {
+        ready_queue_wire_arena_pointers(
+            &sched->early_dispatch_queues[i], arena, layout.off_early_dispatch_queue_slots[i]
+        );
+    }
     sched->ring_sched_state.dep_pool.base =
         static_cast<PTO2DepListEntry *>(arena.region_ptr(layout.off_dep_pool_entries));
-    sched->wiring.queue.wire_arena_pointers(arena, layout.off_wiring_spsc_buffer);
 }
 
 void PTO2SchedulerState::destroy() {
     PTO2SchedulerState *sched = this;
     sched->ring_sched_state.destroy();
     sched->ring_sched_state.dep_pool.base = nullptr;
-    sched->wiring.queue.destroy();
     for (int i = 0; i < PTO2_NUM_RESOURCE_SHAPES; i++) {
         ready_queue_destroy(&sched->ready_queues[i]);
     }
+    for (int i = 0; i < PTO2_NUM_RESOURCE_SHAPES; i++) {
+        ready_queue_destroy(&sched->ready_sync_queues[i]);
+    }
     ready_queue_destroy(&sched->dummy_ready_queue);
-    ready_queue_destroy(&sched->early_dispatch_queue);
+    for (int i = 0; i < PTO2_NUM_RESOURCE_SHAPES; i++) {
+        ready_queue_destroy(&sched->early_dispatch_queues[i]);
+    }
 }
 
 // =============================================================================
