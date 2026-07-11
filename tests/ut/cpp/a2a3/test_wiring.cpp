@@ -33,6 +33,10 @@
 #include "utils/device_arena.h"
 #include "scheduler/pto_scheduler.h"
 
+void reset_test_reg_stub();
+uint64_t get_test_reg_stub_value();
+uint64_t get_test_reg_stub_base_addr();
+
 // =============================================================================
 // Fixture: sets up runtime state with shared memory and provides helpers
 // =============================================================================
@@ -376,6 +380,146 @@ TEST_F(WiringTest, EarlyDispatchWaitsForAllProducerBlocksPublished) {
 
     sched.propagate_dispatch_fanin(producer);
     EXPECT_EQ(payload.dispatch_fanin.load(), payload.fanin_actual_count);
+}
+
+TEST_F(WiringTest, EarlyDispatchDoorbellBitsHaveOneOwner) {
+    constexpr uint64_t all_bits = 0b1111;
+    constexpr uint64_t late_bits = 0b1010;
+
+    std::atomic<uint64_t> release_first{all_bits};
+    uint64_t release_owned = PTO2SchedulerState::claim_all_staged_doorbell_bits(release_first);
+    uint64_t late_owned = PTO2SchedulerState::claim_late_staged_doorbell_bits(release_first, late_bits);
+    EXPECT_EQ(release_owned, all_bits);
+    EXPECT_EQ(late_owned, 0);
+
+    std::atomic<uint64_t> late_first{all_bits};
+    late_owned = PTO2SchedulerState::claim_late_staged_doorbell_bits(late_first, late_bits);
+    release_owned = PTO2SchedulerState::claim_all_staged_doorbell_bits(late_first);
+    EXPECT_EQ(late_owned, late_bits);
+    EXPECT_EQ(release_owned, all_bits & ~late_bits);
+    EXPECT_EQ(release_owned & late_owned, 0);
+    EXPECT_EQ(release_owned | late_owned, all_bits);
+    EXPECT_EQ(late_first.load(std::memory_order_acquire), 0);
+
+    std::atomic<uint64_t> published_after_release{0};
+    release_owned = PTO2SchedulerState::claim_all_staged_doorbell_bits(published_after_release);
+    published_after_release.fetch_or(late_bits, std::memory_order_seq_cst);
+    late_owned = PTO2SchedulerState::claim_late_staged_doorbell_bits(published_after_release, late_bits);
+    EXPECT_EQ(release_owned, 0);
+    EXPECT_EQ(late_owned, late_bits);
+    EXPECT_EQ(published_after_release.load(std::memory_order_acquire), 0);
+}
+
+TEST_F(WiringTest, EarlyDispatchClaimStaysGatedAfterRelease) {
+    EXPECT_TRUE(PTO2SchedulerState::should_gate_early_dispatch(true, PTO2_EARLY_DISPATCH_DISPATCHED));
+    EXPECT_TRUE(PTO2SchedulerState::should_gate_early_dispatch(false, PTO2_EARLY_DISPATCH_STAGING));
+    EXPECT_FALSE(PTO2SchedulerState::should_gate_early_dispatch(false, PTO2_EARLY_DISPATCH_DISPATCHED));
+}
+
+TEST_F(WiringTest, EarlyDispatchLaunchHasSingleOwner) {
+    alignas(64) PTO2TaskPayload payload{};
+    std::atomic<bool> start{false};
+    bool won[2] = {false, false};
+
+    std::thread contenders[2];
+    for (int i = 0; i < 2; i++) {
+        contenders[i] = std::thread([&, i] {
+            while (!start.load(std::memory_order_acquire)) {}
+            won[i] = PTO2SchedulerState::try_claim_early_dispatch_launch(payload);
+        });
+    }
+    start.store(true, std::memory_order_release);
+    for (auto &contender : contenders)
+        contender.join();
+
+    EXPECT_NE(won[0], won[1]);
+    EXPECT_EQ(payload.early_dispatch_launch_state.load(), PTO2_EARLY_DISPATCH_LAUNCH_RINGING);
+}
+
+TEST_F(WiringTest, EarlyDispatchFanoutWaitsForDoorbellPass) {
+    alignas(64) PTO2TaskSlotState producer, consumer;
+    init_slot(producer, PTO2_TASK_PENDING, 1, 1);
+    init_slot(consumer, PTO2_TASK_PENDING, 1, 1);
+
+    producer.allow_early_resolve = true;
+    producer.payload->published_block_count.store(1, std::memory_order_relaxed);
+    consumer.payload->fanin_actual_count = 1;
+
+    PTO2DepListEntry dep{};
+    dep.slot_state = &consumer;
+    producer.fanout_head = &dep;
+
+    producer.payload->early_dispatch_state.store(PTO2_EARLY_DISPATCH_STAGING, std::memory_order_relaxed);
+    sched.propagate_dispatch_fanin(producer);
+    EXPECT_EQ(consumer.payload->dispatch_fanin.load(), 0);
+    EXPECT_EQ(producer.payload->dispatch_propagated.load(), 0);
+
+    producer.payload->early_dispatch_launch_state.store(PTO2_EARLY_DISPATCH_LAUNCH_RINGING);
+    producer.payload->early_dispatch_state.store(PTO2_EARLY_DISPATCH_DISPATCHED, std::memory_order_release);
+    sched.propagate_dispatch_fanin(producer);
+    EXPECT_EQ(consumer.payload->dispatch_fanin.load(), 0);
+    EXPECT_EQ(producer.payload->dispatch_propagated.load(), 0);
+
+    producer.payload->early_dispatch_launch_state.store(PTO2_EARLY_DISPATCH_LAUNCH_COMPLETE, std::memory_order_seq_cst);
+    sched.propagate_dispatch_fanin(producer);
+    EXPECT_EQ(consumer.payload->dispatch_fanin.load(), 1);
+    EXPECT_EQ(producer.payload->dispatch_propagated.load(), 1);
+}
+
+TEST_F(WiringTest, LateStagerRingsCapturedDoorbellAfterTableReuse) {
+    constexpr int core_id = 3;
+    constexpr uint64_t captured_addr = 0x12340000;
+    constexpr uint64_t reused_addr = 0x56780000;
+    constexpr uint32_t captured_token = 7;
+    constexpr uint32_t reused_token = 9;
+
+    reset_test_reg_stub();
+    sched.early_dispatch_doorbell_table[core_id].addr = reused_addr;
+    sched.early_dispatch_doorbell_table[core_id].token = reused_token;
+
+    uint64_t claimed = 1ULL << core_id;
+    EXPECT_TRUE(PTO2SchedulerState::ring_claimed_local_doorbell(claimed, core_id, captured_addr, captured_token));
+    EXPECT_EQ(get_test_reg_stub_base_addr(), captured_addr);
+    EXPECT_EQ(get_test_reg_stub_value(), (static_cast<uint64_t>(captured_token) << 32) | captured_token);
+}
+
+TEST_F(WiringTest, EarlyDispatchReleaseConsumesDoorbellMask) {
+    constexpr int core_id = 5;
+    constexpr uint64_t reg_addr = 0x98760000;
+    constexpr uint32_t token = 11;
+    alignas(64) PTO2TaskSlotState task;
+    init_slot(task, PTO2_TASK_PENDING, 1, 1);
+    task.allow_early_resolve = true;
+    task.next_block_idx.store(1, std::memory_order_relaxed);
+    task.payload->early_dispatch_state.store(PTO2_EARLY_DISPATCH_STAGING, std::memory_order_relaxed);
+    task.payload->staged_core_mask[0].store(1ULL << core_id, std::memory_order_relaxed);
+    sched.early_dispatch_doorbell_table[core_id].addr = reg_addr;
+    sched.early_dispatch_doorbell_table[core_id].token = token;
+    bool released_before =
+        task.payload->early_dispatch_state.load(std::memory_order_seq_cst) == PTO2_EARLY_DISPATCH_DISPATCHED;
+
+    reset_test_reg_stub();
+    EXPECT_FALSE(released_before);
+    EXPECT_TRUE(sched.try_early_dispatch_release(task));
+    EXPECT_EQ(task.payload->early_dispatch_state.load(), PTO2_EARLY_DISPATCH_DISPATCHED);
+    EXPECT_EQ(task.payload->early_dispatch_launch_state.load(), PTO2_EARLY_DISPATCH_LAUNCH_COMPLETE);
+    EXPECT_EQ(task.payload->staged_core_mask[0].load(), 0);
+    EXPECT_EQ(get_test_reg_stub_base_addr(), reg_addr);
+    EXPECT_EQ(get_test_reg_stub_value(), (static_cast<uint64_t>(token) << 32) | token);
+    EXPECT_EQ(task.payload->dispatch_propagated.load(), 0);
+
+    sched.record_published_blocks(task, 1);
+    // The staging path must retry even though its earlier state snapshot was
+    // STAGING; release already missed this final publication count.
+    sched.propagate_dispatch_fanin(task);
+    EXPECT_EQ(task.payload->dispatch_propagated.load(), 1);
+
+    sched.early_dispatch_doorbell_table[core_id].addr = 0x11110000;
+    sched.early_dispatch_doorbell_table[core_id].token = 12;
+    reset_test_reg_stub();
+    EXPECT_TRUE(sched.try_early_dispatch_release(task));
+    EXPECT_EQ(get_test_reg_stub_base_addr(), 0);
+    EXPECT_EQ(get_test_reg_stub_value(), 0);
 }
 
 TEST_F(WiringTest, EarlyDispatchBlockedByUnflaggedProducer) {

@@ -219,8 +219,14 @@ struct PTO2TaskDescriptor {
 enum PTO2EarlyDispatchState : uint8_t {
     PTO2_EARLY_DISPATCH_NONE = 0,       // not pre-staged
     PTO2_EARLY_DISPATCH_STAGING = 1,    // Hook 1 claimed it; staging in progress
-    PTO2_EARLY_DISPATCH_STAGED = 2,     // staged on a core, gated; staged_* fields valid
-    PTO2_EARLY_DISPATCH_DISPATCHED = 3  // routed via the normal dispatch path (no pre-stage)
+    PTO2_EARLY_DISPATCH_STAGED = 2,     // reserved
+    PTO2_EARLY_DISPATCH_DISPATCHED = 3  // producers released; staged blocks may still be gated
+};
+
+enum PTO2EarlyDispatchLaunchState : uint8_t {
+    PTO2_EARLY_DISPATCH_LAUNCH_NONE = 0,
+    PTO2_EARLY_DISPATCH_LAUNCH_RINGING = 1,
+    PTO2_EARLY_DISPATCH_LAUNCH_COMPLETE = 2,
 };
 
 // A pre-staged consumer occupies one core per gated subtask block. WHICH cores
@@ -250,8 +256,8 @@ struct PTO2TaskPayload {
     // 576), so sizeof and tensors[] are unchanged.
     //
     // Bitmask of global core_ids this consumer is pre-staged (gated) on. Set with
-    // atomic fetch_or by concurrent stagers; read by release. (Re)initialized in
-    // PTO2TaskPayload::init before the slot can be staged again.
+    // atomic fetch_or by concurrent stagers, then destructively split between the
+    // release and late-stager paths. (Re)initialized in PTO2TaskPayload::init.
     std::atomic<uint64_t> staged_core_mask[PTO2_EARLY_DISPATCH_CORE_MASK_WORDS]{};
     // Early-dispatch CANDIDATE detection (event-driven, dual of fanin_refcount):
     // seeded at wiring with producers already complete, then a flagged producer
@@ -270,11 +276,14 @@ struct PTO2TaskPayload {
     // 3=DISPATCHED (2=STAGED is unused now). STAGING is the STABLE gated state —
     // many threads stage blocks concurrently while it holds, each claiming a block
     // via the atomic next_block_idx and OR-ing its cores into staged_core_mask.
-    // Release does STAGING->DISPATCHED then rings the mask; a thread that stages a
-    // block AFTER release flipped DISPATCHED rings that block's doorbell itself
-    // (self-ring), so no doorbell is ever missed.
+    // Release does STAGING->DISPATCHED and claims the current mask; a thread that
+    // stages a block after that flip claims and rings only its remaining bits.
     std::atomic<uint8_t> early_dispatch_state{0};
     std::atomic<uint8_t> dispatch_propagated{0};  // PRODUCER side: once-guard for fanout propagation
+    // The release owner publishes COMPLETE only after all doorbells it claimed
+    // are visible. Combined with published_block_count, this keeps fanout
+    // private until release-owned and late-owned blocks have both launched.
+    std::atomic<uint8_t> early_dispatch_launch_state{PTO2_EARLY_DISPATCH_LAUNCH_NONE};
     // === Cache lines 9-72 (4096B) — tensors (alignas(64) forces alignment) ===
     Tensor tensors[MAX_TENSOR_ARGS];
     // === Cache lines 73-74 (128B) — scalars ===
@@ -350,14 +359,15 @@ struct PTO2TaskPayload {
         // one of ITS producers is flagged (propagate_dispatch_fanin bumps
         // dispatch_fanin and may CAS early_dispatch_state on any consumer, independent of the
         // consumer's own hint). So they MUST be zeroed here unconditionally.
-        // published_block_count and dispatch_propagated are producer-side, but share
-        // this same per-submit lifetime and are reset here too.
+        // Publication, propagation, and launch fields share this same
+        // per-submit lifetime and are reset here too.
         early_dispatch_state.store(PTO2_EARLY_DISPATCH_NONE, std::memory_order_relaxed);
         for (int w = 0; w < PTO2_EARLY_DISPATCH_CORE_MASK_WORDS; w++)
             staged_core_mask[w].store(0, std::memory_order_relaxed);
         dispatch_fanin.store(0, std::memory_order_relaxed);
         dispatch_propagated.store(0, std::memory_order_relaxed);
         published_block_count.store(0, std::memory_order_relaxed);
+        early_dispatch_launch_state.store(PTO2_EARLY_DISPATCH_LAUNCH_NONE, std::memory_order_relaxed);
     }
 };
 

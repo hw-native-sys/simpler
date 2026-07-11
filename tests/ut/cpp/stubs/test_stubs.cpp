@@ -91,11 +91,23 @@ void cache_flush_range(const void * /* addr */, size_t /* size */) {}
 // early-dispatch) is an inline that resolves a register id to its MMIO pointer
 // via get_reg_ptr and writes a 64-bit token through it. There is no MMIO on the
 // host UT runner; hand back writable static storage (8 bytes — the doorbell is a
-// 64-bit store) so the inline links and any write is harmless.
-volatile uint32_t *get_reg_ptr(uint64_t /* reg_base_addr */, RegId /* reg */) {
-    static volatile uint64_t dummy_reg = 0;
-    return reinterpret_cast<volatile uint32_t *>(&dummy_reg);
+// 64-bit store) and retain the requested base address for ownership tests.
+static volatile uint64_t g_test_reg = 0;
+static uint64_t g_test_reg_base_addr = 0;
+
+volatile uint32_t *get_reg_ptr(uint64_t reg_base_addr, RegId /* reg */) {
+    g_test_reg_base_addr = reg_base_addr;
+    return reinterpret_cast<volatile uint32_t *>(&g_test_reg);
 }
+
+void reset_test_reg_stub() {
+    g_test_reg = 0;
+    g_test_reg_base_addr = 0;
+}
+
+uint64_t get_test_reg_stub_value() { return g_test_reg; }
+
+uint64_t get_test_reg_stub_base_addr() { return g_test_reg_base_addr; }
 
 // =============================================================================
 // runtime_maker.cpp stub (bind_callable_to_runtime_impl)

@@ -32,6 +32,7 @@
 #include <atomic>
 
 #include "common/core_type.h"
+#include "common/memory_barrier.h"
 #include "utils/device_arena.h"
 #include "aicpu/platform_regs.h"  // get_reg_ptr / RegId for the early-dispatch doorbell
 #include "pto_async_wait.h"
@@ -657,8 +658,8 @@ struct PTO2SchedulerState {
     // PARTIALLY pre-staged — the gated blocks are released by the doorbells rung
     // here, and the remaining (next_block_idx .. logical_block_num) blocks
     // dispatch normally off the ready queue. Lock-free claim shared with Hook 1
-    // (the stager): CAS NONE->DISPATCHED wins => not pre-staged; lose => STAGED
-    // (spin past the brief STAGING window so the mask is visible), then ring.
+    // (the stager): CAS NONE->DISPATCHED wins => not pre-staged; otherwise flip
+    // STAGING->DISPATCHED and destructively claim the published doorbell bits.
 
     // Per-core early-dispatch doorbell table. Hook 1 records each gated core's
     // (reg_addr, dispatch token) here at stage time; the completion-path release
@@ -698,6 +699,42 @@ struct PTO2SchedulerState {
         *dmb = (tk << 32) | tk;  // 64-bit STR: high=low=token releases the gated AICore
     }
 
+    inline void ring_staged_doorbell_bits(int word, uint64_t bits) {
+        while (bits != 0) {
+            int core_id = word * 64 + __builtin_ctzll(bits);
+            bits &= bits - 1;
+            ring_one_doorbell(
+                early_dispatch_doorbell_table[core_id].addr, early_dispatch_doorbell_table[core_id].token
+            );
+        }
+    }
+
+    static inline uint64_t claim_all_staged_doorbell_bits(std::atomic<uint64_t> &mask) {
+        return mask.exchange(0, std::memory_order_seq_cst);
+    }
+
+    static inline uint64_t claim_late_staged_doorbell_bits(std::atomic<uint64_t> &mask, uint64_t candidates) {
+        return mask.fetch_and(~candidates, std::memory_order_seq_cst) & candidates;
+    }
+
+    static inline bool should_gate_early_dispatch(bool force_gate, uint8_t early_dispatch_state) {
+        return force_gate || early_dispatch_state == PTO2_EARLY_DISPATCH_STAGING;
+    }
+
+    static inline bool
+    ring_claimed_local_doorbell(uint64_t claimed_word, int core_id, uint64_t reg_addr, uint32_t token) {
+        if ((claimed_word & (1ULL << (core_id & 63))) == 0) return false;
+        ring_one_doorbell(reg_addr, token);
+        return true;
+    }
+
+    static inline bool try_claim_early_dispatch_launch(PTO2TaskPayload &payload) {
+        uint8_t expected = PTO2_EARLY_DISPATCH_LAUNCH_NONE;
+        return payload.early_dispatch_launch_state.compare_exchange_strong(
+            expected, PTO2_EARLY_DISPATCH_LAUNCH_RINGING, std::memory_order_seq_cst, std::memory_order_seq_cst
+        );
+    }
+
     inline void record_published_blocks(PTO2TaskSlotState &slot_state, int32_t count) {
         if (count <= 0 || !slot_state.allow_early_resolve) return;
         slot_state.payload->published_block_count.fetch_add(static_cast<int16_t>(count), std::memory_order_seq_cst);
@@ -716,6 +753,10 @@ struct PTO2SchedulerState {
     void propagate_dispatch_fanin(PTO2TaskSlotState &p) {
         if (!p.allow_early_resolve) return;  // only codegen-flagged (direct) producers propagate
         if (p.payload->published_block_count.load(std::memory_order_seq_cst) < p.logical_block_num) return;
+        if (p.payload->early_dispatch_state.load(std::memory_order_seq_cst) == PTO2_EARLY_DISPATCH_STAGING) return;
+        if (p.payload->early_dispatch_launch_state.load(std::memory_order_seq_cst) ==
+            PTO2_EARLY_DISPATCH_LAUNCH_RINGING)
+            return;
         if (p.payload->dispatch_propagated.exchange(1, std::memory_order_acq_rel) != 0)
             return;  // already propagated once
         p.lock_fanout();
@@ -767,28 +808,25 @@ struct PTO2SchedulerState {
             )) {
             return false;
         }
-        // Staged (STAGING). Flip STAGING->DISPATCHED, THEN read the mask. seq_cst
-        // gives a total order with the concurrent stagers, each of which OR-s its
-        // core into the mask and THEN loads early_dispatch_state: a stager whose bit lands
-        // before this CAS is read here and rung; a stager whose bit lands after
-        // sees DISPATCHED and rings that core itself (self-ring in
-        // stage_consumer_blocks). Either way every gated core's doorbell fires once
-        // (a double-ring is harmless — the AICore already matched). This replaces
-        // the old transient-STAGING spin: STAGING is now the stable gated state.
+        // route_ready_once admits one caller, but keep the helper defensive: a
+        // duplicate that observes or loses an in-progress launch must never
+        // route the same partial task a second time.
+        if (expect != PTO2_EARLY_DISPATCH_STAGING || !try_claim_early_dispatch_launch(*slot_state.payload)) return true;
         expect = PTO2_EARLY_DISPATCH_STAGING;
         slot_state.payload->early_dispatch_state.compare_exchange_strong(
             expect, PTO2_EARLY_DISPATCH_DISPATCHED, std::memory_order_seq_cst, std::memory_order_seq_cst
         );
+        // Destructively claim every published bit. A stager racing this pass
+        // can claim only bits that land after the exchange, so each gated core
+        // has exactly one doorbell writer.
         for (int w = 0; w < PTO2_EARLY_DISPATCH_CORE_MASK_WORDS; w++) {
-            uint64_t bits = slot_state.payload->staged_core_mask[w].load(std::memory_order_seq_cst);
-            while (bits != 0) {
-                int core_id = w * 64 + __builtin_ctzll(bits);
-                bits &= bits - 1;
-                ring_one_doorbell(
-                    early_dispatch_doorbell_table[core_id].addr, early_dispatch_doorbell_table[core_id].token
-                );
-            }
+            uint64_t owned = claim_all_staged_doorbell_bits(slot_state.payload->staged_core_mask[w]);
+            ring_staged_doorbell_bits(w, owned);
         }
+        wmb();
+        slot_state.payload->early_dispatch_launch_state.store(
+            PTO2_EARLY_DISPATCH_LAUNCH_COMPLETE, std::memory_order_seq_cst
+        );
         // This pre-staged consumer was just released by its doorbell — it starts
         // running NOW, so propagate dispatch_fanin to ITS consumers (only if it is
         // itself codegen-flagged; the gate inside no-ops otherwise). Defer it via the

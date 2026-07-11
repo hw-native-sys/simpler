@@ -230,7 +230,8 @@ private:
     );
 
     void build_payload(
-        PTO2DispatchPayload &dispatch_payload, PTO2TaskSlotState &slot_state, PTO2SubtaskSlot subslot, int32_t block_idx
+        PTO2DispatchPayload &dispatch_payload, PTO2TaskSlotState &slot_state, PTO2SubtaskSlot subslot,
+        int32_t block_idx, bool force_gate
     );
 
     // Batched-dispatch primitives. prepare_* builds the payload and per-core
@@ -251,7 +252,7 @@ private:
 
     PublishHandle prepare_subtask_to_core(
         int32_t thread_idx, int32_t core_offset, PTO2TaskSlotState &slot_state, PTO2SubtaskSlot subslot,
-        bool to_pending, int32_t block_idx
+        bool to_pending, int32_t block_idx, bool force_gate
     );
 
     inline void publish_subtask_to_core(const PublishHandle &h, uint64_t dispatch_ts) {
@@ -298,7 +299,7 @@ private:
     // caller-supplied handles buffer. Returns the number of handles written.
     int prepare_block_for_dispatch(
         int32_t thread_idx, int32_t core_offset, PTO2TaskSlotState &slot_state, PTO2ResourceShape shape,
-        bool to_pending, int32_t block_idx, PublishHandle *out_handles
+        bool to_pending, int32_t block_idx, PublishHandle *out_handles, bool force_gate = false
     );
 
     void dispatch_shape(
@@ -311,7 +312,7 @@ private:
     // is queued) and sets made_progress / try_pushed when it stages, so the caller
     // is a single unconditional call like normal dispatch. After normal dispatch
     // leaves idle cores spare, pre-stage the consumers of any RUNNING flagged
-    // producer onto those cores with not_ready=1 (gated). Touches no dependency
+    // producer onto those cores with a non-zero src_payload (gated). Touches no dependency
     // state — the task is released by the doorbell at its normal ready-pop (Hook 2).
     int32_t try_early_dispatch(
         int32_t thread_idx, CoreTracker &tracker, bool pmu_active, bool &made_progress, bool &try_pushed

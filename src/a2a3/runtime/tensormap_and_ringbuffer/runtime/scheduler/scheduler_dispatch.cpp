@@ -37,7 +37,7 @@
 #define unlikely(x) __builtin_expect(!!(x), 0)
 #endif
 
-// AICore materializes args[] from src_payload on the not_ready path using the
+// AICore materializes args[] from src_payload on the gated path using the
 // byte offsets in pto2_dispatch_payload.h (the AICore .o cannot see PTO2TaskPayload).
 // Pin those constants to the real layout here, where the struct is fully visible.
 static_assert(offsetof(PTO2TaskPayload, tensor_count) == PTO2_TASKPAYLOAD_TENSOR_COUNT_OFFSET);
@@ -123,17 +123,20 @@ int SchedulerContext::pop_ready_tasks_batch(
 }
 
 void SchedulerContext::build_payload(
-    PTO2DispatchPayload &dispatch_payload, PTO2TaskSlotState &slot_state, PTO2SubtaskSlot subslot, int32_t block_idx
+    PTO2DispatchPayload &dispatch_payload, PTO2TaskSlotState &slot_state, PTO2SubtaskSlot subslot, int32_t block_idx,
+    bool force_gate
 ) {
     int32_t slot_idx = static_cast<int32_t>(subslot);
     uint64_t callable_addr = get_function_bin_addr(slot_state.task->kernel_id[slot_idx]);
     const CoreCallable *callable = reinterpret_cast<const CoreCallable *>(callable_addr);
     dispatch_payload.function_bin_addr = callable->resolved_addr();
     auto &payload = *slot_state.payload;
-    // Early-dispatch: a task being staged (Hook 1 set early_dispatch_state to
-    // STAGING before this call) is gated — the AICore must wait for the
-    // DATA_MAIN_BASE high-32 doorbell. All other dispatches run on pickup.
-    if (payload.early_dispatch_state.load(std::memory_order_relaxed) == PTO2_EARLY_DISPATCH_STAGING) {
+    // A claimed early-stage range stays gated even if producer completion flips
+    // the shared state before this payload is built. All other dispatches run on
+    // pickup.
+    if (PTO2SchedulerState::should_gate_early_dispatch(
+            force_gate, payload.early_dispatch_state.load(std::memory_order_relaxed)
+        )) {
         // Gated task: hand the idle AICore the source payload (non-zero = gate) and
         // let it fill args[0..num_args) itself during its doorbell wait, instead of
         // paying the arg-vector write on this scheduler thread.
@@ -162,7 +165,7 @@ void SchedulerContext::build_payload(
 
 SchedulerContext::PublishHandle SchedulerContext::prepare_subtask_to_core(
     int32_t thread_idx, int32_t core_offset, PTO2TaskSlotState &slot_state, PTO2SubtaskSlot subslot, bool to_pending,
-    int32_t block_idx
+    int32_t block_idx, bool force_gate
 ) {
     CoreTracker &tracker = core_trackers_[thread_idx];
     auto core_id = tracker.get_core_id_by_offset(core_offset);
@@ -185,7 +188,7 @@ SchedulerContext::PublishHandle SchedulerContext::prepare_subtask_to_core(
     // deferred completion (count > 0), which is rare. A non-deferred task never
     // touches count/error_code, so the slab stays clean without a per-dispatch
     // write — keeping this cold per-core line off the dispatch path.
-    build_payload(payload, slot_state, subslot, block_idx);
+    build_payload(payload, slot_state, subslot, block_idx, force_gate);
 
     if (to_pending) {
         core_exec_state.pending_subslot = subslot;
@@ -234,7 +237,7 @@ SchedulerContext::PublishHandle SchedulerContext::prepare_subtask_to_core(
 
 int SchedulerContext::prepare_block_for_dispatch(
     int32_t thread_idx, int32_t core_offset, PTO2TaskSlotState &slot_state, PTO2ResourceShape shape, bool to_pending,
-    int32_t block_idx, PublishHandle *out_handles
+    int32_t block_idx, PublishHandle *out_handles, bool force_gate
 ) {
 #if SIMPLER_DFX
     if (is_dump_args_enabled()) {
@@ -256,19 +259,22 @@ int SchedulerContext::prepare_block_for_dispatch(
         if (cmask & PTO2_SUBTASK_MASK_AIC) {
             bool p = to_pending && !tracker.is_aic_core_idle(core_offset);
             out_handles[n++] = prepare_subtask_to_core(
-                thread_idx, tracker.get_aic_core_offset(core_offset), slot_state, PTO2SubtaskSlot::AIC, p, block_idx
+                thread_idx, tracker.get_aic_core_offset(core_offset), slot_state, PTO2SubtaskSlot::AIC, p, block_idx,
+                force_gate
             );
         }
         if (cmask & PTO2_SUBTASK_MASK_AIV0) {
             bool p = to_pending && !tracker.is_aiv0_core_idle(core_offset);
             out_handles[n++] = prepare_subtask_to_core(
-                thread_idx, tracker.get_aiv0_core_offset(core_offset), slot_state, PTO2SubtaskSlot::AIV0, p, block_idx
+                thread_idx, tracker.get_aiv0_core_offset(core_offset), slot_state, PTO2SubtaskSlot::AIV0, p, block_idx,
+                force_gate
             );
         }
         if (cmask & PTO2_SUBTASK_MASK_AIV1) {
             bool p = to_pending && !tracker.is_aiv1_core_idle(core_offset);
             out_handles[n++] = prepare_subtask_to_core(
-                thread_idx, tracker.get_aiv1_core_offset(core_offset), slot_state, PTO2SubtaskSlot::AIV1, p, block_idx
+                thread_idx, tracker.get_aiv1_core_offset(core_offset), slot_state, PTO2SubtaskSlot::AIV1, p, block_idx,
+                force_gate
             );
         }
 #if SIMPLER_DFX
@@ -276,15 +282,17 @@ int SchedulerContext::prepare_block_for_dispatch(
 #endif
         return n;
     } else if (shape == PTO2ResourceShape::AIC) {
-        out_handles[0] =
-            prepare_subtask_to_core(thread_idx, core_offset, slot_state, PTO2SubtaskSlot::AIC, to_pending, block_idx);
+        out_handles[0] = prepare_subtask_to_core(
+            thread_idx, core_offset, slot_state, PTO2SubtaskSlot::AIC, to_pending, block_idx, force_gate
+        );
 #if SIMPLER_DFX
         sched_l2_swimlane_[thread_idx].phase_dispatch_count += 1;
 #endif
         return 1;
     } else {
-        out_handles[0] =
-            prepare_subtask_to_core(thread_idx, core_offset, slot_state, PTO2SubtaskSlot::AIV0, to_pending, block_idx);
+        out_handles[0] = prepare_subtask_to_core(
+            thread_idx, core_offset, slot_state, PTO2SubtaskSlot::AIV0, to_pending, block_idx, force_gate
+        );
 #if SIMPLER_DFX
         sched_l2_swimlane_[thread_idx].phase_dispatch_count += 1;
 #endif
@@ -599,10 +607,10 @@ void SchedulerContext::dispatch_ready_tasks(
 // waiting for an ack the gated task never sends). Each staged core stays
 // pending_occupied while gated, so no second gated block stacks on it.
 //
-// Self-ring: release flips STAGING->DISPATCHED then rings the mask. A block staged
-// after that flip isn't in the mask release read, so this thread rings it here. The
-// seq_cst order between "OR mask then load early_dispatch_state" (here) and "store DISPATCHED
-// then read mask" (release) guarantees every gated core's doorbell fires.
+// Doorbell ownership: release flips STAGING->DISPATCHED and exchanges the shared
+// mask to claim its bits. A late stager ORs its bits, then fetch-and-clears only
+// those release did not take and rings them from its immutable local handles.
+// The seq_cst order guarantees every gated core has exactly one writer.
 int32_t SchedulerContext::stage_consumer_blocks(
     int32_t thread_idx, PTO2TaskSlotState *c, PTO2ResourceShape shape, int32_t start, int32_t count,
     CoreTracker::BitStates &idle, CoreTracker::BitStates &pend
@@ -611,13 +619,13 @@ int32_t SchedulerContext::stage_consumer_blocks(
     // Stamp the real pre-stage time (NOT 0) so the swimlane shows these blocks
     // dispatched during the producer's run, not at trace start.
     uint64_t early_dispatch_ts = get_sys_cnt_aicpu();
-    uint64_t my_cores[PTO2_EARLY_DISPATCH_CORE_MASK_WORDS] = {0};  // cores this thread gated (for self-ring)
+    uint64_t my_cores[PTO2_EARLY_DISPATCH_CORE_MASK_WORDS] = {0};  // cores gated by this staging pass
     int32_t staged = 0;
     int32_t block = start;
     // Mirror the normal flush_publish (scheduler_dispatch.cpp wmb()+publish loop):
     // prepare ALL claimed blocks' payloads (idle bucket -> running slot, pend bucket
     // -> gated pending), then ONE wmb(), then publish. The wmb guarantees the
-    // not_ready gate + args are globally visible before any DATA_MAIN_BASE token —
+    // src_payload gate + source args are globally visible before any DATA_MAIN_BASE token —
     // without it a gated core can pick up the token and dcci a stale payload. The
     // shared `count` budget bounds total blocks <= free clusters/cores, so both
     // buckets fit one handles[] buffer.
@@ -626,7 +634,9 @@ int32_t SchedulerContext::stage_consumer_blocks(
     auto prepare_from = [&](CoreTracker::BitStates &avail, bool to_pending) {
         while (count > 0 && avail.has_value()) {
             int32_t core_offset = avail.pop_first();
-            n += prepare_block_for_dispatch(thread_idx, core_offset, *c, shape, to_pending, block, &handles[n]);
+            n += prepare_block_for_dispatch(
+                thread_idx, core_offset, *c, shape, to_pending, block, &handles[n], /*force_gate=*/true
+            );
             block++;
             count--;
             staged++;
@@ -650,27 +660,34 @@ int32_t SchedulerContext::stage_consumer_blocks(
         if (my_cores[w] != 0) c->payload->staged_core_mask[w].fetch_or(my_cores[w], std::memory_order_seq_cst);
 
     // Full publication and release are independent events. The seq_cst
-    // count/state rechecks form a two-sided handshake: release propagates if
-    // publication won, and the final stager propagates if release won.
-    sched_->record_published_blocks(*c, staged);
+    // state/launch/count operations form a two-sided handshake. A released
+    // block must ring before contributing to the publication count.
     bool released = staged > 0 &&
                     c->payload->early_dispatch_state.load(std::memory_order_seq_cst) == PTO2_EARLY_DISPATCH_DISPATCHED;
 
-    // If release already flipped DISPATCHED, it may have read the mask before our
-    // bits landed — ring our own cores so none is left gated forever.
+    // Claim only bits the release path did not take. Local handles remain valid
+    // even if the shared per-core table is reused before this thread resumes.
     if (released) {
+        uint64_t owned[PTO2_EARLY_DISPATCH_CORE_MASK_WORDS] = {0};
         for (int w = 0; w < PTO2_EARLY_DISPATCH_CORE_MASK_WORDS; w++) {
-            uint64_t bits = my_cores[w];
-            while (bits != 0) {
-                int cid = w * 64 + __builtin_ctzll(bits);
-                bits &= bits - 1;
-                PTO2SchedulerState::ring_one_doorbell(
-                    sched_->early_dispatch_doorbell_table[cid].addr, sched_->early_dispatch_doorbell_table[cid].token
-                );
+            if (my_cores[w] != 0) {
+                owned[w] =
+                    PTO2SchedulerState::claim_late_staged_doorbell_bits(c->payload->staged_core_mask[w], my_cores[w]);
             }
         }
+        for (int i = 0; i < n; i++) {
+            int32_t cid = tracker.get_core_id_by_offset(handles[i].core_offset);
+            PTO2SchedulerState::ring_claimed_local_doorbell(
+                owned[cid >> 6], cid, handles[i].reg_addr, handles[i].reg_task_id
+            );
+        }
+        wmb();
     }
-    if (released) sched_->propagate_dispatch_fanin(*c);
+    sched_->record_published_blocks(*c, staged);
+    // Retry unconditionally after publication. The guards are cheap, and a
+    // pre-ring state read can become stale if release completes before this
+    // count update.
+    sched_->propagate_dispatch_fanin(*c);
     return staged;
 }
 
