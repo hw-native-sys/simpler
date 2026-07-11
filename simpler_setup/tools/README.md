@@ -230,6 +230,13 @@ buckets by callable hash `hid`, and reports each callable's mean `simpler_run`
 plus per-stage means. It reads the host-emitted `[STRACE]` lines and shows the
 host stages (`bind`/`runner_run`/`validate`) alongside the AICPU phases.
 
+`--tree` renders one nested span tree per callable; each node's duration is the
+**median across every invocation** of that callable (not one invocation's
+value). This matters for a callable whose invocations differ in cost — e.g.
+qwen3 decode, where the pypto-serving profile warmup dispatches a tiny-KV step
+(seq_len≈257, ~28 ms) before the real 3.5k-context steps (~40 ms); a
+single-invocation tree would report the warmup value.
+
 `--rounds-table` renders one row per invocation of the busiest `hid` —
 **Host** always, plus **Device / Effective / Orch / Sched** when present, in the
 format `tools/benchmark_rounds.sh` parses. `Effective` is the orch∪sched merged
