@@ -25,9 +25,11 @@
 #include <stdarg.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #include "aicpu/dep_gen_collector_aicpu.h"
 #include "common/dep_gen.h"
+#include "common/platform_config.h"
 #include "common/unified_log.h"
 #include "pto_dep_compute.h"
 #include "pto_runtime2_types.h"
@@ -100,7 +102,18 @@ __attribute__((weak, visibility("hidden"))) volatile uint32_t *get_reg_ptr(uint6
 // With hidden visibility, the HOST .so does not export this symbol globally,
 // so the AICPU .so's PLT resolves to its own strong definition from
 // device_time.cpp.
-__attribute__((weak, visibility("hidden"))) uint64_t get_sys_cnt_aicpu() { return 0; }
+__attribute__((weak, visibility("hidden"))) uint64_t get_sys_cnt_aicpu() {
+    // Host fallback: monotonic wall-clock in AICPU cycle units so the host-orch
+    // deadlock/timeout backstops fire at their intended wall-clock (see the
+    // detailed rationale on the same fallback in pto_runtime2.cpp).
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    // Scale sec and nsec separately (divisor is the constant 1e9): avoids a
+    // div-by-zero when PLATFORM_PROF_SYS_CNT_FREQ >= 1 GHz and the truncation
+    // error a `1e9 / FREQ` divisor would introduce for non-dividing frequencies.
+    return static_cast<uint64_t>(ts.tv_sec) * PLATFORM_PROF_SYS_CNT_FREQ +
+           static_cast<uint64_t>(ts.tv_nsec) * PLATFORM_PROF_SYS_CNT_FREQ / 1000000000ull;
+}
 // Weak fallback for builds that don't link l2_swimlane_collector_aicpu.cpp.
 // The strong symbol from the AICPU build wins when profiling is available.
 // Also hidden to prevent HOST .so from polluting the global symbol table.
@@ -150,7 +163,18 @@ uint64_t g_orch_scope_end_atomic_count = 0;
 #elif SIMPLER_DFX
 #include "aicpu/device_time.h"
 #include "aicpu/l2_swimlane_collector_aicpu.h"
-__attribute__((weak, visibility("hidden"))) uint64_t get_sys_cnt_aicpu() { return 0; }
+__attribute__((weak, visibility("hidden"))) uint64_t get_sys_cnt_aicpu() {
+    // Host fallback: monotonic wall-clock in AICPU cycle units so the host-orch
+    // deadlock/timeout backstops fire at their intended wall-clock (see the
+    // detailed rationale on the same fallback in pto_runtime2.cpp).
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    // Scale sec and nsec separately (divisor is the constant 1e9): avoids a
+    // div-by-zero when PLATFORM_PROF_SYS_CNT_FREQ >= 1 GHz and the truncation
+    // error a `1e9 / FREQ` divisor would introduce for non-dividing frequencies.
+    return static_cast<uint64_t>(ts.tv_sec) * PLATFORM_PROF_SYS_CNT_FREQ +
+           static_cast<uint64_t>(ts.tv_nsec) * PLATFORM_PROF_SYS_CNT_FREQ / 1000000000ull;
+}
 __attribute__((weak, visibility("hidden"))) void
 l2_swimlane_aicpu_record_orch_phase(uint64_t, uint64_t, uint64_t, uint32_t) {}
 // submit_idx needed for swimlane task_id tagging (no cycle accumulation at this level)
