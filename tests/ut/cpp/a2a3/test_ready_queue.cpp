@@ -181,6 +181,31 @@ TEST_F(ReadyQueueTest, PopBatchPartial) {
     }
 }
 
+TEST_F(ReadyQueueTest, TaggedBatchPopPreservesTaskGeneration) {
+    PTO2TaskSlotState items[2];
+    PTO2TaskSlotState *input[2]{&items[0], &items[1]};
+    constexpr uint64_t queued_task_ids[2]{0x123456789abcdef0ULL, 0x0fedcba987654321ULL};
+    queue.push_batch_tagged(input, queued_task_ids, 2);
+
+    PTO2TaskSlotState *out[2];
+    uint64_t task_id_snapshots[2]{};
+    ASSERT_EQ(queue.pop_batch_tagged(out, task_id_snapshots, 2), 2);
+    EXPECT_EQ(out[0], &items[0]);
+    EXPECT_EQ(out[1], &items[1]);
+    EXPECT_EQ(task_id_snapshots[0], queued_task_ids[0]);
+    EXPECT_EQ(task_id_snapshots[1], queued_task_ids[1]);
+}
+
+TEST_F(ReadyQueueTest, TaggedPopPreservesTaskGeneration) {
+    PTO2TaskSlotState item;
+    constexpr uint64_t queued_task_id = 0xfedcba9876543210ULL;
+    ASSERT_TRUE(queue.push_tagged(&item, queued_task_id));
+
+    uint64_t task_id_snapshot = 0;
+    EXPECT_EQ(queue.pop_tagged(&task_id_snapshot), &item);
+    EXPECT_EQ(task_id_snapshot, queued_task_id);
+}
+
 TEST_F(ReadyQueueTest, PopBatchEmpty) {
     PTO2TaskSlotState *out[5];
     int popped = queue.pop_batch(out, 5);

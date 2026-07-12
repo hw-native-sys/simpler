@@ -22,7 +22,7 @@
 set -u
 
 REQUESTED="${1:-}"
-CACHE="/tmp/onboard-arch-precheck.cache"
+CACHE="${TMPDIR:-/tmp}/onboard-arch-precheck-$(id -u).cache"
 TTL=3600   # 1 hour
 
 if [ -z "$REQUESTED" ]; then

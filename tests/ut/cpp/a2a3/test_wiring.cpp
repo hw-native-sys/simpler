@@ -54,6 +54,7 @@ protected:
     // payload, and the scheduler's release/propagate paths dereference it.
     static constexpr int kSlotPayloadPoolSize = 16;
     PTO2TaskPayload slot_payload_pool_[kSlotPayloadPoolSize];
+    PTO2TaskDescriptor slot_task_pool_[kSlotPayloadPoolSize];
     int slot_payload_pool_idx_ = 0;
 
     void SetUp() override {
@@ -93,6 +94,9 @@ protected:
         PTO2TaskPayload &slot_pl = slot_payload_pool_[slot_payload_pool_idx_++ % kSlotPayloadPoolSize];
         memset(&slot_pl, 0, sizeof(slot_pl));
         slot.payload = &slot_pl;
+        PTO2TaskDescriptor &slot_task = slot_task_pool_[(slot_payload_pool_idx_ - 1) % kSlotPayloadPoolSize];
+        memset(&slot_task, 0, sizeof(slot_task));
+        slot.task = &slot_task;
     }
 
     void publish_no_fanin(PTO2TaskSlotState &slot) {

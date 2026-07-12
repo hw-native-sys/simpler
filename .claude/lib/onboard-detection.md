@@ -31,12 +31,14 @@ bugs. Both detecting the platform and refusing a mismatch are handled by the
    .claude/skills/onboard-arch-precheck/check.sh "$ARCH" || exit 1
    ```
 
-3. The gate caches the *detected* arch at `/tmp/onboard-arch-precheck.cache`
+3. The gate caches the *detected* arch at
+   `${TMPDIR:-/tmp}/onboard-arch-precheck-<uid>.cache`
    (`arch|soc|short_soc`). Use that as the authoritative platform instead of
    re-parsing `npu-smi`:
 
    ```bash
-   PLATFORM=$(cut -d'|' -f1 /tmp/onboard-arch-precheck.cache)
+   CACHE="${TMPDIR:-/tmp}/onboard-arch-precheck-$(id -u).cache"
+   PLATFORM=$(cut -d'|' -f1 "$CACHE")
    ```
 
 ## B. Platform (simulation)

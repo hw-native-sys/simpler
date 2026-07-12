@@ -105,7 +105,7 @@ Pipeline:
 
 The skill **never hardcodes "this box is a2a3"** — every check
 re-derives the answer from `npu-smi` + the CANN ini files. The result
-is cached at `/tmp/onboard-arch-precheck.cache` (format
+is cached at `${TMPDIR:-/tmp}/onboard-arch-precheck-<uid>.cache` (format
 `arch|soc|short_soc`) with a 1-hour TTL so repeat invocations stay fast
 (~5 ms). Mismatch errors include the specific SoC + Short_SoC_version
 so you know exactly what silicon was detected (e.g.

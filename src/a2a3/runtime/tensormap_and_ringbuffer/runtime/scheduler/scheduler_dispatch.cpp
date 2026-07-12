@@ -717,6 +717,7 @@ SchedulerContext::early_dispatch_shape(int32_t thread_idx, PTO2ResourceShape sha
 
     int32_t total_staged = 0;
     PTO2TaskSlotState *batch[CoreTracker::MAX_CLUSTERS * 3];
+    uint64_t task_id_snapshots[CoreTracker::MAX_CLUSTERS * 3];
     // Batch-pop in one queue op (fewer CAS than one pop per consumer); the pop is
     // bounded by the shape's capacity so the stack buffer always holds it. Then for
     // each consumer: CLAIM a range sized to THIS thread's free cores by advancing
@@ -728,9 +729,10 @@ SchedulerContext::early_dispatch_shape(int32_t thread_idx, PTO2ResourceShape sha
     // is filled by all idle threads in parallel. When cores run out mid-batch the
     // unprocessed remainder is pushed back for peers (mirrors normal's push_batch of
     // the unconsumed tail).
-    int got = sched_->early_dispatch_queues[s].pop_batch(batch, cores.count());
+    int got = sched_->early_dispatch_queues[s].pop_batch_tagged(batch, task_id_snapshots, cores.count());
     for (int bi = 0; bi < got; bi++) {
         PTO2TaskSlotState *c = batch[bi];
+        if (static_cast<uint64_t>(c->task->task_id.raw) != task_id_snapshots[bi]) continue;
         if (c->payload->early_dispatch_state.load(std::memory_order_acquire) != PTO2_EARLY_DISPATCH_STAGING)
             continue;  // released
 
@@ -756,7 +758,7 @@ SchedulerContext::early_dispatch_shape(int32_t thread_idx, PTO2ResourceShape sha
         }
         int32_t freecores = bucket.has_value() ? bucket.count() : 0;
         if (freecores == 0) {  // no cores for this shape+phase — give this + the unprocessed rest back
-            sched_->early_dispatch_queues[s].push_batch(&batch[bi], got - bi);
+            sched_->early_dispatch_queues[s].push_batch_tagged(&batch[bi], &task_id_snapshots[bi], got - bi);
             break;
         }
         int32_t start = 0;
@@ -764,7 +766,7 @@ SchedulerContext::early_dispatch_shape(int32_t thread_idx, PTO2ResourceShape sha
         if (claim == 0) continue;  // nothing left to claim -> drop (no re-push)
         // Re-push for concurrent peers BEFORE the expensive staging.
         if (start + claim < c->logical_block_num) {
-            if (!sched_->early_dispatch_queues[s].push(c))
+            if (!sched_->early_dispatch_queues[s].push_tagged(c, task_id_snapshots[bi]))
                 LOG_INFO_V9(
                     "[EARLY_DISPATCH] queue full on re-push, consumer=%" PRId64,
                     static_cast<int64_t>(c->task->task_id.raw)
@@ -814,8 +816,11 @@ int32_t SchedulerContext::try_early_dispatch(
     // block_num) => cancel the owner and re-push or transfer its final ready route. A
     // non-STAGING pop was already released and is dropped. Staging happens inside the drain,
     // so this arms at most one drain and adds no blocks to total_staged here.
-    if (PTO2TaskSlotState *c = sched_->early_sync_start_queue.pop()) {
-        if (PTO2SchedulerState::try_claim_early_sync_drain(*c->payload)) {
+    uint64_t sync_task_id_snapshot = 0;
+    if (PTO2TaskSlotState *c = sched_->early_sync_start_queue.pop_tagged(&sync_task_id_snapshot)) {
+        bool current_sync_task = static_cast<uint64_t>(c->task->task_id.raw) == sync_task_id_snapshot &&
+                                 c->active_mask.requires_sync_start();
+        if (current_sync_task && PTO2SchedulerState::try_claim_early_sync_drain(*c->payload)) {
             if (c->payload->early_dispatch_state.load(std::memory_order_seq_cst) != PTO2_EARLY_DISPATCH_STAGING) {
                 sched_->cancel_early_sync_drain(*c);
             } else if (enter_drain_mode(c, c->logical_block_num)) {

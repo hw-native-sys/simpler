@@ -54,8 +54,8 @@ styles**. They measure different things; don't confuse them:
   `examples/model/qwen3_14b/npu_generate.py`, flags `--model-dir --prompt
   --max-seq-len --max-new-tokens --num-layers-override --profile[-verbose]`.
   Measures **end-to-end prefill/decode TPOT** for the whole model; read via
-  the `--profile` report + `device_log_timing` (§2–§5). Use it to reproduce
-  a serving perf number or chase a serving `507018`.
+  the `--profile` report + `strace_timing --rounds-table` (§2–§5). Use it
+  to reproduce a serving perf number or chase a serving `507018`.
 - **Path B — `decode_layer` kernel (pypto-lib).** A single JIT case for one
   decode layer, not the engine. Entry
   `models/qwen3/14b/decode_layer.py`, flags `-p <platform> -d <device>`,
@@ -117,7 +117,8 @@ task-submit --timeout 2400 --max-time 2400 --device auto --device-num 1 --run "\
 
 - `--num-layers-override 40` = full model; `--profile[-verbose]` prints the
   timing report (`api.run_decode` per-step = end-to-end TPOT, `kernel.decode_layer`
-  host wall, per-step layer breakdown).
+  host wall, per-step layer breakdown) plus `strace_timing --rounds-table`
+  (§2–§5).
 - Decode dispatches through the **L3 `DistributedWorker`**, which forks a
   **chip-child (L2)** that runs `run_prepared`. The per-step timing lives at
   **L2**: `run_prepared` computes both host (`host_wall`) and device
@@ -196,14 +197,14 @@ Redirect the CANN device log out of the shared default, then parse it:
 export ASCEND_PROCESS_LOG_PATH="$PWD/build/pypto-serving/build_output/ascend"
 mkdir -p "$ASCEND_PROCESS_LOG_PATH"
 # after the run (local, no device):
-$PY -m simpler_setup.tools.device_log_timing \
-    --device-log "$ASCEND_PROCESS_LOG_PATH/device-*/device-*.log"
+$PY -m simpler_setup.tools.strace_timing \
+    "$ASCEND_PROCESS_LOG_PATH/device-*/device-*.log" --rounds-table
 ```
 
-`device_log_timing` reports per-round **Total / Orch / Sched** from the
-`SIMPLER_DFX` markers (on by default, no swimlane needed). Round 0 is the
-prefill; the rest are decode steps. **Total ≈ on-device kernel makespan** =
-the "kernel run time" layer.
+`strace_timing --rounds-table` reports per-round **Device / Orch / Sched**
+from the `[STRACE]` markers (on by default, no swimlane needed). Round 0 is
+the prefill; the rest are decode steps. **Device ≈ on-device kernel
+makespan** = the "kernel run time" layer.
 
 For layers ②③④ — the host↔device and bind/validate spans — parse the
 `[STRACE]` host-trace markers with `strace_timing.py` (landed in
@@ -224,7 +225,7 @@ The full per-token decomposition (what each layer means / how to get it):
 
 | layer | = | source |
 | ----- | - | ------ |
-| ① kernel run time | makespan | `device_log_timing` Total |
+| ① kernel run time | makespan | `strace_timing --rounds-table` Device |
 | ② device init/finalize | `device_wall − makespan` | `strace_timing` (`[STRACE]` markers) |
 | ③ host↔device handshake | `runner_run − device_wall` | `strace_timing` (`runner_run` span) |
 | ④ attach+bind+validate | `host_wall − runner_run` | `strace_timing` (`bind`/`validate` spans) |

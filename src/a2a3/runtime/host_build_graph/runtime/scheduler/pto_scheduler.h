@@ -61,6 +61,7 @@
 struct PTO2ReadyQueueSlot {
     std::atomic<int64_t> sequence;
     PTO2TaskSlotState *slot_state;
+    uint64_t task_id_snapshot;
 };
 
 /**
@@ -91,7 +92,9 @@ struct alignas(64) PTO2ReadyQueue {
         return (e >= d) ? (e - d) : 0;
     }
 
-    bool push(PTO2TaskSlotState *slot_state) {
+    bool push(PTO2TaskSlotState *slot_state) { return push_tagged(slot_state, 0); }
+
+    bool push_tagged(PTO2TaskSlotState *slot_state, uint64_t task_id_snapshot) {
         uint64_t pos;
         PTO2ReadyQueueSlot *slot;
         while (true) {
@@ -111,13 +114,16 @@ struct alignas(64) PTO2ReadyQueue {
         }
 
         slot->slot_state = slot_state;
+        slot->task_id_snapshot = task_id_snapshot;
         slot->sequence.store(static_cast<int64_t>(pos + 1), std::memory_order_release);
         return true;
     }
 
     // Batch push: reserve count slots with a single CAS after confirming
     // every target slot is available under the usual Vyukov sequence check.
-    void push_batch(PTO2TaskSlotState **items, int count) {
+    void push_batch(PTO2TaskSlotState **items, int count) { push_batch_tagged(items, nullptr, count); }
+
+    void push_batch_tagged(PTO2TaskSlotState **items, const uint64_t *task_id_snapshots, int count) {
         if (count == 0) return;
 
         uint64_t pos;
@@ -146,6 +152,7 @@ struct alignas(64) PTO2ReadyQueue {
         for (int i = 0; i < count; i++) {
             PTO2ReadyQueueSlot *slot = &slots[(pos + i) & mask];
             slot->slot_state = items[i];
+            slot->task_id_snapshot = task_id_snapshots == nullptr ? 0 : task_id_snapshots[i];
             slot->sequence.store(static_cast<int64_t>(pos + i + 1), std::memory_order_release);
         }
     }
@@ -190,7 +197,9 @@ struct alignas(64) PTO2ReadyQueue {
     }
 #endif
 
-    PTO2TaskSlotState *pop() {
+    PTO2TaskSlotState *pop() { return pop_tagged(nullptr); }
+
+    PTO2TaskSlotState *pop_tagged(uint64_t *task_id_snapshot) {
         // Fast-path: skip slot load when queue is clearly empty
         uint64_t d = dequeue_pos.load(std::memory_order_relaxed);
         uint64_t e = enqueue_pos.load(std::memory_order_relaxed);
@@ -216,6 +225,7 @@ struct alignas(64) PTO2ReadyQueue {
         }
 
         PTO2TaskSlotState *result = slot->slot_state;
+        if (task_id_snapshot != nullptr) *task_id_snapshot = slot->task_id_snapshot;
         slot->sequence.store(static_cast<int64_t>(pos + mask + 1), std::memory_order_release);
         return result;
     }
@@ -271,7 +281,9 @@ struct alignas(64) PTO2ReadyQueue {
 
     // Batch pop: reserve a contiguous run of ready slots with a single CAS.
     // Returns actual number of items popped (may be less than max_count).
-    int pop_batch(PTO2TaskSlotState **out, int max_count) {
+    int pop_batch(PTO2TaskSlotState **out, int max_count) { return pop_batch_tagged(out, nullptr, max_count); }
+
+    int pop_batch_tagged(PTO2TaskSlotState **out, uint64_t *task_id_snapshots, int max_count) {
         uint64_t pos;
         int count;
         while (true) {
@@ -303,6 +315,7 @@ struct alignas(64) PTO2ReadyQueue {
         for (int i = 0; i < count; i++) {
             PTO2ReadyQueueSlot *slot = &slots[(pos + i) & mask];
             out[i] = slot->slot_state;
+            if (task_id_snapshots != nullptr) task_id_snapshots[i] = slot->task_id_snapshot;
             slot->sequence.store(static_cast<int64_t>(pos + i + mask + 1), std::memory_order_release);
         }
         return count;
@@ -697,7 +710,7 @@ struct PTO2SchedulerState {
             return;
         }
         if (slot_state.payload->early_dispatch_state.load(std::memory_order_seq_cst) == PTO2_EARLY_DISPATCH_STAGING) {
-            early_sync_start_queue.push(&slot_state);
+            early_sync_start_queue.push_tagged(&slot_state, static_cast<uint64_t>(slot_state.task->task_id.raw));
         }
     }
 
@@ -807,8 +820,9 @@ struct PTO2SchedulerState {
                     expect, PTO2_EARLY_DISPATCH_STAGING, std::memory_order_seq_cst, std::memory_order_seq_cst
                 ))
                 continue;
-            if (c->active_mask.requires_sync_start()) early_sync_start_queue.push(c);
-            else early_dispatch_queues[static_cast<int32_t>(shape)].push(c);
+            uint64_t task_id = static_cast<uint64_t>(c->task->task_id.raw);
+            if (c->active_mask.requires_sync_start()) early_sync_start_queue.push_tagged(c, task_id);
+            else early_dispatch_queues[static_cast<int32_t>(shape)].push_tagged(c, task_id);
         }
     }
 
