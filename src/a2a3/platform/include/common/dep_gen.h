@@ -82,6 +82,7 @@ constexpr int DEP_GEN_MAX_EXPLICIT_DEPS = 64;
  */
 enum DepGenRecordFlags : uint32_t {
     DEP_GEN_FLAG_IN_MANUAL_SCOPE = 1u << 0,  // submit happened inside a manual scope
+    DEP_GEN_FLAG_EARLY_DISPATCH = 1u << 4,   // submit had allow_early_resolve set (flagged producer)
     DEP_GEN_FLAG_HAS_OVERFLOW = 1u << 1,     // base record: at least one overflow record follows
     DEP_GEN_FLAG_OVERFLOW = 1u << 2,         // this slot is a DepGenOverflowRecord, not a DepGenRecord
     DEP_GEN_FLAG_LAST_OVERFLOW = 1u << 3,    // overflow record: end of chain (no further overflow follows)

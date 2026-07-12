@@ -31,7 +31,7 @@
  *
  * Output format (deps.json, strided tensor representation):
  *
- *   {"tasks":   [{"task_id":<u64>, "scope":"auto|manual",
+ *   {"tasks":   [{"task_id":<u64>, "scope":"auto|manual", "early_dispatch":<bool>,
  *                 "args":[{"idx":<i32>, "type":"<arg_type>",
  *                          "tensor_id":<u64>, "dtype":"...", "shape":[...],
  *                          "start_offset":<u64>, "strides":[...]}, ...]}, ...],

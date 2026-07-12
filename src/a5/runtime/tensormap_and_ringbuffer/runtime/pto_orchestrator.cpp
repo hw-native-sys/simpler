@@ -57,7 +57,7 @@ static_assert(sizeof(Tensor) == DEP_GEN_TENSOR_SIZE, "DepGenRecord::tensors slot
 // (same pattern as get_sys_cnt_aicpu / l2_perf_aicpu_record_orch_phase below).
 extern "C" __attribute__((weak, visibility("hidden"))) bool is_dep_gen_enabled() { return false; }
 __attribute__((weak, visibility("hidden"))) void dep_gen_aicpu_record_submit(
-    uint64_t, bool, int, const void *const *, const uint8_t *, int, const uint64_t *, int, const int32_t[3]
+    uint64_t, bool, bool, int, const void *const *, const uint8_t *, int, const uint64_t *, int, const int32_t[3]
 ) {}
 
 #if SIMPLER_DFX
@@ -816,7 +816,7 @@ static TaskOutputTensors submit_task_common(
         }
         const int32_t kernel_ids_capture[3] = {aic_kernel_id, aiv0_kernel_id, aiv1_kernel_id};
         dep_gen_aicpu_record_submit(
-            task_id.raw, orch->in_manual_scope(), tc, tensor_ptrs, arg_types_u8,
+            task_id.raw, orch->in_manual_scope(), /*early_dispatch=*/false, tc, tensor_ptrs, arg_types_u8,
             static_cast<int>(args.explicit_dep_count()), reinterpret_cast<const uint64_t *>(args.explicit_deps_data()),
             args.launch_spec.core_num(), kernel_ids_capture
         );

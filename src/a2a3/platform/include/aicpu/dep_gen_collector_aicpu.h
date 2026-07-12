@@ -112,7 +112,7 @@ void dep_gen_aicpu_init();
  *                            hot path writing identity fields itself.
  */
 void dep_gen_aicpu_record_submit(
-    uint64_t task_id_raw, bool in_manual_scope, int tensor_count, const void *const *tensor_ptrs,
+    uint64_t task_id_raw, bool in_manual_scope, bool early_dispatch, int tensor_count, const void *const *tensor_ptrs,
     const uint8_t *arg_types, int explicit_dep_count, const uint64_t *explicit_deps_raw, int block_num,
     const int32_t kernel_ids[3]
 );

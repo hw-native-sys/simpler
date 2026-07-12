@@ -201,6 +201,7 @@ struct TaskArgEntry {
 struct TaskTableEntry {
     uint64_t task_id;
     bool in_manual_scope;
+    bool early_dispatch;
     int32_t kernel_id[3];  // per-subslot {AIC, AIV0, AIV1}, -1 = inactive
     uint32_t block_num;
     std::vector<TaskArgEntry> args;
@@ -324,6 +325,7 @@ bool write_deps_json(
         // pass these through int(...) and don't care which form they receive.
         out << "{\"task_id\":\"" << t.task_id << '"';
         out << ",\"scope\":\"" << (t.in_manual_scope ? "manual" : "auto") << '"';
+        out << ",\"early_dispatch\":" << (t.early_dispatch ? "true" : "false");
         // Per-subslot kernel ids {AIC, AIV0, AIV1}; INVALID_KERNEL_ID = -1 for
         // inactive subslots. Emitted as a plain int triple — downstream viewers
         // (and the swimlane host post-processor) use it to resolve task_id →
@@ -641,6 +643,7 @@ dep_gen_replay_emit_deps_json(const DepGenRecord *records, size_t num_records, c
         TaskTableEntry task_entry;
         task_entry.task_id = rec.task_id;
         task_entry.in_manual_scope = in_manual_scope;
+        task_entry.early_dispatch = (rec.flags & DEP_GEN_FLAG_EARLY_DISPATCH) != 0;
         task_entry.kernel_id[0] = rec.kernel_id[0];
         task_entry.kernel_id[1] = rec.kernel_id[1];
         task_entry.kernel_id[2] = rec.kernel_id[2];

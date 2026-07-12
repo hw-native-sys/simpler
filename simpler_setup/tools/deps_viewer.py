@@ -449,18 +449,19 @@ def _load_task_meta(deps_path, func_names=None):
     return meta
 
 
-def _label(task_id, meta, task_table, fmt_task):
+def _label(task_id, meta, task_table, fmt_task, marker=""):
     base = fmt_task(task_id)
+    pfx = f"{marker} " if marker else ""
     normalized_task_id = _normalize_task_id(task_id)
     kind = _task_kind(normalized_task_id, meta, task_table)
     if kind == "alloc":
-        return f"{base} · alloc"
+        return f"{pfx}{base} · alloc"
     if kind == "dummy":
-        return f"{base} · dummy"
+        return f"{pfx}{base} · dummy"
     func_name = (meta.get(normalized_task_id) or {}).get("func_name")
     if func_name:
-        return f"{base} · {func_name}"
-    return base
+        return f"{pfx}{base} · {func_name}"
+    return f"{pfx}{base}"
 
 
 _CORE_STYLE = {
@@ -569,12 +570,13 @@ def _arg_row_html(arg, tensor_table, side):
     return f'<TR><TD ALIGN="LEFT" PORT="{port}" BGCOLOR="{bg}">{body}</TD></TR>'
 
 
-def _task_node_html(task_id, task_entry, meta_entry, tensor_table, fmt_task):
+def _task_node_html(task_id, task_entry, meta_entry, tensor_table, fmt_task, marker=""):
     """Build a Graphviz HTML-like label for a task node showing:
         - input rows (top)     INPUT + INOUT slots
-        - identity header      "(ring, local)"
+        - identity header      "<marker> (ring, local) · <func_name>"
         - output rows (bottom) INOUT + OUTPUT_EXISTING + OUTPUT slots
     INOUT slots appear in BOTH compartments (read-then-write semantics).
+    ``marker`` is the 🔥 / ⭐ early-dispatch badge (empty for most tasks).
     """
     args = task_entry.get("args") if task_entry else None
     if not isinstance(args, list):
@@ -585,10 +587,17 @@ def _task_node_html(task_id, task_entry, meta_entry, tensor_table, fmt_task):
     header_bg = _CORE_HEADER_COLOR.get(core_type if isinstance(core_type, str) else "", _HEADER_FALLBACK)
     border_attrs = f'BORDER="1" COLOR="{_SPMD_COLOR}"' if _task_block_num(task_entry) > 1 else 'BORDER="0"'
 
+    ident = fmt_task(task_id)
+    func_name = meta_entry.get("func_name") if meta_entry else None
+    if func_name:
+        ident = f"{ident} · {func_name}"
+    if marker:
+        ident = f"{marker} {ident}"
+
     rows = []
     for a in inputs:
         rows.append(_arg_row_html(a, tensor_table, "in"))
-    rows.append(f'<TR><TD ALIGN="CENTER" BGCOLOR="{header_bg}"><B>{_html_escape(fmt_task(task_id))}</B></TD></TR>')
+    rows.append(f'<TR><TD ALIGN="CENTER" BGCOLOR="{header_bg}"><B>{_html_escape(ident)}</B></TD></TR>')
     for a in outputs:
         rows.append(_arg_row_html(a, tensor_table, "out"))
 
@@ -654,7 +663,7 @@ def _task_blocks_text(task_entry):
     return f"SPMD block num = {block_num}"
 
 
-def _plain_node_attrs(task_id, meta, task_table, fmt_task):
+def _plain_node_attrs(task_id, meta, task_table, fmt_task, marker=""):
     meta_entry = meta.get(task_id)
     kind = _task_kind(task_id, meta, task_table)
     if kind == "submit" and meta_entry:
@@ -665,7 +674,7 @@ def _plain_node_attrs(task_id, meta, task_table, fmt_task):
         style = _DEFAULT_STYLE
 
     task_entry = task_table.get(task_id)
-    label = _dot_escape_label(_label(task_id, meta, task_table, fmt_task))
+    label = _dot_escape_label(_label(task_id, meta, task_table, fmt_task, marker=marker))
     label_attr = f'label="{label}"'
     style_attr = style["style"]
     if _task_block_num(task_entry) > 1:
@@ -741,6 +750,32 @@ def emit_text(edges, nodes, meta, deps_path, annotations=None, tensor_table=None
     return "\n".join(lines) + "\n"
 
 
+def _task_markers(nodes, edges, task_table):
+    """Map task_id -> marker string for the node label.
+
+    🔥 (fire): the task itself is a flagged early-dispatch producer
+        (deps.json ``early_dispatch`` — the submit had allow_early_resolve).
+    ⭐ (star): every one of the task's predecessors is 🔥 (and it has at
+        least one), so the task is fully fed by flagged producers.
+    A task can carry both.
+    """
+    pred_map: dict[int, set] = {}
+    for pred, succ in edges:
+        pred_map.setdefault(succ, set()).add(pred)
+
+    def _flagged(tid):
+        return bool((task_table.get(tid) or {}).get("early_dispatch"))
+
+    markers = {}
+    for tid in nodes:
+        fire = "🔥" if _flagged(tid) else ""
+        preds = pred_map.get(tid, set())
+        star = "⭐" if preds and all(_flagged(p) for p in preds) else ""
+        if fire or star:
+            markers[tid] = fire + star
+    return markers
+
+
 def emit_dot(
     edges,
     nodes,
@@ -772,6 +807,7 @@ def emit_dot(
     task_table = task_table or {}
     hidden_edges = set(hidden_edges or ())
     show_tensor = bool(task_table) if show_tensor_info is None else bool(show_tensor_info and task_table)
+    markers = _task_markers(nodes, edges, task_table)
     lines = [
         "digraph deps {",
         f"  rankdir={direction};",
@@ -781,11 +817,12 @@ def emit_dot(
     ]
     for n in nodes:
         m = meta.get(n)
+        marker = markers.get(n, "")
         if show_tensor and n in task_table:
-            html = _task_node_html(n, task_table.get(n), m, tensor_table, fmt_task)
+            html = _task_node_html(n, task_table.get(n), m, tensor_table, fmt_task, marker=marker)
             lines.append(f"  {_node_id(n)} [shape=none, margin=0, label=<{html}>];")
             continue
-        lines.append(f"  {_node_id(n)} [{_plain_node_attrs(n, meta, task_table, fmt_task)}];")
+        lines.append(f"  {_node_id(n)} [{_plain_node_attrs(n, meta, task_table, fmt_task, marker=marker)}];")
 
     def edge_attr_str(edge_attrs):
         return (" [" + ", ".join(edge_attrs) + "]") if edge_attrs else ""
