@@ -23,19 +23,37 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #include <algorithm>
 
 #include "aicpu/device_time.h"
+#include "common/platform_config.h"
 #include "common/unified_log.h"
 #if SIMPLER_DFX
 #include "aicpu/scope_stats_collector_aicpu.h"
 #endif
 
-// Weak fallback for HOST .so builds (never called, but satisfies linker).
-// The AICPU build links the strong symbol from platform/.../device_time.cpp.
-// Hidden visibility prevents HOST .so from polluting global symbol table.
-__attribute__((weak, visibility("hidden"))) uint64_t get_sys_cnt_aicpu() { return 0; }
+// Host fallback for the host-orchestration path. The AICPU cycle counter is a
+// device register unavailable on the host, so return a monotonic wall-clock
+// scaled to that counter's cycle units (PLATFORM_PROF_SYS_CNT_FREQ). The
+// cycle-denominated deadlock/timeout backstops that run during host orchestration
+// (PTO2_ALLOC_DEADLOCK_TIMEOUT_CYCLES in the ring/heap/fanin allocators,
+// PTO2_TENSOR_DATA_TIMEOUT_CYCLES in wait_for_tensor_ready) then fire at their
+// intended wall-clock. A constant 0 made those backstops no-ops, so a
+// ring/heap/fanin-pool overflow spun forever instead of failing cleanly (host-orch
+// holds the whole graph and cannot reclaim mid-build). The AICPU build links the
+// strong device counter from device_time.cpp; hidden visibility keeps this off
+// the global dynamic symbol table.
+__attribute__((weak, visibility("hidden"))) uint64_t get_sys_cnt_aicpu() {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    // Scale sec and nsec separately (divisor is the constant 1e9): avoids a
+    // div-by-zero when PLATFORM_PROF_SYS_CNT_FREQ >= 1 GHz and the truncation
+    // error a `1e9 / FREQ` divisor would introduce for non-dividing frequencies.
+    return static_cast<uint64_t>(ts.tv_sec) * PLATFORM_PROF_SYS_CNT_FREQ +
+           static_cast<uint64_t>(ts.tv_nsec) * PLATFORM_PROF_SYS_CNT_FREQ / 1000000000ull;
+}
 
 // =============================================================================
 // Orchestration Ops Table (function-pointer dispatch for orchestration .so)
