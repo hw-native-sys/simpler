@@ -17,6 +17,7 @@
 #include "common.h"  // debug_assert
 
 #include "common/unified_log.h"
+#include "aicpu/aicpu_device_config.h"
 #include "aicpu/device_time.h"
 #include "aicpu/platform_regs.h"
 #include "callable.h"
@@ -977,6 +978,15 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
     // "now" so the first budget cycle starts when this thread does, not at
     // an undefined value.
     uint64_t last_progress_ts = get_sys_cnt_aicpu();
+    // Per-device override latched once at worker init by simpler_aicpu_init
+    // (InitArgs.scheduler_timeout_ms -> resident-SO global). 0 means no
+    // override; fall back to the compile-time SCHEDULER_TIMEOUT_CYCLES.
+    uint64_t scheduler_timeout_cycles = SCHEDULER_TIMEOUT_CYCLES;
+    const int32_t scheduler_timeout_ms_override = get_scheduler_timeout_ms();
+    if (scheduler_timeout_ms_override > 0) {
+        scheduler_timeout_cycles =
+            static_cast<uint64_t>(scheduler_timeout_ms_override) * PLATFORM_PROF_SYS_CNT_FREQ / 1000;
+    }
     while (true) {
         if (completed_.load(std::memory_order_acquire)) {
             break;
@@ -1374,7 +1384,7 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
             // case) — refresh last_progress_ts and keep spinning. The
             // STALL diagnostic above still fires periodically so
             // observability is preserved.
-            if (get_sys_cnt_aicpu() - last_progress_ts > SCHEDULER_TIMEOUT_CYCLES) {
+            if (get_sys_cnt_aicpu() - last_progress_ts > scheduler_timeout_cycles) {
                 bool self_owns = self_owns_running_task(thread_idx);
                 bool global_stuck = !self_owns && total_tasks_ > 0 &&
                                     completed_tasks_.load(std::memory_order_relaxed) < total_tasks_ &&

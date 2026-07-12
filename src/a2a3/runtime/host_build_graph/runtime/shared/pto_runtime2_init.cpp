@@ -228,7 +228,13 @@ void PTO2SchedulerState::destroy() {
 PTO2OrchestratorLayout
 PTO2OrchestratorState::reserve_layout(DeviceArena &arena, int32_t task_window_size, int32_t dep_pool_capacity) {
     PTO2OrchestratorLayout layout{};
-    layout.scope_tasks_cap = PTO2_SCOPE_TASKS_CAP;
+    // scope_tasks holds every task in the open scope, so its cap is the real
+    // in-flight budget = the (runtime) task window. Using the compile-time
+    // PTO2_SCOPE_TASKS_CAP instead under-sized the buffer when ring_task_window
+    // was enlarged past the default (premature SCOPE_TASKS_OVERFLOW) and
+    // over-allocated it when shrunk. See issue #1188.
+    always_assert(task_window_size > 0);
+    layout.scope_tasks_cap = task_window_size;
     layout.scope_stack_capacity = PTO2_MAX_SCOPE_DEPTH;
     layout.dep_pool_capacity = dep_pool_capacity;
 
