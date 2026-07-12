@@ -361,8 +361,20 @@ def _merge_task_meta_with_kernel_ids(meta, task_table, func_names=None):
             entry["func_labels"] = [
                 func_names.get(str(slot)) or func_names.get(slot) or f"f{slot}" if slot >= 0 else "-1" for slot in slots
             ]
-            if not entry.get("func_name") and entry["func_labels"]:
-                entry["func_name"] = entry["func_labels"][0]
+            # func_name = the ACTIVE slots' names, order-preserving-deduped.
+            # kernel_ids is [aic, aiv0, aiv1]: an AIC-only task shows the AIC
+            # name, an AIV-only task the AIV name (never the inactive slot's
+            # "-1"), and a MIX task both (e.g. "paged_attention_cce_aic +
+            # paged_attention_cce_aiv"). aiv0/aiv1 usually carry the same
+            # func_id (one AIV kernel on two cores), so the dedup collapses
+            # them to one name.
+            if not entry.get("func_name"):
+                active_names = []
+                for fid in valid_ids:
+                    nm = func_names.get(str(fid)) or func_names.get(fid) or f"f{fid}"
+                    if nm not in active_names:
+                        active_names.append(nm)
+                entry["func_name"] = " + ".join(active_names)
         elif any(s >= 0 for s in slots):
             entry["func_labels"] = [f"f{slot}" if slot >= 0 else "-1" for slot in slots]
         if not entry.get("core_type"):
@@ -445,6 +457,9 @@ def _label(task_id, meta, task_table, fmt_task):
         return f"{base} · alloc"
     if kind == "dummy":
         return f"{base} · dummy"
+    func_name = (meta.get(normalized_task_id) or {}).get("func_name")
+    if func_name:
+        return f"{base} · {func_name}"
     return base
 
 
