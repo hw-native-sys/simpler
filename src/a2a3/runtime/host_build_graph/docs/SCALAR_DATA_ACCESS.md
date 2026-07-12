@@ -46,7 +46,9 @@ One extra step versus get_tensor_data: wait for all consumers to finish (`fanout
 ### 3.3 Timeout
 
 - Uses cycle counter (`get_sys_cnt_aicpu()`), checked every 1024 spins
-- Threshold: `PTO2_TENSOR_DATA_TIMEOUT_CYCLES` (~10 s at 1.5 GHz)
+- Threshold: `PTO2_TENSOR_DATA_TIMEOUT_MS` (15 s), scaled to
+  `PTO2_TENSOR_DATA_TIMEOUT_CYCLES` via `PLATFORM_PROF_SYS_CNT_FREQ` so it reaps
+  at the same wall-clock on every arch
 - On timeout: sets `orch.fatal = true`, preventing further task submission
 
 ## 4. add_output with Initial Value

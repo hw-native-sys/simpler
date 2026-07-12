@@ -55,6 +55,13 @@ __attribute__((weak, visibility("hidden"))) uint64_t get_sys_cnt_aicpu() {
            static_cast<uint64_t>(ts.tv_nsec) * PLATFORM_PROF_SYS_CNT_FREQ / 1000000000ull;
 }
 
+// Derived here, not in pto_runtime2_types.h: that header is included by orchestrations
+// that define PLATFORM_PROF_SYS_CNT_FREQ locally, so pulling the platform header into
+// it caused a redefinition conflict (#1189). Scaling MS by the counter frequency (like
+// SCHEDULER_TIMEOUT_CYCLES) keeps the data-wait wall-clock identical across arches.
+static constexpr uint64_t PTO2_TENSOR_DATA_TIMEOUT_CYCLES =
+    (PTO2_TENSOR_DATA_TIMEOUT_MS * PLATFORM_PROF_SYS_CNT_FREQ) / 1000;
+
 // =============================================================================
 // Orchestration Ops Table (function-pointer dispatch for orchestration .so)
 // =============================================================================
