@@ -79,6 +79,7 @@ REGION_CREATE_REQUEST_BYTES = _REGION_CREATE_REQUEST.size
 REGION_CREATE_REPLY_BYTES = _REGION_CREATE_REPLY.size
 _REGION_LAYOUT_ALIGNMENT = 64
 _UINT64_MAX = (1 << 64) - 1
+_REGION_MAGIC_VERSION = 0x4C334C3200020000
 
 
 def _align_up(value: int, align: int) -> int:
@@ -209,8 +210,20 @@ def decode_region_create_reply(buf: memoryview) -> L3L2RegionCreateReply:
     )
 
 
-def validate_region_create_reply(reply: L3L2RegionCreateReply) -> tuple[int, int]:
+def peek_region_create_reply_region_id(buf: memoryview) -> int:
+    return int(_REGION_CREATE_REPLY.unpack_from(buf, 0)[1])
+
+
+def validate_region_create_reply(
+    reply: L3L2RegionCreateReply, expected_access_profile: L3L2RegionAccessProfile
+) -> tuple[int, int]:
     desc = reply.desc
+    if desc.magic_version != _REGION_MAGIC_VERSION:
+        raise RuntimeError("create_l3_l2_region: reply magic_version is invalid")
+    if desc.region_id == 0:
+        raise RuntimeError("create_l3_l2_region: reply region_id must be nonzero")
+    if reply.access_profile != expected_access_profile:
+        raise RuntimeError(f"create_l3_l2_region: reply access_profile must be {expected_access_profile.name.lower()}")
     if desc.payload_bytes <= 0:
         raise RuntimeError("create_l3_l2_region: reply payload_bytes must be positive")
     if desc.counter_bytes <= 0 or desc.counter_bytes % 4 != 0:

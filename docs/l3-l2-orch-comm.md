@@ -287,9 +287,10 @@ the L3 Host orchestration code: runtime Host tensors, `bytes`, `bytearray`, and
 writable contiguous memoryviews for reads are valid according to the
 operation's read/write direction.
 
-On onboard platforms, payload buffers must be Host tensors returned by
-`orch.alloc(...)`, so the L2 Host runtime can access the storage while
-servicing the operation.
+On onboard platforms, the L3 Host imports the child-owned region through ACL
+IPC and copies directly through ACL runtime primitives. Payload buffers must be
+ordinary contiguous L3 Host-accessible byte spans according to the operation's
+read/write direction.
 
 Small wrapper metadata is payload too. A header such as `{seq, DATA}` or
 `{seq, STOP}` is copied through `payload_write`; any staging needed for a
@@ -308,8 +309,8 @@ L3 Host region:
 - DMA failure after a payload command is issued;
 - signal notify failure;
 - L3 Host transfer failure after operation issue;
-- L2 Host-mediated operation timeout after the region is live;
-- L2 Host-mediated operation fatal error after the region is live;
+- direct L3 Host mapped-region failure after a payload or counter primitive is
+  issued;
 - L2 endpoint fatal error reported with a valid `region_id`;
 - explicit wrapper-level poison in future queue or stream abstractions.
 
@@ -336,10 +337,10 @@ L3 Host poisons only the region parsed from that text.
 
 - `a2a3sim`: full API and protocol support.
 - `a5sim`: full API and protocol support.
-- `a2a3` onboard: full API support with L2 Host-mediated payload and counter
-  operations.
-- `a5` onboard: full API support with L2 Host-mediated payload and counter
-  operations.
+- `a2a3` onboard: full API support with direct L3 Host ACL IPC payload and
+  counter operations.
+- `a5` onboard: full API support with direct L3 Host ACL IPC payload and
+  counter operations.
 
 Simulation backends preserve the same API, ordering, timeout, and error
 semantics as onboard backends.

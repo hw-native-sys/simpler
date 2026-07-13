@@ -8,7 +8,10 @@
 # -----------------------------------------------------------------------------------------------------------
 
 import ctypes
+import threading
+import time
 from multiprocessing.shared_memory import SharedMemory
+from typing import Optional
 
 import pytest
 from simpler import l3_l2_orch_comm
@@ -34,17 +37,21 @@ class _FakeDirectCWorker:
         self,
         *,
         payload_base: int = 0xDEAD_0000,
-        access_profile: l3_l2_orch_comm.L3L2RegionAccessProfile = l3_l2_orch_comm.L3L2RegionAccessProfile.SIM_POSIX_SHM,
+        access_profile: int = int(l3_l2_orch_comm.L3L2RegionAccessProfile.SIM_POSIX_SHM),
         device_id: int = 0,
         export_key: bytes = b"",
+        magic_version: int = 0x4C334C3200020000,
+        region_id: Optional[int] = None,
     ):
         self.create_calls: list[tuple[int, str, str]] = []
         self.release_calls: list[tuple[int, int]] = []
         self.next_region_id = 1
         self.payload_base = int(payload_base)
-        self.access_profile = access_profile
+        self.access_profile = int(access_profile)
         self.device_id = int(device_id)
         self.export_key = bytes(export_key)
+        self.magic_version = int(magic_version)
+        self.region_id = region_id
 
     def control_l3_l2_region_create(self, worker_id: int, request_shm_name: str, reply_shm_name: str) -> None:
         self.create_calls.append((int(worker_id), str(request_shm_name), str(reply_shm_name)))
@@ -59,24 +66,25 @@ class _FakeDirectCWorker:
             payload_bytes = int(req[2])
             counter_bytes = int(req[3])
             counter_offset = ((payload_bytes + 63) // 64) * 64
-            region_id = self.next_region_id
-            self.next_region_id += 1
+            region_id = int(self.region_id) if self.region_id is not None else self.next_region_id
+            if self.region_id is None:
+                self.next_region_id += 1
             backing_name = f"sim-direct-{region_id}".encode()
             export_key = self.export_key or f"acl-ipc-key-{region_id}".encode()
-            if self.access_profile == l3_l2_orch_comm.L3L2RegionAccessProfile.ONBOARD_ACL_IPC:
+            if self.access_profile == int(l3_l2_orch_comm.L3L2RegionAccessProfile.ONBOARD_ACL_IPC):
                 backing_name = b""
             else:
                 export_key = b""
             l3_l2_orch_comm._REGION_CREATE_REPLY.pack_into(
                 reply_buf,
                 0,
-                0x4C334C3200020000,
+                self.magic_version,
                 region_id,
                 self.payload_base,
                 payload_bytes,
                 self.payload_base + counter_offset,
                 counter_bytes,
-                int(self.access_profile),
+                self.access_profile,
                 0,
                 self.device_id,
                 export_key + b"\x00" * (l3_l2_orch_comm.ACL_IPC_EXPORT_KEY_BYTES - len(export_key)),
@@ -131,7 +139,7 @@ def _make_started_onboard_worker(
     assert shm.buf is not None
     _mailbox_store_i32(_buffer_field_addr(shm.buf, _OFF_STATE), _IDLE)
     fake_c_worker = _FakeDirectCWorker(
-        access_profile=l3_l2_orch_comm.L3L2RegionAccessProfile.ONBOARD_ACL_IPC,
+        access_profile=int(l3_l2_orch_comm.L3L2RegionAccessProfile.ONBOARD_ACL_IPC),
         device_id=2,
         export_key=export_key,
     )
@@ -273,6 +281,96 @@ def test_sim_direct_create_import_failure_rolls_back_l2_host_region(monkeypatch)
         assert worker._live_l3_l2_regions == []
     finally:
         worker._close_l3_l2_orch_comm()
+        shm.close()
+        shm.unlink()
+
+
+def test_direct_create_decode_failure_rolls_back_l2_host_region():
+    worker, shm, fake_c_worker = _make_started_sim_worker()
+    fake_c_worker.access_profile = 99
+    try:
+        with pytest.raises(ValueError, match="99 is not a valid"):
+            worker._create_l3_l2_region(0, 64, 128)
+
+        assert fake_c_worker.release_calls == [(0, 1)]
+        assert worker._live_l3_l2_regions == []
+    finally:
+        worker._close_l3_l2_orch_comm()
+        shm.close()
+        shm.unlink()
+
+
+@pytest.mark.parametrize(
+    ("reply_updates", "match"),
+    [
+        ({"magic_version": 0xBAD}, "magic_version is invalid"),
+        ({"region_id": 0}, "region_id must be nonzero"),
+        (
+            {"access_profile": int(l3_l2_orch_comm.L3L2RegionAccessProfile.ONBOARD_ACL_IPC)},
+            "access_profile must be sim_posix_shm",
+        ),
+    ],
+)
+def test_direct_create_validation_failure_rolls_back_l2_host_region(reply_updates, match):
+    worker, shm, fake_c_worker = _make_started_sim_worker()
+    for name, value in reply_updates.items():
+        setattr(fake_c_worker, name, value)
+    expected_region_id = int(reply_updates.get("region_id", 1))
+    try:
+        with pytest.raises(RuntimeError, match=match):
+            worker._create_l3_l2_region(0, 64, 128)
+
+        assert fake_c_worker.release_calls == ([(0, expected_region_id)] if expected_region_id else [])
+        assert worker._live_l3_l2_regions == []
+    finally:
+        worker._close_l3_l2_orch_comm()
+        shm.close()
+        shm.unlink()
+
+
+def test_l3_host_mapped_counter_wait_releases_gil_for_python_notifier():
+    shm = SharedMemory(create=True, size=64)
+    handle = 0
+    notifier_error: list[BaseException] = []
+    try:
+        handle = l3_l2_orch_comm._l3_host_mapped_region_import_sim(shm.name, 64)
+
+        def notify() -> None:
+            try:
+                time.sleep(0.05)
+                l3_l2_orch_comm._l3_host_mapped_counter_notify(handle, 0, 1, int(NotifyOp.Set))
+            except BaseException as exc:  # noqa: BLE001
+                notifier_error.append(exc)
+
+        thread = threading.Thread(target=notify)
+        thread.start()
+        status, error_kind, observed, matched, message = l3_l2_orch_comm._l3_host_mapped_counter_wait(
+            handle, 0, 1, int(WaitCmp.EQ), 1_000_000_000
+        )
+        thread.join(timeout=1.0)
+
+        assert not thread.is_alive()
+        assert notifier_error == []
+        assert (status, error_kind, observed, matched, message) == (0, 0, 1, True, "")
+    finally:
+        if handle:
+            l3_l2_orch_comm._l3_host_mapped_region_close(handle)
+        shm.close()
+        shm.unlink()
+
+
+def test_l3_host_mapped_region_close_makes_sim_handle_unusable():
+    shm = SharedMemory(create=True, size=64)
+    handle = 0
+    try:
+        handle = l3_l2_orch_comm._l3_host_mapped_region_import_sim(shm.name, 64)
+        l3_l2_orch_comm._l3_host_mapped_region_close(handle)
+
+        with pytest.raises(RuntimeError, match="closed or unknown"):
+            l3_l2_orch_comm._l3_host_mapped_counter_test(handle, 0, 0, int(WaitCmp.EQ))
+    finally:
+        if handle:
+            l3_l2_orch_comm._l3_host_mapped_region_close(handle)
         shm.close()
         shm.unlink()
 

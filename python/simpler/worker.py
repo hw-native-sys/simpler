@@ -3698,6 +3698,7 @@ class Worker:
             _l3_host_mapped_region_import_onboard,
             _l3_host_mapped_region_import_sim,
             decode_region_create_reply,
+            peek_region_create_reply_region_id,
             validate_region_create_reply,
         )
 
@@ -3726,17 +3727,18 @@ class Worker:
                 worker = self._worker
                 assert worker is not None
                 worker.control_l3_l2_region_create(int(worker_id), req_shm.name, reply_shm.name)
+                region_id = peek_region_create_reply_region_id(reply_buf)
                 reply = decode_region_create_reply(reply_buf)
-                region_id = int(reply.desc.region_id)
-                counter_offset, total_bytes = validate_region_create_reply(reply)
                 platform = str(self._config.get("platform", ""))
+                expected_access_profile = (
+                    L3L2RegionAccessProfile.SIM_POSIX_SHM
+                    if platform.endswith("sim")
+                    else L3L2RegionAccessProfile.ONBOARD_ACL_IPC
+                )
+                counter_offset, total_bytes = validate_region_create_reply(reply, expected_access_profile)
                 if platform.endswith("sim"):
-                    if reply.access_profile != L3L2RegionAccessProfile.SIM_POSIX_SHM:
-                        raise RuntimeError("create_l3_l2_region: sim direct path requires sim_posix_shm reply")
                     handle = _l3_host_mapped_region_import_sim(reply.backing_shm, int(reply.mapping_bytes))
                 else:
-                    if reply.access_profile != L3L2RegionAccessProfile.ONBOARD_ACL_IPC:
-                        raise RuntimeError("create_l3_l2_region: onboard direct path requires onboard_acl_ipc reply")
                     handle = _l3_host_mapped_region_import_onboard(
                         int(reply.device_id),
                         reply.export_key,

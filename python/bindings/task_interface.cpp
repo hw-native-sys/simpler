@@ -41,6 +41,7 @@
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -1292,20 +1293,56 @@ NB_MODULE(_task_interface, m) {
                     return;
                 }
                 mapping = it->second;
-                g_l3_host_mapped_regions.erase(it);
             }
             if (mapping.profile == L3HostMappedRegionProfile::ONBOARD_ACL_IPC) {
                 bind_acl_device(mapping);
                 AclRuntimeApi &api = acl_api();
                 acl_check(api.aclrtIpcMemClose(mapping.export_key.data()), "aclrtIpcMemClose");
+                std::lock_guard<std::mutex> lk(g_l3_host_mapped_region_mu);
+                auto it = g_l3_host_mapped_regions.find(handle);
+                if (it != g_l3_host_mapped_regions.end()) {
+                    g_l3_host_mapped_regions.erase(it);
+                }
                 return;
             }
-            if (mapping.base != nullptr) {
-                munmap(mapping.base, mapping.size);
+
+            bool unmapped = false;
+            bool fd_closed = false;
+            std::string cleanup_error;
+            if (mapping.base != nullptr && munmap(mapping.base, mapping.size) != 0) {
+                cleanup_error = std::string("L3-L2 sim L3 Host mapped-region munmap failed: ") + std::strerror(errno);
+            } else if (mapping.base != nullptr) {
+                unmapped = true;
             }
-            if (mapping.fd >= 0) {
-                ::close(mapping.fd);
+            if (mapping.fd >= 0 && ::close(mapping.fd) != 0) {
+                if (cleanup_error.empty()) {
+                    cleanup_error =
+                        std::string("L3-L2 sim L3 Host mapped-region close failed: ") + std::strerror(errno);
+                }
+            } else if (mapping.fd >= 0) {
+                fd_closed = true;
             }
+
+            std::lock_guard<std::mutex> lk(g_l3_host_mapped_region_mu);
+            auto it = g_l3_host_mapped_regions.find(handle);
+            if (it == g_l3_host_mapped_regions.end()) {
+                if (!cleanup_error.empty()) {
+                    throw std::runtime_error(cleanup_error);
+                }
+                return;
+            }
+            L3HostMappedRegion &current = it->second;
+            if (unmapped) {
+                current.base = nullptr;
+                current.size = 0;
+            }
+            if (fd_closed) {
+                current.fd = -1;
+            }
+            if (!cleanup_error.empty()) {
+                throw std::runtime_error(cleanup_error);
+            }
+            g_l3_host_mapped_regions.erase(it);
         },
         nb::arg("handle"), "Close an L3 Host mapped-region handle."
     );
@@ -1321,7 +1358,7 @@ NB_MODULE(_task_interface, m) {
             );
         },
         nb::arg("handle"), nb::arg("payload_offset"), nb::arg("host_ptr"), nb::arg("nbytes"),
-        "Copy L3 Host bytes into an imported L3-L2 payload range."
+        nb::call_guard<nb::gil_scoped_release>(), "Copy L3 Host bytes into an imported L3-L2 payload range."
     );
     m.def(
         "_l3_host_mapped_payload_read",
@@ -1335,7 +1372,7 @@ NB_MODULE(_task_interface, m) {
             );
         },
         nb::arg("handle"), nb::arg("payload_offset"), nb::arg("host_ptr"), nb::arg("nbytes"),
-        "Copy imported L3-L2 payload bytes into L3 Host memory."
+        nb::call_guard<nb::gil_scoped_release>(), "Copy imported L3-L2 payload bytes into L3 Host memory."
     );
     m.def(
         "_l3_host_mapped_counter_notify",
@@ -1352,24 +1389,25 @@ NB_MODULE(_task_interface, m) {
             store_counter(mapping, counter_offset, value);
         },
         nb::arg("handle"), nb::arg("counter_offset"), nb::arg("value"), nb::arg("op"),
-        "Store or add one L3 Host-side L3-L2 signal counter."
+        nb::call_guard<nb::gil_scoped_release>(), "Store or add one L3 Host-side L3-L2 signal counter."
     );
     m.def(
         "_l3_host_mapped_counter_test",
-        [](uint64_t handle, uint64_t counter_offset, int32_t operand, int cmp) {
+        [](uint64_t handle, uint64_t counter_offset, int32_t operand, int cmp) -> std::tuple<bool, int32_t> {
             L3HostMappedRegion &mapping = l3_host_mapped_region(handle);
             if (counter_offset % sizeof(int32_t) != 0) {
                 throw std::invalid_argument("L3-L2 counter offset must be 4-byte aligned");
             }
             int32_t observed = load_counter(mapping, counter_offset);
-            return nb::make_tuple(compare_counter(observed, operand, cmp), observed);
+            return std::make_tuple(compare_counter(observed, operand, cmp), observed);
         },
         nb::arg("handle"), nb::arg("counter_offset"), nb::arg("operand"), nb::arg("cmp"),
-        "Load and compare one L3 Host-side L3-L2 signal counter."
+        nb::call_guard<nb::gil_scoped_release>(), "Load and compare one L3 Host-side L3-L2 signal counter."
     );
     m.def(
         "_l3_host_mapped_counter_wait",
-        [](uint64_t handle, uint64_t counter_offset, int32_t operand, int cmp, uint64_t timeout_ns) {
+        [](uint64_t handle, uint64_t counter_offset, int32_t operand, int cmp,
+           uint64_t timeout_ns) -> std::tuple<int, int, int32_t, bool, std::string> {
             L3HostMappedRegion &mapping = l3_host_mapped_region(handle);
             if (counter_offset % sizeof(int32_t) != 0) {
                 throw std::invalid_argument("L3-L2 counter offset must be 4-byte aligned");
@@ -1380,16 +1418,16 @@ NB_MODULE(_task_interface, m) {
                 observed = load_counter(mapping, counter_offset);
                 bool matched = compare_counter(observed, operand, cmp);
                 if (matched) {
-                    return nb::make_tuple(0, 0, observed, true, std::string{});
+                    return std::make_tuple(0, 0, observed, true, std::string{});
                 }
                 if (std::chrono::steady_clock::now() >= deadline) {
-                    return nb::make_tuple(-1, 7, observed, false, std::string{"SIGNAL_WAIT timed out"});
+                    return std::make_tuple(-1, 7, observed, false, std::string{"SIGNAL_WAIT timed out"});
                 }
                 std::this_thread::sleep_for(std::chrono::nanoseconds(50000));
             }
         },
         nb::arg("handle"), nb::arg("counter_offset"), nb::arg("operand"), nb::arg("cmp"), nb::arg("timeout_ns"),
-        "Poll one L3 Host-side L3-L2 signal counter until match or timeout."
+        nb::call_guard<nb::gil_scoped_release>(), "Poll one L3 Host-side L3-L2 signal counter until match or timeout."
     );
     m.def(
         "_l3_child_onboard_region_export",
