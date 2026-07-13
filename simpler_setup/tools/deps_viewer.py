@@ -767,9 +767,7 @@ def _task_markers(nodes, edges, meta, task_table):
         pred_map.setdefault(succ, set()).add(pred)
 
     def _fire_marked(tid):
-        return _task_kind(tid, meta, task_table) == "alloc" or bool(
-            (task_table.get(tid) or {}).get("early_dispatch")
-        )
+        return _task_kind(tid, meta, task_table) == "alloc" or bool((task_table.get(tid) or {}).get("early_dispatch"))
 
     markers = {}
     for tid in nodes:
