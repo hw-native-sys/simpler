@@ -935,6 +935,25 @@ static TaskOutputTensors submit_task_common(
     }
 
     payload.init(args, result, prepared.alloc_result, layout);
+
+    // Dispatch predicate: resolve the (tensor, indices) to an absolute GM address
+    // now so the scheduler can read it at the dispatch point with a single load,
+    // no Arg/Tensor access. Both branches write predicate.op explicitly because
+    // payload slots are ring-reused; op == NONE means "always dispatch".
+    {
+        const L0TaskPredicate &pred = args.predicate();
+        if (pred.op != PredicateOp::NONE && pred.operand.tensor != nullptr && pred.operand.tensor->buffer.addr != 0) {
+            uint64_t elem_size = get_element_size(pred.operand.tensor->dtype);
+            uint64_t flat_offset = pred.operand.tensor->compute_flat_offset(pred.operand.indices, pred.operand.ndims);
+            payload.predicate.addr = pred.operand.tensor->buffer.addr + flat_offset * elem_size;
+            payload.predicate.target = pred.target;
+            payload.predicate.elem_size = static_cast<uint8_t>(elem_size);
+            payload.predicate.op = pred.op;
+        } else {
+            payload.predicate.addr = 0;
+            payload.predicate.op = PredicateOp::NONE;
+        }
+    }
 #if SIMPLER_DFX
     if (is_dump_args_enabled()) {
         if (args.scalar_count() > 0) {
@@ -1047,6 +1066,10 @@ TaskOutputTensors PTO2OrchestratorState::submit_task(const MixedKernels &mixed_k
             return TaskOutputTensors{};
         }
         active_mask.set_sync_start();
+    }
+
+    if (args.predicate().op != PredicateOp::NONE) {
+        active_mask.set_has_predicate();
     }
 
     return submit_task_common(

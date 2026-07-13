@@ -196,6 +196,27 @@ public:
  *   TaskOutputTensors outs = rt_submit_aic_task(kernel_id, args);
  *   const Tensor& y = outs.get_ref(0);
  */
+
+// Operand of a dispatch predicate (L0 layer): locates one element of a tensor —
+// tensor + ndims + indices, mirroring get_tensor_data. The tensor is borrowed and
+// must outlive submit; its buffer must be allocated by then, and its producer must
+// be a dependency of the predicated task so the value is current at dispatch.
+struct L0PredicateOperand {
+    const Tensor *tensor{nullptr};
+    uint32_t ndims{0};
+    uint32_t indices[MAX_TENSOR_DIMS]{};
+};
+
+// Dispatch predicate carried on an Arg: operand OP target (e.g. count[i] > 0).
+// op == NONE means "no predicate — always dispatch". Submit resolves the operand
+// into the payload's DispatchPredicate (an absolute GM address). Read in-process;
+// never crosses the wire.
+struct L0TaskPredicate {
+    L0PredicateOperand operand;
+    PredicateOp op{PredicateOp::NONE};
+    int64_t target{0};
+};
+
 template <size_t MaxT, size_t MaxS>
 struct Arg : TaskArgsTpl<TensorRef, uint64_t, MaxT, MaxS, TensorArgType> {
     using Base = TaskArgsTpl<TensorRef, uint64_t, MaxT, MaxS, TensorArgType>;
@@ -220,6 +241,16 @@ struct Arg : TaskArgsTpl<TensorRef, uint64_t, MaxT, MaxS, TensorArgType> {
     const char *error_msg{nullptr};
     PTO2LaunchSpec launch_spec;  // SPMD launch parameters (block_num, etc.)
 
+    // Dispatch predicate (codegen-author set; default op == NONE = always
+    // dispatch). A FALSE result at the dispatch point retires the task inline
+    // through the dep-only path — never dispatched to an AICore — while still
+    // resolving fanin/fanout so consumers unlock. The predicate tensor's producer
+    // MUST be a dependency of this task so the value is current when the task
+    // becomes ready. Read in-process; never crosses the wire.
+    L0TaskPredicate predicate_;
+    void set_predicate(const L0TaskPredicate &pred) { predicate_ = pred; }
+    const L0TaskPredicate &predicate() const { return predicate_; }
+
     void clear() {
         Base::clear();
 #if SIMPLER_DFX
@@ -227,6 +258,7 @@ struct Arg : TaskArgsTpl<TensorRef, uint64_t, MaxT, MaxS, TensorArgType> {
 #endif
         explicit_deps_ = nullptr;
         explicit_dep_count_ = 0;
+        predicate_ = L0TaskPredicate{};
     }
 
     void reset() {

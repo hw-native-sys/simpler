@@ -506,7 +506,8 @@ struct PTO2SchedulerState {
     // per-shape ready_queues[].
     void push_ready_routed(PTO2TaskSlotState *slot_state) {
         PTO2ResourceShape shape = slot_state->active_mask.to_shape();
-        if (shape == PTO2ResourceShape::DUMMY) {
+        if (shape == PTO2ResourceShape::DUMMY ||
+            (slot_state->active_mask.has_predicate() && !slot_state->payload->predicate.pass())) {
             dummy_ready_queue.push(slot_state);
         } else {
             ready_queues[static_cast<int32_t>(shape)].push(slot_state);
@@ -645,7 +646,8 @@ struct PTO2SchedulerState {
             // ready_queues[]. Use the profiling-aware push so atomic_count / push_wait
             // stay consistent with the non-dummy path.
             PTO2ResourceShape shape = slot_state.active_mask.to_shape();
-            if (shape == PTO2ResourceShape::DUMMY) {
+            if (shape == PTO2ResourceShape::DUMMY ||
+                (slot_state.active_mask.has_predicate() && !slot_state.payload->predicate.pass())) {
                 dummy_ready_queue.push(&slot_state, atomic_count, push_wait);
             } else {
                 ready_queues[static_cast<int32_t>(shape)].push(&slot_state, atomic_count, push_wait);

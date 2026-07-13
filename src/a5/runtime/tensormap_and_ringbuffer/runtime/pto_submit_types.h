@@ -39,10 +39,60 @@ enum class PTO2SubtaskSlot : uint8_t {
 /**
  * Subtask mask bits (for ActiveMask)
  */
-inline constexpr uint8_t PTO2_SUBTASK_MASK_AIC = (1u << 0);         // 0x1
-inline constexpr uint8_t PTO2_SUBTASK_MASK_AIV0 = (1u << 1);        // 0x2
-inline constexpr uint8_t PTO2_SUBTASK_MASK_AIV1 = (1u << 2);        // 0x4
-inline constexpr uint8_t PTO2_SUBTASK_FLAG_SYNC_START = (1u << 3);  // 0x8: all blocks must launch atomically
+inline constexpr uint8_t PTO2_SUBTASK_MASK_AIC = (1u << 0);            // 0x1
+inline constexpr uint8_t PTO2_SUBTASK_MASK_AIV0 = (1u << 1);           // 0x2
+inline constexpr uint8_t PTO2_SUBTASK_MASK_AIV1 = (1u << 2);           // 0x4
+inline constexpr uint8_t PTO2_SUBTASK_FLAG_SYNC_START = (1u << 3);     // 0x8: all blocks must launch atomically
+inline constexpr uint8_t PTO2_SUBTASK_FLAG_HAS_PREDICATE = (1u << 4);  // 0x10: task carries a dispatch predicate
+
+// Dispatch-predicate comparison operator. The scheduler evaluates the predicate
+// at the dispatch point — the task is ready (fanin satisfied), so the predicate
+// address' producer has completed and the value read is current, without the
+// wait_for_tensor_ready() stall that get_tensor_data() pays in orchestration.
+// PASS => dispatch normally; FAIL => retire inline via the dep-only path.
+enum class PredicateOp : uint8_t { NONE = 0, EQ, NE, GT, LT, GE, LE };
+
+// Resolved dispatch predicate stored on a task's payload (AICPU-side only): the
+// absolute GM address of the predicate element + the comparison. op == NONE
+// means "no predicate — always dispatch". Populated at submit from an
+// L0TaskPredicate; evaluated by the scheduler at the dispatch point via pass().
+// Layout is 18 bytes (8-aligned).
+struct DispatchPredicate {
+    uint64_t addr{0};      // absolute GM address of the predicate element (0 when op == NONE)
+    int64_t target{0};     // value compared against
+    uint8_t elem_size{0};  // width of the predicate element in bytes (1/2/4/8)
+    PredicateOp op{PredicateOp::NONE};
+
+    // true => dispatch, false => retire inline. Reads elem_size bytes at addr and
+    // sign-extends to 64 bits before comparing to target. Safe to call only when
+    // the owning task is ready (its producer has written the value).
+    bool pass() const {
+        if (op == PredicateOp::NONE) return true;
+        int64_t v = 0;
+        __builtin_memcpy(&v, reinterpret_cast<const void *>(addr), elem_size);
+        uint32_t bits = static_cast<uint32_t>(elem_size) * 8u;
+        if (bits < 64u) {
+            int64_t shift = static_cast<int64_t>(64u - bits);
+            v = (v << shift) >> shift;
+        }
+        switch (op) {
+        case PredicateOp::EQ:
+            return v == target;
+        case PredicateOp::NE:
+            return v != target;
+        case PredicateOp::GT:
+            return v > target;
+        case PredicateOp::LT:
+            return v < target;
+        case PredicateOp::GE:
+            return v >= target;
+        case PredicateOp::LE:
+            return v <= target;
+        default:
+            return true;
+        }
+    }
+};
 
 /**
  * Resource shape — classifies a MixedKernels into one of 3 scheduling buckets.
@@ -86,6 +136,9 @@ public:
 
     bool requires_sync_start() const { return (raw_ & PTO2_SUBTASK_FLAG_SYNC_START) != 0; }
 
+    // True when the task carries a dispatch predicate.
+    bool has_predicate() const { return (raw_ & PTO2_SUBTASK_FLAG_HAS_PREDICATE) != 0; }
+
     PTO2ResourceShape to_shape() const {
         uint8_t cmask = core_mask();
         if (cmask == 0) return PTO2ResourceShape::DUMMY;
@@ -96,6 +149,8 @@ public:
     }
 
     void set_sync_start() { raw_ |= PTO2_SUBTASK_FLAG_SYNC_START; }
+
+    void set_has_predicate() { raw_ |= PTO2_SUBTASK_FLAG_HAS_PREDICATE; }
 
     bool operator==(ActiveMask other) const { return raw_ == other.raw_; }
     bool operator!=(ActiveMask other) const { return raw_ != other.raw_; }

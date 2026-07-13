@@ -220,9 +220,15 @@ struct PTO2TaskPayload {
     int32_t fanin_spill_start{0};   // Linear start index in fanin spill pool (0 = no spill)
     PTO2FaninPool *fanin_spill_pool{nullptr};
     PTO2TaskSlotState *fanin_inline_slot_states[PTO2_FANIN_INLINE_CAP];
-    // === Cache lines 9-72 (4096B) — tensors (alignas(64) forces alignment) ===
+    // === Cache line 9 (byte 576) — dispatch predicate (AICPU-only) ===
+    // Offset is a fixed 576, independent of MAX_TENSOR_ARGS / MAX_SCALAR_ARGS.
+    // AICore never reads it — args are materialized from the tensor_count / tensors
+    // / scalars offsets only. Resolved at submit; evaluated by the scheduler at
+    // dispatch.
+    alignas(64) DispatchPredicate predicate;
+    // === Cache lines 10-73 (4096B) — tensors (alignas(64) forces alignment) ===
     Tensor tensors[MAX_TENSOR_ARGS];
-    // === Cache lines 73-74 (128B) — scalars ===
+    // === Cache lines 74-75 (128B) — scalars ===
     uint64_t scalars[MAX_SCALAR_ARGS];
 
     // Layout verification (size checks that don't need offsetof).
@@ -270,14 +276,20 @@ static_assert(offsetof(PTO2TaskPayload, fanin_spill_pool) == 16, "spill pool poi
 static_assert(
     offsetof(PTO2TaskPayload, fanin_inline_slot_states) == 24, "inline fanin array must follow spill metadata"
 );
-static_assert(offsetof(PTO2TaskPayload, tensors) == 576, "tensors must start at byte 576 (cache line 9)");
 static_assert(
-    offsetof(PTO2TaskPayload, scalars) == 576 + MAX_TENSOR_ARGS * sizeof(Tensor),
+    offsetof(PTO2TaskPayload, predicate) == 576,
+    "dispatch predicate occupies cache line 9 at fixed byte 576 (before tensors, never moves)"
+);
+static_assert(
+    offsetof(PTO2TaskPayload, tensors) == 640, "tensors must start at byte 640 (cache line 10, after predicate)"
+);
+static_assert(
+    offsetof(PTO2TaskPayload, scalars) == 640 + MAX_TENSOR_ARGS * sizeof(Tensor),
     "scalars must immediately follow tensors"
 );
 static_assert(
-    sizeof(PTO2TaskPayload) == 576 + MAX_TENSOR_ARGS * sizeof(Tensor) + MAX_SCALAR_ARGS * sizeof(uint64_t),
-    "PTO2TaskPayload size must stay on the baseline cache-line footprint"
+    sizeof(PTO2TaskPayload) == 640 + MAX_TENSOR_ARGS * sizeof(Tensor) + MAX_SCALAR_ARGS * sizeof(uint64_t),
+    "PTO2TaskPayload size = metadata(576) + predicate cache line(64) + tensors + scalars"
 );
 
 /**
