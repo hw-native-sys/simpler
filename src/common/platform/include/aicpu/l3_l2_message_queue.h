@@ -35,7 +35,7 @@ static constexpr uint64_t L3L2_QUEUE_L2_ABORT_FLAG_OFFSET = 320;
 static constexpr uint64_t L3L2_QUEUE_COUNTER_BYTES = 384;
 static constexpr uint64_t L3L2_QUEUE_MAX_DEPTH = 1ull << 30;
 static constexpr uint64_t L3L2_QUEUE_MAGIC_VERSION =
-    l3_l2_orch_comm_pack_magic_version(L3L2_QUEUE_MAGIC, L3L2_QUEUE_ABI_MAJOR, L3L2_QUEUE_ABI_MINOR);
+    l3_l2_orch_comm::pack_magic_version(L3L2_QUEUE_MAGIC, L3L2_QUEUE_ABI_MAJOR, L3L2_QUEUE_ABI_MINOR);
 
 struct L3L2QueueDescSlot {
     uint64_t seq;
@@ -151,11 +151,13 @@ struct L3L2QueueOutputReservation {
     bool valid;
 };
 
-static inline uint64_t l3_l2_queue_magic_version() { return L3L2_QUEUE_MAGIC_VERSION; }
+namespace l3_l2_message_queue {
 
-static inline bool l3_l2_queue_is_power_of_two(uint64_t value) { return value != 0 && (value & (value - 1)) == 0; }
+static inline uint64_t magic_version() { return L3L2_QUEUE_MAGIC_VERSION; }
 
-static inline uint64_t l3_l2_queue_align_up(uint64_t value, uint64_t align) {
+static inline bool is_power_of_two(uint64_t value) { return value != 0 && (value & (value - 1)) == 0; }
+
+static inline uint64_t align_up(uint64_t value, uint64_t align) {
     if (align == 0) {
         return value;
     }
@@ -163,54 +165,54 @@ static inline uint64_t l3_l2_queue_align_up(uint64_t value, uint64_t align) {
     return remainder == 0 ? value : value + (align - remainder);
 }
 
-static inline bool l3_l2_queue_align_up_checked(uint64_t value, uint64_t align, uint64_t *out) {
+static inline bool align_up_checked(uint64_t value, uint64_t align, uint64_t *out) {
     if (out == nullptr || align == 0) {
         return false;
     }
     uint64_t remainder = value % align;
     uint64_t bump = remainder == 0 ? 0 : align - remainder;
-    if (l3_l2_orch_comm_add_overflows(value, bump)) {
+    if (l3_l2_orch_comm::add_overflows(value, bump)) {
         return false;
     }
     *out = value + bump;
     return true;
 }
 
-static inline bool l3_l2_queue_valid_opcode(L3L2QueueOpcode opcode) {
+static inline bool valid_opcode(L3L2QueueOpcode opcode) {
     return opcode == L3L2QueueOpcode::DATA || opcode == L3L2QueueOpcode::STOP || opcode == L3L2QueueOpcode::ERROR;
 }
 
 static inline bool
-l3_l2_queue_make_layout(uint64_t depth, uint64_t input_arena_bytes, uint64_t output_arena_bytes, L3L2QueueLayout &out) {
-    if (!l3_l2_queue_is_power_of_two(depth) || depth > L3L2_QUEUE_MAX_DEPTH || input_arena_bytes == 0 ||
-        output_arena_bytes == 0 || input_arena_bytes % L3L2_QUEUE_PAYLOAD_ARENA_ALIGNMENT != 0 ||
+make_layout(uint64_t depth, uint64_t input_arena_bytes, uint64_t output_arena_bytes, L3L2QueueLayout &out) {
+    if (!is_power_of_two(depth) || depth > L3L2_QUEUE_MAX_DEPTH || input_arena_bytes == 0 || output_arena_bytes == 0 ||
+        input_arena_bytes % L3L2_QUEUE_PAYLOAD_ARENA_ALIGNMENT != 0 ||
         output_arena_bytes % L3L2_QUEUE_PAYLOAD_ARENA_ALIGNMENT != 0) {
         return false;
     }
 
     uint64_t desc_ring_bytes = depth * L3L2_QUEUE_DESC_SLOT_BYTES;
     uint64_t input_desc_offset = 0;
-    if (l3_l2_orch_comm_add_overflows(input_desc_offset, desc_ring_bytes)) {
+    if (l3_l2_orch_comm::add_overflows(input_desc_offset, desc_ring_bytes)) {
         return false;
     }
     uint64_t output_desc_offset = input_desc_offset + desc_ring_bytes;
-    if (l3_l2_orch_comm_add_overflows(output_desc_offset, desc_ring_bytes)) {
+    if (l3_l2_orch_comm::add_overflows(output_desc_offset, desc_ring_bytes)) {
         return false;
     }
     uint64_t desc_end = output_desc_offset + desc_ring_bytes;
     uint64_t input_arena_offset = 0;
-    if (!l3_l2_queue_align_up_checked(desc_end, L3L2_QUEUE_PAYLOAD_ARENA_ALIGNMENT, &input_arena_offset)) {
+    if (!align_up_checked(desc_end, L3L2_QUEUE_PAYLOAD_ARENA_ALIGNMENT, &input_arena_offset)) {
         return false;
     }
-    if (l3_l2_orch_comm_add_overflows(input_arena_offset, input_arena_bytes)) {
+    if (l3_l2_orch_comm::add_overflows(input_arena_offset, input_arena_bytes)) {
         return false;
     }
     uint64_t input_arena_end = input_arena_offset + input_arena_bytes;
     uint64_t output_arena_offset = 0;
-    if (!l3_l2_queue_align_up_checked(input_arena_end, L3L2_QUEUE_PAYLOAD_ARENA_ALIGNMENT, &output_arena_offset)) {
+    if (!align_up_checked(input_arena_end, L3L2_QUEUE_PAYLOAD_ARENA_ALIGNMENT, &output_arena_offset)) {
         return false;
     }
-    if (l3_l2_orch_comm_add_overflows(output_arena_offset, output_arena_bytes)) {
+    if (l3_l2_orch_comm::add_overflows(output_arena_offset, output_arena_bytes)) {
         return false;
     }
     uint64_t payload_bytes = output_arena_offset + output_arena_bytes;
@@ -238,11 +240,11 @@ l3_l2_queue_make_layout(uint64_t depth, uint64_t input_arena_bytes, uint64_t out
 }
 
 static inline bool
-l3_l2_queue_validate_region(const L3L2OrchRegionDesc &desc, const L3L2QueueArgs &args, L3L2QueueLayout *out_layout) {
+validate_region(const L3L2OrchRegionDesc &desc, const L3L2QueueArgs &args, L3L2QueueLayout *out_layout) {
     L3L2QueueLayout layout{};
-    if (args.magic_version != l3_l2_queue_magic_version() ||
-        l3_l2_orch_comm_validate_desc(desc) != L3L2OrchCommValidationError::OK ||
-        !l3_l2_queue_make_layout(args.depth, args.input_arena_bytes, args.output_arena_bytes, layout)) {
+    if (args.magic_version != magic_version() ||
+        l3_l2_orch_comm::validate_desc(desc) != L3L2OrchCommValidationError::OK ||
+        !make_layout(args.depth, args.input_arena_bytes, args.output_arena_bytes, layout)) {
         return false;
     }
     if (args.payload_bytes != layout.payload_bytes || args.counter_bytes != layout.counter_bytes ||
@@ -255,7 +257,7 @@ l3_l2_queue_validate_region(const L3L2OrchRegionDesc &desc, const L3L2QueueArgs 
     return true;
 }
 
-static inline void l3_l2_queue_encode_desc(
+static inline void encode_desc(
     L3L2QueueDescSlot *slot, uint64_t seq, L3L2QueueOpcode opcode, uint64_t payload_offset, uint64_t payload_nbytes
 ) {
     if (slot == nullptr) {
@@ -267,7 +269,7 @@ static inline void l3_l2_queue_encode_desc(
     slot->payload_nbytes = payload_nbytes;
 }
 
-static inline bool l3_l2_queue_reconstruct_counter(int32_t observed_low32, uint64_t depth, uint64_t &local_value) {
+static inline bool reconstruct_counter(int32_t observed_low32, uint64_t depth, uint64_t &local_value) {
     if (depth > L3L2_QUEUE_MAX_DEPTH) {
         return false;
     }
@@ -278,40 +280,6 @@ static inline bool l3_l2_queue_reconstruct_counter(int32_t observed_low32, uint6
     }
     local_value += static_cast<uint64_t>(delta);
     return true;
-}
-
-namespace l3_l2_message_queue {
-
-static inline uint64_t magic_version() { return ::l3_l2_queue_magic_version(); }
-
-static inline bool is_power_of_two(uint64_t value) { return ::l3_l2_queue_is_power_of_two(value); }
-
-static inline uint64_t align_up(uint64_t value, uint64_t align) { return ::l3_l2_queue_align_up(value, align); }
-
-static inline bool align_up_checked(uint64_t value, uint64_t align, uint64_t *out) {
-    return ::l3_l2_queue_align_up_checked(value, align, out);
-}
-
-static inline bool valid_opcode(L3L2QueueOpcode opcode) { return ::l3_l2_queue_valid_opcode(opcode); }
-
-static inline bool
-make_layout(uint64_t depth, uint64_t input_arena_bytes, uint64_t output_arena_bytes, L3L2QueueLayout &out) {
-    return ::l3_l2_queue_make_layout(depth, input_arena_bytes, output_arena_bytes, out);
-}
-
-static inline bool
-validate_region(const L3L2OrchRegionDesc &desc, const L3L2QueueArgs &args, L3L2QueueLayout *out_layout) {
-    return ::l3_l2_queue_validate_region(desc, args, out_layout);
-}
-
-static inline void encode_desc(
-    L3L2QueueDescSlot *slot, uint64_t seq, L3L2QueueOpcode opcode, uint64_t payload_offset, uint64_t payload_nbytes
-) {
-    ::l3_l2_queue_encode_desc(slot, seq, opcode, payload_offset, payload_nbytes);
-}
-
-static inline bool reconstruct_counter(int32_t observed_low32, uint64_t depth, uint64_t &local_value) {
-    return ::l3_l2_queue_reconstruct_counter(observed_low32, depth, local_value);
 }
 
 }  // namespace l3_l2_message_queue

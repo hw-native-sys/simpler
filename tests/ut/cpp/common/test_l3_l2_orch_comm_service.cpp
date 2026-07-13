@@ -96,7 +96,7 @@ struct ServiceFixture : public ::testing::Test {
         req.counter_bytes = counter_bytes;
         L3L2OrchCommResponse resp = submit(req);
         EXPECT_EQ(resp.status, 0) << resp.message;
-        EXPECT_EQ(l3_l2_orch_comm_validate_desc(resp.desc), L3L2OrchCommValidationError::OK);
+        EXPECT_EQ(l3_l2_orch_comm::validate_desc(resp.desc), L3L2OrchCommValidationError::OK);
         return resp.desc;
     }
 

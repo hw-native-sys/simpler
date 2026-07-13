@@ -29,7 +29,7 @@ struct RegionStorage {
 
 L3L2OrchRegionDesc make_desc(RegionStorage *storage, uint64_t payload_bytes = 512, uint64_t counter_bytes = 512) {
     return L3L2OrchRegionDesc{
-        l3_l2_orch_comm_magic_version(),
+        l3_l2_orch_comm::magic_version(),
         19,
         reinterpret_cast<uint64_t>(storage->payload.data()),
         payload_bytes,
@@ -42,7 +42,7 @@ size_t counter_index(uint64_t offset) { return static_cast<size_t>(offset / size
 
 L3L2QueueArgs make_args(uint64_t depth, uint64_t input_arena_bytes, uint64_t output_arena_bytes) {
     L3L2QueueLayout layout{};
-    EXPECT_TRUE(l3_l2_queue_make_layout(depth, input_arena_bytes, output_arena_bytes, layout));
+    EXPECT_TRUE(l3_l2_message_queue::make_layout(depth, input_arena_bytes, output_arena_bytes, layout));
     return L3L2QueueArgs{
         L3L2_QUEUE_MAGIC_VERSION, depth, input_arena_bytes, output_arena_bytes, layout.payload_bytes,
         layout.counter_bytes,
@@ -58,7 +58,7 @@ void publish_input_desc(
     uint64_t payload_offset = 0, uint64_t payload_nbytes = 0
 ) {
     L3L2QueueDescSlot slot{};
-    l3_l2_queue_encode_desc(&slot, seq, opcode, payload_offset, payload_nbytes);
+    l3_l2_message_queue::encode_desc(&slot, seq, opcode, payload_offset, payload_nbytes);
     uint64_t desc_offset = layout.input_desc_offset + ((seq - 1) & (layout.depth - 1)) * sizeof(L3L2QueueDescSlot);
     std::memcpy(storage->payload.data() + desc_offset, &slot, sizeof(slot));
     storage->counters[counter_index(layout.input_desc_tail_offset)] = static_cast<int32_t>(seq);
@@ -67,16 +67,16 @@ void publish_input_desc(
 TEST(L3L2MessageQueueTest, MagicVersionConstantMatchesCompatibilityWrapper) {
     EXPECT_EQ(
         L3L2_QUEUE_MAGIC_VERSION,
-        l3_l2_orch_comm_pack_magic_version(L3L2_QUEUE_MAGIC, L3L2_QUEUE_ABI_MAJOR, L3L2_QUEUE_ABI_MINOR)
+        l3_l2_orch_comm::pack_magic_version(L3L2_QUEUE_MAGIC, L3L2_QUEUE_ABI_MAJOR, L3L2_QUEUE_ABI_MINOR)
     );
-    EXPECT_EQ(l3_l2_queue_magic_version(), L3L2_QUEUE_MAGIC_VERSION);
+    EXPECT_EQ(l3_l2_message_queue::magic_version(), L3L2_QUEUE_MAGIC_VERSION);
     EXPECT_EQ(l3_l2_message_queue::magic_version(), L3L2_QUEUE_MAGIC_VERSION);
 }
 
 TEST(L3L2MessageQueueTest, LayoutAssignsPayloadAndAbortCounterOffsets) {
     L3L2QueueLayout layout{};
 
-    ASSERT_TRUE(l3_l2_queue_make_layout(4, 128, 192, layout));
+    ASSERT_TRUE(l3_l2_message_queue::make_layout(4, 128, 192, layout));
 
     EXPECT_EQ(layout.input_desc_offset, 0u);
     EXPECT_EQ(layout.output_desc_offset, 4u * sizeof(L3L2QueueDescSlot));
@@ -112,7 +112,9 @@ TEST(L3L2MessageQueueTest, LayoutLockstepCasesMatchPythonMirrorExpectations) {
     for (const auto &test_case : cases) {
         L3L2QueueLayout layout{};
         ASSERT_TRUE(
-            l3_l2_queue_make_layout(test_case.depth, test_case.input_arena_bytes, test_case.output_arena_bytes, layout)
+            l3_l2_message_queue::make_layout(
+                test_case.depth, test_case.input_arena_bytes, test_case.output_arena_bytes, layout
+            )
         );
 
         EXPECT_EQ(layout.input_desc_offset, 0u);
@@ -134,16 +136,16 @@ TEST(L3L2MessageQueueTest, LayoutLockstepCasesMatchPythonMirrorExpectations) {
 TEST(L3L2MessageQueueTest, LayoutRejectsInvalidDepthArenaAndCounterBytes) {
     L3L2QueueLayout layout{};
 
-    EXPECT_FALSE(l3_l2_queue_make_layout(3, 64, 64, layout));
-    EXPECT_FALSE(l3_l2_queue_make_layout((1ull << 30) + 1, 64, 64, layout));
-    EXPECT_FALSE(l3_l2_queue_make_layout(2, 0, 64, layout));
-    EXPECT_FALSE(l3_l2_queue_make_layout(2, 65, 64, layout));
+    EXPECT_FALSE(l3_l2_message_queue::make_layout(3, 64, 64, layout));
+    EXPECT_FALSE(l3_l2_message_queue::make_layout((1ull << 30) + 1, 64, 64, layout));
+    EXPECT_FALSE(l3_l2_message_queue::make_layout(2, 0, 64, layout));
+    EXPECT_FALSE(l3_l2_message_queue::make_layout(2, 65, 64, layout));
 
     RegionStorage storage{};
     L3L2QueueArgs args = make_args(2, 64, 64);
-    EXPECT_FALSE(l3_l2_queue_validate_region(make_desc(&storage, 256, 320), args, &layout));
-    EXPECT_FALSE(l3_l2_queue_validate_region(make_desc(&storage, 512, 384), args, &layout));
-    EXPECT_TRUE(l3_l2_queue_validate_region(make_desc(&storage, args), args, &layout));
+    EXPECT_FALSE(l3_l2_message_queue::validate_region(make_desc(&storage, 256, 320), args, &layout));
+    EXPECT_FALSE(l3_l2_message_queue::validate_region(make_desc(&storage, 512, 384), args, &layout));
+    EXPECT_TRUE(l3_l2_message_queue::validate_region(make_desc(&storage, args), args, &layout));
 }
 
 TEST(L3L2MessageQueueTest, LayoutOverflowFailsClosedWithoutModifyingOutput) {
@@ -152,7 +154,7 @@ TEST(L3L2MessageQueueTest, LayoutOverflowFailsClosedWithoutModifyingOutput) {
     };
     const L3L2QueueLayout original = layout;
 
-    EXPECT_FALSE(l3_l2_queue_make_layout(2, std::numeric_limits<uint64_t>::max() - 63, 64, layout));
+    EXPECT_FALSE(l3_l2_message_queue::make_layout(2, std::numeric_limits<uint64_t>::max() - 63, 64, layout));
 
     EXPECT_EQ(layout.depth, original.depth);
     EXPECT_EQ(layout.input_desc_offset, original.input_desc_offset);
@@ -179,7 +181,7 @@ TEST(L3L2MessageQueueTest, DescriptorSlotEncodingIsStable) {
     EXPECT_EQ(sizeof(L3L2QueueError::message), 256u);
 
     L3L2QueueDescSlot slot{};
-    l3_l2_queue_encode_desc(&slot, 7, L3L2QueueOpcode::ERROR, 128, 16);
+    l3_l2_message_queue::encode_desc(&slot, 7, L3L2QueueOpcode::ERROR, 128, 16);
     EXPECT_EQ(slot.seq, 7u);
     EXPECT_EQ(slot.opcode, 3u);
     EXPECT_EQ(slot.payload_offset, 128u);
@@ -211,22 +213,22 @@ TEST(L3L2MessageQueueTest, ErrorOperationStringsAndMessageCopyAreStable) {
 TEST(L3L2MessageQueueTest, Low32ReconstructionAcceptsWrapAndRejectsImpossibleDeltas) {
     uint64_t value = 0xFFFF'FFFFull;
 
-    EXPECT_TRUE(l3_l2_queue_reconstruct_counter(0, 4, value));
+    EXPECT_TRUE(l3_l2_message_queue::reconstruct_counter(0, 4, value));
     EXPECT_EQ(value, 0x1'0000'0000ull);
 
     value = (1ull << 31) - 2;
-    EXPECT_TRUE(l3_l2_queue_reconstruct_counter(static_cast<int32_t>(0x8000'0001u), 4, value));
+    EXPECT_TRUE(l3_l2_message_queue::reconstruct_counter(static_cast<int32_t>(0x8000'0001u), 4, value));
     EXPECT_EQ(value, (1ull << 31) + 1);
 
     value = 100;
-    EXPECT_TRUE(l3_l2_queue_reconstruct_counter(104, 4, value));
+    EXPECT_TRUE(l3_l2_message_queue::reconstruct_counter(104, 4, value));
     EXPECT_EQ(value, 104u);
 
     value = 100;
-    EXPECT_FALSE(l3_l2_queue_reconstruct_counter(99, 4, value));
+    EXPECT_FALSE(l3_l2_message_queue::reconstruct_counter(99, 4, value));
 
     value = 100;
-    EXPECT_FALSE(l3_l2_queue_reconstruct_counter(105, 4, value));
+    EXPECT_FALSE(l3_l2_message_queue::reconstruct_counter(105, 4, value));
 }
 
 TEST(L3L2MessageQueueTest, L2InputPeekHandlesZeroByteDescriptorBeforeArenaValidation) {
@@ -236,7 +238,7 @@ TEST(L3L2MessageQueueTest, L2InputPeekHandlesZeroByteDescriptorBeforeArenaValida
     ASSERT_EQ(queue.error().kind, L3L2QueueErrorKind::NONE) << queue.error().message;
 
     L3L2QueueDescSlot slot{};
-    l3_l2_queue_encode_desc(&slot, 1, L3L2QueueOpcode::DATA, 0, 0);
+    l3_l2_message_queue::encode_desc(&slot, 1, L3L2QueueOpcode::DATA, 0, 0);
     std::memcpy(storage.payload.data() + queue.layout().input_desc_offset, &slot, sizeof(slot));
     storage.counters[0] = 1;
 
@@ -258,7 +260,7 @@ TEST(L3L2MessageQueueTest, L2InputPeekPoisonsZeroByteDescriptorWithNonzeroOffset
     ASSERT_EQ(queue.error().kind, L3L2QueueErrorKind::NONE) << queue.error().message;
 
     L3L2QueueDescSlot slot{};
-    l3_l2_queue_encode_desc(&slot, 1, L3L2QueueOpcode::DATA, 8, 0);
+    l3_l2_message_queue::encode_desc(&slot, 1, L3L2QueueOpcode::DATA, 8, 0);
     std::memcpy(storage.payload.data() + queue.layout().input_desc_offset, &slot, sizeof(slot));
     storage.counters[0] = 1;
 

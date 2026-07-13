@@ -217,7 +217,7 @@ void L3L2OrchCommService::alloc_region(const L3L2OrchCommRequest &request, L3L2O
     }
 
     response->desc = desc_for_region(region);
-    if (l3_l2_orch_comm_validate_desc(response->desc) != L3L2OrchCommValidationError::OK) {
+    if (l3_l2_orch_comm::validate_desc(response->desc) != L3L2OrchCommValidationError::OK) {
         release_region(region);
         set_response(response, -1, ServiceError::ALLOC_FAILED, 0, "ALLOC_REGION produced invalid descriptor");
         return;
@@ -254,7 +254,7 @@ void L3L2OrchCommService::payload_write(const L3L2OrchCommRequest &request, L3L2
         return;
     }
     L3L2OrchCommValidationError bounds =
-        l3_l2_orch_comm_validate_payload_bounds(request.payload_offset, request.payload_bytes, region->payload_bytes);
+        l3_l2_orch_comm::validate_payload_bounds(request.payload_offset, request.payload_bytes, region->payload_bytes);
     if (request.host_ptr == 0 || bounds != L3L2OrchCommValidationError::OK) {
         set_response(response, -1, ServiceError::BAD_REQUEST, request.region_id, "invalid PAYLOAD_WRITE request");
         return;
@@ -275,7 +275,7 @@ void L3L2OrchCommService::payload_read(const L3L2OrchCommRequest &request, L3L2O
         return;
     }
     L3L2OrchCommValidationError bounds =
-        l3_l2_orch_comm_validate_payload_bounds(request.payload_offset, request.payload_bytes, region->payload_bytes);
+        l3_l2_orch_comm::validate_payload_bounds(request.payload_offset, request.payload_bytes, region->payload_bytes);
     if (request.host_ptr == 0 || bounds != L3L2OrchCommValidationError::OK) {
         set_response(response, -1, ServiceError::BAD_REQUEST, request.region_id, "invalid PAYLOAD_READ request");
         return;
@@ -295,7 +295,7 @@ void L3L2OrchCommService::signal_notify(const L3L2OrchCommRequest &request, L3L2
         return;
     }
     L3L2OrchNotifyOp op = static_cast<L3L2OrchNotifyOp>(request.op);
-    if (!l3_l2_orch_comm_valid_notify_op(op)) {
+    if (!l3_l2_orch_comm::valid_notify_op(op)) {
         set_response(response, -1, ServiceError::BAD_REQUEST, request.region_id, "invalid SIGNAL_NOTIFY request");
         return;
     }
@@ -330,7 +330,7 @@ void L3L2OrchCommService::signal_test(const L3L2OrchCommRequest &request, L3L2Or
         return;
     }
     L3L2OrchWaitCmp cmp = static_cast<L3L2OrchWaitCmp>(request.op);
-    if (!l3_l2_orch_comm_valid_wait_cmp(cmp)) {
+    if (!l3_l2_orch_comm::valid_wait_cmp(cmp)) {
         set_response(response, -1, ServiceError::BAD_REQUEST, request.region_id, "invalid SIGNAL_TEST request");
         return;
     }
@@ -348,7 +348,7 @@ void L3L2OrchCommService::signal_test(const L3L2OrchCommRequest &request, L3L2Or
     }
 
     response->observed_counter = observed;
-    response->matched = l3_l2_orch_comm_compare_counter(observed, request.counter_operand, cmp) ? 1u : 0u;
+    response->matched = l3_l2_orch_comm::compare_counter(observed, request.counter_operand, cmp) ? 1u : 0u;
     if (response->matched != 0) {
         std::atomic_thread_fence(std::memory_order_acquire);
     }
@@ -361,7 +361,7 @@ void L3L2OrchCommService::signal_wait(const L3L2OrchCommRequest &request, L3L2Or
         return;
     }
     L3L2OrchWaitCmp cmp = static_cast<L3L2OrchWaitCmp>(request.op);
-    if (!l3_l2_orch_comm_valid_wait_cmp(cmp)) {
+    if (!l3_l2_orch_comm::valid_wait_cmp(cmp)) {
         set_response(response, -1, ServiceError::BAD_REQUEST, request.region_id, "invalid SIGNAL_WAIT request");
         return;
     }
@@ -380,7 +380,7 @@ void L3L2OrchCommService::signal_wait(const L3L2OrchCommRequest &request, L3L2Or
             return;
         }
         response->observed_counter = observed;
-        response->matched = l3_l2_orch_comm_compare_counter(observed, request.counter_operand, cmp) ? 1u : 0u;
+        response->matched = l3_l2_orch_comm::compare_counter(observed, request.counter_operand, cmp) ? 1u : 0u;
         if (response->matched != 0) {
             std::atomic_thread_fence(std::memory_order_acquire);
             set_response(response, 0, ServiceError::OK, request.region_id, "");
@@ -412,7 +412,7 @@ L3L2OrchCommService::Region *L3L2OrchCommService::find_live_region(uint64_t regi
 
 L3L2OrchRegionDesc L3L2OrchCommService::desc_for_region(const Region &region) const {
     return L3L2OrchRegionDesc{
-        l3_l2_orch_comm_magic_version(),
+        l3_l2_orch_comm::magic_version(),
         region.region_id,
         reinterpret_cast<uint64_t>(region.payload_dev),
         region.payload_bytes,
@@ -425,7 +425,7 @@ void *L3L2OrchCommService::counter_ptr(
     L3L2OrchCommService::Region &region, uint64_t counter_addr, L3L2OrchCommResponse *response
 ) {
     L3L2OrchRegionDesc desc = desc_for_region(region);
-    L3L2OrchCommValidationError error = l3_l2_orch_comm_validate_counter_addr(desc, counter_addr);
+    L3L2OrchCommValidationError error = l3_l2_orch_comm::validate_counter_addr(desc, counter_addr);
     if (error != L3L2OrchCommValidationError::OK) {
         set_response(response, -1, ServiceError::BAD_REQUEST, region.region_id, "invalid counter address");
         return nullptr;

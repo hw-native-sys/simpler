@@ -55,7 +55,7 @@ TEST(L3L2OrchCommSimRunnerTest, RunnerOwnedServiceHandlesPayloadSignalAndFree) {
     alloc.counter_bytes = 128;
     L3L2OrchCommResponse alloc_resp = submit(client, alloc);
     ASSERT_EQ(alloc_resp.status, 0) << alloc_resp.message;
-    ASSERT_EQ(l3_l2_orch_comm_validate_desc(alloc_resp.desc), L3L2OrchCommValidationError::OK);
+    ASSERT_EQ(l3_l2_orch_comm::validate_desc(alloc_resp.desc), L3L2OrchCommValidationError::OK);
 
     const uint8_t src[4] = {2, 4, 6, 8};
     uint8_t dst[4] = {};

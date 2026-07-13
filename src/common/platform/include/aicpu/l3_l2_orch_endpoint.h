@@ -105,7 +105,7 @@ public:
         if (has_error()) {
             return false;
         }
-        if (l3_l2_orch_comm_add_overflows(desc_.counter_base, offset)) {
+        if (l3_l2_orch_comm::add_overflows(desc_.counter_base, offset)) {
             set_error(
                 L3L2EndpointErrorKind::OUT_OF_BOUNDS, L3L2EndpointOp::COUNTER_ADDR, desc_.region_id, 0, 0,
                 "counter offset is out of bounds"

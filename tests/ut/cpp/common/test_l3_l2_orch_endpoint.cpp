@@ -29,7 +29,7 @@ struct RegionStorage {
 
 L3L2OrchRegionDesc make_desc(RegionStorage *storage) {
     return L3L2OrchRegionDesc{
-        l3_l2_orch_comm_magic_version(),
+        l3_l2_orch_comm::magic_version(),
         17,
         reinterpret_cast<uint64_t>(storage->payload.data()),
         storage->payload.size(),
@@ -42,7 +42,7 @@ TEST(L3L2OrchEndpointTest, DecodesDescriptorScalarsAndCounterRange) {
     RegionStorage storage{};
     L3L2OrchRegionDesc desc = make_desc(&storage);
     std::array<uint64_t, L3L2_ORCH_REGION_DESC_SCALAR_COUNT> scalars{};
-    ASSERT_TRUE(l3_l2_orch_comm_encode_desc(desc, scalars.data(), scalars.size()));
+    ASSERT_TRUE(l3_l2_orch_comm::encode_desc(desc, scalars.data(), scalars.size()));
 
     L3L2OrchEndpoint endpoint(scalars.data(), scalars.size());
 
