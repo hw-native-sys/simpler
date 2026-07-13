@@ -30,7 +30,7 @@
 // Performance profiling headers
 #include "aicpu/l2_swimlane_collector_aicpu.h"
 #include "aicpu/pmu_collector_aicpu.h"
-#include "aicpu/tensor_dump_aicpu.h"
+#include "aicpu/args_dump_aicpu.h"
 
 // =============================================================================
 // Dispatch helpers
@@ -240,7 +240,7 @@ void SchedulerContext::dispatch_block(
 #if SIMPLER_DFX
     if (is_dump_args_enabled()) {
         dump_args_for_task<PTO2_SUBTASK_SLOT_COUNT>(
-            thread_idx, slot_state, TensorDumpStage::BEFORE_DISPATCH,
+            thread_idx, slot_state, ArgsDumpStage::BEFORE_DISPATCH,
             [](ActiveMask active_mask, int raw_subtask_id) {
                 return active_mask.subtask_active(static_cast<PTO2SubtaskSlot>(raw_subtask_id));
             },

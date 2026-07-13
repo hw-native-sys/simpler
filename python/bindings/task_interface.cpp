@@ -742,21 +742,21 @@ NB_MODULE(_task_interface, m) {
                 }
             }
         )
+        // Accept either an int dump level (0=off, 1=partial, 2=full,
+        // 3=full_json_only) or a Python bool. `True` maps to level 1
+        // (partial) — the default when --dump-args is passed without a
+        // value; `False` maps to 0.
         .def_prop_rw(
-            "enable_dump_tensor",
+            "enable_dump_args",
             [](const CallConfig &c) {
-                return c.enable_dump_tensor;
+                return c.enable_dump_args;
             },
-            // Accept either an int dump level (0=off, 1=partial, 2=full,
-            // 3=full_json_only) or a Python bool. `True` maps to level 1
-            // (partial) — the default when --dump-args is passed without a
-            // value; `False` maps to 0.
             [](CallConfig &c, nb::object v) {
                 if (PyBool_Check(v.ptr())) {
-                    c.enable_dump_tensor = nb::cast<bool>(v) ? 1 : 0;
+                    c.enable_dump_args = nb::cast<bool>(v) ? 1 : 0;
                 } else {
                     int level = nb::cast<int>(v);
-                    c.enable_dump_tensor = (level < 0) ? 0 : (level > 3) ? 3 : level;
+                    c.enable_dump_args = (level < 0) ? 0 : (level > 3) ? 3 : level;
                 }
             }
         )
@@ -799,9 +799,8 @@ NB_MODULE(_task_interface, m) {
         .def("__repr__", [append_ring_values](const CallConfig &self) -> std::string {
             std::ostringstream os;
             os << "CallConfig(block_dim=" << self.block_dim << ", aicpu_thread_num=" << self.aicpu_thread_num
-               << ", enable_l2_swimlane=" << self.enable_l2_swimlane
-               << ", enable_dump_tensor=" << self.enable_dump_tensor << ", enable_pmu=" << self.enable_pmu
-               << ", enable_dep_gen=" << (self.enable_dep_gen ? "True" : "False")
+               << ", enable_l2_swimlane=" << self.enable_l2_swimlane << ", enable_dump_args=" << self.enable_dump_args
+               << ", enable_pmu=" << self.enable_pmu << ", enable_dep_gen=" << (self.enable_dep_gen ? "True" : "False")
                << ", enable_scope_stats=" << (self.enable_scope_stats ? "True" : "False");
             if (self.runtime_env.any()) {
                 append_ring_values(os, "runtime_env.ring_task_window", true, self.runtime_env.ring_task_window);

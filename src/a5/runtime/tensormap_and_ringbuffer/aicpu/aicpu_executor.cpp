@@ -41,7 +41,7 @@
 #include "aicpu/dep_gen_collector_aicpu.h"
 #include "aicpu/l2_swimlane_collector_aicpu.h"
 #include "aicpu/scope_stats_collector_aicpu.h"
-#include "aicpu/tensor_dump_aicpu.h"
+#include "aicpu/args_dump_aicpu.h"
 #include "common/l2_swimlane_profiling.h"
 #include "common/unified_log.h"
 

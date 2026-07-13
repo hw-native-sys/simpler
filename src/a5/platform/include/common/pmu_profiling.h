@@ -25,7 +25,7 @@
  *
  * a5 has no halHostRegister (DAV_3510), so host↔device SPSC fields are
  * read/written via rtMemcpy (onboard) or memcpy (sim), using host shadow
- * buffers — same pattern as a5 l2_swimlane_collector and tensor_dump_collector.
+ * buffers — same pattern as a5 l2_swimlane_collector and args_dump_collector.
  */
 
 #ifndef SRC_A5_PLATFORM_INCLUDE_COMMON_PMU_PROFILING_H_

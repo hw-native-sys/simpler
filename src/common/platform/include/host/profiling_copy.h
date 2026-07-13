@@ -40,7 +40,7 @@ inline int profiling_copy_from_device_for_ops(void *host_dst, const void *dev_sr
 }
 
 // Per-arch callback selector for leaf collectors that live in `common/`
-// (e.g. scope_stats, tensor_dump). Returns the copy function on non-SVM
+// (e.g. scope_stats, args_dump). Returns the copy function on non-SVM
 // platforms (a5: real rtMemcpy/memcpy) and an empty `std::function` on SVM
 // platforms (a2a3: host and device share addresses, the framework's
 // null-check then short-circuits all mirror/range/buffer ops to no-ops).

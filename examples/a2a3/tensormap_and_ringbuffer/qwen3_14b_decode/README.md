@@ -82,7 +82,7 @@ match the torch reference (finite `max_abs_diff ≈ 0.03`).
 
 The fused-attention tile-pipe (`TPUSH/TPOP<…, TILE_UP_DOWN>`) computes its per-AIV
 FIFO offset from the **no-arg** ISA `get_subblockid()`, which under this MIX
-dispatch returns **0 for both** AIV0 and AIV1 (confirmed by tensor dump). Left
+dispatch returns **0 for both** AIV0 and AIV1 (confirmed by args dump). Left
 uncorrected, both lanes collide on the same FIFO half and attention is poisoned →
 NaN. The correct lane id (0/1) is only available from simpler's
 `get_sub_block_id(args)`.

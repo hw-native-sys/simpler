@@ -134,7 +134,7 @@ else is internal.
 - Runtime behavior users will observe (new timeouts, validation errors,
   diagnostics, env vars, CLI flags)
 - New examples, new test entry points, new tools
-- **DFX / diagnostic tooling the user runs** — a tensor-dump level, a
+- **DFX / diagnostic tooling the user runs** — an args-dump level, a
   profiling flag, a new channel/field in a report (`scope_stats`), a new
   track/arrow in a trace (`swimlane`), or corrected report output is
   user-facing *when it adds or changes something the user observes while

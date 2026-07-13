@@ -924,7 +924,7 @@ class SceneTestCase:
         config.runtime_env.ring_heap = runtime_env.get("ring_heap", 0)
         config.runtime_env.ring_dep_pool = runtime_env.get("ring_dep_pool", 0)
         config.enable_l2_swimlane = enable_l2_swimlane
-        config.enable_dump_tensor = enable_dump_args
+        config.enable_dump_args = enable_dump_args
         config.enable_pmu = enable_pmu  # 0=disabled, >0=enabled with event type
         config.enable_dep_gen = enable_dep_gen
         config.enable_scope_stats = enable_scope_stats

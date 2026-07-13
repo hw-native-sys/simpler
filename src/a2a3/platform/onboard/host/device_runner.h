@@ -48,7 +48,7 @@
 #include "host/function_cache.h"
 #include "host/memory_allocator.h"
 #include "host/l2_swimlane_collector.h"
-#include "host/tensor_dump_collector.h"
+#include "host/args_dump_collector.h"
 #include "host/pmu_collector.h"
 #include "host/dep_gen_collector.h"
 #include "aicpu_loader/host/load_aicpu_op.h"
@@ -122,7 +122,7 @@ public:
 
     /**
      * a2a3-only `dep_gen` enablement setter. The shared
-     * `set_l2_swimlane_enabled`, `set_dump_tensor_enabled`,
+     * `set_l2_swimlane_enabled`, `set_dump_args_enabled`,
      * `set_pmu_enabled`, `set_scope_stats_enabled`, `set_output_prefix`,
      * `output_prefix`, and `launch_aicpu_kernel` live on `DeviceRunnerBase`.
      */
@@ -261,7 +261,7 @@ private:
     int init_l2_swimlane(int num_aicore, int aicpu_thread_num, int device_id);
 
     /**
-     * Initialize tensor dump shared memory and collector.
+     * Initialize args dump shared memory and collector.
      *
      * Allocates dump SHM + per-thread arenas, populates initial meta buffers,
      * and stores the dump base in AICPU launch arguments.
@@ -270,7 +270,7 @@ private:
      * @param device_id Device ID for host registration
      * @return 0 on success, error code on failure
      */
-    int init_tensor_dump(Runtime &runtime, int device_id);
+    int init_args_dump(Runtime &runtime, int device_id);
 
     /**
      * Initialize PMU streaming shared memory.
@@ -314,7 +314,7 @@ private:
      * as a backstop before mem_alloc_.finalize().
      */
     void finalize_collectors();
-    // Shared enable flags (`enable_l2_swimlane_`, `enable_dump_tensor_`,
+    // Shared enable flags (`enable_l2_swimlane_`, `enable_dump_args_`,
     // `enable_pmu_`, `enable_scope_stats_`, `l2_swimlane_level_`,
     // `pmu_event_type_`, `output_prefix_`) live on `DeviceRunnerBase`.
     //

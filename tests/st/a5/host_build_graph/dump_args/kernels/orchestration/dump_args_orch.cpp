@@ -9,7 +9,7 @@
  * -----------------------------------------------------------------------------------------------------------
  */
 /**
- * Dump-tensor interface demo for host_build_graph.
+ * Dump-args interface demo for host_build_graph.
  *
  * Demonstrates the two ways to register tensor metadata for dump:
  *   Task 0 (add):                add_task() + set_tensor_info_to_task()
@@ -22,7 +22,7 @@
 
 extern "C" {
 
-int build_dump_tensor_graph(OrchestrationRuntime *runtime, const ChipStorageTaskArgs &orch_args) {
+int build_dump_args_graph(OrchestrationRuntime *runtime, const ChipStorageTaskArgs &orch_args) {
     void *host_a = orch_args.tensor(0).data_as<void>();
     void *host_b = orch_args.tensor(1).data_as<void>();
     void *host_f = orch_args.tensor(2).data_as<void>();

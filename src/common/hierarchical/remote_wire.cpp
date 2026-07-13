@@ -311,7 +311,7 @@ std::vector<uint8_t> encode_call_config(const CallConfig &config) {
     put_i32(out, config.block_dim);
     put_i32(out, config.aicpu_thread_num);
     put_i32(out, config.enable_l2_swimlane);
-    put_i32(out, config.enable_dump_tensor);
+    put_i32(out, config.enable_dump_args);
     put_i32(out, config.enable_pmu);
     put_i32(out, config.enable_dep_gen);
     put_i32(out, config.enable_scope_stats);
@@ -324,7 +324,7 @@ CallConfig decode_call_config(const uint8_t *data, size_t size, size_t &offset) 
     config.block_dim = get_i32(data, size, offset);
     config.aicpu_thread_num = get_i32(data, size, offset);
     config.enable_l2_swimlane = get_i32(data, size, offset);
-    config.enable_dump_tensor = get_i32(data, size, offset);
+    config.enable_dump_args = get_i32(data, size, offset);
     config.enable_pmu = get_i32(data, size, offset);
     config.enable_dep_gen = get_i32(data, size, offset);
     config.enable_scope_stats = get_i32(data, size, offset);

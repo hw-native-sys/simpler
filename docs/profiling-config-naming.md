@@ -114,7 +114,7 @@ on runtime timing (natural runtime gate).
 The `SIMPLER_DFX_FLAG_*` constants select which DFX collectors a given run
 collects; accessed via `SIMPLER_GET/SET/CLEAR_DFX_FLAG`:
 
-`SIMPLER_DFX_FLAG_NONE`, `_DUMP_TENSOR`, `_L2_SWIMLANE`, `_PMU`, `_DEP_GEN`,
+`SIMPLER_DFX_FLAG_NONE`, `_DUMP_ARGS`, `_L2_SWIMLANE`, `_PMU`, `_DEP_GEN`,
 `_SCOPE_STATS`.
 
 Platform collectors carry no subsystem qualifier. Future runtime-specific

@@ -1,7 +1,7 @@
 # DFX Buffer Capacity Audit (a2a3)
 
 > Cross-subsystem buffer-capacity audit of the five a2a3 DFX profiling
-> collectors (l2_swimlane / dep_gen / pmu / scope_stats / tensor_dump), with a
+> collectors (l2_swimlane / dep_gen / pmu / scope_stats / args_dump), with a
 > full **data → theory → measurement → conclusion** argument per verdict.
 > The right-sizing it recommends is landed in this PR; a2a3 onboard-validated
 > zero-drop. Responds to
@@ -19,7 +19,7 @@ over-provisioned pools frees **~66 MB, zero ABI**.
 | **pmu** | over, free margin 75%, L≈1 | `BUFFERS_PER_CORE` **4→2** | 9.2 → **4.6 MB** |
 | **scope_stats** | over, free margin 87.5%, L≈1 | `BUFFERS_PER_INSTANCE` **8→4** | 0.21 → **0.11 MB** |
 | **dep_gen** | drops are **rate-limited, not capacity** | `RECORDS_PER_BUFFER` → **1024** (corrects a 2048 overshoot) | frees ~17.5 MB |
-| **tensor_dump** | adequate (0 overwrite across 6 cases) | **unchanged** | — |
+| **args_dump** | adequate (0 overwrite across 6 cases) | **unchanged** | — |
 
 **Two counterintuitive findings** (argued in §6): ① drops are set by the
 **dispatch pattern (burst intensity)**, not submit count; ② dep_gen drops are
@@ -124,7 +124,7 @@ verdict reads the weaker dimension):
 | scope_stats | 7/8 → **87.5%** | 87% | **over** |
 | l2_swimlane | **0/4 → 0%** | 95% | **at edge** (free bottomed, but zero-drop) → §4.2 |
 | dep_gen | 3/4 → 75% | 50% | **rate-limited**: both have room yet it still drops (§5.2) |
-| tensor_dump | 3/4 → 75% | 92% | **adequate** (no overwrite) |
+| args_dump | 3/4 → 75% | 92% | **adequate** (no overwrite) |
 
 ### 4.2 l2_swimlane: the four pools in detail
 
@@ -246,7 +246,7 @@ drop ≈ (P − R) × T − N × S      P=produce rate, R=host drain rate, N×S=
   before the cut (free=0 is recycle-latency-bound, not capacity, so cutting count
   does not worsen it). phase 72→28 MB.
 
-### 5.4 tensor_dump: adequate, leave
+### 5.4 args_dump: adequate, leave
 
 All 6 examples (including the bare flood) show `ovf=0` (no arena overwrite) and a
 steady free of 3/4. The old "arena overwrite under-provisioned" claim is refuted by
@@ -306,7 +306,7 @@ separate fix (fewer threads / merged mgmt / scheduling priority).
 | pmu | `PMU_RECORDS_PER_BUFFER` (512) | `PMU_BUFFERS_PER_CORE` (2) | 64B | per-core |
 | dep_gen | `DEP_GEN_RECORDS_PER_BUFFER` (1024) | `DEP_GEN_BUFFERS_PER_INSTANCE` (4) | 4672B | per-instance |
 | scope_stats | `SCOPE_STATS_RECORDS_PER_BUFFER` (512) | `SCOPE_STATS_BUFFERS_PER_INSTANCE` (4) | 52B | per-instance |
-| tensor_dump | `DUMP_RECORDS_PER_BUFFER` (256) + arena | `DUMP_BUFFERS_PER_THREAD` (8) | 128B+tensor | per-thread |
+| args_dump | `PLATFORM_DUMP_RECORDS_PER_BUFFER` (256) + arena | `PLATFORM_DUMP_BUFFERS_PER_THREAD` (8) | 128B+tensor | per-thread |
 
 All prefixed with `PLATFORM_`. a2a3 and a5 are independent copies; this report
 covers a2a3 only.

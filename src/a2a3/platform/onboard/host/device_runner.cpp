@@ -261,7 +261,7 @@ int DeviceRunner::run(Runtime &runtime, const CallConfig &config) {
 
     // Build the profiling-flag bitfield (a2a3 carries an extra dep_gen bit).
     uint32_t enable_profiling_flag = SIMPLER_DFX_FLAG_NONE;
-    if (enable_dump_tensor_) SIMPLER_SET_DFX_FLAG(enable_profiling_flag, SIMPLER_DFX_FLAG_DUMP_TENSOR);
+    if (enable_dump_args_) SIMPLER_SET_DFX_FLAG(enable_profiling_flag, SIMPLER_DFX_FLAG_DUMP_ARGS);
     if (enable_l2_swimlane_) SIMPLER_SET_DFX_FLAG(enable_profiling_flag, SIMPLER_DFX_FLAG_L2_SWIMLANE);
     if (enable_pmu_) SIMPLER_SET_DFX_FLAG(enable_profiling_flag, SIMPLER_DFX_FLAG_PMU);
     if (enable_dep_gen_) SIMPLER_SET_DFX_FLAG(enable_profiling_flag, SIMPLER_DFX_FLAG_DEP_GEN);
@@ -331,11 +331,11 @@ int DeviceRunner::run(Runtime &runtime, const CallConfig &config) {
         }
     }
 
-    if (enable_dump_tensor_) {
-        // Initialize tensor dump (independent from profiling)
-        rc = init_tensor_dump(runtime, device_id_);
+    if (enable_dump_args_) {
+        // Initialize args dump (independent from profiling)
+        rc = init_args_dump(runtime, device_id_);
         if (rc != 0) {
-            LOG_ERROR("init_tensor_dump failed: %d", rc);
+            LOG_ERROR("init_args_dump failed: %d", rc);
             return rc;
         }
     }
@@ -900,7 +900,7 @@ int DeviceRunner::init_l2_swimlane(int num_aicore, int aicpu_thread_num, int dev
     return 0;
 }
 
-int DeviceRunner::init_tensor_dump(Runtime &runtime, int device_id) {
+int DeviceRunner::init_args_dump(Runtime &runtime, int device_id) {
     int num_dump_threads = runtime.get_aicpu_thread_num();
 
     auto alloc_cb = [this](size_t size) -> void * {
@@ -909,7 +909,7 @@ int DeviceRunner::init_tensor_dump(Runtime &runtime, int device_id) {
 
     auto register_cb = [](void *dev_ptr, size_t size, int device_id, void **host_ptr) -> int {
         if (load_hal_if_needed() != 0) {
-            LOG_ERROR("Failed to load ascend_hal for tensor dump: %s", dlerror());
+            LOG_ERROR("Failed to load ascend_hal for args dump: %s", dlerror());
             return -1;
         }
         HalHostRegisterFn fn = get_halHostRegister();
@@ -925,7 +925,7 @@ int DeviceRunner::init_tensor_dump(Runtime &runtime, int device_id) {
     };
 
     int rc = dump_collector_.initialize(
-        num_dump_threads, device_id, alloc_cb, register_cb, free_cb, output_prefix_, dump_tensor_level_
+        num_dump_threads, device_id, alloc_cb, register_cb, free_cb, output_prefix_, dump_args_level_
     );
     if (rc != 0) {
         return rc;

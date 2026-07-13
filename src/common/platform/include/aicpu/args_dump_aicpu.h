@@ -9,16 +9,16 @@
  * -----------------------------------------------------------------------------------------------------------
  */
 /**
- * @file tensor_dump_aicpu.h
- * @brief AICPU tensor dump collection interface
+ * @file args_dump_aicpu.h
+ * @brief AICPU args dump collection interface
  *
- * Provides tensor dump management for AICPU side.
+ * Provides args dump management for AICPU side.
  * Handles dump shared-memory base propagation plus buffer initialization,
  * tensor data copying to arenas, metadata recording, and flushing.
  */
 
-#ifndef SRC_COMMON_PLATFORM_INCLUDE_AICPU_TENSOR_DUMP_AICPU_H_
-#define SRC_COMMON_PLATFORM_INCLUDE_AICPU_TENSOR_DUMP_AICPU_H_
+#ifndef SRC_COMMON_PLATFORM_INCLUDE_AICPU_ARGS_DUMP_AICPU_H_
+#define SRC_COMMON_PLATFORM_INCLUDE_AICPU_ARGS_DUMP_AICPU_H_
 
 #include <stdint.h>
 
@@ -31,7 +31,7 @@
 #endif
 
 #include "common/memory_barrier.h"
-#include "common/tensor_dump.h"
+#include "common/args_dump.h"
 #include "data_type.h"
 
 #ifdef __cplusplus
@@ -44,7 +44,7 @@ extern "C" {
 #endif
 
 /**
- * Set the tensor dump shared-memory base address.
+ * Set the args dump shared-memory base address.
  * Called by the platform layer before AICPU execution starts.
  *
  * @param dump_data_base Device pointer (as uint64_t) to dump shared memory
@@ -52,29 +52,29 @@ extern "C" {
 void set_platform_dump_base(uint64_t dump_data_base);
 
 /**
- * Get the tensor dump shared-memory base address.
+ * Get the args dump shared-memory base address.
  *
  * @return Device pointer (as uint64_t) to dump shared memory
  */
 uint64_t get_platform_dump_base();
 
 /**
- * Set whether tensor dump is enabled for this execution.
+ * Set whether args dump is enabled for this execution.
  * Called by the platform layer before AICPU execution starts.
  *
- * @param enable true to enable tensor dump, false to disable
+ * @param enable true to enable args dump, false to disable
  */
 void set_dump_args_enabled(bool enable);
 
 /**
- * Get whether tensor dump is enabled for this execution.
+ * Get whether args dump is enabled for this execution.
  *
- * @return true if tensor dump is enabled
+ * @return true if args dump is enabled
  */
 bool is_dump_args_enabled();
 bool is_dump_args_selective_mode();
-void set_dump_args_task_mask(uint64_t task_id, TensorDumpArgMask mask, TensorDumpArgMask flags);
-void get_dump_args_task_masks(uint64_t task_id, TensorDumpArgMask *mask, TensorDumpArgMask *flags);
+void set_dump_args_task_mask(uint64_t task_id, ArgsDumpArgMask mask, ArgsDumpArgMask flags);
+void get_dump_args_task_masks(uint64_t task_id, ArgsDumpArgMask *mask, ArgsDumpArgMask *flags);
 void set_dump_args_task_scalar_dtypes(uint64_t task_id, uint32_t scalar_count, const uint8_t *scalar_dtypes);
 bool get_dump_args_task_scalar_dtypes(uint64_t task_id, uint32_t *scalar_count, uint8_t *scalar_dtypes);
 
@@ -83,27 +83,27 @@ bool get_dump_args_task_scalar_dtypes(uint64_t task_id, uint32_t *scalar_count, 
 #endif
 
 #ifdef __cplusplus
-bool get_dump_arg_role_from_direction(ArgDirection dir, TensorDumpRole *role);
+bool get_dump_arg_role_from_direction(ArgDirection dir, ArgsDumpRole *role);
 int32_t count_callable_tensor_args(const CoreCallable &callable);
-bool should_dump_arg_at_stage(TensorDumpRole role, TensorDumpStage stage);
-bool should_dump_task(TensorDumpArgMask arg_mask);
-bool should_dump_arg(TensorDumpArgMask arg_mask, int32_t arg_index);
-bool has_dump_arg_flag(TensorDumpArgMask arg_mask, int32_t arg_index);
+bool should_dump_arg_at_stage(ArgsDumpRole role, ArgsDumpStage stage);
+bool should_dump_task(ArgsDumpArgMask arg_mask);
+bool should_dump_arg(ArgsDumpArgMask arg_mask, int32_t arg_index);
+bool has_dump_arg_flag(ArgsDumpArgMask arg_mask, int32_t arg_index);
 bool try_log_dump_args_layout_mismatch();
-int dump_arg_record(int thread_idx, const TensorDumpInfo &info);
+int dump_arg_record(int thread_idx, const ArgsDumpInfo &info);
 
 template <int MaxSubtaskSlots, typename SlotStateT, typename IsSubtaskActiveFn, typename GetFunctionBinAddrFn>
 inline void dump_args_for_task(
-    int32_t thread_idx, const SlotStateT &slot_state, TensorDumpStage stage, IsSubtaskActiveFn is_subtask_active,
+    int32_t thread_idx, const SlotStateT &slot_state, ArgsDumpStage stage, IsSubtaskActiveFn is_subtask_active,
     GetFunctionBinAddrFn get_function_bin_addr
 ) {
     // The record's func_ids[] must hold every active subtask's id. MaxSubtaskSlots
     // is PTO2_SUBTASK_SLOT_COUNT at every call site, so this ties the record array
     // size (platform layer) to the runtime subtask cap and catches any drift.
-    static_assert(MaxSubtaskSlots <= TENSOR_DUMP_MAX_FUNC_IDS, "TENSOR_DUMP_MAX_FUNC_IDS must cover MaxSubtaskSlots");
+    static_assert(MaxSubtaskSlots <= ARGS_DUMP_MAX_FUNC_IDS, "ARGS_DUMP_MAX_FUNC_IDS must cover MaxSubtaskSlots");
     const auto &pl = *slot_state.payload;
-    TensorDumpArgMask dump_arg_mask = TENSOR_DUMP_ARG_MASK_NONE;
-    TensorDumpArgMask dump_arg_flags = TENSOR_DUMP_ARG_MASK_NONE;
+    ArgsDumpArgMask dump_arg_mask = ARGS_DUMP_ARG_MASK_NONE;
+    ArgsDumpArgMask dump_arg_flags = ARGS_DUMP_ARG_MASK_NONE;
     if (is_dump_args_selective_mode()) {
         get_dump_args_task_masks(slot_state.task->task_id.raw, &dump_arg_mask, &dump_arg_flags);
     }
@@ -114,7 +114,7 @@ inline void dump_args_for_task(
     // signature drives direction + positional slot mapping; active_fids is the
     // task's mix membership, stamped on every record so a mix is recoverable as
     // the func set on each slot (no per-subtask duplication of the geometry).
-    int32_t active_fids[TENSOR_DUMP_MAX_FUNC_IDS] = {};
+    int32_t active_fids[ARGS_DUMP_MAX_FUNC_IDS] = {};
     int32_t active_count = 0;
     const CoreCallable *sig_src = nullptr;
 
@@ -130,7 +130,7 @@ inline void dump_args_for_task(
         if (sig_src == nullptr || cand->sig_count() > sig_src->sig_count()) {
             sig_src = cand;
         }
-        if (active_count < TENSOR_DUMP_MAX_FUNC_IDS) {
+        if (active_count < ARGS_DUMP_MAX_FUNC_IDS) {
             active_fids[active_count++] = slot_state.task->kernel_id[raw_subtask_id];
         }
     }
@@ -169,13 +169,13 @@ inline void dump_args_for_task(
             covered[slot] = true;
             covered_count++;
         }
-        TensorDumpRole role;
+        ArgsDumpRole role;
         if (!get_dump_arg_role_from_direction(dir, &role) || !should_dump_arg_at_stage(role, stage) ||
             !should_dump_arg(dump_arg_mask, slot)) {
             continue;
         }
         const auto &t = pl.tensors[slot];
-        TensorDumpInfo info = {};
+        ArgsDumpInfo info = {};
         info.buffer_addr = t.buffer.addr;
         info.dtype = static_cast<uint8_t>(t.dtype);
         info.ndims = static_cast<uint8_t>(t.ndims);
@@ -188,7 +188,7 @@ inline void dump_args_for_task(
         info.arg_index = slot;
         info.role = role;
         info.stage = stage;
-        info.kind = static_cast<uint8_t>(TensorDumpKind::TENSOR);
+        info.kind = static_cast<uint8_t>(ArgsDumpKind::TENSOR);
         info.func_count = active_count;
         for (int32_t i = 0; i < active_count; i++) {
             info.func_ids[i] = active_fids[i];
@@ -209,7 +209,7 @@ inline void dump_args_for_task(
 
     // Scalars are stored once in the task payload; dump them once with the task's
     // full active-subtask set (same func_ids as the tensor records).
-    if (stage == TensorDumpStage::BEFORE_DISPATCH && pl.scalar_count > 0) {
+    if (stage == ArgsDumpStage::BEFORE_DISPATCH && pl.scalar_count > 0) {
         uint8_t scalar_dtypes[CORE_MAX_SCALAR_ARGS] = {};
         uint32_t dtype_scalar_count = 0;
         bool has_scalar_dtypes =
@@ -219,23 +219,23 @@ inline void dump_args_for_task(
             if (!should_dump_arg(dump_arg_mask, scalar_arg_index)) {
                 continue;
             }
-            TensorDumpInfo info = {};
+            ArgsDumpInfo info = {};
             info.task_id = slot_state.task->task_id.raw;
-            info.role = TensorDumpRole::INPUT;
+            info.role = ArgsDumpRole::INPUT;
             info.stage = stage;
             info.dtype = (has_scalar_dtypes && scalar_index < static_cast<int32_t>(dtype_scalar_count)) ?
                              scalar_dtypes[scalar_index] :
                              static_cast<uint8_t>(DataType::UINT64);
             info.ndims = 0;
             info.arg_index = static_cast<uint32_t>(scalar_arg_index);
-            info.kind = static_cast<uint8_t>(TensorDumpKind::SCALAR);
+            info.kind = static_cast<uint8_t>(ArgsDumpKind::SCALAR);
             info.func_count = active_count;
             for (int32_t i = 0; i < active_count; i++) {
                 info.func_ids[i] = active_fids[i];
             }
             info.scalar_value = pl.scalars[scalar_index];
             if (has_dump_arg_flag(dump_arg_flags, scalar_arg_index)) {
-                info.flags = TENSOR_DUMP_RECORD_FLAG_ARG_INDEX_AMBIGUOUS;
+                info.flags = ARGS_DUMP_RECORD_FLAG_ARG_INDEX_AMBIGUOUS;
             }
             dump_arg_record(thread_idx, info);
         }
@@ -282,7 +282,7 @@ inline void dump_running_task_outputs(
             continue;
         }
         dump_args_for_task<MaxSubtaskSlots>(
-            thread_idx, *running, TensorDumpStage::AFTER_COMPLETION, is_subtask_active, get_function_bin_addr
+            thread_idx, *running, ArgsDumpStage::AFTER_COMPLETION, is_subtask_active, get_function_bin_addr
         );
     }
 }
@@ -291,7 +291,7 @@ template <typename TensorInfoT>
 inline void dump_args_for_task(
     int32_t thread_idx, uint64_t task_id, int32_t task_arg_count, const CoreCallable &callable,
     const TensorInfoT *tensor_info, int32_t tensor_info_count, const uint64_t *buffer_addrs, int32_t buffer_count,
-    TensorDumpStage stage
+    ArgsDumpStage stage
 ) {
     int32_t sig_count = callable.sig_count();
     if (task_arg_count < sig_count) {
@@ -344,14 +344,14 @@ inline void dump_args_for_task(
             continue;
         }
 
-        TensorDumpRole role;
+        ArgsDumpRole role;
         if (!get_dump_arg_role_from_direction(dir, &role) || !should_dump_arg_at_stage(role, stage)) {
             tensor_arg_index++;
             continue;
         }
 
         const auto &t = tensor_info[tensor_arg_index];
-        TensorDumpInfo info = {};
+        ArgsDumpInfo info = {};
         info.task_id = task_id;
         info.func_count = 1;    // host_build_graph overload does not thread func_id
         info.func_ids[0] = -1;  // -> unknown
@@ -386,7 +386,7 @@ inline void dump_args_for_task(
  * Sets up per-thread DumpBufferState pointers and pops initial
  * metadata buffers from each thread's free_queue.
  *
- * @param num_dump_threads Number of scheduling threads that will dump tensors
+ * @param num_dump_threads Number of scheduling threads that will dump args
  */
 void dump_args_init(int num_dump_threads);
 
@@ -394,7 +394,7 @@ void dump_args_init(int num_dump_threads);
  * Record a single dumped arg.
  *
  * Copies tensor data from GM to the thread's arena, appends a
- * TensorDumpRecord to the current metadata buffer. Switches
+ * ArgsDumpRecord to the current metadata buffer. Switches
  * buffers when full via the SPSC free_queue.
  *
  * When metadata buffers are temporarily exhausted, old dump metadata may be
@@ -404,7 +404,7 @@ void dump_args_init(int num_dump_threads);
  * @param info Tensor metadata and identification
  * @return 0 on success or intentional drop, -1 only when dump state is unavailable
  */
-int dump_arg_record(int thread_idx, const TensorDumpInfo &info);
+int dump_arg_record(int thread_idx, const ArgsDumpInfo &info);
 
 /**
  * Flush remaining args dump data for a thread.
@@ -418,4 +418,4 @@ void dump_args_flush(int thread_idx);
 
 #endif
 
-#endif  // SRC_COMMON_PLATFORM_INCLUDE_AICPU_TENSOR_DUMP_AICPU_H_
+#endif  // SRC_COMMON_PLATFORM_INCLUDE_AICPU_ARGS_DUMP_AICPU_H_

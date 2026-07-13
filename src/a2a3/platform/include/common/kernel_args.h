@@ -68,7 +68,7 @@ extern "C" {
  * - runtime_args: Written by host, read by AICPU (task runtime, includes
  *   handshake buffers)
  * - dump_data_base: Written by host, read by AICPU platform layer; zero when
- *   tensor dump is unused
+ *   args dump is unused
  * - pmu_data_base: Written by host platform, read by AICPU platform layer;
  *   zero when PMU is unused
  * - dep_gen_data_base: Written by host platform, read by AICPU platform layer;
@@ -76,7 +76,7 @@ extern "C" {
  *
  * enable_profiling_flag bit definitions (umbrella bitmask — "profiling" is
  * the umbrella, each bit is a parallel diagnostics sub-feature):
- * - bit0: tensor dump enabled
+ * - bit0: args dump enabled
  * - bit1: L2 swimlane enabled
  * - bit2: PMU enabled
  * - bit3: dep_gen capture enabled
@@ -123,7 +123,7 @@ struct KernelArgs {
     // Zero when the buffer was not allocated.
     uint64_t device_wall_data_base{0};
     // 32-bit tail.
-    uint32_t enable_profiling_flag{0};  // Profiling umbrella bitmask; dump_tensor|l2_swimlane|pmu|dep_gen|scope_stats
+    uint32_t enable_profiling_flag{0};  // Profiling umbrella bitmask; dump_args|l2_swimlane|pmu|dep_gen|scope_stats
 };
 
 static_assert(offsetof(KernelArgs, runtime_args) == 0, "KernelArgs::runtime_args offset drift");

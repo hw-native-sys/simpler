@@ -9,7 +9,7 @@
  * -----------------------------------------------------------------------------------------------------------
  */
 /**
- * Dump-tensor orchestration — submit_task / TensorMap form
+ * Dump-args orchestration — submit_task / TensorMap form
  *
  * Builds: f = (a + b) + 1
  *   t0: f = a + b            (kernel_add, AIV)
@@ -61,7 +61,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const L2Ta
     p1.add_scalar(sconv.u64);
     rt_submit_aiv_task(FUNC_ADD_SCALAR_INPLACE, p1);
 
-    LOG_INFO_V9("[dump_tensor_orch] Submitted f = (a + b) + 1");
+    LOG_INFO_V9("[dump_args_orch] Submitted f = (a + b) + 1");
 }
 
 }  // extern "C"

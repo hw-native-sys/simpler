@@ -44,7 +44,7 @@ private:
     void unload_executor_binaries();
 
     int init_l2_swimlane(int num_aicore, int aicpu_thread_num, int device_id);
-    int init_tensor_dump(Runtime &runtime, int device_id);
+    int init_args_dump(Runtime &runtime, int device_id);
     int init_pmu(int num_cores, int num_threads, const std::string &csv_path, PmuEventType event_type, int device_id);
     int init_scope_stats(int num_threads);
     int init_dep_gen(int num_threads, int device_id);

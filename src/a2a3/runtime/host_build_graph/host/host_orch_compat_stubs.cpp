@@ -26,12 +26,11 @@
  */
 
 #include "aicpu/scope_stats_collector_aicpu.h"
-#include "aicpu/tensor_dump_aicpu.h"
+#include "aicpu/args_dump_aicpu.h"
 
 __attribute__((weak, visibility("hidden"))) bool is_dump_args_enabled() { return false; }
 
-__attribute__((weak, visibility("hidden"))) void
-set_dump_args_task_mask(uint64_t, TensorDumpArgMask, TensorDumpArgMask) {}
+__attribute__((weak, visibility("hidden"))) void set_dump_args_task_mask(uint64_t, ArgsDumpArgMask, ArgsDumpArgMask) {}
 
 __attribute__((weak, visibility("hidden"))) void set_dump_args_task_scalar_dtypes(uint64_t, uint32_t, const uint8_t *) {
 }

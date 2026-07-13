@@ -102,7 +102,7 @@ struct KernelArgs {
     // AICPU args copy makes inline fields write-only).
     uint64_t device_wall_data_base{0};
     // 32-bit tail (two adjacent uint32_t — no interior padding).
-    uint32_t enable_profiling_flag{0};  // Profiling umbrella bitmask; dump_tensor|l2_swimlane|pmu|dep_gen|scope_stats
+    uint32_t enable_profiling_flag{0};  // Profiling umbrella bitmask; dump_args|l2_swimlane|pmu|dep_gen|scope_stats
     // Opaque always-false guard read by the AICore SIMT meta anchor (AIV
     // KERNEL_ENTRY). The host never sets it non-zero; its only purpose is to be
     // a runtime-valued condition the compiler cannot constant-fold, so the

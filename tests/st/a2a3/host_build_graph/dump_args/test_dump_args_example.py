@@ -7,9 +7,9 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""Host-build-graph dump tensor example: f = (a + b) + 1.
+"""Host-build-graph dump args example: f = (a + b) + 1.
 
-Demonstrates the two dump-tensor metadata registration APIs:
+Demonstrates the two dump-args metadata registration APIs:
   Task 0 (add):                add_task() + set_tensor_info_to_task()
   Task 1 (add_scalar_inplace): add_task_with_tensor_info()
 """
@@ -21,13 +21,13 @@ from simpler_setup import SceneTestCase, TaskArgsBuilder, Tensor, scene_test
 
 
 @scene_test(level=2, runtime="host_build_graph")
-class TestDumpTensorExample(SceneTestCase):
+class TestDumpArgsExample(SceneTestCase):
     """f = (a + b) + 1, where a=2.0, b=3.0 -> f=6.0."""
 
     CALLABLE = {
         "orchestration": {
-            "source": "kernels/orchestration/dump_tensor_orch.cpp",
-            "function_name": "build_dump_tensor_graph",
+            "source": "kernels/orchestration/dump_args_orch.cpp",
+            "function_name": "aicpu_orchestration_entry",
             "signature": [D.IN, D.IN, D.OUT],
         },
         "incores": [
@@ -49,8 +49,8 @@ class TestDumpTensorExample(SceneTestCase):
     CASES = [
         {
             "name": "default",
-            "platforms": ["a5"],
-            "config": {"aicpu_thread_num": 3, "block_dim": 3},
+            "platforms": ["a2a3"],
+            "config": {"aicpu_thread_num": 4, "block_dim": 3},
             "params": {},
         },
     ]

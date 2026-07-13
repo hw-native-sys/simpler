@@ -71,7 +71,7 @@ race — which is why deps.json now fully replaces the removed `fanout[]`.
 ## 3. How to Enable
 
 `dep_gen` is gated by `CallConfig.enable_dep_gen` (alongside
-`enable_l2_swimlane`, `enable_dump_tensor`, `enable_pmu`). The CLI flag
+`enable_l2_swimlane`, `enable_dump_args`, `enable_pmu`). The CLI flag
 is `--enable-dep-gen`:
 
 ```bash

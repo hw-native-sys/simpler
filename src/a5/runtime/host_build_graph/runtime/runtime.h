@@ -227,7 +227,7 @@ public:
     // under SIMPLER_DFX (dump-args path), so it lives in the prefix.
     uint64_t func_id_to_addr_[RUNTIME_MAX_FUNC_ID];
 
-    // Tensor info metadata for tensor dump. Device-read via get_tensor_info()
+    // Tensor info metadata for args dump. Device-read via get_tensor_info()
     // under SIMPLER_DFX, so it lives in the prefix.
     void *tensor_info_storage_;
     uint64_t tensor_info_storage_bytes_;

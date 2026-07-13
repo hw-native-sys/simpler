@@ -689,7 +689,7 @@ queue per AICPU thread:
   AICPU enqueues on rotation).
 
 Each `ReadyQueueEntry::kind` carries the discriminator. This is the
-only multi-kind module in the current framework — PMU and TensorDump
+only multi-kind module in the current framework — PMU and ArgsDump
 are single-kind.
 
 ```text
@@ -758,7 +758,7 @@ to copy into the right per-core or per-thread vector, plus
 `read_phase_header_metadata` /
 `reconcile_counters` / `export_swimlane_json` / `finalize`. The
 mgmt/collector threading and `Module` trait pattern are shared with
-PMU and TensorDump — see
+PMU and ArgsDump — see
 [profiling-framework.md](../profiling-framework.md) for the
 framework reference.
 

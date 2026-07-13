@@ -13,7 +13,7 @@
  * CallConfig — per-NEXT_LEVEL-task config. Carries execution knobs
  * (block_dim, aicpu_thread_num), per-task runtime-environment overrides
  * (`runtime_env.ring_task_window` / `.ring_heap` / `.ring_dep_pool`, each a per-ring array) plus the five parallel
- * diagnostics sub-features under the profiling umbrella: `enable_l2_swimlane` (swimlane), `enable_dump_tensor`,
+ * diagnostics sub-features under the profiling umbrella: `enable_l2_swimlane` (swimlane), `enable_dump_args`,
  * `enable_pmu`, `enable_dep_gen`, and `enable_scope_stats`. All five require `output_prefix` because they each write
  * sibling artifacts into that directory
  * (`l2_swimlane_records.json` / `args_dump/` / `pmu.csv` / `deps.json` /
@@ -111,7 +111,7 @@ struct CallConfig {
     int32_t block_dim = 0;  // 0 = auto; resolved by DeviceRunner at run() time
     int32_t aicpu_thread_num = 3;
     int32_t enable_l2_swimlane = 0;
-    int32_t enable_dump_tensor = 0;
+    int32_t enable_dump_args = 0;
     int32_t enable_pmu = 0;  // 0 = disabled; >0 = enabled, value selects event type
     int32_t enable_dep_gen = 0;
     int32_t enable_scope_stats = 0;  // writes <output_prefix>/scope_stats/scope_stats.jsonl
@@ -119,7 +119,7 @@ struct CallConfig {
     char output_prefix[1024] = {};
 
     bool diagnostics_any() const noexcept {
-        return enable_l2_swimlane != 0 || enable_dump_tensor != 0 || enable_pmu != 0 || enable_dep_gen != 0 ||
+        return enable_l2_swimlane != 0 || enable_dump_args != 0 || enable_pmu != 0 || enable_dep_gen != 0 ||
                enable_scope_stats != 0;
     }
 
@@ -133,7 +133,7 @@ struct CallConfig {
         if (diagnostics_any() && !output_prefix_set()) {
             throw std::invalid_argument(
                 "CallConfig: output_prefix must be set whenever any of "
-                "enable_l2_swimlane / enable_dump_tensor / enable_pmu / enable_dep_gen / "
+                "enable_l2_swimlane / enable_dump_args / enable_pmu / enable_dep_gen / "
                 "enable_scope_stats is enabled"
             );
         }

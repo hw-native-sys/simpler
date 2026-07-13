@@ -39,7 +39,7 @@ endif()
 #      by both arches (cache_ops, device_log, device_time, device_malloc,
 #      orch_so_file, platform_aicpu_affinity).
 #   3. arch-shared (between onboard and sim) sources under `../../shared/aicpu/`
-#      and `common/platform/shared/aicpu/` (unified log, scope_stats, tensor_dump).
+#      and `common/platform/shared/aicpu/` (unified log, scope_stats, args_dump).
 set(AICPU_KERNEL_SOURCES "")
 file(GLOB AICPU_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/*.cpp")
 list(APPEND AICPU_KERNEL_SOURCES ${AICPU_SOURCES})

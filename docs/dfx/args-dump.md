@@ -70,13 +70,13 @@ pytest tests/st/<case> --platform a5sim --dump-args 2
 pytest examples/a5/host_build_graph/vector_example --platform a5sim --dump-args 2
 ```
 
-The level sets `CallConfig::enable_dump_tensor` (0/1/2/3). The host then
+The level sets `CallConfig::enable_dump_args` (0/1/2/3). The host then
 allocates dump storage, publishes its base address through
-`kernel_args.dump_data_base`, and sets `SIMPLER_DFX_FLAG_DUMP_TENSOR`
+`kernel_args.dump_data_base`, and sets `SIMPLER_DFX_FLAG_DUMP_ARGS`
 (levels 1, 2, and 3) in each worker handshake's `enable_profiling_flag` for
 the enable/disable decision. The **partial / full / full-json-only**
-distinction is carried as a `DumpTensorLevel` in the dump shared-memory header
-(`DumpDataHeader::dump_tensor_level`, host-written before launch) rather
+distinction is carried as a `DumpArgsLevel` in the dump shared-memory header
+(`DumpDataHeader::dump_args_level`, host-written before launch) rather
 than in the profiling-flag bitmask. The on-device AICPU reads the storage base
 via `set_platform_dump_base()`, the enable bit via
 `set_dump_args_enabled(SIMPLER_GET_DFX_FLAG(...))`, and latches the mode
@@ -84,7 +84,7 @@ in `dump_args_init()` from the header level (`PARTIAL` → selective,
 `FULL_JSON_ONLY` → metadata-only, payload copy suppressed). Because the
 level is decided host-side **before any task is
 dispatched**, it is latched up front — there is no dependence on task
-submission order. AICore executors read the same `SIMPLER_DFX_FLAG_DUMP_TENSOR`
+submission order. AICore executors read the same `SIMPLER_DFX_FLAG_DUMP_ARGS`
 bit to insert a `pipe_barrier(PIPE_ALL)` before FIN when dump is on, so
 `AFTER_COMPLETION` snapshots see the kernel's final writes.
 
@@ -325,9 +325,9 @@ int t1 = add_task_with_tensor_info(
 ```
 
 Full template:
-[`tests/st/a5/host_build_graph/dump_tensor`](../../tests/st/a5/host_build_graph/dump_tensor/)
+[`tests/st/a5/host_build_graph/dump_args`](../../tests/st/a5/host_build_graph/dump_args/)
 (and the `a2a3` mirror at
-`tests/st/a2a3/host_build_graph/dump_tensor`).
+`tests/st/a2a3/host_build_graph/dump_args`).
 
 ## 4. Capabilities
 
@@ -372,7 +372,7 @@ DumpDataHeader                                  (host init, AICPU reads)
 ├── num_dump_threads
 ├── records_per_buffer
 ├── magic = 0x44554D50 ("DUMP")
-└── dump_tensor_level  (DumpTensorLevel: 0=off, 1=partial, 2=full, 3=full_json_only; AICPU latches in dump_args_init)
+└── dump_args_level  (DumpArgsLevel: 0=off, 1=partial, 2=full, 3=full_json_only; AICPU latches in dump_args_init)
 
 DumpBufferState[num_dump_threads]               (per-thread)
 ├── free_queue {buffer_ptrs[SLOT_COUNT], head, tail}
@@ -383,7 +383,7 @@ DumpBufferState[num_dump_threads]               (per-thread)
 └── dropped_record_count
 
 DumpMetaBuffer pool (rotated)                   (BUFFERS_PER_THREAD per thread)
-└── TensorDumpRecord records[RECORDS_PER_BUFFER] + count   ← 128 B each
+└── ArgsDumpRecord records[RECORDS_PER_BUFFER] + count   ← 128 B each
 
 arena_data (per-thread, circular byte buffer)
   default = BUFFERS_PER_THREAD × RECORDS_PER_BUFFER × AVG_TENSOR_BYTES
@@ -396,13 +396,13 @@ These structs are binary-identical between a2a3 and a5
 `k_args->dump_data_base` in `kernel.cpp` and passes it to
 `set_platform_dump_base()`. Dump enablement is propagated
 separately via the umbrella bitmask `KernelArgs::enable_profiling_flag`
-(`bit0 = SIMPLER_DFX_FLAG_DUMP_TENSOR`); the AICPU kernel entry calls
+(`bit0 = SIMPLER_DFX_FLAG_DUMP_ARGS`); the AICPU kernel entry calls
 `set_dump_args_enabled()` with the decoded bit, so device-side
 code does not infer "dump enabled" from `dump_data_base != 0`.
 
 Each record is fixed at 128 B (two cache lines) — see
-`TensorDumpRecord` in
-[`tensor_dump.h`](../src/a2a3/platform/include/common/tensor_dump.h).
+`ArgsDumpRecord` in
+[`args_dump.h`](../../src/a2a3/platform/include/common/args_dump.h).
 
 ### 5.2 Where dump calls are wired in
 
@@ -432,7 +432,7 @@ Each runtime's scheduler dispatch code calls
 `dump_args_for_task` first collects the task's active-subtask kernel ids
 (the `func_id` array), then walks the **widest active subtask's** callable
 signature **once**. Signature entry `i` maps to payload tensor slot `i`
-positionally; for each non-scalar entry it builds a `TensorDumpInfo`
+positionally; for each non-scalar entry it builds a `ArgsDumpInfo`
 (dtype + shape + strides + start offset + device address) for that slot
 and calls `dump_arg_record` for entries whose role matches the current
 stage — stamping every record with the **whole** func_id array. Each
@@ -454,7 +454,7 @@ the FIN handshake. This closes the ordering gap where
 all device-side writes were globally visible. Older
 implementations could capture stale output data; the current
 implementation fixes this in the runtime, not in each individual
-kernel. The barrier is gated on `SIMPLER_DFX_FLAG_DUMP_TENSOR`, so
+kernel. The barrier is gated on `SIMPLER_DFX_FLAG_DUMP_ARGS`, so
 non-dump runs keep the original cheaper completion path.
 
 ### 5.3 Tensor metadata registration
@@ -463,14 +463,14 @@ AICPU has device addresses and sizes — the logical shape, dtype,
 and view geometry come from the runtime. Each runtime exposes
 metadata through a slightly different path, but they all converge
 on `TensorInfo` (see
-[`tensor_info.h`](../src/a5/runtime/host_build_graph/runtime/tensor_info.h)):
+[`tensor_info.h`](../../src/a5/runtime/host_build_graph/runtime/tensor_info.h)):
 
 - **`host_build_graph`** — two orchestration-side APIs:
   - `add_task()` → `set_tensor_info_to_task(task_id, info[], count)`
   - `add_task_with_tensor_info()` (single-call convenience wrapper)
 
   See
-  [`dump_tensor_orch.cpp`](../../tests/st/a5/host_build_graph/dump_tensor/kernels/orchestration/dump_tensor_orch.cpp)
+  [`dump_args_orch.cpp`](../../tests/st/a5/host_build_graph/dump_args/kernels/orchestration/dump_args_orch.cpp)
   for both styles in one file.
 - **`tensormap_and_ringbuffer`** — runtime layer fills `TensorInfo`
   from `PTO2TaskPayload::tensors[]` directly. The ring buffer
@@ -486,8 +486,8 @@ normal execution continues.
 
 `halHostRegister` maps device memory into host virtual address
 space so the host can read device buffers directly.
-`TensorDumpCollector` runs split mgmt threads and collector shards on top of a
-[`BufferPoolManager<DumpModule>`](../src/common/platform/include/host/buffer_pool_manager.h):
+`ArgsDumpCollector` runs split mgmt threads and collector shards on top of a
+[`BufferPoolManager<DumpModule>`](../../src/common/platform/include/host/buffer_pool_manager.h):
 drain/refill shards poll SPSC ready queues and refill free queues from
 shard-local recycled lanes **while kernels are still executing**. Collector
 shards drain the host hand-off queues into `on_buffer_collected`, then the
@@ -498,7 +498,7 @@ allocation without writing device free queues.
 ```text
         HOST                                         DEVICE
 ┌──────────────────────────┐               ┌──────────────────────────┐
-│ TensorDumpCollector      │               │ AICPU thread             │
+│ ArgsDumpCollector      │               │ AICPU thread             │
 │                          │               │                          │
 │ initialize()             │  alloc +      │ dump_args_init()         │
 │   rtMalloc + halRegister │──register────>│   read DumpDataHeader    │
@@ -534,7 +534,7 @@ allocation without writing device free queues.
 **Lifecycle** (`device_runner.cpp`):
 
 ```text
-init_tensor_dump()
+init_args_dump()
   dump_collector_.initialize(..., output_prefix_)
   kernel_args_.args.dump_data_base = dump_collector_.get_dump_shm_device_ptr()
 start()                          ← spawn split mgmt threads (drain/refill
@@ -548,11 +548,11 @@ reconcile_counters()             ← recover leftover current buffers
 export_dump_files()
 ```
 
-[`TensorDumpCollector`](../src/common/platform/include/host/tensor_dump_collector.h)
+[`ArgsDumpCollector`](../../src/common/platform/include/host/args_dump_collector.h)
 on a2a3 inherits from
-[`profiling_common::ProfilerBase<TensorDumpCollector, DumpModule>`](../src/common/platform/include/host/profiler_base.h):
+[`profiling_common::ProfilerBase<ArgsDumpCollector, DumpModule>`](../../src/common/platform/include/host/profiler_base.h):
 the base class owns split mgmt threads, collector shards, and the
-`BufferPoolManager<DumpModule>` they share. `TensorDumpCollector`
+`BufferPoolManager<DumpModule>` they share. `ArgsDumpCollector`
 only supplies the dump-specific pieces — the `DumpModule` trait
 that describes the shared-memory layout, `initialize` that
 allocates and pre-fills free queues, an `on_buffer_collected`
@@ -565,8 +565,8 @@ framework reference.
 
 ### 5.5 a5 — same framework, host-shadow transport
 
-a5's `TensorDumpCollector` derives from
-`ProfilerBase<TensorDumpCollector, DumpModule>` and shares the
+a5's `ArgsDumpCollector` derives from
+`ProfilerBase<ArgsDumpCollector, DumpModule>` and shares the
 split mgmt + collector shard structure with a2a3. The single behavioral
 deviation from §5.4 is the **transport channel**: a5 has no
 `halHostRegister`, so each device buffer is paired with a
@@ -592,7 +592,7 @@ the buffer's records.
 ```text
         HOST                                         DEVICE
 ┌──────────────────────────┐               ┌──────────────────────────┐
-│ TensorDumpCollector      │               │ AICPU thread             │
+│ ArgsDumpCollector      │               │ AICPU thread             │
 │   : ProfilerBase<...>    │               │                          │
 │                          │               │                          │
 │ initialize()             │  alloc + reg  │ dump_args_init()         │
@@ -641,7 +641,7 @@ the buffer's records.
 **Lifecycle** (`device_runner.cpp`):
 
 ```text
-init_tensor_dump()
+init_args_dump()
   dump_collector_.initialize(num_dump_threads, ..., output_prefix_)
   kernel_args_.args.dump_data_base = dump_collector_.get_dump_shm_device_ptr()
 dump_collector_.start(thread_factory)   ← split mgmt + collector shards
@@ -654,11 +654,11 @@ dump_collector_.export_dump_files()
 dump_collector_.finalize()
 ```
 
-[`TensorDumpCollector`](../src/common/platform/include/host/tensor_dump_collector.h)
+[`ArgsDumpCollector`](../../src/common/platform/include/host/args_dump_collector.h)
 on a5 inherits the same CRTP base
-([`profiling_common::ProfilerBase`](../src/common/platform/include/host/profiler_base.h))
+([`profiling_common::ProfilerBase`](../../src/common/platform/include/host/profiler_base.h))
 as a2a3 and parameterizes
-[`BufferPoolManager`](../src/common/platform/include/host/buffer_pool_manager.h)
+[`BufferPoolManager`](../../src/common/platform/include/host/buffer_pool_manager.h)
 with `DumpModule`. The only a5-specific glue is the 5-callback
 `MemoryOps`, the per-tick shm mirror, and the on-demand arena copy
 inside `on_buffer_collected`.
@@ -677,7 +677,7 @@ before that flush runs, `reconcile_counters` recovers a non-empty
 | AICPU recording logic | identical | |
 | Buffer model | rotating pool (free + ready queues per thread) | identical |
 | Host threads | split mgmt + collector shards, streams during execution | identical |
-| Host-class shape | `ProfilerBase<TensorDumpCollector, DumpModule>` | identical |
+| Host-class shape | `ProfilerBase<ArgsDumpCollector, DumpModule>` | identical |
 | Host transport | `halHostRegister` shared memory | host-shadow `malloc` + per-tick `rtMemcpy`/`memcpy` |
 | `MemoryOps` callbacks | 3 (`alloc`, `reg`, `free_`) | 5 (+ `copy_to_device`, `copy_from_device`) |
 | Arena access | direct via SVM | `copy_from_device` inside `on_buffer_collected` |
@@ -850,7 +850,7 @@ host hand-off queue).
 ### 7.5 Configuration knobs
 
 All defaults live in
-[`platform_config.h`](../src/a2a3/platform/include/common/platform_config.h)
+[`platform_config.h`](../../src/a2a3/platform/include/common/platform_config.h)
 and match between `a2a3` and `a5`:
 
 | Constant | Default | Effect |
@@ -890,7 +890,7 @@ log flooding. For `host_build_graph`, ensure
 **`AFTER_COMPLETION` data looks stale or partially written.** This
 should not happen with the runtime barrier in place — AICore
 issues `pipe_barrier(PIPE_ALL)` before FIN when dump is enabled.
-If you see it, verify the executor saw `SIMPLER_DFX_FLAG_DUMP_TENSOR`
+If you see it, verify the executor saw `SIMPLER_DFX_FLAG_DUMP_ARGS`
 set in the handshake (a missing handshake bit silently disables
 the barrier).
 

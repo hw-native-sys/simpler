@@ -61,7 +61,7 @@
 #include "host/pmu_collector.h"
 #include "host/runtime_timeout_config.h"
 #include "host/scope_stats_collector.h"
-#include "host/tensor_dump_collector.h"
+#include "host/args_dump_collector.h"
 #include "prepare_callable_common.h"
 
 struct HostApi;     // common/host_api.h — fwd-declared to keep task_interface headers out
@@ -496,9 +496,9 @@ public:
         l2_swimlane_level_ = static_cast<L2SwimlaneLevel>(level);
         enable_l2_swimlane_ = (l2_swimlane_level_ != L2SwimlaneLevel::DISABLED);
     }
-    void set_dump_tensor_enabled(int level) {
-        dump_tensor_level_ = static_cast<DumpTensorLevel>(level);
-        enable_dump_tensor_ = (dump_tensor_level_ != DumpTensorLevel::OFF);
+    void set_dump_args_enabled(int level) {
+        dump_args_level_ = static_cast<DumpArgsLevel>(level);
+        enable_dump_args_ = (dump_args_level_ != DumpArgsLevel::OFF);
     }
     void set_pmu_enabled(int enable_pmu) {
         enable_pmu_ = (enable_pmu > 0);
@@ -903,7 +903,7 @@ protected:
     // on the base. `DepGenCollector` is not shared — each arch that
     // implements dep_gen (a2a3, a5) keeps it on its own subclass.
     L2SwimlaneCollector l2_swimlane_collector_;
-    TensorDumpCollector dump_collector_;
+    ArgsDumpCollector dump_collector_;
     PmuCollector pmu_collector_;
     ScopeStatsCollector scope_stats_collector_;
 
@@ -911,8 +911,8 @@ protected:
     // Written by the c_api entry point via `set_*_enabled()` before
     // `run()`, read inside `run()` and its helpers.
     bool enable_l2_swimlane_{false};
-    bool enable_dump_tensor_{false};
-    DumpTensorLevel dump_tensor_level_{DumpTensorLevel::OFF};  // resolved from set_dump_tensor_enabled()
+    bool enable_dump_args_{false};
+    DumpArgsLevel dump_args_level_{DumpArgsLevel::OFF};  // resolved from set_dump_args_enabled()
     bool enable_pmu_{false};
     bool enable_scope_stats_{false};
     L2SwimlaneLevel l2_swimlane_level_{L2SwimlaneLevel::DISABLED};  // resolved from set_l2_swimlane_enabled()

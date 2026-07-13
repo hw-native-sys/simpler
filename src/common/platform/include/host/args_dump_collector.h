@@ -10,14 +10,14 @@
  */
 
 /**
- * @file tensor_dump_collector.h
- * @brief Host-side tensor dump collector with independent shared memory.
+ * @file args_dump_collector.h
+ * @brief Host-side args dump collector with independent shared memory.
  *
  * Architecture:
  * - BufferPoolManager<DumpModule>: shared split-mgmt infrastructure that
  *   polls per-thread ready queues, replenishes free_queues, and hands
  *   full DumpMetaBuffers off to collector thread shards.
- * - TensorDumpCollector: copies tensor metadata + arena bytes into host
+ * - ArgsDumpCollector: copies tensor metadata + arena bytes into host
  *   vectors and writes the result to disk (.bin + JSON).
  *
  * a5 specifics: device↔host transfers use rtMemcpy / memcpy via
@@ -28,8 +28,8 @@
  * the part needed for the buffer's records is worth copying.
  */
 
-#ifndef SRC_COMMON_PLATFORM_INCLUDE_HOST_TENSOR_DUMP_COLLECTOR_H_
-#define SRC_COMMON_PLATFORM_INCLUDE_HOST_TENSOR_DUMP_COLLECTOR_H_
+#ifndef SRC_COMMON_PLATFORM_INCLUDE_HOST_ARGS_DUMP_COLLECTOR_H_
+#define SRC_COMMON_PLATFORM_INCLUDE_HOST_ARGS_DUMP_COLLECTOR_H_
 
 #include <atomic>
 #include <chrono>
@@ -49,14 +49,14 @@
 
 #include "common/memory_barrier.h"
 #include "common/platform_config.h"
-#include "common/tensor_dump.h"
+#include "common/args_dump.h"
 #include "common/unified_log.h"
 #include "data_type.h"
 #include "host/profiler_base.h"
 #include "host/profiling_copy.h"
 
 // ---------------------------------------------------------------------------
-// Tensor Dump profiling Module (drives BufferPoolManager<DumpModule>)
+// Args Dump profiling Module (drives BufferPoolManager<DumpModule>)
 // ---------------------------------------------------------------------------
 
 /**
@@ -92,7 +92,7 @@ struct DumpModule {
     static constexpr int kCollectorThreadCount = PLATFORM_MAX_AICPU_THREADS;
 
     /**
-     * Tensor-dump bursts can be very large; this is the startup-only batch
+     * Args-dump bursts can be very large; this is the startup-only batch
      * size used when proactive_replenish needs to grow recycled lanes.
      */
     static constexpr int batch_size(int /*kind*/) {
@@ -154,23 +154,23 @@ using DumpUnregisterCallback = profiling_common::ProfUnregisterCallback;
 using DumpFreeCallback = profiling_common::ProfFreeCallback;
 
 // =============================================================================
-// TensorDumpCollector
+// ArgsDumpCollector
 // =============================================================================
 
 /**
  * Collected arg metadata + payload bytes
  */
-struct DumpedTensor {
+struct DumpedArg {
     uint64_t task_id;
-    int32_t func_ids[TENSOR_DUMP_MAX_FUNC_IDS];  // task's active-subtask set (mix membership); -1 unknown
-    int32_t func_count;                          // number of valid entries in func_ids
+    int32_t func_ids[ARGS_DUMP_MAX_FUNC_IDS];  // task's active-subtask set (mix membership); -1 unknown
+    int32_t func_count;                        // number of valid entries in func_ids
     uint32_t arg_index;
-    TensorDumpRole role;
-    TensorDumpStage stage;
+    ArgsDumpRole role;
+    ArgsDumpStage stage;
     uint8_t dtype;
     uint8_t ndims;
     uint8_t flags;
-    TensorDumpKind kind;
+    ArgsDumpKind kind;
     uint64_t scalar_value;
     uint64_t start_offset;                     // 1D element offset of the view origin
     uint32_t shapes[PLATFORM_DUMP_MAX_DIMS];   // Current view shape
@@ -183,20 +183,20 @@ struct DumpedTensor {
     std::vector<uint8_t> bytes;
 };
 
-class TensorDumpCollector : public profiling_common::ProfilerBase<TensorDumpCollector, DumpModule> {
+class ArgsDumpCollector : public profiling_common::ProfilerBase<ArgsDumpCollector, DumpModule> {
 public:
-    TensorDumpCollector() = default;
-    ~TensorDumpCollector();
+    ArgsDumpCollector() = default;
+    ~ArgsDumpCollector();
 
-    TensorDumpCollector(const TensorDumpCollector &) = delete;
-    TensorDumpCollector &operator=(const TensorDumpCollector &) = delete;
+    ArgsDumpCollector(const ArgsDumpCollector &) = delete;
+    ArgsDumpCollector &operator=(const ArgsDumpCollector &) = delete;
 
     // ProfilerBase contract
     static constexpr int kIdleTimeoutSec = PLATFORM_DUMP_TIMEOUT_SECONDS;
-    static constexpr const char *kSubsystemName = "TensorDump";
+    static constexpr const char *kSubsystemName = "ArgsDump";
 
     /**
-     * Initialize tensor dump shared memory.
+     * Initialize args dump shared memory.
      *
      * Allocates the DumpDataHeader + per-thread DumpBufferState array, the
      * per-thread arenas (single contiguous payload region per thread), and
@@ -217,7 +217,7 @@ public:
      * @param free_cb           Memory free callback
      * @param user_data         Opaque pointer forwarded to callbacks
      * @param output_prefix     Per-task directory; args_dump/ subdir lands here
-     * @param dump_tensor_level OFF / PARTIAL (only Arg::dump()-marked args) /
+     * @param dump_args_level OFF / PARTIAL (only Arg::dump()-marked args) /
      *                          FULL / FULL_JSON_ONLY (every task's metadata to
      *                          JSON, no payload or .bin). Written to
      *                          DumpDataHeader so the AICPU latches the mode
@@ -226,13 +226,13 @@ public:
      */
     int initialize(
         int num_dump_threads, int device_id, const DumpAllocCallback &alloc_cb, DumpRegisterCallback register_cb,
-        const DumpFreeCallback &free_cb, const std::string &output_prefix, DumpTensorLevel dump_tensor_level
+        const DumpFreeCallback &free_cb, const std::string &output_prefix, DumpArgsLevel dump_args_level
     );
 
     /**
      * Per-buffer callback invoked by ProfilerBase's poll loop. Pulls the
      * relevant portion of the originating thread's arena from device, copies
-     * tensor metadata + arena bytes into host-side DumpedTensor records, and
+     * tensor metadata + arena bytes into host-side DumpedArg records, and
      * queues payloads to the writer thread. The writer thread is started
      * lazily on the first invocation per run.
      */
@@ -292,7 +292,7 @@ private:
     std::vector<ArenaInfo> arenas_;
 
     // Collected dump args (metadata only; payloads live in args.bin)
-    std::vector<DumpedTensor> collected_;
+    std::vector<DumpedArg> collected_;
     std::mutex collected_mutex_;
 
     // Stats
@@ -314,11 +314,11 @@ private:
     std::mutex collector_state_mutex_;
     std::mutex write_mutex_;
     std::condition_variable write_cv_;
-    std::queue<DumpedTensor> write_queue_;
+    std::queue<DumpedArg> write_queue_;
     std::atomic<bool> writer_done_{false};
 
     // Resolved dump level; FULL_JSON_ONLY suppresses the .bin file entirely.
-    DumpTensorLevel dump_tensor_level_{DumpTensorLevel::OFF};
+    DumpArgsLevel dump_args_level_{DumpArgsLevel::OFF};
 
     // Output directory and single binary file
     std::filesystem::path run_dir_;
@@ -331,4 +331,4 @@ private:
     void writer_loop();
 };
 
-#endif  // SRC_COMMON_PLATFORM_INCLUDE_HOST_TENSOR_DUMP_COLLECTOR_H_
+#endif  // SRC_COMMON_PLATFORM_INCLUDE_HOST_ARGS_DUMP_COLLECTOR_H_

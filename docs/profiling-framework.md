@@ -1,7 +1,7 @@
 # Profiling Framework
 
 Shared profiling infrastructure that the PMU, L2Swimlane, DepGen,
-TensorDump, and ScopeStats collectors are built on. The host-side framework
+ArgsDump, and ScopeStats collectors are built on. The host-side framework
 headers live in
 [`src/common/platform/include/host/`](../src/common/platform/include/host/)
 and are consumed verbatim by both a2a3 and a5 collectors (PR #944
@@ -40,7 +40,7 @@ Each profiling subsystem needs the same plumbing on the host:
   records out of each ready buffer.
 - A pool of pre-registered device buffers (allocated up-front, refilled on
   demand from host-side watermarks) keyed by "kind". PMU, DepGen,
-  TensorDump, and ScopeStats have one kind; L2Swimlane has four.
+  ArgsDump, and ScopeStats have one kind; L2Swimlane has four.
 - A dev↔host pointer map so the management thread can resolve a device
   pointer popped off a ready queue to the host-mapped pointer the collector
   thread will read.
@@ -229,7 +229,7 @@ The Module structs are defined alongside their collectors in
 [pmu_collector.h](../src/a2a3/platform/include/host/pmu_collector.h),
 [l2_swimlane_collector.h](../src/common/platform/include/host/l2_swimlane_collector.h),
 [dep_gen_collector.h](../src/common/platform/include/host/dep_gen_collector.h),
-[tensor_dump_collector.h](../src/common/platform/include/host/tensor_dump_collector.h),
+[args_dump_collector.h](../src/common/platform/include/host/args_dump_collector.h),
 and
 [scope_stats_collector.h](../src/common/platform/include/host/scope_stats_collector.h)
 — each is a few dozen lines of static methods over the subsystem's own
@@ -249,7 +249,7 @@ and only has to provide:
   the collector loop. Use the subsystem's `PLATFORM_*_TIMEOUT_SECONDS`
   constant.
 - `static constexpr const char* kSubsystemName` — appears in the idle
-  timeout log line (e.g. `"PMU"`, `"L2Swimlane"`, `"TensorDump"`).
+  timeout log line (e.g. `"PMU"`, `"L2Swimlane"`, `"ArgsDump"`).
 - `init(...)` and `finalize(...)` — domain-specific setup/teardown.
   `init` must call `set_memory_context()` on the success path so
   `start(tf)` is not a no-op. `finalize` must release framework-owned
@@ -295,7 +295,7 @@ Each AICPU writer defines a local `XxxDeviceModule` trait with:
 
 Current users:
 
-- ScopeStats, DepGen, TensorDump, and PMU use the engine for
+- ScopeStats, DepGen, ArgsDump, and PMU use the engine for
   ready/free/switch.
 - L2Swimlane uses the engine for ready enqueue / free wait primitives and
   AICPU task-buffer pop/switch.
@@ -444,7 +444,7 @@ Existing collectors are the canonical examples:
   — single kind, per-core instances. See [pmu-profiling.md](dfx/pmu-profiling.md).
 - [`DepGenCollector`](../src/common/platform/include/host/dep_gen_collector.h)
   — single kind, one instance. See [dep_gen.md](dfx/dep_gen.md).
-- [`TensorDumpCollector`](../src/common/platform/include/host/tensor_dump_collector.h)
+- [`ArgsDumpCollector`](../src/common/platform/include/host/args_dump_collector.h)
   — single kind, per-AICPU-thread instances. See [args-dump.md](dfx/args-dump.md).
 - [`ScopeStatsCollector`](../src/common/platform/include/host/scope_stats_collector.h)
   — single kind, one instance. See [scope-stats.md](dfx/scope-stats.md).
@@ -501,7 +501,7 @@ Most collectors keep `reconcile_counters` passive — same shape as a2a3. It
 pulls the post-`stop()` `BufferState`s, logs an error if any
 `current_buf_ptr` still references a non-empty buffer (a device flush bug,
 since AICPU is the only writer that can clear it), and runs the collector's
-counter cross-check/accounting against device-side counters. TensorDump and
+counter cross-check/accounting against device-side counters. ArgsDump and
 ScopeStats are the recovery-oriented exceptions: on abnormal exit they may
 recover a non-empty `current_buf_ptr` host-side before export, so already
 recorded dump metadata or scope samples still reach the output files.

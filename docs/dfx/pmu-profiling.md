@@ -307,7 +307,7 @@ the PMU-specific pieces — the `PmuModule` trait that describes the
 shared-memory layout, an `init()` that allocates and pre-fills the free
 queues, an `on_buffer_collected()` callback that appends records to the
 CSV, and `reconcile_counters()` / `finalize()`. The mgmt/collector threading,
-buffer pooling, and `Module` trait pattern are shared with TensorDump
+buffer pooling, and `Module` trait pattern are shared with ArgsDump
 and L2Swimlane — see [profiling-framework.md](../profiling-framework.md) for
 the framework reference.
 

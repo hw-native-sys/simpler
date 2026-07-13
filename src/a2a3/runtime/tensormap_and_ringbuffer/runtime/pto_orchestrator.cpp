@@ -38,7 +38,7 @@
 
 #if SIMPLER_DFX
 #include "aicpu/scope_stats_collector_aicpu.h"
-#include "aicpu/tensor_dump_aicpu.h"
+#include "aicpu/args_dump_aicpu.h"
 #endif
 
 // Verify the captured Tensor blob size in DepGenRecord matches the runtime

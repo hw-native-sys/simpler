@@ -576,7 +576,7 @@ int SimDeviceRunnerBase::bind_callable_to_runtime(
 
 void SimDeviceRunnerBase::apply_call_config(const CallConfig &config) {
     set_l2_swimlane_enabled(config.enable_l2_swimlane);
-    set_dump_tensor_enabled(config.enable_dump_tensor);
+    set_dump_args_enabled(config.enable_dump_args);
     set_pmu_enabled(config.enable_pmu);
     // a2a3 and a5 override set_dep_gen_enabled; an arch without dep_gen no-ops.
     set_dep_gen_enabled(config.enable_dep_gen != 0);

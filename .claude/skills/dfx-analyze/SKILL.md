@@ -20,7 +20,7 @@ Per-DFX docs: `docs/dfx/` (`l2-timing.md`, `sched-overhead-model.md`,
 | Swimlane → **Perfetto** Chrome trace | `swimlane_converter` | `--enable-l2-swimlane` run (`--overhead` track needs deps.json too) |
 | Task **dependency graph** (text / HTML) | `deps_viewer` | `--enable-dep-gen` run → `deps.json` |
 | **Per-scope ring-fill peaks** (task_window / heap / tensormap) | `scope_stats_plot` | `--enable-scope-stats` run → `scope_stats.jsonl` |
-| Inspect / export **args dumps** | `dump_viewer` | `--enable-dump-tensor` run → `args_dump/` |
+| Inspect / export **args dumps** | `dump_viewer` | `--dump-args` run → `args_dump/` |
 
 ## First reflex: Host/Device/Orch/Sched needs nothing extra
 

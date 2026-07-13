@@ -10,10 +10,10 @@
  */
 
 /**
- * @file tensor_dump_collector.cpp
- * @brief Host-side tensor dump collector implementation. The mgmt-thread +
+ * @file args_dump_collector.cpp
+ * @brief Host-side args dump collector implementation. The mgmt-thread +
  *        buffer-pool machinery lives in profiling_common::BufferPoolManager
- *        parameterized by DumpModule (host/tensor_dump_collector.h); the
+ *        parameterized by DumpModule (host/args_dump_collector.h); the
  *        poll loop lives in profiling_common::ProfilerBase. This file owns
  *        the per-buffer on_buffer_collected callback, arena reads, and disk
  *        export.
@@ -22,10 +22,10 @@
  * framework's mgmt loop mirrors the shm region per tick and pulls each
  * popped DumpMetaBuffer's contents on demand. on_buffer_collected pulls
  * the relevant portion of the originating thread's arena before reading
- * tensor records (arena buffers live outside the shm region).
+ * args records (arena buffers live outside the shm region).
  */
 
-#include "host/tensor_dump_collector.h"
+#include "host/args_dump_collector.h"
 
 #include "data_type.h"
 
@@ -42,23 +42,23 @@
 #include "common/unified_log.h"
 
 // =============================================================================
-// TensorDumpCollector
+// ArgsDumpCollector
 // =============================================================================
 
-TensorDumpCollector::~TensorDumpCollector() { stop(); }
+ArgsDumpCollector::~ArgsDumpCollector() { stop(); }
 
-int TensorDumpCollector::initialize(
+int ArgsDumpCollector::initialize(
     int num_dump_threads, int device_id, const DumpAllocCallback &alloc_cb, DumpRegisterCallback register_cb,
-    const DumpFreeCallback &free_cb, const std::string &output_prefix, DumpTensorLevel dump_tensor_level
+    const DumpFreeCallback &free_cb, const std::string &output_prefix, DumpArgsLevel dump_args_level
 ) {
     if (shm_host_ != nullptr) {
-        LOG_ERROR("TensorDumpCollector already initialized");
+        LOG_ERROR("ArgsDumpCollector already initialized");
         return -1;
     }
 
     num_dump_threads_ = num_dump_threads;
     output_prefix_ = output_prefix;
-    dump_tensor_level_ = dump_tensor_level;
+    dump_args_level_ = dump_args_level;
 
     // Stash the memory context on the base up-front so alloc_paired_buffer
     // (which reads alloc_cb_/register_cb_/free_cb_/device_id_)
@@ -88,10 +88,10 @@ int TensorDumpCollector::initialize(
     // Initialize header on host shadow
     std::memset(shm_host_local, 0, shm_size);
     DumpDataHeader *header = get_dump_header(shm_host_local);
-    header->magic = TENSOR_DUMP_MAGIC;
+    header->magic = ARGS_DUMP_MAGIC;
     header->num_dump_threads = static_cast<uint32_t>(num_dump_threads);
     header->records_per_buffer = PLATFORM_DUMP_RECORDS_PER_BUFFER;
-    header->dump_tensor_level = static_cast<uint32_t>(dump_tensor_level);
+    header->dump_args_level = static_cast<uint32_t>(dump_args_level);
 
     uint64_t arena_size = calc_dump_arena_size();
     header->arena_size_per_thread = arena_size;
@@ -159,7 +159,7 @@ int TensorDumpCollector::initialize(
     );
 
     LOG_INFO_V0(
-        "Tensor dump initialized: %d threads, arena=%lu MB/thread, %d buffers/thread", num_dump_threads,
+        "Args dump initialized: %d threads, arena=%lu MB/thread, %d buffers/thread", num_dump_threads,
         arena_size / (1024 * 1024), PLATFORM_DUMP_BUFFERS_PER_THREAD
     );
 
@@ -167,7 +167,7 @@ int TensorDumpCollector::initialize(
     return 0;
 }
 
-void TensorDumpCollector::start_writer_thread_once() {
+void ArgsDumpCollector::start_writer_thread_once() {
     if (writer_started_) return;
     writer_started_ = true;
 
@@ -179,7 +179,7 @@ void TensorDumpCollector::start_writer_thread_once() {
     // FULL_JSON_ONLY captures no payload (device sets payload_size == 0), so
     // there is nothing to stream — skip the .bin file rather than leaving a
     // 0-byte artifact next to the manifest.
-    if (dump_tensor_level_ != DumpTensorLevel::FULL_JSON_ONLY) {
+    if (dump_args_level_ != DumpArgsLevel::FULL_JSON_ONLY) {
         bin_file_.open(run_dir_ / "args.bin", std::ios::binary);
     }
     next_bin_offset_ = 0;
@@ -189,10 +189,10 @@ void TensorDumpCollector::start_writer_thread_once() {
     run_start_time_ = std::chrono::steady_clock::now();
     last_progress_time_ = run_start_time_;
 
-    writer_thread_ = std::thread(&TensorDumpCollector::writer_loop, this);
+    writer_thread_ = std::thread(&ArgsDumpCollector::writer_loop, this);
 }
 
-void TensorDumpCollector::process_dump_buffer(const DumpReadyBufferInfo &info) {
+void ArgsDumpCollector::process_dump_buffer(const DumpReadyBufferInfo &info) {
     DumpMetaBuffer *buf = reinterpret_cast<DumpMetaBuffer *>(info.host_buffer_ptr);
     uint32_t count = buf->count;
 
@@ -221,32 +221,40 @@ void TensorDumpCollector::process_dump_buffer(const DumpReadyBufferInfo &info) {
     }
 
     for (uint32_t i = 0; i < count; i++) {
-        const TensorDumpRecord &rec = buf->records[i];
+        const ArgsDumpRecord &rec = buf->records[i];
 
-        DumpedTensor dt;
+        DumpedArg dt;
         dt.task_id = rec.task_id;
         // rec is read from device shared memory (untrusted): clamp func_count so a
         // corrupt oversized value can't drive an out-of-bounds read of the
         // fixed-size dt.func_ids[] when the record is serialized later.
         uint8_t func_count = rec.func_count;
-        if (func_count > TENSOR_DUMP_MAX_FUNC_IDS) {
+        if (func_count > ARGS_DUMP_MAX_FUNC_IDS) {
             LOG_WARN(
                 "Dump collector: func_count %u exceeds max %d (corrupt record?), clamping", func_count,
-                TENSOR_DUMP_MAX_FUNC_IDS
+                ARGS_DUMP_MAX_FUNC_IDS
             );
-            func_count = TENSOR_DUMP_MAX_FUNC_IDS;
+            func_count = ARGS_DUMP_MAX_FUNC_IDS;
         }
         dt.func_count = func_count;
         for (uint8_t f = 0; f < func_count; f++) {
             dt.func_ids[f] = (rec.func_ids[f] == 0xFFFF) ? -1 : static_cast<int32_t>(rec.func_ids[f]);
         }
         dt.arg_index = rec.arg_index;
-        dt.role = static_cast<TensorDumpRole>(rec.role);
-        dt.stage = static_cast<TensorDumpStage>(rec.stage);
+        dt.role = static_cast<ArgsDumpRole>(rec.role);
+        dt.stage = static_cast<ArgsDumpStage>(rec.stage);
         dt.dtype = rec.dtype;
-        dt.ndims = rec.ndims;
+        uint8_t ndims = rec.ndims;
+        if (ndims > PLATFORM_DUMP_MAX_DIMS) {
+            LOG_ERROR(
+                "Dump collector: ndims %u exceeds max %u (corrupt record?), clamping", static_cast<unsigned>(ndims),
+                static_cast<unsigned>(PLATFORM_DUMP_MAX_DIMS)
+            );
+            ndims = PLATFORM_DUMP_MAX_DIMS;
+        }
+        dt.ndims = ndims;
         dt.flags = rec.flags;
-        dt.kind = static_cast<TensorDumpKind>(rec.kind);
+        dt.kind = static_cast<ArgsDumpKind>(rec.kind);
         dt.scalar_value = rec.scalar_value;
         dt.is_contiguous = (rec.is_contiguous != 0);
         dt.truncated = (rec.truncated != 0);
@@ -256,10 +264,10 @@ void TensorDumpCollector::process_dump_buffer(const DumpReadyBufferInfo &info) {
         std::memcpy(dt.strides, rec.strides, sizeof(dt.strides));
 
         if (dt.truncated && ++total_truncated_count_ == 1) {
-            LOG_WARN("Tensor dump truncation detected. Increase PLATFORM_DUMP_AVG_TENSOR_BYTES.");
+            LOG_WARN("Args dump truncation detected. Increase PLATFORM_DUMP_AVG_TENSOR_BYTES.");
         }
 
-        if (dt.kind == TensorDumpKind::TENSOR && thread_idx >= 0 && thread_idx < static_cast<int>(arenas_.size())) {
+        if (dt.kind == ArgsDumpKind::TENSOR && thread_idx >= 0 && thread_idx < static_cast<int>(arenas_.size())) {
             ArenaInfo &ai = arenas_[thread_idx];
             char *arena_host = reinterpret_cast<char *>(ai.host_ptr);
             uint64_t arena_sz = ai.size;
@@ -269,7 +277,7 @@ void TensorDumpCollector::process_dump_buffer(const DumpReadyBufferInfo &info) {
                 dt.overwritten = true;
                 if (++total_overwrite_count_ == 1) {
                     LOG_WARN(
-                        "Tensor dump overwrite detected: host drain was slower than arena reuse. "
+                        "Args dump overwrite detected: host drain was slower than arena reuse. "
                         "Increase PLATFORM_DUMP_BUFFERS_PER_THREAD."
                     );
                 }
@@ -295,14 +303,14 @@ void TensorDumpCollector::process_dump_buffer(const DumpReadyBufferInfo &info) {
 
         dt.payload_size = dt.bytes.size();
 
-        bool has_payload = dt.kind == TensorDumpKind::TENSOR && !dt.overwritten && !dt.bytes.empty();
+        bool has_payload = dt.kind == ArgsDumpKind::TENSOR && !dt.overwritten && !dt.bytes.empty();
         dt.bin_offset = has_payload ? next_bin_offset_ : 0;
         if (has_payload) {
             next_bin_offset_ += dt.payload_size;
         }
 
         // Store metadata-only copy in collected_ (no payload bytes)
-        DumpedTensor meta = dt;
+        DumpedArg meta = dt;
         meta.bytes.clear();
         {
             std::scoped_lock<std::mutex> lock(collected_mutex_);
@@ -320,7 +328,7 @@ void TensorDumpCollector::process_dump_buffer(const DumpReadyBufferInfo &info) {
     }
 }
 
-void TensorDumpCollector::on_buffer_collected(const DumpReadyBufferInfo &info) {
+void ArgsDumpCollector::on_buffer_collected(const DumpReadyBufferInfo &info) {
     std::scoped_lock<std::mutex> lock(collector_state_mutex_);
     start_writer_thread_once();
     process_dump_buffer(info);
@@ -339,7 +347,7 @@ void TensorDumpCollector::on_buffer_collected(const DumpReadyBufferInfo &info) {
 // reconcile_counters: recover un-flushed current buffers + dropped accounting
 // ---------------------------------------------------------------------------
 
-void TensorDumpCollector::reconcile_counters() {
+void ArgsDumpCollector::reconcile_counters() {
     if (shm_host_ == nullptr) return;
 
     // Pull the latest BufferStates (current_buf_ptr, dropped_record_count)
@@ -353,7 +361,7 @@ void TensorDumpCollector::reconcile_counters() {
     uint32_t dropped_total = 0;
     int recovered_threads = 0;
     // After stop(), a non-zero current_buf_ptr with records means the device
-    // never ran dump_tensor_flush for that thread. The common cause is a hang:
+    // never ran dump_args_flush for that thread. The common cause is a hang:
     // the AICPU op is reaped by the hardware op-execution timeout (507xxx)
     // before its graceful scheduler-timeout shutdown can flush. The host still
     // holds the buffer and the originating arena, so recover the records here
@@ -410,39 +418,39 @@ void TensorDumpCollector::reconcile_counters() {
 // Writer thread + export
 // ---------------------------------------------------------------------------
 
-static const char *tensor_dump_role_name(TensorDumpRole role) {
+static const char *args_dump_role_name(ArgsDumpRole role) {
     switch (role) {
-    case TensorDumpRole::INPUT:
+    case ArgsDumpRole::INPUT:
         return "input";
-    case TensorDumpRole::OUTPUT:
+    case ArgsDumpRole::OUTPUT:
         return "output";
-    case TensorDumpRole::INOUT:
+    case ArgsDumpRole::INOUT:
         return "inout";
     }
     return "unknown";
 }
 
-static const char *tensor_dump_stage_name(TensorDumpStage stage) {
+static const char *args_dump_stage_name(ArgsDumpStage stage) {
     switch (stage) {
-    case TensorDumpStage::BEFORE_DISPATCH:
+    case ArgsDumpStage::BEFORE_DISPATCH:
         return "before_dispatch";
-    case TensorDumpStage::AFTER_COMPLETION:
+    case ArgsDumpStage::AFTER_COMPLETION:
         return "after_completion";
     }
     return "unknown";
 }
 
-static const char *tensor_dump_kind_name(TensorDumpKind kind) {
+static const char *args_dump_kind_name(ArgsDumpKind kind) {
     switch (kind) {
-    case TensorDumpKind::TENSOR:
+    case ArgsDumpKind::TENSOR:
         return "tensor";
-    case TensorDumpKind::SCALAR:
+    case ArgsDumpKind::SCALAR:
         return "scalar";
     }
     return "unknown";
 }
 
-static void write_scalar_json_value(std::ofstream &json, const DumpedTensor &dt) {
+static void write_scalar_json_value(std::ofstream &json, const DumpedArg &dt) {
     uint64_t raw = dt.scalar_value;
     if (dt.dtype == static_cast<uint8_t>(DataType::FLOAT32)) {
         float f;
@@ -492,7 +500,7 @@ static std::string dims_to_string(const uint32_t dims[], int ndims) {
 
 static std::string get_dtype_name_from_raw(uint8_t dtype) { return get_dtype_name(static_cast<DataType>(dtype)); }
 
-static uint64_t get_num_elements(const DumpedTensor &dt) {
+static uint64_t get_num_elements(const DumpedArg &dt) {
     uint64_t numel = 1;
     for (int d = 0; d < dt.ndims; d++) {
         numel *= dt.shapes[d];
@@ -500,9 +508,9 @@ static uint64_t get_num_elements(const DumpedTensor &dt) {
     return (dt.ndims == 0) ? 1 : numel;
 }
 
-void TensorDumpCollector::writer_loop() {
+void ArgsDumpCollector::writer_loop() {
     while (true) {
-        DumpedTensor dt;
+        DumpedArg dt;
         {
             std::unique_lock<std::mutex> lock(write_mutex_);
             write_cv_.wait(lock, [this] {
@@ -525,7 +533,7 @@ void TensorDumpCollector::writer_loop() {
     }
 }
 
-int TensorDumpCollector::export_dump_files() {
+int ArgsDumpCollector::export_dump_files() {
     // Stop the writer thread (started lazily in on_buffer_collected). Safe
     // to skip when writer_started_ is false (collector ran but produced no
     // buffers, or never started at all).
@@ -567,7 +575,7 @@ int TensorDumpCollector::export_dump_files() {
     }
     auto export_start = std::chrono::steady_clock::now();
 
-    std::sort(collected_.begin(), collected_.end(), [](const DumpedTensor &a, const DumpedTensor &b) {
+    std::sort(collected_.begin(), collected_.end(), [](const DumpedArg &a, const DumpedArg &b) {
         if (a.task_id != b.task_id) return a.task_id < b.task_id;
         if (a.stage != b.stage) return static_cast<uint8_t>(a.stage) < static_cast<uint8_t>(b.stage);
         if (a.arg_index != b.arg_index) return a.arg_index < b.arg_index;
@@ -582,19 +590,19 @@ int TensorDumpCollector::export_dump_files() {
     uint32_t num_output_args = 0;
     uint32_t num_inout_args = 0;
     for (const auto &dt : collected_) {
-        if (dt.stage == TensorDumpStage::BEFORE_DISPATCH) {
+        if (dt.stage == ArgsDumpStage::BEFORE_DISPATCH) {
             num_before_dispatch++;
         } else {
             num_after_completion++;
         }
         switch (dt.role) {
-        case TensorDumpRole::INPUT:
+        case ArgsDumpRole::INPUT:
             num_input_args++;
             break;
-        case TensorDumpRole::OUTPUT:
+        case ArgsDumpRole::OUTPUT:
             num_output_args++;
             break;
-        case TensorDumpRole::INOUT:
+        case ArgsDumpRole::INOUT:
             num_inout_args++;
             break;
         }
@@ -617,7 +625,7 @@ int TensorDumpCollector::export_dump_files() {
     json << "  \"truncated_args\": " << total_truncated_count_ << ",\n";
     json << "  \"dropped_records\": " << total_dropped_record_count_ << ",\n";
     json << "  \"dropped_overwrite\": " << total_overwrite_count_ << ",\n";
-    if (dump_tensor_level_ == DumpTensorLevel::FULL_JSON_ONLY) {
+    if (dump_args_level_ == DumpArgsLevel::FULL_JSON_ONLY) {
         json << "  \"bin_file\": null,\n";
     } else {
         json << "  \"bin_file\": \"args.bin\",\n";
@@ -627,7 +635,7 @@ int TensorDumpCollector::export_dump_files() {
     bool first_entry = true;
 
     for (size_t i = 0; i < collected_.size(); i++) {
-        const DumpedTensor &dt = collected_[i];
+        const DumpedArg &dt = collected_[i];
         std::string dtype_name = get_dtype_name_from_raw(dt.dtype);
         uint64_t numel = get_num_elements(dt);
 
@@ -645,16 +653,16 @@ int TensorDumpCollector::export_dump_files() {
             json << dt.func_ids[f];
         }
         json << "]";
-        json << ", \"arg_index\": " << dt.arg_index << ", \"role\": \"" << tensor_dump_role_name(dt.role)
-             << "\", \"stage\": \"" << tensor_dump_stage_name(dt.stage) << "\", \"kind\": \""
-             << tensor_dump_kind_name(dt.kind) << "\", \"dtype\": \"" << dtype_name << "\"";
-        if (dt.kind == TensorDumpKind::SCALAR) {
+        json << ", \"arg_index\": " << dt.arg_index << ", \"role\": \"" << args_dump_role_name(dt.role)
+             << "\", \"stage\": \"" << args_dump_stage_name(dt.stage) << "\", \"kind\": \""
+             << args_dump_kind_name(dt.kind) << "\", \"dtype\": \"" << dtype_name << "\"";
+        if (dt.kind == ArgsDumpKind::SCALAR) {
             write_scalar_json_value(json, dt);
         }
         json << ", \"is_contiguous\": " << (dt.is_contiguous ? "true" : "false") << ", \"shape\": " << shape_str
              << ", \"strides\": " << strides_str << ", \"start_offset\": " << dt.start_offset
              << ", \"numel\": " << numel;
-        if ((dt.flags & TENSOR_DUMP_RECORD_FLAG_ARG_INDEX_AMBIGUOUS) != 0) {
+        if ((dt.flags & ARGS_DUMP_RECORD_FLAG_ARG_INDEX_AMBIGUOUS) != 0) {
             json << ", \"arg_index_ambiguous\": true";
         }
         json << ", \"bin_offset\": " << dt.bin_offset << ", \"bin_size\": " << dt.payload_size
@@ -688,7 +696,7 @@ int TensorDumpCollector::export_dump_files() {
     return 0;
 }
 
-int TensorDumpCollector::finalize(DumpUnregisterCallback unregister_cb, const DumpFreeCallback &free_cb) {
+int ArgsDumpCollector::finalize(DumpUnregisterCallback unregister_cb, const DumpFreeCallback &free_cb) {
     if (shm_host_ == nullptr) return 0;
 
     // Stop mgmt + collector threads if the caller didn't already (idempotent).

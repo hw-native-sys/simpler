@@ -12,7 +12,7 @@
 /**
  * @file buffer_pool_manager.h
  * @brief Generic buffer-pool data structure shared by L2Swimlane, PMU,
- *        DepGen, TensorDump, and ScopeStats collectors. Owns:
+ *        DepGen, ArgsDump, and ScopeStats collectors. Owns:
  *
  *   - ready_queue shard(s) (mgmt → collector) as SPSC rings,
  *   - done_queue shard(s) (collector → mgmt) as SPSC rings,

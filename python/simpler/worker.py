@@ -141,7 +141,7 @@ _OFF_ERROR = 4
 _OFF_CALLABLE = 8
 _OFF_CONFIG = 16
 # Packed CallConfig wire layout — must match call_config.h byte for byte:
-# 7 int32 (block_dim, aicpu_thread_num, enable_l2_swimlane, enable_dump_tensor,
+# 7 int32 (block_dim, aicpu_thread_num, enable_l2_swimlane, enable_dump_args,
 # enable_pmu, enable_dep_gen, enable_scope_stats) + uint64 ring sizing
 # overrides (3 per-ring arrays of RUNTIME_ENV_RING_COUNT: ring_task_window,
 # ring_heap, ring_dep_pool) + 1024-byte NUL-terminated output_prefix. Log config
@@ -1409,7 +1409,7 @@ def _read_config_from_mailbox(buf: memoryview) -> CallConfig:
     cfg.block_dim = block_dim
     cfg.aicpu_thread_num = aicpu_tn
     cfg.enable_l2_swimlane = swl
-    cfg.enable_dump_tensor = int(dt)
+    cfg.enable_dump_args = int(dt)
     cfg.enable_pmu = pmu
     cfg.enable_dep_gen = bool(dep_gen)
     cfg.enable_scope_stats = bool(scope_stats)

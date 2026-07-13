@@ -145,7 +145,7 @@ inline const char *get_dtype_name(DataType dtype) {
  * Map a C++ type to its DataType enum value.
  *
  * Used to preserve original scalar type information through the
- * Arg -> PTO2TaskPayload -> tensor dump pipeline.
+ * Arg -> PTO2TaskPayload -> args dump pipeline.
  */
 template <typename T>
 inline constexpr uint8_t dtype_of() {

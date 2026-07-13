@@ -19,7 +19,7 @@
  * sole source of truth for fanout edges; the L2 swimlane hot path no longer
  * carries fanout to keep AICPU off the per-task GM-store critical path.
  *
- * Streaming buffer design mirrors PMU / L2Perf / TensorDump (single source of
+ * Streaming buffer design mirrors PMU / L2Perf / ArgsDump (single source of
  * algorithmic truth in src/common/platform/include/host/profiler_base.h):
  *
  *   DepGenFreeQueue    — SPSC: Host pushes free DepGenBuffers, AICPU pops them.

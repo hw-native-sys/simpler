@@ -10,14 +10,14 @@
  */
 
 /**
- * @file tensor_dump.h
- * @brief Tensor dump data structures for device-to-host tensor collection
+ * @file args_dump.h
+ * @brief Args dump data structures for device-to-host tensor collection
  *
  * Independent shared memory region for capturing per-task tensor I/O.
  * Fully decoupled from profiling — uses its own ready queues, buffer states,
  * and memory manager thread.
  *
- * Memory layout (Dump SHM, allocated only when SIMPLER_DFX=1):
+ * Memory layout (allocated only when enable_dump_args=true):
  * ┌─────────────────────────────────────────────────────────────┐
  * │ DumpDataHeader (fixed header)                               │
  * │  - Per-thread ready queues (circular FIFOs)                 │
@@ -32,13 +32,17 @@
  * │ ...                                                         │
  * └─────────────────────────────────────────────────────────────┘
  *
- * Per-thread payload arenas are separate allocations (registered once via
- * halHostRegister). DumpMetaBuffers are allocated by the host and pushed
+ * Per-thread payload arenas are separate allocations.
+ * DumpMetaBuffers are allocated by the host and pushed
  * into per-thread free_queues.
+ *
+ * A5 specifics: memory access uses host-shadow copies + explicit memcpy
+ * instead of halHostRegister/SVM. Data structures and interaction logic
+ * are identical to A2A3.
  */
 
-#ifndef SRC_A2A3_PLATFORM_INCLUDE_COMMON_TENSOR_DUMP_H_
-#define SRC_A2A3_PLATFORM_INCLUDE_COMMON_TENSOR_DUMP_H_
+#ifndef SRC_A5_PLATFORM_INCLUDE_COMMON_ARGS_DUMP_H_
+#define SRC_A5_PLATFORM_INCLUDE_COMMON_ARGS_DUMP_H_
 
 #include <cstddef>
 #include <cstdint>
@@ -49,50 +53,50 @@
 // Constants
 // =============================================================================
 
-constexpr uint32_t TENSOR_DUMP_MAGIC = 0x44554D50;  // "DUMP"
+constexpr uint32_t ARGS_DUMP_MAGIC = 0x44554D50;  // "DUMP"
 
 // =============================================================================
-// TensorDumpRole - Formal kernel signature direction
+// ArgsDumpRole - Formal kernel signature direction
 // =============================================================================
 
-enum class TensorDumpRole : uint8_t {
+enum class ArgsDumpRole : uint8_t {
     INPUT = 0,
     OUTPUT = 1,
     INOUT = 2,
 };
 
 // =============================================================================
-// TensorDumpStage - When the tensor was captured
+// ArgsDumpStage - When the tensor was captured
 // =============================================================================
 
-enum class TensorDumpStage : uint8_t {
+enum class ArgsDumpStage : uint8_t {
     BEFORE_DISPATCH = 0,
     AFTER_COMPLETION = 1,
 };
 
-enum class TensorDumpKind : uint8_t {
+enum class ArgsDumpKind : uint8_t {
     TENSOR = 0,
     SCALAR = 1,
 };
 
-using TensorDumpArgMask = uint64_t;
+using ArgsDumpArgMask = uint64_t;
 
 // Bitmask stored in the platform-owned mask pool when orchestration selects
 // specific task tensor/scalar arguments for dump. Bit N corresponds to the
 // payload arg index: tensors first, then scalars.
 // Zero preserves legacy "dump all tasks" behavior unless selective mode is enabled.
-constexpr TensorDumpArgMask TENSOR_DUMP_ARG_MASK_NONE = 0;
-constexpr uint32_t TENSOR_DUMP_ARG_MASK_BITS = 64;
-constexpr uint8_t TENSOR_DUMP_RECORD_FLAG_ARG_INDEX_AMBIGUOUS = 1u << 0;
+constexpr ArgsDumpArgMask ARGS_DUMP_ARG_MASK_NONE = 0;
+constexpr uint32_t ARGS_DUMP_ARG_MASK_BITS = 64;
+constexpr uint8_t ARGS_DUMP_RECORD_FLAG_ARG_INDEX_AMBIGUOUS = 1u << 0;
 
 // Max kernel ids a record carries: one per active subtask of a task (its mix
 // membership). Must equal the runtime's PTO2_SUBTASK_SLOT_COUNT (1C2V => 3);
 // can't reference it here (platform layer doesn't include the tmap+ring runtime
 // header), so a static_assert in dump_args_for_task ties the two together.
-constexpr uint8_t TENSOR_DUMP_MAX_FUNC_IDS = 3;
+constexpr uint8_t ARGS_DUMP_MAX_FUNC_IDS = 3;
 
 // =============================================================================
-// TensorDumpRecord - Single Tensor Dump Entry (128B = 2 cache lines)
+// ArgsDumpRecord - Single Args Dump Entry (128B = 2 cache lines)
 // =============================================================================
 
 /**
@@ -101,25 +105,25 @@ constexpr uint8_t TENSOR_DUMP_MAX_FUNC_IDS = 3;
  * Cache line 1 (64B): identifiers, payload location, compact scalar metadata
  * Cache line 2 (64B): strides and shapes
  */
-struct alignas(64) TensorDumpRecord {
+struct alignas(64) ArgsDumpRecord {
     // === Cache line 1 (64B) ===
-    uint64_t task_id;                             // PTO2 encoding or plain task index
-    uint8_t role;                                 // TensorDumpRole (formal callable signature)
-    uint8_t stage;                                // TensorDumpStage (before/after execution)
-    uint8_t ndims;                                // Number of dimensions
-    uint32_t arg_index;                           // Position in the callable signature
-    uint8_t dtype;                                // DataType raw enum value
-    uint8_t truncated;                            // 1 if payload was truncated (tensor > arena capacity)
-    uint8_t is_contiguous;                        // 1 when source view is already PyTorch-contiguous
-    uint8_t pad0_align;                           // Explicit alignment before 64-bit payload offsets
-    uint64_t payload_offset;                      // Monotonic byte offset into thread arena
-    uint64_t payload_size;                        // Bytes actually copied (may be < full tensor bytes)
-    uint64_t scalar_value;                        // Valid when kind == TensorDumpKind::SCALAR
-    uint8_t kind;                                 // TensorDumpKind
-    uint8_t flags;                                // TENSOR_DUMP_RECORD_FLAG_*
-    uint16_t func_ids[TENSOR_DUMP_MAX_FUNC_IDS];  // active subtask kernel ids (task's mix set); 0xFFFF unknown
-    uint8_t func_count;                           // number of valid entries in func_ids
-    uint8_t pad0[7];                              // keep cache line 1 = 64B (6 + 1 + 7 = 14)
+    uint64_t task_id;                           // PTO2 encoding or plain task index
+    uint8_t role;                               // ArgsDumpRole (formal callable signature)
+    uint8_t stage;                              // ArgsDumpStage (before/after execution)
+    uint8_t ndims;                              // Number of dimensions
+    uint32_t arg_index;                         // Position in the callable signature
+    uint8_t dtype;                              // DataType raw enum value
+    uint8_t truncated;                          // 1 if payload was truncated (tensor > arena capacity)
+    uint8_t is_contiguous;                      // 1 when source view is already PyTorch-contiguous
+    uint8_t pad0_align;                         // Explicit alignment before 64-bit payload offsets
+    uint64_t payload_offset;                    // Monotonic byte offset into thread arena
+    uint64_t payload_size;                      // Bytes actually copied (may be < full tensor bytes)
+    uint64_t scalar_value;                      // Valid when kind == ArgsDumpKind::SCALAR
+    uint8_t kind;                               // ArgsDumpKind
+    uint8_t flags;                              // ARGS_DUMP_RECORD_FLAG_*
+    uint16_t func_ids[ARGS_DUMP_MAX_FUNC_IDS];  // active subtask kernel ids (task's mix set); 0xFFFF unknown
+    uint8_t func_count;                         // number of valid entries in func_ids
+    uint8_t pad0[7];                            // keep cache line 1 = 64B (6 + 1 + 7 = 14)
 
     // === Cache line 2 (64B) — strided view descriptor ===
     // start_offset placed first for 8B alignment without padding gaps; total = 8 + 20 + 20 = 48B.
@@ -128,7 +132,7 @@ struct alignas(64) TensorDumpRecord {
     uint32_t shapes[PLATFORM_DUMP_MAX_DIMS];   // Current view shape
 } __attribute__((aligned(64)));
 
-static_assert(sizeof(TensorDumpRecord) == 128, "TensorDumpRecord must be 128 bytes (2 cache lines)");
+static_assert(sizeof(ArgsDumpRecord) == 128, "ArgsDumpRecord must be 128 bytes (2 cache lines)");
 
 // =============================================================================
 // DumpMetaBuffer - Fixed-Size Record Buffer
@@ -140,7 +144,7 @@ static_assert(sizeof(TensorDumpRecord) == 128, "TensorDumpRecord must be 128 byt
  * Allocated by host, pushed into per-thread free_queue.
  */
 struct DumpMetaBuffer {
-    TensorDumpRecord records[PLATFORM_DUMP_RECORDS_PER_BUFFER];
+    ArgsDumpRecord records[PLATFORM_DUMP_RECORDS_PER_BUFFER];
     volatile uint32_t count;  // Current record count
 } __attribute__((aligned(64)));
 
@@ -150,7 +154,7 @@ struct DumpMetaBuffer {
 
 /**
  * Single Producer Single Consumer (SPSC) lock-free queue.
- * Same layout and semantics as L2SwimlaneFreeQueue, separate type for decoupling.
+ * Same layout and semantics as PerfFreeQueue, separate type for decoupling.
  *
  * Producer: Host (DumpMemoryManager thread) pushes recycled/new buffers
  * Consumer: Device (AICPU thread) pops buffers when switching
@@ -159,7 +163,7 @@ struct DumpFreeQueue {
     volatile uint64_t buffer_ptrs[PLATFORM_DUMP_SLOT_COUNT];
     volatile uint32_t head;  // Consumer read position (Device increments)
     volatile uint32_t tail;  // Producer write position (Host increments)
-    uint32_t pad[22];        // Pad to 128 bytes (32+4+4+88=128)
+    uint32_t pad[22];        // Pad to 128 bytes (40 + 88 = 128)
 } __attribute__((aligned(64)));
 
 static_assert(sizeof(DumpFreeQueue) == 128, "DumpFreeQueue must be 128 bytes");
@@ -188,7 +192,7 @@ struct DumpBufferState {
     volatile uint64_t arena_size;            // Arena size in bytes
     volatile uint64_t arena_write_offset;    // Monotonic write cursor (host computes % arena_size)
     volatile uint32_t dropped_record_count;  // Records dropped before host export
-    uint8_t pad1[28];                        // Pad to 256 bytes
+    uint8_t pad1[84];                        // Pad to 256 bytes (172 + 84 = 256)
 } __attribute__((aligned(64)));
 
 static_assert(sizeof(DumpBufferState) == 256, "DumpBufferState must be 256 bytes");
@@ -220,7 +224,7 @@ struct DumpReadyQueueEntry {
  * 1. Per-thread ready queues (circular FIFOs) — one per AICPU thread
  * 2. Metadata (thread count, config)
  *
- * Ready queue design:
+ * Ready queue design mirrors PerfDataHeader but is independent:
  * - Per-thread queues avoid lock contention
  * - Producer: AICPU thread (adds full DumpMetaBuffers)
  * - Consumer: Host DumpMemoryManager thread
@@ -228,9 +232,9 @@ struct DumpReadyQueueEntry {
  * - Queue full: (tail + 1) % capacity == head
  */
 
-// Tensor-dump level. Carried in DumpDataHeader so the
+// Args-dump level. Carried in DumpDataHeader so the
 // AICPU latches the mode in dump_args_init() before any task is dispatched.
-enum class DumpTensorLevel : uint32_t {
+enum class DumpArgsLevel : uint32_t {
     OFF = 0,             // no dump
     PARTIAL = 1,         // only args marked with Arg::dump(...)
     FULL = 2,            // every task's tensor/scalar I/O (JSON manifest + BIN payload)
@@ -248,27 +252,27 @@ struct DumpDataHeader {
     uint32_t records_per_buffer;
     uint64_t arena_size_per_thread;
     uint32_t magic;
-    uint32_t dump_tensor_level;  // DumpTensorLevel: 0=off, 1=partial, 2=full, 3=full_json_only
+    uint32_t dump_args_level;  // DumpArgsLevel: 0=off, 1=partial, 2=full, 3=full_json_only
 } __attribute__((aligned(64)));
 
 // =============================================================================
-// TensorDumpInfo - Lightweight Info Struct (passed from runtime to platform API)
+// ArgsDumpInfo - Lightweight Info Struct (passed from runtime to platform API)
 // =============================================================================
 
 /**
  * Caller fills this struct from runtime-specific tensor types.
  * Platform layer is agnostic to runtime-specific types (Tensor, PTO2TaskPayload, etc.).
  */
-struct TensorDumpInfo {
+struct ArgsDumpInfo {
     uint64_t task_id;
-    TensorDumpRole role;
-    TensorDumpStage stage;
+    ArgsDumpRole role;
+    ArgsDumpStage stage;
     uint8_t dtype;
     uint8_t ndims;
     uint32_t arg_index;
     uint64_t buffer_addr;
     uint64_t scalar_value;
-    int32_t func_ids[TENSOR_DUMP_MAX_FUNC_IDS];  // active subtask kernel ids; -1 unknown
+    int32_t func_ids[ARGS_DUMP_MAX_FUNC_IDS];  // active subtask kernel ids; -1 unknown
     int32_t func_count;
     uint8_t kind;
     uint8_t flags;
@@ -339,4 +343,4 @@ inline DumpBufferState *get_dump_buffer_state(void *base_ptr, int thread_idx) {
 }
 #endif
 
-#endif  // SRC_A2A3_PLATFORM_INCLUDE_COMMON_TENSOR_DUMP_H_
+#endif  // SRC_A5_PLATFORM_INCLUDE_COMMON_ARGS_DUMP_H_

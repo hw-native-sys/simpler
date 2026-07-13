@@ -19,7 +19,7 @@
 #include "aicpu/l2_swimlane_collector_aicpu.h"
 #include "aicpu/platform_regs.h"
 #include "aicpu/pmu_collector_aicpu.h"
-#include "aicpu/tensor_dump_aicpu.h"
+#include "aicpu/args_dump_aicpu.h"
 #include "common/memory_barrier.h"
 #include "common/l2_swimlane_profiling.h"
 #include "common/platform_config.h"

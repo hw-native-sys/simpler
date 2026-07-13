@@ -24,7 +24,7 @@ class TestCallConfig:
         assert config.block_dim == 0
         assert config.aicpu_thread_num == 3
         assert config.enable_l2_swimlane == 0
-        assert config.enable_dump_tensor == 0
+        assert config.enable_dump_args == 0
         assert config.enable_pmu == 0
         assert config.enable_dep_gen is False
 
@@ -43,33 +43,33 @@ class TestCallConfig:
         assert config.enable_l2_swimlane == 2
         config.enable_l2_swimlane = False
         assert config.enable_l2_swimlane == 0
-        # enable_dump_tensor is likewise a level (0=off, 1=partial, 2=full,
+        # enable_dump_args is likewise a level (0=off, 1=partial, 2=full,
         # 3=full_json_only): `True` maps to level 1 (partial), explicit ints
         # select the level.
-        config.enable_dump_tensor = True
-        assert config.enable_dump_tensor == 1
-        config.enable_dump_tensor = 2
-        assert config.enable_dump_tensor == 2
-        config.enable_dump_tensor = 3
-        assert config.enable_dump_tensor == 3
-        config.enable_dump_tensor = False
-        assert config.enable_dump_tensor == 0
+        config.enable_dump_args = True
+        assert config.enable_dump_args == 1
+        config.enable_dump_args = 2
+        assert config.enable_dump_args == 2
+        config.enable_dump_args = 3
+        assert config.enable_dump_args == 3
+        config.enable_dump_args = False
+        assert config.enable_dump_args == 0
 
     def test_diagnostics_subfeatures_are_parallel(self):
         # Guard against drift: the four diagnostics sub-features under the
         # profiling umbrella must all round-trip through the nanobind surface.
         config = CallConfig()
         config.enable_l2_swimlane = True
-        config.enable_dump_tensor = True
+        config.enable_dump_args = True
         config.enable_pmu = 2
         config.enable_dep_gen = True
         assert config.enable_l2_swimlane == 4
-        assert config.enable_dump_tensor == 1
+        assert config.enable_dump_args == 1
         assert config.enable_pmu == 2
         assert config.enable_dep_gen is True
         r = repr(config)
         assert "enable_l2_swimlane=4" in r
-        assert "enable_dump_tensor=1" in r
+        assert "enable_dump_args=1" in r
         assert "enable_pmu=2" in r
         assert "enable_dep_gen=True" in r
 
@@ -334,7 +334,7 @@ class TestMailboxConfigRoundtrip:
         cfg.block_dim = 7
         cfg.aicpu_thread_num = 2
         cfg.enable_l2_swimlane = 3
-        cfg.enable_dump_tensor = 2
+        cfg.enable_dump_args = 2
         cfg.enable_pmu = 5
         cfg.enable_dep_gen = True
         cfg.enable_scope_stats = True
@@ -350,7 +350,7 @@ class TestMailboxConfigRoundtrip:
             cfg.block_dim,
             cfg.aicpu_thread_num,
             cfg.enable_l2_swimlane,
-            int(cfg.enable_dump_tensor),
+            int(cfg.enable_dump_args),
             cfg.enable_pmu,
             int(cfg.enable_dep_gen),
             int(cfg.enable_scope_stats),
@@ -364,7 +364,7 @@ class TestMailboxConfigRoundtrip:
         assert decoded.block_dim == 7
         assert decoded.aicpu_thread_num == 2
         assert decoded.enable_l2_swimlane == 3
-        assert decoded.enable_dump_tensor == 2
+        assert decoded.enable_dump_args == 2
         assert decoded.enable_pmu == 5
         assert decoded.enable_dep_gen is True
         assert decoded.enable_scope_stats is True

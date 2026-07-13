@@ -36,7 +36,7 @@
 #include "pto_runtime_status.h"
 // NOTE (host_build_graph divergence from tensormap_and_ringbuffer): the
 // pto2_dispatch_payload.h include is intentionally dropped here. This header is
-// pulled in by the platform's tensor_dump.h via a hardcoded
+// pulled in by the platform's args_dump.h via a hardcoded
 // "host_build_graph/runtime/pto_runtime2_types.h" path, and pto2_dispatch_payload.h
 // uses #pragma once (path-keyed), so leaving it in double-defines PTO2DispatchPayload
 // against tensormap_and_ringbuffer's copy inside the shared host-dispatcher TU.

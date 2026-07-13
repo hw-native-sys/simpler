@@ -11,7 +11,7 @@
 
 /**
  * @file profiler_base.h
- * @brief CRTP scaffolding shared by L2Swimlane, PMU, DepGen, TensorDump,
+ * @brief CRTP scaffolding shared by L2Swimlane, PMU, DepGen, ArgsDump,
  *        and ScopeStats collectors.
  *
  * Owns the BufferPoolManager<Module>, drain/replenish mgmt thread(s) that
@@ -164,7 +164,7 @@
  *       (use the subsystem's PLATFORM_*_TIMEOUT_SECONDS).
  *
  *   static constexpr const char*  kSubsystemName;
- *       Used in the idle-timeout log line (e.g. "L2Swimlane", "PMU", "TensorDump").
+ *       Used in the idle-timeout log line (e.g. "L2Swimlane", "PMU", "ArgsDump").
  */
 
 #ifndef SRC_COMMON_PLATFORM_INCLUDE_HOST_PROFILER_BASE_H_
@@ -215,7 +215,7 @@ struct ProfilerDerivedShardAwareCollector<
     static constexpr bool value = true;
 };
 
-// Common subsystem callback signatures. All four collectors (PMU / TensorDump
+// Common subsystem callback signatures. All four collectors (PMU / ArgsDump
 // / L2Swimlane / DepGen) used to declare their own typedefs with identical
 // shapes; these are the canonical types stashed in ProfilerBase via
 // set_memory_context().

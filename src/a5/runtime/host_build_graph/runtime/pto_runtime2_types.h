@@ -15,10 +15,10 @@
 #include "profiling_config.h"
 
 // =============================================================================
-// Tensor Dump Configuration
+// Args Dump Configuration
 // =============================================================================
 
-// Tensor dump uses these defaults to size its selective mask table so task-id
+// Args dump uses these defaults to size its selective mask table so task-id
 // ring/slot lookup stays aligned with PTO2 task id layout.
 #define PTO2_TASK_WINDOW_SIZE 16384  // Default per-ring task window size (power of 2)
 #define PTO2_MAX_RING_DEPTH 4        // Number of task-id ring layers

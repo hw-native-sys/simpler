@@ -61,7 +61,7 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, in
     // they are safe to cache here.
     uint32_t profiling_flag = get_aicore_profiling_flag();
     bool l2_swimlane_enabled = SIMPLER_GET_DFX_FLAG(profiling_flag, SIMPLER_DFX_FLAG_L2_SWIMLANE);
-    bool dump_tensor_enabled = SIMPLER_GET_DFX_FLAG(profiling_flag, SIMPLER_DFX_FLAG_DUMP_TENSOR);
+    bool dump_args_enabled = SIMPLER_GET_DFX_FLAG(profiling_flag, SIMPLER_DFX_FLAG_DUMP_ARGS);
     bool pmu_enabled = SIMPLER_GET_DFX_FLAG(profiling_flag, SIMPLER_DFX_FLAG_PMU);
     // Lazy resolve at first dispatch — AICPU init populates the rotation
     // table concurrently with kernel entry; first dispatch is proof init done.
@@ -119,7 +119,7 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, in
                 pmu_aicore_record_task(pmu_ring, pmu_reg_base, actual_task_id);
             }
 
-            if (dump_tensor_enabled) {
+            if (dump_args_enabled) {
                 pipe_barrier(PIPE_ALL);
             }
 

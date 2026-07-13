@@ -1218,7 +1218,7 @@ int L2SwimlaneCollector::finalize(L2SwimlaneUnregisterCallback unregister_cb, co
     // shm_host_ aliases freed device/host memory now; null it so is_initialized()
     // reports false, the dtor's "destroyed without finalize()" warning stays
     // quiet, and a re-entrant finalize() / re-init hits the early-out instead of
-    // walking freed buffer state. Mirrors PMU/DepGen/TensorDump collectors.
+    // walking freed buffer state. Mirrors PMU/DepGen/ArgsDump collectors.
     shm_host_ = nullptr;
     collected_perf_records_.clear();
     collected_aicore_records_.clear();

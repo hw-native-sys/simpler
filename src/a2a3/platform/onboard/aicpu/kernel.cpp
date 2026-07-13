@@ -23,7 +23,7 @@
 #include "aicpu/platform_regs.h"
 #include "aicpu/platform_aicpu_affinity.h"
 #include "aicpu/scope_stats_collector_aicpu.h"
-#include "aicpu/tensor_dump_aicpu.h"
+#include "aicpu/args_dump_aicpu.h"
 #include "runtime.h"
 
 // Run-wall capture: the host allocates a device buffer addressed by
@@ -75,7 +75,7 @@ extern "C" __attribute__((visibility("default"))) int simpler_aicpu_exec(void *a
     // profiling-buffer bases are pushed here.
     set_platform_regs(k_args->regs);
     set_platform_dump_base(k_args->dump_data_base);
-    set_dump_args_enabled(SIMPLER_GET_DFX_FLAG(k_args->enable_profiling_flag, SIMPLER_DFX_FLAG_DUMP_TENSOR));
+    set_dump_args_enabled(SIMPLER_GET_DFX_FLAG(k_args->enable_profiling_flag, SIMPLER_DFX_FLAG_DUMP_ARGS));
     set_platform_l2_swimlane_base(k_args->l2_swimlane_data_base);
     set_platform_l2_swimlane_aicore_rotation_table(k_args->l2_swimlane_aicore_rotation_table);
     set_l2_swimlane_enabled(SIMPLER_GET_DFX_FLAG(k_args->enable_profiling_flag, SIMPLER_DFX_FLAG_L2_SWIMLANE));

@@ -10,8 +10,8 @@
 """End-to-end white-box test for the private L2 prepared-callable ABI on a5/host_build_graph.
 
 Mirrors tests/st/a2a3/host_build_graph/prepared_callable for the a5 variant.
-Reuses the dump_tensor example kernels (a + b + 1) since a5/hbg has no
-vector_example today and dump_tensor already runs cleanly on a5sim.
+Reuses the dump_args example kernels (a + b + 1) since a5/hbg has no
+vector_example today and dump_args already runs cleanly on a5sim.
 """
 
 from pathlib import Path
@@ -55,8 +55,8 @@ class TestPreparedCallableHbgA5(SceneTestCase):
 
     CALLABLE = {
         "orchestration": {
-            "source": "kernels/orchestration/dump_tensor_orch.cpp",
-            "function_name": "build_dump_tensor_graph",
+            "source": "kernels/orchestration/dump_args_orch.cpp",
+            "function_name": "build_dump_args_graph",
             "signature": [D.IN, D.IN, D.OUT],
         },
         "incores": [
@@ -97,7 +97,7 @@ class TestPreparedCallableHbgA5(SceneTestCase):
         )
 
     def compute_golden(self, args, params):
-        # dump_tensor orchestration computes f = (a + b) + 1
+        # dump_args orchestration computes f = (a + b) + 1
         args.f[:] = (args.a + args.b) + 1
 
     def _chip_worker(self, worker):

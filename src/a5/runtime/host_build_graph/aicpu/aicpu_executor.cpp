@@ -19,7 +19,7 @@
 #include "aicpu/l2_swimlane_collector_aicpu.h"
 #include "aicpu/pmu_collector_aicpu.h"
 #include "aicpu/platform_aicpu_affinity.h"
-#include "aicpu/tensor_dump_aicpu.h"
+#include "aicpu/args_dump_aicpu.h"
 #include "aicpu/platform_regs.h"
 #include "callable.h"
 #include "common/memory_barrier.h"
@@ -111,8 +111,8 @@ struct AicpuExecutor {
     // ===== Performance profiling state =====
     uint64_t dispatch_timestamps_[RUNTIME_MAX_WORKER];  // Per-core AICPU dispatch timestamp
 
-    // ===== Dump tensor state =====
-    Runtime *runtime_{nullptr};  // Cached for dump_tensor access in try_dispatch_task
+    // ===== Args dump state =====
+    Runtime *runtime_{nullptr};  // Cached for args dump access in try_dispatch_task
 
     // ===== Methods =====
     int init(Runtime *runtime);
@@ -130,7 +130,7 @@ struct AicpuExecutor {
     // Helper functions (inline to avoid linker issues, not always_inline to preserve barriers)
     //
     // resolve_task_dependencies also handles post-completion profiling hooks
-    // (AFTER_COMPLETION tensor dump + per-task PMU record) so that callers
+    // (AFTER_COMPLETION args dump + per-task PMU record) so that callers
     // walk one boundary instead of sprinkling three #if SIMPLER_DFX blocks
     // after every resolve site. core_id / core_type are only read when the
     // relevant profiling flag is enabled.
@@ -169,7 +169,7 @@ collect_task_tensor_buffer_addrs(const Runtime &runtime, const Task &task, uint6
 // ===== Helper Function Implementations =====
 
 // Resolve dependencies: decrement fanin and enqueue newly ready tasks.
-// Also handles post-completion profiling hooks (AFTER_COMPLETION tensor dump
+// Also handles post-completion profiling hooks (AFTER_COMPLETION args dump
 // + per-task PMU record) so callers don't need to re-check profiling flags.
 inline void AicpuExecutor::resolve_task_dependencies(
     Task *task, Runtime &runtime, int thread_idx, int core_id, CoreType core_type, int *cur_ready_queue_aic,
@@ -191,7 +191,7 @@ inline void AicpuExecutor::resolve_task_dependencies(
                 collect_task_tensor_buffer_addrs(runtime, *task, tensor_buffer_addrs, RUNTIME_MAX_ARGS);
             dump_args_for_task(
                 thread_idx, static_cast<uint64_t>(task->task_id), task->num_args, *callable, tensor_info,
-                tensor_info_count, tensor_buffer_addrs, tensor_buffer_count, TensorDumpStage::AFTER_COMPLETION
+                tensor_info_count, tensor_buffer_addrs, tensor_buffer_count, ArgsDumpStage::AFTER_COMPLETION
             );
         }
     }
@@ -274,7 +274,7 @@ inline bool AicpuExecutor::try_dispatch_task(
                     collect_task_tensor_buffer_addrs(*runtime_, *task, tensor_buffer_addrs, RUNTIME_MAX_ARGS);
                 dump_args_for_task(
                     thread_idx, static_cast<uint64_t>(task_id), task->num_args, *callable, tensor_info,
-                    tensor_info_count, tensor_buffer_addrs, tensor_buffer_count, TensorDumpStage::BEFORE_DISPATCH
+                    tensor_info_count, tensor_buffer_addrs, tensor_buffer_count, ArgsDumpStage::BEFORE_DISPATCH
                 );
             }
         }

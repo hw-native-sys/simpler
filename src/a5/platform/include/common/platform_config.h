@@ -226,7 +226,7 @@ inline double cycles_to_us(uint64_t cycles) {
 // Profiling-related runtime flags shared through AICPU-AICore handshake.
 // "Profiling" is the umbrella; each bit is a parallel diagnostics sub-feature.
 #define SIMPLER_DFX_FLAG_NONE 0u
-#define SIMPLER_DFX_FLAG_DUMP_TENSOR (1u << 0)
+#define SIMPLER_DFX_FLAG_DUMP_ARGS (1u << 0)
 #define SIMPLER_DFX_FLAG_L2_SWIMLANE (1u << 1)
 #define SIMPLER_DFX_FLAG_PMU (1u << 2)
 #define SIMPLER_DFX_FLAG_DEP_GEN (1u << 3)
@@ -236,11 +236,11 @@ inline double cycles_to_us(uint64_t cycles) {
 #define SIMPLER_CLEAR_DFX_FLAG(flags, bit) ((flags) &= ~((uint32_t)(bit)))
 
 // =============================================================================
-// Tensor Dump Configuration
+// Args Dump Configuration
 // =============================================================================
 
 /**
- * Number of TensorDumpRecord entries per DumpMetaBuffer.
+ * Number of ArgsDumpRecord entries per DumpMetaBuffer.
  * Each record is 128 bytes, so one buffer = RECORDS * 128 bytes.
  */
 constexpr int PLATFORM_DUMP_RECORDS_PER_BUFFER = 256;
@@ -276,7 +276,7 @@ constexpr int PLATFORM_DUMP_MAX_DIMS = 5;
 constexpr int PLATFORM_DUMP_READYQUEUE_SIZE = PLATFORM_MAX_AICPU_THREADS * PLATFORM_DUMP_BUFFERS_PER_THREAD * 2;
 
 /**
- * Idle timeout duration for tensor dump collection (seconds).
+ * Idle timeout duration for args dump collection (seconds).
  */
 constexpr int PLATFORM_DUMP_TIMEOUT_SECONDS = 30;
 

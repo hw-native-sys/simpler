@@ -58,7 +58,7 @@
 #include "common/pmu_profiling.h"
 
 /**
- * Profiling enable bitmask (umbrella over dump_tensor / l2_swimlane / pmu).
+ * Profiling enable bitmask (umbrella over dump_args / l2_swimlane / pmu).
  * Same layout as `KernelArgs::enable_profiling_flag`. AICore reads via
  * `SIMPLER_GET_DFX_FLAG(get_aicore_profiling_flag(), SIMPLER_DFX_FLAG_*)`.
  */
