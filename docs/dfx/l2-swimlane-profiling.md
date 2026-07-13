@@ -476,24 +476,29 @@ dependency / `hb_violation` flows connect via **anchor pairing** on
 the Worker View and Scheduler View task lanes — there is no dedicated
 `SPMD (block-level)` track.
 
-SPMD tasks use the earliest-start subtask row for each
-`(func_id, task_id)` group as the dependency anchor. This keeps one
-representative endpoint per logical function within a task in each view
-and makes the task-dependency arrows share the same anchor records
-as the `complete` flow. The anchor decision includes both the function
-identity and the logical `task_id` (ring/local id), so MIX tasks that
-share a `task_id` across AIC/AIV functions keep separate anchors. The
-converter does not draw one arrow per subtask instance.
+Each view independently selects one SPMD anchor for every
+`(func_id, task_id)` group. The Worker View chooses the earliest visible
+kernel slice: `receive_time_us` when present, including the valid value `0`,
+or `start_time_us` for archived records without a receive timestamp. The
+Scheduler View independently chooses the earliest visible AICPU slice by
+`dispatch_time_us`. Equal start times are resolved by the smaller `core_id`.
+The two views can therefore select different physical subtask records. Within
+each view, dependency and `complete` arrows use that view's selected anchor.
+
+The grouping includes both the function identity and the logical `task_id`
+(ring/local id), so MIX tasks that share a `task_id` across AIC/AIV functions
+keep separate anchors. The converter does not draw one arrow per subtask
+instance.
 
 **`complete` arrows.** Like the dependency mirror, the per-task
 `complete` flow (task → the pid=2 `complete` phase that observed its
-last subtask FIN) is drawn from **both** task views on the same anchor
-rows: the Worker View source anchors on the kernel slice (`end_time_us`),
-the Scheduler View source anchors on the AICPU `finish_time_us`. Both
-mirrors land on the identical pid=2 endpoint (thread + timestamp), so
-clicking the task in either view surfaces the arrow without changing
-completion attribution. The Scheduler View mirror is skipped for an
-anchor with no AICPU finish (its pid=3 bar does not exist).
+last subtask FIN) is drawn from **both** task views using their independently
+selected anchor rows. The Worker View source anchors on the kernel slice
+(`end_time_us`), and the Scheduler View source anchors on the AICPU
+`finish_time_us`. Both arrows land on the identical pid=2 endpoint (thread +
+timestamp), so clicking the task in either view surfaces the arrow without
+changing completion attribution. The Scheduler View arrow is skipped when
+there is no visible AICPU bar.
 
 Non-SPMD tasks (including MIX multi-slot kernels with `block_num == 1`)
 keep every subtask row as an endpoint (N×N pairing unchanged).
@@ -537,7 +542,7 @@ What the swimlane shows:
   so Perfetto draws arrows between predecessor and successor tasks
   — see [§3.5](#35-dependency-arrows-from-dep_gen). Without
   `deps.json` the trace is correct but unarrowed. For SPMD tasks,
-  dependency arrows use the earliest-start subtask row per
+  dependency arrows independently use each view's earliest visible slice per
   `(func_id, task_id)` group as the anchor.
 - **Scheduler-loop time decomposition.** Per-iteration AICPU
   phase records show how long the scheduler spent in each of

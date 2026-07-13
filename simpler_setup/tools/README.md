@@ -39,6 +39,11 @@ python -m simpler_setup.tools.swimlane_converter
 # Specify an input file
 python -m simpler_setup.tools.swimlane_converter outputs/<case>_<ts>/l2_swimlane_records.json
 
+# A unique sibling name_map*.json is loaded automatically.
+# Override it explicitly when needed:
+python -m simpler_setup.tools.swimlane_converter outputs/<case>_<ts>/l2_swimlane_records.json \
+    --func-names outputs/<case>_<ts>/name_map_<case>.json
+
 # Specify an output file
 python -m simpler_setup.tools.swimlane_converter outputs/<case>_<ts>/l2_swimlane_records.json -o custom_output.json
 
@@ -61,6 +66,11 @@ python -m simpler_setup.tools.swimlane_converter outputs/<case>_<ts>/l2_swimlane
 > `--enable-l2-swimlane` runs that consume it. If no `deps.json` is found
 > alongside the perf JSON (and `--deps-json` isn't passed), the trace
 > still renders but has no arrows; the converter prints a warning.
+
+When neither `--func-names` nor `--kernel-config` is specified, the converter
+loads a unique `name_map*.json` next to the input file. If that directory
+contains multiple matching files, it prints a warning and uses default function
+labels until one is selected explicitly with `--func-names`.
 
 ### SPMD dependency visualization
 
@@ -90,7 +100,7 @@ SPMD tasks are present.
 | `input` | | Input JSON file (l2_swimlane_records_*.json). If omitted, the latest file in outputs/ is used |
 | `--output` | `-o` | Output JSON file (default: outputs/merged_swimlane_`<timestamp>`.json) |
 | `--kernel-config` | `-k` | Path to kernel_config.py, used for function name mapping |
-| `--func-names` | | Path to func_id_names_*.json (SceneTest format) for function name mapping |
+| `--func-names` | | Path to name_map*.json (SceneTest format) for function name mapping |
 | `--deps-json` | | Path to a dep_gen `deps.json` (defaults to sibling of input). Without one, no dependency arrows are drawn. |
 | `--overhead` | | Add the 8-line Overhead Analysis counter group (needs `deps.json`). See [sched-overhead-model](../../docs/dfx/sched-overhead-model.md). |
 | `--verbose` | `-v` | Enable verbose output |
@@ -114,6 +124,13 @@ A statistics summary grouped by function (printed to the console), including Exe
 - **Latency**: end-to-end latency from the AICPU perspective (finish_time - dispatch_time, including head OH + Exec + tail OH)
 - **Head/Tail OH**: scheduling head/tail overhead
 - **Exec_%**: Exec / Latency percentage (kernel utilization)
+
+The table prints the source `l2_swimlane_level` recorded in
+`l2_swimlane_records.json`. At level 1, only AICore timing is captured, so
+Latency, Exec%, Head/Tail OH, and Propagation render as `-`, including total
+latency in the TOTAL row. Count, Exec, and Local Setup remain available. The
+`Total Test Time` line is omitted and replaced by an `AICore Observed Span`
+summary. Level 2 and above retain the full latency summary.
 
 #### 3. Scheduler Overhead Deep-Dive
 

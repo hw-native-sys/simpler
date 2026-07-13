@@ -108,7 +108,62 @@ def _generate_trace(tasks, deps_edges, deps_block_map, tmp_path):
     return out
 
 
-def test_spmd_pred_routes_dependency_to_min_core_subtask(tmp_path):
+def test_task_statistics_level_one_hides_aicpu_metrics(capsys):
+    tasks = [
+        {
+            "task_id": 1,
+            "func_id": 0,
+            "core_id": 0,
+            "core_type": "aic",
+            "start_time_us": 1.0,
+            "end_time_us": 6.0,
+            "duration_us": 5.0,
+            "dispatch_time_us": 0.0,
+            "finish_time_us": 0.0,
+            "receive_time_us": 0.5,
+            "local_setup_us": 0.5,
+        }
+    ]
+
+    sc.print_task_statistics(tasks, {"0": "kernel"}, l2_swimlane_level=1)
+
+    output = capsys.readouterr().out
+    row = next(line for line in output.splitlines() if line.startswith("0        kernel"))
+    total = next(line for line in output.splitlines() if line.startswith("TOTAL"))
+    assert "Source l2_swimlane_level: 1 (AICore timing only; recorded in l2_swimlane_records.json)" in output
+    assert row.split() == ["0", "kernel", "1", "5.00", "-", "-", "-", "-", "-", "0.50"]
+    assert total.split() == ["TOTAL", "1", "5.00", "-"]
+    assert "AICore Observed Span: 5.50 us (from earliest AICore receive to latest AICore end)" in output
+    assert "Total Test Time" not in output
+
+
+def test_load_func_names_auto_discovery_and_explicit_precedence(tmp_path):
+    input_path = tmp_path / "l2_swimlane_records.json"
+    name_map_path = tmp_path / "name_map_case.json"
+    name_map_path.write_text(
+        json.dumps(
+            {
+                "callable_id_to_name": {"0": "kernel"},
+                "orchestrator_name": "orchestrator",
+            }
+        )
+    )
+    args = sc._build_parser().parse_args([str(input_path)])
+
+    func_names, orchestrator_name = sc._load_func_names(args, input_path)
+
+    assert func_names == {"0": "kernel"}
+    assert orchestrator_name == "orchestrator"
+
+    explicit_path = tmp_path / "explicit.json"
+    explicit_path.write_text(json.dumps({"callable_id_to_name": {"0": "explicit"}}))
+    explicit_args = sc._build_parser().parse_args([str(input_path), "--func-names", str(explicit_path)])
+    func_names, _ = sc._load_func_names(explicit_args, input_path)
+
+    assert func_names == {"0": "explicit"}
+
+
+def test_spmd_pred_routes_dependency_to_earliest_slice(tmp_path):
     pred_id = 100
     succ_id = 200
     tasks = [
@@ -134,29 +189,31 @@ def test_spmd_pred_routes_dependency_to_min_core_subtask(tmp_path):
     assert sched_flow[1]["ts"] == tasks[4]["dispatch_time_us"]
 
 
-def test_spmd_succ_routes_dependency_to_min_core_subtask(tmp_path):
+def test_spmd_succ_routes_dependency_to_earliest_slice(tmp_path):
     pred_id = 100
     succ_id = 200
-    tasks = [_task_row(pred_id, 0)]
-    tasks.extend(
-        _task_row(
-            succ_id, core_id, dispatch=20.0 + core_id, start=21.0 + core_id, end=30.0 + core_id, receive=20.5 + core_id
-        )
-        for core_id in range(4)
-    )
+    tasks = [
+        _task_row(pred_id, 0, dispatch=0.0, start=-0.5, end=-0.1, receive=-0.6),
+        _task_row(succ_id, 26, func_id=1, dispatch=0.2, start=1.44, end=3.02, receive=0.0),
+        _task_row(succ_id, 33, func_id=1, dispatch=0.1, start=1.14, end=2.92, receive=0.06),
+    ]
     deps_edges = {pred_id: [succ_id]}
-    deps_block_map = {pred_id: 1, succ_id: 4}
+    deps_block_map = {pred_id: 1, succ_id: 2}
 
     out = _generate_trace(tasks, deps_edges, deps_block_map, tmp_path)
     assert _count_dependency_flow_starts(out, pid=4) == 1
-    flow = _first_worker_dependency_flow(out)
-    assert flow[0]["output_task_count"] == 1
-    assert flow[0]["input_task_count"] == 4
-    assert flow[1]["tid"] == _core_tid(0)
-    assert flow[1]["ts"] == tasks[1]["receive_time_us"]
+    assert _count_dependency_flow_starts(out, pid=3) == 1
+    worker_flow = _first_worker_dependency_flow(out)
+    scheduler_flow = _first_scheduler_dependency_flow(out)
+    assert worker_flow[0]["output_task_count"] == 1
+    assert worker_flow[0]["input_task_count"] == 2
+    assert worker_flow[1]["tid"] == _core_tid(26)
+    assert worker_flow[1]["ts"] == 0.0
+    assert scheduler_flow[1]["tid"] == _aicpu_tid(33)
+    assert scheduler_flow[1]["ts"] == 0.1
 
 
-def test_spmd_to_spmd_one_edge_on_min_core_subtask(tmp_path):
+def test_spmd_to_spmd_one_edge_on_earliest_slice(tmp_path):
     pred_id = 100
     succ_id = 200
     tasks = [_task_row(pred_id, core_id, dispatch=10.0 + core_id) for core_id in range(4)]
@@ -252,19 +309,19 @@ def test_spmd_fallback_without_block_map(tmp_path):
     assert flow[0]["tid"] == _core_tid(0)
 
 
-def test_dependency_flow_anchor_rows_picks_earliest_start_per_func_id():
+def test_worker_flow_anchor_rows_picks_earliest_visible_slice_per_func_id():
     task_map = {
         1: [
-            _task_row(1, 5, "aiv", func_id=2, start=15.0),
-            _task_row(1, 0, "aiv", func_id=2, start=12.0),
-            _task_row(1, 2, "aic", func_id=1, start=13.0),
-            _task_row(1, 7, "aic", func_id=1, start=17.0),
+            _task_row(1, 5, "aiv", func_id=2, start=12.0, receive=10.0),
+            _task_row(1, 0, "aiv", func_id=2, start=11.0, receive=10.0),
+            _task_row(1, 2, "aic", func_id=1, start=13.0, receive=12.0),
+            _task_row(1, 7, "aic", func_id=1, start=12.0, receive=11.0),
         ]
     }
-    rows = sc._dependency_flow_anchor_rows(1, task_map, {1})
+    rows = sc._worker_flow_anchor_rows(1, task_map, {1})
     assert len(rows) == 2
     by_func = {r["func_id"]: r["core_id"] for r in rows}
-    assert by_func == {1: 2, 2: 0}
+    assert by_func == {1: 7, 2: 0}
 
 
 def test_identify_spmd_task_ids_respects_authoritative_block_num_one():
@@ -308,19 +365,16 @@ def _aicpu_tid(core_id):
     return 10000 + core_id * 10
 
 
-def test_complete_flow_mirrored_on_scheduler_view(tmp_path):
-    # One SPMD task across 4 cores, all on scheduler thread 0. A single
-    # complete phase (thread 0) contains every subtask finish.
+def test_complete_flow_uses_independent_view_anchors(tmp_path):
     task_id = 100
     tasks = [
-        _task_row(task_id, core_id, dispatch=10.0 + core_id, start=11.0 + core_id, end=20.0 + core_id)
-        for core_id in range(4)
+        _task_row(task_id, 26, dispatch=0.2, start=1.44, end=3.02, receive=0.0),
+        _task_row(task_id, 33, dispatch=0.1, start=1.14, end=2.92, receive=0.06),
     ]
     deps_edges = {}
-    deps_block_map = {task_id: 4}
-    # finish_time_us = end + 1.0, so subtask finishes span 21.0 .. 24.0.
-    scheduler_phases = [[{"phase": "complete", "start_time_us": 20.0, "end_time_us": 25.0}]]
-    core_to_thread = [0, 0, 0, 0]
+    deps_block_map = {task_id: 2}
+    scheduler_phases = [[{"phase": "complete", "start_time_us": 3.5, "end_time_us": 4.5}]]
+    core_to_thread = [0] * 34
 
     out = tmp_path / "trace.json"
     sc.generate_chrome_trace_json(
@@ -335,28 +389,19 @@ def test_complete_flow_mirrored_on_scheduler_view(tmp_path):
     flows = _complete_flows(out)
     starts_p4 = [e for e in flows if e.get("ph") == "s" and e.get("pid") == 4]
     starts_p3 = [e for e in flows if e.get("ph") == "s" and e.get("pid") == 3]
-    # SPMD single-func anchor collapses the 4 subtasks to one anchor row;
-    # complete is mirrored on both task views for that anchor.
     assert len(starts_p4) == 1
     assert len(starts_p3) == 1
 
     p4 = starts_p4[0]
     p3 = starts_p3[0]
-    anchor_core = 0  # earliest-start subtask
-    anchor = next(t for t in tasks if t["core_id"] == anchor_core)
-    # Worker View source anchors on the kernel slice end; Scheduler View source
-    # anchors on the AICPU finish. Both minus one epsilon (0.01).
-    assert p4["tid"] == _core_tid(anchor_core)
-    assert p4["ts"] == anchor["end_time_us"] - 0.01
-    assert p3["tid"] == _aicpu_tid(anchor_core)
-    assert p3["ts"] == anchor["finish_time_us"] - 0.01
+    assert p4["tid"] == _core_tid(26)
+    assert p4["ts"] == tasks[0]["end_time_us"] - 0.01
+    assert p3["tid"] == _aicpu_tid(33)
+    assert p3["ts"] == tasks[1]["finish_time_us"] - 0.01
 
-    # Both mirrors land on the same pid=2 complete-phase endpoint.
     finishes = [e for e in flows if e.get("ph") == "f"]
     assert len(finishes) == 2
-    assert all(e["pid"] == 2 for e in finishes)
-    assert len({e["tid"] for e in finishes}) == 1
-    assert len({e["ts"] for e in finishes}) == 1
+    assert len({(e["pid"], e["tid"], e["ts"]) for e in finishes}) == 1
 
 
 def test_complete_flow_worker_view_only_without_scheduler_phases(tmp_path):

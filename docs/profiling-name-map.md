@@ -144,8 +144,10 @@ so without `deps.json` tasks cannot be told apart by function — see
 
 ## Tool Usage
 
-The `--func-names` flag is available on both visualization tools.  It
-takes precedence over `-k` (kernel_config.py):
+The `--func-names` flag is available on both visualization tools. It takes
+precedence over `-k` (kernel_config.py). When neither option is specified,
+`swimlane_converter` automatically loads a unique sibling `name_map*.json`;
+multiple sibling candidates require an explicit `--func-names` selection.
 
 ```bash
 # Automatic (via SceneTest profiling)
