@@ -35,8 +35,8 @@
  * │                crosses PLATFORM_AICORE_BUFFER_SIZE)         │
  * │  - free_queue: SPSC ring of recycled AICore buffers         │
  * ├─────────────────────────────────────────────────────────────┤
- * │ L2SwimlaneAicpuSchedPhasePool[0..num_sched_phase_threads-1] │
- * │  - head, free_queue (same shape as AicpuTaskPool)           │
+ * │ L2SwimlaneAicpuSchedPhasePool[0..MAX_AICPU_THREADS-1]       │
+ * │  - head, free_queue; header records the active thread count │
  * ├─────────────────────────────────────────────────────────────┤
  * │ L2SwimlaneAicpuOrchPhasePool[0..num_orch_phase_threads-1]   │
  * │  - head, free_queue                                         │
@@ -48,12 +48,12 @@
  *
  * Base size = sizeof(L2SwimlaneDataHeader) + num_cores * sizeof(L2SwimlaneAicpuTaskPool)
  * With phases = Base + num_cores * sizeof(L2SwimlaneAicoreTaskPool)
- *                    + num_sched_phase_threads * sizeof(L2SwimlaneAicpuSchedPhasePool)
+ *                    + PLATFORM_MAX_AICPU_THREADS * sizeof(L2SwimlaneAicpuSchedPhasePool)
  *                    + num_orch_phase_threads  * sizeof(L2SwimlaneAicpuOrchPhasePool)
  */
 
-#ifndef SRC_A2A3_PLATFORM_INCLUDE_COMMON_L2_SWIMLANE_PROFILING_H_
-#define SRC_A2A3_PLATFORM_INCLUDE_COMMON_L2_SWIMLANE_PROFILING_H_
+#ifndef SRC_COMMON_PLATFORM_INCLUDE_COMMON_L2_SWIMLANE_PROFILING_H_
+#define SRC_COMMON_PLATFORM_INCLUDE_COMMON_L2_SWIMLANE_PROFILING_H_
 
 #include <cstddef>
 #include <cstdint>
@@ -169,7 +169,8 @@ static_assert(sizeof(L2SwimlaneAicpuTaskRecord) == 32, "L2SwimlaneAicpuTaskRecor
  *   - receive_time  = start_time - receive_to_start_cycles
  *   - propagation   = receive_time - dispatch_ts (AICPU view)
  *   - local_setup   = receive_to_start_cycles    (dcci + ack)
- * Delta fits in 32 bits at any platform clock (50 MHz @ 32-bit ≈ 85 s).
+ * Delta fits in 32 bits on all supported platforms (minimum wrap window
+ * is approximately 4.3 s at the fastest 1 GHz counter).
  */
 struct L2SwimlaneAicoreTaskRecord {
     uint64_t start_time;               // Post-dcci+ack timestamp (kernel begins next)
@@ -555,7 +556,7 @@ struct L2SwimlaneAicpuSchedPhaseRecord {
     uint32_t tasks_processed;       // Tasks processed in this phase batch
     uint32_t pop_hit;               // SCHED_DISPATCH delta since last emit (0 for Complete)
     uint32_t pop_miss;              // SCHED_DISPATCH delta since last emit (0 for Complete)
-    int16_t shared_depth_at_start[L2SWIMLANE_NUM_QUEUE_SHAPES];  // ready_queues[shape] + ready_sync_queues[shape]
+    int16_t shared_depth_at_start[L2SWIMLANE_NUM_QUEUE_SHAPES];  // sched->ready_queues[shape].size()
     int16_t shared_depth_at_end[L2SWIMLANE_NUM_QUEUE_SHAPES];
     uint32_t _pad[4];  // 64B alignment padding
 };
@@ -651,17 +652,18 @@ inline L2SwimlaneAicpuTaskPool *get_perf_buffer_state(void *base_ptr, int core_i
  * metadata fields):
  *   [L2SwimlaneAicpuTaskPool       × num_cores]
  *   [L2SwimlaneAicoreTaskPool      × num_cores]
- *   [L2SwimlaneAicpuSchedPhasePool × num_sched_phase_threads]
+ *   [L2SwimlaneAicpuSchedPhasePool × PLATFORM_MAX_AICPU_THREADS]
  *   [L2SwimlaneAicpuOrchPhasePool  × num_orch_phase_threads]
  *
  * @param num_cores               Number of AICore instances
- * @param num_sched_phase_threads Number of scheduler-phase pools
+ * @param num_sched_phase_threads Retained for API compatibility; scheduler allocation uses the platform maximum
  * @param num_orch_phase_threads  Number of orchestrator-phase pools
  * @return Total bytes needed for header + all buffer states
  */
-inline size_t calc_perf_data_size_with_phases(int num_cores, int num_sched_phase_threads, int num_orch_phase_threads) {
+inline size_t
+calc_perf_data_size_with_phases(int num_cores, int /*num_sched_phase_threads*/, int num_orch_phase_threads) {
     return calc_perf_data_size(num_cores) + num_cores * sizeof(L2SwimlaneAicoreTaskPool) +
-           num_sched_phase_threads * sizeof(L2SwimlaneAicpuSchedPhasePool) +
+           PLATFORM_MAX_AICPU_THREADS * sizeof(L2SwimlaneAicpuSchedPhasePool) +
            num_orch_phase_threads * sizeof(L2SwimlaneAicpuOrchPhasePool);
 }
 
@@ -721,4 +723,4 @@ inline L2SwimlaneAicpuOrchPhasePool *get_orch_phase_buffer_state(void *base_ptr,
 }
 #endif
 
-#endif  // SRC_A2A3_PLATFORM_INCLUDE_COMMON_L2_SWIMLANE_PROFILING_H_
+#endif  // SRC_COMMON_PLATFORM_INCLUDE_COMMON_L2_SWIMLANE_PROFILING_H_

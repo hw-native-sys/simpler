@@ -32,17 +32,13 @@
  * │ ...                                                         │
  * └─────────────────────────────────────────────────────────────┘
  *
- * Per-thread payload arenas are separate allocations.
- * DumpMetaBuffers are allocated by the host and pushed
- * into per-thread free_queues.
- *
- * A5 specifics: memory access uses host-shadow copies + explicit memcpy
- * instead of halHostRegister/SVM. Data structures and interaction logic
- * are identical to A2A3.
+ * Per-thread payload arenas are separate allocations. DumpMetaBuffers are
+ * allocated by the host and pushed into per-thread free_queues. Platform-
+ * specific host/device copy mechanics live outside these shared structures.
  */
 
-#ifndef SRC_A5_PLATFORM_INCLUDE_COMMON_ARGS_DUMP_H_
-#define SRC_A5_PLATFORM_INCLUDE_COMMON_ARGS_DUMP_H_
+#ifndef SRC_COMMON_PLATFORM_INCLUDE_COMMON_ARGS_DUMP_H_
+#define SRC_COMMON_PLATFORM_INCLUDE_COMMON_ARGS_DUMP_H_
 
 #include <cstddef>
 #include <cstdint>
@@ -133,6 +129,9 @@ struct alignas(64) ArgsDumpRecord {
 } __attribute__((aligned(64)));
 
 static_assert(sizeof(ArgsDumpRecord) == 128, "ArgsDumpRecord must be 128 bytes (2 cache lines)");
+static_assert(
+    offsetof(ArgsDumpRecord, start_offset) == 64, "ArgsDumpRecord::start_offset must start at cache-line 2 (offset 64)"
+);
 
 // =============================================================================
 // DumpMetaBuffer - Fixed-Size Record Buffer
@@ -196,6 +195,11 @@ struct DumpBufferState {
 } __attribute__((aligned(64)));
 
 static_assert(sizeof(DumpBufferState) == 256, "DumpBufferState must be 256 bytes");
+static_assert(offsetof(DumpBufferState, current_buf_ptr) == 128, "DumpBufferState current_buf_ptr offset changed");
+static_assert(offsetof(DumpBufferState, arena_base) == 144, "DumpBufferState arena_base offset changed");
+static_assert(
+    offsetof(DumpBufferState, dropped_record_count) == 168, "DumpBufferState dropped_record_count offset changed"
+);
 
 // =============================================================================
 // DumpReadyQueueEntry - Ready Queue Entry
@@ -212,6 +216,8 @@ struct DumpReadyQueueEntry {
     uint32_t buffer_seq;  // Sequence number for ordering
     uint32_t pad1;
 } __attribute__((aligned(32)));
+
+static_assert(sizeof(DumpReadyQueueEntry) == 32, "DumpReadyQueueEntry must be 32 bytes");
 
 // =============================================================================
 // DumpDataHeader - Fixed Header
@@ -343,4 +349,4 @@ inline DumpBufferState *get_dump_buffer_state(void *base_ptr, int thread_idx) {
 }
 #endif
 
-#endif  // SRC_A5_PLATFORM_INCLUDE_COMMON_ARGS_DUMP_H_
+#endif  // SRC_COMMON_PLATFORM_INCLUDE_COMMON_ARGS_DUMP_H_

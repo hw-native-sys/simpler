@@ -16,16 +16,16 @@
  * Uses dcci for efficient cache management instead of memory barriers.
  */
 
-#ifndef PLATFORM_AICORE_L2_SWIMLANE_COLLECTOR_AICORE_H_
-#define PLATFORM_AICORE_L2_SWIMLANE_COLLECTOR_AICORE_H_
+#ifndef SRC_COMMON_PLATFORM_INCLUDE_AICORE_L2_SWIMLANE_COLLECTOR_AICORE_H_
+#define SRC_COMMON_PLATFORM_INCLUDE_AICORE_L2_SWIMLANE_COLLECTOR_AICORE_H_
 
 #include "common/l2_swimlane_profiling.h"
 #include "aicore/aicore.h"
 
 // Include platform-specific timestamp implementation
 // Build system selects the correct inner_kernel.h based on platform:
-// - src/a2a3/platform/onboard/aicore/inner_kernel.h (real hardware)
-// - src/a2a3/platform/sim/aicore/inner_kernel.h (simulation)
+// - src/<platform>/platform/onboard/aicore/inner_kernel.h (real hardware)
+// - src/<platform>/platform/sim/aicore/inner_kernel.h (simulation)
 // Both provide unified get_sys_cnt_aicore() interface
 #include "inner_kernel.h"
 
@@ -66,23 +66,19 @@ struct L2SwimlaneAicoreLocalState {
  *
  * Race avoidance: AICPU rotates strictly before `write_reg(DATA_MAIN_BASE)`
  * for the first task of a new BUFFER_SIZE batch — driven by AICPU's own
- * per-core dispatch count (no AICore-side signal). At rotation AICPU only
- * publishes the new buffer; it does NOT hand the old buffer to the host there.
- * The completion-before-dispatch invariant proves all prior tasks FIN'd, but
- * this runtime writes FIN before the record below, so a FIN-gated release could
- * publish a buffer whose tail record's `dcci(record, CACHELINE_OUT) + dsb` has
- * not landed. AICPU instead releases the old buffer once it observes AICore ACK
- * the new buffer's first task (l2_swimlane_aicpu_on_aicore_ack): by this core's
- * single-threaded program order that ACK is emitted only after the previous
- * task's record dcci+dsb, so the old buffer's last record is guaranteed drained.
+ * per-core dispatch count (no AICore-side signal). Rotation publishes the new
+ * active buffer to AICore; safe release of the old buffer to the host is owned
+ * by the AICPU collector and may be ACK-gated or deferred to a backstop,
+ * depending on the runtime's FIN-vs-record ordering.
  *
- * @param head            Per-core L2SwimlaneActiveHead channel. The executor
- *                        resolves it right after Phase 1 handshake exit
- *                        (`aicpu_ready == 1`) via get_l2_swimlane_aicore_head(),
- *                        which dereferences the slot the kernel entry stashed
- *                        from KernelArgs::l2_swimlane_aicore_rotation_table[block_idx]
- *                        — by then AICPU's `l2_swimlane_aicpu_init` has
- *                        populated the slot.
+ * @param head            Per-core L2SwimlaneActiveHead channel — lazy-resolved on
+ *                        the executor's first-task branch via
+ *                        get_l2_swimlane_aicore_head(), which deref's the slot
+ *                        the kernel entry stashed from
+ *                        KernelArgs::l2_swimlane_aicore_rotation_table[block_idx].
+ *                        (Kernel entry can't deref directly — AICPU init runs
+ *                        concurrently with kernel entry, so the slot may not yet
+ *                        hold a valid address at that point.)
  * @param local           Per-core AICore-local state (caller-owned static)
  * @param task_token_raw  Full task identity (PTO2 encoding for tensormap_and_ringbuffer
  *                        runtime: `(ring_id << 32) | local_id`; plain task index
@@ -158,4 +154,4 @@ __aicore__ __attribute__((always_inline)) static inline void l2_swimlane_aicore_
     dsb((mem_dsb_t)0);
 }
 
-#endif  // PLATFORM_AICORE_L2_SWIMLANE_COLLECTOR_AICORE_H_
+#endif  // SRC_COMMON_PLATFORM_INCLUDE_AICORE_L2_SWIMLANE_COLLECTOR_AICORE_H_

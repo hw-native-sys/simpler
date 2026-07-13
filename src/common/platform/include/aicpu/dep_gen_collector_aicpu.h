@@ -39,8 +39,8 @@
  * No-op when dep_gen is disabled (is_dep_gen_enabled() returns false).
  */
 
-#ifndef PLATFORM_AICPU_DEP_GEN_COLLECTOR_AICPU_H_
-#define PLATFORM_AICPU_DEP_GEN_COLLECTOR_AICPU_H_
+#ifndef SRC_COMMON_PLATFORM_INCLUDE_AICPU_DEP_GEN_COLLECTOR_AICPU_H_
+#define SRC_COMMON_PLATFORM_INCLUDE_AICPU_DEP_GEN_COLLECTOR_AICPU_H_
 
 #include <cstdint>
 
@@ -56,7 +56,7 @@ extern "C" bool is_dep_gen_enabled();
  * the per-thread ready_queue when buffers fill or on flush. Must be called by
  * aicpu_executor.cpp before any dep_gen_aicpu_record_submit() can fire.
  *
- * Mirrors l2_perf_aicpu_set_orch_thread_idx().
+ * Mirrors l2_swimlane_aicpu_set_orch_thread_idx().
  */
 void dep_gen_aicpu_set_orch_thread_idx(int thread_idx);
 
@@ -129,4 +129,4 @@ void dep_gen_aicpu_flush();
  */
 void dep_gen_aicpu_finalize();
 
-#endif  // PLATFORM_AICPU_DEP_GEN_COLLECTOR_AICPU_H_
+#endif  // SRC_COMMON_PLATFORM_INCLUDE_AICPU_DEP_GEN_COLLECTOR_AICPU_H_

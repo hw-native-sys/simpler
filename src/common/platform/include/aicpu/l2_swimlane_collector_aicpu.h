@@ -16,8 +16,8 @@
  * Handles buffer initialization, switching, and flushing.
  */
 
-#ifndef PLATFORM_AICPU_L2_SWIMLANE_COLLECTOR_AICPU_H_
-#define PLATFORM_AICPU_L2_SWIMLANE_COLLECTOR_AICPU_H_
+#ifndef SRC_COMMON_PLATFORM_INCLUDE_AICPU_L2_SWIMLANE_COLLECTOR_AICPU_H_
+#define SRC_COMMON_PLATFORM_INCLUDE_AICPU_L2_SWIMLANE_COLLECTOR_AICPU_H_
 
 #include "common/l2_swimlane_profiling.h"
 
@@ -94,11 +94,11 @@ void l2_swimlane_aicpu_init(int worker_count);
  *
  * Race safety: rotation runs BEFORE the dispatch register write. The
  * completion-before-dispatch invariant proves prior tasks FIN'd, but
- * tensormap_and_ringbuffer writes FIN before the swimlane record, so the old
+ * tensormap_and_ringbuffer may write FIN before the swimlane record, so the old
  * buffer's tail record may not have drained at rotation time. The old buffer is
  * therefore not enqueued here; it is released once AICore ACKs the boundary
- * dispatch (whose token is `reg_task_id`). host_build_graph writes the record
- * before FIN so it has no such window and need not wire the ACK hook.
+ * dispatch (whose token is `reg_task_id`) or, when a runtime does not wire the
+ * ACK hook, by the next-rotation / run-end backstop.
  *
  * No-op if l2_swimlane is disabled or `core_id` is out of range.
  *
@@ -118,8 +118,8 @@ void l2_swimlane_aicpu_on_aicore_dispatch(int core_id, int thread_idx, uint32_t 
  * `reg_task_id`, that event proves AICore reached at least the new buffer's
  * first-task ACK — hence passed the old buffer's last record dcci+dsb — so the
  * stashed buffer is enqueued to the ready queue. No-op when nothing is stashed
- * or the token does not match the gate. Only tensormap_and_ringbuffer wires
- * this; host_build_graph relies on the next-rotation / run-end backstop.
+ * or the token does not match the gate. Runtimes that write the record before
+ * FIN need not wire this; the next-rotation / run-end backstop covers them.
  *
  * @param core_id      Core index the COND event was observed on
  * @param thread_idx   Owning AICPU thread (target ready-queue)
@@ -266,4 +266,4 @@ void l2_swimlane_aicpu_flush_sched_phase_buffer(int thread_idx);
  */
 void l2_swimlane_aicpu_flush_orch_phase_buffer(int thread_idx);
 
-#endif  // PLATFORM_AICPU_L2_SWIMLANE_COLLECTOR_AICPU_H_
+#endif  // SRC_COMMON_PLATFORM_INCLUDE_AICPU_L2_SWIMLANE_COLLECTOR_AICPU_H_

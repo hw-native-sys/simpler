@@ -531,7 +531,7 @@ state surface, never the runtime protocol.
 
 L2Swimlane and PMU on a5 both use the "AICore writes, AICPU commits" model.
 The AICore-side write target is a per-core
-[`L2SwimlaneAicoreRing`](../src/a5/platform/include/common/l2_swimlane_profiling.h) /
+[`L2SwimlaneAicoreRing`](../src/common/platform/include/common/l2_swimlane_profiling.h) /
 [`PmuAicoreRing`](../src/a5/platform/include/common/pmu_profiling.h) of
 `PLATFORM_{L2,PMU}_AICORE_RING_SIZE` (= 2, dual-issue) slots, allocated
 once by the host and addressed by

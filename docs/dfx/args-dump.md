@@ -402,7 +402,7 @@ code does not infer "dump enabled" from `dump_data_base != 0`.
 
 Each record is fixed at 128 B (two cache lines) — see
 `ArgsDumpRecord` in
-[`args_dump.h`](../../src/a2a3/platform/include/common/args_dump.h).
+[`args_dump.h`](../../src/common/platform/include/common/args_dump.h).
 
 ### 5.2 Where dump calls are wired in
 

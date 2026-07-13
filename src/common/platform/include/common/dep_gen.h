@@ -38,8 +38,8 @@
  * runtime-agnostic.
  */
 
-#ifndef SRC_A2A3_PLATFORM_INCLUDE_COMMON_DEP_GEN_H_
-#define SRC_A2A3_PLATFORM_INCLUDE_COMMON_DEP_GEN_H_
+#ifndef SRC_COMMON_PLATFORM_INCLUDE_COMMON_DEP_GEN_H_
+#define SRC_COMMON_PLATFORM_INCLUDE_COMMON_DEP_GEN_H_
 
 #include <cstddef>
 #include <cstdint>
@@ -323,4 +323,4 @@ inline DepGenBufferState *get_dep_gen_buffer_state(void *base_ptr, int instance_
            instance_index;
 }
 
-#endif  // SRC_A2A3_PLATFORM_INCLUDE_COMMON_DEP_GEN_H_
+#endif  // SRC_COMMON_PLATFORM_INCLUDE_COMMON_DEP_GEN_H_
