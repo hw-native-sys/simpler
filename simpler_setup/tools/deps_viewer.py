@@ -750,27 +750,32 @@ def emit_text(edges, nodes, meta, deps_path, annotations=None, tensor_table=None
     return "\n".join(lines) + "\n"
 
 
-def _task_markers(nodes, edges, task_table):
+def _task_markers(nodes, edges, meta, task_table):
     """Map task_id -> marker string for the node label.
 
-    🔥 (fire): the task itself is a flagged early-dispatch producer
-        (deps.json ``early_dispatch`` — the submit had allow_early_resolve).
+    🔥 (fire): the task is either a flagged early-dispatch producer
+        (deps.json ``early_dispatch`` — the submit had allow_early_resolve)
+        or an alloc task. Alloc tasks are immediate graph sources, so they
+        are treated as fire-marked producers by default.
     ⭐ (star): every one of the task's predecessors is 🔥 (and it has at
-        least one), so the task is fully fed by flagged producers.
+        least one), so the task is fully fed by flagged producers or alloc
+        sources.
     A task can carry both.
     """
     pred_map: dict[int, set] = {}
     for pred, succ in edges:
         pred_map.setdefault(succ, set()).add(pred)
 
-    def _flagged(tid):
-        return bool((task_table.get(tid) or {}).get("early_dispatch"))
+    def _fire_marked(tid):
+        return _task_kind(tid, meta, task_table) == "alloc" or bool(
+            (task_table.get(tid) or {}).get("early_dispatch")
+        )
 
     markers = {}
     for tid in nodes:
-        fire = "🔥" if _flagged(tid) else ""
+        fire = "🔥" if _fire_marked(tid) else ""
         preds = pred_map.get(tid, set())
-        star = "⭐" if preds and all(_flagged(p) for p in preds) else ""
+        star = "⭐" if preds and all(_fire_marked(p) for p in preds) else ""
         if fire or star:
             markers[tid] = fire + star
     return markers
@@ -807,7 +812,7 @@ def emit_dot(
     task_table = task_table or {}
     hidden_edges = set(hidden_edges or ())
     show_tensor = bool(task_table) if show_tensor_info is None else bool(show_tensor_info and task_table)
-    markers = _task_markers(nodes, edges, task_table)
+    markers = _task_markers(nodes, edges, meta, task_table)
     lines = [
         "digraph deps {",
         f"  rankdir={direction};",

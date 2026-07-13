@@ -240,7 +240,20 @@ def test_spmd_badges_json_includes_only_multiblock_tasks():
 def test_emit_dot_handles_missing_task_table():
     dot = deps_viewer.emit_dot(edges=[], nodes=[1], meta={}, task_table=None)
 
-    assert 'label="1 · alloc"' in dot
+    assert 'label="🔥 1 · alloc"' in dot
+
+
+def test_emit_dot_treats_alloc_as_a_fire_marked_source():
+    dot = deps_viewer.emit_dot(
+        edges=[(1, 2)],
+        nodes=[1, 2],
+        meta={},
+        task_table={2: {"task_id": 2, "kernel_ids": [-1, 7, -1]}},
+        show_tensor_info=False,
+    )
+
+    assert 'label="🔥 1 · alloc"' in dot
+    assert 'label="⭐ 2"' in dot
 
 
 def test_emit_dot_hides_selected_edges_with_background_color():
