@@ -220,11 +220,11 @@ directly into a `PmuRecord` on every task FIN. Buffers rotate through
 an SPSC free queue per core; full buffers flow through a per-thread
 ready queue to host drain/refill shards. Drain refills free queues from
 shard-local recycled lanes; collector shards stream records to CSV during
-execution, and the replenish thread folds done buffers back into recycled
-lanes and tops up optional recycled watermarks without writing device free
-queues. PMU has no init-seeded recycled surplus by default, so the runtime
-watermark is only a minimal reserve batch rather than a core-count-scaled
-extra allocation target.
+execution, and the replenish thread routes done buffers to lanes below their
+recycled watermarks before allocating any remaining top-up. It never writes
+device free queues. PMU has no init-seeded recycled surplus by default, so the
+runtime watermark is only a minimal reserve batch rather than a
+core-count-scaled extra allocation target.
 
 ```text
         HOST                                         DEVICE

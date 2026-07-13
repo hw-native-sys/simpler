@@ -34,8 +34,9 @@ Each profiling subsystem needs the same plumbing on the host:
   refills device free queues from shard-local recycled lanes, and recycles
   collector-returned buffers while kernels are still running. A module may
   opt into split drain/refill threads plus a replenish thread. Runtime
-  allocation, when enabled, is confined to the replenish thread and publishes
-  only to host-side recycled lanes.
+  allocation, when enabled, is confined to the replenish thread. Before it
+  allocates, that thread routes newly returned buffers to compatible recycled
+  lanes below their watermarks.
 - Collector thread shards that drain host-side hand-off queues and copy
   records out of each ready buffer.
 - A pool of pre-registered device buffers (allocated up-front, refilled on
@@ -122,8 +123,8 @@ Owns:
   fixed-capacity SPSC ring. The producer is the collector shard; the single
   consumer is the replenish thread.
 - `recycled_[shard][kind]` — shard-local SPSC lanes of free device buffers;
-  runtime drain reads the owning shard while replenish writes returned buffers
-  and optional watermark allocations.
+  runtime drain reads the owning shard while replenish writes compatible
+  returned buffers and optional watermark allocations.
 - `retired_[shard][kind]` — mutex-protected exceptional holding pools for
   buffers that were removed from a queue but could not be published to the
   next queue. They are drained only during teardown.
@@ -152,10 +153,11 @@ Provides:
 - Split mgmt threads — `mgmt_drain_loop` drains ready queues and refills the
   originating free queue from the current drain shard's local recycled pool
   (`ProfilerAlgorithms<Module>::process_entry` per popped entry), while
-  `mgmt_replenish_loop` drains done buffers into shard-local recycled pools
-  and keeps optional recycled watermarks topped up by batched allocation. The
-  replenish thread never writes device free queues, so the drain hot path
-  stays allocation-free and remains the only runtime writer to free queues.
+  `mgmt_replenish_loop` routes done buffers to compatible shard-local pools
+  below their recycled watermarks, then tops up remaining deficits by batched
+  allocation. The replenish thread never writes device free queues, so the
+  drain hot path stays allocation-free and remains the only runtime writer to
+  free queues.
   A one-shot `proactive_replenish` seeds every free queue before the threads
   start. Split drain threads do not bulk-mirror the whole
   shared-memory region; they refresh only their queue indices / entries
@@ -218,7 +220,7 @@ the required members are:
 | `kSubsystemName` | Tag used in framework log lines |
 | `kMaxCollectorThreads` | Optional compile-time CAPACITY of the drain / collector shard arrays (defaults to 1); live shard count is the runtime `min(aicpu_thread_num, kMaxCollectorThreads)` set via `set_aicpu_thread_num()` |
 | `refresh_replenish_metadata(mgr, header)` | Optional hook to refresh cached queue metadata before a replenish pass |
-| `recycled_warm_target(kind[, shard_count]) → int` | Optional startup/runtime low-water mark for shard-local recycled lanes; the two-arg form scales the mark with the live shard count |
+| `recycled_warm_target(kind[, shard_count]) → int` | Optional low-water mark used first for same-kind done-buffer routing, then for startup/runtime allocation; the two-arg form scales the mark with the live shard count |
 | `header_from_shm(void*) → DataHeader*` | Cast shared-memory base to header |
 | `batch_size(int kind) → int` | Per-kind batch-alloc count |
 | `resolve_entry(shm, header, q, entry) → optional<EntrySite>` | Map a popped ready entry to (kind, free_queue, buffer_size, partial info); return `nullopt` to drop |
@@ -327,18 +329,20 @@ Current users:
                                           ▲
                                           │
                             replenish thread:
-                            done shard q → recycled[q]
+                            done shard q → recycled[largest same-kind deficit]
+                                           or recycled[q] if none
 ```
 
 The queue shards plus the shard-local recycled pools and the dev↔host map all
 live in the single `BufferPoolManager` instance owned by `ProfilerBase`.
 Each ready shard has one collector consumer; each done shard is written by
-its matching collector and drained by the replenish thread into the same
-recycled shard. Split drain refills the originating free queue on the hot
-path from `recycled[q]`; replenish does not write free queues at runtime.
-Backpressure fallbacks that cannot publish a buffer to ready/free/recycled
-place it in `retired_[q][kind]`, which is outside the hot SPSC path and is
-released at teardown.
+its matching collector and drained by the replenish thread. A completed
+buffer first fills the largest same-kind recycled deficit; when no shard is
+below its target, it returns to its origin shard. Split drain refills the
+originating free queue on the hot path from `recycled[q]`; replenish does not
+write free queues at runtime. Backpressure fallbacks that cannot publish a
+buffer to ready/free/recycled place it in `retired_[q][kind]`, which is outside
+the hot SPSC path and is released at teardown.
 
 ## 5. Lifecycle
 
@@ -402,7 +406,9 @@ mid-run by the framework.
 Two things follow:
 
 - `dev_to_host_` has a narrow mapping lock; ready/done/recycled hand-off is
-  SPSC by shard, so the hot drain/refill path stays on the owning lane.
+  SPSC by shard. Cross-shard return routing does not change ownership:
+  replenish remains the only recycled-lane producer, and each drain shard
+  remains its lane's only consumer.
 - Device-side queue backpressure is bounded for the profiling writers that
   use this protocol. If the host does not make ready-queue space or
   free-queue entries visible within the short wait budget, AICPU records a

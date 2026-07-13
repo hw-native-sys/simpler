@@ -14,6 +14,7 @@
 
 #include <gtest/gtest.h>
 
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
@@ -153,6 +154,43 @@ struct WarmRecycledModule {
     template <typename Cb>
     static void for_each_instance(void * /*shm_host*/, DataHeader *header, Cb &&cb) {
         cb(0, &header->free_queue, sizeof(uint64_t));
+    }
+};
+
+struct RebalanceComparisonModule {
+    using DataHeader = AlgorithmHeader;
+    using ReadyEntry = AlgorithmReadyEntry;
+    using ReadyBufferInfo = AlgorithmReadyBufferInfo;
+    using FreeQueue = AlgorithmFreeQueue;
+
+    static constexpr int kBufferKinds = 2;
+    static constexpr int kMaxCollectorThreads = 4;
+    static constexpr uint32_t kReadyQueueSize = 1;
+    static constexpr uint32_t kHostPoolQueueSize = 256;
+    static constexpr uint32_t kHostRecycledQueueSize = 256;
+    static constexpr uint32_t kSlotCount = 1;
+    static constexpr const char *kSubsystemName = "RebalanceComparisonModule";
+
+    static DataHeader *header_from_shm(void *shared_mem_host) { return static_cast<DataHeader *>(shared_mem_host); }
+
+    static int batch_size(int /*kind*/) { return 1; }
+
+    static int recycled_warm_target(int kind, int shard_count) { return kind == 0 ? shard_count - 1 : shard_count; }
+
+    static std::optional<profiling_common::EntrySite<RebalanceComparisonModule>>
+    resolve_entry(void * /*shm_host*/, DataHeader *header, int /*q*/, const ReadyEntry &entry) {
+        return profiling_common::EntrySite<RebalanceComparisonModule>{
+            0,
+            &header->free_queue,
+            sizeof(uint64_t),
+            AlgorithmReadyBufferInfo{reinterpret_cast<void *>(entry.buffer_ptr), nullptr},
+        };
+    }
+
+    template <typename Cb>
+    static void for_each_instance(void * /*shm_host*/, DataHeader *header, Cb &&cb) {
+        cb(0, &header->free_queue, sizeof(uint64_t));
+        cb(1, &header->free_queue, sizeof(uint64_t) * 2);
     }
 };
 
@@ -451,6 +489,278 @@ TEST(BufferPoolManagerShardingTest, ReplenishRecycledPoolsFollowsRuntimeShardCou
         std::free(p);
     });
     manager.clear_mappings();
+}
+
+TEST(BufferPoolManagerShardingTest, CompletedBufferRebalancingAvoidsAllocationsAcrossKindsAndShards) {
+    using Module = RebalanceComparisonModule;
+    using Manager = profiling_common::BufferPoolManager<Module>;
+    static constexpr int kLiveShardCount = 3;
+    using ShardCounts = std::array<size_t, kLiveShardCount>;
+    using ShardInputCounts = std::array<int, kLiveShardCount>;
+    using KindCounts = std::array<ShardCounts, Module::kBufferKinds>;
+    using KindInputCounts = std::array<ShardInputCounts, Module::kBufferKinds>;
+
+    struct ScenarioResult {
+        bool setup_ok{false};
+        size_t drained{0};
+        uint64_t allocated_buffers{0};
+        size_t allocation_calls{0};
+        size_t registration_calls{0};
+        KindCounts recycled_counts{};
+        bool ownership_preserved{false};
+    };
+
+    auto run_scenario = [](bool rebalance, bool balanced) {
+        Manager manager;
+        manager.set_shard_count(kLiveShardCount);
+        AlgorithmHeader header{};
+        size_t allocation_calls = 0;
+        size_t registration_calls = 0;
+        profiling_common::MemoryOps ops;
+        ops.alloc = [&](size_t size) {
+            allocation_calls++;
+            return std::malloc(size);
+        };
+        ops.reg = [&](void *dev_ptr, size_t /*size*/, int /*device_id*/, void **host_ptr_out) {
+            registration_calls++;
+            *host_ptr_out = dev_ptr;
+            return 0;
+        };
+        ops.free_ = [](void *dev_ptr) {
+            std::free(dev_ptr);
+            return 0;
+        };
+        manager.set_memory_context(std::move(ops), nullptr, &header, sizeof(header), 0);
+
+        KindInputCounts completed_by_origin{};
+        if (balanced) {
+            completed_by_origin = {
+                ShardInputCounts{2, 2, 2},
+                ShardInputCounts{3, 3, 3},
+            };
+        } else {
+            completed_by_origin = {
+                ShardInputCounts{6, 0, 0},
+                ShardInputCounts{0, 0, 9},
+            };
+        }
+
+        std::array<std::set<void *>, Module::kBufferKinds> completed_buffers;
+        size_t completed_count = 0;
+        for (int kind = 0; kind < Module::kBufferKinds; kind++) {
+            size_t buffer_size = sizeof(uint64_t) * static_cast<size_t>(kind + 1);
+            for (int shard = 0; shard < kLiveShardCount; shard++) {
+                for (int i = 0; i < completed_by_origin[kind][shard]; i++) {
+                    void *host_ptr = nullptr;
+                    void *dev_ptr = manager.alloc_and_register_block(buffer_size, &host_ptr);
+                    if (dev_ptr == nullptr || !manager.notify_copy_done(dev_ptr, kind, shard)) {
+                        manager.release_all_owned([](void *p) {
+                            std::free(p);
+                        });
+                        return ScenarioResult{};
+                    }
+                    completed_buffers[kind].insert(dev_ptr);
+                    completed_count++;
+                }
+            }
+        }
+        allocation_calls = 0;
+        registration_calls = 0;
+
+        size_t drained = 0;
+        if (rebalance) {
+            drained = manager.drain_done_into_recycled();
+        } else {
+            for (int shard = 0; shard < kLiveShardCount; shard++) {
+                drained += manager.drain_done_into_recycled(shard);
+            }
+        }
+        uint64_t allocated = profiling_common::ProfilerAlgorithms<Module>::replenish_recycled_pools(manager, &header);
+        KindCounts recycled_counts{};
+        for (int kind = 0; kind < Module::kBufferKinds; kind++) {
+            for (int shard = 0; shard < kLiveShardCount; shard++) {
+                recycled_counts[kind][shard] = manager.recycled_count(kind, shard);
+            }
+        }
+
+        std::array<std::set<void *>, Module::kBufferKinds> observed_buffers;
+        bool no_duplicates = true;
+        for (int kind = 0; kind < Module::kBufferKinds; kind++) {
+            for (int shard = 0; shard < kLiveShardCount; shard++) {
+                while (void *dev_ptr = manager.pop_recycled(kind, shard)) {
+                    no_duplicates = observed_buffers[kind].insert(dev_ptr).second && no_duplicates;
+                }
+            }
+        }
+        bool all_completed_present = true;
+        size_t observed_count = 0;
+        for (int kind = 0; kind < Module::kBufferKinds; kind++) {
+            observed_count += observed_buffers[kind].size();
+            for (void *dev_ptr : completed_buffers[kind]) {
+                all_completed_present = observed_buffers[kind].count(dev_ptr) == 1 && all_completed_present;
+            }
+        }
+        bool ownership_preserved =
+            no_duplicates && all_completed_present && observed_count == completed_count + allocated;
+        ScenarioResult result{
+            true, drained, allocated, allocation_calls, registration_calls, recycled_counts, ownership_preserved,
+        };
+        manager.release_all_owned([](void *p) {
+            std::free(p);
+        });
+        return result;
+    };
+
+    ScenarioResult origin_only = run_scenario(false, false);
+    ScenarioResult rebalanced = run_scenario(true, false);
+    ASSERT_TRUE(origin_only.setup_ok);
+    ASSERT_TRUE(rebalanced.setup_ok);
+
+    const KindCounts expected_origin_only = {
+        ShardCounts{6, 2, 2},
+        ShardCounts{3, 3, 9},
+    };
+    EXPECT_EQ(origin_only.drained, 15u);
+    EXPECT_EQ(origin_only.recycled_counts, expected_origin_only);
+    EXPECT_EQ(origin_only.allocated_buffers, 10u);
+    EXPECT_EQ(origin_only.allocation_calls, 4u);
+    EXPECT_EQ(origin_only.registration_calls, 4u);
+    EXPECT_TRUE(origin_only.ownership_preserved);
+
+    const KindCounts expected_rebalanced = {
+        ShardCounts{2, 2, 2},
+        ShardCounts{3, 3, 3},
+    };
+    EXPECT_EQ(rebalanced.drained, 15u);
+    EXPECT_EQ(rebalanced.recycled_counts, expected_rebalanced);
+    EXPECT_EQ(rebalanced.allocated_buffers, 0u);
+    EXPECT_EQ(rebalanced.allocation_calls, 0u);
+    EXPECT_EQ(rebalanced.registration_calls, 0u);
+    EXPECT_TRUE(rebalanced.ownership_preserved);
+
+    EXPECT_LT(rebalanced.allocated_buffers, origin_only.allocated_buffers);
+    EXPECT_LT(rebalanced.allocation_calls, origin_only.allocation_calls);
+    EXPECT_LT(rebalanced.registration_calls, origin_only.registration_calls);
+
+    ScenarioResult balanced_origin = run_scenario(false, true);
+    ScenarioResult balanced_rebalanced = run_scenario(true, true);
+    ASSERT_TRUE(balanced_origin.setup_ok);
+    ASSERT_TRUE(balanced_rebalanced.setup_ok);
+    EXPECT_EQ(balanced_origin.recycled_counts, expected_rebalanced);
+    EXPECT_EQ(balanced_rebalanced.recycled_counts, expected_rebalanced);
+    EXPECT_EQ(balanced_origin.allocated_buffers, 0u);
+    EXPECT_EQ(balanced_rebalanced.allocated_buffers, 0u);
+    EXPECT_EQ(balanced_origin.allocation_calls, 0u);
+    EXPECT_EQ(balanced_rebalanced.allocation_calls, 0u);
+    EXPECT_EQ(balanced_origin.registration_calls, 0u);
+    EXPECT_EQ(balanced_rebalanced.registration_calls, 0u);
+    EXPECT_TRUE(balanced_origin.ownership_preserved);
+    EXPECT_TRUE(balanced_rebalanced.ownership_preserved);
+}
+
+TEST(BufferPoolManagerShardingTest, ConcurrentRebalancingPreservesOwnershipAcrossLiveShards) {
+    using Module = RebalanceComparisonModule;
+    using Manager = profiling_common::BufferPoolManager<Module>;
+    static constexpr int kLiveShardCount = 3;
+    static constexpr int kBuffersPerKindAndShard = 64;
+    static constexpr size_t kExpectedTotal =
+        static_cast<size_t>(kLiveShardCount * Module::kBufferKinds * kBuffersPerKindAndShard);
+
+    Manager manager;
+    manager.set_shard_count(kLiveShardCount);
+    using PerKindBuffers = std::array<std::vector<void *>, Module::kBufferKinds>;
+    std::array<PerKindBuffers, kLiveShardCount> expected;
+    std::array<PerKindBuffers, kLiveShardCount> consumed;
+    for (int shard = 0; shard < kLiveShardCount; shard++) {
+        for (int kind = 0; kind < Module::kBufferKinds; kind++) {
+            for (int i = 0; i < kBuffersPerKindAndShard; i++) {
+                uintptr_t value = 0x1000000u + static_cast<uintptr_t>(kind) * 0x100000u +
+                                  static_cast<uintptr_t>(shard) * 0x10000u + static_cast<uintptr_t>(i + 1);
+                expected[shard][kind].push_back(ptr(value));
+            }
+        }
+    }
+
+    std::atomic<size_t> enqueued{0};
+    std::atomic<int> producers_done{0};
+    std::atomic<int> notify_failures{0};
+    std::atomic<bool> replenish_done{false};
+    size_t drained_total = 0;
+
+    std::array<std::thread, kLiveShardCount> consumers;
+    for (int shard = 0; shard < kLiveShardCount; shard++) {
+        consumers[shard] = std::thread([&, shard]() {
+            while (true) {
+                bool popped = false;
+                for (int kind = 0; kind < Module::kBufferKinds; kind++) {
+                    if (void *dev_ptr = manager.pop_recycled(kind, shard); dev_ptr != nullptr) {
+                        consumed[shard][kind].push_back(dev_ptr);
+                        popped = true;
+                    }
+                }
+                if (popped) continue;
+
+                if (replenish_done.load(std::memory_order_acquire)) {
+                    bool empty = true;
+                    for (int kind = 0; kind < Module::kBufferKinds; kind++) {
+                        empty = manager.recycled_count(kind, shard) == 0 && empty;
+                    }
+                    if (empty) break;
+                }
+                std::this_thread::yield();
+            }
+        });
+    }
+
+    std::thread replenish([&]() {
+        while (producers_done.load(std::memory_order_acquire) < kLiveShardCount ||
+               drained_total < enqueued.load(std::memory_order_acquire)) {
+            size_t drained = manager.drain_done_into_recycled();
+            drained_total += drained;
+            if (drained == 0) std::this_thread::yield();
+        }
+        replenish_done.store(true, std::memory_order_release);
+    });
+
+    std::array<std::thread, kLiveShardCount> producers;
+    for (int shard = 0; shard < kLiveShardCount; shard++) {
+        producers[shard] = std::thread([&, shard]() {
+            for (int kind = 0; kind < Module::kBufferKinds; kind++) {
+                for (void *dev_ptr : expected[shard][kind]) {
+                    if (manager.notify_copy_done(dev_ptr, kind, shard)) {
+                        enqueued.fetch_add(1, std::memory_order_release);
+                    } else {
+                        notify_failures.fetch_add(1, std::memory_order_relaxed);
+                    }
+                }
+            }
+            producers_done.fetch_add(1, std::memory_order_release);
+        });
+    }
+
+    for (auto &producer : producers)
+        producer.join();
+    replenish.join();
+    for (auto &consumer : consumers)
+        consumer.join();
+
+    EXPECT_EQ(notify_failures.load(std::memory_order_relaxed), 0);
+    EXPECT_EQ(enqueued.load(std::memory_order_acquire), kExpectedTotal);
+    EXPECT_EQ(drained_total, kExpectedTotal);
+    for (int kind = 0; kind < Module::kBufferKinds; kind++) {
+        std::set<void *> expected_kind;
+        std::set<void *> consumed_kind;
+        bool no_duplicates = true;
+        for (int shard = 0; shard < kLiveShardCount; shard++) {
+            expected_kind.insert(expected[shard][kind].begin(), expected[shard][kind].end());
+            for (void *dev_ptr : consumed[shard][kind]) {
+                no_duplicates = consumed_kind.insert(dev_ptr).second && no_duplicates;
+            }
+        }
+        EXPECT_TRUE(no_duplicates);
+        EXPECT_EQ(consumed_kind, expected_kind);
+        EXPECT_EQ(manager.recycled_count(kind), 0u);
+    }
 }
 
 TEST(BufferPoolManagerShardingTest, ReplenishRecycledPoolsUsesSlotSizedBatchForSmallGap) {

@@ -491,9 +491,10 @@ space so the host can read device buffers directly.
 drain/refill shards poll SPSC ready queues and refill free queues from
 shard-local recycled lanes **while kernels are still executing**. Collector
 shards drain the host hand-off queues into `on_buffer_collected`, then the
-replenish thread folds done buffers back into recycled lanes and, for
-modules that declare a recycled watermark, tops those lanes up by batched
-allocation without writing device free queues.
+replenish thread routes done buffers to same-kind lanes below their recycled
+watermarks. Modules that declare no watermark keep origin-shard routing. Any
+remaining watermark deficit is batch-allocated without writing device free
+queues.
 
 Each collector appends metadata to its own vector, so collectors do not
 serialize on the manifest accumulator. Payloads still share one `args.bin`:
