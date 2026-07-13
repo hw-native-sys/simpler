@@ -41,10 +41,13 @@ TEST(ArgsDumpCollectorTest, MergesConcurrentShardRecordsIntoManifest) {
     ASSERT_TRUE(std::filesystem::create_directories(test_dir));
 
     constexpr int kRecordsPerShard = 32;
-    constexpr int kShardCount = DumpModule::kCollectorThreadCount;
+    constexpr int kShardCount = DumpModule::kMaxCollectorThreads;
     ArgsDumpCollector collector;
     ASSERT_EQ(
-        collector.initialize(1, 0, test_alloc, nullptr, test_free, test_dir.string(), DumpArgsLevel::FULL_JSON_ONLY), 0
+        collector.initialize(
+            kShardCount, 0, test_alloc, nullptr, test_free, test_dir.string(), DumpArgsLevel::FULL_JSON_ONLY
+        ),
+        0
     );
 
     std::vector<DumpMetaBuffer> buffers(kShardCount);

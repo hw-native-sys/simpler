@@ -74,7 +74,7 @@ TEST(PmuCollectorTest, MergesConcurrentShardWritesIntoFinalCsv) {
     ASSERT_TRUE(std::filesystem::create_directories(test_dir));
 
     constexpr int kRecordsPerShard = 64;
-    constexpr int kShardCount = PmuModule::kCollectorThreadCount;
+    constexpr int kShardCount = PmuModule::kMaxCollectorThreads;
     PmuCollector collector;
     ASSERT_EQ(
         collector.init(

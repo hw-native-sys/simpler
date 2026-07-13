@@ -63,7 +63,7 @@ size_t ArgsDumpCollector::normalize_collector_shard(int collector_shard) const {
 }
 
 void ArgsDumpCollector::reset_collector_shards() {
-    const size_t shard_count = static_cast<size_t>(DumpModule::kCollectorThreadCount);
+    const size_t shard_count = static_cast<size_t>(manager_.shard_count());
     collected_.clear();
     collected_by_collector_.assign(shard_count, {});
     collector_counters_.assign(shard_count, {});

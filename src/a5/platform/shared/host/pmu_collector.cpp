@@ -308,7 +308,7 @@ void PmuCollector::reset_collector_shards() {
     (void)close_csv_shards();
     cleanup_csv_shards();
 
-    const size_t shard_count = static_cast<size_t>(PmuModule::kCollectorThreadCount);
+    const size_t shard_count = static_cast<size_t>(manager_.shard_count());
     csv_shard_paths_.clear();
     csv_shard_paths_.reserve(shard_count);
     for (size_t shard = 0; shard < shard_count; shard++) {
