@@ -143,7 +143,7 @@ Three hardware tiers, applied to all test categories. See [testing.md](testing.m
 
 On a self-hosted runner, every step that touches an NPU — pytest and ctest
 alike — must hold its devices exclusively while it runs. There are two a2a3
-runner pools, branched at run time on `runner.arch`:
+runner pools, branched at run time on the host arch (`uname -m`):
 
 - **ARM64 a2a3 runners** share the host with interactive users, so the step
   runs through `task-submit --device <list> --run "..."`, whose per-device
