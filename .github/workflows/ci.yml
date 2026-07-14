@@ -484,7 +484,8 @@ jobs:
         run: |
           source /usr/local/Ascend/cann/set_env.sh
           source .venv/bin/activate
-          python -m pytest tests -m requires_hardware --platform a2a3 --device ${DEVICE_RANGE} -v
+          DEVICE_LIST=$(python -c "p='${DEVICE_RANGE}'.split('-'); s,e=p[0],p[-1]; print(','.join(str(i) for i in range(int(s),int(e)+1)))")
+          task-submit --timeout 1800 --max-time 1800 --device "$DEVICE_LIST" --run "python -m pytest tests -m requires_hardware --platform a2a3 --device ${DEVICE_RANGE} -v"
 
       - name: Build and run C++ hardware unit tests
         run: |
@@ -500,10 +501,8 @@ jobs:
           json.dump({'version': {'major': 1, 'minor': 0}, 'local': [{'npus': npus}]},
                     open('tests/ut/cpp/build/resources.json', 'w'))
           "
-          ctest --test-dir tests/ut/cpp/build \
-              -L "^requires_hardware(_a2a3)?$" \
-              --resource-spec-file $PWD/tests/ut/cpp/build/resources.json \
-              -j$(nproc) --output-on-failure
+          DEVICE_LIST=$(python -c "p='${DEVICE_RANGE}'.split('-'); s,e=p[0],p[-1]; print(','.join(str(i) for i in range(int(s),int(e)+1)))")
+          task-submit --timeout 1800 --max-time 1800 --device "$DEVICE_LIST" --run "ctest --test-dir tests/ut/cpp/build -L '^requires_hardware(_a2a3)?\$' --resource-spec-file $PWD/tests/ut/cpp/build/resources.json -j$(nproc) --output-on-failure"
 
       - name: Build cann-examples/query (CANN host-API smoke)
         run: |
@@ -570,8 +569,9 @@ jobs:
         run: |
           source /usr/local/Ascend/cann/set_env.sh
           source .venv/bin/activate
-          python -m pytest examples tests/st --platform a2a3 --device ${DEVICE_RANGE} -v \
-            --pto-session-timeout 600 --require-pto-isa
+          DEVICE_LIST=$(python -c "p='${DEVICE_RANGE}'.split('-'); s,e=p[0],p[-1]; print(','.join(str(i) for i in range(int(s),int(e)+1)))")
+          PYTEST="python -m pytest examples tests/st --platform a2a3 --device ${DEVICE_RANGE} -v --require-pto-isa"
+          task-submit --timeout 1800 --max-time 1800 --device "$DEVICE_LIST" --run "$PYTEST --pto-session-timeout 600"
 
       # DFX per-feature smokes — hardware mirror of the st-sim-a2a3 set. The
       # race window in dep_gen only fires on real timing, so this row is
@@ -581,33 +581,41 @@ jobs:
         run: |
           source /usr/local/Ascend/cann/set_env.sh
           source .venv/bin/activate
-          python -m pytest tests/st/a2a3/tensormap_and_ringbuffer/dfx/dep_gen/test_dep_gen.py \
+          DEVICE_LIST=$(python -c "p='${DEVICE_RANGE}'.split('-'); s,e=p[0],p[-1]; print(','.join(str(i) for i in range(int(s),int(e)+1)))")
+          PYTEST="python -m pytest tests/st/a2a3/tensormap_and_ringbuffer/dfx/dep_gen/test_dep_gen.py \
             --platform a2a3 --device ${DEVICE_RANGE} -p no:xdist --pto-session-timeout 600 \
-            --require-pto-isa --enable-dep-gen
+            --require-pto-isa --enable-dep-gen"
+          task-submit --timeout 1800 --max-time 1800 --device "$DEVICE_LIST" --run "$PYTEST"
 
       - name: l2_swimlane smoke
         run: |
           source /usr/local/Ascend/cann/set_env.sh
           source .venv/bin/activate
-          python -m pytest tests/st/a2a3/tensormap_and_ringbuffer/dfx/l2_swimlane/ \
+          DEVICE_LIST=$(python -c "p='${DEVICE_RANGE}'.split('-'); s,e=p[0],p[-1]; print(','.join(str(i) for i in range(int(s),int(e)+1)))")
+          PYTEST="python -m pytest tests/st/a2a3/tensormap_and_ringbuffer/dfx/l2_swimlane/ \
             --platform a2a3 --device ${DEVICE_RANGE} -p no:xdist --pto-session-timeout 600 \
-            --require-pto-isa --enable-l2-swimlane --enable-dep-gen
+            --require-pto-isa --enable-l2-swimlane --enable-dep-gen"
+          task-submit --timeout 1800 --max-time 1800 --device "$DEVICE_LIST" --run "$PYTEST"
 
       - name: PMU smoke
         run: |
           source /usr/local/Ascend/cann/set_env.sh
           source .venv/bin/activate
-          python -m pytest tests/st/a2a3/tensormap_and_ringbuffer/dfx/pmu/test_pmu.py \
+          DEVICE_LIST=$(python -c "p='${DEVICE_RANGE}'.split('-'); s,e=p[0],p[-1]; print(','.join(str(i) for i in range(int(s),int(e)+1)))")
+          PYTEST="python -m pytest tests/st/a2a3/tensormap_and_ringbuffer/dfx/pmu/test_pmu.py \
             --platform a2a3 --device ${DEVICE_RANGE} -p no:xdist --pto-session-timeout 600 \
-            --require-pto-isa --enable-pmu 2
+            --require-pto-isa --enable-pmu 2"
+          task-submit --timeout 1800 --max-time 1800 --device "$DEVICE_LIST" --run "$PYTEST"
 
       - name: args_dump smoke
         run: |
           source /usr/local/Ascend/cann/set_env.sh
           source .venv/bin/activate
-          python -m pytest tests/st/a2a3/tensormap_and_ringbuffer/dfx/args_dump/test_args_dump.py \
+          DEVICE_LIST=$(python -c "p='${DEVICE_RANGE}'.split('-'); s,e=p[0],p[-1]; print(','.join(str(i) for i in range(int(s),int(e)+1)))")
+          PYTEST="python -m pytest tests/st/a2a3/tensormap_and_ringbuffer/dfx/args_dump/test_args_dump.py \
             --platform a2a3 --device ${DEVICE_RANGE} -p no:xdist --pto-session-timeout 600 \
-            --require-pto-isa --dump-args
+            --require-pto-isa --dump-args"
+          task-submit --timeout 1800 --max-time 1800 --device "$DEVICE_LIST" --run "$PYTEST"
 
 
   # ---------- Detect platform-specific changes (runs on GitHub server) ----------
