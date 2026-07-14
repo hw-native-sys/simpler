@@ -141,6 +141,15 @@ Three hardware tiers, applied to all test categories. See [testing.md](testing.m
 | Platform-specific (a2a3) | `[self-hosted, a2a3]` | `ut-a2a3`, `st-onboard-a2a3` |
 | Platform-specific (a5) | `[self-hosted, a5]` | `ut-a5`, `st-onboard-a5` |
 
+Every step on a self-hosted runner that touches an NPU — pytest and ctest
+alike, on both arches — runs through
+`task-submit --device <list> --run "..."`. The runners are shared with
+interactive users, so the device lock is what keeps a CI job from colliding
+with someone's local run (and vice versa). Steps that only build (cmake,
+`RuntimeBuilder`, the `cann-examples` smokes) take no lock. The same rule
+applies to local onboard work — see
+[.claude/rules/running-onboard.md](../.claude/rules/running-onboard.md).
+
 ## Test Sources
 
 ### `tests/ut/` — Python unit tests (ut-py)
