@@ -9,11 +9,11 @@
  * -----------------------------------------------------------------------------------------------------------
  */
 /**
- * AllToAll orchestration shim — push-based (2 kernel phases + local copy-out).
+ * AllToAll orchestration shim — push-based (TPUT → barrier → local copy-out).
  *
  *   tensor(0) input   INPUT           (nranks*COUNT_PER_RANK floats)
  *   tensor(1) output  OUTPUT_EXISTING (nranks*COUNT_PER_RANK floats)
- *   tensor(2) scratch INOUT           (HCCL window slot — holds result after barrier)
+ *   tensor(2) scratch INOUT           (HCCL window; result lives here after barrier)
  *   scalar(0) nranks
  *   scalar(1) CommContext device pointer
  */

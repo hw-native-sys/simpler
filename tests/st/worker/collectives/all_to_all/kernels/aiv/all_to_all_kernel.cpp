@@ -9,23 +9,16 @@
  * -----------------------------------------------------------------------------------------------------------
  */
 /**
- * AllToAll kernel — symmetric, 2-phase push-based pattern.
+ * AllToAll kernel — push-based (TPUT → barrier → local copy-out).
  *
- * Phase 1 (push):     for dest in 0..nranks-1:
- *                       TPUT input[dest*C..) → peer dest's scratch[my_rank*C..)
- *                     Self-rank handled naturally: CommRemotePtr to self
- *                     returns the local pointer, so TPUT degenerates to a
- *                     local GM write.
- * Phase 2 (barrier):  signal matrix + TWAIT cross-rank sync.
- *                     No post-exchange barrier needed — input is read-only
- *                     and the scratch is write-only from peers, so there is
- *                     no WAR hazard on the scratch.
- * Phase 3 (copy-out): for src in 0..nranks-1:
- *                       TLOAD(local scratch[src*C..)) → TSTORE(output[src*C..))
- *                     Purely local copy — the scratch already holds the
- *                     result after the barrier.
+ *   push:      TPUT input[dest*C..) → peer dest scratch[my_rank*C..)
+ *              (CommRemotePtr to self returns localPtr → local write)
+ *   barrier:   signal matrix TNOTIFY / TWAIT
+ *   copy-out:  TLOAD(local scratch[src*C..)) → TSTORE(output[src*C..))
  *
- * Scratch at offset src*C holds the chunk that rank src pushed here.
+ * Scratch invariant: slot src*C holds the chunk rank src pushed here.
+ * Input is read-only and peer writes land in distinct scratch slots, so no
+ * post-exchange barrier is required before copy-out.
  *
  * args layout:
  *   tensor(0) = input    nranks*COUNT_PER_RANK floats  (INPUT)
@@ -90,15 +83,11 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
     ShapeDyn shape(1, 1, 1, 1, COUNT_PER_RANK);
     StrideDyn stride(COUNT_PER_RANK, COUNT_PER_RANK, COUNT_PER_RANK, COUNT_PER_RANK, 1);
 
-    // Single push tile — reused for both Phase 1 push and Phase 3 copy-out.
+    // Reused for push staging and local copy-out.
     TileData pushTile(1, COUNT_PER_RANK);
     TASSIGN(pushTile, 0x0);
 
-    // ------------------------------------------------------------------
-    // Phase 1: push — TPUT each destination chunk directly into the
-    // corresponding peer's scratch at offset my_rank*C. When dest == my_rank
-    // CommRemotePtr returns the local pointer, so TPUT is a local GM write.
-    // ------------------------------------------------------------------
+    // Push each destination chunk into peer dest's scratch[my_rank*C].
     __gm__ float *scratch_dst_local = scratch + my_rank * COUNT_PER_RANK;
     for (int dest = 0; dest < nranks; ++dest) {
         __gm__ float *scratch_dst_remote = CommRemotePtr(commCtx, scratch_dst_local, dest);
@@ -110,10 +99,7 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
     }
     pipe_barrier(PIPE_ALL);
 
-    // ------------------------------------------------------------------
-    // Phase 2: device barrier — notify every peer that our pushes are done,
-    // then wait until every peer has notified us.
-    // ------------------------------------------------------------------
+    // Device barrier: notify peers that our pushes are done, then wait.
     for (int peer = 0; peer < nranks; ++peer) {
         if (peer == my_rank) continue;
         __gm__ int32_t *remote_signal = CommRemotePtr(commCtx, signal_base + my_rank, peer);
@@ -127,11 +113,7 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
     }
     pipe_barrier(PIPE_ALL);
 
-    // ------------------------------------------------------------------
-    // Phase 3: copy-out — every peer has pushed into our scratch at their
-    // rank's offset. Copy each slot into the output tensor. Purely local
-    // reads — no CommRemotePtr needed here.
-    // ------------------------------------------------------------------
+    // Local copy-out from scratch slots into output.
     for (int src = 0; src < nranks; ++src) {
         Global scratchSlotG(scratch + src * COUNT_PER_RANK, shape, stride);
         Global outputSlotG(output + src * COUNT_PER_RANK, shape, stride);

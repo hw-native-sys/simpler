@@ -20,6 +20,6 @@ collectives/
 ├── allgather/            # Mesh allgather
 ├── reduce_scatter/       # Mesh reduce-scatter
 ├── broadcast/            # Mesh broadcast
-├── all_to_all/           # Mesh all-to-all
+├── all_to_all/           # Push-based mesh all-to-all (TPUT → barrier → local copy-out)
 └── README.md
 ```
