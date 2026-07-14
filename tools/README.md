@@ -7,6 +7,42 @@ End-user profiling / debug CLIs live in
 [`simpler_setup/tools/`](../simpler_setup/tools/) and ship with the wheel —
 invoke them via `python -m simpler_setup.tools.<name>`.
 
+## critical_path.py
+
+Post-processing analysis over an L2-swimlane run. Given a directory produced by
+a `--enable-l2-swimlane` run, it reconstructs the critical path of the device
+execution and writes a per-task compute/stall report.
+
+It recursively discovers every directory under the given path that holds the
+full triple — a records file (`l2_swimlane_records.json`, or `l2_perf_records.json`
+for older runtimes) plus `deps.json` and `name_map.json` — so it is not
+restricted to a `dfx_outputs/rank*/d*` layout. For each such rank/device it
+builds a happens-before DAG from the dependency graph oriented by observed
+timestamps, then computes two critical paths:
+
+- **Static CPM** — the longest duration-weighted path, i.e. the
+  dependency-limited latency floor (unlimited cores).
+- **Observed** — the as-executed backward "blame" walk from the last-finishing
+  task; each task's compute plus the scheduling stall before it (`data-wait` =
+  waiting on a producer, `core-wait` = waiting for a core to free) tiles the
+  makespan exactly.
+
+It writes `critical_path_report.md` into the given directory: an overview
+(makespan, CPM floor, compute vs. stall split), a per-kernel-family table, and a
+full per-task listing. Pure post-processing — no C++, no device; O(N log N).
+
+```bash
+# Analyze a case run produced with --enable-l2-swimlane
+python tools/critical_path.py <run-dir>
+
+# Options: report filename, kernel-family rows, tick tolerance, echo summary
+python tools/critical_path.py <run-dir> \
+    --report critical_path_report.md --top 25 --stdout
+```
+
+It auto-discovers all ranks, so you can equally point it at a single
+`dfx_outputs/rank0/d0` directory or at the whole run tree.
+
 ## benchmark_rounds.sh
 
 Batch-run a predefined set of ST examples on hardware, parse `orch_start` /
