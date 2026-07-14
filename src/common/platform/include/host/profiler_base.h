@@ -86,7 +86,9 @@
  *       void* shm_host, DataHeader*, int q, const ReadyEntry&);
  *
  *   // Enumerate every (kind, instance) free_queue and its buffer size for
- *   // proactive_replenish to top up. Callback signature:
+ *   // proactive_replenish to top up. Every instance of one kind has the same
+ *   // buffer size, so completed buffers can move between collector shards.
+ *   // Callback signature:
  *   //   (int kind, FreeQueue* fq, size_t buffer_size).
  *   template <typename Cb>
  *   static void for_each_instance(void* shm_host, DataHeader*, Cb&&);
@@ -101,12 +103,13 @@
  *                          drain/collector threads start. If recycled is dry,
  *                          it allocates one registered block and carves it
  *                          into a batch of buffers.
- *   mgmt_replenish_loop    drains collector-done buffers back into recycled
- *                          lanes and keeps optional per-kind recycled watermarks
- *                          topped up in batches of max(kSlotCount, gap). It
- *                          never writes device free_queues, so
- *                          the drain hot path remains allocation-free and owns
- *                          all runtime free_queue publication.
+ *   mgmt_replenish_loop    routes collector-done buffers to same-kind lanes
+ *                          below their optional recycled watermarks, then tops
+ *                          up remaining deficits in batches of
+ *                          max(kSlotCount, gap). It never writes device
+ *                          free_queues, so the drain hot path remains
+ *                          allocation-free and owns all runtime free_queue
+ *                          publication.
  *
  * The above two algorithms live in ProfilerAlgorithms<Module>; Module only
  * supplies the data-access traits above. Implementors must NOT zero `count`
@@ -493,25 +496,9 @@ struct ProfilerAlgorithms {
     }
 
 private:
-    // Modules that scale their watermark with the number of live shards (the
-    // per-shard core load is ceil(cores / shard_count)) implement the two-arg
-    // form; shard-count-independent modules implement the one-arg form.
     static int recycled_warm_target(int kind, int shard_count) {
-        return recycled_warm_target_impl(kind, shard_count, 0);
+        return profiler_module_recycled_warm_target<Module>(kind, shard_count);
     }
-
-    template <typename M = Module>
-    static auto recycled_warm_target_impl(int kind, int shard_count, int)
-        -> decltype(M::recycled_warm_target(kind, shard_count)) {
-        return M::recycled_warm_target(kind, shard_count);
-    }
-
-    template <typename M = Module>
-    static auto recycled_warm_target_impl(int kind, int, long) -> decltype(M::recycled_warm_target(kind)) {
-        return M::recycled_warm_target(kind);
-    }
-
-    static int recycled_warm_target_impl(int, int, ...) { return 0; }
 
     template <typename Mgr>
     static size_t clamped_recycled_warm_target(int kind, int shard, int shard_count) {

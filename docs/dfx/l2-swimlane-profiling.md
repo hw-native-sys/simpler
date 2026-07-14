@@ -681,8 +681,8 @@ space so the host can read device buffers directly.
 drain/refill shards poll SPSC ready queues and refill free queues from
 shard-local recycled lanes **while kernels are still executing**. Collector
 shards drain the host hand-off queues into `on_buffer_collected`, then the
-replenish thread folds done buffers back into recycled lanes and tops up
-optional recycled watermarks.
+replenish thread routes done buffers to same-kind lanes below their recycled
+watermarks before allocating any remaining top-up.
 
 `L2SwimlaneModule` declares four buffer kinds going through one ready
 queue per AICPU thread:
