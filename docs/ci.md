@@ -149,8 +149,8 @@ runner pools, branched at run time on the host arch (`uname -m`):
   runs through `task-submit --device <list> --run "..."`, whose per-device
   lock keeps a CI job from colliding with someone's local run (and vice
   versa).
-- **X64 a2a3 runners** carry no `task-submit` — their cards are exclusive to
-  the runner — so the step runs pytest/ctest directly with
+- **X64 a2a3 runners** do not use `task-submit` — their cards are exclusive to
+  the runner — so the step runs `pytest`/`ctest` directly with
   `--device ${DEVICE_RANGE}`.
 
 a5 runners are ARM64-only and always use `task-submit`. Steps that only build
