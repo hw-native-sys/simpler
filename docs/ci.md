@@ -141,13 +141,21 @@ Three hardware tiers, applied to all test categories. See [testing.md](testing.m
 | Platform-specific (a2a3) | `[self-hosted, a2a3]` | `ut-a2a3`, `st-onboard-a2a3` |
 | Platform-specific (a5) | `[self-hosted, a5]` | `ut-a5`, `st-onboard-a5` |
 
-Every step on a self-hosted runner that touches an NPU — pytest and ctest
-alike, on both arches — runs through
-`task-submit --device <list> --run "..."`. The runners are shared with
-interactive users, so the device lock is what keeps a CI job from colliding
-with someone's local run (and vice versa). Steps that only build (cmake,
-`RuntimeBuilder`, the `cann-examples` smokes) take no lock. The same rule
-applies to local onboard work — see
+On a self-hosted runner, every step that touches an NPU — pytest and ctest
+alike — must hold its devices exclusively while it runs. There are two a2a3
+runner pools, branched at run time on `runner.arch`:
+
+- **ARM64 a2a3 runners** share the host with interactive users, so the step
+  runs through `task-submit --device <list> --run "..."`, whose per-device
+  lock keeps a CI job from colliding with someone's local run (and vice
+  versa).
+- **X64 a2a3 runners** carry no `task-submit` — their cards are exclusive to
+  the runner — so the step runs pytest/ctest directly with
+  `--device ${DEVICE_RANGE}`.
+
+a5 runners are ARM64-only and always use `task-submit`. Steps that only build
+(cmake, `RuntimeBuilder`, the `cann-examples` smokes) take no lock on either
+arch. The same device-lock rule applies to local onboard work — see
 [.claude/rules/running-onboard.md](../.claude/rules/running-onboard.md).
 
 ## Test Sources
