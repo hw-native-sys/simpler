@@ -1451,6 +1451,11 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
             "release": "olive",  # deferred-release drain (on_task_release work)
             "dummy": "grey",  # dummy_drain pass (Resolve nests inside)
             "early_dispatch": "rail_animation",  # speculative early-dispatch staging
+            # sync_start stop-the-world drain: outer bar time-contains the two
+            # inner staging passes, so Perfetto nests them by depth on the track.
+            "drain": "cq_build_running",  # handle_drain_mode outer
+            "drain_prepare": "cq_build_attempt_runnable",  # inner: cluster scan + build_payload
+            "drain_publish": "cq_build_attempt_passed",  # inner: MMIO write_reg per subtask (the cohort launch)
             # Inner phase — nests inside Complete or Dummy via time containment
             "resolve": "vsync_highlight_color",  # on_task_complete: walk consumer list
             # Separate-lane (Worker View AICPU_N) — fallback color if it ever lands on Sched
@@ -1599,7 +1604,17 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
                         }
                     )
                     continue
-                if phase not in ("complete", "dispatch", "release", "resolve", "early_dispatch", "dummy"):
+                if phase not in (
+                    "complete",
+                    "dispatch",
+                    "release",
+                    "resolve",
+                    "early_dispatch",
+                    "dummy",
+                    "drain",
+                    "drain_prepare",
+                    "drain_publish",
+                ):
                     continue
                 start_us = record["start_time_us"]
                 end_us = record["end_time_us"]
