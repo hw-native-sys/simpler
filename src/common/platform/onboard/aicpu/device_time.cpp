@@ -10,8 +10,12 @@
  */
 #include "aicpu/device_time.h"
 
+#if defined(__aarch64__)
 uint64_t get_sys_cnt_aicpu() {
     uint64_t ticks;
     asm volatile("mrs %0, cntvct_el0" : "=r"(ticks));
     return ticks;
 }
+#else
+uint64_t get_sys_cnt_aicpu() { return 0; }
+#endif

@@ -15,6 +15,7 @@
 
 namespace aicpu_cache_maintenance {
 
+#if defined(__aarch64__)
 void invalidate_range_impl(const void *addr, size_t size) {
     if (size == 0) {
         return;
@@ -42,5 +43,9 @@ void flush_range_impl(const void *addr, size_t size) {
     __asm__ __volatile__("dsb sy" ::: "memory");
     __asm__ __volatile__("isb" ::: "memory");
 }
+#else
+void invalidate_range_impl(const void *, size_t) {}
+void flush_range_impl(const void *, size_t) {}
+#endif
 
 }  // namespace aicpu_cache_maintenance
