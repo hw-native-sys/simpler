@@ -33,9 +33,9 @@ available.
   `l2_swimlane_records.json` with `deps.json` from
   [`dep_gen`](dep_gen.md) at post-process time; see
   [§3.5](#35-dependency-arrows-from-dep_gen).
-- **AICPU scheduler phases** — per-iteration breakdown into five
-  mutually time-exclusive **outer** phases (`complete` / `dispatch`
-  / `release` / `dummy` / `early_dispatch`), one logical
+- **AICPU scheduler phases** — per-iteration breakdown into six
+  mutually time-exclusive **outer** phases (`complete` / `async_poll`
+  / `dispatch` / `release` / `dummy` / `early_dispatch`), one logical
   **inner** phase (`resolve`, parent = Complete or Dummy) rendered on a
   sibling scheduler sub-lane with the same `Sched_N` label and adjacent tid,
   and one **separate-lane**
@@ -227,6 +227,7 @@ field but render differently in Perfetto:
 | Phase | Role | Lane | `tasks_processed` semantic |
 | ----- | ---- | ---- | -------------------------- |
 | `complete` | outer | sched (pid=2) | FIN'd subtasks + sub-block retires this iter |
+| `async_poll` | outer | sched | async-wait (SDMA/RoCE/URMA/CCU) subtasks completed this iter; split from `complete` |
 | `dispatch` | outer | sched | subtasks published this iter |
 | `release` | outer | sched | deferred-release slots drained this iter |
 | `dummy` | outer | sched | dummies handled by `dummy_drain` this iter |

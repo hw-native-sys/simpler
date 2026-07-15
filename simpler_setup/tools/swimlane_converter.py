@@ -1448,6 +1448,7 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
             # Outer phases — mutually time-exclusive within an iter
             "complete": "good",  # green
             "dispatch": "terrible",  # red
+            "async_poll": "yellow",  # async-wait completion polling (split from complete)
             "release": "olive",  # deferred-release drain (on_task_release work)
             "dummy": "grey",  # dummy_drain pass (Resolve nests inside)
             "early_dispatch": "rail_animation",  # speculative early-dispatch staging
@@ -1606,6 +1607,7 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
                     continue
                 if phase not in (
                     "complete",
+                    "async_poll",
                     "dispatch",
                     "release",
                     "resolve",

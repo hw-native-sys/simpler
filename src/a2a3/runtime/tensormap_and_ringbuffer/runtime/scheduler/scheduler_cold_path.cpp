@@ -507,8 +507,8 @@ void SchedulerContext::log_l2_swimlane_summary(int32_t thread_idx, [[maybe_unuse
         cycles_to_us(sched_end_ts - l2_swimlane.sched_start_ts)
     );
 
-    uint64_t sched_total =
-        l2_swimlane.sched_complete_cycle + l2_swimlane.sched_dispatch_cycle + l2_swimlane.sched_idle_cycle;
+    uint64_t sched_total = l2_swimlane.sched_complete_cycle + l2_swimlane.sched_async_cycle +
+                           l2_swimlane.sched_dispatch_cycle + l2_swimlane.sched_idle_cycle;
     if (sched_total == 0) sched_total = 1;
 
     {
@@ -576,6 +576,11 @@ void SchedulerContext::log_l2_swimlane_summary(int32_t thread_idx, [[maybe_unuse
             "Thread %d:     perf         : %.3fus (%.1f%%)", thread_idx,
             cycles_to_us(l2_swimlane.sched_complete_perf_cycle),
             l2_swimlane.sched_complete_perf_cycle * 100.0 / c_parent
+        );
+
+        LOG_INFO_V9(
+            "Thread %d:   async_poll     : %.3fus (%.1f%%)", thread_idx, cycles_to_us(l2_swimlane.sched_async_cycle),
+            l2_swimlane.sched_async_cycle * 100.0 / sched_total
         );
 
         LOG_INFO_V9(

@@ -1042,6 +1042,8 @@ int L2SwimlaneCollector::export_swimlane_json() {
                 return "drain_prepare";
             case L2SwimlaneSchedPhaseKind::DrainPublish:
                 return "drain_publish";
+            case L2SwimlaneSchedPhaseKind::AsyncPoll:
+                return "async_poll";
             }
             return "unknown";
         };

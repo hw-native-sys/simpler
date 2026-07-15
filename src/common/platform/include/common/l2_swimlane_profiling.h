@@ -527,6 +527,10 @@ enum class L2SwimlaneSchedPhaseKind : uint32_t {
                         // (cluster scan + build_payload). tasks_processed = subtasks.
     DrainPublish = 10,  // inner: this thread's drain_stage_cores publish pass
                         // (MMIO write_reg per subtask). tasks_processed = subtasks.
+    // Outer (sched lane): async-wait completion polling, split out of Complete
+    // so async-engine (SDMA/RoCE/URMA/CCU) wait time is attributed to its own
+    // bar. tasks_processed = async subtasks completed this iter.
+    AsyncPoll = 11,
 };
 
 /** Index layout of the queue-depth snapshot arrays below: AIC=0, AIV=1, MIX=2.

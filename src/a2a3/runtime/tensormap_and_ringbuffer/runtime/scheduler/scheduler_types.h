@@ -488,6 +488,7 @@ struct alignas(64) SchedL2SwimlaneCounters {
     uint64_t sched_complete_cycle{0};
     uint64_t sched_dispatch_cycle{0};
     uint64_t sched_idle_cycle{0};
+    uint64_t sched_async_cycle{0};
     uint64_t sched_loop_count{0};
     uint32_t phase_complete_count{0};
     // Sub-block retires that did NOT finish a slot (SPMD blocks of a multi-block
