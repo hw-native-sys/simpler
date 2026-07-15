@@ -733,7 +733,7 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
             // device LOG_INFO_V9 "orch_start=… orch_end=… orch_cost=…" line
             // below carries the same envelope info for debugging, and
             // host-side swimlane derives per-phase timing from the per-event
-            // L2SwimlaneAicpuPhaseRecord[] stream that already covers everything inside
+            // L2SwimlaneAicpuOrchPhaseRecord[] stream that already covers everything inside
             // submit_task().
             int32_t total_tasks = 0;
             if (rt->orchestrator.sm_header) {

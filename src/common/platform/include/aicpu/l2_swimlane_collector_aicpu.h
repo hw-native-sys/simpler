@@ -194,13 +194,15 @@ void l2_swimlane_aicpu_init_phase(int worker_count, int num_sched_phase_threads,
  * record's corresponding slot is zero-filled).
  *
  * @param thread_idx       Scheduler thread index
- * @param kind             Complete or Dispatch
+ * @param kind             Scheduler phase kind; DummyTask uses l2_swimlane_aicpu_record_dummy_task
  * @param start_time       Phase start timestamp
  * @param end_time         Phase end timestamp
  * @param loop_iter        Current scheduler-loop iteration number
  * @param tasks_processed  Tasks processed in this phase batch
- * @param pop_hit          Dispatch delta since last emit (0 for Complete)
- * @param pop_miss         Dispatch delta since last emit (0 for Complete)
+ * @param pop_hit          Ready-queue hit delta since the previous Dispatch emit; ignored for other kinds
+ *                         (Complete, Release, Dummy, EarlyDispatch, Resolve, Drain, DrainPrepare, DrainPublish)
+ * @param pop_miss         Ready-queue miss delta since the previous Dispatch emit; ignored for other kinds
+ *                         (Complete, Release, Dummy, EarlyDispatch, Resolve, Drain, DrainPrepare, DrainPublish)
  * @param shared_at_start  Per-shape sched.ready_queues[shape].size() at phase start (may be nullptr)
  * @param shared_at_end    Per-shape sched.ready_queues[shape].size() at phase end (may be nullptr)
  */
@@ -209,6 +211,16 @@ void l2_swimlane_aicpu_record_sched_phase(
     uint32_t tasks_processed, uint32_t pop_hit = 0, uint32_t pop_miss = 0, const int16_t *shared_at_start = nullptr,
     const int16_t *shared_at_end = nullptr
 );
+
+/**
+ * Record the completion point of one dependency-only dummy task.
+ *
+ * @param thread_idx     Scheduler thread that completed the task
+ * @param complete_time  Timestamp sampled immediately before completion propagation
+ * @param loop_iter      Current scheduler-loop iteration number
+ * @param task_id        Full PTO2 task identity
+ */
+void l2_swimlane_aicpu_record_dummy_task(int thread_idx, uint64_t complete_time, uint32_t loop_iter, uint64_t task_id);
 
 /**
  * Set orchestrator thread index for per-task phase recording

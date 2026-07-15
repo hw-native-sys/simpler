@@ -515,9 +515,8 @@ enum class L2SwimlaneSchedPhaseKind : uint32_t {
                   // push newly-ready successors, ring doorbells for
                   // early-dispatch hits. tasks_processed = # consumers visited.
     // Separate-lane (Worker View pid=4 AICPU_N)
-    DummyTask = 7,      // Per-dummy identity marker (zero-width). tasks_processed
-                        // = task_token_raw low 32 bits so deps.json flow arrows
-                        // can land on it.
+    DummyTask = 7,      // Per-dummy identity marker (zero-width). phase_data.dummy_task
+                        // carries the local/ring components of the full PTO2 identity.
     Drain = 8,          // handle_drain_mode outer: the sync_start stop-the-world drain
                         // (ack barrier + availability + parallel stage + finalize).
                         // One bar per dispatch-loop iteration that enters the drain,
@@ -539,9 +538,9 @@ constexpr int L2SWIMLANE_NUM_QUEUE_SHAPES = 3;
  *
  * Position in the per-thread buffer is the identity — no thread_id field.
  *
- * pop_hit / pop_miss carry SCHED_DISPATCH delta counters since the last emit
- * (zero for Complete). Kept named, not "extra1"/"extra2", so the device-side
- * commit and the host-side JSON emit don't drift on which extra means which.
+ * phase_data is tagged by kind: Dispatch uses its ready-queue counters and
+ * DummyTask uses the local/ring components of the full task id. Other kinds
+ * store zero in the Dispatch view.
  *
  * Queue-depth snapshots (shared_depth_*) record the per-shape scheduler ready
  * queue occupancy at phase boundaries. They surface the dep-release-then-
@@ -554,12 +553,28 @@ struct L2SwimlaneAicpuSchedPhaseRecord {
     uint32_t loop_iter;             // Scheduler-loop iteration number on this thread
     L2SwimlaneSchedPhaseKind kind;  // see enum above
     uint32_t tasks_processed;       // Tasks processed in this phase batch
-    uint32_t pop_hit;               // SCHED_DISPATCH delta since last emit (0 for Complete)
-    uint32_t pop_miss;              // SCHED_DISPATCH delta since last emit (0 for Complete)
+    union {
+        struct {
+            uint32_t pop_hit;   // Ready-queue hit delta since the previous Dispatch emit
+            uint32_t pop_miss;  // Ready-queue miss delta since the previous Dispatch emit
+        } dispatch;
+        struct {
+            uint32_t local_id;  // task_id bits [31:0]
+            uint32_t ring_id;   // task_id bits [63:32]
+        } dummy_task;
+    } phase_data;
     int16_t shared_depth_at_start[L2SWIMLANE_NUM_QUEUE_SHAPES];  // sched->ready_queues[shape].size()
     int16_t shared_depth_at_end[L2SWIMLANE_NUM_QUEUE_SHAPES];
     uint32_t _pad[4];  // 64B alignment padding
 };
+static_assert(
+    sizeof(decltype(L2SwimlaneAicpuSchedPhaseRecord::phase_data)) == 8,
+    "L2SwimlaneAicpuSchedPhaseRecord phase data must remain 8 bytes"
+);
+static_assert(
+    offsetof(L2SwimlaneAicpuSchedPhaseRecord, phase_data) == 28,
+    "L2SwimlaneAicpuSchedPhaseRecord phase data offset drift"
+);
 static_assert(sizeof(L2SwimlaneAicpuSchedPhaseRecord) == 64, "L2SwimlaneAicpuSchedPhaseRecord layout drift");
 
 /**

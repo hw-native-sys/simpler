@@ -915,14 +915,10 @@ static Record *acquire_phase_slot(
     return record;
 }
 
-void l2_swimlane_aicpu_record_sched_phase(
-    int thread_idx, L2SwimlaneSchedPhaseKind kind, uint64_t start_time, uint64_t end_time, uint32_t loop_iter,
-    uint32_t tasks_processed, uint32_t pop_hit, uint32_t pop_miss, const int16_t *shared_at_start,
-    const int16_t *shared_at_end
-) {
-    if (!s_phase_initialized) return;
+static inline L2SwimlaneAicpuSchedPhaseRecord *acquire_sched_phase_record(int thread_idx) {
+    if (!s_phase_initialized) return nullptr;
     auto *state = s_sched_phase_pools[thread_idx];
-    if (state == nullptr) return;
+    if (state == nullptr) return nullptr;
 
     state->head.total_record_count += 1;
 
@@ -932,15 +928,20 @@ void l2_swimlane_aicpu_record_sched_phase(
     );
     if (record == nullptr) {
         state->head.dropped_record_count += 1;
-        return;
+        return nullptr;
     }
+    return record;
+}
+
+static inline void fill_sched_phase_record(
+    L2SwimlaneAicpuSchedPhaseRecord *record, L2SwimlaneSchedPhaseKind kind, uint64_t start_time, uint64_t end_time,
+    uint32_t loop_iter, uint32_t tasks_processed, const int16_t *shared_at_start, const int16_t *shared_at_end
+) {
     record->start_time = start_time;
     record->end_time = end_time;
     record->loop_iter = loop_iter;
     record->kind = kind;
     record->tasks_processed = tasks_processed;
-    record->pop_hit = pop_hit;
-    record->pop_miss = pop_miss;
     auto copy_snapshot = [](int16_t dst[L2SWIMLANE_NUM_QUEUE_SHAPES], const int16_t *src) {
         if (src == nullptr) {
             for (int i = 0; i < L2SWIMLANE_NUM_QUEUE_SHAPES; i++)
@@ -952,6 +953,31 @@ void l2_swimlane_aicpu_record_sched_phase(
     };
     copy_snapshot(record->shared_depth_at_start, shared_at_start);
     copy_snapshot(record->shared_depth_at_end, shared_at_end);
+}
+
+void l2_swimlane_aicpu_record_sched_phase(
+    int thread_idx, L2SwimlaneSchedPhaseKind kind, uint64_t start_time, uint64_t end_time, uint32_t loop_iter,
+    uint32_t tasks_processed, uint32_t pop_hit, uint32_t pop_miss, const int16_t *shared_at_start,
+    const int16_t *shared_at_end
+) {
+    auto *record = acquire_sched_phase_record(thread_idx);
+    if (record == nullptr) return;
+    fill_sched_phase_record(
+        record, kind, start_time, end_time, loop_iter, tasks_processed, shared_at_start, shared_at_end
+    );
+    record->phase_data.dispatch.pop_hit = pop_hit;
+    record->phase_data.dispatch.pop_miss = pop_miss;
+}
+
+void l2_swimlane_aicpu_record_dummy_task(int thread_idx, uint64_t complete_time, uint32_t loop_iter, uint64_t task_id) {
+    auto *record = acquire_sched_phase_record(thread_idx);
+    if (record == nullptr) return;
+    fill_sched_phase_record(
+        record, L2SwimlaneSchedPhaseKind::DummyTask, complete_time, complete_time, loop_iter,
+        /*tasks_processed=*/1, /*shared_at_start=*/nullptr, /*shared_at_end=*/nullptr
+    );
+    record->phase_data.dummy_task.local_id = static_cast<uint32_t>(task_id);
+    record->phase_data.dummy_task.ring_id = static_cast<uint32_t>(task_id >> 32);
 }
 
 void l2_swimlane_aicpu_set_orch_thread_idx(int thread_idx) { s_orch_thread_idx = thread_idx; }

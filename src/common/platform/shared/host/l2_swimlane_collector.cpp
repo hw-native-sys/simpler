@@ -1059,7 +1059,13 @@ int L2SwimlaneCollector::export_swimlane_json() {
                         << ", \"start_cycles\": " << pr.start_time << ", \"end_cycles\": " << pr.end_time
                         << ", \"loop_iter\": " << pr.loop_iter << ", \"tasks_processed\": " << pr.tasks_processed;
                 if (pr.kind == L2SwimlaneSchedPhaseKind::Dispatch) {
-                    outfile << ", \"pop_hit\": " << pr.pop_hit << ", \"pop_miss\": " << pr.pop_miss;
+                    outfile << ", \"pop_hit\": " << pr.phase_data.dispatch.pop_hit
+                            << ", \"pop_miss\": " << pr.phase_data.dispatch.pop_miss;
+                }
+                if (pr.kind == L2SwimlaneSchedPhaseKind::DummyTask) {
+                    uint64_t task_id = (static_cast<uint64_t>(pr.phase_data.dummy_task.ring_id) << 32) |
+                                       pr.phase_data.dummy_task.local_id;
+                    outfile << ", \"task_id\": " << task_id;
                 }
                 // Queue-depth snapshots — [AIC, AIV, MIX] per L2SwimlaneAicpuSchedPhaseRecord docstring.
                 emit_depth_array("shared_at_start", pr.shared_depth_at_start);

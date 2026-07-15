@@ -707,10 +707,22 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
 #endif
             for (int di = 0; di < dummy_got; di++) {
                 PTO2TaskSlotState &dummy_slot = *dummy_batch[di];
+#if SIMPLER_DFX
+                uint64_t dummy_resolve_t0 =
+                    (l2_swimlane_level_ >= L2SwimlaneLevel::SCHED_PHASES) ? get_sys_cnt_aicpu() : 0;
+#endif
 #if SIMPLER_SCHED_PROFILING
                 sched_->on_task_complete(dummy_slot, thread_idx);
 #else
                 sched_->on_task_complete(dummy_slot);
+#endif
+#if SIMPLER_DFX
+                if (dummy_resolve_t0 != 0) {
+                    l2_swimlane_aicpu_record_dummy_task(
+                        thread_idx, dummy_resolve_t0, sched_l2_swimlane_[thread_idx].sched_loop_count,
+                        dummy_slot.task->task_id.raw
+                    );
+                }
 #endif
                 // Dummy tasks have no subtasks to retire and no fanout pre-conditions
                 // beyond their own producers; release self-reference so the slot can
@@ -766,7 +778,7 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
                 // sum-of-deltas == run-cumulative.
                 uint64_t pop_hit_delta = l2_swimlane.pop_hit - l2_swimlane.pop_hit_at_last_emit;
                 uint64_t pop_miss_delta = l2_swimlane.pop_miss - l2_swimlane.pop_miss_at_last_emit;
-                // L2SwimlaneAicpuPhaseRecord's extras are uint32 — a delta that overflows means
+                // L2SwimlaneAicpuSchedPhaseRecord's dispatch counters are uint32 — an overflow means
                 // an emit was missed for ~4 billion pops, which is well outside any
                 // realistic dispatch cadence and silently truncates without this guard.
                 debug_assert(pop_hit_delta < (1ULL << 32));

@@ -39,8 +39,11 @@ available.
   **inner** phase (`resolve`, parent = Complete or Dummy) rendered on a
   sibling scheduler sub-lane with the same `Sched_N` label and adjacent tid,
   and one **separate-lane**
-  phase (`dummy_task`, rendered on Worker View AICPU_N rather than on the
-  sched lane). Idle iterations no longer emit a record on a2a3; the
+  phase (`dummy_task`, sampled immediately before `on_task_complete()` begins
+  dependency resolution and rendered as a synthetic 0.02 us marker on Worker
+  View AICPU_N rather than on the sched lane). It is emitted by both a2a3
+  runtimes and by a5 `tensormap_and_ringbuffer`; a5 `host_build_graph` has no
+  dummy-task phase path. Idle iterations no longer emit a record on a2a3; the
   host tooling reconstructs idle spans from the gap between
   consecutive work records on the same thread. See §3.2 for the
   full per-phase table. Legacy captures may carry `scan` / `poll` /
@@ -218,8 +221,14 @@ Phase records (per scheduler thread, level >= 3 for
 | `start_time_us` / `end_time_us` | Phase start / end timestamps in microseconds (reader-side cycle→µs conversion) |
 | `phase` | Lowercase phase name. Scheduler: see the table below. Orchestrator: `orch_submit` — one record per `submit_task()` / `alloc_tensors()` call spanning its full `[start, end]` window. Legacy per-sub-step strings (`orch_sync` / `orch_alloc` / `orch_params` / `orch_lookup` / `orch_insert` / `orch_fanin`) may appear in old captures. |
 | `loop_iter` (scheduler) / `submit_idx` (orchestrator) | Iteration / submit-call counter for the producing thread |
-| `tasks_processed` (scheduler) / `task_id` (orchestrator) | Phase-specific union field (see per-phase table) |
+| `tasks_processed` (scheduler) | Number of tasks or blocks handled by the phase; `dummy_task` records one task |
+| `task_id` | Full runtime task id on orchestrator records and scheduler `dummy_task` records |
 | `pop_hit` / `pop_miss` (dispatch only) | Ready-queue pop deltas since the previous dispatch emit |
+
+The raw scheduler record has a phase-tagged union: `dispatch` stores
+`pop_hit` / `pop_miss`, while `dummy_task` stores the 32-bit `local_id` and
+`ring_id` components of its full task id. The Host collector reconstructs the
+`task_id` JSON field.
 
 Scheduler phase taxonomy — three role classes share one `phase`
 field but render differently in Perfetto:
@@ -232,7 +241,7 @@ field but render differently in Perfetto:
 | `dummy` | outer | sched | dummies handled by `dummy_drain` this iter |
 | `early_dispatch` | outer | sched | blocks staged by speculative early-dispatch this pass |
 | `resolve` | inner | sched sub-lane, same `Sched_N` label as its outer lane | consumers visited in `on_task_complete` |
-| `dummy_task` | separate-lane | Worker View AICPU_N (pid=4) | dummy `task_id` low 32 bits (deps.json flow target) |
+| `dummy_task` | separate-lane | Worker View AICPU_N (pid=4) | one dummy entering `on_task_complete()`; full identity is in `task_id` |
 
 Fanin/fanout wiring is not a scheduler phase: it runs on the
 orchestrator submit path, so it has no swimlane lane. Read its cost
@@ -300,11 +309,17 @@ in. The trace contains:
   - `AIC_N` — matrix cores (receive → kernel end from level >= 1)
   - `AIV_N` — vector cores (receive → kernel end from level >= 1)
   - `AICPU_N` — AICPU acting as worker; carries `dummy_task`
-    zero-width markers (one per dummy drained by the sched
-    thread on AICPU N) and `alloc` bars (from `alloc_tensors()`
-    calls that the orchestrator on AICPU 0 inline-completed).
+    0.02 us pre-resolve markers (one per dummy entering
+    `on_task_complete()` on AICPU N) and `alloc` bars (from `alloc_tensors()`
+    calls inline-completed by the dedicated orchestrator on the last
+    AICPU runtime thread).
     Both are activities the AICPU performs as a worker, so they
-    share the same lane tier as AIC/AIV.
+    share the same lane tier as AIC/AIV. When `deps.json` is joined,
+    dependency arrows involving dummy/alloc DAG nodes anchor on these
+    AICPU worker slices. The converter identifies dummy nodes from
+    `deps.json` before consulting runtime timing records. If a dummy's
+    scheduler record is missing, it warns and omits that Worker View bar
+    instead of rendering it as `alloc`.
   AIC/AIV hover args keep both `kernel-duration-us` and
   `local_setup_us`; the old standalone setup preview bar is folded
   into the task bar.
@@ -321,7 +336,7 @@ whether a `deps.json` is present** (see
 
 - **With `deps.json`** — each task shows `func_name(rXtY)` (or
   `func_<id>(rXtY)` when no name map), and dependency arrows are
-  drawn in the AICore View.
+  drawn in the task views.
 - **Without `deps.json`** — the host never records `func_id` (it's
   `-1` on disk), so the converter cannot tell tasks apart by
   function. Every task in **both** views is labeled `task(rXtY)` —
@@ -506,6 +521,8 @@ keep every subtask row as an endpoint (N×N pairing unchanged).
 For each logical `(pred, succ)` edge from `deps.json`, the converter
 emits flows between the Cartesian product of pred/succ anchor rows
 (`|pred_anchors| × |succ_anchors|`), not a per-subtask crossbar.
+Kernel tasks anchor on AIC/AIV task rows; dummy and alloc DAG nodes
+anchor on the AICPU worker slices that represent those activities.
 
 **SPMD lane labels.** Logical SPMD tasks append `_spmd` before the
 `(rXtY)` suffix unless the function name already contains `spmd`
@@ -1025,13 +1042,12 @@ active L2 swimlane buffer at run end. Check the AICPU flush path runs
 for every thread that produced records.
 
 **Phase records empty.** Either the runtime did not emit phase
-data (only `tensormap_and_ringbuffer` does, and only when phase init
-ran — on a2a3 gated on
+data or phase initialization did not run. Both a2a3 runtimes and a5
+`tensormap_and_ringbuffer` provide the dummy-task path; a5
+`host_build_graph` does not. On both architectures collection is gated on
 `L2SwimlaneDataHeader::num_sched_phase_threads > 0` (sched) or
-`num_orch_phase_threads > 0` (orch); on a5 gated on
-`L2SwimlaneAicpuPhaseHeader::magic`), or the host did not pre-zero
-those fields. Verify the runtime calls `l2_swimlane_aicpu_init_phase()`
-in its scheduler init path; check the host's
+`num_orch_phase_threads > 0` (orch). Verify the runtime calls
+`l2_swimlane_aicpu_init_phase()` in its scheduler init path; check the host's
 `L2SwimlaneCollector::initialize` zero-inits the relevant metadata
 fields.
 

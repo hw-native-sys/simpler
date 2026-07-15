@@ -412,3 +412,69 @@ def test_complete_flow_worker_view_only_without_scheduler_phases(tmp_path):
 
     out = _generate_trace(tasks, {}, {task_id: 1}, tmp_path)
     assert _complete_flows(out) == []
+
+
+def test_aicpu_worker_lanes_and_full_dummy_ids_follow_runtime_threads(tmp_path):
+    out = tmp_path / "trace.json"
+    dummy_r1t1 = (1 << 32) | 1
+    dummy_r2t1 = (2 << 32) | 1
+    alloc_r3t1 = (3 << 32) | 1
+    scheduler_phases = [
+        [],
+        [{"phase": "dummy_task", "task_id": dummy_r1t1, "start_time_us": 1.0, "end_time_us": 1.0}],
+        [{"phase": "dummy_task", "task_id": dummy_r2t1, "start_time_us": 2.0, "end_time_us": 2.0}],
+        [],
+    ]
+    orchestrator_phases = [[{"phase": "orch_submit", "task_id": alloc_r3t1, "start_time_us": 3.0, "end_time_us": 4.0}]]
+
+    sc.generate_chrome_trace_json(
+        [],
+        str(out),
+        scheduler_phases=scheduler_phases,
+        orchestrator_phases=orchestrator_phases,
+        core_to_thread=[0, 1, 2],
+        deps_edges={dummy_r1t1: [dummy_r2t1]},
+        deps_kernel_map={dummy_r1t1: [-1, -1, -1], dummy_r2t1: [-1, -1, -1]},
+    )
+
+    with open(out) as f:
+        events = json.load(f)["traceEvents"]
+    aicpu_lanes = {
+        event["tid"]: event["args"]["name"]
+        for event in events
+        if event.get("ph") == "M"
+        and event.get("pid") == 4
+        and event.get("args", {}).get("name", "").startswith("AICPU_")
+    }
+    assert aicpu_lanes == {
+        19000: "AICPU_0",
+        19001: "AICPU_1",
+        19002: "AICPU_2",
+        19003: "AICPU_3",
+    }
+    assert next(event for event in events if event.get("name") == "dummy(r1t1)")["tid"] == 19001
+    assert next(event for event in events if event.get("name") == "dummy(r2t1)")["tid"] == 19002
+    assert next(event for event in events if event.get("name") == "alloc(r3t1)")["tid"] == 19003
+
+    flow = _first_worker_dependency_flow(out)
+    assert [(event["ph"], event["tid"]) for event in flow] == [("s", 19001), ("f", 19002)]
+
+
+def test_deps_dummy_without_runtime_record_is_not_rendered_as_alloc(tmp_path, capsys):
+    out = tmp_path / "trace.json"
+    dummy_task_id = (1 << 32) | 1
+
+    sc.generate_chrome_trace_json(
+        [],
+        str(out),
+        scheduler_phases=[[]],
+        orchestrator_phases=[
+            [{"phase": "orch_submit", "task_id": dummy_task_id, "start_time_us": 2.0, "end_time_us": 3.0}]
+        ],
+        deps_kernel_map={dummy_task_id: [-1, -1, -1]},
+    )
+
+    with open(out) as f:
+        events = json.load(f)["traceEvents"]
+    assert not any(event.get("name") == "alloc(r1t1)" for event in events)
+    assert "dummy(r1t1) has no dummy_task scheduler record" in capsys.readouterr().err

@@ -1154,24 +1154,6 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
             for (int di = 0; di < dummy_got; di++) {
                 PTO2TaskSlotState &dummy_slot = *dummy_batch[di];
 
-                // ----- DummyTask phase: dummy "task" identity marker. --------
-                // The dummy has no AICore presence — start ≈ end (1 cycle
-                // wide, just "we identified it"). Converter renders this on
-                // Worker View's DUMMY_T{thread} lane so the DAG node is
-                // visually present. tasks_processed = task_token low 32 bits
-                // (= local_id within ring) so deps.json flow arrows can land.
-                // The Resolve work that follows is emitted separately below.
-#if SIMPLER_DFX
-                if (l2_swimlane_level_ >= L2SwimlaneLevel::SCHED_PHASES) {
-                    uint64_t dummy_marker_t = get_sys_cnt_aicpu();
-                    uint32_t dummy_id_low32 = static_cast<uint32_t>(dummy_slot.task->task_id.raw & 0xFFFFFFFFu);
-                    l2_swimlane_aicpu_record_sched_phase(
-                        thread_idx, L2SwimlaneSchedPhaseKind::DummyTask, dummy_marker_t, dummy_marker_t,
-                        sched_l2_swimlane_[thread_idx].sched_loop_count, dummy_id_low32
-                    );
-                }
-#endif
-
                 // ----- Resolve work: walk this dummy's consumer list. ------
                 // Same 1 µs filter as the main-path Resolve emit suppresses
                 // dummies whose consumer release runs sub-microsecond.
@@ -1198,6 +1180,10 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
                             sched_l2_swimlane_[thread_idx].sched_loop_count, dummy_consumers
                         );
                     }
+                    l2_swimlane_aicpu_record_dummy_task(
+                        thread_idx, dummy_resolve_t0, sched_l2_swimlane_[thread_idx].sched_loop_count,
+                        dummy_slot.task->task_id.raw
+                    );
                 }
 #endif
                 // Dummy tasks have no subtasks to retire and no fanout pre-conditions
@@ -1224,7 +1210,7 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
             }
 #if SIMPLER_DFX
             // Emit Dummy outer over the whole dummy_drain pass. Span starts at
-            // dummy_outer_t0 (captured before the pop_batch) and ends at "now".
+            // dummy_outer_t0 (captured after pop_batch) and ends at "now".
             // tasks_processed = dummy_got. Advancing _t0_phase here makes the
             // following Dispatch / EarlyDispatch / second-Complete bars start
             // at this end.
