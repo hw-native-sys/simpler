@@ -21,10 +21,10 @@
 #define PLATFORM_A5SIM_AICORE_INNER_KERNEL_H_
 
 #include <atomic>
-#include <chrono>
 #include <cstdint>
 #include <dlfcn.h>
 
+#include "aicpu/device_time.h"
 #include "common/platform_config.h"
 
 // AICore function attribute - no-op in simulation
@@ -140,19 +140,7 @@ inline int64_t ld_dev(int32_t *src, int16_t offset) {
  *
  * @return Simulated counter value (ticks)
  */
-inline uint64_t get_sys_cnt_aicore() {
-    auto now = std::chrono::high_resolution_clock::now();
-    uint64_t elapsed_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(now.time_since_epoch()).count();
-
-    // Convert nanoseconds to counter ticks
-    constexpr uint64_t kNsPerSec = std::nano::den;
-    uint64_t seconds = elapsed_ns / kNsPerSec;
-    uint64_t remaining_ns = elapsed_ns % kNsPerSec;
-
-    uint64_t ticks = seconds * PLATFORM_PROF_SYS_CNT_FREQ + (remaining_ns * PLATFORM_PROF_SYS_CNT_FREQ) / kNsPerSec;
-
-    return ticks;
-}
+inline uint64_t get_sys_cnt_aicore() { return sys_cnt_now_ticks(); }
 
 // =============================================================================
 // Register Access Simulation

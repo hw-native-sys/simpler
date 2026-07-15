@@ -65,6 +65,20 @@ inline uint64_t device_time_frequency_hz() {
 
 inline uint64_t get_sys_cnt_aicpu_frequency_hz() { return PLATFORM_PROF_SYS_CNT_FREQ; }
 
+// device_time_now_ticks() expressed in the PLATFORM_PROF_SYS_CNT_FREQ unit that
+// get_sys_cnt_aicpu()/get_sys_cnt_aicore() report in. Rescaling by the clock's
+// own frequency makes it correct without knowing whether this is the device or
+// a host: on the device cntfrq == PROF (identity); on an aarch64 host cntvct
+// runs at that host's cntfrq; on x86 the clock is nanoseconds (1 GHz). The
+// __uint128_t intermediate keeps ticks * PROF from overflowing.
+inline uint64_t sys_cnt_now_ticks() {
+    const uint64_t freq = device_time_frequency_hz();
+    if (freq == 0) {  // cntfrq_el0 unset on a misconfigured/virtualized host — avoid SIGFPE
+        return 0;
+    }
+    return static_cast<uint64_t>(static_cast<__uint128_t>(device_time_now_ticks()) * PLATFORM_PROF_SYS_CNT_FREQ / freq);
+}
+
 inline uint64_t sys_cnt_ticks_to_ns(uint64_t ticks, uint64_t frequency_hz) {
     if (frequency_hz == 0) {
         return UINT64_MAX;
