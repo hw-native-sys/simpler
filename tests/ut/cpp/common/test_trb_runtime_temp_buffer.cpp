@@ -253,7 +253,7 @@ TEST_F(TrbRuntimeTempBufferTest, TemporaryBufferSlicesWithoutChangingCopies) {
     ASSERT_EQ(bind_runtime(malloc_runtime, malloc_api_, args, signature, 2), 0);
     EXPECT_EQ(fake_.device_malloc_count, 2);
     EXPECT_EQ(fake_.copy_to_count, 2);
-    EXPECT_EQ(fake_.device_memset_count, 1);
+    EXPECT_EQ(fake_.device_memset_count, 0);
     ASSERT_EQ(validate_runtime_impl(&malloc_runtime, &malloc_api_), 0);
     EXPECT_EQ(fake_.device_free_count, 2);
     EXPECT_EQ(fake_.copy_from_count, 2);
@@ -266,7 +266,7 @@ TEST_F(TrbRuntimeTempBufferTest, TemporaryBufferSlicesWithoutChangingCopies) {
     EXPECT_EQ(fake_.device_malloc_count, 1);
     EXPECT_EQ(fake_.retained_size, align_up(64, kAlign) * 2);
     EXPECT_EQ(fake_.copy_to_count, 2);
-    EXPECT_EQ(fake_.device_memset_count, 1);
+    EXPECT_EQ(fake_.device_memset_count, 0);
     ASSERT_EQ(validate_runtime_impl(&buffer_runtime, &api_), 0);
     // Retained buffer is NOT freed at end of run — it lives on the slot.
     EXPECT_EQ(fake_.device_free_count, 0);
@@ -330,7 +330,7 @@ TEST_F(TrbRuntimeTempBufferTest, LargerRunGrowsSmallerRunKeepsBuffer) {
     EXPECT_EQ(fake_.retained_size, align_up(4096, kAlign) * 2);
 }
 
-TEST_F(TrbRuntimeTempBufferTest, ChildMemoryIsPassThroughAndPureOutStillMemsets) {
+TEST_F(TrbRuntimeTempBufferTest, ChildMemoryIsPassThroughAndPureOutSkipsStaging) {
     fake_.reset();
     Runtime runtime = make_runtime();
     std::vector<uint8_t> child(64, 3);
@@ -341,15 +341,16 @@ TEST_F(TrbRuntimeTempBufferTest, ChildMemoryIsPassThroughAndPureOutStillMemsets)
     ArgDirection signature[2] = {ArgDirection::IN, ArgDirection::OUT};
 
     ASSERT_EQ(bind_runtime(runtime, api_, args, signature, 2), 0);
-    // Only the non-child output tensor is staged: one retained buffer sized to
-    // a single 1024-aligned slice, no per-tensor malloc, child passed through.
+    // The pure-OUT tensor still gets a retained slice (one 1024-aligned slot,
+    // no per-tensor malloc), but its buffer is handed to the kernel with no
+    // staging; the child is passed through.
     EXPECT_EQ(fake_.device_malloc_count, 1);
     EXPECT_EQ(fake_.retained_size, align_up(64, kAlign));
-    // The pure-OUT tensor is memset (not copied) and the child is passed
-    // through, so no tensor copy-in — the single copy_to is the runtime arena
-    // image upload that every bind performs.
+    // The pure-OUT tensor is neither copied nor memset and the child is passed
+    // through, so no tensor copy-in and no memset — the single copy_to is the
+    // runtime arena image upload that every bind performs.
     EXPECT_EQ(fake_.copy_to_count, 1);
-    EXPECT_EQ(fake_.device_memset_count, 1);
+    EXPECT_EQ(fake_.device_memset_count, 0);
     ASSERT_EQ(validate_runtime_impl(&runtime, &api_), 0);
     EXPECT_EQ(fake_.device_free_count, 0);
 }

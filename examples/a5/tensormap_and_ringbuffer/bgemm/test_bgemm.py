@@ -32,7 +32,11 @@ class TestBgemm(SceneTestCase):
         "orchestration": {
             "source": "kernels/orchestration/bgemm_orch.cpp",
             "function_name": "aicpu_orchestration_entry",
-            "signature": [D.IN, D.IN, D.OUT],
+            # C is a zero-initialized accumulator: the AIV tile kernel reads C
+            # from GM (TLOAD), adds the matmul result, and stores it back across
+            # GRID_K iterations. Its host-provided zeros must be staged H2D, so
+            # C is INOUT (read-before-write), not a pure OUT.
+            "signature": [D.IN, D.IN, D.INOUT],
         },
         "incores": [
             {

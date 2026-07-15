@@ -24,7 +24,11 @@ class TestBenchmarkBgemm(SceneTestCase):
         "orchestration": {
             "source": "kernels/orchestration/bgemm_orch.cpp",
             "function_name": "aicpu_orchestration_entry",
-            "signature": [D.IN, D.IN, D.OUT, D.IN],
+            # C is a zero-initialized accumulator: the AIV add kernel reads C
+            # from GM, adds the matmul result, and stores it back across grid_k
+            # iterations. Its host-provided zeros must be staged H2D, so C is
+            # INOUT (read-before-write), not a pure OUT.
+            "signature": [D.IN, D.IN, D.INOUT, D.IN],
         },
         "incores": [
             {
