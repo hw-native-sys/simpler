@@ -743,3 +743,4 @@ jobs:
           DEVICE_LIST=$(python -c "p='${DEVICE_RANGE}'.split('-'); s,e=p[0],p[-1]; print(','.join(str(i) for i in range(int(s),int(e)+1)))")
           PYTEST="python -m pytest examples tests/st --platform a5 --device ${DEVICE_RANGE} -v --clone-protocol ssh --require-pto-isa"
           task-submit --timeout 1800 --max-time 1800 --device "$DEVICE_LIST" --run "$PYTEST --pto-session-timeout 1200 --pto-isa-commit ${{ env.PTO_ISA_COMMIT }}"
+# Test CI health check
