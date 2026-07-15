@@ -1338,6 +1338,9 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
             uint64_t rel_t0 = (l2_swimlane_level_ >= L2SwimlaneLevel::SCHED_PHASES && deferred_release_count > 0) ?
                                   get_sys_cnt_aicpu() :
                                   0;
+            // Snapshot the slot count before the drain loop decrements it to 0,
+            // so the Release bar can report how many slots it drained.
+            uint32_t released_count = static_cast<uint32_t>(deferred_release_count);
 #endif
             while (deferred_release_count > 0) {
 #if SIMPLER_SCHED_PROFILING
@@ -1354,7 +1357,7 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
             if (rel_t0 != 0) {
                 l2_swimlane_aicpu_record_sched_phase(
                     thread_idx, L2SwimlaneSchedPhaseKind::Release, rel_t0, get_sys_cnt_aicpu(),
-                    l2_swimlane.sched_loop_count, /*tasks_processed=*/0
+                    l2_swimlane.sched_loop_count, released_count
                 );
             }
 #endif
