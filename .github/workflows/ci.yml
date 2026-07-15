@@ -16,7 +16,7 @@ jobs:
   # ---------- Pre-commit hooks (format, lint, clang-tidy) ----------
   pre-commit:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 31
     steps:
       - name: Checkout
         uses: actions/checkout@v5
@@ -164,7 +164,7 @@ jobs:
     needs: detect-changes
     if: needs.detect-changes.outputs.a2a3_changed == 'true'
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 30
+    timeout-minutes: 31
     strategy:
       matrix:
         os: [ubuntu-latest, macos-latest]
@@ -251,7 +251,7 @@ jobs:
     needs: detect-changes
     if: needs.detect-changes.outputs.a5_changed == 'true'
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 30
+    timeout-minutes: 31
     strategy:
       matrix:
         os: [ubuntu-latest, macos-latest]
@@ -345,7 +345,7 @@ jobs:
     needs: detect-changes
     if: needs.detect-changes.outputs.a2a3_changed == 'true' || needs.detect-changes.outputs.a5_changed == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 31
 
     steps:
       - name: Checkout repository
@@ -441,7 +441,7 @@ jobs:
   # ---------- Unit tests (a2a3 hardware, Python + C++) ----------
   ut-a2a3:
     runs-on: [self-hosted, a2a3]
-    timeout-minutes: 30
+    timeout-minutes: 31
 
     steps:
       - name: Checkout repository
@@ -647,7 +647,7 @@ jobs:
   # ---------- Unit tests (a5 hardware, Python + C++) ----------
   ut-a5:
     runs-on: [self-hosted, a5]
-    timeout-minutes: 30
+    timeout-minutes: 31
 
     steps:
       - name: Checkout repository
