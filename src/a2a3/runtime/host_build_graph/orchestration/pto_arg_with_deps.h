@@ -57,6 +57,8 @@ public:
     using L0TaskArgs::allow_early_resolve;  // speculative early-dispatch hint (getter)
     using L0TaskArgs::copy_scalars_from;
     using L0TaskArgs::set_allow_early_resolve;  // speculative early-dispatch hint (setter)
+    using L0TaskArgs::set_task_timing_slot;     // selective task-timing slot (setter)
+    using L0TaskArgs::task_timing_slot;         // selective task-timing slot (getter)
 
     // Error / status — forward to Arg
     using L0TaskArgs::error_msg;

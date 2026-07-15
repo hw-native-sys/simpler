@@ -196,10 +196,27 @@ struct PTO2TaskDescriptor {
     // Per-slot kernel IDs (INVALID_KERNEL_ID = inactive)
     int32_t kernel_id[PTO2_SUBTASK_SLOT_COUNT];
 
+    // Selective task-timing slot (TASK_TIMING_SLOT_NONE = untagged; 0..15 valid).
+    // Occupies the 4-byte alignment pad that already followed kernel_id[3], so
+    // the descriptor does not grow; the scheduler folds this task's dispatch/
+    // finish cycles into the tagged slot (see common/device_phase.h).
+    int32_t task_timing_slot;
+
     // Packed output buffer (all outputs packed into single contiguous buffer)
     void *packed_buffer_base;  // Start of packed buffer in GM Heap
     void *packed_buffer_end;   // End of packed buffer (for heap reclamation)
 };
+
+// task_timing_slot must occupy the former padding after kernel_id[3] without
+// growing the descriptor or shifting packed_buffer_base — the scheduler and
+// shared-memory ABI depend on the existing size and pointer offset.
+static_assert(sizeof(PTO2TaskDescriptor) == 40, "PTO2TaskDescriptor must not grow: slot uses the existing pad");
+static_assert(
+    offsetof(PTO2TaskDescriptor, task_timing_slot) ==
+        offsetof(PTO2TaskDescriptor, kernel_id) + sizeof(int32_t) * PTO2_SUBTASK_SLOT_COUNT,
+    "task_timing_slot must sit immediately after kernel_id in the former pad"
+);
+static_assert(offsetof(PTO2TaskDescriptor, packed_buffer_base) == 24, "packed_buffer_base offset must be unchanged");
 
 // =============================================================================
 // Per-Slot Scheduling State

@@ -90,6 +90,59 @@ inline void aicpu_phase_set_window(AicpuPhase phase, uint64_t start_cycle, uint6
     records[static_cast<int>(phase)].end_cycle = end_cycle;
 }
 
+// =============================================================================
+// Selective task-timing slots (fixed tail after the phase region)
+// =============================================================================
+//
+// The tail lives in the same published buffer at task_timing_tail_offset(), so
+// it reuses get_platform_phase_base() and the same per-thread affinity slot. A
+// tagged task's scheduler folds its dispatch/finish cycles into slot `id`;
+// untagged tasks (TASK_TIMING_SLOT_NONE) never reach these helpers — the caller
+// gates on the sentinel so the hot path stays a single cache-hot compare.
+
+/**
+ * Resolve this thread's task-timing slot array within the buffer, or nullptr if
+ * capture is disabled / the slot array is out of range.
+ */
+inline TaskTimingRecord *aicpu_task_timing_records(uint64_t buffer_base, int thread_idx) {
+    if (buffer_base == 0 || thread_idx < 0 || thread_idx >= PLATFORM_MAX_AICPU_THREADS_JUST_FOR_LAUNCH) {
+        return nullptr;
+    }
+    uint64_t tail = buffer_base + task_timing_tail_offset(PLATFORM_MAX_AICPU_THREADS_JUST_FOR_LAUNCH);
+    return reinterpret_cast<TaskTimingRecord *>(tail) + thread_idx * NUM_TASK_TIMING_SLOTS;
+}
+
+/**
+ * Fold a dispatch cycle into `slot` on `thread_idx`'s record as a min. No-op if
+ * capture is off, `slot` is out of range (0..NUM_TASK_TIMING_SLOTS-1), or
+ * `thread_idx` is out of range — an out-of-range id never writes out of bounds.
+ *
+ * The caller passes the Scheduler's own thread index (not
+ * platform_aicpu_affinity_thread_idx()): host_build_graph hands its scheduler
+ * threads a local index because the sim affinity gate leaves the affinity idx
+ * unset (-1), so resolving via affinity there would drop every write. The host
+ * reduces across all thread records with min/max, so any distinct valid index
+ * per thread yields the same result.
+ */
+inline void aicpu_task_timing_dispatch(int slot, int thread_idx) {
+    if (slot < 0 || slot >= NUM_TASK_TIMING_SLOTS) return;
+    TaskTimingRecord *records = aicpu_task_timing_records(get_platform_phase_base(), thread_idx);
+    if (records == nullptr) return;
+    uint64_t cycle = get_sys_cnt_aicpu();
+    if (cycle < records[slot].dispatch_cycle) records[slot].dispatch_cycle = cycle;
+}
+
+/** Fold a finish cycle into `slot` on `thread_idx`'s record as a max. No-op on
+ * out-of-range slot/thread_idx or when capture is off. See the dispatch variant
+ * for why the caller supplies the Scheduler's own thread index. */
+inline void aicpu_task_timing_finish(int slot, int thread_idx) {
+    if (slot < 0 || slot >= NUM_TASK_TIMING_SLOTS) return;
+    TaskTimingRecord *records = aicpu_task_timing_records(get_platform_phase_base(), thread_idx);
+    if (records == nullptr) return;
+    uint64_t cycle = get_sys_cnt_aicpu();
+    if (cycle > records[slot].finish_cycle) records[slot].finish_cycle = cycle;
+}
+
 /**
  * RAII guard: stamp `phase`'s start on construction, end on destruction. The
  * device analogue of the host `StraceScope` — but it only writes the per-thread

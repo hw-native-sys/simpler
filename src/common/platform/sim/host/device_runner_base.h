@@ -154,6 +154,10 @@ public:
     uint64_t last_device_phase_start_ns(AicpuPhase phase) const {
         return device_phase_start_ns_[static_cast<int>(phase)];
     }
+    // Per-slot task-timing dispatch/finish (ns) on the same device-clock timeline
+    // as the phases. Both 0 for an untagged or incomplete slot. `slot` is 0..15.
+    uint64_t last_task_slot_dispatch_ns(int slot) const { return task_slot_dispatch_ns_[slot]; }
+    uint64_t last_task_slot_finish_ns(int slot) const { return task_slot_finish_ns_[slot]; }
 
     void set_l2_swimlane_enabled(int level) {
         l2_swimlane_level_ = static_cast<L2SwimlaneLevel>(level);
@@ -261,6 +265,10 @@ protected:
     // Per-phase start offset (ns) from the earliest sub-phase start; see
     // last_device_phase_start_ns().
     uint64_t device_phase_start_ns_[NUM_AICPU_PHASES] = {0};
+    // Per-slot task-timing dispatch/finish (ns), offset from the same origin as
+    // the phases; see last_task_slot_dispatch_ns() / last_task_slot_finish_ns().
+    uint64_t task_slot_dispatch_ns_[NUM_TASK_TIMING_SLOTS] = {0};
+    uint64_t task_slot_finish_ns_[NUM_TASK_TIMING_SLOTS] = {0};
 
     // Chip-callable buffer pool (sim path). Keyed by FNV-1a 64-bit content
     // hash. Each entry owns a host scratch holding the ChipCallable with each

@@ -11,6 +11,7 @@
 #ifndef SCHEDULER_CONTEXT_H
 #define SCHEDULER_CONTEXT_H
 
+#include "aicpu/device_phase_aicpu.h"
 #include "aicpu/platform_regs.h"
 #include "common/l2_swimlane_profiling.h"
 #include "common/unified_log.h"
@@ -239,6 +240,8 @@ private:
         uint32_t reg_task_id;
         int32_t core_offset;
         uint64_t *dispatch_timestamp_slot;
+        int32_t task_timing_slot;  // TASK_TIMING_SLOT_NONE unless the task is tagged
+        int32_t thread_idx;        // publishing Scheduler thread, for the task-timing record
     };
 
     PublishHandle prepare_subtask_to_core(
@@ -249,6 +252,12 @@ private:
     inline void publish_subtask_to_core(const PublishHandle &h, uint64_t dispatch_ts) {
         if (h.dispatch_timestamp_slot != nullptr) {
             *h.dispatch_timestamp_slot = dispatch_ts;
+        }
+        // Task-timing dispatch: earliest DATA_MAIN_BASE publication for a tagged
+        // task, folded as min. Untagged tasks pay only this cache-hot compare and
+        // never read the sys counter. Independent of L2 swimlane level.
+        if (h.task_timing_slot != TASK_TIMING_SLOT_NONE) {
+            aicpu_task_timing_dispatch(h.task_timing_slot, h.thread_idx);
         }
         write_reg(h.reg_addr, RegId::DATA_MAIN_BASE, static_cast<uint64_t>(h.reg_task_id));
     }

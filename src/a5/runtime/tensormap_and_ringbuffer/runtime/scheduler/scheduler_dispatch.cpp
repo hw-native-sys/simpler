@@ -14,6 +14,7 @@
 #include <cinttypes>
 #include <limits>
 
+#include "aicpu/device_phase_aicpu.h"
 #include "common.h"  // debug_assert
 #include "common/unified_log.h"
 #include "aicpu/aicpu_device_config.h"
@@ -199,6 +200,13 @@ void SchedulerContext::dispatch_subtask_to_core(
         }
     }
 #endif
+
+    // Task-timing dispatch: earliest DATA_MAIN_BASE publication for a tagged
+    // task, folded as min. Untagged tasks pay only this cache-hot compare and
+    // never read the sys counter. Independent of L2 swimlane level.
+    if (slot_state.task->task_timing_slot != TASK_TIMING_SLOT_NONE) {
+        aicpu_task_timing_dispatch(slot_state.task->task_timing_slot, thread_idx);
+    }
 
     write_reg(core_exec_state.reg_addr, RegId::DATA_MAIN_BASE, static_cast<uint64_t>(reg_task_id));
     tracker.set_pending_occupied(core_offset);

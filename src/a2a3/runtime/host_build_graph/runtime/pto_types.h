@@ -37,6 +37,7 @@
 #endif
 
 #include "aicpu/dump_arg_selection.h"
+#include "common/device_phase.h"
 #include "data_type.h"
 #include "profiling_config.h"
 #include "pto_submit_types.h"
@@ -231,6 +232,20 @@ struct Arg : TaskArgsTpl<TensorRef, uint64_t, MaxT, MaxS, TensorArgType> {
     void set_allow_early_resolve(bool v = true) { allow_early_resolve_ = v; }
     bool allow_early_resolve() const { return allow_early_resolve_; }
 
+    // Selective task-timing slot: tag this task to have the scheduler record its
+    // AICPU dispatch/finish cycles into fixed slot `slot` (0..15). Untagged by
+    // default. An out-of-range id fails through the standard invalid-arg path so
+    // the scheduler never stamps out of bounds.
+    int32_t task_timing_slot_{TASK_TIMING_SLOT_NONE};
+    void set_task_timing_slot(int32_t slot) {
+        if (slot < 0 || slot >= NUM_TASK_TIMING_SLOTS) {
+            set_error("task_timing_slot out of range (valid: 0..15)");
+            return;
+        }
+        task_timing_slot_ = slot;
+    }
+    int32_t task_timing_slot() const { return task_timing_slot_; }
+
     void clear() {
         Base::clear();
 #if SIMPLER_DFX
@@ -239,6 +254,7 @@ struct Arg : TaskArgsTpl<TensorRef, uint64_t, MaxT, MaxS, TensorArgType> {
         explicit_deps_ = nullptr;
         explicit_dep_count_ = 0;
         allow_early_resolve_ = false;
+        task_timing_slot_ = TASK_TIMING_SLOT_NONE;
     }
 
     void reset() {

@@ -127,6 +127,18 @@ instead (see Related docs).
 - **`Worker.run` returns `None`** — timing is never a return value; it is only
   ever read from the markers.
 
+## 4b. Measuring one task's dispatch→finish without the swimlane
+
+When you only need the dispatch→finish window of a specific task (or the
+interval between two tasks) and not a full timeline, tag the task with
+`L0TaskArgs::set_task_timing_slot(0..15)`. The Scheduler folds that task's AICPU
+dispatch/finish (same points as the swimlane's `finish_time`) into one of 16
+fixed slots and the host emits `…device_wall.task_slot_<N>` `[STRACE]` spans —
+with the L2 swimlane **off**, no collector threads, and in `SIMPLER_DFX=0`
+builds. Reuse one slot across tasks for a merged window, or distinct slots to
+recover `finish(B) − dispatch(A)`. Full semantics in
+[device-phases.md](device-phases.md#selective-task-timing-slots-implemented).
+
 ## 5. Related docs
 
 - [host-trace.md](host-trace.md) — the `[STRACE]` marker grammar and the host /

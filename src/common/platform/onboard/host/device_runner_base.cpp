@@ -1189,8 +1189,12 @@ void DeviceRunnerBase::ensure_device_wall_buffer() {
     // buffer is allocated once (lazy) but RESET every run so a stale prior run
     // cannot leak into the reduction.
     constexpr int kThreads = PLATFORM_MAX_AICPU_THREADS_JUST_FOR_LAUNCH;
-    constexpr int kRecords = kThreads * NUM_AICPU_PHASES;
-    constexpr size_t kBytes = static_cast<size_t>(kRecords) * sizeof(AicpuPhaseRecord);
+    // Phase region followed by the task-timing tail. Both records are 16 bytes and
+    // share the {kPhaseUnset, 0} reset, so one AicpuPhaseRecord init array covers
+    // both; the AICPU SO resolves the tail at base + task_timing_tail_offset().
+    static_assert(sizeof(AicpuPhaseRecord) == sizeof(TaskTimingRecord), "phase/tail records must share size");
+    constexpr int kRecords = kThreads * NUM_AICPU_PHASES + task_timing_buffer_slots(kThreads);
+    constexpr size_t kBytes = device_phase_buffer_bytes(kThreads);
     if (device_wall_dev_ptr_ == nullptr) {
         device_wall_dev_ptr_ = allocate_tensor(kBytes);
         if (device_wall_dev_ptr_ != nullptr) {
@@ -1200,8 +1204,8 @@ void DeviceRunnerBase::ensure_device_wall_buffer() {
     if (device_wall_dev_ptr_ != nullptr) {
         AicpuPhaseRecord init[kRecords];
         for (int i = 0; i < kRecords; ++i) {
-            init[i].start_cycle = kPhaseUnset;  // start: sentinel so min()/unset-check ignore unused slots
-            init[i].end_cycle = 0;              // end: 0 so max() ignores unused slots
+            init[i].start_cycle = kPhaseUnset;  // start/dispatch: sentinel so min()/unset-check ignore unused slots
+            init[i].end_cycle = 0;              // end/finish: 0 so max() ignores unused slots
         }
         if (copy_to_device(device_wall_dev_ptr_, init, sizeof(init)) != 0) {
             // Reset failed — disable capture for this run so stale slot data
@@ -1318,6 +1322,10 @@ void DeviceRunnerBase::read_device_wall_ns() {
         device_phase_ns_[p] = 0;
         device_phase_start_ns_[p] = 0;
     }
+    for (int s = 0; s < NUM_TASK_TIMING_SLOTS; ++s) {
+        task_slot_dispatch_ns_[s] = 0;
+        task_slot_finish_ns_[s] = 0;
+    }
     if (device_wall_dev_ptr_ == nullptr) return;
 
     constexpr int kThreads = PLATFORM_MAX_AICPU_THREADS_JUST_FOR_LAUNCH;
@@ -1353,6 +1361,26 @@ void DeviceRunnerBase::read_device_wall_ns() {
         }
     }
     device_wall_ns_ = device_phase_ns_[static_cast<int>(AicpuPhase::RunWall)];
+
+    // Task-timing tail: D2H the per-slot records that follow the phase region,
+    // then resolve them on the phase `origin` timeline (shared logic in
+    // device_phase.h). Platform-specific here: the rtMemcpy and the cycle→ns
+    // conversion (real-silicon sys-counter frequency).
+    constexpr int kTailRecords = task_timing_buffer_slots(kThreads);
+    TaskTimingRecord tail[kTailRecords] = {};
+    const void *tail_src = reinterpret_cast<const uint8_t *>(device_wall_dev_ptr_) + task_timing_tail_offset(kThreads);
+    int tail_rc = rtMemcpy(tail, sizeof(tail), tail_src, sizeof(tail), RT_MEMCPY_DEVICE_TO_HOST);
+    if (tail_rc != 0) {
+        LOG_WARN("rtMemcpy(task_timing) D2H failed: %d", tail_rc);
+        return;
+    }
+    resolve_task_timing_slots_ns(
+        tail, kThreads, origin,
+        [](uint64_t cyc) {
+            return static_cast<uint64_t>(cycles_to_us(cyc) * 1000.0);
+        },
+        task_slot_dispatch_ns_, task_slot_finish_ns_
+    );
 }
 
 int DeviceRunnerBase::init_runtime_args_with_metadata(Runtime &runtime) {

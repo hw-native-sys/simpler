@@ -12,6 +12,7 @@
 
 #include "common/unified_log.h"
 #include "aicpu/device_time.h"
+#include "aicpu/device_phase_aicpu.h"
 #include "aicpu/platform_regs.h"
 #include "common/l2_swimlane_profiling.h"
 #include "common/memory_barrier.h"
@@ -288,6 +289,17 @@ void SchedulerContext::check_running_cores_for_completion(
             finish_ts = get_sys_cnt_aicpu();
         }
 #endif
+
+        // Task-timing finish: latest FIN observation for a tagged task, folded as
+        // max at the same point L2 captures finish_time (after rmb, before fanin/
+        // deferred-completion work). Independent of L2 swimlane level so it works
+        // in SIMPLER_DFX=0 builds; untagged tasks pay only the cache-hot compare.
+        if (t.pending_done && core.pending_slot_state->task->task_timing_slot != TASK_TIMING_SLOT_NONE) {
+            aicpu_task_timing_finish(core.pending_slot_state->task->task_timing_slot, thread_idx);
+        }
+        if (t.running_done && core.running_slot_state->task->task_timing_slot != TASK_TIMING_SLOT_NONE) {
+            aicpu_task_timing_finish(core.running_slot_state->task->task_timing_slot, thread_idx);
+        }
 
         // --- Apply phase: execute actions based on transition ---
 

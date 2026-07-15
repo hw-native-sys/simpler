@@ -486,6 +486,31 @@ static void emit_device_phase_markers(SimDeviceRunnerBase *runner) {
             );
         }
     }
+
+    // Selective task-timing slots: one span per complete slot, start = dispatch
+    // and duration = finish - dispatch, both on the phase timeline so cross-slot
+    // intervals (e.g. finish(slot_1) - dispatch(slot_0)) stay recoverable.
+    // Untagged / incomplete slots read back 0/0 and are skipped.
+    static const char *const kTaskSlotNames[NUM_TASK_TIMING_SLOTS] = {
+        "simpler_run.runner_run.device_wall.task_slot_0",  "simpler_run.runner_run.device_wall.task_slot_1",
+        "simpler_run.runner_run.device_wall.task_slot_2",  "simpler_run.runner_run.device_wall.task_slot_3",
+        "simpler_run.runner_run.device_wall.task_slot_4",  "simpler_run.runner_run.device_wall.task_slot_5",
+        "simpler_run.runner_run.device_wall.task_slot_6",  "simpler_run.runner_run.device_wall.task_slot_7",
+        "simpler_run.runner_run.device_wall.task_slot_8",  "simpler_run.runner_run.device_wall.task_slot_9",
+        "simpler_run.runner_run.device_wall.task_slot_10", "simpler_run.runner_run.device_wall.task_slot_11",
+        "simpler_run.runner_run.device_wall.task_slot_12", "simpler_run.runner_run.device_wall.task_slot_13",
+        "simpler_run.runner_run.device_wall.task_slot_14", "simpler_run.runner_run.device_wall.task_slot_15",
+    };
+    for (int s = 0; s < NUM_TASK_TIMING_SLOTS; ++s) {
+        const uint64_t dispatch_ns = runner->last_task_slot_dispatch_ns(s);
+        const uint64_t finish_ns = runner->last_task_slot_finish_ns(s);
+        if (finish_ns > dispatch_ns) {
+            STRACE_DEV_SPAN_AT(
+                kTaskSlotNames[s], static_cast<long long>(dispatch_ns), static_cast<long long>(finish_ns - dispatch_ns),
+                3
+            );
+        }
+    }
 }
 
 int simpler_run(

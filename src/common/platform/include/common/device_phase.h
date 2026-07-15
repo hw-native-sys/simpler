@@ -35,6 +35,7 @@
 #ifndef PLATFORM_COMMON_DEVICE_PHASE_H_
 #define PLATFORM_COMMON_DEVICE_PHASE_H_
 
+#include <cstddef>
 #include <cstdint>
 
 // Fixed AICPU run phases. Each fires once per run per thread. RunWall (slot 0)
@@ -97,6 +98,115 @@ reduce_aicpu_phase_windows(const AicpuPhaseRecord *buf, int threads, uint64_t *o
         const bool valid = (min_start != kPhaseUnset && max_end > min_start);
         out_start[p] = valid ? min_start : kPhaseUnset;
         out_span[p] = valid ? (max_end - min_start) : 0;
+    }
+}
+
+// =============================================================================
+// Selective task-timing slots
+// =============================================================================
+//
+// A fixed tail appended after the AicpuPhaseRecord region in the SAME device
+// buffer (same base pointer, same per-run H2D reset and post-sync D2H copy).
+// Orchestration tags selected tasks with a slot id 0..NUM_TASK_TIMING_SLOTS-1;
+// the scheduler folds each tagged task's AICPU dispatch/finish cycles into that
+// slot. Unlike AicpuPhase (one {start,end} per run per thread), a slot receives
+// min(dispatch)/max(finish) across every tagged task and block/subtask on a
+// thread, so tail records are a distinct type reduced by min/max, not by the
+// phase window reducer above.
+
+constexpr int NUM_TASK_TIMING_SLOTS = 16;
+
+// A slot untagged on a task descriptor. Valid slot ids are 0..15; anything else
+// is rejected on the invalid-argument path and never stamps a record.
+constexpr int32_t TASK_TIMING_SLOT_NONE = -1;
+
+// One slot in raw sys-counter cycles. dispatch_cycle == kPhaseUnset marks a
+// slot no thread dispatched this run; finish_cycle == 0 marks one no thread
+// observed finished. A complete slot has dispatch != kPhaseUnset && finish >
+// dispatch; incomplete slots are skipped on readback.
+struct TaskTimingRecord {
+    uint64_t dispatch_cycle;  // min across tagged dispatches
+    uint64_t finish_cycle;    // max across tagged finishes
+};
+
+static_assert(sizeof(TaskTimingRecord) == 16, "TaskTimingRecord layout must stay 16 bytes for the fixed tail");
+
+// Task-timing tail is thread-major, same as the phase region: thread t occupies
+// records [t*NUM_TASK_TIMING_SLOTS, (t+1)*N).
+constexpr int task_timing_buffer_slots(int max_threads) { return max_threads * NUM_TASK_TIMING_SLOTS; }
+
+// Byte offset of the task-timing tail from the device buffer base: it sits
+// immediately after the AicpuPhaseRecord region sized for `max_threads`.
+constexpr size_t task_timing_tail_offset(int max_threads) {
+    return static_cast<size_t>(aicpu_phase_buffer_slots(max_threads)) * sizeof(AicpuPhaseRecord);
+}
+
+// Total device buffer bytes: phase region + task-timing tail, both sized for
+// `max_threads` AICPU threads.
+constexpr size_t device_phase_buffer_bytes(int max_threads) {
+    return task_timing_tail_offset(max_threads) +
+           static_cast<size_t>(task_timing_buffer_slots(max_threads)) * sizeof(TaskTimingRecord);
+}
+
+// Reduce a thread-major task-timing tail: for each slot, report the reduced
+// `min(dispatch)` (kPhaseUnset when no thread dispatched it) and `max(finish)`
+// (0 when none finished). Only threads with a complete slot (dispatch !=
+// kPhaseUnset && finish > dispatch) contribute, so a slot that was dispatched
+// but never observed finished (short/failed run) does not surface a bogus span.
+// `out_dispatch` and `out_finish` each hold NUM_TASK_TIMING_SLOTS entries.
+inline void
+reduce_task_timing_slots(const TaskTimingRecord *buf, int threads, uint64_t *out_dispatch, uint64_t *out_finish) {
+    for (int s = 0; s < NUM_TASK_TIMING_SLOTS; ++s) {
+        uint64_t min_dispatch = kPhaseUnset;
+        uint64_t max_finish = 0;
+        for (int t = 0; t < threads; ++t) {
+            const TaskTimingRecord &r = buf[t * NUM_TASK_TIMING_SLOTS + s];
+            if (r.dispatch_cycle != kPhaseUnset && r.finish_cycle > r.dispatch_cycle) {
+                if (r.dispatch_cycle < min_dispatch) min_dispatch = r.dispatch_cycle;
+                if (r.finish_cycle > max_finish) max_finish = r.finish_cycle;
+            }
+        }
+        const bool valid = (min_dispatch != kPhaseUnset && max_finish > min_dispatch);
+        out_dispatch[s] = valid ? min_dispatch : kPhaseUnset;
+        out_finish[s] = valid ? max_finish : 0;
+    }
+}
+
+// Resolve a task-timing tail into per-slot dispatch/finish ns on a shared
+// timeline (the platform-independent half of the host readback; the D2H copy
+// and the cycle→ns conversion stay platform-side). Steps: reduce across threads,
+// pick a timeline origin, and convert the surviving slots.
+//
+// `phase_origin` anchors slots to the phase timeline so slots and phases are
+// comparable; when it is kPhaseUnset — no sub-phase was stamped, e.g.
+// host_build_graph runs orchestration on the host and the device stamps no
+// orch/sched phases — the earliest tagged dispatch becomes the origin so tagged
+// slots are still emitted on a self-consistent timeline. `cyc_to_ns` converts a
+// raw cycle delta to ns using the platform sys-counter frequency. Untagged or
+// incomplete slots (no dispatch, or finish <= dispatch) yield 0/0. `out_*` each
+// hold NUM_TASK_TIMING_SLOTS entries.
+inline void resolve_task_timing_slots_ns(
+    const TaskTimingRecord *tail, int threads, uint64_t phase_origin, uint64_t (*cyc_to_ns)(uint64_t),
+    uint64_t *out_dispatch_ns, uint64_t *out_finish_ns
+) {
+    uint64_t slot_dispatch[NUM_TASK_TIMING_SLOTS];
+    uint64_t slot_finish[NUM_TASK_TIMING_SLOTS];
+    reduce_task_timing_slots(tail, threads, slot_dispatch, slot_finish);
+
+    uint64_t origin = phase_origin;
+    if (origin == kPhaseUnset) {
+        for (int s = 0; s < NUM_TASK_TIMING_SLOTS; ++s) {
+            if (slot_dispatch[s] != kPhaseUnset && slot_dispatch[s] < origin) origin = slot_dispatch[s];
+        }
+    }
+    for (int s = 0; s < NUM_TASK_TIMING_SLOTS; ++s) {
+        out_dispatch_ns[s] = 0;
+        out_finish_ns[s] = 0;
+        if (slot_dispatch[s] != kPhaseUnset && slot_finish[s] > slot_dispatch[s] && origin != kPhaseUnset &&
+            slot_dispatch[s] >= origin) {
+            out_dispatch_ns[s] = cyc_to_ns(slot_dispatch[s] - origin);
+            out_finish_ns[s] = cyc_to_ns(slot_finish[s] - origin);
+        }
     }
 }
 

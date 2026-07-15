@@ -255,6 +255,13 @@ public:
     }
 
     /**
+     * Per-slot task-timing dispatch/finish (ns) on the same device-clock timeline
+     * as the phases. Both 0 for an untagged or incomplete slot. `slot` is 0..15.
+     */
+    uint64_t last_task_slot_dispatch_ns(int slot) const { return task_slot_dispatch_ns_[slot]; }
+    uint64_t last_task_slot_finish_ns(int slot) const { return task_slot_finish_ns_[slot]; }
+
+    /**
      * Upload an entire ChipCallable buffer to device memory in one shot.
      * Walks child_offsets_ to compute total byte size, allocates device
      * GM once, fixes up each child's resolved_addr_ in an internal host
@@ -891,6 +898,10 @@ protected:
     // Per-phase start offset (ns) from the earliest sub-phase start; see
     // last_device_phase_start_ns(). Populated alongside device_phase_ns_.
     uint64_t device_phase_start_ns_[NUM_AICPU_PHASES] = {0};
+    // Per-slot task-timing dispatch/finish (ns), offset from the same origin as
+    // the phases; see last_task_slot_dispatch_ns() / last_task_slot_finish_ns().
+    uint64_t task_slot_dispatch_ns_[NUM_TASK_TIMING_SLOTS] = {0};
+    uint64_t task_slot_finish_ns_[NUM_TASK_TIMING_SLOTS] = {0};
 
     // True after AICPU SO loaded; reset by the subclass's `finalize()`.
     bool binaries_loaded_{false};

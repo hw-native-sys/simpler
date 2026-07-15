@@ -232,7 +232,8 @@ SchedulerContext::PublishHandle SchedulerContext::prepare_subtask_to_core(
     }
 #endif
 
-    return PublishHandle{core_exec_state.reg_addr, reg_task_id, core_offset, dispatch_timestamp_slot};
+    return PublishHandle{core_exec_state.reg_addr,          reg_task_id, core_offset, dispatch_timestamp_slot,
+                         slot_state.task->task_timing_slot, thread_idx};
 }
 
 int SchedulerContext::prepare_block_for_dispatch(

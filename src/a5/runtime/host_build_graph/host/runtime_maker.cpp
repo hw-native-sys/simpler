@@ -149,6 +149,10 @@ void runtime_add_successor(OrchestrationRuntime *runtime, int from_task, int to_
     unwrap_runtime(runtime)->add_successor(from_task, to_task);
 }
 
+void runtime_set_task_timing_slot(OrchestrationRuntime *runtime, int task_id, int32_t slot) {
+    unwrap_runtime(runtime)->set_task_timing_slot(task_id, slot);
+}
+
 void runtime_record_tensor_pair(OrchestrationRuntime *runtime, void *host_ptr, void *dev_ptr, size_t size) {
     unwrap_runtime(runtime)->tensor_pairs_.push_back({host_ptr, dev_ptr, size});
 }
@@ -175,7 +179,7 @@ int runtime_copy_to_device(OrchestrationRuntime *runtime, void *dev_ptr, const v
 const OrchestrationRuntimeOps k_orchestration_runtime_ops = {
     runtime_add_task,       runtime_set_tensor_info_to_task, runtime_add_successor, runtime_record_tensor_pair,
     runtime_get_task_count, runtime_print_runtime,           runtime_device_malloc, runtime_device_free,
-    runtime_copy_to_device,
+    runtime_copy_to_device, runtime_set_task_timing_slot,
 };
 
 bool write_all_bytes(int fd, const uint8_t *data, size_t size) {

@@ -39,6 +39,7 @@
 #include <vector>
 
 #include "common/core_type.h"
+#include "common/device_phase.h"
 #include "common/host_api.h"
 #include "common/platform_config.h"
 #include "aicpu/platform_aicpu_affinity.h"  // MAX_GATE_THREADS (aicpu_allowed_cpus bound)
@@ -164,6 +165,11 @@ typedef struct {
     // DFX-specific fields
     uint64_t start_time;  // Start time of the task
     uint64_t end_time;    // End time of the task
+
+    // Selective task-timing slot (TASK_TIMING_SLOT_NONE = untagged; 0..15 valid).
+    // Set post-submit via set_task_timing_slot(); the AICPU folds this task's
+    // dispatch/finish cycles into the tagged slot (see common/device_phase.h).
+    int32_t task_timing_slot;
 } Task;
 
 // =============================================================================
@@ -299,6 +305,10 @@ public:
      * @return Task ID (>= 0) on success, -1 on failure
      */
     int add_task(uint64_t *args, int num_args, int func_id, CoreType core_type = CoreType::AIC);
+
+    // Tag an already-submitted task with a timing slot (0..15). Out-of-range
+    // task/slot ids are rejected. See common/device_phase.h.
+    void set_task_timing_slot(int task_id, int32_t slot);
 
     /**
      * Add a dependency edge: from_task -> to_task

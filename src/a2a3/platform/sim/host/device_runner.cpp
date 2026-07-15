@@ -492,9 +492,15 @@ int DeviceRunner::run(Runtime &runtime, const CallConfig &config) {
         *reinterpret_cast<uint64_t *>(kernel_args_.device_wall_data_base) = 0;
     }
     constexpr int kPhaseThreads = PLATFORM_MAX_AICPU_THREADS_JUST_FOR_LAUNCH;
-    std::vector<AicpuPhaseRecord> phase_buf(
-        static_cast<size_t>(kPhaseThreads) * NUM_AICPU_PHASES, AicpuPhaseRecord{kPhaseUnset, 0}
-    );
+    constexpr size_t kPhaseRecs = static_cast<size_t>(kPhaseThreads) * NUM_AICPU_PHASES;
+    constexpr size_t kTailRecs = static_cast<size_t>(task_timing_buffer_slots(kPhaseThreads));
+    // One 16-byte-record vector backs the phase region plus the task-timing tail
+    // (both records are 16 bytes; {kPhaseUnset, 0} initializes an AicpuPhaseRecord
+    // start/end and a TaskTimingRecord dispatch/finish identically). The AICPU SO
+    // resolves the tail at base + task_timing_tail_offset(), so it must be part of
+    // the same published buffer.
+    static_assert(sizeof(AicpuPhaseRecord) == sizeof(TaskTimingRecord), "phase/tail records must share size");
+    std::vector<AicpuPhaseRecord> phase_buf(kPhaseRecs + kTailRecs, AicpuPhaseRecord{kPhaseUnset, 0});
     set_platform_phase_base_func_(reinterpret_cast<uint64_t>(phase_buf.data()));
     const auto sim_t0 = std::chrono::steady_clock::now();
 
@@ -568,6 +574,12 @@ int DeviceRunner::run(Runtime &runtime, const CallConfig &config) {
         }
     }
     device_phase_ns_[static_cast<int>(AicpuPhase::RunWall)] = device_wall_ns_;
+
+    // Resolve the task-timing tail on the phase `origin` timeline (shared logic
+    // in device_phase.h). Sim-specific here: the tail lives inline in phase_buf
+    // (in-process, no D2H) and `cyc_to_ns` uses the sim sys-counter frequency.
+    const TaskTimingRecord *tail = reinterpret_cast<const TaskTimingRecord *>(phase_buf.data() + kPhaseRecs);
+    resolve_task_timing_slots_ns(tail, kPhaseThreads, origin, cyc_to_ns, task_slot_dispatch_ns_, task_slot_finish_ns_);
 
     int runtime_rc = aicpu_rc.load(std::memory_order_acquire);
     if (runtime_rc != 0) {

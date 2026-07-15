@@ -623,6 +623,7 @@ set_tests_properties(test_orch_so_file PROPERTIES LABELS "no_hardware")
 # A2A3 tests (src/a2a3/runtime/tensormap_and_ringbuffer/)
 # ---------------------------------------------------------------------------
 add_a2a3_test(test_a2a3_fatal a2a3/test_a2a3_fatal.cpp)
+add_a2a3_test(test_task_timing_slots a2a3/test_task_timing_slots.cpp)
 
 # PTO2 runtime-linked tests
 add_a2a3_runtime_test(test_task_allocator   a2a3/test_task_allocator.cpp)

@@ -61,6 +61,8 @@ public:
     using L0TaskArgs::has_error;
     using L0TaskArgs::launch_spec;
     using L0TaskArgs::set_error;
+    using L0TaskArgs::set_task_timing_slot;  // selective task-timing slot (setter)
+    using L0TaskArgs::task_timing_slot;      // selective task-timing slot (getter)
 
     // NOT exposed: set_dependencies, explicit_dep_count, explicit_dep,
     // explicit_deps_data — these are the primitive-layer dep API. Users of

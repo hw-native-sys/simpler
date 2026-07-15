@@ -46,6 +46,13 @@ typedef struct OrchestrationRuntimeOps {
     void *(*device_malloc)(OrchestrationRuntime *runtime, size_t size);
     void (*device_free)(OrchestrationRuntime *runtime, void *ptr);
     int (*copy_to_device)(OrchestrationRuntime *runtime, void *dev_ptr, const void *host_ptr, size_t size);
+    // Tag an already-submitted task with a selective task-timing slot (0..15) so
+    // the AICPU records its dispatch/finish; the legacy-runtime equivalent of
+    // RT2's L0TaskArgs::set_task_timing_slot (issue #1325). Appended at the struct
+    // tail to preserve the offsets of the pre-existing ops: an orchestration built
+    // before this feature keeps a valid layout, and this slot reads back null so
+    // callers null-check it.
+    void (*set_task_timing_slot)(OrchestrationRuntime *runtime, int task_id, int32_t slot);
 } OrchestrationRuntimeOps;
 
 struct OrchestrationRuntime {
@@ -60,6 +67,14 @@ add_task(OrchestrationRuntime *runtime, uint64_t *args, int num_args, int func_i
 static inline int
 set_tensor_info_to_task(OrchestrationRuntime *runtime, int task_id, const TensorInfo *tensor_info, int tensor_count) {
     return runtime->ops->set_tensor_info_to_task(runtime, task_id, tensor_info, tensor_count);
+}
+
+// Tag task `task_id` with timing slot `slot` (0..15). No-op if the runtime
+// predates the feature (null op pointer).
+static inline void set_task_timing_slot(OrchestrationRuntime *runtime, int task_id, int32_t slot) {
+    if (runtime->ops->set_task_timing_slot != nullptr) {
+        runtime->ops->set_task_timing_slot(runtime, task_id, slot);
+    }
 }
 
 static inline int add_task_with_tensor_info(

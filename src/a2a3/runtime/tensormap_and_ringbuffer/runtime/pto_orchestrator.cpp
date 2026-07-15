@@ -923,6 +923,7 @@ static TaskOutputTensors submit_task_common(
     task.kernel_id[static_cast<int>(PTO2SubtaskSlot::AIC)] = aic_kernel_id;
     task.kernel_id[static_cast<int>(PTO2SubtaskSlot::AIV0)] = aiv0_kernel_id;
     task.kernel_id[static_cast<int>(PTO2SubtaskSlot::AIV1)] = aiv1_kernel_id;
+    task.task_timing_slot = args.task_timing_slot();
     task.packed_buffer_base = prepared.alloc_result.packed_base;
     task.packed_buffer_end = prepared.alloc_result.packed_end;
 
@@ -1181,6 +1182,9 @@ TaskOutputTensors PTO2OrchestratorState::alloc_tensors(const L0TaskArgs &args) {
     task.kernel_id[static_cast<int>(PTO2SubtaskSlot::AIC)] = INVALID_KERNEL_ID;
     task.kernel_id[static_cast<int>(PTO2SubtaskSlot::AIV0)] = INVALID_KERNEL_ID;
     task.kernel_id[static_cast<int>(PTO2SubtaskSlot::AIV1)] = INVALID_KERNEL_ID;
+    // alloc_tensors builds a kernel-less descriptor that never dispatches; keep
+    // the slot untagged so a recycled ring slot cannot leak a stale tag.
+    task.task_timing_slot = TASK_TIMING_SLOT_NONE;
     task.packed_buffer_base = prepared.alloc_result.packed_base;
     task.packed_buffer_end = prepared.alloc_result.packed_end;
 

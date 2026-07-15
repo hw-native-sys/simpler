@@ -94,8 +94,21 @@ int Runtime::add_task(uint64_t *args, int num_args, int func_id, CoreType core_t
     task->fanin = 0;
     task->fanout_count = 0;
     memset(task->fanout, 0, sizeof(task->fanout));
+    task->task_timing_slot = TASK_TIMING_SLOT_NONE;  // untagged until set_task_timing_slot()
 
     return task_id;
+}
+
+void Runtime::set_task_timing_slot(int task_id, int32_t slot) {
+    if (task_id < 0 || task_id >= next_task_id) {
+        LOG_ERROR("[Runtime] set_task_timing_slot: invalid task ID %d", task_id);
+        return;
+    }
+    if (slot < 0 || slot >= NUM_TASK_TIMING_SLOTS) {
+        LOG_ERROR("[Runtime] set_task_timing_slot: slot %d out of range (valid: 0..15)", slot);
+        return;
+    }
+    tasks[task_id].task_timing_slot = slot;
 }
 
 void Runtime::add_successor(int from_task, int to_task) {

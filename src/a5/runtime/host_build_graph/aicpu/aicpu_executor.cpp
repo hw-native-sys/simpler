@@ -15,6 +15,7 @@
 #include <mutex>
 
 #include "aicpu/device_log.h"
+#include "aicpu/device_phase_aicpu.h"
 #include "aicpu/device_time.h"
 #include "aicpu/l2_swimlane_collector_aicpu.h"
 #include "aicpu/pmu_collector_aicpu.h"
@@ -302,6 +303,14 @@ inline bool AicpuExecutor::try_dispatch_task(
     // immediately before the DATA_MAIN_BASE write.
     if (l2_swimlane_enabled && get_l2_swimlane_level() >= L2SwimlaneLevel::AICPU_TIMING) {
         dispatch_timestamps_[core_id] = get_sys_cnt_aicpu();
+    }
+
+    // Task-timing dispatch: earliest DATA_MAIN_BASE publication for a tagged
+    // task, folded as min. Untagged tasks pay only this cache-hot compare and
+    // never read the sys counter. Independent of L2 swimlane level.
+    if (Task *timed = runtime_->get_task(task_id);
+        timed != nullptr && timed->task_timing_slot != TASK_TIMING_SLOT_NONE) {
+        aicpu_task_timing_dispatch(timed->task_timing_slot, thread_idx);
     }
 
     write_reg(reg_addr, RegId::DATA_MAIN_BASE, static_cast<uint64_t>(task_id));
@@ -674,6 +683,17 @@ int AicpuExecutor::shutdown_aicore(Runtime *runtime, int thread_idx, const int *
 /**
  * Resolve dependencies and dispatch tasks using fast-path scheduling
  */
+// Task-timing finish: fold a completed task's FIN observation into its slot as
+// max. No-op for untagged tasks / invalid ids. Called at each completion point
+// (independent of L2 swimlane, so it works in SIMPLER_DFX=0 builds).
+static inline void fold_task_finish(Runtime &runtime, int task_id, int thread_idx) {
+    if (task_id == AICPU_TASK_INVALID) return;
+    Task *t = runtime.get_task(task_id);
+    if (t != nullptr && t->task_timing_slot != TASK_TIMING_SLOT_NONE) {
+        aicpu_task_timing_finish(t->task_timing_slot, thread_idx);
+    }
+}
+
 int AicpuExecutor::resolve_and_dispatch(Runtime &runtime, int thread_idx, const int *cur_thread_cores, int core_num) {
     Handshake *hank = reinterpret_cast<Handshake *>(runtime.workers);
 
@@ -746,6 +766,14 @@ int AicpuExecutor::resolve_and_dispatch(Runtime &runtime, int thread_idx, const 
 
                 int completed_task_id = pending_task_ids_[core_id];
                 int prev_running_id = running_task_ids_[core_id];
+
+                // Both the pending task (FIN observed here) and the running task
+                // (implicitly done — AICore overwrote COND before its FIN) complete.
+                // Fold the implicitly-done running task first: it finished earlier, so
+                // it must take the earlier sys-cycle stamp (fold_task_finish reads the
+                // counter at call time and folds as max).
+                fold_task_finish(runtime, prev_running_id, thread_idx);
+                fold_task_finish(runtime, completed_task_id, thread_idx);
 
                 // Profiling: when prev_running_id exists, its AICore timing was
                 // written to wip[id & 1] first, so complete it BEFORE the
@@ -843,6 +871,10 @@ int AicpuExecutor::resolve_and_dispatch(Runtime &runtime, int thread_idx, const 
 
                 int prev_running_id = running_task_ids_[core_id];
 
+                // The ACK promotes pending to running; the old running task is
+                // implicitly complete.
+                fold_task_finish(runtime, prev_running_id, thread_idx);
+
                 // Move pending to running
                 running_task_ids_[core_id] = pending_task_ids_[core_id];
                 pending_task_ids_[core_id] = AICPU_TASK_INVALID;
@@ -894,6 +926,9 @@ int AicpuExecutor::resolve_and_dispatch(Runtime &runtime, int thread_idx, const 
                 );
 
                 int completed_task_id = running_task_ids_[core_id];
+
+                // Running task FIN observed here.
+                fold_task_finish(runtime, completed_task_id, thread_idx);
 
                 if (l2_swimlane_enabled) {
                     uint64_t finish_ts = (l2_swimlane_level >= L2SwimlaneLevel::AICPU_TIMING) ? get_sys_cnt_aicpu() : 0;
