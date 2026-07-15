@@ -15,6 +15,8 @@
 
 namespace aicpu_cache_maintenance {
 
+#if defined(__aarch64__)
+
 void invalidate_range_impl(const void *addr, size_t size) {
     if (size == 0) {
         return;
@@ -42,5 +44,17 @@ void flush_range_impl(const void *addr, size_t size) {
     __asm__ __volatile__("dsb sy" ::: "memory");
     __asm__ __volatile__("isb" ::: "memory");
 }
+
+#else
+
+// host_build_graph runs orchestration on the host CPU, which reaches device
+// memory only through driver H2D DMA (cache-coherent on x86). The manual
+// AICPU-side cache maintenance the aarch64 path performs has no host-side
+// referent here, so both operations are inert.
+void invalidate_range_impl(const void * /* addr */, size_t /* size */) {}
+
+void flush_range_impl(const void * /* addr */, size_t /* size */) {}
+
+#endif
 
 }  // namespace aicpu_cache_maintenance

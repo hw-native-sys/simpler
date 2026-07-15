@@ -10,8 +10,23 @@
  */
 #include "aicpu/device_time.h"
 
+#if !defined(__aarch64__)
+#include <chrono>
+#endif
+
 uint64_t get_sys_cnt_aicpu() {
-    uint64_t ticks;
-    asm volatile("mrs %0, cntvct_el0" : "=r"(ticks));
-    return ticks;
+#if defined(__aarch64__)
+    return device_time_now_ticks();
+#else
+    // host_build_graph orchestrates on the host CPU, where the device generic
+    // timer is unreachable. device_time_now_ticks() is a monotonic steady_clock
+    // nanosecond count off aarch64; rescale it to the PLATFORM_PROF_SYS_CNT_FREQ
+    // tick unit get_sys_cnt_aicpu() reports in, so the orchestrator's cycle-based
+    // timeouts (get_sys_cnt_aicpu() - t0 > ..._CYCLES) and DFX decode stay valid.
+    uint64_t elapsed_ns = device_time_now_ticks();
+    constexpr uint64_t kNsPerSec = std::nano::den;
+    uint64_t seconds = elapsed_ns / kNsPerSec;
+    uint64_t remaining_ns = elapsed_ns % kNsPerSec;
+    return seconds * PLATFORM_PROF_SYS_CNT_FREQ + (remaining_ns * PLATFORM_PROF_SYS_CNT_FREQ) / kNsPerSec;
+#endif
 }
