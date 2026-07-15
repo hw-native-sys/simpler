@@ -17,5 +17,5 @@ uint64_t get_sys_cnt_aicpu() {
     return ticks;
 }
 #else
-uint64_t get_sys_cnt_aicpu() { return 0; }
+uint64_t get_sys_cnt_aicpu() { return device_time_now_ticks(); }
 #endif
