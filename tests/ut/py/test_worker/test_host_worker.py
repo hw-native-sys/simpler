@@ -1889,6 +1889,7 @@ class TestChipMainLoopDigestRegister:
         t = threading.Thread(
             target=_run_chip_main_loop,
             args=(cw, buf, 0, state_addr, 0, registry, identity_table, identity_refs),
+            kwargs={"chip_platform": ""},
             daemon=True,
         )
         t.start()

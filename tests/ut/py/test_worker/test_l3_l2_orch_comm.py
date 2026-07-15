@@ -42,6 +42,7 @@ class _FakeDirectCWorker:
         export_key: bytes = b"",
         magic_version: int = 0x4C334C3200020000,
         region_id: Optional[int] = None,
+        mapping_bytes: Optional[int] = None,
     ):
         self.create_calls: list[tuple[int, str, str]] = []
         self.release_calls: list[tuple[int, int]] = []
@@ -52,6 +53,7 @@ class _FakeDirectCWorker:
         self.export_key = bytes(export_key)
         self.magic_version = int(magic_version)
         self.region_id = region_id
+        self.mapping_bytes = mapping_bytes
 
     def control_l3_l2_region_create(self, worker_id: int, request_shm_name: str, reply_shm_name: str) -> None:
         self.create_calls.append((int(worker_id), str(request_shm_name), str(reply_shm_name)))
@@ -89,7 +91,7 @@ class _FakeDirectCWorker:
                 self.device_id,
                 export_key + b"\x00" * (l3_l2_orch_comm.ACL_IPC_EXPORT_KEY_BYTES - len(export_key)),
                 backing_name + b"\x00" * (l3_l2_orch_comm.CTRL_SHM_TOKEN_BYTES - len(backing_name)),
-                counter_offset + counter_bytes,
+                counter_offset + counter_bytes if self.mapping_bytes is None else int(self.mapping_bytes),
             )
         finally:
             del req_buf
@@ -328,6 +330,29 @@ def test_direct_create_validation_failure_rolls_back_l2_host_region(reply_update
         shm.unlink()
 
 
+def test_onboard_direct_mapping_bytes_mismatch_rolls_back_l2_host_region(monkeypatch):
+    worker, shm, fake_c_worker = _make_started_onboard_worker()
+    fake_c_worker.mapping_bytes = 191
+    calls: list[tuple] = []
+    try:
+        monkeypatch.setattr(
+            l3_l2_orch_comm,
+            "_l3_host_mapped_region_import_onboard",
+            lambda *args: calls.append(args) or 123,
+        )
+
+        with pytest.raises(RuntimeError, match="onboard_acl_ipc reply mapping_bytes"):
+            worker._create_l3_l2_region(0, 64, 128)
+
+        assert calls == []
+        assert fake_c_worker.release_calls == [(0, 1)]
+        assert worker._live_l3_l2_regions == []
+    finally:
+        worker._close_l3_l2_orch_comm()
+        shm.close()
+        shm.unlink()
+
+
 def test_l3_host_mapped_counter_wait_releases_gil_for_python_notifier():
     shm = SharedMemory(create=True, size=64)
     handle = 0
@@ -352,6 +377,41 @@ def test_l3_host_mapped_counter_wait_releases_gil_for_python_notifier():
         assert not thread.is_alive()
         assert notifier_error == []
         assert (status, error_kind, observed, matched, message) == (0, 0, 1, True, "")
+    finally:
+        if handle:
+            l3_l2_orch_comm._l3_host_mapped_region_close(handle)
+        shm.close()
+        shm.unlink()
+
+
+def test_l3_host_mapped_sim_payload_and_counter_helpers_roundtrip():
+    shm = SharedMemory(create=True, size=128)
+    handle = 0
+    try:
+        handle = l3_l2_orch_comm._l3_host_mapped_region_import_sim(shm.name, 128)
+        src_t = ctypes.c_uint8 * 8
+        src = src_t(*range(10, 18))
+        dst = src_t()
+
+        l3_l2_orch_comm._l3_host_mapped_payload_write(handle, 16, ctypes.addressof(src), 8)
+        l3_l2_orch_comm._l3_host_mapped_payload_read(handle, 16, ctypes.addressof(dst), 8)
+        assert bytes(dst) == bytes(range(10, 18))
+
+        l3_l2_orch_comm._l3_host_mapped_counter_notify(handle, 64, 3, int(NotifyOp.Set))
+        assert l3_l2_orch_comm._l3_host_mapped_counter_test(handle, 64, 3, int(WaitCmp.EQ)) == (True, 3)
+        l3_l2_orch_comm._l3_host_mapped_counter_notify(handle, 64, 4, int(NotifyOp.Add))
+        assert l3_l2_orch_comm._l3_host_mapped_counter_test(handle, 64, 7, int(WaitCmp.GE)) == (True, 7)
+        assert l3_l2_orch_comm._l3_host_mapped_counter_wait(handle, 64, 7, int(WaitCmp.EQ), 1_000_000) == (
+            0,
+            0,
+            7,
+            True,
+            "",
+        )
+
+        l3_l2_orch_comm._l3_host_mapped_region_close(handle)
+        with pytest.raises(RuntimeError, match="closed or unknown"):
+            l3_l2_orch_comm._l3_host_mapped_payload_read(handle, 16, ctypes.addressof(dst), 8)
     finally:
         if handle:
             l3_l2_orch_comm._l3_host_mapped_region_close(handle)

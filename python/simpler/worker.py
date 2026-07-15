@@ -1081,7 +1081,7 @@ def _next_l2_host_l3_l2_region_id(cw: ChipWorker) -> int:
 
 
 def _handle_ctrl_l3_l2_region_create(  # noqa: PLR0912
-    cw: ChipWorker, buf: memoryview, chip_platform: str = ""
+    cw: ChipWorker, buf: memoryview, chip_platform: str
 ) -> None:
     from _task_interface import (  # pyright: ignore[reportMissingImports]  # noqa: PLC0415
         _l3_child_onboard_region_close,
@@ -1306,7 +1306,7 @@ def _run_chip_main_loop(  # noqa: PLR0912, PLR0913, PLR0915 -- unified TASK_READ
     identity_table: dict[bytes, int],
     identity_refs: dict[bytes, int],
     *,
-    chip_platform: str = "",
+    chip_platform: str,
     chip_runtime: str = "",
     on_task_done_success=None,
 ) -> None:
@@ -3623,6 +3623,8 @@ class Worker:
 
     def _l3_l2_onboard_import_enable_peer_access(self) -> bool:
         platform = str(self._config.get("platform", ""))
+        # The ACL IPC import peer-access flag is requested only for the a2a3
+        # L3-L2 direct path; a5 imports the same exported region without it.
         return platform == "a2a3"
 
     def _validate_l3_l2_worker_id(self, worker_id: int) -> None:

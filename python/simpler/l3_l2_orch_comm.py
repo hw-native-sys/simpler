@@ -189,8 +189,10 @@ class L3HostRegionMapping:
     def close(self) -> None:
         if self.closed:
             return
-        _l3_host_mapped_region_close(int(self.handle))
-        self.closed = True
+        try:
+            _l3_host_mapped_region_close(int(self.handle))
+        finally:
+            self.closed = True
 
 
 def decode_region_create_reply(buf: memoryview) -> L3L2RegionCreateReply:
@@ -235,8 +237,16 @@ def validate_region_create_reply(
         raise RuntimeError("create_l3_l2_region: reply counter_base does not match fixed region layout")
     if desc.counter_base % _REGION_LAYOUT_ALIGNMENT != 0:
         raise RuntimeError("create_l3_l2_region: reply counter_base must be 64-byte aligned")
-    if reply.access_profile == L3L2RegionAccessProfile.SIM_POSIX_SHM and reply.mapping_bytes != total_bytes:
-        raise RuntimeError("create_l3_l2_region: sim reply mapping_bytes does not match descriptor layout")
+    if (
+        reply.access_profile
+        in (
+            L3L2RegionAccessProfile.SIM_POSIX_SHM,
+            L3L2RegionAccessProfile.ONBOARD_ACL_IPC,
+        )
+        and reply.mapping_bytes != total_bytes
+    ):
+        profile = reply.access_profile.name.lower()
+        raise RuntimeError(f"create_l3_l2_region: {profile} reply mapping_bytes does not match descriptor layout")
     return counter_offset, total_bytes
 
 
