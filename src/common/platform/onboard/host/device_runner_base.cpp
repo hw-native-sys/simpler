@@ -30,6 +30,7 @@
 
 #include <algorithm>
 #include <cassert>
+#include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <limits>
@@ -625,7 +626,7 @@ void DeviceRunnerBase::print_handshake_results() {
 // =============================================================================
 
 uint64_t DeviceRunnerBase::upload_chip_callable_buffer(const ChipCallable *callable) {
-    if (callable == nullptr || callable->child_count() == 0) {
+    if (callable == nullptr) {
         return 0;
     }
     if (stream_aicpu_ == nullptr) {
@@ -638,9 +639,10 @@ uint64_t DeviceRunnerBase::upload_chip_callable_buffer(const ChipCallable *calla
     // Content-hash dedup: identical bytes → return cached chip_dev.
     auto it = chip_callable_buffers_.find(layout.content_hash);
     if (it != chip_callable_buffers_.end()) {
+        it->second.refcount++;
         LOG_DEBUG(
-            "Chip callable dedup hit: chip_dev=0x%lx, size=%zu, hash=0x%lx", it->second.chip_dev, it->second.total_size,
-            layout.content_hash
+            "Chip callable dedup hit: chip_dev=0x%lx, size=%zu, hash=0x%lx, refcount=%d", it->second.chip_dev,
+            it->second.total_size, layout.content_hash, it->second.refcount
         );
         return it->second.chip_dev;
     }
@@ -668,12 +670,32 @@ uint64_t DeviceRunnerBase::upload_chip_callable_buffer(const ChipCallable *calla
         return 0;
     }
 
-    chip_callable_buffers_.emplace(layout.content_hash, ChipCallableBuffer{chip_dev, layout.total_size});
+    chip_callable_buffers_.emplace(layout.content_hash, ChipCallableBuffer{chip_dev, layout.total_size, 1});
     LOG_DEBUG(
         "Uploaded chip callable: chip_dev=0x%lx, size=%zu, child_count=%d, hash=0x%lx", chip_dev, layout.total_size,
         callable->child_count(), layout.content_hash
     );
     return chip_dev;
+}
+
+int DeviceRunnerBase::release_chip_callable_buffer(uint64_t hash) {
+    if (hash == 0) {
+        return 0;
+    }
+    auto it = chip_callable_buffers_.find(hash);
+    if (it == chip_callable_buffers_.end()) {
+        LOG_WARN("release_chip_callable_buffer: hash=0x%lx not found", hash);
+        return 0;
+    }
+    if (--it->second.refcount <= 0) {
+        mem_alloc_.free(reinterpret_cast<void *>(it->second.chip_dev));
+        LOG_DEBUG(
+            "Freed chip callable buffer: chip_dev=0x%lx, size=%zu, hash=0x%lx", it->second.chip_dev,
+            it->second.total_size, hash
+        );
+        chip_callable_buffers_.erase(it);
+    }
+    return 0;
 }
 
 int DeviceRunnerBase::stamp_orch_so(Runtime &runtime, int32_t cid) {
@@ -776,8 +798,9 @@ int DeviceRunnerBase::launch_device_register(int32_t callable_id) {
 }
 
 int DeviceRunnerBase::record_device_orch_callable(
-    int32_t callable_id, const void *orch_so_data, size_t orch_so_size, const char *func_name, const char *config_name,
-    std::vector<std::pair<int, uint64_t>> kernel_addrs, std::vector<ArgDirection> signature
+    int32_t callable_id, uint64_t chip_buffer_hash, uint64_t chip_dev, const void *orch_so_data, size_t orch_so_size,
+    const char *func_name, const char *config_name, std::vector<std::pair<int, uint64_t>> kernel_addrs,
+    std::vector<ArgDirection> signature
 ) {
     // The AICPU executor reserves `orch_so_table_[MAX_REGISTERED_CALLABLE_IDS]`
     // (declared in src/common/task_interface/callable_protocol.h) and indexes
@@ -793,6 +816,10 @@ int DeviceRunnerBase::record_device_orch_callable(
         LOG_ERROR("record_device_orch_callable: empty orch SO for callable_id=%d", callable_id);
         return -1;
     }
+    if (chip_buffer_hash == 0 || chip_dev == 0) {
+        LOG_ERROR("record_device_orch_callable: missing chip buffer for callable_id=%d", callable_id);
+        return -1;
+    }
     if (callables_.count(callable_id) != 0) {
         LOG_ERROR("record_device_orch_callable: callable_id=%d already registered", callable_id);
         return -1;
@@ -800,52 +827,25 @@ int DeviceRunnerBase::record_device_orch_callable(
 
     const uint64_t hash = simpler::common::utils::elf_build_id_64(orch_so_data, orch_so_size);
 
-    // Hash dedup: share device buffer across callable_ids that carry the same
-    // SO bytes. Refcount drops in unregister_callable; we only free when the
-    // count hits zero.
-    auto buf_it = orch_so_dedup_.find(hash);
-    uint64_t dev_addr = 0;
-    if (buf_it == orch_so_dedup_.end()) {
-        void *buf = mem_alloc_.alloc(orch_so_size);
-        if (buf == nullptr) {
-            LOG_ERROR("record_device_orch_callable: alloc %zu bytes failed", orch_so_size);
-            return -1;
-        }
-        int rc = rtMemcpy(buf, orch_so_size, orch_so_data, orch_so_size, RT_MEMCPY_HOST_TO_DEVICE);
-        if (rc != 0) {
-            LOG_ERROR("record_device_orch_callable: rtMemcpy failed: %d", rc);
-            mem_alloc_.free(buf);
-            return rc;
-        }
-        OrchSoBuffer entry;
-        entry.dev_addr = buf;
-        entry.capacity = orch_so_size;
-        entry.refcount = 1;
-        orch_so_dedup_.emplace(hash, entry);
-        dev_addr = reinterpret_cast<uint64_t>(buf);
-        LOG_INFO_V0("record_device_orch_callable: hash=0x%lx new buffer %zu bytes", hash, orch_so_size);
-    } else {
-        buf_it->second.refcount++;
-        dev_addr = reinterpret_cast<uint64_t>(buf_it->second.dev_addr);
-        LOG_INFO_V0(
-            "record_device_orch_callable: hash=0x%lx shared buffer (refcount=%d)", hash, buf_it->second.refcount
-        );
-    }
-
     CallableState state;
     state.hash = hash;
-    state.dev_orch_so_addr = dev_addr;
+    state.chip_buffer_hash = chip_buffer_hash;
+    state.dev_orch_so_addr = chip_dev + offsetof(ChipCallable, storage_);
     state.dev_orch_so_size = orch_so_size;
     state.func_name = (func_name != nullptr) ? func_name : "";
     state.config_name = (config_name != nullptr) ? config_name : "";
     state.kernel_addrs = std::move(kernel_addrs);
     state.signature = std::move(signature);
     callables_.emplace(callable_id, std::move(state));
+    LOG_INFO_V0(
+        "record_device_orch_callable: cid=%d orch_hash=0x%lx chip_hash=0x%lx %zu bytes", callable_id, hash,
+        chip_buffer_hash, orch_so_size
+    );
     return 0;
 }
 
 int DeviceRunnerBase::record_host_orch_callable(
-    int32_t callable_id, void *host_dlopen_handle, void *host_orch_func_ptr,
+    int32_t callable_id, uint64_t chip_buffer_hash, void *host_dlopen_handle, void *host_orch_func_ptr,
     std::vector<std::pair<int, uint64_t>> kernel_addrs, std::vector<ArgDirection> signature
 ) {
     if (callable_id < 0 || callable_id >= MAX_REGISTERED_CALLABLE_IDS) {
@@ -858,12 +858,17 @@ int DeviceRunnerBase::record_host_orch_callable(
         LOG_ERROR("record_host_orch_callable: null handle/fn for callable_id=%d", callable_id);
         return -1;
     }
+    if (chip_buffer_hash == 0) {
+        LOG_ERROR("record_host_orch_callable: missing chip buffer for callable_id=%d", callable_id);
+        return -1;
+    }
     if (callables_.count(callable_id) != 0) {
         LOG_ERROR("record_host_orch_callable: callable_id=%d already registered", callable_id);
         return -1;
     }
 
     CallableState state;
+    state.chip_buffer_hash = chip_buffer_hash;
     state.host_dlopen_handle = host_dlopen_handle;
     state.host_orch_func_ptr = host_orch_func_ptr;
     state.kernel_addrs = std::move(kernel_addrs);
@@ -882,19 +887,12 @@ int DeviceRunnerBase::unregister_callable(int32_t callable_id) {
     CallableState state = std::move(it->second);
     callables_.erase(it);
     aicpu_seen_callable_ids_.erase(callable_id);
+    release_chip_callable_buffer(state.chip_buffer_hash);
 
     if (state.host_dlopen_handle != nullptr) {
-        // hbg path: no orch SO refcount, just dlclose the host handle.
+        // hbg path: no device-side orch SO handle, just dlclose the host handle.
         dlclose(state.host_dlopen_handle);
         return 0;
-    }
-
-    auto buf_it = orch_so_dedup_.find(state.hash);
-    if (buf_it != orch_so_dedup_.end()) {
-        if (--buf_it->second.refcount <= 0) {
-            mem_alloc_.free(buf_it->second.dev_addr);
-            orch_so_dedup_.erase(buf_it);
-        }
     }
     return 0;
 }
@@ -929,9 +927,8 @@ int DeviceRunnerBase::bind_callable_to_runtime(
     const auto &state = it->second;
 
     // Replay each prepared kernel address into runtime.func_id_to_addr_.
-    // The kernel binaries are owned by the shared DeviceRunner pool and
-    // survive across runs — freed only by `finalize()`, never by
-    // validate_runtime_impl or `unregister_callable`.
+    // The kernel binaries live in the retained ChipCallable buffer for this
+    // callable_id and stay valid until `unregister_callable` or `finalize`.
     for (const auto &kv : state.kernel_addrs) {
         if (kv.first < 0 || kv.first >= RUNTIME_MAX_FUNC_ID) {
             LOG_ERROR("bind_callable_to_runtime: func_id=%d out of range", kv.first);
@@ -1050,8 +1047,7 @@ int DeviceRunnerBase::finalize_common() {
     // re-launches simpler_aicpu_init after the next ensure_binaries_loaded().
     aicpu_init_launched_ = false;
 
-    // Release any chip callable buffers uploaded via upload_chip_callable_buffer.
-    // Pool semantics mirror per-fid binaries: never freed until finalize.
+    // Release any chip callable buffers callers forgot to unregister.
     for (auto &kv : chip_callable_buffers_) {
         mem_alloc_.free(reinterpret_cast<void *>(kv.second.chip_dev));
         LOG_DEBUG(
@@ -1061,15 +1057,6 @@ int DeviceRunnerBase::finalize_common() {
     }
     chip_callable_buffers_.clear();
 
-    // Release any registered-callable orch SO buffers that callers forgot to
-    // unregister. Refcounts no longer matter at this point — the device is
-    // about to be reset.
-    for (auto &kv : orch_so_dedup_) {
-        if (kv.second.dev_addr != nullptr) {
-            mem_alloc_.free(kv.second.dev_addr);
-        }
-    }
-    orch_so_dedup_.clear();
     // hbg path: dlclose any host orch handles callers forgot to unregister.
     // finalize() is the last chance; Worker.close() does not auto-unregister
     // each callable_id, so without this loop the host process leaks one

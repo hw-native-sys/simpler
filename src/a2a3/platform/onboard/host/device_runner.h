@@ -194,9 +194,9 @@ private:
     // binaries_loaded_) is inherited from `DeviceRunnerBase`.
 
     // Group D state (`chip_callable_buffers_`, `callables_`,
-    // `orch_so_dedup_`, `aicpu_seen_callable_ids_`, `aicpu_dlopen_total_`,
+    // `aicpu_seen_callable_ids_`, `aicpu_dlopen_total_`,
     // `host_dlopen_total_`) and inner struct types
-    // (`ChipCallableBuffer`, `CallableState`, `OrchSoBuffer`) are
+    // (`ChipCallableBuffer`, `CallableState`) are
     // inherited from `DeviceRunnerBase`.
 
     // ACL lifecycle (process-wide). aclInit must run exactly once; ensure_acl_ready

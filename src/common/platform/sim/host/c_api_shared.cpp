@@ -384,6 +384,11 @@ int simpler_register_callable(DeviceContextHandle ctx, int32_t callable_id, cons
 
     try {
         CallableArtifacts artifacts;
+        auto chip_buffer_guard = RAIIScopeGuard([runner, &artifacts]() {
+            if (artifacts.chip_buffer_hash != 0) {
+                runner->release_chip_callable_buffer(artifacts.chip_buffer_hash);
+            }
+        });
         int rc = register_callable_impl(
             reinterpret_cast<const ChipCallable *>(callable), upload_chip_callable_buffer_wrapper, &artifacts
         );
@@ -406,18 +411,21 @@ int simpler_register_callable(DeviceContextHandle ctx, int32_t callable_id, cons
         bool needs_aicpu_register = false;
         if (artifacts.host_dlopen_handle != nullptr) {
             rc = runner->record_host_orch_callable(
-                callable_id, artifacts.host_dlopen_handle, artifacts.host_orch_func_ptr, std::move(kernel_addrs),
-                std::move(artifacts.signature)
+                callable_id, artifacts.chip_buffer_hash, artifacts.host_dlopen_handle, artifacts.host_orch_func_ptr,
+                std::move(kernel_addrs), std::move(artifacts.signature)
             );
             if (rc == 0) {
                 host_dlopen_guard.dismiss();
+                chip_buffer_guard.dismiss();
             }
         } else {
             rc = runner->record_device_orch_callable(
-                callable_id, artifacts.orch_so_data, artifacts.orch_so_size, artifacts.func_name.c_str(),
-                artifacts.config_name.c_str(), std::move(kernel_addrs), std::move(artifacts.signature)
+                callable_id, artifacts.chip_buffer_hash, artifacts.chip_buffer_dev, artifacts.orch_so_data,
+                artifacts.orch_so_size, artifacts.func_name.c_str(), artifacts.config_name.c_str(),
+                std::move(kernel_addrs), std::move(artifacts.signature)
             );
             if (rc == 0) {
+                chip_buffer_guard.dismiss();
                 needs_aicpu_register = true;
             }
         }

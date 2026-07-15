@@ -114,11 +114,12 @@ public:
     void unregister_device_memory_from_host(void *dev_ptr) { (void)dev_ptr; }
 
     int record_device_orch_callable(
-        int32_t callable_id, const void *orch_so_data, size_t orch_so_size, const char *func_name,
-        const char *config_name, std::vector<std::pair<int, uint64_t>> kernel_addrs, std::vector<ArgDirection> signature
+        int32_t callable_id, uint64_t chip_buffer_hash, uint64_t chip_dev, const void *orch_so_data,
+        size_t orch_so_size, const char *func_name, const char *config_name,
+        std::vector<std::pair<int, uint64_t>> kernel_addrs, std::vector<ArgDirection> signature
     );
     int record_host_orch_callable(
-        int32_t callable_id, void *host_dlopen_handle, void *host_orch_func_ptr,
+        int32_t callable_id, uint64_t chip_buffer_hash, void *host_dlopen_handle, void *host_orch_func_ptr,
         std::vector<std::pair<int, uint64_t>> kernel_addrs, std::vector<ArgDirection> signature
     );
     int unregister_callable(int32_t callable_id);
@@ -133,6 +134,7 @@ public:
         const uint64_t *ring_task_window, const uint64_t *ring_heap, const uint64_t *ring_dep_pool
     );
     uint64_t upload_chip_callable_buffer(const ChipCallable *callable);
+    int release_chip_callable_buffer(uint64_t hash);
     int launch_device_register(int32_t callable_id);
     int commit_device_register(int32_t callable_id);
 
@@ -271,6 +273,7 @@ protected:
         uint64_t chip_dev{0};  // (uint64_t)host_scratch
         uint8_t *host_scratch{nullptr};
         size_t total_size{0};
+        int refcount{0};
         std::vector<void *> dlopen_handles;
     };
     std::unordered_map<uint64_t, ChipCallableBuffer> chip_callable_buffers_;
@@ -279,6 +282,7 @@ protected:
     struct CallableState {
         // trb path
         uint64_t hash{0};
+        uint64_t chip_buffer_hash{0};
         uint64_t dev_orch_so_addr{0};
         size_t dev_orch_so_size{0};
         std::string func_name;
@@ -290,13 +294,7 @@ protected:
         void *host_dlopen_handle{nullptr};
         void *host_orch_func_ptr{nullptr};
     };
-    struct OrchSoBuffer {
-        void *dev_addr{nullptr};
-        size_t capacity{0};
-        int refcount{0};
-    };
     std::unordered_map<int32_t, CallableState> callables_;
-    std::unordered_map<uint64_t, OrchSoBuffer> orch_so_dedup_;
     std::unordered_set<int32_t> aicpu_seen_callable_ids_;
     size_t aicpu_dlopen_total_{0};
     size_t host_dlopen_total_{0};

@@ -29,6 +29,7 @@
 
 #include "arg_direction.h"
 #include "callable.h"
+#include "chip_callable_layout.h"
 
 struct ChildKernelAddr {
     int func_id;
@@ -46,9 +47,9 @@ struct ChildKernelAddr {
  *   - host_build_graph: kernel_addrs + host_dlopen_handle + host_orch_func_ptr
  *                       (orch_so_* stay null since orch SO never crosses
  *                       host/device on this runtime)
- *   - tensormap_and_ringbuffer: kernel_addrs + orch_so_data + orch_so_size
- *                       + func_name + config_name (orch SO is uploaded to
- *                       device by DeviceRunner; host does no dlopen)
+ *   - tensormap_and_ringbuffer: kernel_addrs + chip buffer lease +
+ *                       orch_so_size + func_name + config_name (the orch SO
+ *                       is the leading slice of ChipCallable::storage_)
  *
  * func_name / config_name are non-empty only for the trb path; the hbg path
  * resolves its entry symbol during register_callable_impl and stores the
@@ -63,7 +64,9 @@ struct CallableArtifacts {
     std::vector<ArgDirection> signature;
     void *host_dlopen_handle{nullptr};  // hbg only
     void *host_orch_func_ptr{nullptr};  // hbg only
-    const void *orch_so_data{nullptr};  // trb only
+    uint64_t chip_buffer_hash{0};       // FNV-1a hash for the whole ChipCallable buffer
+    uint64_t chip_buffer_dev{0};        // device address of the ChipCallable header
+    const void *orch_so_data{nullptr};  // trb only; host view used for validation/hash only
     size_t orch_so_size{0};             // trb only
     std::string func_name;              // trb only (orch entry symbol)
     std::string config_name;            // trb only (orch config symbol)
@@ -73,8 +76,9 @@ struct CallableArtifacts {
  * Upload the ChipCallable buffer via `upload_fn` and compute the device-side
  * address of every child kernel.
  *
- * @param callable   ChipCallable to upload. May have child_count() == 0, in
- *                   which case `out` is cleared and 0 is returned.
+ * @param callable   ChipCallable to upload. May have child_count() == 0; the
+ *                   chip buffer is still uploaded and retained, while `out`
+ *                   remains empty on success.
  * @param upload_fn  HostApi::upload_chip_callable_buffer — declared as
  *                   `uint64_t (*)(const void *)` to avoid pulling runtime
  *                   headers into task_interface. Must not be null.
@@ -82,23 +86,24 @@ struct CallableArtifacts {
  *                   {func_id, device_addr} entry per child kernel. Caller is
  *                   responsible for validating func_id against its runtime's
  *                   RUNTIME_MAX_FUNC_ID before writing to func_id_to_addr_[].
- * @return 0 on success (including the child_count == 0 case), -1 on argument
- *         error or upload failure.
+ * @return 0 on success, -1 on argument error or upload failure.
  */
 inline int upload_and_collect_child_addrs(
-    const ChipCallable *callable, uint64_t (*upload_fn)(const void *), std::vector<ChildKernelAddr> *out
+    const ChipCallable *callable, uint64_t (*upload_fn)(const void *), std::vector<ChildKernelAddr> *out,
+    uint64_t *out_chip_dev = nullptr, uint64_t *out_chip_hash = nullptr
 ) {
     if (callable == nullptr || upload_fn == nullptr || out == nullptr) return -1;
     out->clear();
-    if (callable->child_count() <= 0) return 0;
 
+    const ChipCallableLayout layout = compute_chip_callable_layout(callable);
     uint64_t chip_dev = upload_fn(callable);
     if (chip_dev == 0) return -1;
+    if (out_chip_dev != nullptr) *out_chip_dev = chip_dev;
+    if (out_chip_hash != nullptr) *out_chip_hash = layout.content_hash;
 
-    constexpr size_t kHeaderSize = offsetof(ChipCallable, storage_);
     out->reserve(static_cast<size_t>(callable->child_count()));
     for (int32_t i = 0; i < callable->child_count(); ++i) {
-        uint64_t child_dev = chip_dev + kHeaderSize + callable->child_offset(i);
+        uint64_t child_dev = chip_dev + layout.header_size + callable->child_offset(i);
         out->push_back({callable->child_func_id(i), child_dev});
     }
     return 0;

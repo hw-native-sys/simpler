@@ -317,7 +317,9 @@ int register_callable_impl(const ChipCallable *callable, uint64_t (*upload_fn)(c
     out->signature.assign(callable->signature_, callable->signature_ + callable->sig_count());
 
     LOG_INFO_V0("Registering %d kernel(s) in register_callable_impl", callable->child_count());
-    if (upload_and_collect_child_addrs(callable, upload_fn, &out->kernel_addrs) != 0) {
+    if (upload_and_collect_child_addrs(
+            callable, upload_fn, &out->kernel_addrs, &out->chip_buffer_dev, &out->chip_buffer_hash
+        ) != 0) {
         LOG_ERROR("Failed to upload ChipCallable buffer");
         return -1;
     }

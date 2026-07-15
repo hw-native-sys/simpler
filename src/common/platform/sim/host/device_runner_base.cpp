@@ -13,6 +13,7 @@
 #include <sys/stat.h>
 #include <stdlib.h>
 
+#include <cstddef>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -414,8 +415,9 @@ int SimDeviceRunnerBase::launch_device_register(int32_t callable_id) {
 }
 
 int SimDeviceRunnerBase::record_device_orch_callable(
-    int32_t callable_id, const void *orch_so_data, size_t orch_so_size, const char *func_name, const char *config_name,
-    std::vector<std::pair<int, uint64_t>> kernel_addrs, std::vector<ArgDirection> signature
+    int32_t callable_id, uint64_t chip_buffer_hash, uint64_t chip_dev, const void *orch_so_data, size_t orch_so_size,
+    const char *func_name, const char *config_name, std::vector<std::pair<int, uint64_t>> kernel_addrs,
+    std::vector<ArgDirection> signature
 ) {
     // The AICPU executor reserves `orch_so_table_[MAX_REGISTERED_CALLABLE_IDS]`
     // (declared in src/common/task_interface/callable_protocol.h) and indexes
@@ -431,6 +433,10 @@ int SimDeviceRunnerBase::record_device_orch_callable(
         LOG_ERROR("record_device_orch_callable: empty orch SO for callable_id=%d", callable_id);
         return -1;
     }
+    if (chip_buffer_hash == 0 || chip_dev == 0) {
+        LOG_ERROR("record_device_orch_callable: missing chip buffer for callable_id=%d", callable_id);
+        return -1;
+    }
     if (callables_.count(callable_id) != 0) {
         LOG_ERROR("record_device_orch_callable: callable_id=%d already registered", callable_id);
         return -1;
@@ -438,46 +444,25 @@ int SimDeviceRunnerBase::record_device_orch_callable(
 
     const uint64_t hash = simpler::common::utils::elf_build_id_64(orch_so_data, orch_so_size);
 
-    auto buf_it = orch_so_dedup_.find(hash);
-    uint64_t dev_addr = 0;
-    if (buf_it == orch_so_dedup_.end()) {
-        void *buf = mem_alloc_.alloc(orch_so_size);
-        if (buf == nullptr) {
-            LOG_ERROR("record_device_orch_callable: alloc %zu bytes failed", orch_so_size);
-            return -1;
-        }
-        // Sim shares an address space with the simulated AICPU thread, so a
-        // plain memcpy is the moral equivalent of rtMemcpy on hardware.
-        std::memcpy(buf, orch_so_data, orch_so_size);
-        OrchSoBuffer entry;
-        entry.dev_addr = buf;
-        entry.capacity = orch_so_size;
-        entry.refcount = 1;
-        orch_so_dedup_.emplace(hash, entry);
-        dev_addr = reinterpret_cast<uint64_t>(buf);
-        LOG_INFO_V0("record_device_orch_callable: hash=0x%lx new buffer %zu bytes", hash, orch_so_size);
-    } else {
-        buf_it->second.refcount++;
-        dev_addr = reinterpret_cast<uint64_t>(buf_it->second.dev_addr);
-        LOG_INFO_V0(
-            "record_device_orch_callable: hash=0x%lx shared buffer (refcount=%d)", hash, buf_it->second.refcount
-        );
-    }
-
     CallableState state;
     state.hash = hash;
-    state.dev_orch_so_addr = dev_addr;
+    state.chip_buffer_hash = chip_buffer_hash;
+    state.dev_orch_so_addr = chip_dev + offsetof(ChipCallable, storage_);
     state.dev_orch_so_size = orch_so_size;
     state.func_name = (func_name != nullptr) ? func_name : "";
     state.config_name = (config_name != nullptr) ? config_name : "";
     state.kernel_addrs = std::move(kernel_addrs);
     state.signature = std::move(signature);
     callables_.emplace(callable_id, std::move(state));
+    LOG_INFO_V0(
+        "record_device_orch_callable: cid=%d orch_hash=0x%lx chip_hash=0x%lx %zu bytes", callable_id, hash,
+        chip_buffer_hash, orch_so_size
+    );
     return 0;
 }
 
 int SimDeviceRunnerBase::record_host_orch_callable(
-    int32_t callable_id, void *host_dlopen_handle, void *host_orch_func_ptr,
+    int32_t callable_id, uint64_t chip_buffer_hash, void *host_dlopen_handle, void *host_orch_func_ptr,
     std::vector<std::pair<int, uint64_t>> kernel_addrs, std::vector<ArgDirection> signature
 ) {
     if (callable_id < 0 || callable_id >= MAX_REGISTERED_CALLABLE_IDS) {
@@ -490,12 +475,17 @@ int SimDeviceRunnerBase::record_host_orch_callable(
         LOG_ERROR("record_host_orch_callable: null handle/fn for callable_id=%d", callable_id);
         return -1;
     }
+    if (chip_buffer_hash == 0) {
+        LOG_ERROR("record_host_orch_callable: missing chip buffer for callable_id=%d", callable_id);
+        return -1;
+    }
     if (callables_.count(callable_id) != 0) {
         LOG_ERROR("record_host_orch_callable: callable_id=%d already registered", callable_id);
         return -1;
     }
 
     CallableState state;
+    state.chip_buffer_hash = chip_buffer_hash;
     state.host_dlopen_handle = host_dlopen_handle;
     state.host_orch_func_ptr = host_orch_func_ptr;
     state.kernel_addrs = std::move(kernel_addrs);
@@ -514,19 +504,12 @@ int SimDeviceRunnerBase::unregister_callable(int32_t callable_id) {
     CallableState state = std::move(it->second);
     callables_.erase(it);
     aicpu_seen_callable_ids_.erase(callable_id);
+    release_chip_callable_buffer(state.chip_buffer_hash);
 
     if (state.host_dlopen_handle != nullptr) {
-        // hbg: dlclose the host handle; no orch SO refcount to decrement.
+        // hbg: dlclose the host handle; no device-side orch SO handle.
         dlclose(state.host_dlopen_handle);
         return 0;
-    }
-
-    auto buf_it = orch_so_dedup_.find(state.hash);
-    if (buf_it != orch_so_dedup_.end()) {
-        if (--buf_it->second.refcount <= 0) {
-            mem_alloc_.free(buf_it->second.dev_addr);
-            orch_so_dedup_.erase(buf_it);
-        }
     }
     return 0;
 }
@@ -597,7 +580,7 @@ void SimDeviceRunnerBase::apply_call_config(const CallConfig &config) {
 }
 
 uint64_t SimDeviceRunnerBase::upload_chip_callable_buffer(const ChipCallable *callable) {
-    if (callable == nullptr || callable->child_count() == 0) {
+    if (callable == nullptr) {
         return 0;
     }
 
@@ -605,9 +588,10 @@ uint64_t SimDeviceRunnerBase::upload_chip_callable_buffer(const ChipCallable *ca
 
     auto it = chip_callable_buffers_.find(layout.content_hash);
     if (it != chip_callable_buffers_.end()) {
+        it->second.refcount++;
         LOG_DEBUG(
-            "Chip callable dedup hit (sim): chip_dev=0x%lx, size=%zu, hash=0x%lx", it->second.chip_dev,
-            it->second.total_size, layout.content_hash
+            "Chip callable dedup hit (sim): chip_dev=0x%lx, size=%zu, hash=0x%lx, refcount=%d", it->second.chip_dev,
+            it->second.total_size, layout.content_hash, it->second.refcount
         );
         return it->second.chip_dev;
     }
@@ -672,13 +656,36 @@ uint64_t SimDeviceRunnerBase::upload_chip_callable_buffer(const ChipCallable *ca
     cleanup.dismiss();
     const uint64_t chip_dev = reinterpret_cast<uint64_t>(scratch);
     chip_callable_buffers_.emplace(
-        layout.content_hash, ChipCallableBuffer{chip_dev, scratch, layout.total_size, std::move(dlopen_handles)}
+        layout.content_hash, ChipCallableBuffer{chip_dev, scratch, layout.total_size, 1, std::move(dlopen_handles)}
     );
     LOG_DEBUG(
         "Uploaded chip callable (sim): chip_dev=0x%lx, size=%zu, child_count=%d, hash=0x%lx", chip_dev,
         layout.total_size, callable->child_count(), layout.content_hash
     );
     return chip_dev;
+}
+
+int SimDeviceRunnerBase::release_chip_callable_buffer(uint64_t hash) {
+    if (hash == 0) {
+        return 0;
+    }
+    auto it = chip_callable_buffers_.find(hash);
+    if (it == chip_callable_buffers_.end()) {
+        LOG_WARN("release_chip_callable_buffer: hash=0x%lx not found", hash);
+        return 0;
+    }
+    if (--it->second.refcount <= 0) {
+        for (void *h : it->second.dlopen_handles) {
+            if (h != nullptr) dlclose(h);
+        }
+        delete[] it->second.host_scratch;
+        LOG_DEBUG(
+            "Freed chip callable buffer (sim): chip_dev=0x%lx, size=%zu, hash=0x%lx", it->second.chip_dev,
+            it->second.total_size, hash
+        );
+        chip_callable_buffers_.erase(it);
+    }
+    return 0;
 }
 
 void SimDeviceRunnerBase::print_handshake_results() {
@@ -697,8 +704,7 @@ void SimDeviceRunnerBase::print_handshake_results() {
 }
 
 void SimDeviceRunnerBase::release_callable_state() {
-    // Release any chip callable buffers uploaded via upload_chip_callable_buffer.
-    // Pool semantics mirror per-fid binaries: never freed until finalize.
+    // Release any chip callable buffers callers forgot to unregister.
     for (auto &kv : chip_callable_buffers_) {
         for (void *h : kv.second.dlopen_handles) {
             if (h != nullptr) dlclose(h);
@@ -711,13 +717,6 @@ void SimDeviceRunnerBase::release_callable_state() {
     }
     chip_callable_buffers_.clear();
 
-    // Release any prepared-callable orch SO buffers callers forgot to drop.
-    for (auto &kv : orch_so_dedup_) {
-        if (kv.second.dev_addr != nullptr) {
-            mem_alloc_.free(kv.second.dev_addr);
-        }
-    }
-    orch_so_dedup_.clear();
     // hbg path: dlclose any host orch handles callers forgot to unregister.
     // finalize() is the last chance; Worker.close() does not auto-unregister
     // each callable_id, so without this loop the host process leaks one

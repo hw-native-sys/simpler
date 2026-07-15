@@ -264,9 +264,8 @@ public:
      *
      * Pool-managed: identical buffer bytes (FNV-1a 64-bit content hash)
      * hit the dedup cache and return the cached chip_dev without
-     * reallocating. All chip buffers are bulk-freed by the subclass's
-     * `finalize()` — there is no explicit free API, mirroring the
-     * per-fid binary pool semantics.
+     * reallocating. Each successful upload retains one reference; ownership is
+     * transferred into a CallableState or released on registration failure.
      *
      * Callers compute child addresses as
      *     chip_dev + offsetof(ChipCallable, storage_) + child_offset(i)
@@ -275,20 +274,20 @@ public:
      * before each run.
      *
      * @param callable  Host-side ChipCallable pointer.
-     * @return Device GM address of the ChipCallable header, or 0 on
-     *         failure (also returns 0 when callable->child_count() == 0).
+     * @return Device GM address of the ChipCallable header, or 0 on failure.
      */
     uint64_t upload_chip_callable_buffer(const ChipCallable *callable);
+    int release_chip_callable_buffer(uint64_t hash);
 
     /**
-     * Stage a per-callable_id orchestration SO into device memory and
+     * Stage a per-callable_id orchestration SO from the retained ChipCallable and
      * remember the supporting metadata (entry/config symbol names,
-     * kernel func_id ↔ dev_addr table). Identical SO bytes across two
-     * callable_ids share one device buffer (refcounted by hash) so the
-     * worst case for an N-cid pool is N distinct device buffers, not
-     * N copies of the same SO.
+     * kernel func_id ↔ dev_addr table). The orchestration SO is the leading
+     * slice of ChipCallable::storage_ inside the retained chip buffer.
      *
      * @param callable_id   Caller-stable id, must be in [0, MAX_REGISTERED_CALLABLE_IDS).
+     * @param chip_buffer_hash  FNV-1a hash of the retained ChipCallable buffer.
+     * @param chip_dev      Device GM address of the retained ChipCallable header.
      * @param orch_so_data  Host pointer to orchestration SO bytes (owned by caller).
      * @param orch_so_size  Size of orchestration SO in bytes.
      * @param func_name     Entry symbol name (copied).
@@ -300,8 +299,9 @@ public:
      * @return 0 on success, negative on failure.
      */
     int record_device_orch_callable(
-        int32_t callable_id, const void *orch_so_data, size_t orch_so_size, const char *func_name,
-        const char *config_name, std::vector<std::pair<int, uint64_t>> kernel_addrs, std::vector<ArgDirection> signature
+        int32_t callable_id, uint64_t chip_buffer_hash, uint64_t chip_dev, const void *orch_so_data,
+        size_t orch_so_size, const char *func_name, const char *config_name,
+        std::vector<std::pair<int, uint64_t>> kernel_addrs, std::vector<ArgDirection> signature
     );
 
     /**
@@ -315,16 +315,14 @@ public:
      * dlclose'd by `unregister_callable`. Increments `host_dlopen_total_`.
      */
     int record_host_orch_callable(
-        int32_t callable_id, void *host_dlopen_handle, void *host_orch_func_ptr,
+        int32_t callable_id, uint64_t chip_buffer_hash, void *host_dlopen_handle, void *host_orch_func_ptr,
         std::vector<std::pair<int, uint64_t>> kernel_addrs, std::vector<ArgDirection> signature
     );
 
     /**
-     * Drop the registered state for `callable_id`. trb path: decrement
-     * the orch SO buffer's hash-keyed refcount and free when it hits
-     * zero. hbg path: dlclose the host dlopen handle. Kernel binaries
-     * are shared across callables and only released by the subclass's
-     * `finalize()`.
+     * Drop the registered state for `callable_id`. Decrements the retained
+     * chip buffer's hash-keyed refcount and frees when it hits zero. hbg path
+     * also dlcloses the host dlopen handle.
      *
      * @return 0 on success or if the id was not registered.
      */
@@ -714,7 +712,6 @@ protected:
      *   - rtStreamDestroy for both persistent streams
      *   - aicore_bin_handle_ + binaries_loaded_ reset
      *   - chip_callable_buffers_ free + clear
-     *   - orch_so_dedup_ free + clear
      *   - callables_ dlclose-on-hbg + clear + aicpu counter reset
      *   - 3 arenas release + cached size reset
      *   - device_wall_dev_ptr_ free (before mem_alloc_.finalize)
@@ -749,26 +746,27 @@ protected:
     // the ChipCallable bytes. Each entry owns one device GM allocation
     // holding the entire ChipCallable buffer (header + storage_, with
     // each child's resolved_addr_ fixed up to its post-H2D device
-    // address). Pool-managed: identical buffer bytes share one entry
-    // across cids; the map is bulk-freed by the subclass's `finalize()`.
+    // address). Identical buffer bytes share one entry across cids; refcount
+    // drops on unregister and finalize bulk-frees any leftovers.
     struct ChipCallableBuffer {
         uint64_t chip_dev{0};  // device GM address of the ChipCallable header
         size_t total_size{0};  // byte size of the device allocation
+        int refcount{0};
     };
     std::unordered_map<uint64_t, ChipCallableBuffer> chip_callable_buffers_;
 
     // Per-callable_id registered state.
     //
-    // `callables_` maps the caller-stable callable_id to the orch SO
-    // slice + symbol names needed to launch it. `orch_so_dedup_` shares
-    // device buffers across callable_ids whose orch SO bytes have the
-    // same ELF Build-ID hash (refcounted; freed when the count hits
-    // zero). `aicpu_seen_callable_ids_` tracks which ids have completed a
-    // successful AICPU SO load so `prepare_orch_so` can advertise either a
-    // cache hit or a first-load fallback without committing early.
+    // `callables_` maps the caller-stable callable_id to the chip buffer
+    // lease, orch SO slice + symbol names needed to launch it.
+    // `aicpu_seen_callable_ids_` tracks which ids have completed a successful
+    // AICPU SO load for the monotonic dlopen counter.
     struct CallableState {
         // trb path (AICPU dlopens orch SO from device buffer)
+        // Orchestration ELF Build-ID returned by callable_hash(); distinct from
+        // chip_buffer_hash, which keys the retained buffer.
         uint64_t hash{0};
+        uint64_t chip_buffer_hash{0};
         uint64_t dev_orch_so_addr{0};
         size_t dev_orch_so_size{0};
         std::string func_name;
@@ -780,13 +778,7 @@ protected:
         void *host_dlopen_handle{nullptr};
         void *host_orch_func_ptr{nullptr};
     };
-    struct OrchSoBuffer {
-        void *dev_addr{nullptr};
-        size_t capacity{0};
-        int refcount{0};
-    };
     std::unordered_map<int32_t, CallableState> callables_;
-    std::unordered_map<uint64_t, OrchSoBuffer> orch_so_dedup_;
     std::unordered_set<int32_t> aicpu_seen_callable_ids_;
     // Monotonic count of successful AICPU dlopens (incremented after prewarm
     // or first-run fallback succeeds; never decremented). Diverges from
