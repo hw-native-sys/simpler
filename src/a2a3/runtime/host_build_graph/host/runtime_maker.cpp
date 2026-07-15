@@ -743,23 +743,18 @@ extern "C" int bind_callable_to_runtime_impl(
             return -1;
         }
 
-        // Pure write-only OUTPUT buffers carry no meaningful host content, so
-        // the H2D copy-in is wasted. Zero them on-device instead (cheap HBM
-        // memset, no PCIe) so any region the kernel leaves unwritten reads as 0
-        // rather than pooled-allocator garbage. INOUT (read-before-write)
-        // and IN keep the H2D copy. Falls back to copy_to_device if a backend
-        // did not wire device_memset.
+        // Pure write-only OUTPUT buffers are never read by the kernel and hold
+        // no meaningful host content, so they need no device staging — the
+        // kernel defines what it writes and any unwritten bytes are undefined.
+        // IN / INOUT (read-before-write) are staged H2D.
         bool is_pure_output = (signature != nullptr && i < sig_count && signature[i] == ArgDirection::OUT);
-        int rc;
-        if (is_pure_output && api->device_memset != nullptr) {
-            rc = api->device_memset(dev_ptr, 0, size);
-        } else {
-            rc = api->copy_to_device(dev_ptr, host_ptr, size);
-        }
-        if (rc != 0) {
-            LOG_ERROR("Failed to stage tensor %d to device", i);
-            api->device_free(dev_ptr);
-            return -1;
+        if (!is_pure_output) {
+            int rc = api->copy_to_device(dev_ptr, host_ptr, size);
+            if (rc != 0) {
+                LOG_ERROR("Failed to stage tensor %d to device", i);
+                api->device_free(dev_ptr);
+                return -1;
+            }
         }
         // Read-only INPUT tensors are never written by the kernel, so there is
         // no point copying them back D2H at the end. Index the signature
