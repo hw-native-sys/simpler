@@ -351,11 +351,13 @@ graph — the bare `local` counter when every task is in ring 0, or the explicit
 the selected edge set. HTML output keeps every edge in the Graphviz layout and
 colors unselected edges like the page background, so `reduced` / `omitted`
 preserve the full-graph node placement and routing while showing only the
-selected edge set. When `-o` is omitted the graph is written to a mode-specific
-stem (`deps_viewer_reduced.*` / `deps_viewer_omitted.*`) rather than
-`deps_viewer.*` so it never clobbers a full-graph render in the same directory.
-Reduction is purely structural (it ignores the per-edge tensor/arg identity)
-and is skipped with a warning if the graph contains a cycle.
+selected edge set. Selected edges are drawn above background-colored edges so
+they stay visible where routes overlap. When `-o` is omitted the graph is
+written to a mode-specific stem (`deps_viewer_reduced.*` /
+`deps_viewer_omitted.*`) rather than `deps_viewer.*` so it never clobbers a
+full-graph render in the same directory. Reduction is purely structural (it
+ignores the per-edge tensor/arg identity) and is skipped with a warning if the
+graph contains a cycle.
 
 ### Command-Line Options
 

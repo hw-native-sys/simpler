@@ -265,7 +265,7 @@ def test_emit_dot_hides_selected_edges_with_background_color():
         hidden_edges={(1, 2)},
     )
 
-    assert 'T0_1 -> T0_2 [color="#eef2f7", fontcolor="#eef2f7"];' in dot
+    assert 'T0_1 -> T0_2 [class="hidden-edge", color="#eef2f7", fontcolor="#eef2f7"];' in dot
     assert "T0_2 -> T0_3;" in dot
 
 
