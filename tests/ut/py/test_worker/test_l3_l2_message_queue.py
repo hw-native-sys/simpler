@@ -11,12 +11,12 @@ import ctypes
 import math
 import struct
 from dataclasses import dataclass
-from enum import IntEnum
 from multiprocessing.shared_memory import SharedMemory
 from typing import Optional
 
 import pytest
 from simpler import l3_l2_orch_comm
+from simpler import worker as worker_module
 from simpler.l3_l2_message_queue import (
     L3L2_QUEUE_COUNTER_BYTES,
     L3L2_QUEUE_DESC_SLOT_BYTES,
@@ -40,17 +40,9 @@ from simpler.task_interface import DataType, Tensor, get_element_size
 from simpler.worker import _IDLE, _OFF_STATE, Worker, _buffer_field_addr, _mailbox_store_i32
 
 
-class L3L2OrchCommCmd(IntEnum):
-    ALLOC_REGION = 1
-    PAYLOAD_WRITE = 3
-    PAYLOAD_READ = 4
-    SIGNAL_NOTIFY = 5
-    SIGNAL_TEST = 7
-
-
 @dataclass(frozen=True)
 class _FakeRequest:
-    cmd: L3L2OrchCommCmd
+    cmd: str
     op: int = 0
     region_id: int = 1
     payload_offset: int = 0
@@ -92,8 +84,8 @@ class _FakeCWorker:
                 int(L3L2RegionAccessProfile.SIM_POSIX_SHM),
                 0,
                 0,
-                b"\x00" * l3_l2_orch_comm.ACL_IPC_EXPORT_KEY_BYTES,
-                backing_name + b"\x00" * (l3_l2_orch_comm.CTRL_SHM_TOKEN_BYTES - len(backing_name)),
+                b"\x00" * l3_l2_orch_comm._ACL_IPC_EXPORT_KEY_BYTES,
+                backing_name + b"\x00" * (l3_l2_orch_comm._CTRL_SHM_TOKEN_BYTES - len(backing_name)),
                 counter_offset + counter_bytes,
             )
         finally:
@@ -114,7 +106,7 @@ class _FakeCOrch:
     def alloc(self, shape, dtype):
         if self.fail_next_alloc:
             self.fail_next_alloc = False
-            raise RuntimeError("injected staging allocation failure")
+            raise RuntimeError("injected allocation failure")
         nbytes = math.prod(int(x) for x in shape) * int(get_element_size(dtype))
         storage_t = ctypes.c_uint8 * nbytes
         storage = storage_t()
@@ -133,8 +125,8 @@ class _FakeClient:
         self.payload = bytearray()
         self.counters: dict[int, int] = {}
         self.peer_abort = False
-        self.fail_next_cmd: Optional[L3L2OrchCommCmd] = None
-        self.original_helpers: dict[str, object] = {}
+        self.fail_next_cmd: Optional[str] = None
+        self.original_helpers: list[tuple[object, str, object]] = []
 
     def import_region(self, _token: str, mapping_bytes: int) -> int:
         self.payload = bytearray(int(mapping_bytes))
@@ -144,7 +136,7 @@ class _FakeClient:
         self.requests.append(
             (
                 _FakeRequest(
-                    cmd=L3L2OrchCommCmd.ALLOC_REGION,
+                    cmd="alloc_region",
                     payload_bytes=self.counter_mapping_offset,
                     counter_bytes=L3L2_QUEUE_COUNTER_BYTES,
                 ),
@@ -155,7 +147,7 @@ class _FakeClient:
 
     def payload_write(self, handle: int, offset: int, host_ptr: int, nbytes: int) -> None:
         request = _FakeRequest(
-            cmd=L3L2OrchCommCmd.PAYLOAD_WRITE,
+            cmd="payload_write",
             payload_offset=int(offset),
             host_ptr=int(host_ptr),
             payload_bytes=int(nbytes),
@@ -163,7 +155,7 @@ class _FakeClient:
         self.requests.append((request, 0.0))
         if self.fail_next_cmd == request.cmd:
             self.fail_next_cmd = None
-            raise RuntimeError(f"injected failure for {request.cmd.name}")
+            raise RuntimeError(f"injected failure for {request.cmd}")
         data = ctypes.string_at(int(host_ptr), int(nbytes))
         self.payload_writes.append((int(offset), data))
         begin = int(offset)
@@ -171,13 +163,13 @@ class _FakeClient:
 
     def payload_read(self, handle: int, offset: int, host_ptr: int, nbytes: int) -> None:
         request = _FakeRequest(
-            cmd=L3L2OrchCommCmd.PAYLOAD_READ,
+            cmd="payload_read",
             payload_offset=int(offset),
             host_ptr=int(host_ptr),
             payload_bytes=int(nbytes),
         )
         self.requests.append((request, 0.0))
-        if request.cmd == L3L2OrchCommCmd.PAYLOAD_WRITE:
+        if request.cmd == "payload_write":
             raise AssertionError("unreachable")
         begin = int(offset)
         data = bytes(self.payload[begin : begin + int(nbytes)])
@@ -186,7 +178,7 @@ class _FakeClient:
     def counter_notify(self, handle: int, offset: int, value: int, op: int) -> None:
         logical_offset = int(offset) - self.counter_mapping_offset
         request = _FakeRequest(
-            cmd=L3L2OrchCommCmd.SIGNAL_NOTIFY,
+            cmd="counter_notify",
             op=int(op),
             counter_addr=self.counter_base + logical_offset,
             counter_operand=int(value),
@@ -205,13 +197,13 @@ class _FakeClient:
             else self.counters.get(logical_offset, 0)
         )
         request = _FakeRequest(
-            cmd=L3L2OrchCommCmd.SIGNAL_TEST,
+            cmd="counter_test",
             op=int(cmp),
             counter_addr=self.counter_base + logical_offset,
             counter_operand=int(operand),
         )
         self.requests.append((request, 0.0))
-        return _compare_counter(observed, int(operand), int(cmp)), observed
+        return _test_compare_counter(observed, int(operand), int(cmp)), observed
 
     def counter_wait(self, handle: int, offset: int, operand: int, cmp: int, timeout_ns: int):
         matched, observed = self.counter_test(handle, offset, operand, cmp)
@@ -220,7 +212,7 @@ class _FakeClient:
         return (-1, 7, observed, False, "SIGNAL_WAIT timed out")
 
 
-def _compare_counter(observed: int, operand: int, cmp: int) -> bool:
+def _test_compare_counter(observed: int, operand: int, cmp: int) -> bool:
     if cmp == int(WaitCmp.EQ):
         return observed == operand
     if cmp == int(WaitCmp.NE):
@@ -242,21 +234,21 @@ def _make_orchestrator() -> tuple[Orchestrator, Worker, SharedMemory, _FakeClien
     assert shm.buf is not None
     _mailbox_store_i32(_buffer_field_addr(shm.buf, _OFF_STATE), _IDLE)
     fake_client = _FakeClient()
-    fake_client.original_helpers = {
-        "_l3_host_mapped_region_import_sim": l3_l2_orch_comm._l3_host_mapped_region_import_sim,
-        "_l3_host_mapped_payload_write": l3_l2_orch_comm._l3_host_mapped_payload_write,
-        "_l3_host_mapped_payload_read": l3_l2_orch_comm._l3_host_mapped_payload_read,
-        "_l3_host_mapped_counter_notify": l3_l2_orch_comm._l3_host_mapped_counter_notify,
-        "_l3_host_mapped_counter_test": l3_l2_orch_comm._l3_host_mapped_counter_test,
-        "_l3_host_mapped_counter_wait": l3_l2_orch_comm._l3_host_mapped_counter_wait,
-        "_l3_host_mapped_region_close": l3_l2_orch_comm._l3_host_mapped_region_close,
-    }
+    fake_client.original_helpers = [
+        (worker_module, "_l3_host_mapped_region_import_sim", worker_module._l3_host_mapped_region_import_sim),
+        (l3_l2_orch_comm, "_l3_host_mapped_payload_write", l3_l2_orch_comm._l3_host_mapped_payload_write),
+        (l3_l2_orch_comm, "_l3_host_mapped_payload_read", l3_l2_orch_comm._l3_host_mapped_payload_read),
+        (l3_l2_orch_comm, "_l3_host_mapped_counter_notify", l3_l2_orch_comm._l3_host_mapped_counter_notify),
+        (l3_l2_orch_comm, "_l3_host_mapped_counter_test", l3_l2_orch_comm._l3_host_mapped_counter_test),
+        (l3_l2_orch_comm, "_l3_host_mapped_counter_wait", l3_l2_orch_comm._l3_host_mapped_counter_wait),
+        (l3_l2_orch_comm, "_l3_host_mapped_region_close", l3_l2_orch_comm._l3_host_mapped_region_close),
+    ]
     worker._initialized = True
     worker._hierarchical_started = True
     worker._worker = _FakeCWorker()
     worker._chip_shms = [shm]
     worker._l3_l2_test_fake_client = fake_client
-    l3_l2_orch_comm._l3_host_mapped_region_import_sim = fake_client.import_region
+    worker_module._l3_host_mapped_region_import_sim = fake_client.import_region
     l3_l2_orch_comm._l3_host_mapped_payload_write = fake_client.payload_write
     l3_l2_orch_comm._l3_host_mapped_payload_read = fake_client.payload_read
     l3_l2_orch_comm._l3_host_mapped_counter_notify = fake_client.counter_notify
@@ -270,8 +262,8 @@ def _close(worker: Worker, shm: SharedMemory) -> None:
     worker._close_l3_l2_orch_comm()
     fake_client = getattr(worker, "_l3_l2_test_fake_client", None)
     if fake_client is not None:
-        for name, helper in fake_client.original_helpers.items():
-            setattr(l3_l2_orch_comm, name, helper)
+        for module, name, helper in fake_client.original_helpers:
+            setattr(module, name, helper)
     shm.close()
     shm.unlink()
 
@@ -383,7 +375,7 @@ def test_create_l3_l2_queue_allocates_region_and_exposes_l2_task_scalars():
         queue = orch.create_l3_l2_queue(worker_id=0, depth=4, input_arena_bytes=128, output_arena_bytes=192)
 
         alloc_req = fake_client.requests[0][0]
-        assert alloc_req.cmd == L3L2OrchCommCmd.ALLOC_REGION
+        assert alloc_req.cmd == "alloc_region"
         assert alloc_req.payload_bytes == queue.layout.payload_bytes
         assert alloc_req.counter_bytes == L3L2_QUEUE_COUNTER_BYTES
         assert queue.l2_task_arg_scalars() == [
@@ -439,7 +431,7 @@ def test_zero_byte_enqueue_skips_message_payload_write_and_publishes_descriptor(
         assert queue.layout.input_arena_offset not in payload_write_offsets
         assert queue.layout.input_desc_offset in payload_write_offsets
         notify_req = fake_client.requests[-1][0]
-        assert notify_req.cmd == L3L2OrchCommCmd.SIGNAL_NOTIFY
+        assert notify_req.cmd == "counter_notify"
         assert notify_req.op == int(NotifyOp.Set)
         assert notify_req.counter_addr == queue.region.descriptor.counter_base + queue.layout.input_desc_tail_offset
         assert notify_req.counter_operand == 1
@@ -447,7 +439,7 @@ def test_zero_byte_enqueue_skips_message_payload_write_and_publishes_descriptor(
         _close(worker, shm)
 
 
-def test_enqueue_registered_tensor_uses_fast_path_without_staging():
+def test_enqueue_registered_tensor_uses_direct_payload_write_without_extra_alloc():
     orch, worker, shm, fake_client = _make_orchestrator()
     try:
         queue = orch.create_l3_l2_queue(worker_id=0, depth=4, input_arena_bytes=128, output_arena_bytes=128)
@@ -461,7 +453,7 @@ def test_enqueue_registered_tensor_uses_fast_path_without_staging():
         payload_write_offsets = [offset for offset, _data in fake_client.payload_writes]
         assert queue.layout.input_arena_offset in payload_write_offsets
         assert queue.layout.input_desc_offset in payload_write_offsets
-        assert all(req.cmd != L3L2OrchCommCmd.ALLOC_REGION for req, _timeout in fake_client.requests)
+        assert all(req.cmd != "alloc_region" for req, _timeout in fake_client.requests)
         assert len(orch._o._buffers) == alloc_count
     finally:
         _close(worker, shm)
@@ -484,7 +476,7 @@ def test_enqueue_replays_released_descriptors_before_reusing_input_arena():
         _close(worker, shm)
 
 
-def test_enqueue_accepts_ordinary_host_bytes_without_queue_staging():
+def test_enqueue_accepts_ordinary_host_bytes_with_direct_payload_write():
     orch, worker, shm, fake_client = _make_orchestrator()
     try:
         queue = orch.create_l3_l2_queue(worker_id=0, depth=4, input_arena_bytes=128, output_arena_bytes=128)
@@ -504,7 +496,7 @@ def test_enqueue_accepts_ordinary_host_bytes_without_queue_staging():
         _close(worker, shm)
 
 
-def test_l3_host_mapped_queue_ordinary_input_delegates_staging_to_primitive(monkeypatch):
+def test_l3_host_mapped_queue_ordinary_input_uses_direct_payload_write(monkeypatch):
     orch = _FakeCOrch()
     layout = make_l3_l2_queue_layout(4, 128, 128)
     desc = L3L2OrchRegionDesc(
@@ -561,12 +553,10 @@ def test_l3_host_mapped_queue_ordinary_input_delegates_staging_to_primitive(monk
 
     assert (layout.input_arena_offset, b"ordinary") in payload_writes
     assert len(orch._buffers) == alloc_count
-    l3_host_mapping = region._l3_host_mapping
-    assert l3_host_mapping is not None
-    assert counters[l3_host_mapping.counter_offset + layout.input_desc_tail_offset] == 1
+    assert counters[region._l3_host_mapping.counter_offset + layout.input_desc_tail_offset] == 1
 
 
-def test_direct_mapped_ordinary_host_bytearray_does_not_use_queue_staging():
+def test_direct_mapped_ordinary_host_bytearray_does_not_allocate_queue_buffer():
     orch, worker, shm, fake_client = _make_orchestrator()
     try:
         queue = orch.create_l3_l2_queue(worker_id=0, depth=4, input_arena_bytes=128, output_arena_bytes=128)
@@ -649,7 +639,7 @@ def test_try_dequeue_into_empty_returns_none_without_abort():
         assert fake_client.counters.get(queue.layout.output_desc_head_offset, 0) == 0
         assert all(
             not (
-                req.cmd == L3L2OrchCommCmd.SIGNAL_NOTIFY
+                req.cmd == "counter_notify"
                 and req.counter_addr == queue.region.descriptor.counter_base + L3L2_QUEUE_L3_ABORT_FLAG_OFFSET
             )
             for req, _timeout in fake_client.requests
@@ -658,7 +648,7 @@ def test_try_dequeue_into_empty_returns_none_without_abort():
         _close(worker, shm)
 
 
-def test_output_read_into_ordinary_buffer_uses_lazy_staging():
+def test_output_read_into_ordinary_buffer_uses_direct_payload_read():
     orch, worker, shm, fake_client = _make_orchestrator()
     try:
         queue = orch.create_l3_l2_queue(worker_id=0, depth=4, input_arena_bytes=128, output_arena_bytes=128)
@@ -671,7 +661,7 @@ def test_output_read_into_ordinary_buffer_uses_lazy_staging():
         queue.output.release(handle)
 
         assert bytes(output) == b"abcdefghijklmnop"
-        assert any(req.cmd == L3L2OrchCommCmd.PAYLOAD_READ for req, _timeout in fake_client.requests)
+        assert any(req.cmd == "payload_read" for req, _timeout in fake_client.requests)
         assert fake_client.counters[queue.layout.output_desc_head_offset] == 1
         assert fake_client.counters.get(L3L2_QUEUE_L3_ABORT_FLAG_OFFSET, 0) == 0
     finally:
@@ -689,7 +679,7 @@ def test_output_read_rejects_readonly_ordinary_buffer_before_release():
         with pytest.raises(ValueError, match="writable"):
             queue.output.read_into(handle, b"readonly-read-buf")
 
-        assert all(req.cmd != L3L2OrchCommCmd.PAYLOAD_READ for req, _timeout in fake_client.requests)
+        assert all(req.cmd != "payload_read" for req, _timeout in fake_client.requests)
         assert fake_client.counters.get(queue.layout.output_desc_head_offset, 0) == 0
         assert fake_client.counters.get(L3L2_QUEUE_L3_ABORT_FLAG_OFFSET, 0) == 0
     finally:
@@ -754,7 +744,7 @@ def test_zero_byte_output_read_accepts_none_and_skips_payload_read():
         queue.output.read_into(handle, None)
         queue.output.release(handle)
 
-        assert all(req.cmd != L3L2OrchCommCmd.PAYLOAD_READ for req, _timeout in fake_client.requests)
+        assert all(req.cmd != "payload_read" for req, _timeout in fake_client.requests)
         assert fake_client.counters[queue.layout.output_desc_head_offset] == 1
     finally:
         _close(worker, shm)
@@ -871,9 +861,7 @@ def test_output_payload_offset_mismatch_poisons_before_payload_read():
 
         assert fake_client.counters[L3L2_QUEUE_L3_ABORT_FLAG_OFFSET] == 1
         assert all(
-            not (
-                req.cmd == L3L2OrchCommCmd.PAYLOAD_READ and req.payload_offset == queue.layout.output_arena_offset + 16
-            )
+            not (req.cmd == "payload_read" and req.payload_offset == queue.layout.output_arena_offset + 16)
             for req, _timeout in fake_client.requests
         )
     finally:
@@ -885,7 +873,7 @@ def test_enqueue_payload_write_failure_sets_l3_abort_flag():
     try:
         queue = orch.create_l3_l2_queue(worker_id=0, depth=4, input_arena_bytes=128, output_arena_bytes=128)
         host = orch.alloc([16], DataType.UINT8)
-        fake_client.fail_next_cmd = L3L2OrchCommCmd.PAYLOAD_WRITE
+        fake_client.fail_next_cmd = "payload_write"
 
         with pytest.raises(RuntimeError, match="injected failure"):
             queue.input.enqueue(host, nbytes=16, timeout=0.001)
@@ -909,7 +897,7 @@ def test_timeout_without_peer_abort_flag_returns_timeout_and_keeps_queue_live():
         assert queue.region.descriptor_scalars()[1] == 1
         assert all(
             not (
-                req.cmd == L3L2OrchCommCmd.SIGNAL_NOTIFY
+                req.cmd == "counter_notify"
                 and req.counter_addr == queue.region.descriptor.counter_base + L3L2_QUEUE_L3_ABORT_FLAG_OFFSET
             )
             for req, _timeout in fake_client.requests
@@ -932,7 +920,7 @@ def test_timeout_with_peer_abort_flag_reports_remote_aborted_without_setting_own
             queue.input.try_enqueue(None, nbytes=0)
         assert all(
             not (
-                req.cmd == L3L2OrchCommCmd.SIGNAL_NOTIFY
+                req.cmd == "counter_notify"
                 and req.counter_addr == queue.region.descriptor.counter_base + L3L2_QUEUE_L3_ABORT_FLAG_OFFSET
             )
             for req, _timeout in fake_client.requests

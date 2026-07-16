@@ -16,30 +16,16 @@ from dataclasses import dataclass
 from enum import IntEnum
 from typing import Any
 
-try:
-    from _task_interface import (  # pyright: ignore[reportMissingImports]
-        _l3_host_mapped_counter_notify,
-        _l3_host_mapped_counter_test,
-        _l3_host_mapped_counter_wait,
-        _l3_host_mapped_payload_read,
-        _l3_host_mapped_payload_write,
-        _l3_host_mapped_region_close,
-        _l3_host_mapped_region_import_onboard,
-        _l3_host_mapped_region_import_sim,
-    )
-except ImportError:
+from _task_interface import (  # pyright: ignore[reportMissingImports]
+    _l3_host_mapped_counter_notify,
+    _l3_host_mapped_counter_test,
+    _l3_host_mapped_counter_wait,
+    _l3_host_mapped_payload_read,
+    _l3_host_mapped_payload_write,
+    _l3_host_mapped_region_close,
+)
 
-    def _missing_l3_host_helper(*_: Any) -> Any:
-        raise RuntimeError("L3-L2 L3 Host mapped-region helpers are unavailable; rebuild _task_interface")
-
-    _l3_host_mapped_counter_notify = _missing_l3_host_helper
-    _l3_host_mapped_counter_test = _missing_l3_host_helper
-    _l3_host_mapped_counter_wait = _missing_l3_host_helper
-    _l3_host_mapped_payload_read = _missing_l3_host_helper
-    _l3_host_mapped_payload_write = _missing_l3_host_helper
-    _l3_host_mapped_region_close = _missing_l3_host_helper
-    _l3_host_mapped_region_import_onboard = _missing_l3_host_helper
-    _l3_host_mapped_region_import_sim = _missing_l3_host_helper
+from .task_interface import Tensor
 
 
 class NotifyOp(IntEnum):
@@ -70,13 +56,13 @@ class L3L2RegionAccessProfile(IntEnum):
 _MAX_SIGNED_CHRONO_TIMEOUT_NS = 2**63 - 1
 
 _DESC = struct.Struct("<6Q")
-L3L2_ORCH_REGION_DESC_SCALAR_COUNT = 6
-ACL_IPC_EXPORT_KEY_BYTES = 65
-CTRL_SHM_TOKEN_BYTES = 32
+_L3L2_ORCH_REGION_DESC_SCALAR_COUNT = 6
+_ACL_IPC_EXPORT_KEY_BYTES = 65
+_CTRL_SHM_TOKEN_BYTES = 32
 _REGION_CREATE_REQUEST = struct.Struct("<QQQQi4x")
-_REGION_CREATE_REPLY = struct.Struct(f"<6QIIi{ACL_IPC_EXPORT_KEY_BYTES}s{CTRL_SHM_TOKEN_BYTES}s3xQ")
-REGION_CREATE_REQUEST_BYTES = _REGION_CREATE_REQUEST.size
-REGION_CREATE_REPLY_BYTES = _REGION_CREATE_REPLY.size
+_REGION_CREATE_REPLY = struct.Struct(f"<6QIIi{_ACL_IPC_EXPORT_KEY_BYTES}s{_CTRL_SHM_TOKEN_BYTES}s3xQ")
+_REGION_CREATE_REQUEST_BYTES = _REGION_CREATE_REQUEST.size
+_REGION_CREATE_REPLY_BYTES = _REGION_CREATE_REPLY.size
 _REGION_LAYOUT_ALIGNMENT = 64
 _UINT64_MAX = (1 << 64) - 1
 _REGION_MAGIC_VERSION = 0x4C334C3200020000
@@ -99,22 +85,6 @@ def _checked_add_u64(lhs: int, rhs: int) -> int:
     if int(lhs) < 0 or int(rhs) < 0 or result > _UINT64_MAX:
         raise ValueError("L3-L2 region layout overflowed uint64")
     return result
-
-
-def _compare_counter(observed: int, operand: int, cmp: WaitCmp) -> bool:
-    if cmp == WaitCmp.EQ:
-        return observed == operand
-    if cmp == WaitCmp.NE:
-        return observed != operand
-    if cmp == WaitCmp.GT:
-        return observed > operand
-    if cmp == WaitCmp.GE:
-        return observed >= operand
-    if cmp == WaitCmp.LT:
-        return observed < operand
-    if cmp == WaitCmp.LE:
-        return observed <= operand
-    return False
 
 
 @dataclass(frozen=True)
@@ -251,24 +221,16 @@ def validate_region_create_reply(
 
 
 class _PinnedBuffer:
-    def __init__(self, obj: Any, owner: Any, *, writable: bool = False, has_l3_host_mapping: bool = False) -> None:
-        from .task_interface import Tensor  # noqa: PLC0415
-
+    def __init__(self, obj: Any, *, writable: bool = False) -> None:
         self._keepalive: Any = obj
         if isinstance(obj, Tensor):
-            if has_l3_host_mapping:
-                if obj.child_memory:
-                    raise ValueError("L3-L2 payload buffer must be host storage, not child_memory device storage")
-                if not obj.is_contiguous:
-                    raise ValueError("L3-L2 payload buffer must be contiguous")
-            else:
-                owner._validate_l3_l2_orch_comm_host_buffer(obj)
+            if obj.child_memory:
+                raise ValueError("L3-L2 payload buffer must be host storage, not child_memory device storage")
+            if not obj.is_contiguous:
+                raise ValueError("L3-L2 payload buffer must be contiguous")
             self.addr = int(obj.data)
             self.nbytes = int(obj.nbytes())
             return
-
-        if not has_l3_host_mapping:
-            raise ValueError("L3-L2 payload buffer must be a Tensor returned by orch.alloc(...)")
 
         try:
             view = memoryview(obj)
@@ -341,7 +303,7 @@ class L3L2OrchRegion:
         owner: Any,
         worker_id: int,
         desc: L3L2OrchRegionDesc,
-        l3_host_mapping: L3HostRegionMapping | None = None,
+        l3_host_mapping: L3HostRegionMapping,
     ) -> None:
         self._owner = owner
         self._worker_id = int(worker_id)
@@ -365,35 +327,25 @@ class L3L2OrchRegion:
 
     def payload_write(self, offset: int, host_buffer: Any, nbytes: int | None = None) -> None:
         self._ensure_live()
-        l3_host_mapping = self._l3_host_mapping
-        with _PinnedBuffer(host_buffer, self._owner, has_l3_host_mapping=l3_host_mapping is not None) as pinned:
+        with _PinnedBuffer(host_buffer) as pinned:
             size = pinned.nbytes if nbytes is None else int(nbytes)
             self._validate_payload_range(offset, size, pinned.nbytes)
-            if l3_host_mapping is not None:
-                try:
-                    _l3_host_mapped_payload_write(l3_host_mapping.handle, int(offset), pinned.addr, size)
-                except Exception:
-                    self._poison()
-                    raise
-                return
-            raise RuntimeError("L3-L2 region has no L3 Host mapped payload backend")
+            try:
+                _l3_host_mapped_payload_write(self._l3_host_mapping.handle, int(offset), pinned.addr, size)
+            except Exception:
+                self._poison()
+                raise
 
     def payload_read(self, offset: int, host_buffer: Any, nbytes: int | None = None) -> None:
         self._ensure_live()
-        l3_host_mapping = self._l3_host_mapping
-        with _PinnedBuffer(
-            host_buffer, self._owner, writable=True, has_l3_host_mapping=l3_host_mapping is not None
-        ) as pinned:
+        with _PinnedBuffer(host_buffer, writable=True) as pinned:
             size = pinned.nbytes if nbytes is None else int(nbytes)
             self._validate_payload_range(offset, size, pinned.nbytes)
-            if l3_host_mapping is not None:
-                try:
-                    _l3_host_mapped_payload_read(l3_host_mapping.handle, int(offset), pinned.addr, size)
-                except Exception:
-                    self._poison()
-                    raise
-                return
-            raise RuntimeError("L3-L2 region has no L3 Host mapped payload backend")
+            try:
+                _l3_host_mapped_payload_read(self._l3_host_mapping.handle, int(offset), pinned.addr, size)
+            except Exception:
+                self._poison()
+                raise
 
     def counter(self, offset: int) -> L3L2OrchCounter:
         self._ensure_live()
@@ -434,8 +386,6 @@ class L3L2OrchRegion:
             raise ValueError(f"L3-L2 payload range [{offset}, {offset + nbytes}) exceeds region size {payload_bytes}")
 
     def _close_l3_host_mapping(self) -> None:
-        if self._l3_host_mapping is None:
-            return
         try:
             self._l3_host_mapping.close()
         except Exception:
@@ -444,7 +394,6 @@ class L3L2OrchRegion:
 
     def _direct_counter_notify(self, offset: int, value: int, op: NotifyOp) -> None:
         l3_host_mapping = self._l3_host_mapping
-        assert l3_host_mapping is not None
         mapping_offset = int(l3_host_mapping.counter_offset) + int(offset)
         try:
             _l3_host_mapped_counter_notify(l3_host_mapping.handle, mapping_offset, int(value), int(op))
@@ -454,7 +403,6 @@ class L3L2OrchRegion:
 
     def _direct_counter_test(self, offset: int, cmp_value: int, cmp: WaitCmp) -> SignalTestResult:
         l3_host_mapping = self._l3_host_mapping
-        assert l3_host_mapping is not None
         mapping_offset = int(l3_host_mapping.counter_offset) + int(offset)
         try:
             matched, observed = _l3_host_mapped_counter_test(
@@ -467,7 +415,6 @@ class L3L2OrchRegion:
 
     def _direct_counter_wait(self, offset: int, cmp_value: int, cmp: WaitCmp, timeout_ns: int) -> int:
         l3_host_mapping = self._l3_host_mapping
-        assert l3_host_mapping is not None
         mapping_offset = int(l3_host_mapping.counter_offset) + int(offset)
         try:
             status, error_kind, observed, _matched, message = _l3_host_mapped_counter_wait(

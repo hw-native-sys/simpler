@@ -277,8 +277,6 @@ class L3L2Queue:
         self._input_payload_head = 0
         self._output_payload_head = 0
         self._output_active: L3L2QueueMessage | None = None
-        self._staging_tensor: Tensor | None = None
-        self._staging_nbytes = 0
         self._stop_published = False
         self.input = _L3InputQueue(self)
         self.output = _L3OutputQueue(self)
@@ -346,33 +344,6 @@ class L3L2Queue:
             return None
         return self._validate_registered_buffer(buffer, nbytes)
 
-    def _ensure_staging_capacity(self, nbytes: int) -> Tensor:
-        nbytes = int(nbytes)
-        if self._staging_tensor is None or self._staging_nbytes < nbytes:
-            tensor: Tensor = self._orch.alloc([nbytes], DataType.UINT8)
-            self._staging_tensor = tensor
-            self._staging_nbytes = int(tensor.nbytes())
-            return tensor
-        return self._staging_tensor
-
-    def _copy_host_span_to_tensor(self, span: _HostByteSpan, tensor: Tensor) -> None:
-        if span.nbytes == 0:
-            return
-        if span.ptr is not None:
-            ctypes.memmove(int(tensor.data), span.ptr, span.nbytes)
-            return
-        assert span.view is not None
-        ctypes.memmove(int(tensor.data), span.view[: span.nbytes].tobytes(), span.nbytes)
-
-    def _copy_tensor_to_host_span(self, tensor: Tensor, span: _HostByteSpan) -> None:
-        if span.nbytes == 0:
-            return
-        if span.ptr is not None:
-            ctypes.memmove(span.ptr, int(tensor.data), span.nbytes)
-            return
-        assert span.view is not None
-        span.view[: span.nbytes] = ctypes.string_at(int(tensor.data), span.nbytes)
-
     def _refresh_counter(self, offset: int, local_value: int, depth: int) -> int:
         result = self._signal_test(offset, local_value & 0xFFFF_FFFF, WaitCmp.NE)
         if not result.matched:
@@ -397,11 +368,7 @@ class L3L2Queue:
             return
         self._state = _QueueState.POISONED_LOCAL
         try:
-            l3_host_mapping = getattr(self._region, "_l3_host_mapping", None)
-            if l3_host_mapping is not None:
-                self._region._direct_counter_notify(self._layout.l3_abort_flag_offset, 1, NotifyOp.Set)
-            else:
-                self._region.counter(self._layout.l3_abort_flag_offset).notify(1, NotifyOp.Set)
+            self._region._direct_counter_notify(self._layout.l3_abort_flag_offset, 1, NotifyOp.Set)
         except Exception:
             pass
 
@@ -509,7 +476,7 @@ class _L3InputQueue:
         nbytes = int(nbytes)
         if nbytes < 0:
             raise ValueError("L3-L2 queue nbytes must be non-negative")
-        payload_tensor, staged_span = self._resolve_payload_source(buffer_or_none, nbytes)
+        payload_buffer = self._resolve_payload_source(buffer_or_none, nbytes)
 
         queue._ensure_live()
         if queue._stop_published:
@@ -533,9 +500,7 @@ class _L3InputQueue:
             payload_offset, next_payload_tail = self._reserve_payload_range(nbytes, next_payload_tail)
             if payload_offset < 0:
                 return False
-            if staged_span is not None:
-                payload_tensor = self._materialize_staged_payload(buffer_or_none, staged_span, nbytes)
-            queue._run_primitive(queue._region.payload_write, payload_offset, payload_tensor, nbytes=nbytes)
+            queue._run_primitive(queue._region.payload_write, payload_offset, payload_buffer, nbytes=nbytes)
             queue._input_payload_tail = next_payload_tail + nbytes
 
         seq = queue._input_tail + 1
@@ -548,15 +513,16 @@ class _L3InputQueue:
             queue._stop_published = True
         return True
 
-    def _resolve_payload_source(self, buffer_or_none: Any, nbytes: int) -> tuple[Any | None, _HostByteSpan | None]:
+    def _resolve_payload_source(self, buffer_or_none: Any, nbytes: int) -> Any | None:
         if nbytes == 0:
             if buffer_or_none is not None:
                 raise ValueError("L3-L2 queue zero-byte enqueue requires buffer_or_none == None")
-            return None, None
+            return None
         payload_tensor = self._queue._registered_buffer_or_none(buffer_or_none, nbytes)
         if payload_tensor is not None:
-            return payload_tensor, None
-        return None, _host_byte_span(buffer_or_none, nbytes, writable=False)
+            return payload_tensor
+        _host_byte_span(buffer_or_none, nbytes, writable=False)
+        return buffer_or_none
 
     def _reserve_payload_range(self, nbytes: int, next_payload_tail: int) -> tuple[int, int]:
         queue = self._queue
@@ -567,14 +533,6 @@ class _L3InputQueue:
         if next_payload_tail + nbytes - queue._input_payload_head > queue._layout.input_arena_bytes:
             return -1, next_payload_tail
         return queue._layout.input_arena_offset + arena_pos, next_payload_tail
-
-    def _materialize_staged_payload(self, buffer_or_none: Any, staged_span: _HostByteSpan, nbytes: int) -> Any:
-        queue = self._queue
-        if getattr(queue._region, "_l3_host_mapping", None) is not None:
-            return buffer_or_none
-        payload_tensor = queue._ensure_staging_capacity(nbytes)
-        queue._copy_host_span_to_tensor(staged_span, payload_tensor)
-        return payload_tensor
 
 
 class _L3OutputQueue:
@@ -642,16 +600,10 @@ class _L3OutputQueue:
                 raise ValueError("L3-L2 queue zero-byte output read requires buffer == None")
             return
         target = queue._registered_buffer_or_none(buffer, handle.payload_nbytes)
-        target_span = None
         if target is None:
-            target_span = _host_byte_span(buffer, handle.payload_nbytes, writable=True)
-            if getattr(queue._region, "_l3_host_mapping", None) is None:
-                target = queue._ensure_staging_capacity(handle.payload_nbytes)
-            else:
-                target = buffer
+            _host_byte_span(buffer, handle.payload_nbytes, writable=True)
+            target = buffer
         queue._run_primitive(queue._region.payload_read, handle.payload_offset, target, nbytes=handle.payload_nbytes)
-        if target_span is not None and getattr(queue._region, "_l3_host_mapping", None) is None:
-            queue._copy_tensor_to_host_span(target, target_span)
 
     def release(self, handle: L3L2QueueMessage) -> None:
         queue = self._queue

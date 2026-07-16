@@ -44,6 +44,8 @@ target_include_directories(_task_interface PRIVATE
     ${CMAKE_SOURCE_DIR}/src/common/task_interface
     ${CMAKE_SOURCE_DIR}/src/common/worker
     ${CMAKE_SOURCE_DIR}/src/common/hierarchical
+    ${CMAKE_SOURCE_DIR}/src/common/platform/include/common
+    ${CMAKE_SOURCE_DIR}/src/common/platform/include/host
     ${CMAKE_CURRENT_SOURCE_DIR}
 )
 

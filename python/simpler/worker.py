@@ -80,6 +80,10 @@ from _task_interface import (  # pyright: ignore[reportMissingImports]
     MAX_REGISTERED_CALLABLE_IDS,
     RUNTIME_ENV_RING_COUNT,
     WorkerType,
+    _l3_child_onboard_region_close,
+    _l3_child_onboard_region_export,
+    _l3_host_mapped_region_import_onboard,
+    _l3_host_mapped_region_import_sim,
     _mailbox_load_i32,
     _mailbox_store_i32,
     read_args_from_blob,
@@ -98,6 +102,23 @@ from .callable_identity import (
     parse_python_callable_payload,
     parse_python_import_target,
 )
+from .l3_l2_orch_comm import (
+    _ACL_IPC_EXPORT_KEY_BYTES,
+    _CTRL_SHM_TOKEN_BYTES,
+    _REGION_CREATE_REPLY,
+    _REGION_CREATE_REPLY_BYTES,
+    _REGION_CREATE_REQUEST,
+    _REGION_CREATE_REQUEST_BYTES,
+    L3HostRegionMapping,
+    L3L2OrchRegion,
+    L3L2RegionAccessProfile,
+    L3L2RegionCreateRequest,
+    _align_up,
+    _checked_add_u64,
+    decode_region_create_reply,
+    peek_region_create_reply_region_id,
+    validate_region_create_reply,
+)
 from .orchestrator import Orchestrator
 from .task_interface import (
     MAILBOX_ERROR_MSG_SIZE,
@@ -113,6 +134,7 @@ from .task_interface import (
     RemoteBufferExport,
     RemoteBufferHandle,
     TaskArgs,
+    Tensor,
     _Worker,
 )
 
@@ -1080,25 +1102,23 @@ def _next_l2_host_l3_l2_region_id(cw: ChipWorker) -> int:
     return region_id
 
 
+def _release_l2_host_l3_l2_region(cw: ChipWorker, region: _L2HostL3L2Region) -> None:
+    if region.shm is not None:
+        region.shm.close()
+        region.shm.unlink()
+        return
+    if region.dev_ptr:
+        if region.export_key:
+            try:
+                _l3_child_onboard_region_close(region.export_key)
+            except RuntimeError:
+                pass
+        cw.free(region.dev_ptr)
+
+
 def _handle_ctrl_l3_l2_region_create(  # noqa: PLR0912
     cw: ChipWorker, buf: memoryview, chip_platform: str
 ) -> None:
-    from _task_interface import (  # pyright: ignore[reportMissingImports]  # noqa: PLC0415
-        _l3_child_onboard_region_close,
-        _l3_child_onboard_region_export,
-    )
-
-    from .l3_l2_orch_comm import (  # noqa: PLC0415
-        _REGION_CREATE_REPLY,
-        _REGION_CREATE_REQUEST,
-        ACL_IPC_EXPORT_KEY_BYTES,
-        CTRL_SHM_TOKEN_BYTES,
-        L3L2RegionAccessProfile,
-        L3L2RegionCreateRequest,
-        _align_up,
-        _checked_add_u64,
-    )
-
     request_shm_name = _read_shm_name(buf, _OFF_ARGS)
     reply_shm_name = _read_shm_name(buf, _OFF_ARGS + _CTRL_SHM_NAME_BYTES)
     req_shm = SharedMemory(name=request_shm_name)
@@ -1144,7 +1164,7 @@ def _handle_ctrl_l3_l2_region_create(  # noqa: PLR0912
                 del region_buf
             counter_base = payload_base + counter_offset
             backing_name = shm.name.encode("utf-8")
-            if len(backing_name) >= CTRL_SHM_TOKEN_BYTES:
+            if len(backing_name) >= _CTRL_SHM_TOKEN_BYTES:
                 raise RuntimeError("CTRL_L3_L2_REGION_CREATE backing shm token is too long")
             access_profile = L3L2RegionAccessProfile.SIM_POSIX_SHM
             export_key = b""
@@ -1167,7 +1187,7 @@ def _handle_ctrl_l3_l2_region_create(  # noqa: PLR0912
             if isinstance(export_key, str):
                 export_key = export_key.encode("utf-8")
             export_key = bytes(export_key).split(b"\x00", 1)[0]
-            if len(export_key) >= ACL_IPC_EXPORT_KEY_BYTES:
+            if len(export_key) >= _ACL_IPC_EXPORT_KEY_BYTES:
                 raise RuntimeError("CTRL_L3_L2_REGION_CREATE ACL IPC export key is too long")
             region.export_key = export_key
             payload_base = dev_ptr
@@ -1187,8 +1207,8 @@ def _handle_ctrl_l3_l2_region_create(  # noqa: PLR0912
             int(access_profile),
             0,
             int(getattr(cw, "device_id", -1)),
-            export_key + b"\x00" * (ACL_IPC_EXPORT_KEY_BYTES - len(export_key)),
-            backing_name + b"\x00" * (CTRL_SHM_TOKEN_BYTES - len(backing_name)),
+            export_key + b"\x00" * (_ACL_IPC_EXPORT_KEY_BYTES - len(export_key)),
+            backing_name + b"\x00" * (_CTRL_SHM_TOKEN_BYTES - len(backing_name)),
             mapping_bytes,
         )
         _l2_host_l3_l2_regions(cw)[region_id] = region
@@ -1196,17 +1216,8 @@ def _handle_ctrl_l3_l2_region_create(  # noqa: PLR0912
     finally:
         if region is not None:
             try:
-                if region.shm is not None:
-                    region.shm.close()
-                    region.shm.unlink()
-                elif region.dev_ptr:
-                    if region.export_key:
-                        try:
-                            _l3_child_onboard_region_close(region.export_key)
-                        except Exception:  # noqa: BLE001
-                            pass
-                    cw.free(region.dev_ptr)
-            except Exception:  # noqa: BLE001
+                _release_l2_host_l3_l2_region(cw, region)
+            except (BufferError, FileNotFoundError, OSError, RuntimeError):
                 pass
         del req_buf
         del reply_buf
@@ -1215,23 +1226,11 @@ def _handle_ctrl_l3_l2_region_create(  # noqa: PLR0912
 
 
 def _handle_ctrl_l3_l2_region_release(cw: ChipWorker, buf: memoryview) -> None:
-    from _task_interface import _l3_child_onboard_region_close  # pyright: ignore[reportMissingImports]  # noqa: PLC0415
-
     region_id = struct.unpack_from("Q", buf, _CTRL_OFF_ARG0)[0]
     region = _l2_host_l3_l2_regions(cw).pop(int(region_id), None)
     if region is None:
         return
-    if region.shm is not None:
-        region.shm.close()
-        region.shm.unlink()
-        return
-    if region.export_key:
-        try:
-            _l3_child_onboard_region_close(region.export_key)
-        except Exception:  # noqa: BLE001
-            pass
-    if region.dev_ptr:
-        cw.free(region.dev_ptr)
+    _release_l2_host_l3_l2_region(cw, region)
 
 
 def _sweep_l2_host_l3_l2_regions(cw: ChipWorker) -> None:
@@ -1239,21 +1238,8 @@ def _sweep_l2_host_l3_l2_regions(cw: ChipWorker) -> None:
     for region_id in list(regions):
         region = regions.pop(region_id)
         try:
-            if region.shm is not None:
-                region.shm.close()
-                region.shm.unlink()
-            elif region.dev_ptr:
-                try:
-                    from _task_interface import (  # noqa: PLC0415
-                        _l3_child_onboard_region_close,  # pyright: ignore[reportMissingImports]
-                    )
-
-                    if region.export_key:
-                        _l3_child_onboard_region_close(region.export_key)
-                except Exception:  # noqa: BLE001
-                    pass
-                cw.free(region.dev_ptr)
-        except Exception:  # noqa: BLE001
+            _release_l2_host_l3_l2_region(cw, region)
+        except (BufferError, FileNotFoundError, OSError, RuntimeError):
             pass
 
 
@@ -3618,9 +3604,6 @@ class Worker:
         """
         return dict(self._live_domains)
 
-    def _l3_l2_use_l3_host_mapped_path(self) -> bool:
-        return str(self._config.get("platform", "")) in {"a2a3", "a2a3sim", "a5", "a5sim"}
-
     def _l3_l2_onboard_import_enable_peer_access(self) -> bool:
         platform = str(self._config.get("platform", ""))
         # The ACL IPC import peer-access flag is requested only for the a2a3
@@ -3651,8 +3634,6 @@ class Worker:
         return poisoned
 
     def _register_l3_l2_orch_comm_host_buffer(self, tensor) -> None:
-        from .task_interface import Tensor  # noqa: PLC0415
-
         if not isinstance(tensor, Tensor):
             raise TypeError("L3-L2 host buffer registration expects a Tensor")
         if tensor.child_memory:
@@ -3669,8 +3650,6 @@ class Worker:
         )
 
     def _validate_l3_l2_orch_comm_host_buffer(self, tensor) -> None:
-        from .task_interface import Tensor  # noqa: PLC0415
-
         if not isinstance(tensor, Tensor):
             raise ValueError("L3-L2 payload buffer must be a Tensor returned by orch.alloc(...)")
         if tensor.child_memory:
@@ -3690,100 +3669,82 @@ class Worker:
             )
 
     def _create_l3_l2_region(self, worker_id: int, payload_bytes: int, counter_bytes: int):  # noqa: PLR0912
-        from .l3_l2_orch_comm import (  # noqa: PLC0415
-            REGION_CREATE_REPLY_BYTES,
-            REGION_CREATE_REQUEST_BYTES,
-            L3HostRegionMapping,
-            L3L2OrchRegion,
-            L3L2RegionAccessProfile,
-            L3L2RegionCreateRequest,
-            _l3_host_mapped_region_import_onboard,
-            _l3_host_mapped_region_import_sim,
-            decode_region_create_reply,
-            peek_region_create_reply_region_id,
-            validate_region_create_reply,
-        )
-
         if payload_bytes <= 0:
             raise ValueError("create_l3_l2_region: payload_bytes must be positive")
         if counter_bytes <= 0 or counter_bytes % 4 != 0:
             raise ValueError("create_l3_l2_region: counter_bytes must be positive and a multiple of 4")
         self._validate_l3_l2_worker_id(int(worker_id))
-        if not self._l3_l2_use_l3_host_mapped_path():
-            raise RuntimeError("create_l3_l2_region requires a direct L3 Host mapped backend")
-        if self._l3_l2_use_l3_host_mapped_path():
-            req_shm = SharedMemory(create=True, size=REGION_CREATE_REQUEST_BYTES)
-            reply_shm = SharedMemory(create=True, size=REGION_CREATE_REPLY_BYTES)
-            req_buf = cast(memoryview, req_shm.buf)
-            reply_buf = cast(memoryview, reply_shm.buf)
-            region_id = 0
-            l3_host_mapping = None
-            try:
-                L3L2RegionCreateRequest(
-                    magic_version=0x4C334C3200020000,
-                    request_bytes=REGION_CREATE_REQUEST_BYTES,
-                    payload_bytes=int(payload_bytes),
-                    counter_bytes=int(counter_bytes),
-                    l3_host_pid=os.getpid(),
-                ).encode_into(req_buf)
-                worker = self._worker
-                assert worker is not None
-                worker.control_l3_l2_region_create(int(worker_id), req_shm.name, reply_shm.name)
-                region_id = peek_region_create_reply_region_id(reply_buf)
-                reply = decode_region_create_reply(reply_buf)
-                platform = str(self._config.get("platform", ""))
-                expected_access_profile = (
-                    L3L2RegionAccessProfile.SIM_POSIX_SHM
-                    if platform.endswith("sim")
-                    else L3L2RegionAccessProfile.ONBOARD_ACL_IPC
+        req_shm = SharedMemory(create=True, size=_REGION_CREATE_REQUEST_BYTES)
+        reply_shm = SharedMemory(create=True, size=_REGION_CREATE_REPLY_BYTES)
+        req_buf = cast(memoryview, req_shm.buf)
+        reply_buf = cast(memoryview, reply_shm.buf)
+        region_id = 0
+        l3_host_mapping = None
+        try:
+            L3L2RegionCreateRequest(
+                magic_version=0x4C334C3200020000,
+                request_bytes=_REGION_CREATE_REQUEST_BYTES,
+                payload_bytes=int(payload_bytes),
+                counter_bytes=int(counter_bytes),
+                l3_host_pid=os.getpid(),
+            ).encode_into(req_buf)
+            worker = self._worker
+            assert worker is not None
+            worker.control_l3_l2_region_create(int(worker_id), req_shm.name, reply_shm.name)
+            region_id = peek_region_create_reply_region_id(reply_buf)
+            reply = decode_region_create_reply(reply_buf)
+            platform = str(self._config.get("platform", ""))
+            expected_access_profile = (
+                L3L2RegionAccessProfile.SIM_POSIX_SHM
+                if platform.endswith("sim")
+                else L3L2RegionAccessProfile.ONBOARD_ACL_IPC
+            )
+            counter_offset, total_bytes = validate_region_create_reply(reply, expected_access_profile)
+            if platform.endswith("sim"):
+                handle = _l3_host_mapped_region_import_sim(reply.backing_shm, int(reply.mapping_bytes))
+            else:
+                handle = _l3_host_mapped_region_import_onboard(
+                    int(reply.device_id),
+                    reply.export_key,
+                    int(total_bytes),
+                    self._l3_l2_onboard_import_enable_peer_access(),
                 )
-                counter_offset, total_bytes = validate_region_create_reply(reply, expected_access_profile)
-                if platform.endswith("sim"):
-                    handle = _l3_host_mapped_region_import_sim(reply.backing_shm, int(reply.mapping_bytes))
-                else:
-                    handle = _l3_host_mapped_region_import_onboard(
-                        int(reply.device_id),
-                        reply.export_key,
-                        int(total_bytes),
-                        self._l3_l2_onboard_import_enable_peer_access(),
-                    )
-                l3_host_mapping = L3HostRegionMapping(
-                    worker_id=int(worker_id),
-                    region_id=region_id,
-                    access_profile=reply.access_profile,
-                    total_bytes=total_bytes,
-                    payload_offset=0,
-                    payload_bytes=int(reply.desc.payload_bytes),
-                    counter_offset=counter_offset,
-                    counter_bytes=int(reply.desc.counter_bytes),
-                    handle=int(handle),
-                )
-                region = L3L2OrchRegion(self, int(worker_id), reply.desc, l3_host_mapping)
-                self._live_l3_l2_regions.append(region)
-                return region
-            except Exception:
-                if l3_host_mapping is not None:
-                    try:
-                        l3_host_mapping.close()
-                    except Exception:  # noqa: BLE001
-                        pass
-                if region_id:
-                    try:
-                        assert self._worker is not None
-                        self._worker.control_l3_l2_region_release(int(worker_id), int(region_id))
-                    except Exception:  # noqa: BLE001
-                        pass
-                raise
-            finally:
-                del req_buf
-                del reply_buf
-                for shm in (req_shm, reply_shm):
-                    try:
-                        shm.close()
-                        shm.unlink()
-                    except Exception:  # noqa: BLE001
-                        pass
-        raise AssertionError("unreachable")
+            l3_host_mapping = L3HostRegionMapping(
+                worker_id=int(worker_id),
+                region_id=region_id,
+                access_profile=reply.access_profile,
+                total_bytes=total_bytes,
+                payload_offset=0,
+                payload_bytes=int(reply.desc.payload_bytes),
+                counter_offset=counter_offset,
+                counter_bytes=int(reply.desc.counter_bytes),
+                handle=int(handle),
+            )
+            region = L3L2OrchRegion(self, int(worker_id), reply.desc, l3_host_mapping)
+            self._live_l3_l2_regions.append(region)
+            return region
+        except Exception:
+            if l3_host_mapping is not None:
+                try:
+                    l3_host_mapping.close()
+                except RuntimeError:
+                    pass
+            if region_id:
+                try:
+                    assert self._worker is not None
+                    self._worker.control_l3_l2_region_release(int(worker_id), int(region_id))
+                except RuntimeError:
+                    pass
+            raise
+        finally:
+            del req_buf
+            del reply_buf
+            for shm in (req_shm, reply_shm):
+                try:
+                    shm.close()
+                    shm.unlink()
+                except (BufferError, FileNotFoundError, OSError):
+                    pass
 
     def _cleanup_l3_l2_regions(self) -> None:
         if not self._live_l3_l2_regions:
@@ -3791,10 +3752,9 @@ class Worker:
         regions, self._live_l3_l2_regions = self._live_l3_l2_regions, []
         for region in regions:
             try:
-                if getattr(region, "_l3_host_mapping", None) is not None:
-                    region._close_l3_host_mapping()
-                    if self._worker is not None:
-                        self._worker.control_l3_l2_region_release(region._worker_id, region.region_id)
+                region._close_l3_host_mapping()
+                if self._worker is not None:
+                    self._worker.control_l3_l2_region_release(region._worker_id, region.region_id)
             finally:
                 region._expire()
 
@@ -3802,7 +3762,7 @@ class Worker:
         for region in self._live_l3_l2_regions:
             try:
                 region._close_l3_host_mapping()
-            except Exception:  # noqa: BLE001
+            except RuntimeError:
                 pass
         self._live_l3_l2_regions.clear()
         self._l3_l2_orch_comm_host_buffers.clear()

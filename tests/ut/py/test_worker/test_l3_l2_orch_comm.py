@@ -8,13 +8,15 @@
 # -----------------------------------------------------------------------------------------------------------
 
 import ctypes
-import threading
+import importlib
 import time
+from concurrent.futures import ThreadPoolExecutor
 from multiprocessing.shared_memory import SharedMemory
-from typing import Optional
+from typing import Any, Optional, cast
 
 import pytest
 from simpler import l3_l2_orch_comm
+from simpler import worker as worker_module
 from simpler.l3_l2_orch_comm import (
     NotifyOp,
     SignalTestResult,
@@ -30,6 +32,8 @@ from simpler.worker import (
 )
 
 from simpler_setup.runtime_builder import RuntimeBuilder
+
+_task_interface_ext = cast(Any, importlib.import_module("_task_interface"))
 
 
 class _FakeDirectCWorker:
@@ -89,8 +93,8 @@ class _FakeDirectCWorker:
                 self.access_profile,
                 0,
                 self.device_id,
-                export_key + b"\x00" * (l3_l2_orch_comm.ACL_IPC_EXPORT_KEY_BYTES - len(export_key)),
-                backing_name + b"\x00" * (l3_l2_orch_comm.CTRL_SHM_TOKEN_BYTES - len(backing_name)),
+                export_key + b"\x00" * (l3_l2_orch_comm._ACL_IPC_EXPORT_KEY_BYTES - len(export_key)),
+                backing_name + b"\x00" * (l3_l2_orch_comm._CTRL_SHM_TOKEN_BYTES - len(backing_name)),
                 counter_offset + counter_bytes if self.mapping_bytes is None else int(self.mapping_bytes),
             )
         finally:
@@ -157,7 +161,7 @@ def test_sim_direct_region_uses_lifecycle_control_and_l3_host_metadata(monkeypat
     calls: list[tuple] = []
     try:
         monkeypatch.setattr(
-            l3_l2_orch_comm,
+            worker_module,
             "_l3_host_mapped_region_import_sim",
             lambda token, mapping_bytes: calls.append(("import", token, mapping_bytes)) or 99,
         )
@@ -213,7 +217,7 @@ def test_onboard_direct_region_imports_acl_ipc_and_uses_l3_host_metadata(monkeyp
     calls: list[tuple] = []
     try:
         monkeypatch.setattr(
-            l3_l2_orch_comm,
+            worker_module,
             "_l3_host_mapped_region_import_onboard",
             lambda device_id, export_key, mapping_bytes, enable_peer_access: calls.append(
                 ("import_onboard", device_id, export_key, mapping_bytes, enable_peer_access)
@@ -249,7 +253,7 @@ def test_a5_onboard_direct_region_import_uses_acl_ipc_without_peer_access(monkey
     calls: list[tuple] = []
     try:
         monkeypatch.setattr(
-            l3_l2_orch_comm,
+            worker_module,
             "_l3_host_mapped_region_import_onboard",
             lambda device_id, export_key, mapping_bytes, enable_peer_access: calls.append(
                 ("import_onboard", device_id, export_key, mapping_bytes, enable_peer_access)
@@ -270,7 +274,7 @@ def test_sim_direct_create_import_failure_rolls_back_l2_host_region(monkeypatch)
     worker, shm, fake_c_worker = _make_started_sim_worker()
     try:
         monkeypatch.setattr(
-            l3_l2_orch_comm,
+            worker_module,
             "_l3_host_mapped_region_import_sim",
             lambda _token, _mapping_bytes: (_ for _ in ()).throw(RuntimeError("import failed")),
         )
@@ -336,7 +340,7 @@ def test_onboard_direct_mapping_bytes_mismatch_rolls_back_l2_host_region(monkeyp
     calls: list[tuple] = []
     try:
         monkeypatch.setattr(
-            l3_l2_orch_comm,
+            worker_module,
             "_l3_host_mapped_region_import_onboard",
             lambda *args: calls.append(args) or 123,
         )
@@ -356,30 +360,24 @@ def test_onboard_direct_mapping_bytes_mismatch_rolls_back_l2_host_region(monkeyp
 def test_l3_host_mapped_counter_wait_releases_gil_for_python_notifier():
     shm = SharedMemory(create=True, size=64)
     handle = 0
-    notifier_error: list[BaseException] = []
     try:
-        handle = l3_l2_orch_comm._l3_host_mapped_region_import_sim(shm.name, 64)
+        handle = _task_interface_ext._l3_host_mapped_region_import_sim(shm.name, 64)
 
         def notify() -> None:
-            try:
-                time.sleep(0.05)
-                l3_l2_orch_comm._l3_host_mapped_counter_notify(handle, 0, 1, int(NotifyOp.Set))
-            except BaseException as exc:  # noqa: BLE001
-                notifier_error.append(exc)
+            time.sleep(0.05)
+            _task_interface_ext._l3_host_mapped_counter_notify(handle, 0, 1, int(NotifyOp.Set))
 
-        thread = threading.Thread(target=notify)
-        thread.start()
-        status, error_kind, observed, matched, message = l3_l2_orch_comm._l3_host_mapped_counter_wait(
-            handle, 0, 1, int(WaitCmp.EQ), 1_000_000_000
-        )
-        thread.join(timeout=1.0)
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(notify)
+            status, error_kind, observed, matched, message = _task_interface_ext._l3_host_mapped_counter_wait(
+                handle, 0, 1, int(WaitCmp.EQ), 1_000_000_000
+            )
+            future.result(timeout=1.0)
 
-        assert not thread.is_alive()
-        assert notifier_error == []
         assert (status, error_kind, observed, matched, message) == (0, 0, 1, True, "")
     finally:
         if handle:
-            l3_l2_orch_comm._l3_host_mapped_region_close(handle)
+            _task_interface_ext._l3_host_mapped_region_close(handle)
         shm.close()
         shm.unlink()
 
@@ -388,20 +386,20 @@ def test_l3_host_mapped_sim_payload_and_counter_helpers_roundtrip():
     shm = SharedMemory(create=True, size=128)
     handle = 0
     try:
-        handle = l3_l2_orch_comm._l3_host_mapped_region_import_sim(shm.name, 128)
+        handle = _task_interface_ext._l3_host_mapped_region_import_sim(shm.name, 128)
         src_t = ctypes.c_uint8 * 8
         src = src_t(*range(10, 18))
         dst = src_t()
 
-        l3_l2_orch_comm._l3_host_mapped_payload_write(handle, 16, ctypes.addressof(src), 8)
-        l3_l2_orch_comm._l3_host_mapped_payload_read(handle, 16, ctypes.addressof(dst), 8)
+        _task_interface_ext._l3_host_mapped_payload_write(handle, 16, ctypes.addressof(src), 8)
+        _task_interface_ext._l3_host_mapped_payload_read(handle, 16, ctypes.addressof(dst), 8)
         assert bytes(dst) == bytes(range(10, 18))
 
-        l3_l2_orch_comm._l3_host_mapped_counter_notify(handle, 64, 3, int(NotifyOp.Set))
-        assert l3_l2_orch_comm._l3_host_mapped_counter_test(handle, 64, 3, int(WaitCmp.EQ)) == (True, 3)
-        l3_l2_orch_comm._l3_host_mapped_counter_notify(handle, 64, 4, int(NotifyOp.Add))
-        assert l3_l2_orch_comm._l3_host_mapped_counter_test(handle, 64, 7, int(WaitCmp.GE)) == (True, 7)
-        assert l3_l2_orch_comm._l3_host_mapped_counter_wait(handle, 64, 7, int(WaitCmp.EQ), 1_000_000) == (
+        _task_interface_ext._l3_host_mapped_counter_notify(handle, 64, 3, int(NotifyOp.Set))
+        assert _task_interface_ext._l3_host_mapped_counter_test(handle, 64, 3, int(WaitCmp.EQ)) == (True, 3)
+        _task_interface_ext._l3_host_mapped_counter_notify(handle, 64, 4, int(NotifyOp.Add))
+        assert _task_interface_ext._l3_host_mapped_counter_test(handle, 64, 7, int(WaitCmp.GE)) == (True, 7)
+        assert _task_interface_ext._l3_host_mapped_counter_wait(handle, 64, 7, int(WaitCmp.EQ), 1_000_000) == (
             0,
             0,
             7,
@@ -409,12 +407,12 @@ def test_l3_host_mapped_sim_payload_and_counter_helpers_roundtrip():
             "",
         )
 
-        l3_l2_orch_comm._l3_host_mapped_region_close(handle)
+        _task_interface_ext._l3_host_mapped_region_close(handle)
         with pytest.raises(RuntimeError, match="closed or unknown"):
-            l3_l2_orch_comm._l3_host_mapped_payload_read(handle, 16, ctypes.addressof(dst), 8)
+            _task_interface_ext._l3_host_mapped_payload_read(handle, 16, ctypes.addressof(dst), 8)
     finally:
         if handle:
-            l3_l2_orch_comm._l3_host_mapped_region_close(handle)
+            _task_interface_ext._l3_host_mapped_region_close(handle)
         shm.close()
         shm.unlink()
 
@@ -423,14 +421,14 @@ def test_l3_host_mapped_region_close_makes_sim_handle_unusable():
     shm = SharedMemory(create=True, size=64)
     handle = 0
     try:
-        handle = l3_l2_orch_comm._l3_host_mapped_region_import_sim(shm.name, 64)
-        l3_l2_orch_comm._l3_host_mapped_region_close(handle)
+        handle = _task_interface_ext._l3_host_mapped_region_import_sim(shm.name, 64)
+        _task_interface_ext._l3_host_mapped_region_close(handle)
 
         with pytest.raises(RuntimeError, match="closed or unknown"):
-            l3_l2_orch_comm._l3_host_mapped_counter_test(handle, 0, 0, int(WaitCmp.EQ))
+            _task_interface_ext._l3_host_mapped_counter_test(handle, 0, 0, int(WaitCmp.EQ))
     finally:
         if handle:
-            l3_l2_orch_comm._l3_host_mapped_region_close(handle)
+            _task_interface_ext._l3_host_mapped_region_close(handle)
         shm.close()
         shm.unlink()
 
@@ -438,7 +436,7 @@ def test_l3_host_mapped_region_close_makes_sim_handle_unusable():
 def test_sim_direct_transfer_failure_poisons_only_region(monkeypatch):
     worker, shm, _fake_c_worker = _make_started_sim_worker()
     try:
-        monkeypatch.setattr(l3_l2_orch_comm, "_l3_host_mapped_region_import_sim", lambda _token, _size: 55)
+        monkeypatch.setattr(worker_module, "_l3_host_mapped_region_import_sim", lambda _token, _size: 55)
         monkeypatch.setattr(
             l3_l2_orch_comm,
             "_l3_host_mapped_payload_write",
@@ -468,7 +466,7 @@ def test_sim_direct_cleanup_closes_l3_host_mapping_before_l2_host_release(monkey
 
     try:
         fake_c_worker.control_l3_l2_region_release = release
-        monkeypatch.setattr(l3_l2_orch_comm, "_l3_host_mapped_region_import_sim", lambda _token, _size: 77)
+        monkeypatch.setattr(worker_module, "_l3_host_mapped_region_import_sim", lambda _token, _size: 77)
         monkeypatch.setattr(
             l3_l2_orch_comm,
             "_l3_host_mapped_region_close",
