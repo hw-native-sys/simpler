@@ -94,8 +94,7 @@ struct AivAsyncSession {
     int numPending = 0;
 
 #if defined(__CPU_SIM) || defined(__COSTMODEL)
-    AICORE bool Init(__gm__ uint8_t *workspace,
-                     const pto::comm::sdma::SdmaBaseConfig& = {}) {
+    AICORE bool Init(__gm__ uint8_t *workspace, const pto::comm::sdma::SdmaBaseConfig & = {}) {
         (void)workspace;
         session = {};
         numPending = 0;
@@ -103,11 +102,11 @@ struct AivAsyncSession {
     }
 #else
     template <int kRows = 1, int kCols = 256>
-    AICORE bool Init(__gm__ uint8_t *workspace,
-                     const pto::comm::sdma::SdmaBaseConfig& baseConfig =
-                         {pto::comm::sdma::kDefaultSdmaBlockBytes, 0, 1}) {
-        using ScratchTile =
-            pto::Tile<pto::TileType::Vec, uint8_t, kRows, kCols, pto::BLayout::RowMajor, -1, -1>;
+    AICORE bool Init(
+        __gm__ uint8_t *workspace,
+        const pto::comm::sdma::SdmaBaseConfig &baseConfig = {pto::comm::sdma::kDefaultSdmaBlockBytes, 0, 1}
+    ) {
+        using ScratchTile = pto::Tile<pto::TileType::Vec, uint8_t, kRows, kCols, pto::BLayout::RowMajor, -1, -1>;
         ScratchTile scratchTile(kRows, kCols);
         TASSIGN(scratchTile, static_cast<uint8_t>(0));
         bool ok = pto::comm::BuildAsyncSession(scratchTile, workspace, session, 0, baseConfig);
@@ -119,9 +118,7 @@ struct AivAsyncSession {
 
     AICORE void Reset() { numPending = 0; }
 
-    AICORE void Issue(const pto::comm::AsyncEvent& ev) {
-        events[numPending++] = ev;
-    }
+    AICORE void Issue(const pto::comm::AsyncEvent &ev) { events[numPending++] = ev; }
 
     AICORE bool WaitAll() {
         for (int i = 0; i < numPending; ++i) {
@@ -171,8 +168,9 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
     // SDMA workspace: carved from the end of the scratch buffer, after the
     // signal rows.  On CPUSIM, TPUT_ASYNC always completes immediately
     // (handle=0), so the workspace content is irrelevant.
-    __gm__ uint8_t *workspace =
-        reinterpret_cast<__gm__ uint8_t *>(signal_base + (static_cast<size_t>(2 * (nranks - 1) + 1) * kMaxSupportedRanks));
+    __gm__ uint8_t *workspace = reinterpret_cast<__gm__ uint8_t *>(
+        signal_base + (static_cast<size_t>(2 * (nranks - 1) + 1) * kMaxSupportedRanks)
+    );
 
     // Build the async session (one per kernel invocation).
     AivAsyncSession asyncS;
