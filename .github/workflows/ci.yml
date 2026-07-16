@@ -460,7 +460,11 @@ jobs:
   # ---------- Unit tests (a2a3 hardware, Python + C++) ----------
   ut-a2a3:
     needs: pre-commit
-    runs-on: [self-hosted, a2a3]
+    # The a2a3 pool mixes x86 8P hosts (infra-gpu-npu-021[-2]) and arm64 4P
+    # hosts (runner-dev*) under the same `a2a3` label. ut-a2a3 assumes the
+    # 8-NPU x86 host (DEVICE_RANGE 0-7/8-15; local pto-isa mirror lives here),
+    # so pin to the X64 label instead of matching the 4-NPU arm64 runners.
+    runs-on: [self-hosted, a2a3, X64]
     timeout-minutes: 30
     env:
       SIMPLER_SCHEDULER_TIMEOUT_MS: "2000"
