@@ -43,7 +43,7 @@ static DepGenDataHeader *s_dep_gen_header = nullptr;
 static DepGenBufferState *s_dep_gen_state = nullptr;
 static int s_orch_thread_idx = -1;  // set via dep_gen_aicpu_set_orch_thread_idx
 
-static constexpr uint64_t kDepGenQueueBackpressureWaitCycles = PLATFORM_DFX_BACKPRESSURE_TIMEOUT_CYCLES;
+static constexpr uint64_t kDepGenQueueBackpressureWaitCycles = PLATFORM_PROF_SYS_CNT_FREQ / 50000;  // 20 us
 
 extern "C" void set_platform_dep_gen_base(uint64_t dep_gen_data_base) { g_platform_dep_gen_base = dep_gen_data_base; }
 
