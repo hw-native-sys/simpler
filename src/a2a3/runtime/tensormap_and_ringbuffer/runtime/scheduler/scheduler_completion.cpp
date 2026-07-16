@@ -328,7 +328,11 @@ void SchedulerContext::check_running_cores_for_completion(
         // --- Judgment phase: read register, derive transition ---
         // Use the precomputed cond_ptr (resolved once in handshake) to skip
         // the reg_offset switch and reg_addr addition on every poll.
-        uint64_t reg_val = static_cast<uint64_t>(*core.cond_ptr);
+        // reg_load_acquire makes this an atomic acquire under __CPU_SIM so it
+        // pairs with the AICore's release store of the FIN (without it the sim
+        // poll races the FIN publish and can miss it); on hardware it is the
+        // same plain volatile load the bare deref used to be.
+        uint64_t reg_val = static_cast<uint64_t>(reg_load_acquire(core.cond_ptr));
         // ARM64 allows Device-nGnRnE -> Normal-cacheable load reorder; the
         // rmb() pins any AICore-published cacheable reads downstream of the
         // FIN observation. Replaces the post-`__sync_synchronize` that the

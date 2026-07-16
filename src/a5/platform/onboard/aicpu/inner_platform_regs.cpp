@@ -31,6 +31,13 @@ volatile uint32_t *get_reg_ptr(uint64_t reg_base_addr, RegId reg) {
     return reinterpret_cast<volatile uint32_t *>(reg_base_addr + reg_offset(reg));
 }
 
+// Plain Device-nGnRnE MMIO load/store (atomics are not valid on Device
+// memory); cross Device<->Normal ordering is the caller's rmb()/wmb(). See
+// platform_regs.h.
+uint32_t reg_load_acquire(const volatile uint32_t *p) { return *p; }
+
+void reg_store_release(volatile uint32_t *p, uint32_t v) { *p = v; }
+
 uint64_t read_reg(uint64_t reg_base_addr, RegId reg) { return static_cast<uint64_t>(*get_reg_ptr(reg_base_addr, reg)); }
 
 void write_reg(uint64_t reg_base_addr, RegId reg, uint64_t value) {
