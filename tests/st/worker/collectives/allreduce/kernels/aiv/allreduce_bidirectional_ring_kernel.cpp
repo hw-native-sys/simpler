@@ -10,7 +10,7 @@
  */
 /**
  * Bidirectional Ring AllReduce — two parallel unidirectional rings on
- * disjoint halves of the data, sharing RoundBarrier per step.
+ * disjoint halves of the data, sharing a NeighborBarrier per step.
  *
  * Ring 0 (clockwise, →right neighbour): first half of each chunk's elements.
  *   Uses standard unidirectional RS+AG formulas.
@@ -55,21 +55,34 @@ AICORE inline __gm__ T *CommRemotePtr(__gm__ CommContext *ctx, __gm__ T *localPt
     return (__gm__ T *)(ctx->windowsIn[pe] + offset);
 }
 
-AICORE inline void RoundBarrier(__gm__ CommContext *ctx, __gm__ int32_t *signal_row, int my_rank, int nranks) {
-    for (int peer = 0; peer < nranks; ++peer) {
-        if (peer == my_rank) {
-            continue;
+// Per-round neighbor barrier for bidirectional ring topology.
+// Ring0 (CW): r pushes to (r+1), receives from (r-1).
+// Ring1 (CCW): r pushes to (r-1), receives from (r+1).
+// Both rings share one barrier round, so every rank synchronizes with
+// both left and right neighbors.  O(1) per round regardless of P.
+// When P=2, left == right — notify/wait once to avoid redundant ops.
+// Signal rows used exactly once (AtomicAdd 0→1, TWAIT GE 1).
+AICORE inline void
+NeighborBarrier(__gm__ CommContext *ctx, __gm__ int32_t *signal_row, int my_rank, int left, int right) {
+    // Notify neighbors.
+    {
+        __gm__ int32_t *remote_r = CommRemotePtr(ctx, signal_row + my_rank, right);
+        pto::comm::Signal sig_r(remote_r);
+        pto::comm::TNOTIFY(sig_r, (int32_t)1, pto::comm::NotifyOp::AtomicAdd);
+        if (left != right) {
+            __gm__ int32_t *remote_l = CommRemotePtr(ctx, signal_row + my_rank, left);
+            pto::comm::Signal sig_l(remote_l);
+            pto::comm::TNOTIFY(sig_l, (int32_t)1, pto::comm::NotifyOp::AtomicAdd);
         }
-        __gm__ int32_t *remote_signal = CommRemotePtr(ctx, signal_row + my_rank, peer);
-        pto::comm::Signal sig(remote_signal);
-        pto::comm::TNOTIFY(sig, (int32_t)1, pto::comm::NotifyOp::AtomicAdd);
     }
-    for (int peer = 0; peer < nranks; ++peer) {
-        if (peer == my_rank) {
-            continue;
+    // Wait on neighbors.
+    {
+        pto::comm::Signal sig_l(signal_row + left);
+        pto::comm::TWAIT(sig_l, (int32_t)1, pto::comm::WaitCmp::GE);
+        if (left != right) {
+            pto::comm::Signal sig_r(signal_row + right);
+            pto::comm::TWAIT(sig_r, (int32_t)1, pto::comm::WaitCmp::GE);
         }
-        pto::comm::Signal sig(signal_row + peer);
-        pto::comm::TWAIT(sig, (int32_t)1, pto::comm::WaitCmp::GE);
     }
     pipe_barrier(PIPE_ALL);
 }
@@ -162,7 +175,7 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
     //   Pushes ring1[send_idx] to left neighbour at same index.
     // ------------------------------------------------------------------
     for (int step = 1; step < nranks; ++step) {
-        RoundBarrier(commCtx, signal_base + (step - 1) * kMaxSupportedRanks, my_rank, nranks);
+        NeighborBarrier(commCtx, signal_base + (step - 1) * kMaxSupportedRanks, my_rank, left, right);
 
         // Ring0: push ring0[(r - step + P) % P] → right's ring0[same index].
         {
@@ -195,7 +208,7 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
     // ------------------------------------------------------------------
     for (int step = 1; step < nranks; ++step) {
         const int rs_rounds = nranks - 1;
-        RoundBarrier(commCtx, signal_base + (rs_rounds + step - 1) * kMaxSupportedRanks, my_rank, nranks);
+        NeighborBarrier(commCtx, signal_base + (rs_rounds + step - 1) * kMaxSupportedRanks, my_rank, left, right);
 
         // Ring0 AG.
         {
@@ -225,7 +238,7 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
     // stage-out reads from ring0/ring1.  Without this, remote writes from
     // other ranks may not have propagated to shared memory yet.
     if (nranks > 1) {
-        RoundBarrier(commCtx, signal_base + (2 * (nranks - 1)) * kMaxSupportedRanks, my_rank, nranks);
+        NeighborBarrier(commCtx, signal_base + (2 * (nranks - 1)) * kMaxSupportedRanks, my_rank, left, right);
     }
 
     // ------------------------------------------------------------------

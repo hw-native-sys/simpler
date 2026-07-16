@@ -25,7 +25,7 @@
  * After each per-round barrier, peers read directly from each other's
  * chunks[] slots via CommRemotePtr — no separate exchange publish buffer.
  * The ``pipe_barrier(PIPE_ALL)`` at the end of each RS/AG step body drains
- * MTE pipes before ``RoundBarrier`` fires ``TNOTIFY`` (hand-written
+ * MTE pipes before ``NeighborBarrier`` fires ``TNOTIFY`` (hand-written
  * equivalent of PTOAS v0.45's automatic ``emitTNotifyMteDrain``).
  *
  * args layout (passed as Tensor arg slots — see allreduce_ring_orch.cpp):
@@ -61,24 +61,22 @@ AICORE inline __gm__ T *CommRemotePtr(__gm__ CommContext *ctx, __gm__ T *localPt
     return (__gm__ T *)(ctx->windowsIn[pe] + offset);
 }
 
-// Per-round barrier row: used exactly once (AtomicAdd 0→1, TWAIT GE 1).
-// No explicit reset — matches mesh allreduce_onephase_kernel.cpp; zeroing races peer notify.
-AICORE inline void RoundBarrier(__gm__ CommContext *ctx, __gm__ int32_t *signal_row, int my_rank, int nranks) {
-    for (int peer = 0; peer < nranks; ++peer) {
-        if (peer == my_rank) {
-            continue;
-        }
-        __gm__ int32_t *remote_signal = CommRemotePtr(ctx, signal_row + my_rank, peer);
-        pto::comm::Signal sig(remote_signal);
-        pto::comm::TNOTIFY(sig, (int32_t)1, pto::comm::NotifyOp::AtomicAdd);
-    }
-    for (int peer = 0; peer < nranks; ++peer) {
-        if (peer == my_rank) {
-            continue;
-        }
-        pto::comm::Signal sig(signal_row + peer);
-        pto::comm::TWAIT(sig, (int32_t)1, pto::comm::WaitCmp::GE);
-    }
+// Per-round neighbor barrier for ring topology.
+// Rank r TLOADs (reads) from left = (r-1)%P; right = (r+1)%P TLOADs from r.
+// Each rank notifies its right neighbor (who reads from this rank's chunks)
+// and waits on its left neighbor (whose chunks this rank reads from).
+// Signal rows used exactly once (AtomicAdd 0→1, TWAIT GE 1) —
+// matches RoundBarrier zero-init semantics (fresh HCCL window).
+AICORE inline void
+NeighborBarrier(__gm__ CommContext *ctx, __gm__ int32_t *signal_row, int my_rank, int left, int nranks) {
+    int right = (my_rank + 1) % nranks;
+    // Notify right neighbor: "I'm done with this step, you can TLOAD from my chunks."
+    __gm__ int32_t *remote_signal = CommRemotePtr(ctx, signal_row + my_rank, right);
+    pto::comm::Signal sig_out(remote_signal);
+    pto::comm::TNOTIFY(sig_out, (int32_t)1, pto::comm::NotifyOp::AtomicAdd);
+    // Wait on left neighbor: "Are you done? I need to TLOAD your chunks."
+    pto::comm::Signal sig_in(signal_row + left);
+    pto::comm::TWAIT(sig_in, (int32_t)1, pto::comm::WaitCmp::GE);
     pipe_barrier(PIPE_ALL);
 }
 
@@ -146,11 +144,11 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
     // ------------------------------------------------------------------
     for (int step = 1; step < nranks; ++step) {
         const int recv_add_idx = (my_rank - step - 1 + nranks) % nranks;
+        const int left = (my_rank - 1 + nranks) % nranks;
 
-        RoundBarrier(commCtx, signal_base + round * kMaxSupportedRanks, my_rank, nranks);
+        NeighborBarrier(commCtx, signal_base + round * kMaxSupportedRanks, my_rank, left, nranks);
         ++round;
 
-        const int left = (my_rank - 1 + nranks) % nranks;
         const int left_send_idx = (left - step + nranks) % nranks;
         {
             __gm__ float *remote_chunk =
@@ -180,11 +178,11 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
     // ------------------------------------------------------------------
     for (int step = 1; step < nranks; ++step) {
         const int recv_idx = (my_rank - step + nranks) % nranks;
+        const int left = (my_rank - 1 + nranks) % nranks;
 
-        RoundBarrier(commCtx, signal_base + round * kMaxSupportedRanks, my_rank, nranks);
+        NeighborBarrier(commCtx, signal_base + round * kMaxSupportedRanks, my_rank, left, nranks);
         ++round;
 
-        const int left = (my_rank - 1 + nranks) % nranks;
         const int left_send_idx = (left - step + 1 + nranks) % nranks;
         {
             __gm__ float *remote_chunk =
