@@ -49,8 +49,11 @@ Each profiling subsystem needs the same plumbing on the host:
   losing late entries.
 
 The AICPU producer side has a matching repeated shape: wait for ready-queue
-space, publish a full buffer, wait for a free replacement, install it as the
-current buffer, and account dropped records if bounded backpressure expires.
+space, publish a full buffer, wait for a free replacement, and install it as the
+current buffer. Both waits are resident block-on-contention gates — the writer
+parks until the host clears the freeze — not bounded drops; records are only
+lost if the 30-second host-crash backstop trips. See
+[dfx/global-backpressure-design.md](dfx/global-backpressure-design.md).
 
 Before unification this was near-identical control flow repeated across
 collectors. The framework collapses the host side to one implementation
@@ -162,8 +165,8 @@ Provides:
   start. Split drain threads do not bulk-mirror the whole
   shared-memory region; they refresh only their queue indices / entries
   before advancing `queue_heads`. On an empty scan, split drain does a short
-  busy-poll window before falling back to the 10 us sleep, so micro-bursts
-  are less likely to miss AICPU's bounded wait window.
+  busy-poll window before falling back to the 10 us sleep, so a lane parked at
+  a buffer-switch gate is released promptly instead of riding out the freeze.
 - Optional collector sharding (`Module::kMaxCollectorThreads` caps the shard
   arrays; the live shard count is the runtime `min(aicpu_thread_num,
   kMaxCollectorThreads)`) — each collector drains one host ready shard and
@@ -272,10 +275,13 @@ schema, flush/finalize behavior, and small layout hooks locally.
 
 The engine currently provides:
 
-- `wait_for_ready_queue_space` — bounded wait for a per-thread ready queue
-  slot.
-- `wait_for_free_queue_entry` — bounded wait for a replacement buffer in a
-  free queue, with acquire ordering before reading `buffer_ptrs[]`.
+- `wait_for_ready_queue_space` — block-on-contention park for a per-thread
+  ready-queue slot (push gate): raises `rq_contended` and holds until the host
+  clears `rq_freeze_active`, bounded only by the 30 s host-crash backstop.
+- `wait_for_free_queue_entry` — block-on-contention park for a replacement
+  buffer in a free queue (pop gate): raises `fq_contended` and holds until the
+  host clears `fq_freeze_active`, with acquire ordering before reading
+  `buffer_ptrs[]`.
 - `enqueue_ready` — write the ready entry, `wmb()`, then advance
   `queue_tails[q]`.
 - `pop_free` — pop a free buffer, clear its count, install
@@ -291,7 +297,7 @@ Each AICPU writer defines a local `XxxDeviceModule` trait with:
 | ------ | ------- |
 | `Context` | Per-call context such as header pointer, ready-queue thread, core/pool id, or local cache pointer |
 | `using DataHeader / State / FreeQueue / Buffer` | Device shared-memory layout types |
-| `kReadyQueueSize`, `kSlotCount`, `kBackpressureWaitCycles` | Queue geometry and bounded wait budget |
+| `kReadyQueueSize`, `kSlotCount`, `kBackpressureWaitCycles` | Queue geometry and the 30 s host-crash backstop for the block-on-contention gates |
 | `header(ctx)`, `ready_thread(ctx)`, `free_queue(state)` | Locate the shared header and queues |
 | `current_ptr/set_current_ptr`, `current_seq/set_current_seq` | Access the active device buffer state |
 | `count/set_count` | Access the active buffer's record count |
@@ -409,10 +415,14 @@ Two things follow:
   SPSC by shard. Cross-shard return routing does not change ownership:
   replenish remains the only recycled-lane producer, and each drain shard
   remains its lane's only consumer.
-- Device-side queue backpressure is bounded for the profiling writers that
-  use this protocol. If the host does not make ready-queue space or
-  free-queue entries visible within the short wait budget, AICPU records a
-  drop and keeps the workload moving instead of spinning indefinitely.
+- Device-side queue backpressure is resident block-on-contention for the
+  profiling writers that use this protocol: on a full ready queue or empty free
+  queue the AICPU writer parks at its buffer-switch gate and loses no records
+  until the host clears the freeze. There is no opt-out and no short-wait drop;
+  the only bound is the 30-second host-crash backstop
+  (`PLATFORM_DFX_BACKPRESSURE_TIMEOUT_CYCLES`), and a record is dropped only if
+  that trips — i.e. the host is gone. Full state machine and its correctness
+  arguments: [dfx/global-backpressure-design.md](dfx/global-backpressure-design.md).
 - The AICPU writer publishes a full buffer to the ready queue before
   acquiring its replacement buffer. If no replacement is visible yet, the
   current pointer is cleared and later records first try to recover from

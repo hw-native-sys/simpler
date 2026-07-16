@@ -126,7 +126,7 @@ extern "C" uint64_t get_platform_l2_swimlane_aicore_rotation_table() {
 }
 L2SwimlaneLevel get_l2_swimlane_level() { return g_l2_swimlane_level; }
 
-static constexpr uint64_t kL2SwimlaneQueueBackpressureWaitCycles = PLATFORM_PROF_SYS_CNT_FREQ / 50000;  // 20 us
+static constexpr uint64_t kL2SwimlaneQueueBackpressureWaitCycles = PLATFORM_DFX_BACKPRESSURE_TIMEOUT_CYCLES;
 
 struct L2SwimlaneTaskDeviceModule {
     struct Context {
@@ -204,7 +204,7 @@ static L2SwimlaneTaskDeviceModule::Context l2_task_context(
 }
 
 static bool wait_for_free_queue_entry(L2SwimlaneFreeQueue *free_queue, uint32_t *head_out, uint32_t *tail_out) {
-    return L2SwimlaneTaskEngine::wait_for_free_queue_entry(free_queue, head_out, tail_out);
+    return L2SwimlaneTaskEngine::wait_for_free_queue_entry(s_l2_swimlane_header, free_queue, head_out, tail_out);
 }
 
 /**

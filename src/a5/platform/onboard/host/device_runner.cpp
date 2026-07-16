@@ -770,8 +770,8 @@ void DeviceRunner::finalize_collectors() {
 
 int DeviceRunner::init_l2_swimlane(int num_aicore, int aicpu_thread_num, int device_id) {
     int rc = l2_swimlane_collector_.initialize(
-        num_aicore, aicpu_thread_num, device_id, l2_swimlane_level_, prof_alloc_cb, /*register_cb=*/nullptr,
-        prof_free_cb, output_prefix_
+        num_aicore, aicpu_thread_num, device_id, l2_swimlane_level_, prof_alloc_cb,
+        /*register_cb=*/nullptr, prof_free_cb, output_prefix_
     );
     if (rc == 0) {
         kernel_args_.args.l2_swimlane_data_base =

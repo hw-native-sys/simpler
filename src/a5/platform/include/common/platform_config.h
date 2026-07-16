@@ -210,6 +210,14 @@ constexpr int PLATFORM_PROF_READYQUEUE_SIZE =
 constexpr uint64_t PLATFORM_PROF_SYS_CNT_FREQ = 1000000000;  // 1000 MHz
 
 /**
+ * Unified spin-wait timeout for DFX subsystem backpressure gates (system-counter
+ * cycles). Every DFX collector's park loop aborts after this budget on host
+ * crash / hardware failure. Expressed against PLATFORM_PROF_SYS_CNT_FREQ so it
+ * scales per arch and stays a 30 s wall-clock ceiling.
+ */
+constexpr uint64_t PLATFORM_DFX_BACKPRESSURE_TIMEOUT_CYCLES = PLATFORM_PROF_SYS_CNT_FREQ * 30;
+
+/**
  * Timeout duration for performance data collection (seconds)
  */
 constexpr int PLATFORM_PROF_TIMEOUT_SECONDS = 30;

@@ -9,6 +9,7 @@
  * -----------------------------------------------------------------------------------------------------------
  */
 
+#include "common/dfx_backpressure_device.h"
 #include "host/buffer_pool_manager.h"
 #include "host/profiler_base.h"
 
@@ -75,6 +76,7 @@ struct AlgorithmFreeQueue {
 
 struct AlgorithmHeader {
     AlgorithmFreeQueue free_queue;
+    DfxBackpressureHeader backpressure;
 };
 
 struct AlgorithmReadyEntry {

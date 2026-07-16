@@ -47,6 +47,7 @@
 #include <cstddef>
 #include <cstdint>
 
+#include "common/dfx_backpressure_device.h"
 #include "common/platform_config.h"
 
 #define PTO2_SCOPE_STATS_MAX_RING_DEPTH 4
@@ -153,6 +154,8 @@ struct ScopeStatsDataHeader {
     volatile uint32_t queue_heads[PLATFORM_MAX_AICPU_THREADS];  // Host reads (consumer)
     volatile uint32_t queue_tails[PLATFORM_MAX_AICPU_THREADS];  // AICPU writes (producer)
     uint32_t num_instances;                                     // Always 1 for now
+    // DFX backpressure coordination (unified across all DFX subsystems).
+    DfxBackpressureHeader backpressure;
 
     // Per-ring static capacities — written once by AICPU at orchestrator init
     // (scope_stats_set_ring_capacity / scope_stats_set_tensormap_capacity).
