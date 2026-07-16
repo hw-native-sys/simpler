@@ -225,9 +225,10 @@ TEST(L3L2OrchCommTest, LifecycleCreateWireStructsHaveFixedLayout) {
     EXPECT_EQ(offsetof(L3L2RegionCreateReply, desc), 0u);
     EXPECT_EQ(offsetof(L3L2RegionCreateReply, access_profile), sizeof(uint64_t) * 6);
     EXPECT_EQ(offsetof(L3L2RegionCreateReply, device_id), sizeof(uint64_t) * 6 + sizeof(uint32_t) * 2);
-    EXPECT_EQ(offsetof(L3L2RegionCreateReply, backing_shm), sizeof(uint64_t) * 6 + sizeof(uint32_t) * 2 + 4u + 65u);
-    EXPECT_EQ(offsetof(L3L2RegionCreateReply, mapping_bytes), 160u);
-    EXPECT_EQ(sizeof(L3L2RegionCreateReply), 168u);
+    EXPECT_EQ(offsetof(L3L2RegionCreateReply, backing_shm), sizeof(uint64_t) * 6 + sizeof(uint32_t) * 2 + 4u);
+    EXPECT_EQ(offsetof(L3L2RegionCreateReply, mapping_bytes), 96u);
+    EXPECT_EQ(offsetof(L3L2RegionCreateReply, shareable_handle), 104u);
+    EXPECT_EQ(sizeof(L3L2RegionCreateReply), 112u);
 }
 
 }  // namespace

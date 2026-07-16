@@ -49,7 +49,7 @@ class _ServiceError(IntEnum):
 
 class L3L2RegionAccessProfile(IntEnum):
     INVALID = 0
-    ONBOARD_ACL_IPC = 1
+    ONBOARD_VMM = 1
     SIM_POSIX_SHM = 2
 
 
@@ -57,10 +57,9 @@ _MAX_SIGNED_CHRONO_TIMEOUT_NS = 2**63 - 1
 
 _DESC = struct.Struct("<6Q")
 _L3L2_ORCH_REGION_DESC_SCALAR_COUNT = 6
-_ACL_IPC_EXPORT_KEY_BYTES = 65
 _CTRL_SHM_TOKEN_BYTES = 32
 _REGION_CREATE_REQUEST = struct.Struct("<QQQQi4x")
-_REGION_CREATE_REPLY = struct.Struct(f"<6QIIi{_ACL_IPC_EXPORT_KEY_BYTES}s{_CTRL_SHM_TOKEN_BYTES}s3xQ")
+_REGION_CREATE_REPLY = struct.Struct(f"<6QIIi{_CTRL_SHM_TOKEN_BYTES}s4xQQ")
 _REGION_CREATE_REQUEST_BYTES = _REGION_CREATE_REQUEST.size
 _REGION_CREATE_REPLY_BYTES = _REGION_CREATE_REPLY.size
 _REGION_LAYOUT_ALIGNMENT = 64
@@ -138,9 +137,9 @@ class L3L2RegionCreateReply:
     desc: L3L2OrchRegionDesc
     access_profile: L3L2RegionAccessProfile
     device_id: int
-    export_key: bytes
     backing_shm: str
     mapping_bytes: int
+    shareable_handle: int
 
 
 @dataclass
@@ -170,15 +169,14 @@ def decode_region_create_reply(buf: memoryview) -> L3L2RegionCreateReply:
     desc = L3L2OrchRegionDesc(*[int(v) for v in fields[:6]])
     access_profile = L3L2RegionAccessProfile(int(fields[6]))
     device_id = int(fields[8])
-    export_key = bytes(fields[9]).split(b"\x00", 1)[0]
-    backing_shm = bytes(fields[10]).split(b"\x00", 1)[0].decode("utf-8", "strict")
+    backing_shm = bytes(fields[9]).split(b"\x00", 1)[0].decode("utf-8", "strict")
     return L3L2RegionCreateReply(
         desc=desc,
         access_profile=access_profile,
         device_id=device_id,
-        export_key=export_key,
         backing_shm=backing_shm,
-        mapping_bytes=int(fields[11]),
+        mapping_bytes=int(fields[10]),
+        shareable_handle=int(fields[11]),
     )
 
 
@@ -207,16 +205,12 @@ def validate_region_create_reply(
         raise RuntimeError("create_l3_l2_region: reply counter_base does not match fixed region layout")
     if desc.counter_base % _REGION_LAYOUT_ALIGNMENT != 0:
         raise RuntimeError("create_l3_l2_region: reply counter_base must be 64-byte aligned")
-    if (
-        reply.access_profile
-        in (
-            L3L2RegionAccessProfile.SIM_POSIX_SHM,
-            L3L2RegionAccessProfile.ONBOARD_ACL_IPC,
-        )
-        and reply.mapping_bytes != total_bytes
-    ):
+    if reply.access_profile == L3L2RegionAccessProfile.SIM_POSIX_SHM and reply.mapping_bytes != total_bytes:
         profile = reply.access_profile.name.lower()
         raise RuntimeError(f"create_l3_l2_region: {profile} reply mapping_bytes does not match descriptor layout")
+    if reply.access_profile == L3L2RegionAccessProfile.ONBOARD_VMM:
+        if reply.mapping_bytes < total_bytes:
+            raise RuntimeError("create_l3_l2_region: onboard_vmm reply mapping_bytes is smaller than descriptor layout")
     return counter_offset, total_bytes
 
 

@@ -72,6 +72,27 @@ std::string shm_name_for_open(const std::string &token) {
     return "/" + token;
 }
 
+struct LocalAclMemLocation {
+    uint32_t id{0};
+    int type{0};
+};
+
+struct LocalAclPhysicalMemProp {
+    int handleType{0};
+    int allocationType{0};
+    int memAttr{0};
+    LocalAclMemLocation location{};
+    uint64_t reserve{0};
+};
+
+struct LocalAclMemAccessDesc {
+    int flags{0};
+    LocalAclMemLocation location{};
+    uint8_t rsv[12]{};
+};
+
+void append_cleanup_error(std::string &cleanup_error, const std::string &message);
+
 class AclRuntimeApi {
 public:
     AclRuntimeApi() = default;
@@ -82,11 +103,18 @@ public:
 
     int (*aclInit)(const char *){nullptr};
     int (*aclrtSetDevice)(int){nullptr};
+    int (*aclrtGetDevice)(int *){nullptr};
     int (*aclrtMemcpy)(void *, size_t, const void *, size_t, int){nullptr};
-    int (*aclrtIpcMemGetExportKey)(void *, size_t, char *, size_t, uint64_t){nullptr};
-    int (*aclrtIpcMemClose)(const char *){nullptr};
-    int (*aclrtIpcMemImportByKey)(void **, const char *, uint64_t){nullptr};
-    int (*aclrtIpcMemSetImportPid)(const char *, int32_t *, size_t){nullptr};
+    int (*aclrtMemGetAllocationGranularity)(LocalAclPhysicalMemProp *, int, size_t *){nullptr};
+    int (*aclrtMallocPhysical)(void **, size_t, const LocalAclPhysicalMemProp *, uint64_t){nullptr};
+    int (*aclrtFreePhysical)(void *){nullptr};
+    int (*aclrtReserveMemAddress)(void **, size_t, size_t, void *, uint64_t){nullptr};
+    int (*aclrtReleaseMemAddress)(void *){nullptr};
+    int (*aclrtMapMem)(void *, size_t, size_t, void *, uint64_t){nullptr};
+    int (*aclrtUnmapMem)(void *){nullptr};
+    int (*aclrtMemSetAccess)(void *, size_t, LocalAclMemAccessDesc *, size_t){nullptr};
+    int (*aclrtMemExportToShareableHandle)(void *, int, uint64_t, uint64_t *){nullptr};
+    int (*aclrtMemImportFromShareableHandle)(uint64_t, int32_t, void **){nullptr};
 
     void load() {
         lib_ = dlopen("libascendcl.so", RTLD_NOW | RTLD_LOCAL);
@@ -98,16 +126,31 @@ public:
         }
         aclInit = reinterpret_cast<int (*)(const char *)>(resolve_symbol("aclInit"));
         aclrtSetDevice = reinterpret_cast<int (*)(int)>(resolve_symbol("aclrtSetDevice"));
+        aclrtGetDevice = reinterpret_cast<int (*)(int *)>(resolve_symbol("aclrtGetDevice"));
         aclrtMemcpy =
             reinterpret_cast<int (*)(void *, size_t, const void *, size_t, int)>(resolve_symbol("aclrtMemcpy"));
-        aclrtIpcMemGetExportKey = reinterpret_cast<int (*)(void *, size_t, char *, size_t, uint64_t)>(
-            resolve_symbol("aclrtIpcMemGetExportKey")
+        aclrtMemGetAllocationGranularity = reinterpret_cast<int (*)(LocalAclPhysicalMemProp *, int, size_t *)>(
+            resolve_symbol("aclrtMemGetAllocationGranularity")
         );
-        aclrtIpcMemClose = reinterpret_cast<int (*)(const char *)>(resolve_symbol("aclrtIpcMemClose"));
-        aclrtIpcMemImportByKey =
-            reinterpret_cast<int (*)(void **, const char *, uint64_t)>(resolve_symbol("aclrtIpcMemImportByKey"));
-        aclrtIpcMemSetImportPid =
-            reinterpret_cast<int (*)(const char *, int32_t *, size_t)>(resolve_symbol("aclrtIpcMemSetImportPid"));
+        aclrtMallocPhysical = reinterpret_cast<int (*)(void **, size_t, const LocalAclPhysicalMemProp *, uint64_t)>(
+            resolve_symbol("aclrtMallocPhysical")
+        );
+        aclrtFreePhysical = reinterpret_cast<int (*)(void *)>(resolve_symbol("aclrtFreePhysical"));
+        aclrtReserveMemAddress = reinterpret_cast<int (*)(void **, size_t, size_t, void *, uint64_t)>(
+            resolve_symbol("aclrtReserveMemAddress")
+        );
+        aclrtReleaseMemAddress = reinterpret_cast<int (*)(void *)>(resolve_symbol("aclrtReleaseMemAddress"));
+        aclrtMapMem =
+            reinterpret_cast<int (*)(void *, size_t, size_t, void *, uint64_t)>(resolve_symbol("aclrtMapMem"));
+        aclrtUnmapMem = reinterpret_cast<int (*)(void *)>(resolve_symbol("aclrtUnmapMem"));
+        aclrtMemSetAccess = reinterpret_cast<int (*)(void *, size_t, LocalAclMemAccessDesc *, size_t)>(
+            resolve_symbol("aclrtMemSetAccess")
+        );
+        aclrtMemExportToShareableHandle = reinterpret_cast<int (*)(void *, int, uint64_t, uint64_t *)>(
+            resolve_symbol("aclrtMemExportToShareableHandle")
+        );
+        aclrtMemImportFromShareableHandle =
+            reinterpret_cast<int (*)(uint64_t, int32_t, void **)>(resolve_symbol("aclrtMemImportFromShareableHandle"));
     }
 
     void init() {
@@ -123,6 +166,12 @@ public:
 
     void bind_device_with_check(int device_id) const { acl_check(aclrtSetDevice(device_id), "aclrtSetDevice"); }
 
+    int current_device_with_check() const {
+        int device_id = -1;
+        acl_check(aclrtGetDevice(&device_id), "aclrtGetDevice");
+        return device_id;
+    }
+
     void memcpy_h2d_with_check(void *dst, size_t dst_size, const void *src, size_t count) const {
         acl_check(aclrtMemcpy(dst, dst_size, src, count, kAclMemcpyHostToDevice), "aclrtMemcpy H2D");
     }
@@ -131,38 +180,100 @@ public:
         acl_check(aclrtMemcpy(dst, dst_size, src, count, kAclMemcpyDeviceToHost), "aclrtMemcpy D2H");
     }
 
-    void
-    ipc_mem_get_export_key_with_check(void *dev_ptr, size_t size, char *key, size_t key_size, uint64_t flags) const {
-        acl_check(aclrtIpcMemGetExportKey(dev_ptr, size, key, key_size, flags), "aclrtIpcMemGetExportKey");
+    uint64_t vmm_granularity_with_check(int device_id) const {
+        LocalAclPhysicalMemProp prop{};
+        prop.handleType = kAclMemHandleTypeNone;
+        prop.allocationType = kAclMemAllocationTypePinned;
+        prop.memAttr = kAclHbmMemNormal;
+        prop.location.id = static_cast<uint32_t>(device_id);
+        prop.location.type = kAclMemLocationTypeDevice;
+        size_t granularity = 0;
+        acl_check(
+            aclrtMemGetAllocationGranularity(&prop, kAclRtMemAllocGranularityMinimum, &granularity),
+            "aclrtMemGetAllocationGranularity"
+        );
+        return static_cast<uint64_t>(granularity);
     }
 
-    void ipc_mem_close_with_check(const char *key) const { acl_check(aclrtIpcMemClose(key), "aclrtIpcMemClose"); }
-
-    void ipc_mem_set_import_pid_with_check(const char *key, int32_t *pids, size_t count) const {
-        acl_check(aclrtIpcMemSetImportPid(key, pids, count), "aclrtIpcMemSetImportPid");
+    void *vmm_malloc_physical_with_check(uint64_t bytes, int device_id) const {
+        LocalAclPhysicalMemProp prop{};
+        prop.handleType = kAclMemHandleTypeNone;
+        prop.allocationType = kAclMemAllocationTypePinned;
+        prop.memAttr = kAclHbmMemNormal;
+        prop.location.id = static_cast<uint32_t>(device_id);
+        prop.location.type = kAclMemLocationTypeDevice;
+        void *handle = nullptr;
+        acl_check(aclrtMallocPhysical(&handle, static_cast<size_t>(bytes), &prop, 0), "aclrtMallocPhysical");
+        return handle;
     }
 
-    void ipc_mem_import_by_key_with_retry_and_check(void **base, const char *key, bool enable_peer_access) const {
-        uint64_t flags = enable_peer_access ? kAclIpcImportEnablePeerAccess : 0;
-        int rc = aclrtIpcMemImportByKey(base, key, flags);
-        if (rc != kAclSuccess && flags != 0) {
-            int retry_rc = aclrtIpcMemImportByKey(base, key, 0);
-            if (retry_rc != kAclSuccess) {
-                throw std::runtime_error(
-                    "aclrtIpcMemImportByKey failed with code " + std::to_string(rc) +
-                    "; retry without peer-access flag failed with code " + std::to_string(retry_rc)
-                );
+    void *vmm_reserve_with_check(uint64_t bytes) const {
+        void *va = nullptr;
+        acl_check(aclrtReserveMemAddress(&va, static_cast<size_t>(bytes), 0, nullptr, 0), "aclrtReserveMemAddress");
+        return va;
+    }
+
+    void vmm_map_with_check(void *va, uint64_t bytes, void *handle) const {
+        acl_check(aclrtMapMem(va, static_cast<size_t>(bytes), 0, handle, 0), "aclrtMapMem");
+    }
+
+    void vmm_set_access_with_check(void *va, uint64_t bytes, int device_id) const {
+        LocalAclMemAccessDesc access{};
+        access.flags = kAclRtMemAccessReadwrite;
+        access.location.type = kAclMemLocationTypeDevice;
+        access.location.id = static_cast<uint32_t>(device_id);
+        acl_check(aclrtMemSetAccess(va, static_cast<size_t>(bytes), &access, 1), "aclrtMemSetAccess");
+    }
+
+    uint64_t vmm_export_shareable_with_check(void *handle) const {
+        uint64_t shareable = 0;
+        acl_check(
+            aclrtMemExportToShareableHandle(
+                handle, kAclMemHandleTypeNone, kAclRtVmmExportFlagDisablePidValidation, &shareable
+            ),
+            "aclrtMemExportToShareableHandle"
+        );
+        return shareable;
+    }
+
+    void *vmm_import_shareable_with_check(uint64_t shareable, int device_id) const {
+        void *handle = nullptr;
+        acl_check(
+            aclrtMemImportFromShareableHandle(shareable, device_id, &handle), "aclrtMemImportFromShareableHandle"
+        );
+        return handle;
+    }
+
+    void vmm_release_collecting(void *va, void *handle, std::string &cleanup_error) const {
+        if (va != nullptr) {
+            int rc = aclrtUnmapMem(va);
+            if (rc != kAclSuccess) {
+                append_cleanup_error(cleanup_error, "aclrtUnmapMem failed with code " + std::to_string(rc));
             }
-            return;
+            rc = aclrtReleaseMemAddress(va);
+            if (rc != kAclSuccess) {
+                append_cleanup_error(cleanup_error, "aclrtReleaseMemAddress failed with code " + std::to_string(rc));
+            }
         }
-        acl_check(rc, "aclrtIpcMemImportByKey");
+        if (handle != nullptr) {
+            int rc = aclrtFreePhysical(handle);
+            if (rc != kAclSuccess) {
+                append_cleanup_error(cleanup_error, "aclrtFreePhysical failed with code " + std::to_string(rc));
+            }
+        }
     }
 
 private:
     static constexpr int kAclSuccess = 0;
     static constexpr int kAclMemcpyHostToDevice = 1;
     static constexpr int kAclMemcpyDeviceToHost = 2;
-    static constexpr uint64_t kAclIpcImportEnablePeerAccess = 0x1ULL;
+    static constexpr int kAclMemHandleTypeNone = 0;
+    static constexpr int kAclMemAllocationTypePinned = 0;
+    static constexpr int kAclHbmMemNormal = 5;
+    static constexpr int kAclMemLocationTypeDevice = 1;
+    static constexpr int kAclRtMemAllocGranularityMinimum = 0;
+    static constexpr int kAclRtMemAccessReadwrite = 0x3;
+    static constexpr uint64_t kAclRtVmmExportFlagDisablePidValidation = 0x1ULL;
 
     void *lib_{nullptr};
     bool initialized_{false};
@@ -203,7 +314,8 @@ public:
     int fd{-1};
     uint64_t device_addr{0};
     int device_id{-1};
-    std::array<char, 65> export_key{};
+    uint64_t shareable_handle{0};
+    void *vmm_handle{nullptr};
     uint64_t mapping_bytes{0};
 
     void bind_acl_device() const {
@@ -276,6 +388,22 @@ public:
     }
 };
 
+class L2ChildOnboardRegion {
+public:
+    int device_id{-1};
+    uint64_t device_addr{0};
+    uint64_t mapping_bytes{0};
+    uint64_t shareable_handle{0};
+    void *vmm_handle{nullptr};
+
+    void bind_acl_device() const {
+        if (device_id < 0) {
+            throw std::runtime_error("L3-L2 onboard child region has no device id");
+        }
+        acl_api().bind_device_with_check(device_id);
+    }
+};
+
 class L3HostMappedRegionRegistry {
 public:
     uint64_t emplace(L3HostMappedRegion mapping) {
@@ -312,6 +440,52 @@ private:
 };
 
 L3HostMappedRegionRegistry g_l3_host_mapped_regions;
+
+class L2ChildOnboardRegionRegistry {
+public:
+    uint64_t emplace(L2ChildOnboardRegion region) {
+        std::lock_guard<std::mutex> lk(mu_);
+        uint64_t handle = next_handle_++;
+        regions_.emplace(handle, std::move(region));
+        return handle;
+    }
+
+    std::optional<L2ChildOnboardRegion> remove(uint64_t handle) {
+        std::lock_guard<std::mutex> lk(mu_);
+        auto it = regions_.find(handle);
+        if (it == regions_.end()) {
+            return std::nullopt;
+        }
+        L2ChildOnboardRegion region = std::move(it->second);
+        regions_.erase(it);
+        return region;
+    }
+
+private:
+    mutable std::mutex mu_;
+    std::unordered_map<uint64_t, L2ChildOnboardRegion> regions_;
+    uint64_t next_handle_{1};
+};
+
+L2ChildOnboardRegionRegistry g_l2_child_onboard_regions;
+
+uint64_t align_vmm_bytes(uint64_t bytes, uint64_t granularity) {
+    if (bytes == 0 || bytes > static_cast<uint64_t>(std::numeric_limits<size_t>::max())) {
+        throw std::invalid_argument("L3-L2 onboard VMM region requires a positive mapping size");
+    }
+    if (granularity == 0) {
+        return bytes;
+    }
+    uint64_t remainder = bytes % granularity;
+    if (remainder == 0) {
+        return bytes;
+    }
+    uint64_t bump = granularity - remainder;
+    if (bytes > std::numeric_limits<uint64_t>::max() - bump) {
+        throw std::overflow_error("L3-L2 onboard VMM mapping size overflowed");
+    }
+    return bytes + bump;
+}
 
 L3L2OrchNotifyOp checked_notify_op(int op) {
     auto typed = static_cast<L3L2OrchNotifyOp>(op);
@@ -1316,55 +1490,48 @@ NB_MODULE(_task_interface, m) {
                     std::string("L3-L2 sim L3 Host mapped-region import mmap failed: ") + std::strerror(err)
                 );
             }
-            return g_l3_host_mapped_regions.emplace(
-                L3HostMappedRegion{
-                    L3L2RegionAccessProfile::SIM_POSIX_SHM,
-                    fd,
-                    reinterpret_cast<uint64_t>(base),
-                    -1,
-                    {},
-                    mapping_bytes,
-                }
-            );
+            L3HostMappedRegion mapping{};
+            mapping.profile = L3L2RegionAccessProfile::SIM_POSIX_SHM;
+            mapping.fd = fd;
+            mapping.device_addr = reinterpret_cast<uint64_t>(base);
+            mapping.mapping_bytes = mapping_bytes;
+            return g_l3_host_mapped_regions.emplace(mapping);
         },
         nb::arg("token"), nb::arg("mapping_bytes"), nb::call_guard<nb::gil_scoped_release>(),
         "Import a sim L3-L2 POSIX shm region for L3 Host mapped-region access."
     );
     m.def(
         "_l3_host_mapped_region_import_onboard",
-        [](int device_id, nb::bytes export_key, uint64_t mapping_bytes, bool enable_peer_access) -> uint64_t {
+        [](int device_id, uint64_t shareable_handle, uint64_t mapping_bytes) -> uint64_t {
             if (device_id < 0) {
                 throw std::invalid_argument("L3-L2 onboard mapped-region import requires a non-negative device id");
-            }
-            std::string export_key_copy;
-            {
-                nb::gil_scoped_acquire gil;
-                if (export_key.size() == 0 || export_key.size() >= 65) {
-                    throw std::invalid_argument(
-                        "L3-L2 onboard mapped-region import requires a valid ACL IPC export key"
-                    );
-                }
-                export_key_copy.assign(export_key.c_str(), export_key.size());
             }
             if (mapping_bytes == 0 || mapping_bytes > static_cast<uint64_t>(std::numeric_limits<size_t>::max())) {
                 throw std::invalid_argument("L3-L2 onboard mapped-region import requires a positive mapping size");
             }
             L3HostMappedRegion mapping{};
-            mapping.profile = L3L2RegionAccessProfile::ONBOARD_ACL_IPC;
+            mapping.profile = L3L2RegionAccessProfile::ONBOARD_VMM;
             mapping.device_id = device_id;
             mapping.mapping_bytes = mapping_bytes;
-            std::memcpy(mapping.export_key.data(), export_key_copy.data(), export_key_copy.size());
             mapping.bind_acl_device();
-            void *imported_addr = nullptr;
-            acl_api().ipc_mem_import_by_key_with_retry_and_check(
-                &imported_addr, mapping.export_key.data(), enable_peer_access
-            );
-            mapping.device_addr = reinterpret_cast<uint64_t>(imported_addr);
+            AclRuntimeApi &api = acl_api();
+            mapping.shareable_handle = shareable_handle;
+            mapping.vmm_handle = api.vmm_import_shareable_with_check(shareable_handle, device_id);
+            void *mapped_addr = nullptr;
+            try {
+                mapped_addr = api.vmm_reserve_with_check(mapping_bytes);
+                api.vmm_map_with_check(mapped_addr, mapping_bytes, mapping.vmm_handle);
+                api.vmm_set_access_with_check(mapped_addr, mapping_bytes, device_id);
+            } catch (...) {
+                std::string cleanup_error;
+                api.vmm_release_collecting(mapped_addr, mapping.vmm_handle, cleanup_error);
+                throw;
+            }
+            mapping.device_addr = reinterpret_cast<uint64_t>(mapped_addr);
             return g_l3_host_mapped_regions.emplace(mapping);
         },
-        nb::arg("device_id"), nb::arg("export_key"), nb::arg("mapping_bytes"), nb::arg("enable_peer_access") = true,
-        nb::call_guard<nb::gil_scoped_release>(),
-        "Import an onboard ACL IPC L3-L2 region for L3 Host mapped-region access."
+        nb::arg("device_id"), nb::arg("shareable_handle"), nb::arg("mapping_bytes"),
+        nb::call_guard<nb::gil_scoped_release>(), "Import an onboard VMM L3-L2 region for L3 Host mapped-region access."
     );
     m.def(
         "_l3_host_mapped_region_close",
@@ -1374,9 +1541,16 @@ NB_MODULE(_task_interface, m) {
                 return;
             }
             L3HostMappedRegion mapping = *removed;
-            if (mapping.profile == L3L2RegionAccessProfile::ONBOARD_ACL_IPC) {
+            if (mapping.profile == L3L2RegionAccessProfile::ONBOARD_VMM) {
                 mapping.bind_acl_device();
-                acl_api().ipc_mem_close_with_check(mapping.export_key.data());
+                std::string cleanup_error;
+                acl_api().vmm_release_collecting(
+                    reinterpret_cast<void *>(static_cast<uintptr_t>(mapping.device_addr)), mapping.vmm_handle,
+                    cleanup_error
+                );
+                if (!cleanup_error.empty()) {
+                    throw std::runtime_error(cleanup_error);
+                }
                 return;
             }
 
@@ -1470,44 +1644,54 @@ NB_MODULE(_task_interface, m) {
         nb::call_guard<nb::gil_scoped_release>(), "Poll one L3 Host-side L3-L2 signal counter until match or timeout."
     );
     m.def(
-        "_l3_child_onboard_region_export",
-        [](uint64_t dev_ptr, uint64_t nbytes, int32_t parent_pid) -> nb::bytes {
-            if (dev_ptr == 0 || nbytes == 0 || nbytes > static_cast<uint64_t>(std::numeric_limits<size_t>::max())) {
-                throw std::invalid_argument("L3-L2 onboard child export requires a valid device allocation");
-            }
-            if (parent_pid <= 0) {
-                throw std::invalid_argument("L3-L2 onboard child export requires a positive parent pid");
+        "_l3_child_onboard_region_create",
+        [](uint64_t nbytes) -> std::tuple<uint64_t, uint64_t, uint64_t, uint64_t> {
+            if (nbytes == 0 || nbytes > static_cast<uint64_t>(std::numeric_limits<size_t>::max())) {
+                throw std::invalid_argument("L3-L2 onboard child region requires a positive mapping size");
             }
             AclRuntimeApi &api = acl_api();
-            char key[65]{};
-            api.ipc_mem_get_export_key_with_check(
-                reinterpret_cast<void *>(static_cast<uintptr_t>(dev_ptr)), static_cast<size_t>(nbytes), key,
-                sizeof(key), 0
-            );
-            int32_t pid = parent_pid;
-            api.ipc_mem_set_import_pid_with_check(key, &pid, 1);
-            nb::gil_scoped_acquire gil;
-            return nb::bytes(key, std::strlen(key));
+            int device_id = api.current_device_with_check();
+            uint64_t mapping_bytes = align_vmm_bytes(nbytes, api.vmm_granularity_with_check(device_id));
+            L2ChildOnboardRegion region{};
+            region.device_id = device_id;
+            region.mapping_bytes = mapping_bytes;
+            region.vmm_handle = api.vmm_malloc_physical_with_check(mapping_bytes, device_id);
+            void *mapped_addr = nullptr;
+            try {
+                mapped_addr = api.vmm_reserve_with_check(mapping_bytes);
+                api.vmm_map_with_check(mapped_addr, mapping_bytes, region.vmm_handle);
+                api.vmm_set_access_with_check(mapped_addr, mapping_bytes, device_id);
+                region.shareable_handle = api.vmm_export_shareable_with_check(region.vmm_handle);
+            } catch (...) {
+                std::string cleanup_error;
+                api.vmm_release_collecting(mapped_addr, region.vmm_handle, cleanup_error);
+                throw;
+            }
+            region.device_addr = reinterpret_cast<uint64_t>(mapped_addr);
+            uint64_t registry_handle = g_l2_child_onboard_regions.emplace(region);
+            return std::make_tuple(region.device_addr, region.mapping_bytes, region.shareable_handle, registry_handle);
         },
-        nb::arg("dev_ptr"), nb::arg("nbytes"), nb::arg("parent_pid"), nb::call_guard<nb::gil_scoped_release>(),
-        "Export a child-owned onboard GM region through ACL IPC and authorize the L3 Host PID."
+        nb::arg("nbytes"), nb::call_guard<nb::gil_scoped_release>(),
+        "Create and export a child-owned onboard VMM region."
     );
     m.def(
         "_l3_child_onboard_region_close",
-        [](nb::bytes export_key) {
-            std::string export_key_copy;
-            {
-                nb::gil_scoped_acquire gil;
-                if (export_key.size() == 0 || export_key.size() >= 65) {
-                    return;
-                }
-                export_key_copy.assign(export_key.c_str(), export_key.size());
+        [](uint64_t registry_handle) {
+            std::optional<L2ChildOnboardRegion> removed = g_l2_child_onboard_regions.remove(registry_handle);
+            if (!removed.has_value()) {
+                return;
             }
-            AclRuntimeApi &api = acl_api();
-            api.ipc_mem_close_with_check(export_key_copy.c_str());
+            L2ChildOnboardRegion region = *removed;
+            region.bind_acl_device();
+            std::string cleanup_error;
+            acl_api().vmm_release_collecting(
+                reinterpret_cast<void *>(static_cast<uintptr_t>(region.device_addr)), region.vmm_handle, cleanup_error
+            );
+            if (!cleanup_error.empty()) {
+                throw std::runtime_error(cleanup_error);
+            }
         },
-        nb::arg("export_key"), nb::call_guard<nb::gil_scoped_release>(),
-        "Close a child-owned onboard ACL IPC export key."
+        nb::arg("registry_handle"), nb::call_guard<nb::gil_scoped_release>(), "Close a child-owned onboard VMM region."
     );
 
     bind_worker(m);

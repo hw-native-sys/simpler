@@ -84,9 +84,9 @@ class _FakeCWorker:
                 int(L3L2RegionAccessProfile.SIM_POSIX_SHM),
                 0,
                 0,
-                b"\x00" * l3_l2_orch_comm._ACL_IPC_EXPORT_KEY_BYTES,
                 backing_name + b"\x00" * (l3_l2_orch_comm._CTRL_SHM_TOKEN_BYTES - len(backing_name)),
                 counter_offset + counter_bytes,
+                0,
             )
         finally:
             del req_buf

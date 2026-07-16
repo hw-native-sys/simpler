@@ -17,7 +17,7 @@
 
 enum class L3L2RegionAccessProfile : uint32_t {
     INVALID = 0,
-    ONBOARD_ACL_IPC = 1,
+    ONBOARD_VMM = 1,
     SIM_POSIX_SHM = 2,
 };
 
@@ -40,9 +40,9 @@ struct L3L2RegionCreateReply {
     uint32_t access_profile;
     uint32_t reserved;
     int32_t device_id;
-    uint8_t export_key[65];
     uint8_t backing_shm[32];
     uint64_t mapping_bytes;
+    uint64_t shareable_handle;
 };
 
 static constexpr size_t L3L2_REGION_CREATE_REQUEST_BYTES = sizeof(L3L2RegionCreateRequest);

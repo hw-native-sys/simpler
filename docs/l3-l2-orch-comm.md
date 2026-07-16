@@ -50,9 +50,9 @@ The L3 handle exposes `descriptor_scalars`, `payload_write`, `payload_read`,
 the caller's Host buffer and the region payload range. The steady-state data
 path runs in the L3 Host process on both simulation and onboard platforms.
 Simulation maps a shared POSIX backing object. Onboard imports the child-owned
-GM region with ACL IPC and moves bytes with ACL copy operations. Counter
-handles expose `notify`, `test`, and `wait` over address-based `int32_t`
-counters.
+GM region through a VMM shareable handle and moves bytes with ACL copy
+operations. Counter handles expose `notify`, `test`, and `wait` over
+address-based `int32_t` counters.
 
 On L2, orchestration code consumes the descriptor and builds an endpoint:
 
@@ -145,9 +145,9 @@ metadata. The descriptor still contains L2-side payload and counter addresses
 for the L2 AICPU endpoint; L3 Host operations do not dereference descriptor
 addresses.
 
-On onboard platforms, region create allocates one child-owned GM range, exports
-it with ACL IPC, authorizes the L3 Host PID, and returns the export metadata to
-the parent. The parent imports that region and closes the ACL IPC import before
+On onboard platforms, region create allocates one child-owned VMM GM range,
+exports it through a shareable handle, and returns the import metadata to the
+parent. The parent imports that region and closes the mapped VMM import before
 the child frees the physical allocation.
 
 ## 4. Signal Counters
@@ -337,9 +337,9 @@ L3 Host poisons only the region parsed from that text.
 
 - `a2a3sim`: full API and protocol support.
 - `a5sim`: full API and protocol support.
-- `a2a3` onboard: full API support with direct L3 Host ACL IPC payload and
+- `a2a3` onboard: full API support with direct L3 Host VMM payload and
   counter operations.
-- `a5` onboard: full API support with direct L3 Host ACL IPC payload and
+- `a5` onboard: full API support with direct L3 Host VMM payload and
   counter operations.
 
 Simulation backends preserve the same API, ordering, timeout, and error

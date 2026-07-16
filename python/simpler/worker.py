@@ -81,7 +81,7 @@ from _task_interface import (  # pyright: ignore[reportMissingImports]
     RUNTIME_ENV_RING_COUNT,
     WorkerType,
     _l3_child_onboard_region_close,
-    _l3_child_onboard_region_export,
+    _l3_child_onboard_region_create,
     _l3_host_mapped_region_import_onboard,
     _l3_host_mapped_region_import_sim,
     _mailbox_load_i32,
@@ -103,7 +103,6 @@ from .callable_identity import (
     parse_python_import_target,
 )
 from .l3_l2_orch_comm import (
-    _ACL_IPC_EXPORT_KEY_BYTES,
     _CTRL_SHM_TOKEN_BYTES,
     _REGION_CREATE_REPLY,
     _REGION_CREATE_REPLY_BYTES,
@@ -1085,7 +1084,8 @@ class _L2HostL3L2Region:
     total_bytes: int
     shm: SharedMemory | None = None
     dev_ptr: int = 0
-    export_key: bytes = b""
+    onboard_handle: int = 0
+    shareable_handle: int = 0
 
 
 def _l2_host_l3_l2_regions(cw: ChipWorker) -> dict[int, _L2HostL3L2Region]:
@@ -1107,13 +1107,8 @@ def _release_l2_host_l3_l2_region(cw: ChipWorker, region: _L2HostL3L2Region) -> 
         region.shm.close()
         region.shm.unlink()
         return
-    if region.dev_ptr:
-        if region.export_key:
-            try:
-                _l3_child_onboard_region_close(region.export_key)
-            except RuntimeError:
-                pass
-        cw.free(region.dev_ptr)
+    if region.onboard_handle:
+        _l3_child_onboard_region_close(region.onboard_handle)
 
 
 def _handle_ctrl_l3_l2_region_create(  # noqa: PLR0912
@@ -1144,6 +1139,7 @@ def _handle_ctrl_l3_l2_region_create(  # noqa: PLR0912
 
         region_id = _next_l2_host_l3_l2_region_id(cw)
         platform = str(chip_platform)
+        shareable_handle = 0
         if platform.endswith("sim"):
             shm = SharedMemory(create=True, size=total_bytes)
             region = _L2HostL3L2Region(
@@ -1167,12 +1163,12 @@ def _handle_ctrl_l3_l2_region_create(  # noqa: PLR0912
             if len(backing_name) >= _CTRL_SHM_TOKEN_BYTES:
                 raise RuntimeError("CTRL_L3_L2_REGION_CREATE backing shm token is too long")
             access_profile = L3L2RegionAccessProfile.SIM_POSIX_SHM
-            export_key = b""
             mapping_bytes = total_bytes
         else:
-            dev_ptr = int(cw.malloc(total_bytes))
+            dev_ptr, mapping_bytes, shareable_handle, onboard_handle = _l3_child_onboard_region_create(total_bytes)
+            dev_ptr = int(dev_ptr)
             if dev_ptr == 0:
-                raise RuntimeError("CTRL_L3_L2_REGION_CREATE onboard GM allocation returned null")
+                raise RuntimeError("CTRL_L3_L2_REGION_CREATE onboard VMM allocation returned null")
             region = _L2HostL3L2Region(
                 region_id=region_id,
                 payload_bytes=request.payload_bytes,
@@ -1180,21 +1176,15 @@ def _handle_ctrl_l3_l2_region_create(  # noqa: PLR0912
                 counter_bytes=request.counter_bytes,
                 total_bytes=total_bytes,
                 dev_ptr=dev_ptr,
+                onboard_handle=int(onboard_handle),
+                shareable_handle=int(shareable_handle),
             )
             zeros = ctypes.create_string_buffer(request.counter_bytes)
             cw.copy_to(dev_ptr + counter_offset, ctypes.addressof(zeros), request.counter_bytes)
-            export_key = _l3_child_onboard_region_export(dev_ptr, total_bytes, request.l3_host_pid)
-            if isinstance(export_key, str):
-                export_key = export_key.encode("utf-8")
-            export_key = bytes(export_key).split(b"\x00", 1)[0]
-            if len(export_key) >= _ACL_IPC_EXPORT_KEY_BYTES:
-                raise RuntimeError("CTRL_L3_L2_REGION_CREATE ACL IPC export key is too long")
-            region.export_key = export_key
             payload_base = dev_ptr
             counter_base = payload_base + counter_offset
             backing_name = b""
-            access_profile = L3L2RegionAccessProfile.ONBOARD_ACL_IPC
-            mapping_bytes = total_bytes
+            access_profile = L3L2RegionAccessProfile.ONBOARD_VMM
         _REGION_CREATE_REPLY.pack_into(
             reply_buf,
             0,
@@ -1207,9 +1197,9 @@ def _handle_ctrl_l3_l2_region_create(  # noqa: PLR0912
             int(access_profile),
             0,
             int(getattr(cw, "device_id", -1)),
-            export_key + b"\x00" * (_ACL_IPC_EXPORT_KEY_BYTES - len(export_key)),
             backing_name + b"\x00" * (_CTRL_SHM_TOKEN_BYTES - len(backing_name)),
             mapping_bytes,
+            shareable_handle if access_profile == L3L2RegionAccessProfile.ONBOARD_VMM else 0,
         )
         _l2_host_l3_l2_regions(cw)[region_id] = region
         region = None
@@ -3604,12 +3594,6 @@ class Worker:
         """
         return dict(self._live_domains)
 
-    def _l3_l2_onboard_import_enable_peer_access(self) -> bool:
-        platform = str(self._config.get("platform", ""))
-        # The ACL IPC import peer-access flag is requested only for the a2a3
-        # L3-L2 direct path; a5 imports the same exported region without it.
-        return platform == "a2a3"
-
     def _validate_l3_l2_worker_id(self, worker_id: int) -> None:
         if self.level < 3:
             raise RuntimeError("create_l3_l2_region requires a hierarchical Worker")
@@ -3697,7 +3681,7 @@ class Worker:
             expected_access_profile = (
                 L3L2RegionAccessProfile.SIM_POSIX_SHM
                 if platform.endswith("sim")
-                else L3L2RegionAccessProfile.ONBOARD_ACL_IPC
+                else L3L2RegionAccessProfile.ONBOARD_VMM
             )
             counter_offset, total_bytes = validate_region_create_reply(reply, expected_access_profile)
             if platform.endswith("sim"):
@@ -3705,9 +3689,8 @@ class Worker:
             else:
                 handle = _l3_host_mapped_region_import_onboard(
                     int(reply.device_id),
-                    reply.export_key,
-                    int(total_bytes),
-                    self._l3_l2_onboard_import_enable_peer_access(),
+                    int(reply.shareable_handle),
+                    int(reply.mapping_bytes),
                 )
             l3_host_mapping = L3HostRegionMapping(
                 worker_id=int(worker_id),
