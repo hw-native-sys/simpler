@@ -243,17 +243,51 @@ def test_emit_dot_handles_missing_task_table():
     assert 'label="🔥 1 · alloc"' in dot
 
 
-def test_emit_dot_treats_alloc_as_a_fire_marked_source():
+def test_emit_dot_does_not_mark_alloc_only_successor_with_star():
     dot = deps_viewer.emit_dot(
-        edges=[(1, 2)],
-        nodes=[1, 2],
+        edges=[(1, 3), (2, 3)],
+        nodes=[1, 2, 3],
         meta={},
-        task_table={2: {"task_id": 2, "kernel_ids": [-1, 7, -1]}},
+        task_table={3: {"task_id": 3, "kernel_ids": [-1, 7, -1]}},
         show_tensor_info=False,
     )
 
     assert 'label="🔥 1 · alloc"' in dot
-    assert 'label="⭐ 2"' in dot
+    assert 'label="🔥 2 · alloc"' in dot
+    assert 'label="3"' in dot
+
+
+def test_emit_dot_marks_star_with_alloc_and_early_dispatch_predecessors():
+    dot = deps_viewer.emit_dot(
+        edges=[(1, 3), (2, 3)],
+        nodes=[1, 2, 3],
+        meta={},
+        task_table={
+            2: {"task_id": 2, "kernel_ids": [-1, 6, -1], "early_dispatch": True},
+            3: {"task_id": 3, "kernel_ids": [-1, 7, -1]},
+        },
+        show_tensor_info=False,
+    )
+
+    assert 'label="🔥 1 · alloc"' in dot
+    assert 'label="🔥 2"' in dot
+    assert 'label="⭐ 3"' in dot
+
+
+def test_emit_dot_does_not_mark_star_when_any_predecessor_lacks_fire():
+    dot = deps_viewer.emit_dot(
+        edges=[(1, 4), (2, 4), (3, 4)],
+        nodes=[1, 2, 3, 4],
+        meta={},
+        task_table={
+            2: {"task_id": 2, "kernel_ids": [-1, 6, -1], "early_dispatch": True},
+            3: {"task_id": 3, "kernel_ids": [-1, 7, -1]},
+            4: {"task_id": 4, "kernel_ids": [-1, 8, -1]},
+        },
+        show_tensor_info=False,
+    )
+
+    assert 'label="4"' in dot
 
 
 def test_emit_dot_hides_selected_edges_with_background_color():

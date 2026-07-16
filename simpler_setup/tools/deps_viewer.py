@@ -758,9 +758,9 @@ def _task_markers(nodes, edges, meta, task_table):
         (deps.json ``early_dispatch`` — the submit had allow_early_resolve)
         or an alloc task. Alloc tasks are immediate graph sources, so they
         are treated as fire-marked producers by default.
-    ⭐ (star): every one of the task's predecessors is 🔥 (and it has at
-        least one), so the task is fully fed by flagged producers or alloc
-        sources.
+    ⭐ (star): every one of the task's predecessors is 🔥, and at least
+        one predecessor is not an alloc task. An alloc-only fanin does not
+        qualify.
     A task can carry both.
     """
     pred_map: dict[int, set] = {}
@@ -774,7 +774,13 @@ def _task_markers(nodes, edges, meta, task_table):
     for tid in nodes:
         fire = "🔥" if _fire_marked(tid) else ""
         preds = pred_map.get(tid, set())
-        star = "⭐" if preds and all(_fire_marked(p) for p in preds) else ""
+        star = (
+            "⭐"
+            if preds
+            and all(_fire_marked(p) for p in preds)
+            and any(_task_kind(p, meta, task_table) != "alloc" for p in preds)
+            else ""
+        )
         if fire or star:
             markers[tid] = fire + star
     return markers
