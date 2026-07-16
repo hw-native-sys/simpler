@@ -435,7 +435,21 @@ struct ProfilerAlgorithms {
             );
             return;
         }
-        (void)top_up_free_queue(mgr, site.kind, *site.free_queue, site.buffer_size, q);
+
+        // Drain-driven free_queue top-up, suppressed while EITHER freeze is open so
+        // the mgmt replenish thread (conjunction release) is the sole free_queue
+        // writer. This drain read is not synchronized against the mgmt write, and
+        // try_pop advances queue_heads before it — so mgmt can observe RQ-empty and
+        // start its own top_up while a drain thread is here. The two writers stay
+        // apart by timing, not structure: the freeze_active=1 store precedes the
+        // whole RQ-drain window, so it is visible here well before the last drained
+        // entry. The fields stay plain volatile (they are also host→device shared,
+        // so cannot become std::atomic); a stale read only defers this top_up, or
+        // in the vanishing open-edge overlap duplicates a free_queue slot —
+        // bounding the worst case to DFX diagnostic loss, never compute data.
+        if (header->backpressure.rq_freeze_active == 0 && header->backpressure.fq_freeze_active == 0) {
+            (void)top_up_free_queue(mgr, site.kind, *site.free_queue, site.buffer_size, q);
+        }
 
         if (!mgr.push_to_ready(site.info, q)) {
             (void)mgr.retire_unqueued_buffer(site.kind, site.info.dev_buffer_ptr, q);
@@ -493,6 +507,106 @@ struct ProfilerAlgorithms {
             }
         }
         return pushed;
+    }
+
+    // DFX backpressure global-sync freeze state machine (host-owned). Runs each
+    // mgmt tick for every DFX subsystem; idle at zero cost until a lane raises
+    // contention. Two per-gate freezes, one per gate class (#997 "a thread blocks
+    // only at its buffer-switch gate"):
+    //   rq_freeze (push gate): opened on rq_contended (ready-queue-full); every
+    //     lane parks at its push gate.
+    //   fq_freeze (pop gate): opened on fq_contended (free-queue-empty); every
+    //     lane parks at its pop gate.
+    // Each freeze is opened independently by its leader, but BOTH release together
+    // on the conjunction #997 "block until RQ fully drained AND FQ fully refilled"
+    // — resuming into RQ-empty + FQ-at-limit is one clean common-mode gap.
+    // Deadlock-free at any pool size: RQ-drain is host-driven and independent of
+    // any held buffer, and FQ "refilled" is the attainable initial limit (pushed
+    // ==0), not the unreachable exact-kSlotCount fill.
+    //
+    // *_freeze_active are host→device, *_contended / queue_tails are device→host.
+    // Host writes go through write_range_to_device and device→host reads through
+    // read_range_from_device so a5 (non-SVM) sees them; a2a3 (SVM) short-circuits
+    // both to no-ops since the header already lives in shared device memory.
+    // extra_release_ready is the per-subsystem release predicate
+    // (Derived::backpressure_release_ready(), default true). The caller
+    // (mgmt_replenish_loop) evaluates it because this static has no Derived.
+    // tensor_dump uses it to hold the release until its collector has pulled all
+    // arena bytes (RQ-empty alone does not imply that — see buffer_pool_manager).
+    template <typename Mgr>
+    static void update_backpressure_freeze(Mgr &mgr, DataHeader *header, bool extra_release_ready = true) {
+        // --- Open each per-gate freeze on its own contention ---
+        // A thread blocks only at its own buffer-switch gate (#997 "same gate
+        // class"): push lanes park on rq_freeze (ready-queue-full), pop lanes on
+        // fq_freeze (free-queue-empty). Each is opened independently by its leader.
+        if (header->backpressure.rq_freeze_active == 0 &&
+            mgr.read_range_from_device(&header->backpressure.rq_contended, sizeof(header->backpressure.rq_contended)) ==
+                0 &&
+            header->backpressure.rq_contended != 0) {
+            header->backpressure.rq_freeze_active = 1;
+            wmb();
+            mgr.write_range_to_device(
+                &header->backpressure.rq_freeze_active, sizeof(header->backpressure.rq_freeze_active)
+            );
+            header->backpressure.rq_contended = 0;
+            mgr.write_range_to_device(&header->backpressure.rq_contended, sizeof(header->backpressure.rq_contended));
+        }
+        if (header->backpressure.fq_freeze_active == 0 &&
+            mgr.read_range_from_device(&header->backpressure.fq_contended, sizeof(header->backpressure.fq_contended)) ==
+                0 &&
+            header->backpressure.fq_contended != 0) {
+            // Open fq_freeze BEFORE consuming fq_contended so the disjunction
+            // (fq_contended || fq_freeze_active) that wait_for_release() spins on
+            // stays continuously true — no (0,0) escape window.
+            header->backpressure.fq_freeze_active = 1;
+            wmb();
+            mgr.write_range_to_device(
+                &header->backpressure.fq_freeze_active, sizeof(header->backpressure.fq_freeze_active)
+            );
+            header->backpressure.fq_contended = 0;
+            mgr.write_range_to_device(&header->backpressure.fq_contended, sizeof(header->backpressure.fq_contended));
+        }
+
+        // --- Conjunction release (#997 "block until RQ fully drained AND FQ fully
+        //     refilled") ---
+        // While either freeze is open, release BOTH only once RQ is drained AND
+        // the free queues are refilled to their initial upper limit. Resuming into
+        // RQ-empty + FQ-at-limit is one clean common-mode gap (no immediate
+        // re-stall). Deadlock-free regardless of pool size: RQ-drain is
+        // host-driven and independent of any buffer held at a push gate, and FQ
+        // "refilled" is pushed==0 (the attainable initial limit min(kSlotCount,
+        // BUFFERS)), not the unreachable exact-kSlotCount fill. Order matters: wait
+        // RQ-empty FIRST — once RQ is empty the drain threads are idle, so it is
+        // safe for THIS thread to top up the free queues (drain-driven top_up is
+        // suppressed while either freeze is open).
+        if (header->backpressure.rq_freeze_active == 0 && header->backpressure.fq_freeze_active == 0) {
+            return;
+        }
+        if (mgr.read_range_from_device(&header->queue_tails[0], sizeof(header->queue_tails)) != 0) {
+            return;
+        }
+        for (int q = 0; q < PLATFORM_MAX_AICPU_THREADS; q++) {
+            if (header->queue_heads[q] != header->queue_tails[q]) return;  // RQ not drained
+        }
+        uint64_t pushed = replenish_free_queues(mgr, header);
+        if (pushed != 0 || !extra_release_ready) {
+            return;  // FQ not yet refilled to its attainable initial limit
+        }
+        // Both conjuncts met → release both freezes together.
+        if (header->backpressure.rq_freeze_active != 0) {
+            header->backpressure.rq_freeze_active = 0;
+            wmb();
+            mgr.write_range_to_device(
+                &header->backpressure.rq_freeze_active, sizeof(header->backpressure.rq_freeze_active)
+            );
+        }
+        if (header->backpressure.fq_freeze_active != 0) {
+            header->backpressure.fq_freeze_active = 0;
+            wmb();
+            mgr.write_range_to_device(
+                &header->backpressure.fq_freeze_active, sizeof(header->backpressure.fq_freeze_active)
+            );
+        }
     }
 
 private:
@@ -621,6 +735,16 @@ public:
 
     ProfilerBase(const ProfilerBase &) = delete;
     ProfilerBase &operator=(const ProfilerBase &) = delete;
+
+    // DFX backpressure per-subsystem release predicate (CRTP hook). Default:
+    // the freeze may release as soon as the framework's RQ-empty + FQ-full hold.
+    // A subsystem whose collector owns a separate, independently-overwritten
+    // region (only tensor_dump today: the payload arena) MUST override this to
+    // return false until its collector has drained that region, else the device
+    // resumes and overwrites not-yet-pulled data. Called on the mgmt_replenish
+    // thread inside the freeze loop — overrides must be cheap, non-blocking, and
+    // read only atomics.
+    bool backpressure_release_ready() const { return true; }
 
 private:
     friend Derived;
@@ -1019,6 +1143,17 @@ private:
         while (mgmt_running_.load(std::memory_order_relaxed)) {
             size_t drained = manager_.drain_done_into_recycled();
             uint64_t replenished = Alg::replenish_recycled_pools(manager_, header);
+
+            // DFX backpressure global-sync freeze state machine. Runs on this
+            // single replenish thread — the state machine must be single-writer
+            // for freeze_active. Always active (block-on-contention is the only
+            // behavior); idle at zero cost until a lane raises `contended`.
+            // Per-subsystem release predicate (CRTP): default true, only
+            // tensor_dump overrides it (gate release on collector-quiesce);
+            // evaluated here because update_backpressure_freeze is a static with
+            // no Derived, and must be cheap + non-blocking (freeze hot loop).
+            const bool extra_release_ready = static_cast<const Derived *>(this)->backpressure_release_ready();
+            Alg::update_backpressure_freeze(manager_, header, extra_release_ready);
 
             if (drained == 0 && replenished == 0) {
                 std::this_thread::sleep_for(std::chrono::microseconds(10));

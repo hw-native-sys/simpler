@@ -60,7 +60,7 @@ static PmuAicoreRing *s_pmu_aicore_rings[PLATFORM_MAX_CORES];
 // Populated by pmu_aicpu_init(); 0 means "no PMU for this core" (sim).
 static uint64_t s_pmu_reg_addrs[PLATFORM_MAX_CORES] = {0};
 
-static constexpr uint64_t kPmuQueueBackpressureWaitCycles = PLATFORM_PROF_SYS_CNT_FREQ / 50000;  // 20 us
+static constexpr uint64_t kPmuQueueBackpressureWaitCycles = PLATFORM_DFX_BACKPRESSURE_TIMEOUT_CYCLES;
 
 extern "C" void set_platform_pmu_base(uint64_t pmu_data_base) { g_platform_pmu_base = pmu_data_base; }
 

@@ -45,7 +45,7 @@ static int s_orch_thread_idx = -1;  // set via scope_stats_aicpu_set_orch_thread
 // unroll_heap_offset). Reset in set_platform_scope_stats_base.
 static uint64_t s_heap_wraps[PTO2_SCOPE_STATS_MAX_RING_DEPTH][2] = {};
 
-static constexpr uint64_t kScopeStatsQueueBackpressureWaitCycles = PLATFORM_PROF_SYS_CNT_FREQ / 50000;  // 20 us
+static constexpr uint64_t kScopeStatsQueueBackpressureWaitCycles = PLATFORM_DFX_BACKPRESSURE_TIMEOUT_CYCLES;
 
 namespace {
 

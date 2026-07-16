@@ -50,7 +50,7 @@ static inline void account_dropped_records(DumpBufferState *state, uint32_t drop
     state->dropped_record_count = (next < prev) ? UINT32_MAX : next;
 }
 
-static constexpr uint64_t kDumpQueueBackpressureWaitCycles = PLATFORM_PROF_SYS_CNT_FREQ / 50000;  // 20 us
+static constexpr uint64_t kDumpQueueBackpressureWaitCycles = PLATFORM_DFX_BACKPRESSURE_TIMEOUT_CYCLES;
 
 static bool g_enable_dump_args = false;
 // Dump level latched from the header in dump_args_init(). The selective

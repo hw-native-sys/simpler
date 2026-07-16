@@ -20,6 +20,7 @@
  * only one shard exists. Both shapes are covered here.
  */
 
+#include "common/dfx_backpressure_device.h"
 #include "host/profiler_base.h"
 
 #include <gtest/gtest.h>
@@ -56,6 +57,7 @@ struct TestHeader {
     volatile uint32_t queue_heads[PLATFORM_MAX_AICPU_THREADS];
     volatile uint32_t queue_tails[PLATFORM_MAX_AICPU_THREADS];
     TestFreeQueue free_queue;
+    DfxBackpressureHeader backpressure;
 };
 
 struct TestReadyBufferInfo {
