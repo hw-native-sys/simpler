@@ -12,13 +12,6 @@
  * IBing Interleaved Bidirectional Ring AllReduce — faithful implementation
  * of the algorithm by Zong et al., ACM TACO 2025.
  *
- * Unlike the two-ring bidirectional_ring variant (which runs separate RS
- * and AG phases, 2(P-1)+1 barriers), this kernel implements the true
- * IBing interleaved schedule: P-1 bidirectional rounds, each round
- * pushing one chunk clockwise and one counter-clockwise, with the
- * first ⌊P/2⌋ steps using AtomicAdd (reduce-scatter) and the remaining
- * steps using AtomicNone (allgather-forward).
- *
  * Right-bound:  r pushes chunks[(r - s + P) % P]         → rank r+1
  * Left-bound:   r pushes chunks[(r + s + 1 + P) % P]    → rank r-1
  *
@@ -28,11 +21,19 @@
  * The double-barrier scheme ensures (a) prior writes are globally visible,
  * (b) all snapshots complete, before any push reads the exchange buffers.
  *
+ * **Async allgather (forward) phase**: steps ⌊P/2⌋+1..P−1 use TPUT_ASYNC
+ * instead of synchronous TPUT<AtomicNone>.  Both CW and CCW pushes are
+ * issued to the SDMA engine back-to-back per round, then drained with a
+ * single WaitAll().  Reduce-scatter steps (1..⌊P/2⌋) still use synchronous
+ * TPUT<AtomicAdd> because TPUT_ASYNC does not support atomic operations.
+ *
  * Scratch layout (per rank, in HCCL window):
  *   [0 .. P*chunk_elems)                   P working chunks
- *   [P*chunk .. (P+1)*chunk)               exchange_right (snapshot buffer)
- *   [(P+1)*chunk .. (P+2)*chunk)          exchange_left  (snapshot buffer)
+ *   [P*chunk .. (P+1)*chunk)               exchange_right snapshot buffer
+ *   [(P+1)*chunk .. (P+2)*chunk)          exchange_left  snapshot buffer
  *   tail                   (2*(P-1)+1) * kMaxSupportedRanks int32 signals
+ *   tail + ...                             kSdmaWorkspaceSize bytes for SDMA
+ *                                          control structures
  *
  * Divisibility: requires ALLREDUCE_COUNT % nranks == 0.
  */
@@ -40,6 +41,10 @@
 #include <pto/pto-inst.hpp>
 #include "pto/comm/comm_types.hpp"
 #include "pto/comm/pto_comm_inst.hpp"
+#include "pto/comm/async_common/async_types.hpp"
+#ifndef __CPU_SIM
+#include "pto/comm/async_common/async_event_impl.hpp"
+#endif
 #include "platform_comm/comm_context.h"
 #include "tensor.h"
 
@@ -53,6 +58,8 @@
 
 static constexpr size_t ALLREDUCE_COUNT = 256;
 static constexpr int kMaxSupportedRanks = 16;
+static constexpr size_t kSdmaWorkspaceSize = 16 * 1024;
+static constexpr int kMaxAsyncEvents = 8;
 
 template <typename T>
 AICORE inline __gm__ T *CommRemotePtr(__gm__ CommContext *ctx, __gm__ T *localPtr, int pe) {
@@ -75,6 +82,62 @@ AICORE inline void RoundBarrier(__gm__ CommContext *ctx, __gm__ int32_t *signal_
     }
     pipe_barrier(PIPE_ALL);
 }
+
+// ---------------------------------------------------------------------------
+// Async session wrapper (self-contained; inline for homogeneity with all
+// other AIV kernel files in this directory).
+// ---------------------------------------------------------------------------
+
+struct AivAsyncSession {
+    pto::comm::AsyncSession session{};
+    pto::comm::AsyncEvent events[kMaxAsyncEvents];
+    int numPending = 0;
+
+#if defined(__CPU_SIM) || defined(__COSTMODEL)
+    AICORE bool Init(__gm__ uint8_t *workspace,
+                     const pto::comm::sdma::SdmaBaseConfig& = {}) {
+        (void)workspace;
+        session = {};
+        numPending = 0;
+        return true;
+    }
+#else
+    template <int kRows = 1, int kCols = 256>
+    AICORE bool Init(__gm__ uint8_t *workspace,
+                     const pto::comm::sdma::SdmaBaseConfig& baseConfig =
+                         {pto::comm::sdma::kDefaultSdmaBlockBytes, 0, 1}) {
+        using ScratchTile =
+            pto::Tile<pto::TileType::Vec, uint8_t, kRows, kCols, pto::BLayout::RowMajor, -1, -1>;
+        ScratchTile scratchTile(kRows, kCols);
+        TASSIGN(scratchTile, static_cast<uint8_t>(0));
+        bool ok = pto::comm::BuildAsyncSession(scratchTile, workspace, session, 0, baseConfig);
+        if (!ok) return false;
+        numPending = 0;
+        return true;
+    }
+#endif
+
+    AICORE void Reset() { numPending = 0; }
+
+    AICORE void Issue(const pto::comm::AsyncEvent& ev) {
+        events[numPending++] = ev;
+    }
+
+    AICORE bool WaitAll() {
+        for (int i = 0; i < numPending; ++i) {
+            if (!events[i].Wait(session)) {
+                numPending = 0;
+                return false;
+            }
+        }
+        numPending = 0;
+        return true;
+    }
+};
+
+// ---------------------------------------------------------------------------
+// Kernel entry point
+// ---------------------------------------------------------------------------
 
 extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ int64_t *args) {
     __gm__ Tensor *input_tensor = reinterpret_cast<__gm__ Tensor *>(args[0]);
@@ -104,6 +167,19 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
     __gm__ float *exchange_right = scratch + static_cast<size_t>(nranks * chunk_elems);
     __gm__ float *exchange_left = exchange_right + static_cast<size_t>(chunk_elems);
     __gm__ int32_t *signal_base = reinterpret_cast<__gm__ int32_t *>(exchange_left + static_cast<size_t>(chunk_elems));
+
+    // SDMA workspace: carved from the end of the scratch buffer, after the
+    // signal rows.  On CPUSIM, TPUT_ASYNC always completes immediately
+    // (handle=0), so the workspace content is irrelevant.
+    __gm__ uint8_t *workspace =
+        reinterpret_cast<__gm__ uint8_t *>(signal_base + (static_cast<size_t>(2 * (nranks - 1) + 1) * kMaxSupportedRanks));
+
+    // Build the async session (one per kernel invocation).
+    AivAsyncSession asyncS;
+    if (!asyncS.Init(workspace)) {
+        pipe_barrier(PIPE_ALL);
+        return;
+    }
 
     ShapeDyn chunkShape(1, 1, 1, 1, chunk_elems);
     StrideDyn chunkStride(chunk_elems, chunk_elems, chunk_elems, chunk_elems, 1);
@@ -136,22 +212,13 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
     // ------------------------------------------------------------------
     // Phase 2: IBing interleaved RS+AG — P−1 rounds.
     //
-    // In each step s ∈ [1, P−1]:
-    //   - Push chunk (r - s + P) % P to right neighbour.
-    //   - Push chunk (r + s + 1 + P) % P to left neighbour.
+    // Steps 1..⌊P/2⌋:     reduce  — AtomicAdd pushes from exchange buffers.
+    // Steps ⌊P/2⌋+1..P−1: forward — TPUT_ASYNC AtomicNone pushes.
     //
-    //   Steps 1..⌊P/2⌋:     reduce  — AtomicAdd pushes from exchange buffers.
-    //   Steps ⌊P/2⌋+1..P−1: forward — AtomicNone pushes (allgather).
-    //
-    // CPU sim and NPU both use a double-barrier scheme:
-    //   1. Barrier A: ensure prior writes are globally visible.
-    //   2. Snapshot:  copy src chunks → exchange buffers.
-    //   3. Barrier B: ensure all snapshots complete.
-    //   4. Push:      write exchange buffers → neighbour's chunks[].
-    //
-    // This replicates MPI exchange-buffer semantics.  Without snapshots,
-    // a remote TPUT can modify chunks[idx_l] between the right-bound and
-    // left-bound TLOAD within the same step, double-counting data.
+    // Double-barrier + exchange-buffer snapshot scheme replicates MPI
+    // ISend/IRecv semantics (plan 44).  Forward steps issue both CW and CCW
+    // pushes to the SDMA engine via TPUT_ASYNC and drain with a single
+    // WaitAll() instead of pipe_barrier(PIPE_ALL).
     // ------------------------------------------------------------------
     const int left = (my_rank - 1 + nranks) % nranks;
     const int right = (my_rank + 1) % nranks;
@@ -166,16 +233,6 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
         const bool fwd = (step > reduce_steps);
 
         // Snapshot source chunks into exchange buffers.
-        //
-        // On NPU the snapshot stays on the MTE pipeline (TLOAD → TSTORE)
-        // so that pipe_barrier(PIPE_ALL) in the following RoundBarrier
-        // guarantees the exchange buffers are visible to subsequent MTE
-        // TLOADs inside TPUT.  Scalar-write snapshots are not flushed by
-        // PIPE_ALL and produce stale reads (zero accumulation).
-        //
-        // On CPU sim, scalar pointer writes into POSIX shm are sufficient
-        // because all ranks map the same physical pages and RoundBarrier's
-        // seq_cst atomics provide cross-process ordering.
 #ifdef __CPU_SIM
         for (int i = 0; i < chunk_elems; ++i)
             exchange_right[i] = chunks[static_cast<size_t>(idx_r * chunk_elems) + i];
@@ -212,27 +269,55 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
         // Barrier B: all snapshots complete — safe to push.
         RoundBarrier(commCtx, signal_base + (2 * (step - 1) + 1) * kMaxSupportedRanks, my_rank, nranks);
 
-        // Right-bound push.
-        {
-            __gm__ float *src = exchange_right;
-            __gm__ float *dst = CommRemotePtr(commCtx, chunks + static_cast<size_t>(idx_r * chunk_elems), right);
-            GT srcG(src, chunkShape, chunkStride);
-            GT dstG(dst, chunkShape, chunkStride);
-            if (fwd) pto::comm::TPUT<pto::AtomicType::AtomicNone>(dstG, srcG, pushTile);
-            else pto::comm::TPUT<pto::AtomicType::AtomicAdd>(dstG, srcG, pushTile);
-        }
+        if (fwd) {
+            // Forward step (allgather): TPUT_ASYNC for both CW and CCW pushes.
+            asyncS.Reset();
 
-        // Left-bound push.
-        {
-            __gm__ float *src = exchange_left;
-            __gm__ float *dst = CommRemotePtr(commCtx, chunks + static_cast<size_t>(idx_l * chunk_elems), left);
-            GT srcG(src, chunkShape, chunkStride);
-            GT dstG(dst, chunkShape, chunkStride);
-            if (fwd) pto::comm::TPUT<pto::AtomicType::AtomicNone>(dstG, srcG, pushTile);
-            else pto::comm::TPUT<pto::AtomicType::AtomicAdd>(dstG, srcG, pushTile);
-        }
+            // Right-bound async push.
+            {
+                __gm__ float *src = exchange_right;
+                __gm__ float *dst = CommRemotePtr(commCtx, chunks + static_cast<size_t>(idx_r * chunk_elems), right);
+                GT srcG(src, chunkShape, chunkStride);
+                GT dstG(dst, chunkShape, chunkStride);
+                pto::comm::AsyncEvent ev = pto::comm::TPUT_ASYNC(dstG, srcG, asyncS.session);
+                asyncS.Issue(ev);
+            }
 
-        pipe_barrier(PIPE_ALL);
+            // Left-bound async push.
+            {
+                __gm__ float *src = exchange_left;
+                __gm__ float *dst = CommRemotePtr(commCtx, chunks + static_cast<size_t>(idx_l * chunk_elems), left);
+                GT srcG(src, chunkShape, chunkStride);
+                GT dstG(dst, chunkShape, chunkStride);
+                pto::comm::AsyncEvent ev = pto::comm::TPUT_ASYNC(dstG, srcG, asyncS.session);
+                asyncS.Issue(ev);
+            }
+
+            // Wait for both SDMA transfers to complete.
+            asyncS.WaitAll();
+        } else {
+            // Reduce step: synchronous TPUT<AtomicAdd> (async does not
+            // support atomic operations).
+            // Right-bound reduce push.
+            {
+                __gm__ float *src = exchange_right;
+                __gm__ float *dst = CommRemotePtr(commCtx, chunks + static_cast<size_t>(idx_r * chunk_elems), right);
+                GT srcG(src, chunkShape, chunkStride);
+                GT dstG(dst, chunkShape, chunkStride);
+                pto::comm::TPUT<pto::AtomicType::AtomicAdd>(dstG, srcG, pushTile);
+            }
+
+            // Left-bound reduce push.
+            {
+                __gm__ float *src = exchange_left;
+                __gm__ float *dst = CommRemotePtr(commCtx, chunks + static_cast<size_t>(idx_l * chunk_elems), left);
+                GT srcG(src, chunkShape, chunkStride);
+                GT dstG(dst, chunkShape, chunkStride);
+                pto::comm::TPUT<pto::AtomicType::AtomicAdd>(dstG, srcG, pushTile);
+            }
+
+            pipe_barrier(PIPE_ALL);
+        }
     }
 
     // ------------------------------------------------------------------

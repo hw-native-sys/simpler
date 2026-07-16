@@ -30,6 +30,7 @@ from simpler_setup.torch_interop import make_tensor_arg
 ALLREDUCE_COUNT = 256
 ALLREDUCE_DTYPE_NBYTES = 4  # float32
 ALLREDUCE_MAX_RANKS = 16
+SDMA_WORKSPACE_SIZE = 16 * 1024  # 16 KiB for SDMA control structures (async modes)
 
 # Other collectives: 64 floats per rank, float32
 COUNT_PER_RANK = 64
@@ -70,7 +71,9 @@ def _allreduce_scratch_params(mode: str, nranks: int) -> tuple[int, int, int]:
         chunk_elems = ALLREDUCE_COUNT // nranks
         float_elems = (nranks + 2) * chunk_elems
         scratch_nbytes = (
-            float_elems * ALLREDUCE_DTYPE_NBYTES + (2 * (nranks - 1) + 1) * ALLREDUCE_MAX_RANKS * ALLREDUCE_DTYPE_NBYTES
+            float_elems * ALLREDUCE_DTYPE_NBYTES
+            + (2 * (nranks - 1) + 1) * ALLREDUCE_MAX_RANKS * ALLREDUCE_DTYPE_NBYTES
+            + SDMA_WORKSPACE_SIZE  # extra tail for SDMA control structures
         )
     else:
         raise ValueError(f"Unsupported allreduce mode: {mode!r}")
