@@ -47,7 +47,7 @@ skipped with a warning if the graph contains a cycle):
 ``reduced`` and ``omitted`` print the redundant edges to stdout. Text output
 emits only the selected edge set. HTML output keeps every edge in the Graphviz
 layout and colors the unselected edges like the page background, preserving the
-full-graph layout while making the selected edge set visible.
+full-graph layout while drawing the selected edge set above unselected edges.
 
 HTML output requires Graphviz installed (``brew install graphviz`` /
 ``apt install graphviz``). Text output does not.
@@ -58,6 +58,7 @@ import json
 import shutil
 import subprocess
 import sys
+import xml.etree.ElementTree as ET
 from collections import deque
 from pathlib import Path
 
@@ -814,7 +815,8 @@ def emit_dot(
     lines = [
         "digraph deps {",
         f"  rankdir={direction};",
-        "  concentrate=true;",
+        # Per-edge visibility requires each logical edge to retain its complete spline.
+        "  concentrate=false;",
         '  node [fontname="Helvetica", fontsize=10];',
         '  edge [color="#888"];',
     ]
@@ -831,7 +833,7 @@ def emit_dot(
         return (" [" + ", ".join(edge_attrs) + "]") if edge_attrs else ""
 
     def hidden_edge_attrs():
-        return ['color="#eef2f7"', 'fontcolor="#eef2f7"']
+        return ['class="hidden-edge"', 'color="#eef2f7"', 'fontcolor="#eef2f7"']
 
     for pred, succ in edges:
         hidden = (pred, succ) in hidden_edges
@@ -1087,6 +1089,66 @@ _HTML_TEMPLATE = """<!DOCTYPE html>
 """
 
 
+def _layer_svg_edges(svg_text):
+    try:
+        root = ET.fromstring(svg_text)
+    except ET.ParseError:
+        return svg_text
+
+    def local_name(element):
+        return element.tag.rsplit("}", 1)[-1]
+
+    def classes(element):
+        return set(element.get("class", "").split())
+
+    graph = next(
+        (element for element in root.iter() if local_name(element) == "g" and "graph" in classes(element)),
+        None,
+    )
+    if graph is None:
+        return svg_text
+
+    edge_groups = []
+    non_edge_children = []
+    has_hidden_edges = False
+    for child in graph:
+        child_classes = classes(child)
+        if local_name(child) == "g" and "edge" in child_classes:
+            hidden = "hidden-edge" in child_classes
+            edge_groups.append((child, hidden))
+            has_hidden_edges |= hidden
+        else:
+            non_edge_children.append(child)
+    if not has_hidden_edges:
+        return svg_text
+
+    graph[:] = non_edge_children
+
+    namespace = root.tag[1:].partition("}")[0] if root.tag.startswith("{") else ""
+    group_tag = f"{{{namespace}}}g" if namespace else "g"
+    hidden_layer = ET.Element(group_tag, {"class": "edge-layer hidden-edge-layer"})
+    visible_layer = ET.Element(group_tag, {"class": "edge-layer visible-edge-layer"})
+
+    for edge, hidden in edge_groups:
+        layer = hidden_layer if hidden else visible_layer
+        layer.append(edge)
+
+    insert_at = next(
+        (
+            index
+            for index, child in enumerate(non_edge_children)
+            if local_name(child) == "g" and "node" in classes(child)
+        ),
+        len(non_edge_children),
+    )
+    graph.insert(insert_at, hidden_layer)
+    graph.insert(insert_at + 1, visible_layer)
+
+    if namespace:
+        ET.register_namespace("", namespace)
+    return ET.tostring(root, encoding="unicode")
+
+
 def emit_html(
     edges,
     nodes,
@@ -1120,6 +1182,7 @@ def emit_html(
     svg_text = svg_bytes.decode("utf-8", errors="replace")
     if "<svg" in svg_text:
         svg_text = svg_text[svg_text.index("<svg") :]
+    svg_text = _layer_svg_edges(svg_text)
     return _HTML_TEMPLATE.format(
         n_nodes=len(nodes),
         n_edges=visible_edge_count,
@@ -1192,7 +1255,7 @@ Examples:
             "minimal edge set; omitted selects only the redundant edges reduced would drop (the complement of "
             "reduced). reduced/omitted print the redundant edges to stdout, are structural (pred,succ) level, "
             "apply to both text and html, and are skipped with a warning on a cyclic graph. In html, all edges "
-            "still participate in layout; unselected edges are colored as background."
+            "still participate in layout; unselected edges are colored as background and drawn below selected edges."
         ),
     )
     p.add_argument(
