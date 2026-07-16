@@ -21,19 +21,25 @@
  * The double-barrier scheme ensures (a) prior writes are globally visible,
  * (b) all snapshots complete, before any push reads the exchange buffers.
  *
- * **Async allgather (forward) phase**: steps ⌊P/2⌋+1..P−1 use TPUT_ASYNC
- * instead of synchronous TPUT<AtomicNone>.  Both CW and CCW pushes are
- * issued to the SDMA engine back-to-back per round, then drained with a
- * single WaitAll().  Reduce-scatter steps (1..⌊P/2⌋) still use synchronous
- * TPUT<AtomicAdd> because TPUT_ASYNC does not support atomic operations.
+ * **Forward (allgather) phase**:
+ *   - CPUSIM (`__CPU_SIM`): TPUT_ASYNC for both CW+CCW AtomicNone pushes,
+ *     drained with WaitAll().  Exercises the async completion API; on sim
+ *     TPUT_ASYNC is a synchronous copy (handle=0).
+ *   - NPU: keep synchronous TPUT<AtomicNone>.  Pulling SDMA async helpers /
+ *     BuildAsyncSession into the AIV .o currently produces unresolved .text
+ *     relocations that simpler's AICore loader rejects (issue #900).  Real
+ *     NPU TPUT_ASYNC needs host SdmaWorkspaceManager + loader support.
+ *
+ * Reduce-scatter steps still use synchronous TPUT<AtomicAdd> on all
+ * platforms (TPUT_ASYNC does not support atomic operations).
  *
  * Scratch layout (per rank, in HCCL window):
  *   [0 .. P*chunk_elems)                   P working chunks
  *   [P*chunk .. (P+1)*chunk)               exchange_right snapshot buffer
  *   [(P+1)*chunk .. (P+2)*chunk)          exchange_left  snapshot buffer
  *   tail                   (2*(P-1)+1) * kMaxSupportedRanks int32 signals
- *   tail + ...                             kSdmaWorkspaceSize bytes for SDMA
- *                                          control structures
+ *   tail + ...                             reserved SDMA workspace bytes
+ *                                          (sim / future NPU async path)
  *
  * Divisibility: requires ALLREDUCE_COUNT % nranks == 0.
  */
@@ -41,12 +47,12 @@
 #include <pto/pto-inst.hpp>
 #include "pto/comm/comm_types.hpp"
 #include "pto/comm/pto_comm_inst.hpp"
-#include "pto/comm/async_common/async_types.hpp"
-#ifndef __CPU_SIM
-#include "pto/comm/async_common/async_event_impl.hpp"
-#endif
 #include "platform_comm/comm_context.h"
 #include "tensor.h"
+
+#if defined(__CPU_SIM) || defined(__COSTMODEL)
+#include "pto/comm/async_common/async_types.hpp"
+#endif
 
 #ifndef __gm__
 #define __gm__
@@ -59,7 +65,9 @@
 static constexpr size_t ALLREDUCE_COUNT = 256;
 static constexpr int kMaxSupportedRanks = 16;
 static constexpr size_t kSdmaWorkspaceSize = 16 * 1024;
+#if defined(__CPU_SIM) || defined(__COSTMODEL)
 static constexpr int kMaxAsyncEvents = 8;
+#endif
 
 template <typename T>
 AICORE inline __gm__ T *CommRemotePtr(__gm__ CommContext *ctx, __gm__ T *localPtr, int pe) {
@@ -83,38 +91,20 @@ AICORE inline void RoundBarrier(__gm__ CommContext *ctx, __gm__ int32_t *signal_
     pipe_barrier(PIPE_ALL);
 }
 
-// ---------------------------------------------------------------------------
-// Async session wrapper (self-contained; inline for homogeneity with all
-// other AIV kernel files in this directory).
-// ---------------------------------------------------------------------------
-
+#if defined(__CPU_SIM) || defined(__COSTMODEL)
+// Sim-only async session wrapper.  Intentionally not compiled for NPU AIV
+// payloads — SDMA async helpers currently trip AICore loader issue #900.
 struct AivAsyncSession {
     pto::comm::AsyncSession session{};
     pto::comm::AsyncEvent events[kMaxAsyncEvents];
     int numPending = 0;
 
-#if defined(__CPU_SIM) || defined(__COSTMODEL)
     AICORE bool Init(__gm__ uint8_t *workspace, const pto::comm::sdma::SdmaBaseConfig & = {}) {
         (void)workspace;
         session = {};
         numPending = 0;
         return true;
     }
-#else
-    template <int kRows = 1, int kCols = 256>
-    AICORE bool Init(
-        __gm__ uint8_t *workspace,
-        const pto::comm::sdma::SdmaBaseConfig &baseConfig = {pto::comm::sdma::kDefaultSdmaBlockBytes, 0, 1}
-    ) {
-        using ScratchTile = pto::Tile<pto::TileType::Vec, uint8_t, kRows, kCols, pto::BLayout::RowMajor, -1, -1>;
-        ScratchTile scratchTile(kRows, kCols);
-        TASSIGN(scratchTile, static_cast<uint8_t>(0));
-        bool ok = pto::comm::BuildAsyncSession(scratchTile, workspace, session, 0, baseConfig);
-        if (!ok) return false;
-        numPending = 0;
-        return true;
-    }
-#endif
 
     AICORE void Reset() { numPending = 0; }
 
@@ -131,10 +121,7 @@ struct AivAsyncSession {
         return true;
     }
 };
-
-// ---------------------------------------------------------------------------
-// Kernel entry point
-// ---------------------------------------------------------------------------
+#endif
 
 extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ int64_t *args) {
     __gm__ Tensor *input_tensor = reinterpret_cast<__gm__ Tensor *>(args[0]);
@@ -165,19 +152,19 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
     __gm__ float *exchange_left = exchange_right + static_cast<size_t>(chunk_elems);
     __gm__ int32_t *signal_base = reinterpret_cast<__gm__ int32_t *>(exchange_left + static_cast<size_t>(chunk_elems));
 
-    // SDMA workspace: carved from the end of the scratch buffer, after the
-    // signal rows.  On CPUSIM, TPUT_ASYNC always completes immediately
-    // (handle=0), so the workspace content is irrelevant.
+#if defined(__CPU_SIM) || defined(__COSTMODEL)
+    // Reserved SDMA workspace tail (content unused on sim — TPUT_ASYNC is sync).
     __gm__ uint8_t *workspace = reinterpret_cast<__gm__ uint8_t *>(
         signal_base + (static_cast<size_t>(2 * (nranks - 1) + 1) * kMaxSupportedRanks)
     );
-
-    // Build the async session (one per kernel invocation).
     AivAsyncSession asyncS;
     if (!asyncS.Init(workspace)) {
         pipe_barrier(PIPE_ALL);
         return;
     }
+#else
+    (void)kSdmaWorkspaceSize;
+#endif
 
     ShapeDyn chunkShape(1, 1, 1, 1, chunk_elems);
     StrideDyn chunkStride(chunk_elems, chunk_elems, chunk_elems, chunk_elems, 1);
@@ -211,12 +198,7 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
     // Phase 2: IBing interleaved RS+AG — P−1 rounds.
     //
     // Steps 1..⌊P/2⌋:     reduce  — AtomicAdd pushes from exchange buffers.
-    // Steps ⌊P/2⌋+1..P−1: forward — TPUT_ASYNC AtomicNone pushes.
-    //
-    // Double-barrier + exchange-buffer snapshot scheme replicates MPI
-    // ISend/IRecv semantics (plan 44).  Forward steps issue both CW and CCW
-    // pushes to the SDMA engine via TPUT_ASYNC and drain with a single
-    // WaitAll() instead of pipe_barrier(PIPE_ALL).
+    // Steps ⌊P/2⌋+1..P−1: forward — AtomicNone (async on sim, sync on NPU).
     // ------------------------------------------------------------------
     const int left = (my_rank - 1 + nranks) % nranks;
     const int right = (my_rank + 1) % nranks;
@@ -268,10 +250,10 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
         RoundBarrier(commCtx, signal_base + (2 * (step - 1) + 1) * kMaxSupportedRanks, my_rank, nranks);
 
         if (fwd) {
-            // Forward step (allgather): TPUT_ASYNC for both CW and CCW pushes.
+#if defined(__CPU_SIM) || defined(__COSTMODEL)
+            // Forward step: TPUT_ASYNC for both CW and CCW pushes (sim API path).
             asyncS.Reset();
 
-            // Right-bound async push.
             {
                 __gm__ float *src = exchange_right;
                 __gm__ float *dst = CommRemotePtr(commCtx, chunks + static_cast<size_t>(idx_r * chunk_elems), right);
@@ -281,7 +263,6 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
                 asyncS.Issue(ev);
             }
 
-            // Left-bound async push.
             {
                 __gm__ float *src = exchange_left;
                 __gm__ float *dst = CommRemotePtr(commCtx, chunks + static_cast<size_t>(idx_l * chunk_elems), left);
@@ -291,12 +272,27 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
                 asyncS.Issue(ev);
             }
 
-            // Wait for both SDMA transfers to complete.
             asyncS.WaitAll();
+#else
+            // NPU: synchronous AtomicNone (SDMA async not yet loader-safe).
+            {
+                __gm__ float *src = exchange_right;
+                __gm__ float *dst = CommRemotePtr(commCtx, chunks + static_cast<size_t>(idx_r * chunk_elems), right);
+                GT srcG(src, chunkShape, chunkStride);
+                GT dstG(dst, chunkShape, chunkStride);
+                pto::comm::TPUT<pto::AtomicType::AtomicNone>(dstG, srcG, pushTile);
+            }
+            {
+                __gm__ float *src = exchange_left;
+                __gm__ float *dst = CommRemotePtr(commCtx, chunks + static_cast<size_t>(idx_l * chunk_elems), left);
+                GT srcG(src, chunkShape, chunkStride);
+                GT dstG(dst, chunkShape, chunkStride);
+                pto::comm::TPUT<pto::AtomicType::AtomicNone>(dstG, srcG, pushTile);
+            }
+            pipe_barrier(PIPE_ALL);
+#endif
         } else {
-            // Reduce step: synchronous TPUT<AtomicAdd> (async does not
-            // support atomic operations).
-            // Right-bound reduce push.
+            // Reduce step: synchronous TPUT<AtomicAdd>.
             {
                 __gm__ float *src = exchange_right;
                 __gm__ float *dst = CommRemotePtr(commCtx, chunks + static_cast<size_t>(idx_r * chunk_elems), right);
@@ -304,8 +300,6 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
                 GT dstG(dst, chunkShape, chunkStride);
                 pto::comm::TPUT<pto::AtomicType::AtomicAdd>(dstG, srcG, pushTile);
             }
-
-            // Left-bound reduce push.
             {
                 __gm__ float *src = exchange_left;
                 __gm__ float *dst = CommRemotePtr(commCtx, chunks + static_cast<size_t>(idx_l * chunk_elems), left);
@@ -313,7 +307,6 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
                 GT dstG(dst, chunkShape, chunkStride);
                 pto::comm::TPUT<pto::AtomicType::AtomicAdd>(dstG, srcG, pushTile);
             }
-
             pipe_barrier(PIPE_ALL);
         }
     }
