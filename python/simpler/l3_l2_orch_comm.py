@@ -178,6 +178,17 @@ def decode_region_create_reply(buf: memoryview) -> L3L2RegionCreateReply:
     )
 
 
+def peek_region_create_reply_region_id(buf: memoryview) -> int:
+    """Raw-unpack just the region_id for the create rollback path.
+
+    Must tolerate malformed replies: decode_region_create_reply raises on
+    unknown access_profile / non-UTF-8 backing_shm, but the L2 child has
+    already created the region by then, so the rollback release still needs
+    the id. Call this BEFORE decode_region_create_reply.
+    """
+    return int(_REGION_CREATE_REPLY.unpack_from(buf, 0)[1])
+
+
 def validate_region_create_reply(
     reply: L3L2RegionCreateReply, expected_access_profile: L3L2RegionAccessProfile
 ) -> tuple[int, int]:

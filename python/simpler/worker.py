@@ -117,6 +117,7 @@ from .l3_l2_orch_comm import (
     _align_up,
     _checked_add_u64,
     decode_region_create_reply,
+    peek_region_create_reply_region_id,
     validate_region_create_reply,
 )
 from .orchestrator import Orchestrator
@@ -3699,8 +3700,11 @@ class Worker:
             worker = self._worker
             assert worker is not None
             worker.control_l3_l2_region_create(int(worker_id), req_shm.name, reply_shm.name)
+            # Peek before decode: decode rejects malformed replies, but the
+            # child has already created the region and the rollback below
+            # still needs the id.
+            region_id = peek_region_create_reply_region_id(reply_buf)
             reply = decode_region_create_reply(reply_buf)
-            region_id = int(reply.desc.region_id)
             platform = str(self._config.get("platform", ""))
             expected_access_profile = (
                 L3L2RegionAccessProfile.SIM_POSIX_SHM
