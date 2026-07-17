@@ -18,6 +18,7 @@
 #include "device_runner.h"
 
 #include "acl/acl.h"
+#include "host/acl_error_log.h"
 #include "host_log.h"
 
 #include <dlfcn.h>
@@ -95,6 +96,7 @@ int DeviceRunner::ensure_acl_ready(int device_id) {
     aclError aRet = aclInit(nullptr);
     if (aRet != ACL_SUCCESS && static_cast<int>(aRet) != kAclRepeatInit) {
         LOG_ERROR("aclInit failed: %d", static_cast<int>(aRet));
+        ACL_LOG_ERROR_DETAIL(aRet);
         return static_cast<int>(aRet);
     }
 
@@ -102,6 +104,7 @@ int DeviceRunner::ensure_acl_ready(int device_id) {
     aRet = aclrtSetDevice(device_id);
     if (aRet != ACL_SUCCESS) {
         LOG_ERROR("aclrtSetDevice(%d) failed: %d", device_id, static_cast<int>(aRet));
+        ACL_LOG_ERROR_DETAIL(aRet);
         return static_cast<int>(aRet);
     }
 
@@ -116,6 +119,7 @@ void *DeviceRunner::create_comm_stream() {
     aclError aRet = aclrtCreateStream(&stream);
     if (aRet != ACL_SUCCESS) {
         LOG_ERROR("aclrtCreateStream failed: %d", static_cast<int>(aRet));
+        ACL_LOG_ERROR_DETAIL(aRet);
         return nullptr;
     }
     return stream;

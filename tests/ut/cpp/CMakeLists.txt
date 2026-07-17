@@ -472,6 +472,13 @@ target_include_directories(test_runtime_timeout_config_a5 PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/../../../src/a5/platform/include
 )
 
+# The PTO2_ERROR_* codes the name table switches on live in the runtime's status header;
+# a2a3's and a5's copies are identical, so compiling against one covers both.
+add_common_utils_test(test_error_code_names common/test_error_code_names.cpp)
+target_include_directories(test_error_code_names PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../../src/a2a3/runtime/tensormap_and_ringbuffer/common
+)
+
 add_executable(test_scope_stats_collector
     common/test_scope_stats_collector.cpp
     ${CMAKE_SOURCE_DIR}/../../../src/common/platform/shared/host/scope_stats_collector.cpp

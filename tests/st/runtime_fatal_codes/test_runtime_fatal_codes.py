@@ -44,13 +44,17 @@ RUNTIME = "tensormap_and_ringbuffer"
 KERNELS = os.path.join(HERE, "kernels")
 ORCH_DIR = os.path.join(KERNELS, "orchestration")
 
-# case -> dict(orch, code, runtime_env, kernel, marker)
+# case -> dict(orch, code, runtime_env, kernel, marker, explain)
 #   code       : runtime status the host reports in sim (orch_error_code or sched_error_code)
 #   runtime_env: CallConfig.runtime_env overrides that pin the offending resource small
 #   kernel     : AIV kernel (rel to kernels/) for the async cases, else None
 #   marker     : substring of the validate_runtime_impl host-log line proving the
 #                device error class reached the host (the assertion that holds on
 #                both sim and onboard, even when onboard masks the code as 507xxx)
+#   explain    : PTO2_ERROR_* name the "error detail:" annotation line must carry, so
+#                the log says what the code *means* and not just what it is. Every reachable
+#                code is checked here; the unreachable ones (10/11/103) are covered by the
+#                cpput over the name table itself.
 CASES = {
     "scope_deadlock": dict(
         orch="scope_deadlock_orch.cpp",
@@ -58,6 +62,7 @@ CASES = {
         runtime_env={"ring_task_window": 4},
         kernel=None,
         marker="orch_error_code=1",
+        explain="SCOPE_DEADLOCK",
     ),
     "heap_ring_deadlock": dict(
         orch="heap_ring_deadlock_orch.cpp",
@@ -65,6 +70,7 @@ CASES = {
         runtime_env={"ring_heap": 1024},
         kernel=None,
         marker="orch_error_code=2",
+        explain="HEAP_RING_DEADLOCK",
     ),
     "flow_control_deadlock": dict(
         orch="flow_control_deadlock_orch.cpp",
@@ -72,6 +78,7 @@ CASES = {
         runtime_env={"ring_task_window": 4},
         kernel=None,
         marker="orch_error_code=3",
+        explain="FLOW_CONTROL_DEADLOCK",
     ),
     "dep_pool_overflow": dict(
         orch="dep_pool_overflow_orch.cpp",
@@ -79,6 +86,7 @@ CASES = {
         runtime_env={"ring_dep_pool": 4},
         kernel=None,
         marker="orch_error_code=4",
+        explain="DEP_POOL_OVERFLOW",
     ),
     "invalid_args": dict(
         orch="invalid_args_orch.cpp",
@@ -86,6 +94,7 @@ CASES = {
         runtime_env={},
         kernel=None,
         marker="orch_error_code=5",
+        explain="INVALID_ARGS",
     ),
     "require_sync_start_invalid": dict(
         orch="require_sync_start_orch.cpp",
@@ -93,6 +102,7 @@ CASES = {
         runtime_env={},
         kernel="aiv/kernel_noop.cpp",
         marker="orch_error_code=7",
+        explain="REQUIRE_SYNC_START_INVALID",
     ),
     "aicore_hang": dict(
         orch="aicore_hang_orch.cpp",
@@ -109,6 +119,7 @@ CASES = {
             "SIMPLER_STREAM_SYNC_TIMEOUT_MS": 4000,
         },
         marker="sub_class=S1",
+        explain="SCHEDULER_TIMEOUT",
     ),
     "tensor_wait_timeout": dict(
         orch="tensor_wait_timeout_orch.cpp",
@@ -128,6 +139,7 @@ CASES = {
             "SIMPLER_STREAM_SYNC_TIMEOUT_MS": 40000,
         },
         marker="orch_error_code=8",
+        explain="TENSOR_WAIT_TIMEOUT",
     ),
     "async_completion_invalid": dict(
         orch="async_error_orch.cpp",
@@ -135,6 +147,7 @@ CASES = {
         runtime_env={},
         kernel="aiv/kernel_async_completion_invalid.cpp",
         marker="sched_error_code=101",
+        explain="ASYNC_COMPLETION_INVALID",
     ),
     "async_wait_overflow": dict(
         orch="async_error_orch.cpp",
@@ -142,6 +155,7 @@ CASES = {
         runtime_env={},
         kernel="aiv/kernel_async_wait_overflow.cpp",
         marker="sched_error_code=102",
+        explain="ASYNC_WAIT_OVERFLOW",
     ),
     "explicit_fatal": dict(
         orch="explicit_fatal_orch.cpp",
@@ -149,6 +163,7 @@ CASES = {
         runtime_env={},
         kernel=None,
         marker="orch_error_code=9",
+        explain="EXPLICIT_ORCH_FATAL",
     ),
     # Error codes still without an e2e case, and why. Device-side cpput keeps the
     # structural ones covered; the sub-classes have unit coverage of the classifier.
@@ -202,6 +217,19 @@ CASES = {
     # TENSOR_WAIT_TIMEOUT (8) IS covered (onboard, both arches) — see the
     # tensor_wait_timeout case.
 }
+
+
+def _assert_annotated(log: str, case: dict) -> None:
+    """The failure line must be followed by what the code *means*, not just the number.
+
+    The machine-readable "PTO2 runtime failed: ..." line is deliberately left alone -- it is
+    what ``marker`` matches and what conftest's device-poison regex reads -- so the meaning is
+    carried on its own "error detail:" line, emitted by the LOG_RUNTIME_FAILURE macro
+    (src/common/runtime_status/error_log.h).
+    """
+    assert "error detail:" in log, "host log carries the raw code but no explanation of it"
+    assert case["explain"] in log, f"annotation does not name the code as '{case['explain']}'"
+    assert "error hint:" in log, "annotation names the code but says nothing about what to do"
 
 
 def _build_chip_callable(platform: str, case: dict) -> ChipCallable:
@@ -273,7 +301,9 @@ def test_fatal_code_surfaces_on_sim(st_platform, st_device_ids, case_name, monke
         with pytest.raises(RuntimeError, match=rf"(run_runtime|run) failed with code -{case['code']}\b"):
             worker.run(handle, ChipStorageTaskArgs(), config)
         captured = capfd.readouterr()
-        assert case["marker"] in captured.err + captured.out, f"missing '{case['marker']}' in host log"
+        log = captured.err + captured.out
+        assert case["marker"] in log, f"missing '{case['marker']}' in host log"
+        _assert_annotated(log, case)
     finally:
         worker.close()
 
@@ -295,6 +325,8 @@ def test_device_error_class_reaches_host_log(st_platform, st_device_ids, case_na
         with pytest.raises(RuntimeError):
             worker.run(handle, ChipStorageTaskArgs(), config)
         captured = capfd.readouterr()
-        assert case["marker"] in captured.err + captured.out, f"device error class '{case['marker']}' not in host log"
+        log = captured.err + captured.out
+        assert case["marker"] in log, f"device error class '{case['marker']}' not in host log"
+        _assert_annotated(log, case)
     finally:
         worker.close()

@@ -164,6 +164,12 @@ Then read it directly (`$LOGDIR/device-*/device-*.log`) — no more `grep`-ing
 "deadlock" or "OOM" from the host error alone — **read the device log and grep
 for the signature that actually fired:**
 
+> The host log now names the code and the device-side error class it masks — grep
+> for `error detail:` / `orch_error_code=` / `sched_error_code=` / `sub_class=`
+> before opening the device log at all. The full code reference and the per-code
+> debugging notes are in
+> [docs/troubleshooting/device-error-codes.md](../../docs/troubleshooting/device-error-codes.md).
+
 | device-log signature | mechanism | note |
 | -------------------- | --------- | ---- |
 | `FATAL: Task Allocator Deadlock` / `Provable head-of-line` | ring/heap or dep-pool **deadlock** (alloc can't reclaim) | AICPU detector: 500ms backstop (`PTO2_ALLOC_DEADLOCK_TIMEOUT_CYCLES`) or immediate structural `head_blocked_on_scope_end`. Real capacity/scope deadlock. |
