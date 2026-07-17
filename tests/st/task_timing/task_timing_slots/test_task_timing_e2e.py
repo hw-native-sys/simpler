@@ -214,6 +214,48 @@ def test_duplicate_slot_merges_window(st_platform, st_device_ids, capfd):
     assert slot0[0][1] > 0, f"merged task_slot_0 must be a complete window (dispatch < finish), got {slot0}"
 
 
+# a2a3 host_build_graph exercises a distinct fold path from tensormap_and_ringbuffer:
+# the RT2 orch is identical, but hbg builds the graph on the host and its Scheduler
+# folds dispatch via the PublishHandle (scheduler_context.h) rather than the inline
+# tensormap dispatch. These two cases give that path direct e2e coverage. (a5
+# host_build_graph uses the legacy add_task orch — covered by task_timing_a5hbg.)
+@pytest.mark.platforms(["a2a3sim", "a2a3"])
+@pytest.mark.runtime("host_build_graph")
+@pytest.mark.device_count(1)
+def test_hbg_distinct_slots_emit_markers(st_platform, st_device_ids, capfd):
+    # Same two-task chain as test_distinct_slots_emit_markers, on the hbg path.
+    _drive(st_platform, int(st_device_ids[0]), "task_timing_orchestration", 2, runtime="host_build_graph")
+    err = capfd.readouterr().err
+
+    slot0 = _slot_spans(err, 0)
+    slot1 = _slot_spans(err, 1)
+    assert slot0, "no task_slot_0 marker; hbg dispatch/finish fold or host readback/emit regressed (swimlane OFF)."
+    assert slot1, "no task_slot_1 marker; the second tagged task's slot was not emitted."
+    assert slot0[0][1] > 0 and slot1[0][1] > 0, f"slot durations must be > 0: slot0={slot0}, slot1={slot1}"
+
+    # t1 consumes t0's output, so t1's dispatch follows t0's finish.
+    fin0 = slot0[0][0] + slot0[0][1]
+    disp1 = slot1[0][0]
+    assert disp1 >= fin0, f"expected dispatch(slot1)={disp1} >= finish(slot0)={fin0} (dependency ordering)"
+
+
+@pytest.mark.platforms(["a2a3sim", "a2a3"])
+@pytest.mark.runtime("host_build_graph")
+@pytest.mark.device_count(1)
+def test_hbg_duplicate_slot_merges_window(st_platform, st_device_ids, capfd):
+    # Same 3-task same-slot merge as test_duplicate_slot_merges_window, on the hbg
+    # path: min(dispatch)/max(finish) must fold into a single slot-0 window.
+    _drive(st_platform, int(st_device_ids[0]), "task_timing_dup_orchestration", 3, runtime="host_build_graph")
+    err = capfd.readouterr().err
+
+    slot0 = _slot_spans(err, 0)
+    assert len(slot0) == 1, f"expected exactly ONE merged task_slot_0 marker, got {len(slot0)}: {slot0}"
+    assert not _slot_spans(err, 1) and not _slot_spans(err, 2), (
+        "no other slot should be emitted (all tasks used slot 0)"
+    )
+    assert slot0[0][1] > 0, f"merged task_slot_0 must be a complete window (dispatch < finish), got {slot0}"
+
+
 _MIXED_KERNELS = os.path.join(
     _HERE, "..", "..", "..", "..", "tests", "st", "a2a3", "tensormap_and_ringbuffer", "mixed_example", "kernels"
 )
