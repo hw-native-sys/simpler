@@ -19,6 +19,7 @@
 
 #include <runtime/rt.h>
 
+#include "host/acl_error_log.h"
 #include "common/unified_log.h"
 
 MemoryAllocator::~MemoryAllocator() { finalize(); }
@@ -28,6 +29,7 @@ void *MemoryAllocator::alloc(size_t size) {
     int rc = rtMalloc(&ptr, size, RT_MEMORY_HBM, 0);
     if (rc != 0) {
         LOG_ERROR("rtMalloc failed: %d (size=%zu)", rc, size);
+        ACL_LOG_ERROR_DETAIL(rc);
         return nullptr;
     }
 
@@ -50,6 +52,7 @@ int MemoryAllocator::free(void *ptr) {
     int rc = rtFree(ptr);
     if (rc != 0) {
         LOG_ERROR("rtFree failed: %d", rc);
+        ACL_LOG_ERROR_DETAIL(rc);
         return rc;
     }
 

@@ -1069,12 +1069,15 @@ def pytest_runtest_makereport(item, call):
 # (every non-zero rc is wrapped that way), turning a normal failing test into a
 # spurious worker rebuild and, downstream, a misleading runtime-wide skip. So
 # we extract the trailing <N> and match only the known poison codes:
-#   207001 AICore launch failure (the CI cascade trigger)
+#   207001 ACL_ERROR_RT_MEMORY_ALLOCATION  (the CI cascade trigger)
 #   507000 ACL_ERROR_RT_INTERNAL_ERROR  (a5 op-timeout at AICPU stream sync)
 #   507018 ACL_ERROR_RT_AICPU_EXCEPTION
 #   507046 ACL_ERROR_RT_STREAM_SYNC_TIMEOUT
 #   507899 sticky-error rtMalloc / rtStreamCreate on the poisoned context
 #       -1 a5 DeviceRunner fail-fast sentinel ("marked unusable; refusing to run")
+# The names above are CANN's own (acl/error_codes/rt_error_codes.h); what each one
+# means and how to chase it is in docs/troubleshooting/device-error-codes.md, and the
+# host log now prints that meaning next to the code.
 # Worker surfaces these as "run_prepared/prepare_callable/simpler_init failed
 # with code <N>" — never as an AssertionError, so golden mismatches are already
 # excluded.

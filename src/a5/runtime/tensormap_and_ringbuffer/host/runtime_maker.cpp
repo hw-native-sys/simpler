@@ -45,6 +45,7 @@
 #include "../runtime/pto_runtime2.h"
 #include "../runtime/pto_shared_memory.h"
 #include "../runtime/runtime.h"
+#include "../../../../common/runtime_status/error_log.h"
 #include "../../../../common/task_interface/call_config.h"
 #include "callable.h"
 #include "common/platform_config.h"
@@ -930,10 +931,7 @@ extern "C" int validate_runtime_impl(Runtime *runtime, const HostApi *api) {
     if (runtime_status != 0) {
         int32_t orch_error_code = host_header.orch_error_code.load(std::memory_order_relaxed);
         int32_t sched_error_code = host_header.sched_error_code.load(std::memory_order_relaxed);
-        LOG_ERROR(
-            "PTO2 runtime failed: orch_error_code=%d sched_error_code=%d runtime_status=%d", orch_error_code,
-            sched_error_code, runtime_status
-        );
+        LOG_RUNTIME_FAILURE(orch_error_code, sched_error_code, runtime_status);
         // A scheduler no-progress timeout (code 100) carries a device-classified
         // sub-reason + locators so the failure line is self-diagnosing without a
         // device-log dive. The full stall snapshot stays in the device log / plog.

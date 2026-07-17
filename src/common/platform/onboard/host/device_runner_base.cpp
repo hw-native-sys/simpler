@@ -43,6 +43,7 @@
 #include "common/host_api.h"
 #include "common/platform_config.h"
 #include "common/unified_log.h"
+#include "host/acl_error_log.h"
 #include "host/raii_scope_guard.h"
 #include "host_log.h"
 #include "pto_runtime_c_api.h"
@@ -321,6 +322,7 @@ int DeviceRunnerBase::attach_current_thread(int device_id) {
     int rc = rtSetDevice(device_id);
     if (rc != 0) {
         LOG_ERROR("rtSetDevice(%d) failed: %d", device_id, rc);
+        ACL_LOG_ERROR_DETAIL(rc);
         return rc;
     }
 
@@ -365,6 +367,7 @@ int DeviceRunnerBase::ensure_device_initialized() {
         rc = rtStreamCreate(&stream_aicpu_, 0);
         if (rc != 0) {
             LOG_ERROR("rtStreamCreate (AICPU) failed: %d", rc);
+            ACL_LOG_ERROR_DETAIL(rc);
             return rc;
         }
         aicpu_created_here = true;
@@ -373,6 +376,7 @@ int DeviceRunnerBase::ensure_device_initialized() {
         rc = rtStreamCreate(&stream_aicore_, 0);
         if (rc != 0) {
             LOG_ERROR("rtStreamCreate (AICore) failed: %d", rc);
+            ACL_LOG_ERROR_DETAIL(rc);
             // Roll back only the AICPU stream we just created, not a
             // pre-existing persistent one.
             if (aicpu_created_here) {
@@ -608,6 +612,7 @@ uint64_t DeviceRunnerBase::upload_chip_callable_buffer(const ChipCallable *calla
     int rc = rtMemcpy(gm_addr, layout.total_size, scratch.data(), layout.total_size, RT_MEMCPY_HOST_TO_DEVICE);
     if (rc != 0) {
         LOG_ERROR("rtMemcpy chip callable H2D failed: %d", rc);
+        ACL_LOG_ERROR_DETAIL(rc);
         mem_alloc_.free(gm_addr);
         return 0;
     }
@@ -733,6 +738,7 @@ int DeviceRunnerBase::launch_device_register(int32_t callable_id) {
     }
     if (rc != 0) {
         LOG_ERROR("launch_device_register: aclrtSynchronizeStreamWithTimeout failed: %d", rc);
+        ACL_LOG_ERROR_DETAIL(rc);
         return rc;
     }
 
@@ -1068,6 +1074,7 @@ int DeviceRunnerBase::launch_aicore_kernel(rtStream_t stream, KernelArgs *k_args
         int rc = rtRegisterAllKernel(&binary, &aicore_bin_handle_);
         if (rc != RT_ERROR_NONE) {
             LOG_ERROR("rtRegisterAllKernel failed: %d", rc);
+            ACL_LOG_ERROR_DETAIL(rc);
             aicore_bin_handle_ = nullptr;
             return rc;
         }
@@ -1088,6 +1095,7 @@ int DeviceRunnerBase::launch_aicore_kernel(rtStream_t stream, KernelArgs *k_args
     int rc = rtKernelLaunchWithHandleV2(aicore_bin_handle_, 0, block_dim_, &rt_args, nullptr, stream, &cfg);
     if (rc != RT_ERROR_NONE) {
         LOG_ERROR("rtKernelLaunchWithHandleV2 failed: %d", rc);
+        ACL_LOG_ERROR_DETAIL(rc);
         return rc;
     }
 
@@ -1210,10 +1218,12 @@ int DeviceRunnerBase::sync_run_streams() {
             "Stream sync timeout: stream=AICPU timeout_ms=%d device_id=%d block_dim=%d",
             timeout_config_.stream_sync_timeout_ms, device_id_, block_dim_
         );
+        ACL_LOG_ERROR_DETAIL(rc);
         return rc;
     }
     if (rc != 0) {
         LOG_ERROR("aclrtSynchronizeStreamWithTimeout (AICPU) failed: %d", rc);
+        ACL_LOG_ERROR_DETAIL(rc);
         return rc;
     }
 
@@ -1224,10 +1234,12 @@ int DeviceRunnerBase::sync_run_streams() {
             "Stream sync timeout: stream=AICore timeout_ms=%d device_id=%d block_dim=%d",
             timeout_config_.stream_sync_timeout_ms, device_id_, block_dim_
         );
+        ACL_LOG_ERROR_DETAIL(rc);
         return rc;
     }
     if (rc != 0) {
         LOG_ERROR("aclrtSynchronizeStreamWithTimeout (AICore) failed: %d", rc);
+        ACL_LOG_ERROR_DETAIL(rc);
         return rc;
     }
     return 0;
