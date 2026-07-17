@@ -37,6 +37,14 @@ T load_symbol(void *handle, const char *name) {
     return reinterpret_cast<T>(sym);
 }
 
+template <typename T>
+T load_optional_symbol(void *handle, const char *name) {
+    dlerror();
+    void *sym = dlsym(handle, name);
+    if (dlerror() != nullptr) return nullptr;
+    return reinterpret_cast<T>(sym);
+}
+
 std::vector<uint8_t> read_binary_file(const std::string &path) {
     std::ifstream f(path, std::ios::binary | std::ios::ate);
     if (!f) {
@@ -105,6 +113,8 @@ void ChipWorker::init(
         simpler_init_fn_ = load_symbol<SimplerInitFn>(handle, "simpler_init");
         register_callable_fn_ = load_symbol<SimplerRegisterCallableFn>(handle, "simpler_register_callable");
         run_fn_ = load_symbol<SimplerRunFn>(handle, "simpler_run");
+        prepare_request_fn_ = load_optional_symbol<SimplerPrepareRequestFn>(handle, "simpler_prepare_request");
+        execute_prepared_fn_ = load_optional_symbol<SimplerExecutePreparedFn>(handle, "simpler_execute_prepared");
         unregister_callable_fn_ = load_symbol<SimplerUnregisterCallableFn>(handle, "simpler_unregister_callable");
         get_aicpu_dlopen_count_fn_ = load_symbol<GetAicpuDlopenCountFn>(handle, "get_aicpu_dlopen_count");
         get_host_dlopen_count_fn_ = load_symbol<GetAicpuDlopenCountFn>(handle, "get_host_dlopen_count");
@@ -191,6 +201,8 @@ void ChipWorker::init(
         simpler_init_fn_ = nullptr;
         register_callable_fn_ = nullptr;
         run_fn_ = nullptr;
+        prepare_request_fn_ = nullptr;
+        execute_prepared_fn_ = nullptr;
         unregister_callable_fn_ = nullptr;
         get_aicpu_dlopen_count_fn_ = nullptr;
         get_host_dlopen_count_fn_ = nullptr;
@@ -230,6 +242,8 @@ void ChipWorker::init(
         simpler_init_fn_ = nullptr;
         register_callable_fn_ = nullptr;
         run_fn_ = nullptr;
+        prepare_request_fn_ = nullptr;
+        execute_prepared_fn_ = nullptr;
         unregister_callable_fn_ = nullptr;
         get_aicpu_dlopen_count_fn_ = nullptr;
         get_host_dlopen_count_fn_ = nullptr;
@@ -295,6 +309,8 @@ void ChipWorker::finalize() {
     get_runtime_size_fn_ = nullptr;
     register_callable_fn_ = nullptr;
     run_fn_ = nullptr;
+    prepare_request_fn_ = nullptr;
+    execute_prepared_fn_ = nullptr;
     unregister_callable_fn_ = nullptr;
     get_aicpu_dlopen_count_fn_ = nullptr;
     get_host_dlopen_count_fn_ = nullptr;
@@ -346,9 +362,101 @@ void ChipWorker::run(int32_t callable_id, const ChipStorageTaskArgs *args, const
     // Per-stage timing is emitted by the platform as `[STRACE]` log markers, not
     // returned (see chip_worker.h::run). CallConfig is threaded through to the C
     // ABI as a single pointer rather than unpacked into per-field args.
-    int rc = run_fn_(device_ctx_, rt, callable_id, args, &config);
+    acquire_arena_bank(0);
+    int rc;
+    try {
+        rc = run_fn_(device_ctx_, rt, callable_id, args, &config);
+    } catch (...) {
+        release_arena_bank(0);
+        throw;
+    }
+    release_arena_bank(0);
     if (rc != 0) {
         throw std::runtime_error("run failed with code " + std::to_string(rc));
+    }
+}
+
+void ChipWorker::acquire_arena_bank(unsigned arena_bank) {
+    std::unique_lock<std::mutex> lk(prepared_mu_);
+    prepared_cv_.wait(lk, [this, arena_bank]() {
+        return !prepared_bank_busy_[arena_bank];
+    });
+    prepared_bank_busy_[arena_bank] = true;
+}
+
+void ChipWorker::release_arena_bank(unsigned arena_bank) {
+    {
+        std::lock_guard<std::mutex> lk(prepared_mu_);
+        prepared_bank_busy_[arena_bank] = false;
+    }
+    prepared_cv_.notify_all();
+}
+
+void ChipWorker::prepare(
+    uint64_t request_id, int32_t callable_id, TaskArgsView args, const CallConfig &config, unsigned arena_bank
+) {
+    config.validate();
+    if (!initialized_) throw std::runtime_error("ChipWorker not initialized; call init() first");
+    if (prepare_request_fn_ == nullptr || execute_prepared_fn_ == nullptr) {
+        throw std::runtime_error("bound runtime does not support split request preparation");
+    }
+    if (arena_bank >= 2) throw std::runtime_error("prepared request arena bank must be 0 or 1");
+
+    auto prepared = std::make_unique<PreparedRequestContext>();
+    prepared->runtime_buf.resize(get_runtime_size_fn_());
+    prepared->config = config;
+    prepared->arena_bank = arena_bank;
+    ChipStorageTaskArgs chip_storage = view_to_chip_storage(args);
+
+    {
+        std::unique_lock<std::mutex> lk(prepared_mu_);
+        if (prepared_requests_.count(request_id) != 0) {
+            throw std::runtime_error("request_id already has prepared state");
+        }
+        prepared_cv_.wait(lk, [this, arena_bank]() {
+            return !prepared_bank_busy_[arena_bank];
+        });
+        prepared_bank_busy_[arena_bank] = true;
+    }
+
+    int rc;
+    try {
+        rc = prepare_request_fn_(
+            device_ctx_, prepared->runtime_buf.data(), callable_id, &chip_storage, &prepared->config, arena_bank
+        );
+    } catch (...) {
+        release_arena_bank(arena_bank);
+        throw;
+    }
+    if (rc != 0) {
+        release_arena_bank(arena_bank);
+        throw std::runtime_error("prepare request failed with code " + std::to_string(rc));
+    }
+
+    std::lock_guard<std::mutex> lk(prepared_mu_);
+    prepared_requests_.emplace(request_id, std::move(prepared));
+}
+
+void ChipWorker::execute_prepared(uint64_t request_id) {
+    std::unique_ptr<PreparedRequestContext> prepared;
+    {
+        std::lock_guard<std::mutex> lk(prepared_mu_);
+        auto it = prepared_requests_.find(request_id);
+        if (it == prepared_requests_.end()) throw std::runtime_error("request_id has no prepared state");
+        prepared = std::move(it->second);
+        prepared_requests_.erase(it);
+    }
+
+    int rc;
+    try {
+        rc = execute_prepared_fn_(device_ctx_, prepared->runtime_buf.data(), &prepared->config, prepared->arena_bank);
+    } catch (...) {
+        release_arena_bank(prepared->arena_bank);
+        throw;
+    }
+    release_arena_bank(prepared->arena_bank);
+    if (rc != 0) {
+        throw std::runtime_error("execute prepared request failed with code " + std::to_string(rc));
     }
 }
 

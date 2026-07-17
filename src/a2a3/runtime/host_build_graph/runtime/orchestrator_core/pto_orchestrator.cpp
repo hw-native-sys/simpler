@@ -405,6 +405,14 @@ static bool prepare_task(
     out->task = &orch->sm_header->ring.task_descriptors[out->alloc_result.slot];
     out->payload = &orch->sm_header->ring.task_payloads[out->alloc_result.slot];
 
+    // Streaming Host O advances last_task_alive at graph boundaries, so task IDs
+    // beyond the first physical window can reuse a slot. The original whole-graph
+    // HBG path initialized each slot only once and therefore never needed this
+    // reset on submit.
+    if (out->alloc_result.task_id >= allocator.window_size()) {
+        out->slot_state->reset_for_reuse();
+    }
+
     out->payload->prefetch(args.tensor_count(), args.scalar_count());
 
     // Re-bind payload/task pointers each submit. Value is per-slot constant
@@ -421,14 +429,12 @@ static bool prepare_task(
     // early-dispatch fields) is initialized in PTO2TaskPayload::init, the
     // single payload-init point, which runs before Orch-side wiring publish.
 
-    // Fields already zeroed by reset_for_reuse() at slot init:
+    // Fields already zeroed by reset_for_reuse() at slot init or physical reuse:
     //   fanout_lock=0, fanout_count=PTO2_FANOUT_SCOPE_BIT, fanout_head=nullptr,
     //   fanin_refcount=0, fanout_refcount=0, completed_subtasks=0, next_block_idx=0
     // Fields immutable after RingSchedState::init():
     //   ring_id
-    // task_state is set to PENDING here as the orchestrator populates the slot
-    // (host_build_graph does not recycle slots at runtime, so there is no
-    // post-CONSUMED reset path).
+    // task_state is set to PENDING here as the orchestrator populates the slot.
     out->slot_state->task_state.store(PTO2_TASK_PENDING, std::memory_order_relaxed);
     int16_t block_num = args.launch_spec.block_num();
     out->slot_state->total_required_subtasks =

@@ -15,10 +15,10 @@
  * Both the ChipWorker (consumer, resolves public symbols via dlsym) and the
  * platform implementations (producers, define all symbols) include this file.
  *
- * Public API — resolved by ChipWorker via dlsym (every host_runtime.so must
- * export ALL of these; runtimes without a real backend ship not-supported
- * stubs rather than omitting symbols, so ChipWorker can dlsym the full set
- * unconditionally without per-symbol probing):
+ * Public API — resolved by ChipWorker via dlsym. Core lifecycle, memory,
+ * registration, run, communication, and stream symbols are required from
+ * every host_runtime.so. Split HostGraph request preparation is an optional
+ * extension and is probed separately.
  *   - lifecycle:    create_device_context, destroy_device_context,
  *                   simpler_init, finalize_device
  *   - sizing:       get_runtime_size
@@ -29,6 +29,7 @@
  *                   simpler_provision_dma_workspace
  *   - ACL/stream:   ensure_acl_ready_ctx, create_comm_stream_ctx,
  *                   destroy_comm_stream_ctx
+ *   - optional:     simpler_prepare_request, simpler_execute_prepared
  *   - comm:         comm_init, comm_alloc_windows, comm_get_local_window_base,
  *                   comm_get_window_size, comm_barrier, comm_destroy
  *
@@ -204,6 +205,17 @@ int simpler_register_callable(DeviceContextHandle ctx, int32_t callable_id, cons
  */
 int simpler_run(
     DeviceContextHandle ctx, RuntimeHandle runtime, int32_t callable_id, const void *args, const CallConfig *config
+);
+
+/** Bind one request and start its Host work without launching Device S. */
+int simpler_prepare_request(
+    DeviceContextHandle ctx, RuntimeHandle runtime, int32_t callable_id, const void *args, const CallConfig *config,
+    unsigned arena_bank
+);
+
+/** Launch Device S for a Runtime previously prepared by simpler_prepare_request. */
+int simpler_execute_prepared(
+    DeviceContextHandle ctx, RuntimeHandle runtime, const CallConfig *config, unsigned arena_bank
 );
 
 /**

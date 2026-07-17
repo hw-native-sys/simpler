@@ -172,6 +172,7 @@ private:
     std::atomic<int32_t> active_tasks_{0};
     std::mutex drain_mu_;
     std::condition_variable drain_cv_;
+    std::mutex submit_mu_;
     // Scheduler's loop mutex (not owned). Held across reset_to_empty() in
     // drain() so the scheduler can't be mid-on_task_complete during teardown.
     std::mutex *sched_loop_mu_{nullptr};

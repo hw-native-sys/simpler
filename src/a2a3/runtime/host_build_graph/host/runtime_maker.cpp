@@ -35,15 +35,21 @@
 #include <unistd.h>
 
 #include <cerrno>
+#include <chrono>
 #include <cinttypes>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cctype>
+#include <condition_variable>
 #include <cstdlib>
 #include <cstring>
+#include <exception>
 #include <limits>
+#include <mutex>
+#include <new>
 #include <string>
+#include <thread>
 #include <type_traits>
 #include <vector>
 
@@ -58,7 +64,9 @@
 #include "../../../../common/task_interface/call_config.h"
 #include "callable.h"
 #include "common/platform_config.h"
+#include "common/strace.h"
 #include "common/unified_log.h"
+#include "host/raii_scope_guard.h"
 #include "utils/device_arena.h"
 #include "prepare_callable_common.h"
 
@@ -419,28 +427,313 @@ static bool relocate_host_orch_image(
     return ok;
 }
 
+struct HostGraphEpochCapture {
+    int32_t task_begin{0};
+    int64_t build_start_ns{0};
+    std::vector<PTO2HostGraphEpochRange> ranges;
+    bool (*boundary_handler)(PTO2Runtime *, PTO2HostGraphEpochRange *, size_t, void *){nullptr};
+    void *boundary_context{nullptr};
+};
+
+static bool capture_host_graph_epoch(PTO2Runtime *rt, bool final_epoch, void *opaque) {
+    auto *capture = static_cast<HostGraphEpochCapture *>(opaque);
+    if (capture == nullptr || rt == nullptr || rt->orchestrator.sm_header == nullptr) {
+        LOG_ERROR("host-orch: graph boundary has no active capture context");
+        return false;
+    }
+
+    int32_t task_end = rt->orchestrator.sm_header->ring.fc.current_task_index.load(std::memory_order_acquire);
+    if (task_end <= capture->task_begin) {
+        LOG_ERROR("host-orch: empty or reversed graph range [%d,%d)", capture->task_begin, task_end);
+        return false;
+    }
+
+    PTO2HostGraphEpochRange range;
+    range.task_begin = capture->task_begin;
+    range.task_end = task_end;
+    range.final_epoch = final_epoch ? 1 : 0;
+    size_t epoch_index = capture->ranges.size();
+    auto boundary_time = std::chrono::steady_clock::now();
+    int64_t boundary_ns =
+        std::chrono::duration_cast<std::chrono::nanoseconds>(boundary_time.time_since_epoch()).count();
+    if (capture->build_start_ns > 0 && boundary_ns >= capture->build_start_ns) {
+        char attrs[160];
+        std::snprintf(
+            attrs, sizeof(attrs), "layer=%zu tasks=%d task_begin=%d task_end=%d final=%d", epoch_index,
+            range.task_end - range.task_begin, range.task_begin, range.task_end, range.final_epoch
+        );
+        STRACE_HOST_SPAN_AT(
+            "simpler_run.host_orch.layer_build", capture->build_start_ns, boundary_ns - capture->build_start_ns, 1,
+            attrs
+        );
+    }
+    if (capture->boundary_handler != nullptr &&
+        !capture->boundary_handler(rt, &range, epoch_index, capture->boundary_context)) {
+        return false;
+    }
+    capture->ranges.push_back(range);
+    capture->task_begin = task_end;
+    auto next_build_time = std::chrono::steady_clock::now();
+    capture->build_start_ns =
+        std::chrono::duration_cast<std::chrono::nanoseconds>(next_build_time.time_since_epoch()).count();
+    return true;
+}
+
+static bool
+materialize_streaming_host_graph_range(PTO2Runtime *source, PTO2Runtime *target, PTO2HostGraphEpochRange *range) {
+    if (source == nullptr || target == nullptr || range == nullptr || source->orchestrator.sm_header == nullptr ||
+        target->orchestrator.sm_header == nullptr) {
+        return false;
+    }
+
+    PTO2SharedMemoryRingHeader &source_ring = source->orchestrator.sm_header->ring;
+    PTO2SharedMemoryRingHeader &target_ring = target->orchestrator.sm_header->ring;
+    int32_t source_total = source_ring.fc.current_task_index.load(std::memory_order_acquire);
+    if (range->task_begin < 0 || range->task_end <= range->task_begin || range->task_end > source_total ||
+        static_cast<uint64_t>(range->task_end - range->task_begin) >= target_ring.task_window_size ||
+        target->orchestrator.ring.task_allocator.task_head() != range->task_begin) {
+        LOG_ERROR(
+            "host-orch: invalid streaming range [%d,%d), source_total=%d target_head=%d window=%" PRIu64,
+            range->task_begin, range->task_end, source_total, target->orchestrator.ring.task_allocator.task_head(),
+            target_ring.task_window_size
+        );
+        return false;
+    }
+
+    PTO2DepListPool &target_dep_pool = target->scheduler.ring_sched_state.dep_pool;
+    range->dep_begin = target_dep_pool.top;
+    range->inline_completed = 0;
+
+    for (int32_t task_id = range->task_begin; task_id < range->task_end; ++task_id) {
+        PTO2TaskSlotState &source_slot = source_ring.get_slot_state_by_task_id(task_id);
+        if (source_slot.task == nullptr || source_slot.payload == nullptr) {
+            LOG_ERROR("host-orch: source task %d has incomplete slot bindings", task_id);
+            return false;
+        }
+
+        PTO2TaskAllocResult alloc = target->orchestrator.ring.task_allocator.alloc(0);
+        if (alloc.failed() || alloc.task_id != task_id) {
+            LOG_ERROR("host-orch: target task allocation diverged at task %d", task_id);
+            return false;
+        }
+        PTO2TaskDescriptor &target_task = target_ring.get_task_by_slot(alloc.slot);
+        PTO2TaskPayload &target_payload = target_ring.get_payload_by_slot(alloc.slot);
+        PTO2TaskSlotState &target_slot = target_ring.get_slot_state_by_slot(alloc.slot);
+        std::memcpy(&target_task, source_slot.task, sizeof(target_task));
+        std::memcpy(&target_payload, source_slot.payload, sizeof(target_payload));
+
+        int32_t fanin_count = target_payload.fanin_actual_count;
+        if (fanin_count > PTO2_FANIN_INLINE_CAP) {
+            LOG_ERROR(
+                "host-orch: streaming task %d has fanin %d > inline cap %d", task_id, fanin_count, PTO2_FANIN_INLINE_CAP
+            );
+            return false;
+        }
+        for (int32_t i = 0; i < fanin_count; ++i) {
+            PTO2TaskSlotState *source_producer = target_payload.fanin_inline_slot_states[i];
+            if (source_producer == nullptr || source_producer->task == nullptr) {
+                LOG_ERROR("host-orch: task %d has an invalid fanin producer", task_id);
+                return false;
+            }
+            int32_t producer_id = static_cast<int32_t>(source_producer->task->task_id.local());
+            if (producer_id < 0 || producer_id >= task_id) {
+                LOG_ERROR("host-orch: task %d has invalid producer id %d", task_id, producer_id);
+                return false;
+            }
+            target_payload.fanin_inline_slot_states[i] = &target_ring.get_slot_state_by_task_id(producer_id);
+        }
+        target_payload.fanin_spill_pool = &target->orchestrator.ring.fanin_pool;
+        target_payload.dispatch_fanin.store(0, std::memory_order_relaxed);
+
+        PTO2TaskState task_state = source_slot.task_state.load(std::memory_order_acquire);
+        target_slot.reset_for_reuse();
+        target_slot.bind_buffers(&target_payload, &target_task);
+        target_slot.task_state.store(task_state, std::memory_order_relaxed);
+        target_slot.fanin_refcount.store(0, std::memory_order_relaxed);
+        target_slot.fanin_count = 1;  // publication gate
+        target_slot.active_mask = source_slot.active_mask;
+        target_slot.allow_early_resolve = false;
+        target_slot.ready_state.store(
+            task_state >= PTO2_TASK_COMPLETED ? PTO2_COMPLETION_DONE : PTO2_READY_UNCLAIMED, std::memory_order_relaxed
+        );
+        target_slot.total_required_subtasks = source_slot.total_required_subtasks;
+        target_slot.logical_block_num = source_slot.logical_block_num;
+        if (task_state >= PTO2_TASK_COMPLETED) range->inline_completed++;
+    }
+
+    // Rebuild only same-epoch fanout. Cross-epoch ordering is represented by
+    // the completion-before-commit protocol, so an already executed producer
+    // is never patched with a late consumer edge.
+    for (int32_t producer_id = range->task_begin; producer_id < range->task_end; ++producer_id) {
+        PTO2TaskSlotState &source_producer = source_ring.get_slot_state_by_task_id(producer_id);
+        for (PTO2DepListEntry *source_edge = source_producer.fanout_head; source_edge != nullptr;
+             source_edge = source_edge->next) {
+            if (source_edge->slot_state == nullptr || source_edge->slot_state->task == nullptr) {
+                LOG_ERROR("host-orch: producer %d has an invalid fanout edge", producer_id);
+                return false;
+            }
+            int32_t consumer_id = static_cast<int32_t>(source_edge->slot_state->task->task_id.local());
+            if (consumer_id < range->task_begin || consumer_id >= range->task_end) continue;
+            if (producer_id >= consumer_id) {
+                LOG_ERROR("host-orch: invalid internal dependency %d -> %d", producer_id, consumer_id);
+                return false;
+            }
+            PTO2DepListEntry *target_edge = target_dep_pool.alloc();
+            if (target_edge == nullptr) return false;
+            PTO2TaskSlotState &target_producer = target_ring.get_slot_state_by_task_id(producer_id);
+            PTO2TaskSlotState &target_consumer = target_ring.get_slot_state_by_task_id(consumer_id);
+            target_edge->slot_state = &target_consumer;
+            target_edge->next = target_producer.fanout_head;
+            target_producer.fanout_head = target_edge;
+            target_producer.fanout_count++;
+            target_consumer.fanin_count++;
+        }
+    }
+    range->dep_end = target_dep_pool.top;
+    for (int32_t task_id = range->task_begin; task_id < range->task_end; ++task_id) {
+        target_ring.get_slot_state_by_task_id(task_id).dep_pool_mark = range->dep_end;
+    }
+
+    target->orchestrator.inline_completed_tasks += static_cast<uint64_t>(range->inline_completed);
+    target->orchestrator.sm_header->graph_output_ptr.store(
+        source->orchestrator.sm_header->graph_output_ptr.load(std::memory_order_acquire), std::memory_order_relaxed
+    );
+    target->orchestrator.sm_header->graph_output_size.store(
+        source->orchestrator.sm_header->graph_output_size.load(std::memory_order_acquire), std::memory_order_relaxed
+    );
+    return true;
+}
+
+static int32_t count_streaming_internal_edges(PTO2Runtime *source, const PTO2HostGraphEpochRange &range) {
+    if (source == nullptr || source->orchestrator.sm_header == nullptr) return -1;
+    PTO2SharedMemoryRingHeader &ring = source->orchestrator.sm_header->ring;
+    int64_t edge_count = 0;
+    for (int32_t producer_id = range.task_begin; producer_id < range.task_end; ++producer_id) {
+        PTO2TaskSlotState &producer = ring.get_slot_state_by_task_id(producer_id);
+        for (PTO2DepListEntry *edge = producer.fanout_head; edge != nullptr; edge = edge->next) {
+            if (edge->slot_state == nullptr || edge->slot_state->task == nullptr) return -1;
+            int32_t consumer_id = static_cast<int32_t>(edge->slot_state->task->task_id.local());
+            if (consumer_id >= range.task_begin && consumer_id < range.task_end) {
+                if (++edge_count > INT32_MAX) return -1;
+            }
+        }
+    }
+    return static_cast<int32_t>(edge_count);
+}
+
+static bool materialize_host_graph_ranges(
+    PTO2SharedMemoryHandle &source_sm_handle, PTO2SharedMemoryHandle &target_sm_handle,
+    const std::vector<PTO2HostGraphEpochRange> &ranges, int32_t total_tasks
+) {
+    if (source_sm_handle.header == nullptr || target_sm_handle.header == nullptr) {
+        LOG_ERROR("host-orch: cannot materialize graph ranges without source and target SM headers");
+        return false;
+    }
+
+    PTO2SharedMemoryRingHeader &source_ring = source_sm_handle.header->ring;
+    PTO2SharedMemoryRingHeader &target_ring = target_sm_handle.header->ring;
+    if (total_tasks < 0 || static_cast<uint64_t>(total_tasks) > source_ring.task_window_size ||
+        source_ring.task_window_size != target_ring.task_window_size) {
+        LOG_ERROR(
+            "host-orch: invalid materialization size tasks=%d source_window=%" PRIu64 " target_window=%" PRIu64,
+            total_tasks, source_ring.task_window_size, target_ring.task_window_size
+        );
+        return false;
+    }
+
+    int32_t expected_begin = 0;
+    for (size_t index = 0; index < ranges.size(); ++index) {
+        const PTO2HostGraphEpochRange &range = ranges[index];
+        if (range.task_begin != expected_begin || range.task_end <= range.task_begin || range.task_end > total_tasks) {
+            LOG_ERROR(
+                "host-orch: epoch %zu does not form a contiguous graph partition: expected_begin=%d range=[%d,%d) "
+                "total=%d",
+                index, expected_begin, range.task_begin, range.task_end, total_tasks
+            );
+            return false;
+        }
+
+        char attrs[160];
+        std::snprintf(
+            attrs, sizeof(attrs), "epoch=%zu slot=%zu task_begin=%d task_end=%d tasks=%d", index,
+            index % static_cast<size_t>(PTO2_HOST_GRAPH_EPOCH_SLOT_COUNT), range.task_begin, range.task_end,
+            range.task_end - range.task_begin
+        );
+        {
+            STRACE_A("simpler_run.host_orch.epoch.materialize", attrs);
+            for (int32_t task_id = range.task_begin; task_id < range.task_end; ++task_id) {
+                int32_t source_slot = source_ring.get_slot_by_task_id(task_id);
+                int32_t target_slot = target_ring.get_slot_by_task_id(task_id);
+                std::memcpy(
+                    &target_ring.task_descriptors[target_slot], &source_ring.task_descriptors[source_slot],
+                    sizeof(PTO2TaskDescriptor)
+                );
+                std::memcpy(
+                    &target_ring.task_payloads[target_slot], &source_ring.task_payloads[source_slot],
+                    sizeof(PTO2TaskPayload)
+                );
+                std::memcpy(
+                    &target_ring.slot_states[target_slot], &source_ring.slot_states[source_slot],
+                    sizeof(PTO2TaskSlotState)
+                );
+            }
+        }
+        expected_begin = range.task_end;
+    }
+
+    if (ranges.empty() || expected_begin != total_tasks) {
+        LOG_ERROR("host-orch: captured graph ranges cover [0,%d), expected [0,%d)", expected_begin, total_tasks);
+        return false;
+    }
+    return true;
+}
+
 int32_t run_host_orchestration(
     Runtime *runtime, const HostApi *api, PTO2Runtime *rt, DeviceArena &host_arena,
     const PTO2RuntimeArenaLayout &layout, void *device_sm, uint64_t sm_size, void *device_arena, void *gm_heap,
     const uint64_t eff_heap_sizes[PTO2_MAX_RING_DEPTH], const uint64_t eff_task_window_sizes[PTO2_MAX_RING_DEPTH],
-    void *host_orch_func_ptr, const L2TaskArgs &orch_l2
+    void *host_orch_func_ptr, const L2TaskArgs &orch_l2,
+    bool (*boundary_handler)(PTO2Runtime *, PTO2HostGraphEpochRange *, size_t, void *) = nullptr,
+    void *boundary_context = nullptr
 ) {
-    std::vector<uint8_t> host_sm_buf(sm_size, 0);
-    void *host_sm = host_sm_buf.data();
+    constexpr char epoch_attrs[] = "epoch=0 slot=0 final=1";
+    std::vector<uint8_t> source_sm_buf(sm_size, 0);
+    void *source_sm = source_sm_buf.data();
+
+    DeviceArena source_arena;
+    PTO2RuntimeArenaLayout source_layout =
+        runtime_reserve_layout(source_arena, eff_task_window_sizes, eff_heap_sizes, layout.dep_pool_capacities);
+    if (source_layout.arena_size != layout.arena_size || source_layout.off_runtime != layout.off_runtime ||
+        source_arena.commit(DeviceArena::kDefaultBaseAlign) == nullptr) {
+        LOG_ERROR("host-orch: failed to create an equivalent source arena for epoch capture");
+        return -1;
+    }
+
+    PTO2Runtime *source_rt = runtime_init_data_from_layout(
+        source_arena, source_layout, PTO2_MODE_EXECUTE, device_sm, sm_size, gm_heap, eff_heap_sizes
+    );
+    if (source_rt == nullptr) {
+        LOG_ERROR("host-orch: source runtime init failed");
+        return -1;
+    }
+    runtime_wire_arena_pointers(source_arena, source_layout, source_rt);
 
     // Re-point the orchestrator half at the host SM (scheduler keeps device SM).
     // init_data_from_layout resets the orchestrator state, so this is safe.
-    if (!rt->orchestrator.init_data_from_layout(
-            layout.orch, host_arena, host_sm, gm_heap, eff_heap_sizes[0], eff_task_window_sizes[0]
+    if (!source_rt->orchestrator.init_data_from_layout(
+            source_layout.orch, source_arena, source_sm, gm_heap, eff_heap_sizes[0], eff_task_window_sizes[0]
         )) {
         LOG_ERROR("host-orch: orchestrator re-init against host SM failed");
         return -1;
     }
-    rt->orchestrator.wire_arena_pointers(layout.orch, host_arena, &rt->scheduler);
+    source_rt->orchestrator.wire_arena_pointers(source_layout.orch, source_arena, &source_rt->scheduler);
+    source_rt->scheduler.sm_header = source_rt->orchestrator.sm_header;
+    source_rt->scheduler.ring_sched_state.ring = &source_rt->orchestrator.sm_header->ring;
+    source_rt->scheduler.ring_sched_state.dep_pool.error_code_ptr = &source_rt->orchestrator.sm_header->orch_error_code;
 
     // Initialize the host SM header (ring flow control) so submit_task can run.
-    PTO2SharedMemoryHandle host_sm_handle;
-    if (!host_sm_handle.init_per_ring(host_sm, sm_size, eff_task_window_sizes, eff_heap_sizes)) {
+    PTO2SharedMemoryHandle source_sm_handle;
+    if (!source_sm_handle.init_per_ring(source_sm, sm_size, eff_task_window_sizes, eff_heap_sizes)) {
         LOG_ERROR("host-orch: host SM init_per_ring failed");
         return -1;
     }
@@ -449,8 +742,8 @@ int32_t run_host_orchestration(
     // re-applied with the real device values on the AICPU at boot; the values
     // here only feed cluster spreading during this host submit and are unused
     // by the migrated non-cluster examples.
-    runtime_finalize_after_wire(rt, /*aic*/ 24, /*aiv*/ 48);
-    rt->mode = PTO2_MODE_EXECUTE;
+    runtime_finalize_after_wire(source_rt, /*aic*/ 24, /*aiv*/ 48);
+    source_rt->mode = PTO2_MODE_EXECUTE;
     // get_tensor_data/set_tensor_data dereference buffer.addr directly: the
     // input tensors were mapped into host address space at staging time
     // (HostApi::register_device_memory_to_host), so the host orchestrator can
@@ -461,20 +754,102 @@ int32_t run_host_orchestration(
     // rt_scope_* / rt_orchestration_done) and the orch .so's own copy (used by
     // its inline rt_submit_* -> current_runtime()).
     const HostOrchEntryPoints *eps = reinterpret_cast<const HostOrchEntryPoints *>(host_orch_func_ptr);
-    framework_bind_runtime(rt);
+    framework_bind_runtime(source_rt);
     if (eps->bind != nullptr) {
-        eps->bind(rt);
+        eps->bind(source_rt);
     } else {
         LOG_ERROR("host-orch: orch .so framework_bind_runtime was not resolved");
         return -1;
     }
 
-    rt_scope_begin(rt);
-    eps->entry(orch_l2);
-    rt_scope_end(rt);
-    rt_orchestration_done(rt);
+    HostGraphEpochCapture epoch_capture;
+    epoch_capture.boundary_handler = boundary_handler;
+    epoch_capture.boundary_context = boundary_context;
+    {
+        runtime_set_graph_boundary_callback(source_rt, capture_host_graph_epoch, &epoch_capture);
+        auto capture_guard = RAIIScopeGuard([source_rt]() {
+            runtime_set_graph_boundary_callback(source_rt, nullptr, nullptr);
+        });
+        {
+            STRACE_A("simpler_run.host_orch.epoch.build", epoch_attrs);
+            rt_scope_begin(source_rt);
+            auto build_start = std::chrono::steady_clock::now();
+            epoch_capture.build_start_ns =
+                std::chrono::duration_cast<std::chrono::nanoseconds>(build_start.time_since_epoch()).count();
+            eps->entry(orch_l2);
+            rt_scope_end(source_rt);
+            // An orchestration without explicit boundaries is one final epoch.
+            if (epoch_capture.ranges.empty()) rt_graph_boundary(source_rt, true);
+            rt_orchestration_done(source_rt);
+        }
+    }
 
-    int32_t total_tasks = pto2_sm_layout::ring_current_task_index_addr(host_sm)->load(std::memory_order_acquire);
+    int32_t total_tasks = pto2_sm_layout::ring_current_task_index_addr(source_sm)->load(std::memory_order_acquire);
+    uint64_t captured_epochs = epoch_capture.ranges.size();
+    char capture_attrs[96];
+    std::snprintf(
+        capture_attrs, sizeof(capture_attrs), "captured_epochs=%" PRIu64 " tasks=%d", captured_epochs, total_tasks
+    );
+    { STRACE_A("simpler_run.host_orch.boundary_capture", capture_attrs); }
+    for (size_t index = 0; index < epoch_capture.ranges.size(); ++index) {
+        const PTO2HostGraphEpochRange &range = epoch_capture.ranges[index];
+        char range_attrs[160];
+        std::snprintf(
+            range_attrs, sizeof(range_attrs), "epoch=%zu slot=%zu task_begin=%d task_end=%d tasks=%d", index,
+            index % static_cast<size_t>(PTO2_HOST_GRAPH_EPOCH_SLOT_COUNT), range.task_begin, range.task_end,
+            range.task_end - range.task_begin
+        );
+        { STRACE_A("simpler_run.host_orch.epoch.capture", range_attrs); }
+    }
+    LOG_INFO_V0("host-orch: captured epochs=%" PRIu64 " tasks=%d", captured_epochs, total_tasks);
+
+    if (boundary_handler != nullptr) {
+        if (epoch_capture.ranges.empty() || epoch_capture.ranges.back().final_epoch == 0 ||
+            epoch_capture.ranges.back().task_end != total_tasks) {
+            LOG_ERROR("host-orch: streaming orchestration did not publish one final range covering all tasks");
+            return -1;
+        }
+        return total_tasks;
+    }
+
+    std::memcpy(host_arena.base(), source_arena.base(), layout.arena_size);
+    runtime_wire_arena_pointers(host_arena, layout, rt);
+
+    std::vector<uint8_t> target_sm_buf(sm_size, 0);
+    void *target_sm = target_sm_buf.data();
+    std::memcpy(target_sm, source_sm, sizeof(PTO2SharedMemoryHeader));
+    PTO2SharedMemoryHandle target_sm_handle;
+    if (!target_sm_handle.attach_populated(target_sm, sm_size, eff_task_window_sizes)) {
+        LOG_ERROR("host-orch: target SM attach failed during epoch materialization");
+        return -1;
+    }
+    if (!materialize_host_graph_ranges(source_sm_handle, target_sm_handle, epoch_capture.ranges, total_tasks)) {
+        return -1;
+    }
+
+    PTO2HostGraphEpochControl &epoch_control = target_sm_handle.header->host_graph_epochs;
+    PTO2HostGraphEpochSlot &published_slot = epoch_control.slots[0];
+    published_slot.owner_epoch.store(1, std::memory_order_relaxed);
+    published_slot.range.task_begin = 0;
+    published_slot.range.task_end = total_tasks;
+    published_slot.range.final_epoch = 1;
+    epoch_control.host_publish_epoch.store(0, std::memory_order_relaxed);
+
+    // The source arena is a byte-for-byte execution-state image. Rewiring above
+    // makes all arena-private bases point at the target before relocation walks
+    // them. The scheduler's SM anchors were device addresses before the copy and
+    // remain so; only cross-task pointers move through source -> target -> device.
+    const int64_t source_to_target_sm_delta = static_cast<int64_t>(reinterpret_cast<uint64_t>(target_sm)) -
+                                              static_cast<int64_t>(reinterpret_cast<uint64_t>(source_sm));
+    const int64_t source_to_target_arena_delta = static_cast<int64_t>(reinterpret_cast<uint64_t>(host_arena.base())) -
+                                                 static_cast<int64_t>(reinterpret_cast<uint64_t>(source_arena.base()));
+    if (!relocate_host_orch_image(
+            target_sm_handle, rt, reinterpret_cast<uint64_t>(source_sm), sm_size, source_to_target_sm_delta,
+            reinterpret_cast<uint64_t>(source_arena.base()), layout.arena_size, source_to_target_arena_delta
+        )) {
+        LOG_ERROR("host-orch: source-to-target epoch relocation failed");
+        return -1;
+    }
 
     // Relocate the host-DDR cross-task pointers to their final DEVICE addresses
     // on the host, before the SM and arena leave for the device. Pointers into
@@ -482,25 +857,629 @@ int32_t run_host_orchestration(
     // queue) shift by arena_delta. After this both the SM and arena carry device
     // addresses, so the device boots scheduler-only.
     const int64_t sm_delta = static_cast<int64_t>(reinterpret_cast<uint64_t>(device_sm)) -
-                             static_cast<int64_t>(reinterpret_cast<uint64_t>(host_sm));
+                             static_cast<int64_t>(reinterpret_cast<uint64_t>(target_sm));
     const int64_t arena_delta = static_cast<int64_t>(reinterpret_cast<uint64_t>(device_arena)) -
                                 static_cast<int64_t>(reinterpret_cast<uint64_t>(host_arena.base()));
-    if (!relocate_host_orch_image(
-            host_sm_handle, rt, reinterpret_cast<uint64_t>(host_sm), sm_size, sm_delta,
-            reinterpret_cast<uint64_t>(host_arena.base()), layout.arena_size, arena_delta
-        )) {
-        LOG_ERROR("host-orch: relocation failed; refusing to H2D an image with unrelocated host pointers");
-        return -1;
+    {
+        STRACE_A("simpler_run.host_orch.image.relocate", epoch_attrs);
+        if (!relocate_host_orch_image(
+                target_sm_handle, rt, reinterpret_cast<uint64_t>(target_sm), sm_size, sm_delta,
+                reinterpret_cast<uint64_t>(host_arena.base()), layout.arena_size, arena_delta
+            )) {
+            LOG_ERROR("host-orch: relocation failed; refusing to H2D an image with unrelocated host pointers");
+            return -1;
+        }
     }
 
-    if (api->copy_to_device(device_sm, host_sm, sm_size) != 0) {
-        LOG_ERROR("host-orch: H2D of populated SM failed");
-        return -1;
+    {
+        STRACE_A("simpler_run.host_orch.epoch.stage_sm", epoch_attrs);
+        if (api->copy_to_device(device_sm, target_sm, sm_size) != 0) {
+            LOG_ERROR("host-orch: H2D of populated SM failed");
+            return -1;
+        }
     }
     return total_tasks;
 }
 
+class HostGraphAsyncJob {
+public:
+    ~HostGraphAsyncJob() { (void)join(); }
+
+    bool prepare_and_start(
+        Runtime *runtime, const HostApi *api, const PTO2RuntimeArenaLayout &layout, void *device_sm, uint64_t sm_size,
+        void *device_arena, void *gm_heap, const uint64_t heap_sizes[PTO2_MAX_RING_DEPTH],
+        const uint64_t task_window_sizes[PTO2_MAX_RING_DEPTH], void *host_orch_func_ptr,
+        const ChipStorageTaskArgs &device_args
+    ) {
+        runtime_ = runtime;
+        api_ = api;
+        layout_ = layout;
+        device_sm_ = device_sm;
+        sm_size_ = sm_size;
+        device_arena_ = device_arena;
+        gm_heap_ = gm_heap;
+        host_orch_func_ptr_ = host_orch_func_ptr;
+        device_args_ = device_args;
+        std::memcpy(heap_sizes_, heap_sizes, sizeof(heap_sizes_));
+        std::memcpy(task_window_sizes_, task_window_sizes, sizeof(task_window_sizes_));
+#if SIMPLER_HOST_STRACE
+        strace_inv_ = simpler::strace::StraceScope::current_inv();
+        strace_hid_ = simpler::strace::StraceScope::current_hid();
+#endif
+
+        if (runtime_ == nullptr || api_ == nullptr || device_sm_ == nullptr || device_arena_ == nullptr ||
+            gm_heap_ == nullptr || host_orch_func_ptr_ == nullptr || api_->capture_thread_context == nullptr ||
+            api_->bind_thread_context == nullptr || api_->unbind_thread_context == nullptr ||
+            api_->store_u64_release_to_device == nullptr || api_->load_u64_acquire_from_device == nullptr) {
+            LOG_ERROR("host-orch: async job has incomplete inputs");
+            return false;
+        }
+
+        PTO2RuntimeArenaLayout target_layout =
+            runtime_reserve_layout(target_arena_, task_window_sizes_, heap_sizes_, layout_.dep_pool_capacities);
+        if (target_layout.arena_size != layout_.arena_size || target_layout.off_runtime != layout_.off_runtime ||
+            target_arena_.commit(DeviceArena::kDefaultBaseAlign) == nullptr) {
+            LOG_ERROR("host-orch: async target arena layout mismatch or allocation failure");
+            return false;
+        }
+        target_rt_ = runtime_init_data_from_layout(
+            target_arena_, layout_, PTO2_MODE_EXECUTE, device_sm_, sm_size_, gm_heap_, heap_sizes_
+        );
+        if (target_rt_ == nullptr) {
+            LOG_ERROR("host-orch: async target runtime init failed");
+            return false;
+        }
+        runtime_wire_arena_pointers(target_arena_, layout_, target_rt_);
+        target_rt_->prebuilt_layout = layout_;
+
+        target_sm_.resize(sm_size_, 0);
+        if (!target_sm_handle_.init_per_ring(target_sm_.data(), sm_size_, task_window_sizes_, heap_sizes_) ||
+            !target_rt_->orchestrator.init_data_from_layout(
+                layout_.orch, target_arena_, target_sm_.data(), gm_heap_, heap_sizes_[0], task_window_sizes_[0]
+            )) {
+            LOG_ERROR("host-orch: failed to initialize the streaming target image");
+            return false;
+        }
+        target_rt_->orchestrator.wire_arena_pointers(layout_.orch, target_arena_, &target_rt_->scheduler);
+
+        // Publish the empty runtime arena once. Device-side wire restores every
+        // arena-private pointer; the orchestrator's host SM anchor is unused by
+        // scheduler-only execution and is temporarily replaced for this image.
+        PTO2SharedMemoryHeader *target_host_header = target_rt_->orchestrator.sm_header;
+        target_rt_->orchestrator.sm_header = static_cast<PTO2SharedMemoryHeader *>(device_sm_);
+        int arena_rc = api_->copy_to_device(device_arena_, target_arena_.base(), layout_.arena_size);
+        target_rt_->orchestrator.sm_header = target_host_header;
+        if (arena_rc != 0 || api_->copy_to_device(device_sm_, target_sm_.data(), sm_size_) != 0) {
+            LOG_ERROR("host-orch: failed to reset the async publication SM");
+            return false;
+        }
+
+        runtime_->set_prebuilt_arena(device_arena_, layout_.off_runtime);
+        runtime_->host_total_tasks = -1;
+        thread_context_ = api_->capture_thread_context();
+        if (thread_context_ == nullptr) {
+            LOG_ERROR("host-orch: failed to capture the runner thread context");
+            return false;
+        }
+
+        try {
+            worker_ = std::thread([this]() {
+#if SIMPLER_HOST_STRACE
+                STRACE_SET_CONTEXT(strace_inv_, strace_hid_);
+#endif
+                if (api_->bind_thread_context(thread_context_) != 0) {
+                    result_ = -1;
+                    worker_start_state_.store(-1, std::memory_order_release);
+                    return;
+                }
+                worker_start_state_.store(1, std::memory_order_release);
+                {
+                    std::unique_lock<std::mutex> lock(run_gate_mutex_);
+                    run_gate_cv_.wait(lock, [this]() {
+                        return run_gate_state_.load(std::memory_order_acquire) != 0;
+                    });
+                }
+                if (run_gate_state_.load(std::memory_order_acquire) < 0) {
+                    result_ = -1;
+                    api_->unbind_thread_context();
+                    return;
+                }
+                try {
+                    run();
+                } catch (const std::exception &e) {
+                    LOG_ERROR("host-orch: async worker exception: %s", e.what());
+                    publish_failure(PTO2_ERROR_EXPLICIT_ORCH_FATAL);
+                    result_ = -1;
+                } catch (...) {
+                    LOG_ERROR("host-orch: async worker unknown exception");
+                    publish_failure(PTO2_ERROR_EXPLICIT_ORCH_FATAL);
+                    result_ = -1;
+                }
+                api_->unbind_thread_context();
+            });
+        } catch (const std::exception &e) {
+            LOG_ERROR("host-orch: failed to start async worker: %s", e.what());
+            return false;
+        }
+
+        while (worker_start_state_.load(std::memory_order_acquire) == 0)
+            std::this_thread::yield();
+        if (worker_start_state_.load(std::memory_order_acquire) < 0) {
+            worker_.join();
+            return false;
+        }
+        return true;
+    }
+
+    bool release_for_prepare() {
+        int32_t expected = 0;
+        if (!run_gate_state_.compare_exchange_strong(
+                expected, 1, std::memory_order_release, std::memory_order_acquire
+            )) {
+            return expected == 1;
+        }
+        run_gate_cv_.notify_one();
+        LOG_INFO_V9("host-orch: async worker released for Host preparation");
+        return true;
+    }
+
+    bool release_for_run() {
+        if (!release_for_prepare()) return false;
+        int32_t expected = 0;
+        if (!publish_gate_state_.compare_exchange_strong(
+                expected, 1, std::memory_order_release, std::memory_order_acquire
+            )) {
+            return expected == 1;
+        }
+        run_gate_cv_.notify_all();
+        LOG_INFO_V9("host-orch: publication gate released after runner profiling setup");
+        return true;
+    }
+
+    int join() {
+        int32_t expected = 0;
+        if (run_gate_state_.compare_exchange_strong(
+                expected, -1, std::memory_order_release, std::memory_order_acquire
+            )) {
+            run_gate_cv_.notify_all();
+        }
+        expected = 0;
+        (void)publish_gate_state_.compare_exchange_strong(
+            expected, -1, std::memory_order_release, std::memory_order_acquire
+        );
+        run_gate_cv_.notify_all();
+        if (worker_.joinable()) worker_.join();
+        return result_;
+    }
+
+private:
+    bool wait_for_publish_gate() {
+        std::unique_lock<std::mutex> lock(run_gate_mutex_);
+        run_gate_cv_.wait(lock, [this]() {
+            return publish_gate_state_.load(std::memory_order_acquire) != 0;
+        });
+        return publish_gate_state_.load(std::memory_order_acquire) > 0;
+    }
+
+    void publish_failure(int32_t error_code) const {
+        if (api_ == nullptr || device_sm_ == nullptr) return;
+        uint64_t failed_epoch = 1;
+        (void)api_->copy_to_device(
+            static_cast<char *>(device_sm_) + offsetof(PTO2SharedMemoryHeader, orch_error_code), &error_code,
+            sizeof(error_code)
+        );
+        (void)api_->store_u64_release_to_device(
+            static_cast<char *>(device_sm_) + offsetof(PTO2SharedMemoryHeader, host_graph_epochs) +
+                offsetof(PTO2HostGraphEpochControl, failed_epoch),
+            failed_epoch
+        );
+    }
+
+    bool wait_for_device_epoch(size_t field_offset, uint64_t epoch, const char *kind) const {
+        char attrs[96];
+        std::snprintf(attrs, sizeof(attrs), "kind=%s target_epoch=%" PRIu64, kind, epoch);
+        STRACE_A("simpler_run.host_orch.epoch.wait_device", attrs);
+        auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+        uint64_t observed = 0;
+        while (observed < epoch) {
+            if (api_->load_u64_acquire_from_device(&observed, static_cast<const char *>(device_sm_) + field_offset) !=
+                0) {
+                LOG_ERROR("host-orch: failed to read Device %s epoch", kind);
+                return false;
+            }
+            if (observed >= epoch) return true;
+            if (std::chrono::steady_clock::now() >= deadline) {
+                LOG_ERROR(
+                    "host-orch: timed out waiting for Device %s epoch=%" PRIu64 " (observed=%" PRIu64 ")", kind, epoch,
+                    observed
+                );
+                return false;
+            }
+            std::this_thread::sleep_for(std::chrono::microseconds(50));
+        }
+        return true;
+    }
+
+    bool reclaim_target_through(uint64_t epoch) {
+        if (epoch <= target_reclaimed_epoch_) return true;
+        if (epoch > published_ranges_.size()) {
+            LOG_ERROR(
+                "host-orch: cannot reclaim unpublished target epoch=%" PRIu64 " (published=%zu)", epoch,
+                published_ranges_.size()
+            );
+            return false;
+        }
+
+        const PTO2HostGraphEpochRange &released = published_ranges_[static_cast<size_t>(epoch - 1)];
+        PTO2SharedMemoryRingHeader &ring = target_sm_handle_.header->ring;
+        ring.fc.last_task_alive.store(released.task_end, std::memory_order_release);
+        target_rt_->scheduler.ring_sched_state.dep_pool.advance_tail(released.dep_end);
+        target_reclaimed_epoch_ = epoch;
+        LOG_INFO_V9(
+            "host-orch: reclaimed target through epoch=%" PRIu64 " tasks<%d deps<%d", epoch, released.task_end,
+            released.dep_end
+        );
+        return true;
+    }
+
+    bool wait_and_reclaim_target(uint64_t epoch, const char *kind) {
+        if (epoch <= target_reclaimed_epoch_) return true;
+        size_t field_offset = offsetof(PTO2SharedMemoryHeader, host_graph_epochs) +
+                              offsetof(PTO2HostGraphEpochControl, device_buffer_free_epoch);
+        return wait_for_device_epoch(field_offset, epoch, kind) && reclaim_target_through(epoch);
+    }
+
+    bool ensure_target_capacity(PTO2Runtime *source, const PTO2HostGraphEpochRange &range, size_t epoch_index) {
+        PTO2TaskAllocator &allocator = target_rt_->orchestrator.ring.task_allocator;
+        PTO2DepListPool &dep_pool = target_rt_->scheduler.ring_sched_state.dep_pool;
+        int32_t task_count = range.task_end - range.task_begin;
+        int32_t edge_count = count_streaming_internal_edges(source, range);
+        if (task_count <= 0 || task_count >= allocator.window_size() || edge_count < 0 ||
+            edge_count > dep_pool.capacity) {
+            LOG_ERROR(
+                "host-orch: epoch cannot fit target storage (tasks=%d/%d edges=%d/%d)", task_count,
+                allocator.window_size(), edge_count, dep_pool.capacity
+            );
+            return false;
+        }
+
+        auto has_capacity = [&]() {
+            int32_t active_tasks = allocator.task_head() - allocator.task_tail();
+            int32_t active_deps = dep_pool.top - dep_pool.tail;
+            return active_tasks + task_count < allocator.window_size() && active_deps + edge_count <= dep_pool.capacity;
+        };
+        if (has_capacity()) return true;
+        if (epoch_index == 0 || !wait_and_reclaim_target(epoch_index, "storage-free")) return false;
+        if (!has_capacity()) {
+            LOG_ERROR(
+                "host-orch: target storage remains full after reclaim (tasks=%d+%d/%d deps=%d+%d/%d)",
+                allocator.task_head() - allocator.task_tail(), task_count, allocator.window_size(),
+                dep_pool.top - dep_pool.tail, edge_count, dep_pool.capacity
+            );
+            return false;
+        }
+        return true;
+    }
+
+    bool stage_epoch(const PTO2HostGraphEpochRange &range, size_t epoch_index) {
+        const int32_t task_count = range.task_end - range.task_begin;
+        PTO2SharedMemoryRingHeader &ring = target_sm_handle_.header->ring;
+        if (task_count <= 0 || static_cast<uint64_t>(task_count) >= ring.task_window_size) {
+            LOG_ERROR(
+                "host-orch: invalid streaming task range size=%d window=%" PRIu64, task_count, ring.task_window_size
+            );
+            return false;
+        }
+
+        char attrs[192];
+        std::snprintf(
+            attrs, sizeof(attrs),
+            "epoch=%zu slot=%zu task_begin=%d task_end=%d tasks=%d dep_begin=%d dep_end=%d final=%d", epoch_index + 1,
+            epoch_index % static_cast<size_t>(PTO2_HOST_GRAPH_EPOCH_SLOT_COUNT), range.task_begin, range.task_end,
+            task_count, range.dep_begin, range.dep_end, range.final_epoch
+        );
+        STRACE_A("simpler_run.host_orch.epoch.stage_upload", attrs);
+
+        auto relocate_target_pointer = [&](auto *&pointer) -> bool {
+            using Pointer = std::remove_reference_t<decltype(pointer)>;
+            uint64_t value = reinterpret_cast<uint64_t>(pointer);
+            if (value == 0) return true;
+            uint64_t host_sm = reinterpret_cast<uint64_t>(target_sm_.data());
+            uint64_t host_arena = reinterpret_cast<uint64_t>(target_arena_.base());
+            if (value >= host_sm && value < host_sm + sm_size_) {
+                pointer = reinterpret_cast<Pointer>(
+                    reinterpret_cast<uint64_t>(device_sm_) + static_cast<uint64_t>(value - host_sm)
+                );
+                return true;
+            }
+            if (value >= host_arena && value < host_arena + layout_.arena_size) {
+                pointer = reinterpret_cast<Pointer>(
+                    reinterpret_cast<uint64_t>(device_arena_) + static_cast<uint64_t>(value - host_arena)
+                );
+                return true;
+            }
+            LOG_ERROR("host-orch: streaming pointer %#lx is outside target SM/arena", value);
+            return false;
+        };
+
+        auto sm_offsets = pto2_sm_layout::ring_segment_offsets(ring.task_window_size);
+        char *device_sm_bytes = static_cast<char *>(device_sm_);
+        auto stage_task_run = [&](int32_t first_slot, int32_t run_count) {
+            std::vector<uint8_t> payload_image(static_cast<size_t>(run_count) * sizeof(PTO2TaskPayload));
+            std::vector<uint8_t> slot_image(static_cast<size_t>(run_count) * sizeof(PTO2TaskSlotState));
+            for (int32_t i = 0; i < run_count; ++i) {
+                PTO2TaskPayload payload_copy;
+                PTO2TaskSlotState slot_copy;
+                std::memcpy(&payload_copy, &ring.task_payloads[first_slot + i], sizeof(payload_copy));
+                std::memcpy(&slot_copy, &ring.slot_states[first_slot + i], sizeof(slot_copy));
+                if (payload_copy.fanin_actual_count > PTO2_FANIN_INLINE_CAP) return false;
+                for (int32_t fanin = 0; fanin < payload_copy.fanin_actual_count; ++fanin) {
+                    if (!relocate_target_pointer(payload_copy.fanin_inline_slot_states[fanin])) return false;
+                }
+                payload_copy.fanin_spill_pool = nullptr;
+                if (!relocate_target_pointer(slot_copy.task) || !relocate_target_pointer(slot_copy.payload) ||
+                    !relocate_target_pointer(slot_copy.fanout_head)) {
+                    return false;
+                }
+                std::memcpy(
+                    payload_image.data() + static_cast<size_t>(i) * sizeof(payload_copy), &payload_copy,
+                    sizeof(payload_copy)
+                );
+                std::memcpy(
+                    slot_image.data() + static_cast<size_t>(i) * sizeof(slot_copy), &slot_copy, sizeof(slot_copy)
+                );
+            }
+
+            size_t descriptor_bytes = static_cast<size_t>(run_count) * sizeof(PTO2TaskDescriptor);
+            return api_->copy_to_device(
+                       device_sm_bytes + sm_offsets.descriptors +
+                           static_cast<size_t>(first_slot) * sizeof(PTO2TaskDescriptor),
+                       &ring.task_descriptors[first_slot], descriptor_bytes
+                   ) == 0 &&
+                   api_->copy_to_device(
+                       device_sm_bytes + sm_offsets.payloads +
+                           static_cast<size_t>(first_slot) * sizeof(PTO2TaskPayload),
+                       payload_image.data(), payload_image.size()
+                   ) == 0 &&
+                   api_->copy_to_device(
+                       device_sm_bytes + sm_offsets.slot_states +
+                           static_cast<size_t>(first_slot) * sizeof(PTO2TaskSlotState),
+                       slot_image.data(), slot_image.size()
+                   ) == 0;
+        };
+        int32_t staged_tasks = 0;
+        while (staged_tasks < task_count) {
+            int32_t task_id = range.task_begin + staged_tasks;
+            int32_t first_slot = ring.get_slot_by_task_id(task_id);
+            int32_t run_count =
+                std::min(task_count - staged_tasks, static_cast<int32_t>(ring.task_window_size) - first_slot);
+            if (!stage_task_run(first_slot, run_count)) {
+                LOG_ERROR("host-orch: failed to stage task range [%d,%d)", range.task_begin, range.task_end);
+                return false;
+            }
+            staged_tasks += run_count;
+        }
+
+        PTO2DepListPool &dep_pool = target_rt_->scheduler.ring_sched_state.dep_pool;
+        int32_t dep_count = range.dep_end - range.dep_begin;
+        if (dep_count > 0) {
+            int32_t dep_slot = range.dep_begin % dep_pool.capacity;
+            std::vector<PTO2DepListEntry> dep_image(static_cast<size_t>(dep_count));
+            for (int32_t i = 0; i < dep_count; ++i) {
+                dep_image[static_cast<size_t>(i)] = dep_pool.base[(range.dep_begin + i) % dep_pool.capacity];
+                if (!relocate_target_pointer(dep_image[static_cast<size_t>(i)].slot_state) ||
+                    !relocate_target_pointer(dep_image[static_cast<size_t>(i)].next)) {
+                    return false;
+                }
+            }
+            char *device_arena_bytes = static_cast<char *>(device_arena_);
+            int32_t first_count = std::min(dep_count, dep_pool.capacity - dep_slot);
+            int32_t second_count = dep_count - first_count;
+            bool dep_staged = api_->copy_to_device(
+                                  device_arena_bytes + layout_.sched.off_dep_pool_entries +
+                                      static_cast<size_t>(dep_slot) * sizeof(PTO2DepListEntry),
+                                  dep_image.data(), static_cast<size_t>(first_count) * sizeof(PTO2DepListEntry)
+                              ) == 0;
+            if (dep_staged && second_count > 0) {
+                dep_staged =
+                    api_->copy_to_device(
+                        device_arena_bytes + layout_.sched.off_dep_pool_entries, dep_image.data() + first_count,
+                        static_cast<size_t>(second_count) * sizeof(PTO2DepListEntry)
+                    ) == 0;
+            }
+            if (!dep_staged) {
+                LOG_ERROR("host-orch: failed to stage dependency range [%d,%d)", range.dep_begin, range.dep_end);
+                return false;
+            }
+        }
+
+        PTO2HostGraphEpochControl &control = target_sm_handle_.header->host_graph_epochs;
+        size_t control_slot = epoch_index % static_cast<size_t>(PTO2_HOST_GRAPH_EPOCH_SLOT_COUNT);
+        PTO2HostGraphEpochSlot &epoch_slot = control.slots[control_slot];
+        epoch_slot.owner_epoch.store(epoch_index + 1, std::memory_order_relaxed);
+        epoch_slot.range = range;
+
+        int32_t current_task_index = range.task_end;
+        uint64_t graph_output_ptr = target_sm_handle_.header->graph_output_ptr.load(std::memory_order_relaxed);
+        uint64_t graph_output_size = target_sm_handle_.header->graph_output_size.load(std::memory_order_relaxed);
+        size_t epoch_slot_offset = offsetof(PTO2SharedMemoryHeader, host_graph_epochs) +
+                                   offsetof(PTO2HostGraphEpochControl, slots) +
+                                   control_slot * sizeof(PTO2HostGraphEpochSlot);
+        if (api_->copy_to_device(
+                pto2_sm_layout::ring_current_task_index_addr(device_sm_), &current_task_index,
+                sizeof(current_task_index)
+            ) != 0 ||
+            api_->copy_to_device(
+                device_sm_bytes + offsetof(PTO2SharedMemoryHeader, graph_output_ptr), &graph_output_ptr,
+                sizeof(graph_output_ptr)
+            ) != 0 ||
+            api_->copy_to_device(
+                device_sm_bytes + offsetof(PTO2SharedMemoryHeader, graph_output_size), &graph_output_size,
+                sizeof(graph_output_size)
+            ) != 0 ||
+            api_->copy_to_device(device_sm_bytes + epoch_slot_offset, &epoch_slot, sizeof(epoch_slot)) != 0) {
+            LOG_ERROR("host-orch: failed to stage epoch metadata");
+            return false;
+        }
+        return true;
+    }
+
+    bool commit_publication(const PTO2HostGraphEpochRange &range, size_t epoch_index) const {
+        uint64_t publish_epoch = epoch_index + 1;
+        size_t control_slot = epoch_index % static_cast<size_t>(PTO2_HOST_GRAPH_EPOCH_SLOT_COUNT);
+        char attrs[160];
+        std::snprintf(
+            attrs, sizeof(attrs), "epoch=%" PRIu64 " slot=%zu task_begin=%d task_end=%d final=%d", publish_epoch,
+            control_slot, range.task_begin, range.task_end, range.final_epoch
+        );
+        STRACE_A("simpler_run.host_orch.epoch.commit", attrs);
+        size_t epoch_offset = offsetof(PTO2SharedMemoryHeader, host_graph_epochs) +
+                              offsetof(PTO2HostGraphEpochControl, host_publish_epoch);
+        return api_->store_u64_release_to_device(static_cast<char *>(device_sm_) + epoch_offset, publish_epoch) == 0;
+    }
+
+    bool publish_boundary(PTO2Runtime *source, PTO2HostGraphEpochRange *range, size_t epoch_index) {
+        uint64_t publish_epoch = epoch_index + 1;
+        if (epoch_index >= static_cast<size_t>(PTO2_HOST_GRAPH_EPOCH_SLOT_COUNT) &&
+            !wait_and_reclaim_target(publish_epoch - PTO2_HOST_GRAPH_EPOCH_SLOT_COUNT, "slot-free")) {
+            return false;
+        }
+        if (!ensure_target_capacity(source, *range, epoch_index)) return false;
+
+        char attrs[160];
+        std::snprintf(
+            attrs, sizeof(attrs), "epoch=%" PRIu64 " task_begin=%d task_end=%d final=%d", publish_epoch,
+            range->task_begin, range->task_end, range->final_epoch
+        );
+        {
+            STRACE_A("simpler_run.host_orch.epoch.materialize", attrs);
+            if (!materialize_streaming_host_graph_range(source, target_rt_, range)) return false;
+        }
+        if (!stage_epoch(*range, epoch_index)) return false;
+        if (epoch_index == 0) {
+            char attrs[96];
+            std::snprintf(attrs, sizeof(attrs), "epoch=%" PRIu64 " kind=publish-gate", publish_epoch);
+            STRACE_A("simpler_run.host_orch.epoch.wait_publish", attrs);
+            if (!wait_for_publish_gate()) return false;
+        }
+
+        size_t control_base = offsetof(PTO2SharedMemoryHeader, host_graph_epochs);
+        if (epoch_index > 0 && !wait_for_device_epoch(
+                                   control_base + offsetof(PTO2HostGraphEpochControl, device_exec_done_epoch),
+                                   publish_epoch - 1, "exec-done"
+                               )) {
+            return false;
+        }
+        if (!commit_publication(*range, epoch_index)) return false;
+        published_ranges_.push_back(*range);
+        if (!wait_for_device_epoch(
+                control_base + offsetof(PTO2HostGraphEpochControl, device_release_epoch), publish_epoch, "release"
+            )) {
+            return false;
+        }
+        source->orchestrator.sm_header->ring.fc.last_task_alive.store(range->task_end, std::memory_order_release);
+        return true;
+    }
+
+    static bool
+    boundary_handler(PTO2Runtime *source, PTO2HostGraphEpochRange *range, size_t epoch_index, void *context) {
+        auto *job = static_cast<HostGraphAsyncJob *>(context);
+        return job != nullptr && job->publish_boundary(source, range, epoch_index);
+    }
+
+    void run() {
+        L2TaskArgs orch_l2;
+        orch_l2.create_from_chip_args(device_args_);
+        int32_t total_tasks = run_host_orchestration(
+            runtime_, api_, target_rt_, target_arena_, layout_, device_sm_, sm_size_, device_arena_, gm_heap_,
+            heap_sizes_, task_window_sizes_, host_orch_func_ptr_, orch_l2, boundary_handler, this
+        );
+        if (total_tasks < 0) {
+            publish_failure(PTO2_ERROR_EXPLICIT_ORCH_FATAL);
+            result_ = -1;
+            return;
+        }
+
+        runtime_->host_total_tasks = total_tasks;
+        LOG_INFO_V9("host-orch: async streaming graph completed with %d tasks", total_tasks);
+        result_ = 0;
+    }
+
+    Runtime *runtime_{nullptr};
+    const HostApi *api_{nullptr};
+    void *thread_context_{nullptr};
+    PTO2RuntimeArenaLayout layout_{};
+    DeviceArena target_arena_;
+    PTO2Runtime *target_rt_{nullptr};
+    std::vector<uint8_t> target_sm_;
+    PTO2SharedMemoryHandle target_sm_handle_{};
+    void *device_sm_{nullptr};
+    uint64_t sm_size_{0};
+    void *device_arena_{nullptr};
+    void *gm_heap_{nullptr};
+    uint64_t heap_sizes_[PTO2_MAX_RING_DEPTH]{};
+    uint64_t task_window_sizes_[PTO2_MAX_RING_DEPTH]{};
+    std::vector<PTO2HostGraphEpochRange> published_ranges_;
+    uint64_t target_reclaimed_epoch_{0};
+    void *host_orch_func_ptr_{nullptr};
+    ChipStorageTaskArgs device_args_;
+    std::thread worker_;
+    std::mutex run_gate_mutex_;
+    std::condition_variable run_gate_cv_;
+    std::atomic<int32_t> run_gate_state_{0};
+    std::atomic<int32_t> publish_gate_state_{0};
+    std::atomic<int32_t> worker_start_state_{0};
+    int result_{-1};
+#if SIMPLER_HOST_STRACE
+    unsigned strace_inv_{0};
+    uint64_t strace_hid_{0};
+#endif
+};
+
+static bool start_async_host_graph_pipeline(
+    Runtime *runtime, const HostApi *api, const PTO2RuntimeArenaLayout &layout, void *device_sm, uint64_t sm_size,
+    void *device_arena, void *gm_heap, const uint64_t heap_sizes[PTO2_MAX_RING_DEPTH],
+    const uint64_t task_window_sizes[PTO2_MAX_RING_DEPTH], void *host_orch_func_ptr,
+    const ChipStorageTaskArgs &device_args
+) {
+    auto *job = new (std::nothrow) HostGraphAsyncJob{};
+    if (job == nullptr) return false;
+    if (!job->prepare_and_start(
+            runtime, api, layout, device_sm, sm_size, device_arena, gm_heap, heap_sizes, task_window_sizes,
+            host_orch_func_ptr, device_args
+        )) {
+        delete job;
+        return false;
+    }
+    runtime->set_host_orch_job(job);
+    return true;
+}
+
+static int join_async_host_graph_pipeline(Runtime *runtime) {
+    auto *job = static_cast<HostGraphAsyncJob *>(runtime->take_host_orch_job());
+    if (job == nullptr) return 0;
+    int rc = job->join();
+    delete job;
+    return rc;
+}
+
 }  // namespace
+
+extern "C" int release_async_host_graph_pipeline(Runtime *runtime) {
+    if (runtime == nullptr) return -1;
+    auto *job = static_cast<HostGraphAsyncJob *>(runtime->take_host_orch_job());
+    if (job == nullptr) return 0;
+    runtime->set_host_orch_job(job);
+    return job->release_for_run() ? 0 : -1;
+}
+
+extern "C" int release_async_host_graph_prepare(Runtime *runtime) {
+    if (runtime == nullptr) return -1;
+    auto *job = static_cast<HostGraphAsyncJob *>(runtime->take_host_orch_job());
+    if (job == nullptr) return 0;
+    runtime->set_host_orch_job(job);
+    return job->release_for_prepare() ? 0 : -1;
+}
 
 /**
  * Stage the per-callable resources (kernel binaries + orchestration SO) into
@@ -753,12 +1732,9 @@ extern "C" int bind_callable_to_runtime_impl(
     uint64_t sm_size = PTO2SharedMemoryHandle::calculate_size_per_ring(eff_task_window_sizes);
 
     int64_t t_prebuilt_start = _now_ms();
-    DeviceArena host_arena;  // libc malloc backend by default
-    PTO2RuntimeArenaLayout layout = runtime_reserve_layout(host_arena, eff_task_window_sizes, eff_heap_sizes);
-    if (host_arena.commit(DeviceArena::kDefaultBaseAlign) == nullptr) {
-        LOG_ERROR("Failed to commit host arena for prebuilt runtime image");
-        return -1;
-    }
+    DeviceArena layout_probe;
+    PTO2RuntimeArenaLayout layout =
+        runtime_reserve_layout(layout_probe, eff_task_window_sizes, eff_heap_sizes, eff_dep_pool_capacities);
 
     int64_t t_setup_start = _now_ms();
     if (api->setup_static_arena(total_heap_size, sm_size, layout.arena_size) != 0) {
@@ -794,62 +1770,17 @@ extern "C" int bind_callable_to_runtime_impl(
     // Set up orchestration state (consumed by the host orchestrator below)
     runtime->set_orch_args(device_args);
 
-    // -------------------------------------------------------------------------
-    // Build the prebuilt runtime-arena image on host.
-    //
-    // We pre-compute every byte the AICPU's runtime arena would otherwise have
-    // to write at boot: layout offsets, sub-structure init data, and pointers
-    // back to the SM / GM heap. Then we rtMemcpy the image into the pooled
-    // runtime-arena region that DeviceRunner keeps alive across runs. AICPU
-    // boot becomes attach + wire (cheap pointer fixup) + sm_handle->init (SM
-    // reset) + a handful of device-only field fixups.
-    // -------------------------------------------------------------------------
-    PTO2Runtime *rt =
-        runtime_init_data_from_layout(host_arena, layout, PTO2_MODE_EXECUTE, sm_ptr, sm_size, gm_heap, eff_heap_sizes);
-    if (rt == nullptr) {
-        LOG_ERROR("runtime_init_data_from_layout failed");
-        return -1;
-    }
-    runtime_wire_arena_pointers(host_arena, layout, rt);
-
-    // host_build_graph host-orch: run the orchestrator on the host now, against
-    // a host SM mirror, and ship the populated SM to the device. The arena
-    // (copied to the device below) carries the resulting orchestrator/scheduler
-    // state; the device boots scheduler-only. register_callable_impl guarantees
-    // host_orch_func_ptr is non-null on success (it fails the whole prepare
-    // otherwise), so this is an assertion-style guard, not a fallback path.
     if (host_orch_func_ptr == nullptr) {
         LOG_ERROR("host-orch: orchestration entry points were not resolved");
         return -1;
     }
-    {
-        L2TaskArgs orch_l2;
-        orch_l2.create_from_chip_args(device_args);
-        int32_t total_tasks = run_host_orchestration(
-            runtime, api, rt, host_arena, layout, sm_ptr, sm_size, runtime_arena_dev, gm_heap, eff_heap_sizes,
-            eff_task_window_sizes, host_orch_func_ptr, orch_l2
-        );
-        if (total_tasks < 0) {
-            LOG_ERROR("host-orch: orchestration run failed");
-            return -1;
-        }
-        runtime->host_total_tasks = total_tasks;
-        LOG_INFO_V0("host-orch: submitted %d tasks on host", total_tasks);
-    }
-
-    // Stash the layout inside the PTO2Runtime image so the AICPU can recover
-    // every arena-internal offset after rtMemcpy. The runtime arena's device
-    // base does NOT travel in this image — it's on the host Runtime
-    // (set_prebuilt_arena below), since the AICPU needs that pointer
-    // *before* it can dereference the image.
-    rt->prebuilt_layout = layout;
-
-    int rc_upload = api->copy_to_device(runtime_arena_dev, host_arena.base(), layout.arena_size);
-    if (rc_upload != 0) {
-        LOG_ERROR("Failed to rtMemcpy prebuilt runtime arena to device (rc=%d)", rc_upload);
+    if (!start_async_host_graph_pipeline(
+            runtime, api, layout, sm_ptr, sm_size, runtime_arena_dev, gm_heap, eff_heap_sizes, eff_task_window_sizes,
+            host_orch_func_ptr, device_args
+        )) {
+        LOG_ERROR("host-orch: failed to prepare the async whole-graph worker");
         return -1;
     }
-    runtime->set_prebuilt_arena(runtime_arena_dev, layout.off_runtime);
     int64_t t_prebuilt_end = _now_ms();
 
     LOG_INFO_V0("Device orchestration ready: %d tensors + %d scalars", tensor_count, scalar_count);
@@ -888,6 +1819,11 @@ extern "C" int validate_runtime_impl(Runtime *runtime, const HostApi *api, int e
     }
 
     int rc = 0;
+
+    if (join_async_host_graph_pipeline(runtime) != 0) {
+        LOG_ERROR("host-orch: async orchestration failed");
+        rc = -1;
+    }
 
     LOG_INFO_V0("=== Copying Results Back to Host ===");
 

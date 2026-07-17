@@ -12,19 +12,45 @@
 #include "scope.h"
 
 void Scope::scope_begin() {
-    if (depth() >= MAX_SCOPE_DEPTH) throw std::runtime_error("Scope: maximum nesting depth exceeded");
-    stack_.push_back(ScopeFrame{});
+    std::lock_guard<std::mutex> lk(mu_);
+    auto &stack = stacks_[std::this_thread::get_id()];
+    if (stack.size() >= static_cast<size_t>(MAX_SCOPE_DEPTH)) {
+        throw std::runtime_error("Scope: maximum nesting depth exceeded");
+    }
+    stack.push_back(ScopeFrame{});
 }
 
 void Scope::scope_end(const std::function<void(TaskSlot)> &release_fn) {
-    if (stack_.empty()) throw std::runtime_error("Scope: scope_end without scope_begin");
-    ScopeFrame &frame = stack_.back();
-    for (TaskSlot slot : frame.tasks)
+    ScopeFrame frame;
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        auto it = stacks_.find(std::this_thread::get_id());
+        if (it == stacks_.end() || it->second.empty()) {
+            throw std::runtime_error("Scope: scope_end without scope_begin");
+        }
+        frame = std::move(it->second.back());
+        it->second.pop_back();
+        if (it->second.empty()) stacks_.erase(it);
+    }
+    for (TaskSlot slot : frame.tasks) {
         release_fn(slot);
-    stack_.pop_back();
+    }
 }
 
 void Scope::register_task(TaskSlot slot) {
-    if (stack_.empty()) return;  // no open scope — task has no scope ref
-    stack_.back().tasks.push_back(slot);
+    std::lock_guard<std::mutex> lk(mu_);
+    auto it = stacks_.find(std::this_thread::get_id());
+    if (it == stacks_.end() || it->second.empty()) return;
+    it->second.back().tasks.push_back(slot);
+}
+
+int32_t Scope::depth() const {
+    std::lock_guard<std::mutex> lk(mu_);
+    auto it = stacks_.find(std::this_thread::get_id());
+    return it == stacks_.end() ? 0 : static_cast<int32_t>(it->second.size());
+}
+
+int32_t Scope::current_depth() const {
+    int32_t d = depth();
+    return d > 0 ? d - 1 : 0;
 }

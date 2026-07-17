@@ -60,6 +60,14 @@ extern "C" __attribute__((weak, visibility("hidden"))) int dep_gen_replay_emit_d
     return -1;
 }
 
+// host_build_graph overrides this hook to release its Host O worker only after
+// per-run profiling collectors are live. Other runtimes keep the no-op.
+extern "C" __attribute__((weak, visibility("hidden"))) int release_async_host_graph_pipeline(
+    Runtime * /*runtime*/
+) {
+    return 0;
+}
+
 // =============================================================================
 // Lazy-loaded HAL (ascend_hal) for halHostRegister / halHostUnregister
 // =============================================================================
@@ -426,6 +434,12 @@ int DeviceRunner::run(Runtime &runtime, const CallConfig &config) {
             core_types[i] = runtime.get_workers()[i].core_type;
         }
         l2_swimlane_collector_.set_core_types(core_types.data(), num_aicore);
+    }
+
+    rc = release_async_host_graph_pipeline(&runtime);
+    if (rc != 0) {
+        LOG_ERROR("release_async_host_graph_pipeline failed: %d", rc);
+        return rc;
     }
 
     // Launch the AICore worker BEFORE the AICPU Run task — mirrors the a5 path

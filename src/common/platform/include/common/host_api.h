@@ -28,10 +28,22 @@
  * the field set stays defined in exactly one place.
  */
 struct HostApi {
+    // Async Host orchestration must inherit both the runner TLS and the
+    // backend's per-thread device binding before using callbacks below.
+    void *(*capture_thread_context)();
+    int (*bind_thread_context)(void *context);
+    void (*unbind_thread_context)();
     void *(*device_malloc)(size_t size);
     void (*device_free)(void *dev_ptr);
     int (*copy_to_device)(void *dev_ptr, const void *host_ptr, size_t size);
     int (*copy_from_device)(void *host_ptr, const void *dev_ptr, size_t size);
+    // Publish and observe 64-bit device control words with release/acquire
+    // semantics. Onboard backends use synchronous device copies. Sim backends
+    // must use atomic operations because Host and Device are concurrent threads
+    // sharing one address space; a plain memcpy does not form a publication
+    // edge on weakly ordered hosts.
+    int (*store_u64_release_to_device)(void *dev_ptr, uint64_t value);
+    int (*load_u64_acquire_from_device)(uint64_t *value, const void *dev_ptr);
     // Map a device buffer into host address space and return a host-readable VA
     // (nullptr on failure); the paired unregister releases it. The returned VA
     // may differ from dev_ptr, so callers must use it, not dev_ptr, for host

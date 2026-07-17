@@ -57,6 +57,12 @@ extern "C" __attribute__((weak, visibility("hidden"))) int dep_gen_replay_emit_d
     return -1;
 }
 
+extern "C" __attribute__((weak, visibility("hidden"))) int release_async_host_graph_pipeline(
+    Runtime * /*runtime*/
+) {
+    return 0;
+}
+
 DeviceRunner::~DeviceRunner() { finalize(); }
 
 int DeviceRunner::ensure_binaries_loaded() {
@@ -472,6 +478,12 @@ int DeviceRunner::run(Runtime &runtime, const CallConfig &config) {
     }
     if (enable_scope_stats_) {
         scope_stats_collector_.start(thread_factory);
+    }
+
+    rc = release_async_host_graph_pipeline(&runtime);
+    if (rc != 0) {
+        LOG_ERROR("release_async_host_graph_pipeline failed: %d", rc);
+        return rc;
     }
 
     constexpr int over_launch = PLATFORM_MAX_AICPU_THREADS_JUST_FOR_LAUNCH;

@@ -156,6 +156,13 @@ _PY_CONTROL_TIMEOUT_S = 30.0
 _L3_L2_ENDPOINT_ERROR_REGION_RE = re.compile(r"\bL3-L2 endpoint error\b[^\n]*\bregion=(\d+)\b")
 
 
+class _ConcurrentRunBatch:
+    def __init__(self) -> None:
+        self.active = 0
+        self.done = threading.Event()
+        self.error: BaseException | None = None
+
+
 # ---------------------------------------------------------------------------
 # Unified mailbox layout (must match worker_manager.h MAILBOX_OFF_*)
 # ---------------------------------------------------------------------------
@@ -263,6 +270,7 @@ _CTRL_COMM_INIT = 9
 _CTRL_PY_REGISTER = 10
 _CTRL_PY_UNREGISTER = 11
 _CTRL_PY_IMPORT_REGISTER = 12
+_CTRL_L3_L2_ORCH_COMM_INIT = 13
 # Host-buffer registration. MAP_HOST maps a named host-buffer shm
 # into every local L3 child *post-fork* and keeps it mapped so later runs can copy
 # through it; UNMAP_HOST drops one. The child also records the parent VA range
@@ -511,6 +519,26 @@ def _rewrite_blob_host_addrs(buf: memoryview, blob_off: int, ranges: list[tuple[
             if parent_lo <= addr < parent_hi:
                 struct.pack_into("<Q", buf, addr_off, child_base + (addr - parent_lo))
                 break
+
+
+def _prepared_request_id_from_blob(buf: memoryview, blob_off: int) -> int | None:
+    """Return the prepared request id encoded immediately before the token trailer."""
+    from .request_session import (  # noqa: PLC0415
+        HOST_GRAPH_PREPARED_REQUEST_MAGIC,
+        HOST_GRAPH_TOKEN_STREAM_MAGIC_VERSION,
+        HOST_GRAPH_TOKEN_STREAM_TRAILER_SCALARS,
+    )
+
+    tensor_count, scalar_count = struct.unpack_from("<ii", buf, blob_off)
+    prepared_and_stream_scalars = 2 + HOST_GRAPH_TOKEN_STREAM_TRAILER_SCALARS
+    if tensor_count < 0 or scalar_count < prepared_and_stream_scalars:
+        return None
+    scalar_base = blob_off + _BLOB_HEADER_BYTES + tensor_count * _BLOB_TENSOR_STRIDE
+    marker_index = scalar_count - prepared_and_stream_scalars
+    marker, request_id, token_magic = struct.unpack_from("<QQQ", buf, scalar_base + marker_index * 8)
+    if marker != HOST_GRAPH_PREPARED_REQUEST_MAGIC or token_magic != HOST_GRAPH_TOKEN_STREAM_MAGIC_VERSION:
+        return None
+    return int(request_id)
 
 
 def _read_ctrl_staged_shm_name(buf: memoryview) -> str:
@@ -1230,6 +1258,126 @@ def _create_sim_l3_l2_region(
     return region, meta
 
 
+class _HostRequestAdmissionService:
+    def __init__(
+        self,
+        control_shm: SharedMemory,
+        cw: ChipWorker,
+        identity_table: dict[bytes, int],
+        host_buf_ranges: list[tuple[int, int, int]],
+    ) -> None:
+        from . import request_session as protocol  # noqa: PLC0415
+
+        self._protocol = protocol
+        self._control_shm = control_shm
+        self._cw = cw
+        self._identity_table = identity_table
+        self._host_buf_ranges = host_buf_ranges
+        buf = control_shm.buf
+        assert buf is not None
+        self._buf = buf
+        self._state_addr = _buffer_field_addr(self._buf, protocol.HOST_REQUEST_CONTROL_OFFSET)
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._loop, name="simpler-host-request-admission", daemon=True)
+
+    def start(self) -> None:
+        _mailbox_store_i32(self._state_addr, self._protocol._HOST_REQUEST_STATE_IDLE)
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        self._thread.join()
+        self._buf.release()
+
+    def _loop(self) -> None:
+        protocol = self._protocol
+        while not self._stop.is_set():
+            if _mailbox_load_i32(self._state_addr) != protocol._HOST_REQUEST_STATE_READY:
+                time.sleep(0.00005)
+                continue
+            _mailbox_store_i32(self._state_addr, protocol._HOST_REQUEST_STATE_RUNNING)
+            fields = protocol._HOST_REQUEST_HEADER.unpack_from(self._buf, protocol.HOST_REQUEST_CONTROL_OFFSET)
+            _state, cmd, request_id, _response_id, _status, arena_bank, config_size, blob_size, reserved = fields
+            status = 0
+            response_id = request_id
+            message = ""
+            try:
+                if reserved != 0:
+                    raise RuntimeError("Host request admission reserved field must be zero")
+                if cmd != protocol._HOST_REQUEST_CMD_PREPARE:
+                    raise RuntimeError(f"unknown Host request admission command {cmd}")
+                digest_start = protocol.HOST_REQUEST_CONTROL_OFFSET + protocol._HOST_REQUEST_DIGEST_OFFSET
+                digest = bytes(self._buf[digest_start : digest_start + protocol._HOST_REQUEST_DIGEST_BYTES])
+                cid = self._identity_table.get(digest)
+                if cid is None:
+                    raise RuntimeError(f"Host request callable hash {_format_digest(digest)} is not registered")
+                config_offset = protocol._HOST_REQUEST_PAYLOAD_OFFSET
+                args_offset = (config_offset + int(config_size) + 7) & ~7
+                if (
+                    config_size <= 0
+                    or blob_size <= 0
+                    or args_offset + int(blob_size) > protocol.HOST_REQUEST_CONTROL_BYTES
+                ):
+                    raise RuntimeError("Host request control payload is out of bounds")
+                absolute_blob_off = protocol.HOST_REQUEST_CONTROL_OFFSET + args_offset
+                if self._host_buf_ranges:
+                    _rewrite_blob_host_addrs(self._buf, absolute_blob_off, self._host_buf_ranges)
+                base_addr = _buffer_field_addr(self._buf, protocol.HOST_REQUEST_CONTROL_OFFSET)
+                self._cw._impl.prepare_from_request_blob(
+                    int(request_id),
+                    int(cid),
+                    base_addr + args_offset,
+                    int(blob_size),
+                    base_addr + config_offset,
+                    int(config_size),
+                    int(arena_bank),
+                )
+            except Exception as exc:  # noqa: BLE001
+                status = 1
+                response_id = 0
+                message = _format_exc("Host request admission", exc)
+
+            error_start = protocol.HOST_REQUEST_CONTROL_OFFSET + protocol._HOST_REQUEST_ERROR_OFFSET
+            encoded = message.encode("utf-8", "replace")[: protocol._HOST_REQUEST_ERROR_BYTES - 1]
+            self._buf[error_start : error_start + protocol._HOST_REQUEST_ERROR_BYTES] = b"\x00" * (
+                protocol._HOST_REQUEST_ERROR_BYTES
+            )
+            self._buf[error_start : error_start + len(encoded)] = encoded
+            protocol._HOST_REQUEST_HEADER.pack_into(
+                self._buf,
+                protocol.HOST_REQUEST_CONTROL_OFFSET,
+                protocol._HOST_REQUEST_STATE_RUNNING,
+                cmd,
+                request_id,
+                response_id,
+                status,
+                arena_bank,
+                config_size,
+                blob_size,
+                0,
+            )
+            _mailbox_store_i32(self._state_addr, protocol._HOST_REQUEST_STATE_DONE)
+
+
+def _handle_ctrl_l3_l2_orch_comm_init(cw: ChipWorker, buf: memoryview) -> SharedMemory:
+    control_shm_name = _read_shm_name(buf, _OFF_ARGS)
+    control_shm = SharedMemory(name=control_shm_name)
+    control_buf = control_shm.buf
+    assert control_buf is not None
+    exported = ctypes.c_char.from_buffer(control_buf)
+    success = False
+    try:
+        control_block_addr = ctypes.addressof(exported)
+        cw.l3_l2_orch_comm_init_from_addr(control_block_addr, control_shm.size)
+        success = True
+    finally:
+        del exported
+        del control_buf
+        if not success:
+            control_shm.close()
+    return control_shm
+
+
 def _create_onboard_l3_l2_region(
     cw: ChipWorker, request: L3L2RegionCreateRequest, region_id: int, counter_offset: int, total_bytes: int
 ) -> tuple[_L2HostL3L2Region, _L2HostL3L2RegionReplyMeta]:
@@ -1411,6 +1559,8 @@ def _run_chip_main_loop(  # noqa: PLR0912, PLR0913, PLR0915 -- unified TASK_READ
     """
     prepared = prepared if prepared is not None else set()
     l3_l2_region_store = _L2HostL3L2RegionStore()
+    l3_l2_control_shms: list[SharedMemory] = []
+    host_request_services: list[_HostRequestAdmissionService] = []
     # Post-fork host buffers mapped into this child. `host_buf_table`
     # owns the mmap per token (for unmap + teardown); `host_buf_ranges` is the
     # parent-VA → child-VA translation table the per-task blob rewrite consults,
@@ -1450,7 +1600,11 @@ def _run_chip_main_loop(  # noqa: PLR0912, PLR0913, PLR0915 -- unified TASK_READ
                     # it in Python is N×40B of avoidable work and a permanent
                     # opportunity to drop a field.  C++ reinterpret_cast<ChipStorageTaskArgs*>
                     # is the source of truth.
-                    cw._impl.run_from_blob(cid, mailbox_addr + _OFF_TASK_ARGS_BLOB, _MAILBOX_ARGS_CAPACITY, cfg)
+                    prepared_request_id = _prepared_request_id_from_blob(buf, _OFF_TASK_ARGS_BLOB)
+                    if prepared_request_id is None:
+                        cw._impl.run_from_blob(cid, mailbox_addr + _OFF_TASK_ARGS_BLOB, _MAILBOX_ARGS_CAPACITY, cfg)
+                    else:
+                        cw._impl.execute_prepared(prepared_request_id)
                 except Exception as e:  # noqa: BLE001
                     code = 1
                     msg = _format_exc(f"chip_process dev={device_id}", e)
@@ -1555,6 +1709,14 @@ def _run_chip_main_loop(  # noqa: PLR0912, PLR0913, PLR0915 -- unified TASK_READ
                         _handle_ctrl_release_domain(cw, buf)
                     elif sub_cmd == _CTRL_COMM_INIT:
                         _handle_ctrl_comm_init(cw, buf)
+                    elif sub_cmd == _CTRL_L3_L2_ORCH_COMM_INIT:
+                        control_shm = _handle_ctrl_l3_l2_orch_comm_init(cw, buf)
+                        admission_service = _HostRequestAdmissionService(
+                            control_shm, cw, identity_table, host_buf_ranges
+                        )
+                        admission_service.start()
+                        l3_l2_control_shms.append(control_shm)
+                        host_request_services.append(admission_service)
                     elif sub_cmd == _CTRL_MAP_HOST:
                         _handle_ctrl_map_host(buf, host_buf_table, host_buf_ranges)
                     elif sub_cmd == _CTRL_UNMAP_HOST:
@@ -1578,6 +1740,25 @@ def _run_chip_main_loop(  # noqa: PLR0912, PLR0913, PLR0915 -- unified TASK_READ
                 break
     finally:
         _sweep_l2_host_l3_l2_regions(l3_l2_region_store)
+        for service in reversed(host_request_services):
+            try:
+                service.stop()
+            except Exception:  # noqa: BLE001
+                pass
+        if l3_l2_control_shms:
+            try:
+                cw.l3_l2_orch_comm_shutdown()
+            except Exception as e:  # noqa: BLE001
+                sys.stderr.write(
+                    f"[chip_process pid={os.getpid()} dev={device_id}] "
+                    f"WARN: l3_l2_orch_comm_shutdown failed: {type(e).__name__}: {e}\n"
+                )
+                sys.stderr.flush()
+        for control_shm in reversed(l3_l2_control_shms):
+            try:
+                control_shm.close()
+            except Exception:  # noqa: BLE001
+                pass
         for host_shm, _lo, _hi, _base in host_buf_table.values():
             try:
                 host_shm.close()
@@ -1991,6 +2172,11 @@ class Worker:
         # fast (this worker does not cancel an in-progress init); any thread may
         # join an in-flight close().
         self._init_owner_thread: threading.Thread | None = None
+        self._request_session: Any | None = None
+        self._request_session_lock = threading.Lock()
+        self._run_cv = threading.Condition()
+        self._run_batch: _ConcurrentRunBatch | None = None
+        self._run_draining = False
 
         # Narrow lock around `_callable_registry` mutation so concurrent
         # register / unregister calls don't trip CPython's non-atomic
@@ -2084,6 +2270,10 @@ class Worker:
         # starts the C++ scheduler; no comm work happens there.
         self._comm_base_ready: bool = False
 
+        self._l3_l2_orch_comm_ready: set[int] = set()
+        self._l3_l2_orch_comm_shms: dict[int, SharedMemory] = {}
+        self._l3_l2_orch_comm_clients: dict[int, Any] = {}
+        self._host_request_admission_clients: dict[int, Any] = {}
         self._live_l3_l2_regions: list[Any] = []
         self._l3_l2_orch_comm_host_buffers: dict[int, int] = {}
 
@@ -4564,6 +4754,53 @@ class Worker:
         """
         return dict(self._live_domains)
 
+    def _make_l3_l2_orch_comm_client(self, shm: SharedMemory):
+        from .l3_l2_orch_comm import L3L2OrchCommClient  # noqa: PLC0415
+
+        return L3L2OrchCommClient(shm)
+
+    def _ensure_l3_l2_orch_comm(self, worker_id: int):
+        from .l3_l2_orch_comm import CONTROL_SHM_SIZE  # noqa: PLC0415
+
+        if self.level < 3:
+            raise RuntimeError("create_l3_l2_region requires a hierarchical Worker")
+        if self._worker is None:
+            raise RuntimeError("create_l3_l2_region requires Worker.init()")
+        device_ids = self._config.get("device_ids", [])
+        if worker_id < 0 or worker_id >= len(device_ids):
+            raise ValueError(f"create_l3_l2_region: worker_id {worker_id} outside [0, {len(device_ids)})")
+        if worker_id in self._l3_l2_orch_comm_ready:
+            return self._l3_l2_orch_comm_clients[worker_id]
+
+        chip_shm = self._chip_shms[worker_id]
+        assert chip_shm.buf is not None
+        state = _mailbox_load_i32(_buffer_field_addr(chip_shm.buf, _OFF_STATE))
+        if state != _IDLE:
+            raise RuntimeError(
+                f"create_l3_l2_region bootstrap failed: target worker {worker_id} is busy and "
+                "the L3-L2 service is not ready"
+            )
+
+        control_shm = SharedMemory(create=True, size=CONTROL_SHM_SIZE)
+        try:
+            client = self._make_l3_l2_orch_comm_client(control_shm)
+            self._worker.control_l3_l2_orch_comm_init(worker_id, control_shm.name)
+        except Exception:
+            try:
+                control_shm.close()
+                control_shm.unlink()
+            except Exception:  # noqa: BLE001
+                pass
+            raise
+
+        self._l3_l2_orch_comm_shms[worker_id] = control_shm
+        self._l3_l2_orch_comm_clients[worker_id] = client
+        from .request_session import HostRequestAdmissionClient  # noqa: PLC0415
+
+        self._host_request_admission_clients[worker_id] = HostRequestAdmissionClient(control_shm)
+        self._l3_l2_orch_comm_ready.add(worker_id)
+        return client
+
     def _validate_l3_l2_worker_id(self, worker_id: int) -> None:
         if self.level < 3:
             raise RuntimeError("create_l3_l2_region requires a hierarchical Worker")
@@ -4572,6 +4809,36 @@ class Worker:
         device_ids = self._config.get("device_ids", [])
         if worker_id < 0 or worker_id >= len(device_ids):
             raise ValueError(f"create_l3_l2_region: worker_id {worker_id} outside [0, {len(device_ids)})")
+
+    def _prepare_host_request(
+        self,
+        worker_id: int,
+        request_id: int,
+        callable_handle,
+        args,
+        config,
+        arena_bank: int,
+        timeout: float,
+    ) -> None:
+        from .task_interface import TaskArgs  # noqa: PLC0415
+
+        if not isinstance(args, TaskArgs):
+            raise TypeError("Host request preparation expects TaskArgs")
+        state = self._resolve_handle(callable_handle, expected_namespace="LOCAL_CHIP")
+        self._stage_host_buffers_for_chip_submit(args)
+        self._ensure_l3_l2_orch_comm(worker_id)
+        self._host_request_admission_clients[worker_id].prepare(
+            request_id,
+            state.digest,
+            args,
+            config,
+            arena_bank=arena_bank,
+            timeout=timeout,
+        )
+
+    def _l3_l2_orch_comm_submit(self, worker_id: int, request, timeout_s: float):
+        client = self._ensure_l3_l2_orch_comm(int(worker_id))
+        return client.submit(request, timeout_s)
 
     def _poison_l3_l2_region_from_endpoint_error(self, exc: BaseException) -> bool:
         match = _L3_L2_ENDPOINT_ERROR_REGION_RE.search(str(exc))
@@ -4729,7 +4996,17 @@ class Worker:
             except RuntimeError:
                 pass
         self._live_l3_l2_regions.clear()
+        self._l3_l2_orch_comm_clients.clear()
+        self._host_request_admission_clients.clear()
+        self._l3_l2_orch_comm_ready.clear()
         self._l3_l2_orch_comm_host_buffers.clear()
+        for shm in self._l3_l2_orch_comm_shms.values():
+            try:
+                shm.close()
+                shm.unlink()
+            except Exception:  # noqa: BLE001
+                pass
+        self._l3_l2_orch_comm_shms.clear()
 
     # ------------------------------------------------------------------
     # Dynamic CommDomain allocation (driven by Orchestrator.allocate_domain;
@@ -5614,6 +5891,59 @@ class Worker:
     # run — uniform entry point
     # ------------------------------------------------------------------
 
+    def _enter_concurrent_run(self) -> _ConcurrentRunBatch:
+        assert self._orch is not None
+        with self._run_cv:
+            while self._run_draining:
+                self._run_cv.wait()
+            batch = self._run_batch
+            if batch is None:
+                batch = _ConcurrentRunBatch()
+                self._run_batch = batch
+                self._orch._clear_error()
+            batch.active += 1
+            return batch
+
+    def _leave_concurrent_run(self, batch: _ConcurrentRunBatch) -> bool:
+        with self._run_cv:
+            if self._run_batch is not batch or batch.active <= 0:
+                raise RuntimeError("Worker concurrent run batch state is inconsistent")
+            batch.active -= 1
+            if batch.active != 0:
+                return False
+            self._run_batch = None
+            self._run_draining = True
+            return True
+
+    def _drain_concurrent_run_batch(self, batch: _ConcurrentRunBatch) -> None:
+        assert self._orch is not None
+        try:
+            try:
+                self._orch._drain()
+            except Exception as exc:
+                self._poison_l3_l2_region_from_endpoint_error(exc)
+                raise
+        except BaseException as exc:  # noqa: BLE001
+            batch.error = exc
+        finally:
+            try:
+                self._release_active_remote_slot_refs()
+                self._flush_pending_remote_frees()
+                try:
+                    self._cleanup_l3_l2_regions()
+                finally:
+                    self._l3_l2_orch_comm_host_buffers.clear()
+                self._execute_pending_domain_releases()
+                if self._live_domains:
+                    self._release_all_live_domains()
+            except BaseException as exc:  # noqa: BLE001
+                if batch.error is None:
+                    batch.error = exc
+            with self._run_cv:
+                self._run_draining = False
+                batch.done.set()
+                self._run_cv.notify_all()
+
     def run(self, callable, args=None, config=None) -> None:
         """Execute one task (L2) or one DAG (L3+) synchronously.
 
@@ -5638,6 +5968,10 @@ class Worker:
             self._run_locked(callable, args, config)
 
     def _run_locked(self, callable, args, config) -> None:
+        with self._request_session_lock:
+            request_session = self._request_session
+        if request_session is not None and not request_session._owns_current_thread():
+            raise RuntimeError("Worker.run is owned by an active RequestSession")
         cfg = config if config is not None else CallConfig()
 
         if self.level == 2:
@@ -5648,51 +5982,63 @@ class Worker:
 
         assert self._orch is not None
         assert self._worker is not None
-        # Drop any error stashed by a previous run() so this call starts
-        # clean. drain() rethrows on the way out; every successful run()
-        # leaves the error slot empty, but an unrelated caller may have
-        # poked it.
-        self._orch._clear_error()
-        self._orch._scope_begin()
+        batch = self._enter_concurrent_run()
+        own_error: BaseException | None = None
+        own_traceback = None
+        scope_open = False
         try:
+            self._orch._scope_begin()
+            scope_open = True
             callable(self._orch, args, cfg)
+        except BaseException as exc:  # noqa: BLE001
+            own_error = exc
+            own_traceback = exc.__traceback__
         finally:
-            # Always release scope refs and drain so ring slots aren't
-            # stranded when the orch fn raises mid-DAG. drain() also
-            # rethrows the first dispatch failure for this run — that
-            # is how child-task exceptions surface to the caller of
-            # Worker.run(). scope_end deliberately does NOT throw: if
-            # it did, released refs would be incomplete and drain
-            # would hang on in-flight tasks.
-            self._orch._scope_end()
-            # ORDER MATTERS: drain() must complete first so any in-flight
-            # task that captured a now-pending handle's device_ctx /
-            # buffer_ptrs sees live memory.  THEN execute the pending
-            # backend releases.  Last, sweep any handles that the orch
-            # function neither released nor passed out (covers exception
-            # unwind and "forgot to release" — auto-release in LIFO).
-            # drain() rethrows the first chip-task/dispatch failure, so the
-            # cleanup lives in a finally: a failed task must not strand
-            # backend domain allocations into the next run.
-            try:
+            if scope_open:
                 try:
-                    self._orch._drain()
-                except Exception as e:
-                    self._poison_l3_l2_region_from_endpoint_error(e)
-                    raise
-            finally:
-                self._release_active_remote_slot_refs()
-                self._flush_pending_remote_frees()
-                try:
-                    self._cleanup_l3_l2_regions()
-                finally:
-                    self._l3_l2_orch_comm_host_buffers.clear()
-                self._execute_pending_domain_releases()
-                if self._live_domains:
-                    self._release_all_live_domains()
+                    self._orch._scope_end()
+                except BaseException as exc:  # noqa: BLE001
+                    if own_error is None:
+                        own_error = exc
+                        own_traceback = exc.__traceback__
+            is_last = self._leave_concurrent_run(batch)
+            if is_last:
+                self._drain_concurrent_run_batch(batch)
+            else:
+                batch.done.wait()
+        if own_error is not None:
+            raise own_error.with_traceback(own_traceback)
+        if batch.error is not None:
+            raise batch.error
         # L3+ returns None like every other worker level; per-L2-child timing
         # is emitted as `[STRACE]` markers from each simpler_run.
         return None
+
+    def open_request_session(self, orchestration, *, max_pending: int = 8, max_active_runs: int = 1):
+        """Open a non-blocking request stream over this hierarchical Worker."""
+        if not self._initialized:
+            raise RuntimeError("Worker.open_request_session requires Worker.init()")
+        if self.level < 3:
+            raise RuntimeError("Worker.open_request_session requires a hierarchical Worker")
+        from .request_session import RequestSession  # noqa: PLC0415
+
+        with self._request_session_lock:
+            if self._request_session is not None:
+                raise RuntimeError("Worker already has an active RequestSession")
+            session = RequestSession(
+                self,
+                orchestration,
+                max_pending=int(max_pending),
+                max_active_runs=int(max_active_runs),
+            )
+            self._request_session = session
+            session._start()
+            return session
+
+    def _release_request_session(self, session) -> None:
+        with self._request_session_lock:
+            if self._request_session is session:
+                self._request_session = None
 
     @property
     def aicpu_dlopen_count(self) -> int:

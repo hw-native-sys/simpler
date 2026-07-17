@@ -17,7 +17,8 @@
  * scope_end() is called, that reference is released for every task in the scope,
  * allowing tasks that have no downstream consumers to reach CONSUMED.
  *
- * Orch-owned: single-threaded, no locking required.
+ * Frames are owned by the calling orchestration thread. Multiple concurrent
+ * Worker::run calls may open independent outer scopes on one Orchestrator.
  *
  * Mirrors L2 scope_begin / scope_end semantics.
  */
@@ -25,7 +26,10 @@
 #pragma once
 
 #include <functional>
+#include <mutex>
 #include <stdexcept>
+#include <thread>
+#include <unordered_map>
 #include <vector>
 
 #include "types.h"
@@ -44,7 +48,7 @@ public:
     void register_task(TaskSlot slot);
 
     // Current nesting depth (0 = no open scope).
-    int32_t depth() const { return static_cast<int32_t>(stack_.size()); }
+    int32_t depth() const;
 
     // L2-style 0-based scope index: the innermost open scope, or 0 when
     // none is open. Used by Ring::alloc to choose a heap ring:
@@ -54,14 +58,12 @@ public:
     // scope maps to ring 1, and so on. Returns 0 when no scope is open
     // so tasks submitted outside `Worker::run` still have a deterministic
     // ring assignment.
-    int32_t current_depth() const {
-        int32_t d = depth();
-        return d > 0 ? d - 1 : 0;
-    }
+    int32_t current_depth() const;
 
 private:
     struct ScopeFrame {
         std::vector<TaskSlot> tasks;
     };
-    std::vector<ScopeFrame> stack_;
+    mutable std::mutex mu_;
+    std::unordered_map<std::thread::id, std::vector<ScopeFrame>> stacks_;
 };

@@ -13,6 +13,9 @@
 #define SRC_COMMON_WORKER_CHIP_WORKER_H_
 
 #include <cstdint>
+#include <condition_variable>
+#include <memory>
+#include <mutex>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -73,6 +76,12 @@ public:
     // skip the view→storage memcpy and hand the pointer straight to the C ABI.
     // Used by the ChipStorageTaskArgs path in the nanobind binding.
     void run(int32_t callable_id, const ChipStorageTaskArgs *args, const CallConfig &config);
+
+    // Start Host-side request preparation in an isolated arena bank. The
+    // matching execute_prepared call remains the only path that launches S.
+    void
+    prepare(uint64_t request_id, int32_t callable_id, TaskArgsView args, const CallConfig &config, unsigned arena_bank);
+    void execute_prepared(uint64_t request_id);
 
     // Per-callable_id preparation. Requires init() first and a callable_id
     // in [0, MAX_REGISTERED_CALLABLE_IDS) (cap 64).
@@ -157,6 +166,8 @@ private:
     );
     using SimplerRegisterCallableFn = int (*)(void *, int32_t, const void *);
     using SimplerRunFn = int (*)(void *, void *, int32_t, const void *, const CallConfig *);
+    using SimplerPrepareRequestFn = int (*)(void *, void *, int32_t, const void *, const CallConfig *, unsigned);
+    using SimplerExecutePreparedFn = int (*)(void *, void *, const CallConfig *, unsigned);
     using SimplerUnregisterCallableFn = int (*)(void *, int32_t);
     using GetAicpuDlopenCountFn = size_t (*)(void *);
     using SimplerProvisionDmaWorkspaceFn = int (*)(void *, uint32_t);
@@ -203,6 +214,8 @@ private:
     SimplerInitFn simpler_init_fn_ = nullptr;
     SimplerRegisterCallableFn register_callable_fn_ = nullptr;
     SimplerRunFn run_fn_ = nullptr;
+    SimplerPrepareRequestFn prepare_request_fn_ = nullptr;
+    SimplerExecutePreparedFn execute_prepared_fn_ = nullptr;
     SimplerUnregisterCallableFn unregister_callable_fn_ = nullptr;
     GetAicpuDlopenCountFn get_aicpu_dlopen_count_fn_ = nullptr;
     GetAicpuDlopenCountFn get_host_dlopen_count_fn_ = nullptr;
@@ -226,11 +239,19 @@ private:
     uint64_t base_comm_handle_ = 0;
 
     std::vector<uint8_t> runtime_buf_;
-    // device_id_ is set once in init() and never modified afterward. All
-    // ChipWorker callers run on the thread that called init() (the same
-    // thread is the only one that subsequently calls malloc / copy_to /
-    // run / finalize), so plain `int` is sufficient — no cross-thread
-    // synchronization required.
+    struct PreparedRequestContext {
+        std::vector<uint8_t> runtime_buf;
+        CallConfig config;
+        unsigned arena_bank{0};
+    };
+    void acquire_arena_bank(unsigned arena_bank);
+    void release_arena_bank(unsigned arena_bank);
+    std::mutex prepared_mu_;
+    std::condition_variable prepared_cv_;
+    std::unordered_map<uint64_t, std::unique_ptr<PreparedRequestContext>> prepared_requests_;
+    bool prepared_bank_busy_[2]{false, false};
+    // device_id_ is immutable after init. Admission threads only read it, so
+    // the main execution thread remains its sole writer.
     int device_id_ = -1;
     bool initialized_ = false;
     bool finalized_ = false;

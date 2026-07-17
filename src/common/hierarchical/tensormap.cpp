@@ -12,16 +12,24 @@
 #include "tensormap.h"
 
 TaskSlot TensorMap::lookup(TensorKey key) const {
+    std::lock_guard<std::mutex> lk(mu_);
     auto it = map_.find(key);
     if (it == map_.end()) return INVALID_SLOT;
     return it->second;
 }
 
-void TensorMap::insert(TensorKey key, TaskSlot producer) { map_[key] = producer; }
+void TensorMap::insert(TensorKey key, TaskSlot producer) {
+    std::lock_guard<std::mutex> lk(mu_);
+    map_[key] = producer;
+}
 
 void TensorMap::erase_task_outputs(const std::vector<TensorKey> &keys) {
+    std::lock_guard<std::mutex> lk(mu_);
     for (const auto &key : keys)
         map_.erase(key);
 }
 
-int32_t TensorMap::size() const { return static_cast<int32_t>(map_.size()); }
+int32_t TensorMap::size() const {
+    std::lock_guard<std::mutex> lk(mu_);
+    return static_cast<int32_t>(map_.size());
+}

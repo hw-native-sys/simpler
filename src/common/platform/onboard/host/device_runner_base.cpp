@@ -27,6 +27,7 @@
 #include <runtime/rt.h>
 #include <acl/acl.h>
 #include <dlfcn.h>
+#include <pthread.h>
 
 #include <algorithm>
 #include <cassert>
@@ -118,12 +119,51 @@ HostRuntimeTimeoutConfig resolve_onboard_timeout_config() {
     return HostRuntimeTimeoutConfig{cfg.op_execute_timeout_us, cfg.stream_sync_timeout_ms, scheduler_override};
 }
 
+pthread_key_t g_arena_bank_key;
+pthread_once_t g_arena_bank_once = PTHREAD_ONCE_INIT;
+bool g_arena_bank_key_ready = false;
+
+void create_arena_bank_key() {
+    if (pthread_key_create(&g_arena_bank_key, nullptr) == 0) {
+        g_arena_bank_key_ready = true;
+    }
+}
+
+unsigned current_arena_bank() {
+    pthread_once(&g_arena_bank_once, create_arena_bank_key);
+    if (!g_arena_bank_key_ready) return 0;
+    return static_cast<unsigned>(reinterpret_cast<uintptr_t>(pthread_getspecific(g_arena_bank_key)));
+}
+
+__attribute__((destructor)) void destroy_arena_bank_key() {
+    if (g_arena_bank_key_ready) {
+        pthread_key_delete(g_arena_bank_key);
+        g_arena_bank_key_ready = false;
+    }
+}
+
 }  // namespace
 
 DeviceRunnerBase::DeviceRunnerBase() :
     gm_heap_arena_(&arena_alloc_trampoline, &arena_free_trampoline, &mem_alloc_),
     gm_sm_arena_(&arena_alloc_trampoline, &arena_free_trampoline, &mem_alloc_),
-    runtime_arena_pool_(&arena_alloc_trampoline, &arena_free_trampoline, &mem_alloc_) {}
+    runtime_arena_pool_(&arena_alloc_trampoline, &arena_free_trampoline, &mem_alloc_),
+    gm_heap_arena_bank1_(&arena_alloc_trampoline, &arena_free_trampoline, &mem_alloc_),
+    gm_sm_arena_bank1_(&arena_alloc_trampoline, &arena_free_trampoline, &mem_alloc_),
+    runtime_arena_pool_bank1_(&arena_alloc_trampoline, &arena_free_trampoline, &mem_alloc_) {}
+
+int DeviceRunnerBase::select_arena_bank(unsigned bank) {
+    if (bank > 1) {
+        LOG_ERROR("arena bank %u is outside [0, 2)", bank);
+        return -1;
+    }
+    pthread_once(&g_arena_bank_once, create_arena_bank_key);
+    if (!g_arena_bank_key_ready || pthread_setspecific(g_arena_bank_key, reinterpret_cast<void *>(bank)) != 0) {
+        LOG_ERROR("failed to select arena bank %u for the current thread", bank);
+        return -1;
+    }
+    return 0;
+}
 
 void *DeviceRunnerBase::allocate_tensor(std::size_t bytes) { return mem_alloc_.alloc(bytes); }
 
@@ -164,26 +204,30 @@ void DeviceRunnerBase::clear_temporary_buffer() {
 }
 
 void *DeviceRunnerBase::acquire_pooled_gm_heap() {
-    if (!gm_heap_arena_.is_committed()) return nullptr;
-    return gm_heap_arena_.base();
+    DeviceArena &arena = current_arena_bank() == 0 ? gm_heap_arena_ : gm_heap_arena_bank1_;
+    if (!arena.is_committed()) return nullptr;
+    return arena.base();
 }
 
 void *DeviceRunnerBase::acquire_pooled_gm_sm() {
-    if (!gm_sm_arena_.is_committed()) return nullptr;
-    return gm_sm_arena_.base();
+    DeviceArena &arena = current_arena_bank() == 0 ? gm_sm_arena_ : gm_sm_arena_bank1_;
+    if (!arena.is_committed()) return nullptr;
+    return arena.base();
 }
 
 void *DeviceRunnerBase::acquire_pooled_runtime_arena() {
     // hbg calls setup_static_arena(...,0) and leaves runtime_arena_pool_
     // uncommitted — fail loudly if a caller asks for it anyway.
-    if (!runtime_arena_pool_.is_committed()) return nullptr;
-    return runtime_arena_pool_.base();
+    DeviceArena &arena = current_arena_bank() == 0 ? runtime_arena_pool_ : runtime_arena_pool_bank1_;
+    if (!arena.is_committed()) return nullptr;
+    return arena.base();
 }
 
 bool DeviceRunnerBase::lookup_prebuilt_runtime_arena_cache(
     uint64_t hash, const void *key_data, size_t key_size, void **gm_heap_base, void **sm_base,
     void **runtime_arena_base, size_t *runtime_off, const void **image_data, size_t *image_size
 ) const {
+    if (current_arena_bank() != 0) return false;
     if (!prebuilt_runtime_arena_cache_valid_ || prebuilt_runtime_arena_cache_hash_ != hash ||
         prebuilt_runtime_arena_cache_key_.size() != key_size || key_data == nullptr || gm_heap_base == nullptr ||
         sm_base == nullptr || runtime_arena_base == nullptr || runtime_off == nullptr || image_data == nullptr ||
@@ -206,6 +250,7 @@ void DeviceRunnerBase::mark_prebuilt_runtime_arena_cached(
     uint64_t hash, const void *key_data, size_t key_size, void *gm_heap_base, void *sm_base, void *runtime_arena_base,
     size_t runtime_off, const void *image_data, size_t image_size
 ) {
+    if (current_arena_bank() != 0) return;
     prebuilt_runtime_arena_cache_valid_ = false;
     prebuilt_runtime_arena_cache_hash_ = hash;
     prebuilt_runtime_arena_cache_key_.assign(
@@ -232,6 +277,14 @@ int DeviceRunnerBase::setup_static_arena(size_t gm_heap_size, size_t gm_sm_size,
     // worker's lifetime). If a caller asks for a larger layout on any
     // region, redo just that region — already-committed peers stay alive
     // so their callers don't have to re-acquire.
+    const unsigned arena_bank = current_arena_bank();
+    DeviceArena &gm_heap_arena = arena_bank == 0 ? gm_heap_arena_ : gm_heap_arena_bank1_;
+    DeviceArena &gm_sm_arena = arena_bank == 0 ? gm_sm_arena_ : gm_sm_arena_bank1_;
+    DeviceArena &runtime_arena_pool = arena_bank == 0 ? runtime_arena_pool_ : runtime_arena_pool_bank1_;
+    size_t &cached_gm_heap_size = arena_bank == 0 ? cached_gm_heap_size_ : cached_gm_heap_size_bank1_;
+    size_t &cached_gm_sm_size = arena_bank == 0 ? cached_gm_sm_size_ : cached_gm_sm_size_bank1_;
+    size_t &cached_runtime_arena_size = arena_bank == 0 ? cached_runtime_arena_size_ : cached_runtime_arena_size_bank1_;
+
     bool arena_changed = false;
     auto commit_region = [&arena_changed](DeviceArena &arena, size_t &cached_size, size_t requested_size) -> int {
         if (requested_size == 0) {
@@ -269,25 +322,27 @@ int DeviceRunnerBase::setup_static_arena(size_t gm_heap_size, size_t gm_sm_size,
     // asking for a larger layout) fails midway, defeating the
     // "failure means failure" guarantee. Reset everything to the
     // post-construction state so the caller can retry with a new layout.
-    bool ok = commit_region(gm_heap_arena_, cached_gm_heap_size_, gm_heap_size) == 0;
-    ok = ok && commit_region(gm_sm_arena_, cached_gm_sm_size_, gm_sm_size) == 0;
-    ok = ok && commit_region(runtime_arena_pool_, cached_runtime_arena_size_, runtime_arena_size) == 0;
+    bool ok = commit_region(gm_heap_arena, cached_gm_heap_size, gm_heap_size) == 0;
+    ok = ok && commit_region(gm_sm_arena, cached_gm_sm_size, gm_sm_size) == 0;
+    ok = ok && commit_region(runtime_arena_pool, cached_runtime_arena_size, runtime_arena_size) == 0;
     if (!ok) {
-        gm_heap_arena_.release();
-        gm_sm_arena_.release();
-        runtime_arena_pool_.release();
-        cached_gm_heap_size_ = 0;
-        cached_gm_sm_size_ = 0;
-        cached_runtime_arena_size_ = 0;
-        prebuilt_runtime_arena_cache_valid_ = false;
-        prebuilt_runtime_arena_cache_key_.clear();
-        prebuilt_runtime_arena_cache_gm_heap_base_ = nullptr;
-        prebuilt_runtime_arena_cache_sm_base_ = nullptr;
-        prebuilt_runtime_arena_cache_runtime_arena_base_ = nullptr;
-        prebuilt_runtime_arena_cache_image_.clear();
+        gm_heap_arena.release();
+        gm_sm_arena.release();
+        runtime_arena_pool.release();
+        cached_gm_heap_size = 0;
+        cached_gm_sm_size = 0;
+        cached_runtime_arena_size = 0;
+        if (arena_bank == 0) {
+            prebuilt_runtime_arena_cache_valid_ = false;
+            prebuilt_runtime_arena_cache_key_.clear();
+            prebuilt_runtime_arena_cache_gm_heap_base_ = nullptr;
+            prebuilt_runtime_arena_cache_sm_base_ = nullptr;
+            prebuilt_runtime_arena_cache_runtime_arena_base_ = nullptr;
+            prebuilt_runtime_arena_cache_image_.clear();
+        }
         return -1;
     }
-    if (arena_changed) {
+    if (arena_changed && arena_bank == 0) {
         prebuilt_runtime_arena_cache_valid_ = false;
         prebuilt_runtime_arena_cache_key_.clear();
         prebuilt_runtime_arena_cache_gm_heap_base_ = nullptr;
@@ -1077,6 +1132,9 @@ int DeviceRunnerBase::finalize_common() {
     gm_heap_arena_.release();
     gm_sm_arena_.release();
     runtime_arena_pool_.release();
+    gm_heap_arena_bank1_.release();
+    gm_sm_arena_bank1_.release();
+    runtime_arena_pool_bank1_.release();
     prebuilt_runtime_arena_cache_valid_ = false;
     prebuilt_runtime_arena_cache_key_.clear();
     prebuilt_runtime_arena_cache_gm_heap_base_ = nullptr;
@@ -1104,6 +1162,9 @@ int DeviceRunnerBase::finalize_common() {
     cached_gm_heap_size_ = 0;
     cached_gm_sm_size_ = 0;
     cached_runtime_arena_size_ = 0;
+    cached_gm_heap_size_bank1_ = 0;
+    cached_gm_sm_size_bank1_ = 0;
+    cached_runtime_arena_size_bank1_ = 0;
     return rc;
 }
 

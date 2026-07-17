@@ -876,6 +876,22 @@ NB_MODULE(_task_interface, m) {
         .def("tensor_count", &TaskArgs::tensor_count)
         .def("scalar_count", &TaskArgs::scalar_count)
 
+        .def(
+            "_write_blob",
+            [](const TaskArgs &self, uint64_t dst_ptr, size_t capacity) {
+                const size_t needed = task_args_blob_size(self);
+                if (dst_ptr == 0 || needed > capacity) {
+                    throw std::runtime_error(
+                        "TaskArgs._write_blob: need " + std::to_string(needed) + ", capacity " +
+                        std::to_string(capacity)
+                    );
+                }
+                write_blob(reinterpret_cast<uint8_t *>(dst_ptr), self);
+                return needed;
+            },
+            nb::arg("dst_ptr"), nb::arg("capacity"), "Serialize this TaskArgs into caller-owned shared memory."
+        )
+
         .def("clear", &TaskArgs::clear)
 
         .def(
@@ -1235,6 +1251,23 @@ NB_MODULE(_task_interface, m) {
     // --- CallConfig ---
     nb::class_<CallConfig>(m, "CallConfig")
         .def(nb::init<>())
+        .def_prop_ro_static(
+            "_blob_size",
+            [](nb::handle) {
+                return sizeof(CallConfig);
+            }
+        )
+        .def(
+            "_write_blob",
+            [](const CallConfig &self, uint64_t dst_ptr, size_t capacity) {
+                if (dst_ptr == 0 || capacity < sizeof(CallConfig)) {
+                    throw std::runtime_error("CallConfig._write_blob: destination is null or too small");
+                }
+                std::memcpy(reinterpret_cast<void *>(dst_ptr), &self, sizeof(CallConfig));
+                return sizeof(CallConfig);
+            },
+            nb::arg("dst_ptr"), nb::arg("capacity"), "Serialize the CallConfig POD into shared memory."
+        )
         .def_rw("block_dim", &CallConfig::block_dim)
         .def_rw("aicpu_thread_num", &CallConfig::aicpu_thread_num)
         // runtime_env returns an internal reference so `cfg.runtime_env.ring_heap = X`
@@ -1435,10 +1468,44 @@ NB_MODULE(_task_interface, m) {
                 self.run(callable_id, view, config);
             },
             nb::arg("callable_id"), nb::arg("args_blob_ptr"), nb::arg("blob_capacity"), nb::arg("config"),
+            nb::call_guard<nb::gil_scoped_release>(),
             "Launch a callable_id from a raw mailbox-blob pointer + capacity "
             "(used by chip-child mailbox loops to avoid Python-side re-deserialisation "
             "of the per-task tensor/scalar layout). The blob must be in the format "
             "produced by `write_blob`; read_blob enforces capacity bounds against shm corruption."
+        )
+        .def(
+            "prepare_from_blob",
+            [](ChipWorker &self, uint64_t request_id, int32_t callable_id, uint64_t args_blob_ptr, size_t blob_capacity,
+               const CallConfig &config, unsigned arena_bank) {
+                TaskArgsView view = read_blob(reinterpret_cast<const uint8_t *>(args_blob_ptr), blob_capacity);
+                self.prepare(request_id, callable_id, view, config, arena_bank);
+            },
+            nb::arg("request_id"), nb::arg("callable_id"), nb::arg("args_blob_ptr"), nb::arg("blob_capacity"),
+            nb::arg("config"), nb::arg("arena_bank"), nb::call_guard<nb::gil_scoped_release>(),
+            "Bind a request and start Host work without launching Device execution."
+        )
+        .def(
+            "prepare_from_request_blob",
+            [](ChipWorker &self, uint64_t request_id, int32_t callable_id, uint64_t args_blob_ptr,
+               size_t args_blob_capacity, uint64_t config_blob_ptr, size_t config_blob_size, unsigned arena_bank) {
+                if (config_blob_ptr == 0 || config_blob_size != sizeof(CallConfig)) {
+                    throw std::runtime_error("prepare_from_request_blob: invalid CallConfig blob size");
+                }
+                CallConfig config;
+                std::memcpy(&config, reinterpret_cast<const void *>(config_blob_ptr), sizeof(config));
+                TaskArgsView view = read_blob(reinterpret_cast<const uint8_t *>(args_blob_ptr), args_blob_capacity);
+                self.prepare(request_id, callable_id, view, config, arena_bank);
+            },
+            nb::arg("request_id"), nb::arg("callable_id"), nb::arg("args_blob_ptr"), nb::arg("args_blob_capacity"),
+            nb::arg("config_blob_ptr"), nb::arg("config_blob_size"), nb::arg("arena_bank"),
+            nb::call_guard<nb::gil_scoped_release>(),
+            "Prepare a request from TaskArgs and CallConfig PODs stored in shared memory."
+        )
+        .def(
+            "execute_prepared", &ChipWorker::execute_prepared, nb::arg("request_id"),
+            nb::call_guard<nb::gil_scoped_release>(),
+            "Launch Device execution for a request previously prepared from the admission lane."
         )
         .def(
             "unregister_callable",

@@ -100,6 +100,14 @@ public:
     // step belongs to the orchestrator lifecycle, not the scheduler.
     void on_orchestration_done(Runtime *runtime, PTO2Runtime *rt, int32_t thread_idx, int32_t total_tasks);
 
+    // Publish one Host-built epoch while scheduler threads are already live.
+    // `inline_completed` is the count within this epoch only; `final_epoch`
+    // latches the global completion condition after the last range arrives.
+    void on_host_graph_published(
+        Runtime *runtime, PTO2Runtime *rt, int32_t thread_idx, int32_t total_tasks, int32_t inline_completed,
+        bool final_epoch
+    );
+
     // Bind the PTO2Runtime scheduler pointer.
     void bind_runtime(PTO2Runtime *rt);
 
@@ -149,7 +157,8 @@ private:
 
     // --- Task-execution tracking ---
     std::atomic<int32_t> completed_tasks_{0};
-    int32_t total_tasks_{0};
+    std::atomic<int32_t> total_tasks_{0};
+    std::atomic<bool> orchestration_done_{false};
     std::atomic<bool> completed_{false};
     uint64_t *func_id_to_addr_{nullptr};
 

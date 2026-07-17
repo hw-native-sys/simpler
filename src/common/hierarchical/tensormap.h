@@ -23,11 +23,13 @@
  *   - Does not perform overlap detection (each key maps to one producer)
  *   - Cleans up entries actively when a task is CONSUMED
  *
- * Owned exclusively by the Orchestrator (main thread); no locking required.
+ * Concurrent orchestration threads may submit while the scheduler consumes
+ * completed tasks, so every map operation is internally synchronized.
  */
 
 #pragma once
 
+#include <mutex>
 #include <unordered_map>
 #include <vector>
 
@@ -51,5 +53,6 @@ public:
     int32_t size() const;
 
 private:
+    mutable std::mutex mu_;
     std::unordered_map<TensorKey, TaskSlot, TensorKeyHash> map_;
 };

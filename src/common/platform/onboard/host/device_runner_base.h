@@ -134,6 +134,9 @@ public:
      */
     int setup_static_arena(size_t gm_heap_size, size_t gm_sm_size, size_t runtime_arena_size);
 
+    /** Select the pooled-arena bank used by HostApi calls on this thread. */
+    int select_arena_bank(unsigned bank);
+
     /**
      * Return the pooled GM heap / PTO2 SM / runtime arena base pointer.
      * `setup_static_arena` (arch subclass) must have already committed
@@ -878,6 +881,9 @@ protected:
     DeviceArena gm_heap_arena_;
     DeviceArena gm_sm_arena_;
     DeviceArena runtime_arena_pool_;
+    DeviceArena gm_heap_arena_bank1_;
+    DeviceArena gm_sm_arena_bank1_;
+    DeviceArena runtime_arena_pool_bank1_;
 
     // Cached arena sizes for `setup_static_arena`'s "fits" check — avoids
     // re-allocating the same buffer when a later worker init asks for an
@@ -886,6 +892,9 @@ protected:
     size_t cached_gm_heap_size_{0};
     size_t cached_gm_sm_size_{0};
     size_t cached_runtime_arena_size_{0};
+    size_t cached_gm_heap_size_bank1_{0};
+    size_t cached_gm_sm_size_bank1_{0};
+    size_t cached_runtime_arena_size_bank1_{0};
     bool prebuilt_runtime_arena_cache_valid_{false};
     uint64_t prebuilt_runtime_arena_cache_hash_{0};
     std::vector<uint8_t> prebuilt_runtime_arena_cache_key_;

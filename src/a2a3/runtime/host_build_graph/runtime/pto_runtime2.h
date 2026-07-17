@@ -65,6 +65,7 @@ enum PTO2RuntimeMode {
  * dependencies on runtime .cpp files.
  */
 typedef struct PTO2Runtime PTO2Runtime;  // forward declare for ops signatures
+using PTO2GraphBoundaryCallback = bool (*)(PTO2Runtime *rt, bool final_epoch, void *context);
 
 struct PTO2RuntimeOps {
     TaskOutputTensors (*submit_task)(PTO2Runtime *rt, const MixedKernels &mixed_kernels, const L0TaskArgs &args);
@@ -93,6 +94,7 @@ struct PTO2RuntimeOps {
     // collector. Always present in the struct to keep ops-table layout stable
     // across SIMPLER_DFX settings; set to nullptr at SIMPLER_DFX=0.
     void (*scope_set_site)(const char *file, int line);
+    void (*graph_boundary)(PTO2Runtime *rt, bool final_epoch);
 };
 
 /**
@@ -145,6 +147,11 @@ struct PTO2Runtime {
 
     // Statistics
     int64_t total_cycles;
+
+    // Host-only synchronous capture hook. The host clears both fields before
+    // the runtime-arena image is copied to the device.
+    PTO2GraphBoundaryCallback graph_boundary_callback;
+    void *graph_boundary_context;
 
     // Prebuilt-arena fast path metadata. Carries every offset
     // wire_arena_pointers needs at AICPU boot so the AICPU can reconstruct
@@ -231,6 +238,8 @@ void runtime_destroy(PTO2Runtime *rt, DeviceArena &arena);
  */
 void runtime_set_mode(PTO2Runtime *rt, PTO2RuntimeMode mode);
 
+void runtime_set_graph_boundary_callback(PTO2Runtime *rt, PTO2GraphBoundaryCallback callback, void *context);
+
 // =============================================================================
 // Orchestration API (called by orchestration function)
 // =============================================================================
@@ -258,6 +267,8 @@ void rt_scope_end(PTO2Runtime *rt);
  * Signals that no more tasks will be submitted.
  */
 void rt_orchestration_done(PTO2Runtime *rt);
+
+void rt_graph_boundary(PTO2Runtime *rt, bool final_epoch = false);
 
 /**
  * Enter fatal state explicitly from orchestration.

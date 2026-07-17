@@ -1313,7 +1313,9 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
             }
 
             if (idle_iterations % STALL_LOG_INTERVAL == 0) {
-                log_stall_diagnostics(thread_idx, total_tasks_, idle_iterations, last_progress_count);
+                log_stall_diagnostics(
+                    thread_idx, total_tasks_.load(std::memory_order_relaxed), idle_iterations, last_progress_count
+                );
             }
             // Wall-clock budget gate, with two fatal-latch branches:
             //
@@ -1333,8 +1335,9 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
             // observability is preserved.
             if (get_sys_cnt_aicpu() - last_progress_ts > scheduler_timeout_cycles) {
                 bool self_owns = self_owns_running_task(thread_idx);
-                bool global_stuck = !self_owns && total_tasks_ > 0 &&
-                                    completed_tasks_.load(std::memory_order_relaxed) < total_tasks_ &&
+                int32_t published_tasks = total_tasks_.load(std::memory_order_relaxed);
+                bool global_stuck = !self_owns && published_tasks > 0 &&
+                                    completed_tasks_.load(std::memory_order_relaxed) < published_tasks &&
                                     no_thread_owns_running_task();
                 if (self_owns || global_stuck) {
                     // Latch the error + emergency_shutdown, then break to the
