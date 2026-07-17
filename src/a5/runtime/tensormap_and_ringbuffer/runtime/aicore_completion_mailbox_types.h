@@ -35,6 +35,7 @@ inline constexpr int32_t MAX_COMPLETIONS_PER_TASK = 64;
 
 #define COMPLETION_TYPE_COUNTER 0
 #define COMPLETION_TYPE_SDMA_EVENT_RECORD 1
+#define COMPLETION_TYPE_URMA_EVENT_HANDLE 2
 
 // DeferredCompletionEntry / DeferredCompletionSlab back the per-task scratch
 // area that AICore writes into to record "this completion has to be observed
@@ -45,13 +46,14 @@ inline constexpr int32_t MAX_COMPLETIONS_PER_TASK = 64;
 // pin the compiler against caching / reordering on either side.
 struct DeferredCompletionEntry {
     uint64_t addr;
+    uint64_t backend_cookie;
     uint32_t expected_value;
     uint32_t engine;
     int32_t completion_type;
     uint32_t _pad;
 };
 
-static_assert(sizeof(DeferredCompletionEntry) == 24, "DeferredCompletionEntry layout drift");
+static_assert(sizeof(DeferredCompletionEntry) == 32, "DeferredCompletionEntry layout drift");
 
 struct alignas(PTO2_ALIGN_SIZE) DeferredCompletionSlab {
     volatile uint32_t count;
