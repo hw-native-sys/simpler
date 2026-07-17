@@ -499,6 +499,11 @@ Scheduler View independently chooses the earliest visible AICPU slice by
 `dispatch_time_us`. Equal start times are resolved by the smaller `core_id`.
 The two views can therefore select different physical subtask records. Within
 each view, dependency and `complete` arrows use that view's selected anchor.
+Dependency flows connect the visual starts of the selected source and
+destination bars. The source completion timestamp still determines whether
+the flow is named `dependency` or `hb_violation`; it does not become the flow
+start because a completion later than the destination bar start would create
+a reverse-time flow that Perfetto cannot display.
 
 The grouping includes both the function identity and the logical `task_id`
 (ring/local id), so MIX tasks that share a `task_id` across AIC/AIV functions

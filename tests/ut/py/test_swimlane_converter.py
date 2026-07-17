@@ -182,10 +182,11 @@ def test_spmd_pred_routes_dependency_to_earliest_slice(tmp_path):
     assert flow[0]["output_task_count"] == 4
     assert flow[0]["input_task_count"] == 1
     assert flow[0]["tid"] == _core_tid(0)
+    assert flow[0]["ts"] == tasks[0]["receive_time_us"]
     sched_flow = _first_scheduler_dependency_flow(out)
     assert sched_flow[0]["output_task_count"] == 4
     assert sched_flow[0]["input_task_count"] == 1
-    assert sched_flow[0]["ts"] == tasks[0]["finish_time_us"] - 0.01
+    assert sched_flow[0]["ts"] == tasks[0]["dispatch_time_us"]
     assert sched_flow[1]["ts"] == tasks[4]["dispatch_time_us"]
 
 
@@ -211,6 +212,25 @@ def test_spmd_succ_routes_dependency_to_earliest_slice(tmp_path):
     assert worker_flow[1]["ts"] == 0.0
     assert scheduler_flow[1]["tid"] == _aicpu_tid(33)
     assert scheduler_flow[1]["ts"] == 0.1
+
+
+def test_hb_violation_flows_render_between_bar_starts(tmp_path):
+    pred_id = 100
+    succ_id = 200
+    tasks = [
+        _task_row(pred_id, 0, dispatch=10.0, start=11.0, end=20.0, receive=10.5),
+        _task_row(succ_id, 1, dispatch=15.0, start=22.0, end=30.0, receive=19.0),
+    ]
+
+    out = _generate_trace(tasks, {pred_id: [succ_id]}, {pred_id: 1, succ_id: 1}, tmp_path)
+
+    worker_flow = _first_worker_dependency_flow(out)
+    assert [event["name"] for event in worker_flow] == ["hb_violation", "hb_violation"]
+    assert [event["ts"] for event in worker_flow] == [10.5, 19.0]
+
+    scheduler_flow = _first_scheduler_dependency_flow(out)
+    assert [event["name"] for event in scheduler_flow] == ["hb_violation", "hb_violation"]
+    assert [event["ts"] for event in scheduler_flow] == [10.0, 15.0]
 
 
 def test_spmd_to_spmd_one_edge_on_earliest_slice(tmp_path):

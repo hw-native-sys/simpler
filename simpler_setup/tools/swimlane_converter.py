@@ -1389,7 +1389,6 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
     hb_violation_count = 0
     deps_flow_count = 0
     edges_by_pred = deps_edges or {}
-    flow_epsilon = 0.01
 
     # AICPU Scheduler phase events (l2_swimlane_level >= 3)
     if scheduler_phases:
@@ -1856,9 +1855,10 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
             output_task_count = _dependency_task_fan_count(pred_id, spmd_task_ids, task_map, deps_block_map)
             input_task_count = _dependency_task_fan_count(succ_id, spmd_task_ids, task_map, deps_block_map)
             for pred_row, succ_row in row_pairs:
-                src_ts_end = pred_row["end_time_us"] - flow_epsilon
+                src_bar_start_us = _task_slice_start_us(pred_row)
+                src_end_us = pred_row["end_time_us"]
                 dst_ts_start = _task_slice_start_us(succ_row)
-                hb_violated = (src_ts_end + flow_epsilon) > dst_ts_start
+                hb_violated = src_end_us > dst_ts_start
                 flow_name = "hb_violation" if hb_violated else "dependency"
                 if hb_violated:
                     hb_violation_count += 1
@@ -1870,7 +1870,7 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
                     flow_name,
                     4,
                     src_tid,
-                    src_ts_end,
+                    src_bar_start_us,
                     src_event_id,
                     4,
                     dst_tid,
@@ -1918,15 +1918,15 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
                 output_task_count = _dependency_task_fan_count(pred_id, spmd_task_ids, task_map, deps_block_map)
                 input_task_count = _dependency_task_fan_count(succ_id, spmd_task_ids, task_map, deps_block_map)
                 for pred_row, succ_row in row_pairs:
+                    src_dispatch_us = pred_row.get("dispatch_time_us", 0)
                     src_finish_us = pred_row.get("finish_time_us", 0)
                     dst_dispatch_us = succ_row.get("dispatch_time_us", 0)
                     dst_finish_us = succ_row.get("finish_time_us", 0)
                     # Skip when AICPU timestamps are missing or zero (matches Scheduler
                     # View bar emission, which rejects finish_us <= 0).
-                    if src_finish_us <= 0 or dst_dispatch_us < 0 or dst_finish_us <= 0:
+                    if src_dispatch_us < 0 or src_finish_us <= 0 or dst_dispatch_us < 0 or dst_finish_us <= 0:
                         continue
-                    src_ts = src_finish_us - flow_epsilon
-                    aicpu_hb_violated = (src_ts + flow_epsilon) > dst_dispatch_us
+                    aicpu_hb_violated = src_finish_us > dst_dispatch_us
                     aicpu_flow_name = "hb_violation" if aicpu_hb_violated else "dependency"
                     _append_dependency_flow_pair(
                         events,
@@ -1936,7 +1936,7 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
                         task_to_aicpu_tid.get(
                             (pred_row["task_id"], pred_row["core_id"]), core_to_tid[pred_row["core_id"]]
                         ),
-                        src_ts,
+                        src_dispatch_us,
                         task_to_aicpu_event_id.get((pred_row["task_id"], pred_row["core_id"])),
                         3,
                         task_to_aicpu_tid.get(

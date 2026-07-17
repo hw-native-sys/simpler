@@ -311,7 +311,9 @@ carries `fanout[]`, so there is no longer a `fanout ⊆ deps` cross-check —
 of flow events in the Perfetto trace, and flags any edge whose
 `pred.end_time > succ.start_time` as `hb_violation` (rendered as a
 distinct flow event name so Perfetto colors it apart from regular
-dependencies).
+dependencies). Dependency flows connect the source and destination
+bar starts; the completion timestamps are used only for the
+`hb_violation` classification, not for flow geometry.
 
 ---
 
