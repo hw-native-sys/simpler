@@ -42,11 +42,6 @@ class WaitCmp(IntEnum):
     LE = 5
 
 
-class _ServiceError(IntEnum):
-    COPY_FAILED = 6
-    SIGNAL_TIMEOUT = 7
-
-
 class L3L2RegionAccessProfile(IntEnum):
     INVALID = 0
     ONBOARD_VMM = 1
@@ -55,10 +50,15 @@ class L3L2RegionAccessProfile(IntEnum):
 
 _MAX_SIGNED_CHRONO_TIMEOUT_NS = 2**63 - 1
 
+# Wire values returned by _l3_host_mapped_counter_wait in _task_interface; must
+# match kWaitStatusTimeout / kWaitErrorSignalTimeout in task_interface.cpp.
+_WAIT_STATUS_TIMEOUT = -1
+_WAIT_ERROR_SIGNAL_TIMEOUT = 7
+
 _DESC = struct.Struct("<6Q")
 _L3L2_ORCH_REGION_DESC_SCALAR_COUNT = 6
 _CTRL_SHM_TOKEN_BYTES = 32
-_REGION_CREATE_REQUEST = struct.Struct("<QQQQi4x")
+_REGION_CREATE_REQUEST = struct.Struct("<QQQQ")
 _REGION_CREATE_REPLY = struct.Struct(f"<6QIIi{_CTRL_SHM_TOKEN_BYTES}s4xQQ")
 _REGION_CREATE_REQUEST_BYTES = _REGION_CREATE_REQUEST.size
 _REGION_CREATE_REPLY_BYTES = _REGION_CREATE_REPLY.size
@@ -118,7 +118,6 @@ class L3L2RegionCreateRequest:
     request_bytes: int
     payload_bytes: int
     counter_bytes: int
-    l3_host_pid: int
 
     def encode_into(self, buf: memoryview, offset: int = 0) -> None:
         _REGION_CREATE_REQUEST.pack_into(
@@ -128,7 +127,6 @@ class L3L2RegionCreateRequest:
             int(self.request_bytes),
             int(self.payload_bytes),
             int(self.counter_bytes),
-            int(self.l3_host_pid),
         )
 
 
@@ -178,10 +176,6 @@ def decode_region_create_reply(buf: memoryview) -> L3L2RegionCreateReply:
         mapping_bytes=int(fields[10]),
         shareable_handle=int(fields[11]),
     )
-
-
-def peek_region_create_reply_region_id(buf: memoryview) -> int:
-    return int(_REGION_CREATE_REPLY.unpack_from(buf, 0)[1])
 
 
 def validate_region_create_reply(
@@ -249,7 +243,7 @@ class _PinnedBuffer:
         self.addr = ctypes.addressof(exported)
 
     def close(self) -> None:
-        return None
+        self._keepalive = None
 
     def __enter__(self) -> _PinnedBuffer:
         return self
@@ -314,6 +308,13 @@ class L3L2OrchRegion:
     @property
     def region_id(self) -> int:
         return int(self._descriptor.region_id)
+
+    @property
+    def expired(self) -> bool:
+        return self._expired
+
+    def _validate_host_buffer(self, buffer: Any) -> None:
+        self._owner._validate_l3_l2_orch_comm_host_buffer(buffer)
 
     def descriptor_scalars(self) -> list[int]:
         self._ensure_live()
@@ -420,7 +421,6 @@ class L3L2OrchRegion:
         if int(status) == 0:
             return int(observed)
         msg = str(message) if message else "L3-L2 counter wait timed out"
-        if int(error_kind) == int(_ServiceError.SIGNAL_TIMEOUT):
+        if int(status) == _WAIT_STATUS_TIMEOUT and int(error_kind) == _WAIT_ERROR_SIGNAL_TIMEOUT:
             raise TimeoutError(f"{msg}; observed={int(observed)}")
-        self._poison()
-        raise RuntimeError(f"{msg}; observed={int(observed)}")
+        raise AssertionError(f"unexpected L3-L2 counter wait result status={int(status)} error_kind={int(error_kind)}")

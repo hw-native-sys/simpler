@@ -32,7 +32,6 @@ struct L3L2RegionCreateRequest {
     uint64_t request_bytes;
     uint64_t payload_bytes;
     uint64_t counter_bytes;
-    int32_t l3_host_pid;
 };
 
 struct L3L2RegionCreateReply {

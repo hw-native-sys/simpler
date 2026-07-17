@@ -221,7 +221,7 @@ TEST(L3L2OrchCommTest, LifecycleCreateWireStructsHaveFixedLayout) {
 
     EXPECT_EQ(offsetof(L3L2RegionCreateRequest, magic_version), 0u);
     EXPECT_EQ(offsetof(L3L2RegionCreateRequest, payload_bytes), sizeof(uint64_t) * 2);
-    EXPECT_EQ(sizeof(L3L2RegionCreateRequest), 40u);
+    EXPECT_EQ(sizeof(L3L2RegionCreateRequest), 32u);
     EXPECT_EQ(offsetof(L3L2RegionCreateReply, desc), 0u);
     EXPECT_EQ(offsetof(L3L2RegionCreateReply, access_profile), sizeof(uint64_t) * 6);
     EXPECT_EQ(offsetof(L3L2RegionCreateReply, device_id), sizeof(uint64_t) * 6 + sizeof(uint32_t) * 2);

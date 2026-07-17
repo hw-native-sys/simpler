@@ -397,7 +397,6 @@ def test_onboard_region_create_handler_uses_named_export_fields(monkeypatch):
             request_bytes=l3_l2_orch_comm._REGION_CREATE_REQUEST_BYTES,
             payload_bytes=64,
             counter_bytes=128,
-            l3_host_pid=1234,
         ).encode_into(req_buf)
         _write_ctrl_shm_name(ctrl_buf, worker_module._OFF_ARGS, req_shm.name)
         _write_ctrl_shm_name(ctrl_buf, worker_module._OFF_ARGS + worker_module._CTRL_SHM_NAME_BYTES, reply_shm.name)
@@ -412,7 +411,8 @@ def test_onboard_region_create_handler_uses_named_export_fields(monkeypatch):
             lambda handle: close_calls.append(int(handle)),
         )
 
-        worker_module._handle_ctrl_l3_l2_region_create(typed_cw, ctrl_buf, "a2a3")
+        store = worker_module._L2HostL3L2RegionStore()
+        worker_module._handle_ctrl_l3_l2_region_create(typed_cw, ctrl_buf, "a2a3", store)
 
         reply = l3_l2_orch_comm.decode_region_create_reply(reply_buf)
         assert reply.desc.scalars() == [0x4C334C3200020000, 1, 0xD00D_0000, 64, 0xD00D_0040, 128]
@@ -422,13 +422,53 @@ def test_onboard_region_create_handler_uses_named_export_fields(monkeypatch):
         assert reply.shareable_handle == 0xABCDEF
         assert cw.copy_calls == [(0xD00D_0040, 128)]
 
-        region = worker_module._l2_host_l3_l2_regions(typed_cw).pop(1)
-        worker_module._release_l2_host_l3_l2_region(typed_cw, region)
+        region = store.regions.pop(1)
+        worker_module._release_l2_host_l3_l2_region(region)
         assert close_calls == [77]
     finally:
         ctrl_buf.release()
         del req_buf
         del reply_buf
+        req_shm.close()
+        req_shm.unlink()
+        reply_shm.close()
+        reply_shm.unlink()
+
+
+def test_region_create_handler_rejects_abi_mismatch():
+    req_shm = SharedMemory(create=True, size=l3_l2_orch_comm._REGION_CREATE_REQUEST_BYTES)
+    reply_shm = SharedMemory(create=True, size=l3_l2_orch_comm._REGION_CREATE_REPLY_BYTES)
+    req_buf = cast(memoryview, req_shm.buf)
+    ctrl_storage = bytearray(worker_module._OFF_ARGS + 2 * worker_module._CTRL_SHM_NAME_BYTES)
+    ctrl_buf = memoryview(ctrl_storage)
+    store = worker_module._L2HostL3L2RegionStore()
+    try:
+        _write_ctrl_shm_name(ctrl_buf, worker_module._OFF_ARGS, req_shm.name)
+        _write_ctrl_shm_name(ctrl_buf, worker_module._OFF_ARGS + worker_module._CTRL_SHM_NAME_BYTES, reply_shm.name)
+        bad_requests = (
+            l3_l2_orch_comm.L3L2RegionCreateRequest(
+                magic_version=0xDEAD,
+                request_bytes=l3_l2_orch_comm._REGION_CREATE_REQUEST_BYTES,
+                payload_bytes=64,
+                counter_bytes=128,
+            ),
+            l3_l2_orch_comm.L3L2RegionCreateRequest(
+                magic_version=0x4C334C3200020000,
+                request_bytes=l3_l2_orch_comm._REGION_CREATE_REQUEST_BYTES + 8,
+                payload_bytes=64,
+                counter_bytes=128,
+            ),
+        )
+        for bad_request in bad_requests:
+            bad_request.encode_into(req_buf)
+            with pytest.raises(RuntimeError, match="CTRL_L3_L2_REGION_CREATE"):
+                worker_module._handle_ctrl_l3_l2_region_create(
+                    cast(Any, _FakeChipWorkerForRegionCreate()), ctrl_buf, "a2a3", store
+                )
+        assert store.regions == {}
+    finally:
+        ctrl_buf.release()
+        del req_buf
         req_shm.close()
         req_shm.unlink()
         reply_shm.close()

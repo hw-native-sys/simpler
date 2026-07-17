@@ -96,6 +96,9 @@ void append_cleanup_error(std::string &cleanup_error, const std::string &message
 class AclRuntimeApi {
 public:
     AclRuntimeApi() = default;
+    // Intentionally no aclFinalize/dlclose here: finalizing ACL during static
+    // destruction triggers std::bad_alloc in onboard teardown. The ACL context
+    // and library handle are deliberately leaked at process exit.
     ~AclRuntimeApi() = default;
 
     AclRuntimeApi(const AclRuntimeApi &) = delete;
@@ -154,7 +157,8 @@ public:
     }
 
     void init() {
-        if (initialized_ || aclInit == nullptr) {
+        // load() throws when aclInit cannot be resolved, so it is always set here.
+        if (initialized_) {
             return;
         }
         int rc = aclInit(nullptr);
@@ -386,6 +390,40 @@ public:
         int32_t observed = load_counter(offset);
         return std::make_tuple(l3_l2_orch_comm::compare_counter(observed, operand, cmp), observed);
     }
+
+    // Returns (status, error_kind, observed, matched, message). The status/error
+    // values are the wire contract with the Python facade
+    // (_WAIT_STATUS_TIMEOUT / _WAIT_ERROR_SIGNAL_TIMEOUT in l3_l2_orch_comm.py).
+    std::tuple<int, int, int32_t, bool, std::string>
+    wait_counter(uint64_t offset, int32_t operand, L3L2OrchWaitCmp cmp, uint64_t timeout_ns) const {
+        if (offset % sizeof(int32_t) != 0) {
+            throw std::invalid_argument("L3-L2 counter offset must be 4-byte aligned");
+        }
+        if (!l3_l2_orch_comm::valid_wait_cmp(cmp)) {
+            throw std::invalid_argument("L3-L2 counter wait comparison is invalid");
+        }
+        auto deadline = std::chrono::steady_clock::now() + std::chrono::nanoseconds(timeout_ns);
+        while (true) {
+            int32_t observed = load_counter(offset);
+            bool matched = l3_l2_orch_comm::compare_counter(observed, operand, cmp);
+            if (matched) {
+                return std::make_tuple(kWaitStatusOk, kWaitErrorNone, observed, true, std::string{});
+            }
+            if (std::chrono::steady_clock::now() >= deadline) {
+                return std::make_tuple(
+                    kWaitStatusTimeout, kWaitErrorSignalTimeout, observed, false, std::string{"SIGNAL_WAIT timed out"}
+                );
+            }
+            std::this_thread::sleep_for(std::chrono::nanoseconds(kWaitPollIntervalNs));
+        }
+    }
+
+private:
+    static constexpr int kWaitStatusOk = 0;
+    static constexpr int kWaitStatusTimeout = -1;
+    static constexpr int kWaitErrorNone = 0;
+    static constexpr int kWaitErrorSignalTimeout = 7;
+    static constexpr int64_t kWaitPollIntervalNs = 50000;
 };
 
 class L2ChildOnboardRegion {
@@ -1635,23 +1673,7 @@ NB_MODULE(_task_interface, m) {
         [](uint64_t handle, uint64_t counter_offset, int32_t operand, int cmp,
            uint64_t timeout_ns) -> std::tuple<int, int, int32_t, bool, std::string> {
             L3HostMappedRegion mapping = g_l3_host_mapped_regions.find(handle);
-            if (counter_offset % sizeof(int32_t) != 0) {
-                throw std::invalid_argument("L3-L2 counter offset must be 4-byte aligned");
-            }
-            L3L2OrchWaitCmp typed_cmp = checked_wait_cmp(cmp);
-            auto deadline = std::chrono::steady_clock::now() + std::chrono::nanoseconds(timeout_ns);
-            int32_t observed = 0;
-            while (true) {
-                observed = mapping.load_counter(counter_offset);
-                bool matched = l3_l2_orch_comm::compare_counter(observed, operand, typed_cmp);
-                if (matched) {
-                    return std::make_tuple(0, 0, observed, true, std::string{});
-                }
-                if (std::chrono::steady_clock::now() >= deadline) {
-                    return std::make_tuple(-1, 7, observed, false, std::string{"SIGNAL_WAIT timed out"});
-                }
-                std::this_thread::sleep_for(std::chrono::nanoseconds(50000));
-            }
+            return mapping.wait_counter(counter_offset, operand, checked_wait_cmp(cmp), timeout_ns);
         },
         nb::arg("handle"), nb::arg("counter_offset"), nb::arg("operand"), nb::arg("cmp"), nb::arg("timeout_ns"),
         nb::call_guard<nb::gil_scoped_release>(), "Poll one L3 Host-side L3-L2 signal counter until match or timeout."

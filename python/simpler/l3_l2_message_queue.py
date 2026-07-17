@@ -326,7 +326,7 @@ class L3L2Queue:
             raise RuntimeError("L3-L2 queue is poisoned")
         if self._state == _QueueState.EXPIRED:
             raise RuntimeError("L3-L2 queue expired after orchestration run")
-        if getattr(self._region, "_expired", False):
+        if self._region.expired:
             self._state = _QueueState.EXPIRED
             raise RuntimeError("L3-L2 queue expired after orchestration run")
         self._region._ensure_live()
@@ -334,7 +334,7 @@ class L3L2Queue:
     def _validate_registered_buffer(self, buffer: Any, nbytes: int) -> Tensor:
         if not isinstance(buffer, Tensor):
             raise ValueError("L3-L2 queue requires a registered Tensor returned by orch.alloc(...)")
-        self._region._owner._validate_l3_l2_orch_comm_host_buffer(buffer)
+        self._region._validate_host_buffer(buffer)
         if int(nbytes) > int(buffer.nbytes()):
             raise ValueError(f"L3-L2 queue nbytes={nbytes} exceeds registered Tensor size {int(buffer.nbytes())}")
         return buffer
