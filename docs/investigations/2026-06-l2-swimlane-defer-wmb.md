@@ -17,7 +17,7 @@ publication. The per-record `wmb()` is removed; nothing is added.
 
 The host reads an `AicpuTask` buffer only after the AICPU publishes it to the
 per-thread ready queue. Both publication paths — full-buffer rotation
-(`switch_records_buffer` → `L2SwimlaneTaskEngine::switch_buffer`) and end-of-run
+(`switch_task_buffer` → `L2SwimlaneTaskEngine::switch_buffer`) and end-of-run
 flush (`l2_swimlane_aicpu_flush`) — go through
 `L2SwimlaneTaskEngine::enqueue_ready` (`profiler_device_engine.h`), which issues
 `wmb()` (`dsb st`) before advancing `queue_tails`. A `dsb st` drains every prior

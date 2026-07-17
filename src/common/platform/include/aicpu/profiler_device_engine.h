@@ -155,18 +155,7 @@ struct DeviceProfilerEngine {
         return 0;
     }
 
-    static Buffer *pop_free(Context ctx, State *state, uint32_t next_seq) {
-        if (state == nullptr) {
-            return nullptr;
-        }
-
-        FreeQueue *free_queue = Module::free_queue(state);
-        uint32_t head = 0;
-        uint32_t tail = 0;
-        if (!wait_for_free_queue_entry(Module::header(ctx), free_queue, &head, &tail)) {
-            return nullptr;
-        }
-
+    static Buffer *claim_free(Context ctx, State *state, FreeQueue *free_queue, uint32_t head, uint32_t next_seq) {
         uint64_t buf_ptr = free_queue->buffer_ptrs[head % Module::kSlotCount];
         rmb();  // acquire-strengthening: order buffer_ptrs read before taking ownership via head advance
         free_queue->head = head + 1;
@@ -183,6 +172,42 @@ struct DeviceProfilerEngine {
         Module::on_pop_success(ctx, state, buf);
         wmb();
         return buf;
+    }
+
+    // Non-blocking startup pop. It shares the ownership/head/seq bookkeeping
+    // with pop_free(), but does not enter the runtime backpressure gate. This
+    // keeps initialization failure observable instead of waiting for a host
+    // management loop that may not have started yet.
+    static Buffer *try_pop_free(Context ctx, State *state, uint32_t next_seq) {
+        if (state == nullptr) {
+            return nullptr;
+        }
+
+        FreeQueue *free_queue = Module::free_queue(state);
+        if (free_queue == nullptr) {
+            return nullptr;
+        }
+        uint32_t head = free_queue->head;
+        uint32_t tail = free_queue->tail;
+        if (head == tail) {
+            return nullptr;
+        }
+        rmb();  // acquire: order the tail read above before buffer_ptrs
+        return claim_free(ctx, state, free_queue, head, next_seq);
+    }
+
+    static Buffer *pop_free(Context ctx, State *state, uint32_t next_seq) {
+        if (state == nullptr) {
+            return nullptr;
+        }
+
+        FreeQueue *free_queue = Module::free_queue(state);
+        uint32_t head = 0;
+        uint32_t tail = 0;
+        if (!wait_for_free_queue_entry(Module::header(ctx), free_queue, &head, &tail)) {
+            return nullptr;
+        }
+        return claim_free(ctx, state, free_queue, head, next_seq);
     }
 
     static void switch_buffer(Context ctx, State *state) {

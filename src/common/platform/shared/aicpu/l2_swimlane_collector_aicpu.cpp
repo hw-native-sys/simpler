@@ -128,19 +128,20 @@ L2SwimlaneLevel get_l2_swimlane_level() { return g_l2_swimlane_level; }
 
 static constexpr uint64_t kL2SwimlaneQueueBackpressureWaitCycles = PLATFORM_DFX_BACKPRESSURE_TIMEOUT_CYCLES;
 
-struct L2SwimlaneTaskDeviceModule {
+template <typename BufferT>
+struct L2SwimlaneDeviceModule {
     struct Context {
         L2SwimlaneDataHeader *header;
         int thread_idx;
         uint32_t core_index;
         L2SwimlaneBufferKind kind;
-        L2SwimlaneAicpuTaskBuffer **current_buf;
+        BufferT **current_buf;
     };
 
     using DataHeader = L2SwimlaneDataHeader;
     using State = L2SwimlaneAicpuTaskPool;
     using FreeQueue = L2SwimlaneFreeQueue;
-    using Buffer = L2SwimlaneAicpuTaskBuffer;
+    using Buffer = BufferT;
 
     static constexpr uint32_t kReadyQueueSize = PLATFORM_PROF_READYQUEUE_SIZE;
     static constexpr uint32_t kSlotCount = PLATFORM_PROF_SLOT_COUNT;
@@ -168,6 +169,12 @@ struct L2SwimlaneTaskDeviceModule {
     static void account_dropped(Context, State *state, uint32_t count) {
         state->head.dropped_record_count = state->head.dropped_record_count + count;
     }
+    static const char *phase_label(L2SwimlaneBufferKind kind) {
+        return kind == L2SwimlaneBufferKind::AicpuOrchPhase ? "orch" : "sched";
+    }
+    static bool is_phase(Context ctx) {
+        return ctx.kind == L2SwimlaneBufferKind::AicpuSchedPhase || ctx.kind == L2SwimlaneBufferKind::AicpuOrchPhase;
+    }
     static void on_pop_success(Context ctx, State *, Buffer *buffer) {
         if (ctx.current_buf != nullptr) {
             *ctx.current_buf = buffer;
@@ -178,15 +185,37 @@ struct L2SwimlaneTaskDeviceModule {
             *ctx.current_buf = nullptr;
         }
     }
-    static void on_no_replacement(Context, State *) {}
+    static void on_no_replacement(Context ctx, State *) {
+        if (is_phase(ctx)) {
+            LOG_WARN(
+                "Thread %d: no free %s phase buffer available, dropping records until Host catches up", ctx.thread_idx,
+                phase_label(ctx.kind)
+            );
+        }
+    }
     static void on_null_free_slot(Context, State *) {}
     static void on_enqueue_failed(Context ctx, State *, Buffer *) {
-        LOG_ERROR(
-            "Thread %d: Core %u failed to enqueue buffer (queue full), data lost!", ctx.thread_idx, ctx.core_index
-        );
+        if (is_phase(ctx)) {
+            LOG_ERROR(
+                "Thread %d: failed to enqueue %s phase buffer for pool %u (queue full), data lost!", ctx.thread_idx,
+                phase_label(ctx.kind), ctx.core_index
+            );
+        } else {
+            LOG_ERROR(
+                "Thread %d: Core %u failed to enqueue buffer (queue full), data lost!", ctx.thread_idx, ctx.core_index
+            );
+        }
     }
     static void on_switch_complete(Context ctx, State *, Buffer *buffer) {
-        if (buffer != nullptr) {
+        if (buffer == nullptr) {
+            return;
+        }
+        if (is_phase(ctx)) {
+            LOG_INFO_V0(
+                "Thread %d: switched to new %s phase buffer for pool %u (addr=0x%lx)", ctx.thread_idx,
+                phase_label(ctx.kind), ctx.core_index, reinterpret_cast<uint64_t>(buffer)
+            );
+        } else {
             LOG_INFO_V0(
                 "Thread %d: Core %u switched to new buffer (addr=0x%lx)", ctx.thread_idx, ctx.core_index,
                 reinterpret_cast<uint64_t>(buffer)
@@ -195,12 +224,21 @@ struct L2SwimlaneTaskDeviceModule {
     }
 };
 
+using L2SwimlaneTaskDeviceModule = L2SwimlaneDeviceModule<L2SwimlaneAicpuTaskBuffer>;
 using L2SwimlaneTaskEngine = profiling_device::DeviceProfilerEngine<L2SwimlaneTaskDeviceModule>;
+
+template <typename Buffer>
+static typename L2SwimlaneDeviceModule<Buffer>::Context
+l2_buffer_context(int thread_idx, uint32_t core_index, L2SwimlaneBufferKind kind, Buffer **current_buf) {
+    return typename L2SwimlaneDeviceModule<Buffer>::Context{
+        s_l2_swimlane_header, thread_idx, core_index, kind, current_buf
+    };
+}
 
 static L2SwimlaneTaskDeviceModule::Context l2_task_context(
     int thread_idx, uint32_t core_index, L2SwimlaneBufferKind kind, L2SwimlaneAicpuTaskBuffer **current_buf
 ) {
-    return L2SwimlaneTaskDeviceModule::Context{s_l2_swimlane_header, thread_idx, core_index, kind, current_buf};
+    return l2_buffer_context(thread_idx, core_index, kind, current_buf);
 }
 
 static bool wait_for_free_queue_entry(L2SwimlaneFreeQueue *free_queue, uint32_t *head_out, uint32_t *tail_out) {
@@ -365,7 +403,7 @@ void l2_swimlane_aicpu_init(int worker_count) {
  * AICPU-private records pointer — AICore reads from a stable ring and is
  * unaffected by this call.
  */
-static void switch_records_buffer(int core_id, int thread_idx) {
+static void switch_task_buffer(int core_id, int thread_idx) {
     L2SwimlaneAicpuTaskPool *state = s_aicpu_task_pools[core_id];
     if (state == nullptr) {
         return;
@@ -390,7 +428,7 @@ static void switch_records_buffer(int core_id, int thread_idx) {
 // and run-end flush. No-op when nothing is pending. On ready-queue-full the
 // buffer stays stashed for a later retry; the same no-double-count rationale as
 // the rotation queue-full branch applies (reconcile reports silent_loss).
-static void flush_aicore_pending_enqueue(int core_id, int thread_idx) {
+static void publish_aicore_pending_buffer(int core_id, int thread_idx) {
     AicorePendingEnqueue &pe = s_aicore_pending_enqueue[core_id];
     if (pe.buf_ptr == 0) {
         return;
@@ -470,7 +508,7 @@ static void aicore_rotate(int core_id, int thread_idx, uint32_t new_buf_first_re
     // buffer is overwritten below and shows up as silent_loss at reconcile —
     // the same lossy regime the pre-defer code hit on a queue-full enqueue.
     if (old_buf_ptr != 0) {
-        flush_aicore_pending_enqueue(core_id, thread_idx);
+        publish_aicore_pending_buffer(core_id, thread_idx);
         AicorePendingEnqueue &pe = s_aicore_pending_enqueue[core_id];
         pe.buf_ptr = old_buf_ptr;
         pe.buf_seq = seq;
@@ -547,7 +585,7 @@ void l2_swimlane_aicpu_on_aicore_ack(int core_id, int thread_idx, uint32_t reg_t
     if (pe.buf_ptr == 0 || pe.gate_reg_task_id != reg_task_id) {
         return;
     }
-    flush_aicore_pending_enqueue(core_id, thread_idx);
+    publish_aicore_pending_buffer(core_id, thread_idx);
 }
 
 int l2_swimlane_aicpu_complete_task(
@@ -597,7 +635,7 @@ int l2_swimlane_aicpu_complete_task(
     // Rotate AICpu's L2SwimlaneAicpuTaskBuffer after the write so the just-committed
     // record is preserved.
     if (new_count >= PLATFORM_PROF_BUFFER_SIZE) {
-        switch_records_buffer(core_id, thread_idx);
+        switch_task_buffer(core_id, thread_idx);
     }
 
     // AICore-pool stats (total_record_count) are bumped on the dispatch side,
@@ -679,7 +717,7 @@ void l2_swimlane_aicpu_flush(int thread_idx, const int *cur_thread_cores, int co
         // ACK was never observed before teardown. By run end every AICore task
         // has completed, so the buffer's records are fully drained. Enqueue it
         // before the current buffer so ready-queue order follows buffer_seq.
-        flush_aicore_pending_enqueue(core_id, thread_idx);
+        publish_aicore_pending_buffer(core_id, thread_idx);
 
         rmb();
         uint64_t ac_buf_ptr = ac_state->head.current_buf_ptr;
@@ -733,30 +771,30 @@ void l2_swimlane_aicpu_flush(int thread_idx, const int *cur_thread_cores, int co
 }
 
 // Pop the first buffer from a pool's free_queue and cache it as the current
-// active buffer. Shared init helper for sched and orch phase pool priming.
-// Returns the popped buffer ptr (nullptr if free_queue was empty).
+// active buffer. Uses the same engine path as subsequent phase rotations.
 template <typename Buffer>
-static Buffer *prime_phase_pool(L2SwimlaneAicpuTaskPool *state, int thread_idx, const char *kind_label) {
-    rmb();
-    uint32_t head = state->free_queue.head;
-    uint32_t tail = state->free_queue.tail;
-
-    if (head != tail) {
-        uint64_t buf_ptr = state->free_queue.buffer_ptrs[head % PLATFORM_PROF_SLOT_COUNT];
-        rmb();
-        state->free_queue.head = head + 1;
-        state->head.current_buf_ptr = buf_ptr;
-        state->head.current_buf_seq = 0;
-        wmb();
-
-        auto *buf = reinterpret_cast<Buffer *>(buf_ptr);
-        buf->count = 0;
-        LOG_DEBUG("Thread %d: popped initial %s phase buffer (addr=0x%lx)", thread_idx, kind_label, buf_ptr);
-        return buf;
+static Buffer *prime_phase_pool(
+    L2SwimlaneAicpuTaskPool *state, int thread_idx, L2SwimlaneBufferKind kind, Buffer **current_buf_out,
+    const char *kind_label
+) {
+    auto ctx = l2_buffer_context(thread_idx, 0, kind, current_buf_out);
+    Buffer *buf = profiling_device::DeviceProfilerEngine<L2SwimlaneDeviceModule<Buffer>>::try_pop_free(
+        ctx, state, /*next_seq=*/0
+    );
+    if (buf == nullptr) {
+        LOG_ERROR("Thread %d: %s phase free_queue is empty during init!", thread_idx, kind_label);
+        if (current_buf_out != nullptr) {
+            *current_buf_out = nullptr;
+        }
+        state->head.current_buf_ptr = 0;
+        return nullptr;
     }
-    LOG_ERROR("Thread %d: %s phase free_queue is empty during init!", thread_idx, kind_label);
-    state->head.current_buf_ptr = 0;
-    return nullptr;
+
+    LOG_DEBUG(
+        "Thread %d: popped initial %s phase buffer (addr=0x%lx)", thread_idx, kind_label,
+        reinterpret_cast<uint64_t>(buf)
+    );
+    return buf;
 }
 
 void l2_swimlane_aicpu_init_phase(int worker_count, int num_sched_phase_threads, int num_orch_phase_threads) {
@@ -782,7 +820,9 @@ void l2_swimlane_aicpu_init_phase(int worker_count, int num_sched_phase_threads,
     for (int t = 0; t < sched_n; t++) {
         auto *state = get_sched_phase_buffer_state(l2_swimlane_base, worker_count, t);
         s_sched_phase_pools[t] = state;
-        s_current_sched_phase_buffers[t] = prime_phase_pool<L2SwimlaneAicpuSchedPhaseBuffer>(state, t, "sched");
+        s_current_sched_phase_buffers[t] = prime_phase_pool<L2SwimlaneAicpuSchedPhaseBuffer>(
+            state, t, L2SwimlaneBufferKind::AicpuSchedPhase, &s_current_sched_phase_buffers[t], "sched"
+        );
     }
     for (int t = sched_n; t < PLATFORM_MAX_AICPU_THREADS; t++) {
         s_sched_phase_pools[t] = nullptr;
@@ -792,7 +832,9 @@ void l2_swimlane_aicpu_init_phase(int worker_count, int num_sched_phase_threads,
     for (int t = 0; t < orch_n; t++) {
         auto *state = get_orch_phase_buffer_state(l2_swimlane_base, worker_count, t);
         s_orch_phase_pools[t] = state;
-        s_current_orch_phase_buffers[t] = prime_phase_pool<L2SwimlaneAicpuOrchPhaseBuffer>(state, t, "orch");
+        s_current_orch_phase_buffers[t] = prime_phase_pool<L2SwimlaneAicpuOrchPhaseBuffer>(
+            state, t, L2SwimlaneBufferKind::AicpuOrchPhase, &s_current_orch_phase_buffers[t], "orch"
+        );
     }
     for (int t = orch_n; t < PLATFORM_MAX_AICPU_THREADS; t++) {
         s_orch_phase_pools[t] = nullptr;
@@ -818,7 +860,7 @@ void l2_swimlane_aicpu_init_phase(int worker_count, int num_sched_phase_threads,
 // pools the two coincide (thread t → queue t, pool t); for the single orch
 // instance they differ (orchestrator's thread, but pool ordinal 0).
 template <typename Buffer>
-static void switch_phase_buffer_kind(
+static void switch_phase_buffer(
     int thread_idx, uint32_t pool_idx, L2SwimlaneAicpuTaskPool *state, Buffer **current_buf_out,
     L2SwimlaneBufferKind kind, const char *kind_label
 ) {
@@ -827,48 +869,8 @@ static void switch_phase_buffer_kind(
 
     LOG_INFO_V0("Thread %d: %s phase buffer is full (count=%u)", thread_idx, kind_label, full_buf->count);
 
-    uint32_t seq = state->head.current_buf_seq;
-    int rc = enqueue_ready_buffer(s_l2_swimlane_header, thread_idx, pool_idx, state->head.current_buf_ptr, seq, kind);
-    if (rc != 0) {
-        LOG_ERROR(
-            "Thread %d: failed to enqueue %s phase buffer (queue full), %u records lost!", thread_idx, kind_label,
-            full_buf->count
-        );
-        state->head.dropped_record_count += full_buf->count;
-        full_buf->count = 0;
-        wmb();
-        return;
-    }
-
-    uint32_t head = 0;
-    uint32_t tail = 0;
-    if (wait_for_free_queue_entry(&state->free_queue, &head, &tail)) {
-        uint64_t new_buf_ptr = state->free_queue.buffer_ptrs[head % PLATFORM_PROF_SLOT_COUNT];
-        rmb();
-        state->free_queue.head = head + 1;
-        if (new_buf_ptr == 0) {
-            *current_buf_out = nullptr;
-            state->head.current_buf_ptr = 0;
-            wmb();
-            return;
-        }
-        state->head.current_buf_ptr = new_buf_ptr;
-        state->head.current_buf_seq = seq + 1;
-        wmb();
-
-        Buffer *new_buf = reinterpret_cast<Buffer *>(new_buf_ptr);
-        new_buf->count = 0;
-        *current_buf_out = new_buf;
-        LOG_INFO_V0("Thread %d: switched to new %s phase buffer", thread_idx, kind_label);
-    } else {
-        LOG_WARN(
-            "Thread %d: no free %s phase buffer available, dropping records until Host catches up", thread_idx,
-            kind_label
-        );
-        *current_buf_out = nullptr;
-        state->head.current_buf_ptr = 0;
-        wmb();
-    }
+    auto ctx = l2_buffer_context(thread_idx, pool_idx, kind, current_buf_out);
+    profiling_device::DeviceProfilerEngine<L2SwimlaneDeviceModule<Buffer>>::switch_buffer(ctx, state);
 }
 
 // Acquire a writable slot in the per-thread phase buffer. Handles the
@@ -882,21 +884,11 @@ static Record *acquire_phase_slot(
 ) {
     Buffer *buf = *current_buf_out;
     if (buf == nullptr) {
-        uint32_t head = 0;
-        uint32_t tail = 0;
-        if (wait_for_free_queue_entry(&state->free_queue, &head, &tail)) {
-            uint64_t buf_ptr = state->free_queue.buffer_ptrs[head % PLATFORM_PROF_SLOT_COUNT];
-            rmb();
-            state->free_queue.head = head + 1;
-            if (buf_ptr == 0) {
-                return nullptr;
-            }
-            state->head.current_buf_ptr = buf_ptr;
-            state->head.current_buf_seq += 1;
-            wmb();
-            buf = reinterpret_cast<Buffer *>(buf_ptr);
-            buf->count = 0;
-            *current_buf_out = buf;
+        auto ctx = l2_buffer_context(thread_idx, pool_idx, kind, current_buf_out);
+        buf = profiling_device::DeviceProfilerEngine<L2SwimlaneDeviceModule<Buffer>>::pop_free(
+            ctx, state, state->head.current_buf_seq
+        );
+        if (buf != nullptr) {
             LOG_INFO_V0("Thread %d: recovered %s phase buffer", thread_idx, kind_label);
         }
         if (buf == nullptr) return nullptr;
@@ -904,7 +896,7 @@ static Record *acquire_phase_slot(
 
     uint32_t idx = buf->count;
     if (idx >= PLATFORM_PHASE_RECORDS_PER_THREAD) {
-        switch_phase_buffer_kind(thread_idx, pool_idx, state, current_buf_out, kind, kind_label);
+        switch_phase_buffer(thread_idx, pool_idx, state, current_buf_out, kind, kind_label);
         buf = *current_buf_out;
         if (buf == nullptr) return nullptr;
         idx = buf->count;
@@ -1011,7 +1003,7 @@ void l2_swimlane_aicpu_record_orch_phase(
 }
 
 // Final-drain flush of one phase pool's active buffer. `thread_idx` / `pool_idx`
-// as in switch_phase_buffer_kind.
+// as in switch_phase_buffer.
 static void flush_phase_pool(
     int thread_idx, uint32_t pool_idx, L2SwimlaneAicpuTaskPool *state, L2SwimlaneBufferKind kind, const char *kind_label
 ) {

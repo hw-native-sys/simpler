@@ -399,6 +399,14 @@ target_include_directories(test_profiler_base PRIVATE
     ${CMAKE_SOURCE_DIR}/../../../src/common/log/include
 )
 
+add_common_utils_test(test_profiler_device_engine common/test_profiler_device_engine.cpp)
+target_sources(test_profiler_device_engine PRIVATE
+    ${CMAKE_SOURCE_DIR}/stubs/test_stubs.cpp
+)
+target_include_directories(test_profiler_device_engine PRIVATE
+    ${CMAKE_SOURCE_DIR}/../../../src/a2a3/platform/include
+)
+
 add_common_utils_test(test_l3_l2_orch_comm common/test_l3_l2_orch_comm.cpp)
 
 add_executable(test_trb_runtime_temp_buffer
