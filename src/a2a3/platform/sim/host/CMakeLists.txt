@@ -60,7 +60,6 @@ list(APPEND HOST_RUNTIME_SOURCES
     "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/platform/sim/host/device_runner_base.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/platform/sim/host/c_api_shared.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/platform/sim/host/memory_allocator.cpp"
-    "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/platform/shared/host/l3_l2_orch_comm_service.cpp"
 )
 
 if(DEFINED CUSTOM_SOURCE_DIRS)

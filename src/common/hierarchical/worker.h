@@ -113,8 +113,12 @@ public:
     void control_comm_init(int worker_id, const std::string &request_shm_name) {
         manager_.control_comm_init(worker_id, request_shm_name.c_str());
     }
-    void control_l3_l2_orch_comm_init(int worker_id, const std::string &control_shm_name) {
-        manager_.control_l3_l2_orch_comm_init(worker_id, control_shm_name.c_str());
+    void
+    control_l3_l2_region_create(int worker_id, const std::string &request_shm_name, const std::string &reply_shm_name) {
+        manager_.control_l3_l2_region_create(worker_id, request_shm_name.c_str(), reply_shm_name.c_str());
+    }
+    void control_l3_l2_region_release(int worker_id, uint64_t region_id) {
+        manager_.control_l3_l2_region_release(worker_id, region_id);
     }
 
     ControlResult

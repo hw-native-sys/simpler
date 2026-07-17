@@ -108,7 +108,7 @@ symmetric window is realized:
 
 | Aspect | Sim | HCCL (onboard) |
 | ------ | --- | -------------- |
-| Window memory | POSIX shm + `ftruncate`, mmap'd per rank | `aclrtMalloc` + `aclrtIpcMem*` import; peer access via `aclrtDeviceEnablePeerAccess` |
+| Window memory | POSIX shm + `ftruncate`, mmap'd per rank | VMM physical allocation + shareable-handle import; peer access via `aclrtDeviceEnablePeerAccess` |
 | Subset barrier | shm-header atomic, `allocation_id`-scoped | file barriers, `allocation_id`-scoped |
 | Window init | window zeroed after handshake (`memset`) | window zeroed after handshake (`aclrtMemset`) |
 | SDMA workspace | n/a | provisioned once per handle (`ensure_sdma_workspace`); inherited into each domain `CommContext` |

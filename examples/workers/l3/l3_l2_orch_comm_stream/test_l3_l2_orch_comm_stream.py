@@ -162,6 +162,7 @@ def run_closed_loop_stream(platform: str, device_id: int) -> None:
             _write_header(header, stop_seq, 2)
             region.payload_write(0, header, nbytes=_HEADER.size)
             data_ready.notify(stop_seq, NotifyOp.Set)
+            region.free()
 
         worker.run(orch, args=None, config=config)
     finally:

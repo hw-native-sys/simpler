@@ -14,7 +14,7 @@ Callable identity is exposed as an opaque ``CallableHandle`` returned by
 ``ChipCallable`` objects. L3+ ``Worker.run`` keeps the existing raw Python
 orchestration-function entry point; that function captures handles and submits
 them through the Orchestrator. L≥3 targets resolve the handle's stable SHA-256
-digest to a private child-local slot; later Python registrations are serialized
+digest to a private L2-side slot; later Python registrations are serialized
 and sent through the mailbox control plane.
 
 Usage::
@@ -71,15 +71,19 @@ import struct
 import sys
 import threading
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from multiprocessing.shared_memory import SharedMemory
-from typing import Any
+from typing import Any, cast
 
 import cloudpickle
 from _task_interface import (  # pyright: ignore[reportMissingImports]
     MAX_REGISTERED_CALLABLE_IDS,
     RUNTIME_ENV_RING_COUNT,
     WorkerType,
+    _l3_child_onboard_region_close,
+    _l3_child_onboard_region_create,
+    _l3_host_mapped_region_import_onboard,
+    _l3_host_mapped_region_import_sim,
     _mailbox_load_i32,
     _mailbox_store_i32,
     read_args_from_blob,
@@ -98,6 +102,24 @@ from .callable_identity import (
     parse_python_callable_payload,
     parse_python_import_target,
 )
+from .l3_l2_orch_comm import (
+    _CTRL_SHM_TOKEN_BYTES,
+    _REGION_CREATE_REPLY,
+    _REGION_CREATE_REPLY_BYTES,
+    _REGION_CREATE_REQUEST,
+    _REGION_CREATE_REQUEST_BYTES,
+    _REGION_LAYOUT_ALIGNMENT,
+    _REGION_MAGIC_VERSION,
+    L3HostRegionMapping,
+    L3L2OrchRegion,
+    L3L2RegionAccessProfile,
+    L3L2RegionCreateRequest,
+    _align_up,
+    _checked_add_u64,
+    decode_region_create_reply,
+    peek_region_create_reply_region_id,
+    validate_region_create_reply,
+)
 from .orchestrator import Orchestrator
 from .task_interface import (
     MAILBOX_ERROR_MSG_SIZE,
@@ -113,6 +135,7 @@ from .task_interface import (
     RemoteBufferExport,
     RemoteBufferHandle,
     TaskArgs,
+    Tensor,
     _Worker,
 )
 
@@ -208,7 +231,6 @@ _CTRL_COMM_INIT = 9
 _CTRL_PY_REGISTER = 10
 _CTRL_PY_UNREGISTER = 11
 _CTRL_PY_IMPORT_REGISTER = 12
-_CTRL_L3_L2_ORCH_COMM_INIT = 13
 # Host-buffer registration. MAP_HOST maps a named host-buffer shm
 # into every chip child *post-fork* and keeps it mapped so later runs can copy
 # through it; UNMAP_HOST drops one. The child also records the parent VA range
@@ -233,6 +255,8 @@ _HOST_BUF_UNMAP = struct.Struct("<Q")
 # mapping (the pure-Python blob-rewrite scheme, no runtime C++ change).
 _BLOB_TENSOR_STRIDE = 128
 _BLOB_HEADER_BYTES = 8
+_CTRL_L3_L2_REGION_CREATE = 16
+_CTRL_L3_L2_REGION_RELEASE = 17
 
 # Layout of the CTRL_COMM_INIT request shm.
 _COMM_INIT_HEADER = struct.Struct("<II")  # rank (u32), nranks (u32)
@@ -1053,23 +1077,185 @@ def _handle_ctrl_comm_init(cw: ChipWorker, buf: memoryview) -> None:
     cw._comm_base_handle_cached = int(handle)
 
 
-def _handle_ctrl_l3_l2_orch_comm_init(cw: ChipWorker, buf: memoryview) -> SharedMemory:
-    control_shm_name = _read_shm_name(buf, _OFF_ARGS)
-    control_shm = SharedMemory(name=control_shm_name)
-    control_buf = control_shm.buf
-    assert control_buf is not None
-    exported = ctypes.c_char.from_buffer(control_buf)
-    success = False
+@dataclass
+class _L2HostL3L2Region:
+    region_id: int
+    payload_bytes: int
+    counter_offset: int
+    counter_bytes: int
+    total_bytes: int
+    shm: SharedMemory | None = None
+    dev_ptr: int = 0
+    onboard_handle: int = 0
+
+
+@dataclass
+class _L2HostL3L2RegionStore:
+    """Per-chip-child registry of live L3-L2 direct regions (loop-local state)."""
+
+    regions: dict[int, _L2HostL3L2Region] = field(default_factory=dict)
+    next_region_id: int = 1
+
+
+@dataclass(frozen=True)
+class _L2HostL3L2RegionReplyMeta:
+    payload_base: int
+    backing_name: bytes
+    access_profile: L3L2RegionAccessProfile
+    mapping_bytes: int
+    shareable_handle: int
+
+
+def _release_l2_host_l3_l2_region(region: _L2HostL3L2Region) -> None:
+    if region.shm is not None:
+        region.shm.close()
+        region.shm.unlink()
+        return
+    if region.onboard_handle:
+        _l3_child_onboard_region_close(region.onboard_handle)
+
+
+def _create_sim_l3_l2_region(
+    request: L3L2RegionCreateRequest, region_id: int, counter_offset: int, total_bytes: int
+) -> tuple[_L2HostL3L2Region, _L2HostL3L2RegionReplyMeta]:
+    shm = SharedMemory(create=True, size=total_bytes)
+    region = _L2HostL3L2Region(
+        region_id=region_id,
+        payload_bytes=request.payload_bytes,
+        counter_offset=counter_offset,
+        counter_bytes=request.counter_bytes,
+        total_bytes=total_bytes,
+        shm=shm,
+    )
+    region_buf = cast(memoryview, shm.buf)
+    region_buf[counter_offset : counter_offset + request.counter_bytes] = b"\x00" * request.counter_bytes
+    exported = ctypes.c_char.from_buffer(region_buf)
     try:
-        control_block_addr = ctypes.addressof(exported)
-        cw.l3_l2_orch_comm_init_from_addr(control_block_addr, control_shm.size)
-        success = True
+        payload_base = ctypes.addressof(exported)
     finally:
         del exported
-        del control_buf
-        if not success:
-            control_shm.close()
-    return control_shm
+        del region_buf
+    backing_name = shm.name.encode("utf-8")
+    if len(backing_name) >= _CTRL_SHM_TOKEN_BYTES:
+        raise RuntimeError("CTRL_L3_L2_REGION_CREATE backing shm token is too long")
+    meta = _L2HostL3L2RegionReplyMeta(
+        payload_base=payload_base,
+        backing_name=backing_name,
+        access_profile=L3L2RegionAccessProfile.SIM_POSIX_SHM,
+        mapping_bytes=total_bytes,
+        shareable_handle=0,
+    )
+    return region, meta
+
+
+def _create_onboard_l3_l2_region(
+    cw: ChipWorker, request: L3L2RegionCreateRequest, region_id: int, counter_offset: int, total_bytes: int
+) -> tuple[_L2HostL3L2Region, _L2HostL3L2RegionReplyMeta]:
+    export = _l3_child_onboard_region_create(total_bytes)
+    dev_ptr = int(export.device_addr)
+    region = _L2HostL3L2Region(
+        region_id=region_id,
+        payload_bytes=request.payload_bytes,
+        counter_offset=counter_offset,
+        counter_bytes=request.counter_bytes,
+        total_bytes=total_bytes,
+        dev_ptr=dev_ptr,
+        onboard_handle=int(export.registry_handle),
+    )
+    zeros = ctypes.create_string_buffer(request.counter_bytes)
+    cw.copy_to(dev_ptr + counter_offset, ctypes.addressof(zeros), request.counter_bytes)
+    meta = _L2HostL3L2RegionReplyMeta(
+        payload_base=dev_ptr,
+        backing_name=b"",
+        access_profile=L3L2RegionAccessProfile.ONBOARD_VMM,
+        mapping_bytes=int(export.mapping_bytes),
+        shareable_handle=int(export.shareable_handle),
+    )
+    return region, meta
+
+
+def _handle_ctrl_l3_l2_region_create(
+    cw: ChipWorker, buf: memoryview, chip_platform: str, store: _L2HostL3L2RegionStore
+) -> None:
+    request_shm_name = _read_shm_name(buf, _OFF_ARGS)
+    reply_shm_name = _read_shm_name(buf, _OFF_ARGS + _CTRL_SHM_NAME_BYTES)
+    req_shm = SharedMemory(name=request_shm_name)
+    reply_shm = SharedMemory(name=reply_shm_name)
+    req_buf = cast(memoryview, req_shm.buf)
+    reply_buf = cast(memoryview, reply_shm.buf)
+    region: _L2HostL3L2Region | None = None
+    try:
+        fields = _REGION_CREATE_REQUEST.unpack_from(req_buf, 0)
+        request = L3L2RegionCreateRequest(
+            magic_version=int(fields[0]),
+            request_bytes=int(fields[1]),
+            payload_bytes=int(fields[2]),
+            counter_bytes=int(fields[3]),
+        )
+        # Reject ABI mismatches loudly. The reply carries this child's own
+        # magic (not the request echo) so the L3 side can detect version skew.
+        if request.magic_version != _REGION_MAGIC_VERSION:
+            raise RuntimeError("CTRL_L3_L2_REGION_CREATE magic_version mismatch")
+        if request.request_bytes != _REGION_CREATE_REQUEST_BYTES:
+            raise RuntimeError("CTRL_L3_L2_REGION_CREATE request_bytes mismatch")
+        if request.payload_bytes <= 0:
+            raise RuntimeError("CTRL_L3_L2_REGION_CREATE payload_bytes must be positive")
+        if request.counter_bytes <= 0 or request.counter_bytes % 4 != 0:
+            raise RuntimeError("CTRL_L3_L2_REGION_CREATE counter_bytes must be positive and a multiple of 4")
+        counter_offset = _align_up(request.payload_bytes, _REGION_LAYOUT_ALIGNMENT)
+        total_bytes = _checked_add_u64(counter_offset, request.counter_bytes)
+
+        region_id = store.next_region_id
+        store.next_region_id += 1
+        if str(chip_platform).endswith("sim"):
+            region, meta = _create_sim_l3_l2_region(request, region_id, counter_offset, total_bytes)
+        else:
+            region, meta = _create_onboard_l3_l2_region(cw, request, region_id, counter_offset, total_bytes)
+        _REGION_CREATE_REPLY.pack_into(
+            reply_buf,
+            0,
+            _REGION_MAGIC_VERSION,
+            region_id,
+            meta.payload_base,
+            request.payload_bytes,
+            meta.payload_base + counter_offset,
+            request.counter_bytes,
+            int(meta.access_profile),
+            0,
+            int(getattr(cw, "device_id", -1)),
+            meta.backing_name + b"\x00" * (_CTRL_SHM_TOKEN_BYTES - len(meta.backing_name)),
+            meta.mapping_bytes,
+            meta.shareable_handle,
+        )
+        store.regions[region_id] = region
+        region = None
+    finally:
+        if region is not None:
+            try:
+                _release_l2_host_l3_l2_region(region)
+            except (BufferError, FileNotFoundError, OSError, RuntimeError):
+                pass
+        del req_buf
+        del reply_buf
+        req_shm.close()
+        reply_shm.close()
+
+
+def _handle_ctrl_l3_l2_region_release(buf: memoryview, store: _L2HostL3L2RegionStore) -> None:
+    region_id = struct.unpack_from("Q", buf, _CTRL_OFF_ARG0)[0]
+    region = store.regions.pop(int(region_id), None)
+    if region is None:
+        return
+    _release_l2_host_l3_l2_region(region)
+
+
+def _sweep_l2_host_l3_l2_regions(store: _L2HostL3L2RegionStore) -> None:
+    for region_id in list(store.regions):
+        region = store.regions.pop(region_id)
+        try:
+            _release_l2_host_l3_l2_region(region)
+        except (BufferError, FileNotFoundError, OSError, RuntimeError):
+            pass
 
 
 def _handle_ctrl_release_domain(cw: ChipWorker, buf: memoryview) -> None:
@@ -1121,7 +1307,7 @@ def _run_chip_main_loop(  # noqa: PLR0912, PLR0913, PLR0915 -- unified TASK_READ
     identity_table: dict[bytes, int],
     identity_refs: dict[bytes, int],
     *,
-    chip_platform: str = "",
+    chip_platform: str,
     chip_runtime: str = "",
     on_task_done_success=None,
 ) -> None:
@@ -1141,7 +1327,7 @@ def _run_chip_main_loop(  # noqa: PLR0912, PLR0913, PLR0915 -- unified TASK_READ
     lazily preparing it.
     """
     prepared: set[int] = set()
-    l3_l2_control_shms: list[SharedMemory] = []
+    l3_l2_region_store = _L2HostL3L2RegionStore()
     # Post-fork host buffers mapped into this child. `host_buf_table`
     # owns the mmap per token (for unmap + teardown); `host_buf_ranges` is the
     # parent-VA → child-VA translation table the per-task blob rewrite consults,
@@ -1286,12 +1472,14 @@ def _run_chip_main_loop(  # noqa: PLR0912, PLR0913, PLR0915 -- unified TASK_READ
                         _handle_ctrl_release_domain(cw, buf)
                     elif sub_cmd == _CTRL_COMM_INIT:
                         _handle_ctrl_comm_init(cw, buf)
-                    elif sub_cmd == _CTRL_L3_L2_ORCH_COMM_INIT:
-                        l3_l2_control_shms.append(_handle_ctrl_l3_l2_orch_comm_init(cw, buf))
                     elif sub_cmd == _CTRL_MAP_HOST:
                         _handle_ctrl_map_host(buf, host_buf_table, host_buf_ranges)
                     elif sub_cmd == _CTRL_UNMAP_HOST:
                         _handle_ctrl_unmap_host(buf, host_buf_table, host_buf_ranges)
+                    elif sub_cmd == _CTRL_L3_L2_REGION_CREATE:
+                        _handle_ctrl_l3_l2_region_create(cw, buf, chip_platform, l3_l2_region_store)
+                    elif sub_cmd == _CTRL_L3_L2_REGION_RELEASE:
+                        _handle_ctrl_l3_l2_region_release(buf, l3_l2_region_store)
                     else:
                         raise RuntimeError(f"unknown control sub-command {int(sub_cmd)}")
                 except Exception as e:  # noqa: BLE001
@@ -1306,20 +1494,7 @@ def _run_chip_main_loop(  # noqa: PLR0912, PLR0913, PLR0915 -- unified TASK_READ
             elif state == _SHUTDOWN:
                 break
     finally:
-        if l3_l2_control_shms:
-            try:
-                cw.l3_l2_orch_comm_shutdown()
-            except Exception as e:  # noqa: BLE001
-                sys.stderr.write(
-                    f"[chip_process pid={os.getpid()} dev={device_id}] "
-                    f"WARN: l3_l2_orch_comm_shutdown failed: {type(e).__name__}: {e}\n"
-                )
-                sys.stderr.flush()
-        for control_shm in reversed(l3_l2_control_shms):
-            try:
-                control_shm.close()
-            except Exception:  # noqa: BLE001
-                pass
+        _sweep_l2_host_l3_l2_regions(l3_l2_region_store)
         for host_shm, _lo, _hi, _base in host_buf_table.values():
             try:
                 host_shm.close()
@@ -1432,7 +1607,7 @@ def _child_worker_loop(
     """Runs in forked child process. Any-level Worker as child of its parent.
 
     Polls the unified mailbox for (callable digest, config, args_blob). Looks
-    up the orchestration function in the child-local registry, then delegates to
+    up the orchestration function in the L2-side registry, then delegates to
     ``inner_worker.run(orch_fn, args, cfg)`` which opens its own scope,
     runs the orch function, and drains. Also services CONTROL_REQUEST
     so the L4 parent's dynamic register/unregister broadcasts cascade
@@ -1616,9 +1791,6 @@ class Worker:
         # starts the C++ scheduler; no comm work happens there.
         self._comm_base_ready: bool = False
 
-        self._l3_l2_orch_comm_ready: set[int] = set()
-        self._l3_l2_orch_comm_shms: dict[int, SharedMemory] = {}
-        self._l3_l2_orch_comm_clients: dict[int, Any] = {}
         self._live_l3_l2_regions: list[Any] = []
         self._l3_l2_orch_comm_host_buffers: dict[int, int] = {}
 
@@ -2311,7 +2483,7 @@ class Worker:
             handle, is_new = self._install_registration_locked(reg)
 
         # L3+ post-init ChipCallable: broadcast to chip / next-level children
-        # via C++ after parent-side slot allocation is complete. The slot is
+        # via C++ after L3 Host-side slot allocation is complete. The slot is
         # target-private; task dispatches carry only handle.digest.
         if self.level >= 3 and self._initialized and isinstance(target, ChipCallable):
             try:
@@ -3448,14 +3620,7 @@ class Worker:
         """
         return dict(self._live_domains)
 
-    def _make_l3_l2_orch_comm_client(self, shm: SharedMemory):
-        from .l3_l2_orch_comm import L3L2OrchCommClient  # noqa: PLC0415
-
-        return L3L2OrchCommClient(shm)
-
-    def _ensure_l3_l2_orch_comm(self, worker_id: int):
-        from .l3_l2_orch_comm import CONTROL_SHM_SIZE  # noqa: PLC0415
-
+    def _validate_l3_l2_worker_id(self, worker_id: int) -> None:
         if self.level < 3:
             raise RuntimeError("create_l3_l2_region requires a hierarchical Worker")
         if self._worker is None:
@@ -3463,38 +3628,6 @@ class Worker:
         device_ids = self._config.get("device_ids", [])
         if worker_id < 0 or worker_id >= len(device_ids):
             raise ValueError(f"create_l3_l2_region: worker_id {worker_id} outside [0, {len(device_ids)})")
-        if worker_id in self._l3_l2_orch_comm_ready:
-            return self._l3_l2_orch_comm_clients[worker_id]
-
-        chip_shm = self._chip_shms[worker_id]
-        assert chip_shm.buf is not None
-        state = _mailbox_load_i32(_buffer_field_addr(chip_shm.buf, _OFF_STATE))
-        if state != _IDLE:
-            raise RuntimeError(
-                f"create_l3_l2_region bootstrap failed: target worker {worker_id} is busy and "
-                "the L3-L2 service is not ready"
-            )
-
-        control_shm = SharedMemory(create=True, size=CONTROL_SHM_SIZE)
-        try:
-            client = self._make_l3_l2_orch_comm_client(control_shm)
-            self._worker.control_l3_l2_orch_comm_init(worker_id, control_shm.name)
-        except Exception:
-            try:
-                control_shm.close()
-                control_shm.unlink()
-            except Exception:  # noqa: BLE001
-                pass
-            raise
-
-        self._l3_l2_orch_comm_shms[worker_id] = control_shm
-        self._l3_l2_orch_comm_clients[worker_id] = client
-        self._l3_l2_orch_comm_ready.add(worker_id)
-        return client
-
-    def _l3_l2_orch_comm_submit(self, worker_id: int, request, timeout_s: float):
-        client = self._ensure_l3_l2_orch_comm(int(worker_id))
-        return client.submit(request, timeout_s)
 
     def _poison_l3_l2_region_from_endpoint_error(self, exc: BaseException) -> bool:
         match = _L3_L2_ENDPOINT_ERROR_REGION_RE.search(str(exc))
@@ -3511,8 +3644,6 @@ class Worker:
         return poisoned
 
     def _register_l3_l2_orch_comm_host_buffer(self, tensor) -> None:
-        from .task_interface import Tensor  # noqa: PLC0415
-
         if not isinstance(tensor, Tensor):
             raise TypeError("L3-L2 host buffer registration expects a Tensor")
         if tensor.child_memory:
@@ -3529,8 +3660,6 @@ class Worker:
         )
 
     def _validate_l3_l2_orch_comm_host_buffer(self, tensor) -> None:
-        from .task_interface import Tensor  # noqa: PLC0415
-
         if not isinstance(tensor, Tensor):
             raise ValueError("L3-L2 payload buffer must be a Tensor returned by orch.alloc(...)")
         if tensor.child_memory:
@@ -3549,57 +3678,105 @@ class Worker:
                 f"L3-L2 payload Tensor size {nbytes} exceeds registered shared storage {registered_nbytes}"
             )
 
-    def _create_l3_l2_region(self, worker_id: int, payload_bytes: int, counter_bytes: int):
-        from .l3_l2_orch_comm import L3L2OrchCommCmd, L3L2OrchCommRequest, L3L2OrchRegion  # noqa: PLC0415
-
+    def _create_l3_l2_region(self, worker_id: int, payload_bytes: int, counter_bytes: int):  # noqa: PLR0912
         if payload_bytes <= 0:
             raise ValueError("create_l3_l2_region: payload_bytes must be positive")
         if counter_bytes <= 0 or counter_bytes % 4 != 0:
             raise ValueError("create_l3_l2_region: counter_bytes must be positive and a multiple of 4")
-        response = self._l3_l2_orch_comm_submit(
-            int(worker_id),
-            L3L2OrchCommRequest(
-                cmd=L3L2OrchCommCmd.ALLOC_REGION,
+        self._validate_l3_l2_worker_id(int(worker_id))
+        req_shm = SharedMemory(create=True, size=_REGION_CREATE_REQUEST_BYTES)
+        reply_shm = SharedMemory(create=True, size=_REGION_CREATE_REPLY_BYTES)
+        req_buf = cast(memoryview, req_shm.buf)
+        reply_buf = cast(memoryview, reply_shm.buf)
+        region_id = 0
+        l3_host_mapping = None
+        try:
+            L3L2RegionCreateRequest(
+                magic_version=_REGION_MAGIC_VERSION,
+                request_bytes=_REGION_CREATE_REQUEST_BYTES,
                 payload_bytes=int(payload_bytes),
                 counter_bytes=int(counter_bytes),
-            ),
-            timeout_s=5.0,
-        )
-        if response.status != 0 or response.desc is None:
-            raise RuntimeError(response.message or "create_l3_l2_region: ALLOC_REGION failed")
-        region = L3L2OrchRegion(self, int(worker_id), response.desc)
-        self._live_l3_l2_regions.append(region)
-        return region
+            ).encode_into(req_buf)
+            worker = self._worker
+            assert worker is not None
+            worker.control_l3_l2_region_create(int(worker_id), req_shm.name, reply_shm.name)
+            # Peek before decode: decode rejects malformed replies, but the
+            # child has already created the region and the rollback below
+            # still needs the id.
+            region_id = peek_region_create_reply_region_id(reply_buf)
+            reply = decode_region_create_reply(reply_buf)
+            platform = str(self._config.get("platform", ""))
+            expected_access_profile = (
+                L3L2RegionAccessProfile.SIM_POSIX_SHM
+                if platform.endswith("sim")
+                else L3L2RegionAccessProfile.ONBOARD_VMM
+            )
+            counter_offset, total_bytes = validate_region_create_reply(reply, expected_access_profile)
+            if platform.endswith("sim"):
+                handle = _l3_host_mapped_region_import_sim(reply.backing_shm, int(reply.mapping_bytes))
+            else:
+                handle = _l3_host_mapped_region_import_onboard(
+                    int(reply.device_id),
+                    int(reply.shareable_handle),
+                    int(reply.mapping_bytes),
+                )
+            l3_host_mapping = L3HostRegionMapping(
+                worker_id=int(worker_id),
+                region_id=region_id,
+                access_profile=reply.access_profile,
+                total_bytes=total_bytes,
+                payload_offset=0,
+                payload_bytes=int(reply.desc.payload_bytes),
+                counter_offset=counter_offset,
+                counter_bytes=int(reply.desc.counter_bytes),
+                handle=int(handle),
+            )
+            region = L3L2OrchRegion(self, int(worker_id), reply.desc, l3_host_mapping)
+            self._live_l3_l2_regions.append(region)
+            return region
+        except Exception:
+            if l3_host_mapping is not None:
+                try:
+                    l3_host_mapping.close()
+                except RuntimeError:
+                    pass
+            if region_id:
+                try:
+                    assert self._worker is not None
+                    self._worker.control_l3_l2_region_release(int(worker_id), int(region_id))
+                except RuntimeError:
+                    pass
+            raise
+        finally:
+            del req_buf
+            del reply_buf
+            for shm in (req_shm, reply_shm):
+                try:
+                    shm.close()
+                    shm.unlink()
+                except (BufferError, FileNotFoundError, OSError):
+                    pass
 
     def _cleanup_l3_l2_regions(self) -> None:
         if not self._live_l3_l2_regions:
             return
-        from .l3_l2_orch_comm import L3L2OrchCommCmd, L3L2OrchCommRequest  # noqa: PLC0415
-
         regions, self._live_l3_l2_regions = self._live_l3_l2_regions, []
         for region in regions:
             try:
-                if region._worker_id in self._l3_l2_orch_comm_ready:
-                    self._l3_l2_orch_comm_submit(
-                        region._worker_id,
-                        L3L2OrchCommRequest(cmd=L3L2OrchCommCmd.FREE_REGION, region_id=region.region_id),
-                        timeout_s=5.0,
-                    )
+                region._close_l3_host_mapping()
+                if self._worker is not None:
+                    self._worker.control_l3_l2_region_release(region._worker_id, region.region_id)
             finally:
                 region._expire()
 
     def _close_l3_l2_orch_comm(self) -> None:
-        self._live_l3_l2_regions.clear()
-        self._l3_l2_orch_comm_clients.clear()
-        self._l3_l2_orch_comm_ready.clear()
-        self._l3_l2_orch_comm_host_buffers.clear()
-        for shm in self._l3_l2_orch_comm_shms.values():
+        for region in self._live_l3_l2_regions:
             try:
-                shm.close()
-                shm.unlink()
-            except Exception:  # noqa: BLE001
+                region._close_l3_host_mapping()
+            except RuntimeError:
                 pass
-        self._l3_l2_orch_comm_shms.clear()
+        self._live_l3_l2_regions.clear()
+        self._l3_l2_orch_comm_host_buffers.clear()
 
     # ------------------------------------------------------------------
     # Dynamic CommDomain allocation (driven by Orchestrator.allocate_domain;
@@ -3905,7 +4082,7 @@ class Worker:
         """Fan out CTRL_ALLOC_DOMAIN / CTRL_RELEASE_DOMAIN to all participating chips.
 
         Each chip's `_Worker.control_*` is a blocking per-mailbox call; we issue
-        them on separate threads so the child-side file barrier can converge.
+        them on separate threads so the L2-side file barrier can converge.
         Joins all threads; raises on first error after all join.
         """
         dw = self._worker
