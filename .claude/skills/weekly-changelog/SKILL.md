@@ -30,13 +30,26 @@ original English — only prose is translated.
 
 ## 1. Compute the week range
 
-The window **ends yesterday** (`today - 1 day`) and **starts on the most
-recent Friday strictly before today** — i.e. the Friday that anchors the
-current Fri→Thu release cycle. Do **not** use "last 7 days" — the window is
-anchored to weekdays so the same report can be regenerated deterministically.
+The team, the release cadence, and every git commit timestamp are in **China
+time (UTC+8)**. The box this skill runs on may be in a **different** timezone
+(the dev/CI box has run PDT), so plain `date -d` computes the window in the
+box's local time and silently shifts it by the offset — that misfiles the
+Fri→Thu boundary and drops or double-counts a day's PRs. **First surface the
+offset, then anchor all date math to `Asia/Shanghai`:**
 
 ```bash
-# End = yesterday
+# Understand the box's timezone vs China's before trusting any date.
+echo "box tz: $(date +%Z%z)   china tz: $(TZ='Asia/Shanghai' date +%Z%z)"
+export TZ='Asia/Shanghai'   # anchor ALL later date/git-log timestamps to China time
+```
+
+With `TZ` exported, the window **ends yesterday** (`today - 1 day`) and
+**starts on the most recent Friday strictly before today** — the Friday that
+anchors the current Fri→Thu release cycle, all in China time. Do **not** use
+"last 7 days" — the window is weekday-anchored so the same report regenerates
+deterministically.
+
+```bash
 END=$(date -d "yesterday" +%Y-%m-%d)
 # Start = most recent Friday strictly before today.
 # On Friday, the new cycle has just started — go back 7 days to the
@@ -46,11 +59,12 @@ if [ "$(date +%u)" = "5" ]; then
 else
     START=$(date -d "last friday" +%Y-%m-%d)
 fi
-echo "$START .. $END"
+echo "$START .. $END (China time)"
 ```
 
 The variable names `START` / `END` replace the old `FRI` / `THU` throughout
 section 2 — `END` is no longer guaranteed to be a Thursday on mid-week runs.
+`$START` (the Friday) still names the output files.
 
 ## 2. Collect commits and triage in two passes
 
@@ -59,8 +73,19 @@ list first, then pull just titles for every PR in a single `gh` call so the
 network round-trips don't dominate the run:
 
 ```bash
-git log --since="$START 00:00" --until="$END 23:59" \
-        --pretty=format:"%h %ad %s" --date=short
+# List every commit whose China-local COMMIT date falls in [START, END].
+# Two traps this avoids:
+#  - Filter on commit date (%cd with --date=iso-local), NOT author date (%ad):
+#    a rebased PR keeps an older author date and would be misfiled by a day/week.
+#  - Do NOT use `git log --since/--until`: on non-linear history it prunes the
+#    walk at the first out-of-range commit and silently drops in-range PRs.
+#    Range-filter the full list in awk instead. (TZ is already Asia/Shanghai.)
+#  - Tab-delimit `%cd`/`%s` (not `|`): a subject containing a pipe would else
+#    split across awk fields and truncate the title. No commit cap, so an older
+#    window past the newest N commits is never silently dropped.
+git log --date=iso-local --pretty=format:"%h %cd%x09%s" \
+  | awk -F'\t' -v s="$START" -v e="$END" \
+      '{split($1,a," "); d=a[2]} d>=s && d<=e {print a[1], d, $2}'
 
 # Extract PR numbers and batch-fetch titles in ONE call via GraphQL
 # aliases — `gh pr view` accepts only one PR per call, and
@@ -105,6 +130,20 @@ query($owner: String!, $name: String!) {
 }'
 # render each as `+<additions>/-<deletions>, <changedFiles>f`
 ```
+
+**When `gh` flakes, fall back to local git — no network.** The `gh api
+graphql` / `gh pr view` calls intermittently fail with `Post "...": EOF` or a
+timeout. Every datum they return is also recoverable from the local clone,
+because merged PRs are squash-commits whose message body **is** the PR
+description. Map each PR's merge SHA from the §2 commit list (`%h`), then:
+
+```bash
+git show -s --format='%b' <sha>            # PR body (squash-merge description)
+git show --stat --format='' <sha> | tail -1  # "N files changed, +A insertions, -D deletions"
+```
+
+Retry `gh` once or twice first (the EOF is usually transient); if it keeps
+failing, switch to the git commands above rather than blocking the run.
 
 ## 3. Keep / skip rules (user-facing test)
 
@@ -348,3 +387,44 @@ Report back in the chat reply (not in any md):
   - Example-only fixes / docs: #NNN #NNN ...
   - Skill / tooling: #NNN
   ```
+
+## 8. Publish to the wiki (only when asked)
+
+The default output is the four local files (§7). **When the user asks to
+publish**, the running log lives in the GitHub wiki, a **separate git repo**
+`hw-native-sys/simpler.wiki.git`. Only the two `_zh.md` docs are published there
+(the wiki convention is Chinese-only); the English files stay local.
+
+Clone the wiki into the scratchpad, copy the two `_zh.md` in under their
+existing names (`WEEKLY_CHANGES_<Friday>_zh.md` /
+`WEEKLY_ALL_PRS_<Friday>_zh.md`), and prepend this week's links to the **top**
+of each section in the `simpler-Wiki.md` index (it is newest-first):
+
+```bash
+- [WEEKLY_CHANGES_<Friday>_zh (<START> ~ <END>)](WEEKLY_CHANGES_<Friday>_zh)
+- [WEEKLY_ALL_PRS_<Friday>_zh (<START> ~ <END>)](WEEKLY_ALL_PRS_<Friday>_zh)
+```
+
+Match the existing wiki pages' style when copying — reuse the exact Chinese H1
+wording and its full-width parentheses verbatim from a prior week's `_zh` page
+(open one and copy the heading form) rather than re-deriving them, so the title
+stays consistent with the earlier pages. Two gotchas:
+
+- **A fresh wiki clone has no git identity** — `commit` fails with an
+  unknown-author error. Set it first (reuse the main repo's): `git -C <wiki>
+  config user.name "$(git -C <repo> config user.name)"` and the same for
+  `user.email`.
+- Publishing to the wiki is **team-visible** — it is an outward push, so do it
+  only on an explicit request, not as part of the default run.
+
+```bash
+WIKI=<scratchpad>/simpler.wiki
+git clone git@github.com:hw-native-sys/simpler.wiki.git "$WIKI"
+cp WEEKLY_CHANGES_<Friday>_zh.md WEEKLY_ALL_PRS_<Friday>_zh.md "$WIKI/"
+# edit "$WIKI/simpler-Wiki.md": prepend the two links above to their sections
+git -C "$WIKI" config user.name  "$(git config user.name)"
+git -C "$WIKI" config user.email "$(git config user.email)"
+git -C "$WIKI" add -A
+git -C "$WIKI" commit -m "Add weekly docs for <START> ~ <END> (zh)"
+git -C "$WIKI" push origin HEAD
+```
