@@ -6,24 +6,28 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""Host-side staging for post-fork zero-copy host buffers.
+"""Host-side handling for post-fork zero-copy host buffers.
 
 ``submit_next_level`` calls ``_stage_host_buffers_for_chip_submit`` before any
 dispatch. A ``create_host_buffer`` buffer is born-shared — its bytes already
 live in the child-visible shm and the child writes results back into the same
 pages — so staging copies in neither direction; it only validates that each
-in-range view fits inside its buffer. These are pure host-side unit tests: they
-inject the staging state directly and never fork, compile a kernel, or touch a
-device. The end-to-end round-trip lives in the a2a3sim scene test.
+in-range view fits inside its buffer. The SubWorker tests also exercise
+MAP/UNMAP control handling and parent-to-child address rewriting directly
+against the child loop. These tests never compile a kernel or touch a device;
+the end-to-end chip round-trip lives in the a2a3sim scene test.
 """
 
 from __future__ import annotations
 
 import ctypes
+import struct
+from multiprocessing.shared_memory import SharedMemory
 
 import pytest
+import simpler.worker as worker_mod
 import torch
-from simpler.task_interface import TaskArgs, TensorArgType
+from simpler.task_interface import MAILBOX_SIZE, TaskArgs, TensorArgType, WorkerType
 from simpler.worker import Worker, _HostBufEntry
 
 from simpler_setup import make_tensor_arg
@@ -107,3 +111,127 @@ class TestZeroCopyStagingSkip:
         w = _staging_worker(_entry_for(parent, shm_buf))
         w._stage_host_buffers_for_chip_submit(_arg(parent[64:128], TensorArgType.INPUT))
         assert list(shm_buf[:4]) == [9.0, 9.0, 9.0, 9.0]
+
+
+def test_host_buffer_control_reaches_l3_sub_workers():
+    calls = []
+
+    class FakeWorker:
+        def broadcast_control_all(self, worker_type, sub_cmd, payload, digest, *, timeout_s):
+            calls.append((worker_type, sub_cmd, bytes(payload), digest, timeout_s))
+            return []
+
+    worker = Worker(level=3)
+    worker._initialized = True
+    worker._hierarchical_started = True
+    worker._chip_shms = [None]
+    worker._worker = FakeWorker()
+    worker._start_hierarchical = lambda: None
+
+    handle = worker.create_host_buffer(8)
+    try:
+        assert [(call[0], call[1]) for call in calls] == [
+            (WorkerType.NEXT_LEVEL, worker_mod._CTRL_MAP_HOST),
+            (WorkerType.SUB, worker_mod._CTRL_MAP_HOST),
+        ]
+    finally:
+        handle.buffer.release()
+        worker.free_host_buffer(handle)
+
+    assert [(call[0], call[1]) for call in calls[2:]] == [
+        (WorkerType.NEXT_LEVEL, worker_mod._CTRL_UNMAP_HOST),
+        (WorkerType.SUB, worker_mod._CTRL_UNMAP_HOST),
+    ]
+
+
+def test_l3_sub_worker_maps_rewrites_and_unmaps_host_buffer(monkeypatch):
+    mailbox = SharedMemory(create=True, size=MAILBOX_SIZE)
+    host = SharedMemory(create=True, size=8)
+    staged = None
+    mailbox_buf = mailbox.buf
+    host_buf = host.buf
+    assert mailbox_buf is not None
+    assert host_buf is not None
+
+    try:
+        struct.pack_into("<Q", host_buf, 0, 41)
+        parent_addr = worker_mod._shm_base_addr(host)
+        payload = worker_mod._HOST_BUF_MAP_HEADER.pack(7, parent_addr, 8) + host.name.encode("utf-8")
+        staged = SharedMemory(create=True, size=len(payload))
+        assert staged.buf is not None
+        staged.buf[: len(payload)] = payload
+
+        struct.pack_into("<Q", mailbox_buf, worker_mod._OFF_CALLABLE, worker_mod._CTRL_MAP_HOST)
+        struct.pack_into("<Q", mailbox_buf, worker_mod._CTRL_OFF_ARG0, len(payload))
+        shm_name = staged.name.encode("utf-8")
+        mailbox_buf[worker_mod._OFF_ARGS : worker_mod._OFF_ARGS + len(shm_name)] = shm_name
+
+        digest = bytes(range(32))
+        # MAP, use the child mapping, UNMAP, verify rewriting stops, then exit.
+        states = iter(
+            (
+                worker_mod._CONTROL_REQUEST,
+                worker_mod._TASK_READY,
+                worker_mod._CONTROL_REQUEST,
+                worker_mod._TASK_READY,
+                worker_mod._SHUTDOWN,
+            )
+        )
+        called = []
+
+        def load_state(_state_addr):
+            state = next(states)
+            if state == worker_mod._TASK_READY:
+                start = worker_mod._OFF_TASK_CALLABLE_HASH
+                mailbox_buf[start : start + len(digest)] = digest
+                struct.pack_into("<ii", mailbox_buf, worker_mod._OFF_TASK_ARGS_BLOB, 1, 0)
+                struct.pack_into("<Q", mailbox_buf, worker_mod._OFF_TASK_ARGS_BLOB + 8, parent_addr)
+            elif state == worker_mod._CONTROL_REQUEST and called:
+                unmap_payload = worker_mod._HOST_BUF_UNMAP.pack(7)
+                assert staged is not None
+                staged_buf = staged.buf
+                assert staged_buf is not None
+                staged_buf[: len(unmap_payload)] = unmap_payload
+                staged_buf.release()
+                struct.pack_into("<Q", mailbox_buf, worker_mod._OFF_CALLABLE, worker_mod._CTRL_UNMAP_HOST)
+                struct.pack_into("<Q", mailbox_buf, worker_mod._CTRL_OFF_ARG0, len(unmap_payload))
+                mailbox_buf[worker_mod._OFF_ARGS : worker_mod._OFF_ARGS + worker_mod._CTRL_SHM_NAME_BYTES] = (
+                    b"\x00" * worker_mod._CTRL_SHM_NAME_BYTES
+                )
+                mailbox_buf[worker_mod._OFF_ARGS : worker_mod._OFF_ARGS + len(shm_name)] = shm_name
+            return state
+
+        def read_args(buf):
+            child_addr = struct.unpack_from("<Q", buf, worker_mod._OFF_TASK_ARGS_BLOB + 8)[0]
+            if called:
+                assert child_addr == parent_addr
+                return object()
+            assert child_addr != parent_addr
+            value = ctypes.c_uint64.from_address(child_addr)
+            assert value.value == 41
+            value.value = 42
+            return object()
+
+        monkeypatch.setattr(worker_mod, "_mailbox_load_i32", load_state)
+        monkeypatch.setattr(worker_mod, "_mailbox_store_i32", lambda *_args: None)
+        monkeypatch.setattr(worker_mod, "_read_args_from_mailbox", read_args)
+
+        worker_mod._sub_worker_loop(
+            mailbox_buf,
+            {0: lambda _args: called.append(True)},
+            {digest: 0},
+            {digest: 1},
+        )
+
+        assert called == [True, True], worker_mod._read_error_msg(mailbox_buf)
+        assert struct.unpack_from("<Q", host_buf, 0)[0] == 42
+    finally:
+        mailbox_buf.release()
+        host_buf.release()
+        mailbox.close()
+        mailbox.unlink()
+        host.close()
+        host.unlink()
+        if staged is not None:
+            staged.close()
+            staged.unlink()

@@ -150,20 +150,19 @@ with orch.allocate_domain(...) as handle:
 
 ## 6. Host tensor visibility for `worker.run`
 
-A host tensor passed to `worker.run(...)` / `orch.submit_next_level(...)` is
-ultimately dereferenced from the forked chip child, not the parent, so its
-memory must be reachable there. Zero-copy requires born-shared memory (a virtual
-address is not portable across the fork, so the child can only reach the same
-physical pages via a MAP_SHARED backing established at allocation time), which is
-why the buffer is worker-allocated rather than a user tensor. Two sources are
-legal:
+A host tensor passed to `worker.run(...)` / `orch.submit_next_level(...)` /
+`orch.submit_sub(...)` is ultimately dereferenced from a forked local L3 child,
+not the parent, so its memory must be backed by pages mapped into that child.
+Fork-inherited MAP_SHARED mappings retain their virtual address, while post-fork
+worker-allocated buffers may map at a different address and have their pointers
+rewritten before decoding. Two sources are legal:
 
 | Source | How | Why it works |
 | ------ | --- | ------------ |
-| **fork-inherited** | `tensor.share_memory_()` **before the chip children are forked** (i.e. before the first `Worker.run()`) | the child inherits the MAP_SHARED page at fork |
-| **worker-allocated post-fork** | `worker.create_host_buffer(nbytes)` after the chips exist | born-shared memory attached into every child, **zero-copy** |
+| **fork-inherited** | `tensor.share_memory_()` **before the local L3 children are forked** (i.e. before the first `Worker.run()`) | the child inherits the MAP_SHARED page at fork |
+| **worker-allocated post-fork** | `worker.create_host_buffer(nbytes)` after the children exist | born-shared memory attached into every local child, **zero-copy** |
 
-The chip children are forked lazily on the **first** `run()`. A host tensor
+The local L3 children are forked lazily on the **first** `run()`. A host tensor
 created after that — the natural dynamic-shape serving pattern — is invisible to
 the children unless it lives in a `create_host_buffer` buffer:
 

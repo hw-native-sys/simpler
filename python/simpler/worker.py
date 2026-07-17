@@ -232,7 +232,7 @@ _CTRL_PY_REGISTER = 10
 _CTRL_PY_UNREGISTER = 11
 _CTRL_PY_IMPORT_REGISTER = 12
 # Host-buffer registration. MAP_HOST maps a named host-buffer shm
-# into every chip child *post-fork* and keeps it mapped so later runs can copy
+# into every local L3 child *post-fork* and keeps it mapped so later runs can copy
 # through it; UNMAP_HOST drops one. The child also records the parent VA range
 # the shm stands in for, so the per-task blob's host pointers (raw parent VAs)
 # can be rewritten to the child's own mapping before the runtime dereferences
@@ -387,7 +387,7 @@ _IdentitySnapshotEntry = tuple[bytes, Any, int, str, str]
 class _HostBufEntry:
     """Parent-side record for a born-shared post-fork host buffer.
 
-    The worker owns ``shm`` — a named buffer the chip children attach and
+    The worker owns ``shm`` — a named buffer the local L3 children attach and
     read/write through. The user builds a tensor over it (via the buffer
     protocol on :class:`HostBuffer`), so the buffer *is* the shm: ``data_ptr ==
     shm_base`` and no per-run copy is needed (the child reads and writes the same
@@ -407,7 +407,7 @@ class HostBuffer:
     """Handle for a worker-allocated, born-shared host buffer (zero-copy).
 
     Returned by ``Worker.create_host_buffer``. ``buffer`` is a ``memoryview``
-    over shared memory already attached into every chip child; wrap it with
+    over shared memory already attached into every local L3 child; wrap it with
     ``torch.frombuffer`` / ``np.frombuffer`` to get a real tensor whose writes
     land directly in the child-visible pages — no per-run copy. ``token`` /
     ``data_ptr`` / ``nbytes`` identify the mapping; pass this handle back to
@@ -934,46 +934,62 @@ def _sub_worker_loop(
     rethrows it as ``std::runtime_error``.
     """
     state_addr = _buffer_field_addr(buf, _OFF_STATE)
-    while True:
-        state = _mailbox_load_i32(state_addr)
-        if state == _TASK_READY:
-            digest = _read_task_digest(buf)
-            cid = identity_table.get(digest)
-            fn = registry.get(int(cid)) if cid is not None else None
-            code = 0
-            msg = ""
-            if fn is None:
-                code = 1
-                msg = f"sub_worker: callable hash {_format_digest(digest)} not registered"
-            else:
+    host_buf_table: dict[int, tuple[SharedMemory, int, int, int]] = {}
+    host_buf_ranges: list[tuple[int, int, int]] = []
+    try:
+        while True:
+            state = _mailbox_load_i32(state_addr)
+            if state == _TASK_READY:
+                digest = _read_task_digest(buf)
+                cid = identity_table.get(digest)
+                fn = registry.get(int(cid)) if cid is not None else None
+                code = 0
+                msg = ""
+                if fn is None:
+                    code = 1
+                    msg = f"sub_worker: callable hash {_format_digest(digest)} not registered"
+                else:
+                    try:
+                        if host_buf_ranges:
+                            _rewrite_blob_host_addrs(buf, _OFF_TASK_ARGS_BLOB, host_buf_ranges)
+                        args = _read_args_from_mailbox(buf)
+                        fn(args)
+                    except Exception as e:  # noqa: BLE001
+                        code = 1
+                        msg = _format_exc("sub_worker", e)
+                _write_error(buf, code, msg)
+                _mailbox_store_i32(state_addr, _TASK_DONE)
+            elif state == _CONTROL_REQUEST:
+                sub_cmd = struct.unpack_from("Q", buf, _OFF_CALLABLE)[0]
+                code = 0
+                msg = ""
                 try:
-                    args = _read_args_from_mailbox(buf)
-                    fn(args)
+                    if sub_cmd == _CTRL_MAP_HOST:
+                        _handle_ctrl_map_host(buf, host_buf_table, host_buf_ranges)
+                    elif sub_cmd == _CTRL_UNMAP_HOST:
+                        _handle_ctrl_unmap_host(buf, host_buf_table, host_buf_ranges)
+                    else:
+                        _handle_py_callable_control(
+                            buf,
+                            registry,
+                            identity_table,
+                            identity_refs,
+                            int(sub_cmd),
+                            context="sub_worker",
+                        )
                 except Exception as e:  # noqa: BLE001
                     code = 1
-                    msg = _format_exc("sub_worker", e)
-            _write_error(buf, code, msg)
-            _mailbox_store_i32(state_addr, _TASK_DONE)
-        elif state == _CONTROL_REQUEST:
-            sub_cmd = struct.unpack_from("Q", buf, _OFF_CALLABLE)[0]
-            code = 0
-            msg = ""
+                    msg = _format_exc("sub_worker control", e)
+                _write_error(buf, code, msg)
+                _mailbox_store_i32(state_addr, _CONTROL_DONE)
+            elif state == _SHUTDOWN:
+                break
+    finally:
+        for host_shm, _lo, _hi, _base in host_buf_table.values():
             try:
-                _handle_py_callable_control(
-                    buf,
-                    registry,
-                    identity_table,
-                    identity_refs,
-                    int(sub_cmd),
-                    context="sub_worker",
-                )
-            except Exception as e:  # noqa: BLE001
-                code = 1
-                msg = _format_exc("sub_worker control", e)
-            _write_error(buf, code, msg)
-            _mailbox_store_i32(state_addr, _CONTROL_DONE)
-        elif state == _SHUTDOWN:
-            break
+                host_shm.close()
+            except Exception:  # noqa: BLE001
+                pass
 
 
 def _read_shm_name(buf, offset: int) -> str:
@@ -1796,7 +1812,7 @@ class Worker:
 
         # Post-fork zero-copy host buffers (``create_host_buffer``). Keyed by the
         # born-shared shm's mapped base (== the buffer's data_ptr); each entry maps
-        # a named shm into every chip child so memory created after the children
+        # a named shm into every local L3 child so memory created after the children
         # were forked is still reachable by a later run — with no per-run copy.
         self._host_buf_registry: dict[int, _HostBufEntry] = {}
         # Immutable read snapshot for the lock-free per-submit lookup
@@ -4204,10 +4220,10 @@ class Worker:
     # ------------------------------------------------------------------
 
     def create_host_buffer(self, nbytes: int) -> HostBuffer:
-        """Allocate a born-shared host buffer, attached into every chip child,
+        """Allocate a born-shared host buffer, attached into every local L3 child,
         that a later ``run()`` reads/writes with **no per-run copy**.
 
-        L3 chip children are forked lazily on the first ``run()``; memory created
+        Local L3 children are forked lazily on the first ``run()``; memory created
         afterwards is not in their address space. This hands you memory that is
         *born* in a shm already attached into every child, so there is nothing to
         copy: the child reads and writes the same physical pages the parent sees.
@@ -4223,7 +4239,7 @@ class Worker:
             worker.free_host_buffer(buf)           # drop the tensor first
 
         simpler stays framework-free: torch/numpy appear only on the user's side
-        (``frombuffer``). Blocks until every chip child has attached the buffer;
+        (``frombuffer``). Blocks until every local L3 child has attached the buffer;
         not thread-safe against a concurrent ``run`` / ``create`` / ``free`` on
         the same Worker — drive them from one thread, as the L3 worker is
         otherwise.
@@ -4270,17 +4286,10 @@ class Worker:
                 self._rebuild_host_buf_snapshot()
 
             payload = _HOST_BUF_MAP_HEADER.pack(token, data_ptr, nbytes) + shm.name.encode("utf-8")
-            results = self._worker.broadcast_control_all(
-                WorkerType.NEXT_LEVEL,
-                int(_CTRL_MAP_HOST),
-                payload,
-                None,
-                timeout_s=self._py_control_timeout_s,
-            )
-            errors = self._control_errors(list(results))
+            errors = self._broadcast_host_control(_CTRL_MAP_HOST, payload)
             if errors:
                 raise RuntimeError(
-                    f"create_host_buffer: MAP_HOST failed on {len(errors)} chip children; first error: {errors[0]}"
+                    f"create_host_buffer: MAP_HOST failed on {len(errors)} local L3 children; first error: {errors[0]}"
                 )
         except BaseException:
             # Roll back on any failure — a staging error before the map, a partial
@@ -4315,7 +4324,7 @@ class Worker:
     def free_host_buffer(self, handle: HostBuffer) -> None:
         """Release a born-shared buffer created by ``create_host_buffer``.
 
-        Unmaps it from every chip child and frees the parent shm. Drop every
+        Unmaps it from every local L3 child and frees the parent shm. Drop every
         tensor / ``memoryview`` you built over ``handle.buffer`` *first*: a live
         view keeps the shm's pages exported, so ``close()`` cannot release them
         and the buffer only warns (and is reclaimed once the last view is gone).
@@ -4344,7 +4353,7 @@ class Worker:
         if errors:
             sys.stderr.write(
                 f"[worker pid={os.getpid()}] WARN: free_host_buffer token={entry.token} "
-                f"failed on {len(errors)} chip children; first error: {errors[0]}\n"
+                f"failed on {len(errors)} local L3 children; first error: {errors[0]}\n"
             )
             sys.stderr.flush()
 
@@ -4396,17 +4405,24 @@ class Worker:
                 self._close_host_shm(entry)
 
     def _broadcast_host_unmap(self, token: int) -> list[str]:
-        """Broadcast _CTRL_UNMAP_HOST for ``token`` to every chip child."""
+        """Broadcast _CTRL_UNMAP_HOST for ``token`` to every local L3 child."""
+        return self._broadcast_host_control(_CTRL_UNMAP_HOST, _HOST_BUF_UNMAP.pack(token))
+
+    def _broadcast_host_control(self, sub_cmd: int, payload: bytes) -> list[str]:
         if self._worker is None:
             return []
-        results = self._worker.broadcast_control_all(
-            WorkerType.NEXT_LEVEL,
-            int(_CTRL_UNMAP_HOST),
-            _HOST_BUF_UNMAP.pack(token),
-            None,
-            timeout_s=self._py_control_timeout_s,
-        )
-        return self._control_errors(list(results))
+        results = []
+        for worker_type in (WorkerType.NEXT_LEVEL, WorkerType.SUB):
+            results.extend(
+                self._worker.broadcast_control_all(
+                    worker_type,
+                    int(sub_cmd),
+                    payload,
+                    None,
+                    timeout_s=self._py_control_timeout_s,
+                )
+            )
+        return self._control_errors(results)
 
     def _stage_host_buffers_for_chip_submit(self, args: Any) -> None:
         """Validate the host tensors of one chip submit before dispatch.
@@ -4610,7 +4626,7 @@ class Worker:
             sys.stderr.flush()
 
         # Release any host buffers the user never unregistered. Must run while
-        # the chip mailboxes are still usable (before _worker.close()).
+        # the local L3 child mailboxes are still usable (before _worker.close()).
         self._release_all_host_buffers()
 
         if self.level == 2:
