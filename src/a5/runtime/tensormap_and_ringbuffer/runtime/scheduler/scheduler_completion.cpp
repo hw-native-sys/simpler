@@ -290,21 +290,18 @@ void SchedulerContext::check_running_cores_for_completion(
         }
 #endif
 
-        // Task-timing finish: latest FIN observation for a tagged task, folded as
-        // max at the same point L2 captures finish_time (after rmb, before fanin/
-        // deferred-completion work). Independent of L2 swimlane level so it works
-        // in SIMPLER_DFX=0 builds; untagged tasks pay only the cache-hot compare.
-        if (t.pending_done && core.pending_slot_state->task->task_timing_slot != TASK_TIMING_SLOT_NONE) {
-            aicpu_task_timing_finish(core.pending_slot_state->task->task_timing_slot, thread_idx);
-        }
-        if (t.running_done && core.running_slot_state->task->task_timing_slot != TASK_TIMING_SLOT_NONE) {
-            aicpu_task_timing_finish(core.running_slot_state->task->task_timing_slot, thread_idx);
-        }
-
         // --- Apply phase: execute actions based on transition ---
 
         // 1. Complete finished tasks (capture pointers before modifying core state)
         if (t.pending_done) {
+            // Task-timing finish: latest FIN observation for a tagged task, folded
+            // as max. Sampled after the rmb above and before complete_slot_task runs
+            // fanin / deferred-completion (which may also clear pending_slot_state),
+            // matching L2's finish_time point. Independent of L2 swimlane level, so
+            // it works in SIMPLER_DFX=0 builds; untagged tasks pay only the compare.
+            if (core.pending_slot_state->task->task_timing_slot != TASK_TIMING_SLOT_NONE) {
+                aicpu_task_timing_finish(core.pending_slot_state->task->task_timing_slot, thread_idx);
+            }
             complete_slot_task(
                 *core.pending_slot_state, core.pending_reg_task_id, core.pending_subslot, thread_idx, core_id, hank,
                 completed_this_turn, deferred_release_slot_states, deferred_release_count
@@ -316,6 +313,9 @@ void SchedulerContext::check_running_cores_for_completion(
             cur_thread_completed++;
         }
         if (t.running_done) {
+            if (core.running_slot_state->task->task_timing_slot != TASK_TIMING_SLOT_NONE) {
+                aicpu_task_timing_finish(core.running_slot_state->task->task_timing_slot, thread_idx);
+            }
             complete_slot_task(
                 *core.running_slot_state, core.running_reg_task_id, core.running_subslot, thread_idx, core_id, hank,
                 completed_this_turn, deferred_release_slot_states, deferred_release_count

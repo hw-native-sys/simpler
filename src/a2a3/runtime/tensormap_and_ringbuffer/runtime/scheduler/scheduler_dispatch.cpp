@@ -232,8 +232,9 @@ SchedulerContext::PublishHandle SchedulerContext::prepare_subtask_to_core(
     }
 #endif
 
-    return PublishHandle{core_exec_state.reg_addr,          reg_task_id, core_offset, dispatch_timestamp_slot,
-                         slot_state.task->task_timing_slot, thread_idx};
+    return PublishHandle{
+        core_exec_state.reg_addr, reg_task_id, core_offset, dispatch_timestamp_slot, slot_state.task->task_timing_slot
+    };
 }
 
 int SchedulerContext::prepare_block_for_dispatch(
@@ -383,7 +384,7 @@ void SchedulerContext::dispatch_shape(
             }
 #endif
             for (int i = 0; i < handle_count; i++) {
-                publish_subtask_to_core(handles[i], dispatch_ts);
+                publish_subtask_to_core(handles[i], dispatch_ts, thread_idx);
             }
             handle_count = 0;
             made_progress = true;
@@ -652,7 +653,7 @@ int32_t SchedulerContext::stage_consumer_blocks(
     if (n > 0) {
         wmb();
         for (int i = 0; i < n; i++) {
-            publish_subtask_to_core(handles[i], early_dispatch_ts);
+            publish_subtask_to_core(handles[i], early_dispatch_ts, thread_idx);
             int32_t cid = tracker.get_core_id_by_offset(handles[i].core_offset);
             sched_->early_dispatch_doorbell_table[cid].addr = handles[i].reg_addr;
             sched_->early_dispatch_doorbell_table[cid].token = handles[i].reg_task_id;
