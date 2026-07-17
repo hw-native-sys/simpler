@@ -1078,7 +1078,8 @@ _HTML_TEMPLATE = """<!DOCTYPE html>
   <span class="stat">{n_edges} edges</span>
   <span class="divider"></span>
   <kbd>drag</kbd><span>pan</span>
-  <kbd>wheel</kbd><span>zoom</span>
+  <kbd>scroll</kbd><span>pan</span>
+  <kbd>ctrl+scroll</kbd><span>zoom</span>
   <kbd>click</kbd><span>task</span>
   <kbd>f</kbd><span>fit</span>
   <kbd>r</kbd><span>reset</span>
@@ -1235,13 +1236,29 @@ _HTML_TEMPLATE = """<!DOCTYPE html>
 
   stage.addEventListener('wheel', (e) => {{
     e.preventDefault();
-    const rect = stage.getBoundingClientRect();
-    const cx = e.clientX - rect.left, cy = e.clientY - rect.top;
-    const factor = Math.exp(-e.deltaY * 0.001);
-    const newScale = Math.min(20, Math.max(0.02, scale * factor));
-    tx = cx - (cx - tx) * (newScale / scale);
-    ty = cy - (cy - ty) * (newScale / scale);
-    scale = newScale;
+    let dx = e.deltaX, dy = e.deltaY;
+    if (e.deltaMode === WheelEvent.DOM_DELTA_LINE) {{
+      dx *= 16;
+      dy *= 16;
+    }} else if (e.deltaMode === WheelEvent.DOM_DELTA_PAGE) {{
+      dx *= stage.clientWidth;
+      dy *= stage.clientHeight;
+    }}
+
+    // ctrlKey is set by a real Ctrl+wheel and by trackpad pinch-to-zoom;
+    // a bare wheel / two-finger swipe pans.
+    if (e.ctrlKey) {{
+      const rect = stage.getBoundingClientRect();
+      const cx = e.clientX - rect.left, cy = e.clientY - rect.top;
+      const factor = Math.min(1.25, Math.max(0.8, Math.exp(-dy * 0.003)));
+      const newScale = Math.min(20, Math.max(0.02, scale * factor));
+      tx = cx - (cx - tx) * (newScale / scale);
+      ty = cy - (cy - ty) * (newScale / scale);
+      scale = newScale;
+    }} else {{
+      tx -= dx;
+      ty -= dy;
+    }}
     apply();
   }}, {{ passive: false }});
 

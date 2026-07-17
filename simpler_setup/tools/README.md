@@ -387,7 +387,8 @@ at view time.
 ### Browser controls
 
 - **drag** → pan
-- **wheel** → zoom about cursor
+- **scroll / two-finger swipe** → pan
+- **Ctrl+scroll / trackpad pinch** → zoom about cursor
 - **f** → fit to view
 - **r** → reset to 1:1
 
@@ -504,8 +505,8 @@ The tools extract the `func_id` to `name` mapping from the `KERNELS` list.
 
 - A structural view of task dependencies (who feeds whom)
 - Fast grep-friendly inspection via the default text output
-- A single-file HTML you can open offline, drag-pan / wheel-zoom in any
-  browser when you want a visual layout
+- A single-file HTML you can open offline and pan by dragging or scrolling;
+  use Ctrl+scroll or trackpad pinch to zoom
 - Optional per-task tensor rows and arg-port routing in HTML via
   `--show-tensor-info`
 - A graph that survives without an associated timing run (deps.json is

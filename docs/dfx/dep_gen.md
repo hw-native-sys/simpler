@@ -210,9 +210,10 @@ observed task and tensor — that is not an error.
 
 `simpler_setup/tools/deps_viewer.py` turns `deps.json` into either a
 plain-text dependency view (default) or a self-contained pan/zoom HTML page
-(Graphviz SVG + inline vanilla-JS drag-pan + wheel-zoom). The text view is
-optimized for grep / diff / "what does task X depend on?" debugging; the HTML
-view stays available when you want a visual layout.
+(Graphviz SVG with inline vanilla-JS drag/scroll panning and Ctrl+scroll or
+pinch zooming). The text view is optimized for grep / diff / "what does task X
+depend on?" debugging; the HTML view stays available when you want a visual
+layout.
 
 ```bash
 # Newest deps.json under outputs/ -> deps_viewer.txt
@@ -273,7 +274,8 @@ and arg-port edge routing, rerun the HTML export with `--show-tensor-info`.
 Browser controls in the HTML viewer:
 
 - **drag** → pan
-- **wheel** → zoom about cursor
+- **scroll / two-finger swipe** → pan
+- **Ctrl+scroll / trackpad pinch** → zoom about cursor
 - **`f` key** → fit to view
 - **`r` key** → reset to 1:1
 
