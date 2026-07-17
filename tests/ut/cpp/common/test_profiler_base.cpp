@@ -15,7 +15,7 @@
  * The framework runs `min(aicpu_thread_num, Module::kMaxCollectorThreads)`
  * drain+collector threads while scanning `aicpu_thread_num` device ready
  * queues. Those two counts are equal for the scheduler-fed subsystems
- * (L2Swimlane / TensorDump / PMU) but differ for the orchestrator-only ones
+ * (L2Swimlane / ArgsDump / PMU) but differ for the orchestrator-only ones
  * (DepGen / ScopeStats), whose single producer writes the LAST queue while
  * only one shard exists. Both shapes are covered here.
  */
