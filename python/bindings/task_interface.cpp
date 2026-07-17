@@ -404,6 +404,13 @@ public:
     }
 };
 
+struct L2ChildOnboardRegionExport {
+    uint64_t device_addr{0};
+    uint64_t mapping_bytes{0};
+    uint64_t shareable_handle{0};
+    uint64_t registry_handle{0};
+};
+
 class L3HostMappedRegionRegistry {
 public:
     uint64_t emplace(L3HostMappedRegion mapping) {
@@ -1471,6 +1478,12 @@ NB_MODULE(_task_interface, m) {
         "Tags are not preserved (blob wire format strips them)."
     );
 
+    nb::class_<L2ChildOnboardRegionExport>(m, "_L2ChildOnboardRegionExport")
+        .def_ro("device_addr", &L2ChildOnboardRegionExport::device_addr)
+        .def_ro("mapping_bytes", &L2ChildOnboardRegionExport::mapping_bytes)
+        .def_ro("shareable_handle", &L2ChildOnboardRegionExport::shareable_handle)
+        .def_ro("registry_handle", &L2ChildOnboardRegionExport::registry_handle);
+
     m.def(
         "_l3_host_mapped_region_import_sim",
         [](const std::string &token, uint64_t mapping_bytes) -> uint64_t {
@@ -1645,7 +1658,7 @@ NB_MODULE(_task_interface, m) {
     );
     m.def(
         "_l3_child_onboard_region_create",
-        [](uint64_t nbytes) -> std::tuple<uint64_t, uint64_t, uint64_t, uint64_t> {
+        [](uint64_t nbytes) -> L2ChildOnboardRegionExport {
             if (nbytes == 0 || nbytes > static_cast<uint64_t>(std::numeric_limits<size_t>::max())) {
                 throw std::invalid_argument("L3-L2 onboard child region requires a positive mapping size");
             }
@@ -1669,7 +1682,12 @@ NB_MODULE(_task_interface, m) {
             }
             region.device_addr = reinterpret_cast<uint64_t>(mapped_addr);
             uint64_t registry_handle = g_l2_child_onboard_regions.emplace(region);
-            return std::make_tuple(region.device_addr, region.mapping_bytes, region.shareable_handle, registry_handle);
+            return L2ChildOnboardRegionExport{
+                region.device_addr,
+                region.mapping_bytes,
+                region.shareable_handle,
+                registry_handle,
+            };
         },
         nb::arg("nbytes"), nb::call_guard<nb::gil_scoped_release>(),
         "Create and export a child-owned onboard VMM region."

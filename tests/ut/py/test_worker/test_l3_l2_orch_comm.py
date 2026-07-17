@@ -126,6 +126,31 @@ class _EndpointFailingOrch:
         )
 
 
+class _NamedOnboardRegionExport:
+    def __init__(self) -> None:
+        self.device_addr = 0xD00D_0000
+        self.mapping_bytes = 65536
+        self.shareable_handle = 0xABCDEF
+        self.registry_handle = 77
+
+
+class _FakeChipWorkerForRegionCreate:
+    device_id = 2
+
+    def __init__(self) -> None:
+        self.copy_calls: list[tuple[int, int]] = []
+
+    def copy_to(self, dst: int, _src: int, size: int) -> None:
+        self.copy_calls.append((int(dst), int(size)))
+
+
+def _write_ctrl_shm_name(buf: memoryview, offset: int, name: str) -> None:
+    encoded = name.encode("utf-8")
+    assert len(encoded) < worker_module._CTRL_SHM_NAME_BYTES
+    buf[offset : offset + worker_module._CTRL_SHM_NAME_BYTES] = b"\x00" * worker_module._CTRL_SHM_NAME_BYTES
+    buf[offset : offset + len(encoded)] = encoded
+
+
 def _make_started_sim_worker() -> tuple[Worker, SharedMemory, _FakeDirectCWorker]:
     worker = Worker(level=3, device_ids=[0], platform="a2a3sim", runtime="tensormap_and_ringbuffer")
     shm = SharedMemory(create=True, size=4096)
@@ -354,6 +379,60 @@ def test_onboard_direct_mapping_allows_granularity_aligned_mapping(monkeypatch):
         worker._close_l3_l2_orch_comm()
         shm.close()
         shm.unlink()
+
+
+def test_onboard_region_create_handler_uses_named_export_fields(monkeypatch):
+    req_shm = SharedMemory(create=True, size=l3_l2_orch_comm._REGION_CREATE_REQUEST_BYTES)
+    reply_shm = SharedMemory(create=True, size=l3_l2_orch_comm._REGION_CREATE_REPLY_BYTES)
+    req_buf = cast(memoryview, req_shm.buf)
+    reply_buf = cast(memoryview, reply_shm.buf)
+    ctrl_storage = bytearray(worker_module._OFF_ARGS + 2 * worker_module._CTRL_SHM_NAME_BYTES)
+    ctrl_buf = memoryview(ctrl_storage)
+    cw = _FakeChipWorkerForRegionCreate()
+    typed_cw = cast(Any, cw)
+    close_calls: list[int] = []
+    try:
+        l3_l2_orch_comm.L3L2RegionCreateRequest(
+            magic_version=0x4C334C3200020000,
+            request_bytes=l3_l2_orch_comm._REGION_CREATE_REQUEST_BYTES,
+            payload_bytes=64,
+            counter_bytes=128,
+            l3_host_pid=1234,
+        ).encode_into(req_buf)
+        _write_ctrl_shm_name(ctrl_buf, worker_module._OFF_ARGS, req_shm.name)
+        _write_ctrl_shm_name(ctrl_buf, worker_module._OFF_ARGS + worker_module._CTRL_SHM_NAME_BYTES, reply_shm.name)
+        monkeypatch.setattr(
+            worker_module,
+            "_l3_child_onboard_region_create",
+            lambda _nbytes: _NamedOnboardRegionExport(),
+        )
+        monkeypatch.setattr(
+            worker_module,
+            "_l3_child_onboard_region_close",
+            lambda handle: close_calls.append(int(handle)),
+        )
+
+        worker_module._handle_ctrl_l3_l2_region_create(typed_cw, ctrl_buf, "a2a3")
+
+        reply = l3_l2_orch_comm.decode_region_create_reply(reply_buf)
+        assert reply.desc.scalars() == [0x4C334C3200020000, 1, 0xD00D_0000, 64, 0xD00D_0040, 128]
+        assert reply.access_profile == l3_l2_orch_comm.L3L2RegionAccessProfile.ONBOARD_VMM
+        assert reply.device_id == 2
+        assert reply.mapping_bytes == 65536
+        assert reply.shareable_handle == 0xABCDEF
+        assert cw.copy_calls == [(0xD00D_0040, 128)]
+
+        region = worker_module._l2_host_l3_l2_regions(typed_cw).pop(1)
+        worker_module._release_l2_host_l3_l2_region(typed_cw, region)
+        assert close_calls == [77]
+    finally:
+        ctrl_buf.release()
+        del req_buf
+        del reply_buf
+        req_shm.close()
+        req_shm.unlink()
+        reply_shm.close()
+        reply_shm.unlink()
 
 
 def test_l3_host_mapped_counter_wait_releases_gil_for_python_notifier():

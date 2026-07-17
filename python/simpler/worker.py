@@ -1165,10 +1165,11 @@ def _handle_ctrl_l3_l2_region_create(  # noqa: PLR0912
             access_profile = L3L2RegionAccessProfile.SIM_POSIX_SHM
             mapping_bytes = total_bytes
         else:
-            dev_ptr, mapping_bytes, shareable_handle, onboard_handle = _l3_child_onboard_region_create(total_bytes)
-            dev_ptr = int(dev_ptr)
-            if dev_ptr == 0:
-                raise RuntimeError("CTRL_L3_L2_REGION_CREATE onboard VMM allocation returned null")
+            export = _l3_child_onboard_region_create(total_bytes)
+            dev_ptr = int(export.device_addr)
+            mapping_bytes = int(export.mapping_bytes)
+            shareable_handle = int(export.shareable_handle)
+            onboard_handle = int(export.registry_handle)
             region = _L2HostL3L2Region(
                 region_id=region_id,
                 payload_bytes=request.payload_bytes,
