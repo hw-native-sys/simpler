@@ -987,8 +987,14 @@ static int domain_alloc_via_ipc(
     // those kernels early-return on the workSpace guard.
     ensure_sdma_workspace(h);
 
-    uint64_t domain_workspace_addr = h->host_ctx.workSpace;
-    uint64_t domain_workspace_size = h->host_ctx.workSpaceSize;
+    uint64_t domain_workspace_addr = 0;
+    uint64_t domain_workspace_size = 0;
+#ifdef SIMPLER_ENABLE_PTO_SDMA_WORKSPACE
+    if (h->sdma_workspace) {
+        domain_workspace_addr = reinterpret_cast<uint64_t>(h->sdma_workspace->GetWorkspaceAddr());
+        domain_workspace_size = 16 * 1024;
+    }
+#endif
     if (rank_ids_are_dense_prefix(rank_ids, rank_count)) {
         if (!init_urma_workspace(
                 h, domain_rank, static_cast<uint32_t>(rank_count), localBuf, aligned_size, out->urma_workspace
@@ -1074,6 +1080,7 @@ static int domain_alloc_via_ipc(
     if (aret != ACL_SUCCESS) {
         LOG_ERROR("[comm rank %d] alloc_domain: ctx aclrtMalloc -> %d", h->rank, static_cast<int>(aret));
         out->urma_workspace.reset();
+        release_domain_peer_windows(*out);
         release_own_vmm_window(localBuf, handle);
         return -1;
     }
@@ -1082,6 +1089,7 @@ static int domain_alloc_via_ipc(
         LOG_ERROR("[comm rank %d] alloc_domain: ctx Memcpy H2D -> %d", h->rank, static_cast<int>(aret));
         aclrtFree(newDevMem);
         out->urma_workspace.reset();
+        release_domain_peer_windows(*out);
         release_own_vmm_window(localBuf, handle);
         return -1;
     }

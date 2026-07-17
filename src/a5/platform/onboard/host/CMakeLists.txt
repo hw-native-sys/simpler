@@ -181,15 +181,20 @@ find_library(HCOMM_LIB
         ${ASCEND_ARCH_HOME}/lib64
     NO_DEFAULT_PATH
 )
-if(HCCL_LIB AND HCOMM_LIB)
-    set(HCCL_LINK_TARGETS ${HCCL_LIB} ${HCOMM_LIB})
-    message(STATUS "Using HCCL libraries: ${HCCL_LIB};${HCOMM_LIB}")
+if(HCCL_LIB)
+    if(HCOMM_LIB)
+        set(HCCL_LINK_TARGETS ${HCCL_LIB} ${HCOMM_LIB})
+        message(STATUS "Using HCCL libraries: ${HCCL_LIB};${HCOMM_LIB}")
+    else()
+        set(HCCL_LINK_TARGETS ${HCCL_LIB})
+        message(STATUS "Using HCCL library: ${HCCL_LIB}")
+    endif()
 elseif(HCOMM_LIB)
     set(HCCL_LINK_TARGETS ${HCOMM_LIB})
     message(WARNING "libhccl not found; using HCCL library: ${HCOMM_LIB}")
 else()
     message(FATAL_ERROR
-        "libhcomm not found under ${ASCEND_HOME_PATH}/lib64 or ${ASCEND_ARCH_HOME}/lib64")
+        "Neither libhccl nor libhcomm found under ${ASCEND_HOME_PATH}/lib64 or ${ASCEND_ARCH_HOME}/lib64")
 endif()
 
 # Link against CANN runtime libraries

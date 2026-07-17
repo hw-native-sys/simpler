@@ -94,7 +94,7 @@ UrmaTput(const DstTensor &dst, const SrcTensor &src, __gm__ uint8_t *workspace, 
 namespace pto2::detail {
 
 template <typename PtoAsyncEvent, typename PtoAsyncSession>
-inline __aicore__ void register_urma_async_event(
+inline __aicore__ bool register_urma_async_event(
     AsyncCtx &ctx, const PtoAsyncEvent &event, const PtoAsyncSession &session, __gm__ uint8_t *workspace
 );
 
@@ -188,7 +188,9 @@ inline __aicore__ bool submit_urma_request_once(AsyncCtx &ctx, UrmaRequestDescri
     } else {
         event = pto::comm::TPUT_ASYNC<pto::comm::DmaEngine::URMA>(desc.dst, desc.src, session);
     }
-    pto2::detail::register_urma_async_event(ctx, event, session, desc.workspace);
+    if (!pto2::detail::register_urma_async_event(ctx, event, session, desc.workspace)) {
+        return false;
+    }
     pto2::detail::defer_flush(ctx);
     return true;
 #else
@@ -209,6 +211,10 @@ inline __aicore__ bool submit_chunked_urma_request(AsyncCtx &ctx, UrmaRequestDes
     }
 
     const uint64_t elem_count = tensor_element_count(desc.dst);
+    if (elem_count != tensor_element_count(desc.src)) {
+        pto2::detail::defer_error(ctx, PTO2_ERROR_ASYNC_COMPLETION_INVALID);
+        return false;
+    }
     const uint64_t total_bytes = elem_count * sizeof(RawDType);
     const uint64_t max_bytes = kUrmaMaxTransferBytes;
     if (total_bytes <= max_bytes) {
@@ -291,21 +297,22 @@ inline __aicore__ void defer_flush(AsyncCtx & /*ctx*/) { __asm__ __volatile__(""
 #endif
 
 template <typename PtoAsyncEvent, typename PtoAsyncSession>
-inline __aicore__ void register_urma_async_event(
+inline __aicore__ bool register_urma_async_event(
     AsyncCtx &ctx, const PtoAsyncEvent &event, const PtoAsyncSession &session, __gm__ uint8_t *workspace
 ) {
     if (ctx.task_token.is_invalid() || ctx.completion_count == nullptr || ctx.completion_entries == nullptr) {
         (void)event.Wait(session);
-        return;
+        return true;
     }
     if (event.handle == 0) {
-        return;
+        return true;
     }
 
     const uint32_t engine = static_cast<uint32_t>(event.engine);
     if (engine != static_cast<uint32_t>(::pto::comm::DmaEngine::URMA) || workspace == nullptr) {
         defer_error(ctx, PTO2_ERROR_ASYNC_COMPLETION_INVALID);
-        return;
+        (void)event.Wait(session);
+        return false;
     }
 
     CompletionToken token{
@@ -317,7 +324,10 @@ inline __aicore__ void register_urma_async_event(
     };
     if (!register_completion_condition(ctx, token)) {
         defer_error(ctx, PTO2_ERROR_ASYNC_REGISTRATION_FAILED);
+        (void)event.Wait(session);
+        return false;
     }
+    return true;
 }
 
 }  // namespace pto2::detail

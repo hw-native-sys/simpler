@@ -86,6 +86,13 @@ inline uintptr_t cache_line(const volatile void *addr) {
     return reinterpret_cast<uintptr_t>(addr) & ~(uintptr_t(PTO2_ALIGN_SIZE) - 1u);
 }
 
+inline void invalidate_object(const volatile void *addr, std::size_t size) {
+    const uintptr_t object_addr = reinterpret_cast<uintptr_t>(addr);
+    const uintptr_t begin = cache_line(addr);
+    const uintptr_t end = (object_addr + size + PTO2_ALIGN_SIZE - 1u) & ~(uintptr_t(PTO2_ALIGN_SIZE) - 1u);
+    cache_invalidate_range(reinterpret_cast<const void *>(begin), end - begin);
+}
+
 inline bool has_reached(uint32_t current, uint32_t target) { return static_cast<int32_t>(current - target) >= 0; }
 
 inline bool is_power_of_two(uint32_t value) { return value != 0 && (value & (value - 1u)) == 0; }
@@ -139,7 +146,7 @@ inline CompletionPollResult poll_urma_event_handle(uint64_t event_handle, uint64
     }
 
     auto *info = reinterpret_cast<volatile UrmaInfo *>(static_cast<uintptr_t>(workspace_addr));
-    cache_invalidate_range(reinterpret_cast<const void *>(cache_line(info)), PTO2_ALIGN_SIZE);
+    invalidate_object(info, sizeof(*info));
     const uint32_t qp_num = __atomic_load_n(&info->qp_num, __ATOMIC_ACQUIRE);
     const uint32_t rank_count = __atomic_load_n(&info->rank_count, __ATOMIC_ACQUIRE);
     const uint64_t sq_ptr = __atomic_load_n(&info->sq_ptr, __ATOMIC_ACQUIRE);
@@ -155,8 +162,8 @@ inline CompletionPollResult poll_urma_event_handle(uint64_t event_handle, uint64
     auto *wq_entry = reinterpret_cast<volatile UrmaWqCtx *>(
         static_cast<uintptr_t>(sq_ptr + ctx_index * static_cast<uint64_t>(sizeof(UrmaWqCtx)))
     );
-    cache_invalidate_range(reinterpret_cast<const void *>(cache_line(cq_entry)), PTO2_ALIGN_SIZE);
-    cache_invalidate_range(reinterpret_cast<const void *>(cache_line(wq_entry)), PTO2_ALIGN_SIZE);
+    invalidate_object(cq_entry, sizeof(*cq_entry));
+    invalidate_object(wq_entry, sizeof(*wq_entry));
 
     UrmaCqCtx cq_ctx{};
     cq_ctx.buf_addr = __atomic_load_n(&cq_entry->buf_addr, __ATOMIC_ACQUIRE);
@@ -192,6 +199,8 @@ inline CompletionPollResult poll_urma_event_handle(uint64_t event_handle, uint64
         const uint8_t substatus = static_cast<uint8_t>((dw0 >> 16) & 0xFFu);
         const uint8_t status = static_cast<uint8_t>((dw0 >> 24) & 0xFFu);
         if (status != 0 || substatus != 0) {
+            ++next_tail;
+            update_tail_info(cq_ctx, wq_ctx, next_tail);
             return {CompletionPollState::FAILED, PTO2_ERROR_ASYNC_COMPLETION_INVALID};
         }
         next_tail++;
