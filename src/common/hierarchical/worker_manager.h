@@ -62,13 +62,16 @@ enum class MailboxState : int32_t {
     SHUTDOWN = 3,
     CONTROL_REQUEST = 4,
     CONTROL_DONE = 5,
-    // Child writes this after its expensive init (ChipWorker::init / inner
-    // Worker::init) completes. Parent's _start_hierarchical spin-waits for
-    // EVERY chip child to reach INIT_DONE before any dispatch (CTRL_PREPARE
-    // or TASK_READY) goes out. This aligns the host-side stream-sync windows
-    // across distributed ranks so cross-rank init skew never charges against
-    // the per-rank PLATFORM_STREAM_SYNC_TIMEOUT_MS budget (issue #897).
-    INIT_DONE = 6,
+    // Startup readiness handshake, driven entirely by the Python facade
+    // (_await_children_ready). A child writes INIT_READY after its expensive
+    // init (ChipWorker::init / inner Worker::init) succeeds, or INIT_FAILED
+    // after it fails. The parent barrier waits for EVERY child to reach
+    // INIT_READY before any dispatch (CTRL_PREPARE or TASK_READY) goes out,
+    // which also aligns the host-side stream-sync windows across distributed
+    // ranks so cross-rank init skew never charges against the per-rank
+    // PLATFORM_STREAM_SYNC_TIMEOUT_MS budget (issue #897).
+    INIT_READY = 6,
+    INIT_FAILED = 7,
 };
 
 // Sized so the args region can hold any TaskArgs the runtime itself accepts
