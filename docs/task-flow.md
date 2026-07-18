@@ -460,27 +460,30 @@ that maps to a Python orchestration function, not a `ChipCallable`.
 
 ### Fork sequence
 
-L4's `init()` allocates the L4 Worker's HeapRing (before fork).
-On first `run()`, the deferred `_start_hierarchical()`:
+L4's `init()` allocates the L4 Worker's HeapRing (before fork), then eagerly
+runs `_start_hierarchical()` — `init()` is the single startup point, and it
+returns only once the whole tree is READY:
 
 1. Forks one child process per L3 Worker child
-2. **Inside the child**: `inner_worker.init()` creates the L3 Worker
-   (mmaps L3's own HeapRing), allocates L3's sub/chip mailboxes. L3's
-   own children are forked lazily on L3's first `run()`.
-3. Child enters `_child_worker_loop(mailbox, registry, inner_worker)`
-4. **Parent**: registers each mailbox with L4's Worker via
-   `add_next_level_worker_at(worker_id, mailbox_addr)`
+2. **Inside the child**: `inner_worker.init()` is eager and recursive — it
+   creates the L3 Worker (mmaps L3's own HeapRing), forks L3's sub/chip
+   children, and blocks on their `INIT_READY` before it returns.
+3. Child publishes `INIT_READY` (whole L3 subtree ready), then enters
+   `_child_worker_loop(mailbox, registry, inner_worker)` for dispatch
+4. **Parent**: awaits each child's `INIT_READY`, then registers each mailbox
+   with L4's Worker via `add_next_level_worker_at(worker_id, mailbox_addr)`
 
 ```text
 L4 parent process
   ├─ Worker(4) + HeapRing (MAP_SHARED, inherited by L3 child)
   └─ fork ──────────────────► L3 child process
-                                 ├─ inner_worker.init()
-                                 │    └─ Worker(3) + L3's own HeapRing
+                                 ├─ inner_worker.init()   (eager, recursive)
+                                 │    ├─ Worker(3) + L3's own HeapRing
+                                 │    └─ forks L3's sub/chip children, awaits
+                                 │       their INIT_READY
+                                 ├─ publish INIT_READY (subtree ready)
                                  └─ _child_worker_loop(mbox, registry, inner_worker)
-                                      └─ on first dispatch:
-                                           inner_worker.run(orch_fn, args, cfg)
-                                             └─ _start_hierarchical() forks L3's sub children
+                                      └─ on dispatch: inner_worker.run(orch_fn, args, cfg)
 ```
 
 ### Dispatch walkthrough

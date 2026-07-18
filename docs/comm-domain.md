@@ -159,16 +159,15 @@ rewritten before decoding. Two sources are legal:
 
 | Source | How | Why it works |
 | ------ | --- | ------------ |
-| **fork-inherited** | `tensor.share_memory_()` **before the local L3 children are forked** (i.e. before the first `Worker.run()`) | the child inherits the MAP_SHARED page at fork |
+| **fork-inherited** | `tensor.share_memory_()` **before `Worker.init()`** (before the local L3 children are forked) | the child inherits the MAP_SHARED page at fork |
 | **worker-allocated post-fork** | `worker.create_host_buffer(nbytes)` after the children exist | born-shared memory attached into every local child, **zero-copy** |
 
-The local L3 children are forked lazily on the **first** `run()`. A host tensor
+The local L3 children are forked eagerly in `Worker.init()`. A host tensor
 created after that — the natural dynamic-shape serving pattern — is invisible to
 the children unless it lives in a `create_host_buffer` buffer:
 
 ```python
-worker = Worker(level=3, ...); worker.register(chip); worker.init()
-worker.run(orch0, ...)                          # forks the chips
+worker = Worker(level=3, ...); worker.register(chip); worker.init()   # forks the chips
 
 buf_h = worker.create_host_buffer(tokens * hidden_size * 4)   # born-shared, post-fork
 buf_o = worker.create_host_buffer(batch * vocab * 4)
@@ -215,7 +214,7 @@ the child — allocate it with `create_host_buffer` instead.
 - **`orch.copy_to` is the unmanaged low-level path.** `create_host_buffer`
   covers the `run` / `submit_next_level` host-tensor args. The explicit
   `orch.copy_to(src=tensor.data_ptr())` staging path (§5) is *not* validated —
-  its `src` must be fork-inherited (`.share_memory_()` before the first `run()`)
+  its `src` must be fork-inherited (`.share_memory_()` before `init()`)
   or a `create_host_buffer` buffer.
 - **Fork-inherited anonymous memory is copy-on-write, hence stale.** Even a
   tensor the child legitimately inherited is only useful as a *live* input if it

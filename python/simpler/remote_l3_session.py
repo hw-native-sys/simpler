@@ -21,10 +21,12 @@ import hashlib
 import importlib
 import json
 import os
+import signal
 import socket
 import struct
 import sys
 import threading
+import time
 import traceback
 from dataclasses import dataclass
 from multiprocessing import shared_memory
@@ -910,9 +912,17 @@ def run_session(manifest: dict[str, Any], ready_fd: int) -> int:
     try:
         session_timeout_s = _session_timeout_s(manifest)
         manifest_dispatch_registry = _install_manifest_dispatcher_registry(manifest)
-        inner_worker.init()
+        # Register the inner L3 callables before init() so they are frozen into
+        # the eager startup snapshot and uploaded to the chip children before
+        # those children publish INIT_READY. init() is the single, eager startup
+        # point: it forks and readies the whole inner L3->L2 tree, so the runner
+        # reports ready (below) only once that subtree is up.
         manifest_inner_handles = _install_manifest_inner_registry(manifest, inner_worker)
-        inner_worker._start_hierarchical()  # noqa: SLF001 -- session runner owns the fork-safe prestart.
+        # Bound the inner startup and mark it non-root so its chip/sub children
+        # inherit this runner's process group (see start_new_session in the
+        # daemon) rather than splitting into their own — the daemon reaps the
+        # whole L3->L2 subtree with one killpg on the runner.
+        inner_worker.init(_startup_deadline=time.monotonic() + session_timeout_s)
 
         listen_host = str(manifest.get("listen_host", "127.0.0.1"))
         command_sock = _bind_listener(listen_host)
@@ -963,11 +973,18 @@ def run_session(manifest: dict[str, Any], ready_fd: int) -> int:
             pass
 
 
+def _raise_keyboard_interrupt(_signum, _frame):
+    # A daemon cooperative-kill (SIGTERM) unwinds run_session so its finally
+    # closes the inner Worker — reaping the L3->L2 subtree — before exit.
+    raise KeyboardInterrupt
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--manifest", required=True)
     parser.add_argument("--ready-fd", required=True, type=int)
     ns = parser.parse_args(argv)
+    signal.signal(signal.SIGTERM, _raise_keyboard_interrupt)
     with open(ns.manifest, encoding="utf-8") as f:
         manifest = json.load(f)
     return run_session(manifest, ns.ready_fd)

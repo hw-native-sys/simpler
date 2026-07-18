@@ -60,6 +60,7 @@ Usage::
 from __future__ import annotations
 
 import bisect
+import contextlib
 import ctypes
 import importlib
 import json
@@ -81,6 +82,7 @@ import cloudpickle
 from _task_interface import (  # pyright: ignore[reportMissingImports]
     MAX_REGISTERED_CALLABLE_IDS,
     RUNTIME_ENV_RING_COUNT,
+    TENSOR_CHILD_MEMORY_OFFSET,
     WorkerType,
     _l3_child_onboard_region_close,
     _l3_child_onboard_region_create,
@@ -450,11 +452,14 @@ def _rewrite_blob_host_addrs(buf: memoryview, blob_off: int, ranges: list[tuple[
     """Redirect registered host pointers in a task-args blob to child mappings.
 
     ``ranges`` is ``(parent_lo, parent_hi, child_base)`` for each host buffer the
-    child has mapped via _CTRL_MAP_HOST. For every tensor whose ``buffer.addr``
-    (a parent VA) lands in a registered range, rewrite it in place to
-    ``child_base + (addr - parent_lo)`` so the runtime dereferences the child's
-    own mapping. Tensors outside every range (fork-inherited or child-allocated)
-    are left untouched. See _BLOB_TENSOR_STRIDE for the wire layout.
+    child has mapped via _CTRL_MAP_HOST. For every host tensor whose
+    ``buffer.addr`` (a parent VA) lands in a registered range, rewrite it in
+    place to ``child_base + (addr - parent_lo)`` so the runtime dereferences the
+    child's own mapping. Tensors outside every range (fork-inherited or
+    child-allocated) are left untouched. A ``child_memory`` tensor carries a
+    child-owned device pointer, never a host VA, so it is skipped even when its
+    address numerically falls inside a registered host range — rewriting it would
+    corrupt the device pointer. See _BLOB_TENSOR_STRIDE for the wire layout.
     """
     tensor_count = struct.unpack_from("<i", buf, blob_off)[0]
     if tensor_count <= 0:
@@ -462,6 +467,8 @@ def _rewrite_blob_host_addrs(buf: memoryview, blob_off: int, ranges: list[tuple[
     base = blob_off + _BLOB_HEADER_BYTES
     for i in range(tensor_count):
         addr_off = base + i * _BLOB_TENSOR_STRIDE
+        if buf[addr_off + TENSOR_CHILD_MEMORY_OFFSET]:
+            continue
         addr = struct.unpack_from("<Q", buf, addr_off)[0]
         for parent_lo, parent_hi, child_base in ranges:
             if parent_lo <= addr < parent_hi:
@@ -1348,6 +1355,7 @@ def _run_chip_main_loop(  # noqa: PLR0912, PLR0913, PLR0915 -- unified TASK_READ
     chip_platform: str,
     chip_runtime: str = "",
     on_task_done_success=None,
+    prepared: set[int] | None = None,
 ) -> None:
     """Unified TASK_READY / CONTROL_REQUEST / SHUTDOWN state machine.
 
@@ -1358,13 +1366,13 @@ def _run_chip_main_loop(  # noqa: PLR0912, PLR0913, PLR0915 -- unified TASK_READ
     Returning a non-zero code overrides the kernel's success.
 
     TASK_READY carries a callable digest. The child resolves it to a
-    target-local slot and runs it. The slot must already be prepared via
-    ``_CTRL_PREPARE`` (the explicit registration path the parent pushes after
-    init() to stage the H2D upload + device-orch load); a TASK_READY for an
-    unprepared slot is a control-flow error and fails the task rather than
-    lazily preparing it.
+    target-local slot and runs it. The slot must already be prepared: initial
+    startup-snapshot ChipCallables are prepared before INIT_READY (carried in via
+    ``prepared``), and callables registered dynamically after startup arrive via
+    ``_CTRL_PREPARE``. A TASK_READY for an unprepared slot is a control-flow
+    error and fails the task rather than lazily preparing it.
     """
-    prepared: set[int] = set()
+    prepared = prepared if prepared is not None else set()
     l3_l2_region_store = _L2HostL3L2RegionStore()
     # Post-fork host buffers mapped into this child. `host_buf_table`
     # owns the mmap per token (for unmap + teardown); `host_buf_ranges` is the
@@ -1576,6 +1584,24 @@ def _chip_process_loop(  # noqa: PLR0913 -- fork-child entry: all context (bins,
         _mailbox_store_i32(_buffer_field_addr(buf, _OFF_STATE), _INIT_FAILED)
         return
 
+    # Prepare every ChipCallable in the startup snapshot before publishing
+    # INIT_READY, so the H2D upload + device-orch load is charged inside the
+    # readiness barrier and the first task dispatch pays no upload. The set of
+    # prepared cids carries into the main loop, which requires a cid be prepared
+    # before it dispatches. The parent therefore issues no post-READY
+    # control_prepare for the initial snapshot.
+    prepared: set[int] = set()
+    try:
+        for cid, target in registry.items():
+            if isinstance(target, ChipCallable):
+                _ensure_prepared(cw, registry, prepared, int(cid), device_id=device_id)
+    except Exception as e:
+        _tb.print_exc()
+        _write_error(buf, 1, _format_exc(f"chip_process dev={device_id} prepare", e))
+        _mailbox_store_i32(_buffer_field_addr(buf, _OFF_STATE), _INIT_FAILED)
+        cw.finalize()
+        return
+
     mailbox_addr = ctypes.addressof(ctypes.c_char.from_buffer(buf))
     state_addr = mailbox_addr + _OFF_STATE
     # Signal init success. The parent's readiness barrier waits for every chip
@@ -1598,6 +1624,7 @@ def _chip_process_loop(  # noqa: PLR0913 -- fork-child entry: all context (bins,
             identity_refs,
             chip_platform=platform,
             chip_runtime=runtime,
+            prepared=prepared,
         )
     finally:
         cw.finalize()
@@ -1736,13 +1763,26 @@ def _child_worker_loop(
             break
 
 
-def _forked_child_main(buf: memoryview, label: str, setup, serve) -> None:
+class _StartupCancelled(BaseException):
+    """Raised inside a forked child when the parent cooperatively cancels its
+    startup (SIGTERM). Unwinds the child's own ``setup`` — recursively rolling
+    back any grandchildren it already forked — before it exits."""
+
+
+def _forked_child_main(buf: memoryview, label: str, setup, serve, make_group_leader: bool = False) -> None:
     """Run a forked child to completion, always terminating via ``os._exit``.
 
     ``setup()`` runs the child's fallible init and returns an opaque context;
     any failure there publishes INIT_FAILED with the cause and exits. On
     success the child publishes INIT_READY (the parent's readiness barrier
     unblocks) and ``serve(ctx)`` runs the mailbox loop.
+
+    ``make_group_leader`` puts the child in its own process group so the startup
+    root can reap the whole subtree (this child plus every descendant it forks)
+    with one ``killpg``; deeper descendants inherit the group and do not set
+    their own. During ``setup`` a SIGTERM is a cooperative cancel: it raises
+    ``_StartupCancelled``, which unwinds ``setup`` (recursively tearing down any
+    grandchildren and their nested shms) before the child exits.
 
     Load-bearing invariant: a forked child must NEVER let an exception unwind
     back into the forked copy of the parent's ``_start_hierarchical`` frames.
@@ -1752,14 +1792,32 @@ def _forked_child_main(buf: memoryview, label: str, setup, serve) -> None:
     """
     import traceback as _tb  # noqa: PLC0415
 
+    if make_group_leader:
+        with contextlib.suppress(OSError):
+            os.setpgid(0, 0)
+
     state_addr = _buffer_field_addr(buf, _OFF_STATE)
+
+    def _on_cancel(_signum, _frame):
+        raise _StartupCancelled()
+
+    prev_term = signal.signal(signal.SIGTERM, _on_cancel)
     try:
         ctx = setup()
+    except _StartupCancelled:
+        # Parent cancelled us mid-init; setup() already unwound its own subtree.
+        _tb.print_exc()
+        os._exit(1)
     except BaseException as e:  # noqa: BLE001
         _tb.print_exc()
         _write_error(buf, 1, _format_exc(f"{label} init", e))
         _mailbox_store_i32(state_addr, _INIT_FAILED)
         os._exit(1)
+    # Serving is torn down via the SHUTDOWN mailbox state, not the cancel signal.
+    # signal.signal returns None when the prior handler was not installed from
+    # Python (e.g. a C library / host default); restore SIG_DFL in that case so
+    # the round-trip does not raise TypeError.
+    signal.signal(signal.SIGTERM, prev_term if prev_term is not None else signal.SIG_DFL)
     _mailbox_store_i32(state_addr, _INIT_READY)
     try:
         serve(ctx)
@@ -1828,6 +1886,15 @@ class Worker:
         self._hierarchical_start_state = "not_started"
         self._hierarchical_start_mu = threading.Lock()
         self._hierarchical_start_cv = threading.Condition(self._hierarchical_start_mu)
+        # Absolute time.monotonic() deadline for the current startup epoch, set
+        # once at init() and shared by every child group and recursive descendant
+        # so the whole tree comes up within a single startup_timeout_s budget.
+        self._startup_deadline: float = 0.0
+        # True on the worker whose init() the user called (the startup root).
+        # The root's direct children are process-group leaders, so the root can
+        # killpg a whole subtree; nested (recursive) workers inherit their
+        # parent's group and rely on the root's killpg as the hard backstop.
+        self._is_startup_root: bool = True
 
         # Optional CallConfig whose ring sizing is pre-warmed at init() so the
         # first run() with the same sizing skips the (~800ms) cold prebuilt
@@ -1912,16 +1979,20 @@ class Worker:
         return worker_id
 
     def add_remote_worker(self, spec: RemoteWorkerSpec) -> int:
-        if self._initialized:
-            raise RuntimeError("Worker.add_remote_worker after init")
-        if self.level < 4:
-            raise TypeError("Worker.add_remote_worker: remote L3 workers require a level >= 4 parent")
-        if not isinstance(spec, RemoteWorkerSpec):
-            raise TypeError("Worker.add_remote_worker expects a RemoteWorkerSpec")
-        worker_id = self._allocate_next_level_worker_id()
-        self._remote_worker_specs.append(spec)
-        self._remote_worker_ids.append(worker_id)
-        return worker_id
+        # Hold the lifecycle lock across the state check and the topology
+        # mutation so a concurrent init() cannot freeze the topology snapshot
+        # between them.
+        with self._hierarchical_start_cv:
+            if self._initialized or self._hierarchical_start_state != "not_started":
+                raise RuntimeError("Worker.add_remote_worker after init")
+            if self.level < 4:
+                raise TypeError("Worker.add_remote_worker: remote L3 workers require a level >= 4 parent")
+            if not isinstance(spec, RemoteWorkerSpec):
+                raise TypeError("Worker.add_remote_worker expects a RemoteWorkerSpec")
+            worker_id = self._allocate_next_level_worker_id()
+            self._remote_worker_specs.append(spec)
+            self._remote_worker_ids.append(worker_id)
+            return worker_id
 
     @staticmethod
     def _parse_remote_endpoint(endpoint: str) -> tuple[str, int]:
@@ -2058,7 +2129,6 @@ class Worker:
             raise RuntimeError("remote memory APIs require Worker.init() before allocation or copy")
         if int(worker_id) not in set(self._remote_worker_ids):
             raise ValueError("remote memory APIs require a remote worker id returned by add_remote_worker")
-        self._start_hierarchical()
         if self._worker is None:
             raise RuntimeError("remote memory APIs require a started hierarchical Worker")
 
@@ -2523,6 +2593,28 @@ class Worker:
         with self._registry_lock:
             return self._resolve_handle_locked(handle, expected_namespace=expected_namespace)
 
+    def _register_into_snapshot_or_wait(self, reg: _CallableRegistration) -> CallableHandle | None:
+        """Linearize a level>=3 register against the startup epoch.
+
+        Waits out an in-progress init() (INITIALIZING); a FAILED epoch raises. A
+        pre-start registration is installed into the startup snapshot and its
+        handle returned; once the hierarchy is READY, returns None so the caller
+        takes its post-start control-broadcast path.
+        """
+        with self._hierarchical_start_cv:
+            while self._hierarchical_start_state == "starting":
+                self._hierarchical_start_cv.wait()
+            if self._hierarchical_start_state == "failed":
+                raise RuntimeError("Worker hierarchical startup failed; close this Worker and create a new one")
+            pre_start = self._hierarchical_start_state != "started" and not getattr(
+                self, "_hierarchical_started", False
+            )
+            if pre_start:
+                with self._registry_lock:
+                    handle, _is_new = self._install_registration_locked(reg)
+                return handle
+        return None
+
     def register(self, target, *, workers: list[int] | None = None) -> CallableHandle:
         """Register a callable for dispatch and return an opaque handle.
 
@@ -2545,24 +2637,18 @@ class Worker:
                         "Worker.register(RemoteCallable): workers must name remote worker ids returned by "
                         "add_remote_worker"
                     )
-            if not self._initialized:
-                with self._registry_lock:
-                    handle, _is_new = self._install_registration_locked(reg)
+            # Linearize against the startup epoch exactly like the local path: a
+            # register that races an in-progress init() waits for it, then a
+            # pre-start registration lands in the snapshot while a post-READY one
+            # goes through the remote prepare/commit control path.
+            handle = self._register_into_snapshot_or_wait(reg)
+            if handle is not None:
                 return handle
             return self._post_start_register_remote(reg)
         if self.level >= 3:
-            with self._hierarchical_start_cv:
-                while self._hierarchical_start_state == "starting":
-                    self._hierarchical_start_cv.wait()
-                if self._hierarchical_start_state == "failed":
-                    raise RuntimeError("Worker hierarchical startup failed; close this Worker and create a new one")
-                pre_start = self._hierarchical_start_state != "started" and not getattr(
-                    self, "_hierarchical_started", False
-                )
-                if pre_start:
-                    with self._registry_lock:
-                        handle, _is_new = self._install_registration_locked(reg)
-                    return handle
+            handle = self._register_into_snapshot_or_wait(reg)
+            if handle is not None:
+                return handle
             if not isinstance(target, ChipCallable):
                 return self._post_start_register_python(reg)
 
@@ -2640,7 +2726,6 @@ class Worker:
                 handle, _is_new = self._install_registration_locked(reg)
                 return handle
 
-        self._start_hierarchical()
         if self._worker is None:
             raise RuntimeError("Worker.register(RemoteCallable): hierarchical worker is not started")
 
@@ -2970,10 +3055,10 @@ class Worker:
         ``mailbox_mu_`` so the broadcast serializes against any in-flight
         dispatch on each child mailbox. No Python lock required.
         """
-        # Chip children are forked lazily on the first Worker.run() via
-        # _start_hierarchical; before that point the chip mailboxes have no
-        # reader and a CTRL_REGISTER broadcast would deadlock. In that pre-fork
-        # window, the startup snapshot carries the digest and target bytes.
+        # Until init() has started the hierarchy the chip mailboxes have no
+        # reader, so a CTRL_REGISTER broadcast would deadlock; a registration in
+        # that window is instead carried by the startup snapshot and
+        # COW-inherited by the children forked in init().
         if not getattr(self, "_hierarchical_started", False):
             return
         assert self._worker is not None
@@ -3169,7 +3254,6 @@ class Worker:
         errors: list[str] = []
         try:
             if self._initialized:
-                self._start_hierarchical()
                 assert self._worker is not None
                 for worker_id in worker_ids:
                     try:
@@ -3298,54 +3382,104 @@ class Worker:
             raise RuntimeError("Worker.add_worker() requires level >= 4")
         if self._config.get("device_ids", []):
             raise RuntimeError("Worker.add_worker() cannot be combined with device_ids on the same Worker")
-        if self._initialized:
-            raise RuntimeError("Worker.add_worker() must be called before init()")
         if worker._initialized:
             raise RuntimeError("Child worker must not be initialized before add_worker()")
-        worker_id = self._allocate_next_level_worker_id()
-        self._next_level_workers.append(worker)
-        self._next_level_worker_ids.append(worker_id)
-        return worker_id
+        # Hold the lifecycle lock across the state check and the topology
+        # mutation so a concurrent init() cannot freeze the topology snapshot
+        # between them.
+        with self._hierarchical_start_cv:
+            if self._initialized or self._hierarchical_start_state != "not_started":
+                raise RuntimeError("Worker.add_worker() must be called before init()")
+            worker_id = self._allocate_next_level_worker_id()
+            self._next_level_workers.append(worker)
+            self._next_level_worker_ids.append(worker_id)
+            return worker_id
 
     # ------------------------------------------------------------------
     # init — auto-discovery
     # ------------------------------------------------------------------
 
-    def init(self, prewarm_config=None) -> None:
-        """Initialize the worker.
+    def init(self, prewarm_config=None, *, _startup_deadline: float | None = None) -> None:
+        """Initialize the worker and bring its whole subtree to READY.
+
+        For an L3+ worker ``init`` is the single startup submission point: it
+        forks every local child (sub / chip / next-level), waits for the whole
+        subtree — recursively, for L4+ — to publish INIT_READY, activates any
+        remote L3 sessions, starts the C++ scheduler, and only then publishes
+        READY in one atomic commit. It returns with the tree ready to run, or
+        raises after a bounded rollback that leaves no child, mailbox, or session
+        behind. ``run`` / ``create_host_buffer`` / the remote register/memory
+        APIs never trigger startup.
 
         Args:
             prewarm_config: Optional CallConfig. When given, its ring sizing
                 (``runtime_env.ring_task_window`` / ``ring_heap`` /
                 ``ring_dep_pool``) is built + cached so the first ``run`` with the
                 same sizing skips the (~800ms) cold prebuilt runtime-arena build.
-                Timing is level-dependent: an L2 worker prewarms here in
-                ``init``; an L3+ worker has no chip children until the hierarchy
-                starts on the first ``run``, so it prewarms there — during
-                hierarchy startup, alongside the callable SO upload and before the
-                first task dispatches. A no-op for runtimes without a prebuilt
-                arena (host_build_graph). ``None`` (default) disables prewarm.
+                An L2 worker prewarms here; an L3+ worker prewarms each chip child
+                during hierarchy startup, before it publishes INIT_READY. A no-op
+                for runtimes without a prebuilt arena (host_build_graph). ``None``
+                (default) disables prewarm.
+            _startup_deadline: Internal. Absolute ``time.monotonic()`` deadline
+                inherited from a parent's startup epoch so a recursive descendant
+                consumes the parent's remaining budget instead of restarting the
+                timeout. ``None`` starts a fresh epoch.
         """
-        if self._initialized:
-            raise RuntimeError("Worker already initialized")
-        # Validate up front so a bad config fails here regardless of level, even
-        # though an L3+ worker does not build the arena until the first run.
         if prewarm_config is not None:
             prewarm_config.validate()
-        self._prewarm_config = prewarm_config
+        # Claim the startup epoch atomically: NEW -> INITIALIZING under the
+        # lifecycle lock so a concurrent init / register / close observes one
+        # linear transition and never a half-built Worker. The INITIALIZING /
+        # READY / FAILED state machine is a hierarchical (level >= 3) concept; an
+        # L2 worker inits synchronously in-process and never enters "starting".
+        with self._hierarchical_start_cv:
+            if self._initialized:
+                raise RuntimeError("Worker already initialized")
+            if self._hierarchical_start_state == "starting":
+                raise RuntimeError("Worker.init() is already in progress")
+            if self._hierarchical_start_state == "failed":
+                raise RuntimeError("Worker startup failed; close this Worker and create a new one")
+            self._prewarm_config = prewarm_config
+            if self.level >= 3:
+                self._hierarchical_start_state = "starting"
+                self._is_startup_root = _startup_deadline is None
+                own_deadline = time.monotonic() + self._startup_timeout_s
+                # A recursive descendant caps its own timeout at the parent's
+                # remaining budget so the whole tree fits one startup_timeout_s.
+                self._startup_deadline = (
+                    own_deadline if _startup_deadline is None else min(_startup_deadline, own_deadline)
+                )
+            self._hierarchical_start_cv.notify_all()
 
         try:
             if self.level == 2:
                 self._init_level2()
             elif self.level >= 3:
                 self._init_hierarchical()
+                self._start_hierarchical()
             else:
                 raise ValueError(f"Worker: level {self.level} not supported")
         except BaseException:
-            self._cleanup_partial_init()
+            # Commit FAILED even if rollback itself raises, so a waiter blocked on
+            # the lifecycle condition (register / close) is always released.
+            try:
+                self._cleanup_partial_init()
+            finally:
+                if self.level >= 3:
+                    with self._hierarchical_start_cv:
+                        self._hierarchical_start_state = "failed"
+                        self._hierarchical_start_cv.notify_all()
             raise
 
-        self._initialized = True
+        # Atomic READY commit: publish _initialized together with the started
+        # state so no thread ever observes a started hierarchy while
+        # _initialized is still False.
+        with self._hierarchical_start_cv:
+            self._initialized = True
+            if self.level >= 3:
+                self._hierarchical_started = True
+                self._hierarchical_start_state = "started"
+            self._hierarchical_start_cv.notify_all()
 
     def _init_level2(self) -> None:
         from simpler_setup.runtime_builder import RuntimeBuilder  # noqa: PLC0415
@@ -3423,6 +3557,12 @@ class Worker:
         else:
             self._worker = _Worker(self.level, int(heap_ring_size))
 
+        # Open remote L3 sessions (the remote runner brings up its own L3->L2
+        # tree and answers the daemon handshake). Opening only exchanges a
+        # transient socket message — it starts no local thread. Registering the
+        # socket into the C++ Worker (which spawns the RemoteL3Endpoint health
+        # thread) is deferred to _start_hierarchical, after the last local fork,
+        # to preserve the fork-before-thread invariant.
         opened_remote_sessions: list[_RemoteSession] = []
         try:
             for worker_id, spec in zip(self._remote_worker_ids, self._remote_worker_specs, strict=True):
@@ -3434,17 +3574,6 @@ class Worker:
                     spec=spec, worker_id=worker_id, session_id=session_id, timeout_s=timeout_s
                 )
                 opened_remote_sessions.append(session)
-                assert self._worker is not None
-                self._worker.add_remote_l3_socket(
-                    worker_id,
-                    session_id,
-                    spec.transport,
-                    session.command_host,
-                    session.command_port,
-                    session.health_host,
-                    session.health_port,
-                    timeout_s,
-                )
                 self._remote_sessions.append(session)
                 opened_remote_sessions.pop()
         except BaseException:
@@ -3454,220 +3583,218 @@ class Worker:
         self._hierarchical_started = False
 
     def _start_hierarchical(self) -> None:  # noqa: PLR0912 -- three parallel fork loops (sub/chip/next) + bootstrap wait + scheduler register/init; branches track the fork order documented in the body
-        """Fork child processes and start C++ scheduler. Called on first run()."""
+        """Fork every local child, await the subtree, register endpoints, start the scheduler.
+
+        Called only by init(), which owns the lifecycle state. Any failure here
+        propagates to init(), whose single rollback entry (_cleanup_partial_init)
+        closes the C++ Worker (if the scheduler started) and tears the whole
+        epoch down. The readiness barriers raise on any child failure/exit/hang.
+        """
         device_ids = self._config.get("device_ids", [])
         n_sub = self._config.get("num_sub_workers", 0)
+        deadline = self._startup_deadline
 
-        # Until the C++ scheduler is running (dw.init), every forked child is
-        # ours alone to reap: a readiness-barrier failure rolls the whole epoch
-        # back. After dw.init the scheduler owns the mailboxes, so we leave the
-        # existing (state="failed") handling and let close() tear down.
-        scheduler_started = False
-        try:
-            # Fork children from an immutable snapshot. The state transition
-            # and snapshot are one gate, so dynamic register/unregister callers
-            # cannot return through the pre-start path after this point.
-            with self._hierarchical_start_cv:
-                while self._hierarchical_start_state == "starting":
-                    self._hierarchical_start_cv.wait()
-                if self._hierarchical_start_state == "started":
-                    return
-                if self._hierarchical_start_state == "failed":
-                    raise RuntimeError("Worker hierarchical startup failed; close this Worker and create a new one")
-                self._hierarchical_start_state = "starting"
-                with self._registry_lock:
-                    identity_snapshot = [
-                        (digest, state.target, state.ref_count, state.kind, state.target_namespace)
-                        for digest, state in self._identity_registry.items()
-                    ]
-                self._hierarchical_start_cv.notify_all()
+        # Freeze the startup registry snapshot. init() already holds the epoch in
+        # the "starting" state, so a concurrent register/unregister is blocked on
+        # the lifecycle condition and cannot slip a mutation in after this point.
+        with self._registry_lock:
+            identity_snapshot = [
+                (digest, state.target, state.ref_count, state.kind, state.target_namespace)
+                for digest, state in self._identity_registry.items()
+            ]
 
-            self._startup_reaped_pids = set()
-            self._startup_ready_pids = set()
+        self._startup_reaped_pids = set()
+        self._startup_ready_pids = set()
 
-            # Fork SubWorker processes (MUST be before any C++ threads)
-            for i in range(n_sub):
-                pid = os.fork()
-                if pid == 0:
-                    buf = self._sub_shms[i].buf
-                    assert buf is not None
+        # Fork SubWorker processes (MUST be before any C++ threads)
+        for i in range(n_sub):
+            pid = os.fork()
+            if pid == 0:
+                buf = self._sub_shms[i].buf
+                assert buf is not None
 
-                    def _setup():
-                        return _make_local_identity_tables(
-                            identity_snapshot,
-                            callable_kind=("PYTHON_SERIALIZED", "PYTHON_IMPORT"),
-                            target_namespace="LOCAL_PYTHON",
-                        )
-
-                    _forked_child_main(buf, f"sub worker {i}", _setup, lambda t, b=buf: _sub_worker_loop(b, *t))
-                else:
-                    self._sub_pids.append(pid)
-
-            # SUB children have no fallible device/runtime init, but they join
-            # the same readiness contract so a child that dies before entering
-            # its loop aborts startup rather than surfacing later as a hung
-            # submit_sub.
-            self._await_children_ready(self._sub_shms, self._sub_pids, "sub")
-
-            # Fork ChipWorker processes (L3 with device_ids).  Always use the
-            # plain task-loop variant; the base communicator is established
-            # lazily on first ``orch.allocate_domain`` via CTRL_COMM_INIT.
-            chip_log_level, chip_log_info_v = _simpler_log.get_current_config()
-            if device_ids:
-                for idx, dev_id in enumerate(device_ids):
-                    pid = os.fork()
-                    if pid == 0:
-                        buf = self._chip_shms[idx].buf
-                        assert buf is not None
-                        # _chip_process_loop publishes INIT_READY/INIT_FAILED
-                        # itself (around cw.init). This guard only ensures the
-                        # child exits rather than unwinding into the parent's
-                        # startup frames (see _forked_child_main). A throw before
-                        # cw.init (e.g. identity-table build) leaves the mailbox
-                        # IDLE, so publish INIT_FAILED for a bounded parent error.
-                        try:
-                            _chip_process_loop(
-                                buf,
-                                self._l3_bins,
-                                dev_id,
-                                *_make_local_identity_tables(
-                                    identity_snapshot,
-                                    callable_kind="CHIP_CALLABLE",
-                                    target_namespace="LOCAL_CHIP",
-                                ),
-                                log_level=chip_log_level,
-                                log_info_v=chip_log_info_v,
-                                platform=str(self._config["platform"]),
-                                runtime=str(self._config["runtime"]),
-                                prewarm_config=self._prewarm_config,
-                            )
-                        except BaseException as e:  # noqa: BLE001
-                            import traceback as _tb  # noqa: PLC0415
-
-                            _tb.print_exc()
-                            if _mailbox_load_i32(_buffer_field_addr(buf, _OFF_STATE)) == _IDLE:
-                                _write_error(buf, 1, _format_exc(f"chip worker {idx} dev={dev_id} init", e))
-                                _mailbox_store_i32(_buffer_field_addr(buf, _OFF_STATE), _INIT_FAILED)
-                            os._exit(1)
-                        os._exit(0)
-                    else:
-                        self._chip_pids.append(pid)
-
-                # Cross-chip init barrier.  ChipWorker.init can have a long
-                # right tail (e.g. PTO2_RING_HEAP=4 GiB pushes per-rank
-                # device_malloc beyond the host stream sync budget); without
-                # this barrier a fast-init chip starts its aclrtSyncStream
-                # window N seconds before a slow peer reaches the same
-                # point, and any cross-rank wait inside the op (HCCL notify,
-                # etc.) charges the slow peer's remaining init time against
-                # the fast peer's PLATFORM_STREAM_SYNC_TIMEOUT_MS budget —
-                # the cascade documented in issue #897.  A chip that fails or
-                # dies during init raises here rather than spinning forever.
-                self._await_children_ready(self._chip_shms, self._chip_pids, "chip")
-
-            # Fork next-level Worker children (L4+ with Worker children).
-            # Each child process: init the inner Worker (which mmaps its own
-            # HeapRing and allocates its own child mailboxes), then enter
-            # _child_worker_loop. The inner Worker's own children are forked
-            # lazily on first run() inside _child_worker_loop, so the process
-            # tree nests correctly: L4 → L3 child → L3's chip/sub children.
-            for idx, inner_worker in enumerate(self._next_level_workers):
-                pid = os.fork()
-                if pid == 0:
-                    buf = self._next_level_shms[idx].buf
-                    assert buf is not None
-
-                    def _setup(inner=inner_worker):
-                        # Propagate the fork-constant prewarm sizing down so L4+
-                        # trees prewarm their L3 chips too (each inner Worker
-                        # prewarms on its own first run). INIT_READY is published
-                        # only after BOTH the inner init and the identity-table
-                        # build succeed, so the parent never observes READY for a
-                        # child that then dies in fallible post-init setup.
-                        inner.init(prewarm_config=self._prewarm_config)
-                        return _make_local_identity_tables(
-                            identity_snapshot,
-                            callable_kind=("PYTHON_SERIALIZED", "PYTHON_IMPORT"),
-                            target_namespace="LOCAL_PYTHON",
-                        )
-
-                    _forked_child_main(
-                        buf,
-                        f"next_level worker {idx}",
-                        _setup,
-                        lambda tables, b=buf, inner=inner_worker: _child_worker_loop(b, *tables, inner),
+                def _setup():
+                    return _make_local_identity_tables(
+                        identity_snapshot,
+                        callable_kind=("PYTHON_SERIALIZED", "PYTHON_IMPORT"),
+                        target_namespace="LOCAL_PYTHON",
                     )
+
+                _forked_child_main(
+                    buf,
+                    f"sub worker {i}",
+                    _setup,
+                    lambda t, b=buf: _sub_worker_loop(b, *t),
+                    make_group_leader=self._is_startup_root,
+                )
+            else:
+                self._sub_pids.append(pid)
+
+        # SUB children have no fallible device/runtime init, but they join the
+        # same readiness contract so a child that dies before entering its loop
+        # aborts startup rather than surfacing later as a hung submit_sub.
+        self._await_children_ready(self._sub_shms, self._sub_pids, "sub", deadline)
+
+        # Fork ChipWorker processes (L3 with device_ids).  Always use the plain
+        # task-loop variant; the base communicator is established lazily on first
+        # ``orch.allocate_domain`` via CTRL_COMM_INIT.
+        chip_log_level, chip_log_info_v = _simpler_log.get_current_config()
+        if device_ids:
+            for idx, dev_id in enumerate(device_ids):
+                pid = os.fork()
+                if pid == 0:
+                    buf = self._chip_shms[idx].buf
+                    assert buf is not None
+                    if self._is_startup_root:
+                        with contextlib.suppress(OSError):
+                            os.setpgid(0, 0)
+                    # _chip_process_loop publishes INIT_READY/INIT_FAILED itself
+                    # (around cw.init + ChipCallable prepare). This guard only
+                    # ensures the child exits rather than unwinding into the
+                    # parent's startup frames (see _forked_child_main). A throw
+                    # before cw.init (e.g. identity-table build) leaves the
+                    # mailbox IDLE, so publish INIT_FAILED for a bounded parent
+                    # error.
+                    try:
+                        _chip_process_loop(
+                            buf,
+                            self._l3_bins,
+                            dev_id,
+                            *_make_local_identity_tables(
+                                identity_snapshot,
+                                callable_kind="CHIP_CALLABLE",
+                                target_namespace="LOCAL_CHIP",
+                            ),
+                            log_level=chip_log_level,
+                            log_info_v=chip_log_info_v,
+                            platform=str(self._config["platform"]),
+                            runtime=str(self._config["runtime"]),
+                            prewarm_config=self._prewarm_config,
+                        )
+                    except BaseException as e:  # noqa: BLE001
+                        import traceback as _tb  # noqa: PLC0415
+
+                        _tb.print_exc()
+                        if _mailbox_load_i32(_buffer_field_addr(buf, _OFF_STATE)) == _IDLE:
+                            _write_error(buf, 1, _format_exc(f"chip worker {idx} dev={dev_id} init", e))
+                            _mailbox_store_i32(_buffer_field_addr(buf, _OFF_STATE), _INIT_FAILED)
+                        os._exit(1)
+                    os._exit(0)
                 else:
-                    self._next_level_pids.append(pid)
+                    self._chip_pids.append(pid)
 
-            # A next-level child publishes INIT_READY only after its own init
-            # succeeds; a failure, exit, or hang aborts startup here. This is
-            # the recursive readiness edge: once eager init lands, the child's
-            # init itself blocks on its descendants, so INIT_READY propagates up
-            # only after the whole subtree is ready.
-            self._await_children_ready(self._next_level_shms, self._next_level_pids, "next_level")
+            # Cross-chip init barrier.  ChipWorker.init can have a long right tail
+            # (e.g. PTO2_RING_HEAP=4 GiB pushes per-rank device_malloc beyond the
+            # host stream sync budget); without this barrier a fast-init chip
+            # starts its aclrtSyncStream window N seconds before a slow peer
+            # reaches the same point, and any cross-rank wait inside the op (HCCL
+            # notify, etc.) charges the slow peer's remaining init time against
+            # the fast peer's PLATFORM_STREAM_SYNC_TIMEOUT_MS budget — the cascade
+            # documented in issue #897.  A chip that fails or dies during init
+            # raises here rather than spinning forever.
+            self._await_children_ready(self._chip_shms, self._chip_pids, "chip", deadline)
 
-            # _Worker was constructed in _init_hierarchical (pre-fork) so
-            # children inherit the HeapRing MAP_SHARED mmap. Register PROCESS-mode
-            # workers via the unified mailbox.
-            dw = self._worker
-            assert dw is not None
+        # Fork next-level Worker children (L4+ with Worker children).
+        # Each child process eagerly inits the inner Worker, which forks its own
+        # chip/sub (and, for L5+, deeper next-level) children and blocks on their
+        # readiness before returning — so the process tree nests correctly (L4 →
+        # L3 child → L3's chip/sub grandchildren) and INIT_READY propagates up
+        # only after the whole subtree is ready.
+        for idx, inner_worker in enumerate(self._next_level_workers):
+            pid = os.fork()
+            if pid == 0:
+                buf = self._next_level_shms[idx].buf
+                assert buf is not None
 
-            # Register chip workers as NEXT_LEVEL (L3)
-            if device_ids:
-                for shm in self._chip_shms:
-                    dw.add_next_level_worker(_mailbox_addr(shm))
+                def _setup(inner=inner_worker):
+                    # Propagate the fork-constant prewarm sizing and the shared
+                    # startup deadline so the inner subtree comes up within the
+                    # parent's remaining budget. INIT_READY is published only
+                    # after BOTH the inner init (its whole subtree) and the
+                    # identity-table build succeed, so the parent never observes
+                    # READY for a child that then dies in fallible post-init
+                    # setup. A failure after inner.init() succeeded tears the
+                    # inner subtree back down before propagating, so a fallible
+                    # post-init step leaves no orphaned grandchildren / shms.
+                    inner.init(prewarm_config=self._prewarm_config, _startup_deadline=deadline)
+                    try:
+                        return _make_local_identity_tables(
+                            identity_snapshot,
+                            callable_kind=("PYTHON_SERIALIZED", "PYTHON_IMPORT"),
+                            target_namespace="LOCAL_PYTHON",
+                        )
+                    except BaseException:
+                        with contextlib.suppress(BaseException):
+                            inner.close()
+                        raise
 
-            # Register Worker children as NEXT_LEVEL (L4+)
-            if self._next_level_shms and not hasattr(dw, "add_next_level_worker_at"):
-                raise RuntimeError("explicit NEXT_LEVEL worker ids require a rebuilt _task_interface module")
-            for idx, shm in enumerate(self._next_level_shms):
-                worker_id = self._next_level_worker_ids[idx]
-                dw.add_next_level_worker_at(worker_id, _mailbox_addr(shm))
+                _forked_child_main(
+                    buf,
+                    f"next_level worker {idx}",
+                    _setup,
+                    lambda tables, b=buf, inner=inner_worker: _child_worker_loop(b, *tables, inner),
+                    make_group_leader=self._is_startup_root,
+                )
+            else:
+                self._next_level_pids.append(pid)
 
-            for shm in self._sub_shms:
-                dw.add_sub_worker(_mailbox_addr(shm))
+        # The recursive readiness edge: a next-level child's own init blocks on
+        # its descendants, so its INIT_READY means the whole subtree is ready. A
+        # failure, exit, or hang aborts startup here.
+        self._await_children_ready(self._next_level_shms, self._next_level_pids, "next_level", deadline)
 
-            # Start Scheduler + WorkerThreads (C++ threads start here, after fork)
-            dw.init()
-            scheduler_started = True
+        # Last local fork is done. Now — and only now — register remote L3
+        # endpoints, which spawns the RemoteL3Endpoint health thread; doing it
+        # here keeps every local fork ahead of every C++/Python thread. Each
+        # remote attach consumes the shared startup budget.
+        for session, spec in zip(self._remote_sessions, self._remote_worker_specs, strict=True):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise RuntimeError("remote L3 endpoint attach: startup deadline exceeded")
+            assert self._worker is not None
+            self._worker.add_remote_l3_socket(
+                session.worker_id,
+                session.session_id,
+                spec.transport,
+                session.command_host,
+                session.command_port,
+                session.health_host,
+                session.health_port,
+                min(self._remote_session_timeout_s(), remaining),
+            )
 
-            self._orch = Orchestrator(dw.get_orchestrator(), self)
+        # _Worker was constructed in _init_hierarchical (pre-fork) so children
+        # inherit the HeapRing MAP_SHARED mmap. Register PROCESS-mode workers via
+        # the unified mailbox.
+        dw = self._worker
+        assert dw is not None
 
-            # Pre-warm every chip child: for each registered ChipCallable digest,
-            # send `_CTRL_PREPARE` to all chip children so the first
-            # `submit_next_level` does not pay the H2D upload cost.  Sub fns /
-            # orch fns do not need pre-warming — the registry is already
-            # COW-inherited.
-            if device_ids:
-                for digest, target, _ref_count, kind, namespace in identity_snapshot:
-                    if kind == "CHIP_CALLABLE" and namespace == "LOCAL_CHIP" and isinstance(target, ChipCallable):
-                        for worker_id in range(len(self._chip_shms)):
-                            dw.control_prepare(worker_id, digest)
+        # Register chip workers as NEXT_LEVEL (L3)
+        if device_ids:
+            for shm in self._chip_shms:
+                dw.add_next_level_worker(_mailbox_addr(shm))
 
-            # The prebuilt runtime-arena is prewarmed inside each chip child's
-            # cw.init (the fork-constant sizing is COW-inherited via
-            # _chip_process_loop's prewarm_config arg) — no control command here.
+        # Register Worker children as NEXT_LEVEL (L4+)
+        if self._next_level_shms and not hasattr(dw, "add_next_level_worker_at"):
+            raise RuntimeError("explicit NEXT_LEVEL worker ids require a rebuilt _task_interface module")
+        for idx, shm in enumerate(self._next_level_shms):
+            worker_id = self._next_level_worker_ids[idx]
+            dw.add_next_level_worker_at(worker_id, _mailbox_addr(shm))
 
-            self._hierarchical_started = True
-            with self._hierarchical_start_cv:
-                self._hierarchical_start_state = "started"
-                self._hierarchical_start_cv.notify_all()
-        except BaseException:
-            # Pre-scheduler failures (a readiness-barrier abort, or a
-            # KeyboardInterrupt/SystemExit during the wait) roll the whole epoch
-            # back: gracefully close READY children so they unlink their own
-            # nested shms, SIGKILL the rest, reap all, and free the mailboxes —
-            # so a failed startup leaks no process or shm. After dw.init the
-            # scheduler owns the mailboxes, so leave teardown to close().
-            if not scheduler_started:
-                self._abort_hierarchical()
-            with self._hierarchical_start_cv:
-                self._hierarchical_start_state = "failed"
-                self._hierarchical_start_cv.notify_all()
-            raise
+        for shm in self._sub_shms:
+            dw.add_sub_worker(_mailbox_addr(shm))
 
-    def _await_children_ready(self, shms, pids, kind: str) -> None:
+        # Start Scheduler + WorkerThreads (C++ threads start here, after fork)
+        dw.init()
+
+        self._orch = Orchestrator(dw.get_orchestrator(), self)
+
+        # Every ChipCallable in the startup snapshot was already uploaded by its
+        # chip child before that child published INIT_READY (see
+        # _chip_process_loop), and the runtime arena was prewarmed there too — so
+        # there is no post-scheduler control_prepare on the startup path.
+
+    def _await_children_ready(self, shms, pids, kind: str, deadline: float) -> None:
         """Block until every forked child reports INIT_READY, or abort.
 
         Polls each child's mailbox: INIT_READY resets the slot to _IDLE (so the
@@ -3675,11 +3802,12 @@ class Worker:
         state), records the pid as having reached its serve loop, and retires
         it; INIT_FAILED surfaces the child's own error; ``waitpid(WNOHANG)``
         catches a child that died before signalling (recording the reaped pid so
-        rollback never re-SIGKILLs a possibly-reused PID); the per-Worker
-        ``startup_timeout_s`` deadline catches a child that hangs. A failure
-        raises ``RuntimeError`` — the caller rolls back the whole startup epoch.
+        rollback never re-SIGKILLs a possibly-reused PID). ``deadline`` is the
+        single startup-epoch deadline shared by every child group and every
+        recursive descendant, so a deep tree cannot multiply the timeout; a
+        child that hangs past it aborts the epoch. A failure raises
+        ``RuntimeError`` — the caller rolls back the whole startup epoch.
         """
-        deadline = time.monotonic() + self._startup_timeout_s
         pending = list(range(len(shms)))
         while pending:
             still_pending = []
@@ -3721,44 +3849,73 @@ class Worker:
     # Hierarchical abort
     # ------------------------------------------------------------------
 
-    def _abort_hierarchical(self) -> None:  # noqa: PLR0912 -- graceful-close-then-kill rollback: classify next-level children, bounded-wait, SIGKILL the rest, reap, free shms
-        """Tear down all forked children + shms after a bootstrap failure.
+    def _abort_hierarchical(self) -> None:  # noqa: PLR0912 -- graceful/cooperative-cancel-then-killpg rollback across sub/chip/next-level, bounded-wait, reap, free shms
+        """Tear down the whole forked subtree + shms after a bootstrap failure.
 
-        Called from the init() failure path and from a pre-scheduler
-        ``_start_hierarchical`` abort (readiness-barrier failure, or an
-        interrupt during the wait) — in both cases `dw.init()` has not run, so
-        the C++ scheduler is not holding any mailbox references.
+        Called from the init() failure path — the single rollback entry
+        (_cleanup_partial_init) — so `dw.init()` may or may not have run.
 
-        A next-level child that already reached its serve loop owns nested
-        mailbox shms that only *it* can unlink (the parent never learns their
-        names), so it is asked to close gracefully (SHUTDOWN, bounded wait)
-        before any SIGKILL. Every other child — and any graceful child that
-        overran the deadline — is SIGKILLed. PIDs the barrier already reaped are
-        excluded from the kill so a reused PID is never signalled.
+        Teardown proceeds in two bounded phases within one cleanup budget:
 
-        Residual: a next-level child still inside ``inner.init()`` when a sibling
-        fails has not reached its serve loop, so it cannot service SHUTDOWN and
-        is SIGKILLed; any nested shms it had already created are reclaimed by the
-        multiprocessing resource_tracker at interpreter exit rather than here.
-        Closing that race needs the eager-init handshake (follow-up PR).
+        1. Cooperative. A child that reached its serve loop (READY) is asked to
+           close gracefully via SHUTDOWN so it finalizes its device / unlinks its
+           own nested shms. A next-level child still inside ``inner.init()``
+           (mid-init, and possibly already the parent of grandchildren) is sent
+           SIGTERM, which unwinds its ``inner.init()`` and recursively reclaims
+           its grandchildren and their nested shms.
+        2. Hard backstop. Any child still alive past the cleanup deadline is
+           reaped. As the startup root, ``killpg`` takes the whole subtree — the
+           child and every descendant that inherited its process group — so a
+           mid-init grandchild is reaped here rather than left to the
+           multiprocessing resource_tracker; a nested (non-root) worker SIGKILLs
+           the direct pid and relies on the root's killpg. PIDs the barrier
+           already reaped are excluded so a reused PID is never signalled.
         """
         reaped = set(self._startup_reaped_pids)
         graceful: list[int] = []
+        cancelled: list[int] = []
         killed: list[int] = []
 
-        # Ask serve-loop-reached next-level children to close (unlinks their
-        # own nested shms), then bounded-wait for them to exit.
+        # A next-level child may have published INIT_READY in the window between
+        # the barrier last polling it and aborting on a failing sibling — its
+        # mailbox still reads INIT_READY (only the barrier resets it to IDLE).
+        # Promote it to READY so it is torn down gracefully (SHUTDOWN unlinks its
+        # own nested shms) rather than cooperatively cancelled after it has
+        # already restored the default SIGTERM disposition.
         for idx, pid in enumerate(self._next_level_pids):
-            if pid in reaped or pid not in self._startup_ready_pids:
+            if pid in reaped or pid in self._startup_ready_pids:
                 continue
             buf = self._next_level_shms[idx].buf if idx < len(self._next_level_shms) else None
-            if buf is None:
+            if buf is not None and _mailbox_load_i32(_buffer_field_addr(buf, _OFF_STATE)) == _INIT_READY:
+                self._startup_ready_pids.add(pid)
+
+        # Phase 1a: READY children (sub / chip / next-level) close gracefully.
+        for pids_list, shms_list in (
+            (self._next_level_pids, self._next_level_shms),
+            (self._chip_pids, self._chip_shms),
+            (self._sub_pids, self._sub_shms),
+        ):
+            for idx, pid in enumerate(pids_list):
+                if pid in reaped or pid not in self._startup_ready_pids:
+                    continue
+                buf = shms_list[idx].buf if idx < len(shms_list) else None
+                if buf is None:
+                    continue
+                _mailbox_store_i32(_buffer_field_addr(buf, _OFF_STATE), _SHUTDOWN)
+                graceful.append(pid)
+
+        # Phase 1b: mid-init next-level children get a cooperative cancel so they
+        # unwind inner.init() and recursively reclaim their own subtree.
+        for pid in self._next_level_pids:
+            if pid in reaped or pid in self._startup_ready_pids:
                 continue
-            _mailbox_store_i32(_buffer_field_addr(buf, _OFF_STATE), _SHUTDOWN)
-            graceful.append(pid)
-        if graceful:
+            with contextlib.suppress(ProcessLookupError, OSError):
+                os.kill(pid, signal.SIGTERM)
+            cancelled.append(pid)
+
+        waiting = set(graceful) | set(cancelled)
+        if waiting:
             gdeadline = time.monotonic() + _ROLLBACK_GRACEFUL_TIMEOUT_S
-            waiting = set(graceful)
             while waiting and time.monotonic() <= gdeadline:
                 for pid in list(waiting):
                     try:
@@ -3772,27 +3929,25 @@ class Worker:
                         reaped.add(pid)
                 if waiting:
                     time.sleep(_STARTUP_POLL_INTERVAL_S)
-            # Any graceful child still alive overran the deadline; fall through
-            # to SIGKILL below.
 
+        # Phase 2: hard backstop for any survivor. A not-yet-reaped pid still
+        # holds its slot (no reuse), so killpg on the root reaps the survivor's
+        # whole group (it + inherited-group descendants) safely.
         pids = list(self._chip_pids) + list(self._sub_pids) + list(self._next_level_pids)
         for pid in pids:
             if pid in reaped:
                 continue
-            try:
+            if self._is_startup_root:
+                with contextlib.suppress(ProcessLookupError, OSError):
+                    os.killpg(pid, signal.SIGKILL)
+            with contextlib.suppress(ProcessLookupError, OSError):
                 os.kill(pid, signal.SIGKILL)
-                killed.append(pid)
-            except ProcessLookupError:
-                pass
-            except OSError:
-                pass
+            killed.append(pid)
         for pid in pids:
             if pid in reaped and pid not in killed:
                 continue
-            try:
+            with contextlib.suppress(ChildProcessError):
                 os.waitpid(pid, 0)
-            except ChildProcessError:
-                pass
 
         self._last_rollback = {
             "graceful": [p for p in graceful if p not in killed],
@@ -3850,10 +4005,6 @@ class Worker:
         self._hierarchical_started = False
         self._comm_base_ready = False
         self._initialized = False
-        with self._hierarchical_start_cv:
-            if self._hierarchical_start_state != "started":
-                self._hierarchical_start_state = "not_started"
-            self._hierarchical_start_cv.notify_all()
 
     @property
     def live_domains(self) -> dict[str, CommDomainHandle]:
@@ -4451,7 +4602,7 @@ class Worker:
         """Allocate a born-shared host buffer, attached into every local L3 child,
         that a later ``run()`` reads/writes with **no per-run copy**.
 
-        Local L3 children are forked lazily on the first ``run()``; memory created
+        Local L3 children are forked during ``init()``; host memory allocated
         afterwards is not in their address space. This hands you memory that is
         *born* in a shm already attached into every child, so there is nothing to
         copy: the child reads and writes the same physical pages the parent sees.
@@ -4476,9 +4627,13 @@ class Worker:
             raise TypeError("create_host_buffer requires a level >= 3 Worker")
         if not self._initialized:
             raise RuntimeError("create_host_buffer requires Worker.init() before allocation")
-        self._start_hierarchical()
-        if not self._chip_shms:
-            raise RuntimeError("create_host_buffer requires forked chip children (none are configured)")
+        # A born-shared buffer is mapped into every direct process child (chip
+        # and sub alike, via _broadcast_host_control). Only a truly childless L3
+        # has nowhere to attach it.
+        if not self._chip_shms and not self._sub_shms:
+            raise RuntimeError(
+                "create_host_buffer requires at least one forked chip or sub child (this Worker has none)"
+            )
         assert self._worker is not None
 
         nbytes = int(nbytes)
@@ -4760,7 +4915,6 @@ class Worker:
             self._chip_worker._run_slot(state.slot_id, args, cfg)
             return None
 
-        self._start_hierarchical()
         assert self._orch is not None
         assert self._worker is not None
         # Drop any error stashed by a previous run() so this call starts
@@ -4837,6 +4991,13 @@ class Worker:
     # ------------------------------------------------------------------
 
     def close(self) -> None:  # noqa: PLR0912 -- parallel teardown for _worker + sub/chip/next/bootstrap shms with ordering constraints documented inline
+        # A close() that races an in-progress init() must not no-op on the still
+        # -false _initialized flag and leave the epoch's tree running: wait for
+        # the epoch to reach READY (then tear it down) or FAILED (already rolled
+        # back by init()).
+        with self._hierarchical_start_cv:
+            while self._hierarchical_start_state == "starting":
+                self._hierarchical_start_cv.wait()
         if not self._initialized:
             return
 

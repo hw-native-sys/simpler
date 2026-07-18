@@ -47,18 +47,26 @@ def test_start_session_kills_runner_on_ready_timeout(monkeypatch):
         pid = 12345
 
         def __init__(self, *args, **kwargs):
+            self.terminated = False
             self.killed = False
             self.wait_calls = 0
 
         def poll(self):
             return -9 if self.killed else None
 
+        def terminate(self):
+            self.terminated = True
+
         def kill(self):
             self.killed = True
 
         def wait(self, timeout=None):
+            # Model a runner that does not exit on its own or on the cooperative
+            # SIGTERM, so cleanup must escalate to the killpg/kill backstop.
             self.wait_calls += 1
-            return -9 if self.killed else 0
+            raise remote_l3_worker.subprocess.TimeoutExpired(
+                cmd="runner", timeout=timeout if timeout is not None else 0.0
+            )
 
     fake_proc = FakePopen()
 
@@ -74,6 +82,8 @@ def test_start_session_kills_runner_on_ready_timeout(monkeypatch):
     with pytest.raises(TimeoutError):
         remote_l3_worker._start_session(_manifest())
 
+    # Cooperative SIGTERM first, then the hard SIGKILL backstop.
+    assert fake_proc.terminated
     assert fake_proc.killed
     assert fake_proc.wait_calls >= 1
 
@@ -116,10 +126,7 @@ def test_run_session_bounds_post_ready_command_accept(monkeypatch):
         def __init__(self, *args, **kwargs):
             self.closed = False
 
-        def init(self):
-            pass
-
-        def _start_hierarchical(self):
+        def init(self, *args, **kwargs):
             pass
 
         def close(self):

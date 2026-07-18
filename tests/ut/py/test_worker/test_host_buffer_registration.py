@@ -235,3 +235,36 @@ def test_l3_sub_worker_maps_rewrites_and_unmaps_host_buffer(monkeypatch):
         if staged is not None:
             staged.close()
             staged.unlink()
+
+
+class TestCreateHostBufferChildPrecondition:
+    """A born-shared buffer needs a process child to attach into — chip OR sub.
+
+    The buffer is broadcast to both NEXT_LEVEL and SUB children, so a sub-only
+    L3 (no device_ids) is a valid host; only a truly childless L3 is rejected.
+    """
+
+    def test_sub_only_l3_allows_create_host_buffer(self):
+        w = Worker(level=3, num_sub_workers=1)
+        w.register(lambda args: None)
+        w.init()
+        try:
+            buf = w.create_host_buffer(64)
+            try:
+                # SharedMemory may round the mapping up to a page.
+                assert buf.buffer.nbytes >= 64
+            finally:
+                buf.buffer.release()
+                w.free_host_buffer(buf)
+        finally:
+            w.close()
+
+    def test_childless_l3_rejects_create_host_buffer(self):
+        w = Worker(level=3, num_sub_workers=0)
+        w.register(lambda args: None)
+        w.init()
+        try:
+            with pytest.raises(RuntimeError, match="at least one forked chip or sub child"):
+                w.create_host_buffer(64)
+        finally:
+            w.close()

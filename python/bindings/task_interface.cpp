@@ -596,6 +596,12 @@ NB_MODULE(_task_interface, m) {
     m.attr("MAX_TENSOR_DIMS") = MAX_TENSOR_DIMS;
     m.attr("MAX_REGISTERED_CALLABLE_IDS") = MAX_REGISTERED_CALLABLE_IDS;
     m.attr("RUNTIME_ENV_RING_COUNT") = RUNTIME_ENV_RING_COUNT;
+    // Byte size of a Tensor and the offset of its child_memory flag within it.
+    // A task-args blob stores Tensors as a raw memcpy array, so a Python-side
+    // blob walker locates tensor i's fields at i * TENSOR_STRIDE_BYTES without
+    // reimplementing the struct layout.
+    m.attr("TENSOR_STRIDE_BYTES") = static_cast<int>(sizeof(Tensor));
+    m.attr("TENSOR_CHILD_MEMORY_OFFSET") = static_cast<int>(offsetof(Tensor, child_memory));
 
     // --- Tensor ---
     // The unified strided tensor descriptor. Constructed contiguous via make()
