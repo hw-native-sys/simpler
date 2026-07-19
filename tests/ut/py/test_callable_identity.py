@@ -478,6 +478,23 @@ def test_remote_worker_id_stays_stable_when_local_worker_is_added_later(monkeypa
         def add_remote_l3_socket(self, worker_id, *args):
             self.remote_worker_ids.append(worker_id)
 
+        # Eager init() forks the local L3 child and starts the C++ scheduler, so
+        # the mock must satisfy the register/init/orchestrator surface.
+        def add_sub_worker(self, *args):
+            pass
+
+        def add_next_level_worker(self, *args):
+            pass
+
+        def add_next_level_worker_at(self, *args):
+            pass
+
+        def init(self):
+            pass
+
+        def get_orchestrator(self):
+            return None
+
         def close(self):
             self.closed = True
 
@@ -1014,7 +1031,6 @@ def test_remote_sim_prepare_callable_control_roundtrip():
             workers=[worker_id],
         )
         worker.init()
-        worker._start_hierarchical()  # noqa: SLF001 -- exercise PREPARE_CALLABLE before TASK dispatch.
         assert worker._worker is not None
         worker._worker.control_prepare(worker_id, handle.digest)
 
@@ -1200,7 +1216,6 @@ def test_remote_sim_inner_python_import_register_runs_sub_task():
             workers=[worker_id],
         )
         worker.init()
-        worker._start_hierarchical()
         assert worker._worker is not None
         inner_digest = hashid_to_digest(_INNER_SUB_HASHID)
         target = b"tests.ut.py.test_callable_identity:_remote_inner_sub_noop"

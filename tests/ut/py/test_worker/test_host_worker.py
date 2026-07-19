@@ -133,7 +133,7 @@ def test_chip_process_loop_inits_runs_and_finalizes(monkeypatch):
         def finalize(self) -> None:
             events.append(("finalize",))
 
-    def fake_run_chip_main_loop(cw, *_args, chip_platform, chip_runtime):
+    def fake_run_chip_main_loop(cw, *_args, chip_platform, chip_runtime, prepared=None):
         events.append(("main_loop", cw, chip_platform, chip_runtime))
 
     monkeypatch.setattr(worker_mod, "ChipWorker", FakeChipWorker)
@@ -225,32 +225,33 @@ class TestLifecycle:
         assert hw._identity_registry == {}
         assert hw._live_handles == {}
 
-    def test_prepare_python_fn_after_init_before_start_succeeds(self):
-        # init() allocates mailboxes but does not fork children. Python
-        # callables prepared in this window still land in the startup
-        # snapshot consumed by the first run().
-        hw = Worker(level=3, num_sub_workers=0)
+    def test_register_python_fn_before_init_lands_in_snapshot(self):
+        # init() is eager, so there is no init-before-start window. A Python
+        # callable registered before init() is frozen into the startup snapshot
+        # and COW-inherited by the sub child during init — no run() needed.
+        hw = Worker(level=3, num_sub_workers=1)
+        handle = hw.register(lambda args: None)
         hw.init()
         try:
-            handle = hw.register(lambda args: None)
             assert _slot_for(hw, handle) in hw._callable_registry
         finally:
             hw.close()
 
-    def test_prepare_python_fn_after_init_before_start_does_not_broadcast(self):
-        class BroadcastTrap:
-            def broadcast_control_all(self, *args, **kwargs):
-                raise AssertionError("pre-start Python prepare must not broadcast")
-
+    def test_pre_init_register_does_not_broadcast(self):
+        # A registration issued before init() takes the pre-start snapshot path
+        # and must not attempt a control broadcast — there is no started
+        # hierarchy to broadcast to yet.
         hw = Worker(level=3, num_sub_workers=1)
+
+        def _trap(*_a, **_k):
+            raise AssertionError("pre-init Python register must not broadcast")
+
+        hw._broadcast_py_control = _trap
+        handle = hw.register(lambda args: None)
         hw.init()
-        real_worker = hw._worker
         try:
-            hw._worker = BroadcastTrap()
-            handle = hw.register(lambda args: None)
             assert _slot_for(hw, handle) in hw._callable_registry
         finally:
-            hw._worker = real_worker
             hw.close()
 
     def test_prepare_python_fn_after_start_no_python_children_raises(self):
@@ -373,73 +374,51 @@ class TestLifecycle:
                 hw._hierarchical_start_cv.wait = original_wait
             hw.close()
 
-    def test_prepare_blocks_startup_snapshot_from_not_started_window(self):
-        hw = Worker(level=3, num_sub_workers=0)
+    def test_register_during_initializing_waits_then_takes_post_start_path(self):
+        # A register that races an in-progress startup epoch (INITIALIZING) must
+        # block on the lifecycle condition rather than mutate the registry, then
+        # resolve via the post-start broadcast path once the epoch commits READY.
+        hw = Worker(level=3, num_sub_workers=1)
         hw.init()
-
-        real_registry_lock = hw._registry_lock
-        register_waiting = threading.Event()
-        release_register = threading.Event()
-        startup_snapshot_attempted = threading.Event()
-        result: list[CallableHandle] = []
-        errors: list[BaseException] = []
-
-        class BlockingRegistryLock:
-            def __enter__(self):
-                thread_name = threading.current_thread().name
-                if thread_name == "register-thread":
-                    register_waiting.set()
-                    if not release_register.wait(timeout=2.0):
-                        raise TimeoutError("test timed out waiting to release register")
-                elif thread_name == "startup-thread":
-                    startup_snapshot_attempted.set()
-                return real_registry_lock.__enter__()
-
-            def __exit__(self, exc_type, exc, tb):
-                return real_registry_lock.__exit__(exc_type, exc, tb)
-
-            def locked(self):
-                return real_registry_lock.locked()
-
-        hw._registry_lock = BlockingRegistryLock()
-
-        def do_register():
-            try:
-                result.append(hw.register(lambda args: None))
-            except BaseException as exc:  # noqa: BLE001
-                errors.append(exc)
-
-        def do_startup():
-            try:
-                hw._start_hierarchical()
-            except BaseException as exc:  # noqa: BLE001
-                errors.append(exc)
-
-        register_thread = threading.Thread(target=do_register, name="register-thread")
-        startup_thread = threading.Thread(target=do_startup, name="startup-thread")
         try:
-            register_thread.start()
-            assert register_waiting.wait(timeout=2.0)
+            with hw._hierarchical_start_cv:
+                hw._hierarchical_start_state = "starting"
 
-            startup_thread.start()
-            assert not startup_snapshot_attempted.wait(timeout=0.2)
+            errors: list[BaseException] = []
+            result: list[object] = []
+            wait_entered = threading.Event()
+            original_wait = hw._hierarchical_start_cv.wait
 
-            release_register.set()
-            register_thread.join(timeout=2.0)
-            startup_thread.join(timeout=2.0)
+            def wait_with_signal(timeout=None):
+                wait_entered.set()
+                return original_wait(timeout)
 
-            assert not register_thread.is_alive()
-            assert not startup_thread.is_alive()
+            hw._hierarchical_start_cv.wait = wait_with_signal
+
+            def do_register():
+                try:
+                    result.append(hw.register(lambda args: None))
+                except BaseException as exc:  # noqa: BLE001
+                    errors.append(exc)
+
+            t = threading.Thread(target=do_register)
+            t.start()
+            assert wait_entered.wait(timeout=2.0)
+            # Still INITIALIZING: the register must be parked, not installed.
+            assert len(hw._identity_registry) == 0
+
+            with hw._hierarchical_start_cv:
+                hw._hierarchical_started = True
+                hw._hierarchical_start_state = "started"
+                hw._hierarchical_start_cv.notify_all()
+            t.join(timeout=2.0)
+
+            assert not t.is_alive()
             assert errors == []
             assert len(result) == 1
-            assert _slot_for(hw, result[0]) == 0
-            assert startup_snapshot_attempted.is_set()
-            assert hw._hierarchical_start_state == "started"
         finally:
-            release_register.set()
-            register_thread.join(timeout=2.0)
-            startup_thread.join(timeout=2.0)
-            hw._registry_lock = real_registry_lock
+            if "original_wait" in locals():
+                hw._hierarchical_start_cv.wait = original_wait
             hw.close()
 
     def test_prepare_chip_callable_after_init_no_chips_succeeds(self):

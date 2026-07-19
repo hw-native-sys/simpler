@@ -167,6 +167,121 @@ class TaskArgsBuilder:
         return [s.name for s in self._specs if isinstance(s, Tensor)]
 
 
+class _RehostedTaskArgs:
+    """Move a builder's host tensors into born-shared child buffers.
+
+    ``Worker.init()`` is eager: the L3 chip/sub children are forked in ``init()``,
+    before ``generate_args()`` runs, so a plain post-init host tensor's raw VA is
+    not in any child's address space. Each host tensor is rehosted into its own
+    ``create_host_buffer`` (born-shared, mapped into every direct child) with
+    dtype / shape / value preserved, and the builder is rebound to a view over
+    that buffer so multi-round reset, dispatch, and golden compare all read and
+    write the same physical pages the children see.
+
+    Each tensor gets an independent buffer (no aliasing of one registered range).
+    A non-contiguous / non-faithfully-representable layout is rejected rather
+    than silently copied to contiguous. ``release()`` frees every buffer in LIFO
+    order; a partial-construction failure rolls the builder back and frees what
+    was already allocated.
+    """
+
+    def __init__(self, worker, test_args: TaskArgsBuilder):
+        import torch  # noqa: PLC0415
+
+        self._worker = worker
+        self._torch = torch
+        self._buffers: list = []  # (HostBuffer, view) in creation order
+        self._originals: dict[str, Any] = {}  # name -> pre-rehost tensor
+        self._test_args = test_args
+        self._reject_aliased_tensors(test_args)
+        try:
+            new_specs = []
+            for spec in test_args._specs:
+                # Only non-empty host tensors carry bytes across the process edge;
+                # an empty tensor is never dereferenced by the child, so it is
+                # left untouched rather than allocating a zero-length buffer.
+                if isinstance(spec, Tensor) and isinstance(spec.value, torch.Tensor) and spec.value.numel() > 0:
+                    view = self._rehost_one(spec.value)
+                    self._originals[spec.name] = test_args._data[spec.name]
+                    test_args._data[spec.name] = view
+                    new_specs.append(Tensor(spec.name, view))
+                else:
+                    new_specs.append(spec)
+            test_args._specs = new_specs
+        except BaseException:
+            self.release()
+            raise
+
+    def _reject_aliased_tensors(self, test_args: TaskArgsBuilder) -> None:
+        # Two args whose storage byte-ranges overlap encode an OverlapMap
+        # dependency that independent born-shared buffers cannot preserve, so
+        # reject rather than silently split them into separate storage.
+        torch = self._torch
+        ranges: list = []  # (name, lo, hi)
+        for spec in test_args._specs:
+            if not (isinstance(spec, Tensor) and isinstance(spec.value, torch.Tensor)):
+                continue
+            t = spec.value
+            if t.numel() == 0:
+                continue
+            lo = t.data_ptr()
+            hi = lo + t.numel() * t.element_size()
+            for oname, olo, ohi in ranges:
+                if lo < ohi and olo < hi:
+                    raise ValueError(
+                        f"SceneTest rehost: tensors {spec.name!r} and {oname!r} alias overlapping storage; "
+                        "an aliased layout is not faithfully representable across the process edge — build "
+                        "them as independent tensors in generate_args()"
+                    )
+            ranges.append((spec.name, lo, hi))
+
+    def _rehost_one(self, t):
+        torch = self._torch
+        if t.device.type != "cpu":
+            raise ValueError(
+                f"SceneTest rehost: a host tensor crossing a process edge must be a CPU tensor, got "
+                f"device {t.device}; a device tensor must be declared child_memory, not rehosted to host"
+            )
+        if not t.is_contiguous():
+            raise ValueError(
+                "SceneTest rehost: a host tensor crossing a process edge must be contiguous to move "
+                "into a born-shared child buffer; a non-contiguous / aliased layout is not faithfully "
+                "representable — build it contiguous in generate_args()"
+            )
+        nbytes = t.numel() * t.element_size()
+        buf = self._worker.create_host_buffer(nbytes)
+        try:
+            view = torch.frombuffer(buf.buffer, dtype=t.dtype, count=t.numel()).view(t.shape)
+            view.copy_(t)
+        except BaseException:
+            self._worker.free_host_buffer(buf)
+            raise
+        self._buffers.append((buf, view))
+        return view
+
+    def release(self) -> None:
+        # Restore the builder's original entries (dropping the born-shared view
+        # refs), then free each buffer in LIFO order after releasing its view.
+        for name, orig in self._originals.items():
+            self._test_args._data[name] = orig
+        self._test_args._specs = [
+            Tensor(s.name, self._originals[s.name]) if isinstance(s, Tensor) and s.name in self._originals else s
+            for s in self._test_args._specs
+        ]
+        self._originals.clear()
+        while self._buffers:
+            buf, view = self._buffers.pop()
+            del view
+            try:
+                buf.buffer.release()
+            except (ValueError, BufferError):
+                pass
+            try:
+                self._worker.free_host_buffer(buf)
+            except Exception as exc:  # noqa: BLE001 -- best-effort cleanup; a leak here must not mask the test result, but process-control exceptions still propagate
+                logger.warning("SceneTest rehost cleanup: free_host_buffer failed: %s", exc)
+
+
 # ---------------------------------------------------------------------------
 # CallableNamespace — dot-access container for L3 callables
 # ---------------------------------------------------------------------------
@@ -1109,51 +1224,59 @@ class SceneTestCase:
             golden_args = test_args.clone()
             self.compute_golden(golden_args, params)
 
-        # Save initial tensor values for reset between rounds
-        all_tensor_names = test_args.tensor_names()
-        initial_tensors = {}
-        if rounds > 1:
-            for name in all_tensor_names:
-                initial_tensors[name] = getattr(test_args, name).clone()
+        # Eager Worker.init() forked the chip/sub children before generate_args
+        # ran, so move test_args' host tensors into born-shared buffers the
+        # children can see. Golden was cloned above from the original host data;
+        # reset, dispatch, and compare below all operate on the rehosted views.
+        rehosted = _RehostedTaskArgs(worker, test_args)
+        try:
+            # Save initial tensor values for reset between rounds
+            all_tensor_names = test_args.tensor_names()
+            initial_tensors = {}
+            if rounds > 1:
+                for name in all_tensor_names:
+                    initial_tensors[name] = getattr(test_args, name).clone()
 
-        # Build CallableNamespace: compiled ChipCallables + sub callable IDs
-        ns = CallableNamespace({**compiled_callables, **sub_handles})
+            # Build CallableNamespace: compiled ChipCallables + sub callable IDs
+            ns = CallableNamespace({**compiled_callables, **sub_handles})
 
-        # Get orch function (plain function from CALLABLE)
-        orch_fn = self.CALLABLE["orchestration"]
+            # Get orch function (plain function from CALLABLE)
+            orch_fn = self.CALLABLE["orchestration"]
 
-        # Execute rounds. As for L2 (see _run_and_validate_l2), per-round timing
-        # is obtained offline from the `[STRACE]` stderr markers via
-        # `strace_timing --rounds-table`; the L3 chip children emit their own
-        # markers (grouped by (pid, inv)), so multi-round works without any
-        # inline fd capture here.
-        for round_idx in range(rounds):
-            if round_idx > 0:
-                for name, initial in initial_tensors.items():
-                    getattr(test_args, name).copy_(initial)
+            # Execute rounds. As for L2 (see _run_and_validate_l2), per-round
+            # timing is obtained offline from the `[STRACE]` stderr markers via
+            # `strace_timing --rounds-table`; the L3 chip children emit their own
+            # markers (grouped by (pid, inv)), so multi-round works without any
+            # inline fd capture here.
+            for round_idx in range(rounds):
+                if round_idx > 0:
+                    for name, initial in initial_tensors.items():
+                        getattr(test_args, name).copy_(initial)
 
-            # See _run_and_validate_l2: the per-round masking is dead code
-            # under the existing upstream gate. Keep parity by passing through.
-            config = self._build_config(
-                config_dict,
-                enable_l2_swimlane=enable_l2_swimlane,
-                enable_dump_args=enable_dump_args,
-                enable_pmu=enable_pmu,
-                enable_dep_gen=enable_dep_gen,
-                enable_scope_stats=enable_scope_stats,
-                output_prefix=output_prefix,
-            )
+                # See _run_and_validate_l2: the per-round masking is dead code
+                # under the existing upstream gate. Keep parity by passing through.
+                config = self._build_config(
+                    config_dict,
+                    enable_l2_swimlane=enable_l2_swimlane,
+                    enable_dump_args=enable_dump_args,
+                    enable_pmu=enable_pmu,
+                    enable_dep_gen=enable_dep_gen,
+                    enable_scope_stats=enable_scope_stats,
+                    output_prefix=output_prefix,
+                )
 
-            # Orch fn signature: (orch, args, cfg) — inner fn forwards to
-            # the user's scene orch which takes (orch, callables, task_args, config).
-            def task_orch(orch, _args, _cfg, _ns=ns, _test_args=test_args, _config=config):
-                orch_fn(orch, _ns, _test_args, _config)
+                # Orch fn signature: (orch, args, cfg) — inner fn forwards to
+                # the user's scene orch which takes (orch, callables, task_args, config).
+                def task_orch(orch, _args, _cfg, _ns=ns, _test_args=test_args, _config=config):
+                    orch_fn(orch, _ns, _test_args, _config)
 
-            with _temporary_env(self._resolve_env()):
-                worker.run(task_orch)
+                with _temporary_env(self._resolve_env()):
+                    worker.run(task_orch)
 
-            if not skip_golden:
-                _compare_outputs(test_args, golden_args, all_tensor_names, self.RTOL, self.ATOL)
+                if not skip_golden:
+                    _compare_outputs(test_args, golden_args, all_tensor_names, self.RTOL, self.ATOL)
+        finally:
+            rehosted.release()
 
     # ------------------------------------------------------------------
     # pytest auto test method

@@ -258,23 +258,31 @@ the session runner reports `HELLO READY`.
 
 ### 4.1 Nested fork ordering (L4+ Worker children)
 
-When an L4 Worker has L3 Worker children, the fork sequence nests:
+When an L4 Worker has L3 Worker children, `init()` is eager and the fork
+sequence nests recursively — the whole tree is READY when `L4.init()` returns:
 
 ```text
 L4 parent process
   ├─ _init_hierarchical(): Worker(4) + HeapRing mmap (before fork)
-  └─ _start_hierarchical() (on first run):
+  └─ _start_hierarchical() (inside init()):
        ├─ fork L3 child  ────────►  L3 child process:
-       │                              inner_worker.init()  ← Worker(3) + L3 HeapRing
-       │                              _child_worker_loop()
-       │                                └─ on first dispatch: inner_worker.run()
-       │                                     └─ _start_hierarchical() forks L3's sub/chip children
+       │                              inner_worker.init()  ← eager, recursive
+       │                                ├─ Worker(3) + L3 HeapRing
+       │                                └─ _start_hierarchical() forks L3's
+       │                                   sub/chip children and blocks on their
+       │                                   INIT_READY, THEN publishes INIT_READY
+       │                              _child_worker_loop()  (dispatch only)
+       ├─ await every L3 child's INIT_READY (whole subtree ready)
        └─ register mailbox with L4's Worker
 ```
 
 Each inner Worker inits **inside its forked child process** so its own
-children are forked from the correct parent. The L4 parent never sees L3's
-sub/chip grandchildren — they're L3's responsibility.
+children are forked from the correct parent. Because the inner `init()` is
+eager and blocks on its descendants, a child publishes `INIT_READY` only after
+its whole subtree is ready, so readiness propagates recursively up to
+`L4.init()`. The L4 parent never sees L3's sub/chip grandchildren — they're
+L3's responsibility; if startup fails, they are reclaimed via the child's
+process-group cancellation domain, not the resource_tracker.
 
 **Key invariant**: `Worker(N)` and its HeapRing are created before any
 fork at level N. Children inherit the `MAP_SHARED` mmap at the same virtual

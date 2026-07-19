@@ -97,20 +97,16 @@ class TestPostForkHostBufferZeroCopy(SceneTestCase):
         {"name": "post_fork_zero_copy", "platforms": ["a2a3sim"]},
     ]
 
-    def _force_fork(self, worker, chip_handle):
-        a = torch.full((SIZE,), 2.0, dtype=DTYPE).share_memory_()
-        b = torch.full((SIZE,), 3.0, dtype=DTYPE).share_memory_()
-        out = torch.zeros(SIZE, dtype=DTYPE).share_memory_()
-        worker.run(_one_task_orch(chip_handle, a, b, out), args=None, config=CallConfig())
-        assert torch.allclose(out, _golden(a, b), rtol=self.RTOL, atol=self.ATOL)
-
     def test_run(self, st_worker):
         """Zero-copy: buffers allocated AFTER the fork via ``create_host_buffer``,
-        filled in place, run, and read back — all without a per-run copy."""
+        filled in place, run, and read back — all without a per-run copy.
+
+        ``Worker.init()`` is eager, so the chip child is already forked when the
+        buffers are created; a born-shared ``create_host_buffer`` is the mapped
+        path a post-init host tensor takes to reach that child.
+        """
         worker = st_worker
         chip_handle = type(self)._st_chip_handles["vector"]
-
-        self._force_fork(worker, chip_handle)
 
         nbytes = SIZE * DTYPE.itemsize  # element count × dtype size, not a magic 4
         ba = worker.create_host_buffer(nbytes)

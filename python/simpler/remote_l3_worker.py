@@ -11,9 +11,11 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import os
 import select
+import signal
 import socket
 import struct
 import subprocess
@@ -97,14 +99,24 @@ def _wait_or_kill_runner(proc: subprocess.Popen[Any], *, timeout_s: float = 5.0)
         return
     except subprocess.TimeoutExpired:
         pass
-    try:
-        proc.kill()
-    except OSError:
-        pass
+    # Cooperative: SIGTERM lets the runner close its inner Worker and reap its
+    # own L3->L2 subtree (unlinking nested shms) before it exits.
+    with contextlib.suppress(OSError):
+        proc.terminate()
     try:
         proc.wait(timeout=timeout_s)
+        return
     except subprocess.TimeoutExpired:
         pass
+    # Hard backstop: SIGKILL the whole runner process group. The runner is a
+    # session leader (start_new_session) and its inner chip/sub children inherit
+    # its group, so this reaps the entire subtree rather than orphaning it.
+    with contextlib.suppress(OSError, ProcessLookupError):
+        os.killpg(proc.pid, signal.SIGKILL)
+    with contextlib.suppress(OSError):
+        proc.kill()
+    with contextlib.suppress(subprocess.TimeoutExpired):
+        proc.wait(timeout=timeout_s)
 
 
 def _reap_session_runner(proc: subprocess.Popen[Any]) -> None:
@@ -138,17 +150,15 @@ def _start_session(manifest: dict[str, Any]) -> dict[str, Any]:
             ],
             pass_fds=(ready_w,),
             close_fds=True,
+            # Own session/group so the daemon can killpg the whole runner
+            # subtree (runner + eagerly-forked inner L3->L2 children).
+            start_new_session=True,
         )
         os.close(ready_w)
         ready_w = -1
         try:
             ready = _read_runner_ready(ready_r, timeout_s)
         except BaseException:
-            if proc.poll() is None:
-                try:
-                    proc.kill()
-                except OSError:
-                    pass
             _wait_or_kill_runner(proc)
             raise
         ready["pid"] = int(proc.pid)
