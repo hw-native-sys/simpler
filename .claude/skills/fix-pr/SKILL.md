@@ -14,7 +14,7 @@ Create tasks to track progress through this workflow:
 1. Match input to PR
 2. Detect & classify issues
 3. Get user confirmation
-4. Fix issues & push
+4. Fix issues & push (fold into one commit — amend/squash, never append)
 5. Resolve comment threads
 6. Re-check (loop until clean)
 
@@ -190,15 +190,59 @@ Run [checkout-fork-branch](../../lib/github/checkout-fork-branch.md) to create/s
 
 1. Read affected files, make changes with Edit tool
 2. For CI: analyze logs online first, reproduce locally only as last resort
-3. Commit using `/git-commit` skill (skip testing/review for minor fixes)
 
-Then run [commit-and-push](../../lib/github/commit-and-push.md):
+**Fold the fix into the PR — never append a standalone "fix(pr)" commit.**
+The PR must stay as **one commit** (its original commit + your fixes squashed
+in), so reviewers see a single clean diff, not a running log of review
+churn. This is the default on **every** iteration.
 
-1. Rebase onto `$BASE_REF`
-2. Ensure single valid commit (squash with original PR commit)
+Stage all changes, then squash based on how many commits the PR has ahead of
+`$BASE_REF`:
+
+```bash
+git add -A
+COMMITS_AHEAD=$(git rev-list HEAD --not "$BASE_REF" --count)
+```
+
+| `COMMITS_AHEAD` | How to fold the fix in |
+| --------------- | ---------------------- |
+| `0` | **Error — stop.** Nothing ahead of base to fold into; do not rebase or push. Matches [commit-and-push](../../lib/github/commit-and-push.md) §2. |
+| `1` | **Amend with an updated message.** Pass the message non-interactively — `git commit --amend -F <msgfile>` (or `-m`), never bare `--amend` (it opens an editor and hangs in a non-interactive/agent shell) and never `--no-edit` (leaves the message stale). Write the evolved message per the rule below into `<msgfile>` first. |
+| `> 1` | **Squash to one** via the [commit-and-push](../../lib/github/commit-and-push.md) squash procedure (capture the original message, soft-reset to `$BASE_REF`, recommit once) |
+
+Do NOT run `/git-commit` to create a *new* commit here — that is what causes
+the appended-commit problem. `/git-commit` is only for regenerating the
+squashed message when `COMMITS_AHEAD > 1`.
+
+Then push and verify exactly one commit landed:
+
+1. Rebase onto `$BASE_REF` (see [commit-and-push](../../lib/github/commit-and-push.md) §1)
+2. **Verify single commit:** `git rev-list HEAD --not "$BASE_REF" --count` must print `1`. If not, squash again before pushing — never push a multi-commit PR.
 3. Push (update push with `--force-with-lease` to `$PUSH_REMOTE`)
 
-**Commit message:** `fix(pr): resolve issues for #<number>` with bullet list of fixes.
+**Commit message — evolve it, don't replace or freeze it.** The message must
+describe the commit's *final combined diff*, so it has to change when the fix
+changes the code's behavior or scope. Two failure modes to avoid equally:
+
+- ❌ **Frozen** (`--no-edit`): the message now under-describes what the commit
+  does — a reviewer reads it and the diff disagrees.
+- ❌ **Replaced** (`fix(pr): resolve review comments`): the original intent and
+  its scope/type/subject are lost, and the message becomes a changelog of
+  review churn rather than a description of the code.
+
+Instead: **keep the original subject and body, then edit them to absorb the
+fix.** Match the type/scope/style of the original message.
+
+- Small fix that doesn't change what the commit does (typo, lint, comment) →
+  message may stay as-is; amend without message edits only in this case.
+- Fix that adds/changes behavior → work it into the existing body (extend or
+  correct the relevant bullet/sentence); adjust the subject only if the
+  headline scope actually changed.
+
+Example — original `feat(runtime): add predicated dispatch`; review found a
+missing null check on the predicate. Update the body to note the guard, keep
+the `feat(runtime): add predicated dispatch` subject — not `fix(pr): address
+comments`, not the untouched original.
 
 ### Step 7: Reply and Resolve Comment Threads
 
@@ -224,7 +268,7 @@ For each comment, **both steps are mandatory** (see [reply-and-resolve](../../li
 
 Reply templates:
 
-- **Fixed** → "Fixed in `<commit>` — description of change"
+- **Fixed** → "Fixed — description of change" (do **not** cite a commit SHA: the PR commit is amended/squashed and force-pushed each iteration, so any SHA you quote is immediately stale)
 - **Skip** → "Follows `.claude/rules/<file>` — explanation"
 - **Ack** → "Acknowledged!"
 
@@ -262,8 +306,9 @@ Then loop back to Step 2.
 - [ ] PR matched and validated
 - [ ] Review comments and CI status fetched
 - [ ] ALL issues presented to user for selection
-- [ ] Code changes made and committed (use `/git-commit`)
-- [ ] Changes pushed (single valid commit, squashed with original PR commit)
+- [ ] Fixes folded into the PR (amended/squashed — **no appended `fix(pr)` commit**)
+- [ ] Verified `git rev-list HEAD --not "$BASE_REF" --count` == 1 before pushing
+- [ ] Changes force-pushed with `--force-with-lease` (single commit)
 - [ ] Review comment threads replied to and resolved
 - [ ] Waited for CI/reviews and re-checked
 - [ ] Loop exited: all clean OR max iterations reached
