@@ -306,7 +306,6 @@ struct PTO2TaskPayload {
     // mask and a late stager rings only its remaining bits. A sync_start consumer
     // preserves the mask for rendezvous counting and its single launch pass.
     std::atomic<uint8_t> early_dispatch_state{0};
-    std::atomic<uint8_t> dispatch_propagated{0};  // PRODUCER side: once-guard for fanout propagation
     // The launch owner publishes COMPLETE only after all owned doorbells are
     // visible, keeping fanout private until every gated block has launched.
     std::atomic<uint8_t> early_dispatch_launch_state{PTO2_EARLY_DISPATCH_LAUNCH_NONE};
@@ -403,13 +402,12 @@ struct PTO2TaskPayload {
         // one of ITS producers is flagged (propagate_dispatch_fanin bumps
         // dispatch_fanin and may CAS early_dispatch_state on any consumer, independent of the
         // consumer's own hint). So they MUST be zeroed here unconditionally.
-        // Publication, propagation, and launch fields share this same
-        // per-submit lifetime and are reset here too.
+        // Publication and launch fields share this same per-submit lifetime
+        // and are reset here too.
         early_dispatch_state.store(PTO2_EARLY_DISPATCH_NONE, std::memory_order_relaxed);
         for (int w = 0; w < PTO2_EARLY_DISPATCH_CORE_MASK_WORDS; w++)
             staged_core_mask[w].store(0, std::memory_order_relaxed);
         dispatch_fanin.store(0, std::memory_order_relaxed);
-        dispatch_propagated.store(0, std::memory_order_relaxed);
         published_block_count.store(0, std::memory_order_relaxed);
         early_dispatch_launch_state.store(PTO2_EARLY_DISPATCH_LAUNCH_NONE, std::memory_order_relaxed);
         running_slot_count.store(0, std::memory_order_relaxed);
@@ -442,7 +440,7 @@ static_assert(
  * Per-task slot scheduling state (scheduler-private, NOT in shared memory)
  *
  * Consolidates all hot-path scheduling fields into a single cache-friendly
- * structure (32 bytes = half a cache line). Accessing any field of a task's
+ * structure (64 bytes = one cache line). Accessing any field of a task's
  * slot state brings all related fields into the same cache line.
  *
  * Concurrency notes:
@@ -480,6 +478,12 @@ enum PTO2DeferredCompletionFlag : uint8_t {
     PTO2_SUBTASK_DEFERRED = 4,
 };
 
+enum PTO2DispatchPropagationFlag : uint8_t {
+    PTO2_DISPATCH_PROPAGATED = 8,
+};
+
+static_assert((PTO2_DISPATCH_PROPAGATED & (PTO2_READY_CLAIMED | PTO2_COMPLETION_DONE | PTO2_SUBTASK_DEFERRED)) == 0);
+
 struct alignas(64) PTO2TaskSlotState {
     // Fanout lock + list (accessed together under lock in on_task_complete)
     std::atomic<int32_t> fanout_lock;  // Per-task spinlock (0=unlocked, 1=locked)
@@ -514,6 +518,8 @@ struct alignas(64) PTO2TaskSlotState {
     // slot_state (not payload) so fanin walks read the already-hot producer
     // slot_state cache line.
     bool allow_early_resolve{false};
+    // Concurrent lifecycle updates preserve unrelated bits. Slot reuse clears
+    // the byte only after the previous task lifetime is quiescent.
     std::atomic<uint8_t> ready_state{PTO2_READY_UNCLAIMED};
     int32_t dep_pool_mark{0};  // Dep pool top after Orch-side wiring
 
@@ -558,6 +564,17 @@ struct alignas(64) PTO2TaskSlotState {
     void bind_buffers(PTO2TaskPayload *p, PTO2TaskDescriptor *t) {
         payload = p;
         task = t;
+    }
+
+    bool has_dispatch_propagated() const {
+        return (ready_state.load(std::memory_order_relaxed) & PTO2_DISPATCH_PROPAGATED) != 0;
+    }
+
+    // The propagation owner holds fanout_lock from this claim through its
+    // fanout snapshot so wiring can classify late edges exactly once.
+    bool try_mark_dispatch_propagated() {
+        return (ready_state.fetch_or(PTO2_DISPATCH_PROPAGATED, std::memory_order_relaxed) & PTO2_DISPATCH_PROPAGATED) ==
+               0;
     }
 
     void mark_completed() {

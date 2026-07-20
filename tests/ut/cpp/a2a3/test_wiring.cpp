@@ -174,7 +174,7 @@ TEST_F(WiringTest, WireTaskAllProducersEarlyFinished) {
 
     // fanin_count = 2 + 1 = 3
     EXPECT_EQ(task_slot.fanin_count, 3);
-    // early_finished = 2, init_rc = 2 + 1 = 3, so refcount should hit fanin_count
+    // completed_fanin = 2, init_rc = 2 + 1 = 3, so refcount should hit fanin_count
     EXPECT_GE(task_slot.fanin_refcount.load(), task_slot.fanin_count);
 
     // Task should be in ready queue
@@ -210,7 +210,7 @@ TEST_F(WiringTest, WireTaskProducersPendingTaskNotReady) {
 
     // fanin_count = 3 (2 + 1)
     EXPECT_EQ(task_slot.fanin_count, 3);
-    // early_finished = 0, init_rc = 1 -> not ready
+    // completed_fanin = 0, init_rc = 1 -> not ready
     EXPECT_EQ(task_slot.fanin_refcount.load(), 1);
     EXPECT_LT(task_slot.fanin_refcount.load(), task_slot.fanin_count);
 
@@ -224,6 +224,26 @@ TEST_F(WiringTest, WireTaskProducersPendingTaskNotReady) {
     EXPECT_EQ(producer_slots[0].fanout_head->slot_state, &task_slot);
     EXPECT_NE(producer_slots[1].fanout_head, nullptr);
     EXPECT_EQ(producer_slots[1].fanout_head->slot_state, &task_slot);
+}
+
+TEST_F(WiringTest, DispatchPropagationMarkerPreservesReadyStateFlagsAndResets) {
+    alignas(64) PTO2TaskSlotState producer;
+    init_slot(producer, PTO2_TASK_PENDING, 1, 1);
+
+    EXPECT_FALSE(producer.has_dispatch_propagated());
+    EXPECT_TRUE(producer.try_mark_dispatch_propagated());
+    EXPECT_TRUE(sched.try_claim_ready_once(producer));
+    producer.mark_completed();
+    producer.mark_any_subtask_deferred();
+    EXPECT_FALSE(producer.try_mark_dispatch_propagated());
+    EXPECT_EQ(
+        producer.ready_state.load(std::memory_order_relaxed),
+        PTO2_READY_CLAIMED | PTO2_COMPLETION_DONE | PTO2_SUBTASK_DEFERRED | PTO2_DISPATCH_PROPAGATED
+    );
+
+    producer.reset_for_reuse();
+    EXPECT_FALSE(producer.has_dispatch_propagated());
+    EXPECT_EQ(producer.ready_state.load(std::memory_order_relaxed), PTO2_READY_UNCLAIMED);
 }
 
 // =============================================================================
@@ -253,7 +273,7 @@ TEST_F(WiringTest, WireTaskMixedProducerStates) {
 
     // fanin_count = 4 (3 + 1)
     EXPECT_EQ(task_slot.fanin_count, 4);
-    // early_finished = 2 (COMPLETED + CONSUMED), init_rc = 3
+    // completed_fanin = 2 (COMPLETED + CONSUMED), init_rc = 3
     // Not yet 4 -> not ready (one producer still running)
     EXPECT_EQ(task_slot.fanin_refcount.load(), 3);
 
@@ -321,7 +341,7 @@ TEST_F(WiringTest, WireTaskUnflaggedPrecompletedProducerDoesNotSeed) {
     wire_fanin(task_slot, 1);
 
     EXPECT_EQ(payload.dispatch_fanin.load(), 0);  // NOT seeded (direct-only)
-    // Readiness is unaffected: early_finished(1) + 1 == fanin_count(2) -> ready.
+    // Readiness is unaffected: completed_fanin(1) + 1 == fanin_count(2) -> ready.
     EXPECT_GE(task_slot.fanin_refcount.load(), task_slot.fanin_count);
 }
 
@@ -375,12 +395,12 @@ TEST_F(WiringTest, EarlyDispatchWaitsForAllProducerBlocksPublished) {
     sched.record_published_blocks(producer, 2);
     sched.propagate_dispatch_fanin(producer);
     EXPECT_EQ(payload.dispatch_fanin.load(), 0);
-    EXPECT_EQ(producer.payload->dispatch_propagated.load(), 0);
+    EXPECT_FALSE(producer.has_dispatch_propagated());
 
     sched.record_published_blocks(producer, 1);
     sched.propagate_dispatch_fanin(producer);
     EXPECT_EQ(payload.dispatch_fanin.load(), payload.fanin_actual_count);
-    EXPECT_EQ(producer.payload->dispatch_propagated.load(), 1);
+    EXPECT_TRUE(producer.has_dispatch_propagated());
 
     sched.propagate_dispatch_fanin(producer);
     EXPECT_EQ(payload.dispatch_fanin.load(), payload.fanin_actual_count);
@@ -396,7 +416,7 @@ TEST_F(WiringTest, LateWiredFullyPublishedProducerStillSeedsEarlyDispatch) {
     producer.allow_early_resolve = true;
     sched.record_published_blocks(producer, producer.logical_block_num);
     sched.propagate_dispatch_fanin(producer);
-    ASSERT_EQ(producer.payload->dispatch_propagated.load(), 1);
+    ASSERT_TRUE(producer.has_dispatch_propagated());
 
     init_slot(consumer, PTO2_TASK_PENDING, 0, 1);
     consumer_payload.fanin_actual_count = 1;
@@ -582,18 +602,18 @@ TEST_F(WiringTest, EarlyDispatchFanoutWaitsForDoorbellPass) {
     producer.payload->early_dispatch_state.store(PTO2_EARLY_DISPATCH_STAGING, std::memory_order_relaxed);
     sched.propagate_dispatch_fanin(producer);
     EXPECT_EQ(consumer.payload->dispatch_fanin.load(), 0);
-    EXPECT_EQ(producer.payload->dispatch_propagated.load(), 0);
+    EXPECT_FALSE(producer.has_dispatch_propagated());
 
     producer.payload->early_dispatch_launch_state.store(PTO2_EARLY_DISPATCH_LAUNCH_RINGING);
     producer.payload->early_dispatch_state.store(PTO2_EARLY_DISPATCH_DISPATCHED, std::memory_order_release);
     sched.propagate_dispatch_fanin(producer);
     EXPECT_EQ(consumer.payload->dispatch_fanin.load(), 0);
-    EXPECT_EQ(producer.payload->dispatch_propagated.load(), 0);
+    EXPECT_FALSE(producer.has_dispatch_propagated());
 
     producer.payload->early_dispatch_launch_state.store(PTO2_EARLY_DISPATCH_LAUNCH_COMPLETE, std::memory_order_seq_cst);
     sched.propagate_dispatch_fanin(producer);
     EXPECT_EQ(consumer.payload->dispatch_fanin.load(), 1);
-    EXPECT_EQ(producer.payload->dispatch_propagated.load(), 1);
+    EXPECT_TRUE(producer.has_dispatch_propagated());
 }
 
 TEST_F(WiringTest, LateStagerRingsCapturedDoorbellAfterTableReuse) {
@@ -636,13 +656,13 @@ TEST_F(WiringTest, EarlyDispatchReleaseConsumesDoorbellMask) {
     EXPECT_EQ(task.payload->staged_core_mask[0].load(), 0);
     EXPECT_EQ(get_test_reg_stub_base_addr(), reg_addr);
     EXPECT_EQ(get_test_reg_stub_value(), (static_cast<uint64_t>(token) << 32) | token);
-    EXPECT_EQ(task.payload->dispatch_propagated.load(), 0);
+    EXPECT_FALSE(task.has_dispatch_propagated());
 
     sched.record_published_blocks(task, 1);
     // The staging path must retry even though its earlier state snapshot was
     // STAGING; release already missed this final publication count.
     sched.propagate_dispatch_fanin(task);
-    EXPECT_EQ(task.payload->dispatch_propagated.load(), 1);
+    EXPECT_TRUE(task.has_dispatch_propagated());
 
     sched.early_dispatch_doorbell_table[core_id].addr = 0x11110000;
     sched.early_dispatch_doorbell_table[core_id].token = 12;
@@ -711,7 +731,7 @@ TEST_F(WiringTest, SyncStartDrainFinalizeRetriesProducerFirstRendezvous) {
     sync_consumer.payload->running_slot_count.store(2, std::memory_order_seq_cst);
     EXPECT_TRUE(sched.retry_sync_start_rendezvous_after_drain(sync_consumer));
     EXPECT_EQ(sync_consumer.payload->early_dispatch_launch_state.load(), PTO2_EARLY_DISPATCH_LAUNCH_COMPLETE);
-    EXPECT_EQ(sync_consumer.payload->dispatch_propagated.load(), 1);
+    EXPECT_TRUE(sync_consumer.has_dispatch_propagated());
     EXPECT_EQ(downstream.payload->dispatch_fanin.load(), 1);
 
     EXPECT_FALSE(sched.retry_sync_start_rendezvous_after_drain(sync_consumer));
@@ -900,8 +920,8 @@ TEST_F(WiringTest, UnflaggedProducerDoesNotPropagate) {
 
     sched.propagate_dispatch_fanin(producer);
 
-    EXPECT_EQ(cons_payload.dispatch_fanin.load(), 0);       // no bump
-    EXPECT_EQ(prod_payload.dispatch_propagated.load(), 0);  // gate returned before once-guard
+    EXPECT_EQ(cons_payload.dispatch_fanin.load(), 0);  // no bump
+    EXPECT_FALSE(producer.has_dispatch_propagated());  // gate returned before once-guard
 }
 
 TEST_F(WiringTest, FlaggedPrecompletedCreatorTransparentToEarlyDispatch) {

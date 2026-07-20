@@ -923,9 +923,9 @@ struct PTO2SchedulerState {
         // The once-claim and fanout snapshot share fanout_lock with wiring, so a
         // set marker tells wiring that its new edge is outside this snapshot.
         // The unlocked precheck avoids fanout-lock traffic after propagation.
-        if (p.payload->dispatch_propagated.load(std::memory_order_acquire) != 0) return;
+        if (p.has_dispatch_propagated()) return;
         p.lock_fanout();
-        if (p.payload->dispatch_propagated.exchange(1, std::memory_order_acq_rel) != 0) {
+        if (!p.try_mark_dispatch_propagated()) {
             p.unlock_fanout();
             return;
         }

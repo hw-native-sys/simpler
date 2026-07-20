@@ -446,7 +446,7 @@ The orchestrator completes fanout wiring before publishing a task to the ready q
    - Checks `task_state >= COMPLETED` (early-finished optimization)
    - If not completed: prepends consumer to producer's `fanout_head` via `dep_pool.prepend`
    - **Releases** `fanout_lock`
-3. Atomically releases the +1 redundance + early_finished count via `fanin_refcount.fetch_add`
+3. Atomically releases the +1 redundance + completed-fanin count via `fanin_refcount.fetch_add`
 4. If all deps satisfied: pushes task to the routed ready queue
 
 Zero-fanin tasks and tasks whose claimed producers are already completed skip dep_pool entry allocation and publish directly to the routed ready queue.
@@ -683,11 +683,13 @@ reserved core slot and a launch-visible payload before a consumer can pre-occupy
 `next_block_idx` records reservation progress; `published_block_count` independently establishes
 publication and early-candidate readiness.
 
-The producer's `dispatch_propagated` claim and fanout snapshot are serialized under
-`fanout_lock` with consumer wiring. An edge already in the snapshot is counted by scheduler
-propagation; wiring seeds an edge added after the claim and enqueues the consumer if that seed
-completes `dispatch_fanin`. This gives each eligible producer-consumer edge exactly one
-early-candidate contribution regardless of which side acquires the lock first.
+The producer's slot-local dispatch-propagated bit in `ready_state` and fanout snapshot are
+serialized under `fanout_lock` with consumer wiring. Wiring already locks and reads the
+producer's 64-byte `PTO2TaskSlotState`, so testing this bit does not read a producer payload
+cache line. An edge already in the snapshot is counted by scheduler propagation; wiring seeds
+an edge added after the claim and enqueues the consumer if that seed completes
+`dispatch_fanin`. This gives each eligible producer-consumer edge exactly one early-candidate
+contribution regardless of which side acquires the lock first.
 
 #### MIX per-core placement
 
