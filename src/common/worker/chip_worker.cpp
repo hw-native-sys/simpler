@@ -123,6 +123,7 @@ void ChipWorker::init(
         comm_get_window_size_fn_ = load_symbol<CommGetWindowSizeFn>(handle, "comm_get_window_size");
         comm_derive_context_fn_ = load_symbol<CommDeriveContextFn>(handle, "comm_derive_context");
         comm_alloc_domain_windows_fn_ = load_symbol<CommAllocDomainWindowsFn>(handle, "comm_alloc_domain_windows");
+        comm_reset_domain_windows_fn_ = load_symbol<CommResetDomainWindowsFn>(handle, "comm_reset_domain_windows");
         comm_release_domain_windows_fn_ =
             load_symbol<CommReleaseDomainWindowsFn>(handle, "comm_release_domain_windows");
         comm_barrier_fn_ = load_symbol<CommBarrierFn>(handle, "comm_barrier");
@@ -201,6 +202,7 @@ void ChipWorker::init(
         comm_get_local_window_base_fn_ = nullptr;
         comm_get_window_size_fn_ = nullptr;
         comm_alloc_domain_windows_fn_ = nullptr;
+        comm_reset_domain_windows_fn_ = nullptr;
         comm_release_domain_windows_fn_ = nullptr;
         comm_barrier_fn_ = nullptr;
         comm_destroy_fn_ = nullptr;
@@ -240,6 +242,7 @@ void ChipWorker::init(
         comm_get_window_size_fn_ = nullptr;
         comm_derive_context_fn_ = nullptr;
         comm_alloc_domain_windows_fn_ = nullptr;
+        comm_reset_domain_windows_fn_ = nullptr;
         comm_release_domain_windows_fn_ = nullptr;
         comm_barrier_fn_ = nullptr;
         comm_destroy_fn_ = nullptr;
@@ -289,6 +292,7 @@ void ChipWorker::finalize() {
     comm_get_window_size_fn_ = nullptr;
     comm_derive_context_fn_ = nullptr;
     comm_alloc_domain_windows_fn_ = nullptr;
+    comm_reset_domain_windows_fn_ = nullptr;
     comm_release_domain_windows_fn_ = nullptr;
     comm_barrier_fn_ = nullptr;
     comm_destroy_fn_ = nullptr;
@@ -598,6 +602,16 @@ std::pair<uint64_t, uint64_t> ChipWorker::comm_alloc_domain_windows(
         throw std::runtime_error("comm_alloc_domain_windows returned null device_ctx / local_window_base");
     }
     return {device_ctx, local_window_base};
+}
+
+void ChipWorker::comm_reset_domain_windows(uint64_t comm_handle, uint64_t allocation_id) {
+    if (comm_reset_domain_windows_fn_ == nullptr) {
+        throw std::runtime_error("comm_reset_domain_windows is not supported by this runtime");
+    }
+    int rc = comm_reset_domain_windows_fn_(reinterpret_cast<void *>(comm_handle), allocation_id);
+    if (rc != 0) {
+        throw std::runtime_error("comm_reset_domain_windows failed with code " + std::to_string(rc));
+    }
 }
 
 void ChipWorker::comm_release_domain_windows(

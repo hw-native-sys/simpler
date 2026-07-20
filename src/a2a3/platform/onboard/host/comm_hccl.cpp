@@ -1207,6 +1207,32 @@ extern "C" int comm_alloc_domain_windows(
     return -1;
 }
 
+extern "C" int comm_reset_domain_windows(CommHandle h, uint64_t allocation_id) try {
+    if (!h) return -1;
+    auto it = h->domain_allocations.find(allocation_id);
+    if (it == h->domain_allocations.end()) {
+        LOG_ERROR(
+            "[comm rank %d] reset_domain: allocation_id=%llu not found", h->rank,
+            static_cast<unsigned long long>(allocation_id)
+        );
+        return -1;
+    }
+    auto &alloc = it->second;
+    if (!alloc->local_buf || alloc->alloc_size == 0) return -1;
+    aclError aret = aclrtMemset(alloc->local_buf, alloc->alloc_size, 0, alloc->alloc_size);
+    if (aret != ACL_SUCCESS) {
+        LOG_ERROR("[comm rank %d] reset_domain: aclrtMemset -> %d", h->rank, static_cast<int>(aret));
+        return -1;
+    }
+    return 0;
+} catch (const std::exception &e) {
+    LOG_ERROR("[comm] reset_domain: exception: %s", e.what());
+    return -1;
+} catch (...) {
+    LOG_ERROR("[comm] reset_domain: unknown exception");
+    return -1;
+}
+
 extern "C" int
 comm_release_domain_windows(CommHandle h, uint64_t allocation_id, size_t rank_count, uint32_t domain_rank) try {
     if (!h) return -1;

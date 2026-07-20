@@ -359,6 +359,35 @@ class Orchestrator:
             buffers=list(buffers),
         )
 
+    def acquire_domain(
+        self,
+        *,
+        name: str,
+        workers: Sequence[int],
+        window_size: int,
+        buffers: Sequence[CommBufferSpec] = (),
+    ) -> CommDomainHandle:
+        """Acquire a zero-initialized lease over a Worker-cached CommDomain.
+
+        The first acquisition performs the same backend allocation as
+        :meth:`allocate_domain`. Later Worker.run calls reuse its VMM mappings
+        and CommContext, resetting every rank's local window before returning.
+        Exiting the lease does not free the backing allocation; Worker.close
+        owns physical teardown.
+
+        The same structural domain may be acquired only once per Worker.run,
+        because a second reset could race tasks already submitted through the
+        first lease.
+        """
+        if self._worker is None:
+            raise RuntimeError("acquire_domain requires an Orchestrator bound to a Worker")
+        return self._worker._acquire_domain(
+            name=str(name),
+            workers=tuple(int(w) for w in workers),
+            window_size=int(window_size),
+            buffers=list(buffers),
+        )
+
     def release_domain(self, handle: CommDomainHandle) -> None:
         """Collective release.  Equivalent to ``handle.release()``."""
         handle.release()

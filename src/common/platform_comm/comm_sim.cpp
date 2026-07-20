@@ -607,6 +607,31 @@ extern "C" int comm_alloc_domain_windows(
     return -1;
 }
 
+extern "C" int comm_reset_domain_windows(CommHandle h, uint64_t allocation_id) try {
+    if (h == nullptr) return -1;
+    auto it = h->domain_allocations.find(allocation_id);
+    if (it == h->domain_allocations.end()) {
+        std::fprintf(
+            stderr, "[comm_sim rank %d] reset_domain: allocation_id=%llu not found\n", h->rank,
+            static_cast<unsigned long long>(allocation_id)
+        );
+        return -1;
+    }
+    auto &alloc = it->second;
+    if (!alloc->host_ctx) return -1;
+    auto &ctx = *alloc->host_ctx;
+    void *local_window = reinterpret_cast<void *>(ctx.windowsIn[ctx.rankId]);
+    if (local_window == nullptr || ctx.winSize == 0) return -1;
+    std::memset(local_window, 0, static_cast<size_t>(ctx.winSize));
+    return 0;
+} catch (const std::exception &e) {
+    std::fprintf(stderr, "[comm_sim] reset_domain: exception: %s\n", e.what());
+    return -1;
+} catch (...) {
+    std::fprintf(stderr, "[comm_sim] reset_domain: unknown exception\n");
+    return -1;
+}
+
 extern "C" int
 comm_release_domain_windows(CommHandle h, uint64_t allocation_id, size_t rank_count, uint32_t domain_rank) try {
     // The shm header's `destroy_count` atomic is the subset-scoped release

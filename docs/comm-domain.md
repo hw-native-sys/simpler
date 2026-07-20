@@ -2,9 +2,10 @@
 
 A **communication domain** is a symmetric device-memory window shared by a
 subset of ranks, used for cross-rank reads/writes (collectives, SDMA, notify
-protocols). Domains are allocated **dynamically from inside the orchestration
-function** via `orch.allocate_domain(...)` — there is no init-time / static
-declaration path.
+protocols). Domains are created **dynamically from inside the orchestration
+function**. Use `orch.allocate_domain(...)` for a one-run domain, or
+`orch.acquire_domain(...)` for a domain cached by the owning `Worker` and
+reused across runs. There is no init-time / static declaration path.
 
 For where the Orchestrator sits among the engine components see
 [hierarchical_level_runtime.md](hierarchical_level_runtime.md); for the DAG
@@ -30,8 +31,27 @@ with orch.allocate_domain(
 ```
 
 `window_size` is validated on the orch thread **before** any chip-side
-allocation: if `sum(b.nbytes) > window_size`, `allocate_domain` raises
-`ValueError` immediately and no backend allocation is registered.
+allocation: if `sum(b.nbytes) > window_size`, either API raises `ValueError`
+immediately and no backend allocation is registered.
+
+Generated PyPTO orchestration uses the persistent form:
+
+```python
+with orch.acquire_domain(
+    name="default",
+    workers=[0, 1],
+    window_size=4096,
+    buffers=[CommBufferSpec(name="scratch", dtype="float32", count=1024, nbytes=4096)],
+) as handle:
+    ...
+```
+
+The cache key contains the name, workers, window size, and complete buffer
+layout. A cache miss performs the same allocation as `allocate_domain`; a hit
+keeps the allocation and device context but resets every participating local
+window to zero before returning the handle. A given cache key may be acquired
+only once in one `Worker.run()`, because a second reset could race queued work
+from the first lease.
 
 ### `ChipDomainContext` (one per participating chip, via `handle[chip_idx]`)
 
@@ -75,15 +95,16 @@ lexical (end of block), the physical teardown is managed for you. Use
 you must assert physical teardown.
 
 Cleanup is **drain-safe**: even if a chip task fails and `drain()` re-raises,
-`Worker.run` still executes the pending releases and sweeps any live domains the
-orch fn forgot to release (LIFO), so a failed run cannot strand backend
-allocations into the next run.
+`Worker.run` still executes pending one-run releases and sweeps any live
+one-run domains the orch fn forgot to release (LIFO). Cached domains remain
+owned by the Worker and are physically released by `Worker.close()`.
 
 ---
 
-## 3. Lazy base communicator (created once, cached)
+## 3. Reuse boundaries
 
-`Worker.init()` does **no** comm work. The first `allocate_domain(...)` lazily
+`Worker.init()` does **no** comm work. The first `allocate_domain(...)` or
+`acquire_domain(...)` lazily
 fires `CTRL_COMM_INIT` to every chip in parallel, which runs the base HCCL
 `comm_init` (RootInfo handshake + membership). This base communicator is
 **cached** (`_comm_base_ready`), and `ChipWorker.comm_init` itself caches the
@@ -98,6 +119,19 @@ called many times:
   `allocate_domain` / `run`. Each allocation gets a fresh `allocation_id` so
   concurrent or sequential domains never collide on IPC handshake / barrier
   names.
+
+`acquire_domain(...)` adds a second cache at Worker scope:
+
+- the first matching acquire allocates the domain windows;
+- later `run()` calls reuse the same `allocation_id`, contexts, and window
+  addresses after a synchronous zero reset;
+- leaving the `with` block releases only that run's lexical lease;
+- `Worker.close()` releases the cached backend allocation.
+
+This cache cannot be implemented by generated Python alone: before this API,
+`Worker.run()` owned and released every allocated domain after draining the
+DAG. The runtime must own the persistent allocation and define reset/teardown
+semantics; code generation only selects that runtime policy.
 
 ---
 

@@ -1492,6 +1492,10 @@ NB_MODULE(_task_interface, m) {
             "(device_ctx, local_window_base) for this rank."
         )
         .def(
+            "comm_reset_domain_windows", &ChipWorker::comm_reset_domain_windows, nb::arg("comm_handle"),
+            nb::arg("allocation_id"), "Zero this rank's local window for a live dynamic allocation."
+        )
+        .def(
             "comm_release_domain_windows", &ChipWorker::comm_release_domain_windows, nb::arg("comm_handle"),
             nb::arg("allocation_id"), nb::arg("rank_count"), nb::arg("domain_rank"),
             "Pair to comm_alloc_domain_windows: collectively release the per-rank pool."

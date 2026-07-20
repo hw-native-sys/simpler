@@ -264,6 +264,7 @@ _CTRL_PY_IMPORT_REGISTER = 12
 # for the buffer's registered lifetime — see docs/comm-domain.md.
 _CTRL_MAP_HOST = 14
 _CTRL_UNMAP_HOST = 15
+_CTRL_RESET_DOMAIN = 18
 
 # MAP_HOST payload: token (u64), parent_va (u64), nbytes (u64), then the
 # NUL-free host-buffer shm name as the trailing bytes. UNMAP_HOST payload is the
@@ -1319,6 +1320,22 @@ def _handle_ctrl_release_domain(cw: ChipWorker, buf: memoryview) -> None:
     cw._impl.comm_release_domain_windows(int(handle), int(allocation_id), int(rank_count), int(domain_rank))
 
 
+def _handle_ctrl_reset_domain(cw: ChipWorker, buf: memoryview) -> None:
+    """CTRL_RESET_DOMAIN handler — zero this rank's cached local window."""
+    request_shm_name = _read_shm_name(buf, _OFF_ARGS)
+    req_shm = SharedMemory(name=request_shm_name)
+    req_buf = req_shm.buf
+    assert req_buf is not None
+    try:
+        (allocation_id, _rank_count, _domain_rank, _ws, _bc) = _DOMAIN_REQ_HEADER.unpack_from(req_buf, 0)
+    finally:
+        req_buf.release()
+        req_shm.close()
+
+    handle = _comm_base_handle(cw)
+    cw._impl.comm_reset_domain_windows(int(handle), int(allocation_id))
+
+
 def _comm_base_handle(cw: ChipWorker) -> int:
     """Return the cached base-communicator handle the chip allocated during bootstrap.
 
@@ -1514,6 +1531,8 @@ def _run_chip_main_loop(  # noqa: PLR0912, PLR0913, PLR0915 -- unified TASK_READ
                             prepared.discard(int(cid))
                     elif sub_cmd == _CTRL_ALLOC_DOMAIN:
                         _handle_ctrl_alloc_domain(cw, buf)
+                    elif sub_cmd == _CTRL_RESET_DOMAIN:
+                        _handle_ctrl_reset_domain(cw, buf)
                     elif sub_cmd == _CTRL_RELEASE_DOMAIN:
                         _handle_ctrl_release_domain(cw, buf)
                     elif sub_cmd == _CTRL_COMM_INIT:
@@ -1934,6 +1953,15 @@ class Worker:
         # tasks already submitted with this domain's device_ctx / buffer_ptrs
         # see live memory through execution.
         self._pending_release_domains: list[CommDomainHandle] = []
+        # Persistent domains acquired by generated orchestration.  The backend
+        # allocation survives Worker.run boundaries and is reset to the same
+        # zero-initialized state before each later run.  Cache entries are
+        # physically released only by Worker.close().
+        self._cached_domains: dict[tuple[Any, ...], CommDomainHandle] = {}
+        # A cached domain may be acquired at most once in one Worker.run.  This
+        # prevents resetting it while tasks submitted through an earlier lease
+        # in the same DAG are still pending.
+        self._cached_domains_used_this_run: set[tuple[Any, ...]] = set()
         # Monotonic per-Worker counter; mixed into IPC barrier filenames so
         # two concurrent allocations don't share a marker file.  Wraps after
         # 2^64 allocations — far beyond any realistic Worker lifetime.
@@ -4378,6 +4406,66 @@ class Worker:
         self._live_domains[name] = handle
         return handle
 
+    @staticmethod
+    def _domain_cache_key(
+        *, name: str, workers: tuple[int, ...], window_size: int, buffers: list[CommBufferSpec]
+    ) -> tuple[Any, ...]:
+        """Build a structural cache key for one generated communication domain."""
+        buffer_key = tuple(
+            (b.name, b.dtype, int(b.count), int(b.nbytes), bool(b.load_from_host), bool(b.store_to_host))
+            for b in buffers
+        )
+        return (name, workers, int(window_size), buffer_key)
+
+    def _acquire_domain(
+        self,
+        *,
+        name: str,
+        workers: tuple[int, ...],
+        window_size: int,
+        buffers: list[CommBufferSpec],
+    ) -> CommDomainHandle:
+        """Acquire a Worker-cached domain lease for the current run.
+
+        A cache miss performs the existing fresh backend allocation.  A hit
+        keeps the VMM/IPC mappings and CommContext alive, but zeros every
+        rank's local window before returning so scratch and signal protocols
+        observe the same initial state as a fresh allocation.
+        """
+        key = self._domain_cache_key(name=name, workers=workers, window_size=window_size, buffers=buffers)
+        if key in self._cached_domains_used_this_run:
+            raise RuntimeError(
+                f"acquire_domain: domain {name!r} with the same layout may only be acquired once per Worker.run"
+            )
+
+        backing = self._cached_domains.get(key)
+        if backing is None:
+            backing = self._allocate_domain(
+                name=name,
+                workers=workers,
+                window_size=window_size,
+                buffers=buffers,
+            )
+            # Persistent allocations are not part of the per-run fresh-domain
+            # sweep. Their physical lifetime is owned by _cached_domains.
+            self._live_domains.pop(name, None)
+            self._cached_domains[key] = backing
+        else:
+            self._reset_domain_now(backing)
+
+        self._cached_domains_used_this_run.add(key)
+
+        # Return a lexical lease rather than the backing handle. Releasing the
+        # lease prevents further indexing but intentionally does not free the
+        # cached allocation; Worker.close owns physical teardown.
+        return CommDomainHandle(
+            name=backing.name,
+            workers=backing.workers,
+            contexts=backing.contexts,
+            allocation_id=backing.allocation_id,
+            _release_fn=lambda _lease: None,
+        )
+
     def _release_domain_handle(self, handle: CommDomainHandle) -> None:
         """Mark a handle for release.  Actual backend free is deferred.
 
@@ -4423,12 +4511,18 @@ class Worker:
     def _release_domain_now(self, handle: CommDomainHandle) -> None:
         """Synchronous backend release for one handle.  Used by the
         deferred-release path and by the abort/close cleanup helpers."""
+        self._dispatch_domain_lifecycle(handle, op="release")
+        self._live_domains.pop(handle.name, None)
+
+    def _reset_domain_now(self, handle: CommDomainHandle) -> None:
+        """Synchronously zero every rank's local window for a cached domain."""
+        self._dispatch_domain_lifecycle(handle, op="reset")
+
+    def _dispatch_domain_lifecycle(self, handle: CommDomainHandle, *, op: str) -> None:
+        """Dispatch a reset or release request for an existing allocation."""
         if self._worker is None:
             return
         workers = handle.workers
-        # Release payload is just the fixed header — no rank_ids tail; the
-        # backend looked them up from its own per-allocation record at
-        # alloc time and doesn't need them again.
         req_size = _DOMAIN_REQ_HEADER.size
         worker_to_rank = {w: r for r, w in enumerate(workers)}
 
@@ -4444,8 +4538,8 @@ class Worker:
                     int(handle.allocation_id),
                     int(len(workers)),
                     int(worker_to_rank[chip_idx]),
-                    0,  # window_size — ignored on release
-                    0,  # buffer_count — ignored on release
+                    0,
+                    0,
                 )
                 request_shms[chip_idx] = req
 
@@ -4453,7 +4547,7 @@ class Worker:
                 workers=workers,
                 request_shms=request_shms,
                 reply_shms=None,
-                op="release",
+                op=op,
                 allocation_id=handle.allocation_id,
             )
         finally:
@@ -4463,7 +4557,6 @@ class Worker:
                     shm.unlink()
                 except Exception:  # noqa: BLE001
                     pass
-        self._live_domains.pop(handle.name, None)
 
     def _dispatch_control_domain(
         self,
@@ -4490,6 +4583,8 @@ class Worker:
                 if op == "alloc":
                     assert reply_shms is not None
                     dw.control_alloc_domain(chip_idx, req_name, reply_shms[chip_idx].name)
+                elif op == "reset":
+                    dw.control_reset_domain(chip_idx, req_name)
                 else:
                     dw.control_release_domain(chip_idx, req_name)
             except BaseException as e:  # noqa: BLE001
@@ -4535,6 +4630,21 @@ class Worker:
                 # Drop from live_domains anyway — leaving a known-bad handle
                 # would just block close().
                 self._live_domains.pop(handle.name, None)
+
+    def _release_all_cached_domains(self) -> None:
+        """Best-effort physical teardown of Worker-cached domains in LIFO order."""
+        for key, handle in list(self._cached_domains.items())[::-1]:
+            try:
+                self._release_domain_now(handle)
+                handle._released = True  # noqa: SLF001 -- runtime owns backing handles
+                handle._freed = True  # noqa: SLF001
+            except Exception as e:  # noqa: BLE001
+                sys.stderr.write(
+                    f"Worker._release_all_cached_domains: {handle.name!r} release failed: {type(e).__name__}: {e}\n"
+                )
+                sys.stderr.flush()
+            finally:
+                self._cached_domains.pop(key, None)
 
     # ------------------------------------------------------------------
     # memory management — forward to C++ Orchestrator, which holds
@@ -4922,6 +5032,7 @@ class Worker:
         # leaves the error slot empty, but an unrelated caller may have
         # poked it.
         self._orch._clear_error()
+        self._cached_domains_used_this_run.clear()
         self._orch._scope_begin()
         try:
             callable(self._orch, args, cfg)
@@ -4959,6 +5070,7 @@ class Worker:
                 self._execute_pending_domain_releases()
                 if self._live_domains:
                     self._release_all_live_domains()
+                self._cached_domains_used_this_run.clear()
         # L3+ returns None like every other worker level; per-L2-child timing
         # is emitted as `[STRACE]` markers from each simpler_run.
         return None
@@ -5007,6 +5119,8 @@ class Worker:
         self._cleanup_l3_l2_regions()
         if self._live_domains:
             self._release_all_live_domains()
+        if self._cached_domains:
+            self._release_all_cached_domains()
         try:
             self._release_active_remote_slot_refs()
             self._flush_pending_remote_frees()

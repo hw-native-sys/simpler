@@ -169,6 +169,19 @@ int comm_alloc_domain_windows(
 );
 
 /**
+ * Reset this rank's local window for a live dynamic domain allocation.
+ *
+ * The caller must ensure that no device work is still using the allocation.
+ * The hierarchical Worker satisfies that contract by resetting cached domains
+ * only at the start of a new run, after the previous run has drained.
+ *
+ * @param h               Base handle from comm_init().
+ * @param allocation_id   Id of a live comm_alloc_domain_windows allocation.
+ * @return 0 on success, non-zero on failure.
+ */
+int comm_reset_domain_windows(CommHandle h, uint64_t allocation_id);
+
+/**
  * Collectively release a domain window pool allocated by
  * comm_alloc_domain_windows().
  *

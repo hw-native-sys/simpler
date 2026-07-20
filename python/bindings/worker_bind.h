@@ -713,6 +713,10 @@ inline void bind_worker(nb::module_ &m) {
             "participating chips in parallel (one Python thread per chip)."
         )
         .def(
+            "control_reset_domain", &Worker::control_reset_domain, nb::arg("worker_id"), nb::arg("request_shm_name"),
+            nb::call_guard<nb::gil_scoped_release>(), "Drive one NEXT_LEVEL chip child through CTRL_RESET_DOMAIN."
+        )
+        .def(
             "control_release_domain", &Worker::control_release_domain, nb::arg("worker_id"),
             nb::arg("request_shm_name"), nb::call_guard<nb::gil_scoped_release>(),
             "Drive one NEXT_LEVEL chip child through CTRL_RELEASE_DOMAIN.  Same serialisation "

@@ -156,7 +156,8 @@ static constexpr uint64_t CTRL_PY_REGISTER = 10;
 static constexpr uint64_t CTRL_PY_UNREGISTER = 11;
 static constexpr uint64_t CTRL_L3_L2_REGION_CREATE = 16;
 static constexpr uint64_t CTRL_L3_L2_REGION_RELEASE = 17;
-
+// Reset one cached dynamic CommDomain's local window between Worker.run calls.
+static constexpr uint64_t CTRL_RESET_DOMAIN = 18;
 // Control args reuse the task mailbox region (mutually exclusive with task dispatch):
 //   offset 16: uint64 arg0 (size for malloc/register; ptr for free; dst for copy)
 //   offset 24: uint64 arg1 (src for copy)
@@ -241,6 +242,7 @@ public:
         uint64_t sub_cmd, const char *shm_name, size_t payload_size, double timeout_s, const uint8_t *digest
     );
     virtual void control_alloc_domain(const char *request_shm_name, const char *reply_shm_name);
+    virtual void control_reset_domain(const char *request_shm_name);
     virtual void control_release_domain(const char *request_shm_name);
     virtual void control_comm_init(const char *request_shm_name);
     virtual void control_l3_l2_region_create(const char *request_shm_name, const char *reply_shm_name);
@@ -292,6 +294,7 @@ public:
         uint64_t sub_cmd, const char *shm_name, size_t payload_size, double timeout_s, const uint8_t *digest
     ) override;
     void control_alloc_domain(const char *request_shm_name, const char *reply_shm_name) override;
+    void control_reset_domain(const char *request_shm_name) override;
     void control_release_domain(const char *request_shm_name) override;
     void control_comm_init(const char *request_shm_name) override;
     void control_l3_l2_region_create(const char *request_shm_name, const char *reply_shm_name) override;
@@ -427,6 +430,7 @@ public:
     // CTRL_SHM_NAME_BYTES-1.  Holds mailbox_mu_ so it serialises with task
     // dispatch on the same chip mailbox.
     void control_alloc_domain(const char *request_shm_name, const char *reply_shm_name);
+    void control_reset_domain(const char *request_shm_name);
     void control_release_domain(const char *request_shm_name);
 
     // Lazy comm_init driver — payload shm carries (rank, nranks, rootinfo_path).
@@ -493,6 +497,7 @@ public:
     // allocation across a subset of chips — caller dispatches to each
     // participating chip and joins on completion.
     void control_alloc_domain(int worker_id, const char *request_shm_name, const char *reply_shm_name);
+    void control_reset_domain(int worker_id, const char *request_shm_name);
     void control_release_domain(int worker_id, const char *request_shm_name);
     void control_comm_init(int worker_id, const char *request_shm_name);
     void control_l3_l2_region_create(int worker_id, const char *request_shm_name, const char *reply_shm_name);

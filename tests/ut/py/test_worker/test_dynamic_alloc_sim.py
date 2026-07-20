@@ -30,6 +30,9 @@ The flow under test:
 
 from __future__ import annotations
 
+import ctypes
+from multiprocessing.shared_memory import SharedMemory
+
 import pytest
 
 
@@ -175,7 +178,90 @@ class TestDynamicAllocateContextManager:
 
 
 # ---------------------------------------------------------------------------
-# 3. Re-alloc with the same name after release succeeds (canonical "resize"
+# 3. Cached acquire persists across Worker.run and resets the local window.
+# ---------------------------------------------------------------------------
+
+
+class TestCachedDomainAcquire:
+    def test_acquire_reuses_allocation_and_resets_window(self):
+        from simpler.task_interface import CallConfig, CommBufferSpec
+
+        shared = SharedMemory(create=True, size=16)
+        shared_buf = shared.buf
+        assert shared_buf is not None
+        shared_buf[:] = b"\x5a" * 16
+        exported = ctypes.c_char.from_buffer(shared_buf)
+        shared_addr = ctypes.addressof(exported)
+        observations: list[tuple[int, int]] = []
+
+        def populate(orch, _args, _cfg):
+            with orch.acquire_domain(
+                name="tp_cached",
+                workers=[0, 1],
+                window_size=4096,
+                buffers=[CommBufferSpec(name="scratch", dtype="opaque", count=16, nbytes=16)],
+            ) as domain:
+                observations.append((domain.allocation_id, int(domain[0].local_window_base)))
+                for chip_idx in domain.workers:
+                    orch.copy_to(
+                        chip_idx,
+                        dst=domain[chip_idx].buffer_ptrs["scratch"],
+                        src=shared_addr,
+                        size=16,
+                    )
+
+        def observe_after_reset(orch, _args, _cfg):
+            with orch.acquire_domain(
+                name="tp_cached",
+                workers=[0, 1],
+                window_size=4096,
+                buffers=[CommBufferSpec(name="scratch", dtype="opaque", count=16, nbytes=16)],
+            ) as domain:
+                observations.append((domain.allocation_id, int(domain[0].local_window_base)))
+                orch.copy_from(
+                    0,
+                    dst=shared_addr,
+                    src=domain[0].buffer_ptrs["scratch"],
+                    size=16,
+                )
+
+        worker = _make_worker(nranks=2)
+        try:
+            worker.init()
+            worker.run(populate, args=None, config=CallConfig())
+            assert bytes(shared_buf) == b"\x5a" * 16
+            worker.run(observe_after_reset, args=None, config=CallConfig())
+            assert bytes(shared_buf) == b"\x00" * 16
+            assert len(worker._cached_domains) == 1
+        finally:
+            worker.close()
+            del exported
+            shared_buf.release()
+            shared.close()
+            shared.unlink()
+
+        assert observations[0] == observations[1]
+        assert worker._cached_domains == {}
+
+    def test_same_domain_cannot_be_reacquired_in_one_run(self):
+        from simpler.task_interface import CallConfig
+
+        def orch_fn(orch, _args, _cfg):
+            first = orch.acquire_domain(name="tp_cached", workers=[0, 1], window_size=4096)
+            first.release()
+            with pytest.raises(RuntimeError, match="only be acquired once per Worker.run"):
+                orch.acquire_domain(name="tp_cached", workers=[0, 1], window_size=4096)
+
+        worker = _make_worker(nranks=2)
+        try:
+            worker.init()
+            worker.run(orch_fn, args=None, config=CallConfig())
+        finally:
+            worker.close()
+
+
+# ---------------------------------------------------------------------------
+# 4. Re-alloc with the same name after release succeeds (canonical "resize"
 #    pattern: release, then allocate a bigger one under the same name).
 # ---------------------------------------------------------------------------
 
