@@ -110,10 +110,19 @@ WORKTREE_ABS="/home/user/simpler/tmp/worktree_baseline_20260331_102302"
 
 ## Step 5: Run Benchmarks
 
+**Prefix every benchmark invocation below with `ASCEND_GLOBAL_LOG_LEVEL=3`** — in
+both single and (especially) compare mode, baseline *and* current. The CANN driver
+log defaults to INFO, whose per-round device-side writes land inside the measured
+device wall (~4–6% on `paged_attention`). Pinning it to ERROR holds the log level
+constant across both sides, so a compare-mode delta reflects code under test, not
+logging: the merge-base worktree may predate the scene-test auto-set (which only
+fires when the var is unset), leaving the baseline noisy otherwise. An explicit
+value wins over the auto-set, so this is safe.
+
 ### Single Mode
 
 ```bash
-./tools/benchmark_rounds.sh $BENCH_ARGS -r "$RUNTIME" 2>&1 | tee "tmp/benchmark_${TIMESTAMP}.txt"
+ASCEND_GLOBAL_LOG_LEVEL=3 ./tools/benchmark_rounds.sh $BENCH_ARGS -r "$RUNTIME" 2>&1 | tee "tmp/benchmark_${TIMESTAMP}.txt"
 ```
 
 Use `--serial-orch-sched` to run each case once in the default overlapped mode
@@ -161,7 +170,7 @@ Activate the venv so `benchmark_rounds.sh` (which calls `python3`) picks up the 
 cd "$WORKTREE_ABS" && \
   source .venv/bin/activate && \
   pwd && \
-  ./tools/benchmark_rounds.sh -d "$BASELINE_DEVICE" -r "$RUNTIME" \
+  ASCEND_GLOBAL_LOG_LEVEL=3 ./tools/benchmark_rounds.sh -d "$BASELINE_DEVICE" -r "$RUNTIME" \
   2>&1 | tee "${PROJECT_ROOT}/tmp/benchmark_baseline_${TIMESTAMP}_${RUNTIME}.txt"
 ```
 
@@ -171,7 +180,7 @@ cd "$WORKTREE_ABS" && \
 
 ```bash
 # Runs from the main workspace (Bash tool default cwd)
-./tools/benchmark_rounds.sh -d $CURRENT_DEVICE -r "$RUNTIME" \
+ASCEND_GLOBAL_LOG_LEVEL=3 ./tools/benchmark_rounds.sh -d $CURRENT_DEVICE -r "$RUNTIME" \
   2>&1 | tee "tmp/benchmark_current_${TIMESTAMP}_${RUNTIME}.txt"
 ```
 
@@ -195,8 +204,8 @@ When two devices are available, run baseline and current **for the same runtime*
 # For each runtime (serially):
 for RUNTIME in "${RUNTIMES_TO_BENCH[@]}"; do
   # Baseline on device A (from worktree with venv), current on device B (from main) — parallel
-  (cd "$WORKTREE_ABS" && source .venv/bin/activate && pwd && ./tools/benchmark_rounds.sh -d $DEVICE_BASELINE -r "$RUNTIME" ...) &
-  ./tools/benchmark_rounds.sh -d $DEVICE_CURRENT -r "$RUNTIME" ... &
+  (cd "$WORKTREE_ABS" && source .venv/bin/activate && pwd && ASCEND_GLOBAL_LOG_LEVEL=3 ./tools/benchmark_rounds.sh -d $DEVICE_BASELINE -r "$RUNTIME" ...) &
+  ASCEND_GLOBAL_LOG_LEVEL=3 ./tools/benchmark_rounds.sh -d $DEVICE_CURRENT -r "$RUNTIME" ... &
   wait  # Both finish before starting next runtime
 done
 ```
@@ -213,11 +222,11 @@ done
 cd "$WORKTREE_ABS" && \
   source .venv/bin/activate && \
   pwd && \
-  ./tools/benchmark_rounds.sh -d "$DEVICE" -r "$RUNTIME" \
+  ASCEND_GLOBAL_LOG_LEVEL=3 ./tools/benchmark_rounds.sh -d "$DEVICE" -r "$RUNTIME" \
   2>&1 | tee "${PROJECT_ROOT}/tmp/benchmark_baseline_${TIMESTAMP}_${RUNTIME}.txt"
 
 #    Then current (from main workspace — default cwd, no venv)
-./tools/benchmark_rounds.sh -d $DEVICE -r "$RUNTIME" \
+ASCEND_GLOBAL_LOG_LEVEL=3 ./tools/benchmark_rounds.sh -d $DEVICE -r "$RUNTIME" \
   2>&1 | tee "tmp/benchmark_current_${TIMESTAMP}_${RUNTIME}.txt"
 
 # 3. Cleanup

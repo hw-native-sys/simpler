@@ -783,6 +783,20 @@ def _plot_case_scope_stats(case_label: str, output_prefix: Path) -> None:
         sys.path.remove(str(tools_dir))
 
 
+def _default_quiet_driver_log(rounds: int) -> None:
+    """For a multi-round timing run, default ``ASCEND_GLOBAL_LOG_LEVEL`` to ``3``
+    (ERROR) so the CANN driver's per-round INFO writes stay out of the measured
+    device wall. Must run before the CANN driver initializes, so both entry points
+    call it early: ``run_module`` (standalone CLI) and ``pytest_configure`` (pytest,
+    where the Worker/ACL init lives in the ``st_worker`` fixture). An explicitly-set
+    ``ASCEND_GLOBAL_LOG_LEVEL`` is left untouched; ERROR keeps real failures visible."""
+    if rounds > 1 and "ASCEND_GLOBAL_LOG_LEVEL" not in os.environ:
+        os.environ["ASCEND_GLOBAL_LOG_LEVEL"] = "3"
+        logger.warning(
+            "Multi-round timing: set ASCEND_GLOBAL_LOG_LEVEL=3 (quiet CANN driver log; set it yourself to override)"
+        )
+
+
 def run_class_cases(  # noqa: PLR0913 -- shared layer-5 entry; kwargs mirror CLI surface
     worker,
     cls_inst,
@@ -1529,6 +1543,8 @@ class SceneTestCase:
         if args.rounds > 1 and args.enable_l2_swimlane:
             logger.warning("Profiling disabled: --rounds > 1")
             args.enable_l2_swimlane = 0
+
+        _default_quiet_driver_log(args.rounds)
         if args.rounds > 1 and args.enable_dep_gen:
             logger.warning("dep_gen disabled: --rounds > 1")
             args.enable_dep_gen = False

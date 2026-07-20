@@ -156,6 +156,28 @@ task-submit --device auto --device-num 1 --run "python ... -d \$TASK_DEVICE"
 Then read it directly (`$LOGDIR/device-*/device-*.log`) — no more `grep`-ing
 `~/ascend/log/debug/` and guessing which file is yours.
 
+## Device log *level*: quiet the CANN driver log for timing runs
+
+`ASCEND_PROCESS_LOG_PATH` (above) sets *where* the log goes;
+**`ASCEND_GLOBAL_LOG_LEVEL`** sets *how much*. Unset, it defaults to **INFO**,
+so the CANN driver/runtime writes hundreds of `[INFO]` lines per run into
+`device-<id>/*.log` (device-side `aicpu-sd`) and `plog/*.log` (host `RUNTIME`).
+The device-side writes land inside the measured device wall: on
+`paged_attention` they cost **~4–6%** (measured n=8, a2a3) and recur every
+`--rounds` iteration (~178 lines/round on top of a ~870-line one-time init).
+
+For any timing/benchmark run, set it to **ERROR** so only real failures log:
+
+```bash
+export ASCEND_GLOBAL_LOG_LEVEL=3   # 0=DEBUG 1=INFO(default) 2=WARNING 3=ERROR 4=NULL
+```
+
+It is a **severity floor** — higher = quieter — and is a *different* system from
+simpler's `--log-level` V0..V9 verbosity (independent knobs). Use `3` (ERROR),
+not `4` (NULL), so `507018`-class errors still surface. Scene tests set this
+automatically when `--rounds > 1` (a timing run, standalone or pytest) unless you
+pin it.
+
 ## `507018` triage: classify the mechanism before concluding
 
 `507018` (and `507014` / `507899`) is a **generic host-side code** —

@@ -54,7 +54,7 @@ import pytest  # noqa: E402
 from simpler_setup import parallel_scheduler as _ps  # noqa: E402
 from simpler_setup.log_config import DEFAULT_LOG_LEVEL, configure_logging  # noqa: E402
 from simpler_setup.pto_isa import ensure_pto_isa_root  # noqa: E402
-from simpler_setup.scene_test import clear_compile_cache  # noqa: E402
+from simpler_setup.scene_test import _default_quiet_driver_log, clear_compile_cache  # noqa: E402
 
 # Exit code used when the session watchdog fires. Matches the GNU `timeout`
 # convention so shell wrappers (e.g. CI) can distinguish timeout from other
@@ -424,6 +424,10 @@ def pytest_configure(config):
     # --log-level still overrides the default threshold.
     log_level = config.getoption("--log-level", default=None)
     configure_logging(log_level or DEFAULT_LOG_LEVEL)
+
+    # Quiet the CANN driver log for multi-round timing runs before the st_worker
+    # fixture initializes the Worker/ACL context (after which the level is fixed).
+    _default_quiet_driver_log(config.getoption("--rounds", default=1))
 
     # Pre-clone / refresh PTO-ISA up front so scene-test children inherit the
     # pinned managed checkout resolved from pto_isa.pin.
