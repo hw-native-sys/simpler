@@ -257,13 +257,74 @@ int32_t AicpuExecutor::init(Runtime *runtime) {
         if (init_failed_.load(std::memory_order_acquire)) return -1;
     }
 
-    // All threads: handshake this thread's slice of cores in parallel.
-    sched_ctx_.handshake_partition(runtime, tidx, nthreads);
+    // The orchestrator (top thread, tidx == nthreads-1) does not dispatch to
+    // cores, so it skips the handshake entirely and returns to
+    // run() immediately to build the graph — overlapping the schedulers' handshake.
+    // Core counts it needs are derived from cores_total_num_ (fixed 1:2 ratio) in
+    // run(). The remaining (nthreads-1) threads re-partition ALL cores among
+    // themselves, so every core still gets its register window opened.
+    const bool decouple_orch = (nthreads > 1) && !serial_orch_sched_;
+    const bool is_orchestrator = (tidx == nthreads - 1);
+    if (decouple_orch && is_orchestrator) {
+        return 0;  // do NOT touch the handshake or hs_arrived_ barrier
+    }
+    const int32_t hs_nthreads = decouple_orch ? (nthreads - 1) : nthreads;
 
-    // Barrier: leader waits for every slice to finish, then completes init.
+    // Barrier-free scheduler init (the decoupled default). Each scheduler thread
+    // handshakes exactly the clusters it will dispatch to (blocked-layout
+    // ownership: cluster ci = {ci, N/3+2ci, N/3+2ci+1}, owned by ci % hs_nthreads)
+    // and self-assigns them, then returns straight to run(). With no all-thread
+    // barrier a thread starts dispatching to its own cores as soon as they come
+    // up, independent of peers still handshaking. hs_nthreads == active_sched_threads_
+    // in this branch, so handshake ownership matches assign_own_clusters'.
+    if (decouple_orch) {
+        sched_ctx_.handshake_owned_clusters(runtime, tidx, hs_nthreads);
+        sched_ctx_.assign_own_clusters(tidx);
+#if SIMPLER_DFX
+        // Profiling subsystems (pmu/dump/dep) need every core's physical_core_id,
+        // so gate their one-time leader init behind a barrier — DFX builds only.
+        hs_arrived_.fetch_add(1, std::memory_order_acq_rel);
+        if (is_leader) {
+            while (hs_arrived_.load(std::memory_order_acquire) < hs_nthreads) {}
+            if (sched_ctx_.handshake_failed()) {
+                sched_ctx_.abort_and_shutdown(runtime);
+                init_failed_.store(true, std::memory_order_release);
+                init_done_.store(true, std::memory_order_release);
+                return -1;
+            }
+            sched_ctx_.post_handshake_profiling_init();
+            init_done_.store(true, std::memory_order_release);
+        } else {
+            while (!init_done_.load(std::memory_order_acquire)) {
+                if (init_failed_.load(std::memory_order_acquire)) return -1;
+            }
+            if (init_failed_.load(std::memory_order_acquire)) return -1;
+        }
+#else
+        // Perf path: a scheduler that sees an invalid core report (its own or a
+        // peer's, observed so far) latches completed_ via abort_and_shutdown, which
+        // stops any peer still entering dispatch (run()'s is_completed() gate). A
+        // peer that already passed that gate is not joined here — its own cores are
+        // valid (it handshaked them), and the failure ends in the host device reset
+        // that reaps every core, so the residual overlap is bounded and
+        // non-corrupting. finished_count_ is reset per-run in deinit(), not here.
+        if (sched_ctx_.handshake_failed()) {
+            sched_ctx_.abort_and_shutdown(runtime);
+            init_failed_.store(true, std::memory_order_release);
+            return -1;
+        }
+#endif
+        return 0;
+    }
+
+    // Serial / single-thread fallback: contiguous handshake + all-thread barrier +
+    // leader post_handshake_init (the orchestrator participates as a handshaker,
+    // and hs_nthreads != active_sched_threads_ makes per-thread self-assignment
+    // unsafe here).
+    sched_ctx_.handshake_partition(runtime, tidx, hs_nthreads);
     hs_arrived_.fetch_add(1, std::memory_order_acq_rel);
     if (is_leader) {
-        while (hs_arrived_.load(std::memory_order_acquire) < nthreads) {}
+        while (hs_arrived_.load(std::memory_order_acquire) < hs_nthreads) {}
         finished_count_.store(0, std::memory_order_release);
         if (sched_ctx_.post_handshake_init(runtime) != 0) {
             init_failed_.store(true, std::memory_order_release);
@@ -599,7 +660,11 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
 
                 // Fill ops / core counts (host can't resolve s_runtime_ops's
                 // device address nor know the SchedulerContext's core fan-out).
-                runtime_finalize_after_wire(rt, sched_ctx_.aic_count(), sched_ctx_.aiv_count());
+                // Core counts come from cores_total_num_ (fixed 1 AIC : 2 AIV
+                // cluster ratio). On the decoupled path aic_count()/aiv_count() are
+                // not populated until after this SM reset, so they cannot be read here.
+                int32_t spike_total = sched_ctx_.cores_total_num();
+                runtime_finalize_after_wire(rt, spike_total / 3, (spike_total * 2) / 3);
 #if SIMPLER_DFX
                 rt->orchestrator.l2_swimlane_level = get_l2_swimlane_level();
                 {

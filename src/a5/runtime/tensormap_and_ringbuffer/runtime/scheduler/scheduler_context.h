@@ -68,6 +68,23 @@ public:
     // All threads: handshake this thread's contiguous slice [lo, hi) of cores
     // (partitioned by tidx/nthreads). Each core is touched by exactly one thread.
     void handshake_partition(Runtime *runtime, int32_t tidx, int32_t nthreads);
+    // Handshake exactly the cores this scheduler thread will later manage:
+    // clusters {tidx, tidx+active, ...}, cluster ci =
+    // {ci, N/3+2ci, N/3+2ci+1} (blocked layout: [0,N/3) AIC, [N/3,N) AIV). Matches
+    // assign_cores_to_threads' round-robin so handshake warms the same
+    // core_exec_states_ the thread later dispatches from.
+    void handshake_owned_clusters(Runtime *runtime, int32_t tidx, int32_t active_threads);
+    // Barrier-free counterpart of assign_cores_to_threads: thread tidx populates
+    // its own CoreTracker + per-core sub_block_id for the clusters it owns, right
+    // after handshaking them — no all-thread barrier or leader post_handshake_init.
+    void assign_own_clusters(int32_t tidx);
+    // Latch completion + shutdown cores on a handshake failure seen without the
+    // barrier (non-DFX path). Idempotent.
+    void abort_and_shutdown(Runtime *runtime);
+    // Leader-only profiling-subsystem init (DFX builds); called behind a barrier
+    // in the barrier-free path since pmu_aicpu_init needs all physical_core_ids_.
+    void post_handshake_profiling_init();
+    bool handshake_failed() const { return handshake_failed_.load(std::memory_order_acquire); }
     // Leader-only, after the handshake barrier: build worker-id lists, assign
     // cores, init profiling subsystems, read task counts, init payloads.
     int32_t post_handshake_init(Runtime *runtime);
@@ -112,6 +129,7 @@ public:
 
     int32_t aic_count() const { return aic_count_; }
     int32_t aiv_count() const { return aiv_count_; }
+    int32_t cores_total_num() const { return cores_total_num_; }
     bool is_completed() const { return completed_.load(std::memory_order_acquire); }
     int32_t completed_tasks_count() const { return completed_tasks_.load(std::memory_order_acquire); }
     bool orchestration_done() const { return orchestrator_done_.load(std::memory_order_relaxed); }

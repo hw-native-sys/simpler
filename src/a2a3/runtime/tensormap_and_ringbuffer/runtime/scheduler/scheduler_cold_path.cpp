@@ -783,6 +783,188 @@ void SchedulerContext::handshake_partition(Runtime *runtime, int32_t tidx, int32
     OUT_OF_ORDER_STORE_BARRIER();
 }
 
+// Handshake exactly the cores this scheduler thread will later manage. Blocked
+// core layout ([0,N/3) AIC, [N/3,N) AIV) makes ownership predictable before
+// handshake: cluster ci = {ci, N/3+2ci, N/3+2ci+1}, assigned to thread
+// ci % active_threads. Same protocol as handshake_partition, but over the owned
+// set instead of a contiguous slice.
+void SchedulerContext::handshake_owned_clusters(Runtime *runtime, int32_t tidx, int32_t active_threads) {
+    Handshake *all_handshakes = reinterpret_cast<Handshake *>(runtime->dev.workers);
+    const int32_t aic_n = cores_total_num_ / 3;
+
+    int32_t owned[RUNTIME_MAX_WORKER];
+    int32_t own_n = 0;
+    for (int32_t ci = tidx; ci < aic_n; ci += active_threads) {
+        owned[own_n++] = ci;                  // AIC
+        owned[own_n++] = aic_n + 2 * ci;      // AIV0
+        owned[own_n++] = aic_n + 2 * ci + 1;  // AIV1
+    }
+
+    uint32_t max_physical_cores_count = platform_get_physical_cores_count();
+    uint64_t *regs = reinterpret_cast<uint64_t *>(regs_);
+    bool core_serviced[RUNTIME_MAX_WORKER] = {false};
+
+    // Batched 4-phase handshake (mirrors handshake_partition over the owned set):
+    // collect reports, then publish tasks / open windows / store CoreExecStates in
+    // separate passes so posted MMIO STRs and GM stores don't serialize, and only
+    // two barriers fire for the whole owned set (not one per core).
+    struct ReadyCore {
+        int32_t i;
+        uint32_t pcid;
+        uint64_t reg_addr;
+        CoreType core_type;
+    };
+    ReadyCore ready[RUNTIME_MAX_WORKER];
+    int32_t n_ready = 0;
+
+    // Phase 1: collect every reported owned core, prefetch its CoreExecState line.
+    for (int32_t remaining = own_n; remaining > 0;) {
+        for (int32_t k = 0; k < own_n; k++) {
+            int32_t i = owned[k];
+            if (core_serviced[i]) continue;
+            Handshake *hank = &all_handshakes[i];
+            if (hank->aicore_done == 0) {
+                SPIN_WAIT_HINT();
+                continue;
+            }
+            uint32_t physical_core_id = hank->physical_core_id;
+            if (physical_core_id >= max_physical_cores_count) {
+                LOG_ERROR(
+                    "Core %d reported invalid physical_core_id=%u (platform max=%u)", i, physical_core_id,
+                    max_physical_cores_count
+                );
+                handshake_failed_.store(true, std::memory_order_release);
+                core_serviced[i] = true;
+                remaining--;
+                continue;
+            }
+            __builtin_prefetch(&core_exec_states_[i], 1, 3);
+            ready[n_ready++] = {i, physical_core_id, regs[physical_core_id], hank->core_type};
+            core_serviced[i] = true;
+            remaining--;
+        }
+    }
+
+    // Phase 2: publish every task pointer, then ONE barrier. The core reads task
+    // only after its window opens (Phase 3), so a single barrier orders all task
+    // stores before any window STR.
+    for (int32_t r = 0; r < n_ready; r++) {
+        all_handshakes[ready[r].i].task = reinterpret_cast<uint64_t>(&payload_per_core_[ready[r].i][0]);
+    }
+    OUT_OF_ORDER_STORE_BARRIER();
+
+    // Phase 3: open every window (the IDLE write is also the core's ack).
+    for (int32_t r = 0; r < n_ready; r++) {
+        platform_init_aicore_regs(ready[r].reg_addr);
+    }
+
+    // Phase 4: publish each CoreExecState (AICPU-private, may follow the windows).
+    // reg_task_id fields start INVALID (pre_handshake_init memset zeroed them, and
+    // 0 is a valid task id); core_type_compact_ is filled for parity.
+    for (int32_t r = 0; r < n_ready; r++) {
+        int32_t i = ready[r].i;
+        CoreExecState st{};
+        st.reg_addr = ready[r].reg_addr;
+        st.cond_ptr = get_reg_ptr(ready[r].reg_addr, RegId::COND);
+        st.running_reg_task_id = AICPU_TASK_INVALID;
+        st.pending_reg_task_id = AICPU_TASK_INVALID;
+#if !SIMPLER_DFX
+        st.worker_id = i;
+        st.physical_core_id = ready[r].pcid;
+        st.core_type = ready[r].core_type;
+#endif
+        core_exec_states_[i] = st;
+        core_type_compact_[i] = static_cast<uint8_t>(ready[r].core_type);
+#if SIMPLER_DFX
+        physical_core_ids_[i] = ready[r].pcid;
+#endif
+    }
+    OUT_OF_ORDER_STORE_BARRIER();
+}
+
+// =============================================================================
+// Per-thread self-assignment (barrier-free init). Thread tidx owns the clusters
+// ci with ci % active_sched_threads_ == tidx (same round-robin as
+// assign_cores_to_threads), and the blocked layout gives their worker ids
+// directly, so a thread populates its own CoreTracker + per-core payload state
+// right after handshaking its own clusters, with no all-thread barrier.
+// =============================================================================
+void SchedulerContext::assign_own_clusters(int32_t tidx) {
+    const int32_t aic_n = cores_total_num_ / 3;
+    const int32_t active = active_sched_threads_;
+
+    CoreTracker &tracker = core_trackers_[tidx];
+    int32_t own_n = 0;
+    for (int32_t ci = tidx; ci < aic_n; ci += active)
+        own_n++;
+    tracker.init(own_n);
+
+    int32_t local = 0;
+    for (int32_t ci = tidx; ci < aic_n; ci += active) {
+        tracker.set_cluster(local++, ci, aic_n + 2 * ci, aic_n + 2 * ci + 1);
+    }
+
+    // Per-cluster GlobalContext sub_block_id (mirrors post_handshake_init) for
+    // this thread's owned cores only — a thread only ever dispatches to its own.
+    for (int32_t c = 0; c < tracker.get_cluster_count(); c++) {
+        int32_t cluster_offset = c * 3;
+        int32_t aiv0_id = tracker.get_core_id_by_offset(tracker.get_aiv0_core_offset(cluster_offset));
+        int32_t aiv1_id = tracker.get_core_id_by_offset(tracker.get_aiv1_core_offset(cluster_offset));
+        payload_per_core_[aiv0_id][0].global_context.sub_block_id = 0;
+        payload_per_core_[aiv0_id][1].global_context.sub_block_id = 0;
+        payload_per_core_[aiv1_id][0].global_context.sub_block_id = 1;
+        payload_per_core_[aiv1_id][1].global_context.sub_block_id = 1;
+    }
+
+    // Per-dispatch AsyncCtx constant prefill + one-time slab clear for owned cores
+    // (mirrors post_handshake_init's all-core loop, restricted to this thread's).
+    for (int32_t c = 0; c < tracker.get_cluster_count(); c++) {
+        for (int32_t sub = 0; sub < 3; sub++) {
+            int32_t core_id = tracker.get_core_id_by_offset(c * 3 + sub);
+            for (int32_t buf = 0; buf < 2; buf++) {
+                PTO2DispatchPayload &dp = payload_per_core_[core_id][buf];
+                AsyncCtx &ac = dp.local_context.async_ctx;
+                volatile DeferredCompletionSlab *slab = &deferred_slab_per_core_[core_id][buf];
+                ac.completion_count = &slab->count;
+                ac.completion_error_code = &slab->error_code;
+                ac.completion_entries = &slab->entries[0];
+                ac.completion_capacity = MAX_COMPLETIONS_PER_TASK;
+                slab->count = 0;
+                slab->error_code = PTO2_ERROR_NONE;
+                dp.args[PAYLOAD_LOCAL_CONTEXT_INDEX] = reinterpret_cast<uint64_t>(&dp.local_context);
+                dp.args[PAYLOAD_GLOBAL_CONTEXT_INDEX] = reinterpret_cast<uint64_t>(&dp.global_context);
+            }
+        }
+    }
+}
+
+// Abort the run on a handshake failure discovered without the all-thread barrier
+// (non-DFX path): latch completion so every scheduler thread exits its dispatch
+// loop, and broadcast exit to whatever cores did come up. Idempotent.
+void SchedulerContext::abort_and_shutdown(Runtime *runtime) {
+    if (!completed_.exchange(true, std::memory_order_acq_rel)) {
+        emergency_shutdown(runtime);
+    }
+}
+
+// Profiling-subsystem init (leader-only). pmu_aicpu_init needs every core's
+// physical_core_id, so the barrier-free init path calls this behind an
+// all-thread barrier compiled only into DFX builds. No-op otherwise.
+void SchedulerContext::post_handshake_profiling_init() {
+#if SIMPLER_DFX
+    if (is_dump_args_enabled()) {
+        dump_args_init(active_sched_threads_);
+    }
+    if (is_pmu_enabled()) {
+        pmu_aicpu_init(physical_core_ids_, cores_total_num_);
+        LOG_INFO_V0("PMU profiling started on %d cores", cores_total_num_);
+    }
+    if (is_dep_gen_enabled()) {
+        dep_gen_aicpu_init();
+    }
+#endif
+}
+
 // =============================================================================
 // Assign discovered cores to scheduler threads (cluster-aligned round-robin).
 // =============================================================================
@@ -923,9 +1105,46 @@ int32_t SchedulerContext::pre_handshake_init(
         LOG_ERROR("Invalid cores_total_num %d (expected 1-%d)", cores_total_num_, RUNTIME_MAX_WORKER);
         return -1;
     }
-    aic_count_ = 0;
-    aiv_count_ = 0;
+    // The blocked 1 AIC : 2 AIV layout requires an exact multiple of 3: cluster ci
+    // owns cores {ci, N/3+2ci, N/3+2ci+1}, so a non-zero remainder leaves the tail
+    // AIV cores [3*(N/3), N) in no cluster — unhandshaked, their windows never open,
+    // and the run hangs at the op-execute timeout. assign_cores_to_threads pairs
+    // aiv_worker_ids_[2*ci]/[2*ci+1] on the serial path too, so this holds for both.
+    if (cores_total_num_ % 3 != 0) {
+        LOG_ERROR("cores_total_num %d is not a multiple of 3 (blocked 1 AIC : 2 AIV layout)", cores_total_num_);
+        return -1;
+    }
+    // Blocked core layout ([0,N/3) AIC, [N/3,N) AIV) with a fixed 1:2 AIC:AIV
+    // ratio makes these exact pre-handshake, so scheduler threads can self-assign
+    // their owned clusters (assign_own_clusters) without the post-handshake
+    // discovery pass and its all-thread barrier.
+    aic_count_ = cores_total_num_ / 3;
+    aiv_count_ = (cores_total_num_ * 2) / 3;
+    active_sched_threads_ = (sched_thread_num_ > 0) ? sched_thread_num_ : aicpu_thread_num_;
     handshake_failed_.store(false, std::memory_order_release);
+
+    // State the barrier-free per-thread init path no longer reaches via
+    // post_handshake_init; reset on the leader before any scheduler thread is
+    // released to dispatch.
+    completed_tasks_.store(0, std::memory_order_release);
+    orchestrator_done_.store(false, std::memory_order_release);
+    func_id_to_addr_ = runtime->dev.func_id_to_addr_;
+
+    // total_tasks_ must be read before hs_setup_done_ is published: on the
+    // decoupled path the orchestrator resets the SM as soon as it observes
+    // hs_setup_done_, which zeroes these ring counters, so the read completes here
+    // (on the leader, before any thread is released) rather than post-handshake.
+    if (runtime->get_gm_sm_ptr()) {
+        auto *header = static_cast<PTO2SharedMemoryHeader *>(runtime->get_gm_sm_ptr());
+        int64_t pto2_count = 0;
+        for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
+            int32_t ring_tasks = header->rings[r].fc.current_task_index.load(std::memory_order_acquire);
+            if (ring_tasks > 0 && ring_tasks <= PTO2_SCOPE_TASKS_CAP) pto2_count += ring_tasks;
+        }
+        total_tasks_ = static_cast<int32_t>(pto2_count);
+    } else {
+        total_tasks_ = 0;
+    }
 
     LOG_INFO_V0("Handshaking with %d cores", cores_total_num_);
     return 0;
@@ -987,25 +1206,8 @@ int32_t SchedulerContext::post_handshake_init(Runtime *runtime) {
     }
 #endif
 
-    // Initialize task counters. Task count comes from PTO2 shared memory.
-    if (runtime->get_gm_sm_ptr()) {
-        auto *header = static_cast<PTO2SharedMemoryHeader *>(runtime->get_gm_sm_ptr());
-        // Read at one-time boot init, before the SM is reset for the run, so a
-        // ring not yet written holds uninitialized memory (0xbe... under ASAN's
-        // malloc-fill). Sum in int64 and only count rings whose value is a
-        // plausible task count — (0, PTO2_SCOPE_TASKS_CAP]; a ring cannot hold
-        // more than the scope cap. This rejects any garbage pattern (negative
-        // or positive), so uninitialized rings contribute 0 (the correct boot
-        // count) while valid counts still add up, with no signed overflow.
-        int64_t pto2_count = 0;
-        for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
-            int32_t ring_tasks = header->rings[r].fc.current_task_index.load(std::memory_order_acquire);
-            if (ring_tasks > 0 && ring_tasks <= PTO2_SCOPE_TASKS_CAP) pto2_count += ring_tasks;
-        }
-        total_tasks_ = static_cast<int32_t>(pto2_count);
-    } else {
-        total_tasks_ = 0;
-    }
+    // total_tasks_ is read in pre_handshake_init (before the orchestrator's early
+    // SM reset on the decoupled path can zero the ring counters).
     completed_tasks_.store(0, std::memory_order_release);
 
     // Device orchestration: the orchestrator thread flips this when the graph is built.
