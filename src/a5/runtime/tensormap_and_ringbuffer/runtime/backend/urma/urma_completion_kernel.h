@@ -164,12 +164,16 @@ template <typename TensorT>
 inline __aicore__ TensorT make_tensor_slice(TensorT &tensor, uint64_t elem_offset, uint64_t elem_count) {
     using ShapeT = typename TensorT::Shape;
     using StrideT = typename TensorT::Stride;
-    ShapeT shape(tensor.GetShape(pto::GlobalTensorDim::DIM_0), tensor.GetShape(pto::GlobalTensorDim::DIM_1),
-                 tensor.GetShape(pto::GlobalTensorDim::DIM_2), tensor.GetShape(pto::GlobalTensorDim::DIM_3),
-                 static_cast<int64_t>(elem_count));
-    StrideT stride(tensor.GetStride(pto::GlobalTensorDim::DIM_0), tensor.GetStride(pto::GlobalTensorDim::DIM_1),
-                   tensor.GetStride(pto::GlobalTensorDim::DIM_2), tensor.GetStride(pto::GlobalTensorDim::DIM_3),
-                   tensor.GetStride(pto::GlobalTensorDim::DIM_4));
+    ShapeT shape(
+        tensor.GetShape(pto::GlobalTensorDim::DIM_0), tensor.GetShape(pto::GlobalTensorDim::DIM_1),
+        tensor.GetShape(pto::GlobalTensorDim::DIM_2), tensor.GetShape(pto::GlobalTensorDim::DIM_3),
+        static_cast<int64_t>(elem_count)
+    );
+    StrideT stride(
+        tensor.GetStride(pto::GlobalTensorDim::DIM_0), tensor.GetStride(pto::GlobalTensorDim::DIM_1),
+        tensor.GetStride(pto::GlobalTensorDim::DIM_2), tensor.GetStride(pto::GlobalTensorDim::DIM_3),
+        tensor.GetStride(pto::GlobalTensorDim::DIM_4)
+    );
     return TensorT(tensor.data() + elem_offset, shape, stride);
 }
 

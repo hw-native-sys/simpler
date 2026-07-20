@@ -771,8 +771,7 @@ static uint64_t urma_workspace_bytes(uint32_t rank_count) {
     constexpr uint32_t qp_num = 1;
     return sizeof(UrmaInfo) +
            static_cast<uint64_t>(rank_count) *
-               (2ULL * sizeof(UrmaWQCtx) * qp_num + 2ULL * sizeof(UrmaCqCtx) * qp_num +
-                sizeof(UrmaMemInfo) * qp_num);
+               (2ULL * sizeof(UrmaWQCtx) * qp_num + 2ULL * sizeof(UrmaCqCtx) * qp_num + sizeof(UrmaMemInfo) * qp_num);
 }
 
 static bool rank_ids_are_dense_prefix(const uint32_t *rank_ids, size_t rank_count) {
@@ -1032,9 +1031,7 @@ static int domain_alloc_via_ipc(
         domain_workspace_addr = reinterpret_cast<uint64_t>(out->urma_workspace->GetWorkspaceAddr());
         domain_workspace_size = urma_workspace_bytes(static_cast<uint32_t>(rank_count));
     } else {
-        LOG_WARN(
-            "[comm rank %d] alloc_domain: URMA workspace disabled for non-dense rank mapping", h->rank
-        );
+        LOG_WARN("[comm rank %d] alloc_domain: URMA workspace disabled for non-dense rank mapping", h->rank);
     }
 #endif
 
