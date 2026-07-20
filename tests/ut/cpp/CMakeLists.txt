@@ -606,6 +606,7 @@ add_a2a3_runtime_test(test_a2a3_scope_stats_collector a2a3/test_scope_stats_coll
 # A5 tests (src/a5/runtime/tensormap_and_ringbuffer/)
 # ---------------------------------------------------------------------------
 add_a5_test(test_a5_fatal a5/test_a5_fatal.cpp)
+add_a5_test(test_a5_task_args a5/test_task_args.cpp)
 
 # A5 trb runtime UTs — mirror of a2a3 trb runtime UTs, link against a5_rt_objs.
 # Target names carry the a5_ prefix because hierarchical/test_tensormap (and

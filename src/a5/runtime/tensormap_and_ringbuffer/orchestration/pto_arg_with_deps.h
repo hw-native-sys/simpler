@@ -54,15 +54,17 @@ public:
     using L0TaskArgs::add_scalar;
     using L0TaskArgs::add_scalars;
     using L0TaskArgs::add_scalars_i32;
+    using L0TaskArgs::allow_early_resolve;  // task hint (getter)
     using L0TaskArgs::copy_scalars_from;
+    using L0TaskArgs::set_allow_early_resolve;  // task hint (setter)
+    using L0TaskArgs::set_task_timing_slot;     // selective task-timing slot (setter)
+    using L0TaskArgs::task_timing_slot;         // selective task-timing slot (getter)
 
     // Error / status — forward to Arg
     using L0TaskArgs::error_msg;
     using L0TaskArgs::has_error;
     using L0TaskArgs::launch_spec;
     using L0TaskArgs::set_error;
-    using L0TaskArgs::set_task_timing_slot;  // selective task-timing slot (setter)
-    using L0TaskArgs::task_timing_slot;      // selective task-timing slot (getter)
 
     // NOT exposed: set_dependencies, explicit_dep_count, explicit_dep,
     // explicit_deps_data — these are the primitive-layer dep API. Users of
