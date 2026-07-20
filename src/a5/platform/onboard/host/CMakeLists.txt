@@ -46,6 +46,11 @@ set(ASCEND_ARCH_HOME "${ASCEND_HOME_PATH}/${CMAKE_SYSTEM_PROCESSOR}-linux")
 # same name, forwarded by simpler_setup/runtime_builder.py).
 option(SIMPLER_ENABLE_PTO_SDMA_WORKSPACE "Enable a5 PTO SDMA workspace overlay" OFF)
 option(SIMPLER_ENABLE_PTO_URMA_WORKSPACE "Enable a5 PTO URMA workspace overlay" OFF)
+if(SIMPLER_ENABLE_PTO_SDMA_WORKSPACE AND SIMPLER_ENABLE_PTO_URMA_WORKSPACE)
+    message(FATAL_ERROR
+        "SIMPLER_ENABLE_PTO_SDMA_WORKSPACE and SIMPLER_ENABLE_PTO_URMA_WORKSPACE are mutually exclusive "
+        "because CommContext exposes a single workSpace/workSpaceSize pair")
+endif()
 if(SIMPLER_ENABLE_PTO_SDMA_WORKSPACE OR SIMPLER_ENABLE_PTO_URMA_WORKSPACE)
     if(NOT DEFINED ENV{PTO_ISA_ROOT})
         message(FATAL_ERROR
