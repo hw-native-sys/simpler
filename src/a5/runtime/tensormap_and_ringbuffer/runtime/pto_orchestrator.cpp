@@ -376,19 +376,19 @@ void PTO2OrchestratorState::wire_fanin_task(PTO2TaskSlotState &slot_state, int32
     PTO2TaskPayload *payload = slot_state.payload;
     slot_state.fanin_count = wfanin + 1;
 
-    int32_t early_finished = 0;
+    int32_t completed_fanin = 0;
     for_each_fanin_slot_state(*payload, [&](PTO2TaskSlotState *producer) {
         producer->lock_fanout();
         int32_t pstate = producer->task_state.load(std::memory_order_acquire);
         if (pstate >= PTO2_TASK_COMPLETED) {
-            early_finished++;
+            completed_fanin++;
         } else {
             producer->fanout_head = rss.dep_pool.prepend(producer->fanout_head, &slot_state);
         }
         producer->unlock_fanout();
     });
 
-    int32_t init_rc = early_finished + 1;
+    int32_t init_rc = completed_fanin + 1;
     int32_t new_rc = slot_state.fanin_refcount.fetch_add(init_rc, std::memory_order_acq_rel) + init_rc;
     mark_dep_pool_position(slot_state);
     if (new_rc >= slot_state.fanin_count) {

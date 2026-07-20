@@ -446,7 +446,7 @@ The orchestrator completes fanout wiring before publishing a task to the ready q
    - Checks `task_state >= COMPLETED` (early-finished optimization)
    - If not completed: prepends consumer to producer's `fanout_head` via `dep_pool.prepend`
    - **Releases** `fanout_lock`
-3. Atomically releases the +1 redundance + early_finished count via `fanin_refcount.fetch_add`
+3. Atomically releases the +1 redundance + completed-fanin count via `fanin_refcount.fetch_add`
 4. If all deps satisfied: pushes task to the routed ready queue
 
 Zero-fanin tasks and tasks whose claimed producers are already completed skip dep_pool entry allocation and publish directly to the routed ready queue.

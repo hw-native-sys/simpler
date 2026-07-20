@@ -566,14 +566,16 @@ struct alignas(64) PTO2TaskSlotState {
         task = t;
     }
 
+    // Lock-free callers use this only as a fast-path hint. A false result is
+    // rechecked by try_mark_dispatch_propagated() while holding fanout_lock.
     bool has_dispatch_propagated() const {
-        return (ready_state.load(std::memory_order_relaxed) & PTO2_DISPATCH_PROPAGATED) != 0;
+        return (ready_state.load(std::memory_order_acquire) & PTO2_DISPATCH_PROPAGATED) != 0;
     }
 
     // The propagation owner holds fanout_lock from this claim through its
     // fanout snapshot so wiring can classify late edges exactly once.
     bool try_mark_dispatch_propagated() {
-        return (ready_state.fetch_or(PTO2_DISPATCH_PROPAGATED, std::memory_order_relaxed) & PTO2_DISPATCH_PROPAGATED) ==
+        return (ready_state.fetch_or(PTO2_DISPATCH_PROPAGATED, std::memory_order_acq_rel) & PTO2_DISPATCH_PROPAGATED) ==
                0;
     }
 

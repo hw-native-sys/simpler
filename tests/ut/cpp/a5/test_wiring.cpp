@@ -156,7 +156,7 @@ TEST_F(WiringTest, WireTaskAllProducersEarlyFinished) {
 
     // fanin_count = 2 + 1 = 3
     EXPECT_EQ(task_slot.fanin_count, 3);
-    // early_finished = 2, init_rc = 2 + 1 = 3, so refcount should hit fanin_count
+    // completed_fanin = 2, init_rc = 2 + 1 = 3, so refcount should hit fanin_count
     EXPECT_GE(task_slot.fanin_refcount.load(), task_slot.fanin_count);
 
     // Task should be in ready queue
@@ -192,7 +192,7 @@ TEST_F(WiringTest, WireTaskProducersPendingTaskNotReady) {
 
     // fanin_count = 3 (2 + 1)
     EXPECT_EQ(task_slot.fanin_count, 3);
-    // early_finished = 0, init_rc = 1 -> not ready
+    // completed_fanin = 0, init_rc = 1 -> not ready
     EXPECT_EQ(task_slot.fanin_refcount.load(), 1);
     EXPECT_LT(task_slot.fanin_refcount.load(), task_slot.fanin_count);
 
@@ -235,7 +235,7 @@ TEST_F(WiringTest, WireTaskMixedProducerStates) {
 
     // fanin_count = 4 (3 + 1)
     EXPECT_EQ(task_slot.fanin_count, 4);
-    // early_finished = 2 (COMPLETED + CONSUMED), init_rc = 3
+    // completed_fanin = 2 (COMPLETED + CONSUMED), init_rc = 3
     // Not yet 4 -> not ready (one producer still running)
     EXPECT_EQ(task_slot.fanin_refcount.load(), 3);
 
