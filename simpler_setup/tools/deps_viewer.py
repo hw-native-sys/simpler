@@ -1438,8 +1438,11 @@ def _load_func_names_json(path):
 
 
 def _autoload_name_map(deps_path):
-    """Look for a ``name_map_*.json`` next to deps.json."""
-    candidates = sorted(Path(deps_path).parent.glob("name_map_*.json"), key=lambda p: p.stat().st_mtime)
+    """Look for a ``name_map*.json`` next to deps.json."""
+    candidates = sorted(
+        (path for path in Path(deps_path).parent.glob("name_map*.json") if path.is_file()),
+        key=lambda path: (path.stat().st_mtime, path.name),
+    )
     if not candidates:
         return {}
     return _load_func_names_json(candidates[-1])

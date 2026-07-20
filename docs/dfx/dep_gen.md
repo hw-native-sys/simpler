@@ -242,7 +242,7 @@ The default text output contains:
   - `perf_sidecar`: `yes` when `l2_swimlane_records.json` was successfully loaded
   - `func_name_map`: `yes` when at least one task label resolved to a named `func_name`
     from either an explicit `--func-names` file or an auto-discovered sibling
-    `name_map_*.json`. When the `kernel_ids` fallback is used, `func_id=` shows an
+    `name_map*.json`. When the `kernel_ids` fallback is used, `func_id=` shows an
     aligned 3-slot integer array in `[aic,aiv0,aiv1]` order; inactive slots remain
     `-1`. `func_name_map` stays `no` unless a real human-readable name was resolved.
 - `TASK INDEX` — one line per task with `kind=` + `func_id=` and unique

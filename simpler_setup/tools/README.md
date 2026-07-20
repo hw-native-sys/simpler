@@ -11,14 +11,78 @@ no repo checkout required.
 
 - **[swimlane_converter](#swimlane_converter)** — perf JSON → Chrome Trace Event (Perfetto)
 - **[sched_overhead_analysis](#sched_overhead_analysis)** — scheduler overhead / Tail OH breakdown
+- **[critical_path](#critical_path)** — L2 swimlane critical-path compute/stall analysis
 - **[strace_timing](#strace_timing)** — per-stage `simpler_run` breakdown (host + AICPU phases) from `[STRACE]` log markers → TPOT table, per-round table (`--rounds-table`), nested tree (`--tree`), or Perfetto JSON
 - **[dump_viewer](#dump_viewer)** — inspect / export args dumps (see [docs/args-dump.md](../../docs/dfx/args-dump.md) for full workflow)
 - **[deps_viewer](#deps_viewer)** — `deps.json` (dep_gen) → text or pan/zoom HTML dependency graph
 
-Auto-detection paths (`outputs/*/l2_swimlane_records.json`, `outputs/*/args_dump/`)
-are resolved relative to the **current working directory** — run these from the
-directory that holds your `outputs/`. Each test case writes into its own
-`outputs/<case>_<ts>/` directory; the tools auto-pick the latest by mtime.
+For CLIs that allow an omitted input, auto-detection paths
+(`outputs/*/l2_swimlane_records.json`, `outputs/*/args_dump/`) are resolved
+relative to the **current working directory** — run these from the directory
+that holds your `outputs/`. Each test case writes into its own
+`outputs/<case>_<ts>/` directory; those tools auto-pick the latest by mtime.
+
+---
+
+## critical_path
+
+Post-processing analysis over an L2-swimlane run. Given a run directory, it
+recursively discovers every directory containing all three required artifacts:
+
+- `l2_swimlane_records.json` (or legacy `l2_perf_records.json`)
+- `deps.json`
+- `name_map*.json` (the newest matching sibling is used when several exist)
+
+When a sibling `merged_swimlane*.json` is present, the newest matching file is
+used as the source for two additional Perfetto-compatible traces:
+
+- `CPM_static.json` — highlights the Static CPM task set.
+- `CPM_observed.json` — highlights the Observed path task set.
+
+Both files retain every view, metadata event, bar, and flow from the merged
+trace. Only AIC/AIV task bars in Worker View (`pid=4`) outside the selected path
+are renamed to `·(rXtY)` (or `·(tY)` for ring 0); path bars and every slice
+in other views keep their original names. With Perfetto's default name-based
+coloring, the middle dot maps to a light blue-purple while digits are removed
+before hashing, so anonymous Worker View bars share a subdued color and path
+bars remain grouped by function. `dummy(...)` and `alloc(...)` bars keep their
+original names because the AICore critical-path model does not classify them.
+
+This supports both simpler directories such as `outputs/<case>_<ts>/` and
+PyPTO directories such as `build_output/<case>/dfx_outputs/`, including nested
+rank/device layouts. Each discovered artifact directory is analyzed separately,
+and its `critical_path_report.md` is written beside
+`l2_swimlane_records.json`. Pointing the command at a whole run therefore
+creates one local report per rank/device rather than one combined report at the
+scan root.
+
+For each rank/device, the tool builds a happens-before DAG from the dependency
+graph oriented by observed timestamps, then computes two critical paths:
+
+- **Static CPM** — the longest duration-weighted path, i.e. the
+  dependency-limited latency floor with unlimited cores.
+- **Observed** — the as-executed backward blame walk from the last-finishing
+  task. Each task's compute plus its preceding scheduling stall (`data-wait`,
+  `core-wait`, or `front-gap`) tiles the makespan exactly.
+
+The report contains a makespan/CPM/compute/stall overview, a per-kernel-family
+table, and a full per-task listing. It is pure post-processing: no C++ or device
+is required. If no sibling `merged_swimlane*.json` exists, Markdown analysis
+still succeeds and the tool prints a warning that the two Perfetto traces were
+skipped.
+
+```bash
+# Analyze one simpler output directory or an entire PyPTO run tree
+python -m simpler_setup.tools.critical_path outputs/<case>_<ts>
+python -m simpler_setup.tools.critical_path build_output/<case>
+
+# Customize each local report filename/table size and print a combined stdout view
+python -m simpler_setup.tools.critical_path <run-dir> \
+    --report critical_path_report.md --top 25 --stdout
+```
+
+`--report` accepts a filename, not a path, so the report cannot be redirected
+away from the directory containing its source `l2_swimlane_records.json`.
 
 ---
 
@@ -285,7 +349,7 @@ this is the structural view.
     - `annotated_edges`: total number of annotated edge rows
     - `perf_sidecar`: `yes` when `l2_swimlane_records.json` was successfully loaded
     - `func_name_map`: `yes` when at least one task name resolved to a named
-      `func_name` from `--func-names` or an auto-discovered `name_map_*.json`.
+      `func_name` from `--func-names` or an auto-discovered `name_map*.json`.
       `func_name_map` stays `no` unless a real human-readable name was resolved.
   - `TASK INDEX` (one line per task for grep)
     - `kind=` distinguishes `submit` / `dummy` / `alloc` / `unknown`

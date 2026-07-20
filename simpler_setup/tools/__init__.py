@@ -12,6 +12,7 @@ Invoke via ``python -m simpler_setup.tools.<name>``:
 
 - ``swimlane_converter``   : perf JSON -> Perfetto/Chrome trace
 - ``sched_overhead_analysis``: scheduler overhead deep-dive
+- ``critical_path``          : L2 swimlane critical-path compute/stall analysis
 - ``deps_viewer``           : deps.json -> text or pan/zoom HTML dependency graph
 - ``dump_viewer``           : inspect args dumps
 - ``strace_timing``         : per-stage / per-round timing from [STRACE] log markers

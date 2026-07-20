@@ -14,6 +14,14 @@ from simpler_setup.tools import deps_viewer
 from simpler_setup.tools.deps_viewer import _merge_task_meta_with_kernel_ids, emit_text
 
 
+def test_autoload_name_map_accepts_exact_name(tmp_path):
+    deps_path = tmp_path / "deps.json"
+    deps_path.write_text("{}")
+    (tmp_path / "name_map.json").write_text(json.dumps({"callable_id_to_name": {"7": "kernel_add"}}))
+
+    assert deps_viewer._autoload_name_map(deps_path) == {"7": "kernel_add"}
+
+
 def test_emit_text_marks_alloc_without_task_entry():
     text = emit_text(
         edges=[],
