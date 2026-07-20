@@ -226,7 +226,7 @@ TEST_F(WiringTest, WireTaskProducersPendingTaskNotReady) {
     EXPECT_EQ(producer_slots[1].fanout_head->slot_state, &task_slot);
 }
 
-TEST_F(WiringTest, DispatchPropagationMarkerPreservesReadyStateFlagsAndResets) {
+TEST_F(WiringTest, DispatchPropagationMarkerPreservesLifecycleFlagsAndResets) {
     alignas(64) PTO2TaskSlotState producer;
     init_slot(producer, PTO2_TASK_PENDING, 1, 1);
 
@@ -237,13 +237,13 @@ TEST_F(WiringTest, DispatchPropagationMarkerPreservesReadyStateFlagsAndResets) {
     producer.mark_any_subtask_deferred();
     EXPECT_FALSE(producer.try_mark_dispatch_propagated());
     EXPECT_EQ(
-        producer.ready_state.load(std::memory_order_relaxed),
+        producer.lifecycle_flags.load(std::memory_order_relaxed),
         PTO2_READY_CLAIMED | PTO2_COMPLETION_DONE | PTO2_SUBTASK_DEFERRED | PTO2_DISPATCH_PROPAGATED
     );
 
     producer.reset_for_reuse();
     EXPECT_FALSE(producer.has_dispatch_propagated());
-    EXPECT_EQ(producer.ready_state.load(std::memory_order_relaxed), PTO2_READY_UNCLAIMED);
+    EXPECT_EQ(producer.lifecycle_flags.load(std::memory_order_relaxed), PTO2_LIFECYCLE_FLAGS_NONE);
 }
 
 // =============================================================================

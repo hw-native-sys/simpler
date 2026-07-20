@@ -544,12 +544,12 @@ struct PTO2SchedulerState {
     }
 
     bool try_claim_ready_once(PTO2TaskSlotState &slot_state) {
-        uint8_t state = slot_state.ready_state.load(std::memory_order_acquire);
+        uint8_t flags = slot_state.lifecycle_flags.load(std::memory_order_acquire);
         for (;;) {
-            if ((state & PTO2_READY_CLAIMED) != 0) return false;
-            uint8_t desired = state | PTO2_READY_CLAIMED;
-            if (slot_state.ready_state.compare_exchange_weak(
-                    state, desired, std::memory_order_acq_rel, std::memory_order_acquire
+            if ((flags & PTO2_READY_CLAIMED) != 0) return false;
+            uint8_t desired_flags = flags | PTO2_READY_CLAIMED;
+            if (slot_state.lifecycle_flags.compare_exchange_weak(
+                    flags, desired_flags, std::memory_order_acq_rel, std::memory_order_acquire
                 )) {
                 return true;
             }
@@ -1053,18 +1053,18 @@ struct PTO2SchedulerState {
         PTO2TaskSlotState &slot_state, uint64_t &atomic_count, uint64_t &push_wait,
         EarlyDispatchReleaseSink *sink = nullptr
     ) {
-        uint8_t state = slot_state.ready_state.load(std::memory_order_acquire);
-        atomic_count += 1;  // ready_state load
+        uint8_t flags = slot_state.lifecycle_flags.load(std::memory_order_acquire);
+        atomic_count += 1;  // lifecycle_flags load
         for (;;) {
-            if ((state & PTO2_READY_CLAIMED) != 0) return false;
-            uint8_t desired = state | PTO2_READY_CLAIMED;
-            if (slot_state.ready_state.compare_exchange_weak(
-                    state, desired, std::memory_order_acq_rel, std::memory_order_acquire
+            if ((flags & PTO2_READY_CLAIMED) != 0) return false;
+            uint8_t desired_flags = flags | PTO2_READY_CLAIMED;
+            if (slot_state.lifecycle_flags.compare_exchange_weak(
+                    flags, desired_flags, std::memory_order_acq_rel, std::memory_order_acquire
                 )) {
-                atomic_count += 1;  // ready_state CAS
+                atomic_count += 1;  // lifecycle_flags CAS
                 break;
             }
-            atomic_count += 1;  // failed ready_state CAS
+            atomic_count += 1;  // failed lifecycle_flags CAS
         }
 
         // Early-dispatch: pre-staged tasks are released by doorbell
@@ -1207,7 +1207,7 @@ struct PTO2SchedulerState {
         slot_state.unlock_fanout();
 
 #if SIMPLER_SCHED_PROFILING
-        lock_atomics += 3;  // task_state.store + ready_state.fetch_or + unlock.store
+        lock_atomics += 3;  // task_state.store + lifecycle_flags.fetch_or + unlock.store
         g_sched_lock_atomic_count[thread_idx] += lock_atomics;
         g_sched_lock_wait_cycle[thread_idx] += lock_wait;
         PTO2_SCHED_CYCLE_LAP(g_sched_lock_cycle[thread_idx]);
