@@ -303,6 +303,13 @@ int simpler_init(
     if (ctx == NULL) return -1;
 
     DeviceRunnerBase *runner = static_cast<DeviceRunnerBase *>(ctx);
+    // HostApi callbacks, including the prewarm path below, recover their
+    // DeviceRunner from this thread-local binding.
+    pthread_once(&g_runner_key_once, create_runner_key);
+    pthread_setspecific(g_runner_key, ctx);
+    auto tsd_guard = RAIIScopeGuard([]() {
+        pthread_setspecific(g_runner_key, nullptr);
+    });
 
     // CANN dlog must be levelled BEFORE the device context is opened
     // (rtSetDevice inside attach_current_thread): CANN snapshots the
