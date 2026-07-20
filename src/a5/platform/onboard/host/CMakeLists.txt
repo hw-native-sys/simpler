@@ -32,13 +32,6 @@ if(DEFINED CUSTOM_INCLUDE_DIRS)
 else()
     message(FATAL_ERROR "MUST set CUSTOM_INCLUDE_DIRS to build Host runtime")
 endif()
-if(NOT DEFINED ENV{PTO_ISA_ROOT})
-    message(FATAL_ERROR
-        "a5 onboard host_runtime requires PTO_ISA_ROOT "
-        "(URMA workspace setup uses pto-isa host headers)")
-endif()
-list(APPEND CMAKE_CUSTOM_INCLUDE_DIRS "$ENV{PTO_ISA_ROOT}/include")
-
 set(ASCEND_ARCH_HOME "${ASCEND_HOME_PATH}/${CMAKE_SYSTEM_PROCESSOR}-linux")
 
 # SIMPLER_ENABLE_PTO_SDMA_WORKSPACE: opt-in overlay that wires the PTO-ISA
@@ -52,11 +45,12 @@ set(ASCEND_ARCH_HOME "${ASCEND_HOME_PATH}/${CMAKE_SYSTEM_PROCESSOR}-linux")
 # Flip ON via -DSIMPLER_ENABLE_PTO_SDMA_WORKSPACE=ON (or the env var of the
 # same name, forwarded by simpler_setup/runtime_builder.py).
 option(SIMPLER_ENABLE_PTO_SDMA_WORKSPACE "Enable a5 PTO SDMA workspace overlay" OFF)
-if(SIMPLER_ENABLE_PTO_SDMA_WORKSPACE)
+option(SIMPLER_ENABLE_PTO_URMA_WORKSPACE "Enable a5 PTO URMA workspace overlay" OFF)
+if(SIMPLER_ENABLE_PTO_SDMA_WORKSPACE OR SIMPLER_ENABLE_PTO_URMA_WORKSPACE)
     if(NOT DEFINED ENV{PTO_ISA_ROOT})
         message(FATAL_ERROR
-            "a5 onboard host_runtime with SIMPLER_ENABLE_PTO_SDMA_WORKSPACE=ON requires PTO_ISA_ROOT "
-            "(needs pto-isa headers + CANN 9.0+ with a5 SDMA primitives)")
+            "a5 onboard host_runtime PTO async workspace overlays require PTO_ISA_ROOT "
+            "(needs pto-isa host headers)")
     endif()
     list(APPEND CMAKE_CUSTOM_INCLUDE_DIRS "$ENV{PTO_ISA_ROOT}/include")
 endif()
@@ -127,6 +121,9 @@ target_compile_definitions(host_runtime PRIVATE SIMPLER_PLATFORM_NAME="a5")
 
 if(SIMPLER_ENABLE_PTO_SDMA_WORKSPACE)
     target_compile_definitions(host_runtime PRIVATE SIMPLER_ENABLE_PTO_SDMA_WORKSPACE=1)
+endif()
+if(SIMPLER_ENABLE_PTO_URMA_WORKSPACE)
+    target_compile_definitions(host_runtime PRIVATE SIMPLER_ENABLE_PTO_URMA_WORKSPACE=1)
 endif()
 
 set(SIMPLER_PTO_ISA_BUILD_COMMIT "" CACHE STRING

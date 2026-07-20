@@ -346,16 +346,12 @@ class RuntimeBuilder:
                 defines: dict[str, str] = {}
                 if build_pto_isa_commit:
                     defines["SIMPLER_PTO_ISA_BUILD_COMMIT"] = build_pto_isa_commit
-                # Mirror the SIMPLER_ENABLE_PTO_SDMA_WORKSPACE env var into the
-                # CMake option (src/{arch}/platform/onboard/host/CMakeLists.txt)
-                # so the a5 SDMA workspace overlay is built only when opted in.
-                if os.environ.get("SIMPLER_ENABLE_PTO_SDMA_WORKSPACE", "").upper() in {
-                    "1",
-                    "ON",
-                    "TRUE",
-                    "YES",
-                }:
-                    defines["SIMPLER_ENABLE_PTO_SDMA_WORKSPACE"] = "ON"
+                for opt_in_define in (
+                    "SIMPLER_ENABLE_PTO_SDMA_WORKSPACE",
+                    "SIMPLER_ENABLE_PTO_URMA_WORKSPACE",
+                ):
+                    if os.environ.get(opt_in_define, "").upper() in {"1", "ON", "TRUE", "YES"}:
+                        defines[opt_in_define] = "ON"
                 cmake_defines = defines or None
             # compile() adds a {target}/ subdirectory inside build_dir
             cache_dir = self._CACHE_DIR / arch / variant / name
