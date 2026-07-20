@@ -116,6 +116,12 @@ struct AICoreCompletionMailbox {
     // Safe to call concurrently from any number of producers; structurally
     // independent of the AsyncWaitList::busy lock.
     bool try_push_condition(
+        PTO2TaskId task_token, uint64_t addr, uint32_t expected_value, uint32_t engine, int32_t completion_type
+    ) {
+        return try_push_condition(task_token, addr, 0, expected_value, engine, completion_type);
+    }
+
+    bool try_push_condition(
         PTO2TaskId task_token, uint64_t addr, uint64_t backend_cookie, uint32_t expected_value, uint32_t engine,
         int32_t completion_type
     ) {
