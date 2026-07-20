@@ -107,31 +107,24 @@ static uint64_t g_orch_insert_cycle = 0;     // tensormap insert
 static uint64_t g_orch_fanin_cycle = 0;      // fanin list + early-return check
 static uint64_t g_orch_scope_end_cycle = 0;  // scope_end overhead
 static int64_t g_orch_submit_count = 0;
-static uint32_t g_orch_submit_idx = 0;
 uint64_t g_orch_alloc_wait_cycle = 0;
 uint64_t g_orch_fanin_wait_cycle = 0;
 uint64_t g_orch_alloc_atomic_count = 0;
 uint64_t g_orch_args_atomic_count = 0;
 uint64_t g_orch_scope_end_atomic_count = 0;
-// Cycle accumulation feeds the per-sub-step `g_orch_*_cycle` cumulatives
-// printed in the cold-path log. Per-sub-step swim-lane phase records were
-// dropped; the per-submit envelope record (CYCLE_COUNT_ORCH_SUBMIT_RECORD)
-// is the only swim-lane emit on the orch path.
-#define CYCLE_COUNT_START()                                                        \
-    bool _prof_active = (orch->l2_swimlane_level >= L2SwimlaneLevel::ORCH_PHASES); \
-    uint64_t _t0 = get_sys_cnt_aicpu(), _t1;                                       \
-    uint64_t _submit_start_ts = _t0
+// Cycle accumulation is unconditional under SIMPLER_ORCH_PROFILING (that's what
+// the flag is for) and feeds the per-sub-step `g_orch_*_cycle` cumulatives
+// printed in the cold-path log.
+//
+// Orch swim-lane records are emitted per orchestration scope (begin_scope /
+// end_scope), one span per scope at nesting depth <= kOrchPhaseScopeDepth. The
+// per-sub-step cumulatives (g_orch_*_cycle) below are independent of that emit.
+#define CYCLE_COUNT_START() uint64_t _t0 = get_sys_cnt_aicpu(), _t1
 #define CYCLE_COUNT_LAP(acc)       \
     do {                           \
         _t1 = get_sys_cnt_aicpu(); \
         acc += (_t1 - _t0);        \
         _t0 = _t1;                 \
-    } while (0)
-#define CYCLE_COUNT_ORCH_SUBMIT_RECORD(tid)                                                       \
-    do {                                                                                          \
-        if (_prof_active) {                                                                       \
-            l2_swimlane_aicpu_record_orch_phase(_submit_start_ts, _t1, (tid), g_orch_submit_idx); \
-        }                                                                                         \
     } while (0)
 #elif SIMPLER_DFX
 #include "aicpu/device_time.h"
@@ -139,26 +132,26 @@ uint64_t g_orch_scope_end_atomic_count = 0;
 __attribute__((weak, visibility("hidden"))) uint64_t get_sys_cnt_aicpu() { return 0; }
 __attribute__((weak, visibility("hidden"))) void
 l2_swimlane_aicpu_record_orch_phase(uint64_t, uint64_t, uint64_t, uint32_t) {}
-// submit_idx needed for swimlane task_id tagging (no cycle accumulation at this level)
-static uint32_t g_orch_submit_idx = 0;
-#define CYCLE_COUNT_START()                                                        \
-    bool _prof_active = (orch->l2_swimlane_level >= L2SwimlaneLevel::ORCH_PHASES); \
-    uint64_t _t0 = _prof_active ? get_sys_cnt_aicpu() : 0, _t1 = 0;                \
-    uint64_t _submit_start_ts = _t0
+#define CYCLE_COUNT_START()
 #define CYCLE_COUNT_LAP(acc) \
     do {                     \
-    } while (0)
-#define CYCLE_COUNT_ORCH_SUBMIT_RECORD(tid)                                                       \
-    do {                                                                                          \
-        if (_prof_active) {                                                                       \
-            _t1 = get_sys_cnt_aicpu();                                                            \
-            l2_swimlane_aicpu_record_orch_phase(_submit_start_ts, _t1, (tid), g_orch_submit_idx); \
-        }                                                                                         \
     } while (0)
 #else
 #define CYCLE_COUNT_START()
 #define CYCLE_COUNT_LAP(acc)
-#define CYCLE_COUNT_ORCH_SUBMIT_RECORD(tid)
+#endif
+
+#if SIMPLER_DFX
+// Deepest scope nesting level that emits an orch phase record (0 = outermost).
+// Nearly all scopes nest deeper, so a shallow cap bounds the per-run record
+// count — the dominant orchestrator-capture cost — to the semantic scopes.
+static constexpr int32_t kOrchPhaseScopeDepth = 1;
+// Per-depth scope-open timestamp, paired into a record at end_scope.
+static uint64_t g_orch_scope_start_ts[PTO2_MAX_SCOPE_DEPTH] = {};
+static uint32_t g_orch_scope_rec_idx = 0;
+static_assert(
+    kOrchPhaseScopeDepth < PTO2_MAX_SCOPE_DEPTH, "kOrchPhaseScopeDepth is the deepest index into g_orch_scope_start_ts"
+);
 #endif
 
 static int32_t orch_mark_fatal(PTO2OrchestratorState *orch, int32_t error_code) {
@@ -590,6 +583,9 @@ void PTO2OrchestratorState::begin_scope(PTO2ScopeMode mode) {
         orch->manual_begin_depth = orch->scope_stack_top;
     }
 #if SIMPLER_DFX
+    if (orch->scope_stack_top <= kOrchPhaseScopeDepth && orch->l2_swimlane_level >= L2SwimlaneLevel::ORCH_PHASES) {
+        g_orch_scope_start_ts[orch->scope_stack_top] = get_sys_cnt_aicpu();
+    }
     // Gate via is_scope_stats_enabled() (weak-false in host builds) BEFORE the
     // collector call: when disabled we pay nothing. Sample the current ring's
     // task/heap start-end and tensormap usage at the scope boundary.
@@ -633,6 +629,15 @@ void PTO2OrchestratorState::end_scope() {
         scope_stats_end(
             ring_id, alloc.task_tail(), alloc.task_head(), alloc.heap_tail(), alloc.heap_top(), dep_pool_tail,
             dep_pool_top, orch->tensor_map.current_used()
+        );
+    }
+#endif
+
+#if SIMPLER_DFX
+    if (orch->scope_stack_top <= kOrchPhaseScopeDepth && orch->l2_swimlane_level >= L2SwimlaneLevel::ORCH_PHASES) {
+        l2_swimlane_aicpu_record_orch_phase(
+            g_orch_scope_start_ts[orch->scope_stack_top], get_sys_cnt_aicpu(),
+            static_cast<uint64_t>(orch->scope_stack_top), g_orch_scope_rec_idx++
         );
     }
 #endif
@@ -996,14 +1001,12 @@ static TaskOutputTensors submit_task_common(
     }
 
     CYCLE_COUNT_LAP(g_orch_fanin_cycle);
-    CYCLE_COUNT_ORCH_SUBMIT_RECORD(task_id.raw);
 
 #if SIMPLER_DFX
     orch->tasks_submitted++;
 #if SIMPLER_ORCH_PROFILING
     g_orch_submit_count++;
 #endif
-    g_orch_submit_idx++;
 #endif
     return result;
 }
@@ -1190,14 +1193,12 @@ TaskOutputTensors PTO2OrchestratorState::alloc_tensors(const L0TaskArgs &args) {
     orch->inline_completed_tasks++;
 
     CYCLE_COUNT_LAP(g_orch_fanin_cycle);
-    CYCLE_COUNT_ORCH_SUBMIT_RECORD(prepared.task_id.raw);
 
 #if SIMPLER_DFX
     orch->tasks_submitted++;
 #if SIMPLER_ORCH_PROFILING
     g_orch_submit_count++;
 #endif
-    g_orch_submit_idx++;
 #endif
 
     return outputs;
@@ -1226,9 +1227,6 @@ void PTO2OrchestratorState::mark_done() {
     orch->scope_tasks_size = 0;
     orch->scope_stack_top = -1;
     orch->manual_begin_depth = PTO2_MAX_SCOPE_DEPTH;
-#if !SIMPLER_ORCH_PROFILING && SIMPLER_DFX
-    g_orch_submit_idx = 0;
-#endif
 }
 
 #if SIMPLER_ORCH_PROFILING
@@ -1253,7 +1251,6 @@ PTO2OrchProfilingData orchestrator_get_profiling() {
     g_orch_lookup_cycle = g_orch_insert_cycle = 0;
     g_orch_fanin_cycle = g_orch_scope_end_cycle = 0;
     g_orch_submit_count = 0;
-    g_orch_submit_idx = 0;
     g_orch_alloc_wait_cycle = 0;
     g_orch_fanin_wait_cycle = 0;
     g_orch_alloc_atomic_count = 0;
