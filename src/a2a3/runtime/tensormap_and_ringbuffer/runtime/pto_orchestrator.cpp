@@ -390,6 +390,7 @@ void PTO2OrchestratorState::wire_fanin_task(PTO2TaskSlotState &slot_state, int32
     slot_state.fanin_count = wfanin + 1;
 
     int32_t early_finished = 0;
+    int32_t early_propagated = 0;
     bool early_disqualified = false;
     for_each_fanin_slot_state(*payload, [&](PTO2TaskSlotState *producer) {
         producer->lock_fanout();
@@ -401,15 +402,26 @@ void PTO2OrchestratorState::wire_fanin_task(PTO2TaskSlotState &slot_state, int32
             early_finished++;
         } else {
             producer->fanout_head = rss.dep_pool.prepend(producer->fanout_head, &slot_state);
+            // The marker shares fanout_lock with propagation's snapshot. A set
+            // marker means this edge is outside that snapshot and needs a seed.
+            if (producer->payload->dispatch_propagated.load(std::memory_order_acquire) != 0) {
+                early_propagated++;
+            }
         }
         producer->unlock_fanout();
     });
 
-    // Pre-completed producers will not dispatch again. Seed dispatch_fanin only
-    // when every producer is codegen-flagged; one unflagged producer makes the
-    // direct-only early-dispatch candidate count unreachable by design.
-    if (!early_disqualified && early_finished != 0) {
-        payload->dispatch_fanin.fetch_add(early_finished, std::memory_order_acq_rel);
+    // Completed producers and edges outside a producer's one-shot propagation
+    // snapshot both need wiring-time contributions. Seed only when every
+    // producer is codegen-flagged; one unflagged producer disqualifies the task.
+    int32_t early_seed = early_finished + early_propagated;
+    if (!early_disqualified && early_seed != 0) {
+        int32_t dispatch_fanin = payload->dispatch_fanin.fetch_add(early_seed, std::memory_order_acq_rel) + early_seed;
+        // A fully pre-completed fanin routes normally. If any producer was live,
+        // the exact-full increment must enqueue the early candidate.
+        if (early_finished != payload->fanin_actual_count && dispatch_fanin == payload->fanin_actual_count) {
+            sched->try_enqueue_early_dispatch_candidate(slot_state);
+        }
     }
 
     int32_t init_rc = early_finished + 1;

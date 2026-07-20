@@ -668,11 +668,11 @@ block is not mistaken for a normal task).
 
 #### Early-candidate gate: producer must publish every block (deadlock avoidance)
 
-`propagate_dispatch_fanin` (the EARLY-source candidate trigger) no-ops until the producer is
-**fully published**: `published_block_count == logical_block_num`. Normal dispatch, regular
-early staging, and the sync drain increment this counter only after the claimed range's payloads
-and MMIO dispatch tokens are visible. A staged producer also waits for release and completion of
-its owned doorbell pass before exposing fanout.
+Producer-side `propagate_dispatch_fanin` no-ops until the producer is **fully published**:
+`published_block_count == logical_block_num`. Normal dispatch, regular early staging, and the
+sync drain increment this counter only after the claimed range's payloads and MMIO dispatch
+tokens are visible. A staged producer also waits for release and completion of its owned
+doorbell pass before exposing fanout.
 
 This is load-bearing: a flagged SPMD producer with more blocks than cores (for example, a
 50-block AIC projection on 24 AIC cores) dispatches in waves. If its first wave triggered a
@@ -682,6 +682,12 @@ never ring. Full publication is stronger than full reservation: every producer b
 reserved core slot and a launch-visible payload before a consumer can pre-occupy resources.
 `next_block_idx` records reservation progress; `published_block_count` independently establishes
 publication and early-candidate readiness.
+
+The producer's `dispatch_propagated` claim and fanout snapshot are serialized under
+`fanout_lock` with consumer wiring. An edge already in the snapshot is counted by scheduler
+propagation; wiring seeds an edge added after the claim and enqueues the consumer if that seed
+completes `dispatch_fanin`. This gives each eligible producer-consumer edge exactly one
+early-candidate contribution regardless of which side acquires the lock first.
 
 #### MIX per-core placement
 

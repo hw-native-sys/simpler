@@ -700,9 +700,9 @@ int32_t SchedulerContext::stage_consumer_blocks(
 // Early-dispatch analog of dispatch_shape: drain early_dispatch_queues[shape] and
 // pre-stage claimed block ranges onto this thread's `shape` cores for `phase`. IDLE
 // stages onto idle cores (RUNNING slot, gated); PENDING stages onto a running core's
-// gated pending slot. Candidates are pushed to the shape's queue EVENT-DRIVEN by
-// propagate_dispatch_fanin, so the shape is the queue index (no per-consumer
-// to_shape()). Returns the number of blocks staged.
+// gated pending slot. Producer propagation and late wiring push candidates to the
+// shape's queue when dispatch_fanin becomes complete, so the shape is the queue
+// index (no per-consumer to_shape()). Returns the number of blocks staged.
 int32_t
 SchedulerContext::early_dispatch_shape(int32_t thread_idx, PTO2ResourceShape shape, CoreTracker::DispatchPhase phase) {
     CoreTracker &tracker = core_trackers_[thread_idx];

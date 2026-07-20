@@ -386,6 +386,77 @@ TEST_F(WiringTest, EarlyDispatchWaitsForAllProducerBlocksPublished) {
     EXPECT_EQ(payload.dispatch_fanin.load(), payload.fanin_actual_count);
 }
 
+TEST_F(WiringTest, LateWiredFullyPublishedProducerStillSeedsEarlyDispatch) {
+    alignas(64) PTO2TaskSlotState producer, consumer;
+    alignas(64) PTO2TaskPayload consumer_payload;
+    memset(&consumer_payload, 0, sizeof(consumer_payload));
+    PTO2TaskDescriptor consumer_desc{};
+
+    init_slot(producer, PTO2_TASK_PENDING, 1, 1);
+    producer.allow_early_resolve = true;
+    sched.record_published_blocks(producer, producer.logical_block_num);
+    sched.propagate_dispatch_fanin(producer);
+    ASSERT_EQ(producer.payload->dispatch_propagated.load(), 1);
+
+    init_slot(consumer, PTO2_TASK_PENDING, 0, 1);
+    consumer_payload.fanin_actual_count = 1;
+    consumer_payload.fanin_inline_slot_states[0] = &producer;
+    consumer.payload = &consumer_payload;
+    consumer.task = &consumer_desc;
+
+    wire_fanin(consumer, 1);
+
+    EXPECT_EQ(consumer_payload.dispatch_fanin.load(), consumer_payload.fanin_actual_count);
+    EXPECT_EQ(consumer_payload.early_dispatch_state.load(), PTO2_EARLY_DISPATCH_STAGING);
+    auto shape = static_cast<int32_t>(consumer.active_mask.to_shape());
+    EXPECT_EQ(sched.early_dispatch_queues[shape].pop(), &consumer);
+    EXPECT_NE(producer.fanout_head, nullptr);
+}
+
+TEST_F(WiringTest, WiringSeedEnqueuesAfterConcurrentPropagation) {
+    alignas(64) PTO2TaskSlotState producers[3], consumer;
+    alignas(64) PTO2TaskPayload consumer_payload;
+    memset(&consumer_payload, 0, sizeof(consumer_payload));
+    PTO2TaskDescriptor consumer_desc{};
+
+    init_slot(producers[0], PTO2_TASK_COMPLETED, 1, 1);
+    init_slot(producers[1], PTO2_TASK_PENDING, 1, 1);
+    init_slot(producers[2], PTO2_TASK_COMPLETED, 1, 1);
+    for (auto &producer : producers)
+        producer.allow_early_resolve = true;
+    sched.record_published_blocks(producers[1], producers[1].logical_block_num);
+
+    init_slot(consumer, PTO2_TASK_PENDING, 0, 1);
+    consumer_payload.fanin_actual_count = 3;
+    for (int i = 0; i < 3; i++)
+        consumer_payload.fanin_inline_slot_states[i] = &producers[i];
+    consumer.payload = &consumer_payload;
+    consumer.task = &consumer_desc;
+
+    producers[2].lock_fanout();
+    std::thread wiring([&]() {
+        wire_fanin(consumer, 3);
+    });
+
+    bool live_edge_wired = false;
+    while (!live_edge_wired) {
+        producers[1].lock_fanout();
+        live_edge_wired = producers[1].fanout_head != nullptr;
+        producers[1].unlock_fanout();
+        if (!live_edge_wired) std::this_thread::yield();
+    }
+
+    sched.propagate_dispatch_fanin(producers[1]);
+    EXPECT_EQ(consumer_payload.dispatch_fanin.load(), 1);
+    producers[2].unlock_fanout();
+    wiring.join();
+
+    EXPECT_EQ(consumer_payload.dispatch_fanin.load(), consumer_payload.fanin_actual_count);
+    EXPECT_EQ(consumer_payload.early_dispatch_state.load(), PTO2_EARLY_DISPATCH_STAGING);
+    auto shape = static_cast<int32_t>(consumer.active_mask.to_shape());
+    EXPECT_EQ(sched.early_dispatch_queues[shape].pop(), &consumer);
+}
+
 TEST_F(WiringTest, ConcurrentBlockRangeClaimsDoNotOverlap) {
     alignas(64) PTO2TaskSlotState task_slot;
     init_slot(task_slot, PTO2_TASK_PENDING, 1, 1);
