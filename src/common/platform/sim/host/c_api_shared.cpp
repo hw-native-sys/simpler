@@ -51,7 +51,7 @@ extern "C" {
  * Runtime Implementation Functions (defined in runtime_maker.cpp)
  * =========================================================================== */
 int register_callable_impl(const ChipCallable *callable, uint64_t (*upload_fn)(const void *), CallableArtifacts *out);
-int validate_runtime_impl(Runtime *runtime, const HostApi *api);
+int validate_runtime_impl(Runtime *runtime, const HostApi *api, int execution_rc);
 
 /* ===========================================================================
  * Per-thread DeviceRunner binding
@@ -550,9 +550,9 @@ int simpler_run(
         }
         if (rc != 0) {
             r->set_gm_sm_ptr(nullptr);
-            validate_runtime_impl(r, &g_host_api);
+            int validation_rc = validate_runtime_impl(r, &g_host_api, rc);
             pthread_setspecific(g_runner_key, nullptr);
-            return rc;
+            return validation_rc != 0 ? validation_rc : rc;
         }
 
         {
@@ -562,14 +562,14 @@ int simpler_run(
             rc = runner->run(*r, *config);
         }
         if (rc != 0) {
-            validate_runtime_impl(r, &g_host_api);
+            int validation_rc = validate_runtime_impl(r, &g_host_api, rc);
             pthread_setspecific(g_runner_key, nullptr);
-            return rc;
+            return validation_rc != 0 ? validation_rc : rc;
         }
 
         {
             STRACE("simpler_run.validate");
-            rc = validate_runtime_impl(r, &g_host_api);
+            rc = validate_runtime_impl(r, &g_host_api, 0);
         }
         pthread_setspecific(g_runner_key, nullptr);
         emit_device_phase_markers(runner);

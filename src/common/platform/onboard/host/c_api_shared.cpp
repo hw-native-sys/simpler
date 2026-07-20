@@ -56,7 +56,7 @@ extern "C" {
  * Runtime Implementation Functions (defined in each runtime's runtime_maker.cpp)
  * =========================================================================== */
 int register_callable_impl(const ChipCallable *callable, uint64_t (*upload_fn)(const void *), CallableArtifacts *out);
-int validate_runtime_impl(Runtime *runtime, const HostApi *api);
+int validate_runtime_impl(Runtime *runtime, const HostApi *api, int execution_rc);
 
 /* ===========================================================================
  * Per-thread DeviceRunnerBase binding (set by simpler_register_callable / simpler_run)
@@ -594,8 +594,8 @@ int simpler_run(
         }
         if (rc != 0) {
             r->set_gm_sm_ptr(nullptr);
-            validate_runtime_impl(r, &g_host_api);
-            return rc;
+            int validation_rc = validate_runtime_impl(r, &g_host_api, rc);
+            return validation_rc != 0 ? validation_rc : rc;
         }
 
         {
@@ -605,13 +605,13 @@ int simpler_run(
             rc = runner->run(*r, *config);
         }
         if (rc != 0) {
-            validate_runtime_impl(r, &g_host_api);
-            return rc;
+            int validation_rc = validate_runtime_impl(r, &g_host_api, rc);
+            return validation_rc != 0 ? validation_rc : rc;
         }
 
         {
             STRACE("simpler_run.validate");
-            rc = validate_runtime_impl(r, &g_host_api);
+            rc = validate_runtime_impl(r, &g_host_api, 0);
         }
         // Device-domain phase markers: the AICPU subdivision of the on-NPU wall
         // (device_wall + preamble/so_load/graph_build/post_orch/orch/sched).

@@ -466,10 +466,11 @@ int bind_callable_to_runtime_impl(
  * 2. Frees device memory for recorded tensors
  * 3. Clears tensor pair state
  *
- * @param runtime  Pointer to Runtime
+ * @param runtime       Pointer to Runtime
+ * @param execution_rc  Status returned by DeviceRunner::run
  * @return 0 on success, -1 on failure
  */
-int validate_runtime_impl(Runtime *runtime, const HostApi *api) {
+int validate_runtime_impl(Runtime *runtime, const HostApi *api, int execution_rc) {
     if (runtime == nullptr) {
         LOG_ERROR("Runtime pointer is null");
         return -1;
@@ -487,15 +488,19 @@ int validate_runtime_impl(Runtime *runtime, const HostApi *api) {
     TensorPair *tensor_pairs = runtime->tensor_pairs_.data();
     int tensor_pair_count = static_cast<int>(runtime->tensor_pairs_.size());
 
-    for (int i = 0; i < tensor_pair_count; i++) {
-        const TensorPair &pair = tensor_pairs[i];
-        int copy_rc = api->copy_from_device(pair.host_ptr, pair.dev_ptr, pair.size);
-        if (copy_rc != 0) {
-            LOG_ERROR("Failed to copy tensor %d from device: %d", i, copy_rc);
-            rc = copy_rc;
-            // Continue with cleanup anyway
-        } else {
-            LOG_DEBUG("Tensor %d: %zu bytes copied to host", i, pair.size);
+    if (execution_rc != 0) {
+        LOG_WARN("Skipping tensor copy-back because execution failed (rc=%d)", execution_rc);
+    } else {
+        for (int i = 0; i < tensor_pair_count; i++) {
+            const TensorPair &pair = tensor_pairs[i];
+            int copy_rc = api->copy_from_device(pair.host_ptr, pair.dev_ptr, pair.size);
+            if (copy_rc != 0) {
+                LOG_ERROR("Failed to copy tensor %d from device: %d", i, copy_rc);
+                rc = copy_rc;
+                // Continue with cleanup anyway
+            } else {
+                LOG_DEBUG("Tensor %d: %zu bytes copied to host", i, pair.size);
+            }
         }
     }
 

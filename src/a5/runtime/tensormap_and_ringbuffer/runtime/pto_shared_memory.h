@@ -129,10 +129,10 @@ struct alignas(PTO2_ALIGN_SIZE) PTO2SharedMemoryHeader {
     // Total shared memory size (for validation)
     uint64_t total_size;
 
-    // Graph output for copy-back (set by orchestrator when using packed buffer)
-    // Host finalize copies from this address instead of dev_ptr when non-zero
-    std::atomic<uint64_t> graph_output_ptr;   // Address where final output was written (packed buffer)
-    std::atomic<uint64_t> graph_output_size;  // Size in bytes
+    // Reserved legacy packed-output metadata. Keep these zero and retain them
+    // only for shared-memory layout compatibility; host finalize ignores them.
+    std::atomic<uint64_t> graph_output_ptr;
+    std::atomic<uint64_t> graph_output_size;
 
     // === ERROR REPORTING ===
 

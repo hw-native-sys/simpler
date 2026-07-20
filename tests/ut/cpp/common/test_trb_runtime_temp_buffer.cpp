@@ -29,7 +29,9 @@
 
 #include "arg_direction.h"
 #include "common/host_api.h"
+#include "pto_runtime_status.h"
 #include "pto_runtime2_types.h"
+#include "pto_shared_memory.h"
 #include "runtime.h"
 #include "task_args.h"
 
@@ -38,7 +40,7 @@ extern "C" int bind_callable_to_runtime_impl(
     const ArgDirection *signature, int sig_count, const uint64_t *ring_task_window, const uint64_t *ring_heap,
     const uint64_t *ring_dep_pool
 );
-extern "C" int validate_runtime_impl(Runtime *runtime, const HostApi *api);
+extern "C" int validate_runtime_impl(Runtime *runtime, const HostApi *api, int execution_rc);
 
 namespace {
 
@@ -239,6 +241,71 @@ protected:
 
 }  // namespace
 
+TEST_F(TrbRuntimeTempBufferTest, SuccessfulValidateCopiesOnlyOutputTensor) {
+    fake_.reset();
+    Runtime runtime = make_runtime();
+    std::vector<uint8_t> output(64, 0);
+    ChipStorageTaskArgs args;
+    args.add_tensor(make_tensor(output));
+    ArgDirection signature[1] = {ArgDirection::OUT};
+
+    ASSERT_EQ(bind_runtime(runtime, api_, args, signature, 1), 0);
+    ASSERT_EQ(runtime.tensor_leases_.size(), 1u);
+    std::memset(runtime.tensor_leases_[0].dev_ptr, 0x2a, output.size());
+
+    // Legacy packed-output metadata is retained only for shared-memory layout
+    // compatibility. Finalization must copy from the tensor's own allocation.
+    std::vector<uint8_t> legacy_packed_output(output.size(), 0x7f);
+    auto *header = static_cast<PTO2SharedMemoryHeader *>(runtime.get_gm_sm_ptr());
+    ASSERT_NE(header, nullptr);
+    header->graph_output_ptr.store(reinterpret_cast<uint64_t>(legacy_packed_output.data()), std::memory_order_relaxed);
+    header->graph_output_size.store(legacy_packed_output.size(), std::memory_order_relaxed);
+
+    ASSERT_EQ(validate_runtime_impl(&runtime, &api_, 0), 0);
+    EXPECT_EQ(fake_.copy_from_count, 1);
+    EXPECT_TRUE(std::all_of(output.begin(), output.end(), [](uint8_t value) {
+        return value == 0x2a;
+    }));
+}
+
+TEST_F(TrbRuntimeTempBufferTest, FailedExecutionCopiesRuntimeStatus) {
+    fake_.reset();
+    Runtime runtime = make_runtime();
+    std::vector<uint8_t> output(64, 0);
+    ChipStorageTaskArgs args;
+    args.add_tensor(make_tensor(output));
+    ArgDirection signature[1] = {ArgDirection::OUT};
+
+    ASSERT_EQ(bind_runtime(runtime, api_, args, signature, 1), 0);
+    auto *header = static_cast<PTO2SharedMemoryHeader *>(runtime.get_gm_sm_ptr());
+    ASSERT_NE(header, nullptr);
+    header->orch_error_code.store(PTO2_ERROR_EXPLICIT_ORCH_FATAL, std::memory_order_relaxed);
+
+    EXPECT_EQ(validate_runtime_impl(&runtime, &api_, -1), -PTO2_ERROR_EXPLICIT_ORCH_FATAL);
+    EXPECT_EQ(fake_.copy_from_count, 1);
+}
+
+TEST_F(TrbRuntimeTempBufferTest, FailedExecutionWithoutDeviceStatusSkipsTensorCopyBack) {
+    fake_.reset();
+    Runtime runtime = make_runtime();
+    std::vector<uint8_t> output(64, 0);
+    ChipStorageTaskArgs args;
+    args.add_tensor(make_tensor(output));
+    ArgDirection signature[1] = {ArgDirection::OUT};
+
+    ASSERT_EQ(bind_runtime(runtime, api_, args, signature, 1), 0);
+    ASSERT_EQ(runtime.tensor_leases_.size(), 1u);
+    std::memset(runtime.tensor_leases_[0].dev_ptr, 0x2a, output.size());
+
+    // A stream/bind failure may happen before the device publishes a PTO2
+    // status. The one D2H is the diagnostic header; tensor data stays untouched.
+    EXPECT_EQ(validate_runtime_impl(&runtime, &api_, -1), 0);
+    EXPECT_EQ(fake_.copy_from_count, 1);
+    EXPECT_TRUE(std::all_of(output.begin(), output.end(), [](uint8_t value) {
+        return value == 0;
+    }));
+}
+
 // The retained buffer is malloc'd once for the run and sliced (not per-tensor
 // malloc'd); copies/memsets are unchanged from the fallback path.
 TEST_F(TrbRuntimeTempBufferTest, TemporaryBufferSlicesWithoutChangingCopies) {
@@ -254,9 +321,9 @@ TEST_F(TrbRuntimeTempBufferTest, TemporaryBufferSlicesWithoutChangingCopies) {
     EXPECT_EQ(fake_.device_malloc_count, 2);
     EXPECT_EQ(fake_.copy_to_count, 2);
     EXPECT_EQ(fake_.device_memset_count, 0);
-    ASSERT_EQ(validate_runtime_impl(&malloc_runtime, &malloc_api_), 0);
+    ASSERT_EQ(validate_runtime_impl(&malloc_runtime, &malloc_api_, 0), 0);
     EXPECT_EQ(fake_.device_free_count, 2);
-    EXPECT_EQ(fake_.copy_from_count, 2);
+    EXPECT_EQ(fake_.copy_from_count, 1);
 
     // Retained-buffer path: single device_malloc for the whole run (two
     // 64-byte tensors pack to 2 * 1024-aligned = 2048 bytes), sliced in place.
@@ -267,10 +334,10 @@ TEST_F(TrbRuntimeTempBufferTest, TemporaryBufferSlicesWithoutChangingCopies) {
     EXPECT_EQ(fake_.retained_size, align_up(64, kAlign) * 2);
     EXPECT_EQ(fake_.copy_to_count, 2);
     EXPECT_EQ(fake_.device_memset_count, 0);
-    ASSERT_EQ(validate_runtime_impl(&buffer_runtime, &api_), 0);
+    ASSERT_EQ(validate_runtime_impl(&buffer_runtime, &api_, 0), 0);
     // Retained buffer is NOT freed at end of run — it lives on the slot.
     EXPECT_EQ(fake_.device_free_count, 0);
-    EXPECT_EQ(fake_.copy_from_count, 2);
+    EXPECT_EQ(fake_.copy_from_count, 1);
     EXPECT_NE(fake_.retained_addr, nullptr);
 }
 
@@ -283,13 +350,13 @@ TEST_F(TrbRuntimeTempBufferTest, SecondSameShapeRunReusesRetainedBuffer) {
     fake_.reset();
     Runtime run1 = make_runtime();
     ASSERT_EQ(bind_runtime(run1, api_, args, signature, 2), 0);
-    ASSERT_EQ(validate_runtime_impl(&run1, &api_), 0);
+    ASSERT_EQ(validate_runtime_impl(&run1, &api_, 0), 0);
     EXPECT_EQ(fake_.device_malloc_count, 1);
     void *first_addr = fake_.retained_addr;
 
     Runtime run2 = make_runtime();
     ASSERT_EQ(bind_runtime(run2, api_, args, signature, 2), 0);
-    ASSERT_EQ(validate_runtime_impl(&run2, &api_), 0);
+    ASSERT_EQ(validate_runtime_impl(&run2, &api_, 0), 0);
     // Same shape → no new allocation, same retained buffer.
     EXPECT_EQ(fake_.device_malloc_count, 1);
     EXPECT_EQ(fake_.device_free_count, 0);
@@ -305,7 +372,7 @@ TEST_F(TrbRuntimeTempBufferTest, LargerRunGrowsSmallerRunKeepsBuffer) {
     ChipStorageTaskArgs small = make_args(small_in, small_out);
     Runtime run1 = make_runtime();
     ASSERT_EQ(bind_runtime(run1, api_, small, signature, 2), 0);
-    ASSERT_EQ(validate_runtime_impl(&run1, &api_), 0);
+    ASSERT_EQ(validate_runtime_impl(&run1, &api_, 0), 0);
     EXPECT_EQ(fake_.device_malloc_count, 1);
     EXPECT_EQ(fake_.retained_size, align_up(64, kAlign) * 2);
 
@@ -315,7 +382,7 @@ TEST_F(TrbRuntimeTempBufferTest, LargerRunGrowsSmallerRunKeepsBuffer) {
     ChipStorageTaskArgs big = make_args(big_in, big_out);
     Runtime run2 = make_runtime();
     ASSERT_EQ(bind_runtime(run2, api_, big, signature, 2), 0);
-    ASSERT_EQ(validate_runtime_impl(&run2, &api_), 0);
+    ASSERT_EQ(validate_runtime_impl(&run2, &api_, 0), 0);
     EXPECT_EQ(fake_.device_malloc_count, 2);
     EXPECT_EQ(fake_.device_free_count, 1);
     EXPECT_EQ(fake_.retained_size, align_up(4096, kAlign) * 2);
@@ -324,7 +391,7 @@ TEST_F(TrbRuntimeTempBufferTest, LargerRunGrowsSmallerRunKeepsBuffer) {
     // Smaller run again: retained buffer is big enough, no free/malloc.
     Runtime run3 = make_runtime();
     ASSERT_EQ(bind_runtime(run3, api_, small, signature, 2), 0);
-    ASSERT_EQ(validate_runtime_impl(&run3, &api_), 0);
+    ASSERT_EQ(validate_runtime_impl(&run3, &api_, 0), 0);
     EXPECT_EQ(fake_.device_malloc_count, static_cast<int>(after_grow_mallocs));
     EXPECT_EQ(fake_.device_free_count, 1);
     EXPECT_EQ(fake_.retained_size, align_up(4096, kAlign) * 2);
@@ -351,7 +418,7 @@ TEST_F(TrbRuntimeTempBufferTest, ChildMemoryIsPassThroughAndPureOutSkipsStaging)
     // runtime arena image upload that every bind performs.
     EXPECT_EQ(fake_.copy_to_count, 1);
     EXPECT_EQ(fake_.device_memset_count, 0);
-    ASSERT_EQ(validate_runtime_impl(&runtime, &api_), 0);
+    ASSERT_EQ(validate_runtime_impl(&runtime, &api_, 0), 0);
     EXPECT_EQ(fake_.device_free_count, 0);
 }
 

@@ -946,10 +946,11 @@ extern "C" int bind_callable_to_runtime_impl(
  * 2. Frees device memory for recorded tensors
  * 3. Clears tensor pair state
  *
- * @param runtime  Pointer to Runtime
+ * @param runtime       Pointer to Runtime
+ * @param execution_rc  Status returned by DeviceRunner::run
  * @return 0 on success, -1 on failure
  */
-extern "C" int validate_runtime_impl(Runtime *runtime, const HostApi *api) {
+extern "C" int validate_runtime_impl(Runtime *runtime, const HostApi *api, int execution_rc) {
     if (runtime == nullptr) {
         LOG_ERROR("Runtime pointer is null");
         return -1;
@@ -969,32 +970,23 @@ extern "C" int validate_runtime_impl(Runtime *runtime, const HostApi *api) {
 
     LOG_INFO_V0("Tensor pairs to process: %d", tensor_pair_count);
 
-    // PTO2: graph output may be in packed buffer
-    uint64_t graph_out_ptr = 0;
-    uint64_t graph_out_size = 0;
-    bool skip_tensor_copy_back = false;
+    bool skip_tensor_copy_back = execution_rc != 0;
     int32_t runtime_status = 0;
     PTO2SharedMemoryHeader host_header;
     memset(&host_header, 0, sizeof(host_header));
 
-    runtime_status = pto2_read_runtime_status(runtime, api, &host_header);
+    if (execution_rc != 0) {
+        runtime_status = pto2_read_runtime_status(runtime, api, &host_header);
+    }
     if (runtime_status != 0) {
         int32_t orch_error_code = host_header.orch_error_code.load(std::memory_order_relaxed);
         int32_t sched_error_code = host_header.sched_error_code.load(std::memory_order_relaxed);
         LOG_RUNTIME_FAILURE(orch_error_code, sched_error_code, runtime_status);
-        skip_tensor_copy_back = true;
-    } else {
-        graph_out_ptr = host_header.graph_output_ptr;
-        graph_out_size = host_header.graph_output_size;
-        if (graph_out_ptr != 0) {
-            LOG_INFO_V0("Graph output buffer: ptr=0x%" PRIx64 ", size=%" PRIu64, graph_out_ptr, graph_out_size);
-        }
     }
 
     if (skip_tensor_copy_back) {
-        LOG_WARN("Skipping tensor copy-back because PTO2 runtime reported fatal status");
+        LOG_WARN("Skipping tensor copy-back because execution failed (rc=%d)", execution_rc);
     } else {
-        bool first_output_tensor = true;
         for (int i = 0; i < tensor_pair_count; i++) {
             const TensorPair &pair = tensor_pairs[i];
 
@@ -1018,18 +1010,7 @@ extern "C" int validate_runtime_impl(Runtime *runtime, const HostApi *api) {
                 continue;
             }
 
-            void *src_ptr = pair.dev_ptr;
-            size_t copy_size = pair.size;
-
-            // Use graph_output_ptr for the first output tensor if available
-            if (first_output_tensor && graph_out_ptr != 0 && graph_out_size > 0) {
-                src_ptr = reinterpret_cast<void *>(static_cast<uintptr_t>(graph_out_ptr));
-                copy_size = static_cast<size_t>(graph_out_size);
-                LOG_INFO_V0("Using packed output buffer for tensor %d", i);
-                first_output_tensor = false;
-            }
-
-            int copy_rc = api->copy_from_device(pair.host_ptr, src_ptr, copy_size);
+            int copy_rc = api->copy_from_device(pair.host_ptr, pair.dev_ptr, pair.size);
             if (copy_rc != 0) {
                 LOG_ERROR("Failed to copy tensor %d from device: %d", i, copy_rc);
                 rc = copy_rc;
