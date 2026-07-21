@@ -59,7 +59,6 @@ extern "C" {
 int register_callable_impl(const ChipCallable *callable, uint64_t (*upload_fn)(const void *), CallableArtifacts *out);
 int validate_runtime_impl(Runtime *runtime, const HostApi *api, int execution_rc);
 int release_async_host_graph_pipeline(Runtime *runtime);
-__attribute__((weak)) int release_async_host_graph_prepare(Runtime * /*runtime*/) { return 0; }
 
 /* ===========================================================================
  * Per-thread DeviceRunnerBase binding (set by simpler_register_callable / simpler_run)
@@ -676,93 +675,6 @@ int select_arena_bank_ctx(DeviceContextHandle ctx, unsigned arena_bank) {
     if (ctx == NULL) return -1;
     try {
         return static_cast<DeviceRunnerBase *>(ctx)->select_arena_bank(arena_bank);
-    } catch (...) {
-        return -1;
-    }
-}
-
-int simpler_prepare_request(
-    DeviceContextHandle ctx, RuntimeHandle runtime, int32_t callable_id, const void *args, const CallConfig *config,
-    unsigned arena_bank
-) {
-    if (ctx == NULL || runtime == NULL || args == NULL || config == NULL) return -1;
-    DeviceRunnerBase *runner = static_cast<DeviceRunnerBase *>(ctx);
-    if (!runner->has_callable(callable_id) || runner->select_arena_bank(arena_bank) != 0) return -1;
-    auto arena_guard = RAIIScopeGuard([runner]() {
-        runner->select_arena_bank(0);
-    });
-
-    pthread_once(&g_runner_key_once, create_runner_key);
-    pthread_setspecific(g_runner_key, ctx);
-    auto tsd_guard = RAIIScopeGuard([]() {
-        pthread_setspecific(g_runner_key, nullptr);
-    });
-
-    STRACE_NEW_INV();
-    STRACE_SET_HID(runner->callable_hash(callable_id));
-    STRACE("simpler_prepare_request");
-    Runtime *r = nullptr;
-    try {
-        int rc = runner->attach_current_thread(runner->device_id());
-        if (rc != 0) return rc;
-        r = new (runtime) Runtime();
-        {
-            STRACE("simpler_prepare_request.bind");
-            rc = runner->bind_callable_to_runtime(
-                *r, callable_id, &g_host_api, args, config->runtime_env.ring_task_window, config->runtime_env.ring_heap,
-                config->runtime_env.ring_dep_pool
-            );
-        }
-        if (rc == 0) {
-            rc = release_async_host_graph_prepare(r);
-        }
-        if (rc != 0) {
-            r->set_gm_sm_ptr(nullptr);
-            validate_runtime_impl(r, &g_host_api);
-            r->~Runtime();
-        }
-        return rc;
-    } catch (...) {
-        if (r != nullptr) r->~Runtime();
-        return -1;
-    }
-}
-
-int simpler_execute_prepared(
-    DeviceContextHandle ctx, RuntimeHandle runtime, const CallConfig *config, unsigned arena_bank
-) {
-    if (ctx == NULL || runtime == NULL || config == NULL) return -1;
-    DeviceRunnerBase *runner = static_cast<DeviceRunnerBase *>(ctx);
-    if (runner->select_arena_bank(arena_bank) != 0) return -1;
-    auto arena_guard = RAIIScopeGuard([runner]() {
-        runner->select_arena_bank(0);
-    });
-
-    pthread_once(&g_runner_key_once, create_runner_key);
-    pthread_setspecific(g_runner_key, ctx);
-    auto tsd_guard = RAIIScopeGuard([]() {
-        pthread_setspecific(g_runner_key, nullptr);
-    });
-
-    STRACE_NEW_INV();
-    STRACE("simpler_execute_prepared");
-    Runtime *r = static_cast<Runtime *>(runtime);
-    auto runtime_guard = RAIIScopeGuard([r]() {
-        r->~Runtime();
-    });
-    try {
-        int rc = runner->attach_current_thread(runner->device_id());
-        if (rc == 0) {
-            STRACE("simpler_execute_prepared.runner_run");
-            rc = runner->run(*r, *config);
-        }
-        int validate_rc;
-        {
-            STRACE("simpler_execute_prepared.validate");
-            validate_rc = validate_runtime_impl(r, &g_host_api);
-        }
-        emit_device_phase_markers(runner);
-        return rc != 0 ? rc : validate_rc;
     } catch (...) {
         return -1;
     }

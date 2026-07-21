@@ -1011,7 +1011,7 @@ public:
         return true;
     }
 
-    bool release_for_prepare() {
+    bool open_run_gate() {
         int32_t expected = 0;
         if (!run_gate_state_.compare_exchange_strong(
                 expected, 1, std::memory_order_release, std::memory_order_acquire
@@ -1019,12 +1019,12 @@ public:
             return expected == 1;
         }
         run_gate_cv_.notify_one();
-        LOG_INFO_V9("host-orch: async worker released for Host preparation");
+        LOG_INFO_V9("host-orch: async worker run gate opened");
         return true;
     }
 
     bool release_for_run() {
-        if (!release_for_prepare()) return false;
+        if (!open_run_gate()) return false;
         int32_t expected = 0;
         if (!publish_gate_state_.compare_exchange_strong(
                 expected, 1, std::memory_order_release, std::memory_order_acquire
@@ -1471,14 +1471,6 @@ extern "C" int release_async_host_graph_pipeline(Runtime *runtime) {
     if (job == nullptr) return 0;
     runtime->set_host_orch_job(job);
     return job->release_for_run() ? 0 : -1;
-}
-
-extern "C" int release_async_host_graph_prepare(Runtime *runtime) {
-    if (runtime == nullptr) return -1;
-    auto *job = static_cast<HostGraphAsyncJob *>(runtime->take_host_orch_job());
-    if (job == nullptr) return 0;
-    runtime->set_host_orch_job(job);
-    return job->release_for_prepare() ? 0 : -1;
 }
 
 /**

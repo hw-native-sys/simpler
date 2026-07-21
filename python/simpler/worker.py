@@ -524,26 +524,6 @@ def _rewrite_blob_host_addrs(buf: memoryview, blob_off: int, ranges: list[tuple[
                 break
 
 
-def _prepared_request_id_from_blob(buf: memoryview, blob_off: int) -> int | None:
-    """Return the prepared request id encoded immediately before the token trailer."""
-    from .request_session import (  # noqa: PLC0415
-        HOST_GRAPH_PREPARED_REQUEST_MAGIC,
-        HOST_GRAPH_TOKEN_STREAM_MAGIC_VERSION,
-        HOST_GRAPH_TOKEN_STREAM_TRAILER_SCALARS,
-    )
-
-    tensor_count, scalar_count = struct.unpack_from("<ii", buf, blob_off)
-    prepared_and_stream_scalars = 2 + HOST_GRAPH_TOKEN_STREAM_TRAILER_SCALARS
-    if tensor_count < 0 or scalar_count < prepared_and_stream_scalars:
-        return None
-    scalar_base = blob_off + _BLOB_HEADER_BYTES + tensor_count * _BLOB_TENSOR_STRIDE
-    marker_index = scalar_count - prepared_and_stream_scalars
-    marker, request_id, token_magic = struct.unpack_from("<QQQ", buf, scalar_base + marker_index * 8)
-    if marker != HOST_GRAPH_PREPARED_REQUEST_MAGIC or token_magic != HOST_GRAPH_TOKEN_STREAM_MAGIC_VERSION:
-        return None
-    return int(request_id)
-
-
 def _read_ctrl_staged_shm_name(buf: memoryview) -> str:
     """Decode the staged-payload shm name a broadcast_control_all left at _OFF_ARGS."""
     raw = bytes(buf[_OFF_ARGS : _OFF_ARGS + _CTRL_SHM_NAME_BYTES])
@@ -1276,107 +1256,6 @@ def _create_sim_l3_l2_region(
     return region, meta
 
 
-class _HostRequestAdmissionService:
-    def __init__(
-        self,
-        control_shm: SharedMemory,
-        cw: ChipWorker,
-        identity_table: dict[bytes, int],
-        host_buf_ranges: list[tuple[int, int, int]],
-    ) -> None:
-        from . import request_session as protocol  # noqa: PLC0415
-
-        self._protocol = protocol
-        self._control_shm = control_shm
-        self._cw = cw
-        self._identity_table = identity_table
-        self._host_buf_ranges = host_buf_ranges
-        buf = control_shm.buf
-        assert buf is not None
-        self._buf = buf
-        self._state_addr = _buffer_field_addr(self._buf, protocol.HOST_REQUEST_CONTROL_OFFSET)
-        self._stop = threading.Event()
-        self._thread = threading.Thread(target=self._loop, name="simpler-host-request-admission", daemon=True)
-
-    def start(self) -> None:
-        _mailbox_store_i32(self._state_addr, self._protocol._HOST_REQUEST_STATE_IDLE)
-        self._thread.start()
-
-    def stop(self) -> None:
-        self._stop.set()
-        self._thread.join()
-        self._buf.release()
-
-    def _loop(self) -> None:
-        protocol = self._protocol
-        while not self._stop.is_set():
-            if _mailbox_load_i32(self._state_addr) != protocol._HOST_REQUEST_STATE_READY:
-                time.sleep(0.00005)
-                continue
-            _mailbox_store_i32(self._state_addr, protocol._HOST_REQUEST_STATE_RUNNING)
-            fields = protocol._HOST_REQUEST_HEADER.unpack_from(self._buf, protocol.HOST_REQUEST_CONTROL_OFFSET)
-            _state, cmd, request_id, _response_id, _status, arena_bank, config_size, blob_size, reserved = fields
-            status = 0
-            response_id = request_id
-            message = ""
-            try:
-                if reserved != 0:
-                    raise RuntimeError("Host request admission reserved field must be zero")
-                if cmd != protocol._HOST_REQUEST_CMD_PREPARE:
-                    raise RuntimeError(f"unknown Host request admission command {cmd}")
-                digest_start = protocol.HOST_REQUEST_CONTROL_OFFSET + protocol._HOST_REQUEST_DIGEST_OFFSET
-                digest = bytes(self._buf[digest_start : digest_start + protocol._HOST_REQUEST_DIGEST_BYTES])
-                cid = self._identity_table.get(digest)
-                if cid is None:
-                    raise RuntimeError(f"Host request callable hash {_format_digest(digest)} is not registered")
-                config_offset = protocol._HOST_REQUEST_PAYLOAD_OFFSET
-                args_offset = (config_offset + int(config_size) + 7) & ~7
-                if (
-                    config_size <= 0
-                    or blob_size <= 0
-                    or args_offset + int(blob_size) > protocol.HOST_REQUEST_CONTROL_BYTES
-                ):
-                    raise RuntimeError("Host request control payload is out of bounds")
-                absolute_blob_off = protocol.HOST_REQUEST_CONTROL_OFFSET + args_offset
-                if self._host_buf_ranges:
-                    _rewrite_blob_host_addrs(self._buf, absolute_blob_off, self._host_buf_ranges)
-                base_addr = _buffer_field_addr(self._buf, protocol.HOST_REQUEST_CONTROL_OFFSET)
-                self._cw._impl.prepare_from_request_blob(
-                    int(request_id),
-                    int(cid),
-                    base_addr + args_offset,
-                    int(blob_size),
-                    base_addr + config_offset,
-                    int(config_size),
-                    int(arena_bank),
-                )
-            except Exception as exc:  # noqa: BLE001
-                status = 1
-                response_id = 0
-                message = _format_exc("Host request admission", exc)
-
-            error_start = protocol.HOST_REQUEST_CONTROL_OFFSET + protocol._HOST_REQUEST_ERROR_OFFSET
-            encoded = message.encode("utf-8", "replace")[: protocol._HOST_REQUEST_ERROR_BYTES - 1]
-            self._buf[error_start : error_start + protocol._HOST_REQUEST_ERROR_BYTES] = b"\x00" * (
-                protocol._HOST_REQUEST_ERROR_BYTES
-            )
-            self._buf[error_start : error_start + len(encoded)] = encoded
-            protocol._HOST_REQUEST_HEADER.pack_into(
-                self._buf,
-                protocol.HOST_REQUEST_CONTROL_OFFSET,
-                protocol._HOST_REQUEST_STATE_RUNNING,
-                cmd,
-                request_id,
-                response_id,
-                status,
-                arena_bank,
-                config_size,
-                blob_size,
-                0,
-            )
-            _mailbox_store_i32(self._state_addr, protocol._HOST_REQUEST_STATE_DONE)
-
-
 def _handle_ctrl_l3_l2_orch_comm_init(cw: ChipWorker, buf: memoryview) -> SharedMemory:
     control_shm_name = _read_shm_name(buf, _OFF_ARGS)
     control_shm = SharedMemory(name=control_shm_name)
@@ -1535,9 +1414,11 @@ def _comm_base_handle(cw: ChipWorker) -> int:
     return int(handle)
 
 
-def _ensure_prepared(run_workers, registry, prepared, cid: int, *, device_id: int) -> None:
-    if cid in prepared:
+def _ensure_registered(run_workers, registry, registered_callables, cid: int, *, device_id: int) -> None:
+    if cid in registered_callables:
         return
+    if not isinstance(run_workers, (list, tuple)):
+        run_workers = [run_workers]
     callable_obj = registry.get(cid)
     if callable_obj is None:
         raise RuntimeError(f"chip_process dev={device_id}: cid {cid} not in registry")
@@ -1553,7 +1434,7 @@ def _ensure_prepared(run_workers, registry, prepared, cid: int, *, device_id: in
             except Exception:  # noqa: BLE001
                 pass
         raise
-    prepared.add(cid)
+    registered_callables.add(cid)
 
 
 def _run_chip_main_loop(  # noqa: PLR0912, PLR0913, PLR0915 -- unified TASK_READY / CONTROL_REQUEST state machine
@@ -1581,16 +1462,14 @@ def _run_chip_main_loop(  # noqa: PLR0912, PLR0913, PLR0915 -- unified TASK_READ
     Returning a non-zero code overrides the kernel's success.
 
     TASK_READY carries a callable digest. The child resolves it to a
-    target-local slot and runs it. The slot must already be prepared: initial
-    startup-snapshot ChipCallables are prepared before INIT_READY (carried in via
-    ``prepared``), and callables registered dynamically after startup arrive via
-    ``_CTRL_PREPARE``. A TASK_READY for an unprepared slot is a control-flow
-    error and fails the task rather than lazily preparing it.
+    target-local slot and runs it. Startup-snapshot ChipCallables are registered
+    before INIT_READY (carried in via ``prepared``), while dynamic registrations
+    arrive through ``_CTRL_PREPARE``. A TASK_READY for an unregistered slot is a
+    control-flow error and fails the task rather than registering it lazily.
     """
-    prepared = prepared if prepared is not None else set()
+    registered_callables = prepared if prepared is not None else set()
     l3_l2_region_store = _L2HostL3L2RegionStore()
     l3_l2_control_shms: list[SharedMemory] = []
-    host_request_services: list[_HostRequestAdmissionService] = []
     # Post-fork host buffers mapped into this child. `host_buf_table`
     # owns the mmap per token (for unmap + teardown); `host_buf_ranges` is the
     # parent-VA → child-VA translation table the per-task blob rewrite consults,
@@ -1617,22 +1496,20 @@ def _run_chip_main_loop(  # noqa: PLR0912, PLR0913, PLR0915 -- unified TASK_READ
                 cid = identity_table.get(digest)
                 if cid is None:
                     raise RuntimeError(f"callable hash {_format_digest(digest)} not registered")
-                if cid not in prepared:
+                if cid not in registered_callables:
                     raise RuntimeError(
-                        f"chip_process dev={device_id}: cid {cid} not prepared before TASK_READY "
+                        f"chip_process dev={device_id}: cid {cid} not registered before TASK_READY "
                         f"(register via _CTRL_PREPARE first)"
                     )
                 blob_offset = frame_offset + _OFF_TASK_ARGS_BLOB
                 if host_buf_ranges:
                     _rewrite_blob_host_addrs(buf, blob_offset, host_buf_ranges)
                 cfg = _read_config_from_mailbox(buf, frame_offset)
-                prepared_request_id = _prepared_request_id_from_blob(buf, blob_offset)
-                if prepared_request_id is None:
-                    slot_worker._impl.run_from_blob(
-                        int(cid), mailbox_addr + blob_offset, _MAILBOX_ARGS_CAPACITY, cfg, slot_index
-                    )
-                else:
-                    slot_worker._impl.execute_prepared(prepared_request_id)
+                # Each slot has a dedicated DeviceRunner, so its private arena
+                # is bank 0. HostGraph's async thread does not inherit the
+                # caller's arena-bank TLS; selecting bank 1 here would split
+                # Host O and Device S across different arenas.
+                slot_worker._impl.run_from_blob(int(cid), mailbox_addr + blob_offset, _MAILBOX_ARGS_CAPACITY, cfg, 0)
             except Exception as e:  # noqa: BLE001
                 code = 1
                 msg = _format_exc(f"chip_process dev={device_id} slot={slot_index}", e)
@@ -1684,7 +1561,7 @@ def _run_chip_main_loop(  # noqa: PLR0912, PLR0913, PLR0915 -- unified TASK_READ
                             raise RuntimeError(
                                 f"prepare chip={device_id}: callable hash {_format_digest(digest)} not registered"
                             )
-                        _ensure_prepared(slot_workers, registry, prepared, int(cid), device_id=device_id)
+                        _ensure_registered(slot_workers, registry, registered_callables, int(cid), device_id=device_id)
                     elif sub_cmd == _CTRL_REGISTER:
                         digest = _read_control_digest(buf)
                         payload_size = struct.unpack_from("Q", buf, _CTRL_OFF_ARG0)[0]
@@ -1713,14 +1590,14 @@ def _run_chip_main_loop(  # noqa: PLR0912, PLR0913, PLR0915 -- unified TASK_READ
                                 )
                                 # Self-heal when a prior unregister popped the local
                                 # identity table but failed before clearing device
-                                # prepared state for the reusable private slot.
-                                if int(cid) in prepared:
+                                # registered state for the reusable private slot.
+                                if int(cid) in registered_callables:
                                     try:
                                         for slot_worker in slot_workers:
                                             slot_worker._unregister_slot(int(cid))
                                     except Exception:  # noqa: BLE001
                                         pass
-                                    prepared.discard(int(cid))
+                                    registered_callables.discard(int(cid))
                                 exported = ctypes.c_char.from_buffer(shm_buf)
                                 try:
                                     addr = ctypes.addressof(exported)
@@ -1738,7 +1615,7 @@ def _run_chip_main_loop(  # noqa: PLR0912, PLR0913, PLR0915 -- unified TASK_READ
                                         raise
                                 finally:
                                     del exported
-                                prepared.add(int(cid))
+                                registered_callables.add(int(cid))
                         finally:
                             shm_buf.release()
                             # Release the local mmap as soon as prepare returns;
@@ -1751,7 +1628,7 @@ def _run_chip_main_loop(  # noqa: PLR0912, PLR0913, PLR0915 -- unified TASK_READ
                         if removed and cid is not None:
                             for slot_worker in slot_workers:
                                 slot_worker._unregister_slot(int(cid))
-                            prepared.discard(int(cid))
+                            registered_callables.discard(int(cid))
                     elif sub_cmd == _CTRL_ALLOC_DOMAIN:
                         _handle_ctrl_alloc_domain(cw, buf)
                     elif sub_cmd == _CTRL_RELEASE_DOMAIN:
@@ -1760,12 +1637,7 @@ def _run_chip_main_loop(  # noqa: PLR0912, PLR0913, PLR0915 -- unified TASK_READ
                         _handle_ctrl_comm_init(cw, buf)
                     elif sub_cmd == _CTRL_L3_L2_ORCH_COMM_INIT:
                         control_shm = _handle_ctrl_l3_l2_orch_comm_init(cw, buf)
-                        admission_service = _HostRequestAdmissionService(
-                            control_shm, cw, identity_table, host_buf_ranges
-                        )
-                        admission_service.start()
                         l3_l2_control_shms.append(control_shm)
-                        host_request_services.append(admission_service)
                     elif sub_cmd == _CTRL_MAP_HOST:
                         _handle_ctrl_map_host(buf, host_buf_table, host_buf_ranges)
                     elif sub_cmd == _CTRL_UNMAP_HOST:
@@ -1794,11 +1666,6 @@ def _run_chip_main_loop(  # noqa: PLR0912, PLR0913, PLR0915 -- unified TASK_READ
         for thread in task_threads:
             thread.join()
         _sweep_l2_host_l3_l2_regions(l3_l2_region_store)
-        for service in reversed(host_request_services):
-            try:
-                service.stop()
-            except Exception:  # noqa: BLE001
-                pass
         if l3_l2_control_shms:
             try:
                 cw.l3_l2_orch_comm_shutdown()
@@ -1882,14 +1749,14 @@ def _chip_process_loop(  # noqa: PLR0913 -- fork-child entry: all context (bins,
     # Prepare every ChipCallable in the startup snapshot before publishing
     # INIT_READY, so the H2D upload + device-orch load is charged inside the
     # readiness barrier and the first task dispatch pays no upload. The set of
-    # prepared cids carries into the main loop, which requires a cid be prepared
+    # registered cids carry into the main loop, which requires a cid be registered
     # before it dispatches. The parent therefore issues no post-READY
     # control_prepare for the initial snapshot.
     prepared: set[int] = set()
     try:
         for cid, target in registry.items():
             if isinstance(target, ChipCallable):
-                _ensure_prepared(run_workers, registry, prepared, int(cid), device_id=device_id)
+                _ensure_registered(run_workers, registry, prepared, int(cid), device_id=device_id)
     except Exception as e:
         _tb.print_exc()
         _write_error(buf, 1, _format_exc(f"chip_process dev={device_id} prepare", e))
@@ -2351,7 +2218,6 @@ class Worker:
         self._l3_l2_orch_comm_ready: set[int] = set()
         self._l3_l2_orch_comm_shms: dict[int, SharedMemory] = {}
         self._l3_l2_orch_comm_clients: dict[int, Any] = {}
-        self._host_request_admission_clients: dict[int, Any] = {}
         self._live_l3_l2_regions: list[Any] = []
         self._l3_l2_orch_comm_host_buffers: dict[int, int] = {}
 
@@ -4876,9 +4742,6 @@ class Worker:
 
         self._l3_l2_orch_comm_shms[worker_id] = control_shm
         self._l3_l2_orch_comm_clients[worker_id] = client
-        from .request_session import HostRequestAdmissionClient  # noqa: PLC0415
-
-        self._host_request_admission_clients[worker_id] = HostRequestAdmissionClient(control_shm)
         self._l3_l2_orch_comm_ready.add(worker_id)
         return client
 
@@ -4890,32 +4753,6 @@ class Worker:
         device_ids = self._config.get("device_ids", [])
         if worker_id < 0 or worker_id >= len(device_ids):
             raise ValueError(f"create_l3_l2_region: worker_id {worker_id} outside [0, {len(device_ids)})")
-
-    def _prepare_host_request(
-        self,
-        worker_id: int,
-        request_id: int,
-        callable_handle,
-        args,
-        config,
-        arena_bank: int,
-        timeout: float,
-    ) -> None:
-        from .task_interface import TaskArgs  # noqa: PLC0415
-
-        if not isinstance(args, TaskArgs):
-            raise TypeError("Host request preparation expects TaskArgs")
-        state = self._resolve_handle(callable_handle, expected_namespace="LOCAL_CHIP")
-        self._stage_host_buffers_for_chip_submit(args)
-        self._ensure_l3_l2_orch_comm(worker_id)
-        self._host_request_admission_clients[worker_id].prepare(
-            request_id,
-            state.digest,
-            args,
-            config,
-            arena_bank=arena_bank,
-            timeout=timeout,
-        )
 
     def _l3_l2_orch_comm_submit(self, worker_id: int, request, timeout_s: float):
         client = self._ensure_l3_l2_orch_comm(int(worker_id))
@@ -5078,7 +4915,6 @@ class Worker:
                 pass
         self._live_l3_l2_regions.clear()
         self._l3_l2_orch_comm_clients.clear()
-        self._host_request_admission_clients.clear()
         self._l3_l2_orch_comm_ready.clear()
         self._l3_l2_orch_comm_host_buffers.clear()
         for shm in self._l3_l2_orch_comm_shms.values():

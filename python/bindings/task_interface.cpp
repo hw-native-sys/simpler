@@ -1475,39 +1475,6 @@ NB_MODULE(_task_interface, m) {
             "produced by `write_blob`; read_blob enforces capacity bounds against shm corruption."
         )
         .def(
-            "prepare_from_blob",
-            [](ChipWorker &self, uint64_t request_id, int32_t callable_id, uint64_t args_blob_ptr, size_t blob_capacity,
-               const CallConfig &config, unsigned arena_bank) {
-                TaskArgsView view = read_blob(reinterpret_cast<const uint8_t *>(args_blob_ptr), blob_capacity);
-                self.prepare(request_id, callable_id, view, config, arena_bank);
-            },
-            nb::arg("request_id"), nb::arg("callable_id"), nb::arg("args_blob_ptr"), nb::arg("blob_capacity"),
-            nb::arg("config"), nb::arg("arena_bank"), nb::call_guard<nb::gil_scoped_release>(),
-            "Bind a request and start Host work without launching Device execution."
-        )
-        .def(
-            "prepare_from_request_blob",
-            [](ChipWorker &self, uint64_t request_id, int32_t callable_id, uint64_t args_blob_ptr,
-               size_t args_blob_capacity, uint64_t config_blob_ptr, size_t config_blob_size, unsigned arena_bank) {
-                if (config_blob_ptr == 0 || config_blob_size != sizeof(CallConfig)) {
-                    throw std::runtime_error("prepare_from_request_blob: invalid CallConfig blob size");
-                }
-                CallConfig config;
-                std::memcpy(&config, reinterpret_cast<const void *>(config_blob_ptr), sizeof(config));
-                TaskArgsView view = read_blob(reinterpret_cast<const uint8_t *>(args_blob_ptr), args_blob_capacity);
-                self.prepare(request_id, callable_id, view, config, arena_bank);
-            },
-            nb::arg("request_id"), nb::arg("callable_id"), nb::arg("args_blob_ptr"), nb::arg("args_blob_capacity"),
-            nb::arg("config_blob_ptr"), nb::arg("config_blob_size"), nb::arg("arena_bank"),
-            nb::call_guard<nb::gil_scoped_release>(),
-            "Prepare a request from TaskArgs and CallConfig PODs stored in shared memory."
-        )
-        .def(
-            "execute_prepared", &ChipWorker::execute_prepared, nb::arg("request_id"),
-            nb::call_guard<nb::gil_scoped_release>(),
-            "Launch Device execution for a request previously prepared from the admission lane."
-        )
-        .def(
             "unregister_callable",
             [](ChipWorker &self, int32_t callable_id) {
                 self.unregister_callable(callable_id);

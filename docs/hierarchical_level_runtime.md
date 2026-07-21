@@ -311,5 +311,5 @@ device allocation algorithm.
 | `python/bindings/` | nanobind exposure of C++ engine to Python |
 | `python/simpler/worker.py` | Python `Worker` factory + lifecycle wrapper |
 
-For non-blocking request admission and Host O / Device S overlap on one L3
-Worker, see [Streaming Request Sessions](request-session.md).
+For bounded multi-flight request execution and per-request token streams on one
+L3 Worker, see [Streaming Request Sessions](request-session.md).

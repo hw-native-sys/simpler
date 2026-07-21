@@ -17,19 +17,17 @@
  *
  * Public API — resolved by ChipWorker via dlsym. Core lifecycle, memory,
  * registration, run, communication, and stream symbols are required from
- * every host_runtime.so. Split HostGraph request preparation is an optional
- * extension and is probed separately.
+ * every host_runtime.so.
  *   - lifecycle:    create_device_context, destroy_device_context,
  *                   simpler_init, finalize_device
  *   - sizing:       get_runtime_size
  *   - device-mem:   device_malloc_ctx, device_free_ctx,
  *                   copy_to_device_ctx, copy_from_device_ctx
- *   - prepared run: simpler_register_callable, simpler_run, unregister_callable,
+ *   - callable/run: simpler_register_callable, simpler_run, unregister_callable,
  *                   get_aicpu_dlopen_count, get_host_dlopen_count,
  *                   simpler_provision_dma_workspace
  *   - ACL/stream:   ensure_acl_ready_ctx, create_comm_stream_ctx,
  *                   destroy_comm_stream_ctx
- *   - optional:     simpler_prepare_request, simpler_execute_prepared
  *   - comm:         comm_init, comm_alloc_windows, comm_get_local_window_base,
  *                   comm_get_window_size, comm_barrier, comm_destroy
  *
@@ -211,16 +209,6 @@ int simpler_run(
 int select_arena_bank_ctx(DeviceContextHandle ctx, unsigned arena_bank);
 
 /** Bind one request and start its Host work without launching Device S. */
-int simpler_prepare_request(
-    DeviceContextHandle ctx, RuntimeHandle runtime, int32_t callable_id, const void *args, const CallConfig *config,
-    unsigned arena_bank
-);
-
-/** Launch Device S for a Runtime previously prepared by simpler_prepare_request. */
-int simpler_execute_prepared(
-    DeviceContextHandle ctx, RuntimeHandle runtime, const CallConfig *config, unsigned arena_bank
-);
-
 /**
  * Drop the prepared state for `callable_id` and release the per-id share of
  * the device orch SO buffer. The buffer itself is freed only when its

@@ -156,7 +156,7 @@ containing two fixed-size task frames. Slot generation identifies frame reuse;
 the protocol magic/version rejects mismatched parent and child layouts. An
 onboard a2a3 HostGraph child owns two long-lived task threads. Each thread has
 its own `ChipWorker`/`DeviceRunner`, Runtime storage, streams, kernel arguments,
-diagnostic collectors, and fixed arena bank. This isolates complete run state
+diagnostic collectors, and private device arena. This isolates Host run state
 instead of making `DeviceRunnerBase`'s mutable launch state concurrent.
 The Python facade forks one child per mailbox **before**
 `WorkerManager::start()` (so the parent has only the Python main thread when
@@ -228,7 +228,7 @@ Control commands remain exclusive with task frames. Request-session resources
 that require control operations, such as L3-L2 message regions, must therefore
 be created before the first device task is published. The two-flight hardware
 test creates both token queues before request A submits its task; request B then
-uses its prepared queue without draining A.
+reuses its existing queue without draining A.
 
 ### 3.3 Mailbox layout
 

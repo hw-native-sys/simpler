@@ -120,15 +120,10 @@ def parse_log(log: Path) -> tuple[dict[int, list[dict]], list[dict], list[dict],
 
 def map_host_invocations(spans: dict[int, list[dict]], request_ids: list[int]) -> dict[int, int]:
     normal_invs = [inv for inv, values in spans.items() if any(span["name"] == "simpler_run" for span in values)]
-    prepare_invs = [
-        inv for inv, values in spans.items() if any(span["name"] == "simpler_prepare_request" for span in values)
-    ]
-    prepare_invs.sort(
-        key=lambda inv: next(span["ts"] for span in spans[inv] if span["name"] == "simpler_prepare_request")
-    )
-    if len(normal_invs) != 1 or len(prepare_invs) != len(request_ids) - 1:
-        raise ValueError("log must contain one normal run and one Host prepare invocation per later request")
-    return dict(zip(request_ids, [normal_invs[0], *prepare_invs]))
+    normal_invs.sort(key=lambda inv: next(span["ts"] for span in spans[inv] if span["name"] == "simpler_run"))
+    if len(normal_invs) != len(request_ids):
+        raise ValueError("log must contain one complete simpler_run invocation per request")
+    return dict(zip(request_ids, normal_invs))
 
 
 def complete(

@@ -26,6 +26,7 @@
 #include <cstddef>
 #include <cstring>
 #include <iostream>
+#include <mutex>
 #include <string>
 #include <vector>
 #include "acl/acl.h"
@@ -74,6 +75,11 @@ extern "C" __attribute__((weak, visibility("hidden"))) int release_async_host_gr
 
 namespace {
 void *g_hal_handle = nullptr;
+
+// The resident AICPU runtime owns process-global executor, affinity, register,
+// and diagnostic state. HostGraph runners may build concurrently, but their
+// Device S phases must not enter that runtime at the same time.
+std::mutex g_device_run_mutex;
 
 using HalHostRegisterFn = int (*)(void *dev_ptr, size_t size, unsigned int flags, int device_id, void **host_ptr);
 using HalHostUnregisterFn = int (*)(void *host_ptr, int device_id);
@@ -441,6 +447,12 @@ int DeviceRunner::run(Runtime &runtime, const CallConfig &config) {
         LOG_ERROR("release_async_host_graph_pipeline failed: %d", rc);
         return rc;
     }
+
+    // Keep Host O outside this gate: a later run can build and publish its
+    // first epoch while the current Device S is active. The gate begins only
+    // at device launch and remains held through stream synchronization and
+    // device-side collector teardown.
+    std::unique_lock<std::mutex> device_run_lock(g_device_run_mutex);
 
     // Launch the AICore worker BEFORE the AICPU Run task — mirrors the a5 path
     // so the two arches stay symmetric. First-launch latency optimization +
