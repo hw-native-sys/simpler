@@ -3836,6 +3836,14 @@ class Worker:
         if self.level >= 4 and device_ids:
             raise RuntimeError("Worker level >= 4 must use add_worker(); device_ids are only supported on L3 Workers")
 
+        # Only a worker that carries remote workers has a remote session to
+        # time out. Its remote_session_timeout_s is validated here, before any
+        # startup resource (mailbox shm, pre-fork _Worker mmap, child fork,
+        # daemon socket) exists, so an invalid value fails without a
+        # partially-built subtree to roll back.
+        if self._remote_worker_specs:
+            self._remote_session_timeout_s()
+
         # 1. Allocate sub-worker mailboxes (unified layout, MAILBOX_SIZE each).
         for _ in range(n_sub):
             shm = SharedMemory(create=True, size=MAILBOX_SIZE)
@@ -3896,6 +3904,8 @@ class Worker:
         failure propagates to init()'s single rollback, which closes every
         session recorded in ``self._remote_sessions``.
         """
+        if not self._remote_worker_specs:
+            return
         session_timeout = self._remote_session_timeout_s()
         for worker_id, spec in zip(self._remote_worker_ids, self._remote_worker_specs, strict=True):
             remaining = deadline - time.monotonic()

@@ -28,6 +28,7 @@ from unittest.mock import MagicMock
 import pytest
 import simpler.remote_l3_session as session_mod
 import simpler.remote_l3_worker as daemon_mod
+import simpler.worker as worker_mod
 from simpler.worker import RemoteWorkerSpec, Worker
 
 
@@ -97,6 +98,119 @@ class TestRemoteSideValidation:
     @pytest.mark.parametrize("mod", [session_mod, daemon_mod])
     def test_startup_remaining_used_when_present(self, mod):
         assert mod._startup_remaining_s({"startup_remaining_s": 8.0, "session_timeout_s": 30.0}) == 8.0
+
+
+class TestParentPreflightBeforeResources:
+    """An invalid remote_session_timeout_s fails before the parent builds any
+    startup resource — no mailbox shm, no pre-fork _Worker, ever constructed."""
+
+    @pytest.mark.parametrize("bad", [0.0, -1.0, float("inf"), float("nan")])
+    def test_invalid_timeout_creates_no_startup_resources(self, monkeypatch, bad):
+        shm_ctor = MagicMock(side_effect=AssertionError("SharedMemory constructed before timeout preflight"))
+        worker_ctor = MagicMock(side_effect=AssertionError("_Worker constructed before timeout preflight"))
+        monkeypatch.setattr(worker_mod, "SharedMemory", shm_ctor)
+        monkeypatch.setattr(worker_mod, "_Worker", worker_ctor)
+
+        w = Worker(level=4, num_sub_workers=1, remote_session_timeout_s=bad)
+        w.add_remote_worker(_spec())
+        try:
+            with pytest.raises(ValueError, match="remote_session_timeout_s"):
+                w._init_hierarchical()
+            assert shm_ctor.call_count == 0
+            assert worker_ctor.call_count == 0
+        finally:
+            w.close()
+
+    def test_no_remotes_does_not_validate_remote_timeout(self, monkeypatch):
+        # The preflight is gated on actual remote presence: a worker with no
+        # remote workers never validates remote_session_timeout_s (only a
+        # level >= 4 parent can carry remotes), so an unused/invalid value does
+        # not fail an otherwise-valid tree.
+        monkeypatch.setattr(worker_mod, "_Worker", MagicMock())
+        preflight = MagicMock(side_effect=AssertionError("remote timeout validated without any remote worker"))
+        monkeypatch.setattr(Worker, "_remote_session_timeout_s", preflight)
+
+        w = Worker(level=4, num_sub_workers=0, remote_session_timeout_s=-1.0)
+        try:
+            w._init_hierarchical()
+            assert preflight.call_count == 0
+        finally:
+            w._worker = None
+            w.close()
+
+    def test_activate_remote_sessions_no_remotes_is_noop(self, monkeypatch):
+        # With no remotes, activation returns before validating the timeout or
+        # touching the C++ Worker — the empty tree is a clean no-op.
+        preflight = MagicMock(side_effect=AssertionError("remote timeout validated with no remotes to activate"))
+        monkeypatch.setattr(Worker, "_remote_session_timeout_s", preflight)
+
+        w = Worker(level=4, num_sub_workers=0)
+        mock_worker = MagicMock()
+        w._worker = mock_worker
+        try:
+            w._activate_remote_sessions(time.monotonic() + 5.0)
+            assert preflight.call_count == 0
+            assert mock_worker.add_remote_l3_socket.call_count == 0
+            assert w._remote_sessions == []
+        finally:
+            w._worker = None
+            w.close()
+
+
+class TestDaemonPreflightBeforeSpawn:
+    """The daemon validates both numeric timeouts before any spawn resource —
+    ready pipe, manifest tempfile, runner Popen — is created."""
+
+    @staticmethod
+    def _manifest(**overrides) -> dict:
+        manifest = {
+            "session_id": 1,
+            "worker_id": 0,
+            "parent_worker_level": 4,
+            "remote_worker_level": 3,
+            "platform": "a2a3sim",
+            "transport": "sim",
+            "session_timeout_s": 30.0,
+            "startup_remaining_s": 10.0,
+        }
+        manifest.update(overrides)
+        return manifest
+
+    @pytest.mark.parametrize(
+        ("manifest_kwargs", "match"),
+        [
+            ({"session_timeout_s": 0.0}, "session_timeout_s"),
+            ({"session_timeout_s": -1.0}, "session_timeout_s"),
+            ({"session_timeout_s": float("inf")}, "session_timeout_s"),
+            ({"session_timeout_s": float("nan")}, "session_timeout_s"),
+            ({"startup_remaining_s": 0.0}, "startup_remaining_s"),
+            ({"startup_remaining_s": -1.0}, "startup_remaining_s"),
+            ({"startup_remaining_s": float("inf")}, "startup_remaining_s"),
+            ({"startup_remaining_s": float("nan")}, "startup_remaining_s"),
+        ],
+    )
+    def test_invalid_timeout_spawns_nothing(self, monkeypatch, manifest_kwargs, match):
+        pipe_mock = MagicMock(side_effect=AssertionError("os.pipe before timeout preflight"))
+        tempfile_mock = MagicMock(side_effect=AssertionError("NamedTemporaryFile before timeout preflight"))
+        popen_mock = MagicMock(side_effect=AssertionError("Popen before timeout preflight"))
+        monkeypatch.setattr(daemon_mod.os, "pipe", pipe_mock)
+        monkeypatch.setattr(daemon_mod.tempfile, "NamedTemporaryFile", tempfile_mock)
+        monkeypatch.setattr(daemon_mod.subprocess, "Popen", popen_mock)
+
+        with pytest.raises(ValueError, match=match):
+            daemon_mod._start_session(self._manifest(**manifest_kwargs))
+        assert pipe_mock.call_count == 0
+        assert tempfile_mock.call_count == 0
+        assert popen_mock.call_count == 0
+
+    def test_valid_session_timeout_but_invalid_startup_remaining_spawns_nothing(self, monkeypatch):
+        # A valid session_timeout_s must not shield an invalid startup_remaining_s
+        # from the pre-spawn gate.
+        popen_mock = MagicMock(side_effect=AssertionError("Popen before timeout preflight"))
+        monkeypatch.setattr(daemon_mod.subprocess, "Popen", popen_mock)
+        with pytest.raises(ValueError, match="startup_remaining_s"):
+            daemon_mod._start_session(self._manifest(session_timeout_s=30.0, startup_remaining_s=-1.0))
+        assert popen_mock.call_count == 0
 
 
 class TestActivationAfterFork:

@@ -143,6 +143,10 @@ def _reap_session_runner(proc: subprocess.Popen[Any]) -> None:
 
 def _start_session(manifest: dict[str, Any]) -> dict[str, Any]:
     _validate_manifest(manifest)
+    # Both numeric timeouts are validated before any spawn resource (ready pipe,
+    # manifest tempfile, runner Popen) exists: the runner is never launched only
+    # to die on an invalid session_timeout_s or startup_remaining_s.
+    _session_timeout_s(manifest)
     # The runner must publish ready within the parent's remaining startup budget,
     # not a fresh full command timeout.
     timeout_s = _startup_remaining_s(manifest)
