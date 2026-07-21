@@ -9,27 +9,14 @@
  * -----------------------------------------------------------------------------------------------------------
  */
 
-/**
- * PTO Submit Types - Shared submit-contract definitions
- *
- * Header-only definitions shared by orchestration-facing and runtime-facing
- * headers. Keeps orchestration slim (no dependency on pto_runtime2_types.h).
- */
-
 #pragma once
 
 #include <stdint.h>
 
 inline constexpr int32_t INVALID_KERNEL_ID = -1;
 
-/**
- * Subtask slot count: AIC, AIV0, AIV1
- */
 inline constexpr int32_t PTO2_SUBTASK_SLOT_COUNT = 3;
 
-/**
- * Subtask slot indices
- */
 enum class PTO2SubtaskSlot : uint8_t {
     AIC = 0,
     AIV0 = 1,
@@ -114,14 +101,8 @@ enum class PTO2ResourceShape : uint8_t {
     DUMMY = 3,  // Dependency-only (no AICore dispatch)
 };
 
-// Number of *dispatchable* resource shapes (AIC, AIV, MIX). DUMMY does not
-// allocate a per-shape ready_queue entry / local buffer — it lives in a
-// dedicated queue inside PTO2SchedulerState.
 inline constexpr int32_t PTO2_NUM_RESOURCE_SHAPES = 3;
 
-/**
- * Bitmask of active subtask slots + flags, sizeof == 1.
- */
 class ActiveMask {
 public:
     constexpr ActiveMask() = default;
@@ -173,12 +154,6 @@ private:
 
 static_assert(sizeof(ActiveMask) == 1, "ActiveMask must be exactly 1 byte");
 
-/**
- * Mixed-task submit contract.
- *
- * Each field holds either a valid kernel ID or INVALID_KERNEL_ID (inactive).
- * At least one slot must be valid.
- */
 struct MixedKernels {
     int32_t aic_kernel_id{INVALID_KERNEL_ID};
     int32_t aiv0_kernel_id{INVALID_KERNEL_ID};
@@ -193,13 +168,6 @@ struct MixedKernels {
     }
 };
 
-/**
- * SPMD launch parameters carried inside Arg.
- *
- * Controls how many logical blocks (SPMD dimension) a single task
- * is expanded into at dispatch time.  Each block receives a unique
- * block_idx in [0, block_num) via the per-dispatch LocalContext.
- */
 class PTO2LaunchSpec {
 public:
     constexpr PTO2LaunchSpec() = default;

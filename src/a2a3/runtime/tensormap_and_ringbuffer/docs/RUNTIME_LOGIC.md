@@ -446,7 +446,7 @@ The orchestrator completes fanout wiring before publishing a task to the ready q
    - Checks `task_state >= COMPLETED` (early-finished optimization)
    - If not completed: prepends consumer to producer's `fanout_head` via `dep_pool.prepend`
    - **Releases** `fanout_lock`
-3. Atomically releases the +1 redundance + completed-fanin count via `fanin_refcount.fetch_add`
+3. Atomically releases the +1 redundance + early_finished count via `fanin_refcount.fetch_add`
 4. If all deps satisfied: pushes task to the routed ready queue
 
 Zero-fanin tasks and tasks whose claimed producers are already completed skip dep_pool entry allocation and publish directly to the routed ready queue.
@@ -586,7 +586,7 @@ This is protected by a per-ring try-lock (`advance_lock`) in `RingSchedState`, e
 
 ### 8.5 SchedulerContext
 
-All scheduler-side state and methods live in `SchedulerContext` (`runtime/scheduler/scheduler_context.h`). It is held as a `sched_ctx_` member of `AicpuExecutor`; `AicpuExecutor` is a thin wrapper that owns the lifecycle atomics and the orchestration SO handle, and delegates everything else to `SchedulerContext`.
+All scheduler-side state and methods live in `SchedulerContext` (`runtime/scheduler_context.h`). It is held as a `sched_ctx_` member of `AicpuExecutor`; `AicpuExecutor` is a thin wrapper that owns the lifecycle atomics and the orchestration SO handle, and delegates everything else to `SchedulerContext`.
 
 Public surface (called from `AicpuExecutor::init/run/deinit`):
 
@@ -600,11 +600,7 @@ Public surface (called from `AicpuExecutor::init/run/deinit`):
 | `deinit()` | once per run | Reset every scheduler-owned field to its post-construction default |
 | Read-only accessors | various | `aic_count()` / `aiv_count()` / `is_completed()` / `completed_tasks_count()` |
 
-Private internals are split across three .cpp files by responsibility:
-
-- `scheduler_completion.cpp` — completion polling, drain protocol
-- `scheduler_dispatch.cpp` — task dispatch loop and helpers
-- `scheduler_cold_path.cpp` — exit checks, stall diagnostics, profiling, lifecycle (`pre_handshake_init` / `handshake_partition` / `post_handshake_init` / `deinit`), core management (`assign_cores_to_threads` / `emergency_shutdown`), and `on_orchestration_done`
+Private internals all live inline in `scheduler_context.h`, covering completion polling, drain protocol, task dispatch loop and helpers, exit checks, stall diagnostics, profiling, lifecycle (`init/deinit`), core management (`handshake_all_cores` / `assign_cores_to_threads` / `reassign_cores_for_all_threads` / `emergency_shutdown`), and `on_orchestration_done`.
 
 `AicpuExecutor` calls neither `handshake_*`, `assign_*`, `reassign_*`, nor `emergency_shutdown` directly — they are private, invoked only by `init` and `on_orchestration_done`.
 
@@ -683,13 +679,11 @@ reserved core slot and a launch-visible payload before a consumer can pre-occupy
 `next_block_idx` records reservation progress; `published_block_count` independently establishes
 publication and early-candidate readiness.
 
-The producer's slot-local dispatch-propagated bit in `lifecycle_flags` and fanout snapshot are
-serialized under `fanout_lock` with consumer wiring. Wiring already locks and reads the
-producer's 64-byte `PTO2TaskSlotState`, so testing this bit does not read a producer payload
-cache line. An edge already in the snapshot is counted by scheduler propagation; wiring seeds
-an edge added after the claim and enqueues the consumer if that seed completes
-`dispatch_fanin`. This gives each eligible producer-consumer edge exactly one early-candidate
-contribution regardless of which side acquires the lock first.
+The producer's `dispatch_propagated` claim and fanout snapshot are serialized under
+`fanout_lock` with consumer wiring. An edge already in the snapshot is counted by scheduler
+propagation; wiring seeds an edge added after the claim and enqueues the consumer if that seed
+completes `dispatch_fanin`. This gives each eligible producer-consumer edge exactly one
+early-candidate contribution regardless of which side acquires the lock first.
 
 #### MIX per-core placement
 

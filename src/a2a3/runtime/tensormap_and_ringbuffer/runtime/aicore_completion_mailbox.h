@@ -19,14 +19,6 @@
 #include "pto_constants.h"
 #include "pto_task_id.h"
 
-// AICPU-only MPSC ring used to convey deferred-completion observations from
-// FIN-handling scheduler threads to the dispatch thread. Producers push under
-// CAS on `head`; the single consumer (dispatch thread, under AsyncWaitList::
-// busy) drains in seq order. Kernel-side code never touches this struct —
-// AICore writes go into DeferredCompletionSlab (see
-// aicore_completion_mailbox_types.h), which the FIN thread reads, flattens
-// into messages here, and forwards.
-
 #define AICORE_COMPLETION_MAILBOX_CAPACITY 4096u
 #define AICORE_COMPLETION_MAILBOX_MASK (AICORE_COMPLETION_MAILBOX_CAPACITY - 1u)
 
@@ -46,15 +38,8 @@ static_assert(
 #define MSG_KIND_TASK_NORMAL_DONE 1u
 
 struct AICoreCompletionMailboxMessage {
-    // Per-slot ready flag. Producer publishes `tail+1` after filling the rest
-    // of the slot with a release store; consumer waits for the matching seq
-    // value with an acquire load. The release-acquire pair publishes all
-    // other fields below as a side effect, so they stay plain.
     std::atomic<uint64_t> seq;
     PTO2TaskId task_token;
-    // CONDITION: completion observation addr (counter / SDMA event record).
-    // TASK_NORMAL_DONE: PTO2TaskSlotState pointer carried over to the consumer
-    //   so it can finalize the AsyncWaitEntry.slot_state binding.
     uint64_t addr;
     uint32_t expected_value;
     uint32_t engine;
@@ -73,9 +58,6 @@ static_assert(
     "AICoreCompletionMailbox requires lock-free uint64_t atomics on every supported target"
 );
 
-// POD view of a drained message. `seq` is the ring's publication flag, not
-// payload, so try_pop copies out only the fields below (and seq is not even
-// copyable — it is a std::atomic).
 struct AICoreCompletionMsgView {
     PTO2TaskId task_token{PTO2TaskId::invalid()};
     uint64_t addr{0};
@@ -98,21 +80,6 @@ struct AICoreCompletionMailbox {
     // consumer lock; a stale answer only over/under-triggers a drain attempt.
     bool has_pending() { return tail.load(std::memory_order_acquire) < head.load(std::memory_order_acquire); }
 
-    // MPSC push for a CONDITION message. Returns false when the ring is full
-    // (head - tail >= CAPACITY); caller should SPIN_WAIT_HINT and retry.
-    // Lock-free: CAS the shared head to claim a slot, write the fields, then
-    // release-store seq so the single consumer observes the publication.
-    //
-    // The head CAS is relaxed: head is a pure ticket counter and carries no
-    // data to the consumer — publication is solely the seq release-store, and
-    // slot-reuse safety rests on the acquire load of tail. The relaxed failure
-    // order is likewise sufficient since a lost CAS just re-reads head and
-    // retries. compare_exchange_weak is used because this loop already re-reads
-    // head and re-checks fullness, so masking LL/SC spurious failures (what
-    // _strong adds on aarch64) would only be a redundant inner retry.
-    //
-    // Safe to call concurrently from any number of producers; structurally
-    // independent of the AsyncWaitList::busy lock.
     bool try_push_condition(
         PTO2TaskId task_token, uint64_t addr, uint32_t expected_value, uint32_t engine, int32_t completion_type
     ) {
@@ -136,9 +103,6 @@ struct AICoreCompletionMailbox {
         }
     }
 
-    // MPSC push for a TASK_NORMAL_DONE sentinel. Carries the PTO2TaskSlotState
-    // pointer in the `addr` field so the consumer can finish binding the
-    // AsyncWaitEntry.slot_state without going back to the FIN-handling thread.
     bool try_push_normal_done(PTO2TaskId task_token, uint64_t slot_state_addr) {
         while (true) {
             uint64_t h = head.load(std::memory_order_relaxed);
@@ -159,12 +123,6 @@ struct AICoreCompletionMailbox {
         }
     }
 
-    // Single-consumer transport-level dequeue (caller holds the consumer lock).
-    // Returns false at the first not-yet-published slot (gap) or when empty;
-    // otherwise copies the next message in tail order into `out`, advances
-    // tail, and returns true. tail is consumer-only-written (relaxed read);
-    // head bounds the scan (relaxed); the seq acquire is the real publication
-    // gate; the tail release publishes "slot free" to reusing producers.
     bool try_pop(AICoreCompletionMsgView &out) {
         uint64_t t = tail.load(std::memory_order_relaxed);
         uint64_t h = head.load(std::memory_order_relaxed);

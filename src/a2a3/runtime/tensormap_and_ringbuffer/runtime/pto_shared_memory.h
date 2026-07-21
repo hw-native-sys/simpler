@@ -8,49 +8,14 @@
  * See LICENSE in the root of the software repository for the full text of the License.
  * -----------------------------------------------------------------------------------------------------------
  */
-/**
- * PTO Runtime2 - Shared Memory Layout
- *
- * Defines the shared memory structure for Orchestrator-Scheduler communication.
- *
- * Memory Layout (per-ring sections repeat for each ring 0..PTO2_MAX_RING_DEPTH-1):
- *   +---------------------------+
- *   | SharedMemoryHeader        |  (per-ring flow control + sync)
- *   +---------------------------+
- *   | Ring 0: TaskDescriptor[]  |
- *   | Ring 0: TaskPayload[]     |
- *   | Ring 0: TaskSlotState[]   |
- *   +---------------------------+
- *   | Ring 1: TaskDescriptor[]  |
- *   | Ring 1: TaskPayload[]     |
- *   | Ring 1: TaskSlotState[]   |
- *   +---------------------------+
- *   | ...                       |
- *   +---------------------------+
- *
- * Design principles:
- * - Only data needed for Orchestrator<->Scheduler communication is here
- * - TensorMap, scope_stack, ready_queues, dep_pool are in private memory
- * - Flow control via atomic counters/flags (no locks needed for single-word R/W)
- *
- * Based on: docs/RUNTIME_LOGIC.md
- */
 
 #pragma once
 
 #include "utils/device_arena.h"
 #include "pto_runtime2_types.h"
 
-// =============================================================================
-// Shared Memory Header
-// =============================================================================
-
 struct PTO2SharedMemoryHandle;
 
-/**
- * Per-ring flow control state in shared memory.
- * Written/read by Orchestrator and Scheduler for synchronization.
- */
 struct alignas(64) PTO2RingFlowControl {
     // === Cache Line 0: Written by Orchestrator, Read by Scheduler ===
     alignas(64) std::atomic<int32_t> current_task_index;  // Task ring head (next to allocate)
@@ -58,13 +23,6 @@ struct alignas(64) PTO2RingFlowControl {
     // === Cache Line 1: Written by Scheduler, Read by Orchestrator (for back-pressure) ===
     alignas(64) std::atomic<int32_t> last_task_alive;  // Task ring tail (oldest active task)
 
-    // Per-boot SM reset. PTO2TaskAllocator::init() seeds its private
-    // local_task_id_ from initial_local_task_id (default 0 in production)
-    // *without* dereferencing current_task_index — it relies on this reset
-    // running on every AICPU boot so 0 stays in sync. If you ever change
-    // the initial fc value or the boot ordering, update the default in
-    // PTO2TaskAllocator::init (pto_ring_buffer.h) in the same change, or
-    // submit IDs will be off by the divergence.
     void init() {
         current_task_index.store(0, std::memory_order_relaxed);
         last_task_alive.store(0, std::memory_order_relaxed);
@@ -75,14 +33,14 @@ struct alignas(64) PTO2RingFlowControl {
 
 static_assert(sizeof(PTO2RingFlowControl) == 128, "PTO2RingFlowControl must be exactly 2 cache lines (128B)");
 
-/**
- * Per-ring shared memory header section.
- *
- * Groups flow-control, layout info, and per-ring data pointers for a single ring.
- * Pointers are host-side only (set by setup_pointers, invalid on device).
- */
 struct alignas(64) PTO2SharedMemoryRingHeader {
     PTO2RingFlowControl fc;
+
+    // Highest task_id such that every task with id in [0, completed_watermark]
+    // has reached COMPLETED. Maintained at task-completion time. Used to gate
+    // slot reclamation: a producer slot P is safe to retire when
+    // completed_watermark >= P.last_consumer_local_id.
+    alignas(64) std::atomic<int32_t> completed_watermark;
 
     // Layout metadata (set once at init)
     uint64_t task_window_size;
@@ -95,30 +53,28 @@ struct alignas(64) PTO2SharedMemoryRingHeader {
     PTO2TaskPayload *task_payloads;
     PTO2TaskSlotState *slot_states;
 
-    int32_t get_slot_by_task_id(int32_t local_task_id) { return local_task_id & task_window_mask; }
+    // Compact contiguous array (one byte per slot) holding the polling-fast
+    // "task X completed?" flag. 0 = pending, 1 = completed. Indexed by
+    // local_id & task_window_mask. Writer: the task's completer at
+    // on_mixed_task_complete; Resetter: orchestrator in prepare_task for the
+    // newly-allocated slot. Reader: thread-0 fanin polling. Replaces a chain
+    // of 128B-aligned slot_state pointer derefs with byte reads into a single
+    // array — typically condenses 16 fanin checks into 1-2 cache lines.
+    std::atomic<uint8_t> *completion_flags;
 
     PTO2TaskDescriptor &get_task_by_slot(int32_t slot) { return task_descriptors[slot]; }
 
-    PTO2TaskDescriptor &get_task_by_task_id(int32_t local_id) {
-        return task_descriptors[get_slot_by_task_id(local_id)];
-    }
+    PTO2TaskDescriptor &get_task_by_task_id(int32_t local_id) { return task_descriptors[local_id & task_window_mask]; }
 
     PTO2TaskPayload &get_payload_by_slot(int32_t slot) { return task_payloads[slot]; }
 
-    PTO2TaskPayload &get_payload_by_task_id(int32_t local_id) { return task_payloads[get_slot_by_task_id(local_id)]; }
+    PTO2TaskPayload &get_payload_by_task_id(int32_t local_id) { return task_payloads[local_id & task_window_mask]; }
 
     PTO2TaskSlotState &get_slot_state_by_slot(int32_t slot) { return slot_states[slot]; }
 
-    PTO2TaskSlotState &get_slot_state_by_task_id(int32_t local_id) {
-        return slot_states[get_slot_by_task_id(local_id)];
-    }
+    PTO2TaskSlotState &get_slot_state_by_task_id(int32_t local_id) { return slot_states[local_id & task_window_mask]; }
 };
 
-/**
- * Shared memory header structure
- *
- * Contains per-ring flow control and global layout information.
- */
 struct alignas(PTO2_ALIGN_SIZE) PTO2SharedMemoryHeader {
     // === PER-RING FLOW CONTROL + LAYOUT INFO (set once at init) ===
     PTO2SharedMemoryRingHeader rings[PTO2_MAX_RING_DEPTH];
@@ -167,14 +123,6 @@ static_assert(
     "PTO2SharedMemoryHeader should be reasonably sized"
 );
 
-// =============================================================================
-// Shared Memory Handle
-// =============================================================================
-
-/**
- * Handle for shared memory lifecycle management (create/destroy).
- * Runtime components (orchestrator, scheduler) use PTO2SharedMemoryHeader* directly.
- */
 struct PTO2SharedMemoryHandle {
     void *sm_base;     // Base address of shared memory
     uint64_t sm_size;  // Total size of shared memory
@@ -182,58 +130,47 @@ struct PTO2SharedMemoryHandle {
     PTO2SharedMemoryHeader *header;
 
     // Ownership flag
-    bool is_owner;  // True if this handle allocated the memory
+    bool is_owner;
+    // True if this handle allocated the memory
 
     // === Static helpers ===
 
     static uint64_t calculate_size(uint64_t task_window_size);
+
     static uint64_t calculate_size_per_ring(const uint64_t task_window_sizes[PTO2_MAX_RING_DEPTH]);
 
-    // UT convenience: reserve wrapper + sm_base on `arena`, commit, and init
-    // using default PTO2_TASK_WINDOW_SIZE / PTO2_HEAP_SIZE. Only valid when the
-    // arena is otherwise empty (the call performs the single commit). All
-    // memory is owned by the arena — caller must not call destroy().
     static PTO2SharedMemoryHandle *create_and_init_default(DeviceArena &arena);
 
     // === Instance methods ===
 
-    // In-place init for caller-provided wrapper storage (e.g. a region carved
-    // out of a DeviceArena). Sets is_owner = false, calls setup_pointers and
-    // init_header. Returns false when `sm_size` is too small for the requested
-    // `task_window_size`.
-    bool init(void *sm_base, uint64_t sm_size, uint64_t task_window_size, uint64_t heap_size);
+    bool init(void *sm_base_arg, uint64_t sm_size_arg, uint64_t task_window_size, uint64_t heap_size);
+
+    // Per-ring init adapter (upstream signature). Polling-side init treats
+    // task_window_sizes[0] as canonical; rings 1..N inherit. heap_sizes[0] is
+    // passed to the per-ring header init below.
     bool init_per_ring(
-        void *sm_base, uint64_t sm_size, const uint64_t task_window_sizes[PTO2_MAX_RING_DEPTH],
+        void *sm_base_arg, uint64_t sm_size_arg, const uint64_t task_window_sizes[PTO2_MAX_RING_DEPTH],
         const uint64_t heap_sizes[PTO2_MAX_RING_DEPTH]
     );
 
     void destroy();
+
     void print_layout();
+
     bool validate();
 
 private:
     void init_header(uint64_t task_window_size, uint64_t heap_size);
+
     void init_header_per_ring(
         const uint64_t task_window_sizes[PTO2_MAX_RING_DEPTH], const uint64_t heap_sizes[PTO2_MAX_RING_DEPTH]
     );
+
     void setup_pointers(uint64_t task_window_size);
+
     void setup_pointers_per_ring(const uint64_t task_window_sizes[PTO2_MAX_RING_DEPTH]);
 };
 
-// =============================================================================
-// SM Device Layout Helpers
-// =============================================================================
-//
-// When the host pre-builds a runtime-arena image, it needs the device-side
-// addresses of several SM sub-fields (ring flow-control counters,
-// task_descriptors arrays, orch_error_code) so it can wire them into the
-// orchestrator / scheduler init_data path without dereferencing the SM —
-// the SM lives in device memory and cannot be touched from host.
-//
-// These helpers compute those addresses by offset arithmetic on the SM
-// device base. Pure pointer math, no loads/stores; safe to call from host.
-// The same arithmetic happens on AICPU too (via PTO2SharedMemoryHandle's
-// own setup_pointers), so values are guaranteed consistent across sides.
 namespace pto2_sm_layout {
 
 inline std::atomic<int32_t> *orch_error_code_addr(void *sm_dev_base) noexcept {
@@ -263,58 +200,23 @@ inline std::atomic<int32_t> *ring_last_task_alive_addr(void *sm_dev_base, int ri
     );
 }
 
-// Byte offsets (from the SM base) of one ring's three segments. The per-ring
-// layout is: header, then for each ring descriptors -> payloads -> slot_states,
-// every segment PTO2_ALIGN_UP-padded.
-struct PTO2RingSegmentOffsets {
-    uint64_t descriptors;
-    uint64_t payloads;
-    uint64_t slot_states;
-    uint64_t end;  // offset just past this ring's slot_states (next ring's start; total SM size for the last ring)
-};
-
-// Single source of truth for the per-ring SM layout. Returns offsets (not
-// pointers), so it serves BOTH the host-side pointer setup
-// (`setup_pointers_per_ring`, which adds `sm_base`) and the device-address
-// helpers below (which add `sm_dev_base`). Adding or reordering a per-ring
-// segment is a one-line edit here; every consumer follows automatically, so the
-// layout walk can never silently disagree across call sites.
-inline PTO2RingSegmentOffsets
-ring_segment_offsets(const uint64_t task_window_sizes[PTO2_MAX_RING_DEPTH], int ring_id) noexcept {
-    assert(ring_id >= 0 && ring_id < PTO2_MAX_RING_DEPTH && "pto2_sm_layout: ring_id out of range");
-    uint64_t off = PTO2_ALIGN_UP(sizeof(PTO2SharedMemoryHeader), PTO2_ALIGN_SIZE);
-    for (int r = 0; r < ring_id; r++) {
-        off += PTO2_ALIGN_UP(task_window_sizes[r] * sizeof(PTO2TaskDescriptor), PTO2_ALIGN_SIZE);
-        off += PTO2_ALIGN_UP(task_window_sizes[r] * sizeof(PTO2TaskPayload), PTO2_ALIGN_SIZE);
-        off += PTO2_ALIGN_UP(task_window_sizes[r] * sizeof(PTO2TaskSlotState), PTO2_ALIGN_SIZE);
-    }
-    PTO2RingSegmentOffsets o{};
-    o.descriptors = off;
-    off += PTO2_ALIGN_UP(task_window_sizes[ring_id] * sizeof(PTO2TaskDescriptor), PTO2_ALIGN_SIZE);
-    o.payloads = off;
-    off += PTO2_ALIGN_UP(task_window_sizes[ring_id] * sizeof(PTO2TaskPayload), PTO2_ALIGN_SIZE);
-    o.slot_states = off;
-    off += PTO2_ALIGN_UP(task_window_sizes[ring_id] * sizeof(PTO2TaskSlotState), PTO2_ALIGN_SIZE);
-    o.end = off;
-    return o;
-}
-
-// Device address of ring `ring_id`'s task_descriptors array.
 inline PTO2TaskDescriptor *ring_task_descriptors_addr(
     void *sm_dev_base, const uint64_t task_window_sizes[PTO2_MAX_RING_DEPTH], int ring_id
 ) noexcept {
-    return reinterpret_cast<PTO2TaskDescriptor *>(
-        static_cast<char *>(sm_dev_base) + ring_segment_offsets(task_window_sizes, ring_id).descriptors
-    );
-}
-
-// Device address of ring `ring_id`'s slot_states array (used by the allocator's
-// deadlock detector to inspect the head task's state/fanout).
-inline PTO2TaskSlotState *
-ring_slot_states_addr(void *sm_dev_base, const uint64_t task_window_sizes[PTO2_MAX_RING_DEPTH], int ring_id) noexcept {
-    return reinterpret_cast<PTO2TaskSlotState *>(
-        static_cast<char *>(sm_dev_base) + ring_segment_offsets(task_window_sizes, ring_id).slot_states
-    );
+    assert(ring_id >= 0 && ring_id < PTO2_MAX_RING_DEPTH && "pto2_sm_layout: ring_id out of range");
+    char *p = static_cast<char *>(sm_dev_base);
+    p += PTO2_ALIGN_UP(sizeof(PTO2SharedMemoryHeader), PTO2_ALIGN_SIZE);
+    for (int r = 0; r < ring_id; r++) {
+        p += PTO2_ALIGN_UP(task_window_sizes[r] * sizeof(PTO2TaskDescriptor), PTO2_ALIGN_SIZE);
+        p += PTO2_ALIGN_UP(task_window_sizes[r] * sizeof(PTO2TaskPayload), PTO2_ALIGN_SIZE);
+        p += PTO2_ALIGN_UP(task_window_sizes[r] * sizeof(PTO2TaskSlotState), PTO2_ALIGN_SIZE);
+        // Mirror setup_pointers_per_ring's per-ring stride exactly: completion_flags
+        // follows slot_states for every ring. Omitting it made this address diverge
+        // from where submit writes descriptors for rings >= 1, so the allocator read
+        // unwritten memory and update_heap_tail underflowed the reclaim tail.
+        p += PTO2_ALIGN_UP(task_window_sizes[r] * sizeof(std::atomic<uint8_t>), PTO2_ALIGN_SIZE);
+    }
+    return reinterpret_cast<PTO2TaskDescriptor *>(p);
 }
 
 }  // namespace pto2_sm_layout
