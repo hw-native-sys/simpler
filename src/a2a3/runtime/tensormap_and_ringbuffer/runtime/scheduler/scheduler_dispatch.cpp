@@ -1182,11 +1182,11 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
             PTO2TaskSlotState *dummy_batch[DUMMY_DRAIN_BATCH];
             int dummy_got = sched_->dummy_ready_queue.pop_batch(dummy_batch, DUMMY_DRAIN_BATCH);
 #if SIMPLER_DFX
-            // Dummy outer phase: covers handling of all dummies popped this
-            // iter. Per-dummy DummyTask markers are emitted to a SEPARATE lane
-            // (Worker View AICPU_N) by the converter, so they do not nest
-            // under this bar. Resolve emits below DO land on the sched lane
-            // and nest under this Dummy outer by time containment.
+            // Dummy outer phase: covers all dependency-only items popped this
+            // iter. Per-item identity markers are emitted to a SEPARATE lane
+            // (Worker View AICPU_N) by the converter, so they do not nest under
+            // this bar. Resolve emits below DO land on the sched lane and nest
+            // under this Dummy outer by time containment.
             uint64_t dummy_outer_t0 =
                 (dummy_got > 0 && l2_swimlane_level_ >= L2SwimlaneLevel::SCHED_PHASES) ? get_sys_cnt_aicpu() : 0;
 #endif
@@ -1219,15 +1219,22 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
                             sched_l2_swimlane_[thread_idx].sched_loop_count, dummy_consumers
                         );
                     }
-                    l2_swimlane_aicpu_record_dummy_task(
-                        thread_idx, dummy_resolve_t0, sched_l2_swimlane_[thread_idx].sched_loop_count,
-                        dummy_slot.task->task_id.raw
-                    );
+                    if (dummy_slot.active_mask.has_predicate()) {
+                        l2_swimlane_aicpu_record_predicated_skip(
+                            thread_idx, dummy_resolve_t0, sched_l2_swimlane_[thread_idx].sched_loop_count,
+                            dummy_slot.task->task_id.raw
+                        );
+                    } else {
+                        l2_swimlane_aicpu_record_dummy_task(
+                            thread_idx, dummy_resolve_t0, sched_l2_swimlane_[thread_idx].sched_loop_count,
+                            dummy_slot.task->task_id.raw
+                        );
+                    }
                 }
 #endif
-                // Dummy tasks have no subtasks to retire and no fanout pre-conditions
-                // beyond their own producers; release self-reference so the slot can
-                // reach CONSUMED once all consumers drain.
+                // Dependency-only completions have no dispatched subtasks to retire
+                // and no fanout pre-conditions beyond their own producers; release
+                // self-reference so the slot can reach CONSUMED once all consumers drain.
                 deferred_release_slot_states[deferred_release_count++] = &dummy_slot;
                 if (deferred_release_count >= PTO2_DEFERRED_RELEASE_CAP) {
                     while (deferred_release_count > 0) {

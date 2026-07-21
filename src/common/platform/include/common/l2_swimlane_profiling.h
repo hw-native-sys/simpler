@@ -495,10 +495,10 @@ static_assert(sizeof(L2SwimlaneDataHeader) % 64 == 0, "L2SwimlaneDataHeader must
  *     FIN-observation sites that call on_task_complete.
  *
  *   SEPARATE-LANE (converter routes to Worker View pid=4, not the sched lane):
- *     DummyTask. One zero-width marker per dummy so the DAG node is visually
- *     present on its handling AICPU's lane; the surrounding Dummy outer bar
- *     (sched lane) carries the actual drain time, and Resolve inside that
- *     bar carries the consumer-release work.
+ *     DummyTask and PredicatedSkip. One zero-width marker per dependency-only
+ *     completion keeps the DAG node visible on its handling AICPU's lane; the
+ *     surrounding Dummy outer bar (sched lane) carries the actual drain time,
+ *     and Resolve inside that bar carries the consumer-release work.
  */
 enum class L2SwimlaneSchedPhaseKind : uint32_t {
     // Outer
@@ -509,8 +509,9 @@ enum class L2SwimlaneSchedPhaseKind : uint32_t {
                         // tasks_processed = subtasks published this iter.
     Release = 2,        // Deferred-release drain (on_task_release work).
                         // tasks_processed = slots released this iter.
-    Dummy = 4,          // dummy_drain outer bar: covers handling of all dummies
-                        // popped this iter. tasks_processed = dummy_got count.
+    Dummy = 4,          // dummy_drain outer bar: covers explicit dummies and
+                        // false-predicate tasks popped this iter.
+                        // tasks_processed = dummy_got count.
     EarlyDispatch = 5,  // try_early_dispatch: early-dispatch pre-staging
                         // of a flagged producer's consumer's gated blocks.
                         // tasks_processed = blocks staged this pass.
@@ -534,6 +535,10 @@ enum class L2SwimlaneSchedPhaseKind : uint32_t {
     // so async-engine (SDMA/RoCE/URMA/CCU) wait time is attributed to its own
     // bar. tasks_processed = async subtasks completed this iter.
     AsyncPoll = 11,
+    // Separate-lane (Worker View pid=4 AICPU_N)
+    PredicatedSkip = 12,  // Per-task marker for a real task retired inline because
+                          // its dispatch predicate evaluated false. Uses the same
+                          // phase_data.dummy_task identity payload as DummyTask.
 };
 
 /** Index layout of the queue-depth snapshot arrays below: AIC=0, AIV=1, MIX=2.
@@ -547,8 +552,8 @@ constexpr int L2SWIMLANE_NUM_QUEUE_SHAPES = 3;
  * Position in the per-thread buffer is the identity — no thread_id field.
  *
  * phase_data is tagged by kind: Dispatch uses its ready-queue counters and
- * DummyTask uses the local/ring components of the full task id. Other kinds
- * store zero in the Dispatch view.
+ * DummyTask and PredicatedSkip use the local/ring components of the full task
+ * id. Other kinds store zero in the Dispatch view.
  *
  * Queue-depth snapshots (shared_depth_*) record the per-shape scheduler ready
  * queue occupancy at phase boundaries. They surface the dep-release-then-

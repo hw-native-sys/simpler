@@ -194,7 +194,7 @@ void l2_swimlane_aicpu_init_phase(int worker_count, int num_sched_phase_threads,
  * record's corresponding slot is zero-filled).
  *
  * @param thread_idx       Scheduler thread index
- * @param kind             Scheduler phase kind; DummyTask uses l2_swimlane_aicpu_record_dummy_task
+ * @param kind             Scheduler phase kind; separate-lane task markers use their dedicated record helpers
  * @param start_time       Phase start timestamp
  * @param end_time         Phase end timestamp
  * @param loop_iter        Current scheduler-loop iteration number
@@ -221,6 +221,18 @@ void l2_swimlane_aicpu_record_sched_phase(
  * @param task_id        Full PTO2 task identity
  */
 void l2_swimlane_aicpu_record_dummy_task(int thread_idx, uint64_t complete_time, uint32_t loop_iter, uint64_t task_id);
+
+/**
+ * Record the completion point of one task skipped by a false dispatch predicate.
+ *
+ * @param thread_idx     Scheduler thread that completed the task
+ * @param complete_time  Timestamp sampled immediately before completion propagation
+ * @param loop_iter      Current scheduler-loop iteration number
+ * @param task_id        Full PTO2 task identity
+ */
+void l2_swimlane_aicpu_record_predicated_skip(
+    int thread_idx, uint64_t complete_time, uint32_t loop_iter, uint64_t task_id
+);
 
 /**
  * Set orchestrator thread index for per-task phase recording

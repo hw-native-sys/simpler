@@ -671,6 +671,16 @@ def resolve_func_id_from_kernel_map(task_id, core_type, kernel_map):
     return -1
 
 
+def resolve_task_func_id_from_kernel_map(task_id, kernel_map):
+    """Look up the first active ``func_id`` for a task without an AICore row."""
+    if kernel_map is None or task_id is None:
+        return -1
+    kids = kernel_map.get(int(task_id))
+    if not kids:
+        return -1
+    return next((func_id for func_id in kids if func_id >= 0), -1)
+
+
 def load_kernel_config(config_path):
     """Load kernel configuration from kernel_config.py file.
 
@@ -1480,10 +1490,9 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
                     continue
                 finishes_per_complete[id(t_comp)] += 1
 
-        # Dummy task X event width — start/end on the device coincide
-        # (identification is a single MSR read); render as a 0.02 µs sliver
-        # so Perfetto picks it up instead of collapsing it to a hairline.
-        DUMMY_BAR_MIN_DUR_US = 0.02  # noqa: N806
+        # AICPU worker-marker width — start/end on the device coincide; render
+        # as a 0.02 us sliver so Perfetto does not collapse it to a hairline.
+        AICPU_WORKER_MARKER_MIN_DUR_US = 0.02  # noqa: N806
 
         for thread_idx, thread_records in enumerate(scheduler_phases):
             tid = sched_lane_tid(thread_idx, 0)
@@ -1517,30 +1526,43 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
             # that retired nothing; release = on_task_release drain). Genuine
             # spin emits no record and shows as a blank gap.
             #
-            # `dummy_task` is special: it does NOT live on the sched track —
-            # it represents a DAG fence node briefly inhabiting the AICPU as a
-            # virtual worker, so we route it to Worker View (pid=4) AICPU_N
-            # (where N = the AICPU id of the sched thread that drained it).
+            # Dependency-only task markers do NOT live on the sched track —
+            # they represent DAG nodes briefly inhabiting the AICPU as a
+            # virtual worker, so we route them to Worker View (pid=4) AICPU_N
+            # (where N = the AICPU id of the sched thread that drained them).
             for record in thread_records:
                 phase = record.get("phase", "unknown")
-                if phase == "dummy_task":
+                if phase in ("dummy_task", "predicated_skip"):
                     start_us = record["start_time_us"]
                     end_us = record["end_time_us"]
-                    dur = max(end_us - start_us, DUMMY_BAR_MIN_DUR_US)
+                    dur = max(end_us - start_us, AICPU_WORKER_MARKER_MIN_DUR_US)
                     task_id = normalize_pto2_task_id_int(record.get("task_id"))
                     task_label = format_task_display(task_id) if task_id is not None else "unknown"
+                    if phase == "dummy_task":
+                        event_name = f"dummy({task_label})"
+                    else:
+                        func_id = resolve_task_func_id_from_kernel_map(task_id, deps_kernel_map)
+                        event_name = _task_display_name(
+                            func_id,
+                            func_id_to_name,
+                            task_label,
+                            spmd=task_id in spmd_task_ids,
+                        )
+                    event_args = {
+                        "loop_iter": record.get("loop_iter", 0),
+                        "task_id": task_id,
+                        "event-hint": event_name,
+                    }
+                    if phase == "dummy_task":
+                        event_args["phase"] = phase
+                    else:
+                        event_args["predicated_pass"] = False
                     events.append(
                         {
-                            "args": {
-                                "phase": "dummy_task",
-                                "loop_iter": record.get("loop_iter", 0),
-                                "task_id": task_id,
-                                "event-hint": f"dummy({task_label})",
-                            },
+                            "args": event_args,
                             "cat": "event",
-                            "cname": "grey",
                             "id": event_id,
-                            "name": f"dummy({task_label})",
+                            "name": event_name,
                             "ph": "X",
                             "pid": 4,
                             "tid": AICPU_TID_BASE + thread_idx,
@@ -1729,13 +1751,18 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
         # identity source when a runtime timing record is missing.
         regular_task_ids = {int(t.get("task_id", -1)) for t in tasks}
         dummy_task_ids = set()
+        predicated_skip_task_ids = set()
         if scheduler_phases:
             for thread_records in scheduler_phases:
                 for rec in thread_records:
-                    if rec.get("phase") == "dummy_task":
+                    phase = rec.get("phase")
+                    if phase in ("dummy_task", "predicated_skip"):
                         task_id = normalize_pto2_task_id_int(rec.get("task_id"))
                         if task_id is not None:
-                            dummy_task_ids.add(task_id)
+                            if phase == "dummy_task":
+                                dummy_task_ids.add(task_id)
+                            else:
+                                predicated_skip_task_ids.add(task_id)
         deps_dummy_task_ids = {
             task_id
             for task_id, kernel_ids in (deps_kernel_map or {}).items()
@@ -1793,7 +1820,8 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
                     else:
                         is_regular = task_id in regular_task_ids
                         is_dummy = task_id in dummy_task_ids
-                    if not is_regular and not is_dummy:
+                    is_predicated_skip = task_id in predicated_skip_task_ids
+                    if not is_regular and not is_dummy and not is_predicated_skip:
                         events.append(
                             {
                                 "args": {

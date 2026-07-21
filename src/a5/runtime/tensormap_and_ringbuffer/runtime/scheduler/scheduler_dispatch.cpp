@@ -1028,10 +1028,17 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
 #endif
 #if SIMPLER_DFX
                 if (dummy_resolve_t0 != 0) {
-                    l2_swimlane_aicpu_record_dummy_task(
-                        thread_idx, dummy_resolve_t0, sched_l2_swimlane_[thread_idx].sched_loop_count,
-                        dummy_slot.task->task_id.raw
-                    );
+                    if (dummy_slot.active_mask.has_predicate()) {
+                        l2_swimlane_aicpu_record_predicated_skip(
+                            thread_idx, dummy_resolve_t0, sched_l2_swimlane_[thread_idx].sched_loop_count,
+                            dummy_slot.task->task_id.raw
+                        );
+                    } else {
+                        l2_swimlane_aicpu_record_dummy_task(
+                            thread_idx, dummy_resolve_t0, sched_l2_swimlane_[thread_idx].sched_loop_count,
+                            dummy_slot.task->task_id.raw
+                        );
+                    }
                 }
 #endif
                 // Dummy tasks have no subtasks to retire and no fanout pre-conditions

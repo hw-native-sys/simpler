@@ -50,16 +50,24 @@ available.
   / `dispatch` / `release` / `dummy` / `early_dispatch`), one logical
   **inner** phase (`resolve`, parent = Complete or Dummy) rendered on a
   sibling scheduler sub-lane with the same `Sched_N` label and adjacent tid,
-  and one **separate-lane**
-  phase (`dummy_task`, sampled immediately before `on_task_complete()` begins
-  dependency resolution and rendered as a synthetic 0.02 us marker on Worker
-  View AICPU_N rather than on the sched lane). It is emitted by both a2a3
-  runtimes and by a5 `tensormap_and_ringbuffer`; a5 `host_build_graph` has no
-  dummy-task phase path. Idle iterations no longer emit a record on a2a3; the
-  host tooling reconstructs idle spans from the gap between
-  consecutive work records on the same thread. See §3.2 for the
-  full per-phase table. Legacy captures may carry `scan` / `poll` /
-  `idle` / `fanout` / `prestage` — current a2a3 builds no longer
+  and two **separate-lane**
+  phases (`dummy_task` and `predicated_skip`, sampled immediately before
+  `on_task_complete()` begins dependency resolution and rendered as synthetic
+  0.02 us markers on Worker View AICPU_N rather than on the sched lane).
+  `predicated_skip` identifies a real task whose dispatch predicate evaluated
+  false. Its marker uses the task's ordinary function name and carries
+  `predicated_pass: false` in its Perfetto arguments; a predicate that evaluates
+  true follows the ordinary task timing path with no special argument. The
+  source `predicated_skip` phase remains in `l2_swimlane_records.json` and is
+  not copied into the merged Worker View event's arguments.
+  `dummy_task` is emitted by both a2a3 runtimes and by a5
+  `tensormap_and_ringbuffer`; `predicated_skip` is emitted by the a2a3 and a5
+  `tensormap_and_ringbuffer` runtimes, where predicated dispatch is
+  implemented. a5 `host_build_graph` has no dummy-task phase path. Idle
+  iterations no longer emit a record on a2a3; the host tooling reconstructs
+  idle spans from the gap between consecutive work records on the same thread.
+  See §3.2 for the full per-phase table. Legacy captures may carry `scan` /
+  `poll` / `idle` / `fanout` / `prestage` — current a2a3 builds no longer
   emit them (PR #1079's Scan/Poll debug overlay was removed;
   Fanout was renamed Resolve and now also filters out <1 µs walks;
   Prestage was renamed EarlyDispatch).
@@ -233,14 +241,14 @@ Phase records (per scheduler thread, level >= 3 for
 | `start_time_us` / `end_time_us` | Phase start / end timestamps in microseconds (reader-side cycle→µs conversion) |
 | `phase` | Lowercase phase name. Scheduler: see the table below. Orchestrator: `orch_submit` — one record per `submit_task()` / `alloc_tensors()` call spanning its full `[start, end]` window. Legacy per-sub-step strings (`orch_sync` / `orch_alloc` / `orch_params` / `orch_lookup` / `orch_insert` / `orch_fanin`) may appear in old captures. |
 | `loop_iter` (scheduler) / `submit_idx` (orchestrator) | Iteration / submit-call counter for the producing thread |
-| `tasks_processed` (scheduler) | Number of tasks or blocks handled by the phase; `dummy_task` records one task |
-| `task_id` | Full runtime task id on orchestrator records and scheduler `dummy_task` records |
+| `tasks_processed` (scheduler) | Number of tasks or blocks handled by the phase; `dummy_task` and `predicated_skip` record one task |
+| `task_id` | Full runtime task id on orchestrator records and scheduler `dummy_task` / `predicated_skip` records |
 | `pop_hit` / `pop_miss` (dispatch only) | Ready-queue pop deltas since the previous dispatch emit |
 
 The raw scheduler record has a phase-tagged union: `dispatch` stores
-`pop_hit` / `pop_miss`, while `dummy_task` stores the 32-bit `local_id` and
-`ring_id` components of its full task id. The Host collector reconstructs the
-`task_id` JSON field.
+`pop_hit` / `pop_miss`, while `dummy_task` and `predicated_skip` store the
+32-bit `local_id` and `ring_id` components of their full task id. The Host
+collector reconstructs the `task_id` JSON field.
 
 Scheduler phase taxonomy — three role classes share one `phase`
 field but render differently in Perfetto:
@@ -251,10 +259,11 @@ field but render differently in Perfetto:
 | `async_poll` | outer | sched | async-wait (SDMA/RoCE/URMA/CCU) subtasks completed this iter; split from `complete` |
 | `dispatch` | outer | sched | subtasks published this iter |
 | `release` | outer | sched | deferred-release slots drained this iter |
-| `dummy` | outer | sched | dummies handled by `dummy_drain` this iter |
+| `dummy` | outer | sched | `dummy_ready_queue` entries handled this iter (explicit dummies and false-predicate tasks) |
 | `early_dispatch` | outer | sched | blocks staged by speculative early-dispatch this pass |
 | `resolve` | inner | sched sub-lane, same `Sched_N` label as its outer lane | consumers visited in `on_task_complete` |
 | `dummy_task` | separate-lane | Worker View AICPU_N (pid=4) | one dummy entering `on_task_complete()`; full identity is in `task_id` |
+| `predicated_skip` | separate-lane | Worker View AICPU_N (pid=4) | one real task retired inline after its dispatch predicate evaluated false; full identity is in `task_id` |
 
 Fanin/fanout wiring is not a scheduler phase: it runs on the
 orchestrator submit path, so it has no swimlane lane. Read its cost
@@ -321,14 +330,16 @@ in. The trace contains:
 - **Worker View** (pid=4) — one swim-lane per physical worker:
   - `AIC_N` — matrix cores (receive → kernel end from level >= 1)
   - `AIV_N` — vector cores (receive → kernel end from level >= 1)
-  - `AICPU_N` — AICPU acting as worker; carries `dummy_task`
-    0.02 us pre-resolve markers (one per dummy entering
-    `on_task_complete()` on AICPU N) and `alloc` bars (from `alloc_tensors()`
-    calls inline-completed by the dedicated orchestrator on the last
-    AICPU runtime thread).
+  - `AICPU_N` — AICPU acting as worker; carries `dummy(...)` markers and
+    ordinary task-named markers with `predicated_pass: false` in their Perfetto
+    arguments. These 0.02 us pre-resolve markers represent one dependency-only
+    completion entering `on_task_complete()` on AICPU N. It also carries
+    `alloc` bars
+    (from `alloc_tensors()` calls inline-completed by the dedicated
+    orchestrator on the last AICPU runtime thread).
     Both are activities the AICPU performs as a worker, so they
     share the same lane tier as AIC/AIV. When `deps.json` is joined,
-    dependency arrows involving dummy/alloc DAG nodes anchor on these
+    dependency arrows involving dummy/predicated-skip/alloc DAG nodes anchor on these
     AICPU worker slices. The converter identifies dummy nodes from
     `deps.json` before consulting runtime timing records. If a dummy's
     scheduler record is missing, it warns and omits that Worker View bar

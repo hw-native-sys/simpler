@@ -1036,6 +1036,8 @@ int L2SwimlaneCollector::export_swimlane_json() {
                 return "resolve";
             case L2SwimlaneSchedPhaseKind::DummyTask:
                 return "dummy_task";
+            case L2SwimlaneSchedPhaseKind::PredicatedSkip:
+                return "predicated_skip";
             case L2SwimlaneSchedPhaseKind::Drain:
                 return "drain";
             case L2SwimlaneSchedPhaseKind::DrainPrepare:
@@ -1064,7 +1066,8 @@ int L2SwimlaneCollector::export_swimlane_json() {
                     outfile << ", \"pop_hit\": " << pr.phase_data.dispatch.pop_hit
                             << ", \"pop_miss\": " << pr.phase_data.dispatch.pop_miss;
                 }
-                if (pr.kind == L2SwimlaneSchedPhaseKind::DummyTask) {
+                if (pr.kind == L2SwimlaneSchedPhaseKind::DummyTask ||
+                    pr.kind == L2SwimlaneSchedPhaseKind::PredicatedSkip) {
                     uint64_t task_id = (static_cast<uint64_t>(pr.phase_data.dummy_task.ring_id) << 32) |
                                        pr.phase_data.dummy_task.local_id;
                     outfile << ", \"task_id\": " << task_id;

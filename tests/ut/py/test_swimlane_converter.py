@@ -498,3 +498,75 @@ def test_deps_dummy_without_runtime_record_is_not_rendered_as_alloc(tmp_path, ca
         events = json.load(f)["traceEvents"]
     assert not any(event.get("name") == "alloc(r1t1)" for event in events)
     assert "dummy(r1t1) has no dummy_task scheduler record" in capsys.readouterr().err
+
+
+def test_predicated_skip_uses_aicpu_worker_lane_and_dependency_anchor(tmp_path):
+    out = tmp_path / "trace.json"
+    skipped_task_id = (1 << 32) | 2
+    consumer_task_id = (1 << 32) | 3
+    scheduler_phases = [
+        [{"phase": "predicated_skip", "task_id": skipped_task_id, "start_time_us": 2.0, "end_time_us": 2.0}]
+    ]
+    orchestrator_phases = [
+        [{"phase": "orch_submit", "task_id": skipped_task_id, "start_time_us": 1.0, "end_time_us": 1.5}]
+    ]
+
+    sc.generate_chrome_trace_json(
+        [_task_row(consumer_task_id, 0, dispatch=3.0, start=4.0, end=5.0, receive=3.5)],
+        str(out),
+        func_id_to_name={"21": "exp_gate_mm"},
+        scheduler_phases=scheduler_phases,
+        orchestrator_phases=orchestrator_phases,
+        core_to_thread=[0],
+        deps_edges={skipped_task_id: [consumer_task_id]},
+        deps_kernel_map={skipped_task_id: [21, -1, -1]},
+        deps_block_map={skipped_task_id: 2, consumer_task_id: 1},
+    )
+
+    with open(out) as f:
+        events = json.load(f)["traceEvents"]
+    marker = next(event for event in events if event.get("name") == "exp_gate_mm_spmd(r1t2)")
+    assert marker["pid"] == 4
+    assert marker["tid"] == 19000
+    assert marker["dur"] == 0.02
+    assert marker["args"] == {
+        "loop_iter": 0,
+        "task_id": skipped_task_id,
+        "event-hint": "exp_gate_mm_spmd(r1t2)",
+        "predicated_pass": False,
+    }
+    assert "cname" not in marker
+    assert not any(event.get("name") == "alloc(r1t2)" for event in events)
+
+    flow = _first_worker_dependency_flow(out)
+    assert [(event["ph"], event["tid"]) for event in flow] == [("s", 19000), ("f", _core_tid(0))]
+
+
+def test_predicated_skip_without_deps_is_not_rendered_as_alloc(tmp_path):
+    out = tmp_path / "trace.json"
+    skipped_task_id = (1 << 32) | 2
+
+    sc.generate_chrome_trace_json(
+        [],
+        str(out),
+        scheduler_phases=[
+            [{"phase": "predicated_skip", "task_id": skipped_task_id, "start_time_us": 2.0, "end_time_us": 2.0}]
+        ],
+        orchestrator_phases=[
+            [{"phase": "orch_submit", "task_id": skipped_task_id, "start_time_us": 1.0, "end_time_us": 1.5}]
+        ],
+        core_to_thread=[0],
+    )
+
+    with open(out) as f:
+        events = json.load(f)["traceEvents"]
+    marker = next(event for event in events if event.get("name") == "task(r1t2)")
+    assert marker["pid"] == 4
+    assert marker["tid"] == 19000
+    assert marker["args"] == {
+        "loop_iter": 0,
+        "task_id": skipped_task_id,
+        "event-hint": "task(r1t2)",
+        "predicated_pass": False,
+    }
+    assert not any(event.get("name") == "alloc(r1t2)" for event in events)

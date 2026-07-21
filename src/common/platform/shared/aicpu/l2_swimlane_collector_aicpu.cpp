@@ -961,15 +961,27 @@ void l2_swimlane_aicpu_record_sched_phase(
     record->phase_data.dispatch.pop_miss = pop_miss;
 }
 
-void l2_swimlane_aicpu_record_dummy_task(int thread_idx, uint64_t complete_time, uint32_t loop_iter, uint64_t task_id) {
+static void record_aicpu_worker_task(
+    int thread_idx, L2SwimlaneSchedPhaseKind kind, uint64_t complete_time, uint32_t loop_iter, uint64_t task_id
+) {
     auto *record = acquire_sched_phase_record(thread_idx);
     if (record == nullptr) return;
     fill_sched_phase_record(
-        record, L2SwimlaneSchedPhaseKind::DummyTask, complete_time, complete_time, loop_iter,
-        /*tasks_processed=*/1, /*shared_at_start=*/nullptr, /*shared_at_end=*/nullptr
+        record, kind, complete_time, complete_time, loop_iter, /*tasks_processed=*/1, /*shared_at_start=*/nullptr,
+        /*shared_at_end=*/nullptr
     );
     record->phase_data.dummy_task.local_id = static_cast<uint32_t>(task_id);
     record->phase_data.dummy_task.ring_id = static_cast<uint32_t>(task_id >> 32);
+}
+
+void l2_swimlane_aicpu_record_dummy_task(int thread_idx, uint64_t complete_time, uint32_t loop_iter, uint64_t task_id) {
+    record_aicpu_worker_task(thread_idx, L2SwimlaneSchedPhaseKind::DummyTask, complete_time, loop_iter, task_id);
+}
+
+void l2_swimlane_aicpu_record_predicated_skip(
+    int thread_idx, uint64_t complete_time, uint32_t loop_iter, uint64_t task_id
+) {
+    record_aicpu_worker_task(thread_idx, L2SwimlaneSchedPhaseKind::PredicatedSkip, complete_time, loop_iter, task_id);
 }
 
 void l2_swimlane_aicpu_set_orch_thread_idx(int thread_idx) { s_orch_thread_idx = thread_idx; }
