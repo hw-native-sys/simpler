@@ -1,0 +1,284 @@
+/*
+ * Copyright (c) PyPTO Contributors.
+ * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+ * CANN Open Software License Agreement Version 2.0 (the "License").
+ * Please refer to the License for details. You may not use this file except in compliance with the License.
+ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+ * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+ * See LICENSE in the root of the software repository for the full text of the License.
+ * -----------------------------------------------------------------------------------------------------------
+ */
+
+/**
+ * @file dep_gen_collector.h
+ * @brief Host-side dep_gen (SubmitTrace) buffer allocation and streaming
+ *        collection for in-memory replay.
+ *
+ * Architecture:
+ * - BufferPoolManager<DepGenModule>: shared mgmt-thread infrastructure that
+ *   polls per-thread ready queues, drains done-queue shards, and replenishes
+ *   the single instance's free_queue from shard-local recycled lanes.
+ * - DepGenCollector: collector thread shards pop full DepGenBuffers from the
+ *   manager and append their DepGenRecords to an in-memory vector consumed by
+ *   host replay after device execution completes.
+ *
+ * Lifecycle:
+ *   init()                       — Allocate header + 1 BufferState + N DepGenBuffers
+ *                                  (pre-fills free_queue; surplus → recycled pool).
+ *                                  Calls set_memory_context() on the base.
+ *   start(tf)                    — Inherited: launches mgmt + collector threads.
+ *   [device execution]
+ *   stop()                       — Inherited: drain queues, join threads.
+ *   reconcile_counters()         — Sanity-check current_buf_ptr is cleared by
+ *                                  AICPU flush, run collected+dropped==total
+ *                                  cross-check. If dropped_record_count > 0,
+ *                                  the host caller skips deps.json emission
+ *                                  (incomplete graph; user gets a warning).
+ *   finalize()                   — Free all device memory, unregister.
+ *
+ * Output contract: a contiguous in-memory stream of DepGenRecord values.
+ * Host replay consumes this stream directly; no submit_trace.bin intermediary
+ * is written by the collector.
+ */
+
+#ifndef SRC_COMMON_PLATFORM_INCLUDE_HOST_DEP_GEN_COLLECTOR_H_
+#define SRC_COMMON_PLATFORM_INCLUDE_HOST_DEP_GEN_COLLECTOR_H_
+
+#include <atomic>
+#include <cstddef>
+#include <cstdint>
+#include <filesystem>
+#include <mutex>
+#include <optional>
+#include <string>
+#include <system_error>
+#include <vector>
+
+#include "common/dep_gen.h"
+#include "common/platform_config.h"
+#include "common/unified_log.h"
+#include "host/profiler_base.h"
+
+// ---------------------------------------------------------------------------
+// dep_gen Module (drives BufferPoolManager<DepGenModule>)
+// ---------------------------------------------------------------------------
+
+/**
+ * Internal hand-off struct delivered from a drain thread to a collector shard.
+ * thread_index identifies the AICPU thread queue the entry was popped from
+ * (always equal to the orchestrator thread index, since dep_gen is single-
+ * instance — exposed for symmetry with PmuReadyBufferInfo).
+ */
+struct DepGenReadyBufferInfo {
+    uint32_t instance_index;  // Always 0 (single instance)
+    uint32_t thread_index;    // AICPU thread queue index this entry came from
+    void *dev_buffer_ptr;
+    void *host_buffer_ptr;
+    uint32_t buffer_seq;
+};
+
+struct DepGenModule {
+    using DataHeader = DepGenDataHeader;
+    using ReadyEntry = DepGenReadyQueueEntry;
+    using ReadyBufferInfo = ::DepGenReadyBufferInfo;
+    using FreeQueue = DepGenFreeQueue;
+
+    static constexpr int kBufferKinds = 1;
+    static constexpr uint32_t kReadyQueueSize = PLATFORM_DEP_GEN_READYQUEUE_SIZE;
+    static constexpr uint32_t kHostPoolQueueSize = PLATFORM_MAX_AICPU_THREADS * PLATFORM_DEP_GEN_BUFFERS_PER_INSTANCE;
+    static constexpr uint32_t kSlotCount = PLATFORM_DEP_GEN_SLOT_COUNT;
+    static constexpr const char *kSubsystemName = "DepGenModule";
+    // The orchestrator is the sole device-side producer (dep_gen_collector_aicpu
+    // enqueues into queues[s_orch_thread_idx]), so one drain thread scanning
+    // every AICPU ready queue covers it; further shards would only ever be empty.
+    static constexpr int kMaxCollectorThreads = 1;
+
+    /**
+     * Startup-only batch allocation size for proactive_replenish when the
+     * recycled lanes need additional buffers before drain threads start.
+     */
+    static constexpr int batch_size(int /*kind*/) {
+        constexpr int kBatch = PLATFORM_DEP_GEN_BUFFERS_PER_INSTANCE - PLATFORM_DEP_GEN_SLOT_COUNT;
+        return kBatch < 1 ? 1 : kBatch;
+    }
+
+    static DataHeader *header_from_shm(void *shm) { return get_dep_gen_header(shm); }
+
+    /**
+     * `count` is intentionally NOT reset here — AICPU is the sole writer and
+     * resets it itself on flush/drop/pop.
+     */
+    static std::optional<profiling_common::EntrySite<DepGenModule>>
+    resolve_entry(void *shm, DataHeader *header, int q, const ReadyEntry &entry) {
+        if (shm == nullptr || header == nullptr) {
+            LOG_ERROR("DepGenModule: invalid shared memory/header while resolving ready entry");
+            return std::nullopt;
+        }
+        if (header->num_instances != 1 || entry.instance_index >= header->num_instances) {
+            LOG_ERROR(
+                "DepGenModule: invalid ready entry instance=%u (num_instances=%u)", entry.instance_index,
+                header->num_instances
+            );
+            return std::nullopt;
+        }
+        DepGenBufferState *state = get_dep_gen_buffer_state(shm, static_cast<int>(entry.instance_index));
+        profiling_common::EntrySite<DepGenModule> site;
+        site.kind = 0;
+        site.free_queue = &state->free_queue;
+        site.buffer_size = sizeof(DepGenBuffer);
+        site.info.instance_index = entry.instance_index;
+        site.info.thread_index = static_cast<uint32_t>(q);
+        site.info.dev_buffer_ptr = reinterpret_cast<void *>(entry.buffer_ptr);
+        site.info.host_buffer_ptr = nullptr;  // filled by ProfilerAlgorithms
+        site.info.buffer_seq = entry.buffer_seq;
+        return site;
+    }
+
+    template <typename Cb>
+    static void for_each_instance(void *shm, DataHeader *header, Cb &&cb) {
+        const int n = static_cast<int>(header->num_instances);
+        for (int i = 0; i < n; i++) {
+            DepGenBufferState *state = get_dep_gen_buffer_state(shm, i);
+            cb(/*kind=*/0, &state->free_queue, sizeof(DepGenBuffer));
+        }
+    }
+};
+
+// ---------------------------------------------------------------------------
+// Memory callbacks — thin aliases for the canonical profiling_common shapes.
+// alloc / free are std::function so callers bind their MemoryAllocator via
+// lambda capture; register / unregister stay as plain function pointers
+// because they wrap stateless HAL globals (halHost*).
+// ---------------------------------------------------------------------------
+
+using DepGenAllocCallback = profiling_common::ProfAllocCallback;
+using DepGenRegisterCallback = profiling_common::ProfRegisterCallback;
+using DepGenUnregisterCallback = profiling_common::ProfUnregisterCallback;
+using DepGenFreeCallback = profiling_common::ProfFreeCallback;
+
+// ---------------------------------------------------------------------------
+// DepGenCollector
+// ---------------------------------------------------------------------------
+
+class DepGenCollector : public profiling_common::ProfilerBase<DepGenCollector, DepGenModule> {
+public:
+    DepGenCollector() = default;
+    ~DepGenCollector();
+
+    DepGenCollector(const DepGenCollector &) = delete;
+    DepGenCollector &operator=(const DepGenCollector &) = delete;
+
+    static constexpr int kIdleTimeoutSec = PLATFORM_DEP_GEN_TIMEOUT_SECONDS;
+    static constexpr const char *kSubsystemName = "DepGen";
+
+    /**
+     * Allocate dep_gen shared memory and pre-populate the free_queue.
+     *
+     * Allocates a DepGenDataHeader + 1 DepGenBufferState, plus
+     * PLATFORM_DEP_GEN_BUFFERS_PER_INSTANCE DepGenBuffers. The first
+     * PLATFORM_DEP_GEN_SLOT_COUNT buffers go directly into the free_queue;
+     * the surplus go into BufferPoolManager's shard-local recycled lanes.
+     *
+     * @param num_threads     Number of AICPU scheduling threads (so the
+     *                        DataHeader sizes its per-thread ready queues)
+     * @param alloc_cb        Memory allocation callback
+     * @param register_cb     halHostRegister callback (nullptr on non-SVM platforms)
+     * @param free_cb         Memory free callback
+     * @param device_id       Device ID
+     * @return 0 on success, non-zero on failure
+     */
+    int init(
+        int num_threads, const DepGenAllocCallback &alloc_cb, DepGenRegisterCallback register_cb,
+        const DepGenFreeCallback &free_cb, int device_id
+    );
+
+    /**
+     * Device pointer to the DepGenDataHeader. Set kernel_args.dep_gen_data_base
+     * to this after init() so AICPU can find the shared memory via
+     * set_platform_dep_gen_base().
+     */
+    void *get_dep_gen_shm_device_ptr() const { return shm_dev_; }
+
+    /**
+     * Per-buffer callback invoked by ProfilerBase's poll loop. Appends the
+     * buffer's DepGenRecord entries to the in-memory ``records_`` vector
+     * (no disk I/O — the host replay consumes that vector directly via
+     * ``records()`` once the device run completes).
+     */
+    void on_buffer_collected(const DepGenReadyBufferInfo &info);
+
+    /**
+     * After stop(): cross-check collected + dropped == total. If dropped > 0,
+     * the host caller skips deps.json emission so users get an incomplete-
+     * graph warning rather than partial data they might mistake for complete.
+     *
+     * @return true iff the run captured a complete trace (no drops, no leftovers).
+     */
+    bool reconcile_counters();
+
+    /**
+     * Free all device memory and release the in-memory record buffer. Idempotent.
+     */
+    void finalize(DepGenUnregisterCallback unregister_cb, const DepGenFreeCallback &free_cb);
+
+    /**
+     * @return true if init() succeeded and finalize() has not run.
+     */
+    bool is_initialized() const { return initialized_; }
+
+    /**
+     * Total DepGenRecords drained from the device-side ring buffer so far.
+     */
+    uint64_t total_collected() const { return total_collected_; }
+
+    /**
+     * In-memory record buffer (host replay's input). Valid between init()
+     * and finalize(); pointer/size stay stable after stop() returns, which
+     * is when the caller hands them to ``dep_gen_replay_emit_deps_json``.
+     */
+    const std::vector<DepGenRecord> &records() const { return records_; }
+
+private:
+    bool initialized_ = false;
+    int num_threads_ = 0;
+
+    // Shared memory region (DepGenDataHeader + DepGenBufferState[1]).
+    // shm_host_ / device_id_ live on ProfilerBase (set via set_memory_context
+    // in init()).
+    void *shm_dev_ = nullptr;
+    size_t shm_size_ = 0;
+
+    // In-memory record buffer — drained from the device ring on
+    // on_buffer_collected() and consumed by the host replay directly (no
+    // disk hop). Mutex serializes the mgmt thread's appends against the
+    // (rare) reader on the same collector instance.
+    std::vector<DepGenRecord> records_;
+    std::mutex records_mutex_;
+
+    // Running total of records appended. Equal to ``records_.size()`` after
+    // every append; kept separately for the reconcile_counters cross-check
+    // even when records_ may be inspected concurrently.
+    uint64_t total_collected_ = 0;
+
+    DepGenDataHeader *dep_gen_header() const { return get_dep_gen_header(shm_host_); }
+    DepGenBufferState *dep_gen_state(int idx = 0) const { return get_dep_gen_buffer_state(shm_host_, idx); }
+
+    void append_buffer_records(const void *buf_host_ptr);
+};
+
+/**
+ * Build the ``deps.json`` output path under the caller-provided per-task
+ * directory. Filename is fixed (no timestamp) — the directory is the
+ * per-task uniqueness boundary, mirroring make_pmu_csv_path().
+ */
+inline std::string make_deps_json_path(const std::string &output_dir) {
+    std::filesystem::path dir(output_dir);
+    std::error_code ec;
+    std::filesystem::create_directories(dir, ec);
+    if (ec) {
+        LOG_WARN("Failed to create dep_gen output directory %s: %s", output_dir.c_str(), ec.message().c_str());
+    }
+    return (dir / "deps.json").string();
+}
+
+#endif  // SRC_COMMON_PLATFORM_INCLUDE_HOST_DEP_GEN_COLLECTOR_H_

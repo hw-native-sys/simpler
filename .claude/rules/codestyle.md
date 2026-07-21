@@ -1,0 +1,42 @@
+# Codestyle Rules
+
+1. **Avoid plan specific comments** such as Phase 1, Step 1, or Gap #3 which reflect planning details but don't aid code comprehension.
+2. Use `enum class` preferentially for basic enumeration usage. Use `enum` only when implementing bitmask patterns or when bitwise operations are required.
+
+    **Good:**
+
+    ```cpp
+    enum class CoreType : int { AIC = 0, AIV = 1 };
+    CoreType type = CoreType::AIC;
+    ```
+
+    **Bad (unless implementing bitmask):**
+
+    ```cpp
+    enum CoreType { AIC = 0, AIV = 1 };  // Avoid this for basic enums
+    ```
+
+3. Prefer `volatile` decorator on struct members rather than volatile pointer casts unless necessary.
+4. Avoid using pointer arithmetic with hardcoded offsets when `offsetof` is available.
+5. **Never use `std::this_thread::yield()` or `sched_yield()` in AICPU spin-wait loops.** On the Ascend AICPU, yielding to the OS scheduler introduces unacceptable latency for tight spin-waits (ticket locks, CAS retries, etc.). Use an empty loop body or a bare architecture hint (`__asm__ volatile("yield")`) instead.
+6. **For cross-platform/platform-isolation preprocessor blocks, place the `__aarch64__` branch first.** Use this ordering pattern:
+
+    ```cpp
+    #if defined(__aarch64__)
+    // aarch64 path (must be first)
+    #elif defined(__x86_64__)
+    // x86_64 path
+    #else
+    // other platforms
+    #endif
+    ```
+
+7. **Never log on AICPU hot paths** (orchestrator / scheduler inner loops,
+   per-task or per-scope code such as `submit_task` / `begin_scope` / the
+   dispatch loop). AICPU `device_log` writes are expensive and serialize on the
+   single AICPU op; flooding them — e.g. one `LOG_*` per scope_begin or per task
+   — slows the op enough to trip the **op-execute timeout** (STARS/tsdaemon
+   `HandleTaskTimeout` kills `aicpu-sd`), which *masks the very behavior you were
+   trying to observe* and looks like a runtime hang. Gate any diagnostic to a
+   high-water-mark (log only on a new max), a sample interval, or the
+   cold/stall path — never unconditionally per iteration.

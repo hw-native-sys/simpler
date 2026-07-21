@@ -1,0 +1,59 @@
+name: Feature Request
+description: Suggest a new feature or enhancement for PTO Runtime
+title: "[Feature] "
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thank you for suggesting a new feature! Please provide details to help us understand your proposal.
+
+  - type: textarea
+    id: summary
+    attributes:
+      label: Summary
+      description: Brief description of the feature you'd like to see
+      placeholder: e.g., "Add support for dynamic block dimensions in orchestration"
+    validations:
+      required: true
+
+  - type: textarea
+    id: motivation
+    attributes:
+      label: Motivation / Use Case
+      description: Why is this feature needed? What problem does it solve?
+      placeholder: Describe the use case and why existing functionality is insufficient
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposed_api
+    attributes:
+      label: Proposed API / Behavior
+      description: How should this feature work? What should the API look like?
+      placeholder: |
+        ```cpp
+        // Example of proposed orchestration API
+        PTO2_SCOPE(rt) {
+            // dynamic block iteration
+        }
+        ```
+    validations:
+      required: false
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives Considered
+      description: What alternative solutions or workarounds have you considered?
+      placeholder: Describe any alternatives you've explored
+    validations:
+      required: false
+
+  - type: textarea
+    id: additional_context
+    attributes:
+      label: Additional Context
+      description: Any other context, screenshots, or references
+    validations:
+      required: false

@@ -1,0 +1,833 @@
+name: CI
+
+permissions:
+  contents: read
+  pull-requests: read
+
+on:
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ---------- Pre-commit hooks (format, lint, clang-tidy) ----------
+  pre-commit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Install build and lint tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build g++ clang-tidy
+
+      - name: Set up Python 3.10
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.10'
+
+      - name: Install Python dependencies
+        run: pip install torch --index-url https://download.pytorch.org/whl/cpu
+
+      - name: Install package (for pyright C extension symbol resolution)
+        run: pip install .
+
+      - name: Cache cmake build directories
+        uses: actions/cache@v5
+        with:
+          path: build/cache
+          key: cmake-sim-${{ runner.os }}-${{ hashFiles('src/**/CMakeLists.txt', 'src/**/build_config.py', 'simpler_setup/runtime_compiler.py', 'simpler_setup/kernel_compiler.py', 'simpler_setup/toolchain.py') }}
+          restore-keys: |
+            cmake-sim-${{ runner.os }}-
+
+      - name: Build sim runtimes (generates per-target compile_commands.json)
+        run: python simpler_setup/build_runtimes.py --platforms a2a3sim a5sim
+
+      - name: Run pre-commit
+        uses: pre-commit/action@v3.0.0
+        with:
+          extra_args: --from-ref ${{ github.event.pull_request.base.sha }} --to-ref ${{ github.event.pull_request.head.sha }}
+
+  # ---------- Packaging matrix: 5 install paths × 4 entry points, on macOS + Ubuntu ----------
+  # Smoke-checks that every supported install path exposes the four user entry points.
+  # Each mode is wiped to a fully clean state (no caches) so a previous mode's
+  # build artifacts cannot mask a regression in the next mode. Slow but reliable.
+  # See docs/python-packaging.md and tools/verify_packaging.sh.
+  packaging-matrix:
+    needs: pre-commit
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        python-version: ['3.10']
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: Set up C++ compiler (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build g++
+
+      - name: Set up C++ compiler (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew install ninja cmake
+          brew install gcc@15 || brew install gcc
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install build + runtime deps in venv
+        run: |
+          python3 -m venv .venv
+          . .venv/bin/activate
+          pip install --upgrade pip
+          pip install scikit-build-core nanobind cmake pytest
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+
+      - name: Run packaging matrix (5 modes × 4 entry points, fully isolated)
+        run: |
+          . .venv/bin/activate
+          bash tools/verify_packaging.sh
+
+  # ---------- Unit tests (no hardware, Python + C++) ----------
+  ut:
+    needs: pre-commit
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        python-version: ['3.10']
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install GoogleTest (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake libgtest-dev
+          cd /usr/src/googletest
+          sudo cmake -B build
+          sudo cmake --build build
+          sudo cmake --install build
+
+      - name: Install GoogleTest (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew install googletest
+
+      - name: Cache pip packages
+        uses: actions/cache@v5
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('**/*.py') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+
+      - name: Install dependencies
+        run: |
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+          pip install '.[test]'
+
+      - name: Run Python unit tests
+        run: pytest tests/ut -m "not requires_hardware" -v
+
+      - name: Build and run C++ unit tests
+        run: |
+          cmake -B tests/ut/cpp/build -S tests/ut/cpp
+          cmake --build tests/ut/cpp/build
+          ctest --test-dir tests/ut/cpp/build -LE requires_hardware --output-on-failure
+
+  # ---------- Simulation scene tests ----------
+  st-sim-a2a3:
+    needs: [detect-changes, pre-commit]
+    if: needs.detect-changes.outputs.a2a3_changed == 'true'
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    env:
+      SIMPLER_SCHEDULER_TIMEOUT_MS: "5000"
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        python-version: ['3.10']
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+      - name: Set up C++ compiler
+        run: |
+          if [[ "${{ runner.os }}" == "Linux" ]]; then
+            sudo add-apt-repository -y ppa:ubuntu-toolchain-r/test
+            sudo apt-get update
+            sudo apt-get install -y ninja-build
+            sudo apt-get install -y g++-15 || sudo apt-get install -y g++
+            if ! command -v g++-15; then sudo ln -s $(which g++) /usr/local/bin/g++-15; fi
+            # graphviz: required by the dep_gen smoke (deps_viewer -> dot).
+            # Both a2a3 and a5 sim jobs run dep_gen, so install it in both.
+            sudo apt-get install -y graphviz
+          else
+            brew install ninja
+            brew install gcc@15 || brew install gcc
+            brew install graphviz
+          fi
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Cache pip packages
+        uses: actions/cache@v5
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('**/*.py') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+
+      - name: Install dependencies
+        run: |
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+          pip install '.[test]'
+
+      - name: Run pytest scene tests (a2a3sim)
+        run: |
+          pytest examples tests/st --platform a2a3sim --device 0-15 -v \
+            --pto-session-timeout 600 --require-pto-isa
+
+      # DFX per-feature smokes — the default pytest above passes no --enable-*
+      # flag, so each capture pipeline gets its own invocation here. Kept as
+      # separate steps so a failing capture pipeline is attributed to its own
+      # CI step rather than buried in a combined run.
+      - name: dep_gen smoke
+        run: |
+          pytest tests/st/a2a3/tensormap_and_ringbuffer/dfx/dep_gen/test_dep_gen.py \
+            --platform a2a3sim --device 0-15 -p no:xdist --pto-session-timeout 600 \
+            --require-pto-isa --enable-dep-gen
+
+      - name: l2_swimlane smoke
+        run: |
+          pytest tests/st/a2a3/tensormap_and_ringbuffer/dfx/l2_swimlane/ \
+            --platform a2a3sim --device 0-15 -p no:xdist --pto-session-timeout 600 \
+            --require-pto-isa --enable-l2-swimlane --enable-dep-gen
+
+      - name: PMU smoke
+        run: |
+          pytest tests/st/a2a3/tensormap_and_ringbuffer/dfx/pmu/test_pmu.py \
+            --platform a2a3sim --device 0-15 -p no:xdist --pto-session-timeout 600 \
+            --require-pto-isa --enable-pmu 2
+
+      - name: args_dump smoke
+        run: |
+          pytest tests/st/a2a3/tensormap_and_ringbuffer/dfx/args_dump/test_args_dump.py \
+            --platform a2a3sim --device 0-15 -p no:xdist --pto-session-timeout 600 \
+            --require-pto-isa --dump-args
+
+  st-sim-a5:
+    needs: [detect-changes, pre-commit]
+    if: needs.detect-changes.outputs.a5_changed == 'true'
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    env:
+      SIMPLER_SCHEDULER_TIMEOUT_MS: "5000"
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        python-version: ['3.10']
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+      - name: Set up C++ compiler
+        run: |
+          if [[ "${{ runner.os }}" == "Linux" ]]; then
+            sudo add-apt-repository -y ppa:ubuntu-toolchain-r/test
+            sudo apt-get update
+            sudo apt-get install -y ninja-build
+            sudo apt-get install -y g++-15 || sudo apt-get install -y g++
+            if ! command -v g++-15; then sudo ln -s $(which g++) /usr/local/bin/g++-15; fi
+            # graphviz: required by the dep_gen smoke (deps_viewer -> dot).
+            # Both a2a3 and a5 sim jobs run dep_gen, so install it in both.
+            sudo apt-get install -y graphviz
+          else
+            brew install ninja
+            brew install gcc@15 || brew install gcc
+            brew install graphviz
+          fi
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Cache pip packages
+        uses: actions/cache@v5
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('**/*.py') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+
+      - name: Install dependencies
+        run: |
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+          pip install '.[test]'
+
+      - name: Run pytest scene tests (a5sim)
+        run: |
+          pytest examples tests/st --platform a5sim --device 0-15 -v \
+            --pto-session-timeout 600 --require-pto-isa
+
+      # DFX per-feature smokes — the default pytest above passes no --enable-*
+      # flag, so each capture pipeline gets its own invocation here. Kept as
+      # separate steps so a failing capture pipeline is attributed to its own
+      # CI step rather than buried in a combined run. Mirrors st-sim-a2a3.
+      - name: dep_gen smoke
+        run: |
+          pytest tests/st/a5/tensormap_and_ringbuffer/dfx/dep_gen/test_dep_gen.py \
+            --platform a5sim --device 0-15 -p no:xdist --pto-session-timeout 600 \
+            --require-pto-isa --enable-dep-gen
+
+      - name: l2_swimlane smoke
+        run: |
+          pytest tests/st/a5/tensormap_and_ringbuffer/dfx/l2_swimlane/ \
+            --platform a5sim --device 0-15 -p no:xdist --pto-session-timeout 600 \
+            --require-pto-isa --enable-l2-swimlane --enable-dep-gen
+
+      - name: PMU smoke
+        run: |
+          pytest tests/st/a5/tensormap_and_ringbuffer/dfx/pmu/test_pmu.py \
+            --platform a5sim --device 0-15 -p no:xdist --pto-session-timeout 600 \
+            --require-pto-isa --enable-pmu 2
+
+      - name: args_dump smoke
+        run: |
+          pytest tests/st/a5/tensormap_and_ringbuffer/dfx/args_dump/test_args_dump.py \
+            --platform a5sim --device 0-15 -p no:xdist --pto-session-timeout 600 \
+            --require-pto-isa --dump-args
+
+  # ---------- Profiling sub-flags smoke (compile + run) ----------
+  # SIMPLER_DFX / SIMPLER_ORCH_PROFILING / SIMPLER_SCHED_PROFILING /
+  # SIMPLER_TENSORMAP_PROFILING are compile-time gates whose defaults and
+  # dependency checks live in src/common/task_interface/profiling_config.h.
+  # The defaults (SIMPLER_DFX=1, sub-flags=0) are exercised by every CI job,
+  # but non-default branches are otherwise dead coverage: a developer flipping
+  # any of them for perf debugging or to minimize logging overhead had no gate
+  # protecting the gated code from drift (renamed fields, changed signatures,
+  # format-string mismatches in LOG_INFO summaries, dead parameters caught
+  # only by -Wunused-parameter -Werror).
+  #
+  # All combos run sequentially in a single job (not a matrix) so the
+  # apt/python/pip setup cost is paid once, not 12×. Failures across combos
+  # are accumulated and reported together at the end — first failure does
+  # not abort the rest.
+  #
+  # Combos walk the macro hierarchy explicitly (not just "all on" or "all
+  # off") so log scrubbing the failing leg pinpoints the specific gate:
+  #
+  #   SIMPLER_DFX (default=1, covered by every other CI job)
+  #   ├── dfx-off:         -DSIMPLER_DFX=0   (no profiling at all)
+  #   ├── orch:             -DSIMPLER_ORCH_PROFILING=1
+  #   │   └── orch-tensormap:  + -DSIMPLER_TENSORMAP_PROFILING=1
+  #   ├── sched:            -DSIMPLER_SCHED_PROFILING=1
+  #   ├── orch-sched:       ORCH=1 + SCHED=1   (both sub-flags on, tensormap off)
+  #   └── all-on:           ORCH=1 + SCHED=1 + TENSORMAP=1
+  #
+  # Each combo rebuilds the sim runtime with its CXXFLAGS and runs the
+  # smallest full-pipeline example (vector_example) — exercises orchestrator,
+  # scheduler, AICore dispatch, and completion paths gated by the macros.
+  #
+  # Verified locally that each combo's compile_commands.json contains *only*
+  # its declared -D flags, the resulting libaicpu_kernel.so contains *only*
+  # the matching profiling log strings, and pytest output emits *only* the
+  # corresponding profiling block — no cross-contamination from cmake cache.
+  profiling-flags-smoke:
+    needs: [detect-changes, pre-commit]
+    if: needs.detect-changes.outputs.a2a3_changed == 'true' || needs.detect-changes.outputs.a5_changed == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: Set up C++ compiler
+        run: |
+          sudo add-apt-repository -y ppa:ubuntu-toolchain-r/test
+          sudo apt-get update
+          sudo apt-get install -y ninja-build
+          sudo apt-get install -y g++-15 || sudo apt-get install -y g++
+          if ! command -v g++-15; then sudo ln -s "$(which g++)" /usr/local/bin/g++-15; fi
+
+      - name: Set up Python 3.10
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.10'
+
+      - name: Cache pip packages
+        uses: actions/cache@v5
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('**/*.py') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+
+      - name: Install dependencies (editable so simpler_setup always resolves to source tree)
+        run: |
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+          # Editable install (`-e .`) avoids a cwd-dependent footgun: with a
+          # plain wheel install, `import simpler_setup` from a non-source-tree
+          # cwd resolves to the wheel-internal copy (PROJECT_ROOT = _assets/),
+          # silently reading runtime .so files from the wheel instead of the
+          # build/lib/ that our combo loop overwrites. With editable mode the
+          # shim always redirects to source-tree paths, regardless of cwd.
+          # pyproject.toml sets editable.rebuild=false so import-time auto
+          # rebuilds cannot clobber our profiling-on binaries.
+          #
+          # Build isolation (pip default, no --no-build-isolation) pulls
+          # scikit-build-core into a throwaway env automatically — matches the
+          # `pre-commit` job's `pip install .` pattern and works on a fresh
+          # CI runner that has no build deps pre-installed.
+          pip install -e '.[test]'
+
+      - name: Run all profiling flag combos × 2 arches
+        run: |
+          # Combo names paired with their CXX defines. Parallel arrays (not
+          # an associative array) so the loop iteration order is deterministic
+          # and the log reads top-to-bottom in hierarchy order.
+          COMBO_NAMES=(dfx-off orch orch-tensormap sched orch-sched all-on)
+          COMBO_DEFS=(
+            "-DSIMPLER_DFX=0"
+            "-DSIMPLER_ORCH_PROFILING=1"
+            "-DSIMPLER_ORCH_PROFILING=1 -DSIMPLER_TENSORMAP_PROFILING=1"
+            "-DSIMPLER_SCHED_PROFILING=1"
+            "-DSIMPLER_ORCH_PROFILING=1 -DSIMPLER_SCHED_PROFILING=1"
+            "-DSIMPLER_ORCH_PROFILING=1 -DSIMPLER_SCHED_PROFILING=1 -DSIMPLER_TENSORMAP_PROFILING=1"
+          )
+          ARCHES=(a2a3sim a5sim)
+          FAIL=()
+
+          for ARCH in "${ARCHES[@]}"; do
+            ARCH_DIR=${ARCH%sim}
+            for i in "${!COMBO_NAMES[@]}"; do
+              NAME=${COMBO_NAMES[$i]}
+              DEFS=${COMBO_DEFS[$i]}
+              echo "::group::$ARCH / $NAME — CXX defines: $DEFS"
+              if ! CXX="g++ $DEFS" python simpler_setup/build_runtimes.py --platforms "$ARCH"; then
+                echo "::error::Build failed: $ARCH / $NAME"
+                FAIL+=("$ARCH/$NAME (build)")
+                echo "::endgroup::"
+                continue
+              fi
+              if ! python -m pytest \
+                   "examples/${ARCH_DIR}/tensormap_and_ringbuffer/vector_example/test_vector_example.py" \
+                   --platform "$ARCH" --device 0-1 -p no:xdist \
+                   --pto-session-timeout 600; then
+                echo "::error::Smoke failed: $ARCH / $NAME"
+                FAIL+=("$ARCH/$NAME (pytest)")
+              fi
+              echo "::endgroup::"
+            done
+          done
+
+          echo ""
+          echo "==== SUMMARY ===="
+          if [ ${#FAIL[@]} -gt 0 ]; then
+            printf 'FAILED: %s\n' "${FAIL[@]}"
+            exit 1
+          fi
+          echo "All $((${#COMBO_NAMES[@]} * ${#ARCHES[@]})) combos passed."
+
+  # ---------- Unit tests (a2a3 hardware, Python + C++) ----------
+  ut-a2a3:
+    needs: pre-commit
+    runs-on: [self-hosted, a2a3]
+    timeout-minutes: 30
+    env:
+      SIMPLER_SCHEDULER_TIMEOUT_MS: "2000"
+      SIMPLER_OP_EXECUTE_TIMEOUT_US: "3000000"
+      SIMPLER_STREAM_SYNC_TIMEOUT_MS: "4000"
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+      - name: Set up environment
+        run: |
+          source /usr/local/Ascend/cann/set_env.sh
+          python3 -m venv --system-site-packages .venv
+          source .venv/bin/activate
+          pip install --upgrade pip
+          # The host_runtime build and test-time kernels both resolve PTO-ISA
+          # from pto_isa.pin, so they share one ISA revision.
+          pip install '.[test]'
+
+      - name: Run Python hardware unit tests
+        run: |
+          source /usr/local/Ascend/cann/set_env.sh
+          source .venv/bin/activate
+          if [ "$(uname -m)" = "x86_64" ]; then
+            python -m pytest tests -m requires_hardware --platform a2a3 --device ${DEVICE_RANGE} -v
+          else
+            task-submit --timeout 1800 --max-time 1800 --device auto --device-num "$DEVICE_NUM" \
+              --run "python -m pytest tests -m requires_hardware --platform a2a3 --device \$TASK_DEVICE -v"
+          fi
+
+      - name: Build and run C++ hardware unit tests
+        run: |
+          source /usr/local/Ascend/cann/set_env.sh
+          source .venv/bin/activate
+          python -c "from simpler_setup.runtime_builder import RuntimeBuilder; RuntimeBuilder('a2a3').get_binaries('tensormap_and_ringbuffer', build=True)"
+          cmake -B tests/ut/cpp/build -S tests/ut/cpp -DSIMPLER_ENABLE_HARDWARE_TESTS=ON
+          cmake --build tests/ut/cpp/build
+          if [ "$(uname -m)" = "x86_64" ]; then
+            python3 -c "
+          import json, os
+          p = os.environ['DEVICE_RANGE'].split('-'); s, e = p[0], p[-1]  # tolerate a single id (no hyphen)
+          npus = [{'id': str(i), 'slots': 1} for i in range(int(s), int(e)+1)]
+          json.dump({'version': {'major': 1, 'minor': 0}, 'local': [{'npus': npus}]},
+                    open('tests/ut/cpp/build/resources.json', 'w'))
+          "
+            ctest --test-dir tests/ut/cpp/build -L '^requires_hardware(_a2a3)?$' --resource-spec-file $PWD/tests/ut/cpp/build/resources.json -j$(nproc) --output-on-failure
+          else
+            task-submit --timeout 1800 --max-time 1800 --device auto --device-num "$DEVICE_NUM" \
+              --run "python3 -c \"import json,os; ids=os.environ['TASK_DEVICE'].split(','); json.dump({'version':{'major':1,'minor':0},'local':[{'npus':[{'id':i,'slots':1} for i in ids]}]}, open('tests/ut/cpp/build/resources.json','w'))\" && ctest --test-dir tests/ut/cpp/build -L '^requires_hardware(_a2a3)?\$' --resource-spec-file $PWD/tests/ut/cpp/build/resources.json -j$(nproc) --output-on-failure"
+          fi
+
+      - name: Build cann-examples/query (CANN host-API smoke)
+        run: |
+          source /usr/local/Ascend/cann/set_env.sh
+          cd tools/cann-examples/query
+          cmake -B build .
+          cmake --build build
+          ./build/query version
+
+      - name: Build cann-examples/aicpu-device-query (device-side HAL probe smoke)
+        run: |
+          source /usr/local/Ascend/cann/set_env.sh
+          export CROSS=${ASCEND_HOME_PATH}/tools/hcc/bin/aarch64-target-linux-gnu
+          cd tools/cann-examples/aicpu-device-query/device
+          cmake -B build . -DCMAKE_C_COMPILER=${CROSS}-gcc -DCMAKE_CXX_COMPILER=${CROSS}-g++
+          cmake --build build
+          cd ../host
+          cmake -B build .
+          cmake --build build
+
+      - name: Build cann-examples/aicpu-kernel-launch (dispatcher bootstrap smoke)
+        run: |
+          source /usr/local/Ascend/cann/set_env.sh
+          export CROSS=${ASCEND_HOME_PATH}/tools/hcc/bin/aarch64-target-linux-gnu
+          cd tools/cann-examples/aicpu-kernel-launch/device
+          cmake -B build . -DCMAKE_C_COMPILER=${CROSS}-gcc -DCMAKE_CXX_COMPILER=${CROSS}-g++
+          cmake --build build
+          cd ../host
+          cmake -B build .
+          cmake --build build
+
+  # ---------- Scene tests (a2a3 hardware) ----------
+  st-onboard-a2a3:
+    needs: [detect-changes, pre-commit]
+    if: needs.detect-changes.outputs.a2a3_changed == 'true'
+    runs-on: [self-hosted, a2a3]
+    timeout-minutes: 60
+    env:
+      SIMPLER_SCHEDULER_TIMEOUT_MS: "2000"
+      SIMPLER_OP_EXECUTE_TIMEOUT_US: "3000000"
+      SIMPLER_STREAM_SYNC_TIMEOUT_MS: "4000"
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+      - name: Set up environment
+        run: |
+          source /usr/local/Ascend/cann/set_env.sh
+          python3 -m venv --system-site-packages .venv
+          source .venv/bin/activate
+          pip install --upgrade pip
+          # The host_runtime build and test-time kernels both resolve PTO-ISA
+          # from pto_isa.pin, so they share one ISA revision.
+          pip install '.[test]'
+          # Warn if graphviz isn't installed on the runner — the dep_gen
+          # smoke step needs `dot` to render deps_viewer. The Python
+          # has_binary("dot") guard in the test will skip cleanly without
+          # it, but coverage drops, so flag it loudly here.
+          if ! command -v dot >/dev/null 2>&1; then
+            echo "::warning::graphviz 'dot' not found on PATH; deps_viewer tool smoke will skip. Install graphviz on this self-hosted runner to restore coverage."
+          fi
+
+      - name: Run pytest scene tests (a2a3)
+        run: |
+          source /usr/local/Ascend/cann/set_env.sh
+          source .venv/bin/activate
+          if [ "$(uname -m)" = "x86_64" ]; then
+            python -m pytest examples tests/st --platform a2a3 --device ${DEVICE_RANGE} -v --require-pto-isa --pto-session-timeout 600
+          else
+            task-submit --timeout 1800 --max-time 1800 --device auto --device-num "$DEVICE_NUM" \
+              --run "python -m pytest examples tests/st --platform a2a3 --device \$TASK_DEVICE -v --require-pto-isa --pto-session-timeout 600"
+          fi
+
+      # DFX per-feature smokes — hardware mirror of the st-sim-a2a3 set. The
+      # race window in dep_gen only fires on real timing, so this row is
+      # what would catch onboard-only regressions like the missing kernel.cpp
+      # propagation #742 fixed.
+      - name: dep_gen smoke
+        run: |
+          source /usr/local/Ascend/cann/set_env.sh
+          source .venv/bin/activate
+          if [ "$(uname -m)" = "x86_64" ]; then
+            python -m pytest tests/st/a2a3/tensormap_and_ringbuffer/dfx/dep_gen/test_dep_gen.py \
+              --platform a2a3 --device ${DEVICE_RANGE} -p no:xdist --pto-session-timeout 600 \
+              --require-pto-isa --enable-dep-gen
+          else
+            task-submit --timeout 1800 --max-time 1800 --device auto --device-num "$DEVICE_NUM" \
+              --run "python -m pytest tests/st/a2a3/tensormap_and_ringbuffer/dfx/dep_gen/test_dep_gen.py \
+              --platform a2a3 --device \$TASK_DEVICE -p no:xdist --pto-session-timeout 600 \
+              --require-pto-isa --enable-dep-gen"
+          fi
+
+      - name: l2_swimlane smoke
+        run: |
+          source /usr/local/Ascend/cann/set_env.sh
+          source .venv/bin/activate
+          if [ "$(uname -m)" = "x86_64" ]; then
+            python -m pytest tests/st/a2a3/tensormap_and_ringbuffer/dfx/l2_swimlane/ \
+              --platform a2a3 --device ${DEVICE_RANGE} -p no:xdist --pto-session-timeout 600 \
+              --require-pto-isa --enable-l2-swimlane --enable-dep-gen
+          else
+            task-submit --timeout 1800 --max-time 1800 --device auto --device-num "$DEVICE_NUM" \
+              --run "python -m pytest tests/st/a2a3/tensormap_and_ringbuffer/dfx/l2_swimlane/ \
+              --platform a2a3 --device \$TASK_DEVICE -p no:xdist --pto-session-timeout 600 \
+              --require-pto-isa --enable-l2-swimlane --enable-dep-gen"
+          fi
+
+      - name: PMU smoke
+        run: |
+          source /usr/local/Ascend/cann/set_env.sh
+          source .venv/bin/activate
+          if [ "$(uname -m)" = "x86_64" ]; then
+            python -m pytest tests/st/a2a3/tensormap_and_ringbuffer/dfx/pmu/test_pmu.py \
+              --platform a2a3 --device ${DEVICE_RANGE} -p no:xdist --pto-session-timeout 600 \
+              --require-pto-isa --enable-pmu 2
+          else
+            task-submit --timeout 1800 --max-time 1800 --device auto --device-num "$DEVICE_NUM" \
+              --run "python -m pytest tests/st/a2a3/tensormap_and_ringbuffer/dfx/pmu/test_pmu.py \
+              --platform a2a3 --device \$TASK_DEVICE -p no:xdist --pto-session-timeout 600 \
+              --require-pto-isa --enable-pmu 2"
+          fi
+
+      - name: args_dump smoke
+        run: |
+          source /usr/local/Ascend/cann/set_env.sh
+          source .venv/bin/activate
+          if [ "$(uname -m)" = "x86_64" ]; then
+            python -m pytest tests/st/a2a3/tensormap_and_ringbuffer/dfx/args_dump/test_args_dump.py \
+              --platform a2a3 --device ${DEVICE_RANGE} -p no:xdist --pto-session-timeout 600 \
+              --require-pto-isa --dump-args
+          else
+            task-submit --timeout 1800 --max-time 1800 --device auto --device-num "$DEVICE_NUM" \
+              --run "python -m pytest tests/st/a2a3/tensormap_and_ringbuffer/dfx/args_dump/test_args_dump.py \
+              --platform a2a3 --device \$TASK_DEVICE -p no:xdist --pto-session-timeout 600 \
+              --require-pto-isa --dump-args"
+          fi
+
+
+  # ---------- Detect platform-specific changes (runs on GitHub server) ----------
+  detect-changes:
+    runs-on: ubuntu-latest
+    outputs:
+      a2a3_changed: ${{ steps.check.outputs.a2a3_changed }}
+      a5_changed: ${{ steps.check.outputs.a5_changed }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - name: Check file changes
+        id: check
+        run: |
+          FILES=$(git diff --name-only ${{ github.event.pull_request.base.sha }}...${{ github.event.pull_request.head.sha }})
+
+          NON_CODE='^(docs/|\.docs/|\.claude/|\.gitignore$|\.pre-commit-config\.yaml$)|\.md$'
+
+          # a2a3: skip only when ALL changed files are a5-only or non-code
+          A5_ONLY='^(src/a5/|examples/a5/|tests/(st|ut/cpp)/a5/)'
+          A2A3_REMAINING=$(echo "$FILES" | grep -vE "$A5_ONLY" | grep -vE "$NON_CODE" || true)
+
+          if [ -n "$A2A3_REMAINING" ]; then
+            echo "a2a3_changed=true" >> "$GITHUB_OUTPUT"
+            echo "Files affecting a2a3:"
+            echo "$A2A3_REMAINING"
+          else
+            echo "a2a3_changed=false" >> "$GITHUB_OUTPUT"
+            echo "All changes are a5-only or non-code; skipping a2a3"
+          fi
+
+          # a5: skip only when ALL changed files are a2a3-only or non-code
+          A2A3_ONLY='^(src/a2a3/|examples/a2a3/|tests/(st|ut/cpp)/a2a3/)'
+          A5_REMAINING=$(echo "$FILES" | grep -vE "$A2A3_ONLY" | grep -vE "$NON_CODE" || true)
+
+          if [ -n "$A5_REMAINING" ]; then
+            echo "a5_changed=true" >> "$GITHUB_OUTPUT"
+            echo "Files affecting a5:"
+            echo "$A5_REMAINING"
+          else
+            echo "a5_changed=false" >> "$GITHUB_OUTPUT"
+            echo "All changes are a2a3-only or non-code; skipping a5"
+          fi
+
+  # ---------- Unit tests (a5 hardware, Python + C++) ----------
+  ut-a5:
+    needs: pre-commit
+    runs-on: [self-hosted, a5]
+    timeout-minutes: 30
+    env:
+      SIMPLER_SCHEDULER_TIMEOUT_MS: "2000"
+      SIMPLER_OP_EXECUTE_TIMEOUT_US: "3000000"
+      SIMPLER_STREAM_SYNC_TIMEOUT_MS: "4000"
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+      - name: Set up environment
+        run: |
+          python3 -m venv --system-site-packages .venv
+          source .venv/bin/activate
+          pip install --upgrade pip
+          # The host_runtime build and test-time kernels both resolve PTO-ISA
+          # from pto_isa.pin, so they share one ISA revision.
+          pip install '.[test]'
+
+      - name: Run Python hardware unit tests (a5)
+        run: |
+          source .venv/bin/activate
+          DEVICE_LIST=$(python -c "p='${DEVICE_RANGE}'.split('-'); s,e=p[0],p[-1]; print(','.join(str(i) for i in range(int(s),int(e)+1)))")
+          task-submit --timeout 1800 --max-time 1800 --device "$DEVICE_LIST" --run "python -m pytest tests -m requires_hardware --platform a5 --device ${DEVICE_RANGE} -v"
+
+      - name: Build and run C++ hardware unit tests (a5)
+        run: |
+          source .venv/bin/activate
+          cmake -B tests/ut/cpp/build -S tests/ut/cpp -DSIMPLER_ENABLE_HARDWARE_TESTS=ON
+          cmake --build tests/ut/cpp/build
+          python3 -c "
+          import json, os
+          p = os.environ['DEVICE_RANGE'].split('-'); s, e = p[0], p[-1]  # tolerate a single id (no hyphen)
+          npus = [{'id': str(i), 'slots': 1} for i in range(int(s), int(e)+1)]
+          json.dump({'version': {'major': 1, 'minor': 0}, 'local': [{'npus': npus}]},
+                    open('tests/ut/cpp/build/resources.json', 'w'))
+          "
+          DEVICE_LIST=$(python -c "p='${DEVICE_RANGE}'.split('-'); s,e=p[0],p[-1]; print(','.join(str(i) for i in range(int(s),int(e)+1)))")
+          task-submit --timeout 1800 --max-time 1800 --device "$DEVICE_LIST" --run "ctest --test-dir tests/ut/cpp/build -L '^requires_hardware(_a5)?\$' --resource-spec-file $PWD/tests/ut/cpp/build/resources.json -j$(nproc) --output-on-failure"
+
+      - name: Build cann-examples/query (CANN host-API smoke)
+        run: |
+          cd tools/cann-examples/query
+          cmake -B build .
+          cmake --build build
+          ./build/query version
+
+      - name: Build cann-examples/aicpu-device-query (device-side HAL probe smoke)
+        run: |
+          export CROSS=${ASCEND_HOME_PATH}/tools/hcc/bin/aarch64-target-linux-gnu
+          cd tools/cann-examples/aicpu-device-query/device
+          cmake -B build . -DCMAKE_C_COMPILER=${CROSS}-gcc -DCMAKE_CXX_COMPILER=${CROSS}-g++
+          cmake --build build
+          cd ../host
+          cmake -B build .
+          cmake --build build
+
+      - name: Build cann-examples/aicpu-kernel-launch (dispatcher bootstrap smoke)
+        run: |
+          export CROSS=${ASCEND_HOME_PATH}/tools/hcc/bin/aarch64-target-linux-gnu
+          cd tools/cann-examples/aicpu-kernel-launch/device
+          cmake -B build . -DCMAKE_C_COMPILER=${CROSS}-gcc -DCMAKE_CXX_COMPILER=${CROSS}-g++
+          cmake --build build
+          cd ../host
+          cmake -B build .
+          cmake --build build
+
+  st-onboard-a5:
+    needs: [detect-changes, pre-commit]
+    if: needs.detect-changes.outputs.a5_changed == 'true'
+    runs-on: [self-hosted, a5]
+    timeout-minutes: 60
+    env:
+      SIMPLER_SCHEDULER_TIMEOUT_MS: "2000"
+      SIMPLER_OP_EXECUTE_TIMEOUT_US: "3000000"
+      SIMPLER_STREAM_SYNC_TIMEOUT_MS: "4000"
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+      - name: Set up environment
+        run: |
+          python3 -m venv --system-site-packages .venv
+          source .venv/bin/activate
+          pip install --upgrade pip
+          # The host_runtime build and test-time kernels both resolve PTO-ISA
+          # from pto_isa.pin, so they share one ISA revision.
+          pip install '.[test]'
+
+      - name: Run pytest scene tests (a5)
+        run: |
+          source .venv/bin/activate
+          DEVICE_LIST=$(python -c "p='${DEVICE_RANGE}'.split('-'); s,e=p[0],p[-1]; print(','.join(str(i) for i in range(int(s),int(e)+1)))")
+          PYTEST="python -m pytest examples tests/st --platform a5 --device ${DEVICE_RANGE} -v --require-pto-isa"
+          task-submit --timeout 1800 --max-time 1800 --device "$DEVICE_LIST" --run "$PYTEST --pto-session-timeout 1200"
+
+      # DFX per-feature smokes — hardware mirror of the st-sim-a5 set. The
+      # race window in dep_gen only fires on real timing, so this row is
+      # what would catch onboard-only regressions like the missing kernel.cpp
+      # propagation #742 fixed.
+      - name: dep_gen smoke
+        run: |
+          source .venv/bin/activate
+          DEVICE_LIST=$(python -c "p='${DEVICE_RANGE}'.split('-'); s,e=p[0],p[-1]; print(','.join(str(i) for i in range(int(s),int(e)+1)))")
+          PYTEST="python -m pytest tests/st/a5/tensormap_and_ringbuffer/dfx/dep_gen/test_dep_gen.py \
+            --platform a5 --device ${DEVICE_RANGE} -p no:xdist --pto-session-timeout 600 \
+            --require-pto-isa --enable-dep-gen"
+          task-submit --timeout 1800 --max-time 1800 --device "$DEVICE_LIST" --run "$PYTEST"
+
+      - name: l2_swimlane smoke
+        run: |
+          source .venv/bin/activate
+          DEVICE_LIST=$(python -c "p='${DEVICE_RANGE}'.split('-'); s,e=p[0],p[-1]; print(','.join(str(i) for i in range(int(s),int(e)+1)))")
+          PYTEST="python -m pytest tests/st/a5/tensormap_and_ringbuffer/dfx/l2_swimlane/ \
+            --platform a5 --device ${DEVICE_RANGE} -p no:xdist --pto-session-timeout 600 \
+            --require-pto-isa --enable-l2-swimlane --enable-dep-gen"
+          task-submit --timeout 1800 --max-time 1800 --device "$DEVICE_LIST" --run "$PYTEST"
+
+      - name: PMU smoke
+        run: |
+          source .venv/bin/activate
+          DEVICE_LIST=$(python -c "p='${DEVICE_RANGE}'.split('-'); s,e=p[0],p[-1]; print(','.join(str(i) for i in range(int(s),int(e)+1)))")
+          PYTEST="python -m pytest tests/st/a5/tensormap_and_ringbuffer/dfx/pmu/test_pmu.py \
+            --platform a5 --device ${DEVICE_RANGE} -p no:xdist --pto-session-timeout 600 \
+            --require-pto-isa --enable-pmu 2"
+          task-submit --timeout 1800 --max-time 1800 --device "$DEVICE_LIST" --run "$PYTEST"
+
+      - name: args_dump smoke
+        run: |
+          source .venv/bin/activate
+          DEVICE_LIST=$(python -c "p='${DEVICE_RANGE}'.split('-'); s,e=p[0],p[-1]; print(','.join(str(i) for i in range(int(s),int(e)+1)))")
+          PYTEST="python -m pytest tests/st/a5/tensormap_and_ringbuffer/dfx/args_dump/test_args_dump.py \
+            --platform a5 --device ${DEVICE_RANGE} -p no:xdist --pto-session-timeout 600 \
+            --require-pto-isa --dump-args"
+          task-submit --timeout 1800 --max-time 1800 --device "$DEVICE_LIST" --run "$PYTEST"

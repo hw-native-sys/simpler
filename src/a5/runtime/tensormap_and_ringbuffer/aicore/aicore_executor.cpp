@@ -1,0 +1,200 @@
+/*
+ * Copyright (c) PyPTO Contributors.
+ * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+ * CANN Open Software License Agreement Version 2.0 (the "License").
+ * Please refer to the License for details. You may not use this file except in compliance with the License.
+ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+ * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+ * See LICENSE in the root of the software repository for the full text of the License.
+ * -----------------------------------------------------------------------------------------------------------
+ */
+
+#include "aicore/aicore.h"
+#include "aicore/aicore_profiling_state.h"
+#include "aicore/l2_swimlane_collector_aicore.h"
+#include "aicore/pmu_collector_aicore.h"
+#include "common/l2_swimlane_profiling.h"
+#include "common/platform_config.h"  // Register-based communication
+#include "common/pmu_profiling.h"
+#include "pto2_dispatch_payload.h"
+#include "runtime.h"
+
+/**
+ * Unified function pointer type for kernel dispatch
+ *
+ * All kernels follow the same signature: void kernel(__gm__ int64_t* args)
+ * This enables simple, switch-free dispatch.
+ */
+typedef void (*UnifiedKernelFunc)(__gm__ int64_t *);
+
+/**
+ * Execute task from PTO2DispatchPayload.
+ *
+ * Reads function_bin_addr and args from the dispatch payload.
+ *
+ * @param payload Pointer to PTO2DispatchPayload in global memory
+ */
+__aicore__ __attribute__((always_inline)) static void execute_task(__gm__ PTO2DispatchPayload *payload) {
+    if (payload == nullptr || payload->function_bin_addr == 0) {
+        return;
+    }
+
+    UnifiedKernelFunc kernel = (UnifiedKernelFunc)payload->function_bin_addr;
+    kernel(reinterpret_cast<__gm__ int64_t *>(payload->args));
+    OUT_OF_ORDER_STORE_BARRIER();
+}
+
+/**
+ * AICore main execution loop
+ *
+ * Implements the AICPU-AICore register-based dispatch protocol:
+ * 1. Wait for AICPU ready signal via handshake buffer
+ * 2. Report physical core ID and core type, signal AICore ready
+ * 3. Cache per-core PTO2DispatchPayload pointer from hank->task
+ * 4. Poll DATA_MAIN_BASE register for task dispatch until exit signal
+ *
+ * AICPU writes &s_payload_per_core[i] to hank->task before setting
+ * aicpu_ready=1. AICore caches this pointer and reads function_bin_addr +
+ * args pointer from it on each dispatch. reg_val is a monotonically
+ * increasing task ID used only for dispatch signaling and ACK/FIN protocol.
+ *
+ * @param runtime Pointer to Runtime in global memory
+ * @param s_block_idx Block index (core ID)
+ * @param core_type Core type (AIC or AIV)
+ */
+__aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, int s_block_idx, CoreType core_type) {
+    __gm__ Handshake *my_hank = (__gm__ Handshake *)(&runtime->dev.workers[s_block_idx]);
+
+    // Phase 1: report physical core ID + core type and signal done in one write,
+    // with no wait for the AICPU — both fields are self-known. The AICPU opens
+    // this core's register window only after it observes aicore_done, so a single
+    // report suffices. The host clears aicore_done before this kernel launches,
+    // so the value the AICPU reads is this run's report, never a stale prior one.
+    my_hank->physical_core_id = get_physical_core_id();
+    my_hank->core_type = core_type;
+    OUT_OF_ORDER_STORE_BARRIER();
+    my_hank->aicore_done = s_block_idx + 1;  // Signal ready (use s_block_idx + 1 to avoid 0)
+    dcci(my_hank, SINGLE_CACHE_LINE, CACHELINE_OUT);
+
+    // Phase 2: Wait for the AICPU to open our register window. A kernel launch
+    // resets DATA_MAIN_BASE to 0 (verified on a2a3 silicon; a5 shares this
+    // register protocol and relies on CI); the AICPU writes DATA_MAIN_BASE =
+    // AICPU_IDLE_TASK_ID (non-zero) as it opens FAST_PATH, so a non-zero read
+    // means the window is open and reads/writes are valid. The AICPU runs
+    // assign_cores_to_threads (µs) between opening the window and the first
+    // dispatch, so this IDLE is observed long before any task_id lands — the
+    // poll cannot miss it and mistake a later task for the reset value.
+    // Window-open is the sync point for everything the AICPU publishes (task
+    // pointer, swimlane head): the AICPU writes those before opening the window.
+    while (read_reg(RegId::DATA_MAIN_BASE) == 0) {
+        SPIN_WAIT_HINT();
+    }
+    // Report initial idle status via register (FAST_PATH is now open).
+    write_reg(RegId::COND, AICORE_IDLE_VALUE);
+
+    // The AICPU writes task after observing our report (so our CACHELINE_OUT flush
+    // above cannot clobber it) and before opening the window; dcci to read its
+    // fresh value here.
+    dcci(my_hank, SINGLE_CACHE_LINE);
+    __gm__ PTO2DispatchPayload *payload = reinterpret_cast<__gm__ PTO2DispatchPayload *>(my_hank->task);
+
+    // Cache profiling state once after Phase 3. The L2 / PMU rings and the
+    // PMU MMIO base are all stable for the entire run (host-resolved at
+    // AICore kernel entry from KernelArgs::regs[physical_core_id]), so
+    // they are safe to cache here.
+    uint32_t profiling_flag = get_aicore_profiling_flag();
+    bool l2_swimlane_enabled = SIMPLER_GET_DFX_FLAG(profiling_flag, SIMPLER_DFX_FLAG_L2_SWIMLANE);
+    bool dump_args_enabled = SIMPLER_GET_DFX_FLAG(profiling_flag, SIMPLER_DFX_FLAG_DUMP_ARGS);
+    bool pmu_enabled = SIMPLER_GET_DFX_FLAG(profiling_flag, SIMPLER_DFX_FLAG_PMU);
+    // Per-core L2SwimlaneActiveHead channel — lazy-resolved on first task; the
+    // table slot AICPU populates inside `l2_swimlane_aicpu_init` runs
+    // concurrently with kernel entry, so we cannot deref at startup. The
+    // first dispatch is proof AICPU init is done.
+    __gm__ L2SwimlaneActiveHead *l2_swimlane_head = nullptr;
+    L2SwimlaneAicoreLocalState l2_swimlane_local = {nullptr, UINT32_MAX, 0};
+    __gm__ PmuAicoreRing *pmu_ring = pmu_enabled ? get_aicore_pmu_ring() : nullptr;
+    uint64_t pmu_reg_base = pmu_enabled ? get_aicore_pmu_reg_base() : 0;
+
+    // Phase 4: Main execution loop - poll register for tasks until exit signal
+    // Register encoding: AICPU_IDLE_TASK_ID=idle, task_id=task, AICORE_EXIT_SIGNAL=exit
+    uint32_t reg_val = AICPU_IDLE_TASK_ID;
+    uint32_t last_reg_val = AICPU_IDLE_TASK_ID;
+
+    while (true) {
+        reg_val = static_cast<uint32_t>(read_reg(RegId::DATA_MAIN_BASE));
+        if (reg_val == AICORE_EXIT_SIGNAL) {
+            // Signal exit acknowledgment to AICPU
+            write_reg(RegId::COND, AICORE_EXITED_VALUE);
+            break;
+        }
+
+        // Execute task if new (reg_val encoding: AICPU_IDLE_TASK_ID=idle, task_id=task)
+        if (reg_val == AICPU_IDLE_TASK_ID || reg_val == last_reg_val) {
+            SPIN_WAIT_HINT();
+            continue;
+        }
+
+        {
+            // receive_time is captured the instant DATA_MAIN_BASE returned a
+            // new task_id, BEFORE the per-task dcci + ack pair. Paired with
+            // start_time (captured after dcci + ack) it lets DFX split head_OH
+            // into the AICPU→AICore NoC propagation (dispatch_ts → receive_time,
+            // hardware-bound) and the AICore-local dcci+ack cost
+            // (receive_time → start_time, software-tunable). Stored in the
+            // record as a 32-bit delta `start_time - receive_time`.
+            uint64_t receive_time = get_sys_cnt_aicore();
+
+            uint32_t task_id = reg_val;  // Decode: register holds task_id directly
+
+            // First-task lazy resolve of the rotation channel.
+            if (l2_swimlane_enabled && l2_swimlane_head == nullptr) {
+                l2_swimlane_head = get_l2_swimlane_aicore_head();
+            }
+
+            // Select dual-buffer slot: same bit as AICPU used when writing payload
+            __gm__ PTO2DispatchPayload *exec_payload = payload + (task_id & 1u);
+
+            // Invalidate payload buffer (AICPU updates its content each dispatch)
+            dcci(exec_payload, ENTIRE_DATA_CACHE);
+
+            write_reg(RegId::COND, MAKE_ACK_VALUE(task_id));
+
+            // Performance profiling: record start time
+            uint64_t start_time = get_sys_cnt_aicore();
+
+            if (pmu_enabled) {
+                pmu_aicore_begin();
+            }
+
+            // Execute the task
+            execute_task(exec_payload);
+
+            if (pmu_enabled) {
+                pmu_aicore_end();
+                pmu_aicore_record_task(pmu_ring, pmu_reg_base, task_id);
+            }
+
+            if (dump_args_enabled) {
+                pipe_barrier(PIPE_ALL);
+            }
+
+            // Performance profiling: record task execution. task_token_raw is
+            // the PTO2 identity (already in AICore cache from the dispatch
+            // payload); reg_task_id is the per-core dispatch token AICore just
+            // read. Host uses reg_task_id as join key vs the AICPU stream.
+            if (l2_swimlane_enabled) {
+                uint64_t end_time = get_sys_cnt_aicore();
+                uint64_t task_token_raw = exec_payload->local_context.async_ctx.task_token.raw;
+                l2_swimlane_aicore_record_task(
+                    l2_swimlane_head, &l2_swimlane_local, task_token_raw, task_id, receive_time, start_time, end_time
+                );
+            }
+
+            last_reg_val = reg_val;
+            write_reg(RegId::COND, MAKE_FIN_VALUE(task_id));
+        }
+    }
+
+    // Flush all dirty cache lines to HBM before kernel exit.
+    dcci(my_hank, SINGLE_CACHE_LINE, CACHELINE_OUT);
+}

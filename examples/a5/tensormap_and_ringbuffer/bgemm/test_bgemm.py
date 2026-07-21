@@ -1,0 +1,91 @@
+#!/usr/bin/env python3
+# Copyright (c) PyPTO Contributors.
+# This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+# CANN Open Software License Agreement Version 2.0 (the "License").
+# Please refer to the License for details. You may not use this file except in compliance with the License.
+# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+# INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+# See LICENSE in the root of the software repository for the full text of the License.
+# -----------------------------------------------------------------------------------------------------------
+"""BGEMM: batched tiled matrix multiplication C = A @ B.
+
+Fixed 4x4x4 grid with 64x64 tiles, 2 batches.
+Cube core (AIC) for matmul, Vector core (AIV) for accumulation.
+"""
+
+import torch
+from simpler.task_interface import ArgDirection as D
+
+from simpler_setup import SceneTestCase, TaskArgsBuilder, Tensor, scene_test
+
+TILE_M, TILE_K, TILE_N = 64, 64, 64
+GRID_M, GRID_K, GRID_N = 4, 4, 4
+BATCH = 2
+
+
+@scene_test(level=2, runtime="tensormap_and_ringbuffer")
+class TestBgemm(SceneTestCase):
+    RTOL = 1e-3
+    ATOL = 1e-3
+
+    CALLABLE = {
+        "orchestration": {
+            "source": "kernels/orchestration/bgemm_orch.cpp",
+            "function_name": "aicpu_orchestration_entry",
+            # C is a zero-initialized accumulator: the AIV tile kernel reads C
+            # from GM (TLOAD), adds the matmul result, and stores it back across
+            # GRID_K iterations. Its host-provided zeros must be staged H2D, so
+            # C is INOUT (read-before-write), not a pure OUT.
+            "signature": [D.IN, D.IN, D.INOUT],
+        },
+        "incores": [
+            {
+                "func_id": 0,
+                "name": "GEMM",
+                "source": "kernels/mix/kernel_bgemm.cpp",
+                "core_type": "aic",
+                # Cooperative mix sharing one 3-tensor args[] (A, B, C). AIC
+                # reads A, B and produces C.
+                "signature": [D.IN, D.IN, D.OUT],
+            },
+            {
+                "func_id": 1,
+                "name": "ADD",
+                "source": "kernels/mix/kernel_bgemm.cpp",
+                "core_type": "aiv",
+                # AIV reads the same args[0..2] (kernel_bgemm.cpp: args[0]=A in,
+                # args[1]=B in, args[2]=C inout accumulator).
+                "signature": [D.IN, D.IN, D.INOUT],
+            },
+        ],
+    }
+
+    CASES = [
+        {
+            "name": "default",
+            "platforms": ["a5sim", "a5"],
+            "config": {"aicpu_thread_num": 4, "block_dim": 3},
+            "params": {},
+        }
+    ]
+
+    def generate_args(self, params):
+        A = torch.randn(BATCH, GRID_M, GRID_K, TILE_M, TILE_K, dtype=torch.float32) * 0.01
+        B = torch.randn(BATCH, GRID_K, GRID_N, TILE_K, TILE_N, dtype=torch.float32) * 0.01
+        C = torch.zeros(BATCH, GRID_M, GRID_N, TILE_M, TILE_N, dtype=torch.float32)
+        return TaskArgsBuilder(Tensor("A", A.flatten()), Tensor("B", B.flatten()), Tensor("C", C.flatten()))
+
+    def compute_golden(self, args, params):
+        A = args.A.reshape(BATCH, GRID_M, GRID_K, TILE_M, TILE_K)
+        B = args.B.reshape(BATCH, GRID_K, GRID_N, TILE_K, TILE_N)
+        C = args.C.reshape(BATCH, GRID_M, GRID_N, TILE_M, TILE_N)
+        C[:] = 0.0
+        for batch in range(BATCH):
+            for m in range(GRID_M):
+                for n in range(GRID_N):
+                    for k in range(GRID_K):
+                        C[batch, m, n] += torch.matmul(A[batch, m, k], B[batch, k, n])
+
+
+if __name__ == "__main__":
+    SceneTestCase.run_module(__name__)

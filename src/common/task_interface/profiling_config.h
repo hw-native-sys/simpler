@@ -1,0 +1,51 @@
+/*
+ * Copyright (c) PyPTO Contributors.
+ * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+ * CANN Open Software License Agreement Version 2.0 (the "License").
+ * Please refer to the License for details. You may not use this file except in compliance with the License.
+ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+ * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+ * See LICENSE in the root of the software repository for the full text of the License.
+ * -----------------------------------------------------------------------------------------------------------
+ */
+
+#ifndef SRC_COMMON_TASK_INTERFACE_PROFILING_CONFIG_H_
+#define SRC_COMMON_TASK_INTERFACE_PROFILING_CONFIG_H_
+
+#ifndef SIMPLER_DFX
+#define SIMPLER_DFX 1
+#endif
+
+// Gate for the host-side `[STRACE]` run-timing trace facility
+// (src/common/log/include/common/strace.h). Separate from SIMPLER_DFX (which
+// gates the device orch/sched markers) so the host trace can be toggled
+// independently; default on, mirroring SIMPLER_DFX.
+#ifndef SIMPLER_HOST_STRACE
+#define SIMPLER_HOST_STRACE 1
+#endif
+
+#ifndef SIMPLER_ORCH_PROFILING
+#define SIMPLER_ORCH_PROFILING 0
+#endif
+
+#ifndef SIMPLER_SCHED_PROFILING
+#define SIMPLER_SCHED_PROFILING 0
+#endif
+
+#ifndef SIMPLER_TENSORMAP_PROFILING
+#define SIMPLER_TENSORMAP_PROFILING 0
+#endif
+
+#if SIMPLER_ORCH_PROFILING && !SIMPLER_DFX
+#error "SIMPLER_ORCH_PROFILING requires SIMPLER_DFX=1"
+#endif
+
+#if SIMPLER_SCHED_PROFILING && !SIMPLER_DFX
+#error "SIMPLER_SCHED_PROFILING requires SIMPLER_DFX=1"
+#endif
+
+#if SIMPLER_TENSORMAP_PROFILING && !SIMPLER_ORCH_PROFILING
+#error "SIMPLER_TENSORMAP_PROFILING requires SIMPLER_ORCH_PROFILING=1"
+#endif
+
+#endif  // SRC_COMMON_TASK_INTERFACE_PROFILING_CONFIG_H_

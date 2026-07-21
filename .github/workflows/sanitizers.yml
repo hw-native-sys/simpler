@@ -1,0 +1,136 @@
+name: Sanitizers
+
+# Nightly sanitizer sweep of main. Kept in its OWN workflow (not ci.yml) so the
+# schedule trigger fires ONLY these jobs — adding `schedule` to ci.yml would run
+# every unguarded job (pre-commit, ut, packaging, self-hosted hardware) on cron.
+#
+# ASAN and TSAN are separate, mutually-exclusive builds; both instrument only
+# host-compiled code (sim runtime + kernels + orchestration), and sim unifies on
+# g++-15 so the preloaded runtime matches the kernels' ABI. Not a PR gate (too
+# slow, esp. TSAN ~5-15x) — runs nightly on main. Each sanitizer runs a scoped,
+# parallelism-limited subset to dodge the sim-oversubscription livelock; see the
+# run step. detect_leaks=0 until LSan suppressions exist for the device arenas.
+on:
+  schedule:
+    - cron: "0 18 * * *"  # 02:00 Beijing
+  # Manual trigger so a flaky nightly can be re-run on demand to confirm it
+  # reproduces (and now that reports are captured, to inspect the stack).
+  workflow_dispatch:
+
+concurrency:
+  group: sanitizers-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  sanitizer-sim:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    # Both ASAN and TSAN gate (no continue-on-error). They run different scopes:
+    # ASAN (~1.7x) takes the broader set with --max-parallel 2; TSAN (~5-15x)
+    # livelocks the chip-fork L3 cases even serial, so it runs only the light
+    # prepared_callable L2 tests, serially, reporting races without aborting.
+    strategy:
+      fail-fast: false
+      matrix:
+        sanitizer: [asan, tsan]
+        platform: [a2a3sim, a5sim]
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+      - name: Set up C++ compiler
+        run: |
+          sudo add-apt-repository -y ppa:ubuntu-toolchain-r/test
+          sudo apt-get update
+          # build-essential provides the unversioned gcc/g++ that
+          # _ensure_host_compilers checks for; gcc-15/g++-15 are the actual
+          # compilers the sanitizer build unifies on (GxxToolchain prefer_g15).
+          sudo apt-get install -y ninja-build graphviz build-essential
+          sudo apt-get install -y gcc-15 g++-15 || sudo apt-get install -y gcc g++
+          if ! command -v g++-15; then sudo ln -s "$(which g++)" /usr/local/bin/g++-15; fi
+          if ! command -v gcc-15; then sudo ln -s "$(which gcc)" /usr/local/bin/gcc-15; fi
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.10'
+
+      - name: Install with sanitizer
+        run: |
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+          # --no-cache-dir so pip rebuilds rather than reusing a non-sanitizer wheel.
+          pip install --no-cache-dir \
+            --config-settings=cmake.define.SIMPLER_SANITIZER=${{ matrix.sanitizer }} '.[test]'
+
+      - name: Run sanitized scene tests (${{ matrix.sanitizer }}, ${{ matrix.platform }})
+        run: |
+          # Sim unifies host compilation on g++-15, so preload g++-15's runtime.
+          LIB=$(g++-15 -print-file-name=lib${{ matrix.sanitizer }}.so)
+          # Also preload g++-15's libstdc++. ASan resolves its __cxa_throw
+          # interceptor at init via dlsym(RTLD_NEXT, ...); the runtime is dlopen'd
+          # into a plain C Python where libstdc++ is not yet mapped, so that
+          # lookup returns null and the first C++ throw from the runtime aborts
+          # with "CHECK failed: ... real___cxa_throw != 0" (seen on the prewarm
+          # rollback test, which throws by design). Mapping libstdc++ up front
+          # makes the real symbol resolvable. Must be g++-15's, matching $LIB.
+          LIBSTDCXX=$(g++-15 -print-file-name=libstdc++.so)
+          ARCH=$(echo "${{ matrix.platform }}" | sed 's/sim$//')
+          PC="tests/st/$ARCH/tensormap_and_ringbuffer/prepared_callable"
+          # Why the report needs explicit capture: pytest's default fd-capture
+          # buffers each test's stdout/stderr in memory and prints it at test
+          # teardown. A sanitizer abort (abort_on_error=1) kills the process
+          # mid-test, so teardown never runs and that buffer is discarded —
+          # leaving only the parent's faulthandler "Fatal Python error: Aborted"
+          # with no sanitizer stack (that line survives because faulthandler
+          # holds the original fd). Two fixes, below:
+          #   1. `log_path` routes each process's sanitizer report to a per-pid
+          #      file, written at report time independent of fd capture, so it
+          #      survives the abort. Forked chip children (worker.py os.fork)
+          #      inherit the env and get their own files; uploaded as an artifact.
+          #   2. pytest `-s` disables capture so the report also reaches the live
+          #      job log inline (and recovers non-sanitizer abort/assert messages,
+          #      which never go to log_path).
+          LOGDIR="$GITHUB_WORKSPACE/sanitizer-logs"
+          mkdir -p "$LOGDIR"
+          # dlopen_count tests are excluded everywhere: they assert exact dlopen
+          # accounting that the sanitizers perturb by interposing dlopen.
+          if [ "${{ matrix.sanitizer }}" = "tsan" ]; then
+            # TSAN (~5-15x) livelocks the chip-fork L3 cases even serial, so scope
+            # to the light prepared_callable L2 tests (which still surface races),
+            # run serially, and report-don't-abort. Job gates on hang/crash;
+            # triaging the races into a suppressions file is a follow-up.
+            # exitcode=0: TSAN's default exitcode=66 fires on any reported race
+            # even with halt_on_error=0, which would redden the cell every run —
+            # we want races reported in the log, not failing the job (yet).
+            TARGETS="$PC"
+            MAXPAR=1
+            KFILTER="not dlopen_count"
+            export TSAN_OPTIONS=halt_on_error=0:exitcode=0:log_path="$LOGDIR/tsan"
+          else
+            # ASAN (~1.7x) + UBSan. Like TSAN, the chip-fork L3 cases
+            # (dynamic_register is all level=3) livelock on the 4-vCPU runner
+            # once a sanitizer's slowdown is in play (#884 oversubscription
+            # family — AICPU + AICore + host threads oversubscribe), so scope to
+            # the light prepared_callable L2 set. UBSan halt_on_error=1 keeps it
+            # a real gate: any undefined behaviour fails the cell.
+            TARGETS="$PC"
+            MAXPAR=2
+            KFILTER="not parallel_broadcast and not dlopen_count"
+            export ASAN_OPTIONS=detect_leaks=0:abort_on_error=1:halt_on_error=1:log_path="$LOGDIR/asan"
+            export UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1:log_path="$LOGDIR/ubsan"
+          fi
+          # -s (no capture) so the report/abort message also reaches the live
+          # job log inline, not just the uploaded per-pid file.
+          LD_PRELOAD="$LIB $LIBSTDCXX" pytest $TARGETS --platform ${{ matrix.platform }} \
+            --device 0-7 --max-parallel "$MAXPAR" -k "$KFILTER" \
+            --sanitizer ${{ matrix.sanitizer }} -v -s --pto-session-timeout 600 --require-pto-isa
+
+      - name: Upload sanitizer logs (${{ matrix.sanitizer }}, ${{ matrix.platform }})
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sanitizer-logs-${{ matrix.sanitizer }}-${{ matrix.platform }}
+          path: sanitizer-logs/
+          # ASAN writes a file only on error, so a clean run leaves the dir
+          # empty — don't fail the upload (or the job) over that.
+          if-no-files-found: ignore

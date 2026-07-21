@@ -1,0 +1,46 @@
+__pycache__/
+*.pyc
+*.pyo
+.DS_Store
+.idea/
+*.egg-info/
+dist/
+build/
+.env
+.venv/
+venv/
+.cache
+.ccache/
+.vscode
+*bak
+
+# Local Codex files (not tracked in repo)
+.codex
+
+# claude local settings
+.claude/settings.json
+.claude/settings.local.json
+.claude/worktrees
+.claude/plans
+
+# Profiling files
+outputs
+tmp
+
+# Mid-work documentation
+.docs
+
+# Local issue tracking (per-developer, not shared)
+KNOWN_ISSUES.md
+
+# Generated compilation database (clangd)
+compile_commands.json
+
+# Built nanobind extensions
+python/_task_interface*.so
+python/_task_interface*.dylib
+.claude/scheduled_tasks.lock
+
+# Log files
+*.log
+profiling_logs_*/

@@ -1,0 +1,523 @@
+/*
+ * Copyright (c) PyPTO Contributors.
+ * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+ * CANN Open Software License Agreement Version 2.0 (the "License").
+ * Please refer to the License for details. You may not use this file except in compliance with the License.
+ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+ * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+ * See LICENSE in the root of the software repository for the full text of the License.
+ * -----------------------------------------------------------------------------------------------------------
+ */
+
+/**
+ * Runtime Class - Task Dependency Runtime Management
+ *
+ * This is a simplified, standalone runtime class for managing task
+ * dependencies. Tasks are stored in a fixed-size array with compile-time
+ * configurable bounds. Each task has:
+ * - Unique ID (array index)
+ * - Arguments (uint64_t array)
+ * - Fanin (predecessor count)
+ * - Fanout (array of successor task IDs)
+ *
+ * The runtime maintains a ready queue for tasks with fanin == 0.
+ *
+ * Based on patterns from pto_runtime.h/c but simplified for educational
+ * and lightweight scheduling use cases.
+ */
+
+#ifndef SRC_A5_RUNTIME_HOST_BUILD_GRAPH_RUNTIME_RUNTIME_H_
+#define SRC_A5_RUNTIME_HOST_BUILD_GRAPH_RUNTIME_RUNTIME_H_
+
+#include <stdbool.h>
+#include <stddef.h>  // for offsetof (layout static_asserts)
+#include <stdint.h>
+#include <stdio.h>   // for fprintf, printf
+#include <string.h>  // for memset
+
+#include <atomic>
+#include <vector>
+
+#include "common/core_type.h"
+#include "common/device_phase.h"
+#include "common/host_api.h"
+#include "common/platform_config.h"
+#include "aicpu/platform_aicpu_affinity.h"  // MAX_GATE_THREADS (aicpu_allowed_cpus bound)
+#include "tensor_info.h"
+
+// Logging macros using unified logging interface
+#include "common/unified_log.h"
+
+// =============================================================================
+// Configuration Macros
+// =============================================================================
+
+#ifndef RUNTIME_MAX_TASKS
+#define RUNTIME_MAX_TASKS 131072
+#endif
+
+#ifndef RUNTIME_MAX_ARGS
+#define RUNTIME_MAX_ARGS 16
+#endif
+
+#ifndef RUNTIME_MAX_FANOUT
+#define RUNTIME_MAX_FANOUT 128
+#endif
+
+#ifndef RUNTIME_MAX_WORKER
+#define RUNTIME_MAX_WORKER PLATFORM_MAX_CORES_PER_THREAD
+#endif
+
+#ifndef RUNTIME_MAX_FUNC_ID
+#define RUNTIME_MAX_FUNC_ID 1024
+#endif
+
+// =============================================================================
+// Data Structures
+// =============================================================================
+
+/**
+ * Handshake Structure - Shared between Host, AICPU, and AICore
+ *
+ * This structure facilitates communication and synchronization between
+ * AICPU and AICore during task execution.
+ *
+ * Protocol State Machine:
+ * 1. Initialization: AICPU sets aicpu_ready=1
+ * 2. Acknowledgment: AICore sets aicore_done=core_id+1
+ * 3. Task Dispatch: AICPU writes DATA_MAIN_BASE with the task_id after publishing Task*
+ * 4. Task Execution: AICore reads the task and executes
+ * 5. Task Completion: AICore writes FIN to COND; AICPU observes completion
+ * 6. Shutdown: AICPU sets control=1, AICore exits
+ *
+ * Each AICore instance has its own handshake buffer to enable concurrent
+ * task execution across multiple cores.
+ */
+
+/**
+ * Handshake buffer for AICPU-AICore communication
+ *
+ * Each AICore has its own handshake buffer for synchronization with AICPU.
+ * The structure is cache-line aligned (64 bytes) to prevent false sharing
+ * between cores and optimize cache coherency operations.
+ *
+ * Profiling state lives outside this struct: enablement bits and per-core
+ * ring/reg addresses travel through `KernelArgs::enable_profiling_flag` +
+ * `KernelArgs::aicore_* per-core address arrays`, which the AICore kernel entry
+ * forwards into platform-owned per-core slots
+ * (`aicore/aicore_profiling_state.h`). Adding a profiling sub-feature does
+ * not require touching this struct anymore.
+ *
+ * Field Access Patterns:
+ * - aicpu_ready: Written by AICPU, read by AICore
+ * - aicore_done: Written by AICore, read by AICPU
+ * - task: Written by AICPU, read by AICore (0 = no task assigned)
+ * - core_type: Written by AICPU, read by AICore (CoreType::AIC or CoreType::AIV)
+ * - physical_core_id: Written by AICore (Phase 2), read by AICPU
+ * - aicpu_regs_ready / aicore_regs_ready: handshake sequence flags
+ */
+struct Handshake {
+    volatile uint32_t aicpu_ready;        // AICPU ready signal: 0=not ready, 1=ready
+    volatile uint32_t aicore_done;        // AICore ready signal: 0=not ready, core_id+1=ready
+    volatile uint64_t task;               // Task pointer: 0=no task, non-zero=Task* address
+    volatile CoreType core_type;          // Core type: CoreType::AIC or CoreType::AIV
+    volatile uint32_t physical_core_id;   // Physical core ID
+    volatile uint32_t aicpu_regs_ready;   // AICPU register init done: 0=pending, 1=done
+    volatile uint32_t aicore_regs_ready;  // AICore ID reported: 0=pending, 1=done
+} __attribute__((aligned(64)));
+
+/**
+ * Tensor pair for tracking host-device memory mappings.
+ * Used for copy-back during finalize.
+ */
+struct TensorPair {
+    void *host_ptr;
+    void *dev_ptr;
+    size_t size;
+};
+
+/**
+ * Task entry in the runtime
+ *
+ * Each task has a unique ID (its index in the task array), arguments,
+ * and dependency information (fanin/fanout).
+ */
+typedef struct {
+    int task_id;                      // Unique task identifier
+    int func_id;                      // Function identifier
+    uint64_t args[RUNTIME_MAX_ARGS];  // Task arguments
+    int num_args;                     // Number of valid arguments
+
+    // Runtime function pointer address (NEW)
+    // This is the GM address where the kernel binary resides
+    // It's cast to a function pointer at runtime: (KernelFunc)function_bin_addr
+    uint64_t function_bin_addr;  // Address of kernel in device GM memory
+
+    // Core type specification
+    // Specifies which core type this task should run on
+    CoreType core_type;  // CoreType::AIC or CoreType::AIV
+
+    // Dependency tracking (using PTO runtime terminology)
+    std::atomic<int> fanin;          // Number of predecessors (dependencies)
+    int fanout[RUNTIME_MAX_FANOUT];  // Successor task IDs
+    int fanout_count;                // Number of successors
+
+    // DFX-specific fields
+    uint64_t start_time;  // Start time of the task
+    uint64_t end_time;    // End time of the task
+
+    // Selective task-timing slot (TASK_TIMING_SLOT_NONE = untagged; 0..15 valid).
+    // Set post-submit via set_task_timing_slot(); the AICPU folds this task's
+    // dispatch/finish cycles into the tagged slot (see common/device_phase.h).
+    int32_t task_timing_slot;
+} Task;
+
+// =============================================================================
+// Runtime Class
+// =============================================================================
+
+/**
+ * Runtime class for task dependency management
+ *
+ * Maintains a fixed-size array of tasks and uses a Queue for ready tasks.
+ * Tasks are allocated monotonically and never reused within the same
+ * runtime instance.
+ *
+ * Dependencies are managed manually via add_successor().
+ */
+class Runtime {
+public:
+    // ===================== Device-read prefix =====================
+    // Everything from here through `tasks[]` is uploaded to the device. The
+    // ordering is load-bearing: AICore reads `workers[]` at offset 0 and
+    // `tasks[i]` by offset, and `tasks[]` is the LAST device-read member so a
+    // variable-length H2D copy of `offsetof(tasks) + get_task_count()*sizeof(Task)`
+    // (see runtime_device_copy_size) keeps every preceding field at its fixed
+    // offset while shipping only the populated task slots. All fields device
+    // code may read must therefore precede `tasks[]`; the offsetof static_asserts
+    // after the class enforce this. These are public (not hidden behind the
+    // accessors) because they form the host/device ABI, mirroring trb's
+    // DeviceRuntimeLaunchDesc.
+    Handshake workers[RUNTIME_MAX_WORKER];  // Worker (AICore) handshake buffers
+    int worker_count;                       // Number of active workers
+
+    // Total AICPU threads launched on this run. host_build_graph has no
+    // orchestrator/scheduler split — every thread dispatches tasks in
+    // round-robin across the assigned cores. See AicpuExecutor::init.
+    int aicpu_thread_num;
+
+    // Filter-style affinity gate input (a5 onboard). Read device-side by the
+    // affinity gate, so it must precede `tasks[]`. Host fills before launch from
+    // device-side OCCUPY + DSMI CPU_TOPO via pto::a5::compute_allowed_cpus. The
+    // on-device gate keeps threads whose sched_getcpu() lands on one of these
+    // cpu_ids; exec_idx = position in this array drives sched/orch role
+    // assignment. Indices 0..count-2 are scheduler slots, index count-1 is the
+    // orchestrator slot. Sized to MAX_GATE_THREADS (the shared gate/ABI bound,
+    // ≥ any launch count) for headroom — current policy is 4 sched + 1 orch = 5
+    // active.
+    int32_t aicpu_allowed_cpus[MAX_GATE_THREADS];
+    int32_t aicpu_allowed_cpu_count;
+    // Actual AICPU thread launch count for this run. Set by the host
+    // topology probe to popcount(OCCUPY) so CANN spreads threads across
+    // every user-schedulable cpu_id (one per cpu, no over-subscription on
+    // the same physical cpu — over-subscription deadlocks the production
+    // AICPU kernel on SKUs with fewer user cpus than the compile-time
+    // PLATFORM_MAX_AICPU_THREADS_JUST_FOR_LAUNCH bound).
+    int32_t aicpu_launch_count;
+
+    // Next available task ID. Device-read via get_task_count() (AICPU task loop
+    // bound), so it lives in the prefix.
+    int next_task_id;
+
+    // Function address mapping (for API compatibility with rt2). Device-read
+    // under SIMPLER_DFX (dump-args path), so it lives in the prefix.
+    uint64_t func_id_to_addr_[RUNTIME_MAX_FUNC_ID];
+
+    // Tensor info metadata for args dump. Device-read via get_tensor_info()
+    // under SIMPLER_DFX, so it lives in the prefix.
+    void *tensor_info_storage_;
+    uint64_t tensor_info_storage_bytes_;
+    uint32_t tensor_info_offsets_[RUNTIME_MAX_TASKS];
+    uint16_t tensor_info_counts_[RUNTIME_MAX_TASKS];
+
+    // Device allocation ranges used to recover tensor buffer addresses from
+    // task.args[]. Device-read via is_tensor_buffer_addr() under SIMPLER_DFX,
+    // so it lives in the prefix.
+    void *tensor_allocation_storage_;
+    uint64_t tensor_allocation_storage_bytes_;
+    uint32_t tensor_allocation_count_;
+
+    // Task storage — LAST device-read member. The variable-length H2D copy stops
+    // at offsetof(tasks) + get_task_count()*sizeof(Task); the unpopulated tail is
+    // never read device-side (get_task() bounds-checks task_id < next_task_id,
+    // and AICore only touches AICPU-dispatched ids). Inserting a device-read
+    // field after `tasks` would shift its offset and silently produce NaN
+    // outputs in any AICore task-execute test.
+    Task tasks[RUNTIME_MAX_TASKS];  // Fixed-size task array
+
+private:
+    // ===================== Host-only tail =====================
+    // Never crosses to the device (physically after `tasks[]`, excluded from the
+    // H2D copy). See also active_callable_id_ / tensor_pairs_ declared below.
+
+    // Initial ready tasks (computed once, read-only after)
+    int initial_ready_tasks[RUNTIME_MAX_TASKS];
+    int initial_ready_count;
+
+public:
+    /**
+     * Constructor - zero-initialize all arrays
+     */
+    Runtime();
+
+    // =========================================================================
+    // Accessors for the launch/affinity fields.
+    //
+    // Mirror the trb Runtime's accessor surface (which forwards into its `dev`
+    // sub-struct) so the shared platform layer compiles against either variant.
+    // host_build_graph keeps these fields as flat public members, so the
+    // accessors just return them; layout and sizeof are unchanged.
+    // =========================================================================
+
+    int get_worker_count() const { return worker_count; }
+    void set_worker_count(int n) { worker_count = n; }
+    int get_aicpu_thread_num() const { return aicpu_thread_num; }
+    void set_aicpu_thread_num(int n) { aicpu_thread_num = n; }
+    Handshake *get_workers() { return workers; }
+    int32_t get_aicpu_allowed_cpu_count() const { return aicpu_allowed_cpu_count; }
+    void set_aicpu_allowed_cpu_count(int32_t n) { aicpu_allowed_cpu_count = n; }
+    int32_t get_aicpu_launch_count() const { return aicpu_launch_count; }
+    void set_aicpu_launch_count(int32_t n) { aicpu_launch_count = n; }
+    int32_t *get_aicpu_allowed_cpus() { return aicpu_allowed_cpus; }
+    size_t aicpu_allowed_cpus_capacity() const { return sizeof(aicpu_allowed_cpus) / sizeof(aicpu_allowed_cpus[0]); }
+
+    // =========================================================================
+    // Task Management
+    // =========================================================================
+
+    /**
+     * Allocate a new task with the given arguments
+     *
+     * @param args      Array of uint64_t arguments
+     * @param num_args  Number of arguments (must be <= RUNTIME_MAX_ARGS)
+     * @param func_id   Function identifier
+     * @param core_type Core type for this task (CoreType::AIC or CoreType::AIV)
+     * @return Task ID (>= 0) on success, -1 on failure
+     */
+    int add_task(uint64_t *args, int num_args, int func_id, CoreType core_type = CoreType::AIC);
+
+    // Tag an already-submitted task with a timing slot (0..15). Out-of-range
+    // task/slot ids are rejected. See common/device_phase.h.
+    void set_task_timing_slot(int task_id, int32_t slot);
+
+    /**
+     * Add a dependency edge: from_task -> to_task
+     *
+     * This adds to_task to from_task's fanout array and increments
+     * to_task's fanin counter.
+     *
+     * @param from_task  Producer task ID
+     * @param to_task    Consumer task ID (depends on from_task)
+     */
+    void add_successor(int from_task, int to_task);
+
+    // =========================================================================
+    // Query Methods
+    // =========================================================================
+
+    /**
+     * Get a pointer to a task by ID
+     *
+     * @param task_id  Task ID to query
+     * @return Pointer to task, or nullptr if invalid ID
+     */
+    Task *get_task(int task_id);
+
+    /**
+     * Get the total number of tasks in the runtime
+     *
+     * @return Total task count
+     */
+    int get_task_count() const;
+
+    /**
+     * Get initially ready tasks (fanin == 0) as entry point for execution
+     *
+     * This scans all tasks and populates the provided array with task IDs
+     * that have no dependencies (fanin == 0). The runtime can use this
+     * as the starting point for task scheduling.
+     *
+     * @param ready_tasks  Array to populate with ready task IDs (can be
+     * nullptr)
+     * @return Number of initially ready tasks
+     */
+    int get_initial_ready_tasks(int *ready_tasks);
+
+    // =========================================================================
+    // Utility Methods
+    // =========================================================================
+
+    /**
+     * Print the runtime structure to stdout
+     *
+     * Shows task table with fanin/fanout information.
+     */
+    void print_runtime() const;
+
+    // =========================================================================
+    // Tensor Info Metadata
+    // =========================================================================
+
+    void set_tensor_info_storage(void *ptr, uint64_t bytes) {
+        tensor_info_storage_ = ptr;
+        tensor_info_storage_bytes_ = bytes;
+    }
+
+    void clear_tensor_info_storage() {
+        tensor_info_storage_ = nullptr;
+        tensor_info_storage_bytes_ = 0;
+    }
+
+    void set_tensor_info_range(int task_id, uint32_t offset, uint16_t count) {
+        if (task_id < 0 || task_id >= RUNTIME_MAX_TASKS) return;
+        tensor_info_offsets_[task_id] = offset;
+        tensor_info_counts_[task_id] = count;
+    }
+
+    const TensorInfo *get_tensor_info(int task_id, int *count) const {
+        if (count != nullptr) {
+            *count = 0;
+        }
+        if (task_id < 0 || task_id >= RUNTIME_MAX_TASKS || tensor_info_storage_ == nullptr) {
+            return nullptr;
+        }
+        uint16_t tensor_info_count = tensor_info_counts_[task_id];
+        if (tensor_info_count == 0) {
+            return nullptr;
+        }
+        if (count != nullptr) {
+            *count = static_cast<int>(tensor_info_count);
+        }
+        const TensorInfo *base = reinterpret_cast<const TensorInfo *>(tensor_info_storage_);
+        return base + tensor_info_offsets_[task_id];
+    }
+
+    void *get_tensor_info_storage() const { return tensor_info_storage_; }
+
+    uint64_t get_tensor_info_storage_bytes() const { return tensor_info_storage_bytes_; }
+
+    void set_tensor_allocation_storage(void *ptr, uint32_t count, uint64_t bytes) {
+        tensor_allocation_storage_ = ptr;
+        tensor_allocation_count_ = count;
+        tensor_allocation_storage_bytes_ = bytes;
+    }
+
+    void clear_tensor_allocation_storage() {
+        tensor_allocation_storage_ = nullptr;
+        tensor_allocation_count_ = 0;
+        tensor_allocation_storage_bytes_ = 0;
+    }
+
+    bool is_tensor_buffer_addr(uint64_t addr) const {
+        if (tensor_allocation_storage_ == nullptr || tensor_allocation_count_ == 0) {
+            return false;
+        }
+        const TensorAllocationInfo *allocations =
+            reinterpret_cast<const TensorAllocationInfo *>(tensor_allocation_storage_);
+        for (uint32_t i = 0; i < tensor_allocation_count_; i++) {
+            if (allocations[i].contains(addr)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    void *get_tensor_allocation_storage() const { return tensor_allocation_storage_; }
+
+    uint64_t get_tensor_allocation_storage_bytes() const { return tensor_allocation_storage_bytes_; }
+
+    // =========================================================================
+    // Device Orchestration (stub for API compatibility)
+    // =========================================================================
+
+    /**
+     * Set PTO2 shared memory pointer (stub for host_build_graph).
+     * This is a no-op for host orchestration; only used by rt2.
+     */
+    void set_gm_sm_ptr(void *) { /* no-op */ }
+
+    /**
+     * Get function binary address by func_id.
+     * Used by platform layer to resolve kernel addresses.
+     */
+    uint64_t get_function_bin_addr(int func_id) const {
+        if (func_id < 0 || func_id >= RUNTIME_MAX_FUNC_ID) return 0;
+        return func_id_to_addr_[func_id];
+    }
+
+    /**
+     * Replay a previously-uploaded kernel address onto a fresh Runtime.
+     * See a2a3 hbg runtime.h for the full contract.
+     */
+    void replay_function_bin_addr(int func_id, uint64_t addr) {
+        if (func_id < 0 || func_id >= RUNTIME_MAX_FUNC_ID) return;
+        func_id_to_addr_[func_id] = addr;
+    }
+
+    // =========================================================================
+    // Host-only state (not copied to device)
+    // =========================================================================
+
+    // Per-callable_id dispatch. hbg orch runs on host, so AICPU never reads
+    // `active_callable_id_`; the field exists for parity with the shared
+    // platform layer (DeviceRunner stamps it on every run via
+    // set_active_callable_id).
+    int32_t active_callable_id_{-1};
+
+    void set_active_callable_id(int32_t callable_id) { active_callable_id_ = callable_id; }
+    int32_t get_active_callable_id() const { return active_callable_id_; }
+
+    // Host-side tensor ledger for D2H copy-back at finalize. Populated by
+    // runtime_maker.cpp from orch_args at bind time; iterated in
+    // validate_runtime_impl. Not read by AICPU/AICore and — being after
+    // `tasks[]` in the host-only tail — is not uploaded to the device at all.
+    // No fixed cap.
+    std::vector<TensorPair> tensor_pairs_;
+};
+
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Winvalid-offsetof"
+// Layout invariants for the variable-length H2D copy (runtime_device_copy_size).
+// workers[] must be first (AICore reads runtime->workers[block_idx] at offset 0),
+// and tasks[] must be the highest-offset device-read member so copying
+// offsetof(tasks) + n*sizeof(Task) covers every field the device reads while
+// truncating only the unpopulated task tail. The host-only tail
+// (initial_ready_*, registered_*, active_callable_id_, tensor_pairs_) sits after
+// tasks[] and is excluded from the copy. (offsetof over Runtime is technically
+// non-standard-layout due to the std::vector tail; the pragma silences that —
+// the device-read prefix is all standard-layout scalars/arrays.)
+static_assert(offsetof(Runtime, workers) == 0, "workers[] must be first: AICore reads offset 0");
+static_assert(
+    offsetof(Runtime, tasks) > offsetof(Runtime, aicpu_allowed_cpus),
+    "tasks[] must follow the affinity gate array (device-read at fixed offset)"
+);
+static_assert(
+    offsetof(Runtime, tasks) > offsetof(Runtime, func_id_to_addr_),
+    "tasks[] must follow func_id_to_addr_ (device-read under profiling)"
+);
+static_assert(
+    offsetof(Runtime, tasks) > offsetof(Runtime, tensor_allocation_count_),
+    "tasks[] must be the last device-read member (all profiling metadata precedes it)"
+);
+#pragma GCC diagnostic pop
+
+// Number of bytes of the Runtime image copied to the device. host_build_graph
+// uploads a variable-length prefix: everything from offset 0 up to and including
+// the populated task slots, i.e. offsetof(Runtime, tasks) + n*sizeof(Task).
+// tasks[] is the last device-read member (static_asserts above), so this ships
+// every device-read field while truncating the unpopulated task tail and the
+// host-only members after tasks[]. Mirrors the trb declaration so the shared
+// device_runner_helpers.cpp copy path is runtime-agnostic.
+size_t runtime_device_copy_size(const Runtime &rt);
+
+#endif  // SRC_A5_RUNTIME_HOST_BUILD_GRAPH_RUNTIME_RUNTIME_H_

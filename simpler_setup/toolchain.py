@@ -1,0 +1,321 @@
+# Copyright (c) PyPTO Contributors.
+# This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+# CANN Open Software License Agreement Version 2.0 (the "License").
+# Please refer to the License for details. You may not use this file except in compliance with the License.
+# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+# INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+# See LICENSE in the root of the software repository for the full text of the License.
+# -----------------------------------------------------------------------------------------------------------
+
+from __future__ import annotations
+
+import os
+import shlex
+import subprocess
+from enum import IntEnum
+
+from simpler import env_manager
+
+
+# Must match compile_strategy.h
+class ToolchainType(IntEnum):
+    """Toolchain types matching the C enum in compile_strategy.h."""
+
+    CCEC = 0  # ccec (Ascend AICore compiler)
+    HOST_GXX_15 = 1  # g++-15 (host, simulation kernels)
+    HOST_GXX = 2  # g++ (host, orchestration .so)
+    AARCH64_GXX = 3  # aarch64-target-linux-gnu-g++ (cross-compile)
+
+
+def _is_gcc(cxx_path: str) -> bool:
+    """Return True if *cxx_path* is a real GCC (not clang masquerading as g++)."""
+    try:
+        out = subprocess.run(
+            [cxx_path, "--version"], check=False, capture_output=True, text=True, timeout=5
+        ).stdout.lower()
+        return "clang" not in out
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+def _parse_compiler_env(var_name: str, default: str) -> tuple[str, list[str]]:
+    """Split a CC/CXX env var into (compiler_path, extra_flags).
+
+    Conda activate scripts set CC/CXX to a multi-token string such as
+    ``gcc -pthread -B <env>/compiler_compat``. CMake rejects that as
+    ``CMAKE_C_COMPILER`` because it expects a single executable path, so we
+    separate the leading token from the injected flags.
+    """
+    raw = os.environ.get(var_name, "")
+    tokens = shlex.split(raw) if raw else []
+    if not tokens:
+        return default, []
+    return tokens[0], tokens[1:]
+
+
+def _matches_pinned_name(actual: str, pinned: str) -> bool:
+    """True if *actual* (a CC/CXX value) names the *pinned* compiler.
+
+    Matches the bare name or a versioned/triplet variant — ``g++-15``,
+    ``/opt/tc/bin/g++-15``, ``aarch64-linux-gnu-g++-15`` — but NOT a substring
+    false-positive like ``clang++-15`` (``"g++-15" in "clang++-15"`` is True),
+    whose sanitizer-runtime ABI differs from GCC's.
+    """
+    base = os.path.basename(actual)
+    return base == pinned or base.endswith(f"-{pinned}")
+
+
+def _host_compiler_cmake_args(default_cc: str, default_cxx: str, pin_compiler: bool = False) -> list[str]:
+    """CMake ``-D`` args for a host GCC/G++ toolchain.
+
+    Reads CC/CXX from the environment and splits off any conda-injected flags
+    (e.g. ``-pthread -B <env>/compiler_compat``) into CMAKE_{C,CXX}_FLAGS. The
+    flags are re-joined with ``shlex.join`` so tokens containing spaces survive
+    CMake's shell-style re-parse of the flag string.
+
+    When ``pin_compiler`` is set, an env CC/CXX naming a *different* GCC is
+    overridden by the caller's ``default_cc``/``default_cxx`` — but any
+    env-injected flags are still preserved, and an env compiler that already
+    names the pinned version (e.g. a custom path ``/opt/tc/bin/g++-15``) is kept
+    so non-PATH installs still work. This is required under a sanitizer: the
+    host compiler is ABI-pinned to g++-15 so its sanitizer runtime
+    (libtsan.so.2 / libasan.so) matches the lib*san the run-step preloads.
+    scikit-build-core exports CXX during ``pip install``; letting it name a
+    different GCC (whose libtsan SONAME is .so.0) produces a runtime mismatch
+    that fails at dlopen with "cannot allocate memory in static TLS block".
+    """
+    cc, cc_flags = _parse_compiler_env("CC", default_cc)
+    cxx, cxx_flags = _parse_compiler_env("CXX", default_cxx)
+    if pin_compiler:
+        # Keep an env compiler that already names the pinned version (bare,
+        # custom-path, or triplet) so non-PATH installs work; override anything
+        # else — a different GCC, or clang++-15 whose runtime ABI differs.
+        if not _matches_pinned_name(cc, os.path.basename(default_cc)):
+            cc = default_cc
+        if not _matches_pinned_name(cxx, os.path.basename(default_cxx)):
+            cxx = default_cxx
+    args = [
+        f"-DCMAKE_C_COMPILER={cc}",
+        f"-DCMAKE_CXX_COMPILER={cxx}",
+    ]
+    if cc_flags:
+        args.append(f"-DCMAKE_C_FLAGS={shlex.join(cc_flags)}")
+    if cxx_flags:
+        args.append(f"-DCMAKE_CXX_FLAGS={shlex.join(cxx_flags)}")
+    return args
+
+
+class Toolchain:
+    """Base class for all compile toolchains.
+
+    A Toolchain represents a compiler identity: which compiler binary to use,
+    what flags to pass, and what CMake -D arguments to generate.
+
+    The Ascend SDK path is managed by env_manager. Call
+    env_manager.ensure("ASCEND_HOME_PATH") before creating toolchains that
+    need the Ascend SDK (CCECToolchain, Aarch64GxxToolchain, GxxToolchain
+    with Ascend includes).
+
+    Used by:
+    - KernelCompiler: calls get_compile_flags() for direct single-file invocation
+    - BuildTarget (in runtime_compiler.py): calls get_cmake_args() for CMake builds
+    """
+
+    # Host toolchains can carry a host sanitizer runtime; device toolchains
+    # (ccec / aarch64 cross) run on the NPU and cannot. Overridden to True by
+    # the host compilers (Gxx, Gxx15) below.
+    is_host: bool = False
+
+    cxx_path: str
+
+    def __init__(self):
+        self.ascend_home_path = env_manager.get("ASCEND_HOME_PATH")
+
+    def get_compile_flags(self, **kwargs) -> list[str]:
+        """Return base compiler flags for direct invocation."""
+        raise NotImplementedError
+
+    def get_cmake_args(self) -> list[str]:
+        """Return compiler-specific CMake -D arguments."""
+        raise NotImplementedError
+
+
+class CCECToolchain(Toolchain):
+    """Ascend ccec compiler for AICore kernels."""
+
+    def __init__(self, platform: str = "a2a3"):
+        super().__init__()
+        self.platform = platform
+
+        if self.ascend_home_path is None:
+            raise RuntimeError("ASCEND_HOME_PATH is required for CCEC toolchain")
+
+        self.cxx_path = os.path.join(self.ascend_home_path, "bin", "ccec")
+        self.linker_path = os.path.join(self.ascend_home_path, "bin", "ld.lld")
+
+        if not os.path.isfile(self.cxx_path):
+            raise FileNotFoundError(f"ccec compiler not found: {self.cxx_path}")
+        if not os.path.isfile(self.linker_path):
+            raise FileNotFoundError(f"ccec linker not found: {self.linker_path}")
+
+    def get_compile_flags(self, core_type: str = "aiv", **kwargs) -> list[str]:
+        # A5 uses dav-c310 architecture, A2A3 uses dav-c220
+        if self.platform in ("a5", "a5sim"):
+            arch = "dav-c310-vec" if core_type == "aiv" else "dav-c310-cube"
+        elif self.platform in ("a2a3", "a2a3sim"):
+            arch = "dav-c220-vec" if core_type == "aiv" else "dav-c220-cube"
+        else:
+            raise ValueError(f"Unknown platform: {self.platform}. Supported: a2a3, a2a3sim, a5, a5sim")
+
+        return [
+            "-c",
+            "-O3",
+            "-g",
+            "-x",
+            "cce",
+            "-Wall",
+            "-std=c++17",
+            "--cce-aicore-only",
+            f"--cce-aicore-arch={arch}",
+            "-mllvm",
+            "-cce-aicore-stack-size=0x8000",
+            "-mllvm",
+            "-cce-aicore-function-stack-size=0x8000",
+            "-mllvm",
+            "-cce-aicore-record-overflow=false",
+            "-mllvm",
+            "-cce-aicore-addr-transform",
+            "-mllvm",
+            "-cce-aicore-dcci-insert-for-scalar=false",
+            "-DMEMORY_BASE",
+        ]
+
+    def get_cmake_args(self) -> list[str]:
+        return [
+            f"-DBISHENG_CC={self.cxx_path}",
+            f"-DBISHENG_LD={self.linker_path}",
+        ]
+
+
+class Gxx15Toolchain(Toolchain):
+    """g++-15 compiler for simulation kernels."""
+
+    is_host = True
+
+    def __init__(self):
+        super().__init__()
+        self.cxx_path = "g++-15"
+
+    def get_compile_flags(self, core_type: str = "", **kwargs) -> list[str]:
+        flags = [
+            "-shared",
+            "-O2",
+            "-fPIC",
+            "-std=c++23",
+            "-fpermissive",
+            "-Wno-macro-redefined",
+            "-Wno-ignored-attributes",
+            "-D__CPU_SIM",
+            "-DPTO_CPU_MAX_THREADS=1",
+            "-DNDEBUG",
+        ]
+        # g++ does not define __DAV_VEC__/__DAV_CUBE__ like ccec does,
+        # so we must add them explicitly based on core_type.
+        if core_type == "aiv":
+            flags.append("-D__DAV_VEC__")
+        elif core_type == "aic":
+            flags.append("-D__DAV_CUBE__")
+        return flags
+
+    def get_cmake_args(self) -> list[str]:
+        # Default to gcc-15/g++-15 to match self.cxx_path used for direct compilation.
+        return _host_compiler_cmake_args("gcc-15", self.cxx_path)
+
+
+class GxxToolchain(Toolchain):
+    """g++ compiler for host compilation.
+
+    ``prefer_g15`` switches the binary to g++-15/gcc-15. Used under a sanitizer
+    on sim: the runtime, helpers, and orchestration must share the SAME host
+    compiler as the sim kernels (which are always g++-15), because mixing g++
+    and g++-15 sanitizer runtimes is an ABI mismatch that fails at `.so` load.
+    """
+
+    is_host = True
+
+    def __init__(self, prefer_g15: bool = False):
+        super().__init__()
+        self.cxx_path = "g++-15" if prefer_g15 else "g++"
+        self._prefer_g15 = prefer_g15
+        self._gcc = _is_gcc(self.cxx_path)
+
+    def get_compile_flags(self, **kwargs) -> list[str]:
+        flags = ["-shared", "-fPIC", "-O3", "-g", "-std=c++17"]
+        # -fno-gnu-unique: prevent STB_GNU_UNIQUE binding so dlclose actually
+        # unloads the SO.  GCC-only; clang does not produce STB_GNU_UNIQUE.
+        if self._gcc:
+            flags.append("-fno-gnu-unique")
+        return flags
+
+    def get_cmake_args(self) -> list[str]:
+        # Under prefer_g15 (sanitizer build) the compiler is ABI-pinned: env
+        # CC/CXX must not redirect it away from g++-15, or the built .so link a
+        # different lib*san than the run-step preloads. See pin_compiler above.
+        args = _host_compiler_cmake_args(
+            "gcc-15" if self._prefer_g15 else "gcc",
+            self.cxx_path,
+            pin_compiler=self._prefer_g15,
+        )
+        if self.ascend_home_path:
+            args.append(f"-DASCEND_HOME_PATH={self.ascend_home_path}")
+        return args
+
+
+class Aarch64GxxToolchain(Toolchain):
+    """aarch64 cross-compiler for device code."""
+
+    def __init__(self):
+        super().__init__()
+
+        if self.ascend_home_path is None:
+            raise RuntimeError("ASCEND_HOME_PATH is required for aarch64 toolchain")
+
+        self.cxx_path = os.path.join(
+            self.ascend_home_path,
+            "tools",
+            "hcc",
+            "bin",
+            "aarch64-target-linux-gnu-g++",
+        )
+        self.cc_path = os.path.join(
+            self.ascend_home_path,
+            "tools",
+            "hcc",
+            "bin",
+            "aarch64-target-linux-gnu-gcc",
+        )
+        if not os.path.isfile(self.cc_path):
+            raise FileNotFoundError(f"aarch64 C compiler not found: {self.cc_path}")
+        if not os.path.isfile(self.cxx_path):
+            raise FileNotFoundError(f"aarch64 C++ compiler not found: {self.cxx_path}")
+        self._gcc = _is_gcc(self.cxx_path)
+
+    def get_compile_flags(self, **kwargs) -> list[str]:
+        flags = [
+            "-shared",
+            "-fPIC",
+            "-O3",
+            "-g",
+            "-std=c++17",
+        ]
+        # -fno-gnu-unique: prevent STB_GNU_UNIQUE binding so dlclose actually unloads the SO.
+        if self._gcc:
+            flags.append("-fno-gnu-unique")
+        return flags
+
+    def get_cmake_args(self) -> list[str]:
+        return [
+            f"-DCMAKE_C_COMPILER={self.cc_path}",
+            f"-DCMAKE_CXX_COMPILER={self.cxx_path}",
+            f"-DASCEND_HOME_PATH={self.ascend_home_path}",
+        ]

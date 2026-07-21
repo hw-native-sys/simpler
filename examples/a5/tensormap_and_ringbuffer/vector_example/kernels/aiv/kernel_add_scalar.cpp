@@ -1,0 +1,89 @@
+/*
+ * Copyright (c) PyPTO Contributors.
+ * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+ * CANN Open Software License Agreement Version 2.0 (the "License").
+ * Please refer to the License for details. You may not use this file except in compliance with the License.
+ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+ * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+ * See LICENSE in the root of the software repository for the full text of the License.
+ * -----------------------------------------------------------------------------------------------------------
+ */
+
+/**
+ * Scalar Addition Kernel
+ *
+ * Implements: out[i] = src[i] + scalar
+ *
+ * This kernel adds a scalar value to each element of a tensor. It's compiled
+ * separately as a standalone kernel and linked with the dispatcher using
+ * function pointers, demonstrating the separation pattern used in production
+ * systems where kernel binaries are loaded dynamically.
+ */
+
+#include <cstdint>
+#include <pto/pto-inst.hpp>
+
+#include "tensor.h"  // NOLINT(build/include_subdir)
+
+// NOLINTNEXTLINE(build/namespaces)
+using namespace pto;
+
+#include "pipe_sync.h"
+
+#ifndef __gm__
+#define __gm__
+#endif
+
+#ifndef __aicore__
+#define __aicore__ [aicore]  // NOLINT(whitespace/braces)
+#endif
+
+/**
+ * Scalar addition kernel implementation
+ *
+ * Unified signature: all arguments passed via int64_t array
+ * @param args  Argument array:
+ *              args[0] = src pointer (input tensor)
+ *              args[1] = out pointer (output tensor)
+ *              args[2] = scalar value (as uint64_t, needs conversion to float)
+ *              args[3] = size (number of elements)
+ */
+extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ int64_t *args) {
+    // Unpack arguments (Tensor* pointers from runtime)
+    __gm__ Tensor *src_tensor = reinterpret_cast<__gm__ Tensor *>(args[0]);
+    __gm__ Tensor *out_tensor = reinterpret_cast<__gm__ Tensor *>(args[1]);
+    __gm__ float *src = reinterpret_cast<__gm__ float *>(src_tensor->buffer.addr) + src_tensor->start_offset;
+    __gm__ float *out = reinterpret_cast<__gm__ float *>(out_tensor->buffer.addr) + out_tensor->start_offset;
+
+    // Convert scalar from uint64_t to float
+    float scalar = from_u64<float>(static_cast<uint64_t>(args[2]));
+
+    // Configuration: float, 128, 128, 128, 128
+    constexpr int kTRows_ = 128;
+    constexpr int kTCols_ = 128;
+    constexpr int vRows = 128;
+    constexpr int vCols = 128;
+
+    using DynShapeDim5 = Shape<1, 1, 1, vRows, vCols>;
+    using DynStridDim5 = pto::Stride<1, 1, 1, kTCols_, 1>;
+    using GlobalData = GlobalTensor<float, DynShapeDim5, DynStridDim5>;
+    using TileData = Tile<TileType::Vec, float, kTRows_, kTCols_, BLayout::RowMajor, -1, -1>;
+
+    TileData srcTile(vRows, vCols);
+    TileData dstTile(vRows, vCols);
+    TASSIGN(srcTile, 0x0);
+    TASSIGN(dstTile, 0x10000);
+
+    GlobalData srcGlobal(src);
+    GlobalData dstGlobal(out);
+
+    TLOAD(srcTile, srcGlobal);
+    set_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
+    wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
+    TADDS(dstTile, srcTile, scalar);
+    set_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
+    wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
+    TSTORE(dstGlobal, dstTile);
+
+    pipe_sync();
+}

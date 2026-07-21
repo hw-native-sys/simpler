@@ -1,0 +1,46 @@
+# Copyright (c) PyPTO Contributors.
+# This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+# CANN Open Software License Agreement Version 2.0 (the "License").
+# Please refer to the License for details. You may not use this file except in compliance with the License.
+# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+# INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+# See LICENSE in the root of the software repository for the full text of the License.
+# -----------------------------------------------------------------------------------------------------------
+
+Checks: >
+  -*,
+  bugprone-*,
+  performance-*,
+  modernize-*,
+  -modernize-use-trailing-return-type,
+  -modernize-avoid-c-arrays,
+  -modernize-use-nodiscard,
+  -modernize-macro-to-enum,
+  -modernize-deprecated-headers,
+  -modernize-use-auto,
+  -modernize-use-nullptr,
+  -modernize-use-using,
+  -modernize-loop-convert,
+  -modernize-use-default-member-init,
+  -modernize-use-equals-delete,
+  -modernize-use-bool-literals,
+  -modernize-raw-string-literal,
+  -bugprone-easily-swappable-parameters,
+  -bugprone-narrowing-conversions,
+  -bugprone-reserved-identifier,
+  -bugprone-implicit-widening-of-multiplication-result,
+  -bugprone-multi-level-implicit-pointer-conversion,
+  -bugprone-branch-clone,
+  -bugprone-empty-catch,
+  -bugprone-lambda-function-name,
+  -bugprone-macro-parentheses,
+  -bugprone-infinite-loop,
+  -bugprone-argument-comment,
+  -performance-no-int-to-ptr,
+  -performance-enum-size
+
+WarningsAsErrors: '*'
+
+HeaderFilterRegex: '(src|include)/.*'
+
+FormatStyle: file

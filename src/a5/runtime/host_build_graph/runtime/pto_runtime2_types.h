@@ -1,0 +1,26 @@
+/*
+ * Copyright (c) PyPTO Contributors.
+ * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+ * CANN Open Software License Agreement Version 2.0 (the "License").
+ * Please refer to the License for details. You may not use this file except in compliance with the License.
+ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+ * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+ * See LICENSE in the root of the software repository for the full text of the License.
+ * -----------------------------------------------------------------------------------------------------------
+ */
+
+#ifndef SRC_A5_RUNTIME_HOST_BUILD_GRAPH_RUNTIME_PTO_RUNTIME2_TYPES_H_
+#define SRC_A5_RUNTIME_HOST_BUILD_GRAPH_RUNTIME_PTO_RUNTIME2_TYPES_H_
+
+#include "profiling_config.h"
+
+// =============================================================================
+// Args Dump Configuration
+// =============================================================================
+
+// Args dump uses these defaults to size its selective mask table so task-id
+// ring/slot lookup stays aligned with PTO2 task id layout.
+#define PTO2_TASK_WINDOW_SIZE 16384  // Default per-ring task window size (power of 2)
+#define PTO2_MAX_RING_DEPTH 4        // Number of task-id ring layers
+
+#endif  // SRC_A5_RUNTIME_HOST_BUILD_GRAPH_RUNTIME_PTO_RUNTIME2_TYPES_H_

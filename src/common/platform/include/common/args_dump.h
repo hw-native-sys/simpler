@@ -1,0 +1,355 @@
+/*
+ * Copyright (c) PyPTO Contributors.
+ * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+ * CANN Open Software License Agreement Version 2.0 (the "License").
+ * Please refer to the License for details. You may not use this file except in compliance with the License.
+ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+ * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+ * See LICENSE in the root of the software repository for the full text of the License.
+ * -----------------------------------------------------------------------------------------------------------
+ */
+
+/**
+ * @file args_dump.h
+ * @brief Args dump data structures for device-to-host tensor collection
+ *
+ * Independent shared memory region for capturing per-task tensor I/O.
+ * Fully decoupled from profiling — uses its own ready queues, buffer states,
+ * and memory manager thread.
+ *
+ * Memory layout (allocated only when enable_dump_args=true):
+ * ┌─────────────────────────────────────────────────────────────┐
+ * │ DumpDataHeader (fixed header)                               │
+ * │  - Per-thread ready queues (circular FIFOs)                 │
+ * │  - Metadata (num_dump_threads, config)                      │
+ * ├─────────────────────────────────────────────────────────────┤
+ * │ DumpBufferState[0] (Thread 0)                               │
+ * │  - free_queue: SPSC queue of DumpMetaBuffer addresses       │
+ * │  - current_buf_ptr, arena_base, arena_write_offset          │
+ * ├─────────────────────────────────────────────────────────────┤
+ * │ DumpBufferState[1] (Thread 1)                               │
+ * ├─────────────────────────────────────────────────────────────┤
+ * │ ...                                                         │
+ * └─────────────────────────────────────────────────────────────┘
+ *
+ * Per-thread payload arenas are separate allocations. DumpMetaBuffers are
+ * allocated by the host and pushed into per-thread free_queues. Platform-
+ * specific host/device copy mechanics live outside these shared structures.
+ */
+
+#ifndef SRC_COMMON_PLATFORM_INCLUDE_COMMON_ARGS_DUMP_H_
+#define SRC_COMMON_PLATFORM_INCLUDE_COMMON_ARGS_DUMP_H_
+
+#include <cstddef>
+#include <cstdint>
+
+#include "common/dfx_backpressure_device.h"
+#include "common/platform_config.h"
+
+// =============================================================================
+// Constants
+// =============================================================================
+
+constexpr uint32_t ARGS_DUMP_MAGIC = 0x44554D50;  // "DUMP"
+
+// =============================================================================
+// ArgsDumpRole - Formal kernel signature direction
+// =============================================================================
+
+enum class ArgsDumpRole : uint8_t {
+    INPUT = 0,
+    OUTPUT = 1,
+    INOUT = 2,
+};
+
+// =============================================================================
+// ArgsDumpStage - When the tensor was captured
+// =============================================================================
+
+enum class ArgsDumpStage : uint8_t {
+    BEFORE_DISPATCH = 0,
+    AFTER_COMPLETION = 1,
+};
+
+enum class ArgsDumpKind : uint8_t {
+    TENSOR = 0,
+    SCALAR = 1,
+};
+
+using ArgsDumpArgMask = uint64_t;
+
+// Bitmask stored in the platform-owned mask pool when orchestration selects
+// specific task tensor/scalar arguments for dump. Bit N corresponds to the
+// payload arg index: tensors first, then scalars.
+// Zero preserves legacy "dump all tasks" behavior unless selective mode is enabled.
+constexpr ArgsDumpArgMask ARGS_DUMP_ARG_MASK_NONE = 0;
+constexpr uint32_t ARGS_DUMP_ARG_MASK_BITS = 64;
+constexpr uint8_t ARGS_DUMP_RECORD_FLAG_ARG_INDEX_AMBIGUOUS = 1u << 0;
+
+// Max kernel ids a record carries: one per active subtask of a task (its mix
+// membership). Must equal the runtime's PTO2_SUBTASK_SLOT_COUNT (1C2V => 3);
+// can't reference it here (platform layer doesn't include the tmap+ring runtime
+// header), so a static_assert in dump_args_for_task ties the two together.
+constexpr uint8_t ARGS_DUMP_MAX_FUNC_IDS = 3;
+
+// =============================================================================
+// ArgsDumpRecord - Single Args Dump Entry (128B = 2 cache lines)
+// =============================================================================
+
+/**
+ * Per-tensor metadata + payload reference.
+ *
+ * Cache line 1 (64B): identifiers, payload location, compact scalar metadata
+ * Cache line 2 (64B): strides and shapes
+ */
+struct alignas(64) ArgsDumpRecord {
+    // === Cache line 1 (64B) ===
+    uint64_t task_id;                           // PTO2 encoding or plain task index
+    uint8_t role;                               // ArgsDumpRole (formal callable signature)
+    uint8_t stage;                              // ArgsDumpStage (before/after execution)
+    uint8_t ndims;                              // Number of dimensions
+    uint32_t arg_index;                         // Position in the callable signature
+    uint8_t dtype;                              // DataType raw enum value
+    uint8_t truncated;                          // 1 if payload was truncated (tensor > arena capacity)
+    uint8_t is_contiguous;                      // 1 when source view is already PyTorch-contiguous
+    uint8_t pad0_align;                         // Explicit alignment before 64-bit payload offsets
+    uint64_t payload_offset;                    // Monotonic byte offset into thread arena
+    uint64_t payload_size;                      // Bytes actually copied (may be < full tensor bytes)
+    uint64_t scalar_value;                      // Valid when kind == ArgsDumpKind::SCALAR
+    uint8_t kind;                               // ArgsDumpKind
+    uint8_t flags;                              // ARGS_DUMP_RECORD_FLAG_*
+    uint16_t func_ids[ARGS_DUMP_MAX_FUNC_IDS];  // active subtask kernel ids (task's mix set); 0xFFFF unknown
+    uint8_t func_count;                         // number of valid entries in func_ids
+    uint8_t pad0[7];                            // keep cache line 1 = 64B (6 + 1 + 7 = 14)
+
+    // === Cache line 2 (64B) — strided view descriptor ===
+    // start_offset placed first for 8B alignment without padding gaps; total = 8 + 20 + 20 = 48B.
+    uint64_t start_offset;                     // 1D ELEMENT offset of the view origin
+    uint32_t strides[PLATFORM_DUMP_MAX_DIMS];  // Element stride per dimension (strictly > 0, type-enforced)
+    uint32_t shapes[PLATFORM_DUMP_MAX_DIMS];   // Current view shape
+} __attribute__((aligned(64)));
+
+static_assert(sizeof(ArgsDumpRecord) == 128, "ArgsDumpRecord must be 128 bytes (2 cache lines)");
+static_assert(
+    offsetof(ArgsDumpRecord, start_offset) == 64, "ArgsDumpRecord::start_offset must start at cache-line 2 (offset 64)"
+);
+
+// =============================================================================
+// DumpMetaBuffer - Fixed-Size Record Buffer
+// =============================================================================
+
+/**
+ * Fixed-size dump record buffer.
+ * Capacity: PLATFORM_DUMP_RECORDS_PER_BUFFER
+ * Allocated by host, pushed into per-thread free_queue.
+ */
+struct DumpMetaBuffer {
+    ArgsDumpRecord records[PLATFORM_DUMP_RECORDS_PER_BUFFER];
+    volatile uint32_t count;  // Current record count
+} __attribute__((aligned(64)));
+
+// =============================================================================
+// DumpFreeQueue - SPSC Lock-Free Queue for Free Buffers
+// =============================================================================
+
+/**
+ * Single Producer Single Consumer (SPSC) lock-free queue.
+ * Same layout and semantics as PerfFreeQueue, separate type for decoupling.
+ *
+ * Producer: Host (DumpMemoryManager thread) pushes recycled/new buffers
+ * Consumer: Device (AICPU thread) pops buffers when switching
+ */
+struct DumpFreeQueue {
+    volatile uint64_t buffer_ptrs[PLATFORM_DUMP_SLOT_COUNT];
+    volatile uint32_t head;  // Consumer read position (Device increments)
+    volatile uint32_t tail;  // Producer write position (Host increments)
+    uint32_t pad[22];        // Pad to 128 bytes (40 + 88 = 128)
+} __attribute__((aligned(64)));
+
+static_assert(sizeof(DumpFreeQueue) == 128, "DumpFreeQueue must be 128 bytes");
+
+// =============================================================================
+// DumpBufferState - Per-Thread Buffer State
+// =============================================================================
+
+/**
+ * Per-thread buffer management state.
+ *
+ * Writers:
+ * - free_queue.tail: Host writes (pushes new buffers)
+ * - free_queue.head: Device writes (pops buffers)
+ * - current_buf_ptr: Device writes (after pop), Host reads (for flush/collect)
+ * - current_buf_seq: Device writes (monotonic counter)
+ * - arena_write_offset: Device writes (monotonic), Host reads (for overwrite detection)
+ * - dropped_record_count: Device writes (records lost before host export)
+ */
+struct DumpBufferState {
+    DumpFreeQueue free_queue;                // SPSC queue of free DumpMetaBuffer addresses
+    volatile uint64_t current_buf_ptr;       // Current active DumpMetaBuffer (0 = none)
+    volatile uint32_t current_buf_seq;       // Sequence number for ordering
+    uint32_t pad0;                           // Alignment
+    volatile uint64_t arena_base;            // Device pointer to this thread's arena
+    volatile uint64_t arena_size;            // Arena size in bytes
+    volatile uint64_t arena_write_offset;    // Monotonic write cursor (host computes % arena_size)
+    volatile uint32_t dropped_record_count;  // Records dropped before host export
+    uint8_t pad1[84];                        // Pad to 256 bytes (172 + 84 = 256)
+} __attribute__((aligned(64)));
+
+static_assert(sizeof(DumpBufferState) == 256, "DumpBufferState must be 256 bytes");
+static_assert(offsetof(DumpBufferState, current_buf_ptr) == 128, "DumpBufferState current_buf_ptr offset changed");
+static_assert(offsetof(DumpBufferState, arena_base) == 144, "DumpBufferState arena_base offset changed");
+static_assert(
+    offsetof(DumpBufferState, dropped_record_count) == 168, "DumpBufferState dropped_record_count offset changed"
+);
+
+// =============================================================================
+// DumpReadyQueueEntry - Ready Queue Entry
+// =============================================================================
+
+/**
+ * When a DumpMetaBuffer is full, AICPU adds this entry to the thread's ready queue.
+ * Host memory manager retrieves entries and processes them.
+ */
+struct DumpReadyQueueEntry {
+    uint32_t thread_index;  // Thread index (0 ~ num_dump_threads-1)
+    uint32_t pad0;
+    uint64_t buffer_ptr;  // Device pointer to the full DumpMetaBuffer
+    uint32_t buffer_seq;  // Sequence number for ordering
+    uint32_t pad1;
+} __attribute__((aligned(32)));
+
+static_assert(sizeof(DumpReadyQueueEntry) == 32, "DumpReadyQueueEntry must be 32 bytes");
+
+// =============================================================================
+// DumpDataHeader - Fixed Header
+// =============================================================================
+
+/**
+ * Dump data fixed header, located at the start of dump shared memory.
+ *
+ * Contains:
+ * 1. Per-thread ready queues (circular FIFOs) — one per AICPU thread
+ * 2. Metadata (thread count, config)
+ *
+ * Ready queue design mirrors PerfDataHeader but is independent:
+ * - Per-thread queues avoid lock contention
+ * - Producer: AICPU thread (adds full DumpMetaBuffers)
+ * - Consumer: Host DumpMemoryManager thread
+ * - Queue empty: head == tail
+ * - Queue full: (tail + 1) % capacity == head
+ */
+
+// Args-dump level. Carried in DumpDataHeader so the
+// AICPU latches the mode in dump_args_init() before any task is dispatched.
+enum class DumpArgsLevel : uint32_t {
+    OFF = 0,             // no dump
+    PARTIAL = 1,         // only args marked with Arg::dump(...)
+    FULL = 2,            // every task's tensor/scalar I/O (JSON manifest + BIN payload)
+    FULL_JSON_ONLY = 3,  // every task's tensor/scalar metadata to JSON; no BIN
+};
+
+struct DumpDataHeader {
+    // Per-thread ready queues
+    DumpReadyQueueEntry queues[PLATFORM_MAX_AICPU_THREADS][PLATFORM_DUMP_READYQUEUE_SIZE];
+    volatile uint32_t queue_heads[PLATFORM_MAX_AICPU_THREADS];  // Host reads (consumer)
+    volatile uint32_t queue_tails[PLATFORM_MAX_AICPU_THREADS];  // AICPU writes (producer)
+
+    // Metadata (Host initializes, Device reads)
+    uint32_t num_dump_threads;
+    uint32_t records_per_buffer;
+    uint64_t arena_size_per_thread;
+    uint32_t magic;
+    uint32_t dump_args_level;  // DumpArgsLevel: 0=off, 1=partial, 2=full, 3=full_json_only
+    // DFX backpressure coordination (unified across all DFX subsystems).
+    DfxBackpressureHeader backpressure;
+} __attribute__((aligned(64)));
+
+// =============================================================================
+// ArgsDumpInfo - Lightweight Info Struct (passed from runtime to platform API)
+// =============================================================================
+
+/**
+ * Caller fills this struct from runtime-specific tensor types.
+ * Platform layer is agnostic to runtime-specific types (Tensor, PTO2TaskPayload, etc.).
+ */
+struct ArgsDumpInfo {
+    uint64_t task_id;
+    ArgsDumpRole role;
+    ArgsDumpStage stage;
+    uint8_t dtype;
+    uint8_t ndims;
+    uint32_t arg_index;
+    uint64_t buffer_addr;
+    uint64_t scalar_value;
+    int32_t func_ids[ARGS_DUMP_MAX_FUNC_IDS];  // active subtask kernel ids; -1 unknown
+    int32_t func_count;
+    uint8_t kind;
+    uint8_t flags;
+    uint8_t pad[6];
+    uint64_t start_offset;                     // 1D ELEMENT offset of the view origin
+    uint32_t shapes[PLATFORM_DUMP_MAX_DIMS];   // Current view shape
+    uint32_t strides[PLATFORM_DUMP_MAX_DIMS];  // Element stride per dimension (strictly > 0, type-enforced)
+};
+
+// =============================================================================
+// Helper Functions - Memory Layout
+// =============================================================================
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+/**
+ * Calculate total memory size for dump header + buffer states.
+ *
+ * @param num_dump_threads Number of AICPU scheduling threads
+ * @return Total bytes for DumpDataHeader + DumpBufferState array
+ */
+inline size_t calc_dump_data_size(int num_dump_threads) {
+    return sizeof(DumpDataHeader) + num_dump_threads * sizeof(DumpBufferState);
+}
+
+/**
+ * Calculate per-thread arena size from configuration constants.
+ *
+ * @return Arena size in bytes per thread
+ */
+inline uint64_t calc_dump_arena_size() {
+    return static_cast<uint64_t>(PLATFORM_DUMP_BUFFERS_PER_THREAD) * PLATFORM_DUMP_RECORDS_PER_BUFFER *
+           PLATFORM_DUMP_AVG_TENSOR_BYTES;
+}
+
+/**
+ * Get DumpDataHeader pointer.
+ *
+ * @param base_ptr Dump shared memory base address
+ * @return DumpDataHeader pointer
+ */
+inline DumpDataHeader *get_dump_header(void *base_ptr) { return reinterpret_cast<DumpDataHeader *>(base_ptr); }
+
+/**
+ * Get DumpBufferState array start address (after DumpDataHeader).
+ *
+ * @param base_ptr Dump shared memory base address
+ * @return DumpBufferState array pointer
+ */
+inline DumpBufferState *get_dump_buffer_states(void *base_ptr) {
+    return reinterpret_cast<DumpBufferState *>(reinterpret_cast<char *>(base_ptr) + sizeof(DumpDataHeader));
+}
+
+/**
+ * Get DumpBufferState for specified thread.
+ *
+ * @param base_ptr Dump shared memory base address
+ * @param thread_idx Thread index (0 ~ num_dump_threads-1)
+ * @return DumpBufferState pointer
+ */
+inline DumpBufferState *get_dump_buffer_state(void *base_ptr, int thread_idx) {
+    return &get_dump_buffer_states(base_ptr)[thread_idx];
+}
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif  // SRC_COMMON_PLATFORM_INCLUDE_COMMON_ARGS_DUMP_H_
