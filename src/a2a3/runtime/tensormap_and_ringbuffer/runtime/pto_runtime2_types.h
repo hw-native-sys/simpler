@@ -465,21 +465,12 @@ static_assert(
 // never reach -> provable deadlock.
 static constexpr uint32_t PTO2_FANOUT_SCOPE_BIT = 0x80000000u;
 
-enum PTO2ReadyState : uint8_t {
-    PTO2_READY_UNCLAIMED = 0,
-    PTO2_READY_CLAIMED = 1,
-};
-
-enum PTO2CompletionFlag : uint8_t {
-    PTO2_COMPLETION_DONE = 2,
-};
-
-enum PTO2DeferredCompletionFlag : uint8_t {
-    PTO2_SUBTASK_DEFERRED = 4,
-};
-
-enum PTO2DispatchPropagationFlag : uint8_t {
-    PTO2_DISPATCH_PROPAGATED = 8,
+enum PTO2TaskLifecycleFlag : uint8_t {
+    PTO2_LIFECYCLE_FLAGS_NONE = 0,
+    PTO2_READY_CLAIMED = 1U << 0,
+    PTO2_COMPLETION_DONE = 1U << 1,
+    PTO2_SUBTASK_DEFERRED = 1U << 2,
+    PTO2_DISPATCH_PROPAGATED = 1U << 3,
 };
 
 static_assert((PTO2_DISPATCH_PROPAGATED & (PTO2_READY_CLAIMED | PTO2_COMPLETION_DONE | PTO2_SUBTASK_DEFERRED)) == 0);
@@ -520,7 +511,7 @@ struct alignas(64) PTO2TaskSlotState {
     bool allow_early_resolve{false};
     // Concurrent lifecycle updates preserve unrelated bits. Slot reuse clears
     // the byte only after the previous task lifetime is quiescent.
-    std::atomic<uint8_t> ready_state{PTO2_READY_UNCLAIMED};
+    std::atomic<uint8_t> lifecycle_flags{PTO2_LIFECYCLE_FLAGS_NONE};
     int32_t dep_pool_mark{0};  // Dep pool top after Orch-side wiring
 
     std::atomic<int16_t> completed_subtasks{0};  // Each core completion increments by 1
@@ -569,23 +560,23 @@ struct alignas(64) PTO2TaskSlotState {
     // Lock-free callers use this only as a fast-path hint. A false result is
     // rechecked by try_mark_dispatch_propagated() while holding fanout_lock.
     bool has_dispatch_propagated() const {
-        return (ready_state.load(std::memory_order_acquire) & PTO2_DISPATCH_PROPAGATED) != 0;
+        return (lifecycle_flags.load(std::memory_order_acquire) & PTO2_DISPATCH_PROPAGATED) != 0;
     }
 
     // The propagation owner holds fanout_lock from this claim through its
     // fanout snapshot so wiring can classify late edges exactly once.
     bool try_mark_dispatch_propagated() {
-        return (ready_state.fetch_or(PTO2_DISPATCH_PROPAGATED, std::memory_order_acq_rel) & PTO2_DISPATCH_PROPAGATED) ==
-               0;
+        return (lifecycle_flags.fetch_or(PTO2_DISPATCH_PROPAGATED, std::memory_order_acq_rel) &
+                PTO2_DISPATCH_PROPAGATED) == 0;
     }
 
     void mark_completed() {
         task_state.store(PTO2_TASK_COMPLETED, std::memory_order_release);
-        ready_state.fetch_or(PTO2_COMPLETION_DONE, std::memory_order_release);
+        lifecycle_flags.fetch_or(PTO2_COMPLETION_DONE, std::memory_order_release);
     }
 
     bool is_completion_flag_set() const {
-        return (ready_state.load(std::memory_order_acquire) & PTO2_COMPLETION_DONE) != 0;
+        return (lifecycle_flags.load(std::memory_order_acquire) & PTO2_COMPLETION_DONE) != 0;
     }
 
     // Set by any subtask FIN that pushed deferred-completion CONDITIONs to the
@@ -594,10 +585,10 @@ struct alignas(64) PTO2TaskSlotState {
     // release write is sequenced before on_subtask_complete's acq_rel fetch_add
     // and the acquire read after, so all earlier subtasks' writes are visible to
     // the last subtask.
-    void mark_any_subtask_deferred() { ready_state.fetch_or(PTO2_SUBTASK_DEFERRED, std::memory_order_release); }
+    void mark_any_subtask_deferred() { lifecycle_flags.fetch_or(PTO2_SUBTASK_DEFERRED, std::memory_order_release); }
 
     bool has_any_subtask_deferred() const {
-        return (ready_state.load(std::memory_order_acquire) & PTO2_SUBTASK_DEFERRED) != 0;
+        return (lifecycle_flags.load(std::memory_order_acquire) & PTO2_SUBTASK_DEFERRED) != 0;
     }
 
     void set_allow_early_resolve(bool v) { allow_early_resolve = v; }
@@ -621,7 +612,7 @@ struct alignas(64) PTO2TaskSlotState {
         fanout_refcount.store(0, std::memory_order_relaxed);
         completed_subtasks.store(0, std::memory_order_relaxed);
         next_block_idx.store(0, std::memory_order_relaxed);
-        ready_state.store(PTO2_READY_UNCLAIMED, std::memory_order_relaxed);
+        lifecycle_flags.store(PTO2_LIFECYCLE_FLAGS_NONE, std::memory_order_relaxed);
         allow_early_resolve = false;
         // Note: payload early-dispatch fields (state, masks, fanin, publication count)
         // are NOT reset here — this method skips the payload by contract. They are

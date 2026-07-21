@@ -441,7 +441,7 @@ static_assert(
  * Per-task slot scheduling state (scheduler-private, NOT in shared memory)
  *
  * Consolidates all hot-path scheduling fields into a single cache-friendly
- * structure (32 bytes = half a cache line). Accessing any field of a task's
+ * structure (64 bytes = one cache line). Accessing any field of a task's
  * slot state brings all related fields into the same cache line.
  *
  * Concurrency notes:
@@ -466,17 +466,11 @@ static_assert(
 // never reach -> provable deadlock.
 static constexpr uint32_t PTO2_FANOUT_SCOPE_BIT = 0x80000000u;
 
-enum PTO2ReadyState : uint8_t {
-    PTO2_READY_UNCLAIMED = 0,
-    PTO2_READY_CLAIMED = 1,
-};
-
-enum PTO2CompletionFlag : uint8_t {
-    PTO2_COMPLETION_DONE = 2,
-};
-
-enum PTO2DeferredCompletionFlag : uint8_t {
-    PTO2_SUBTASK_DEFERRED = 4,
+enum PTO2TaskLifecycleFlag : uint8_t {
+    PTO2_LIFECYCLE_FLAGS_NONE = 0,
+    PTO2_READY_CLAIMED = 1U << 0,
+    PTO2_COMPLETION_DONE = 1U << 1,
+    PTO2_SUBTASK_DEFERRED = 1U << 2,
 };
 
 struct alignas(64) PTO2TaskSlotState {
@@ -512,7 +506,7 @@ struct alignas(64) PTO2TaskSlotState {
     // slot_state (not payload) so fanin walks read the already-hot producer
     // slot_state cache line.
     bool allow_early_resolve{false};
-    std::atomic<uint8_t> ready_state{PTO2_READY_UNCLAIMED};
+    std::atomic<uint8_t> lifecycle_flags{PTO2_LIFECYCLE_FLAGS_NONE};
     int32_t dep_pool_mark{0};  // Dep pool top after Orch-side wiring
 
     std::atomic<int16_t> completed_subtasks{0};  // Each core completion increments by 1
@@ -554,11 +548,11 @@ struct alignas(64) PTO2TaskSlotState {
 
     void mark_completed() {
         task_state.store(PTO2_TASK_COMPLETED, std::memory_order_release);
-        ready_state.fetch_or(PTO2_COMPLETION_DONE, std::memory_order_release);
+        lifecycle_flags.fetch_or(PTO2_COMPLETION_DONE, std::memory_order_release);
     }
 
     bool is_completion_flag_set() const {
-        return (ready_state.load(std::memory_order_acquire) & PTO2_COMPLETION_DONE) != 0;
+        return (lifecycle_flags.load(std::memory_order_acquire) & PTO2_COMPLETION_DONE) != 0;
     }
 
     // Set by any subtask FIN that pushed deferred-completion CONDITIONs to the
@@ -567,10 +561,10 @@ struct alignas(64) PTO2TaskSlotState {
     // release write is sequenced before on_subtask_complete's acq_rel fetch_add
     // and the acquire read after, so all earlier subtasks' writes are visible to
     // the last subtask.
-    void mark_any_subtask_deferred() { ready_state.fetch_or(PTO2_SUBTASK_DEFERRED, std::memory_order_release); }
+    void mark_any_subtask_deferred() { lifecycle_flags.fetch_or(PTO2_SUBTASK_DEFERRED, std::memory_order_release); }
 
     bool has_any_subtask_deferred() const {
-        return (ready_state.load(std::memory_order_acquire) & PTO2_SUBTASK_DEFERRED) != 0;
+        return (lifecycle_flags.load(std::memory_order_acquire) & PTO2_SUBTASK_DEFERRED) != 0;
     }
 
     void set_allow_early_resolve(bool v) { allow_early_resolve = v; }
@@ -594,7 +588,7 @@ struct alignas(64) PTO2TaskSlotState {
         fanout_refcount.store(0, std::memory_order_relaxed);
         completed_subtasks.store(0, std::memory_order_relaxed);
         next_block_idx.store(0, std::memory_order_relaxed);
-        ready_state.store(PTO2_READY_UNCLAIMED, std::memory_order_relaxed);
+        lifecycle_flags.store(PTO2_LIFECYCLE_FLAGS_NONE, std::memory_order_relaxed);
         allow_early_resolve = false;
         // Note: payload early-dispatch fields (state, masks, fanin, publication count)
         // are NOT reset here — this method skips the payload by contract. They are

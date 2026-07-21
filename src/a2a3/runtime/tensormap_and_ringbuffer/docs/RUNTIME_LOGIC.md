@@ -683,7 +683,7 @@ reserved core slot and a launch-visible payload before a consumer can pre-occupy
 `next_block_idx` records reservation progress; `published_block_count` independently establishes
 publication and early-candidate readiness.
 
-The producer's slot-local dispatch-propagated bit in `ready_state` and fanout snapshot are
+The producer's slot-local dispatch-propagated bit in `lifecycle_flags` and fanout snapshot are
 serialized under `fanout_lock` with consumer wiring. Wiring already locks and reads the
 producer's 64-byte `PTO2TaskSlotState`, so testing this bit does not read a producer payload
 cache line. An edge already in the snapshot is counted by scheduler propagation; wiring seeds
