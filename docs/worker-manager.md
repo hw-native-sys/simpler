@@ -16,9 +16,9 @@ SUB) in its own address space.
 
 `WorkerEndpointCaps::max_in_flight` defines the dispatch credits of one
 endpoint. `WorkerThread` owns that many executor threads and reports itself
-available while at least one credit remains. Production local mailboxes still
-advertise one credit at this stage; the credit mechanism is in place for the
-bounded two-flight HostGraph path.
+available while at least one credit remains. Onboard a2a3 HostGraph chip
+mailboxes advertise two credits; TRB, simulation, SUB, nested Worker, and
+remote endpoints advertise one.
 
 The remote L3 design keeps this local fork/shm path behind
 `LocalMailboxEndpoint` and reserves the same `WorkerEndpoint` boundary for a
@@ -153,9 +153,11 @@ group sub-index.
 
 Each `LocalMailboxEndpoint` drives a `MAILBOX_SIZE`-byte `MAP_SHARED` region
 containing two fixed-size task frames. Slot generation identifies frame reuse;
-the protocol magic/version rejects mismatched parent and child layouts. Local
-production endpoints currently publish only slot 0, so this layout change is
-behavior-equivalent until the child gains two run threads.
+the protocol magic/version rejects mismatched parent and child layouts. An
+onboard a2a3 HostGraph child owns two long-lived task threads. Each thread has
+its own `ChipWorker`/`DeviceRunner`, Runtime storage, streams, kernel arguments,
+diagnostic collectors, and fixed arena bank. This isolates complete run state
+instead of making `DeviceRunnerBase`'s mutable launch state concurrent.
 The Python facade forks one child per mailbox **before**
 `WorkerManager::start()` (so the parent has only the Python main thread when
 fork runs, avoiding the classical "fork in a multi-threaded process" hazard)
@@ -221,6 +223,12 @@ The child inherits the parent's full address space at fork time, so:
 - ChipCallable objects (pre-fork allocated) are COW-visible at the same VA
 - The Python callable registry is COW-visible
 - Tensor data in `torch.share_memory_()` regions is fully shared (MAP_SHARED)
+
+Control commands remain exclusive with task frames. Request-session resources
+that require control operations, such as L3-L2 message regions, must therefore
+be created before the first device task is published. The two-flight hardware
+test creates both token queues before request A submits its task; request B then
+uses its prepared queue without draining A.
 
 ### 3.3 Mailbox layout
 

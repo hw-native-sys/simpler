@@ -416,13 +416,16 @@ WorkerCompletion LocalMailboxEndpoint::run_task_slot(Ring *ring, const WorkerDis
 // WorkerManager
 // =============================================================================
 
-void WorkerManager::add_next_level(void *mailbox) {
-    add_next_level_at(static_cast<int32_t>(next_level_entries_.size()), mailbox);
+void WorkerManager::add_next_level(void *mailbox, uint32_t max_in_flight) {
+    add_next_level_at(static_cast<int32_t>(next_level_entries_.size()), mailbox, max_in_flight);
 }
 
-void WorkerManager::add_next_level_at(int32_t worker_id, void *mailbox) {
+void WorkerManager::add_next_level_at(int32_t worker_id, void *mailbox, uint32_t max_in_flight) {
     if (worker_id < 0) throw std::invalid_argument("WorkerManager::add_next_level_at: negative worker_id");
-    next_level_entries_.push_back(LocalNextLevelEntry{worker_id, mailbox});
+    if (max_in_flight == 0 || max_in_flight > MAILBOX_TASK_SLOT_COUNT) {
+        throw std::invalid_argument("WorkerManager::add_next_level_at: invalid max_in_flight");
+    }
+    next_level_entries_.push_back(LocalNextLevelEntry{worker_id, mailbox, max_in_flight});
 }
 
 void WorkerManager::add_next_level_endpoint(std::unique_ptr<WorkerEndpoint> endpoint) {
@@ -459,7 +462,7 @@ void WorkerManager::start(Ring *ring, const OnCompleteFn &on_complete) {
     auto make_next_level_threads = [&]() {
         for (const auto &entry : next_level_entries_) {
             auto wt = std::make_unique<WorkerThread>();
-            auto endpoint = std::make_unique<LocalMailboxEndpoint>(entry.worker_id, entry.mailbox);
+            auto endpoint = std::make_unique<LocalMailboxEndpoint>(entry.worker_id, entry.mailbox, entry.max_in_flight);
             wt->start(ring, this, on_complete, std::move(endpoint));
             next_level_threads_.push_back(std::move(wt));
         }

@@ -482,8 +482,8 @@ public:
     // Register a worker. `mailbox` is a MAILBOX_SIZE-byte MAP_SHARED
     // region; the real worker (a `ChipWorker` for NEXT_LEVEL, a Python
     // callable for SUB) lives in the forked child.
-    void add_next_level(void *mailbox);
-    void add_next_level_at(int32_t worker_id, void *mailbox);
+    void add_next_level(void *mailbox, uint32_t max_in_flight = 1);
+    void add_next_level_at(int32_t worker_id, void *mailbox, uint32_t max_in_flight = 1);
     void add_next_level_endpoint(std::unique_ptr<WorkerEndpoint> endpoint);
     void add_sub(void *mailbox);
 
@@ -573,6 +573,7 @@ private:
     struct LocalNextLevelEntry {
         int32_t worker_id{-1};
         void *mailbox{nullptr};
+        uint32_t max_in_flight{1};
     };
     std::vector<LocalNextLevelEntry> next_level_entries_;
     std::vector<void *> sub_entries_;

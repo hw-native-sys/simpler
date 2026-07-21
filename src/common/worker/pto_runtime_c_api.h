@@ -207,6 +207,9 @@ int simpler_run(
     DeviceContextHandle ctx, RuntimeHandle runtime, int32_t callable_id, const void *args, const CallConfig *config
 );
 
+/** Select the arena bank used by subsequent calls on the current thread. */
+int select_arena_bank_ctx(DeviceContextHandle ctx, unsigned arena_bank);
+
 /** Bind one request and start its Host work without launching Device S. */
 int simpler_prepare_request(
     DeviceContextHandle ctx, RuntimeHandle runtime, int32_t callable_id, const void *args, const CallConfig *config,

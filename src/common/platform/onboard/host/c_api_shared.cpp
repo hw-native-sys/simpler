@@ -672,6 +672,15 @@ int simpler_run(
     }
 }
 
+int select_arena_bank_ctx(DeviceContextHandle ctx, unsigned arena_bank) {
+    if (ctx == NULL) return -1;
+    try {
+        return static_cast<DeviceRunnerBase *>(ctx)->select_arena_bank(arena_bank);
+    } catch (...) {
+        return -1;
+    }
+}
+
 int simpler_prepare_request(
     DeviceContextHandle ctx, RuntimeHandle runtime, int32_t callable_id, const void *args, const CallConfig *config,
     unsigned arena_bank

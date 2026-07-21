@@ -132,6 +132,7 @@ from .task_interface import (
     MAILBOX_OFF_PROTOCOL,
     MAILBOX_PROTOCOL_MAGIC_VERSION,
     MAILBOX_SIZE,
+    MAILBOX_TASK_SLOT_SIZE,
     CallConfig,
     ChipCallable,
     ChipDomainContext,
@@ -892,8 +893,9 @@ def _read_control_digest(buf) -> bytes:
     return bytes(buf[_OFF_CONTROL_CALLABLE_HASH : _OFF_CONTROL_CALLABLE_HASH + CALLABLE_HASH_DIGEST_BYTES])
 
 
-def _read_task_digest(buf) -> bytes:
-    return bytes(buf[_OFF_TASK_CALLABLE_HASH : _OFF_TASK_CALLABLE_HASH + CALLABLE_HASH_DIGEST_BYTES])
+def _read_task_digest(buf, frame_offset: int = 0) -> bytes:
+    start = frame_offset + _OFF_TASK_CALLABLE_HASH
+    return bytes(buf[start : start + CALLABLE_HASH_DIGEST_BYTES])
 
 
 def _format_digest(digest: bytes) -> str:
@@ -965,7 +967,7 @@ def _buffer_field_addr(buf, offset: int) -> int:
     return ctypes.addressof(ctypes.c_char.from_buffer(buf)) + offset
 
 
-def _write_error(buf, code: int, msg: str = "") -> None:
+def _write_error(buf, code: int, msg: str = "", frame_offset: int = 0) -> None:
     """Write an (error code, message) tuple into the mailbox error region.
 
     The message is UTF-8-encoded and truncated to ``MAILBOX_ERROR_MSG_SIZE - 1``
@@ -973,10 +975,10 @@ def _write_error(buf, code: int, msg: str = "") -> None:
     NUL-terminated content. On success (code=0) callers may pass an empty
     message; the region is zero-padded.
     """
-    struct.pack_into("i", buf, _OFF_ERROR, code)
+    struct.pack_into("i", buf, frame_offset + _OFF_ERROR, code)
     encoded = msg.encode("utf-8", "replace")
     n = min(len(encoded), MAILBOX_ERROR_MSG_SIZE - 1)
-    start = MAILBOX_OFF_ERROR_MSG
+    start = frame_offset + MAILBOX_OFF_ERROR_MSG
     buf[start : start + n] = encoded[:n]
     # Zero-pad the remaining bytes so stale content from a previous dispatch
     # never leaks into the current error report.
@@ -996,15 +998,15 @@ def _format_exc(prefix: str, exc: BaseException) -> str:
     return f"{prefix}: {type(exc).__name__}: {exc}"
 
 
-def _validate_task_protocol(buf) -> None:
-    protocol = struct.unpack_from("Q", buf, MAILBOX_OFF_PROTOCOL)[0]
+def _validate_task_protocol(buf, frame_offset: int = 0) -> None:
+    protocol = struct.unpack_from("Q", buf, frame_offset + MAILBOX_OFF_PROTOCOL)[0]
     if protocol != MAILBOX_PROTOCOL_MAGIC_VERSION:
         raise RuntimeError(
             f"mailbox protocol mismatch: got 0x{protocol:016x}, expected 0x{MAILBOX_PROTOCOL_MAGIC_VERSION:016x}"
         )
 
 
-def _read_args_from_mailbox(buf) -> TaskArgs:
+def _read_args_from_mailbox(buf, frame_offset: int = 0) -> TaskArgs:
     """Decode the TaskArgs blob written by C++ write_blob from the mailbox.
 
     Used by the Python-targeted child loops (sub_worker, nested L4+ child)
@@ -1021,7 +1023,7 @@ def _read_args_from_mailbox(buf) -> TaskArgs:
     (HCCL window slots etc.) — now structurally impossible.
     """
     mailbox_addr = ctypes.addressof(ctypes.c_char.from_buffer(buf))
-    return read_args_from_blob(mailbox_addr + _OFF_TASK_ARGS_BLOB)
+    return read_args_from_blob(mailbox_addr + frame_offset + _OFF_TASK_ARGS_BLOB)
 
 
 def _sub_worker_loop(  # noqa: PLR0912 -- unified task/control mailbox state machine
@@ -1533,13 +1535,24 @@ def _comm_base_handle(cw: ChipWorker) -> int:
     return int(handle)
 
 
-def _ensure_prepared(cw, registry, prepared, cid: int, *, device_id: int) -> None:
+def _ensure_prepared(run_workers, registry, prepared, cid: int, *, device_id: int) -> None:
     if cid in prepared:
         return
     callable_obj = registry.get(cid)
     if callable_obj is None:
         raise RuntimeError(f"chip_process dev={device_id}: cid {cid} not in registry")
-    cw._register_callable_at_slot(cid, callable_obj)
+    registered = []
+    try:
+        for worker in run_workers:
+            worker._register_callable_at_slot(cid, callable_obj)
+            registered.append(worker)
+    except Exception:
+        for worker in reversed(registered):
+            try:
+                worker._unregister_slot(cid)
+            except Exception:  # noqa: BLE001
+                pass
+        raise
     prepared.add(cid)
 
 
@@ -1557,6 +1570,7 @@ def _run_chip_main_loop(  # noqa: PLR0912, PLR0913, PLR0915 -- unified TASK_READ
     chip_runtime: str = "",
     on_task_done_success=None,
     prepared: set[int] | None = None,
+    run_workers=None,
 ) -> None:
     """Unified TASK_READY / CONTROL_REQUEST / SHUTDOWN state machine.
 
@@ -1583,65 +1597,65 @@ def _run_chip_main_loop(  # noqa: PLR0912, PLR0913, PLR0915 -- unified TASK_READ
     # rebuilt from the table on every map/unmap.
     host_buf_table: dict[int, tuple[SharedMemory, int, int, int]] = {}  # token -> (shm, lo, hi, child_base)
     host_buf_ranges: list[tuple[int, int, int]] = []  # (parent_lo, parent_hi, child_base)
+    slot_workers = list(run_workers) if run_workers is not None else [cw]
+    if not slot_workers or slot_workers[0] is not cw:
+        raise RuntimeError("chip run worker 0 must be the control ChipWorker")
+    stop_run_workers = threading.Event()
+
+    def run_task_loop(slot_index: int, slot_worker: ChipWorker) -> None:
+        frame_offset = slot_index * MAILBOX_TASK_SLOT_SIZE
+        slot_state_addr = state_addr if slot_index == 0 else mailbox_addr + frame_offset + _OFF_STATE
+        while not stop_run_workers.is_set():
+            if _mailbox_load_i32(slot_state_addr) != _TASK_READY:
+                time.sleep(0.00005)
+                continue
+            code = 0
+            msg = ""
+            try:
+                _validate_task_protocol(buf, frame_offset)
+                digest = _read_task_digest(buf, frame_offset)
+                cid = identity_table.get(digest)
+                if cid is None:
+                    raise RuntimeError(f"callable hash {_format_digest(digest)} not registered")
+                if cid not in prepared:
+                    raise RuntimeError(
+                        f"chip_process dev={device_id}: cid {cid} not prepared before TASK_READY "
+                        f"(register via _CTRL_PREPARE first)"
+                    )
+                blob_offset = frame_offset + _OFF_TASK_ARGS_BLOB
+                if host_buf_ranges:
+                    _rewrite_blob_host_addrs(buf, blob_offset, host_buf_ranges)
+                cfg = _read_config_from_mailbox(buf, frame_offset)
+                prepared_request_id = _prepared_request_id_from_blob(buf, blob_offset)
+                if prepared_request_id is None:
+                    slot_worker._impl.run_from_blob(
+                        int(cid), mailbox_addr + blob_offset, _MAILBOX_ARGS_CAPACITY, cfg, slot_index
+                    )
+                else:
+                    slot_worker._impl.execute_prepared(prepared_request_id)
+            except Exception as e:  # noqa: BLE001
+                code = 1
+                msg = _format_exc(f"chip_process dev={device_id} slot={slot_index}", e)
+
+            if code == 0 and on_task_done_success is not None:
+                code, msg = on_task_done_success()
+            _write_error(buf, code, msg, frame_offset)
+            _mailbox_store_i32(slot_state_addr, _TASK_DONE)
+
+    task_threads = [
+        threading.Thread(
+            target=run_task_loop,
+            args=(slot_index, slot_worker),
+            name=f"simpler-chip-run-{slot_index}",
+        )
+        for slot_index, slot_worker in enumerate(slot_workers)
+    ]
+    for thread in task_threads:
+        thread.start()
     try:
         while True:
             state = _mailbox_load_i32(state_addr)
-            if state == _TASK_READY:
-                try:
-                    _validate_task_protocol(buf)
-                except Exception as e:  # noqa: BLE001
-                    _write_error(buf, 1, _format_exc(f"chip_process dev={device_id}", e))
-                    _mailbox_store_i32(state_addr, _TASK_DONE)
-                    continue
-                digest = _read_task_digest(buf)
-                cid = identity_table.get(digest)
-                cfg = _read_config_from_mailbox(buf)
-
-                code = 0
-                msg = ""
-                try:
-                    if cid is None:
-                        raise RuntimeError(f"callable hash {_format_digest(digest)} not registered")
-                    # Run only consumes a prepared slot — it never lazily
-                    # prepares. The callable must have been staged via
-                    # _CTRL_PREPARE first; reaching TASK_READY without it is a
-                    # control-flow bug, so fail loudly instead of masking the
-                    # missing-prepare with a first-task latency spike.
-                    if cid not in prepared:
-                        raise RuntimeError(
-                            f"chip_process dev={device_id}: cid {cid} not prepared before TASK_READY "
-                            f"(register via _CTRL_PREPARE first)"
-                        )
-                    # Redirect any registered host pointer (a parent VA) in the
-                    # blob to this child's own mapping before the runtime reads it.
-                    # No-op when nothing is registered.
-                    if host_buf_ranges:
-                        _rewrite_blob_host_addrs(buf, _OFF_TASK_ARGS_BLOB, host_buf_ranges)
-                    # Hand the mailbox bytes straight to C++ (zero-copy zero-decode):
-                    # the blob layout is what `write_blob` already wrote, so re-parsing
-                    # it in Python is N×40B of avoidable work and a permanent
-                    # opportunity to drop a field.  C++ reinterpret_cast<ChipStorageTaskArgs*>
-                    # is the source of truth.
-                    prepared_request_id = _prepared_request_id_from_blob(buf, _OFF_TASK_ARGS_BLOB)
-                    if prepared_request_id is None:
-                        cw._impl.run_from_blob(cid, mailbox_addr + _OFF_TASK_ARGS_BLOB, _MAILBOX_ARGS_CAPACITY, cfg)
-                    else:
-                        cw._impl.execute_prepared(prepared_request_id)
-                except Exception as e:  # noqa: BLE001
-                    code = 1
-                    msg = _format_exc(f"chip_process dev={device_id}", e)
-
-                # On a successful kernel run, give the caller a chance to do
-                # post-run work (e.g. store_to_host D2H staging) before the
-                # parent sees TASK_DONE. The kernel's failure path skips the
-                # hook because the device output region is undefined and
-                # staging garbage would mask the real error in post-mortems.
-                if code == 0 and on_task_done_success is not None:
-                    code, msg = on_task_done_success()
-
-                _write_error(buf, code, msg)
-                _mailbox_store_i32(state_addr, _TASK_DONE)
-            elif state == _CONTROL_REQUEST:
+            if state == _CONTROL_REQUEST:
                 sub_cmd = struct.unpack_from("Q", buf, _OFF_CALLABLE)[0]
                 code = 0
                 msg = ""
@@ -1670,7 +1684,7 @@ def _run_chip_main_loop(  # noqa: PLR0912, PLR0913, PLR0915 -- unified TASK_READ
                             raise RuntimeError(
                                 f"prepare chip={device_id}: callable hash {_format_digest(digest)} not registered"
                             )
-                        _ensure_prepared(cw, registry, prepared, int(cid), device_id=device_id)
+                        _ensure_prepared(slot_workers, registry, prepared, int(cid), device_id=device_id)
                     elif sub_cmd == _CTRL_REGISTER:
                         digest = _read_control_digest(buf)
                         payload_size = struct.unpack_from("Q", buf, _CTRL_OFF_ARG0)[0]
@@ -1702,14 +1716,26 @@ def _run_chip_main_loop(  # noqa: PLR0912, PLR0913, PLR0915 -- unified TASK_READ
                                 # prepared state for the reusable private slot.
                                 if int(cid) in prepared:
                                     try:
-                                        cw._unregister_slot(int(cid))
+                                        for slot_worker in slot_workers:
+                                            slot_worker._unregister_slot(int(cid))
                                     except Exception:  # noqa: BLE001
                                         pass
                                     prepared.discard(int(cid))
                                 exported = ctypes.c_char.from_buffer(shm_buf)
                                 try:
                                     addr = ctypes.addressof(exported)
-                                    cw._impl.register_callable_from_blob(int(cid), addr)
+                                    registered_workers = []
+                                    try:
+                                        for slot_worker in slot_workers:
+                                            slot_worker._impl.register_callable_from_blob(int(cid), addr)
+                                            registered_workers.append(slot_worker)
+                                    except Exception:
+                                        for slot_worker in reversed(registered_workers):
+                                            try:
+                                                slot_worker._unregister_slot(int(cid))
+                                            except Exception:  # noqa: BLE001
+                                                pass
+                                        raise
                                 finally:
                                     del exported
                                 prepared.add(int(cid))
@@ -1723,7 +1749,8 @@ def _run_chip_main_loop(  # noqa: PLR0912, PLR0913, PLR0915 -- unified TASK_READ
                         digest = _read_control_digest(buf)
                         cid, removed = _remove_local_identity(registry, identity_table, identity_refs, digest)
                         if removed and cid is not None:
-                            cw._unregister_slot(int(cid))
+                            for slot_worker in slot_workers:
+                                slot_worker._unregister_slot(int(cid))
                             prepared.discard(int(cid))
                     elif sub_cmd == _CTRL_ALLOC_DOMAIN:
                         _handle_ctrl_alloc_domain(cw, buf)
@@ -1760,7 +1787,12 @@ def _run_chip_main_loop(  # noqa: PLR0912, PLR0913, PLR0915 -- unified TASK_READ
                 _mailbox_store_i32(state_addr, _CONTROL_DONE)
             elif state == _SHUTDOWN:
                 break
+            else:
+                time.sleep(0.00005)
     finally:
+        stop_run_workers.set()
+        for thread in task_threads:
+            thread.join()
         _sweep_l2_host_l3_l2_regions(l3_l2_region_store)
         for service in reversed(host_request_services):
             try:
@@ -1813,6 +1845,7 @@ def _chip_process_loop(  # noqa: PLR0913 -- fork-child entry: all context (bins,
     """
     import traceback as _tb  # noqa: PLC0415
 
+    run_workers: list[ChipWorker] = []
     try:
         cw = ChipWorker()
         cw.init(
@@ -1823,6 +1856,18 @@ def _chip_process_loop(  # noqa: PLR0913 -- fork-child entry: all context (bins,
             prewarm_config=prewarm_config,
             enable_sdma=enable_sdma,
         )
+        run_workers.append(cw)
+        if platform == "a2a3" and runtime == "host_build_graph":
+            secondary = ChipWorker()
+            run_workers.append(secondary)
+            secondary.init(
+                device_id,
+                bins,
+                log_level=log_level,
+                log_info_v=log_info_v,
+                prewarm_config=prewarm_config,
+                enable_sdma=enable_sdma,
+            )
     except Exception as e:
         _tb.print_exc()
         # Publish the cause into the mailbox and flag INIT_FAILED so the
@@ -1830,6 +1875,8 @@ def _chip_process_loop(  # noqa: PLR0913 -- fork-child entry: all context (bins,
         # spinning forever on a child that will never reach INIT_READY.
         _write_error(buf, 1, _format_exc(f"chip_process dev={device_id} init", e))
         _mailbox_store_i32(_buffer_field_addr(buf, _OFF_STATE), _INIT_FAILED)
+        for worker in reversed(run_workers):
+            worker.finalize()
         return
 
     # Prepare every ChipCallable in the startup snapshot before publishing
@@ -1842,12 +1889,13 @@ def _chip_process_loop(  # noqa: PLR0913 -- fork-child entry: all context (bins,
     try:
         for cid, target in registry.items():
             if isinstance(target, ChipCallable):
-                _ensure_prepared(cw, registry, prepared, int(cid), device_id=device_id)
+                _ensure_prepared(run_workers, registry, prepared, int(cid), device_id=device_id)
     except Exception as e:
         _tb.print_exc()
         _write_error(buf, 1, _format_exc(f"chip_process dev={device_id} prepare", e))
         _mailbox_store_i32(_buffer_field_addr(buf, _OFF_STATE), _INIT_FAILED)
-        cw.finalize()
+        for worker in reversed(run_workers):
+            worker.finalize()
         return
 
     mailbox_addr = ctypes.addressof(ctypes.c_char.from_buffer(buf))
@@ -1873,12 +1921,14 @@ def _chip_process_loop(  # noqa: PLR0913 -- fork-child entry: all context (bins,
             chip_platform=platform,
             chip_runtime=runtime,
             prepared=prepared,
+            run_workers=run_workers,
         )
     finally:
-        cw.finalize()
+        for worker in reversed(run_workers):
+            worker.finalize()
 
 
-def _read_config_from_mailbox(buf: memoryview) -> CallConfig:
+def _read_config_from_mailbox(buf: memoryview, frame_offset: int = 0) -> CallConfig:
     """Reconstruct a CallConfig from the unified mailbox layout."""
     (
         block_dim,
@@ -1890,7 +1940,7 @@ def _read_config_from_mailbox(buf: memoryview) -> CallConfig:
         scope_stats,
         *ring_values,
         prefix_bytes,
-    ) = _CFG_FMT.unpack_from(buf, _OFF_CONFIG)
+    ) = _CFG_FMT.unpack_from(buf, frame_offset + _OFF_CONFIG)
     ring_task_window = list(ring_values[:RUNTIME_ENV_RING_COUNT])
     ring_heap = list(ring_values[RUNTIME_ENV_RING_COUNT : 2 * RUNTIME_ENV_RING_COUNT])
     ring_dep_pool = list(ring_values[2 * RUNTIME_ENV_RING_COUNT : 3 * RUNTIME_ENV_RING_COUNT])
@@ -4496,8 +4546,11 @@ class Worker:
 
         # Register chip workers as NEXT_LEVEL (L3)
         if device_ids:
+            max_in_flight = (
+                2 if self._config["platform"] == "a2a3" and self._config["runtime"] == "host_build_graph" else 1
+            )
             for shm in self._chip_shms:
-                dw.add_next_level_worker(_mailbox_addr(shm))
+                dw.add_next_level_worker(_mailbox_addr(shm), max_in_flight=max_in_flight)
 
         # Register Worker children as NEXT_LEVEL (L4+)
         if self._next_level_shms and not hasattr(dw, "add_next_level_worker_at"):

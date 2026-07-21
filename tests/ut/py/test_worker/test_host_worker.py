@@ -123,7 +123,8 @@ def _chip_payload_shm(callable_obj: ChipCallable) -> SharedMemory:
     return shm
 
 
-def test_chip_process_loop_inits_runs_and_finalizes(monkeypatch):
+@pytest.mark.parametrize(("runtime", "expected_workers"), [("tensormap_and_ringbuffer", 1), ("host_build_graph", 2)])
+def test_chip_process_loop_inits_runs_and_finalizes(monkeypatch, runtime, expected_workers):
     events: list[tuple] = []
 
     class FakeChipWorker:
@@ -133,8 +134,8 @@ def test_chip_process_loop_inits_runs_and_finalizes(monkeypatch):
         def finalize(self) -> None:
             events.append(("finalize",))
 
-    def fake_run_chip_main_loop(cw, *_args, chip_platform, chip_runtime, prepared=None):
-        events.append(("main_loop", cw, chip_platform, chip_runtime))
+    def fake_run_chip_main_loop(cw, *_args, chip_platform, chip_runtime, prepared=None, run_workers=None):
+        events.append(("main_loop", cw, chip_platform, chip_runtime, len(run_workers or [cw])))
 
     monkeypatch.setattr(worker_mod, "ChipWorker", FakeChipWorker)
     monkeypatch.setattr(worker_mod, "_run_chip_main_loop", fake_run_chip_main_loop)
@@ -150,16 +151,17 @@ def test_chip_process_loop_inits_runs_and_finalizes(monkeypatch):
             {},
             {},
             platform="a2a3",
-            runtime="tensormap_and_ringbuffer",
+            runtime=runtime,
         )
     finally:
         shm.close()
         shm.unlink()
 
-    assert events[0] == ("init", 7, "bins", 1, 5, None, False)
-    assert events[1][0] == "main_loop"
-    assert events[1][2:] == ("a2a3", "tensormap_and_ringbuffer")
-    assert events[2] == ("finalize",)
+    assert [event[0] for event in events].count("init") == expected_workers
+    main_loop_index = expected_workers
+    assert events[main_loop_index][0] == "main_loop"
+    assert events[main_loop_index][2:] == ("a2a3", runtime, expected_workers)
+    assert events[main_loop_index + 1 :] == [("finalize",)] * expected_workers
 
 
 def _chip_digest(callable_obj: ChipCallable, *, platform: str = "", runtime: str = "") -> bytes:

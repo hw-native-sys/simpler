@@ -113,6 +113,7 @@ void ChipWorker::init(
         simpler_init_fn_ = load_symbol<SimplerInitFn>(handle, "simpler_init");
         register_callable_fn_ = load_symbol<SimplerRegisterCallableFn>(handle, "simpler_register_callable");
         run_fn_ = load_symbol<SimplerRunFn>(handle, "simpler_run");
+        select_arena_bank_fn_ = load_optional_symbol<SelectArenaBankFn>(handle, "select_arena_bank_ctx");
         prepare_request_fn_ = load_optional_symbol<SimplerPrepareRequestFn>(handle, "simpler_prepare_request");
         execute_prepared_fn_ = load_optional_symbol<SimplerExecutePreparedFn>(handle, "simpler_execute_prepared");
         unregister_callable_fn_ = load_symbol<SimplerUnregisterCallableFn>(handle, "simpler_unregister_callable");
@@ -201,6 +202,7 @@ void ChipWorker::init(
         simpler_init_fn_ = nullptr;
         register_callable_fn_ = nullptr;
         run_fn_ = nullptr;
+        select_arena_bank_fn_ = nullptr;
         prepare_request_fn_ = nullptr;
         execute_prepared_fn_ = nullptr;
         unregister_callable_fn_ = nullptr;
@@ -242,6 +244,7 @@ void ChipWorker::init(
         simpler_init_fn_ = nullptr;
         register_callable_fn_ = nullptr;
         run_fn_ = nullptr;
+        select_arena_bank_fn_ = nullptr;
         prepare_request_fn_ = nullptr;
         execute_prepared_fn_ = nullptr;
         unregister_callable_fn_ = nullptr;
@@ -309,6 +312,7 @@ void ChipWorker::finalize() {
     get_runtime_size_fn_ = nullptr;
     register_callable_fn_ = nullptr;
     run_fn_ = nullptr;
+    select_arena_bank_fn_ = nullptr;
     prepare_request_fn_ = nullptr;
     execute_prepared_fn_ = nullptr;
     unregister_callable_fn_ = nullptr;
@@ -348,29 +352,46 @@ void ChipWorker::register_callable(int32_t callable_id, const void *callable) {
 }
 
 void ChipWorker::run(int32_t callable_id, TaskArgsView args, const CallConfig &config) {
+    run(callable_id, args, config, 0);
+}
+
+void ChipWorker::run(int32_t callable_id, TaskArgsView args, const CallConfig &config, unsigned arena_bank) {
     ChipStorageTaskArgs chip_storage = view_to_chip_storage(args);
-    run(callable_id, &chip_storage, config);
+    run(callable_id, &chip_storage, config, arena_bank);
 }
 
 void ChipWorker::run(int32_t callable_id, const ChipStorageTaskArgs *args, const CallConfig &config) {
+    run(callable_id, args, config, 0);
+}
+
+void ChipWorker::run(
+    int32_t callable_id, const ChipStorageTaskArgs *args, const CallConfig &config, unsigned arena_bank
+) {
     config.validate();
     if (!initialized_) {
         throw std::runtime_error("ChipWorker not initialized; call init() first");
     }
 
+    if (arena_bank >= 2) throw std::runtime_error("run arena bank must be 0 or 1");
+    if (arena_bank != 0 && select_arena_bank_fn_ == nullptr) {
+        throw std::runtime_error("bound runtime does not support nonzero arena banks");
+    }
     void *rt = runtime_buf_.data();
     // Per-stage timing is emitted by the platform as `[STRACE]` log markers, not
     // returned (see chip_worker.h::run). CallConfig is threaded through to the C
     // ABI as a single pointer rather than unpacked into per-field args.
-    acquire_arena_bank(0);
+    acquire_arena_bank(arena_bank);
     int rc;
     try {
+        if (select_arena_bank_fn_ != nullptr && select_arena_bank_fn_(device_ctx_, arena_bank) != 0) {
+            throw std::runtime_error("select_arena_bank_ctx failed");
+        }
         rc = run_fn_(device_ctx_, rt, callable_id, args, &config);
     } catch (...) {
-        release_arena_bank(0);
+        release_arena_bank(arena_bank);
         throw;
     }
-    release_arena_bank(0);
+    release_arena_bank(arena_bank);
     if (rc != 0) {
         throw std::runtime_error("run failed with code " + std::to_string(rc));
     }

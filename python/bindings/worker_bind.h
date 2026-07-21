@@ -372,20 +372,21 @@ inline void bind_worker(nb::module_ &m) {
 
         .def(
             "add_next_level_worker",
-            [](Worker &self, uint64_t mailbox_ptr) {
-                self.add_worker(WorkerType::NEXT_LEVEL, reinterpret_cast<void *>(mailbox_ptr));
+            [](Worker &self, uint64_t mailbox_ptr, uint32_t max_in_flight) {
+                self.add_worker(WorkerType::NEXT_LEVEL, reinterpret_cast<void *>(mailbox_ptr), max_in_flight);
             },
-            nb::arg("mailbox_ptr"),
+            nb::arg("mailbox_ptr"), nb::arg("max_in_flight") = 1,
             "Add a NEXT_LEVEL sub-worker. `mailbox_ptr` is the address of a "
             "MAILBOX_SIZE-byte MAP_SHARED region; the child process loop is "
             "Python-managed (fork + _chip_process_loop)."
         )
         .def(
             "add_next_level_worker_at",
-            [](Worker &self, int32_t worker_id, uint64_t mailbox_ptr) {
-                self.add_next_level_worker(worker_id, reinterpret_cast<void *>(mailbox_ptr));
+            [](Worker &self, int32_t worker_id, uint64_t mailbox_ptr, uint32_t max_in_flight) {
+                self.add_next_level_worker(worker_id, reinterpret_cast<void *>(mailbox_ptr), max_in_flight);
             },
-            nb::arg("worker_id"), nb::arg("mailbox_ptr"), "Add a NEXT_LEVEL sub-worker with an explicit worker id."
+            nb::arg("worker_id"), nb::arg("mailbox_ptr"), nb::arg("max_in_flight") = 1,
+            "Add a NEXT_LEVEL sub-worker with an explicit worker id."
         )
         .def(
             "add_sub_worker",

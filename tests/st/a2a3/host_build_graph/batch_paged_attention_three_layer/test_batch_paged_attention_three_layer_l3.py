@@ -16,7 +16,6 @@ import torch
 from simpler.l3_l2_message_queue import L3L2QueueOpcode
 from simpler.request_session import (
     HostGraphToken,
-    append_host_graph_prepared_request_args,
     append_host_graph_token_stream_args,
     decode_host_graph_token,
 )
@@ -171,14 +170,11 @@ class TestBatchPagedAttentionThreeLayerL3(SceneTestCase):
             return super()._run_and_validate_l3(worker, compiled_callables, sub_handles, case, **kwargs)
         return self._run_concurrent_requests(worker, compiled_callables, sub_handles, case)
 
-    def _build_submission(self, orch, callables, request, request_id: int, *, prepared: bool):
+    def _build_submission(self, callables, request, request_id: int, queue):
         chip_args, _ = _build_l3_task_args(request, callables.paged_attention_sig)
         layer_count = int(chip_args.scalar(1))
         layers_per_epoch = int(chip_args.scalar(2))
         expected_epochs = (layer_count + layers_per_epoch - 1) // layers_per_epoch
-        queue = orch.create_l3_l2_queue(worker_id=0, depth=1, input_arena_bytes=64, output_arena_bytes=4096)
-        if prepared:
-            append_host_graph_prepared_request_args(chip_args, request_id)
         append_host_graph_token_stream_args(chip_args, queue, request_id)
         callables.keep(chip_args)
         return chip_args, queue, expected_epochs
@@ -208,18 +204,20 @@ class TestBatchPagedAttentionThreeLayerL3(SceneTestCase):
         config = self._build_config(case["config"])
         callables = CallableNamespace({**compiled_callables, **sub_handles})
         request_a_submitted = threading.Event()
+        queues_ready = threading.Event()
+        queues = {}
 
         def request_orch(orch, request, request_id, emitter, cfg):
-            prepared = request_id == _REQUEST_B
-            chip_args, queue, expected_epochs = self._build_submission(
-                orch, callables, request, request_id, prepared=prepared
-            )
-            if prepared:
-                start_ns = time.monotonic_ns()
-                emitter.prepare_host_request(
-                    0, request_id, callables.paged_attention, chip_args, cfg, arena_bank=1, timeout=_STREAM_TIMEOUT_S
-                )
-                print(f"HOST_REQUEST_PREPARED request_id={request_id} start_ns={start_ns} end_ns={time.monotonic_ns()}")
+            if request_id == _REQUEST_A:
+                for queued_request_id in (_REQUEST_A, _REQUEST_B):
+                    queues[queued_request_id] = orch.create_l3_l2_queue(
+                        worker_id=0, depth=1, input_arena_bytes=64, output_arena_bytes=4096
+                    )
+                queues_ready.set()
+            else:
+                assert queues_ready.wait(_STREAM_TIMEOUT_S)
+            queue = queues[request_id]
+            chip_args, queue, expected_epochs = self._build_submission(callables, request, request_id, queue)
             orch.submit_next_level(callables.paged_attention, chip_args, cfg, worker=0)
             if request_id == _REQUEST_A:
                 request_a_submitted.set()

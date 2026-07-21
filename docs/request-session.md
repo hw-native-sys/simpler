@@ -7,18 +7,17 @@ bounded admission, cancellation, and failure isolation.
 `max_active_runs` controls the number of dispatcher threads. Each dispatcher
 enters a real `Worker.run` call with its own outer scope. Submission mutates the
 shared orchestrator under one lock, while callbacks may wait for token messages
-independently. Device launches remain ordered by each chip worker's mailbox, so
-a later run can prepare Host O through the admission lane while the earlier run
-executes Device S.
+independently. Onboard a2a3 HostGraph chip workers expose two mailbox credits,
+so two session dispatchers can execute complete runs concurrently. Other
+endpoint types remain single-credit.
 
-## Accepted PR1379 Redesign
+## PR1379 Multi-Flight Architecture
 
-The admission lane and split prepare/execute ABI above describe the current
-implementation. PR1379 will replace them with a bounded multi-flight mailbox.
-The accepted target has these invariants:
+The bounded multi-flight mailbox has these invariants:
 
 - one resident child message thread owns mailbox state transitions;
-- two long-lived run threads execute complete HostGraph runs;
+- two long-lived run threads execute complete HostGraph runs, each through an
+  isolated `ChipWorker`/`DeviceRunner`;
 - run thread 0 always uses arena bank 0, and run thread 1 uses bank 1;
 - each run thread owns its Runtime storage and mutable run context;
 - task completion is correlated by slot generation, so completion order may
@@ -43,8 +42,8 @@ child marks that slot done. This is the non-blocking boundary; changing only
 `submit_next_level` would leave the current synchronous endpoint bottleneck in
 place.
 
-The redesign removes these cross-request mechanisms after the multi-flight
-path is validated:
+The following legacy cross-request mechanisms remain only until the final
+cleanup step:
 
 - `HostRequestAdmissionClient` and `_HostRequestAdmissionService`;
 - the prepared-request TaskArgs marker;
@@ -54,9 +53,8 @@ path is validated:
 
 HostApi thread context, scheduler completion latches, the HostGraph epoch/token
 pipeline, arena banks, and concurrent top-level `Worker.run` batching remain.
-The rollout first fixes session shutdown, then introduces the multi-slot
-protocol at one credit, enables two HostGraph credits after hardware
-validation, and finally removes the superseded admission path.
+The protocol and two-credit execution path are hardware validated. The final
+cleanup removes the superseded admission path and split ABI.
 
 ## API
 
@@ -108,7 +106,11 @@ buffers before Device S finishes would allow the next Host O to overwrite live
 state, so active cancellation deliberately favors memory safety over immediate
 device preemption.
 
-## Host O and Device S Pipeline
+## Legacy Admission Path
+
+The section below describes the compatibility path being removed by PR1379.
+New request-session code submits a normal complete run and relies on the two
+mailbox credits.
 
 The later request prepares its HostGraph through the independent admission
 lane before submitting its prepared Device task:

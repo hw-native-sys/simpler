@@ -1457,7 +1457,7 @@ NB_MODULE(_task_interface, m) {
         .def(
             "run_from_blob",
             [](ChipWorker &self, int32_t callable_id, uint64_t args_blob_ptr, size_t blob_capacity,
-               const CallConfig &config) {
+               const CallConfig &config, unsigned arena_bank) {
                 // The mailbox region is the on-wire format `write_blob` produced;
                 // `read_blob` is the matching reader that returns a zero-copy
                 // TaskArgsView into the caller-owned bytes. Forwards to the
@@ -1465,10 +1465,10 @@ NB_MODULE(_task_interface, m) {
                 // loops never re-implement the tensor/scalar layout in Python
                 // (where it has historically dropped fields like child_memory).
                 TaskArgsView view = read_blob(reinterpret_cast<const uint8_t *>(args_blob_ptr), blob_capacity);
-                self.run(callable_id, view, config);
+                self.run(callable_id, view, config, arena_bank);
             },
             nb::arg("callable_id"), nb::arg("args_blob_ptr"), nb::arg("blob_capacity"), nb::arg("config"),
-            nb::call_guard<nb::gil_scoped_release>(),
+            nb::arg("arena_bank") = 0, nb::call_guard<nb::gil_scoped_release>(),
             "Launch a callable_id from a raw mailbox-blob pointer + capacity "
             "(used by chip-child mailbox loops to avoid Python-side re-deserialisation "
             "of the per-task tensor/scalar layout). The blob must be in the format "

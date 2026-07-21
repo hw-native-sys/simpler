@@ -72,10 +72,12 @@ public:
     // platform as `[STRACE]` log markers — see src/common/log/.../strace.h — not
     // returned, so the L3 dispatcher and L2 child are observed uniformly.
     void run(int32_t callable_id, TaskArgsView args, const CallConfig &config);
+    void run(int32_t callable_id, TaskArgsView args, const CallConfig &config, unsigned arena_bank);
     // Same launch, but the caller already holds the runtime.so-ABI POD —
     // skip the view→storage memcpy and hand the pointer straight to the C ABI.
     // Used by the ChipStorageTaskArgs path in the nanobind binding.
     void run(int32_t callable_id, const ChipStorageTaskArgs *args, const CallConfig &config);
+    void run(int32_t callable_id, const ChipStorageTaskArgs *args, const CallConfig &config, unsigned arena_bank);
 
     // Start Host-side request preparation in an isolated arena bank. The
     // matching execute_prepared call remains the only path that launches S.
@@ -166,6 +168,7 @@ private:
     );
     using SimplerRegisterCallableFn = int (*)(void *, int32_t, const void *);
     using SimplerRunFn = int (*)(void *, void *, int32_t, const void *, const CallConfig *);
+    using SelectArenaBankFn = int (*)(void *, unsigned);
     using SimplerPrepareRequestFn = int (*)(void *, void *, int32_t, const void *, const CallConfig *, unsigned);
     using SimplerExecutePreparedFn = int (*)(void *, void *, const CallConfig *, unsigned);
     using SimplerUnregisterCallableFn = int (*)(void *, int32_t);
@@ -214,6 +217,7 @@ private:
     SimplerInitFn simpler_init_fn_ = nullptr;
     SimplerRegisterCallableFn register_callable_fn_ = nullptr;
     SimplerRunFn run_fn_ = nullptr;
+    SelectArenaBankFn select_arena_bank_fn_ = nullptr;
     SimplerPrepareRequestFn prepare_request_fn_ = nullptr;
     SimplerExecutePreparedFn execute_prepared_fn_ = nullptr;
     SimplerUnregisterCallableFn unregister_callable_fn_ = nullptr;
