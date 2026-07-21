@@ -13,6 +13,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import json
+import math
 import os
 import select
 import signal
@@ -67,9 +68,23 @@ def _validate_manifest(manifest: dict[str, Any]) -> None:
 
 def _session_timeout_s(manifest: dict[str, Any]) -> float:
     timeout_s = float(manifest.get("session_timeout_s", 30.0))
-    if timeout_s <= 0:
-        raise ValueError("manifest session_timeout_s must be positive")
+    if not (timeout_s > 0 and math.isfinite(timeout_s)):
+        raise ValueError("manifest session_timeout_s must be a positive finite number of seconds")
     return timeout_s
+
+
+def _startup_remaining_s(manifest: dict[str, Any]) -> float:
+    # The parent's remaining slice of the single root startup budget bounds how
+    # long the runner may take to bring up its subtree. Absent only from a
+    # pre-P0.3 parent; fall back to the runtime command timeout then. The
+    # fallback is evaluated only when the key is absent, so a valid
+    # startup_remaining_s is not held hostage to an invalid session_timeout_s.
+    if "startup_remaining_s" not in manifest:
+        return _session_timeout_s(manifest)
+    remaining_s = float(manifest["startup_remaining_s"])
+    if not (remaining_s > 0 and math.isfinite(remaining_s)):
+        raise ValueError("manifest startup_remaining_s must be a positive finite number of seconds")
+    return remaining_s
 
 
 def _read_runner_ready(fd: int, timeout_s: float) -> dict[str, Any]:
@@ -128,7 +143,9 @@ def _reap_session_runner(proc: subprocess.Popen[Any]) -> None:
 
 def _start_session(manifest: dict[str, Any]) -> dict[str, Any]:
     _validate_manifest(manifest)
-    timeout_s = _session_timeout_s(manifest)
+    # The runner must publish ready within the parent's remaining startup budget,
+    # not a fresh full command timeout.
+    timeout_s = _startup_remaining_s(manifest)
     ready_r, ready_w = os.pipe()
     manifest_path = ""
     proc: subprocess.Popen[Any] | None = None

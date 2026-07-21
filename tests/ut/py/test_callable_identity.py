@@ -504,7 +504,7 @@ def test_remote_worker_id_stays_stable_when_local_worker_is_added_later(monkeypa
     def fake_worker_ctor(*args):
         return fake_c_worker
 
-    def fake_open_remote_session(self, *, spec, worker_id, session_id, timeout_s):
+    def fake_open_remote_session(self, *, spec, worker_id, session_id, timeout_s, startup_remaining_s):
         opened_worker_ids.append(worker_id)
         return worker_mod._RemoteSession(  # noqa: SLF001
             worker_id=worker_id,
@@ -545,6 +545,7 @@ def test_remote_session_manifest_uses_endpoint_host_as_default_bind():
             spec=RemoteWorkerSpec(endpoint="127.0.0.1:19073", platform="a2a3sim"),
             worker_id=0,
             session_id=1,
+            startup_remaining_s=30.0,
         )
         assert loopback["listen_host"] == "127.0.0.1"
         assert loopback["connect_host"] == "127.0.0.1"
@@ -553,6 +554,7 @@ def test_remote_session_manifest_uses_endpoint_host_as_default_bind():
             spec=RemoteWorkerSpec(endpoint="10.0.0.8:19073", platform="a2a3sim"),
             worker_id=0,
             session_id=1,
+            startup_remaining_s=30.0,
         )
         assert remote["listen_host"] == "10.0.0.8"
         assert remote["connect_host"] == "10.0.0.8"
@@ -569,7 +571,7 @@ def test_remote_session_manifest_requires_wildcard_bind_opt_in():
             session_listen_host="0.0.0.0",
         )
         with pytest.raises(ValueError, match="wildcard session bind"):
-            worker._build_remote_manifest(spec=spec, worker_id=0, session_id=1)
+            worker._build_remote_manifest(spec=spec, worker_id=0, session_id=1, startup_remaining_s=30.0)
 
         opted_in = worker._build_remote_manifest(
             spec=RemoteWorkerSpec(
@@ -580,6 +582,7 @@ def test_remote_session_manifest_requires_wildcard_bind_opt_in():
             ),
             worker_id=0,
             session_id=1,
+            startup_remaining_s=30.0,
         )
         assert opted_in["listen_host"] == "0.0.0.0"
         assert opted_in["connect_host"] == "10.0.0.8"
@@ -1613,7 +1616,7 @@ def test_partial_init_failure_cleans_open_remote_session(monkeypatch):
 
     calls = 0
 
-    def fake_open_remote_session(self, *, spec, worker_id, session_id, timeout_s):
+    def fake_open_remote_session(self, *, spec, worker_id, session_id, timeout_s, startup_remaining_s):
         nonlocal calls
         calls += 1
         if calls == 2:
@@ -1670,7 +1673,7 @@ def test_partial_init_failure_closes_unregistered_open_remote_session(monkeypatc
     def fake_worker_ctor(*args):
         return fake_c_worker
 
-    def fake_open_remote_session(self, *, spec, worker_id, session_id, timeout_s):
+    def fake_open_remote_session(self, *, spec, worker_id, session_id, timeout_s, startup_remaining_s):
         return opened_session
 
     def fake_close_remote_session(self, session):

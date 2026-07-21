@@ -10,6 +10,7 @@
 import os
 import socket
 import threading
+import time
 from typing import cast
 
 import pytest
@@ -173,6 +174,63 @@ def test_run_session_bounds_post_ready_command_accept(monkeypatch):
         assert command_sock.timeout == 0.01
     finally:
         os.close(ready_r)
+
+
+def test_run_session_bounds_subtree_by_startup_remaining_not_session_timeout(monkeypatch):
+    """The inner subtree deadline comes from the parent's startup_remaining_s
+    (its slice of the single root startup budget), not the runtime command
+    session_timeout_s — the two are deliberately different here."""
+
+    captured = {}
+
+    class FakeWorker:
+        def __init__(self, *args, **kwargs):
+            self.closed = False
+
+        def init(self, *args, _startup_deadline=None, **kwargs):
+            captured["deadline"] = _startup_deadline
+            captured["at"] = time.monotonic()
+
+        def close(self):
+            self.closed = True
+
+    class FakeCommandSock:
+        def getsockname(self):
+            return ("127.0.0.1", 12345)
+
+        def settimeout(self, timeout):
+            pass
+
+        def accept(self):
+            raise socket.timeout("stop after init")
+
+        def close(self):
+            pass
+
+    class FakeHealthSock:
+        def getsockname(self):
+            return ("127.0.0.1", 12346)
+
+        def close(self):
+            pass
+
+    sockets = [FakeCommandSock(), FakeHealthSock()]
+    ready_r, ready_w = os.pipe()
+
+    monkeypatch.setattr(remote_l3_session, "Worker", FakeWorker)
+    monkeypatch.setattr(remote_l3_session, "_install_manifest_dispatcher_registry", lambda manifest: {})
+    monkeypatch.setattr(remote_l3_session, "_install_manifest_inner_registry", lambda manifest, worker: {})
+    monkeypatch.setattr(remote_l3_session, "_bind_listener", lambda host: sockets.pop(0))
+    monkeypatch.setattr(remote_l3_session, "_health_loop", lambda *args: None)
+
+    try:
+        remote_l3_session.run_session(_manifest(session_timeout_s=0.01, startup_remaining_s=50.0), ready_w)
+    finally:
+        os.close(ready_r)
+
+    budget = captured["deadline"] - captured["at"]
+    # ~50s startup budget, not the 0.01s runtime command timeout.
+    assert 40.0 < budget <= 50.0
 
 
 def test_health_loop_closes_active_connection_on_stop():

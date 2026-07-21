@@ -20,6 +20,7 @@ import ctypes
 import hashlib
 import importlib
 import json
+import math
 import os
 import signal
 import socket
@@ -163,9 +164,22 @@ def _send_ready(fd: int, payload: dict[str, Any]) -> None:
 
 def _session_timeout_s(manifest: dict[str, Any]) -> float:
     timeout_s = float(manifest.get("session_timeout_s", 30.0))
-    if timeout_s <= 0:
-        raise ValueError("manifest session_timeout_s must be positive")
+    if not (timeout_s > 0 and math.isfinite(timeout_s)):
+        raise ValueError("manifest session_timeout_s must be a positive finite number of seconds")
     return timeout_s
+
+
+def _startup_remaining_s(manifest: dict[str, Any]) -> float:
+    # The parent's remaining slice of the single root startup budget. Absent only
+    # from a pre-P0.3 parent; fall back to the runtime command timeout then. The
+    # fallback is evaluated only when the key is absent, so a valid
+    # startup_remaining_s is not held hostage to an invalid session_timeout_s.
+    if "startup_remaining_s" not in manifest:
+        return _session_timeout_s(manifest)
+    remaining_s = float(manifest["startup_remaining_s"])
+    if not (remaining_s > 0 and math.isfinite(remaining_s)):
+        raise ValueError("manifest startup_remaining_s must be a positive finite number of seconds")
+    return remaining_s
 
 
 def _health_loop(sock: socket.socket, stop: threading.Event, session_id: int, worker_id: int) -> None:
@@ -911,6 +925,7 @@ def run_session(manifest: dict[str, Any], ready_fd: int) -> int:
     health_thread: threading.Thread | None = None
     try:
         session_timeout_s = _session_timeout_s(manifest)
+        startup_remaining_s = _startup_remaining_s(manifest)
         manifest_dispatch_registry = _install_manifest_dispatcher_registry(manifest)
         # Register the inner L3 callables before init() so they are frozen into
         # the eager startup snapshot and uploaded to the chip children before
@@ -918,11 +933,14 @@ def run_session(manifest: dict[str, Any], ready_fd: int) -> int:
         # point: it forks and readies the whole inner L3->L2 tree, so the runner
         # reports ready (below) only once that subtree is up.
         manifest_inner_handles = _install_manifest_inner_registry(manifest, inner_worker)
-        # Bound the inner startup and mark it non-root so its chip/sub children
-        # inherit this runner's process group (see start_new_session in the
-        # daemon) rather than splitting into their own — the daemon reaps the
-        # whole L3->L2 subtree with one killpg on the runner.
-        inner_worker.init(_startup_deadline=time.monotonic() + session_timeout_s)
+        # Bound the inner startup by the parent's remaining startup budget
+        # (rebuilt against this host's own monotonic clock — the parent's
+        # absolute deadline is not comparable across machines), not a fresh full
+        # session_timeout_s. Mark it non-root so its chip/sub children inherit
+        # this runner's process group (see start_new_session in the daemon)
+        # rather than splitting into their own — the daemon reaps the whole
+        # L3->L2 subtree with one killpg on the runner.
+        inner_worker.init(_startup_deadline=time.monotonic() + startup_remaining_s)
 
         listen_host = str(manifest.get("listen_host", "127.0.0.1"))
         command_sock = _bind_listener(listen_host)

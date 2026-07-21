@@ -2133,8 +2133,8 @@ class Worker:
 
     def _remote_session_timeout_s(self) -> float:
         timeout_s = float(self._config.get("remote_session_timeout_s", 30.0))
-        if timeout_s <= 0:
-            raise ValueError("Worker remote_session_timeout_s must be positive")
+        if not (timeout_s > 0 and math.isfinite(timeout_s)):
+            raise ValueError("Worker remote_session_timeout_s must be a positive finite number of seconds")
         return timeout_s
 
     @staticmethod
@@ -2182,7 +2182,9 @@ class Worker:
             )
         return entries
 
-    def _build_remote_manifest(self, *, spec: RemoteWorkerSpec, worker_id: int, session_id: int) -> dict[str, Any]:
+    def _build_remote_manifest(
+        self, *, spec: RemoteWorkerSpec, worker_id: int, session_id: int, startup_remaining_s: float
+    ) -> dict[str, Any]:
         daemon_host, _daemon_port = self._parse_remote_endpoint(spec.endpoint)
         listen_host = spec.session_listen_host or ("127.0.0.1" if daemon_host == "localhost" else daemon_host)
         if self._is_wildcard_session_host(listen_host) and not spec.allow_wildcard_session_bind:
@@ -2198,7 +2200,11 @@ class Worker:
             "num_sub_workers": int(spec.num_sub_workers),
             "heap_ring_size": self._config.get("remote_heap_ring_size", None),
             "transport": spec.transport,
+            # session_timeout_s bounds the runtime command socket; startup_remaining_s
+            # bounds this session's slice of the single root startup budget. They are
+            # distinct: the remote must not spend runtime-command time as startup time.
             "session_timeout_s": self._remote_session_timeout_s(),
+            "startup_remaining_s": float(startup_remaining_s),
             "listen_host": listen_host,
             "connect_host": daemon_host,
             "remote_task_dispatcher": self._remote_dispatcher_entries_for_worker(worker_id),
@@ -2207,10 +2213,12 @@ class Worker:
         }
 
     def _open_remote_session(
-        self, *, spec: RemoteWorkerSpec, worker_id: int, session_id: int, timeout_s: float
+        self, *, spec: RemoteWorkerSpec, worker_id: int, session_id: int, timeout_s: float, startup_remaining_s: float
     ) -> _RemoteSession:
         daemon_host, daemon_port = self._parse_remote_endpoint(spec.endpoint)
-        manifest = self._build_remote_manifest(spec=spec, worker_id=worker_id, session_id=session_id)
+        manifest = self._build_remote_manifest(
+            spec=spec, worker_id=worker_id, session_id=session_id, startup_remaining_s=startup_remaining_s
+        )
         with socket.create_connection((daemon_host, daemon_port), timeout=timeout_s) as sock:
             sock.settimeout(timeout_s)
             self._send_remote_daemon_json(sock, manifest)
@@ -3874,28 +3882,53 @@ class Worker:
         else:
             self._worker = _Worker(self.level, int(heap_ring_size))
 
-        # Open remote L3 sessions (the remote runner brings up its own L3->L2
-        # tree and answers the daemon handshake). Opening only exchanges a
-        # transient socket message — it starts no local thread. Registering the
-        # socket into the C++ Worker (which spawns the RemoteL3Endpoint health
-        # thread) is deferred to _start_hierarchical, after the last local fork,
-        # to preserve the fork-before-thread invariant.
-        opened_remote_sessions: list[_RemoteSession] = []
-        try:
-            for worker_id, spec in zip(self._remote_worker_ids, self._remote_worker_specs, strict=True):
-                session_id = uuid.uuid4().int & ((1 << 63) - 1)
-                if session_id == 0:
-                    session_id = 1
-                timeout_s = self._remote_session_timeout_s()
-                session = self._open_remote_session(
-                    spec=spec, worker_id=worker_id, session_id=session_id, timeout_s=timeout_s
-                )
-                opened_remote_sessions.append(session)
-                self._remote_sessions.append(session)
-                opened_remote_sessions.pop()
-        except BaseException:
-            self._close_remote_sessions(opened_remote_sessions)
-            raise
+    def _activate_remote_sessions(self, deadline: float) -> None:
+        """Open and register every remote L3 session within the shared startup budget.
+
+        Called only from _start_hierarchical, after this process's last local
+        fork, so opening a session (which starts the remote subtree) and
+        registering its endpoint (which spawns the health thread) both stay
+        behind every local fork. All remotes draw from the single root startup
+        ``deadline``: each computes the remaining budget at the moment it opens,
+        propagates it as the manifest's ``startup_remaining_s`` so the remote
+        bounds its own subtree by this process's remaining time (measured on the
+        remote's own monotonic clock) instead of a fresh full timeout. Any
+        failure propagates to init()'s single rollback, which closes every
+        session recorded in ``self._remote_sessions``.
+        """
+        session_timeout = self._remote_session_timeout_s()
+        for worker_id, spec in zip(self._remote_worker_ids, self._remote_worker_specs, strict=True):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise RuntimeError("remote L3 session activation: startup deadline exceeded")
+            session_id = uuid.uuid4().int & ((1 << 63) - 1)
+            if session_id == 0:
+                session_id = 1
+            # The handshake blocks until the remote subtree is READY, so the
+            # socket timeout must cover the startup budget granted below — not
+            # the (shorter) runtime command timeout.
+            session = self._open_remote_session(
+                spec=spec,
+                worker_id=worker_id,
+                session_id=session_id,
+                timeout_s=remaining,
+                startup_remaining_s=remaining,
+            )
+            self._remote_sessions.append(session)
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise RuntimeError("remote L3 endpoint attach: startup deadline exceeded")
+            assert self._worker is not None
+            self._worker.add_remote_l3_socket(
+                session.worker_id,
+                session.session_id,
+                spec.transport,
+                session.command_host,
+                session.command_port,
+                session.health_host,
+                session.health_port,
+                min(session_timeout, remaining),
+            )
 
     def _start_hierarchical(self) -> None:  # noqa: PLR0912 -- three parallel fork loops (sub/chip/next) + bootstrap wait + scheduler register/init; branches track the fork order documented in the body
         """Fork every local child, await the subtree, register endpoints, start the scheduler.
@@ -4065,25 +4098,11 @@ class Worker:
         # failure, exit, or hang aborts startup here.
         self._await_children_ready(self._next_level_shms, self._next_level_pids, "next_level", deadline)
 
-        # Last local fork is done. Now — and only now — register remote L3
-        # endpoints, which spawns the RemoteL3Endpoint health thread; doing it
-        # here keeps every local fork ahead of every C++/Python thread. Each
-        # remote attach consumes the shared startup budget.
-        for session, spec in zip(self._remote_sessions, self._remote_worker_specs, strict=True):
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                raise RuntimeError("remote L3 endpoint attach: startup deadline exceeded")
-            assert self._worker is not None
-            self._worker.add_remote_l3_socket(
-                session.worker_id,
-                session.session_id,
-                spec.transport,
-                session.command_host,
-                session.command_port,
-                session.health_host,
-                session.health_port,
-                min(self._remote_session_timeout_s(), remaining),
-            )
+        # Last local fork is done. Now — and only now — open and register remote
+        # L3 sessions: opening starts the remote subtree and registering spawns
+        # the RemoteL3Endpoint health thread, so both must follow every local
+        # fork. Each remote consumes this process's remaining startup budget.
+        self._activate_remote_sessions(deadline)
 
         # _Worker was constructed in _init_hierarchical (pre-fork) so children
         # inherit the HeapRing MAP_SHARED mmap. Register PROCESS-mode workers via
