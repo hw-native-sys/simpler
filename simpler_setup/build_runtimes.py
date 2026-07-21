@@ -112,17 +112,16 @@ def build_all(
     pto_isa_root_for_metadata: Optional[str] = None
     pto_isa_runtime_keys: list[str] = []
 
-    # Onboard hosts that embed pto-isa headers (a2a3 always; a5 when the SDMA
-    # overlay is opted in) hard-depend on the pinned managed checkout + CANN
-    # aclnn syms. Resolve PTO_ISA_ROOT now so the runtime compiler consumes the
-    # same pin as kernel compilation. Skipped when no embedding platform is
-    # being built (sim-only, or a5 with overlay OFF). See issue #1351.
+    # Onboard hosts that embed pto-isa headers (a2a3 always; a5 when an async
+    # workspace overlay is opted in) hard-depend on the pinned managed
+    # checkout + CANN aclnn syms. Resolve once for metadata recording;
+    # RuntimeBuilder passes the path to CMake as -DPTO_ISA_ROOT= (#1403) —
+    # do not export it via os.environ. Skipped when no embedding platform is
+    # being built (sim-only, or a5 with overlays OFF). See issue #1351.
     if any(platform_embeds_pto_isa(p) for p in platforms):
         from simpler_setup.pto_isa import ensure_pto_isa_root  # noqa: PLC0415
 
-        pto_isa_root = ensure_pto_isa_root(verbose=True)
-        os.environ["PTO_ISA_ROOT"] = pto_isa_root
-        pto_isa_root_for_metadata = pto_isa_root
+        pto_isa_root_for_metadata = ensure_pto_isa_root(verbose=True)
 
     # libsimpler_log.so and libcpu_sim_context.so are process-global (one per
     # host toolchain, not per arch/variant) — build them once before iterating

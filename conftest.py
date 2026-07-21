@@ -436,14 +436,13 @@ def pytest_configure(config):
     # (CI scene-test jobs) want the session to die here rather than fan out
     # into device subprocesses that each re-attempt the clone.
     try:
-        root = ensure_pto_isa_root(verbose=True)
+        # Eager clone only — do not export PTO_ISA_ROOT into the ambient env
+        # (#1403). Downstream host builds receive the path via -DPTO_ISA_ROOT=.
+        ensure_pto_isa_root(verbose=True)
     except OSError as e:
         if config.getoption("--require-pto-isa"):
             pytest.exit(f"PTO-ISA required but unavailable: {e}", returncode=pytest.ExitCode.USAGE_ERROR)
         print(f"[pytest] PTO-ISA pre-clone skipped: {e}", file=sys.stderr)
-        root = None
-    if root:
-        os.environ["PTO_ISA_ROOT"] = root
 
     timeout = config.getoption("--pto-session-timeout")
     if timeout and timeout > 0:
@@ -1382,10 +1381,13 @@ def st_worker(request, st_platform, device_pool, _l2_worker_pool, _l2_poisoned):
                 handle = w.register(entry["callable"])
                 sub_handles[entry["name"]] = handle
             elif "orchestration" in entry:
-                from simpler_setup.scene_test import _compile_chip_callable_from_spec  # noqa: PLC0415
+                from simpler_setup.scene_test import (  # noqa: PLC0415
+                    _compile_chip_callable_from_spec,
+                    l3_compile_cache_key,
+                )
 
                 name = entry["name"]
-                cache_key = (cls.__qualname__, name, st_platform, runtime)
+                cache_key = l3_compile_cache_key(cls.__qualname__, name, st_platform, runtime)
                 chip = _compile_chip_callable_from_spec(entry, st_platform, runtime, cache_key)
                 handle = w.register(chip)
                 chip_handles[name] = handle

@@ -415,7 +415,8 @@ This repo vendors the `pto-isa` headers from a **pinned** git commit. When the p
 **Pin source of truth:** repo-root `pto_isa.pin` (a 40-hex SHA). CI
 reads it via `.github/actions/read-pto-isa` and feeds it both to
 test-time (`--pto-isa-commit`) and to the onboard `host_runtime.so`
-build (`SIMPLER_PTO_ISA_COMMIT` cmake define). Unpinned sentinel
+build (`SIMPLER_PTO_ISA_BUILD_COMMIT` cmake define; path is
+`-DPTO_ISA_ROOT=` from the managed pin checkout, not ambient env). Unpinned sentinel
 values (use latest HEAD): `""`, `head`, `latest`, `none` — see
 `simpler_setup/pto_isa.py` `_UNPINNED_COMMIT_VALUES`.
 
@@ -478,7 +479,7 @@ echo "new pto includes:";        printf '%s\n' "$NEW_PTO_INC"
 
 Note: this detects *include-path* changes, **not** edits to files that merely happen to `#include` pto-isa. A logic-only change inside an existing pto-isa consumer keeps the paragraph at the default advisory level — it does not by itself escalate.
 
-**What to convey (both levels):** the current pinned SHA from `pto_isa.pin`; and that a pin bump requires rebuilding onboard `a2a3` `host_runtime.so` against the new commit via `--config-settings=cmake.define.SIMPLER_PTO_ISA_COMMIT=<sha>` (the SDMA headers are compiled into `host_runtime.so`; see `docs/developer-guide.md`, issue #1067). The exact wording per level is given by the Step 8 blockquotes.
+**What to convey (both levels):** the current pinned SHA from `pto_isa.pin`; and that a pin bump requires rebuilding onboard `a2a3` `host_runtime.so` against the new commit via `--config-settings=cmake.define.SIMPLER_PTO_ISA_BUILD_COMMIT=<sha>` (the SDMA headers are compiled into `host_runtime.so`; see `docs/developer-guide.md`, issue #1067). The exact wording per level is given by the Step 8 blockquotes.
 
 ## Step 7: Optional Cross-Check with External CLI Reviewers
 
@@ -721,11 +722,11 @@ From Step 6.5. **Always rendered when the pin is active** (`PIN_ACTIVE=1`), at o
 
 - **No header-reference change** (`PTO_REFS` and `NEW_PTO_INC` empty) → **advisory**. A light, always-on nudge that the pin exists; does not by itself block the merge. Render as a single info line, e.g.:
 
-  > ℹ️ **pto-isa pin:** `pto_isa.pin` is pinned to `<sha>`. No pto-isa header references changed in this PR — confirm the pinned commit is still adequate; bump + rebuild onboard `a2a3` `host_runtime.so` (`SIMPLER_PTO_ISA_COMMIT`) only if needed.
+  > ℹ️ **pto-isa pin:** `pto_isa.pin` is pinned to `<sha>`. No pto-isa header references changed in this PR — confirm the pinned commit is still adequate; bump + rebuild onboard `a2a3` `host_runtime.so` (`SIMPLER_PTO_ISA_BUILD_COMMIT`) only if needed.
 
 - **Header-reference changed** (`PTO_REFS` or `NEW_PTO_INC` non-empty) → escalate to **recommendation**. Surface a visible reminder and mirror it as a **Should-fix / check** row in Issues Found below so it cannot be missed at Verdict time:
 
-  > ⚠️ **pto-isa pin check:** this PR changes how it references pto-isa while `pto_isa.pin` is pinned to `<sha>`. Verify the pinned commit still provides every pto-isa header the PR references — a **changed pto-isa include path** (e.g. `pto/npu/...` → `pto/...`) is the strongest hint a bump is needed; a newly added pto-isa include is a weaker hint. If the pin is bumped, rebuild onboard `a2a3` `host_runtime.so` against the new commit (`SIMPLER_PTO_ISA_COMMIT`).
+  > ⚠️ **pto-isa pin check:** this PR changes how it references pto-isa while `pto_isa.pin` is pinned to `<sha>`. Verify the pinned commit still provides every pto-isa header the PR references — a **changed pto-isa include path** (e.g. `pto/npu/...` → `pto/...`) is the strongest hint a bump is needed; a newly added pto-isa include is a weaker hint. If the pin is bumped, rebuild onboard `a2a3` `host_runtime.so` against the new commit (`SIMPLER_PTO_ISA_BUILD_COMMIT`).
 
   List the triggering signals verbatim (changed pto-isa include paths / newly added pto-isa includes). `PIN_TOUCHED` (the PR edited `pto_isa.pin`) is reported alongside, at whichever level applies, with a note to verify the new SHA and the `host_runtime.so` rebuild.
 

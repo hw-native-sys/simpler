@@ -239,7 +239,7 @@ def _build_chip_callable(platform: str, case: dict) -> ChipCallable:
     pto_isa_root = None
     if case["kernel"] is not None or not platform.endswith("sim"):
         pto_isa_root = ensure_pto_isa_root()
-        os.environ["PTO_ISA_ROOT"] = pto_isa_root
+        # Path is passed explicitly to KernelCompiler; do not export (#1403).
 
     children = []
     if case["kernel"] is not None:

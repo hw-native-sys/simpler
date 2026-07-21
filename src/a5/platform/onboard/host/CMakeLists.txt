@@ -52,12 +52,14 @@ if(SIMPLER_ENABLE_PTO_SDMA_WORKSPACE AND SIMPLER_ENABLE_PTO_URMA_WORKSPACE)
         "because CommContext exposes a single workSpace/workSpaceSize pair")
 endif()
 if(SIMPLER_ENABLE_PTO_SDMA_WORKSPACE OR SIMPLER_ENABLE_PTO_URMA_WORKSPACE)
-    if(NOT DEFINED ENV{PTO_ISA_ROOT})
+    # Pin-resolved checkout path is passed by RuntimeBuilder as -DPTO_ISA_ROOT=
+    # (#1403). Do not read $ENV{PTO_ISA_ROOT} — ambient exports are not the pin.
+    if(NOT PTO_ISA_ROOT)
         message(FATAL_ERROR
-            "a5 onboard host_runtime PTO async workspace overlays require PTO_ISA_ROOT "
-            "(needs pto-isa host headers)")
+            "a5 onboard host_runtime PTO async workspace overlays require "
+            "-DPTO_ISA_ROOT=<pin-resolved path> (needs pto-isa host headers)")
     endif()
-    list(APPEND CMAKE_CUSTOM_INCLUDE_DIRS "$ENV{PTO_ISA_ROOT}/include")
+    list(APPEND CMAKE_CUSTOM_INCLUDE_DIRS "${PTO_ISA_ROOT}/include")
 endif()
 
 # Build complete source list: core host sources + sources from CUSTOM_SOURCE_DIRS

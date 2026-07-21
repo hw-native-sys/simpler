@@ -367,6 +367,17 @@ class RuntimeBuilder:
                 defines: dict[str, str] = {}
                 if build_pto_isa_commit:
                     defines["SIMPLER_PTO_ISA_BUILD_COMMIT"] = build_pto_isa_commit
+                # Pin-resolved checkout path for host CMake include dirs (#1403).
+                # Prefer the path already resolved on the RuntimeCompiler; fall
+                # back to ensure_pto_isa_root when embedding but the compiler
+                # field is unset (e.g. mocked UT / partial construction).
+                if self._requires_pto_isa_metadata_validation():
+                    pto_root = getattr(compiler, "pto_isa_root", None)
+                    if not isinstance(pto_root, str) or not pto_root:
+                        from .pto_isa import ensure_pto_isa_root  # noqa: PLC0415
+
+                        pto_root = ensure_pto_isa_root(verbose=True)
+                    defines["PTO_ISA_ROOT"] = pto_root
                 for opt_in_define in (
                     "SIMPLER_ENABLE_PTO_SDMA_WORKSPACE",
                     "SIMPLER_ENABLE_PTO_URMA_WORKSPACE",

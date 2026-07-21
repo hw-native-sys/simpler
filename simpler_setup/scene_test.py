@@ -36,7 +36,31 @@ from .pto_isa import ensure_pto_isa_root
 
 logger = logging.getLogger(__name__)
 
-_compile_cache: dict[tuple[str, str, str], object] = {}
+_compile_cache: dict[tuple, object] = {}
+
+
+def _pto_isa_compile_cache_token() -> str:
+    """Pin SHA included in session compile-cache keys.
+
+    ``ensure_pto_isa_root()`` always resolves the managed checkout, but the
+    session cache previously keyed only on (qualname, platform, runtime). A
+    mid-session pin bump could then reuse kernels built against the old ISA.
+    """
+    from .pto_isa import read_pto_isa_pin  # noqa: PLC0415
+
+    return read_pto_isa_pin()
+
+
+def l3_compile_cache_key(qualname: str, name: str, platform: str, runtime: str) -> tuple:
+    """Session compile-cache key for an L3 orchestration entry.
+
+    Every L3 compile path (scene-test ``test_run``, standalone worker, the
+    ``st_worker`` pytest fixture) keys ``_compile_cache`` through here so they
+    share one entry per orchestration; a divergent key format recompiles the
+    same kernels once per path. The pin token pins the key to the current
+    pto-isa revision.
+    """
+    return (qualname, name, platform, runtime, _pto_isa_compile_cache_token())
 
 
 def clear_compile_cache() -> None:
@@ -958,7 +982,7 @@ class SceneTestCase:
     @classmethod
     def compile_chip_callable(cls, platform):
         """Compile CALLABLE -> ChipCallable (L2). Session-cached."""
-        cache_key = (cls.__qualname__, platform, cls._st_runtime)
+        cache_key = (cls.__qualname__, platform, cls._st_runtime, _pto_isa_compile_cache_token())
         return _compile_chip_callable_from_spec(cls.CALLABLE, platform, cls._st_runtime, cache_key)
 
     @classmethod
@@ -968,7 +992,7 @@ class SceneTestCase:
         for entry in cls.CALLABLE["callables"]:
             if "orchestration" in entry:
                 name = entry["name"]
-                cache_key = (cls.__qualname__, name, platform, cls._st_runtime)
+                cache_key = l3_compile_cache_key(cls.__qualname__, name, platform, cls._st_runtime)
                 chip = _compile_chip_callable_from_spec(entry, platform, cls._st_runtime, cache_key)
                 compiled[name] = chip
                 compiled[f"{name}_sig"] = entry["orchestration"].get("signature", [])
@@ -1524,7 +1548,9 @@ class SceneTestCase:
                     f"  {_san.preload_command(_san_tokens, args.platform)} python {module_name} ..."
                 )
 
-        os.environ["PTO_ISA_ROOT"] = ensure_pto_isa_root(verbose=True)
+        # Eager pin checkout for kernel/orchestration compiles that pass
+        # pto_isa_root explicitly. Do not export PTO_ISA_ROOT (#1403).
+        ensure_pto_isa_root(verbose=True)
 
         if args.rounds > 1 and args.enable_l2_swimlane:
             logger.warning("Profiling disabled: --rounds > 1")
@@ -1935,7 +1961,7 @@ def _create_standalone_worker(group, level, args, selected_by_cls):
                 cls_sub_handles[entry["name"]] = handle
             elif "orchestration" in entry:
                 name = entry["name"]
-                cache_key = (cls.__qualname__, name, args.platform, cls._st_runtime)
+                cache_key = l3_compile_cache_key(cls.__qualname__, name, args.platform, cls._st_runtime)
                 chip = _compile_chip_callable_from_spec(entry, args.platform, cls._st_runtime, cache_key)
                 handle = worker.register(chip)
                 cls_chip_handles[name] = handle

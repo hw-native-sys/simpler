@@ -821,7 +821,11 @@ if(NOT DEFINED ENV{{ASCEND_HOME_PATH}})
 endif()
 set(ASCEND_HOME_PATH $ENV{{ASCEND_HOME_PATH}})
 set(SOC_VERSION {cfg["soc"]} CACHE STRING "Simulator SoC version")
-set(PTO_ISA_ROOT $ENV{{PTO_ISA_ROOT}} CACHE PATH "PTO ISA root")
+# Passed by the Python driver as -DPTO_ISA_ROOT= (pin-resolved); never $ENV (#1403).
+set(PTO_ISA_ROOT "" CACHE PATH "PTO ISA root")
+if(NOT PTO_ISA_ROOT)
+    message(FATAL_ERROR "PTO_ISA_ROOT must be passed as -DPTO_ISA_ROOT=<pin-resolved path>")
+endif()
 set(REPO_ROOT $ENV{{REPO_ROOT}} CACHE PATH "simpler repo root")
 
 add_compile_options(
@@ -883,20 +887,21 @@ target_link_libraries(replay_host PRIVATE
 """
 
 
-def emit_run_collect(cfg) -> str:
-    # Plain string (bash uses ${} braces) — substitute the SoC default via token.
-    return _RUN_COLLECT_TEMPLATE.replace("__SOC_DEFAULT__", cfg["soc"])
+def emit_run_collect(cfg, pto_isa_root: str) -> str:
+    # Plain string (bash uses ${} braces) — bake SoC default and the
+    # pin-resolved pto-isa path via tokens (no ambient PTO_ISA_ROOT env #1403).
+    return _RUN_COLLECT_TEMPLATE.replace("__SOC_DEFAULT__", cfg["soc"]).replace("__PTO_ISA_ROOT__", pto_isa_root)
 
 
 _RUN_COLLECT_TEMPLATE = """\
 #!/usr/bin/env bash
 set -euo pipefail
 : "${CANN_HOME:?CANN_HOME must be set}"
-: "${PTO_ISA_ROOT:?PTO_ISA_ROOT must be set}"
 : "${REPO_ROOT:?REPO_ROOT must be set}"
 
 WS="${WS:-$(dirname "$(readlink -f "$0")")}"
 SOC_VERSION="${SOC_VERSION:-__SOC_DEFAULT__}"
+PTO_ISA_ROOT="__PTO_ISA_ROOT__"
 DEVICE_ID="${TARGET_DEVICE_ID:-${NPU_LOCKED_DEVICE:-0}}"
 BUILD_DIR="$WS/build"
 COLLECT_DIR="$WS/msprof_collect"
@@ -941,6 +946,7 @@ def generate_workspace(  # noqa: PLR0913
     name: str,
     tensor_count: int,
     args,
+    pto_isa_root: str,
     debug: bool = False,
     block_num: int = 1,
 ):
@@ -954,7 +960,7 @@ def generate_workspace(  # noqa: PLR0913
     (ws / "replay_host.cpp").write_text(emit_replay_host(tensor_count, args, block_num))
     (ws / "CMakeLists.txt").write_text(emit_cmakelists(arch, name, cfg, debug))
     rc = ws / "run_collect.sh"
-    rc.write_text(emit_run_collect(cfg))
+    rc.write_text(emit_run_collect(cfg, pto_isa_root))
     rc.chmod(0o755)
 
 
@@ -969,11 +975,10 @@ def _build_env():
     env["ASCEND_HOME_PATH"] = cann
     env["CANN_HOME"] = cann
     env["REPO_ROOT"] = str(PROJECT_ROOT)
-    env["PTO_ISA_ROOT"] = ensure_pto_isa_root(verbose=True)
     return env
 
 
-def smoke_build(ws: Path, env, cfg):
+def smoke_build(ws: Path, env, cfg, pto_isa_root: str):
     build = ws / "build"
     build.mkdir(exist_ok=True)
     subprocess.run(
@@ -986,7 +991,7 @@ def smoke_build(ws: Path, env, cfg):
             "-B",
             str(build),
             f"-DSOC_VERSION={cfg['soc']}",
-            f"-DPTO_ISA_ROOT={env['PTO_ISA_ROOT']}",
+            f"-DPTO_ISA_ROOT={pto_isa_root}",
             f"-DREPO_ROOT={env['REPO_ROOT']}",
         ],
         cwd=str(ws),
@@ -1157,8 +1162,8 @@ def collect(ws: Path, env, max_time: int, device=None, dest_name: str = "trace.j
             "--max-time",
             str(max_time),
             "--run",
-            f"CANN_HOME={env['CANN_HOME']} PTO_ISA_ROOT={env['PTO_ISA_ROOT']} "
-            f"REPO_ROOT={env['REPO_ROOT']} TARGET_DEVICE_ID=$TASK_DEVICE "
+            f"CANN_HOME={env['CANN_HOME']} REPO_ROOT={env['REPO_ROOT']} "
+            f"TARGET_DEVICE_ID=$TASK_DEVICE "
             f"bash {ws}/run_collect.sh",
         ]
     else:
@@ -1403,6 +1408,10 @@ def main():
     label = f"{class_name}_{case}_{args.platform}_{name}_mix{mix_tag}"
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     ws = PROJECT_ROOT / "outputs" / f"l0_swimlane_{label}_{ts}"
+    # Pin-resolved checkout, threaded by value into the workspace generator (bakes
+    # it into run_collect.sh) and smoke_build (-DPTO_ISA_ROOT=). Never exported
+    # into the subprocess environment — CMakeLists does not read $ENV (#1403).
+    pto_isa_root = ensure_pto_isa_root(verbose=True)
     generate_workspace(
         ws,
         arch,
@@ -1411,13 +1420,14 @@ def main():
         name,
         tensor_count,
         kargs,
+        pto_isa_root,
         debug=args.debug_line,
         block_num=block_num,
     )
     print(f"[l0_swimlane] workspace: {ws}")
 
     env = _build_env()
-    smoke_build(ws, env, cfg)
+    smoke_build(ws, env, cfg, pto_isa_root)
     if args.no_collect:
         print(f"[l0_swimlane] --no-collect: stopping after smoke build.\n  {ws}")
         return

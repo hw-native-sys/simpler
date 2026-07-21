@@ -179,13 +179,24 @@ def read_pto_isa_build_metadata(lib_dir: Path) -> Optional[dict]:
 
 
 def validate_runtime_pto_isa_current_pin(lib_dir: Path, runtime_key: Optional[str] = None) -> None:
-    """Raise when pre-built runtime binaries do not match the current pin."""
-    metadata = read_pto_isa_build_metadata(lib_dir)
-    if metadata is None:
-        return
+    """Raise when pre-built runtime binaries do not match the current pin.
 
+    Called only for platforms that embed PTO-ISA headers into host runtimes
+    (see :func:`simpler_setup.runtime_builder.platform_embeds_pto_isa`). Missing
+    metadata is a hard failure — silent skip would let a pin bump load a stale
+    ``host_runtime.so``.
+    """
     required_commit = read_pto_isa_pin()
     metadata_path = pto_isa_build_metadata_path(lib_dir)
+    metadata = read_pto_isa_build_metadata(lib_dir)
+    if metadata is None:
+        raise RuntimeError(
+            "Missing PTO-ISA build metadata: "
+            f"current pto_isa.pin requires {required_commit}, but {metadata_path} "
+            "is absent.\n"
+            "Reinstall simpler or rebuild this runtime so build/lib records the pin."
+        )
+
     if metadata.get("schema_version") == 3 and runtime_key is not None:
         artifacts = metadata.get("runtime_artifacts")
         if not isinstance(artifacts, dict):

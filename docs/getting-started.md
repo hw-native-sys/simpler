@@ -55,20 +55,17 @@ To use a different PTO-ISA revision, update `pto_isa.pin` to the desired
 diff and applies the same revision to install-time runtime builds and run-time
 kernel compilation.
 
-For a2a3 onboard runtimes (and a5 onboard when the SDMA overlay is enabled),
-builds record the actual PTO-ISA git HEAD used for each runtime in
-`build/lib/pto_isa_build.json`. This JSON is artifact
-provenance, not a second configuration source. If the metadata says a
-pre-built runtime was built for an older pin, or a partial rebuild did not
-record that runtime, lookup fails with a stale-binary diagnostic and asks you
-to reinstall or rebuild:
+For platforms that embed PTO-ISA headers into onboard host runtimes (a2a3
+always; a5 when an async workspace overlay is ON), builds record the actual
+PTO-ISA git HEAD used for each runtime in `build/lib/pto_isa_build.json`.
+This JSON is artifact provenance, not a second configuration source. Lookup
+of those runtimes **requires** the metadata file: if it is missing, or if it
+says a pre-built runtime was built for an older pin / omitted that runtime,
+lookup fails with a diagnostic and asks you to reinstall or rebuild:
 
 ```bash
 cat build/lib/pto_isa_build.json
 ```
-
-Existing installs that do not have `build/lib/pto_isa_build.json` continue to
-work; they simply skip this stale-artifact check.
 
 **Troubleshooting:**
 
@@ -76,8 +73,11 @@ work; they simply skip this stale-artifact check.
   `build/pto-isa` on a machine that can access GitHub.
 - If clone fails due to network: try again or manually clone with HTTPS into
   `build/pto-isa`.
-- If runtime lookup reports stale PTO-ISA binaries: rerun `pip install` so
-  `build/lib` is rebuilt for the current `pto_isa.pin`.
+- If runtime lookup reports missing or stale PTO-ISA metadata/binaries: rerun
+  `pip install` so `build/lib` is rebuilt for the current `pto_isa.pin`.
+- Host compile receives the pin-resolved checkout as `-DPTO_ISA_ROOT=` (not
+  via ambient `PTO_ISA_ROOT`); kernel compile uses the same
+  `ensure_pto_isa_root()` path.
 
 Note: for simulation platforms, PTO ISA headers are optional and only needed if
 your kernels use PTO ISA intrinsics.

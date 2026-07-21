@@ -367,7 +367,10 @@ class TestRuntimeBuilderGetBinaries:
 
         host_call = next(call for call in mock_instance.compile.call_args_list if call.args[0] == "host")
         non_host_calls = [call for call in mock_instance.compile.call_args_list if call.args[0] != "host"]
-        assert host_call.kwargs["cmake_defines"] == {"SIMPLER_PTO_ISA_BUILD_COMMIT": pin}
+        assert host_call.kwargs["cmake_defines"] == {
+            "PTO_ISA_ROOT": "/tmp/pto-isa",
+            "SIMPLER_PTO_ISA_BUILD_COMMIT": pin,
+        }
         assert all(call.kwargs["cmake_defines"] is None for call in non_host_calls)
 
     @patch("simpler_setup.runtime_builder.RuntimeCompiler")
@@ -419,6 +422,7 @@ class TestRuntimeBuilderGetBinaries:
         host_call = next(call for call in mock_instance.compile.call_args_list if call.args[0] == "host")
         assert host_call.kwargs["cmake_defines"]["SIMPLER_PTO_ISA_BUILD_COMMIT"] == pin
         assert host_call.kwargs["cmake_defines"]["SIMPLER_ENABLE_PTO_SDMA_WORKSPACE"] == "ON"
+        assert host_call.kwargs["cmake_defines"]["PTO_ISA_ROOT"] == "/tmp/pto-isa"
 
     @patch("simpler_setup.runtime_builder.RuntimeCompiler")
     def test_a5_overlay_off_direct_build_does_not_write_pto_isa_metadata(self, MockCompiler, tmp_path, monkeypatch):

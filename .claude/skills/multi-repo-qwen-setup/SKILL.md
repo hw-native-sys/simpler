@@ -21,7 +21,7 @@ There are **three distinct qwen3 entry points with different invocation
 styles**. They measure different things; don't confuse them:
 
 | aspect | Path 0 (in-repo) | Path A (serving) | Path B (decode_fwd) |
-| ------ | ---------------- | ---------------- | --------------------- |
+| ------ | ---------------- | ---------------- | ------------------- |
 | repo | simpler (this) | pypto-serving | pypto-lib |
 | entry | qwen3_14b_decode | npu_generate.py | decode_fwd.py |
 | cross-repo? | no | yes | yes |
@@ -264,7 +264,9 @@ the pinned PTO-ISA + a context length:
 ```bash
 .claude/skills/onboard-arch-precheck/check.sh a2a3 || exit 1
 cd "$PWD/build/pypto-lib"
-export PTO_ISA_ROOT="$PWD/build/pto-isa" SIMPLER_PTO_ISA_COMMIT=<pinned-commit>
+# PTO-ISA is auto-resolved from simpler's pto_isa.pin via ensure_pto_isa_root();
+# do NOT export PTO_ISA_ROOT (#1403). An ambient path can drift off-pin and
+# simpler now rejects a checkout whose HEAD does not match the pin.
 export PTO2_MANUAL_MAX_SEQ=3338   # ctx length used by --max-seq
 ```
 

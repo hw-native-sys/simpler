@@ -25,7 +25,7 @@ from _task_interface import ArgDirection, ChipCallable  # pyright: ignore[report
 # ``simpler_setup/__init__.py`` re-exports the ``scene_test`` *decorator*,
 # which shadows the submodule attribute when accessed via ``simpler_setup``.
 # Importing the names directly from the submodule avoids that ambiguity.
-from simpler_setup.scene_test import _compile_cache, clear_compile_cache
+from simpler_setup.scene_test import _compile_cache, _pto_isa_compile_cache_token, clear_compile_cache
 
 
 def _build_chip_callable(tag: str) -> ChipCallable:
@@ -49,9 +49,19 @@ def test_clear_compile_cache_drops_cached_chip_callables():
     """
     _compile_cache.clear()
     for i in range(3):
-        _compile_cache[("t", "plat", f"rt{i}")] = _build_chip_callable(f"n{i}")
+        _compile_cache[("t", "plat", f"rt{i}", "pin")] = _build_chip_callable(f"n{i}")
     assert len(_compile_cache) == 3
 
     clear_compile_cache()
 
     assert _compile_cache == {}
+
+
+def test_pto_isa_compile_cache_token_tracks_pin(monkeypatch):
+    """Session cache keys must change when pto_isa.pin changes."""
+    pin_a = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    pin_b = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+    monkeypatch.setattr("simpler_setup.pto_isa.read_pto_isa_pin", lambda: pin_a)
+    assert _pto_isa_compile_cache_token() == pin_a
+    monkeypatch.setattr("simpler_setup.pto_isa.read_pto_isa_pin", lambda: pin_b)
+    assert _pto_isa_compile_cache_token() == pin_b

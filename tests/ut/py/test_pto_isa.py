@@ -341,3 +341,10 @@ def test_validate_runtime_pto_isa_current_pin_accepts_legacy_global_metadata(tmp
     monkeypatch.setattr(pto_isa, "read_pto_isa_pin", lambda: PIN_A)
 
     pto_isa.validate_runtime_pto_isa_current_pin(tmp_path, runtime_key=RUNTIME_A)
+
+
+def test_validate_runtime_pto_isa_current_pin_rejects_missing_metadata(tmp_path, monkeypatch):
+    monkeypatch.setattr(pto_isa, "read_pto_isa_pin", lambda: PIN_A)
+
+    with pytest.raises(RuntimeError, match="Missing PTO-ISA build metadata"):
+        pto_isa.validate_runtime_pto_isa_current_pin(tmp_path, runtime_key=RUNTIME_A)

@@ -40,12 +40,14 @@ endif()
 # refactored away, the macro is forced ON: PTO_ISA_ROOT and CANN 9.0+ are
 # hard build/runtime preconditions for a2a3 onboard.
 set(SIMPLER_ENABLE_PTO_SDMA_WORKSPACE ON)
-if(NOT DEFINED ENV{PTO_ISA_ROOT})
+# Pin-resolved checkout path is passed by RuntimeBuilder as -DPTO_ISA_ROOT=
+# (#1403). Do not read $ENV{PTO_ISA_ROOT} — ambient exports are not the pin.
+if(NOT PTO_ISA_ROOT)
     message(FATAL_ERROR
-        "a2a3 onboard host_runtime requires PTO_ISA_ROOT "
+        "a2a3 onboard host_runtime requires -DPTO_ISA_ROOT=<pin-resolved path> "
         "(SIMPLER_ENABLE_PTO_SDMA_WORKSPACE is forced ON; needs pto-isa headers + CANN 9.0+)")
 endif()
-list(APPEND CMAKE_CUSTOM_INCLUDE_DIRS "$ENV{PTO_ISA_ROOT}/include")
+list(APPEND CMAKE_CUSTOM_INCLUDE_DIRS "${PTO_ISA_ROOT}/include")
 
 # Build complete source list: core host sources + sources from CUSTOM_SOURCE_DIRS
 set(HOST_RUNTIME_SOURCES "")
