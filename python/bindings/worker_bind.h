@@ -740,7 +740,11 @@ inline void bind_worker(nb::module_ &m) {
 
     m.attr("DEFAULT_HEAP_RING_SIZE") = static_cast<uint64_t>(DEFAULT_HEAP_RING_SIZE);
     m.attr("MAILBOX_SIZE") = static_cast<int>(MAILBOX_SIZE);
+    m.attr("MAILBOX_TASK_SLOT_SIZE") = static_cast<int>(MAILBOX_TASK_SLOT_SIZE);
+    m.attr("MAILBOX_TASK_SLOT_COUNT") = static_cast<int>(MAILBOX_TASK_SLOT_COUNT);
     m.attr("MAILBOX_OFF_ERROR_MSG") = static_cast<int>(MAILBOX_OFF_ERROR_MSG);
+    m.attr("MAILBOX_OFF_PROTOCOL") = static_cast<int>(MAILBOX_OFF_PROTOCOL);
+    m.attr("MAILBOX_PROTOCOL_MAGIC_VERSION") = MAILBOX_PROTOCOL_MAGIC_VERSION;
     m.attr("MAILBOX_ERROR_MSG_SIZE") = static_cast<int>(MAILBOX_ERROR_MSG_SIZE);
     m.attr("MAX_RING_DEPTH") = static_cast<int32_t>(MAX_RING_DEPTH);
     m.attr("MAX_SCOPE_DEPTH") = static_cast<int32_t>(MAX_SCOPE_DEPTH);

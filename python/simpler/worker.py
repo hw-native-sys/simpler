@@ -129,6 +129,8 @@ from .orchestrator import Orchestrator
 from .task_interface import (
     MAILBOX_ERROR_MSG_SIZE,
     MAILBOX_OFF_ERROR_MSG,
+    MAILBOX_OFF_PROTOCOL,
+    MAILBOX_PROTOCOL_MAGIC_VERSION,
     MAILBOX_SIZE,
     CallConfig,
     ChipCallable,
@@ -193,7 +195,7 @@ _OFF_TASK_ARGS_BLOB = _OFF_TASK_CALLABLE_HASH + CALLABLE_HASH_DIGEST_BYTES
 # MAILBOX_ARGS_CAPACITY mirrors the C++ constexpr in worker_manager.h so the
 # Python reader can bounds-check incoming args blobs. Source-of-truth for the
 # constants on the right is the nanobind binding (cannot drift).
-_MAILBOX_ARGS_CAPACITY = MAILBOX_SIZE - _OFF_TASK_ARGS_BLOB - MAILBOX_ERROR_MSG_SIZE
+_MAILBOX_ARGS_CAPACITY = MAILBOX_OFF_PROTOCOL - _OFF_TASK_ARGS_BLOB
 _OFF_CONTROL_CALLABLE_HASH = _OFF_ARGS + 32
 # MAILBOX_OFF_ERROR_MSG / MAILBOX_ERROR_MSG_SIZE come from the C++
 # nanobind module so the two sides cannot drift.
@@ -994,6 +996,14 @@ def _format_exc(prefix: str, exc: BaseException) -> str:
     return f"{prefix}: {type(exc).__name__}: {exc}"
 
 
+def _validate_task_protocol(buf) -> None:
+    protocol = struct.unpack_from("Q", buf, MAILBOX_OFF_PROTOCOL)[0]
+    if protocol != MAILBOX_PROTOCOL_MAGIC_VERSION:
+        raise RuntimeError(
+            f"mailbox protocol mismatch: got 0x{protocol:016x}, expected 0x{MAILBOX_PROTOCOL_MAGIC_VERSION:016x}"
+        )
+
+
 def _read_args_from_mailbox(buf) -> TaskArgs:
     """Decode the TaskArgs blob written by C++ write_blob from the mailbox.
 
@@ -1014,7 +1024,7 @@ def _read_args_from_mailbox(buf) -> TaskArgs:
     return read_args_from_blob(mailbox_addr + _OFF_TASK_ARGS_BLOB)
 
 
-def _sub_worker_loop(
+def _sub_worker_loop(  # noqa: PLR0912 -- unified task/control mailbox state machine
     buf,
     registry: dict[int, Any],
     identity_table: dict[bytes, int],
@@ -1034,6 +1044,12 @@ def _sub_worker_loop(
         while True:
             state = _mailbox_load_i32(state_addr)
             if state == _TASK_READY:
+                try:
+                    _validate_task_protocol(buf)
+                except Exception as e:  # noqa: BLE001
+                    _write_error(buf, 1, _format_exc("sub_worker", e))
+                    _mailbox_store_i32(state_addr, _TASK_DONE)
+                    continue
                 digest = _read_task_digest(buf)
                 cid = identity_table.get(digest)
                 fn = registry.get(int(cid)) if cid is not None else None
@@ -1571,6 +1587,12 @@ def _run_chip_main_loop(  # noqa: PLR0912, PLR0913, PLR0915 -- unified TASK_READ
         while True:
             state = _mailbox_load_i32(state_addr)
             if state == _TASK_READY:
+                try:
+                    _validate_task_protocol(buf)
+                except Exception as e:  # noqa: BLE001
+                    _write_error(buf, 1, _format_exc(f"chip_process dev={device_id}", e))
+                    _mailbox_store_i32(state_addr, _TASK_DONE)
+                    continue
                 digest = _read_task_digest(buf)
                 cid = identity_table.get(digest)
                 cfg = _read_config_from_mailbox(buf)
@@ -1908,6 +1930,12 @@ def _child_worker_loop(
     while True:
         state = _mailbox_load_i32(state_addr)
         if state == _TASK_READY:
+            try:
+                _validate_task_protocol(buf)
+            except Exception as e:  # noqa: BLE001
+                _write_error(buf, 1, _format_exc(f"child_worker level={inner_worker.level}", e))
+                _mailbox_store_i32(state_addr, _TASK_DONE)
+                continue
             digest = _read_task_digest(buf)
             cid = identity_table.get(digest)
             orch_fn = registry.get(int(cid)) if cid is not None else None

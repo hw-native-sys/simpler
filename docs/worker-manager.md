@@ -14,6 +14,12 @@ drives a shared-memory mailbox consumed by a forked Python child. The child
 runs the real worker (a `ChipWorker` for NEXT_LEVEL, a Python callable for
 SUB) in its own address space.
 
+`WorkerEndpointCaps::max_in_flight` defines the dispatch credits of one
+endpoint. `WorkerThread` owns that many executor threads and reports itself
+available while at least one credit remains. Production local mailboxes still
+advertise one credit at this stage; the credit mechanism is in place for the
+bounded two-flight HostGraph path.
+
 The remote L3 design keeps this local fork/shm path behind
 `LocalMailboxEndpoint` and reserves the same `WorkerEndpoint` boundary for a
 framed `RemoteL3Endpoint` for cross-host NEXT_LEVEL children. A remote endpoint
@@ -79,8 +85,8 @@ the public worker id from the local worker vector index.
 - **Directed NEXT_LEVEL lookup**: `get_worker_by_id` resolves the exact stable
   target selected by the user; the Scheduler never asks the manager to choose
   another NEXT_LEVEL worker
-- **SUB-only idle selection**: `pick_idle_sub_excluding` chooses an idle SUB
-  worker not already used by the same SUB group
+- **SUB-only credit selection**: `pick_idle_sub_excluding` chooses a SUB worker
+  with available endpoint credit that is not already used by the same SUB group
 
 Callable and remote-buffer eligibility is validated against the exact target
 during Orchestrator submission. It is not scheduling metadata and is not
@@ -112,19 +118,21 @@ public:
 private:
     Ring *ring_;                       // reads slot state via ring->slot_state(id)
     std::unique_ptr<WorkerEndpoint> endpoint_;
-    std::thread thread_;
+    std::vector<std::thread> threads_;
     std::queue<WorkerDispatch> queue_;
     std::mutex mu_;
     std::condition_variable cv_;
+    uint32_t capacity_;
+    std::atomic<uint32_t> available_;
 
     void loop();
     WorkerCompletion dispatch_process(WorkerDispatch d);
 };
 ```
 
-The WorkerThread's `std::thread` pumps the internal queue and calls
-`endpoint->run(...)` once per dispatch. `LocalMailboxEndpoint::run` drives the
-shm handshake — one mailbox round trip per dispatch. The forked child loop
+The WorkerThread executor threads pump one shared queue and call
+`endpoint->run(...)` once per reserved credit. `LocalMailboxEndpoint::run`
+drives one mailbox frame round trip per dispatch. The forked child loop
 that consumes the mailbox lives in Python (`_chip_process_loop` /
 `_sub_worker_loop` in `python/simpler/worker.py`); the parent does not fork
 children.
@@ -143,7 +151,11 @@ group sub-index.
 
 ## 3. Dispatch via shm mailbox
 
-Each `LocalMailboxEndpoint` drives a `MAILBOX_SIZE`-byte `MAP_SHARED` region.
+Each `LocalMailboxEndpoint` drives a `MAILBOX_SIZE`-byte `MAP_SHARED` region
+containing two fixed-size task frames. Slot generation identifies frame reuse;
+the protocol magic/version rejects mismatched parent and child layouts. Local
+production endpoints currently publish only slot 0, so this layout change is
+behavior-equivalent until the child gains two run threads.
 The Python facade forks one child per mailbox **before**
 `WorkerManager::start()` (so the parent has only the Python main thread when
 fork runs, avoiding the classical "fork in a multi-threaded process" hazard)
@@ -154,37 +166,42 @@ and the child polls the mailbox for the lifetime of the worker.
 ```cpp
 WorkerCompletion LocalMailboxEndpoint::run(Ring *ring, WorkerDispatch d) {
     TaskSlotState &s = *ring->slot_state(d.task_slot);
-    char *m = static_cast<char *>(mailbox_);
+    size_t slot = acquire_task_slot();
+    char *m = static_cast<char *>(mailbox_) + slot * MAILBOX_TASK_SLOT_SIZE;
 
-    // Write task data: reserved callable field, config, digest prefix, then
+    // Write task data: generation, protocol, config, digest prefix, then
     // length-prefixed TaskArgs blob. Tags are stripped; only
     // [digest][T][S][tensors][scalars] crosses the fork boundary.
-    uint64_t reserved = 0;
-    memcpy(m + MAILBOX_OFF_CALLABLE, &reserved, sizeof(reserved));
+    uint64_t generation = next_generation(slot);
+    memcpy(m + MAILBOX_OFF_GENERATION, &generation, sizeof(generation));
+    write_protocol(m, MAILBOX_PROTOCOL_MAGIC_VERSION);
     memcpy(m + MAILBOX_OFF_CONFIG, &s.config, sizeof(CallConfig));
     memcpy(m + MAILBOX_OFF_TASK_CALLABLE_HASH, s.callable.digest.data(), 32);
     const TaskArgs &args = s.is_group() ? s.task_args_list[d.group_index] : s.task_args;
     write_blob(m + MAILBOX_OFF_TASK_ARGS_BLOB, args);
 
     // Signal child
-    write_state(mailbox_, MailboxState::TASK_READY);
+    write_state(m, MailboxState::TASK_READY);
 
     // Poll for completion
-    while (read_state(mailbox_) != MailboxState::TASK_DONE)
+    while (read_state(m) != MailboxState::TASK_DONE)
         std::this_thread::sleep_for(std::chrono::microseconds(50));
 
-    int err = read_error(mailbox_);
-    write_state(mailbox_, MailboxState::IDLE);
+    check_generation(m, generation);
+    int err = read_error(m);
+    write_state(m, MailboxState::IDLE);
+    release_task_slot(slot);
     return err == 0
         ? WorkerCompletion{d.task_slot, d.group_index, EndpointOutcome::SUCCESS, ""}
         : WorkerCompletion{d.task_slot, d.group_index, EndpointOutcome::TASK_FAILURE,
-                           read_error_msg(mailbox_)};
+                           read_error_msg(m)};
 }
 ```
 
 Parent-side cost per dispatch:
 
-- One reserved `uint64`, one `CallConfig`, one 32-byte digest, and one
+- One generation `uint64`, one protocol word, one `CallConfig`, one 32-byte
+  digest, and one
   TaskArgs blob
 - One signal (`write_state`)
 - Poll loop with `sleep_for(50us)` (not busy-wait)
@@ -210,18 +227,19 @@ The child inherits the parent's full address space at fork time, so:
 ```text
 offset 0:                         int32   state
 offset 4:                         int32   error
-offset 8:                         uint64  reserved task callable field
+offset 8:                         uint64  task generation
                                           or control sub-command
 offset 16:                        CallConfig config
 MAILBOX_OFF_TASK_CALLABLE_HASH:   uint8[32] callable digest
 MAILBOX_OFF_TASK_ARGS_BLOB:       bytes [int32 T][int32 S]
                                         [Tensor x T][uint64_t x S]
-tail:                             fixed-size NUL-terminated error message
+MAILBOX_OFF_PROTOCOL:             uint64  protocol magic/version
+frame tail:                       fixed-size NUL-terminated error message
 ```
 
-The current mailbox size is the C++ `MAILBOX_SIZE` constant exported through
-the nanobind module; Python derives its offsets from the same binding where
-possible so the two sides cannot drift silently.
+`MAILBOX_SIZE` is two `MAILBOX_TASK_SLOT_SIZE` frames. The constants are
+exported through the nanobind module; Python derives its protocol, offsets,
+and allocation size from that binding so the two sides cannot drift silently.
 
 ### 3.4 Shutdown
 
@@ -229,7 +247,7 @@ possible so the two sides cannot drift silently.
 endpoint; for `LocalMailboxEndpoint` this writes `SHUTDOWN` to the mailbox.
 Each child loop sees it on its next poll and exits. The Python facade owns the
 child PIDs and calls `waitpid()` after writing `SHUTDOWN` to its own mailbox
-copy. The parent's `WorkerThread::stop()` only joins the C++ dispatcher thread
+copy. The parent's `WorkerThread::stop()` only joins the C++ dispatcher threads
 — it does not own the child process.
 
 ---

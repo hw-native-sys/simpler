@@ -57,6 +57,7 @@ struct MockMailboxWorker {
     struct Record {
         uint8_t callable_hash0;
         uint64_t tensor_key;  // first tensor's `data` field (unique per submit in tests)
+        uint64_t generation;
     };
 
     alignas(8) std::array<char, MAILBOX_SIZE> mailbox{};
@@ -70,6 +71,7 @@ struct MockMailboxWorker {
     std::string next_error_msg;
     std::atomic<bool> is_running{false};
     std::atomic<bool> stop_flag{false};
+    std::atomic<bool> protocol_valid{true};
     std::thread loop_thread;
 
     void start() {
@@ -146,6 +148,11 @@ private:
             if (stop_flag.load(std::memory_order_acquire)) return;
             MailboxState s = read_state();
             if (s == MailboxState::TASK_READY) {
+                uint64_t protocol = 0;
+                std::memcpy(&protocol, mailbox.data() + MAILBOX_OFF_PROTOCOL, sizeof(uint64_t));
+                protocol_valid.store(protocol == MAILBOX_PROTOCOL_MAGIC_VERSION, std::memory_order_release);
+                uint64_t generation = 0;
+                std::memcpy(&generation, mailbox.data() + MAILBOX_OFF_GENERATION, sizeof(uint64_t));
                 uint8_t callable_hash0 = static_cast<uint8_t>(mailbox[MAILBOX_OFF_TASK_CALLABLE_HASH]);
                 int32_t t_count = 0;
                 std::memcpy(&t_count, mailbox.data() + MAILBOX_OFF_TASK_ARGS_BLOB, sizeof(int32_t));
@@ -159,7 +166,7 @@ private:
                 }
                 {
                     std::lock_guard<std::mutex> lk(dispatched_mu);
-                    dispatched.push_back({callable_hash0, tensor_key});
+                    dispatched.push_back({callable_hash0, tensor_key, generation});
                 }
                 is_running.store(true, std::memory_order_release);
 
@@ -209,12 +216,13 @@ private:
 
 class FakeEndpoint final : public WorkerEndpoint {
 public:
-    explicit FakeEndpoint(int32_t worker_id, std::atomic<int> *prepare_count = nullptr) :
+    explicit FakeEndpoint(int32_t worker_id, std::atomic<int> *prepare_count = nullptr, uint32_t max_in_flight = 1) :
         prepare_count_(prepare_count) {
         caps_.kind = WorkerEndpointKind::REMOTE_L3;
         caps_.worker_id = worker_id;
         caps_.remote = true;
         caps_.transport = "test-remote";
+        caps_.max_in_flight = max_in_flight;
     }
 
     const WorkerEndpointCaps &caps() const override { return caps_; }
@@ -235,6 +243,49 @@ public:
 private:
     WorkerEndpointCaps caps_;
     std::atomic<int> *prepare_count_{nullptr};
+};
+
+class BlockingEndpoint final : public WorkerEndpoint {
+public:
+    BlockingEndpoint() {
+        caps_.kind = WorkerEndpointKind::REMOTE_L3;
+        caps_.worker_id = 9;
+        caps_.max_in_flight = 2;
+    }
+
+    const WorkerEndpointCaps &caps() const override { return caps_; }
+
+    WorkerCompletion run(Ring *, const WorkerDispatch &dispatch) override {
+        {
+            std::unique_lock<std::mutex> lk(mu_);
+            ++entered_;
+            cv_.notify_all();
+            cv_.wait(lk, [this] {
+                return released_;
+            });
+        }
+        return WorkerCompletion{dispatch.task_slot, dispatch.group_index, EndpointOutcome::SUCCESS, ""};
+    }
+
+    bool wait_entered(int expected, int timeout_ms = 500) {
+        std::unique_lock<std::mutex> lk(mu_);
+        return cv_.wait_for(lk, std::chrono::milliseconds(timeout_ms), [this, expected] {
+            return entered_ >= expected;
+        });
+    }
+
+    void release() {
+        std::lock_guard<std::mutex> lk(mu_);
+        released_ = true;
+        cv_.notify_all();
+    }
+
+private:
+    WorkerEndpointCaps caps_;
+    std::mutex mu_;
+    std::condition_variable cv_;
+    int entered_{0};
+    bool released_{false};
 };
 
 // ---------------------------------------------------------------------------
@@ -374,6 +425,38 @@ TEST(WorkerManagerTest, ControlPrepareUsesStableNextLevelWorkerId) {
     EXPECT_EQ(worker3_prepares.load(std::memory_order_relaxed), 1);
 }
 
+TEST(WorkerThreadTest, EndpointCreditsRunTwoDispatchesConcurrently) {
+    Ring allocator;
+    allocator.init(/*heap_bytes=*/0);
+    WorkerThread worker;
+    auto endpoint = std::make_unique<BlockingEndpoint>();
+    BlockingEndpoint *endpoint_ptr = endpoint.get();
+    std::atomic<int> completed{0};
+
+    worker.start(
+        &allocator, nullptr,
+        [&completed](WorkerCompletion) {
+            completed.fetch_add(1, std::memory_order_release);
+        },
+        std::move(endpoint)
+    );
+    EXPECT_EQ(worker.capacity(), 2u);
+    worker.dispatch(WorkerDispatch{1, 0});
+    worker.dispatch(WorkerDispatch{2, 0});
+    EXPECT_TRUE(endpoint_ptr->wait_entered(2));
+    EXPECT_FALSE(worker.idle());
+
+    endpoint_ptr->release();
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(500);
+    while (completed.load(std::memory_order_acquire) != 2 && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    EXPECT_EQ(completed.load(std::memory_order_acquire), 2);
+    EXPECT_TRUE(worker.idle());
+    worker.stop();
+    allocator.shutdown();
+}
+
 TEST_F(SchedulerFixture, IndependentTaskDispatchedAndConsumed) {
     auto args_a = single_tensor_args(0xCAFE, TensorArgType::OUTPUT);
     auto res = orch.submit_next_level(C(42), args_a, cfg, 0);
@@ -383,6 +466,8 @@ TEST_F(SchedulerFixture, IndependentTaskDispatchedAndConsumed) {
     ASSERT_GE(mock_worker.dispatched_count(), 1);
     EXPECT_EQ(mock_worker.dispatched[0].tensor_key, 0xCAFEu);
     EXPECT_EQ(mock_worker.dispatched[0].callable_hash0, 42u);
+    EXPECT_TRUE(mock_worker.protocol_valid.load(std::memory_order_acquire));
+    EXPECT_GT(mock_worker.dispatched[0].generation, 0u);
 
     mock_worker.complete();
     wait_consumed(slot);
@@ -406,6 +491,7 @@ TEST_F(SchedulerFixture, DependentTaskDispatchedAfterProducerCompletes) {
     }
     ASSERT_GE(mock_worker.dispatched_count(), 2);
     EXPECT_EQ(mock_worker.dispatched[1].callable_hash0, 11u);
+    EXPECT_EQ(mock_worker.dispatched[1].generation, mock_worker.dispatched[0].generation + 1);
 
     mock_worker.complete();  // B done
     wait_consumed(b.task_slot);

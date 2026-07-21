@@ -34,7 +34,11 @@ from typing import Any
 from _task_interface import (  # pyright: ignore[reportMissingImports]
     MAILBOX_ERROR_MSG_SIZE,
     MAILBOX_OFF_ERROR_MSG,
+    MAILBOX_OFF_PROTOCOL,
+    MAILBOX_PROTOCOL_MAGIC_VERSION,
     MAILBOX_SIZE,
+    MAILBOX_TASK_SLOT_COUNT,
+    MAILBOX_TASK_SLOT_SIZE,
     MAX_REGISTERED_CALLABLE_IDS,
     MAX_TENSOR_DIMS,
     ArgDirection,
@@ -83,7 +87,11 @@ __all__ = [
     "TaskState",
     "_Worker",
     "MAILBOX_SIZE",
+    "MAILBOX_TASK_SLOT_SIZE",
+    "MAILBOX_TASK_SLOT_COUNT",
     "MAILBOX_OFF_ERROR_MSG",
+    "MAILBOX_OFF_PROTOCOL",
+    "MAILBOX_PROTOCOL_MAGIC_VERSION",
     "MAILBOX_ERROR_MSG_SIZE",
     "read_args_from_blob",
     # Dynamic CommDomain allocation (orch-only API)

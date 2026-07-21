@@ -27,6 +27,7 @@
 #pragma once
 
 #include <atomic>
+#include <array>
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
@@ -36,6 +37,7 @@
 #include <memory>
 #include <mutex>
 #include <queue>
+#include <shared_mutex>
 #include <string>
 #include <thread>
 #include <vector>
@@ -82,7 +84,10 @@ enum class MailboxState : int32_t {
 // to the unified 128 B Tensor: the worst-case blob (CHIP_MAX_TENSOR_ARGS tensors)
 // grew ~3x, and 128*128 B = 16 KB alone exceeded the old mailbox (see the
 // capacity static_assert after MAILBOX_ARGS_CAPACITY).
-static constexpr size_t MAILBOX_SIZE = 32768;
+static constexpr size_t MAILBOX_TASK_SLOT_SIZE = 32768;
+static constexpr size_t MAILBOX_TASK_SLOT_COUNT = 2;
+static constexpr size_t MAILBOX_SIZE = MAILBOX_TASK_SLOT_SIZE * MAILBOX_TASK_SLOT_COUNT;
+static constexpr uint64_t MAILBOX_PROTOCOL_MAGIC_VERSION = 0x534D424F00020000ULL;
 
 // Error message region lives at the mailbox tail. 256 B of headroom is
 // enough for `<ExceptionType>: <short message>` produced by the child-side
@@ -110,15 +115,16 @@ static_assert(
     "CallConfig overflows reserved config region"
 );
 static constexpr ptrdiff_t MAILBOX_OFF_ERROR_MSG =
-    static_cast<ptrdiff_t>(MAILBOX_SIZE) - static_cast<ptrdiff_t>(MAILBOX_ERROR_MSG_SIZE);
+    static_cast<ptrdiff_t>(MAILBOX_TASK_SLOT_SIZE) - static_cast<ptrdiff_t>(MAILBOX_ERROR_MSG_SIZE);
+static constexpr ptrdiff_t MAILBOX_OFF_PROTOCOL = MAILBOX_OFF_ERROR_MSG - static_cast<ptrdiff_t>(sizeof(uint64_t));
+static constexpr ptrdiff_t MAILBOX_OFF_GENERATION = MAILBOX_OFF_CALLABLE;
 static constexpr ptrdiff_t MAILBOX_OFF_TASK_CALLABLE_HASH = MAILBOX_OFF_ARGS;
 static constexpr ptrdiff_t MAILBOX_OFF_TASK_ARGS_BLOB =
     MAILBOX_OFF_TASK_CALLABLE_HASH + static_cast<ptrdiff_t>(CALLABLE_HASH_DIGEST_SIZE);
 static constexpr size_t CTRL_SHM_NAME_BYTES = 32;
 static constexpr ptrdiff_t MAILBOX_OFF_CONTROL_CALLABLE_HASH =
     MAILBOX_OFF_ARGS + static_cast<ptrdiff_t>(CTRL_SHM_NAME_BYTES);
-static constexpr size_t MAILBOX_ARGS_CAPACITY =
-    MAILBOX_SIZE - static_cast<size_t>(MAILBOX_OFF_TASK_ARGS_BLOB) - MAILBOX_ERROR_MSG_SIZE;
+static constexpr size_t MAILBOX_ARGS_CAPACITY = static_cast<size_t>(MAILBOX_OFF_PROTOCOL - MAILBOX_OFF_TASK_ARGS_BLOB);
 static_assert(
     MAILBOX_ARGS_CAPACITY >= TASK_ARGS_BLOB_HEADER_SIZE + static_cast<size_t>(CHIP_MAX_TENSOR_ARGS) * sizeof(Tensor) +
                                  static_cast<size_t>(CHIP_MAX_SCALAR_ARGS) * sizeof(uint64_t),
@@ -193,6 +199,7 @@ struct WorkerEndpointCaps {
     bool remote{false};
     bool supports_task_dispatch{true};
     bool supports_control{true};
+    uint32_t max_in_flight{1};
     std::string transport{"local-mailbox"};
 };
 
@@ -249,7 +256,7 @@ public:
 
 class LocalMailboxEndpoint : public WorkerEndpoint {
 public:
-    LocalMailboxEndpoint(int32_t worker_id, void *mailbox);
+    LocalMailboxEndpoint(int32_t worker_id, void *mailbox, uint32_t task_slot_count = 1);
 
     const WorkerEndpointCaps &caps() const override { return caps_; }
     WorkerCompletion run(Ring *ring, const WorkerDispatch &dispatch) override;
@@ -300,12 +307,21 @@ public:
 private:
     WorkerEndpointCaps caps_;
     void *mailbox_{nullptr};
-    std::mutex mailbox_mu_;
+    std::shared_mutex mailbox_mu_;
+    std::mutex free_slot_mu_;
+    std::condition_variable free_slot_cv_;
+    std::queue<size_t> free_task_slots_;
+    std::array<std::atomic<uint64_t>, MAILBOX_TASK_SLOT_COUNT> generations_{};
     bool mailbox_control_timed_out_{false};
 
-    char *mbox() const { return static_cast<char *>(mailbox_); }
-    MailboxState read_mailbox_state() const;
-    void write_mailbox_state(MailboxState s);
+    char *mbox(size_t task_slot = 0) const {
+        return static_cast<char *>(mailbox_) + task_slot * MAILBOX_TASK_SLOT_SIZE;
+    }
+    MailboxState read_mailbox_state(const char *frame) const;
+    void write_mailbox_state(char *frame, MailboxState s);
+    size_t acquire_task_slot();
+    void release_task_slot(size_t task_slot);
+    WorkerCompletion run_task_slot(Ring *ring, const WorkerDispatch &dispatch, size_t task_slot);
     void run_control_command(const char *op_name, double timeout_s = -1.0);
 };
 
@@ -356,7 +372,9 @@ public:
     void dispatch(WorkerDispatch d);
 
     // True if the worker has no active task.
-    bool idle() const { return idle_.load(std::memory_order_acquire); }
+    bool idle() const { return available_.load(std::memory_order_acquire) > 0; }
+    bool busy() const { return available_.load(std::memory_order_acquire) < capacity_; }
+    uint32_t capacity() const { return capacity_; }
     const WorkerEndpointCaps &caps() const;
     int32_t worker_id() const;
 
@@ -441,12 +459,13 @@ private:
     std::unique_ptr<WorkerEndpoint> endpoint_;
     std::function<void(WorkerCompletion)> on_complete_;
 
-    std::thread thread_;
+    std::vector<std::thread> threads_;
     std::queue<WorkerDispatch> queue_;
     std::mutex mu_;
     std::condition_variable cv_;
     bool shutdown_{false};
-    std::atomic<bool> idle_{true};
+    uint32_t capacity_{1};
+    std::atomic<uint32_t> available_{1};
 
     void loop();
     WorkerCompletion dispatch_process(WorkerDispatch d);
