@@ -45,11 +45,12 @@ dispatch. For chip targets, the local implementation also prewarms executable
 state before first use when startup or dynamic register control reaches the
 child before dispatch.
 
-The current chip child loop preserves the historical TASK_READY lazy-prepare
-safety net: if a digest is already registered in the child identity table but
-the explicit prewarm step was missed, the child prepares its private slot in
-the dispatch path and logs a warning. This is not a public cid compatibility
-path and it does not fetch missing callable bytes from the parent.
+The chip child loop requires a prepared slot at dispatch: a TASK_READY only
+consumes a slot already staged via `_CTRL_PREPARE` (dynamic register) or via the
+startup snapshot (initial callables, prepared before INIT_READY). Reaching
+TASK_READY for an unprepared slot is a control-flow error and fails loudly
+rather than lazily preparing in the dispatch path. The child never fetches
+missing callable bytes from the parent.
 
 ### Chip Executable Prewarm
 

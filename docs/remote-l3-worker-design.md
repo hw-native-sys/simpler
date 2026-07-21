@@ -204,10 +204,10 @@ Use a two-process remote model:
    single-threaded pipe. This handoff is not the remote transport protocol.
 4. The session runner reads the manifest before starting transport threads and
    constructs `Worker(level=3)`.
-5. The runner then performs an explicit prestart step equivalent to
-   `inner_worker.init()` plus `_start_hierarchical()` for the inner Worker:
-   allocate local mailboxes, fork local chip/sub children, register local
-   endpoints with the inner C++ Worker, and start the inner Scheduler and
+5. The runner then performs an explicit prestart step, `inner_worker.init()`
+   for the inner Worker — `init()` is the single startup point: it allocates
+   local mailboxes, forks local chip/sub children, registers local endpoints
+   with the inner C++ Worker, and starts the inner Scheduler and
    `WorkerThread`s.
 6. Only after this local L3 child tree is established does the session runner
    bring up sockets, RDMA queue pairs, health threads, or UB doorbells for task

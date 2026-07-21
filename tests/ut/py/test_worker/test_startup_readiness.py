@@ -187,9 +187,9 @@ class TestNextLevelStartupFailure:
         captured: dict[str, list[int]] = {}
         orig_abort = Worker._abort_hierarchical
 
-        def spy_abort(self):
+        def spy_abort(self, deadline=None):
             captured["pids"] = list(self._chip_pids) + list(self._sub_pids) + list(self._next_level_pids)
-            return orig_abort(self)
+            return orig_abort(self, deadline=deadline)
 
         monkeypatch.setattr(Worker, "_abort_hierarchical", spy_abort)
 
@@ -549,7 +549,15 @@ class TestApiLinearizationDuringInit:
         w = Worker(level=3, num_sub_workers=1, startup_timeout_s=30.0)
         w.register(lambda args: None)
         init_err: list = []
-        it = threading.Thread(target=lambda: init_err.append(_run_catch(w.init)))
+        proceed = threading.Event()
+
+        def owner_body():
+            init_err.append(_run_catch(w.init))
+            # A READY worker must be closed on its init-owner thread.
+            proceed.wait(10.0)
+            _run_catch(w.close)
+
+        it = threading.Thread(target=owner_body)
         it.start()
         try:
             with _hard_timeout(_TEST_WALL_BUDGET_S):
@@ -567,14 +575,13 @@ class TestApiLinearizationDuringInit:
                 time.sleep(0.3)
                 assert reg_out == [], "register must block while INITIALIZING"
                 release.set()
-                it.join(10.0)
-                rt.join(10.0)
+                rt.join(10.0)  # register completes post-READY (implies init done)
                 assert init_err == [None]
                 assert len(reg_out) == 1
         finally:
             release.set()
+            proceed.set()  # owner thread closes the READY worker
             it.join(5.0)
-            w.close()
 
     def test_init_failure_wakes_register_waiter_with_startup_error(self, monkeypatch):
         entered = threading.Event()
@@ -624,7 +631,14 @@ class TestApiLinearizationDuringInit:
         w4 = Worker(level=4, num_sub_workers=0, startup_timeout_s=30.0)
         w4.register(_trivial_orch)
         w4.add_worker(_l3_child())
-        it = threading.Thread(target=w4.init)
+        proceed = threading.Event()
+
+        def owner_body():
+            _run_catch(w4.init)
+            proceed.wait(10.0)
+            _run_catch(w4.close)  # owner thread closes the READY tree
+
+        it = threading.Thread(target=owner_body)
         it.start()
         try:
             with _hard_timeout(_TEST_WALL_BUDGET_S):
@@ -632,37 +646,44 @@ class TestApiLinearizationDuringInit:
                 with pytest.raises(RuntimeError, match="before init"):
                     w4.add_worker(_l3_child())
                 release.set()
-                it.join(10.0)
         finally:
             release.set()
-            it.join(5.0)
-            w4.close()
+            proceed.set()
+            it.join(10.0)
 
-    def test_close_waits_for_in_progress_init(self, monkeypatch):
+    def test_close_during_initializing_fails_fast(self, monkeypatch):
+        # close() does not cancel an in-progress init: it fails fast so the
+        # INITIALIZING epoch is never torn down under its owner. The owner
+        # completes init and closes the READY tree itself.
+        import simpler.worker as worker_mod  # noqa: PLC0415
+
         entered = threading.Event()
         release = threading.Event()
         monkeypatch.setattr(Worker, "_start_hierarchical", self._pause_start(entered, release))
 
         w = Worker(level=3, num_sub_workers=1, startup_timeout_s=30.0)
         w.register(lambda args: None)
-        it = threading.Thread(target=w.init)
+        proceed = threading.Event()
+
+        def owner_body():
+            _run_catch(w.init)
+            proceed.wait(10.0)
+            _run_catch(w.close)  # owner closes the READY tree
+
+        it = threading.Thread(target=owner_body)
         it.start()
         try:
             with _hard_timeout(_TEST_WALL_BUDGET_S):
                 assert entered.wait(3.0)
-                closed = threading.Event()
-                ct = threading.Thread(target=lambda: (w.close(), closed.set()))
-                ct.start()
-                # close() must not no-op while init() is still in progress.
-                assert not closed.wait(0.3)
-                release.set()
-                ct.join(10.0)
-                it.join(10.0)
-                assert closed.is_set()
-                assert w._sub_pids == []
+                # A concurrent close() while INITIALIZING is rejected outright.
+                with pytest.raises(RuntimeError, match="in progress"):
+                    w.close()
+                assert w._lifecycle is worker_mod._Lifecycle.INITIALIZING
+                release.set()  # let init finish -> READY
         finally:
             release.set()
-            it.join(5.0)
+            proceed.set()
+            it.join(10.0)
 
 
 class _FakeChipOk:
@@ -676,6 +697,28 @@ class _FakeChipOk:
 
     def finalize(self):
         pass
+
+
+# Module-level (picklable-by-reference) probe for the callable-__del__-reenters-
+# close regression: the callable must not hold a Worker ref (register pickles it),
+# so it reaches the worker via this module global at __del__ time only.
+_REENTRY_STATE: dict = {"worker": None, "count": 0}
+
+
+class _ReentryProbe:
+    """A registered callable whose __del__ reenters Worker.close()."""
+
+    def __call__(self, args):  # pragma: no cover - never dispatched in this test
+        return None
+
+    def __del__(self):
+        _REENTRY_STATE["count"] += 1
+        worker = _REENTRY_STATE["worker"]
+        if worker is not None:
+            try:
+                worker.close()
+            except BaseException:  # noqa: BLE001
+                pass
 
 
 class TestLevel2Lifecycle:
@@ -719,6 +762,534 @@ class TestLevel2Lifecycle:
         w = self._make_l2(monkeypatch)
         with _hard_timeout(_TEST_WALL_BUDGET_S):
             w.close()
+
+    def test_close_terminal_residual_raises_and_replays(self, monkeypatch):
+        # If teardown runs but leaves a resource un-reclaimed, close() must NOT
+        # return success: it synthesizes a terminal error naming the leak, and a
+        # later close() replays the same result (teardown is never re-driven).
+        import simpler.worker as worker_mod  # noqa: PLC0415
+
+        w = self._make_l2(monkeypatch)  # owner = main
+        with _hard_timeout(_TEST_WALL_BUDGET_S):
+            w.init()
+            # A teardown that reclaims nothing (the chip stays live).
+            monkeypatch.setattr(Worker, "_teardown_ready_tree", lambda self: None)
+            err = _run_catch(w.close)
+            assert isinstance(err, RuntimeError)
+            assert "un-reclaimed" in str(err)
+            assert w._lifecycle is worker_mod._Lifecycle.CLOSED
+            assert w._chip_worker is not None  # leaked — terminal, not retried
+            # Terminal: a later close() replays the same error, never re-drives.
+            err2 = _run_catch(w.close)
+            assert isinstance(err2, RuntimeError)
+            assert "un-reclaimed" in str(err2)
+            assert w._chip_worker is not None
+
+    def test_close_of_registered_new_worker_releases_registry(self):
+        # A NEW worker (never init'd) with pre-registered callables has no native
+        # tree, but close() must still release its callable/identity/handle
+        # registries — not keep the callable refs forever.
+        import simpler.worker as worker_mod  # noqa: PLC0415
+
+        w = Worker(level=3, num_sub_workers=1)
+        w.register(lambda args: None)
+        assert w._identity_registry and w._callable_registry and w._live_handles
+        with _hard_timeout(_TEST_WALL_BUDGET_S):
+            w.close()
+        assert w._lifecycle is worker_mod._Lifecycle.CLOSED
+        assert w._callable_registry == {}
+        assert w._identity_registry == {}
+        assert w._live_handles == {}
+
+    def test_close_tolerates_callable_del_reentry(self):
+        # A registered callable whose __del__ reenters close() must not deadlock:
+        # the registry refs are released AFTER the attempt is completed and
+        # OUTSIDE _registry_lock, so the reentrant close() resolves against the
+        # done attempt instead of waiting on itself.
+        import simpler.worker as worker_mod  # noqa: PLC0415
+
+        w = Worker(level=3, num_sub_workers=1)
+        _REENTRY_STATE["worker"] = w
+        _REENTRY_STATE["count"] = 0
+        try:
+            w.register(_ReentryProbe())  # only the registry holds the callable
+            with _hard_timeout(_TEST_WALL_BUDGET_S):
+                w.close()  # dropping the registry ref runs __del__ -> reentrant close()
+            assert w._lifecycle is worker_mod._Lifecycle.CLOSED
+            assert _REENTRY_STATE["count"] >= 1  # __del__ actually fired during close()
+        finally:
+            _REENTRY_STATE["worker"] = None
+
+    def test_close_detach_interrupt_folds_into_single_result(self, monkeypatch):
+        # A BaseException during the registry detach must fold into the ONE
+        # attempt result, never leaving one close() seeing success and another
+        # the error. Teardown succeeds here (result would be None); the injected
+        # detach interrupt makes the whole close terminally fail CONSISTENTLY,
+        # the attempt is still completed (no strand), and a later close() replays
+        # that same error — never a spurious success.
+        import simpler.worker as worker_mod  # noqa: PLC0415
+        from simpler.task_interface import ChipCallable  # noqa: PLC0415
+
+        def _catch(fn):
+            try:
+                fn()
+                return None
+            except BaseException as e:  # noqa: BLE001
+                return e
+
+        w = self._make_l2(monkeypatch)  # owner = main
+        with _hard_timeout(_TEST_WALL_BUDGET_S):
+            w.init()
+            w.register(ChipCallable.build(signature=[], func_name="x", binary=b"\x00", children=[]))
+            assert w._identity_registry  # registry populated
+            # Teardown "succeeds" (chip gone, no residual) WITHOUT touching the
+            # registry lock, so the injected interrupt fires only at the detach.
+            monkeypatch.setattr(Worker, "_teardown_ready_tree", lambda self: setattr(self, "_chip_worker", None))
+
+            class _KIOnEnter:
+                def __enter__(self):
+                    raise KeyboardInterrupt
+
+                def __exit__(self, *_a):
+                    return False
+
+            w._registry_lock = _KIOnEnter()  # the detach acquire raises
+
+            r1 = _catch(w.close)
+            assert isinstance(r1, KeyboardInterrupt)  # the detach interrupt surfaced
+            assert w._close_completion is not None and w._close_completion.done  # not stranded
+            assert isinstance(w._close_completion.error, KeyboardInterrupt)  # folded → one result
+            assert w._lifecycle is worker_mod._Lifecycle.CLOSED
+            # No fork: a later close() replays the SAME terminal error, not success.
+            w._registry_lock = threading.Lock()
+            assert isinstance(_catch(w.close), KeyboardInterrupt)
+
+    def test_close_done_set_before_notify_lock_no_strand(self, monkeypatch):
+        # attempt.done must be set BEFORE acquiring the notify CV, so a
+        # BaseException during that (interruptible, possibly-blocking) acquire
+        # cannot leave the attempt at done=False. The KI is injected on the
+        # completion's CV acquire BY ORDER (the 2nd acquire of a clean close),
+        # NOT by observing done — so if the code regressed to set done *inside*
+        # that block, done would stay False and this test fails (strand assert +
+        # a hanging second close caught by the hard timeout).
+        import simpler.worker as worker_mod  # noqa: PLC0415
+
+        w = self._make_l2(monkeypatch)  # owner = main
+        with _hard_timeout(_TEST_WALL_BUDGET_S):
+            w.init()
+            real_cv = w._hierarchical_start_cv
+            state = {"count": 0, "injected": False}
+
+            class _KIOnCompletionAcquire:
+                # A clean close acquires the CV twice: (1) claim/drain block,
+                # (2) the completion's notify. Raise on #2 regardless of `done`.
+                def __enter__(self):
+                    state["count"] += 1
+                    if state["count"] == 2:
+                        state["injected"] = True
+                        raise KeyboardInterrupt
+                    return real_cv.__enter__()
+
+                def __exit__(self, *a):
+                    return real_cv.__exit__(*a)
+
+                def __getattr__(self, name):
+                    return getattr(real_cv, name)
+
+            w._hierarchical_start_cv = _KIOnCompletionAcquire()
+            r1 = _run_catch(w.close)
+            assert state["injected"] is True  # the KI was actually injected
+            assert isinstance(r1, KeyboardInterrupt)  # the first close() surfaced it
+            # Regression catch: done was published BEFORE the interrupted acquire.
+            assert w._close_completion is not None and w._close_completion.done
+            assert w._lifecycle is worker_mod._Lifecycle.CLOSED
+            # The second close() resolves against the saved completion, no hang
+            # (teardown succeeded, so it returns cleanly rather than replaying).
+            w._hierarchical_start_cv = real_cv
+            assert _run_catch(w.close) is None
+
+    def test_reap_deadline_starts_after_shutdown_broadcast(self, monkeypatch):
+        # The child-reap grace must be measured from when SHUTDOWN is broadcast,
+        # not from teardown entry: a slow pre-child cleanup step must not consume
+        # it and reduce the reap to a single poll.
+        import types  # noqa: PLC0415
+
+        import simpler.worker as worker_mod  # noqa: PLC0415
+
+        monkeypatch.setattr(worker_mod, "_ROLLBACK_GRACEFUL_TIMEOUT_S", 1.0)
+        w = Worker(level=3, num_sub_workers=0)
+        w._worker = types.SimpleNamespace(close=lambda: None)  # look "started" for the L3 branch
+
+        # A slow pre-child cleanup step (runs before the SHUTDOWN broadcast).
+        monkeypatch.setattr(Worker, "_release_all_host_buffers", lambda self: time.sleep(0.6))
+        captured: dict = {}
+
+        def capture_reap(groups, deadline):
+            captured["remaining"] = deadline - time.monotonic()
+
+        monkeypatch.setattr(Worker, "_reap_child_groups", staticmethod(capture_reap))
+        with _hard_timeout(_TEST_WALL_BUDGET_S):
+            w._teardown_ready_tree()
+        # The reap got ~full grace (1.0s), not 1.0 - 0.6 left over from a deadline
+        # fixed at teardown entry.
+        assert captured["remaining"] > 0.7
+
+    def test_reap_child_groups_stuck_child_no_starvation(self, monkeypatch):
+        # A stuck child in one group must not starve the reap of healthy children
+        # in another. With every group SHUTDOWN up front, the interleaved reap
+        # polls all groups each round, so healthy children that take a few polls
+        # to exit are still reaped while one group's child is wedged; only the
+        # wedged child remains a (reported) survivor.
+        import simpler.worker as worker_mod  # noqa: PLC0415
+
+        class _FakeShm:
+            def __init__(self):
+                self.closed = False
+
+            def close(self):
+                self.closed = True
+
+            def unlink(self):
+                pass
+
+        stuck_pid = 90001
+        polls: dict[int, int] = {}
+
+        def fake_waitpid(pid, _flags):
+            polls[pid] = polls.get(pid, 0) + 1
+            if pid == stuck_pid:
+                return (0, 0)  # never exits
+            if polls[pid] < 3:
+                return (0, 0)  # healthy: needs a few polls to exit after SHUTDOWN
+            return (pid, 0)  # reaped, clean exit
+
+        monkeypatch.setattr(worker_mod.os, "waitpid", fake_waitpid)
+        sub_shms, sub_pids = [_FakeShm()], [stuck_pid]
+        chip_shms, chip_pids = [_FakeShm()], [90002]
+        next_shms, next_pids = [_FakeShm()], [90003]
+        groups = [(sub_shms, sub_pids), (chip_shms, chip_pids), (next_shms, next_pids)]
+        deadline = time.monotonic() + 1.0
+        with _hard_timeout(_TEST_WALL_BUDGET_S):
+            err = _run_catch(lambda: Worker._reap_child_groups(groups, deadline))  # type: ignore[arg-type]
+        # The wedged child is a reported survivor, kept in its group...
+        assert isinstance(err, TimeoutError) and str(stuck_pid) in str(err)
+        assert sub_pids == [stuck_pid] and len(sub_shms) == 1
+        # ...but the healthy children were reaped, freed, and removed.
+        assert chip_pids == [] and chip_shms == [] and next_pids == [] and next_shms == []
+
+    def test_non_owner_close_of_ready_raises(self, monkeypatch):
+        # A READY worker holds same-thread-only native objects, so a close() from
+        # a thread other than the init owner is rejected before touching the
+        # lifecycle; the owner can still close cleanly.
+        w = self._make_l2(monkeypatch)  # init owner = this (main) thread
+        with _hard_timeout(_TEST_WALL_BUDGET_S):
+            w.init()
+            err: list = []
+            t = threading.Thread(target=lambda: err.append(_run_catch(w.close)))
+            t.start()
+            t.join(10.0)
+            assert isinstance(err[0], RuntimeError)
+            assert "thread that init" in str(err[0])
+            w.close()  # owner closes cleanly
+
+    def test_concurrent_close_owner_plus_joiner(self, monkeypatch):
+        # Once the owner has published CLOSED and is mid-teardown, any thread may
+        # join the in-flight attempt and observe the same completion — no second
+        # (double-finalize) teardown.
+        import simpler.worker as worker_mod  # noqa: PLC0415
+
+        entered = threading.Event()
+        release = threading.Event()
+        orig_teardown = Worker._teardown_ready_tree
+
+        def paused_teardown(self):
+            entered.set()
+            assert release.wait(10.0)
+            return orig_teardown(self)
+
+        monkeypatch.setattr(Worker, "_teardown_ready_tree", paused_teardown)
+        w = self._make_l2(monkeypatch)
+        results: dict = {}
+
+        def owner():
+            w.init()  # owner thread claims the epoch
+            results["owner"] = _run_catch(w.close)
+
+        ot = threading.Thread(target=owner)
+        ot.start()
+        try:
+            with _hard_timeout(_TEST_WALL_BUDGET_S):
+                assert entered.wait(3.0)  # owner published CLOSED, teardown paused
+                assert w._lifecycle is worker_mod._Lifecycle.CLOSED
+                joiner: list = []
+                jt = threading.Thread(target=lambda: joiner.append(_run_catch(w.close)))
+                jt.start()
+                time.sleep(0.2)  # joiner parks on the in-flight attempt
+                assert w._close_completion is not None and not w._close_completion.done
+                release.set()
+                ot.join(10.0)
+                jt.join(10.0)
+                assert results["owner"] is None
+                assert joiner == [None]
+                assert w._lifecycle is worker_mod._Lifecycle.CLOSED
+        finally:
+            release.set()
+            ot.join(5.0)
+
+    def test_close_drains_in_flight_operation(self, monkeypatch):
+        # An operation admitted before close() holds a lease; close() (the owner)
+        # blocks in its drain until the in-flight op finishes, then tears down.
+        import simpler.worker as worker_mod  # noqa: PLC0415
+
+        entered = threading.Event()
+        release = threading.Event()
+
+        def paused_run(self, *_a, **_k):
+            entered.set()
+            assert release.wait(10.0)
+
+        monkeypatch.setattr(Worker, "_run_locked", paused_run)
+        w = self._make_l2(monkeypatch)  # owner = this (main) thread
+        with _hard_timeout(_TEST_WALL_BUDGET_S):
+            w.init()
+            rt = threading.Thread(target=lambda: w.run(lambda *_a: None))
+            rt.start()
+            try:
+                assert entered.wait(3.0)  # run() admitted, holding a lease
+                assert w._active_ops == 1
+                releaser = threading.Thread(target=lambda: (time.sleep(0.5), release.set()))
+                releaser.start()
+                t0 = time.monotonic()
+                w.close()  # owner close: drains the lease before teardown
+                assert time.monotonic() - t0 >= 0.4
+                assert w._lifecycle is worker_mod._Lifecycle.CLOSED
+                assert w._active_ops == 0
+                releaser.join(5.0)
+            finally:
+                release.set()
+                rt.join(5.0)
+
+    def test_reentrant_close_from_operation_rejected(self, monkeypatch):
+        # close() called from inside a leased operation (e.g. an orch fn) would
+        # drain its own never-releasing lease; it must be rejected outright.
+        result: dict = {}
+
+        def reentrant_run(self, *_a, **_k):
+            result["close_err"] = _run_catch(self.close)
+
+        monkeypatch.setattr(Worker, "_run_locked", reentrant_run)
+        w = self._make_l2(monkeypatch)  # owner = main
+        with _hard_timeout(_TEST_WALL_BUDGET_S):
+            w.init()
+            w.run(lambda *_a: None)  # inside, calls w.close() -> rejected
+            assert isinstance(result["close_err"], RuntimeError)
+            assert "within a run" in str(result["close_err"])
+            w.close()  # after the op returns, close succeeds
+
+    def test_close_timeout_defers_teardown_and_retry_completes(self, monkeypatch):
+        # If an admitted operation outlives the drain budget, close() must NOT
+        # tear down the live tree: it publishes CLOSED (admission fenced) but
+        # leaves teardown UN-attempted (attempt INCOMPLETE) and the native object
+        # intact, reporting TimeoutError. Because teardown never ran, this is the
+        # one retryable close() path: a later close() drives it once the op ends.
+        import simpler.worker as worker_mod  # noqa: PLC0415
+
+        monkeypatch.setattr(worker_mod, "_ROLLBACK_GRACEFUL_TIMEOUT_S", 0.5)
+        entered = threading.Event()
+        release = threading.Event()
+
+        def paused_run(self, *_a, **_k):
+            entered.set()
+            assert release.wait(10.0)
+
+        monkeypatch.setattr(Worker, "_run_locked", paused_run)
+        w = self._make_l2(monkeypatch)  # owner = main
+        with _hard_timeout(_TEST_WALL_BUDGET_S):
+            w.init()
+            rt = threading.Thread(target=lambda: _run_catch(lambda: w.run(lambda *_a: None)))
+            rt.start()
+            try:
+                assert entered.wait(3.0)
+                assert w._active_ops == 1
+                err = _run_catch(w.close)  # owner drains, times out at 0.5s
+                assert isinstance(err, TimeoutError)
+                assert w._lifecycle is worker_mod._Lifecycle.CLOSED  # admission fenced
+                assert w._close_completion is not None and w._close_completion.incomplete
+                assert w._chip_worker is not None  # native object NOT torn down
+            finally:
+                release.set()
+                rt.join(5.0)
+            w.close()  # op drained -> teardown runs once, to completion
+            assert w._lifecycle is worker_mod._Lifecycle.CLOSED
+            assert w._chip_worker is None
+            assert w._close_completion is not None and not w._close_completion.incomplete
+
+    def test_close_retry_still_drains_before_teardown(self, monkeypatch):
+        # Regression: a retry close() while the op is STILL in flight must drain
+        # again (teardown is still un-attempted), never tear down under a live op.
+        import simpler.worker as worker_mod  # noqa: PLC0415
+
+        monkeypatch.setattr(worker_mod, "_ROLLBACK_GRACEFUL_TIMEOUT_S", 0.4)
+        entered = threading.Event()
+        release = threading.Event()
+
+        def paused_run(self, *_a, **_k):
+            entered.set()
+            assert release.wait(10.0)
+
+        monkeypatch.setattr(Worker, "_run_locked", paused_run)
+        w = self._make_l2(monkeypatch)  # owner = main
+        with _hard_timeout(_TEST_WALL_BUDGET_S):
+            w.init()
+            rt = threading.Thread(target=lambda: _run_catch(lambda: w.run(lambda *_a: None)))
+            rt.start()
+            try:
+                assert entered.wait(3.0)
+                # First close: times out, CLOSED + incomplete, native intact.
+                assert isinstance(_run_catch(w.close), TimeoutError)
+                assert w._chip_worker is not None
+                # Retry WHILE the op is still running: must drain again and time
+                # out — must NOT tear down the still-in-use device.
+                assert isinstance(_run_catch(w.close), TimeoutError)
+                assert w._chip_worker is not None
+                assert w._active_ops == 1
+            finally:
+                release.set()
+                rt.join(5.0)
+            w.close()  # op drained -> teardown completes
+            assert w._chip_worker is None
+
+    def test_l2_register_after_close_rejected(self, monkeypatch):
+        from simpler.task_interface import ChipCallable  # noqa: PLC0415
+
+        w = self._make_l2(monkeypatch)
+        with _hard_timeout(_TEST_WALL_BUDGET_S):
+            w.init()
+            w.close()
+            cc = ChipCallable.build(signature=[], func_name="x", binary=b"\x00", children=[])
+            with pytest.raises(RuntimeError, match="closed"):
+                w.register(cc)
+
+    def _make_l2_with_chip(self, monkeypatch, chip_cls):
+        import simpler.worker as worker_mod  # noqa: PLC0415
+
+        import simpler_setup.runtime_builder as rb_mod  # noqa: PLC0415
+
+        class _FakeBuilder:
+            def __init__(self, *_a, **_k):
+                pass
+
+            def get_binaries(self, *_a, **_k):
+                return object()
+
+        monkeypatch.setattr(worker_mod, "ChipWorker", chip_cls)
+        monkeypatch.setattr(rb_mod, "RuntimeBuilder", _FakeBuilder)
+        return Worker(level=2, device_id=0, platform="a2a3sim", runtime="tensormap_and_ringbuffer")
+
+    def test_two_concurrent_l2_init_serialize_on_epoch(self, monkeypatch):
+        # Two concurrent init() calls must serialize on the lifecycle epoch: the
+        # first claims INITIALIZING and builds the one ChipWorker; the second is
+        # rejected while the first holds the epoch — never a second _chip_worker.
+        entered = threading.Event()
+        release = threading.Event()
+        build_count = {"n": 0}
+
+        class _PausingChip:
+            def __init__(self):
+                build_count["n"] += 1
+
+            def init(self, *_a, **_k):
+                entered.set()
+                assert release.wait(10.0)
+
+            def _register_callable_at_slot(self, *_a, **_k):  # pragma: no cover
+                pass
+
+            def finalize(self):
+                pass
+
+        w = self._make_l2_with_chip(monkeypatch, _PausingChip)
+        errs: list = []
+        proceed = threading.Event()
+        state: dict = {}
+
+        def owner_body():
+            errs.append(_run_catch(w.init))
+            state["initialized"] = w._initialized
+            state["build"] = build_count["n"]
+            proceed.wait(10.0)
+            _run_catch(w.close)  # the winning (owner) thread closes
+
+        t1 = threading.Thread(target=owner_body)
+        t1.start()
+        try:
+            with _hard_timeout(_TEST_WALL_BUDGET_S):
+                assert entered.wait(3.0)
+                # The second init sees INITIALIZING and rejects immediately.
+                err2 = _run_catch(w.init)
+                assert isinstance(err2, RuntimeError)
+                assert "in progress" in str(err2)
+                release.set()
+                # Wait for the owner to finish init (it then parks on `proceed`).
+                deadline = time.monotonic() + 10.0
+                while "initialized" not in state and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                assert errs == [None]
+                assert state["initialized"] is True
+                assert state["build"] == 1
+        finally:
+            release.set()
+            proceed.set()
+            t1.join(5.0)
+
+    def test_l2_close_during_initializing_fails_fast(self, monkeypatch):
+        # close() cannot cancel an in-progress L2 init: it fails fast, the owner
+        # finishes init to READY, and the owner then finalizes the device
+        # same-thread. No cross-thread finalize, no resurrected epoch.
+        import simpler.worker as worker_mod  # noqa: PLC0415
+
+        entered = threading.Event()
+        release = threading.Event()
+        finalized = {"n": 0}
+        proceed = threading.Event()
+
+        class _PausingChip:
+            def init(self, *_a, **_k):
+                entered.set()
+                assert release.wait(10.0)
+
+            def _register_callable_at_slot(self, *_a, **_k):  # pragma: no cover
+                pass
+
+            def finalize(self):
+                finalized["n"] += 1
+
+        w = self._make_l2_with_chip(monkeypatch, _PausingChip)
+        init_err: list = []
+
+        def owner_body():
+            init_err.append(_run_catch(w.init))
+            proceed.wait(10.0)
+            _run_catch(w.close)  # owner finalizes the device same-thread
+
+        t1 = threading.Thread(target=owner_body)
+        t1.start()
+        try:
+            with _hard_timeout(_TEST_WALL_BUDGET_S):
+                assert entered.wait(3.0)
+                with pytest.raises(RuntimeError, match="in progress"):
+                    w.close()
+                assert w._lifecycle is worker_mod._Lifecycle.INITIALIZING
+                release.set()  # init completes -> READY
+                proceed.set()  # owner then closes
+                t1.join(10.0)
+                assert init_err[0] is None
+                assert w._lifecycle is worker_mod._Lifecycle.CLOSED
+                assert finalized["n"] == 1  # device finalized once, same-thread
+        finally:
+            release.set()
+            proceed.set()
+            t1.join(5.0)
 
 
 class _FakeChipRaises:
@@ -775,8 +1346,7 @@ class TestChipStartupFailure:
         import simpler.worker as worker_mod  # noqa: PLC0415
 
         monkeypatch.setattr(worker_mod, "ChipWorker", _FakeChipRaises)
-        l3 = self._make_l3(timeout_s=10.0)
-        l3.register(lambda args: None)
+        l3 = self._make_l3(timeout_s=10.0)  # chip-only; the chip forks from device_ids
         try:
             with _hard_timeout(_TEST_WALL_BUDGET_S):
                 with pytest.raises(RuntimeError, match="injected chip init failure"):
@@ -788,8 +1358,7 @@ class TestChipStartupFailure:
         import simpler.worker as worker_mod  # noqa: PLC0415
 
         monkeypatch.setattr(worker_mod, "ChipWorker", _FakeChipHangs)
-        l3 = self._make_l3(timeout_s=1.5)
-        l3.register(lambda args: None)
+        l3 = self._make_l3(timeout_s=1.5)  # chip-only; the chip forks from device_ids
         start = time.monotonic()
         try:
             with _hard_timeout(_TEST_WALL_BUDGET_S):
@@ -798,3 +1367,188 @@ class TestChipStartupFailure:
             assert 1.5 <= time.monotonic() - start < _TEST_WALL_BUDGET_S
         finally:
             l3.close()
+
+
+class TestEligibleTargetPrecheck:
+    """A childless L3 that accepted a callable must fail at init() — before any
+    startup resource — rather than come up READY yet inert (a callable with no
+    process to run on)."""
+
+    def test_childless_l3_with_callable_rejected_at_init(self):
+        w = Worker(level=3, num_sub_workers=0)
+        w.register(lambda args: None)
+        try:
+            with _hard_timeout(_TEST_WALL_BUDGET_S):
+                with pytest.raises(RuntimeError, match="no eligible dispatch target"):
+                    w.init()
+                # The rejection is pre-resource: nothing was forked, and the
+                # epoch never left NEW, so the worker is still constructible-away.
+                assert w._sub_pids == []
+        finally:
+            w.close()
+
+    def test_childless_l3_without_callable_inits(self):
+        # No pre-registered callable: a childless L3 is a valid (if inert) host,
+        # e.g. targets are registered later once children exist. It must init.
+        w = Worker(level=3, num_sub_workers=0)
+        with _hard_timeout(_TEST_WALL_BUDGET_S):
+            w.init()
+            assert w._initialized is True
+            w.close()
+
+    def test_sub_backed_l3_with_callable_inits(self):
+        w = Worker(level=3, num_sub_workers=1)
+        w.register(lambda args: None)
+        with _hard_timeout(_TEST_WALL_BUDGET_S):
+            w.init()
+            assert w._initialized is True
+            w.close()
+
+    def test_registered_python_on_chip_only_l3_rejected(self):
+        # A registered LOCAL_PYTHON callable is resolved only by a SUB/next-level
+        # child, never a chip — so a chip-only L3 (device_ids, no sub/next) has no
+        # eligible target for it. Rejected at init before any chip is forked
+        # (device-free: the check runs before _start_hierarchical).
+        w = Worker(level=3, device_ids=[0])
+        w.register(lambda args: None)
+        try:
+            with _hard_timeout(_TEST_WALL_BUDGET_S):
+                with pytest.raises(RuntimeError, match="LOCAL_PYTHON callable .* has no eligible"):
+                    w.init()
+        finally:
+            w.close()
+
+    def test_sub_backed_l3_python_callable_inits(self):
+        # A LOCAL_PYTHON callable with a SUB resolver is eligible.
+        w = Worker(level=3, num_sub_workers=1)
+        w.register(lambda args: None)
+        with _hard_timeout(_TEST_WALL_BUDGET_S):
+            w.init()
+            assert w._initialized is True
+            w.close()
+
+
+class TestTerminalStateContract:
+    """CLOSED is terminal: no later API reopens the epoch."""
+
+    def test_init_after_close_is_rejected(self):
+        w = Worker(level=3, num_sub_workers=1)
+        with _hard_timeout(_TEST_WALL_BUDGET_S):
+            w.init()
+            w.close()
+            import simpler.worker as worker_mod  # noqa: PLC0415
+
+            assert w._lifecycle is worker_mod._Lifecycle.CLOSED
+            with pytest.raises(RuntimeError, match="closed"):
+                w.init()
+
+    def test_register_after_close_is_rejected(self):
+        w = Worker(level=3, num_sub_workers=1)
+        with _hard_timeout(_TEST_WALL_BUDGET_S):
+            w.init()
+            w.close()
+            with pytest.raises(RuntimeError, match="closed"):
+                w.register(lambda args: None)
+
+    def test_double_close_is_idempotent(self):
+        w = Worker(level=3, num_sub_workers=1)
+        with _hard_timeout(_TEST_WALL_BUDGET_S):
+            w.init()
+            w.close()
+            w.close()
+
+    def test_init_after_close_claim_is_rejected(self):
+        # close() publishes CLOSED atomically at claim (before teardown finishes);
+        # a concurrent init() observing CLOSED must be rejected, never reviving
+        # the epoch mid-teardown.
+        w = Worker(level=3, num_sub_workers=1)
+        with _hard_timeout(_TEST_WALL_BUDGET_S):
+            w.init()
+            w.close()  # -> CLOSED
+            with pytest.raises(RuntimeError, match="closed"):
+                w.init()
+
+    def test_add_worker_rejects_non_new_child(self):
+        # add_worker requires a pristine NEW child (init happens in the forked
+        # child process); an already-started/closed child is rejected.
+        child = Worker(level=3, num_sub_workers=0)
+        with _hard_timeout(_TEST_WALL_BUDGET_S):
+            child.init()  # childless L3 comes up READY device-free
+            try:
+                parent = Worker(level=4, num_sub_workers=0)
+                with pytest.raises(RuntimeError, match="must be NEW"):
+                    parent.add_worker(child)
+            finally:
+                child.close()
+
+
+class TestFailureSurfacing:
+    """Every waiter on a failed init observes the same original cause, and a
+    BaseException in start unwinds through the same rollback."""
+
+    @staticmethod
+    def _fail_start(entered, release, exc):
+        def boom(self):
+            entered.set()
+            assert release.wait(10.0)
+            raise exc
+
+        return boom
+
+    def test_all_waiters_get_same_original_failure(self, monkeypatch):
+        entered = threading.Event()
+        release = threading.Event()
+        original = RuntimeError("distinctive start failure")
+        monkeypatch.setattr(Worker, "_start_hierarchical", self._fail_start(entered, release, original))
+
+        w = Worker(level=3, num_sub_workers=1, startup_timeout_s=30.0)
+        init_err: list = []
+        it = threading.Thread(target=lambda: init_err.append(_run_catch(w.init)))
+        it.start()
+        try:
+            with _hard_timeout(_TEST_WALL_BUDGET_S):
+                assert entered.wait(3.0)
+                reg_errs: list = []
+                started = threading.Event()
+                n = 3
+
+                def do_reg():
+                    started.set()
+                    reg_errs.append(_run_catch(lambda: w.register(lambda args: None)))
+
+                threads = [threading.Thread(target=do_reg) for _ in range(n)]
+                for t in threads:
+                    t.start()
+                assert started.wait(3.0)
+                time.sleep(0.3)  # let the waiters park on the epoch condition
+                release.set()
+                for t in threads:
+                    t.join(10.0)
+                it.join(10.0)
+                # init surfaced the original; every parked register raised a
+                # RuntimeError chained from the SAME original exception object.
+                assert init_err[0] is original
+                assert len(reg_errs) == n
+                for err in reg_errs:
+                    assert isinstance(err, RuntimeError)
+                    assert err.__cause__ is original
+        finally:
+            release.set()
+            it.join(5.0)
+            w.close()
+
+    def test_keyboardinterrupt_before_ready_rolls_back(self, monkeypatch):
+        def boom(self):
+            raise KeyboardInterrupt()
+
+        monkeypatch.setattr(Worker, "_start_hierarchical", boom)
+        w = Worker(level=3, num_sub_workers=1)
+        import simpler.worker as worker_mod  # noqa: PLC0415
+
+        with _hard_timeout(_TEST_WALL_BUDGET_S):
+            with pytest.raises(KeyboardInterrupt):
+                w.init()
+            # BaseException funnels into the same rollback: FAILED, no residual.
+            assert w._lifecycle is worker_mod._Lifecycle.FAILED
+            assert w._sub_pids == []
+            w.close()

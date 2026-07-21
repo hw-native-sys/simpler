@@ -1361,6 +1361,13 @@ NB_MODULE(_task_interface, m) {
             },
             nb::arg("host_lib_path"), nb::arg("aicpu_path"), nb::arg("aicore_path"), nb::arg("dispatcher_path"),
             nb::arg("device_id"), nb::arg("prewarm_config") = nb::none(),
+            // Release the GIL for the (potentially long) native device attach so
+            // another Python thread can run during it — e.g. a concurrent close()
+            // observing INITIALIZING and failing fast (a GIL held for the whole
+            // attach would block it until init returned). This does not make
+            // ChipWorker cross-thread-safe: init/finalize still run on the owning
+            // thread (enforced by Worker.close()).
+            nb::call_guard<nb::gil_scoped_release>(),
             "Bind the runtime library and attach to device_id. When prewarm_config is "
             "given, its ring sizing is built + cached inside init (fork-constant, no "
             "cross-process control command). A no-op for runtimes without a prebuilt arena."

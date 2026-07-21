@@ -265,7 +265,10 @@ def test_prepare_capacity_overflow_post_start(st_platform, st_device_ids):
     worker = Worker(
         level=3,
         device_ids=[int(st_device_ids[0])],
-        num_sub_workers=0,
+        # A sub worker gives the LOCAL_PYTHON fillers below a valid resolver, so
+        # they exercise the shared capacity ceiling as eligible registrations
+        # (not inert ones) alongside the chip callable.
+        num_sub_workers=1,
         platform=st_platform,
         runtime=_RUNTIME,
     )

@@ -104,7 +104,7 @@ class TestL4Validation:
         child = Worker(level=3, num_sub_workers=0)
         child.init()
         w4 = Worker(level=4, num_sub_workers=0)
-        with pytest.raises(RuntimeError, match="must not be initialized"):
+        with pytest.raises(RuntimeError, match="must be NEW"):
             w4.add_worker(child)
         child.close()
         w4.close()

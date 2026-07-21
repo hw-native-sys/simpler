@@ -269,13 +269,13 @@ class TestLifecycle:
         hw.init()
         try:
             with hw._hierarchical_start_cv:
-                hw._hierarchical_start_state = "starting"
+                hw._lifecycle = worker_mod._Lifecycle.INITIALIZING
 
             observed = {}
 
             def fake_post_start_register(target):
                 observed["target"] = target
-                observed["state"] = hw._hierarchical_start_state
+                observed["state"] = hw._lifecycle
                 observed["hierarchical_started"] = hw._hierarchical_started
                 return 7
 
@@ -301,15 +301,14 @@ class TestLifecycle:
             t.start()
             assert wait_entered.wait(timeout=2.0)
             with hw._hierarchical_start_cv:
-                hw._hierarchical_started = True
-                hw._hierarchical_start_state = "started"
+                hw._lifecycle = worker_mod._Lifecycle.READY
                 hw._hierarchical_start_cv.notify_all()
             t.join(timeout=2.0)
 
             assert not t.is_alive()
             assert errors == []
             assert result == [7]
-            assert observed["state"] == "started"
+            assert observed["state"] is worker_mod._Lifecycle.READY
             assert observed["hierarchical_started"] is True
         finally:
             if "original_wait" in locals():
@@ -322,7 +321,7 @@ class TestLifecycle:
         hw.init()
         try:
             with hw._hierarchical_start_cv:
-                hw._hierarchical_start_state = "starting"
+                hw._lifecycle = worker_mod._Lifecycle.INITIALIZING
 
             observed = {}
 
@@ -330,7 +329,7 @@ class TestLifecycle:
                 observed["worker_types"] = worker_types
                 observed["sub_cmd"] = sub_cmd
                 observed["digest"] = digest
-                observed["state"] = hw._hierarchical_start_state
+                observed["state"] = hw._lifecycle
                 observed["hierarchical_started"] = hw._hierarchical_started
                 return []
 
@@ -357,8 +356,7 @@ class TestLifecycle:
             assert handle.digest in hw._identity_registry
 
             with hw._hierarchical_start_cv:
-                hw._hierarchical_started = True
-                hw._hierarchical_start_state = "started"
+                hw._lifecycle = worker_mod._Lifecycle.READY
                 hw._hierarchical_start_cv.notify_all()
             t.join(timeout=2.0)
 
@@ -366,7 +364,7 @@ class TestLifecycle:
             assert errors == []
             assert observed["sub_cmd"] == _CTRL_PY_UNREGISTER
             assert observed["digest"] == handle.digest
-            assert observed["state"] == "started"
+            assert observed["state"] is worker_mod._Lifecycle.READY
             assert observed["hierarchical_started"] is True
             assert handle.digest not in hw._identity_registry
         finally:
@@ -382,7 +380,7 @@ class TestLifecycle:
         hw.init()
         try:
             with hw._hierarchical_start_cv:
-                hw._hierarchical_start_state = "starting"
+                hw._lifecycle = worker_mod._Lifecycle.INITIALIZING
 
             errors: list[BaseException] = []
             result: list[object] = []
@@ -408,8 +406,7 @@ class TestLifecycle:
             assert len(hw._identity_registry) == 0
 
             with hw._hierarchical_start_cv:
-                hw._hierarchical_started = True
-                hw._hierarchical_start_state = "started"
+                hw._lifecycle = worker_mod._Lifecycle.READY
                 hw._hierarchical_start_cv.notify_all()
             t.join(timeout=2.0)
 
@@ -440,8 +437,9 @@ class TestLifecycle:
         # cid budget is enforced under the new dynamic-prepare path too:
         # pre-fill registry with lambdas pre-init, init, then attempt one
         # post-init ChipCallable prepare and observe the existing
-        # MAX_REGISTERED_CALLABLE_IDS RuntimeError.
-        hw = Worker(level=3, num_sub_workers=0)
+        # MAX_REGISTERED_CALLABLE_IDS RuntimeError. A sub child gives the
+        # pre-registered python callables an eligible dispatch target.
+        hw = Worker(level=3, num_sub_workers=1)
         try:
             for i in range(MAX_REGISTERED_CALLABLE_IDS):
                 hw.register(_unique_py_callable(i))
@@ -485,8 +483,7 @@ class TestLifecycle:
 
     def test_prepare_chip_callable_broadcast_runs_without_registry_lock(self):
         hw = Worker(level=3, num_sub_workers=0)
-        hw._initialized = True
-        hw._hierarchical_started = True
+        hw._lifecycle = worker_mod._Lifecycle.READY
         callable_obj = ChipCallable.build(signature=[], func_name="x", binary=b"\x00", children=[])
         observed = {}
 
@@ -508,8 +505,7 @@ class TestLifecycle:
         from simpler.worker import _build_callable_registration  # noqa: PLC0415
 
         hw = Worker(level=3, num_sub_workers=0)
-        hw._initialized = True
-        hw._hierarchical_started = True
+        hw._lifecycle = worker_mod._Lifecycle.READY
         callable_obj = ChipCallable.build(signature=[], func_name="x", binary=b"\x00", children=[])
         digest = _build_callable_registration(hw, callable_obj).digest
         observed = {}
@@ -637,8 +633,7 @@ class TestLifecycle:
 
         hw = Worker(level=3, num_sub_workers=1)
         handle = hw.register(lambda args: None)
-        hw._initialized = True
-        hw._hierarchical_started = True
+        hw._lifecycle = worker_mod._Lifecycle.READY
         calls = []
 
         class FakeWorker:
@@ -671,8 +666,7 @@ class TestLifecycle:
 
         hw = Worker(level=3, num_sub_workers=1)
         handle = hw.register(lambda args: None)
-        hw._initialized = True
-        hw._hierarchical_started = True
+        hw._lifecycle = worker_mod._Lifecycle.READY
 
         broadcast_started = threading.Event()
         release_broadcast = threading.Event()
@@ -720,8 +714,7 @@ class TestLifecycle:
 
         hw = Worker(level=3, num_sub_workers=1)
         handle = hw.register(target)
-        hw._initialized = True
-        hw._hierarchical_started = True
+        hw._lifecycle = worker_mod._Lifecycle.READY
 
         unregister_started = threading.Event()
         release_unregister = threading.Event()
@@ -769,8 +762,7 @@ class TestLifecycle:
         hw = Worker(level=3, num_sub_workers=1)
         first = hw.register(target)
         second = hw.register(target)
-        hw._initialized = True
-        hw._hierarchical_started = True
+        hw._lifecycle = worker_mod._Lifecycle.READY
 
         unregister_started = threading.Event()
         release_unregister = threading.Event()
@@ -1224,8 +1216,7 @@ class TestLifecycle:
                 return [_FakeControlResult("NEXT_LEVEL", 0, True)]
 
         hw = Worker(level=3, num_sub_workers=1)
-        hw._initialized = True
-        hw._hierarchical_started = True
+        hw._lifecycle = worker_mod._Lifecycle.READY
         hw._worker = FakeWorker()
         callable_obj = ChipCallable.build(signature=[], func_name="x", binary=b"\x00", children=[])
 
@@ -1260,8 +1251,7 @@ class TestLifecycle:
                 return _FakeControlResult("NEXT_LEVEL", worker_id, True)
 
         hw = Worker(level=3, num_sub_workers=1)
-        hw._initialized = True
-        hw._hierarchical_started = True
+        hw._lifecycle = worker_mod._Lifecycle.READY
         hw._worker = FakeWorker()
         callable_obj = ChipCallable.build(signature=[], func_name="x", binary=b"\x00", children=[])
 
@@ -1292,8 +1282,7 @@ class TestLifecycle:
                 return ["cleanup failed"]
 
         hw = Worker(level=3, num_sub_workers=1)
-        hw._initialized = True
-        hw._hierarchical_started = True
+        hw._lifecycle = worker_mod._Lifecycle.READY
         hw._worker = FakeWorker()
         callable_obj = ChipCallable.build(signature=[], func_name="x", binary=b"\x00", children=[])
 

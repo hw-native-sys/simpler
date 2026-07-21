@@ -62,6 +62,7 @@ from __future__ import annotations
 import bisect
 import contextlib
 import ctypes
+import enum
 import importlib
 import json
 import math
@@ -221,6 +222,13 @@ _STARTUP_POLL_INTERVAL_S = 0.001
 # to close gracefully (so it unlinks the nested mailbox shms only it knows the
 # names of) before being SIGKILLed. This bounds that graceful wait.
 _ROLLBACK_GRACEFUL_TIMEOUT_S = 10.0
+# Bounded re-check interval for a close() joiner waiting on an in-flight
+# _CloseAttempt. A joiner normally wakes immediately on the completing thread's
+# notify_all(); the timeout is a backstop so that if that notify is skipped (an
+# async BaseException landing between publishing `done` and notifying), the
+# joiner still re-observes `done` within this interval instead of blocking
+# forever.
+_CLOSE_JOIN_RECHECK_S = 1.0
 
 # Control sub-commands (written at _OFF_CALLABLE as uint64)
 _CTRL_MALLOC = 0
@@ -1763,10 +1771,61 @@ def _child_worker_loop(
             break
 
 
+class _Lifecycle(enum.Enum):
+    """The single authoritative *public-admission* lifecycle of a Worker (5
+    states), guarded by ``_hierarchical_start_cv``.
+
+    ``NEW → INITIALIZING → READY | FAILED → CLOSED``. Every level uses this
+    machine: an L2 worker inits synchronously (no child barrier) but still claims
+    INITIALIZING so two concurrent ``init()`` calls serialize on the same epoch.
+    close() while INITIALIZING fails fast (this worker does not support
+    cancelling an in-progress init); a caller must wait for READY or FAILED.
+
+    Admission is decided solely by this state: CLOSED rejects every public
+    live-tree API, permanently (close() is a commitment, not a reversible
+    attempt — it never reverts to READY). "Closing in progress" is NOT a public
+    state: it is a private per-attempt teardown phase (see ``_CloseAttempt``)
+    that drives child teardown off *resource presence* (``_worker``/mailboxes),
+    never off this lifecycle.
+    """
+
+    NEW = enum.auto()
+    INITIALIZING = enum.auto()
+    READY = enum.auto()
+    FAILED = enum.auto()
+    CLOSED = enum.auto()
+
+
+class _CloseAttempt:
+    """Private completion record for one close() teardown attempt.
+
+    close() publishes CLOSED atomically and installs a fresh attempt; concurrent
+    close()s pin to the attempt they observed (via ``_close_completion``) and
+    wait on its ``done``, so every joiner of the same attempt sees the same
+    outcome. ``incomplete=True`` means the tree was not fully reclaimed.
+
+    Teardown is single-shot and terminal: once it *runs* (``_teardown_attempted``
+    latches True), an un-reclaimed resource LEAKS — a later close() never re-drives
+    a half-torn tree. The one retry path is a *drain-timeout*, which leaves
+    teardown UN-attempted and the tree intact; a later close() may then drive
+    drain+teardown once the in-flight operation finishes.
+    """
+
+    __slots__ = ("done", "error", "incomplete")
+
+    def __init__(self) -> None:
+        self.done: bool = False
+        self.error: BaseException | None = None
+        self.incomplete: bool = False
+
+
 class _StartupCancelled(BaseException):
     """Raised inside a forked child when the parent cooperatively cancels its
     startup (SIGTERM). Unwinds the child's own ``setup`` — recursively rolling
-    back any grandchildren it already forked — before it exits."""
+    back any grandchildren it already forked — before it exits.
+
+    Only the forked-child SIGTERM path raises this: the startup *root* is not
+    cancellable (``close()`` fails fast while INITIALIZING)."""
 
 
 def _forked_child_main(buf: memoryview, label: str, setup, serve, make_group_leader: bool = False) -> None:
@@ -1856,7 +1915,45 @@ class Worker:
         self._next_handle_id: int = 0
         self._owner_id = uuid.uuid4().hex
         self._uncertain_hashids: set[bytes] = set()
-        self._initialized = False
+        # Single authoritative lifecycle state (see _Lifecycle). All reads and
+        # writes hold _hierarchical_start_cv. `_initialized` / `_hierarchical_
+        # started` are read-only views of this field, kept for call-site brevity.
+        self._lifecycle = _Lifecycle.NEW
+        # The first BaseException that unwound init(), captured before rollback
+        # runs so every waiter observes the same original cause and a cleanup
+        # error cannot overwrite it.
+        self._startup_error: BaseException | None = None
+        # The current/last close() teardown attempt (private teardown phase, not
+        # a public lifecycle state). Concurrent close()s pin to the attempt they
+        # observe and wait on its completion; None until the first close().
+        self._close_completion: _CloseAttempt | None = None
+        # One-way latch: True once close() has *entered* teardown. Teardown is
+        # terminal — after it runs, a later close() never re-drives a half-torn
+        # tree (un-reclaimed resources leak). Only a drain-timeout, which leaves
+        # this False, permits a later close() to drive drain+teardown once.
+        self._teardown_attempted: bool = False
+        # Count of in-flight admitted operations (run / buffer / remote-memory)
+        # that passed the READY gate and hold a lease. close() publishes CLOSED
+        # (blocking new leases) and drains this to zero before teardown; if it
+        # does NOT reach zero within the budget, teardown is deferred (the
+        # attempt is marked INCOMPLETE, worker stays CLOSED) — a tree with a live
+        # operation is never destroyed under it. Guarded by _hierarchical_start_cv.
+        self._active_ops: int = 0
+        # Per-thread lease depth. A thread inside a leased operation that calls
+        # close() would drain its own never-releasing lease, so close() rejects
+        # such a reentrant call (e.g. worker.close() from inside an orch fn).
+        # Guarded by _hierarchical_start_cv.
+        self._lease_depth: dict[int, int] = {}
+        # Thread that claimed the current startup epoch (set at NEW->INITIALIZING).
+        # Native objects (ChipWorker / _Worker) bind the device to the calling
+        # thread (aclrtSetDevice) and are same-thread-only, so their teardown must
+        # run on this thread: a non-owner close() of a READY tree is always
+        # rejected — even after the owner thread has exited, because thread
+        # affinity does not transfer (a foreign finalize would run against the
+        # wrong / unbound device context). A close() while INITIALIZING fails
+        # fast (this worker does not cancel an in-progress init); any thread may
+        # join an in-flight close().
+        self._init_owner_thread: threading.Thread | None = None
 
         # Narrow lock around `_callable_registry` mutation so concurrent
         # register / unregister calls don't trip CPython's non-atomic
@@ -1880,10 +1977,15 @@ class Worker:
         # so they unlink their own nested shms). Reset at each _start_hierarchical.
         self._startup_reaped_pids: set[int] = set()
         self._startup_ready_pids: set[int] = set()
+        # Root-visible journal of this level's process-group-leader PIDs. On the
+        # startup root each direct child is a group leader (pgid == pid), so its
+        # whole inherited-group subtree — including grandchildren the leader
+        # forked — is reachable by killpg(pid) even after the leader itself has
+        # been reaped and dropped from the direct-pid lists. Reset per startup.
+        self._startup_group_leader_pids: set[int] = set()
         # Disposition of the last rollback (graceful vs. killed PIDs); diagnostics
         # and tests read it to confirm READY children were closed, not killed.
         self._last_rollback: dict[str, list[int]] | None = None
-        self._hierarchical_start_state = "not_started"
         self._hierarchical_start_mu = threading.Lock()
         self._hierarchical_start_cv = threading.Condition(self._hierarchical_start_mu)
         # Absolute time.monotonic() deadline for the current startup epoch, set
@@ -1964,6 +2066,25 @@ class Worker:
         self._host_buf_snapshot: tuple[tuple[int, ...], dict[int, _HostBufEntry]] = ((), {})
         self._host_buf_token_counter: int = 0
 
+    @property
+    def _initialized(self) -> bool:
+        """True only in READY — the worker's tree is live and dispatchable.
+
+        False once CLOSED (the moment close() claims the epoch), so a dispatch /
+        register / create_host_buffer that races an in-progress close() is
+        rejected rather than entering the teardown window.
+        """
+        return self._lifecycle is _Lifecycle.READY
+
+    @property
+    def _hierarchical_started(self) -> bool:
+        """True while an L3+ hierarchy is READY (children forked, scheduler up).
+
+        NOT true during teardown: teardown drives the children off resource
+        presence (``_worker`` / child mailboxes), never off this property, so a
+        CLOSED worker mid-teardown does not re-admit anything through it."""
+        return self._lifecycle is _Lifecycle.READY and self.level >= 3
+
     def _comm_plan_rootinfo_path(self) -> str:
         """Per-Worker rootinfo path used by HCCL/sim base comm_init.
 
@@ -1983,7 +2104,7 @@ class Worker:
         # mutation so a concurrent init() cannot freeze the topology snapshot
         # between them.
         with self._hierarchical_start_cv:
-            if self._initialized or self._hierarchical_start_state != "not_started":
+            if self._lifecycle is not _Lifecycle.NEW:
                 raise RuntimeError("Worker.add_remote_worker after init")
             if self.level < 4:
                 raise TypeError("Worker.add_remote_worker: remote L3 workers require a level >= 4 parent")
@@ -2123,10 +2244,27 @@ class Worker:
             self._close_remote_session(session)
 
     def _require_remote_worker_started(self, worker_id: int) -> None:
+        """Argument + resource gate for the public remote-memory APIs. Admission
+        (READY) is decided by the ``_operation_lease`` these APIs already hold —
+        this checks only worker id, level, and transport **presence** (not the
+        public lifecycle), so an operation legitimately admitted before a
+        concurrent ``close()`` published CLOSED still completes during the drain
+        instead of spuriously failing."""
         if self.level < 4:
             raise TypeError("remote memory APIs require a level >= 4 parent Worker")
-        if not self._initialized:
-            raise RuntimeError("remote memory APIs require Worker.init() before allocation or copy")
+        if int(worker_id) not in set(self._remote_worker_ids):
+            raise ValueError("remote memory APIs require a remote worker id returned by add_remote_worker")
+        if self._worker is None:
+            raise RuntimeError("remote memory APIs require a started hierarchical Worker")
+
+    def _require_remote_transport(self, worker_id: int) -> None:
+        """Internal transport gate for the low-level ``_send_*`` helpers, which
+        also run from close()'s teardown (lifecycle is already CLOSED then).
+        Gated purely on *resource presence* — the C++ ``_worker`` / remote
+        sockets are still up until ``_worker.close()`` nulls it — never on the
+        public lifecycle, so teardown keeps its capability without re-opening
+        public admission. Public entrypoints validate READY separately via
+        ``_require_remote_worker_started``."""
         if int(worker_id) not in set(self._remote_worker_ids):
             raise ValueError("remote memory APIs require a remote worker id returned by add_remote_worker")
         if self._worker is None:
@@ -2181,14 +2319,14 @@ class Worker:
     def _send_remote_free(self, handle: RemoteBufferHandle) -> None:
         if handle.is_imported:
             raise ValueError("remote_free is invalid for imported handles; use remote_release_import")
-        self._require_remote_worker_started(handle.worker_id)
+        self._require_remote_transport(handle.worker_id)
         assert self._worker is not None
         self._worker.remote_free(handle.worker_id, handle._buffer_id, handle._generation)
 
     def _send_remote_release_import(self, handle: RemoteBufferHandle) -> None:
         if not handle.is_imported:
             raise ValueError("remote_release_import expects an imported remote handle")
-        self._require_remote_worker_started(handle.worker_id)
+        self._require_remote_transport(handle.worker_id)
         assert self._worker is not None
         self._worker.remote_release_import(
             handle.worker_id,
@@ -2200,7 +2338,7 @@ class Worker:
 
     def _send_remote_release_import_fields(self, fields: Any) -> None:
         worker_id = int(fields[0])
-        self._require_remote_worker_started(worker_id)
+        self._require_remote_transport(worker_id)
         assert self._worker is not None
         self._worker.remote_release_import(
             worker_id,
@@ -2215,19 +2353,20 @@ class Worker:
         size = int(nbytes)
         if size <= 0:
             raise ValueError("Worker.remote_malloc nbytes must be positive")
-        self._require_remote_worker_started(worker_id)
-        assert self._worker is not None
-        fields = self._worker.remote_malloc(worker_id, size)
-        return RemoteBufferHandle._from_remote_allocation(
-            worker_id=int(fields[0]),
-            buffer_id=int(fields[1]),
-            generation=int(fields[2]),
-            address_space=RemoteAddressSpace(int(fields[3])),
-            nbytes=int(fields[4]),
-            remote_addr=int(fields[5]),
-            rkey_or_token=int(fields[6]),
-            ub_ldst_va=int(fields[7]),
-        )
+        with self._operation_lease("remote_malloc"):
+            self._require_remote_worker_started(worker_id)
+            assert self._worker is not None
+            fields = self._worker.remote_malloc(worker_id, size)
+            return RemoteBufferHandle._from_remote_allocation(
+                worker_id=int(fields[0]),
+                buffer_id=int(fields[1]),
+                generation=int(fields[2]),
+                address_space=RemoteAddressSpace(int(fields[3])),
+                nbytes=int(fields[4]),
+                remote_addr=int(fields[5]),
+                rkey_or_token=int(fields[6]),
+                ub_ldst_va=int(fields[7]),
+            )
 
     def remote_free(self, handle: RemoteBufferHandle) -> None:
         if not isinstance(handle, RemoteBufferHandle):
@@ -2238,57 +2377,77 @@ class Worker:
             raise ValueError("remote_free is invalid for imported handles; use remote_release_import")
         if handle.released:
             return
-        if handle._live_slot_refs > 0 or handle._live_import_refs > 0:
+        # Public admission: READY-only + drained. (The private _send_* transport
+        # helper accepts CLOSED so teardown can flush pending frees, so remote_free
+        # must fence admission itself rather than lean on the transport gate.)
+        with self._operation_lease("remote_free"):
+            if handle._live_slot_refs > 0 or handle._live_import_refs > 0:
+                handle._mark_released()
+                if handle not in self._pending_remote_buffer_frees:
+                    self._pending_remote_buffer_frees.append(handle)
+                return
+            self._send_remote_free(handle)
             handle._mark_released()
-            if handle not in self._pending_remote_buffer_frees:
-                self._pending_remote_buffer_frees.append(handle)
-            return
-        self._send_remote_free(handle)
-        handle._mark_released()
 
     def remote_copy_to(self, handle: RemoteBufferHandle, host_ptr: Any, nbytes: int, *, offset: int = 0) -> None:
-        self._require_live_remote_buffer(handle)
-        if handle.is_imported:
-            raise ValueError("Worker.remote_copy_to expects an owner remote buffer handle")
-        size = int(nbytes)
-        start = int(offset)
-        if size < 0 or start < 0:
-            raise ValueError("Worker.remote_copy_to size and offset must be non-negative")
-        if start + size > handle.nbytes:
-            raise ValueError("Worker.remote_copy_to range exceeds RemoteBufferHandle.nbytes")
-        assert self._worker is not None
-        self._worker.remote_copy_to(
-            handle.worker_id,
-            handle._buffer_id,
-            handle._generation,
-            start,
-            self._host_ptr_value(host_ptr),
-            size,
-            handle.nbytes,
-        )
+        with self._operation_lease("remote_copy_to"):
+            self._require_live_remote_buffer(handle)
+            if handle.is_imported:
+                raise ValueError("Worker.remote_copy_to expects an owner remote buffer handle")
+            size = int(nbytes)
+            start = int(offset)
+            if size < 0 or start < 0:
+                raise ValueError("Worker.remote_copy_to size and offset must be non-negative")
+            if start + size > handle.nbytes:
+                raise ValueError("Worker.remote_copy_to range exceeds RemoteBufferHandle.nbytes")
+            assert self._worker is not None
+            self._worker.remote_copy_to(
+                handle.worker_id,
+                handle._buffer_id,
+                handle._generation,
+                start,
+                self._host_ptr_value(host_ptr),
+                size,
+                handle.nbytes,
+            )
 
     def remote_copy_from(self, handle: RemoteBufferHandle, host_ptr: Any, nbytes: int, *, offset: int = 0) -> None:
-        self._require_live_remote_buffer(handle)
-        if handle.is_imported:
-            raise ValueError("Worker.remote_copy_from expects an owner remote buffer handle")
-        size = int(nbytes)
-        start = int(offset)
-        if size < 0 or start < 0:
-            raise ValueError("Worker.remote_copy_from size and offset must be non-negative")
-        if start + size > handle.nbytes:
-            raise ValueError("Worker.remote_copy_from range exceeds RemoteBufferHandle.nbytes")
-        assert self._worker is not None
-        self._worker.remote_copy_from(
-            self._host_ptr_value(host_ptr),
-            handle.worker_id,
-            handle._buffer_id,
-            handle._generation,
-            start,
-            size,
-            handle.nbytes,
-        )
+        with self._operation_lease("remote_copy_from"):
+            self._require_live_remote_buffer(handle)
+            if handle.is_imported:
+                raise ValueError("Worker.remote_copy_from expects an owner remote buffer handle")
+            size = int(nbytes)
+            start = int(offset)
+            if size < 0 or start < 0:
+                raise ValueError("Worker.remote_copy_from size and offset must be non-negative")
+            if start + size > handle.nbytes:
+                raise ValueError("Worker.remote_copy_from range exceeds RemoteBufferHandle.nbytes")
+            assert self._worker is not None
+            self._worker.remote_copy_from(
+                self._host_ptr_value(host_ptr),
+                handle.worker_id,
+                handle._buffer_id,
+                handle._generation,
+                start,
+                size,
+                handle.nbytes,
+            )
 
     def remote_export(
+        self,
+        handle: RemoteBufferHandle,
+        *,
+        offset: int = 0,
+        nbytes: int | None = None,
+        access: str | int = "readwrite",
+        transport_profile: str = "sim",
+    ) -> RemoteBufferExport:
+        with self._operation_lease("remote_export"):
+            return self._remote_export_locked(
+                handle, offset=offset, nbytes=nbytes, access=access, transport_profile=transport_profile
+            )
+
+    def _remote_export_locked(
         self,
         handle: RemoteBufferHandle,
         *,
@@ -2342,12 +2501,20 @@ class Worker:
     def remote_import(
         self, exported: RemoteBufferExport, *, worker: int, access: str | int | None = None
     ) -> RemoteBufferHandle:
+        # Argument validation (type / forged / stale) is independent of lifecycle
+        # and runs before admission; the lease guards the actual transport.
         if not isinstance(exported, RemoteBufferExport):
             raise TypeError("Worker.remote_import expects a RemoteBufferExport returned by remote_export")
         if exported._worker_owner_id != self._owner_id:
             raise ValueError("Worker.remote_import rejects forged or different Worker RemoteBufferExport values")
         if exported._owner_handle is not None and exported._owner_handle.released:
             raise ValueError("Worker.remote_import rejects stale RemoteBufferExport values for released buffers")
+        with self._operation_lease("remote_import"):
+            return self._remote_import_locked(exported, worker=worker, access=access)
+
+    def _remote_import_locked(
+        self, exported: RemoteBufferExport, *, worker: int, access: str | int | None = None
+    ) -> RemoteBufferHandle:
         importer_worker_id = int(worker)
         self._require_remote_worker_started(importer_worker_id)
         flags = exported._access_flags if access is None else self._remote_access_flags(access)
@@ -2408,17 +2575,20 @@ class Worker:
             raise ValueError("Worker.remote_release_import expects an imported remote handle")
         if handle.released:
             return
-        if handle._live_slot_refs > 0:
+        # Public admission: READY-only + drained (the private _send_* transport
+        # accepts CLOSED for teardown, so fence admission here).
+        with self._operation_lease("remote_release_import"):
+            if handle._live_slot_refs > 0:
+                handle._mark_released()
+                if handle not in self._pending_remote_import_releases:
+                    self._pending_remote_import_releases.append(handle)
+                return
+            self._send_remote_release_import(handle)
+            if handle._owner_handle_ref is not None:
+                handle._owner_handle_ref._release_import_ref()
+                handle._owner_handle_ref = None
             handle._mark_released()
-            if handle not in self._pending_remote_import_releases:
-                self._pending_remote_import_releases.append(handle)
-            return
-        self._send_remote_release_import(handle)
-        if handle._owner_handle_ref is not None:
-            handle._owner_handle_ref._release_import_ref()
-            handle._owner_handle_ref = None
-        handle._mark_released()
-        self._flush_pending_remote_frees()
+            self._flush_pending_remote_frees()
 
     def _capture_remote_sidecar_refs(self, remote_sidecar: Any) -> list[RemoteBufferHandle]:
         captured: list[RemoteBufferHandle] = []
@@ -2593,23 +2763,65 @@ class Worker:
         with self._registry_lock:
             return self._resolve_handle_locked(handle, expected_namespace=expected_namespace)
 
+    def _wait_out_init_locked(self, api: str) -> None:
+        """Block while an epoch is INITIALIZING, then reject a terminal epoch.
+
+        Must hold ``_hierarchical_start_cv``. Returns with the lifecycle in a
+        non-INITIALIZING state; raises on FAILED (re-raising the original
+        startup cause) or CLOSED so a mutation never lands on a dead epoch.
+        """
+        while self._lifecycle is _Lifecycle.INITIALIZING:
+            self._hierarchical_start_cv.wait()
+        if self._lifecycle is _Lifecycle.FAILED:
+            raise RuntimeError(
+                f"Worker.{api}: hierarchical startup failed; close this Worker and create a new one"
+            ) from self._startup_error
+        if self._lifecycle is _Lifecycle.CLOSED:
+            # A register/unregister that lost the wake race to a concurrent
+            # close() still sees the original startup cause if one was recorded
+            # (a FAILED epoch that close() then reaped), not just "closed".
+            raise RuntimeError(f"Worker.{api}: worker is closed") from self._startup_error
+
+    @contextlib.contextmanager
+    def _operation_lease(self, api: str):
+        """Admit an operation onto a READY worker and hold a lease for its whole
+        duration, so a concurrent close() drains it before teardown.
+
+        Fail-fast: admits only a READY worker (a non-READY worker — NEW,
+        INITIALIZING, CLOSED, FAILED — is rejected immediately, not waited on,
+        per the state/API matrix for dispatch/buffer). The lease is
+        released on exit and wakes a close() that is draining. Use around any API
+        that touches the live tree and can run past its admission check (run /
+        host-buffer / remote-memory)."""
+        tid = threading.get_ident()
+        with self._hierarchical_start_cv:
+            if self._lifecycle is not _Lifecycle.READY:
+                raise RuntimeError(f"Worker.{api}: requires an initialized (READY) worker") from self._startup_error
+            self._active_ops += 1
+            self._lease_depth[tid] = self._lease_depth.get(tid, 0) + 1
+        try:
+            yield
+        finally:
+            with self._hierarchical_start_cv:
+                self._active_ops -= 1
+                depth = self._lease_depth.get(tid, 0) - 1
+                if depth <= 0:
+                    self._lease_depth.pop(tid, None)
+                else:
+                    self._lease_depth[tid] = depth
+                self._hierarchical_start_cv.notify_all()
+
     def _register_into_snapshot_or_wait(self, reg: _CallableRegistration) -> CallableHandle | None:
         """Linearize a level>=3 register against the startup epoch.
 
-        Waits out an in-progress init() (INITIALIZING); a FAILED epoch raises. A
-        pre-start registration is installed into the startup snapshot and its
-        handle returned; once the hierarchy is READY, returns None so the caller
-        takes its post-start control-broadcast path.
+        Waits out an in-progress init() (INITIALIZING); a FAILED or CLOSED epoch
+        raises. A pre-start (NEW) registration is installed into the startup
+        snapshot and its handle returned; once the hierarchy is READY, returns
+        None so the caller takes its post-start control-broadcast path.
         """
         with self._hierarchical_start_cv:
-            while self._hierarchical_start_state == "starting":
-                self._hierarchical_start_cv.wait()
-            if self._hierarchical_start_state == "failed":
-                raise RuntimeError("Worker hierarchical startup failed; close this Worker and create a new one")
-            pre_start = self._hierarchical_start_state != "started" and not getattr(
-                self, "_hierarchical_started", False
-            )
-            if pre_start:
+            self._wait_out_init_locked("register")
+            if self._lifecycle is _Lifecycle.NEW:
                 with self._registry_lock:
                     handle, _is_new = self._install_registration_locked(reg)
                 return handle
@@ -2621,6 +2833,14 @@ class Worker:
         Integer execution slots remain private to the local target process.
         Submit APIs consume the returned handle and dispatch by its stable
         SHA-256 callable identity.
+
+        Target eligibility (a callable's kind having a resolving child) is
+        checked only at init(), over the pre-init registrations
+        (``_validate_eligible_targets``). A post-init dynamic register does NOT
+        re-validate against the frozen topology, so registering e.g. a
+        ChipCallable on a chipless worker yields a handle that never dispatches.
+        Unifying the two paths is a follow-up (needs a device-free chip-child
+        test harness).
         """
         if isinstance(target, RemoteCallable) and self.level < 4:
             raise TypeError("Worker.register(RemoteCallable): remote L3 dispatch requires a level >= 4 parent")
@@ -2644,13 +2864,26 @@ class Worker:
             handle = self._register_into_snapshot_or_wait(reg)
             if handle is not None:
                 return handle
-            return self._post_start_register_remote(reg)
+            # Post-start broadcast touches the live tree; hold a lease so close()
+            # drains it before teardown (re-checks READY, closing the
+            # gate-then-teardown race).
+            with self._operation_lease("register"):
+                return self._post_start_register_remote(reg)
         if self.level >= 3:
             handle = self._register_into_snapshot_or_wait(reg)
             if handle is not None:
                 return handle
             if not isinstance(target, ChipCallable):
-                return self._post_start_register_python(reg)
+                with self._operation_lease("register"):
+                    return self._post_start_register_python(reg)
+        else:
+            # L2 has no pre-start snapshot, but still linearizes against the
+            # epoch: reject a terminal (CLOSED/FAILED) worker and wait out an
+            # in-progress init so the callable is installed and its device slot
+            # prepared after READY — never left registered-but-not-prepared, and
+            # never accepted onto a closed worker as an inert handle.
+            with self._hierarchical_start_cv:
+                self._wait_out_init_locked("register")
 
         with self._registry_lock:
             handle, is_new = self._install_registration_locked(reg)
@@ -2660,7 +2893,8 @@ class Worker:
         # target-private; task dispatches carry only handle.digest.
         if self.level >= 3 and self._initialized and isinstance(target, ChipCallable):
             try:
-                self._post_init_register(target, handle.digest, is_new=is_new)
+                with self._operation_lease("register"):
+                    self._post_init_register(target, handle.digest, is_new=is_new)
             except Exception:
                 with self._registry_lock:
                     self._rollback_handle_locked(handle)
@@ -2672,7 +2906,8 @@ class Worker:
             assert self._chip_worker is not None
             with self._registry_lock:
                 slot_id = self._identity_registry[handle.digest].slot_id
-            self._chip_worker._register_callable_at_slot(slot_id, target)
+            with self._operation_lease("register"):
+                self._chip_worker._register_callable_at_slot(slot_id, target)
         return handle
 
     def _python_worker_types(self) -> list[WorkerType]:
@@ -3127,13 +3362,14 @@ class Worker:
 
     def _pre_start_unregister_if_needed(self, handle_or_slot) -> bool:
         if self.level < 3:
+            # L2 has no pre-start snapshot, but still linearizes against the
+            # epoch: reject a terminal worker and wait out an in-progress init.
+            with self._hierarchical_start_cv:
+                self._wait_out_init_locked("unregister")
             return False
         with self._hierarchical_start_cv:
-            while self._hierarchical_start_state == "starting":
-                self._hierarchical_start_cv.wait()
-            if self._hierarchical_start_state == "failed":
-                raise RuntimeError("Worker hierarchical startup failed; close this Worker and create a new one")
-            if self._hierarchical_start_state == "started" or getattr(self, "_hierarchical_started", False):
+            self._wait_out_init_locked("unregister")
+            if self._lifecycle is not _Lifecycle.NEW:
                 return False
             with self._registry_lock:
                 handle_id, digest, state = self._coerce_handle_state(handle_or_slot)
@@ -3170,6 +3406,13 @@ class Worker:
           KeyError: handle was never registered.
         """
         if isinstance(handle_or_slot, CallableHandle) and handle_or_slot.target_namespace == "REMOTE_TASK_DISPATCHER":
+            # Linearize against the epoch before dispatching: wait out an
+            # in-progress init so the remote cleanup is actually sent once READY
+            # (an INITIALIZING worker has _initialized False and would drop local
+            # state while skipping the remote send, leaving a dangling remote
+            # dispatcher); reject a terminal worker.
+            with self._hierarchical_start_cv:
+                self._wait_out_init_locked("unregister")
             self._unregister_remote_handle(handle_or_slot)
             return
         if self._pre_start_unregister_if_needed(handle_or_slot):
@@ -3382,13 +3625,15 @@ class Worker:
             raise RuntimeError("Worker.add_worker() requires level >= 4")
         if self._config.get("device_ids", []):
             raise RuntimeError("Worker.add_worker() cannot be combined with device_ids on the same Worker")
-        if worker._initialized:
-            raise RuntimeError("Child worker must not be initialized before add_worker()")
+        if worker._lifecycle is not _Lifecycle.NEW:
+            # init() happens inside the forked child process, so the child must
+            # be pristine — not started, failed, or closed.
+            raise RuntimeError("Child worker must be NEW (not started/failed/closed) before add_worker()")
         # Hold the lifecycle lock across the state check and the topology
         # mutation so a concurrent init() cannot freeze the topology snapshot
         # between them.
         with self._hierarchical_start_cv:
-            if self._initialized or self._hierarchical_start_state != "not_started":
+            if self._lifecycle is not _Lifecycle.NEW:
                 raise RuntimeError("Worker.add_worker() must be called before init()")
             worker_id = self._allocate_next_level_worker_id()
             self._next_level_workers.append(worker)
@@ -3399,6 +3644,58 @@ class Worker:
     # init — auto-discovery
     # ------------------------------------------------------------------
 
+    def _eligible_target_need(self, namespace: str | None, eligible_worker_ids) -> str | None:
+        """Return the missing dispatch target for a callable of this *kind*, or
+        None if it is eligible in the current (frozen) topology.
+
+        Keyed on the same ``target_namespace`` → child-loop mapping
+        ``_make_local_identity_tables`` applies at fork:
+          - ``LOCAL_PYTHON`` (Python callable) is installed only into SUB and
+            next-level child loops — a chip child does NOT resolve it;
+          - ``LOCAL_CHIP`` (ChipCallable) only into chip child loops;
+          - ``REMOTE_TASK_DISPATCHER`` only onto its named remote worker(s).
+        An L2 worker (or any non-dispatch namespace) is always eligible.
+
+        Used only by ``_validate_eligible_targets`` at init (the *startup*
+        eligibility gate). The post-init dynamic ``register`` path does NOT yet
+        apply this rule — see that method for the deferred inconsistency.
+        """
+        if self.level < 3:
+            return None
+        if namespace == "LOCAL_PYTHON":
+            has_python_child = self._config.get("num_sub_workers", 0) > 0 or bool(self._next_level_workers)
+            return None if has_python_child else "a SUB or next-level child"
+        if namespace == "LOCAL_CHIP":
+            return None if bool(self._config.get("device_ids")) else "a chip device (device_ids)"
+        if namespace == "REMOTE_TASK_DISPATCHER":
+            has_remote_workers = set(self._remote_worker_ids)
+            ok = bool(has_remote_workers) and set(eligible_worker_ids) <= has_remote_workers
+            return None if ok else "its named remote worker(s) (add_remote_worker)"
+        return None
+
+    def _validate_eligible_targets(self) -> None:
+        """Reject a pre-registered callable that no child of the frozen topology
+        can resolve, before any startup resource is allocated.
+
+        A registration whose namespace has no matching child is silently dropped
+        by ``_make_local_identity_tables`` and would leave the worker
+        READY-yet-inert, so raise here with its namespace + hashid. (An L3
+        orchestrator passed to ``run()`` runs on this host and is never
+        registered, so it is not subject to this check.) See
+        ``_eligible_target_need`` for the per-kind rule.
+        """
+        if self.level < 3:
+            return
+        with self._registry_lock:
+            states = list(self._identity_registry.items())
+        for digest, state in states:
+            need = self._eligible_target_need(state.target_namespace, state.eligible_worker_ids)
+            if need is not None:
+                raise RuntimeError(
+                    f"Worker.init(): registered {state.target_namespace} callable {_format_digest(digest)} "
+                    f"has no eligible dispatch target (needs {need})"
+                )
+
     def init(self, prewarm_config=None, *, _startup_deadline: float | None = None) -> None:
         """Initialize the worker and bring its whole subtree to READY.
 
@@ -3407,9 +3704,11 @@ class Worker:
         subtree — recursively, for L4+ — to publish INIT_READY, activates any
         remote L3 sessions, starts the C++ scheduler, and only then publishes
         READY in one atomic commit. It returns with the tree ready to run, or
-        raises after a bounded rollback that leaves no child, mailbox, or session
-        behind. ``run`` / ``create_host_buffer`` / the remote register/memory
-        APIs never trigger startup.
+        raises after a bounded rollback that reaps the children it forked
+        best-effort (a child wedged in native code past the deadline may be left
+        behind — see the deferred un-reaped-child / nested-shm items).
+        ``run`` / ``create_host_buffer`` / the remote register/memory APIs never
+        trigger startup.
 
         Args:
             prewarm_config: Optional CallConfig. When given, its ring sizing
@@ -3429,19 +3728,33 @@ class Worker:
             prewarm_config.validate()
         # Claim the startup epoch atomically: NEW -> INITIALIZING under the
         # lifecycle lock so a concurrent init / register / close observes one
-        # linear transition and never a half-built Worker. The INITIALIZING /
-        # READY / FAILED state machine is a hierarchical (level >= 3) concept; an
-        # L2 worker inits synchronously in-process and never enters "starting".
+        # linear transition and never a half-built Worker. Every level claims the
+        # epoch so two concurrent init() calls serialize on it; an L2 worker
+        # still inits synchronously in-process, with no child barrier.
         with self._hierarchical_start_cv:
-            if self._initialized:
-                raise RuntimeError("Worker already initialized")
-            if self._hierarchical_start_state == "starting":
+            if self._lifecycle is _Lifecycle.INITIALIZING:
                 raise RuntimeError("Worker.init() is already in progress")
-            if self._hierarchical_start_state == "failed":
+            if self._lifecycle is _Lifecycle.READY:
+                raise RuntimeError("Worker already initialized")
+            if self._lifecycle is _Lifecycle.FAILED:
                 raise RuntimeError("Worker startup failed; close this Worker and create a new one")
+            if self._lifecycle is _Lifecycle.CLOSED:
+                # CLOSED is a permanent admission fence: a closed worker (even one
+                # whose private teardown is still finishing) is never revived by a
+                # concurrent init().
+                raise RuntimeError("Worker is closed; create a new Worker")
+            # Reject an initial callable that can never run before any startup
+            # resource is spent: a childless worker that accepted a callable
+            # would otherwise come up READY yet inert. Held under the lifecycle
+            # lock so a concurrent register() cannot install a target between the
+            # check and the epoch claim (register's snapshot install also holds
+            # this lock).
+            self._validate_eligible_targets()
             self._prewarm_config = prewarm_config
+            self._startup_error = None
+            self._init_owner_thread = threading.current_thread()
+            self._lifecycle = _Lifecycle.INITIALIZING
             if self.level >= 3:
-                self._hierarchical_start_state = "starting"
                 self._is_startup_root = _startup_deadline is None
                 own_deadline = time.monotonic() + self._startup_timeout_s
                 # A recursive descendant caps its own timeout at the parent's
@@ -3459,27 +3772,31 @@ class Worker:
                 self._start_hierarchical()
             else:
                 raise ValueError(f"Worker: level {self.level} not supported")
-        except BaseException:
-            # Commit FAILED even if rollback itself raises, so a waiter blocked on
-            # the lifecycle condition (register / close) is always released.
+            # Atomic READY commit inside the exception boundary: publish the
+            # single lifecycle state so no thread ever observes a started
+            # hierarchy while the worker is not yet READY.
+            with self._hierarchical_start_cv:
+                self._lifecycle = _Lifecycle.READY
+                self._hierarchical_start_cv.notify_all()
+        except BaseException as exc:
+            # Any unwind (init failure or KeyboardInterrupt) rolls back through
+            # one path: capture the original cause first (so a cleanup error
+            # cannot overwrite it and every waiter sees the same reason), roll
+            # back, commit FAILED even if rollback raises, then surface.
+            with self._hierarchical_start_cv:
+                if self._startup_error is None:
+                    self._startup_error = exc
             try:
                 self._cleanup_partial_init()
             finally:
-                if self.level >= 3:
-                    with self._hierarchical_start_cv:
-                        self._hierarchical_start_state = "failed"
-                        self._hierarchical_start_cv.notify_all()
+                with self._hierarchical_start_cv:
+                    # Only an INITIALIZING epoch commits FAILED. This thread is
+                    # the sole writer of the INITIALIZING -> FAILED edge (close()
+                    # fails fast while INITIALIZING and never advances it).
+                    if self._lifecycle is _Lifecycle.INITIALIZING:
+                        self._lifecycle = _Lifecycle.FAILED
+                    self._hierarchical_start_cv.notify_all()
             raise
-
-        # Atomic READY commit: publish _initialized together with the started
-        # state so no thread ever observes a started hierarchy while
-        # _initialized is still False.
-        with self._hierarchical_start_cv:
-            self._initialized = True
-            if self.level >= 3:
-                self._hierarchical_started = True
-                self._hierarchical_start_state = "started"
-            self._hierarchical_start_cv.notify_all()
 
     def _init_level2(self) -> None:
         from simpler_setup.runtime_builder import RuntimeBuilder  # noqa: PLC0415
@@ -3580,8 +3897,6 @@ class Worker:
             self._close_remote_sessions(opened_remote_sessions)
             raise
 
-        self._hierarchical_started = False
-
     def _start_hierarchical(self) -> None:  # noqa: PLR0912 -- three parallel fork loops (sub/chip/next) + bootstrap wait + scheduler register/init; branches track the fork order documented in the body
         """Fork every local child, await the subtree, register endpoints, start the scheduler.
 
@@ -3595,8 +3910,8 @@ class Worker:
         deadline = self._startup_deadline
 
         # Freeze the startup registry snapshot. init() already holds the epoch in
-        # the "starting" state, so a concurrent register/unregister is blocked on
-        # the lifecycle condition and cannot slip a mutation in after this point.
+        # the INITIALIZING state, so a concurrent register/unregister is blocked
+        # on the lifecycle condition and cannot slip a mutation in after this point.
         with self._registry_lock:
             identity_snapshot = [
                 (digest, state.target, state.ref_count, state.kind, state.target_namespace)
@@ -3605,6 +3920,7 @@ class Worker:
 
         self._startup_reaped_pids = set()
         self._startup_ready_pids = set()
+        self._startup_group_leader_pids = set()
 
         # Fork SubWorker processes (MUST be before any C++ threads)
         for i in range(n_sub):
@@ -3629,6 +3945,8 @@ class Worker:
                 )
             else:
                 self._sub_pids.append(pid)
+                if self._is_startup_root:
+                    self._startup_group_leader_pids.add(pid)
 
         # SUB children have no fallible device/runtime init, but they join the
         # same readiness contract so a child that dies before entering its loop
@@ -3682,6 +4000,8 @@ class Worker:
                     os._exit(0)
                 else:
                     self._chip_pids.append(pid)
+                    if self._is_startup_root:
+                        self._startup_group_leader_pids.add(pid)
 
             # Cross-chip init barrier.  ChipWorker.init can have a long right tail
             # (e.g. PTO2_RING_HEAP=4 GiB pushes per-rank device_malloc beyond the
@@ -3737,6 +4057,8 @@ class Worker:
                 )
             else:
                 self._next_level_pids.append(pid)
+                if self._is_startup_root:
+                    self._startup_group_leader_pids.add(pid)
 
         # The recursive readiness edge: a next-level child's own init blocks on
         # its descendants, so its INIT_READY means the whole subtree is ready. A
@@ -3849,11 +4171,17 @@ class Worker:
     # Hierarchical abort
     # ------------------------------------------------------------------
 
-    def _abort_hierarchical(self) -> None:  # noqa: PLR0912 -- graceful/cooperative-cancel-then-killpg rollback across sub/chip/next-level, bounded-wait, reap, free shms
+    def _abort_hierarchical(self, deadline: float | None = None) -> None:  # noqa: PLR0912 -- graceful/cooperative-cancel-then-killpg rollback across sub/chip/next-level, bounded-wait, reap, free shms
         """Tear down the whole forked subtree + shms after a bootstrap failure.
 
         Called from the init() failure path — the single rollback entry
         (_cleanup_partial_init) — so `dw.init()` may or may not have run.
+
+        ``deadline`` is one absolute ``time.monotonic()`` budget shared by both
+        phases (cooperative wait and the final reap), so the whole rollback is
+        bounded end-to-end; a survivor still alive at the deadline is left to the
+        OS/init rather than blocking this thread on a D-state child. Defaults to
+        one ``_ROLLBACK_GRACEFUL_TIMEOUT_S`` window.
 
         Teardown proceeds in two bounded phases within one cleanup budget:
 
@@ -3871,6 +4199,8 @@ class Worker:
            the direct pid and relies on the root's killpg. PIDs the barrier
            already reaped are excluded so a reused PID is never signalled.
         """
+        if deadline is None:
+            deadline = time.monotonic() + _ROLLBACK_GRACEFUL_TIMEOUT_S
         reaped = set(self._startup_reaped_pids)
         graceful: list[int] = []
         cancelled: list[int] = []
@@ -3915,8 +4245,7 @@ class Worker:
 
         waiting = set(graceful) | set(cancelled)
         if waiting:
-            gdeadline = time.monotonic() + _ROLLBACK_GRACEFUL_TIMEOUT_S
-            while waiting and time.monotonic() <= gdeadline:
+            while waiting and time.monotonic() <= deadline:
                 for pid in list(waiting):
                     try:
                         wpid, _status = os.waitpid(pid, os.WNOHANG)
@@ -3943,11 +4272,41 @@ class Worker:
             with contextlib.suppress(ProcessLookupError, OSError):
                 os.kill(pid, signal.SIGKILL)
             killed.append(pid)
-        for pid in pids:
-            if pid in reaped and pid not in killed:
-                continue
-            with contextlib.suppress(ChildProcessError):
-                os.waitpid(pid, 0)
+        # Bounded final reap within the shared deadline: a SIGKILL'd child exits
+        # promptly, so poll with WNOHANG rather than a blocking waitpid — a
+        # D-state (uninterruptible) survivor must not pin this thread past the
+        # cleanup budget. One sweep always runs (a just-killed pid is usually
+        # already reapable); a pid not reaped by the deadline is left to the
+        # OS/init rather than extending the budget.
+        to_reap = {p for p in pids if p in killed or p not in reaped}
+        while to_reap:
+            for pid in list(to_reap):
+                try:
+                    wpid, _status = os.waitpid(pid, os.WNOHANG)
+                except ChildProcessError:
+                    to_reap.discard(pid)
+                    continue
+                if wpid != 0:
+                    to_reap.discard(pid)
+            if to_reap and time.monotonic() <= deadline:
+                time.sleep(_STARTUP_POLL_INTERVAL_S)
+            else:
+                break
+
+        # Leader-reaped-but-descendants-alive sweep: a group-leader child that
+        # died on its own (barrier waitpid'd it, so it is in `reaped` and was
+        # skipped above) may have left grandchildren it forked before dying.
+        # Those inherited its process group and were reparented to init, so they
+        # are unreachable by waitpid but still reachable by killpg on the leader's
+        # pgid (== the leader pid) as long as the group has a live member.
+        # Fire-and-forget: init reaps the orphans. Like every killpg-based
+        # reclaim this assumes the reaped leader's pid has not yet been reused as
+        # a new group leader (Linux allocates pids ~monotonically, so the reuse
+        # window here is negligible).
+        if self._is_startup_root:
+            for leader_pid in self._startup_group_leader_pids:
+                with contextlib.suppress(ProcessLookupError, OSError):
+                    os.killpg(leader_pid, signal.SIGKILL)
 
         self._last_rollback = {
             "graceful": [p for p in graceful if p not in killed],
@@ -3974,12 +4333,19 @@ class Worker:
         self._chip_pids.clear()
         self._sub_pids.clear()
         self._next_level_pids.clear()
+        self._startup_group_leader_pids.clear()
         self._sub_shms.clear()
         self._chip_shms.clear()
         self._next_level_shms.clear()
 
     def _cleanup_partial_init(self) -> None:
-        """Best-effort cleanup for init() failures before the Worker is public-live."""
+        """Best-effort cleanup for init() failures before the Worker is public-live.
+
+        One absolute cleanup deadline is created here and shared by every phase
+        (including ``_abort_hierarchical``) so the whole rollback is bounded
+        end-to-end rather than each phase re-acquiring a full timeout.
+        """
+        deadline = time.monotonic() + _ROLLBACK_GRACEFUL_TIMEOUT_S
 
         try:
             self._release_active_remote_slot_refs()
@@ -4001,10 +4367,8 @@ class Worker:
             self._chip_worker = None
 
         self._remote_sessions.clear()
-        self._abort_hierarchical()
-        self._hierarchical_started = False
+        self._abort_hierarchical(deadline=deadline)
         self._comm_base_ready = False
-        self._initialized = False
 
     @property
     def live_domains(self) -> dict[str, CommDomainHandle]:
@@ -4153,16 +4517,25 @@ class Worker:
                     pass
 
     def _cleanup_l3_l2_regions(self) -> None:
+        # Per-region best-effort: every region is attempted (and _expire()d) even
+        # if one raises, so a failing region never strands the rest; the first
+        # error is raised after all are attempted so close() reports the leak.
         if not self._live_l3_l2_regions:
             return
         regions, self._live_l3_l2_regions = self._live_l3_l2_regions, []
+        errors: list[BaseException] = []
         for region in regions:
             try:
-                region._close_l3_host_mapping()
-                if self._worker is not None:
-                    self._worker.control_l3_l2_region_release(region._worker_id, region.region_id)
-            finally:
-                region._expire()
+                try:
+                    region._close_l3_host_mapping()
+                    if self._worker is not None:
+                        self._worker.control_l3_l2_region_release(region._worker_id, region.region_id)
+                finally:
+                    region._expire()
+            except BaseException as exc:  # noqa: BLE001
+                errors.append(exc)
+        if errors:
+            raise errors[0]
 
     def _close_l3_l2_orch_comm(self) -> None:
         for region in self._live_l3_l2_regions:
@@ -4246,8 +4619,10 @@ class Worker:
         window_size: int,
         buffers: list[CommBufferSpec],
     ) -> CommDomainHandle:
-        if not self._initialized:
-            raise RuntimeError("allocate_domain requires Worker.init() (HCCL membership) to have run")
+        # Admission is the run() lease that the driving orchestrator holds;
+        # this checks resource presence (not the public lifecycle) so a domain
+        # allocation admitted before a concurrent close() published CLOSED still
+        # completes during the drain. The _worker check below is that gate.
         if self.level < 3:
             raise RuntimeError("allocate_domain requires level >= 3")
         if self._worker is None:
@@ -4532,9 +4907,9 @@ class Worker:
                     f"Worker._release_all_live_domains: {handle.name!r} release failed: {type(e).__name__}: {e}\n"
                 )
                 sys.stderr.flush()
-                # Drop from live_domains anyway — leaving a known-bad handle
-                # would just block close().
-                self._live_domains.pop(handle.name, None)
+                # Keep the un-freed handle in _live_domains so the leak stays
+                # detectable: close() reports it as a terminal residual instead
+                # of returning success (terminal — it is not retried).
 
     # ------------------------------------------------------------------
     # memory management — forward to C++ Orchestrator, which holds
@@ -4557,42 +4932,46 @@ class Worker:
 
     def malloc(self, size: int, worker_id: int = 0) -> int:
         """Allocate memory on next-level chip worker *worker_id*. Returns a pointer."""
-        if self.level == 2:
-            assert self._chip_worker is not None
-            return self._chip_worker.malloc(size)
-        self._check_chip_worker_id(worker_id)
-        assert self._orch is not None
-        return self._orch.malloc(worker_id, size)
+        with self._operation_lease("malloc"):
+            if self.level == 2:
+                assert self._chip_worker is not None
+                return self._chip_worker.malloc(size)
+            self._check_chip_worker_id(worker_id)
+            assert self._orch is not None
+            return self._orch.malloc(worker_id, size)
 
     def free(self, ptr: int, worker_id: int = 0) -> None:
         """Free memory allocated by ``malloc()``."""
-        if self.level == 2:
-            assert self._chip_worker is not None
-            self._chip_worker.free(ptr)
-            return
-        self._check_chip_worker_id(worker_id)
-        assert self._orch is not None
-        self._orch.free(worker_id, ptr)
+        with self._operation_lease("free"):
+            if self.level == 2:
+                assert self._chip_worker is not None
+                self._chip_worker.free(ptr)
+                return
+            self._check_chip_worker_id(worker_id)
+            assert self._orch is not None
+            self._orch.free(worker_id, ptr)
 
     def copy_to(self, dst: int, src: int, size: int, worker_id: int = 0) -> None:
         """Copy *size* bytes from host *src* to chip worker *dst*."""
-        if self.level == 2:
-            assert self._chip_worker is not None
-            self._chip_worker.copy_to(dst, src, size)
-            return
-        self._check_chip_worker_id(worker_id)
-        assert self._orch is not None
-        self._orch.copy_to(worker_id, dst, src, size)
+        with self._operation_lease("copy_to"):
+            if self.level == 2:
+                assert self._chip_worker is not None
+                self._chip_worker.copy_to(dst, src, size)
+                return
+            self._check_chip_worker_id(worker_id)
+            assert self._orch is not None
+            self._orch.copy_to(worker_id, dst, src, size)
 
     def copy_from(self, dst: int, src: int, size: int, worker_id: int = 0) -> None:
         """Copy *size* bytes from chip worker *src* to host *dst*."""
-        if self.level == 2:
-            assert self._chip_worker is not None
-            self._chip_worker.copy_from(dst, src, size)
-            return
-        self._check_chip_worker_id(worker_id)
-        assert self._orch is not None
-        self._orch.copy_from(worker_id, dst, src, size)
+        with self._operation_lease("copy_from"):
+            if self.level == 2:
+                assert self._chip_worker is not None
+                self._chip_worker.copy_from(dst, src, size)
+                return
+            self._check_chip_worker_id(worker_id)
+            assert self._orch is not None
+            self._orch.copy_from(worker_id, dst, src, size)
 
     # ------------------------------------------------------------------
     # Post-fork zero-copy host buffers
@@ -4625,8 +5004,10 @@ class Worker:
         """
         if self.level < 3:
             raise TypeError("create_host_buffer requires a level >= 3 Worker")
-        if not self._initialized:
-            raise RuntimeError("create_host_buffer requires Worker.init() before allocation")
+        with self._operation_lease("create_host_buffer"):
+            return self._create_host_buffer_locked(int(nbytes))
+
+    def _create_host_buffer_locked(self, nbytes: int) -> HostBuffer:
         # A born-shared buffer is mapped into every direct process child (chip
         # and sub alike, via _broadcast_host_control). Only a truly childless L3
         # has nowhere to attach it.
@@ -4636,7 +5017,6 @@ class Worker:
             )
         assert self._worker is not None
 
-        nbytes = int(nbytes)
         if nbytes <= 0:
             raise ValueError("create_host_buffer: nbytes must be positive")
 
@@ -4717,6 +5097,10 @@ class Worker:
         """
         if not isinstance(handle, HostBuffer):
             raise TypeError("free_host_buffer expects a HostBuffer from create_host_buffer")
+        with self._operation_lease("free_host_buffer"):
+            self._free_host_buffer_locked(handle)
+
+    def _free_host_buffer_locked(self, handle: HostBuffer) -> None:
         with self._registry_lock:
             entry = self._host_buf_registry.get(handle.data_ptr)
             if entry is None or entry.token != handle.token:
@@ -4725,7 +5109,10 @@ class Worker:
             self._rebuild_host_buf_snapshot()
         errors: list[str] = []
         try:
-            if self._worker is not None and getattr(self, "_hierarchical_started", False):
+            # Gate on resource presence, not lifecycle: the child mailboxes are
+            # driveable whenever the C++ _worker is up — including during close()
+            # teardown (CLOSED), when the children are still alive to unmap.
+            if self._worker is not None:
                 errors = self._broadcast_host_unmap(entry.token)
         except Exception as exc:  # noqa: BLE001
             errors = [str(exc)]
@@ -4765,27 +5152,30 @@ class Worker:
         return warn
 
     def _release_all_host_buffers(self) -> None:
-        """Unmap + free every still-registered host buffer (called from close())."""
+        """Unmap + free every still-registered host buffer (called from close()).
+
+        Per-buffer best-effort: every buffer's shm is closed even if its unmap
+        broadcast (or a prior buffer) fails, so one failure never strands the
+        rest; the first error is raised after all are attempted so close()
+        reports the leak rather than swallowing it to stderr."""
         with self._registry_lock:
             entries = list(self._host_buf_registry.values())
             self._host_buf_registry.clear()
             self._rebuild_host_buf_snapshot()
+        errors: list[BaseException] = []
         for entry in entries:
             try:
-                if self._worker is not None and getattr(self, "_hierarchical_started", False):
-                    self._broadcast_host_unmap(entry.token)
-            except Exception as exc:  # noqa: BLE001
-                # A failed unmap broadcast must not strand the parent shm; log it
-                # (mirrors free_host_buffer) instead of swallowing silently.
-                sys.stderr.write(
-                    f"[worker pid={os.getpid()}] WARN: close() UNMAP_HOST token={entry.token} "
-                    f"failed (continuing best-effort): {exc}\n"
-                )
-                sys.stderr.flush()
-            finally:
-                # Tolerates a still-live view over a zero-copy buffer at close():
-                # unlinks the name regardless so the OS reclaims it once dropped.
-                self._close_host_shm(entry)
+                try:
+                    if self._worker is not None:  # resource presence, not lifecycle (see _close_host_shm)
+                        self._broadcast_host_unmap(entry.token)
+                finally:
+                    # Tolerates a still-live view over a zero-copy buffer at close():
+                    # unlinks the name regardless so the OS reclaims it once dropped.
+                    self._close_host_shm(entry)
+            except BaseException as exc:  # noqa: BLE001
+                errors.append(exc)
+        if errors:
+            raise errors[0]
 
     def _broadcast_host_unmap(self, token: int) -> list[str]:
         """Broadcast _CTRL_UNMAP_HOST for ``token`` to every local L3 child."""
@@ -4906,7 +5296,10 @@ class Worker:
         with ``simpler_setup.tools.strace_timing`` (see
         ``docs/dfx/host-trace.md``).
         """
-        assert self._initialized, "Worker not initialized; call init() first"
+        with self._operation_lease("run"):
+            self._run_locked(callable, args, config)
+
+    def _run_locked(self, callable, args, config) -> None:
         cfg = config if config is not None else CallConfig()
 
         if self.level == 2:
@@ -4990,102 +5383,390 @@ class Worker:
     # close
     # ------------------------------------------------------------------
 
-    def close(self) -> None:  # noqa: PLR0912 -- parallel teardown for _worker + sub/chip/next/bootstrap shms with ordering constraints documented inline
-        # A close() that races an in-progress init() must not no-op on the still
-        # -false _initialized flag and leave the epoch's tree running: wait for
-        # the epoch to reach READY (then tear it down) or FAILED (already rolled
-        # back by init()).
-        with self._hierarchical_start_cv:
-            while self._hierarchical_start_state == "starting":
-                self._hierarchical_start_cv.wait()
-        if not self._initialized:
-            return
+    def _has_native_tree(self) -> bool:
+        """A device-bound native object (ChipWorker / _Worker) is live."""
+        return self._worker is not None or self._chip_worker is not None
 
-        # Release any orch-allocated CommDomain handles before tearing down
-        # the C++ scheduler.  Once `dw.close()` runs, the chip mailboxes
-        # become unusable and we can no longer drive CTRL_RELEASE_DOMAIN.
-        self._cleanup_l3_l2_regions()
+    def _has_live_resources(self) -> bool:
+        """Any teardown-owned resource is still present. close() reads this once,
+        to decide whether the first (and only) teardown needs to run — it is NOT
+        a retry gate; teardown is terminal (see close()). Covers the native tree,
+        child pids/shms, L3-L2 regions, live CommDomains, host buffers, and
+        pending remote frees/import-releases."""
+        return (
+            self._has_native_tree()
+            or bool(self._sub_pids or self._chip_pids or self._next_level_pids)
+            or bool(self._sub_shms or self._chip_shms or self._next_level_shms)
+            or bool(self._live_l3_l2_regions)
+            or bool(self._live_domains)
+            or bool(self._host_buf_registry)
+            or bool(self._pending_remote_buffer_frees or self._pending_remote_import_releases)
+        )
+
+    def _describe_live_resources(self) -> str:
+        """One-line inventory of the resource categories still present, for the
+        terminal-close error synthesized when teardown leaves a residual."""
+        parts: list[str] = []
+        if self._has_native_tree():
+            parts.append("native tree")
+        n_pids = len(self._sub_pids) + len(self._chip_pids) + len(self._next_level_pids)
+        if n_pids:
+            parts.append(f"{n_pids} child pid(s)")
+        n_shms = len(self._sub_shms) + len(self._chip_shms) + len(self._next_level_shms)
+        if n_shms:
+            parts.append(f"{n_shms} child shm(s)")
+        if self._live_l3_l2_regions:
+            parts.append(f"{len(self._live_l3_l2_regions)} L3-L2 region(s)")
         if self._live_domains:
-            self._release_all_live_domains()
-        try:
-            self._release_active_remote_slot_refs()
-            self._flush_pending_remote_frees()
-        except BaseException as exc:  # noqa: BLE001
-            sys.stderr.write(f"Worker.close(): remote buffer cleanup reported error (continuing): {exc}\n")
-            sys.stderr.flush()
+            parts.append(f"{len(self._live_domains)} comm domain(s)")
+        if self._host_buf_registry:
+            parts.append(f"{len(self._host_buf_registry)} host buffer(s)")
+        n_remote = len(self._pending_remote_buffer_frees) + len(self._pending_remote_import_releases)
+        if n_remote:
+            parts.append(f"{n_remote} pending remote free(s)")
+        return ", ".join(parts) if parts else "(none)"
 
-        # Release any host buffers the user never unregistered. Must run while
-        # the local L3 child mailboxes are still usable (before _worker.close()).
-        self._release_all_host_buffers()
+    def close(self) -> None:  # noqa: PLR0912, PLR0915 -- lifecycle linearization: reentrancy / init-guard / join / owner / claim / drain / teardown
+        # close() is a permanent commitment against a resource, not a reversible
+        # attempt: it publishes CLOSED atomically (the sole public admission
+        # fence — the leased live-tree APIs are rejected once CLOSED) and NEVER
+        # reverts to READY. Contract:
+        #   - reentrant close() (from inside a leased op) is rejected;
+        #   - close() while init() is INITIALIZING fails fast — this worker does
+        #     not cancel an in-progress init; wait for READY or FAILED;
+        #   - a concurrent close() joins the in-flight attempt and observes its
+        #     result; the same worker's teardown never runs twice at once;
+        #   - teardown is single-shot and TERMINAL: once it runs, an un-reclaimed
+        #     resource leaks and a later close() re-raises the same result — it
+        #     never re-drives a half-torn tree. Only a drain-timeout (teardown
+        #     un-attempted, tree intact) lets a later close() retry once the
+        #     in-flight op finishes; a tree with a live op is never torn down;
+        #   - native teardown runs only on the init-owner thread (device-bound).
+        # `attempt` is None until the claim installs it. The pre-claim checks
+        # raise/return before that, so the finally skips completion for them. From
+        # the claim on, the attempt is completed in an innermost resilient finally
+        # whose only work is three plain attribute assigns (`error`, `incomplete`,
+        # then `done`) followed by a locked `notify_all()`. Every fallible step —
+        # drain, teardown, residual synthesis, registry detach — runs before it
+        # and folds its error into `result`. `done` is set BEFORE the CV acquire,
+        # so an async BaseException in the (interruptible) acquire or the notify
+        # cannot strand a joiner — the joiner's bounded re-check recovers a
+        # skipped notify. The only irreducible window is an async exception landing
+        # between the `error`/`incomplete` and `done` plain assigns.
+        attempt: _CloseAttempt | None = None
+        result: BaseException | None = None
+        teardown_tree = False
+        try:
+            with self._hierarchical_start_cv:
+                if threading.get_ident() in self._lease_depth:
+                    raise RuntimeError(
+                        "Worker.close(): cannot be called from within a run() / create_host_buffer() "
+                        "operation on this thread"
+                    )
+                if self._lifecycle is _Lifecycle.INITIALIZING:
+                    raise RuntimeError(
+                        "Worker.close(): cannot close while init() is in progress; "
+                        "wait for the worker to reach READY or FAILED first"
+                    )
+                # A caller that WAITS on an in-flight attempt must always resolve
+                # against THAT attempt — never re-read _close_completion (a
+                # successor may already be installed) and never start a retry
+                # (that would race the owner's own retry into a concurrent
+                # teardown). Only a fresh entry (below) may retry a drain-timeout.
+                joined = self._close_completion
+                if joined is not None and not joined.done:
+                    # Bounded re-check so a skipped notify (async exception
+                    # between publishing `done` and notify_all()) cannot block a
+                    # joiner forever — it re-observes `done` within the interval.
+                    while not joined.done:
+                        self._hierarchical_start_cv.wait(timeout=_CLOSE_JOIN_RECHECK_S)
+                    if joined.error is not None:
+                        raise joined.error
+                    return
+                # Fresh entry: the last attempt (if any) is already resolved. A
+                # terminal result (teardown ran, or nothing to tear down)
+                # replays; only a drain-timeout — teardown un-attempted, tree
+                # intact — may be retried by this call.
+                prior = self._close_completion
+                if prior is not None and prior.done and (self._teardown_attempted or prior.error is None):
+                    if prior.error is not None:
+                        raise prior.error
+                    return
+                # A device-bound native object must be finalized on the init-owner
+                # thread — always, even after that thread has exited (affinity
+                # does not transfer). NEW/FAILED/reclaimed-CLOSED have none.
+                owner = self._init_owner_thread
+                if self._has_native_tree() and owner is not None and owner is not threading.current_thread():
+                    raise RuntimeError(
+                        "Worker.close(): a worker with a live native tree must be closed on the thread that "
+                        "init()'d it (native teardown is thread-bound)"
+                    )
+                # Claim: publish CLOSED (permanent admission fence) and install a
+                # fresh teardown attempt.
+                self._lifecycle = _Lifecycle.CLOSED
+                attempt = _CloseAttempt()
+                self._close_completion = attempt
+                self._hierarchical_start_cv.notify_all()
+                # Drain in-flight leases before touching the tree. CLOSED already
+                # rejects new leases; a tree with a live op is never torn down.
+                # If an op outlives the budget, teardown stays UN-attempted and
+                # the tree intact so a later close() can retry once it drains —
+                # the one retryable close() path.
+                if self._active_ops > 0:
+                    drain_deadline = time.monotonic() + _ROLLBACK_GRACEFUL_TIMEOUT_S
+                    while self._active_ops > 0:
+                        remaining = drain_deadline - time.monotonic()
+                        if remaining <= 0:
+                            break
+                        self._hierarchical_start_cv.wait(timeout=remaining)
+                    if self._active_ops > 0:
+                        result = TimeoutError(
+                            "Worker.close(): operation(s) still in flight after the cleanup budget "
+                            f"({_ROLLBACK_GRACEFUL_TIMEOUT_S}s); teardown deferred (worker stays CLOSED)"
+                        )
+                if result is None:
+                    teardown_tree = self._has_live_resources()
+                    # Latch terminal: once we commit to teardown no later close()
+                    # re-drives it, whatever the outcome.
+                    if teardown_tree:
+                        self._teardown_attempted = True
+            if teardown_tree:
+                self._teardown_ready_tree()
+        except BaseException as exc:  # noqa: BLE001
+            if result is None:
+                result = exc
+        finally:
+            if attempt is not None:
+                had_live = True  # conservative default if a read below is interrupted
+                detached_registry: tuple[dict, dict, dict] | None = None
+                try:
+                    had_live = self._has_live_resources()
+                    # Terminal teardown is single-shot and best-effort: a resource
+                    # it could not reclaim LEAKS. Never return success with a
+                    # residual — if teardown ran and left something behind without
+                    # itself raising, synthesize a terminal error.
+                    if teardown_tree and result is None and had_live:
+                        result = RuntimeError(
+                            "Worker.close(): teardown left resources un-reclaimed (leaked): "
+                            f"{self._describe_live_resources()}"
+                        )
+                    # Detach the user-callable registries for every terminal close
+                    # (including a NEW/FAILED worker with no native tree) — only a
+                    # drain-timeout / mid-drain interrupt (teardown un-attempted)
+                    # keeps them for the retry. Swap to a local under the lock;
+                    # its refs are released after completion, outside the lock. A
+                    # detach failure folds into `result` so every observer of this
+                    # attempt sees the SAME outcome — never one success + one error.
+                    if not (result is not None and not self._teardown_attempted):
+                        with self._registry_lock:
+                            detached_registry = (
+                                self._callable_registry,
+                                self._identity_registry,
+                                self._live_handles,
+                            )
+                            self._callable_registry = {}
+                            self._identity_registry = {}
+                            self._live_handles = {}
+                except BaseException as exc:  # noqa: BLE001
+                    if result is None:
+                        result = exc
+                finally:
+                    # Innermost, resilient publish: all plain attribute assigns
+                    # (error/incomplete first, then `done`), so a joiner that
+                    # observes `done` always observes the result. `done` is set
+                    # BEFORE acquiring the CV — the only remaining work under the
+                    # lock is notify_all(). A BaseException during the
+                    # (interruptible, possibly-blocking) CV acquire therefore
+                    # cannot strand the attempt at done=False; a joiner's bounded
+                    # re-check then recovers the skipped notify on its own.
+                    attempt.error = result
+                    attempt.incomplete = result is not None or had_live
+                    attempt.done = True
+                    with self._hierarchical_start_cv:
+                        self._hierarchical_start_cv.notify_all()
+                # Post-completion, lock-free: dropping the last refs may run a
+                # callable __del__ (which can reenter close()); the attempt is
+                # already done, so the reentrant close() resolves against it
+                # instead of self-deadlocking.
+                del detached_registry
+        if result is not None:
+            raise result
+
+    @staticmethod
+    def _broadcast_child_shutdown(shms: list[SharedMemory]) -> None:
+        """Store _SHUTDOWN into every child mailbox in one group (next-level
+        children trigger ``inner_worker.close()``; chip/sub children exit their
+        serve loop). The first store error is raised after all are attempted."""
+        errors: list[BaseException] = []
+        for shm in shms:
+            try:
+                buf = shm.buf
+                if buf is not None:
+                    _mailbox_store_i32(_buffer_field_addr(buf, _OFF_STATE), _SHUTDOWN)
+            except BaseException as exc:  # noqa: BLE001
+                errors.append(exc)
+        if errors:
+            raise errors[0]
+
+    @staticmethod
+    def _reap_child_groups(  # noqa: PLR0912 -- interleaved reap across groups / bounded poll / conditional shm-free
+        groups: list[tuple[list[SharedMemory], list[int]]], deadline: float
+    ) -> None:
+        """Reap + free every child across ALL groups within one shared deadline.
+
+        SHUTDOWN must already have been broadcast to every group (see
+        ``_broadcast_child_shutdown``): this polls every still-pending pid from
+        every group each round, so a child wedged in one group never starves the
+        reap of healthy children in another (the serial-per-group variant let the
+        first stuck group burn the whole budget and left later groups as
+        one-poll survivors). ``pids[i]`` pairs with ``shms[i]``; a shm is freed
+        ONLY once its pid is reaped (freeing a live child's mailbox is a
+        use-after-free), so a survivor keeps BOTH. Teardown is terminal — a
+        survivor LEAKS and is reported as an error so close() never returns
+        success while a child is alive; an abnormal exit (signal / non-zero code)
+        is likewise reported. The first error is raised after every child is
+        attempted.
+        """
+        errors: list[BaseException] = []
+        bad_exits: list[str] = []
+        # Flat (group, index) work-list over the reap-eligible pairs.
+        pending: list[tuple[int, int]] = [
+            (g, i) for g, (shms, pids) in enumerate(groups) for i in range(min(len(shms), len(pids)))
+        ]
+        reaped: set[tuple[int, int]] = set()
+        while pending:
+            still: list[tuple[int, int]] = []
+            for g, i in pending:
+                _shms, pids = groups[g]
+                try:
+                    wpid, status = os.waitpid(pids[i], os.WNOHANG)
+                except ChildProcessError:
+                    reaped.add((g, i))
+                    continue
+                except BaseException as exc:  # noqa: BLE001
+                    errors.append(exc)
+                    continue  # leave un-reaped (kept below)
+                if wpid != 0:
+                    reaped.add((g, i))
+                    if os.WIFSIGNALED(status):
+                        bad_exits.append(f"pid {pids[i]} killed by signal {os.WTERMSIG(status)}")
+                    elif os.WIFEXITED(status) and os.WEXITSTATUS(status) != 0:
+                        bad_exits.append(f"pid {pids[i]} exited with code {os.WEXITSTATUS(status)}")
+                else:
+                    still.append((g, i))
+            pending = still
+            if pending and time.monotonic() <= deadline:
+                time.sleep(_STARTUP_POLL_INTERVAL_S)
+            else:
+                break
+        survivors: list[int] = []
+        for g, (shms, pids) in enumerate(groups):
+            n = min(len(shms), len(pids))
+            keep_pids: list[int] = []
+            keep_shms: list[SharedMemory] = []
+            for i in range(n):
+                if (g, i) not in reaped:
+                    survivors.append(pids[i])
+                    keep_pids.append(pids[i])
+                    keep_shms.append(shms[i])
+                    continue
+                try:
+                    shms[i].close()
+                    try:
+                        shms[i].unlink()
+                    except FileNotFoundError:
+                        pass
+                except BaseException as exc:  # noqa: BLE001
+                    errors.append(exc)
+                    keep_shms.append(shms[i])  # shm survives; its pid is already gone
+            pids[:] = keep_pids + pids[n:]
+            shms[:] = keep_shms + shms[n:]
+        if survivors:
+            errors.append(TimeoutError(f"child process(es) {survivors} did not exit within the close budget"))
+        for msg in bad_exits:
+            errors.append(RuntimeError(f"child teardown: {msg}"))
+        if errors:
+            raise errors[0]
+
+    def _teardown_ready_tree(self) -> None:
+        """Tear down the worker's live tree. Called only from close() after it
+        has published CLOSED and drained the leased ops, so no leased operation
+        is in flight. (register / unregister are not yet lease-fenced against
+        close — see the deferred admission item — so a racing register broadcast
+        is possible; that gap is out of this PR's scope.)
+
+        Best-effort and error-accumulating: every step runs even if an earlier
+        one raised, so one failing resource never strands the rest. Teardown is
+        terminal — an un-reclaimed resource LEAKS (it is not retried) and the
+        first collected error is re-raised after all steps complete so the leak
+        surfaces to the caller. The child-reap grace starts only after SHUTDOWN
+        has been broadcast to every group (below), not at teardown entry, so the
+        (potentially blocking) pre-child cleanup cannot consume it and reduce the
+        reap to a single poll.
+        """
+        errors: list[BaseException] = []
+
+        def _step(fn) -> None:
+            try:
+                fn()
+            except BaseException as exc:  # noqa: BLE001
+                errors.append(exc)
+
+        # Release any orch-allocated CommDomain handles before tearing down the
+        # C++ scheduler: once `dw.close()` runs the chip mailboxes are unusable
+        # and we can no longer drive CTRL_RELEASE_DOMAIN.
+        _step(self._cleanup_l3_l2_regions)
+        if self._live_domains:
+            _step(self._release_all_live_domains)
+        _step(self._release_active_remote_slot_refs)
+        _step(self._flush_pending_remote_frees)
+        # Host buffers must be released while the local L3 child mailboxes are
+        # still usable (before _worker.close()).
+        _step(self._release_all_host_buffers)
 
         if self.level == 2:
-            if self._chip_worker:
-                self._chip_worker.finalize()
-                self._chip_worker = None
+
+            def _finalize_chip() -> None:
+                if self._chip_worker:
+                    self._chip_worker.finalize()
+                    self._chip_worker = None
+
+            _step(_finalize_chip)
         else:
-            if self._worker:
-                self._worker.close()
-                self._worker = None
-                self._orch = None
 
-            # Shutdown SubWorker processes: write SHUTDOWN to each mailbox,
-            # then waitpid + free shm.
-            for shm in self._sub_shms:
-                buf = shm.buf
-                assert buf is not None
-                _mailbox_store_i32(_buffer_field_addr(buf, _OFF_STATE), _SHUTDOWN)
-            for pid in self._sub_pids:
-                os.waitpid(pid, 0)
-            for shm in self._sub_shms:
-                shm.close()
-                shm.unlink()
+            def _close_worker() -> None:
+                if self._worker:
+                    self._worker.close()
+                    self._worker = None
+                    self._orch = None
 
-            # Shutdown ChipWorker processes: same pattern.
-            for shm in self._chip_shms:
-                buf = shm.buf
-                assert buf is not None
-                _mailbox_store_i32(_buffer_field_addr(buf, _OFF_STATE), _SHUTDOWN)
-            for pid in self._chip_pids:
-                os.waitpid(pid, 0)
-            for shm in self._chip_shms:
-                shm.close()
-                shm.unlink()
+            _step(_close_worker)
+            # Two-phase child shutdown: broadcast SHUTDOWN to EVERY group first,
+            # then reap all groups together within the shared deadline. Sending
+            # SHUTDOWN per-group-then-reap (serial) let a stuck child in the first
+            # group burn the whole budget, so later healthy children — SHUTDOWN
+            # late — got a single WNOHANG poll and became permanent survivors.
+            groups = [
+                (self._sub_shms, self._sub_pids),
+                (self._chip_shms, self._chip_pids),
+                (self._next_level_shms, self._next_level_pids),
+            ]
+            for shms, _pids in groups:
+                _step(lambda shms=shms: self._broadcast_child_shutdown(shms))
+            # Grace starts NOW, once SHUTDOWN is delivered to every group — not at
+            # teardown entry — so the (blocking) pre-child cleanup above cannot
+            # eat it. Reap removes reclaimed pids/shms in place; a surviving child
+            # is left in place and reported as an error (terminal, not retried).
+            reap_deadline = time.monotonic() + _ROLLBACK_GRACEFUL_TIMEOUT_S
+            _step(lambda: self._reap_child_groups(groups, reap_deadline))
+            _step(self._close_l3_l2_orch_comm)
+            # Drop next-level worker refs only once their pids/shms are reclaimed.
+            if not self._next_level_pids and not self._next_level_shms:
+                self._next_level_workers.clear()
+                self._next_level_worker_ids.clear()
 
-            # Shutdown next-level Worker children (L4+): SHUTDOWN triggers
-            # _child_worker_loop to call inner_worker.close() before exiting.
-            for shm in self._next_level_shms:
-                buf = shm.buf
-                assert buf is not None
-                _mailbox_store_i32(_buffer_field_addr(buf, _OFF_STATE), _SHUTDOWN)
-            for pid in self._next_level_pids:
-                os.waitpid(pid, 0)
-            for shm in self._next_level_shms:
-                shm.close()
-                shm.unlink()
-
-            self._close_l3_l2_orch_comm()
-            self._sub_shms.clear()
-            self._sub_pids.clear()
-            self._chip_shms.clear()
-            self._chip_pids.clear()
-            self._next_level_shms.clear()
-            self._next_level_pids.clear()
-            self._next_level_workers.clear()
-            self._next_level_worker_ids.clear()
-
-        # Drop the Worker-held references to registered callables. These dicts
-        # pin ChipCallable/CoreCallable nanobind instances (and, via identity
-        # state, their payloads); if a closed Worker is kept alive past
-        # interpreter exit — e.g. a failing test's traceback pins the frame's
-        # `worker` local — any surviving instance prevents nanobind from
-        # unloading its module and triggers a leak dump at shutdown. Guard with
-        # _registry_lock, mirroring every other mutation of these three dicts.
-        with self._registry_lock:
-            self._callable_registry.clear()
-            self._identity_registry.clear()
-            self._live_handles.clear()
-
-        self._initialized = False
+        if errors:
+            raise errors[0]
 
     def __enter__(self) -> Worker:
         return self

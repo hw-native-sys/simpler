@@ -157,8 +157,7 @@ def _make_started_sim_worker() -> tuple[Worker, SharedMemory, _FakeDirectCWorker
     assert shm.buf is not None
     _mailbox_store_i32(_buffer_field_addr(shm.buf, _OFF_STATE), _IDLE)
     fake_c_worker = _FakeDirectCWorker()
-    worker._initialized = True
-    worker._hierarchical_started = True
+    worker._lifecycle = worker_module._Lifecycle.READY
     worker._worker = fake_c_worker
     worker._chip_shms = [shm]
     return worker, shm, fake_c_worker
@@ -173,8 +172,7 @@ def _make_started_onboard_worker(platform: str = "a2a3") -> tuple[Worker, Shared
         access_profile=int(l3_l2_orch_comm.L3L2RegionAccessProfile.ONBOARD_VMM),
         device_id=2,
     )
-    worker._initialized = True
-    worker._hierarchical_started = True
+    worker._lifecycle = worker_module._Lifecycle.READY
     worker._worker = fake_c_worker
     worker._chip_shms = [shm]
     return worker, shm, fake_c_worker

@@ -413,7 +413,11 @@ inline void bind_worker(nb::module_ &m) {
             "Register a REMOTE_L3 endpoint after the session reports HELLO READY."
         )
 
-        .def("init", &Worker::init, "Start the Scheduler thread.")
+        // Release the GIL while starting the Scheduler thread so another Python
+        // thread can run during it — e.g. a concurrent close() observing
+        // INITIALIZING and failing fast. init/close remain same-thread-only
+        // (enforced by Worker.close()).
+        .def("init", &Worker::init, nb::call_guard<nb::gil_scoped_release>(), "Start the Scheduler thread.")
         .def("close", &Worker::close, "Stop the Scheduler thread.")
 
         .def(

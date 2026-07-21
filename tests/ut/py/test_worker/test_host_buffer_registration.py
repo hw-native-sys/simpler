@@ -122,8 +122,7 @@ def test_host_buffer_control_reaches_l3_sub_workers():
             return []
 
     worker = Worker(level=3)
-    worker._initialized = True
-    worker._hierarchical_started = True
+    worker._lifecycle = worker_mod._Lifecycle.READY
     worker._chip_shms = [None]
     worker._worker = FakeWorker()
     worker._start_hierarchical = lambda: None
@@ -260,8 +259,9 @@ class TestCreateHostBufferChildPrecondition:
             w.close()
 
     def test_childless_l3_rejects_create_host_buffer(self):
+        # No callable registered: a childless L3 with a pre-registered callable
+        # is rejected earlier, at init() (see TestEligibleTargetPrecheck).
         w = Worker(level=3, num_sub_workers=0)
-        w.register(lambda args: None)
         w.init()
         try:
             with pytest.raises(RuntimeError, match="at least one forked chip or sub child"):

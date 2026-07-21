@@ -243,8 +243,7 @@ def _make_orchestrator() -> tuple[Orchestrator, Worker, SharedMemory, _FakeClien
         (l3_l2_orch_comm, "_l3_host_mapped_counter_wait", l3_l2_orch_comm._l3_host_mapped_counter_wait),
         (l3_l2_orch_comm, "_l3_host_mapped_region_close", l3_l2_orch_comm._l3_host_mapped_region_close),
     ]
-    worker._initialized = True
-    worker._hierarchical_started = True
+    worker._lifecycle = worker_module._Lifecycle.READY
     worker._worker = _FakeCWorker()
     worker._chip_shms = [shm]
     worker._l3_l2_test_fake_client = fake_client
