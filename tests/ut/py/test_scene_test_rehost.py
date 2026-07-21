@@ -17,12 +17,13 @@ partial-construction rollback, and non-contiguous rejection.
 
 from __future__ import annotations
 
+import ctypes
 from multiprocessing.shared_memory import SharedMemory
 
 import pytest
 import torch
 
-from simpler_setup.scene_test import TaskArgsBuilder, Tensor, _RehostedTaskArgs
+from simpler_setup.scene_test import Scalar, TaskArgsBuilder, Tensor, _RehostedTaskArgs
 
 
 class _FakeHostBuffer:
@@ -130,3 +131,85 @@ def test_rehost_rejects_noncontiguous():
     # Rejected before any allocation — nothing to leak.
     assert w.created == []
     assert w.freed == []
+
+
+# ---------------------------------------------------------------------------
+# TaskArgsBuilder duplicate-name fail-fast
+# ---------------------------------------------------------------------------
+
+
+def test_builder_constructor_rejects_duplicate_tensor():
+    with pytest.raises(ValueError, match="duplicate argument name 'a'"):
+        TaskArgsBuilder(
+            Tensor("a", torch.zeros(4)),
+            Tensor("a", torch.ones(4)),
+        )
+
+
+def test_builder_constructor_rejects_tensor_scalar_name_clash():
+    with pytest.raises(ValueError, match="duplicate argument name 'x'"):
+        TaskArgsBuilder(
+            Tensor("x", torch.zeros(4)),
+            Scalar("x", ctypes.c_float(1.0)),
+        )
+
+
+def test_builder_rejects_name_shadowing_builder_attribute():
+    # A name that resolves to a real attribute/method would shadow it, so
+    # `args.specs` returns the property instead of the argument. Reject it.
+    with pytest.raises(ValueError, match="conflicts with builder attributes/methods"):
+        TaskArgsBuilder(Tensor("specs", torch.zeros(4)))
+    with pytest.raises(ValueError, match="conflicts with builder attributes/methods"):
+        TaskArgsBuilder(Scalar("clone", ctypes.c_int64(1)))
+    # A name that is not a builder member is still accepted.
+    ta = TaskArgsBuilder(Tensor("value", torch.zeros(4)))
+    assert torch.equal(ta.value, torch.zeros(4))
+
+
+def test_builder_incremental_add_rejects_duplicate():
+    ta = TaskArgsBuilder(Tensor("a", torch.zeros(4)))
+    with pytest.raises(ValueError, match="duplicate argument name 'a'"):
+        ta.add_tensor("a", torch.ones(4))
+
+
+def test_builder_duplicate_scalar_leaves_state_unchanged():
+    # A rejected duplicate scalar must not flip `_has_scalar`, so a legal tensor
+    # can still be added afterwards (tensor-before-scalar ordering intact).
+    ta = TaskArgsBuilder(Tensor("a", torch.zeros(4)))
+    ta.add_scalar("s", ctypes.c_int64(7))
+    with pytest.raises(ValueError, match="duplicate argument name 's'"):
+        ta.add_scalar("s", ctypes.c_int64(9))
+    # State unchanged: names, order, and stored values are exactly as before.
+    assert [s.name for s in ta.specs] == ["a", "s"]
+    assert ta.s.value == 7
+
+    # A rejected duplicate scalar must not set `_has_scalar` before the check,
+    # or the tensor-before-scalar guard would spuriously block a later legal
+    # tensor. Fresh tensor-only builder → reject a name-clashing scalar → a
+    # subsequent add_tensor must still succeed. (Catches moving the
+    # `_has_scalar = True` assignment ahead of the duplicate check.)
+    tb = TaskArgsBuilder(Tensor("a", torch.zeros(4)))
+    orig_a = tb.a
+    with pytest.raises(ValueError, match="duplicate argument name 'a'"):
+        tb.add_scalar("a", ctypes.c_int64(3))
+    tb.add_tensor("b", torch.ones(4))
+    assert [s.name for s in tb.specs] == ["a", "b"]
+    assert tb.a is orig_a
+
+
+def test_builder_valid_args_order_named_access_and_clone():
+    ta = TaskArgsBuilder(
+        Tensor("a", torch.arange(4, dtype=torch.float32)),
+        Tensor("b", torch.ones(4, dtype=torch.float32)),
+        Scalar("scale", ctypes.c_float(1.5)),
+    )
+    assert [s.name for s in ta.specs] == ["a", "b", "scale"]
+    assert torch.equal(ta.a, torch.arange(4, dtype=torch.float32))
+    assert ta.scale.value == 1.5
+
+    clone = ta.clone()
+    assert [s.name for s in clone.specs] == ["a", "b", "scale"]
+    assert torch.equal(clone.a, torch.arange(4, dtype=torch.float32))
+    # Clone is deep: mutating the clone does not touch the original.
+    clone.a.copy_(torch.full((4,), 9.0))
+    assert torch.equal(ta.a, torch.arange(4, dtype=torch.float32))

@@ -115,15 +115,31 @@ class TaskArgsBuilder:
         self._add_scalar(Scalar(name, value))
 
     def _add_tensor(self, spec: Tensor) -> None:
+        # Names are this container's lookup keys, so reject a bad name before any
+        # mutation — a rejected add leaves the builder untouched.
+        self._reject_bad_name(spec.name)
         if self._has_scalar:
             raise ValueError("Cannot add tensor after scalar (tensor-before-scalar ordering required)")
         self._specs.append(spec)
         self._data[spec.name] = spec.value
 
     def _add_scalar(self, spec: Scalar) -> None:
+        self._reject_bad_name(spec.name)
         self._has_scalar = True
         self._specs.append(spec)
         self._data[spec.name] = spec.value
+
+    def _reject_bad_name(self, name: str) -> None:
+        # A name already stored duplicates an argument. A name that resolves to a
+        # real attribute (the `specs`/`clone`/`tensor_names`/`add_*` members)
+        # would shadow that member: `__getattr__` only fires on lookup miss, so
+        # `args.<name>` would return the member, not the argument value. Reject
+        # both — names must be unique across tensors and scalars and must not
+        # collide with the container's own surface.
+        if name in self._data:
+            raise ValueError(f"TaskArgsBuilder: duplicate argument name {name!r}")
+        if hasattr(self, name):
+            raise ValueError(f"TaskArgsBuilder: argument name {name!r} conflicts with builder attributes/methods")
 
     def __getattr__(self, name: str) -> Any:
         if name.startswith("_"):
