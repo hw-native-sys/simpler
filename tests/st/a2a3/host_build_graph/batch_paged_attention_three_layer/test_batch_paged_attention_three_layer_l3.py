@@ -24,7 +24,7 @@ from simpler.task_interface import ArgDirection as D
 from simpler_setup import Scalar, SceneTestCase, TaskArgsBuilder, Tensor, scene_test
 from simpler_setup.goldens.paged_attention import compute_golden as _pa_compute_golden
 from simpler_setup.goldens.paged_attention import generate_inputs as _pa_generate_inputs
-from simpler_setup.scene_test import CallableNamespace, _build_l3_task_args, _compare_outputs
+from simpler_setup.scene_test import CallableNamespace, _build_l3_task_args, _compare_outputs, _RehostedTaskArgs
 
 _STREAM_TIMEOUT_S = 30.0
 _CROSS_REQUEST_STAGGER_S = 0.02
@@ -201,65 +201,77 @@ class TestBatchPagedAttentionThreeLayerL3(SceneTestCase):
         goldens = {request_id: request.clone() for request_id, request in requests.items()}
         for golden in goldens.values():
             self.compute_golden(golden, params)
-        config = self._build_config(case["config"])
-        callables = CallableNamespace({**compiled_callables, **sub_handles})
-        request_a_submitted = threading.Event()
-        queues_ready = threading.Event()
-        queues = {}
+        rehosted = []
+        try:
+            for request_id in (_REQUEST_A, _REQUEST_B):
+                rehosted.append(_RehostedTaskArgs(worker, requests[request_id]))
 
-        def request_orch(orch, request, request_id, emitter, cfg):
-            if request_id == _REQUEST_A:
-                for queued_request_id in (_REQUEST_A, _REQUEST_B):
-                    queues[queued_request_id] = orch.create_l3_l2_queue(
-                        worker_id=0, depth=1, input_arena_bytes=64, output_arena_bytes=4096
-                    )
-                queues_ready.set()
-            else:
-                assert queues_ready.wait(_STREAM_TIMEOUT_S)
-            queue = queues[request_id]
-            chip_args, queue, expected_epochs = self._build_submission(callables, request, request_id, queue)
-            orch.submit_next_level(callables.paged_attention, chip_args, cfg, worker=0)
-            if request_id == _REQUEST_A:
-                request_a_submitted.set()
-            self._relay_tokens(queue, request_id, expected_epochs, emitter)
+            config = self._build_config(case["config"])
+            callables = CallableNamespace({**compiled_callables, **sub_handles})
+            request_a_submitted = threading.Event()
+            queues_ready = threading.Event()
+            queues = {}
 
-        def consume(stream, output, errors):
-            try:
-                output.extend(stream)
-            except BaseException as exc:  # noqa: BLE001
-                errors.append(exc)
+            def request_orch(orch, request, request_id, emitter, cfg):
+                if request_id == _REQUEST_A:
+                    for queued_request_id in (_REQUEST_A, _REQUEST_B):
+                        queues[queued_request_id] = orch.create_l3_l2_queue(
+                            worker_id=0, depth=1, input_arena_bytes=64, output_arena_bytes=4096
+                        )
+                    queues_ready.set()
+                else:
+                    assert queues_ready.wait(_STREAM_TIMEOUT_S)
+                queue = queues[request_id]
+                chip_args, queue, expected_epochs = self._build_submission(callables, request, request_id, queue)
+                orch.submit_next_level(callables.paged_attention, chip_args, cfg, worker=0)
+                if request_id == _REQUEST_A:
+                    request_a_submitted.set()
+                self._relay_tokens(queue, request_id, expected_epochs, emitter)
 
-        with worker.open_request_session(request_orch, max_active_runs=2) as session:
-            streams = {
-                _REQUEST_A: session.submit(requests[_REQUEST_A], config=config, request_id=_REQUEST_A),
-            }
-            assert request_a_submitted.wait(_STREAM_TIMEOUT_S)
-            # Place B's Host O behind A's first publication instead of profiling
-            # two simultaneous cold starts.
-            time.sleep(_CROSS_REQUEST_STAGGER_S)
-            streams[_REQUEST_B] = session.submit(requests[_REQUEST_B], config=config, request_id=_REQUEST_B)
-            tokens = {request_id: [] for request_id in streams}
-            errors = []
-            consumers = [
-                threading.Thread(target=consume, args=(stream, tokens[request_id], errors))
-                for request_id, stream in streams.items()
-            ]
-            for consumer in consumers:
-                consumer.start()
-            for consumer in consumers:
-                consumer.join(_STREAM_TIMEOUT_S)
-                assert not consumer.is_alive(), "request stream consumer timed out"
-            if errors:
-                raise errors[0]
+            def consume(stream, output, errors):
+                try:
+                    output.extend(stream)
+                except BaseException as exc:  # noqa: BLE001
+                    errors.append(exc)
 
-        expected_epochs = (int(params["layer_count"]) + int(params["layers_per_epoch"]) - 1) // int(
-            params["layers_per_epoch"]
-        )
-        for request_id in streams:
-            assert [token.token_seq for token in tokens[request_id]] == list(range(1, expected_epochs + 1))
-            _compare_outputs(
-                requests[request_id], goldens[request_id], requests[request_id].tensor_names(), self.RTOL, self.ATOL
+            with worker.open_request_session(request_orch, max_active_runs=2) as session:
+                streams = {
+                    _REQUEST_A: session.submit(requests[_REQUEST_A], config=config, request_id=_REQUEST_A),
+                }
+                assert request_a_submitted.wait(_STREAM_TIMEOUT_S)
+                # Place B's Host O behind A's first publication instead of profiling
+                # two simultaneous cold starts.
+                time.sleep(_CROSS_REQUEST_STAGGER_S)
+                streams[_REQUEST_B] = session.submit(requests[_REQUEST_B], config=config, request_id=_REQUEST_B)
+                tokens = {request_id: [] for request_id in streams}
+                errors = []
+                consumers = [
+                    threading.Thread(target=consume, args=(stream, tokens[request_id], errors))
+                    for request_id, stream in streams.items()
+                ]
+                for consumer in consumers:
+                    consumer.start()
+                for consumer in consumers:
+                    consumer.join(_STREAM_TIMEOUT_S)
+                    assert not consumer.is_alive(), "request stream consumer timed out"
+                if errors:
+                    raise errors[0]
+
+            expected_epochs = (int(params["layer_count"]) + int(params["layers_per_epoch"]) - 1) // int(
+                params["layers_per_epoch"]
             )
+            for request_id in streams:
+                assert [token.token_seq for token in tokens[request_id]] == list(range(1, expected_epochs + 1))
+                _compare_outputs(
+                    requests[request_id],
+                    goldens[request_id],
+                    requests[request_id].tensor_names(),
+                    self.RTOL,
+                    self.ATOL,
+                )
+        finally:
+            for request_buffers in reversed(rehosted):
+                request_buffers.release()
 
     def generate_args(self, params):
         specs = [
