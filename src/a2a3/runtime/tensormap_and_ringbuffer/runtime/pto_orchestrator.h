@@ -69,7 +69,10 @@ struct PTO2OrchestratorState {
 
     // === PER-RING RESOURCES ===
     PTO2RingSet rings[PTO2_MAX_RING_DEPTH];
-    uint32_t *fanin_seen_epoch[PTO2_MAX_RING_DEPTH];
+    // Per-slot dedup record for fanin discovery: high 32 bits = seen epoch,
+    // low 32 bits = builder edge index of the first claim (valid iff the
+    // epoch matches), so duplicate discoveries OR-merge flags in place.
+    uint64_t *fanin_seen_epoch[PTO2_MAX_RING_DEPTH];
     uint32_t fanin_seen_current_epoch{1};
 
     // === TENSOR MAP (Private) ===

@@ -75,6 +75,12 @@ public:
      * multiple times; deps accumulate. Variadic accepts any non-zero number
      * of PTO2TaskId arguments.
      *
+     * Every dep added here is wired WAIT|RETAIN (ordering + producer-output
+     * lifetime) — the only edge kind user code can express. A planned
+     * `add_execution_dep(...)` will cover ordering-only (WAIT) deps for
+     * codegen; RETAIN-only is never user-expressible (reduction artifact
+     * only). See docs/two-kinds-of-dep.md §3.6.
+     *
      * Overflow (more than MAX_DEP_COUNT total) records an error on the
      * underlying Arg; the error surfaces at submit time.
      */

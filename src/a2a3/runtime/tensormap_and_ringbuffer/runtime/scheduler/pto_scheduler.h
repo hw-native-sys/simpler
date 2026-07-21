@@ -896,8 +896,8 @@ struct PTO2SchedulerState {
     // FLAGGED producer `p` publishes blocks (normal dispatch, early-dispatch release, or the
     // sync_start drain), but no-ops until every logical block is launch-visible. Only then
     // does it walk p's fanout and bump each consumer's
-    // dispatch_fanin. A consumer whose dispatch_fanin reaches fanin_actual_count (= every
-    // producer is flagged-and-fully-dispatched, or was already complete when the consumer was
+    // dispatch_fanin. A consumer whose dispatch_fanin reaches fanin_count - 1 (= every
+    // WAIT producer is flagged-and-fully-dispatched, or was already complete when the consumer was
     // wired) is an early-dispatch candidate: CAS NONE->STAGING (exactly-once) and push to
     // early_dispatch_queues[shape] (or early_sync_start_queue for a require_sync_start cohort)
     // for the drain to pre-stage. The full-publication gate is load-bearing: a consumer that
@@ -934,17 +934,19 @@ struct PTO2SchedulerState {
         PTO2DepListEntry *edge = p.fanout_head;
         p.unlock_fanout();
         for (; edge != nullptr; edge = edge->next) {
-            PTO2TaskSlotState *c = edge->slot_state;
+            PTO2TaskSlotState *c = edge->slot_state.slot();
             if (c->task_attrs.has_predicate()) continue;  // predicated consumers never early-dispatch
-            // Compare to fanin_actual_count (the real producer-edge count), NOT
-            // fanin_count: fanin_count = fanin_actual_count + 1 (a self/wiring +1 that
+            // Compare to fanin_count - 1 (the WAIT producer-edge count), NOT
+            // fanin_actual_count: fanin_actual_count is the fanin STORAGE length
+            // and may include RETAIN-only edges that carry no ordering and never
+            // propagate. fanin_count = wait_edges + 1 (a self/wiring +1 that
             // ready_fanin gets but dispatch_fanin does not). dispatch_fanin starts at
             // the wiring-time flagged-pre-completed seed and is bumped here by flagged
-            // producers; reaching fanin_actual_count means every producer is
+            // producers; reaching fanin_count - 1 means every WAIT producer is
             // flagged-and-fully-published or was pre-completed. An unflagged producer leaves the
             // seed short and never bumps, so this stays unreachable for that consumer.
             int32_t nf = c->payload->dispatch_fanin.fetch_add(1, std::memory_order_acq_rel) + 1;
-            if (nf != c->payload->fanin_actual_count) continue;
+            if (nf != c->fanin_count - 1) continue;
             try_enqueue_early_dispatch_candidate(*c);
         }
     }
@@ -1233,8 +1235,17 @@ struct PTO2SchedulerState {
         // below; their dispatch_fanin propagation is collected here and replayed
         // after the walk, so no consumer's doorbell waits on a sibling's propagate.
         EarlyDispatchReleaseSink rel_sink;
+        bool released_wait_only_pin = false;
         while (current != nullptr) {
-            PTO2TaskSlotState &consumer_slot = *current->slot_state;
+            PTO2TaskSlotState &consumer_slot = *current->slot_state.slot();
+            if (current->slot_state.flags() == PTO2_DEP_WAIT) {
+                // WAIT-only edge: the consumer's submit pin ended at wiring;
+                // releasing it here (producer already COMPLETED) lets the slot
+                // and packed output be reclaimed without waiting for the
+                // consumer. One batched CONSUMED check after the walk.
+                slot_state.fanout_refcount.fetch_add(1, std::memory_order_acq_rel);
+                released_wait_only_pin = true;
+            }
 #if SIMPLER_SCHED_PROFILING
             stats.fanout_edges++;
             if (release_fanin_and_check_ready(consumer_slot, fanout_atomics, push_wait, &rel_sink)) {
@@ -1245,6 +1256,9 @@ struct PTO2SchedulerState {
             release_fanin_and_check_ready(consumer_slot, &rel_sink);
 #endif
             current = current->next;
+        }
+        if (released_wait_only_pin) {
+            check_and_handle_consumed(slot_state);
         }
         for (int i = 0; i < rel_sink.n; i++) {
             propagate_dispatch_fanin(*rel_sink.items[i]);
@@ -1277,7 +1291,12 @@ struct PTO2SchedulerState {
     int32_t on_task_release(PTO2TaskSlotState &slot_state) {
 #endif
         PTO2TaskPayload *payload = slot_state.payload;
-        for_each_fanin_slot_state(*payload, [&](PTO2TaskSlotState *producer_slot_state) {
+        // Fanin storage is retain-first (sorted at submit): the WAIT_RETAIN
+        // select resolves to the fanin_retain_count prefix with no per-entry
+        // check, and to a full filtered walk for spilled (unsorted) fanins.
+        // WAIT-only edges released their pin at wiring / producer completion,
+        // so only creator/explicit producers are released here.
+        for_each_fanin_slot_state(*payload, PTO2_DEP_WAIT_RETAIN, [&](PTO2TaskSlotState *producer_slot_state) {
 #if SIMPLER_SCHED_PROFILING
             release_producer(*producer_slot_state, fanin_atomics);
 #else

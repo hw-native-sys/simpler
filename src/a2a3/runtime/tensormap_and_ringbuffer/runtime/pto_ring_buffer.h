@@ -37,6 +37,7 @@
 #include <algorithm>
 #include <inttypes.h>
 #include <type_traits>
+#include <utility>
 
 #include "pto_runtime2_types.h"
 #include "pto_shared_memory.h"
@@ -514,7 +515,7 @@ struct PTO2FaninPool {
         tail = 1;
         high_water = 0;
         reclaim_task_cursor = 0;
-        base[0].slot_state = nullptr;
+        base[0].slot_state = PTO2TaggedSlotPtr{};
         error_code_ptr = in_error_code_ptr;
     }
 
@@ -523,7 +524,7 @@ struct PTO2FaninPool {
         tail = 1;
         high_water = 0;
         reclaim_task_cursor = 0;
-        base[0].slot_state = nullptr;
+        base[0].slot_state = PTO2TaggedSlotPtr{};
         error_code_ptr = in_error_code_ptr;
     }
 
@@ -568,83 +569,105 @@ struct PTO2FaninPool {
 
     int32_t available() const { return capacity - used(); }
 };
+template <typename Fn, typename = void>
+struct PTO2FaninCallbackResultHelper {
+    using type = std::invoke_result_t<Fn &, PTO2TaskSlotState *>;
+};
+template <typename Fn>
+struct PTO2FaninCallbackResultHelper<Fn, std::void_t<std::invoke_result_t<Fn &, PTO2TaskSlotState *, PTO2DepFlags>>> {
+    using type = std::invoke_result_t<Fn &, PTO2TaskSlotState *, PTO2DepFlags>;
+};
 
 template <typename Fn>
-using PTO2FaninCallbackResult = std::invoke_result_t<Fn &, PTO2TaskSlotState *>;
+using PTO2FaninCallbackResult = typename PTO2FaninCallbackResultHelper<Fn>::type;
 
 template <typename Fn>
 using PTO2FaninForEachReturn = std::conditional_t<std::is_same_v<PTO2FaninCallbackResult<Fn>, void>, void, bool>;
 
+// Walks fanin storage. Two callback forms, picked at compile time:
+//   fn(slot_state, dep_flags) — unfiltered (pass select == PTO2_DEP_NONE):
+//     every edge is reported with its flags, for callers that dispatch on
+//     the kind per edge (e.g. wire_fanin_task handles both kinds in one
+//     pass).
+//   fn(slot_state)            — filtered: the callback fires only for edges
+//     whose flags EXACTLY equal `select` and never sees the flags.
+// For the filtered form the traversal strategy is internal: when the
+// storage is retain-first (retain_count >= 0 marks the sorted prefix, see
+// PTO2TaskPayload::fanin_retain_count) the two kinds are contiguous
+// segments and the select resolves to a range with no per-entry check
+// ([0, retain_count) for WAIT_RETAIN, [retain_count, fanin_count) for
+// WAIT). Unsorted storage (retain_count < 0, e.g. the submit-time builder)
+// and the spilled fallback (retain_count == fanin_count > inline cap) use
+// a full walk with a per-entry exact-match test done here, never in the
+// callback.
 template <typename InlineSlots, typename Fn>
 inline PTO2FaninForEachReturn<Fn> for_each_fanin_storage(
-    InlineSlots &&inline_slot_states, int32_t fanin_count, int32_t spill_start, PTO2FaninPool &spill_pool, Fn &&fn
+    InlineSlots &&inline_slot_states, int32_t fanin_count, int32_t retain_count, int32_t spill_start,
+    PTO2FaninPool &spill_pool, PTO2DepFlags select, Fn &&fn
 ) {
+    constexpr bool kWithFlags = std::is_invocable_v<Fn &, PTO2TaskSlotState *, PTO2DepFlags>;
+    static_assert(
+        kWithFlags || std::is_invocable_v<Fn &, PTO2TaskSlotState *>,
+        "fanin callback must take (slot_state) or (slot_state, dep_flags)"
+    );
     using FaninCallbackResult = PTO2FaninCallbackResult<Fn>;
     static_assert(
         std::is_same_v<FaninCallbackResult, void> || std::is_same_v<FaninCallbackResult, bool>,
         "fanin callback must return void or bool"
     );
 
+    bool unsorted = retain_count < 0 || (retain_count == fanin_count && fanin_count > PTO2_FANIN_INLINE_CAP);
+    int32_t lo = 0;
+    int32_t hi = fanin_count;
+    bool check = !kWithFlags && select != PTO2_DEP_NONE;
+    if (!kWithFlags && !unsorted) {
+        check = false;
+        if (select == PTO2_DEP_WAIT_RETAIN) {
+            hi = retain_count;
+        } else if (select == PTO2_DEP_WAIT) {
+            lo = retain_count;
+        } else if (select == PTO2_DEP_RETAIN) {
+            hi = lo;  // RETAIN-only edges: no segment exists today
+        }
+    }
+
+    auto entry_at = [&](int32_t i) -> const PTO2TaggedSlotPtr & {
+        if (i < PTO2_FANIN_INLINE_CAP) {
+            return inline_slot_states[i];
+        }
+        return spill_pool.base[(spill_start + i - PTO2_FANIN_INLINE_CAP) % spill_pool.capacity].slot_state;
+    };
+
     if constexpr (std::is_void_v<FaninCallbackResult>) {
-        int32_t inline_count = std::min(fanin_count, PTO2_FANIN_INLINE_CAP);
-        for (int32_t i = 0; i < inline_count; i++) {
-            fn(inline_slot_states[i]);
-        }
-
-        int32_t spill_count = fanin_count - inline_count;
-        if (spill_count <= 0) {
-            return;
-        }
-
-        int32_t start_idx = spill_start % spill_pool.capacity;
-        int32_t first_count = std::min(spill_count, spill_pool.capacity - start_idx);
-        PTO2FaninSpillEntry *first = spill_pool.base + start_idx;
-        for (int32_t i = 0; i < first_count; i++) {
-            fn(first[i].slot_state);
-        }
-
-        int32_t second_count = spill_count - first_count;
-        for (int32_t i = 0; i < second_count; i++) {
-            fn(spill_pool.base[i].slot_state);
+        for (int32_t i = lo; i < hi; i++) {
+            const PTO2TaggedSlotPtr &e = entry_at(i);
+            if (check && e.flags() != select) continue;
+            if constexpr (kWithFlags) fn(e.slot(), e.flags());
+            else fn(e.slot());
         }
         return;
     } else {
-        int32_t inline_count = std::min(fanin_count, PTO2_FANIN_INLINE_CAP);
-        for (int32_t i = 0; i < inline_count; i++) {
-            if (!fn(inline_slot_states[i])) {
-                return false;
-            }
-        }
-
-        int32_t spill_count = fanin_count - inline_count;
-        if (spill_count <= 0) {
-            return true;
-        }
-
-        int32_t start_idx = spill_start % spill_pool.capacity;
-        int32_t first_count = std::min(spill_count, spill_pool.capacity - start_idx);
-        PTO2FaninSpillEntry *first = spill_pool.base + start_idx;
-        for (int32_t i = 0; i < first_count; i++) {
-            if (!fn(first[i].slot_state)) {
-                return false;
-            }
-        }
-
-        int32_t second_count = spill_count - first_count;
-        for (int32_t i = 0; i < second_count; i++) {
-            if (!fn(spill_pool.base[i].slot_state)) {
-                return false;
+        for (int32_t i = lo; i < hi; i++) {
+            const PTO2TaggedSlotPtr &e = entry_at(i);
+            if (check && e.flags() != select) continue;
+            if constexpr (kWithFlags) {
+                if (!fn(e.slot(), e.flags())) return false;
+            } else {
+                if (!fn(e.slot())) return false;
             }
         }
         return true;
     }
 }
 
+// Payload-owner wrapper: all storage parameters (counts, spill range, pool)
+// come from the payload; callers only state which edges they want.
 template <typename Fn>
-inline PTO2FaninForEachReturn<Fn> for_each_fanin_slot_state(const PTO2TaskPayload &payload, Fn &&fn) {
+inline PTO2FaninForEachReturn<Fn>
+for_each_fanin_slot_state(const PTO2TaskPayload &payload, PTO2DepFlags select, Fn &&fn) {
     return for_each_fanin_storage(
-        payload.fanin_inline_slot_states, payload.fanin_actual_count, payload.fanin_spill_start,
-        *payload.fanin_spill_pool, static_cast<Fn &&>(fn)
+        payload.fanin_inline_slot_states, payload.fanin_actual_count, payload.fanin_retain_count,
+        payload.fanin_spill_start, *payload.fanin_spill_pool, select, std::forward<Fn>(fn)
     );
 }
 
@@ -688,7 +711,7 @@ struct PTO2DepListPool {
         last_reclaimed = 0;
 
         // Initialize entry 0 as NULL marker
-        base[0].slot_state = nullptr;
+        base[0].slot_state = PTO2TaggedSlotPtr{};
         base[0].next = nullptr;
 
         error_code_ptr = in_error_code_ptr;
@@ -699,7 +722,7 @@ struct PTO2DepListPool {
         tail = 1;
         high_water = 0;
         last_reclaimed = 0;
-        base[0].slot_state = nullptr;
+        base[0].slot_state = PTO2TaggedSlotPtr{};
         base[0].next = nullptr;
         error_code_ptr = in_error_code_ptr;
     }
@@ -780,10 +803,10 @@ struct PTO2DepListPool {
      * @param task_slot     Task slot to prepend
      * @return New head offset
      */
-    PTO2DepListEntry *prepend(PTO2DepListEntry *cur, PTO2TaskSlotState *slot_state) {
+    PTO2DepListEntry *prepend(PTO2DepListEntry *cur, PTO2TaskSlotState *slot_state, PTO2DepFlags dep_flags) {
         PTO2DepListEntry *new_entry = alloc();
         if (!new_entry) return nullptr;
-        new_entry->slot_state = slot_state;
+        new_entry->slot_state = PTO2TaggedSlotPtr::make(slot_state, dep_flags);
         new_entry->next = cur;
         return new_entry;
     }

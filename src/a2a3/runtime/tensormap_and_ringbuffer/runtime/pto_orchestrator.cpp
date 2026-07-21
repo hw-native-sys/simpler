@@ -26,6 +26,8 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include <utility>
+
 #include "aicpu/dep_gen_collector_aicpu.h"
 #include "common/dep_gen.h"
 #include "common/unified_log.h"
@@ -240,34 +242,73 @@ struct PTO2FaninBuilder {
         seen_epoch(seen_epoch),
         spill_pool(spill_pool) {}
     int32_t count{0};
+    int32_t wait_count{0};  // Edges with PTO2_DEP_WAIT (kept in sync by set_flags)
     int32_t spill_start{0};
     PTO2OrchestratorState *orch{nullptr};
     uint32_t seen_epoch{0};
     PTO2FaninPool &spill_pool;
-    PTO2TaskSlotState *inline_slots[PTO2_FANIN_INLINE_CAP];
+    // Producer slot pointers tagged with the edge's current PTO2DepFlags.
+    // Entries at index >= PTO2_FANIN_INLINE_CAP live in the spill pool.
+    PTO2TaggedSlotPtr inline_slots[PTO2_FANIN_INLINE_CAP];
 
     template <typename Fn>
-    PTO2FaninForEachReturn<Fn> for_each(Fn &&fn) const {
-        return for_each_fanin_storage(inline_slots, count, spill_start, spill_pool, static_cast<Fn &&>(fn));
+    PTO2FaninForEachReturn<Fn> for_each(PTO2DepFlags select, Fn &&fn) const {
+        // The builder keeps discovery order, so retain_count = -1 marks the
+        // storage as unsorted and filtered selects use per-entry checks.
+        return for_each_fanin_storage(inline_slots, count, -1, spill_start, spill_pool, select, std::forward<Fn>(fn));
     }
 
-    bool mark_seen(uint8_t prod_ring, int32_t prod_slot) {
+    // Returns the builder edge index of the producer's first claim in this
+    // submission, or -1 if not seen yet (and records new_index for it).
+    int32_t seen_index(uint8_t prod_ring, int32_t prod_slot, int32_t new_index) {
         if (prod_ring >= PTO2_MAX_RING_DEPTH || prod_slot < 0) {
-            return false;
+            return -1;
         }
-        uint32_t *seen = orch->fanin_seen_epoch[prod_ring];
-        uint32_t slot = static_cast<uint32_t>(prod_slot);
-        if (seen[slot] == seen_epoch) {
-            return true;
+        uint64_t *seen = orch->fanin_seen_epoch[prod_ring];
+        uint64_t v = seen[prod_slot];
+        if (static_cast<uint32_t>(v >> 32) == seen_epoch) {
+            return static_cast<int32_t>(v & 0xFFFFFFFFu);
         }
-        seen[slot] = seen_epoch;
-        return false;
+        seen[prod_slot] = (static_cast<uint64_t>(seen_epoch) << 32) | static_cast<uint32_t>(new_index);
+        return -1;
+    }
+
+    PTO2DepFlags edge_flags(int32_t index) const {
+        if (index < PTO2_FANIN_INLINE_CAP) {
+            return inline_slots[index].flags();
+        }
+        int32_t pool_idx = (spill_start + index - PTO2_FANIN_INLINE_CAP) % spill_pool.capacity;
+        return spill_pool.base[pool_idx].slot_state.flags();
+    }
+
+    PTO2TaskSlotState *edge_slot(int32_t index) const {
+        if (index < PTO2_FANIN_INLINE_CAP) {
+            return inline_slots[index].slot();
+        }
+        int32_t pool_idx = (spill_start + index - PTO2_FANIN_INLINE_CAP) % spill_pool.capacity;
+        return spill_pool.base[pool_idx].slot_state.slot();
+    }
+
+    void set_flags(int32_t index, PTO2DepFlags flags) {
+        wait_count += ((flags & PTO2_DEP_WAIT) != 0) - ((edge_flags(index) & PTO2_DEP_WAIT) != 0);
+        if (index < PTO2_FANIN_INLINE_CAP) {
+            inline_slots[index] = PTO2TaggedSlotPtr::make(edge_slot(index), flags);
+            return;
+        }
+        int32_t pool_idx = (spill_start + index - PTO2_FANIN_INLINE_CAP) % spill_pool.capacity;
+        spill_pool.base[pool_idx].slot_state = PTO2TaggedSlotPtr::make(edge_slot(index), flags);
+    }
+
+    // OR additional flags into an existing edge (duplicate discovery of the
+    // same producer from another source — the strongest semantics win).
+    void merge_flags(int32_t index, PTO2DepFlags flags) {
+        set_flags(index, static_cast<PTO2DepFlags>(edge_flags(index) | flags));
     }
 };
 
 static bool append_fanin_or_fail(
     PTO2OrchestratorState *orch, uint8_t prod_ring, int32_t prod_slot, PTO2TaskSlotState *prod_state,
-    PTO2TaskId producer_task_id, PTO2FaninBuilder *fanin_builder, uint8_t ring_id
+    PTO2TaskId producer_task_id, PTO2FaninBuilder *fanin_builder, uint8_t ring_id, PTO2DepFlags dep_flags
 ) {
     // Decide-and-claim under the producer's fanout_lock. Two conditions make this
     // resolved slot a non-dependency, and both must be checked together with the
@@ -283,24 +324,28 @@ static bool append_fanin_or_fail(
     // the fanin slot, so on_task_release still release_producer()'s it) that
     // desyncs the slot's refcount (rc != fc) and wedges in-order reclaim. Claiming a live
     // producer under the lock pins it: fanout_count now counts us, so it cannot
-    // reach CONSUMED (rc == fc) until we release it in on_task_release, keeping the
-    // slot's generation stable until then. check_and_handle_consumed flips
+    // reach CONSUMED (rc == fc) until we release it (after wiring for WAIT-only
+    // edges, or in on_task_release for RETAIN edges), keeping the slot's
+    // generation stable until then. check_and_handle_consumed flips
     // COMPLETED->CONSUMED under the same lock, so the check and the ++ are atomic
     // against the consume. fanout_count is lock-protected per the
     // PTO2TaskSlotState contract.
     //
-    // Dedup (mark_seen) happens HERE, gated on a live producer — NOT before the
-    // gone check. mark_seen keys only on (ring, slot); a stale owner that resolves
+    // Dedup (seen_index) happens HERE, gated on a live producer — NOT before the
+    // gone check. It keys only on (ring, slot); a stale owner that resolves
     // to a reused slot must not record it as seen, or a later dependency on the
-    // live generation in the same submission would hit mark_seen and be skipped
+    // live generation in the same submission would hit the dedup and be skipped
     // without claiming it (dropped edge). Marking only when !gone keeps the dedup
     // keyed to the live producer, and doing it before the ++ still suppresses a
-    // double-count for a producer named twice in one submission.
+    // double-count for a producer named twice in one submission. A duplicate
+    // discovery merges its dep_flags into the first claim's edge (OR — the
+    // strongest semantics win) rather than first-wins dropping them.
     prod_state->lock_fanout();
     PTO2TaskState pstate = prod_state->task_state.load(std::memory_order_acquire);
     bool gone = prod_state->task == nullptr || prod_state->task->task_id.local() != producer_task_id.local() ||
                 pstate == PTO2_TASK_CONSUMED;
-    bool claim = !gone && !fanin_builder->mark_seen(prod_ring, prod_slot);
+    int32_t dup_index = gone ? -1 : fanin_builder->seen_index(prod_ring, prod_slot, fanin_builder->count);
+    bool claim = !gone && dup_index < 0;
     int32_t fanout_now = -1;
     if (claim) {
         // Low bits hold the consumer count; bit31 is the scope ref. The consumer
@@ -327,14 +372,18 @@ static bool append_fanin_or_fail(
             static_cast<unsigned>(producer_task_id.ring()), producer_task_id.local(), PTO2_DEP_DEGREE_DEBUG_THRESHOLD
         );
     }
-    // gone (stale/consumed) or an already-seen duplicate live producer: no new
-    // fanin edge either way.
+    if (dup_index >= 0) {
+        fanin_builder->merge_flags(dup_index, dep_flags);
+        return true;
+    }
+    // gone (stale/consumed): no new fanin edge.
     if (!claim) {
         return true;
     }
 
     if (fanin_builder->count < PTO2_FANIN_INLINE_CAP) {
-        fanin_builder->inline_slots[fanin_builder->count++] = prod_state;
+        fanin_builder->inline_slots[fanin_builder->count++] = PTO2TaggedSlotPtr::make(prod_state, dep_flags);
+        fanin_builder->wait_count += (dep_flags & PTO2_DEP_WAIT) != 0;
         return true;
     }
 
@@ -352,21 +401,22 @@ static bool append_fanin_or_fail(
     if (fanin_builder->count == PTO2_FANIN_INLINE_CAP) {
         fanin_builder->spill_start = spill_idx;
     }
-    entry->slot_state = prod_state;
+    entry->slot_state = PTO2TaggedSlotPtr::make(prod_state, dep_flags);
     fanin_builder->count++;
+    fanin_builder->wait_count += (dep_flags & PTO2_DEP_WAIT) != 0;
     return true;
 }
 
 static bool all_claimed_fanin_completed(const PTO2FaninBuilder &fanin_builder) {
-    if (fanin_builder.count == 0) return true;
-    return fanin_builder.for_each([](PTO2TaskSlotState *producer) -> bool {
+    // All constructed edges carry WAIT today, so NONE == all WAIT producers.
+    return fanin_builder.for_each(PTO2_DEP_NONE, [](PTO2TaskSlotState *producer) -> bool {
         return producer != nullptr && producer->task_state.load(std::memory_order_acquire) >= PTO2_TASK_COMPLETED;
     });
 }
 
 static bool all_claimed_fanin_allow_early_resolve(const PTO2FaninBuilder &fanin_builder) {
     if (fanin_builder.count == 0) return true;
-    return fanin_builder.for_each([](PTO2TaskSlotState *producer) -> bool {
+    return fanin_builder.for_each(PTO2_DEP_NONE, [](PTO2TaskSlotState *producer) -> bool {
         return producer != nullptr && producer->task_attrs.allow_early_resolve();
     });
 }
@@ -386,12 +436,18 @@ void PTO2OrchestratorState::wire_fanin_task(PTO2TaskSlotState &slot_state, int32
     PTO2SchedulerState *sched = scheduler;
     auto &rss = sched->ring_sched_states[slot_state.ring_id];
     PTO2TaskPayload *payload = slot_state.payload;
+    // wfanin counts WAIT edges only; RETAIN-only edges sit in fanin storage
+    // but carry no ordering, so they neither wire a fanout node nor count
+    // toward readiness.
     slot_state.fanin_count = wfanin + 1;
 
     int32_t completed_fanin = 0;
     int32_t early_propagated = 0;
     bool early_disqualified = false;
-    for_each_fanin_slot_state(*payload, [&](PTO2TaskSlotState *producer) {
+    for_each_fanin_slot_state(*payload, PTO2_DEP_NONE, [&](PTO2TaskSlotState *producer, PTO2DepFlags flags) {
+        if ((flags & PTO2_DEP_WAIT) == 0) {
+            return;
+        }
         producer->lock_fanout();
         int32_t pstate = producer->task_state.load(std::memory_order_acquire);
         if (!early_disqualified && !producer->task_attrs.allow_early_resolve()) {
@@ -400,7 +456,7 @@ void PTO2OrchestratorState::wire_fanin_task(PTO2TaskSlotState &slot_state, int32
         if (pstate >= PTO2_TASK_COMPLETED) {
             completed_fanin++;
         } else {
-            producer->fanout_head = rss.dep_pool.prepend(producer->fanout_head, &slot_state);
+            producer->fanout_head = rss.dep_pool.prepend(producer->fanout_head, &slot_state, flags);
             // The marker shares fanout_lock with propagation's snapshot. A set
             // marker means this edge is outside that snapshot and needs a seed.
             if (!early_disqualified && producer->has_dispatch_propagated()) {
@@ -408,6 +464,15 @@ void PTO2OrchestratorState::wire_fanin_task(PTO2TaskSlotState &slot_state, int32
             }
         }
         producer->unlock_fanout();
+        if (flags == PTO2_DEP_WAIT && pstate >= PTO2_TASK_COMPLETED) {
+            // WAIT-only edge on an already-completed producer: no fanout node
+            // exists to carry the completion-walk pin release, so the pin is
+            // released here. Live producers instead release it on the
+            // scheduler thread in the completion fanout walk (the entry
+            // carries the flags), keeping per-edge atomics off the
+            // orchestrator.
+            sched->release_producer(*producer);
+        }
     });
 
     // Completed producers and edges outside a producer's one-shot propagation
@@ -416,9 +481,11 @@ void PTO2OrchestratorState::wire_fanin_task(PTO2TaskSlotState &slot_state, int32
     int32_t early_seed = completed_fanin + early_propagated;
     if (!early_disqualified && early_seed != 0) {
         int32_t dispatch_fanin = payload->dispatch_fanin.fetch_add(early_seed, std::memory_order_acq_rel) + early_seed;
-        // A fully pre-completed fanin routes normally. If any producer was live,
-        // the exact-full increment must enqueue the early candidate.
-        if (completed_fanin != payload->fanin_actual_count && dispatch_fanin == payload->fanin_actual_count) {
+        // A fully pre-completed fanin routes normally. If any WAIT producer was
+        // live, the exact-full increment must enqueue the early candidate. The
+        // target is wfanin (= fanin_count - 1, WAIT edges only), NOT
+        // fanin_actual_count: RETAIN-only edges never propagate.
+        if (completed_fanin != wfanin && dispatch_fanin == wfanin) {
             sched->try_enqueue_early_dispatch_candidate(slot_state);
         }
     }
@@ -887,8 +954,13 @@ static TaskOutputTensors submit_task_common(
         }
         int32_t dep_slot = dep_ring.get_slot_by_task_id(dep_local_task_id);
         PTO2TaskSlotState *producer_slot_state = &dep_ring.get_slot_state_by_slot(dep_slot);
+        // Explicit deps are conservative WAIT|RETAIN: the caller may rely on
+        // either ordering or producer-output lifetime. User code has no
+        // kind/flags selector — WAIT|RETAIN is the only user-expressible
+        // edge kind (docs/two-kinds-of-dep.md §3.6).
         if (!append_fanin_or_fail(
-                orch, dep_ring_id, dep_slot, producer_slot_state, dep_task_id, &fanin_builder, ring_id
+                orch, dep_ring_id, dep_slot, producer_slot_state, dep_task_id, &fanin_builder, ring_id,
+                PTO2_DEP_WAIT_RETAIN
             )) {
             return result;
         }
@@ -900,12 +972,14 @@ static TaskOutputTensors submit_task_common(
         args.explicit_deps_data(),
     };
 
-    auto runtime_emit = [&](PTO2TaskId producer_task_id) -> bool {
+    auto runtime_emit = [&](PTO2TaskId producer_task_id, PTO2DepFlags dep_flags) -> bool {
         uint8_t prod_ring = producer_task_id.ring();
         PTO2SharedMemoryRingHeader &producer_ring = orch->sm_header->rings[prod_ring];
         int32_t prod_slot = producer_ring.get_slot_by_task_id(static_cast<int32_t>(producer_task_id.local()));
         PTO2TaskSlotState *prod_state = &producer_ring.get_slot_state_by_slot(prod_slot);
-        return append_fanin_or_fail(orch, prod_ring, prod_slot, prod_state, producer_task_id, &fanin_builder, ring_id);
+        return append_fanin_or_fail(
+            orch, prod_ring, prod_slot, prod_state, producer_task_id, &fanin_builder, ring_id, dep_flags
+        );
     };
 
     if (!compute_task_fanin(dep_inputs, orch->tensor_map, orch->in_manual_scope(), runtime_emit)) {
@@ -957,8 +1031,41 @@ static TaskOutputTensors submit_task_common(
     }
     payload.fanin_spill_start = fanin_builder.spill_start;
     payload.fanin_spill_pool = &fanin_builder.spill_pool;
-    for (int i = 0; i < inline_count; i++) {
-        payload.fanin_inline_slot_states[i] = fanin_builder.inline_slots[i];
+    if (fanin_builder.count <= PTO2_FANIN_INLINE_CAP) {
+        // Retain-first ordering: RETAIN-bearing edges (creator/explicit) go to
+        // the front of the inline array, WAIT-only (tensormap) after, so
+        // on_task_release walks only the fanin_retain_count prefix instead of
+        // scanning past WAIT-only entries. Builders stay in discovery order;
+        // only the payload copy is sorted. The ordering is an optimization
+        // hint only — the flag checks at both readers stay the authority, so
+        // a future RETAIN-only kind lands in the prefix and is still released
+        // correctly (though the ordering should then be redesigned — see
+        // docs/two-kinds-of-dep.md section 3.8).
+        int32_t wi = 0;
+        for (int32_t i = 0; i < fanin_builder.count; i++) {
+            if ((fanin_builder.inline_slots[i].flags() & PTO2_DEP_RETAIN) != 0) {
+                payload.fanin_inline_slot_states[wi++] = fanin_builder.inline_slots[i];
+            }
+        }
+        payload.fanin_retain_count = wi;
+        for (int32_t i = 0; i < fanin_builder.count; i++) {
+            if ((fanin_builder.inline_slots[i].flags() & PTO2_DEP_RETAIN) == 0) {
+                payload.fanin_inline_slot_states[wi++] = fanin_builder.inline_slots[i];
+            }
+        }
+    } else {
+        // Deliberate choice: spilled fanins (> PTO2_FANIN_INLINE_CAP edges)
+        // stay in discovery order and pay a full walk with per-entry flag
+        // checks in on_task_release. Sorting the spill range would cost a
+        // pool-range read-modify-write in DRAM per big-fanin submit (or a
+        // much larger stack builder); fanin beyond the inline cap is rare
+        // (the dep-degree warning fires at 16), so the unsaved traversal is
+        // accepted. retain_count == actual_count marks this fallback. See
+        // docs/two-kinds-of-dep.md section 3.8.
+        payload.fanin_retain_count = fanin_builder.count;
+        for (int i = 0; i < inline_count; i++) {
+            payload.fanin_inline_slot_states[i] = fanin_builder.inline_slots[i];
+        }
     }
 
     payload.init(args, result, prepared.alloc_result, layout);
@@ -1001,25 +1108,33 @@ static TaskOutputTensors submit_task_common(
     CYCLE_COUNT_LAP(g_orch_args_cycle);
 
     // === STEP 6: wire on the orchestrator side and publish readiness ===
-    // Zero-fanin tasks and tasks whose claimed producers are already completed
-    // do not need fanout links or dep_pool entries. Tasks with live producers
-    // allocate fanout links here before any scheduler thread can dispatch them.
-    if (fanin_builder.count == 0) {
+    // Readiness counts WAIT edges only. Tasks with no WAIT edges and tasks
+    // whose WAIT producers are all completed do not need fanout links or
+    // dep_pool entries. Tasks with live WAIT producers allocate fanout links
+    // here before any scheduler thread can dispatch them.
+    int32_t wait_count = fanin_builder.wait_count;
+    if (wait_count == 0) {
         cur_slot_state.fanin_count = 1;
         cur_slot_state.fanin_refcount.store(1, std::memory_order_release);
         orch->mark_dep_pool_position(cur_slot_state);
         sched->push_ready_routed(&cur_slot_state);
     } else if (all_claimed_fanin_completed(fanin_builder)) {
-        int32_t ready_seed = fanin_builder.count + 1;
+        int32_t ready_seed = wait_count + 1;
         cur_slot_state.fanin_count = ready_seed;
         if (all_claimed_fanin_allow_early_resolve(fanin_builder)) {
-            payload.dispatch_fanin.store(fanin_builder.count, std::memory_order_release);
+            payload.dispatch_fanin.store(wait_count, std::memory_order_release);
         }
         cur_slot_state.fanin_refcount.store(ready_seed, std::memory_order_release);
+        // No wiring happens on this path, so WAIT-only pins (which normally
+        // end at wiring) are released here; RETAIN edges keep theirs until
+        // this consumer's on_task_release.
+        fanin_builder.for_each(PTO2_DEP_WAIT, [&](PTO2TaskSlotState *producer) {
+            sched->release_producer(*producer);
+        });
         orch->mark_dep_pool_position(cur_slot_state);
         sched->push_ready_routed(&cur_slot_state);
     } else {
-        if (!orch_wire_live_fanin_task(orch, cur_slot_state, fanin_builder.count)) {
+        if (!orch_wire_live_fanin_task(orch, cur_slot_state, wait_count)) {
             return result;
         }
     }
@@ -1213,6 +1328,7 @@ TaskOutputTensors PTO2OrchestratorState::alloc_tensors(const L0TaskArgs &args) {
     outputs.set_task_id(prepared.task_id);
     payload.init(args, outputs, prepared.alloc_result, layout);
     payload.fanin_actual_count = 0;
+    payload.fanin_retain_count = 0;
     payload.fanin_spill_start = 0;
     payload.fanin_spill_pool = &orch->rings[prepared.task_id.ring()].fanin_pool;
     CYCLE_COUNT_LAP(g_orch_args_cycle);

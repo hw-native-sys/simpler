@@ -160,23 +160,77 @@ struct PTO2OutputLayout {
 // =============================================================================
 
 /**
+ * Per-edge dependency semantics, stored in bits [1:0] of the producer
+ * slot_state pointer (PTO2TaskSlotState is alignas(64), so those bits are
+ * always zero in a real pointer). WAIT: the consumer's readiness
+ * (fanin_count/fanin_refcount, producer fanout notification) includes this
+ * edge. RETAIN: the producer's slot and packed output stay referenced
+ * (fanout_count/fanout_refcount) until the consumer's on_task_release.
+ * An edge with neither flag is dead and must not be stored.
+ */
+enum PTO2DepFlags : uint8_t {
+    PTO2_DEP_NONE = 0,
+    PTO2_DEP_WAIT = 1 << 0,
+    PTO2_DEP_RETAIN = 1 << 1,
+    PTO2_DEP_WAIT_RETAIN = PTO2_DEP_WAIT | PTO2_DEP_RETAIN,
+};
+
+struct PTO2TaskSlotState;  // Forward declaration
+struct PTO2FaninPool;      // Forward declaration
+
+/**
+ * A PTO2TaskSlotState pointer carrying its dependency edge's PTO2DepFlags in
+ * bits [1:0] (PTO2TaskSlotState is alignas(64), so those bits are zero in a
+ * real pointer). Keeping the tagged value a distinct type (rather than a raw
+ * PTO2TaskSlotState *) makes dereferencing it without untagging a compile
+ * error instead of silent corruption: use slot() for the pointer, flags()
+ * for the edge semantics. Trivially copyable; storage regions may be
+ * zero-initialized with memset.
+ */
+class PTO2TaggedSlotPtr {
+public:
+    PTO2TaggedSlotPtr() = default;
+
+    static PTO2TaggedSlotPtr make(PTO2TaskSlotState *slot_state, PTO2DepFlags flags) {
+        PTO2TaggedSlotPtr t;
+        t.raw_ = reinterpret_cast<uintptr_t>(slot_state) | flags;
+        return t;
+    }
+
+    PTO2TaskSlotState *slot() const {
+        return reinterpret_cast<PTO2TaskSlotState *>(raw_ & ~static_cast<uintptr_t>(PTO2_DEP_WAIT_RETAIN));
+    }
+
+    PTO2DepFlags flags() const { return static_cast<PTO2DepFlags>(raw_ & PTO2_DEP_WAIT_RETAIN); }
+
+private:
+    // Deliberately uninitialized: default construction must stay trivial so
+    // the per-submit PTO2FaninBuilder inline array (64 entries) is not
+    // zero-filled on every task. Value-initialization (PTO2TaggedSlotPtr{})
+    // still yields zero, which is what the pool null-markers rely on.
+    uintptr_t raw_;
+};
+static_assert(sizeof(PTO2TaggedSlotPtr) == sizeof(uintptr_t));
+static_assert(std::is_trivially_default_constructible_v<PTO2TaggedSlotPtr>);
+
+/**
  * Fanin spill entry
  * Stored in the dedicated fanin spill ring buffer.
  */
-struct PTO2TaskSlotState;  // Forward declaration
-struct PTO2FaninPool;      // Forward declaration
 struct PTO2FaninSpillEntry {
-    PTO2TaskSlotState *slot_state;
+    PTO2TaggedSlotPtr slot_state;
 };
 static_assert(sizeof(PTO2FaninSpillEntry) == sizeof(uintptr_t));
 
 /**
  * Dependency list entry (singly-linked list node)
- * Stored in DepListPool ring buffer.
+ * Stored in DepListPool ring buffer. slot_state is the consumer; its flags
+ * tell the completion walk to release a WAIT-only edge's submit pin here, on
+ * the scheduler thread, instead of paying it on the orchestrator.
  */
 struct PTO2DepListEntry {
-    PTO2TaskSlotState *slot_state;  // Consumer slot state (direct pointer)
-    PTO2DepListEntry *next;         // next entry
+    PTO2TaggedSlotPtr slot_state;  // Consumer slot state (tagged)
+    PTO2DepListEntry *next;        // next entry
 };
 
 // =============================================================================
@@ -258,7 +312,8 @@ struct PTO2TaskPayload {
     int32_t fanin_actual_count{0};  // Actual fanin count (without the +1 redundance)
     int32_t fanin_spill_start{0};   // Linear start index in fanin spill pool (0 = no spill)
     PTO2FaninPool *fanin_spill_pool{nullptr};
-    PTO2TaskSlotState *fanin_inline_slot_states[PTO2_FANIN_INLINE_CAP];
+    // Producer slot pointers tagged with each edge's PTO2DepFlags.
+    PTO2TaggedSlotPtr fanin_inline_slot_states[PTO2_FANIN_INLINE_CAP];
     // Early-dispatch metadata (AICPU-side only). Ordered by descending
     // alignment (8B mask, 4B fanin, then 2B/1B counters and flags) so the block packs with no
     // internal padding. Kept here after the fanin array (not moved up front): on
@@ -274,11 +329,13 @@ struct PTO2TaskPayload {
     // the completed mask stable for its single cohort launch owner.
     std::atomic<uint64_t> staged_core_mask[PTO2_EARLY_DISPATCH_CORE_MASK_WORDS]{};
     // Early-dispatch CANDIDATE detection (event-driven, dual of fanin_refcount):
-    // seeded at wiring with producers already complete, then a flagged producer
+    // seeded at wiring with WAIT producers already complete, then a flagged producer
     // bumps each consumer after all of its logical blocks are published.
-    // dispatch_fanin == fanin_actual_count  <=>  every producer is
+    // dispatch_fanin == fanin_count - 1  <=>  every WAIT producer is
     // flagged-and-fully-published or was
     // pre-completed  =>  this task is an early-dispatch candidate (push early_dispatch_queues[shape]).
+    // (Target is fanin_count - 1, not fanin_actual_count: RETAIN-only edges
+    // sit in fanin storage but carry no ordering and never propagate.)
     std::atomic<int32_t> dispatch_fanin{0};  // CONSUMER side: fully-published + pre-completed producers
     // Number of logical blocks whose payloads and MMIO tokens are published.
     // Claimed-but-unpublished blocks do not make a producer launch-visible. Its
@@ -309,6 +366,12 @@ struct PTO2TaskPayload {
     // reinitialization. READY records that producer release observed OWNER;
     // only cancellation clears OWNER during the current task lifetime.
     std::atomic<uint8_t> early_sync_drain_state{PTO2_EARLY_SYNC_DRAIN_NONE};
+    // Number of leading fanin entries (inline array then spill range, in
+    // storage order) that carry PTO2_DEP_RETAIN. Fanin storage is written
+    // retain-first at submit, so on_task_release walks only this prefix
+    // instead of scanning past WAIT-only entries. Equals fanin_actual_count
+    // when the task spilled (unsorted fallback: full walk with flag checks).
+    int32_t fanin_retain_count{0};
     // === Cache line 9 (byte 576) — dispatch predicate (AICPU-only) ===
     // Offset is a fixed 576, independent of MAX_TENSOR_ARGS / MAX_SCALAR_ARGS.
     // AICore never reads it — args are materialized from the tensor_count / tensors
@@ -405,6 +468,10 @@ struct PTO2TaskPayload {
 
 // PTO2TaskPayload layout verification (offsetof requires complete type).
 static_assert(offsetof(PTO2TaskPayload, fanin_spill_pool) == 16, "spill pool pointer layout drift");
+static_assert(
+    offsetof(PTO2TaskPayload, fanin_retain_count) == 564,
+    "fanin_retain_count must occupy the slack between the early-dispatch block and the predicate"
+);
 static_assert(
     offsetof(PTO2TaskPayload, fanin_inline_slot_states) == 24, "inline fanin array must follow spill metadata"
 );
@@ -659,5 +726,8 @@ struct alignas(64) PTO2TaskSlotState {
 };
 
 static_assert(sizeof(PTO2TaskSlotState) == 64);
+// PTO2TaggedSlotPtr stores PTO2DepFlags in pointer bits [1:0]; this hard-fails
+// the build if the alignment guarantee the tagging relies on is ever weakened.
+static_assert(alignof(PTO2TaskSlotState) >= 4, "dep-flag pointer tagging requires >= 4B alignment");
 
 #endif  // SRC_A2A3_RUNTIME_TENSORMAP_AND_RINGBUFFER_RUNTIME_PTO_RUNTIME2_TYPES_H_

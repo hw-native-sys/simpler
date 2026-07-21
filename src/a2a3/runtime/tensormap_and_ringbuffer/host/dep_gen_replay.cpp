@@ -697,10 +697,11 @@ dep_gen_replay_emit_deps_json(const DepGenRecord *records, size_t num_records, c
         }
 
         // ============ ORACLE pass — drive compute_task_fanin ============
-        bool ok = compute_task_fanin(inputs, tm_oracle, in_manual_scope, [&](PTO2TaskId producer) -> bool {
-            oracle_preds.insert(producer.raw);
-            return true;
-        });
+        bool ok =
+            compute_task_fanin(inputs, tm_oracle, in_manual_scope, [&](PTO2TaskId producer, PTO2DepFlags) -> bool {
+                oracle_preds.insert(producer.raw);
+                return true;
+            });
         if (!ok) {
             LOG_ERROR("dep_gen replay: compute_task_fanin returned fatal at task_id=%" PRIu64, rec.task_id);
             tm_oracle.destroy();

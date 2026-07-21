@@ -29,7 +29,11 @@
  * the minor structural overlap. Replay handles STEP 1 with a one-line loop of its own.
  *
  * The Emit callback contract:
- *   bool emit(PTO2TaskId producer);
+ *   bool emit(PTO2TaskId producer, PTO2DepFlags dep_flags);
+ *     - dep_flags is the edge's initial PTO2DepFlags: Step A (creator)
+ *       emits PTO2_DEP_WAIT_RETAIN, Step B (tensormap modifier) emits
+ *       PTO2_DEP_WAIT. Callers OR-merge flags on duplicate
+ *       (producer, consumer) discoveries — never first-wins.
  *     - return true to continue (whether or not the producer was actually recorded —
  *       producer-not-alive / dedup-hit / etc. all return true silently)
  *     - return false to signal fatal (e.g. fanin spill overflow); caller bails
@@ -46,6 +50,7 @@
 #include <cstdint>
 
 #include "pto_task_id.h"
+#include "pto_runtime2_types.h"  // PTO2DepFlags
 #include "pto_tensormap.h"
 #include "pto_types.h"  // TensorRef
 #include "tensor.h"
@@ -97,7 +102,7 @@ compute_task_fanin(const DepInputs &inputs, PTO2TensorMap &tensor_map, bool in_m
         // Step A: creator retention — all existing tensors extend their creator lifetime.
         PTO2TaskId owner = tensor->owner_task_id;
         if (owner.is_valid()) {
-            if (!emit(owner)) {
+            if (!emit(owner, PTO2_DEP_WAIT_RETAIN)) {
                 return false;
             }
         }
@@ -112,7 +117,7 @@ compute_task_fanin(const DepInputs &inputs, PTO2TensorMap &tensor_map, bool in_m
 
         bool fatal = false;
         tensor_map.lookup(*tensor, [&](PTO2TensorMapEntry &entry, OverlapStatus overlap_status) -> bool {
-            if (!emit(entry.producer_task_id)) {
+            if (!emit(entry.producer_task_id, PTO2_DEP_WAIT)) {
                 fatal = true;
                 return false;  // stop iteration
             }

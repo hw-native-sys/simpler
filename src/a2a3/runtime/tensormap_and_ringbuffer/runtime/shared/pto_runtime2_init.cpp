@@ -345,7 +345,7 @@ PTO2OrchestratorLayout PTO2OrchestratorState::reserve_layout(
 
         always_assert(task_window_sizes[r] > 0 && (task_window_sizes[r] & (task_window_sizes[r] - 1)) == 0);
         const size_t seen_epoch_bytes =
-            PTO2_ALIGN_UP(static_cast<size_t>(task_window_sizes[r]) * sizeof(uint32_t), PTO2_ALIGN_SIZE);
+            PTO2_ALIGN_UP(static_cast<size_t>(task_window_sizes[r]) * sizeof(uint64_t), PTO2_ALIGN_SIZE);
         layout.off_fanin_seen_epoch[r] = arena.reserve(seen_epoch_bytes, PTO2_ALIGN_SIZE);
     }
     layout.off_scope_tasks =
@@ -391,6 +391,13 @@ bool PTO2OrchestratorState::init_data_from_layout(
         void *ring_heap_base = reinterpret_cast<char *>(gm_heap) + heap_offset;
         auto *task_descs_dev = pto2_sm_layout::ring_task_descriptors_addr(sm_dev_base, task_window_sizes, r);
         auto *slot_states_dev = pto2_sm_layout::ring_slot_states_addr(sm_dev_base, task_window_sizes, r);
+        // PTO2TaggedSlotPtr stores dep flags in the low bits of
+        // PTO2TaskSlotState pointers; it silently corrupts edges if a
+        // suballocated slot_states base ever loses cache-line alignment.
+        always_assert(
+            reinterpret_cast<uintptr_t>(slot_states_dev) % PTO2_ALIGN_SIZE == 0 &&
+            "slot_states must stay cache-line aligned (dep-flag pointer tagging uses the low bits)"
+        );
         auto *cur_idx_dev = pto2_sm_layout::ring_current_task_index_addr(sm_dev_base, r);
         auto *last_alive_dev = pto2_sm_layout::ring_last_task_alive_addr(sm_dev_base, r);
 
@@ -408,9 +415,9 @@ bool PTO2OrchestratorState::init_data_from_layout(
         orch->rings[r].fanin_pool.init(fanin_entries, layout.dep_pool_capacities[r], orch_err);
 
         const size_t seen_epoch_bytes = PTO2_ALIGN_UP(
-            static_cast<size_t>(layout.tensor_map.task_window_sizes[r]) * sizeof(uint32_t), PTO2_ALIGN_SIZE
+            static_cast<size_t>(layout.tensor_map.task_window_sizes[r]) * sizeof(uint64_t), PTO2_ALIGN_SIZE
         );
-        auto *seen_epoch = static_cast<uint32_t *>(arena.region_ptr(layout.off_fanin_seen_epoch[r]));
+        auto *seen_epoch = static_cast<uint64_t *>(arena.region_ptr(layout.off_fanin_seen_epoch[r]));
         memset(seen_epoch, 0, seen_epoch_bytes);
         orch->fanin_seen_epoch[r] = seen_epoch;
     }
@@ -449,7 +456,7 @@ bool PTO2OrchestratorState::reset_for_reuse(
         for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
             memset(
                 orch->fanin_seen_epoch[r], 0,
-                static_cast<size_t>(layout.tensor_map.task_window_sizes[r]) * sizeof(uint32_t)
+                static_cast<size_t>(layout.tensor_map.task_window_sizes[r]) * sizeof(uint64_t)
             );
         }
     }
@@ -461,6 +468,13 @@ bool PTO2OrchestratorState::reset_for_reuse(
         void *ring_heap_base = reinterpret_cast<char *>(gm_heap) + heap_offset;
         auto *task_descs_dev = pto2_sm_layout::ring_task_descriptors_addr(sm_dev_base, task_window_sizes, r);
         auto *slot_states_dev = pto2_sm_layout::ring_slot_states_addr(sm_dev_base, task_window_sizes, r);
+        // See init_data_from_layout: dep-flag pointer tagging uses the low
+        // bits of PTO2TaskSlotState pointers, so the suballocated base must
+        // stay cache-line aligned.
+        always_assert(
+            reinterpret_cast<uintptr_t>(slot_states_dev) % PTO2_ALIGN_SIZE == 0 &&
+            "slot_states must stay cache-line aligned (dep-flag pointer tagging uses the low bits)"
+        );
         auto *cur_idx_dev = pto2_sm_layout::ring_current_task_index_addr(sm_dev_base, r);
         auto *last_alive_dev = pto2_sm_layout::ring_last_task_alive_addr(sm_dev_base, r);
 
@@ -494,7 +508,7 @@ void PTO2OrchestratorState::wire_arena_pointers(
     auto *orch = this;
     for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
         orch->rings[r].fanin_pool.base = static_cast<PTO2FaninSpillEntry *>(arena.region_ptr(layout.off_fanin_pool[r]));
-        orch->fanin_seen_epoch[r] = static_cast<uint32_t *>(arena.region_ptr(layout.off_fanin_seen_epoch[r]));
+        orch->fanin_seen_epoch[r] = static_cast<uint64_t *>(arena.region_ptr(layout.off_fanin_seen_epoch[r]));
     }
     orch->tensor_map.wire_arena_pointers(layout.tensor_map, arena);
     orch->scope_tasks = static_cast<PTO2TaskSlotState **>(arena.region_ptr(layout.off_scope_tasks));

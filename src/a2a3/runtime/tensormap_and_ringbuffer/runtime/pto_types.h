@@ -382,6 +382,15 @@ struct Arg : TaskArgsTpl<TensorRef, uint64_t, MaxT, MaxS, TensorArgType> {
      * copying — the caller's array must outlive the submit (same lifetime rule
      * as add_input/add_output, which also store pointers).
      *
+     * Every explicit edge is wired WAIT|RETAIN (ordering + producer-output
+     * lifetime) — the conservative default, since the runtime cannot know
+     * which of the two the caller relies on. There is deliberately no
+     * kind/flags parameter: RETAIN-only edges are a transitive-reduction
+     * artifact that user code cannot express, and a WAIT-only explicit tier
+     * (for codegen that knows a dep is ordering-only) is planned as a
+     * separate named entry point, not a flags argument. See
+     * docs/two-kinds-of-dep.md §3.6.
+     *
      * count == 0 is a valid "set empty" — it clears any previously stored deps
      * and returns. This lets callers that build the dep set conditionally pass
      * the result through unguarded, including in the no-dep branch:
