@@ -18,7 +18,7 @@
  *   comm_get_local_window_base / comm_get_window_size ->
  *   comm_barrier -> comm_destroy
  * and then copies the device-side CommContext back to host to assert the
- * Path D backend populated it correctly:
+ * Fabric V2 backend populated it correctly:
  *
  *   rankId          == (this process's rank)
  *   rankNum         == (nranks we passed to comm_init)
@@ -26,22 +26,21 @@
  *   windowsIn[rank] == comm_get_local_window_base(h)
  *   windowsIn[0..nranks-1] all non-zero                 (every peer GVA populated)
  *
- * What this guards in the Path D world:
+ * What this guards in the Fabric V2 backend:
  *
- *   - ipc_read_announce timing out on a peer but the function still returning
- *     0 -- the windowsIn[peer]==0 assertion would catch the resulting empty
+ *   - Fabric announcement timing out on a peer but the function still returning
+ *     0 -- the windowsIn[peer]==0
+ * assertion would catch the resulting empty
  *     slot.
- *   - comm_get_window_size / winSize implementation drift -- the cross-API
+ *   - comm_get_window_size / winSize implementation drift --
+ * the cross-API
  *     consistency check pins them together.
- *   - aclrtDeviceEnablePeerAccess silently failing but the warning being
- *     fprintf'd and continuing (alloc_windows_via_ipc does this on
- *     "already enabled" returns) -- a peer slot can still get populated with
- *     an unmapped VA; host-side byte-level memcpy of the device ctx catches
- *     a wholly null slot.
- *
- * This is *not* an HCCL-private ABI canary (that role died with the MC2
- * reverse-parse code); it is a black-box lifecycle test of the comm_*
- * C API and the device-side CommContext it produces.
+ *   - a Fabric import succeeding without populating the
+ * corresponding peer
+ *     GVA -- host-side byte-level memcpy of the device ctx catches a null slot.
+ * This is *not*
+ * an HCCL-private ABI canary (that role died with the MC2 reverse-parse code); it is a black-box lifecycle test of the
+ * comm_* C API and the device-side CommContext it produces.
  *
  * Hardware classification: requires_hardware_a2a3 (ctest label) + CMake
  * gate SIMPLER_ENABLE_HARDWARE_TESTS.  Device allocation is driven by
@@ -125,8 +124,8 @@ constexpr int EXIT_INIT = 20;
 constexpr int EXIT_ALLOC = 30;
 constexpr int EXIT_WINDOW_BASE = 40;
 constexpr int EXIT_WINDOW_SIZE = 50;
-// EXIT_CTX_{MEMCPY,FIELDS} guard the device-side CommContext that Path D
-// fills in alloc_windows_via_ipc: cross-API consistency between
+// EXIT_CTX_{MEMCPY,FIELDS} guard the device-side CommContext that Fabric V2
+// fills in alloc_windows_via_fabric: cross-API consistency between
 // comm_get_window_size / winSize, and every peer's windowsIn slot
 // actually getting a non-zero GVA.
 constexpr int EXIT_CTX_MEMCPY = 55;
@@ -205,7 +204,7 @@ int run_rank(int rank, int nranks, int device_id, const char *rootinfo_path) {
                     stage = EXIT_WINDOW_SIZE;
                 } else {
                     // Black-box contract check on the device-side CommContext
-                    // produced by Path D: cross-API consistency (winSize ==
+                    // produced by Fabric V2: cross-API consistency (winSize ==
                     // comm_get_window_size), every peer's windowsIn slot
                     // populated, and the local slot matching
                     // comm_get_local_window_base.
@@ -235,7 +234,7 @@ int run_rank(int rank, int nranks, int device_id, const char *rootinfo_path) {
                         stage = EXIT_CTX_FIELDS;
                     } else {
                         // Every peer's window GVA must be non-zero.  A zero
-                        // entry means ipc_read_announce / ImportByKey didn't
+                        // entry means the Fabric handle import didn't
                         // populate that slot but the function still returned
                         // success.
                         for (int i = 0; i < nranks; ++i) {

@@ -16,15 +16,15 @@ real ``tensormap_and_ringbuffer`` runtime on Ascend.  The flow under test:
      base HCCL membership is established lazily on the first
      ``orch.allocate_domain`` call inside ``Worker.run``.
   2. Inside ``Worker.run(orch_fn)``, call ``orch.allocate_domain(...)``
-     to drive ``comm_alloc_domain_windows`` (aclrtMalloc + IPC announce +
-     SetImportPid + ImportByKey).
+     to drive ``comm_alloc_domain_windows`` (VMM allocation + Fabric V2
+     handle exchange and import).
   3. Verify the returned per-chip ``ChipDomainContext`` carries a non-zero
      ``device_ctx`` + ``local_window_base`` on every participating chip.
   4. Exit the ``with`` block to mark the handle for release; the actual
      ``comm_release_domain_windows`` runs after Worker.run drains.
 
 Deliberately no ``comm_barrier`` after alloc — HCCL 507018 surfaces only
-on the explicit HcclBarrier path, not in our IPC alloc/release.
+on the explicit HcclBarrier path, not in our Fabric alloc/release.
 Cross-rank sync is already enforced by the internal file barriers inside
 the C ABI.
 """
@@ -42,8 +42,8 @@ import pytest
 def test_two_rank_allocate_release_round_trip(st_platform, st_device_ids):
     """End-to-end 2-rank hardware alloc + release round trip.
 
-    Single allocation, one CommBufferSpec, both chips participate.  Locks
-    in the same fields the sim happy-path test does, on real HCCL.
+    A3 performs two sequential allocations on the same base communicator to
+    check Fabric mapping release. A5 keeps the existing single allocation.
     """
     from simpler.task_interface import CallConfig, CommBufferSpec
     from simpler.worker import Worker
@@ -56,9 +56,10 @@ def test_two_rank_allocate_release_round_trip(st_platform, st_device_ids):
     device_ids = [int(d) for d in st_device_ids[:2]]
     nranks = len(device_ids)
 
-    captured: dict[str, object] = {}
+    captures: list[dict[str, object]] = []
 
     def orch_fn(orch, _args, _cfg):
+        captured: dict[str, object] = {}
         with orch.allocate_domain(
             name="tp",
             workers=list(range(nranks)),
@@ -81,6 +82,7 @@ def test_two_rank_allocate_release_round_trip(st_platform, st_device_ids):
                 for chip_idx in tp.workers
             }
         captured["released_after_with"] = tp.released
+        captures.append(captured)
 
     worker = Worker(
         level=3,
@@ -91,25 +93,29 @@ def test_two_rank_allocate_release_round_trip(st_platform, st_device_ids):
     )
     try:
         worker.init()
-        worker.run(orch_fn, args=None, config=CallConfig())
+        repetitions = 2 if st_platform == "a2a3" else 1
+        for _ in range(repetitions):
+            worker.run(orch_fn, args=None, config=CallConfig())
     finally:
         worker.close()
 
-    assert captured["released_after_with"] is True
-    assert captured["workers"] == tuple(range(nranks))
+    assert len(captures) == repetitions
+    if repetitions == 2:
+        assert captures[0]["alloc_id"] != captures[1]["alloc_id"]
+    for captured in captures:
+        assert captured["released_after_with"] is True
+        assert captured["workers"] == tuple(range(nranks))
 
-    contexts: dict[int, dict[str, object]] = captured["contexts"]  # type: ignore[assignment]
-    # Dense domain ranks follow worker order.
-    assert contexts[0]["domain_rank"] == 0
-    assert contexts[1]["domain_rank"] == 1
-    for chip_idx in range(nranks):
-        ctx = contexts[chip_idx]
-        # aclrtMalloc returned non-null for the CommContext + the per-rank pool.
-        assert ctx["device_ctx"] != 0, f"chip {chip_idx}: device_ctx is 0"
-        assert ctx["local_window_base"] != 0, f"chip {chip_idx}: local_window_base is 0"
-        # Buffers carved sequentially from the local pool: scratch at base + 0,
-        # signal at base + 64 (scratch.nbytes).
-        ptrs = ctx["buffer_ptrs"]
-        assert isinstance(ptrs, dict)
-        assert ptrs["scratch"] == ctx["local_window_base"]
-        assert ptrs["signal"] == ctx["local_window_base"] + 64
+        contexts: dict[int, dict[str, object]] = captured["contexts"]  # type: ignore[assignment]
+        # Dense domain ranks follow worker order.
+        assert contexts[0]["domain_rank"] == 0
+        assert contexts[1]["domain_rank"] == 1
+        for chip_idx in range(nranks):
+            ctx = contexts[chip_idx]
+            assert ctx["device_ctx"] != 0, f"chip {chip_idx}: device_ctx is 0"
+            assert ctx["local_window_base"] != 0, f"chip {chip_idx}: local_window_base is 0"
+            # Buffers are carved sequentially from the local pool.
+            ptrs = ctx["buffer_ptrs"]
+            assert isinstance(ptrs, dict)
+            assert ptrs["scratch"] == ctx["local_window_base"]
+            assert ptrs["signal"] == ctx["local_window_base"] + 64
