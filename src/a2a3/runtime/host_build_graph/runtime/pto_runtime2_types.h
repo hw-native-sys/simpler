@@ -197,26 +197,14 @@ struct PTO2TaskDescriptor {
     // Per-slot kernel IDs (INVALID_KERNEL_ID = inactive)
     int32_t kernel_id[PTO2_SUBTASK_SLOT_COUNT];
 
-    // Selective task-timing slot (TASK_TIMING_SLOT_NONE = untagged; 0..15 valid).
-    // Occupies the 4-byte alignment pad that already followed kernel_id[3], so
-    // the descriptor does not grow; the scheduler folds this task's dispatch/
-    // finish cycles into the tagged slot (see common/device_phase.h).
-    int32_t task_timing_slot;
-
     // Packed output buffer (all outputs packed into single contiguous buffer)
     void *packed_buffer_base;  // Start of packed buffer in GM Heap
     void *packed_buffer_end;   // End of packed buffer (for heap reclamation)
 };
 
-// task_timing_slot must occupy the former padding after kernel_id[3] without
-// growing the descriptor or shifting packed_buffer_base — the scheduler and
-// shared-memory ABI depend on the existing size and pointer offset.
-static_assert(sizeof(PTO2TaskDescriptor) == 40, "PTO2TaskDescriptor must not grow: slot uses the existing pad");
-static_assert(
-    offsetof(PTO2TaskDescriptor, task_timing_slot) ==
-        offsetof(PTO2TaskDescriptor, kernel_id) + sizeof(int32_t) * PTO2_SUBTASK_SLOT_COUNT,
-    "task_timing_slot must sit immediately after kernel_id in the former pad"
-);
+// A 4-byte alignment pad follows kernel_id[3]; the scheduler and shared-memory
+// ABI depend on the descriptor size and packed_buffer_base offset staying fixed.
+static_assert(sizeof(PTO2TaskDescriptor) == 40, "PTO2TaskDescriptor size is part of the shared-memory ABI");
 static_assert(offsetof(PTO2TaskDescriptor, packed_buffer_base) == 24, "packed_buffer_base offset must be unchanged");
 
 // =============================================================================
@@ -480,9 +468,12 @@ struct alignas(64) PTO2TaskSlotState {
 
     // --- Set per-submit (depend on task inputs) ---
     ActiveMask active_mask;  // Bitmask of active subtask slots (set once)
-    // Codegen early-dispatch hint, copied from Arg at submit. Stored for the
-    // Milestone-2 publish-status early-dispatch; no Milestone-1 hot-path reader.
-    bool allow_early_resolve{false};
+    // Single per-task attributes byte (early-dispatch hint, sync_start,
+    // has_predicate, selective timing tag). Lives on slot_state (not payload) so
+    // fanin walks and the completion path read them off the already-hot producer
+    // slot_state cache line. Plain-write (set once at submit, before the slot is
+    // scheduler-visible).
+    TaskAttrs task_attrs{};
     // Set by any subtask FIN that pushed a deferred-completion CONDITION to the
     // runtime mailbox; read by the last subtask FIN to decide inline vs
     // MPSC-deferred completion. The release write is sequenced before
@@ -530,8 +521,6 @@ struct alignas(64) PTO2TaskSlotState {
 
     bool has_any_subtask_deferred() const { return any_subtask_deferred.load(std::memory_order_acquire); }
 
-    void set_allow_early_resolve(bool v) { allow_early_resolve = v; }
-
     /**
      * Reset dynamic scheduling fields to their pristine values. Runs once per
      * slot at init (pto_shared_memory.cpp) — whole-graph-resident hbg has no
@@ -545,7 +534,8 @@ struct alignas(64) PTO2TaskSlotState {
         any_subtask_deferred.store(false, std::memory_order_relaxed);
         completed_subtasks.store(0, std::memory_order_relaxed);
         next_block_idx.store(0, std::memory_order_relaxed);
-        allow_early_resolve = false;
+        // Note: active_mask and task_attrs are per-submit-constant fields
+        // rewritten in prepare_task on every reuse, so they are not reset here.
         // last_consumer_local_id is seeded in prepare_task once the id is known.
         // Payload early-dispatch/fanin fields are (re)initialized in
         // PTO2TaskPayload::init on every submit, before the slot is visible.

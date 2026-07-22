@@ -385,7 +385,7 @@ static bool check_scope_can_accept_task(PTO2OrchestratorState *orch, PTO2TaskAll
 
 static bool prepare_task(
     PTO2OrchestratorState *orch, const L0TaskArgs &args, int32_t total_output_size, ActiveMask active_mask,
-    PTO2PreparedTask *out
+    TaskAttrs task_attrs, PTO2PreparedTask *out
 ) {
     uint8_t ring_id = 0;
     auto &allocator = orch->ring.task_allocator;
@@ -435,6 +435,7 @@ static bool prepare_task(
         static_cast<int16_t>(block_num * __builtin_popcount(active_mask.core_mask()));
     out->slot_state->logical_block_num = block_num;
     out->slot_state->active_mask = active_mask;
+    out->slot_state->task_attrs = task_attrs;
     // Reclaim gate: seed last_consumer to self, so a producer with no consumers
     // is retirable once completed_watermark >= its own id. Each fanin edge bumps
     // it in append_fanin_or_fail. completion_flags for this slot are already 0
@@ -655,20 +656,19 @@ static bool ensure_tensormap_capacity(PTO2OrchestratorState *orch, int32_t neede
 // computation (explicit_deps + auto), output registration, slot init, and
 // Orch-side wiring/ready publication.
 static TaskOutputTensors submit_task_common(
-    PTO2OrchestratorState *orch, const L0TaskArgs &args, ActiveMask active_mask, int32_t aic_kernel_id,
-    int32_t aiv0_kernel_id, int32_t aiv1_kernel_id
+    PTO2OrchestratorState *orch, const L0TaskArgs &args, ActiveMask active_mask, TaskAttrs task_attrs,
+    int32_t aic_kernel_id, int32_t aiv0_kernel_id, int32_t aiv1_kernel_id
 ) {
     CYCLE_COUNT_START();
     TaskOutputTensors result;
     PTO2OutputLayout layout = calculate_output_layout(args);
     PTO2PreparedTask prepared;
-    if (!prepare_task(orch, args, layout.total_output_size, active_mask, &prepared)) {
+    if (!prepare_task(orch, args, layout.total_output_size, active_mask, task_attrs, &prepared)) {
         return result;
     }
     PTO2SchedulerState *sched = orch->scheduler;
     PTO2RingFlowControl &fc = orch->sm_header->ring.fc;
     PTO2TaskId task_id = prepared.task_id;
-    PTO2TaskSlotState &cur_slot_state = *prepared.slot_state;
     PTO2TaskDescriptor &task = *prepared.task;
     PTO2TaskPayload &payload = *prepared.payload;
     result.set_task_id(task_id);
@@ -789,7 +789,6 @@ static TaskOutputTensors submit_task_common(
     task.kernel_id[static_cast<int>(PTO2SubtaskSlot::AIC)] = aic_kernel_id;
     task.kernel_id[static_cast<int>(PTO2SubtaskSlot::AIV0)] = aiv0_kernel_id;
     task.kernel_id[static_cast<int>(PTO2SubtaskSlot::AIV1)] = aiv1_kernel_id;
-    task.task_timing_slot = args.task_timing_slot();
     task.packed_buffer_base = prepared.alloc_result.packed_base;
     task.packed_buffer_end = prepared.alloc_result.packed_end;
 
@@ -797,7 +796,6 @@ static TaskOutputTensors submit_task_common(
     // payload.fanin_local_ids and bumped its last_consumer_local_id; the count is
     // published in STEP 6 below. payload.init does not touch the fanin region.
     payload.init(args, result, prepared.alloc_result, layout);
-    cur_slot_state.set_allow_early_resolve(args.allow_early_resolve());
 
     // Dispatch predicate: resolve the (tensor, indices) to an absolute GM address
     // now so the scheduler can read it at the dispatch point with a single load,
@@ -905,7 +903,11 @@ TaskOutputTensors PTO2OrchestratorState::submit_task(const MixedKernels &mixed_k
         active_mask = normalized.to_active_mask();
     }
 
-    // Encode require_sync_start into active_mask bit 3 (only meaningful for tasks with block_num > 1)
+    TaskAttrs task_attrs;
+    task_attrs.set_early_resolve(args.allow_early_resolve());
+    task_attrs.set_timing_slot(args.task_timing_slot());
+
+    // sync_start is only meaningful for tasks with block_num > 1.
     if (block_num > 1 && args.launch_spec.require_sync_start()) {
         // Deadlock check: block_num >= total available slots of the required type.
         // For MIX/AIC: limit is total_cluster_count (one AIC per cluster).
@@ -919,15 +921,16 @@ TaskOutputTensors PTO2OrchestratorState::submit_task(const MixedKernels &mixed_k
             );
             return TaskOutputTensors{};
         }
-        active_mask.set_sync_start();
+        task_attrs.set_sync_start();
     }
 
     if (args.predicate().op != PredicateOp::NONE) {
-        active_mask.set_has_predicate();
+        task_attrs.set_predicate();
     }
 
     return submit_task_common(
-        orch, args, active_mask, normalized.aic_kernel_id, normalized.aiv0_kernel_id, normalized.aiv1_kernel_id
+        orch, args, active_mask, task_attrs, normalized.aic_kernel_id, normalized.aiv0_kernel_id,
+        normalized.aiv1_kernel_id
     );
 }
 
@@ -955,7 +958,15 @@ TaskOutputTensors PTO2OrchestratorState::submit_dummy_task(const L0TaskArgs &arg
     }
     always_assert(orch->scheduler != nullptr);
 
-    return submit_task_common(orch, args, ActiveMask{}, INVALID_KERNEL_ID, INVALID_KERNEL_ID, INVALID_KERNEL_ID);
+    // Dummy tasks never dispatch to an AICore, so sync_start / has_predicate do
+    // not apply; only the early-dispatch hint and timing tag carry over.
+    TaskAttrs task_attrs;
+    task_attrs.set_early_resolve(args.allow_early_resolve());
+    task_attrs.set_timing_slot(args.task_timing_slot());
+
+    return submit_task_common(
+        orch, args, ActiveMask{}, task_attrs, INVALID_KERNEL_ID, INVALID_KERNEL_ID, INVALID_KERNEL_ID
+    );
 }
 
 TaskOutputTensors PTO2OrchestratorState::alloc_tensors(const L0TaskArgs &args) {
@@ -995,7 +1006,9 @@ TaskOutputTensors PTO2OrchestratorState::alloc_tensors(const L0TaskArgs &args) {
 
     PTO2OutputLayout layout = calculate_output_layout(args);
     PTO2PreparedTask prepared;
-    if (!prepare_task(orch, args, layout.total_output_size, ActiveMask{}, &prepared)) {
+    // Kernel-less alloc task: no active subtasks, no dispatch-time attributes. The
+    // early-dispatch hint is force-set below (see the flag-the-creator note).
+    if (!prepare_task(orch, args, layout.total_output_size, ActiveMask{}, TaskAttrs{}, &prepared)) {
         return TaskOutputTensors{};
     }
 
@@ -1015,9 +1028,6 @@ TaskOutputTensors PTO2OrchestratorState::alloc_tensors(const L0TaskArgs &args) {
     task.kernel_id[static_cast<int>(PTO2SubtaskSlot::AIC)] = INVALID_KERNEL_ID;
     task.kernel_id[static_cast<int>(PTO2SubtaskSlot::AIV0)] = INVALID_KERNEL_ID;
     task.kernel_id[static_cast<int>(PTO2SubtaskSlot::AIV1)] = INVALID_KERNEL_ID;
-    // alloc_tensors builds a kernel-less descriptor that never dispatches; keep
-    // the slot untagged so a recycled ring slot cannot leak a stale tag.
-    task.task_timing_slot = TASK_TIMING_SLOT_NONE;
     task.packed_buffer_base = prepared.alloc_result.packed_base;
     task.packed_buffer_end = prepared.alloc_result.packed_end;
 
@@ -1044,7 +1054,7 @@ TaskOutputTensors PTO2OrchestratorState::alloc_tensors(const L0TaskArgs &args) {
         // creation — it should always be transparent, never a barrier. Unlike a
         // codegen task there is no Arg-driven hint to honor here, so mark it
         // unconditionally.
-        prepared.slot_state->allow_early_resolve = true;
+        prepared.slot_state->task_attrs.set_early_resolve(true);
         prepared.slot_state->mark_completed();  // host-visible task_state mirror
         // Polling: pre-set the device-visible completion_flags byte in the H2D
         // image. Consumers poll completion_flags (not task_state), so a hidden-alloc

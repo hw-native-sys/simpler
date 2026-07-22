@@ -482,9 +482,9 @@ struct PTO2SchedulerState {
     void push_ready_routed(PTO2TaskSlotState *slot_state) {
         PTO2ResourceShape shape = slot_state->active_mask.to_shape();
         if (shape == PTO2ResourceShape::DUMMY ||
-            (slot_state->active_mask.has_predicate() && !slot_state->payload->predicate.pass())) {
+            (slot_state->task_attrs.has_predicate() && !slot_state->payload->predicate.pass())) {
             dummy_ready_queue.push(slot_state);
-        } else if (slot_state->active_mask.requires_sync_start()) {
+        } else if (slot_state->task_attrs.requires_sync_start()) {
             ready_sync_queues[static_cast<int32_t>(shape)].push(slot_state);
         } else {
             ready_queues[static_cast<int32_t>(shape)].push(slot_state);
@@ -703,7 +703,7 @@ struct PTO2SchedulerState {
     }
 
     inline void record_published_blocks(PTO2TaskSlotState &slot_state, int32_t count) {
-        if (count <= 0 || !slot_state.allow_early_resolve) return;
+        if (count <= 0 || !slot_state.task_attrs.allow_early_resolve()) return;
         slot_state.payload->published_block_count.fetch_add(static_cast<int16_t>(count), std::memory_order_seq_cst);
     }
 
