@@ -36,7 +36,7 @@ worker.init()                 # forks chip child processes + sub children,
 
 def my_orch(orch, args, cfg):
     # orch is the Orchestrator. Submit one task per chip + any sub work.
-    # orch.submit_next_level(...) schedules a ChipCallable onto a free chip.
+    # orch.submit_next_level(..., worker=chip_id) targets one chip.
     # orch.submit_sub(postprocess_handle, sub_args) schedules a Python callable.
     ...
 

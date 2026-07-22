@@ -18,7 +18,7 @@ and passes the handle to the user's orch function::
         a = TaskArgs()
         a.add_tensor(make_tensor_arg(input_tensor),  TensorArgType.INPUT)
         a.add_tensor(make_tensor_arg(output_tensor), TensorArgType.OUTPUT)
-        orch.submit_next_level(chip_handle, a, cfg)  # handle from Worker.register(chip_callable)
+        orch.submit_next_level(chip_handle, a, cfg, worker=0)
 
         sub_args = TaskArgs()
         sub_args.add_tensor(make_tensor_arg(output_tensor), TensorArgType.INPUT)
@@ -154,15 +154,12 @@ class Orchestrator:
     # User-facing submit API
     # ------------------------------------------------------------------
 
-    def submit_next_level(
-        self, callable_handle: Any, args: TaskArgs, config: CallConfig | None = None, *, worker: int = -1
-    ):
+    def submit_next_level(self, callable_handle: Any, args: TaskArgs, config: CallConfig | None = None, *, worker: int):
         """Submit a NEXT_LEVEL task by registered callable handle.
 
         ``callable_handle`` must be returned by ``Worker.register``. Tags inside ``args`` drive deps.
-        ``worker``: stable NEXT_LEVEL worker id for affinity
-        (-1 = unconstrained). For L3 chip dispatch, worker ids are the
-        existing chip worker ids.
+        ``worker`` is the exact stable NEXT_LEVEL worker id that runs the
+        task. For L3 chip dispatch, these are the existing chip worker ids.
         """
         cfg = config if config is not None else CallConfig()
         expected_namespace = (
@@ -194,6 +191,8 @@ class Orchestrator:
             self._worker._stage_host_buffers_for_chip_submit(c_args)
         final_worker_ids = _remote_data_eligible_worker_ids(remote_sidecar, eligible_worker_ids)
         cpp_worker_id = int(worker)
+        if cpp_worker_id < 0:
+            raise ValueError("worker must be a non-negative NEXT_LEVEL worker id")
         worker = self._worker
         # Do the (fallible) kind4 provenance analysis BEFORE capturing remote slot
         # refs, so an exception here can never leave captured refs neither
@@ -250,16 +249,21 @@ class Orchestrator:
         args_list: list,
         config: CallConfig | None = None,
         *,
-        workers: list | None = None,
+        workers: list,
     ):
         """Submit a group of NEXT_LEVEL tasks (N TaskArgs → N worker selections, 1 DAG node).
 
-        ``workers``: per-args stable NEXT_LEVEL worker ids. For L3 chip
-        dispatch, worker ids are the existing chip worker ids.
-        None/empty = all unconstrained.
+        ``workers`` contains the exact stable NEXT_LEVEL worker id for each
+        member. For L3 chip dispatch, these are the existing chip worker ids.
         """
         cfg = config if config is not None else CallConfig()
-        worker_ids = [int(x) for x in workers] if workers else []
+        worker_ids = [int(x) for x in workers]
+        if len(worker_ids) != len(args_list):
+            raise ValueError("workers length must match args_list length")
+        if any(worker_id < 0 for worker_id in worker_ids):
+            raise ValueError("workers must contain only non-negative NEXT_LEVEL worker ids")
+        if len(set(worker_ids)) != len(worker_ids):
+            raise ValueError("workers must not contain duplicate NEXT_LEVEL worker ids")
         expected_namespace = (
             None
             if isinstance(callable_handle, CallableHandle)
@@ -488,9 +492,9 @@ class Orchestrator:
     #
     #     def my_orch(orch, args):
     #         with orch.scope():
-    #             orch.submit_next_level(a, ...)
-    #             orch.submit_next_level(b, ...)
-    #         orch.submit_next_level(c, ...)   # back on outer-scope ring
+    #             orch.submit_next_level(a, ..., worker=0)
+    #             orch.submit_next_level(b, ..., worker=0)
+    #         orch.submit_next_level(c, ..., worker=0)  # outer-scope ring
 
     def scope_begin(self) -> None:
         self._o.scope_begin()

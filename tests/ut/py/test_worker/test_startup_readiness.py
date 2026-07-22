@@ -322,11 +322,11 @@ class TestReadyBarrierHappyPath:
 
             w4 = Worker(level=4, num_sub_workers=0, startup_timeout_s=30.0)
             l3_handle = w4.register(l3_orch)
-            w4.add_worker(l3)
+            l3_worker_id = w4.add_worker(l3)
             w4.init()
 
             def l4_orch(orch, args, config):
-                orch.submit_next_level(l3_handle, TaskArgs(), CallConfig())
+                orch.submit_next_level(l3_handle, TaskArgs(), CallConfig(), worker=l3_worker_id)
 
             w4.run(l4_orch)
             assert _read_counter(counter_buf) == 1
@@ -361,13 +361,13 @@ class TestReadyBarrierHappyPath:
             w4 = Worker(level=4, num_sub_workers=0, startup_timeout_s=30.0)
             ha = w4.register(l3a_orch)
             hb = w4.register(l3b_orch)
-            w4.add_worker(l3a)
-            w4.add_worker(l3b)
+            l3a_worker_id = w4.add_worker(l3a)
+            l3b_worker_id = w4.add_worker(l3b)
             w4.init()
 
             def l4_orch(orch, args, config):
-                orch.submit_next_level(ha, TaskArgs(), CallConfig())
-                orch.submit_next_level(hb, TaskArgs(), CallConfig())
+                orch.submit_next_level(ha, TaskArgs(), CallConfig(), worker=l3a_worker_id)
+                orch.submit_next_level(hb, TaskArgs(), CallConfig(), worker=l3b_worker_id)
 
             w4.run(l4_orch)
             assert _read_counter(a_buf) == 1

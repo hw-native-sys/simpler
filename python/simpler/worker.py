@@ -34,7 +34,7 @@ Usage::
     w.init()
 
     def my_orch(orch, args, cfg):
-        r = orch.submit_next_level(chip_handle, chip_args_ptr, cfg)
+        r = orch.submit_next_level(chip_handle, chip_args_ptr, cfg, worker=0)
         orch.submit_sub(sub_handle, sub_args)
 
     w.run(my_orch, my_args, my_config)

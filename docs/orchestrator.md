@@ -34,13 +34,13 @@ public:
     SubmitResult submit_next_level(const CallableIdentity &callable,
                                     const TaskArgs &args,
                                     const CallConfig &config,
-                                    int32_t worker = -1,
+                                    int32_t worker,
                                     const std::vector<int32_t> &eligible_worker_ids = {},
                                     const RemoteTaskArgsSidecar &remote_sidecar = {});
     SubmitResult submit_next_level_group(const CallableIdentity &callable,
                                           const std::vector<TaskArgs> &args_list,
                                           const CallConfig &config,
-                                          const std::vector<int32_t> &workers = {},
+                                          const std::vector<int32_t> &workers,
                                           const std::vector<std::vector<int32_t>> &eligible_worker_ids = {},
                                           const std::vector<RemoteTaskArgsSidecar> &remote_sidecars = {});
     SubmitResult submit_sub(const CallableIdentity &callable,
@@ -75,11 +75,11 @@ Remote L3 submit adds two hidden pieces of metadata: final eligible worker-id
 sets and optional `RemoteTaskArgsSidecar` entries aligned by tensor index.
 Python `RemoteCallable` handles supply callable eligibility, and
 `TaskArgs.add_tensor(RemoteTensorRef(...), tag)` supplies tensor sidecars. The
-Orchestrator validates affinity, worker existence, local-vs-remote
+Orchestrator validates exact placement, worker existence, local-vs-remote
 compatibility, remote handle access rights for the tensor tag, bare host
 pointers, and remote null OUTPUT tensors before committing the slot.
-For NEXT_LEVEL tasks, `worker`/`workers` are stable worker ids rather than
-C++ worker-thread vector indices.
+For NEXT_LEVEL tasks, `worker`/`workers` are required stable worker ids rather
+than C++ worker-thread vector indices. SUB submit APIs remain unconstrained.
 
 ---
 
@@ -92,7 +92,8 @@ how the slot is set up.
 ```cpp
 SubmitResult Orchestrator::submit_next_level(const CallableIdentity &callable,
                                               TaskArgs args,
-                                              const CallConfig &config) {
+                                              const CallConfig &config,
+                                              int32_t worker) {
     // 1. Alloc slot (blocks on back-pressure if ring full)
     TaskSlot sid = ring_.alloc();
     TaskSlotState &s = slots_[sid];
@@ -443,11 +444,11 @@ Flow:
 ```python
 def my_orch(orch, args, cfg):
     with orch.scope():                             # ring 1
-        orch.submit_next_level(chip_a, a_args, cfg)
-        orch.submit_next_level(chip_b, b_args, cfg)
+        orch.submit_next_level(chip_a, a_args, cfg, worker=0)
+        orch.submit_next_level(chip_b, b_args, cfg, worker=1)
     # Inner tasks are now eligible for reclamation on ring 1,
     # without waiting for any outer-scope task.
-    orch.submit_next_level(chip_c, c_args, cfg)    # ring 0 (outer)
+    orch.submit_next_level(chip_c, c_args, cfg, worker=0)  # ring 0
 ```
 
 `with orch.scope():` is the recommended form. Raw `orch.scope_begin()` /

@@ -242,7 +242,7 @@ and encodes it into the per-WT mailbox — see
 [worker-manager.md](worker-manager.md) §3 for the dispatch protocol.
 
 **Pick-idle back-pressure**: when the manager cannot provide enough idle
-workers that also satisfy affinity and worker eligibility, the slot is
+workers that also satisfy placement and worker eligibility, the slot is
 pushed back onto *its* queue and that queue's drain halts; the other-type
 queue's drain continues. The ring's back-pressure at the Orch side already
 caps the total number of in-flight tasks across both types.
@@ -250,9 +250,9 @@ caps the total number of in-flight tasks across both types.
 Worker eligibility is opaque scheduling metadata. The Scheduler compares
 worker ids and capability bits exposed through `WorkerEndpoint::caps()`, but
 does not inspect HCOMM, RDMA, socket, or remote buffer internals.
-For NEXT_LEVEL affinity, `s.get_affinity(i)` is a stable worker id and can
-be different from the `next_level_threads_` vector index. SUB affinity is not
-public and keeps the internal index semantics.
+For NEXT_LEVEL placement, `s.get_affinity(i)` is the required stable worker id
+and can be different from the `next_level_threads_` vector index. SUB affinity
+is not public and keeps the internal index semantics.
 
 ---
 

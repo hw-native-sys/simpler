@@ -342,11 +342,11 @@ every active child endpoint in the handle's `target_namespace` for this
 `Worker` has installed the callable identity. Registering to a user-selected
 worker subset is not part of this contract.
 `orch.submit_next_level(..., worker=...)` and
-`orch.submit_next_level_group(..., workers=...)` are submit-time affinity
-controls; they do not define registration scope. NEXT_LEVEL affinity consumes
-stable worker ids. Local Python Worker children and remote L3 workers use the
-worker ids returned by `add_worker(...)` / `add_remote_worker(...)`; L3 chip
-worker ids are the existing chip worker ids.
+`orch.submit_next_level_group(..., workers=...)` require exact submit-time
+placement; they do not define registration scope. NEXT_LEVEL placement uses
+stable worker ids. Local Python Worker children and remote L3 workers use ids
+returned by `add_worker(...)` / `add_remote_worker(...)`; L3 chip worker ids
+are the existing chip worker ids.
 
 `CallableHandle` is the public callable token returned by registration:
 
@@ -381,7 +381,7 @@ matmul = worker.register(chip_callable)
 postprocess = worker.register(py_callable)
 
 def parent_orch(orch, args, config):
-    orch.submit_next_level(matmul, args, config)
+    orch.submit_next_level(matmul, args, config, worker=0)
     orch.submit_sub(postprocess, args)
 ```
 

@@ -137,7 +137,7 @@ Relevant code paths:
     `MAILBOX_OFF_ERROR_MSG`.
 - `src/common/hierarchical/orchestrator.{h,cpp}`
   - `submit_next_level()` stores `TaskArgs`, `CallConfig`,
-  `CallableIdentity`, and optional worker affinity in a parent-side slot.
+  `CallableIdentity`, and the required target worker in a parent-side slot.
   - Dependency inference happens before dispatch from tags in `TaskArgs`.
 - `src/common/task_interface/task_args.h`
   - Process dispatch writes `[T][S][Tensor x T][uint64 x S]`.
@@ -234,9 +234,8 @@ initialization has completed.
 ## Worker Identity and Callable Routing
 
 Remote scheduling needs explicit callable resolver scopes and an explicit
-mapping from callable identities to eligible NEXT_LEVEL workers. The current
-scheduler can otherwise choose any idle worker, which is only correct when
-every NEXT_LEVEL child has the same callable registry.
+mapping from callable identities to eligible NEXT_LEVEL workers. Every submit
+also names the exact worker that will execute the task.
 
 Required contracts:
 
@@ -325,13 +324,10 @@ Required contracts:
 - `TaskSlotState` stores the final eligible worker-id set for the slot. This is
   the intersection of workers that can resolve the callable hashid and workers
   that can access every tensor/buffer referenced by the slot.
-- If the user passes `worker=worker_id`, submit-time validation checks that
-  the worker id is eligible for that hashid and for the slot's tensor
-  sidecars.
-- If `worker=-1`, the Scheduler chooses only from idle workers in the
-  slot's eligible set.
-- Group submit validates each affinity independently. Unconstrained group
-  members are assigned distinct idle eligible endpoints.
+- `worker=worker_id` is required. Submit-time validation checks that the worker
+  id is eligible for that hashid and for the slot's tensor sidecars.
+- Group submit requires one distinct worker id per member and validates each
+  target independently.
 - Mixed local + remote NEXT_LEVEL pools are allowed only when the callable
   hashid is registered on every endpoint that can receive the slot and the
   slot's tensors are materialized in a representation those endpoints can

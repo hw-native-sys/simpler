@@ -151,8 +151,7 @@ SubmitResult Orchestrator::submit_next_level(
     const CallableIdentity &callable, const TaskArgs &args, const CallConfig &config, int32_t worker_id,
     const std::vector<int32_t> &eligible_worker_ids, const RemoteTaskArgsSidecar &remote_sidecar
 ) {
-    std::vector<int32_t> affinities;
-    if (worker_id >= 0) affinities = {worker_id};
+    std::vector<int32_t> affinities{worker_id};
     std::vector<std::vector<int32_t>> worker_id_sets;
     if (!eligible_worker_ids.empty()) worker_id_sets = {eligible_worker_ids};
     std::vector<RemoteTaskArgsSidecar> sidecars;
@@ -322,10 +321,10 @@ void Orchestrator::validate_worker_eligibility(
     WorkerType worker_type, size_t args_count, const std::vector<int32_t> &affinities,
     const std::vector<std::vector<int32_t>> &eligible_worker_ids
 ) const {
-    if (!affinities.empty() && affinities.size() != args_count) {
+    if (worker_type == WorkerType::NEXT_LEVEL && affinities.size() != args_count) {
         throw std::invalid_argument(
-            "Orchestrator: affinity length " + std::to_string(affinities.size()) + " does not match args length " +
-            std::to_string(args_count)
+            "Orchestrator: NEXT_LEVEL target count " + std::to_string(affinities.size()) +
+            " does not match args length " + std::to_string(args_count)
         );
     }
     if (!eligible_worker_ids.empty() && eligible_worker_ids.size() != args_count) {
@@ -333,6 +332,20 @@ void Orchestrator::validate_worker_eligibility(
             "Orchestrator: eligible worker-id set length " + std::to_string(eligible_worker_ids.size()) +
             " does not match args length " + std::to_string(args_count)
         );
+    }
+
+    if (worker_type == WorkerType::NEXT_LEVEL) {
+        std::unordered_set<int32_t> unique_targets;
+        for (int32_t worker_id : affinities) {
+            if (worker_id < 0) {
+                throw std::invalid_argument("Orchestrator: NEXT_LEVEL worker id must be non-negative");
+            }
+            if (!unique_targets.insert(worker_id).second) {
+                throw std::invalid_argument(
+                    "Orchestrator: duplicate NEXT_LEVEL worker id " + std::to_string(worker_id)
+                );
+            }
+        }
     }
 
     const std::vector<int32_t> empty_eligible;

@@ -314,13 +314,12 @@ and calls `submit_next_level` / `submit_sub`. These Python methods return
 
 ```python
 class Orchestrator:
-    # `worker=-1` means unconstrained. Non-negative affinities are stable
-    # NEXT_LEVEL worker ids. For local Python Worker children and remote
-    # L3 dispatch, these are returned by add_worker(...) or
+    # NEXT_LEVEL placement is required. For local Python Worker children and
+    # remote L3 dispatch, stable ids are returned by add_worker(...) or
     # add_remote_worker(...). For L3 ChipCallable dispatch, worker ids are
     # the existing chip worker ids.
-    def submit_next_level(self, handle, args, config=None, *, worker=-1) -> None: ...
-    def submit_next_level_group(self, handle, args_list, config=None, *, workers=None) -> None: ...
+    def submit_next_level(self, handle, args, config=None, *, worker) -> None: ...
+    def submit_next_level_group(self, handle, args_list, config=None, *, workers) -> None: ...
     def submit_sub(self, handle, args=None) -> None: ...
     def submit_sub_group(self, handle, args_list) -> None: ...
 ```
@@ -527,7 +526,7 @@ def my_orch(orch, view, cfg):
     chip_args = TaskArgs()
     for i in range(view.tensor_count):
         chip_args.add_tensor(view.tensors[i], IN if i < 2 else OUT)
-    orch.submit_next_level(chip_kernel_handle, chip_args, cfg)
+    orch.submit_next_level(chip_kernel_handle, chip_args, cfg, worker=0)
 
 w3 = Worker(level=3, child_mode=PROCESS)
 w3.add_worker(NEXT_LEVEL, chip_worker_0)

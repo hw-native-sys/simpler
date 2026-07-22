@@ -200,11 +200,11 @@ class TestL4DynamicRegister:
 
             w4 = Worker(level=4, num_sub_workers=0)
             bootstrap_handle = w4.register(lambda orch, args, config: None)
-            w4.add_worker(l3)
+            l3_worker_id = w4.add_worker(l3)
             w4.init()
 
             def bootstrap(orch, args, config):
-                orch.submit_next_level(bootstrap_handle, TaskArgs(), CallConfig())
+                orch.submit_next_level(bootstrap_handle, TaskArgs(), CallConfig(), worker=l3_worker_id)
 
             w4.run(bootstrap)
 
@@ -214,7 +214,7 @@ class TestL4DynamicRegister:
             dynamic_handle = w4.register(dynamic_l3_orch)
 
             def l4_orch(orch, args, config):
-                orch.submit_next_level(dynamic_handle, TaskArgs(), CallConfig())
+                orch.submit_next_level(dynamic_handle, TaskArgs(), CallConfig(), worker=l3_worker_id)
 
             w4.run(l4_orch)
             w4.close()
@@ -250,11 +250,11 @@ class TestL4ToL3SingleDispatch:
             # L4 parent: one next-level child, register L3 orch fn
             w4 = Worker(level=4, num_sub_workers=0)
             l3_handle = w4.register(l3_orch)
-            w4.add_worker(l3)
+            l3_worker_id = w4.add_worker(l3)
             w4.init()
 
             def l4_orch(orch, args, config):
-                orch.submit_next_level(l3_handle, TaskArgs(), CallConfig())
+                orch.submit_next_level(l3_handle, TaskArgs(), CallConfig(), worker=l3_worker_id)
 
             w4.run(l4_orch)
             w4.close()
@@ -284,12 +284,12 @@ class TestL4ToL3MultipleDispatches:
 
             w4 = Worker(level=4, num_sub_workers=0)
             l3_handle = w4.register(l3_orch)
-            w4.add_worker(l3)
+            l3_worker_id = w4.add_worker(l3)
             w4.init()
 
             def l4_orch(orch, args, config):
                 for _ in range(3):
-                    orch.submit_next_level(l3_handle, TaskArgs(), CallConfig())
+                    orch.submit_next_level(l3_handle, TaskArgs(), CallConfig(), worker=l3_worker_id)
 
             w4.run(l4_orch)
             w4.close()
@@ -326,11 +326,11 @@ class TestL4WithOwnSubs:
             w4 = Worker(level=4, num_sub_workers=1)
             l3_handle = w4.register(l3_orch)
             l4_verify_handle = w4.register(lambda args: _increment_counter(counter_buf))
-            w4.add_worker(l3)
+            l3_worker_id = w4.add_worker(l3)
             w4.init()
 
             def l4_orch(orch, args, config):
-                orch.submit_next_level(l3_handle, TaskArgs(), CallConfig())
+                orch.submit_next_level(l3_handle, TaskArgs(), CallConfig(), worker=l3_worker_id)
                 orch.submit_sub(l4_verify_handle)
 
             w4.run(l4_orch)
@@ -362,11 +362,11 @@ class TestL4MultipleRuns:
 
             w4 = Worker(level=4, num_sub_workers=0)
             l3_handle = w4.register(l3_orch)
-            w4.add_worker(l3)
+            l3_worker_id = w4.add_worker(l3)
             w4.init()
 
             def l4_orch(orch, args, config):
-                orch.submit_next_level(l3_handle, TaskArgs(), CallConfig())
+                orch.submit_next_level(l3_handle, TaskArgs(), CallConfig(), worker=l3_worker_id)
 
             for _ in range(5):
                 w4.run(l4_orch)
@@ -403,11 +403,11 @@ class TestL4L3WithMultipleSubs:
 
             w4 = Worker(level=4, num_sub_workers=0)
             l3_handle = w4.register(l3_orch)
-            w4.add_worker(l3)
+            l3_worker_id = w4.add_worker(l3)
             w4.init()
 
             def l4_orch(orch, args, config):
-                orch.submit_next_level(l3_handle, TaskArgs(), CallConfig())
+                orch.submit_next_level(l3_handle, TaskArgs(), CallConfig(), worker=l3_worker_id)
 
             w4.run(l4_orch)
             w4.close()
@@ -439,11 +439,11 @@ class TestL3OwnOrchestrator:
 
             w4 = Worker(level=4, num_sub_workers=0)
             l3_handle = w4.register(l3_orch)
-            w4.add_worker(l3)
+            l3_worker_id = w4.add_worker(l3)
             w4.init()
 
             def l4_orch(orch, args, config):
-                orch.submit_next_level(l3_handle, TaskArgs(), CallConfig())
+                orch.submit_next_level(l3_handle, TaskArgs(), CallConfig(), worker=l3_worker_id)
 
             w4.run(l4_orch)
             w4.close()

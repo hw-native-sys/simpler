@@ -86,7 +86,7 @@ Owns:
   identity and logical offset.
 - `Scope` — lifetime management for intermediate tensors
 
-One `submit_next_level(callable, task_args, config)` call:
+One `submit_next_level(callable, task_args, config, worker=worker_id)` call:
 
 1. allocates a slot
 2. moves task data into the slot

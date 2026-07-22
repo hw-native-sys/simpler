@@ -98,17 +98,17 @@ public:
     // by Worker.register(); the child resolves its digest to a private slot.
     // Tags inside `args` drive dependency inference; OUTPUT tensors with
     // null data are auto-allocated from the HeapRing.
-    // `worker_id`: stable NEXT_LEVEL worker id for affinity (-1 = unconstrained).
+    // `worker_id`: exact stable NEXT_LEVEL worker id that runs this task.
     SubmitResult submit_next_level(
-        const CallableIdentity &callable, const TaskArgs &args, const CallConfig &config, int32_t worker_id = -1,
+        const CallableIdentity &callable, const TaskArgs &args, const CallConfig &config, int32_t worker_id,
         const std::vector<int32_t> &eligible_worker_ids = {}, const RemoteTaskArgsSidecar &remote_sidecar = {}
     );
 
     // Submit a group of NEXT_LEVEL tasks: N args -> N worker selections, 1 DAG node.
-    // `worker_ids`: per-args stable NEXT_LEVEL worker id affinity.
+    // `worker_ids`: one exact stable NEXT_LEVEL worker id per member.
     SubmitResult submit_next_level_group(
         const CallableIdentity &callable, const std::vector<TaskArgs> &args_list, const CallConfig &config,
-        const std::vector<int32_t> &worker_ids = {}, const std::vector<std::vector<int32_t>> &eligible_worker_ids = {},
+        const std::vector<int32_t> &worker_ids, const std::vector<std::vector<int32_t>> &eligible_worker_ids = {},
         const std::vector<RemoteTaskArgsSidecar> &remote_sidecars = {}
     );
 

@@ -215,12 +215,12 @@ class TestL4ChainedFailure:
 
         w4 = Worker(level=4, num_sub_workers=0)
         l3_handle = w4.register(l3_orch)
-        w4.add_worker(l3)
+        l3_worker_id = w4.add_worker(l3)
         w4.init()
         try:
 
             def l4_orch(orch, args, config):
-                orch.submit_next_level(l3_handle, TaskArgs(), CallConfig())
+                orch.submit_next_level(l3_handle, TaskArgs(), CallConfig(), worker=l3_worker_id)
 
             with pytest.raises(RuntimeError) as info:
                 w4.run(l4_orch)

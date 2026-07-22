@@ -22,7 +22,7 @@ def orch_fn(orch, _args, _cfg):
         for key in RING_FIELDS:                # ring_task_window / ring_heap / ring_dep_pool
             if key in spec:                    # value is a scalar or a 4-entry list
                 setattr(cfg.runtime_env, key, spec[key])
-        orch.submit_next_level(chip_handle, chip_args, cfg)  # per-task config
+        orch.submit_next_level(chip_handle, chip_args, cfg, worker=0)  # per-task config
 ```
 
 The per-task config travels through the mailbox to the chip child, so each L2
