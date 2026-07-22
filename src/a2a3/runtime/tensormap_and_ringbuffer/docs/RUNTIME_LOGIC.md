@@ -634,7 +634,7 @@ pending slot, promoted on completion). This order lives in one shared skeleton,
 | NORMAL (ready) | `ready_queues[MIX\|AIC\|AIV]` | `ready_sync_queues[MIX\|AIC\|AIV]` (per-shape) |
 | EARLY (speculative) | `early_dispatch_queues[MIX\|AIC\|AIV]` | `early_sync_start_queue` (single) |
 
-A task routes to the sync lane iff `active_mask.requires_sync_start()`. In each source the
+A task routes to the sync lane iff `task_attrs.requires_sync_start()`. In each source the
 sync lane is drained as a strict **Tier-0** before the regular lane (`sync_start > MIX > C/V`),
 and early dispatch runs only once *both* normal lanes are empty (normal ▸ early).
 

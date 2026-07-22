@@ -634,7 +634,7 @@ pending slot, promoted on completion). a5 implements this order inline in
 | NORMAL (ready) | `ready_queues[MIX\|AIC\|AIV]` | *(same `ready_queues[]` — a5 has no `ready_sync_queues[]`)* |
 | EARLY (speculative) | `early_dispatch_queues[MIX\|AIC\|AIV]` | `early_sync_start_queue` (single) |
 
-A task routes to the early sync lane iff `active_mask.requires_sync_start()`. Early
+A task routes to the early sync lane iff `task_attrs.requires_sync_start()`. Early
 dispatch runs only once normal `ready_queues[]` are empty **and** the local
 `CoreTracker` has a spare slot (`has_any_free_slot`, a2a3 #1288).
 

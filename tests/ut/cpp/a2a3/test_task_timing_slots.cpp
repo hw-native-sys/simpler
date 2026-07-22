@@ -133,20 +133,54 @@ TEST(TaskTimingSlots, ResolveZeroesIncompleteAndUntagged) {
     }
 }
 
-// --- Descriptor fits the former padding, no growth ------------------------
+// --- Descriptor stays 40B; timing tag now rides TaskAttrs ----------------
 
-TEST(TaskTimingSlots, DescriptorSlotRoundTrip) {
-    // Static guarantees live as static_asserts in pto_runtime2_types.h; here we
-    // exercise the field roundtrip and confirm it sits in the former pad.
+TEST(TaskTimingSlots, DescriptorDoesNotGrow) {
+    // The timing tag moved off the descriptor onto TaskAttrs; the descriptor
+    // (shared-memory ABI) keeps its size and packed_buffer_base offset.
     EXPECT_EQ(sizeof(PTO2TaskDescriptor), 40u);
-    EXPECT_EQ(
-        offsetof(PTO2TaskDescriptor, task_timing_slot),
-        offsetof(PTO2TaskDescriptor, kernel_id) + sizeof(int32_t) * PTO2_SUBTASK_SLOT_COUNT
-    );
+    EXPECT_EQ(offsetof(PTO2TaskDescriptor, packed_buffer_base), 24u);
+}
 
-    PTO2TaskDescriptor desc{};
-    desc.task_timing_slot = 7;
-    EXPECT_EQ(desc.task_timing_slot, 7);
+TEST(TaskTimingSlots, MarkersTimingRoundTrip) {
+    EXPECT_EQ(sizeof(TaskAttrs), 1u);
+
+    TaskAttrs m;
+    // Untagged by default.
+    EXPECT_FALSE(m.is_timed());
+    EXPECT_EQ(m.timing_slot(), TASK_TIMING_SLOT_NONE);
+
+    // Tagging endpoints of the valid range roundtrips through the 4-bit field.
+    m.set_timing_slot(0);
+    EXPECT_TRUE(m.is_timed());
+    EXPECT_EQ(m.timing_slot(), 0);
+    m.set_timing_slot(15);
+    EXPECT_TRUE(m.is_timed());
+    EXPECT_EQ(m.timing_slot(), 15);
+
+    // A negative slot clears the tag back to untagged.
+    m.set_timing_slot(TASK_TIMING_SLOT_NONE);
+    EXPECT_FALSE(m.is_timed());
+    EXPECT_EQ(m.timing_slot(), TASK_TIMING_SLOT_NONE);
+}
+
+TEST(TaskTimingSlots, MarkersFlagsIndependent) {
+    // Each flag is independent and does not disturb the timing tag.
+    TaskAttrs m;
+    m.set_timing_slot(9);
+    m.set_early_resolve(true);
+    m.set_sync_start();
+    m.set_predicate();
+    EXPECT_TRUE(m.allow_early_resolve());
+    EXPECT_TRUE(m.requires_sync_start());
+    EXPECT_TRUE(m.has_predicate());
+    EXPECT_EQ(m.timing_slot(), 9);
+
+    m.set_early_resolve(false);
+    EXPECT_FALSE(m.allow_early_resolve());
+    EXPECT_TRUE(m.requires_sync_start());
+    EXPECT_TRUE(m.has_predicate());
+    EXPECT_EQ(m.timing_slot(), 9);
 }
 
 // --- L0TaskArgs setter: bounds + sentinel ---------------------------------

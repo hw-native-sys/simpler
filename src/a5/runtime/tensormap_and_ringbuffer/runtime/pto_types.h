@@ -45,6 +45,11 @@
 #include "tensor.h"
 #include "tensor_create_info.h"  // runtime-only TensorCreateInfo + materialization helpers
 
+// TaskAttrs packs the timing tag into a 4-bit field and reports "untagged" as
+// -1, so the tag domain must fit 0..15 and the untagged sentinel must be -1.
+static_assert(NUM_TASK_TIMING_SLOTS <= 16, "timing tag must fit TaskAttrs' 4-bit field");
+static_assert(TASK_TIMING_SLOT_NONE == -1, "TaskAttrs::timing_slot() reports untagged as -1");
+
 typedef enum {
     ASYNC_ENGINE_SDMA = 0,
     ASYNC_ENGINE_ROCE = 1,

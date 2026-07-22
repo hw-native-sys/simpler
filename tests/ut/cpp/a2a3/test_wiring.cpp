@@ -301,7 +301,7 @@ TEST_F(WiringTest, WireTaskAllFlaggedPrecompletedSeedsDispatchFanin) {
 
     for (int i = 0; i < 2; i++) {
         init_slot(producer_slots[i], PTO2_TASK_COMPLETED, 1, 2);
-        producer_slots[i].allow_early_resolve = true;  // codegen-flagged
+        producer_slots[i].task_attrs.set_early_resolve(true);  // codegen-flagged
     }
 
     init_slot(task_slot, PTO2_TASK_PENDING, 0, 1);
@@ -330,7 +330,7 @@ TEST_F(WiringTest, WireTaskUnflaggedPrecompletedProducerDoesNotSeed) {
     PTO2TaskDescriptor desc{};
 
     init_slot(producer, PTO2_TASK_COMPLETED, 1, 1);
-    producer.allow_early_resolve = false;  // unflagged
+    producer.task_attrs.set_early_resolve(false);  // unflagged
 
     init_slot(task_slot, PTO2_TASK_PENDING, 0, 1);
     payload.fanin_actual_count = 1;
@@ -353,9 +353,9 @@ TEST_F(WiringTest, WireTaskOneUnflaggedProducerDisqualifiesSeed) {
     PTO2TaskDescriptor desc{};
 
     init_slot(producers[0], PTO2_TASK_COMPLETED, 1, 2);
-    producers[0].allow_early_resolve = true;  // flagged
+    producers[0].task_attrs.set_early_resolve(true);  // flagged
     init_slot(producers[1], PTO2_TASK_COMPLETED, 1, 2);
-    producers[1].allow_early_resolve = false;  // one unflagged -> disqualifies
+    producers[1].task_attrs.set_early_resolve(false);  // one unflagged -> disqualifies
 
     init_slot(task_slot, PTO2_TASK_PENDING, 0, 1);
     payload.fanin_actual_count = 2;
@@ -380,7 +380,7 @@ TEST_F(WiringTest, EarlyDispatchWaitsForAllProducerBlocksPublished) {
     PTO2TaskDescriptor desc{};
 
     init_slot(producer, PTO2_TASK_PENDING, 1, 1);
-    producer.allow_early_resolve = true;
+    producer.task_attrs.set_early_resolve(true);
     producer.logical_block_num = 3;
 
     init_slot(task_slot, PTO2_TASK_PENDING, 0, 1);
@@ -413,7 +413,7 @@ TEST_F(WiringTest, LateWiredFullyPublishedProducerStillSeedsEarlyDispatch) {
     PTO2TaskDescriptor consumer_desc{};
 
     init_slot(producer, PTO2_TASK_PENDING, 1, 1);
-    producer.allow_early_resolve = true;
+    producer.task_attrs.set_early_resolve(true);
     sched.record_published_blocks(producer, producer.logical_block_num);
     sched.propagate_dispatch_fanin(producer);
     ASSERT_TRUE(producer.has_dispatch_propagated());
@@ -443,7 +443,7 @@ TEST_F(WiringTest, WiringSeedEnqueuesAfterConcurrentPropagation) {
     init_slot(producers[1], PTO2_TASK_PENDING, 1, 1);
     init_slot(producers[2], PTO2_TASK_COMPLETED, 1, 1);
     for (auto &producer : producers)
-        producer.allow_early_resolve = true;
+        producer.task_attrs.set_early_resolve(true);
     sched.record_published_blocks(producers[1], producers[1].logical_block_num);
 
     init_slot(consumer, PTO2_TASK_PENDING, 0, 1);
@@ -591,7 +591,7 @@ TEST_F(WiringTest, EarlyDispatchFanoutWaitsForDoorbellPass) {
     init_slot(producer, PTO2_TASK_PENDING, 1, 1);
     init_slot(consumer, PTO2_TASK_PENDING, 1, 1);
 
-    producer.allow_early_resolve = true;
+    producer.task_attrs.set_early_resolve(true);
     producer.payload->published_block_count.store(1, std::memory_order_relaxed);
     consumer.payload->fanin_actual_count = 1;
 
@@ -639,7 +639,7 @@ TEST_F(WiringTest, EarlyDispatchReleaseConsumesDoorbellMask) {
     constexpr uint32_t token = 11;
     alignas(64) PTO2TaskSlotState task;
     init_slot(task, PTO2_TASK_PENDING, 1, 1);
-    task.allow_early_resolve = true;
+    task.task_attrs.set_early_resolve(true);
     task.next_block_idx.store(1, std::memory_order_relaxed);
     task.payload->early_dispatch_state.store(PTO2_EARLY_DISPATCH_STAGING, std::memory_order_relaxed);
     task.payload->staged_core_mask[0].store(1ULL << core_id, std::memory_order_relaxed);
@@ -707,8 +707,8 @@ TEST_F(WiringTest, SyncStartDrainFinalizeRetriesProducerFirstRendezvous) {
     init_slot(downstream, PTO2_TASK_PENDING, 1, 1);
 
     sync_consumer.active_mask = ActiveMask(PTO2_SUBTASK_MASK_AIV0);
-    sync_consumer.active_mask.set_sync_start();
-    sync_consumer.allow_early_resolve = true;
+    sync_consumer.task_attrs.set_sync_start();
+    sync_consumer.task_attrs.set_early_resolve(true);
     sync_consumer.logical_block_num = 2;
     sync_consumer.next_block_idx.store(2, std::memory_order_relaxed);
     sched.record_published_blocks(sync_consumer, sync_consumer.logical_block_num);
@@ -742,7 +742,7 @@ TEST_F(WiringTest, ArmedEarlySyncDrainOwnsFinalReadyRoute) {
     alignas(64) PTO2TaskSlotState sync_consumer;
     init_slot(sync_consumer, PTO2_TASK_PENDING, 1, 1);
     sync_consumer.active_mask = ActiveMask(PTO2_SUBTASK_MASK_AIV0);
-    sync_consumer.active_mask.set_sync_start();
+    sync_consumer.task_attrs.set_sync_start();
     sync_consumer.logical_block_num = 2;
     sync_consumer.payload->early_dispatch_state.store(PTO2_EARLY_DISPATCH_STAGING, std::memory_order_relaxed);
 
@@ -811,7 +811,7 @@ TEST_F(WiringTest, DrainFinishBetweenReleasePhasesRetainsOwner) {
     alignas(64) PTO2TaskSlotState sync_consumer;
     init_slot(sync_consumer, PTO2_TASK_PENDING, 1, 1);
     sync_consumer.active_mask = ActiveMask(PTO2_SUBTASK_MASK_AIV0);
-    sync_consumer.active_mask.set_sync_start();
+    sync_consumer.task_attrs.set_sync_start();
     sync_consumer.logical_block_num = 2;
     sync_consumer.payload->early_dispatch_state.store(PTO2_EARLY_DISPATCH_STAGING, std::memory_order_relaxed);
 
@@ -835,7 +835,7 @@ TEST_F(WiringTest, CancelledEarlySyncDrainRoutesProducerRelease) {
     alignas(64) PTO2TaskSlotState sync_consumer;
     init_slot(sync_consumer, PTO2_TASK_PENDING, 1, 1);
     sync_consumer.active_mask = ActiveMask(PTO2_SUBTASK_MASK_AIV0);
-    sync_consumer.active_mask.set_sync_start();
+    sync_consumer.task_attrs.set_sync_start();
     sync_consumer.logical_block_num = 2;
     sync_consumer.payload->early_dispatch_state.store(PTO2_EARLY_DISPATCH_STAGING, std::memory_order_relaxed);
 
@@ -853,7 +853,7 @@ TEST_F(WiringTest, ProducerReleaseTransfersReadyRouteToCancellingDrain) {
     alignas(64) PTO2TaskSlotState sync_consumer;
     init_slot(sync_consumer, PTO2_TASK_PENDING, 1, 1);
     sync_consumer.active_mask = ActiveMask(PTO2_SUBTASK_MASK_AIV0);
-    sync_consumer.active_mask.set_sync_start();
+    sync_consumer.task_attrs.set_sync_start();
     sync_consumer.logical_block_num = 2;
     sync_consumer.payload->early_dispatch_state.store(PTO2_EARLY_DISPATCH_STAGING, std::memory_order_relaxed);
 
@@ -876,9 +876,9 @@ TEST_F(WiringTest, EarlyDispatchBlockedByUnflaggedProducer) {
     PTO2TaskDescriptor desc{};
 
     init_slot(p_flagged, PTO2_TASK_PENDING, 1, 1);
-    p_flagged.allow_early_resolve = true;
+    p_flagged.task_attrs.set_early_resolve(true);
     init_slot(q_unflagged, PTO2_TASK_PENDING, 1, 1);
-    q_unflagged.allow_early_resolve = false;
+    q_unflagged.task_attrs.set_early_resolve(false);
 
     init_slot(task_slot, PTO2_TASK_PENDING, 0, 1);
     payload.fanin_actual_count = 2;
@@ -906,7 +906,7 @@ TEST_F(WiringTest, UnflaggedProducerDoesNotPropagate) {
     memset(&cons_payload, 0, sizeof(cons_payload));
 
     init_slot(producer, PTO2_TASK_PENDING, 1, 1);
-    producer.allow_early_resolve = false;  // unflagged
+    producer.task_attrs.set_early_resolve(false);  // unflagged
     producer.payload = &prod_payload;
 
     init_slot(consumer, PTO2_TASK_PENDING, 1, 1);
@@ -937,9 +937,9 @@ TEST_F(WiringTest, FlaggedPrecompletedCreatorTransparentToEarlyDispatch) {
     PTO2TaskDescriptor desc{};
 
     init_slot(creator, PTO2_TASK_COMPLETED, 1, 1);
-    creator.allow_early_resolve = true;  // alloc creator: flagged -> transparent
+    creator.task_attrs.set_early_resolve(true);  // alloc creator: flagged -> transparent
     init_slot(compute, PTO2_TASK_PENDING, 1, 1);
-    compute.allow_early_resolve = true;  // flagged compute producer
+    compute.task_attrs.set_early_resolve(true);  // flagged compute producer
 
     init_slot(task_slot, PTO2_TASK_PENDING, 0, 1);
     payload.fanin_actual_count = 2;

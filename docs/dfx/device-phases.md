@@ -172,10 +172,10 @@ threads, no per-task AICore records, works in `SIMPLER_DFX=0`. See
   invalid-arg path. **No env var and no compile gate** — tagging is the only
   switch. An untagged task's only added hot-path cost is one cache-hot sentinel
   compare; it never reads `get_sys_cnt_aicpu()`.
-* **Transport reuses this same buffer.** The id rides the descriptor in the
-  4-byte pad after `PTO2TaskDescriptor::kernel_id[3]` (size/offset
-  `static_assert`s guard that it does not grow the descriptor). The 16 slots are
-  a fixed `TaskTimingRecord[16]` **tail** appended after the `AicpuPhaseRecord`
+* **Transport reuses this same buffer.** The id rides the scheduler's hot
+  `PTO2TaskSlotState` in the `TaskAttrs` byte (bit 3 `is_timed` + bits 4-7 the
+  0..15 tag), co-located with the other per-task scheduling flags. The 16 slots
+  are a fixed `TaskTimingRecord[16]` **tail** appended after the `AicpuPhaseRecord`
   region in the same device buffer — same base pointer, same per-run H2D reset
   and post-sync D2H readback. It is a distinct record type (dispatch/finish, not
   start/end) reduced by **min(dispatch) / max(finish)**, not an `AicpuPhase`
@@ -209,8 +209,8 @@ threads, no per-task AICore records, works in `SIMPLER_DFX=0`. See
   resolving via affinity there would drop every write. Any distinct valid index
   per thread yields the same min/max reduction.
 * **Dummy tasks.** `alloc_tensors` builds a kernel-less descriptor that never
-  dispatches; it is forced untagged so a recycled ring slot cannot leak a stale
-  tag.
+  dispatches; its `TaskAttrs` start cleared (untagged) so a recycled ring slot
+  cannot leak a stale tag.
 
 Seams: `common/device_phase.h` (`TaskTimingRecord`, `reduce_task_timing_slots`,
 buffer-layout helpers), `aicpu/device_phase_aicpu.h`

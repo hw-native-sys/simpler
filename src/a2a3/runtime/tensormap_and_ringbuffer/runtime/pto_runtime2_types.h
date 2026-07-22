@@ -199,26 +199,14 @@ struct PTO2TaskDescriptor {
     // Per-slot kernel IDs (INVALID_KERNEL_ID = inactive)
     int32_t kernel_id[PTO2_SUBTASK_SLOT_COUNT];
 
-    // Selective task-timing slot (TASK_TIMING_SLOT_NONE = untagged; 0..15 valid).
-    // Occupies the 4-byte alignment pad that already followed kernel_id[3], so
-    // the descriptor does not grow; the scheduler folds this task's dispatch/
-    // finish cycles into the tagged slot (see common/device_phase.h).
-    int32_t task_timing_slot;
-
     // Packed output buffer (all outputs packed into single contiguous buffer)
     void *packed_buffer_base;  // Start of packed buffer in GM Heap
     void *packed_buffer_end;   // End of packed buffer (for heap reclamation)
 };
 
-// task_timing_slot must occupy the former padding after kernel_id[3] without
-// growing the descriptor or shifting packed_buffer_base — the scheduler and
-// shared-memory ABI depend on the existing size and pointer offset.
-static_assert(sizeof(PTO2TaskDescriptor) == 40, "PTO2TaskDescriptor must not grow: slot uses the existing pad");
-static_assert(
-    offsetof(PTO2TaskDescriptor, task_timing_slot) ==
-        offsetof(PTO2TaskDescriptor, kernel_id) + sizeof(int32_t) * PTO2_SUBTASK_SLOT_COUNT,
-    "task_timing_slot must sit immediately after kernel_id in the former pad"
-);
+// A 4-byte alignment pad follows kernel_id[3]; the scheduler and shared-memory
+// ABI depend on the descriptor size and packed_buffer_base offset staying fixed.
+static_assert(sizeof(PTO2TaskDescriptor) == 40, "PTO2TaskDescriptor size is part of the shared-memory ABI");
 static_assert(offsetof(PTO2TaskDescriptor, packed_buffer_base) == 24, "packed_buffer_base offset must be unchanged");
 
 // =============================================================================
@@ -503,12 +491,14 @@ struct alignas(64) PTO2TaskSlotState {
     // --- Set per-submit (depend on task inputs) ---
     ActiveMask active_mask;  // Bitmask of active subtask slots (set once)
     uint8_t ring_id;         // Ring layer (immutable after init)
-    // These one-byte flags live in the padding before dep_pool_mark to keep
-    // PTO2TaskSlotState at 64 bytes.
-    // Codegen early-dispatch hint, copied from Arg at submit. Lives on
-    // slot_state (not payload) so fanin walks read the already-hot producer
-    // slot_state cache line.
-    bool allow_early_resolve{false};
+    // Single per-task attributes byte (early-dispatch hint, sync_start,
+    // has_predicate, selective timing tag). Lives on slot_state (not payload) so
+    // fanin walks and the completion path read them off the already-hot producer
+    // slot_state cache line. Packed into the padding before dep_pool_mark to keep
+    // PTO2TaskSlotState at 64 bytes. Plain-write (set once at submit, before the
+    // slot is scheduler-visible), so it MUST NOT share a byte with the atomically
+    // mutated lifecycle_flags.
+    TaskAttrs task_attrs{};
     // Concurrent lifecycle updates preserve unrelated bits. Slot reuse clears
     // the byte only after the previous task lifetime is quiescent.
     std::atomic<uint8_t> lifecycle_flags{PTO2_LIFECYCLE_FLAGS_NONE};
@@ -591,8 +581,6 @@ struct alignas(64) PTO2TaskSlotState {
         return (lifecycle_flags.load(std::memory_order_acquire) & PTO2_SUBTASK_DEFERRED) != 0;
     }
 
-    void set_allow_early_resolve(bool v) { allow_early_resolve = v; }
-
     /**
      * Reset dynamic scheduling fields for slot reuse.
      * Called by advance_ring_pointers() after a slot transitions to CONSUMED
@@ -613,7 +601,8 @@ struct alignas(64) PTO2TaskSlotState {
         completed_subtasks.store(0, std::memory_order_relaxed);
         next_block_idx.store(0, std::memory_order_relaxed);
         lifecycle_flags.store(PTO2_LIFECYCLE_FLAGS_NONE, std::memory_order_relaxed);
-        allow_early_resolve = false;
+        // Note: active_mask and task_attrs are per-submit-constant fields
+        // rewritten in prepare_task on every reuse, so they are not reset here.
         // Note: payload early-dispatch fields (state, masks, fanin, publication count)
         // are NOT reset here — this method skips the payload by contract. They are
         // (re)initialized in PTO2TaskPayload::init on every submit, before the slot

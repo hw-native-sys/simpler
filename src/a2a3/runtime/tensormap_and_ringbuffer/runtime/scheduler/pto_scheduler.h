@@ -534,9 +534,9 @@ struct PTO2SchedulerState {
     void push_ready_routed(PTO2TaskSlotState *slot_state) {
         PTO2ResourceShape shape = slot_state->active_mask.to_shape();
         if (shape == PTO2ResourceShape::DUMMY ||
-            (slot_state->active_mask.has_predicate() && !slot_state->payload->predicate.pass())) {
+            (slot_state->task_attrs.has_predicate() && !slot_state->payload->predicate.pass())) {
             dummy_ready_queue.push(slot_state);
-        } else if (slot_state->active_mask.requires_sync_start()) {
+        } else if (slot_state->task_attrs.requires_sync_start()) {
             ready_sync_queues[static_cast<int32_t>(shape)].push(slot_state);
         } else {
             ready_queues[static_cast<int32_t>(shape)].push(slot_state);
@@ -766,7 +766,7 @@ struct PTO2SchedulerState {
     }
 
     inline void record_published_blocks(PTO2TaskSlotState &slot_state, int32_t count) {
-        if (count <= 0 || !slot_state.allow_early_resolve) return;
+        if (count <= 0 || !slot_state.task_attrs.allow_early_resolve()) return;
         slot_state.payload->published_block_count.fetch_add(static_cast<int16_t>(count), std::memory_order_seq_cst);
     }
 
@@ -869,7 +869,7 @@ struct PTO2SchedulerState {
     inline void try_enqueue_early_dispatch_candidate(PTO2TaskSlotState &consumer) {
         // Predicated tasks resolve at the ready point, never early-dispatch. The
         // wiring caller has no separate predicate filter, so the gate lives here.
-        if (consumer.active_mask.has_predicate()) return;
+        if (consumer.task_attrs.has_predicate()) return;
         PTO2ResourceShape shape = consumer.active_mask.to_shape();
         if (shape != PTO2ResourceShape::AIC && shape != PTO2ResourceShape::AIV && shape != PTO2ResourceShape::MIX) {
             return;
@@ -885,7 +885,7 @@ struct PTO2SchedulerState {
         uint64_t task_id = static_cast<uint64_t>(consumer.task->task_id.raw);
         // A sync-start cohort uses one shape-agnostic queue so only the
         // all-or-nothing drain path can claim and stage it.
-        if (consumer.active_mask.requires_sync_start()) {
+        if (consumer.task_attrs.requires_sync_start()) {
             early_sync_start_queue.push_tagged(&consumer, task_id);
         } else {
             early_dispatch_queues[static_cast<int32_t>(shape)].push_tagged(&consumer, task_id);
@@ -908,12 +908,12 @@ struct PTO2SchedulerState {
     // Only codegen-flagged producers propagate: a task's successors early-dispatch off its
     // DIRECT producers' marks, never an inherited chain.
     void propagate_dispatch_fanin(PTO2TaskSlotState &p) {
-        if (!p.allow_early_resolve) return;  // only codegen-flagged (direct) producers propagate
+        if (!p.task_attrs.allow_early_resolve()) return;  // only codegen-flagged (direct) producers propagate
         if (p.payload->published_block_count.load(std::memory_order_seq_cst) < p.logical_block_num) return;
         if (p.payload->early_dispatch_state.load(std::memory_order_acquire) == PTO2_EARLY_DISPATCH_STAGING) return;
         uint8_t launch_state = p.payload->early_dispatch_launch_state.load(std::memory_order_acquire);
         if (launch_state == PTO2_EARLY_DISPATCH_LAUNCH_RINGING) return;
-        if (p.active_mask.requires_sync_start()) {
+        if (p.task_attrs.requires_sync_start()) {
             bool was_pre_staged = false;
             for (int w = 0; w < PTO2_EARLY_DISPATCH_CORE_MASK_WORDS; w++) {
                 was_pre_staged |= p.payload->staged_core_mask[w].load(std::memory_order_acquire) != 0;
@@ -935,7 +935,7 @@ struct PTO2SchedulerState {
         p.unlock_fanout();
         for (; edge != nullptr; edge = edge->next) {
             PTO2TaskSlotState *c = edge->slot_state;
-            if (c->active_mask.has_predicate()) continue;  // predicated consumers never early-dispatch
+            if (c->task_attrs.has_predicate()) continue;  // predicated consumers never early-dispatch
             // Compare to fanin_actual_count (the real producer-edge count), NOT
             // fanin_count: fanin_count = fanin_actual_count + 1 (a self/wiring +1 that
             // ready_fanin gets but dispatch_fanin does not). dispatch_fanin starts at
@@ -965,7 +965,7 @@ struct PTO2SchedulerState {
 
     inline bool try_early_dispatch_release(PTO2TaskSlotState &slot_state, EarlyDispatchReleaseSink *sink = nullptr) {
         // A predicated task is evaluated at the ready point, never early-dispatched.
-        if (slot_state.active_mask.has_predicate()) return false;
+        if (slot_state.task_attrs.has_predicate()) return false;
         // Never staged => CAS NONE->DISPATCHED wins => dispatch normally.
         uint8_t expect = PTO2_EARLY_DISPATCH_NONE;
         if (slot_state.payload->early_dispatch_state.compare_exchange_strong(
@@ -977,7 +977,7 @@ struct PTO2SchedulerState {
         // duplicate that observes or loses an in-progress launch must never
         // route the same partial task a second time.
         if (expect != PTO2_EARLY_DISPATCH_STAGING) return true;
-        bool sync_start = slot_state.active_mask.requires_sync_start();
+        bool sync_start = slot_state.task_attrs.requires_sync_start();
         if (!sync_start && !try_claim_early_dispatch_launch(*slot_state.payload)) return true;
         expect = PTO2_EARLY_DISPATCH_STAGING;
         slot_state.payload->early_dispatch_state.compare_exchange_strong(
@@ -1029,7 +1029,7 @@ struct PTO2SchedulerState {
         // Early-dispatch: pre-staged tasks are released by doorbell
         // here, skipping the ready-queue round-trip entirely.
         bool early_handled = try_early_dispatch_release(slot_state, sink);
-        if (slot_state.active_mask.requires_sync_start()) {
+        if (slot_state.task_attrs.requires_sync_start()) {
             bool drain_owned = publish_ready_to_early_sync_drain(*slot_state.payload);
             if (early_handled || drain_owned) return true;
         } else if (early_handled) {
@@ -1038,9 +1038,9 @@ struct PTO2SchedulerState {
 
         PTO2ResourceShape shape = slot_state.active_mask.to_shape();
         if (shape == PTO2ResourceShape::DUMMY ||
-            (slot_state.active_mask.has_predicate() && !slot_state.payload->predicate.pass())) {
+            (slot_state.task_attrs.has_predicate() && !slot_state.payload->predicate.pass())) {
             dummy_ready_queue.push(&slot_state);
-        } else if (slot_state.active_mask.requires_sync_start()) {
+        } else if (slot_state.task_attrs.requires_sync_start()) {
             ready_sync_queues[static_cast<int32_t>(shape)].push(&slot_state);
         } else {
             ready_queues[static_cast<int32_t>(shape)].push(&slot_state);
@@ -1070,7 +1070,7 @@ struct PTO2SchedulerState {
         // Early-dispatch: pre-staged tasks are released by doorbell
         // here, skipping the ready-queue round-trip entirely.
         bool early_handled = try_early_dispatch_release(slot_state, sink);
-        if (slot_state.active_mask.requires_sync_start()) {
+        if (slot_state.task_attrs.requires_sync_start()) {
             bool drain_owned = publish_ready_to_early_sync_drain(*slot_state.payload);
             if (early_handled || drain_owned) return true;
         } else if (early_handled) {
@@ -1079,9 +1079,9 @@ struct PTO2SchedulerState {
 
         PTO2ResourceShape shape = slot_state.active_mask.to_shape();
         if (shape == PTO2ResourceShape::DUMMY ||
-            (slot_state.active_mask.has_predicate() && !slot_state.payload->predicate.pass())) {
+            (slot_state.task_attrs.has_predicate() && !slot_state.payload->predicate.pass())) {
             dummy_ready_queue.push(&slot_state, atomic_count, push_wait);
-        } else if (slot_state.active_mask.requires_sync_start()) {
+        } else if (slot_state.task_attrs.requires_sync_start()) {
             ready_sync_queues[static_cast<int32_t>(shape)].push(&slot_state, atomic_count, push_wait);
         } else {
             ready_queues[static_cast<int32_t>(shape)].push(&slot_state, atomic_count, push_wait);
