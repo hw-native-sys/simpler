@@ -463,6 +463,15 @@ WorkerThread *WorkerManager::get_worker_by_id(WorkerType type, int32_t worker_id
     return nullptr;
 }
 
+std::vector<int32_t> WorkerManager::next_level_worker_ids() const {
+    std::vector<int32_t> worker_ids;
+    worker_ids.reserve(next_level_threads_.size());
+    for (const auto &worker : next_level_threads_) {
+        worker_ids.push_back(worker->worker_id());
+    }
+    return worker_ids;
+}
+
 WorkerThread *WorkerManager::pick_idle(
     WorkerType type, const std::vector<WorkerThread *> &exclude, const std::vector<int32_t> &eligible_worker_ids
 ) const {

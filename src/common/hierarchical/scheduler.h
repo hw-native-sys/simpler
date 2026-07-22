@@ -54,12 +54,14 @@ class Scheduler {
 public:
     struct Config {
         Ring *ring;  // owns slot state storage; Scheduler reads via ring->slot_state(id)
-        // Strict-4 per-worker-type ready queues. `dispatch_ready` walks each
-        // queue independently so a saturated pool of one worker type cannot
-        // head-of-line-block dispatch for the other.
+        // NEXT_LEVEL singles use one FIFO per stable worker id. NEXT_LEVEL
+        // groups and SUB tasks use their shared queues.
         ReadyQueue *ready_next_level_queue;
         ReadyQueue *ready_sub_queue;
+        PerWorkerReadyQueues *ready_next_level_single_queues;
         WorkerManager *manager;  // not owned — Scheduler calls manager for dispatch
+        // Shared READY routing path owned by Orchestrator.
+        std::function<void(TaskSlot)> enqueue_ready_cb;
         // Called when a task reaches CONSUMED (TensorMap cleanup + ring release).
         std::function<void(TaskSlot)> on_consumed_cb;
     };
@@ -101,4 +103,5 @@ private:
     void poison_task(TaskSlot slot, const std::string &root_message);
     void try_consume(TaskSlot slot);
     void dispatch_ready();
+    void dispatch_next_level_singles();
 };

@@ -68,13 +68,12 @@ struct SubmitResult {
 
 class Orchestrator {
 public:
-    // Strict-4: the engine keeps one ReadyQueue per WorkerType so a
-    // saturated sub pool cannot head-of-line-block chip dispatch (and vice
-    // versa). Submit routes to the queue matching the task's worker_type;
-    // the Scheduler's dispatch_ready walks each queue independently.
+    // NEXT_LEVEL singles use one FIFO per stable worker id. NEXT_LEVEL groups
+    // and SUB tasks retain their shared queues in this stage of the stack.
     void init(
         TensorMap *tensormap, Ring *allocator, Scope *scope, ReadyQueue *ready_next_level_queue,
-        ReadyQueue *ready_sub_queue, WorkerManager *manager = nullptr, std::function<void()> ready_notify_cb = {}
+        ReadyQueue *ready_sub_queue, PerWorkerReadyQueues *ready_next_level_single_queues,
+        WorkerManager *manager = nullptr, std::function<void()> ready_notify_cb = {}
     );
 
     // Allocate an intermediate buffer from the Worker's HeapRing (MAP_SHARED,
@@ -158,6 +157,10 @@ public:
     // CAS — only the winner returns true and runs cleanup; losers return false.
     bool on_consumed(TaskSlot slot);
 
+    // Route a slot whose state is already READY to the queue that owns it.
+    // Scheduler uses the same path after releasing the final dependency.
+    void enqueue_ready(TaskSlot slot);
+
 private:
     TensorMap *tensormap_ = nullptr;
     Ring *allocator_ = nullptr;
@@ -169,6 +172,7 @@ private:
     // without being blocked by another pool's saturation.
     ReadyQueue *ready_next_level_queue_ = nullptr;
     ReadyQueue *ready_sub_queue_ = nullptr;
+    PerWorkerReadyQueues *ready_next_level_single_queues_ = nullptr;
 
     // Returns the ready queue that owns tasks of the given worker type.
     // The method itself does not mutate the Orchestrator (hence `const`);

@@ -11,6 +11,8 @@
 
 #include "types.h"
 
+#include <stdexcept>
+
 // =============================================================================
 // TaskSlotState
 // =============================================================================
@@ -97,4 +99,51 @@ void ReadyQueue::shutdown() {
         shutdown_ = true;
     }
     cv_.notify_all();
+}
+
+// =============================================================================
+// PerWorkerReadyQueues
+// =============================================================================
+
+void PerWorkerReadyQueues::reset(const std::vector<int32_t> &worker_ids) {
+    worker_ids_.clear();
+    queues_.clear();
+    worker_ids_.reserve(worker_ids.size());
+    queues_.reserve(worker_ids.size());
+    for (int32_t worker_id : worker_ids) {
+        if (worker_id < 0) throw std::invalid_argument("PerWorkerReadyQueues::reset: negative worker id");
+        for (int32_t existing : worker_ids_) {
+            if (existing == worker_id) {
+                throw std::invalid_argument("PerWorkerReadyQueues::reset: duplicate worker id");
+            }
+        }
+        worker_ids_.push_back(worker_id);
+        queues_.push_back(std::make_unique<ReadyQueue>());
+    }
+}
+
+size_t PerWorkerReadyQueues::index_for(int32_t worker_id) const {
+    for (size_t i = 0; i < worker_ids_.size(); ++i) {
+        if (worker_ids_[i] == worker_id) return i;
+    }
+    throw std::out_of_range("PerWorkerReadyQueues: unknown worker id " + std::to_string(worker_id));
+}
+
+void PerWorkerReadyQueues::push(int32_t worker_id, TaskSlot slot) { queues_[index_for(worker_id)]->push(slot); }
+
+bool PerWorkerReadyQueues::try_pop(int32_t worker_id, TaskSlot &out) {
+    return queues_[index_for(worker_id)]->try_pop(out);
+}
+
+bool PerWorkerReadyQueues::empty() const {
+    for (const auto &queue : queues_) {
+        if (!queue->empty()) return false;
+    }
+    return true;
+}
+
+void PerWorkerReadyQueues::shutdown() {
+    for (auto &queue : queues_) {
+        queue->shutdown();
+    }
 }

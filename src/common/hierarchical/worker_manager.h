@@ -474,6 +474,7 @@ public:
     // Direct index into the worker pool (0-based).
     WorkerThread *get_worker_by_index(WorkerType type, int worker_index) const;
     WorkerThread *get_worker_by_id(WorkerType type, int32_t worker_id) const;
+    std::vector<int32_t> next_level_worker_ids() const;
 
     // Pick one idle worker NOT in `exclude`, restricted to `eligible_worker_ids`
     // when that list is non-empty. Returns nullptr if none available.

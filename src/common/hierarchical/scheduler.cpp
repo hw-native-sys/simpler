@@ -35,13 +35,9 @@ bool is_terminal_group_state(GroupMemberState state) {
 // Scheduler
 // =============================================================================
 
-// =============================================================================
-// Scheduler
-// =============================================================================
-
 void Scheduler::start(const Config &cfg) {
     if (cfg.ring == nullptr || cfg.ready_next_level_queue == nullptr || cfg.ready_sub_queue == nullptr ||
-        cfg.manager == nullptr)
+        cfg.ready_next_level_single_queues == nullptr || cfg.manager == nullptr || !cfg.enqueue_ready_cb)
         throw std::invalid_argument("Scheduler::start: null config fields");
     cfg_ = cfg;
 
@@ -53,9 +49,10 @@ void Scheduler::start(const Config &cfg) {
 void Scheduler::stop() {
     stop_requested_.store(true, std::memory_order_release);
     completion_cv_.notify_all();
-    // Shut down both per-type ready queues so any wait_pop waiters unblock.
+    // Shut down every ready queue so any wait_pop waiters unblock.
     cfg_.ready_next_level_queue->shutdown();
     cfg_.ready_sub_queue->shutdown();
+    cfg_.ready_next_level_single_queues->shutdown();
 
     if (sched_thread_.joinable()) sched_thread_.join();
 
@@ -168,7 +165,8 @@ void Scheduler::run() {
             std::unique_lock<std::mutex> lk(completion_mu_);
             completion_cv_.wait(lk, [this] {
                 return !completion_queue_.empty() || !cfg_.ready_next_level_queue->empty() ||
-                       !cfg_.ready_sub_queue->empty() || stop_requested_.load(std::memory_order_acquire);
+                       !cfg_.ready_next_level_single_queues->empty() || !cfg_.ready_sub_queue->empty() ||
+                       stop_requested_.load(std::memory_order_acquire);
             });
         }
 
@@ -244,11 +242,7 @@ void Scheduler::on_task_complete(const WorkerCompletion &completion) {
         if (released >= cs.fanin_count) {
             TaskState expected = TaskState::PENDING;
             if (cs.state.compare_exchange_strong(expected, TaskState::READY, std::memory_order_acq_rel)) {
-                // Strict-4: route the freshly-ready consumer to the queue
-                // matching its own worker type.
-                auto *q =
-                    (cs.worker_type == WorkerType::NEXT_LEVEL) ? cfg_.ready_next_level_queue : cfg_.ready_sub_queue;
-                q->push(consumer);
+                cfg_.enqueue_ready_cb(consumer);
                 completion_cv_.notify_one();
             }
         }
@@ -421,5 +415,30 @@ void Scheduler::dispatch_ready() {
     };
 
     drain_one(cfg_.ready_next_level_queue);
+    dispatch_next_level_singles();
     drain_one(cfg_.ready_sub_queue);
+}
+
+void Scheduler::dispatch_next_level_singles() {
+    for (int32_t worker_id : cfg_.ready_next_level_single_queues->worker_ids()) {
+        WorkerThread *worker = cfg_.manager->get_worker_by_id(WorkerType::NEXT_LEVEL, worker_id);
+        if (worker == nullptr) {
+            throw std::runtime_error(
+                "Scheduler::dispatch_next_level_singles: unknown worker id " + std::to_string(worker_id)
+            );
+        }
+        if (!worker->idle()) continue;
+
+        TaskSlot slot;
+        while (cfg_.ready_next_level_single_queues->try_pop(worker_id, slot)) {
+            TaskSlotState &s = *cfg_.ring->slot_state(slot);
+            if (s.state.load(std::memory_order_acquire) != TaskState::READY) continue;
+            if (s.worker_type != WorkerType::NEXT_LEVEL || s.is_group() || s.get_affinity(0) != worker_id) {
+                throw std::runtime_error("Scheduler::dispatch_next_level_singles: misrouted task slot");
+            }
+            s.state.store(TaskState::RUNNING, std::memory_order_release);
+            worker->dispatch(WorkerDispatch{slot, 0});
+            break;
+        }
+    }
 }

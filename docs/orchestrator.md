@@ -173,7 +173,11 @@ remote buffer identity and logical offset.
 
 **Step 4 — fanin count**: The number of live producers. Decremented by
 `fanin_released++` each time a producer completes; when `fanin_released ==
-fanin_count`, the slot is ready.
+fanin_count`, the slot is ready. A ready NEXT_LEVEL single task is routed to
+the FIFO for its required stable worker id. The same routing function is used
+for immediately-ready submissions and tasks released by Scheduler dependency
+processing. NEXT_LEVEL groups and SUB tasks remain on their shared queues in
+this transition.
 
 **Step 5 — scope ref**: Each slot starts with one "scope reference" in its
 fanout_total. Without this, a task with no downstream consumer would never be

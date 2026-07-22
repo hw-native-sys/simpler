@@ -33,6 +33,7 @@
 #include <condition_variable>
 #include <cstdint>
 #include <functional>
+#include <memory>
 #include <mutex>
 #include <queue>
 #include <string>
@@ -438,4 +439,24 @@ private:
     mutable std::mutex mu_;
     std::condition_variable cv_;
     bool shutdown_{false};
+};
+
+// Fixed NEXT_LEVEL worker-id to single-task ready-queue mapping. Worker
+// registration is complete before reset() and the mapping is immutable while
+// Orchestrator submissions and Scheduler dispatch are active.
+class PerWorkerReadyQueues {
+public:
+    void reset(const std::vector<int32_t> &worker_ids);
+    void push(int32_t worker_id, TaskSlot slot);
+    bool try_pop(int32_t worker_id, TaskSlot &out);
+    bool empty() const;
+    void shutdown();
+
+    const std::vector<int32_t> &worker_ids() const { return worker_ids_; }
+
+private:
+    size_t index_for(int32_t worker_id) const;
+
+    std::vector<int32_t> worker_ids_;
+    std::vector<std::unique_ptr<ReadyQueue>> queues_;
 };

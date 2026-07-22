@@ -20,8 +20,9 @@ The Scheduler's job:
 
 - Drain the **wiring queue** (Phase 0): wire fanout edges for newly
   submitted slots; if all producers are already done, promote to the ready queue.
-- Drain the **ready queue** (Phase 1): for each ready slot, pick an idle
-  `WorkerThread` from the appropriate pool and hand off.
+- Drain the **ready queues** (Phase 1): dispatch each NEXT_LEVEL single task
+  only to its requested worker; group and SUB dispatch remain on their shared
+  queues during this transition.
 - Drain the **completion queue** (Phase 2): for each worker completion,
   transition the slot to `COMPLETED` or `FAILED`, release fanout references,
   wake or poison downstream consumers, and (if all refs released) retire the
@@ -40,14 +41,18 @@ class Scheduler {
     // Producer: Orchestrator.submit_*. Consumer: Scheduler's own loop, Phase 0.
     LockFreeQueue<WiringEntry> wiring_queue_;       // {slot, producers}
 
-    // Strict-4 — per-worker-type ready queues.
-    // Producers: Orchestrator.submit_* (routes by slot.worker_type) +
-    //            Scheduler Phase 0 / Phase 2 (fanout-released; routes by
-    //            consumer worker_type).
-    // Consumer: Scheduler's own loop, Phase 1 (one drain loop per queue,
-    //           each with its own head-of-line break).
+    // NEXT_LEVEL single tasks use one FIFO per stable worker id.
+    PerWorkerReadyQueues *ready_next_level_single_queues_;
+
+    // Transitional shared queue: NEXT_LEVEL groups only. PR3 gives this
+    // queue an explicit group contract and name.
     ReadyQueue *ready_next_level_queue_;
+
+    // SUB scheduling stays unconstrained and shared.
     ReadyQueue *ready_sub_queue_;
+
+    // Shared READY router used by submit, wiring, and dependency release.
+    std::function<void(TaskSlot)> enqueue_ready_cb_;
 
     // Producer: WorkerThread (on endpoint->run() return).
     // Consumer: Scheduler's own loop, Phase 2.
@@ -76,24 +81,24 @@ Slots whose `fanin_count == fanin_released` are ready to dispatch. The queue
 holds just the slot id; dispatch reads task data from the
 `ring.slot_state(sid)` pool.
 
-**Strict-4 — per-worker-type split.** In practice the ready queue is two
-`ReadyQueue` instances, one per `WorkerType`:
+NEXT_LEVEL single tasks have one FIFO for every stable worker id. A task is
+inserted into the FIFO named by its required `worker` argument:
 
 ```cpp
-ReadyQueue ready_next_level_queue_;   // WorkerType::NEXT_LEVEL tasks
-ReadyQueue ready_sub_queue_;          // WorkerType::SUB tasks
+PerWorkerReadyQueues ready_next_level_single_queues_; // worker id -> FIFO
+ReadyQueue ready_next_level_queue_;                  // NEXT_LEVEL groups
+ReadyQueue ready_sub_queue_;                         // all SUB tasks
 ```
 
-Matching L2's per-shape ready queues (the shared MPMC `ready_queues[]` split
-by AIC / AIV / MIX), with the L3+ exception that we use `std::queue`
-(Allowed Exception 3: dynamic data structures on host) and only two
-worker types (Allowed Exception 2: `NEXT_LEVEL` + `SUB` at L3+, not
-AIC / AIV / MIX). `Orchestrator::submit_*` routes each slot to the queue
-matching `slot.worker_type`; `Scheduler::on_task_complete` routes a
-newly-ready consumer the same way, based on the *consumer's* worker
-type. `Scheduler::dispatch_ready` drains each queue with its own
-head-of-line break so a saturated pool of one type cannot stall dispatch
-for the other.
+The Orchestrator owns the routing rule. Both immediately-ready submissions
+and Scheduler transitions to READY call the same `enqueue_ready` entry point,
+so dependency release cannot accidentally return a directed single task to a
+shared queue. A busy target blocks only its own FIFO; the Scheduler continues
+checking other worker FIFOs. FIFO order is preserved independently per worker.
+
+This PR intentionally leaves NEXT_LEVEL groups in the previous shared queue
+and leaves SUB dispatch unchanged. The next PR replaces the transitional group
+path with a dedicated all-targets-ready dispatcher.
 
 ### Completion queue
 
@@ -172,10 +177,7 @@ void Scheduler::wire_fanout(const WiringEntry &w) {
     // finished don't count).
     c.fanin_count = actual_live;
     if (actual_live == 0) {
-        // Strict-4: wiring promotes directly to the per-type queue.
-        auto *q = (c.worker_type == WorkerType::NEXT_LEVEL) ? ready_next_level_queue_
-                                                            : ready_sub_queue_;
-        q->push(csid);
+        enqueue_ready_cb_(csid);
     }
 }
 ```
@@ -192,46 +194,26 @@ The `lock_guard(p.fanout_mu)` + `p.state.load()` check ensures we either:
 
 ## 5. Phase 1 — dispatch
 
-`dispatch_ready` drains each per-type ready queue with its own
-head-of-line break so one saturated pool cannot stall the other:
+`dispatch_ready` first drains the transitional NEXT_LEVEL group queue, then
+checks each NEXT_LEVEL worker's single-task FIFO, and finally drains the SUB
+queue. The single-task path has no worker selection:
 
 ```cpp
-void Scheduler::dispatch_ready() {
-    auto drain_one = [&](ReadyQueue *q) {
-        TaskSlot slot;
-        while (q->try_pop(slot)) {
-            TaskSlotState &s = slots_[slot];
-            int N = s.group_size();  // 1 for single-task slots
+void Scheduler::dispatch_next_level_singles() {
+    for (int32_t worker_id : ready_next_level_single_queues_->worker_ids()) {
+        WorkerThread *worker =
+            manager_->get_worker_by_id(WorkerType::NEXT_LEVEL, worker_id);
+        if (!worker || !worker->idle()) continue;
 
-            std::vector<WorkerThread *> workers;
-            for (int i = 0; i < N; i++) {
-                WorkerThread *wt = nullptr;
-                int32_t affinity = s.get_affinity(i);
-                if (affinity >= 0) {
-                    wt = (s.worker_type == WorkerType::NEXT_LEVEL)
-                        ? manager_->get_worker_by_id(s.worker_type, affinity)
-                        : manager_->get_worker_by_index(s.worker_type, affinity);
-                    if (wt && (!wt->idle() || !s.worker_allowed(i, wt->worker_id())))
-                        wt = nullptr;
-                } else {
-                    wt = manager_->pick_idle(
-                        s.worker_type, workers, s.eligible_workers_for(i));
-                }
-                if (!wt) break;
-                workers.push_back(wt);
-            }
-            if (static_cast<int>(workers.size()) < N) {
-                q->push(slot);   // put back; try again after a completion
-                break;
-            }
-            s.state.store(TaskState::RUNNING);
-            for (int i = 0; i < N; i++) {
-                workers[i]->dispatch({slot, i});
-            }
+        TaskSlot slot;
+        while (worker->idle() &&
+               ready_next_level_single_queues_->try_pop(worker_id, slot)) {
+            TaskSlotState &task = slots_[slot];
+            if (task.state.load() != TaskState::READY) continue;
+            task.state.store(TaskState::RUNNING);
+            worker->dispatch({slot, 0});
         }
-    };
-    drain_one(ready_next_level_queue_);
-    drain_one(ready_sub_queue_);
+    }
 }
 ```
 
@@ -241,18 +223,17 @@ Dispatch hands off a `WorkerDispatch {slot, group_index}` to a
 and encodes it into the per-WT mailbox — see
 [worker-manager.md](worker-manager.md) §3 for the dispatch protocol.
 
-**Pick-idle back-pressure**: when the manager cannot provide enough idle
-workers that also satisfy placement and worker eligibility, the slot is
-pushed back onto *its* queue and that queue's drain halts; the other-type
-queue's drain continues. The ring's back-pressure at the Orch side already
-caps the total number of in-flight tasks across both types.
+**Directed-single back-pressure**: if the requested worker is busy, its FIFO
+is left untouched. Other NEXT_LEVEL worker FIFOs and the SUB queue still make
+progress. The ring's back-pressure at the Orch side caps the total number of
+in-flight tasks.
 
 Worker eligibility is opaque scheduling metadata. The Scheduler compares
 worker ids and capability bits exposed through `WorkerEndpoint::caps()`, but
 does not inspect HCOMM, RDMA, socket, or remote buffer internals.
-For NEXT_LEVEL placement, `s.get_affinity(i)` is the required stable worker id
-and can be different from the `next_level_threads_` vector index. SUB affinity
-is not public and keeps the internal index semantics.
+For a NEXT_LEVEL single task, `s.get_affinity(0)` is the stable requested
+worker id and can differ from the `next_level_threads_` vector index. SUB has
+no public affinity.
 
 ---
 
@@ -287,12 +268,7 @@ void Scheduler::on_task_complete(const WorkerCompletion &completion) {
         }
         TaskSlotState &c = slots_[csid];
         if (++c.fanin_released == c.fanin_count) {
-            // Strict-4: push to the queue matching the *consumer's*
-            // worker type. A consumer of a NEXT_LEVEL producer can itself
-            // be SUB, so we pick based on `c.worker_type`, not `s`.
-            auto *q = (c.worker_type == WorkerType::NEXT_LEVEL) ? ready_next_level_queue_
-                                                                : ready_sub_queue_;
-            q->push(csid);
+            enqueue_ready_cb_(csid);
         }
     }
 
