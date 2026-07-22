@@ -159,8 +159,12 @@ static bool wait_for_tensor_ready(PTO2Runtime *rt, const Tensor &tensor, bool wa
         int32_t local_id = slot.task->task_id.local();
         uint64_t t0 = get_sys_cnt_aicpu();
         int32_t spin_count = 0;
-        while ((slot.fanout_refcount.load(std::memory_order_acquire) & ~PTO2_FANOUT_SCOPE_BIT) <
-               (slot.fanout_count & ~PTO2_FANOUT_SCOPE_BIT)) {
+        // Polling: all consumers of this producer have retired once the per-ring
+        // completed_watermark reaches the producer's highest consumer id (set at
+        // submit in append_fanin_or_fail). Replaces the fanout_refcount ==
+        // fanout_count wiring check, which polling removes.
+        PTO2SharedMemoryRingHeader &cons_ring = orch.sm_header->ring;
+        while (cons_ring.completed_watermark.load(std::memory_order_acquire) < slot.last_consumer_local_id) {
             SPIN_WAIT_HINT();
             if ((++spin_count & 1023) == 0) {
                 // A fatal latched elsewhere (e.g. the scheduler-side wiring

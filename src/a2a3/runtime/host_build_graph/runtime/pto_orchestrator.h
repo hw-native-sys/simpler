@@ -44,12 +44,10 @@
  * pools, scope arrays, plus the nested PTO2TensorMap layout).
  */
 struct PTO2OrchestratorLayout {
-    size_t off_fanin_pool;
     size_t off_fanin_seen_epoch;
     size_t off_scope_tasks;
     size_t off_scope_begins;
     PTO2TensorMapLayout tensor_map;
-    int32_t dep_pool_capacity;
     int32_t scope_tasks_cap;
     uint64_t scope_stack_capacity;
 };
@@ -130,8 +128,7 @@ struct PTO2OrchestratorState {
     // tensor_map sub-layout) on the supplied arena. task_window_sizes feeds
     // the nested tensor_map layout. Returned layout is consumed by
     // init_from_layout.
-    static PTO2OrchestratorLayout
-    reserve_layout(DeviceArena &arena, int32_t task_window_size, int32_t dep_pool_capacity = PTO2_DEP_LIST_POOL_SIZE);
+    static PTO2OrchestratorLayout reserve_layout(DeviceArena &arena, int32_t task_window_size);
 
     // Phase 3a: write everything *except* arena-internal pointer fields.
     // sm_dev_base is the SM device address (only stored, never dereferenced);
@@ -176,7 +173,7 @@ struct PTO2OrchProfilingData {
     int64_t submit_count;
     // Wait time tracking for blocking phases
     uint64_t alloc_wait_cycle;  // Cycles spent waiting in unified alloc
-    uint64_t fanin_wait_cycle;  // Cycles spent waiting in fanout_lock
+    uint64_t fanin_wait_cycle;  // Legacy (wiring): fanout_lock wait; polling has no such lock
     // Atomic operation counts per phase
     uint64_t alloc_atomic_count;
     uint64_t args_atomic_count;

@@ -80,6 +80,14 @@ static_assert(sizeof(PTO2RingFlowControl) == 128, "PTO2RingFlowControl must be e
 struct alignas(64) PTO2SharedMemoryRingHeader {
     PTO2RingFlowControl fc;
 
+    // Highest task_id such that every task with id in [0, completed_watermark]
+    // has its completion_flags byte set. Advanced over the full contiguous
+    // completed prefix at task-completion time (on_mixed_task_complete). The host
+    // consumer-wait gates on it: a producer slot P's consumers have all retired
+    // once completed_watermark >= P.last_consumer_local_id. On its own cache line
+    // (concurrent CAS-advance by completing threads).
+    alignas(64) std::atomic<int32_t> completed_watermark;
+
     // Layout metadata (set once at init)
     uint64_t task_window_size;
     int32_t task_window_mask;
@@ -90,6 +98,12 @@ struct alignas(64) PTO2SharedMemoryRingHeader {
     PTO2TaskDescriptor *task_descriptors;
     PTO2TaskPayload *task_payloads;
     PTO2TaskSlotState *slot_states;
+
+    // Polling-completion state (device-addressed array, one byte per slot).
+    // 0 = pending, 1 = task fully COMPLETED. Writer = the task's completer at
+    // on_mixed_task_complete; reader = consumer fanin polling (fanin_satisfied).
+    // Zeroed host-side at init. Indexed by local_id & task_window_mask.
+    std::atomic<uint8_t> *completion_flags;
 
     int32_t get_slot_by_task_id(int32_t local_task_id) { return local_task_id & task_window_mask; }
 
@@ -110,9 +124,9 @@ struct alignas(64) PTO2SharedMemoryRingHeader {
     }
 };
 
-static_assert(sizeof(PTO2SharedMemoryRingHeader) == 192, "PTO2SharedMemoryRingHeader layout drift");
+static_assert(sizeof(PTO2SharedMemoryRingHeader) == 256, "PTO2SharedMemoryRingHeader layout drift");
 static_assert(
-    offsetof(PTO2SharedMemoryRingHeader, task_descriptors_offset) == 152,
+    offsetof(PTO2SharedMemoryRingHeader, task_descriptors_offset) == 160,
     "PTO2SharedMemoryRingHeader task_descriptors_offset layout drift"
 );
 
@@ -144,10 +158,10 @@ struct alignas(PTO2_ALIGN_SIZE) PTO2SharedMemoryHeader {
     std::atomic<int32_t> sched_error_thread;   // Thread index of last error writer
 };
 
-static_assert(sizeof(PTO2SharedMemoryHeader) == 256, "PTO2SharedMemoryHeader layout drift");
-static_assert(offsetof(PTO2SharedMemoryHeader, total_size) == 200, "PTO2SharedMemoryHeader total_size layout drift");
+static_assert(sizeof(PTO2SharedMemoryHeader) == 320, "PTO2SharedMemoryHeader layout drift");
+static_assert(offsetof(PTO2SharedMemoryHeader, total_size) == 264, "PTO2SharedMemoryHeader total_size layout drift");
 static_assert(
-    offsetof(PTO2SharedMemoryHeader, orch_error_code) == 208, "PTO2SharedMemoryHeader orch_error_code layout drift"
+    offsetof(PTO2SharedMemoryHeader, orch_error_code) == 272, "PTO2SharedMemoryHeader orch_error_code layout drift"
 );
 
 // =============================================================================
@@ -260,7 +274,8 @@ struct PTO2RingSegmentOffsets {
     uint64_t descriptors;
     uint64_t payloads;
     uint64_t slot_states;
-    uint64_t end;  // offset just past slot_states (total SM size)
+    uint64_t completion_flags;  // polling-completion byte array (1 byte/slot)
+    uint64_t end;               // offset just past completion_flags (total SM size)
 };
 
 // Single source of truth for the SM segment layout. Returns offsets (not
@@ -278,6 +293,8 @@ inline PTO2RingSegmentOffsets ring_segment_offsets(uint64_t task_window_size) no
     off += PTO2_ALIGN_UP(task_window_size * sizeof(PTO2TaskPayload), PTO2_ALIGN_SIZE);
     o.slot_states = off;
     off += PTO2_ALIGN_UP(task_window_size * sizeof(PTO2TaskSlotState), PTO2_ALIGN_SIZE);
+    o.completion_flags = off;
+    off += PTO2_ALIGN_UP(task_window_size * sizeof(std::atomic<uint8_t>), PTO2_ALIGN_SIZE);
     o.end = off;
     return o;
 }
@@ -294,6 +311,13 @@ inline PTO2TaskDescriptor *ring_task_descriptors_addr(void *sm_dev_base, uint64_
 inline PTO2TaskSlotState *ring_slot_states_addr(void *sm_dev_base, uint64_t task_window_size) noexcept {
     return reinterpret_cast<PTO2TaskSlotState *>(
         static_cast<char *>(sm_dev_base) + ring_segment_offsets(task_window_size).slot_states
+    );
+}
+
+// Device address of the polling completion_flags byte array.
+inline std::atomic<uint8_t> *ring_completion_flags_addr(void *sm_dev_base, uint64_t task_window_size) noexcept {
+    return reinterpret_cast<std::atomic<uint8_t> *>(
+        static_cast<char *>(sm_dev_base) + ring_segment_offsets(task_window_size).completion_flags
     );
 }
 

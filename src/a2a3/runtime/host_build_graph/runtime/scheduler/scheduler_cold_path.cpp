@@ -233,8 +233,18 @@ void SchedulerContext::log_stall_diagnostics(
             for (int32_t si = 0; si < ring_task_count; si++) {
                 PTO2TaskSlotState &slot_state = ring.get_slot_state_by_task_id(si);
                 PTO2TaskState st = slot_state.task_state.load(std::memory_order_relaxed);
-                int32_t rc = slot_state.fanin_refcount.load(std::memory_order_relaxed);
-                int32_t fi = slot_state.fanin_count;
+                // Polling: no fanin_refcount. Recompute met/total from the inline
+                // fanin ids vs the ring completion_flags (rc = satisfied producers,
+                // fi = raw producer count) so the stall dump still shows readiness.
+                int32_t fi = slot_state.payload != nullptr ? slot_state.payload->fanin_count : 0;
+                int32_t rc = 0;
+                if (slot_state.payload != nullptr) {
+                    for (int32_t k = 0; k < fi; k++) {
+                        int32_t pid = slot_state.payload->fanin_local_ids[k];
+                        if (ring.completion_flags[pid & ring.task_window_mask].load(std::memory_order_relaxed) != 0)
+                            rc++;
+                    }
+                }
                 int32_t kid_aic = slot_state.task->kernel_id[0];
                 int32_t kid_aiv0 = slot_state.task->kernel_id[1];
                 int32_t kid_aiv1 = slot_state.task->kernel_id[2];
@@ -266,7 +276,7 @@ void SchedulerContext::log_stall_diagnostics(
                     if (cnt_running > STALL_DUMP_READY_MAX) continue;
                     LOG_INFO_V9(
                         "[STALL thread=%d idle_iterations=%d] TASK ring=%d task_id=%" PRId64
-                        " state=RUNNING fanin_refcount=%d/%d kernels=[aic:%d aiv0:%d aiv1:%d] "
+                        " state=RUNNING fanin_met=%d/%d kernels=[aic:%d aiv0:%d aiv1:%d] "
                         "running_on=[owner_thread=%d cores=[%s]]",
                         thread_idx, idle_iterations, r, task_id, rc, fi, kid_aic, kid_aiv0, kid_aiv1, owner, running_on
                     );
@@ -277,7 +287,7 @@ void SchedulerContext::log_stall_diagnostics(
                     if (cnt_ready > STALL_DUMP_READY_MAX) continue;
                     LOG_INFO_V9(
                         "[STALL thread=%d idle_iterations=%d] TASK ring=%d task_id=%" PRId64
-                        " state=READY   fanin_refcount=%d/%d kernels=[aic:%d aiv0:%d aiv1:%d]",
+                        " state=READY   fanin_met=%d/%d kernels=[aic:%d aiv0:%d aiv1:%d]",
                         thread_idx, idle_iterations, r, task_id, rc, fi, kid_aic, kid_aiv0, kid_aiv1
                     );
                     continue;
@@ -286,7 +296,7 @@ void SchedulerContext::log_stall_diagnostics(
                 if (cnt_waiting > STALL_DUMP_WAIT_MAX) continue;
                 LOG_INFO_V9(
                     "[STALL thread=%d idle_iterations=%d] TASK ring=%d task_id=%" PRId64
-                    " state=WAIT    fanin_refcount=%d/%d kernels=[aic:%d aiv0:%d aiv1:%d] missing_deps=%d",
+                    " state=WAIT    fanin_met=%d/%d kernels=[aic:%d aiv0:%d aiv1:%d] missing_deps=%d",
                     thread_idx, idle_iterations, r, task_id, rc, fi, kid_aic, kid_aiv0, kid_aiv1, fi - rc
                 );
             }
@@ -1065,6 +1075,34 @@ void SchedulerContext::on_orchestration_done(
     if (orch_err != PTO2_ERROR_NONE) {
         if (!completed_.exchange(true, std::memory_order_acq_rel)) {
             emergency_shutdown(runtime);
+        }
+    }
+
+    // Polling initial classify (device boot): the host built the whole graph and
+    // no producer has executed yet — every completion_flags byte is 0 except the
+    // hidden-alloc tasks the host completed inline (pre-set to 1). Classify each
+    // submitted task exactly once: route roots (all fanin met) to the ready queues
+    // and register the rest on their first unmet producer's wake list. This
+    // replaces the host-side wiring drain the wiring model deferred to a device
+    // queue. Runs on the boot leader BEFORE the caller publishes
+    // runtime_init_ready_ (release), so it is race-free against the scheduler
+    // threads (they acquire that store before dispatching) and nothing completes
+    // during the scan.
+    if (orch_err == PTO2_ERROR_NONE && sched_->ring_sched_state.ring != nullptr) {
+        PTO2SharedMemoryRingHeader &ring = *sched_->ring_sched_state.ring;
+        const int32_t submitted = ring.fc.current_task_index.load(std::memory_order_acquire);
+        for (int32_t id = 0; id < submitted; id++) {
+            if (ring.completion_flags[id & ring.task_window_mask].load(std::memory_order_acquire) != 0) {
+                continue;  // completed on the host (hidden alloc); nothing to dispatch
+            }
+            PTO2TaskSlotState &s = ring.get_slot_state_by_task_id(id);
+            int32_t state = sched_->classify_fanin_state(&s);
+            if (state < 0) {
+                sched_->push_ready_routed(&s);
+            } else {
+                int32_t prod_local = s.payload->fanin_local_ids[state];
+                sched_->register_wake(&ring.get_slot_state_by_task_id(prod_local), &s);
+            }
         }
     }
 

@@ -78,13 +78,6 @@ void PTO2SchedulerState::print_stats() {
         if (sched->ring_sched_state.last_task_alive > 0) {
             LOG_INFO_V0("Ring %d:", r);
             LOG_INFO_V0("  last_task_alive: %d", sched->ring_sched_state.last_task_alive);
-            auto &dp = sched->ring_sched_state.dep_pool;
-            if (dp.top > 0) {
-                LOG_INFO_V0(
-                    "  dep_pool: top=%d tail=%d used=%d high_water=%d capacity=%d", dp.top, dp.tail, dp.top - dp.tail,
-                    dp.high_water, dp.capacity
-                );
-            }
         }
     }
 #if SIMPLER_SCHED_PROFILING

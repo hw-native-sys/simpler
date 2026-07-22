@@ -31,9 +31,7 @@
 // Dual-slot state machine helpers
 // =============================================================================
 
-namespace {
-inline constexpr int32_t PTO2_DEFERRED_RELEASE_CAP = 256;
-}
+namespace {}
 
 // Pure function: read register result -> SlotTransition (no side effects).
 SlotTransition SchedulerContext::decide_slot_transition(
@@ -84,8 +82,7 @@ SlotTransition SchedulerContext::decide_slot_transition(
 // Complete one slot's task: subtask counting, mixed completion, deferred release, profiling.
 void SchedulerContext::complete_slot_task(
     PTO2TaskSlotState &slot_state, int32_t expected_reg_task_id, [[maybe_unused]] PTO2SubtaskSlot subslot,
-    int32_t thread_idx, int32_t core_id, Handshake *hank, int32_t &completed_this_turn,
-    PTO2TaskSlotState *deferred_release_slot_states[], int32_t &deferred_release_count
+    [[maybe_unused]] int32_t thread_idx, int32_t core_id, Handshake *hank, int32_t &completed_this_turn
 #if SIMPLER_DFX
     ,
     uint64_t dispatch_ts, uint64_t finish_ts
@@ -225,21 +222,8 @@ void SchedulerContext::complete_slot_task(
         }
         l2_swimlane.phase_complete_count++;
 #endif
-        if (deferred_release_count < PTO2_DEFERRED_RELEASE_CAP) {
-            deferred_release_slot_states[deferred_release_count++] = &slot_state;
-        } else {
-            LOG_INFO_V9("Thread %d: release", thread_idx);
-            while (deferred_release_count > 0) {
-#if SIMPLER_SCHED_PROFILING
-                // SCHED_PROFILING variant takes thread_idx for the per-thread
-                // atomic counter side-effects. The return value is unused.
-                (void)sched_->on_task_release(*deferred_release_slot_states[--deferred_release_count], thread_idx);
-#else
-                sched_->on_task_release(*deferred_release_slot_states[--deferred_release_count]);
-#endif
-            }
-            deferred_release_slot_states[deferred_release_count++] = &slot_state;
-        }
+        // Polling: on_task_complete published completion + drained the wake list
+        // inline; no deferred producer-release step.
         completed_this_turn++;
     }
 
@@ -298,7 +282,7 @@ void SchedulerContext::clear_running_slot(CoreExecState &core) {
 
 void SchedulerContext::check_running_cores_for_completion(
     int32_t thread_idx, Handshake *hank, int32_t &completed_this_turn, int32_t &cur_thread_completed,
-    bool &made_progress, PTO2TaskSlotState *deferred_release_slot_states[], int32_t &deferred_release_count
+    bool &made_progress
 ) {
 #if SIMPLER_SCHED_PROFILING
     auto &l2_swimlane = sched_l2_swimlane_[thread_idx];
@@ -404,7 +388,7 @@ void SchedulerContext::check_running_cores_for_completion(
             }
             complete_slot_task(
                 *core.pending_slot_state, core.pending_reg_task_id, core.pending_subslot, thread_idx, core_id, hank,
-                completed_this_turn, deferred_release_slot_states, deferred_release_count
+                completed_this_turn
 #if SIMPLER_DFX
                 ,
                 core.pending_dispatch_timestamp, finish_ts
@@ -418,7 +402,7 @@ void SchedulerContext::check_running_cores_for_completion(
             }
             complete_slot_task(
                 *core.running_slot_state, core.running_reg_task_id, core.running_subslot, thread_idx, core_id, hank,
-                completed_this_turn, deferred_release_slot_states, deferred_release_count
+                completed_this_turn
 #if SIMPLER_DFX
                 ,
                 core.running_dispatch_timestamp, finish_ts

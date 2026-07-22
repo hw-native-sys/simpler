@@ -404,8 +404,7 @@ private:
 
     void complete_slot_task(
         PTO2TaskSlotState &slot_state, int32_t expected_reg_task_id, PTO2SubtaskSlot subslot, int32_t thread_idx,
-        int32_t core_id, Handshake *hank, int32_t &completed_this_turn,
-        PTO2TaskSlotState *deferred_release_slot_states[], int32_t &deferred_release_count
+        int32_t core_id, Handshake *hank, int32_t &completed_this_turn
 #if SIMPLER_DFX
         ,
         uint64_t dispatch_ts, uint64_t finish_ts
@@ -417,7 +416,7 @@ private:
 
     void check_running_cores_for_completion(
         int32_t thread_idx, Handshake *hank, int32_t &completed_this_turn, int32_t &cur_thread_completed,
-        bool &made_progress, PTO2TaskSlotState *deferred_release_slot_states[], int32_t &deferred_release_count
+        bool &made_progress
     );
 
     bool enter_drain_mode(PTO2TaskSlotState *slot_state, int32_t block_num);

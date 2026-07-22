@@ -57,6 +57,7 @@ void PTO2SharedMemoryHandle::setup_pointers_per_ring(const uint64_t task_window_
     ring.task_descriptors = (PTO2TaskDescriptor *)(base + off.descriptors);
     ring.task_payloads = (PTO2TaskPayload *)(base + off.payloads);
     ring.slot_states = (PTO2TaskSlotState *)(base + off.slot_states);
+    ring.completion_flags = (std::atomic<uint8_t> *)(base + off.completion_flags);
 }
 
 void PTO2SharedMemoryHandle::setup_pointers(uint64_t task_window_size) {
@@ -153,6 +154,10 @@ void PTO2SharedMemoryHandle::init_header_per_ring(
     // Flow control (starts at 0)
     header->ring.fc.init();
 
+    // Polling completion: -1 = "no task completed yet"; the first task to
+    // complete (local_id 0) advances the watermark to 0.
+    header->ring.completed_watermark.store(-1, std::memory_order_relaxed);
+
     header->orchestrator_done.store(0, std::memory_order_relaxed);
 
     // Ring layout info
@@ -182,9 +187,13 @@ void PTO2SharedMemoryHandle::init_header_per_ring(
     auto &ring = header->ring;
     for (uint64_t i = 0; i < task_window_sizes[0]; i++) {
         ring.slot_states[i].reset_for_reuse();
-        ring.slot_states[i].fanin_count = 0;
         ring.slot_states[i].active_mask = ActiveMask{};
     }
+
+    // Polling completion flags: 0 = pending. Shared memory is not guaranteed
+    // zero on device; stale non-zero bytes would make consumers observe a
+    // producer as already completed. Zero the whole per-ring array once.
+    __builtin_memset((void *)ring.completion_flags, 0, task_window_sizes[0] * sizeof(std::atomic<uint8_t>));
 }
 
 // =============================================================================

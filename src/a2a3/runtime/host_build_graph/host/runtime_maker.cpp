@@ -201,38 +201,31 @@ static uint64_t read_ring_override(const uint64_t *base, int idx) {
     return value;
 }
 
-// Each of ring_task_window / ring_heap / ring_dep_pool is a per-ring array of
-// PTO2_MAX_RING_DEPTH entries (0 = unset). Precedence per ring: per-task entry >
-// PTO2_RING_* env value > compile-time default. A "size all rings the same"
-// request arrives already broadcast to every entry by the caller.
+// Each of ring_task_window / ring_heap is a per-ring array of PTO2_MAX_RING_DEPTH
+// entries (0 = unset). Precedence per ring: per-task entry > PTO2_RING_* env value
+// > compile-time default. A "size all rings the same" request arrives already
+// broadcast to every entry by the caller. (Polling has no dep_pool, so the former
+// PTO2_RING_DEP_POOL knob is gone.)
 static bool resolve_ring_config(
-    const uint64_t *ring_task_window, const uint64_t *ring_heap, const uint64_t *ring_dep_pool,
-    uint64_t eff_task_window_sizes[PTO2_MAX_RING_DEPTH], uint64_t eff_heap_sizes[PTO2_MAX_RING_DEPTH],
-    int32_t eff_dep_pool_capacities[PTO2_MAX_RING_DEPTH]
+    const uint64_t *ring_task_window, const uint64_t *ring_heap, uint64_t eff_task_window_sizes[PTO2_MAX_RING_DEPTH],
+    uint64_t eff_heap_sizes[PTO2_MAX_RING_DEPTH]
 ) {
-    uint64_t dep_pool_values[PTO2_MAX_RING_DEPTH];
     for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
         eff_task_window_sizes[r] = PTO2_TASK_WINDOW_SIZE;
         eff_heap_sizes[r] = PTO2_HEAP_SIZE;
-        dep_pool_values[r] = PTO2_DEP_LIST_POOL_SIZE;
     }
 
     apply_env_ring_values("PTO2_RING_TASK_WINDOW", 4, static_cast<uint64_t>(INT32_MAX), true, eff_task_window_sizes);
     apply_env_ring_values("PTO2_RING_HEAP", 1024, std::numeric_limits<uint64_t>::max(), false, eff_heap_sizes);
-    apply_env_ring_values("PTO2_RING_DEP_POOL", 4, static_cast<uint64_t>(INT32_MAX), false, dep_pool_values);
 
     for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
         const uint64_t task_window_override = read_ring_override(ring_task_window, r);
         const uint64_t heap_override = read_ring_override(ring_heap, r);
-        const uint64_t dep_pool_override = read_ring_override(ring_dep_pool, r);
         if (task_window_override != 0) {
             eff_task_window_sizes[r] = task_window_override;
         }
         if (heap_override != 0) {
             eff_heap_sizes[r] = heap_override;
-        }
-        if (dep_pool_override != 0) {
-            dep_pool_values[r] = dep_pool_override;
         }
 
         if (eff_task_window_sizes[r] < 4 || eff_task_window_sizes[r] > static_cast<uint64_t>(INT32_MAX) ||
@@ -246,11 +239,6 @@ static bool resolve_ring_config(
             LOG_ERROR("ring_heap[%d]=%" PRIu64 " must be >= 1024", r, eff_heap_sizes[r]);
             return false;
         }
-        if (dep_pool_values[r] < 4 || dep_pool_values[r] > static_cast<uint64_t>(INT32_MAX)) {
-            LOG_ERROR("ring_dep_pool[%d]=%" PRIu64 " must be in [4, INT32_MAX]", r, dep_pool_values[r]);
-            return false;
-        }
-        eff_dep_pool_capacities[r] = static_cast<int32_t>(dep_pool_values[r]);
     }
 
     return true;
@@ -369,8 +357,8 @@ struct HostOrchEntryPoints {
 // (returns false) rather than shipping un-relocated host pointers to the device.
 // Returns false on any unrelocatable pointer so the caller can fail the prepare.
 static bool relocate_host_orch_image(
-    PTO2SharedMemoryHandle &host_sm_handle, PTO2Runtime *rt, uint64_t host_sm, uint64_t sm_size, int64_t sm_delta,
-    uint64_t host_arena, uint64_t arena_size, int64_t arena_delta
+    PTO2SharedMemoryHandle &host_sm_handle, [[maybe_unused]] PTO2Runtime *rt, uint64_t host_sm, uint64_t sm_size,
+    int64_t sm_delta, uint64_t host_arena, uint64_t arena_size, int64_t arena_delta
 ) {
     // host_build_graph is single-ring; the loops below iterate the lone ring and
     // index header->ring (singular). If the ring depth ever grows, those loops
@@ -418,68 +406,15 @@ static bool relocate_host_orch_image(
             int32_t count = ring.fc.current_task_index.load(std::memory_order_acquire);
             for (int32_t slot = 0; slot < count; slot++) {
                 PTO2TaskSlotState *ss = &ring.slot_states[slot];
+                // Polling: fanin is a flat array of position-independent local-id
+                // integers on the payload, so only the two per-slot arena/SM
+                // pointers need relocating. There is no fanout_head/dep_pool graph
+                // and no host-seeded ready queue (the device boot scan classifies),
+                // so those relocation passes are gone.
                 reloc(ss->task);
                 reloc(ss->payload);
-                reloc(ss->fanout_head);
-
-                PTO2TaskPayload *payload = &ring.task_payloads[slot];
-                int32_t nf = payload->fanin_actual_count;
-                if (nf > PTO2_FANIN_INLINE_CAP) {
-                    // host-orch does not yet relocate the multi-fanin spill pool,
-                    // so a task with more than the inline cap of producers would
-                    // ship un-relocated host pointers to the device. Fail loud
-                    // rather than silently clamp (tensormap handles this via the
-                    // on-device spill pool; that path is not wired here yet).
-                    LOG_ERROR(
-                        "host-orch: task slot %d has fanin %d > inline cap %d; multi-fanin spill relocation is not "
-                        "implemented",
-                        slot, nf, PTO2_FANIN_INLINE_CAP
-                    );
-                    ok = false;
-                    nf = PTO2_FANIN_INLINE_CAP;
-                }
-                for (int32_t i = 0; i < nf; i++) {
-                    reloc(payload->fanin_inline_slot_states[i]);
-                }
             }
         }
-    }
-
-    // Per-ring fanout adjacency (dep_pool entries) built inline during host
-    // submit (orch_wire_fanin_task). Each live entry [tail, top) carries a
-    // consumer slot_state pointer (into the SM) and a next pointer (into the
-    // arena).
-    for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
-        PTO2DepListPool &dp = rt->scheduler.ring_sched_state.dep_pool;
-        if (dp.base == nullptr || dp.capacity == 0) {
-            continue;
-        }
-        for (int32_t i = dp.tail; i < dp.top; i++) {
-            PTO2DepListEntry &e = dp.base[i % dp.capacity];
-            reloc(e.slot_state);
-            reloc(e.next);
-        }
-    }
-
-    // Ready queues seeded by push_ready_routed on the host. Each populated slot
-    // [dequeue_pos, enqueue_pos) holds a slot_state pointer into the SM.
-    auto reloc_ready = [&](PTO2ReadyQueue &q) {
-        if (q.slots == nullptr) {
-            return;
-        }
-        uint64_t enq = q.enqueue_pos.load(std::memory_order_relaxed);
-        uint64_t deq = q.dequeue_pos.load(std::memory_order_relaxed);
-        for (uint64_t pos = deq; pos < enq; pos++) {
-            reloc(q.slots[pos & q.mask].slot_state);
-        }
-    };
-    for (int i = 0; i < PTO2_NUM_RESOURCE_SHAPES; i++) {
-        reloc_ready(rt->scheduler.ready_queues[i]);
-        reloc_ready(rt->scheduler.ready_sync_queues[i]);
-    }
-    reloc_ready(rt->scheduler.dummy_ready_queue);
-    for (int i = 0; i < PTO2_NUM_RESOURCE_SHAPES; i++) {
-        reloc_ready(rt->scheduler.early_dispatch_queues[i]);
     }
     return ok;
 }
@@ -685,7 +620,7 @@ register_callable_impl(const ChipCallable *callable, uint64_t (*upload_fn)(const
 extern "C" int bind_callable_to_runtime_impl(
     Runtime *runtime, const HostApi *api, const ChipStorageTaskArgs *orch_args, void *host_orch_func_ptr,
     const ArgDirection *signature, int sig_count, const uint64_t *ring_task_window, const uint64_t *ring_heap,
-    const uint64_t *ring_dep_pool
+    [[maybe_unused]] const uint64_t *ring_dep_pool  // polling has no dep_pool; kept for ABI stability
 ) {
     if (runtime == nullptr) {
         LOG_ERROR("Runtime pointer is null");
@@ -710,19 +645,12 @@ extern "C" int bind_callable_to_runtime_impl(
 
     uint64_t eff_task_window_sizes[PTO2_MAX_RING_DEPTH];
     uint64_t eff_heap_sizes[PTO2_MAX_RING_DEPTH];
-    int32_t eff_dep_pool_capacities[PTO2_MAX_RING_DEPTH];
-    if (!resolve_ring_config(
-            ring_task_window, ring_heap, ring_dep_pool, eff_task_window_sizes, eff_heap_sizes, eff_dep_pool_capacities
-        )) {
+    if (!resolve_ring_config(ring_task_window, ring_heap, eff_task_window_sizes, eff_heap_sizes)) {
         return -1;
     }
     const std::string task_window_log = format_ring_array(eff_task_window_sizes);
     const std::string heap_log = format_ring_array(eff_heap_sizes);
-    const std::string dep_pool_log = format_ring_array(eff_dep_pool_capacities);
-    LOG_INFO_V0(
-        "Ring buffer sizes: task_window=%s heap=%s dep_pool=%s", task_window_log.c_str(), heap_log.c_str(),
-        dep_pool_log.c_str()
-    );
+    LOG_INFO_V0("Ring buffer sizes: task_window=%s heap=%s", task_window_log.c_str(), heap_log.c_str());
 
     // Build device args: copy from input, replace host tensor pointers with device pointers
     ChipStorageTaskArgs device_args;
@@ -826,8 +754,7 @@ extern "C" int bind_callable_to_runtime_impl(
 
     int64_t t_prebuilt_start = _now_ms();
     DeviceArena host_arena;  // libc malloc backend by default
-    PTO2RuntimeArenaLayout layout =
-        runtime_reserve_layout(host_arena, eff_task_window_sizes, eff_heap_sizes, eff_dep_pool_capacities);
+    PTO2RuntimeArenaLayout layout = runtime_reserve_layout(host_arena, eff_task_window_sizes, eff_heap_sizes);
     if (host_arena.commit(DeviceArena::kDefaultBaseAlign) == nullptr) {
         LOG_ERROR("Failed to commit host arena for prebuilt runtime image");
         return -1;

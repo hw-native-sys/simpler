@@ -112,7 +112,6 @@ struct PTO2RuntimeArenaLayout {
     // Cached parameters (re-used by init_data + wire stages).
     uint64_t task_window_sizes[PTO2_MAX_RING_DEPTH]{};
     uint64_t heap_sizes[PTO2_MAX_RING_DEPTH]{};
-    int32_t dep_pool_capacities[PTO2_MAX_RING_DEPTH]{};
 
     // Total arena byte size post-commit. Used by host to size the prebuilt
     // image buffer and as the rtMemcpy length.
@@ -169,12 +168,10 @@ struct PTO2Runtime {
  * Returns the layout descriptor; caller commits/attaches the arena before
  * Phase 2/3.
  */
-PTO2RuntimeArenaLayout runtime_reserve_layout(
-    DeviceArena &arena, uint64_t task_window_size, int32_t dep_pool_capacity = PTO2_DEP_LIST_POOL_SIZE
-);
+PTO2RuntimeArenaLayout runtime_reserve_layout(DeviceArena &arena, uint64_t task_window_size);
 PTO2RuntimeArenaLayout runtime_reserve_layout(
     DeviceArena &arena, const uint64_t task_window_sizes[PTO2_MAX_RING_DEPTH],
-    const uint64_t heap_sizes[PTO2_MAX_RING_DEPTH], const int32_t dep_pool_capacities[PTO2_MAX_RING_DEPTH]
+    const uint64_t heap_sizes[PTO2_MAX_RING_DEPTH]
 );
 
 /**

@@ -30,7 +30,7 @@ four layers of execution:
 │                                                                       │
 │  ┌─────────────────────────────────────────────────────────────────┐  │
 │  │                   Shared Memory (GM)                             │  │
-│  │  SharedMemoryHeader │ TaskDescriptors[] │ DepListPool           │  │
+│  │  SharedMemoryHeader │ TaskDescriptors[] │ Payloads[] │ SlotStates[] │
 │  │  GM Heap (output buffers)                                       │  │
 │  └─────────────────────────────────────────────────────────────────┘  │
 │                                                                       │
@@ -46,20 +46,19 @@ four layers of execution:
 >
 > - **host_build_graph (this runtime):** the **host** dlopens the orchestration
 >   `.so` and runs it to completion, populating shared memory + the prebuilt
->   arena. It **wires the fanin/fanout adjacency inline during submit** —
->   allocates `dep_pool` entries under each live producer's `fanout_lock`, links
->   the consumer onto the producer's `fanout_head`, and seeds readiness directly
->   into the ready queue (`push_ready_routed` for zero-fanin tasks,
->   `route_ready_once` once a producer's fanin resolves). The host then
->   relocates every cross-task pointer to its final device address
->   (`relocate_host_orch_image`) **before** the H2D copy — pointers into the SM
->   and pointers into the arena shift by independent deltas — and ships the
->   image. The device boots **scheduler-only**: no on-device orchestrator thread
->   and no on-device pointer fixup; it attaches the already-device-addressed
->   SM/arena, whose ready queue is already seeded, and dispatches.
+>   arena. Dependencies are recorded as **position-independent integer fanin**:
+>   each task's payload stores its producers' local-ids (`fanin_local_ids`) and
+>   each producer records its highest consumer id (`last_consumer_local_id`).
+>   There is no fanout adjacency, dep-pool, or per-task lock. Because fanin is
+>   integer ids, the host→device relocation (`relocate_host_orch_image`)
+>   collapses to fixing up only the per-slot `task` / `payload` pointers before
+>   the H2D copy. The device boots **scheduler-only**: no on-device orchestrator
+>   thread and no fanout wiring; on boot it scans the submitted tasks and
+>   classifies each (fanin-free → ready queue; otherwise register on its first
+>   unmet producer's wake list — see §8), then dispatches.
 > - **tensormap_and_ringbuffer:** the orchestrator runs **on-device** on AICPU
->   thread N-1, concurrently with the scheduler threads, wiring the same
->   fanin/fanout adjacency inline during submit.
+>   thread N-1, concurrently with the scheduler threads, recording the same
+>   integer fanin during submit.
 >
 > Where a section below says "the orchestrator runs on AICPU Thread 3" or
 > "Thread 3 dlopens the SO", read that as the **tensormap (device-orch)
@@ -93,7 +92,7 @@ The primary production runtime. Uses ring buffers for task slots and output memo
 - **Dependencies**: automatically derived from tensor read/write patterns via TensorMap
 - **Thread model**: 3 scheduler threads + 1 orchestrator thread on AICPU
 - **Single ring**: host_build_graph builds the whole graph on the host with no
-  execution-time reclaim, so HeapRing, TaskRing, and DepPool are single
+  execution-time reclaim, so HeapRing and TaskRing are single
   whole-graph-resident instances (`PTO2_MAX_RING_DEPTH == 1`); all scope depths
   map to ring 0.
 - **Use case**: production workloads; supports streaming, flow control, and large batch sizes
@@ -137,7 +136,7 @@ Two platform implementations exist under `src/platform/`, sharing a common inter
 
 ## 3. Shared Memory Layout
 
-The orchestrator and schedulers communicate through a contiguous shared memory region in Global Memory (GM). The single ring's TaskDescriptor and DepListPool sections are laid out by `pto2_sm_layout::ring_segment_offsets`.
+The orchestrator and schedulers communicate through a contiguous shared memory region in Global Memory (GM). The single ring's TaskDescriptor, TaskPayload, and TaskSlotState sections (plus the per-slot `completion_flags`) are laid out by `pto2_sm_layout::ring_segment_offsets`.
 
 ```text
 ┌─────────────────────────────┐  offset 0
@@ -179,11 +178,10 @@ Alignment is 64 bytes (`PTO2_ALIGN_SIZE`).
 
 ## 4. Ring Buffer Mechanisms
 
-> **Single ring**: TaskRing, HeapRing, and DepPool are single whole-graph
-> instances (`PTO2_MAX_RING_DEPTH == 1`). The host builds the entire graph
-> before the device boots and there is no execution-time reclaim, so a
-> per-scope-depth ring split would buy nothing — every scope depth maps to
-> ring 0.
+> **Single ring**: TaskRing and HeapRing are single whole-graph instances
+> (`PTO2_MAX_RING_DEPTH == 1`). The host builds the entire graph before the
+> device boots and there is no execution-time reclaim, so a per-scope-depth
+> ring split would buy nothing — every scope depth maps to ring 0.
 
 ### 4.1 Task Ring
 
@@ -227,13 +225,21 @@ The heap ring manages output buffer allocation from a circular GM heap.
 
 **Reclamation**: When `last_task_alive` advances past a task, its `packed_buffer_end` is used to advance `heap_tail`, freeing the memory region.
 
-### 4.3 Dependency List Pool
+### 4.3 Dependency Representation (polling completion)
 
-A simple bump allocator for `PTO2DepListEntry` nodes used in fanin/fanout linked lists.
+There is no dependency-list pool or fanout adjacency. A task's dependencies are
+stored inline on its payload as a flat array of position-independent producer
+local-ids:
 
-- **Entry 0**: NULL sentinel (`task_id=-1, next_offset=0`)
-- **Allocation**: `pool->top++`, wraps around when full
-- **Reclamation**: implicit — old entries become unreachable as `last_task_alive` advances
+- `fanin_local_ids[fanin_count]` — the local-ids of this task's direct producers
+  (`fanin_count <= PTO2_MAX_FANIN`; there is no spill, so an overflow is fatal).
+- A per-slot `completion_flags[id]` byte in the ring header is the device-side
+  readiness truth: a task is ready iff every id in its `fanin_local_ids` has its
+  `completion_flags` byte set (see §8.2).
+
+Because the fanin is integer ids rather than pointers, the host→device image
+needs no fanout/dep-pool relocation — only the per-slot `task` / `payload`
+pointers are relocated (see §7.3).
 
 ### 4.4 Flow Control and Back-Pressure
 
@@ -371,12 +377,12 @@ When `PTO2OrchestratorState::submit_task` processes parameters:
 | `kernel_id[3]` | Per-slot kernel IDs: `[AIC, AIV0, AIV1]`; `INVALID_KERNEL_ID` = inactive |
 | `active_mask` | Bitmask of active subtask slots: `bit0=AIC`, `bit1=AIV0`, `bit2=AIV1` |
 | `completed_subtasks` | Atomic counter; each subtask increments on completion. Trigger condition: `completed_subtasks == total_required_subtasks` |
-| `fanin_count` | Number of producer dependencies (set inline during submit wiring) |
-| `fanout_lock` | Per-task spinlock for fanout modification (used by submit-time wiring + scheduler completion) |
-| `fanout_head` | Head of fanout consumer list (pointer, protected by `fanout_lock`) |
-| `fanout_count` | 1 (scope ref) + number of consumers |
 | `packed_buffer_base` | Start of packed buffer in GM Heap |
 | `packed_buffer_end` | End of packed buffer (for heap reclamation) |
+
+Fanin/fanout are not on the descriptor: producer ids live on the payload
+(`fanin_local_ids`, §6.1b) and consumers are reached at completion via the
+per-slot wake list (§8.2), not a fanout adjacency list.
 
 ### 6.1b PTO2TaskPayload (Cold Path)
 
@@ -386,25 +392,32 @@ When `PTO2OrchestratorState::submit_task` processes parameters:
 | `scalar_value[16]` | Scalar parameter values |
 | `is_tensor[16]` | Whether each parameter is tensor or scalar |
 | `param_count` | Number of valid parameters |
-| `fanin_slot_states[]` | Producer slot state pointers (used by `on_task_release`) |
-| `fanin_actual_count` | Actual fanin count |
+| `fanin_local_ids[fanin_count]` | Producer local-ids (position-independent; readiness = all their `completion_flags` set) |
+| `fanin_count` | Number of producer dependencies (`<= PTO2_MAX_FANIN`, no spill) |
+| `predicate` | Dispatch predicate (`DispatchPredicate`, cache line 9 / byte 576); evaluated by the scheduler at the ready point (see §8.3) |
+
+`last_consumer_local_id` (the highest consumer id of this task) lives on the
+slot state, not the payload; the host consumer-wait gates on it (§8.4).
 
 ### 6.2 Task State Machine
 
+`task_state` is the **host-visible mirror** of completion; the device-side
+readiness truth is the per-slot `completion_flags` byte (§8.2). The host polls
+`task_state` in `wait_for_tensor_ready`, the allocator deadlock detector, and
+the cold-path stall dump.
+
 ```text
-  [0] PENDING ──worker(s) done──► [1] COMPLETED ──fanout done──► [2] CONSUMED
-      ▲                                                                │
-      │                                                                ▼
-      └──────────────────── slot recycled ◄───────────────────────────┘
+  [0] PENDING ──worker(s) done, on_mixed_task_complete──► [1] COMPLETED
 ```
 
-In the scheduler's `task_state[]` array (`std::atomic<PTO2TaskState>`):
+- **0 (PENDING)**: slot allocated; remains PENDING while waiting on producers,
+  queued, or dispatched.
+- **1 (COMPLETED)**: all subtasks done. `on_mixed_task_complete` sets this
+  (host mirror) and, in the same step, sets `completion_flags[id]` (device
+  readiness) and advances `completed_watermark`.
 
-- **0 (PENDING)**: slot is allocated and remains PENDING through "waiting on
-  producers", "queued in ready queue", and "dispatched to a worker"; ready vs
-  running is derived from `fanin_refcount` and per-core `running_slot_state`
-- **1 (COMPLETED)**: hardware execution complete, output may still be in use
-- **2 (CONSUMED)**: output fully consumed, buffers can be released
+There is no runtime CONSUMED flip and no slot recycle: host_build_graph is
+whole-graph-resident (§8.4).
 
 ---
 
@@ -419,10 +432,10 @@ structure tensormap drives on AICPU thread N-1.
 
 Key members:
 
-- `ring`: the single `PTO2RingSet` (HeapRing + TaskRing + FaninPool).
+- `ring`: the single `PTO2RingSet` (HeapRing + TaskRing).
 - `tensor_map`, `tensor_pool`: dependency tracking
 - `scope_tasks[]`, `scope_begins[]`, `scope_stack_top`: scope nesting stack (flat buffer partitioned by level)
-- `scheduler`: pointer to scheduler state (for inline fanout wiring and ready queue access)
+- `scheduler`: pointer to scheduler state (for seeding zero-fanin tasks into the ready queue)
 - `gm_heap_base`, `gm_heap_size`: GM heap for output buffers
 
 ### 7.2 Task Submission Flow (`PTO2OrchestratorState::submit_task`)
@@ -432,65 +445,42 @@ Key members:
 | 0 | `PTO2TensorMap::sync_tensormap` — prune stale TensorMap entries |
 | 1 | `PTO2TaskAllocator::alloc` — allocate task slot (may block on flow control) |
 | 2 | Initialize task descriptor + slot state, copy parameters |
-| 3 | **Lookup**: for each INPUT/INOUT param, search TensorMap for producers; collect producer pointers in `PTO2FaninBuilder` |
+| 3 | **Lookup**: for each INPUT/INOUT param, search TensorMap for producers; collect producer ids in `PTO2FaninBuilder` |
 | 4 | **Insert**: register OUTPUT/INOUT args in TensorMap |
-| 5 | **Record fanin metadata**: store producer pointers in `payload->fanin_inline_slot_states[]` (+ spill pool if >64); increment each producer's `fanout_count` (no lock needed — single writer). This step runs **before** `payload.init()`. |
-| 6 | **Wire fanout inline**: for a task with live producers, lock each producer, allocate `dep_pool` entries, prepend the consumer to each producer's `fanout_head`, then seed readiness — `push_ready_routed` for zero-fanin tasks, `route_ready_once` once the fanin refcount is already satisfied. |
+| 5 | **Record fanin**: `append_fanin_or_fail` dedups producers and writes their local-ids into `payload->fanin_local_ids[]`; each producer's `last_consumer_local_id` is bumped to this task's id. `payload.fanin_count` is set from the builder. |
+| 6 | **Seed readiness**: a task with zero fanin (`fanin_count == 0`) is pushed straight to the ready queue via `push_ready_routed`. A task with fanin is left for the device boot classify (§8) — the host does not pre-register wake lists. |
 
-> **Note**: The orchestrator wires fanout **inline in submit** (Step 6) —
-> there is no device-side wiring queue. The `dep_pool` is sized for the whole
-> graph — there is no reclaim during host orchestration, exactly like the task
-> window and GM heap — so an exhausted pool latches
-> `PTO2_ERROR_DEP_POOL_OVERFLOW` and aborts the run. The `fanout_head` /
-> dep-entry / ready-queue pointers this produces are host-DDR addresses;
-> `relocate_host_orch_image` shifts them to device addresses before H2D (SM
-> pointers and arena pointers by independent deltas).
+> **Note**: There is no fanout adjacency, dep-pool, or per-producer lock. A
+> producer inline-completed on the host (e.g. a hidden-alloc task) pre-sets its
+> own `completion_flags[id] = 1` in the H2D image so device consumers see it as
+> already satisfied. The only cross-task pointers the image carries are the
+> per-slot `task` / `payload` pointers, which `relocate_host_orch_image` shifts
+> to device addresses before H2D.
 
-### 7.3 Fanout Wiring
+### 7.3 Dependency Recording and Relocation
 
-The orchestrator wires each task's fanin/fanout adjacency inline during submit
-(Step 6). Three cases, by the state of the claimed producers:
+`append_fanin_or_fail` records, per consumer, the deduped list of producer
+local-ids into `payload->fanin_local_ids[]` and bumps `fanin_count`; it also
+raises each producer's `last_consumer_local_id` to the consumer's id. An
+overflow past `PTO2_MAX_FANIN` is fatal (`PTO2_ERROR_...`), since there is no
+spill.
 
-1. **Zero-fanin** (`fanin_builder.count == 0`): no producers to link. Sets
-   `fanin_count = 1`, releases the +1 self-reference, records the `dep_pool`
-   position (`orch_mark_dep_pool_position`), and seeds the task directly via
-   `push_ready_routed`.
-2. **All claimed producers already completed**: no live fanout links are
-   needed. Sets `fanin_count = N + 1`, primes `dispatch_fanin` when every
-   producer is codegen-flagged, releases the refcount, and pushes via
-   `push_ready_routed`.
-3. **At least one live producer** (`orch_wire_live_fanin_task` →
-   `orch_wire_fanin_task`):
-   - Reserves `dep_pool` space (`ensure_space`); an exhausted pool latches
-     `PTO2_ERROR_DEP_POOL_OVERFLOW`.
-   - Sets `fanin_count = N + 1` (+1 self-reference prevents premature
-     readiness).
-   - For each producer, under its `fanout_lock`: if `task_state >= COMPLETED`,
-     count it as early-finished; otherwise prepend the consumer to the
-     producer's `fanout_head` via `dep_pool.prepend`.
-   - Seeds `dispatch_fanin` by the early-finished count when every producer is
-     codegen-flagged.
-   - Releases the +1 self-reference plus the early-finished count via
-     `fanin_refcount.fetch_add`; if that already satisfies `fanin_count`,
-     publishes readiness via `route_ready_once`.
+`relocate_host_orch_image` runs on the host before H2D. Because fanin is
+position-independent integer ids, the only pointers needing fixup are the
+per-slot `task` and `payload` pointers (SM-region delta); the fanout adjacency,
+dep-pool, and ready-queue pointer relocation of the wiring model are gone.
 
-`push_ready_routed` pushes a ready slot straight to its shape's queue;
-`route_ready_once` claims the slot exactly once (CAS), takes the early-dispatch
-doorbell path if the task was pre-staged, and otherwise routes it to the queue.
-
-The scheduler's completion handler (`on_task_complete`) mirrors the wiring:
-acquire `fanout_lock`, mark the task COMPLETED, read `fanout_head`, release the
-lock, then traverse the fanout list releasing each consumer's fanin
-(`release_fanin_and_check_ready`) and pushing newly-ready consumers via
-`route_ready_once`. This protocol guarantees every consumer is accounted for
-exactly once. (host-orch does not flip tasks to CONSUMED — see §8.4.)
+Readiness and completion are handled entirely device-side by the scheduler:
+the boot classify seeds the ready queue and registers wake lists (§8.2), and
+`on_mixed_task_complete` publishes each producer's `completion_flags` and drains
+its wake list. See §8.2 for the completion protocol.
 
 ### 7.4 Scope Mechanism (`PTO2_SCOPE`)
 
 Scopes control the lifetime of intermediate buffers. Each scope:
 
 - Tracks tasks submitted within it via a flat `scope_tasks[]` buffer partitioned by `scope_begins[]`
-- On `scope_end`: increments `fanout_refcount` for scope tasks; when it reaches `fanout_count`, the task's packed buffer can be reclaimed
+- Scopes bound intermediate-buffer lifetime **structurally** (the orchestration function that built the graph). host_build_graph is whole-graph-resident, so `scope_end` performs no runtime buffer reclaim — there is no `fanout_refcount`.
 
 ```cpp
 PTO2_SCOPE(rt) {
@@ -568,10 +558,31 @@ Core assignment: AICs and AIVs are divided equally among the 3 scheduler threads
 
 Each scheduler thread runs a tight loop with two main phases:
 
-**Phase 1 — Completion Handling**:
+**Phase 1 — Completion Handling (polling)**:
 
-- Poll register `COND` on each managed core
-- When `TASK_FIN_STATE` detected: record completion timestamps, call `on_subtask_complete(task_id, subslot)` to increment the completion counter; when `completed_subtasks == total_required_subtasks`, trigger `on_task_complete(task_id)` which marks `task_state[slot] = COMPLETED`, acquires fanout lock, traverses fanout list (incrementing consumers' `fanin_refcount`), marks `task_state[slot] = CONSUMED`, and advances `last_task_alive` watermark
+- Poll register `COND` on each managed core.
+- When `TASK_FIN_STATE` detected: call `on_subtask_complete`; when
+  `completed_subtasks == total_required_subtasks`, call `on_mixed_task_complete`,
+  which:
+  1. mirrors `task_state = COMPLETED` (host-visible) and sets the device
+     readiness truth `completion_flags[my_id] = 1` (release);
+  2. drains this task's intrusive **wake list** — `wake_list_head.exchange(SENTINEL)`
+     — reclassifying each waiter: a waiter whose remaining fanin is now all met
+     is pushed via `push_ready_routed`; otherwise it re-registers on its next
+     unmet producer. After the exchange the head is `SENTINEL`, so a consumer
+     registering concurrently re-checks the flags instead of being lost;
+  3. CAS-advances `completed_watermark` over the contiguous completed prefix
+     (§8.4).
+
+**Readiness / wake registration.** A task is ready iff every id in its
+`fanin_local_ids` has its `completion_flags` byte set (`fanin_satisfied` /
+`classify_fanin_state`, acquire loads). A not-yet-ready task registers itself on
+its **first unmet** producer's wake list (`register_wake`); that producer's
+completion re-drives the classification. The decision is terminal — tasks are
+never re-polled — because `completion_flags` are monotonic. This wake machinery
+is seeded by the device **boot classify** (`on_orchestration_done`), which scans
+the submitted tasks once and either pushes the fanin-free ones to the ready
+queue or registers each remaining task on its first unmet producer.
 
 **Phase 2 — Dispatch**:
 
@@ -591,20 +602,25 @@ Ready queues use a lock-free bounded MPMC (Vyukov) design:
 - Per-slot sequence counters prevent ABA problems
 - `enqueue_pos` and `dequeue_pos` are on separate cache lines to avoid false sharing
 
-### 8.4 No Runtime Watermark Advancement (host-orch)
+### 8.4 Completion Watermark (host consumer-wait gate)
 
-host_build_graph is whole-graph-resident: the host builds the entire task
-graph into a single ring and H2Ds it once, and the device runs it with **no
-execution-time reclaim**. `last_task_alive` is initialized to 0 and is **not
-advanced at runtime** — slots are never recycled within a run, so there is no
-`advance_ring_pointers` / per-ring `advance_lock` step (both removed; they
-existed only for the device-orch reclaim path in `tensormap_and_ringbuffer`).
-Completion is tracked by `completed_tasks_`; consumer waits key on
-`fanout_refcount` rather than on a watermark.
+`completed_watermark` is the highest id such that every task in
+`[0, completed_watermark]` has its `completion_flags` byte set. The tail of
+`on_mixed_task_complete` CAS-advances it over the **full contiguous completed
+prefix** (bounded by `current_task_index`, not by the completing task's own id)
+— capping at `my_id` would make the final value completion-order-dependent and
+strand it below the true prefix.
 
-`reset_for_reuse()` survives but runs **once at init**
-(`pto_shared_memory.cpp`) to zero each slot's dynamic scheduling fields before
-the host orchestrator populates them — it is not a runtime recycle hook.
+It is **load-bearing**: the host `wait_for_tensor_ready(..., wait_for_consumers)`
+gates on `completed_watermark >= producer.last_consumer_local_id` to observe
+"every consumer of this producer has retired" — replacing the wiring model's
+`fanout_refcount == fanout_count` check.
+
+Slot reclaim is inert: host_build_graph is whole-graph-resident, so
+`last_task_alive` is never advanced at runtime and there is no
+`advance_ring_pointers` step. `reset_for_reuse()` runs **once at init**
+(`pto_shared_memory.cpp`) to zero each slot before the host orchestrator
+populates it — it is not a runtime recycle hook.
 
 ### 8.5 SchedulerContext
 

@@ -385,25 +385,16 @@ private:
 #endif
 
     /**
-     * Structural deadlock test on the reclaim head.
+     * Structural deadlock test on the reclaim head — inert under polling.
      *
-     * The head (oldest un-CONSUMED task, at last_task_alive) gates all
-     * reclamation. If it is COMPLETED and every consumer reference is released
-     * (low bits of fanout_refcount == consumer count) but the scope reference
-     * (bit31) is still unset, the only release left is its scope_end. Because
-     * this is evaluated while the orchestrator is blocked in alloc(), scope_end
-     * can never be reached -> provable deadlock, no timeout required.
-     *
-     * The COMPLETED guard is mandatory: a zero-consumer task has
-     * refcount == 0 == (count & ~SCOPE_BIT) from birth, before it has run.
+     * The wiring model used a per-task scope refcount (fanout_count/refcount) to
+     * prove a head-of-line deadlock without a timeout. Polling removes those
+     * fields, and host_build_graph is whole-graph-resident host-orchestrated: no
+     * task completes during host build (the device runs afterward), so the head is
+     * never COMPLETED here and the structural test cannot apply. A genuine
+     * ring/heap overflow during build is caught by the wall-clock backstop.
      */
-    bool head_blocked_on_scope_end(int32_t head_task_id) const {
-        if (slot_states_ == nullptr) return false;
-        PTO2TaskSlotState &h = slot_states_[head_task_id & window_mask_];
-        if (h.task_state.load(std::memory_order_acquire) != PTO2_TASK_COMPLETED) return false;
-        uint32_t rc = h.fanout_refcount.load(std::memory_order_acquire);
-        return rc == (h.fanout_count & ~PTO2_FANOUT_SCOPE_BIT);
-    }
+    bool head_blocked_on_scope_end(int32_t /*head_task_id*/) const { return false; }
 
     /**
      * Report deadlock with targeted diagnostics. scope_gated == true means the
@@ -446,12 +437,9 @@ private:
         // Head-task state dump: what the reclaim watermark is actually waiting on.
         if (slot_states_ != nullptr) {
             PTO2TaskSlotState &h = slot_states_[last_alive & window_mask_];
-            uint32_t fc = h.fanout_count;
-            uint32_t rc = h.fanout_refcount.load(std::memory_order_acquire);
             LOG_ERROR(
-                "  Head task %d: state=%d, consumers=%u/%u, scope_released=%d", last_alive,
-                static_cast<int>(h.task_state.load(std::memory_order_acquire)), rc & ~PTO2_FANOUT_SCOPE_BIT,
-                fc & ~PTO2_FANOUT_SCOPE_BIT, (rc & PTO2_FANOUT_SCOPE_BIT) ? 1 : 0
+                "  Head task %d: state=%d, last_consumer=%d", last_alive,
+                static_cast<int>(h.task_state.load(std::memory_order_acquire)), h.last_consumer_local_id
             );
         }
         LOG_ERROR("Solution:");
@@ -479,286 +467,6 @@ private:
 };
 
 // =============================================================================
-// Fanin Spill Pool
-// =============================================================================
-
-/**
- * Fanin spill pool structure
- *
- * True ring buffer for allocating spilled fanin entries.
- * Entries are reclaimed when their consumer tasks become CONSUMED.
- *
- * Linear counters (top, tail) grow monotonically; the physical index
- * is obtained via modulo: base[linear_index % capacity].
- */
-struct PTO2FaninPool {
-    PTO2FaninSpillEntry *base;       // Pool base address
-    int32_t capacity;                // Total number of entries
-    int32_t top;                     // Linear next-allocation counter (starts from 1)
-    int32_t tail;                    // Linear first-alive counter (entries before this are dead)
-    int32_t high_water;              // Peak concurrent usage (top - tail)
-    int32_t reclaim_task_cursor{0};  // Last task id scanned for reclaim on this pool
-
-    std::atomic<int32_t> *error_code_ptr = nullptr;
-
-    void init(PTO2FaninSpillEntry *in_base, int32_t in_capacity, std::atomic<int32_t> *in_error_code_ptr) {
-        base = in_base;
-        capacity = in_capacity;
-        top = 1;
-        tail = 1;
-        high_water = 0;
-        reclaim_task_cursor = 0;
-        base[0].slot_state = nullptr;
-        error_code_ptr = in_error_code_ptr;
-    }
-
-    void reclaim(PTO2SharedMemoryRingHeader &ring, int32_t sm_last_task_alive);
-
-    bool ensure_space(PTO2SharedMemoryRingHeader &ring, int32_t needed);
-
-    PTO2FaninSpillEntry *alloc() {
-        int32_t used = top - tail;
-        if (used >= capacity) {
-            LOG_ERROR("========================================");
-            LOG_ERROR("FATAL: Fanin Spill Pool Overflow!");
-            LOG_ERROR("========================================");
-            LOG_ERROR("Fanin spill pool exhausted: %d entries alive (capacity=%d).", used, capacity);
-            LOG_ERROR("  - Pool top:      %d (linear)", top);
-            LOG_ERROR("  - Pool tail:     %d (linear)", tail);
-            LOG_ERROR("  - High water:    %d", high_water);
-            LOG_ERROR("Solution:");
-            LOG_ERROR("  Increase fanin spill pool capacity (current: %d, recommended: %d).", capacity, capacity * 2);
-            LOG_ERROR("  Compile-time: PTO2_DEP_LIST_POOL_SIZE in pto_runtime2_types.h");
-            LOG_ERROR("  Runtime env:  PTO2_RING_DEP_POOL=%d", capacity * 2);
-            LOG_ERROR("========================================");
-            if (error_code_ptr) {
-                error_code_ptr->store(PTO2_ERROR_DEP_POOL_OVERFLOW, std::memory_order_release);
-            }
-            return nullptr;
-        }
-        int32_t idx = top % capacity;
-        top++;
-        used++;
-        if (used > high_water) high_water = used;
-        return &base[idx];
-    }
-
-    void advance_tail(int32_t new_tail) {
-        if (new_tail > tail) {
-            tail = new_tail;
-        }
-    }
-
-    int32_t used() const { return top - tail; }
-
-    int32_t available() const { return capacity - used(); }
-};
-
-template <typename Fn>
-using PTO2FaninCallbackResult = std::invoke_result_t<Fn &, PTO2TaskSlotState *>;
-
-template <typename Fn>
-using PTO2FaninForEachReturn = std::conditional_t<std::is_same_v<PTO2FaninCallbackResult<Fn>, void>, void, bool>;
-
-template <typename InlineSlots, typename Fn>
-inline PTO2FaninForEachReturn<Fn> for_each_fanin_storage(
-    InlineSlots &&inline_slot_states, int32_t fanin_count, int32_t spill_start, PTO2FaninPool &spill_pool, Fn &&fn
-) {
-    using FaninCallbackResult = PTO2FaninCallbackResult<Fn>;
-    static_assert(
-        std::is_same_v<FaninCallbackResult, void> || std::is_same_v<FaninCallbackResult, bool>,
-        "fanin callback must return void or bool"
-    );
-
-    if constexpr (std::is_void_v<FaninCallbackResult>) {
-        int32_t inline_count = std::min(fanin_count, PTO2_FANIN_INLINE_CAP);
-        for (int32_t i = 0; i < inline_count; i++) {
-            fn(inline_slot_states[i]);
-        }
-
-        int32_t spill_count = fanin_count - inline_count;
-        if (spill_count <= 0) {
-            return;
-        }
-
-        int32_t start_idx = spill_start % spill_pool.capacity;
-        int32_t first_count = std::min(spill_count, spill_pool.capacity - start_idx);
-        PTO2FaninSpillEntry *first = spill_pool.base + start_idx;
-        for (int32_t i = 0; i < first_count; i++) {
-            fn(first[i].slot_state);
-        }
-
-        int32_t second_count = spill_count - first_count;
-        for (int32_t i = 0; i < second_count; i++) {
-            fn(spill_pool.base[i].slot_state);
-        }
-        return;
-    } else {
-        int32_t inline_count = std::min(fanin_count, PTO2_FANIN_INLINE_CAP);
-        for (int32_t i = 0; i < inline_count; i++) {
-            if (!fn(inline_slot_states[i])) {
-                return false;
-            }
-        }
-
-        int32_t spill_count = fanin_count - inline_count;
-        if (spill_count <= 0) {
-            return true;
-        }
-
-        int32_t start_idx = spill_start % spill_pool.capacity;
-        int32_t first_count = std::min(spill_count, spill_pool.capacity - start_idx);
-        PTO2FaninSpillEntry *first = spill_pool.base + start_idx;
-        for (int32_t i = 0; i < first_count; i++) {
-            if (!fn(first[i].slot_state)) {
-                return false;
-            }
-        }
-
-        int32_t second_count = spill_count - first_count;
-        for (int32_t i = 0; i < second_count; i++) {
-            if (!fn(spill_pool.base[i].slot_state)) {
-                return false;
-            }
-        }
-        return true;
-    }
-}
-
-template <typename Fn>
-inline PTO2FaninForEachReturn<Fn> for_each_fanin_slot_state(const PTO2TaskPayload &payload, Fn &&fn) {
-    return for_each_fanin_storage(
-        payload.fanin_inline_slot_states, payload.fanin_actual_count, payload.fanin_spill_start,
-        *payload.fanin_spill_pool, static_cast<Fn &&>(fn)
-    );
-}
-
-// =============================================================================
-// Dependency List Pool
-// =============================================================================
-
-/**
- * Dependency list pool structure
- *
- * True ring buffer for allocating linked list entries.
- * Entries are reclaimed when their producer tasks become CONSUMED,
- * as tracked by the orchestrator via dep_pool_mark per task.
- *
- * Linear counters (top, tail) grow monotonically; the physical index
- * is obtained via modulo: base[linear_index % capacity].
- */
-struct PTO2DepListPool {
-    PTO2DepListEntry *base;     // Pool base address
-    int32_t capacity;           // Total number of entries
-    int32_t top;                // Linear next-allocation counter (starts from 1)
-    int32_t tail;               // Linear first-alive counter (entries before this are dead)
-    int32_t high_water;         // Peak concurrent usage (top - tail)
-    int32_t last_reclaimed{0};  // last_task_alive at last successful reclamation
-
-    // Error code pointer for fatal error reporting (→ sm_header->orch_error_code)
-    std::atomic<int32_t> *error_code_ptr = nullptr;
-
-    /**
-     *
-     * Initialize dependency list pool
-     * @param base      Pool base address from shared memory
-     * @param capacity  Total number of entries
-     */
-    void init(PTO2DepListEntry *in_base, int32_t in_capacity, std::atomic<int32_t> *in_error_code_ptr) {
-        base = in_base;
-        capacity = in_capacity;
-        top = 1;   // Start from 1, 0 means NULL/empty
-        tail = 1;  // Match initial top (no reclaimable entries yet)
-        high_water = 0;
-        last_reclaimed = 0;
-
-        // Initialize entry 0 as NULL marker
-        base[0].slot_state = nullptr;
-        base[0].next = nullptr;
-
-        error_code_ptr = in_error_code_ptr;
-    }
-
-    /**
-     * Reclaim dead entries based on scheduler's slot state dep_pool_mark.
-     * Safe to call multiple times — only advances tail forward.
-     *
-     * @param ring             Ring header (for reading slot dep_pool_mark)
-     * @param sm_last_task_alive Current last_task_alive from shared memory
-     */
-    void reclaim(PTO2SharedMemoryRingHeader &ring, int32_t sm_last_task_alive);
-
-    /**
-     * Ensure dep pool for a specific ring has at least `needed` entries available.
-     * Spin-waits for reclamation if under pressure. Detects deadlock if no progress.
-     */
-    bool ensure_space(PTO2SharedMemoryRingHeader &ring, int32_t needed);
-
-    /**
-     * Allocate a single entry from the pool (single-thread per pool instance)
-     *
-     * @return Pointer to allocated entry, or nullptr on fatal error
-     */
-    PTO2DepListEntry *alloc() {
-        int32_t used = top - tail;
-        if (used >= capacity) {
-            LOG_ERROR("========================================");
-            LOG_ERROR("FATAL: Dependency Pool Overflow!");
-            LOG_ERROR("========================================");
-            LOG_ERROR("DepListPool exhausted: %d entries alive (capacity=%d).", used, capacity);
-            LOG_ERROR("  - Pool top:      %d (linear)", top);
-            LOG_ERROR("  - Pool tail:     %d (linear)", tail);
-            LOG_ERROR("  - High water:    %d", high_water);
-            LOG_ERROR("Solution:");
-            LOG_ERROR("  Increase dep pool capacity (current: %d, recommended: %d).", capacity, capacity * 2);
-            LOG_ERROR("  Compile-time: PTO2_DEP_LIST_POOL_SIZE in pto_runtime2_types.h");
-            LOG_ERROR("  Runtime env:  PTO2_RING_DEP_POOL=%d", capacity * 2);
-            LOG_ERROR("========================================");
-            if (error_code_ptr) {
-                error_code_ptr->store(PTO2_ERROR_DEP_POOL_OVERFLOW, std::memory_order_release);
-            }
-            return nullptr;
-        }
-        int32_t idx = top % capacity;
-        top++;
-        used++;
-        if (used > high_water) high_water = used;
-        return &base[idx];
-    }
-
-    /**
-     * Advance the tail pointer, reclaiming dead entries.
-     * Called by the orchestrator based on last_task_alive advancement.
-     */
-    void advance_tail(int32_t new_tail) {
-        if (new_tail > tail) {
-            tail = new_tail;
-        }
-    }
-
-    /**
-     * Prepend a task ID to a dependency list
-     *
-     * O(1) operation: allocates new entry and links to current head.
-     *
-     * @param current_head  Current list head offset (0 = empty list)
-     * @param task_slot     Task slot to prepend
-     * @return New head offset
-     */
-    PTO2DepListEntry *prepend(PTO2DepListEntry *cur, PTO2TaskSlotState *slot_state) {
-        PTO2DepListEntry *new_entry = alloc();
-        if (!new_entry) return nullptr;
-        new_entry->slot_state = slot_state;
-        new_entry->next = cur;
-        return new_entry;
-    }
-
-    int32_t used() const { return top - tail; }
-
-    int32_t available() const { return capacity - used(); }
-};
-
-// =============================================================================
 // Ring Set (per-depth aggregate)
 // =============================================================================
 
@@ -768,7 +476,6 @@ struct PTO2DepListPool {
  */
 struct PTO2RingSet {
     PTO2TaskAllocator task_allocator;
-    PTO2FaninPool fanin_pool;
 };
 
 #endif  // PTO_RING_BUFFER_H
