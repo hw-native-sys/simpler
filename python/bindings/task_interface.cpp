@@ -603,6 +603,17 @@ NB_MODULE(_task_interface, m) {
     m.attr("TENSOR_STRIDE_BYTES") = static_cast<int>(sizeof(Tensor));
     m.attr("TENSOR_ADDRESS_SPACE_OFFSET") = static_cast<int>(offsetof(Tensor, address_space));
 
+    // BufferHandle / BufferRef wire ABI (buffer_handle.h). Exported so the Python mirror in
+    // simpler.buffer_handle can pin its struct formats to the C++ layout and reject drift.
+    m.attr("BUFFER_ABI_VERSION") = static_cast<uint32_t>(BUFFER_ABI_VERSION);
+    m.attr("BUFFER_REF_BYTES") = static_cast<int>(sizeof(BufferRef));
+    m.attr("BUFFER_HANDLE_DESCRIPTOR_BYTES") = static_cast<int>(sizeof(BufferHandleDescriptor));
+    m.attr("CANONICAL_IDENTITY_BYTES") = static_cast<int>(sizeof(CanonicalIdentity));
+    m.attr("OWNER_WORKER_PATH_BYTES") = static_cast<int>(sizeof(OwnerWorkerPath));
+    m.attr("MAX_WORKER_PATH_DEPTH") = static_cast<int>(MAX_WORKER_PATH_DEPTH);
+    m.attr("BACKEND_TOKEN_BYTES") = static_cast<int>(BACKEND_TOKEN_BYTES);
+    m.attr("BUFFERREF_BLOB_HEADER_BYTES") = static_cast<int>(BUFFERREF_BLOB_HEADER_SIZE);
+
     // --- Tensor ---
     // The unified strided tensor descriptor. Constructed contiguous via make()
     // (row-major strides, start_offset == 0); see src/common/task_interface/tensor.h.
