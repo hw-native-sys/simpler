@@ -166,8 +166,6 @@ void PTO2SharedMemoryHandle::init_header_per_ring(
     offset += PTO2_ALIGN_UP(task_window_sizes[0] * sizeof(PTO2TaskSlotState), PTO2_ALIGN_SIZE);
 
     header->total_size = sm_size;
-    header->graph_output_ptr.store(0, std::memory_order_relaxed);
-    header->graph_output_size.store(0, std::memory_order_relaxed);
 
     // Error reporting
     header->orch_error_code.store(PTO2_ERROR_NONE, std::memory_order_relaxed);

@@ -253,14 +253,6 @@ TEST_F(TrbRuntimeTempBufferTest, SuccessfulValidateCopiesOnlyOutputTensor) {
     ASSERT_EQ(runtime.tensor_leases_.size(), 1u);
     std::memset(runtime.tensor_leases_[0].dev_ptr, 0x2a, output.size());
 
-    // Legacy packed-output metadata is retained only for shared-memory layout
-    // compatibility. Finalization must copy from the tensor's own allocation.
-    std::vector<uint8_t> legacy_packed_output(output.size(), 0x7f);
-    auto *header = static_cast<PTO2SharedMemoryHeader *>(runtime.get_gm_sm_ptr());
-    ASSERT_NE(header, nullptr);
-    header->graph_output_ptr.store(reinterpret_cast<uint64_t>(legacy_packed_output.data()), std::memory_order_relaxed);
-    header->graph_output_size.store(legacy_packed_output.size(), std::memory_order_relaxed);
-
     ASSERT_EQ(validate_runtime_impl(&runtime, &api_, 0), 0);
     EXPECT_EQ(fake_.copy_from_count, 1);
     EXPECT_TRUE(std::all_of(output.begin(), output.end(), [](uint8_t value) {

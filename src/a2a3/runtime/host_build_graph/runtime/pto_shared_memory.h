@@ -32,6 +32,8 @@
 
 #pragma once
 
+#include <stddef.h>
+
 #include "utils/device_arena.h"
 #include "pto_runtime2_types.h"
 
@@ -108,6 +110,12 @@ struct alignas(64) PTO2SharedMemoryRingHeader {
     }
 };
 
+static_assert(sizeof(PTO2SharedMemoryRingHeader) == 192, "PTO2SharedMemoryRingHeader layout drift");
+static_assert(
+    offsetof(PTO2SharedMemoryRingHeader, task_descriptors_offset) == 152,
+    "PTO2SharedMemoryRingHeader task_descriptors_offset layout drift"
+);
+
 /**
  * Shared memory header structure
  *
@@ -123,11 +131,6 @@ struct alignas(PTO2_ALIGN_SIZE) PTO2SharedMemoryHeader {
     // Total shared memory size (for validation)
     uint64_t total_size;
 
-    // Reserved legacy packed-output metadata. Keep these zero and retain them
-    // only for shared-memory layout compatibility; host finalize ignores them.
-    std::atomic<uint64_t> graph_output_ptr;
-    std::atomic<uint64_t> graph_output_size;
-
     // === ERROR REPORTING ===
 
     // Orchestrator fatal error code (Orchestrator → Scheduler, AICPU → Host)
@@ -141,9 +144,10 @@ struct alignas(PTO2_ALIGN_SIZE) PTO2SharedMemoryHeader {
     std::atomic<int32_t> sched_error_thread;   // Thread index of last error writer
 };
 
+static_assert(sizeof(PTO2SharedMemoryHeader) == 256, "PTO2SharedMemoryHeader layout drift");
+static_assert(offsetof(PTO2SharedMemoryHeader, total_size) == 200, "PTO2SharedMemoryHeader total_size layout drift");
 static_assert(
-    (sizeof(PTO2SharedMemoryHeader) % PTO2_ALIGN_SIZE == 0) && (sizeof(PTO2SharedMemoryHeader) < 4096),
-    "PTO2SharedMemoryHeader should be reasonably sized"
+    offsetof(PTO2SharedMemoryHeader, orch_error_code) == 208, "PTO2SharedMemoryHeader orch_error_code layout drift"
 );
 
 // =============================================================================

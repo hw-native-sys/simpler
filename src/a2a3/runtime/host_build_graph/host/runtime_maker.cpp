@@ -985,7 +985,7 @@ extern "C" int validate_runtime_impl(Runtime *runtime, const HostApi *api, int e
     }
 
     if (skip_tensor_copy_back) {
-        LOG_WARN("Skipping tensor copy-back because execution failed (rc=%d)", execution_rc);
+        LOG_WARN("Skipping tensor copy-back because execution failed");
     } else {
         for (int i = 0; i < tensor_pair_count; i++) {
             const TensorPair &pair = tensor_pairs[i];

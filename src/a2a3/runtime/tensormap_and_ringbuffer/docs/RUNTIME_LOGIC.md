@@ -164,8 +164,6 @@ The orchestrator and schedulers communicate through a contiguous shared memory r
 | `heap_size` | Init | Both | Heap total size (per-ring, in `PTO2SharedMemoryRingHeader`) |
 | `task_descriptors_offset` | Init | Both | Offset to TaskDescriptor array in SM (per-ring) |
 | `total_size` | Init | Both | Total shared memory size |
-| `graph_output_ptr` | Reserved | None | Legacy packed-output field retained for layout compatibility; remains zero |
-| `graph_output_size` | Reserved | None | Legacy packed-output field retained for layout compatibility; remains zero |
 
 ### 3.2 Size Calculation
 
