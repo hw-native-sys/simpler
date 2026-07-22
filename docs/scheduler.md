@@ -41,12 +41,8 @@ class Scheduler {
     // Producer: Orchestrator.submit_*. Consumer: Scheduler's own loop, Phase 0.
     LockFreeQueue<WiringEntry> wiring_queue_;       // {slot, producers}
 
-    // NEXT_LEVEL single tasks use one FIFO per stable worker id.
-    PerWorkerReadyQueues *ready_next_level_single_queues_;
-
-    // Transitional shared queue: NEXT_LEVEL groups only. PR3 gives this
-    // queue an explicit group contract and name.
-    ReadyQueue *ready_next_level_queue_;
+    // Owns one single-task FIFO per stable worker id and one group FIFO.
+    NextLevelReadyQueues *ready_next_level_queues_;
 
     // SUB scheduling stays unconstrained and shared.
     ReadyQueue *ready_sub_queue_;
@@ -85,9 +81,8 @@ NEXT_LEVEL single tasks have one FIFO for every stable worker id. A task is
 inserted into the FIFO named by its required `worker` argument:
 
 ```cpp
-PerWorkerReadyQueues ready_next_level_single_queues_; // worker id -> FIFO
-ReadyQueue ready_next_level_queue_;                  // NEXT_LEVEL groups
-ReadyQueue ready_sub_queue_;                         // all SUB tasks
+NextLevelReadyQueues ready_next_level_queues_; // worker FIFOs + group FIFO
+ReadyQueue ready_sub_queue_;                   // all SUB tasks
 ```
 
 The Orchestrator owns the routing rule. Both immediately-ready submissions
@@ -96,9 +91,10 @@ so dependency release cannot accidentally return a directed single task to a
 shared queue. A busy target blocks only its own FIFO; the Scheduler continues
 checking other worker FIFOs. FIFO order is preserved independently per worker.
 
-This PR intentionally leaves NEXT_LEVEL groups in the previous shared queue
-and leaves SUB dispatch unchanged. The next PR replaces the transitional group
-path with a dedicated all-targets-ready dispatcher.
+NEXT_LEVEL groups use the dedicated group FIFO. The Scheduler examines only
+its head. A group leaves READY only when every submitted target worker is idle;
+otherwise the group stays at the head, no worker is reserved, and independent
+single-task queues can still dispatch. SUB dispatch remains unchanged.
 
 ### Completion queue
 
@@ -194,20 +190,38 @@ The `lock_guard(p.fanout_mu)` + `p.state.load()` check ensures we either:
 
 ## 5. Phase 1 — dispatch
 
-`dispatch_ready` first drains the transitional NEXT_LEVEL group queue, then
-checks each NEXT_LEVEL worker's single-task FIFO, and finally drains the SUB
-queue. The single-task path has no worker selection:
+`dispatch_ready` tries launchable NEXT_LEVEL groups first, then checks each
+NEXT_LEVEL worker's single-task FIFO, and finally drains the SUB queue. The
+only cross-queue policy is launchable-group-first.
+
+Group dispatch is all-or-nothing:
+
+```cpp
+TaskSlot group;
+if (ready_next_level_queues_->try_front_group(group)) {
+    resolve every submitted worker id;
+    if (every target worker is idle) {
+        ready_next_level_queues_->try_pop_group(group);
+        mark every group member RUNNING;
+        dispatch every member to its submitted target;
+    }
+}
+```
+
+If any target is busy, the head is not removed or moved to the tail. The
+Scheduler does not scan later groups and does not reserve the currently idle
+members. It continues to the single-task queues:
 
 ```cpp
 void Scheduler::dispatch_next_level_singles() {
-    for (int32_t worker_id : ready_next_level_single_queues_->worker_ids()) {
+    for (int32_t worker_id : ready_next_level_queues_->worker_ids()) {
         WorkerThread *worker =
             manager_->get_worker_by_id(WorkerType::NEXT_LEVEL, worker_id);
         if (!worker || !worker->idle()) continue;
 
         TaskSlot slot;
         while (worker->idle() &&
-               ready_next_level_single_queues_->try_pop(worker_id, slot)) {
+               ready_next_level_queues_->try_pop_single(worker_id, slot)) {
             TaskSlotState &task = slots_[slot];
             if (task.state.load() != TaskState::READY) continue;
             task.state.store(TaskState::RUNNING);

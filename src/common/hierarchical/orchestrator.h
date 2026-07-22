@@ -68,12 +68,10 @@ struct SubmitResult {
 
 class Orchestrator {
 public:
-    // NEXT_LEVEL singles use one FIFO per stable worker id. NEXT_LEVEL groups
-    // and SUB tasks retain their shared queues in this stage of the stack.
     void init(
-        TensorMap *tensormap, Ring *allocator, Scope *scope, ReadyQueue *ready_next_level_queue,
-        ReadyQueue *ready_sub_queue, PerWorkerReadyQueues *ready_next_level_single_queues,
-        WorkerManager *manager = nullptr, std::function<void()> ready_notify_cb = {}
+        TensorMap *tensormap, Ring *allocator, Scope *scope, ReadyQueue *ready_sub_queue,
+        NextLevelReadyQueues *ready_next_level_queues, WorkerManager *manager = nullptr,
+        std::function<void()> ready_notify_cb = {}
     );
 
     // Allocate an intermediate buffer from the Worker's HeapRing (MAP_SHARED,
@@ -167,19 +165,8 @@ private:
     Scope *scope_ = nullptr;
     WorkerManager *manager_ = nullptr;
     std::function<void()> ready_notify_cb_;
-    // Strict-4 per-worker-type ready queues. Each queue handles tasks of
-    // exactly one WorkerType so the Scheduler can dispatch from an idle pool
-    // without being blocked by another pool's saturation.
-    ReadyQueue *ready_next_level_queue_ = nullptr;
     ReadyQueue *ready_sub_queue_ = nullptr;
-    PerWorkerReadyQueues *ready_next_level_single_queues_ = nullptr;
-
-    // Returns the ready queue that owns tasks of the given worker type.
-    // The method itself does not mutate the Orchestrator (hence `const`);
-    // the returned pointer is non-const because callers push into the queue.
-    ReadyQueue *ready_queue_for(WorkerType t) const {
-        return t == WorkerType::NEXT_LEVEL ? ready_next_level_queue_ : ready_sub_queue_;
-    }
+    NextLevelReadyQueues *ready_next_level_queues_ = nullptr;
 
     // --- Drain support (owned here, not on Worker) ---
     std::atomic<int32_t> active_tasks_{0};

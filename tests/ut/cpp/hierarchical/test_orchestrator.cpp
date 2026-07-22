@@ -29,10 +29,8 @@ struct OrchestratorFixture : public ::testing::Test {
     TensorMap tm;
     Ring allocator;
     Scope scope;
-    // Strict-4: per-type ready queues.
-    ReadyQueue rq_next_level;
+    NextLevelReadyQueues rq_next_level;
     ReadyQueue rq_sub;
-    PerWorkerReadyQueues rq_next_level_single;
     Orchestrator orch;
     CallConfig cfg;
 
@@ -41,14 +39,14 @@ struct OrchestratorFixture : public ::testing::Test {
     // `rq.try_pop(...)` / `EXPECT_TRUE(rq.try_pop(...))` lines continue to
     // work without rewriting every assertion.
     struct WorkerQueueView {
-        PerWorkerReadyQueues *queues;
-        bool try_pop(TaskSlot &out) { return queues->try_pop(0, out); }
-    } rq{&rq_next_level_single};
+        NextLevelReadyQueues *queues;
+        bool try_pop(TaskSlot &out) { return queues->try_pop_single(0, out); }
+    } rq{&rq_next_level};
 
     void SetUp() override {
         allocator.init(/*heap_bytes=*/1ULL << 20);
-        rq_next_level_single.reset({0, 1, 3});
-        orch.init(&tm, &allocator, &scope, &rq_next_level, &rq_sub, &rq_next_level_single);
+        rq_next_level.reset({0, 1, 3});
+        orch.init(&tm, &allocator, &scope, &rq_sub, &rq_next_level);
     }
 
     void TearDown() override { allocator.shutdown(); }
@@ -356,7 +354,7 @@ TEST_F(OrchestratorFixture, RemoteInputSidecarUsesRemoteTensorMapKey) {
     output_sidecar.tensors[0].desc.nbytes = 1;
     auto producer = orch.submit_next_level(C(42), output_args, cfg, 3, {3}, output_sidecar);
     TaskSlot ready;
-    rq_next_level_single.try_pop(3, ready);
+    rq_next_level.try_pop_single(3, ready);
 
     TaskArgs input_args;
     Tensor in = out;

@@ -428,6 +428,9 @@ public:
 
     bool empty() const;
 
+    // Non-blocking: copies the front without removing it.
+    bool try_front(TaskSlot &out);
+
     // Blocking: waits until a slot is available or shutdown() is called.
     // Returns false only when shutdown and queue is empty.
     bool wait_pop(TaskSlot &out);
@@ -441,14 +444,16 @@ private:
     bool shutdown_{false};
 };
 
-// Fixed NEXT_LEVEL worker-id to single-task ready-queue mapping. Worker
-// registration is complete before reset() and the mapping is immutable while
-// Orchestrator submissions and Scheduler dispatch are active.
-class PerWorkerReadyQueues {
+// Directed NEXT_LEVEL queues. Worker registration is complete before reset()
+// and the worker-id mapping is immutable while scheduling is active.
+class NextLevelReadyQueues {
 public:
     void reset(const std::vector<int32_t> &worker_ids);
-    void push(int32_t worker_id, TaskSlot slot);
-    bool try_pop(int32_t worker_id, TaskSlot &out);
+    void push_single(int32_t worker_id, TaskSlot slot);
+    bool try_pop_single(int32_t worker_id, TaskSlot &out);
+    void push_group(TaskSlot slot);
+    bool try_front_group(TaskSlot &out);
+    bool try_pop_group(TaskSlot &out);
     bool empty() const;
     void shutdown();
 
@@ -459,4 +464,5 @@ private:
 
     std::vector<int32_t> worker_ids_;
     std::vector<std::unique_ptr<ReadyQueue>> queues_;
+    ReadyQueue group_queue_;
 };

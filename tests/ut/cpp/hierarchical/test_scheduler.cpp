@@ -266,10 +266,8 @@ struct SchedulerFixture : public ::testing::Test {
     TensorMap tm;
     Ring allocator;
     Scope scope;
-    // Strict-4: per-type ready queues.
-    ReadyQueue rq_next_level;
     ReadyQueue rq_sub;
-    PerWorkerReadyQueues rq_next_level_single;
+    NextLevelReadyQueues rq_next_level;
     Orchestrator orch;
     MockMailboxWorker mock_worker;
     WorkerManager manager;
@@ -289,17 +287,15 @@ struct SchedulerFixture : public ::testing::Test {
         manager.start(&allocator, [this](WorkerCompletion completion) {
             sched.worker_done(std::move(completion));
         });
-        rq_next_level_single.reset(manager.next_level_worker_ids());
-        orch.init(
-            &tm, &allocator, &scope, &rq_next_level, &rq_sub, &rq_next_level_single, &manager,
-            [this] { sched.notify_ready(); }
-        );
+        rq_next_level.reset(manager.next_level_worker_ids());
+        orch.init(&tm, &allocator, &scope, &rq_sub, &rq_next_level, &manager, [this] {
+            sched.notify_ready();
+        });
 
         Scheduler::Config c;
         c.ring = &allocator;
-        c.ready_next_level_queue = &rq_next_level;
         c.ready_sub_queue = &rq_sub;
-        c.ready_next_level_single_queues = &rq_next_level_single;
+        c.ready_next_level_queues = &rq_next_level;
         c.manager = &manager;
         c.enqueue_ready_cb = [this](TaskSlot slot) {
             orch.enqueue_ready(slot);
@@ -479,10 +475,8 @@ struct GroupSchedulerFixture : public ::testing::Test {
     TensorMap tm;
     Ring allocator;
     Scope scope;
-    // Strict-4: per-type ready queues.
-    ReadyQueue rq_next_level;
     ReadyQueue rq_sub;
-    PerWorkerReadyQueues rq_next_level_single;
+    NextLevelReadyQueues rq_next_level;
     Orchestrator orch;
     MockMailboxWorker worker_a;
     MockMailboxWorker worker_b;
@@ -505,17 +499,15 @@ struct GroupSchedulerFixture : public ::testing::Test {
         manager.start(&allocator, [this](WorkerCompletion completion) {
             sched.worker_done(std::move(completion));
         });
-        rq_next_level_single.reset(manager.next_level_worker_ids());
-        orch.init(
-            &tm, &allocator, &scope, &rq_next_level, &rq_sub, &rq_next_level_single, &manager,
-            [this] { sched.notify_ready(); }
-        );
+        rq_next_level.reset(manager.next_level_worker_ids());
+        orch.init(&tm, &allocator, &scope, &rq_sub, &rq_next_level, &manager, [this] {
+            sched.notify_ready();
+        });
 
         Scheduler::Config c;
         c.ring = &allocator;
-        c.ready_next_level_queue = &rq_next_level;
         c.ready_sub_queue = &rq_sub;
-        c.ready_next_level_single_queues = &rq_next_level_single;
+        c.ready_next_level_queues = &rq_next_level;
         c.manager = &manager;
         c.enqueue_ready_cb = [this](TaskSlot slot) {
             orch.enqueue_ready(slot);
@@ -561,12 +553,8 @@ TEST_F(GroupSchedulerFixture, GroupDispatchesToNWorkers) {
     EXPECT_EQ(worker_a.dispatched_count(), 1);
     EXPECT_EQ(worker_b.dispatched_count(), 1);
 
-    // Each worker got a different TaskArgs from the slot's task_args_list —
-    // proven by the keys 0xA0 and 0xA1 each landing on exactly one worker.
-    uint64_t keys[2] = {worker_a.dispatched[0].tensor_key, worker_b.dispatched[0].tensor_key};
-    std::sort(std::begin(keys), std::end(keys));
-    EXPECT_EQ(keys[0], 0xA0u);
-    EXPECT_EQ(keys[1], 0xA1u);
+    EXPECT_EQ(worker_a.dispatched[0].tensor_key, 0xA0u);
+    EXPECT_EQ(worker_b.dispatched[0].tensor_key, 0xA1u);
     (void)slot;
 
     worker_a.complete();
@@ -589,6 +577,103 @@ TEST_F(GroupSchedulerFixture, GroupCompletesOnlyWhenAllDone) {
 
     worker_b.complete();
     wait_consumed(slot);
+}
+
+TEST_F(GroupSchedulerFixture, BlockedGroupDoesNotDispatchPartiallyOrReserveIdleWorker) {
+    auto running = orch.submit_next_level(C(70), single_tensor_args(0xF0, TensorArgType::OUTPUT), cfg, 0);
+    worker_a.wait_running();
+    ASSERT_TRUE(worker_a.is_running.load());
+
+    TaskArgs group_a = single_tensor_args(0xF1, TensorArgType::OUTPUT);
+    TaskArgs group_b = single_tensor_args(0xF2, TensorArgType::OUTPUT);
+    auto group = orch.submit_next_level_group(C(71), {group_a, group_b}, cfg, {0, 1});
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    EXPECT_EQ(S(group.task_slot).state.load(), TaskState::READY);
+    EXPECT_FALSE(worker_b.is_running.load());
+    EXPECT_EQ(worker_b.dispatched_count(), 0);
+
+    auto independent = orch.submit_next_level(C(72), single_tensor_args(0xF3, TensorArgType::OUTPUT), cfg, 1);
+    worker_b.wait_running();
+    ASSERT_TRUE(worker_b.is_running.load());
+    EXPECT_EQ(worker_b.dispatched[0].callable_hash0, 72u);
+    EXPECT_EQ(S(group.task_slot).state.load(), TaskState::READY);
+
+    worker_b.complete();
+    wait_consumed(independent.task_slot);
+    worker_a.complete();
+
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(500);
+    while ((!worker_a.is_running.load() || !worker_b.is_running.load()) &&
+           std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    ASSERT_TRUE(worker_a.is_running.load());
+    ASSERT_TRUE(worker_b.is_running.load());
+    EXPECT_EQ(worker_a.dispatched[1].callable_hash0, 71u);
+    EXPECT_EQ(worker_b.dispatched[1].callable_hash0, 71u);
+
+    worker_a.complete();
+    worker_b.complete();
+    wait_consumed(running.task_slot);
+    wait_consumed(group.task_slot);
+}
+
+TEST_F(GroupSchedulerFixture, LaunchableGroupPrecedesConflictingSingles) {
+    auto running_a = orch.submit_next_level(C(73), single_tensor_args(0xF4, TensorArgType::OUTPUT), cfg, 0);
+    auto running_b = orch.submit_next_level(C(74), single_tensor_args(0xF5, TensorArgType::OUTPUT), cfg, 1);
+    worker_a.wait_running();
+    worker_b.wait_running();
+    ASSERT_TRUE(worker_a.is_running.load());
+    ASSERT_TRUE(worker_b.is_running.load());
+
+    TaskArgs group_a = single_tensor_args(0xF6, TensorArgType::OUTPUT);
+    TaskArgs group_b = single_tensor_args(0xF7, TensorArgType::OUTPUT);
+    SubmitResult group;
+    SubmitResult single_a;
+    SubmitResult single_b;
+    {
+        std::lock_guard<std::mutex> scheduler_pause(sched.loop_mutex());
+        group = orch.submit_next_level_group(C(75), {group_a, group_b}, cfg, {0, 1});
+        single_a = orch.submit_next_level(C(76), single_tensor_args(0xF8, TensorArgType::OUTPUT), cfg, 0);
+        single_b = orch.submit_next_level(C(77), single_tensor_args(0xF9, TensorArgType::OUTPUT), cfg, 1);
+        worker_a.complete();
+        worker_b.complete();
+
+        auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(500);
+        while (manager.any_busy() && std::chrono::steady_clock::now() < deadline) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        ASSERT_FALSE(manager.any_busy());
+    }
+
+    worker_a.wait_running();
+    worker_b.wait_running();
+    ASSERT_EQ(worker_a.dispatched_count(), 2);
+    ASSERT_EQ(worker_b.dispatched_count(), 2);
+    EXPECT_EQ(worker_a.dispatched[1].callable_hash0, 75u);
+    EXPECT_EQ(worker_b.dispatched[1].callable_hash0, 75u);
+
+    worker_a.complete();
+    worker_b.complete();
+    wait_consumed(group.task_slot);
+
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(500);
+    while ((worker_a.dispatched_count() < 3 || worker_b.dispatched_count() < 3) &&
+           std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    ASSERT_EQ(worker_a.dispatched_count(), 3);
+    ASSERT_EQ(worker_b.dispatched_count(), 3);
+    EXPECT_EQ(worker_a.dispatched[2].callable_hash0, 76u);
+    EXPECT_EQ(worker_b.dispatched[2].callable_hash0, 77u);
+    worker_a.complete();
+    worker_b.complete();
+
+    wait_consumed(running_a.task_slot);
+    wait_consumed(running_b.task_slot);
+    wait_consumed(single_a.task_slot);
+    wait_consumed(single_b.task_slot);
 }
 
 TEST_F(GroupSchedulerFixture, GroupFailureWaitsForRunningMembersThenConsumes) {
@@ -727,9 +812,8 @@ TEST(SchedulerWorkerAffinityTest, NextLevelAffinityUsesWorkerIdNotVectorIndex) {
     TensorMap tm;
     Ring allocator;
     Scope scope;
-    ReadyQueue rq_next_level;
     ReadyQueue rq_sub;
-    PerWorkerReadyQueues rq_next_level_single;
+    NextLevelReadyQueues rq_next_level;
     Orchestrator orch;
     MockMailboxWorker worker_a;
     MockMailboxWorker worker_b;
@@ -747,17 +831,15 @@ TEST(SchedulerWorkerAffinityTest, NextLevelAffinityUsesWorkerIdNotVectorIndex) {
     manager.start(&allocator, [&sched](WorkerCompletion completion) {
         sched.worker_done(std::move(completion));
     });
-    rq_next_level_single.reset(manager.next_level_worker_ids());
-    orch.init(
-        &tm, &allocator, &scope, &rq_next_level, &rq_sub, &rq_next_level_single, &manager,
-        [&sched] { sched.notify_ready(); }
-    );
+    rq_next_level.reset(manager.next_level_worker_ids());
+    orch.init(&tm, &allocator, &scope, &rq_sub, &rq_next_level, &manager, [&sched] {
+        sched.notify_ready();
+    });
 
     Scheduler::Config c;
     c.ring = &allocator;
-    c.ready_next_level_queue = &rq_next_level;
     c.ready_sub_queue = &rq_sub;
-    c.ready_next_level_single_queues = &rq_next_level_single;
+    c.ready_next_level_queues = &rq_next_level;
     c.manager = &manager;
     c.enqueue_ready_cb = [&orch](TaskSlot slot) {
         orch.enqueue_ready(slot);
@@ -849,9 +931,8 @@ struct MixedTypeSchedulerFixture : public ::testing::Test {
     TensorMap tm;
     Ring allocator;
     Scope scope;
-    ReadyQueue rq_next_level;
     ReadyQueue rq_sub;
-    PerWorkerReadyQueues rq_next_level_single;
+    NextLevelReadyQueues rq_next_level;
     Orchestrator orch;
     MockMailboxWorker next_level_worker;
     MockMailboxWorker sub_worker;
@@ -874,17 +955,15 @@ struct MixedTypeSchedulerFixture : public ::testing::Test {
         manager.start(&allocator, [this](WorkerCompletion completion) {
             sched.worker_done(std::move(completion));
         });
-        rq_next_level_single.reset(manager.next_level_worker_ids());
-        orch.init(
-            &tm, &allocator, &scope, &rq_next_level, &rq_sub, &rq_next_level_single, &manager,
-            [this] { sched.notify_ready(); }
-        );
+        rq_next_level.reset(manager.next_level_worker_ids());
+        orch.init(&tm, &allocator, &scope, &rq_sub, &rq_next_level, &manager, [this] {
+            sched.notify_ready();
+        });
 
         Scheduler::Config c;
         c.ring = &allocator;
-        c.ready_next_level_queue = &rq_next_level;
         c.ready_sub_queue = &rq_sub;
-        c.ready_next_level_single_queues = &rq_next_level_single;
+        c.ready_next_level_queues = &rq_next_level;
         c.manager = &manager;
         c.enqueue_ready_cb = [this](TaskSlot slot) {
             orch.enqueue_ready(slot);
@@ -972,7 +1051,7 @@ TEST_F(GroupSchedulerFixture, GroupDependencyChain) {
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
     int total = worker_a.dispatched_count() + worker_b.dispatched_count();
-    EXPECT_GE(total, 3);  // 2 from group A + 1 from B
+    EXPECT_EQ(total, 3);  // 2 from group A + exactly 1 downstream dispatch
 
     if (worker_a.is_running.load()) worker_a.complete();
     if (worker_b.is_running.load()) worker_b.complete();

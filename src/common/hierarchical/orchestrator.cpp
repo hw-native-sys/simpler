@@ -18,16 +18,14 @@
 #include "worker_manager.h"
 
 void Orchestrator::init(
-    TensorMap *tensormap, Ring *allocator, Scope *scope, ReadyQueue *ready_next_level_queue,
-    ReadyQueue *ready_sub_queue, PerWorkerReadyQueues *ready_next_level_single_queues, WorkerManager *manager,
-    std::function<void()> ready_notify_cb
+    TensorMap *tensormap, Ring *allocator, Scope *scope, ReadyQueue *ready_sub_queue,
+    NextLevelReadyQueues *ready_next_level_queues, WorkerManager *manager, std::function<void()> ready_notify_cb
 ) {
     tensormap_ = tensormap;
     allocator_ = allocator;
     scope_ = scope;
-    ready_next_level_queue_ = ready_next_level_queue;
     ready_sub_queue_ = ready_sub_queue;
-    ready_next_level_single_queues_ = ready_next_level_single_queues;
+    ready_next_level_queues_ = ready_next_level_queues;
     manager_ = manager;
     ready_notify_cb_ = std::move(ready_notify_cb);
     active_tasks_.store(0, std::memory_order_relaxed);
@@ -321,14 +319,17 @@ SubmitResult Orchestrator::submit_impl(
 
 void Orchestrator::enqueue_ready(TaskSlot slot) {
     TaskSlotState &s = slot_state(slot);
-    if (s.worker_type == WorkerType::NEXT_LEVEL && !s.is_group()) {
-        if (ready_next_level_single_queues_ == nullptr) {
-            throw std::runtime_error("Orchestrator::enqueue_ready: NEXT_LEVEL single queues are not initialized");
+    if (s.worker_type == WorkerType::NEXT_LEVEL) {
+        if (ready_next_level_queues_ == nullptr)
+            throw std::runtime_error("Orchestrator::enqueue_ready: NEXT_LEVEL queues are not initialized");
+        if (s.is_group()) {
+            ready_next_level_queues_->push_group(slot);
+        } else {
+            ready_next_level_queues_->push_single(s.get_affinity(0), slot);
         }
-        ready_next_level_single_queues_->push(s.get_affinity(0), slot);
         return;
     }
-    ready_queue_for(s.worker_type)->push(slot);
+    ready_sub_queue_->push(slot);
 }
 
 void Orchestrator::validate_worker_eligibility(

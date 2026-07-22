@@ -204,10 +204,9 @@ private:
     TensorMap tensormap_;
     Ring allocator_;
     Scope scope_;
-    // NEXT_LEVEL singles use one FIFO per stable worker id. Groups remain on
-    // the shared NEXT_LEVEL queue until directed group dispatch is installed.
-    PerWorkerReadyQueues ready_next_level_single_queues_;
-    ReadyQueue ready_next_level_queue_;
+    // NEXT_LEVEL singles use one FIFO per stable worker id; groups use one
+    // FIFO whose head launches only when every requested worker is idle.
+    NextLevelReadyQueues ready_next_level_queues_;
     ReadyQueue ready_sub_queue_;
     Orchestrator orchestrator_;
     Scheduler scheduler_;

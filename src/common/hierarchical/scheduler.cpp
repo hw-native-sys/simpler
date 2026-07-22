@@ -11,6 +11,7 @@
 
 #include "scheduler.h"
 
+#include <algorithm>
 #include <stdexcept>
 #include <utility>
 
@@ -36,8 +37,8 @@ bool is_terminal_group_state(GroupMemberState state) {
 // =============================================================================
 
 void Scheduler::start(const Config &cfg) {
-    if (cfg.ring == nullptr || cfg.ready_next_level_queue == nullptr || cfg.ready_sub_queue == nullptr ||
-        cfg.ready_next_level_single_queues == nullptr || cfg.manager == nullptr || !cfg.enqueue_ready_cb)
+    if (cfg.ring == nullptr || cfg.ready_sub_queue == nullptr || cfg.ready_next_level_queues == nullptr ||
+        cfg.manager == nullptr || !cfg.enqueue_ready_cb)
         throw std::invalid_argument("Scheduler::start: null config fields");
     cfg_ = cfg;
 
@@ -50,9 +51,8 @@ void Scheduler::stop() {
     stop_requested_.store(true, std::memory_order_release);
     completion_cv_.notify_all();
     // Shut down every ready queue so any wait_pop waiters unblock.
-    cfg_.ready_next_level_queue->shutdown();
     cfg_.ready_sub_queue->shutdown();
-    cfg_.ready_next_level_single_queues->shutdown();
+    cfg_.ready_next_level_queues->shutdown();
 
     if (sched_thread_.joinable()) sched_thread_.join();
 
@@ -164,9 +164,8 @@ void Scheduler::run() {
         {
             std::unique_lock<std::mutex> lk(completion_mu_);
             completion_cv_.wait(lk, [this] {
-                return !completion_queue_.empty() || !cfg_.ready_next_level_queue->empty() ||
-                       !cfg_.ready_next_level_single_queues->empty() || !cfg_.ready_sub_queue->empty() ||
-                       stop_requested_.load(std::memory_order_acquire);
+                return !completion_queue_.empty() || !cfg_.ready_next_level_queues->empty() ||
+                       !cfg_.ready_sub_queue->empty() || stop_requested_.load(std::memory_order_acquire);
             });
         }
 
@@ -333,9 +332,10 @@ void Scheduler::try_consume(TaskSlot slot) {
 // =============================================================================
 
 void Scheduler::dispatch_ready() {
-    // Strict-4: drain each per-type queue with its OWN head-of-line break.
-    // A saturated pool of one type only stalls its own queue; the other
-    // type continues to dispatch from its pool of idle workers.
+    dispatch_next_level_group();
+    dispatch_next_level_singles();
+
+    // SUB scheduling remains unconstrained and shared.
     auto drain_one = [this](ReadyQueue *q) {
         TaskSlot slot;
         while (q->try_pop(slot)) {
@@ -414,13 +414,62 @@ void Scheduler::dispatch_ready() {
         }
     };
 
-    drain_one(cfg_.ready_next_level_queue);
-    dispatch_next_level_singles();
     drain_one(cfg_.ready_sub_queue);
 }
 
+void Scheduler::dispatch_next_level_group() {
+    TaskSlot slot;
+    while (cfg_.ready_next_level_queues->try_front_group(slot)) {
+        TaskSlotState &s = *cfg_.ring->slot_state(slot);
+        if (s.state.load(std::memory_order_acquire) != TaskState::READY) {
+            TaskSlot stale;
+            cfg_.ready_next_level_queues->try_pop_group(stale);
+            continue;
+        }
+        if (s.worker_type != WorkerType::NEXT_LEVEL || !s.is_group()) {
+            throw std::runtime_error("Scheduler::dispatch_next_level_group: misrouted task slot");
+        }
+
+        const int32_t group_size = s.group_size();
+        std::vector<WorkerThread *> workers;
+        workers.reserve(static_cast<size_t>(group_size));
+        for (int32_t i = 0; i < group_size; ++i) {
+            const int32_t worker_id = s.get_affinity(i);
+            WorkerThread *worker = cfg_.manager->get_worker_by_id(WorkerType::NEXT_LEVEL, worker_id);
+            if (worker == nullptr || !s.worker_allowed(i, worker_id)) {
+                throw std::runtime_error("Scheduler::dispatch_next_level_group: invalid target worker");
+            }
+            if (std::find(workers.begin(), workers.end(), worker) != workers.end()) {
+                throw std::runtime_error("Scheduler::dispatch_next_level_group: duplicate target worker");
+            }
+            if (!worker->idle()) return;
+            workers.push_back(worker);
+        }
+
+        TaskSlot popped;
+        if (!cfg_.ready_next_level_queues->try_pop_group(popped) || popped != slot) {
+            throw std::runtime_error("Scheduler::dispatch_next_level_group: group queue changed unexpectedly");
+        }
+
+        {
+            std::lock_guard<std::mutex> lk(s.group_mu);
+            s.group_member_states.assign(static_cast<size_t>(group_size), GroupMemberState::RUNNING);
+            s.group_member_outcomes.assign(static_cast<size_t>(group_size), EndpointOutcome::SKIPPED);
+            s.group_terminal_count.store(0, std::memory_order_relaxed);
+            s.group_dispatched_count.store(group_size, std::memory_order_relaxed);
+            s.group_failed = false;
+            s.group_first_failure_index = -1;
+            s.group_first_failure_message.clear();
+        }
+        s.state.store(TaskState::RUNNING, std::memory_order_release);
+        for (int32_t i = 0; i < group_size; ++i) {
+            workers[static_cast<size_t>(i)]->dispatch(WorkerDispatch{slot, i});
+        }
+    }
+}
+
 void Scheduler::dispatch_next_level_singles() {
-    for (int32_t worker_id : cfg_.ready_next_level_single_queues->worker_ids()) {
+    for (int32_t worker_id : cfg_.ready_next_level_queues->worker_ids()) {
         WorkerThread *worker = cfg_.manager->get_worker_by_id(WorkerType::NEXT_LEVEL, worker_id);
         if (worker == nullptr) {
             throw std::runtime_error(
@@ -430,7 +479,7 @@ void Scheduler::dispatch_next_level_singles() {
         if (!worker->idle()) continue;
 
         TaskSlot slot;
-        while (cfg_.ready_next_level_single_queues->try_pop(worker_id, slot)) {
+        while (cfg_.ready_next_level_queues->try_pop_single(worker_id, slot)) {
             TaskSlotState &s = *cfg_.ring->slot_state(slot);
             if (s.state.load(std::memory_order_acquire) != TaskState::READY) continue;
             if (s.worker_type != WorkerType::NEXT_LEVEL || s.is_group() || s.get_affinity(0) != worker_id) {

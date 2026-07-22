@@ -82,6 +82,13 @@ bool ReadyQueue::empty() const {
     return q_.empty();
 }
 
+bool ReadyQueue::try_front(TaskSlot &out) {
+    std::lock_guard<std::mutex> lk(mu_);
+    if (q_.empty()) return false;
+    out = q_.front();
+    return true;
+}
+
 bool ReadyQueue::wait_pop(TaskSlot &out) {
     std::unique_lock<std::mutex> lk(mu_);
     cv_.wait(lk, [this] {
@@ -102,19 +109,19 @@ void ReadyQueue::shutdown() {
 }
 
 // =============================================================================
-// PerWorkerReadyQueues
+// NextLevelReadyQueues
 // =============================================================================
 
-void PerWorkerReadyQueues::reset(const std::vector<int32_t> &worker_ids) {
+void NextLevelReadyQueues::reset(const std::vector<int32_t> &worker_ids) {
     worker_ids_.clear();
     queues_.clear();
     worker_ids_.reserve(worker_ids.size());
     queues_.reserve(worker_ids.size());
     for (int32_t worker_id : worker_ids) {
-        if (worker_id < 0) throw std::invalid_argument("PerWorkerReadyQueues::reset: negative worker id");
+        if (worker_id < 0) throw std::invalid_argument("NextLevelReadyQueues::reset: negative worker id");
         for (int32_t existing : worker_ids_) {
             if (existing == worker_id) {
-                throw std::invalid_argument("PerWorkerReadyQueues::reset: duplicate worker id");
+                throw std::invalid_argument("NextLevelReadyQueues::reset: duplicate worker id");
             }
         }
         worker_ids_.push_back(worker_id);
@@ -122,28 +129,36 @@ void PerWorkerReadyQueues::reset(const std::vector<int32_t> &worker_ids) {
     }
 }
 
-size_t PerWorkerReadyQueues::index_for(int32_t worker_id) const {
+size_t NextLevelReadyQueues::index_for(int32_t worker_id) const {
     for (size_t i = 0; i < worker_ids_.size(); ++i) {
         if (worker_ids_[i] == worker_id) return i;
     }
-    throw std::out_of_range("PerWorkerReadyQueues: unknown worker id " + std::to_string(worker_id));
+    throw std::out_of_range("NextLevelReadyQueues: unknown worker id " + std::to_string(worker_id));
 }
 
-void PerWorkerReadyQueues::push(int32_t worker_id, TaskSlot slot) { queues_[index_for(worker_id)]->push(slot); }
+void NextLevelReadyQueues::push_single(int32_t worker_id, TaskSlot slot) { queues_[index_for(worker_id)]->push(slot); }
 
-bool PerWorkerReadyQueues::try_pop(int32_t worker_id, TaskSlot &out) {
+bool NextLevelReadyQueues::try_pop_single(int32_t worker_id, TaskSlot &out) {
     return queues_[index_for(worker_id)]->try_pop(out);
 }
 
-bool PerWorkerReadyQueues::empty() const {
+void NextLevelReadyQueues::push_group(TaskSlot slot) { group_queue_.push(slot); }
+
+bool NextLevelReadyQueues::try_front_group(TaskSlot &out) { return group_queue_.try_front(out); }
+
+bool NextLevelReadyQueues::try_pop_group(TaskSlot &out) { return group_queue_.try_pop(out); }
+
+bool NextLevelReadyQueues::empty() const {
+    if (!group_queue_.empty()) return false;
     for (const auto &queue : queues_) {
         if (!queue->empty()) return false;
     }
     return true;
 }
 
-void PerWorkerReadyQueues::shutdown() {
+void NextLevelReadyQueues::shutdown() {
     for (auto &queue : queues_) {
         queue->shutdown();
     }
+    group_queue_.shutdown();
 }

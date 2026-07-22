@@ -176,8 +176,8 @@ remote buffer identity and logical offset.
 fanin_count`, the slot is ready. A ready NEXT_LEVEL single task is routed to
 the FIFO for its required stable worker id. The same routing function is used
 for immediately-ready submissions and tasks released by Scheduler dependency
-processing. NEXT_LEVEL groups and SUB tasks remain on their shared queues in
-this transition.
+processing. A ready NEXT_LEVEL group is routed to the dedicated group FIFO;
+SUB tasks remain on their shared queue.
 
 **Step 5 — scope ref**: Each slot starts with one "scope reference" in its
 fanout_total. Without this, a task with no downstream consumer would never be
@@ -237,9 +237,12 @@ SubmitResult Orchestrator::submit_next_level_group(const CallableIdentity &calla
 }
 ```
 
-At dispatch time the Scheduler reserves `group_size` idle WorkerThreads, and
-each WorkerThread runs `worker->run` with its own `task_args_list[i]`.
-Completion is gated on `sub_complete_count.fetch_add(1) + 1 == group_size`.
+At dispatch time the Scheduler checks the group FIFO head and resolves every
+entry in `workers` to that exact stable worker ID. It dispatches only if the
+entire target set is idle; a blocked group reserves no partial worker set and
+does not cause a scan past the FIFO head. Each WorkerThread runs `worker->run`
+with its own `task_args_list[i]`. Completion remains aggregated at the group
+slot, so downstream consumers are released once after every member is terminal.
 
 ---
 
