@@ -1598,6 +1598,7 @@ def _chip_process_loop(  # noqa: PLR0913 -- fork-child entry: all context (bins,
     platform: str = "",
     runtime: str = "",
     prewarm_config=None,
+    enable_sdma: bool = False,
 ) -> None:
     """Runs in forked child process. Loads host_runtime.so in own address space.
 
@@ -1612,7 +1613,14 @@ def _chip_process_loop(  # noqa: PLR0913 -- fork-child entry: all context (bins,
 
     try:
         cw = ChipWorker()
-        cw.init(device_id, bins, log_level=log_level, log_info_v=log_info_v, prewarm_config=prewarm_config)
+        cw.init(
+            device_id,
+            bins,
+            log_level=log_level,
+            log_info_v=log_info_v,
+            prewarm_config=prewarm_config,
+            enable_sdma=enable_sdma,
+        )
     except Exception as e:
         _tb.print_exc()
         # Publish the cause into the mailbox and flag INIT_FAILED so the
@@ -3954,8 +3962,15 @@ class Worker:
         self._chip_worker = ChipWorker()
         # The prebuilt runtime-arena is prewarmed inside cw.init for the declared
         # config's ring sizing (built right after the device comes up), so the
-        # first run() with matching sizing skips the cold arena build.
-        self._chip_worker.init(device_id, binaries, prewarm_config=self._prewarm_config)
+        # first run() with matching sizing skips the cold arena build. enable_sdma
+        # opts this Worker into async-DMA (SDMA) workspace provisioning at init;
+        # off by default so ordinary Workers create no SDMA streams.
+        self._chip_worker.init(
+            device_id,
+            binaries,
+            prewarm_config=self._prewarm_config,
+            enable_sdma=bool(self._config.get("enable_sdma", False)),
+        )
 
         # Pre-warm any registered ChipCallable so the first run(handle, …)
         # does not pay the H2D upload cost.
@@ -4172,6 +4187,7 @@ class Worker:
                             platform=str(self._config["platform"]),
                             runtime=str(self._config["runtime"]),
                             prewarm_config=self._prewarm_config,
+                            enable_sdma=bool(self._config.get("enable_sdma", False)),
                         )
                     except BaseException as e:  # noqa: BLE001
                         import traceback as _tb  # noqa: PLC0415
@@ -6063,8 +6079,10 @@ class Worker:
 
             def _finalize_chip() -> None:
                 if self._chip_worker:
-                    self._chip_worker.finalize()
-                    self._chip_worker = None
+                    try:
+                        self._chip_worker.finalize()
+                    finally:
+                        self._chip_worker = None
 
             _step(_finalize_chip)
         else:

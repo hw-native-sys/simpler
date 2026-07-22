@@ -577,11 +577,36 @@ jobs:
         run: |
           source /usr/local/Ascend/cann/set_env.sh
           source .venv/bin/activate
+          # SDMA workloads provision 48 device-only STARS streams that sit in the
+          # device fault/sync domain, so a fault on that device pays a multi-minute
+          # teardown (issue #1425). Keep EVERY SDMA test out of this general sweep
+          # — which also runs the aicore_op_timeout fault-injection test — and run
+          # them on their own dedicated device(s) in the SDMA step below, so an
+          # SDMA fault's slow teardown can never mix with ordinary fault recovery.
+          SDMA_IGNORE="--ignore=examples/a2a3/tensormap_and_ringbuffer/prefetch_async_demo --ignore=examples/a2a3/tensormap_and_ringbuffer/sdma_async_completion_demo"
           if [ "$(uname -m)" = "x86_64" ]; then
-            python -m pytest examples tests/st --platform a2a3 --device ${DEVICE_RANGE} -v --require-pto-isa --pto-session-timeout 600
+            python -m pytest examples tests/st $SDMA_IGNORE --platform a2a3 --device ${DEVICE_RANGE} -v --require-pto-isa --pto-session-timeout 600
           else
             task-submit --timeout 1800 --max-time 1800 --device auto --device-num "$DEVICE_NUM" \
-              --run "python -m pytest examples tests/st --platform a2a3 --device \$TASK_DEVICE -v --require-pto-isa --pto-session-timeout 600"
+              --run "python -m pytest examples tests/st $SDMA_IGNORE --platform a2a3 --device \$TASK_DEVICE -v --require-pto-isa --pto-session-timeout 600"
+          fi
+
+      # SDMA pytest — every SDMA test runs here on its own dedicated device(s),
+      # isolated from the general sweep's aicore_op_timeout fault-injection test
+      # (issue #1425). Both demos create their Worker with enable_sdma=True so the
+      # runtime provisions the SDMA workspace: prefetch_async_demo on 1 device (L2),
+      # sdma_async_completion_demo on 2 devices (L3, workspace provisioned per chip
+      # child) with a comm domain for the peer windows.
+      - name: SDMA pytest (a2a3)
+        run: |
+          source /usr/local/Ascend/cann/set_env.sh
+          source .venv/bin/activate
+          SDMA_TESTS="examples/a2a3/tensormap_and_ringbuffer/prefetch_async_demo examples/a2a3/tensormap_and_ringbuffer/sdma_async_completion_demo"
+          if [ "$(uname -m)" = "x86_64" ]; then
+            python -m pytest $SDMA_TESTS --platform a2a3 --device ${DEVICE_RANGE} -v --require-pto-isa --pto-session-timeout 600
+          else
+            task-submit --timeout 1800 --max-time 1800 --device auto --device-num 2 \
+              --run "python -m pytest $SDMA_TESTS --platform a2a3 --device \$TASK_DEVICE -v --require-pto-isa --pto-session-timeout 600"
           fi
 
       # DFX per-feature smokes — hardware mirror of the st-sim-a2a3 set. The

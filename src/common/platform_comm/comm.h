@@ -29,11 +29,43 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "common/dma_workspace.h"
+
 #ifdef __cplusplus
 extern "C" {
 #endif
 
 typedef struct CommHandle_ *CommHandle;
+
+/** Bit mask of DmaWorkspaceKind values this platform can provision. */
+uint32_t dma_workspace_supported_mask(void);
+
+/**
+ * Provision the async-DMA workspaces named in required_mask for the current
+ * device (aclrtGetDevice) and write their device addresses into addr_out[kind]
+ * (0 where unused), for kind in [0, count). Bit `1u << kind` requests that
+ * engine. A requested workspace is mandatory: success guarantees a non-zero
+ * address for every requested bit.
+ *
+ * Called once at Worker init when the Worker was created with SDMA enabled.
+ * The provisioned addresses are stable for the Worker's life; the host copies
+ * them onto every run's KernelArgs, and AICPU injects them into GlobalContext
+ * (get_dma_workspace) — they are never threaded as user args. On success
+ * *handle_out owns the provider resources and must be released with
+ * dma_workspace_release(). Bits outside dma_workspace_supported_mask() are
+ * rejected, so provisioning fails fast on a platform/runtime without SDMA.
+ *
+ * @return 0 on success, non-zero on invalid/unsupported input or provisioning
+ *         failure.
+ */
+int dma_workspace_provision(uint32_t required_mask, uint64_t *addr_out, int count, void **handle_out);
+
+/**
+ * Release the resources returned by a successful dma_workspace_provision().
+ * Ordinary teardown: destroys the provider's streams and workspace. A null
+ * handle is a no-op.
+ */
+void dma_workspace_release(void *handle);
 
 /**
  * Initialize a communicator for the given rank.

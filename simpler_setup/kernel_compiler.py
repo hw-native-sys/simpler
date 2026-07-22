@@ -156,8 +156,15 @@ class KernelCompiler:
         exposes them. Both compile_incore and _compile_incore_sim prepend
         these regardless of what extra_include_dirs the caller passes, so
         kernels can include them without the call site knowing the dependency.
+
+        Also carries ``src/common/platform/include`` so kernel-facing runtime
+        headers (e.g. ``intrinsic.h``) can pull shared platform headers like
+        ``common/dma_workspace.h`` regardless of what the call site passes.
         """
-        return [str(Path(__file__).resolve().parent / "incore")]
+        return [
+            str(Path(__file__).resolve().parent / "incore"),
+            str(self.project_root / "src" / "common" / "platform" / "include"),
+        ]
 
     def _get_orchestration_config(self, runtime_name: str) -> tuple[list[str], list[str]]:
         """

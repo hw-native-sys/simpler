@@ -11,11 +11,11 @@
 /**
  * Per-device AICPU runtime config.
  *
- * Home for run-invariant per-device knobs that simpler_aicpu_init latches once
- * at worker init (from InitArgs) into resident-SO globals surviving every
- * subsequent per-task launch. The runtime consumes these read-only; they do
- * NOT ride the per-run KernelArgs or the arena layout. Add fields here as new
- * per-device config appears rather than threading it through the per-run path.
+ * Home for per-device knobs that simpler_aicpu_init latches at worker init
+ * (from InitArgs) into resident-SO globals surviving every subsequent per-task
+ * launch. Async-DMA slots may be republished after first-use provisioning; the
+ * runtime otherwise consumes these read-only. They do NOT ride the per-run
+ * KernelArgs or arena layout.
  *
  * Kept separate from platform_regs (which is strictly per-core register
  * addressing) so neither file accretes the other's concern.
@@ -49,6 +49,20 @@ void set_scheduler_timeout_ms(int timeout_ms);
 
 /** Get the scheduler watchdog timeout override in ms (0 if unset). */
 int get_scheduler_timeout_ms();
+
+/**
+ * Set the device address of the per-device async-DMA workspace for one engine
+ * kind (see DmaWorkspaceKind). Published by simpler_aicpu_init (from
+ * InitArgs.dma_workspace_addr[]) into a resident-SO array; the scheduler
+ * copies each slot into every core's GlobalContext, so kernels read it via
+ * get_dma_workspace(args, kind). 0 means no callable has provisioned that
+ * engine. A callable that declares the engine is rejected before launch if the
+ * platform cannot provide a non-zero address. Out-of-range kinds are ignored.
+ */
+void set_dma_workspace_addr(int kind, unsigned long long addr);
+
+/** Get the async-DMA workspace device address for one engine kind (0 if unavailable). */
+unsigned long long get_dma_workspace_addr(int kind);
 
 #ifdef __cplusplus
 }

@@ -10,11 +10,14 @@
  */
 #include "aicpu/aicpu_device_config.h"
 
+#include "common/dma_workspace.h"
+
 namespace {
-// Latched once per device by simpler_aicpu_init; survive every per-task launch
-// because the AICPU inner SO stays dlopen'd for the runner's life.
+// Latched by simpler_aicpu_init and updated after first-use DMA provisioning;
+// survives per-task launches because the inner SO stays dlopen'd.
 int g_orch_device_id = 0;
 int g_scheduler_timeout_ms = 0;
+unsigned long long g_dma_workspace_addr[DMA_WORKSPACE_KIND_COUNT] = {0};
 }  // namespace
 
 void set_orch_device_id(int device_id) { g_orch_device_id = device_id; }
@@ -24,3 +27,13 @@ int get_orch_device_id() { return g_orch_device_id; }
 void set_scheduler_timeout_ms(int timeout_ms) { g_scheduler_timeout_ms = timeout_ms; }
 
 int get_scheduler_timeout_ms() { return g_scheduler_timeout_ms; }
+
+void set_dma_workspace_addr(int kind, unsigned long long addr) {
+    if (kind < 0 || kind >= DMA_WORKSPACE_KIND_COUNT) return;
+    g_dma_workspace_addr[kind] = addr;
+}
+
+unsigned long long get_dma_workspace_addr(int kind) {
+    if (kind < 0 || kind >= DMA_WORKSPACE_KIND_COUNT) return 0;
+    return g_dma_workspace_addr[kind];
+}

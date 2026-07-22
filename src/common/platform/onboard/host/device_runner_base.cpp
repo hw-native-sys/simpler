@@ -46,6 +46,7 @@
 #include "host/acl_error_log.h"
 #include "host/raii_scope_guard.h"
 #include "host_log.h"
+#include "platform_comm/comm.h"
 #include "pto_runtime_c_api.h"
 #include "task_args.h"
 #include "utils/elf_build_id.h"
@@ -398,10 +399,6 @@ int DeviceRunnerBase::ensure_device_initialized() {
 }
 
 int DeviceRunnerBase::ensure_aicpu_init_launched() {
-    // Per-device one-shot: latch the invariants (orch device id, log config)
-    // into the resident AICPU SO globals via simpler_aicpu_init, so exec /
-    // record_device_orch_callable launches no longer carry them. The inner SO stays
-    // dlopen'd across launches, so a single init holds for the runner's life.
     if (aicpu_init_launched_) {
         return 0;
     }
@@ -413,6 +410,13 @@ int DeviceRunnerBase::ensure_aicpu_init_launched() {
     // Per-device scheduler watchdog override, resolved once at attach into
     // timeout_config_. 0 -> the AICPU scheduler keeps its compile-time default.
     init_args.scheduler_timeout_ms = timeout_config_.scheduler_timeout_ms;
+    // Publish the provisioned async-DMA workspace addresses (all-zero until a
+    // Worker opts into SDMA). provision_dma_workspace() re-launches this entry to
+    // re-latch them; the AICPU SO stays resident, so the latest values survive
+    // every subsequent per-task launch.
+    for (int kind = 0; kind < DMA_WORKSPACE_KIND_COUNT; ++kind) {
+        init_args.dma_workspace_addr[kind] = dma_workspace_addr_[kind];
+    }
 
     LOG_INFO_V0("=== launch_aicpu_payload %s ===", host::KernelNames::InitName);
     int rc = launch_aicpu_payload(
@@ -428,7 +432,6 @@ int DeviceRunnerBase::ensure_aicpu_init_launched() {
         LOG_ERROR("ensure_aicpu_init_launched: stream sync failed: %d (device_id=%d)", rc, device_id_);
         return rc;
     }
-
     aicpu_init_launched_ = true;
     return 0;
 }
@@ -847,6 +850,48 @@ int DeviceRunnerBase::unregister_callable(int32_t callable_id) {
 
 bool DeviceRunnerBase::has_callable(int32_t callable_id) const { return callables_.count(callable_id) != 0; }
 
+int DeviceRunnerBase::provision_dma_workspace(uint32_t required_mask) {
+    const uint32_t supported = dma_workspace_supported_mask();
+    if ((required_mask & ~supported) != 0) {
+        LOG_ERROR("provision_dma_workspace: unsupported mask=0x%x (supported=0x%x)", required_mask, supported);
+        return -1;
+    }
+    if (dma_workspace_handle_ != nullptr) {
+        LOG_ERROR("provision_dma_workspace: workspace already provisioned");
+        return -1;
+    }
+
+    for (int kind = 0; kind < DMA_WORKSPACE_KIND_COUNT; ++kind)
+        dma_workspace_addr_[kind] = 0;
+
+    // The provisioned addresses are stable for the Worker's life.
+    int rc =
+        dma_workspace_provision(required_mask, dma_workspace_addr_, DMA_WORKSPACE_KIND_COUNT, &dma_workspace_handle_);
+    if (rc != 0) {
+        LOG_ERROR("provision_dma_workspace: mask=0x%x failed: %d", required_mask, rc);
+        for (int kind = 0; kind < DMA_WORKSPACE_KIND_COUNT; ++kind)
+            dma_workspace_addr_[kind] = 0;
+        dma_workspace_handle_ = nullptr;
+        return rc;
+    }
+
+    // Re-latch the resident AICPU globals: simpler_aicpu_init publishes the
+    // provisioned addresses into g_dma_workspace_addr, which the scheduler
+    // prefills into every core's GlobalContext (get_dma_workspace). The AICPU SO
+    // stays dlopen'd, so the values survive every subsequent per-task launch.
+    aicpu_init_launched_ = false;
+    rc = ensure_aicpu_init_launched();
+    if (rc != 0) {
+        LOG_ERROR("provision_dma_workspace: re-latch of simpler_aicpu_init failed: %d", rc);
+        dma_workspace_release(dma_workspace_handle_);
+        dma_workspace_handle_ = nullptr;
+        for (int kind = 0; kind < DMA_WORKSPACE_KIND_COUNT; ++kind)
+            dma_workspace_addr_[kind] = 0;
+        return rc;
+    }
+    return 0;
+}
+
 uint64_t DeviceRunnerBase::callable_hash(int32_t callable_id) const {
     auto it = callables_.find(callable_id);
     return it == callables_.end() ? 0 : it->second.hash;
@@ -977,6 +1022,14 @@ int DeviceRunnerBase::finalize_common() {
     if (stream_aicore_ != nullptr) {
         capture(rtStreamDestroy(stream_aicore_));
         stream_aicore_ = nullptr;
+    }
+
+    // Release the async-DMA provider (SDMA STARS streams + workspace) while RTS
+    // is live, before the subclass device reset. Null unless the Worker was
+    // created with SDMA enabled; idempotent so a reused runner re-provisions.
+    if (dma_workspace_handle_ != nullptr) {
+        dma_workspace_release(dma_workspace_handle_);
+        dma_workspace_handle_ = nullptr;
     }
 
     // LoadAicpuOp holds a binary_handle_ from rtsBinaryLoadFromFile; unload it

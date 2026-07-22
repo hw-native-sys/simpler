@@ -106,6 +106,7 @@ public:
      * and read off DeviceRunner state / HostLogger here — no per-run args.
      */
     int run(Runtime &runtime, const CallConfig &config) override;
+    bool can_accept_run() const override { return !device_unusable_; }
 
     // `set_l2_swimlane_enabled`, `set_dump_args_enabled`,
     // `set_pmu_enabled`, `set_scope_stats_enabled`, `set_output_prefix`,

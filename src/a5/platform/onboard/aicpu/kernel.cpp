@@ -140,11 +140,11 @@ extern "C" __attribute__((visibility("default"))) int simpler_aicpu_exec(void *a
 /**
  * AICPU per-device init entry point.
  *
- * Launched once at worker init (before any register_callable / exec), this
- * latches the per-device invariants — log config and orchestration device id —
- * into the resident AICPU SO globals. Because the inner SO stays dlopen'd in
- * the AICPU OS process across launches, these globals survive every subsequent
- * per-task launch, so exec / register_callable no longer re-push them.
+ * Launched at worker init (before any register_callable / exec), this latches
+ * the per-device invariants into the resident AICPU SO globals. It is launched
+ * again only when first-use provisioning adds an async-DMA workspace. Because
+ * the inner SO stays dlopen'd across launches, the latest values survive every
+ * subsequent per-task launch.
  *
  * @param arg Pointer to an InitArgs payload
  * @return 0 on success, non-zero on error
@@ -161,6 +161,9 @@ extern "C" __attribute__((visibility("default"))) int simpler_aicpu_init(void *a
     set_log_info_v(static_cast<int>(init_args->log_info_v));
     set_orch_device_id(static_cast<int>(init_args->device_id));
     set_scheduler_timeout_ms(static_cast<int>(init_args->scheduler_timeout_ms));
+    for (int k = 0; k < DMA_WORKSPACE_KIND_COUNT; ++k) {
+        set_dma_workspace_addr(k, init_args->dma_workspace_addr[k]);
+    }
 
     LOG_INFO_V0("%s", "simpler_aicpu_init: per-device invariants latched");
     return 0;

@@ -51,6 +51,7 @@
 #include "arg_direction.h"
 #include "callable.h"
 #include "common/device_phase.h"
+#include "common/dma_workspace.h"
 #include "common/l2_swimlane_profiling.h"
 #include "utils/device_arena.h"
 #include "device_runner_helpers.h"
@@ -339,6 +340,19 @@ public:
     bool has_callable(int32_t callable_id) const;
 
     /**
+     * Provision the async-DMA workspaces named in `required_mask` once at Worker
+     * init and latch their device addresses into the resident KernelArgs so every
+     * subsequent run carries them (AICPU injects them into GlobalContext via
+     * get_dma_workspace). Called only for a Worker created with SDMA enabled;
+     * `required_mask` bits outside dma_workspace_supported_mask() are rejected, so
+     * a platform/runtime without SDMA fails fast. The provider handle is released
+     * by finalize_common().
+     *
+     * @return 0 on success, negative on unsupported/failed provisioning.
+     */
+    int provision_dma_workspace(uint32_t required_mask);
+
+    /**
      * Content-derived stable identity for a registered callable: the
      * ELF Build-ID 64-bit hash of its orchestration SO (CallableState::hash,
      * computed at record_device_orch_callable time via elf_build_id_64). Returns 0 when
@@ -412,6 +426,14 @@ public:
     // through these virtuals. Each arch's `DeviceRunner` overrides
     // `run` and `finalize`; a2a3 and a5 both override `set_dep_gen_enabled`
     // (an arch without dep_gen keeps the base no-op default).
+
+    /**
+     * Whether this runner may start another run without first being finalized.
+     * The shared c_api checks this before attaching the thread or provisioning
+     * optional resources, so a poisoned runner cannot create SDMA streams on
+     * its way to the arch-specific run() fail-fast guard.
+     */
+    virtual bool can_accept_run() const = 0;
 
     /**
      * Execute a Runtime. Each arch implements its own `run()` — the bodies
@@ -562,9 +584,9 @@ protected:
     int ensure_binaries_loaded();
 
     /**
-     * Per-device one-shot launch of `simpler_aicpu_init`, latching the
-     * invariants (orch device id, log config) into the resident AICPU SO
-     * globals. Idempotent via `aicpu_init_launched_`; called from
+     * Initial launch of `simpler_aicpu_init`, latching the invariants (orch
+     * device id, log config) into the resident AICPU SO globals. Idempotent via
+     * `aicpu_init_launched_`; called from
      * `ensure_device_initialized()` after the binaries are loaded.
      *
      * @return 0 on success, error code on failure.
@@ -780,6 +802,16 @@ protected:
         void *host_orch_func_ptr{nullptr};
     };
     std::unordered_map<int32_t, CallableState> callables_;
+    // Opaque provider handle from dma_workspace_provision(), owned for the
+    // Worker's life and released by finalize_common(). Null unless the Worker
+    // was created with SDMA enabled.
+    void *dma_workspace_handle_{nullptr};
+    // Provisioned async-DMA workspace device addresses, indexed by
+    // DmaWorkspaceKind. Published into InitArgs by ensure_aicpu_init_launched()
+    // so the resident AICPU SO latches them into g_dma_workspace_addr; the
+    // scheduler prefills each core's GlobalContext from there. All-zero until a
+    // Worker opts into SDMA via provision_dma_workspace().
+    uint64_t dma_workspace_addr_[DMA_WORKSPACE_KIND_COUNT]{};
     std::unordered_set<int32_t> aicpu_seen_callable_ids_;
     // Monotonic count of successful AICPU dlopens (incremented after prewarm
     // or first-run fallback succeeds; never decremented). Diverges from
@@ -891,9 +923,8 @@ protected:
 
     // True after AICPU SO loaded; reset by the subclass's `finalize()`.
     bool binaries_loaded_{false};
-    // Per-device one-shot guard for the simpler_aicpu_init launch.
+    // Per-device guard for the initial simpler_aicpu_init launch.
     bool aicpu_init_launched_{false};
-
     // Shared diagnostics collectors. Each subclass initializes its own
     // (a2a3 wraps `halHostRegister`/`Unregister` callbacks, a5 uses
     // direct `rtMalloc`/`rtFree`), but the storage and lifetime live

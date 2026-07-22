@@ -14,6 +14,7 @@
 #include <cstdio>
 
 #include "common/unified_log.h"
+#include "aicpu/aicpu_device_config.h"
 #include "aicpu/dep_gen_collector_aicpu.h"
 #include "aicpu/device_phase_aicpu.h"
 #include "aicpu/device_time.h"
@@ -936,6 +937,9 @@ void SchedulerContext::assign_own_clusters(int32_t tidx) {
                 ac.completion_capacity = MAX_COMPLETIONS_PER_TASK;
                 slab->count = 0;
                 slab->error_code = PTO2_ERROR_NONE;
+                for (int k = 0; k < DMA_WORKSPACE_KIND_COUNT; ++k) {
+                    dp.global_context.dma_workspace[k] = get_dma_workspace_addr(k);
+                }
                 dp.args[PAYLOAD_LOCAL_CONTEXT_INDEX] = reinterpret_cast<uint64_t>(&dp.local_context);
                 dp.args[PAYLOAD_GLOBAL_CONTEXT_INDEX] = reinterpret_cast<uint64_t>(&dp.global_context);
             }
@@ -1264,6 +1268,9 @@ int32_t SchedulerContext::post_handshake_init(Runtime *runtime) {
             // count (and only when a deferred task dirtied it), never per dispatch.
             slab->count = 0;
             slab->error_code = PTO2_ERROR_NONE;
+            for (int k = 0; k < DMA_WORKSPACE_KIND_COUNT; ++k) {
+                dp.global_context.dma_workspace[k] = get_dma_workspace_addr(k);
+            }
             dp.args[PAYLOAD_LOCAL_CONTEXT_INDEX] = reinterpret_cast<uint64_t>(&dp.local_context);
             dp.args[PAYLOAD_GLOBAL_CONTEXT_INDEX] = reinterpret_cast<uint64_t>(&dp.global_context);
         }

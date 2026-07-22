@@ -607,4 +607,11 @@ size_t get_aicpu_dlopen_count(DeviceContextHandle ctx) {
     }
 }
 
+int simpler_provision_dma_workspace(DeviceContextHandle ctx, uint32_t required_mask) {
+    // Simulation provides no async-DMA workspaces; a non-empty request fails
+    // fast so an SDMA-enabled Worker cannot come up on sim.
+    (void)ctx;
+    return required_mask == 0 ? 0 : -1;
+}
+
 }  // extern "C"

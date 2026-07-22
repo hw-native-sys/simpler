@@ -47,13 +47,15 @@ accessor functions defined in that header.
 
 ## 2. SPMD execution context
 
-Three pieces of topology data are exposed to user kernels:
+The runtime context exposes three topology values plus an optional async-DMA
+workspace address:
 
 | Accessor (use these) | Returns | Lifetime | Source |
 | -------------------- | ------- | -------- | ------ |
 | `get_block_idx(args)` | logical block index in `[0, block_num)` | per-dispatch | `LocalContext.block_idx` |
 | `get_block_num(args)` | total logical blocks for this task | per-dispatch | `LocalContext.block_num` |
 | `get_sub_block_id(args)` | AIV lane in cluster (0 = AIV0, 1 = AIV1) | per-core, init once | `GlobalContext.sub_block_id` |
+| `get_dma_workspace(args, kind)` | engine workspace GM pointer, or `nullptr` | Worker init (SDMA-enabled) | `GlobalContext.dma_workspace[kind]` |
 
 `sub_block_id` is **only meaningful for AIV kernels in MIX tasks**.
 AIC kernels and single-AIV tasks should not depend on it. AIV0 is the
@@ -61,10 +63,22 @@ AIC kernels and single-AIV tasks should not depend on it. AIV0 is the
 binary and use `sub_block_id` to pick which half of the work they own
 (for example: head 0 of a `(head0, head1)` pair vs head 1).
 
-The scheduler initialises `GlobalContext.sub_block_id` once per AIV
-core at startup, based on each core's position in its cluster
-(`scheduler_cold_path.cpp::SchedulerContext::init`). `LocalContext` is
-rewritten by `build_payload()` before each dispatch.
+The scheduler initialises `GlobalContext.sub_block_id` once per AIV core at
+startup, based on each core's position in its cluster
+(`scheduler_cold_path.cpp::SchedulerContext::init`). It also copies the
+async-DMA workspace addresses from `KernelArgs` into
+`GlobalContext.dma_workspace`.
+Async-DMA is opt-in per Worker: construct the Worker with `enable_sdma=True`
+and the runtime provisions the SDMA workspace once at init, latches its address
+into `KernelArgs`, and injects it into every run's `GlobalContext`. A Worker
+that does not opt in creates no SDMA streams, and `get_dma_workspace` returns
+`nullptr`. Provisioning fails fast (Worker init raises) on a platform/runtime
+without SDMA support. Every event submitted through the workspace must be waited
+before the kernel returns or registered with the runtime's deferred-completion
+mechanism.
+An invalid kind or unprovisioned slot returns `nullptr` and must not be used to
+submit DMA work. `LocalContext` is rewritten by `build_payload()` before each
+dispatch.
 
 ### Logical vs physical block_dim
 

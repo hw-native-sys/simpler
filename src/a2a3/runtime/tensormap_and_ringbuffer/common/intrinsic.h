@@ -13,13 +13,16 @@
  * @file intrinsic.h
  * @brief SPMD execution context for AICore user kernels
  *
- * Topology data exposed to user kernels has two distinct lifetimes:
+ * Runtime context exposed to user kernels has two distinct lifetimes:
  *
- *   1. Global topology (per-core, fixed after runtime init):
+ *   1. Global context (per-core, fixed for one scheduler instance):
  *      - sub_block_id : identifies the AIV lane within a cluster
  *        (0 = AIV0/left, 1 = AIV1/right).  Initialized once at runtime
  *        startup based on each core's cluster position; never changes.
  *        Only meaningful for AIV kernels in MIX tasks.
+ *      - dma_workspace : optional per-engine device addresses copied from the
+ *        resident runtime config when the scheduler starts. A declaring
+ *        callable is provisioned before that scheduler run begins.
  *
  *   2. Local per-dispatch context (changes each dispatch):
  *      - block_idx : which logical block the current worker is executing
@@ -82,6 +85,7 @@
 #include <stdint.h>
 
 #include "aicore_completion_mailbox_types.h"
+#include "common/dma_workspace.h"
 #include "pto_task_id.h"
 
 #ifndef __gm__
@@ -107,14 +111,20 @@ static constexpr int32_t PAYLOAD_GLOBAL_CONTEXT_INDEX = SPMD_GLOBAL_CONTEXT_INDE
 
 /**
  * Per-core global context, stored in PTO2DispatchPayload.
- * Initialized once at runtime startup (init_global_context) based on each
- * core's cluster position.  Never modified after initialization.
+ * Initialized during scheduler cold start from each core's cluster position
+ * and the resident per-device async-DMA config. Stable for that scheduler
+ * instance; unavailable workspace slots remain zero.
  */
 struct GlobalContext {
     // AIV lane within cluster: 0=AIV0(left), 1=AIV1(right).
     // Used by AIV to select the correct intra-cluster hw instruction.
     // Not meaningful for AIC kernels or single-AIV tasks.
     int32_t sub_block_id;
+    // Per-engine async-DMA workspace device addresses (0 when unavailable),
+    // indexed by DmaWorkspaceKind. The scheduler copies them from the resident
+    // config into every core's context during cold start.
+    // Read via get_dma_workspace(args, kind).
+    uint64_t dma_workspace[DMA_WORKSPACE_KIND_COUNT];
 };
 
 struct AsyncCtx {
@@ -171,6 +181,23 @@ static __aicore__ inline int32_t get_sub_block_id(__gm__ int64_t *args) {
     __gm__ GlobalContext *ctx =
         reinterpret_cast<__gm__ GlobalContext *>(static_cast<uint64_t>(args[SPMD_GLOBAL_CONTEXT_INDEX]));
     return ctx->sub_block_id;
+}
+
+/**
+ * Return the device-global async-DMA workspace address for one engine kind
+ * (see DmaWorkspaceKind), or nullptr when unavailable. Runtime-provided (like
+ * get_block_idx): the host provisions each engine once per device and the
+ * scheduler injects the addresses into every core's context, so kernels bind
+ * the workspace to pto.tprefetch_async / SDMA / URMA sessions without threading
+ * it as a user arg. A declaring callable is rejected before dispatch unless its
+ * provider is supported and provisioning succeeds; nullptr is reserved for an
+ * invalid kind or an unavailable slot and must not be used to submit DMA work.
+ */
+static __aicore__ inline __gm__ uint8_t *get_dma_workspace(__gm__ int64_t *args, int kind) {
+    if (kind < 0 || kind >= DMA_WORKSPACE_KIND_COUNT) return nullptr;
+    __gm__ GlobalContext *ctx =
+        reinterpret_cast<__gm__ GlobalContext *>(static_cast<uint64_t>(args[SPMD_GLOBAL_CONTEXT_INDEX]));
+    return reinterpret_cast<__gm__ uint8_t *>(ctx->dma_workspace[kind]);
 }
 
 /**

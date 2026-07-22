@@ -14,6 +14,7 @@
 #include <cstdio>
 
 #include "common/unified_log.h"
+#include "aicpu/aicpu_device_config.h"
 #include "aicpu/dep_gen_collector_aicpu.h"
 #include "aicpu/device_phase_aicpu.h"
 #include "aicpu/device_time.h"
@@ -925,6 +926,16 @@ void SchedulerContext::assign_own_clusters(int32_t tidx) {
         payload_per_core_[aiv0_id][1].global_context.sub_block_id = 0;
         payload_per_core_[aiv1_id][0].global_context.sub_block_id = 1;
         payload_per_core_[aiv1_id][1].global_context.sub_block_id = 1;
+        // dma_workspace is a device constant: prefill it once per owned core
+        // (all cores in the cluster, both buffers), never on the dispatch path.
+        for (int32_t sub = 0; sub < 3; sub++) {
+            int32_t core_id = tracker.get_core_id_by_offset(cluster_offset + sub);
+            for (int32_t buf = 0; buf < 2; buf++) {
+                for (int k = 0; k < DMA_WORKSPACE_KIND_COUNT; ++k) {
+                    payload_per_core_[core_id][buf].global_context.dma_workspace[k] = get_dma_workspace_addr(k);
+                }
+            }
+        }
     }
 }
 
@@ -1226,6 +1237,16 @@ int32_t SchedulerContext::post_handshake_init(Runtime *runtime) {
             payload_per_core_[aiv0_id][1].global_context.sub_block_id = 0;
             payload_per_core_[aiv1_id][0].global_context.sub_block_id = 1;
             payload_per_core_[aiv1_id][1].global_context.sub_block_id = 1;
+            // dma_workspace is a device constant: prefill it once per core here,
+            // never on the dispatch path.
+            for (int32_t sub = 0; sub < 3; sub++) {
+                int32_t core_id = tracker.get_core_id_by_offset(cluster_offset + sub);
+                for (int32_t buf = 0; buf < 2; buf++) {
+                    for (int k = 0; k < DMA_WORKSPACE_KIND_COUNT; ++k) {
+                        payload_per_core_[core_id][buf].global_context.dma_workspace[k] = get_dma_workspace_addr(k);
+                    }
+                }
+            }
         }
     }
 

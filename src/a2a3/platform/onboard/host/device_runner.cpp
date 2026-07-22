@@ -30,6 +30,8 @@
 #include <vector>
 #include "acl/acl.h"
 #include "host/acl_error_log.h"
+#include "platform_comm/comm.h"
+#include "pto_runtime_c_api.h"
 
 // Include HAL constants from CANN (header only, library loaded dynamically)
 #include "ascend_hal.h"
@@ -616,6 +618,12 @@ public:
     DeviceBindGuard &operator=(const DeviceBindGuard &) = delete;
     bool bound() const { return bound_; }
 
+    // A successful force reset has already destroyed the bound default
+    // context. Suppress the ordinary reset that otherwise balances a live
+    // binding; issuing it after force reset reports 507007 and pollutes ACL's
+    // recent-error state even though the requested teardown succeeded.
+    void dismiss_after_force_reset() { bound_ = false; }
+
 private:
     int device_id_;
     bool bound_{false};
@@ -653,6 +661,7 @@ int DeviceRunner::force_reset_device() {
             LOG_ERROR("force_reset_device: aclrtResetDeviceForce(%d) failed: %d", device_id_, static_cast<int>(rc));
             return static_cast<int>(rc);
         }
+        bind_guard.dismiss_after_force_reset();
     }
     // Post-reset self-check: a 0 rc from aclrtResetDeviceForce does not by itself
     // prove the card is usable. Re-bind (fresh guard, balanced on exit) and
@@ -698,7 +707,8 @@ int DeviceRunner::force_reset_device() {
         return free_rc;
     }
     LOG_WARN(
-        "force_reset_device: aclrtResetDeviceForce(%d) cleared the poisoned card (probe confirmed clean)", device_id_
+        "force_reset_device: aclrtResetDeviceForce(%d) established a usable device generation (probe confirmed)",
+        device_id_
     );
     return 0;
 }

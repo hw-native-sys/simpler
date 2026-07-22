@@ -44,7 +44,8 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
 
     int rank = static_cast<int>(comm_ctx->rankId);
     int nranks = static_cast<int>(comm_ctx->rankNum);
-    if (nranks != 2 || comm_ctx->workSpace == 0) {
+    __gm__ uint8_t *sdma_workspace = get_dma_workspace(args, DMA_WORKSPACE_SDMA);
+    if (nranks != 2 || sdma_workspace == nullptr) {
         pipe_barrier(PIPE_ALL);
         return;
     }
@@ -64,8 +65,5 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
     TASSIGN(scratch_tile, 0x0);
 
     AsyncCtx async_ctx = get_async_ctx(args);
-    send_request_entry(
-        async_ctx,
-        SdmaTget(local_global, remote_global, scratch_tile, reinterpret_cast<__gm__ uint8_t *>(comm_ctx->workSpace))
-    );
+    send_request_entry(async_ctx, SdmaTget(local_global, remote_global, scratch_tile, sdma_workspace));
 }

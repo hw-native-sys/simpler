@@ -111,10 +111,29 @@ symmetric window is realized:
 | Window memory | POSIX shm + `ftruncate`, mmap'd per rank | VMM physical allocation + shareable-handle import; peer access via `aclrtDeviceEnablePeerAccess` |
 | Subset barrier | shm-header atomic, `allocation_id`-scoped | file barriers, `allocation_id`-scoped |
 | Window init | window zeroed after handshake (`memset`) | window zeroed after handshake (`aclrtMemset`) |
-| SDMA workspace | n/a | provisioned once per handle (`ensure_sdma_workspace`); inherited into each domain `CommContext` |
+| Async-DMA workspace | n/a | a2a3: opt-in per Worker (`enable_sdma`); a5: optional communication overlay, gated off by default |
 
 The window is zero-initialized on both backends so scratch/signal protocols see
 a known starting state (matching the historical static-path contract).
+
+On a2a3, async-DMA resources are a Worker-level opt-in, not a
+communication-domain property. Construct the Worker with `enable_sdma=True` and
+the runtime provisions the SDMA workspace once at init, latches its address into
+the resident `KernelArgs`, and injects it into every run's kernel
+`GlobalContext` (`get_dma_workspace`). A Worker without `enable_sdma` creates no
+SDMA streams and its kernels read a zero workspace address. The workspace is
+released at Worker finalize by ordinary stream/manager teardown.
+Communication-domain allocation does not create SDMA streams or carry the
+workspace through `CommContext`. Because an SDMA-enabled Worker's 48 STARS
+streams sit in the device fault/sync domain, a fault on that Worker slows its
+teardown; keep SDMA workloads on their own Worker (and, in CI, their own task)
+so ordinary workloads are unaffected — see
+[docs/investigations/2026-07-a2a3-sdma-fault-teardown.md](investigations/2026-07-a2a3-sdma-fault-teardown.md)
+and issue #1425. `enable_sdma` is currently honored only by the a2a3 onboard
+`tensormap_and_ringbuffer` runtime; host-build-graph, simulation, a5, and
+provider-disabled builds fail Worker init fast when it is set. The a5
+communication overlay remains isolated behind its default-off gate; see
+[a5-sdma-overlay.md](a5-sdma-overlay.md).
 
 ---
 
@@ -233,4 +252,5 @@ the child — allocate it with `create_host_buffer` instead.
 - `examples/workers/l3/dual_domain_overlap/` — overlapping domains where one
   worker participates in both.
 - `examples/a2a3/tensormap_and_ringbuffer/sdma_async_completion_demo/` — host
-  staging via `copy_to` + cross-rank `SdmaTget` (needs the SDMA workspace).
+  staging via `copy_to` + cross-rank `SdmaTget`; its producer `CoreCallable`
+  declares the SDMA workspace requirement.

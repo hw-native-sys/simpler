@@ -1023,7 +1023,7 @@ def pytest_sessionfinish(session, exitstatus):  # noqa: ARG001
 
 
 # ---------------------------------------------------------------------------
-# L2 worker-pool self-healing
+# L2 worker-pool generation rotation and self-healing
 #
 # The L2 ``st_worker`` pool hands ONE ``ChipWorker`` to every SceneTestCase on
 # a (runtime, device) for the life of an xdist worker process. That amortizes
@@ -1031,19 +1031,26 @@ def pytest_sessionfinish(session, exitstatus):  # noqa: ARG001
 # op-timeout reaped by STARS, or a kernel-launch failure) poisons the shared
 # ACL/device context: every later test on that worker then fails at
 # ``halResMap`` (rc=62) / ``rtMalloc`` (507899) — one failure cascades into the
-# whole worker's remaining tests. The driver-side guard
+# whole worker's remaining tests. An a2a3 Worker that has attempted an SDMA
+# dispatch has a second, non-error terminal condition for pooling:
+# CANN does not expose a fence proving its remote channels fully retired, so it
+# must be closed/reset before an ordinary or fault-injection class can reuse the
+# physical device. The Worker records actual SDMA dispatch attempts; merely
+# registering an unused SDMA callable does not rotate the pool.
+#
+# The driver-side guard
 # (``DeviceRunner::run`` fail-fast on ``device_unusable_``) keeps that cascade
 # from wedging, but the Worker stays poisoned.
 #
 # On a5 the poison survives close()+device-reset for the life of the process
 # (an in-process Worker.init rebuild fails with rtStreamCreate 507899; a
 # force-reset is unsafe on this shared box), so there is no in-process
-# recovery — only a fresh worker process gets a clean device. The hook below
-# stashes the call-phase exception so the ``st_worker`` finalizer can, after
-# — and ONLY after — a device-runtime error, drop the pooled Worker; the L2
-# branch then rebuilds where the arch allows it and otherwise skips the
-# remaining tests for that runtime (``_l2_poisoned``). Golden mismatches /
-# ordinary assertions leave the Worker reusable.
+# recovery — only a fresh worker process gets a clean device. The native status
+# query tells the ``st_worker`` finalizer when to drop a poisoned or
+# SDMA-exposed pooled Worker; the hook below also stashes setup/call exceptions
+# as a diagnostic fallback. The L2 branch rebuilds where the arch allows it and otherwise
+# skips the remaining tests for that runtime (``_l2_poisoned``). Golden
+# mismatches / ordinary assertions leave a non-SDMA Worker reusable.
 # ---------------------------------------------------------------------------
 
 # Plain attribute name on the test item — NOT pytest.StashKey()/item.stash,
@@ -1058,7 +1065,11 @@ _ST_CALL_EXCINFO = "_st_call_excinfo"
 @pytest.hookimpl(hookwrapper=True)
 def pytest_runtest_makereport(item, call):
     yield
-    if call.when == "call":
+    # A fixture that depends on st_worker may dispatch during setup. Preserve
+    # that error before st_worker's teardown finalizer decides whether its
+    # Worker can return to the session pool. Native lifecycle status below is
+    # authoritative; this text classification remains a diagnostic fallback.
+    if call.when in {"setup", "call"} and call.excinfo is not None:
         setattr(item, _ST_CALL_EXCINFO, call.excinfo)
 
 
@@ -1070,6 +1081,7 @@ def pytest_runtest_makereport(item, call):
 # we extract the trailing <N> and match only the known poison codes:
 #   207001 ACL_ERROR_RT_MEMORY_ALLOCATION  (the CI cascade trigger)
 #   507000 ACL_ERROR_RT_INTERNAL_ERROR  (a5 op-timeout at AICPU stream sync)
+#   507015 ACL_ERROR_RT_AICORE_EXCEPTION
 #   507018 ACL_ERROR_RT_AICPU_EXCEPTION
 #   507046 ACL_ERROR_RT_STREAM_SYNC_TIMEOUT
 #   507899 sticky-error rtMalloc / rtStreamCreate on the poisoned context
@@ -1077,16 +1089,55 @@ def pytest_runtest_makereport(item, call):
 # The names above are CANN's own (acl/error_codes/rt_error_codes.h); what each one
 # means and how to chase it is in docs/troubleshooting/device-error-codes.md, and the
 # host log now prints that meaning next to the code.
-# Worker surfaces these as "run_prepared/prepare_callable/simpler_init failed
-# with code <N>" — never as an AssertionError, so golden mismatches are already
-# excluded.
-_DEVICE_POISON_CODES = frozenset({207001, 507000, 507018, 507046, 507899, -1})
-_DEVICE_ERROR_CODE_RE = re.compile(r"(?:run_prepared|prepare_callable|simpler_init) failed with code (-?\d+)")
+# Worker surfaces these as "run/run_prepared/prepare_callable/simpler_init
+# failed with code <N>" — never as an AssertionError, so golden mismatches are
+# already excluded.
+_DEVICE_POISON_CODES = frozenset({207001, 507000, 507015, 507018, 507046, 507899, -1})
+_DEVICE_ERROR_CODE_RE = re.compile(r"\b(?:run|run_prepared|prepare_callable|simpler_init) failed with code (-?\d+)\b")
+_DEVICE_QUARANTINE_MARKERS = (
+    "device is quarantined after a prior Worker could not confirm reset",
+    "device is already owned by another live ChipWorker in this process",
+    "device reset was not confirmed, so this process quarantined the device",
+    "cleanup could not confirm device reset, so this process quarantined the device",
+)
+
+
+class _L2WorkerPool(dict):
+    """Reusable Workers plus closed-terminal Workers retained for safe cleanup.
+
+    A Worker is removed from the reusable mapping before close, but a close
+    failure can be the retryable active-operation drain path. Keep a strong
+    reference in ``retired`` so GC cannot jump directly to the C++ destructor
+    and bypass Python's drain fence; session teardown retries it once.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.retired: list[object] = []
+
+    def retire(self, key):
+        worker = self.pop(key, None)
+        if worker is None:
+            return
+        try:
+            worker.close()
+        except BaseException:  # noqa: BLE001
+            self.retired.append(worker)
+            raise
+
+
+# A final session-teardown close can still fail (for example an operation that
+# never drained). Retain such terminal objects until interpreter/process exit;
+# recreating or dropping them early would be less safe than an intentional
+# process-lifetime leak.
+_L2_TERMINAL_RETAINED_WORKERS: list[object] = []
 
 
 def _is_device_runtime_error_msg(msg: str) -> bool:
     match = _DEVICE_ERROR_CODE_RE.search(msg)
-    return match is not None and int(match.group(1)) in _DEVICE_POISON_CODES
+    return (match is not None and int(match.group(1)) in _DEVICE_POISON_CODES) or any(
+        marker in msg for marker in _DEVICE_QUARANTINE_MARKERS
+    )
 
 
 def _is_device_runtime_error(excinfo) -> bool:
@@ -1095,37 +1146,37 @@ def _is_device_runtime_error(excinfo) -> bool:
     return _is_device_runtime_error_msg(str(excinfo.value))
 
 
-def _register_l2_pool_heal(request, pool, key):
-    """Drop + close the pooled L2 Worker iff this test raised a device-runtime
-    error, so the next test on this (runtime, device) gets a chance to rebuild a
-    fresh Worker / ACL context instead of inheriting a poisoned one. No-op on
-    pass or on a non-device failure (golden mismatch, assertion).
+def _register_l2_pool_recycle(request, pool, key, poisoned_runtimes):
+    """Drop + close a pooled L2 Worker after a device-runtime error.
+
+    Recycling prevents a poisoned-context cascade. A passing test and a
+    non-device failure (golden mismatch, assertion) keep the Worker pooled.
 
     NOTE: an AICore op-timeout poisons the device context. `DeviceRunner::
     finalize()` force-resets the card (`aclrtResetDeviceForce`, per-card safe
     under the exclusive task-submit lock), so the rebuilt Worker.init normally
-    lands on a clean card and the next test runs. But force-reset only fires
-    when `device_unusable_` was set, and that flag is gated on the bounded drain
-    failing — a "drain succeeded but card still poisoned" false-negative skips
-    force-reset, the rebuild's Worker.init then fails (rtStreamCreate 507899),
+    lands on a clean card and the next test runs. Force-reset fires when
+    `device_unusable_` was set by the runner's launch/sync error paths. If the
+    rebuild still fails (for example rtStreamCreate returns 507899),
     and the st_worker L2 branch falls back to skipping the rest of the runtime
     (see _l2_poisoned). The dispatcher re-runs those poison-skipped classes in a
     fresh subprocess (= clean card) so they keep coverage — see
     _register_l2_poison_skip / issue #1110. Either way one device error stops
     cascading into a worker-wide storm of confusing 507899 failures."""
 
-    def _heal():
-        if not _is_device_runtime_error(getattr(request.node, _ST_CALL_EXCINFO, None)):
+    def _recycle():
+        worker = pool.get(key)
+        if worker is None:
             return
-        w = pool.pop(key, None)
-        if w is None:
+        device_error = _is_device_runtime_error(getattr(request.node, _ST_CALL_EXCINFO, None))
+        if not device_error:
             return
         try:
-            w.close()
+            pool.retire(key)
         except Exception:  # noqa: BLE001
-            pass
+            poisoned_runtimes.add(key[0])
 
-    request.addfinalizer(_heal)
+    request.addfinalizer(_recycle)
 
 
 # ---------------------------------------------------------------------------
@@ -1162,15 +1213,17 @@ def _l2_worker_pool(request, st_platform):
     ``ChipWorker`` — amortizing the init cost (three dlopens + device
     acquire) over every class on that device.
     """
-    pool: dict[tuple[str, int], object] = {}
+    pool = _L2WorkerPool()
     yield pool
     # Session teardown: close every Worker we minted.
-    for w in pool.values():
+    workers = list(pool.values()) + pool.retired
+    pool.clear()
+    pool.retired.clear()
+    for w in workers:
         try:
             w.close()
         except Exception:  # noqa: BLE001
-            pass
-    pool.clear()
+            _L2_TERMINAL_RETAINED_WORKERS.append(w)
 
 
 _L2_POISON_SINK_ENV = "SIMPLER_L2_POISON_SINK"
@@ -1274,7 +1327,7 @@ def _l2_poisoned():
 
 
 @pytest.fixture()
-def st_worker(request, st_platform, device_pool, _l2_worker_pool, _l2_poisoned):
+def st_worker(request, st_platform, device_pool, _l2_worker_pool, _l2_poisoned):  # noqa: PLR0912
     """Per-test Worker.
 
     L2: session-scoped, reused across classes with the same (runtime, device).
@@ -1311,7 +1364,7 @@ def st_worker(request, st_platform, device_pool, _l2_worker_pool, _l2_poisoned):
         # same xdist worker.
         for (rt, dev_id), existing in _l2_worker_pool.items():
             if rt == runtime:
-                _register_l2_pool_heal(request, _l2_worker_pool, (rt, dev_id))
+                _register_l2_pool_recycle(request, _l2_worker_pool, (rt, dev_id), _l2_poisoned)
                 yield existing
                 return
 
@@ -1321,6 +1374,18 @@ def st_worker(request, st_platform, device_pool, _l2_worker_pool, _l2_poisoned):
         dev_id = ids[0]
         device_pool.release(ids)
         key = (runtime, dev_id)
+
+        # At most one runtime-specific Worker may own a device: finalization
+        # resets resources that would invalidate every other Worker on it.
+        for stale_key in list(_l2_worker_pool):
+            if stale_key[1] != dev_id:
+                continue
+            try:
+                _l2_worker_pool.retire(stale_key)
+            except Exception:
+                _l2_poisoned.add(stale_key[0])
+                raise
+
         from simpler.worker import Worker  # noqa: PLC0415
 
         w = Worker(level=2, device_id=dev_id, platform=st_platform, runtime=runtime)
@@ -1347,7 +1412,7 @@ def st_worker(request, st_platform, device_pool, _l2_worker_pool, _l2_poisoned):
                 )
             raise
         _l2_worker_pool[key] = w
-        _register_l2_pool_heal(request, _l2_worker_pool, key)
+        _register_l2_pool_recycle(request, _l2_worker_pool, key, _l2_poisoned)
         yield w
         # No close here on success — the pool handles teardown at session end.
         # On a device-runtime failure, the finalizer registered above closes
@@ -1402,12 +1467,21 @@ def st_worker(request, st_platform, device_pool, _l2_worker_pool, _l2_poisoned):
 
 
 @pytest.fixture()
-def st_device_ids(request, device_pool):
+def st_device_ids(request, device_pool, _l2_worker_pool):
     """Allocate device IDs. Use @pytest.mark.device_count(n) to request multiple."""
     marker = request.node.get_closest_marker("device_count")
     n = marker.args[0] if marker else 1
     ids = device_pool.allocate(n)
     if not ids:
         pytest.fail(f"need {n} devices")
-    yield ids
-    device_pool.release(ids)
+    # Standalone/manual Worker tests can be selected into the same direct
+    # pytest process as SceneTestCase classes. A pooled ChipWorker owns the
+    # physical device, so retire it before handing that id to an independent
+    # fixture (normal CI dispatch already separates these phases/processes).
+    try:
+        for key in list(_l2_worker_pool):
+            if key[1] in ids:
+                _l2_worker_pool.retire(key)
+        yield ids
+    finally:
+        device_pool.release(ids)

@@ -20,6 +20,8 @@
 #include "acl/acl.h"
 #include "host/acl_error_log.h"
 #include "host_log.h"
+#include "platform_comm/comm.h"
+#include "pto_runtime_c_api.h"
 
 #include <dlfcn.h>
 

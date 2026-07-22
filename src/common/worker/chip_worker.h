@@ -45,9 +45,17 @@ public:
     /// runtime-arena for its ring sizing right after the device comes up (the
     /// sizing is fork-constant, delivered by COW into init). A no-op for
     /// runtimes without a prebuilt arena.
+    /// `dma_workspace_mask` (a bitmask of DmaWorkspaceKind bits, 0 = none)
+    /// provisions those async-DMA workspaces once at init, so kernels can use
+    /// get_dma_workspace. Empty by default; a Worker that does not opt in creates
+    /// no SDMA streams. Provisioning fails fast (init throws) on a
+    /// platform/runtime that does not support a requested engine. The mask stays
+    /// a raw integer here so this platform-agnostic worker needs no platform
+    /// headers; the binding derives it from the DmaWorkspaceKind enum.
     void init(
         const std::string &host_lib_path, const std::string &aicpu_path, const std::string &aicore_path,
-        const std::string &dispatcher_path, int device_id, const CallConfig *prewarm_config = nullptr
+        const std::string &dispatcher_path, int device_id, const CallConfig *prewarm_config = nullptr,
+        uint32_t dma_workspace_mask = 0
     );
 
     /// Tear down everything: device resources and runtime library.
@@ -151,6 +159,7 @@ private:
     using SimplerRunFn = int (*)(void *, void *, int32_t, const void *, const CallConfig *);
     using SimplerUnregisterCallableFn = int (*)(void *, int32_t);
     using GetAicpuDlopenCountFn = size_t (*)(void *);
+    using SimplerProvisionDmaWorkspaceFn = int (*)(void *, uint32_t);
     using FinalizeDeviceFn = int (*)(void *);
     using EnsureAclReadyFn = int (*)(void *, int);
     using CreateCommStreamFn = void *(*)(void *);
@@ -197,6 +206,7 @@ private:
     SimplerUnregisterCallableFn unregister_callable_fn_ = nullptr;
     GetAicpuDlopenCountFn get_aicpu_dlopen_count_fn_ = nullptr;
     GetAicpuDlopenCountFn get_host_dlopen_count_fn_ = nullptr;
+    SimplerProvisionDmaWorkspaceFn simpler_provision_dma_workspace_fn_ = nullptr;
     FinalizeDeviceFn finalize_device_fn_ = nullptr;
     EnsureAclReadyFn ensure_acl_ready_fn_ = nullptr;
     CreateCommStreamFn create_comm_stream_fn_ = nullptr;

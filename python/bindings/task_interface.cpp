@@ -52,6 +52,7 @@
 #include "callable_protocol.h"
 #include "chip_worker.h"
 #include "data_type.h"
+#include "dma_workspace.h"
 #include "l3_l2_orch_comm.h"
 #include "l3_l2_orch_region_access.h"
 #include "worker_bind.h"
@@ -1353,14 +1354,18 @@ NB_MODULE(_task_interface, m) {
             "init",
             [](ChipWorker &self, const std::string &host_lib_path, const std::string &aicpu_path,
                const std::string &aicore_path, const std::string &dispatcher_path, int device_id,
-               std::optional<CallConfig> prewarm_config) {
+               std::optional<CallConfig> prewarm_config, bool enable_sdma) {
+                // Translate the Python bool into a DmaWorkspaceKind bitmask so the
+                // platform-agnostic ChipWorker stays free of the enum. Empty mask
+                // when disabled leaves the Worker with no async-DMA provisioning.
+                uint32_t dma_workspace_mask = enable_sdma ? (uint32_t{1} << DMA_WORKSPACE_SDMA) : 0;
                 self.init(
                     host_lib_path, aicpu_path, aicore_path, dispatcher_path, device_id,
-                    prewarm_config.has_value() ? &(*prewarm_config) : nullptr
+                    prewarm_config.has_value() ? &(*prewarm_config) : nullptr, dma_workspace_mask
                 );
             },
             nb::arg("host_lib_path"), nb::arg("aicpu_path"), nb::arg("aicore_path"), nb::arg("dispatcher_path"),
-            nb::arg("device_id"), nb::arg("prewarm_config") = nb::none(),
+            nb::arg("device_id"), nb::arg("prewarm_config") = nb::none(), nb::arg("enable_sdma") = false,
             // Release the GIL for the (potentially long) native device attach so
             // another Python thread can run during it — e.g. a concurrent close()
             // observing INITIALIZING and failing fast (a GIL held for the whole
@@ -1370,7 +1375,9 @@ NB_MODULE(_task_interface, m) {
             nb::call_guard<nb::gil_scoped_release>(),
             "Bind the runtime library and attach to device_id. When prewarm_config is "
             "given, its ring sizing is built + cached inside init (fork-constant, no "
-            "cross-process control command). A no-op for runtimes without a prebuilt arena."
+            "cross-process control command). A no-op for runtimes without a prebuilt arena. "
+            "When enable_sdma is True, provisions the async-DMA (SDMA) workspace at init so "
+            "kernels can use get_dma_workspace; init raises if the platform lacks SDMA."
         )
         .def("finalize", &ChipWorker::finalize)
         .def(

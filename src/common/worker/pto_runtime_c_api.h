@@ -25,7 +25,8 @@
  *   - device-mem:   device_malloc_ctx, device_free_ctx,
  *                   copy_to_device_ctx, copy_from_device_ctx
  *   - prepared run: simpler_register_callable, simpler_run, unregister_callable,
- *                   get_aicpu_dlopen_count, get_host_dlopen_count
+ *                   get_aicpu_dlopen_count, get_host_dlopen_count,
+ *                   simpler_provision_dma_workspace
  *   - ACL/stream:   ensure_acl_ready_ctx, create_comm_stream_ctx,
  *                   destroy_comm_stream_ctx
  *   - comm:         comm_init, comm_alloc_windows, comm_get_local_window_base,
@@ -239,6 +240,16 @@ size_t get_aicpu_dlopen_count(DeviceContextHandle ctx);
  * the device.
  */
 size_t get_host_dlopen_count(DeviceContextHandle ctx);
+
+/**
+ * Provision the async-DMA workspaces named in `required_mask` (a bitmask of
+ * DmaWorkspaceKind bits) once at Worker init, latching their device addresses
+ * into the resident KernelArgs so every subsequent run carries them. Called only
+ * for a Worker created with SDMA enabled. Bits unsupported by this
+ * platform/runtime are rejected, so a Worker opting into SDMA on sim / a5 / hbg
+ * fails fast. Returns 0 on success, negative on unsupported/failed provisioning.
+ */
+int simpler_provision_dma_workspace(DeviceContextHandle ctx, uint32_t required_mask);
 
 #ifdef __cplusplus
 }

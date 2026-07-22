@@ -44,6 +44,7 @@
 #include "host_log.h"
 #include "host/raii_scope_guard.h"
 #include "runtime.h"
+#include "platform_comm/comm.h"
 
 // Forward-declared (rather than `#include "dlog_pub.h"`) so this TU does not
 // require CANN's toolchain include path on the host build. Resolved at link
@@ -554,6 +555,14 @@ int simpler_run(
         LOG_ERROR("simpler_run: callable_id=%d not registered", callable_id);
         return -1;
     }
+    if (!runner->can_accept_run()) {
+        LOG_ERROR(
+            "simpler_run: runner is unusable after a prior device failure; refusing callable_id=%d before resource "
+            "provisioning",
+            callable_id
+        );
+        return -1;
+    }
 
     pthread_once(&g_runner_key_once, create_runner_key);
     pthread_setspecific(g_runner_key, ctx);
@@ -648,6 +657,15 @@ size_t get_host_dlopen_count(DeviceContextHandle ctx) {
         return static_cast<DeviceRunnerBase *>(ctx)->host_dlopen_count();
     } catch (...) {
         return 0;
+    }
+}
+
+int simpler_provision_dma_workspace(DeviceContextHandle ctx, uint32_t required_mask) {
+    if (ctx == NULL) return -1;
+    try {
+        return static_cast<DeviceRunnerBase *>(ctx)->provision_dma_workspace(required_mask);
+    } catch (...) {
+        return -1;
     }
 }
 

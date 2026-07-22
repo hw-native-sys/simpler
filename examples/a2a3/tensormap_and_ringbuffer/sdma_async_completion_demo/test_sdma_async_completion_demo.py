@@ -131,6 +131,7 @@ def run(
         runtime="tensormap_and_ringbuffer",
         device_ids=device_ids,
         num_sub_workers=0,
+        enable_sdma=True,
     )
     chip_handle = worker.register(chip_callable)
     try:

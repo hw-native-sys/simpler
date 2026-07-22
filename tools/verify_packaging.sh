@@ -63,9 +63,9 @@ print('simpler_setup:', simpler_setup.__file__)
 # A wheel that misses these data files would fall through to a cryptic kernel
 # compilation error; this catches it at smoke time.
 inc_dirs = KernelCompiler('a2a3sim').get_incore_include_dirs()
-for d in inc_dirs:
-    h = os.path.join(d, 'pipe_sync.h')
-    assert os.path.isfile(h), 'incore helper not shipped: ' + h
+for rel in ('pipe_sync.h', os.path.join('common', 'dma_workspace.h')):
+    assert any(os.path.isfile(os.path.join(d, rel)) for d in inc_dirs), \
+        'incore helper not shipped: ' + rel + '; include dirs: ' + repr(inc_dirs)
 print('incore helpers OK:', inc_dirs)
 "
     echo "::endgroup::"

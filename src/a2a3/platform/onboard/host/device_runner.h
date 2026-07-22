@@ -113,6 +113,7 @@ public:
      * and read off DeviceRunner state / HostLogger here — no per-run args.
      */
     int run(Runtime &runtime, const CallConfig &config) override;
+    bool can_accept_run() const override { return !device_unusable_; }
 
     // Map/unmap a device buffer into host address space via
     // halHostRegister(DEV_SVM_MAP_HOST) / halHostUnregister. The returned host

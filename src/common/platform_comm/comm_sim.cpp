@@ -219,6 +219,19 @@ extern "C" CommHandle comm_init(int rank, int nranks, void *stream, const char *
     return nullptr;
 }
 
+extern "C" uint32_t dma_workspace_supported_mask(void) { return 0; }
+
+extern "C" int dma_workspace_provision(uint32_t required_mask, uint64_t *addr_out, int count, void **handle_out) {
+    // No async-DMA hardware under simulation; 0 makes every engine a no-op.
+    if (!addr_out || !handle_out || count < 0) return -1;
+    *handle_out = nullptr;
+    for (int i = 0; i < count; ++i)
+        addr_out[i] = 0;
+    return required_mask == 0 ? 0 : -1;
+}
+
+extern "C" void dma_workspace_release(void *handle) { (void)handle; }
+
 extern "C" int comm_alloc_windows(CommHandle h, size_t win_size, uint64_t *device_ctx_out) try {
     if (h == nullptr || device_ctx_out == nullptr) return -1;
 

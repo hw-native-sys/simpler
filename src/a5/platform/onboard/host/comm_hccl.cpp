@@ -765,6 +765,23 @@ static void ensure_sdma_workspace(CommHandle h) {
 #endif
 }
 
+// Callable-declared workspace injection is not available on a5 yet. Its URMA
+// workspace is sized per communication domain (rank count), not per device;
+// reject required masks before a callable runs instead of silently launching
+// it with a null workspace. The separate, default-off communication overlay
+// above remains gated by SIMPLER_ENABLE_PTO_SDMA_WORKSPACE (#1315).
+extern "C" uint32_t dma_workspace_supported_mask(void) { return 0; }
+
+extern "C" int dma_workspace_provision(uint32_t required_mask, uint64_t *addr_out, int count, void **handle_out) {
+    if (!addr_out || !handle_out || count < 0) return -1;
+    *handle_out = nullptr;
+    for (int i = 0; i < count; ++i)
+        addr_out[i] = 0;
+    return required_mask == 0 ? 0 : -1;
+}
+
+extern "C" void dma_workspace_release(void *handle) { (void)handle; }
+
 #ifdef SIMPLER_ENABLE_PTO_URMA_WORKSPACE
 static uint64_t urma_workspace_bytes(uint32_t rank_count) {
     using namespace pto::comm::urma;

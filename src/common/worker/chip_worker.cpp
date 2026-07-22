@@ -60,7 +60,7 @@ ChipWorker::~ChipWorker() { finalize(); }
 
 void ChipWorker::init(
     const std::string &host_lib_path, const std::string &aicpu_path, const std::string &aicore_path,
-    const std::string &dispatcher_path, int device_id, const CallConfig *prewarm_config
+    const std::string &dispatcher_path, int device_id, const CallConfig *prewarm_config, uint32_t dma_workspace_mask
 ) {
     if (finalized_) {
         throw std::runtime_error("ChipWorker already finalized; cannot reinitialize");
@@ -108,6 +108,8 @@ void ChipWorker::init(
         unregister_callable_fn_ = load_symbol<SimplerUnregisterCallableFn>(handle, "simpler_unregister_callable");
         get_aicpu_dlopen_count_fn_ = load_symbol<GetAicpuDlopenCountFn>(handle, "get_aicpu_dlopen_count");
         get_host_dlopen_count_fn_ = load_symbol<GetAicpuDlopenCountFn>(handle, "get_host_dlopen_count");
+        simpler_provision_dma_workspace_fn_ =
+            load_symbol<SimplerProvisionDmaWorkspaceFn>(handle, "simpler_provision_dma_workspace");
         finalize_device_fn_ = load_symbol<FinalizeDeviceFn>(handle, "finalize_device");
         // ACL lifecycle + comm_* are part of the uniform host_runtime.so ABI.
         // Every platform runtime exports all of them — runtimes that do not
@@ -192,6 +194,7 @@ void ChipWorker::init(
         unregister_callable_fn_ = nullptr;
         get_aicpu_dlopen_count_fn_ = nullptr;
         get_host_dlopen_count_fn_ = nullptr;
+        simpler_provision_dma_workspace_fn_ = nullptr;
         finalize_device_fn_ = nullptr;
         ensure_acl_ready_fn_ = nullptr;
         create_comm_stream_fn_ = nullptr;
@@ -230,6 +233,7 @@ void ChipWorker::init(
         unregister_callable_fn_ = nullptr;
         get_aicpu_dlopen_count_fn_ = nullptr;
         get_host_dlopen_count_fn_ = nullptr;
+        simpler_provision_dma_workspace_fn_ = nullptr;
         finalize_device_fn_ = nullptr;
         ensure_acl_ready_fn_ = nullptr;
         create_comm_stream_fn_ = nullptr;
@@ -249,6 +253,21 @@ void ChipWorker::init(
 
     device_id_ = device_id;
     initialized_ = true;
+
+    // Provision async-DMA workspaces (SDMA) once, now that the device is up. The
+    // addresses are latched into the resident KernelArgs so every run carries
+    // them. On failure, roll the whole Worker back through finalize() so no
+    // half-provisioned state leaks, then surface the error.
+    if (dma_workspace_mask != 0) {
+        int prov_rc = simpler_provision_dma_workspace_fn_(device_ctx_, dma_workspace_mask);
+        if (prov_rc != 0) {
+            finalize();
+            throw std::runtime_error(
+                "async-DMA workspace provisioning (mask=" + std::to_string(dma_workspace_mask) + ") failed with code " +
+                std::to_string(prov_rc)
+            );
+        }
+    }
 }
 
 void ChipWorker::finalize() {
@@ -279,6 +298,7 @@ void ChipWorker::finalize() {
     unregister_callable_fn_ = nullptr;
     get_aicpu_dlopen_count_fn_ = nullptr;
     get_host_dlopen_count_fn_ = nullptr;
+    simpler_provision_dma_workspace_fn_ = nullptr;
     finalize_device_fn_ = nullptr;
     ensure_acl_ready_fn_ = nullptr;
     create_comm_stream_fn_ = nullptr;
