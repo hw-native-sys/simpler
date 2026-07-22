@@ -953,7 +953,7 @@ extern "C" int validate_runtime_impl(Runtime *runtime, const HostApi *api, int e
     }
 
     if (skip_tensor_copy_back) {
-        LOG_WARN("Skipping tensor copy-back because execution failed (rc=%d)", execution_rc);
+        LOG_WARN("Skipping tensor copy-back because execution failed");
     } else {
         for (int i = 0; i < tensor_lease_count; i++) {
             const TensorLease &lease = tensor_leases[i];

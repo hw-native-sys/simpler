@@ -489,7 +489,7 @@ int validate_runtime_impl(Runtime *runtime, const HostApi *api, int execution_rc
     int tensor_pair_count = static_cast<int>(runtime->tensor_pairs_.size());
 
     if (execution_rc != 0) {
-        LOG_WARN("Skipping tensor copy-back because execution failed (rc=%d)", execution_rc);
+        LOG_WARN("Skipping tensor copy-back because execution failed");
     } else {
         for (int i = 0; i < tensor_pair_count; i++) {
             const TensorPair &pair = tensor_pairs[i];
