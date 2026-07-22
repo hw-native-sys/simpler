@@ -212,7 +212,7 @@ SchedulerContext::PublishHandle SchedulerContext::prepare_subtask_to_core(
 #endif
 
     return PublishHandle{
-        core_exec_state.reg_addr, reg_task_id, core_offset, dispatch_timestamp_slot, slot_state.task->task_timing_slot
+        core_exec_state.reg_addr, reg_task_id, core_offset, dispatch_timestamp_slot, slot_state.task_attrs.timing_slot()
     };
 }
 
@@ -329,7 +329,7 @@ void SchedulerContext::dispatch_shape(
         // one register write.
         bool any_sync_start = false;
         for (int bi = 0; bi < got; bi++) {
-            if (batch[bi]->active_mask.requires_sync_start()) {
+            if (batch[bi]->task_attrs.requires_sync_start()) {
                 any_sync_start = true;
                 break;
             }
@@ -387,7 +387,7 @@ void SchedulerContext::dispatch_shape(
                 }
             }
 
-            if (slot_state->active_mask.requires_sync_start()) {
+            if (slot_state->task_attrs.requires_sync_start()) {
                 if (is_pending) {
                     sched_->ready_queues[static_cast<int32_t>(shape)].push(slot_state);
                     continue;
@@ -598,8 +598,8 @@ int32_t SchedulerContext::try_early_dispatch(
     // Tier 0: sync_start early cohorts (shape-agnostic, all-or-nothing drain).
     uint64_t sync_task_id_snapshot = 0;
     if (PTO2TaskSlotState *c = sched_->early_sync_start_queue.pop_tagged(&sync_task_id_snapshot)) {
-        bool current_sync_task = static_cast<uint64_t>(c->task->task_id.raw) == sync_task_id_snapshot &&
-                                 c->active_mask.requires_sync_start();
+        bool current_sync_task =
+            static_cast<uint64_t>(c->task->task_id.raw) == sync_task_id_snapshot && c->task_attrs.requires_sync_start();
         if (current_sync_task && PTO2SchedulerState::try_claim_early_sync_drain(*c->payload)) {
             if (c->payload->early_dispatch_state.load(std::memory_order_seq_cst) != PTO2_EARLY_DISPATCH_STAGING) {
                 sched_->cancel_early_sync_drain(*c);

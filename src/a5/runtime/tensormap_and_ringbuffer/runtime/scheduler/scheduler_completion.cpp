@@ -299,7 +299,7 @@ void SchedulerContext::check_running_cores_for_completion(
             (core.pending_slot_state != nullptr && core.pending_slot_state->payload != nullptr &&
              (pending_ss == PTO2_EARLY_DISPATCH_STAGING ||
               (pending_ss == PTO2_EARLY_DISPATCH_DISPATCHED &&
-               core.pending_slot_state->active_mask.requires_sync_start())));
+               core.pending_slot_state->task_attrs.requires_sync_start())));
         SlotTransition t = decide_slot_transition(
             reg_task_id, reg_state, core.running_reg_task_id, core.pending_reg_task_id, pending_gated
         );
@@ -331,8 +331,8 @@ void SchedulerContext::check_running_cores_for_completion(
             // fanin / deferred-completion (which may also clear pending_slot_state),
             // matching L2's finish_time point. Independent of L2 swimlane level, so
             // it works in SIMPLER_DFX=0 builds; untagged tasks pay only the compare.
-            if (core.pending_slot_state->task->task_timing_slot != TASK_TIMING_SLOT_NONE) {
-                aicpu_task_timing_finish(core.pending_slot_state->task->task_timing_slot, thread_idx);
+            if (core.pending_slot_state->task_attrs.is_timed()) {
+                aicpu_task_timing_finish(core.pending_slot_state->task_attrs.timing_slot(), thread_idx);
             }
             complete_slot_task(
                 *core.pending_slot_state, core.pending_reg_task_id, core.pending_subslot, thread_idx, core_id, hank,
@@ -345,8 +345,8 @@ void SchedulerContext::check_running_cores_for_completion(
             cur_thread_completed++;
         }
         if (t.running_done) {
-            if (core.running_slot_state->task->task_timing_slot != TASK_TIMING_SLOT_NONE) {
-                aicpu_task_timing_finish(core.running_slot_state->task->task_timing_slot, thread_idx);
+            if (core.running_slot_state->task_attrs.is_timed()) {
+                aicpu_task_timing_finish(core.running_slot_state->task_attrs.timing_slot(), thread_idx);
             }
             complete_slot_task(
                 *core.running_slot_state, core.running_reg_task_id, core.running_subslot, thread_idx, core_id, hank,
@@ -363,7 +363,7 @@ void SchedulerContext::check_running_cores_for_completion(
         if (t.running_freed) {
             if (core.pending_slot_state != nullptr && !t.pending_done) {
                 PTO2TaskSlotState *promoted = core.pending_slot_state;
-                bool sync_start_promote = pending_gated && promoted->active_mask.requires_sync_start();
+                bool sync_start_promote = pending_gated && promoted->task_attrs.requires_sync_start();
                 promote_pending_to_running(core);
                 if (sync_start_promote) {
                     promoted->payload->running_slot_count.fetch_add(1, std::memory_order_seq_cst);
