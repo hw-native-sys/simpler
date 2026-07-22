@@ -9,56 +9,19 @@
  * -----------------------------------------------------------------------------------------------------------
  */
 
-/**
- * PTO Runtime2 - Main Implementation
- *
- * Implements the unified runtime API that combines orchestrator and scheduler.
- *
- * Based on: docs/RUNTIME_LOGIC.md
- */
-
 #include "pto_runtime2.h"
-
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-
 #include <algorithm>
-
 #include "aicpu/device_time.h"
 #include "common/platform_config.h"  // PLATFORM_PROF_SYS_CNT_FREQ (data-wait deadline)
 #include "common/unified_log.h"
-#if SIMPLER_DFX
 #include "aicpu/scope_stats_collector_aicpu.h"
-#endif
 
-// Weak fallback for HOST .so builds (never called, but satisfies linker).
-// The AICPU build links the strong symbol from platform/.../device_time.cpp.
-// Hidden visibility prevents HOST .so from polluting global symbol table.
-__attribute__((weak, visibility("hidden"))) uint64_t get_sys_cnt_aicpu() { return 0; }
-
-// Derived here, not in pto_runtime2_types.h: that header is included by orchestrations
-// that define PLATFORM_PROF_SYS_CNT_FREQ locally, so pulling the platform header into
-// it caused a redefinition conflict (#1189). Scaling MS by the counter frequency (like
-// SCHEDULER_TIMEOUT_CYCLES) keeps the data-wait wall-clock identical across arches.
-static constexpr uint64_t PTO2_TENSOR_DATA_TIMEOUT_CYCLES =
-    (PTO2_TENSOR_DATA_TIMEOUT_MS * PLATFORM_PROF_SYS_CNT_FREQ) / 1000;
-
-// =============================================================================
-// Orchestration Ops Table (function-pointer dispatch for orchestration .so)
-// =============================================================================
-
-static TaskOutputTensors submit_task_impl(PTO2Runtime *rt, const MixedKernels &mixed_kernels, const L0TaskArgs &args) {
-    return rt->orchestrator.submit_task(mixed_kernels, args);
-}
-
-static TaskOutputTensors alloc_tensors_impl(PTO2Runtime *rt, const L0TaskArgs &args) {
-    return rt->orchestrator.alloc_tensors(args);
-}
-
-static TaskOutputTensors submit_dummy_task_impl(PTO2Runtime *rt, const L0TaskArgs &args) {
-    return rt->orchestrator.submit_dummy_task(args);
+void runtime_set_mode(PTO2Runtime *rt, PTO2RuntimeMode mode) {
+    if (rt) rt->mode = mode;
 }
 
 void rt_scope_begin(PTO2Runtime *rt) {
@@ -66,12 +29,6 @@ void rt_scope_begin(PTO2Runtime *rt) {
     rt->pending_scope_mode = PTO2ScopeMode::AUTO;
     rt->orchestrator.begin_scope(mode);
 }
-
-void rt_scope_end(PTO2Runtime *rt) { rt->orchestrator.end_scope(); }
-
-void rt_orchestration_done(PTO2Runtime *rt) { rt->orchestrator.mark_done(); }
-
-static bool is_fatal_impl(PTO2Runtime *rt) { return rt->orchestrator.fatal; }
 
 void rt_report_fatal(PTO2Runtime *rt, int32_t error_code, const char *func, const char *fmt, ...) {
     va_list args;
@@ -86,52 +43,35 @@ void rt_report_fatal(PTO2Runtime *rt, int32_t error_code, const char *func, cons
     va_end(args);
 }
 
-// Wait for all producers of this tensor to be safe for data access.
-// Checks owner metadata (lifecycle anchor) and OverlapMap (modifier writers).
-// For reads: wait until each producer COMPLETED (done writing).
-// For writes: also wait until all consumers done reading
-//   (consumer low bits of fanout_refcount >= consumer count, excluding the
-//    bit31 scope reference).
-// Uses cycle-based timeout (checked every 1024 spins).
-// Returns false on timeout (sets orch.fatal).
 MAYBE_UNINITIALIZED_BEGIN
-static bool wait_for_tensor_ready(PTO2Runtime *rt, const Tensor &tensor, bool wait_for_consumers, const char *caller) {
+inline bool wait_for_tensor_ready(PTO2Runtime *rt, const Tensor &tensor, bool wait_for_consumers, const char *caller) {
     PTO2TaskId owner = tensor.owner_task_id;
     PTO2OrchestratorState &orch = rt->orchestrator;
 
-    // Segmented wait: collect up to kSegmentCap producer slots, then flush by
-    // spinning on each. When the segment fills, we wait for the accumulated
-    // batch before continuing to gather more. Dedup is per-segment only; a
-    // producer that appears in two segments is waited on twice, which is
-    // idempotent (task_state is monotonic) and only adds one atomic load on
-    // the second encounter.
     constexpr int kSegmentCap = 64;
     const PTO2TaskSlotState *seg[kSegmentCap];
     int seg_count = 0;
+    bool signaled = false;
     bool failed = false;
 
     auto wait_one_producer = [&](const PTO2TaskSlotState &slot) {
         uint8_t ring_id = slot.ring_id;
         int32_t local_id = static_cast<int32_t>(slot.task->task_id.local());
+        auto &ring_hdr = orch.sm_header->rings[ring_id];
+        const int32_t mask = ring_hdr.task_window_mask;
         uint64_t t0 = get_sys_cnt_aicpu();
         int32_t spin_count = 0;
-        while (slot.task_state.load(std::memory_order_acquire) < PTO2_TASK_COMPLETED) {
+        // (m) Use completion_flags as the single completion signal.
+        while (ring_hdr.completion_flags[local_id & mask].load(std::memory_order_acquire) == 0) {
             SPIN_WAIT_HINT();
-            if ((++spin_count & 1023) == 0) {
-                // A fatal latched elsewhere breaks this wait; cold path only.
-                if (orch.sm_header->orch_error_code.load(std::memory_order_acquire) != PTO2_ERROR_NONE) {
-                    failed = true;
-                    return;
-                }
-                if (get_sys_cnt_aicpu() - t0 > PTO2_TENSOR_DATA_TIMEOUT_CYCLES) {
-                    orch.report_fatal(
-                        PTO2_ERROR_TENSOR_WAIT_TIMEOUT, caller,
-                        "Timeout (%llu cycles): producer (ring=%d, local=%d) not completed",
-                        (unsigned long long)PTO2_TENSOR_DATA_TIMEOUT_CYCLES, ring_id, local_id
-                    );
-                    failed = true;
-                    return;
-                }
+            if ((++spin_count & 1023) == 0 && get_sys_cnt_aicpu() - t0 > PTO2_TENSOR_DATA_TIMEOUT_CYCLES) {
+                orch.report_fatal(
+                    PTO2_ERROR_TENSOR_WAIT_TIMEOUT, caller,
+                    "Timeout (%llu cycles): producer (ring=%d, local=%d) not completed",
+                    (unsigned long long)PTO2_TENSOR_DATA_TIMEOUT_CYCLES, ring_id, local_id
+                );
+                failed = true;
+                return;
             }
         }
     };
@@ -139,26 +79,23 @@ static bool wait_for_tensor_ready(PTO2Runtime *rt, const Tensor &tensor, bool wa
     auto wait_one_consumers = [&](const PTO2TaskSlotState &slot) {
         uint8_t ring_id = slot.ring_id;
         int32_t local_id = slot.task->task_id.local();
+        // With watermark-based reclamation, "all consumers done" means the
+        // per-ring completed_watermark has reached this slot's recorded
+        // last_consumer_local_id.
+        PTO2SharedMemoryRingHeader &ring_hdr = rt->orchestrator.sm_header->rings[ring_id];
+        int32_t target = slot.last_consumer_local_id;
         uint64_t t0 = get_sys_cnt_aicpu();
         int32_t spin_count = 0;
-        while ((slot.fanout_refcount.load(std::memory_order_acquire) & ~PTO2_FANOUT_SCOPE_BIT) <
-               (slot.fanout_count & ~PTO2_FANOUT_SCOPE_BIT)) {
+        while (ring_hdr.completed_watermark.load(std::memory_order_acquire) < target) {
             SPIN_WAIT_HINT();
-            if ((++spin_count & 1023) == 0) {
-                // A fatal latched elsewhere breaks this wait; cold path only.
-                if (orch.sm_header->orch_error_code.load(std::memory_order_acquire) != PTO2_ERROR_NONE) {
-                    failed = true;
-                    return;
-                }
-                if (get_sys_cnt_aicpu() - t0 > PTO2_TENSOR_DATA_TIMEOUT_CYCLES) {
-                    orch.report_fatal(
-                        PTO2_ERROR_TENSOR_WAIT_TIMEOUT, caller,
-                        "Timeout (%llu cycles): consumers of producer (ring=%d, local=%d) not done",
-                        (unsigned long long)PTO2_TENSOR_DATA_TIMEOUT_CYCLES, ring_id, local_id
-                    );
-                    failed = true;
-                    return;
-                }
+            if ((++spin_count & 1023) == 0 && get_sys_cnt_aicpu() - t0 > PTO2_TENSOR_DATA_TIMEOUT_CYCLES) {
+                orch.report_fatal(
+                    PTO2_ERROR_TENSOR_WAIT_TIMEOUT, caller,
+                    "Timeout (%llu cycles): consumers of producer (ring=%d, local=%d) not done",
+                    (unsigned long long)PTO2_TENSOR_DATA_TIMEOUT_CYCLES, ring_id, local_id
+                );
+                failed = true;
+                return;
             }
         }
     };
@@ -175,25 +112,26 @@ static bool wait_for_tensor_ready(PTO2Runtime *rt, const Tensor &tensor, bool wa
     };
 
     auto try_push = [&](const PTO2TaskSlotState &s) {
-        for (int j = 0; j < seg_count; j++) {
-            if (seg[j] == &s) return;  // per-segment dedup
-        }
+        for (int j = 0; j < seg_count; j++)
+            if (seg[j] == &s) return;
         if (seg_count == kSegmentCap) {
             flush_segment();
             if (failed) return;
         }
         seg[seg_count++] = &s;
+        if (!signaled) {
+            orch.scheduler->wiring.orch_needs_drain.store(true, std::memory_order_release);
+            signaled = true;
+        }
     };
 
     auto do_wait = [&]() {
-        // Step A: creator retention — read owner directly from tensor metadata
         if (owner.is_valid()) {
             auto &s = orch.sm_header->rings[owner.ring()].get_slot_state_by_task_id(owner.local());
             try_push(s);
             if (failed) return;
         }
 
-        // Step B: modifier writer lookup (OverlapMap), direct callback
         orch.tensor_map.lookup(tensor, [&](PTO2TensorMapEntry &entry, OverlapStatus) -> bool {
             PTO2TaskId pid = entry.producer_task_id;
             auto &s = orch.sm_header->rings[pid.ring()].get_slot_state_by_task_id(pid.local());
@@ -205,22 +143,16 @@ static bool wait_for_tensor_ready(PTO2Runtime *rt, const Tensor &tensor, bool wa
     };
 
     do_wait();
+    if (signaled) orch.scheduler->wiring.orch_needs_drain.store(false, std::memory_order_release);
     return !failed;
 }
+
 MAYBE_UNINITIALIZED_END
 
-uint64_t get_tensor_data(PTO2Runtime *rt, const Tensor &tensor, uint32_t ndims, const uint32_t indices[]) {
-    if (tensor.buffer.addr == 0) {
-        unified_log_error(
-            __FUNCTION__, "get_tensor_data: buffer not allocated (addr=0). "
-                          "Use the Tensor returned by add_output(TensorCreateInfo) after submit returns."
-        );
-        return 0;
-    }
+inline uint64_t get_tensor_data(PTO2Runtime *rt, const Tensor &tensor, uint32_t ndims, const uint32_t indices[]) {
+    if (tensor.buffer.addr == 0) return 0;
 
-    if (!wait_for_tensor_ready(rt, tensor, false, __FUNCTION__)) {
-        return 0;
-    }
+    if (!wait_for_tensor_ready(rt, tensor, false, __FUNCTION__)) return 0;
 
     uint64_t flat_offset = tensor.compute_flat_offset(indices, ndims);
     uint64_t elem_size = get_element_size(tensor.dtype);
@@ -231,18 +163,10 @@ uint64_t get_tensor_data(PTO2Runtime *rt, const Tensor &tensor, uint32_t ndims, 
 }
 
 void set_tensor_data(PTO2Runtime *rt, const Tensor &tensor, uint32_t ndims, const uint32_t indices[], uint64_t value) {
-    if (tensor.buffer.addr == 0) {
-        unified_log_error(
-            __FUNCTION__, "set_tensor_data: buffer not allocated (addr=0). "
-                          "Use the Tensor returned by add_output(TensorCreateInfo) after submit returns."
-        );
-        return;
-    }
+    if (tensor.buffer.addr == 0) return;
 
     // Wait for producer + all consumers before writing (WAW + WAR safety)
-    if (!wait_for_tensor_ready(rt, tensor, true, __FUNCTION__)) {
-        return;
-    }
+    if (!wait_for_tensor_ready(rt, tensor, true, __FUNCTION__)) return;
 
     uint64_t flat_offset = tensor.compute_flat_offset(indices, ndims);
     uint64_t elem_size = get_element_size(tensor.dtype);
@@ -250,54 +174,20 @@ void set_tensor_data(PTO2Runtime *rt, const Tensor &tensor, uint32_t ndims, cons
     memcpy(ptr, &value, elem_size);
 }
 
-// Ops-table entry that hands the call-site captured by PTO2ScopeGuard to the
-// [ScopeStats] collector. The slot is always present in the struct to keep
-// the layout stable; at SIMPLER_DFX=0 we fill nullptr so the orchestration
-// .so's null-check skips it.
-#if SIMPLER_DFX
-static void scope_set_site_impl(const char *file, int line) { scope_stats_set_pending_site(file, line); }
-#endif
+TaskOutputTensors submit_task_impl(PTO2Runtime *rt, const MixedKernels &mixed_kernels, const L0TaskArgs &args) {
+    return rt->orchestrator.submit_task(mixed_kernels, args);
+}
 
-static const PTO2RuntimeOps s_runtime_ops = {
-    .submit_task = submit_task_impl,
-    .scope_begin = rt_scope_begin,
-    .scope_end = rt_scope_end,
-    .orchestration_done = rt_orchestration_done,
-    .is_fatal = is_fatal_impl,
-    .report_fatal = rt_report_fatal,
-    .log_error = unified_log_error,
-    .log_warn = unified_log_warn,
-    .log_debug = unified_log_debug,
-    .log_info_v = unified_log_info_v,
-    .get_tensor_data = get_tensor_data,
-    .set_tensor_data = set_tensor_data,
-    .alloc_tensors = alloc_tensors_impl,
-    .submit_dummy_task = submit_dummy_task_impl,
-#if SIMPLER_DFX
-    .scope_set_site = scope_set_site_impl,
-#else
-    .scope_set_site = nullptr,
-#endif
-};
+TaskOutputTensors alloc_tensors_impl(PTO2Runtime *rt, const L0TaskArgs &args) {
+    return rt->orchestrator.alloc_tensors(args);
+}
 
-// =============================================================================
-// Runtime Lifecycle (AICPU-only fixup)
-// =============================================================================
-//
-// Layout / init_data / wire / destroy live in
-// runtime/shared/pto_runtime2_init.cpp so the host build can pre-populate the
-// prebuilt arena image. The pieces below — wiring the ops table and the
-// SPMD core counts — depend on the device-side s_runtime_ops global and the
-// AICPU SchedulerContext respectively, so they remain in the AICPU build.
+TaskOutputTensors submit_dummy_task_impl(PTO2Runtime *rt, const L0TaskArgs &args) {
+    return rt->orchestrator.submit_dummy_task(args);
+}
 
 void runtime_finalize_after_wire(PTO2Runtime *rt, int32_t aic_count, int32_t aiv_count) {
     rt->ops = &s_runtime_ops;
     rt->orchestrator.total_cluster_count = aic_count;
     rt->orchestrator.total_aiv_count = aiv_count;
-}
-
-void runtime_set_mode(PTO2Runtime *rt, PTO2RuntimeMode mode) {
-    if (rt) {
-        rt->mode = mode;
-    }
 }

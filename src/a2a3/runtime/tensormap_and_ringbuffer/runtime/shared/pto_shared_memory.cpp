@@ -8,77 +8,65 @@
  * See LICENSE in the root of the software repository for the full text of the License.
  * -----------------------------------------------------------------------------------------------------------
  */
-/**
- * PTO Runtime2 - Shared Memory Implementation
- *
- * Implements shared memory allocation, initialization, and management
- * for Orchestrator-Scheduler communication.
- *
- * Based on: docs/RUNTIME_LOGIC.md
- */
 
 #include "pto_shared_memory.h"
+
 #include <inttypes.h>
 #include <stdlib.h>
 #include <string.h>
-#include "common/unified_log.h"
 
-// =============================================================================
-// Size Calculation
-// =============================================================================
+#include "common/unified_log.h"
 
 uint64_t PTO2SharedMemoryHandle::calculate_size(uint64_t task_window_size) {
     uint64_t task_window_sizes[PTO2_MAX_RING_DEPTH];
-    for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
+    for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++)
         task_window_sizes[r] = task_window_size;
-    }
     return calculate_size_per_ring(task_window_sizes);
 }
 
 uint64_t PTO2SharedMemoryHandle::calculate_size_per_ring(const uint64_t task_window_sizes[PTO2_MAX_RING_DEPTH]) {
-    // Total SM size = offset just past the last ring, from the single source of
-    // truth for the layout (pto2_sm_layout::ring_segment_offsets).
-    return pto2_sm_layout::ring_segment_offsets(task_window_sizes, PTO2_MAX_RING_DEPTH - 1).end;
+    uint64_t size = 0;
+
+    // Header (aligned to cache line)
+    size += PTO2_ALIGN_UP(sizeof(PTO2SharedMemoryHeader), PTO2_ALIGN_SIZE);
+
+    // Per-ring task descriptors and payloads
+    for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
+        size += PTO2_ALIGN_UP(task_window_sizes[r] * sizeof(PTO2TaskDescriptor), PTO2_ALIGN_SIZE);
+        size += PTO2_ALIGN_UP(task_window_sizes[r] * sizeof(PTO2TaskPayload), PTO2_ALIGN_SIZE);
+        size += PTO2_ALIGN_UP(task_window_sizes[r] * sizeof(PTO2TaskSlotState), PTO2_ALIGN_SIZE);
+        size += PTO2_ALIGN_UP(task_window_sizes[r] * sizeof(std::atomic<uint8_t>), PTO2_ALIGN_SIZE);
+    }
+
+    return size;
 }
 
-// =============================================================================
-// Creation and Destruction
-// =============================================================================
+PTO2SharedMemoryHandle *PTO2SharedMemoryHandle::create_and_init_default(DeviceArena &arena) {
+    const uint64_t buffer_size = calculate_size(PTO2_TASK_WINDOW_SIZE);
+    const size_t off_handle = arena.reserve(sizeof(PTO2SharedMemoryHandle), alignof(PTO2SharedMemoryHandle));
+    const size_t off_buffer = arena.reserve(static_cast<size_t>(buffer_size), PTO2_ALIGN_SIZE);
+    if (arena.commit() == nullptr) return nullptr;
 
-void PTO2SharedMemoryHandle::setup_pointers_per_ring(const uint64_t task_window_sizes[PTO2_MAX_RING_DEPTH]) {
-    char *base = (char *)sm_base;
-    header = (PTO2SharedMemoryHeader *)base;
-
-    // Per-ring descriptors / payloads / slot_states — offsets from the single
-    // source of truth (pto2_sm_layout::ring_segment_offsets), so this setup and
-    // the device-address helpers cannot drift.
-    for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
-        auto off = pto2_sm_layout::ring_segment_offsets(task_window_sizes, r);
-        auto &ring = header->rings[r];
-        ring.task_descriptors = (PTO2TaskDescriptor *)(base + off.descriptors);
-        ring.task_payloads = (PTO2TaskPayload *)(base + off.payloads);
-        ring.slot_states = (PTO2TaskSlotState *)(base + off.slot_states);
-    }
-}
-
-void PTO2SharedMemoryHandle::setup_pointers(uint64_t task_window_size) {
-    uint64_t task_window_sizes[PTO2_MAX_RING_DEPTH];
-    for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
-        task_window_sizes[r] = task_window_size;
-    }
-    setup_pointers_per_ring(task_window_sizes);
+    auto *handle = static_cast<PTO2SharedMemoryHandle *>(arena.region_ptr(off_handle));
+    memset(handle, 0, sizeof(*handle));
+    void *buffer = arena.region_ptr(off_buffer);
+    memset(buffer, 0, static_cast<size_t>(buffer_size));
+    if (!handle->init(buffer, buffer_size, PTO2_TASK_WINDOW_SIZE, PTO2_HEAP_SIZE)) return nullptr;
+    return handle;
 }
 
 bool PTO2SharedMemoryHandle::init(
     void *sm_base_arg, uint64_t sm_size_arg, uint64_t task_window_size, uint64_t heap_size
 ) {
-    uint64_t task_window_sizes[PTO2_MAX_RING_DEPTH];
-    uint64_t heap_sizes[PTO2_MAX_RING_DEPTH];
-    for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
-        task_window_sizes[r] = task_window_size;
-        heap_sizes[r] = heap_size;
-    }
-    return init_per_ring(sm_base_arg, sm_size_arg, task_window_sizes, heap_sizes);
+    if (!sm_base_arg || sm_size_arg == 0) return false;
+    if (sm_size_arg < calculate_size(task_window_size)) return false;
+
+    sm_base = sm_base_arg;
+    sm_size = sm_size_arg;
+    is_owner = false;
+    setup_pointers(task_window_size);
+    init_header(task_window_size, heap_size);
+    return true;
 }
 
 bool PTO2SharedMemoryHandle::init_per_ring(
@@ -96,20 +84,6 @@ bool PTO2SharedMemoryHandle::init_per_ring(
     return true;
 }
 
-PTO2SharedMemoryHandle *PTO2SharedMemoryHandle::create_and_init_default(DeviceArena &arena) {
-    const uint64_t buffer_size = calculate_size(PTO2_TASK_WINDOW_SIZE);
-    const size_t off_handle = arena.reserve(sizeof(PTO2SharedMemoryHandle), alignof(PTO2SharedMemoryHandle));
-    const size_t off_buffer = arena.reserve(static_cast<size_t>(buffer_size), PTO2_ALIGN_SIZE);
-    if (arena.commit() == nullptr) return nullptr;
-
-    auto *handle = static_cast<PTO2SharedMemoryHandle *>(arena.region_ptr(off_handle));
-    memset(handle, 0, sizeof(*handle));
-    void *buffer = arena.region_ptr(off_buffer);
-    memset(buffer, 0, static_cast<size_t>(buffer_size));
-    if (!handle->init(buffer, buffer_size, PTO2_TASK_WINDOW_SIZE, PTO2_HEAP_SIZE)) return nullptr;
-    return handle;
-}
-
 void PTO2SharedMemoryHandle::destroy() {
     // Arena-owned wrappers (is_owner == false) are reclaimed by arena.release();
     // calling destroy on them is a no-op so existing callers stay safe.
@@ -119,11 +93,12 @@ void PTO2SharedMemoryHandle::destroy() {
     }
 }
 
-// =============================================================================
-// Initialization
-// =============================================================================
-//
-// no need init data in pool, init pool data when used
+void PTO2SharedMemoryHandle::print_layout() {
+    if (!header) return;
+
+    for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {}
+}
+
 void PTO2SharedMemoryHandle::init_header(uint64_t task_window_size, uint64_t heap_size) {
     uint64_t task_window_sizes[PTO2_MAX_RING_DEPTH];
     uint64_t heap_sizes[PTO2_MAX_RING_DEPTH];
@@ -140,6 +115,16 @@ void PTO2SharedMemoryHandle::init_header_per_ring(
     // Per-ring flow control (start at 0)
     for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
         header->rings[r].fc.init();
+        // -1 = "no task completed yet"; first task to complete (local_id 0)
+        // will advance the watermark to 0.
+        header->rings[r].completed_watermark.store(-1, std::memory_order_relaxed);
+        // Shared memory is not guaranteed zero on device. The watermark-advance
+        // loop reads completion_flags for not-yet-completed slots, so stale
+        // non-zero bytes would prematurely advance completed_watermark and retire
+        // live slots. Zero the whole per-ring flag block (1 byte/slot, cheap).
+        __builtin_memset(
+            (void *)header->rings[r].completion_flags, 0, task_window_sizes[r] * sizeof(std::atomic<uint8_t>)
+        );
     }
 
     header->orchestrator_done.store(0, std::memory_order_relaxed);
@@ -165,53 +150,44 @@ void PTO2SharedMemoryHandle::init_header_per_ring(
     header->sched_error_bitmap.store(0, std::memory_order_relaxed);
     header->sched_error_code.store(PTO2_ERROR_NONE, std::memory_order_relaxed);
     header->sched_error_thread.store(-1, std::memory_order_relaxed);
-    header->sched_stall_detail.store(PTO2_STALL_DETAIL_NONE, std::memory_order_relaxed);
-    header->sched_stall_completed.store(0, std::memory_order_relaxed);
-    header->sched_stall_total.store(0, std::memory_order_relaxed);
-    header->sched_stall_cnt_running.store(0, std::memory_order_relaxed);
-    header->sched_stall_cnt_ready.store(0, std::memory_order_relaxed);
-    header->sched_stall_cnt_waiting.store(0, std::memory_order_relaxed);
-    header->sched_stall_orch_done.store(0, std::memory_order_relaxed);
-    header->sched_stall_task_id.store(-1, std::memory_order_relaxed);
-    header->sched_stall_core.store(-1, std::memory_order_relaxed);
 
-    // No per-slot loop: prepare_task resets each slot when it allocates it, and
-    // the scheduler only scans submitted task_ids [last_task_alive,
-    // current_task_index), so unsubmitted slots are never read. Per-boot reset
-    // is just the header fields above; per-slot state is set lazily at submit.
+    // No per-slot loop: prepare_task() resets each slot when the allocator
+    // hands it out (bind_ring + reset_for_reuse + per-submit fields). The
+    // scheduler only scans submitted task_ids [last_task_alive,
+    // current_task_index), so unsubmitted slots are never read. Cost moves
+    // from O(sum(task_window_sizes)) every run to O(tasks actually
+    // submitted) — and stays on the device. Mirrors upstream #1199.
 }
 
-// =============================================================================
-// Debug Utilities
-// =============================================================================
+void PTO2SharedMemoryHandle::setup_pointers(uint64_t task_window_size) {
+    uint64_t task_window_sizes[PTO2_MAX_RING_DEPTH];
+    for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++)
+        task_window_sizes[r] = task_window_size;
+    setup_pointers_per_ring(task_window_sizes);
+}
 
-void PTO2SharedMemoryHandle::print_layout() {
-    if (!header) return;
+void PTO2SharedMemoryHandle::setup_pointers_per_ring(const uint64_t task_window_sizes[PTO2_MAX_RING_DEPTH]) {
+    char *ptr = (char *)sm_base;
 
-    PTO2SharedMemoryHeader *h = header;
+    // Header
+    header = (PTO2SharedMemoryHeader *)ptr;
+    ptr += PTO2_ALIGN_UP(sizeof(PTO2SharedMemoryHeader), PTO2_ALIGN_SIZE);
 
-    LOG_INFO_V0("=== PTO2 Shared Memory Layout ===");
-    LOG_INFO_V0("Base address:       %p", sm_base);
-    LOG_INFO_V0("Total size:         %" PRIu64 " bytes", h->total_size);
-    LOG_INFO_V0("Ring depth:         %d", PTO2_MAX_RING_DEPTH);
+    // Per-ring task descriptors, payloads, and slot states
     for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
-        LOG_INFO_V0("Ring %d:", r);
-        LOG_INFO_V0("  task_window_size: %" PRIu64, h->rings[r].task_window_size);
-        LOG_INFO_V0("  heap_size:        %" PRIu64 " bytes", h->rings[r].heap_size);
-        LOG_INFO_V0(
-            "  descriptors_off:  %" PRIu64 " (0x%" PRIx64 ")", h->rings[r].task_descriptors_offset,
-            h->rings[r].task_descriptors_offset
-        );
-        LOG_INFO_V0("  current_task_idx: %d", h->rings[r].fc.current_task_index.load(std::memory_order_acquire));
-        LOG_INFO_V0("  last_task_alive:  %d", h->rings[r].fc.last_task_alive.load(std::memory_order_acquire));
+        auto &ring = header->rings[r];
+        ring.task_descriptors = (PTO2TaskDescriptor *)ptr;
+        ptr += PTO2_ALIGN_UP(task_window_sizes[r] * sizeof(PTO2TaskDescriptor), PTO2_ALIGN_SIZE);
+
+        ring.task_payloads = (PTO2TaskPayload *)ptr;
+        ptr += PTO2_ALIGN_UP(task_window_sizes[r] * sizeof(PTO2TaskPayload), PTO2_ALIGN_SIZE);
+
+        ring.slot_states = (PTO2TaskSlotState *)ptr;
+        ptr += PTO2_ALIGN_UP(task_window_sizes[r] * sizeof(PTO2TaskSlotState), PTO2_ALIGN_SIZE);
+
+        ring.completion_flags = (std::atomic<uint8_t> *)ptr;
+        ptr += PTO2_ALIGN_UP(task_window_sizes[r] * sizeof(std::atomic<uint8_t>), PTO2_ALIGN_SIZE);
     }
-    LOG_INFO_V0("orchestrator_done:  %d", h->orchestrator_done.load(std::memory_order_acquire));
-    LOG_INFO_V0("Error state:");
-    LOG_INFO_V0("  orch_error_code:    %d", h->orch_error_code.load(std::memory_order_relaxed));
-    LOG_INFO_V0("  sched_error_bitmap: 0x%x", h->sched_error_bitmap.load(std::memory_order_relaxed));
-    LOG_INFO_V0("  sched_error_code:   %d", h->sched_error_code.load(std::memory_order_relaxed));
-    LOG_INFO_V0("  sched_error_thread: %d", h->sched_error_thread.load(std::memory_order_relaxed));
-    LOG_INFO_V0("================================");
 }
 
 bool PTO2SharedMemoryHandle::validate() {
@@ -220,9 +196,8 @@ bool PTO2SharedMemoryHandle::validate() {
 
     PTO2SharedMemoryHeader *h = header;
 
-    for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
+    for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++)
         if (!h->rings[r].fc.validate(this, r)) return false;
-    }
 
     return true;
 }

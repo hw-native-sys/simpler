@@ -558,7 +558,7 @@ dep_gen_replay_emit_deps_json(const DepGenRecord *records, size_t num_records, c
         // `explicit_dep_count` / `over->dep_count` originate from device
         // shared memory and are bounded by the writer to the array sizes, but
         // we clamp on read too so a corrupted record never drives an OOB read
-        // off the end of rec.explicit_deps[64] / over->deps[582].
+        // off the end of rec.explicit_deps[64] / over->deps[326].
         const uint64_t *deps_data;
         int32_t dc;
         if (rec.flags & DEP_GEN_FLAG_HAS_OVERFLOW) {
