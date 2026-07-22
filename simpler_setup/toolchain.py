@@ -167,7 +167,7 @@ class CCECToolchain(Toolchain):
         else:
             raise ValueError(f"Unknown platform: {self.platform}. Supported: a2a3, a2a3sim, a5, a5sim")
 
-        return [
+        flags = [
             "-c",
             "-O3",
             "-g",
@@ -189,6 +189,14 @@ class CCECToolchain(Toolchain):
             "-cce-aicore-dcci-insert-for-scalar=false",
             "-DMEMORY_BASE",
         ]
+        # A5 hardware only: enable VF alias analysis between loop iterations.
+        # a5sim uses Gxx15Toolchain (KernelCompiler leaves self.ccec unset), so this
+        # LLVM option does not apply there. Stricter inter-iteration AA constrains
+        # BiSheng VF fusion scale/correctness; BiSheng plans to make this always-on
+        # later, so pin it for A5 CCEC builds now.
+        if self.platform == "a5":
+            flags.extend(["-mllvm", "-cce-vf-aa-between-iters=true"])
+        return flags
 
     def get_cmake_args(self) -> list[str]:
         return [
