@@ -895,6 +895,14 @@ void L2SwimlaneCollector::set_core_types(const CoreType *types, int n) {
     core_types_.assign(types, types + n);
 }
 
+void L2SwimlaneCollector::set_host_orch_records(
+    const std::vector<L2SwimlaneAicpuOrchPhaseRecord> &records, uint64_t host_start_cycles, uint64_t host_end_cycles
+) {
+    host_orch_phase_records_ = records;
+    host_orch_start_cycles_ = host_start_cycles;
+    host_orch_end_cycles_ = host_end_cycles;
+}
+
 // JSON v2 emit: the host now dumps raw cycle-domain per-stream records plus
 // metadata, and `swimlane_converter.py` performs the join (AICore↔AICPU on
 // reg_task_id, base_time normalization, cycles→µs conversion, sort, core_type
@@ -1046,6 +1054,8 @@ int L2SwimlaneCollector::export_swimlane_json() {
                 return "drain_publish";
             case L2SwimlaneSchedPhaseKind::AsyncPoll:
                 return "async_poll";
+            case L2SwimlaneSchedPhaseKind::GraphPrepare:
+                return "graph_prepare";
             }
             return "unknown";
         };
@@ -1070,6 +1080,11 @@ int L2SwimlaneCollector::export_swimlane_json() {
                     pr.kind == L2SwimlaneSchedPhaseKind::PredicatedSkip) {
                     uint64_t task_id = (static_cast<uint64_t>(pr.phase_data.dummy_task.ring_id) << 32) |
                                        pr.phase_data.dummy_task.local_id;
+                    outfile << ", \"task_id\": " << task_id;
+                }
+                if (pr.kind == L2SwimlaneSchedPhaseKind::GraphPrepare) {
+                    uint64_t task_id = (static_cast<uint64_t>(pr.phase_data.graph_task.ring_id) << 32) |
+                                       pr.phase_data.graph_task.local_id;
                     outfile << ", \"task_id\": " << task_id;
                 }
                 // Queue-depth snapshots — [AIC, AIV, MIX] per L2SwimlaneAicpuSchedPhaseRecord docstring.
@@ -1115,6 +1130,21 @@ int L2SwimlaneCollector::export_swimlane_json() {
                 outfile << "\n";
             }
             outfile << "  ]";
+        }
+        if (host_orch_end_cycles_ > host_orch_start_cycles_) {
+            outfile << ",\n  \"host_orchestrator\": {\n";
+            outfile << "    \"start_cycles\": " << host_orch_start_cycles_ << ",\n";
+            outfile << "    \"end_cycles\": " << host_orch_end_cycles_ << ",\n";
+            outfile << "    \"records\": [";
+            bool first = true;
+            for (const auto &pr : host_orch_phase_records_) {
+                if (!first) outfile << ",";
+                outfile << "\n      {\"submit_idx\": " << pr.submit_idx << ", \"task_id\": " << pr.task_id
+                        << ", \"start_cycles\": " << pr.start_time << ", \"end_cycles\": " << pr.end_time << "}";
+                first = false;
+            }
+            if (!first) outfile << "\n    ";
+            outfile << "]\n  }";
         }
     }
 
@@ -1243,6 +1273,9 @@ int L2SwimlaneCollector::finalize(L2SwimlaneUnregisterCallback unregister_cb, co
     collected_aicore_records_.clear();
     collected_sched_phase_records_.clear();
     collected_orch_phase_records_.clear();
+    host_orch_phase_records_.clear();
+    host_orch_start_cycles_ = 0;
+    host_orch_end_cycles_ = 0;
     perf_records_by_collector_.clear();
     aicore_records_by_collector_.clear();
     sched_phase_records_by_collector_.clear();

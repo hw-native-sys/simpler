@@ -10,6 +10,8 @@
 
 import json
 
+import pytest
+
 from simpler_setup.tools import swimlane_converter as sc
 
 
@@ -161,6 +163,178 @@ def test_load_func_names_auto_discovery_and_explicit_precedence(tmp_path):
     func_names, _ = sc._load_func_names(explicit_args, input_path)
 
     assert func_names == {"0": "explicit"}
+
+
+def test_graph_prepare_phases_create_graph_execution_envelopes(tmp_path):
+    out = tmp_path / "trace.json"
+    outer_a = 3
+    outer_b = 7
+    node_a0 = (1 << 32) | (outer_a << 10)
+    node_a1 = (1 << 32) | ((outer_a << 10) | 1)
+    node_b0 = (1 << 32) | (outer_b << 10)
+    scheduler_phases = [
+        [
+            {
+                "phase": "graph_prepare",
+                "task_id": outer_a,
+                "start_time_us": 1.0,
+                "end_time_us": 1.4,
+                "tasks_processed": 1,
+            },
+            {
+                "phase": "graph_prepare",
+                "task_id": outer_a,
+                "start_time_us": 1.5,
+                "end_time_us": 1.8,
+                "tasks_processed": 1,
+            },
+            {
+                "phase": "graph_prepare",
+                "task_id": outer_b,
+                "start_time_us": 5.0,
+                "end_time_us": 5.2,
+                "tasks_processed": 1,
+            },
+        ]
+    ]
+    tasks = [
+        _task_row(node_a0, 0, dispatch=2.0, start=2.2, end=3.0, receive=2.1),
+        _task_row(node_a1, 1, dispatch=3.2, start=3.4, end=4.0, receive=3.3),
+        _task_row(node_b0, 0, dispatch=5.3, start=5.5, end=6.0, receive=5.4),
+    ]
+
+    sc.generate_chrome_trace_json(tasks, str(out), scheduler_phases=scheduler_phases, core_to_thread=[0, 0])
+
+    with open(out) as f:
+        events = json.load(f)["traceEvents"]
+    assert any(
+        event.get("ph") == "M" and event.get("pid") == 5 and event.get("args", {}).get("name") == "Graph Execution"
+        for event in events
+    )
+    graph_events = [event for event in events if event.get("cat") == "graph_execution"]
+    assert [event["args"]["outer_task_id"] for event in graph_events] == [outer_a, outer_b]
+    assert graph_events[0]["args"]["visible_node_count"] == 2
+    assert graph_events[0]["args"]["prepare_slice_count"] == 2
+    assert graph_events[0]["ts"] == 1.0
+    assert graph_events[0]["dur"] == 4.0
+    assert (
+        sum(event.get("cat") == "scheduler" and event.get("name", "").startswith("graph_prepare(") for event in events)
+        == 3
+    )
+
+
+def test_host_orchestrator_uses_separate_clock_domain_and_lane(tmp_path):
+    raw = tmp_path / "l2_swimlane_records.json"
+    raw.write_text(
+        json.dumps(
+            {
+                "l2_swimlane_level": 4,
+                "metadata": {"clock_freq_hz": 50_000_000, "num_cores": 0, "core_types": []},
+                "aicore_tasks": [],
+                "aicpu_tasks": [],
+                "aicpu_scheduler_phases": [],
+                "host_orchestrator": {
+                    "start_cycles": 100,
+                    "end_cycles": 200,
+                    "records": [{"submit_idx": 0, "task_id": 3, "start_cycles": 120, "end_cycles": 140}],
+                },
+            }
+        )
+    )
+    parsed = sc.read_perf_data(raw)
+    host = parsed["host_orchestrator"]
+    assert host["start_time_us"] == -2.0
+    assert host["end_time_us"] == 0.0
+    assert host["records"][0]["start_time_us"] == -1.6
+    assert host["records"][0]["end_time_us"] == -1.2
+
+    out = tmp_path / "trace.json"
+    tasks = [_task_row(1, 0, dispatch=0.5, start=1.0, end=1.5, receive=0.75)]
+    sc.generate_chrome_trace_json(tasks, str(out), host_orchestrator=host)
+    with open(out) as f:
+        events = json.load(f)["traceEvents"]
+    assert any(
+        event.get("ph") == "M" and event.get("pid") == 1 and event.get("args", {}).get("name") == "Host Orchestrator"
+        for event in events
+    )
+    assert not any(
+        event.get("ph") == "M" and event.get("args", {}).get("name") == "AICPU Orchestrator" for event in events
+    )
+    envelope = next(event for event in events if event.get("name") == "host_orchestration")
+    assert envelope["ts"] == 0.0
+    assert envelope["dur"] == 2.0
+    host_submit = next(event for event in events if event.get("name") == "task_submit(t3)")
+    assert host_submit["ts"] == pytest.approx(0.4)
+    worker = next(event for event in events if event.get("pid") == 4 and event.get("ph") == "X")
+    assert worker["ts"] == 2.75
+
+
+def test_host_orchestrator_envelope_does_not_require_submit_records(tmp_path):
+    raw = tmp_path / "l2_swimlane_records.json"
+    raw.write_text(
+        json.dumps(
+            {
+                "l2_swimlane_level": 4,
+                "metadata": {"clock_freq_hz": 50_000_000, "num_cores": 0, "core_types": []},
+                "aicore_tasks": [],
+                "aicpu_tasks": [],
+                "aicpu_scheduler_phases": [],
+                "host_orchestrator": {"start_cycles": 100, "end_cycles": 200, "records": []},
+            }
+        )
+    )
+
+    host = sc.read_perf_data(raw)["host_orchestrator"]
+    out = tmp_path / "trace.json"
+    sc.generate_chrome_trace_json([], str(out), host_orchestrator=host)
+
+    with open(out) as f:
+        events = json.load(f)["traceEvents"]
+    envelopes = [event for event in events if event.get("name") == "host_orchestration"]
+    assert len(envelopes) == 1
+    assert envelopes[0]["ts"] == 0.0
+    assert envelopes[0]["dur"] == 2.0
+
+
+def test_host_submit_records_distinguish_graph_outer_task(tmp_path):
+    out = tmp_path / "trace.json"
+    outer_task_id = 3
+    node_task_id = (1 << 32) | (outer_task_id << 10)
+    tasks = [_task_row(node_task_id, 0, dispatch=2.0, start=2.2, end=3.0, receive=2.1)]
+    scheduler_phases = [
+        [
+            {
+                "phase": "graph_prepare",
+                "task_id": outer_task_id,
+                "start_time_us": 1.0,
+                "end_time_us": 1.5,
+                "tasks_processed": 1,
+            }
+        ]
+    ]
+    host_orchestrator = {
+        "start_time_us": -1.0,
+        "end_time_us": 0.0,
+        "clock_alignment": "host_orch_end_aligned_to_device_zero",
+        "records": [
+            {"submit_idx": 0, "task_id": 2, "start_time_us": -0.9, "end_time_us": -0.8},
+            {"submit_idx": 1, "task_id": outer_task_id, "start_time_us": -0.7, "end_time_us": -0.6},
+        ],
+    }
+
+    sc.generate_chrome_trace_json(
+        tasks,
+        str(out),
+        scheduler_phases=scheduler_phases,
+        core_to_thread=[0],
+        host_orchestrator=host_orchestrator,
+    )
+
+    with open(out) as f:
+        events = json.load(f)["traceEvents"]
+    host_submits = [event for event in events if event.get("cat") == "host_orchestrator" and "submit(" in event["name"]]
+    assert [event["name"] for event in host_submits] == ["task_submit(t2)", "graph_submit(t3)"]
+    assert [event["args"]["submit_kind"] for event in host_submits] == ["task_submit", "graph_submit"]
 
 
 def test_spmd_pred_routes_dependency_to_earliest_slice(tmp_path):

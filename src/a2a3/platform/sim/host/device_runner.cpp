@@ -317,6 +317,12 @@ int DeviceRunner::run(Runtime &runtime, const CallConfig &config) {
             core_types[i] = runtime.get_workers()[i].core_type;
         }
         l2_swimlane_collector_.set_core_types(core_types.data(), num_aicore);
+        if (l2_swimlane_level_ >= L2SwimlaneLevel::ORCH_PHASES) {
+            l2_swimlane_collector_.set_host_orch_records(
+                runtime.get_host_orch_phase_records(), runtime.get_host_orch_start_cycles(),
+                runtime.get_host_orch_end_cycles()
+            );
+        }
     }
 
     if (enable_dump_args_) {

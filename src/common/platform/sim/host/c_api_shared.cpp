@@ -545,7 +545,7 @@ int simpler_run(
             // host_orch_func_ptr + signature stay inside the runner.
             rc = runner->bind_callable_to_runtime(
                 *r, callable_id, &g_host_api, args, config->runtime_env.ring_task_window, config->runtime_env.ring_heap,
-                config->runtime_env.ring_dep_pool
+                config->runtime_env.ring_dep_pool, config->enable_l2_swimlane
             );
         }
         if (rc != 0) {

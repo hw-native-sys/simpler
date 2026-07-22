@@ -31,12 +31,15 @@
 #include "common/l2_swimlane_profiling.h"
 #include "utils/device_arena.h"
 #include "pto_ring_buffer.h"
+#include "pto_graph_cache.h"
 #include "pto_runtime2_types.h"
 #include "pto_submit_types.h"
 #include "scheduler/pto_scheduler.h"
 #include "pto_shared_memory.h"
 #include "pto_tensormap.h"
 #include "pto_types.h"
+
+struct PTO2GraphSubmission;
 
 /**
  * Layout descriptor produced by PTO2OrchestratorState::reserve_layout(). Holds
@@ -115,11 +118,24 @@ struct PTO2OrchestratorState {
     // after orchestration finishes so shutdown/profiling totals remain closed.
     int64_t inline_completed_tasks{0};
 
+    // Host-side execution images waiting for runtime_maker to relocate and
+    // upload. Each replayed Graph contributes one compact block; ordinary
+    // task-window storage still contains only its outer Graph descriptor.
+    PTO2GraphSubmission *pending_graph_uploads{nullptr};
+
     // === STATISTICS ===
 #if SIMPLER_DFX
     int64_t tasks_submitted;
     int64_t buffers_allocated;
     int64_t bytes_allocated;
+
+    // Host-build-graph runs submit_task through this state before the device
+    // collector exists. Point directly at the per-run host capture vector so
+    // submit records cannot be lost through ELF symbol interposition between
+    // the host runtime and simulator/AICPU DSOs.
+    L2SwimlaneAicpuOrchPhaseRecord *host_orch_phase_records{nullptr};
+    size_t host_orch_phase_capacity{0};
+    size_t host_orch_phase_count{0};
 #endif
 
     bool in_manual_scope() const { return scope_stack_top >= manual_begin_depth; }
@@ -157,6 +173,9 @@ struct PTO2OrchestratorState {
     TaskOutputTensors submit_task(const MixedKernels &mixed_kernels, const L0TaskArgs &args);
     TaskOutputTensors submit_dummy_task(const L0TaskArgs &args);
     TaskOutputTensors alloc_tensors(const L0TaskArgs &args);
+    PTO2GraphScopeResult graph_begin(uint64_t graph_key, const L2TaskArgs &args, uint64_t callable_hash);
+    void graph_end();
+    bool finalize_pending_graph_definition();
     void mark_done();
 };
 

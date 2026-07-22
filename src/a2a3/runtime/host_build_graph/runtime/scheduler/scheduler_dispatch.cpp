@@ -1133,6 +1133,53 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
             continue;
         }
 
+        // Graph control work never consumes an AICore. An outer Graph becomes
+        // activatable only after its external fanin is ready; materialization
+        // can run independently in bounded slices and therefore overlaps other
+        // scheduler work instead of creating one long expansion bar.
+        if (thread_idx < 3) {
+            // host_build_graph never reuses task-window slots during a run, so
+            // the Graph ready queue does not need a generation tag. The common
+            // ready routing path deliberately uses push(), whose tag is zero.
+            PTO2TaskSlotState *graph_slot = sched_->graph_ready_queue.pop();
+            if (graph_slot != nullptr && graph_slot->task != nullptr && graph_slot->task->kind == PTO2TaskKind::GRAPH) {
+                (void)sched_->activate_graph_task(*graph_slot);
+                made_progress = true;
+            }
+
+            uint64_t prepare_task_id = 0;
+            PTO2TaskSlotState *prepare_slot = sched_->graph_prepare_queue.pop_tagged(&prepare_task_id);
+            if (prepare_slot != nullptr && prepare_slot->task != nullptr &&
+                prepare_slot->task->kind == PTO2TaskKind::GRAPH && prepare_slot->task->task_id.raw == prepare_task_id) {
+#if SIMPLER_DFX
+                uint64_t graph_prepare_t0 =
+                    l2_swimlane_level_ >= L2SwimlaneLevel::SCHED_PHASES ? get_sys_cnt_aicpu() : 0;
+#endif
+                int32_t nodes_materialized = 0;
+                PTO2GraphMaterializeResult result =
+                    sched_->prepare_graph_task(*prepare_slot, PTO2_GRAPH_MATERIALIZE_SLICE_NODES, &nodes_materialized);
+                if (result == PTO2GraphMaterializeResult::PENDING || result == PTO2GraphMaterializeResult::BUSY) {
+                    while (!sched_->graph_prepare_queue.push_tagged(prepare_slot, prepare_task_id)) {
+                        SPIN_WAIT_HINT();
+                    }
+                }
+                if (nodes_materialized > 0 || result == PTO2GraphMaterializeResult::PREPARED) {
+                    made_progress = true;
+                }
+#if SIMPLER_DFX
+                if (graph_prepare_t0 != 0) {
+                    uint64_t graph_prepare_t1 = get_sys_cnt_aicpu();
+                    l2_swimlane_aicpu_record_graph_prepare(
+                        thread_idx, graph_prepare_t0, graph_prepare_t1, l2_swimlane.sched_loop_count, prepare_task_id,
+                        static_cast<uint32_t>(nodes_materialized)
+                    );
+                    // Keep Graph expansion out of the next Dispatch envelope.
+                    _t0_phase = graph_prepare_t1;
+                }
+#endif
+            }
+        }
+
         // Phase 3: Drain dummy ready queue (S0/S1/S2).
         //
         // Dependency-only tasks bypass AICore dispatch: they go through the
@@ -1168,10 +1215,11 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
                 // OFF and the Resolve emit below is excluded.
                 [[maybe_unused]] uint32_t dummy_consumers = 0;
 #if SIMPLER_SCHED_PROFILING
-                dummy_consumers = sched_->on_task_complete(dummy_slot, thread_idx).fanout_edges;
+                PTO2SchedulerState::TaskCompletionOutcome outcome = sched_->complete_task(dummy_slot, thread_idx);
 #else
-                dummy_consumers = sched_->on_task_complete(dummy_slot);
+                PTO2SchedulerState::TaskCompletionOutcome outcome = sched_->complete_task(dummy_slot);
 #endif
+                dummy_consumers = outcome.fanout_edges;
 #if SIMPLER_DFX
                 if (dummy_resolve_t0 != 0) {
                     uint64_t dummy_resolve_t1 = get_sys_cnt_aicpu();
@@ -1203,8 +1251,8 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
 #endif
                     }
                 }
-                int32_t prev = completed_tasks_.fetch_add(1, std::memory_order_relaxed);
-                last_progress_count = prev + 1;
+                int32_t prev = completed_tasks_.fetch_add(outcome.stream_tasks_completed, std::memory_order_relaxed);
+                last_progress_count = prev + outcome.stream_tasks_completed;
                 cur_thread_completed++;
             }
             if (dummy_got > 0) {

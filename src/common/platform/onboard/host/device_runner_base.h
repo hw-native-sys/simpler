@@ -362,12 +362,15 @@ public:
      * @param orch_args         const ChipStorageTaskArgs* for this run (void* to
      *                          keep task_interface headers out of this header).
      * @param ring_task_window  Per-ring overrides (trb); ignored by hbg.
+     * @param l2_swimlane_level Per-run DFX level; hbg uses level 4 to capture
+     *                          host-side orchestration before device launch.
      * @return 0 on success, non-zero on failure (unregistered id, out-of-range
      *         func_id, or the underlying bind_callable_to_runtime_impl rc).
      */
     int bind_callable_to_runtime(
         Runtime &runtime, int32_t callable_id, const HostApi *api, const void *orch_args,
-        const uint64_t *ring_task_window, const uint64_t *ring_heap, const uint64_t *ring_dep_pool
+        const uint64_t *ring_task_window, const uint64_t *ring_heap, const uint64_t *ring_dep_pool,
+        int32_t l2_swimlane_level
     );
 
     /**

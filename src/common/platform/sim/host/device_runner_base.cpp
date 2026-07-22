@@ -474,12 +474,12 @@ bool SimDeviceRunnerBase::has_callable(int32_t callable_id) const { return calla
 extern "C" int bind_callable_to_runtime_impl(
     Runtime *runtime, const HostApi *api, const ChipStorageTaskArgs *orch_args, void *host_orch_func_ptr,
     const ArgDirection *signature, int sig_count, const uint64_t *ring_task_window, const uint64_t *ring_heap,
-    const uint64_t *ring_dep_pool
+    const uint64_t *ring_dep_pool, int32_t l2_swimlane_level
 );
 
 int SimDeviceRunnerBase::bind_callable_to_runtime(
     Runtime &runtime, int32_t callable_id, const HostApi *api, const void *orch_args, const uint64_t *ring_task_window,
-    const uint64_t *ring_heap, const uint64_t *ring_dep_pool
+    const uint64_t *ring_heap, const uint64_t *ring_dep_pool, int32_t l2_swimlane_level
 ) {
     auto it = callables_.find(callable_id);
     if (it == callables_.end()) {
@@ -503,7 +503,7 @@ int SimDeviceRunnerBase::bind_callable_to_runtime(
     return bind_callable_to_runtime_impl(
         &runtime, api, reinterpret_cast<const ChipStorageTaskArgs *>(orch_args), state.host_orch_func_ptr,
         state.signature.empty() ? nullptr : state.signature.data(), static_cast<int>(state.signature.size()),
-        ring_task_window, ring_heap, ring_dep_pool
+        ring_task_window, ring_heap, ring_dep_pool, l2_swimlane_level
     );
 }
 
