@@ -497,12 +497,15 @@ struct PTO2SchedulerState {
     // Inline hot-path methods
     // =========================================================================
 
-    // Route a ready slot to the right global queue. Dummy tasks (empty active_mask)
-    // live in dummy_ready_queue; a ready sync_start cohort goes to the per-shape
-    // ready_sync_queues[] (drained as Tier-0); everything else to ready_queues[].
+    // Route a ready slot to the right global queue. Dep-only tasks — DUMMY-shaped
+    // (empty active_mask) or a task whose dispatch predicate fails — live in
+    // dummy_ready_queue and are retired inline; a ready sync_start cohort goes to
+    // the per-shape ready_sync_queues[] (drained as Tier-0); everything else to
+    // ready_queues[].
     void push_ready_routed(PTO2TaskSlotState *slot_state) {
         PTO2ResourceShape shape = slot_state->active_mask.to_shape();
-        if (shape == PTO2ResourceShape::DUMMY) {
+        if (shape == PTO2ResourceShape::DUMMY ||
+            (slot_state->active_mask.has_predicate() && !slot_state->payload->predicate.pass())) {
             dummy_ready_queue.push(slot_state);
         } else if (slot_state->active_mask.requires_sync_start()) {
             ready_sync_queues[static_cast<int32_t>(shape)].push(slot_state);
@@ -793,6 +796,7 @@ struct PTO2SchedulerState {
         p.unlock_fanout();
         for (; edge != nullptr; edge = edge->next) {
             PTO2TaskSlotState *c = edge->slot_state;
+            if (c->active_mask.has_predicate()) continue;  // predicated consumers never early-dispatch
             // Compare to fanin_actual_count (the real producer-edge count), NOT
             // fanin_count: fanin_count = fanin_actual_count + 1 (a self/wiring +1 that
             // ready_fanin gets but dispatch_fanin does not). dispatch_fanin starts at
@@ -841,6 +845,8 @@ struct PTO2SchedulerState {
     };
 
     inline bool try_early_dispatch_release(PTO2TaskSlotState &slot_state, EarlyDispatchReleaseSink *sink = nullptr) {
+        // A predicated task is evaluated at the ready point, never early-dispatched.
+        if (slot_state.active_mask.has_predicate()) return false;
         // Never staged => CAS NONE->DISPATCHED wins => dispatch normally.
         uint8_t expect = PTO2_EARLY_DISPATCH_NONE;
         if (slot_state.payload->early_dispatch_state.compare_exchange_strong(
@@ -912,7 +918,8 @@ struct PTO2SchedulerState {
         }
 
         PTO2ResourceShape shape = slot_state.active_mask.to_shape();
-        if (shape == PTO2ResourceShape::DUMMY) {
+        if (shape == PTO2ResourceShape::DUMMY ||
+            (slot_state.active_mask.has_predicate() && !slot_state.payload->predicate.pass())) {
             dummy_ready_queue.push(&slot_state);
         } else if (slot_state.active_mask.requires_sync_start()) {
             ready_sync_queues[static_cast<int32_t>(shape)].push(&slot_state);
@@ -952,7 +959,8 @@ struct PTO2SchedulerState {
         }
 
         PTO2ResourceShape shape = slot_state.active_mask.to_shape();
-        if (shape == PTO2ResourceShape::DUMMY) {
+        if (shape == PTO2ResourceShape::DUMMY ||
+            (slot_state.active_mask.has_predicate() && !slot_state.payload->predicate.pass())) {
             dummy_ready_queue.push(&slot_state, atomic_count, push_wait);
         } else if (slot_state.active_mask.requires_sync_start()) {
             ready_sync_queues[static_cast<int32_t>(shape)].push(&slot_state, atomic_count, push_wait);
