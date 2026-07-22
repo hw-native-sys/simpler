@@ -99,7 +99,7 @@ static_assert(offsetof(TensorCreateInfo, ndims) == offsetof(Tensor, ndims));
 static_assert(offsetof(TensorCreateInfo, dtype) == offsetof(Tensor, dtype));
 static_assert(offsetof(TensorCreateInfo, manual_dep) == offsetof(Tensor, manual_dep));
 static_assert(offsetof(TensorCreateInfo, is_contiguous) == offsetof(Tensor, is_contiguous));
-static_assert(offsetof(TensorCreateInfo, __pad_flags__) == offsetof(Tensor, child_memory));
+static_assert(offsetof(TensorCreateInfo, __pad_flags__) == offsetof(Tensor, address_space));
 static_assert(offsetof(TensorCreateInfo, shapes) == offsetof(Tensor, shapes));
 
 // ============================================================================

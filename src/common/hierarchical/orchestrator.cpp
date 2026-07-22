@@ -445,7 +445,7 @@ void Orchestrator::validate_remote_sidecars(
             if (!tensor_sidecar.present && tensor.nbytes() != 0) {
                 throw std::invalid_argument("Orchestrator: remote tensor payload requires a RemoteTensorRef sidecar");
             }
-            if (tensor.is_child_memory() && !tensor_sidecar.present) {
+            if (tensor.is_device_memory() && !tensor_sidecar.present) {
                 throw std::invalid_argument("Orchestrator: remote child-memory tensor requires a sidecar");
             }
             if (tensor_sidecar.present && tensor_sidecar.desc.address_space != RemoteAddressSpace::HOST_INLINE) {
@@ -584,8 +584,8 @@ void Orchestrator::infer_deps(
             }
             if (!has_key) {
                 if (t.buffer.addr == 0) continue;  // null tensor — nothing to track
-                key = t.is_child_memory() ? TensorKey::local_child(t.buffer.addr, worker_id) :
-                                            TensorKey::local_host(t.buffer.addr);
+                key = t.is_device_memory() ? TensorKey::local_child(t.buffer.addr, worker_id) :
+                                             TensorKey::local_host(t.buffer.addr);
                 has_key = true;
             }
             TensorArgType tag = a.tag(i);

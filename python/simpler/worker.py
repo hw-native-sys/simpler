@@ -84,7 +84,7 @@ import cloudpickle
 from _task_interface import (  # pyright: ignore[reportMissingImports]
     MAX_REGISTERED_CALLABLE_IDS,
     RUNTIME_ENV_RING_COUNT,
-    TENSOR_CHILD_MEMORY_OFFSET,
+    TENSOR_ADDRESS_SPACE_OFFSET,
     WorkerType,
     _l3_child_onboard_region_close,
     _l3_child_onboard_region_create,
@@ -494,10 +494,11 @@ def _rewrite_blob_host_addrs(buf: memoryview, blob_off: int, ranges: list[tuple[
     ``buffer.addr`` (a parent VA) lands in a registered range, rewrite it in
     place to ``child_base + (addr - parent_lo)`` so the runtime dereferences the
     child's own mapping. Tensors outside every range (fork-inherited or
-    child-allocated) are left untouched. A ``child_memory`` tensor carries a
-    child-owned device pointer, never a host VA, so it is skipped even when its
-    address numerically falls inside a registered host range — rewriting it would
-    corrupt the device pointer. See _BLOB_TENSOR_STRIDE for the wire layout.
+    child-allocated) are left untouched. A device-memory tensor
+    (``address_space == DEVICE``) carries a child-owned device pointer, never a
+    host VA, so it is skipped even when its address numerically falls inside a
+    registered host range — rewriting it would corrupt the device pointer. See
+    _BLOB_TENSOR_STRIDE for the wire layout.
     """
     tensor_count = struct.unpack_from("<i", buf, blob_off)[0]
     if tensor_count <= 0:
@@ -505,7 +506,7 @@ def _rewrite_blob_host_addrs(buf: memoryview, blob_off: int, ranges: list[tuple[
     base = blob_off + _BLOB_HEADER_BYTES
     for i in range(tensor_count):
         addr_off = base + i * _BLOB_TENSOR_STRIDE
-        if buf[addr_off + TENSOR_CHILD_MEMORY_OFFSET]:
+        if buf[addr_off + TENSOR_ADDRESS_SPACE_OFFSET]:
             continue
         addr = struct.unpack_from("<Q", buf, addr_off)[0]
         for parent_lo, parent_hi, child_base in ranges:

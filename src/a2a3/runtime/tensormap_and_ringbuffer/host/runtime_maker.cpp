@@ -318,7 +318,7 @@ public:
         size_t required = 0;
         for (int i = 0; i < orch_args->tensor_count(); i++) {
             Tensor t = orch_args->tensor(i);
-            if (t.is_child_memory() || t.nbytes() == 0) {
+            if (t.is_device_memory() || t.nbytes() == 0) {
                 continue;
             }
             required += align_up(static_cast<size_t>(t.nbytes()));
@@ -534,7 +534,7 @@ static bool stage_device_args(
     for (int i = 0; i < tensor_count; i++) {
         Tensor t = orch_args->tensor(i);
 
-        if (t.is_child_memory()) {
+        if (t.is_device_memory()) {
             LOG_INFO_V0("  Tensor %d: child memory, pass-through (0x%" PRIx64 ")", i, t.buffer.addr);
             out->add_tensor(t);
             continue;

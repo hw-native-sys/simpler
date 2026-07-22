@@ -25,8 +25,8 @@ TEST(ChildMemory, TensorAbiSize) { EXPECT_EQ(sizeof(Tensor), 128u); }
 
 TEST(ChildMemory, DefaultIsZero) {
     Tensor t{};
-    EXPECT_EQ(t.child_memory, 0);
-    EXPECT_FALSE(t.is_child_memory());
+    EXPECT_EQ(t.address_space, AddressSpace::HOST);
+    EXPECT_FALSE(t.is_device_memory());
 }
 
 TEST(ChildMemory, SetChildMemory) {
@@ -35,9 +35,9 @@ TEST(ChildMemory, SetChildMemory) {
     t.shapes[0] = 16;
     t.ndims = 1;
     t.dtype = DataType::FLOAT32;
-    t.child_memory = 1;
+    t.address_space = AddressSpace::DEVICE;
 
-    EXPECT_TRUE(t.is_child_memory());
+    EXPECT_TRUE(t.is_device_memory());
     EXPECT_EQ(t.buffer.addr, 0xDEAD0000u);
     EXPECT_EQ(t.nbytes(), 16u * 4u);
 }
@@ -54,7 +54,7 @@ TEST(ChildMemory, BlobRoundtripPreservesChildMemory) {
     host_t.shapes[0] = 4;
     host_t.ndims = 1;
     host_t.dtype = DataType::FLOAT32;
-    host_t.child_memory = 0;
+    host_t.address_space = AddressSpace::HOST;
     args.add_tensor(host_t, TensorArgType::INPUT);
 
     Tensor dev_t{};
@@ -62,7 +62,7 @@ TEST(ChildMemory, BlobRoundtripPreservesChildMemory) {
     dev_t.shapes[0] = 8;
     dev_t.ndims = 1;
     dev_t.dtype = DataType::FLOAT16;
-    dev_t.child_memory = 1;
+    dev_t.address_space = AddressSpace::DEVICE;
     args.add_tensor(dev_t, TensorArgType::INPUT);
 
     args.add_scalar(42);
@@ -77,11 +77,11 @@ TEST(ChildMemory, BlobRoundtripPreservesChildMemory) {
     ASSERT_EQ(view.tensor_count, 2);
     ASSERT_EQ(view.scalar_count, 1);
 
-    EXPECT_EQ(view.tensors(0).child_memory, 0);
-    EXPECT_FALSE(view.tensors(0).is_child_memory());
+    EXPECT_EQ(view.tensors(0).address_space, AddressSpace::HOST);
+    EXPECT_FALSE(view.tensors(0).is_device_memory());
 
-    EXPECT_EQ(view.tensors(1).child_memory, 1);
-    EXPECT_TRUE(view.tensors(1).is_child_memory());
+    EXPECT_EQ(view.tensors(1).address_space, AddressSpace::DEVICE);
+    EXPECT_TRUE(view.tensors(1).is_device_memory());
     EXPECT_EQ(view.tensors(1).buffer.addr, 0x2000u);
 }
 
@@ -95,13 +95,13 @@ TEST(ChildMemory, ViewToChipStoragePreservesChildMemory) {
     tensors[0].shapes[0] = 1;
     tensors[0].ndims = 1;
     tensors[0].dtype = DataType::INT32;
-    tensors[0].child_memory = 0;
+    tensors[0].address_space = AddressSpace::HOST;
 
     tensors[1].buffer.addr = 0xB000;
     tensors[1].shapes[0] = 2;
     tensors[1].ndims = 1;
     tensors[1].dtype = DataType::INT32;
-    tensors[1].child_memory = 1;
+    tensors[1].address_space = AddressSpace::DEVICE;
 
     uint64_t scalars[] = {99};
     TaskArgsView view{2, 1, reinterpret_cast<const uint8_t *>(tensors), scalars};
@@ -109,8 +109,8 @@ TEST(ChildMemory, ViewToChipStoragePreservesChildMemory) {
     ChipStorageTaskArgs chip = view_to_chip_storage(view);
 
     ASSERT_EQ(chip.tensor_count(), 2);
-    EXPECT_FALSE(chip.tensor(0).is_child_memory());
-    EXPECT_TRUE(chip.tensor(1).is_child_memory());
+    EXPECT_FALSE(chip.tensor(0).is_device_memory());
+    EXPECT_TRUE(chip.tensor(1).is_device_memory());
     EXPECT_EQ(chip.tensor(1).buffer.addr, 0xB000u);
 }
 
@@ -129,7 +129,7 @@ TEST(ChildMemory, SkipLogicSimulation) {
     host_t.shapes[0] = 4;
     host_t.ndims = 1;
     host_t.dtype = DataType::FLOAT32;
-    host_t.child_memory = 0;
+    host_t.address_space = AddressSpace::HOST;
     args.add_tensor(host_t);
 
     Tensor dev_t{};
@@ -137,7 +137,7 @@ TEST(ChildMemory, SkipLogicSimulation) {
     dev_t.shapes[0] = 8;
     dev_t.ndims = 1;
     dev_t.dtype = DataType::FLOAT32;
-    dev_t.child_memory = 1;
+    dev_t.address_space = AddressSpace::DEVICE;
     args.add_tensor(dev_t);
 
     int malloc_count = 0;
@@ -145,7 +145,7 @@ TEST(ChildMemory, SkipLogicSimulation) {
 
     for (int i = 0; i < args.tensor_count(); i++) {
         Tensor t = args.tensor(i);
-        if (t.is_child_memory()) {
+        if (t.is_device_memory()) {
             passthrough_count++;
         } else {
             malloc_count++;

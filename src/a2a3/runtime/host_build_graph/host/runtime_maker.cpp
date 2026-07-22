@@ -731,7 +731,7 @@ extern "C" int bind_callable_to_runtime_impl(
     for (int i = 0; i < tensor_count; i++) {
         Tensor t = orch_args->tensor(i);
 
-        if (t.is_child_memory()) {
+        if (t.is_device_memory()) {
             LOG_INFO_V0("  Tensor %d: child memory, pass-through (0x%" PRIx64 ")", i, t.buffer.addr);
             device_args.add_tensor(t);
             continue;

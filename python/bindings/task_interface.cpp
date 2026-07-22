@@ -601,7 +601,7 @@ NB_MODULE(_task_interface, m) {
     // blob walker locates tensor i's fields at i * TENSOR_STRIDE_BYTES without
     // reimplementing the struct layout.
     m.attr("TENSOR_STRIDE_BYTES") = static_cast<int>(sizeof(Tensor));
-    m.attr("TENSOR_CHILD_MEMORY_OFFSET") = static_cast<int>(offsetof(Tensor, child_memory));
+    m.attr("TENSOR_ADDRESS_SPACE_OFFSET") = static_cast<int>(offsetof(Tensor, address_space));
 
     // --- Tensor ---
     // The unified strided tensor descriptor. Constructed contiguous via make()
@@ -622,7 +622,7 @@ NB_MODULE(_task_interface, m) {
                 // start_offset == 0, buffer.size == numel * element_size.
                 return make_tensor_external(
                     reinterpret_cast<void *>(static_cast<uintptr_t>(data)), shp, static_cast<uint32_t>(n), dtype,
-                    /*manual_dep=*/false, /*version=*/0, child_memory ? 1 : 0
+                    /*manual_dep=*/false, /*version=*/0, child_memory ? AddressSpace::DEVICE : AddressSpace::HOST
                 );
             },
             nb::arg("data"), nb::arg("shapes"), nb::arg("dtype"), nb::arg("child_memory") = false,
@@ -667,7 +667,7 @@ NB_MODULE(_task_interface, m) {
                 // Re-establish a contiguous layout over the same buffer base.
                 self.init_external(
                     reinterpret_cast<void *>(self.buffer.addr), numel * get_element_size(self.dtype), shp,
-                    static_cast<uint32_t>(n), self.dtype, self.version, self.manual_dep, self.child_memory
+                    static_cast<uint32_t>(n), self.dtype, self.version, self.manual_dep, self.address_space
                 );
             }
         )
@@ -696,10 +696,10 @@ NB_MODULE(_task_interface, m) {
         .def_prop_rw(
             "child_memory",
             [](const Tensor &self) -> bool {
-                return self.is_child_memory();
+                return self.is_device_memory();
             },
             [](Tensor &self, bool v) {
-                self.child_memory = v ? 1 : 0;
+                self.address_space = v ? AddressSpace::DEVICE : AddressSpace::HOST;
             }
         )
 
@@ -742,7 +742,7 @@ NB_MODULE(_task_interface, m) {
                 os << self.shapes[i];
             }
             os << "), dtype=" << get_dtype_name(self.dtype);
-            if (self.is_child_memory()) os << ", child_memory=True";
+            if (self.is_device_memory()) os << ", child_memory=True";
             os << ")";
             return os.str();
         });

@@ -354,7 +354,7 @@ std::vector<uint8_t> encode_tensor(const Tensor &tensor) {
         put_u32(out, shape);
     put_u32(out, tensor.ndims);
     put_u32(out, static_cast<uint32_t>(tensor.dtype));
-    put_u8(out, tensor.child_memory);
+    put_u8(out, static_cast<uint8_t>(tensor.address_space));
     for (int i = 0; i < 7; ++i)
         put_u8(out, 0);
     return out;
@@ -370,15 +370,15 @@ Tensor decode_tensor(const uint8_t *data, size_t size, size_t &offset, bool remo
     ensure(ndims > 0 && ndims <= MAX_TENSOR_DIMS, "remote_wire: tensor ndims out of range");
     uint32_t dtype = get_u32(data, size, offset);
     ensure(valid_dtype(dtype), "remote_wire: unknown tensor dtype");
-    uint8_t child_memory = get_u8(data, size, offset);
-    ensure(child_memory == 0 || child_memory == 1, "remote_wire: tensor child_memory must be 0 or 1");
+    uint8_t address_space = get_u8(data, size, offset);
+    ensure(address_space == 0 || address_space == 1, "remote_wire: tensor address_space must be 0 or 1");
     for (int i = 0; i < 7; ++i) {
         ensure(get_u8(data, size, offset) == 0, "remote_wire: Tensor reserved bytes must be zero");
     }
     // Reconstruct a contiguous external Tensor (owner=invalid, row-major strides).
     return make_tensor_external(
         reinterpret_cast<void *>(addr), shapes, ndims, static_cast<DataType>(dtype), /*manual_dep=*/false,
-        /*version=*/0, child_memory
+        /*version=*/0, static_cast<AddressSpace>(address_space)
     );
 }
 

@@ -649,7 +649,7 @@ remote_l3::TaskPayloadWire RemoteL3Endpoint::build_task_payload(const TaskSlotSt
         if (tensor.buffer.addr != 0 && !tensor_sidecar.present) {
             throw std::runtime_error("RemoteL3Endpoint::run: bare host pointer submitted without remote sidecar");
         }
-        if (tensor.is_child_memory() && !tensor_sidecar.present) {
+        if (tensor.is_device_memory() && !tensor_sidecar.present) {
             throw std::runtime_error("RemoteL3Endpoint::run: child-memory tensor submitted without remote sidecar");
         }
         if (!tensor_sidecar.present && tensor.nbytes() != 0) {
