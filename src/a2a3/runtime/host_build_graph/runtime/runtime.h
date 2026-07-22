@@ -314,6 +314,23 @@ public:
     // garbage, identical to host_api above. No fixed cap — grows with the
     // chip-level entry-tensor count.
     std::vector<TensorPair> tensor_pairs_;
+
+    // Host-build-graph runs orchestration before the device collector starts.
+    // Preserve its host-clock envelope and per-submit records here, then hand
+    // both to the collector during DeviceRunner::run. These fields are
+    // host-only like tensor_pairs_. Keep them in the ABI even when a
+    // translation unit is built without DFX:
+    // platform and runtime objects are compiled with different profiling
+    // defines but share this placement-new'd Runtime object.
+    std::vector<L2SwimlaneAicpuOrchPhaseRecord> host_orch_phase_records_;
+    uint64_t host_orch_start_cycles_{0};
+    uint64_t host_orch_end_cycles_{0};
+
+    const std::vector<L2SwimlaneAicpuOrchPhaseRecord> &get_host_orch_phase_records() const {
+        return host_orch_phase_records_;
+    }
+    uint64_t get_host_orch_start_cycles() const { return host_orch_start_cycles_; }
+    uint64_t get_host_orch_end_cycles() const { return host_orch_end_cycles_; }
 };
 
 // Number of bytes of the Runtime image that must be copied to the device.

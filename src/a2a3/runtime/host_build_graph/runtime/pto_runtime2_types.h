@@ -160,6 +160,13 @@ struct PTO2TaskAllocResult {
     bool failed() const { return task_id < 0; }
 };
 
+enum class PTO2TaskKind : uint8_t {
+    KERNEL = 0,
+    DUMMY = 1,
+    GRAPH = 2,
+    GRAPH_NODE = 3,
+};
+
 struct PTO2OutputLayout {
     uint64_t offsets[MAX_TENSOR_ARGS] = {};
     uint64_t buffer_sizes[MAX_TENSOR_ARGS] = {};
@@ -219,12 +226,18 @@ struct PTO2TaskDescriptor {
     // Packed output buffer (all outputs packed into single contiguous buffer)
     void *packed_buffer_base;  // Start of packed buffer in GM Heap
     void *packed_buffer_end;   // End of packed buffer (for heap reclamation)
+
+    // Ordinary tasks leave these fields null/-1. A Graph task points at the
+    // separately uploaded GraphExecution block; scheduler-owned Graph nodes
+    // point at the same block and carry their immutable topological index.
+    void *graph_execution{nullptr};
+    int32_t graph_node_index{-1};
+    PTO2TaskKind kind{PTO2TaskKind::KERNEL};
 };
 
-// task_timing_slot must occupy the former padding after kernel_id[3] without
-// growing the descriptor or shifting packed_buffer_base — the scheduler and
-// shared-memory ABI depend on the existing size and pointer offset.
-static_assert(sizeof(PTO2TaskDescriptor) == 40, "PTO2TaskDescriptor must not grow: slot uses the existing pad");
+// task_timing_slot retains its established location. Graph metadata follows
+// the original descriptor prefix so AICore payload consumers keep the same
+// offsets for task identity, kernels, timing and packed buffers.
 static_assert(
     offsetof(PTO2TaskDescriptor, task_timing_slot) ==
         offsetof(PTO2TaskDescriptor, kernel_id) + sizeof(int32_t) * PTO2_SUBTASK_SLOT_COUNT,

@@ -117,6 +117,8 @@ PTO2SchedulerLayout PTO2SchedulerState::reserve_layout(DeviceArena &arena, int32
         layout.off_ready_sync_queue_slots[i] = ready_queue_reserve_layout(arena, PTO2_READY_QUEUE_SIZE);
     }
     layout.off_dummy_ready_queue_slots = ready_queue_reserve_layout(arena, PTO2_READY_QUEUE_SIZE);
+    layout.off_graph_ready_queue_slots = ready_queue_reserve_layout(arena, PTO2_READY_QUEUE_SIZE);
+    layout.off_graph_prepare_queue_slots = ready_queue_reserve_layout(arena, PTO2_READY_QUEUE_SIZE);
     for (int i = 0; i < PTO2_NUM_RESOURCE_SHAPES; i++) {
         layout.off_early_dispatch_queue_slots[i] = ready_queue_reserve_layout(arena, PTO2_EARLY_DISPATCH_QUEUE_SIZE);
     }
@@ -162,6 +164,14 @@ bool PTO2SchedulerState::init_data_from_layout(
         )) {
         return false;
     }
+    if (!ready_queue_init_data_from_layout(
+            &sched->graph_ready_queue, arena, layout.off_graph_ready_queue_slots, layout.ready_queue_capacity
+        ) ||
+        !ready_queue_init_data_from_layout(
+            &sched->graph_prepare_queue, arena, layout.off_graph_prepare_queue_slots, layout.ready_queue_capacity
+        )) {
+        return false;
+    }
     for (int i = 0; i < PTO2_NUM_RESOURCE_SHAPES; i++) {
         if (!ready_queue_init_data_from_layout(
                 &sched->early_dispatch_queues[i], arena, layout.off_early_dispatch_queue_slots[i],
@@ -194,6 +204,8 @@ void PTO2SchedulerState::wire_arena_pointers(const PTO2SchedulerLayout &layout, 
         ready_queue_wire_arena_pointers(&sched->ready_sync_queues[i], arena, layout.off_ready_sync_queue_slots[i]);
     }
     ready_queue_wire_arena_pointers(&sched->dummy_ready_queue, arena, layout.off_dummy_ready_queue_slots);
+    ready_queue_wire_arena_pointers(&sched->graph_ready_queue, arena, layout.off_graph_ready_queue_slots);
+    ready_queue_wire_arena_pointers(&sched->graph_prepare_queue, arena, layout.off_graph_prepare_queue_slots);
     for (int i = 0; i < PTO2_NUM_RESOURCE_SHAPES; i++) {
         ready_queue_wire_arena_pointers(
             &sched->early_dispatch_queues[i], arena, layout.off_early_dispatch_queue_slots[i]
@@ -215,6 +227,8 @@ void PTO2SchedulerState::destroy() {
         ready_queue_destroy(&sched->ready_sync_queues[i]);
     }
     ready_queue_destroy(&sched->dummy_ready_queue);
+    ready_queue_destroy(&sched->graph_ready_queue);
+    ready_queue_destroy(&sched->graph_prepare_queue);
     for (int i = 0; i < PTO2_NUM_RESOURCE_SHAPES; i++) {
         ready_queue_destroy(&sched->early_dispatch_queues[i]);
     }
@@ -398,6 +412,7 @@ PTO2Runtime *runtime_init_data_from_layout(
     rt->gm_heap_size = total_heap_size;
     rt->gm_heap_owned = false;
     rt->total_cycles = 0;
+    rt->active_callable_hash = 0;
 
     if (!rt->orchestrator.init_data_from_layout(
             layout.orch, arena, sm_dev_base, gm_heap_dev_base, heap_sizes[0], layout.task_window_sizes[0]

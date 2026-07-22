@@ -204,10 +204,11 @@ void SchedulerContext::complete_slot_task(
         // counter side-effects (g_sched_*_atomic_count[thread_idx], consumed
         // by the otc_* log lines). It returns CompletionStats whose
         // `fanout_edges` is the consumer-walk count.
-        consumers_resolved = sched_->on_task_complete(slot_state, thread_idx).fanout_edges;
+        PTO2SchedulerState::TaskCompletionOutcome outcome = sched_->complete_task(slot_state, thread_idx);
 #else
-        consumers_resolved = sched_->on_task_complete(slot_state);
+        PTO2SchedulerState::TaskCompletionOutcome outcome = sched_->complete_task(slot_state);
 #endif
+        consumers_resolved = outcome.fanout_edges;
 #if SIMPLER_DFX
         if (resolve_t0 != 0) {
             uint64_t resolve_t1 = get_sys_cnt_aicpu();
@@ -240,7 +241,7 @@ void SchedulerContext::complete_slot_task(
             }
             deferred_release_slot_states[deferred_release_count++] = &slot_state;
         }
-        completed_this_turn++;
+        completed_this_turn += outcome.stream_tasks_completed;
     }
 
 #if SIMPLER_DFX

@@ -29,6 +29,7 @@
 // Runtime headers (full struct definition for create/destroy + PTO2_SCOPE)
 #include "pto_runtime2.h"
 #include "pto_runtime2_types.h"
+#include "pto_graph_execution.h"
 #include "pto_shared_memory.h"
 
 // Performance profiling headers
@@ -321,6 +322,10 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
         if (rt != nullptr) {
             // Clear g_current_runtime in this DSO before destroying rt.
             framework_bind_runtime(nullptr);
+            // Graph nodes are expanded into AICPU-local storage.  Reclaim all
+            // completed executions into the bounded graph-affine pool before
+            // the HBM submission descriptors for this run are released.
+            pto2_graph_execution_collect_retired();
             runtime_destroy(rt, runtime_arena_);
             rt = nullptr;
         }

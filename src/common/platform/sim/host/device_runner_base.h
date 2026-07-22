@@ -127,7 +127,8 @@ public:
     // header). Returns 0 on success, non-zero on failure.
     int bind_callable_to_runtime(
         Runtime &runtime, int32_t callable_id, const HostApi *api, const void *orch_args,
-        const uint64_t *ring_task_window, const uint64_t *ring_heap, const uint64_t *ring_dep_pool
+        const uint64_t *ring_task_window, const uint64_t *ring_heap, const uint64_t *ring_dep_pool,
+        int32_t l2_swimlane_level
     );
     uint64_t upload_chip_callable_buffer(const ChipCallable *callable);
     int release_chip_callable_buffer(uint64_t hash);

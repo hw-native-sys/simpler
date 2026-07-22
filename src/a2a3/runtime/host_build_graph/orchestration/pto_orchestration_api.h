@@ -34,6 +34,7 @@
 
 // Type headers needed by orchestration
 #include "common.h"              // framework_bind_runtime / framework_current_runtime
+#include "pto_graph_cache.h"     // Graph Execution key and result helpers
 #include "pto_runtime2_types.h"  // PTO2_ERROR_*
 #include "pto_submit_types.h"    // MixedKernels, INVALID_KERNEL_ID, subtask slots
 #include "pto_types.h"           // Arg, TaskOutputTensors, TensorArgType
@@ -86,6 +87,8 @@ typedef struct PTO2RuntimeOps {
     );
     TaskOutputTensors (*alloc_tensors)(PTO2Runtime *rt, const L0TaskArgs &args);
     TaskOutputTensors (*submit_dummy_task)(PTO2Runtime *rt, const L0TaskArgs &args);
+    PTO2GraphScopeResult (*graph_begin)(PTO2Runtime *rt, uint64_t graph_key, const L2TaskArgs &args);
+    void (*graph_end)(PTO2Runtime *rt);
 
     // Stash the call-site of the next PTO2ScopeGuard so the [ScopeStats]
     // collector can log it. Always present to keep ops-table layout stable
@@ -201,6 +204,22 @@ static inline TaskOutputTensors rt_submit_dummy_task(const L0TaskArgs &args) {
         return TaskOutputTensors{};
     }
     return rt->ops->submit_dummy_task(rt, args);
+}
+
+static inline PTO2GraphScopeResult rt_graph_begin(uint64_t graph_key, const L2TaskArgs &args) {
+    PTO2Runtime *rt = current_runtime();
+    if (rt->ops->is_fatal(rt) || rt->ops->graph_begin == nullptr) {
+        return PTO2GraphScopeResult{};
+    }
+    return rt->ops->graph_begin(rt, graph_key, args);
+}
+
+static inline void rt_graph_end() {
+    PTO2Runtime *rt = current_runtime();
+    if (rt->ops->is_fatal(rt) || rt->ops->graph_end == nullptr) {
+        return;
+    }
+    rt->ops->graph_end(rt);
 }
 
 static inline void rt_scope_begin(PTO2ScopeMode mode = PTO2ScopeMode::AUTO) {
@@ -346,6 +365,39 @@ public:
 private:
     PTO2Runtime *rt_;
 };
+
+// Define or submit a Graph Execution. On a cache miss the function executes
+// normally and its sub-DAG is recorded. On a hit the function is skipped and
+// one Graph task is submitted; Scheduler expands the cached topology with the
+// current invocation's L2TaskArgs.
+using PTO2GraphFunction = void (*)(const L2TaskArgs &);
+
+static inline uint64_t rt_graph_function_id(PTO2GraphFunction function) {
+    static_assert(sizeof(function) <= sizeof(uint64_t), "Graph function pointer must fit in a 64-bit identity");
+    uint64_t function_id = 0;
+    memcpy(&function_id, &function, sizeof(function));
+    return function_id;
+}
+
+static inline PTO2GraphSubmitResult
+rt_submit_graph(uint64_t graph_id, PTO2GraphFunction function, const L2TaskArgs &args) {
+    if (!rt_graph_args_cacheable(args)) {
+        if (function != nullptr) function(args);
+        return PTO2GraphSubmitResult{};
+    }
+    PTO2GraphScopeResult result = rt_graph_begin(rt_graph_make_key(graph_id, args), args);
+    if (result.execute_block && function != nullptr) {
+        function(args);
+    }
+    if (result.recording) {
+        rt_graph_end();
+    }
+    return result;
+}
+
+static inline PTO2GraphSubmitResult rt_submit_graph(PTO2GraphFunction function, const L2TaskArgs &args) {
+    return rt_submit_graph(rt_graph_function_id(function), function, args);
+}
 
 #define _PTO2_CONCATENATE_IMPL(x, y) x##y
 #define _PTO2_CONCATENATE(x, y) _PTO2_CONCATENATE_IMPL(x, y)

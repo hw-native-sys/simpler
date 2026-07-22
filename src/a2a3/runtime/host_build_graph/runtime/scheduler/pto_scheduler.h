@@ -36,6 +36,7 @@
 #include "utils/device_arena.h"
 #include "aicpu/platform_regs.h"  // get_reg_ptr / RegId for the early-dispatch doorbell
 #include "pto_async_wait.h"
+#include "pto_graph_execution.h"
 #include "pto_ring_buffer.h"
 #include "pto_runtime2_types.h"
 #include "pto_shared_memory.h"
@@ -417,6 +418,8 @@ struct PTO2SchedulerLayout {
     size_t off_ready_queue_slots[PTO2_NUM_RESOURCE_SHAPES];
     size_t off_ready_sync_queue_slots[PTO2_NUM_RESOURCE_SHAPES];
     size_t off_dummy_ready_queue_slots;
+    size_t off_graph_ready_queue_slots;
+    size_t off_graph_prepare_queue_slots;
     size_t off_early_dispatch_queue_slots[PTO2_NUM_RESOURCE_SHAPES];
     size_t off_early_sync_start_queue_slots;
     size_t off_dep_pool_entries;
@@ -486,6 +489,12 @@ struct PTO2SchedulerState {
     // the dispatch loop and completed inline -- never goes to AICore.
     PTO2ReadyQueue dummy_ready_queue;
 
+    // Graph outer tasks are scheduler control work. Preparation expands the
+    // immutable definition in bounded slices; activation remains gated by the
+    // outer task's external dependencies.
+    PTO2ReadyQueue graph_ready_queue;
+    PTO2ReadyQueue graph_prepare_queue;
+
     alignas(64) AsyncWaitList async_wait_list;
 
     // Statistics (cold path, isolated from hot-path fields)
@@ -503,6 +512,10 @@ struct PTO2SchedulerState {
     // the per-shape ready_sync_queues[] (drained as Tier-0); everything else to
     // ready_queues[].
     void push_ready_routed(PTO2TaskSlotState *slot_state) {
+        if (slot_state->task != nullptr && slot_state->task->kind == PTO2TaskKind::GRAPH) {
+            graph_ready_queue.push(slot_state);
+            return;
+        }
         PTO2ResourceShape shape = slot_state->active_mask.to_shape();
         if (shape == PTO2ResourceShape::DUMMY ||
             (slot_state->active_mask.has_predicate() && !slot_state->payload->predicate.pass())) {
@@ -907,6 +920,11 @@ struct PTO2SchedulerState {
     bool route_ready_once(PTO2TaskSlotState &slot_state, EarlyDispatchReleaseSink *sink = nullptr) {
         if (!try_claim_ready_once(slot_state)) return false;
 
+        if (slot_state.task != nullptr && slot_state.task->kind == PTO2TaskKind::GRAPH) {
+            graph_ready_queue.push(&slot_state);
+            return true;
+        }
+
         // Early-dispatch: pre-staged tasks are released by doorbell
         // here, skipping the ready-queue round-trip entirely.
         bool early_handled = try_early_dispatch_release(slot_state, sink);
@@ -946,6 +964,11 @@ struct PTO2SchedulerState {
                 break;
             }
             atomic_count += 1;  // failed lifecycle_flags CAS
+        }
+
+        if (slot_state.task != nullptr && slot_state.task->kind == PTO2TaskKind::GRAPH) {
+            graph_ready_queue.push(&slot_state, atomic_count, push_wait);
+            return true;
         }
 
         // Early-dispatch: pre-staged tasks are released by doorbell
@@ -1028,6 +1051,49 @@ struct PTO2SchedulerState {
 #endif
     }
 
+    struct TaskCompletionOutcome {
+        uint32_t fanout_edges{0};
+        int32_t stream_tasks_completed{0};
+    };
+
+    TaskCompletionOutcome complete_task(
+        PTO2TaskSlotState &slot_state
+#if SIMPLER_SCHED_PROFILING
+        ,
+        int thread_idx
+#endif
+    ) {
+        TaskCompletionOutcome outcome;
+#if SIMPLER_SCHED_PROFILING
+        CompletionStats stats = on_task_complete(slot_state, thread_idx);
+        outcome.fanout_edges = static_cast<uint32_t>(stats.fanout_edges);
+#else
+        outcome.fanout_edges = on_task_complete(slot_state);
+#endif
+        if (slot_state.task == nullptr || slot_state.task->kind != PTO2TaskKind::GRAPH_NODE) {
+            outcome.stream_tasks_completed = 1;
+            return outcome;
+        }
+
+        PTO2GraphExecution *execution = pto2_graph_execution_from_task(*slot_state.task);
+        if (execution == nullptr || !pto2_graph_execution_complete_node(*execution)) return outcome;
+
+        PTO2TaskSlotState *outer = execution->outer_slot;
+        if (outer != nullptr) {
+#if SIMPLER_SCHED_PROFILING
+            CompletionStats outer_stats = on_task_complete(*outer, thread_idx);
+            outcome.fanout_edges += static_cast<uint32_t>(outer_stats.fanout_edges);
+            (void)on_task_release(*outer, thread_idx);
+#else
+            outcome.fanout_edges += on_task_complete(*outer);
+            (void)on_task_release(*outer);
+#endif
+            outcome.stream_tasks_completed = 1;
+        }
+        pto2_graph_execution_mark_completed(*execution);
+        return outcome;
+    }
+
     /**
      * Subtask completion: atomic counter model.
      * Called when a single subtask (AIC, AIV0, or AIV1) finishes on any block.
@@ -1039,6 +1105,52 @@ struct PTO2SchedulerState {
     bool on_subtask_complete(PTO2TaskSlotState &slot_state) {
         int16_t prev = slot_state.completed_subtasks.fetch_add(1, std::memory_order_acq_rel);
         return (prev + 1) == slot_state.total_required_subtasks;
+    }
+
+    int32_t activate_prepared_graph_task(PTO2GraphExecution &execution) {
+        if (!pto2_graph_execution_activate(execution)) return 0;
+        int32_t roots = 0;
+        for (int32_t i = 0; i < execution.topology.root_count; ++i) {
+            uint16_t node_index = execution.topology.root_indices[i];
+            if (node_index >= execution.node_count) continue;
+            route_ready_once(execution.nodes[node_index].slot);
+            roots++;
+        }
+        return roots;
+    }
+
+    PTO2GraphMaterializeResult prepare_graph_task(
+        PTO2TaskSlotState &outer_slot, int32_t max_nodes = PTO2_GRAPH_MATERIALIZE_SLICE_NODES,
+        int32_t *nodes_materialized = nullptr
+    ) {
+        if (outer_slot.task == nullptr || outer_slot.task->kind != PTO2TaskKind::GRAPH) {
+            return PTO2GraphMaterializeResult::INVALID;
+        }
+        PTO2GraphSubmission *submission = pto2_graph_submission_from_task(*outer_slot.task);
+        if (submission == nullptr) return PTO2GraphMaterializeResult::INVALID;
+        PTO2GraphExecution *execution = pto2_graph_execution_localize(outer_slot);
+        if (execution == nullptr) return PTO2GraphMaterializeResult::INVALID;
+
+        PTO2GraphMaterializeResult result =
+            pto2_graph_execution_materialize_slice(outer_slot, *execution, max_nodes, nodes_materialized);
+        PTO2GraphExecutionState state = execution->state.load(std::memory_order_acquire);
+        if (result == PTO2GraphMaterializeResult::PREPARED && state == PTO2GraphExecutionState::PREPARED &&
+            submission->activation_requested.load(std::memory_order_acquire) != 0) {
+            activate_prepared_graph_task(*execution);
+        }
+        return result;
+    }
+
+    int32_t activate_graph_task(PTO2TaskSlotState &outer_slot) {
+        if (outer_slot.task == nullptr || outer_slot.task->kind != PTO2TaskKind::GRAPH) return 0;
+        PTO2GraphSubmission *submission = pto2_graph_submission_from_task(*outer_slot.task);
+        if (submission == nullptr) return 0;
+
+        submission->activation_requested.store(1, std::memory_order_release);
+        PTO2GraphExecution *execution = submission->local_execution.load(std::memory_order_acquire);
+        if (execution == nullptr) return 0;
+        if (execution->state.load(std::memory_order_acquire) != PTO2GraphExecutionState::PREPARED) return 0;
+        return activate_prepared_graph_task(*execution);
     }
 
     /**
@@ -1078,14 +1190,20 @@ struct PTO2SchedulerState {
         PTO2_SCHED_CYCLE_START();
 #endif
 
+        const bool graph_node = slot_state.task != nullptr && slot_state.task->kind == PTO2TaskKind::GRAPH_NODE;
+        PTO2DepListEntry *current = nullptr;
+        if (graph_node) {
+            slot_state.mark_completed();
+        } else {
 #if SIMPLER_SCHED_PROFILING
-        slot_state.lock_fanout(lock_atomics, lock_wait);
+            slot_state.lock_fanout(lock_atomics, lock_wait);
 #else
-        slot_state.lock_fanout();
+            slot_state.lock_fanout();
 #endif
-        slot_state.mark_completed();
-        PTO2DepListEntry *current = slot_state.fanout_head;  // Protected by fanout_lock
-        slot_state.unlock_fanout();
+            slot_state.mark_completed();
+            current = slot_state.fanout_head;  // Protected by fanout_lock
+            slot_state.unlock_fanout();
+        }
 
 #if SIMPLER_SCHED_PROFILING
         lock_atomics += 3;  // task_state.store + lifecycle_flags.fetch_or + unlock.store
@@ -1114,8 +1232,7 @@ struct PTO2SchedulerState {
         // below; their dispatch_fanin propagation is collected here and replayed
         // after the walk, so no consumer's doorbell waits on a sibling's propagate.
         EarlyDispatchReleaseSink rel_sink;
-        while (current != nullptr) {
-            PTO2TaskSlotState &consumer_slot = *current->slot_state;
+        auto release_consumer = [&](PTO2TaskSlotState &consumer_slot) {
 #if SIMPLER_SCHED_PROFILING
             stats.fanout_edges++;
             if (release_fanin_and_check_ready(consumer_slot, fanout_atomics, push_wait, &rel_sink)) {
@@ -1125,7 +1242,26 @@ struct PTO2SchedulerState {
             consumer_walk_count++;
             release_fanin_and_check_ready(consumer_slot, &rel_sink);
 #endif
-            current = current->next;
+        };
+        if (graph_node) {
+            PTO2GraphExecution *execution = pto2_graph_execution_from_task(*slot_state.task);
+            int32_t node_index = slot_state.task->graph_node_index;
+            if (execution != nullptr && execution->nodes != nullptr && node_index >= 0 &&
+                node_index < execution->node_count) {
+                uint32_t begin = execution->topology.fanout_offsets[node_index];
+                uint32_t end = execution->topology.fanout_offsets[node_index + 1];
+                for (uint32_t edge = begin; edge < end; ++edge) {
+                    uint16_t consumer_index = execution->topology.fanout_indices[edge];
+                    if (consumer_index < execution->node_count) {
+                        release_consumer(execution->nodes[consumer_index].slot);
+                    }
+                }
+            }
+        } else {
+            while (current != nullptr) {
+                release_consumer(*current->slot_state);
+                current = current->next;
+            }
         }
         for (int i = 0; i < rel_sink.n; i++) {
             propagate_dispatch_fanin(*rel_sink.items[i]);
@@ -1155,6 +1291,14 @@ struct PTO2SchedulerState {
 #else
     int32_t on_task_release(PTO2TaskSlotState &slot_state) {
 #endif
+        if (slot_state.task != nullptr && slot_state.task->kind == PTO2TaskKind::GRAPH_NODE) {
+            PTO2GraphExecution *execution = pto2_graph_execution_from_task(*slot_state.task);
+            if (execution != nullptr) pto2_graph_execution_retire_node(*execution);
+#if SIMPLER_SCHED_PROFILING
+            g_sched_complete_count[thread_idx]++;
+#endif
+            return 0;
+        }
         PTO2TaskPayload *payload = slot_state.payload;
         for_each_fanin_slot_state(*payload, [&](PTO2TaskSlotState *producer_slot_state) {
 #if SIMPLER_SCHED_PROFILING
@@ -1222,9 +1366,9 @@ AsyncWaitList::try_inline_complete_locked(AsyncWaitList::DrainCompletionSink &si
     // Return value (CompletionStats / consumer-walk count) discarded:
     // async-wait drain path has no Resolve swimlane bar attached.
 #if SIMPLER_SCHED_PROFILING
-    (void)sink.sched->on_task_complete(slot_state, sink.thread_idx);
+    PTO2SchedulerState::TaskCompletionOutcome outcome = sink.sched->complete_task(slot_state, sink.thread_idx);
 #else
-    (void)sink.sched->on_task_complete(slot_state);
+    PTO2SchedulerState::TaskCompletionOutcome outcome = sink.sched->complete_task(slot_state);
 #endif
     if (*sink.deferred_release_count >= sink.deferred_release_capacity) {
         while (*sink.deferred_release_count > 0) {
@@ -1238,7 +1382,7 @@ AsyncWaitList::try_inline_complete_locked(AsyncWaitList::DrainCompletionSink &si
         }
     }
     sink.deferred_release_slot_states[(*sink.deferred_release_count)++] = &slot_state;
-    sink.inline_completed++;
+    sink.inline_completed += outcome.stream_tasks_completed;
     return true;
 }
 
@@ -1303,9 +1447,9 @@ inline AsyncPollResult AsyncWaitList::poll_and_complete(
             // Return value (CompletionStats / consumer-walk count) discarded:
             // deferred-completion drain has no Resolve swimlane bar attached.
 #if SIMPLER_SCHED_PROFILING
-            (void)sched->on_task_complete(*entry.slot_state, thread_idx);
+            PTO2SchedulerState::TaskCompletionOutcome outcome = sched->complete_task(*entry.slot_state, thread_idx);
 #else
-            (void)sched->on_task_complete(*entry.slot_state);
+            PTO2SchedulerState::TaskCompletionOutcome outcome = sched->complete_task(*entry.slot_state);
 #endif
             // Drain deferred_release in place when the buffer fills — same
             // overflow-drain idiom used by complete_slot_task's inline path
@@ -1322,7 +1466,7 @@ inline AsyncPollResult AsyncWaitList::poll_and_complete(
                 }
             }
             deferred_release_slot_states[deferred_release_count++] = entry.slot_state;
-            result.completed++;
+            result.completed += outcome.stream_tasks_completed;
 
             int32_t last = count - 1;
             if (i != last) entries[i] = entries[last];

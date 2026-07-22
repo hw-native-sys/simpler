@@ -408,6 +408,11 @@ public:
      */
     void set_core_types(const CoreType *types, int n);
 
+    /** Attach host-build-graph orchestration timing captured before initialize(). */
+    void set_host_orch_records(
+        const std::vector<L2SwimlaneAicpuOrchPhaseRecord> &records, uint64_t host_start_cycles, uint64_t host_end_cycles
+    );
+
     /**
      * Export collected records as a Chrome Trace Event JSON (swimlane view).
      * Writes <output_prefix>/l2_swimlane_records.json — directory is captured at
@@ -529,6 +534,12 @@ private:
     // orch records (kind-tagged at routing time; no parse-time discrimination).
     std::vector<std::vector<L2SwimlaneAicpuSchedPhaseRecord>> collected_sched_phase_records_;
     std::vector<std::vector<L2SwimlaneAicpuOrchPhaseRecord>> collected_orch_phase_records_;
+
+    // Host and AICPU clocks do not share an epoch.  These records stay in a
+    // separate stream and the converter aligns host-orch end to device t=0.
+    std::vector<L2SwimlaneAicpuOrchPhaseRecord> host_orch_phase_records_;
+    uint64_t host_orch_start_cycles_{0};
+    uint64_t host_orch_end_cycles_{0};
 
     // Core-to-thread mapping (core_id → scheduler thread index, -1 = unassigned)
     std::vector<int8_t> core_to_thread_;

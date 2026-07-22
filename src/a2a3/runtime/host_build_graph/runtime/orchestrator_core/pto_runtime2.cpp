@@ -78,6 +78,15 @@ static TaskOutputTensors submit_dummy_task_impl(PTO2Runtime *rt, const L0TaskArg
     return rt->orchestrator.submit_dummy_task(args);
 }
 
+static PTO2GraphScopeResult graph_begin_impl(PTO2Runtime *rt, uint64_t graph_key, const L2TaskArgs &args) {
+    if (rt == nullptr) return PTO2GraphScopeResult{};
+    return rt->orchestrator.graph_begin(graph_key, args, rt->active_callable_hash);
+}
+
+static void graph_end_impl(PTO2Runtime *rt) {
+    if (rt != nullptr) rt->orchestrator.graph_end();
+}
+
 void rt_scope_begin(PTO2Runtime *rt) {
     PTO2ScopeMode mode = rt->pending_scope_mode;
     rt->pending_scope_mode = PTO2ScopeMode::AUTO;
@@ -295,6 +304,8 @@ static const PTO2RuntimeOps s_runtime_ops = {
     .set_tensor_data = set_tensor_data,
     .alloc_tensors = alloc_tensors_impl,
     .submit_dummy_task = submit_dummy_task_impl,
+    .graph_begin = graph_begin_impl,
+    .graph_end = graph_end_impl,
 #if SIMPLER_DFX
     .scope_set_site = scope_set_site_impl,
 #else

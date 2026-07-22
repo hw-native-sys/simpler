@@ -308,6 +308,15 @@ public:
     // runtime_maker.cpp from orch_args at bind time, then iterated in
     // validate_runtime_impl. Host-only (after `dev`): never uploaded.
     std::vector<TensorLease> tensor_leases_;
+
+    // Shared platform DFX accessors. TRB orchestration runs on AICPU and has no
+    // host-clock envelope, so these return an empty stream.
+    const std::vector<L2SwimlaneAicpuOrchPhaseRecord> &get_host_orch_phase_records() const {
+        static const std::vector<L2SwimlaneAicpuOrchPhaseRecord> empty;
+        return empty;
+    }
+    uint64_t get_host_orch_start_cycles() const { return 0; }
+    uint64_t get_host_orch_end_cycles() const { return 0; }
 };
 
 // `dev` must be the first member so the narrowed H2D copy starts at offset 0.

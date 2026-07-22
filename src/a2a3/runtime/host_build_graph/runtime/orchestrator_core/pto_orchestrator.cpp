@@ -27,11 +27,17 @@
 #include <string.h>
 #include <time.h>
 
+#include <algorithm>
+#include <atomic>
+#include <new>
+#include <type_traits>
+
 #include "aicpu/dep_gen_collector_aicpu.h"
 #include "common/dep_gen.h"
 #include "common/platform_config.h"
 #include "common/unified_log.h"
 #include "pto_dep_compute.h"
+#include "pto_graph_execution.h"
 #include "pto_runtime2_types.h"
 #include "pto_shared_memory.h"
 #include "pto_tensormap.h"
@@ -88,6 +94,26 @@ __attribute__((weak, visibility("hidden"))) volatile uint32_t *get_reg_ptr(uint6
 // =============================================================================
 // Orchestrator Profiling (compile-time toggle)
 // =============================================================================
+#if SIMPLER_DFX
+namespace {
+void record_host_orch_phase(
+    PTO2OrchestratorState *orch, uint64_t start_time, uint64_t end_time, uint64_t task_id, uint32_t submit_idx
+) {
+    if (orch == nullptr || orch->host_orch_phase_records == nullptr ||
+        orch->host_orch_phase_count >= orch->host_orch_phase_capacity) {
+        return;
+    }
+    auto &record = orch->host_orch_phase_records[orch->host_orch_phase_count++];
+    record.start_time = start_time;
+    record.end_time = end_time;
+    record.task_id = task_id;
+    record.submit_idx = submit_idx;
+    record._pad = 0;
+}
+
+}  // namespace
+#endif
+
 #if SIMPLER_ORCH_PROFILING
 #include "aicpu/device_time.h"
 #include "aicpu/l2_swimlane_collector_aicpu.h"
@@ -118,7 +144,12 @@ __attribute__((weak, visibility("hidden"))) uint64_t get_sys_cnt_aicpu() {
 // The strong symbol from the AICPU build wins when profiling is available.
 // Also hidden to prevent HOST .so from polluting the global symbol table.
 __attribute__((weak, visibility("hidden"))) void
-l2_swimlane_aicpu_record_orch_phase(uint64_t, uint64_t, uint64_t, uint32_t) {}
+l2_swimlane_aicpu_record_orch_phase(uint64_t start, uint64_t end, uint64_t task_id, uint32_t submit_idx) {
+    (void)start;
+    (void)end;
+    (void)task_id;
+    (void)submit_idx;
+}
 // Accumulated cycles per sub-step (only needed for ORCH_PROFILING export)
 static uint64_t g_orch_sync_cycle = 0;       // tensormap sync
 static uint64_t g_orch_alloc_cycle = 0;      // unified task+heap alloc
@@ -154,11 +185,11 @@ uint64_t g_orch_scope_end_atomic_count = 0;
         acc += (_t1 - _t0);        \
         _t0 = _t1;                 \
     } while (0)
-#define CYCLE_COUNT_ORCH_SUBMIT_RECORD(tid)                                                       \
-    do {                                                                                          \
-        if (_prof_active) {                                                                       \
-            l2_swimlane_aicpu_record_orch_phase(_submit_start_ts, _t1, (tid), g_orch_submit_idx); \
-        }                                                                                         \
+#define CYCLE_COUNT_ORCH_SUBMIT_RECORD(tid)                                                \
+    do {                                                                                   \
+        if (_prof_active) {                                                                \
+            record_host_orch_phase(orch, _submit_start_ts, _t1, (tid), g_orch_submit_idx); \
+        }                                                                                  \
     } while (0)
 #elif SIMPLER_DFX
 #include "aicpu/device_time.h"
@@ -176,7 +207,12 @@ __attribute__((weak, visibility("hidden"))) uint64_t get_sys_cnt_aicpu() {
            static_cast<uint64_t>(ts.tv_nsec) * PLATFORM_PROF_SYS_CNT_FREQ / 1000000000ull;
 }
 __attribute__((weak, visibility("hidden"))) void
-l2_swimlane_aicpu_record_orch_phase(uint64_t, uint64_t, uint64_t, uint32_t) {}
+l2_swimlane_aicpu_record_orch_phase(uint64_t start, uint64_t end, uint64_t task_id, uint32_t submit_idx) {
+    (void)start;
+    (void)end;
+    (void)task_id;
+    (void)submit_idx;
+}
 // submit_idx needed for swimlane task_id tagging (no cycle accumulation at this level)
 static uint32_t g_orch_submit_idx = 0;
 #define CYCLE_COUNT_START()                                                        \
@@ -186,12 +222,12 @@ static uint32_t g_orch_submit_idx = 0;
 #define CYCLE_COUNT_LAP(acc) \
     do {                     \
     } while (0)
-#define CYCLE_COUNT_ORCH_SUBMIT_RECORD(tid)                                                       \
-    do {                                                                                          \
-        if (_prof_active) {                                                                       \
-            _t1 = get_sys_cnt_aicpu();                                                            \
-            l2_swimlane_aicpu_record_orch_phase(_submit_start_ts, _t1, (tid), g_orch_submit_idx); \
-        }                                                                                         \
+#define CYCLE_COUNT_ORCH_SUBMIT_RECORD(tid)                                                \
+    do {                                                                                   \
+        if (_prof_active) {                                                                \
+            _t1 = get_sys_cnt_aicpu();                                                     \
+            record_host_orch_phase(orch, _submit_start_ts, _t1, (tid), g_orch_submit_idx); \
+        }                                                                                  \
     } while (0)
 #else
 #define CYCLE_COUNT_START()
@@ -251,6 +287,437 @@ void PTO2OrchestratorState::report_fatal(int32_t error_code, const char *func, c
     orch_report_fatal_v(orch, error_code, func, fmt, args);
     va_end(args);
 }
+
+namespace {
+
+constexpr int32_t PTO2_GRAPH_DEFINITION_CAP = 16;
+constexpr int32_t PTO2_GRAPH_MAX_TASKS = 1024;
+constexpr int32_t PTO2_GRAPH_MAX_FANIN_PER_TASK = 128;
+constexpr int32_t PTO2_GRAPH_MAX_INTERNAL_EDGES = PTO2_GRAPH_MAX_TASKS * PTO2_GRAPH_MAX_FANIN_PER_TASK;
+
+enum class PTO2GraphTensorSource : uint8_t {
+    BOUNDARY_EXACT = 0,
+    BOUNDARY_VIEW = 1,
+    INTERNAL = 2,
+    OWN_OUTPUT = 3,
+};
+
+enum class PTO2GraphFaninSource : uint8_t {
+    INTERNAL = 0,
+    EXTERNAL_LOCAL_DELTA = 1,
+};
+
+struct PTO2GraphTensorSourceRef {
+    PTO2GraphTensorSource source{PTO2GraphTensorSource::BOUNDARY_EXACT};
+    uint16_t source_index{0};
+    uint64_t packed_offset{0};
+};
+
+struct PTO2GraphFaninRef {
+    PTO2GraphFaninSource source{PTO2GraphFaninSource::INTERNAL};
+    int32_t value{0};
+};
+
+// Capture-only representation. Its fixed arrays make recording allocation-free
+// but are never copied wholesale into the process-local Definition cache.
+struct PTO2GraphRecordedNode {
+    int32_t kernel_id[PTO2_SUBTASK_SLOT_COUNT]{INVALID_KERNEL_ID, INVALID_KERNEL_ID, INVALID_KERNEL_ID};
+    ActiveMask active_mask{};
+    int16_t logical_block_num{1};
+    int16_t total_required_subtasks{0};
+    int32_t task_timing_slot{TASK_TIMING_SLOT_NONE};
+    int32_t tensor_count{0};
+    int32_t scalar_count{0};
+    int32_t total_output_size{0};
+    uint64_t record_packed_base{0};
+    Tensor tensors[MAX_TENSOR_ARGS];
+    PTO2GraphTensorSourceRef tensor_sources[MAX_TENSOR_ARGS];
+    TensorArgType tensor_arg_types[MAX_TENSOR_ARGS];
+    uint64_t scalars[MAX_SCALAR_ARGS];
+    uint16_t scalar_source_indices[MAX_SCALAR_ARGS];
+    int32_t fanin_count{0};
+    PTO2GraphFaninRef fanins[PTO2_GRAPH_MAX_FANIN_PER_TASK];
+};
+
+static_assert(std::is_trivially_copyable_v<PTO2GraphRecordedNode>, "Graph capture nodes must remain byte-copyable");
+
+// Cache/runtime representation. Variable-length tensors, sources, scalars,
+// and scalar-source indices live in Definition-wide packed arrays.
+struct PTO2GraphNodeDefinition {
+    int32_t kernel_id[PTO2_SUBTASK_SLOT_COUNT];
+    ActiveMask active_mask;
+    int16_t logical_block_num;
+    int16_t total_required_subtasks;
+    int32_t task_timing_slot;
+    int32_t tensor_count;
+    int32_t scalar_count;
+    int32_t total_output_size;
+    uint32_t tensor_offset;
+    uint32_t scalar_offset;
+};
+
+static_assert(
+    std::is_trivially_copyable_v<PTO2GraphNodeDefinition>, "Compact Graph Definition nodes must remain byte-copyable"
+);
+
+struct PTO2GraphReplayPlan {
+    uint64_t required_heap{0};
+    int32_t boundary_count{0};
+    uint32_t required_tensor_count{0};
+    uint32_t required_scalar_count{0};
+    uint16_t boundary_indices[PTO2_GRAPH_MAX_TENSOR_ARGS]{};
+    TensorArgType boundary_types[PTO2_GRAPH_MAX_TENSOR_ARGS]{};
+};
+
+struct PTO2GraphRecordingDefinition {
+    bool in_use{false};
+    uint64_t full_key{0};
+    int32_t task_count{0};
+    int32_t edge_count{0};
+    int32_t root_count{0};
+    PTO2GraphReplayPlan replay_plan;
+    uint32_t fanout_offsets[PTO2_GRAPH_MAX_TASKS + 1]{};
+    uint16_t fanout_indices[PTO2_GRAPH_MAX_INTERNAL_EDGES]{};
+    uint16_t fanin_counts[PTO2_GRAPH_MAX_TASKS]{};
+    uint16_t root_indices[PTO2_GRAPH_MAX_TASKS]{};
+    uint64_t node_offsets[PTO2_GRAPH_MAX_TASKS]{};
+    PTO2GraphRecordedNode tasks[PTO2_GRAPH_MAX_TASKS];
+};
+
+struct PTO2GraphDefinition {
+    bool in_use{false};
+    uint64_t full_key{0};
+    int32_t task_count{0};
+    int32_t edge_count{0};
+    int32_t root_count{0};
+    PTO2GraphReplayPlan replay_plan;
+    size_t storage_bytes{0};
+    void *storage{nullptr};
+    uint32_t *fanout_offsets{nullptr};
+    uint16_t *fanout_indices{nullptr};
+    uint16_t *fanin_counts{nullptr};
+    uint16_t *root_indices{nullptr};
+    uint64_t *node_offsets{nullptr};
+    PTO2GraphNodeDefinition *tasks{nullptr};
+    Tensor *tensors{nullptr};
+    PTO2GraphTensorSourceRef *tensor_sources{nullptr};
+    uint64_t *scalars{nullptr};
+    uint16_t *scalar_source_indices{nullptr};
+};
+
+struct PTO2GraphRecordingState {
+    bool active{false};
+    bool pending_finalize{false};
+    bool unsupported{false};
+    int32_t unsupported_reason{0};
+    int32_t unsupported_task_index{-1};
+    int32_t unsupported_tensor_index{-1};
+    uint64_t full_key{0};
+    int32_t start_local_task_id{0};
+    int32_t current_task_index{-1};
+    int32_t current_fanin_count{0};
+    PTO2GraphFaninRef current_fanins[PTO2_GRAPH_MAX_FANIN_PER_TASK];
+    ChipStorageTaskArgs args;
+    PTO2GraphRecordingDefinition temp;
+};
+
+// Definitions survive repeated simpler_run calls while the AICPU runtime DSO
+// remains loaded for the DeviceRunner lifetime.
+PTO2GraphDefinition g_graph_definitions[PTO2_GRAPH_DEFINITION_CAP];
+int32_t g_graph_next_replace = 0;
+PTO2GraphRecordingState g_graph_recording;
+
+enum PTO2GraphUnsupportedReason : int32_t {
+    PTO2_GRAPH_UNSUPPORTED_NONE = 0,
+    PTO2_GRAPH_UNSUPPORTED_TASK_WINDOW = 1,
+    PTO2_GRAPH_UNSUPPORTED_NULL_PRODUCER = 2,
+    PTO2_GRAPH_UNSUPPORTED_EXTERNAL_PRODUCER = 3,
+    PTO2_GRAPH_UNSUPPORTED_FANIN_OVERFLOW = 4,
+    PTO2_GRAPH_UNSUPPORTED_RECORD_TASK_ORDER = 5,
+    PTO2_GRAPH_UNSUPPORTED_RECORD_TASK_NULL = 6,
+    PTO2_GRAPH_UNSUPPORTED_ARG_OVERFLOW = 7,
+    PTO2_GRAPH_UNSUPPORTED_TENSOR_SOURCE = 8,
+    PTO2_GRAPH_UNSUPPORTED_NESTED_SCOPE = 9,
+    PTO2_GRAPH_UNSUPPORTED_EXTERNAL_EXPLICIT_DEP = 10,
+    PTO2_GRAPH_UNSUPPORTED_PREDICATE = 11,
+};
+
+void graph_mark_unsupported(PTO2GraphUnsupportedReason reason, int32_t task_index = -1, int32_t tensor_index = -1) {
+    if (!g_graph_recording.unsupported) {
+        g_graph_recording.unsupported_reason = static_cast<int32_t>(reason);
+        g_graph_recording.unsupported_task_index = task_index;
+        g_graph_recording.unsupported_tensor_index = tensor_index;
+    }
+    g_graph_recording.unsupported = true;
+}
+
+void reset_graph_definition_header(PTO2GraphRecordingDefinition *templ) {
+    templ->in_use = false;
+    templ->full_key = 0;
+    templ->task_count = 0;
+    templ->edge_count = 0;
+    templ->root_count = 0;
+    templ->replay_plan = PTO2GraphReplayPlan{};
+}
+
+void reset_graph_recording() {
+    g_graph_recording.active = false;
+    g_graph_recording.pending_finalize = false;
+    g_graph_recording.unsupported = false;
+    g_graph_recording.unsupported_reason = PTO2_GRAPH_UNSUPPORTED_NONE;
+    g_graph_recording.unsupported_task_index = -1;
+    g_graph_recording.unsupported_tensor_index = -1;
+    g_graph_recording.full_key = 0;
+    g_graph_recording.start_local_task_id = 0;
+    g_graph_recording.current_task_index = -1;
+    g_graph_recording.current_fanin_count = 0;
+    g_graph_recording.args.clear();
+    reset_graph_definition_header(&g_graph_recording.temp);
+}
+
+uint64_t graph_full_key(uint64_t callable_hash, uint64_t graph_key) {
+    uint64_t h = 1469598103934665603ULL;
+    h = pto2_graph_hash_bytes(h, &PTO2_GRAPH_CACHE_SCHEMA_VERSION, sizeof(PTO2_GRAPH_CACHE_SCHEMA_VERSION));
+    h = pto2_graph_hash_bytes(h, &callable_hash, sizeof(callable_hash));
+    return pto2_graph_hash_bytes(h, &graph_key, sizeof(graph_key));
+}
+
+bool graph_snapshot_args(const L2TaskArgs &source, ChipStorageTaskArgs *snapshot) {
+    if (snapshot == nullptr || source.has_error ||
+        source.tensor_count() > static_cast<int32_t>(PTO2_GRAPH_MAX_TENSOR_ARGS) ||
+        source.scalar_count() > static_cast<int32_t>(PTO2_GRAPH_MAX_SCALAR_ARGS)) {
+        return false;
+    }
+    snapshot->clear();
+    for (int32_t i = 0; i < source.tensor_count(); ++i) {
+        if (source.tag(i) == TensorArgType::OUTPUT) return false;
+        snapshot->add_tensor(source.tensor(i).ref());
+    }
+    for (int32_t i = 0; i < source.scalar_count(); ++i) {
+        snapshot->add_scalar(source.scalar(i));
+    }
+    return true;
+}
+
+PTO2GraphDefinition *find_graph_definition(uint64_t full_key) {
+    for (int32_t i = 0; i < PTO2_GRAPH_DEFINITION_CAP; ++i) {
+        if (g_graph_definitions[i].in_use && g_graph_definitions[i].full_key == full_key) {
+            return &g_graph_definitions[i];
+        }
+    }
+    return nullptr;
+}
+
+bool graph_definition_append_storage(
+    size_t *cursor, size_t count, size_t element_size, size_t alignment, size_t *offset
+) {
+    if (cursor == nullptr || offset == nullptr || alignment == 0 || (alignment & (alignment - 1)) != 0) return false;
+    if (*cursor > SIZE_MAX - (alignment - 1)) return false;
+    size_t aligned = (*cursor + alignment - 1) & ~(alignment - 1);
+    if (count > 0 && element_size > SIZE_MAX / count) return false;
+    size_t bytes = count * element_size;
+    if (aligned > SIZE_MAX - bytes) return false;
+    *offset = aligned;
+    *cursor = aligned + bytes;
+    return true;
+}
+
+void release_graph_definition(PTO2GraphDefinition *definition) {
+    if (definition == nullptr) return;
+    free(definition->storage);
+    *definition = PTO2GraphDefinition{};
+}
+
+bool compact_graph_definition(PTO2GraphDefinition *definition, const PTO2GraphRecordingDefinition &recorded) {
+    if (definition == nullptr || recorded.task_count <= 0 || recorded.edge_count < 0 || recorded.root_count < 0) {
+        return false;
+    }
+
+    size_t tensor_arg_count = 0;
+    size_t scalar_arg_count = 0;
+    for (int32_t i = 0; i < recorded.task_count; ++i) {
+        const PTO2GraphRecordedNode &node = recorded.tasks[i];
+        if (node.tensor_count < 0 || node.tensor_count > MAX_TENSOR_ARGS || node.scalar_count < 0 ||
+            node.scalar_count > MAX_SCALAR_ARGS) {
+            return false;
+        }
+        tensor_arg_count += static_cast<size_t>(node.tensor_count);
+        scalar_arg_count += static_cast<size_t>(node.scalar_count);
+    }
+    if (tensor_arg_count > UINT32_MAX || scalar_arg_count > UINT32_MAX) return false;
+
+    size_t cursor = 0;
+    size_t fanout_offsets_offset = 0;
+    size_t fanout_indices_offset = 0;
+    size_t fanin_counts_offset = 0;
+    size_t root_indices_offset = 0;
+    size_t node_offsets_offset = 0;
+    size_t tasks_offset = 0;
+    size_t tensors_offset = 0;
+    size_t tensor_sources_offset = 0;
+    size_t scalars_offset = 0;
+    size_t scalar_source_indices_offset = 0;
+    if (!graph_definition_append_storage(
+            &cursor, static_cast<size_t>(recorded.task_count) + 1, sizeof(uint32_t), alignof(uint32_t),
+            &fanout_offsets_offset
+        ) ||
+        !graph_definition_append_storage(
+            &cursor, static_cast<size_t>(recorded.edge_count), sizeof(uint16_t), alignof(uint16_t),
+            &fanout_indices_offset
+        ) ||
+        !graph_definition_append_storage(
+            &cursor, static_cast<size_t>(recorded.task_count), sizeof(uint16_t), alignof(uint16_t), &fanin_counts_offset
+        ) ||
+        !graph_definition_append_storage(
+            &cursor, static_cast<size_t>(recorded.root_count), sizeof(uint16_t), alignof(uint16_t), &root_indices_offset
+        ) ||
+        !graph_definition_append_storage(
+            &cursor, static_cast<size_t>(recorded.task_count), sizeof(uint64_t), alignof(uint64_t), &node_offsets_offset
+        ) ||
+        !graph_definition_append_storage(
+            &cursor, static_cast<size_t>(recorded.task_count), sizeof(PTO2GraphNodeDefinition),
+            alignof(PTO2GraphNodeDefinition), &tasks_offset
+        ) ||
+        !graph_definition_append_storage(&cursor, tensor_arg_count, sizeof(Tensor), alignof(Tensor), &tensors_offset) ||
+        !graph_definition_append_storage(
+            &cursor, tensor_arg_count, sizeof(PTO2GraphTensorSourceRef), alignof(PTO2GraphTensorSourceRef),
+            &tensor_sources_offset
+        ) ||
+        !graph_definition_append_storage(
+            &cursor, scalar_arg_count, sizeof(uint64_t), alignof(uint64_t), &scalars_offset
+        ) ||
+        !graph_definition_append_storage(
+            &cursor, scalar_arg_count, sizeof(uint16_t), alignof(uint16_t), &scalar_source_indices_offset
+        )) {
+        return false;
+    }
+
+    void *storage = nullptr;
+    if (posix_memalign(&storage, alignof(Tensor), cursor) != 0) return false;
+    auto *base = static_cast<char *>(storage);
+
+    PTO2GraphDefinition compact;
+    compact.in_use = true;
+    compact.full_key = recorded.full_key;
+    compact.task_count = recorded.task_count;
+    compact.edge_count = recorded.edge_count;
+    compact.root_count = recorded.root_count;
+    compact.replay_plan = recorded.replay_plan;
+    compact.storage_bytes = cursor;
+    compact.storage = storage;
+    compact.fanout_offsets = reinterpret_cast<uint32_t *>(base + fanout_offsets_offset);
+    compact.fanout_indices = reinterpret_cast<uint16_t *>(base + fanout_indices_offset);
+    compact.fanin_counts = reinterpret_cast<uint16_t *>(base + fanin_counts_offset);
+    compact.root_indices = reinterpret_cast<uint16_t *>(base + root_indices_offset);
+    compact.node_offsets = reinterpret_cast<uint64_t *>(base + node_offsets_offset);
+    compact.tasks = reinterpret_cast<PTO2GraphNodeDefinition *>(base + tasks_offset);
+    compact.tensors = reinterpret_cast<Tensor *>(base + tensors_offset);
+    compact.tensor_sources = reinterpret_cast<PTO2GraphTensorSourceRef *>(base + tensor_sources_offset);
+    compact.scalars = reinterpret_cast<uint64_t *>(base + scalars_offset);
+    compact.scalar_source_indices = reinterpret_cast<uint16_t *>(base + scalar_source_indices_offset);
+
+    memcpy(
+        compact.fanout_offsets, recorded.fanout_offsets,
+        sizeof(uint32_t) * (static_cast<size_t>(recorded.task_count) + 1)
+    );
+    memcpy(
+        compact.fanout_indices, recorded.fanout_indices, sizeof(uint16_t) * static_cast<size_t>(recorded.edge_count)
+    );
+    memcpy(compact.fanin_counts, recorded.fanin_counts, sizeof(uint16_t) * static_cast<size_t>(recorded.task_count));
+    memcpy(compact.root_indices, recorded.root_indices, sizeof(uint16_t) * static_cast<size_t>(recorded.root_count));
+    memcpy(compact.node_offsets, recorded.node_offsets, sizeof(uint64_t) * static_cast<size_t>(recorded.task_count));
+
+    uint32_t tensor_cursor = 0;
+    uint32_t scalar_cursor = 0;
+    for (int32_t i = 0; i < recorded.task_count; ++i) {
+        const PTO2GraphRecordedNode &src = recorded.tasks[i];
+        PTO2GraphNodeDefinition &dst = compact.tasks[i];
+        for (int32_t k = 0; k < PTO2_SUBTASK_SLOT_COUNT; ++k)
+            dst.kernel_id[k] = src.kernel_id[k];
+        dst.active_mask = src.active_mask;
+        dst.logical_block_num = src.logical_block_num;
+        dst.total_required_subtasks = src.total_required_subtasks;
+        dst.task_timing_slot = src.task_timing_slot;
+        dst.tensor_count = src.tensor_count;
+        dst.scalar_count = src.scalar_count;
+        dst.total_output_size = src.total_output_size;
+        dst.tensor_offset = tensor_cursor;
+        dst.scalar_offset = scalar_cursor;
+
+        memcpy(compact.tensors + tensor_cursor, src.tensors, sizeof(Tensor) * static_cast<size_t>(src.tensor_count));
+        memcpy(
+            compact.tensor_sources + tensor_cursor, src.tensor_sources,
+            sizeof(PTO2GraphTensorSourceRef) * static_cast<size_t>(src.tensor_count)
+        );
+        memcpy(compact.scalars + scalar_cursor, src.scalars, sizeof(uint64_t) * static_cast<size_t>(src.scalar_count));
+        memcpy(
+            compact.scalar_source_indices + scalar_cursor, src.scalar_source_indices,
+            sizeof(uint16_t) * static_cast<size_t>(src.scalar_count)
+        );
+        tensor_cursor += static_cast<uint32_t>(src.tensor_count);
+        scalar_cursor += static_cast<uint32_t>(src.scalar_count);
+    }
+
+    release_graph_definition(definition);
+    *definition = compact;
+    return true;
+}
+
+bool store_graph_definition(const PTO2GraphRecordingDefinition &templ) {
+    int32_t target = -1;
+    for (int32_t i = 0; i < PTO2_GRAPH_DEFINITION_CAP; ++i) {
+        if (!g_graph_definitions[i].in_use) {
+            target = i;
+            break;
+        }
+    }
+    if (target < 0) {
+        target = g_graph_next_replace;
+        g_graph_next_replace = (g_graph_next_replace + 1) % PTO2_GRAPH_DEFINITION_CAP;
+    }
+    if (target < 0) return false;
+    if (!compact_graph_definition(&g_graph_definitions[target], templ)) return false;
+    return true;
+}
+
+void graph_record_begin_task(PTO2TaskId task_id) {
+    if (!g_graph_recording.active || g_graph_recording.unsupported) return;
+    int32_t idx = static_cast<int32_t>(task_id.local()) - g_graph_recording.start_local_task_id;
+    if (idx < 0 || idx >= PTO2_GRAPH_MAX_TASKS || idx != g_graph_recording.temp.task_count) {
+        graph_mark_unsupported(PTO2_GRAPH_UNSUPPORTED_TASK_WINDOW, idx);
+        return;
+    }
+    g_graph_recording.current_task_index = idx;
+    g_graph_recording.current_fanin_count = 0;
+}
+
+void graph_record_note_fanin(PTO2TaskSlotState *producer) {
+    if (!g_graph_recording.active || g_graph_recording.unsupported) return;
+    if (producer == nullptr || producer->task == nullptr) {
+        graph_mark_unsupported(PTO2_GRAPH_UNSUPPORTED_NULL_PRODUCER, g_graph_recording.current_task_index);
+        return;
+    }
+    int32_t producer_local = static_cast<int32_t>(producer->task->task_id.local());
+    int32_t producer_index = producer_local - g_graph_recording.start_local_task_id;
+    if (producer_index >= g_graph_recording.current_task_index) {
+        graph_mark_unsupported(PTO2_GRAPH_UNSUPPORTED_EXTERNAL_PRODUCER, g_graph_recording.current_task_index);
+        return;
+    }
+    if (g_graph_recording.current_fanin_count >= PTO2_GRAPH_MAX_FANIN_PER_TASK) {
+        graph_mark_unsupported(PTO2_GRAPH_UNSUPPORTED_FANIN_OVERFLOW, g_graph_recording.current_task_index);
+        return;
+    }
+    PTO2GraphFaninRef &fanin = g_graph_recording.current_fanins[g_graph_recording.current_fanin_count++];
+    if (producer_index >= 0) {
+        fanin.source = PTO2GraphFaninSource::INTERNAL;
+        fanin.value = producer_index;
+    } else {
+        fanin.source = PTO2GraphFaninSource::EXTERNAL_LOCAL_DELTA;
+        fanin.value = producer_local - g_graph_recording.start_local_task_id;
+    }
+}
+
+}  // namespace
 
 static uint32_t next_fanin_seen_epoch(PTO2OrchestratorState *orch) {
     uint32_t next = orch->fanin_seen_current_epoch + 1;
@@ -352,6 +819,8 @@ static bool append_fanin_or_fail(
     if (!claim) {
         return true;
     }
+
+    graph_record_note_fanin(prod_state);
 
     if (fanin_builder->count < PTO2_FANIN_INLINE_CAP) {
         fanin_builder->inline_slots[fanin_builder->count++] = prod_state;
@@ -472,6 +941,670 @@ struct PTO2PreparedTask {
     PTO2TaskSlotState *slot_state = nullptr;
 };
 
+namespace {
+
+static bool graph_tensor_metadata_equal(const Tensor &lhs, const Tensor &rhs) {
+    if (lhs.buffer.addr != rhs.buffer.addr || lhs.buffer.size != rhs.buffer.size ||
+        lhs.start_offset != rhs.start_offset || lhs.version != rhs.version || lhs.ndims != rhs.ndims ||
+        lhs.dtype != rhs.dtype || lhs.manual_dep != rhs.manual_dep || lhs.is_contiguous != rhs.is_contiguous ||
+        lhs.child_memory != rhs.child_memory) {
+        return false;
+    }
+    return memcmp(lhs.shapes, rhs.shapes, sizeof(uint32_t) * lhs.ndims) == 0 &&
+           memcmp(lhs.strides, rhs.strides, sizeof(uint32_t) * lhs.ndims) == 0;
+}
+
+static bool
+graph_tensor_from_args(const Tensor &tensor, const ChipStorageTaskArgs &args, PTO2GraphTensorSourceRef *source_ref) {
+    for (int32_t i = 0; i < args.tensor_count(); ++i) {
+        if (graph_tensor_metadata_equal(tensor, args.tensor(i))) {
+            source_ref->source = PTO2GraphTensorSource::BOUNDARY_EXACT;
+            source_ref->source_index = static_cast<uint16_t>(i);
+            source_ref->packed_offset = 0;
+            return true;
+        }
+    }
+    uint16_t best_index = UINT16_MAX;
+    uint64_t best_offset = UINT64_MAX;
+    for (int32_t i = 0; i < args.tensor_count(); ++i) {
+        const Tensor &boundary = args.tensor(i);
+        if (tensor.buffer.addr == boundary.buffer.addr && tensor.buffer.size == boundary.buffer.size &&
+            tensor.start_offset >= boundary.start_offset) {
+            uint64_t offset = tensor.start_offset - boundary.start_offset;
+            if (offset < best_offset) {
+                best_index = static_cast<uint16_t>(i);
+                best_offset = offset;
+            }
+        }
+    }
+    if (best_index == UINT16_MAX) return false;
+    source_ref->source = PTO2GraphTensorSource::BOUNDARY_VIEW;
+    source_ref->source_index = best_index;
+    source_ref->packed_offset = best_offset;
+    return true;
+}
+
+static bool
+graph_classify_tensor(PTO2GraphRecordedNode *task, int32_t tensor_index, const Tensor &tensor, int32_t task_index) {
+    PTO2GraphTensorSourceRef &source_ref = task->tensor_sources[tensor_index];
+    if (graph_tensor_from_args(tensor, g_graph_recording.args, &source_ref)) return true;
+
+    uint64_t tensor_addr = tensor.buffer.addr;
+    for (int32_t producer_index = task_index; producer_index >= 0; --producer_index) {
+        const PTO2GraphRecordedNode &producer =
+            (producer_index == task_index) ? *task : g_graph_recording.temp.tasks[producer_index];
+        if (producer.record_packed_base == 0 || producer.total_output_size <= 0) continue;
+        uint64_t producer_begin = producer.record_packed_base;
+        uint64_t producer_end = producer_begin + static_cast<uint64_t>(producer.total_output_size);
+        if (tensor_addr < producer_begin || tensor_addr >= producer_end) continue;
+        source_ref.source =
+            producer_index == task_index ? PTO2GraphTensorSource::OWN_OUTPUT : PTO2GraphTensorSource::INTERNAL;
+        source_ref.source_index = static_cast<uint16_t>(producer_index);
+        source_ref.packed_offset = tensor_addr - producer_begin;
+        return true;
+    }
+    return false;
+}
+
+static void graph_record_task(const PTO2PreparedTask &prepared, const L0TaskArgs &args) {
+    if (!g_graph_recording.active || g_graph_recording.unsupported) return;
+    int32_t task_index = static_cast<int32_t>(prepared.task_id.local()) - g_graph_recording.start_local_task_id;
+    if (task_index < 0 || task_index >= PTO2_GRAPH_MAX_TASKS || task_index != g_graph_recording.temp.task_count) {
+        graph_mark_unsupported(PTO2_GRAPH_UNSUPPORTED_RECORD_TASK_ORDER, task_index);
+        return;
+    }
+    if (prepared.task == nullptr || prepared.payload == nullptr || prepared.slot_state == nullptr) {
+        graph_mark_unsupported(PTO2_GRAPH_UNSUPPORTED_RECORD_TASK_NULL, task_index);
+        return;
+    }
+
+    PTO2GraphRecordedNode &task = g_graph_recording.temp.tasks[task_index];
+    task = PTO2GraphRecordedNode{};
+    for (int i = 0; i < PTO2_SUBTASK_SLOT_COUNT; ++i)
+        task.kernel_id[i] = prepared.task->kernel_id[i];
+    task.active_mask = prepared.slot_state->active_mask;
+    task.logical_block_num = prepared.slot_state->logical_block_num;
+    task.total_required_subtasks = prepared.slot_state->total_required_subtasks;
+    task.task_timing_slot = prepared.task->task_timing_slot;
+    task.tensor_count = prepared.payload->tensor_count;
+    task.scalar_count = prepared.payload->scalar_count;
+    task.total_output_size = static_cast<int32_t>(
+        reinterpret_cast<uintptr_t>(prepared.task->packed_buffer_end) -
+        reinterpret_cast<uintptr_t>(prepared.task->packed_buffer_base)
+    );
+    task.record_packed_base = reinterpret_cast<uint64_t>(prepared.task->packed_buffer_base);
+    if (task.tensor_count < 0 || task.tensor_count > MAX_TENSOR_ARGS || task.scalar_count < 0 ||
+        task.scalar_count > MAX_SCALAR_ARGS) {
+        graph_mark_unsupported(PTO2_GRAPH_UNSUPPORTED_ARG_OVERFLOW, task_index);
+        return;
+    }
+
+    for (int32_t i = 0; i < task.tensor_count; ++i) {
+        task.tensors[i].copy(prepared.payload->tensors[i]);
+        task.tensor_arg_types[i] = args.tag(i);
+        if (!graph_classify_tensor(&task, i, task.tensors[i], task_index)) {
+            graph_mark_unsupported(PTO2_GRAPH_UNSUPPORTED_TENSOR_SOURCE, task_index, i);
+            return;
+        }
+    }
+    memcpy(task.scalars, prepared.payload->scalars, sizeof(uint64_t) * static_cast<size_t>(task.scalar_count));
+    for (int32_t i = 0; i < task.scalar_count; ++i)
+        task.scalar_source_indices[i] = args.scalar_source_index(i);
+    for (uint32_t i = 0; i < args.explicit_dep_count(); ++i) {
+        PTO2TaskId dependency = args.explicit_dep(i);
+        int32_t dependency_index = static_cast<int32_t>(dependency.local()) - g_graph_recording.start_local_task_id;
+        if (!dependency.is_valid() || dependency.ring() != 0 || dependency_index < 0 ||
+            dependency_index >= task_index) {
+            graph_mark_unsupported(PTO2_GRAPH_UNSUPPORTED_EXTERNAL_EXPLICIT_DEP, task_index);
+            return;
+        }
+    }
+    if (args.predicate().op != PredicateOp::NONE) {
+        graph_mark_unsupported(PTO2_GRAPH_UNSUPPORTED_PREDICATE, task_index);
+        return;
+    }
+    task.fanin_count = g_graph_recording.current_fanin_count;
+    for (int32_t i = 0; i < task.fanin_count; ++i)
+        task.fanins[i] = g_graph_recording.current_fanins[i];
+
+    g_graph_recording.temp.task_count++;
+    g_graph_recording.current_task_index = -1;
+}
+
+static void graph_reset_payload(PTO2TaskPayload *payload) {
+    payload->early_dispatch_state.store(PTO2_EARLY_DISPATCH_NONE, std::memory_order_relaxed);
+    for (int w = 0; w < PTO2_EARLY_DISPATCH_CORE_MASK_WORDS; ++w) {
+        payload->staged_core_mask[w].store(0, std::memory_order_relaxed);
+    }
+    payload->dispatch_fanin.store(0, std::memory_order_relaxed);
+    payload->dispatch_propagated.store(0, std::memory_order_relaxed);
+    payload->published_block_count.store(0, std::memory_order_relaxed);
+    payload->early_dispatch_launch_state.store(PTO2_EARLY_DISPATCH_LAUNCH_NONE, std::memory_order_relaxed);
+    payload->running_slot_count.store(0, std::memory_order_relaxed);
+    payload->early_sync_drain_state.store(PTO2_EARLY_SYNC_DRAIN_NONE, std::memory_order_relaxed);
+}
+
+static TensorArgType graph_boundary_type(bool reads, bool writes, bool no_dep) {
+    if (reads && writes) return TensorArgType::INOUT;
+    if (writes) return TensorArgType::OUTPUT_EXISTING;
+    if (reads) return TensorArgType::INPUT;
+    return no_dep ? TensorArgType::NO_DEP : TensorArgType::INPUT;
+}
+
+static bool graph_build_definition(PTO2GraphRecordingDefinition *templ, const ChipStorageTaskArgs &args) {
+    if (templ == nullptr || templ->task_count <= 0 || templ->task_count > PTO2_GRAPH_MAX_TASKS) return false;
+    PTO2GraphReplayPlan plan;
+    bool boundary_seen[PTO2_GRAPH_MAX_TENSOR_ARGS]{};
+    bool boundary_reads[PTO2_GRAPH_MAX_TENSOR_ARGS]{};
+    bool boundary_writes[PTO2_GRAPH_MAX_TENSOR_ARGS]{};
+    bool boundary_no_dep[PTO2_GRAPH_MAX_TENSOR_ARGS]{};
+    uint32_t fanout_counts[PTO2_GRAPH_MAX_TASKS]{};
+
+    for (int32_t i = 0; i < templ->task_count; ++i) {
+        const PTO2GraphRecordedNode &task = templ->tasks[i];
+        if (task.tensor_count < 0 || task.tensor_count > MAX_TENSOR_ARGS || task.scalar_count < 0 ||
+            task.scalar_count > MAX_SCALAR_ARGS || task.fanin_count < 0 ||
+            task.fanin_count > PTO2_GRAPH_MAX_FANIN_PER_TASK || task.total_output_size < 0) {
+            return false;
+        }
+        templ->node_offsets[i] = plan.required_heap;
+        uint64_t aligned_output = PTO2_ALIGN_UP(static_cast<uint64_t>(task.total_output_size), PTO2_ALIGN_SIZE);
+        if (plan.required_heap > UINT64_MAX - aligned_output) return false;
+        plan.required_heap += aligned_output;
+
+        int32_t internal_fanin_count = 0;
+        for (int32_t e = 0; e < task.fanin_count; ++e) {
+            const PTO2GraphFaninRef &fanin = task.fanins[e];
+            if (fanin.source != PTO2GraphFaninSource::INTERNAL) continue;
+            if (fanin.value < 0 || fanin.value >= i) return false;
+            if (templ->edge_count >= PTO2_GRAPH_MAX_INTERNAL_EDGES) return false;
+            fanout_counts[fanin.value]++;
+            templ->edge_count++;
+            internal_fanin_count++;
+        }
+        templ->fanin_counts[i] = static_cast<uint16_t>(internal_fanin_count);
+        if (internal_fanin_count == 0) {
+            templ->root_indices[templ->root_count++] = static_cast<uint16_t>(i);
+        }
+
+        for (int32_t j = 0; j < task.tensor_count; ++j) {
+            const PTO2GraphTensorSourceRef &source_ref = task.tensor_sources[j];
+            bool is_boundary = source_ref.source == PTO2GraphTensorSource::BOUNDARY_EXACT ||
+                               source_ref.source == PTO2GraphTensorSource::BOUNDARY_VIEW;
+            if (is_boundary && source_ref.source_index >= args.tensor_count()) return false;
+            if (source_ref.source == PTO2GraphTensorSource::INTERNAL && source_ref.source_index >= i) return false;
+            if (is_boundary) {
+                uint16_t index = source_ref.source_index;
+                uint32_t required = static_cast<uint32_t>(index) + 1;
+                if (required > plan.required_tensor_count) plan.required_tensor_count = required;
+                TensorArgType type = task.tensor_arg_types[j];
+                boundary_seen[index] = true;
+                boundary_reads[index] |= type == TensorArgType::INPUT || type == TensorArgType::INOUT;
+                boundary_writes[index] |= type == TensorArgType::INOUT || type == TensorArgType::OUTPUT_EXISTING;
+                boundary_no_dep[index] |= type == TensorArgType::NO_DEP;
+            }
+        }
+        for (int32_t j = 0; j < task.scalar_count; ++j) {
+            uint16_t source_index = task.scalar_source_indices[j];
+            if (source_index != PTO2_TASK_ARG_STATIC && source_index >= args.scalar_count()) return false;
+            if (source_index != PTO2_TASK_ARG_STATIC) {
+                uint32_t required = static_cast<uint32_t>(source_index) + 1;
+                if (required > plan.required_scalar_count) plan.required_scalar_count = required;
+            }
+        }
+    }
+
+    for (int32_t i = 0; i < args.tensor_count(); ++i) {
+        if (!boundary_seen[i]) continue;
+        TensorArgType type = graph_boundary_type(boundary_reads[i], boundary_writes[i], boundary_no_dep[i]);
+        plan.boundary_indices[plan.boundary_count] = static_cast<uint16_t>(i);
+        plan.boundary_types[plan.boundary_count] = type;
+        plan.boundary_count++;
+    }
+
+    templ->fanout_offsets[0] = 0;
+    for (int32_t i = 0; i < templ->task_count; ++i) {
+        templ->fanout_offsets[i + 1] = templ->fanout_offsets[i] + fanout_counts[i];
+    }
+    uint32_t fanout_cursors[PTO2_GRAPH_MAX_TASKS];
+    memcpy(fanout_cursors, templ->fanout_offsets, sizeof(uint32_t) * static_cast<size_t>(templ->task_count));
+    for (int32_t consumer_index = 0; consumer_index < templ->task_count; ++consumer_index) {
+        const PTO2GraphRecordedNode &task = templ->tasks[consumer_index];
+        for (int32_t e = 0; e < task.fanin_count; ++e) {
+            const PTO2GraphFaninRef &fanin = task.fanins[e];
+            if (fanin.source != PTO2GraphFaninSource::INTERNAL) continue;
+            templ->fanout_indices[fanout_cursors[fanin.value]++] = static_cast<uint16_t>(consumer_index);
+        }
+    }
+
+    templ->replay_plan = plan;
+    return templ->fanout_offsets[templ->task_count] == static_cast<uint32_t>(templ->edge_count);
+}
+
+static bool graph_submission_preflight(
+    PTO2OrchestratorState *orch, const PTO2GraphDefinition &templ, const ChipStorageTaskArgs &args
+) {
+    const PTO2GraphReplayPlan &plan = templ.replay_plan;
+    if (args.tensor_count() < static_cast<int32_t>(plan.required_tensor_count) ||
+        args.scalar_count() < static_cast<int32_t>(plan.required_scalar_count)) {
+        return false;
+    }
+    auto &allocator = orch->ring.task_allocator;
+    if (allocator.active_count() + 1 >= allocator.window_size()) return false;
+    if (plan.required_heap > allocator.heap_available() || plan.required_heap > INT32_MAX) return false;
+    int32_t tensormap_entries = 0;
+    for (int32_t i = 0; i < plan.boundary_count; ++i) {
+        uint16_t arg_index = plan.boundary_indices[i];
+        if (arg_index >= args.tensor_count()) return false;
+        TensorArgType type = plan.boundary_types[i];
+        if ((type == TensorArgType::INOUT || type == TensorArgType::OUTPUT_EXISTING) &&
+            !args.tensor(arg_index).manual_dep) {
+            tensormap_entries++;
+        }
+    }
+    if (tensormap_entries > orch->tensor_map.free_entries()) return false;
+    return true;
+}
+
+static size_t graph_definition_image_bytes(const PTO2GraphDefinition &templ) {
+    size_t header_bytes = PTO2_ALIGN_UP(sizeof(PTO2GraphDefinition), alignof(Tensor));
+    if (templ.storage_bytes > SIZE_MAX - header_bytes) return 0;
+    return header_bytes + templ.storage_bytes;
+}
+
+template <typename T>
+static bool graph_rebase_cloned_pointer(T *&ptr, uintptr_t source_begin, size_t source_bytes, intptr_t delta) {
+    if (ptr == nullptr) return true;
+    uintptr_t value = reinterpret_cast<uintptr_t>(ptr);
+    if (value < source_begin || value >= source_begin + source_bytes) return false;
+    ptr = reinterpret_cast<T *>(static_cast<intptr_t>(value) + delta);
+    return true;
+}
+
+static PTO2GraphDefinition *
+graph_clone_definition_image(void *definition_storage, size_t definition_capacity, const PTO2GraphDefinition &templ) {
+    if (definition_storage == nullptr || templ.storage == nullptr) return nullptr;
+    const size_t header_bytes = PTO2_ALIGN_UP(sizeof(PTO2GraphDefinition), alignof(Tensor));
+    if (definition_capacity < header_bytes + templ.storage_bytes) return nullptr;
+
+    auto *copy = new (definition_storage) PTO2GraphDefinition(templ);
+    void *copy_storage = static_cast<char *>(definition_storage) + header_bytes;
+    memcpy(copy_storage, templ.storage, templ.storage_bytes);
+    const uintptr_t source_begin = reinterpret_cast<uintptr_t>(templ.storage);
+    const intptr_t delta =
+        static_cast<intptr_t>(reinterpret_cast<uintptr_t>(copy_storage)) - static_cast<intptr_t>(source_begin);
+    copy->storage = copy_storage;
+    if (!graph_rebase_cloned_pointer(copy->fanout_offsets, source_begin, templ.storage_bytes, delta) ||
+        !graph_rebase_cloned_pointer(copy->fanout_indices, source_begin, templ.storage_bytes, delta) ||
+        !graph_rebase_cloned_pointer(copy->fanin_counts, source_begin, templ.storage_bytes, delta) ||
+        !graph_rebase_cloned_pointer(copy->root_indices, source_begin, templ.storage_bytes, delta) ||
+        !graph_rebase_cloned_pointer(copy->node_offsets, source_begin, templ.storage_bytes, delta) ||
+        !graph_rebase_cloned_pointer(copy->tasks, source_begin, templ.storage_bytes, delta) ||
+        !graph_rebase_cloned_pointer(copy->tensors, source_begin, templ.storage_bytes, delta) ||
+        !graph_rebase_cloned_pointer(copy->tensor_sources, source_begin, templ.storage_bytes, delta) ||
+        !graph_rebase_cloned_pointer(copy->scalars, source_begin, templ.storage_bytes, delta) ||
+        !graph_rebase_cloned_pointer(copy->scalar_source_indices, source_begin, templ.storage_bytes, delta)) {
+        return nullptr;
+    }
+    return copy;
+}
+
+static bool graph_clone_definition(PTO2GraphSubmission *submission, const PTO2GraphDefinition &templ) {
+    if (submission == nullptr) return false;
+    submission->graph_definition =
+        graph_clone_definition_image(submission->definition_storage, submission->definition_capacity, templ);
+    return submission->graph_definition != nullptr;
+}
+
+static bool graph_clone_definition(PTO2GraphExecution *execution, const PTO2GraphDefinition &templ) {
+    if (execution == nullptr) return false;
+    auto *copy = graph_clone_definition_image(execution->definition_storage, execution->definition_capacity, templ);
+    if (copy == nullptr) return false;
+    execution->graph_definition = copy;
+    execution->topology.edge_count = copy->edge_count;
+    execution->topology.root_count = copy->root_count;
+    execution->topology.fanout_offsets = copy->fanout_offsets;
+    execution->topology.fanout_indices = copy->fanout_indices;
+    execution->topology.fanin_counts = copy->fanin_counts;
+    execution->topology.root_indices = copy->root_indices;
+    return true;
+}
+
+static bool graph_submit_definition(
+    PTO2OrchestratorState *orch, const PTO2GraphDefinition &templ, const ChipStorageTaskArgs &args,
+    uint64_t *orch_record_task_id
+) {
+    if (orch_record_task_id != nullptr) *orch_record_task_id = PTO2TaskId::invalid().raw;
+    if (!graph_submission_preflight(orch, templ, args)) return false;
+
+    const size_t definition_bytes = graph_definition_image_bytes(templ);
+    if (definition_bytes == 0) return false;
+    PTO2GraphSubmission *submission = pto2_graph_submission_create(templ.task_count, templ.full_key, definition_bytes);
+    if (submission == nullptr || !graph_clone_definition(submission, templ)) {
+        pto2_graph_submission_discard(submission);
+        return false;
+    }
+    submission->args = args;
+
+    const PTO2GraphReplayPlan &plan = templ.replay_plan;
+    PTO2TaskAllocResult outer_alloc = orch->ring.task_allocator.alloc(static_cast<int32_t>(plan.required_heap));
+    if (outer_alloc.failed()) {
+        pto2_graph_submission_discard(submission);
+        orch_mark_fatal(orch, PTO2_ERROR_HEAP_RING_DEADLOCK);
+        return false;
+    }
+
+    PTO2TaskId outer_task_id = PTO2TaskId::make(0, static_cast<uint32_t>(outer_alloc.task_id));
+    PTO2SharedMemoryRingHeader &ring = orch->sm_header->ring;
+    PTO2TaskDescriptor &outer_task = ring.task_descriptors[outer_alloc.slot];
+    PTO2TaskPayload &outer_payload = ring.task_payloads[outer_alloc.slot];
+    PTO2TaskSlotState &outer_slot = ring.get_slot_state_by_slot(outer_alloc.slot);
+    outer_task.task_id = outer_task_id;
+    for (int k = 0; k < PTO2_SUBTASK_SLOT_COUNT; ++k)
+        outer_task.kernel_id[k] = INVALID_KERNEL_ID;
+    outer_task.task_timing_slot = TASK_TIMING_SLOT_NONE;
+    outer_task.packed_buffer_base = outer_alloc.packed_base;
+    outer_task.packed_buffer_end = outer_alloc.packed_end;
+    outer_task.graph_execution = submission;
+    outer_task.graph_node_index = -1;
+    outer_task.kind = PTO2TaskKind::GRAPH;
+    outer_payload.tensor_count = 0;
+    outer_payload.scalar_count = 0;
+    outer_payload.fanin_actual_count = 0;
+    outer_payload.fanin_spill_start = 0;
+    outer_payload.fanin_spill_pool = &orch->ring.fanin_pool;
+    outer_payload.predicate = DispatchPredicate{};
+    graph_reset_payload(&outer_payload);
+    outer_slot.bind_buffers(&outer_payload, &outer_task);
+    outer_slot.task_state.store(PTO2_TASK_PENDING, std::memory_order_relaxed);
+    outer_slot.active_mask = ActiveMask{};
+    outer_slot.set_allow_early_resolve(false);
+    outer_slot.total_required_subtasks = 0;
+    outer_slot.logical_block_num = 1;
+    scope_tasks_push(orch, &outer_slot);
+
+    submission->outer_slot = &outer_slot;
+
+    TensorRef boundary_tensors[PTO2_GRAPH_MAX_TENSOR_ARGS];
+    TensorArgType boundary_types[PTO2_GRAPH_MAX_TENSOR_ARGS];
+    for (int32_t i = 0; i < plan.boundary_count; ++i) {
+        boundary_tensors[i] = &args.tensor(plan.boundary_indices[i]);
+        boundary_types[i] = plan.boundary_types[i];
+    }
+    DepInputs boundary_inputs{plan.boundary_count, boundary_tensors, boundary_types, 0, nullptr};
+    PTO2FaninBuilder fanin_builder(orch, orch->ring.fanin_pool, next_fanin_seen_epoch(orch));
+    orch->tensor_map.sync_tensormap(outer_task_id, ring.fc.last_task_alive.load(std::memory_order_acquire));
+    auto boundary_emit = [&](PTO2TaskId producer_task_id) -> bool {
+        uint8_t producer_ring_id = producer_task_id.ring();
+        int32_t producer_local = static_cast<int32_t>(producer_task_id.local());
+        int32_t producer_slot = ring.get_slot_by_task_id(producer_local);
+        PTO2TaskSlotState *producer = &ring.get_slot_state_by_slot(producer_slot);
+        return append_fanin_or_fail(orch, producer_ring_id, producer_slot, producer, producer_task_id, &fanin_builder);
+    };
+    if (!compute_task_fanin(boundary_inputs, orch->tensor_map, orch->in_manual_scope(), boundary_emit)) {
+        pto2_graph_submission_discard(submission);
+        return false;
+    }
+    register_task_outputs(boundary_inputs, outer_task_id, orch->tensor_map, orch->in_manual_scope());
+
+    outer_payload.fanin_actual_count = fanin_builder.count;
+    outer_payload.fanin_spill_start = fanin_builder.spill_start;
+    outer_payload.fanin_spill_pool = &fanin_builder.spill_pool;
+    const int32_t inline_count = std::min(fanin_builder.count, PTO2_FANIN_INLINE_CAP);
+    for (int32_t i = 0; i < inline_count; ++i)
+        outer_payload.fanin_inline_slot_states[i] = fanin_builder.inline_slots[i];
+
+    if (fanin_builder.count == 0) {
+        outer_slot.fanin_count = 1;
+        outer_slot.fanin_refcount.store(1, std::memory_order_release);
+        orch_mark_dep_pool_position(orch, outer_slot);
+        orch->scheduler->push_ready_routed(&outer_slot);
+    } else if (all_claimed_fanin_completed(fanin_builder)) {
+        int32_t ready_seed = fanin_builder.count + 1;
+        outer_slot.fanin_count = ready_seed;
+        outer_slot.fanin_refcount.store(ready_seed, std::memory_order_release);
+        orch_mark_dep_pool_position(orch, outer_slot);
+        orch->scheduler->push_ready_routed(&outer_slot);
+    } else if (!orch_wire_live_fanin_task(orch, outer_slot, fanin_builder.count)) {
+        pto2_graph_submission_discard(submission);
+        return false;
+    }
+
+    if (orch_record_task_id != nullptr) *orch_record_task_id = outer_task_id.raw;
+    if (!orch->scheduler->graph_prepare_queue.push_tagged(&outer_slot, outer_task_id.raw)) {
+        orch_mark_fatal(orch, PTO2_ERROR_HEAP_RING_DEADLOCK);
+        pto2_graph_submission_discard(submission);
+        return false;
+    }
+    submission->upload_next = orch->pending_graph_uploads;
+    orch->pending_graph_uploads = submission;
+#if SIMPLER_DFX
+    orch->tasks_submitted++;
+#endif
+    return true;
+}
+
+}  // namespace
+
+bool pto2_graph_definition_relocate_for_upload(PTO2GraphSubmission *submission, void *device_base) {
+    if (submission == nullptr || device_base == nullptr || submission->graph_definition == nullptr) return false;
+    auto *definition =
+        const_cast<PTO2GraphDefinition *>(static_cast<const PTO2GraphDefinition *>(submission->graph_definition));
+    const uintptr_t host_begin = reinterpret_cast<uintptr_t>(submission);
+    const intptr_t delta =
+        static_cast<intptr_t>(reinterpret_cast<uintptr_t>(device_base)) - static_cast<intptr_t>(host_begin);
+    const size_t bytes = submission->allocation_bytes;
+    return graph_rebase_cloned_pointer(definition->storage, host_begin, bytes, delta) &&
+           graph_rebase_cloned_pointer(definition->fanout_offsets, host_begin, bytes, delta) &&
+           graph_rebase_cloned_pointer(definition->fanout_indices, host_begin, bytes, delta) &&
+           graph_rebase_cloned_pointer(definition->fanin_counts, host_begin, bytes, delta) &&
+           graph_rebase_cloned_pointer(definition->root_indices, host_begin, bytes, delta) &&
+           graph_rebase_cloned_pointer(definition->node_offsets, host_begin, bytes, delta) &&
+           graph_rebase_cloned_pointer(definition->tasks, host_begin, bytes, delta) &&
+           graph_rebase_cloned_pointer(definition->tensors, host_begin, bytes, delta) &&
+           graph_rebase_cloned_pointer(definition->tensor_sources, host_begin, bytes, delta) &&
+           graph_rebase_cloned_pointer(definition->scalars, host_begin, bytes, delta) &&
+           graph_rebase_cloned_pointer(definition->scalar_source_indices, host_begin, bytes, delta);
+}
+
+PTO2GraphExecution *pto2_graph_execution_localize(PTO2TaskSlotState &outer_slot) {
+    if (outer_slot.task == nullptr || outer_slot.task->kind != PTO2TaskKind::GRAPH) return nullptr;
+    PTO2GraphSubmission *submission = pto2_graph_submission_from_task(*outer_slot.task);
+    if (submission == nullptr || submission->graph_definition == nullptr) return nullptr;
+
+    PTO2GraphExecution *execution = submission->local_execution.load(std::memory_order_acquire);
+    if (execution != nullptr) return execution;
+
+    // Reclaim completed local blocks before allocating.  This pool is owned by
+    // the Scheduler DSO and survives run boundaries, so later invocations can
+    // reuse both the allocation and graph-affine static node contents.
+    pto2_graph_execution_collect_retired();
+    const auto &templ = *static_cast<const PTO2GraphDefinition *>(submission->graph_definition);
+    const size_t definition_bytes = graph_definition_image_bytes(templ);
+    execution = pto2_graph_execution_create(submission->node_count, submission->graph_key, definition_bytes);
+    if (execution == nullptr) return nullptr;
+
+    if (!execution->definition_affine_reuse && !graph_clone_definition(execution, templ)) {
+        pto2_graph_execution_discard(execution);
+        return nullptr;
+    }
+    execution->args = submission->args;
+    execution->outer_slot = &outer_slot;
+
+    PTO2GraphExecution *expected = nullptr;
+    if (!submission->local_execution.compare_exchange_strong(
+            expected, execution, std::memory_order_release, std::memory_order_acquire
+        )) {
+        pto2_graph_execution_discard(execution);
+        return expected;
+    }
+    pto2_graph_execution_publish(execution);
+    return execution;
+}
+
+bool PTO2OrchestratorState::finalize_pending_graph_definition() {
+    if (!g_graph_recording.pending_finalize) return true;
+
+    bool built = graph_build_definition(&g_graph_recording.temp, g_graph_recording.args);
+    bool stored = built && store_graph_definition(g_graph_recording.temp);
+    if (stored) {
+        PTO2GraphDefinition *definition = find_graph_definition(g_graph_recording.full_key);
+        LOG_INFO_V0(
+            "[GraphExecution] define key=0x%llx nodes=%d bytes=%zu",
+            static_cast<unsigned long long>(g_graph_recording.full_key), g_graph_recording.temp.task_count,
+            definition == nullptr ? 0 : definition->storage_bytes
+        );
+    }
+    reset_graph_recording();
+    return stored;
+}
+
+PTO2GraphMaterializeResult pto2_graph_execution_materialize_slice(
+    PTO2TaskSlotState &outer_slot, PTO2GraphExecution &execution_ref, int32_t max_nodes, int32_t *nodes_materialized
+) {
+    if (nodes_materialized != nullptr) *nodes_materialized = 0;
+    if (outer_slot.task == nullptr || outer_slot.task->kind != PTO2TaskKind::GRAPH || max_nodes <= 0) {
+        return PTO2GraphMaterializeResult::INVALID;
+    }
+    PTO2GraphExecution *execution = &execution_ref;
+    if (execution == nullptr || execution->graph_definition == nullptr || execution->node_storage == nullptr) {
+        return PTO2GraphMaterializeResult::INVALID;
+    }
+
+    PTO2GraphExecutionState state = execution->state.load(std::memory_order_acquire);
+    if (state >= PTO2GraphExecutionState::PREPARED) return PTO2GraphMaterializeResult::PREPARED;
+
+    uint8_t expected_busy = 0;
+    if (!execution->materialize_busy.compare_exchange_strong(
+            expected_busy, 1, std::memory_order_acq_rel, std::memory_order_acquire
+        )) {
+        return PTO2GraphMaterializeResult::BUSY;
+    }
+
+    state = execution->state.load(std::memory_order_acquire);
+    if (state == PTO2GraphExecutionState::SUBMITTED) {
+        if (!pto2_graph_execution_begin_materialize(*execution)) {
+            execution->materialize_busy.store(0, std::memory_order_release);
+            state = execution->state.load(std::memory_order_acquire);
+            return state >= PTO2GraphExecutionState::PREPARED ? PTO2GraphMaterializeResult::PREPARED :
+                                                                PTO2GraphMaterializeResult::BUSY;
+        }
+    } else if (state != PTO2GraphExecutionState::MATERIALIZING) {
+        execution->materialize_busy.store(0, std::memory_order_release);
+        return state >= PTO2GraphExecutionState::PREPARED ? PTO2GraphMaterializeResult::PREPARED :
+                                                            PTO2GraphMaterializeResult::INVALID;
+    }
+
+    const auto &templ = *static_cast<const PTO2GraphDefinition *>(execution->graph_definition);
+    const ChipStorageTaskArgs &args = execution->args;
+    const bool reuse_static = execution->definition_affine_reuse;
+    const int32_t first_node = execution->materialized_nodes;
+    if (first_node == 0 && !reuse_static) {
+        execution->materialized_graph_key = 0;
+        execution->materialized_node_count = 0;
+    }
+    const int32_t last_node = std::min(templ.task_count, first_node + max_nodes);
+    for (int32_t i = first_node; i < last_node; ++i) {
+        const PTO2GraphNodeDefinition &src = templ.tasks[i];
+        PTO2GraphNodeStorage *node = &execution->node_storage[i];
+        if (i >= execution->constructed_nodes) {
+            // Default-initialize object lifetimes without value-initializing
+            // the 4 KiB payload arrays. Every live descriptor/slot field and
+            // every tensor/scalar below the published counts is overwritten
+            // before PREPARED is release-published.
+            node = new (node) PTO2GraphNodeStorage;
+            execution->constructed_nodes++;
+        }
+        execution->materialized_nodes++;
+        PTO2TaskDescriptor &task = node->task;
+        PTO2TaskPayload &payload = node->payload;
+        PTO2TaskSlotState &slot = node->slot;
+
+        uint32_t synthetic_local =
+            (static_cast<uint32_t>(outer_slot.task->task_id.local()) << 10) | static_cast<uint32_t>(i);
+        task.task_id = PTO2TaskId::make(1, synthetic_local);
+        task.packed_buffer_base = static_cast<char *>(outer_slot.task->packed_buffer_base) + templ.node_offsets[i];
+        task.packed_buffer_end = static_cast<char *>(task.packed_buffer_base) +
+                                 PTO2_ALIGN_UP(static_cast<uint64_t>(src.total_output_size), PTO2_ALIGN_SIZE);
+        if (!reuse_static) {
+            for (int k = 0; k < PTO2_SUBTASK_SLOT_COUNT; ++k)
+                task.kernel_id[k] = src.kernel_id[k];
+            task.task_timing_slot = src.task_timing_slot;
+            task.graph_execution = execution;
+            task.graph_node_index = i;
+            task.kind = PTO2TaskKind::GRAPH_NODE;
+        }
+
+        slot.reset_for_reuse();
+        if (!reuse_static) slot.bind_buffers(&payload, &task);
+        slot.task_state.store(PTO2_TASK_PENDING, std::memory_order_relaxed);
+        slot.fanin_refcount.store(1, std::memory_order_relaxed);
+        if (!reuse_static) {
+            slot.fanin_count = static_cast<int32_t>(templ.fanin_counts[i]) + 1;
+            slot.active_mask = src.active_mask;
+            // Graph topology is released directly, so ordinary fanout-based
+            // early propagation is intentionally disabled for Graph nodes.
+            slot.set_allow_early_resolve(false);
+            slot.total_required_subtasks = src.total_required_subtasks;
+            slot.logical_block_num = src.logical_block_num;
+        }
+
+        if (!reuse_static) {
+            payload.tensor_count = src.tensor_count;
+            payload.scalar_count = src.scalar_count;
+        }
+        payload.fanin_actual_count = 0;
+        payload.fanin_spill_start = 0;
+        payload.fanin_spill_pool = nullptr;
+        payload.predicate = DispatchPredicate{};
+        for (int32_t j = 0; j < src.tensor_count; ++j) {
+            const uint32_t tensor_index = src.tensor_offset + static_cast<uint32_t>(j);
+            Tensor &tensor = payload.tensors[j];
+            if (!reuse_static) tensor.copy(templ.tensors[tensor_index]);
+            const PTO2GraphTensorSourceRef &source_ref = templ.tensor_sources[tensor_index];
+            if (source_ref.source == PTO2GraphTensorSource::BOUNDARY_EXACT) {
+                tensor.copy(args.tensor(source_ref.source_index));
+            } else if (source_ref.source == PTO2GraphTensorSource::BOUNDARY_VIEW) {
+                const Tensor &boundary = args.tensor(source_ref.source_index);
+                tensor.buffer = boundary.buffer;
+                tensor.owner_task_id = boundary.owner_task_id;
+                tensor.start_offset = boundary.start_offset + source_ref.packed_offset;
+                tensor.version = boundary.version;
+                tensor.child_memory = boundary.child_memory;
+            } else {
+                int32_t producer_index = source_ref.source == PTO2GraphTensorSource::OWN_OUTPUT ?
+                                             i :
+                                             static_cast<int32_t>(source_ref.source_index);
+                PTO2TaskDescriptor &producer = execution->node_storage[producer_index].task;
+                tensor.buffer.addr = reinterpret_cast<uint64_t>(producer.packed_buffer_base) + source_ref.packed_offset;
+                tensor.owner_task_id = producer.task_id;
+            }
+        }
+        for (int32_t j = 0; j < src.scalar_count; ++j) {
+            const uint32_t scalar_index = src.scalar_offset + static_cast<uint32_t>(j);
+            uint16_t source_index = templ.scalar_source_indices[scalar_index];
+            if (!reuse_static || source_index != PTO2_TASK_ARG_STATIC) {
+                payload.scalars[j] =
+                    source_index == PTO2_TASK_ARG_STATIC ? templ.scalars[scalar_index] : args.scalar(source_index);
+            }
+        }
+        graph_reset_payload(&payload);
+    }
+    if (nodes_materialized != nullptr) *nodes_materialized = last_node - first_node;
+
+    if (execution->materialized_nodes < templ.task_count) {
+        execution->materialize_busy.store(0, std::memory_order_release);
+        return PTO2GraphMaterializeResult::PENDING;
+    }
+
+    execution->nodes = execution->node_storage;
+    execution->materialized_graph_key = execution->graph_key;
+    execution->materialized_node_count = execution->node_count;
+    pto2_graph_execution_publish_materialized(*execution);
+    execution->materialize_busy.store(0, std::memory_order_release);
+    return PTO2GraphMaterializeResult::PREPARED;
+}
+
 static PTO2OutputLayout calculate_output_layout(const L0TaskArgs &args) {
     PTO2OutputLayout layout;
     for (int32_t i = 0; i < args.tensor_count(); i++) {
@@ -540,6 +1673,8 @@ static bool prepare_task(
     out->slot_state = &orch->sm_header->ring.get_slot_state_by_slot(out->alloc_result.slot);
     out->task = &orch->sm_header->ring.task_descriptors[out->alloc_result.slot];
     out->payload = &orch->sm_header->ring.task_payloads[out->alloc_result.slot];
+
+    graph_record_begin_task(out->task_id);
 
     out->payload->prefetch(args.tensor_count(), args.scalar_count());
 
@@ -927,6 +2062,9 @@ static TaskOutputTensors submit_task_common(
     task.task_timing_slot = args.task_timing_slot();
     task.packed_buffer_base = prepared.alloc_result.packed_base;
     task.packed_buffer_end = prepared.alloc_result.packed_end;
+    task.graph_execution = nullptr;
+    task.graph_node_index = -1;
+    task.kind = static_cast<bool>(active_mask) ? PTO2TaskKind::KERNEL : PTO2TaskKind::DUMMY;
 
     // fanout_count was already incremented per live producer inside
     // append_fanin_or_fail, atomically with the consumed/generation check under
@@ -963,6 +2101,7 @@ static TaskOutputTensors submit_task_common(
             payload.predicate.op = PredicateOp::NONE;
         }
     }
+    graph_record_task(prepared, args);
 #if SIMPLER_DFX
     if (is_dump_args_enabled()) {
         if (args.scalar_count() > 0) {
@@ -1188,6 +2327,9 @@ TaskOutputTensors PTO2OrchestratorState::alloc_tensors(const L0TaskArgs &args) {
     task.task_timing_slot = TASK_TIMING_SLOT_NONE;
     task.packed_buffer_base = prepared.alloc_result.packed_base;
     task.packed_buffer_end = prepared.alloc_result.packed_end;
+    task.graph_execution = nullptr;
+    task.graph_node_index = -1;
+    task.kind = PTO2TaskKind::DUMMY;
 
     TaskOutputTensors outputs;
     outputs.set_task_id(prepared.task_id);
@@ -1217,6 +2359,7 @@ TaskOutputTensors PTO2OrchestratorState::alloc_tensors(const L0TaskArgs &args) {
         prepared.slot_state->allow_early_resolve = true;
         prepared.slot_state->mark_completed();
     }
+    graph_record_task(prepared, args);
     orch->inline_completed_tasks++;
 
     CYCLE_COUNT_LAP(g_orch_fanin_cycle);
@@ -1233,12 +2376,81 @@ TaskOutputTensors PTO2OrchestratorState::alloc_tensors(const L0TaskArgs &args) {
     return outputs;
 }
 
+PTO2GraphScopeResult
+PTO2OrchestratorState::graph_begin(uint64_t graph_key, const L2TaskArgs &args, uint64_t callable_hash) {
+    PTO2GraphScopeResult result;
+    auto *orch = this;
+    if (g_graph_recording.pending_finalize) finalize_pending_graph_definition();
+
+    ChipStorageTaskArgs args_snapshot;
+    if (orch->fatal || !graph_snapshot_args(args, &args_snapshot)) return result;
+    if (g_graph_recording.active) {
+        graph_mark_unsupported(PTO2_GRAPH_UNSUPPORTED_NESTED_SCOPE);
+        return result;
+    }
+
+    uint64_t full_key = graph_full_key(callable_hash, graph_key);
+    PTO2GraphDefinition *cached = find_graph_definition(full_key);
+    if (cached != nullptr) {
+#if SIMPLER_DFX
+        bool record_replay_orch = orch->l2_swimlane_level >= L2SwimlaneLevel::ORCH_PHASES;
+        uint64_t replay_start_ts = record_replay_orch ? get_sys_cnt_aicpu() : 0;
+#endif
+        uint64_t replay_task_id = PTO2TaskId::invalid().raw;
+        if (graph_submit_definition(orch, *cached, args_snapshot, &replay_task_id)) {
+#if SIMPLER_DFX
+            if (record_replay_orch) {
+                record_host_orch_phase(orch, replay_start_ts, get_sys_cnt_aicpu(), replay_task_id, g_orch_submit_idx++);
+            }
+#endif
+            LOG_INFO_V0(
+                "[GraphExecution] submit key=0x%llx nodes=%d", static_cast<unsigned long long>(full_key),
+                cached->task_count
+            );
+            result.execute_block = false;
+            result.recording = false;
+            result.task_id = PTO2TaskId{replay_task_id};
+            return result;
+        }
+        if (orch->fatal) return result;
+    }
+
+    reset_graph_recording();
+    g_graph_recording.active = true;
+    g_graph_recording.full_key = full_key;
+    g_graph_recording.start_local_task_id = orch->ring.task_allocator.task_head();
+    g_graph_recording.args = args_snapshot;
+    reset_graph_definition_header(&g_graph_recording.temp);
+    g_graph_recording.temp.full_key = full_key;
+    result.execute_block = true;
+    result.recording = true;
+    return result;
+}
+
+void PTO2OrchestratorState::graph_end() {
+    if (!g_graph_recording.active) return;
+    if (g_graph_recording.unsupported || g_graph_recording.temp.task_count <= 0) {
+        if (g_graph_recording.unsupported) {
+            LOG_WARN(
+                "Graph Execution definition skipped: reason=%d task_index=%d tensor_index=%d recorded_tasks=%d",
+                g_graph_recording.unsupported_reason, g_graph_recording.unsupported_task_index,
+                g_graph_recording.unsupported_tensor_index, g_graph_recording.temp.task_count
+            );
+        }
+        reset_graph_recording();
+        return;
+    }
+    g_graph_recording.active = false;
+    g_graph_recording.pending_finalize = true;
+}
+
 // =============================================================================
 // Flow Control
 // =============================================================================
 
 void PTO2OrchestratorState::mark_done() {
     auto *orch = this;
+    if (!orch->fatal) finalize_pending_graph_definition();
     for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
         int32_t total_tasks = orch->ring.task_allocator.active_count();
         if (total_tasks > 0) {

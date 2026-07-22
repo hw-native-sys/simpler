@@ -66,6 +66,11 @@ enum class PTO2ScopeMode : uint8_t {
     MANUAL = 1,
 };
 
+// Scalar values copied from L2TaskArgs retain their invocation argument index.
+// Scalars constructed directly inside a graph function are part of the static
+// Graph Definition.
+inline constexpr uint16_t PTO2_TASK_ARG_STATIC = UINT16_MAX;
+
 /**
  * TaskOutputTensors — returned by submit, holds materialized output Tensors.
  *
@@ -176,6 +181,25 @@ public:
     bool refers_to(const TensorCreateInfo *ci) const { return create_info_ == ci; }
 };
 
+class ScalarRef {
+public:
+    ScalarRef(uint64_t value, uint16_t source_index) :
+        value_(value),
+        source_index_(source_index) {}
+
+    operator uint64_t() const { return value_; }
+    uint64_t value() const { return value_; }
+    uint16_t source_index() const { return source_index_; }
+
+private:
+    uint64_t value_;
+    uint16_t source_index_;
+};
+
+template <typename T>
+inline constexpr bool is_task_scalar_arg_v =
+    is_supported_scalar_arg_v<T> || std::is_same_v<std::remove_cv_t<std::remove_reference_t<T>>, ScalarRef>;
+
 /**
  * Aggregated argument container for pto_submit_task
  *
@@ -252,6 +276,21 @@ struct Arg : TaskArgsTpl<TensorRef, uint64_t, MaxT, MaxS, TensorArgType> {
     bool allow_early_resolve_{false};
     void set_allow_early_resolve(bool v = true) { allow_early_resolve_ = v; }
     bool allow_early_resolve() const { return allow_early_resolve_; }
+
+    ScalarRef scalar(int32_t index) const {
+        always_assert(index >= 0 && index < scalar_count_);
+        return ScalarRef{scalars_[index], scalar_source_indices_[index]};
+    }
+
+    uint64_t &scalar(int32_t index) {
+        always_assert(index >= 0 && index < scalar_count_);
+        return scalars_[index];
+    }
+
+    uint16_t scalar_source_index(int32_t index) const {
+        always_assert(index >= 0 && index < scalar_count_);
+        return scalar_source_indices_[index];
+    }
 
     // Dispatch predicate (codegen-author set; default op == NONE = always
     // dispatch). A FALSE result at the dispatch point retires the task inline
@@ -427,7 +466,10 @@ struct Arg : TaskArgsTpl<TensorRef, uint64_t, MaxT, MaxS, TensorArgType> {
     template <typename... Args>
     void add_scalar(Args &&...args) {
         static_assert(sizeof...(Args) >= 1, "add_scalar: at least one argument required");
-        static_assert((is_supported_scalar_arg_v<Args> && ...), "add_scalar: all types must be arithmetic or enum");
+        static_assert(
+            (is_task_scalar_arg_v<Args> && ...),
+            "add_scalar: all types must be arithmetic, enum, or scalar references from another Args object"
+        );
         if (scalar_count_ + sizeof...(Args) > MaxS) {
             set_error(scalar_cap_msg());
             return;
@@ -441,6 +483,8 @@ struct Arg : TaskArgsTpl<TensorRef, uint64_t, MaxT, MaxS, TensorArgType> {
             return;
         }
         memcpy(&scalars_[scalar_count_], values, count * sizeof(uint64_t));
+        for (int i = 0; i < count; ++i)
+            scalar_source_indices_[scalar_count_ + i] = PTO2_TASK_ARG_STATIC;
 #if SIMPLER_DFX
         dump_arg_selection_.clear_scalar_metadata(scalar_count_, count);
 #endif
@@ -479,6 +523,8 @@ struct Arg : TaskArgsTpl<TensorRef, uint64_t, MaxT, MaxS, TensorArgType> {
 #if SIMPLER_DFX
         dump_arg_selection_.clear_scalar_metadata(scalar_count_, count);
 #endif
+        for (int i = 0; i < count; ++i)
+            scalar_source_indices_[scalar_count_ + i] = PTO2_TASK_ARG_STATIC;
         scalar_count_ += count;
     }
 
@@ -496,6 +542,9 @@ struct Arg : TaskArgsTpl<TensorRef, uint64_t, MaxT, MaxS, TensorArgType> {
             return;
         }
         memcpy(&scalars_[scalar_count_], &src.scalars_[src_offset], count * sizeof(uint64_t));
+        memcpy(
+            &scalar_source_indices_[scalar_count_], &src.scalar_source_indices_[src_offset], count * sizeof(uint16_t)
+        );
 #if SIMPLER_DFX
         dump_arg_selection_.copy_scalar_dtypes_from(src.dump_arg_selection_, scalar_count_, src_offset, count);
 #endif
@@ -515,6 +564,7 @@ private:
 #endif
     const PTO2TaskId *explicit_deps_{nullptr};
     uint32_t explicit_dep_count_{0};
+    uint16_t scalar_source_indices_[MaxS]{};
 #if SIMPLER_DFX
     template <typename T>
     static constexpr bool is_supported_dump_arg_v =
@@ -535,16 +585,24 @@ private:
     }
 
     template <typename T>
-    void add_scalar_one(T &&value) {
-        scalars_[scalar_count_] = to_u64(value);
+    void add_scalar_one(T &&value, uint16_t source_index = PTO2_TASK_ARG_STATIC) {
+        using ValueT = std::remove_cv_t<std::remove_reference_t<T>>;
+        if constexpr (std::is_same_v<ValueT, ScalarRef>) {
+            scalars_[scalar_count_] = value.value();
+            scalar_source_indices_[scalar_count_] =
+                source_index == PTO2_TASK_ARG_STATIC ? value.source_index() : source_index;
+        } else {
+            scalars_[scalar_count_] = to_u64(value);
+            scalar_source_indices_[scalar_count_] = source_index;
+        }
 #if SIMPLER_DFX
         uintptr_t scalar_source_ptr = 0;
         if constexpr (std::is_lvalue_reference_v<T>) {
             scalar_source_ptr = reinterpret_cast<uintptr_t>(&value);
         }
-        dump_arg_selection_.record_scalar_source(
-            scalar_count_, scalar_source_ptr, dtype_of<std::remove_cv_t<std::remove_reference_t<T>>>()
-        );
+        uint8_t scalar_dtype = static_cast<uint8_t>(DataType::UINT64);
+        if constexpr (!std::is_same_v<ValueT, ScalarRef>) scalar_dtype = dtype_of<ValueT>();
+        dump_arg_selection_.record_scalar_source(scalar_count_, scalar_source_ptr, scalar_dtype);
 #endif
         scalar_count_++;
     }
@@ -640,6 +698,15 @@ using L0TaskArgs = Arg<MAX_TENSOR_ARGS, MAX_SCALAR_ARGS>;
 // already-allocated inputs (capacity matches ChipStorageTaskArgs).
 // aicpu_orchestration_entry/config receive a const L2TaskArgs&.
 struct L2TaskArgs : Arg<CHIP_MAX_TENSOR_ARGS, CHIP_MAX_SCALAR_ARGS> {
+    using Base = Arg<CHIP_MAX_TENSOR_ARGS, CHIP_MAX_SCALAR_ARGS>;
+
+    ScalarRef scalar(int32_t index) const {
+        always_assert(index >= 0 && index < this->scalar_count_);
+        return ScalarRef{this->scalars_[index], static_cast<uint16_t>(index)};
+    }
+
+    uint64_t &scalar(int32_t index) { return Base::scalar(index); }
+
     // Build from the executor's ChipStorageTaskArgs: each input becomes a
     // TensorRef pointing at src's Tensor, so `src` must outlive this (on the
     // executor path src is runtime->orch_args_storage_, alive for the whole run).

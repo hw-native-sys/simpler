@@ -32,6 +32,7 @@
 #include <stdint.h>
 #include <sys/stat.h>
 #include <sys/time.h>
+#include <time.h>
 #include <unistd.h>
 
 #include <cerrno>
@@ -50,6 +51,7 @@
 #include "../common/pto_runtime_status.h"
 #include "../runtime/common.h"
 #include "../runtime/pto_orchestrator.h"
+#include "../runtime/pto_graph_execution.h"
 #include "../runtime/pto_runtime2.h"
 #include "../runtime/pto_shared_memory.h"
 #include "../runtime/pto_types.h"
@@ -73,6 +75,13 @@ static int64_t _now_ms() {
     struct timeval tv;
     gettimeofday(&tv, nullptr);
     return static_cast<int64_t>(tv.tv_sec) * 1000 + tv.tv_usec / 1000;
+}
+
+static uint64_t host_prof_cycles() {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return static_cast<uint64_t>(ts.tv_sec) * PLATFORM_PROF_SYS_CNT_FREQ +
+           static_cast<uint64_t>(ts.tv_nsec) * PLATFORM_PROF_SYS_CNT_FREQ / 1000000000ull;
 }
 
 static bool is_power_of_2_u64(uint64_t value) { return value != 0 && (value & (value - 1)) == 0; }
@@ -478,17 +487,78 @@ static bool relocate_host_orch_image(
         reloc_ready(rt->scheduler.ready_sync_queues[i]);
     }
     reloc_ready(rt->scheduler.dummy_ready_queue);
+    reloc_ready(rt->scheduler.graph_ready_queue);
+    reloc_ready(rt->scheduler.graph_prepare_queue);
     for (int i = 0; i < PTO2_NUM_RESOURCE_SHAPES; i++) {
         reloc_ready(rt->scheduler.early_dispatch_queues[i]);
     }
     return ok;
 }
 
+static void discard_pending_graph_submissions(PTO2GraphSubmission *submission) {
+    while (submission != nullptr) {
+        PTO2GraphSubmission *next = submission->upload_next;
+        pto2_graph_submission_discard(submission);
+        submission = next;
+    }
+}
+
+// Graph definitions live in a process-local cache, while each invocation's
+// compact execution image must be device-visible. Upload only the bytes used
+// by that invocation, rewrite the single outer Graph descriptor to the device
+// image, and return the host block to its bounded pool immediately.
+static bool upload_pending_graph_executions(
+    Runtime *runtime, const HostApi *api, PTO2Runtime *rt, uintptr_t host_sm_begin, size_t host_sm_size,
+    intptr_t sm_delta
+) {
+    PTO2GraphSubmission *submission = rt->orchestrator.pending_graph_uploads;
+    rt->orchestrator.pending_graph_uploads = nullptr;
+
+    while (submission != nullptr) {
+        PTO2GraphSubmission *next = submission->upload_next;
+        PTO2TaskSlotState *outer_slot = submission->outer_slot;
+        PTO2TaskDescriptor *outer_task = outer_slot == nullptr ? nullptr : outer_slot->task;
+        const size_t bytes = pto2_graph_submission_allocation_bytes(submission);
+        if (outer_task == nullptr || outer_task->kind != PTO2TaskKind::GRAPH || bytes == 0) {
+            LOG_ERROR("host-orch: invalid pending Graph submission image");
+            pto2_graph_submission_discard(submission);
+            discard_pending_graph_submissions(next);
+            return false;
+        }
+
+        void *device_submission = api->device_malloc(bytes);
+        if (device_submission == nullptr) {
+            LOG_ERROR("host-orch: failed to allocate %zu bytes for Graph submission", bytes);
+            pto2_graph_submission_discard(submission);
+            discard_pending_graph_submissions(next);
+            return false;
+        }
+
+        if (!pto2_graph_definition_relocate_for_upload(submission, device_submission) ||
+            !pto2_graph_submission_relocate_for_upload(
+                submission, device_submission, host_sm_begin, host_sm_size, sm_delta
+            ) ||
+            api->copy_to_device(device_submission, submission, bytes) != 0) {
+            LOG_ERROR("host-orch: failed to relocate or upload Graph submission image");
+            api->device_free(device_submission);
+            pto2_graph_submission_discard(submission);
+            discard_pending_graph_submissions(next);
+            return false;
+        }
+
+        outer_task->graph_execution = device_submission;
+        runtime->tensor_pairs_.push_back({nullptr, device_submission, bytes, false});
+        pto2_graph_submission_release_uploaded(submission);
+        submission = next;
+    }
+    return true;
+}
+
 int32_t run_host_orchestration(
     Runtime *runtime, const HostApi *api, PTO2Runtime *rt, DeviceArena &host_arena,
     const PTO2RuntimeArenaLayout &layout, void *device_sm, uint64_t sm_size, void *device_arena, void *gm_heap,
     const uint64_t eff_heap_sizes[PTO2_MAX_RING_DEPTH], const uint64_t eff_task_window_sizes[PTO2_MAX_RING_DEPTH],
-    void *host_orch_func_ptr, const L2TaskArgs &orch_l2
+    void *host_orch_func_ptr, const L2TaskArgs &orch_l2, bool capture_host_orch
 ) {
     std::vector<uint8_t> host_sm_buf(sm_size, 0);
     void *host_sm = host_sm_buf.data();
@@ -526,6 +596,7 @@ int32_t run_host_orchestration(
     // rt_scope_* / rt_orchestration_done) and the orch .so's own copy (used by
     // its inline rt_submit_* -> current_runtime()).
     const HostOrchEntryPoints *eps = reinterpret_cast<const HostOrchEntryPoints *>(host_orch_func_ptr);
+    rt->active_callable_hash = reinterpret_cast<uint64_t>(eps->entry);
     framework_bind_runtime(rt);
     if (eps->bind != nullptr) {
         eps->bind(rt);
@@ -534,10 +605,45 @@ int32_t run_host_orchestration(
         return -1;
     }
 
+    // Host orchestration precedes collector initialization. At level 4 keep
+    // both the whole-orchestration envelope and one record per task/Graph
+    // submit. Point the current orchestrator state at the per-run capture
+    // buffer before entering the user function and retain the populated prefix
+    // afterwards.
+    runtime->host_orch_phase_records_.clear();
+    runtime->host_orch_start_cycles_ = 0;
+    runtime->host_orch_end_cycles_ = 0;
+#if SIMPLER_DFX
+    if (capture_host_orch) {
+        rt->orchestrator.l2_swimlane_level = L2SwimlaneLevel::ORCH_PHASES;
+        size_t record_capacity = static_cast<size_t>(eff_task_window_sizes[0]);
+        if (record_capacity > PLATFORM_PHASE_RECORDS_PER_THREAD) {
+            record_capacity = PLATFORM_PHASE_RECORDS_PER_THREAD;
+        }
+        runtime->host_orch_phase_records_.resize(record_capacity);
+        rt->orchestrator.host_orch_phase_records = runtime->host_orch_phase_records_.data();
+        rt->orchestrator.host_orch_phase_capacity = record_capacity;
+        rt->orchestrator.host_orch_phase_count = 0;
+        runtime->host_orch_start_cycles_ = host_prof_cycles();
+    }
+#endif
     rt_scope_begin(rt);
     eps->entry(orch_l2);
     rt_scope_end(rt);
     rt_orchestration_done(rt);
+#if SIMPLER_DFX
+    if (capture_host_orch) {
+        runtime->host_orch_end_cycles_ = host_prof_cycles();
+        size_t record_count = rt->orchestrator.host_orch_phase_count;
+        if (record_count > runtime->host_orch_phase_records_.size()) {
+            record_count = runtime->host_orch_phase_records_.size();
+        }
+        runtime->host_orch_phase_records_.resize(record_count);
+        rt->orchestrator.host_orch_phase_records = nullptr;
+        rt->orchestrator.host_orch_phase_capacity = 0;
+        rt->orchestrator.host_orch_phase_count = 0;
+    }
+#endif
 
     int32_t total_tasks = pto2_sm_layout::ring_current_task_index_addr(host_sm)->load(std::memory_order_acquire);
 
@@ -550,6 +656,9 @@ int32_t run_host_orchestration(
                              static_cast<int64_t>(reinterpret_cast<uint64_t>(host_sm));
     const int64_t arena_delta = static_cast<int64_t>(reinterpret_cast<uint64_t>(device_arena)) -
                                 static_cast<int64_t>(reinterpret_cast<uint64_t>(host_arena.base()));
+    if (!upload_pending_graph_executions(runtime, api, rt, reinterpret_cast<uintptr_t>(host_sm), sm_size, sm_delta)) {
+        return -1;
+    }
     if (!relocate_host_orch_image(
             host_sm_handle, rt, reinterpret_cast<uint64_t>(host_sm), sm_size, sm_delta,
             reinterpret_cast<uint64_t>(host_arena.base()), layout.arena_size, arena_delta
@@ -685,7 +794,7 @@ register_callable_impl(const ChipCallable *callable, uint64_t (*upload_fn)(const
 extern "C" int bind_callable_to_runtime_impl(
     Runtime *runtime, const HostApi *api, const ChipStorageTaskArgs *orch_args, void *host_orch_func_ptr,
     const ArgDirection *signature, int sig_count, const uint64_t *ring_task_window, const uint64_t *ring_heap,
-    const uint64_t *ring_dep_pool
+    const uint64_t *ring_dep_pool, int32_t l2_swimlane_level
 ) {
     if (runtime == nullptr) {
         LOG_ERROR("Runtime pointer is null");
@@ -900,7 +1009,8 @@ extern "C" int bind_callable_to_runtime_impl(
         orch_l2.create_from_chip_args(device_args);
         int32_t total_tasks = run_host_orchestration(
             runtime, api, rt, host_arena, layout, sm_ptr, sm_size, runtime_arena_dev, gm_heap, eff_heap_sizes,
-            eff_task_window_sizes, host_orch_func_ptr, orch_l2
+            eff_task_window_sizes, host_orch_func_ptr, orch_l2,
+            l2_swimlane_level >= static_cast<int32_t>(L2SwimlaneLevel::ORCH_PHASES)
         );
         if (total_tasks < 0) {
             LOG_ERROR("host-orch: orchestration run failed");
@@ -1027,7 +1137,9 @@ extern "C" int validate_runtime_impl(Runtime *runtime, const HostApi *api, int e
             // Release the SVM host mapping installed at staging time before
             // freeing the device buffer (unregister-before-free, as the HAL
             // requires). No-op on sim. Keyed by dev_ptr.
-            api->unregister_device_memory_from_host(tensor_pairs[i].dev_ptr);
+            if (tensor_pairs[i].host_ptr != nullptr) {
+                api->unregister_device_memory_from_host(tensor_pairs[i].dev_ptr);
+            }
             api->device_free(tensor_pairs[i].dev_ptr);
         }
     }

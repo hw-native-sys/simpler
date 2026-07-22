@@ -234,6 +234,12 @@ void l2_swimlane_aicpu_record_predicated_skip(
     int thread_idx, uint64_t complete_time, uint32_t loop_iter, uint64_t task_id
 );
 
+/** Record one bounded Scheduler-side Graph materialization slice. */
+void l2_swimlane_aicpu_record_graph_prepare(
+    int thread_idx, uint64_t start_time, uint64_t end_time, uint32_t loop_iter, uint64_t task_id,
+    uint32_t nodes_materialized
+);
+
 /**
  * Set orchestrator thread index for per-task phase recording
  *

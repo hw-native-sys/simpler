@@ -36,6 +36,7 @@
 
 #include "utils/device_arena.h"
 #include "pto_runtime2_types.h"
+#include "pto_graph_cache.h"
 #include "pto_submit_types.h"
 #include "pto_shared_memory.h"
 #include "pto_ring_buffer.h"
@@ -89,6 +90,8 @@ struct PTO2RuntimeOps {
     );
     TaskOutputTensors (*alloc_tensors)(PTO2Runtime *rt, const L0TaskArgs &args);
     TaskOutputTensors (*submit_dummy_task)(PTO2Runtime *rt, const L0TaskArgs &args);
+    PTO2GraphScopeResult (*graph_begin)(PTO2Runtime *rt, uint64_t graph_key, const L2TaskArgs &args);
+    void (*graph_end)(PTO2Runtime *rt);
     // Stash the call-site captured by PTO2ScopeGuard into the [ScopeStats]
     // collector. Always present in the struct to keep ops-table layout stable
     // across SIMPLER_DFX settings; set to nullptr at SIMPLER_DFX=0.
@@ -146,6 +149,9 @@ struct PTO2Runtime {
 
     // Statistics
     int64_t total_cycles;
+    // Graph definitions are process-local host cache entries. The callable
+    // identity prevents two orchestration DSOs from sharing the same key.
+    uint64_t active_callable_hash;
 
     // Prebuilt-arena fast path metadata. Carries every offset
     // wire_arena_pointers needs at AICPU boot so the AICPU can reconstruct
