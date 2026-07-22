@@ -194,11 +194,33 @@ class Orchestrator:
             self._worker._stage_host_buffers_for_chip_submit(c_args)
         final_worker_ids = _remote_data_eligible_worker_ids(remote_sidecar, eligible_worker_ids)
         cpp_worker_id = int(worker)
-        captured_refs = self._worker._capture_remote_sidecar_refs(remote_sidecar) if self._worker is not None else []
+        worker = self._worker
+        # Do the (fallible) kind4 provenance analysis BEFORE capturing remote slot
+        # refs, so an exception here can never leave captured refs neither
+        # released nor adopted (which would defer a remote free forever). Capture
+        # is the last step before the rollback try.
+        child_ptrs = worker._child_ptrs_in_args(c_args) if worker is not None else []
+        prov_guard: Any = contextlib.nullcontext()
+        candidates: set[int] = set()
+        if child_ptrs and worker is not None:
+            candidates = self._child_dispatch_candidates(cpp_worker_id, final_worker_ids)
+            prov_guard = worker._child_prov_lock
+        captured_refs = worker._capture_remote_sidecar_refs(remote_sidecar) if worker is not None else []
         try:
-            self._o.submit_next_level(
-                digest, kind, target_namespace, c_args, cfg, cpp_worker_id, final_worker_ids, remote_sidecar
-            )
+            with prov_guard:
+                if child_ptrs and worker is not None:
+                    worker._child_prov_check_dispatch(child_ptrs, candidates, api="submit_next_level")
+                    # The child_memory arg resolved to a unique owner; pass that
+                    # worker as the effective affinity so C++ keys the child
+                    # TensorKey by its owner (worker_id), not the raw -1.
+                    # Otherwise the same buffer submitted once as -1 and once as W
+                    # yields two keys (ptr,-1) / (ptr,W) and its dependency is
+                    # missed. The unique target is exactly what the scheduler
+                    # would have picked, so pinning it changes no scheduling.
+                    cpp_worker_id = next(iter(candidates))
+                self._o.submit_next_level(
+                    digest, kind, target_namespace, c_args, cfg, cpp_worker_id, final_worker_ids, remote_sidecar
+                )
         except BaseException:
             if self._worker is not None:
                 self._worker._release_remote_slot_refs(captured_refs)
@@ -206,7 +228,23 @@ class Orchestrator:
         if self._worker is not None:
             self._worker._adopt_remote_slot_refs(captured_refs)
 
-    def submit_next_level_group(
+    def _child_dispatch_candidates(self, cpp_worker_id: int, eligible_ids: Any) -> set[int]:
+        """Resolve the set of eligible target workers for a kind4 dispatch.
+
+        A pinned ``worker`` is the sole candidate; an unpinned ``-1`` falls back
+        to the callable's eligible set, or the full next-level pool when the
+        callable is unconstrained. ``_child_prov_check_dispatch`` rejects any
+        result that is not a single unique target.
+        """
+        if cpp_worker_id >= 0:
+            return {cpp_worker_id}
+        if eligible_ids:
+            return {int(w) for w in eligible_ids}
+        if self._worker is None:
+            return set()
+        return set(self._worker._next_level_target_ids())
+
+    def submit_next_level_group(  # noqa: PLR0912 -- linear per-member sidecar + eligibility + kind4-provenance passes, one branch each
         self,
         callable_handle: Any,
         args_list: list,
@@ -270,14 +308,67 @@ class Orchestrator:
             else []
         )
         cpp_worker_ids = worker_ids
+        # Per-member kind4 dispatch guard: each member's child_memory pointers
+        # must resolve to that member's unique eligible target and be live there.
+        # Run this (fallible) analysis BEFORE capturing remote slot refs, so an
+        # exception here can never strand captured refs outside the rollback try.
+        worker = self._worker
+        member_checks: list[tuple[int, list[tuple[int, int]], set[int]]] = []
+        if worker is not None:
+            for g, c_args in enumerate(c_args_list):
+                child_ptrs = worker._child_ptrs_in_args(c_args)
+                if not child_ptrs:
+                    continue
+                worker_pin = cpp_worker_ids[g] if g < len(cpp_worker_ids) else -1
+                eligible_g = worker_id_sets[g] if g < len(worker_id_sets) else []
+                member_checks.append((g, child_ptrs, self._child_dispatch_candidates(int(worker_pin), eligible_g)))
+        prov_guard: Any = (
+            worker._child_prov_lock if (worker is not None and member_checks) else contextlib.nullcontext()
+        )
         captured_refs: list[Any] = []
         if self._worker is not None and remote_sidecars is not None:
             for sidecar in remote_sidecars:
                 captured_refs.extend(self._worker._capture_remote_sidecar_refs(sidecar))
         try:
-            self._o.submit_next_level_group(
-                digest, kind, target_namespace, c_args_list, cfg, cpp_worker_ids, worker_id_sets, remote_sidecars
-            )
+            with prov_guard:
+                if member_checks:
+                    # Materialise a full per-member affinity so each child member's
+                    # resolved owner is the effective affinity C++ keys its child
+                    # TensorKey by (see the single-submit note); non-child members
+                    # keep their original affinity / -1. Only an empty/None
+                    # ``workers`` is padded — a non-empty list must already be one
+                    # per member (C++ enforces this), so padding a short one would
+                    # silently bypass that length check.
+                    if cpp_worker_ids:
+                        if len(cpp_worker_ids) != len(c_args_list):
+                            raise ValueError(
+                                f"submit_next_level_group: workers length {len(cpp_worker_ids)} "
+                                f"!= {len(c_args_list)} args"
+                            )
+                        cpp_worker_ids = list(cpp_worker_ids)
+                    else:
+                        cpp_worker_ids = [-1] * len(c_args_list)
+                for g, child_ptrs, candidates in member_checks:
+                    assert worker is not None  # member_checks is only populated when worker is present
+                    worker._child_prov_check_dispatch(child_ptrs, candidates, api="submit_next_level_group")
+                    cpp_worker_ids[g] = next(iter(candidates))
+                # A group dispatches its members in parallel to distinct workers.
+                # Two members pinned to the same owner (e.g. two child args on the
+                # same chip) would give the same affinity twice; the scheduler sees
+                # that WorkerThread idle for both and serializes them on one thread.
+                # This rejects that duplicate-pinned case only — full injective
+                # feasibility (e.g. a wildcard member left with no free worker once
+                # a child member is pinned) is the scheduler's pre-existing capacity
+                # concern, not narrowed here.
+                pinned = [wid for wid in cpp_worker_ids if wid >= 0]
+                if len(pinned) != len(set(pinned)):
+                    raise ValueError(
+                        f"submit_next_level_group: members resolve to duplicate target workers "
+                        f"{cpp_worker_ids} — a group must dispatch to distinct workers"
+                    )
+                self._o.submit_next_level_group(
+                    digest, kind, target_namespace, c_args_list, cfg, cpp_worker_ids, worker_id_sets, remote_sidecars
+                )
         except BaseException:
             if self._worker is not None:
                 self._worker._release_remote_slot_refs(captured_refs)
@@ -422,20 +513,58 @@ class Orchestrator:
             self._o.scope_end()
 
     def malloc(self, worker_id: int, size: int) -> int:
-        """Allocate memory on next-level worker *worker_id*. Returns a pointer."""
-        return int(self._o.malloc(int(worker_id), int(size)))
+        """Allocate memory on next-level worker *worker_id*. Returns a pointer.
+
+        This is the single L3 choke for kind4 device memory: ``Worker.malloc``
+        also funnels through here, as does a user's direct ``orch.malloc``. The
+        returned pointer's ``(worker_id, ptr)`` provenance is recorded so a later
+        free / copy / kind4 dispatch to the wrong worker is rejected.
+        """
+        wid, sz = int(worker_id), int(size)
+        if self._worker is None:
+            return int(self._o.malloc(wid, sz))
+        with self._worker._child_prov_lock:
+            ptr = int(self._o.malloc(wid, sz))
+            self._worker._child_prov_record_malloc(wid, ptr)
+            return ptr
 
     def free(self, worker_id: int, ptr: int) -> None:
         """Free memory on next-level worker *worker_id*."""
-        self._o.free(int(worker_id), int(ptr))
+        wid, p = int(worker_id), int(ptr)
+        if self._worker is None:
+            self._o.free(wid, p)
+            return
+        with self._worker._child_prov_lock:
+            # Safety-first commit barrier: revoke provenance BEFORE the native
+            # free. If the native free succeeds and an async unwind (e.g. a
+            # KeyboardInterrupt delivered after the binding returns) fires before
+            # a post-free clear could run, a freed address would stay live and a
+            # later copy/dispatch would re-authorize it — a UAF. Revoking first
+            # turns a native-free failure into a terminal leak (recoverable) but
+            # never re-authorizes a maybe-freed address.
+            self._worker._child_prov_require_malloc_base(wid, p, api="free")
+            self._worker._child_prov_clear_malloc(wid, p)
+            self._o.free(wid, p)
 
     def copy_to(self, worker_id: int, dst: int, src: int, size: int) -> None:
         """Copy *size* bytes from host *src* to worker *dst*."""
-        self._o.copy_to(int(worker_id), int(dst), int(src), int(size))
+        wid, d = int(worker_id), int(dst)
+        if self._worker is None:
+            self._o.copy_to(wid, d, int(src), int(size))
+            return
+        with self._worker._child_prov_lock:
+            self._worker._child_prov_require_live(wid, d, api="copy_to")
+            self._o.copy_to(wid, d, int(src), int(size))
 
     def copy_from(self, worker_id: int, dst: int, src: int, size: int) -> None:
         """Copy *size* bytes from worker *src* to host *dst*."""
-        self._o.copy_from(int(worker_id), int(dst), int(src), int(size))
+        wid, s = int(worker_id), int(src)
+        if self._worker is None:
+            self._o.copy_from(wid, int(dst), s, int(size))
+            return
+        with self._worker._child_prov_lock:
+            self._worker._child_prov_require_live(wid, s, api="copy_from")
+            self._o.copy_from(wid, int(dst), s, int(size))
 
     def alloc(self, shape: Sequence[int], dtype: DataType) -> Tensor:
         """Allocate a runtime-managed intermediate buffer.

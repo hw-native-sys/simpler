@@ -16,7 +16,10 @@ pattern in miniature.
 
 There is no `orch.free` — the buffer is reclaimed by `DeviceRunner::finalize`
 when `worker.close()` runs. That asymmetry is the whole point of
-`child_memory`: you opt out of the runtime's bookkeeping.
+`child_memory`: you opt out of the runtime's **automatic lifecycle** (no
+auto-malloc, no auto-free). The pointer is still tracked for **ownership**: its
+`(worker_id, ptr)` provenance is validated on every `copy_*` and dispatch, so it
+cannot be freed, copied, or run on a worker that did not allocate it.
 
 ## Run
 

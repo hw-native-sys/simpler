@@ -75,6 +75,7 @@ import sys
 import threading
 import time
 import uuid
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from multiprocessing.shared_memory import SharedMemory
 from typing import Any, cast
@@ -413,6 +414,32 @@ class _RemoteSession:
 
 
 _IdentitySnapshotEntry = tuple[bytes, Any, int, str, str]
+
+
+class _ChildProvEntry:
+    """Provenance record for one exact ``(worker_id, device_ptr)`` child pointer.
+
+    Typed rather than a bare presence bit because the same ``(worker_id, ptr)``
+    can carry more than one role at once: a ``malloc`` base and a CommDomain
+    window / carved buffer pointer can legally alias the same device address.
+    The key is live while ``malloc_owned or domain_allocation_ids``; only an
+    exact ``malloc`` base is ``free``-able, while a domain pointer is revoked by
+    its domain's release. Interior pointers are never recorded, so a pointer
+    that merely lands inside a live allocation has no entry and is rejected.
+    """
+
+    __slots__ = ("malloc_owned", "domain_allocation_ids")
+
+    def __init__(self) -> None:
+        self.malloc_owned: bool = False
+        self.domain_allocation_ids: set[int] = set()
+
+    def is_live(self) -> bool:
+        """True iff this entry still carries a role. A role-less entry is dead —
+        live checks are fail-closed on this, never on key presence alone, so an
+        entry momentarily left empty (e.g. an interrupted revoke) never
+        re-authorizes a freed pointer."""
+        return self.malloc_owned or bool(self.domain_allocation_ids)
 
 
 @dataclass
@@ -2049,6 +2076,19 @@ class Worker:
 
         self._live_l3_l2_regions: list[Any] = []
         self._l3_l2_orch_comm_host_buffers: dict[int, int] = {}
+
+        # Live-provenance of child (kind4, device) pointers, keyed on the exact
+        # ``(worker_id, device_ptr)`` composite: a raw device VA is not globally
+        # unique (two chips can return the same numeric address), so a single
+        # ptr->worker map would collide. Populated by malloc / allocate_domain,
+        # consumed by free / copy_to / copy_from and by kind4 argument dispatch
+        # so a device pointer is never freed, copied, or run on the wrong worker.
+        # Guarded by ``_child_prov_lock``, which makes each op atomic. Ordering is
+        # safety-first: malloc records only after the native alloc succeeds, while
+        # free (and domain release) revokes BEFORE the native free, so an
+        # interrupted op never leaves a freed address live. Cleared on close().
+        self._child_alloc_prov: dict[tuple[int, int], _ChildProvEntry] = {}
+        self._child_prov_lock = threading.Lock()
 
         # Post-fork zero-copy host buffers (``create_host_buffer``). Keyed by the
         # born-shared shm's mapped base (== the buffer's data_ptr); each entry maps
@@ -4780,6 +4820,16 @@ class Worker:
             _release_fn=self._release_domain_handle,
         )
         self._live_domains[name] = handle
+        # The backend windows are now live: record each chip's window base and
+        # every carved buffer pointer so a later kind4 (child_memory) dispatch of
+        # one of them is validated against its owning chip. Revoked by
+        # _release_domain_now just before the backend free (a commit barrier),
+        # not by the deferred marker — so the deferred window stays dispatchable.
+        with self._child_prov_lock:
+            for chip_idx, ctx in contexts.items():
+                self._child_prov_record_domain(chip_idx, int(ctx.local_window_base), allocation_id)
+                for buf_ptr in ctx.buffer_ptrs.values():
+                    self._child_prov_record_domain(chip_idx, int(buf_ptr), allocation_id)
         return handle
 
     def _release_domain_handle(self, handle: CommDomainHandle) -> None:
@@ -4829,6 +4879,15 @@ class Worker:
         deferred-release path and by the abort/close cleanup helpers."""
         if self._worker is None:
             return
+        # Revoke provenance BEFORE the physical free: once release begins the
+        # domain's pointers are no longer dispatchable. Revoking after the
+        # backend free would leave a use-after-free window (a concurrent
+        # copy/dispatch could still validate the being-freed pointer as live),
+        # and a partial/failed release would strand a freed pointer as "live"
+        # forever. Dropping first is the safe direction — a leak (if the backend
+        # free later fails) is recoverable; a use-after-free is not.
+        with self._child_prov_lock:
+            self._child_prov_drop_domain(handle.allocation_id)
         workers = handle.workers
         # Release payload is just the fixed header — no rank_ids tail; the
         # backend looked them up from its own per-allocation record at
@@ -4946,6 +5005,136 @@ class Worker:
     # with in-flight dispatch on the same chip mailbox.
     # ------------------------------------------------------------------
 
+    # ------------------------------------------------------------------
+    # Child (kind4, device) pointer provenance (guard ②)
+    #
+    # Every mutator/reader below assumes the caller holds ``_child_prov_lock``,
+    # so the enclosing op is atomic. Ordering is safety-first: record after a
+    # successful native alloc; revoke before the native free.
+    # ------------------------------------------------------------------
+
+    def _child_prov_record_malloc(self, worker_id: int, ptr: int) -> None:
+        """Mark ``(worker_id, ptr)`` as a live malloc base (after a successful malloc)."""
+        entry = self._child_alloc_prov.get((worker_id, ptr))
+        if entry is None:
+            # Fully initialise the role BEFORE inserting, so the dict never holds
+            # a role-less (dead) entry even if an async unwind lands here.
+            entry = _ChildProvEntry()
+            entry.malloc_owned = True
+            self._child_alloc_prov[(worker_id, ptr)] = entry
+        else:
+            entry.malloc_owned = True
+
+    def _child_prov_require_malloc_base(self, worker_id: int, ptr: int, *, api: str) -> None:
+        """Require ``(worker_id, ptr)`` to be an exact live malloc base (freeable).
+
+        Rejects a wrong-worker pointer, an interior/stale pointer, a double free,
+        and a CommDomain pointer (which is revoked by its domain's release, never
+        by ``free``).
+        """
+        entry = self._child_alloc_prov.get((worker_id, ptr))
+        if entry is None or not entry.malloc_owned:
+            raise ValueError(
+                f"Worker.{api}: device pointer 0x{ptr:x} is not a live malloc base on worker "
+                f"{worker_id} (wrong worker, already-freed/stale, an interior pointer, or a "
+                f"CommDomain buffer that must be released via release_domain)"
+            )
+
+    def _child_prov_clear_malloc(self, worker_id: int, ptr: int) -> None:
+        """Revoke the malloc role of ``(worker_id, ptr)`` — called BEFORE the native
+        free (safety-first), so an interrupted free never leaves the address live."""
+        key = (worker_id, ptr)
+        entry = self._child_alloc_prov.get(key)
+        if entry is None:
+            return
+        if entry.domain_allocation_ids:
+            entry.malloc_owned = False  # still live via a domain — keep the entry
+        else:
+            del self._child_alloc_prov[key]  # last role — delete directly, no empty state
+
+    def _child_prov_require_live(self, worker_id: int, ptr: int, *, api: str) -> None:
+        """Require ``(worker_id, ptr)`` to be a live child pointer (malloc or domain)."""
+        entry = self._child_alloc_prov.get((worker_id, ptr))
+        if entry is None or not entry.is_live():
+            raise ValueError(
+                f"Worker.{api}: device pointer 0x{ptr:x} is not a live allocation on worker "
+                f"{worker_id} (wrong worker, freed/stale, or an interior pointer)"
+            )
+
+    def _child_prov_record_domain(self, worker_id: int, ptr: int, allocation_id: int) -> None:
+        """Record a CommDomain window / buffer pointer at exact ``(worker_id, ptr)``."""
+        entry = self._child_alloc_prov.get((worker_id, ptr))
+        if entry is None:
+            entry = _ChildProvEntry()
+            self._child_alloc_prov[(worker_id, ptr)] = entry
+        entry.domain_allocation_ids.add(allocation_id)
+
+    def _child_prov_drop_domain(self, allocation_id: int) -> None:
+        """Drop every pointer recorded by a CommDomain allocation (at the start of
+        its physical release, before the backend free — see _release_domain_now)."""
+        for key in list(self._child_alloc_prov):
+            entry = self._child_alloc_prov[key]
+            if allocation_id not in entry.domain_allocation_ids:
+                continue
+            if entry.malloc_owned or len(entry.domain_allocation_ids) > 1:
+                entry.domain_allocation_ids.discard(allocation_id)  # other roles remain
+            else:
+                del self._child_alloc_prov[key]  # last role — delete directly, no empty state
+
+    @staticmethod
+    def _child_ptrs_in_args(args: Any) -> list[tuple[int, int]]:
+        """Extract ``(device_ptr, arg_index)`` for every child_memory tensor in ``args``."""
+        out: list[tuple[int, int]] = []
+        for i in range(args.tensor_count()):
+            tensor = args.tensor(i)
+            if tensor.child_memory:
+                out.append((int(tensor.data), i))
+        return out
+
+    def _next_level_target_ids(self) -> Sequence[int]:
+        """The full pool of dispatchable next-level worker ids.
+
+        Chip ids ``0..N`` at L3; the stable ``_next_level_worker_ids`` at L4+ (an
+        index range would not match the local/remote stable worker ids).
+        """
+        if self._chip_shms:
+            return range(len(self._chip_shms))
+        return self._next_level_worker_ids
+
+    def _child_prov_check_dispatch(
+        self, child_ptrs: list[tuple[int, int]], candidate_worker_ids: Any, *, api: str
+    ) -> None:
+        """Validate every child_memory pointer against its unique target worker.
+
+        A child_memory argument must resolve to exactly one eligible target
+        worker; ``0`` or ``>= 2`` candidates is ambiguous and rejected (judged on
+        the resolved eligibility, not the raw ``worker=-1``). The pointer must be
+        a live allocation on that target — else it is being routed to the wrong
+        worker, or is stale.
+        """
+        if not child_ptrs:
+            return
+        candidates = set(candidate_worker_ids)
+        if len(candidates) != 1:
+            arg_index = child_ptrs[0][1]
+            raise ValueError(
+                f"orch.{api}: child_memory argument (arg {arg_index}) cannot resolve a unique "
+                f"target worker (eligible={sorted(candidates)}); pin worker= explicitly"
+            )
+        target = next(iter(candidates))
+        for ptr, arg_index in child_ptrs:
+            entry = self._child_alloc_prov.get((target, ptr))
+            if entry is None or not entry.is_live():
+                raise ValueError(
+                    f"orch.{api}: child_memory argument (arg {arg_index}, ptr 0x{ptr:x}) is not a "
+                    f"live allocation on target worker {target} (wrong worker, stale, or interior pointer)"
+                )
+
+    def _clear_child_prov(self) -> None:
+        """Drop the whole child-pointer provenance table (close-path hygiene)."""
+        with self._child_prov_lock:
+            self._child_alloc_prov.clear()
+
     def _check_chip_worker_id(self, worker_id: int) -> None:
         """Range-check ``worker_id`` against the L3-level chip mailbox set.
 
@@ -4964,7 +5153,12 @@ class Worker:
         with self._operation_lease("malloc"):
             if self.level == 2:
                 assert self._chip_worker is not None
-                return self._chip_worker.malloc(size)
+                # L2 is a single chip; worker_id is meaningless there, so the
+                # provenance is keyed on the canonical worker 0.
+                with self._child_prov_lock:
+                    ptr = self._chip_worker.malloc(size)
+                    self._child_prov_record_malloc(0, int(ptr))
+                    return ptr
             self._check_chip_worker_id(worker_id)
             assert self._orch is not None
             return self._orch.malloc(worker_id, size)
@@ -4974,7 +5168,13 @@ class Worker:
         with self._operation_lease("free"):
             if self.level == 2:
                 assert self._chip_worker is not None
-                self._chip_worker.free(ptr)
+                # Safety-first commit barrier (mirrors Orchestrator.free): revoke
+                # provenance BEFORE the native free so an async unwind after a
+                # successful free can never leave a freed address live.
+                with self._child_prov_lock:
+                    self._child_prov_require_malloc_base(0, int(ptr), api="free")
+                    self._child_prov_clear_malloc(0, int(ptr))
+                    self._chip_worker.free(ptr)
                 return
             self._check_chip_worker_id(worker_id)
             assert self._orch is not None
@@ -4985,7 +5185,9 @@ class Worker:
         with self._operation_lease("copy_to"):
             if self.level == 2:
                 assert self._chip_worker is not None
-                self._chip_worker.copy_to(dst, src, size)
+                with self._child_prov_lock:
+                    self._child_prov_require_live(0, int(dst), api="copy_to")
+                    self._chip_worker.copy_to(dst, src, size)
                 return
             self._check_chip_worker_id(worker_id)
             assert self._orch is not None
@@ -4996,7 +5198,9 @@ class Worker:
         with self._operation_lease("copy_from"):
             if self.level == 2:
                 assert self._chip_worker is not None
-                self._chip_worker.copy_from(dst, src, size)
+                with self._child_prov_lock:
+                    self._child_prov_require_live(0, int(src), api="copy_from")
+                    self._chip_worker.copy_from(dst, src, size)
                 return
             self._check_chip_worker_id(worker_id)
             assert self._orch is not None
@@ -5747,6 +5951,7 @@ class Worker:
         _step(self._cleanup_l3_l2_regions)
         if self._live_domains:
             _step(self._release_all_live_domains)
+        _step(self._clear_child_prov)
         _step(self._release_active_remote_slot_refs)
         _step(self._flush_pending_remote_frees)
         # Host buffers must be released while the local L3 child mailboxes are
