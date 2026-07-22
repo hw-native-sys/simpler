@@ -14,6 +14,7 @@
 #include <memory>
 #include <mutex>
 #include <atomic>
+#include <chrono>
 #include <string>
 #include <thread>
 #include <vector>
@@ -32,7 +33,8 @@ public:
 class RemoteL3SocketTransport : public RemoteL3Transport {
 public:
     RemoteL3SocketTransport(
-        std::string host, uint16_t port, std::string health_host, uint16_t health_port, double timeout_s
+        std::string host, uint16_t port, std::string health_host, uint16_t health_port, double attach_timeout_s,
+        double runtime_timeout_s
     );
     ~RemoteL3SocketTransport() override;
 
@@ -46,7 +48,12 @@ private:
     uint16_t port_{0};
     std::string health_host_;
     uint16_t health_port_{0};
-    double timeout_s_{30.0};
+    // Startup-budget clock for the attach phase (command-connect, HELLO read,
+    // health-connect all share attach_deadline_) vs the per-command runtime
+    // timeout for post-attach frame I/O and the health-monitor loop.
+    double attach_timeout_s_{30.0};
+    double runtime_timeout_s_{30.0};
+    std::chrono::steady_clock::time_point attach_deadline_{};
     int fd_{-1};
     int health_fd_{-1};
     std::thread health_thread_;
@@ -61,10 +68,10 @@ private:
     void stop_health_monitor();
     void mark_health_failed(const std::string &message);
     void check_health();
-    void wait_readable();
-    void wait_writable();
-    void write_all(const uint8_t *data, size_t size);
-    std::vector<uint8_t> read_frame();
+    void wait_readable(std::chrono::steady_clock::time_point deadline);
+    void wait_writable(std::chrono::steady_clock::time_point deadline);
+    void write_all(const uint8_t *data, size_t size, std::chrono::steady_clock::time_point deadline);
+    std::vector<uint8_t> read_frame(std::chrono::steady_clock::time_point deadline);
 };
 
 class RemoteL3Endpoint : public WorkerEndpoint {

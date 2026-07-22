@@ -369,6 +369,9 @@ class RemoteCallable:
 
 @dataclass(frozen=True)
 class RemoteWorkerSpec:
+    # endpoint is "host:port"; host must be a numeric IP (or "localhost").
+    # Hostnames are rejected at add_remote_worker time — getaddrinfo resolution is
+    # unbounded and uncancellable and would risk pinning startup on a hung DNS.
     endpoint: str
     platform: str
     runtime: str = "tensormap_and_ringbuffer"
@@ -2110,6 +2113,11 @@ class Worker:
                 raise TypeError("Worker.add_remote_worker: remote L3 workers require a level >= 4 parent")
             if not isinstance(spec, RemoteWorkerSpec):
                 raise TypeError("Worker.add_remote_worker expects a RemoteWorkerSpec")
+            # Validate the endpoint here, before any startup resource exists, so a
+            # non-numeric host fails at registration rather than mid-activation
+            # (which would roll back the whole already-forked tree).
+            host, _port = self._parse_remote_endpoint(spec.endpoint)
+            self._validate_numeric_endpoint_host(host)
             worker_id = self._allocate_next_level_worker_id()
             self._remote_worker_specs.append(spec)
             self._remote_worker_ids.append(worker_id)
@@ -2128,6 +2136,21 @@ class Worker:
         return host, port
 
     @staticmethod
+    def _validate_numeric_endpoint_host(host: str) -> None:
+        # Remote L3 endpoints are numeric-only (or localhost) by contract:
+        # hostname resolution via getaddrinfo is unbounded and uncancellable, so
+        # it is rejected rather than risk pinning startup on a hung resolver.
+        if host == "localhost":
+            return
+        try:
+            socket.getaddrinfo(host, None, flags=socket.AI_NUMERICHOST)
+        except socket.gaierror as exc:
+            raise ValueError(
+                f"RemoteWorkerSpec.endpoint host must be a numeric IP address (hostname resolution is "
+                f"unbounded and unsupported for remote L3); got {host!r}"
+            ) from exc
+
+    @staticmethod
     def _is_wildcard_session_host(host: str) -> bool:
         return host in ("0.0.0.0", "::")
 
@@ -2138,14 +2161,69 @@ class Worker:
         return timeout_s
 
     @staticmethod
+    def _remaining_until(deadline: float, what: str) -> float:
+        # A blocking op's slice of the single root startup deadline. Raising here
+        # keeps the timeout local and clear, and avoids settimeout(0.0) — which
+        # would flip the socket to non-blocking and surface BlockingIOError.
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError(f"{what}: startup deadline exceeded")
+        return remaining
+
+    @staticmethod
+    def _resolve_within_deadline(host: str, port: int, deadline: float) -> list[Any]:
+        # Numeric-only, by contract: getaddrinfo is not cancellable, so a hung
+        # NSS/DNS lookup could pin init() in INITIALIZING past the root deadline.
+        # AI_NUMERICHOST performs NO name resolution (it parses a numeric literal
+        # or fails immediately), so this never blocks; a hostname is rejected
+        # outright rather than risk an unbounded stall. "localhost" is accepted as
+        # the loopback literal. The deadline pre-check keeps a spent budget from
+        # even attempting the parse.
+        Worker._remaining_until(deadline, "remote L3 session resolve")
+        lookup = "127.0.0.1" if host == "localhost" else host
+        try:
+            return socket.getaddrinfo(
+                lookup, port, type=socket.SOCK_STREAM, proto=socket.IPPROTO_TCP, flags=socket.AI_NUMERICHOST
+            )
+        except socket.gaierror as exc:
+            raise ValueError(
+                f"remote L3 endpoint host must be a numeric IP address (hostname resolution is "
+                f"unbounded and unsupported); got {host!r}"
+            ) from exc
+
+    @staticmethod
+    def _connect_within_deadline(host: str, port: int, deadline: float) -> socket.socket:
+        # Bound name resolution AND every per-address connect attempt by the single
+        # root deadline — mirroring the C++ connect_tcp_socket — so a slow resolver
+        # or a black-holed first address cannot let this stage restart the clock or
+        # outrun the startup budget (unlike socket.create_connection, which grants
+        # a fresh full timeout to every address and never bounds getaddrinfo).
+        infos = Worker._resolve_within_deadline(host, port, deadline)
+        last_exc: BaseException | None = None
+        for family, socktype, proto, _canonname, sockaddr in infos:
+            remaining = Worker._remaining_until(deadline, "remote L3 session connect")
+            sock = socket.socket(family, socktype, proto)
+            try:
+                sock.settimeout(remaining)
+                sock.connect(sockaddr)
+                return sock
+            except OSError as exc:
+                last_exc = exc
+                sock.close()
+        if last_exc is not None:
+            raise last_exc
+        raise OSError(f"remote L3 session connect: no address for {host}:{port}")
+
+    @staticmethod
     def _send_remote_daemon_json(sock: socket.socket, payload: dict[str, Any]) -> None:
         data = json.dumps(payload, sort_keys=True).encode("utf-8")
         sock.sendall(struct.pack("<I", len(data)) + data)
 
     @staticmethod
-    def _recv_remote_daemon_json(sock: socket.socket) -> dict[str, Any]:
+    def _recv_remote_daemon_json(sock: socket.socket, deadline: float) -> dict[str, Any]:
         size_data = bytearray()
         while len(size_data) < 4:
+            sock.settimeout(Worker._remaining_until(deadline, "remote daemon reply"))
             chunk = sock.recv(4 - len(size_data))
             if not chunk:
                 raise EOFError("remote daemon closed before reply length")
@@ -2155,6 +2233,7 @@ class Worker:
             raise RuntimeError("remote daemon reply exceeds maximum")
         data = bytearray()
         while len(data) < size:
+            sock.settimeout(Worker._remaining_until(deadline, "remote daemon reply"))
             chunk = sock.recv(size - len(data))
             if not chunk:
                 raise EOFError("remote daemon closed before full reply")
@@ -2213,16 +2292,24 @@ class Worker:
         }
 
     def _open_remote_session(
-        self, *, spec: RemoteWorkerSpec, worker_id: int, session_id: int, timeout_s: float, startup_remaining_s: float
+        self, *, spec: RemoteWorkerSpec, worker_id: int, session_id: int, deadline: float
     ) -> _RemoteSession:
         daemon_host, daemon_port = self._parse_remote_endpoint(spec.endpoint)
-        manifest = self._build_remote_manifest(
-            spec=spec, worker_id=worker_id, session_id=session_id, startup_remaining_s=startup_remaining_s
-        )
-        with socket.create_connection((daemon_host, daemon_port), timeout=timeout_s) as sock:
-            sock.settimeout(timeout_s)
+        # Every blocking op (resolve, connect, send, framed recv) derives its
+        # remaining from the single root deadline, so their sum cannot exceed the
+        # root startup budget.
+        with self._connect_within_deadline(daemon_host, daemon_port, deadline) as sock:
+            manifest = self._build_remote_manifest(
+                spec=spec, worker_id=worker_id, session_id=session_id, startup_remaining_s=0.0
+            )
+            # Derive the send budget AFTER building the (registry-iterating)
+            # manifest, right before send, so the socket timeout and the wire
+            # duration reflect what is actually left — not a pre-build sample.
+            startup_remaining_s = self._remaining_until(deadline, "remote L3 session handshake")
+            manifest["startup_remaining_s"] = startup_remaining_s
+            sock.settimeout(startup_remaining_s)
             self._send_remote_daemon_json(sock, manifest)
-            reply = self._recv_remote_daemon_json(sock)
+            reply = self._recv_remote_daemon_json(sock, deadline)
         if not reply.get("ok", False):
             raise RuntimeError(f"remote L3 session startup failed for worker {worker_id}: {reply.get('error')}")
         return _RemoteSession(
@@ -3784,6 +3871,14 @@ class Worker:
             # single lifecycle state so no thread ever observes a started
             # hierarchy while the worker is not yet READY.
             with self._hierarchical_start_cv:
+                # Final root-deadline gate, in the same critical section as the
+                # commit: a thread descheduled between startup and here cannot
+                # publish READY past the single root startup deadline. Applied to
+                # every hierarchical worker, not just those with direct remote
+                # sessions — a local child may have remote descendants whose
+                # startup this deadline also bounds.
+                if self.level >= 3 and time.monotonic() >= self._startup_deadline:
+                    raise RuntimeError("hierarchical startup: startup deadline exceeded before READY")
                 self._lifecycle = _Lifecycle.READY
                 self._hierarchical_start_cv.notify_all()
         except BaseException as exc:
@@ -3914,21 +4009,22 @@ class Worker:
             session_id = uuid.uuid4().int & ((1 << 63) - 1)
             if session_id == 0:
                 session_id = 1
-            # The handshake blocks until the remote subtree is READY, so the
-            # socket timeout must cover the startup budget granted below — not
-            # the (shorter) runtime command timeout.
+            # The handshake blocks until the remote subtree is READY; the whole
+            # open derives its per-op remaining from the shared root deadline.
             session = self._open_remote_session(
                 spec=spec,
                 worker_id=worker_id,
                 session_id=session_id,
-                timeout_s=remaining,
-                startup_remaining_s=remaining,
+                deadline=deadline,
             )
             self._remote_sessions.append(session)
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise RuntimeError("remote L3 endpoint attach: startup deadline exceeded")
             assert self._worker is not None
+            # attach_timeout bounds the command/health connect + HELLO read by the
+            # remaining startup budget; runtime_timeout is the full runtime command
+            # budget, never clamped by leftover startup time.
             self._worker.add_remote_l3_socket(
                 session.worker_id,
                 session.session_id,
@@ -3937,8 +4033,13 @@ class Worker:
                 session.command_port,
                 session.health_host,
                 session.health_port,
-                min(session_timeout, remaining),
+                remaining,
+                session_timeout,
             )
+        # Attach may have consumed the last slice of the budget; a final root
+        # deadline check keeps a just-over-budget attach from committing READY.
+        if time.monotonic() >= deadline:
+            raise RuntimeError("remote L3 activation: startup deadline exceeded after attach")
 
     def _start_hierarchical(self) -> None:  # noqa: PLR0912 -- three parallel fork loops (sub/chip/next) + bootstrap wait + scheduler register/init; branches track the fork order documented in the body
         """Fork every local child, await the subtree, register endpoints, start the scheduler.

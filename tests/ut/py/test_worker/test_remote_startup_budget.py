@@ -22,6 +22,7 @@ Device-free tests that pin the single-root-deadline contract:
 
 from __future__ import annotations
 
+import socket
 import time
 from unittest.mock import MagicMock
 
@@ -43,6 +44,20 @@ def _l4_with_remotes(n: int, **config) -> Worker:
     return w
 
 
+class _FakeClock:
+    """Deterministic monotonic clock; advance it by explicit ticks so every
+    derived ``deadline - now()`` value is exact (no real-sleep magnitude races)."""
+
+    def __init__(self, t0: float = 1000.0):
+        self.t = t0
+
+    def monotonic(self) -> float:
+        return self.t
+
+    def advance(self, dt: float) -> None:
+        self.t += dt
+
+
 class TestManifestBudgetField:
     def test_manifest_carries_startup_remaining_distinct_from_session_timeout(self):
         w = Worker(level=4, num_sub_workers=0, remote_session_timeout_s=30.0)
@@ -52,6 +67,11 @@ class TestManifestBudgetField:
             assert manifest["session_timeout_s"] == 30.0
             # The startup budget must not be fixed to the runtime command timeout.
             assert manifest["startup_remaining_s"] != manifest["session_timeout_s"]
+            # The cross-host wire carries a duration, never an absolute deadline
+            # (monotonic clocks are not comparable across machines).
+            assert isinstance(manifest["startup_remaining_s"], float)
+            assert "startup_deadline" not in manifest
+            assert "deadline" not in manifest
         finally:
             w.close()
 
@@ -70,6 +90,29 @@ class TestParentTimeoutValidation:
         w = Worker(level=4, num_sub_workers=0, remote_session_timeout_s=17.0)
         try:
             assert w._remote_session_timeout_s() == 17.0
+        finally:
+            w.close()
+
+
+class TestNumericEndpointContract:
+    """Remote L3 endpoints are numeric-only (or localhost); a hostname is rejected
+    at add_remote_worker time, before any startup resource exists."""
+
+    def test_add_remote_worker_rejects_hostname_at_registration(self):
+        w = Worker(level=4, num_sub_workers=0)
+        try:
+            with pytest.raises(ValueError, match="numeric IP"):
+                w.add_remote_worker(RemoteWorkerSpec(endpoint="node17:19073", platform="a2a3sim"))
+            assert w._remote_worker_specs == []  # rejected before it is registered
+        finally:
+            w.close()
+
+    def test_add_remote_worker_accepts_numeric_and_localhost(self):
+        w = Worker(level=4, num_sub_workers=0)
+        try:
+            w.add_remote_worker(RemoteWorkerSpec(endpoint="127.0.0.1:19073", platform="a2a3sim"))
+            w.add_remote_worker(RemoteWorkerSpec(endpoint="localhost:19074", platform="a2a3sim"))
+            assert len(w._remote_worker_specs) == 2
         finally:
             w.close()
 
@@ -235,46 +278,89 @@ class TestActivationAfterFork:
 
 
 class TestSingleRootBudget:
-    def _drive_activation(self, monkeypatch, *, n_remotes, root_budget_s, per_open_delay_s=0.02):
-        granted: list[float] = []
-        socket_timeouts: list[float] = []
+    def _drive_activation(self, monkeypatch, *, n_remotes, root_budget_s, per_open_tick_s=0.5):
+        clock = _FakeClock()
+        monkeypatch.setattr(worker_mod.time, "monotonic", clock.monotonic)
 
-        def fake_open(self, *, spec, worker_id, session_id, timeout_s, startup_remaining_s):
-            granted.append(startup_remaining_s)
-            socket_timeouts.append(timeout_s)
-            time.sleep(per_open_delay_s)
+        deadlines: list[float] = []
+        granted: list[float] = []  # the startup_remaining_s the real open would derive
+
+        def fake_open(self, *, spec, worker_id, session_id, deadline):
+            deadlines.append(deadline)
+            granted.append(deadline - worker_mod.time.monotonic())
+            clock.advance(per_open_tick_s)  # models per-remote open cost, deterministically
             return _FakeSession(worker_id, session_id)
 
         monkeypatch.setattr(Worker, "_open_remote_session", fake_open)
 
         w = _l4_with_remotes(n_remotes)
-        w._worker = MagicMock()
-        deadline = time.monotonic() + root_budget_s
+        mock_worker = MagicMock()
+        w._worker = mock_worker
+        deadline = clock.monotonic() + root_budget_s
         try:
             w._activate_remote_sessions(deadline)
         finally:
             w._worker = None
             w.close()
-        return granted, socket_timeouts, w
+        return deadlines, granted, mock_worker
 
     def test_budget_not_multiplied_by_remote_count(self, monkeypatch):
-        granted, socket_timeouts, _ = self._drive_activation(monkeypatch, n_remotes=3, root_budget_s=5.0)
+        deadlines, granted, _ = self._drive_activation(monkeypatch, n_remotes=3, root_budget_s=5.0)
         assert len(granted) == 3
-        # Every remote's granted startup budget fits inside the single root budget.
+        # THE anti-multiplication invariant: one shared absolute root deadline is
+        # threaded to every remote — the bug would surface as distinct, freshly
+        # computed deadlines per remote.
+        assert len(set(deadlines)) == 1
+        # Each remote's derived startup slice fits inside the single root budget…
         for g in granted:
             assert 0 < g <= 5.0
-        # And the budget shrinks per remote (shared deadline), never a fresh full
-        # timeout each — the multiplication bug.
+        # …and shrinks per remote (shared deadline + advancing clock).
         assert granted[0] > granted[1] > granted[2]
-        # Socket handshake timeout tracks the same remaining budget.
-        for s, g in zip(socket_timeouts, granted, strict=True):
-            assert s == g
+
+    def test_attach_and_runtime_timeouts_are_split(self, monkeypatch):
+        _deadlines, _granted, mock_worker = self._drive_activation(monkeypatch, n_remotes=3, root_budget_s=5.0)
+        calls = mock_worker.add_remote_l3_socket.call_args_list
+        assert len(calls) == 3
+        # attach_timeout / runtime_timeout are the last two positional args.
+        attach = [c.args[-2] for c in calls]
+        runtime = [c.args[-1] for c in calls]
+        # runtime_timeout is the full runtime command budget: constant, ==
+        # session_timeout, NOT min(session_timeout, remaining), never shrinking.
+        assert runtime == [30.0, 30.0, 30.0]
+        # attach_timeout tracks the remaining root budget: shrinks, bounded, and
+        # is a distinct quantity from runtime_timeout (the split the old min() lost).
+        assert attach[0] > attach[1] > attach[2]
+        for a in attach:
+            assert 0 < a <= 5.0
+            assert a != 30.0
+
+    def test_final_recheck_fires_when_last_attach_overruns_deadline(self, monkeypatch):
+        clock = _FakeClock()
+        monkeypatch.setattr(worker_mod.time, "monotonic", clock.monotonic)
+
+        def fake_open(self, *, spec, worker_id, session_id, deadline):
+            clock.advance(0.4)  # open leaves budget > 0, so both per-iteration rechecks pass
+            return _FakeSession(worker_id, session_id)
+
+        monkeypatch.setattr(Worker, "_open_remote_session", fake_open)
+        w = _l4_with_remotes(1)
+        mock_worker = MagicMock()
+        # The last attach itself consumes the remaining slice, so now >= deadline
+        # only AFTER add_remote_l3_socket returns — only a post-loop recheck catches it.
+        mock_worker.add_remote_l3_socket.side_effect = lambda *a, **k: clock.advance(1.0)
+        w._worker = mock_worker
+        deadline = clock.monotonic() + 1.0  # 0.4 (open) + 1.0 (attach) > 1.0
+        try:
+            with pytest.raises(RuntimeError, match="startup deadline exceeded after attach"):
+                w._activate_remote_sessions(deadline)
+            assert mock_worker.add_remote_l3_socket.call_count == 1  # attach did run
+            assert len(w._remote_sessions) == 1  # left recorded so init()'s rollback closes it
+        finally:
+            w._worker = None
+            w.close()
 
     def test_attach_called_once_per_remote(self, monkeypatch):
-        granted: list[float] = []
-
-        def fake_open(self, *, spec, worker_id, session_id, timeout_s, startup_remaining_s):
-            granted.append(startup_remaining_s)
+        def fake_open(self, *, spec, worker_id, session_id, deadline):
             return _FakeSession(worker_id, session_id)
 
         monkeypatch.setattr(Worker, "_open_remote_session", fake_open)
@@ -292,7 +378,7 @@ class TestSingleRootBudget:
     def test_expired_deadline_fails_fast_without_opening(self, monkeypatch):
         opened = []
 
-        def fake_open(self, *, spec, worker_id, session_id, timeout_s, startup_remaining_s):
+        def fake_open(self, *, spec, worker_id, session_id, deadline):
             opened.append(worker_id)
             return _FakeSession(worker_id, session_id)
 
@@ -306,6 +392,167 @@ class TestSingleRootBudget:
             assert w._remote_sessions == []
         finally:
             w._worker = None
+            w.close()
+
+
+class TestReadyCommitGate:
+    """The final root-deadline gate lives in init()'s READY-commit critical
+    section, so a thread descheduled after attach cannot publish READY late."""
+
+    def test_gate_fires_inside_commit_before_publishing_ready(self, monkeypatch):
+        clock = _FakeClock()
+        monkeypatch.setattr(worker_mod.time, "monotonic", clock.monotonic)
+
+        def fake_start(self):
+            # Time crosses the deadline during post-startup work. No remote
+            # session on THIS worker — the gate must still fire (a local child
+            # could have remote descendants this deadline also bounds).
+            clock.advance(self._startup_timeout_s + 1.0)
+
+        monkeypatch.setattr(Worker, "_init_hierarchical", lambda self: None)
+        monkeypatch.setattr(Worker, "_start_hierarchical", fake_start)
+        monkeypatch.setattr(Worker, "_cleanup_partial_init", lambda self: None)
+
+        w = Worker(level=4, num_sub_workers=0)
+        try:
+            with pytest.raises(RuntimeError, match="startup deadline exceeded before READY"):
+                w.init()
+            assert w._lifecycle is not worker_mod._Lifecycle.READY
+        finally:
+            w._worker = None
+            w.close()
+
+
+class TestBoundedConnect:
+    """Resolution and every per-address connect are bounded by the single root
+    deadline (unlike socket.create_connection, which restarts the clock per
+    address and never bounds getaddrinfo)."""
+
+    def test_resolve_fails_fast_past_deadline_without_calling_getaddrinfo(self, monkeypatch):
+        gai = MagicMock(side_effect=AssertionError("getaddrinfo on an already-past deadline"))
+        monkeypatch.setattr(worker_mod.socket, "getaddrinfo", gai)
+        with pytest.raises(TimeoutError, match="startup deadline exceeded"):
+            Worker._resolve_within_deadline("localhost", 9, time.monotonic() - 1.0)
+        assert gai.call_count == 0
+
+    def test_resolve_rejects_hostname_instead_of_risking_unbounded_dns(self):
+        # A hostname would need an unbounded, uncancellable getaddrinfo; reject it
+        # outright rather than let a hung resolver pin init() in INITIALIZING.
+        with pytest.raises(ValueError, match="must be a numeric IP"):
+            Worker._resolve_within_deadline("example.invalid", 9, time.monotonic() + 5.0)
+
+    def test_resolve_accepts_numeric_and_localhost(self):
+        for host in ("127.0.0.1", "localhost"):
+            infos = Worker._resolve_within_deadline(host, 9, time.monotonic() + 5.0)
+            assert infos
+            assert infos[0][4][0] == "127.0.0.1"
+
+    def test_resolve_never_issues_a_dns_query(self, monkeypatch):
+        # AI_NUMERICHOST must be set so getaddrinfo cannot block on NSS/DNS.
+        calls = []
+        real = worker_mod.socket.getaddrinfo
+
+        def spy(host, port, **kwargs):
+            calls.append(kwargs.get("flags", 0))
+            return real(host, port, **kwargs)
+
+        monkeypatch.setattr(worker_mod.socket, "getaddrinfo", spy)
+        Worker._resolve_within_deadline("127.0.0.1", 9, time.monotonic() + 5.0)
+        assert calls and (calls[0] & socket.AI_NUMERICHOST)
+
+    def test_connect_bounds_each_address_by_shrinking_remaining(self, monkeypatch):
+        clock = _FakeClock()
+        monkeypatch.setattr(worker_mod.time, "monotonic", clock.monotonic)
+        addr_a = (socket.AF_INET, socket.SOCK_STREAM, 0, "", ("10.0.0.1", 9))
+        addr_b = (socket.AF_INET, socket.SOCK_STREAM, 0, "", ("10.0.0.2", 9))
+        monkeypatch.setattr(Worker, "_resolve_within_deadline", lambda h, p, d: [addr_a, addr_b])
+
+        timeouts: list[float] = []
+        made: list = []
+
+        class _FakeSock:
+            def settimeout(self, t):
+                timeouts.append(t)
+
+            def connect(self, sockaddr):
+                clock.advance(3.0)  # each connect attempt burns budget
+                if sockaddr == addr_a[4]:
+                    raise ConnectionRefusedError("first address black-holed")
+
+            def close(self):
+                pass
+
+        def fake_socket(*_a):
+            s = _FakeSock()
+            made.append(s)
+            return s
+
+        monkeypatch.setattr(worker_mod.socket, "socket", fake_socket)
+        sock = Worker._connect_within_deadline("host", 9, clock.monotonic() + 10.0)
+
+        # The second address gets the SHRUNKEN remaining (10 - 3), not a fresh full
+        # 10s — the per-address multiplication create_connection would allow.
+        assert timeouts == [10.0, 7.0]
+        assert sock is made[1]
+
+    def test_connect_fails_fast_when_deadline_passes_before_next_address(self, monkeypatch):
+        addr = (socket.AF_INET, socket.SOCK_STREAM, 0, "", ("10.0.0.1", 9))
+        monkeypatch.setattr(Worker, "_resolve_within_deadline", lambda h, p, d: [addr])
+        made = MagicMock(side_effect=AssertionError("socket created past deadline"))
+        monkeypatch.setattr(worker_mod.socket, "socket", made)
+        with pytest.raises(TimeoutError, match="startup deadline exceeded"):
+            Worker._connect_within_deadline("h", 9, time.monotonic() - 1.0)
+        assert made.call_count == 0
+
+
+class TestOpenRemoteSession:
+    """The single-deadline contract inside _open_remote_session itself."""
+
+    def test_fails_fast_on_past_deadline_without_connecting(self, monkeypatch):
+        # Build the worker first: add_remote_worker validates the (numeric) host
+        # via getaddrinfo, which we then poison to assert the connect path is skipped.
+        w = _l4_with_remotes(1)
+        gai = MagicMock(side_effect=AssertionError("getaddrinfo on an already-past deadline"))
+        mksock = MagicMock(side_effect=AssertionError("socket() on an already-past deadline"))
+        monkeypatch.setattr(worker_mod.socket, "getaddrinfo", gai)
+        monkeypatch.setattr(worker_mod.socket, "socket", mksock)
+        try:
+            with pytest.raises(TimeoutError, match="startup deadline exceeded"):
+                w._open_remote_session(spec=_spec(), worker_id=0, session_id=1, deadline=time.monotonic() - 1.0)
+            assert gai.call_count == 0
+            assert mksock.call_count == 0
+        finally:
+            w.close()
+
+    def test_recomputes_budget_before_send_and_refuses_nonpositive_slice(self, monkeypatch):
+        clock = _FakeClock()
+        monkeypatch.setattr(worker_mod.time, "monotonic", clock.monotonic)
+        sent: list = []
+
+        class _FakeSock:
+            def settimeout(self, _t):
+                pass
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_a):
+                return False
+
+        def fake_connect(self, host, port, deadline):
+            clock.advance(10.0)  # resolve + connect consume the entire budget
+            return _FakeSock()
+
+        monkeypatch.setattr(Worker, "_connect_within_deadline", fake_connect)
+        monkeypatch.setattr(Worker, "_send_remote_daemon_json", lambda self, sock, payload: sent.append(payload))
+        w = _l4_with_remotes(1)
+        try:
+            # connect succeeds within budget, but by send time the budget is gone,
+            # so it raises before sending a <= 0 startup_remaining_s the remote bounces.
+            with pytest.raises(TimeoutError, match="startup deadline exceeded"):
+                w._open_remote_session(spec=_spec(), worker_id=0, session_id=1, deadline=clock.monotonic() + 1.0)
+            assert sent == []
+        finally:
             w.close()
 
 

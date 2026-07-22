@@ -402,15 +402,16 @@ inline void bind_worker(nb::module_ &m) {
             "add_remote_l3_socket",
             [](Worker &self, int32_t worker_id, uint64_t session_id, const std::string &transport_name,
                const std::string &host, uint16_t port, const std::string &health_host, uint16_t health_port,
-               double timeout_s) {
+               double attach_timeout_s, double runtime_timeout_s) {
                 nb::gil_scoped_release release;
                 self.add_remote_l3_socket(
-                    worker_id, session_id, transport_name, host, port, health_host, health_port, timeout_s
+                    worker_id, session_id, transport_name, host, port, health_host, health_port, attach_timeout_s,
+                    runtime_timeout_s
                 );
             },
             nb::arg("worker_id"), nb::arg("session_id"), nb::arg("transport_name"), nb::arg("host"), nb::arg("port"),
-            nb::arg("health_host"), nb::arg("health_port"), nb::arg("timeout_s") = 30.0,
-            "Register a REMOTE_L3 endpoint after the session reports HELLO READY."
+            nb::arg("health_host"), nb::arg("health_port"), nb::arg("attach_timeout_s") = 30.0,
+            nb::arg("runtime_timeout_s") = 30.0, "Register a REMOTE_L3 endpoint after the session reports HELLO READY."
         )
 
         // Release the GIL while starting the Scheduler thread so another Python

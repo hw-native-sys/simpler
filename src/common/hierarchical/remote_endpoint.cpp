@@ -175,17 +175,14 @@ void configure_socket_no_sigpipe(int fd, const std::string &label) {
 }
 
 ssize_t send_no_sigpipe(int fd, const uint8_t *data, size_t size) {
+    // The fd is O_NONBLOCK, so a send never blocks: it writes what fits and
+    // returns EAGAIN when the buffer is full, letting write_all re-poll under the
+    // deadline. MSG_NOSIGNAL only suppresses SIGPIPE on a closed peer.
 #if defined(MSG_NOSIGNAL)
     return ::send(fd, data, size, MSG_NOSIGNAL);
 #else
     return ::send(fd, data, size, 0);
 #endif
-}
-
-void restore_socket_flags(int fd, int flags, const std::string &label) {
-    if (::fcntl(fd, F_SETFL, flags) != 0) {
-        throw std::runtime_error(label + ": fcntl(F_SETFL) failed: " + std::strerror(errno));
-    }
 }
 
 short poll_socket(
@@ -253,10 +250,15 @@ void validate_remote_buffer_export_range(
     }
 }
 
-int connect_tcp_socket(const std::string &host, uint16_t port, const std::string &label, double timeout_s) {
-    Deadline deadline =
-        std::chrono::steady_clock::now() +
-        std::chrono::duration_cast<std::chrono::steady_clock::duration>(std::chrono::duration<double>(timeout_s));
+std::chrono::steady_clock::time_point deadline_from_now(double timeout_s) {
+    return std::chrono::steady_clock::now() +
+           std::chrono::duration_cast<std::chrono::steady_clock::duration>(std::chrono::duration<double>(timeout_s));
+}
+
+int connect_tcp_socket(const std::string &host, uint16_t port, const std::string &label, Deadline deadline) {
+    // The caller's absolute deadline is used verbatim for resolution and every
+    // per-address connect — never re-derived as now()+remaining, which would
+    // extend the hard wall if this thread is descheduled before entry.
     std::string port_s = std::to_string(port);
     std::vector<TcpAddress> addresses = resolve_tcp_addresses_with_timeout(host, port_s, label, deadline);
     int fd = -1;
@@ -283,7 +285,10 @@ int connect_tcp_socket(const std::string &host, uint16_t port, const std::string
             }
             int rc = ::connect(candidate, reinterpret_cast<const sockaddr *>(&addr.addr), addr.addrlen);
             if (rc == 0) {
-                restore_socket_flags(candidate, flags, label);
+                // Keep the fd O_NONBLOCK for its whole life: all frame I/O polls
+                // for readiness under a deadline, so recv/send never block (a
+                // blocking send of a large frame to a stalled reader would
+                // outlast the deadline, and MSG_DONTWAIT is not portable).
                 fd = candidate;
                 break;
             }
@@ -294,7 +299,6 @@ int connect_tcp_socket(const std::string &host, uint16_t port, const std::string
             }
             int connect_error = wait_for_connect(candidate, deadline, label);
             if (connect_error == 0) {
-                restore_socket_flags(candidate, flags, label);
                 fd = candidate;
                 break;
             }
@@ -352,25 +356,37 @@ void validate_owner_buffer_handle(const RemoteBufferHandle &handle, size_t reque
 }  // namespace
 
 RemoteL3SocketTransport::RemoteL3SocketTransport(
-    std::string host, uint16_t port, std::string health_host, uint16_t health_port, double timeout_s
+    std::string host, uint16_t port, std::string health_host, uint16_t health_port, double attach_timeout_s,
+    double runtime_timeout_s
 ) :
     host_(std::move(host)),
     port_(port),
     health_host_(std::move(health_host)),
     health_port_(health_port),
-    timeout_s_(timeout_s) {
+    attach_timeout_s_(attach_timeout_s),
+    runtime_timeout_s_(runtime_timeout_s) {
     if (host_.empty()) throw std::invalid_argument("RemoteL3SocketTransport: host must be non-empty");
     if (port_ == 0) throw std::invalid_argument("RemoteL3SocketTransport: port must be non-zero");
     if (health_host_.empty()) throw std::invalid_argument("RemoteL3SocketTransport: health host must be non-empty");
     if (health_port_ == 0) throw std::invalid_argument("RemoteL3SocketTransport: health port must be non-zero");
-    if (timeout_s_ <= 0.0) throw std::invalid_argument("RemoteL3SocketTransport: timeout must be positive");
+    if (attach_timeout_s_ <= 0.0)
+        throw std::invalid_argument("RemoteL3SocketTransport: attach timeout must be positive");
+    if (runtime_timeout_s_ <= 0.0)
+        throw std::invalid_argument("RemoteL3SocketTransport: runtime timeout must be positive");
+    // One absolute deadline for the whole attach phase; command-connect, the
+    // HELLO read, and health-connect all derive their remaining from it so the
+    // attach cannot exceed the caller's startup-budget slice.
+    attach_deadline_ =
+        std::chrono::steady_clock::now() + std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+                                               std::chrono::duration<double>(attach_timeout_s_)
+                                           );
     connect_socket();
 }
 
 RemoteL3SocketTransport::~RemoteL3SocketTransport() { close_socket(); }
 
 void RemoteL3SocketTransport::connect_socket() {
-    fd_ = connect_tcp_socket(host_, port_, "RemoteL3SocketTransport(command)", timeout_s_);
+    fd_ = connect_tcp_socket(host_, port_, "RemoteL3SocketTransport(command)", attach_deadline_);
 }
 
 void RemoteL3SocketTransport::close_socket() {
@@ -401,7 +417,8 @@ void RemoteL3SocketTransport::check_health() {
 
 void RemoteL3SocketTransport::start_health_monitor(uint64_t session_id, int32_t worker_id) {
     if (health_thread_.joinable()) return;
-    health_fd_ = connect_tcp_socket(health_host_, health_port_, "RemoteL3SocketTransport(health)", timeout_s_);
+    // Health-connect is the last attach-phase op, so it shares attach_deadline_.
+    health_fd_ = connect_tcp_socket(health_host_, health_port_, "RemoteL3SocketTransport(health)", attach_deadline_);
     health_stop_.store(false, std::memory_order_release);
     health_failed_.store(false, std::memory_order_release);
     {
@@ -409,7 +426,9 @@ void RemoteL3SocketTransport::start_health_monitor(uint64_t session_id, int32_t 
         health_error_.clear();
     }
     int fd = health_fd_;
-    double timeout_s = timeout_s_;
+    // The health-monitor loop is a runtime lane; its per-frame read uses the
+    // runtime timeout, not the (spent) attach budget.
+    double timeout_s = runtime_timeout_s_;
     health_thread_ = std::thread([this, fd, session_id, worker_id, timeout_s]() {
         auto read_exact = [&](uint8_t *data, size_t size) -> bool {
             size_t off = 0;
@@ -424,7 +443,7 @@ void RemoteL3SocketTransport::start_health_monitor(uint64_t session_id, int32_t 
                 (void)poll_socket(fd, POLLIN, deadline, "timed out waiting for HEALTH frame", "poll failed");
                 ssize_t n = ::recv(fd, data + off, size - off, 0);
                 if (n < 0) {
-                    if (errno == EINTR) continue;
+                    if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) continue;
                     throw std::runtime_error(std::string("recv failed: ") + std::strerror(errno));
                 }
                 if (n == 0) throw std::runtime_error("health socket closed");
@@ -472,10 +491,7 @@ void RemoteL3SocketTransport::stop_health_monitor() {
     }
 }
 
-void RemoteL3SocketTransport::wait_readable() {
-    auto deadline =
-        std::chrono::steady_clock::now() +
-        std::chrono::duration_cast<std::chrono::steady_clock::duration>(std::chrono::duration<double>(timeout_s_));
+void RemoteL3SocketTransport::wait_readable(std::chrono::steady_clock::time_point deadline) {
     while (true) {
         check_health();
         auto now = std::chrono::steady_clock::now();
@@ -488,10 +504,7 @@ void RemoteL3SocketTransport::wait_readable() {
     }
 }
 
-void RemoteL3SocketTransport::wait_writable() {
-    auto deadline =
-        std::chrono::steady_clock::now() +
-        std::chrono::duration_cast<std::chrono::steady_clock::duration>(std::chrono::duration<double>(timeout_s_));
+void RemoteL3SocketTransport::wait_writable(std::chrono::steady_clock::time_point deadline) {
     while (true) {
         check_health();
         auto now = std::chrono::steady_clock::now();
@@ -504,13 +517,17 @@ void RemoteL3SocketTransport::wait_writable() {
     }
 }
 
-void RemoteL3SocketTransport::write_all(const uint8_t *data, size_t size) {
+void RemoteL3SocketTransport::write_all(
+    const uint8_t *data, size_t size, std::chrono::steady_clock::time_point deadline
+) {
     size_t off = 0;
     while (off < size) {
-        wait_writable();
+        wait_writable(deadline);
         ssize_t n = send_no_sigpipe(fd_, data + off, size - off);
         if (n < 0) {
-            if (errno == EINTR) continue;
+            // EAGAIN/EWOULDBLOCK: the buffer filled (peer not draining) — re-poll
+            // under the deadline, which throws if the write outlasts it.
+            if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) continue;
             throw std::runtime_error(std::string("RemoteL3SocketTransport: send failed: ") + std::strerror(errno));
         }
         if (n == 0) throw std::runtime_error("RemoteL3SocketTransport: socket closed while writing");
@@ -518,15 +535,15 @@ void RemoteL3SocketTransport::write_all(const uint8_t *data, size_t size) {
     }
 }
 
-std::vector<uint8_t> RemoteL3SocketTransport::read_frame() {
+std::vector<uint8_t> RemoteL3SocketTransport::read_frame(std::chrono::steady_clock::time_point deadline) {
     static constexpr size_t HEADER_BYTES = 40;
     std::vector<uint8_t> frame(HEADER_BYTES);
     size_t off = 0;
     while (off < HEADER_BYTES) {
-        wait_readable();
+        wait_readable(deadline);
         ssize_t n = ::recv(fd_, frame.data() + off, HEADER_BYTES - off, 0);
         if (n < 0) {
-            if (errno == EINTR) continue;
+            if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) continue;
             throw std::runtime_error(
                 std::string("RemoteL3SocketTransport: recv header failed: ") + std::strerror(errno)
             );
@@ -541,10 +558,10 @@ std::vector<uint8_t> RemoteL3SocketTransport::read_frame() {
     frame.resize(HEADER_BYTES + payload_bytes);
     off = HEADER_BYTES;
     while (off < frame.size()) {
-        wait_readable();
+        wait_readable(deadline);
         ssize_t n = ::recv(fd_, frame.data() + off, frame.size() - off, 0);
         if (n < 0) {
-            if (errno == EINTR) continue;
+            if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) continue;
             throw std::runtime_error(
                 std::string("RemoteL3SocketTransport: recv payload failed: ") + std::strerror(errno)
             );
@@ -558,7 +575,9 @@ std::vector<uint8_t> RemoteL3SocketTransport::read_frame() {
 void RemoteL3SocketTransport::expect_hello_ready(
     uint64_t session_id, int32_t worker_id, const std::string &comm_profile
 ) {
-    auto frame = remote_l3::decode_frame(read_frame());
+    // The HELLO read is an attach-phase op: it shares attach_deadline_ so the
+    // whole (possibly multi-recv) read cannot outlast the startup-budget slice.
+    auto frame = remote_l3::decode_frame(read_frame(attach_deadline_));
     if (frame.header.frame_type != remote_l3::FrameType::HELLO) {
         throw std::runtime_error("RemoteL3SocketTransport: expected HELLO frame");
     }
@@ -577,11 +596,13 @@ void RemoteL3SocketTransport::expect_hello_ready(
 
 void RemoteL3SocketTransport::submit_frame(const std::vector<uint8_t> &frame) {
     if (fd_ < 0) throw std::runtime_error("RemoteL3SocketTransport: socket is closed");
-    write_all(frame.data(), frame.size());
+    // Each runtime command gets a fresh runtime-timeout budget, independent of
+    // the (already-spent) attach deadline.
+    write_all(frame.data(), frame.size(), deadline_from_now(runtime_timeout_s_));
 }
 
 std::vector<uint8_t> RemoteL3SocketTransport::wait_for_reply(remote_l3::FrameType frame_type, uint64_t sequence) {
-    auto frame_bytes = read_frame();
+    auto frame_bytes = read_frame(deadline_from_now(runtime_timeout_s_));
     auto frame = remote_l3::decode_frame(frame_bytes);
     if (frame.header.frame_type != frame_type || frame.header.sequence != sequence) {
         throw std::runtime_error("RemoteL3SocketTransport: reply frame type or sequence mismatch");

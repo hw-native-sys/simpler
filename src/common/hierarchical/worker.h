@@ -81,7 +81,8 @@ public:
     // prestart and reported HELLO READY on the command lane.
     void add_remote_l3_socket(
         int32_t worker_id, uint64_t session_id, const std::string &transport_name, const std::string &host,
-        uint16_t port, const std::string &health_host, uint16_t health_port, double timeout_s
+        uint16_t port, const std::string &health_host, uint16_t health_port, double attach_timeout_s,
+        double runtime_timeout_s
     );
 
     // Start the scheduler thread. Must be called AFTER the parent has forked

@@ -182,6 +182,19 @@ def _startup_remaining_s(manifest: dict[str, Any]) -> float:
     return remaining_s
 
 
+def _startup_deadline(manifest: dict[str, Any]) -> float:
+    # The daemon and this runner share CLOCK_MONOTONIC (same host), so when the
+    # daemon supplies an absolute deadline the runner uses it directly — its
+    # remaining is measured post-spawn, and its deadline cannot exceed the
+    # daemon's. Only a pre-P0.3 daemon omits it; fall back to the duration then.
+    if "startup_deadline_monotonic" in manifest:
+        deadline = float(manifest["startup_deadline_monotonic"])
+        if not math.isfinite(deadline):
+            raise ValueError("manifest startup_deadline_monotonic must be a finite monotonic timestamp")
+        return deadline
+    return time.monotonic() + _startup_remaining_s(manifest)
+
+
 def _health_loop(sock: socket.socket, stop: threading.Event, session_id: int, worker_id: int) -> None:
     conn: socket.socket | None = None
     sock.settimeout(0.2)
@@ -924,8 +937,14 @@ def run_session(manifest: dict[str, Any], ready_fd: int) -> int:
     stop_health = threading.Event()
     health_thread: threading.Thread | None = None
     try:
-        session_timeout_s = _session_timeout_s(manifest)
-        startup_remaining_s = _startup_remaining_s(manifest)
+        # Validate the runtime command timeout wire value up front (rejects a
+        # malformed session_timeout_s); the command lane itself idle-waits blocking.
+        _session_timeout_s(manifest)
+        # Establish this runner's single absolute deadline before any startup work
+        # (registry install, inner init) so every stage draws from it. It is the
+        # daemon's shared-clock deadline when supplied (so spawn/import time is
+        # already charged), else derived from the remaining duration.
+        startup_deadline = _startup_deadline(manifest)
         manifest_dispatch_registry = _install_manifest_dispatcher_registry(manifest)
         # Register the inner L3 callables before init() so they are frozen into
         # the eager startup snapshot and uploaded to the chip children before
@@ -933,14 +952,13 @@ def run_session(manifest: dict[str, Any], ready_fd: int) -> int:
         # point: it forks and readies the whole inner L3->L2 tree, so the runner
         # reports ready (below) only once that subtree is up.
         manifest_inner_handles = _install_manifest_inner_registry(manifest, inner_worker)
-        # Bound the inner startup by the parent's remaining startup budget
-        # (rebuilt against this host's own monotonic clock — the parent's
-        # absolute deadline is not comparable across machines), not a fresh full
+        # Bound the inner startup by the runner's single deadline established
+        # above (which already charges registry-install time), not a fresh full
         # session_timeout_s. Mark it non-root so its chip/sub children inherit
         # this runner's process group (see start_new_session in the daemon)
         # rather than splitting into their own — the daemon reaps the whole
         # L3->L2 subtree with one killpg on the runner.
-        inner_worker.init(_startup_deadline=time.monotonic() + startup_remaining_s)
+        inner_worker.init(_startup_deadline=startup_deadline)
 
         listen_host = str(manifest.get("listen_host", "127.0.0.1"))
         command_sock = _bind_listener(listen_host)
@@ -965,8 +983,22 @@ def run_session(manifest: dict[str, Any], ready_fd: int) -> int:
             },
         )
 
-        command_sock.settimeout(session_timeout_s)
+        # Waiting for the parent to attach is still the attach phase, so bound it
+        # by the remaining startup budget — not session_timeout_s. Otherwise a
+        # tiny runtime timeout could drop the parent before it connects, and a
+        # large one could keep the runner alive well past the root deadline if the
+        # parent is lost.
+        attach_remaining = startup_deadline - time.monotonic()
+        if attach_remaining <= 0:
+            raise TimeoutError("remote L3 runner: startup deadline exceeded before parent attach")
+        command_sock.settimeout(attach_remaining)
         conn, _addr = command_sock.accept()
+        # Force the command connection blocking, explicitly: accept() inherits
+        # socket.getdefaulttimeout(), which a user module imported during registry
+        # install could have set. A finite timeout would tear down a healthy but
+        # idle session; the loop instead idle-waits blocking and ends when the
+        # parent closes the command socket (read_frame sees EOF).
+        conn.settimeout(None)
         with conn:
             _run_command_loop(conn, manifest, inner_worker, manifest_inner_handles, manifest_dispatch_registry)
         return 0

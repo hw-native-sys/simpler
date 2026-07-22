@@ -87,9 +87,8 @@ def _startup_remaining_s(manifest: dict[str, Any]) -> float:
     return remaining_s
 
 
-def _read_runner_ready(fd: int, timeout_s: float) -> dict[str, Any]:
+def _read_runner_ready(fd: int, deadline: float) -> dict[str, Any]:
     chunks = bytearray()
-    deadline = time.monotonic() + timeout_s
     while True:
         remaining = deadline - time.monotonic()
         if remaining <= 0:
@@ -154,18 +153,30 @@ def _start_session(manifest: dict[str, Any]) -> tuple[dict[str, Any], subprocess
     # manifest tempfile, runner Popen) exists: the runner is never launched only
     # to die on an invalid session_timeout_s or startup_remaining_s.
     _session_timeout_s(manifest)
-    # The runner must publish ready within the parent's remaining startup budget,
-    # not a fresh full command timeout.
-    timeout_s = _startup_remaining_s(manifest)
+    # One local absolute deadline for this session's startup: the runner-ready
+    # wait below and the budget handed to the runner both derive from it, so the
+    # daemon's own setup and the runner's init cannot each restart the full slice.
+    deadline = time.monotonic() + _startup_remaining_s(manifest)
     ready_r, ready_w = os.pipe()
     manifest_path = ""
     proc: subprocess.Popen[Any] | None = None
     try:
+        runner_remaining = deadline - time.monotonic()
+        if runner_remaining <= 0:
+            raise TimeoutError("remote L3 session: startup deadline exceeded before runner launch")
+        runner_manifest = dict(manifest)
+        # Hand the runner this daemon's ABSOLUTE monotonic deadline. Daemon and
+        # runner share CLOCK_MONOTONIC (same host, Popen-spawned), so the runner
+        # derives its remaining post-spawn and its deadline equals this one — the
+        # spawn/import/registry time is charged, not restarted from a frozen
+        # duration. startup_remaining_s stays for a pre-P0.3 runner's fallback.
+        runner_manifest["startup_deadline_monotonic"] = deadline
+        runner_manifest["startup_remaining_s"] = runner_remaining
         with tempfile.NamedTemporaryFile(
             "w", encoding="utf-8", prefix="simpler-remote-l3-", suffix=".json", delete=False
         ) as f:
             manifest_path = f.name
-            json.dump(manifest, f, sort_keys=True)
+            json.dump(runner_manifest, f, sort_keys=True)
         proc = subprocess.Popen(
             [
                 sys.executable,
@@ -185,7 +196,7 @@ def _start_session(manifest: dict[str, Any]) -> tuple[dict[str, Any], subprocess
         os.close(ready_w)
         ready_w = -1
         try:
-            ready = _read_runner_ready(ready_r, timeout_s)
+            ready = _read_runner_ready(ready_r, deadline)
         except BaseException:
             _wait_or_kill_runner(proc)
             raise

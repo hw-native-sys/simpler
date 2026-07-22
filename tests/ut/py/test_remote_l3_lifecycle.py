@@ -40,10 +40,89 @@ def test_read_runner_ready_times_out_without_payload():
     ready_r, ready_w = os.pipe()
     try:
         with pytest.raises(TimeoutError):
-            remote_l3_worker._read_runner_ready(ready_r, 0.01)
+            remote_l3_worker._read_runner_ready(ready_r, time.monotonic() + 0.01)
     finally:
         os.close(ready_r)
         os.close(ready_w)
+
+
+class _Clock:
+    """Deterministic monotonic clock advanced by explicit ticks."""
+
+    def __init__(self, t0: float = 1000.0):
+        self.t = t0
+
+    def monotonic(self) -> float:
+        return self.t
+
+    def advance(self, dt: float) -> None:
+        self.t += dt
+
+
+def test_start_session_hands_runner_absolute_deadline_and_single_ready_wait(monkeypatch):
+    # The daemon builds ONE absolute deadline up front; the runner-ready wait
+    # derives from it (so the daemon's own Popen/setup time is charged, not a
+    # fresh full slice), and the runner is handed that same ABSOLUTE deadline —
+    # so the runner's deadline cannot be re-amplified past the daemon's.
+    clock = _Clock(1000.0)
+    monkeypatch.setattr(remote_l3_worker.time, "monotonic", clock.monotonic)
+    captured: dict = {}
+
+    def fake_pipe():
+        clock.advance(1.0)  # daemon setup before the runner manifest is written
+        return (11, 12)
+
+    class _FakeTmp:
+        name = "/tmp/fake-remote-l3.json"
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_a):
+            return False
+
+        def write(self, *_a):
+            pass
+
+    class _FakePopen:
+        pid = 999
+
+        def __init__(self, *_a, **_k):
+            clock.advance(2.0)  # Popen + interpreter spawn charged to runner-ready
+
+        def wait(self, timeout=None):
+            return 0
+
+    class _SyncThread:
+        def __init__(self, *, target, args, daemon):
+            self._target, self._args = target, args
+
+        def start(self):
+            self._target(*self._args)
+
+    def fake_read_ready(fd, deadline):
+        captured["deadline"] = deadline
+        return {"ok": True}
+
+    monkeypatch.setattr(remote_l3_worker.os, "pipe", fake_pipe)
+    monkeypatch.setattr(remote_l3_worker.os, "close", lambda fd: None)
+    monkeypatch.setattr(remote_l3_worker.os, "unlink", lambda p: None)
+    monkeypatch.setattr(remote_l3_worker.tempfile, "NamedTemporaryFile", lambda *a, **k: _FakeTmp())
+    monkeypatch.setattr(remote_l3_worker.json, "dump", lambda obj, f, **k: captured.__setitem__("manifest", obj))
+    monkeypatch.setattr(remote_l3_worker.subprocess, "Popen", lambda *a, **k: _FakePopen())
+    monkeypatch.setattr(remote_l3_worker.threading, "Thread", _SyncThread)
+    monkeypatch.setattr(remote_l3_worker, "_read_runner_ready", fake_read_ready)
+
+    reply, _proc = remote_l3_worker._start_session(_manifest(startup_remaining_s=50.0, session_timeout_s=30.0))
+
+    # One deadline = 1000 + 50; the runner-ready wait uses it (the 2s Popen is
+    # charged), NOT a fresh now()+50 rebuilt after Popen.
+    assert captured["deadline"] == 1050.0
+    # The runner is handed that same ABSOLUTE monotonic deadline, so its own
+    # deadline equals the daemon's (spawn/import time charged) rather than a
+    # rebuilt now()+remaining that would run past it.
+    assert captured["manifest"]["startup_deadline_monotonic"] == 1050.0
+    assert reply["ok"] is True
 
 
 def test_start_session_kills_runner_on_ready_timeout(monkeypatch):
@@ -77,14 +156,14 @@ def test_start_session_kills_runner_on_ready_timeout(monkeypatch):
     def fake_popen(*args, **kwargs):
         return fake_proc
 
-    def fake_read_ready(fd, timeout_s):
+    def fake_read_ready(fd, deadline):
         raise TimeoutError("ready timeout")
 
     monkeypatch.setattr(remote_l3_worker.subprocess, "Popen", fake_popen)
     monkeypatch.setattr(remote_l3_worker, "_read_runner_ready", fake_read_ready)
 
     with pytest.raises(TimeoutError):
-        remote_l3_worker._start_session(_manifest())
+        remote_l3_worker._start_session(_manifest(startup_remaining_s=30.0))
 
     # Cooperative SIGTERM first, then the hard SIGKILL backstop.
     assert fake_proc.terminated
@@ -108,7 +187,7 @@ def test_start_session_returns_live_runner_without_reaping(monkeypatch):
     monkeypatch.setattr(remote_l3_worker.subprocess, "Popen", lambda *args, **kwargs: fake_proc)
     monkeypatch.setattr(remote_l3_worker, "_read_runner_ready", lambda fd, timeout_s: {"ok": True})
 
-    reply, proc = remote_l3_worker._start_session(_manifest())
+    reply, proc = remote_l3_worker._start_session(_manifest(startup_remaining_s=30.0))
 
     # A ready runner is handed back live for the caller to hand off or reclaim;
     # _start_session itself neither reaps nor kills it.
@@ -132,7 +211,7 @@ def test_start_session_returns_none_proc_when_runner_reports_not_ok(monkeypatch)
     monkeypatch.setattr(remote_l3_worker, "_read_runner_ready", lambda fd, timeout_s: {"ok": False})
     monkeypatch.setattr(remote_l3_worker, "_wait_or_kill_runner", lambda p, **kw: reclaimed.append(p))
 
-    reply, proc = remote_l3_worker._start_session(_manifest())
+    reply, proc = remote_l3_worker._start_session(_manifest(startup_remaining_s=30.0))
 
     # A failed handshake is killed+reaped exactly once inside _start_session, so
     # the caller gets no runner to reclaim.
@@ -141,21 +220,25 @@ def test_start_session_returns_none_proc_when_runner_reports_not_ok(monkeypatch)
     assert reclaimed == [fake_proc]
 
 
-def test_run_session_bounds_post_ready_command_accept(monkeypatch):
+def test_run_session_bounds_command_accept_by_startup_deadline_not_session_timeout(monkeypatch):
+    # Waiting for the parent to attach is still the attach phase: command accept
+    # must be bounded by the remaining startup budget, not session_timeout_s.
+    clock = _Clock(1000.0)
+    monkeypatch.setattr(remote_l3_session.time, "monotonic", clock.monotonic)
+
     class FakeWorker:
         def __init__(self, *args, **kwargs):
-            self.closed = False
+            pass
 
         def init(self, *args, **kwargs):
             pass
 
         def close(self):
-            self.closed = True
+            pass
 
     class FakeCommandSock:
         def __init__(self):
             self.timeout = None
-            self.closed = False
 
         def getsockname(self):
             return ("127.0.0.1", 12345)
@@ -169,7 +252,7 @@ def test_run_session_bounds_post_ready_command_accept(monkeypatch):
             raise socket.timeout("command attach timed out")
 
         def close(self):
-            self.closed = True
+            pass
 
     class FakeHealthSock:
         def getsockname(self):
@@ -189,10 +272,91 @@ def test_run_session_bounds_post_ready_command_accept(monkeypatch):
     monkeypatch.setattr(remote_l3_session, "_health_loop", lambda *args: None)
 
     try:
-        assert remote_l3_session.run_session(_manifest(), ready_w) == 1
-        assert command_sock.timeout == 0.01
+        # 5s startup budget (deadline 1005), 30s runtime timeout — deliberately different.
+        rc = remote_l3_session.run_session(
+            _manifest(startup_deadline_monotonic=1005.0, session_timeout_s=30.0), ready_w
+        )
+        assert rc == 1
     finally:
         os.close(ready_r)
+
+    # accept timeout = startup_deadline - now() = 5.0, NOT the 30s session timeout.
+    assert command_sock.timeout == 5.0
+
+
+def test_run_session_forces_command_conn_blocking_for_idle(monkeypatch):
+    # A finite timeout on the command connection would self-destruct a healthy but
+    # idle session (read_frame idle-waiting for the next command would raise). The
+    # accept()'d socket inherits socket.getdefaulttimeout() (a user module could
+    # have set it), so the runner must explicitly force it blocking.
+    clock = _Clock(1000.0)
+    monkeypatch.setattr(remote_l3_session.time, "monotonic", clock.monotonic)
+
+    class FakeConn:
+        def __init__(self):
+            self.timeout = 0.05  # hostile: a non-None default timeout was inherited
+
+        def settimeout(self, t):
+            self.timeout = t
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_a):
+            return False
+
+    fake_conn = FakeConn()
+
+    class FakeWorker:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def init(self, *args, **kwargs):
+            pass
+
+        def close(self):
+            pass
+
+    class FakeCommandSock:
+        def getsockname(self):
+            return ("127.0.0.1", 12345)
+
+        def settimeout(self, timeout):
+            pass
+
+        def accept(self):
+            return fake_conn, ("127.0.0.1", 1)
+
+        def close(self):
+            pass
+
+    class FakeHealthSock:
+        def getsockname(self):
+            return ("127.0.0.1", 12346)
+
+        def close(self):
+            pass
+
+    sockets = [FakeCommandSock(), FakeHealthSock()]
+    ready_r, ready_w = os.pipe()
+
+    monkeypatch.setattr(remote_l3_session, "Worker", FakeWorker)
+    monkeypatch.setattr(remote_l3_session, "_install_manifest_dispatcher_registry", lambda manifest: {})
+    monkeypatch.setattr(remote_l3_session, "_install_manifest_inner_registry", lambda manifest, worker: {})
+    monkeypatch.setattr(remote_l3_session, "_bind_listener", lambda host: sockets.pop(0))
+    monkeypatch.setattr(remote_l3_session, "_health_loop", lambda *args: None)
+    monkeypatch.setattr(remote_l3_session, "_run_command_loop", lambda *args, **kwargs: None)
+
+    try:
+        rc = remote_l3_session.run_session(
+            _manifest(startup_deadline_monotonic=1005.0, session_timeout_s=0.05), ready_w
+        )
+        assert rc == 0
+    finally:
+        os.close(ready_r)
+
+    # Forced blocking before the command loop, regardless of the inherited default.
+    assert fake_conn.timeout is None
 
 
 def test_run_session_bounds_subtree_by_startup_remaining_not_session_timeout(monkeypatch):
@@ -250,6 +414,126 @@ def test_run_session_bounds_subtree_by_startup_remaining_not_session_timeout(mon
     budget = captured["deadline"] - captured["at"]
     # ~50s startup budget, not the 0.01s runtime command timeout.
     assert 40.0 < budget <= 50.0
+
+
+def test_run_session_builds_deadline_before_registry_install(monkeypatch):
+    # The runner establishes its single deadline before registry install, so that
+    # time is charged against the budget rather than restarting a fresh slice at
+    # inner init.
+    clock = _Clock(1000.0)
+    monkeypatch.setattr(remote_l3_session.time, "monotonic", clock.monotonic)
+    captured: dict = {}
+
+    class FakeWorker:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def init(self, *args, _startup_deadline=None, **kwargs):
+            captured["deadline"] = _startup_deadline
+
+        def close(self):
+            pass
+
+    def slow_dispatch_registry(manifest):
+        clock.advance(5.0)  # registry install consumes the budget
+        return {}
+
+    class FakeCommandSock:
+        def getsockname(self):
+            return ("127.0.0.1", 12345)
+
+        def settimeout(self, timeout):
+            pass
+
+        def accept(self):
+            raise socket.timeout("stop after init")
+
+        def close(self):
+            pass
+
+    class FakeHealthSock:
+        def getsockname(self):
+            return ("127.0.0.1", 12346)
+
+        def close(self):
+            pass
+
+    sockets = [FakeCommandSock(), FakeHealthSock()]
+    ready_r, ready_w = os.pipe()
+
+    monkeypatch.setattr(remote_l3_session, "Worker", FakeWorker)
+    monkeypatch.setattr(remote_l3_session, "_install_manifest_dispatcher_registry", slow_dispatch_registry)
+    monkeypatch.setattr(remote_l3_session, "_install_manifest_inner_registry", lambda manifest, worker: {})
+    monkeypatch.setattr(remote_l3_session, "_bind_listener", lambda host: sockets.pop(0))
+    monkeypatch.setattr(remote_l3_session, "_health_loop", lambda *args: None)
+
+    try:
+        remote_l3_session.run_session(_manifest(session_timeout_s=0.01, startup_remaining_s=50.0), ready_w)
+    finally:
+        os.close(ready_r)
+
+    # deadline built at t=1000 (before the 5s registry install) => 1050, NOT the
+    # 1005 + 50 = 1055 a post-registry rebuild would give.
+    assert captured["deadline"] == 1050.0
+
+
+def test_run_session_uses_daemon_absolute_deadline_verbatim(monkeypatch):
+    # Given the daemon's shared-clock absolute deadline, the runner uses it as-is
+    # — its deadline equals the daemon's regardless of spawn/import/registry time.
+    clock = _Clock(1000.0)
+    monkeypatch.setattr(remote_l3_session.time, "monotonic", clock.monotonic)
+    captured: dict = {}
+
+    class FakeWorker:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def init(self, *args, _startup_deadline=None, **kwargs):
+            captured["deadline"] = _startup_deadline
+
+        def close(self):
+            pass
+
+    def slow_dispatch_registry(manifest):
+        clock.advance(7.0)  # spawn/import/registry cost — must NOT extend the deadline
+        return {}
+
+    class FakeCommandSock:
+        def getsockname(self):
+            return ("127.0.0.1", 12345)
+
+        def settimeout(self, timeout):
+            pass
+
+        def accept(self):
+            raise socket.timeout("stop after init")
+
+        def close(self):
+            pass
+
+    class FakeHealthSock:
+        def getsockname(self):
+            return ("127.0.0.1", 12346)
+
+        def close(self):
+            pass
+
+    sockets = [FakeCommandSock(), FakeHealthSock()]
+    ready_r, ready_w = os.pipe()
+
+    monkeypatch.setattr(remote_l3_session, "Worker", FakeWorker)
+    monkeypatch.setattr(remote_l3_session, "_install_manifest_dispatcher_registry", slow_dispatch_registry)
+    monkeypatch.setattr(remote_l3_session, "_install_manifest_inner_registry", lambda manifest, worker: {})
+    monkeypatch.setattr(remote_l3_session, "_bind_listener", lambda host: sockets.pop(0))
+    monkeypatch.setattr(remote_l3_session, "_health_loop", lambda *args: None)
+
+    try:
+        remote_l3_session.run_session(_manifest(startup_deadline_monotonic=1042.0, session_timeout_s=0.01), ready_w)
+    finally:
+        os.close(ready_r)
+
+    # Uses the daemon's absolute deadline verbatim (1042), not now()+something.
+    assert captured["deadline"] == 1042.0
 
 
 def test_health_loop_closes_active_connection_on_stop():

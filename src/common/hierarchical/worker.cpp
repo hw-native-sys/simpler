@@ -81,10 +81,12 @@ void Worker::add_next_level_worker(int32_t worker_id, void *mailbox) {
 
 void Worker::add_remote_l3_socket(
     int32_t worker_id, uint64_t session_id, const std::string &transport_name, const std::string &host, uint16_t port,
-    const std::string &health_host, uint16_t health_port, double timeout_s
+    const std::string &health_host, uint16_t health_port, double attach_timeout_s, double runtime_timeout_s
 ) {
     if (initialized_) throw std::runtime_error("Worker: add_remote_l3_socket after init");
-    auto transport = std::make_unique<RemoteL3SocketTransport>(host, port, health_host, health_port, timeout_s);
+    auto transport = std::make_unique<RemoteL3SocketTransport>(
+        host, port, health_host, health_port, attach_timeout_s, runtime_timeout_s
+    );
     transport->expect_hello_ready(session_id, worker_id, transport_name);
     manager_.add_next_level_endpoint(
         std::make_unique<RemoteL3Endpoint>(worker_id, session_id, transport_name, std::move(transport))

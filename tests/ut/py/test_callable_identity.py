@@ -504,7 +504,7 @@ def test_remote_worker_id_stays_stable_when_local_worker_is_added_later(monkeypa
     def fake_worker_ctor(*args):
         return fake_c_worker
 
-    def fake_open_remote_session(self, *, spec, worker_id, session_id, timeout_s, startup_remaining_s):
+    def fake_open_remote_session(self, *, spec, worker_id, session_id, deadline):
         opened_worker_ids.append(worker_id)
         return worker_mod._RemoteSession(  # noqa: SLF001
             worker_id=worker_id,
@@ -1616,7 +1616,7 @@ def test_partial_init_failure_cleans_open_remote_session(monkeypatch):
 
     calls = 0
 
-    def fake_open_remote_session(self, *, spec, worker_id, session_id, timeout_s, startup_remaining_s):
+    def fake_open_remote_session(self, *, spec, worker_id, session_id, deadline):
         nonlocal calls
         calls += 1
         if calls == 2:
@@ -1673,7 +1673,7 @@ def test_partial_init_failure_closes_unregistered_open_remote_session(monkeypatc
     def fake_worker_ctor(*args):
         return fake_c_worker
 
-    def fake_open_remote_session(self, *, spec, worker_id, session_id, timeout_s, startup_remaining_s):
+    def fake_open_remote_session(self, *, spec, worker_id, session_id, deadline):
         return opened_session
 
     def fake_close_remote_session(self, session):

@@ -346,8 +346,10 @@ from simpler.worker import RemoteCallable, RemoteWorkerSpec, Worker
 
 w4 = Worker(level=4)
 
+# endpoint host must be a numeric IP (or "localhost"); hostnames are rejected
+# because getaddrinfo resolution is unbounded and could pin startup.
 l3 = RemoteWorkerSpec(
-    endpoint="node17:19073",
+    endpoint="10.0.0.17:19073",
     platform="a2a3",
     runtime="tensormap_and_ringbuffer",
     device_ids=list(range(16)),

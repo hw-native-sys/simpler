@@ -17,6 +17,7 @@
 #include <unistd.h>
 
 #include <array>
+#include <atomic>
 #include <cerrno>
 #include <csignal>
 #include <chrono>
@@ -121,6 +122,83 @@ uint16_t start_closing_server(std::thread &server_thread) {
         ::close(listener);
     });
     return ntohs(addr.sin_port);
+}
+
+int make_loopback_listener(uint16_t &port_out) {
+    int listener = ::socket(AF_INET, SOCK_STREAM, 0);
+    if (listener < 0) throw std::runtime_error(std::string("socket failed: ") + std::strerror(errno));
+    int one = 1;
+    (void)::setsockopt(listener, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    addr.sin_port = 0;
+    if (::bind(listener, reinterpret_cast<sockaddr *>(&addr), sizeof(addr)) != 0) {
+        int err = errno;
+        ::close(listener);
+        throw std::runtime_error(std::string("bind failed: ") + std::strerror(err));
+    }
+    if (::listen(listener, 1) != 0) {
+        int err = errno;
+        ::close(listener);
+        throw std::runtime_error(std::string("listen failed: ") + std::strerror(err));
+    }
+    socklen_t len = sizeof(addr);
+    if (::getsockname(listener, reinterpret_cast<sockaddr *>(&addr), &len) != 0) {
+        int err = errno;
+        ::close(listener);
+        throw std::runtime_error(std::string("getsockname failed: ") + std::strerror(err));
+    }
+    port_out = ntohs(addr.sin_port);
+    return listener;
+}
+
+// Accept one connection and hold it open (sending nothing) until `stop` is set,
+// so a client blocked in read_frame can only end by timing out on its own
+// deadline — never on EOF. Holding well past any client timeout is what lets a
+// test tell an attach-bounded read from a runtime-bounded one; a hard safety cap
+// keeps a failing test from hanging the suite.
+uint16_t start_stalling_server(std::thread &server_thread, std::atomic<bool> &stop) {
+    uint16_t port = 0;
+    int listener = make_loopback_listener(port);
+    server_thread = std::thread([listener, &stop]() {
+        int fd = ::accept(listener, nullptr, nullptr);
+        for (int i = 0; i < 500 && !stop.load(std::memory_order_acquire); ++i) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        }
+        if (fd >= 0) ::close(fd);
+        ::close(listener);
+    });
+    return port;
+}
+
+// Accept one connection, wait delay_ms, then send a single COMPLETION frame with
+// the given sequence so a client's wait_for_reply(COMPLETION, seq) succeeds.
+uint16_t start_delayed_reply_server(std::thread &server_thread, int delay_ms, uint64_t sequence) {
+    uint16_t port = 0;
+    int listener = make_loopback_listener(port);
+    server_thread = std::thread([listener, delay_ms, sequence]() {
+        int fd = ::accept(listener, nullptr, nullptr);
+        if (fd >= 0) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(delay_ms));
+            remote_l3::FrameHeader header;
+            header.frame_type = remote_l3::FrameType::COMPLETION;
+            header.session_id = 1;
+            header.worker_id = 0;
+            header.sequence = sequence;
+            std::vector<uint8_t> frame = remote_l3::encode_frame(header, {});
+            size_t off = 0;
+            while (off < frame.size()) {
+                ssize_t n = ::send(fd, frame.data() + off, frame.size() - off, MSG_NOSIGNAL);
+                if (n <= 0) break;
+                off += static_cast<size_t>(n);
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            ::close(fd);
+        }
+        ::close(listener);
+    });
+    return port;
 }
 
 class FakeRemoteTransport : public RemoteL3Transport {
@@ -356,7 +434,7 @@ TEST(RemoteEndpoint, RemoteBufferControlsRejectOutOfRangeSlices) {
 TEST(RemoteSocketTransport, ClosedPeerWriteDoesNotRaiseSigpipe) {
     std::thread server_thread;
     uint16_t port = start_closing_server(server_thread);
-    RemoteL3SocketTransport transport("127.0.0.1", port, "127.0.0.1", 1, 1.0);
+    RemoteL3SocketTransport transport("127.0.0.1", port, "127.0.0.1", 1, 1.0, 1.0);
     server_thread.join();
     std::this_thread::sleep_for(std::chrono::milliseconds(50));
 
@@ -375,6 +453,74 @@ TEST(RemoteSocketTransport, ClosedPeerWriteDoesNotRaiseSigpipe) {
     EXPECT_TRUE(saw_error);
     EXPECT_EQ(g_sigpipe_count, 0);
     transport.shutdown();
+}
+
+TEST(RemoteSocketTransport, CtorRejectsNonPositiveTimeouts) {
+    // Validation runs before connect_socket(), so no server is needed.
+    EXPECT_THROW(RemoteL3SocketTransport("127.0.0.1", 1, "127.0.0.1", 1, 0.0, 5.0), std::invalid_argument);
+    EXPECT_THROW(RemoteL3SocketTransport("127.0.0.1", 1, "127.0.0.1", 1, -1.0, 5.0), std::invalid_argument);
+    EXPECT_THROW(RemoteL3SocketTransport("127.0.0.1", 1, "127.0.0.1", 1, 5.0, 0.0), std::invalid_argument);
+    EXPECT_THROW(RemoteL3SocketTransport("127.0.0.1", 1, "127.0.0.1", 1, 5.0, -1.0), std::invalid_argument);
+}
+
+TEST(RemoteSocketTransport, HelloReadBoundedByAttachTimeout) {
+    // Server accepts the command connection but never sends HELLO, so the read
+    // can only end by timing out. A small attach budget (0.2s) and a large
+    // runtime budget (5.0s) tell the two apart: bounding the HELLO read by the
+    // runtime timeout would take ~5s.
+    std::atomic<bool> stop{false};
+    std::thread server_thread;
+    uint16_t port = start_stalling_server(server_thread, stop);
+    RemoteL3SocketTransport transport("127.0.0.1", port, "127.0.0.1", 1, /*attach*/ 0.2, /*runtime*/ 5.0);
+
+    auto t0 = std::chrono::steady_clock::now();
+    EXPECT_THROW(transport.expect_hello_ready(1, 0, "sim"), std::runtime_error);
+    double elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    EXPECT_LT(elapsed, 1.0);
+
+    stop.store(true, std::memory_order_release);
+    transport.shutdown();
+    server_thread.join();
+}
+
+TEST(RemoteSocketTransport, RuntimeReadSurvivesElapsedAttachDeadline) {
+    // The reply arrives after the attach deadline (0.3s) has elapsed. A runtime
+    // read that (wrongly) reused the attach deadline would throw immediately; a
+    // fresh runtime budget (2.0s) receives it. This proves the value split, not
+    // just the path.
+    std::thread server_thread;
+    uint16_t port = start_delayed_reply_server(server_thread, /*delay_ms=*/500, /*sequence=*/1);
+    RemoteL3SocketTransport transport("127.0.0.1", port, "127.0.0.1", 1, /*attach*/ 0.3, /*runtime*/ 2.0);
+
+    std::vector<uint8_t> probe(16, 0x11);
+    transport.submit_frame(probe);
+    EXPECT_NO_THROW({
+        auto reply = transport.wait_for_reply(remote_l3::FrameType::COMPLETION, 1);
+        EXPECT_FALSE(reply.empty());
+    });
+
+    transport.shutdown();
+    server_thread.join();
+}
+
+TEST(RemoteSocketTransport, RuntimeWriteToStalledReaderTimesOut) {
+    // The peer accepts but never reads; a large frame overruns the socket buffers
+    // so a single blocking send() would hang past the runtime deadline. The fd is
+    // persistently O_NONBLOCK, so the write re-polls under the deadline and throws.
+    std::atomic<bool> stop{false};
+    std::thread server_thread;
+    uint16_t port = start_stalling_server(server_thread, stop);
+    RemoteL3SocketTransport transport("127.0.0.1", port, "127.0.0.1", 1, /*attach*/ 1.0, /*runtime*/ 0.5);
+
+    std::vector<uint8_t> big(16 * 1024 * 1024, 0x7E);
+    auto t0 = std::chrono::steady_clock::now();
+    EXPECT_THROW(transport.submit_frame(big), std::runtime_error);
+    double elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    EXPECT_LT(elapsed, 3.0);
+
+    stop.store(true, std::memory_order_release);
+    transport.shutdown();
+    server_thread.join();
 }
 
 TEST(RemoteEndpoint, BareHostPointerWithoutSidecarIsEndpointFailure) {
