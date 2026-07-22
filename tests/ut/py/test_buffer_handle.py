@@ -8,18 +8,29 @@
 # -----------------------------------------------------------------------------------------------------------
 """Unit tests for simpler.buffer_handle: identity/descriptor pack-unpack + create/import round trip."""
 
+import ctypes
+
 import pytest
-from _task_interface import BUFFER_HANDLE_DESCRIPTOR_BYTES, CANONICAL_IDENTITY_BYTES
+from _task_interface import (
+    BUFFER_HANDLE_DESCRIPTOR_BYTES,
+    CANONICAL_IDENTITY_BYTES,
+    DataType,
+    materialize_bufferref_blob,
+    read_args_from_blob,
+)
 from simpler.buffer_handle import (
+    BUFFER_REF_FLAG_MANUAL_DEP,
     AccessMode,
     AddressSpace,
     BackendKind,
     BufferHandleDescriptor,
+    BufferRef,
     CanonicalIdentity,
     ImportRegistry,
     Visibility,
     create_host_shared_buffer,
     mint_owner_instance_id,
+    pack_bufferref_blob,
 )
 
 
@@ -152,3 +163,57 @@ def test_register_remote_sidecar_rejected():
 def test_owner_instance_ids_are_distinct():
     ids = {mint_owner_instance_id() for _ in range(64)}
     assert len(ids) == 64  # 64-bit nonce, collisions astronomically unlikely
+
+
+def test_materialize_bufferref_blob_to_tensors():
+    oid = mint_owner_instance_id()
+    h_host = create_host_shared_buffer(nbytes=64, owner_instance_id=oid, buffer_id=1)
+    h_dev = create_host_shared_buffer(nbytes=128, owner_instance_id=oid, buffer_id=2, generation=3)
+    reg = ImportRegistry()
+    try:
+        reg.register(h_host.to_descriptor().pack())
+        reg.register(h_dev.to_descriptor().pack())
+
+        # A BufferRef blob referencing both handles (contiguous views) plus a scalar.
+        ref0 = BufferRef(h_host.identity, byte_offset=0, shapes=(4,), strides=(1,), dtype=DataType.FLOAT32.value)
+        ref1 = BufferRef(
+            h_dev.identity,
+            byte_offset=8,
+            shapes=(2, 4),
+            strides=(4, 1),
+            dtype=DataType.FLOAT16.value,
+            flags=BUFFER_REF_FLAG_MANUAL_DEP,
+        )
+        blob = pack_bufferref_blob([ref0, ref1], scalars=(42,))
+        src = ctypes.create_string_buffer(blob, len(blob))
+
+        tensor_blob = materialize_bufferref_blob(ctypes.addressof(src), len(blob), reg.materialization_map())
+        dst = ctypes.create_string_buffer(tensor_blob, len(tensor_blob))
+        args = read_args_from_blob(ctypes.addressof(dst))
+
+        assert args.tensor_count() == 2
+        assert args.scalar_count() == 1
+        # Each tensor resolves to its handle's local base + byte_offset, with the ref's view.
+        assert args.tensor(0).data == reg.resolve(h_host.identity).base + 0
+        assert args.tensor(0).shapes == (4,)
+        assert args.tensor(0).child_memory is False  # HOST
+        assert args.tensor(1).data == reg.resolve(h_dev.identity).base + 8
+        assert args.tensor(1).shapes == (2, 4)
+        assert args.scalar(0) == 42
+    finally:
+        reg.close()
+        h_host.close()
+        h_dev.close()
+
+
+def test_materialize_rejects_unregistered_identity():
+    oid = mint_owner_instance_id()
+    handle = create_host_shared_buffer(nbytes=32, owner_instance_id=oid, buffer_id=9)
+    try:
+        ref = BufferRef(handle.identity, byte_offset=0, shapes=(8,), strides=(1,), dtype=DataType.INT32.value)
+        blob = pack_bufferref_blob([ref])
+        src = ctypes.create_string_buffer(blob, len(blob))
+        with pytest.raises(RuntimeError, match="identity"):
+            materialize_bufferref_blob(ctypes.addressof(src), len(blob), {})  # empty registry
+    finally:
+        handle.close()

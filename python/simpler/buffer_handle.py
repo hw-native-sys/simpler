@@ -32,7 +32,10 @@ from _task_interface import (  # pyright: ignore[reportMissingImports]
     BACKEND_TOKEN_BYTES,
     BUFFER_ABI_VERSION,
     BUFFER_HANDLE_DESCRIPTOR_BYTES,
+    BUFFER_REF_BYTES,
+    BUFFERREF_BLOB_HEADER_BYTES,
     CANONICAL_IDENTITY_BYTES,
+    MAX_TENSOR_DIMS,
     MAX_WORKER_PATH_DEPTH,
     OWNER_WORKER_PATH_BYTES,
 )
@@ -162,6 +165,52 @@ class BufferHandleDescriptor:
         )
 
 
+# BufferRef (96 B): CanonicalIdentity(40) + byte_offset u64, ndims u32, shapes[MAX] u32,
+#   strides[MAX] u32, dtype u8, flags u8, reserved[2].
+_BUFFER_REF_TAIL = struct.Struct(f"<QI{MAX_TENSOR_DIMS}I{MAX_TENSOR_DIMS}IBB2x")
+assert _CANONICAL_IDENTITY.size + _BUFFER_REF_TAIL.size == BUFFER_REF_BYTES, "BufferRef layout drift"
+
+BUFFER_REF_FLAG_MANUAL_DEP = 1 << 0
+BUFFER_REF_FLAG_CONTIGUOUS = 1 << 1
+
+# BufferRef blob envelope (16 B): abi_version u32, ref_count i32, scalar_count i32, reserved u32.
+_BUFFERREF_BLOB_HEADER = struct.Struct("<IiiI")
+assert _BUFFERREF_BLOB_HEADER.size == BUFFERREF_BLOB_HEADER_BYTES, "BufferRef blob header drift"
+
+
+@dataclass(frozen=True)
+class BufferRef:
+    """The blob-carried view: a reference to a handle (canonical identity) + a strided view onto it."""
+
+    identity: CanonicalIdentity
+    byte_offset: int
+    shapes: tuple[int, ...]
+    strides: tuple[int, ...]
+    dtype: int  # DataType enum value
+    flags: int = 0
+
+    def __post_init__(self) -> None:
+        if not 0 < len(self.shapes) <= MAX_TENSOR_DIMS:
+            raise ValueError(f"BufferRef ndims must be in [1, {MAX_TENSOR_DIMS}], got {len(self.shapes)}")
+        if len(self.strides) != len(self.shapes):
+            raise ValueError("BufferRef shapes and strides must have equal length")
+
+    def pack(self) -> bytes:
+        ndims = len(self.shapes)
+        shapes = list(self.shapes) + [0] * (MAX_TENSOR_DIMS - ndims)
+        strides = list(self.strides) + [0] * (MAX_TENSOR_DIMS - ndims)
+        tail = _BUFFER_REF_TAIL.pack(self.byte_offset, ndims, *shapes, *strides, self.dtype, self.flags)
+        return self.identity.pack() + tail
+
+
+def pack_bufferref_blob(refs: list[BufferRef], scalars: tuple[int, ...] = ()) -> bytes:
+    """Serialize refs + scalars into the versioned BufferRef blob (mirror of write_bufferref_blob)."""
+    header = _BUFFERREF_BLOB_HEADER.pack(BUFFER_ABI_VERSION, len(refs), len(scalars), 0)
+    body = b"".join(ref.pack() for ref in refs)
+    tail = struct.pack(f"<{len(scalars)}Q", *scalars) if scalars else b""
+    return header + body + tail
+
+
 def mint_owner_instance_id() -> int:
     """A fresh 64-bit nonce, unique per owner incarnation (defends canonical identity against ABA)."""
     return int.from_bytes(os.urandom(8), "little")
@@ -246,6 +295,7 @@ class ImportedBuffer:
     identity: CanonicalIdentity
     base: int
     nbytes: int
+    address_space: AddressSpace = AddressSpace.HOST
     shm: SharedMemory | None = None  # the consumer's own mapping for shm backends
 
 
@@ -264,7 +314,7 @@ class ImportRegistry:
         desc = BufferHandleDescriptor.unpack(descriptor) if isinstance(descriptor, (bytes, bytearray)) else descriptor
         if desc.backend_kind in (BackendKind.POSIX_SHM, BackendKind.FORK_SHM):
             shm = SharedMemory(name=desc.token)
-            imported = ImportedBuffer(desc.identity, _shm_base_addr(shm), desc.nbytes, shm)
+            imported = ImportedBuffer(desc.identity, _shm_base_addr(shm), desc.nbytes, desc.address_space, shm)
         elif desc.backend_kind == BackendKind.REMOTE_SIDECAR:
             raise ValueError("ImportRegistry: REMOTE_SIDECAR backend is reserved for P2")
         else:
@@ -281,6 +331,10 @@ class ImportRegistry:
         if imported is None:
             raise KeyError(f"ImportRegistry: no handle registered for {identity}")
         return imported
+
+    def materialization_map(self) -> dict[bytes, tuple[int, int]]:
+        """Snapshot for ``materialize_bufferref_blob``: packed identity -> (local base, address_space)."""
+        return {key: (ib.base, int(ib.address_space)) for key, ib in self._by_identity.items()}
 
     def unregister(self, identity: CanonicalIdentity) -> None:
         imported = self._by_identity.pop(identity.pack(), None)

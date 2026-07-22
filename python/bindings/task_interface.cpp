@@ -606,6 +606,7 @@ NB_MODULE(_task_interface, m) {
     // BufferHandle / BufferRef wire ABI (buffer_handle.h). Exported so the Python mirror in
     // simpler.buffer_handle can pin its struct formats to the C++ layout and reject drift.
     m.attr("BUFFER_ABI_VERSION") = static_cast<uint32_t>(BUFFER_ABI_VERSION);
+    m.attr("MAX_TENSOR_DIMS") = static_cast<int>(MAX_TENSOR_DIMS);
     m.attr("BUFFER_REF_BYTES") = static_cast<int>(sizeof(BufferRef));
     m.attr("BUFFER_HANDLE_DESCRIPTOR_BYTES") = static_cast<int>(sizeof(BufferHandleDescriptor));
     m.attr("CANONICAL_IDENTITY_BYTES") = static_cast<int>(sizeof(CanonicalIdentity));
@@ -1538,6 +1539,64 @@ NB_MODULE(_task_interface, m) {
         nb::arg("blob_ptr"),
         "Reconstruct a TaskArgs from a length-prefixed blob at blob_ptr. "
         "Tags are not preserved (blob wire format strips them)."
+    );
+
+    m.def(
+        "materialize_bufferref_blob",
+        [](uint64_t blob_ptr, size_t capacity, nb::dict resolved) -> nb::bytes {
+            const uint8_t *src = reinterpret_cast<const uint8_t *>(blob_ptr);
+            BufferRefBlobView view = read_bufferref_blob(src, capacity);
+            TaskArgs args;
+            for (int32_t i = 0; i < view.ref_count; i++) {
+                BufferRef r = view.ref(i);
+                uint64_t elem = get_element_size(r.dtype);
+                if (elem == 0) {
+                    throw std::runtime_error("materialize_bufferref_blob: unknown dtype");
+                }
+                if (r.byte_offset % elem != 0) {
+                    throw std::runtime_error("materialize_bufferref_blob: byte_offset is not a multiple of dtype size");
+                }
+                // Only row-major (contiguous) views are materializable in this ABI version.
+                uint32_t row_major = 1;
+                bool contiguous = true;
+                for (int d = static_cast<int>(r.ndims) - 1; d >= 0; d--) {
+                    if (r.strides[d] != row_major) {
+                        contiguous = false;
+                        break;
+                    }
+                    row_major *= r.shapes[d];
+                }
+                if (!contiguous) {
+                    throw std::runtime_error("materialize_bufferref_blob: non-contiguous BufferRef not supported yet");
+                }
+                nb::bytes key(reinterpret_cast<const char *>(&r.identity), sizeof(CanonicalIdentity));
+                if (!resolved.contains(key)) {
+                    throw std::runtime_error(
+                        "materialize_bufferref_blob: canonical identity not in the import registry"
+                    );
+                }
+                nb::tuple val = nb::cast<nb::tuple>(resolved[key]);
+                auto base = nb::cast<uint64_t>(val[0]);
+                auto addr_space = nb::cast<int>(val[1]);
+                Tensor t = make_tensor_external(
+                    reinterpret_cast<void *>(static_cast<uintptr_t>(base + r.byte_offset)), r.shapes, r.ndims, r.dtype,
+                    /*manual_dep=*/(r.flags & BUFFER_REF_MANUAL_DEP) != 0, /*version=*/0,
+                    static_cast<AddressSpace>(addr_space)
+                );
+                args.add_tensor(t, TensorArgType::INPUT);
+            }
+            for (int32_t i = 0; i < view.scalar_count; i++) {
+                args.add_scalar(view.scalars[i]);
+            }
+            size_t sz = task_args_blob_size(args);
+            std::string out(sz, '\0');
+            write_blob(reinterpret_cast<uint8_t *>(out.data()), args);
+            return nb::bytes(out.data(), sz);
+        },
+        nb::arg("blob_ptr"), nb::arg("capacity"), nb::arg("resolved"),
+        "Materialize a BufferRef blob into a Tensor blob (write_blob format). Each ref's canonical "
+        "identity is resolved via `resolved` {identity_bytes: (local_base, address_space)}; addr = "
+        "base + byte_offset. Rejects unknown identity, non-dtype-aligned byte_offset, non-contiguous view."
     );
 
     nb::class_<L2ChildOnboardRegionExport>(m, "_L2ChildOnboardRegionExport")
