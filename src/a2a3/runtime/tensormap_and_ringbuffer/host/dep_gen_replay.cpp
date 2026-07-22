@@ -21,10 +21,11 @@
  *   ORACLE pass (read-only contract):
  *     Drives `compute_task_fanin` (the same template the device orchestrator
  *     uses in pto_orchestrator.cpp:submit_task) against `tm_oracle`. Emits
- *     only PTO2TaskId values — the canonical set of producer IDs the runtime
- *     would have wired. We never widen this template's emit signature: this
- *     pass IS the contract, and any future change to `compute_task_fanin`
- *     automatically refreshes the oracle.
+ *     (PTO2TaskId, initial PTO2DepFlags) pairs — the canonical set of
+ *     producer IDs and per-edge flags the runtime would have wired, OR-merged
+ *     per producer exactly like the runtime's PTO2FaninBuilder. This pass IS
+ *     the contract: any future change to `compute_task_fanin` automatically
+ *     refreshes the oracle.
  *
  *   ANNOT pass (this file's feature):
  *     Inlines the same STEP A (creator retention) + STEP B (tensormap lookup)
@@ -33,12 +34,16 @@
  *     replay can record per-edge tensor metadata (producer/consumer
  *     shape/offset, dtype, version).
  *
- * After both passes finish per record, we compare the producer-ID set the
- * oracle emitted to the producer-ID set the annot pass emitted. They MUST
- * match. If they diverge, deps.json is not written and the function returns
- * non-zero — this is the "no shotgun modifications" guarantee: anyone who
- * changes `compute_task_fanin` will trip this gate immediately and know to
- * mirror the change in the annot pass.
+ * After both passes finish per record, we compare the producer → merged-flags
+ * map the oracle emitted to the one the annot pass emitted. They MUST match —
+ * both the producer-ID set AND each producer's OR-merged PTO2DepFlags. If
+ * they diverge, deps.json is not written and the function returns non-zero —
+ * this is the "no shotgun modifications" guarantee: anyone who changes
+ * `compute_task_fanin` will trip this gate immediately and know to mirror the
+ * change in the annot pass. Comparing merged flags (not just IDs) also pins
+ * the provenance mapping: a producer attributed to different steps on the two
+ * passes (e.g. creator on one, tensormap modifier on the other) yields
+ * different merged flags even though the producer-ID set is identical.
  *
  * STEP 1 (explicit_deps) is emitted at the call site (per pto_dep_compute.h's
  * "kept at call site" note); both passes run the same explicit-deps loop, so
@@ -63,7 +68,6 @@
 #include <fstream>
 #include <string>
 #include <unordered_map>
-#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -140,6 +144,32 @@ const char *overlap_status_str(OverlapStatus s) {
         return "no_overlap";
     }
     return "unknown";
+}
+
+const char *dep_flags_str(PTO2DepFlags f) {
+    switch (f) {
+    case PTO2_DEP_NONE:
+        return "NONE";
+    case PTO2_DEP_WAIT:
+        return "WAIT";
+    case PTO2_DEP_RETAIN:
+        return "RETAIN";
+    case PTO2_DEP_WAIT_RETAIN:
+        return "WAIT|RETAIN";
+    }
+    return "unknown";
+}
+
+// OR-merge one discovery into a pred → merged-flags map, mirroring the
+// runtime PTO2FaninBuilder's never-first-wins rule for duplicate
+// (producer, consumer) discoveries. Returns true if this pred was newly
+// inserted (callers use it to decide whether to record a first-edge entry).
+bool merge_edge_flags(std::unordered_map<uint64_t, PTO2DepFlags> &m, uint64_t pred, PTO2DepFlags flags) {
+    auto [it, inserted] = m.emplace(pred, flags);
+    if (!inserted) {
+        it->second = static_cast<PTO2DepFlags>(it->second | flags);
+    }
+    return inserted;
 }
 
 // One annotated edge. consumer_* always populated. producer_* populated for
@@ -401,7 +431,8 @@ bool write_deps_json(
 // ---------------------------------------------------------------------------
 // Annot pass — mirrors compute_task_fanin step-by-step against tm_annot.
 // Must stay bit-equivalent to pto_dep_compute.h::compute_task_fanin in terms
-// of which producer IDs are emitted (the differential check enforces this).
+// of which producer IDs are emitted AND which initial PTO2DepFlags each step
+// assigns (the differential check enforces both).
 // ---------------------------------------------------------------------------
 
 template <typename EmitTM, typename EmitCreator>
@@ -516,13 +547,16 @@ dep_gen_replay_emit_deps_json(const DepGenRecord *records, size_t num_records, c
     TensorRef tref_buf[CORE_MAX_TENSOR_ARGS];
     TensorArgType atype_buf[CORE_MAX_TENSOR_ARGS];
 
-    // Per-record dedup of producer IDs — must match runtime's
+    // Per-record producer → OR-merged PTO2DepFlags — must match the runtime's
     // PTO2FaninBuilder::append_fanin_or_fail semantics, which collapses STEP 1
     // (explicit_deps) + STEP A (creator retention) + STEP B (tensormap lookup)
-    // into a single per-task fanin list. Both oracle and annot use this same
-    // semantics so the divergence check is meaningful.
-    std::unordered_set<uint64_t> oracle_preds;
-    std::unordered_set<uint64_t> annot_preds;
+    // into a single per-task fanin list and OR-merges flags on duplicate
+    // discoveries (never first-wins). Both oracle and annot use this same
+    // semantics so the divergence check is meaningful — including the
+    // provenance mapping, since a producer attributed to different steps on
+    // the two passes merges to different flags.
+    std::unordered_map<uint64_t, PTO2DepFlags> oracle_flags;
+    std::unordered_map<uint64_t, PTO2DepFlags> annot_flags;
 
     // Scratch buffer for assembling full dep lists across overflow chains.
     // Declared outside the loop so it can be reused (clear() keeps capacity).
@@ -539,8 +573,8 @@ dep_gen_replay_emit_deps_json(const DepGenRecord *records, size_t num_records, c
         PTO2TaskId task_id{rec.task_id};
         bool in_manual_scope = (rec.flags & DEP_GEN_FLAG_IN_MANUAL_SCOPE) != 0;
 
-        oracle_preds.clear();
-        annot_preds.clear();
+        oracle_flags.clear();
+        annot_flags.clear();
 
         int32_t tc = static_cast<int32_t>(rec.tensor_count);
         if (tc > CORE_MAX_TENSOR_ARGS) {
@@ -676,17 +710,16 @@ dep_gen_replay_emit_deps_json(const DepGenRecord *records, size_t num_records, c
         task_table.push_back(std::move(task_entry));
 
         // ============ STEP 1 — explicit_deps (call-site emit) ============
-        // Same loop on both passes; they MUST produce identical sets here
-        // because they read the same record. Annot records explicit edges
-        // with consumer_arg_idx = -1 (not tied to any tensor arg). Reads
-        // from deps_data (base record's explicit_deps[] on fast path, the
-        // gathered base+chain buffer on overflow path).
+        // Same loop on both passes; they MUST produce identical flags here
+        // because they read the same record. Explicit edges are born
+        // PTO2_DEP_WAIT_RETAIN (pto_orchestrator.cpp STEP 1). Annot records
+        // explicit edges with consumer_arg_idx = -1 (not tied to any tensor
+        // arg). Reads from deps_data (base record's explicit_deps[] on fast
+        // path, the gathered base+chain buffer on overflow path).
         for (int32_t i = 0; i < dc; i++) {
             uint64_t pred_raw = deps_data[i];
-            if (oracle_preds.insert(pred_raw).second) {
-                // First time this pred is seen at runtime call site.
-            }
-            if (annot_preds.insert(pred_raw).second) {
+            merge_edge_flags(oracle_flags, pred_raw, PTO2_DEP_WAIT_RETAIN);
+            if (merge_edge_flags(annot_flags, pred_raw, PTO2_DEP_WAIT_RETAIN)) {
                 EdgeAnnot e{};
                 e.pred = pred_raw;
                 e.succ = rec.task_id;
@@ -697,11 +730,13 @@ dep_gen_replay_emit_deps_json(const DepGenRecord *records, size_t num_records, c
         }
 
         // ============ ORACLE pass — drive compute_task_fanin ============
-        bool ok =
-            compute_task_fanin(inputs, tm_oracle, in_manual_scope, [&](PTO2TaskId producer, PTO2DepFlags) -> bool {
-                oracle_preds.insert(producer.raw);
+        bool ok = compute_task_fanin(
+            inputs, tm_oracle, in_manual_scope,
+            [&](PTO2TaskId producer, PTO2DepFlags dep_flags) -> bool {
+                merge_edge_flags(oracle_flags, producer.raw, dep_flags);
                 return true;
-            });
+            }
+        );
         if (!ok) {
             LOG_ERROR("dep_gen replay: compute_task_fanin returned fatal at task_id=%" PRIu64, rec.task_id);
             tm_oracle.destroy();
@@ -714,8 +749,10 @@ dep_gen_replay_emit_deps_json(const DepGenRecord *records, size_t num_records, c
             inputs, tm_annot, in_manual_scope,
             // emit_creator(producer, arg_idx, consumer_tensor)
             [&](PTO2TaskId producer, int32_t arg_idx, const Tensor &consumer) {
-                if (!annot_preds.insert(producer.raw).second) {
-                    return;  // already covered by an earlier emit on this record
+                // Flags merge on every discovery (never first-wins); only the
+                // first discovery records an EdgeAnnot entry for this pred.
+                if (!merge_edge_flags(annot_flags, producer.raw, PTO2_DEP_WAIT_RETAIN)) {
+                    return;  // edge entry already recorded by an earlier emit
                 }
                 EdgeAnnot e{};
                 e.pred = producer.raw;
@@ -733,10 +770,10 @@ dep_gen_replay_emit_deps_json(const DepGenRecord *records, size_t num_records, c
                 // dedup gives us "the same producer slice fired twice for the
                 // same consumer arg" collapse — but two distinct slices from
                 // the same producer (different version), or two different
-                // producers, both yield their own edges. The producer-id-set
-                // comparison below uses annot_preds, which dedups by pred
-                // only, matching runtime PTO2FaninBuilder semantics.
-                annot_preds.insert(producer.raw);
+                // producers, both yield their own edges. The differential
+                // check uses annot_flags, which OR-merges by pred, matching
+                // runtime PTO2FaninBuilder semantics.
+                merge_edge_flags(annot_flags, producer.raw, PTO2_DEP_WAIT);
                 EdgeAnnot e{};
                 e.pred = producer.raw;
                 e.succ = rec.task_id;
@@ -751,20 +788,26 @@ dep_gen_replay_emit_deps_json(const DepGenRecord *records, size_t num_records, c
         );
 
         // ============ Differential check ============
-        if (oracle_preds != annot_preds) {
+        if (oracle_flags != annot_flags) {
             LOG_ERROR(
                 "dep_gen replay: DIVERGENCE at task_id=%" PRIu64 " (rec_idx=%zu): oracle has %zu preds, annot has %zu",
-                rec.task_id, rec_i, oracle_preds.size(), annot_preds.size()
+                rec.task_id, rec_i, oracle_flags.size(), annot_flags.size()
             );
             // Log the symmetric difference for debugging.
-            for (uint64_t p : oracle_preds) {
-                if (annot_preds.find(p) == annot_preds.end()) {
-                    LOG_ERROR("  only-in-oracle pred: %" PRIu64, p);
+            for (const auto &[pred, oflags] : oracle_flags) {
+                auto it = annot_flags.find(pred);
+                if (it == annot_flags.end()) {
+                    LOG_ERROR("  only-in-oracle pred: %" PRIu64 " (%s)", pred, dep_flags_str(oflags));
+                } else if (it->second != oflags) {
+                    LOG_ERROR(
+                        "  flags mismatch pred %" PRIu64 ": oracle=%s annot=%s", pred, dep_flags_str(oflags),
+                        dep_flags_str(it->second)
+                    );
                 }
             }
-            for (uint64_t p : annot_preds) {
-                if (oracle_preds.find(p) == oracle_preds.end()) {
-                    LOG_ERROR("  only-in-annot  pred: %" PRIu64, p);
+            for (const auto &[pred, aflags] : annot_flags) {
+                if (oracle_flags.find(pred) == oracle_flags.end()) {
+                    LOG_ERROR("  only-in-annot  pred: %" PRIu64 " (%s)", pred, dep_flags_str(aflags));
                 }
             }
             tm_oracle.destroy();
