@@ -1028,7 +1028,7 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
 #endif
 #if SIMPLER_DFX
                 if (dummy_resolve_t0 != 0) {
-                    if (dummy_slot.active_mask.has_predicate()) {
+                    if (dummy_slot.task_attrs.has_predicate()) {
                         l2_swimlane_aicpu_record_predicated_skip(
                             thread_idx, dummy_resolve_t0, sched_l2_swimlane_[thread_idx].sched_loop_count,
                             dummy_slot.task->task_id.raw
