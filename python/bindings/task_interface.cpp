@@ -1304,6 +1304,15 @@ NB_MODULE(_task_interface, m) {
             }
         )
         .def_prop_rw(
+            "enable_graph_cache",
+            [](const CallConfig &c) {
+                return static_cast<bool>(c.enable_graph_cache);
+            },
+            [](CallConfig &c, bool v) {
+                c.enable_graph_cache = v ? 1 : 0;
+            }
+        )
+        .def_prop_rw(
             "output_prefix",
             [](const CallConfig &c) -> std::string {
                 return std::string(c.output_prefix, ::strnlen(c.output_prefix, sizeof(c.output_prefix)));
@@ -1324,7 +1333,8 @@ NB_MODULE(_task_interface, m) {
             os << "CallConfig(block_dim=" << self.block_dim << ", aicpu_thread_num=" << self.aicpu_thread_num
                << ", enable_l2_swimlane=" << self.enable_l2_swimlane << ", enable_dump_args=" << self.enable_dump_args
                << ", enable_pmu=" << self.enable_pmu << ", enable_dep_gen=" << (self.enable_dep_gen ? "True" : "False")
-               << ", enable_scope_stats=" << (self.enable_scope_stats ? "True" : "False");
+               << ", enable_scope_stats=" << (self.enable_scope_stats ? "True" : "False")
+               << ", enable_graph_cache=" << (self.enable_graph_cache ? "True" : "False");
             if (self.runtime_env.any()) {
                 append_ring_values(os, "runtime_env.ring_task_window", true, self.runtime_env.ring_task_window);
                 append_ring_values(os, "runtime_env.ring_heap", true, self.runtime_env.ring_heap);

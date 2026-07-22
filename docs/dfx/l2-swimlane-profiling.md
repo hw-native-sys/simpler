@@ -45,10 +45,11 @@ available.
   `l2_swimlane_records.json` with `deps.json` from
   [`dep_gen`](dep_gen.md) at post-process time; see
   [§3.5](#35-dependency-arrows-from-dep_gen).
-- **AICPU scheduler phases** — per-iteration breakdown into six
+- **AICPU scheduler phases** — per-iteration breakdown into eight
   mutually time-exclusive **outer** phases (`complete` / `async_poll`
-  / `dispatch` / `release` / `dummy` / `early_dispatch`), one logical
-  **inner** phase (`resolve`, parent = Complete or Dummy) rendered on a
+  / `dispatch` / `release` / `dummy` / `early_dispatch` / `drain`
+  / `graph_prepare`) and three logical **inner** phases (`resolve`,
+  `drain_prepare`, and `drain_publish`) rendered on a
   sibling scheduler sub-lane with the same `Sched_N` label and adjacent tid,
   and one **separate-lane**
   phase (`dummy_task`, sampled immediately before `on_task_complete()` begins
@@ -71,6 +72,11 @@ available.
   `g_orch_*_cycle` counters — that's where you go for "which
   sub-step dominates overall"; the per-submit record covers
   "which submit was slow".
+- **Graph Execution overview** — replay-graph cache hits get one
+  end-to-end `GraphExecution(tN, M visible nodes)` envelope. The
+  converter reconstructs outer-task ownership and node indices from
+  the runtime's ring-1 synthetic ids, so this adds no record or branch
+  to the device scheduling hot path.
 - **Standard outputs** — raw `l2_swimlane_records.json`, plus a
   Perfetto-loadable `merged_swimlane_*.json` produced by
   `swimlane_converter`.
@@ -253,6 +259,7 @@ field but render differently in Perfetto:
 | `release` | outer | sched | deferred-release slots drained this iter |
 | `dummy` | outer | sched | dummies handled by `dummy_drain` this iter |
 | `early_dispatch` | outer | sched | blocks staged by speculative early-dispatch this pass |
+| `graph_prepare` | outer | sched | Graph nodes materialized by this bounded slice |
 | `resolve` | inner | sched sub-lane, same `Sched_N` label as its outer lane | consumers visited in `on_task_complete` |
 | `dummy_task` | separate-lane | Worker View AICPU_N (pid=4) | one dummy entering `on_task_complete()`; full identity is in `task_id` |
 
@@ -307,12 +314,20 @@ The output is `outputs/<case>_<ts>/merged_swimlane.json` (or your
 `-o` override). Open <https://ui.perfetto.dev/> and drag the file
 in. The trace contains:
 
+- **Graph Execution** (pid=5) — one overview envelope per cached
+  Graph invocation, from the start of Graph submission through the
+  last visible AICore completion. Hover args expose the outer ring-0
+  task, visible node count/index range, AICore/AICPU node and slice
+  counts, and the submit/execution split. This track appears only when level-4
+  orchestrator records can be joined to replay-graph ring-1 tasks.
 - **Orchestrator** (pid=1) — per-submit `orch_submit` envelope
-  blocks (level >= 4).
+  blocks (level >= 4). A matched Graph hit is labeled
+  `graph_submit(tN)` instead of `submit(tN)` and is excluded from
+  the fallback `alloc(tN)` classification.
 - **AICPU Scheduler** (pid=2) — per-iteration scheduler phase
-  blocks coloured by `phase` (level >= 3). The five outer phases
+  blocks coloured by `phase` (level >= 3). The six outer phases
   (`complete` / `dispatch` / `release` / `dummy` /
-  `early_dispatch`) appear as sibling bars on each scheduler
+  `early_dispatch` / `graph_prepare`) appear as sibling bars on each scheduler
   thread's first `Sched_N` lane; the `resolve` inner phase appears on an
   adjacent `Sched_N` sub-lane.
 - **Scheduler View** (pid=3) — task-execution overlay using AICPU
@@ -335,7 +350,19 @@ in. The trace contains:
     instead of rendering it as `alloc`.
   AIC/AIV hover args keep both `kernel-duration-us` and
   `local_setup_us`; the old standalone setup preview bar is folded
-  into the task bar.
+  into the task bar. Replay-graph node bars also expose
+  `graph_outer_task_id` and `graph_node_index`; when no `deps.json`
+  can resolve a function name, they use `graph_node[N](r1tM)` rather
+  than the generic `task(r1tM)` label.
+
+Graph node ownership uses the replay-graph runtime contract
+`ring_id = 1`, `local_id = (outer_task_id << 10) | node_index`.
+Merged multi-round captures may reuse an outer task id, so the
+converter assigns each ring-1 row to the latest temporally preceding
+same-id orchestrator submit. AICPU-only Graph nodes are recovered from
+scheduler `dummy_task` markers and included alongside the AICore
+C/V/MIX nodes. A node with neither an AICore timing row nor a scheduler
+marker cannot be included in `visible_node_count`.
 
 `merged_swimlane.json` no longer emits separate `setup` X events.
 For AIC/AIV tasks, the Worker View task bar starts at `receive_time_us`
@@ -581,7 +608,7 @@ What the swimlane shows:
   `(func_id, task_id)` group as the anchor.
 - **Scheduler-loop time decomposition.** Per-iteration AICPU
   phase records show how long the scheduler spent in each of
-  its two work phases (complete / dispatch); idle is recovered
+  its work phases (including complete, dispatch, and graph_prepare); idle is recovered
   from the gap between records.
 - **Orchestrator overhead breakdown.** Per-submit envelope
   records (`orch_submit`) pin "which submit is slow"; cumulative

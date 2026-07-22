@@ -279,6 +279,7 @@ public:
     void set_dev_orch_so(uint64_t dev_addr, uint64_t size);
     void set_active_callable_id(int32_t callable_id);
     int32_t get_active_callable_id() const;
+    void set_graph_cache_config(bool, uint64_t) {}
     void set_device_orch_func_name(const char *name);
     void set_device_orch_config_name(const char *name);
 

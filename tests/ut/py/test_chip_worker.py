@@ -27,6 +27,7 @@ class TestCallConfig:
         assert config.enable_dump_args == 0
         assert config.enable_pmu == 0
         assert config.enable_dep_gen is False
+        assert config.enable_graph_cache is False
 
     def test_setters(self):
         # enable_l2_swimlane accepts both an int perf_level (0-4) and a Python
@@ -63,15 +64,18 @@ class TestCallConfig:
         config.enable_dump_args = True
         config.enable_pmu = 2
         config.enable_dep_gen = True
+        config.enable_graph_cache = True
         assert config.enable_l2_swimlane == 4
         assert config.enable_dump_args == 1
         assert config.enable_pmu == 2
         assert config.enable_dep_gen is True
+        assert config.enable_graph_cache is True
         r = repr(config)
         assert "enable_l2_swimlane=4" in r
         assert "enable_dump_args=1" in r
         assert "enable_pmu=2" in r
         assert "enable_dep_gen=True" in r
+        assert "enable_graph_cache=True" in r
 
     def test_repr(self):
         config = CallConfig()
@@ -328,6 +332,7 @@ class TestMailboxConfigRoundtrip:
         cfg.enable_pmu = 5
         cfg.enable_dep_gen = True
         cfg.enable_scope_stats = True
+        cfg.enable_graph_cache = True
         cfg.runtime_env.ring_task_window = [16, 32, 128, 256]
         cfg.runtime_env.ring_heap = [1024, 2048, 4096, 8192]
         cfg.runtime_env.ring_dep_pool = [64, 128, 256, 512]
@@ -344,6 +349,7 @@ class TestMailboxConfigRoundtrip:
             cfg.enable_pmu,
             int(cfg.enable_dep_gen),
             int(cfg.enable_scope_stats),
+            int(cfg.enable_graph_cache),
             *cfg.runtime_env.ring_task_window,
             *cfg.runtime_env.ring_heap,
             *cfg.runtime_env.ring_dep_pool,
@@ -358,6 +364,7 @@ class TestMailboxConfigRoundtrip:
         assert decoded.enable_pmu == 5
         assert decoded.enable_dep_gen is True
         assert decoded.enable_scope_stats is True
+        assert decoded.enable_graph_cache is True
         assert decoded.runtime_env.ring_task_window == [16, 32, 128, 256]
         assert decoded.runtime_env.ring_heap == [1024, 2048, 4096, 8192]
         assert decoded.runtime_env.ring_dep_pool == [64, 128, 256, 512]

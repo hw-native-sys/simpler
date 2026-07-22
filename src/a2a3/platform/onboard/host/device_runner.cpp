@@ -193,6 +193,9 @@ int DeviceRunner::run(Runtime &runtime, const CallConfig &config) {
     // Latch this run's diagnostic enables onto the runner before the collector
     // paths below read them; block_dim/aicpu_thread_num are consumed locally.
     apply_call_config(config);
+    runtime.set_graph_cache_config(
+        config.enable_graph_cache != 0, callable_hash(runtime.get_active_callable_id())
+    );
     int block_dim = config.block_dim;
     const int launch_aicpu_num = config.aicpu_thread_num;
     // A prior AICore launch/sync error poisoned the device context and the

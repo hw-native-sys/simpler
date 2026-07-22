@@ -51,6 +51,7 @@ from .remote_l3_protocol import (
     FrameType,
     HelloPayload,
     ImportBufferResult,
+    PROTOCOL_VERSION,
     ReadyState,
     RemoteAddressSpace,
     RemoteRegistryTarget,
@@ -534,7 +535,7 @@ def _run_command_loop(  # noqa: PLR0912, PLR0915
     hello = HelloPayload(
         session_id=session_id,
         worker_id=worker_id,
-        protocol_version=1,
+        protocol_version=PROTOCOL_VERSION,
         comm_profile=str(manifest["transport"]),
         feature_flags=0,
         ready_state=ReadyState.READY,

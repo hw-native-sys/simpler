@@ -14,6 +14,7 @@ from simpler_setup.tools.sched_overhead_analysis import (
     compute_critical_path,
     compute_head_tail,
     compute_overhead,
+    parse_scheduler_from_json_phases,
     per_id_timing,
     print_distribution,
 )
@@ -144,3 +145,26 @@ def test_print_distribution(capsys):
 
     print_distribution("Head OH", [])
     assert "(no tasks)" in capsys.readouterr().out
+
+
+def test_graph_prepare_is_work_not_reconstructed_idle():
+    data = {
+        "aicpu_scheduler_phases": [
+            [
+                {"phase": "complete", "start_time_us": 0.0, "end_time_us": 1.0, "loop_iter": 1},
+                {
+                    "phase": "graph_prepare",
+                    "start_time_us": 1.0,
+                    "end_time_us": 3.0,
+                    "tasks_processed": 4,
+                    "loop_iter": 1,
+                },
+                {"phase": "dispatch", "start_time_us": 3.0, "end_time_us": 4.0, "loop_iter": 2},
+            ]
+        ]
+    }
+
+    thread = parse_scheduler_from_json_phases(data)[0]
+    assert thread["graph_prepare_us"] == 2.0
+    assert thread["idle_us"] == 0.0
+    assert thread["total_us"] == 4.0

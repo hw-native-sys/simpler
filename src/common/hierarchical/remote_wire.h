@@ -22,7 +22,7 @@
 
 namespace remote_l3 {
 
-static constexpr uint32_t PROTOCOL_VERSION = 1;
+static constexpr uint32_t PROTOCOL_VERSION = 2;
 static constexpr uint32_t MAX_FRAME_PAYLOAD_BYTES = 16U * 1024U * 1024U;
 static constexpr uint32_t MAX_STRING_BYTES = 1024U;
 static constexpr uint32_t MAX_ERROR_BYTES = 4096U;

@@ -208,6 +208,9 @@ int DeviceRunner::invoke_device_register(const RegisterCallableArgs &reg_args) {
 
 int DeviceRunner::run(Runtime &runtime, const CallConfig &config) {
     apply_call_config(config);
+    runtime.set_graph_cache_config(
+        config.enable_graph_cache != 0, callable_hash(runtime.get_active_callable_id())
+    );
     int block_dim = config.block_dim;
     const int launch_aicpu_num = config.aicpu_thread_num;
     clear_cpu_sim_shared_storage();

@@ -466,6 +466,11 @@ int SimDeviceRunnerBase::unregister_callable(int32_t callable_id) {
 
 bool SimDeviceRunnerBase::has_callable(int32_t callable_id) const { return callables_.count(callable_id) != 0; }
 
+uint64_t SimDeviceRunnerBase::callable_hash(int32_t callable_id) const {
+    auto it = callables_.find(callable_id);
+    return it == callables_.end() ? 0 : it->second.hash;
+}
+
 // Per-run binding half, defined in each runtime's runtime_maker.cpp and linked
 // into this same sim runtime .so. Declared here (rather than only in
 // c_api_shared.cpp) so bind_callable_to_runtime can call it directly, keeping

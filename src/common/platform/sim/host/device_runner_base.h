@@ -120,6 +120,7 @@ public:
     );
     int unregister_callable(int32_t callable_id);
     bool has_callable(int32_t callable_id) const;
+    uint64_t callable_hash(int32_t callable_id) const;
     // One-step bind: replay CallableState (kernel addrs + active_callable_id)
     // then run the per-run bind_callable_to_runtime_impl with the state's
     // host_orch_func_ptr + signature. `api` is g_host_api; `orch_args` is a

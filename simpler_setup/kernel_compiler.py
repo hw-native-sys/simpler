@@ -406,7 +406,7 @@ class KernelCompiler:
 
         Args:
             runtime_name: Name of the runtime (e.g., "host_build_graph",
-                         "tensormap_and_ringbuffer")
+                         "tensormap_and_ringbuffer", "replay_graph")
             source_path: Path to orchestration source file (.cpp)
             extra_include_dirs: Additional include directories (merged with
                                the runtime/platform include dirs)
@@ -431,11 +431,11 @@ class KernelCompiler:
 
         # host_build_graph dlopens the orchestration .so on the host, so it
         # compiles with the host g++ (x86_64) regardless of platform.
-        # tensormap_and_ringbuffer dlopens it on the aarch64 AICPU onboard, so
-        # it cross-compiles there and uses the host g++ only for sim.
+        # Device-orchestration runtimes dlopen it on the aarch64 AICPU onboard,
+        # so they cross-compile there and use the host g++ only for sim.
         if runtime_name == "host_build_graph":
             toolchain_type = ToolchainType.HOST_GXX
-        elif runtime_name == "tensormap_and_ringbuffer":
+        elif runtime_name in ("tensormap_and_ringbuffer", "replay_graph"):
             toolchain_type = self._get_toolchain(
                 {
                     "a2a3": ToolchainType.AARCH64_GXX,

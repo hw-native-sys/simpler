@@ -29,12 +29,13 @@ PTO ISA headers are automatically cloned on first run. See [Getting Started](doc
 
 ## Runtime Variants
 
-Two runtimes under `src/{arch}/runtime/`, each with a different graph-building strategy:
+Runtime implementations live under `src/{arch}/runtime/`; `replay_graph` is currently available on a2a3 only:
 
 | Runtime | Graph built on | Use case |
 | ------- | -------------- | -------- |
 | `host_build_graph` | Host CPU | Development, debugging |
 | `tensormap_and_ringbuffer` | AICPU (device) | Production workloads |
+| `replay_graph` | AICPU (device, frozen graph) | Single-shot replay workloads |
 
 See runtime docs per arch: [a2a3](src/a2a3/docs/runtimes.md), [a5](src/a5/docs/runtimes.md).
 

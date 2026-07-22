@@ -280,6 +280,7 @@ public:
     // register time (RegisterCallableArgs), not through Runtime.
     void set_active_callable_id(int32_t callable_id);
     int32_t get_active_callable_id() const;
+    void set_graph_cache_config(bool, uint64_t) {}
 
     uint64_t get_function_bin_addr(int func_id) const;
     /**

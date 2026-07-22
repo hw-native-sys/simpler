@@ -1,20 +1,20 @@
 # Runtime Variants (a2a3)
 
-Two runtime implementations live under `src/a2a3/runtime/`, each providing a different graph-building strategy. The `RUNTIME_CONFIG.runtime` field in `kernel_config.py` selects which runtime to use.
+Three runtime implementations live under `src/a2a3/runtime/`, each providing a different graph-building strategy. The `RUNTIME_CONFIG.runtime` field in `kernel_config.py` selects which runtime to use.
 
 ## Comparison
 
-| Feature | host_build_graph | tensormap_and_ringbuffer |
-| ------- | ---------------- | ------------------------ |
-| Graph built on | Host CPU | AICPU (device) |
-| Task storage | Fixed `Task[]` array | Ring buffer (`PTO2TaskDescriptor[]`) |
-| Dependencies | Explicit edges | Auto-derived via TensorMap |
-| Memory management | Host-side | Ring buffer heap (GM) |
-| Concurrent build+schedule | No | Yes (always) |
-| Profiling support | Basic | Multi-level hierarchy |
-| Batch/streaming | No | Yes (flow control, back-pressure) |
-| Thread model | N scheduler threads | 1 orchestrator + 3 schedulers |
-| Use case | Development, debugging | Production workloads |
+| Feature | host_build_graph | tensormap_and_ringbuffer | replay_graph |
+| ------- | ---------------- | ------------------------ | ------------ |
+| Graph built on | Host CPU | AICPU (device) | AICPU (device) |
+| Task storage | Fixed `Task[]` array | Ring buffer (`PTO2TaskDescriptor[]`) | Ping-pong task-window arenas + Graph Execution storage |
+| Dependencies | Explicit edges | Auto-derived via TensorMap | Explicit + TensorMap, wired in submit |
+| Memory management | Host-side | Ring buffer heap (GM) | Monotonic task/heap/dep pools |
+| Concurrent build+schedule | No | Yes (always) | Yes, across explicit graph boundaries |
+| Profiling support | Basic | Multi-level hierarchy | Multi-level hierarchy |
+| Batch/streaming | No | Yes (flow control, back-pressure) | Arena-sized batches; repeated sub-DAGs collapse to one outer task |
+| Thread model | N scheduler threads | 1 orchestrator + 3 schedulers | 1 orchestrator + scheduler threads |
+| Use case | Development, debugging | Production workloads | Graph-boundary pipelining and Graph Execution |
 
 ## host_build_graph
 
@@ -48,11 +48,28 @@ See [tensormap_and_ringbuffer/docs/](../runtime/tensormap_and_ringbuffer/docs/):
 - [l2-swimlane-profiling.md](../../../docs/dfx/l2-swimlane-profiling.md) — L2 swimlane and scheduler-phase profiling
 - [args-dump.md](../../../docs/dfx/args-dump.md) — Per-task argument capture
 
+## replay_graph
+
+The replay runtime builds arena-sized graph batches on AICPU and pipelines their construction with scheduler dispatch. It uses one logical task stream, two task/output arenas, monotonic dependency allocation, and immutable fanout edges built directly by `submit_task`.
+
+- Task lifecycle: `PENDING -> COMPLETED`; no `CONSUMED` or in-replay reclaim
+- Capacity contract: one arena graph fits half the task window and heap; dependency and TensorMap pools cover the invocation
+- Synchronization: `rt_graph_boundary()` publishes an arena graph and allows orchestration to build the next one concurrently
+- Graph Execution: `rt_submit_graph()` captures a repeated C/V/MIX/Dummy sub-DAG as a Graph Definition, then represents each later execution with one outer Task Window task
+- Scheduler expansion: a ready outer `GRAPH` task expands to scheduler-owned nodes and preserves their internal dependencies
+- Failure mode: task-window/heap capacity exhaustion is a fatal sizing error rather than back-pressure
+
+See the
+[Graph Execution API Guide](../runtime/replay_graph/docs/GRAPH_EXECUTION_API.md)
+for orchestration usage and
+[Runtime Logic](../runtime/replay_graph/docs/RUNTIME_LOGIC.md) for the full
+design.
+
 ## Shared Components
 
-Ring buffer and submit type definitions are duplicated per-runtime (not in a shared `common/` directory):
+Runtime-specific allocator and submit type definitions are kept per-runtime (not in a shared `common/` directory):
 
-- `{runtime}/runtime/pto_ring_buffer.cpp` — Ring buffer data structures (HeapRing, TaskRing, DepListPool)
+- `{runtime}/runtime/pto_ring_buffer.{h,cpp}` — ring allocators for TMR; monotonic allocators for replay_graph
 - `{runtime}/runtime/pto_runtime2_types.h` — Task descriptor types, resource shapes
 
 Cross-architecture shared files are in `src/common/task_interface/`:

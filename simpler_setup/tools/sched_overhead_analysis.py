@@ -181,22 +181,30 @@ def parse_scheduler_from_json_phases(data):
         if not records:
             continue
 
-        # Only "complete" and "dispatch" emit records on a2a3 post-#869.
-        # Legacy a2a3 captures (or current a5 captures, which still emit
-        # SCHED_IDLE_WAIT) may carry "idle" / "scan" records; both are
-        # dropped because idle is reconstructed from gaps between work
-        # records on the same thread — for the a5/legacy case the gap
-        # exactly equals the dropped idle records' total span, so the
-        # numeric idle_us is preserved (only the per-iter granularity is
-        # lost, which Part 2 doesn't surface).
+        # Keep every mutually-exclusive outer work phase. Inner phases such
+        # as resolve/drain_prepare overlap their parent and separate-lane
+        # dummy_task markers are not scheduler occupancy, so exclude those.
+        # Legacy explicit idle/scan records are also excluded because idle is
+        # reconstructed from gaps between outer work records.
+        outer_phases = (
+            "complete",
+            "async_poll",
+            "dispatch",
+            "release",
+            "dummy",
+            "early_dispatch",
+            "drain",
+            "graph_prepare",
+        )
         work_recs = sorted(
-            (r for r in records if r.get("phase") in ("complete", "async_poll", "dispatch")),
+            (r for r in records if r.get("phase") in outer_phases),
             key=lambda r: r.get("start_time_us", 0),
         )
         if not work_recs:
             continue
 
-        phase_us = {"complete": 0.0, "async_poll": 0.0, "dispatch": 0.0, "idle": 0.0}
+        phase_us = {phase: 0.0 for phase in outer_phases}
+        phase_us["idle"] = 0.0
         total_tasks = 0
         max_loop_iter = 0
         pop_hit = 0
@@ -841,11 +849,26 @@ def run_analysis(  # noqa: PLR0912, PLR0915
     # Phase breakdown. Idle is reconstructed from gaps between work
     # records on the same thread (no explicit idle record is emitted by
     # the device anymore).
-    phases = ["complete", "async_poll", "dispatch", "idle"]
+    phases = [
+        "complete",
+        "async_poll",
+        "dispatch",
+        "release",
+        "dummy",
+        "early_dispatch",
+        "drain",
+        "graph_prepare",
+        "idle",
+    ]
     phase_labels = {
         "complete": "Complete (poll handshake, resolve deps)",
         "async_poll": "AsyncPoll (async-wait completion: SDMA/RoCE/URMA/CCU)",
         "dispatch": "Dispatch (pop queue, build payload, flush)",
+        "release": "Release (drain deferred task releases)",
+        "dummy": "Dummy (complete dependency-only tasks)",
+        "early_dispatch": "Early dispatch (speculative staging)",
+        "drain": "Drain (sync-start stop-the-world handling)",
+        "graph_prepare": "Graph prepare (bounded node materialization)",
         "idle": "Idle (spinning, no progress — reconstructed from gaps)",
     }
 
@@ -917,7 +940,7 @@ def run_analysis(  # noqa: PLR0912, PLR0915
     print()
 
     # Data-driven insight: find the dominant phase (excluding idle which is not useful work)
-    work_phases = {p: phase_totals.get(p, 0) for p in ["complete", "async_poll", "dispatch"]}
+    work_phases = {p: phase_totals.get(p, 0) for p in phases if p != "idle"}
     dominant_phase = max(work_phases, key=lambda p: work_phases[p])
     dominant_pct = work_phases[dominant_phase] / total_us * 100 if total_us > 0 else 0
     key_phase_label = phase_labels[dominant_phase].split(" (")[0]

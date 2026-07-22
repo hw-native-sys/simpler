@@ -119,6 +119,147 @@ def format_task_display(task_id):
     return f"r{ring}t{local}"
 
 
+def _decode_graph_node_task_id(task_id):
+    """Return ``(outer_task_id, node_index)`` for replay-graph node ids.
+
+    Graph Execution keeps the one stream-visible outer task on ring 0 and
+    gives scheduler-owned nodes a diagnostic-only ring-1 identity:
+
+        local_id = (outer_task_id << 10) | node_index
+
+    Ring 1 is reserved for this purpose by the replay-graph runtime.  The
+    converter still requires a temporally matching outer ``orch_submit``
+    record before it classifies a row as a Graph node, so an unrelated trace
+    that happens to contain ring-1 ids is not relabelled on id shape alone.
+    """
+    tid = normalize_pto2_task_id_int(task_id)
+    if tid is None or ((tid >> 32) & 0xFFFFFFFF) != 1:
+        return None
+    local = tid & 0xFFFFFFFF
+    return local >> 10, local & 0x3FF
+
+
+def _collect_graph_execution_instances(tasks, orchestrator_phases, scheduler_phases=None):  # noqa: PLR0912
+    """Join Graph-node timing rows to the outer Graph submit records.
+
+    Merged multi-round captures can reuse a ring-0 task id.  Assigning every
+    ring-1 row to the latest same-id orchestrator record at or before its
+    dispatch time keeps those instances separate and avoids mistaking an
+    earlier normal submit with the same local id for a Graph submission.
+    """
+    if not orchestrator_phases:
+        return []
+
+    candidates_by_outer = defaultdict(list)
+    for orch_idx, records in enumerate(orchestrator_phases):
+        for record_idx, record in enumerate(records):
+            if record.get("phase") != "orch_submit":
+                continue
+            outer_task_id = normalize_pto2_task_id_int(record.get("task_id"))
+            if outer_task_id is None or (outer_task_id >> 32) != 0:
+                continue
+            candidates_by_outer[outer_task_id].append(
+                {
+                    "record_key": (orch_idx, record_idx),
+                    "orch_idx": orch_idx,
+                    "record": record,
+                    "rows": [],
+                    "aicpu_rows": [],
+                }
+            )
+
+    for candidates in candidates_by_outer.values():
+        candidates.sort(key=lambda candidate: candidate["record"]["start_time_us"])
+
+    for task in tasks:
+        identity = _decode_graph_node_task_id(task.get("task_id"))
+        if identity is None:
+            continue
+        outer_task_id, node_index = identity
+        candidates = candidates_by_outer.get(outer_task_id)
+        if not candidates:
+            continue
+        dispatch_us = task.get("dispatch_time_us", -1)
+        reference_us = dispatch_us if dispatch_us >= 0 else _task_slice_start_us(task)
+        candidate_starts = [candidate["record"]["start_time_us"] for candidate in candidates]
+        candidate_idx = bisect.bisect_right(candidate_starts, reference_us) - 1
+        if candidate_idx >= 0:
+            candidates[candidate_idx]["rows"].append((task, node_index))
+
+    # Graph alloc/dummy nodes have no AICore timing row.  The scheduler's
+    # dummy_task marker carries the full synthetic task id, so fold those nodes
+    # into the same instance instead of under-counting Graphs made from mixed
+    # C/V/MIX/Dummy work.
+    for thread_idx, records in enumerate(scheduler_phases or []):
+        for record in records:
+            if record.get("phase") != "dummy_task":
+                continue
+            synthetic_task_id = normalize_pto2_task_id_int(record.get("task_id"))
+            if synthetic_task_id is None or ((synthetic_task_id >> 32) & 0xFFFFFFFF) != 1:
+                continue
+            synthetic_local = synthetic_task_id & 0xFFFFFFFF
+            outer_task_id = synthetic_local >> 10
+            node_index = synthetic_local & 0x3FF
+            # Require an AICore-confirmed Graph candidate so a malformed or
+            # unrelated ring-1 DummyTask cannot create a Graph instance by
+            # itself.
+            candidates = [candidate for candidate in candidates_by_outer.get(outer_task_id, []) if candidate["rows"]]
+            if not candidates:
+                continue
+            reference_us = record["start_time_us"]
+            candidate_starts = [candidate["record"]["start_time_us"] for candidate in candidates]
+            candidate_idx = bisect.bisect_right(candidate_starts, reference_us) - 1
+            if candidate_idx >= 0:
+                candidates[candidate_idx]["aicpu_rows"].append((record, node_index, thread_idx))
+
+    instances = []
+    for outer_task_id, candidates in candidates_by_outer.items():
+        for candidate in candidates:
+            if not candidate["rows"] and not candidate["aicpu_rows"]:
+                continue
+            rows = candidate["rows"]
+            aicpu_rows = candidate["aicpu_rows"]
+            aicore_node_indices = {node_index for _, node_index in rows}
+            aicpu_node_indices = {node_index for _, node_index, _ in aicpu_rows}
+            visible_node_indices = sorted(aicore_node_indices | aicpu_node_indices)
+            node_start_times = [
+                task.get("dispatch_time_us", _task_slice_start_us(task))
+                if task.get("dispatch_time_us", -1) >= 0
+                else _task_slice_start_us(task)
+                for task, _ in rows
+            ]
+            node_start_times.extend(record["start_time_us"] for record, _, _ in aicpu_rows)
+            node_end_times = [
+                task.get("finish_time_us", 0) if task.get("finish_time_us", 0) > 0 else task["end_time_us"]
+                for task, _ in rows
+            ]
+            node_end_times.extend(record["end_time_us"] for record, _, _ in aicpu_rows)
+            instances.append(
+                {
+                    **candidate,
+                    "outer_task_id": outer_task_id,
+                    "aicore_node_count": len(aicore_node_indices),
+                    "aicpu_node_count": len(aicpu_node_indices),
+                    "visible_node_indices": visible_node_indices,
+                    "execution_start_us": min(node_start_times),
+                    "execution_end_us": max(node_end_times),
+                }
+            )
+
+    instances.sort(key=lambda instance: instance["record"]["start_time_us"])
+    lane_finish_us = []
+    for instance_idx, instance in enumerate(instances):
+        start_us = instance["record"]["start_time_us"]
+        lane_idx = next((idx for idx, finish_us in enumerate(lane_finish_us) if finish_us <= start_us), -1)
+        if lane_idx < 0:
+            lane_idx = len(lane_finish_us)
+            lane_finish_us.append(0.0)
+        lane_finish_us[lane_idx] = instance["execution_end_us"]
+        instance["instance_idx"] = instance_idx
+        instance["lane_idx"] = lane_idx
+    return instances
+
+
 def read_perf_data(filepath):  # noqa: PLR0912, PLR0915
     """Read performance data from a swimlane JSON file.
 
@@ -1103,6 +1244,7 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
         core_to_thread: Optional list mapping core_id (index) to scheduler thread index (-1 = unassigned)
 
     Generates processes in the trace:
+        - pid=5 "Graph Execution": one end-to-end envelope per cached Graph invocation
         - pid=1 "AICPU Orchestrator": orchestrator phase bars (l2_swimlane_level >= 4)
         - pid=2 "AICPU Scheduler": scheduler phase bars (l2_swimlane_level >= 3)
         - pid=3 "Scheduler View": dispatch_time_us to finish_time_us (AICPU perspective)
@@ -1140,12 +1282,34 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
                 if resolved >= 0:
                     task["func_id"] = resolved
 
+    # A Graph hit has one ring-0 outer task with an orchestrator record and
+    # scheduler-owned ring-1 node ids.  Recover that relation offline from the
+    # runtime's synthetic-id contract; no device hot-path record is added.
+    graph_instances = _collect_graph_execution_instances(tasks, orchestrator_phases, scheduler_phases)
+    graph_record_keys = {instance["record_key"] for instance in graph_instances}
+    graph_task_metadata = {}
+    graph_dummy_metadata = {}
+    for instance in graph_instances:
+        for task, node_index in instance["rows"]:
+            graph_task_metadata[id(task)] = {
+                "graph_instance": instance["instance_idx"],
+                "graph_outer_task_id": instance["outer_task_id"],
+                "graph_node_index": node_index,
+            }
+        for record, node_index, _ in instance["aicpu_rows"]:
+            graph_dummy_metadata[id(record)] = {
+                "graph_instance": instance["instance_idx"],
+                "graph_outer_task_id": instance["outer_task_id"],
+                "graph_node_index": node_index,
+            }
+
     # Step 2: Generate JSON events
     events = []
 
     # Metadata event: Process names and sort order.
     # pid is renumbered in pipeline order (top → bottom in Perfetto):
-    #   pid=1  AICPU Orchestrator  (submits tasks — earliest)
+    #   pid=5  Graph Execution     (end-to-end cached-Graph overview)
+    #   pid=1  AICPU Orchestrator  (submits tasks — earliest pipeline stage)
     #   pid=2  AICPU Scheduler     (pops ready, dispatches, completes)
     #   pid=3  Scheduler View      (AICPU-eye view of each worker's dispatch→finish)
     #   pid=4  Worker View         (physical AIC/AIV execution rows)
@@ -1154,6 +1318,59 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
     for t in tasks:
         task_map[t["task_id"]].append(t)
     spmd_task_ids = _identify_spmd_task_ids(task_map, deps_block_map)
+
+    if graph_instances:
+        events.append(
+            {"args": {"name": "Graph Execution"}, "cat": "__metadata", "name": "process_name", "ph": "M", "pid": 5}
+        )
+        events.append(
+            {"args": {"sort_index": 0}, "cat": "__metadata", "name": "process_sort_index", "ph": "M", "pid": 5}
+        )
+        graph_lane_indices = sorted({instance["lane_idx"] for instance in graph_instances})
+        for lane_idx in graph_lane_indices:
+            events.append(
+                {
+                    "args": {"name": f"Graph_{lane_idx}"},
+                    "cat": "__metadata",
+                    "name": "thread_name",
+                    "ph": "M",
+                    "pid": 5,
+                    "tid": 5000 + lane_idx,
+                }
+            )
+        for instance in graph_instances:
+            record = instance["record"]
+            start_us = record["start_time_us"]
+            end_us = instance["execution_end_us"]
+            outer_display = format_task_display(instance["outer_task_id"])
+            visible_node_count = len(instance["visible_node_indices"])
+            events.append(
+                {
+                    "args": {
+                        "outer_task_id": instance["outer_task_id"],
+                        "outer_task": outer_display,
+                        "visible_node_count": visible_node_count,
+                        "visible_node_index_min": min(instance["visible_node_indices"]),
+                        "visible_node_index_max": max(instance["visible_node_indices"]),
+                        "aicore_node_count": instance["aicore_node_count"],
+                        "aicpu_node_count": instance["aicpu_node_count"],
+                        "aicore_slice_count": len(instance["rows"]),
+                        "aicpu_slice_count": len(instance["aicpu_rows"]),
+                        "submit_duration_us": record["end_time_us"] - start_us,
+                        "execution_start_us": instance["execution_start_us"],
+                        "execution_duration_us": end_us - instance["execution_start_us"],
+                        "synthetic_id_layout": "ring1:(outer_task_id << 10) | node_index",
+                    },
+                    "cat": "graph_execution",
+                    "cname": "rail_animation",
+                    "name": f"GraphExecution({outer_display}, {visible_node_count} visible nodes)",
+                    "ph": "X",
+                    "pid": 5,
+                    "tid": 5000 + instance["lane_idx"],
+                    "ts": start_us,
+                    "dur": end_us - start_us,
+                }
+            )
 
     events.append({"args": {"name": "Worker View"}, "cat": "__metadata", "name": "process_name", "ph": "M", "pid": 4})
     events.append({"args": {"sort_index": 4}, "cat": "__metadata", "name": "process_sort_index", "ph": "M", "pid": 4})
@@ -1245,6 +1462,9 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
         func_id = task["func_id"]
         tdisp = format_task_display(task["task_id"])
         task_name = _task_display_name(func_id, func_id_to_name, tdisp, spmd=task["task_id"] in spmd_task_ids)
+        graph_metadata = graph_task_metadata.get(id(task))
+        if graph_metadata is not None and int(func_id) < 0:
+            task_name = f"graph_node[{graph_metadata['graph_node_index']}]({tdisp})"
 
         # fanout (consumers) / fanin (producers) hints from deps.json — the device
         # hot path no longer carries them. Each leads with the degree (count) so
@@ -1254,17 +1474,20 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
         fanout_str = f"{len(fanout_ids)}: [" + ", ".join(format_task_display(x) for x in fanout_ids) + "]"
         fanin_str = f"{len(fanin_ids)}: [" + ", ".join(format_task_display(x) for x in fanin_ids) + "]"
 
+        task_args = {
+            "event-hint": f"Task:{tdisp}, FuncId:{func_id}, CoreId:{task['core_id']}",
+            "fanout-hint": fanout_str,
+            "fanin-hint": fanin_str,
+            "duration-us": dur,
+            "kernel-duration-us": task["duration_us"],
+            "local_setup_us": local_setup_us,
+            "taskId": task["task_id"],
+        }
+        if graph_metadata is not None:
+            task_args.update(graph_metadata)
         events.append(
             {
-                "args": {
-                    "event-hint": f"Task:{tdisp}, FuncId:{func_id}, CoreId:{task['core_id']}",
-                    "fanout-hint": fanout_str,
-                    "fanin-hint": fanin_str,
-                    "duration-us": dur,
-                    "kernel-duration-us": task["duration_us"],
-                    "local_setup_us": local_setup_us,
-                    "taskId": task["task_id"],
-                },
+                "args": task_args,
                 "cat": "event",
                 "id": event_id,
                 "name": task_name,
@@ -1362,16 +1585,22 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
             func_id = task["func_id"]
             tdisp = format_task_display(task["task_id"])
             task_name = _task_display_name(func_id, func_id_to_name, tdisp, spmd=task["task_id"] in spmd_task_ids)
+            graph_metadata = graph_task_metadata.get(id(task))
+            if graph_metadata is not None and int(func_id) < 0:
+                task_name = f"graph_node[{graph_metadata['graph_node_index']}]({tdisp})"
 
+            task_args = {
+                "event-hint": f"Task:{tdisp}, FuncId:{func_id}, CoreId:{task['core_id']}",
+                "dispatch-time-us": dispatch_us,
+                "finish-time-us": finish_us,
+                "aicpu-duration-us": aicpu_dur,
+                "taskId": task["task_id"],
+            }
+            if graph_metadata is not None:
+                task_args.update(graph_metadata)
             events.append(
                 {
-                    "args": {
-                        "event-hint": f"Task:{tdisp}, FuncId:{func_id}, CoreId:{task['core_id']}",
-                        "dispatch-time-us": dispatch_us,
-                        "finish-time-us": finish_us,
-                        "aicpu-duration-us": aicpu_dur,
-                        "taskId": task["task_id"],
-                    },
+                    "args": task_args,
                     "cat": "event",
                     "id": event_id,
                     "name": task_name,
@@ -1405,7 +1634,7 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
         )
 
         # Phase color mapping. The Perfetto sched lane only renders the
-        # two work phases (complete, dispatch). Idle is the wall-clock gap
+        # scheduler work phases. Idle is the wall-clock gap
         # between consecutive work bars — Perfetto's empty-track regions
         # already convey that visually, so we don't paint a synthetic bar
         # for it. (Idle is still tallied numerically by
@@ -1418,6 +1647,7 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
             "release": "olive",  # deferred-release drain (on_task_release work)
             "dummy": "grey",  # dummy_drain pass (Resolve nests inside)
             "early_dispatch": "rail_animation",  # speculative early-dispatch staging
+            "graph_prepare": "thread_state_uninterruptible",  # bounded Graph materialization slice
             # sync_start stop-the-world drain: outer bar time-contains the two
             # inner staging passes, so Perfetto nests them by depth on the track.
             "drain": "cq_build_running",  # handle_drain_mode outer
@@ -1512,7 +1742,7 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
                     }
                 )
 
-            # Render work phases (complete / dispatch) plus the real operations
+            # Render scheduler work phases plus the real operations
             # that otherwise hide inside an idle stretch (poll = completion-scan
             # that retired nothing; release = on_task_release drain). Genuine
             # spin emits no record and shows as a blank gap.
@@ -1529,18 +1759,28 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
                     dur = max(end_us - start_us, DUMMY_BAR_MIN_DUR_US)
                     task_id = normalize_pto2_task_id_int(record.get("task_id"))
                     task_label = format_task_display(task_id) if task_id is not None else "unknown"
+                    graph_metadata = graph_dummy_metadata.get(id(record))
+                    if graph_metadata is not None:
+                        event_name = f"graph_node[{graph_metadata['graph_node_index']}]({task_label})"
+                        event_hint = f"Graph dummy node:{task_label}"
+                    else:
+                        event_name = f"dummy({task_label})"
+                        event_hint = event_name
+                    event_args = {
+                        "phase": "dummy_task",
+                        "loop_iter": record.get("loop_iter", 0),
+                        "task_id": task_id,
+                        "event-hint": event_hint,
+                    }
+                    if graph_metadata is not None:
+                        event_args.update(graph_metadata)
                     events.append(
                         {
-                            "args": {
-                                "phase": "dummy_task",
-                                "loop_iter": record.get("loop_iter", 0),
-                                "task_id": task_id,
-                                "event-hint": f"dummy({task_label})",
-                            },
+                            "args": event_args,
                             "cat": "event",
                             "cname": "grey",
                             "id": event_id,
-                            "name": f"dummy({task_label})",
+                            "name": event_name,
                             "ph": "X",
                             "pid": 4,
                             "tid": AICPU_TID_BASE + thread_idx,
@@ -1572,6 +1812,7 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
                     "drain",
                     "drain_prepare",
                     "drain_publish",
+                    "graph_prepare",
                 ):
                     continue
                 start_us = record["start_time_us"]
@@ -1746,16 +1987,20 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
         for orch_idx, thread_records in enumerate(orchestrator_phases):
             tid = 4000 + orch_idx
             orch_worker_thread_idx = orchestrator_thread_base + orch_idx
-            for record in thread_records:
+            for record_idx, record in enumerate(thread_records):
                 phase = record.get("phase", "unknown")
                 start_us = record["start_time_us"]
                 end_us = record["end_time_us"]
                 dur = end_us - start_us
                 submit_idx = record.get("submit_idx", 0)
                 task_id = record.get("task_id", -1)
+                is_graph_submit = (orch_idx, record_idx) in graph_record_keys
 
                 # Strip "orch_" prefix for display name
-                display_name = phase.replace("orch_", "") if phase.startswith("orch_") else phase
+                if is_graph_submit:
+                    display_name = "graph_submit"
+                else:
+                    display_name = phase.replace("orch_", "") if phase.startswith("orch_") else phase
 
                 # Full PTO2TaskId in JSON (device uses task_id.raw, same as TensorMap) → rXtY / tY
                 if task_id >= 0:
@@ -1763,8 +2008,11 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
                 else:
                     label = f"{display_name}({submit_idx})"
 
+                event_args = {"phase": phase, "submit_idx": submit_idx, "task_id": task_id}
+                if is_graph_submit:
+                    event_args["graph_execution"] = True
                 event = {
-                    "args": {"phase": phase, "submit_idx": submit_idx, "task_id": task_id},
+                    "args": event_args,
                     "cat": "orchestrator",
                     "cname": orch_phase_colors.get(phase, "generic_work"),
                     "name": label,
@@ -1793,7 +2041,7 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
                     else:
                         is_regular = task_id in regular_task_ids
                         is_dummy = task_id in dummy_task_ids
-                    if not is_regular and not is_dummy:
+                    if not is_graph_submit and not is_regular and not is_dummy:
                         events.append(
                             {
                                 "args": {

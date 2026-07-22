@@ -385,6 +385,31 @@ def _aicpu_tid(core_id):
     return 10000 + core_id * 10
 
 
+def test_graph_prepare_phase_renders_on_scheduler_lane(tmp_path):
+    out = tmp_path / "trace.json"
+    sc.generate_chrome_trace_json(
+        [],
+        str(out),
+        scheduler_phases=[
+            [
+                {
+                    "phase": "graph_prepare",
+                    "start_time_us": 1.0,
+                    "end_time_us": 2.5,
+                    "tasks_processed": 4,
+                    "loop_iter": 7,
+                }
+            ]
+        ],
+    )
+
+    events = json.loads(out.read_text())["traceEvents"]
+    phase = next(e for e in events if e.get("cat") == "scheduler" and e.get("name") == "graph_prepare(4)")
+    assert phase["ts"] == 1.0
+    assert phase["dur"] == 1.5
+    assert phase["args"]["tasks_processed"] == 4
+
+
 def test_complete_flow_uses_independent_view_anchors(tmp_path):
     task_id = 100
     tasks = [
@@ -498,3 +523,123 @@ def test_deps_dummy_without_runtime_record_is_not_rendered_as_alloc(tmp_path, ca
         events = json.load(f)["traceEvents"]
     assert not any(event.get("name") == "alloc(r1t1)" for event in events)
     assert "dummy(r1t1) has no dummy_task scheduler record" in capsys.readouterr().err
+
+
+def test_graph_execution_gets_overview_lane_and_node_identity(tmp_path):
+    outer_task_id = 7
+    node_2 = (1 << 32) | (outer_task_id << 10) | 2
+    node_3 = (1 << 32) | (outer_task_id << 10) | 3
+    tasks = [
+        _task_row(node_2, 0, func_id=-1, dispatch=12.0, start=13.0, end=20.0, receive=12.5),
+        _task_row(node_3, 1, func_id=-1, dispatch=21.0, start=22.0, end=30.0, receive=21.5),
+    ]
+    orchestrator_phases = [
+        [
+            # Same ring-0 id from an earlier, unrelated submit. Temporal
+            # matching must leave this one as a normal submit.
+            {
+                "phase": "orch_submit",
+                "submit_idx": 0,
+                "task_id": outer_task_id,
+                "start_time_us": 1.0,
+                "end_time_us": 2.0,
+            },
+            {
+                "phase": "orch_submit",
+                "submit_idx": 1,
+                "task_id": outer_task_id,
+                "start_time_us": 9.0,
+                "end_time_us": 11.0,
+            },
+        ]
+    ]
+    scheduler_phases = [
+        [
+            {
+                "phase": "dummy_task",
+                "loop_iter": 0,
+                "task_id": (1 << 32) | (outer_task_id << 10),
+                "start_time_us": 11.5,
+                "end_time_us": 11.5,
+            }
+        ]
+    ]
+    out = tmp_path / "trace.json"
+
+    sc.generate_chrome_trace_json(
+        tasks,
+        str(out),
+        orchestrator_phases=orchestrator_phases,
+        scheduler_phases=scheduler_phases,
+    )
+
+    events = json.loads(out.read_text())["traceEvents"]
+    graph_process = [
+        e
+        for e in events
+        if e.get("ph") == "M" and e.get("name") == "process_name" and e.get("args", {}).get("name") == "Graph Execution"
+    ]
+    assert len(graph_process) == 1
+
+    graph_events = [e for e in events if e.get("cat") == "graph_execution" and e.get("ph") == "X"]
+    assert len(graph_events) == 1
+    graph_event = graph_events[0]
+    assert graph_event["name"] == "GraphExecution(t7, 3 visible nodes)"
+    assert graph_event["ts"] == 9.0
+    assert graph_event["dur"] == 22.0
+    assert graph_event["args"]["outer_task_id"] == outer_task_id
+    assert graph_event["args"]["visible_node_count"] == 3
+    assert graph_event["args"]["aicore_node_count"] == 2
+    assert graph_event["args"]["aicpu_node_count"] == 1
+    assert graph_event["args"]["aicore_slice_count"] == 2
+    assert graph_event["args"]["aicpu_slice_count"] == 1
+
+    orch_names = [e["name"] for e in events if e.get("cat") == "orchestrator"]
+    assert orch_names == ["submit(t7)", "graph_submit(t7)"]
+
+    node_events = [e for e in events if e.get("cat") == "event" and e.get("pid") == 4 and "graph_node" in e["name"]]
+    assert {e["name"] for e in node_events} == {
+        "graph_node[0](r1t7168)",
+        "graph_node[2](r1t7170)",
+        "graph_node[3](r1t7171)",
+    }
+    assert {e["args"]["graph_node_index"] for e in node_events} == {0, 2, 3}
+    assert {e["args"]["graph_outer_task_id"] for e in node_events} == {outer_task_id}
+
+    # The matched Graph submit must not fall through to the old
+    # no-AICore-record heuristic and render as an allocation.
+    assert not any(e.get("name") == "alloc(t7)" and e.get("ts") == 9.0 for e in events)
+
+
+def test_ring_zero_dummy_does_not_create_false_graph_instance(tmp_path):
+    out = tmp_path / "trace.json"
+    sc.generate_chrome_trace_json(
+        [],
+        str(out),
+        orchestrator_phases=[
+            [
+                {
+                    "phase": "orch_submit",
+                    "submit_idx": 0,
+                    "task_id": 0,
+                    "start_time_us": 1.0,
+                    "end_time_us": 2.0,
+                }
+            ]
+        ],
+        scheduler_phases=[
+            [
+                {
+                    "phase": "dummy_task",
+                    "loop_iter": 0,
+                    "task_id": 0,
+                    "start_time_us": 3.0,
+                    "end_time_us": 3.0,
+                }
+            ]
+        ],
+    )
+
+    events = json.loads(out.read_text())["traceEvents"]
+    assert not any(e.get("cat") == "graph_execution" for e in events)
+    assert any(e.get("name") == "dummy(t0)" for e in events)

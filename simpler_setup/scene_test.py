@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import gc
 import inspect
+import json
 import logging
 import os
 import sys
@@ -708,6 +709,138 @@ def _run_swimlane_converter(
             logger.debug(f"stderr: {e.stderr}")
 
 
+def _swimlane_cycle_bounds(data: dict) -> tuple[int, int] | None:
+    cycles: list[int] = []
+    for row in data.get("aicore_tasks") or []:
+        if len(row) >= 5:
+            start = int(row[3])
+            end = int(row[4])
+            receive_to_start = int(row[5]) if len(row) > 5 else 0
+            cycles.extend([start - receive_to_start, end])
+    for row in data.get("aicpu_tasks") or []:
+        if len(row) >= 4:
+            cycles.extend([int(row[2]), int(row[3])])
+    for key in ("aicpu_scheduler_phases", "aicpu_orchestrator_phases"):
+        for thread_records in data.get(key) or []:
+            for record in thread_records:
+                cycles.extend([int(record.get("start_cycles", 0)), int(record.get("end_cycles", 0))])
+    cycles = [cycle for cycle in cycles if cycle > 0]
+    return (min(cycles), max(cycles)) if cycles else None
+
+
+def _extend_thread_records(dst: list[list], src: list[list]) -> None:
+    for idx, records in enumerate(src):
+        while len(dst) <= idx:
+            dst.append([])
+        dst[idx].extend(records)
+
+
+def _merge_swimlane_round_files(round_perf_files: list[Path], output_path: Path) -> tuple[list[dict], int]:
+    """Merge per-round raw captures into one converter input."""
+    merged: dict[str, Any] = {
+        "l2_swimlane_level": 0,
+        "metadata": {},
+        "aicore_tasks": [],
+        "aicpu_tasks": [],
+        "aicpu_scheduler_phases": [],
+        "aicpu_orchestrator_phases": [],
+    }
+    round_spans: list[dict] = []
+    next_reg_offset = 0
+    clock_freq_hz = 0
+
+    for round_idx, perf_file in enumerate(round_perf_files):
+        with perf_file.open() as f:
+            data = json.load(f)
+        if not merged["metadata"]:
+            merged["metadata"] = dict(data.get("metadata") or {})
+            clock_freq_hz = int(merged["metadata"].get("clock_freq_hz") or 0)
+        merged["l2_swimlane_level"] = max(
+            int(merged["l2_swimlane_level"]), int(data.get("l2_swimlane_level") or 0)
+        )
+
+        max_reg_task_id = 0
+        for key in ("aicore_tasks", "aicpu_tasks"):
+            id_index = 2 if key == "aicore_tasks" else 1
+            for row in data.get(key) or []:
+                new_row = list(row)
+                if len(new_row) > id_index:
+                    reg_task_id = int(new_row[id_index])
+                    new_row[id_index] = reg_task_id + next_reg_offset
+                    max_reg_task_id = max(max_reg_task_id, reg_task_id)
+                merged[key].append(new_row)
+        next_reg_offset += max_reg_task_id + 1
+
+        _extend_thread_records(merged["aicpu_scheduler_phases"], data.get("aicpu_scheduler_phases") or [])
+        _extend_thread_records(merged["aicpu_orchestrator_phases"], data.get("aicpu_orchestrator_phases") or [])
+
+        bounds = _swimlane_cycle_bounds(data)
+        if bounds is not None:
+            round_spans.append(
+                {
+                    "round": round_idx,
+                    "start_cycles": bounds[0],
+                    "end_cycles": bounds[1],
+                    "file": str(perf_file.relative_to(output_path.parent)),
+                }
+            )
+
+    if round_spans:
+        merged["metadata"]["merged_rounds"] = round_spans
+    for key in ("aicpu_scheduler_phases", "aicpu_orchestrator_phases"):
+        if not any(merged[key]):
+            merged.pop(key, None)
+
+    with output_path.open("w") as f:
+        json.dump(merged, f, indent=2)
+    return round_spans, clock_freq_hz
+
+
+def _annotate_swimlane_rounds(trace_path: Path, round_spans: list[dict], clock_freq_hz: int) -> None:
+    if not round_spans or clock_freq_hz <= 0 or not trace_path.exists():
+        return
+    with trace_path.open() as f:
+        trace = json.load(f)
+    events = trace.get("traceEvents")
+    if not isinstance(events, list):
+        return
+
+    base_cycles = min(int(span["start_cycles"]) for span in round_spans)
+    factor = 1_000_000.0 / float(clock_freq_hz)
+    events.extend(
+        [
+            {"args": {"name": "SceneTest Rounds"}, "cat": "__metadata", "name": "process_name", "ph": "M", "pid": 0},
+            {"args": {"name": "rounds"}, "cat": "__metadata", "name": "thread_name", "ph": "M", "pid": 0, "tid": 0},
+        ]
+    )
+    for span in round_spans:
+        start_cycles = int(span["start_cycles"])
+        end_cycles = int(span["end_cycles"])
+        events.append(
+            {
+                "args": {"source": span.get("file", "")},
+                "cat": "round",
+                "name": f"round {span['round']}",
+                "ph": "X",
+                "pid": 0,
+                "tid": 0,
+                "ts": (start_cycles - base_cycles) * factor,
+                "dur": max(0.0, (end_cycles - start_cycles) * factor),
+            }
+        )
+
+    with trace_path.open("w") as f:
+        json.dump(trace, f, indent=2)
+
+
+def _diagnostic_round_output_prefix(output_prefix: str, round_idx: int, rounds: int, enabled: bool) -> str:
+    if not output_prefix or rounds <= 1 or not enabled:
+        return output_prefix
+    round_prefix = Path(output_prefix) / f"round_{round_idx:03d}"
+    round_prefix.mkdir(parents=True, exist_ok=True)
+    return str(round_prefix)
+
+
 def _sanitize_for_filename(s: str) -> str:
     return "".join(c if c.isalnum() or c in "._-" else "_" for c in s)
 
@@ -718,14 +851,20 @@ def _convert_case_swimlane(
     callable_spec: dict | None = None,
     enable_overhead: bool = False,
 ) -> None:
-    """Post-case: invoke the swimlane converter on the perf file the runtime
-    just wrote into ``<output_prefix>/l2_swimlane_records.json``. No diff/rename
-    dance — the path is known a priori from CallConfig.output_prefix.
-    """
+    """Post-case: merge per-round captures and invoke the converter."""
     import logging  # noqa: PLC0415
 
     logger = logging.getLogger(__name__)
+    round_perf_files = sorted(output_prefix.glob("round_*/l2_swimlane_records.json"))
+    round_spans: list[dict] = []
+    clock_freq_hz = 0
     perf_file = output_prefix / "l2_swimlane_records.json"
+    if round_perf_files:
+        try:
+            round_spans, clock_freq_hz = _merge_swimlane_round_files(round_perf_files, perf_file)
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"[{case_label}] failed to merge round swimlane records: {e}")
+            return
     if not perf_file.exists():
         logger.warning(f"[{case_label}] {perf_file} not produced; skipping conversion")
         return
@@ -738,6 +877,7 @@ def _convert_case_swimlane(
         func_names_path = _dump_name_map(mapping, output_prefix / f"name_map_{safe_label}.json")
 
     _run_swimlane_converter(input_path=perf_file, func_names_path=func_names_path, enable_overhead=enable_overhead)
+    _annotate_swimlane_rounds(output_prefix / "merged_swimlane.json", round_spans, clock_freq_hz)
 
 
 def _run_deps_viewer(
@@ -850,6 +990,7 @@ def run_class_cases(  # noqa: PLR0913 -- shared layer-5 entry; kwargs mirror CLI
     diagnostics_on = enable_l2_swimlane or enable_dump_args or enable_pmu or enable_dep_gen or enable_scope_stats
     for case in cases:
         case_label = f"{cls_name}_{case['name']}"
+        case_rounds = max(rounds, int(case.get("config", {}).get("rounds", 1)))
         # Per-case directory the runtime writes into. Required (non-empty) when
         # any diagnostic flag is on; CallConfig::validate() throws otherwise.
         # scope_stats now writes <prefix>/scope_stats/scope_stats.jsonl (sibling of
@@ -862,7 +1003,7 @@ def run_class_cases(  # noqa: PLR0913 -- shared layer-5 entry; kwargs mirror CLI
                 callable_obj,
                 case,
                 sub_handles=sub_handles,
-                rounds=rounds,
+                rounds=case_rounds,
                 skip_golden=skip_golden,
                 enable_l2_swimlane=enable_l2_swimlane,
                 enable_dump_args=enable_dump_args,
@@ -1083,6 +1224,7 @@ class SceneTestCase:
         config.enable_pmu = enable_pmu  # 0=disabled, >0=enabled with event type
         config.enable_dep_gen = enable_dep_gen
         config.enable_scope_stats = enable_scope_stats
+        config.enable_graph_cache = bool(config_dict.get("enable_graph_cache", False))
         # `output_prefix` is required by CallConfig::validate() whenever any
         # diagnostic flag is enabled. Caller threads it down from the per-case
         # directory built by _build_output_prefix().
@@ -1204,11 +1346,15 @@ class SceneTestCase:
                 for name, initial in initial_outputs.items():
                     getattr(test_args, name).copy_(initial)
 
-            # enable_l2_swimlane / enable_dep_gen are already forced False by
-            # the upstream gate in test_run / run_module when rounds > 1, so an
-            # extra `and round_idx == 0` here is dead code; pass them through
-            # verbatim. (If the upstream gate is ever relaxed, restore the
-            # per-round masking here.)
+            # Case-level rounds intentionally keep diagnostics enabled. Each
+            # round writes to its own directory and the L2 traces are merged
+            # after the run, so record and replay appear on one timeline.
+            round_output_prefix = _diagnostic_round_output_prefix(
+                output_prefix,
+                round_idx,
+                rounds,
+                bool(enable_l2_swimlane or enable_dump_args or enable_pmu or enable_dep_gen or enable_scope_stats),
+            )
             config = self._build_config(
                 config_dict,
                 enable_l2_swimlane=enable_l2_swimlane,
@@ -1216,7 +1362,7 @@ class SceneTestCase:
                 enable_pmu=enable_pmu,
                 enable_dep_gen=enable_dep_gen,
                 enable_scope_stats=enable_scope_stats,
-                output_prefix=output_prefix,
+                output_prefix=round_output_prefix,
             )
 
             with _temporary_env(self._resolve_env()):

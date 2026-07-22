@@ -476,6 +476,7 @@ public:
 
     void set_active_callable_id(int32_t callable_id) { active_callable_id_ = callable_id; }
     int32_t get_active_callable_id() const { return active_callable_id_; }
+    void set_graph_cache_config(bool, uint64_t) {}
 
     // Host-side tensor ledger for D2H copy-back at finalize. Populated by
     // runtime_maker.cpp from orch_args at bind time; iterated in

@@ -534,6 +534,9 @@ enum class L2SwimlaneSchedPhaseKind : uint32_t {
     // so async-engine (SDMA/RoCE/URMA/CCU) wait time is attributed to its own
     // bar. tasks_processed = async subtasks completed this iter.
     AsyncPoll = 11,
+    GraphPrepare = 12,  // bounded Graph node materialization slice. Runs after
+                        // completion and dispatch so it cannot monopolize a scheduler.
+                        // tasks_processed = nodes materialized in this slice.
 };
 
 /** Index layout of the queue-depth snapshot arrays below: AIC=0, AIV=1, MIX=2.
