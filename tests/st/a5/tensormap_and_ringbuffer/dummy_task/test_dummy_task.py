@@ -9,7 +9,7 @@
 # -----------------------------------------------------------------------------------------------------------
 """dummy_task: verify dep-only tasks block consumers and never run a kernel.
 
-The orchestration submits one of three scenes, controlled by params["case"]:
+The orchestration submits one of four scenes, controlled by params["case"]:
 
   case=1 (single dummy via tensormap INOUT):
     producer writes X[0]=42.0 -> dummy_T INOUTs X -> consumer copies X to Y.
@@ -27,6 +27,10 @@ The orchestration submits one of three scenes, controlled by params["case"]:
     set_dependencies({A, B}, 2) as a many-to-one barrier; the consumer
     set_dependencies({dummy}, 1) and reads X. Verifies dummy_task
     participates in explicit_dep wiring.
+
+  case=4 (dense fanout and fanin):
+    One producer feeds 18 dummy barriers, then one consumer depends on all
+    18. Verifies high-degree dummy-task dependency wiring.
 """
 
 import torch
@@ -87,10 +91,9 @@ class TestDummyTask(SceneTestCase):
             "params": {"case": 3},
         },
         {
-            # One producer fanned out to 18 dummy barriers, then one consumer
-            # depending on all 18 — both degrees exceed the dense-dependency
-            # warn threshold (16), exercising the orchestrator's fanout and
-            # fanin diagnostics. Correctness is still just the copy.
+            # One producer fans out to 18 dummy barriers, then one consumer
+            # depends on all 18, exercising the dense-dependency debug paths.
+            # Correctness is still just the copy.
             "name": "DenseFanoutFanin",
             "platforms": ["a5sim", "a5"],
             "config": {"aicpu_thread_num": 2, "block_dim": 1},

@@ -49,8 +49,8 @@
 #define FUNC_COPY_FIRST 1
 
 static constexpr int32_t LONG_CHAIN_DUMMIES = 4;
-// case=4 dense-dependency degree: > PTO2_DEP_DEGREE_WARN_THRESHOLD (16) so the
-// producer's fanout and the final consumer's fanin both trip the diagnostic.
+// case=4 exceeds PTO2_DEP_DEGREE_DEBUG_THRESHOLD (16), exercising both the
+// producer-fanout and final-consumer-fanin debug diagnostics.
 static constexpr int32_t DENSE_DEP_COUNT = 18;
 
 extern "C" {
@@ -142,11 +142,8 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const L2Ta
             rt_submit_aic_task(FUNC_COPY_FIRST, args);
         }
     } else if (case_id == 4) {
-        // Dense fanout + fanin: one producer feeds DENSE_DEP_COUNT dummy
-        // barriers (producer fanout = DENSE_DEP_COUNT), then one consumer
-        // depends on all of them (consumer fanin = DENSE_DEP_COUNT). Both
-        // degrees exceed PTO2_DEP_DEGREE_WARN_THRESHOLD, tripping the
-        // orchestrator's dense-fanout and dense-fanin diagnostics.
+        // One producer feeds DENSE_DEP_COUNT dummy barriers, then one consumer
+        // depends on all of them, exercising both dense-dependency diagnostics.
         PTO2TaskId a_id;
         {
             L0TaskArgs args;
