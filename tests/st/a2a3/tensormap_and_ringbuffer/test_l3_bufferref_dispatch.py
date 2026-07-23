@@ -83,7 +83,7 @@ class TestL3BufferRefDispatch(SceneTestCase):
     }
 
     CASES = [
-        {"name": "bufferref_dispatch", "platforms": ["a2a3sim"]},
+        {"name": "bufferref_dispatch", "platforms": ["a2a3sim", "a2a3"]},
     ]
 
     def test_run(self, st_worker):
