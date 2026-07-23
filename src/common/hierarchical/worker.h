@@ -205,10 +205,9 @@ private:
     TensorMap tensormap_;
     Ring allocator_;
     Scope scope_;
-    // One ready queue per WorkerType. Submit routes by s.worker_type;
-    // the Scheduler drains each queue independently so saturation of
-    // one pool cannot head-of-line-block the other.
-    ReadyQueue ready_next_level_queue_;
+    // NEXT_LEVEL singles use one FIFO per stable worker id; groups use one
+    // FIFO whose head launches only when every requested worker is idle.
+    NextLevelReadyQueues ready_next_level_queues_;
     ReadyQueue ready_sub_queue_;
     Orchestrator orchestrator_;
     Scheduler scheduler_;

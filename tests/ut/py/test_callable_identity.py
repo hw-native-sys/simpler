@@ -590,7 +590,7 @@ def test_remote_session_manifest_requires_wildcard_bind_opt_in():
         worker.close()
 
 
-def test_remote_submit_worker_affinity_uses_stable_worker_id_after_mixed_add_order():
+def test_remote_submit_target_uses_stable_worker_id_after_mixed_add_order():
     class FakeCOrchestrator:
         def submit_next_level(self, *args):
             self.submit_next_level_args = args
@@ -614,7 +614,7 @@ def test_remote_submit_worker_affinity_uses_stable_worker_id_after_mixed_add_ord
         worker.close()
 
 
-def test_local_submit_worker_affinity_maps_stable_worker_id_after_mixed_add_order():
+def test_local_submit_target_maps_stable_worker_id_after_mixed_add_order():
     class FakeCOrchestrator:
         def submit_next_level(self, *args):
             self.submit_next_level_args = args
@@ -658,6 +658,37 @@ def test_chip_submit_uses_chip_index_worker_id():
     assert call[6] == []
 
 
+def test_next_level_submit_requires_valid_explicit_targets():
+    class FakeCOrchestrator:
+        def submit_next_level(self, *args):
+            self.submit_next_level_args = args
+
+        def submit_next_level_group(self, *args):
+            self.submit_next_level_group_args = args
+
+    handle = CallableHandle("sha256:" + "00" * 32, "CHIP_CALLABLE", "LOCAL_CHIP")
+    orch = Orchestrator(FakeCOrchestrator())
+
+    with pytest.raises(TypeError, match="worker"):
+        orch.submit_next_level(handle, TaskArgs())
+    with pytest.raises(ValueError, match="non-negative"):
+        orch.submit_next_level(handle, TaskArgs(), worker=-1)
+    for worker in (True, 1.0, "1"):
+        with pytest.raises(TypeError, match="integer"):
+            orch.submit_next_level(handle, TaskArgs(), worker=cast(int, worker))
+    with pytest.raises(TypeError, match="workers"):
+        orch.submit_next_level_group(handle, [TaskArgs()])
+    with pytest.raises(ValueError, match="length"):
+        orch.submit_next_level_group(handle, [TaskArgs(), TaskArgs()], workers=[0])
+    with pytest.raises(ValueError, match="non-negative"):
+        orch.submit_next_level_group(handle, [TaskArgs()], workers=[-1])
+    for worker in (True, 1.0, "1"):
+        with pytest.raises(TypeError, match="integer"):
+            orch.submit_next_level_group(handle, [TaskArgs()], workers=[worker])
+    with pytest.raises(ValueError, match="duplicate"):
+        orch.submit_next_level_group(handle, [TaskArgs(), TaskArgs()], workers=[0, 0])
+
+
 def test_remote_callable_submit_passes_remote_sidecar_to_cpp_facade():
     class FakeCOrchestrator:
         def submit_next_level(self, *args):
@@ -682,7 +713,7 @@ def test_remote_callable_submit_passes_remote_sidecar_to_cpp_facade():
         )
         args = TaskArgs()
         args.add_tensor(RemoteTensorRef(buf, shape=(4,), dtype=DataType.UINT8), TensorArgType.INPUT)
-        orch.submit_next_level(handle, args)
+        orch.submit_next_level(handle, args, worker=worker_id)
 
         call = fake.submit_next_level_args
         assert call[1] == "PYTHON_IMPORT"
@@ -695,7 +726,7 @@ def test_remote_callable_submit_passes_remote_sidecar_to_cpp_facade():
 
         bare = TaskArgs()
         bare.add_tensor(Tensor.make(0x1234, (1,), DataType.UINT8), TensorArgType.INPUT)
-        orch.submit_next_level(handle, bare)
+        orch.submit_next_level(handle, bare, worker=worker_id)
 
         bare_sidecar = fake.submit_next_level_args[7]
         assert len(bare_sidecar.tensors) == 1
@@ -820,7 +851,7 @@ def test_remote_callable_submit_rejects_tag_access_mismatch(tag, access_flags):
         args.add_tensor(RemoteTensorRef(remote_buf, shape=(4,), dtype=DataType.UINT8), tag)
 
         with pytest.raises(ValueError, match="remote tensor .* access"):
-            orch.submit_next_level(handle, args)
+            orch.submit_next_level(handle, args, worker=worker_id)
     finally:
         worker.close()
 
@@ -860,7 +891,7 @@ def test_remote_callable_submit_accepts_readwrite_handle_for_all_tags(tag):
         args = TaskArgs()
         args.add_tensor(RemoteTensorRef(remote_buf, shape=(4,), dtype=DataType.UINT8), tag)
 
-        orch.submit_next_level(handle, args)
+        orch.submit_next_level(handle, args, worker=worker_id)
 
         assert fake.submit_next_level_args[6] == [worker_id]
     finally:
@@ -892,7 +923,7 @@ def test_remote_callable_submit_intersects_remote_buffer_owner_worker():
         )
         args = TaskArgs()
         args.add_tensor(RemoteTensorRef(buf, shape=(4,), dtype=DataType.UINT8), TensorArgType.INPUT)
-        orch.submit_next_level(handle, args)
+        orch.submit_next_level(handle, args, worker=worker_id1)
 
         assert fake.submit_next_level_args[6] == [worker_id1]
     finally:
@@ -926,7 +957,7 @@ def test_remote_callable_submit_rejects_remote_buffer_outside_callable_workers()
         args.add_tensor(RemoteTensorRef(buf, shape=(4,), dtype=DataType.UINT8), TensorArgType.INPUT)
 
         with pytest.raises(ValueError, match="no eligible remote worker"):
-            orch.submit_next_level(handle, args)
+            orch.submit_next_level(handle, args, worker=worker_id0)
     finally:
         worker.close()
 
@@ -965,7 +996,7 @@ def test_remote_callable_group_submit_intersects_each_member_worker_set():
         args0.add_tensor(RemoteTensorRef(buf0, shape=(4,), dtype=DataType.UINT8), TensorArgType.INPUT)
         args1 = TaskArgs()
         args1.add_tensor(RemoteTensorRef(buf1, shape=(4,), dtype=DataType.UINT8), TensorArgType.INPUT)
-        orch.submit_next_level_group(handle, [args0, args1])
+        orch.submit_next_level_group(handle, [args0, args1], workers=[worker_id0, worker_id1])
 
         assert fake.submit_next_level_group_args[6] == [[worker_id0], [worker_id1]]
     finally:

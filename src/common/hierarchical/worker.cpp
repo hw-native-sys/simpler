@@ -96,23 +96,26 @@ void Worker::add_remote_l3_socket(
 void Worker::init() {
     if (initialized_) throw std::runtime_error("Worker: already initialized");
 
-    orchestrator_.init(
-        &tensormap_, &allocator_, &scope_, &ready_next_level_queue_, &ready_sub_queue_, &manager_, [this] {
-            scheduler_.notify_ready();
-        }
-    );
-
     // Start WorkerManager first — creates WorkerThreads.
     // The on_complete callback routes through the Scheduler's worker_done().
     manager_.start(&allocator_, [this](WorkerCompletion completion) {
         scheduler_.worker_done(std::move(completion));
     });
+    ready_next_level_queues_.reset(manager_.next_level_worker_ids());
+    orchestrator_.init(
+        &tensormap_, &allocator_, &scope_, &ready_sub_queue_, &ready_next_level_queues_, &manager_, [this] {
+            scheduler_.notify_ready();
+        }
+    );
 
     Scheduler::Config cfg;
     cfg.ring = &allocator_;
-    cfg.ready_next_level_queue = &ready_next_level_queue_;
     cfg.ready_sub_queue = &ready_sub_queue_;
+    cfg.ready_next_level_queues = &ready_next_level_queues_;
     cfg.manager = &manager_;
+    cfg.enqueue_ready_cb = [this](TaskSlot slot) {
+        orchestrator_.enqueue_ready(slot);
+    };
     cfg.on_consumed_cb = [this](TaskSlot slot) {
         orchestrator_.on_consumed(slot);
     };

@@ -342,11 +342,11 @@ every active child endpoint in the handle's `target_namespace` for this
 `Worker` has installed the callable identity. Registering to a user-selected
 worker subset is not part of this contract.
 `orch.submit_next_level(..., worker=...)` and
-`orch.submit_next_level_group(..., workers=...)` are submit-time affinity
-controls; they do not define registration scope. NEXT_LEVEL affinity consumes
-stable worker ids. Local Python Worker children and remote L3 workers use the
-worker ids returned by `add_worker(...)` / `add_remote_worker(...)`; L3 chip
-worker ids are the existing chip worker ids.
+`orch.submit_next_level_group(..., workers=...)` require exact submit-time
+placement; they do not define registration scope. NEXT_LEVEL placement uses
+stable worker ids. Local Python Worker children and remote L3 workers use ids
+returned by `add_worker(...)` / `add_remote_worker(...)`; L3 chip worker ids
+are the existing chip worker ids.
 
 `CallableHandle` is the public callable token returned by registration:
 
@@ -381,7 +381,7 @@ matmul = worker.register(chip_callable)
 postprocess = worker.register(py_callable)
 
 def parent_orch(orch, args, config):
-    orch.submit_next_level(matmul, args, config)
+    orch.submit_next_level(matmul, args, config, worker=0)
     orch.submit_sub(postprocess, args)
 ```
 
@@ -488,11 +488,10 @@ Worker teardown is deferred to a later design.
 
 ### Dispatch Contract
 
-Parent-side scheduling assumes the handle's `hashid` is installed on every
-active target in its registration scope. Dispatch choices are constrained by
-the handle namespace, submit-time affinity, and tensor/buffer accessibility.
-Submit-time live validation is a preflight check only. It does not pin the
-target identity through later drain or child dispatch. Callers must not
+Parent-side scheduling requires the handle's `hashid` on the submitted exact
+target. The Orchestrator validates the handle namespace and tensor/buffer
+accessibility for that target before committing the slot. The target identity
+is then fixed in `TaskSlotState` through dispatch. Callers must not
 concurrently unregister a handle while `Worker.run()` or any in-flight task may
 submit or use that handle; wait for the relevant run/drain to return before
 unregistering it.

@@ -13,8 +13,8 @@
  * Orchestrator — DAG builder.
  *
  * Public API (called by the user's orch fn during Worker::run):
- *   - submit_next_level(CallableIdentity, TaskArgs, CallConfig)
- *   - submit_next_level_group(CallableIdentity, vector<TaskArgs>, CallConfig)
+ *   - submit_next_level(CallableIdentity, TaskArgs, CallConfig, worker_id)
+ *   - submit_next_level_group(CallableIdentity, vector<TaskArgs>, CallConfig, worker_ids)
  *   - submit_sub(CallableIdentity, TaskArgs)
  *   - submit_sub_group(CallableIdentity, vector<TaskArgs>)
  *   - alloc(shape, dtype) — runtime-owned intermediate buffer
@@ -68,13 +68,10 @@ struct SubmitResult {
 
 class Orchestrator {
 public:
-    // Strict-4: the engine keeps one ReadyQueue per WorkerType so a
-    // saturated sub pool cannot head-of-line-block chip dispatch (and vice
-    // versa). Submit routes to the queue matching the task's worker_type;
-    // the Scheduler's dispatch_ready walks each queue independently.
     void init(
-        TensorMap *tensormap, Ring *allocator, Scope *scope, ReadyQueue *ready_next_level_queue,
-        ReadyQueue *ready_sub_queue, WorkerManager *manager = nullptr, std::function<void()> ready_notify_cb = {}
+        TensorMap *tensormap, Ring *allocator, Scope *scope, ReadyQueue *ready_sub_queue,
+        NextLevelReadyQueues *ready_next_level_queues, WorkerManager *manager = nullptr,
+        std::function<void()> ready_notify_cb = {}
     );
 
     // Allocate an intermediate buffer from the Worker's HeapRing (MAP_SHARED,
@@ -98,17 +95,17 @@ public:
     // by Worker.register(); the child resolves its digest to a private slot.
     // Tags inside `args` drive dependency inference; OUTPUT tensors with
     // null data are auto-allocated from the HeapRing.
-    // `worker_id`: stable NEXT_LEVEL worker id for affinity (-1 = unconstrained).
+    // `worker_id`: exact stable NEXT_LEVEL worker id that runs this task.
     SubmitResult submit_next_level(
-        const CallableIdentity &callable, const TaskArgs &args, const CallConfig &config, int32_t worker_id = -1,
+        const CallableIdentity &callable, const TaskArgs &args, const CallConfig &config, int32_t worker_id,
         const std::vector<int32_t> &eligible_worker_ids = {}, const RemoteTaskArgsSidecar &remote_sidecar = {}
     );
 
     // Submit a group of NEXT_LEVEL tasks: N args -> N worker selections, 1 DAG node.
-    // `worker_ids`: per-args stable NEXT_LEVEL worker id affinity.
+    // `worker_ids`: one exact stable NEXT_LEVEL worker id per member.
     SubmitResult submit_next_level_group(
         const CallableIdentity &callable, const std::vector<TaskArgs> &args_list, const CallConfig &config,
-        const std::vector<int32_t> &worker_ids = {}, const std::vector<std::vector<int32_t>> &eligible_worker_ids = {},
+        const std::vector<int32_t> &worker_ids, const std::vector<std::vector<int32_t>> &eligible_worker_ids = {},
         const std::vector<RemoteTaskArgsSidecar> &remote_sidecars = {}
     );
 
@@ -158,24 +155,18 @@ public:
     // CAS — only the winner returns true and runs cleanup; losers return false.
     bool on_consumed(TaskSlot slot);
 
+    // Route a slot whose state is already READY to the queue that owns it.
+    // Scheduler uses the same path after releasing the final dependency.
+    void enqueue_ready(TaskSlot slot);
+
 private:
     TensorMap *tensormap_ = nullptr;
     Ring *allocator_ = nullptr;
     Scope *scope_ = nullptr;
     WorkerManager *manager_ = nullptr;
     std::function<void()> ready_notify_cb_;
-    // Strict-4 per-worker-type ready queues. Each queue handles tasks of
-    // exactly one WorkerType so the Scheduler can dispatch from an idle pool
-    // without being blocked by another pool's saturation.
-    ReadyQueue *ready_next_level_queue_ = nullptr;
     ReadyQueue *ready_sub_queue_ = nullptr;
-
-    // Returns the ready queue that owns tasks of the given worker type.
-    // The method itself does not mutate the Orchestrator (hence `const`);
-    // the returned pointer is non-const because callers push into the queue.
-    ReadyQueue *ready_queue_for(WorkerType t) const {
-        return t == WorkerType::NEXT_LEVEL ? ready_next_level_queue_ : ready_sub_queue_;
-    }
+    NextLevelReadyQueues *ready_next_level_queues_ = nullptr;
 
     // --- Drain support (owned here, not on Worker) ---
     std::atomic<int32_t> active_tasks_{0};
@@ -194,7 +185,7 @@ private:
     // can patch `tensor.data` on OUTPUT tensors flagged for auto-allocation.
     SubmitResult submit_impl(
         WorkerType worker_type, const CallableIdentity &callable, const CallConfig &config,
-        std::vector<TaskArgs> args_list, std::vector<int32_t> affinities = {},
+        std::vector<TaskArgs> args_list, std::vector<int32_t> target_worker_ids = {},
         std::vector<std::vector<int32_t>> eligible_worker_ids = {},
         std::vector<RemoteTaskArgsSidecar> remote_sidecars = {}
     );
@@ -214,14 +205,15 @@ private:
     // Walk the tags of each TaskArgs in `args_list`, accumulating producer
     // slots (for INPUT/INOUT tags) and registering outputs in the tensormap
     // (for OUTPUT/INOUT/OUTPUT_EXISTING tags). NO_DEP tags are skipped.
-    // `affinities` maps args_list[i] to worker id for TensorKey construction.
+    // `target_worker_ids` maps NEXT_LEVEL args_list[i] to its exact worker for
+    // TensorKey construction. It is empty for SUB tasks.
     void infer_deps(
-        TaskSlot slot, const std::vector<TaskArgs> &args_list, const std::vector<int32_t> &affinities,
+        TaskSlot slot, const std::vector<TaskArgs> &args_list, const std::vector<int32_t> &target_worker_ids,
         const std::vector<RemoteTaskArgsSidecar> &remote_sidecars, std::vector<TaskSlot> &producers,
         std::vector<TensorKey> &output_keys
     );
     void validate_worker_eligibility(
-        WorkerType worker_type, size_t args_count, const std::vector<int32_t> &affinities,
+        WorkerType worker_type, size_t args_count, const std::vector<int32_t> &target_worker_ids,
         const std::vector<std::vector<int32_t>> &eligible_worker_ids
     ) const;
     void validate_remote_sidecars(

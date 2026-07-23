@@ -40,10 +40,11 @@ Status for the local PR #866 cut:
    - Assign each NEXT_LEVEL child a stable `worker_id`.
    - Store `callable hashid -> eligible worker ids` in parent runtime
      metadata.
-   - Extend submit slots with final eligible worker-id sets computed as
-     callable eligibility intersected with tensor/buffer data eligibility.
-   - Teach Scheduler/WorkerManager to pick only eligible idle workers.
-   - Validate `worker=` affinity against the slot's final eligible set.
+   - Compute final eligible worker-id sets from callable eligibility intersected
+     with tensor/buffer data eligibility before C++ submission.
+   - Validate the exact `worker=` target against that final eligible set.
+   - Store only the exact target on the slot; Scheduler dispatch does not
+     repeat eligibility selection.
    - Keep current docs in sync: describe local fork/shm as
      `LocalMailboxEndpoint` and remote L3 as a framed endpoint, not as another
      mailbox child loop.
@@ -237,7 +238,7 @@ Status for the local PR #866 cut:
 | Test | Expected result |
 | ---- | --------------- |
 | Local adapter regression | Existing L3/L4 fork/shm behavior unchanged. |
-| Endpoint eligibility | Scheduler never picks an ineligible endpoint. |
+| Endpoint eligibility | Exact target is rejected before enqueue when ineligible. |
 | Frame fuzz/bounds | Corrupt lengths and counts are rejected. |
 | Remote sim hello | Parent bootstraps remote L3 and shuts down cleanly. |
 | Manifest handoff | Runner reads manifest before transport starts. |

@@ -268,10 +268,10 @@ inline void bind_worker(nb::module_ &m) {
                 );
             },
             nb::arg("digest"), nb::arg("kind"), nb::arg("target_namespace"), nb::arg("args"), nb::arg("config"),
-            nb::arg("worker") = int32_t(-1), nb::arg("eligible_worker_ids") = std::vector<int32_t>{},
+            nb::arg("worker"), nb::arg("eligible_worker_ids") = std::vector<int32_t>{},
             nb::arg("remote_sidecar") = nb::none(),
             "Submit a NEXT_LEVEL task by registered callable digest. "
-            "worker= pins to a stable NEXT_LEVEL worker id (-1 = any)."
+            "worker= selects the exact stable NEXT_LEVEL worker id."
         )
         .def(
             "submit_next_level_group",
@@ -284,11 +284,10 @@ inline void bind_worker(nb::module_ &m) {
                 );
             },
             nb::arg("digest"), nb::arg("kind"), nb::arg("target_namespace"), nb::arg("args_list"), nb::arg("config"),
-            nb::arg("workers") = std::vector<int32_t>{},
-            nb::arg("eligible_worker_ids") = std::vector<std::vector<int32_t>>{},
+            nb::arg("workers"), nb::arg("eligible_worker_ids") = std::vector<std::vector<int32_t>>{},
             nb::arg("remote_sidecars") = nb::none(),
             "Submit a group of NEXT_LEVEL tasks by registered callable digest. "
-            "workers= per-args stable NEXT_LEVEL worker id affinity (empty = any)."
+            "workers= selects one exact stable NEXT_LEVEL worker id per member."
         )
         .def(
             "submit_sub",

@@ -415,7 +415,7 @@ def _build_l3_task_args(test_args: TaskArgsBuilder, orch_signature: list):
     """Build a tagged `TaskArgs` (vector-backed, with `TensorArgType` tags) from
     `TaskArgsBuilder`.
 
-    Used by the L3 path (`orch.submit_next_level(callable, args, config)`):
+    Used by the L3 path (`orch.submit_next_level(callable, args, config, worker=chip_id)`):
     the orchestrator reads the tags to drive dependency inference.
 
     Returns:

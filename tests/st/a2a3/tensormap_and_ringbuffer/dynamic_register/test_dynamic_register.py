@@ -163,7 +163,7 @@ def test_prepare_new_identity_after_start_then_run(st_platform, st_device_ids):
         #    snapshot, so they are in _run_chip_main_loop — the only state in
         #    which the CTRL_REGISTER broadcast in step 2 can be ACKed.
         def orch_pre(o, _args, _cfg):
-            o.submit_next_level(pre_handle, chip_args_pre, config)
+            o.submit_next_level(pre_handle, chip_args_pre, config, worker=0)
 
         worker.run(orch_pre)
         got_pre = args_pre.f
@@ -182,7 +182,7 @@ def test_prepare_new_identity_after_start_then_run(st_platform, st_device_ids):
         # 3. Run with post_handle. If CTRL_REGISTER delivered correctly, the
         #    child has the identity prepared; otherwise dispatch will fail.
         def orch_post(o, _args, _cfg):
-            o.submit_next_level(post_handle, chip_args_post, config)
+            o.submit_next_level(post_handle, chip_args_post, config, worker=0)
 
         worker.run(orch_post)
         got_post = args_post.f
@@ -217,14 +217,13 @@ def test_prepare_new_identity_after_start_parallel_broadcast(st_platform, st_dev
     pre_handle = worker.register(chip_callable)
     a, b = 2.0, 3.0
     expected = _golden(a, b)
-    # Pre-allocate args for each chip (chip_id = block group). The
-    # vector_example orchestration partitions the input across cores, so a
-    # single args bundle works for both chips' first-run trigger; the
-    # second-run uses the post-start prepared handle.
+    # Use one first-run bundle to start the control-capable child loop, then one
+    # post-start bundle per chip so the dynamically prepared handle is executed
+    # by both broadcast targets.
     args_pre = _make_args(a, b)
-    args_post = _make_args(a, b)
+    args_post = [_make_args(a, b) for _ in device_ids]
     chip_args_pre, _ = _build_l3_task_args(args_pre, _ORCH_SIG)
-    chip_args_post, _ = _build_l3_task_args(args_post, _ORCH_SIG)
+    chip_args_post = [_build_l3_task_args(args, _ORCH_SIG)[0] for args in args_post]
 
     worker.init()
     try:
@@ -233,7 +232,7 @@ def test_prepare_new_identity_after_start_parallel_broadcast(st_platform, st_dev
         config.aicpu_thread_num = 4
 
         def orch_pre(o, _a, _c):
-            o.submit_next_level(pre_handle, chip_args_pre, config)
+            o.submit_next_level(pre_handle, chip_args_pre, config, worker=0)
 
         worker.run(orch_pre)
         assert torch.allclose(args_pre.f, torch.full_like(args_pre.f, expected), rtol=1e-5, atol=1e-5)
@@ -242,10 +241,11 @@ def test_prepare_new_identity_after_start_parallel_broadcast(st_platform, st_dev
         post_handle = worker.register(post_callable)
 
         def orch_post(o, _a, _c):
-            o.submit_next_level(post_handle, chip_args_post, config)
+            o.submit_next_level_group(post_handle, chip_args_post, config, workers=[0, 1])
 
         worker.run(orch_post)
-        assert torch.allclose(args_post.f, torch.full_like(args_post.f, expected), rtol=1e-5, atol=1e-5)
+        for args in args_post:
+            assert torch.allclose(args.f, torch.full_like(args.f, expected), rtol=1e-5, atol=1e-5)
     finally:
         worker.close()
 
@@ -289,7 +289,7 @@ def test_prepare_capacity_overflow_post_start(st_platform, st_device_ids):
         config.aicpu_thread_num = 4
 
         def orch_pre(o, _a, _c):
-            o.submit_next_level(chip_handle, chip_args_pre, config)
+            o.submit_next_level(chip_handle, chip_args_pre, config, worker=0)
 
         worker.run(orch_pre)
 
@@ -340,7 +340,7 @@ def test_duplicate_prepare_same_hashid_survives_one_unregister(st_platform, st_d
 
         # 1. Trigger fork via pre_handle to put the chip child into the main loop.
         def orch_one(o, _args, _cfg):
-            o.submit_next_level(pre_handle, chip_args_one, config)
+            o.submit_next_level(pre_handle, chip_args_one, config, worker=0)
 
         worker.run(orch_one)
         assert torch.allclose(args_one.f, torch.full_like(args_one.f, expected), rtol=1e-5, atol=1e-5)
@@ -357,10 +357,10 @@ def test_duplicate_prepare_same_hashid_survives_one_unregister(st_platform, st_d
         worker.unregister(pre_handle)
 
         with pytest.raises(KeyError, match="not live"):
-            worker.run(lambda o, _args, _cfg: o.submit_next_level(pre_handle, chip_args_one, config))
+            worker.run(lambda o, _args, _cfg: o.submit_next_level(pre_handle, chip_args_one, config, worker=0))
 
         def orch_two(o, _args, _cfg):
-            o.submit_next_level(duplicate_handle, chip_args_two, config)
+            o.submit_next_level(duplicate_handle, chip_args_two, config, worker=0)
 
         worker.run(orch_two)
         assert torch.allclose(args_two.f, torch.full_like(args_two.f, expected), rtol=1e-5, atol=1e-5)
@@ -368,7 +368,7 @@ def test_duplicate_prepare_same_hashid_survives_one_unregister(st_platform, st_d
         # 4. Dropping the final handle invalidates it through the public API.
         worker.unregister(duplicate_handle)
         with pytest.raises(KeyError, match="not live"):
-            worker.run(lambda o, _args, _cfg: o.submit_next_level(duplicate_handle, chip_args_two, config))
+            worker.run(lambda o, _args, _cfg: o.submit_next_level(duplicate_handle, chip_args_two, config, worker=0))
     finally:
         worker.close()
 
@@ -410,7 +410,7 @@ def test_unregister_last_handle_allows_reprepare_same_hashid(st_platform, st_dev
         config.aicpu_thread_num = 4
 
         def orch_one(o, _args, _cfg):
-            o.submit_next_level(pre_handle, chip_args_one, config)
+            o.submit_next_level(pre_handle, chip_args_one, config, worker=0)
 
         worker.run(orch_one)
         assert torch.allclose(args_one.f, torch.full_like(args_one.f, expected), rtol=1e-5, atol=1e-5)
@@ -418,14 +418,14 @@ def test_unregister_last_handle_allows_reprepare_same_hashid(st_platform, st_dev
         dyn_handle = worker.register(post_callable)
 
         def orch_two(o, _args, _cfg):
-            o.submit_next_level(dyn_handle, chip_args_two, config)
+            o.submit_next_level(dyn_handle, chip_args_two, config, worker=0)
 
         worker.run(orch_two)
         assert torch.allclose(args_two.f, torch.full_like(args_two.f, expected), rtol=1e-5, atol=1e-5)
 
         worker.unregister(dyn_handle)
         with pytest.raises(KeyError, match="not live"):
-            worker.run(lambda o, _args, _cfg: o.submit_next_level(dyn_handle, chip_args_two, config))
+            worker.run(lambda o, _args, _cfg: o.submit_next_level(dyn_handle, chip_args_two, config, worker=0))
 
         # Re-prepare the same hashid after its final handle was dropped.
         again_handle = worker.register(post_callable)
@@ -434,7 +434,7 @@ def test_unregister_last_handle_allows_reprepare_same_hashid(st_platform, st_dev
         assert again_handle._handle_id != dyn_handle._handle_id
 
         def orch_three(o, _args, _cfg):
-            o.submit_next_level(again_handle, chip_args_three, config)
+            o.submit_next_level(again_handle, chip_args_three, config, worker=0)
 
         worker.run(orch_three)
         assert torch.allclose(args_three.f, torch.full_like(args_three.f, expected), rtol=1e-5, atol=1e-5)

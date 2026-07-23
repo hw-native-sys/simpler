@@ -34,7 +34,7 @@ def run_dag(orch, callables, task_args, config):
     chip_args, _ = _build_l3_task_args(task_args, callables.vector_kernel_sig)
     callables.keep(chip_args)  # prevent GC before drain
 
-    orch.submit_next_level(callables.vector_kernel, chip_args, config)
+    orch.submit_next_level(callables.vector_kernel, chip_args, config, worker=0)
 
     # SubTask: tag the chip output as INPUT — Orchestrator wires the dep via TensorMap.
     sub_args = TaskArgs()

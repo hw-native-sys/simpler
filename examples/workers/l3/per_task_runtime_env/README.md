@@ -12,17 +12,15 @@ Before this knob, every L2 dispatched from one L3 shared the process-wide
 `submit_next_level` gets its own `CallConfig`:
 
 Each spec sets `ring_task_window` / `ring_heap` / `ring_dep_pool` to a scalar
-(broadcast to every ring) or a 4-entry list (per-ring), so the loop just sets
-whichever keys the spec contains:
+(broadcast to every ring) or a 4-entry list (per-ring). `_l2_config` preserves
+the orchestration's base diagnostics and overrides whichever ring keys the spec
+contains:
 
 ```python
 def orch_fn(orch, _args, _cfg):
     for spec in L2_TASKS:                      # one entry per L2 task
-        cfg = CallConfig()
-        for key in RING_FIELDS:                # ring_task_window / ring_heap / ring_dep_pool
-            if key in spec:                    # value is a scalar or a 4-entry list
-                setattr(cfg.runtime_env, key, spec[key])
-        orch.submit_next_level(chip_handle, chip_args, cfg)  # per-task config
+        cfg = _l2_config(_cfg, spec)
+        orch.submit_next_level(chip_handle, chip_args, cfg, worker=0)  # per-task config
 ```
 
 The per-task config travels through the mailbox to the chip child, so each L2

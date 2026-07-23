@@ -283,8 +283,8 @@ Scope:
 
 Acceptance criteria:
 
-- Scheduler chooses only eligible idle workers.
-- Worker affinity is validated against eligibility.
+- The Orchestrator validates each exact target against eligibility.
+- Scheduler dispatch preserves the validated stable worker ID.
 - Group partial failure and downstream poison are tested.
 - Slot release and `drain()` behavior are correct after success and failure.
 

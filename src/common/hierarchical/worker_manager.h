@@ -471,15 +471,12 @@ public:
     void start(Ring *ring, const OnCompleteFn &on_complete);
     void stop();
 
-    // Direct index into the worker pool (0-based).
-    WorkerThread *get_worker_by_index(WorkerType type, int worker_index) const;
     WorkerThread *get_worker_by_id(WorkerType type, int32_t worker_id) const;
+    std::vector<int32_t> next_level_worker_ids() const;
 
-    // Pick one idle worker NOT in `exclude`, restricted to `eligible_worker_ids`
-    // when that list is non-empty. Returns nullptr if none available.
-    WorkerThread *pick_idle(
-        WorkerType type, const std::vector<WorkerThread *> &exclude, const std::vector<int32_t> &eligible_worker_ids
-    ) const;
+    // SUB has no worker-selection API. Pick any idle SUB worker not already
+    // selected for the same group dispatch.
+    WorkerThread *pick_idle_sub_excluding(const std::vector<WorkerThread *> &exclude) const;
 
     bool any_busy() const;
 

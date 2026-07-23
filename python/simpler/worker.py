@@ -34,7 +34,7 @@ Usage::
     w.init()
 
     def my_orch(orch, args, cfg):
-        r = orch.submit_next_level(chip_handle, chip_args_ptr, cfg)
+        r = orch.submit_next_level(chip_handle, chip_args_ptr, cfg, worker=0)
         orch.submit_sub(sub_handle, sub_args)
 
     w.run(my_orch, my_args, my_config)
@@ -75,7 +75,6 @@ import sys
 import threading
 import time
 import uuid
-from collections.abc import Sequence
 from dataclasses import dataclass, field
 from multiprocessing.shared_memory import SharedMemory
 from typing import Any, cast
@@ -5208,44 +5207,33 @@ class Worker:
                 out.append((int(tensor.data), i))
         return out
 
-    def _next_level_target_ids(self) -> Sequence[int]:
-        """The full pool of dispatchable next-level worker ids.
-
-        Chip ids ``0..N`` at L3; the stable ``_next_level_worker_ids`` at L4+ (an
-        index range would not match the local/remote stable worker ids).
-        """
-        if self._chip_shms:
-            return range(len(self._chip_shms))
-        return self._next_level_worker_ids
-
-    def _child_prov_check_dispatch(
-        self, child_ptrs: list[tuple[int, int]], candidate_worker_ids: Any, *, api: str
-    ) -> None:
-        """Validate every child_memory pointer against its unique target worker.
-
-        A child_memory argument must resolve to exactly one eligible target
-        worker; ``0`` or ``>= 2`` candidates is ambiguous and rejected (judged on
-        the resolved eligibility, not the raw ``worker=-1``). The pointer must be
-        a live allocation on that target — else it is being routed to the wrong
-        worker, or is stale.
-        """
+    def _child_prov_check_dispatch(self, child_ptrs: list[tuple[int, int]], target_worker_id: int, *, api: str) -> None:
+        """Validate every child_memory pointer against its exact target worker."""
         if not child_ptrs:
             return
-        candidates = set(candidate_worker_ids)
-        if len(candidates) != 1:
-            arg_index = child_ptrs[0][1]
-            raise ValueError(
-                f"orch.{api}: child_memory argument (arg {arg_index}) cannot resolve a unique "
-                f"target worker (eligible={sorted(candidates)}); pin worker= explicitly"
-            )
-        target = next(iter(candidates))
         for ptr, arg_index in child_ptrs:
-            entry = self._child_alloc_prov.get((target, ptr))
+            entry = self._child_alloc_prov.get((target_worker_id, ptr))
             if entry is None or not entry.is_live():
                 raise ValueError(
                     f"orch.{api}: child_memory argument (arg {arg_index}, ptr 0x{ptr:x}) is not a "
-                    f"live allocation on target worker {target} (wrong worker, stale, or interior pointer)"
+                    f"live allocation on target worker {target_worker_id} (wrong worker, stale, or interior pointer)"
                 )
+
+    def _require_local_next_level_target(self, worker_id: int, *, api: str) -> None:
+        """Reject a local callable pinned to a remote NEXT_LEVEL worker.
+
+        A LOCAL_PYTHON / LOCAL_CHIP callable is installed only in the local
+        children's registries; a remote-L3 worker's manifest carries only its
+        dispatcher callables, so routing a local digest to a remote worker id
+        fails asynchronously with an unknown-hashid on the remote endpoint. The
+        C++ target check only rejects unregistered ids, so a registered remote
+        worker slips through — this guards that hole.
+        """
+        if worker_id in set(self._remote_worker_ids):
+            raise ValueError(
+                f"orch.{api}: worker {worker_id} is a remote NEXT_LEVEL worker; a local callable "
+                f"must target a local child (remote workers only run RemoteCallable dispatches)"
+            )
 
     def _clear_child_prov(self) -> None:
         """Drop the whole child-pointer provenance table (close-path hygiene)."""

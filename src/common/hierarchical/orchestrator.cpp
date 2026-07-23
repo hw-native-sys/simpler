@@ -18,14 +18,14 @@
 #include "worker_manager.h"
 
 void Orchestrator::init(
-    TensorMap *tensormap, Ring *allocator, Scope *scope, ReadyQueue *ready_next_level_queue,
-    ReadyQueue *ready_sub_queue, WorkerManager *manager, std::function<void()> ready_notify_cb
+    TensorMap *tensormap, Ring *allocator, Scope *scope, ReadyQueue *ready_sub_queue,
+    NextLevelReadyQueues *ready_next_level_queues, WorkerManager *manager, std::function<void()> ready_notify_cb
 ) {
     tensormap_ = tensormap;
     allocator_ = allocator;
     scope_ = scope;
-    ready_next_level_queue_ = ready_next_level_queue;
     ready_sub_queue_ = ready_sub_queue;
+    ready_next_level_queues_ = ready_next_level_queues;
     manager_ = manager;
     ready_notify_cb_ = std::move(ready_notify_cb);
     active_tasks_.store(0, std::memory_order_relaxed);
@@ -151,14 +151,13 @@ SubmitResult Orchestrator::submit_next_level(
     const CallableIdentity &callable, const TaskArgs &args, const CallConfig &config, int32_t worker_id,
     const std::vector<int32_t> &eligible_worker_ids, const RemoteTaskArgsSidecar &remote_sidecar
 ) {
-    std::vector<int32_t> affinities;
-    if (worker_id >= 0) affinities = {worker_id};
+    std::vector<int32_t> target_worker_ids{worker_id};
     std::vector<std::vector<int32_t>> worker_id_sets;
     if (!eligible_worker_ids.empty()) worker_id_sets = {eligible_worker_ids};
     std::vector<RemoteTaskArgsSidecar> sidecars;
     if (!remote_sidecar.tensors.empty() || !remote_sidecar.inline_payload.empty()) sidecars = {remote_sidecar};
     return submit_impl(
-        WorkerType::NEXT_LEVEL, callable, config, {args}, std::move(affinities), std::move(worker_id_sets),
+        WorkerType::NEXT_LEVEL, callable, config, {args}, std::move(target_worker_ids), std::move(worker_id_sets),
         std::move(sidecars)
     );
 }
@@ -187,12 +186,12 @@ SubmitResult Orchestrator::submit_sub_group(const CallableIdentity &callable, co
 
 SubmitResult Orchestrator::submit_impl(
     WorkerType worker_type, const CallableIdentity &callable, const CallConfig &config, std::vector<TaskArgs> args_list,
-    std::vector<int32_t> affinities, std::vector<std::vector<int32_t>> eligible_worker_ids,
+    std::vector<int32_t> target_worker_ids, std::vector<std::vector<int32_t>> eligible_worker_ids,
     std::vector<RemoteTaskArgsSidecar> remote_sidecars
 ) {
     if (args_list.empty()) throw std::invalid_argument("Orchestrator: args_list must not be empty");
     config.validate();
-    validate_worker_eligibility(worker_type, args_list.size(), affinities, eligible_worker_ids);
+    validate_worker_eligibility(worker_type, args_list.size(), target_worker_ids, eligible_worker_ids);
     validate_remote_sidecars(args_list, remote_sidecars, eligible_worker_ids);
 
     // Fail-fast: if a previously-dispatched task has already failed, abort
@@ -226,13 +225,11 @@ SubmitResult Orchestrator::submit_impl(
     s.worker_type = worker_type;
     s.callable = callable;
     s.config = config;
-    s.eligible_worker_ids = std::move(eligible_worker_ids);
-
     // --- Step 2: Walk tags → tensormap.lookup (deps) + tensormap.insert
     // (outputs). Must happen before we move args_list into the slot because
     // infer_deps reads tensor data pointers and tags from it.
     std::vector<TaskSlot> producers;
-    infer_deps(slot, args_list, affinities, remote_sidecars, producers, s.output_keys);
+    infer_deps(slot, args_list, target_worker_ids, remote_sidecars, producers, s.output_keys);
 
     // --- Step 3: Store TaskArgs directly (no chip-storage pre-build) ---
     // Dispatch builds a TaskArgsView on demand via `slot.args_view(i)`
@@ -248,7 +245,7 @@ SubmitResult Orchestrator::submit_impl(
         s.task_args_list = std::move(args_list);
         s.remote_sidecars = std::move(remote_sidecars);
     }
-    s.affinities = std::move(affinities);
+    s.target_worker_ids = std::move(target_worker_ids);
 
     // --- Step 5: Finalize fanin — lock each producer's fanout_mu, attach ---
     //
@@ -304,12 +301,10 @@ SubmitResult Orchestrator::submit_impl(
         return SubmitResult{slot};
     }
 
-    // --- Step 6: If no live fanins → READY ---
-    // Strict-4: push to the queue dedicated to this task's worker type so a
-    // saturated sub pool cannot stall next-level dispatch (and vice versa).
+    // --- Step 6: If no live fanins → READY and route by final placement ---
     if (live_fanins == 0) {
         s.state.store(TaskState::READY, std::memory_order_release);
-        ready_queue_for(worker_type)->push(slot);
+        enqueue_ready(slot);
         if (ready_notify_cb_) ready_notify_cb_();
     } else {
         s.state.store(TaskState::PENDING, std::memory_order_release);
@@ -318,14 +313,36 @@ SubmitResult Orchestrator::submit_impl(
     return SubmitResult{slot};
 }
 
+void Orchestrator::enqueue_ready(TaskSlot slot) {
+    TaskSlotState &s = slot_state(slot);
+    if (s.worker_type == WorkerType::NEXT_LEVEL) {
+        if (ready_next_level_queues_ == nullptr)
+            throw std::runtime_error("Orchestrator::enqueue_ready: NEXT_LEVEL queues are not initialized");
+        if (s.is_group()) {
+            ready_next_level_queues_->push_group(slot);
+        } else {
+            ready_next_level_queues_->push_single(s.target_worker_id(0), slot);
+        }
+        return;
+    }
+    ready_sub_queue_->push(slot);
+}
+
 void Orchestrator::validate_worker_eligibility(
-    WorkerType worker_type, size_t args_count, const std::vector<int32_t> &affinities,
+    WorkerType worker_type, size_t args_count, const std::vector<int32_t> &target_worker_ids,
     const std::vector<std::vector<int32_t>> &eligible_worker_ids
 ) const {
-    if (!affinities.empty() && affinities.size() != args_count) {
+    if (worker_type == WorkerType::SUB) {
+        if (!target_worker_ids.empty() || !eligible_worker_ids.empty()) {
+            throw std::invalid_argument("Orchestrator: SUB tasks do not accept worker-selection metadata");
+        }
+        return;
+    }
+
+    if (target_worker_ids.size() != args_count) {
         throw std::invalid_argument(
-            "Orchestrator: affinity length " + std::to_string(affinities.size()) + " does not match args length " +
-            std::to_string(args_count)
+            "Orchestrator: NEXT_LEVEL target count " + std::to_string(target_worker_ids.size()) +
+            " does not match args length " + std::to_string(args_count)
         );
     }
     if (!eligible_worker_ids.empty() && eligible_worker_ids.size() != args_count) {
@@ -333,6 +350,16 @@ void Orchestrator::validate_worker_eligibility(
             "Orchestrator: eligible worker-id set length " + std::to_string(eligible_worker_ids.size()) +
             " does not match args length " + std::to_string(args_count)
         );
+    }
+
+    std::unordered_set<int32_t> unique_targets;
+    for (int32_t worker_id : target_worker_ids) {
+        if (worker_id < 0) {
+            throw std::invalid_argument("Orchestrator: NEXT_LEVEL worker id must be non-negative");
+        }
+        if (!unique_targets.insert(worker_id).second) {
+            throw std::invalid_argument("Orchestrator: duplicate NEXT_LEVEL worker id " + std::to_string(worker_id));
+        }
     }
 
     const std::vector<int32_t> empty_eligible;
@@ -343,51 +370,33 @@ void Orchestrator::validate_worker_eligibility(
                 "Orchestrator: final eligible worker-id set is empty for member " + std::to_string(i)
             );
         }
-        if (manager_ != nullptr && !eligible_worker_ids.empty()) {
+        if (manager_ != nullptr) {
             for (int32_t worker_id : eligible) {
-                if (manager_->get_worker_by_id(worker_type, worker_id) == nullptr) {
+                if (manager_->get_worker_by_id(WorkerType::NEXT_LEVEL, worker_id) == nullptr) {
                     throw std::invalid_argument(
                         "Orchestrator: eligible worker-id " + std::to_string(worker_id) + " is not a registered worker"
                     );
                 }
             }
+            if (manager_->get_worker_by_id(WorkerType::NEXT_LEVEL, target_worker_ids[i]) == nullptr) {
+                throw std::invalid_argument(
+                    "Orchestrator: target worker " + std::to_string(target_worker_ids[i]) +
+                    " is not a registered worker"
+                );
+            }
         }
-        int32_t affinity = affinities.empty() ? -1 : affinities[i];
-        if (affinity < 0) continue;
 
-        if (manager_ != nullptr) {
-            auto *wt = worker_type == WorkerType::NEXT_LEVEL ? manager_->get_worker_by_id(worker_type, affinity) :
-                                                               manager_->get_worker_by_index(worker_type, affinity);
-            if (wt == nullptr) {
-                throw std::invalid_argument(
-                    "Orchestrator: worker affinity " + std::to_string(affinity) + " is not a registered worker"
-                );
-            }
-            int32_t worker_id = wt->worker_id();
-            bool allowed = eligible_worker_ids.empty();
-            for (int32_t id : eligible) {
-                if (id == worker_id) {
-                    allowed = true;
-                    break;
-                }
-            }
-            if (!allowed) {
-                throw std::invalid_argument(
-                    "Orchestrator: worker affinity " + std::to_string(affinity) +
-                    " is not in the slot's final eligible worker-id set"
-                );
-            }
-        } else if (affinity >= 0 && !eligible_worker_ids.empty()) {
+        if (!eligible_worker_ids.empty()) {
             bool allowed = false;
             for (int32_t id : eligible) {
-                if (id == affinity) {
+                if (id == target_worker_ids[i]) {
                     allowed = true;
                     break;
                 }
             }
             if (!allowed) {
                 throw std::invalid_argument(
-                    "Orchestrator: worker affinity " + std::to_string(affinity) +
+                    "Orchestrator: target worker " + std::to_string(target_worker_ids[i]) +
                     " is not in the slot's final eligible worker-id set"
                 );
             }
@@ -528,7 +537,7 @@ AllocResult Orchestrator::reserve_outputs_and_slot(
 // =============================================================================
 
 void Orchestrator::infer_deps(
-    TaskSlot slot, const std::vector<TaskArgs> &args_list, const std::vector<int32_t> &affinities,
+    TaskSlot slot, const std::vector<TaskArgs> &args_list, const std::vector<int32_t> &target_worker_ids,
     const std::vector<RemoteTaskArgsSidecar> &remote_sidecars, std::vector<TaskSlot> &producers,
     std::vector<TensorKey> &output_keys
 ) {
@@ -562,7 +571,7 @@ void Orchestrator::infer_deps(
     //                      reserve_outputs_and_slot before this step)
     //   NO_DEP           → skip
     for (size_t g = 0; g < args_list.size(); ++g) {
-        int32_t worker_id = (g < affinities.size()) ? affinities[g] : -1;
+        int32_t worker_id = (g < target_worker_ids.size()) ? target_worker_ids[g] : -1;
         const TaskArgs &a = args_list[g];
         for (int32_t i = 0; i < a.tensor_count(); ++i) {
             const Tensor &t = a.tensor(i);

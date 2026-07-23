@@ -133,7 +133,7 @@ class TestProvenanceTable:
             with pytest.raises(ValueError, match="not a live malloc base"):
                 w._child_prov_require_malloc_base(0, 0x1000, api="free")
             with pytest.raises(ValueError, match="not a live allocation on target worker 0"):
-                w._child_prov_check_dispatch([(0x1000, 0)], {0}, api="submit_next_level")
+                w._child_prov_check_dispatch([(0x1000, 0)], 0, api="submit_next_level")
 
     def test_drop_last_role_deletes_entry_no_empty_state(self):
         # Dropping the last role deletes the key outright — it never leaves a
@@ -167,37 +167,17 @@ class TestProvenanceTable:
 
 
 class TestDispatchResolution:
-    def test_candidates_pinned_worker(self):
-        o = Orchestrator(MagicMock(), _l3())
-        assert o._child_dispatch_candidates(2, [0, 1, 2]) == {2}
-
-    def test_candidates_wildcard_uses_eligible_set(self):
-        o = Orchestrator(MagicMock(), _l3())
-        assert o._child_dispatch_candidates(-1, [0, 1]) == {0, 1}
-
-    def test_candidates_wildcard_unconstrained_uses_full_pool(self):
-        w = _l3()
-        w._chip_shms = [object(), object(), object()]  # 3 chips
-        o = Orchestrator(MagicMock(), w)
-        assert o._child_dispatch_candidates(-1, []) == {0, 1, 2}
-
     def test_unique_target_and_live_passes(self):
         w = _l3()
         _record_malloc(w, 0, 0x1000)
         with w._child_prov_lock:
-            w._child_prov_check_dispatch([(0x1000, 0)], {0}, api="submit_next_level")
-
-    def test_ambiguous_target_rejected(self):
-        w = _l3()
-        _record_malloc(w, 0, 0x1000)
-        with w._child_prov_lock, pytest.raises(ValueError, match="cannot resolve a unique"):
-            w._child_prov_check_dispatch([(0x1000, 0)], {0, 1}, api="submit_next_level")
+            w._child_prov_check_dispatch([(0x1000, 0)], 0, api="submit_next_level")
 
     def test_unique_target_but_wrong_worker_rejected(self):
         w = _l3()
         _record_malloc(w, 0, 0x1000)  # lives on worker 0
         with w._child_prov_lock, pytest.raises(ValueError, match="not a live allocation on target worker 1"):
-            w._child_prov_check_dispatch([(0x1000, 0)], {1}, api="submit_next_level")
+            w._child_prov_check_dispatch([(0x1000, 0)], 1, api="submit_next_level")
 
 
 # ----------------------------------------------------------------------------
@@ -296,29 +276,6 @@ class TestSubmitDispatchGuard:
             o.submit_next_level(object(), _child_args(0x1000), None, worker=1)
         fake.submit_next_level.assert_not_called()
 
-    def test_child_arg_wildcard_ambiguous_rejected(self, _fake_handle):
-        _fake_handle["eligible"] = (0, 1)  # two eligible targets
-        w = _l3()
-        _record_malloc(w, 0, 0x1000)
-        fake = MagicMock()
-        o = Orchestrator(fake, w)
-        with pytest.raises(ValueError, match="cannot resolve a unique"):
-            o.submit_next_level(object(), _child_args(0x1000), None, worker=-1)
-        fake.submit_next_level.assert_not_called()
-
-    def test_child_arg_wildcard_narrowed_passes_resolved_affinity_to_cpp(self, _fake_handle):
-        # worker=-1 narrowed to a unique owner must be passed to C++ as that
-        # worker (not the raw -1), so the child TensorKey is keyed by its owner
-        # and deps against an explicit-worker submit of the same buffer are seen.
-        _fake_handle["eligible"] = (0,)
-        w = _l3()
-        _record_malloc(w, 0, 0x1000)
-        fake = MagicMock()
-        o = Orchestrator(fake, w)
-        o.submit_next_level(object(), _child_args(0x1000), None, worker=-1)
-        fake.submit_next_level.assert_called_once()
-        assert fake.submit_next_level.call_args.args[5] == 0  # cpp_worker_id, not -1
-
     def test_host_only_args_are_not_guarded(self, _fake_handle):
         # A submit with no child_memory tensor never touches provenance.
         w = _l3()
@@ -326,7 +283,7 @@ class TestSubmitDispatchGuard:
         o = Orchestrator(fake, w)
         args = TaskArgs()
         args.add_tensor(Tensor.make(0, (16,), DataType.FLOAT32, child_memory=False), TensorArgType.INPUT)
-        o.submit_next_level(object(), args, None, worker=-1)
+        o.submit_next_level(object(), args, None, worker=0)
         fake.submit_next_level.assert_called_once()
 
     def test_group_member_child_arg_wrong_worker_rejected(self, _fake_handle):
@@ -349,20 +306,6 @@ class TestSubmitDispatchGuard:
         o.submit_next_level_group(object(), [TaskArgs(), _child_args(0x1000)], None, workers=[0, 1])
         fake.submit_next_level_group.assert_called_once()
 
-    def test_group_child_member_wildcard_passes_resolved_affinity_to_cpp(self, _fake_handle):
-        # A single-member group (schedulable) whose child member's eligibility
-        # narrows to a unique owner materialises a full per-member affinity
-        # pinning it to that owner.
-        _fake_handle["eligible"] = (1,)
-        w = _l3()
-        w._chip_shms = [object(), object()]
-        _record_malloc(w, 1, 0x1000)
-        fake = MagicMock()
-        o = Orchestrator(fake, w)
-        o.submit_next_level_group(object(), [_child_args(0x1000)], None, workers=None)
-        fake.submit_next_level_group.assert_called_once()
-        assert fake.submit_next_level_group.call_args.args[5] == [1]  # cpp_worker_ids
-
     def test_group_child_member_rejects_mismatched_workers_length(self, _fake_handle):
         # A non-empty workers list must be one-per-member; a short list must NOT
         # be silently padded (that would bypass the C++ length check).
@@ -371,23 +314,33 @@ class TestSubmitDispatchGuard:
         _record_malloc(w, 0, 0x1000)
         fake = MagicMock()
         o = Orchestrator(fake, w)
-        with pytest.raises(ValueError, match="workers length 1 != 2 args"):
+        with pytest.raises(ValueError, match="workers length must match"):
             o.submit_next_level_group(object(), [_child_args(0x1000), TaskArgs()], None, workers=[0])
         fake.submit_next_level_group.assert_not_called()
 
-    def test_group_two_child_members_same_owner_rejected(self, _fake_handle):
-        # Two child members owned by the same worker resolve to the same
-        # affinity; a group must dispatch to distinct workers, so reject rather
-        # than silently serialize them on one WorkerThread.
-        _fake_handle["eligible"] = (0,)
+    def test_local_callable_rejects_remote_worker_target(self, _fake_handle):
+        # A LOCAL_CHIP callable pinned to a remote worker id would enqueue on the
+        # remote endpoint, whose manifest lacks the local digest -> async unknown
+        # hashid. The Python guard rejects it up front; a local chip id passes.
         w = _l3()
-        w._chip_shms = [object(), object()]
-        _record_malloc(w, 0, 0x1000)
-        _record_malloc(w, 0, 0x2000)
+        w._chip_shms = [object()]
+        w._remote_worker_ids = [7]
         fake = MagicMock()
         o = Orchestrator(fake, w)
-        with pytest.raises(ValueError, match="distinct workers"):
-            o.submit_next_level_group(object(), [_child_args(0x1000), _child_args(0x2000)], None, workers=None)
+        with pytest.raises(ValueError, match="remote NEXT_LEVEL worker"):
+            o.submit_next_level(object(), TaskArgs(), None, worker=7)
+        fake.submit_next_level.assert_not_called()
+        o.submit_next_level(object(), TaskArgs(), None, worker=0)
+        fake.submit_next_level.assert_called_once()
+
+    def test_local_group_rejects_remote_worker_target(self, _fake_handle):
+        w = _l3()
+        w._chip_shms = [object()]
+        w._remote_worker_ids = [7]
+        fake = MagicMock()
+        o = Orchestrator(fake, w)
+        with pytest.raises(ValueError, match="remote NEXT_LEVEL worker"):
+            o.submit_next_level_group(object(), [TaskArgs(), TaskArgs()], None, workers=[0, 7])
         fake.submit_next_level_group.assert_not_called()
 
     def test_domain_pointer_dispatch_to_owner_then_rejected_after_release(self, _fake_handle):
@@ -594,7 +547,7 @@ class TestDomainReleaseOrdering:
         def _fake_dispatch(**kwargs):
             try:
                 with w._child_prov_lock:
-                    w._child_prov_check_dispatch([(0x5000, 0)], {0}, api="submit_next_level")
+                    w._child_prov_check_dispatch([(0x5000, 0)], 0, api="submit_next_level")
                 outcome["dispatch"] = "allowed"
             except ValueError:
                 outcome["dispatch"] = "rejected"

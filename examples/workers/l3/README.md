@@ -3,8 +3,8 @@
 **L3 = HOST**: one host machine that drives multiple L2 chips plus M
 SubWorkers (plain Python callables), coordinated by an Orchestrator running in
 the host process. This is where you first see the *DAG* model — you submit a
-task per chip, each task carries a dependency graph via `orchestrator` APIs,
-and the runtime schedules them onto available devices.
+task per chip — each pinned to its target chip worker id — and each task
+carries a dependency graph via `orchestrator` APIs.
 
 See [`docs/hierarchical_level_runtime.md`](../../../docs/hierarchical_level_runtime.md)
 for the full L0–L6 diagram and [`docs/task-flow.md`](../../../docs/task-flow.md)
@@ -36,7 +36,7 @@ worker.init()                 # forks chip child processes + sub children,
 
 def my_orch(orch, args, cfg):
     # orch is the Orchestrator. Submit one task per chip + any sub work.
-    # orch.submit_next_level(...) schedules a ChipCallable onto a free chip.
+    # orch.submit_next_level(..., worker=chip_id) targets one chip.
     # orch.submit_sub(postprocess_handle, sub_args) schedules a Python callable.
     ...
 

@@ -50,11 +50,10 @@ public:
     void stop();
 
     // Scheduler API
-    WorkerThread *get_worker_by_index(WorkerType type, int worker_index) const;
     WorkerThread *get_worker_by_id(WorkerType type, int32_t worker_id) const;
-    WorkerThread *pick_idle(WorkerType type,
-                            const std::vector<WorkerThread *> &exclude,
-                            const std::vector<int32_t> &eligible_worker_ids) const;
+    std::vector<int32_t> next_level_worker_ids() const;
+    WorkerThread *pick_idle_sub_excluding(
+        const std::vector<WorkerThread *> &exclude) const;
 
 private:
     struct LocalNextLevelEntry {
@@ -77,12 +76,15 @@ the public worker id from the local worker vector index.
 
 - **Pool ownership**: two `std::vector` pools, sized at init from `add_*`
   calls
-- **Idle selection & eligibility**: `pick_idle(type, exclude, eligible_worker_ids)`
-  finds an idle WorkerThread whose queue is empty, skipping any in `exclude`
-  and (when `eligible_worker_ids` is non-empty) restricted to that set; returns
-  nullptr if none available. Remote-aware NEXT_LEVEL slots carry final eligible
-  worker ids, so a task cannot land on a worker that lacks the callable or
-  tensor sidecars.
+- **Directed NEXT_LEVEL lookup**: `get_worker_by_id` resolves the exact stable
+  target selected by the user; the Scheduler never asks the manager to choose
+  another NEXT_LEVEL worker
+- **SUB-only idle selection**: `pick_idle_sub_excluding` chooses an idle SUB
+  worker not already used by the same SUB group
+
+Callable and remote-buffer eligibility is validated against the exact target
+during Orchestrator submission. It is not scheduling metadata and is not
+stored on the task slot.
 
 ---
 
@@ -131,7 +133,8 @@ children.
 `slot.callable` / `slot.task_args` / `slot.config` on each dispatch via
 `ring->slot_state(slot_id)`. For a group slot with `group_size() == N`,
 the Scheduler pushes N `WorkerDispatch` entries (one per member) onto N
-idle threads; each thread's `group_index` selects which
+exact target threads for NEXT_LEVEL, or N freely selected SUB threads. Each
+thread's `group_index` selects which
 `task_args_list[i]` view to hand to the worker. There is no
 `WorkerPayload` — the per-dispatch carrier is just the slot id plus the
 group sub-index.
@@ -240,8 +243,8 @@ forked worker kind still follows the existing pattern:
 2. Write a child-process loop that polls the mailbox, decodes the args blob,
    and invokes that entry point.
 3. Register the mailbox via `manager.add_next_level_at(worker_id, mailbox)`
-   for explicit NEXT_LEVEL worker ids, `manager.add_next_level(mailbox)` for
-   the legacy local default, or `manager.add_sub(mailbox)`.
+   for an explicit NEXT_LEVEL worker id, `manager.add_next_level(mailbox)` to
+   allocate the next stable local id, or `manager.add_sub(mailbox)`.
 
 Remote L3 is different. It cannot reuse the mailbox wire format because the
 remote side does not share virtual addresses, fork-time COW registries, POSIX
@@ -313,8 +316,9 @@ and shm-safe containers for no benefit. See
 
 Alternative: N children share one dispatch queue. Rejected because:
 
-- `WorkerThread` queue is the natural unit of backpressure — if child `i` is
-  slow, its queue fills up and scheduler falls back to another
+- `WorkerThread` is the natural execution unit. Directed NEXT_LEVEL work waits
+  in child `i`'s ready FIFO if that child is busy; SUB work may use another
+  idle SUB child
 - Simpler mental model: one child = one thread that drives it
 - Zero contention on queue access (only one producer, one consumer per queue)
 

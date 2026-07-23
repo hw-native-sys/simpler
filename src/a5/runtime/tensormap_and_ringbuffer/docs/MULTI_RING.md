@@ -266,7 +266,7 @@ cfg = CallConfig()
 cfg.runtime_env.ring_task_window = 128   # power of 2, >= 4
 cfg.runtime_env.ring_heap = 262144       # bytes/ring, >= 1024
 cfg.runtime_env.ring_dep_pool = 256      # 4 .. INT32_MAX
-orchestrator.submit_next_level(handle, args, cfg)
+orchestrator.submit_next_level(handle, args, cfg, worker=0)
 ```
 
 Assign a four-entry list to tune the scope-depth rings independently. The list
@@ -284,7 +284,7 @@ cfg.runtime_env.ring_heap = [
     512 * 1024 * 1024,
 ]
 cfg.runtime_env.ring_dep_pool = [4096, 8192, 16384, 32768]
-orchestrator.submit_next_level(handle, args, cfg)
+orchestrator.submit_next_level(handle, args, cfg, worker=0)
 ```
 
 Scene tests set the same keys under a nested `runtime_env` block in the

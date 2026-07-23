@@ -43,7 +43,7 @@ def run_dag(orch, callables, task_args, config):
     args1 = _chip_args(task_args.a1, task_args.b1, task_args.f1)
     callables.keep(args0, args1)  # prevent GC before drain
 
-    orch.submit_next_level_group(callables.vector_kernel, [args0, args1], config)
+    orch.submit_next_level_group(callables.vector_kernel, [args0, args1], config, workers=[0, 1])
 
     # SubTask depends on both group outputs (f0, f1) — tag both as INPUT.
     sub_args = TaskArgs()

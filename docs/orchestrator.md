@@ -34,13 +34,13 @@ public:
     SubmitResult submit_next_level(const CallableIdentity &callable,
                                     const TaskArgs &args,
                                     const CallConfig &config,
-                                    int32_t worker = -1,
+                                    int32_t worker,
                                     const std::vector<int32_t> &eligible_worker_ids = {},
                                     const RemoteTaskArgsSidecar &remote_sidecar = {});
     SubmitResult submit_next_level_group(const CallableIdentity &callable,
                                           const std::vector<TaskArgs> &args_list,
                                           const CallConfig &config,
-                                          const std::vector<int32_t> &workers = {},
+                                          const std::vector<int32_t> &workers,
                                           const std::vector<std::vector<int32_t>> &eligible_worker_ids = {},
                                           const std::vector<RemoteTaskArgsSidecar> &remote_sidecars = {});
     SubmitResult submit_sub(const CallableIdentity &callable,
@@ -75,11 +75,12 @@ Remote L3 submit adds two hidden pieces of metadata: final eligible worker-id
 sets and optional `RemoteTaskArgsSidecar` entries aligned by tensor index.
 Python `RemoteCallable` handles supply callable eligibility, and
 `TaskArgs.add_tensor(RemoteTensorRef(...), tag)` supplies tensor sidecars. The
-Orchestrator validates affinity, worker existence, local-vs-remote
+Orchestrator validates exact placement, worker existence, local-vs-remote
 compatibility, remote handle access rights for the tensor tag, bare host
 pointers, and remote null OUTPUT tensors before committing the slot.
-For NEXT_LEVEL tasks, `worker`/`workers` are stable worker ids rather than
-C++ worker-thread vector indices.
+For NEXT_LEVEL tasks, `worker`/`workers` are required stable worker ids rather
+than C++ worker-thread vector indices. SUB submit APIs expose no worker
+selection and use the shared SUB ready queue.
 
 ---
 
@@ -92,7 +93,8 @@ how the slot is set up.
 ```cpp
 SubmitResult Orchestrator::submit_next_level(const CallableIdentity &callable,
                                               TaskArgs args,
-                                              const CallConfig &config) {
+                                              const CallConfig &config,
+                                              int32_t worker) {
     // 1. Alloc slot (blocks on back-pressure if ring full)
     TaskSlot sid = ring_.alloc();
     TaskSlotState &s = slots_[sid];
@@ -103,6 +105,7 @@ SubmitResult Orchestrator::submit_next_level(const CallableIdentity &callable,
     s.callable    = callable;
     s.task_args   = std::move(args);
     s.config      = config;
+    s.target_worker_ids = {worker};
 
     // 3. Walk task_args tags, derive dependencies
     //    (dedup producers: same producer may appear on multiple input tensors)
@@ -130,10 +133,16 @@ SubmitResult Orchestrator::submit_next_level(const CallableIdentity &callable,
     // 5. Register with scope (holds slot open until scope_end releases ref)
     scope_.register_task(sid);          // increments s.fanout_total by 1
 
-    // 6. Push fanout edges onto scheduler's wiring queue
-    //    (Scheduler wires producer→consumer asynchronously; avoids blocking
-    //    the Orch thread on fanout_mu)
-    scheduler_.enqueue_wiring(sid, std::move(producers));
+    // 6. Attach fanout edges under each producer's mutex. Producers already
+    //    completed do not count as live fanins; failed producers poison this
+    //    slot. Route an immediately READY slot through enqueue_ready().
+    attach_fanout_and_count_live_producers(sid, producers);
+    if (s.fanin_count == 0) {
+        s.state = TaskState::READY;
+        enqueue_ready(sid);
+    } else {
+        s.state = TaskState::PENDING;
+    }
 
     // 7. Return handle
     return {sid};
@@ -172,16 +181,21 @@ remote buffer identity and logical offset.
 
 **Step 4 — fanin count**: The number of live producers. Decremented by
 `fanin_released++` each time a producer completes; when `fanin_released ==
-fanin_count`, the slot is ready.
+fanin_count`, the slot is ready. A ready NEXT_LEVEL single task is routed to
+the FIFO for its required stable worker id. The same routing function is used
+for immediately-ready submissions and tasks released by Scheduler dependency
+processing. A ready NEXT_LEVEL group is routed to the dedicated group FIFO;
+SUB tasks remain on their shared queue.
 
 **Step 5 — scope ref**: Each slot starts with one "scope reference" in its
 fanout_total. Without this, a task with no downstream consumer would never be
 reclaimable. See [§6 Scope](#6-scope).
 
-**Step 6 — wiring queue**: Fanout edges (producer knows its consumers) are
-wired **asynchronously** by the Scheduler thread. This decouples submit from
-`fanout_mu` contention. See [scheduler.md](scheduler.md) §2 for the wiring
-phase.
+**Step 6 — fanout attachment and READY routing**: Submission synchronously
+locks each producer's `fanout_mu`, attaches the consumer, and counts only live
+producers. An immediately READY task is routed to its exact NEXT_LEVEL worker
+FIFO, the NEXT_LEVEL group FIFO, or the shared SUB FIFO. See
+[scheduler.md](scheduler.md) §1.
 
 ---
 
@@ -192,49 +206,29 @@ Each worker gets its own `TaskArgs`; the node only reaches COMPLETED when all
 N finish.
 
 ```cpp
-SubmitResult Orchestrator::submit_next_level_group(const CallableIdentity &callable,
-                                                    std::vector<TaskArgs> args_list,
-                                                    const CallConfig &config) {
-    TaskSlot sid = ring_.alloc();
-    TaskSlotState &s = slots_[sid];
-    s.reset();
-    s.worker_type     = WorkerType::NEXT_LEVEL;
-    s.callable        = callable;
-    s.config          = config;
-    s.group_size      = args_list.size();
-    s.sub_complete_count = 0;
-    s.task_args_list  = std::move(args_list);
-
-    // Tag walk unions all entries in args_list (any input in any member → fanin)
-    // Dedup both producers and outputs across all args_list entries.
-    std::vector<TaskSlot> producers;
-    std::unordered_set<TaskSlot> producers_seen;
-    std::unordered_set<uint64_t> outputs_seen;
-    for (auto &a : s.task_args_list) {
-        for (int i = 0; i < a.tensor_count(); i++) {
-            TensorArgType tag = a.tag(i);
-            uint64_t ptr      = a.tensor(i).data;
-            if (tag == INPUT || tag == INOUT)
-                if (auto prod = tensormap_.lookup(ptr); prod != INVALID)
-                    if (producers_seen.insert(prod).second)
-                        producers.push_back(prod);
-            if (tag == OUTPUT || tag == INOUT || tag == OUTPUT_EXISTING)
-                if (outputs_seen.insert(ptr).second)
-                    tensormap_.insert(ptr, sid);
-        }
-    }
-
-    s.fanin_count    = static_cast<int32_t>(producers.size());
-    s.fanin_released = 0;
-    scope_.register_task(sid);
-    scheduler_.enqueue_wiring(sid, std::move(producers));
-    return {sid};
+SubmitResult Orchestrator::submit_next_level_group(
+    const CallableIdentity &callable, const std::vector<TaskArgs> &args_list,
+    const CallConfig &config, const std::vector<int32_t> &worker_ids,
+    const std::vector<std::vector<int32_t>> &eligible_worker_ids,
+    const std::vector<RemoteTaskArgsSidecar> &remote_sidecars
+) {
+    return submit_impl(
+        WorkerType::NEXT_LEVEL, callable, config, args_list, worker_ids,
+        eligible_worker_ids, remote_sidecars
+    );
 }
 ```
 
-At dispatch time the Scheduler reserves `group_size` idle WorkerThreads, and
-each WorkerThread runs `worker->run` with its own `task_args_list[i]`.
-Completion is gated on `sub_complete_count.fetch_add(1) + 1 == group_size`.
+`submit_impl` validates that `worker_ids` contains one unique, eligible target
+per group member before it performs shared dependency inference and READY
+routing.
+
+At dispatch time the Scheduler checks the group FIFO head and resolves every
+entry in `workers` to that exact stable worker ID. It dispatches only if the
+entire target set is idle; a blocked group reserves no partial worker set and
+does not cause a scan past the FIFO head. Each WorkerThread runs `worker->run`
+with its own `task_args_list[i]`. Completion remains aggregated at the group
+slot, so downstream consumers are released once after every member is terminal.
 
 ---
 
@@ -443,11 +437,11 @@ Flow:
 ```python
 def my_orch(orch, args, cfg):
     with orch.scope():                             # ring 1
-        orch.submit_next_level(chip_a, a_args, cfg)
-        orch.submit_next_level(chip_b, b_args, cfg)
+        orch.submit_next_level(chip_a, a_args, cfg, worker=0)
+        orch.submit_next_level(chip_b, b_args, cfg, worker=1)
     # Inner tasks are now eligible for reclamation on ring 1,
     # without waiting for any outer-scope task.
-    orch.submit_next_level(chip_c, c_args, cfg)    # ring 0 (outer)
+    orch.submit_next_level(chip_c, c_args, cfg, worker=0)  # ring 0
 ```
 
 `with orch.scope():` is the recommended form. Raw `orch.scope_begin()` /
@@ -722,8 +716,8 @@ instead of stalling forever. Default timeout: 10 s.
 
 - [hierarchical_level_runtime.md](hierarchical_level_runtime.md) — how
   Orchestrator fits alongside Scheduler and Worker
-- [scheduler.md](scheduler.md) — what happens to slots after they're pushed
-  onto the wiring queue
+- [scheduler.md](scheduler.md) — READY dispatch and completion-time dependency
+  release
 - [task-flow.md](task-flow.md) — the data (Callable / TaskArgs / CallConfig)
   being moved by `submit_*`
 - [comm-domain.md](comm-domain.md) — `orch.allocate_domain` dynamic

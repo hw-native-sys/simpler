@@ -18,7 +18,7 @@ and passes the handle to the user's orch function::
         a = TaskArgs()
         a.add_tensor(make_tensor_arg(input_tensor),  TensorArgType.INPUT)
         a.add_tensor(make_tensor_arg(output_tensor), TensorArgType.OUTPUT)
-        orch.submit_next_level(chip_handle, a, cfg)  # handle from Worker.register(chip_callable)
+        orch.submit_next_level(chip_handle, a, cfg, worker=0)
 
         sub_args = TaskArgs()
         sub_args.add_tensor(make_tensor_arg(output_tensor), TensorArgType.INPUT)
@@ -33,6 +33,7 @@ directly.
 from __future__ import annotations
 
 import contextlib
+import operator
 from collections.abc import Iterator, Sequence
 from typing import Any
 
@@ -86,6 +87,19 @@ def _require_handle(
             f"for {callable_or_handle.hashid}"
         )
     return callable_or_handle.digest, callable_or_handle.kind, callable_or_handle.target_namespace, ()
+
+
+def _require_next_level_worker_id(value: Any, *, argument: str) -> int:
+    """Return an exact integer worker ID without accepting coercible values."""
+    if isinstance(value, bool):
+        raise TypeError(f"{argument} must be an integer NEXT_LEVEL worker id")
+    try:
+        worker_id = operator.index(value)
+    except TypeError as exc:
+        raise TypeError(f"{argument} must be an integer NEXT_LEVEL worker id") from exc
+    if worker_id < 0:
+        raise ValueError(f"{argument} must be a non-negative NEXT_LEVEL worker id")
+    return worker_id
 
 
 def _split_next_level_args(args: TaskArgs) -> tuple[TaskArgs, _RemoteTaskArgsSidecar | None]:
@@ -154,17 +168,15 @@ class Orchestrator:
     # User-facing submit API
     # ------------------------------------------------------------------
 
-    def submit_next_level(
-        self, callable_handle: Any, args: TaskArgs, config: CallConfig | None = None, *, worker: int = -1
-    ):
+    def submit_next_level(self, callable_handle: Any, args: TaskArgs, config: CallConfig | None = None, *, worker: int):
         """Submit a NEXT_LEVEL task by registered callable handle.
 
         ``callable_handle`` must be returned by ``Worker.register``. Tags inside ``args`` drive deps.
-        ``worker``: stable NEXT_LEVEL worker id for affinity
-        (-1 = unconstrained). For L3 chip dispatch, worker ids are the
-        existing chip worker ids.
+        ``worker`` is the exact stable NEXT_LEVEL worker id that runs the
+        task. For L3 chip dispatch, these are the existing chip worker ids.
         """
         cfg = config if config is not None else CallConfig()
+        cpp_worker_id = _require_next_level_worker_id(worker, argument="worker")
         expected_namespace = (
             None
             if isinstance(callable_handle, CallableHandle)
@@ -177,6 +189,8 @@ class Orchestrator:
             worker=self._worker,
             expected_namespace=expected_namespace,
         )
+        if target_namespace != "REMOTE_TASK_DISPATCHER" and self._worker is not None:
+            self._worker._require_local_next_level_target(cpp_worker_id, api="submit_next_level")
         c_args, explicit_remote_sidecar = _split_next_level_args(args)
         if target_namespace == "REMOTE_TASK_DISPATCHER":
             remote_sidecar = (
@@ -193,7 +207,6 @@ class Orchestrator:
         if target_namespace == "LOCAL_CHIP" and self._worker is not None:
             self._worker._stage_host_buffers_for_chip_submit(c_args)
         final_worker_ids = _remote_data_eligible_worker_ids(remote_sidecar, eligible_worker_ids)
-        cpp_worker_id = int(worker)
         worker = self._worker
         # Do the (fallible) kind4 provenance analysis BEFORE capturing remote slot
         # refs, so an exception here can never leave captured refs neither
@@ -201,23 +214,13 @@ class Orchestrator:
         # is the last step before the rollback try.
         child_ptrs = worker._child_ptrs_in_args(c_args) if worker is not None else []
         prov_guard: Any = contextlib.nullcontext()
-        candidates: set[int] = set()
         if child_ptrs and worker is not None:
-            candidates = self._child_dispatch_candidates(cpp_worker_id, final_worker_ids)
             prov_guard = worker._child_prov_lock
         captured_refs = worker._capture_remote_sidecar_refs(remote_sidecar) if worker is not None else []
         try:
             with prov_guard:
                 if child_ptrs and worker is not None:
-                    worker._child_prov_check_dispatch(child_ptrs, candidates, api="submit_next_level")
-                    # The child_memory arg resolved to a unique owner; pass that
-                    # worker as the effective affinity so C++ keys the child
-                    # TensorKey by its owner (worker_id), not the raw -1.
-                    # Otherwise the same buffer submitted once as -1 and once as W
-                    # yields two keys (ptr,-1) / (ptr,W) and its dependency is
-                    # missed. The unique target is exactly what the scheduler
-                    # would have picked, so pinning it changes no scheduling.
-                    cpp_worker_id = next(iter(candidates))
+                    worker._child_prov_check_dispatch(child_ptrs, cpp_worker_id, api="submit_next_level")
                 self._o.submit_next_level(
                     digest, kind, target_namespace, c_args, cfg, cpp_worker_id, final_worker_ids, remote_sidecar
                 )
@@ -228,38 +231,25 @@ class Orchestrator:
         if self._worker is not None:
             self._worker._adopt_remote_slot_refs(captured_refs)
 
-    def _child_dispatch_candidates(self, cpp_worker_id: int, eligible_ids: Any) -> set[int]:
-        """Resolve the set of eligible target workers for a kind4 dispatch.
-
-        A pinned ``worker`` is the sole candidate; an unpinned ``-1`` falls back
-        to the callable's eligible set, or the full next-level pool when the
-        callable is unconstrained. ``_child_prov_check_dispatch`` rejects any
-        result that is not a single unique target.
-        """
-        if cpp_worker_id >= 0:
-            return {cpp_worker_id}
-        if eligible_ids:
-            return {int(w) for w in eligible_ids}
-        if self._worker is None:
-            return set()
-        return set(self._worker._next_level_target_ids())
-
     def submit_next_level_group(  # noqa: PLR0912 -- linear per-member sidecar + eligibility + kind4-provenance passes, one branch each
         self,
         callable_handle: Any,
         args_list: list,
         config: CallConfig | None = None,
         *,
-        workers: list | None = None,
+        workers: list,
     ):
         """Submit a group of NEXT_LEVEL tasks (N TaskArgs → N worker selections, 1 DAG node).
 
-        ``workers``: per-args stable NEXT_LEVEL worker ids. For L3 chip
-        dispatch, worker ids are the existing chip worker ids.
-        None/empty = all unconstrained.
+        ``workers`` contains the exact stable NEXT_LEVEL worker id for each
+        member. For L3 chip dispatch, these are the existing chip worker ids.
         """
         cfg = config if config is not None else CallConfig()
-        worker_ids = [int(x) for x in workers] if workers else []
+        worker_ids = [_require_next_level_worker_id(value, argument="workers entries") for value in workers]
+        if len(worker_ids) != len(args_list):
+            raise ValueError("workers length must match args_list length")
+        if len(set(worker_ids)) != len(worker_ids):
+            raise ValueError("workers must not contain duplicate NEXT_LEVEL worker ids")
         expected_namespace = (
             None
             if isinstance(callable_handle, CallableHandle)
@@ -272,6 +262,9 @@ class Orchestrator:
             worker=self._worker,
             expected_namespace=expected_namespace,
         )
+        if target_namespace != "REMOTE_TASK_DISPATCHER" and self._worker is not None:
+            for worker_id in worker_ids:
+                self._worker._require_local_next_level_target(worker_id, api="submit_next_level_group")
         c_args_list = []
         explicit_remote_sidecars = []
         has_explicit_remote_sidecar = False
@@ -307,21 +300,18 @@ class Orchestrator:
             if eligible_worker_ids
             else []
         )
-        cpp_worker_ids = worker_ids
         # Per-member kind4 dispatch guard: each member's child_memory pointers
-        # must resolve to that member's unique eligible target and be live there.
+        # must be live on that member's exact submitted target.
         # Run this (fallible) analysis BEFORE capturing remote slot refs, so an
         # exception here can never strand captured refs outside the rollback try.
         worker = self._worker
-        member_checks: list[tuple[int, list[tuple[int, int]], set[int]]] = []
+        member_checks: list[tuple[list[tuple[int, int]], int]] = []
         if worker is not None:
             for g, c_args in enumerate(c_args_list):
                 child_ptrs = worker._child_ptrs_in_args(c_args)
                 if not child_ptrs:
                     continue
-                worker_pin = cpp_worker_ids[g] if g < len(cpp_worker_ids) else -1
-                eligible_g = worker_id_sets[g] if g < len(worker_id_sets) else []
-                member_checks.append((g, child_ptrs, self._child_dispatch_candidates(int(worker_pin), eligible_g)))
+                member_checks.append((child_ptrs, worker_ids[g]))
         prov_guard: Any = (
             worker._child_prov_lock if (worker is not None and member_checks) else contextlib.nullcontext()
         )
@@ -331,43 +321,11 @@ class Orchestrator:
                 captured_refs.extend(self._worker._capture_remote_sidecar_refs(sidecar))
         try:
             with prov_guard:
-                if member_checks:
-                    # Materialise a full per-member affinity so each child member's
-                    # resolved owner is the effective affinity C++ keys its child
-                    # TensorKey by (see the single-submit note); non-child members
-                    # keep their original affinity / -1. Only an empty/None
-                    # ``workers`` is padded — a non-empty list must already be one
-                    # per member (C++ enforces this), so padding a short one would
-                    # silently bypass that length check.
-                    if cpp_worker_ids:
-                        if len(cpp_worker_ids) != len(c_args_list):
-                            raise ValueError(
-                                f"submit_next_level_group: workers length {len(cpp_worker_ids)} "
-                                f"!= {len(c_args_list)} args"
-                            )
-                        cpp_worker_ids = list(cpp_worker_ids)
-                    else:
-                        cpp_worker_ids = [-1] * len(c_args_list)
-                for g, child_ptrs, candidates in member_checks:
+                for child_ptrs, target_worker_id in member_checks:
                     assert worker is not None  # member_checks is only populated when worker is present
-                    worker._child_prov_check_dispatch(child_ptrs, candidates, api="submit_next_level_group")
-                    cpp_worker_ids[g] = next(iter(candidates))
-                # A group dispatches its members in parallel to distinct workers.
-                # Two members pinned to the same owner (e.g. two child args on the
-                # same chip) would give the same affinity twice; the scheduler sees
-                # that WorkerThread idle for both and serializes them on one thread.
-                # This rejects that duplicate-pinned case only — full injective
-                # feasibility (e.g. a wildcard member left with no free worker once
-                # a child member is pinned) is the scheduler's pre-existing capacity
-                # concern, not narrowed here.
-                pinned = [wid for wid in cpp_worker_ids if wid >= 0]
-                if len(pinned) != len(set(pinned)):
-                    raise ValueError(
-                        f"submit_next_level_group: members resolve to duplicate target workers "
-                        f"{cpp_worker_ids} — a group must dispatch to distinct workers"
-                    )
+                    worker._child_prov_check_dispatch(child_ptrs, target_worker_id, api="submit_next_level_group")
                 self._o.submit_next_level_group(
-                    digest, kind, target_namespace, c_args_list, cfg, cpp_worker_ids, worker_id_sets, remote_sidecars
+                    digest, kind, target_namespace, c_args_list, cfg, worker_ids, worker_id_sets, remote_sidecars
                 )
         except BaseException:
             if self._worker is not None:
@@ -488,9 +446,9 @@ class Orchestrator:
     #
     #     def my_orch(orch, args):
     #         with orch.scope():
-    #             orch.submit_next_level(a, ...)
-    #             orch.submit_next_level(b, ...)
-    #         orch.submit_next_level(c, ...)   # back on outer-scope ring
+    #             orch.submit_next_level(a, ..., worker=0)
+    #             orch.submit_next_level(b, ..., worker=0)
+    #         orch.submit_next_level(c, ..., worker=0)  # outer-scope ring
 
     def scope_begin(self) -> None:
         self._o.scope_begin()
