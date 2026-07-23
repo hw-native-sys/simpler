@@ -21,6 +21,7 @@
 #define SRC_A2A3_PLATFORM_SIM_HOST_DEVICE_RUNNER_H_
 
 #include <cstdint>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -80,6 +81,11 @@ private:
     // a2a3-only; a5 has no dep_gen.
     DepGenCollector dep_gen_collector_;
     bool enable_dep_gen_{false};
+
+    // Gate B: the sim runner has process-shared per-run state (KernelArgs,
+    // executor symbols, collectors, and temporary SO handles). Host binding
+    // happens before DeviceRunner::run(), so this only serializes Device S.
+    std::mutex device_run_mutex_;
 };
 
 #endif  // SRC_A2A3_PLATFORM_SIM_HOST_DEVICE_RUNNER_H_

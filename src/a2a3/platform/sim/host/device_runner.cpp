@@ -213,6 +213,10 @@ int DeviceRunner::invoke_device_register(const RegisterCallableArgs &reg_args) {
 }
 
 int DeviceRunner::run(Runtime &runtime, const CallConfig &config) {
+    // Match onboard Gate B: two pipeline slots may finish Host O concurrently,
+    // but one shared runner cannot mutate its per-run state from both slots.
+    std::unique_lock<std::mutex> device_run_lock(device_run_mutex_);
+
     apply_call_config(config);
     int block_dim = config.block_dim;
     const int launch_aicpu_num = config.aicpu_thread_num;
