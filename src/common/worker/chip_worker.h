@@ -76,10 +76,9 @@ public:
     // Used by the ChipStorageTaskArgs path in the nanobind binding.
     void run(int32_t callable_id, const ChipStorageTaskArgs *args, const CallConfig &config);
     void run(int32_t callable_id, const ChipStorageTaskArgs *args, const CallConfig &config, unsigned pipeline_slot);
-    void run(
-        int32_t callable_id, const ChipStorageTaskArgs *args, const CallConfig &config, unsigned pipeline_slot,
-        volatile int32_t *accepted_state
-    );
+    void
+    run(int32_t callable_id, const ChipStorageTaskArgs *args, const CallConfig &config, unsigned pipeline_slot,
+        volatile int32_t *accepted_state);
 
     // Per-callable_id registration. Requires init() first and a callable_id
     // in [0, MAX_REGISTERED_CALLABLE_IDS) (cap 64).

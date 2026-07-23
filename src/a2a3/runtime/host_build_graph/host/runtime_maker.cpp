@@ -541,9 +541,7 @@ materialize_streaming_host_graph_range(PTO2Runtime *source, PTO2Runtime *target,
         std::memcpy(&target_payload, source_slot.payload, sizeof(target_payload));
 
         if (target_payload.fanin_count < 0 || target_payload.fanin_count > PTO2_MAX_FANIN) {
-            LOG_ERROR(
-                "host-orch: streaming task %d has invalid fanin count %d", task_id, target_payload.fanin_count
-            );
+            LOG_ERROR("host-orch: streaming task %d has invalid fanin count %d", task_id, target_payload.fanin_count);
             return false;
         }
         for (int32_t i = 0; i < target_payload.fanin_count; ++i) {
@@ -564,9 +562,8 @@ materialize_streaming_host_graph_range(PTO2Runtime *source, PTO2Runtime *target,
         target_slot.allow_early_resolve = false;
         target_slot.total_required_subtasks = source_slot.total_required_subtasks;
         target_slot.logical_block_num = source_slot.logical_block_num;
-        uint8_t completed = source_ring.completion_flags[source_ring.get_slot_by_task_id(task_id)].load(
-            std::memory_order_acquire
-        );
+        uint8_t completed =
+            source_ring.completion_flags[source_ring.get_slot_by_task_id(task_id)].load(std::memory_order_acquire);
         target_ring.completion_flags[alloc.slot].store(completed, std::memory_order_relaxed);
         if (completed != 0 || task_state >= PTO2_TASK_COMPLETED) range->inline_completed++;
     }
@@ -631,8 +628,7 @@ static bool materialize_host_graph_ranges(
                     sizeof(PTO2TaskSlotState)
                 );
                 target_ring.completion_flags[target_slot].store(
-                    source_ring.completion_flags[source_slot].load(std::memory_order_acquire),
-                    std::memory_order_relaxed
+                    source_ring.completion_flags[source_slot].load(std::memory_order_acquire), std::memory_order_relaxed
                 );
             }
         }
@@ -659,8 +655,7 @@ int32_t run_host_orchestration(
     void *source_sm = source_sm_buf.data();
 
     DeviceArena source_arena;
-    PTO2RuntimeArenaLayout source_layout =
-        runtime_reserve_layout(source_arena, eff_task_window_sizes, eff_heap_sizes);
+    PTO2RuntimeArenaLayout source_layout = runtime_reserve_layout(source_arena, eff_task_window_sizes, eff_heap_sizes);
     if (source_layout.arena_size != layout.arena_size || source_layout.off_runtime != layout.off_runtime ||
         source_arena.commit(DeviceArena::kDefaultBaseAlign) == nullptr) {
         LOG_ERROR("host-orch: failed to create an equivalent source arena for epoch capture");
@@ -885,8 +880,7 @@ public:
             return false;
         }
 
-        PTO2RuntimeArenaLayout target_layout =
-            runtime_reserve_layout(target_arena_, task_window_sizes_, heap_sizes_);
+        PTO2RuntimeArenaLayout target_layout = runtime_reserve_layout(target_arena_, task_window_sizes_, heap_sizes_);
         if (target_layout.arena_size != layout_.arena_size || target_layout.off_runtime != layout_.off_runtime ||
             target_arena_.commit(DeviceArena::kDefaultBaseAlign) == nullptr) {
             LOG_ERROR("host-orch: async target arena layout mismatch or allocation failure");
@@ -1124,8 +1118,7 @@ private:
 
         char attrs[192];
         std::snprintf(
-            attrs, sizeof(attrs),
-            "epoch=%zu slot=%zu task_begin=%d task_end=%d tasks=%d final=%d", epoch_index + 1,
+            attrs, sizeof(attrs), "epoch=%zu slot=%zu task_begin=%d task_end=%d tasks=%d final=%d", epoch_index + 1,
             epoch_index % static_cast<size_t>(PTO2_HOST_GRAPH_EPOCH_SLOT_COUNT), range.task_begin, range.task_end,
             task_count, range.final_epoch
         );
@@ -1644,8 +1637,7 @@ extern "C" int bind_callable_to_runtime_impl(
 
     int64_t t_prebuilt_start = _now_ms();
     DeviceArena layout_probe;
-    PTO2RuntimeArenaLayout layout =
-        runtime_reserve_layout(layout_probe, eff_task_window_sizes, eff_heap_sizes);
+    PTO2RuntimeArenaLayout layout = runtime_reserve_layout(layout_probe, eff_task_window_sizes, eff_heap_sizes);
 
     int64_t t_setup_start = _now_ms();
     if (api->setup_static_arena(total_heap_size, sm_size, layout.arena_size) != 0) {

@@ -1472,8 +1472,7 @@ NB_MODULE(_task_interface, m) {
                 );
             },
             nb::arg("callable_id"), nb::arg("args_blob_ptr"), nb::arg("blob_capacity"), nb::arg("config"),
-            nb::arg("pipeline_slot") = 0, nb::arg("accepted_state_addr") = 0,
-            nb::call_guard<nb::gil_scoped_release>(),
+            nb::arg("pipeline_slot") = 0, nb::arg("accepted_state_addr") = 0, nb::call_guard<nb::gil_scoped_release>(),
             "Launch a callable_id from a raw mailbox-blob pointer + capacity "
             "(used by chip-child mailbox loops to avoid Python-side re-deserialisation "
             "of the per-task tensor/scalar layout). The blob must be in the format "

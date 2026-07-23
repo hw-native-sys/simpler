@@ -114,12 +114,10 @@ void ChipWorker::init(
         register_callable_fn_ = load_symbol<SimplerRegisterCallableFn>(handle, "simpler_register_callable");
         run_fn_ = load_symbol<SimplerRunFn>(handle, "simpler_run");
         select_arena_bank_fn_ = load_optional_symbol<SelectArenaBankFn>(handle, "select_arena_bank_ctx");
-        select_pipeline_slot_fn_ =
-            load_optional_symbol<SelectPipelineSlotFn>(handle, "select_pipeline_slot_ctx");
+        select_pipeline_slot_fn_ = load_optional_symbol<SelectPipelineSlotFn>(handle, "select_pipeline_slot_ctx");
         set_task_accepted_state_fn_ =
             load_optional_symbol<SetTaskAcceptedStateFn>(handle, "set_task_accepted_state_ctx");
-        get_pipeline_contract_fn_ =
-            load_optional_symbol<GetPipelineContractFn>(handle, "get_pipeline_contract");
+        get_pipeline_contract_fn_ = load_optional_symbol<GetPipelineContractFn>(handle, "get_pipeline_contract");
         unregister_callable_fn_ = load_symbol<SimplerUnregisterCallableFn>(handle, "simpler_unregister_callable");
         get_aicpu_dlopen_count_fn_ = load_symbol<GetAicpuDlopenCountFn>(handle, "get_aicpu_dlopen_count");
         get_host_dlopen_count_fn_ = load_symbol<GetAicpuDlopenCountFn>(handle, "get_host_dlopen_count");
@@ -242,7 +240,8 @@ void ChipWorker::init(
         comm_release_domain_windows_fn_ = nullptr;
         comm_barrier_fn_ = nullptr;
         comm_destroy_fn_ = nullptr;
-        for (auto &runtime_buf : runtime_bufs_) runtime_buf.clear();
+        for (auto &runtime_buf : runtime_bufs_)
+            runtime_buf.clear();
         throw;
     }
     if (init_rc != 0) {
@@ -286,7 +285,8 @@ void ChipWorker::init(
         comm_release_domain_windows_fn_ = nullptr;
         comm_barrier_fn_ = nullptr;
         comm_destroy_fn_ = nullptr;
-        for (auto &runtime_buf : runtime_bufs_) runtime_buf.clear();
+        for (auto &runtime_buf : runtime_bufs_)
+            runtime_buf.clear();
         throw std::runtime_error("simpler_init failed with code " + std::to_string(init_rc));
     }
 
@@ -355,7 +355,8 @@ void ChipWorker::finalize() {
     comm_release_domain_windows_fn_ = nullptr;
     comm_barrier_fn_ = nullptr;
     comm_destroy_fn_ = nullptr;
-    for (auto &runtime_buf : runtime_bufs_) runtime_buf.clear();
+    for (auto &runtime_buf : runtime_bufs_)
+        runtime_buf.clear();
     pipeline_contract_ = {PTO_PIPELINE_CONTRACT_ABI_VERSION, 0, 1, 1, {}};
     initialized_ = false;
     device_id_ = -1;
