@@ -98,8 +98,11 @@ from _task_interface import (  # pyright: ignore[reportMissingImports]
 from . import _log as _simpler_log
 from .buffer_handle import (
     BufferHandle,
+    BufferRef,
     create_host_shared_buffer,
     mint_owner_instance_id,
+    wrap_fork_inherited,
+    wrap_posix_shm,
 )
 from .callable_identity import (
     CALLABLE_HASH_DIGEST_BYTES,
@@ -147,6 +150,7 @@ from .task_interface import (
     RemoteBufferHandle,
     TaskArgs,
     Tensor,
+    TensorArgType,
     _Worker,
 )
 
@@ -2121,6 +2125,11 @@ class Worker:
         self._owner_instance_id: bytes = mint_owner_instance_id()
         self._buffer_id_counter: int = 1
         self._buffer_handles: dict[int, BufferHandle] = {}
+        # Auto-wrap memo: a materialized Tensor arg's addr / host-buffer token -> the handle backing
+        # it, so repeated submits of the same buffer reuse one canonical identity (dependency
+        # inference keys on identity, not address).
+        self._fork_wrap_by_addr: dict[int, BufferHandle] = {}
+        self._host_buf_handle_by_token: dict[int, BufferHandle] = {}
 
     @property
     def _initialized(self) -> bool:
@@ -5357,6 +5366,79 @@ class Worker:
         with self._registry_lock:
             self._buffer_handles[buffer_id] = handle
         return handle
+
+    def _next_buffer_id(self) -> int:
+        with self._registry_lock:
+            bid = self._buffer_id_counter
+            self._buffer_id_counter += 1
+        return bid
+
+    def _shared_handle_for_addr(self, addr: int, nbytes: int) -> BufferHandle | None:
+        """A shm-backed ``BufferHandle`` whose backing wholly contains ``[addr, addr+nbytes)``.
+
+        A ``create_buffer``'d handle, or a ``create_host_buffer`` entry wrapped as a POSIX_SHM handle
+        (memoized by token). ``None`` when ``addr`` is not in any shared buffer (a pre-fork raw
+        tensor).
+        """
+        with self._registry_lock:
+            for handle in self._buffer_handles.values():
+                if handle.base <= addr and addr + nbytes <= handle.base + handle.nbytes:
+                    return handle
+        entry = self._find_host_buf_entry(addr, nbytes)
+        if entry is None:
+            return None
+        handle = self._host_buf_handle_by_token.get(entry.token)
+        if handle is None:
+            handle = wrap_posix_shm(
+                entry.shm_name,
+                entry.shm_base,
+                entry.nbytes,
+                self._owner_instance_id,
+                self._next_buffer_id(),
+                f"L{self.level}",
+            )
+            self._host_buf_handle_by_token[entry.token] = handle
+        return handle
+
+    def _bufferref_for_tensor(self, tensor: Tensor, tag: TensorArgType) -> BufferRef:
+        """Auto-wrap one materialized ``Tensor`` arg into a self-describing ``BufferRef`` (P1-B).
+
+        Backing selection: an OUTPUT with a null address gets a fresh shared buffer (an intermediate,
+        consumed downstream by identity); an address inside a ``create_buffer``'d / host buffer uses
+        that handle (read+write shared); otherwise a pre-fork INPUT tensor is FORK_SHM zero-copy
+        (COW-inherited, read-only). A writable raw tensor not in a shared buffer is rejected — the
+        child's copy-on-write writes never reach the parent. Minted handles are memoized so repeated
+        submits of one buffer share a canonical identity (dependency inference keys on identity).
+        """
+        addr = int(tensor.data)
+        nbytes = int(tensor.nbytes())
+        writable = tag in (TensorArgType.OUTPUT, TensorArgType.OUTPUT_EXISTING, TensorArgType.INOUT)
+        if addr == 0:
+            if tag != TensorArgType.OUTPUT:
+                raise ValueError(f"auto-wrap: only an OUTPUT arg may have a null address, got tag={tag!r}")
+            handle = self._create_buffer_locked(nbytes)
+            return handle.ref(shapes=tuple(tensor.shapes), strides=tuple(tensor.strides), dtype=int(tensor.dtype.value))
+        handle = self._shared_handle_for_addr(addr, nbytes)
+        if handle is not None:
+            return handle.ref_for_tensor(tensor)
+        if writable:
+            raise ValueError(
+                "auto-wrap: a writable raw tensor arg needs a shared backing (create_host_buffer/create_buffer); "
+                "a pre-fork tensor is copy-on-write and the child's writes never reach the parent"
+            )
+        fork = self._fork_wrap_by_addr.get(addr)
+        if fork is None:
+            fork = wrap_fork_inherited(addr, nbytes, self._owner_instance_id, self._next_buffer_id(), f"L{self.level}")
+            self._fork_wrap_by_addr[addr] = fork
+        return fork.ref_for_tensor(tensor)
+
+    def _bufferrefs_from_task_args(self, task_args: TaskArgs) -> tuple[list[BufferRef], list[int]]:
+        """Auto-wrap a whole ``TaskArgs`` (Tensors + tags) into self-describing BufferRefs + scalars."""
+        refs = [
+            self._bufferref_for_tensor(task_args.tensor(i), task_args.tag(i)) for i in range(task_args.tensor_count())
+        ]
+        scalars = [task_args.scalar(i) for i in range(task_args.scalar_count())]
+        return refs, scalars
 
     def create_host_buffer(self, nbytes: int) -> HostBuffer:
         """Allocate a born-shared host buffer, attached into every local L3 child,

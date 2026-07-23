@@ -361,6 +361,37 @@ def wrap_fork_inherited(
     )
 
 
+def wrap_posix_shm(
+    shm_name: str,
+    base: int,
+    nbytes: int,
+    owner_instance_id: bytes,
+    buffer_id: int,
+    owner_worker_path: str = "",
+    generation: int = 0,
+    access: AccessMode = AccessMode.READWRITE,
+) -> BufferHandle:
+    """Wrap an **already-existing** POSIX shm (owned elsewhere, e.g. a ``create_host_buffer``) as a
+    ``POSIX_SHM`` ``BufferHandle`` carrying a canonical identity.
+
+    The returned handle does NOT own the shm: ``shm`` is None so ``close()`` is a no-op, and the
+    original allocator is responsible for unlinking it. Used by submit-layer auto-wrap to give an
+    existing shared buffer a typed identity + descriptor without re-creating it.
+    """
+    identity = CanonicalIdentity(owner_instance_id, buffer_id, owner_worker_path, generation)
+    return BufferHandle(
+        identity=identity,
+        address_space=AddressSpace.HOST,
+        visibility=Visibility.SHARED,
+        access=access,
+        backend_kind=BackendKind.POSIX_SHM,
+        nbytes=nbytes,
+        body=shm_name.encode("utf-8"),
+        shm=None,
+        base=base,
+    )
+
+
 @dataclass
 class ImportedBuffer:
     """A handle materialized into the consumer's address space: identity -> local base."""
