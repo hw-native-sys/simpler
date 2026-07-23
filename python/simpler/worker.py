@@ -5199,13 +5199,13 @@ class Worker:
 
     @staticmethod
     def _child_ptrs_in_args(args: Any) -> list[tuple[int, int]]:
-        """Extract ``(device_ptr, arg_index)`` for every child_memory tensor in ``args``."""
-        out: list[tuple[int, int]] = []
-        for i in range(args.tensor_count()):
-            tensor = args.tensor(i)
-            if tensor.child_memory:
-                out.append((int(tensor.data), i))
-        return out
+        """``(device_ptr, arg_index)`` for every device arg — used for kind4 device-pointer provenance.
+
+        A BufferRef carries no materialized address, so a device pointer is not extractable here under
+        the BufferRef wire; device-pointer provenance is deferred with the device/remote path. Host
+        refs contribute nothing.
+        """
+        return []
 
     def _next_level_target_ids(self) -> Sequence[int]:
         """The full pool of dispatchable next-level worker ids.
