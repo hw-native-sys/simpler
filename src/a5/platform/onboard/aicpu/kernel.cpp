@@ -112,7 +112,6 @@ extern "C" __attribute__((visibility("default"))) int simpler_aicpu_exec(void *a
     if (!platform_aicpu_affinity_gate_filter(
             runtime->get_aicpu_allowed_cpus(), runtime->get_aicpu_allowed_cpu_count(), runtime->get_aicpu_launch_count()
         )) {
-        LOG_INFO_V0("Thread dropped by filter affinity gate");
         return 0;
     }
 
@@ -124,13 +123,11 @@ extern "C" __attribute__((visibility("default"))) int simpler_aicpu_exec(void *a
     set_platform_phase_base(k_args->device_wall_data_base);
     AicpuPhaseScope run_wall(AicpuPhase::RunWall);
 
-    LOG_INFO_V0("%s", "simpler_aicpu_exec: Calling aicpu_execute with Runtime");
     int rc = aicpu_execute(runtime);
     if (rc != 0) {
         LOG_ERROR("simpler_aicpu_exec: aicpu_execute failed with rc=%d", rc);
         return rc;
     }
-    LOG_INFO_V0("%s", "simpler_aicpu_exec: aicpu_execute completed successfully");
 
     // Run-wall end is stamped by run_wall's destructor (covers the early return
     // above too); host reduces max(end) - min(start) → ns.
@@ -165,6 +162,5 @@ extern "C" __attribute__((visibility("default"))) int simpler_aicpu_init(void *a
         set_dma_workspace_addr(k, init_args->dma_workspace_addr[k]);
     }
 
-    LOG_INFO_V0("%s", "simpler_aicpu_init: per-device invariants latched");
     return 0;
 }

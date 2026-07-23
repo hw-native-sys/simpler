@@ -661,7 +661,6 @@ int32_t SchedulerContext::shutdown(int32_t thread_idx) {
             LOG_ERROR("Thread %d: Core %d has invalid register address", thread_idx, core_id);
         }
     }
-    LOG_INFO_V0("Thread %d: Shutdown complete", thread_idx);
     return rc;
 }
 
@@ -958,7 +957,6 @@ void SchedulerContext::post_handshake_profiling_init() {
     }
     if (is_pmu_enabled()) {
         pmu_aicpu_init(physical_core_ids_, cores_total_num_);
-        LOG_INFO_V0("PMU profiling started on %d cores", cores_total_num_);
     }
     if (is_dep_gen_enabled()) {
         dep_gen_aicpu_init();
@@ -1012,11 +1010,11 @@ bool SchedulerContext::assign_cores_to_threads() {
 
         core_trackers_[t].set_cluster(cluster_idx_per_thread[t]++, aic_wid, aiv0_wid, aiv1_wid);
 
-        LOG_INFO_V0("Thread %d: cluster %d (AIC=%d, AIV0=%d, AIV1=%d)", t, ci, aic_wid, aiv0_wid, aiv1_wid);
+        LOG_DEBUG("Thread %d: cluster %d (AIC=%d, AIV0=%d, AIV1=%d)", t, ci, aic_wid, aiv0_wid, aiv1_wid);
     }
 
     for (int32_t t = 0; t < aicpu_thread_num_; t++) {
-        LOG_INFO_V0(
+        LOG_DEBUG(
             "Thread %d: total %d cores (%d clusters)", t, core_trackers_[t].core_num(),
             core_trackers_[t].get_cluster_count()
         );
@@ -1050,7 +1048,6 @@ void SchedulerContext::emergency_shutdown(Runtime *runtime) {
     if (timeout_count > 0) {
         LOG_ERROR("Emergency shutdown: %d cores did not acknowledge exit", timeout_count);
     }
-    LOG_WARN("Emergency shutdown complete");
 }
 
 // =============================================================================
@@ -1199,7 +1196,6 @@ int32_t SchedulerContext::post_handshake_init(Runtime *runtime) {
     }
     if (is_pmu_enabled()) {
         pmu_aicpu_init(physical_core_ids_, cores_total_num_);
-        LOG_INFO_V0("PMU profiling started on %d cores", cores_total_num_);
     }
     // dep_gen is host-driven (SubmitTrace) — runtime-gated by the host flag —
     // and compiles out with the other profiling subsystems at SIMPLER_DFX=0.

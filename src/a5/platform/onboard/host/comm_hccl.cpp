@@ -206,7 +206,7 @@ wait_for_rootinfo(const std::string &path, HcclRootInfo *root_info, uint64_t *ru
             return true;
         }
         if (i > 0 && i % (kLogEverySec * 10) == 0) {
-            LOG_INFO_V0("[comm] wait_for_rootinfo: still waiting (%ds elapsed) path=%s", i / 10, path.c_str());
+            LOG_DEBUG("[comm] wait_for_rootinfo: still waiting (%ds elapsed) path=%s", i / 10, path.c_str());
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }

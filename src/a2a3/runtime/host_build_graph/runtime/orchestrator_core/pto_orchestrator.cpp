@@ -1091,7 +1091,7 @@ void PTO2OrchestratorState::mark_done() {
     for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
         int32_t total_tasks = orch->ring.task_allocator.active_count();
         if (total_tasks > 0) {
-            LOG_INFO_V0("=== [Orchestrator] ring %d: total_tasks=%d ===", r, total_tasks);
+            LOG_DEBUG("=== [Orchestrator] ring %d: total_tasks=%d ===", r, total_tasks);
         }
     }
     orch->sm_header->orchestrator_done.store(1, std::memory_order_release);

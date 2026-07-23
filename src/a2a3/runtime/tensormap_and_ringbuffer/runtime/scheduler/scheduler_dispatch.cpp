@@ -769,7 +769,7 @@ SchedulerContext::early_dispatch_shape(int32_t thread_idx, PTO2ResourceShape sha
         // Re-push for concurrent peers BEFORE the expensive staging.
         if (start + claim < c->logical_block_num) {
             if (!sched_->early_dispatch_queues[s].push_tagged(c, task_id_snapshots[bi]))
-                LOG_INFO_V9(
+                LOG_DEBUG(
                     "[EARLY_DISPATCH] queue full on re-push, consumer=%" PRId64,
                     static_cast<int64_t>(c->task->task_id.raw)
                 );
@@ -864,24 +864,14 @@ int32_t SchedulerContext::try_early_dispatch(
 int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_idx) {
     always_assert(sched_ != nullptr);
     CoreTracker &tracker = core_trackers_[thread_idx];
-    LOG_INFO_V0("Thread %d: resolve_and_dispatch entry", thread_idx);
 
     PTO2SharedMemoryHeader *header = sched_->sm_header;
     if (!header) {
         LOG_ERROR("PTO2 dispatch: header is null");
         return -1;
     }
-    LOG_INFO_V0(
-        "Thread %d: header=%p, task_desc_offset[0]=%lu, window_size=%lu", thread_idx, static_cast<void *>(header),
-        static_cast<uint64_t>(header->rings[0].task_descriptors_offset),
-        static_cast<uint64_t>(header->rings[0].task_window_size)
-    );
 
     Handshake *hank = static_cast<Handshake *>(runtime->dev.workers);
-    LOG_INFO_V0(
-        "Thread %d: hank=%p, window_size=%lu", thread_idx, static_cast<void *>(hank),
-        static_cast<uint64_t>(header->rings[0].task_window_size)
-    );
 
     LOG_INFO_V0("Thread %d: PTO2 dispatch starting with %d cores", thread_idx, core_trackers_[thread_idx].core_num());
     int32_t cur_thread_completed = 0;

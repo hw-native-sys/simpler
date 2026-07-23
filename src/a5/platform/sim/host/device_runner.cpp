@@ -100,9 +100,6 @@ int DeviceRunner::ensure_binaries_loaded() {
         auto load_optional_sym = [this](const char *name, void **out) {
             dlerror();
             void *sym = dlsym(aicpu_so_handle_, name);
-            if (sym == nullptr) {
-                LOG_DEBUG("Optional dlsym skipped for %s: %s", name, dlerror());
-            }
             *out = sym;
         };
 
@@ -284,7 +281,6 @@ int DeviceRunner::run(Runtime &runtime, const CallConfig &config) {
     }
     kernel_args_.enable_profiling_flag = enable_profiling_flag;
 
-    LOG_DEBUG("Setting function_bin_addr for Tasks (Simulation)");
     for (int i = 0; i < runtime.get_task_count(); i++) {
         Task *task = runtime.get_task(i);
         if (task != nullptr) {
@@ -390,10 +386,6 @@ int DeviceRunner::run(Runtime &runtime, const CallConfig &config) {
             kernel_args_.regs = 0;
         }
     });
-
-    LOG_INFO_V0(
-        "Allocated simulated registers: %d cores x 0x%x bytes (sparse: 3 pages)", num_aicore, SIM_REG_TOTAL_SIZE
-    );
 
     if (aicpu_execute_func_ == nullptr || aicore_execute_func_ == nullptr || set_platform_regs_func_ == nullptr ||
         set_platform_dump_base_func_ == nullptr || set_platform_phase_base_func_ == nullptr ||
@@ -503,7 +495,6 @@ int DeviceRunner::run(Runtime &runtime, const CallConfig &config) {
         }));
     }
 
-    LOG_INFO_V0("Waiting for threads to complete");
     for (auto &t : aicpu_threads) {
         t.join();
     }
@@ -683,7 +674,6 @@ int DeviceRunner::finalize() {
     worker_count_ = 0;
     last_runtime_ = nullptr;
 
-    LOG_INFO_V0("DeviceRunner(sim) finalized");
     return 0;
 }
 

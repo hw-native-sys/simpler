@@ -223,7 +223,6 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
         return -1;
     }
     int32_t run_rc = 0;
-    LOG_INFO_V0("Thread %d: Start (exec_idx=%d)", thread_idx, affinity_exec_idx);
 
     // Boot thread (thread N-1): host_build_graph host-orch boot. The
     // orchestrator already ran on the host, which also relocated every

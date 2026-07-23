@@ -535,7 +535,7 @@ static bool stage_device_args(
         Tensor t = orch_args->tensor(i);
 
         if (t.is_child_memory()) {
-            LOG_INFO_V0("  Tensor %d: child memory, pass-through (0x%" PRIx64 ")", i, t.buffer.addr);
+            LOG_DEBUG("  Tensor %d: child memory, pass-through (0x%" PRIx64 ")", i, t.buffer.addr);
             out->add_tensor(t);
             continue;
         }
@@ -588,7 +588,7 @@ static bool stage_device_args(
         // copying back.
         bool needs_copy_back = !(signature != nullptr && i < sig_count && signature[i] == ArgDirection::IN);
         runtime->tensor_leases_.push_back({host_ptr, dev_ptr, size, needs_copy_back, release_kind});
-        LOG_INFO_V0("  Tensor %d: %zu bytes at %p", i, size, dev_ptr);
+        LOG_DEBUG("  Tensor %d: %zu bytes at %p", i, size, dev_ptr);
 
         t.buffer.addr = reinterpret_cast<uint64_t>(dev_ptr);
         out->add_tensor(t);
@@ -966,7 +966,7 @@ extern "C" int validate_runtime_impl(Runtime *runtime, const HostApi *api, int e
 
             // If host pointer is null, this is a device-only allocation (no copy-back)
             if (lease.host_ptr == nullptr) {
-                LOG_INFO_V0("Tensor %d: device-only allocation (no copy-back)", i);
+                LOG_DEBUG("Tensor %d: device-only allocation (no copy-back)", i);
                 continue;
             }
 
@@ -974,7 +974,7 @@ extern "C" int validate_runtime_impl(Runtime *runtime, const HostApi *api, int e
             // wrote them — copying them back (potentially ~GB) is pure waste.
             // They are still released through release_kind below.
             if (!lease.needs_copy_back) {
-                LOG_INFO_V0("Tensor %d: read-only input, skipping copy-back", i);
+                LOG_DEBUG("Tensor %d: read-only input, skipping copy-back", i);
                 continue;
             }
 
@@ -983,7 +983,7 @@ extern "C" int validate_runtime_impl(Runtime *runtime, const HostApi *api, int e
                 LOG_ERROR("Failed to copy tensor %d from device: %d", i, copy_rc);
                 rc = copy_rc;
             } else {
-                LOG_INFO_V0("Tensor %d: %zu bytes copied to host", i, lease.size);
+                LOG_DEBUG("Tensor %d: %zu bytes copied to host", i, lease.size);
             }
         }
     }

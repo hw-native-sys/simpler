@@ -73,30 +73,30 @@ PTO2SchedProfilingData scheduler_get_profiling(int thread_idx) {
 
 void PTO2SchedulerState::print_stats() {
     PTO2SchedulerState *sched = this;
-    LOG_INFO_V0("=== Scheduler Statistics ===");
+    LOG_DEBUG("=== Scheduler Statistics ===");
     for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
         if (sched->ring_sched_state.last_task_alive > 0) {
-            LOG_INFO_V0("Ring %d:", r);
-            LOG_INFO_V0("  last_task_alive: %d", sched->ring_sched_state.last_task_alive);
+            LOG_DEBUG("Ring %d:", r);
+            LOG_DEBUG("  last_task_alive: %d", sched->ring_sched_state.last_task_alive);
         }
     }
 #if SIMPLER_SCHED_PROFILING
-    LOG_INFO_V0("tasks_completed:   %lld", (long long)sched->tasks_completed.load(std::memory_order_relaxed));
-    LOG_INFO_V0("tasks_consumed:    %lld", (long long)sched->tasks_consumed.load(std::memory_order_relaxed));
+    LOG_DEBUG("tasks_completed:   %lld", (long long)sched->tasks_completed.load(std::memory_order_relaxed));
+    LOG_DEBUG("tasks_consumed:    %lld", (long long)sched->tasks_consumed.load(std::memory_order_relaxed));
 #endif
-    LOG_INFO_V0("============================");
+    LOG_DEBUG("============================");
 }
 
 void PTO2SchedulerState::print_queues() {
     PTO2SchedulerState *sched = this;
-    LOG_INFO_V0("=== Ready Queues ===");
+    LOG_DEBUG("=== Ready Queues ===");
 
     const char *shape_names[] = {"AIC", "AIV", "MIX"};
 
     for (int i = 0; i < PTO2_NUM_RESOURCE_SHAPES; i++) {
-        LOG_INFO_V0("  %s: count=%" PRIu64, shape_names[i], sched->ready_queues[i].size());
+        LOG_DEBUG("  %s: count=%" PRIu64, shape_names[i], sched->ready_queues[i].size());
     }
-    LOG_INFO_V0("  DUMMY: count=%" PRIu64, sched->dummy_ready_queue.size());
+    LOG_DEBUG("  DUMMY: count=%" PRIu64, sched->dummy_ready_queue.size());
 
-    LOG_INFO_V0("====================");
+    LOG_DEBUG("====================");
 }

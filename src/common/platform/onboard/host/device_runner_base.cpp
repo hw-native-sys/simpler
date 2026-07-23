@@ -1254,7 +1254,6 @@ int DeviceRunnerBase::prepare_runtime_for_launch(Runtime &runtime, int block_dim
     // a CoreCallable device address; the binary code address is one
     // compile-time offset further in. The dispatch path then reads
     // resolved_addr_ from the on-device CoreCallable header.
-    LOG_DEBUG("Setting function_bin_addr for Tasks");
     for (int i = 0; i < runtime.get_task_count(); i++) {
         Task *task = runtime.get_task(i);
         if (task != nullptr) {
@@ -1263,7 +1262,6 @@ int DeviceRunnerBase::prepare_runtime_for_launch(Runtime &runtime, int block_dim
             LOG_DEBUG("Task %d (func_id=%d) -> function_bin_addr=0x%lx", i, task->func_id, task->function_bin_addr);
         }
     }
-    LOG_DEBUG("");
     return 0;
 }
 
