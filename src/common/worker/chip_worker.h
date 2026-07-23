@@ -13,7 +13,9 @@
 #define SRC_COMMON_WORKER_CHIP_WORKER_H_
 
 #include <array>
+#include <condition_variable>
 #include <cstdint>
+#include <mutex>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -199,6 +201,9 @@ private:
 
     void *create_comm_stream_checked(const char *op_name);
     void destroy_comm_stream_best_effort(void *stream, int *rc);
+    bool has_shared_reuse_resource() const;
+    void acquire_reuse_resource(const RuntimeEnv &runtime_env);
+    void release_reuse_resource();
     CommSession *find_comm_session(uint64_t comm_handle);
     CommSession *create_comm_session(void *handle, void *stream, bool is_base);
     int destroy_comm_session(CommSession &session);
@@ -244,6 +249,10 @@ private:
 
     std::array<std::vector<uint8_t>, 2> runtime_bufs_;
     PipelineContract pipeline_contract_{PTO_PIPELINE_CONTRACT_ABI_VERSION, 0, 1, 1, {}};
+    std::mutex reuse_resource_mutex_;
+    std::condition_variable reuse_resource_cv_;
+    RuntimeEnv active_reuse_runtime_env_{};
+    unsigned active_reuse_runs_{0};
     int device_id_ = -1;
     bool initialized_ = false;
     bool finalized_ = false;

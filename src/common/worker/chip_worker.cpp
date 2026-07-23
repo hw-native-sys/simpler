@@ -430,12 +430,59 @@ void ChipWorker::run(
             throw std::runtime_error("set_task_accepted_state_ctx failed");
         }
     }
-    int rc = run_fn_(device_ctx_, rt, callable_id, args, &config);
-    if (set_task_accepted_state_fn_ != nullptr) {
-        (void)set_task_accepted_state_fn_(device_ctx_, nullptr, 0);
+
+    const bool reuse_admitted = has_shared_reuse_resource();
+    if (reuse_admitted) {
+        acquire_reuse_resource(config.runtime_env);
+    }
+
+    int rc = 0;
+    try {
+        rc = run_fn_(device_ctx_, rt, callable_id, args, &config);
+        if (set_task_accepted_state_fn_ != nullptr) {
+            (void)set_task_accepted_state_fn_(device_ctx_, nullptr, 0);
+        }
+    } catch (...) {
+        if (set_task_accepted_state_fn_ != nullptr) {
+            (void)set_task_accepted_state_fn_(device_ctx_, nullptr, 0);
+        }
+        if (reuse_admitted) {
+            release_reuse_resource();
+        }
+        throw;
+    }
+    if (reuse_admitted) {
+        release_reuse_resource();
     }
     if (rc != 0) {
         throw std::runtime_error("run failed with code " + std::to_string(rc));
+    }
+}
+
+bool ChipWorker::has_shared_reuse_resource() const {
+    if (pipeline_contract_.arena_banks >= pipeline_contract_.pipeline_slots) return false;
+    for (uint32_t i = 0; i < pipeline_contract_.resource_count; ++i) {
+        if (pipeline_contract_.resources[i].resource_class == PTO_PIPELINE_REUSE_MEM) return true;
+    }
+    return false;
+}
+
+void ChipWorker::acquire_reuse_resource(const RuntimeEnv &runtime_env) {
+    std::unique_lock<std::mutex> lock(reuse_resource_mutex_);
+    reuse_resource_cv_.wait(lock, [&]() {
+        return active_reuse_runs_ == 0 ||
+               std::memcmp(&active_reuse_runtime_env_, &runtime_env, sizeof(RuntimeEnv)) == 0;
+    });
+    if (active_reuse_runs_ == 0) {
+        active_reuse_runtime_env_ = runtime_env;
+    }
+    ++active_reuse_runs_;
+}
+
+void ChipWorker::release_reuse_resource() {
+    std::lock_guard<std::mutex> lock(reuse_resource_mutex_);
+    if (--active_reuse_runs_ == 0) {
+        reuse_resource_cv_.notify_all();
     }
 }
 
