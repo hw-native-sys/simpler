@@ -616,11 +616,11 @@ Public surface (called from `AicpuExecutor::init/run/deinit`):
 
 | Method | Phase | Purpose |
 | ------ | ----- | ------- |
-| `init(runtime, aicpu_thread_num, sched_thread_num, orch_to_sched, regs_base)` | once per run | Handshake + assign cores, reset counters, latch `regs_base`, bind `func_id_to_addr_` |
+| `init(runtime, aicpu_thread_num, regs_base)` | once per run | Handshake + assign cores, reset counters, latch `regs_base`, bind `func_id_to_addr_` |
 | `bind_runtime(rt)` | boot thread | Wire `sched_` to `rt->scheduler` once the boot thread attaches the host-built `rt` |
 | `resolve_and_dispatch(runtime, thread_idx)` | per scheduler thread | Main dispatch loop |
 | `shutdown(thread_idx)` | per thread on exit | `platform_deinit_aicore_regs` for this thread's cores; PMU finalize when enabled |
-| `on_orchestration_done(runtime, rt, thread_idx, total_tasks)` | orchestrator thread | Publish core assignments, latch task count, fold inline-completed tasks, flip `orchestrator_done_`, drive orch→sched core transition (or `emergency_shutdown` on fatal) |
+| `on_orchestration_done(runtime, rt, thread_idx, total_tasks)` | boot thread | Publish core assignments, latch task count, fold inline-completed tasks, flip `orchestrator_done_` (or `emergency_shutdown` on fatal) |
 | `deinit()` | once per run | Reset every scheduler-owned field to its post-construction default |
 | Read-only accessors | various | `aic_count()` / `aiv_count()` / `is_completed()` / `completed_tasks_count()` |
 

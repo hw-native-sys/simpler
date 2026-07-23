@@ -66,8 +66,7 @@ public:
     // Leader-only: per-core state + config + swimlane buffers + core count. Must
     // be published before any thread enters handshake_partition. Returns 0 on
     // success, negative on failure.
-    int32_t
-    pre_handshake_init(Runtime *runtime, int32_t aicpu_thread_num, int32_t sched_thread_num, uint64_t regs_base);
+    int32_t pre_handshake_init(Runtime *runtime, int32_t aicpu_thread_num, uint64_t regs_base);
     // All threads: handshake this thread's contiguous slice [lo, hi) of cores
     // (partitioned by tidx/nthreads). Each core is touched by exactly one thread.
     void handshake_partition(Runtime *runtime, int32_t tidx, int32_t nthreads);
@@ -155,7 +154,6 @@ private:
 
     // --- Thread/core configuration ---
     int32_t active_sched_threads_{0};
-    int32_t sched_thread_num_{0};
     int32_t aicpu_thread_num_{0};
     int32_t cores_total_num_{0};
 
