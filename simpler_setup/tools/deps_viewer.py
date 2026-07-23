@@ -35,18 +35,25 @@ Usage:
     python -m simpler_setup.tools.deps_viewer DEPS_JSON --format html --engine sfdp
     python -m simpler_setup.tools.deps_viewer DEPS_JSON --edge-mode reduced
     python -m simpler_setup.tools.deps_viewer DEPS_JSON --edge-mode omitted
+    python -m simpler_setup.tools.deps_viewer DEPS_JSON --edge-mode reduced_v2
+    python -m simpler_setup.tools.deps_viewer DEPS_JSON --edge-mode omitted_v2
 
-``--edge-mode`` selects which edges are visible (structural transitive reduction,
-purely on ``(pred, succ)`` — per-edge tensor identity is ignored, and it is
-skipped with a warning if the graph contains a cycle):
+``--edge-mode`` selects which edges are visible (transitive reduction on
+``(pred, succ)``, while preserving ``source=creator`` tensor-lifetime edges;
+reduction is skipped with a warning if the graph contains a cycle):
 
 - ``full`` (default) — every edge.
-- ``reduced`` — the minimal edge set: drops every edge whose ordering is already
-  implied by a longer path (e.g. ``A->C`` when ``A->B->C`` exists).
+- ``reduced`` — the reduced scheduling-edge set: drops an ``explicit`` or
+  ``tensormap`` edge whose ordering is already implied by a longer path (e.g.
+  ``A->C`` when ``A->B->C`` exists), while retaining every ``creator`` edge.
 - ``omitted`` — only the redundant edges ``reduced`` would drop (its complement),
   useful for auditing exactly which dependencies are transitively covered.
+- ``reduced_v2`` / ``omitted_v2`` — start from structural reduction, then
+  preserve ``OUTPUT_EXISTING`` reuse boundaries and restore creator edges unless
+  every byte of an ``INOUT`` has direct TensorMap dataflow from an earlier
+  Output and to a later ``INOUT`` owned by the same creator.
 
-``reduced`` and ``omitted`` print the redundant edges to stdout. Text output
+All reduction modes print the redundant edges to stdout. Text output
 emits only the selected edge set. HTML output keeps every edge in the Graphviz
 layout and colors the unselected edges like the page background, preserving the
 full-graph layout while drawing the selected edge set above unselected edges.
@@ -84,6 +91,27 @@ def _normalize_task_id(v):
 # Same coercion semantics — alias so the call sites read as "this is a
 # tensor_id, not a task_id". Both encode 64-bit unsigned values as JSON strings.
 _normalize_tensor_id = _normalize_task_id
+
+
+_DTYPE_BYTES = {
+    "FLOAT32": 4,
+    "FLOAT16": 2,
+    "INT32": 4,
+    "INT16": 2,
+    "INT8": 1,
+    "UINT8": 1,
+    "BFLOAT16": 2,
+    "INT64": 8,
+    "UINT64": 8,
+    "UINT16": 2,
+    "UINT32": 4,
+    "BOOL": 1,
+}
+_OUTPUT_LIFETIME_ARG_TYPES = frozenset({"INOUT", "OUTPUT_EXISTING"})
+# Exact expansion of an arbitrary strided view can grow as the product of its
+# non-contiguous dimensions. Refuse an expensive proof and preserve the edge
+# instead; v2 must never call an unproven lifetime boundary redundant.
+_MAX_STRIDED_REGION_INTERVALS = 10_000
 
 
 def _normalize_small_int(v):
@@ -217,15 +245,18 @@ def _load_deps_edges(deps_path):
     return sorted(edges), sorted(nodes), annotations, tensor_table, task_table
 
 
-def _transitive_reduction(edges, nodes):
-    """DAG transitive reduction on structural ``(pred, succ)`` edges.
+def _transitive_reduction(edges, nodes, annotations=None):
+    """DAG transitive reduction that preserves tensor-lifetime references.
 
     An edge ``(u, v)`` is redundant when ``v`` is still reachable from ``u``
     through some other path that does not use the direct ``(u, v)`` edge — i.e.
-    the dependency it expresses is already implied by a longer chain. Reduction
-    is purely structural: it ignores the per-edge tensor / arg annotations, so a
-    ``(u, v)`` carrying its own tensor is dropped whenever the ordering it
-    encodes is transitively covered.
+    the scheduling dependency it expresses is already implied by a longer
+    chain. A ``source=creator`` annotation is different: it retains the task
+    that owns a tensor still referenced by the consumer, so it must survive even
+    when the producer-to-consumer execution order is transitively covered. If
+    any annotation row for a structural ``(u, v)`` edge has creator source, the
+    whole rendered edge is protected. Explicit and tensormap dependencies remain
+    structural-reduction candidates.
 
     Runs in ``O(V·E)``: nodes are visited in reverse topological order while a
     descendant-reachability set is accumulated per node, so each edge is tested
@@ -239,6 +270,9 @@ def _transitive_reduction(edges, nodes):
     ``is_dag=False`` (transitive reduction is only well-defined on a DAG); the
     caller warns and emits the full graph.
     """
+    annotations = annotations or {}
+    lifetime_edges = {edge for edge, rows in annotations.items() if any(row.get("source") == "creator" for row in rows)}
+
     succ: dict[int, set[int]] = {n: set() for n in nodes}
     indeg: dict[int, int] = {n: 0 for n in nodes}
     for u, v in edges:
@@ -273,7 +307,7 @@ def _transitive_reduction(edges, nodes):
         for v in succ[u]:
             indirect |= reach[v]
         for v in succ[u]:
-            if v in indirect:
+            if v in indirect and (u, v) not in lifetime_edges:
                 redundant.add((u, v))
         node_reach = set(succ[u])
         node_reach |= indirect
@@ -283,6 +317,263 @@ def _transitive_reduction(edges, nodes):
     # that order, so kept/removed stay sorted without a second sort.
     kept = [e for e in edges if e not in redundant]
     removed = [e for e in edges if e in redundant]
+    return kept, removed, True
+
+
+def _merge_intervals(intervals):
+    """Return sorted, non-overlapping half-open byte intervals."""
+    merged = []
+    for begin, end in sorted(intervals):
+        if begin >= end:
+            continue
+        if merged and begin <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+        else:
+            merged.append((begin, end))
+    return tuple(merged)
+
+
+def _intervals_cover(target, covers):
+    """Whether the union of ``covers`` completely contains ``target``."""
+    cover = _merge_intervals(covers)
+    cover_idx = 0
+    for target_begin, target_end in target:
+        cursor = target_begin
+        while cover_idx < len(cover) and cover[cover_idx][1] <= cursor:
+            cover_idx += 1
+        idx = cover_idx
+        while cursor < target_end and idx < len(cover) and cover[idx][0] <= cursor:
+            cursor = max(cursor, cover[idx][1])
+            idx += 1
+        if cursor < target_end:
+            return False
+    return True
+
+
+def _strided_byte_region(row, arg, tensor_table, role="consumer"):
+    """Resolve one annotated tensor view into exact occupied byte intervals.
+
+    Returns ``(buffer_addr, intervals)`` or ``None`` when the metadata is
+    incomplete or exact expansion would exceed the safety cap. Callers treat
+    ``None`` conservatively as a lifetime boundary.
+    """
+    tensor_id = _normalize_tensor_id(row.get("tensor_id", arg.get("tensor_id")))
+    tensor = tensor_table.get(tensor_id) if tensor_id is not None else None
+    if not isinstance(tensor, dict):
+        return None
+
+    try:
+        buffer_addr = int(tensor["buffer_addr"])
+        start_offset = int(row.get(f"{role}_start_offset", arg.get("start_offset")))
+        buffer_numel = int(tensor["buffer_numel"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    if buffer_addr < 0 or start_offset < 0 or buffer_numel < 0:
+        return None
+
+    shape_raw = row.get(f"{role}_shape", arg.get("shape"))
+    strides_raw = row.get(f"{role}_strides", arg.get("strides"))
+    if not isinstance(shape_raw, list) or not isinstance(strides_raw, list) or len(shape_raw) != len(strides_raw):
+        return None
+    try:
+        shape = [int(v) for v in shape_raw]
+        strides = [int(v) for v in strides_raw]
+    except (TypeError, ValueError):
+        return None
+    if not shape or any(v <= 0 for v in shape) or any(v <= 0 for v in strides):
+        return None
+
+    dtype = str(row.get(f"{role}_dtype", arg.get("dtype", tensor.get("dtype")))).upper()
+    buffer_dtype = str(tensor.get("dtype", dtype)).upper()
+    dtype_bytes = _DTYPE_BYTES.get(dtype)
+    buffer_dtype_bytes = _DTYPE_BYTES.get(buffer_dtype)
+    # A reinterpretation would make start_offset/strides and buffer_numel use
+    # different element units. The runtime normally keeps these equal; malformed
+    # or future reinterpret metadata must veto the proof rather than guess.
+    if dtype_bytes is None or buffer_dtype_bytes is None or dtype != buffer_dtype:
+        return None
+
+    # Collapse the largest canonically-contiguous suffix into one interval;
+    # enumerate only the outer strided coordinates. If even the last dimension
+    # is strided, the contiguous block is one element and every coordinate is
+    # enumerated exactly.
+    suffix_start = len(shape)
+    contiguous_elems = 1
+    for dim in range(len(shape) - 1, -1, -1):
+        if strides[dim] != contiguous_elems:
+            break
+        contiguous_elems *= shape[dim]
+        suffix_start = dim
+
+    interval_count = 1
+    for dim in range(suffix_start):
+        interval_count *= shape[dim]
+        if interval_count > _MAX_STRIDED_REGION_INTERVALS:
+            return None
+
+    offsets = [start_offset]
+    for dim in range(suffix_start):
+        offsets = [base + idx * strides[dim] for base in offsets for idx in range(shape[dim])]
+
+    intervals = _merge_intervals(
+        (
+            buffer_addr + offset * dtype_bytes,
+            buffer_addr + (offset + contiguous_elems) * dtype_bytes,
+        )
+        for offset in offsets
+    )
+    buffer_end = buffer_addr + buffer_numel * buffer_dtype_bytes
+    if not intervals or any(begin < buffer_addr or end > buffer_end for begin, end in intervals):
+        return None
+    return buffer_addr, intervals
+
+
+def _task_args_by_index(task_table, task_id):
+    task = task_table.get(task_id)
+    if not isinstance(task, dict):
+        return {}
+    args_by_idx = {}
+    for arg in task.get("args", []):
+        if not isinstance(arg, dict):
+            continue
+        arg_idx = _normalize_small_int(arg.get("idx"))
+        if arg_idx is not None:
+            args_by_idx[arg_idx] = arg
+    return args_by_idx
+
+
+def _intersect_intervals(left, right):
+    """Return the exact intersection of two sorted interval collections."""
+    intersections = []
+    left_idx = 0
+    right_idx = 0
+    while left_idx < len(left) and right_idx < len(right):
+        begin = max(left[left_idx][0], right[right_idx][0])
+        end = min(left[left_idx][1], right[right_idx][1])
+        if begin < end:
+            intersections.append((begin, end))
+        if left[left_idx][1] <= right[right_idx][1]:
+            left_idx += 1
+        else:
+            right_idx += 1
+    return tuple(intersections)
+
+
+def _creator_output_records(annotations, tensor_table, task_table):
+    """Collect exact existing-output regions carried by creator annotations."""
+    by_edge = {}
+    by_owner_task_buffer = {}
+    for edge, rows in annotations.items():
+        args_by_idx = _task_args_by_index(task_table, edge[1])
+        for row in rows:
+            if row.get("source") != "creator":
+                continue
+            arg_idx = _normalize_small_int(row.get("arg"))
+            arg = args_by_idx.get(arg_idx)
+            if not isinstance(arg, dict) or arg.get("type") not in _OUTPUT_LIFETIME_ARG_TYPES:
+                continue
+            region = _strided_byte_region(row, arg, tensor_table)
+            if region is None:
+                continue
+            buffer_addr, intervals = region
+            record = {
+                "edge": edge,
+                "owner": edge[0],
+                "task": edge[1],
+                "arg": arg_idx,
+                "arg_type": arg.get("type"),
+                "buffer_addr": buffer_addr,
+                "intervals": intervals,
+            }
+            by_edge.setdefault(edge, []).append(record)
+            by_owner_task_buffer.setdefault((edge[0], edge[1], buffer_addr), []).append(record)
+    return by_edge, by_owner_task_buffer
+
+
+def _modifier_records(annotations, tensor_table, task_table):
+    """Collect exact direct producer-to-INOUT dataflow evidence."""
+    incoming = {}
+    outgoing = {}
+    for edge, rows in annotations.items():
+        args_by_idx = _task_args_by_index(task_table, edge[1])
+        for row in rows:
+            if row.get("source") != "tensormap":
+                continue
+            arg_idx = _normalize_small_int(row.get("arg"))
+            arg = args_by_idx.get(arg_idx)
+            if not isinstance(arg, dict) or arg.get("type") != "INOUT":
+                continue
+            consumer_region = _strided_byte_region(row, arg, tensor_table)
+            producer_region = _strided_byte_region(row, {}, tensor_table, role="producer")
+            if consumer_region is None or producer_region is None or consumer_region[0] != producer_region[0]:
+                continue
+            overlap = _intersect_intervals(consumer_region[1], producer_region[1])
+            if not overlap:
+                continue
+            record = {
+                "edge": edge,
+                "pred": edge[0],
+                "succ": edge[1],
+                "arg": arg_idx,
+                "buffer_addr": consumer_region[0],
+                "overlap": overlap,
+            }
+            incoming.setdefault((edge[1], arg_idx, consumer_region[0]), []).append(record)
+            outgoing.setdefault((edge[0], consumer_region[0]), []).append(record)
+    return incoming, outgoing
+
+
+def _transitive_reduction_v2(edges, nodes, annotations, tensor_table, task_table):
+    """Structural reduction followed by conservative lifetime restoration.
+
+    A structurally redundant creator edge is removable only when every creator
+    annotation on that structural pair is an exactly-known INOUT region, and
+    every byte has direct TensorMap dataflow from an earlier Output and to a
+    later INOUT owned by the same creator. OUTPUT_EXISTING can begin a reuse
+    generation, so it is always preserved. Missing or ambiguous evidence also
+    preserves the edge; graph reachability alone never joins reuse rounds.
+    """
+    kept, structural_removed, is_dag = _transitive_reduction(edges, nodes)
+    if not is_dag:
+        return kept, structural_removed, False
+
+    records_by_edge, records_by_owner_task_buffer = _creator_output_records(annotations, tensor_table, task_table)
+    incoming_modifiers, outgoing_modifiers = _modifier_records(annotations, tensor_table, task_table)
+    final_removed = set(structural_removed)
+    for edge in structural_removed:
+        creator_rows = [row for row in annotations.get(edge, []) if row.get("source") == "creator"]
+        if not creator_rows:
+            continue
+        records = records_by_edge.get(edge, [])
+        # Only INOUT has direct modifier dataflow that can prove it remains
+        # within one reuse generation. OUTPUT_EXISTING, INPUT, missing task arg
+        # metadata, and overly-complex strides all veto removal.
+        if len(records) != len(creator_rows) or any(record["arg_type"] != "INOUT" for record in records):
+            final_removed.discard(edge)
+            continue
+        for record in records:
+            owner = record["owner"]
+            buffer_addr = record["buffer_addr"]
+            earlier_intervals = []
+            for modifier in incoming_modifiers.get((record["task"], record["arg"], buffer_addr), []):
+                peers = records_by_owner_task_buffer.get((owner, modifier["pred"], buffer_addr), [])
+                for peer in peers:
+                    earlier_intervals.extend(_intersect_intervals(modifier["overlap"], peer["intervals"]))
+
+            later_intervals = []
+            for modifier in outgoing_modifiers.get((record["task"], buffer_addr), []):
+                peers = records_by_owner_task_buffer.get((owner, modifier["succ"], buffer_addr), [])
+                for peer in peers:
+                    if peer["arg"] == modifier["arg"] and peer["arg_type"] == "INOUT":
+                        later_intervals.extend(_intersect_intervals(modifier["overlap"], peer["intervals"]))
+            if not _intervals_cover(record["intervals"], earlier_intervals) or not _intervals_cover(
+                record["intervals"], later_intervals
+            ):
+                final_removed.discard(edge)
+                break
+
+    kept = [edge for edge in edges if edge not in final_removed]
+    removed = [edge for edge in edges if edge in final_removed]
     return kept, removed, True
 
 
@@ -1461,6 +1752,8 @@ Examples:
   %(prog)s deps.json --format html --show-tensor-info
   %(prog)s deps.json --edge-mode reduced      # select non-redundant edges, print what was removed
   %(prog)s deps.json --edge-mode omitted      # select transitively-implied (redundant) edges
+  %(prog)s deps.json --edge-mode reduced_v2   # require direct INOUT dataflow before omitting creator edges
+  %(prog)s deps.json --edge-mode omitted_v2   # show only lifetime-safe redundant edges
 """,
     )
     p.add_argument("input", nargs="?", help="Path to deps.json (default: newest under ./outputs/).")
@@ -1473,14 +1766,17 @@ Examples:
     )
     p.add_argument(
         "--edge-mode",
-        choices=["full", "reduced", "omitted"],
+        choices=["full", "reduced", "omitted", "reduced_v2", "omitted_v2"],
         default="full",
         help=(
             "full (default) selects every dependency edge; reduced applies transitive reduction, selecting the "
-            "minimal edge set; omitted selects only the redundant edges reduced would drop (the complement of "
-            "reduced). reduced/omitted print the redundant edges to stdout, are structural (pred,succ) level, "
-            "apply to both text and html, and are skipped with a warning on a cyclic graph. In html, all edges "
-            "still participate in layout; unselected edges are colored as background and drawn below selected edges."
+            "minimal scheduling-edge set while preserving creator tensor-lifetime edges; omitted selects only "
+            "the redundant edges reduced would drop (the complement of reduced). reduced/omitted print the "
+            "redundant edges to stdout. reduced_v2/omitted_v2 first find structural redundancy, then restore "
+            "OUTPUT_EXISTING reuse boundaries and require direct TensorMap dataflow into and out of every byte "
+            "of an INOUT before omitting its creator edge. All reduction modes work for text and html and are "
+            "skipped with a warning on a cyclic graph. In html, all edges still participate in layout; "
+            "unselected edges are colored as background and drawn below selected edges."
         ),
     )
     p.add_argument(
@@ -1525,6 +1821,54 @@ def _validate_args(args, argv):
     return 0
 
 
+def _apply_edge_mode(edge_mode, output_format, edges, nodes, annotations, tensor_table, task_table):
+    """Select rendered edges and HTML visibility metadata for one mode."""
+    hidden_html_edges = set()
+    visible_html_edge_count = len(edges)
+    if edge_mode == "full":
+        return edges, annotations, "deps_viewer", hidden_html_edges, visible_html_edge_count
+
+    is_v2 = edge_mode.endswith("_v2")
+    if is_v2:
+        kept, removed, is_dag = _transitive_reduction_v2(edges, nodes, annotations, tensor_table, task_table)
+    else:
+        kept, removed, is_dag = _transitive_reduction(edges, nodes, annotations)
+    if not is_dag:
+        print(
+            f"warning: dependency graph has a cycle; transitive reduction skipped, "
+            f"emitting full graph (--edge-mode {edge_mode} ignored)",
+            file=sys.stderr,
+        )
+        return edges, annotations, "deps_viewer", hidden_html_edges, visible_html_edge_count
+
+    fmt_task = _make_task_formatter(nodes)
+    is_reduced = edge_mode.startswith("reduced")
+    shown = kept if is_reduced else removed
+    if is_reduced:
+        prefix = "Lifecycle-aware transitive reduction" if is_v2 else "Transitive reduction"
+        print(f"{prefix}: removed {len(removed)} redundant edge(s) of {len(edges)} ({len(kept)} kept)")
+    else:
+        prefix = "Lifecycle-safe redundant edges only" if is_v2 else "Redundant edges only"
+        print(f"{prefix}: showing {len(removed)} redundant edge(s) of {len(edges)}")
+    for pred, succ in removed:
+        print(f"  - {fmt_task(pred)} -> {fmt_task(succ)}")
+
+    if output_format == "html":
+        hidden_html_edges = set(removed if is_reduced else kept)
+        visible_html_edge_count = len(shown)
+        print(
+            f"HTML layout preserves all {len(edges)} edge(s); "
+            f"{len(hidden_html_edges)} unselected edge(s) are colored as background"
+        )
+        return edges, annotations, f"deps_viewer_{edge_mode}", hidden_html_edges, visible_html_edge_count
+
+    # Keep only annotations for the selected text edges so summary counts stay
+    # consistent with the rendered edge set instead of counting hidden rows.
+    shown_set = set(shown)
+    annotations = {key: rows for key, rows in annotations.items() if key in shown_set}
+    return shown, annotations, f"deps_viewer_{edge_mode}", hidden_html_edges, visible_html_edge_count
+
+
 def main(argv=None):
     argv = list(sys.argv[1:] if argv is None else argv)
     parser = _build_parser()
@@ -1549,45 +1893,15 @@ def main(argv=None):
     if meta:
         nodes = sorted(set(nodes) | set(meta.keys()), key=_sort_task_id_key)
 
-    mode_stem = "deps_viewer"
-    hidden_html_edges = set()
-    visible_html_edge_count = len(edges)
-    if args.edge_mode in ("reduced", "omitted"):
-        kept, removed, is_dag = _transitive_reduction(edges, nodes)
-        if not is_dag:
-            print(
-                f"warning: dependency graph has a cycle; transitive reduction skipped, "
-                f"emitting full graph (--edge-mode {args.edge_mode} ignored)",
-                file=sys.stderr,
-            )
-        else:
-            fmt_task = _make_task_formatter(nodes)
-            # reduced keeps the minimal edge set; omitted keeps exactly the
-            # redundant edges that reduced would drop (the two are complements).
-            shown = kept if args.edge_mode == "reduced" else removed
-            if args.edge_mode == "reduced":
-                print(
-                    f"Transitive reduction: removed {len(removed)} redundant edge(s) of {len(edges)} ({len(kept)} kept)"
-                )
-            else:
-                print(f"Redundant edges only: showing {len(removed)} redundant edge(s) of {len(edges)}")
-            for u, v in removed:
-                print(f"  - {fmt_task(u)} -> {fmt_task(v)}")
-            if args.format == "html":
-                hidden_html_edges = set(removed if args.edge_mode == "reduced" else kept)
-                visible_html_edge_count = len(shown)
-                print(
-                    f"HTML layout preserves all {len(edges)} edge(s); "
-                    f"{len(hidden_html_edges)} unselected edge(s) are colored as background"
-                )
-            else:
-                edges = shown
-                # Keep only the annotations of the shown edges so annotated-edge
-                # counts (emit_text summary, the final print) stay consistent with
-                # the rendered edge set instead of counting the hidden ones.
-                shown_set = set(shown)
-                annotations = {k: v for k, v in annotations.items() if k in shown_set}
-            mode_stem = f"deps_viewer_{args.edge_mode}"
+    edges, annotations, mode_stem, hidden_html_edges, visible_html_edge_count = _apply_edge_mode(
+        args.edge_mode,
+        args.format,
+        edges,
+        nodes,
+        annotations,
+        tensor_table,
+        task_table,
+    )
 
     out = (
         Path(args.output)
