@@ -1570,7 +1570,7 @@ NB_MODULE(_task_interface, m) {
                 if (!contiguous) {
                     throw std::runtime_error("materialize_bufferref_blob: non-contiguous BufferRef not supported yet");
                 }
-                nb::bytes key(reinterpret_cast<const char *>(&r.identity), sizeof(CanonicalIdentity));
+                nb::bytes key(reinterpret_cast<const char *>(&r.handle.identity), sizeof(CanonicalIdentity));
                 if (!resolved.contains(key)) {
                     throw std::runtime_error(
                         "materialize_bufferref_blob: canonical identity not in the import registry"
@@ -1594,9 +1594,29 @@ NB_MODULE(_task_interface, m) {
             return nb::bytes(out.data(), sz);
         },
         nb::arg("blob_ptr"), nb::arg("capacity"), nb::arg("resolved"),
-        "Materialize a BufferRef blob into a Tensor blob (write_blob format). Each ref's canonical "
-        "identity is resolved via `resolved` {identity_bytes: (local_base, address_space)}; addr = "
-        "base + byte_offset. Rejects unknown identity, non-dtype-aligned byte_offset, non-contiguous view."
+        "Materialize a BufferRef blob into a Tensor blob (write_blob format). Each ref's embedded "
+        "handle identity is resolved via `resolved` {identity_bytes: (local_base, address_space)}; "
+        "addr = base + byte_offset. The caller pre-populates `resolved` by materializing each embedded "
+        "descriptor (see bufferref_blob_descriptors) on first receipt. Rejects unknown identity, "
+        "non-dtype-aligned byte_offset, non-contiguous view."
+    );
+
+    m.def(
+        "bufferref_blob_descriptors",
+        [](uint64_t blob_ptr, size_t capacity) -> nb::list {
+            const uint8_t *src = reinterpret_cast<const uint8_t *>(blob_ptr);
+            BufferRefBlobView view = read_bufferref_blob(src, capacity);
+            nb::list out;
+            for (int32_t i = 0; i < view.ref_count; i++) {
+                BufferRef r = view.ref(i);
+                out.append(nb::bytes(reinterpret_cast<const char *>(&r.handle), sizeof(BufferHandleDescriptor)));
+            }
+            return out;
+        },
+        nb::arg("blob_ptr"), nb::arg("capacity"),
+        "Extract each BufferRef's embedded BufferHandleDescriptor (packed bytes) from a BufferRef "
+        "blob, in ref order. A consumer materializes these lazily on receipt to build the `resolved` "
+        "map passed to materialize_bufferref_blob."
     );
 
     nb::class_<L2ChildOnboardRegionExport>(m, "_L2ChildOnboardRegionExport")

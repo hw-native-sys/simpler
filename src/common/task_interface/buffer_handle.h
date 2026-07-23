@@ -18,16 +18,16 @@
  * widths / enum values / endianness / evolution; exact byte offsets here are this P1 wire's choice).
  *
  * Three types:
- *   - BufferHandleDescriptor : the owner's exported wire descriptor, sent once per edge in the
- *                              export/import handshake and registered into the consumer's import
- *                              registry. Carries backing properties + a versioned length-delimited
- *                              backend body. abi_version (u16) leads so a decoder rejects an unknown
- *                              version before trusting the rest.
- *   - BufferRef              : the blob-carried view. Holds only the canonical identity (a reference
- *                              to a handle) plus a view (byte_offset, shape, strides, dtype). No
- *                              materialized address, no copy of handle properties.
+ *   - BufferHandleDescriptor : the owner's self-describing wire descriptor. Carries backing
+ *                              properties + a versioned length-delimited backend body. abi_version
+ *                              (u16) leads so a decoder rejects an unknown version before trusting the
+ *                              rest. Embedded whole in every BufferRef built over the handle.
+ *   - BufferRef              : the blob-carried wire element. Embeds the full BufferHandleDescriptor
+ *                              plus a view (byte_offset, shape, strides, dtype) — self-describing, so
+ *                              a consumer materializes it lazily on receipt with no prior handshake.
+ *                              No materialized address.
  *   - CanonicalIdentity      : owner_instance_id + owner_worker_path + buffer_id + generation. The
- *                              key both the owner registry and every consumer import registry use.
+ *                              key both the owner registry and every consumer import cache use.
  *
  * Endianness: all multi-byte integers little-endian. owner_instance_id is an opaque byte sequence
  * (bytewise-compared, no integer/endianness meaning). Unknown version / backend / descriptor_version
@@ -136,44 +136,14 @@ struct CanonicalIdentityHash {
 };
 
 /**
- * The blob-carried view: a reference to a handle (canonical identity) plus a strided view onto it.
- *
- * Invariants:
- *   - Carries NO materialized address. The consumer resolves the canonical identity against its
- *     import registry to a local base, then `Tensor.buffer.addr = base`,
- *     `Tensor.start_offset = byte_offset / dtype_bytes`.
- *   - `byte_offset` is a BYTE offset of the view origin; a multiple of the dtype size (validated at
- *     materialization).
- *   - `strides[i] > 0` strictly (broadcast / negative step unsupported), carried explicitly — a
- *     singleton dimension's stride is never normalized away.
- */
-struct BufferRef {
-    CanonicalIdentity identity;
-    uint64_t byte_offset;
-    uint32_t ndims;
-    uint32_t shapes[MAX_TENSOR_DIMS];
-    uint32_t strides[MAX_TENSOR_DIMS];
-    DataType dtype;
-    uint8_t _pad[3];
-};
-
-static_assert(std::is_trivially_copyable_v<BufferRef>, "BufferRef must be trivially copyable for blob memcpy");
-static_assert(sizeof(BufferRef) == 152, "BufferRef is wire ABI");
-static_assert(offsetof(BufferRef, identity) == 0);
-static_assert(offsetof(BufferRef, byte_offset) == 96);
-static_assert(offsetof(BufferRef, ndims) == 104);
-static_assert(offsetof(BufferRef, shapes) == 108);
-static_assert(offsetof(BufferRef, strides) == 128);
-static_assert(offsetof(BufferRef, dtype) == 148);
-
-/**
- * The owner's exported handle descriptor — the export/import handshake payload. Registered once per
- * edge into the consumer's import registry, keyed by canonical identity. `backend_kind` +
- * `descriptor_version` + `body[0, body_len)` carry the per-backend materialization (POSIX/fork shm
- * name, VMM shareable-handle, device VA, ...). Version-prefixed (`abi_version` u16 leads); unknown
- * abi_version / backend_kind / descriptor_version is rejected before trusting the rest.
- * `address_space` / `visibility` / `access` / `backend_kind` are raw u8 so an unknown value can be
- * rejected without invoking undefined enum behavior.
+ * The owner's self-describing handle descriptor — embedded whole in every BufferRef built over the
+ * handle. A consumer materializes it lazily on first receipt (no separate export handshake) and
+ * caches `canonical identity -> local base` (map-once). `backend_kind` + `descriptor_version` +
+ * `body[0, body_len)` carry the per-backend materialization (POSIX/fork shm name, VMM
+ * shareable-handle, device VA, ...). Version-prefixed (`abi_version` u16 leads); unknown abi_version /
+ * backend_kind / descriptor_version is rejected before trusting the rest. `address_space` /
+ * `visibility` / `access` / `backend_kind` are raw u8 so an unknown value can be rejected without
+ * invoking undefined enum behavior.
  */
 struct BufferHandleDescriptor {
     uint16_t abi_version;
@@ -202,3 +172,36 @@ static_assert(offsetof(BufferHandleDescriptor, identity) == 8);
 static_assert(offsetof(BufferHandleDescriptor, nbytes) == 104);
 static_assert(offsetof(BufferHandleDescriptor, body_len) == 112);
 static_assert(offsetof(BufferHandleDescriptor, body) == 120);
+
+/**
+ * The blob-carried, self-describing wire element: a full embedded handle descriptor plus a strided
+ * view onto it. Because the descriptor travels with the ref, a consumer needs no prior handshake —
+ * it materializes the embedded `handle` (backend selects how) on first receipt, keyed by
+ * `handle.identity`, and reuses the cached base for later refs to the same identity.
+ *
+ * Invariants:
+ *   - Carries NO materialized address. The consumer materializes `handle` to a local base, then
+ *     `Tensor.buffer.addr = base`, `Tensor.start_offset = byte_offset / dtype_bytes`.
+ *   - `byte_offset` is a BYTE offset of the view origin; a multiple of the dtype size (validated at
+ *     materialization).
+ *   - `strides[i] > 0` strictly (broadcast / negative step unsupported), carried explicitly — a
+ *     singleton dimension's stride is never normalized away.
+ */
+struct BufferRef {
+    BufferHandleDescriptor handle;
+    uint64_t byte_offset;
+    uint32_t ndims;
+    uint32_t shapes[MAX_TENSOR_DIMS];
+    uint32_t strides[MAX_TENSOR_DIMS];
+    DataType dtype;
+    uint8_t _pad[3];
+};
+
+static_assert(std::is_trivially_copyable_v<BufferRef>, "BufferRef must be trivially copyable for blob memcpy");
+static_assert(sizeof(BufferRef) == 272, "BufferRef is wire ABI");
+static_assert(offsetof(BufferRef, handle) == 0);
+static_assert(offsetof(BufferRef, byte_offset) == 216);
+static_assert(offsetof(BufferRef, ndims) == 224);
+static_assert(offsetof(BufferRef, shapes) == 228);
+static_assert(offsetof(BufferRef, strides) == 248);
+static_assert(offsetof(BufferRef, dtype) == 268);

@@ -40,7 +40,10 @@ CanonicalIdentity make_identity() {
 
 BufferRef make_ref() {
     BufferRef r{};
-    r.identity = make_identity();
+    r.handle.abi_version = BUFFER_ABI_VERSION;
+    r.handle.backend_kind = static_cast<uint8_t>(BackendKind::POSIX_SHM);
+    r.handle.descriptor_version = BUFFER_DESCRIPTOR_VERSION;
+    r.handle.identity = make_identity();
     r.byte_offset = 4096;
     r.ndims = 3;
     r.shapes[0] = 2;
@@ -57,7 +60,7 @@ BufferRef make_ref() {
 
 TEST(BufferHandleAbi, StructSizesAreFrozen) {
     EXPECT_EQ(sizeof(CanonicalIdentity), 96u);
-    EXPECT_EQ(sizeof(BufferRef), 152u);
+    EXPECT_EQ(sizeof(BufferRef), 272u);
     EXPECT_EQ(sizeof(BufferHandleDescriptor), 216u);
 }
 
@@ -96,7 +99,7 @@ TEST(BufferHandleAbi, BufferRefSurvivesByteRoundTrip) {
     EXPECT_EQ(dst.byte_offset, 4096u);
     EXPECT_EQ(dst.dtype, DataType::FLOAT16);
     EXPECT_EQ(dst.strides[0], 32u);
-    EXPECT_EQ(dst.identity, src.identity);
+    EXPECT_EQ(dst.handle.identity, src.handle.identity);
 }
 
 TEST(BufferHandleAbi, HandleDescriptorSurvivesByteRoundTrip) {
@@ -157,7 +160,7 @@ TEST(BufferHandleAbi, IdentityHashMatchesEquality) {
 
 BufferRef make_ref_b() {
     BufferRef r = make_ref();
-    r.identity.buffer_id = 99;
+    r.handle.identity.buffer_id = 99;
     r.byte_offset = 0;
     r.ndims = 1;
     r.shapes[0] = 5;

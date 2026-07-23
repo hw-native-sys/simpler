@@ -35,6 +35,7 @@ from _task_interface import (  # pyright: ignore[reportMissingImports]
     MAX_TENSOR_DIMS,
     OWNER_INSTANCE_ID_BYTES,
     PATH_MAX_BYTES,
+    bufferref_blob_descriptors,
 )
 
 
@@ -114,7 +115,7 @@ class CanonicalIdentity:
 
 @dataclass(frozen=True)
 class BufferHandleDescriptor:
-    """The export-handshake wire payload — the owner's handle projected to a flat, versioned blob.
+    """The self-describing handle payload — embedded whole in every BufferRef built over the handle.
 
     ``body`` is the per-backend materialization (POSIX/fork shm name UTF-8, VMM handle bytes, ...).
     """
@@ -165,10 +166,10 @@ class BufferHandleDescriptor:
         )
 
 
-# BufferRef (152 B): CanonicalIdentity(96) + byte_offset u64, ndims u32, shapes[MAX] u32,
+# BufferRef (272 B): BufferHandleDescriptor(216) + byte_offset u64, ndims u32, shapes[MAX] u32,
 #   strides[MAX] u32, dtype u8, _pad[3].
 _BUFFER_REF_TAIL = struct.Struct(f"<QI{MAX_TENSOR_DIMS}I{MAX_TENSOR_DIMS}IB3x")
-assert _CANONICAL_IDENTITY.size + _BUFFER_REF_TAIL.size == BUFFER_REF_BYTES, "BufferRef layout drift"
+assert BUFFER_HANDLE_DESCRIPTOR_BYTES + _BUFFER_REF_TAIL.size == BUFFER_REF_BYTES, "BufferRef layout drift"
 
 # BufferRef blob envelope (16 B): abi_version u32, ref_count i32, scalar_count i32, reserved u32.
 _BUFFERREF_BLOB_HEADER = struct.Struct("<IiiI")
@@ -177,9 +178,13 @@ assert _BUFFERREF_BLOB_HEADER.size == BUFFERREF_BLOB_HEADER_BYTES, "BufferRef bl
 
 @dataclass(frozen=True)
 class BufferRef:
-    """The blob-carried view: a reference to a handle (canonical identity) + a strided view onto it."""
+    """The blob-carried wire element: a full embedded handle descriptor + a strided view onto it.
 
-    identity: CanonicalIdentity
+    Self-describing — the consumer materializes ``handle`` on first receipt (no prior handshake),
+    keyed by ``handle.identity``. Carries no materialized address.
+    """
+
+    handle: BufferHandleDescriptor
     byte_offset: int
     shapes: tuple[int, ...]
     strides: tuple[int, ...]
@@ -196,7 +201,7 @@ class BufferRef:
         shapes = list(self.shapes) + [0] * (MAX_TENSOR_DIMS - ndims)
         strides = list(self.strides) + [0] * (MAX_TENSOR_DIMS - ndims)
         tail = _BUFFER_REF_TAIL.pack(self.byte_offset, ndims, *shapes, *strides, self.dtype)
-        return self.identity.pack() + tail
+        return self.handle.pack() + tail
 
 
 def pack_bufferref_blob(refs: list[BufferRef], scalars: tuple[int, ...] = ()) -> bytes:
@@ -296,17 +301,26 @@ class ImportedBuffer:
 
 
 class ImportRegistry:
-    """Per-consumer-endpoint registry: register an export descriptor, resolve identity -> local base.
+    """Per-consumer-endpoint lazy import cache: materialize a BufferRef's embedded descriptor to a
+    local base on first receipt (map-once), keyed by canonical identity.
 
-    Keyed by the packed canonical identity so lookups are exact (never a numeric-range guess). Host
-    shm backends are mapped into this process on register.
+    A consumer calls ``materialize`` for each ref's embedded descriptor as it arrives; the first
+    sight of an identity maps its backing into this process, later sights reuse the cached base
+    (a bumped generation is a distinct identity, materialized fresh). Keyed by the packed canonical
+    identity so lookups are exact — never a numeric-range guess.
     """
 
     def __init__(self) -> None:
         self._by_identity: dict[bytes, ImportedBuffer] = {}
 
-    def register(self, descriptor: BufferHandleDescriptor | bytes) -> ImportedBuffer:
+    def materialize(self, descriptor: BufferHandleDescriptor | bytes) -> ImportedBuffer:
+        """Map ``descriptor``'s backing into this process on first sight of its identity; reuse the
+        cached ImportedBuffer thereafter (map-once)."""
         desc = BufferHandleDescriptor.unpack(descriptor) if isinstance(descriptor, (bytes, bytearray)) else descriptor
+        key = desc.identity.pack()
+        cached = self._by_identity.get(key)
+        if cached is not None:
+            return cached
         if desc.backend_kind in (BackendKind.POSIX_SHM, BackendKind.FORK_SHM):
             shm = SharedMemory(name=desc.body.decode("utf-8"))
             imported = ImportedBuffer(desc.identity, _shm_base_addr(shm), desc.nbytes, desc.address_space, shm)
@@ -314,12 +328,15 @@ class ImportRegistry:
             raise ValueError("ImportRegistry: REMOTE_SIDECAR backend is reserved for P2")
         else:
             raise NotImplementedError(f"ImportRegistry: backend {desc.backend_kind!r} not supported in P1-B")
-        key = desc.identity.pack()
-        prior = self._by_identity.pop(key, None)
-        if prior is not None and prior.shm is not None:
-            prior.shm.close()
         self._by_identity[key] = imported
         return imported
+
+    def materialize_blob(self, blob_ptr: int, capacity: int) -> dict[bytes, tuple[int, int]]:
+        """Lazily materialize every embedded descriptor in a BufferRef blob and return the resolved
+        map for ``materialize_bufferref_blob``: packed identity -> (local base, address_space)."""
+        for desc_bytes in bufferref_blob_descriptors(blob_ptr, capacity):
+            self.materialize(desc_bytes)
+        return self.materialization_map()
 
     def resolve(self, identity: CanonicalIdentity) -> ImportedBuffer:
         imported = self._by_identity.get(identity.pack())

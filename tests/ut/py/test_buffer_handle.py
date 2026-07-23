@@ -127,8 +127,9 @@ def test_create_export_import_resolve_zero_copy():
     reg = ImportRegistry()
     try:
         assert handle.backend_kind == BackendKind.POSIX_SHM
-        imported = reg.register(handle.to_descriptor().pack())
+        imported = reg.materialize(handle.to_descriptor().pack())
         assert reg.resolve(handle.identity).base == imported.base
+        assert reg.materialize(handle.to_descriptor()).base == imported.base  # map-once: same mapping
         assert imported.nbytes == 256
         owner_shm = handle.shm
         consumer_shm = imported.shm
@@ -151,7 +152,7 @@ def test_resolve_unregistered_raises():
         reg.resolve(_identity())
 
 
-def test_register_remote_sidecar_rejected():
+def test_materialize_remote_sidecar_rejected():
     desc = BufferHandleDescriptor(
         identity=_identity(),
         address_space=AddressSpace.HOST,
@@ -162,7 +163,7 @@ def test_register_remote_sidecar_rejected():
     )
     reg = ImportRegistry()
     with pytest.raises(ValueError, match="REMOTE_SIDECAR"):
-        reg.register(desc)
+        reg.materialize(desc)
 
 
 def test_owner_instance_ids_are_distinct():
@@ -177,15 +178,15 @@ def test_materialize_bufferref_blob_to_tensors():
     h1 = create_host_shared_buffer(nbytes=128, owner_instance_id=oid, buffer_id=2, generation=3)
     reg = ImportRegistry()
     try:
-        reg.register(h0.to_descriptor().pack())
-        reg.register(h1.to_descriptor().pack())
-
-        ref0 = BufferRef(h0.identity, byte_offset=0, shapes=(4,), strides=(1,), dtype=DataType.FLOAT32.value)
-        ref1 = BufferRef(h1.identity, byte_offset=8, shapes=(2, 4), strides=(4, 1), dtype=DataType.FLOAT16.value)
+        # Self-describing: refs embed the full descriptor; the consumer materializes lazily from the
+        # blob (no prior register), map-once by identity.
+        ref0 = BufferRef(h0.to_descriptor(), byte_offset=0, shapes=(4,), strides=(1,), dtype=DataType.FLOAT32.value)
+        ref1 = BufferRef(h1.to_descriptor(), byte_offset=8, shapes=(2, 4), strides=(4, 1), dtype=DataType.FLOAT16.value)
         blob = pack_bufferref_blob([ref0, ref1], scalars=(42,))
         src = ctypes.create_string_buffer(blob, len(blob))
 
-        tensor_blob = materialize_bufferref_blob(ctypes.addressof(src), len(blob), reg.materialization_map())
+        resolved = reg.materialize_blob(ctypes.addressof(src), len(blob))
+        tensor_blob = materialize_bufferref_blob(ctypes.addressof(src), len(blob), resolved)
         dst = ctypes.create_string_buffer(tensor_blob, len(tensor_blob))
         args = read_args_from_blob(ctypes.addressof(dst))
 
@@ -203,14 +204,14 @@ def test_materialize_bufferref_blob_to_tensors():
         h1.close()
 
 
-def test_materialize_rejects_unregistered_identity():
+def test_materialize_rejects_unresolved_identity():
     oid = mint_owner_instance_id()
     handle = create_host_shared_buffer(nbytes=32, owner_instance_id=oid, buffer_id=9)
     try:
-        ref = BufferRef(handle.identity, byte_offset=0, shapes=(8,), strides=(1,), dtype=DataType.INT32.value)
+        ref = BufferRef(handle.to_descriptor(), byte_offset=0, shapes=(8,), strides=(1,), dtype=DataType.INT32.value)
         blob = pack_bufferref_blob([ref])
         src = ctypes.create_string_buffer(blob, len(blob))
         with pytest.raises(RuntimeError, match="identity"):
-            materialize_bufferref_blob(ctypes.addressof(src), len(blob), {})  # empty registry
+            materialize_bufferref_blob(ctypes.addressof(src), len(blob), {})  # nothing resolved
     finally:
         handle.close()
