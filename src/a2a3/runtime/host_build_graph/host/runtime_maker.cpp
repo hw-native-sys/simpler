@@ -660,7 +660,7 @@ extern "C" int bind_callable_to_runtime_impl(
         Tensor t = orch_args->tensor(i);
 
         if (t.is_child_memory()) {
-            LOG_INFO_V0("  Tensor %d: child memory, pass-through (0x%" PRIx64 ")", i, t.buffer.addr);
+            LOG_DEBUG("  Tensor %d: child memory, pass-through (0x%" PRIx64 ")", i, t.buffer.addr);
             device_args.add_tensor(t);
             continue;
         }
@@ -695,7 +695,7 @@ extern "C" int bind_callable_to_runtime_impl(
         // copying back.
         bool needs_copy_back = !(signature != nullptr && i < sig_count && signature[i] == ArgDirection::IN);
         runtime->tensor_pairs_.push_back({host_ptr, dev_ptr, size, needs_copy_back});
-        LOG_INFO_V0("  Tensor %d: %zu bytes at %p", i, size, dev_ptr);
+        LOG_DEBUG("  Tensor %d: %zu bytes at %p", i, size, dev_ptr);
 
         // host_build_graph runs the orchestrator on the host, which may read
         // control tensors (e.g. paged_attention's context_lens/block_table) via
@@ -925,7 +925,7 @@ extern "C" int validate_runtime_impl(Runtime *runtime, const HostApi *api, int e
 
             // If host pointer is null, this is a device-only allocation (no copy-back)
             if (pair.host_ptr == nullptr) {
-                LOG_INFO_V0("Tensor %d: device-only allocation (no copy-back)", i);
+                LOG_DEBUG("Tensor %d: device-only allocation (no copy-back)", i);
                 continue;
             }
 
@@ -933,7 +933,7 @@ extern "C" int validate_runtime_impl(Runtime *runtime, const HostApi *api, int e
             // wrote them — copying them back (potentially ~GB) is pure waste.
             // They are still device_free'd in the cleanup loop below.
             if (!pair.needs_copy_back) {
-                LOG_INFO_V0("Tensor %d: read-only input, skipping copy-back", i);
+                LOG_DEBUG("Tensor %d: read-only input, skipping copy-back", i);
                 continue;
             }
 
@@ -942,7 +942,7 @@ extern "C" int validate_runtime_impl(Runtime *runtime, const HostApi *api, int e
                 LOG_ERROR("Failed to copy tensor %d from device: %d", i, copy_rc);
                 rc = copy_rc;
             } else {
-                LOG_INFO_V0("Tensor %d: %zu bytes copied to host", i, pair.size);
+                LOG_DEBUG("Tensor %d: %zu bytes copied to host", i, pair.size);
             }
         }
     }

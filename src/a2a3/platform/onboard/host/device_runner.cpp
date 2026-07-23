@@ -378,7 +378,6 @@ int DeviceRunner::run(Runtime &runtime, const CallConfig &config) {
         finalize_collectors();
     });
 
-    LOG_INFO_V0("=== Initialize runtime args ===");
     // Resolve the orchestration SO into a device-resident buffer and refresh
     // runtime metadata before the Runtime struct is uploaded to device.
     rc = prepare_orch_so(runtime);
@@ -872,7 +871,6 @@ int DeviceRunner::finalize() {
     if (reset_rc == 0) {
         device_unusable_ = false;
     }
-    LOG_INFO_V0("DeviceRunner finalized");
     return rc != 0 ? rc : reset_rc;
 }
 

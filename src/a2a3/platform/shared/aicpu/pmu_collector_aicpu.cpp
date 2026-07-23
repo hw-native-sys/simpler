@@ -151,7 +151,7 @@ struct PmuDeviceModule {
     }
     static void on_switch_complete(Context ctx, State *, Buffer *buffer) {
         if (buffer != nullptr) {
-            LOG_INFO_V0(
+            LOG_DEBUG(
                 "Thread %d: Core %d switched to new PMU buffer (addr=0x%lx)", ctx.thread_idx, ctx.core_id,
                 reinterpret_cast<uint64_t>(buffer)
             );
@@ -239,8 +239,6 @@ void pmu_aicpu_init(const uint32_t *physical_core_ids, int num_cores) {
 
         if (head != tail) {
             (void)try_pop_pmu_buffer(i, state, 0);
-            uint64_t buf_ptr = state->current_buf_ptr;
-            LOG_DEBUG("Core %d: popped initial PMU buffer (addr=0x%lx)", i, buf_ptr);
         } else {
             LOG_ERROR("Core %d: PMU free_queue is empty during init!", i);
             state->current_buf_ptr = 0;
@@ -248,7 +246,6 @@ void pmu_aicpu_init(const uint32_t *physical_core_ids, int num_cores) {
     }
 
     wmb();
-    LOG_INFO_V0("PMU initialized: %d cores, event_type=%u", num_cores, pmu_event_type);
 }
 
 void pmu_aicpu_record_task(int core_id, int thread_idx, uint64_t task_id, uint32_t func_id, CoreType core_type) {
@@ -353,7 +350,6 @@ void pmu_aicpu_flush_buffers(int thread_idx, const int *cur_thread_cores, int co
         uint32_t seq = state->current_buf_seq;
         int rc = enqueue_pmu_ready_buffer(thread_idx, static_cast<uint32_t>(core_id), buf_ptr, seq);
         if (rc == 0) {
-            LOG_INFO_V0("Thread %d: Core %d flushed PMU buffer with %u records", thread_idx, core_id, buf->count);
             state->current_buf_ptr = 0;
             wmb();
         } else {

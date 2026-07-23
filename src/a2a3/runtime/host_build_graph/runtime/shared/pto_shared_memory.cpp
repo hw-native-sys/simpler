@@ -205,28 +205,28 @@ void PTO2SharedMemoryHandle::print_layout() {
 
     PTO2SharedMemoryHeader *h = header;
 
-    LOG_INFO_V0("=== PTO2 Shared Memory Layout ===");
-    LOG_INFO_V0("Base address:       %p", sm_base);
-    LOG_INFO_V0("Total size:         %" PRIu64 " bytes", h->total_size);
-    LOG_INFO_V0("Ring depth:         %d", PTO2_MAX_RING_DEPTH);
+    LOG_DEBUG("=== PTO2 Shared Memory Layout ===");
+    LOG_DEBUG("Base address:       %p", sm_base);
+    LOG_DEBUG("Total size:         %" PRIu64 " bytes", h->total_size);
+    LOG_DEBUG("Ring depth:         %d", PTO2_MAX_RING_DEPTH);
     for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
-        LOG_INFO_V0("Ring %d:", r);
-        LOG_INFO_V0("  task_window_size: %" PRIu64, h->ring.task_window_size);
-        LOG_INFO_V0("  heap_size:        %" PRIu64 " bytes", h->ring.heap_size);
-        LOG_INFO_V0(
+        LOG_DEBUG("Ring %d:", r);
+        LOG_DEBUG("  task_window_size: %" PRIu64, h->ring.task_window_size);
+        LOG_DEBUG("  heap_size:        %" PRIu64 " bytes", h->ring.heap_size);
+        LOG_DEBUG(
             "  descriptors_off:  %" PRIu64 " (0x%" PRIx64 ")", h->ring.task_descriptors_offset,
             h->ring.task_descriptors_offset
         );
-        LOG_INFO_V0("  current_task_idx: %d", h->ring.fc.current_task_index.load(std::memory_order_acquire));
-        LOG_INFO_V0("  last_task_alive:  %d", h->ring.fc.last_task_alive.load(std::memory_order_acquire));
+        LOG_DEBUG("  current_task_idx: %d", h->ring.fc.current_task_index.load(std::memory_order_acquire));
+        LOG_DEBUG("  last_task_alive:  %d", h->ring.fc.last_task_alive.load(std::memory_order_acquire));
     }
-    LOG_INFO_V0("orchestrator_done:  %d", h->orchestrator_done.load(std::memory_order_acquire));
-    LOG_INFO_V0("Error state:");
-    LOG_INFO_V0("  orch_error_code:    %d", h->orch_error_code.load(std::memory_order_relaxed));
-    LOG_INFO_V0("  sched_error_bitmap: 0x%x", h->sched_error_bitmap.load(std::memory_order_relaxed));
-    LOG_INFO_V0("  sched_error_code:   %d", h->sched_error_code.load(std::memory_order_relaxed));
-    LOG_INFO_V0("  sched_error_thread: %d", h->sched_error_thread.load(std::memory_order_relaxed));
-    LOG_INFO_V0("================================");
+    LOG_DEBUG("orchestrator_done:  %d", h->orchestrator_done.load(std::memory_order_acquire));
+    LOG_DEBUG("Error state:");
+    LOG_DEBUG("  orch_error_code:    %d", h->orch_error_code.load(std::memory_order_relaxed));
+    LOG_DEBUG("  sched_error_bitmap: 0x%x", h->sched_error_bitmap.load(std::memory_order_relaxed));
+    LOG_DEBUG("  sched_error_code:   %d", h->sched_error_code.load(std::memory_order_relaxed));
+    LOG_DEBUG("  sched_error_thread: %d", h->sched_error_thread.load(std::memory_order_relaxed));
+    LOG_DEBUG("================================");
 }
 
 bool PTO2SharedMemoryHandle::validate() {

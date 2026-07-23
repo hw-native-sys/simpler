@@ -496,7 +496,6 @@ void PmuCollector::reconcile_counters() {
     // active buffer (success → current_buf_ptr=0) or counted it as dropped
     // and cleared it. A non-zero pointer with non-zero count means records
     // AICPU neither delivered nor accounted for — a device-side flush bug.
-    int leftover_active = 0;
     for (int c = 0; c < num_cores_; c++) {
         PmuBufferState *state = pmu_state(c);
         uint64_t buf_dev = state->current_buf_ptr;
@@ -514,11 +513,6 @@ void PmuCollector::reconcile_counters() {
             "stop() — device flush failed",
             c, static_cast<unsigned long>(buf_dev), count
         );
-        leftover_active++;
-    }
-
-    if (leftover_active > 0) {
-        LOG_ERROR("PMU reconcile: %d core(s) had un-cleared current_buf_ptr — see prior errors", leftover_active);
     }
 
     // Cross-check device-side totals against host CSV.  PMU is single-kind
@@ -672,5 +666,4 @@ void PmuCollector::finalize(PmuUnregisterCallback unregister_cb, const PmuFreeCa
     collector_counters_.shrink_to_fit();
     csv_shards_finalized_ = false;
     clear_memory_context();
-    LOG_INFO_V0("PMU collector finalized");
 }
