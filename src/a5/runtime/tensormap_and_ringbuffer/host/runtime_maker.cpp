@@ -620,8 +620,7 @@ static void apply_orch_sched_env_flags(Runtime *runtime) {
 // reserve sequence on a throwaway host arena. Idempotent across runs — the
 // pools are owned by DeviceRunner and freed in DeviceRunner::finalize().
 static bool ensure_static_arenas(
-    Runtime *runtime, const HostApi *api, const ArenaSizingConfig &sizing, const ArenaStaticSizes &sizes,
-    StaticArenaPtrs *out
+    const HostApi *api, const ArenaSizingConfig &sizing, const ArenaStaticSizes &sizes, StaticArenaPtrs *out
 ) {
     DeviceArena sizing_arena;  // discarded; only its computed arena_size is read
     PTO2RuntimeArenaLayout layout =
@@ -649,7 +648,6 @@ static bool ensure_static_arenas(
         LOG_ERROR("Failed to acquire pooled PTO2 shared memory");
         return false;
     }
-    runtime->set_gm_sm_ptr(out->gm_sm);
 
     out->runtime_arena_dev = api->acquire_pooled_runtime_arena();
     if (out->runtime_arena_dev == nullptr) {
@@ -676,8 +674,8 @@ static bool ensure_static_arenas(
 // The layout is stashed inside the image (rt->prebuilt_layout) so the AICPU can
 // recover every arena-internal offset after the rtMemcpy. Returns the layout
 // via `out_layout`; the runtime-arena device base travels separately on the
-// host Runtime (bind_launch_state), since the AICPU needs that pointer *before*
-// it can dereference the image.
+// host Runtime (set on the cache-hit path), since the AICPU needs that pointer
+// *before* it can dereference the image.
 static bool build_runtime_image(
     const ArenaSizingConfig &sizing, const ArenaStaticSizes &sizes, const StaticArenaPtrs &ptrs,
     DeviceArena *host_arena, PTO2RuntimeArenaLayout *out_layout
@@ -700,24 +698,6 @@ static bool build_runtime_image(
     rt->prebuilt_layout = layout;
 
     *out_layout = layout;
-    return true;
-}
-
-// per-run: publish the launch state. Copy the staged args onto the runtime,
-// rtMemcpy the host image into the pooled runtime-arena region, and record the
-// device base + runtime offset the AICPU reads before dereferencing the image.
-static bool bind_launch_state(
-    Runtime *runtime, const HostApi *api, const StaticArenaPtrs &ptrs, const DeviceArena &host_arena,
-    const PTO2RuntimeArenaLayout &layout, const ChipStorageTaskArgs &device_args
-) {
-    runtime->set_orch_args(device_args);
-
-    int rc_upload = api->copy_to_device(ptrs.runtime_arena_dev, host_arena.base(), layout.offsets.arena_size);
-    if (rc_upload != 0) {
-        LOG_ERROR("Failed to rtMemcpy prebuilt runtime arena to device (rc=%d)", rc_upload);
-        return false;
-    }
-    runtime->set_prebuilt_arena(ptrs.runtime_arena_dev, layout.offsets.off_runtime);
     return true;
 }
 
@@ -752,7 +732,7 @@ static int bind_cached_runtime_image(
 }
 
 static void store_prebuilt_runtime_image(
-    Runtime *runtime, const HostApi *api, const PrebuiltRuntimeArenaCacheProbe &probe, const StaticArenaPtrs &ptrs,
+    const HostApi *api, const PrebuiltRuntimeArenaCacheProbe &probe, const StaticArenaPtrs &ptrs,
     const PTO2RuntimeArenaLayout &layout, const DeviceArena &host_arena
 ) {
     if (api->mark_prebuilt_runtime_arena_cached == nullptr) {
@@ -762,6 +742,51 @@ static void store_prebuilt_runtime_image(
         probe.hash, probe.serialized_key.data(), probe.serialized_key.size(), ptrs.gm_heap, ptrs.gm_sm,
         ptrs.runtime_arena_dev, layout.offsets.off_runtime, host_arena.base(), layout.offsets.arena_size
     );
+}
+
+// Reserve the pooled arenas, build the host image, rtMemcpy it to the pooled
+// runtime-arena region, and record it in the DeviceRunnerBase prebuilt-arena
+// cache for `sizing`. Needs no Runtime and no per-run args — the image is
+// arg-independent. The cache store is best-effort (a no-op on backends without
+// cache callbacks); `out_ptrs`/`out_layout` return the freshly built arena so
+// the run path can wire the runtime directly instead of depending on a cache
+// round-trip. Shared by the lazy first-run miss path and the eager
+// prewarm_config_impl entry, so both build the arena identically.
+static bool build_and_cache_prebuilt_arena(
+    const HostApi *api, const ArenaSizingConfig &sizing, StaticArenaPtrs *out_ptrs = nullptr,
+    PTO2RuntimeArenaLayout *out_layout = nullptr
+) {
+    ArenaStaticSizes sizes;
+    if (!derive_arena_static_sizes(sizing, &sizes)) {
+        return false;
+    }
+
+    StaticArenaPtrs ptrs;
+    if (!ensure_static_arenas(api, sizing, sizes, &ptrs)) {
+        return false;
+    }
+
+    DeviceArena host_arena;  // libc malloc backend; owns the image until upload
+    PTO2RuntimeArenaLayout layout;
+    if (!build_runtime_image(sizing, sizes, ptrs, &host_arena, &layout)) {
+        return false;
+    }
+
+    int rc_upload = api->copy_to_device(ptrs.runtime_arena_dev, host_arena.base(), layout.offsets.arena_size);
+    if (rc_upload != 0) {
+        LOG_ERROR("Failed to rtMemcpy prebuilt runtime arena to device (rc=%d)", rc_upload);
+        return false;
+    }
+
+    PrebuiltRuntimeArenaCacheProbe probe = make_prebuilt_runtime_arena_cache_probe(sizing);
+    store_prebuilt_runtime_image(api, probe, ptrs, layout, host_arena);
+    if (out_ptrs != nullptr) {
+        *out_ptrs = ptrs;
+    }
+    if (out_layout != nullptr) {
+        *out_layout = layout;
+    }
+    return true;
 }
 
 /**
@@ -775,9 +800,9 @@ static void store_prebuilt_runtime_image(
  * half runs only once per callable_id.
  *
  * Orchestrates the three lifecycles behind the bind: per-config arena sizing
- * (resolve_arena_sizing) + static pools (ensure_static_arenas) + host image
- * (build_runtime_image), and per-run args (stage_device_args) + launch publish
- * (bind_launch_state).
+ * (resolve_arena_sizing) + per-run args (stage_device_args) + the prebuilt
+ * runtime-arena image (build_and_cache_prebuilt_arena on a cache miss, then
+ * bind_cached_runtime_image wires the pointers onto the runtime).
  *
  * @param runtime    Pointer to pre-constructed Runtime
  * @param orch_args  Separated tensor/scalar arguments for this run
@@ -854,26 +879,20 @@ extern "C" int bind_callable_to_runtime_impl(
             return -1;
         }
         if (cache_rc != 0) {
-            ArenaStaticSizes sizes;
-            if (!derive_arena_static_sizes(sizing, &sizes)) {
-                return -1;
-            }
-
+            // Miss: build + upload the arena image, then wire the runtime
+            // directly from the freshly built arena (same three fields the
+            // cache-hit path sets). The store inside build_and_cache is
+            // best-effort for the NEXT bind — this bind must not depend on the
+            // cache round-trip, so a backend with no-op cache callbacks still
+            // binds successfully.
             StaticArenaPtrs ptrs;
-            if (!ensure_static_arenas(runtime, api, sizing, sizes, &ptrs)) {
-                return -1;
-            }
-
-            DeviceArena host_arena;  // libc malloc backend; owns the image until upload
             PTO2RuntimeArenaLayout layout;
-            if (!build_runtime_image(sizing, sizes, ptrs, &host_arena, &layout)) {
+            if (!build_and_cache_prebuilt_arena(api, sizing, &ptrs, &layout)) {
                 return -1;
             }
-
-            if (!bind_launch_state(runtime, api, ptrs, host_arena, layout, device_args)) {
-                return -1;
-            }
-            store_prebuilt_runtime_image(runtime, api, cache_probe, ptrs, layout, host_arena);
+            runtime->set_orch_args(device_args);
+            runtime->set_gm_sm_ptr(ptrs.gm_sm);
+            runtime->set_prebuilt_arena(ptrs.runtime_arena_dev, layout.offsets.off_runtime);
         }
     }
     int64_t t_prebuilt_end = _now_ms();
@@ -886,6 +905,32 @@ extern "C" int bind_callable_to_runtime_impl(
 
     bind_cleanup.dismiss();
     return 0;
+}
+
+/**
+ * Eagerly populate the prebuilt runtime-arena cache for a run config, so the
+ * first bind_callable_to_runtime_impl with the same sizing hits the cache and
+ * skips the (~800ms) build + upload. Config-only: no callable, no per-run args
+ * — the arena image depends solely on the ring sizing. Requires the device to
+ * be initialized (pooled-arena device_malloc + rtMemcpy need a live context).
+ *
+ * @return 0 on success, -1 on failure
+ */
+extern "C" int prewarm_config_impl(
+    const HostApi *api, const uint64_t *ring_task_window, const uint64_t *ring_heap, const uint64_t *ring_dep_pool
+) {
+    if (api == nullptr) {
+        LOG_ERROR("HostApi pointer is null");
+        return -1;
+    }
+
+    ArenaSizingConfig sizing;
+    if (!resolve_arena_sizing(ring_task_window, ring_heap, ring_dep_pool, &sizing)) {
+        return -1;
+    }
+
+    STRACE("simpler_prewarm.build");
+    return build_and_cache_prebuilt_arena(api, sizing) ? 0 : -1;
 }
 
 /**
