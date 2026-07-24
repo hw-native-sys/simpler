@@ -51,11 +51,12 @@ public:
     // --- Intermediate-buffer allocation (runtime-owned lifetime) ---
     Tensor alloc(const std::vector<uint32_t> &shape, DataType dtype);
 
-    // --- Internal lifecycle (invoked by Worker::run only) ---
+    // --- Internal lifecycle (invoked by Python Worker.submit/RunHandle) ---
     RunId begin_run();
     void close_run_submission(RunId run_id);
     void fail_run_submission(RunId run_id, std::exception_ptr error);
     void wait_run(RunId run_id);
+    bool wait_run_for(RunId run_id, double timeout_seconds);
     bool run_done(RunId run_id) const;
     void release_run(RunId run_id);
     void scope_begin();
@@ -72,9 +73,32 @@ struct SubmitResult { TaskSlot task_slot; };  // internal only; not bound to Pyt
 `config`, since SUB has no per-call config.
 
 The run lifecycle and outer `scope_begin` / `scope_end` are invoked from Python
-`Worker.run` through private bindings. They are not part of the user-facing
-orch-fn API. `Worker.run` remains blocking: it closes submission, waits for the
-matching run fence, performs run-owned cleanup, and returns `None`.
+`Worker.submit` through private bindings. They are not part of the user-facing
+orch-fn API. `Worker.submit` invokes the orchestration callback and closes DAG
+submission synchronously, then returns a `RunHandle` before L3 device work has
+necessarily completed. Graph-construction errors therefore remain synchronous;
+device or endpoint errors are attached to the handle and raised by `wait()` or
+`result()`.
+
+`RunHandle.done` polls the matching native run fence. `wait(timeout)` supports
+bounded waits without cancelling or corrupting the run, and repeated waits
+replay the same terminal result. The handle keeps its `Worker`, callback
+arguments, configuration, and run-owned cleanup state alive until completion.
+`Worker.close()` rejects new submissions and drains every accepted handle
+before tearing down the worker tree.
+
+`Worker.run` remains source-compatible and blocking:
+
+```python
+worker.run(orchestration, args, config)
+# Equivalent to:
+worker.submit(orchestration, args, config).wait()
+```
+
+The current L2 backend is synchronous, so L2 `submit()` executes the existing
+blocking path and returns an already-completed handle. L3 asynchronous return
+does not yet imply overlapping runs: a later submit waits for the prior run's
+fence and cleanup before building the next DAG.
 
 Remote L3 submit adds two hidden pieces of metadata: final eligible worker-id
 sets and optional `RemoteTaskArgsSidecar` entries aligned by tensor index.

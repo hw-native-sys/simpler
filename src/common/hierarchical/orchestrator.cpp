@@ -11,6 +11,7 @@
 
 #include "orchestrator.h"
 
+#include <chrono>
 #include <cstdint>
 #include <limits>
 #include <stdexcept>
@@ -132,6 +133,22 @@ void Orchestrator::wait_run(RunId run_id) {
         error = run->first_error;
     }
     if (error) std::rethrow_exception(error);
+}
+
+bool Orchestrator::wait_run_for(RunId run_id, double timeout_seconds) {
+    auto run = get_run(run_id);
+    std::exception_ptr error;
+    {
+        std::unique_lock<std::mutex> lk(run->completion_mu);
+        if (!run->completion_cv.wait_for(lk, std::chrono::duration<double>(timeout_seconds), [&run] {
+                return is_terminal(run->phase.load(std::memory_order_acquire));
+            })) {
+            return false;
+        }
+        error = run->first_error;
+    }
+    if (error) std::rethrow_exception(error);
+    return true;
 }
 
 bool Orchestrator::run_done(RunId run_id) const {

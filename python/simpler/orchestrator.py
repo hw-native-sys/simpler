@@ -6,7 +6,7 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""Orchestrator — DAG builder exposed to the user's orch function during Worker.run().
+"""Orchestrator — DAG builder passed to a Worker submit/run callback.
 
 A thin Python facade over the C++ ``Orchestrator``. The Worker creates one
 Orchestrator handle at init, retrieves the C++ object via ``Worker.get_orchestrator()``,
@@ -24,10 +24,12 @@ and passes the handle to the user's orch function::
         sub_args.add_tensor(make_tensor_arg(output_tensor), TensorArgType.INPUT)
         orch.submit_sub(sub_handle, sub_args)
 
-    w.run(my_orch, my_args, my_config)
+    handle = w.submit(my_orch, my_args, my_config)
+    handle.wait()
 
-Scope/drain lifecycle is managed by ``Worker.run()``; users never call those
-directly.
+Scope and submission-close lifecycle is managed by ``Worker.submit()``;
+completion is managed by its ``RunHandle``. ``Worker.run()`` remains the
+blocking ``submit(...).wait()`` compatibility entry point.
 """
 
 from __future__ import annotations
@@ -440,7 +442,7 @@ class Orchestrator:
     # deeper heap ring (``min(depth, MAX_RING_DEPTH-1)``) so their
     # memory reclaims independently of the outer scope. ``scope_end`` is
     # non-blocking — it releases scope refs and returns; call
-    # ``Worker.run``/``drain`` for a synchronous wait.
+    # the ``RunHandle`` returned by ``Worker.submit`` for a synchronous wait.
     #
     # Usage::
     #
@@ -543,7 +545,7 @@ class Orchestrator:
         return tensor
 
     # ------------------------------------------------------------------
-    # Internal (called by Worker.run)
+    # Internal (called by Worker.submit)
     # ------------------------------------------------------------------
 
     def _scope_begin(self) -> None:
@@ -563,6 +565,9 @@ class Orchestrator:
 
     def _wait_run(self, run_id: int) -> None:
         self._o._wait_run(run_id)
+
+    def _wait_run_for(self, run_id: int, timeout_seconds: float) -> bool:
+        return bool(self._o._wait_run_for(run_id, timeout_seconds))
 
     def _run_done(self, run_id: int) -> bool:
         return bool(self._o._run_done(run_id))

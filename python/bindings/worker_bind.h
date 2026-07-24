@@ -363,6 +363,10 @@ inline void bind_worker(nb::module_ &m) {
             "_wait_run", &Orchestrator::wait_run, nb::arg("run_id"), nb::call_guard<nb::gil_scoped_release>(),
             "Block until one run is terminal and raise only that run's error."
         )
+        .def(
+            "_wait_run_for", &Orchestrator::wait_run_for, nb::arg("run_id"), nb::arg("timeout_seconds"),
+            nb::call_guard<nb::gil_scoped_release>(), "Wait up to timeout_seconds for one run to become terminal."
+        )
         .def("_run_done", &Orchestrator::run_done, nb::arg("run_id"))
         .def("_release_run", &Orchestrator::release_run, nb::arg("run_id"));
 

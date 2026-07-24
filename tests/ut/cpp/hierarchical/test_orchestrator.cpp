@@ -443,6 +443,15 @@ TEST_F(OrchestratorFixture, EmptyRunCompletesWhenSubmissionCloses) {
     orch.release_run(run_id);
 }
 
+TEST_F(OrchestratorFixture, TimedWaitCanRetryAfterTimeout) {
+    EXPECT_FALSE(orch.wait_run_for(run_id, 0.0));
+    EXPECT_FALSE(orch.run_done(run_id));
+
+    orch.close_run_submission(run_id);
+    EXPECT_TRUE(orch.wait_run_for(run_id, 0.0));
+    orch.release_run(run_id);
+}
+
 TEST_F(OrchestratorFixture, OneTaskRunCompletesAfterConsumption) {
     auto result = orch.submit_next_level(C(80), single_tensor_args(0x8000, TensorArgType::OUTPUT), cfg, 0);
     EXPECT_EQ(S(result.task_slot).run_id, run_id);

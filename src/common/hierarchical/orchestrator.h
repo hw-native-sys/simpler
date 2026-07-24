@@ -121,6 +121,7 @@ public:
     void close_run_submission(RunId run_id);
     void fail_run_submission(RunId run_id, std::exception_ptr error = nullptr);
     void wait_run(RunId run_id);
+    bool wait_run_for(RunId run_id, double timeout_seconds);
     bool run_done(RunId run_id) const;
     bool run_failed(RunId run_id) const;
     void release_run(RunId run_id);
