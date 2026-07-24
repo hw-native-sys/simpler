@@ -16,8 +16,8 @@
  * Lifecycle (called from scheduler cold path + aicpu_executor.cpp):
  *   dep_gen_aicpu_init()                — pop the initial DepGenBuffer from
  *                                         the (single) instance's free_queue.
- *                                         Runs in SchedulerContext::init() on
- *                                         the single-threaded cold path.
+ *                                         Runs in pre_handshake_init() before
+ *                                         the orchestrator can submit tasks.
  *   dep_gen_aicpu_set_orch_thread_idx() — record which AICPU thread runs the
  *                                         orchestrator (used to select the
  *                                         per-thread ready_queue on flush).

@@ -281,8 +281,8 @@ int32_t AicpuExecutor::init(Runtime *runtime) {
         sched_ctx_.handshake_owned_clusters(runtime, tidx, hs_nthreads);
         sched_ctx_.assign_own_clusters(tidx);
 #if SIMPLER_DFX
-        // Profiling subsystems (pmu/dump/dep) need every core's physical_core_id,
-        // so gate their one-time leader init behind a barrier — DFX builds only.
+        // Scheduler-side profiling state is initialized after every scheduler
+        // has published its handshake-derived core metadata.
         hs_arrived_.fetch_add(1, std::memory_order_acq_rel);
         if (is_leader) {
             while (hs_arrived_.load(std::memory_order_acquire) < hs_nthreads) {}

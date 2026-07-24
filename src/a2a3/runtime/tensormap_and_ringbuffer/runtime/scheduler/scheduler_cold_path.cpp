@@ -956,9 +956,8 @@ void SchedulerContext::abort_and_shutdown(Runtime *runtime) {
     }
 }
 
-// Profiling-subsystem init (leader-only). pmu_aicpu_init needs every core's
-// physical_core_id, so the barrier-free init path calls this behind an
-// all-thread barrier compiled only into DFX builds. No-op otherwise.
+// Scheduler-side profiling init (leader-only). The barrier-free init path
+// calls this after every scheduler has populated handshake-derived metadata.
 void SchedulerContext::post_handshake_profiling_init() {
 #if SIMPLER_DFX
     if (is_dump_args_enabled()) {
@@ -967,9 +966,6 @@ void SchedulerContext::post_handshake_profiling_init() {
     if (is_pmu_enabled()) {
         pmu_aicpu_init(physical_core_ids_, cores_total_num_);
         LOG_INFO_V0("PMU profiling started on %d cores", cores_total_num_);
-    }
-    if (is_dep_gen_enabled()) {
-        dep_gen_aicpu_init();
     }
 #endif
 }
@@ -1155,6 +1151,14 @@ int32_t SchedulerContext::pre_handshake_init(
         total_tasks_ = 0;
     }
 
+#if SIMPLER_DFX
+    // The dep-gen buffer is ready before pre_handshake_init returns and
+    // hs_setup_done_ releases the orchestrator to submit its first task.
+    if (is_dep_gen_enabled()) {
+        dep_gen_aicpu_init();
+    }
+#endif
+
     LOG_INFO_V0("Handshaking with %d cores", cores_total_num_);
     return 0;
 }
@@ -1204,14 +1208,6 @@ int32_t SchedulerContext::post_handshake_init(Runtime *runtime) {
     if (is_pmu_enabled()) {
         pmu_aicpu_init(physical_core_ids_, cores_total_num_);
         LOG_INFO_V0("PMU profiling started on %d cores", cores_total_num_);
-    }
-    // dep_gen is host-driven (SubmitTrace) — runtime-gated by the host flag —
-    // and compiles out with the other profiling subsystems at SIMPLER_DFX=0.
-    // init() only pops the initial buffer from instance 0's free_queue; the
-    // orchestrator thread still records its idx via
-    // dep_gen_aicpu_set_orch_thread_idx() before the first record_submit.
-    if (is_dep_gen_enabled()) {
-        dep_gen_aicpu_init();
     }
 #endif
 
