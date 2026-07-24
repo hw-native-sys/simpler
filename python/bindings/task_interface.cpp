@@ -602,7 +602,20 @@ NB_MODULE(_task_interface, m) {
     // blob walker locates tensor i's fields at i * TENSOR_STRIDE_BYTES without
     // reimplementing the struct layout.
     m.attr("TENSOR_STRIDE_BYTES") = static_cast<int>(sizeof(Tensor));
-    m.attr("TENSOR_CHILD_MEMORY_OFFSET") = static_cast<int>(offsetof(Tensor, child_memory));
+    m.attr("TENSOR_ADDRESS_SPACE_OFFSET") = static_cast<int>(offsetof(Tensor, address_space));
+
+    // BufferHandle / BufferRef wire ABI (buffer_handle.h). Exported so the Python mirror in
+    // simpler.buffer_handle can pin its struct formats to the C++ layout and reject drift.
+    m.attr("BUFFER_ABI_VERSION") = static_cast<int>(BUFFER_ABI_VERSION);
+    m.attr("BUFFER_DESCRIPTOR_VERSION") = static_cast<int>(BUFFER_DESCRIPTOR_VERSION);
+    m.attr("MAX_TENSOR_DIMS") = static_cast<int>(MAX_TENSOR_DIMS);
+    m.attr("BUFFER_REF_BYTES") = static_cast<int>(sizeof(BufferRef));
+    m.attr("BUFFER_HANDLE_DESCRIPTOR_BYTES") = static_cast<int>(sizeof(BufferHandleDescriptor));
+    m.attr("CANONICAL_IDENTITY_BYTES") = static_cast<int>(sizeof(CanonicalIdentity));
+    m.attr("OWNER_INSTANCE_ID_BYTES") = static_cast<int>(OWNER_INSTANCE_ID_BYTES);
+    m.attr("PATH_MAX_BYTES") = static_cast<int>(PATH_MAX_BYTES);
+    m.attr("DESC_MAX_BYTES") = static_cast<int>(DESC_MAX_BYTES);
+    m.attr("BUFFERREF_BLOB_HEADER_BYTES") = static_cast<int>(BUFFERREF_BLOB_HEADER_SIZE);
 
     // --- Tensor ---
     // The unified strided tensor descriptor. Constructed contiguous via make()
@@ -623,7 +636,7 @@ NB_MODULE(_task_interface, m) {
                 // start_offset == 0, buffer.size == numel * element_size.
                 return make_tensor_external(
                     reinterpret_cast<void *>(static_cast<uintptr_t>(data)), shp, static_cast<uint32_t>(n), dtype,
-                    /*manual_dep=*/false, /*version=*/0, child_memory ? 1 : 0
+                    /*manual_dep=*/false, /*version=*/0, child_memory ? AddressSpace::DEVICE : AddressSpace::HOST
                 );
             },
             nb::arg("data"), nb::arg("shapes"), nb::arg("dtype"), nb::arg("child_memory") = false,
@@ -668,7 +681,7 @@ NB_MODULE(_task_interface, m) {
                 // Re-establish a contiguous layout over the same buffer base.
                 self.init_external(
                     reinterpret_cast<void *>(self.buffer.addr), numel * get_element_size(self.dtype), shp,
-                    static_cast<uint32_t>(n), self.dtype, self.version, self.manual_dep, self.child_memory
+                    static_cast<uint32_t>(n), self.dtype, self.version, self.manual_dep, self.address_space
                 );
             }
         )
@@ -697,10 +710,10 @@ NB_MODULE(_task_interface, m) {
         .def_prop_rw(
             "child_memory",
             [](const Tensor &self) -> bool {
-                return self.is_child_memory();
+                return self.is_device_memory();
             },
             [](Tensor &self, bool v) {
-                self.child_memory = v ? 1 : 0;
+                self.address_space = v ? AddressSpace::DEVICE : AddressSpace::HOST;
             }
         )
 
@@ -743,7 +756,7 @@ NB_MODULE(_task_interface, m) {
                 os << self.shapes[i];
             }
             os << "), dtype=" << get_dtype_name(self.dtype);
-            if (self.is_child_memory()) os << ", child_memory=True";
+            if (self.is_device_memory()) os << ", child_memory=True";
             os << ")";
             return os.str();
         });
@@ -824,26 +837,32 @@ NB_MODULE(_task_interface, m) {
         .def(nb::init<>())
 
         .def(
-            "add_tensor",
-            [](TaskArgs &self, const Tensor &t, TensorArgType tag) {
-                self.add_tensor(t, tag);
+            "add_ref",
+            [](TaskArgs &self, nb::bytes packed, TensorArgType tag) {
+                if (packed.size() != sizeof(BufferRef))
+                    throw std::invalid_argument("TaskArgs.add_ref: packed BufferRef must be sizeof(BufferRef) bytes");
+                BufferRef r;
+                std::memcpy(&r, packed.c_str(), sizeof(BufferRef));
+                self.add_tensor(r, tag);
             },
-            nb::arg("t"), nb::arg("tag") = TensorArgType::INPUT,
-            "Add a Tensor with an optional TensorArgType tag (default INPUT)."
+            nb::arg("packed"), nb::arg("tag") = TensorArgType::INPUT,
+            "Add a BufferRef (packed bytes, e.g. buffer_handle.BufferRef.pack()) with an optional "
+            "TensorArgType tag (default INPUT)."
         )
 
         .def(
             "add_scalar", &TaskArgs::add_scalar, nb::arg("s"),
-            "Add a uint64_t scalar. After this, add_tensor() is no longer allowed."
+            "Add a uint64_t scalar. After this, add_ref() is no longer allowed."
         )
 
         .def(
-            "tensor",
-            [](const TaskArgs &self, int32_t i) -> const Tensor & {
-                if (i < 0 || i >= self.tensor_count()) throw std::out_of_range("TaskArgs tensor index out of range");
-                return self.tensor(i);
+            "ref",
+            [](const TaskArgs &self, int32_t i) -> nb::bytes {
+                if (i < 0 || i >= self.tensor_count()) throw std::out_of_range("TaskArgs ref index out of range");
+                const BufferRef &r = self.tensor(i);
+                return nb::bytes(reinterpret_cast<const char *>(&r), sizeof(BufferRef));
             },
-            nb::arg("i"), nb::rv_policy::reference_internal, "Return the Tensor at index i."
+            nb::arg("i"), "Return the packed BufferRef bytes at index i."
         )
 
         .def(
@@ -885,6 +904,49 @@ NB_MODULE(_task_interface, m) {
             },
             "Return total number of arguments (tensors + scalars)."
         );
+
+    // --- TensorTaskArgs (Tensor-typed builder: root-L2 in-process run + the materialized form
+    //     read_args_from_blob returns). L3+ dispatch uses TaskArgs (BufferRef); this is the L2 side. ---
+    nb::class_<TensorTaskArgs>(m, "TensorTaskArgs", nb::is_weak_referenceable())
+        .def(nb::init<>())
+        .def(
+            "add_tensor",
+            [](TensorTaskArgs &self, const Tensor &t, TensorArgType tag) {
+                self.add_tensor(t, tag);
+            },
+            nb::arg("t"), nb::arg("tag") = TensorArgType::INPUT,
+            "Add a Tensor with an optional TensorArgType tag (default INPUT)."
+        )
+        .def("add_scalar", &TensorTaskArgs::add_scalar, nb::arg("s"))
+        .def(
+            "tensor",
+            [](const TensorTaskArgs &self, int32_t i) -> const Tensor & {
+                if (i < 0 || i >= self.tensor_count())
+                    throw std::out_of_range("TensorTaskArgs tensor index out of range");
+                return self.tensor(i);
+            },
+            nb::arg("i"), nb::rv_policy::reference_internal, "Return the Tensor at index i."
+        )
+        .def(
+            "scalar",
+            [](const TensorTaskArgs &self, int32_t i) -> uint64_t {
+                if (i < 0 || i >= self.scalar_count())
+                    throw std::out_of_range("TensorTaskArgs scalar index out of range");
+                return self.scalar(i);
+            },
+            nb::arg("i")
+        )
+        .def(
+            "tag",
+            [](const TensorTaskArgs &self, int32_t i) -> TensorArgType {
+                if (i < 0 || i >= self.tensor_count()) throw std::out_of_range("TensorTaskArgs tag index out of range");
+                return self.tag(i);
+            },
+            nb::arg("i")
+        )
+        .def("tensor_count", &TensorTaskArgs::tensor_count)
+        .def("scalar_count", &TensorTaskArgs::scalar_count)
+        .def("clear", &TensorTaskArgs::clear);
 
     // --- ArgDirection enum ---
     nb::enum_<ArgDirection>(m, "ArgDirection")
@@ -1413,12 +1475,12 @@ NB_MODULE(_task_interface, m) {
         )
         .def(
             "run",
-            [](ChipWorker &self, int32_t callable_id, TaskArgs &args, const CallConfig &config) {
+            [](ChipWorker &self, int32_t callable_id, TensorTaskArgs &args, const CallConfig &config) {
                 TaskArgsView view = make_view(args);
                 self.run(callable_id, view, config);
             },
             nb::arg("callable_id"), nb::arg("args"), nb::arg("config"),
-            "Launch a callable_id from a TaskArgs (used for in-process callers). "
+            "Launch a callable_id from a TensorTaskArgs (used for in-process callers). "
             "Returns None; timing is emitted as `[STRACE]` log markers."
         )
         .def(
@@ -1522,7 +1584,7 @@ NB_MODULE(_task_interface, m) {
         "read_args_from_blob",
         [](uint64_t blob_ptr) {
             TaskArgsView view = read_blob(reinterpret_cast<const uint8_t *>(blob_ptr), MAILBOX_ARGS_CAPACITY);
-            TaskArgs args;
+            TensorTaskArgs args;
             for (int32_t i = 0; i < view.tensor_count; i++) {
                 args.add_tensor(view.tensors(i));
             }
@@ -1534,6 +1596,106 @@ NB_MODULE(_task_interface, m) {
         nb::arg("blob_ptr"),
         "Reconstruct a TaskArgs from a length-prefixed blob at blob_ptr. "
         "Tags are not preserved (blob wire format strips them)."
+    );
+
+    m.def(
+        "materialize_bufferref_blob",
+        [](uint64_t blob_ptr, size_t capacity, nb::dict resolved) -> nb::bytes {
+            const uint8_t *src = reinterpret_cast<const uint8_t *>(blob_ptr);
+            BufferRefBlobView view = read_bufferref_blob(src, capacity);
+            TensorTaskArgs args;
+            for (int32_t i = 0; i < view.ref_count; i++) {
+                BufferRef r = view.ref(i);
+                uint64_t elem = get_element_size(r.dtype);
+                if (elem == 0) {
+                    throw std::runtime_error("materialize_bufferref_blob: unknown dtype");
+                }
+                if (r.byte_offset % elem != 0) {
+                    throw std::runtime_error("materialize_bufferref_blob: byte_offset is not a multiple of dtype size");
+                }
+                nb::bytes key(reinterpret_cast<const char *>(&r.handle.identity), sizeof(CanonicalIdentity));
+                if (!resolved.contains(key)) {
+                    throw std::runtime_error(
+                        "materialize_bufferref_blob: canonical identity not in the import registry"
+                    );
+                }
+                nb::tuple val = nb::cast<nb::tuple>(resolved[key]);
+                auto base = nb::cast<uint64_t>(val[0]);
+                auto addr_space = nb::cast<int>(val[1]);
+                // The view origin is base + byte_offset (start_offset folded into addr); strides carry
+                // any non-row-major layout (transpose / permute / step-slice), matching the mainline
+                // Tensor wire which is natively strided.
+                Tensor t = make_tensor_strided(
+                    reinterpret_cast<void *>(static_cast<uintptr_t>(base + r.byte_offset)), r.shapes, r.strides,
+                    r.ndims, r.dtype, /*manual_dep=*/false, /*version=*/0, static_cast<AddressSpace>(addr_space)
+                );
+                args.add_tensor(t, TensorArgType::INPUT);
+            }
+            for (int32_t i = 0; i < view.scalar_count; i++) {
+                args.add_scalar(view.scalars[i]);
+            }
+            size_t sz = task_args_blob_size(args);
+            std::string out(sz, '\0');
+            write_blob(reinterpret_cast<uint8_t *>(out.data()), args);
+            return nb::bytes(out.data(), sz);
+        },
+        nb::arg("blob_ptr"), nb::arg("capacity"), nb::arg("resolved"),
+        "Materialize a BufferRef blob into a Tensor blob (write_blob format). Each ref's embedded "
+        "handle identity is resolved via `resolved` {identity_bytes: (local_base, address_space)}; "
+        "addr = base + byte_offset. The caller pre-populates `resolved` by materializing each embedded "
+        "descriptor (see bufferref_blob_descriptors) on first receipt. Strided views (transpose / "
+        "permute / step-slice) materialize to strided Tensors. Rejects unknown identity, "
+        "non-dtype-aligned byte_offset."
+    );
+
+    m.def(
+        "bufferref_blob_descriptors",
+        [](uint64_t blob_ptr, size_t capacity) -> nb::list {
+            const uint8_t *src = reinterpret_cast<const uint8_t *>(blob_ptr);
+            BufferRefBlobView view = read_bufferref_blob(src, capacity);
+            nb::list out;
+            for (int32_t i = 0; i < view.ref_count; i++) {
+                BufferRef r = view.ref(i);
+                out.append(nb::bytes(reinterpret_cast<const char *>(&r.handle), sizeof(BufferHandleDescriptor)));
+            }
+            return out;
+        },
+        nb::arg("blob_ptr"), nb::arg("capacity"),
+        "Extract each BufferRef's embedded BufferHandleDescriptor (packed bytes) from a BufferRef "
+        "blob, in ref order. A consumer materializes these lazily on receipt to build the `resolved` "
+        "map passed to materialize_bufferref_blob."
+    );
+
+    m.def(
+        "bufferref_blob_refs",
+        [](uint64_t blob_ptr, size_t capacity) -> nb::list {
+            const uint8_t *src = reinterpret_cast<const uint8_t *>(blob_ptr);
+            BufferRefBlobView view = read_bufferref_blob(src, capacity);
+            nb::list out;
+            for (int32_t i = 0; i < view.ref_count; i++) {
+                BufferRef r = view.ref(i);
+                out.append(nb::bytes(reinterpret_cast<const char *>(&r), sizeof(BufferRef)));
+            }
+            return out;
+        },
+        nb::arg("blob_ptr"), nb::arg("capacity"),
+        "Extract each full packed BufferRef (descriptor + view) from a BufferRef blob, in ref order. "
+        "Used by an L3 orch endpoint to re-export each backing under a local identity before "
+        "forwarding to L2 (no BufferRef pass-through)."
+    );
+
+    m.def(
+        "bufferref_blob_scalars",
+        [](uint64_t blob_ptr, size_t capacity) -> nb::list {
+            const uint8_t *src = reinterpret_cast<const uint8_t *>(blob_ptr);
+            BufferRefBlobView view = read_bufferref_blob(src, capacity);
+            nb::list out;
+            for (int32_t i = 0; i < view.scalar_count; i++) {
+                out.append(view.scalars[i]);
+            }
+            return out;
+        },
+        nb::arg("blob_ptr"), nb::arg("capacity"), "Extract the scalar args (uint64) from a BufferRef blob, in order."
     );
 
     nb::class_<L2ChildOnboardRegionExport>(m, "_L2ChildOnboardRegionExport")

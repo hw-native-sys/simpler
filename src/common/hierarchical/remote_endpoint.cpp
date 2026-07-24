@@ -633,35 +633,39 @@ remote_l3::TaskPayloadWire RemoteL3Endpoint::build_task_payload(const TaskSlotSt
     payload.callable_digest = slot.callable.digest;
     payload.config = slot.config;
 
-    TaskArgsView view = slot.args_view(group_index);
+    const TaskArgs &a = slot.args(group_index);
     const RemoteTaskArgsSidecar &sidecar = slot.remote_sidecar_for(group_index);
-    if (!sidecar.tensors.empty() && sidecar.tensors.size() != static_cast<size_t>(view.tensor_count)) {
+    if (!sidecar.tensors.empty() && sidecar.tensors.size() != static_cast<size_t>(a.tensor_count())) {
         throw std::runtime_error("RemoteL3Endpoint::run: remote sidecar tensor count does not match TaskArgs");
     }
     payload.args.inline_payload = sidecar.inline_payload;
-    payload.args.tensor_metadata.reserve(static_cast<size_t>(view.tensor_count));
-    payload.args.remote_desc.reserve(static_cast<size_t>(view.tensor_count));
+    payload.args.tensor_metadata.reserve(static_cast<size_t>(a.tensor_count()));
+    payload.args.remote_desc.reserve(static_cast<size_t>(a.tensor_count()));
 
-    for (int32_t i = 0; i < view.tensor_count; ++i) {
-        Tensor tensor = view.tensors(i);
+    for (int32_t i = 0; i < a.tensor_count(); ++i) {
+        const BufferRef &ref = a.tensor(i);
         RemoteTensorSidecar tensor_sidecar{};
         if (!sidecar.tensors.empty()) tensor_sidecar = sidecar.tensors[static_cast<size_t>(i)];
-        if (tensor.buffer.addr != 0 && !tensor_sidecar.present) {
-            throw std::runtime_error("RemoteL3Endpoint::run: bare host pointer submitted without remote sidecar");
+        bool has_local_backing =
+            ref.handle.nbytes != 0 && ref.handle.backend_kind != static_cast<uint8_t>(BackendKind::REMOTE_SIDECAR);
+        if (has_local_backing && !tensor_sidecar.present) {
+            throw std::runtime_error("RemoteL3Endpoint::run: local backing submitted without remote sidecar");
         }
-        if (tensor.is_child_memory() && !tensor_sidecar.present) {
-            throw std::runtime_error("RemoteL3Endpoint::run: child-memory tensor submitted without remote sidecar");
+        if (ref.handle.address_space == static_cast<uint8_t>(AddressSpace::DEVICE) && !tensor_sidecar.present) {
+            throw std::runtime_error("RemoteL3Endpoint::run: device-memory tensor submitted without remote sidecar");
         }
-        if (!tensor_sidecar.present && tensor.nbytes() != 0) {
-            throw std::runtime_error("RemoteL3Endpoint::run: tensor payload submitted without remote sidecar");
-        }
-        tensor.buffer.addr = 0;
-        payload.args.tensor_metadata.push_back(tensor);
+        // Metadata is the ref's view geometry with a null address (the remote side re-materializes
+        // from remote_desc); shape/dtype travel, the backing does not.
+        Tensor meta = make_tensor_external(
+            nullptr, ref.shapes, ref.ndims, ref.dtype, /*manual_dep=*/false, /*version=*/0,
+            static_cast<AddressSpace>(ref.handle.address_space)
+        );
+        payload.args.tensor_metadata.push_back(meta);
         payload.args.remote_desc.push_back(tensor_sidecar);
     }
-    payload.args.scalars.reserve(static_cast<size_t>(view.scalar_count));
-    for (int32_t i = 0; i < view.scalar_count; ++i)
-        payload.args.scalars.push_back(view.scalars[i]);
+    payload.args.scalars.reserve(static_cast<size_t>(a.scalar_count()));
+    for (int32_t i = 0; i < a.scalar_count(); ++i)
+        payload.args.scalars.push_back(a.scalar(i));
     return payload;
 }
 

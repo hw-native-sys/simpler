@@ -440,22 +440,23 @@ void Orchestrator::validate_remote_sidecars(
             }
         }
         for (int32_t i = 0; i < args.tensor_count(); ++i) {
-            const Tensor &tensor = args.tensor(i);
+            const BufferRef &ref = args.tensor(i);
             const RemoteTensorSidecar &tensor_sidecar = sidecar.tensors[static_cast<size_t>(i)];
-            if (tensor_sidecar.present && tensor.buffer.addr != 0) {
-                throw std::invalid_argument("Orchestrator: remote tensor metadata data field must be zero");
+            // A remote arg carries no local backing: its BufferRef is a placeholder (nbytes 0 or a
+            // REMOTE_SIDECAR backend) and the real descriptor lives in the sidecar.
+            bool has_local_backing =
+                ref.handle.nbytes != 0 && ref.handle.backend_kind != static_cast<uint8_t>(BackendKind::REMOTE_SIDECAR);
+            if (tensor_sidecar.present && has_local_backing) {
+                throw std::invalid_argument("Orchestrator: remote tensor metadata must not carry a local backing");
             }
-            if (!tensor_sidecar.present && tensor.buffer.addr != 0) {
-                throw std::invalid_argument("Orchestrator: remote tensor uses a bare host pointer without sidecar");
+            if (!tensor_sidecar.present && has_local_backing) {
+                throw std::invalid_argument("Orchestrator: remote tensor uses a local backing without sidecar");
             }
-            if (args.tag(i) == TensorArgType::OUTPUT && tensor.buffer.addr == 0 && !tensor_sidecar.present) {
+            if (args.tag(i) == TensorArgType::OUTPUT && !has_local_backing && !tensor_sidecar.present) {
                 throw std::invalid_argument("Orchestrator: remote OUTPUT tensor requires a RemoteTensorRef sidecar");
             }
-            if (!tensor_sidecar.present && tensor.nbytes() != 0) {
-                throw std::invalid_argument("Orchestrator: remote tensor payload requires a RemoteTensorRef sidecar");
-            }
-            if (tensor.is_child_memory() && !tensor_sidecar.present) {
-                throw std::invalid_argument("Orchestrator: remote child-memory tensor requires a sidecar");
+            if (ref.handle.address_space == static_cast<uint8_t>(AddressSpace::DEVICE) && !tensor_sidecar.present) {
+                throw std::invalid_argument("Orchestrator: remote device-memory tensor requires a sidecar");
             }
             if (tensor_sidecar.present && tensor_sidecar.desc.address_space != RemoteAddressSpace::HOST_INLINE) {
                 if (tensor_sidecar.desc.owner_worker_id < 0) {
@@ -481,55 +482,20 @@ void Orchestrator::validate_remote_sidecars(
 }
 
 // =============================================================================
-// reserve_outputs_and_slot — atomic slot + heap carve-up for this submit
+// reserve_slot — claim this submit's task slot
 // =============================================================================
 //
-// Walks every OUTPUT-tagged tensor that arrived with `data == 0` and reserves
-// aligned slabs out of a single contiguous HeapRing allocation. OUTPUT tensors
-// with a user-supplied data pointer are left untouched (that's the
-// OUTPUT_EXISTING-equivalent back-compat path for callers that pre-fill
-// OUTPUT.data themselves). The single allocator call owns both the slot and
-// the heap range, so there is no partial-failure rollback.
+// A slot-only allocation (0 heap bytes). Args are BufferRefs backed by handles the
+// caller already owns (create_buffer / create_host_buffer), so the orchestrator no
+// longer auto-allocates OUTPUT memory — an OUTPUT is a handle-backed ref like any
+// other, tracked by canonical identity in infer_deps.
 
 AllocResult Orchestrator::reserve_outputs_and_slot(
     std::vector<TaskArgs> &args_list, const std::vector<RemoteTaskArgsSidecar> &remote_sidecars
 ) {
-    uint64_t total_bytes = 0;
-    for (size_t g = 0; g < args_list.size(); ++g) {
-        const TaskArgs &a = args_list[g];
-        for (int32_t i = 0; i < a.tensor_count(); ++i) {
-            if (a.tag(i) != TensorArgType::OUTPUT) continue;
-            if (a.tensor(i).buffer.addr != 0) continue;  // user supplied a pointer — leave alone
-            bool remote_output = !remote_sidecars.empty() &&
-                                 static_cast<size_t>(i) < remote_sidecars[g].tensors.size() &&
-                                 remote_sidecars[g].tensors[static_cast<size_t>(i)].present;
-            if (remote_output) continue;
-            total_bytes += output_alloc_bytes(a.tensor(i));
-        }
-    }
-
-    AllocResult ar = allocator_->alloc(total_bytes, scope_->current_depth());
-    if (ar.slot == INVALID_SLOT) return ar;
-
-    // Hand slabs out in the same order we counted them.
-    uint64_t off = 0;
-    char *base = static_cast<char *>(ar.heap_ptr);
-    for (size_t g = 0; g < args_list.size(); ++g) {
-        TaskArgs &a = args_list[g];
-        for (int32_t i = 0; i < a.tensor_count(); ++i) {
-            if (a.tag(i) != TensorArgType::OUTPUT) continue;
-            Tensor &t = a.tensor(i);
-            if (t.buffer.addr != 0) continue;
-            bool remote_output = !remote_sidecars.empty() &&
-                                 static_cast<size_t>(i) < remote_sidecars[g].tensors.size() &&
-                                 remote_sidecars[g].tensors[static_cast<size_t>(i)].present;
-            if (remote_output) continue;
-            uint64_t slab = output_alloc_bytes(t);
-            t.buffer.addr = reinterpret_cast<uint64_t>(base + off);
-            off += slab;
-        }
-    }
-    return ar;
+    (void)args_list;
+    (void)remote_sidecars;
+    return allocator_->alloc(0, scope_->current_depth());
 }
 
 // =============================================================================
@@ -574,7 +540,7 @@ void Orchestrator::infer_deps(
         int32_t worker_id = (g < target_worker_ids.size()) ? target_worker_ids[g] : -1;
         const TaskArgs &a = args_list[g];
         for (int32_t i = 0; i < a.tensor_count(); ++i) {
-            const Tensor &t = a.tensor(i);
+            const BufferRef &r = a.tensor(i);
             TensorKey key{};
             bool has_key = false;
             if (!remote_sidecars.empty()) {
@@ -592,9 +558,18 @@ void Orchestrator::infer_deps(
                 }
             }
             if (!has_key) {
-                if (t.buffer.addr == 0) continue;  // null tensor — nothing to track
-                key = t.is_child_memory() ? TensorKey::local_child(t.buffer.addr, worker_id) :
-                                            TensorKey::local_host(t.buffer.addr);
+                if (r.handle.nbytes == 0) continue;  // placeholder / null ref — nothing to track
+                // Key a local BufferRef by its canonical identity alone (buffer granularity) — the
+                // successor of the former buffer-address key now that BufferRef carries identity, not
+                // an address. Any two refs to the same buffer collide (a candidate dependency); the
+                // byte_offset/footprint overlap that would refine this to only *conflicting* sub-views
+                // is a future precision pass, not part of the key (folding it in would split
+                // same-buffer refs into distinct keys and miss real dependencies).
+                CanonicalIdentityHash idh;
+                uint64_t k = idh(r.handle.identity);
+                key = r.handle.address_space == static_cast<uint8_t>(AddressSpace::DEVICE) ?
+                          TensorKey::local_child(k, worker_id) :
+                          TensorKey::local_host(k);
                 has_key = true;
             }
             TensorArgType tag = a.tag(i);

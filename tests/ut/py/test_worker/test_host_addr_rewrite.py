@@ -18,7 +18,7 @@ per-tensor ``child_memory`` flag, not on the numeric address alone.
 
 import struct
 
-from _task_interface import TENSOR_CHILD_MEMORY_OFFSET, TENSOR_STRIDE_BYTES
+from _task_interface import TENSOR_ADDRESS_SPACE_OFFSET, TENSOR_STRIDE_BYTES
 from simpler.worker import _BLOB_HEADER_BYTES, _rewrite_blob_host_addrs
 
 _PARENT_LO = 0x7F00_0000_0000
@@ -40,7 +40,7 @@ def _make_blob(tensors: list[tuple[int, int]]) -> bytearray:
     for i, (addr, child_mem) in enumerate(tensors):
         off = _BLOB_HEADER_BYTES + i * TENSOR_STRIDE_BYTES
         struct.pack_into("<Q", buf, off, addr)
-        struct.pack_into("<B", buf, off + TENSOR_CHILD_MEMORY_OFFSET, child_mem)
+        struct.pack_into("<B", buf, off + TENSOR_ADDRESS_SPACE_OFFSET, child_mem)
     return buf
 
 

@@ -43,7 +43,8 @@
 #include <vector>
 
 #include "arg_direction.h"
-#include "tensor.h"  // unified Tensor (strided) + TensorArgType, carried by TaskArgs and on the wire
+#include "buffer_handle.h"  // BufferRef wire type + BUFFER_ABI_VERSION for the versioned BufferRef blob
+#include "tensor.h"         // unified Tensor (strided) + TensorArgType, carried by TaskArgs and on the wire
 
 // ============================================================================
 // TensorTagMixin — conditionally provides per-tensor tag storage
@@ -173,8 +174,16 @@ struct TaskArgsTpl<T, S, 0, 0, TensorTag> : TensorTagMixin<TensorTag, 0> {
 
 // Unified user-facing builder: vector-backed with TensorArgType tags.
 // Used by Orchestrator.submit_*; tags drive dependency inference at submit
-// time and are stripped before the args cross the dispatch boundary.
-using TaskArgs = TaskArgsTpl<Tensor, uint64_t, 0, 0, TensorArgType>;
+// time and are stripped before the args cross the dispatch boundary. The element
+// is BufferRef (self-describing view; L3+ holds no C++ Tensor) — the L3→L2 wire
+// carries BufferRefs, materialized to ChipStorageTaskArgs (Tensor) on the L2 child.
+using TaskArgs = TaskArgsTpl<BufferRef, uint64_t, 0, 0, TensorArgType>;
+
+// Tensor-typed args — the materialized form used at the L2 boundary and for the
+// Tensor-blob round trip (write_blob / read_blob / make_view). Distinct from the
+// BufferRef-typed TaskArgs the L3 orchestrator dispatches: a BufferRef blob is
+// materialized into these on the L2 child before run.
+using TensorTaskArgs = TaskArgsTpl<Tensor, uint64_t, 0, 0, TensorArgType>;
 
 // L2 runtime ABI: fixed POD matching runtime.so byte-for-byte.
 // Assembled from a TaskArgsView on the child side just before pto2_run_runtime.
@@ -213,7 +222,7 @@ struct TaskArgsView {
 };
 
 // Build a view directly over a TaskArgs's vectors (THREAD-mode dispatch).
-inline TaskArgsView make_view(const TaskArgs &a) {
+inline TaskArgsView make_view(const TensorTaskArgs &a) {
     return TaskArgsView{
         a.tensor_count(), a.scalar_count(), reinterpret_cast<const uint8_t *>(a.tensor_data()), a.scalar_data()
     };
@@ -237,14 +246,14 @@ inline TaskArgsView make_view(const TaskArgs &a) {
 
 inline constexpr size_t TASK_ARGS_BLOB_HEADER_SIZE = 8;
 
-inline size_t task_args_blob_size(const TaskArgs &a) {
+inline size_t task_args_blob_size(const TensorTaskArgs &a) {
     return TASK_ARGS_BLOB_HEADER_SIZE + static_cast<size_t>(a.tensor_count()) * sizeof(Tensor) +
            static_cast<size_t>(a.scalar_count()) * sizeof(uint64_t);
 }
 
 // Serialize a TaskArgs into `dst`. Caller must ensure `dst` has room for
 // task_args_blob_size(a) bytes. Tags are not written.
-inline void write_blob(uint8_t *dst, const TaskArgs &a) {
+inline void write_blob(uint8_t *dst, const TensorTaskArgs &a) {
     int32_t T = a.tensor_count();
     int32_t S = a.scalar_count();
     std::memcpy(dst + 0, &T, sizeof(T));
@@ -298,6 +307,114 @@ inline TaskArgsView read_blob(const uint8_t *src, size_t capacity) {
         S,
         src + TASK_ARGS_BLOB_HEADER_SIZE,
         reinterpret_cast<const uint64_t *>(src + TASK_ARGS_BLOB_HEADER_SIZE + static_cast<size_t>(T) * sizeof(Tensor)),
+    };
+}
+
+// ============================================================================
+// BufferRef wire blob — versioned, length-prefixed (P1-B).
+// ============================================================================
+//
+// Byte layout:
+//   offset 0:         uint32   abi_version = BUFFER_ABI_VERSION
+//   offset 4:         int32    ref_count = R
+//   offset 8:         int32    scalar_count = S
+//   offset 12:        uint32   reserved (= 0)
+//   offset 16:        BufferRef refs[R]           (sizeof(BufferRef) B each)
+//   offset 16 + R*sizeof(BufferRef):  uint64_t  scalars[S]
+//
+// The element is BufferRef (embedded handle descriptor + view, no materialized addr) and the envelope
+// carries abi_version so a decoder rejects an unknown layout rather than misreading it. The
+// reserved word 8-aligns refs[0] (whose first field is a u64) and gates a future layout bump: a
+// non-zero reserved is rejected.
+
+inline constexpr size_t BUFFERREF_BLOB_HEADER_SIZE = 16;
+
+struct BufferRefBlobView {
+    int32_t ref_count;
+    int32_t scalar_count;
+    const uint8_t *ref_bytes;  // R contiguous BufferRef; extract element i with ref(i)
+    const uint64_t *scalars;
+
+    BufferRef ref(int32_t i) const {
+        BufferRef r;
+        std::memcpy(&r, ref_bytes + static_cast<size_t>(i) * sizeof(BufferRef), sizeof(BufferRef));
+        return r;
+    }
+};
+
+inline size_t bufferref_blob_size(int32_t ref_count, int32_t scalar_count) {
+    return BUFFERREF_BLOB_HEADER_SIZE + static_cast<size_t>(ref_count) * sizeof(BufferRef) +
+           static_cast<size_t>(scalar_count) * sizeof(uint64_t);
+}
+
+// Serialize refs + scalars into `dst` (caller ensures room for bufferref_blob_size). Writes the
+// current abi_version into the envelope.
+inline void write_bufferref_blob(
+    uint8_t *dst, const BufferRef *refs, int32_t ref_count, const uint64_t *scalars, int32_t scalar_count
+) {
+    uint32_t version = BUFFER_ABI_VERSION;
+    uint32_t reserved = 0;
+    std::memcpy(dst + 0, &version, sizeof(version));
+    std::memcpy(dst + 4, &ref_count, sizeof(ref_count));
+    std::memcpy(dst + 8, &scalar_count, sizeof(scalar_count));
+    std::memcpy(dst + 12, &reserved, sizeof(reserved));
+    if (ref_count > 0) {
+        std::memcpy(dst + BUFFERREF_BLOB_HEADER_SIZE, refs, static_cast<size_t>(ref_count) * sizeof(BufferRef));
+    }
+    if (scalar_count > 0) {
+        std::memcpy(
+            dst + BUFFERREF_BLOB_HEADER_SIZE + static_cast<size_t>(ref_count) * sizeof(BufferRef), scalars,
+            static_cast<size_t>(scalar_count) * sizeof(uint64_t)
+        );
+    }
+}
+
+// Zero-copy view into a blob written by write_bufferref_blob; valid while `src` stays mapped.
+// `capacity` bounds the read. Throws on an unknown abi_version, negative counts, or a header that
+// would walk past `capacity` (shared-memory corruption or a writer-side bug).
+inline BufferRefBlobView read_bufferref_blob(const uint8_t *src, size_t capacity) {
+    if (capacity < BUFFERREF_BLOB_HEADER_SIZE) {
+        throw std::runtime_error(
+            "read_bufferref_blob: capacity " + std::to_string(capacity) + " < header size " +
+            std::to_string(BUFFERREF_BLOB_HEADER_SIZE)
+        );
+    }
+    uint32_t version;
+    std::memcpy(&version, src + 0, sizeof(version));
+    if (version != BUFFER_ABI_VERSION) {
+        throw std::runtime_error(
+            "read_bufferref_blob: unknown abi_version " + std::to_string(version) + " (expected " +
+            std::to_string(BUFFER_ABI_VERSION) + ")"
+        );
+    }
+    int32_t R;
+    int32_t S;
+    uint32_t reserved;
+    std::memcpy(&R, src + 4, sizeof(R));
+    std::memcpy(&S, src + 8, sizeof(S));
+    std::memcpy(&reserved, src + 12, sizeof(reserved));
+    if (reserved != 0) {
+        throw std::runtime_error("read_bufferref_blob: reserved header word must be zero");
+    }
+    if (R < 0 || S < 0) {
+        throw std::runtime_error(
+            "read_bufferref_blob: negative counts — refs=" + std::to_string(R) + ", scalars=" + std::to_string(S)
+        );
+    }
+    const size_t needed = bufferref_blob_size(R, S);
+    if (needed > capacity) {
+        throw std::runtime_error(
+            "read_bufferref_blob: header reports " + std::to_string(needed) + " bytes (R=" + std::to_string(R) +
+            ", S=" + std::to_string(S) + ") but capacity is " + std::to_string(capacity)
+        );
+    }
+    return BufferRefBlobView{
+        R,
+        S,
+        src + BUFFERREF_BLOB_HEADER_SIZE,
+        reinterpret_cast<const uint64_t *>(
+            src + BUFFERREF_BLOB_HEADER_SIZE + static_cast<size_t>(R) * sizeof(BufferRef)
+        ),
     };
 }
 

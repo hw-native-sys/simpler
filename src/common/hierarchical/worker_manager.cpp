@@ -256,7 +256,7 @@ WorkerCompletion LocalMailboxEndpoint::run(Ring *ring, const WorkerDispatch &dis
     if (ring == nullptr) throw std::invalid_argument("LocalMailboxEndpoint::run: null ring");
     TaskSlotState &s = *ring->slot_state(dispatch.task_slot);
     int32_t group_index = dispatch.group_index;
-    TaskArgsView view = s.args_view(group_index);
+    const TaskArgs &a = s.args(group_index);
     if (!s.remote_sidecar_for(group_index).empty()) {
         WorkerCompletion completion;
         completion.task_slot = dispatch.task_slot;
@@ -292,34 +292,22 @@ WorkerCompletion LocalMailboxEndpoint::run(Ring *ring, const WorkerDispatch &dis
     // Write config as a single packed POD block (see call_config.h).
     std::memcpy(mbox() + MAILBOX_OFF_CONFIG, &s.config, sizeof(CallConfig));
 
-    // Write length-prefixed TaskArgs blob: [T][S][tensors][scalars].
-    size_t blob_bytes = TASK_ARGS_BLOB_HEADER_SIZE + static_cast<size_t>(view.tensor_count) * sizeof(Tensor) +
-                        static_cast<size_t>(view.scalar_count) * sizeof(uint64_t);
+    // Write the versioned, length-prefixed BufferRef blob (the L3→L2 wire; the child materializes it
+    // to a Tensor blob before run).
+    size_t blob_bytes = bufferref_blob_size(a.tensor_count(), a.scalar_count());
     if (blob_bytes > MAILBOX_ARGS_CAPACITY) {
         completion.outcome = EndpointOutcome::ENDPOINT_FAILURE;
         completion.error_message =
             "LocalMailboxEndpoint::run: args blob exceeds mailbox capacity: need " + std::to_string(blob_bytes) +
             " bytes, capacity " + std::to_string(MAILBOX_ARGS_CAPACITY) +
-            " bytes, tensors=" + std::to_string(view.tensor_count) + ", scalars=" + std::to_string(view.scalar_count);
+            " bytes, refs=" + std::to_string(a.tensor_count()) + ", scalars=" + std::to_string(a.scalar_count());
         return completion;
     }
     uint8_t *hash_dst = reinterpret_cast<uint8_t *>(mbox() + MAILBOX_OFF_TASK_CALLABLE_HASH);
     std::memcpy(hash_dst, s.callable.digest.data(), CALLABLE_HASH_DIGEST_SIZE);
 
     uint8_t *d = reinterpret_cast<uint8_t *>(mbox() + MAILBOX_OFF_TASK_ARGS_BLOB);
-    std::memcpy(d + 0, &view.tensor_count, sizeof(int32_t));
-    std::memcpy(d + 4, &view.scalar_count, sizeof(int32_t));
-    if (view.tensor_count > 0) {
-        std::memcpy(
-            d + TASK_ARGS_BLOB_HEADER_SIZE, view.tensor_bytes, static_cast<size_t>(view.tensor_count) * sizeof(Tensor)
-        );
-    }
-    if (view.scalar_count > 0) {
-        std::memcpy(
-            d + TASK_ARGS_BLOB_HEADER_SIZE + static_cast<size_t>(view.tensor_count) * sizeof(Tensor), view.scalars,
-            static_cast<size_t>(view.scalar_count) * sizeof(uint64_t)
-        );
-    }
+    write_bufferref_blob(d, a.tensor_data(), a.tensor_count(), a.scalar_data(), a.scalar_count());
 
     // Signal child process.
     write_mailbox_state(MailboxState::TASK_READY);

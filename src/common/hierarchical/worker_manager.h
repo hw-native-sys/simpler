@@ -74,15 +74,12 @@ enum class MailboxState : int32_t {
     INIT_FAILED = 7,
 };
 
-// Sized so the args region can hold any TaskArgs the runtime itself accepts
-// (CHIP_MAX_TENSOR_ARGS tensors + CHIP_MAX_SCALAR_ARGS scalars; see the
-// static_assert after MAILBOX_ARGS_CAPACITY). 4096 was too tight for composed
-// child kernels with many tensor args (issue #1024).
-// Bumped 16384 -> 32768 when TaskArgs moved from the former 40 B compact tensor
-// to the unified 128 B Tensor: the worst-case blob (CHIP_MAX_TENSOR_ARGS tensors)
-// grew ~3x, and 128*128 B = 16 KB alone exceeded the old mailbox (see the
-// capacity static_assert after MAILBOX_ARGS_CAPACITY).
-static constexpr size_t MAILBOX_SIZE = 32768;
+// Sized so the args region holds the largest args blob the runtime accepts:
+// CHIP_MAX_TENSOR_ARGS elements at sizeof(BufferRef) (the self-describing wire
+// element, 272 B) + CHIP_MAX_SCALAR_ARGS scalars ~= 35.9 KB (see the capacity
+// static_assert after MAILBOX_ARGS_CAPACITY). 40960 = 10 * 4 KB pages. The 272 B
+// BufferRef dominates the 128 B Tensor blob, so a Tensor-wire dispatch also fits.
+static constexpr size_t MAILBOX_SIZE = 40960;
 
 // Error message region lives at the mailbox tail. 256 B of headroom is
 // enough for `<ExceptionType>: <short message>` produced by the child-side
@@ -120,9 +117,11 @@ static constexpr ptrdiff_t MAILBOX_OFF_CONTROL_CALLABLE_HASH =
 static constexpr size_t MAILBOX_ARGS_CAPACITY =
     MAILBOX_SIZE - static_cast<size_t>(MAILBOX_OFF_TASK_ARGS_BLOB) - MAILBOX_ERROR_MSG_SIZE;
 static_assert(
-    MAILBOX_ARGS_CAPACITY >= TASK_ARGS_BLOB_HEADER_SIZE + static_cast<size_t>(CHIP_MAX_TENSOR_ARGS) * sizeof(Tensor) +
+    MAILBOX_ARGS_CAPACITY >= BUFFERREF_BLOB_HEADER_SIZE +
+                                 static_cast<size_t>(CHIP_MAX_TENSOR_ARGS) * sizeof(BufferRef) +
                                  static_cast<size_t>(CHIP_MAX_SCALAR_ARGS) * sizeof(uint64_t),
-    "mailbox args region must hold the largest TaskArgs blob the runtime accepts (issue #1024)"
+    "mailbox args region must hold the largest args blob the runtime accepts: the self-describing "
+    "BufferRef wire (272 B/arg) dominates the 128 B Tensor blob (issue #1024)"
 );
 
 // Control sub-commands (written at MAILBOX_OFF_CALLABLE when state == CONTROL_*)

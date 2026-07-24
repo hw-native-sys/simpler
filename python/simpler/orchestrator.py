@@ -39,6 +39,7 @@ from typing import Any
 
 from _task_interface import _Orchestrator as _COrchestrator  # pyright: ignore[reportMissingImports]
 
+from .buffer_handle import BufferHandle, wrap_device_malloc
 from .callable_identity import CallableHandle
 from .task_interface import (
     CallConfig,
@@ -53,6 +54,7 @@ from .task_interface import (
     _remote_sidecar_for,
     _RemoteTaskArgsSidecar,
     _validate_remote_sidecar_access,
+    get_element_size,
 )
 
 
@@ -201,11 +203,6 @@ class Orchestrator:
                 raise TypeError("RemoteTensorRef is only supported for RemoteCallable NEXT_LEVEL submits")
             remote_sidecar = None
         _validate_remote_sidecar_access(c_args, remote_sidecar)
-        # Validate the post-fork host buffers of this submit (issue #1027). Only
-        # the LOCAL_CHIP path dereferences raw host pointers in the forked child;
-        # zero-copy buffers need no per-run mirror, just an in-range fit check.
-        if target_namespace == "LOCAL_CHIP" and self._worker is not None:
-            self._worker._stage_host_buffers_for_chip_submit(c_args)
         final_worker_ids = _remote_data_eligible_worker_ids(remote_sidecar, eligible_worker_ids)
         worker = self._worker
         # Do the (fallible) kind4 provenance analysis BEFORE capturing remote slot
@@ -285,11 +282,6 @@ class Orchestrator:
         if remote_sidecars is not None:
             for c_args, remote_sidecar in zip(c_args_list, remote_sidecars):
                 _validate_remote_sidecar_access(c_args, remote_sidecar)
-        # Validate post-fork host buffers for chip dispatch (issue #1027), same as
-        # the single submit path.
-        if target_namespace == "LOCAL_CHIP" and self._worker is not None:
-            for c_args in c_args_list:
-                self._worker._stage_host_buffers_for_chip_submit(c_args)
         worker_id_sets = (
             [
                 _remote_data_eligible_worker_ids(remote_sidecar, eligible_worker_ids)
@@ -485,6 +477,37 @@ class Orchestrator:
             ptr = int(self._o.malloc(wid, sz))
             self._worker._child_prov_record_malloc(wid, ptr)
             return ptr
+
+    def device_handle(self, device_ptr: int, nbytes: int) -> BufferHandle:
+        """Wrap an ``orch.malloc`` device pointer as a DEVICE_MALLOC ``BufferHandle`` owned by this
+        worker, for naming a chip task arg as a BufferRef (``dev_h.ref(shapes, dtype)`` →
+        ``ta.add_ref(...)``). The pointer is chip-local (valid only on the worker that allocated it),
+        so the ref must be dispatched only to that worker — the successor of the ``child_memory=True``
+        Tensor.
+        """
+        if self._worker is None:
+            raise RuntimeError("orch.device_handle requires a Worker context")
+        return wrap_device_malloc(
+            int(device_ptr),
+            int(nbytes),
+            self._worker._owner_instance_id,
+            self._worker._next_buffer_id(),
+            f"L{self._worker.level}",
+        )
+
+    def alloc_child_tensor(self, worker_id: int, shapes: tuple[int, ...], dtype: DataType) -> BufferHandle:
+        """Allocate device memory on next-level ``worker_id`` sized for ``shapes`` × ``dtype`` and wrap
+        it as a DEVICE_MALLOC ``BufferHandle`` (kind4; successor of ``orch.malloc`` + ``child_memory``).
+
+        Combines ``orch.malloc`` + ``orch.device_handle``. The pointer is private to ``worker_id``; name
+        the arg with ``handle.ref(shapes, dtype)`` and dispatch it only to that worker. Load host data
+        into it with ``orch.copy_to``. Not auto-freed at end-of-task.
+        """
+        nbytes = get_element_size(dtype)
+        for s in shapes:
+            nbytes *= int(s)
+        ptr = self.malloc(worker_id=int(worker_id), size=int(nbytes))
+        return self.device_handle(ptr, int(nbytes))
 
     def free(self, worker_id: int, ptr: int) -> None:
         """Free memory on next-level worker *worker_id*."""

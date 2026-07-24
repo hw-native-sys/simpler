@@ -57,14 +57,12 @@ from simpler.task_interface import (
     CoreCallable,
     DataType,
     TaskArgs,
-    Tensor,
     TensorArgType,
 )
 from simpler.worker import Worker
 
 from simpler_setup.kernel_compiler import KernelCompiler
 from simpler_setup.pto_isa import ensure_pto_isa_root
-from simpler_setup.torch_interop import make_tensor_arg
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 KERNELS_DIR = os.path.normpath(os.path.join(HERE, "../../../a2a3/tensormap_and_ringbuffer/vector_example/kernels"))
@@ -124,19 +122,14 @@ def run(platform: str, device_id: int) -> int:
     """Core logic — callable from both CLI and pytest."""
     print(f"[child_memory] platform={platform} device={device_id}")
 
-    # --- 1. Host tensors. share_memory_() makes data_ptr() valid in the chip
-    # child process — the orchestration's copy_to reads it from there.
+    # --- 1. The H2D source weight. share_memory_() makes data_ptr() valid in the chip child, where
+    # orch.copy_to reads it. Inputs/outputs are handle-backed shared buffers (create_buffer, below).
     torch.manual_seed(0)
-    host_a = torch.full((SIZE,), 2.0, dtype=torch.float32).share_memory_()
     host_w = torch.full((SIZE,), 3.0, dtype=torch.float32).share_memory_()
-    host_f1 = torch.zeros(SIZE, dtype=torch.float32).share_memory_()
-    host_f2 = torch.zeros(SIZE, dtype=torch.float32).share_memory_()
-    s = host_a + host_w
-    expected = (s + 1) * (s + 2) + s
 
     # --- 2. Worker(level=3, ...) — single chip, no Python sub-workers. We
-    # still need level=3 (not level=2) because orch.malloc + child_memory
-    # require the L3 Orchestrator to reach into the chip child via mailbox.
+    # still need level=3 (not level=2) because orch.malloc + a device (DEVICE_MALLOC)
+    # task arg require the L3 Orchestrator to reach into the chip child via mailbox.
     worker = Worker(
         level=3,
         platform=platform,
@@ -152,45 +145,57 @@ def run(platform: str, device_id: int) -> int:
     print("[child_memory] init worker...")
     worker.init()
 
+    f32 = DataType.FLOAT32.value
+    a = f1 = f2 = None
     try:
+        # Born-shared input/output buffers (post-fork, attached into the chip child). torch is used
+        # only here at the run boundary to fill the input and read the outputs.
+        def _view(handle):
+            shm = handle.shm
+            assert shm is not None
+            return torch.frombuffer(shm.buf, dtype=torch.float32, count=SIZE)
+
+        a_h = worker.create_buffer(NBYTES)
+        f1_h = worker.create_buffer(NBYTES)
+        f2_h = worker.create_buffer(NBYTES)
+        a = _view(a_h)
+        f1 = _view(f1_h)
+        f2 = _view(f2_h)
+        a.fill_(2.0)
+        f1.zero_()
+        f2.zero_()
+        s = a + host_w
+        expected = (s + 1) * (s + 2) + s
 
         def orch_fn(orch, _args, cfg):
-            # Allocate weight on chip 0. orch.malloc forwards CTRL_MALLOC over
-            # the mailbox to the chip child, which calls ChipWorker::malloc ->
-            # device_malloc_ctx -> rtMalloc inside its own bound device context.
-            dev_w = orch.malloc(worker_id=0, size=NBYTES)
-            orch.copy_to(worker_id=0, dst=dev_w, src=host_w.data_ptr(), size=NBYTES)
+            # Allocate the weight on chip 0 as a DEVICE_MALLOC handle (kind4; successor of
+            # orch.malloc + child_memory=True). alloc_child_tensor rtMallocs inside the chip child's
+            # bound device context and wraps the pointer as a handle owned by this worker — NOT
+            # auto-freed at end-of-task, so both kernel calls share the same live weight (reclaimed at
+            # worker.close()). Its .base is the device pointer, the copy_to destination.
+            w_h = orch.alloc_child_tensor(worker_id=0, shapes=(SIZE,), dtype=DataType.FLOAT32)
+            orch.copy_to(worker_id=0, dst=w_h.base, src=host_w.data_ptr(), size=NBYTES)
 
-            # child_memory=True: tell the runtime "this pointer already lives
-            # on the worker; do NOT auto-malloc, do NOT auto-free at end-of-task".
-            # Without this flag the first task's teardown would free dev_w and
-            # the second task would read freed memory.
-            w_dev = Tensor.make(dev_w, (SIZE,), DataType.FLOAT32, child_memory=True)
-
-            # Two kernel invocations sharing the weight, pinned to chip 0.
-            for out in (host_f1, host_f2):
-                a = TaskArgs()
-                a.add_tensor(make_tensor_arg(host_a), TensorArgType.INPUT)
-                a.add_tensor(w_dev, TensorArgType.INPUT)
-                a.add_tensor(make_tensor_arg(out), TensorArgType.OUTPUT_EXISTING)
-                orch.submit_next_level(chip_handle, a, cfg, worker=0)
-
-            # dev_w is reclaimed by DeviceRunner::finalize on worker.close() —
-            # we don't orch.free it here, that's the whole point of child_memory.
+            for out_h in (f1_h, f2_h):
+                ta = TaskArgs()
+                ta.add_ref(a_h.ref(shapes=(SIZE,), dtype=f32), TensorArgType.INPUT)
+                ta.add_ref(w_h.ref(shapes=(SIZE,), dtype=f32), TensorArgType.INPUT)
+                ta.add_ref(out_h.ref(shapes=(SIZE,), dtype=f32), TensorArgType.OUTPUT_EXISTING)
+                orch.submit_next_level(chip_handle, ta, cfg, worker=0)
 
         print("[child_memory] running DAG (1 malloc + 1 copy_to + 2 kernel tasks)...")
         worker.run(orch_fn, args=None, config=CallConfig())
 
-        # --- 3. Verify — both outputs must equal the same golden, and they
-        # must agree with each other (proves the second invocation read the
-        # same weight, not freed/garbage memory).
-        for tag, got in (("f1", host_f1), ("f2", host_f2)):
+        # --- 3. Verify — both outputs must equal the same golden, and they must agree with each other
+        # (proves the second invocation read the same weight, not freed/garbage memory).
+        for tag, got in (("f1", f1), ("f2", f2)):
             max_diff = float(torch.max(torch.abs(got - expected)))
             print(f"[child_memory] {tag}: max |got - expected| = {max_diff:.3e}")
             assert torch.allclose(got, expected, rtol=1e-5, atol=1e-5), f"{tag} mismatch"
-        assert torch.equal(host_f1, host_f2), "f1 and f2 diverged — weight buffer was not preserved"
+        assert torch.equal(f1, f2), "f1 and f2 diverged — weight buffer was not preserved"
         print("[child_memory] golden + cross-invocation checks PASSED")
     finally:
+        a = f1 = f2 = None  # drop views before close unlinks the shm
         worker.close()
     return 0
 

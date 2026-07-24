@@ -23,8 +23,6 @@
 #include "data_type.h"
 #include "pto_task_id.h"
 
-constexpr int MAX_TENSOR_DIMS = 5;
-
 /**
  * Buffer Handle
  *
@@ -104,7 +102,7 @@ struct alignas(64) Tensor {
     DataType dtype;                    // Data type of tensor elements
     bool manual_dep;                   // True when dependency tracking is creator-only (skip OverlapMap lookup/insert)
     bool is_contiguous;                // Cached: strides[] == row_major_stride(shapes)
-    uint8_t child_memory;              // 0 = host memory (default), 1 = child-managed device memory (skips H2D copy)
+    AddressSpace address_space;        // HOST (default) or DEVICE (child-managed device memory; skips H2D copy)
     uint32_t shapes[MAX_TENSOR_DIMS];  // Current view shape per dimension (elements)
 
     // === Cache line 2 (64B) — warm path (view metadata) ===
@@ -157,7 +155,7 @@ struct alignas(64) Tensor {
     /// True when `buffer.addr` is a device pointer allocated by the child process
     /// (host skips the H2D copy in init_runtime_impl). Host-side concept carried
     /// across the wire; runtime views inherit it via the cache-line-1 copy.
-    [[nodiscard]] bool is_child_memory() const { return child_memory != 0; }
+    [[nodiscard]] bool is_device_memory() const { return address_space == AddressSpace::DEVICE; }
 
     /// Logical byte size of the view (numel * element size). For a contiguous
     /// host-constructed tensor this equals buffer.size; provided for parity with
@@ -181,7 +179,7 @@ struct alignas(64) Tensor {
     /// Enforces the ndims > 0 invariant relied upon by every downstream op.
     void init_external(
         void *addr, uint64_t buffer_size_bytes, const uint32_t in_shapes[], uint32_t in_ndims, DataType in_dtype,
-        int32_t in_version, bool in_manual_dep = false, uint8_t in_child_memory = 0
+        int32_t in_version, bool in_manual_dep = false, AddressSpace in_address_space = AddressSpace::HOST
     ) {
         always_assert(in_ndims > 0 && in_ndims <= MAX_TENSOR_DIMS);
         buffer = {reinterpret_cast<uint64_t>(addr), buffer_size_bytes};
@@ -190,7 +188,7 @@ struct alignas(64) Tensor {
         version = in_version;
         manual_dep = in_manual_dep;
         is_contiguous = true;
-        child_memory = in_child_memory;
+        address_space = in_address_space;
         start_offset = 0;
         owner_task_id = PTO2TaskId::invalid();
         // Single reverse pass: write shapes, accumulate row-major stride, and
@@ -434,10 +432,10 @@ private:
     // default constructor is public — see above — for POD/array storage.)
     Tensor(
         void *addr, uint64_t buffer_size_bytes, const uint32_t in_shapes[], uint32_t in_ndims, DataType in_dtype,
-        int32_t in_version, bool in_manual_dep = false, uint8_t in_child_memory = 0
+        int32_t in_version, bool in_manual_dep = false, AddressSpace in_address_space = AddressSpace::HOST
     ) {
         init_external(
-            addr, buffer_size_bytes, in_shapes, in_ndims, in_dtype, in_version, in_manual_dep, in_child_memory
+            addr, buffer_size_bytes, in_shapes, in_ndims, in_dtype, in_version, in_manual_dep, in_address_space
         );
     }
 
@@ -475,7 +473,11 @@ private:
     friend struct PTO2TaskPayload;
     friend inline Tensor make_tensor_external(
         void *addr, const uint32_t shapes[], uint32_t ndims, DataType dtype, bool manual_dep, int32_t version,
-        uint8_t child_memory
+        AddressSpace address_space
+    );
+    friend inline Tensor make_tensor_strided(
+        void *addr, const uint32_t shapes[], const uint32_t strides[], uint32_t ndims, DataType dtype, bool manual_dep,
+        int32_t version, AddressSpace address_space
     );
 };
 
@@ -488,7 +490,9 @@ static_assert(offsetof(Tensor, ndims) == 36);
 static_assert(offsetof(Tensor, dtype) == 40);
 static_assert(offsetof(Tensor, manual_dep) == 41);
 static_assert(offsetof(Tensor, is_contiguous) == 42);
-static_assert(offsetof(Tensor, child_memory) == 43, "child_memory must be at byte 43 (cacheline 1, former _pad_cl1)");
+static_assert(
+    offsetof(Tensor, address_space) == 43, "address_space must be at byte 43 (cacheline 1, former child_memory)"
+);
 static_assert(offsetof(Tensor, shapes) == 44, "shapes must start at byte 44 (cacheline 1)");
 static_assert(offsetof(Tensor, extent_elem_cache) == 64, "extent_elem_cache must start at byte 64 (cacheline 2)");
 static_assert(offsetof(Tensor, strides) == 72);
@@ -502,11 +506,41 @@ static_assert(offsetof(Tensor, strides) == 72);
 // =============================================================================
 inline Tensor make_tensor_external(
     void *addr, const uint32_t shapes[], uint32_t ndims, DataType dtype = DataType::FLOAT32, bool manual_dep = false,
-    int32_t version = 0, uint8_t child_memory = 0
+    int32_t version = 0, AddressSpace address_space = AddressSpace::HOST
 ) {
     uint64_t total = 1;
     for (uint32_t i = 0; i < ndims; i++) {
         total *= shapes[i];
     }
-    return {addr, total * get_element_size(dtype), shapes, ndims, dtype, version, manual_dep, child_memory};
+    return {addr, total * get_element_size(dtype), shapes, ndims, dtype, version, manual_dep, address_space};
+}
+
+// =============================================================================
+// Tensor factory — a possibly-strided external view. `addr` is the view origin
+// (start_offset == 0); `strides[]` are element strides (may be non-row-major, as
+// from a transpose / permute / step-sliced BufferRef). Derived fields
+// (extent_elem_cache, is_contiguous) are recomputed from shapes + strides;
+// buffer.size is the element extent in bytes.
+// =============================================================================
+inline Tensor make_tensor_strided(
+    void *addr, const uint32_t shapes[], const uint32_t strides[], uint32_t ndims, DataType dtype = DataType::FLOAT32,
+    bool manual_dep = false, int32_t version = 0, AddressSpace address_space = AddressSpace::HOST
+) {
+    always_assert(ndims > 0 && ndims <= MAX_TENSOR_DIMS);
+    Tensor t{};
+    t.buffer.addr = reinterpret_cast<uint64_t>(addr);
+    t.ndims = ndims;
+    t.dtype = dtype;
+    t.version = version;
+    t.manual_dep = manual_dep;
+    t.address_space = address_space;
+    t.start_offset = 0;
+    t.owner_task_id = PTO2TaskId::invalid();
+    for (uint32_t i = 0; i < ndims; i++) {
+        t.shapes[i] = shapes[i];
+        t.strides[i] = strides[i];
+    }
+    t.refresh_derived();  // extent_elem_cache + is_contiguous from shapes/strides
+    t.buffer.size = t.extent_elem_cache * get_element_size(dtype);
+    return t;
 }
