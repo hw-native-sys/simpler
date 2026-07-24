@@ -19,7 +19,7 @@ import threading
 import time
 import weakref
 from multiprocessing.shared_memory import SharedMemory
-from typing import cast
+from typing import Any, cast
 
 import pytest
 import simpler.worker as worker_mod
@@ -1631,6 +1631,104 @@ class TestRunHandle:
             wait_thread.join(5.0)
         assert observed == [True]
         assert wait_entered.is_set()
+
+    def test_run_finalization_releases_only_its_resources(self, monkeypatch):
+        class SlotRef:
+            def __init__(self):
+                self.releases = 0
+
+            def _release_slot_ref(self):
+                self.releases += 1
+
+        class Region:
+            def __init__(self, region_id):
+                self.region_id = region_id
+                self._worker_id = 0
+                self.mapping_closed = False
+                self.expired = False
+
+            def _close_l3_host_mapping(self):
+                self.mapping_closed = True
+
+            def _expire(self):
+                self.expired = True
+
+        class NativeWorker:
+            def __init__(self):
+                self.released_regions = []
+
+            def control_l3_l2_region_release(self, worker_id, region_id):
+                self.released_regions.append((worker_id, region_id))
+
+        class NativeOrchestrator:
+            def __init__(self):
+                self.released_runs = []
+
+            def _release_run(self, run_id):
+                self.released_runs.append(run_id)
+
+        def domain(name, allocation_id):
+            return worker_mod.CommDomainHandle(
+                name=name,
+                workers=(),
+                contexts={},
+                allocation_id=allocation_id,
+                _release_fn=lambda _handle: None,
+            )
+
+        worker = Worker(level=3, num_sub_workers=0)
+        native_worker = NativeWorker()
+        native_orch = NativeOrchestrator()
+        worker._worker = cast(Any, native_worker)
+        worker._orch = cast(Any, native_orch)
+
+        first = worker_mod._RunResources()
+        second = worker_mod._RunResources()
+        first_ref, second_ref = SlotRef(), SlotRef()
+        first_region, second_region = Region(11), Region(22)
+        first_live, second_live = domain("first-live", 1), domain("second-live", 2)
+        first_pending, second_pending = domain("first-pending", 3), domain("second-pending", 4)
+        first.remote_slot_refs.append(cast(Any, first_ref))
+        second.remote_slot_refs.append(cast(Any, second_ref))
+        first.l3_l2_regions.append(first_region)
+        second.l3_l2_regions.append(second_region)
+        first.l3_l2_orch_comm_host_buffers[0x1000] = 64
+        second.l3_l2_orch_comm_host_buffers[0x2000] = 128
+        first.live_domains[first_live.name] = first_live
+        second.live_domains[second_live.name] = second_live
+        first.pending_release_domains.append(first_pending)
+        second.pending_release_domains.append(second_pending)
+        worker._live_l3_l2_regions.extend([first_region, second_region])
+        worker._live_domains.update({first_live.name: first_live, second_live.name: second_live})
+
+        released_domains = []
+
+        def release_domain_now(handle):
+            released_domains.append(handle)
+            if worker._live_domains.get(handle.name) is handle:
+                worker._live_domains.pop(handle.name)
+
+        monkeypatch.setattr(worker, "_release_domain_now", release_domain_now)
+        first_handle = RunHandle(worker, 1, (), first)
+        second_handle = RunHandle(worker, 2, (), second)
+        worker._accepted_run_handles.update({first_handle, second_handle})
+
+        assert worker._finalize_run_handle(first_handle, 1, None) is None
+
+        assert first_ref.releases == 1
+        assert second_ref.releases == 0
+        assert native_worker.released_regions == [(0, 11)]
+        assert first_region.mapping_closed and first_region.expired
+        assert not second_region.mapping_closed and not second_region.expired
+        assert worker._live_l3_l2_regions == [second_region]
+        assert first.l3_l2_orch_comm_host_buffers == {}
+        assert second.l3_l2_orch_comm_host_buffers == {0x2000: 128}
+        assert released_domains == [first_pending, first_live]
+        assert first_pending.freed and first_live.freed
+        assert not second_pending.freed and not second_live.freed
+        assert worker._live_domains == {second_live.name: second_live}
+        assert native_orch.released_runs == [1]
+        assert worker._accepted_run_handles == {second_handle}
 
 
 # ---------------------------------------------------------------------------
