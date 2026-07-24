@@ -13,8 +13,8 @@ channel has to carry:
 
 1. SubWorker callable raises   →  Worker.run(orch) re-raises with original
                                   Python exception type + message in the text.
-2. Scope mid-failure           →  Nth submit sees has_error, next Worker.run
-                                  is not wedged (error state cleared).
+2. Scope mid-failure           →  Nth submit sees its run error; the next
+                                  Worker.run uses an independent error state.
 3. L4 → L3 → SubWorker chain   →  Exception raised in bottom sub surfaces at
                                   L4 Worker.run() with an identifiable chain
                                   (sub_worker / child_worker prefixes).
@@ -100,19 +100,33 @@ class TestSubWorkerException:
 
 
 # ---------------------------------------------------------------------------
-# 2. Scope mid-failure — drain rethrows once, next run clean
+# 2. Scope mid-failure — per-run wait rethrows once, next run clean
 # ---------------------------------------------------------------------------
 
 
 class TestScopeMidFailure:
+    def test_orchestration_exception_is_synchronous(self):
+        hw = Worker(level=3, num_sub_workers=1)
+        hw.init()
+        try:
+
+            def graph_boom(orch, args, cfg):
+                raise SentinelError("graph-build-failure")
+
+            with pytest.raises(SentinelError, match="graph-build-failure"):
+                hw.run(graph_boom)
+
+            assert hw.run(lambda orch, args, cfg: None) is None
+        finally:
+            hw.close()
+
     def test_failure_does_not_wedge_worker(self):
         """After a run() fails, the next run() using a clean orch succeeds.
 
         Register two callables — one that always raises, one that increments
         a shared counter. Fire the failing one first (should raise) then the
-        succeeding one (should run to completion). Proves ``_clear_error`` at
-        the top of ``Worker.run`` resets the error slot so the next run is
-        not permanently poisoned.
+        succeeding one (should run to completion). Proves the next run owns a
+        separate error state and is not permanently poisoned.
 
         Two callables rather than a shared-state toggle: the sub-worker is
         a forked child that inherits closure state copy-on-write; updates
@@ -155,8 +169,8 @@ class TestScopeMidFailure:
         """A second submit_sub after a failed first one must not swallow the error.
 
         With one sub worker we submit two tasks sequentially in the orch fn;
-        the first one fails, so the second submit sees has_error and re-raises
-        immediately (fail-fast). The exception reaching Worker.run is the
+        the first one fails, so the second submit sees the current run's error
+        and re-raises immediately (fail-fast). The exception reaching Worker.run is the
         original child failure — not some generic "orchestrator poisoned"
         wrapper.
         """
@@ -197,7 +211,7 @@ class TestL4ChainedFailure:
 
         The error first bubbles from the SubWorker through the parent's
         dispatch_process as `std::runtime_error("sub_worker: ... SentinelError: ...")`.
-        Inside the L3 orch fn this reaches _drain which rethrows. The L3
+        Inside the L3 orch fn this reaches the per-run wait, which rethrows. The L3
         child process catches that in _child_worker_loop and rewrites it
         as `child_worker level=3: RuntimeError: <original>`. The L4 parent's
         dispatch_process rethrows again. The final string visible at the L4

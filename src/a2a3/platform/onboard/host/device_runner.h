@@ -219,6 +219,24 @@ private:
     // recovery. See run() and recover_device_or_mark_unusable().
     bool device_unusable_{false};
 
+    struct RunStreamSet {
+        rtStream_t aicpu{nullptr};
+        rtStream_t aicore{nullptr};
+    };
+    static constexpr unsigned kRunStreamSetCount = 2;
+
+    // The contract remains K=1 in this PR, so only slot 0 is selected. Both
+    // slots are represented now so enabling K=2 later does not change stream
+    // ownership again.
+    RunStreamSet run_stream_sets_[kRunStreamSetCount]{};
+    int create_run_stream_set(unsigned slot);
+    int destroy_run_stream_set(unsigned slot);
+
+    // Keep the kernel submission boundary separate from stream synchronization
+    // and teardown. run() still invokes these back-to-back in this change.
+    int launch_run(Runtime &runtime, int num_aicore, int launch_aicpu_num, unsigned slot);
+    int reap_run(unsigned slot);
+
     // On an AICore launch/sync error, best-effort drain the device so a later
     // run() on the same DeviceRunner can recover in place; if the drain itself
     // errors the context is unrecoverable without a full reset, so flip

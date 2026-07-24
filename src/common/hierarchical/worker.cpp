@@ -119,10 +119,12 @@ void Worker::init() {
     cfg.on_consumed_cb = [this](TaskSlot slot) {
         orchestrator_.on_consumed(slot);
     };
+    cfg.on_task_failed_cb = [this](TaskSlot slot, const std::string &message) {
+        orchestrator_.report_task_error(slot, message);
+    };
 
     scheduler_.start(cfg);
-    // Let drain() hold the scheduler's loop mutex across ring teardown so slots
-    // aren't freed while the scheduler thread is mid-on_task_complete.
+    // Allocator compaction and scheduler slot access share this mutex.
     orchestrator_.set_scheduler_loop_mutex(&scheduler_.loop_mutex());
     initialized_ = true;
 }

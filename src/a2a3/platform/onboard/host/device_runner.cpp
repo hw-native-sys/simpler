@@ -192,6 +192,7 @@ int DeviceRunner::destroy_comm_stream(void *stream) {
 // `src/common/platform/onboard/host/device_runner_base.cpp`.
 
 int DeviceRunner::run(Runtime &runtime, const CallConfig &config) {
+    constexpr unsigned kPipelineSlot = 0;
     // Latch this run's diagnostic enables onto the runner before the collector
     // paths below read them; block_dim/aicpu_thread_num are consumed locally.
     apply_call_config(config);
@@ -221,6 +222,15 @@ int DeviceRunner::run(Runtime &runtime, const CallConfig &config) {
         LOG_ERROR("ensure_device_initialized failed: %d", rc);
         return rc;
     }
+
+    rc = create_run_stream_set(kPipelineSlot);
+    if (rc != 0) {
+        LOG_ERROR("create_run_stream_set(%u) failed: %d", kPipelineSlot, rc);
+        return rc;
+    }
+    auto run_stream_cleanup = RAIIScopeGuard([this, kPipelineSlot]() {
+        destroy_run_stream_set(kPipelineSlot);
+    });
 
     ensure_device_wall_buffer();
 
@@ -428,6 +438,86 @@ int DeviceRunner::run(Runtime &runtime, const CallConfig &config) {
         l2_swimlane_collector_.set_core_types(core_types.data(), num_aicore);
     }
 
+    rc = launch_run(runtime, num_aicore, launch_aicpu_num, kPipelineSlot);
+    if (rc != 0) return rc;
+
+    rc = reap_run(kPipelineSlot);
+    if (rc != 0) return rc;
+    run_stream_cleanup.dismiss();
+
+    // Print handshake results (reads from device memory, must be before free)
+    print_handshake_results();
+
+    return 0;
+}
+
+int DeviceRunner::create_run_stream_set(unsigned slot) {
+    if (slot >= kRunStreamSetCount) {
+        LOG_ERROR("create_run_stream_set: invalid slot %u", slot);
+        return -1;
+    }
+    RunStreamSet &streams = run_stream_sets_[slot];
+    if (streams.aicpu != nullptr || streams.aicore != nullptr) {
+        LOG_ERROR("create_run_stream_set: slot %u is still occupied", slot);
+        return -1;
+    }
+
+    int rc = rtStreamCreate(&streams.aicpu, 0);
+    if (rc != 0) {
+        LOG_ERROR("rtStreamCreate (run AICPU slot %u) failed: %d", slot, rc);
+        ACL_LOG_ERROR_DETAIL(rc);
+        return rc;
+    }
+    rc = rtStreamCreate(&streams.aicore, 0);
+    if (rc != 0) {
+        LOG_ERROR("rtStreamCreate (run AICore slot %u) failed: %d", slot, rc);
+        ACL_LOG_ERROR_DETAIL(rc);
+        rtStreamDestroy(streams.aicpu);
+        streams.aicpu = nullptr;
+        return rc;
+    }
+    LOG_INFO_V0("DeviceRunner: run stream set %u created", slot);
+    return 0;
+}
+
+int DeviceRunner::destroy_run_stream_set(unsigned slot) {
+    if (slot >= kRunStreamSetCount) {
+        LOG_ERROR("destroy_run_stream_set: invalid slot %u", slot);
+        return -1;
+    }
+    RunStreamSet &streams = run_stream_sets_[slot];
+    int rc = 0;
+    if (streams.aicpu != nullptr) {
+        int destroy_rc = rtStreamDestroy(streams.aicpu);
+        if (destroy_rc != 0) {
+            LOG_ERROR("rtStreamDestroy (run AICPU slot %u) failed: %d", slot, destroy_rc);
+        }
+        if (destroy_rc != 0 && rc == 0) rc = destroy_rc;
+        streams.aicpu = nullptr;
+    }
+    if (streams.aicore != nullptr) {
+        int destroy_rc = rtStreamDestroy(streams.aicore);
+        if (destroy_rc != 0) {
+            LOG_ERROR("rtStreamDestroy (run AICore slot %u) failed: %d", slot, destroy_rc);
+        }
+        if (destroy_rc != 0 && rc == 0) rc = destroy_rc;
+        streams.aicore = nullptr;
+    }
+    return rc;
+}
+
+int DeviceRunner::launch_run(Runtime &runtime, int num_aicore, int launch_aicpu_num, unsigned slot) {
+    // KernelLaunch is the pipeline boundary: this method clears the handshake
+    // consumed by the launch and submits exactly the AICore and AICPU kernels.
+    // It intentionally performs no stream synchronization or per-run cleanup.
+    if (slot >= kRunStreamSetCount || run_stream_sets_[slot].aicpu == nullptr ||
+        run_stream_sets_[slot].aicore == nullptr) {
+        LOG_ERROR("launch_run: stream set %u is not ready", slot);
+        return -1;
+    }
+    RunStreamSet &streams = run_stream_sets_[slot];
+    int rc = 0;
+
     // Launch the AICore worker BEFORE the AICPU Run task — mirrors the a5 path
     // so the two arches stay symmetric. First-launch latency optimization +
     // op-timeout-family defense-in-depth: with the AICPU Run task launched first
@@ -453,7 +543,7 @@ int DeviceRunner::run(Runtime &runtime, const CallConfig &config) {
 
     LOG_INFO_V0("=== launch_aicore_kernel ===");
     // Launch AICore kernel (pass device copy of KernelArgs)
-    rc = launch_aicore_kernel(stream_aicore_, kernel_args_.device_k_args_);
+    rc = launch_aicore_kernel(streams.aicore, kernel_args_.device_k_args_);
     if (rc != 0) {
         LOG_ERROR("launch_aicore_kernel failed: %d", rc);
         recover_device_or_mark_unusable(rc);
@@ -462,7 +552,7 @@ int DeviceRunner::run(Runtime &runtime, const CallConfig &config) {
 
     LOG_INFO_V0("=== launch_aicpu_kernel %s ===", host::KernelNames::RunName);
     int aicpu_launch_n = (runtime.get_aicpu_launch_count() > 0) ? runtime.get_aicpu_launch_count() : launch_aicpu_num;
-    rc = launch_aicpu_kernel(stream_aicpu_, &kernel_args_.args, host::KernelNames::RunName, aicpu_launch_n);
+    rc = launch_aicpu_kernel(streams.aicpu, &kernel_args_.args, host::KernelNames::RunName, aicpu_launch_n);
     if (rc != 0) {
         LOG_ERROR("launch_aicpu_kernel (main) failed: %d", rc);
         // The AICore worker was already launched above and is now spinning in
@@ -474,7 +564,19 @@ int DeviceRunner::run(Runtime &runtime, const CallConfig &config) {
         return rc;
     }
 
-    rc = sync_run_streams();
+    return 0;
+}
+
+int DeviceRunner::reap_run(unsigned slot) {
+    if (slot >= kRunStreamSetCount) {
+        LOG_ERROR("reap_run: invalid stream set %u", slot);
+        return -1;
+    }
+    RunStreamSet &streams = run_stream_sets_[slot];
+    auto stream_cleanup = RAIIScopeGuard([this, slot]() {
+        destroy_run_stream_set(slot);
+    });
+    int rc = sync_stream_pair(streams.aicpu, streams.aicore);
     if (rc != 0) {
         // sync_run_streams surfaces the AICore op-timeout (STARS-reaped op ->
         // 507000/507018/507046 at AICPU/AICore stream sync). The op-timeout
@@ -513,10 +615,9 @@ int DeviceRunner::run(Runtime &runtime, const CallConfig &config) {
         }
     }
 
-    // Print handshake results (reads from device memory, must be before free)
-    print_handshake_results();
-
-    return 0;
+    rc = destroy_run_stream_set(slot);
+    stream_cleanup.dismiss();
+    return rc;
 }
 
 // `print_handshake_results`, `prepare_orch_so`, `register_callable`,

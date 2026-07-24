@@ -7,9 +7,9 @@ internals, not public submit arguments. See
 [callable-identity-registration.md](callable-identity-registration.md).
 
 The Orchestrator is the **DAG builder**. It runs single-threaded on the user's
-thread (inside `Worker::run` between `scope_begin` and `drain`) and owns the
-three data structures that turn a sequence of `submit_*` calls into a scheduled
-DAG: `Ring`, `TensorMap`, and `Scope`.
+thread while a run is open for submission and owns the three data structures
+that turn a sequence of `submit_*` calls into a scheduled DAG: `Ring`,
+`TensorMap`, and `Scope`.
 
 For the high-level role of the Orchestrator among the three engine components,
 see [hierarchical_level_runtime.md](hierarchical_level_runtime.md). For what
@@ -51,14 +51,19 @@ public:
     // --- Intermediate-buffer allocation (runtime-owned lifetime) ---
     Tensor alloc(const std::vector<uint32_t> &shape, DataType dtype);
 
-    // --- Internal lifecycle (invoked by Worker::run only, bound as _scope_begin
-    //     / _scope_end / _drain in the Python facade) ---
+    // --- Internal lifecycle (invoked by Python Worker.submit/RunHandle) ---
+    RunId begin_run();
+    void close_run_submission(RunId run_id);
+    void fail_run_submission(RunId run_id, std::exception_ptr error);
+    void wait_run(RunId run_id);
+    bool wait_run_for(RunId run_id, double timeout_seconds);
+    bool run_done(RunId run_id) const;
+    void release_run(RunId run_id);
     void scope_begin();
     void scope_end();
-    void drain();
 
 private:
-    // ... components: Ring, TensorMap, Scope, slot pool, active_tasks_ counter
+    // ... components: Ring, TensorMap, Scope, and the RunState registry
 };
 
 struct SubmitResult { TaskSlot task_slot; };  // internal only; not bound to Python
@@ -67,9 +72,33 @@ struct SubmitResult { TaskSlot task_slot; };  // internal only; not bound to Pyt
 **Status**: `submit_sub` takes only `(CallableIdentity, args)` — no
 `config`, since SUB has no per-call config.
 
-`scope_begin` / `scope_end` / `drain` are invoked from Python `Worker.run` via
-`_scope_begin` / `_scope_end` / `_drain` bindings. They are not part of the
-user-facing orch-fn API.
+The run lifecycle and outer `scope_begin` / `scope_end` are invoked from Python
+`Worker.submit` through private bindings. They are not part of the user-facing
+orch-fn API. `Worker.submit` invokes the orchestration callback and closes DAG
+submission synchronously, then returns a `RunHandle` before L3 device work has
+necessarily completed. Graph-construction errors therefore remain synchronous;
+device or endpoint errors are attached to the handle and raised by `wait()` or
+`result()`.
+
+`RunHandle.done` polls the matching native run fence. `wait(timeout)` supports
+bounded waits without cancelling or corrupting the run, and repeated waits
+replay the same terminal result. The handle keeps its `Worker`, callback
+arguments, configuration, and run-owned cleanup state alive until completion.
+`Worker.close()` rejects new submissions and drains every accepted handle
+before tearing down the worker tree.
+
+`Worker.run` remains source-compatible and blocking:
+
+```python
+worker.run(orchestration, args, config)
+# Equivalent to:
+worker.submit(orchestration, args, config).wait()
+```
+
+The current L2 backend is synchronous, so L2 `submit()` executes the existing
+blocking path and returns an already-completed handle. L3 asynchronous return
+does not yet imply overlapping runs: a later submit waits for the prior run's
+fence and cleanup before building the next DAG.
 
 Remote L3 submit adds two hidden pieces of metadata: final eligible worker-id
 sets and optional `RemoteTaskArgsSidecar` entries aligned by tensor index.
@@ -161,9 +190,9 @@ small POD copied by value. `callable` is a `uint64_t` opaque handle (see
 **Step 3 — tag walk**: The only place tags are consumed. After this step tags
 are never inspected again; they are not carried into the slot's stored
 `task_args` value during dispatch (see [task-flow.md](task-flow.md) §3).
-Local tensors key TensorMap by `(LOCAL_HOST, ptr)` or
-`(LOCAL_CHILD, worker, ptr)`. Remote tensors with sidecars key by
-`(address_kind, owner_worker_id, buffer_id, generation, offset)`.
+Every TensorMap key starts with the current `RunId`. Local tensor identity is
+then `(LOCAL_HOST, ptr)` or `(LOCAL_CHILD, worker, ptr)`. Remote tensors with
+sidecars use `(address_kind, owner_worker_id, buffer_id, generation, offset)`.
 
 | Tag | `tensormap.lookup` | `tensormap.insert` |
 | --- | ------------------ | ------------------ |
@@ -276,8 +305,7 @@ SubmitResult Orchestrator::submit_sub(const CallableIdentity &callable, TaskArgs
    state lives in parent-process heap (never crossed into child workers),
    so the ring-index addressing scheme L2 needs for shmem descriptors
    buys us nothing here. A monotonic `int32_t` gives ~2 billion ids per
-   `reset_to_empty()` interval, reset to 0 at the end of every
-   `Worker.run()`.
+   globally quiescent compaction interval.
 2. **`MAX_RING_DEPTH = 4` independent shared-memory heap slabs**
    (Strict-1; matches L2's `PTO2_MAX_RING_DEPTH`). Each slab has its own
    `mmap(MAP_SHARED | MAP_ANONYMOUS)` region, bump cursor, FIFO
@@ -299,7 +327,7 @@ SubmitResult Orchestrator::submit_sub(const CallableIdentity &callable, TaskArgs
    records its `ring_idx` and `ring_slot_idx` (position within that
    ring's FIFO order). `std::deque::push_back` never invalidates pointers
    to existing elements, so the pointer returned by `slot_state(id)`
-   stays valid until `reset_to_empty()` drops the whole deque.
+   stays valid until globally quiescent `reset_to_empty()` drops the deque.
 
 ```cpp
 struct AllocResult {
@@ -351,12 +379,13 @@ next-oldest in-ring slot is released, walking the ring's `heap_tail`
 forward. Rings never touch each other — inner-scope tasks reclaim
 without waiting for an outer-scope task to finish.
 
-**End-of-run reset**: `Orchestrator::drain()` waits for
-`active_tasks_` to hit 0, then calls `ring.reset_to_empty()` which
-drops the whole slot-state deque *and* rewinds every ring's cursors /
-`released[]` / `slot_heap_end[]` back to 0. Memory per `Worker.run()`
-is bounded by that run's peak alive task count; nothing accumulates
-across runs.
+**Run completion and compaction**: every committed slot increments its owning
+`RunState.active_tasks`; `on_consumed` decrements that same run exactly once. A
+run becomes terminal only after submission is closed and its count reaches
+zero. Slot and heap reclamation still happens incrementally through
+`ring.release(slot)`. `release_run()` may call `ring.reset_to_empty()` only
+when no registered runs or live slots remain, so one run never resets storage
+owned by another.
 
 **Locking**: each ring has its own `mu` / `cv`; the shared
 `next_task_id_` and slot deque are guarded by a separate `slots_mu_`.
@@ -457,29 +486,28 @@ threshold transitions to CONSUMED inline; others stay COMPLETED or PENDING
 until the scheduler and consumers finish their own releases. This mirrors
 L2's `pto2_scope_end`.
 
-Users who need a synchronous wait for *all* in-flight tasks must call
-`drain()` (or let `Worker::run` finish — its outer `scope_end` is followed
-by `drain()` before the call returns). There is deliberately no
-per-scope drain primitive: the extra machinery (per-scope active counter
-and cv) would only pay for itself in patterns we do not have yet.
+The internal run fence, not `scope_end`, provides synchronous completion.
+`Worker.run` closes its outer scope, closes submission, and waits for that
+run's active count to reach zero before returning. There is deliberately no
+per-scope wait primitive.
 
 ---
 
 ## 7. TensorMap
 
-The TensorMap maps `tensor_base_ptr → current_producer_slot`. It drives
-automatic dependency inference.
+The TensorMap maps `(RunId, TensorKey) → current_producer_slot`. It drives
+automatic dependency inference without resolving a producer from another run.
 
 ```cpp
 class TensorMap {
 public:
-    TaskSlot lookup(uint64_t base_ptr) const;         // returns INVALID if absent
-    void     insert(uint64_t base_ptr, TaskSlot sid); // overwrites; previous
-                                                      // producer remains wire-referenced
-    void     erase(uint64_t base_ptr);                // called when producer
-                                                      // reaches CONSUMED
+    TaskSlot lookup(RunId run_id, TensorKey key) const;
+    void insert(RunId run_id, TensorKey key, TaskSlot sid);
+    void erase_task_outputs(RunId run_id,
+                            const std::vector<TensorKey> &keys);
 private:
-    std::unordered_map<uint64_t, TaskSlot> map_;
+    std::mutex mu_;
+    std::unordered_map<RunTensorKey, TaskSlot, RunTensorKeyHash> map_;
 };
 ```
 
@@ -503,11 +531,9 @@ private:
 
 ### Thread safety
 
-TensorMap is written only by the Orch thread (in `submit_*`) and modified by
-the Scheduler thread via `erase` (on CONSUMED). Since `submit_*` and `erase`
-for different entries are non-overlapping in practice, a single mutex guards
-the map in the current implementation. If contention becomes a concern, a
-concurrent hash map can replace it.
+TensorMap is written by the Orch thread in `submit_*` and modified by the
+Scheduler thread when a slot becomes CONSUMED. A mutex serializes lookup,
+insert, erase, and size operations across those threads.
 
 ---
 
@@ -577,7 +603,8 @@ Tensor Orchestrator::alloc(const std::vector<uint32_t> &shape, DataType dtype) {
     // 2. Register as this slot's output so downstream tensors with the same
     //    data pointer look up this slot as producer.
     uint64_t key = reinterpret_cast<uint64_t>(ar.heap_ptr);
-    tensormap_.insert(key, ar.slot);
+    s.run_id = current_run_id;
+    tensormap_.insert(current_run_id, key, ar.slot);
     s.output_keys.push_back(key);
     // 3. No fanin — alloc has no work to wait on.
     s.fanin_count = 0;
@@ -591,7 +618,7 @@ Tensor Orchestrator::alloc(const std::vector<uint32_t> &shape, DataType dtype) {
     s.fanout_released = 1;
     // 6. Straight to COMPLETED — no dispatch needed.
     s.state = TaskState::COMPLETED;
-    active_tasks_++;
+    current_run.active_tasks++;
     return Tensor{key, shape, dtype};
 }
 ```
@@ -695,9 +722,9 @@ instead of stalling forever. Default timeout: 10 s.
 
 ## 9. Invariants
 
-1. **Orch is single-threaded**: only one thread ever calls `submit_*` or holds
-   the `Orchestrator`. No locking is needed on TensorMap, Scope, or Ring-head
-   for self-writes.
+1. **Orch is single-threaded**: only one thread builds a run and calls
+   `submit_*` at a time. TensorMap still uses a mutex because Scheduler-driven
+   consumption erases entries concurrently.
 2. **Tags are consumed at submit**: `task_args.tag(i)` is read only inside
    `submit_*`. Phases after submit (slot storage, dispatch, execution) do not
    see tags.
