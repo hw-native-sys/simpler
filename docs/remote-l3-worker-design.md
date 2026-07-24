@@ -143,7 +143,7 @@ Relevant code paths:
   - Tags are stripped after submit.
 - `docs/comm-domain.md`
   - Dynamic communication domains already model deferred release after
-    `drain()`.
+    their owning run's completion fence.
 
 The Scheduler should not inspect transport details, but it does need enough
 metadata to avoid dispatching a task to an endpoint that cannot run it. Remote
@@ -178,11 +178,10 @@ the endpoint, reports endpoint errors, and notifies the Scheduler with an
 explicit success/failure outcome.
 
 Directed ready queues, exact group dispatch, fanin/fanout, and ring release
-remain in the common runtime. The first-error-wins policy remains only as the error
-reporting policy for choosing which root error `drain()` raises. The important
-change is that completion is no longer implicitly success; every endpoint,
-including `LocalMailboxEndpoint`, must report an explicit success/failure
-outcome.
+remain in the common runtime. First-error-wins is scoped to each `RunState` and
+chooses which root error that run's wait raises. Completion is not implicitly
+success; every endpoint, including `LocalMailboxEndpoint`, reports an explicit
+success/failure outcome.
 
 ## Fork-Safe Remote Process Model
 
@@ -517,17 +516,17 @@ Required parent-side behavior:
   `task_failure` instead of reporting a successful completion.
 - Non-zero task or endpoint errors become candidates for the worker's first
   reported error.
-- The worker still notifies the Scheduler so `drain()` cannot hang.
+- The worker still notifies the Scheduler so the originating run can finish.
 - The notification carries an outcome: success, task failure, or endpoint
   failure.
 - Failed slots transition to a failed/poisoned state rather than successful
   `COMPLETED`.
 - Downstream consumers of a failed producer are marked failed/skipped and are
   not dispatched.
-- `drain()` waits for bookkeeping and cleanup, then raises the first root
-  error with remote host, worker id, hashid, and sequence in the message.
+- The run fence waits for bookkeeping and cleanup, then raises that run's first
+  root error with remote host, worker id, hashid, and sequence in the message.
 
-Local mailbox dispatch keeps first-error-wins only for final error reporting.
+Local mailbox dispatch keeps per-run first-error-wins only for final reporting.
 It must not mark a failed child dispatch as successful `COMPLETED`. The remote
 buffer path and the local adapter both use the same poisoned dependency
 propagation before dependent tasks are exposed to failed producer outputs.

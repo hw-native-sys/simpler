@@ -201,7 +201,7 @@ void Ring::reset_to_empty() {
         if (r.last_alive != static_cast<int32_t>(r.released.size())) {
             throw std::logic_error(
                 "Ring::reset_to_empty: tasks still live on at least one ring. "
-                "Did drain() complete?"
+                "Did every registered run complete?"
             );
         }
     }

@@ -66,9 +66,10 @@ while (true) {
 }
 ```
 
-`loop_mutex` covers completion and dispatch slot access. `Orchestrator::drain`
-uses the same mutex while releasing/resetting slots, preventing slot reuse
-while the Scheduler still holds a reference.
+`loop_mutex` covers completion and dispatch slot access.
+`Orchestrator::release_run` uses the same mutex during optional globally
+quiescent compaction, preventing slot removal while the Scheduler holds a
+reference.
 
 ## 3. Directed NEXT_LEVEL dispatch
 
