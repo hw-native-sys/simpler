@@ -57,6 +57,12 @@ git diff --staged  # Review before committing
 
 Separate from subject by a blank line. Explain **what** changed and **why**. Use bullet points for multiple items. Wrap at 72 characters.
 
+Describe what the change does and why it is correct — **not** the plan or
+step sequence that produced it. No `Phase 1 / Step 2 / Gap #3` framing and no
+"first did X, then changed to Y" working-process narration (see
+[`codestyle.md`](../../rules/codestyle.md) §1, which applies the same ban to
+comments and commit messages).
+
 **When to include a body**:
 
 - Changes touch 3+ files
@@ -105,6 +111,11 @@ x  fix bug                         # Lowercase type
 x  WIP                             # Not descriptive
 x  Chore: update gitignore         # Invalid type
 x  Support: update stuff           # Vague, no body for multi-file change
+```
+
+```text
+x  Add: graph exec — Phase 1 record, Step 2 replay, Gap #3 fixed
+                                    # Plan/process framing: say what+why, not the steps
 ```
 
 ## Co-Author Policy
