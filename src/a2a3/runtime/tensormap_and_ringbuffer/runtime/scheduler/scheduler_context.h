@@ -164,6 +164,7 @@ private:
 
     // sync_start drain coordination
     SyncStartDrainState drain_state_;
+    std::atomic<uint64_t> drain_ack_attempts_[MAX_AICPU_THREADS]{};
 
 #if SIMPLER_DFX
     SchedL2SwimlaneCounters sched_l2_swimlane_[MAX_AICPU_THREADS];
@@ -185,6 +186,9 @@ private:
     int32_t sched_thread_num_{0};
     int32_t aicpu_thread_num_{0};
     int32_t cores_total_num_{0};
+    bool drain_aba_test_mode_{false};
+    // Test-only: arms the single deterministic stale-attempt pause per drain run.
+    std::atomic<int32_t> drain_test_victim_armed_{0};
 
     // Cluster-ordered worker_id lists, populated by post_handshake_init().
     int32_t aic_worker_ids_[RUNTIME_MAX_WORKER]{};

@@ -23,6 +23,34 @@
 #include "scheduler/scheduler_types.h"
 #include "scheduler/pto_scheduler.h"
 
+TEST(SyncStartDrainAttemptTest, LateAckCannotSatisfyNextAttemptBarrier) {
+    std::atomic<uint64_t> ack_attempts[3]{};
+
+    for (auto &ack : ack_attempts)
+        ack.store(41, std::memory_order_relaxed);
+    EXPECT_EQ(sync_start_drain_ack_mask_for_attempt(ack_attempts, 3, 41), 0b111u);
+
+    // Attempt 42 starts, then thread 0 from attempt 41 publishes late.
+    ack_attempts[1].store(42, std::memory_order_relaxed);
+    ack_attempts[2].store(42, std::memory_order_relaxed);
+    ack_attempts[0].store(41, std::memory_order_relaxed);
+    EXPECT_EQ(sync_start_drain_ack_mask_for_attempt(ack_attempts, 3, 42), 0b110u);
+
+    ack_attempts[0].store(42, std::memory_order_relaxed);
+    EXPECT_EQ(sync_start_drain_ack_mask_for_attempt(ack_attempts, 3, 42), 0b111u);
+}
+
+TEST(SyncStartDrainAttemptTest, StaleParticipantCannotOwnNextAttempt) {
+    SyncStartDrainState state;
+    state.drain_attempt.store(42, std::memory_order_relaxed);
+
+    EXPECT_FALSE(sync_start_drain_try_elect(state, 0, 41));
+    EXPECT_EQ(state.drain_worker_elected.load(std::memory_order_relaxed), 0);
+
+    EXPECT_TRUE(sync_start_drain_try_elect(state, 1, 42));
+    EXPECT_EQ(state.drain_worker_elected.load(std::memory_order_relaxed), 2);
+}
+
 class SchedulerStateTest : public ::testing::Test {
 protected:
     PTO2SchedulerState sched;

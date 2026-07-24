@@ -187,6 +187,12 @@ struct alignas(64) DeviceRuntimeLaunchDesc {
     // Controlled via SIMPLER_TMR_SERIAL_ORCH_SCHED_ENABLE environment variable.
     bool serial_orch_sched;
 
+    // Test-only drain interleaving hook. When enabled, scheduler threads create a
+    // deterministic stale-attempt window in sync_start drain to prove whether the
+    // reusable ack/election fields are generation-less.
+    // Controlled via SIMPLER_DRAIN_ABA_TEST environment variable.
+    bool drain_aba_test_mode;
+
     void *gm_sm_ptr_;                        // GM pointer to PTO2 shared memory (device)
     ChipStorageTaskArgs orch_args_storage_;  // Copy of args for device
 

@@ -139,6 +139,7 @@ private:
 
     // sync_start drain coordination
     SyncStartDrainState drain_state_;
+    std::atomic<uint64_t> drain_ack_attempts_[MAX_AICPU_THREADS]{};
 
 #if SIMPLER_DFX
     SchedL2SwimlaneCounters sched_l2_swimlane_[MAX_AICPU_THREADS];

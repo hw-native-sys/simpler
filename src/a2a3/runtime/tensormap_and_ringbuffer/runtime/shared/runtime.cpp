@@ -38,6 +38,7 @@ Runtime::Runtime() {
     dev.aicpu_allowed_cpu_count = 0;
     dev.aicpu_launch_count = 0;
     dev.serial_orch_sched = false;
+    dev.drain_aba_test_mode = false;
     dev.gm_sm_ptr_ = nullptr;
     dev.orch_args_storage_.clear();
     dev.prebuilt_arena_base_ = nullptr;

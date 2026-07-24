@@ -39,6 +39,8 @@
 #define PTO2_ERROR_ASYNC_COMPLETION_INVALID 101
 #define PTO2_ERROR_ASYNC_WAIT_OVERFLOW 102
 #define PTO2_ERROR_ASYNC_REGISTRATION_FAILED 103
+#define PTO2_ERROR_DRAIN_ABA_TEST_NOT_EXERCISED \
+    104  // SIMPLER_DRAIN_ABA_TEST: hook never observed the forced attempt change
 
 // Sub-classification of a PTO2_ERROR_SCHEDULER_TIMEOUT (code 100). The top-level
 // sched_error_code stays 100 for backward compatibility; this detail value tells

@@ -1130,6 +1130,7 @@ int32_t SchedulerContext::pre_handshake_init(
     aic_count_ = cores_total_num_ / 3;
     aiv_count_ = (cores_total_num_ * 2) / 3;
     active_sched_threads_ = (sched_thread_num_ > 0) ? sched_thread_num_ : aicpu_thread_num_;
+    drain_aba_test_mode_ = runtime->dev.drain_aba_test_mode;
     handshake_failed_.store(false, std::memory_order_release);
 
     // State the barrier-free per-thread init path no longer reaches via
@@ -1307,7 +1308,10 @@ void SchedulerContext::deinit() {
     // would otherwise leave dirty pending/elected/ack state for the next reuse.
     drain_state_.sync_start_pending.store(0, std::memory_order_release);
     drain_state_.drain_worker_elected.store(0, std::memory_order_release);
-    drain_state_.drain_ack_mask.store(0, std::memory_order_release);
+    drain_state_.drain_attempt.store(0, std::memory_order_release);
+    for (int32_t t = 0; t < MAX_AICPU_THREADS; t++) {
+        drain_ack_attempts_[t].store(0, std::memory_order_release);
+    }
     drain_state_.drain_stage_go.store(0, std::memory_order_release);
     drain_state_.drain_stage_done_mask.store(0, std::memory_order_release);
     drain_state_.drain_running_staged.store(0, std::memory_order_release);
@@ -1324,6 +1328,8 @@ void SchedulerContext::deinit() {
     aiv_count_ = 0;
     cores_total_num_ = 0;
     aicpu_thread_num_ = 0;
+    drain_aba_test_mode_ = false;
+    drain_test_victim_armed_.store(0, std::memory_order_relaxed);
     sched_thread_num_ = 0;
     active_sched_threads_ = 0;
     for (int32_t t = 0; t < MAX_AICPU_THREADS; t++) {
