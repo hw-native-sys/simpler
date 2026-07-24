@@ -10,7 +10,7 @@
  */
 
 /**
- * TensorMap — TensorKey → producer task slot mapping.
+ * TensorMap — (RunId, TensorKey) → producer task slot mapping.
  *
  * At the hierarchical host level, every tensor is identified by a TensorKey
  * consisting of (ptr, worker_id). Host tensors (HeapRing) use
@@ -28,6 +28,7 @@
 
 #pragma once
 
+#include <mutex>
 #include <unordered_map>
 #include <vector>
 
@@ -37,19 +38,36 @@ class TensorMap {
 public:
     // Look up the producer for a tensor key.
     // Returns INVALID_SLOT when not found.
-    TaskSlot lookup(TensorKey key) const;
+    TaskSlot lookup(RunId run_id, TensorKey key) const;
 
     // Register key → producer mapping.
     // Overwrites any existing entry (re-use of the same buffer by a new producer).
-    void insert(TensorKey key, TaskSlot producer);
+    void insert(RunId run_id, TensorKey key, TaskSlot producer);
 
     // Remove all entries whose key appears in 'keys'.
     // Called when a producer task transitions to CONSUMED.
-    void erase_task_outputs(const std::vector<TensorKey> &keys);
+    void erase_task_outputs(RunId run_id, const std::vector<TensorKey> &keys);
 
     // Number of entries currently tracked.
     int32_t size() const;
 
 private:
-    std::unordered_map<TensorKey, TaskSlot, TensorKeyHash> map_;
+    struct RunTensorKey {
+        RunId run_id{INVALID_RUN_ID};
+        TensorKey tensor{};
+
+        bool operator==(const RunTensorKey &other) const { return run_id == other.run_id && tensor == other.tensor; }
+    };
+
+    struct RunTensorKeyHash {
+        size_t operator()(const RunTensorKey &key) const {
+            size_t h = std::hash<RunId>{}(key.run_id);
+            size_t tensor_hash = TensorKeyHash{}(key.tensor);
+            h ^= tensor_hash + 0x9e3779b9 + (h << 6) + (h >> 2);
+            return h;
+        }
+    };
+
+    mutable std::mutex mu_;
+    std::unordered_map<RunTensorKey, TaskSlot, RunTensorKeyHash> map_;
 };

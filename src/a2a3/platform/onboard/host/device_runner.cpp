@@ -428,6 +428,24 @@ int DeviceRunner::run(Runtime &runtime, const CallConfig &config) {
         l2_swimlane_collector_.set_core_types(core_types.data(), num_aicore);
     }
 
+    rc = launch_run(runtime, num_aicore, launch_aicpu_num);
+    if (rc != 0) return rc;
+
+    rc = reap_run();
+    if (rc != 0) return rc;
+
+    // Print handshake results (reads from device memory, must be before free)
+    print_handshake_results();
+
+    return 0;
+}
+
+int DeviceRunner::launch_run(Runtime &runtime, int num_aicore, int launch_aicpu_num) {
+    // KernelLaunch is the pipeline boundary: this method clears the handshake
+    // consumed by the launch and submits exactly the AICore and AICPU kernels.
+    // It intentionally performs no stream synchronization or per-run cleanup.
+    int rc = 0;
+
     // Launch the AICore worker BEFORE the AICPU Run task — mirrors the a5 path
     // so the two arches stay symmetric. First-launch latency optimization +
     // op-timeout-family defense-in-depth: with the AICPU Run task launched first
@@ -474,7 +492,11 @@ int DeviceRunner::run(Runtime &runtime, const CallConfig &config) {
         return rc;
     }
 
-    rc = sync_run_streams();
+    return 0;
+}
+
+int DeviceRunner::reap_run() {
+    int rc = sync_run_streams();
     if (rc != 0) {
         // sync_run_streams surfaces the AICore op-timeout (STARS-reaped op ->
         // 507000/507018/507046 at AICPU/AICore stream sync). The op-timeout
@@ -512,9 +534,6 @@ int DeviceRunner::run(Runtime &runtime, const CallConfig &config) {
             }
         }
     }
-
-    // Print handshake results (reads from device memory, must be before free)
-    print_handshake_results();
 
     return 0;
 }
