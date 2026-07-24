@@ -61,6 +61,9 @@ public:
         std::function<void(TaskSlot)> enqueue_ready_cb;
         // Called when a task reaches CONSUMED (TensorMap cleanup + ring release).
         std::function<void(TaskSlot)> on_consumed_cb;
+        // Called as soon as an endpoint reports failure so the error is
+        // attached to the task's run even when a group has other members live.
+        std::function<void(TaskSlot, const std::string &)> on_task_failed_cb;
     };
 
     void start(const Config &cfg);
@@ -77,9 +80,9 @@ public:
     void notify_ready();
 
     // Mutex held by run() across each loop iteration's slot-touching body
-    // (completion processing + dispatch). Orchestrator::drain() acquires it
-    // before Ring::reset_to_empty() so the ring can't be torn down while the
-    // scheduler thread is mid-on_task_complete (heap-use-after-free).
+    // (completion processing + dispatch). Orchestrator::release_run() acquires
+    // it before optional Ring::reset_to_empty() compaction so the ring cannot
+    // be torn down while the scheduler thread is mid-on_task_complete.
     std::mutex &loop_mutex() { return loop_mu_; }
 
 private:

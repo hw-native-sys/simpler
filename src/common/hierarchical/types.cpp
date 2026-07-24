@@ -19,6 +19,7 @@
 
 void TaskSlotState::reset() {
     state.store(TaskState::FREE, std::memory_order_relaxed);
+    run_id = INVALID_RUN_ID;
     fanin_count = 0;
     fanin_released.store(0, std::memory_order_relaxed);
     {

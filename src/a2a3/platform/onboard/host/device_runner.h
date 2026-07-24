@@ -219,6 +219,11 @@ private:
     // recovery. See run() and recover_device_or_mark_unusable().
     bool device_unusable_{false};
 
+    // Keep the kernel submission boundary separate from stream synchronization
+    // and teardown. run() still invokes these back-to-back in this change.
+    int launch_run(Runtime &runtime, int num_aicore, int launch_aicpu_num);
+    int reap_run();
+
     // On an AICore launch/sync error, best-effort drain the device so a later
     // run() on the same DeviceRunner can recover in place; if the drain itself
     // errors the context is unrecoverable without a full reset, so flip

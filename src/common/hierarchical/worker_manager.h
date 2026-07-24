@@ -345,11 +345,8 @@ public:
     // `ring->slot_state(task_slot)` on each dispatch.
     // on_complete(completion) is called (in the WorkerThread) after each
     // endpoint run().
-    // `manager` is a borrowed pointer used to report dispatch failures
-    // (exception_ptr routed out of the worker thread to the orch thread).
     void start(
-        Ring *ring, WorkerManager *manager, const std::function<void(WorkerCompletion)> &on_complete,
-        std::unique_ptr<WorkerEndpoint> endpoint
+        Ring *ring, const std::function<void(WorkerCompletion)> &on_complete, std::unique_ptr<WorkerEndpoint> endpoint
     );
 
     // Enqueue a dispatch for the worker. Non-blocking.
@@ -437,7 +434,6 @@ public:
 
 private:
     Ring *ring_{nullptr};
-    WorkerManager *manager_{nullptr};
     std::unique_ptr<WorkerEndpoint> endpoint_;
     std::function<void(WorkerCompletion)> on_complete_;
 
@@ -542,14 +538,6 @@ public:
         double timeout_s
     );
 
-    // Error propagation: first dispatch failure from any WorkerThread wins.
-    // The orch thread inspects via `has_error()` / `take_error()` and
-    // clears between Worker.run() invocations via `clear_error()`.
-    void report_error(std::exception_ptr e);
-    bool has_error() const { return has_error_.load(std::memory_order_acquire); }
-    std::exception_ptr take_error();
-    void clear_error();
-
 private:
     struct LocalNextLevelEntry {
         int32_t worker_id{-1};
@@ -561,11 +549,4 @@ private:
 
     std::vector<std::unique_ptr<WorkerThread>> next_level_threads_;
     std::vector<std::unique_ptr<WorkerThread>> sub_threads_;
-
-    // First-error-wins exception slot. Written under err_mu_ by
-    // WorkerThread::loop() catch handlers; read by the orch thread at
-    // submit_*/drain boundaries.
-    std::atomic<bool> has_error_{false};
-    mutable std::mutex err_mu_;
-    std::exception_ptr first_error_;
 };
