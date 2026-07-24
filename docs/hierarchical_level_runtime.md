@@ -157,7 +157,7 @@ what flows through `ChipWorker::run`.
                  │                                 │   success → COMPLETED
                  │                                 │   failure → FAILED + poison downstream
                  │                                 │   try_consume → ring release
-                 │ drain() ◄── notify when all done │
+                 │ wait_run(id) ◄── run becomes terminal
 ```
 
 Communication channels:
@@ -212,9 +212,9 @@ When L4's `WorkerThread` writes a task frame to the L3 child's mailbox, the
 frame carries the callable hash digest plus `config` and `args_blob`. The child
 loop reads the digest, resolves it through its local identity table to a private
 orch-function slot, and calls `inner_worker.run(orch_fn, args, cfg)`. The inner
-Worker opens its own scope, executes the orch function with its own
-`Orchestrator`, and drains. Each level's orch fn receives its own Orchestrator
-— recursion is symmetric.
+Worker opens its own run and scope, executes the orch function with its own
+`Orchestrator`, closes submission, and waits for that run. Each level's orch fn
+receives its own Orchestrator — recursion is symmetric.
 
 **Nested fork ordering**: L3's own children (sub/chip) are forked **inside**
 the L4 child process, in L3's eager `init()` (which the L4 child runs before it

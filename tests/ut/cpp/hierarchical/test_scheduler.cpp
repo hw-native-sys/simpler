@@ -273,6 +273,7 @@ struct SchedulerFixture : public ::testing::Test {
     WorkerManager manager;
     Scheduler sched;
     CallConfig cfg;
+    RunId run_id{INVALID_RUN_ID};
 
     std::vector<TaskSlot> consumed_slots;
     std::mutex consumed_mu;
@@ -291,6 +292,7 @@ struct SchedulerFixture : public ::testing::Test {
         orch.init(&tm, &allocator, &scope, &rq_sub, &rq_next_level, &manager, [this] {
             sched.notify_ready();
         });
+        run_id = orch.begin_run();
 
         Scheduler::Config c;
         c.ring = &allocator;
@@ -304,6 +306,9 @@ struct SchedulerFixture : public ::testing::Test {
             orch.on_consumed(s);
             std::lock_guard<std::mutex> lk(consumed_mu);
             consumed_slots.push_back(s);
+        };
+        c.on_task_failed_cb = [this](TaskSlot s, const std::string &message) {
+            orch.report_task_error(s, message);
         };
         sched.start(c);
     }
@@ -461,7 +466,7 @@ TEST_F(SchedulerFixture, FailedProducerPoisonsDependentTask) {
 
     wait_consumed(a.task_slot);
     wait_consumed(b.task_slot);
-    EXPECT_TRUE(manager.has_error());
+    EXPECT_TRUE(orch.run_failed(run_id));
     EXPECT_EQ(mock_worker.dispatched_count(), 1) << "poisoned consumer must not dispatch";
     EXPECT_EQ(S(a.task_slot).state.load(), TaskState::CONSUMED);
     EXPECT_EQ(S(b.task_slot).state.load(), TaskState::CONSUMED);
@@ -483,6 +488,7 @@ struct GroupSchedulerFixture : public ::testing::Test {
     WorkerManager manager;
     Scheduler sched;
     CallConfig cfg;
+    RunId run_id{INVALID_RUN_ID};
 
     std::vector<TaskSlot> consumed_slots;
     std::mutex consumed_mu;
@@ -503,6 +509,7 @@ struct GroupSchedulerFixture : public ::testing::Test {
         orch.init(&tm, &allocator, &scope, &rq_sub, &rq_next_level, &manager, [this] {
             sched.notify_ready();
         });
+        run_id = orch.begin_run();
 
         Scheduler::Config c;
         c.ring = &allocator;
@@ -516,6 +523,9 @@ struct GroupSchedulerFixture : public ::testing::Test {
             orch.on_consumed(s);
             std::lock_guard<std::mutex> lk(consumed_mu);
             consumed_slots.push_back(s);
+        };
+        c.on_task_failed_cb = [this](TaskSlot s, const std::string &message) {
+            orch.report_task_error(s, message);
         };
         sched.start(c);
     }
@@ -712,10 +722,10 @@ TEST_F(GroupSchedulerFixture, GroupFailureWaitsForRunningMembersThenConsumes) {
 
     worker_a.complete_with_error("member boom");
     auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(300);
-    while (!manager.has_error() && std::chrono::steady_clock::now() < deadline) {
+    while (!orch.run_failed(run_id) && std::chrono::steady_clock::now() < deadline) {
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
-    EXPECT_TRUE(manager.has_error());
+    EXPECT_TRUE(orch.run_failed(run_id));
     EXPECT_EQ(S(slot).state.load(), TaskState::RUNNING);
 
     worker_b.complete();
@@ -860,6 +870,7 @@ TEST(SchedulerWorkerTargetTest, NextLevelTargetUsesWorkerIdNotVectorIndex) {
     orch.init(&tm, &allocator, &scope, &rq_sub, &rq_next_level, &manager, [&sched] {
         sched.notify_ready();
     });
+    (void)orch.begin_run();
 
     Scheduler::Config c;
     c.ring = &allocator;
@@ -873,6 +884,9 @@ TEST(SchedulerWorkerTargetTest, NextLevelTargetUsesWorkerIdNotVectorIndex) {
         orch.on_consumed(s);
         std::lock_guard<std::mutex> lk(consumed_mu);
         consumed_slots.push_back(s);
+    };
+    c.on_task_failed_cb = [&orch](TaskSlot s, const std::string &message) {
+        orch.report_task_error(s, message);
     };
     sched.start(c);
 
@@ -963,6 +977,7 @@ struct MixedTypeSchedulerFixture : public ::testing::Test {
     WorkerManager manager;
     Scheduler sched;
     CallConfig cfg;
+    RunId run_id{INVALID_RUN_ID};
 
     std::vector<TaskSlot> consumed_slots;
     std::mutex consumed_mu;
@@ -983,6 +998,7 @@ struct MixedTypeSchedulerFixture : public ::testing::Test {
         orch.init(&tm, &allocator, &scope, &rq_sub, &rq_next_level, &manager, [this] {
             sched.notify_ready();
         });
+        run_id = orch.begin_run();
 
         Scheduler::Config c;
         c.ring = &allocator;
@@ -996,6 +1012,9 @@ struct MixedTypeSchedulerFixture : public ::testing::Test {
             orch.on_consumed(s);
             std::lock_guard<std::mutex> lk(consumed_mu);
             consumed_slots.push_back(s);
+        };
+        c.on_task_failed_cb = [this](TaskSlot s, const std::string &message) {
+            orch.report_task_error(s, message);
         };
         sched.start(c);
     }

@@ -39,7 +39,7 @@ from multiprocessing.shared_memory import SharedMemory
 
 import pytest
 from simpler.task_interface import CallConfig, TaskArgs
-from simpler.worker import Worker
+from simpler.worker import RunHandle, Worker
 
 # Hard wall budget for a single failure scenario — comfortably above the
 # injected startup_timeout_s values below, well under any real hang.
@@ -695,6 +695,9 @@ class _FakeChipOk:
     def _register_callable_at_slot(self, *_a, **_k):  # pragma: no cover
         pass
 
+    def _run_slot(self, *_a, **_k):
+        pass
+
     def finalize(self):
         pass
 
@@ -756,6 +759,20 @@ class TestLevel2Lifecycle:
             w.close()
             assert w._initialized is False
             # A second close is a clean no-op (does not re-block on the epoch cv).
+            w.close()
+
+    def test_l2_submit_returns_completed_handle(self, monkeypatch):
+        from simpler.task_interface import ChipCallable  # noqa: PLC0415
+
+        w = self._make_l2(monkeypatch)
+        callable = ChipCallable.build(signature=[], func_name="x", binary=b"\x00", children=[])
+        callable_handle = w.register(callable)
+        with _hard_timeout(_TEST_WALL_BUDGET_S):
+            w.init()
+            run_handle = w.submit(callable_handle)
+            assert isinstance(run_handle, RunHandle)
+            assert run_handle.done
+            assert run_handle.wait() is None
             w.close()
 
     def test_l2_close_without_init_is_noop(self, monkeypatch):
@@ -1047,8 +1064,9 @@ class TestLevel2Lifecycle:
         def paused_run(self, *_a, **_k):
             entered.set()
             assert release.wait(10.0)
+            return RunHandle._completed(self)
 
-        monkeypatch.setattr(Worker, "_run_locked", paused_run)
+        monkeypatch.setattr(Worker, "_submit_locked", paused_run)
         w = self._make_l2(monkeypatch)  # owner = this (main) thread
         with _hard_timeout(_TEST_WALL_BUDGET_S):
             w.init()
@@ -1076,8 +1094,9 @@ class TestLevel2Lifecycle:
 
         def reentrant_run(self, *_a, **_k):
             result["close_err"] = _run_catch(self.close)
+            return RunHandle._completed(self)
 
-        monkeypatch.setattr(Worker, "_run_locked", reentrant_run)
+        monkeypatch.setattr(Worker, "_submit_locked", reentrant_run)
         w = self._make_l2(monkeypatch)  # owner = main
         with _hard_timeout(_TEST_WALL_BUDGET_S):
             w.init()
@@ -1101,8 +1120,9 @@ class TestLevel2Lifecycle:
         def paused_run(self, *_a, **_k):
             entered.set()
             assert release.wait(10.0)
+            return RunHandle._completed(self)
 
-        monkeypatch.setattr(Worker, "_run_locked", paused_run)
+        monkeypatch.setattr(Worker, "_submit_locked", paused_run)
         w = self._make_l2(monkeypatch)  # owner = main
         with _hard_timeout(_TEST_WALL_BUDGET_S):
             w.init()
@@ -1136,8 +1156,9 @@ class TestLevel2Lifecycle:
         def paused_run(self, *_a, **_k):
             entered.set()
             assert release.wait(10.0)
+            return RunHandle._completed(self)
 
-        monkeypatch.setattr(Worker, "_run_locked", paused_run)
+        monkeypatch.setattr(Worker, "_submit_locked", paused_run)
         w = self._make_l2(monkeypatch)  # owner = main
         with _hard_timeout(_TEST_WALL_BUDGET_S):
             w.init()

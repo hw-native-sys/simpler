@@ -72,6 +72,10 @@ void Scheduler::stop() {
 
 void Scheduler::worker_done(WorkerCompletion completion) {
     TaskSlotState &s = *cfg_.ring->slot_state(completion.task_slot);
+    bool failure_reported = is_failure(completion.outcome);
+    if (failure_reported && cfg_.on_task_failed_cb) {
+        cfg_.on_task_failed_cb(completion.task_slot, completion.error_message);
+    }
 
     // Group aggregation: only push to completion queue when ALL workers done
     if (s.is_group()) {
@@ -146,6 +150,10 @@ void Scheduler::worker_done(WorkerCompletion completion) {
         completion = std::move(terminal);
     }
 
+    if (!failure_reported && is_failure(completion.outcome) && cfg_.on_task_failed_cb) {
+        cfg_.on_task_failed_cb(completion.task_slot, completion.error_message);
+    }
+
     {
         std::lock_guard<std::mutex> lk(completion_mu_);
         completion_queue_.push(std::move(completion));
@@ -173,9 +181,9 @@ void Scheduler::run() {
             });
         }
 
-        // Hold loop_mu_ across the entire slot-touching body so drain()'s
-        // reset_to_empty() cannot free TaskSlotStates while on_task_complete /
-        // dispatch_ready are still reading them (heap-use-after-free).
+        // Hold loop_mu_ across the entire slot-touching body so quiescent
+        // compaction cannot free TaskSlotStates while on_task_complete or
+        // dispatch_ready is still reading them.
         std::lock_guard<std::mutex> loop_lk(loop_mu_);
 
         // Phase 1: drain completions
