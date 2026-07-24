@@ -56,11 +56,29 @@
 #include "../runtime/runtime.h"
 #include "../../../../common/runtime_status/error_log.h"
 #include "../../../../common/task_interface/call_config.h"
+#include "../../../../common/worker/pto_runtime_c_api.h"
 #include "callable.h"
 #include "common/platform_config.h"
 #include "common/unified_log.h"
 #include "utils/device_arena.h"
 #include "prepare_callable_common.h"
+
+extern "C" const PipelineContract *get_pipeline_contract(void) {
+    static const PipelineContract contract = {
+        PTO_PIPELINE_CONTRACT_ABI_VERSION,
+        5,
+        1,
+        1,
+        {
+            {PTO_PIPELINE_GM_HEAP, PTO_PIPELINE_FILL_MEM, 0},
+            {PTO_PIPELINE_GM_SM, PTO_PIPELINE_FILL_MEM, 0},
+            {PTO_PIPELINE_RUNTIME_IMAGE, PTO_PIPELINE_FILL_MEM, 0},
+            {PTO_PIPELINE_AICPU_STREAM, PTO_PIPELINE_EXEC_HANDLE, 0},
+            {PTO_PIPELINE_AICORE_STREAM, PTO_PIPELINE_EXEC_HANDLE, 0},
+        },
+    };
+    return &contract;
+}
 
 // RuntimeEnv (call_config.h) is the cross-runtime ABI for per-ring config and
 // carries RUNTIME_ENV_RING_COUNT slots, shared with tensormap_and_ringbuffer.

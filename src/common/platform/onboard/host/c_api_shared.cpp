@@ -633,6 +633,15 @@ int simpler_run(
     }
 }
 
+int set_task_accepted_state_ctx(DeviceContextHandle ctx, volatile int32_t *state, int32_t accepted_value) {
+    if (ctx == NULL) return -1;
+    try {
+        return static_cast<DeviceRunnerBase *>(ctx)->set_task_accepted_state(state, accepted_value);
+    } catch (...) {
+        return -1;
+    }
+}
+
 int simpler_unregister_callable(DeviceContextHandle ctx, int32_t callable_id) {
     if (ctx == NULL) return -1;
     try {

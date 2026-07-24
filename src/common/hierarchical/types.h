@@ -30,7 +30,9 @@
 
 #include <array>
 #include <atomic>
+#include <condition_variable>
 #include <cstdint>
+#include <exception>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -117,6 +119,32 @@ static constexpr int32_t MAX_SCOPE_DEPTH = 64;
 static constexpr int32_t MAX_RING_DEPTH = 4;
 
 static constexpr int32_t INVALID_SLOT = -1;
+
+using RunId = uint64_t;
+static constexpr RunId INVALID_RUN_ID = 0;
+
+enum class RunPhase : int32_t {
+    BUILDING = 0,
+    PREPARED = 1,
+    EXECUTING = 2,
+    COMPLETED = 3,
+    FAILED = 4,
+};
+
+struct RunState {
+    explicit RunState(RunId run_id) :
+        id(run_id) {}
+
+    RunId id{INVALID_RUN_ID};
+    std::atomic<RunPhase> phase{RunPhase::BUILDING};
+    std::atomic<int32_t> active_tasks{0};
+    std::atomic<int32_t> pending_accepts{0};
+    mutable std::mutex completion_mu;
+    std::condition_variable completion_cv;
+    std::exception_ptr first_error;
+    bool submission_closed{false};
+    bool submission_failed{false};
+};
 
 // =============================================================================
 // Task slot index type
@@ -290,6 +318,7 @@ struct WorkerCompletion {
 
 struct TaskSlotState {
     std::atomic<TaskState> state{TaskState::FREE};
+    RunId run_id{INVALID_RUN_ID};
 
     // --- Fanin (orch writes once; scheduler reads atomically) ---
     int32_t fanin_count{0};
@@ -318,7 +347,7 @@ struct TaskSlotState {
 
     // --- Failure state ---
     // Root worker failures and downstream poison both land here. The
-    // WorkerManager still owns first-error-wins reporting for drain().
+    // originating RunState owns first-error-wins reporting.
     std::string failure_message;
 
     // --- Task data (stored on parent heap, lives until slot CONSUMED) ---

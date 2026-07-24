@@ -166,13 +166,13 @@ void LocalMailboxEndpoint::shutdown_child() { write_mailbox_state(MailboxState::
 // =============================================================================
 
 void WorkerThread::start(
-    Ring *ring, WorkerManager *manager, const std::function<void(WorkerCompletion)> &on_complete,
-    std::unique_ptr<WorkerEndpoint> endpoint
+    Ring *ring, const std::function<void(WorkerCompletion)> &on_complete,
+    const std::function<void(WorkerDispatch)> &on_accept, std::unique_ptr<WorkerEndpoint> endpoint
 ) {
     if (!endpoint) throw std::invalid_argument("WorkerThread::start: null endpoint");
     ring_ = ring;
-    manager_ = manager;
     on_complete_ = on_complete;
+    on_accept_ = on_accept;
     endpoint_ = std::move(endpoint);
     shutdown_ = false;
     idle_.store(true, std::memory_order_relaxed);
@@ -224,8 +224,14 @@ void WorkerThread::loop() {
         }
 
         WorkerCompletion completion;
+        bool accepted = false;
+        auto accept_once = [&]() {
+            if (accepted) return;
+            accepted = true;
+            if (on_accept_) on_accept_(d);
+        };
         try {
-            completion = dispatch_process(d);
+            completion = dispatch_process(d, accept_once);
         } catch (const std::exception &e) {
             completion.task_slot = d.task_slot;
             completion.group_index = d.group_index;
@@ -237,22 +243,20 @@ void WorkerThread::loop() {
             completion.outcome = EndpointOutcome::ENDPOINT_FAILURE;
             completion.error_message = "WorkerThread endpoint failed with unknown exception";
         }
-
-        if (completion.outcome != EndpointOutcome::SUCCESS && manager_) {
-            manager_->report_error(std::make_exception_ptr(std::runtime_error(completion.error_message)));
-        }
+        accept_once();
 
         idle_.store(true, std::memory_order_release);
         on_complete_(std::move(completion));
     }
 }
 
-WorkerCompletion WorkerThread::dispatch_process(WorkerDispatch d) {
+WorkerCompletion WorkerThread::dispatch_process(WorkerDispatch d, const std::function<void()> &on_accept) {
     if (!endpoint_) throw std::runtime_error("WorkerThread::dispatch_process: null endpoint");
-    return endpoint_->run(ring_, d);
+    return endpoint_->run(ring_, d, on_accept);
 }
 
-WorkerCompletion LocalMailboxEndpoint::run(Ring *ring, const WorkerDispatch &dispatch) {
+WorkerCompletion
+LocalMailboxEndpoint::run(Ring *ring, const WorkerDispatch &dispatch, const std::function<void()> &on_accept) {
     if (ring == nullptr) throw std::invalid_argument("LocalMailboxEndpoint::run: null ring");
     TaskSlotState &s = *ring->slot_state(dispatch.task_slot);
     int32_t group_index = dispatch.group_index;
@@ -324,8 +328,13 @@ WorkerCompletion LocalMailboxEndpoint::run(Ring *ring, const WorkerDispatch &dis
     // Signal child process.
     write_mailbox_state(MailboxState::TASK_READY);
 
-    // Spin-poll until child signals TASK_DONE.
-    while (read_mailbox_state() != MailboxState::TASK_DONE) {
+    // Observe the launch ACK without releasing mailbox ownership. A very short
+    // task may advance directly to TASK_DONE between polls; WorkerThread's
+    // completion fallback then satisfies the accepted fence conservatively.
+    while (true) {
+        MailboxState state = read_mailbox_state();
+        if (state == MailboxState::TASK_ACCEPTED) on_accept();
+        if (state == MailboxState::TASK_DONE) break;
         std::this_thread::sleep_for(std::chrono::microseconds(50));
     }
 
@@ -370,7 +379,7 @@ void WorkerManager::add_next_level_endpoint(std::unique_ptr<WorkerEndpoint> endp
 
 void WorkerManager::add_sub(void *mailbox) { sub_entries_.push_back(mailbox); }
 
-void WorkerManager::start(Ring *ring, const OnCompleteFn &on_complete) {
+void WorkerManager::start(Ring *ring, const OnCompleteFn &on_complete, const OnAcceptFn &on_accept) {
     if (ring == nullptr) throw std::invalid_argument("WorkerManager::start: null ring");
 
     std::vector<int32_t> next_level_worker_ids;
@@ -398,7 +407,7 @@ void WorkerManager::start(Ring *ring, const OnCompleteFn &on_complete) {
         for (const auto &entry : next_level_entries_) {
             auto wt = std::make_unique<WorkerThread>();
             auto endpoint = std::make_unique<LocalMailboxEndpoint>(entry.worker_id, entry.mailbox);
-            wt->start(ring, this, on_complete, std::move(endpoint));
+            wt->start(ring, on_complete, on_accept, std::move(endpoint));
             next_level_threads_.push_back(std::move(wt));
         }
     };
@@ -407,37 +416,18 @@ void WorkerManager::start(Ring *ring, const OnCompleteFn &on_complete) {
         for (size_t i = 0; i < entries.size(); ++i) {
             auto wt = std::make_unique<WorkerThread>();
             auto endpoint = std::make_unique<LocalMailboxEndpoint>(static_cast<int32_t>(i), entries[i]);
-            wt->start(ring, this, on_complete, std::move(endpoint));
+            wt->start(ring, on_complete, on_accept, std::move(endpoint));
             threads.push_back(std::move(wt));
         }
     };
     make_next_level_threads();
     for (auto &endpoint : next_level_endpoint_entries_) {
         auto wt = std::make_unique<WorkerThread>();
-        wt->start(ring, this, on_complete, std::move(endpoint));
+        wt->start(ring, on_complete, on_accept, std::move(endpoint));
         next_level_threads_.push_back(std::move(wt));
     }
     next_level_endpoint_entries_.clear();
     make_sub_threads(sub_entries_, sub_threads_);
-}
-
-void WorkerManager::report_error(std::exception_ptr e) {
-    if (!e) return;
-    std::lock_guard<std::mutex> lk(err_mu_);
-    if (first_error_) return;  // first-error-wins
-    first_error_ = std::move(e);
-    has_error_.store(true, std::memory_order_release);
-}
-
-std::exception_ptr WorkerManager::take_error() {
-    std::lock_guard<std::mutex> lk(err_mu_);
-    return first_error_;
-}
-
-void WorkerManager::clear_error() {
-    std::lock_guard<std::mutex> lk(err_mu_);
-    first_error_ = nullptr;
-    has_error_.store(false, std::memory_order_release);
 }
 
 void WorkerManager::stop() {

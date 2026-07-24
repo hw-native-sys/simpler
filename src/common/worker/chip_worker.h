@@ -73,6 +73,9 @@ public:
     // skip the view→storage memcpy and hand the pointer straight to the C ABI.
     // Used by the ChipStorageTaskArgs path in the nanobind binding.
     void run(int32_t callable_id, const ChipStorageTaskArgs *args, const CallConfig &config);
+    void
+    run(int32_t callable_id, const ChipStorageTaskArgs *args, const CallConfig &config,
+        volatile int32_t *accepted_state, int32_t accepted_value);
 
     // Per-callable_id preparation. Requires init() first and a callable_id
     // in [0, MAX_REGISTERED_CALLABLE_IDS) (cap 64).
@@ -140,6 +143,8 @@ public:
 
     int device_id() const { return device_id_; }
     bool initialized() const { return initialized_; }
+    unsigned pipeline_slot_count() const { return pipeline_contract_.pipeline_slots; }
+    unsigned arena_bank_count() const { return pipeline_contract_.arena_banks; }
 
 private:
     using CreateDeviceContextFn = void *(*)();
@@ -157,6 +162,8 @@ private:
     );
     using SimplerRegisterCallableFn = int (*)(void *, int32_t, const void *);
     using SimplerRunFn = int (*)(void *, void *, int32_t, const void *, const CallConfig *);
+    using SetTaskAcceptedStateFn = int (*)(void *, volatile int32_t *, int32_t);
+    using GetPipelineContractFn = const PipelineContract *(*)();
     using SimplerUnregisterCallableFn = int (*)(void *, int32_t);
     using GetAicpuDlopenCountFn = size_t (*)(void *);
     using SimplerProvisionDmaWorkspaceFn = int (*)(void *, uint32_t);
@@ -203,6 +210,7 @@ private:
     SimplerInitFn simpler_init_fn_ = nullptr;
     SimplerRegisterCallableFn register_callable_fn_ = nullptr;
     SimplerRunFn run_fn_ = nullptr;
+    SetTaskAcceptedStateFn set_task_accepted_state_fn_ = nullptr;
     SimplerUnregisterCallableFn unregister_callable_fn_ = nullptr;
     GetAicpuDlopenCountFn get_aicpu_dlopen_count_fn_ = nullptr;
     GetAicpuDlopenCountFn get_host_dlopen_count_fn_ = nullptr;
@@ -226,6 +234,7 @@ private:
     uint64_t base_comm_handle_ = 0;
 
     std::vector<uint8_t> runtime_buf_;
+    PipelineContract pipeline_contract_{PTO_PIPELINE_CONTRACT_ABI_VERSION, 0, 1, 1, {}};
     // device_id_ is set once in init() and never modified afterward. All
     // ChipWorker callers run on the thread that called init() (the same
     // thread is the only one that subsequently calls malloc / copy_to /

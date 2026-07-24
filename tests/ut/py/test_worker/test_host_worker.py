@@ -13,9 +13,13 @@ Each test verifies a distinct aspect of the L3 scheduling pipeline.
 """
 
 import ctypes
+import gc
 import struct
 import threading
+import time
+import weakref
 from multiprocessing.shared_memory import SharedMemory
+from typing import Any, cast
 
 import pytest
 import simpler.worker as worker_mod
@@ -45,6 +49,7 @@ from simpler.worker import (
     _CTRL_UNREGISTER,
     _IDLE,
     _OFF_STATE,
+    RunHandle,
     Worker,
     _buffer_field_addr,
     _mailbox_addr,
@@ -1385,6 +1390,365 @@ class TestSingleSubTask:
         finally:
             counter_shm.close()
             counter_shm.unlink()
+
+
+class TestRunHandle:
+    def test_submit_returns_before_completion_and_timeout_is_retryable(self):
+        state_shm = SharedMemory(create=True, size=8)
+        state_buf = state_shm.buf
+        assert state_buf is not None
+        _set_flag(state_buf, 0, 0)
+        _set_flag(state_buf, 4, 0)
+        try:
+            hw = Worker(level=3, num_sub_workers=1)
+
+            def delayed(_args):
+                while _get_flag(state_buf, 0) == 0:
+                    time.sleep(0.001)
+                _set_flag(state_buf, 4, 1)
+
+            target = hw.register(delayed)
+            hw.init()
+            callback_done = False
+
+            def orch(o, _args, _cfg):
+                nonlocal callback_done
+                o.submit_sub(target)
+                callback_done = True
+
+            handle = hw.submit(orch)
+            assert isinstance(handle, RunHandle)
+            assert callback_done
+            assert not handle.done
+            with pytest.raises(TimeoutError, match="timed out"):
+                handle.wait(0.01)
+            assert not handle.done
+
+            _set_flag(state_buf, 0, 1)
+            handle.wait(5.0)
+            assert handle.done
+            assert _get_flag(state_buf, 4) == 1
+            handle.wait()
+            assert handle.result() is None
+            hw.close()
+        finally:
+            state_shm.close()
+            state_shm.unlink()
+
+    def test_graph_error_is_synchronous(self):
+        hw = Worker(level=3, num_sub_workers=0)
+        hw.init()
+        try:
+
+            def bad_graph(_orch, _args, _cfg):
+                raise ValueError("bad graph")
+
+            with pytest.raises(ValueError, match="bad graph"):
+                hw.submit(bad_graph)
+            assert not hw._accepted_run_handles
+        finally:
+            hw.close()
+
+    def test_failed_run_does_not_poison_next_submit(self):
+        counter_shm, counter_buf = _make_shared_counter()
+        try:
+            hw = Worker(level=3, num_sub_workers=1)
+
+            def fail(_args):
+                raise RuntimeError("first run failed")
+
+            failed_target = hw.register(fail)
+            good_target = hw.register(lambda _args: _increment_counter(counter_buf))
+            hw.init()
+            failed = hw.submit(lambda o, _args, _cfg: o.submit_sub(failed_target))
+            good = hw.submit(lambda o, _args, _cfg: o.submit_sub(good_target))
+
+            with pytest.raises(RuntimeError, match="first run failed"):
+                failed.wait()
+            good.wait()
+            assert _read_counter(counter_buf) == 1
+            hw.close()
+        finally:
+            counter_shm.close()
+            counter_shm.unlink()
+
+    def test_close_drains_accepted_handle_and_rejects_later_submit(self):
+        state_shm = SharedMemory(create=True, size=4)
+        state_buf = state_shm.buf
+        assert state_buf is not None
+        _set_flag(state_buf, 0, 0)
+        try:
+            hw = Worker(level=3, num_sub_workers=1)
+
+            def delayed(_args):
+                while _get_flag(state_buf, 0) == 0:
+                    time.sleep(0.001)
+
+            target = hw.register(delayed)
+            hw.init()
+            handle = hw.submit(lambda o, _args, _cfg: o.submit_sub(target))
+            releaser = threading.Thread(target=lambda: (time.sleep(0.1), _set_flag(state_buf, 0, 1)))
+            releaser.start()
+            try:
+                hw.close()
+            finally:
+                _set_flag(state_buf, 0, 1)
+                releaser.join(5.0)
+            assert handle.done
+            with pytest.raises(RuntimeError, match="requires an initialized"):
+                hw.submit(lambda *_args: None)
+        finally:
+            state_shm.close()
+            state_shm.unlink()
+
+    def test_submit_close_race_accepts_and_drains_admitted_run(self):
+        callback_entered = threading.Event()
+        callback_release = threading.Event()
+        result: dict[str, object] = {}
+        hw = Worker(level=3, num_sub_workers=0)
+        hw.init()
+
+        def orch(_o, _args, _cfg):
+            callback_entered.set()
+            assert callback_release.wait(5.0)
+
+        submitter = threading.Thread(target=lambda: result.setdefault("handle", hw.submit(orch)))
+        submitter.start()
+        assert callback_entered.wait(3.0)
+        releaser = threading.Thread(target=lambda: (time.sleep(0.1), callback_release.set()))
+        releaser.start()
+        try:
+            hw.close()
+        finally:
+            callback_release.set()
+            submitter.join(5.0)
+            releaser.join(5.0)
+        handle = result["handle"]
+        assert isinstance(handle, RunHandle)
+        assert handle.done
+
+    def test_orchestration_callable_is_kept_alive_until_completion(self):
+        class Keepalive:
+            pass
+
+        state_shm = SharedMemory(create=True, size=4)
+        state_buf = state_shm.buf
+        assert state_buf is not None
+        _set_flag(state_buf, 0, 0)
+        token = Keepalive()
+        token_ref = weakref.ref(token)
+        try:
+            hw = Worker(level=3, num_sub_workers=1)
+
+            def delayed(_args):
+                while _get_flag(state_buf, 0) == 0:
+                    time.sleep(0.001)
+
+            target = hw.register(delayed)
+            hw.init()
+
+            def orch(o, _args, _cfg, held=token):
+                assert held is not None
+                o.submit_sub(target)
+
+            handle = hw.submit(orch)
+            del orch, token
+            gc.collect()
+            assert token_ref() is not None
+            _set_flag(state_buf, 0, 1)
+            handle.wait(5.0)
+            gc.collect()
+            assert token_ref() is None
+            hw.close()
+        finally:
+            _set_flag(state_buf, 0, 1)
+            state_shm.close()
+            state_shm.unlink()
+
+    def test_run_delegates_to_submit_and_wait(self, monkeypatch):
+        events: list[tuple] = []
+
+        class FakeHandle:
+            def wait(self):
+                events.append(("wait",))
+
+        def fake_submit(self, callable, args=None, config=None):
+            events.append(("submit", callable, args, config))
+            return FakeHandle()
+
+        monkeypatch.setattr(Worker, "submit", fake_submit)
+        worker = Worker(level=3, num_sub_workers=0)
+
+        def callback(*_args):
+            return None
+
+        worker.run(callback, args="args", config="config")
+        assert events == [("submit", callback, "args", "config"), ("wait",)]
+
+    def test_serialization_drain_does_not_swallow_async_interrupt(self, monkeypatch):
+        handle = RunHandle._completed(Worker(level=3, num_sub_workers=0))
+
+        def interrupted_wait(_self, _timeout=None):
+            raise KeyboardInterrupt
+
+        monkeypatch.setattr(RunHandle, "wait", interrupted_wait)
+        with pytest.raises(KeyboardInterrupt):
+            handle._wait_for_serialization()
+
+    def test_launch_acceptance_does_not_finalize_run(self):
+        class FakeWorker:
+            def __init__(self):
+                self.accepted_runs = []
+
+            def _wait_run_handle_accepted(self, run_id):
+                self.accepted_runs.append(run_id)
+
+        worker = FakeWorker()
+        handle = RunHandle(cast(Worker, worker), 7, (object(),))
+
+        handle._wait_for_acceptance()
+        handle._wait_for_acceptance()
+
+        assert worker.accepted_runs == [7]
+        assert handle._launch_accepted
+        assert not handle._terminal
+        assert handle._run_id == 7
+        assert handle._keepalive is not None
+
+    def test_done_query_cannot_race_native_run_release(self):
+        done_entered = threading.Event()
+        done_release = threading.Event()
+        wait_entered = threading.Event()
+
+        class FakeWorker:
+            def _run_handle_done(self, run_id):
+                assert run_id == 1
+                done_entered.set()
+                assert done_release.wait(5.0)
+                return True
+
+            def _wait_run_handle(self, run_id, timeout):
+                assert run_id == 1
+                wait_entered.set()
+                return True
+
+            def _finalize_run_handle(self, handle, run_id, error):
+                assert run_id == 1
+                return error
+
+        handle = RunHandle(cast(Worker, FakeWorker.__new__(FakeWorker)), 1, ())
+        observed: list[bool] = []
+        done_thread = threading.Thread(target=lambda: observed.append(handle.done))
+        wait_thread = threading.Thread(target=handle.wait)
+        done_thread.start()
+        assert done_entered.wait(3.0)
+        wait_thread.start()
+        try:
+            assert not wait_entered.wait(0.1)
+        finally:
+            done_release.set()
+            done_thread.join(5.0)
+            wait_thread.join(5.0)
+        assert observed == [True]
+        assert wait_entered.is_set()
+
+    def test_run_finalization_releases_only_its_resources(self, monkeypatch):
+        class SlotRef:
+            def __init__(self):
+                self.releases = 0
+
+            def _release_slot_ref(self):
+                self.releases += 1
+
+        class Region:
+            def __init__(self, region_id):
+                self.region_id = region_id
+                self._worker_id = 0
+                self.mapping_closed = False
+                self.expired = False
+
+            def _close_l3_host_mapping(self):
+                self.mapping_closed = True
+
+            def _expire(self):
+                self.expired = True
+
+        class NativeWorker:
+            def __init__(self):
+                self.released_regions = []
+
+            def control_l3_l2_region_release(self, worker_id, region_id):
+                self.released_regions.append((worker_id, region_id))
+
+        class NativeOrchestrator:
+            def __init__(self):
+                self.released_runs = []
+
+            def _release_run(self, run_id):
+                self.released_runs.append(run_id)
+
+        def domain(name, allocation_id):
+            return worker_mod.CommDomainHandle(
+                name=name,
+                workers=(),
+                contexts={},
+                allocation_id=allocation_id,
+                _release_fn=lambda _handle: None,
+            )
+
+        worker = Worker(level=3, num_sub_workers=0)
+        native_worker = NativeWorker()
+        native_orch = NativeOrchestrator()
+        worker._worker = cast(Any, native_worker)
+        worker._orch = cast(Any, native_orch)
+
+        first = worker_mod._RunResources()
+        second = worker_mod._RunResources()
+        first_ref, second_ref = SlotRef(), SlotRef()
+        first_region, second_region = Region(11), Region(22)
+        first_live, second_live = domain("first-live", 1), domain("second-live", 2)
+        first_pending, second_pending = domain("first-pending", 3), domain("second-pending", 4)
+        first.remote_slot_refs.append(cast(Any, first_ref))
+        second.remote_slot_refs.append(cast(Any, second_ref))
+        first.l3_l2_regions.append(first_region)
+        second.l3_l2_regions.append(second_region)
+        first.l3_l2_orch_comm_host_buffers[0x1000] = 64
+        second.l3_l2_orch_comm_host_buffers[0x2000] = 128
+        first.live_domains[first_live.name] = first_live
+        second.live_domains[second_live.name] = second_live
+        first.pending_release_domains.append(first_pending)
+        second.pending_release_domains.append(second_pending)
+        worker._live_l3_l2_regions.extend([first_region, second_region])
+        worker._live_domains.update({first_live.name: first_live, second_live.name: second_live})
+
+        released_domains = []
+
+        def release_domain_now(handle):
+            released_domains.append(handle)
+            if worker._live_domains.get(handle.name) is handle:
+                worker._live_domains.pop(handle.name)
+
+        monkeypatch.setattr(worker, "_release_domain_now", release_domain_now)
+        first_handle = RunHandle(worker, 1, (), first)
+        second_handle = RunHandle(worker, 2, (), second)
+        worker._accepted_run_handles.update({first_handle, second_handle})
+
+        assert worker._finalize_run_handle(first_handle, 1, None) is None
+
+        assert first_ref.releases == 1
+        assert second_ref.releases == 0
+        assert native_worker.released_regions == [(0, 11)]
+        assert first_region.mapping_closed and first_region.expired
+        assert not second_region.mapping_closed and not second_region.expired
+        assert worker._live_l3_l2_regions == [second_region]
+        assert first.l3_l2_orch_comm_host_buffers == {}
+        assert second.l3_l2_orch_comm_host_buffers == {0x2000: 128}
+        assert released_domains == [first_pending, first_live]
+        assert first_pending.freed and first_live.freed
+        assert not second_pending.freed and not second_live.freed
+        assert worker._live_domains == {second_live.name: second_live}
+        assert native_orch.released_runs == [1]
+        assert worker._accepted_run_handles == {second_handle}
 
 
 # ---------------------------------------------------------------------------

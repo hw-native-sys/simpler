@@ -37,6 +37,29 @@ T load_symbol(void *handle, const char *name) {
     return reinterpret_cast<T>(sym);
 }
 
+template <typename T>
+T load_optional_symbol(void *handle, const char *name) {
+    dlerror();
+    void *sym = dlsym(handle, name);
+    if (dlerror() != nullptr) return nullptr;
+    return reinterpret_cast<T>(sym);
+}
+
+bool is_valid_k1_pipeline_contract(const PipelineContract *contract) {
+    if (contract == nullptr || contract->abi_version != PTO_PIPELINE_CONTRACT_ABI_VERSION ||
+        contract->resource_count > PTO_PIPELINE_MAX_RESOURCES || contract->pipeline_slots != 1 ||
+        contract->arena_banks != 1) {
+        return false;
+    }
+    for (uint32_t i = 0; i < contract->resource_count; ++i) {
+        const PipelineResource &resource = contract->resources[i];
+        if (resource.kind > PTO_PIPELINE_AICORE_STREAM || resource.resource_class > PTO_PIPELINE_EXEC_HANDLE) {
+            return false;
+        }
+    }
+    return true;
+}
+
 std::vector<uint8_t> read_binary_file(const std::string &path) {
     std::ifstream f(path, std::ios::binary | std::ios::ate);
     if (!f) {
@@ -71,6 +94,7 @@ void ChipWorker::init(
     if (device_id < 0) {
         throw std::runtime_error("ChipWorker::init requires a non-negative device_id");
     }
+    pipeline_contract_ = {PTO_PIPELINE_CONTRACT_ABI_VERSION, 0, 1, 1, {}};
 
     // libsimpler_log.so (RTLD_GLOBAL, with HostLogger already seeded via
     // simpler_log_init) and — on sim — libcpu_sim_context.so (RTLD_GLOBAL) must
@@ -94,6 +118,7 @@ void ChipWorker::init(
         throw std::runtime_error(err);
     }
 
+    GetPipelineContractFn get_pipeline_contract_fn = nullptr;
     try {
         create_device_context_fn_ = load_symbol<CreateDeviceContextFn>(handle, "create_device_context");
         destroy_device_context_fn_ = load_symbol<DestroyDeviceContextFn>(handle, "destroy_device_context");
@@ -105,6 +130,9 @@ void ChipWorker::init(
         simpler_init_fn_ = load_symbol<SimplerInitFn>(handle, "simpler_init");
         register_callable_fn_ = load_symbol<SimplerRegisterCallableFn>(handle, "simpler_register_callable");
         run_fn_ = load_symbol<SimplerRunFn>(handle, "simpler_run");
+        set_task_accepted_state_fn_ =
+            load_optional_symbol<SetTaskAcceptedStateFn>(handle, "set_task_accepted_state_ctx");
+        get_pipeline_contract_fn = load_optional_symbol<GetPipelineContractFn>(handle, "get_pipeline_contract");
         unregister_callable_fn_ = load_symbol<SimplerUnregisterCallableFn>(handle, "simpler_unregister_callable");
         get_aicpu_dlopen_count_fn_ = load_symbol<GetAicpuDlopenCountFn>(handle, "get_aicpu_dlopen_count");
         get_host_dlopen_count_fn_ = load_symbol<GetAicpuDlopenCountFn>(handle, "get_host_dlopen_count");
@@ -134,7 +162,18 @@ void ChipWorker::init(
         throw;
     }
 
+    PipelineContract resolved_contract{PTO_PIPELINE_CONTRACT_ABI_VERSION, 0, 1, 1, {}};
+    if (get_pipeline_contract_fn != nullptr) {
+        const PipelineContract *contract = get_pipeline_contract_fn();
+        if (!is_valid_k1_pipeline_contract(contract)) {
+            dlclose(handle);
+            throw std::runtime_error("host runtime returned an invalid K=1 PipelineContract");
+        }
+        resolved_contract = *contract;
+    }
+
     lib_handle_ = handle;
+    pipeline_contract_ = resolved_contract;
 
     device_ctx_ = create_device_context_fn_();
     if (device_ctx_ == nullptr) {
@@ -191,6 +230,7 @@ void ChipWorker::init(
         simpler_init_fn_ = nullptr;
         register_callable_fn_ = nullptr;
         run_fn_ = nullptr;
+        set_task_accepted_state_fn_ = nullptr;
         unregister_callable_fn_ = nullptr;
         get_aicpu_dlopen_count_fn_ = nullptr;
         get_host_dlopen_count_fn_ = nullptr;
@@ -230,6 +270,7 @@ void ChipWorker::init(
         simpler_init_fn_ = nullptr;
         register_callable_fn_ = nullptr;
         run_fn_ = nullptr;
+        set_task_accepted_state_fn_ = nullptr;
         unregister_callable_fn_ = nullptr;
         get_aicpu_dlopen_count_fn_ = nullptr;
         get_host_dlopen_count_fn_ = nullptr;
@@ -295,6 +336,7 @@ void ChipWorker::finalize() {
     get_runtime_size_fn_ = nullptr;
     register_callable_fn_ = nullptr;
     run_fn_ = nullptr;
+    set_task_accepted_state_fn_ = nullptr;
     unregister_callable_fn_ = nullptr;
     get_aicpu_dlopen_count_fn_ = nullptr;
     get_host_dlopen_count_fn_ = nullptr;
@@ -313,6 +355,7 @@ void ChipWorker::finalize() {
     comm_barrier_fn_ = nullptr;
     comm_destroy_fn_ = nullptr;
     runtime_buf_.clear();
+    pipeline_contract_ = {PTO_PIPELINE_CONTRACT_ABI_VERSION, 0, 1, 1, {}};
     initialized_ = false;
     device_id_ = -1;
     finalized_ = true;
@@ -337,16 +380,40 @@ void ChipWorker::run(int32_t callable_id, TaskArgsView args, const CallConfig &c
 }
 
 void ChipWorker::run(int32_t callable_id, const ChipStorageTaskArgs *args, const CallConfig &config) {
+    run(callable_id, args, config, nullptr, 0);
+}
+
+void ChipWorker::run(
+    int32_t callable_id, const ChipStorageTaskArgs *args, const CallConfig &config, volatile int32_t *accepted_state,
+    int32_t accepted_value
+) {
     config.validate();
     if (!initialized_) {
         throw std::runtime_error("ChipWorker not initialized; call init() first");
     }
 
     void *rt = runtime_buf_.data();
+    if (accepted_state != nullptr && set_task_accepted_state_fn_ != nullptr) {
+        int bind_rc = set_task_accepted_state_fn_(device_ctx_, accepted_state, accepted_value);
+        if (bind_rc != 0) {
+            throw std::runtime_error("set_task_accepted_state_ctx failed with code " + std::to_string(bind_rc));
+        }
+    }
+    auto clear_accepted_state = [&]() {
+        if (accepted_state != nullptr && set_task_accepted_state_fn_ != nullptr)
+            (void)set_task_accepted_state_fn_(device_ctx_, nullptr, 0);
+    };
     // Per-stage timing is emitted by the platform as `[STRACE]` log markers, not
     // returned (see chip_worker.h::run). CallConfig is threaded through to the C
     // ABI as a single pointer rather than unpacked into per-field args.
-    int rc = run_fn_(device_ctx_, rt, callable_id, args, &config);
+    int rc = -1;
+    try {
+        rc = run_fn_(device_ctx_, rt, callable_id, args, &config);
+    } catch (...) {
+        clear_accepted_state();
+        throw;
+    }
+    clear_accepted_state();
     if (rc != 0) {
         throw std::runtime_error("run failed with code " + std::to_string(rc));
     }

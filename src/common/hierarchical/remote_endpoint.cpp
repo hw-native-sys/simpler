@@ -665,7 +665,9 @@ remote_l3::TaskPayloadWire RemoteL3Endpoint::build_task_payload(const TaskSlotSt
     return payload;
 }
 
-WorkerCompletion RemoteL3Endpoint::run(Ring *ring, const WorkerDispatch &dispatch) {
+WorkerCompletion
+RemoteL3Endpoint::run(Ring *ring, const WorkerDispatch &dispatch, const std::function<void()> &on_accept) {
+    (void)on_accept;  // The current remote protocol has completion but no launch ACK.
     if (ring == nullptr) throw std::invalid_argument("RemoteL3Endpoint::run: null ring");
     TaskSlotState &slot = *ring->slot_state(dispatch.task_slot);
 

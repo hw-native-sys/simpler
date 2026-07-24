@@ -6,7 +6,7 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""Orchestrator — DAG builder exposed to the user's orch function during Worker.run().
+"""Orchestrator — DAG builder passed to a Worker submit/run callback.
 
 A thin Python facade over the C++ ``Orchestrator``. The Worker creates one
 Orchestrator handle at init, retrieves the C++ object via ``Worker.get_orchestrator()``,
@@ -24,10 +24,12 @@ and passes the handle to the user's orch function::
         sub_args.add_tensor(make_tensor_arg(output_tensor), TensorArgType.INPUT)
         orch.submit_sub(sub_handle, sub_args)
 
-    w.run(my_orch, my_args, my_config)
+    handle = w.submit(my_orch, my_args, my_config)
+    handle.wait()
 
-Scope/drain lifecycle is managed by ``Worker.run()``; users never call those
-directly.
+Scope and submission-close lifecycle is managed by ``Worker.submit()``;
+completion is managed by its ``RunHandle``. ``Worker.run()`` remains the
+blocking ``submit(...).wait()`` compatibility entry point.
 """
 
 from __future__ import annotations
@@ -440,7 +442,7 @@ class Orchestrator:
     # deeper heap ring (``min(depth, MAX_RING_DEPTH-1)``) so their
     # memory reclaims independently of the outer scope. ``scope_end`` is
     # non-blocking — it releases scope refs and returns; call
-    # ``Worker.run``/``drain`` for a synchronous wait.
+    # the ``RunHandle`` returned by ``Worker.submit`` for a synchronous wait.
     #
     # Usage::
     #
@@ -543,7 +545,7 @@ class Orchestrator:
         return tensor
 
     # ------------------------------------------------------------------
-    # Internal (called by Worker.run)
+    # Internal (called by Worker.submit)
     # ------------------------------------------------------------------
 
     def _scope_begin(self) -> None:
@@ -552,8 +554,29 @@ class Orchestrator:
     def _scope_end(self) -> None:
         self._o._scope_end()
 
-    def _drain(self) -> None:
-        self._o._drain()
+    def _begin_run(self) -> int:
+        return int(self._o._begin_run())
 
-    def _clear_error(self) -> None:
-        self._o._clear_error()
+    def _close_run_submission(self, run_id: int) -> None:
+        self._o._close_run_submission(run_id)
+
+    def _fail_run_submission(self, run_id: int) -> None:
+        self._o._fail_run_submission(run_id)
+
+    def _wait_run_accepted(self, run_id: int) -> None:
+        self._o._wait_run_accepted(run_id)
+
+    def _run_accepted(self, run_id: int) -> bool:
+        return bool(self._o._run_accepted(run_id))
+
+    def _wait_run(self, run_id: int) -> None:
+        self._o._wait_run(run_id)
+
+    def _wait_run_for(self, run_id: int, timeout_seconds: float) -> bool:
+        return bool(self._o._wait_run_for(run_id, timeout_seconds))
+
+    def _run_done(self, run_id: int) -> bool:
+        return bool(self._o._run_done(run_id))
+
+    def _release_run(self, run_id: int) -> None:
+        self._o._release_run(run_id)

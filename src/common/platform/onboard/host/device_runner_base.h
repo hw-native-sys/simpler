@@ -87,6 +87,9 @@ public:
     DeviceRunnerBase(DeviceRunnerBase &&) = delete;
     DeviceRunnerBase &operator=(DeviceRunnerBase &&) = delete;
 
+    /** Bind the current host thread's launch-acceptance publication target. */
+    int set_task_accepted_state(volatile int32_t *state, int32_t accepted_value);
+
     /** Allocate / free / copy on the per-Worker `MemoryAllocator` + CANN runtime. */
     void *allocate_tensor(std::size_t bytes);
     void free_tensor(void *dev_ptr);
@@ -546,6 +549,8 @@ public:
     const std::string &output_prefix() const { return output_prefix_; }
 
 protected:
+    /** Publish launch acceptance for the target bound by the C API caller. */
+    void publish_task_accepted() const;
     // Ctor is protected: this class is for inheritance only — direct
     // instantiation (`new DeviceRunnerBase()`) is a compile error. The
     // public virtual dtor above lets the shared c_api delete through a
@@ -675,6 +680,9 @@ protected:
      * block_dim) context in the log. Returns the first non-zero rc encountered.
      */
     int sync_run_streams();
+
+    /** Wait for an explicit AICPU/AICore stream pair. */
+    int sync_stream_pair(rtStream_t aicpu_stream, rtStream_t aicore_stream);
 
     /**
      * Pull the device wall (ns) back from `device_wall_dev_ptr_` and
@@ -897,7 +905,9 @@ protected:
 
     // Persistent AICPU / AICore streams created in
     // `ensure_device_initialized()` and torn down in the subclass's
-    // `finalize()`. `nullptr` before init.
+    // `finalize()`. A2A3 reserves these for bootstrap/control operations and
+    // uses separate per-run stream sets; A5 continues to use them for runs.
+    // `nullptr` before init.
     rtStream_t stream_aicpu_{nullptr};
     rtStream_t stream_aicore_{nullptr};
     KernelArgsHelper kernel_args_;

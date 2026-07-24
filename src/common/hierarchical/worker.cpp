@@ -98,9 +98,15 @@ void Worker::init() {
 
     // Start WorkerManager first — creates WorkerThreads.
     // The on_complete callback routes through the Scheduler's worker_done().
-    manager_.start(&allocator_, [this](WorkerCompletion completion) {
-        scheduler_.worker_done(std::move(completion));
-    });
+    manager_.start(
+        &allocator_,
+        [this](WorkerCompletion completion) {
+            scheduler_.worker_done(std::move(completion));
+        },
+        [this](WorkerDispatch dispatch) {
+            orchestrator_.mark_task_accepted(dispatch.task_slot);
+        }
+    );
     ready_next_level_queues_.reset(manager_.next_level_worker_ids());
     orchestrator_.init(
         &tensormap_, &allocator_, &scope_, &ready_sub_queue_, &ready_next_level_queues_, &manager_, [this] {
@@ -119,10 +125,12 @@ void Worker::init() {
     cfg.on_consumed_cb = [this](TaskSlot slot) {
         orchestrator_.on_consumed(slot);
     };
+    cfg.on_task_failed_cb = [this](TaskSlot slot, const std::string &message) {
+        orchestrator_.report_task_error(slot, message);
+    };
 
     scheduler_.start(cfg);
-    // Let drain() hold the scheduler's loop mutex across ring teardown so slots
-    // aren't freed while the scheduler thread is mid-on_task_complete.
+    // Allocator compaction and scheduler slot access share this mutex.
     orchestrator_.set_scheduler_loop_mutex(&scheduler_.loop_mutex());
     initialized_ = true;
 }

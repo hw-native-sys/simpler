@@ -81,7 +81,8 @@ public:
     );
 
     const WorkerEndpointCaps &caps() const override { return caps_; }
-    WorkerCompletion run(Ring *ring, const WorkerDispatch &dispatch) override;
+    WorkerCompletion
+    run(Ring *ring, const WorkerDispatch &dispatch, const std::function<void()> &on_accept = {}) override;
     void shutdown_child() override;
     void control_prepare(const uint8_t *digest) override;
     void control_remote_prepare_register(
