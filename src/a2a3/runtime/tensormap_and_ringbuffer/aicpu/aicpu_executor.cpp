@@ -660,11 +660,11 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
 
                 // Fill ops / core counts (host can't resolve s_runtime_ops's
                 // device address nor know the SchedulerContext's core fan-out).
-                // Core counts come from cores_total_num_ (fixed 1 AIC : 2 AIV
-                // cluster ratio). On the decoupled path aic_count()/aiv_count() are
-                // not populated until after this SM reset, so they cannot be read here.
-                int32_t spike_total = sched_ctx_.cores_total_num();
-                runtime_finalize_after_wire(rt, spike_total / 3, (spike_total * 2) / 3);
+                // aic_count()/aiv_count() carry the handshake-derived cluster
+                // count: cores_total_num_/3 on the fixed 1:2 blocked layout, or
+                // the core-type-classified count post_handshake_init produces on
+                // the serial path.
+                runtime_finalize_after_wire(rt, sched_ctx_.aic_count(), sched_ctx_.aiv_count());
 #if SIMPLER_DFX
                 rt->orchestrator.l2_swimlane_level = get_l2_swimlane_level();
                 {
