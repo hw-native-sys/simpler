@@ -128,7 +128,7 @@ Two platform implementations exist under `src/platform/`, sharing a common inter
 | Constant | Value | Description |
 | -------- | ----- | ----------- |
 | `PLATFORM_MAX_BLOCKDIM` | 24 | Maximum blocks (each = 1 AIC + 2 AIV) |
-| `PLATFORM_MAX_AICPU_THREADS` | 4 | AICPU thread count (3 schedulers + 1 orchestrator) |
+| `PLATFORM_MAX_AICPU_THREADS` | 4 | AICPU thread count (all schedulers; the highest-index thread also runs the host-orch boot) |
 | `PLATFORM_MAX_AIC_PER_THREAD` | 24 | Max AIC cores per scheduler thread |
 | `PLATFORM_MAX_AIV_PER_THREAD` | 48 | Max AIV cores per scheduler thread |
 | `PLATFORM_PROF_SYS_CNT_FREQ` | 50 MHz | System counter frequency for profiling |
@@ -555,16 +555,18 @@ verified by review.
 
 ### 8.1 Thread Model
 
-With `aicpu_thread_num=4`, the AICPU runs 4 threads:
+With `aicpu_thread_num=4`, the AICPU runs 4 scheduler threads (thread 3 also
+performs the one-time host-orch boot before it starts dispatching):
 
-| Thread | Role | Cores |
+| Thread | Role | Cores (block_dim=24) |
 | ------ | ---- | ----- |
-| 0 | Scheduler | 6 AIC + ~13 AIV |
-| 1 | Scheduler | 6 AIC + ~13 AIV |
-| 2 | Scheduler | 6 AIC + ~13 AIV |
-| 3 | Orchestrator | none |
+| 0 | Scheduler | 6 AIC + 12 AIV |
+| 1 | Scheduler | 6 AIC + 12 AIV |
+| 2 | Scheduler | 6 AIC + 12 AIV |
+| 3 | Scheduler (+ host-orch boot) | 6 AIC + 12 AIV |
 
-Core assignment: AICs and AIVs are divided equally among the 3 scheduler threads.
+Core assignment: clusters (1 AIC + 2 AIV) are divided equally among all 4
+scheduler threads.
 
 ### 8.2 Scheduler Main Loop
 
