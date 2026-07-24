@@ -57,6 +57,8 @@ from _task_interface import (  # pyright: ignore[reportMissingImports]
     read_args_from_blob,
 )
 
+from .global_comm_domain import GlobalDomainBuffer, GlobalDomainMember
+
 __all__ = [
     "DataType",
     "get_element_size",
@@ -90,6 +92,8 @@ __all__ = [
     "CommBufferSpec",
     "ChipDomainContext",
     "CommDomainHandle",
+    "GlobalCommDomainHandle",
+    "GlobalCommDomainView",
 ]
 
 COMM_MAX_RANK_NUM = 64
@@ -894,6 +898,132 @@ class CommDomainHandle:
         else:
             state = "live"
         return f"CommDomainHandle(name={self.name!r}, workers={self.workers}, {state})"
+
+
+class GlobalCommDomainHandle:
+    """L4-owned handle for one CommDomain spanning remote L3 nodes.
+
+    The handle contains stable topology and buffer offsets only. Device
+    addresses remain in the L3/L2 process that imported the transport handles.
+    """
+
+    __slots__ = (
+        "_freed",
+        "_release_fn",
+        "_released",
+        "buffers",
+        "domain_id",
+        "generation",
+        "mapping_size",
+        "members",
+        "name",
+        "retain_after_run",
+    )
+
+    def __init__(
+        self,
+        *,
+        name: str,
+        members: tuple[GlobalDomainMember, ...],
+        buffers: tuple[GlobalDomainBuffer, ...],
+        domain_id: int,
+        generation: int,
+        mapping_size: int,
+        retain_after_run: bool,
+        _release_fn,
+    ) -> None:
+        self.name = str(name)
+        self.members = tuple(members)
+        self.buffers = tuple(buffers)
+        self.domain_id = int(domain_id)
+        self.generation = int(generation)
+        self.mapping_size = int(mapping_size)
+        self.retain_after_run = bool(retain_after_run)
+        self._release_fn = _release_fn
+        self._released = False
+        self._freed = False
+
+    def member(self, domain_rank: int) -> GlobalDomainMember:
+        if self._released:
+            raise RuntimeError(f"GlobalCommDomainHandle({self.name!r}) is already released")
+        rank = int(domain_rank)
+        if rank < 0 or rank >= len(self.members):
+            raise IndexError(f"global domain rank {rank} is out of range")
+        member = self.members[rank]
+        if member.domain_rank != rank:
+            raise RuntimeError("global domain member table is not rank ordered")
+        return member
+
+    def buffer_range(self, name: str) -> tuple[int, int]:
+        if self._released:
+            raise RuntimeError(f"GlobalCommDomainHandle({self.name!r}) is already released")
+        offset = 0
+        for buffer in self.buffers:
+            if buffer.name == name:
+                return offset, buffer.nbytes
+            offset += buffer.nbytes
+        raise KeyError(f"global domain {self.name!r} has no buffer {name!r}")
+
+    @property
+    def released(self) -> bool:
+        return self._released
+
+    @property
+    def freed(self) -> bool:
+        return self._freed
+
+    def release(self) -> None:
+        if self._released:
+            return
+        self._release_fn(self)
+        self._released = True
+
+    def __enter__(self) -> GlobalCommDomainHandle:
+        return self
+
+    def __exit__(self, *_):
+        self.release()
+
+
+class GlobalCommDomainView:
+    """L3-local imported view exposed to remote orchestration callables."""
+
+    __slots__ = (
+        "_committed",
+        "contexts",
+        "domain_id",
+        "generation",
+        "mapping_size",
+        "members",
+        "name",
+    )
+
+    def __init__(
+        self,
+        *,
+        name: str,
+        members: tuple[GlobalDomainMember, ...],
+        contexts: dict[int, ChipDomainContext],
+        domain_id: int,
+        generation: int,
+        mapping_size: int,
+    ) -> None:
+        self.name = str(name)
+        self.members = tuple(members)
+        self.contexts = dict(contexts)
+        self.domain_id = int(domain_id)
+        self.generation = int(generation)
+        self.mapping_size = int(mapping_size)
+        self._committed = False
+
+    def __getitem__(self, local_worker_id: int) -> ChipDomainContext:
+        if not self._committed:
+            raise RuntimeError(f"GlobalCommDomainView({self.name!r}) is not committed")
+        return self.contexts[int(local_worker_id)]
+
+    @property
+    def committed(self) -> bool:
+        return self._committed
 
 
 # Process-wide RTLD_GLOBAL preload registry. host_runtime.so resolves its

@@ -147,6 +147,8 @@ bool valid_control_name(uint32_t v) {
     case ControlName::COMM_INIT:
     case ControlName::ALLOC_DOMAIN:
     case ControlName::RELEASE_DOMAIN:
+    case ControlName::COPY_TO_DOMAIN:
+    case ControlName::COPY_FROM_DOMAIN:
         return true;
     }
     return false;

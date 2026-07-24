@@ -934,6 +934,12 @@ void RemoteL3Endpoint::control_remote_release_import(const RemoteBufferHandle &h
     run_control(remote_l3::ControlName::RELEASE_IMPORT, remote_l3::encode_release_import_request(request));
 }
 
+std::vector<uint8_t> RemoteL3Endpoint::control_remote_domain(
+    remote_l3::ControlName control_name, const std::vector<uint8_t> &command_bytes
+) {
+    return run_control(control_name, command_bytes).result_bytes;
+}
+
 void RemoteL3Endpoint::shutdown_child() {
     if (!transport_) return;
     try {

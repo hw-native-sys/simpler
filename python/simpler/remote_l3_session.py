@@ -42,6 +42,20 @@ from .callable_identity import (
     parse_python_import_target,
     validate_hashid,
 )
+from .global_comm_domain import (
+    GLOBAL_DOMAIN_DESCRIPTOR_BYTES,
+    GLOBAL_DOMAIN_MAX_RANKS,
+    GlobalCommInitResult,
+    GlobalDomainPhase,
+    GlobalDomainReleaseCommand,
+    decode_comm_init,
+    decode_copy_command,
+    decode_domain_command,
+    decode_release_command,
+    encode_comm_init_result,
+    encode_copy_result,
+    encode_descriptor_table,
+)
 from .remote_l3_protocol import (
     CallableKind,
     ChipCallableBlobLocation,
@@ -110,6 +124,7 @@ class _RemoteBufferEntry:
     nbytes: int
     generation: int
     address_space: RemoteAddressSpace
+    owner: Worker | None = None
     offset: int = 0
     released: bool = False
 
@@ -119,6 +134,8 @@ class _RemoteBufferEntry:
             buf = self.data.buf
             assert buf is not None
             return ctypes.addressof(ctypes.c_char.from_buffer(buf))
+        if hasattr(self.data, "data_ptr"):
+            return int(self.data.data_ptr)
         return ctypes.addressof(self.data)
 
     @property
@@ -129,6 +146,13 @@ class _RemoteBufferEntry:
 
     def close(self, *, unlink: bool = False) -> None:
         if not isinstance(self.data, shared_memory.SharedMemory):
+            if self.owner is not None:
+                owner, self.owner = self.owner, None
+                # HostBuffer itself owns a memoryview. Release it before asking
+                # Worker to close the backing shm so teardown is prompt and does
+                # not report a false live-view warning.
+                self.data.buffer.release()
+                owner.free_host_buffer(self.data)
             return
         self.data.close()
         if unlink:
@@ -460,6 +484,20 @@ def _control_reply(
     send_frame(conn, FrameHeader(FrameType.CONTROL_REPLY, session_id, worker_id, sequence), payload)
 
 
+def _control_result_reply(
+    conn: socket.socket,
+    manifest: dict[str, Any],
+    sequence: int,
+    control_name: ControlName,
+    version: int,
+    result: bytes,
+) -> None:
+    session_id = int(manifest["session_id"])
+    worker_id = int(manifest["worker_id"])
+    payload = encode_control_reply(sequence, control_name, version, 0, "", bytes(result))
+    send_frame(conn, FrameHeader(FrameType.CONTROL_REPLY, session_id, worker_id, sequence), payload)
+
+
 def _copy_command_header(data: bytes) -> tuple[int, int, int, int, int, bytes]:
     if len(data) < 36:
         raise ValueError("remote buffer copy command is truncated")
@@ -543,12 +581,13 @@ def _run_command_loop(  # noqa: PLR0912, PLR0915
     next_export_id = 1
     next_import_id = 1
     buffers: dict[tuple[int, ...], _RemoteBufferEntry] = {}
+    global_comm_inits: dict[str, Any] = {}
 
     hello = HelloPayload(
         session_id=session_id,
         worker_id=worker_id,
         protocol_version=1,
-        comm_profile=str(manifest["transport"]),
+        comm_profile=str(manifest.get("comm_profile", manifest["transport"])),
         feature_flags=0,
         ready_state=ReadyState.READY,
     )
@@ -655,9 +694,27 @@ def _run_command_loop(  # noqa: PLR0912, PLR0915
                         buffer_id = next_buffer_id
                         next_buffer_id += 1
                         generation = 1
-                        buf = shared_memory.SharedMemory(create=True, size=int(nbytes))
+                        try:
+                            buf = inner_worker.create_host_buffer(int(nbytes))
+                            entry = _RemoteBufferEntry(
+                                buf,
+                                int(nbytes),
+                                generation,
+                                RemoteAddressSpace.REMOTE_DEVICE,
+                                owner=inner_worker,
+                            )
+                        except RuntimeError as exc:
+                            no_child = "create_host_buffer requires at least one forked chip or sub child"
+                            if no_child not in str(exc):
+                                raise
+                            buf = shared_memory.SharedMemory(create=True, size=int(nbytes))
+                            entry = _RemoteBufferEntry(
+                                buf,
+                                int(nbytes),
+                                generation,
+                                RemoteAddressSpace.REMOTE_DEVICE,
+                            )
                         key = _buffer_key(buffer_id, generation)
-                        entry = _RemoteBufferEntry(buf, int(nbytes), generation, RemoteAddressSpace.REMOTE_DEVICE)
                         buffers[key] = entry
                         remote_addr = entry.addr
                         result = struct.pack(
@@ -845,19 +902,137 @@ def _run_command_loop(  # noqa: PLR0912, PLR0915
                         _control_reply(
                             conn, manifest, header.sequence, control.control_name, control.control_version, 0, ""
                         )
-                    elif control.control_name in (
-                        ControlName.COMM_INIT,
-                        ControlName.ALLOC_DOMAIN,
-                        ControlName.RELEASE_DOMAIN,
-                    ):
+                    elif control.control_name == ControlName.COMM_INIT:
+                        command = decode_comm_init(control.command_bytes)
+                        manifest_profile = str(manifest.get("comm_profile", manifest["transport"]))
+                        if command.cluster_id != str(manifest.get("cluster_id", "")):
+                            raise ValueError("COMM_INIT cluster_id does not match the session manifest")
+                        if command.profile != manifest_profile:
+                            raise ValueError("COMM_INIT profile does not match the session manifest")
+                        if command.node_rank != int(manifest.get("node_rank", 0)) or command.node_count != int(
+                            manifest.get("node_count", 1)
+                        ):
+                            raise ValueError("COMM_INIT node identity does not match the session manifest")
+                        global_ranks = tuple(int(rank) for rank in manifest.get("global_device_ranks", ()))
+                        local_members = tuple(
+                            member for member in command.members if member.node_worker_id == worker_id
+                        )
+                        if not local_members:
+                            raise ValueError("COMM_INIT topology has no local members")
+                        for member in local_members:
+                            if member.local_worker_id < 0 or member.local_worker_id >= len(global_ranks):
+                                raise ValueError("COMM_INIT local worker id exceeds the session device list")
+                            if member.global_device_rank != global_ranks[member.local_worker_id]:
+                                raise ValueError("COMM_INIT global device rank does not match the manifest")
+                        prior = global_comm_inits.get(command.topology_hash)
+                        if prior is not None and prior != command:
+                            raise ValueError("COMM_INIT topology hash conflicts with an earlier command")
+                        global_comm_inits[command.topology_hash] = command
+                        result = GlobalCommInitResult(
+                            profile=manifest_profile,
+                            max_ranks=GLOBAL_DOMAIN_MAX_RANKS,
+                            descriptor_bytes=GLOBAL_DOMAIN_DESCRIPTOR_BYTES,
+                            local_device_count=len(global_ranks),
+                        )
+                        _control_result_reply(
+                            conn,
+                            manifest,
+                            header.sequence,
+                            control.control_name,
+                            control.control_version,
+                            encode_comm_init_result(result),
+                        )
+                    elif control.control_name == ControlName.ALLOC_DOMAIN:
+                        command = decode_domain_command(control.command_bytes)
+                        if not any(
+                            init.profile == command.profile and init.members == command.members
+                            for init in global_comm_inits.values()
+                        ):
+                            raise RuntimeError("ALLOC_DOMAIN requires a matching COMM_INIT topology")
+                        if command.phase is GlobalDomainPhase.PREPARE_EXPORT:
+                            if command.descriptors:
+                                raise ValueError("PREPARE_EXPORT must not carry descriptors")
+                            descriptors = inner_worker._prepare_global_domain_node(command, worker_id)  # noqa: SLF001
+                            _control_result_reply(
+                                conn,
+                                manifest,
+                                header.sequence,
+                                control.control_name,
+                                control.control_version,
+                                encode_descriptor_table(descriptors),
+                            )
+                        elif command.phase is GlobalDomainPhase.IMPORT:
+                            inner_worker._import_global_domain_node(command, worker_id)  # noqa: SLF001
+                            _control_reply(
+                                conn,
+                                manifest,
+                                header.sequence,
+                                control.control_name,
+                                control.control_version,
+                                0,
+                                "",
+                            )
+                        elif command.phase is GlobalDomainPhase.COMMIT:
+                            inner_worker._commit_global_domain_node(command)  # noqa: SLF001
+                            _control_reply(
+                                conn,
+                                manifest,
+                                header.sequence,
+                                control.control_name,
+                                control.control_version,
+                                0,
+                                "",
+                            )
+                        elif command.phase is GlobalDomainPhase.ABORT:
+                            inner_worker._release_global_domain_node(  # noqa: SLF001
+                                GlobalDomainReleaseCommand(command.domain_id, command.generation),
+                                suppress_errors=True,
+                            )
+                            _control_reply(
+                                conn,
+                                manifest,
+                                header.sequence,
+                                control.control_name,
+                                control.control_version,
+                                0,
+                                "",
+                            )
+                        else:
+                            raise ValueError("ALLOC_DOMAIN phase is not supported")
+                    elif control.control_name == ControlName.RELEASE_DOMAIN:
+                        command = decode_release_command(control.command_bytes)
+                        inner_worker._release_global_domain_node(command)  # noqa: SLF001
                         _control_reply(
                             conn,
                             manifest,
                             header.sequence,
                             control.control_name,
                             control.control_version,
-                            1,
-                            f"unsupported reserved remote domain control {control.control_name.name}",
+                            0,
+                            "",
+                        )
+                    elif control.control_name == ControlName.COPY_TO_DOMAIN:
+                        command = decode_copy_command(control.command_bytes, include_data=True)
+                        inner_worker._copy_global_domain_node(command, copy_to_device=True)  # noqa: SLF001
+                        _control_reply(
+                            conn,
+                            manifest,
+                            header.sequence,
+                            control.control_name,
+                            control.control_version,
+                            0,
+                            "",
+                        )
+                    elif control.control_name == ControlName.COPY_FROM_DOMAIN:
+                        command = decode_copy_command(control.command_bytes, include_data=False)
+                        result = inner_worker._copy_global_domain_node(command, copy_to_device=False)  # noqa: SLF001
+                        _control_result_reply(
+                            conn,
+                            manifest,
+                            header.sequence,
+                            control.control_name,
+                            control.control_version,
+                            encode_copy_result(result),
                         )
                     else:
                         _control_reply(

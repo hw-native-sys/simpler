@@ -126,6 +126,11 @@ public:
     control_digest_only(WorkerType type, int worker_id, uint64_t sub_cmd, const uint8_t *digest, double timeout_s) {
         return manager_.control_digest_only(type, worker_id, sub_cmd, digest, timeout_s);
     }
+    std::vector<uint8_t> control_payload(
+        WorkerType type, int worker_id, uint64_t sub_cmd, const void *payload, size_t payload_size, double timeout_s
+    ) {
+        return manager_.control_payload(type, worker_id, sub_cmd, payload, payload_size, timeout_s);
+    }
     ControlResult remote_prepare_register(
         int worker_id, remote_l3::RemoteRegistryTarget target_registry, CallableKind callable_kind, const void *payload,
         size_t payload_size, const uint8_t *digest
@@ -173,6 +178,11 @@ public:
         return manager_.control_remote_import(importer_worker_id, export_desc, requested_access_flags);
     }
     void remote_release_import(const RemoteBufferHandle &handle) { manager_.control_remote_release_import(handle); }
+    std::vector<uint8_t> remote_domain_control(
+        int worker_id, remote_l3::ControlName control_name, const std::vector<uint8_t> &command_bytes
+    ) {
+        return manager_.control_remote_domain(worker_id, control_name, command_bytes);
+    }
 
     // Broadcast CTRL_REGISTER / CTRL_UNREGISTER for a ChipCallable digest to
     // every NEXT_LEVEL child in parallel. `blob_ptr`/`blob_size` describe

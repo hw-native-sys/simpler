@@ -165,6 +165,38 @@ struct DomainAllocation {
     std::unique_ptr<CommContext> host_ctx;  // device_ctx points here on sim
 };
 
+struct GlobalPeerMapping {
+    void *base = nullptr;
+    size_t size = 0;
+};
+
+struct GlobalDomainAllocation {
+    ~GlobalDomainAllocation() {
+        for (auto &mapping : peer_mappings) {
+            if (mapping.base != nullptr) {
+                munmap(mapping.base, mapping.size);
+            }
+        }
+        if (local_base != nullptr) {
+            munmap(local_base, mapping_size);
+        }
+        if (!shm_name.empty()) {
+            shm_unlink(shm_name.c_str());
+        }
+    }
+
+    uint32_t rank = 0;
+    uint32_t nranks = 0;
+    std::string shm_name;
+    void *local_base = nullptr;
+    size_t mapping_size = 0;
+    std::vector<GlobalPeerMapping> peer_mappings;
+    std::unique_ptr<CommContext> host_ctx;
+};
+
+static_assert(sizeof(CommGlobalDomainDescriptor) == 288, "global domain descriptor ABI changed");
+static std::unordered_map<uint64_t, std::unique_ptr<GlobalDomainAllocation>> global_domain_allocations;
+
 struct CommHandle_ {
     int rank;
     int nranks;
@@ -679,6 +711,152 @@ comm_release_domain_windows(CommHandle h, uint64_t allocation_id, size_t rank_co
     return -1;
 } catch (...) {
     std::fprintf(stderr, "[comm_sim] release_domain: unknown exception\n");
+    return -1;
+}
+
+extern "C" int comm_global_domain_prepare(
+    uint64_t domain_id, uint32_t domain_rank, uint32_t rank_count, size_t window_size, uint32_t profile,
+    CommGlobalDomainDescriptor *descriptor_out, uint64_t *local_window_base_out
+) try {
+    if (domain_id == 0 || rank_count == 0 || rank_count > COMM_MAX_RANK_NUM || domain_rank >= rank_count ||
+        window_size == 0 || profile != COMM_GLOBAL_DOMAIN_PROFILE_SIM_SHM || descriptor_out == nullptr ||
+        local_window_base_out == nullptr) {
+        return -1;
+    }
+    if (global_domain_allocations.count(domain_id) != 0) {
+        return -1;
+    }
+
+    std::string identity =
+        std::to_string(static_cast<unsigned long long>(domain_id)) + ":" + std::to_string(domain_rank);
+    std::string shm_name = make_shm_name(static_cast<uint32_t>(getpid()), hash_id(identity.c_str()));
+    if (shm_name.empty() || shm_name.size() > COMM_GLOBAL_DOMAIN_HANDLE_BYTES) {
+        return -1;
+    }
+
+    int fd = shm_open(shm_name.c_str(), O_CREAT | O_EXCL | O_RDWR, 0600);
+    if (fd < 0) {
+        return -1;
+    }
+    if (ftruncate(fd, static_cast<off_t>(window_size)) != 0) {
+        close(fd);
+        shm_unlink(shm_name.c_str());
+        return -1;
+    }
+    void *base = mmap(nullptr, window_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    close(fd);
+    if (base == MAP_FAILED) {
+        shm_unlink(shm_name.c_str());
+        return -1;
+    }
+    std::memset(base, 0, window_size);
+
+    auto allocation = std::make_unique<GlobalDomainAllocation>();
+    allocation->rank = domain_rank;
+    allocation->nranks = rank_count;
+    allocation->shm_name = shm_name;
+    allocation->local_base = base;
+    allocation->mapping_size = window_size;
+
+    CommGlobalDomainDescriptor descriptor{};
+    descriptor.version = COMM_GLOBAL_DOMAIN_VERSION;
+    descriptor.profile = COMM_GLOBAL_DOMAIN_PROFILE_SIM_SHM;
+    descriptor.domain_rank = domain_rank;
+    descriptor.rank_count = rank_count;
+    descriptor.mapping_size = window_size;
+    descriptor.handle_size = static_cast<uint32_t>(shm_name.size());
+    std::memcpy(descriptor.handle, shm_name.data(), shm_name.size());
+
+    *descriptor_out = descriptor;
+    *local_window_base_out = reinterpret_cast<uint64_t>(base);
+    global_domain_allocations.emplace(domain_id, std::move(allocation));
+    return 0;
+} catch (const std::exception &e) {
+    std::fprintf(stderr, "[comm_sim] global_domain_prepare: exception: %s\n", e.what());
+    return -1;
+} catch (...) {
+    std::fprintf(stderr, "[comm_sim] global_domain_prepare: unknown exception\n");
+    return -1;
+}
+
+extern "C" int comm_global_domain_import(
+    uint64_t domain_id, const CommGlobalDomainDescriptor *descriptors, size_t descriptor_count, uint64_t *device_ctx_out
+) try {
+    auto it = global_domain_allocations.find(domain_id);
+    if (it == global_domain_allocations.end() || descriptors == nullptr || device_ctx_out == nullptr) {
+        return -1;
+    }
+    auto &allocation = it->second;
+    if (descriptor_count != allocation->nranks || allocation->host_ctx != nullptr) {
+        return -1;
+    }
+
+    std::vector<const CommGlobalDomainDescriptor *> rank_order(descriptor_count, nullptr);
+    for (size_t i = 0; i < descriptor_count; ++i) {
+        const auto &descriptor = descriptors[i];
+        if (descriptor.version != COMM_GLOBAL_DOMAIN_VERSION ||
+            descriptor.profile != COMM_GLOBAL_DOMAIN_PROFILE_SIM_SHM || descriptor.rank_count != allocation->nranks ||
+            descriptor.domain_rank >= allocation->nranks || descriptor.mapping_size != allocation->mapping_size ||
+            descriptor.handle_size == 0 || descriptor.handle_size > COMM_GLOBAL_DOMAIN_HANDLE_BYTES ||
+            rank_order[descriptor.domain_rank] != nullptr) {
+            return -1;
+        }
+        rank_order[descriptor.domain_rank] = &descriptor;
+    }
+
+    auto ctx = std::make_unique<CommContext>();
+    ctx->rankId = allocation->rank;
+    ctx->rankNum = allocation->nranks;
+    ctx->winSize = allocation->mapping_size;
+    allocation->peer_mappings.reserve(allocation->nranks - 1);
+    for (uint32_t rank = 0; rank < allocation->nranks; ++rank) {
+        const auto *descriptor = rank_order[rank];
+        if (descriptor == nullptr) {
+            return -1;
+        }
+        void *base = allocation->local_base;
+        if (rank != allocation->rank) {
+            std::string peer_name(
+                reinterpret_cast<const char *>(descriptor->handle), static_cast<size_t>(descriptor->handle_size)
+            );
+            int fd = shm_open(peer_name.c_str(), O_RDWR, 0600);
+            if (fd < 0) {
+                return -1;
+            }
+            base = mmap(nullptr, allocation->mapping_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+            close(fd);
+            if (base == MAP_FAILED) {
+                return -1;
+            }
+            allocation->peer_mappings.push_back(GlobalPeerMapping{base, allocation->mapping_size});
+        }
+        ctx->windowsIn[rank] = reinterpret_cast<uint64_t>(base);
+        ctx->windowsOut[rank] = reinterpret_cast<uint64_t>(base);
+    }
+
+    *device_ctx_out = reinterpret_cast<uint64_t>(ctx.get());
+    allocation->host_ctx = std::move(ctx);
+    return 0;
+} catch (const std::exception &e) {
+    std::fprintf(stderr, "[comm_sim] global_domain_import: exception: %s\n", e.what());
+    return -1;
+} catch (...) {
+    std::fprintf(stderr, "[comm_sim] global_domain_import: unknown exception\n");
+    return -1;
+}
+
+extern "C" int comm_global_domain_release(uint64_t domain_id) try {
+    auto it = global_domain_allocations.find(domain_id);
+    if (it == global_domain_allocations.end()) {
+        return 0;
+    }
+    global_domain_allocations.erase(it);
+    return 0;
+} catch (const std::exception &e) {
+    std::fprintf(stderr, "[comm_sim] global_domain_release: exception: %s\n", e.what());
+    return -1;
+} catch (...) {
+    std::fprintf(stderr, "[comm_sim] global_domain_release: unknown exception\n");
     return -1;
 }
 
