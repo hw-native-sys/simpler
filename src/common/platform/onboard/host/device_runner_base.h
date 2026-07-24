@@ -676,6 +676,9 @@ protected:
      */
     int sync_run_streams();
 
+    /** Wait for an explicit AICPU/AICore stream pair. */
+    int sync_stream_pair(rtStream_t aicpu_stream, rtStream_t aicore_stream);
+
     /**
      * Pull the device wall (ns) back from `device_wall_dev_ptr_` and
      * cache it on `device_wall_ns_`. D2H copy failure is a soft warn —
@@ -897,7 +900,9 @@ protected:
 
     // Persistent AICPU / AICore streams created in
     // `ensure_device_initialized()` and torn down in the subclass's
-    // `finalize()`. `nullptr` before init.
+    // `finalize()`. A2A3 reserves these for bootstrap/control operations and
+    // uses separate per-run stream sets; A5 continues to use them for runs.
+    // `nullptr` before init.
     rtStream_t stream_aicpu_{nullptr};
     rtStream_t stream_aicore_{nullptr};
     KernelArgsHelper kernel_args_;
