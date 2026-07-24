@@ -89,6 +89,10 @@ struct PTO2RuntimeOps {
     );
     TaskOutputTensors (*alloc_tensors)(PTO2Runtime *rt, const L0TaskArgs &args);
     TaskOutputTensors (*submit_dummy_task)(PTO2Runtime *rt, const L0TaskArgs &args);
+
+    // This-run MIX cluster (= AIC) count from runtime_finalize_after_wire.
+    int32_t (*available_cluster_count)(PTO2Runtime *rt);
+
     // Stash the call-site captured by PTO2ScopeGuard into the [ScopeStats]
     // collector. Always present in the struct to keep ops-table layout stable
     // across SIMPLER_DFX settings; set to nullptr at SIMPLER_DFX=0.
