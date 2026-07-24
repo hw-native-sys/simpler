@@ -15,16 +15,15 @@
  * Both the ChipWorker (consumer, resolves public symbols via dlsym) and the
  * platform implementations (producers, define all symbols) include this file.
  *
- * Public API — resolved by ChipWorker via dlsym (every host_runtime.so must
- * export ALL of these; runtimes without a real backend ship not-supported
- * stubs rather than omitting symbols, so ChipWorker can dlsym the full set
- * unconditionally without per-symbol probing):
+ * Public API — resolved by ChipWorker via dlsym. Core lifecycle, memory,
+ * registration, run, communication, and stream symbols are required from
+ * every host_runtime.so.
  *   - lifecycle:    create_device_context, destroy_device_context,
  *                   simpler_init, finalize_device
  *   - sizing:       get_runtime_size
  *   - device-mem:   device_malloc_ctx, device_free_ctx,
  *                   copy_to_device_ctx, copy_from_device_ctx
- *   - prepared run: simpler_register_callable, simpler_run, unregister_callable,
+ *   - callable/run: simpler_register_callable, simpler_run, unregister_callable,
  *                   get_aicpu_dlopen_count, get_host_dlopen_count,
  *                   simpler_provision_dma_workspace
  *   - ACL/stream:   ensure_acl_ready_ctx, create_comm_stream_ctx,
@@ -61,6 +60,42 @@ enum {
     PTO_RUNTIME_ERR_UNSUPPORTED = -2,
 };
 
+enum {
+    PTO_PIPELINE_CONTRACT_ABI_VERSION = 1,
+    PTO_PIPELINE_MAX_RESOURCES = 8,
+    PTO_PIPELINE_MAX_SLOTS = 2,
+};
+
+typedef enum PipelineResourceClass {
+    PTO_PIPELINE_FILL_MEM = 0,
+    PTO_PIPELINE_REUSE_MEM = 1,
+    PTO_PIPELINE_EXEC_HANDLE = 2,
+} PipelineResourceClass;
+
+typedef enum PipelineResourceKind {
+    PTO_PIPELINE_GM_HEAP = 0,
+    PTO_PIPELINE_GM_SM = 1,
+    PTO_PIPELINE_RUNTIME_IMAGE = 2,
+    PTO_PIPELINE_TASK_ARGS = 3,
+    PTO_PIPELINE_AICPU_STREAM = 4,
+    PTO_PIPELINE_AICORE_STREAM = 5,
+} PipelineResourceKind;
+
+typedef struct PipelineResource {
+    uint32_t kind;
+    uint32_t resource_class;
+    size_t bytes_per_slot;
+} PipelineResource;
+
+/** Runtime-owned declaration of resources crossing KernelLaunch. */
+typedef struct PipelineContract {
+    uint32_t abi_version;
+    uint32_t resource_count;
+    uint32_t pipeline_slots;
+    uint32_t arena_banks;
+    PipelineResource resources[PTO_PIPELINE_MAX_RESOURCES];
+} PipelineContract;
+
 /* Per-stage run timing is no longer returned. The platform emits it as
  * `[STRACE]` log markers (host stages + the AICPU device-phase breakdown,
  * gated on SIMPLER_HOST_STRACE) — parse with simpler_setup.tools.strace_timing.
@@ -69,6 +104,9 @@ enum {
 /* ===========================================================================
  * Public API (resolved by ChipWorker via dlsym)
  * =========================================================================== */
+
+/** Return this runtime's immutable pipeline resource declaration. Optional. */
+const PipelineContract *get_pipeline_contract(void);
 
 /**
  * Create a new device context (heap-allocated DeviceRunner).
@@ -205,6 +243,15 @@ int simpler_register_callable(DeviceContextHandle ctx, int32_t callable_id, cons
 int simpler_run(
     DeviceContextHandle ctx, RuntimeHandle runtime, int32_t callable_id, const void *args, const CallConfig *config
 );
+
+/** Select the arena bank used by subsequent calls on the current thread. */
+int select_arena_bank_ctx(DeviceContextHandle ctx, unsigned arena_bank);
+
+/** Select the per-thread pipeline slot independently from arena banking. */
+int select_pipeline_slot_ctx(DeviceContextHandle ctx, unsigned pipeline_slot);
+
+/** Register the mailbox state word that receives the post-KernelLaunch ACK. */
+int set_task_accepted_state_ctx(DeviceContextHandle ctx, volatile int32_t *state, int32_t accepted_value);
 
 /**
  * Drop the prepared state for `callable_id` and release the per-id share of

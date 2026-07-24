@@ -27,6 +27,7 @@
 #include <runtime/rt.h>
 #include <acl/acl.h>
 #include <dlfcn.h>
+#include <pthread.h>
 
 #include <algorithm>
 #include <cassert>
@@ -62,6 +63,10 @@
 extern "C" const char *const *runtime_extra_aicpu_symbols(size_t *count);
 
 namespace {
+
+thread_local unsigned g_pipeline_slot = 0;
+thread_local volatile int32_t *g_task_accepted_state = nullptr;
+thread_local int32_t g_task_accepted_value = 0;
 
 HostRuntimeTimeoutConfig resolve_onboard_timeout_config() {
     RuntimeTimeoutConfig order_defaults{
@@ -118,12 +123,72 @@ HostRuntimeTimeoutConfig resolve_onboard_timeout_config() {
     return HostRuntimeTimeoutConfig{cfg.op_execute_timeout_us, cfg.stream_sync_timeout_ms, scheduler_override};
 }
 
+pthread_key_t g_arena_bank_key;
+pthread_once_t g_arena_bank_once = PTHREAD_ONCE_INIT;
+bool g_arena_bank_key_ready = false;
+
+void create_arena_bank_key() {
+    if (pthread_key_create(&g_arena_bank_key, nullptr) == 0) {
+        g_arena_bank_key_ready = true;
+    }
+}
+
+unsigned current_arena_bank() {
+    pthread_once(&g_arena_bank_once, create_arena_bank_key);
+    if (!g_arena_bank_key_ready) return 0;
+    return static_cast<unsigned>(reinterpret_cast<uintptr_t>(pthread_getspecific(g_arena_bank_key)));
+}
+
+__attribute__((destructor)) void destroy_arena_bank_key() {
+    if (g_arena_bank_key_ready) {
+        pthread_key_delete(g_arena_bank_key);
+        g_arena_bank_key_ready = false;
+    }
+}
+
 }  // namespace
 
 DeviceRunnerBase::DeviceRunnerBase() :
     gm_heap_arena_(&arena_alloc_trampoline, &arena_free_trampoline, &mem_alloc_),
     gm_sm_arena_(&arena_alloc_trampoline, &arena_free_trampoline, &mem_alloc_),
-    runtime_arena_pool_(&arena_alloc_trampoline, &arena_free_trampoline, &mem_alloc_) {}
+    runtime_arena_pool_(&arena_alloc_trampoline, &arena_free_trampoline, &mem_alloc_),
+    gm_heap_arena_bank1_(&arena_alloc_trampoline, &arena_free_trampoline, &mem_alloc_),
+    gm_sm_arena_bank1_(&arena_alloc_trampoline, &arena_free_trampoline, &mem_alloc_),
+    runtime_arena_pool_bank1_(&arena_alloc_trampoline, &arena_free_trampoline, &mem_alloc_) {}
+
+int DeviceRunnerBase::select_arena_bank(unsigned bank) {
+    if (bank > 1) {
+        LOG_ERROR("arena bank %u is outside [0, 2)", bank);
+        return -1;
+    }
+    pthread_once(&g_arena_bank_once, create_arena_bank_key);
+    if (!g_arena_bank_key_ready || pthread_setspecific(g_arena_bank_key, reinterpret_cast<void *>(bank)) != 0) {
+        LOG_ERROR("failed to select arena bank %u for the current thread", bank);
+        return -1;
+    }
+    return 0;
+}
+
+int DeviceRunnerBase::select_pipeline_slot(unsigned slot) {
+    if (slot > 1) {
+        LOG_ERROR("pipeline slot %u is outside [0, 2)", slot);
+        return -1;
+    }
+    g_pipeline_slot = slot;
+    return 0;
+}
+
+int DeviceRunnerBase::set_task_accepted_state(volatile int32_t *state, int32_t accepted_value) {
+    g_task_accepted_state = state;
+    g_task_accepted_value = accepted_value;
+    return 0;
+}
+
+void DeviceRunnerBase::publish_task_accepted() {
+    if (g_task_accepted_state != nullptr) {
+        __atomic_store_n(g_task_accepted_state, g_task_accepted_value, __ATOMIC_RELEASE);
+    }
+}
 
 void *DeviceRunnerBase::allocate_tensor(std::size_t bytes) { return mem_alloc_.alloc(bytes); }
 
@@ -146,44 +211,50 @@ int DeviceRunnerBase::device_memset(void *dev_ptr, int value, std::size_t bytes)
 }
 
 void DeviceRunnerBase::get_retained_temp_buffer(void **addr, size_t *size) {
-    if (addr != nullptr) *addr = retained_temp_addr_;
-    if (size != nullptr) *size = retained_temp_size_;
+    if (addr != nullptr) *addr = retained_temp_addrs_[g_pipeline_slot];
+    if (size != nullptr) *size = retained_temp_sizes_[g_pipeline_slot];
 }
 
 void DeviceRunnerBase::set_retained_temp_buffer(void *addr, size_t size) {
-    retained_temp_addr_ = addr;
-    retained_temp_size_ = size;
+    retained_temp_addrs_[g_pipeline_slot] = addr;
+    retained_temp_sizes_[g_pipeline_slot] = size;
 }
 
 void DeviceRunnerBase::clear_temporary_buffer() {
-    if (retained_temp_addr_ != nullptr) {
-        mem_alloc_.free(retained_temp_addr_);
-        retained_temp_addr_ = nullptr;
-        retained_temp_size_ = 0;
+    for (size_t slot = 0; slot < retained_temp_addrs_.size(); ++slot) {
+        if (retained_temp_addrs_[slot] != nullptr) {
+            mem_alloc_.free(retained_temp_addrs_[slot]);
+            retained_temp_addrs_[slot] = nullptr;
+            retained_temp_sizes_[slot] = 0;
+        }
     }
 }
 
 void *DeviceRunnerBase::acquire_pooled_gm_heap() {
-    if (!gm_heap_arena_.is_committed()) return nullptr;
-    return gm_heap_arena_.base();
+    DeviceArena &arena = current_arena_bank() == 0 ? gm_heap_arena_ : gm_heap_arena_bank1_;
+    if (!arena.is_committed()) return nullptr;
+    return arena.base();
 }
 
 void *DeviceRunnerBase::acquire_pooled_gm_sm() {
-    if (!gm_sm_arena_.is_committed()) return nullptr;
-    return gm_sm_arena_.base();
+    DeviceArena &arena = current_arena_bank() == 0 ? gm_sm_arena_ : gm_sm_arena_bank1_;
+    if (!arena.is_committed()) return nullptr;
+    return arena.base();
 }
 
 void *DeviceRunnerBase::acquire_pooled_runtime_arena() {
     // hbg calls setup_static_arena(...,0) and leaves runtime_arena_pool_
     // uncommitted — fail loudly if a caller asks for it anyway.
-    if (!runtime_arena_pool_.is_committed()) return nullptr;
-    return runtime_arena_pool_.base();
+    DeviceArena &arena = current_arena_bank() == 0 ? runtime_arena_pool_ : runtime_arena_pool_bank1_;
+    if (!arena.is_committed()) return nullptr;
+    return arena.base();
 }
 
 bool DeviceRunnerBase::lookup_prebuilt_runtime_arena_cache(
     uint64_t hash, const void *key_data, size_t key_size, void **gm_heap_base, void **sm_base,
     void **runtime_arena_base, size_t *runtime_off, const void **image_data, size_t *image_size
 ) const {
+    if (current_arena_bank() != 0) return false;
     if (!prebuilt_runtime_arena_cache_valid_ || prebuilt_runtime_arena_cache_hash_ != hash ||
         prebuilt_runtime_arena_cache_key_.size() != key_size || key_data == nullptr || gm_heap_base == nullptr ||
         sm_base == nullptr || runtime_arena_base == nullptr || runtime_off == nullptr || image_data == nullptr ||
@@ -206,6 +277,7 @@ void DeviceRunnerBase::mark_prebuilt_runtime_arena_cached(
     uint64_t hash, const void *key_data, size_t key_size, void *gm_heap_base, void *sm_base, void *runtime_arena_base,
     size_t runtime_off, const void *image_data, size_t image_size
 ) {
+    if (current_arena_bank() != 0) return;
     prebuilt_runtime_arena_cache_valid_ = false;
     prebuilt_runtime_arena_cache_hash_ = hash;
     prebuilt_runtime_arena_cache_key_.assign(
@@ -232,6 +304,14 @@ int DeviceRunnerBase::setup_static_arena(size_t gm_heap_size, size_t gm_sm_size,
     // worker's lifetime). If a caller asks for a larger layout on any
     // region, redo just that region — already-committed peers stay alive
     // so their callers don't have to re-acquire.
+    const unsigned arena_bank = current_arena_bank();
+    DeviceArena &gm_heap_arena = arena_bank == 0 ? gm_heap_arena_ : gm_heap_arena_bank1_;
+    DeviceArena &gm_sm_arena = arena_bank == 0 ? gm_sm_arena_ : gm_sm_arena_bank1_;
+    DeviceArena &runtime_arena_pool = arena_bank == 0 ? runtime_arena_pool_ : runtime_arena_pool_bank1_;
+    size_t &cached_gm_heap_size = arena_bank == 0 ? cached_gm_heap_size_ : cached_gm_heap_size_bank1_;
+    size_t &cached_gm_sm_size = arena_bank == 0 ? cached_gm_sm_size_ : cached_gm_sm_size_bank1_;
+    size_t &cached_runtime_arena_size = arena_bank == 0 ? cached_runtime_arena_size_ : cached_runtime_arena_size_bank1_;
+
     bool arena_changed = false;
     auto commit_region = [&arena_changed](DeviceArena &arena, size_t &cached_size, size_t requested_size) -> int {
         if (requested_size == 0) {
@@ -269,25 +349,27 @@ int DeviceRunnerBase::setup_static_arena(size_t gm_heap_size, size_t gm_sm_size,
     // asking for a larger layout) fails midway, defeating the
     // "failure means failure" guarantee. Reset everything to the
     // post-construction state so the caller can retry with a new layout.
-    bool ok = commit_region(gm_heap_arena_, cached_gm_heap_size_, gm_heap_size) == 0;
-    ok = ok && commit_region(gm_sm_arena_, cached_gm_sm_size_, gm_sm_size) == 0;
-    ok = ok && commit_region(runtime_arena_pool_, cached_runtime_arena_size_, runtime_arena_size) == 0;
+    bool ok = commit_region(gm_heap_arena, cached_gm_heap_size, gm_heap_size) == 0;
+    ok = ok && commit_region(gm_sm_arena, cached_gm_sm_size, gm_sm_size) == 0;
+    ok = ok && commit_region(runtime_arena_pool, cached_runtime_arena_size, runtime_arena_size) == 0;
     if (!ok) {
-        gm_heap_arena_.release();
-        gm_sm_arena_.release();
-        runtime_arena_pool_.release();
-        cached_gm_heap_size_ = 0;
-        cached_gm_sm_size_ = 0;
-        cached_runtime_arena_size_ = 0;
-        prebuilt_runtime_arena_cache_valid_ = false;
-        prebuilt_runtime_arena_cache_key_.clear();
-        prebuilt_runtime_arena_cache_gm_heap_base_ = nullptr;
-        prebuilt_runtime_arena_cache_sm_base_ = nullptr;
-        prebuilt_runtime_arena_cache_runtime_arena_base_ = nullptr;
-        prebuilt_runtime_arena_cache_image_.clear();
+        gm_heap_arena.release();
+        gm_sm_arena.release();
+        runtime_arena_pool.release();
+        cached_gm_heap_size = 0;
+        cached_gm_sm_size = 0;
+        cached_runtime_arena_size = 0;
+        if (arena_bank == 0) {
+            prebuilt_runtime_arena_cache_valid_ = false;
+            prebuilt_runtime_arena_cache_key_.clear();
+            prebuilt_runtime_arena_cache_gm_heap_base_ = nullptr;
+            prebuilt_runtime_arena_cache_sm_base_ = nullptr;
+            prebuilt_runtime_arena_cache_runtime_arena_base_ = nullptr;
+            prebuilt_runtime_arena_cache_image_.clear();
+        }
         return -1;
     }
-    if (arena_changed) {
+    if (arena_changed && arena_bank == 0) {
         prebuilt_runtime_arena_cache_valid_ = false;
         prebuilt_runtime_arena_cache_key_.clear();
         prebuilt_runtime_arena_cache_gm_heap_base_ = nullptr;
@@ -362,34 +444,30 @@ int DeviceRunnerBase::ensure_device_initialized() {
         return rc;
     }
 
-    bool aicpu_created_here = false;
-    bool aicore_created_here = false;
-    if (stream_aicpu_ == nullptr) {
-        rc = rtStreamCreate(&stream_aicpu_, 0);
-        if (rc != 0) {
-            LOG_ERROR("rtStreamCreate (AICPU) failed: %d", rc);
-            ACL_LOG_ERROR_DETAIL(rc);
-            return rc;
+    std::vector<rtStream_t *> created_here;
+    auto ensure_stream = [&](rtStream_t *stream, const char *name) -> int {
+        if (*stream != nullptr) return 0;
+        int create_rc = rtStreamCreate(stream, 0);
+        if (create_rc != 0) {
+            LOG_ERROR("rtStreamCreate (%s) failed: %d", name, create_rc);
+            ACL_LOG_ERROR_DETAIL(create_rc);
+            return create_rc;
         }
-        aicpu_created_here = true;
-    }
-    if (stream_aicore_ == nullptr) {
-        rc = rtStreamCreate(&stream_aicore_, 0);
-        if (rc != 0) {
-            LOG_ERROR("rtStreamCreate (AICore) failed: %d", rc);
-            ACL_LOG_ERROR_DETAIL(rc);
-            // Roll back only the AICPU stream we just created, not a
-            // pre-existing persistent one.
-            if (aicpu_created_here) {
-                rtStreamDestroy(stream_aicpu_);
-                stream_aicpu_ = nullptr;
-            }
-            return rc;
+        created_here.push_back(stream);
+        return 0;
+    };
+    if ((rc = ensure_stream(&stream_aicpu_, "AICPU slot 0")) != 0 ||
+        (rc = ensure_stream(&stream_aicore_, "AICore slot 0")) != 0 ||
+        (rc = ensure_stream(&stream_aicpu_bank1_, "AICPU slot 1")) != 0 ||
+        (rc = ensure_stream(&stream_aicore_bank1_, "AICore slot 1")) != 0) {
+        for (auto it = created_here.rbegin(); it != created_here.rend(); ++it) {
+            rtStreamDestroy(**it);
+            **it = nullptr;
         }
-        aicore_created_here = true;
+        return rc;
     }
-    if (aicpu_created_here || aicore_created_here) {
-        LOG_INFO_V0("DeviceRunner: device=%d set, streams created", device_id_);
+    if (!created_here.empty()) {
+        LOG_INFO_V0("DeviceRunner: device=%d set, two stream sets created", device_id_);
     }
 
     rc = ensure_binaries_loaded();
@@ -1023,6 +1101,14 @@ int DeviceRunnerBase::finalize_common() {
         capture(rtStreamDestroy(stream_aicore_));
         stream_aicore_ = nullptr;
     }
+    if (stream_aicpu_bank1_ != nullptr) {
+        capture(rtStreamDestroy(stream_aicpu_bank1_));
+        stream_aicpu_bank1_ = nullptr;
+    }
+    if (stream_aicore_bank1_ != nullptr) {
+        capture(rtStreamDestroy(stream_aicore_bank1_));
+        stream_aicore_bank1_ = nullptr;
+    }
 
     // Release the async-DMA provider (SDMA STARS streams + workspace) while RTS
     // is live, before the subclass device reset. Null unless the Worker was
@@ -1077,6 +1163,9 @@ int DeviceRunnerBase::finalize_common() {
     gm_heap_arena_.release();
     gm_sm_arena_.release();
     runtime_arena_pool_.release();
+    gm_heap_arena_bank1_.release();
+    gm_sm_arena_bank1_.release();
+    runtime_arena_pool_bank1_.release();
     prebuilt_runtime_arena_cache_valid_ = false;
     prebuilt_runtime_arena_cache_key_.clear();
     prebuilt_runtime_arena_cache_gm_heap_base_ = nullptr;
@@ -1104,6 +1193,9 @@ int DeviceRunnerBase::finalize_common() {
     cached_gm_heap_size_ = 0;
     cached_gm_sm_size_ = 0;
     cached_runtime_arena_size_ = 0;
+    cached_gm_heap_size_bank1_ = 0;
+    cached_gm_sm_size_bank1_ = 0;
+    cached_runtime_arena_size_bank1_ = 0;
     return rc;
 }
 
@@ -1213,14 +1305,14 @@ int DeviceRunnerBase::resolve_block_dim(int requested_block_dim) {
     // auto branch skips validate so we don't pay the ACL syscalls twice.
     int resolved = requested_block_dim;
     if (resolved == 0) {
-        resolved = query_max_block_dim(stream_aicore_);
+        resolved = query_max_block_dim(run_stream_aicore());
         LOG_INFO_V0("block_dim auto-resolved to %d", resolved);
         if (resolved < 1) {
             LOG_ERROR("block_dim auto-resolved to invalid value %d", resolved);
             return -1;
         }
     } else {
-        int rc = validate_block_dim(stream_aicore_, resolved);
+        int rc = validate_block_dim(run_stream_aicore(), resolved);
         if (rc != 0) {
             return -1;
         }
@@ -1268,8 +1360,10 @@ int DeviceRunnerBase::prepare_runtime_for_launch(Runtime &runtime, int block_dim
 }
 
 int DeviceRunnerBase::sync_run_streams() {
-    LOG_INFO_V0("=== aclrtSynchronizeStreamWithTimeout stream_aicpu_ ===");
-    int rc = aclrtSynchronizeStreamWithTimeout(stream_aicpu_, timeout_config_.stream_sync_timeout_ms);
+    rtStream_t aicpu_stream = run_stream_aicpu();
+    rtStream_t aicore_stream = run_stream_aicore();
+    LOG_INFO_V0("=== aclrtSynchronizeStreamWithTimeout AICPU pipeline slot %u ===", g_pipeline_slot);
+    int rc = aclrtSynchronizeStreamWithTimeout(aicpu_stream, timeout_config_.stream_sync_timeout_ms);
     if (rc == ACL_ERROR_RT_STREAM_SYNC_TIMEOUT) {
         LOG_ERROR(
             "Stream sync timeout: stream=AICPU timeout_ms=%d device_id=%d block_dim=%d",
@@ -1284,8 +1378,8 @@ int DeviceRunnerBase::sync_run_streams() {
         return rc;
     }
 
-    LOG_INFO_V0("=== aclrtSynchronizeStreamWithTimeout stream_aicore_ ===");
-    rc = aclrtSynchronizeStreamWithTimeout(stream_aicore_, timeout_config_.stream_sync_timeout_ms);
+    LOG_INFO_V0("=== aclrtSynchronizeStreamWithTimeout AICore pipeline slot %u ===", g_pipeline_slot);
+    rc = aclrtSynchronizeStreamWithTimeout(aicore_stream, timeout_config_.stream_sync_timeout_ms);
     if (rc == ACL_ERROR_RT_STREAM_SYNC_TIMEOUT) {
         LOG_ERROR(
             "Stream sync timeout: stream=AICore timeout_ms=%d device_id=%d block_dim=%d",
@@ -1300,6 +1394,14 @@ int DeviceRunnerBase::sync_run_streams() {
         return rc;
     }
     return 0;
+}
+
+rtStream_t DeviceRunnerBase::run_stream_aicpu() const {
+    return g_pipeline_slot == 0 ? stream_aicpu_ : stream_aicpu_bank1_;
+}
+
+rtStream_t DeviceRunnerBase::run_stream_aicore() const {
+    return g_pipeline_slot == 0 ? stream_aicore_ : stream_aicore_bank1_;
 }
 
 void DeviceRunnerBase::read_device_wall_ns() {

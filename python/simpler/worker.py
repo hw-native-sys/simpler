@@ -129,7 +129,10 @@ from .orchestrator import Orchestrator
 from .task_interface import (
     MAILBOX_ERROR_MSG_SIZE,
     MAILBOX_OFF_ERROR_MSG,
+    MAILBOX_OFF_PROTOCOL,
+    MAILBOX_PROTOCOL_MAGIC_VERSION,
     MAILBOX_SIZE,
+    MAILBOX_TASK_SLOT_SIZE,
     CallConfig,
     ChipCallable,
     ChipDomainContext,
@@ -154,6 +157,13 @@ _PY_CONTROL_TIMEOUT_S = 30.0
 # text emitted by the orchestration wrapper; keep this pattern in sync with the
 # wrapper's ``L3-L2 endpoint error ... region=<id>`` format.
 _L3_L2_ENDPOINT_ERROR_REGION_RE = re.compile(r"\bL3-L2 endpoint error\b[^\n]*\bregion=(\d+)\b")
+
+
+class _ConcurrentRunBatch:
+    def __init__(self) -> None:
+        self.active = 0
+        self.done = threading.Event()
+        self.error: BaseException | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -186,7 +196,7 @@ _OFF_TASK_ARGS_BLOB = _OFF_TASK_CALLABLE_HASH + CALLABLE_HASH_DIGEST_BYTES
 # MAILBOX_ARGS_CAPACITY mirrors the C++ constexpr in worker_manager.h so the
 # Python reader can bounds-check incoming args blobs. Source-of-truth for the
 # constants on the right is the nanobind binding (cannot drift).
-_MAILBOX_ARGS_CAPACITY = MAILBOX_SIZE - _OFF_TASK_ARGS_BLOB - MAILBOX_ERROR_MSG_SIZE
+_MAILBOX_ARGS_CAPACITY = MAILBOX_OFF_PROTOCOL - _OFF_TASK_ARGS_BLOB
 _OFF_CONTROL_CALLABLE_HASH = _OFF_ARGS + 32
 # MAILBOX_OFF_ERROR_MSG / MAILBOX_ERROR_MSG_SIZE come from the C++
 # nanobind module so the two sides cannot drift.
@@ -194,6 +204,7 @@ _OFF_CONTROL_CALLABLE_HASH = _OFF_ARGS + 32
 _IDLE = 0
 _TASK_READY = 1
 _TASK_DONE = 2
+_TASK_ACCEPTED = 8
 _SHUTDOWN = 3
 _CONTROL_REQUEST = 4
 _CONTROL_DONE = 5
@@ -222,6 +233,11 @@ _STARTUP_POLL_INTERVAL_S = 0.001
 # to close gracefully (so it unlinks the nested mailbox shms only it knows the
 # names of) before being SIGKILLed. This bounds that graceful wait.
 _ROLLBACK_GRACEFUL_TIMEOUT_S = 10.0
+# Communicator teardown can legitimately remain inside the native HCCL
+# destroy barrier for up to 120 seconds. Give chip children a matching grace
+# window once a base communicator exists; ordinary child teardown keeps the
+# shorter rollback bound above.
+_COMM_REAP_GRACEFUL_TIMEOUT_S = 130.0
 # Bounded re-check interval for a close() joiner waiting on an in-flight
 # _CloseAttempt. A joiner normally wakes immediately on the completing thread's
 # notify_all(); the timeout is a backstop so that if that notify is skipped (an
@@ -263,6 +279,7 @@ _CTRL_COMM_INIT = 9
 _CTRL_PY_REGISTER = 10
 _CTRL_PY_UNREGISTER = 11
 _CTRL_PY_IMPORT_REGISTER = 12
+_CTRL_L3_L2_ORCH_COMM_INIT = 13
 # Host-buffer registration. MAP_HOST maps a named host-buffer shm
 # into every local L3 child *post-fork* and keeps it mapped so later runs can copy
 # through it; UNMAP_HOST drops one. The child also records the parent VA range
@@ -862,8 +879,9 @@ def _read_control_digest(buf) -> bytes:
     return bytes(buf[_OFF_CONTROL_CALLABLE_HASH : _OFF_CONTROL_CALLABLE_HASH + CALLABLE_HASH_DIGEST_BYTES])
 
 
-def _read_task_digest(buf) -> bytes:
-    return bytes(buf[_OFF_TASK_CALLABLE_HASH : _OFF_TASK_CALLABLE_HASH + CALLABLE_HASH_DIGEST_BYTES])
+def _read_task_digest(buf, frame_offset: int = 0) -> bytes:
+    start = frame_offset + _OFF_TASK_CALLABLE_HASH
+    return bytes(buf[start : start + CALLABLE_HASH_DIGEST_BYTES])
 
 
 def _format_digest(digest: bytes) -> str:
@@ -935,7 +953,7 @@ def _buffer_field_addr(buf, offset: int) -> int:
     return ctypes.addressof(ctypes.c_char.from_buffer(buf)) + offset
 
 
-def _write_error(buf, code: int, msg: str = "") -> None:
+def _write_error(buf, code: int, msg: str = "", frame_offset: int = 0) -> None:
     """Write an (error code, message) tuple into the mailbox error region.
 
     The message is UTF-8-encoded and truncated to ``MAILBOX_ERROR_MSG_SIZE - 1``
@@ -943,10 +961,10 @@ def _write_error(buf, code: int, msg: str = "") -> None:
     NUL-terminated content. On success (code=0) callers may pass an empty
     message; the region is zero-padded.
     """
-    struct.pack_into("i", buf, _OFF_ERROR, code)
+    struct.pack_into("i", buf, frame_offset + _OFF_ERROR, code)
     encoded = msg.encode("utf-8", "replace")
     n = min(len(encoded), MAILBOX_ERROR_MSG_SIZE - 1)
-    start = MAILBOX_OFF_ERROR_MSG
+    start = frame_offset + MAILBOX_OFF_ERROR_MSG
     buf[start : start + n] = encoded[:n]
     # Zero-pad the remaining bytes so stale content from a previous dispatch
     # never leaks into the current error report.
@@ -966,7 +984,15 @@ def _format_exc(prefix: str, exc: BaseException) -> str:
     return f"{prefix}: {type(exc).__name__}: {exc}"
 
 
-def _read_args_from_mailbox(buf) -> TaskArgs:
+def _validate_task_protocol(buf, frame_offset: int = 0) -> None:
+    protocol = struct.unpack_from("Q", buf, frame_offset + MAILBOX_OFF_PROTOCOL)[0]
+    if protocol != MAILBOX_PROTOCOL_MAGIC_VERSION:
+        raise RuntimeError(
+            f"mailbox protocol mismatch: got 0x{protocol:016x}, expected 0x{MAILBOX_PROTOCOL_MAGIC_VERSION:016x}"
+        )
+
+
+def _read_args_from_mailbox(buf, frame_offset: int = 0) -> TaskArgs:
     """Decode the TaskArgs blob written by C++ write_blob from the mailbox.
 
     Used by the Python-targeted child loops (sub_worker, nested L4+ child)
@@ -983,10 +1009,10 @@ def _read_args_from_mailbox(buf) -> TaskArgs:
     (HCCL window slots etc.) — now structurally impossible.
     """
     mailbox_addr = ctypes.addressof(ctypes.c_char.from_buffer(buf))
-    return read_args_from_blob(mailbox_addr + _OFF_TASK_ARGS_BLOB)
+    return read_args_from_blob(mailbox_addr + frame_offset + _OFF_TASK_ARGS_BLOB)
 
 
-def _sub_worker_loop(
+def _sub_worker_loop(  # noqa: PLR0912 -- unified task/control mailbox state machine
     buf,
     registry: dict[int, Any],
     identity_table: dict[bytes, int],
@@ -1006,6 +1032,12 @@ def _sub_worker_loop(
         while True:
             state = _mailbox_load_i32(state_addr)
             if state == _TASK_READY:
+                try:
+                    _validate_task_protocol(buf)
+                except Exception as e:  # noqa: BLE001
+                    _write_error(buf, 1, _format_exc("sub_worker", e))
+                    _mailbox_store_i32(state_addr, _TASK_DONE)
+                    continue
                 digest = _read_task_digest(buf)
                 cid = identity_table.get(digest)
                 fn = registry.get(int(cid)) if cid is not None else None
@@ -1230,6 +1262,25 @@ def _create_sim_l3_l2_region(
     return region, meta
 
 
+def _handle_ctrl_l3_l2_orch_comm_init(cw: ChipWorker, buf: memoryview) -> SharedMemory:
+    control_shm_name = _read_shm_name(buf, _OFF_ARGS)
+    control_shm = SharedMemory(name=control_shm_name)
+    control_buf = control_shm.buf
+    assert control_buf is not None
+    exported = ctypes.c_char.from_buffer(control_buf)
+    success = False
+    try:
+        control_block_addr = ctypes.addressof(exported)
+        cw.l3_l2_orch_comm_init_from_addr(control_block_addr, control_shm.size)
+        success = True
+    finally:
+        del exported
+        del control_buf
+        if not success:
+            control_shm.close()
+    return control_shm
+
+
 def _create_onboard_l3_l2_region(
     cw: ChipWorker, request: L3L2RegionCreateRequest, region_id: int, counter_offset: int, total_bytes: int
 ) -> tuple[_L2HostL3L2Region, _L2HostL3L2RegionReplyMeta]:
@@ -1369,14 +1420,27 @@ def _comm_base_handle(cw: ChipWorker) -> int:
     return int(handle)
 
 
-def _ensure_prepared(cw, registry, prepared, cid: int, *, device_id: int) -> None:
-    if cid in prepared:
+def _ensure_registered(run_workers, registry, registered_callables, cid: int, *, device_id: int) -> None:
+    if cid in registered_callables:
         return
+    if not isinstance(run_workers, (list, tuple)):
+        run_workers = [run_workers]
     callable_obj = registry.get(cid)
     if callable_obj is None:
         raise RuntimeError(f"chip_process dev={device_id}: cid {cid} not in registry")
-    cw._register_callable_at_slot(cid, callable_obj)
-    prepared.add(cid)
+    registered = []
+    try:
+        for worker in run_workers:
+            worker._register_callable_at_slot(cid, callable_obj)
+            registered.append(worker)
+    except Exception:
+        for worker in reversed(registered):
+            try:
+                worker._unregister_slot(cid)
+            except Exception:  # noqa: BLE001
+                pass
+        raise
+    registered_callables.add(cid)
 
 
 def _run_chip_main_loop(  # noqa: PLR0912, PLR0913, PLR0915 -- unified TASK_READY / CONTROL_REQUEST state machine
@@ -1393,6 +1457,8 @@ def _run_chip_main_loop(  # noqa: PLR0912, PLR0913, PLR0915 -- unified TASK_READ
     chip_runtime: str = "",
     on_task_done_success=None,
     prepared: set[int] | None = None,
+    run_workers=None,
+    pipeline_slots: int = 1,
 ) -> None:
     """Unified TASK_READY / CONTROL_REQUEST / SHUTDOWN state machine.
 
@@ -1403,68 +1469,93 @@ def _run_chip_main_loop(  # noqa: PLR0912, PLR0913, PLR0915 -- unified TASK_READ
     Returning a non-zero code overrides the kernel's success.
 
     TASK_READY carries a callable digest. The child resolves it to a
-    target-local slot and runs it. The slot must already be prepared: initial
-    startup-snapshot ChipCallables are prepared before INIT_READY (carried in via
-    ``prepared``), and callables registered dynamically after startup arrive via
-    ``_CTRL_PREPARE``. A TASK_READY for an unprepared slot is a control-flow
-    error and fails the task rather than lazily preparing it.
+    target-local slot and runs it. Startup-snapshot ChipCallables are registered
+    before INIT_READY (carried in via ``prepared``), while dynamic registrations
+    arrive through ``_CTRL_PREPARE``. A TASK_READY for an unregistered slot is a
+    control-flow error and fails the task rather than registering it lazily.
     """
-    prepared = prepared if prepared is not None else set()
+    registered_callables = prepared if prepared is not None else set()
     l3_l2_region_store = _L2HostL3L2RegionStore()
+    l3_l2_control_shms: list[SharedMemory] = []
     # Post-fork host buffers mapped into this child. `host_buf_table`
     # owns the mmap per token (for unmap + teardown); `host_buf_ranges` is the
     # parent-VA → child-VA translation table the per-task blob rewrite consults,
     # rebuilt from the table on every map/unmap.
     host_buf_table: dict[int, tuple[SharedMemory, int, int, int]] = {}  # token -> (shm, lo, hi, child_base)
     host_buf_ranges: list[tuple[int, int, int]] = []  # (parent_lo, parent_hi, child_base)
+    control_workers = list(run_workers) if run_workers is not None else [cw]
+    if not control_workers or control_workers[0] is not cw:
+        raise RuntimeError("chip run worker 0 must be the control ChipWorker")
+    if pipeline_slots not in (1, 2):
+        raise RuntimeError(f"chip pipeline_slots must be 1 or 2, got {pipeline_slots}")
+    slot_workers = [cw] * pipeline_slots
+    stop_run_workers = threading.Event()
+
+    def run_task(slot_index: int, slot_worker: ChipWorker) -> None:
+        frame_offset = slot_index * MAILBOX_TASK_SLOT_SIZE
+        slot_state_addr = state_addr if slot_index == 0 else mailbox_addr + frame_offset + _OFF_STATE
+        code = 0
+        msg = ""
+        try:
+            _validate_task_protocol(buf, frame_offset)
+            digest = _read_task_digest(buf, frame_offset)
+            cid = identity_table.get(digest)
+            if cid is None:
+                raise RuntimeError(f"callable hash {_format_digest(digest)} not registered")
+            if cid not in registered_callables:
+                raise RuntimeError(
+                    f"chip_process dev={device_id}: cid {cid} not registered before TASK_READY "
+                    f"(register via _CTRL_PREPARE first)"
+                )
+            blob_offset = frame_offset + _OFF_TASK_ARGS_BLOB
+            if host_buf_ranges:
+                _rewrite_blob_host_addrs(buf, blob_offset, host_buf_ranges)
+            cfg = _read_config_from_mailbox(buf, frame_offset)
+            # The shared ChipWorker owns one DeviceRunner and two Runtime
+            # buffers. The slot index selects the matching Runtime/image bank;
+            # arena selection is thread-local, so Host O and Device S for this
+            # request stay on the same bank.
+            slot_worker._impl.run_from_blob(
+                int(cid), mailbox_addr + blob_offset, _MAILBOX_ARGS_CAPACITY, cfg, slot_index, slot_state_addr
+            )
+        except Exception as e:  # noqa: BLE001
+            code = 1
+            msg = _format_exc(f"chip_process dev={device_id} slot={slot_index}", e)
+
+        if code == 0 and on_task_done_success is not None:
+            code, msg = on_task_done_success()
+        _write_error(buf, code, msg, frame_offset)
+        _mailbox_store_i32(slot_state_addr, _TASK_DONE)
+
+    def run_task_loop(slot_index: int, slot_worker: ChipWorker) -> None:
+        frame_offset = slot_index * MAILBOX_TASK_SLOT_SIZE
+        slot_state_addr = state_addr if slot_index == 0 else mailbox_addr + frame_offset + _OFF_STATE
+        while not stop_run_workers.is_set():
+            if _mailbox_load_i32(slot_state_addr) != _TASK_READY:
+                time.sleep(0.00005)
+                continue
+            run_task(slot_index, slot_worker)
+
+    # Preserve the native runtime's thread affinity on every single-slot
+    # platform. Only the two-slot a2a3 HostGraph path needs background run
+    # threads so its control loop can admit another request concurrently.
+    task_threads = []
+    if len(slot_workers) > 1:
+        task_threads = [
+            threading.Thread(
+                target=run_task_loop,
+                args=(slot_index, slot_worker),
+                name=f"simpler-chip-run-{slot_index}",
+            )
+            for slot_index, slot_worker in enumerate(slot_workers)
+        ]
+    for thread in task_threads:
+        thread.start()
     try:
         while True:
             state = _mailbox_load_i32(state_addr)
-            if state == _TASK_READY:
-                digest = _read_task_digest(buf)
-                cid = identity_table.get(digest)
-                cfg = _read_config_from_mailbox(buf)
-
-                code = 0
-                msg = ""
-                try:
-                    if cid is None:
-                        raise RuntimeError(f"callable hash {_format_digest(digest)} not registered")
-                    # Run only consumes a prepared slot — it never lazily
-                    # prepares. The callable must have been staged via
-                    # _CTRL_PREPARE first; reaching TASK_READY without it is a
-                    # control-flow bug, so fail loudly instead of masking the
-                    # missing-prepare with a first-task latency spike.
-                    if cid not in prepared:
-                        raise RuntimeError(
-                            f"chip_process dev={device_id}: cid {cid} not prepared before TASK_READY "
-                            f"(register via _CTRL_PREPARE first)"
-                        )
-                    # Redirect any registered host pointer (a parent VA) in the
-                    # blob to this child's own mapping before the runtime reads it.
-                    # No-op when nothing is registered.
-                    if host_buf_ranges:
-                        _rewrite_blob_host_addrs(buf, _OFF_TASK_ARGS_BLOB, host_buf_ranges)
-                    # Hand the mailbox bytes straight to C++ (zero-copy zero-decode):
-                    # the blob layout is what `write_blob` already wrote, so re-parsing
-                    # it in Python is N×40B of avoidable work and a permanent
-                    # opportunity to drop a field.  C++ reinterpret_cast<ChipStorageTaskArgs*>
-                    # is the source of truth.
-                    cw._impl.run_from_blob(cid, mailbox_addr + _OFF_TASK_ARGS_BLOB, _MAILBOX_ARGS_CAPACITY, cfg)
-                except Exception as e:  # noqa: BLE001
-                    code = 1
-                    msg = _format_exc(f"chip_process dev={device_id}", e)
-
-                # On a successful kernel run, give the caller a chance to do
-                # post-run work (e.g. store_to_host D2H staging) before the
-                # parent sees TASK_DONE. The kernel's failure path skips the
-                # hook because the device output region is undefined and
-                # staging garbage would mask the real error in post-mortems.
-                if code == 0 and on_task_done_success is not None:
-                    code, msg = on_task_done_success()
-
-                _write_error(buf, code, msg)
-                _mailbox_store_i32(state_addr, _TASK_DONE)
+            if len(slot_workers) == 1 and state == _TASK_READY:
+                run_task(0, slot_workers[0])
             elif state == _CONTROL_REQUEST:
                 sub_cmd = struct.unpack_from("Q", buf, _OFF_CALLABLE)[0]
                 code = 0
@@ -1494,7 +1585,9 @@ def _run_chip_main_loop(  # noqa: PLR0912, PLR0913, PLR0915 -- unified TASK_READ
                             raise RuntimeError(
                                 f"prepare chip={device_id}: callable hash {_format_digest(digest)} not registered"
                             )
-                        _ensure_prepared(cw, registry, prepared, int(cid), device_id=device_id)
+                        _ensure_registered(
+                            control_workers, registry, registered_callables, int(cid), device_id=device_id
+                        )
                     elif sub_cmd == _CTRL_REGISTER:
                         digest = _read_control_digest(buf)
                         payload_size = struct.unpack_from("Q", buf, _CTRL_OFF_ARG0)[0]
@@ -1523,20 +1616,32 @@ def _run_chip_main_loop(  # noqa: PLR0912, PLR0913, PLR0915 -- unified TASK_READ
                                 )
                                 # Self-heal when a prior unregister popped the local
                                 # identity table but failed before clearing device
-                                # prepared state for the reusable private slot.
-                                if int(cid) in prepared:
+                                # registered state for the reusable private slot.
+                                if int(cid) in registered_callables:
                                     try:
-                                        cw._unregister_slot(int(cid))
+                                        for slot_worker in control_workers:
+                                            slot_worker._unregister_slot(int(cid))
                                     except Exception:  # noqa: BLE001
                                         pass
-                                    prepared.discard(int(cid))
+                                    registered_callables.discard(int(cid))
                                 exported = ctypes.c_char.from_buffer(shm_buf)
                                 try:
                                     addr = ctypes.addressof(exported)
-                                    cw._impl.register_callable_from_blob(int(cid), addr)
+                                    registered_workers = []
+                                    try:
+                                        for slot_worker in control_workers:
+                                            slot_worker._impl.register_callable_from_blob(int(cid), addr)
+                                            registered_workers.append(slot_worker)
+                                    except Exception:
+                                        for slot_worker in reversed(registered_workers):
+                                            try:
+                                                slot_worker._unregister_slot(int(cid))
+                                            except Exception:  # noqa: BLE001
+                                                pass
+                                        raise
                                 finally:
                                     del exported
-                                prepared.add(int(cid))
+                                registered_callables.add(int(cid))
                         finally:
                             shm_buf.release()
                             # Release the local mmap as soon as prepare returns;
@@ -1547,14 +1652,18 @@ def _run_chip_main_loop(  # noqa: PLR0912, PLR0913, PLR0915 -- unified TASK_READ
                         digest = _read_control_digest(buf)
                         cid, removed = _remove_local_identity(registry, identity_table, identity_refs, digest)
                         if removed and cid is not None:
-                            cw._unregister_slot(int(cid))
-                            prepared.discard(int(cid))
+                            for slot_worker in control_workers:
+                                slot_worker._unregister_slot(int(cid))
+                            registered_callables.discard(int(cid))
                     elif sub_cmd == _CTRL_ALLOC_DOMAIN:
                         _handle_ctrl_alloc_domain(cw, buf)
                     elif sub_cmd == _CTRL_RELEASE_DOMAIN:
                         _handle_ctrl_release_domain(cw, buf)
                     elif sub_cmd == _CTRL_COMM_INIT:
                         _handle_ctrl_comm_init(cw, buf)
+                    elif sub_cmd == _CTRL_L3_L2_ORCH_COMM_INIT:
+                        control_shm = _handle_ctrl_l3_l2_orch_comm_init(cw, buf)
+                        l3_l2_control_shms.append(control_shm)
                     elif sub_cmd == _CTRL_MAP_HOST:
                         _handle_ctrl_map_host(buf, host_buf_table, host_buf_ranges)
                     elif sub_cmd == _CTRL_UNMAP_HOST:
@@ -1576,8 +1685,27 @@ def _run_chip_main_loop(  # noqa: PLR0912, PLR0913, PLR0915 -- unified TASK_READ
                 _mailbox_store_i32(state_addr, _CONTROL_DONE)
             elif state == _SHUTDOWN:
                 break
+            else:
+                time.sleep(0.00005)
     finally:
+        stop_run_workers.set()
+        for thread in task_threads:
+            thread.join()
         _sweep_l2_host_l3_l2_regions(l3_l2_region_store)
+        if l3_l2_control_shms:
+            try:
+                cw.l3_l2_orch_comm_shutdown()
+            except Exception as e:  # noqa: BLE001
+                sys.stderr.write(
+                    f"[chip_process pid={os.getpid()} dev={device_id}] "
+                    f"WARN: l3_l2_orch_comm_shutdown failed: {type(e).__name__}: {e}\n"
+                )
+                sys.stderr.flush()
+        for control_shm in reversed(l3_l2_control_shms):
+            try:
+                control_shm.close()
+            except Exception:  # noqa: BLE001
+                pass
         for host_shm, _lo, _hi, _base in host_buf_table.values():
             try:
                 host_shm.close()
@@ -1610,6 +1738,7 @@ def _chip_process_loop(  # noqa: PLR0913 -- fork-child entry: all context (bins,
     """
     import traceback as _tb  # noqa: PLC0415
 
+    run_workers: list[ChipWorker] = []
     try:
         cw = ChipWorker()
         cw.init(
@@ -1620,6 +1749,7 @@ def _chip_process_loop(  # noqa: PLR0913 -- fork-child entry: all context (bins,
             prewarm_config=prewarm_config,
             enable_sdma=enable_sdma,
         )
+        run_workers.append(cw)
     except Exception as e:
         _tb.print_exc()
         # Publish the cause into the mailbox and flag INIT_FAILED so the
@@ -1627,28 +1757,35 @@ def _chip_process_loop(  # noqa: PLR0913 -- fork-child entry: all context (bins,
         # spinning forever on a child that will never reach INIT_READY.
         _write_error(buf, 1, _format_exc(f"chip_process dev={device_id} init", e))
         _mailbox_store_i32(_buffer_field_addr(buf, _OFF_STATE), _INIT_FAILED)
+        for worker in reversed(run_workers):
+            worker.finalize()
         return
 
     # Prepare every ChipCallable in the startup snapshot before publishing
     # INIT_READY, so the H2D upload + device-orch load is charged inside the
     # readiness barrier and the first task dispatch pays no upload. The set of
-    # prepared cids carries into the main loop, which requires a cid be prepared
+    # registered cids carry into the main loop, which requires a cid be registered
     # before it dispatches. The parent therefore issues no post-READY
     # control_prepare for the initial snapshot.
     prepared: set[int] = set()
     try:
         for cid, target in registry.items():
             if isinstance(target, ChipCallable):
-                _ensure_prepared(cw, registry, prepared, int(cid), device_id=device_id)
+                _ensure_registered(run_workers, registry, prepared, int(cid), device_id=device_id)
     except Exception as e:
         _tb.print_exc()
         _write_error(buf, 1, _format_exc(f"chip_process dev={device_id} prepare", e))
         _mailbox_store_i32(_buffer_field_addr(buf, _OFF_STATE), _INIT_FAILED)
-        cw.finalize()
+        for worker in reversed(run_workers):
+            worker.finalize()
         return
 
     mailbox_addr = ctypes.addressof(ctypes.c_char.from_buffer(buf))
     state_addr = mailbox_addr + _OFF_STATE
+    # Publish the runtime's resource-contract depth before INIT_READY. The
+    # parent reads this immutable bootstrap field when assigning endpoint
+    # credits, so admission is contract-driven rather than runtime-name based.
+    struct.pack_into("Q", buf, _CTRL_OFF_RESULT, cw.pipeline_slot_count)
     # Signal init success. The parent's readiness barrier waits for every chip
     # child to reach _INIT_READY before dispatching the first task, so the
     # per-rank host-side stream sync budget only covers actual op execution
@@ -1670,12 +1807,15 @@ def _chip_process_loop(  # noqa: PLR0913 -- fork-child entry: all context (bins,
             chip_platform=platform,
             chip_runtime=runtime,
             prepared=prepared,
+            run_workers=run_workers,
+            pipeline_slots=cw.pipeline_slot_count,
         )
     finally:
-        cw.finalize()
+        for worker in reversed(run_workers):
+            worker.finalize()
 
 
-def _read_config_from_mailbox(buf: memoryview) -> CallConfig:
+def _read_config_from_mailbox(buf: memoryview, frame_offset: int = 0) -> CallConfig:
     """Reconstruct a CallConfig from the unified mailbox layout."""
     (
         block_dim,
@@ -1687,7 +1827,7 @@ def _read_config_from_mailbox(buf: memoryview) -> CallConfig:
         scope_stats,
         *ring_values,
         prefix_bytes,
-    ) = _CFG_FMT.unpack_from(buf, _OFF_CONFIG)
+    ) = _CFG_FMT.unpack_from(buf, frame_offset + _OFF_CONFIG)
     ring_task_window = list(ring_values[:RUNTIME_ENV_RING_COUNT])
     ring_heap = list(ring_values[RUNTIME_ENV_RING_COUNT : 2 * RUNTIME_ENV_RING_COUNT])
     ring_dep_pool = list(ring_values[2 * RUNTIME_ENV_RING_COUNT : 3 * RUNTIME_ENV_RING_COUNT])
@@ -1727,6 +1867,12 @@ def _child_worker_loop(
     while True:
         state = _mailbox_load_i32(state_addr)
         if state == _TASK_READY:
+            try:
+                _validate_task_protocol(buf)
+            except Exception as e:  # noqa: BLE001
+                _write_error(buf, 1, _format_exc(f"child_worker level={inner_worker.level}", e))
+                _mailbox_store_i32(state_addr, _TASK_DONE)
+                continue
             digest = _read_task_digest(buf)
             cid = identity_table.get(digest)
             orch_fn = registry.get(int(cid)) if cid is not None else None
@@ -1991,6 +2137,11 @@ class Worker:
         # fast (this worker does not cancel an in-progress init); any thread may
         # join an in-flight close().
         self._init_owner_thread: threading.Thread | None = None
+        self._request_session: Any | None = None
+        self._request_session_lock = threading.Lock()
+        self._run_cv = threading.Condition()
+        self._run_batch: _ConcurrentRunBatch | None = None
+        self._run_draining = False
 
         # Narrow lock around `_callable_registry` mutation so concurrent
         # register / unregister calls don't trip CPython's non-atomic
@@ -2084,6 +2235,9 @@ class Worker:
         # starts the C++ scheduler; no comm work happens there.
         self._comm_base_ready: bool = False
 
+        self._l3_l2_orch_comm_ready: set[int] = set()
+        self._l3_l2_orch_comm_shms: dict[int, SharedMemory] = {}
+        self._l3_l2_orch_comm_clients: dict[int, Any] = {}
         self._live_l3_l2_regions: list[Any] = []
         self._l3_l2_orch_comm_host_buffers: dict[int, int] = {}
 
@@ -4279,7 +4433,11 @@ class Worker:
         # Register chip workers as NEXT_LEVEL (L3)
         if device_ids:
             for shm in self._chip_shms:
-                dw.add_next_level_worker(_mailbox_addr(shm))
+                assert shm.buf is not None
+                max_in_flight = int(struct.unpack_from("Q", shm.buf, _CTRL_OFF_RESULT)[0])
+                if max_in_flight not in (1, 2):
+                    raise RuntimeError(f"chip child published invalid pipeline slot count {max_in_flight}")
+                dw.add_next_level_worker(_mailbox_addr(shm), max_in_flight=max_in_flight)
 
         # Register Worker children as NEXT_LEVEL (L4+)
         if self._next_level_shms and not hasattr(dw, "add_next_level_worker_at"):
@@ -4564,6 +4722,50 @@ class Worker:
         """
         return dict(self._live_domains)
 
+    def _make_l3_l2_orch_comm_client(self, shm: SharedMemory):
+        from .l3_l2_orch_comm import L3L2OrchCommClient  # noqa: PLC0415
+
+        return L3L2OrchCommClient(shm)
+
+    def _ensure_l3_l2_orch_comm(self, worker_id: int):
+        from .l3_l2_orch_comm import CONTROL_SHM_SIZE  # noqa: PLC0415
+
+        if self.level < 3:
+            raise RuntimeError("create_l3_l2_region requires a hierarchical Worker")
+        if self._worker is None:
+            raise RuntimeError("create_l3_l2_region requires Worker.init()")
+        device_ids = self._config.get("device_ids", [])
+        if worker_id < 0 or worker_id >= len(device_ids):
+            raise ValueError(f"create_l3_l2_region: worker_id {worker_id} outside [0, {len(device_ids)})")
+        if worker_id in self._l3_l2_orch_comm_ready:
+            return self._l3_l2_orch_comm_clients[worker_id]
+
+        chip_shm = self._chip_shms[worker_id]
+        assert chip_shm.buf is not None
+        state = _mailbox_load_i32(_buffer_field_addr(chip_shm.buf, _OFF_STATE))
+        if state != _IDLE:
+            raise RuntimeError(
+                f"create_l3_l2_region bootstrap failed: target worker {worker_id} is busy and "
+                "the L3-L2 service is not ready"
+            )
+
+        control_shm = SharedMemory(create=True, size=CONTROL_SHM_SIZE)
+        try:
+            client = self._make_l3_l2_orch_comm_client(control_shm)
+            self._worker.control_l3_l2_orch_comm_init(worker_id, control_shm.name)
+        except Exception:
+            try:
+                control_shm.close()
+                control_shm.unlink()
+            except Exception:  # noqa: BLE001
+                pass
+            raise
+
+        self._l3_l2_orch_comm_shms[worker_id] = control_shm
+        self._l3_l2_orch_comm_clients[worker_id] = client
+        self._l3_l2_orch_comm_ready.add(worker_id)
+        return client
+
     def _validate_l3_l2_worker_id(self, worker_id: int) -> None:
         if self.level < 3:
             raise RuntimeError("create_l3_l2_region requires a hierarchical Worker")
@@ -4572,6 +4774,10 @@ class Worker:
         device_ids = self._config.get("device_ids", [])
         if worker_id < 0 or worker_id >= len(device_ids):
             raise ValueError(f"create_l3_l2_region: worker_id {worker_id} outside [0, {len(device_ids)})")
+
+    def _l3_l2_orch_comm_submit(self, worker_id: int, request, timeout_s: float):
+        client = self._ensure_l3_l2_orch_comm(int(worker_id))
+        return client.submit(request, timeout_s)
 
     def _poison_l3_l2_region_from_endpoint_error(self, exc: BaseException) -> bool:
         match = _L3_L2_ENDPOINT_ERROR_REGION_RE.search(str(exc))
@@ -4729,7 +4935,16 @@ class Worker:
             except RuntimeError:
                 pass
         self._live_l3_l2_regions.clear()
+        self._l3_l2_orch_comm_clients.clear()
+        self._l3_l2_orch_comm_ready.clear()
         self._l3_l2_orch_comm_host_buffers.clear()
+        for shm in self._l3_l2_orch_comm_shms.values():
+            try:
+                shm.close()
+                shm.unlink()
+            except Exception:  # noqa: BLE001
+                pass
+        self._l3_l2_orch_comm_shms.clear()
 
     # ------------------------------------------------------------------
     # Dynamic CommDomain allocation (driven by Orchestrator.allocate_domain;
@@ -5614,6 +5829,59 @@ class Worker:
     # run — uniform entry point
     # ------------------------------------------------------------------
 
+    def _enter_concurrent_run(self) -> _ConcurrentRunBatch:
+        assert self._orch is not None
+        with self._run_cv:
+            while self._run_draining:
+                self._run_cv.wait()
+            batch = self._run_batch
+            if batch is None:
+                batch = _ConcurrentRunBatch()
+                self._run_batch = batch
+                self._orch._clear_error()
+            batch.active += 1
+            return batch
+
+    def _leave_concurrent_run(self, batch: _ConcurrentRunBatch) -> bool:
+        with self._run_cv:
+            if self._run_batch is not batch or batch.active <= 0:
+                raise RuntimeError("Worker concurrent run batch state is inconsistent")
+            batch.active -= 1
+            if batch.active != 0:
+                return False
+            self._run_batch = None
+            self._run_draining = True
+            return True
+
+    def _drain_concurrent_run_batch(self, batch: _ConcurrentRunBatch) -> None:
+        assert self._orch is not None
+        try:
+            try:
+                self._orch._drain()
+            except Exception as exc:
+                self._poison_l3_l2_region_from_endpoint_error(exc)
+                raise
+        except BaseException as exc:  # noqa: BLE001
+            batch.error = exc
+        finally:
+            try:
+                self._release_active_remote_slot_refs()
+                self._flush_pending_remote_frees()
+                try:
+                    self._cleanup_l3_l2_regions()
+                finally:
+                    self._l3_l2_orch_comm_host_buffers.clear()
+                self._execute_pending_domain_releases()
+                if self._live_domains:
+                    self._release_all_live_domains()
+            except BaseException as exc:  # noqa: BLE001
+                if batch.error is None:
+                    batch.error = exc
+            with self._run_cv:
+                self._run_draining = False
+                batch.done.set()
+                self._run_cv.notify_all()
+
     def run(self, callable, args=None, config=None) -> None:
         """Execute one task (L2) or one DAG (L3+) synchronously.
 
@@ -5638,6 +5906,10 @@ class Worker:
             self._run_locked(callable, args, config)
 
     def _run_locked(self, callable, args, config) -> None:
+        with self._request_session_lock:
+            request_session = self._request_session
+        if request_session is not None and not request_session._owns_current_thread():
+            raise RuntimeError("Worker.run is owned by an active RequestSession")
         cfg = config if config is not None else CallConfig()
 
         if self.level == 2:
@@ -5648,51 +5920,66 @@ class Worker:
 
         assert self._orch is not None
         assert self._worker is not None
-        # Drop any error stashed by a previous run() so this call starts
-        # clean. drain() rethrows on the way out; every successful run()
-        # leaves the error slot empty, but an unrelated caller may have
-        # poked it.
-        self._orch._clear_error()
-        self._orch._scope_begin()
+        batch = self._enter_concurrent_run()
+        own_error: BaseException | None = None
+        own_traceback = None
+        scope_open = False
         try:
+            self._orch._scope_begin()
+            scope_open = True
             callable(self._orch, args, cfg)
+        except BaseException as exc:  # noqa: BLE001
+            own_error = exc
+            own_traceback = exc.__traceback__
         finally:
-            # Always release scope refs and drain so ring slots aren't
-            # stranded when the orch fn raises mid-DAG. drain() also
-            # rethrows the first dispatch failure for this run — that
-            # is how child-task exceptions surface to the caller of
-            # Worker.run(). scope_end deliberately does NOT throw: if
-            # it did, released refs would be incomplete and drain
-            # would hang on in-flight tasks.
-            self._orch._scope_end()
-            # ORDER MATTERS: drain() must complete first so any in-flight
-            # task that captured a now-pending handle's device_ctx /
-            # buffer_ptrs sees live memory.  THEN execute the pending
-            # backend releases.  Last, sweep any handles that the orch
-            # function neither released nor passed out (covers exception
-            # unwind and "forgot to release" — auto-release in LIFO).
-            # drain() rethrows the first chip-task/dispatch failure, so the
-            # cleanup lives in a finally: a failed task must not strand
-            # backend domain allocations into the next run.
-            try:
+            if scope_open:
                 try:
-                    self._orch._drain()
-                except Exception as e:
-                    self._poison_l3_l2_region_from_endpoint_error(e)
-                    raise
-            finally:
-                self._release_active_remote_slot_refs()
-                self._flush_pending_remote_frees()
-                try:
-                    self._cleanup_l3_l2_regions()
-                finally:
-                    self._l3_l2_orch_comm_host_buffers.clear()
-                self._execute_pending_domain_releases()
-                if self._live_domains:
-                    self._release_all_live_domains()
+                    self._orch._scope_end()
+                except BaseException as exc:  # noqa: BLE001
+                    if own_error is None:
+                        own_error = exc
+                        own_traceback = exc.__traceback__
+            is_last = self._leave_concurrent_run(batch)
+            if is_last:
+                self._drain_concurrent_run_batch(batch)
+            else:
+                batch.done.wait()
+        if own_error is not None:
+            raise own_error.with_traceback(own_traceback)
+        if batch.error is not None:
+            raise batch.error
         # L3+ returns None like every other worker level; per-L2-child timing
         # is emitted as `[STRACE]` markers from each simpler_run.
         return None
+
+    def open_request_session(self, orchestration, *, max_pending: int = 8, max_active_runs: int = 1):
+        """Open a non-blocking request stream over this hierarchical Worker."""
+        if self.level < 3:
+            raise RuntimeError("Worker.open_request_session requires a hierarchical Worker")
+        from .request_session import RequestSession  # noqa: PLC0415
+
+        with self._request_session_lock:
+            # Re-check under the session lock. Worker.close() publishes CLOSED
+            # before taking this lock, so a racing open is either observed and
+            # closed by that teardown or rejected here.
+            if not self._initialized:
+                raise RuntimeError("Worker.open_request_session requires Worker.init()")
+            if self._request_session is not None:
+                raise RuntimeError("Worker already has an active RequestSession")
+            session = RequestSession(
+                self,
+                orchestration,
+                max_pending=int(max_pending),
+                max_active_runs=int(max_active_runs),
+            )
+            self._request_session = session
+            session._start()
+            return session
+
+    def _release_request_session(self, session) -> None:
+        with self._request_session_lock:
+            if self._request_session is session:
+                self._request_session = None
 
     @property
     def aicpu_dlopen_count(self) -> int:
@@ -5869,6 +6156,14 @@ class Worker:
                     if teardown_tree:
                         self._teardown_attempted = True
             if teardown_tree:
+                # CLOSED already rejects new run leases. Closing the session now
+                # stops its idle dispatchers and cancels queued requests before
+                # their backing native tree is dismantled. An active dispatcher
+                # was covered by the lease drain above.
+                with self._request_session_lock:
+                    request_session = self._request_session
+                if request_session is not None:
+                    request_session.close()
                 self._teardown_ready_tree()
         except BaseException as exc:  # noqa: BLE001
             if result is None:
@@ -6098,7 +6393,8 @@ class Worker:
             # teardown entry — so the (blocking) pre-child cleanup above cannot
             # eat it. Reap removes reclaimed pids/shms in place; a surviving child
             # is left in place and reported as an error (terminal, not retried).
-            reap_deadline = time.monotonic() + _ROLLBACK_GRACEFUL_TIMEOUT_S
+            reap_timeout_s = _COMM_REAP_GRACEFUL_TIMEOUT_S if self._comm_base_ready else _ROLLBACK_GRACEFUL_TIMEOUT_S
+            reap_deadline = time.monotonic() + reap_timeout_s
             _step(lambda: self._reap_child_groups(groups, reap_deadline))
             _step(self._close_l3_l2_orch_comm)
             # Drop next-level worker refs only once their pids/shms are reclaimed.

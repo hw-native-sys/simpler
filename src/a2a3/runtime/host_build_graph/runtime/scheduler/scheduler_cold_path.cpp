@@ -57,7 +57,8 @@ LoopAction SchedulerContext::handle_orchestrator_exit(
         LOG_ERROR(
             "Thread %d: Fatal error (code=%d), sending EXIT_SIGNAL to all cores. "
             "completed_tasks=%d, total_tasks=%d",
-            thread_idx, orch_err, completed_tasks_.load(std::memory_order_relaxed), total_tasks_
+            thread_idx, orch_err, completed_tasks_.load(std::memory_order_relaxed),
+            total_tasks_.load(std::memory_order_relaxed)
         );
         if (!completed_.exchange(true, std::memory_order_acq_rel)) {
             emergency_shutdown(runtime);
@@ -73,8 +74,9 @@ LoopAction SchedulerContext::handle_orchestrator_exit(
         return LoopAction::BREAK_LOOP;
     }
 
-    task_count = total_tasks_;
-    if (task_count > 0 && completed_tasks_.load(std::memory_order_relaxed) >= task_count) {
+    task_count = total_tasks_.load(std::memory_order_acquire);
+    if (orchestration_done_.load(std::memory_order_acquire) && task_count > 0 &&
+        completed_tasks_.load(std::memory_order_relaxed) >= task_count) {
         completed_.store(true, std::memory_order_release);
         LOG_INFO_V0(
             "Thread %d: PTO2 completed tasks %d/%d", thread_idx, completed_tasks_.load(std::memory_order_relaxed),
@@ -359,7 +361,9 @@ void SchedulerContext::log_shutdown_stall_snapshot(
         thread_count = thread_count < 0 ? 0 : MAX_AICPU_THREADS;
     }
     for (int32_t t = 0; t < thread_count; t++) {
-        log_stall_diagnostics(t, total_tasks_, trigger_idle_iterations, trigger_last_progress_count);
+        log_stall_diagnostics(
+            t, total_tasks_.load(std::memory_order_relaxed), trigger_idle_iterations, trigger_last_progress_count
+        );
     }
 }
 
@@ -901,7 +905,11 @@ int32_t SchedulerContext::post_handshake_init(Runtime *runtime) {
 #endif
 
     // Initialize task counters. Task count comes from PTO2 shared memory.
-    if (runtime->get_gm_sm_ptr()) {
+    if (runtime->host_total_tasks < 0) {
+        // Async Host O publishes the first range after AICPU init. Do not
+        // mistake a concurrently staged ring head for a final task count.
+        total_tasks_.store(0, std::memory_order_relaxed);
+    } else if (runtime->get_gm_sm_ptr()) {
         auto *header = static_cast<PTO2SharedMemoryHeader *>(runtime->get_gm_sm_ptr());
         // Read at one-time boot init, before the SM is reset for the run, so a
         // ring not yet written holds uninitialized memory (0xbe... under ASAN's
@@ -915,11 +923,12 @@ int32_t SchedulerContext::post_handshake_init(Runtime *runtime) {
             int32_t ring_tasks = header->ring.fc.current_task_index.load(std::memory_order_acquire);
             if (ring_tasks > 0 && ring_tasks <= PTO2_SCOPE_TASKS_CAP) pto2_count += ring_tasks;
         }
-        total_tasks_ = static_cast<int32_t>(pto2_count);
+        total_tasks_.store(static_cast<int32_t>(pto2_count), std::memory_order_relaxed);
     } else {
-        total_tasks_ = 0;
+        total_tasks_.store(0, std::memory_order_relaxed);
     }
     completed_tasks_.store(0, std::memory_order_release);
+    orchestration_done_.store(false, std::memory_order_relaxed);
 
     // prepare_subtask_to_core fully writes a per-core payload / deferred-slab slot
     // before the AICore is told to read it: build_payload sets
@@ -1011,7 +1020,8 @@ void SchedulerContext::deinit() {
 
     // Reset task counters and orchestrator state
     completed_tasks_.store(0, std::memory_order_release);
-    total_tasks_ = 0;
+    total_tasks_.store(0, std::memory_order_relaxed);
+    orchestration_done_.store(false, std::memory_order_relaxed);
     completed_.store(false, std::memory_order_release);
 
     // Reset core discovery and assignment state
@@ -1056,7 +1066,7 @@ void SchedulerContext::on_orchestration_done(
     }
 #endif
 
-    total_tasks_ = total_tasks;
+    total_tasks_.store(total_tasks, std::memory_order_release);
 
     // Fold tasks completed inline during orchestration
     int32_t inline_completed = static_cast<int32_t>(rt->orchestrator.inline_completed_tasks);
@@ -1106,6 +1116,8 @@ void SchedulerContext::on_orchestration_done(
         }
     }
 
+    orchestration_done_.store(true, std::memory_order_release);
+
 #if SIMPLER_DFX
     // Write the core-to-thread mapping so the profiling data reflects the
     // scheduler threads' final core distribution.
@@ -1118,4 +1130,47 @@ void SchedulerContext::on_orchestration_done(
         }
     }
 #endif
+}
+
+void SchedulerContext::on_host_graph_published(
+    Runtime *runtime, [[maybe_unused]] PTO2Runtime *rt, [[maybe_unused]] int32_t thread_idx, int32_t total_tasks,
+    int32_t inline_completed, bool final_epoch
+) {
+    total_tasks_.store(total_tasks, std::memory_order_release);
+    if (inline_completed > 0) {
+        completed_tasks_.fetch_add(inline_completed, std::memory_order_acq_rel);
+#if SIMPLER_SCHED_PROFILING
+        rt->scheduler.tasks_completed.fetch_add(inline_completed, std::memory_order_relaxed);
+#endif
+    }
+
+    if (!final_epoch) return;
+
+    int32_t orch_err = PTO2_ERROR_NONE;
+    if (sched_->sm_header != nullptr) {
+        orch_err = sched_->sm_header->orch_error_code.load(std::memory_order_acquire);
+    }
+    if (orch_err != PTO2_ERROR_NONE && !completed_.exchange(true, std::memory_order_acq_rel)) {
+        emergency_shutdown(runtime);
+    }
+
+#if SIMPLER_DFX
+    if (l2_swimlane_level_ >= L2SwimlaneLevel::ORCH_PHASES) {
+        l2_swimlane_aicpu_flush_orch_phase_buffer(thread_idx);
+    }
+    if (l2_swimlane_level_ >= L2SwimlaneLevel::SCHED_PHASES) {
+        l2_swimlane_aicpu_init_core_assignments(cores_total_num_);
+        for (int32_t t = 0; t < active_sched_threads_; t++) {
+            l2_swimlane_aicpu_write_core_assignments_for_thread(
+                t, core_trackers_[t].core_ids(), core_trackers_[t].core_num()
+            );
+        }
+    }
+#endif
+
+    orchestration_done_.store(true, std::memory_order_release);
+    LOG_INFO_V9(
+        "HostGraph final publication latched: total=%d completed=%d", total_tasks,
+        completed_tasks_.load(std::memory_order_relaxed)
+    );
 }

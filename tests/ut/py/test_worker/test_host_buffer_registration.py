@@ -164,6 +164,7 @@ def test_l3_sub_worker_maps_rewrites_and_unmaps_host_buffer(monkeypatch):
         struct.pack_into("<Q", mailbox_buf, worker_mod._CTRL_OFF_ARG0, len(payload))
         shm_name = staged.name.encode("utf-8")
         mailbox_buf[worker_mod._OFF_ARGS : worker_mod._OFF_ARGS + len(shm_name)] = shm_name
+        struct.pack_into("<Q", mailbox_buf, worker_mod.MAILBOX_OFF_PROTOCOL, worker_mod.MAILBOX_PROTOCOL_MAGIC_VERSION)
 
         digest = bytes(range(32))
         # MAP, use the child mapping, UNMAP, verify rewriting stops, then exit.

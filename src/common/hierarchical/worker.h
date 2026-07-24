@@ -74,8 +74,8 @@ public:
     // MAILBOX_SIZE-byte MAP_SHARED region; the real worker (a `ChipWorker`
     // for NEXT_LEVEL, a Python callable for SUB) lives in the forked
     // child and consumes the mailbox via the Python child loop.
-    void add_worker(WorkerType type, void *mailbox);
-    void add_next_level_worker(int32_t worker_id, void *mailbox);
+    void add_worker(WorkerType type, void *mailbox, uint32_t max_in_flight = 1);
+    void add_next_level_worker(int32_t worker_id, void *mailbox, uint32_t max_in_flight = 1);
 
     // Register a REMOTE_L3 endpoint only after its session runner completed
     // prestart and reported HELLO READY on the command lane.

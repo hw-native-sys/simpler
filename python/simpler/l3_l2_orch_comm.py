@@ -12,8 +12,11 @@ from __future__ import annotations
 
 import ctypes
 import struct
+import threading
+import time
 from dataclasses import dataclass
 from enum import IntEnum
+from multiprocessing.shared_memory import SharedMemory
 from typing import Any
 
 from _task_interface import (  # pyright: ignore[reportMissingImports]
@@ -23,9 +26,21 @@ from _task_interface import (  # pyright: ignore[reportMissingImports]
     _l3_host_mapped_payload_read,
     _l3_host_mapped_payload_write,
     _l3_host_mapped_region_close,
+    _mailbox_load_i32,
+    _mailbox_store_i32,
 )
 
 from .task_interface import Tensor
+
+
+class L3L2OrchCommCmd(IntEnum):
+    ALLOC_REGION = 1
+    FREE_REGION = 2
+    PAYLOAD_WRITE = 3
+    PAYLOAD_READ = 4
+    SIGNAL_NOTIFY = 5
+    SIGNAL_WAIT = 6
+    SIGNAL_TEST = 7
 
 
 class NotifyOp(IntEnum):
@@ -48,6 +63,17 @@ class L3L2RegionAccessProfile(IntEnum):
     SIM_POSIX_SHM = 2
 
 
+class _ServiceError(IntEnum):
+    COPY_FAILED = 6
+    SIGNAL_TIMEOUT = 7
+
+
+_STATE_IDLE = 0
+_STATE_READY = 1
+_STATE_DONE = 3
+_POLL_INTERVAL_S = 0.00005
+_DEFAULT_SUBMIT_TIMEOUT_S = 5.0
+_SIGNAL_TIMEOUT_MARGIN_S = 1.0
 _MAX_SIGNED_CHRONO_TIMEOUT_NS = 2**63 - 1
 
 # Wire values returned by _l3_host_mapped_counter_wait in _task_interface; must
@@ -86,6 +112,16 @@ def _checked_add_u64(lhs: int, rhs: int) -> int:
     return result
 
 
+_REQUEST = struct.Struct("<IIQQQQQQiIQ")
+_RESPONSE = struct.Struct("<iIQiI6Q256s")
+_CONTROL_OFF_STATE = 0
+_CONTROL_OFF_REQUEST = 8
+_CONTROL_OFF_RESPONSE = _CONTROL_OFF_REQUEST + _REQUEST.size
+CONTROL_BLOCK_SIZE = _CONTROL_OFF_RESPONSE + _RESPONSE.size
+CONTROL_SHM_SIZE = max(65536, CONTROL_BLOCK_SIZE)
+L3L2_ORCH_REGION_DESC_SCALAR_COUNT = 6
+
+
 @dataclass(frozen=True)
 class L3L2OrchRegionDesc:
     magic_version: int
@@ -110,6 +146,98 @@ class L3L2OrchRegionDesc:
 class SignalTestResult:
     matched: bool
     observed: int
+
+
+@dataclass(frozen=True)
+class L3L2OrchCommRequest:
+    cmd: L3L2OrchCommCmd
+    op: int = 0
+    region_id: int = 0
+    payload_offset: int = 0
+    host_ptr: int = 0
+    payload_bytes: int = 0
+    counter_addr: int = 0
+    counter_bytes: int = 0
+    counter_operand: int = 0
+    timeout_ns: int = 0
+
+
+@dataclass(frozen=True)
+class L3L2OrchCommResponse:
+    status: int
+    error_kind: int
+    region_id: int
+    observed_counter: int
+    matched: bool
+    desc: L3L2OrchRegionDesc | None
+    message: str
+
+
+class L3L2OrchCommClient:
+    def __init__(self, shm: SharedMemory) -> None:
+        self._shm = shm
+        buf = shm.buf
+        assert buf is not None
+        self._buf = buf
+        self._state_addr = ctypes.addressof(ctypes.c_char.from_buffer(self._buf)) + _CONTROL_OFF_STATE
+        self._mu = threading.Lock()
+        _mailbox_store_i32(self._state_addr, _STATE_IDLE)
+
+    def submit(
+        self, request: L3L2OrchCommRequest, timeout_s: float = _DEFAULT_SUBMIT_TIMEOUT_S
+    ) -> L3L2OrchCommResponse:
+        deadline = time.monotonic() + float(timeout_s)
+        with self._mu:
+            while _mailbox_load_i32(self._state_addr) != _STATE_IDLE:
+                if time.monotonic() >= deadline:
+                    raise TimeoutError("L3-L2 orch comm client timed out waiting for IDLE")
+                time.sleep(_POLL_INTERVAL_S)
+
+            _REQUEST.pack_into(
+                self._buf,
+                _CONTROL_OFF_REQUEST,
+                int(request.cmd),
+                int(request.op),
+                int(request.region_id),
+                int(request.payload_offset),
+                int(request.host_ptr),
+                int(request.payload_bytes),
+                int(request.counter_addr),
+                int(request.counter_bytes),
+                int(request.counter_operand),
+                0,
+                int(request.timeout_ns),
+            )
+            self._buf[_CONTROL_OFF_RESPONSE : _CONTROL_OFF_RESPONSE + _RESPONSE.size] = b"\x00" * _RESPONSE.size
+            _mailbox_store_i32(self._state_addr, _STATE_READY)
+
+            while _mailbox_load_i32(self._state_addr) != _STATE_DONE:
+                if time.monotonic() >= deadline:
+                    raise TimeoutError("L3-L2 orch comm client timed out waiting for DONE")
+                time.sleep(_POLL_INTERVAL_S)
+
+            response = self._read_response()
+            _mailbox_store_i32(self._state_addr, _STATE_IDLE)
+            return response
+
+    def _read_response(self) -> L3L2OrchCommResponse:
+        fields = _RESPONSE.unpack_from(self._buf, _CONTROL_OFF_RESPONSE)
+        status, error_kind, region_id, observed_counter, matched = fields[:5]
+        desc_values = fields[5:11]
+        raw_message = fields[11]
+        desc = None
+        if any(int(v) != 0 for v in desc_values):
+            desc = L3L2OrchRegionDesc(*[int(v) for v in desc_values])
+        message = raw_message.split(b"\x00", 1)[0].decode("utf-8", "replace")
+        return L3L2OrchCommResponse(
+            status=int(status),
+            error_kind=int(error_kind),
+            region_id=int(region_id),
+            observed_counter=int(observed_counter),
+            matched=bool(matched),
+            desc=desc,
+            message=message,
+        )
 
 
 @dataclass(frozen=True)

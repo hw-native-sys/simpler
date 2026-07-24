@@ -12,7 +12,10 @@
 #ifndef SRC_COMMON_WORKER_CHIP_WORKER_H_
 #define SRC_COMMON_WORKER_CHIP_WORKER_H_
 
+#include <array>
+#include <condition_variable>
 #include <cstdint>
+#include <mutex>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -69,12 +72,17 @@ public:
     // platform as `[STRACE]` log markers — see src/common/log/.../strace.h — not
     // returned, so the L3 dispatcher and L2 child are observed uniformly.
     void run(int32_t callable_id, TaskArgsView args, const CallConfig &config);
+    void run(int32_t callable_id, TaskArgsView args, const CallConfig &config, unsigned pipeline_slot);
     // Same launch, but the caller already holds the runtime.so-ABI POD —
     // skip the view→storage memcpy and hand the pointer straight to the C ABI.
     // Used by the ChipStorageTaskArgs path in the nanobind binding.
     void run(int32_t callable_id, const ChipStorageTaskArgs *args, const CallConfig &config);
+    void run(int32_t callable_id, const ChipStorageTaskArgs *args, const CallConfig &config, unsigned pipeline_slot);
+    void
+    run(int32_t callable_id, const ChipStorageTaskArgs *args, const CallConfig &config, unsigned pipeline_slot,
+        volatile int32_t *accepted_state);
 
-    // Per-callable_id preparation. Requires init() first and a callable_id
+    // Per-callable_id registration. Requires init() first and a callable_id
     // in [0, MAX_REGISTERED_CALLABLE_IDS) (cap 64).
     void register_callable(int32_t callable_id, const void *callable);
     void unregister_callable(int32_t callable_id);
@@ -89,6 +97,9 @@ public:
     /// Number of host-side dlopens (host_build_graph variant). Mirrors
     /// `aicpu_dlopen_count` for the trb path; returns 0 on device-orch variants.
     size_t host_dlopen_count() const;
+
+    unsigned pipeline_slot_count() const { return pipeline_contract_.pipeline_slots; }
+    unsigned arena_bank_count() const { return pipeline_contract_.arena_banks; }
 
     uint64_t malloc(size_t size);
     void free(uint64_t ptr);
@@ -157,6 +168,10 @@ private:
     );
     using SimplerRegisterCallableFn = int (*)(void *, int32_t, const void *);
     using SimplerRunFn = int (*)(void *, void *, int32_t, const void *, const CallConfig *);
+    using SelectArenaBankFn = int (*)(void *, unsigned);
+    using SelectPipelineSlotFn = int (*)(void *, unsigned);
+    using SetTaskAcceptedStateFn = int (*)(void *, volatile int32_t *, int32_t);
+    using GetPipelineContractFn = const PipelineContract *(*)();
     using SimplerUnregisterCallableFn = int (*)(void *, int32_t);
     using GetAicpuDlopenCountFn = size_t (*)(void *);
     using SimplerProvisionDmaWorkspaceFn = int (*)(void *, uint32_t);
@@ -186,6 +201,9 @@ private:
 
     void *create_comm_stream_checked(const char *op_name);
     void destroy_comm_stream_best_effort(void *stream, int *rc);
+    bool has_shared_reuse_resource() const;
+    void acquire_reuse_resource(const RuntimeEnv &runtime_env);
+    void release_reuse_resource();
     CommSession *find_comm_session(uint64_t comm_handle);
     CommSession *create_comm_session(void *handle, void *stream, bool is_base);
     int destroy_comm_session(CommSession &session);
@@ -203,6 +221,10 @@ private:
     SimplerInitFn simpler_init_fn_ = nullptr;
     SimplerRegisterCallableFn register_callable_fn_ = nullptr;
     SimplerRunFn run_fn_ = nullptr;
+    SelectArenaBankFn select_arena_bank_fn_ = nullptr;
+    SelectPipelineSlotFn select_pipeline_slot_fn_ = nullptr;
+    SetTaskAcceptedStateFn set_task_accepted_state_fn_ = nullptr;
+    GetPipelineContractFn get_pipeline_contract_fn_ = nullptr;
     SimplerUnregisterCallableFn unregister_callable_fn_ = nullptr;
     GetAicpuDlopenCountFn get_aicpu_dlopen_count_fn_ = nullptr;
     GetAicpuDlopenCountFn get_host_dlopen_count_fn_ = nullptr;
@@ -225,12 +247,12 @@ private:
     std::unordered_map<uint64_t, size_t> comm_session_index_;
     uint64_t base_comm_handle_ = 0;
 
-    std::vector<uint8_t> runtime_buf_;
-    // device_id_ is set once in init() and never modified afterward. All
-    // ChipWorker callers run on the thread that called init() (the same
-    // thread is the only one that subsequently calls malloc / copy_to /
-    // run / finalize), so plain `int` is sufficient — no cross-thread
-    // synchronization required.
+    std::array<std::vector<uint8_t>, 2> runtime_bufs_;
+    PipelineContract pipeline_contract_{PTO_PIPELINE_CONTRACT_ABI_VERSION, 0, 1, 1, {}};
+    std::mutex reuse_resource_mutex_;
+    std::condition_variable reuse_resource_cv_;
+    RuntimeEnv active_reuse_runtime_env_{};
+    unsigned active_reuse_runs_{0};
     int device_id_ = -1;
     bool initialized_ = false;
     bool finalized_ = false;

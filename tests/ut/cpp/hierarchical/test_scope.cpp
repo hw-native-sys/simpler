@@ -11,6 +11,10 @@
 
 #include <gtest/gtest.h>
 
+#include <condition_variable>
+#include <mutex>
+#include <thread>
+
 #include "scope.h"
 
 TEST(Scope, InitialDepthIsZero) {
@@ -80,4 +84,62 @@ TEST(Scope, EmptyScopeReleasesNothing) {
         ++calls;
     });
     EXPECT_EQ(calls, 0);
+}
+
+TEST(Scope, ConcurrentThreadsOwnIndependentFrames) {
+    Scope sc;
+    std::mutex mu;
+    std::condition_variable cv;
+    int stage = 0;
+    std::vector<TaskSlot> released_a;
+    std::vector<TaskSlot> released_b;
+
+    std::thread a([&]() {
+        sc.scope_begin();
+        sc.register_task(10);
+        {
+            std::unique_lock<std::mutex> lk(mu);
+            stage = 1;
+            cv.notify_all();
+            cv.wait(lk, [&]() {
+                return stage >= 2;
+            });
+        }
+        sc.scope_end([&](TaskSlot slot) {
+            released_a.push_back(slot);
+        });
+        {
+            std::lock_guard<std::mutex> lk(mu);
+            stage = 3;
+            cv.notify_all();
+        }
+    });
+    std::thread b([&]() {
+        {
+            std::unique_lock<std::mutex> lk(mu);
+            cv.wait(lk, [&]() {
+                return stage >= 1;
+            });
+        }
+        sc.scope_begin();
+        sc.register_task(20);
+        {
+            std::unique_lock<std::mutex> lk(mu);
+            stage = 2;
+            cv.notify_all();
+            cv.wait(lk, [&]() {
+                return stage >= 3;
+            });
+        }
+        sc.scope_end([&](TaskSlot slot) {
+            released_b.push_back(slot);
+        });
+    });
+
+    a.join();
+    b.join();
+    ASSERT_EQ(released_a.size(), 1u);
+    ASSERT_EQ(released_b.size(), 1u);
+    EXPECT_EQ(released_a[0], 10);
+    EXPECT_EQ(released_b[0], 20);
 }

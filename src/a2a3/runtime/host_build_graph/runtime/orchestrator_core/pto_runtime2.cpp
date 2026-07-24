@@ -88,6 +88,19 @@ void rt_scope_end(PTO2Runtime *rt) { rt->orchestrator.end_scope(); }
 
 void rt_orchestration_done(PTO2Runtime *rt) { rt->orchestrator.mark_done(); }
 
+void rt_graph_boundary(PTO2Runtime *rt, bool final_epoch) {
+    PTO2SharedMemoryHeader *header = rt->orchestrator.sm_header;
+    if (header == nullptr) {
+        rt->orchestrator.report_fatal(PTO2_ERROR_INVALID_ARGS, __FUNCTION__, "shared-memory header is null");
+        return;
+    }
+    if (rt->graph_boundary_callback != nullptr &&
+        !rt->graph_boundary_callback(rt, final_epoch, rt->graph_boundary_context)) {
+        rt->orchestrator.report_fatal(PTO2_ERROR_EXPLICIT_ORCH_FATAL, __FUNCTION__, "Host graph capture failed");
+        return;
+    }
+}
+
 static bool is_fatal_impl(PTO2Runtime *rt) { return rt->orchestrator.fatal; }
 
 void rt_report_fatal(PTO2Runtime *rt, int32_t error_code, const char *func, const char *fmt, ...) {
@@ -304,6 +317,7 @@ static const PTO2RuntimeOps s_runtime_ops = {
 #else
     .scope_set_site = nullptr,
 #endif
+    .graph_boundary = rt_graph_boundary,
 };
 
 // =============================================================================
@@ -326,4 +340,12 @@ void runtime_set_mode(PTO2Runtime *rt, PTO2RuntimeMode mode) {
     if (rt) {
         rt->mode = mode;
     }
+}
+
+void runtime_set_graph_boundary_callback(PTO2Runtime *rt, PTO2GraphBoundaryCallback callback, void *context) {
+    if (rt == nullptr) {
+        return;
+    }
+    rt->graph_boundary_callback = callback;
+    rt->graph_boundary_context = context;
 }

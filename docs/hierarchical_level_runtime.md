@@ -310,3 +310,6 @@ device allocation algorithm.
 | `src/common/worker/chip_worker.{h,cpp}` | L2 `ChipWorker` (kernel-running leaf, runs in the forked chip child) |
 | `python/bindings/` | nanobind exposure of C++ engine to Python |
 | `python/simpler/worker.py` | Python `Worker` factory + lifecycle wrapper |
+
+For bounded multi-flight request execution and per-request token streams on one
+L3 Worker, see [Streaming Request Sessions](request-session.md).

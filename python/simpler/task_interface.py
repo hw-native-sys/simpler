@@ -34,7 +34,11 @@ from typing import Any
 from _task_interface import (  # pyright: ignore[reportMissingImports]
     MAILBOX_ERROR_MSG_SIZE,
     MAILBOX_OFF_ERROR_MSG,
+    MAILBOX_OFF_PROTOCOL,
+    MAILBOX_PROTOCOL_MAGIC_VERSION,
     MAILBOX_SIZE,
+    MAILBOX_TASK_SLOT_COUNT,
+    MAILBOX_TASK_SLOT_SIZE,
     MAX_REGISTERED_CALLABLE_IDS,
     MAX_TENSOR_DIMS,
     ArgDirection,
@@ -83,7 +87,11 @@ __all__ = [
     "TaskState",
     "_Worker",
     "MAILBOX_SIZE",
+    "MAILBOX_TASK_SLOT_SIZE",
+    "MAILBOX_TASK_SLOT_COUNT",
     "MAILBOX_OFF_ERROR_MSG",
+    "MAILBOX_OFF_PROTOCOL",
+    "MAILBOX_PROTOCOL_MAGIC_VERSION",
     "MAILBOX_ERROR_MSG_SIZE",
     "read_args_from_blob",
     # Dynamic CommDomain allocation (orch-only API)
@@ -1028,6 +1036,16 @@ class ChipWorker:
                 self._callable_registry.clear()
                 self._identity_registry.clear()
                 self._live_handles.clear()
+
+    @property
+    def pipeline_slot_count(self) -> int:
+        """Pipeline depth declared by the initialized runtime."""
+        return int(self._impl.pipeline_slot_count)
+
+    @property
+    def arena_bank_count(self) -> int:
+        """Number of independently filled runtime arena banks."""
+        return int(self._impl.arena_bank_count)
 
     def _allocate_slot_locked(self) -> int:
         for slot_id in range(MAX_REGISTERED_CALLABLE_IDS):

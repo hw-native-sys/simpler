@@ -58,6 +58,7 @@ extern "C" {
  * =========================================================================== */
 int register_callable_impl(const ChipCallable *callable, uint64_t (*upload_fn)(const void *), CallableArtifacts *out);
 int validate_runtime_impl(Runtime *runtime, const HostApi *api, int execution_rc);
+int release_async_host_graph_pipeline(Runtime *runtime);
 
 /* ===========================================================================
  * Per-thread DeviceRunnerBase binding (set by simpler_register_callable / simpler_run)
@@ -68,6 +69,20 @@ static pthread_once_t g_runner_key_once = PTHREAD_ONCE_INIT;
 static void create_runner_key() { pthread_key_create(&g_runner_key, nullptr); }
 
 static DeviceRunnerBase *current_runner() { return static_cast<DeviceRunnerBase *>(pthread_getspecific(g_runner_key)); }
+
+static void *capture_thread_context() { return current_runner(); }
+
+static int bind_thread_context(void *context) {
+    auto *runner = static_cast<DeviceRunnerBase *>(context);
+    if (runner == nullptr) return -1;
+    pthread_once(&g_runner_key_once, create_runner_key);
+    pthread_setspecific(g_runner_key, runner);
+    int rc = runner->attach_current_thread(runner->device_id());
+    if (rc != 0) pthread_setspecific(g_runner_key, nullptr);
+    return rc;
+}
+
+static void unbind_thread_context() { pthread_setspecific(g_runner_key, nullptr); }
 
 /* ===========================================================================
  * Internal device-memory functions (wired into a HostApi and passed to the
@@ -102,6 +117,24 @@ static int copy_from_device(void *host_ptr, const void *dev_ptr, size_t size) {
     if (host_ptr == NULL || dev_ptr == NULL) return -1;
     try {
         return current_runner()->copy_from_device(host_ptr, dev_ptr, size);
+    } catch (...) {
+        return -1;
+    }
+}
+
+static int store_u64_release_to_device(void *dev_ptr, uint64_t value) {
+    if (dev_ptr == nullptr) return -1;
+    try {
+        return current_runner()->copy_to_device(dev_ptr, &value, sizeof(value));
+    } catch (...) {
+        return -1;
+    }
+}
+
+static int load_u64_acquire_from_device(uint64_t *value, const void *dev_ptr) {
+    if (value == nullptr || dev_ptr == nullptr) return -1;
+    try {
+        return current_runner()->copy_from_device(value, dev_ptr, sizeof(*value));
     } catch (...) {
         return -1;
     }
@@ -222,10 +255,15 @@ extern "C" int prewarm_config_impl(
 // time rather than reassembling the pointer table on each simpler_run. Passed by
 // address into bind_callable_to_runtime_impl / validate_runtime_impl.
 static const HostApi g_host_api = {
+    .capture_thread_context = capture_thread_context,
+    .bind_thread_context = bind_thread_context,
+    .unbind_thread_context = unbind_thread_context,
     .device_malloc = device_malloc,
     .device_free = device_free,
     .copy_to_device = copy_to_device,
     .copy_from_device = copy_from_device,
+    .store_u64_release_to_device = store_u64_release_to_device,
+    .load_u64_acquire_from_device = load_u64_acquire_from_device,
     .register_device_memory_to_host = register_device_memory_to_host,
     .unregister_device_memory_from_host = unregister_device_memory_from_host,
     .device_memset = device_memset,
@@ -628,6 +666,33 @@ int simpler_run(
         // return value.
         emit_device_phase_markers(runner);
         return rc;
+    } catch (...) {
+        return -1;
+    }
+}
+
+int select_arena_bank_ctx(DeviceContextHandle ctx, unsigned arena_bank) {
+    if (ctx == NULL) return -1;
+    try {
+        return static_cast<DeviceRunnerBase *>(ctx)->select_arena_bank(arena_bank);
+    } catch (...) {
+        return -1;
+    }
+}
+
+int select_pipeline_slot_ctx(DeviceContextHandle ctx, unsigned pipeline_slot) {
+    if (ctx == NULL) return -1;
+    try {
+        return static_cast<DeviceRunnerBase *>(ctx)->select_pipeline_slot(pipeline_slot);
+    } catch (...) {
+        return -1;
+    }
+}
+
+int set_task_accepted_state_ctx(DeviceContextHandle ctx, volatile int32_t *state, int32_t accepted_value) {
+    if (ctx == NULL) return -1;
+    try {
+        return static_cast<DeviceRunnerBase *>(ctx)->set_task_accepted_state(state, accepted_value);
     } catch (...) {
         return -1;
     }

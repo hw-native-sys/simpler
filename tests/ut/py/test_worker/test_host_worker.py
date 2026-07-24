@@ -123,18 +123,23 @@ def _chip_payload_shm(callable_obj: ChipCallable) -> SharedMemory:
     return shm
 
 
-def test_chip_process_loop_inits_runs_and_finalizes(monkeypatch):
+@pytest.mark.parametrize(("runtime", "expected_slots"), [("tensormap_and_ringbuffer", 2), ("host_build_graph", 2)])
+def test_chip_process_loop_inits_one_worker_with_runtime_slots(monkeypatch, runtime, expected_slots):
     events: list[tuple] = []
 
     class FakeChipWorker:
+        pipeline_slot_count = expected_slots
+
         def init(self, device_id, bins, *, log_level, log_info_v, prewarm_config=None, enable_sdma=False):
             events.append(("init", device_id, bins, log_level, log_info_v, prewarm_config, enable_sdma))
 
         def finalize(self) -> None:
             events.append(("finalize",))
 
-    def fake_run_chip_main_loop(cw, *_args, chip_platform, chip_runtime, prepared=None):
-        events.append(("main_loop", cw, chip_platform, chip_runtime))
+    def fake_run_chip_main_loop(
+        cw, *_args, chip_platform, chip_runtime, prepared=None, run_workers=None, pipeline_slots=1
+    ):
+        events.append(("main_loop", cw, chip_platform, chip_runtime, len(run_workers or [cw]), pipeline_slots))
 
     monkeypatch.setattr(worker_mod, "ChipWorker", FakeChipWorker)
     monkeypatch.setattr(worker_mod, "_run_chip_main_loop", fake_run_chip_main_loop)
@@ -150,16 +155,17 @@ def test_chip_process_loop_inits_runs_and_finalizes(monkeypatch):
             {},
             {},
             platform="a2a3",
-            runtime="tensormap_and_ringbuffer",
+            runtime=runtime,
         )
     finally:
         shm.close()
         shm.unlink()
 
-    assert events[0] == ("init", 7, "bins", 1, 5, None, False)
-    assert events[1][0] == "main_loop"
-    assert events[1][2:] == ("a2a3", "tensormap_and_ringbuffer")
-    assert events[2] == ("finalize",)
+    assert [event[0] for event in events].count("init") == 1
+    main_loop_index = 1
+    assert events[main_loop_index][0] == "main_loop"
+    assert events[main_loop_index][2:] == ("a2a3", runtime, 1, expected_slots)
+    assert events[main_loop_index + 1 :] == [("finalize",)]
 
 
 def _chip_digest(callable_obj: ChipCallable, *, platform: str = "", runtime: str = "") -> bytes:
@@ -1862,6 +1868,60 @@ class TestChipMainLoopDigestRegister:
         )
         t.start()
         return t
+
+    def test_single_slot_runs_on_chip_main_thread(self):
+        from unittest.mock import MagicMock  # noqa: PLC0415
+
+        digest = b"\x05" * 32
+        cw = MagicMock()
+        run_threads = []
+        cw._impl.run_from_blob.side_effect = lambda *_args: run_threads.append(threading.get_ident())
+        shm, buf, state_addr = self._build_mailbox()
+        monitor_errors = []
+
+        def shutdown_after_done():
+            import time  # noqa: PLC0415
+
+            deadline = time.monotonic() + 2.0
+            try:
+                while _mailbox_load_i32(state_addr) != worker_mod._TASK_DONE:
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError("single-slot run did not publish TASK_DONE")
+                    time.sleep(0.001)
+            except BaseException as exc:  # noqa: BLE001
+                monitor_errors.append(exc)
+            finally:
+                _mailbox_store_i32(state_addr, worker_mod._SHUTDOWN)
+
+        try:
+            struct.pack_into("Q", buf, worker_mod.MAILBOX_OFF_PROTOCOL, worker_mod.MAILBOX_PROTOCOL_MAGIC_VERSION)
+            start = worker_mod._OFF_TASK_CALLABLE_HASH
+            buf[start : start + len(digest)] = digest
+            monitor = threading.Thread(target=shutdown_after_done)
+            monitor.start()
+            caller_thread = threading.get_ident()
+            _mailbox_store_i32(state_addr, worker_mod._TASK_READY)
+            worker_mod._run_chip_main_loop(
+                cw,
+                buf,
+                _mailbox_addr(shm),
+                state_addr,
+                0,
+                {0: object()},
+                {digest: 0},
+                {digest: 1},
+                chip_platform="a5",
+                prepared={0},
+                run_workers=[cw],
+            )
+            monitor.join(timeout=2.0)
+            assert not monitor.is_alive()
+            assert not monitor_errors
+            assert run_threads == [caller_thread]
+        finally:
+            buf.release()
+            shm.close()
+            shm.unlink()
 
     def test_register_uses_payload_size_and_allocates_local_slot(self):
         from unittest.mock import MagicMock  # noqa: PLC0415

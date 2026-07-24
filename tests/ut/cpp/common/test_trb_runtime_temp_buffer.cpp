@@ -178,24 +178,24 @@ uint64_t fake_upload_chip_callable_buffer(const void * /* callable */) { return 
 // with_temporary_buffer=false leaves the retained-slot callbacks null, which
 // makes trb bind fall back to a per-tensor device_malloc for each tensor.
 HostApi make_host_api(bool with_temporary_buffer = true) {
-    return HostApi{
-        fake_device_malloc,
-        fake_device_free,
-        fake_copy_to_device,
-        fake_copy_from_device,
-        fake_register_device_memory_to_host,
-        fake_unregister_device_memory_from_host,
-        fake_device_memset,
-        with_temporary_buffer ? fake_get_retained_temp_buffer : nullptr,
-        with_temporary_buffer ? fake_set_retained_temp_buffer : nullptr,
-        fake_setup_static_arena,
-        fake_acquire_pooled_gm_heap,
-        fake_acquire_pooled_gm_sm,
-        fake_acquire_pooled_runtime_arena,
-        fake_lookup_prebuilt_runtime_arena_cache,
-        fake_mark_prebuilt_runtime_arena_cached,
-        fake_upload_chip_callable_buffer,
-    };
+    HostApi api{};
+    api.device_malloc = fake_device_malloc;
+    api.device_free = fake_device_free;
+    api.copy_to_device = fake_copy_to_device;
+    api.copy_from_device = fake_copy_from_device;
+    api.register_device_memory_to_host = fake_register_device_memory_to_host;
+    api.unregister_device_memory_from_host = fake_unregister_device_memory_from_host;
+    api.device_memset = fake_device_memset;
+    api.get_retained_temp_buffer = with_temporary_buffer ? fake_get_retained_temp_buffer : nullptr;
+    api.set_retained_temp_buffer = with_temporary_buffer ? fake_set_retained_temp_buffer : nullptr;
+    api.setup_static_arena = fake_setup_static_arena;
+    api.acquire_pooled_gm_heap = fake_acquire_pooled_gm_heap;
+    api.acquire_pooled_gm_sm = fake_acquire_pooled_gm_sm;
+    api.acquire_pooled_runtime_arena = fake_acquire_pooled_runtime_arena;
+    api.lookup_prebuilt_runtime_arena_cache = fake_lookup_prebuilt_runtime_arena_cache;
+    api.mark_prebuilt_runtime_arena_cached = fake_mark_prebuilt_runtime_arena_cached;
+    api.upload_chip_callable_buffer = fake_upload_chip_callable_buffer;
+    return api;
 }
 
 Tensor make_tensor(std::vector<uint8_t> &storage, bool child_memory = false) {

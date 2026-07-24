@@ -177,6 +177,7 @@ void PTO2SharedMemoryHandle::init_header_per_ring(
     header->sched_error_bitmap.store(0, std::memory_order_relaxed);
     header->sched_error_code.store(PTO2_ERROR_NONE, std::memory_order_relaxed);
     header->sched_error_thread.store(-1, std::memory_order_relaxed);
+    header->host_graph_epochs.init();
 
     // Per-ring slot_states reset. Previously lived in
     // PTO2SchedulerState::RingSchedState::init(), but it writes into

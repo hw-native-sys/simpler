@@ -68,15 +68,18 @@ Worker::~Worker() {
     if (initialized_) close();
 }
 
-void Worker::add_worker(WorkerType type, void *mailbox) {
+void Worker::add_worker(WorkerType type, void *mailbox, uint32_t max_in_flight) {
     if (initialized_) throw std::runtime_error("Worker: add_worker after init");
-    if (type == WorkerType::NEXT_LEVEL) manager_.add_next_level(mailbox);
-    else manager_.add_sub(mailbox);
+    if (type == WorkerType::NEXT_LEVEL) manager_.add_next_level(mailbox, max_in_flight);
+    else {
+        if (max_in_flight != 1) throw std::invalid_argument("Worker: SUB worker max_in_flight must be 1");
+        manager_.add_sub(mailbox);
+    }
 }
 
-void Worker::add_next_level_worker(int32_t worker_id, void *mailbox) {
+void Worker::add_next_level_worker(int32_t worker_id, void *mailbox, uint32_t max_in_flight) {
     if (initialized_) throw std::runtime_error("Worker: add_next_level_worker after init");
-    manager_.add_next_level_at(worker_id, mailbox);
+    manager_.add_next_level_at(worker_id, mailbox, max_in_flight);
 }
 
 void Worker::add_remote_l3_socket(

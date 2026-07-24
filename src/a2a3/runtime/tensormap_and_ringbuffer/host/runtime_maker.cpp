@@ -38,6 +38,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <limits>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -47,6 +48,7 @@
 #include "../runtime/runtime.h"
 #include "../../../../common/runtime_status/error_log.h"
 #include "../../../../common/task_interface/call_config.h"
+#include "../../../../common/worker/pto_runtime_c_api.h"
 #include "callable.h"
 #include "common/platform_config.h"
 #include "common/strace.h"
@@ -56,6 +58,24 @@
 #include "common/host_api.h"
 #include "utils/device_arena.h"
 #include "prepare_callable_common.h"
+
+extern "C" const PipelineContract *get_pipeline_contract(void) {
+    static const PipelineContract contract = {
+        PTO_PIPELINE_CONTRACT_ABI_VERSION,
+        4,
+        2,
+        1,
+        {
+            {PTO_PIPELINE_TASK_ARGS, PTO_PIPELINE_FILL_MEM, 0},
+            {PTO_PIPELINE_RUNTIME_IMAGE, PTO_PIPELINE_REUSE_MEM, 0},
+            {PTO_PIPELINE_AICPU_STREAM, PTO_PIPELINE_EXEC_HANDLE, 0},
+            {PTO_PIPELINE_AICORE_STREAM, PTO_PIPELINE_EXEC_HANDLE, 0},
+        },
+    };
+    return &contract;
+}
+
+static std::mutex g_stage1_mutex;
 
 static_assert(
     RUNTIME_ENV_RING_COUNT == PTO2_MAX_RING_DEPTH, "RuntimeEnv ring count must match PTO2 runtime ring depth"
@@ -833,6 +853,11 @@ extern "C" int bind_callable_to_runtime_impl(
         return -1;
     }
 
+    // Gate A: one host Stage1 at a time. Releasing this lock at bind return
+    // lets the next request fill its independent TaskArg slot while this
+    // request waits in or executes the runner's Gate-B-protected Device S.
+    std::lock_guard<std::mutex> stage1_lock(g_stage1_mutex);
+
     int tensor_count = orch_args->tensor_count();
     int scalar_count = orch_args->scalar_count();
     LOG_INFO_V0("RT2 bind: %d tensors + %d scalars, device orchestration mode", tensor_count, scalar_count);
@@ -873,6 +898,8 @@ extern "C" int bind_callable_to_runtime_impl(
     int64_t t_prebuilt_start = _now_ms();
     {
         STRACE("simpler_run.bind.prebuilt");
+        // Gate A also serializes a cold miss, so one request builds and uploads
+        // the single REUSE_MEM arena and the next observes the immutable cache.
         PrebuiltRuntimeArenaCacheProbe cache_probe = make_prebuilt_runtime_arena_cache_probe(sizing);
         int cache_rc = bind_cached_runtime_image(runtime, api, cache_probe, device_args);
         if (cache_rc < 0) {

@@ -91,6 +91,7 @@ typedef struct PTO2RuntimeOps {
     // collector can log it. Always present to keep ops-table layout stable
     // across SIMPLER_DFX settings; set to nullptr at SIMPLER_DFX=0.
     void (*scope_set_site)(const char *file, int line);
+    void (*graph_boundary)(PTO2Runtime *rt, bool final_epoch);
 } PTO2RuntimeOps;
 
 /**
@@ -223,6 +224,14 @@ static inline void rt_scope_end() {
 static inline void rt_orchestration_done() {
     PTO2Runtime *rt = current_runtime();
     rt->ops->orchestration_done(rt);
+}
+
+static inline void rt_graph_boundary(bool final_epoch = false) {
+    PTO2Runtime *rt = current_runtime();
+    if (rt->ops->is_fatal(rt) || rt->ops->graph_boundary == nullptr) {
+        return;
+    }
+    rt->ops->graph_boundary(rt, final_epoch);
 }
 
 static inline bool rt_is_fatal() {
