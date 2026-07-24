@@ -1278,7 +1278,10 @@ void SchedulerContext::deinit() {
     // would otherwise leave dirty pending/elected/ack state for the next reuse.
     drain_state_.sync_start_pending.store(0, std::memory_order_release);
     drain_state_.drain_worker_elected.store(0, std::memory_order_release);
-    drain_state_.drain_ack_mask.store(0, std::memory_order_release);
+    drain_state_.drain_attempt.store(0, std::memory_order_release);
+    for (int32_t t = 0; t < MAX_AICPU_THREADS; t++) {
+        drain_ack_attempts_[t].store(0, std::memory_order_release);
+    }
     drain_state_.pending_task.store(nullptr, std::memory_order_release);
     drain_state_.drain_stage_go.store(0, std::memory_order_release);
     drain_state_.drain_stage_done_mask.store(0, std::memory_order_release);

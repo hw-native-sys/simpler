@@ -223,8 +223,8 @@ SchedulerContext owns its own teardown:
 
 - `SchedulerContext::deinit()` resets every scheduler-owned field —
   per-core states, payloads, sync-start drain coordination
-  (`sync_start_pending` / `drain_worker_elected` / `drain_ack_mask` /
-  `pending_task`), task counters, worker-id lists,
+  (`sync_start_pending` / `drain_worker_elected` / `drain_attempt` /
+  `drain_ack_attempts_` / `pending_task`), task counters, worker-id lists,
   core trackers, `cores_total_num_` / `aic_count_` / `aiv_count_`,
   `regs_`, `sched_`, `func_id_to_addr_`, and the `pto2_init_*` flags.
 - `AicpuExecutor::deinit()` calls `sched_ctx_.deinit()` first, then resets

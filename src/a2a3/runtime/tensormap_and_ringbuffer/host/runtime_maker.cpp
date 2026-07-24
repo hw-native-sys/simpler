@@ -608,9 +608,13 @@ static void apply_orch_sched_env_flags(Runtime *runtime) {
     const char *serial_env = std::getenv("SIMPLER_TMR_SERIAL_ORCH_SCHED_ENABLE");
     runtime->dev.serial_orch_sched =
         serial_env && (serial_env[0] == '1' || serial_env[0] == 't' || serial_env[0] == 'T');
+    const char *drain_aba_env = std::getenv("SIMPLER_DRAIN_ABA_TEST");
+    runtime->dev.drain_aba_test_mode =
+        drain_aba_env && (drain_aba_env[0] == '1' || drain_aba_env[0] == 't' || drain_aba_env[0] == 'T');
     LOG_INFO_V0(
         "Serial orchestrator-to-scheduler start gate: %s", runtime->dev.serial_orch_sched ? "enabled" : "disabled"
     );
+    LOG_INFO_V0("Drain ABA test hook: %s", runtime->dev.drain_aba_test_mode ? "enabled" : "disabled");
 }
 
 // per-(cid,config): reserve and acquire the static device pools. GM heap, PTO2
