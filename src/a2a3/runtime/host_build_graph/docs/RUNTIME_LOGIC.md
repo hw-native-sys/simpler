@@ -127,7 +127,7 @@ Two platform implementations exist under `src/platform/`, sharing a common inter
 | Constant | Value | Description |
 | -------- | ----- | ----------- |
 | `PLATFORM_MAX_BLOCKDIM` | 24 | Maximum blocks (each = 1 AIC + 2 AIV) |
-| `PLATFORM_MAX_AICPU_THREADS` | 4 | AICPU thread count (3 schedulers + 1 orchestrator) |
+| `PLATFORM_MAX_AICPU_THREADS` | 4 | AICPU thread count (all schedulers; the highest-index thread also runs the host-orch boot) |
 | `PLATFORM_MAX_AIC_PER_THREAD` | 24 | Max AIC cores per scheduler thread |
 | `PLATFORM_MAX_AIV_PER_THREAD` | 48 | Max AIV cores per scheduler thread |
 | `PLATFORM_PROF_SYS_CNT_FREQ` | 50 MHz | System counter frequency for profiling |
@@ -543,16 +543,19 @@ verified by review.
 
 ### 8.1 Thread Model
 
-With `aicpu_thread_num=4`, the AICPU runs 4 threads:
+With `aicpu_thread_num=4` and `block_dim=24`, the AICPU runs 4 scheduler
+threads (thread 3 also performs the one-time host-orch boot before it starts
+dispatching):
 
 | Thread | Role | Cores |
 | ------ | ---- | ----- |
-| 0 | Scheduler | 6 AIC + ~13 AIV |
-| 1 | Scheduler | 6 AIC + ~13 AIV |
-| 2 | Scheduler | 6 AIC + ~13 AIV |
-| 3 | Orchestrator | none |
+| 0 | Scheduler | 6 AIC + 12 AIV |
+| 1 | Scheduler | 6 AIC + 12 AIV |
+| 2 | Scheduler | 6 AIC + 12 AIV |
+| 3 | Scheduler (+ host-orch boot) | 6 AIC + 12 AIV |
 
-Core assignment: AICs and AIVs are divided equally among the 3 scheduler threads.
+Core assignment: clusters (1 AIC + 2 AIV) are divided equally among all 4
+scheduler threads.
 
 ### 8.2 Scheduler Main Loop
 
@@ -630,11 +633,11 @@ Public surface (called from `AicpuExecutor::init/run/deinit`):
 
 | Method | Phase | Purpose |
 | ------ | ----- | ------- |
-| `init(runtime, aicpu_thread_num, sched_thread_num, orch_to_sched, regs_base)` | once per run | Handshake + assign cores, reset counters, latch `regs_base`, bind `func_id_to_addr_` |
+| `init(runtime, aicpu_thread_num, regs_base)` | once per run | Handshake + assign cores, reset counters, latch `regs_base`, bind `func_id_to_addr_` |
 | `bind_runtime(rt)` | boot thread | Wire `sched_` to `rt->scheduler` once the boot thread attaches the host-built `rt` |
 | `resolve_and_dispatch(runtime, thread_idx)` | per scheduler thread | Main dispatch loop |
 | `shutdown(thread_idx)` | per thread on exit | `platform_deinit_aicore_regs` for this thread's cores; PMU finalize when enabled |
-| `on_orchestration_done(runtime, rt, thread_idx, total_tasks)` | orchestrator thread | Publish core assignments, latch task count, fold inline-completed tasks, flip `orchestrator_done_`, drive orch→sched core transition (or `emergency_shutdown` on fatal) |
+| `on_orchestration_done(runtime, rt, thread_idx, total_tasks)` | boot thread | Publish core assignments, latch task count, fold inline-completed tasks, flip `orchestrator_done_` (or `emergency_shutdown` on fatal) |
 | `deinit()` | once per run | Reset every scheduler-owned field to its post-construction default |
 | Read-only accessors | various | `aic_count()` / `aiv_count()` / `is_completed()` / `completed_tasks_count()` |
 

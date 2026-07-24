@@ -86,7 +86,7 @@ Thread 3: PTO2 total submitted tasks = 16704
 
 ## Block 2: PTO2 Scheduler Summary
 
-Each of the 3 scheduler threads (Thread 0, 1, 2) prints its own summary after completing all tasks. The output has two sub-sections: **summary** and **phase breakdown**.
+Each scheduler thread (Thread 0–3 at `aicpu_thread_num=4`) prints its own summary after completing all tasks. The output has two sub-sections: **summary** and **phase breakdown**.
 
 ### Example (Thread 0, from a different run: batch=1, 1044 tasks)
 

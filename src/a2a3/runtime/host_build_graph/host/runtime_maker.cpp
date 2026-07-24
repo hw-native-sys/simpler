@@ -727,15 +727,6 @@ extern "C" int bind_callable_to_runtime_impl(
     }
     int64_t t_args_end = _now_ms();
 
-    // Read orchestrator-to-scheduler transition flag from environment
-    {
-        const char *env_val = std::getenv("PTO2_ORCH_TO_SCHED");
-        if (env_val && (env_val[0] == '1' || env_val[0] == 't' || env_val[0] == 'T')) {
-            runtime->orch_to_sched = true;
-        }
-        LOG_INFO_V0("Orchestrator-to-scheduler transition: %s", runtime->orch_to_sched ? "enabled" : "disabled");
-    }
-
     // Lay out the per-Worker static device arena. GM heap, PTO2 shared memory,
     // and the prebuilt runtime arena all live in a single backing allocation;
     // setup_static_arena reserves the three regions and commits in one shot.

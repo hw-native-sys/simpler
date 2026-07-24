@@ -37,7 +37,6 @@ Runtime::Runtime() {
     memset(aicpu_allowed_cpus, 0, sizeof(aicpu_allowed_cpus));
     aicpu_allowed_cpu_count = 0;
     aicpu_launch_count = 0;
-    orch_to_sched = false;
     host_total_tasks = 0;
 
     // Initialize shared-memory / orchestration argument plumbing

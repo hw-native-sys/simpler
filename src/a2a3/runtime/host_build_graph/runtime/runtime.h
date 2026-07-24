@@ -54,7 +54,7 @@
 #define RUNTIME_MAX_ORCH_SO_SIZE (4 * 1024 * 1024)  // 4MB max for orchestration SO
 #define RUNTIME_MAX_ORCH_SYMBOL_NAME 64
 
-// Default ready queue shards: one shard per worker thread (total minus orchestrator)
+// Default number of ready-queue shards.
 constexpr int RUNTIME_DEFAULT_READY_QUEUE_SHARDS = PLATFORM_MAX_AICPU_THREADS - 1;
 
 // =============================================================================
@@ -156,19 +156,19 @@ public:
 
     // Execution parameters for AICPU scheduling.
     //
-    // aicpu_thread_num is the *total* AICPU thread count launched on this run
-    // (= orch + schedulers). AicpuExecutor splits this into one orchestrator
-    // thread (highest idx, runs aicpu_orchestration_entry) and the remaining
-    // aicpu_thread_num-1 scheduler threads that dispatch tasks to AICore.
-    // The orch thread also dispatches when env PTO2_ORCH_TO_SCHED is set.
+    // aicpu_thread_num is the total AICPU thread count launched on this run.
+    // host_build_graph builds the task graph on the host, so there is no
+    // on-device orchestrator: every thread is a scheduler that dispatches tasks
+    // to AICore. The highest-index thread additionally performs the one-time
+    // host-orch boot (attach SM, latch task count) before it starts dispatching.
     int aicpu_thread_num;
     int ready_queue_shards;  // Number of ready queue shards (1..MAX_AICPU_THREADS, default MAX-1)
 
     // Filter-style affinity gate input (a2a3 onboard). Host fills these
     // before launch from AICPU OCCUPY, and the device gate keeps threads whose
     // sched_getcpu() lands on one of the cpu_ids. The array position is the
-    // deterministic exec_idx used by AicpuExecutor for sched/orch role
-    // assignment; the highest active index is the orchestrator slot.
+    // deterministic exec_idx used by AicpuExecutor for scheduler-thread
+    // assignment; the highest active index additionally runs the host-orch boot.
     int32_t aicpu_allowed_cpus[MAX_GATE_THREADS];
     int32_t aicpu_allowed_cpu_count;
     int32_t aicpu_launch_count;
@@ -176,12 +176,6 @@ public:
     // PTO2 integration: kernel_id -> GM function_bin_addr mapping
     // NOTE: Made public for direct access from aicore code
     uint64_t func_id_to_addr_[RUNTIME_MAX_FUNC_ID];
-
-    // Orchestrator-to-scheduler transition control
-    // When true, orchestrator threads convert to scheduler threads after orchestration completes.
-    // When false (default), orchestrator threads exit after orchestration without dispatching tasks.
-    // Controlled via PTO2_ORCH_TO_SCHED environment variable.
-    bool orch_to_sched;
 
     // Total tasks submitted by the host orchestrator — handed to the scheduler
     // (SchedulerContext::on_orchestration_done) in place of latching the SM ring
