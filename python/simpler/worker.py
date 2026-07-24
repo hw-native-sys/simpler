@@ -2069,7 +2069,7 @@ class Worker:
         # ``release()`` removes them and queues a deferred backend free.
         self._live_domains: dict[str, CommDomainHandle] = {}
         # Handles whose `release()` has been called inside an orch function.
-        # The backend free is deferred until after Worker.run.drain() so that
+        # The backend free is deferred until the current Worker.run completes so that
         # tasks already submitted with this domain's device_ctx / buffer_ptrs
         # see live memory through execution.
         self._pending_release_domains: list[CommDomainHandle] = []
@@ -4956,7 +4956,7 @@ class Worker:
         to have already submitted DAG tasks that capture the handle's
         ``device_ctx`` / ``buffer_ptrs``.  Those tasks must see live
         memory through execution; ``Worker.run`` calls
-        ``_execute_pending_domain_releases`` only after ``drain()``.
+        ``_execute_pending_domain_releases`` only after the run-specific wait.
         """
         if self._worker is None:
             return
@@ -4968,7 +4968,7 @@ class Worker:
 
     def _execute_pending_domain_releases(self) -> None:
         """Drive CTRL_RELEASE_DOMAIN for every queued handle.  Must run
-        after ``self._orch._drain()`` so chip-side tasks have completed
+        after ``self._orch._wait_run()`` so chip-side tasks have completed
         their use of the domain memory.
         """
         if not self._pending_release_domains:
@@ -5648,48 +5648,50 @@ class Worker:
 
         assert self._orch is not None
         assert self._worker is not None
-        # Drop any error stashed by a previous run() so this call starts
-        # clean. drain() rethrows on the way out; every successful run()
-        # leaves the error slot empty, but an unrelated caller may have
-        # poked it.
-        self._orch._clear_error()
-        self._orch._scope_begin()
+        run_id = self._orch._begin_run()
+        scope_open = False
+        submission_failed = True
         try:
+            self._orch._scope_begin()
+            scope_open = True
             callable(self._orch, args, cfg)
+            submission_failed = False
         finally:
-            # Always release scope refs and drain so ring slots aren't
-            # stranded when the orch fn raises mid-DAG. drain() also
-            # rethrows the first dispatch failure for this run — that
-            # is how child-task exceptions surface to the caller of
-            # Worker.run(). scope_end deliberately does NOT throw: if
-            # it did, released refs would be incomplete and drain
-            # would hang on in-flight tasks.
-            self._orch._scope_end()
-            # ORDER MATTERS: drain() must complete first so any in-flight
-            # task that captured a now-pending handle's device_ctx /
-            # buffer_ptrs sees live memory.  THEN execute the pending
-            # backend releases.  Last, sweep any handles that the orch
-            # function neither released nor passed out (covers exception
-            # unwind and "forgot to release" — auto-release in LIFO).
-            # drain() rethrows the first chip-task/dispatch failure, so the
-            # cleanup lives in a finally: a failed task must not strand
-            # backend domain allocations into the next run.
             try:
-                try:
-                    self._orch._drain()
-                except Exception as e:
-                    self._poison_l3_l2_region_from_endpoint_error(e)
-                    raise
+                if scope_open:
+                    self._orch._scope_end()
+            except BaseException:
+                submission_failed = True
+                raise
             finally:
-                self._release_active_remote_slot_refs()
-                self._flush_pending_remote_frees()
+                if submission_failed:
+                    self._orch._fail_run_submission(run_id)
+                else:
+                    self._orch._close_run_submission(run_id)
                 try:
-                    self._cleanup_l3_l2_regions()
+                    try:
+                        self._orch._wait_run(run_id)
+                    except Exception as e:
+                        self._poison_l3_l2_region_from_endpoint_error(e)
+                        # Preserve a synchronous graph-construction exception
+                        # already propagating from the orchestration callback.
+                        if not submission_failed:
+                            raise
                 finally:
-                    self._l3_l2_orch_comm_host_buffers.clear()
-                self._execute_pending_domain_releases()
-                if self._live_domains:
-                    self._release_all_live_domains()
+                    try:
+                        # Run-owned resources remain live until the per-run
+                        # completion fence fires, even on failure.
+                        self._release_active_remote_slot_refs()
+                        self._flush_pending_remote_frees()
+                        try:
+                            self._cleanup_l3_l2_regions()
+                        finally:
+                            self._l3_l2_orch_comm_host_buffers.clear()
+                        self._execute_pending_domain_releases()
+                        if self._live_domains:
+                            self._release_all_live_domains()
+                    finally:
+                        self._orch._release_run(run_id)
         # L3+ returns None like every other worker level; per-L2-child timing
         # is emitted as `[STRACE]` markers from each simpler_run.
         return None

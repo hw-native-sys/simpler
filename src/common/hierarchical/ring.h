@@ -130,8 +130,7 @@ public:
 
     // Rewind every ring's cursors + released/slot_heap_end vectors and drop
     // all slot states. Requires that no slots are currently live
-    // (`active_count() == 0`) — typically called by `Orchestrator::drain`
-    // right after the active count hits zero.
+    // (`active_count() == 0`) and no registered runs remain.
     void reset_to_empty();
 
     int32_t active_count() const;

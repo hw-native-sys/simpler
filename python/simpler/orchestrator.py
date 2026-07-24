@@ -552,8 +552,20 @@ class Orchestrator:
     def _scope_end(self) -> None:
         self._o._scope_end()
 
-    def _drain(self) -> None:
-        self._o._drain()
+    def _begin_run(self) -> int:
+        return int(self._o._begin_run())
 
-    def _clear_error(self) -> None:
-        self._o._clear_error()
+    def _close_run_submission(self, run_id: int) -> None:
+        self._o._close_run_submission(run_id)
+
+    def _fail_run_submission(self, run_id: int) -> None:
+        self._o._fail_run_submission(run_id)
+
+    def _wait_run(self, run_id: int) -> None:
+        self._o._wait_run(run_id)
+
+    def _run_done(self, run_id: int) -> bool:
+        return bool(self._o._run_done(run_id))
+
+    def _release_run(self, run_id: int) -> None:
+        self._o._release_run(run_id)

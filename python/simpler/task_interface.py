@@ -854,7 +854,7 @@ class CommDomainHandle:
     def freed(self) -> bool:
         """True once the backend ``comm_release_domain_windows`` has executed.
 
-        Only flips after the owning ``Worker.run`` drains and processes the
+        Only flips after the owning ``Worker.run`` completes and processes the
         pending-release queue.  An ``orch_fn`` will never observe ``True``
         for a handle it released within the same ``run`` call.
         """
@@ -865,7 +865,7 @@ class CommDomainHandle:
 
         Inside an orch function, this is a non-blocking mark — the actual
         backend ``comm_release_domain_windows`` runs after
-        ``Worker.run.drain()`` so that any tasks already submitted with
+        the owning run's completion wait so that tasks already submitted with
         this domain's ``device_ctx`` see live memory through execution.
 
         After this returns, the handle is treated as released for the
@@ -877,7 +877,7 @@ class CommDomainHandle:
             return
         self._released = True
         # _release_fn is owned by Worker; it queues the actual backend
-        # release and runs it after drain.  Worker also flips _freed.
+        # release and runs it after the owning run completes. Worker also flips _freed.
         self._release_fn(self)
 
     def __enter__(self) -> CommDomainHandle:

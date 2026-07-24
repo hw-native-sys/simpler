@@ -166,12 +166,10 @@ void LocalMailboxEndpoint::shutdown_child() { write_mailbox_state(MailboxState::
 // =============================================================================
 
 void WorkerThread::start(
-    Ring *ring, WorkerManager *manager, const std::function<void(WorkerCompletion)> &on_complete,
-    std::unique_ptr<WorkerEndpoint> endpoint
+    Ring *ring, const std::function<void(WorkerCompletion)> &on_complete, std::unique_ptr<WorkerEndpoint> endpoint
 ) {
     if (!endpoint) throw std::invalid_argument("WorkerThread::start: null endpoint");
     ring_ = ring;
-    manager_ = manager;
     on_complete_ = on_complete;
     endpoint_ = std::move(endpoint);
     shutdown_ = false;
@@ -236,10 +234,6 @@ void WorkerThread::loop() {
             completion.group_index = d.group_index;
             completion.outcome = EndpointOutcome::ENDPOINT_FAILURE;
             completion.error_message = "WorkerThread endpoint failed with unknown exception";
-        }
-
-        if (completion.outcome != EndpointOutcome::SUCCESS && manager_) {
-            manager_->report_error(std::make_exception_ptr(std::runtime_error(completion.error_message)));
         }
 
         idle_.store(true, std::memory_order_release);
@@ -398,7 +392,7 @@ void WorkerManager::start(Ring *ring, const OnCompleteFn &on_complete) {
         for (const auto &entry : next_level_entries_) {
             auto wt = std::make_unique<WorkerThread>();
             auto endpoint = std::make_unique<LocalMailboxEndpoint>(entry.worker_id, entry.mailbox);
-            wt->start(ring, this, on_complete, std::move(endpoint));
+            wt->start(ring, on_complete, std::move(endpoint));
             next_level_threads_.push_back(std::move(wt));
         }
     };
@@ -407,37 +401,18 @@ void WorkerManager::start(Ring *ring, const OnCompleteFn &on_complete) {
         for (size_t i = 0; i < entries.size(); ++i) {
             auto wt = std::make_unique<WorkerThread>();
             auto endpoint = std::make_unique<LocalMailboxEndpoint>(static_cast<int32_t>(i), entries[i]);
-            wt->start(ring, this, on_complete, std::move(endpoint));
+            wt->start(ring, on_complete, std::move(endpoint));
             threads.push_back(std::move(wt));
         }
     };
     make_next_level_threads();
     for (auto &endpoint : next_level_endpoint_entries_) {
         auto wt = std::make_unique<WorkerThread>();
-        wt->start(ring, this, on_complete, std::move(endpoint));
+        wt->start(ring, on_complete, std::move(endpoint));
         next_level_threads_.push_back(std::move(wt));
     }
     next_level_endpoint_entries_.clear();
     make_sub_threads(sub_entries_, sub_threads_);
-}
-
-void WorkerManager::report_error(std::exception_ptr e) {
-    if (!e) return;
-    std::lock_guard<std::mutex> lk(err_mu_);
-    if (first_error_) return;  // first-error-wins
-    first_error_ = std::move(e);
-    has_error_.store(true, std::memory_order_release);
-}
-
-std::exception_ptr WorkerManager::take_error() {
-    std::lock_guard<std::mutex> lk(err_mu_);
-    return first_error_;
-}
-
-void WorkerManager::clear_error() {
-    std::lock_guard<std::mutex> lk(err_mu_);
-    first_error_ = nullptr;
-    has_error_.store(false, std::memory_order_release);
 }
 
 void WorkerManager::stop() {

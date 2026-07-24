@@ -36,6 +36,7 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <unordered_map>
 #include <vector>
 
 #include "../task_interface/call_config.h"
@@ -115,6 +116,15 @@ public:
     // Submit a group of SUB tasks: N args -> N workers, 1 DAG node.
     SubmitResult submit_sub_group(const CallableIdentity &callable, const std::vector<TaskArgs> &args_list);
 
+    // Only the calling orchestration thread builds a run at a time.
+    RunId begin_run();
+    void close_run_submission(RunId run_id);
+    void fail_run_submission(RunId run_id, std::exception_ptr error = nullptr);
+    void wait_run(RunId run_id);
+    bool run_done(RunId run_id) const;
+    bool run_failed(RunId run_id) const;
+    void release_run(RunId run_id);
+
     // Open a nested scope. Every task submitted between this call and the
     // matching `scope_end()` picks a heap ring based on the current scope
     // depth (`min(depth, MAX_RING_DEPTH - 1)`) so its slab reclaims
@@ -125,27 +135,17 @@ public:
     // Non-blocking: `scope_end` walks the scope's tasks and releases one
     // ref per task, returning immediately. Actual CONSUMED transitions
     // happen asynchronously as each task's consumer count reaches
-    // threshold (mirrors L2's `pto2_scope_end`). Callers that need a
-    // synchronous wait must call `drain()` separately.
+    // threshold (mirrors L2's `pto2_scope_end`). The owning run fence
+    // provides the synchronous completion boundary.
     void scope_begin();
     void scope_end();
 
-    // Block until every submitted task has reached CONSUMED. Invoked by
-    // Worker::run after scope_end; not part of the user-facing orch-fn API.
-    // Rethrows the first exception reported by any WorkerThread during
-    // dispatch (fail-fast): the wait itself is unaffected — every in-flight
-    // task is allowed to finish so ring slots aren't leaked.
-    void drain();
-
-    // Wire the Scheduler's loop mutex so drain() can hold it across
-    // reset_to_empty(), preventing the scheduler thread from touching slot
-    // state mid-teardown (heap-use-after-free). Set once by Worker after the
-    // Scheduler is constructed.
+    // Wire the Scheduler's loop mutex so release_run() can safely perform an
+    // optional allocator compaction when the whole worker is quiescent.
     void set_scheduler_loop_mutex(std::mutex *m) { sched_loop_mu_ = m; }
 
-    // Clear any stored dispatch error so the next Worker::run() starts
-    // from a clean slate. Called by Worker::run before scope_begin.
-    void clear_error();
+    // Attach a scheduler/endpoint failure to the task's originating run.
+    void report_task_error(TaskSlot slot, const std::string &message);
 
     // Called by Scheduler (via Worker) when a task becomes CONSUMED:
     // erases TensorMap entries, releases the allocator slot (and implicitly
@@ -168,13 +168,22 @@ private:
     ReadyQueue *ready_sub_queue_ = nullptr;
     NextLevelReadyQueues *ready_next_level_queues_ = nullptr;
 
-    // --- Drain support (owned here, not on Worker) ---
-    std::atomic<int32_t> active_tasks_{0};
-    std::mutex drain_mu_;
-    std::condition_variable drain_cv_;
-    // Scheduler's loop mutex (not owned). Held across reset_to_empty() in
-    // drain() so the scheduler can't be mid-on_task_complete during teardown.
+    mutable std::mutex runs_mu_;
+    std::unordered_map<RunId, std::shared_ptr<RunState>> runs_;
+    RunId next_run_id_{1};
+    RunId building_run_id_{INVALID_RUN_ID};
+
+    // Scheduler's loop mutex (not owned). Held across optional quiescent
+    // compaction so the scheduler cannot retain a slot pointer being removed.
     std::mutex *sched_loop_mu_{nullptr};
+
+    std::shared_ptr<RunState> get_run(RunId run_id) const;
+    std::shared_ptr<RunState> current_building_run() const;
+    static void finish_run_if_ready(const std::shared_ptr<RunState> &run);
+    static bool is_terminal(RunPhase phase);
+    void increment_run_tasks(RunId run_id);
+    void decrement_run_tasks(RunId run_id);
+    void record_run_error(RunId run_id, std::exception_ptr error);
 
     // Slot state lives in the Ring; the pointer stays stable for the
     // slot's lifetime. Throws if the id is out of range — callers that

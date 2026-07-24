@@ -12,6 +12,7 @@
 #include "orchestrator.h"
 
 #include <cstdint>
+#include <limits>
 #include <stdexcept>
 #include <unordered_set>
 
@@ -28,7 +29,164 @@ void Orchestrator::init(
     ready_next_level_queues_ = ready_next_level_queues;
     manager_ = manager;
     ready_notify_cb_ = std::move(ready_notify_cb);
-    active_tasks_.store(0, std::memory_order_relaxed);
+}
+
+bool Orchestrator::is_terminal(RunPhase phase) { return phase == RunPhase::COMPLETED || phase == RunPhase::FAILED; }
+
+std::shared_ptr<RunState> Orchestrator::get_run(RunId run_id) const {
+    std::lock_guard<std::mutex> lk(runs_mu_);
+    auto it = runs_.find(run_id);
+    if (it == runs_.end()) throw std::invalid_argument("Orchestrator: unknown run id");
+    return it->second;
+}
+
+std::shared_ptr<RunState> Orchestrator::current_building_run() const {
+    std::lock_guard<std::mutex> lk(runs_mu_);
+    auto it = runs_.find(building_run_id_);
+    if (building_run_id_ == INVALID_RUN_ID || it == runs_.end()) {
+        throw std::logic_error("Orchestrator: task submission requires an active run");
+    }
+    return it->second;
+}
+
+RunId Orchestrator::begin_run() {
+    std::lock_guard<std::mutex> lk(runs_mu_);
+    if (building_run_id_ != INVALID_RUN_ID) {
+        throw std::logic_error("Orchestrator::begin_run: another run is still building");
+    }
+    if (next_run_id_ == INVALID_RUN_ID || next_run_id_ == std::numeric_limits<RunId>::max()) {
+        throw std::overflow_error("Orchestrator::begin_run: run id space exhausted");
+    }
+    RunId run_id = next_run_id_++;
+    runs_.emplace(run_id, std::make_shared<RunState>(run_id));
+    building_run_id_ = run_id;
+    return run_id;
+}
+
+void Orchestrator::finish_run_if_ready(const std::shared_ptr<RunState> &run) {
+    bool notify = false;
+    {
+        std::lock_guard<std::mutex> lk(run->completion_mu);
+        if (!run->submission_closed || run->active_tasks.load(std::memory_order_acquire) != 0 ||
+            is_terminal(run->phase.load(std::memory_order_acquire))) {
+            return;
+        }
+        bool failed = run->submission_failed || static_cast<bool>(run->first_error);
+        run->phase.store(failed ? RunPhase::FAILED : RunPhase::COMPLETED, std::memory_order_release);
+        notify = true;
+    }
+    if (notify) run->completion_cv.notify_all();
+}
+
+void Orchestrator::close_run_submission(RunId run_id) {
+    auto run = get_run(run_id);
+    {
+        std::lock_guard<std::mutex> runs_lk(runs_mu_);
+        if (building_run_id_ != run_id) {
+            throw std::logic_error("Orchestrator::close_run_submission: run is not building");
+        }
+        building_run_id_ = INVALID_RUN_ID;
+    }
+    {
+        std::lock_guard<std::mutex> lk(run->completion_mu);
+        if (run->submission_closed) {
+            throw std::logic_error("Orchestrator::close_run_submission: submission already closed");
+        }
+        run->submission_closed = true;
+        if (run->active_tasks.load(std::memory_order_acquire) != 0) {
+            run->phase.store(RunPhase::EXECUTING, std::memory_order_release);
+        }
+    }
+    finish_run_if_ready(run);
+}
+
+void Orchestrator::fail_run_submission(RunId run_id, std::exception_ptr error) {
+    auto run = get_run(run_id);
+    if (error) record_run_error(run_id, std::move(error));
+    {
+        std::lock_guard<std::mutex> runs_lk(runs_mu_);
+        if (building_run_id_ != run_id) {
+            throw std::logic_error("Orchestrator::fail_run_submission: run is not building");
+        }
+        building_run_id_ = INVALID_RUN_ID;
+    }
+    {
+        std::lock_guard<std::mutex> lk(run->completion_mu);
+        run->submission_failed = true;
+        run->submission_closed = true;
+        if (run->active_tasks.load(std::memory_order_acquire) != 0) {
+            run->phase.store(RunPhase::EXECUTING, std::memory_order_release);
+        }
+    }
+    finish_run_if_ready(run);
+}
+
+void Orchestrator::wait_run(RunId run_id) {
+    auto run = get_run(run_id);
+    std::exception_ptr error;
+    {
+        std::unique_lock<std::mutex> lk(run->completion_mu);
+        run->completion_cv.wait(lk, [&run] {
+            return is_terminal(run->phase.load(std::memory_order_acquire));
+        });
+        error = run->first_error;
+    }
+    if (error) std::rethrow_exception(error);
+}
+
+bool Orchestrator::run_done(RunId run_id) const {
+    return is_terminal(get_run(run_id)->phase.load(std::memory_order_acquire));
+}
+
+bool Orchestrator::run_failed(RunId run_id) const {
+    auto run = get_run(run_id);
+    std::lock_guard<std::mutex> lk(run->completion_mu);
+    return run->submission_failed || static_cast<bool>(run->first_error);
+}
+
+void Orchestrator::release_run(RunId run_id) {
+    bool globally_quiescent = false;
+    {
+        std::lock_guard<std::mutex> lk(runs_mu_);
+        auto it = runs_.find(run_id);
+        if (it == runs_.end()) throw std::invalid_argument("Orchestrator::release_run: unknown run id");
+        if (!is_terminal(it->second->phase.load(std::memory_order_acquire))) {
+            throw std::logic_error("Orchestrator::release_run: run is not terminal");
+        }
+        runs_.erase(it);
+        globally_quiescent = runs_.empty() && building_run_id_ == INVALID_RUN_ID;
+    }
+
+    if (!globally_quiescent || allocator_->active_count() != 0) return;
+    if (sched_loop_mu_ != nullptr) {
+        std::lock_guard<std::mutex> sched_lk(*sched_loop_mu_);
+        allocator_->reset_to_empty();
+    } else {
+        allocator_->reset_to_empty();
+    }
+}
+
+void Orchestrator::increment_run_tasks(RunId run_id) {
+    get_run(run_id)->active_tasks.fetch_add(1, std::memory_order_relaxed);
+}
+
+void Orchestrator::decrement_run_tasks(RunId run_id) {
+    auto run = get_run(run_id);
+    int32_t remaining = run->active_tasks.fetch_sub(1, std::memory_order_acq_rel) - 1;
+    if (remaining < 0) throw std::logic_error("Orchestrator: run task count underflow");
+    if (remaining == 0) finish_run_if_ready(run);
+}
+
+void Orchestrator::record_run_error(RunId run_id, std::exception_ptr error) {
+    if (!error) return;
+    auto run = get_run(run_id);
+    std::lock_guard<std::mutex> lk(run->completion_mu);
+    if (!run->first_error) run->first_error = std::move(error);
+}
+
+void Orchestrator::report_task_error(TaskSlot slot, const std::string &message) {
+    TaskSlotState &task = slot_state(slot);
+    record_run_error(task.run_id, std::make_exception_ptr(std::runtime_error(message)));
 }
 
 uint64_t Orchestrator::malloc(int worker_id, size_t size) {
@@ -68,6 +226,7 @@ TaskSlotState &Orchestrator::slot_state(TaskSlot s) {
 uint64_t Orchestrator::output_alloc_bytes(const Tensor &t) { return align_up(t.nbytes(), HEAP_ALIGN); }
 
 Tensor Orchestrator::alloc(const std::vector<uint32_t> &shape, DataType dtype) {
+    auto run = current_building_run();
     if (shape.empty()) {
         // Rank-0 tensors are not supported across the ABI (Tensor enforces
         // ndims > 0). Reject here so we never allocate + register a buffer in
@@ -100,11 +259,12 @@ Tensor Orchestrator::alloc(const std::vector<uint32_t> &shape, DataType dtype) {
 
     TaskSlotState &s = slot_state(ar.slot);
     s.reset();
+    s.run_id = run->id;
 
     uint64_t ptr = reinterpret_cast<uint64_t>(ar.heap_ptr);
     if (ptr != 0) {
         TensorKey key = TensorKey::local_host(ptr);
-        tensormap_->insert(key, ar.slot);
+        tensormap_->insert(run->id, key, ar.slot);
         s.output_keys.push_back(key);
     }
 
@@ -128,7 +288,7 @@ Tensor Orchestrator::alloc(const std::vector<uint32_t> &shape, DataType dtype) {
 
     s.state.store(TaskState::COMPLETED, std::memory_order_release);
 
-    active_tasks_.fetch_add(1, std::memory_order_relaxed);
+    increment_run_tasks(run->id);
 
     // Build a contiguous external Tensor over the allocated buffer. ptr may be
     // 0 for a 0-byte request (a shape with a zero dim), in which case
@@ -189,24 +349,16 @@ SubmitResult Orchestrator::submit_impl(
     std::vector<int32_t> target_worker_ids, std::vector<std::vector<int32_t>> eligible_worker_ids,
     std::vector<RemoteTaskArgsSidecar> remote_sidecars
 ) {
+    auto run = current_building_run();
     if (args_list.empty()) throw std::invalid_argument("Orchestrator: args_list must not be empty");
     config.validate();
     validate_worker_eligibility(worker_type, args_list.size(), target_worker_ids, eligible_worker_ids);
     validate_remote_sidecars(args_list, remote_sidecars, eligible_worker_ids);
 
-    // Fail-fast: if a previously-dispatched task has already failed, abort
-    // this submit before any bookkeeping so the orch fn unwinds promptly
-    // and no further work is queued. Tasks already in flight run to
-    // completion; drain() picks up any remaining bookkeeping and rethrows
-    // at the finally: _drain() site in Worker.run.
-    if (manager_ && manager_->has_error()) {
-        std::rethrow_exception(manager_->take_error());
+    {
+        std::lock_guard<std::mutex> lk(run->completion_mu);
+        if (run->first_error) std::rethrow_exception(run->first_error);
     }
-
-    // Track this submission for drain() before any allocations so the count
-    // is incremented exactly once per submitted DAG node, regardless of the
-    // group_size N.
-    active_tasks_.fetch_add(1, std::memory_order_relaxed);
 
     // --- Step 1: Atomically claim slot + auto-alloc any OUTPUT tensors that
     // arrived with a null data pointer. Both resources come from the same
@@ -214,13 +366,13 @@ SubmitResult Orchestrator::submit_impl(
     // path.
     AllocResult ar = reserve_outputs_and_slot(args_list, remote_sidecars);
     if (ar.slot == INVALID_SLOT) {
-        active_tasks_.fetch_sub(1, std::memory_order_relaxed);
         throw std::runtime_error("Orchestrator: allocator shutdown");
     }
     TaskSlot slot = ar.slot;
 
     TaskSlotState &s = slot_state(slot);
     s.reset();
+    s.run_id = run->id;
 
     s.worker_type = worker_type;
     s.callable = callable;
@@ -288,10 +440,12 @@ SubmitResult Orchestrator::submit_impl(
     s.fanout_released.store(0, std::memory_order_relaxed);
 
     if (scope_ref > 0) scope_->register_task(slot);
+    increment_run_tasks(run->id);
 
     if (poisoned_by_failed_producer) {
         if (poison_message.empty()) poison_message = "producer task failed";
         s.failure_message = poison_message;
+        record_run_error(run->id, std::make_exception_ptr(std::runtime_error(poison_message)));
         s.state.store(TaskState::FAILED, std::memory_order_release);
         std::vector<TaskSlot> fanin_producers = s.fanin_producers;
         try_consume(slot);
@@ -541,6 +695,7 @@ void Orchestrator::infer_deps(
     const std::vector<RemoteTaskArgsSidecar> &remote_sidecars, std::vector<TaskSlot> &producers,
     std::vector<TensorKey> &output_keys
 ) {
+    RunId run_id = slot_state(slot).run_id;
     std::unordered_set<TaskSlot> producer_seen;
     size_t tensor_count_hint = 0;
     for (const TaskArgs &args : args_list) {
@@ -600,20 +755,20 @@ void Orchestrator::infer_deps(
             TensorArgType tag = a.tag(i);
             switch (tag) {
             case TensorArgType::INPUT: {
-                TaskSlot prod = tensormap_->lookup(key);
+                TaskSlot prod = tensormap_->lookup(run_id, key);
                 if (prod != INVALID_SLOT) add_unique_producer(prod);
                 break;
             }
             case TensorArgType::INOUT: {
-                TaskSlot prod = tensormap_->lookup(key);
+                TaskSlot prod = tensormap_->lookup(run_id, key);
                 if (prod != INVALID_SLOT) add_unique_producer(prod);
-                tensormap_->insert(key, slot);
+                tensormap_->insert(run_id, key, slot);
                 output_keys.push_back(key);
                 break;
             }
             case TensorArgType::OUTPUT:
             case TensorArgType::OUTPUT_EXISTING: {
-                tensormap_->insert(key, slot);
+                tensormap_->insert(run_id, key, slot);
                 output_keys.push_back(key);
                 break;
             }
@@ -629,7 +784,10 @@ void Orchestrator::infer_deps(
 // Scope
 // =============================================================================
 
-void Orchestrator::scope_begin() { scope_->scope_begin(); }
+void Orchestrator::scope_begin() {
+    (void)current_building_run();
+    scope_->scope_begin();
+}
 
 void Orchestrator::scope_end() {
     scope_->scope_end([this](TaskSlot slot) {
@@ -680,57 +838,13 @@ bool Orchestrator::on_consumed(TaskSlot slot) {
         }
     }
 
-    tensormap_->erase_task_outputs(s.output_keys);
+    RunId run_id = s.run_id;
+    tensormap_->erase_task_outputs(run_id, s.output_keys);
 
     // HeapRing-owned OUTPUT slabs are reclaimed implicitly when the allocator
     // advances last_alive past this slot — no per-slot munmap needed.
     allocator_->release(slot);
 
-    // Decrement active-task counter so drain() observes completion. Gated
-    // on the CAS win so both consume paths — release_ref (Orch thread,
-    // scope_end) and try_consume (scheduler thread, consumer's deferred
-    // release) — decrement exactly once. Notify drain_cv when the count
-    // hits zero.
-    int32_t remaining = active_tasks_.fetch_sub(1, std::memory_order_acq_rel) - 1;
-    if (remaining == 0) {
-        std::lock_guard<std::mutex> lk(drain_mu_);
-        drain_cv_.notify_all();
-    }
+    decrement_run_tasks(run_id);
     return true;
-}
-
-void Orchestrator::drain() {
-    {
-        std::unique_lock<std::mutex> lk(drain_mu_);
-        drain_cv_.wait(lk, [this] {
-            return active_tasks_.load(std::memory_order_acquire) == 0;
-        });
-    }
-    // Every slot is CONSUMED (active_tasks_ == 0 ⇒ allocator last_alive_ ==
-    // next_task_id_). Drop all per-slot state so the next Worker.run()
-    // starts from task_id = 0 with no accumulated memory.
-    //
-    // Hold the scheduler's loop mutex across the reset: active_tasks_ can reach
-    // zero while the scheduler thread is still inside on_task_complete (it reads
-    // the slot after the consume that drives the count to 0). Freeing the slots
-    // here without this guard is a heap-use-after-free. The scheduler releases
-    // loop_mu_ only between iterations, and with active_tasks_ == 0 it has no
-    // further slots to touch, so this blocks at most one in-flight iteration.
-    if (sched_loop_mu_ != nullptr) {
-        std::lock_guard<std::mutex> sched_lk(*sched_loop_mu_);
-        allocator_->reset_to_empty();
-    } else {
-        allocator_->reset_to_empty();
-    }
-
-    // Rethrow the first dispatch failure seen during this run. Deferred to
-    // after allocator reset so the next Worker.run() can proceed cleanly
-    // once clear_error() is called.
-    if (manager_ && manager_->has_error()) {
-        std::rethrow_exception(manager_->take_error());
-    }
-}
-
-void Orchestrator::clear_error() {
-    if (manager_) manager_->clear_error();
 }

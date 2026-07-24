@@ -110,8 +110,8 @@ class _FakeDirectCWorker:
 
 
 class _EndpointFailingOrch:
-    def _clear_error(self) -> None:
-        pass
+    def _begin_run(self) -> int:
+        return 1
 
     def _scope_begin(self) -> None:
         pass
@@ -119,11 +119,21 @@ class _EndpointFailingOrch:
     def _scope_end(self) -> None:
         pass
 
-    def _drain(self) -> None:
+    def _close_run_submission(self, run_id: int) -> None:
+        assert run_id == 1
+
+    def _fail_run_submission(self, run_id: int) -> None:
+        assert run_id == 1
+
+    def _wait_run(self, run_id: int) -> None:
+        assert run_id == 1
         raise RuntimeError(
             "child failed: L3-L2 endpoint error op=signal_wait kind=3 region=2 "
             "counter_addr=0x200000 counter_operand=7 observed_counter=0 msg=wait timed out"
         )
+
+    def _release_run(self, run_id: int) -> None:
+        assert run_id == 1
 
 
 class _NamedOnboardRegionExport:

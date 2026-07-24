@@ -350,14 +350,21 @@ inline void bind_worker(nb::module_ &m) {
         .def("scope_end", &Orchestrator::scope_end, "Close the innermost scope. Non-blocking.")
         .def("_scope_begin", &Orchestrator::scope_begin)
         .def("_scope_end", &Orchestrator::scope_end)
+        .def("_begin_run", &Orchestrator::begin_run)
+        .def("_close_run_submission", &Orchestrator::close_run_submission, nb::arg("run_id"))
         .def(
-            "_drain", &Orchestrator::drain, nb::call_guard<nb::gil_scoped_release>(),
-            "Block until all submitted tasks are CONSUMED (releases GIL). "
-            "Rethrows the first dispatch failure seen in this run, if any."
+            "_fail_run_submission",
+            [](Orchestrator &self, RunId run_id) {
+                self.fail_run_submission(run_id);
+            },
+            nb::arg("run_id")
         )
         .def(
-            "_clear_error", &Orchestrator::clear_error, "Clear any stored dispatch error so the next run can proceed."
-        );
+            "_wait_run", &Orchestrator::wait_run, nb::arg("run_id"), nb::call_guard<nb::gil_scoped_release>(),
+            "Block until one run is terminal and raise only that run's error."
+        )
+        .def("_run_done", &Orchestrator::run_done, nb::arg("run_id"))
+        .def("_release_run", &Orchestrator::release_run, nb::arg("run_id"));
 
     // --- Worker ---
     // Bound as `_Worker` because the Python user-facing `Worker` factory
