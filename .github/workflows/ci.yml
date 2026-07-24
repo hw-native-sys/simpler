@@ -743,23 +743,25 @@ jobs:
       - name: Run Python hardware unit tests (a5)
         run: |
           source .venv/bin/activate
-          DEVICE_LIST=$(python -c "p='${DEVICE_RANGE}'.split('-'); s,e=p[0],p[-1]; print(','.join(str(i) for i in range(int(s),int(e)+1)))")
-          task-submit --timeout 1800 --max-time 1800 --device "$DEVICE_LIST" --run "python -m pytest tests -m requires_hardware --platform a5 --device ${DEVICE_RANGE} -v"
+          DEVICE_NUM=$(python -c "p='${DEVICE_RANGE}'.split('-'); print(int(p[-1])-int(p[0])+1)")
+          PYTEST_BASETEMP="${RUNNER_TEMP}/pytest-${GITHUB_JOB}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          task-submit --timeout 1800 --max-time 1800 --device auto --device-num "$DEVICE_NUM" \
+            --run "python -m pytest tests -m requires_hardware --platform a5 \
+            --device \$TASK_DEVICE --basetemp $PYTEST_BASETEMP -v"
 
       - name: Build and run C++ hardware unit tests (a5)
         run: |
           source .venv/bin/activate
           cmake -B tests/ut/cpp/build -S tests/ut/cpp -DSIMPLER_ENABLE_HARDWARE_TESTS=ON
           cmake --build tests/ut/cpp/build
-          python3 -c "
-          import json, os
-          p = os.environ['DEVICE_RANGE'].split('-'); s, e = p[0], p[-1]  # tolerate a single id (no hyphen)
-          npus = [{'id': str(i), 'slots': 1} for i in range(int(s), int(e)+1)]
-          json.dump({'version': {'major': 1, 'minor': 0}, 'local': [{'npus': npus}]},
-                    open('tests/ut/cpp/build/resources.json', 'w'))
-          "
-          DEVICE_LIST=$(python -c "p='${DEVICE_RANGE}'.split('-'); s,e=p[0],p[-1]; print(','.join(str(i) for i in range(int(s),int(e)+1)))")
-          task-submit --timeout 1800 --max-time 1800 --device "$DEVICE_LIST" --run "ctest --test-dir tests/ut/cpp/build -L '^requires_hardware(_a5)?\$' --resource-spec-file $PWD/tests/ut/cpp/build/resources.json -j$(nproc) --output-on-failure"
+          DEVICE_NUM=$(python -c "p='${DEVICE_RANGE}'.split('-'); print(int(p[-1])-int(p[0])+1)")
+          RESOURCE_SPEC="$PWD/tests/ut/cpp/build/resources.json"
+          task-submit --timeout 1800 --max-time 1800 --device auto --device-num "$DEVICE_NUM" \
+            --run "python3 -c 'import json, os; ids=os.environ[\"TASK_DEVICE\"].split(\",\"); \
+            spec={\"version\":{\"major\":1,\"minor\":0},\"local\":[{\"npus\":[{\"id\":i,\"slots\":1} for i in ids]}]}; \
+            json.dump(spec, open(\"$RESOURCE_SPEC\", \"w\"))' && \
+            ctest --test-dir tests/ut/cpp/build -L '^requires_hardware(_a5)?\$' \
+            --resource-spec-file $RESOURCE_SPEC -j$(nproc) --output-on-failure"
 
       - name: Build cann-examples/query (CANN host-API smoke)
         run: |
@@ -813,9 +815,12 @@ jobs:
       - name: Run pytest scene tests (a5)
         run: |
           source .venv/bin/activate
-          DEVICE_LIST=$(python -c "p='${DEVICE_RANGE}'.split('-'); s,e=p[0],p[-1]; print(','.join(str(i) for i in range(int(s),int(e)+1)))")
-          PYTEST="python -m pytest examples tests/st --platform a5 --device ${DEVICE_RANGE} -v --require-pto-isa"
-          task-submit --timeout 1800 --max-time 1800 --device "$DEVICE_LIST" --run "$PYTEST --pto-session-timeout 1200"
+          DEVICE_NUM=$(python -c "p='${DEVICE_RANGE}'.split('-'); print(int(p[-1])-int(p[0])+1)")
+          PYTEST_BASETEMP="${RUNNER_TEMP}/pytest-${GITHUB_JOB}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          PYTEST="python -m pytest examples tests/st --platform a5 --device \$TASK_DEVICE \
+            --basetemp $PYTEST_BASETEMP -v --require-pto-isa"
+          task-submit --timeout 1800 --max-time 1800 --device auto --device-num "$DEVICE_NUM" \
+            --run "$PYTEST --pto-session-timeout 1200"
 
       # DFX per-feature smokes — hardware mirror of the st-sim-a5 set. The
       # race window in dep_gen only fires on real timing, so this row is
@@ -824,35 +829,43 @@ jobs:
       - name: dep_gen smoke
         run: |
           source .venv/bin/activate
-          DEVICE_LIST=$(python -c "p='${DEVICE_RANGE}'.split('-'); s,e=p[0],p[-1]; print(','.join(str(i) for i in range(int(s),int(e)+1)))")
+          DEVICE_NUM=$(python -c "p='${DEVICE_RANGE}'.split('-'); print(int(p[-1])-int(p[0])+1)")
+          PYTEST_BASETEMP="${RUNNER_TEMP}/pytest-${GITHUB_JOB}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
           PYTEST="python -m pytest tests/st/a5/tensormap_and_ringbuffer/dfx/dep_gen/test_dep_gen.py \
-            --platform a5 --device ${DEVICE_RANGE} -p no:xdist --pto-session-timeout 600 \
+            --platform a5 --device \$TASK_DEVICE --basetemp $PYTEST_BASETEMP \
+            -p no:xdist --pto-session-timeout 600 \
             --require-pto-isa --enable-dep-gen"
-          task-submit --timeout 1800 --max-time 1800 --device "$DEVICE_LIST" --run "$PYTEST"
+          task-submit --timeout 1800 --max-time 1800 --device auto --device-num "$DEVICE_NUM" --run "$PYTEST"
 
       - name: l2_swimlane smoke
         run: |
           source .venv/bin/activate
-          DEVICE_LIST=$(python -c "p='${DEVICE_RANGE}'.split('-'); s,e=p[0],p[-1]; print(','.join(str(i) for i in range(int(s),int(e)+1)))")
+          DEVICE_NUM=$(python -c "p='${DEVICE_RANGE}'.split('-'); print(int(p[-1])-int(p[0])+1)")
+          PYTEST_BASETEMP="${RUNNER_TEMP}/pytest-${GITHUB_JOB}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
           PYTEST="python -m pytest tests/st/a5/tensormap_and_ringbuffer/dfx/l2_swimlane/ \
-            --platform a5 --device ${DEVICE_RANGE} -p no:xdist --pto-session-timeout 600 \
+            --platform a5 --device \$TASK_DEVICE --basetemp $PYTEST_BASETEMP \
+            -p no:xdist --pto-session-timeout 600 \
             --require-pto-isa --enable-l2-swimlane --enable-dep-gen"
-          task-submit --timeout 1800 --max-time 1800 --device "$DEVICE_LIST" --run "$PYTEST"
+          task-submit --timeout 1800 --max-time 1800 --device auto --device-num "$DEVICE_NUM" --run "$PYTEST"
 
       - name: PMU smoke
         run: |
           source .venv/bin/activate
-          DEVICE_LIST=$(python -c "p='${DEVICE_RANGE}'.split('-'); s,e=p[0],p[-1]; print(','.join(str(i) for i in range(int(s),int(e)+1)))")
+          DEVICE_NUM=$(python -c "p='${DEVICE_RANGE}'.split('-'); print(int(p[-1])-int(p[0])+1)")
+          PYTEST_BASETEMP="${RUNNER_TEMP}/pytest-${GITHUB_JOB}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
           PYTEST="python -m pytest tests/st/a5/tensormap_and_ringbuffer/dfx/pmu/test_pmu.py \
-            --platform a5 --device ${DEVICE_RANGE} -p no:xdist --pto-session-timeout 600 \
+            --platform a5 --device \$TASK_DEVICE --basetemp $PYTEST_BASETEMP \
+            -p no:xdist --pto-session-timeout 600 \
             --require-pto-isa --enable-pmu 2"
-          task-submit --timeout 1800 --max-time 1800 --device "$DEVICE_LIST" --run "$PYTEST"
+          task-submit --timeout 1800 --max-time 1800 --device auto --device-num "$DEVICE_NUM" --run "$PYTEST"
 
       - name: args_dump smoke
         run: |
           source .venv/bin/activate
-          DEVICE_LIST=$(python -c "p='${DEVICE_RANGE}'.split('-'); s,e=p[0],p[-1]; print(','.join(str(i) for i in range(int(s),int(e)+1)))")
+          DEVICE_NUM=$(python -c "p='${DEVICE_RANGE}'.split('-'); print(int(p[-1])-int(p[0])+1)")
+          PYTEST_BASETEMP="${RUNNER_TEMP}/pytest-${GITHUB_JOB}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
           PYTEST="python -m pytest tests/st/a5/tensormap_and_ringbuffer/dfx/args_dump/test_args_dump.py \
-            --platform a5 --device ${DEVICE_RANGE} -p no:xdist --pto-session-timeout 600 \
+            --platform a5 --device \$TASK_DEVICE --basetemp $PYTEST_BASETEMP \
+            -p no:xdist --pto-session-timeout 600 \
             --require-pto-isa --dump-args"
-          task-submit --timeout 1800 --max-time 1800 --device "$DEVICE_LIST" --run "$PYTEST"
+          task-submit --timeout 1800 --max-time 1800 --device auto --device-num "$DEVICE_NUM" --run "$PYTEST"
