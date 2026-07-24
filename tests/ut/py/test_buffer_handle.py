@@ -323,6 +323,34 @@ def test_materialize_bufferref_blob_to_tensors():
         h1.close()
 
 
+def test_materialize_strided_views():
+    # transpose / inner-slice produce non-contiguous refs that materialize to strided Tensors
+    # (matching the mainline strided Tensor wire), not rejected.
+    oid = mint_owner_instance_id()
+    h = create_host_shared_buffer(1024, oid, buffer_id=1)
+    reg = ImportRegistry()
+    try:
+        t = h.ref(shapes=(4, 8), dtype=DataType.FLOAT32.value).transpose(0, 1)  # (8,4) strides (1,8)
+        s = h.ref(shapes=(4, 8), dtype=DataType.FLOAT32.value).slice(1, 2, 6)  # (4,4) strides (8,1), off 8
+        blob = pack_bufferref_blob([t, s])
+        src = ctypes.create_string_buffer(blob, len(blob))
+        resolved = reg.materialize_blob(ctypes.addressof(src), len(blob))
+        tb = materialize_bufferref_blob(ctypes.addressof(src), len(blob), resolved)
+        dst = ctypes.create_string_buffer(tb, len(tb))
+        args = read_args_from_blob(ctypes.addressof(dst))
+        base = reg.resolve(h.identity).base
+
+        tt = args.tensor(0)
+        assert tt.shapes == (8, 4) and tt.strides == (1, 8) and not tt.is_contiguous
+        assert tt.data == base
+        ss = args.tensor(1)
+        assert ss.shapes == (4, 4) and ss.strides == (8, 1) and not ss.is_contiguous
+        assert ss.data == base + 2 * 1 * 4  # slice(1,2,..) shifts byte_offset by start*stride*elem
+    finally:
+        reg.close()
+        h.close()
+
+
 def test_materialize_rejects_unresolved_identity():
     oid = mint_owner_instance_id()
     handle = create_host_shared_buffer(nbytes=32, owner_instance_id=oid, buffer_id=9)

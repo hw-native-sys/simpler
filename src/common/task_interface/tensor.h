@@ -475,6 +475,10 @@ private:
         void *addr, const uint32_t shapes[], uint32_t ndims, DataType dtype, bool manual_dep, int32_t version,
         AddressSpace address_space
     );
+    friend inline Tensor make_tensor_strided(
+        void *addr, const uint32_t shapes[], const uint32_t strides[], uint32_t ndims, DataType dtype, bool manual_dep,
+        int32_t version, AddressSpace address_space
+    );
 };
 
 static_assert(std::is_trivially_copyable_v<Tensor>, "Tensor must be trivially copyable for DMA / wire transport");
@@ -509,4 +513,34 @@ inline Tensor make_tensor_external(
         total *= shapes[i];
     }
     return {addr, total * get_element_size(dtype), shapes, ndims, dtype, version, manual_dep, address_space};
+}
+
+// =============================================================================
+// Tensor factory — a possibly-strided external view. `addr` is the view origin
+// (start_offset == 0); `strides[]` are element strides (may be non-row-major, as
+// from a transpose / permute / step-sliced BufferRef). Derived fields
+// (extent_elem_cache, is_contiguous) are recomputed from shapes + strides;
+// buffer.size is the element extent in bytes.
+// =============================================================================
+inline Tensor make_tensor_strided(
+    void *addr, const uint32_t shapes[], const uint32_t strides[], uint32_t ndims, DataType dtype = DataType::FLOAT32,
+    bool manual_dep = false, int32_t version = 0, AddressSpace address_space = AddressSpace::HOST
+) {
+    always_assert(ndims > 0 && ndims <= MAX_TENSOR_DIMS);
+    Tensor t{};
+    t.buffer.addr = reinterpret_cast<uint64_t>(addr);
+    t.ndims = ndims;
+    t.dtype = dtype;
+    t.version = version;
+    t.manual_dep = manual_dep;
+    t.address_space = address_space;
+    t.start_offset = 0;
+    t.owner_task_id = PTO2TaskId::invalid();
+    for (uint32_t i = 0; i < ndims; i++) {
+        t.shapes[i] = shapes[i];
+        t.strides[i] = strides[i];
+    }
+    t.refresh_derived();  // extent_elem_cache + is_contiguous from shapes/strides
+    t.buffer.size = t.extent_elem_cache * get_element_size(dtype);
+    return t;
 }

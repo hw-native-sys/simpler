@@ -1606,19 +1606,6 @@ NB_MODULE(_task_interface, m) {
                 if (r.byte_offset % elem != 0) {
                     throw std::runtime_error("materialize_bufferref_blob: byte_offset is not a multiple of dtype size");
                 }
-                // Only row-major (contiguous) views are materializable in this ABI version.
-                uint32_t row_major = 1;
-                bool contiguous = true;
-                for (int d = static_cast<int>(r.ndims) - 1; d >= 0; d--) {
-                    if (r.strides[d] != row_major) {
-                        contiguous = false;
-                        break;
-                    }
-                    row_major *= r.shapes[d];
-                }
-                if (!contiguous) {
-                    throw std::runtime_error("materialize_bufferref_blob: non-contiguous BufferRef not supported yet");
-                }
                 nb::bytes key(reinterpret_cast<const char *>(&r.handle.identity), sizeof(CanonicalIdentity));
                 if (!resolved.contains(key)) {
                     throw std::runtime_error(
@@ -1628,9 +1615,12 @@ NB_MODULE(_task_interface, m) {
                 nb::tuple val = nb::cast<nb::tuple>(resolved[key]);
                 auto base = nb::cast<uint64_t>(val[0]);
                 auto addr_space = nb::cast<int>(val[1]);
-                Tensor t = make_tensor_external(
-                    reinterpret_cast<void *>(static_cast<uintptr_t>(base + r.byte_offset)), r.shapes, r.ndims, r.dtype,
-                    /*manual_dep=*/false, /*version=*/0, static_cast<AddressSpace>(addr_space)
+                // The view origin is base + byte_offset (start_offset folded into addr); strides carry
+                // any non-row-major layout (transpose / permute / step-slice), matching the mainline
+                // Tensor wire which is natively strided.
+                Tensor t = make_tensor_strided(
+                    reinterpret_cast<void *>(static_cast<uintptr_t>(base + r.byte_offset)), r.shapes, r.strides,
+                    r.ndims, r.dtype, /*manual_dep=*/false, /*version=*/0, static_cast<AddressSpace>(addr_space)
                 );
                 args.add_tensor(t, TensorArgType::INPUT);
             }
@@ -1646,8 +1636,9 @@ NB_MODULE(_task_interface, m) {
         "Materialize a BufferRef blob into a Tensor blob (write_blob format). Each ref's embedded "
         "handle identity is resolved via `resolved` {identity_bytes: (local_base, address_space)}; "
         "addr = base + byte_offset. The caller pre-populates `resolved` by materializing each embedded "
-        "descriptor (see bufferref_blob_descriptors) on first receipt. Rejects unknown identity, "
-        "non-dtype-aligned byte_offset, non-contiguous view."
+        "descriptor (see bufferref_blob_descriptors) on first receipt. Strided views (transpose / "
+        "permute / step-slice) materialize to strided Tensors. Rejects unknown identity, "
+        "non-dtype-aligned byte_offset."
     );
 
     m.def(
