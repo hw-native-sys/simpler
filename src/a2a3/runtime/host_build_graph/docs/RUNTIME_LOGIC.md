@@ -555,10 +555,11 @@ verified by review.
 
 ### 8.1 Thread Model
 
-With `aicpu_thread_num=4`, the AICPU runs 4 scheduler threads (thread 3 also
-performs the one-time host-orch boot before it starts dispatching):
+With `aicpu_thread_num=4` and `block_dim=24`, the AICPU runs 4 scheduler
+threads (thread 3 also performs the one-time host-orch boot before it starts
+dispatching):
 
-| Thread | Role | Cores (block_dim=24) |
+| Thread | Role | Cores |
 | ------ | ---- | ----- |
 | 0 | Scheduler | 6 AIC + 12 AIV |
 | 1 | Scheduler | 6 AIC + 12 AIV |
