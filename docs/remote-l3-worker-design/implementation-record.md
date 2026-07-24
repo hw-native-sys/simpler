@@ -16,7 +16,7 @@ It is updated as each documented feature is completed and verified.
 | 5 | Versioned remote frame codec | In progress | TASK/COMPLETION/CONTROL_REPLY/HELLO/CONTROL/HEALTH exist; core fuzz/bounds coverage is present, with more exhaustive corpus testing still possible. |
 | 6 | Remote callable registry | In progress | Dispatcher `PYTHON_IMPORT`, inner manifest/control `PYTHON_IMPORT`, and inner manifest/control inline `CHIP_CALLABLE` are implemented; serialized payloads and staged chip blobs remain negotiated extensions. |
 | 7 | Fork-safe simulation session runner | In progress | Daemon/session bootstrap and HELLO READY barrier are implemented for sim transport. |
-| 8 | Remote control-plane parity | In progress | Registry, alloc/free/copy, export/import/release-import controls are implemented for sim; Remote CommDomain controls are reserved/unsupported. |
+| 8 | Remote control-plane parity | In progress | Registry, remote buffers, and Global CommDomain prepare/import/commit/release/copy controls are implemented. |
 | 9 | Remote buffer registry | In progress | Sim owner/imported buffers, TASK materialization, public memory API, opaque handles, slot/import-ref capture, and deferred free/release-import are implemented. |
 | 10 | A2 RoCE HCOMM profile | Pending | Hardware-gated profile. |
 | 11 | A3 HCCS HCOMM profile | Pending | Hardware-gated profile. |
@@ -88,6 +88,26 @@ It is updated as each documented feature is completed and verified.
   Imports use shared-memory backed mappings in the session runner, imported
   handles remain opaque on the parent, and owner frees wait for live imports
   and slot refs to drain.
+- Added L4-brokered Global CommDomain setup without MPI. L2 export
+  descriptors are collected by L3, assembled by L4, returned to every L3/L2
+  for import, and released after the L4 DAG drain by default. Domains created
+  with `retain_after_run=True` remain live for a later run until explicitly
+  released or the Worker closes. Sim shm and A3 Fabric V2 use the same
+  descriptor ABI.
+- Added startup-manifest delivery for pre-registered inner `CHIP_CALLABLE`
+  payloads and `tools/a3_l4_tcp_smoke/global_tload_smoke.py`. The smoke uses
+  TCP daemons for launch/control, executes peer Fabric `TLOAD` in L2 kernels,
+  and verifies results without `mpirun`.
+- Added `tools/remote_l4_npu/remote_l4_npu_smoke.py` as the real-device
+  control/data-path baseline. L4 submits one task to each remote L3, each L3
+  runs a two-NPU local group, and L4 copies the results back for a golden
+  check. Remote buffers now use L3-owned child-visible host buffers whenever
+  the L3 has forked chip children, while childless sim sessions keep the
+  shared-memory fallback.
+- Added `tools/a3_l4_tcp_smoke/compute_then_tload_smoke.py`. One persistent L4
+  session first dispatches a local L2 vector-add through every remote L3, then
+  dispatches a cross-machine peer `TLOAD` over the computed values. The smoke
+  checks both the per-rank compute output and the final communication output.
 - Documented the v1 remote registry target/kind matrix, inner
   `INNER_L3_WORKER` visibility rules, remote `CHIP_CALLABLE` staged/inline
   payload contract, partial-register cleanup outcomes, and health-expiry
@@ -95,6 +115,16 @@ It is updated as each documented feature is completed and verified.
 
 ## Verification
 
+- Global CommDomain codec/validation tests and the Linux two-daemon sim
+  transaction test live in `tests/ut/py/test_global_comm_domain.py`.
+- The A3 two-server hardware commands in
+  `tools/a3_l4_tcp_smoke/README.md` passed for both peer `TLOAD` and
+  compute-then-`TLOAD`; every rank reported zero maximum difference.
+- The two-machine real-NPU compute baseline is documented in
+  `tools/remote_l4_npu/README.md`. It intentionally verifies remote L4
+  dispatch and per-machine L3/L2 compute separately from the cross-machine
+  Global CommDomain smoke. The two-NPU-per-node run passed with zero maximum
+  difference for every output.
 - Python focused sidecar/callable tests:
   `tests/ut/py/test_task_interface.py tests/ut/py/test_callable_identity.py`
   passed with `145 passed`.

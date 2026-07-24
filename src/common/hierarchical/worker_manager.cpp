@@ -107,6 +107,9 @@ RemoteBufferHandle WorkerEndpoint::control_remote_import(int32_t, const RemoteBu
 void WorkerEndpoint::control_remote_release_import(const RemoteBufferHandle &) {
     throw_unsupported_control("control_remote_release_import");
 }
+std::vector<uint8_t> WorkerEndpoint::control_remote_domain(remote_l3::ControlName, const std::vector<uint8_t> &) {
+    throw_unsupported_control("control_remote_domain");
+}
 void WorkerEndpoint::control_generic(uint64_t, const char *, size_t, double, const uint8_t *) {
     throw_unsupported_control("control_generic");
 }
@@ -828,6 +831,12 @@ void WorkerThread::control_remote_release_import(const RemoteBufferHandle &handl
     endpoint_->control_remote_release_import(handle);
 }
 
+std::vector<uint8_t>
+WorkerThread::control_remote_domain(remote_l3::ControlName control_name, const std::vector<uint8_t> &command_bytes) {
+    if (!endpoint_) throw std::runtime_error("control_remote_domain: null endpoint");
+    return endpoint_->control_remote_domain(control_name, command_bytes);
+}
+
 void WorkerThread::control_generic(
     uint64_t sub_cmd, const char *shm_name, size_t payload_size, double timeout_s, const uint8_t *digest
 ) {
@@ -1041,6 +1050,24 @@ ControlResult WorkerManager::control_digest_only(
     return result;
 }
 
+std::vector<uint8_t> WorkerManager::control_payload(
+    WorkerType type, int worker_id, uint64_t sub_cmd, const void *payload, size_t payload_size, double timeout_s
+) {
+    if (payload == nullptr || payload_size == 0) {
+        throw std::runtime_error("control_payload: payload must be non-empty");
+    }
+    WorkerThread *wt = get_worker_by_id(type, worker_id);
+    if (wt == nullptr) {
+        throw std::runtime_error("control_payload: invalid worker_id " + std::to_string(worker_id));
+    }
+    std::string shm_name = make_shm_name();
+    PosixShmHolder shm(shm_name, payload_size);
+    std::memcpy(shm.addr(), payload, payload_size);
+    wt->control_generic(sub_cmd, shm_name.c_str(), payload_size, timeout_s, nullptr);
+    auto *begin = static_cast<const uint8_t *>(shm.addr());
+    return {begin, begin + payload_size};
+}
+
 ControlResult WorkerManager::control_remote_prepare_register(
     int worker_id, remote_l3::RemoteRegistryTarget target_registry, CallableKind callable_kind, const void *payload,
     size_t payload_size, const uint8_t *digest
@@ -1181,6 +1208,25 @@ void WorkerManager::control_remote_release_import(const RemoteBufferHandle &hand
         );
     }
     wt->control_remote_release_import(handle);
+}
+
+std::vector<uint8_t> WorkerManager::control_remote_domain(
+    int worker_id, remote_l3::ControlName control_name, const std::vector<uint8_t> &command_bytes
+) {
+    WorkerThread *wt = get_worker_by_id(WorkerType::NEXT_LEVEL, worker_id);
+    if (wt == nullptr) {
+        throw std::runtime_error("control_remote_domain: invalid worker_id " + std::to_string(worker_id));
+    }
+    switch (control_name) {
+    case remote_l3::ControlName::COMM_INIT:
+    case remote_l3::ControlName::ALLOC_DOMAIN:
+    case remote_l3::ControlName::RELEASE_DOMAIN:
+    case remote_l3::ControlName::COPY_TO_DOMAIN:
+    case remote_l3::ControlName::COPY_FROM_DOMAIN:
+        return wt->control_remote_domain(control_name, command_bytes);
+    default:
+        throw std::runtime_error("control_remote_domain: control name is not a domain operation");
+    }
 }
 
 std::vector<ControlResult>

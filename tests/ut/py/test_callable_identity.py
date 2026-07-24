@@ -41,10 +41,14 @@ from simpler.remote_l3_protocol import (
     encode_register_callable_command,
     encode_remote_chip_callable_payload,
 )
+from simpler.remote_l3_protocol import (
+    RemoteAddressSpace as WireRemoteAddressSpace,
+)
 from simpler.remote_l3_session import (
     _install_manifest_dispatcher_registry,
     _install_manifest_inner_registry,
     _prepare_register_callable,
+    _RemoteBufferEntry,
     _unpublish_inner_handle,
     get_inner_handle,
 )
@@ -112,6 +116,42 @@ def _remote_sum_u8_orch(orch, args, cfg):
     src_data = (ctypes.c_ubyte * src.nbytes()).from_address(src.data)
     dst_data = (ctypes.c_ubyte * dst.nbytes()).from_address(dst.data)
     dst_data[0] = sum(int(src_data[i]) for i in range(src.nbytes())) & 0xFF
+
+
+def test_remote_buffer_entry_releases_child_visible_host_buffer():
+    raw = bytearray(8)
+    view = memoryview(raw)
+
+    class FakeHostBuffer:
+        data_ptr = ctypes.addressof(ctypes.c_char.from_buffer(raw))
+        buffer = view
+
+    class FakeOwner:
+        def __init__(self):
+            self.freed = []
+
+        def free_host_buffer(self, handle):
+            self.freed.append(handle)
+
+    data = FakeHostBuffer()
+    owner = FakeOwner()
+    entry = _RemoteBufferEntry(
+        data=data,
+        nbytes=len(raw),
+        generation=1,
+        address_space=WireRemoteAddressSpace.REMOTE_DEVICE,
+        owner=cast(Worker, owner),
+    )
+
+    assert entry.addr == data.data_ptr
+    entry.close()
+    assert owner.freed == [data]
+    assert entry.owner is None
+    with pytest.raises(ValueError, match="released memoryview"):
+        _ = view[0]
+
+    # Session finalization may defensively revisit an already closed entry.
+    entry.close()
 
 
 class _FakeRemoteControlResult:
@@ -558,6 +598,44 @@ def test_remote_session_manifest_uses_endpoint_host_as_default_bind():
         )
         assert remote["listen_host"] == "10.0.0.8"
         assert remote["connect_host"] == "10.0.0.8"
+    finally:
+        worker.close()
+
+
+def test_remote_manifest_carries_pre_registered_inner_chip_callable():
+    worker = Worker(level=4, num_sub_workers=0)
+    chip = ChipCallable.build(signature=[], func_name="x", binary=b"\x01", children=[])
+    try:
+        worker_id = worker.add_remote_worker(
+            RemoteWorkerSpec(
+                endpoint="127.0.0.1:19073",
+                platform="a2a3sim",
+                device_ids=(0,),
+            )
+        )
+        handle = worker.register(chip)
+        manifest = worker._build_remote_manifest(
+            spec=worker._remote_worker_specs[0],
+            worker_id=worker_id,
+            session_id=1,
+            startup_remaining_s=30.0,
+        )
+
+        assert len(manifest["inner_l3_worker"]) == 1
+        entry = manifest["inner_l3_worker"][0]
+        assert entry["hashid"] == handle.digest.hex()
+        command = encode_register_callable_command(
+            RemoteRegistryTarget.INNER_L3_WORKER,
+            CallableKind.CHIP_CALLABLE,
+            handle.digest,
+            1,
+            bytes.fromhex(entry["payload_hex"]),
+        )
+        digest, kind, registry, target = _prepare_register_callable(command, manifest)
+        assert digest == handle.digest
+        assert kind is CallableKind.CHIP_CALLABLE
+        assert registry is RemoteRegistryTarget.INNER_L3_WORKER
+        assert isinstance(target, ChipCallable)
     finally:
         worker.close()
 

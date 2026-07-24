@@ -89,6 +89,12 @@ struct DomainAllocation {
     CommContext *device_ctx = nullptr;  // aclrtMalloc'd CommContext mirror
 };
 
+static_assert(sizeof(CommGlobalDomainDescriptor) == 288, "global domain descriptor ABI changed");
+static_assert(
+    sizeof(aclrtMemFabricHandle) <= COMM_GLOBAL_DOMAIN_HANDLE_BYTES, "Fabric handle exceeds global descriptor"
+);
+static std::unordered_map<uint64_t, std::unique_ptr<DomainAllocation>> global_domain_allocations;
+
 struct CommHandle_ {
     int rank;
     int nranks;
@@ -1520,6 +1526,172 @@ comm_release_domain_windows(CommHandle h, uint64_t allocation_id, size_t rank_co
     return -1;
 } catch (...) {
     LOG_ERROR("[comm] release_domain: unknown exception");
+    return -1;
+}
+
+extern "C" int comm_global_domain_prepare(
+    uint64_t domain_id, uint32_t domain_rank, uint32_t rank_count, size_t window_size, uint32_t profile,
+    CommGlobalDomainDescriptor *descriptor_out, uint64_t *local_window_base_out
+) try {
+    if (domain_id == 0 || rank_count == 0 || rank_count > COMM_MAX_RANK_NUM || domain_rank >= rank_count ||
+        window_size == 0 || profile != COMM_GLOBAL_DOMAIN_PROFILE_A3_FABRIC || descriptor_out == nullptr ||
+        local_window_base_out == nullptr || global_domain_allocations.count(domain_id) != 0) {
+        return -1;
+    }
+
+    int32_t device_id = -1;
+    if (aclrtGetDevice(&device_id) != ACL_SUCCESS) {
+        return -1;
+    }
+    auto allocation = std::make_unique<DomainAllocation>();
+    aclError status = create_local_fabric_window(device_id, window_size, &allocation->local_window);
+    if (status != ACL_SUCCESS) {
+        LOG_ERROR("[global domain rank %u] create local Fabric window -> %d", domain_rank, static_cast<int>(status));
+        return -1;
+    }
+
+    aclrtMemFabricHandle fabric_handle{};
+    status = export_fabric_window(allocation->local_window, &fabric_handle);
+    if (status != ACL_SUCCESS) {
+        LOG_ERROR("[global domain rank %u] export Fabric handle -> %d", domain_rank, static_cast<int>(status));
+        release_domain_windows(allocation.get());
+        return -1;
+    }
+    status =
+        aclrtMemset(allocation->local_window.base, allocation->local_window.size, 0, allocation->local_window.size);
+    if (status != ACL_SUCCESS) {
+        LOG_ERROR("[global domain rank %u] zero local Fabric window -> %d", domain_rank, static_cast<int>(status));
+        release_domain_windows(allocation.get());
+        return -1;
+    }
+
+    allocation->rank = static_cast<int>(domain_rank);
+    allocation->nranks = static_cast<int>(rank_count);
+    CommGlobalDomainDescriptor descriptor{};
+    descriptor.version = COMM_GLOBAL_DOMAIN_VERSION;
+    descriptor.profile = COMM_GLOBAL_DOMAIN_PROFILE_A3_FABRIC;
+    descriptor.domain_rank = domain_rank;
+    descriptor.rank_count = rank_count;
+    descriptor.mapping_size = allocation->local_window.size;
+    descriptor.handle_size = sizeof(fabric_handle);
+    std::memcpy(descriptor.handle, &fabric_handle, sizeof(fabric_handle));
+
+    *descriptor_out = descriptor;
+    *local_window_base_out = reinterpret_cast<uint64_t>(allocation->local_window.base);
+    global_domain_allocations.emplace(domain_id, std::move(allocation));
+    return 0;
+} catch (const std::exception &e) {
+    LOG_ERROR("[global domain] prepare exception: %s", e.what());
+    return -1;
+} catch (...) {
+    LOG_ERROR("[global domain] prepare unknown exception");
+    return -1;
+}
+
+extern "C" int comm_global_domain_import(
+    uint64_t domain_id, const CommGlobalDomainDescriptor *descriptors, size_t descriptor_count, uint64_t *device_ctx_out
+) try {
+    auto it = global_domain_allocations.find(domain_id);
+    if (it == global_domain_allocations.end() || descriptors == nullptr || device_ctx_out == nullptr) {
+        return -1;
+    }
+    auto &allocation = it->second;
+    if (descriptor_count != static_cast<size_t>(allocation->nranks) || allocation->device_ctx != nullptr) {
+        return -1;
+    }
+
+    std::vector<const CommGlobalDomainDescriptor *> rank_order(descriptor_count, nullptr);
+    for (size_t i = 0; i < descriptor_count; ++i) {
+        const auto &descriptor = descriptors[i];
+        if (descriptor.version != COMM_GLOBAL_DOMAIN_VERSION ||
+            descriptor.profile != COMM_GLOBAL_DOMAIN_PROFILE_A3_FABRIC ||
+            descriptor.rank_count != static_cast<uint32_t>(allocation->nranks) ||
+            descriptor.domain_rank >= static_cast<uint32_t>(allocation->nranks) ||
+            descriptor.mapping_size != allocation->local_window.size ||
+            descriptor.handle_size != sizeof(aclrtMemFabricHandle) || rank_order[descriptor.domain_rank] != nullptr) {
+            return -1;
+        }
+        rank_order[descriptor.domain_rank] = &descriptor;
+    }
+
+    int32_t device_id = -1;
+    if (aclrtGetDevice(&device_id) != ACL_SUCCESS) {
+        return -1;
+    }
+    CommContext ctx{};
+    ctx.rankId = static_cast<uint32_t>(allocation->rank);
+    ctx.rankNum = static_cast<uint32_t>(allocation->nranks);
+    ctx.winSize = allocation->local_window.size;
+    allocation->peer_windows.reserve(descriptor_count - 1);
+    for (uint32_t rank = 0; rank < static_cast<uint32_t>(allocation->nranks); ++rank) {
+        const auto *descriptor = rank_order[rank];
+        if (descriptor == nullptr) {
+            return -1;
+        }
+        uint64_t window_addr = reinterpret_cast<uint64_t>(allocation->local_window.base);
+        if (rank != static_cast<uint32_t>(allocation->rank)) {
+            aclrtMemFabricHandle fabric_handle{};
+            std::memcpy(&fabric_handle, descriptor->handle, sizeof(fabric_handle));
+            VmmWindow peer_window;
+            aclError status = import_fabric_window(device_id, fabric_handle, descriptor->mapping_size, &peer_window);
+            if (status != ACL_SUCCESS) {
+                LOG_ERROR(
+                    "[global domain rank %d] import peer rank %u -> %d", allocation->rank, rank,
+                    static_cast<int>(status)
+                );
+                return -1;
+            }
+            window_addr = reinterpret_cast<uint64_t>(peer_window.base);
+            allocation->peer_windows.push_back(std::move(peer_window));
+        }
+        ctx.windowsIn[rank] = window_addr;
+        ctx.windowsOut[rank] = window_addr;
+    }
+
+    void *device_ctx = nullptr;
+    aclError status = aclrtMalloc(&device_ctx, sizeof(CommContext), ACL_MEM_MALLOC_HUGE_FIRST);
+    if (status != ACL_SUCCESS) {
+        return -1;
+    }
+    status = aclrtMemcpy(device_ctx, sizeof(CommContext), &ctx, sizeof(CommContext), ACL_MEMCPY_HOST_TO_DEVICE);
+    if (status != ACL_SUCCESS) {
+        aclrtFree(device_ctx);
+        return -1;
+    }
+    allocation->device_ctx = static_cast<CommContext *>(device_ctx);
+    *device_ctx_out = reinterpret_cast<uint64_t>(device_ctx);
+    return 0;
+} catch (const std::exception &e) {
+    LOG_ERROR("[global domain] import exception: %s", e.what());
+    return -1;
+} catch (...) {
+    LOG_ERROR("[global domain] import unknown exception");
+    return -1;
+}
+
+extern "C" int comm_global_domain_release(uint64_t domain_id) try {
+    auto it = global_domain_allocations.find(domain_id);
+    if (it == global_domain_allocations.end()) {
+        return 0;
+    }
+    auto &allocation = it->second;
+    int rc = 0;
+    if (allocation->device_ctx != nullptr) {
+        if (aclrtFree(allocation->device_ctx) != ACL_SUCCESS) {
+            rc = -1;
+        }
+        allocation->device_ctx = nullptr;
+    }
+    if (release_domain_windows(allocation.get()) != ACL_SUCCESS) {
+        rc = -1;
+    }
+    global_domain_allocations.erase(it);
+    return rc;
+} catch (const std::exception &e) {
+    LOG_ERROR("[global domain] release exception: %s", e.what());
+    return -1;
+} catch (...) {
+    LOG_ERROR("[global domain] release unknown exception");
     return -1;
 }
 

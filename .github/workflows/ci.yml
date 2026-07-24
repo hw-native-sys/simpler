@@ -723,6 +723,9 @@ jobs:
     needs: pre-commit
     runs-on: [self-hosted, a5]
     timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: source
     env:
       SIMPLER_SCHEDULER_TIMEOUT_MS: "2000"
       SIMPLER_OP_EXECUTE_TIMEOUT_US: "3000000"
@@ -731,6 +734,11 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v5
+        with:
+          # The legacy workspace root contains an undeletable privileged
+          # .pytest_cache. Use a clean child checkout instead.
+          path: source
+
       - name: Set up environment
         run: |
           python3 -m venv --system-site-packages .venv
@@ -744,7 +752,7 @@ jobs:
         run: |
           source .venv/bin/activate
           DEVICE_LIST=$(python -c "p='${DEVICE_RANGE}'.split('-'); s,e=p[0],p[-1]; print(','.join(str(i) for i in range(int(s),int(e)+1)))")
-          task-submit --timeout 1800 --max-time 1800 --device "$DEVICE_LIST" --run "python -m pytest tests -m requires_hardware --platform a5 --device ${DEVICE_RANGE} -v"
+          task-submit --timeout 1800 --max-time 1800 --device "$DEVICE_LIST" --run "python -m pytest tests -m requires_hardware -p no:cacheprovider --platform a5 --device ${DEVICE_RANGE} -v"
 
       - name: Build and run C++ hardware unit tests (a5)
         run: |
@@ -793,6 +801,9 @@ jobs:
     if: needs.detect-changes.outputs.a5_changed == 'true'
     runs-on: [self-hosted, a5]
     timeout-minutes: 60
+    defaults:
+      run:
+        working-directory: source
     env:
       SIMPLER_SCHEDULER_TIMEOUT_MS: "2000"
       SIMPLER_OP_EXECUTE_TIMEOUT_US: "3000000"
@@ -801,6 +812,11 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v5
+        with:
+          # The legacy workspace root contains an undeletable privileged
+          # .pytest_cache. Use a clean child checkout instead.
+          path: source
+
       - name: Set up environment
         run: |
           python3 -m venv --system-site-packages .venv
@@ -814,7 +830,7 @@ jobs:
         run: |
           source .venv/bin/activate
           DEVICE_LIST=$(python -c "p='${DEVICE_RANGE}'.split('-'); s,e=p[0],p[-1]; print(','.join(str(i) for i in range(int(s),int(e)+1)))")
-          PYTEST="python -m pytest examples tests/st --platform a5 --device ${DEVICE_RANGE} -v --require-pto-isa"
+          PYTEST="python -m pytest examples tests/st -p no:cacheprovider --platform a5 --device ${DEVICE_RANGE} -v --require-pto-isa"
           task-submit --timeout 1800 --max-time 1800 --device "$DEVICE_LIST" --run "$PYTEST --pto-session-timeout 1200"
 
       # DFX per-feature smokes — hardware mirror of the st-sim-a5 set. The
@@ -826,7 +842,7 @@ jobs:
           source .venv/bin/activate
           DEVICE_LIST=$(python -c "p='${DEVICE_RANGE}'.split('-'); s,e=p[0],p[-1]; print(','.join(str(i) for i in range(int(s),int(e)+1)))")
           PYTEST="python -m pytest tests/st/a5/tensormap_and_ringbuffer/dfx/dep_gen/test_dep_gen.py \
-            --platform a5 --device ${DEVICE_RANGE} -p no:xdist --pto-session-timeout 600 \
+            --platform a5 --device ${DEVICE_RANGE} -p no:xdist -p no:cacheprovider --pto-session-timeout 600 \
             --require-pto-isa --enable-dep-gen"
           task-submit --timeout 1800 --max-time 1800 --device "$DEVICE_LIST" --run "$PYTEST"
 
@@ -835,7 +851,7 @@ jobs:
           source .venv/bin/activate
           DEVICE_LIST=$(python -c "p='${DEVICE_RANGE}'.split('-'); s,e=p[0],p[-1]; print(','.join(str(i) for i in range(int(s),int(e)+1)))")
           PYTEST="python -m pytest tests/st/a5/tensormap_and_ringbuffer/dfx/l2_swimlane/ \
-            --platform a5 --device ${DEVICE_RANGE} -p no:xdist --pto-session-timeout 600 \
+            --platform a5 --device ${DEVICE_RANGE} -p no:xdist -p no:cacheprovider --pto-session-timeout 600 \
             --require-pto-isa --enable-l2-swimlane --enable-dep-gen"
           task-submit --timeout 1800 --max-time 1800 --device "$DEVICE_LIST" --run "$PYTEST"
 
@@ -844,7 +860,7 @@ jobs:
           source .venv/bin/activate
           DEVICE_LIST=$(python -c "p='${DEVICE_RANGE}'.split('-'); s,e=p[0],p[-1]; print(','.join(str(i) for i in range(int(s),int(e)+1)))")
           PYTEST="python -m pytest tests/st/a5/tensormap_and_ringbuffer/dfx/pmu/test_pmu.py \
-            --platform a5 --device ${DEVICE_RANGE} -p no:xdist --pto-session-timeout 600 \
+            --platform a5 --device ${DEVICE_RANGE} -p no:xdist -p no:cacheprovider --pto-session-timeout 600 \
             --require-pto-isa --enable-pmu 2"
           task-submit --timeout 1800 --max-time 1800 --device "$DEVICE_LIST" --run "$PYTEST"
 
@@ -853,6 +869,6 @@ jobs:
           source .venv/bin/activate
           DEVICE_LIST=$(python -c "p='${DEVICE_RANGE}'.split('-'); s,e=p[0],p[-1]; print(','.join(str(i) for i in range(int(s),int(e)+1)))")
           PYTEST="python -m pytest tests/st/a5/tensormap_and_ringbuffer/dfx/args_dump/test_args_dump.py \
-            --platform a5 --device ${DEVICE_RANGE} -p no:xdist --pto-session-timeout 600 \
+            --platform a5 --device ${DEVICE_RANGE} -p no:xdist -p no:cacheprovider --pto-session-timeout 600 \
             --require-pto-isa --dump-args"
           task-submit --timeout 1800 --max-time 1800 --device "$DEVICE_LIST" --run "$PYTEST"

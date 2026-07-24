@@ -170,6 +170,7 @@ add_library(hierarchical_objs OBJECT
 )
 target_include_directories(hierarchical_objs PUBLIC
     ${HIERARCHICAL_SRC_DIR}
+    ${CMAKE_SOURCE_DIR}/../../../src/common/platform/include
     ${CMAKE_SOURCE_DIR}/../../../src/common/task_interface
     ${WORKER_SRC_DIR}
 )

@@ -37,6 +37,49 @@ extern "C" {
 
 typedef struct CommHandle_ *CommHandle;
 
+#define COMM_GLOBAL_DOMAIN_VERSION 1U
+#define COMM_GLOBAL_DOMAIN_HANDLE_BYTES 256U
+#define COMM_GLOBAL_DOMAIN_DESCRIPTOR_BYTES 288U
+
+typedef enum CommGlobalDomainProfile {
+    COMM_GLOBAL_DOMAIN_PROFILE_SIM_SHM = 1,
+    COMM_GLOBAL_DOMAIN_PROFILE_A3_FABRIC = 2,
+} CommGlobalDomainProfile;
+
+typedef struct CommGlobalDomainDescriptor {
+    uint32_t version;
+    uint32_t profile;
+    uint32_t domain_rank;
+    uint32_t rank_count;
+    uint64_t mapping_size;
+    uint32_t handle_size;
+    uint32_t reserved;
+    uint8_t handle[COMM_GLOBAL_DOMAIN_HANDLE_BYTES];
+} CommGlobalDomainDescriptor;
+
+#ifdef __cplusplus
+static_assert(
+    sizeof(CommGlobalDomainDescriptor) == COMM_GLOBAL_DOMAIN_DESCRIPTOR_BYTES,
+    "CommGlobalDomainDescriptor wire size drift"
+);
+static_assert(offsetof(CommGlobalDomainDescriptor, version) == 0, "CommGlobalDomainDescriptor.version offset drift");
+static_assert(offsetof(CommGlobalDomainDescriptor, profile) == 4, "CommGlobalDomainDescriptor.profile offset drift");
+static_assert(
+    offsetof(CommGlobalDomainDescriptor, domain_rank) == 8, "CommGlobalDomainDescriptor.domain_rank offset drift"
+);
+static_assert(
+    offsetof(CommGlobalDomainDescriptor, rank_count) == 12, "CommGlobalDomainDescriptor.rank_count offset drift"
+);
+static_assert(
+    offsetof(CommGlobalDomainDescriptor, mapping_size) == 16, "CommGlobalDomainDescriptor.mapping_size offset drift"
+);
+static_assert(
+    offsetof(CommGlobalDomainDescriptor, handle_size) == 24, "CommGlobalDomainDescriptor.handle_size offset drift"
+);
+static_assert(offsetof(CommGlobalDomainDescriptor, reserved) == 28, "CommGlobalDomainDescriptor.reserved offset drift");
+static_assert(offsetof(CommGlobalDomainDescriptor, handle) == 32, "CommGlobalDomainDescriptor.handle offset drift");
+#endif
+
 /** Bit mask of DmaWorkspaceKind values this platform can provision. */
 uint32_t dma_workspace_supported_mask(void);
 
@@ -222,6 +265,42 @@ int comm_alloc_domain_windows(
  * @return 0 on success, non-zero on failure.
  */
 int comm_release_domain_windows(CommHandle h, uint64_t allocation_id, size_t rank_count, uint32_t domain_rank);
+
+/**
+ * Create one local window for a Global CommDomain and export its transport
+ * descriptor. This operation has no
+ * HCCL or filesystem bootstrap dependency.
+ *
+ * The caller relays the descriptor through its control plane. It later
+ * passes
+ * the complete rank-ordered table to comm_global_domain_import(). A live
+ * domain_id is unique within one
+ * ChipWorker process.
+ */
+int comm_global_domain_prepare(
+    uint64_t domain_id, uint32_t domain_rank, uint32_t rank_count, size_t window_size, uint32_t profile,
+    CommGlobalDomainDescriptor *descriptor_out, uint64_t *local_window_base_out
+);
+
+/**
+ * Import every peer descriptor and publish a device CommContext.
+ *
+ * descriptors must contain exactly one entry
+ * for every dense domain rank.
+ * The returned context and all imported mappings remain live until
+ *
+ * comm_global_domain_release().
+ */
+int comm_global_domain_import(
+    uint64_t domain_id, const CommGlobalDomainDescriptor *descriptors, size_t descriptor_count, uint64_t *device_ctx_out
+);
+
+/**
+ * Release a prepared or imported Global CommDomain. This is local teardown.
+ * The L4 owner is responsible for
+ * draining all rank tasks before fanout.
+ */
+int comm_global_domain_release(uint64_t domain_id);
 
 /**
  * Synchronize all ranks.

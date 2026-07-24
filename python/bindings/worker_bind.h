@@ -669,6 +669,25 @@ inline void bind_worker(nb::module_ &m) {
             nb::arg("import_id"), "Release an imported remote buffer mapping."
         )
         .def(
+            "remote_domain_control",
+            [](Worker &self, int worker_id, uint32_t control_name, nb::bytes command) {
+                std::vector<uint8_t> command_bytes(
+                    reinterpret_cast<const uint8_t *>(command.c_str()),
+                    reinterpret_cast<const uint8_t *>(command.c_str()) + command.size()
+                );
+                std::vector<uint8_t> result;
+                {
+                    nb::gil_scoped_release release;
+                    result = self.remote_domain_control(
+                        worker_id, static_cast<remote_l3::ControlName>(control_name), command_bytes
+                    );
+                }
+                return nb::bytes(reinterpret_cast<const char *>(result.data()), result.size());
+            },
+            nb::arg("worker_id"), nb::arg("control_name"), nb::arg("command"),
+            "Send one Global CommDomain control to a remote L3 endpoint."
+        )
+        .def(
             "broadcast_unregister_all",
             [](Worker &self, nb::object digest) {
                 std::string digest_bytes = bytes_from_digest_arg(digest);
@@ -708,6 +727,25 @@ inline void bind_worker(nb::module_ &m) {
             "Broadcast an arbitrary CONTROL_REQUEST to the selected worker pool. "
             "If payload is a Python buffer, C++ stages it in POSIX shm and writes the shm name "
             "into the mailbox. Returns per-child ControlResult entries."
+        )
+        .def(
+            "control_payload",
+            [](Worker &self, WorkerType worker_type, int worker_id, uint64_t sub_cmd, nb::object payload,
+               nb::object timeout_s) {
+                std::string payload_bytes = buffer_to_string(payload, "payload");
+                double timeout_val = timeout_s.is_none() ? -1.0 : nb::cast<double>(timeout_s);
+                std::vector<uint8_t> result;
+                {
+                    nb::gil_scoped_release release;
+                    result = self.control_payload(
+                        worker_type, worker_id, sub_cmd, payload_bytes.data(), payload_bytes.size(), timeout_val
+                    );
+                }
+                return nb::bytes(reinterpret_cast<const char *>(result.data()), result.size());
+            },
+            nb::arg("worker_type"), nb::arg("worker_id"), nb::arg("sub_cmd"), nb::arg("payload"),
+            nb::arg("timeout_s") = nb::none(),
+            "Drive one local worker control with a mutable staged payload and return its final bytes."
         )
         .def(
             "control_alloc_domain", &Worker::control_alloc_domain, nb::arg("worker_id"), nb::arg("request_shm_name"),

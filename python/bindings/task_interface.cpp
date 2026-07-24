@@ -1510,6 +1510,36 @@ NB_MODULE(_task_interface, m) {
             nb::arg("allocation_id"), nb::arg("rank_count"), nb::arg("domain_rank"),
             "Pair to comm_alloc_domain_windows: collectively release the per-rank pool."
         )
+        .def(
+            "comm_global_domain_prepare",
+            [](ChipWorker &self, uint64_t domain_id, uint32_t domain_rank, uint32_t rank_count, size_t window_size,
+               uint32_t profile) {
+                auto [descriptor, local_window_base, actual_window_size] =
+                    self.comm_global_domain_prepare(domain_id, domain_rank, rank_count, window_size, profile);
+                return nb::make_tuple(
+                    nb::bytes(reinterpret_cast<const char *>(descriptor.data()), descriptor.size()), local_window_base,
+                    actual_window_size
+                );
+            },
+            nb::arg("domain_id"), nb::arg("domain_rank"), nb::arg("rank_count"), nb::arg("window_size"),
+            nb::arg("profile"), "Create a Global CommDomain local window and return its transport descriptor."
+        )
+        .def(
+            "comm_global_domain_import",
+            [](ChipWorker &self, uint64_t domain_id, nb::bytes descriptors) {
+                std::vector<uint8_t> descriptor_bytes(
+                    reinterpret_cast<const uint8_t *>(descriptors.c_str()),
+                    reinterpret_cast<const uint8_t *>(descriptors.c_str()) + descriptors.size()
+                );
+                return self.comm_global_domain_import(domain_id, descriptor_bytes);
+            },
+            nb::arg("domain_id"), nb::arg("descriptors"),
+            "Import a rank-ordered Global CommDomain descriptor table and return the device context."
+        )
+        .def(
+            "comm_global_domain_release", &ChipWorker::comm_global_domain_release, nb::arg("domain_id"),
+            "Release a prepared or imported Global CommDomain."
+        )
         .def("comm_barrier", &ChipWorker::comm_barrier, nb::arg("comm_handle"), "Synchronize all ranks.")
         .def(
             "comm_destroy", &ChipWorker::comm_destroy, nb::arg("comm_handle"),

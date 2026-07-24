@@ -295,15 +295,29 @@ Required remote controls:
 - `IMPORT_BUFFER`
 - `RELEASE_IMPORT`
 
-Reserved future controls for Remote CommDomain:
+Required Global CommDomain controls:
 
 - `COMM_INIT`
 - `ALLOC_DOMAIN`
 - `RELEASE_DOMAIN`
+- `COPY_TO_DOMAIN`
+- `COPY_FROM_DOMAIN`
 
-The first Remote L3 task-dispatch cut rejects the reserved domain controls
-with an unsupported-control reply. They become required only when Remote
-CommDomain enters scope.
+`COMM_INIT` validates the cluster id, node identity, communication profile,
+global device ranks, and dense domain-rank table. `ALLOC_DOMAIN` is a
+transaction with `PREPARE_EXPORT`, `IMPORT`, `COMMIT`, and `ABORT` phases.
+Each L2 exports its local transport descriptor during prepare. L4 assembles
+the complete rank-ordered table and sends it to every L3; each L3 forwards it
+to its L2 children for import. No domain becomes visible to a remote task
+before every node acknowledges `COMMIT`.
+
+`RELEASE_DOMAIN` is idempotent and normally runs after the L4 DAG drain.
+An allocation marked `retain_after_run` may remain live for a later L4 run
+that reads kernel results; explicit release or session shutdown then performs
+the same teardown.
+`COPY_TO_DOMAIN` and `COPY_FROM_DOMAIN` are bounded smoke/control data
+operations for a committed local window. They do not replace kernel data
+movement through `CommContext`.
 
 The register-family controls are registry-scope-aware.
 `PREPARE_REGISTER_CALLABLE` carries:

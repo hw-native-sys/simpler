@@ -62,6 +62,8 @@ class ControlName(enum.IntEnum):
     COMM_INIT = 13
     ALLOC_DOMAIN = 14
     RELEASE_DOMAIN = 15
+    COPY_TO_DOMAIN = 16
+    COPY_FROM_DOMAIN = 17
 
 
 class RemoteRegistryTarget(enum.IntEnum):

@@ -46,6 +46,8 @@ from .task_interface import (
     CommBufferSpec,
     CommDomainHandle,
     DataType,
+    GlobalCommDomainHandle,
+    GlobalCommDomainView,
     RemoteAddressSpace,
     TaskArgs,
     Tensor,
@@ -411,6 +413,87 @@ class Orchestrator:
     def release_domain(self, handle: CommDomainHandle) -> None:
         """Collective release.  Equivalent to ``handle.release()``."""
         handle.release()
+
+    def allocate_global_domain(
+        self,
+        *,
+        name: str,
+        members: Sequence[tuple[int, int]],
+        window_size: int,
+        buffers: Sequence[CommBufferSpec] = (),
+        retain_after_run: bool = False,
+    ) -> GlobalCommDomainHandle:
+        """Create a CommDomain across remote L3 nodes without MPI.
+
+        Each member is ``(remote_l3_worker_id, local_l2_worker_id)``. L4
+        collects every L2 export descriptor, sends the complete rank-ordered
+        table back to every L3, and commits only after all L2 imports succeed.
+        ``retain_after_run=True`` keeps the domain live after the current DAG
+        drains so a later run can inspect communication results; explicit
+        release or ``Worker.close()`` still tears it down.
+        """
+        if self._worker is None:
+            raise RuntimeError("allocate_global_domain requires an Orchestrator bound to a Worker")
+        return self._worker._allocate_global_domain(
+            name=str(name),
+            members=tuple((int(node), int(local)) for node, local in members),
+            window_size=int(window_size),
+            buffers=list(buffers),
+            retain_after_run=bool(retain_after_run),
+        )
+
+    def release_global_domain(self, handle: GlobalCommDomainHandle) -> None:
+        handle.release()
+
+    def get_global_domain(self, domain_id: int) -> GlobalCommDomainView:
+        """Return the committed L3-local view for a domain created by L4."""
+        if self._worker is None:
+            raise RuntimeError("get_global_domain requires an Orchestrator bound to a Worker")
+        return self._worker._get_global_domain(int(domain_id))
+
+    @staticmethod
+    def _global_copy_range(handle: GlobalCommDomainHandle, *, buffer: str | None, offset: int, nbytes: int) -> int:
+        absolute = int(offset)
+        if absolute < 0 or nbytes <= 0:
+            raise ValueError("Global CommDomain copy offset must be non-negative and size must be positive")
+        limit = handle.mapping_size
+        if buffer is not None:
+            buffer_offset, buffer_nbytes = handle.buffer_range(str(buffer))
+            if absolute > buffer_nbytes or nbytes > buffer_nbytes - absolute:
+                raise ValueError(f"Global CommDomain copy exceeds buffer {buffer!r}")
+            absolute += buffer_offset
+        elif absolute > limit or nbytes > limit - absolute:
+            raise ValueError("Global CommDomain copy exceeds the mapped window")
+        return absolute
+
+    def copy_to_global_domain(
+        self,
+        handle: GlobalCommDomainHandle,
+        domain_rank: int,
+        data: bytes,
+        *,
+        buffer: str | None = None,
+        offset: int = 0,
+    ) -> None:
+        payload = bytes(data)
+        absolute = self._global_copy_range(handle, buffer=buffer, offset=int(offset), nbytes=len(payload))
+        if self._worker is None:
+            raise RuntimeError("copy_to_global_domain requires an Orchestrator bound to a Worker")
+        self._worker._copy_to_global_domain(handle, int(domain_rank), payload, absolute)
+
+    def copy_from_global_domain(
+        self,
+        handle: GlobalCommDomainHandle,
+        domain_rank: int,
+        nbytes: int,
+        *,
+        buffer: str | None = None,
+        offset: int = 0,
+    ) -> bytes:
+        absolute = self._global_copy_range(handle, buffer=buffer, offset=int(offset), nbytes=int(nbytes))
+        if self._worker is None:
+            raise RuntimeError("copy_from_global_domain requires an Orchestrator bound to a Worker")
+        return self._worker._copy_from_global_domain(handle, int(domain_rank), int(nbytes), absolute)
 
     def create_l3_l2_region(self, *, worker_id: int, payload_bytes: int, counter_bytes: int):
         """Create an L3-L2 communication region on one NEXT_LEVEL chip worker."""

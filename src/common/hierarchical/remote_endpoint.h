@@ -110,6 +110,8 @@ public:
         int32_t importer_worker_id, const RemoteBufferExport &export_desc, uint32_t requested_access_flags
     ) override;
     void control_remote_release_import(const RemoteBufferHandle &handle) override;
+    std::vector<uint8_t>
+    control_remote_domain(remote_l3::ControlName control_name, const std::vector<uint8_t> &command_bytes) override;
 
 private:
     WorkerEndpointCaps caps_;
